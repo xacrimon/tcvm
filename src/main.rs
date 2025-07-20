@@ -61,7 +61,7 @@ fn main() {
         OpCode::NoOp,
     ];
 
-    for _ in 0..100 {
+    for _ in 0..100000 {
         tape.push(OpCode::Incr);
     }
 
