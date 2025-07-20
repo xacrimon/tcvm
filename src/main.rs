@@ -1,3 +1,6 @@
+#![allow(incomplete_features)]
+#![feature(explicit_tail_calls)]
+
 #[derive(Clone, Copy)]
 enum OpCode {
     Stop,
@@ -28,7 +31,7 @@ macro_rules! dispatch {
         let pc = $state.pc;
         let op = $state.tape[pc];
         let handler = HANDLERS[op as usize];
-        handler($state);
+        become handler($state);
     }};
 }
 
