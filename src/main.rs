@@ -1,7 +1,7 @@
 #![allow(incomplete_features)]
 #![feature(explicit_tail_calls)]
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 enum OpCode {
     Stop = 0,
@@ -11,53 +11,54 @@ enum OpCode {
 
 const HANDLERS: &[Handler] = &[insn_stop, insn_noop, insn_incr];
 
-struct State {
-    pc: usize,
-    value: i32,
-    tape: Vec<OpCode>,
-    handlers: &'static [Handler],
-}
-
-type Handler = fn(&mut State);
+type Handler = fn(pc: usize, value: &mut i32, tape: &[OpCode], handlers: *const ());
 
 macro_rules! dispatch {
-    ($state:expr) => {{
-        $state.pc += 1;
-        dispatch!($state, impl);
+    ($pc:expr, $value:expr, $tape:expr, $handlers:expr) => {{
+        let mut pc = $pc;
+        pc += 1;
+        dispatch!(pc, $value, $tape, $handlers, impl);
     }};
 
-    ($state:expr, start) => {{
-        dispatch!($state, impl);
+    ($pc:expr, $value:expr, $tape:expr, $handlers:expr, start) => {{
+        dispatch!($pc, $value, $tape, $handlers, impl);
     }};
 
-    ($state:expr, impl) => {{
+    ($pc:expr, $value:expr, $tape:expr, $handlers:expr, impl) => {{
         unsafe {
-            let op = *$state.tape.get_unchecked($state.pc);
-            let handler = *$state.handlers.get_unchecked(op as usize);
-            become handler($state);
+            let op = *$tape.get_unchecked($pc);
+            let handlers = $handlers as *const Handler;
+            let handler = *handlers.add(op as usize);
+            become handler($pc, $value, $tape, $handlers);
         }
     }};
 }
 
 #[inline(never)]
-fn insn_stop(_state: &mut State) {
+fn insn_stop(_pc: usize, _value: &mut i32, _tape: &[OpCode], _handlers: *const ()) {
     return;
 }
 
 #[inline(never)]
-fn insn_noop(state: &mut State) {
-    dispatch!(state);
+fn insn_noop(pc: usize, value: &mut i32, tape: &[OpCode], handlers: *const ()) {
+    dispatch!(pc, value, tape, handlers);
 }
 
 #[inline(never)]
-fn insn_incr(state: &mut State) {
-    state.value += 1;
-    dispatch!(state);
+fn insn_incr(pc: usize, value: &mut i32, tape: &[OpCode], handlers: *const ()) {
+    *value += 1;
+    dispatch!(pc, value, tape, handlers);
 }
 
 #[inline(never)]
-fn run(state: &mut State) {
-    dispatch!(state, start);
+fn run(tape: &[OpCode], value: &mut i32) {
+    #[inline(never)]
+    fn start(pc: usize, value: &mut i32, tape: &[OpCode], handlers: *const ()) {
+        dispatch!(pc, value, tape, handlers, start);
+    }
+
+    let handlers = HANDLERS.as_ptr() as *const ();
+    start(0, value, tape, handlers);
 }
 
 fn main() {
@@ -69,13 +70,7 @@ fn main() {
 
     tape.push(OpCode::Stop);
 
-    let mut state = State {
-        pc: 0,
-        value: 0,
-        tape,
-        handlers: HANDLERS,
-    };
-
-    run(&mut state);
-    println!("value: {}", state.value);
+    let mut value = 0;
+    run(&tape, &mut value);
+    println!("value: {}", value);
 }
