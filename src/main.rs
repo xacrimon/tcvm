@@ -32,26 +32,40 @@ macro_rules! dispatch {
     }};
 }
 
-fn insn_stop(state: &mut State) {
+#[inline(never)]
+fn insn_stop(_state: &mut State) {
     return;
 }
 
+#[inline(never)]
 fn insn_noop(state: &mut State) {
     dispatch!(state, false);
 }
 
+#[inline(never)]
 fn insn_incr(state: &mut State) {
     state.value += 1;
     dispatch!(state, false);
 }
 
+#[inline(never)]
+fn run(state: &mut State) {
+    dispatch!(state, true);
+}
+
 fn main() {
-    let tape = vec![
+    let mut tape = vec![
         OpCode::Incr,
         OpCode::NoOp,
         OpCode::Incr,
-        OpCode::Stop,
+        OpCode::NoOp,
     ];
+
+    for _ in 0..100 {
+        tape.push(OpCode::Incr);
+    }
+
+    tape.push(OpCode::Stop);
 
     let mut state = State {
         pc: 0,
@@ -59,6 +73,6 @@ fn main() {
         value: 0,
     };
 
-    dispatch!(&mut state, true);
+    run(&mut state);
     println!("value: {}", state.value);
 }
