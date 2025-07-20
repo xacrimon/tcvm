@@ -34,25 +34,20 @@ macro_rules! dispatch {
     }};
 }
 
-#[inline(never)]
 fn insn_stop(_pc: usize, _value: &mut i32, _tape: &[OpCode], _handlers: *const ()) {
     return;
 }
 
-#[inline(never)]
 fn insn_noop(pc: usize, value: &mut i32, tape: &[OpCode], handlers: *const ()) {
     dispatch!(pc, value, tape, handlers);
 }
 
-#[inline(never)]
 fn insn_incr(pc: usize, value: &mut i32, tape: &[OpCode], handlers: *const ()) {
     *value += 1;
     dispatch!(pc, value, tape, handlers);
 }
 
-#[inline(never)]
 fn run(tape: &[OpCode], value: &mut i32) {
-    #[inline(never)]
     fn start(pc: usize, value: &mut i32, tape: &[OpCode], handlers: *const ()) {
         dispatch!(pc, value, tape, handlers, start);
     }
