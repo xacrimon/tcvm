@@ -23,6 +23,14 @@ const HANDLERS: [Handler; 3] = [
 ];
 
 macro_rules! dispatch {
+    ($state:expr) => {{
+        dispatch!($state, false);
+    }};
+
+    ($state:expr, start) => {{
+        dispatch!($state, true);
+    }};
+
     ($state:expr, $start:expr) => {{
         if !$start {
             $state.pc += 1;
@@ -42,18 +50,18 @@ fn insn_stop(_state: &mut State) {
 
 #[inline(never)]
 fn insn_noop(state: &mut State) {
-    dispatch!(state, false);
+    dispatch!(state);
 }
 
 #[inline(never)]
 fn insn_incr(state: &mut State) {
     state.value += 1;
-    dispatch!(state, false);
+    dispatch!(state);
 }
 
 #[inline(never)]
 fn run(state: &mut State) {
-    dispatch!(state, true);
+    dispatch!(state, start);
 }
 
 fn main() {
