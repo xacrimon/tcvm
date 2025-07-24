@@ -7,3 +7,4 @@ edition = "2024"
 bumpalo = { version = "3.19.0", features = ["allocator_api"] }
 gc-arena = "0.5.3"
 paste = "1.0.15"
+foldhash = "0.1.5"
