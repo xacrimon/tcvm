@@ -54,7 +54,8 @@ macro_rules! helpers {
                     let pos = instruction.discriminant() as usize;
                     debug_assert!(pos < HANDLERS.len());
                     let handler = $$handlers.cast::<Handler>().add(pos).read();
-                    return handler(instruction, $$thread, $$registers, $$ip.add(1), $$handlers); // TODO: use become
+                    let ip = $$ip.add(1);
+                    return handler(instruction, $$thread, $$registers, ip, $$handlers); // TODO: use become
                 }
             }};
         }
