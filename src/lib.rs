@@ -6,4 +6,3 @@
 mod instruction;
 mod interp;
 mod value;
-mod value2;
