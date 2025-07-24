@@ -1,7 +1,7 @@
 #![allow(incomplete_features)]
 #![feature(explicit_tail_calls)]
 #![feature(macro_metavar_expr)]
-#![feature(try_blocks)]
+#![feature(likely_unlikely)]
 
 mod instruction;
 mod interp;

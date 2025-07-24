@@ -14,6 +14,7 @@ enum Repr {
     Table(*const ()),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ValueType {
     Nil = 0,
