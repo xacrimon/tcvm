@@ -63,6 +63,7 @@ macro_rules! type_methods {
 }
 
 #[derive(Clone, Copy)]
+#[repr(transparent)]
 pub struct Value(Repr);
 
 impl Value {
