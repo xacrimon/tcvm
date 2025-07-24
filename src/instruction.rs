@@ -4,15 +4,13 @@ type ConstantIndex = u16;
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum Instruction {
-    MOVE,
-    LOADI,
-    LOADF,
-    LOADK,
-    LOADKX,
-    LOADFALSE,
-    LFALSESKIP,
-    LOADTRUE,
-    LOADNIL,
+    MOVE { dst: Register, src: Register },
+    LOADI { dst: Register, imm: i32 },
+    LOADK { dst: Register, idx: ConstantIndex },
+    LOADFALSE { dst: Register },
+    LFALSESKIP { src: Register },
+    LOADTRUE { dst: Register },
+    LOADNIL { start: Register, end: Register },
 
     GETUPVAL,
     SETUPVAL,

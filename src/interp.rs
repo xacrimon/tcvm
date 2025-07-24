@@ -6,9 +6,7 @@ use crate::value::{Value, ValueType};
 const HANDLERS: &[Handler] = &[
     op_move,
     op_loadi,
-    op_loadf,
     op_loadk,
-    op_loadkx,
     op_loadfalse,
     op_lfalseskip,
     op_loadtrue,
@@ -192,21 +190,9 @@ macro_rules! helpers {
 
 #[inline(never)]
 pub fn run(tape: &[Instruction], thread: &mut Thread) {
-    #[inline(never)]
-    fn start(
-        instruction: Instruction,
-        thread: &mut Thread,
-        registers: &mut [Value],
-        ip: *const Instruction,
-        handlers: *const (),
-    ) -> Result<(), Box<Error>> {
-        helpers!(instruction, thread, registers, ip, handlers);
-        dispatch!();
-    }
-
     let ip = tape.as_ptr();
     let handlers = HANDLERS.as_ptr() as *const ();
-    start(Instruction::NOP, thread, &mut [], ip, handlers).unwrap();
+    op_nop(Instruction::NOP, thread, &mut [], ip, handlers).unwrap();
 }
 
 #[inline(never)]
@@ -234,31 +220,7 @@ fn op_loadi(
 }
 
 #[inline(never)]
-fn op_loadf(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
 fn op_loadk(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_loadkx(
     instruction: Instruction,
     thread: &mut Thread,
     registers: &mut [Value],
