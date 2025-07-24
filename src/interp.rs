@@ -12,7 +12,6 @@ struct Error {
 }
 
 pub struct Thread {
-    state: (),
     tape: Vec<Instruction>,
 }
 
@@ -20,7 +19,7 @@ type Handler = fn(
     instruction: Instruction,
     thread: &mut Thread,
     registers: &mut [Value],
-    tape: *const Instruction,
+    ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>>;
 
@@ -31,31 +30,31 @@ fn impl_error(
     _instruction: Instruction,
     thread: &mut Thread,
     _registers: &mut [Value],
-    tape: *const Instruction,
+    ip: *const Instruction,
     _handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    let pc = unsafe { tape.offset_from_unsigned(thread.tape.as_ptr()) };
+    let pc = unsafe { ip.offset_from_unsigned(thread.tape.as_ptr()) };
     let caller = panic::Location::caller();
     let error = Error { pc, caller };
     Err(Box::new(error))
 }
 
 macro_rules! helpers {
-    ($instruction:expr, $thread:expr, $registers:expr, $tape:expr, $handlers:expr) => {
+    ($instruction:expr, $thread:expr, $registers:expr, $ip:expr, $handlers:expr) => {
         macro_rules! dispatch {
             () => {{
-                dispatch!($instruction, $thread, $registers, $tape, $handlers, impl);
+                dispatch!(@impl: $instruction, $thread, $registers, $ip, $handlers);
             }};
 
-            ($$instruction:expr, $$thread:expr, $$registers:expr, $$tape:expr, $$handlers:expr, impl) => {{
+            (@impl: $$instruction:expr, $$thread:expr, $$registers:expr, $$ip:expr, $$handlers:expr) => {{
                 unsafe {
                     let _ = $$instruction;
-                    debug_assert!($$tape.offset_from_unsigned($$thread.tape.as_ptr()) < $$thread.tape.len());
-                    let instruction = *$$tape;
+                    debug_assert!($$ip.offset_from_unsigned($$thread.tape.as_ptr()) < $$thread.tape.len());
+                    let instruction = *$$ip;
                     let pos = instruction.discriminant() as usize;
                     debug_assert!(pos < HANDLERS.len());
                     let handler = $$handlers.cast::<Handler>().add(pos).read();
-                    return handler(instruction, $$thread, $$registers, $$tape.add(1), $$handlers); // TODO: use become
+                    return handler(instruction, $$thread, $$registers, $$ip.add(1), $$handlers); // TODO: use become
                 }
             }};
         }
@@ -76,7 +75,7 @@ macro_rules! helpers {
 
         macro_rules! raise {
             () => {{
-                return impl_error($instruction, $thread, $registers, $tape, $handlers); // TODO: use become
+                return impl_error($instruction, $thread, $registers, $ip, $handlers); // TODO: use become
             }};
         }
 
@@ -122,16 +121,16 @@ pub fn run(tape: &[Instruction], thread: &mut Thread) {
         instruction: Instruction,
         thread: &mut Thread,
         registers: &mut [Value],
-        tape: *const Instruction,
+        ip: *const Instruction,
         handlers: *const (),
     ) -> Result<(), Box<Error>> {
-        helpers!(instruction, thread, registers, tape, handlers);
+        helpers!(instruction, thread, registers, ip, handlers);
         dispatch!();
     }
 
-    let tape = tape.as_ptr();
+    let ip = tape.as_ptr();
     let handlers = HANDLERS.as_ptr() as *const ();
-    start(Instruction::Nop, thread, &mut [], tape, handlers).unwrap();
+    start(Instruction::Nop, thread, &mut [], ip, handlers).unwrap();
 }
 
 #[inline(never)]
@@ -139,35 +138,33 @@ fn op_stop(
     _instruction: Instruction,
     _thread: &mut Thread,
     _registers: &mut [Value],
-    _tape: *const Instruction,
+    ip: *const Instruction,
     _handlers: *const (),
 ) -> Result<(), Box<Error>> {
     Ok(())
 }
 
-#[unsafe(no_mangle)]
 #[inline(never)]
-pub fn op_noop(
+fn op_noop(
     instruction: Instruction,
     thread: &mut Thread,
     registers: &mut [Value],
-    tape: *const Instruction,
+    ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, tape, handlers);
+    helpers!(instruction, thread, registers, ip, handlers);
     dispatch!();
 }
 
-#[unsafe(no_mangle)]
 #[inline(never)]
-pub fn op_add(
+fn op_add(
     instruction: Instruction,
     thread: &mut Thread,
     registers: &mut [Value],
-    tape: *const Instruction,
+    ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, tape, handlers);
+    helpers!(instruction, thread, registers, ip, handlers);
     let (out, lhs, rhs) = args!(Instruction::Add { out, lhs, rhs });
 
     let (lhs, rhs) = (reg!(lhs), reg!(rhs));
@@ -184,9 +181,9 @@ fn op_load(
     instruction: Instruction,
     thread: &mut Thread,
     registers: &mut [Value],
-    tape: *const Instruction,
+    ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, tape, handlers);
+    helpers!(instruction, thread, registers, ip, handlers);
     dispatch!();
 }
