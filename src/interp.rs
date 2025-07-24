@@ -135,7 +135,7 @@ macro_rules! helpers {
                     let instruction = *$$ip;
                     let pos = instruction.discriminant() as usize;
                     debug_assert!(pos < HANDLERS.len());
-                    let handler = $$handlers.cast::<Handler>().add(pos).read();
+                    let handler = *$$handlers.cast::<Handler>().add(pos);
                     let ip = $$ip.add(1);
                     return handler(instruction, $$thread, $$registers, ip, $$handlers); // TODO: use become
                 }
@@ -175,13 +175,6 @@ macro_rules! helpers {
                 unsafe {
                     debug_assert!(($$idx as usize) < $registers.len());
                     *$registers.get_unchecked($$idx as usize)
-                }
-            }};
-
-            (mut $$idx:expr) => {{
-                unsafe {
-                    debug_assert!(($$idx as usize) < $registers.len());
-                    $registers.get_unchecked_mut($$idx as usize)
                 }
             }};
         }
