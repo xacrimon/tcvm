@@ -44,11 +44,6 @@ macro_rules! helpers {
     ($instruction:expr, $thread:expr, $registers:expr, $tape:expr, $handlers:expr) => {
         macro_rules! dispatch {
             () => {{
-                let tape = unsafe { $tape.add(1) };
-                dispatch!($instruction, $thread, $registers, tape, $handlers, impl);
-            }};
-
-            (start) => {{
                 dispatch!($instruction, $thread, $registers, $tape, $handlers, impl);
             }};
 
@@ -60,7 +55,7 @@ macro_rules! helpers {
                     let pos = instruction.discriminant() as usize;
                     debug_assert!(pos < HANDLERS.len());
                     let handler = $$handlers.cast::<Handler>().add(pos).read();
-                    return handler(instruction, $$thread, $$registers, $$tape, $$handlers); // TODO: use become
+                    return handler(instruction, $$thread, $$registers, $$tape.add(1), $$handlers); // TODO: use become
                 }
             }};
         }
@@ -131,7 +126,7 @@ pub fn run(tape: &[Instruction], thread: &mut Thread) {
         handlers: *const (),
     ) -> Result<(), Box<Error>> {
         helpers!(instruction, thread, registers, tape, handlers);
-        dispatch!(start);
+        dispatch!();
     }
 
     let tape = tape.as_ptr();
