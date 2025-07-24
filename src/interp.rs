@@ -177,6 +177,13 @@ macro_rules! helpers {
                     *$registers.get_unchecked($$idx as usize)
                 }
             }};
+
+            (mut $$idx:expr) => {{
+                unsafe {
+                    debug_assert!(($$idx as usize) < $registers.len());
+                    $registers.get_unchecked_mut($$idx as usize)
+                }
+            }};
         }
     };
 }
@@ -197,6 +204,8 @@ fn op_move(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let (dst, src) = args!(Instruction::MOVE { dst, src });
+    *reg!(mut dst) = reg!(src);
     dispatch!();
 }
 
@@ -209,6 +218,8 @@ fn op_loadi(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let (dst, imm) = args!(Instruction::LOADI { dst, imm });
+    *reg!(mut dst) = Value::new_integer(imm as i64);
     dispatch!();
 }
 
