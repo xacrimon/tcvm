@@ -137,7 +137,7 @@ macro_rules! helpers {
                     debug_assert!(pos < HANDLERS.len());
                     let handler = *$$handlers.cast::<Handler>().add(pos);
                     let ip = $$ip.add(1);
-                    return handler(instruction, $$thread, $$registers, ip, $$handlers); // TODO: use become
+                    become handler(instruction, $$thread, $$registers, ip, $$handlers); // TODO: use become
                 }
             }};
         }
