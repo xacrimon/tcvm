@@ -90,7 +90,6 @@ const HANDLERS: &[Handler] = &[
 #[derive(Debug)]
 struct Error {
     pc: usize,
-    caller: &'static panic::Location<'static>,
 }
 
 pub struct Thread {
@@ -105,7 +104,6 @@ type Handler = fn(
     handlers: *const (),
 ) -> Result<(), Box<Error>>;
 
-#[track_caller]
 #[cold]
 #[inline(never)]
 fn impl_error(
@@ -116,8 +114,7 @@ fn impl_error(
     _handlers: *const (),
 ) -> Result<(), Box<Error>> {
     let pc = unsafe { ip.offset_from_unsigned(thread.tape.as_ptr()) };
-    let caller = panic::Location::caller();
-    let error = Error { pc, caller };
+    let error = Error { pc };
     Err(Box::new(error))
 }
 
@@ -137,7 +134,7 @@ macro_rules! helpers {
                     debug_assert!(pos < HANDLERS.len());
                     let handler = *$$handlers.cast::<Handler>().add(pos);
                     let ip = $$ip.add(1);
-                    become handler(instruction, $$thread, $$registers, ip, $$handlers); // TODO: use become
+                    become handler(instruction, $$thread, $$registers, ip, $$handlers);
                 }
             }};
         }
@@ -158,7 +155,7 @@ macro_rules! helpers {
 
         macro_rules! raise {
             () => {{
-                return impl_error($instruction, $thread, $registers, $ip, $handlers); // TODO: use become
+                become impl_error($instruction, $thread, $registers, $ip, $handlers);
             }};
         }
 
