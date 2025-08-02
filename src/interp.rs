@@ -177,7 +177,6 @@ pub fn run(tape: &[Instruction], thread: &mut Thread) {
     op_nop(Instruction::NOP, thread, &mut [], ip, handlers).unwrap();
 }
 
-
 #[cold]
 #[inline(never)]
 fn impl_error(
