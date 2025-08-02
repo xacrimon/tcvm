@@ -39,63 +39,6 @@ pub enum Instruction {
 
     SELF,
 
-    ADDI,
-
-    ADDK {
-        dst: Register,
-        lhs: Register,
-        rhs: ConstantIndex,
-    },
-    SUBK {
-        dst: Register,
-        lhs: Register,
-        rhs: ConstantIndex,
-    },
-    MULK {
-        dst: Register,
-        lhs: Register,
-        rhs: ConstantIndex,
-    },
-    MODK {
-        dst: Register,
-        lhs: Register,
-        rhs: ConstantIndex,
-    },
-    POWK {
-        dst: Register,
-        lhs: Register,
-        rhs: ConstantIndex,
-    },
-    DIVK {
-        dst: Register,
-        lhs: Register,
-        rhs: ConstantIndex,
-    },
-    IDIVK {
-        dst: Register,
-        lhs: Register,
-        rhs: ConstantIndex,
-    },
-
-    BANDK {
-        dst: Register,
-        lhs: Register,
-        rhs: ConstantIndex,
-    },
-    BORK {
-        dst: Register,
-        lhs: Register,
-        rhs: ConstantIndex,
-    },
-    BXORK {
-        dst: Register,
-        lhs: Register,
-        rhs: ConstantIndex,
-    },
-
-    SHRI,
-    SHLI,
-
     ADD {
         dst: Register,
         lhs: Register,
@@ -194,13 +137,6 @@ pub enum Instruction {
     EQ,
     LT,
     LE,
-
-    EQK,
-    EQI,
-    LTI,
-    LEI,
-    GTI,
-    GEI,
 
     TEST,
     TESTSET,
