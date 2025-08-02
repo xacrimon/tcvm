@@ -9,7 +9,7 @@ pub enum Instruction {
         dst: Register,
         src: Register,
     },
-    LOADK {
+    LOAD {
         dst: Register,
         idx: ConstantIndex,
     },
