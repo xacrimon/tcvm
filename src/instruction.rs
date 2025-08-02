@@ -4,6 +4,7 @@ type ConstantIndex = u16;
 
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
+#[repr(align(8))]
 pub enum Instruction {
     MOVE {
         dst: Register,
