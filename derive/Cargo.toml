@@ -1,5 +1,5 @@
 [package]
-name = "derive"
+name = "tcvm-derive"
 description = "TBD"
 version.workspace = true
 authors.workspace = true
