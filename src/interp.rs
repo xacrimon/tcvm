@@ -5,12 +5,8 @@ use crate::value::{Value, ValueType};
 
 const HANDLERS: &[Handler] = &[
     op_move,
-    op_loadi,
     op_loadk,
-    op_loadfalse,
     op_lfalseskip,
-    op_loadtrue,
-    op_loadnil,
     op_getupval,
     op_setupval,
     op_gettabup,
@@ -206,20 +202,6 @@ fn op_move(
 }
 
 #[inline(never)]
-fn op_loadi(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    let (dst, imm) = args!(Instruction::LOADI { dst, imm });
-    *reg!(mut dst) = Value::new_integer(imm as i64);
-    dispatch!();
-}
-
-#[inline(never)]
 fn op_loadk(
     instruction: Instruction,
     thread: &mut Thread,
@@ -232,43 +214,7 @@ fn op_loadk(
 }
 
 #[inline(never)]
-fn op_loadfalse(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
 fn op_lfalseskip(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_loadtrue(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_loadnil(
     instruction: Instruction,
     thread: &mut Thread,
     registers: &mut [Value],

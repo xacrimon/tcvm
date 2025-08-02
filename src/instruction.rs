@@ -9,26 +9,12 @@ pub enum Instruction {
         dst: Register,
         src: Register,
     },
-    LOADI {
-        dst: Register,
-        imm: i32,
-    },
     LOADK {
         dst: Register,
         idx: ConstantIndex,
     },
-    LOADFALSE {
-        dst: Register,
-    },
     LFALSESKIP {
         src: Register,
-    },
-    LOADTRUE {
-        dst: Register,
-    },
-    LOADNIL {
-        start: Register,
-        end: Register,
     },
     GETUPVAL {
         dst: Register,
