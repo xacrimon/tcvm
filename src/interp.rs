@@ -19,19 +19,6 @@ const HANDLERS: &[Handler] = &[
     op_setfield,
     op_newtable,
     op_self,
-    op_addi,
-    op_addk,
-    op_subk,
-    op_mulk,
-    op_modk,
-    op_powk,
-    op_divk,
-    op_idivk,
-    op_bandk,
-    op_bork,
-    op_bxork,
-    op_shri,
-    op_shli,
     op_add,
     op_sub,
     op_mul,
@@ -58,12 +45,6 @@ const HANDLERS: &[Handler] = &[
     op_eq,
     op_lt,
     op_le,
-    op_eqk,
-    op_eqi,
-    op_lti,
-    op_lei,
-    op_gti,
-    op_gei,
     op_test,
     op_testset,
     op_call,
@@ -370,162 +351,6 @@ fn op_self(
 }
 
 #[inline(never)]
-fn op_addi(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_addk(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_subk(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_mulk(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_modk(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_powk(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_divk(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_idivk(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_bandk(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_bork(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_bxork(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_shri(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_shli(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
 fn op_add(
     instruction: Instruction,
     thread: &mut Thread,
@@ -599,18 +424,6 @@ fn op_div(
 
 #[inline(never)]
 fn op_idiv(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_(
     instruction: Instruction,
     thread: &mut Thread,
     registers: &mut [Value],
@@ -839,78 +652,6 @@ fn op_lt(
 
 #[inline(never)]
 fn op_le(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_eqk(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_eqi(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_lti(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_lei(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_gti(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_gei(
     instruction: Instruction,
     thread: &mut Thread,
     registers: &mut [Value],
