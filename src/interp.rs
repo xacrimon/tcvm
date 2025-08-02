@@ -104,20 +104,6 @@ type Handler = fn(
     handlers: *const (),
 ) -> Result<(), Box<Error>>;
 
-#[cold]
-#[inline(never)]
-fn impl_error(
-    _instruction: Instruction,
-    thread: &mut Thread,
-    _registers: &mut [Value],
-    ip: *const Instruction,
-    _handlers: *const (),
-) -> Result<(), Box<Error>> {
-    let pc = unsafe { ip.offset_from_unsigned(thread.tape.as_ptr()) };
-    let error = Error { pc };
-    Err(Box::new(error))
-}
-
 macro_rules! helpers {
     ($instruction:expr, $thread:expr, $registers:expr, $ip:expr, $handlers:expr) => {
         macro_rules! dispatch {
@@ -185,11 +171,25 @@ macro_rules! helpers {
     };
 }
 
-#[inline(never)]
 pub fn run(tape: &[Instruction], thread: &mut Thread) {
     let ip = tape.as_ptr();
     let handlers = HANDLERS.as_ptr() as *const ();
     op_nop(Instruction::NOP, thread, &mut [], ip, handlers).unwrap();
+}
+
+
+#[cold]
+#[inline(never)]
+fn impl_error(
+    _instruction: Instruction,
+    thread: &mut Thread,
+    _registers: &mut [Value],
+    ip: *const Instruction,
+    _handlers: *const (),
+) -> Result<(), Box<Error>> {
+    let pc = unsafe { ip.offset_from_unsigned(thread.tape.as_ptr()) };
+    let error = Error { pc };
+    Err(Box::new(error))
 }
 
 #[inline(never)]
