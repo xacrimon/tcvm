@@ -5,7 +5,7 @@ use crate::value::{Value, ValueType};
 
 const HANDLERS: &[Handler] = &[
     op_move,
-    op_loadk,
+    op_load,
     op_lfalseskip,
     op_getupval,
     op_setupval,
@@ -183,7 +183,7 @@ fn op_move(
 }
 
 #[inline(never)]
-fn op_loadk(
+fn op_load(
     instruction: Instruction,
     thread: &mut Thread,
     registers: &mut [Value],
