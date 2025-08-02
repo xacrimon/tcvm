@@ -3,16 +3,6 @@
 version = 4
 
 [[package]]
-name = "derive"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
- "synstructure",
-]
-
-[[package]]
 name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -77,6 +67,17 @@ dependencies = [
  "foldhash",
  "hashbrown",
  "paste",
+ "tcvm-derive",
+]
+
+[[package]]
+name = "tcvm-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+ "synstructure",
 ]
 
 [[package]]
