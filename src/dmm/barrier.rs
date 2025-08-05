@@ -12,7 +12,7 @@ use std::vec::Vec;
 use std::{collections::HashMap, hash::BuildHasher, hash::Hash};
 
 #[cfg(doc)]
-use crate::Gc;
+use crate::dmm::Gc;
 #[cfg(doc)]
 use core::ops::IndexMut;
 
