@@ -1,12 +1,12 @@
-use alloc::{boxed::Box, vec::Vec};
 use core::{
     cell::{Cell, UnsafeCell},
     mem,
     ops::{ControlFlow, Deref, DerefMut},
     ptr::NonNull,
 };
+use std::{boxed::Box, vec::Vec};
 
-use crate::{
+use crate::dmm::{
     Gc, GcWeak,
     collect::{Collect, Trace},
     metrics::Metrics,
@@ -166,8 +166,6 @@ pub(crate) enum Stop {
 pub(crate) struct Context {
     metrics: Metrics,
     phase: Phase,
-    #[cfg(feature = "tracing")]
-    phase_span: tracing::Span,
 
     // A linked list of all allocated `GcBox`es.
     all: Cell<Option<GcBox>>,
@@ -233,8 +231,6 @@ impl Context {
         let metrics = Metrics::new();
         Context {
             phase: Phase::Sleep,
-            #[cfg(feature = "tracing")]
-            phase_span: PhaseGuard::span_for(&metrics, Phase::Sleep),
             metrics: metrics.clone(),
             all: Cell::new(None),
             sweep: None,
@@ -719,18 +715,10 @@ impl Context {
 /// Helper type for managing phase transitions.
 struct PhaseGuard<'a> {
     cx: &'a mut Context,
-    #[cfg(feature = "tracing")]
-    span: tracing::span::EnteredSpan,
 }
 
 impl<'a> Drop for PhaseGuard<'a> {
-    fn drop(&mut self) {
-        #[cfg(feature = "tracing")]
-        {
-            let span = mem::replace(&mut self.span, tracing::Span::none().entered());
-            self.cx.phase_span = span.exit();
-        }
-    }
+    fn drop(&mut self) {}
 }
 
 impl<'a> Deref for PhaseGuard<'a> {
@@ -755,50 +743,14 @@ impl<'a> PhaseGuard<'a> {
             cx.phase = phase;
         }
 
-        Self {
-            #[cfg(feature = "tracing")]
-            span: {
-                let mut span = mem::replace(&mut cx.phase_span, tracing::Span::none());
-                if let Some(phase) = phase {
-                    span = Self::span_for(&cx.metrics, phase);
-                }
-                span.entered()
-            },
-            cx,
-        }
+        Self { cx }
     }
 
     fn switch(&mut self, phase: Phase) {
         self.cx.phase = phase;
-
-        #[cfg(feature = "tracing")]
-        {
-            let _ = mem::replace(&mut self.span, tracing::Span::none().entered());
-            self.span = Self::span_for(&self.cx.metrics, phase).entered();
-        }
     }
 
-    fn log_progress(&mut self, #[allow(unused)] message: &str) {
-        // TODO: add more infos here
-        #[cfg(feature = "tracing")]
-        tracing::debug!(
-            target: "gc_arena",
-            parent: &self.span,
-            message,
-            phase = tracing::field::debug(self.cx.phase),
-            allocated = self.cx.metrics.total_allocation(),
-        );
-    }
-
-    #[cfg(feature = "tracing")]
-    fn span_for(metrics: &Metrics, phase: Phase) -> tracing::Span {
-        tracing::debug_span!(
-            target: "gc_arena",
-            "gc_arena",
-            id = metrics.arena_id(),
-            ?phase,
-        )
-    }
+    fn log_progress(&mut self, #[allow(unused)] message: &str) {}
 }
 
 // A shared, internally mutable `Vec<T>` that avoids the overhead of `RefCell`. Used for the "gray"

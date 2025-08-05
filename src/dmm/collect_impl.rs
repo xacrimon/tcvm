@@ -1,14 +1,13 @@
-use alloc::boxed::Box;
-use alloc::collections::{BTreeMap, BTreeSet, BinaryHeap, LinkedList, VecDeque};
-use alloc::rc::Rc;
-use alloc::string::String;
-use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 use core::marker::PhantomData;
-#[cfg(feature = "std")]
+use std::boxed::Box;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, LinkedList, VecDeque};
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+use std::string::String;
+use std::vec::Vec;
 
-use crate::collect::{Collect, Trace};
+use crate::dmm::collect::{Collect, Trace};
 
 /// If a type is static, we know that it can never hold `Gc` pointers, so it is safe to provide a
 /// simple empty `Collect` implementation.
@@ -40,16 +39,12 @@ static_collect!(f32);
 static_collect!(f64);
 static_collect!(String);
 static_collect!(str);
-static_collect!(alloc::ffi::CString);
+static_collect!(std::ffi::CString);
 static_collect!(core::ffi::CStr);
 static_collect!(core::any::TypeId);
-#[cfg(feature = "std")]
 static_collect!(std::path::Path);
-#[cfg(feature = "std")]
 static_collect!(std::path::PathBuf);
-#[cfg(feature = "std")]
 static_collect!(std::ffi::OsStr);
-#[cfg(feature = "std")]
 static_collect!(std::ffi::OsString);
 
 /// SAFETY: We know that a `&'static` reference cannot possibly point to `'gc` data, so it is safe
@@ -158,7 +153,6 @@ unsafe impl<'gc, T: Collect<'gc>> Collect<'gc> for LinkedList<T> {
     }
 }
 
-#[cfg(feature = "std")]
 unsafe impl<'gc, K, V, S> Collect<'gc> for HashMap<K, V, S>
 where
     K: Collect<'gc>,
@@ -176,7 +170,6 @@ where
     }
 }
 
-#[cfg(feature = "std")]
 unsafe impl<'gc, T, S> Collect<'gc> for HashSet<T, S>
 where
     T: Collect<'gc>,
@@ -249,7 +242,7 @@ where
 }
 
 #[cfg(target_has_atomic = "ptr")]
-unsafe impl<'gc, T> Collect<'gc> for alloc::sync::Arc<T>
+unsafe impl<'gc, T> Collect<'gc> for std::sync::Arc<T>
 where
     T: ?Sized + Collect<'gc>,
 {

@@ -1,11 +1,11 @@
 use core::{alloc::Layout, marker::PhantomData, ops::Index, ptr::NonNull};
 
-use allocator_api2::{
+use std::{
     alloc::{AllocError, Allocator, Global},
     boxed, vec,
 };
 
-use crate::{
+use crate::dmm::{
     barrier::{DerefWrite, IndexWrite},
     collect::{Collect, Trace},
     context::Mutation,
@@ -127,40 +127,4 @@ unsafe impl<'gc, A: 'static> Collect<'gc> for MetricsAlloc<'gc, A> {
 
 unsafe impl<'gc> Collect<'gc> for Global {
     const NEEDS_TRACE: bool = false;
-}
-
-unsafe impl<'gc, T, A> Collect<'gc> for boxed::Box<T, A>
-where
-    T: Collect<'gc> + ?Sized,
-    A: Collect<'gc> + Allocator,
-{
-    const NEEDS_TRACE: bool = T::NEEDS_TRACE || A::NEEDS_TRACE;
-
-    #[inline]
-    fn trace<C: Trace<'gc>>(&self, cc: &mut C) {
-        cc.trace(&**self);
-        cc.trace(boxed::Box::allocator(self));
-    }
-}
-
-unsafe impl<T: ?Sized, A: Allocator> DerefWrite for boxed::Box<T, A> {}
-
-unsafe impl<'gc, T: Collect<'gc>, A: Collect<'gc> + Allocator> Collect<'gc> for vec::Vec<T, A> {
-    const NEEDS_TRACE: bool = T::NEEDS_TRACE || A::NEEDS_TRACE;
-
-    #[inline]
-    fn trace<C: Trace<'gc>>(&self, cc: &mut C) {
-        for v in self {
-            cc.trace(v);
-        }
-        cc.trace(self.allocator());
-    }
-}
-
-unsafe impl<T, A: Allocator> DerefWrite for vec::Vec<T, A> {}
-unsafe impl<T, A: Allocator, I> IndexWrite<I> for vec::Vec<T, A>
-where
-    [T]: IndexWrite<I>,
-    Self: Index<I>,
-{
 }

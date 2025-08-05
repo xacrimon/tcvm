@@ -1,5 +1,5 @@
-use alloc::rc::Rc;
 use core::cell::Cell;
+use std::rc::Rc;
 
 /// Tuning parameters for a given garbage collected [`crate::Arena`].
 ///
@@ -216,14 +216,6 @@ pub struct Metrics(Rc<MetricsInner>);
 impl Metrics {
     pub(crate) fn new() -> Self {
         Self(Default::default())
-    }
-
-    /// Return a value identifying the arena, for logging purposes.
-    #[cfg(feature = "tracing")]
-    pub(crate) fn arena_id(&self) -> tracing::field::DebugValue<*const ()> {
-        // Be very cheeky and use the `Metrics` address as a (temporally) unique ID.
-        // TODO: use a monotonically increasing global counter instead?
-        tracing::field::debug(Rc::as_ptr(&self.0) as *const ())
     }
 
     /// Sets the pacing parameters used by the collection algorithm.

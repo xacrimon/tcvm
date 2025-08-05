@@ -4,7 +4,7 @@ use core::marker::PhantomData;
 use core::ptr::NonNull;
 use core::{mem, ptr};
 
-use crate::{collect::Collect, context::Context};
+use crate::dmm::{collect::Collect, context::Context};
 
 /// A thin-pointer-sized box containing a type-erased GC object.
 /// Stores the metadata required by the GC algorithm inline (see `GcBoxInner`
@@ -70,7 +70,7 @@ impl GcBox {
         let layout = self.header().vtable().box_layout;
         let ptr = self.0.as_ptr() as *mut u8;
         // SAFETY: the pointer was `Box`-allocated with this layout.
-        alloc::alloc::dealloc(ptr, layout);
+        std::alloc::dealloc(ptr, layout);
     }
 }
 
