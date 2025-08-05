@@ -4,7 +4,7 @@
 #![feature(likely_unlikely)]
 #![feature(allocator_api)]
 
-mod dmm;
+pub mod dmm;
 mod instruction;
 mod interp;
 mod value;
