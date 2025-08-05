@@ -6,10 +6,9 @@ use core::ops::{
     Deref, DerefMut, Index, Range, RangeFrom, RangeInclusive, RangeTo, RangeToInclusive,
 };
 
-use alloc::collections::{BTreeMap, VecDeque};
-use alloc::vec::Vec;
+use std::collections::{BTreeMap, VecDeque};
+use std::vec::Vec;
 
-#[cfg(feature = "std")]
 use std::{collections::HashMap, hash::BuildHasher, hash::Hash};
 
 #[cfg(doc)]
@@ -162,11 +161,11 @@ pub unsafe trait DerefWrite: Deref {}
 
 // SAFETY: All these types have pure & non-GC-traversing Deref(Mut) impls
 unsafe impl<T: ?Sized> DerefWrite for &T {}
-unsafe impl<T: ?Sized> DerefWrite for alloc::boxed::Box<T> {}
+unsafe impl<T: ?Sized> DerefWrite for std::boxed::Box<T> {}
 unsafe impl<T> DerefWrite for Vec<T> {}
-unsafe impl<T: ?Sized> DerefWrite for alloc::rc::Rc<T> {}
+unsafe impl<T: ?Sized> DerefWrite for std::rc::Rc<T> {}
 #[cfg(target_has_atomic = "ptr")]
-unsafe impl<T: ?Sized> DerefWrite for alloc::sync::Arc<T> {}
+unsafe impl<T: ?Sized> DerefWrite for std::sync::Arc<T> {}
 
 /// Types which preserve write barriers when indexed.
 ///
@@ -202,7 +201,7 @@ where
     Q: Ord + ?Sized,
 {
 }
-#[cfg(feature = "std")]
+
 unsafe impl<K, V, S, Q> IndexWrite<&Q> for HashMap<K, V, S>
 where
     K: Eq + Hash + Borrow<Q>,

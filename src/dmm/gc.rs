@@ -8,7 +8,7 @@ use core::{
     ptr::NonNull,
 };
 
-use crate::{
+use crate::dmm::{
     Finalization,
     barrier::{Unlock, Write},
     collect::{Collect, Trace},

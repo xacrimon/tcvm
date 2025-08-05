@@ -1,8 +1,8 @@
-use crate::Mutation;
-use crate::collect::{Collect, Trace};
-use crate::context::Finalization;
-use crate::gc::Gc;
-use crate::types::GcBox;
+use crate::dmm::Mutation;
+use crate::dmm::collect::{Collect, Trace};
+use crate::dmm::context::Finalization;
+use crate::dmm::gc::Gc;
+use crate::dmm::types::GcBox;
 
 use core::fmt::{self, Debug};
 

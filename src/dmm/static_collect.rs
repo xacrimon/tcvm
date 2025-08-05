@@ -1,9 +1,9 @@
-use crate::Rootable;
-use crate::collect::Collect;
+use crate::dmm::Rootable;
+use crate::dmm::collect::Collect;
 
-use alloc::borrow::{Borrow, BorrowMut};
 use core::convert::{AsMut, AsRef};
 use core::ops::{Deref, DerefMut};
+use std::borrow::{Borrow, BorrowMut};
 
 /// A wrapper type that implements Collect whenever the contained T is 'static, which is useful in
 /// generic contexts

@@ -1,11 +1,11 @@
 use core::{cell::RefCell, fmt, mem};
 
-use alloc::{
+use std::{
     rc::{Rc, Weak},
     vec::Vec,
 };
 
-use crate::{
+use crate::dmm::{
     Gc, Mutation, Rootable,
     arena::Root,
     collect::{Collect, Trace},
@@ -187,7 +187,6 @@ impl fmt::Display for MismatchedRootSet {
     }
 }
 
-#[cfg(feature = "std")]
 impl std::error::Error for MismatchedRootSet {}
 
 struct Inner<'gc> {

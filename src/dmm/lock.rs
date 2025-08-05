@@ -6,7 +6,7 @@ use core::{
     fmt,
 };
 
-use crate::{
+use crate::dmm::{
     Gc, Mutation,
     barrier::Unlock,
     collect::{Collect, Trace},

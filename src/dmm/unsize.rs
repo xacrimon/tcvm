@@ -1,7 +1,7 @@
 use core::marker::PhantomData;
 use core::ptr::NonNull;
 
-use crate::{
+use crate::dmm::{
     types::GcBoxInner,
     {Gc, GcWeak},
 };
