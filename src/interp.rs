@@ -1,7 +1,5 @@
-use std::panic;
-
 use crate::instruction::Instruction;
-use crate::value::{Value, ValueType};
+use crate::value::Value;
 
 const HANDLERS: &[Handler] = &[
     op_move,
