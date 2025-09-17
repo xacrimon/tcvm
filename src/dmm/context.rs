@@ -243,12 +243,12 @@ impl Context {
 
     #[inline]
     pub(crate) unsafe fn mutation_context<'gc>(&self) -> &Mutation<'gc> {
-        mem::transmute::<&Self, &Mutation>(&self)
+        unsafe { mem::transmute::<&Self, &Mutation>(&self) }
     }
 
     #[inline]
     pub(crate) unsafe fn finalization_context<'gc>(&self) -> &Finalization<'gc> {
-        mem::transmute::<&Self, &Finalization>(&self)
+        unsafe { mem::transmute::<&Self, &Finalization>(&self) }
     }
 
     #[inline]
@@ -291,7 +291,6 @@ impl Context {
         let mut cx = PhaseGuard::enter(self, None);
 
         if run_until == RunUntil::PayDebt && !(cx.metrics.allocation_debt() > 0.0) {
-            cx.log_progress("GC: paused");
             return;
         }
 
@@ -335,7 +334,6 @@ impl Context {
                         // We treat a stop condition of `Stop::Finish` as special for the purposes
                         // of logging, and log that we finished a cycle.
                         if stop == Stop::FinishCycle {
-                            cx.log_progress("GC: finished");
                             return;
                         }
 
@@ -357,8 +355,6 @@ impl Context {
                 break;
             }
         }
-
-        cx.log_progress("GC: yielding...");
     }
 
     fn allocate<'gc, T: Collect<'gc>>(&self, t: T) -> NonNull<GcBoxInner<T>> {
@@ -717,10 +713,6 @@ struct PhaseGuard<'a> {
     cx: &'a mut Context,
 }
 
-impl<'a> Drop for PhaseGuard<'a> {
-    fn drop(&mut self) {}
-}
-
 impl<'a> Deref for PhaseGuard<'a> {
     type Target = Context;
 
@@ -749,8 +741,6 @@ impl<'a> PhaseGuard<'a> {
     fn switch(&mut self, phase: Phase) {
         self.cx.phase = phase;
     }
-
-    fn log_progress(&mut self, #[allow(unused)] message: &str) {}
 }
 
 // A shared, internally mutable `Vec<T>` that avoids the overhead of `RefCell`. Used for the "gray"

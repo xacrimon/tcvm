@@ -151,13 +151,15 @@ impl<'gc, T: ?Sized + 'gc> Gc<'gc, T> {
     /// have been collected yet.
     #[inline]
     pub unsafe fn from_ptr(ptr: *const T) -> Gc<'gc, T> {
-        let layout = Layout::new::<GcBoxHeader>();
-        let (_, header_offset) = layout.extend(Layout::for_value(&*ptr)).unwrap();
-        let header_offset = -(header_offset as isize);
-        let ptr = (ptr as *mut T).byte_offset(header_offset) as *mut GcBoxInner<T>;
-        Gc {
-            ptr: NonNull::new_unchecked(ptr),
-            _invariant: PhantomData,
+        unsafe {
+            let layout = Layout::new::<GcBoxHeader>();
+            let (_, header_offset) = layout.extend(Layout::for_value(&*ptr)).unwrap();
+            let header_offset = -(header_offset as isize);
+            let ptr = (ptr as *mut T).byte_offset(header_offset) as *mut GcBoxInner<T>;
+            Gc {
+                ptr: NonNull::new_unchecked(ptr),
+                _invariant: PhantomData,
+            }
         }
     }
 }

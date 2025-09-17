@@ -241,7 +241,6 @@ where
     }
 }
 
-#[cfg(target_has_atomic = "ptr")]
 unsafe impl<'gc, T> Collect<'gc> for std::sync::Arc<T>
 where
     T: ?Sized + Collect<'gc>,
