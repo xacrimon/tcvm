@@ -10,66 +10,90 @@ pub enum Instruction {
         dst: Register,
         src: Register,
     },
+
     LOAD {
         dst: Register,
         idx: ConstantIndex,
     },
+
     LFALSESKIP {
         src: Register,
     },
+
     GETUPVAL {
         dst: Register,
         idx: UpvalueIndex,
     },
+
     SETUPVAL {
         src: Register,
         idx: UpvalueIndex,
     },
 
-    GETTABUP,
-    GETTABLE,
-    GETI,
-    GETFIELD,
+    GETTABUP {
+        dst: Register,
+        idx: UpvalueIndex,
+        key: ConstantIndex,
+    },
 
-    SETTABUP,
-    SETTABLE,
-    SETI,
-    SETFIELD,
+    SETTABUP {
+        src: Register,
+        idx: UpvalueIndex,
+        key: ConstantIndex,
+    },
+    
+    GETTABLE {
+        dst: Register,
+        table: Register,
+        key: Register,
+    },
 
-    NEWTABLE,
+    SETTABLE {
+        src: Register,
+        table: Register,
+        key: Register,
+    },
 
-    SELF,
+    NEWTABLE {
+        dst: Register,
+    },
 
     ADD {
         dst: Register,
         lhs: Register,
         rhs: Register,
     },
+
     SUB {
         dst: Register,
         lhs: Register,
         rhs: Register,
     },
+
     MUL {
         dst: Register,
         lhs: Register,
         rhs: Register,
     },
+
     MOD {
         dst: Register,
         lhs: Register,
         rhs: Register,
     },
+
     POW {
         dst: Register,
         lhs: Register,
         rhs: Register,
     },
+
     DIV {
         dst: Register,
         lhs: Register,
         rhs: Register,
     },
+
     IDIV {
         dst: Register,
         lhs: Register,
@@ -81,43 +105,52 @@ pub enum Instruction {
         lhs: Register,
         rhs: Register,
     },
+
     BOR {
         dst: Register,
         lhs: Register,
         rhs: Register,
     },
+
     BXOR {
         dst: Register,
         lhs: Register,
         rhs: Register,
     },
+
     SHL {
         dst: Register,
         lhs: Register,
         rhs: Register,
     },
+
     SHR {
         dst: Register,
         lhs: Register,
         rhs: Register,
     },
 
-    MMBIN,
-    MMBINI,
-    MMBINK,
+    MMBIN {
+        lhs: Register,
+        rhs: Register,
+        metamethod: MetaMethod,
+    },
 
     UNM {
         dst: Register,
         src: Register,
     },
+
     BNOT {
         dst: Register,
         src: Register,
     },
+
     NOT {
         dst: Register,
         src: Register,
     },
+
     LEN {
         dst: Register,
         src: Register,
@@ -131,38 +164,71 @@ pub enum Instruction {
     CLOSE {
         start: Register,
     },
+
     TBC {
         val: Register,
     },
-    JMP,
-    EQ,
-    LT,
-    LE,
 
-    TEST,
-    TESTSET,
+    JMP {
+        offset: i32,
+    },
 
-    CALL,
-    TAILCALL,
+    EQ {
+        lhs: Register,
+        rhs: Register,
+        inverted: bool,
+    },
 
-    RETURN,
-    RETURN0,
-    RETURN1,
+    LT {
+        lhs: Register,
+        rhs: Register,
+        inverted: bool,
+    },
 
-    FORLOOP,
-    FORPREP,
+    LE {
+        lhs: Register,
+        rhs: Register,
+        inverted: bool,
+    },
 
-    TFORPREP,
-    TFORCALL,
-    TFORLOOP,
+    TEST {
+        src: Register,
+        inverted: bool,
+    },
 
-    SETLIST,
+    CALL {
+        func: Register,
+        args: u8,
+        returns: u8,
+    },
 
-    CLOSURE,
+    TAILCALL {
+        func: Register,
+        args: u8,
+    },
 
-    VARARG,
+    RETURN {
+        values: Register,
+        count: u8,
+    },
 
-    VARARGPREP,
+    FORLOOP {},
+
+    FORPREP {},
+
+    TFORPREP {},
+
+    TFORCALL {},
+
+    TFORLOOP {},
+
+    SETLIST {},
+
+    CLOSURE {},
+
+    VARARG {},
+
+    VARARGPREP {},
 
     NOP,
 
@@ -173,4 +239,33 @@ impl Instruction {
     pub fn discriminant(self) -> u8 {
         unsafe { *<*const _>::from(&self).cast::<u8>() }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum MetaMethod {
+    INDEX,
+    NEWINDEX,
+    GC,
+    MODE,
+    LEN,
+    EQ,
+    ADD,
+    SUB,
+    MUL,
+    MOD,
+    POW,
+    DIV,
+    IDIV,
+    BAND,
+    BOR,
+    BXOR,
+    SHL,
+    SHR,
+    UNM,
+    BNOT,
+    LT,
+    LE,
+    CONCAT,
+    CALL,
+    CLOSE,
 }

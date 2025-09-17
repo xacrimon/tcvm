@@ -8,15 +8,10 @@ const HANDLERS: &[Handler] = &[
     op_getupval,
     op_setupval,
     op_gettabup,
-    op_gettable,
-    op_geti,
-    op_getfield,
     op_settabup,
+    op_gettable,
     op_settable,
-    op_seti,
-    op_setfield,
     op_newtable,
-    op_self,
     op_add,
     op_sub,
     op_mul,
@@ -30,8 +25,6 @@ const HANDLERS: &[Handler] = &[
     op_shl,
     op_shr,
     op_mmbin,
-    op_mmbini,
-    op_mmbink,
     op_unm,
     op_bnot,
     op_not,
@@ -44,12 +37,9 @@ const HANDLERS: &[Handler] = &[
     op_lt,
     op_le,
     op_test,
-    op_testset,
     op_call,
     op_tailcall,
     op_return,
-    op_return0,
-    op_return1,
     op_forloop,
     op_forprep,
     op_tforcall,
@@ -106,9 +96,6 @@ macro_rules! helpers {
                     $$kind { $$($$field),* } => {
                         ( $$($$field),* )
                     },
-                    #[cfg(debug_assertions)]
-                    _ => unreachable!(),
-                    #[cfg(not(debug_assertions))]
                     _ => unsafe { std::hint::unreachable_unchecked() },
                 }
             }};
@@ -146,6 +133,7 @@ macro_rules! helpers {
     };
 }
 
+#[inline(never)]
 pub fn run(tape: &[Instruction], thread: &mut Thread) {
     let ip = tape.as_ptr();
     let handlers = HANDLERS.as_ptr() as *const ();
@@ -189,6 +177,7 @@ fn op_load(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let (dst, idx) = args!(Instruction::LOAD { dst, idx });
     dispatch!();
 }
 
@@ -201,6 +190,7 @@ fn op_lfalseskip(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let src = args!(Instruction::LFALSESKIP { src });
     dispatch!();
 }
 
@@ -213,6 +203,7 @@ fn op_getupval(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let (dst, idx) = args!(Instruction::GETUPVAL { dst, idx });
     dispatch!();
 }
 
@@ -225,6 +216,7 @@ fn op_setupval(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let (src, idx) = args!(Instruction::SETUPVAL { src, idx });
     dispatch!();
 }
 
@@ -237,42 +229,7 @@ fn op_gettabup(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_gettable(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_geti(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_getfield(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    let (dst, idx, key) = args!(Instruction::GETTABUP { dst, idx, key });
     dispatch!();
 }
 
@@ -285,6 +242,20 @@ fn op_settabup(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let (src, idx, key) = args!(Instruction::SETTABUP { src, idx, key });
+    dispatch!();
+}
+
+#[inline(never)]
+fn op_gettable(
+    instruction: Instruction,
+    thread: &mut Thread,
+    registers: &mut [Value],
+    ip: *const Instruction,
+    handlers: *const (),
+) -> Result<(), Box<Error>> {
+    helpers!(instruction, thread, registers, ip, handlers);
+    let (dst, table, key) = args!(Instruction::GETTABLE { dst, table, key });
     dispatch!();
 }
 
@@ -297,30 +268,7 @@ fn op_settable(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_seti(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_setfield(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    let (src, table, key) = args!(Instruction::SETTABLE { src, table, key });
     dispatch!();
 }
 
@@ -333,18 +281,7 @@ fn op_newtable(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_self(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    let dst = args!(Instruction::NEWTABLE { dst });
     dispatch!();
 }
 
@@ -357,6 +294,7 @@ fn op_add(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let (dst, lhs, rhs) = args!(Instruction::ADD { dst, lhs, rhs });
     dispatch!();
 }
 
@@ -369,6 +307,7 @@ fn op_sub(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let (dst, lhs, rhs) = args!(Instruction::SUB { dst, lhs, rhs });
     dispatch!();
 }
 
@@ -381,6 +320,7 @@ fn op_mul(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let (dst, lhs, rhs) = args!(Instruction::MUL { dst, lhs, rhs });
     dispatch!();
 }
 
@@ -393,6 +333,7 @@ fn op_mod(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let (dst, lhs, rhs) = args!(Instruction::MOD { dst, lhs, rhs });
     dispatch!();
 }
 
@@ -405,6 +346,7 @@ fn op_pow(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let (dst, lhs, rhs) = args!(Instruction::POW { dst, lhs, rhs });
     dispatch!();
 }
 
@@ -417,6 +359,7 @@ fn op_div(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let (dst, lhs, rhs) = args!(Instruction::DIV { dst, lhs, rhs });
     dispatch!();
 }
 
@@ -429,6 +372,7 @@ fn op_idiv(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let (dst, lhs, rhs) = args!(Instruction::IDIV { dst, lhs, rhs });
     dispatch!();
 }
 
@@ -441,6 +385,7 @@ fn op_band(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let (dst, lhs, rhs) = args!(Instruction::BAND { dst, lhs, rhs });
     dispatch!();
 }
 
@@ -453,6 +398,7 @@ fn op_bor(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let (dst, lhs, rhs) = args!(Instruction::BOR { dst, lhs, rhs });
     dispatch!();
 }
 
@@ -465,6 +411,7 @@ fn op_bxor(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let (dst, lhs, rhs) = args!(Instruction::BXOR { dst, lhs, rhs });
     dispatch!();
 }
 
@@ -489,6 +436,7 @@ fn op_shr(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let (dst, lhs, rhs) = args!(Instruction::SHR { dst, lhs, rhs });
     dispatch!();
 }
 
@@ -501,30 +449,7 @@ fn op_mmbin(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_mmbini(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_mmbink(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    let (lhs, rhs, metamethod) = args!(Instruction::MMBIN { lhs, rhs, metamethod });
     dispatch!();
 }
 
@@ -537,6 +462,7 @@ fn op_unm(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let (dst, src) = args!(Instruction::UNM { dst, src });
     dispatch!();
 }
 
@@ -673,18 +599,6 @@ fn op_test(
 }
 
 #[inline(never)]
-fn op_testset(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
 fn op_call(
     instruction: Instruction,
     thread: &mut Thread,
@@ -710,30 +624,6 @@ fn op_tailcall(
 
 #[inline(never)]
 fn op_return(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_return0(
-    instruction: Instruction,
-    thread: &mut Thread,
-    registers: &mut [Value],
-    ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    dispatch!();
-}
-
-#[inline(never)]
-fn op_return1(
     instruction: Instruction,
     thread: &mut Thread,
     registers: &mut [Value],

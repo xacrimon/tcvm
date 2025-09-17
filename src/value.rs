@@ -6,6 +6,7 @@ use std::mem;
 
 #[derive(Clone, Copy)]
 #[repr(u8)]
+#[repr(align(8))]
 enum Repr {
     Nil,
     Boolean(bool),
@@ -42,9 +43,6 @@ macro_rules! type_methods {
             pub fn [<as_$lowercase>](self) -> $type {
                 match self.0 {
                     Repr::$variant(v) => v,
-                    #[cfg(debug_assertions)]
-                    _ => unreachable!(),
-                    #[cfg(not(debug_assertions))]
                     _ => unsafe { std::hint::unreachable_unchecked() },
                 }
             }
