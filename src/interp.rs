@@ -765,13 +765,13 @@ fn op_nop(
 
 #[inline(never)]
 fn op_stop(
-    _instruction: Instruction,
+    instruction: Instruction,
     _thread: &mut Thread,
     _registers: &mut [Value],
     _ip: *const Instruction,
     _handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(_instruction, _thread, _registers, _ip, _handlers);
+    helpers!(instruction, _thread, _registers, _ip, _handlers);
     args!(Instruction::STOP {});
     Ok(())
 }
