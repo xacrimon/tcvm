@@ -157,8 +157,9 @@ pub enum Instruction {
     },
 
     CONCAT {
-        start: Register,
-        end: Register,
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
     },
 
     CLOSE {

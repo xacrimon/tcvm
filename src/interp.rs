@@ -73,19 +73,15 @@ macro_rules! helpers {
     ($instruction:expr, $thread:expr, $registers:expr, $ip:expr, $handlers:expr) => {
         macro_rules! dispatch {
             () => {{
-                dispatch!(@impl: $instruction, $thread, $registers, $ip, $handlers);
-            }};
-
-            (@impl: $$instruction:expr, $$thread:expr, $$registers:expr, $$ip:expr, $$handlers:expr) => {{
                 unsafe {
-                    let _ = $$instruction;
-                    debug_assert!($$ip.offset_from_unsigned($$thread.tape.as_ptr()) < $$thread.tape.len());
-                    let instruction = *$$ip;
+                    let _ = $instruction;
+                    debug_assert!($ip.offset_from_unsigned($thread.tape.as_ptr()) < $thread.tape.len());
+                    let instruction = *$ip;
                     let pos = instruction.discriminant() as usize;
                     debug_assert!(pos < HANDLERS.len());
-                    let handler = *$$handlers.cast::<Handler>().add(pos);
-                    let ip = $$ip.add(1);
-                    become handler(instruction, $$thread, $$registers, ip, $$handlers);
+                    let handler = *$handlers.cast::<Handler>().add(pos);
+                    let ip = $ip.add(1);
+                    become handler(instruction, $thread, $registers, ip, $handlers);
                 }
             }};
         }
@@ -93,9 +89,7 @@ macro_rules! helpers {
         macro_rules! args {
             ($$kind:path { $$($$field:ident),* }) => {{
                 match $instruction {
-                    $$kind { $$($$field),* } => {
-                        ( $$($$field),* )
-                    },
+                    $$kind { $$($$field),* } => ( $$($$field),* ),
                     _ => unsafe { std::hint::unreachable_unchecked() },
                 }
             }};
@@ -475,6 +469,7 @@ fn op_bnot(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let (dst, src) = args!(Instruction::BNOT { dst, src });
     dispatch!();
 }
 
@@ -487,6 +482,7 @@ fn op_not(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let (dst, src) = args!(Instruction::BNOT { dst, src });
     dispatch!();
 }
 
@@ -499,6 +495,7 @@ fn op_len(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let (dst, src) = args!(Instruction::BNOT { dst, src });
     dispatch!();
 }
 
@@ -511,6 +508,7 @@ fn op_concat(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let (dst, lhs, rhs) = args!(Instruction::CONCAT { dst, lhs, rhs });
     dispatch!();
 }
 
@@ -523,6 +521,7 @@ fn op_close(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let start = args!(Instruction::CLOSE { start });
     dispatch!();
 }
 
@@ -535,6 +534,7 @@ fn op_tbc(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let val = args!(Instruction::TBC { val });
     dispatch!();
 }
 
@@ -547,6 +547,7 @@ fn op_jmp(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let offset = args!(Instruction::JMP { offset });
     dispatch!();
 }
 
@@ -559,6 +560,7 @@ fn op_eq(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let (lhs, rhs, inverted) = args!(Instruction::EQ { lhs, rhs, inverted });
     dispatch!();
 }
 
@@ -571,6 +573,7 @@ fn op_lt(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let (lhs, rhs, inverted) = args!(Instruction::LT { lhs, rhs, inverted });
     dispatch!();
 }
 
@@ -583,6 +586,7 @@ fn op_le(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let (lhs, rhs, inverted) = args!(Instruction::LE { lhs, rhs, inverted });
     dispatch!();
 }
 
@@ -595,6 +599,7 @@ fn op_test(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let (src, inverted) = args!(Instruction::TEST { src, inverted });
     dispatch!();
 }
 
@@ -607,6 +612,7 @@ fn op_call(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let (func, args, returns) = args!(Instruction::CALL { func, args, returns });
     dispatch!();
 }
 
@@ -619,6 +625,7 @@ fn op_tailcall(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let (func, args) = args!(Instruction::TAILCALL { func, args });
     dispatch!();
 }
 
@@ -631,6 +638,7 @@ fn op_return(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let (values, count) = args!(Instruction::RETURN { values, count });
     dispatch!();
 }
 
@@ -751,6 +759,7 @@ fn op_nop(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    args!(Instruction::NOP {});
     dispatch!();
 }
 
@@ -762,5 +771,7 @@ fn op_stop(
     _ip: *const Instruction,
     _handlers: *const (),
 ) -> Result<(), Box<Error>> {
+    helpers!(_instruction, _thread, _registers, _ip, _handlers);
+    args!(Instruction::STOP {});
     Ok(())
 }
