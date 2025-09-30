@@ -8,3 +8,4 @@ pub mod dmm;
 mod instruction;
 mod interp;
 mod value;
+mod parser;
