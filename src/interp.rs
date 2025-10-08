@@ -1,5 +1,6 @@
 use crate::instruction::Instruction;
-use crate::value::Value;
+use crate::num::{self, op_arith};
+use crate::value::{Value, ValueType};
 
 const HANDLERS: &[Handler] = &[
     op_move,
@@ -289,6 +290,12 @@ fn op_add(
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
     let (dst, lhs, rhs) = args!(Instruction::ADD { dst, lhs, rhs });
+    let (lhs, rhs) = (reg!(lhs), reg!(rhs));
+
+    if let Some(v) = op_arith::<num::Add>(lhs, rhs) {
+        *reg!(mut dst) = v;
+    }
+
     dispatch!();
 }
 
@@ -302,6 +309,12 @@ fn op_sub(
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
     let (dst, lhs, rhs) = args!(Instruction::SUB { dst, lhs, rhs });
+    let (lhs, rhs) = (reg!(lhs), reg!(rhs));
+
+    if let Some(v) = op_arith::<num::Sub>(lhs, rhs) {
+        *reg!(mut dst) = v;
+    }
+
     dispatch!();
 }
 
@@ -315,6 +328,12 @@ fn op_mul(
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
     let (dst, lhs, rhs) = args!(Instruction::MUL { dst, lhs, rhs });
+    let (lhs, rhs) = (reg!(lhs), reg!(rhs));
+
+    if let Some(v) = op_arith::<num::Mul>(lhs, rhs) {
+        *reg!(mut dst) = v;
+    }
+
     dispatch!();
 }
 
@@ -328,6 +347,12 @@ fn op_mod(
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
     let (dst, lhs, rhs) = args!(Instruction::MOD { dst, lhs, rhs });
+    let (lhs, rhs) = (reg!(lhs), reg!(rhs));
+
+    if let Some(v) = op_arith::<num::Mod>(lhs, rhs) {
+        *reg!(mut dst) = v;
+    }
+
     dispatch!();
 }
 
@@ -341,6 +366,12 @@ fn op_pow(
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
     let (dst, lhs, rhs) = args!(Instruction::POW { dst, lhs, rhs });
+    let (lhs, rhs) = (reg!(lhs), reg!(rhs));
+
+    if let Some(v) = op_arith::<num::Pow>(lhs, rhs) {
+        *reg!(mut dst) = v;
+    }
+
     dispatch!();
 }
 
@@ -354,6 +385,12 @@ fn op_div(
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
     let (dst, lhs, rhs) = args!(Instruction::DIV { dst, lhs, rhs });
+    let (lhs, rhs) = (reg!(lhs), reg!(rhs));
+
+    if let Some(v) = op_arith::<num::Div>(lhs, rhs) {
+        *reg!(mut dst) = v;
+    }
+
     dispatch!();
 }
 
@@ -367,6 +404,12 @@ fn op_idiv(
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
     let (dst, lhs, rhs) = args!(Instruction::IDIV { dst, lhs, rhs });
+    let (lhs, rhs) = (reg!(lhs), reg!(rhs));
+
+    if let Some(v) = op_arith::<num::Sub>(lhs, rhs) {
+        *reg!(mut dst) = v;
+    }
+
     dispatch!();
 }
 
@@ -443,7 +486,11 @@ fn op_mmbin(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
-    let (lhs, rhs, metamethod) = args!(Instruction::MMBIN { lhs, rhs, metamethod });
+    let (lhs, rhs, metamethod) = args!(Instruction::MMBIN {
+        lhs,
+        rhs,
+        metamethod
+    });
     dispatch!();
 }
 
@@ -612,7 +659,11 @@ fn op_call(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
-    let (func, args, returns) = args!(Instruction::CALL { func, args, returns });
+    let (func, args, returns) = args!(Instruction::CALL {
+        func,
+        args,
+        returns
+    });
     dispatch!();
 }
 

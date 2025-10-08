@@ -7,7 +7,7 @@ use std::mem;
 #[derive(Clone, Copy)]
 #[repr(u8)]
 #[repr(align(8))]
-enum Repr {
+pub enum Value {
     Nil,
     Boolean(bool),
     Integer(i64),
@@ -37,26 +37,26 @@ macro_rules! type_methods {
     ($variant:ident, $lowercase:ident, $type:ty) => {
         paste::paste! {
             pub fn [<new_ $lowercase>](v: $type) -> Self {
-                Self(Repr::$variant(v))
+                Self::$variant(v)
             }
 
             pub fn [<as_$lowercase>](self) -> $type {
-                match self.0 {
-                    Repr::$variant(v) => v,
+                match self {
+                    Self::$variant(v) => v,
                     _ => unsafe { std::hint::unreachable_unchecked() },
                 }
             }
 
             pub fn [<get_ $lowercase>](self) -> Option<$type> {
-                match self.0 {
-                    Repr::$variant(v) => Some(v),
+                match self {
+                    Self::$variant(v) => Some(v),
                     _ => None,
                 }
             }
 
             pub fn [<try_ $lowercase>](self) -> Result<$type, ()> {
-                match self.0 {
-                    Repr::$variant(v) => Ok(v),
+                match self {
+                    Self::$variant(v) => Ok(v),
                     _ => Err(()),
                 }
             }
@@ -64,14 +64,10 @@ macro_rules! type_methods {
     };
 }
 
-#[derive(Clone, Copy)]
-#[repr(transparent)]
-pub struct Value(Repr);
-
 impl Value {
     pub fn ty(self) -> ValueType {
         unsafe {
-            let discriminant = *<*const _>::from(&self.0).cast::<u8>();
+            let discriminant = *<*const _>::from(&self).cast::<u8>();
             mem::transmute::<u8, ValueType>(discriminant)
         }
     }
