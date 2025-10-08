@@ -7,5 +7,6 @@
 pub mod dmm;
 mod instruction;
 mod interp;
-mod value;
+mod num;
 mod parser;
+mod value;

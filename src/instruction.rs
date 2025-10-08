@@ -41,7 +41,7 @@ pub enum Instruction {
         idx: UpvalueIndex,
         key: ConstantIndex,
     },
-    
+
     GETTABLE {
         dst: Register,
         table: Register,
