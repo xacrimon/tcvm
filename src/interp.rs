@@ -1,5 +1,5 @@
 use crate::instruction::Instruction;
-use crate::num::{self, op_arith};
+use crate::num::{self, op_arith, op_bit};
 use crate::value::{Value, ValueType};
 
 const HANDLERS: &[Handler] = &[
@@ -446,6 +446,12 @@ fn op_band(
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
     let (dst, lhs, rhs) = args!(Instruction::BAND { dst, lhs, rhs });
+    let (lhs, rhs) = (reg!(lhs), reg!(rhs));
+
+    if let Some(v) = op_bit::<num::BAnd>(lhs, rhs) {
+        *reg!(mut dst) = v;
+    }
+
     dispatch!();
 }
 
@@ -459,6 +465,12 @@ fn op_bor(
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
     let (dst, lhs, rhs) = args!(Instruction::BOR { dst, lhs, rhs });
+    let (lhs, rhs) = (reg!(lhs), reg!(rhs));
+
+    if let Some(v) = op_bit::<num::BOr>(lhs, rhs) {
+        *reg!(mut dst) = v;
+    }
+
     dispatch!();
 }
 
@@ -472,6 +484,12 @@ fn op_bxor(
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
     let (dst, lhs, rhs) = args!(Instruction::BXOR { dst, lhs, rhs });
+    let (lhs, rhs) = (reg!(lhs), reg!(rhs));
+
+    if let Some(v) = op_bit::<num::BXor>(lhs, rhs) {
+        *reg!(mut dst) = v;
+    }
+
     dispatch!();
 }
 
@@ -484,6 +502,13 @@ fn op_shl(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
+    let (dst, lhs, rhs) = args!(Instruction::SHL { dst, lhs, rhs });
+    let (lhs, rhs) = (reg!(lhs), reg!(rhs));
+
+    if let Some(v) = op_bit::<num::Shl>(lhs, rhs) {
+        *reg!(mut dst) = v;
+    }
+
     dispatch!();
 }
 
@@ -497,6 +522,12 @@ fn op_shr(
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, thread, registers, ip, handlers);
     let (dst, lhs, rhs) = args!(Instruction::SHR { dst, lhs, rhs });
+    let (lhs, rhs) = (reg!(lhs), reg!(rhs));
+
+    if let Some(v) = op_bit::<num::Shr>(lhs, rhs) {
+        *reg!(mut dst) = v;
+    }
+
     dispatch!();
 }
 
