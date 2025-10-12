@@ -39,6 +39,7 @@ fn collect_derive(s: synstructure::Structure) -> TokenStream {
     let mut mode = None;
     let mut override_bound = None;
     let mut gc_lifetime = None;
+    let mut internal = false;
 
     fn usage_error(meta: &syn::meta::ParseNestedMeta, msg: &str) -> syn::parse::Error {
         meta.error(format_args!(
@@ -68,6 +69,11 @@ fn collect_derive(s: synstructure::Structure) -> TokenStream {
                 return Ok(());
             }
 
+            if meta.path.is_ident("internal") {
+                internal = true;
+                return Ok(());
+            }
+
             meta.input.parse::<syn::parse::Nothing>()?;
 
             if mode.is_some() {
@@ -90,6 +96,12 @@ fn collect_derive(s: synstructure::Structure) -> TokenStream {
     if let Err(err) = result {
         return err.to_compile_error();
     }
+
+    let base = if internal {
+        quote!(crate::dmm)
+    } else {
+        quote!(::tcvm::dmm)
+    };
 
     let Some(mode) = mode else {
         panic!(
@@ -116,7 +128,7 @@ fn collect_derive(s: synstructure::Structure) -> TokenStream {
         let mut impl_struct = s.clone();
         impl_struct.add_bounds(AddBounds::None);
         impl_struct.gen_impl(quote! {
-            gen unsafe impl<'gc> ::tcvm::dmm::Collect<'gc> for @Self #where_clause {
+            gen unsafe impl<'gc> #base::Collect<'gc> for @Self #where_clause {
                 const NEEDS_TRACE: bool = false;
             }
         })
@@ -184,7 +196,7 @@ fn collect_derive(s: synstructure::Structure) -> TokenStream {
                 // (e.g. `gc_arena::Collect`), so this won't cause any hygiene issues
                 let call_span = b.ast().span().resolved_at(Span::call_site());
                 quote_spanned!(call_span=>
-                    || <#ty as ::tcvm::dmm::Collect>::NEEDS_TRACE
+                    || <#ty as #base::Collect>::NEEDS_TRACE
                 )
                 .to_tokens(&mut needs_trace_expr);
             }
@@ -240,22 +252,22 @@ fn collect_derive(s: synstructure::Structure) -> TokenStream {
 
         if let Some(gc_lifetime) = gc_lifetime {
             impl_struct.gen_impl(quote! {
-                gen unsafe impl ::tcvm::dmm::Collect<#gc_lifetime> for @Self #where_clause {
+                gen unsafe impl #base::Collect<#gc_lifetime> for @Self #where_clause {
                     const NEEDS_TRACE: bool = #needs_trace_expr;
 
                     #[inline]
-                    fn trace<Trace: ::tcvm::dmm::collect::Trace<#gc_lifetime>>(&self, cc: &mut Trace) {
+                    fn trace<Trace: #base::collect::Trace<#gc_lifetime>>(&self, cc: &mut Trace) {
                         match *self { #trace_body }
                     }
                 }
             })
         } else {
             impl_struct.gen_impl(quote! {
-                gen unsafe impl<'gc> ::tcvm::dmm::Collect<'gc> for @Self #where_clause {
+                gen unsafe impl<'gc> #base::Collect<'gc> for @Self #where_clause {
                     const NEEDS_TRACE: bool = #needs_trace_expr;
 
                     #[inline]
-                    fn trace<Trace: ::tcvm::dmm::collect::Trace<'gc>>(&self, cc: &mut Trace) {
+                    fn trace<Trace: #base::collect::Trace<'gc>>(&self, cc: &mut Trace) {
                         match *self { #trace_body }
                     }
                 }
@@ -266,7 +278,7 @@ fn collect_derive(s: synstructure::Structure) -> TokenStream {
     let drop_impl = if mode == Mode::NoDrop {
         let mut drop_struct = s.clone();
         drop_struct.add_bounds(AddBounds::None).gen_impl(quote! {
-            gen impl ::tcvm::dmm::__MustNotImplDrop for @Self {}
+            gen impl #base::__MustNotImplDrop for @Self {}
         })
     } else {
         quote!()

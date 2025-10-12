@@ -6,7 +6,6 @@
 
 pub mod dmm;
 mod instruction;
-mod interp;
-mod num;
 mod parser;
-mod value;
+mod vm;
+pub mod env;
