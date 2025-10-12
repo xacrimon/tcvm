@@ -1,6 +1,6 @@
 use crate::instruction::Instruction;
-use crate::num::{self, op_arith, op_bit};
-use crate::value::{Value, ValueType};
+use crate::vm::num::{self, op_arith, op_bit};
+use crate::env::Value;
 
 const HANDLERS: &[Handler] = &[
     op_move,
@@ -63,15 +63,15 @@ pub struct Thread {
 }
 
 #[cfg(debug_assertions)]
-type Registers<'a> = &'a mut [Value];
+type Registers<'gc, 'a> = &'a mut [Value<'gc>];
 
 #[cfg(not(debug_assertions))]
-type Registers<'a> = *mut Value;
+type Registers<'gc, 'a> = *mut Value<'gc>;
 
 type Handler = fn(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'_, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>>;
@@ -160,10 +160,10 @@ pub fn run(tape: &[Instruction], thread: &mut Thread) {
 
 #[cold]
 #[inline(never)]
-fn impl_error(
+fn impl_error<'gc>(
     _instruction: Instruction,
     thread: &mut Thread,
-    _registers: Registers<'_>,
+    _registers: Registers<'gc, '_>,
     ip: *const Instruction,
     _handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -173,10 +173,10 @@ fn impl_error(
 }
 
 #[inline(never)]
-fn op_move(
+fn op_move<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -187,10 +187,10 @@ fn op_move(
 }
 
 #[inline(never)]
-fn op_load(
+fn op_load<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -200,10 +200,10 @@ fn op_load(
 }
 
 #[inline(never)]
-fn op_lfalseskip(
+fn op_lfalseskip<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -213,10 +213,10 @@ fn op_lfalseskip(
 }
 
 #[inline(never)]
-fn op_getupval(
+fn op_getupval<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -226,10 +226,10 @@ fn op_getupval(
 }
 
 #[inline(never)]
-fn op_setupval(
+fn op_setupval<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -239,10 +239,10 @@ fn op_setupval(
 }
 
 #[inline(never)]
-fn op_gettabup(
+fn op_gettabup<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -252,10 +252,10 @@ fn op_gettabup(
 }
 
 #[inline(never)]
-fn op_settabup(
+fn op_settabup<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -265,10 +265,10 @@ fn op_settabup(
 }
 
 #[inline(never)]
-fn op_gettable(
+fn op_gettable<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -278,10 +278,10 @@ fn op_gettable(
 }
 
 #[inline(never)]
-fn op_settable(
+fn op_settable<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -291,10 +291,10 @@ fn op_settable(
 }
 
 #[inline(never)]
-fn op_newtable(
+fn op_newtable<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -304,10 +304,10 @@ fn op_newtable(
 }
 
 #[inline(never)]
-fn op_add(
+fn op_add<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -323,10 +323,10 @@ fn op_add(
 }
 
 #[inline(never)]
-fn op_sub(
+fn op_sub<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -342,10 +342,10 @@ fn op_sub(
 }
 
 #[inline(never)]
-fn op_mul(
+fn op_mul<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -361,10 +361,10 @@ fn op_mul(
 }
 
 #[inline(never)]
-fn op_mod(
+fn op_mod<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -380,10 +380,10 @@ fn op_mod(
 }
 
 #[inline(never)]
-fn op_pow(
+fn op_pow<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -399,10 +399,10 @@ fn op_pow(
 }
 
 #[inline(never)]
-fn op_div(
+fn op_div<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -418,10 +418,10 @@ fn op_div(
 }
 
 #[inline(never)]
-fn op_idiv(
+fn op_idiv<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -437,10 +437,10 @@ fn op_idiv(
 }
 
 #[inline(never)]
-fn op_band(
+fn op_band<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -456,10 +456,10 @@ fn op_band(
 }
 
 #[inline(never)]
-fn op_bor(
+fn op_bor<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -475,10 +475,10 @@ fn op_bor(
 }
 
 #[inline(never)]
-fn op_bxor(
+fn op_bxor<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -494,10 +494,10 @@ fn op_bxor(
 }
 
 #[inline(never)]
-fn op_shl(
+fn op_shl<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -513,10 +513,10 @@ fn op_shl(
 }
 
 #[inline(never)]
-fn op_shr(
+fn op_shr<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -532,10 +532,10 @@ fn op_shr(
 }
 
 #[inline(never)]
-fn op_mmbin(
+fn op_mmbin<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -549,10 +549,10 @@ fn op_mmbin(
 }
 
 #[inline(never)]
-fn op_unm(
+fn op_unm<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -562,10 +562,10 @@ fn op_unm(
 }
 
 #[inline(never)]
-fn op_bnot(
+fn op_bnot<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -575,10 +575,10 @@ fn op_bnot(
 }
 
 #[inline(never)]
-fn op_not(
+fn op_not<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -588,10 +588,10 @@ fn op_not(
 }
 
 #[inline(never)]
-fn op_len(
+fn op_len<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -601,10 +601,10 @@ fn op_len(
 }
 
 #[inline(never)]
-fn op_concat(
+fn op_concat<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -614,10 +614,10 @@ fn op_concat(
 }
 
 #[inline(never)]
-fn op_close(
+fn op_close<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -627,10 +627,10 @@ fn op_close(
 }
 
 #[inline(never)]
-fn op_tbc(
+fn op_tbc<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -640,10 +640,10 @@ fn op_tbc(
 }
 
 #[inline(never)]
-fn op_jmp(
+fn op_jmp<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -653,10 +653,10 @@ fn op_jmp(
 }
 
 #[inline(never)]
-fn op_eq(
+fn op_eq<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -666,10 +666,10 @@ fn op_eq(
 }
 
 #[inline(never)]
-fn op_lt(
+fn op_lt<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -679,10 +679,10 @@ fn op_lt(
 }
 
 #[inline(never)]
-fn op_le(
+fn op_le<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -692,10 +692,10 @@ fn op_le(
 }
 
 #[inline(never)]
-fn op_test(
+fn op_test<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -705,10 +705,10 @@ fn op_test(
 }
 
 #[inline(never)]
-fn op_call(
+fn op_call<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -722,10 +722,10 @@ fn op_call(
 }
 
 #[inline(never)]
-fn op_tailcall(
+fn op_tailcall<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -735,10 +735,10 @@ fn op_tailcall(
 }
 
 #[inline(never)]
-fn op_return(
+fn op_return<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -748,10 +748,10 @@ fn op_return(
 }
 
 #[inline(never)]
-fn op_forloop(
+fn op_forloop<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -760,10 +760,10 @@ fn op_forloop(
 }
 
 #[inline(never)]
-fn op_forprep(
+fn op_forprep<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -772,10 +772,10 @@ fn op_forprep(
 }
 
 #[inline(never)]
-fn op_tforprep(
+fn op_tforprep<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -784,10 +784,10 @@ fn op_tforprep(
 }
 
 #[inline(never)]
-fn op_tforcall(
+fn op_tforcall<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -796,10 +796,10 @@ fn op_tforcall(
 }
 
 #[inline(never)]
-fn op_tforloop(
+fn op_tforloop<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -808,10 +808,10 @@ fn op_tforloop(
 }
 
 #[inline(never)]
-fn op_setlist(
+fn op_setlist<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -820,10 +820,10 @@ fn op_setlist(
 }
 
 #[inline(never)]
-fn op_closure(
+fn op_closure<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -832,10 +832,10 @@ fn op_closure(
 }
 
 #[inline(never)]
-fn op_vararg(
+fn op_vararg<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -844,10 +844,10 @@ fn op_vararg(
 }
 
 #[inline(never)]
-fn op_varargprep(
+fn op_varargprep<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -856,10 +856,10 @@ fn op_varargprep(
 }
 
 #[inline(never)]
-fn op_nop(
+fn op_nop<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
-    registers: Registers<'_>,
+    registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -869,10 +869,10 @@ fn op_nop(
 }
 
 #[inline(never)]
-fn op_stop(
+fn op_stop<'gc>(
     instruction: Instruction,
     _thread: &mut Thread,
-    _registers: Registers<'_>,
+    _registers: Registers<'gc, '_>,
     _ip: *const Instruction,
     _handlers: *const (),
 ) -> Result<(), Box<Error>> {
