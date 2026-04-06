@@ -2,6 +2,8 @@ use crate::instruction::Instruction;
 use crate::vm::num::{self, op_arith, op_bit};
 use crate::env::Value;
 
+// https://www.mattkeeter.com/blog/2026-04-05-tailcall/
+
 const HANDLERS: &[Handler] = &[
     op_move,
     op_load,
@@ -68,7 +70,7 @@ type Registers<'gc, 'a> = &'a mut [Value<'gc>];
 #[cfg(not(debug_assertions))]
 type Registers<'gc, 'a> = *mut Value<'gc>;
 
-type Handler = fn(
+type Handler = extern "rust-preserve-none" fn(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'_, '_>,
@@ -160,7 +162,7 @@ pub fn run(tape: &[Instruction], thread: &mut Thread) {
 
 #[cold]
 #[inline(never)]
-fn impl_error<'gc>(
+extern "rust-preserve-none" fn impl_error<'gc>(
     _instruction: Instruction,
     thread: &mut Thread,
     _registers: Registers<'gc, '_>,
@@ -173,7 +175,7 @@ fn impl_error<'gc>(
 }
 
 #[inline(never)]
-fn op_move<'gc>(
+extern "rust-preserve-none" fn op_move<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -187,7 +189,7 @@ fn op_move<'gc>(
 }
 
 #[inline(never)]
-fn op_load<'gc>(
+extern "rust-preserve-none" fn op_load<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -200,7 +202,7 @@ fn op_load<'gc>(
 }
 
 #[inline(never)]
-fn op_lfalseskip<'gc>(
+extern "rust-preserve-none" fn op_lfalseskip<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -213,7 +215,7 @@ fn op_lfalseskip<'gc>(
 }
 
 #[inline(never)]
-fn op_getupval<'gc>(
+extern "rust-preserve-none" fn op_getupval<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -226,7 +228,7 @@ fn op_getupval<'gc>(
 }
 
 #[inline(never)]
-fn op_setupval<'gc>(
+extern "rust-preserve-none" fn op_setupval<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -239,7 +241,7 @@ fn op_setupval<'gc>(
 }
 
 #[inline(never)]
-fn op_gettabup<'gc>(
+extern "rust-preserve-none" fn op_gettabup<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -252,7 +254,7 @@ fn op_gettabup<'gc>(
 }
 
 #[inline(never)]
-fn op_settabup<'gc>(
+extern "rust-preserve-none" fn op_settabup<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -265,7 +267,7 @@ fn op_settabup<'gc>(
 }
 
 #[inline(never)]
-fn op_gettable<'gc>(
+extern "rust-preserve-none" fn op_gettable<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -278,7 +280,7 @@ fn op_gettable<'gc>(
 }
 
 #[inline(never)]
-fn op_settable<'gc>(
+extern "rust-preserve-none" fn op_settable<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -291,7 +293,7 @@ fn op_settable<'gc>(
 }
 
 #[inline(never)]
-fn op_newtable<'gc>(
+extern "rust-preserve-none" fn op_newtable<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -304,7 +306,7 @@ fn op_newtable<'gc>(
 }
 
 #[inline(never)]
-fn op_add<'gc>(
+extern "rust-preserve-none" fn op_add<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -323,7 +325,7 @@ fn op_add<'gc>(
 }
 
 #[inline(never)]
-fn op_sub<'gc>(
+extern "rust-preserve-none" fn op_sub<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -342,7 +344,7 @@ fn op_sub<'gc>(
 }
 
 #[inline(never)]
-fn op_mul<'gc>(
+extern "rust-preserve-none" fn op_mul<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -361,7 +363,7 @@ fn op_mul<'gc>(
 }
 
 #[inline(never)]
-fn op_mod<'gc>(
+extern "rust-preserve-none" fn op_mod<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -380,7 +382,7 @@ fn op_mod<'gc>(
 }
 
 #[inline(never)]
-fn op_pow<'gc>(
+extern "rust-preserve-none" fn op_pow<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -399,7 +401,7 @@ fn op_pow<'gc>(
 }
 
 #[inline(never)]
-fn op_div<'gc>(
+extern "rust-preserve-none" fn op_div<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -418,7 +420,7 @@ fn op_div<'gc>(
 }
 
 #[inline(never)]
-fn op_idiv<'gc>(
+extern "rust-preserve-none" fn op_idiv<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -437,7 +439,7 @@ fn op_idiv<'gc>(
 }
 
 #[inline(never)]
-fn op_band<'gc>(
+extern "rust-preserve-none" fn op_band<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -456,7 +458,7 @@ fn op_band<'gc>(
 }
 
 #[inline(never)]
-fn op_bor<'gc>(
+extern "rust-preserve-none" fn op_bor<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -475,7 +477,7 @@ fn op_bor<'gc>(
 }
 
 #[inline(never)]
-fn op_bxor<'gc>(
+extern "rust-preserve-none" fn op_bxor<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -494,7 +496,7 @@ fn op_bxor<'gc>(
 }
 
 #[inline(never)]
-fn op_shl<'gc>(
+extern "rust-preserve-none" fn op_shl<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -513,7 +515,7 @@ fn op_shl<'gc>(
 }
 
 #[inline(never)]
-fn op_shr<'gc>(
+extern "rust-preserve-none" fn op_shr<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -532,7 +534,7 @@ fn op_shr<'gc>(
 }
 
 #[inline(never)]
-fn op_mmbin<'gc>(
+extern "rust-preserve-none" fn op_mmbin<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -549,7 +551,7 @@ fn op_mmbin<'gc>(
 }
 
 #[inline(never)]
-fn op_unm<'gc>(
+extern "rust-preserve-none" fn op_unm<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -562,7 +564,7 @@ fn op_unm<'gc>(
 }
 
 #[inline(never)]
-fn op_bnot<'gc>(
+extern "rust-preserve-none" fn op_bnot<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -575,7 +577,7 @@ fn op_bnot<'gc>(
 }
 
 #[inline(never)]
-fn op_not<'gc>(
+extern "rust-preserve-none" fn op_not<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -588,7 +590,7 @@ fn op_not<'gc>(
 }
 
 #[inline(never)]
-fn op_len<'gc>(
+extern "rust-preserve-none" fn op_len<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -601,7 +603,7 @@ fn op_len<'gc>(
 }
 
 #[inline(never)]
-fn op_concat<'gc>(
+extern "rust-preserve-none" fn op_concat<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -614,7 +616,7 @@ fn op_concat<'gc>(
 }
 
 #[inline(never)]
-fn op_close<'gc>(
+extern "rust-preserve-none" fn op_close<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -627,7 +629,7 @@ fn op_close<'gc>(
 }
 
 #[inline(never)]
-fn op_tbc<'gc>(
+extern "rust-preserve-none" fn op_tbc<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -640,7 +642,7 @@ fn op_tbc<'gc>(
 }
 
 #[inline(never)]
-fn op_jmp<'gc>(
+extern "rust-preserve-none" fn op_jmp<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -653,7 +655,7 @@ fn op_jmp<'gc>(
 }
 
 #[inline(never)]
-fn op_eq<'gc>(
+extern "rust-preserve-none" fn op_eq<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -666,7 +668,7 @@ fn op_eq<'gc>(
 }
 
 #[inline(never)]
-fn op_lt<'gc>(
+extern "rust-preserve-none" fn op_lt<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -679,7 +681,7 @@ fn op_lt<'gc>(
 }
 
 #[inline(never)]
-fn op_le<'gc>(
+extern "rust-preserve-none" fn op_le<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -692,7 +694,7 @@ fn op_le<'gc>(
 }
 
 #[inline(never)]
-fn op_test<'gc>(
+extern "rust-preserve-none" fn op_test<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -705,7 +707,7 @@ fn op_test<'gc>(
 }
 
 #[inline(never)]
-fn op_call<'gc>(
+extern "rust-preserve-none" fn op_call<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -722,7 +724,7 @@ fn op_call<'gc>(
 }
 
 #[inline(never)]
-fn op_tailcall<'gc>(
+extern "rust-preserve-none" fn op_tailcall<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -735,7 +737,7 @@ fn op_tailcall<'gc>(
 }
 
 #[inline(never)]
-fn op_return<'gc>(
+extern "rust-preserve-none" fn op_return<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -748,7 +750,7 @@ fn op_return<'gc>(
 }
 
 #[inline(never)]
-fn op_forloop<'gc>(
+extern "rust-preserve-none" fn op_forloop<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -760,7 +762,7 @@ fn op_forloop<'gc>(
 }
 
 #[inline(never)]
-fn op_forprep<'gc>(
+extern "rust-preserve-none" fn op_forprep<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -772,7 +774,7 @@ fn op_forprep<'gc>(
 }
 
 #[inline(never)]
-fn op_tforprep<'gc>(
+extern "rust-preserve-none" fn op_tforprep<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -784,7 +786,7 @@ fn op_tforprep<'gc>(
 }
 
 #[inline(never)]
-fn op_tforcall<'gc>(
+extern "rust-preserve-none" fn op_tforcall<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -796,7 +798,7 @@ fn op_tforcall<'gc>(
 }
 
 #[inline(never)]
-fn op_tforloop<'gc>(
+extern "rust-preserve-none" fn op_tforloop<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -808,7 +810,7 @@ fn op_tforloop<'gc>(
 }
 
 #[inline(never)]
-fn op_setlist<'gc>(
+extern "rust-preserve-none" fn op_setlist<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -820,7 +822,7 @@ fn op_setlist<'gc>(
 }
 
 #[inline(never)]
-fn op_closure<'gc>(
+extern "rust-preserve-none" fn op_closure<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -832,7 +834,7 @@ fn op_closure<'gc>(
 }
 
 #[inline(never)]
-fn op_vararg<'gc>(
+extern "rust-preserve-none" fn op_vararg<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -844,7 +846,7 @@ fn op_vararg<'gc>(
 }
 
 #[inline(never)]
-fn op_varargprep<'gc>(
+extern "rust-preserve-none" fn op_varargprep<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -856,7 +858,7 @@ fn op_varargprep<'gc>(
 }
 
 #[inline(never)]
-fn op_nop<'gc>(
+extern "rust-preserve-none" fn op_nop<'gc>(
     instruction: Instruction,
     thread: &mut Thread,
     registers: Registers<'gc, '_>,
@@ -869,7 +871,7 @@ fn op_nop<'gc>(
 }
 
 #[inline(never)]
-fn op_stop<'gc>(
+extern "rust-preserve-none" fn op_stop<'gc>(
     instruction: Instruction,
     _thread: &mut Thread,
     _registers: Registers<'gc, '_>,
