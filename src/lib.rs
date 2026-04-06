@@ -3,6 +3,7 @@
 #![feature(macro_metavar_expr)]
 #![feature(likely_unlikely)]
 #![feature(allocator_api)]
+#![feature(rust_preserve_none_cc)]
 
 pub mod dmm;
 mod instruction;
