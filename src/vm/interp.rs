@@ -2,8 +2,6 @@ use crate::instruction::Instruction;
 use crate::vm::num::{self, op_arith, op_bit};
 use crate::env::Value;
 
-// https://www.mattkeeter.com/blog/2026-04-05-tailcall/
-
 const HANDLERS: &[Handler] = &[
     op_move,
     op_load,
@@ -80,6 +78,7 @@ type Handler = extern "rust-preserve-none" fn(
 
 macro_rules! helpers {
     ($instruction:expr, $thread:expr, $registers:expr, $ip:expr, $handlers:expr) => {
+        #[allow(unused_macros)]
         macro_rules! dispatch {
             () => {{
                 unsafe {
@@ -95,6 +94,7 @@ macro_rules! helpers {
             }};
         }
 
+        #[allow(unused_macros)]
         macro_rules! args {
             ($$kind:path { $$($$field:ident),* }) => {{
                 match $instruction {
@@ -104,12 +104,14 @@ macro_rules! helpers {
             }};
         }
 
+        #[allow(unused_macros)]
         macro_rules! raise {
             () => {{
                 become impl_error($instruction, $thread, $registers, $ip, $handlers);
             }};
         }
 
+        #[allow(unused_macros)]
         macro_rules! check {
             ($$cond:expr) => {{
                 if std::hint::unlikely(!$$cond) {
@@ -118,6 +120,7 @@ macro_rules! helpers {
             }};
         }
 
+        #[allow(unused_macros)]
         macro_rules! reg {
             ($$idx:expr) => {{
                 #[cfg(debug_assertions)]
