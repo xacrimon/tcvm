@@ -56,7 +56,7 @@ pub struct Function<'gc>(Gc<'gc, FunctionKind<'gc>>);
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub enum FunctionKind<'gc> {
-    Lua(LuaClosure<'gc>),
+    Lua(Gc<'gc, LuaClosure<'gc>>),
     Native(NativeClosure<'gc>),
 }
 
@@ -66,7 +66,8 @@ impl<'gc> Function<'gc> {
         proto: Gc<'gc, Prototype<'gc>>,
         upvalues: Box<[Upvalue<'gc>]>,
     ) -> Self {
-        Function(Gc::new(mc, FunctionKind::Lua(LuaClosure { proto, upvalues })))
+        let closure = Gc::new(mc, LuaClosure { proto, upvalues });
+        Function(Gc::new(mc, FunctionKind::Lua(closure)))
     }
 
     pub fn new_native(mc: &Mutation<'gc>, function: fn(), upvalues: Box<[Value<'gc>]>) -> Self {
@@ -74,6 +75,13 @@ impl<'gc> Function<'gc> {
             mc,
             FunctionKind::Native(NativeClosure { function, upvalues }),
         ))
+    }
+
+    pub fn as_lua(self) -> Option<Gc<'gc, LuaClosure<'gc>>> {
+        match &*self.0 {
+            FunctionKind::Lua(cl) => Some(*cl),
+            _ => None,
+        }
     }
 
     pub fn inner(self) -> Gc<'gc, FunctionKind<'gc>> {
