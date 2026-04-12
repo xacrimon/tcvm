@@ -1,6 +1,5 @@
 use crate::dmm::{Collect, Gc, Mutation, RefLock};
-use crate::env::Prototype;
-use crate::env::function::{Function, Upvalue};
+use crate::env::function::{LuaClosure, Upvalue};
 use crate::env::value::Value;
 
 /// Copy wrapper stored in Value.
@@ -18,10 +17,11 @@ pub enum ThreadStatus {
 }
 
 /// A single call frame on the call stack.
+/// Only represents Lua function execution — native calls don't push frames.
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub struct CallFrame<'gc> {
-    pub function: Function<'gc>,
+    pub closure: Gc<'gc, LuaClosure<'gc>>,
     pub base: usize,
     pub pc: usize,
     pub num_results: u8,
