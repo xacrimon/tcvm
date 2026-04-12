@@ -58,7 +58,7 @@ struct Error {
     pc: usize,
 }
 
-pub struct Thread {
+pub struct InterpreterState {
     tape: Vec<Instruction>,
 }
 
@@ -70,7 +70,7 @@ type Registers<'gc, 'a> = *mut Value<'gc>;
 
 type Handler = extern "rust-preserve-none" fn(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'_, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -150,7 +150,7 @@ macro_rules! helpers {
 }
 
 #[inline(never)]
-pub fn run(tape: &[Instruction], thread: &mut Thread) {
+pub fn run(tape: &[Instruction], thread: &mut InterpreterState) {
     let ip = tape.as_ptr();
     let handlers = HANDLERS.as_ptr() as *const ();
 
@@ -167,7 +167,7 @@ pub fn run(tape: &[Instruction], thread: &mut Thread) {
 #[inline(never)]
 extern "rust-preserve-none" fn impl_error<'gc>(
     _instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     _registers: Registers<'gc, '_>,
     ip: *const Instruction,
     _handlers: *const (),
@@ -180,7 +180,7 @@ extern "rust-preserve-none" fn impl_error<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_move<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -194,7 +194,7 @@ extern "rust-preserve-none" fn op_move<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_load<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -207,7 +207,7 @@ extern "rust-preserve-none" fn op_load<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_lfalseskip<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -220,7 +220,7 @@ extern "rust-preserve-none" fn op_lfalseskip<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_getupval<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -233,7 +233,7 @@ extern "rust-preserve-none" fn op_getupval<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_setupval<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -246,7 +246,7 @@ extern "rust-preserve-none" fn op_setupval<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_gettabup<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -259,7 +259,7 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_settabup<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -272,7 +272,7 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_gettable<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -285,7 +285,7 @@ extern "rust-preserve-none" fn op_gettable<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_settable<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -298,7 +298,7 @@ extern "rust-preserve-none" fn op_settable<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_newtable<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -311,7 +311,7 @@ extern "rust-preserve-none" fn op_newtable<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_add<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -330,7 +330,7 @@ extern "rust-preserve-none" fn op_add<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_sub<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -349,7 +349,7 @@ extern "rust-preserve-none" fn op_sub<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_mul<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -368,7 +368,7 @@ extern "rust-preserve-none" fn op_mul<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_mod<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -387,7 +387,7 @@ extern "rust-preserve-none" fn op_mod<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_pow<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -406,7 +406,7 @@ extern "rust-preserve-none" fn op_pow<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_div<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -425,7 +425,7 @@ extern "rust-preserve-none" fn op_div<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_idiv<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -444,7 +444,7 @@ extern "rust-preserve-none" fn op_idiv<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_band<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -463,7 +463,7 @@ extern "rust-preserve-none" fn op_band<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_bor<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -482,7 +482,7 @@ extern "rust-preserve-none" fn op_bor<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_bxor<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -501,7 +501,7 @@ extern "rust-preserve-none" fn op_bxor<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_shl<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -520,7 +520,7 @@ extern "rust-preserve-none" fn op_shl<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_shr<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -539,7 +539,7 @@ extern "rust-preserve-none" fn op_shr<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_mmbin<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -556,7 +556,7 @@ extern "rust-preserve-none" fn op_mmbin<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_unm<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -569,7 +569,7 @@ extern "rust-preserve-none" fn op_unm<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_bnot<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -582,7 +582,7 @@ extern "rust-preserve-none" fn op_bnot<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_not<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -595,7 +595,7 @@ extern "rust-preserve-none" fn op_not<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_len<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -608,7 +608,7 @@ extern "rust-preserve-none" fn op_len<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_concat<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -621,7 +621,7 @@ extern "rust-preserve-none" fn op_concat<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_close<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -634,7 +634,7 @@ extern "rust-preserve-none" fn op_close<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_tbc<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -647,7 +647,7 @@ extern "rust-preserve-none" fn op_tbc<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_jmp<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -660,7 +660,7 @@ extern "rust-preserve-none" fn op_jmp<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_eq<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -673,7 +673,7 @@ extern "rust-preserve-none" fn op_eq<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_lt<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -686,7 +686,7 @@ extern "rust-preserve-none" fn op_lt<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_le<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -699,7 +699,7 @@ extern "rust-preserve-none" fn op_le<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_test<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -712,7 +712,7 @@ extern "rust-preserve-none" fn op_test<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_call<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -729,7 +729,7 @@ extern "rust-preserve-none" fn op_call<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_tailcall<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -742,7 +742,7 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_return<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -755,7 +755,7 @@ extern "rust-preserve-none" fn op_return<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_forloop<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -767,7 +767,7 @@ extern "rust-preserve-none" fn op_forloop<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_forprep<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -779,7 +779,7 @@ extern "rust-preserve-none" fn op_forprep<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_tforprep<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -791,7 +791,7 @@ extern "rust-preserve-none" fn op_tforprep<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_tforcall<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -803,7 +803,7 @@ extern "rust-preserve-none" fn op_tforcall<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_tforloop<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -815,7 +815,7 @@ extern "rust-preserve-none" fn op_tforloop<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_setlist<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -827,7 +827,7 @@ extern "rust-preserve-none" fn op_setlist<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_closure<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -839,7 +839,7 @@ extern "rust-preserve-none" fn op_closure<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_vararg<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -851,7 +851,7 @@ extern "rust-preserve-none" fn op_vararg<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_varargprep<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -863,7 +863,7 @@ extern "rust-preserve-none" fn op_varargprep<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_nop<'gc>(
     instruction: Instruction,
-    thread: &mut Thread,
+    thread: &mut InterpreterState,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
@@ -876,7 +876,7 @@ extern "rust-preserve-none" fn op_nop<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_stop<'gc>(
     instruction: Instruction,
-    _thread: &mut Thread,
+    _thread: &mut InterpreterState,
     _registers: Registers<'gc, '_>,
     _ip: *const Instruction,
     _handlers: *const (),
