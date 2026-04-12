@@ -1,0 +1,65 @@
+use crate::dmm::{Collect, Gc, Mutation, RefLock};
+use crate::env::function::{Function, Upvalue};
+use crate::env::value::Value;
+
+/// Copy wrapper stored in Value.
+#[derive(Clone, Copy, Collect)]
+#[collect(internal, no_drop)]
+pub struct Thread<'gc>(Gc<'gc, RefLock<ThreadState<'gc>>>);
+
+#[derive(Clone, Copy, PartialEq, Eq, Collect)]
+#[collect(internal, require_static)]
+pub enum ThreadStatus {
+    Suspended,
+    Running,
+    Normal,
+    Dead,
+}
+
+/// A single call frame on the call stack.
+#[derive(Collect)]
+#[collect(internal, no_drop)]
+pub struct CallFrame<'gc> {
+    pub function: Function<'gc>,
+    pub base: usize,
+    pub pc: usize,
+    pub num_results: u8,
+}
+
+/// The mutable state of a thread/coroutine.
+#[derive(Collect)]
+#[collect(internal, no_drop)]
+pub struct ThreadState<'gc> {
+    pub stack: Vec<Value<'gc>>,
+    pub frames: Vec<CallFrame<'gc>>,
+    pub open_upvalues: Vec<Upvalue<'gc>>,
+    pub status: ThreadStatus,
+}
+
+impl<'gc> Thread<'gc> {
+    pub fn new(mc: &Mutation<'gc>) -> Self {
+        let state = ThreadState {
+            stack: Vec::new(),
+            frames: Vec::new(),
+            open_upvalues: Vec::new(),
+            status: ThreadStatus::Suspended,
+        };
+        Thread(Gc::new(mc, RefLock::new(state)))
+    }
+
+    pub fn borrow(self) -> std::cell::Ref<'gc, ThreadState<'gc>> {
+        self.0.borrow()
+    }
+
+    pub fn borrow_mut(self, mc: &Mutation<'gc>) -> std::cell::RefMut<'gc, ThreadState<'gc>> {
+        self.0.borrow_mut(mc)
+    }
+
+    pub fn status(self) -> ThreadStatus {
+        self.0.borrow().status
+    }
+
+    pub fn inner(self) -> Gc<'gc, RefLock<ThreadState<'gc>>> {
+        self.0
+    }
+}
