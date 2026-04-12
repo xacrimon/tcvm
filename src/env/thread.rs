@@ -1,4 +1,5 @@
 use crate::dmm::{Collect, Gc, Mutation, RefLock};
+use crate::env::Prototype;
 use crate::env::function::{Function, Upvalue};
 use crate::env::value::Value;
 
