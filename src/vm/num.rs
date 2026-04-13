@@ -5,8 +5,8 @@ fn exact_float_to_int(f: f64) -> Option<i64> {
         return None;
     }
 
-    const MIN: i64 = -(2<<53 - 1);
-    const MAX: i64 = 2<<53 - 1;
+    const MIN: i64 = -(2 << 53 - 1);
+    const MAX: i64 = 2 << 53 - 1;
 
     if f < MIN as f64 || f > MAX as f64 {
         return None;
@@ -210,65 +210,13 @@ impl BitOp for Shr {
     }
 }
 
-pub fn write_float(buf: &mut Vec<u8>, f: f64) {
-    if f.is_nan() {
-        buf.extend_from_slice(b"nan");
-        return;
-    }
-    if f.is_infinite() {
-        if f > 0.0 {
-            buf.extend_from_slice(b"inf");
-        } else {
-            buf.extend_from_slice(b"-inf");
-        }
-        return;
-    }
-    if f == 0.0 {
-        if f.is_sign_negative() {
-            buf.extend_from_slice(b"-0.0");
-        } else {
-            buf.extend_from_slice(b"0.0");
-        }
-        return;
-    }
-
-    // Format as scientific with 13 decimal places (= 14 significant digits).
-    // Derive the actual exponent from the formatted string to avoid log10
-    // precision issues near powers of ten.
-    let sci = format!("{:.13e}", f);
-    let (mantissa, exp_part) = sci.split_once('e').unwrap();
-    let exp: i32 = exp_part.parse().unwrap();
-
-    let s = if exp < -4 || exp >= 14 {
-        // Scientific: strip trailing zeros from mantissa, normalize exponent.
-        let mantissa = mantissa.trim_end_matches('0').trim_end_matches('.');
-        let exp_str = if exp >= 0 {
-            format!("e+{:02}", exp)
-        } else {
-            format!("e-{:02}", exp.abs())
-        };
-        format!("{}{}", mantissa, exp_str)
-    } else {
-        // Fixed: enough decimal places for 14 significant digits.
-        let prec = (13 - exp).max(0) as usize;
-        let raw = format!("{:.prec$}", f, prec = prec);
-        if raw.contains('.') {
-            raw.trim_end_matches('0').trim_end_matches('.').to_string()
-        } else {
-            raw
-        }
-    };
-
-    // Post-pass: whole-number floats need ".0" (e.g. 1.0 → "1.0" not "1").
-    if !s.contains('.') && !s.contains('e') {
-        buf.extend_from_slice(s.as_bytes());
-        buf.extend_from_slice(b".0");
-    } else {
-        buf.extend_from_slice(s.as_bytes());
-    }
+pub fn write_float(dst: &mut Vec<u8>, f: f64) {
+    let mut buf = zmij::Buffer::new();
+    let s = buf.format(f);
+    dst.extend_from_slice(s.as_bytes());
 }
 
-pub fn coerce_to_bytes(buf: &mut Vec<u8>, val: Value) -> bool {
+pub fn coerce_to_str(buf: &mut Vec<u8>, val: Value) -> bool {
     match val {
         Value::String(s) => {
             buf.extend_from_slice(s.as_bytes());

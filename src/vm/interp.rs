@@ -1,70 +1,68 @@
-use crate::instruction::Instruction;
-use crate::vm::num::{self, coerce_to_bytes, op_arith, op_bit};
+use crate::dmm::Mutation;
 use crate::env::Value;
+use crate::env::function::{Function, FunctionKind, UpvalueState};
 use crate::env::string::LuaString;
 use crate::env::table::Table;
-use crate::env::function::{Function, FunctionKind, UpvalueState};
 use crate::env::thread::{CallFrame, ThreadState, ThreadStatus};
-use crate::dmm::Mutation;
+use crate::instruction::Instruction;
+use crate::vm::num::{self, op_arith, op_bit};
 
 macro_rules! handler_array {
-    ($gc:lifetime) => {
-        {
-            type H<'a> = Handler<'a>;
-            super let handlers: &[Handler<$gc>] = &[
-                op_move as H,
-                op_load as H,
-                op_lfalseskip as H,
-                op_getupval as H,
-                op_setupval as H,
-                op_gettabup as H,
-                op_settabup as H,
-                op_gettable as H,
-                op_settable as H,
-                op_newtable as H,
-                op_add as H,
-                op_sub as H,
-                op_mul as H,
-                op_mod as H,
-                op_pow as H,
-                op_div as H,
-                op_idiv as H,
-                op_band as H,
-                op_bor as H,
-                op_bxor as H,
-                op_shl as H,
-                op_shr as H,
-                op_mmbin as H,
-                op_unm as H,
-                op_bnot as H,
-                op_not as H,
-                op_len as H,
-                op_concat as H,
-                op_close as H,
-                op_tbc as H,
-                op_jmp as H,
-                op_eq as H,
-                op_lt as H,
-                op_le as H,
-                op_test as H,
-                op_call as H,
-                op_tailcall as H,
-                op_return as H,
-                op_forloop as H,
-                op_forprep as H,
-                op_tforprep as H,
-                op_tforcall as H,
-                op_tforloop as H,
-                op_setlist as H,
-                op_closure as H,
-                op_vararg as H,
-                op_varargprep as H,
-                op_nop as H,
-                op_stop as H,
-            ];
-            handlers
-        }
-    };
+    ($gc:lifetime) => {{
+        type H<'a> = Handler<'a>;
+        super let handlers: &[Handler<$gc>] = &[
+                    op_move as H,
+                    op_load as H,
+                    op_lfalseskip as H,
+                    op_getupval as H,
+                    op_setupval as H,
+                    op_gettabup as H,
+                    op_settabup as H,
+                    op_gettable as H,
+                    op_settable as H,
+                    op_newtable as H,
+                    op_add as H,
+                    op_sub as H,
+                    op_mul as H,
+                    op_mod as H,
+                    op_pow as H,
+                    op_div as H,
+                    op_idiv as H,
+                    op_band as H,
+                    op_bor as H,
+                    op_bxor as H,
+                    op_shl as H,
+                    op_shr as H,
+                    op_mmbin as H,
+                    op_unm as H,
+                    op_bnot as H,
+                    op_not as H,
+                    op_len as H,
+                    op_concat as H,
+                    op_close as H,
+                    op_tbc as H,
+                    op_jmp as H,
+                    op_eq as H,
+                    op_lt as H,
+                    op_le as H,
+                    op_test as H,
+                    op_call as H,
+                    op_tailcall as H,
+                    op_return as H,
+                    op_forloop as H,
+                    op_forprep as H,
+                    op_tforprep as H,
+                    op_tforcall as H,
+                    op_tforloop as H,
+                    op_setlist as H,
+                    op_closure as H,
+                    op_vararg as H,
+                    op_varargprep as H,
+                    op_nop as H,
+                    op_stop as H,
+                ];
+        handlers
+    }};
 }
 
 #[derive(Debug)]
@@ -698,7 +696,9 @@ extern "rust-preserve-none" fn op_unm<'gc>(
         Value::Integer(i) => Value::Integer(i.wrapping_neg()),
         Value::Float(f) => Value::Float(-f),
         // TODO: __unm metamethod
-        _ => { raise!(); }
+        _ => {
+            raise!();
+        }
     };
     *reg!(mut dst) = result;
     dispatch!();
@@ -720,7 +720,9 @@ extern "rust-preserve-none" fn op_bnot<'gc>(
     let result = match val {
         Value::Integer(i) => Value::Integer(!i),
         // TODO: __bnot metamethod
-        _ => { raise!(); }
+        _ => {
+            raise!();
+        }
     };
     *reg!(mut dst) = result;
     dispatch!();
@@ -760,7 +762,9 @@ extern "rust-preserve-none" fn op_len<'gc>(
         Value::String(s) => Value::Integer(s.len() as i64),
         Value::Table(t) => Value::Integer(t.raw_len() as i64),
         // TODO: __len metamethod
-        _ => { raise!(); }
+        _ => {
+            raise!();
+        }
     };
     *reg!(mut dst) = result;
     dispatch!();
@@ -768,6 +772,7 @@ extern "rust-preserve-none" fn op_len<'gc>(
 
 /// R[dst] = R[lhs] .. R[rhs]  (string concatenation)
 #[inline(never)]
+#[unsafe(no_mangle)]
 extern "rust-preserve-none" fn op_concat<'gc>(
     instruction: Instruction,
     mc: &Mutation<'gc>,
@@ -782,8 +787,8 @@ extern "rust-preserve-none" fn op_concat<'gc>(
     let b = reg!(rhs);
     // TODO: __concat metamethod
     let mut buf = Vec::new();
-    check!(coerce_to_bytes(&mut buf, a));
-    check!(coerce_to_bytes(&mut buf, b));
+    check!(num::coerce_to_str(&mut buf, a));
+    check!(num::coerce_to_str(&mut buf, b));
     *reg!(mut dst) = Value::String(LuaString::new(mc, &buf));
     dispatch!();
 }
@@ -886,7 +891,9 @@ extern "rust-preserve-none" fn op_lt<'gc>(
         (Value::Float(a), Value::Integer(b)) => a < (b as f64),
         (Value::String(a), Value::String(b)) => a < b,
         // TODO: __lt metamethod
-        _ => { raise!(); }
+        _ => {
+            raise!();
+        }
     };
     if result != inverted {
         skip!();
@@ -915,7 +922,9 @@ extern "rust-preserve-none" fn op_le<'gc>(
         (Value::Float(a), Value::Integer(b)) => a <= (b as f64),
         (Value::String(a), Value::String(b)) => a <= b,
         // TODO: __le metamethod
-        _ => { raise!(); }
+        _ => {
+            raise!();
+        }
     };
     if result != inverted {
         skip!();
@@ -1088,7 +1097,11 @@ extern "rust-preserve-none" fn op_return<'gc>(
 
     // Copy return values into caller's expected slots
     let dst_start = cur_base - 1; // func slot in caller's frame
-    let wanted = if num_results == 0 { 0 } else { num_results as usize - 1 };
+    let wanted = if num_results == 0 {
+        0
+    } else {
+        num_results as usize - 1
+    };
     let to_copy = nret.min(wanted);
     for i in 0..to_copy {
         thread.stack[dst_start + i] = thread.stack[cur_base + values as usize + i];
@@ -1134,7 +1147,11 @@ extern "rust-preserve-none" fn op_forprep<'gc>(
 
     let should_run = match (init, limit, step) {
         (Value::Integer(i), Value::Integer(lim), Value::Integer(s)) => {
-            if s > 0 { i <= lim } else { i >= lim }
+            if s > 0 {
+                i <= lim
+            } else {
+                i >= lim
+            }
         }
         _ => {
             let i = to_number(init).unwrap_or(0.0);
