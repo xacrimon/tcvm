@@ -991,7 +991,7 @@ extern "rust-preserve-none" fn op_call<'gc>(
             #[cfg(debug_assertions)]
             let registers = &mut thread.stack[new_base..];
             #[cfg(not(debug_assertions))]
-            let registers = thread.stack.as_mut_ptr().add(new_base);
+            let registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
             dispatch!();
         }
         FunctionKind::Native(_native) => {
@@ -1043,7 +1043,7 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
             #[cfg(debug_assertions)]
             let registers = &mut thread.stack[cur_base..];
             #[cfg(not(debug_assertions))]
-            let registers = thread.stack.as_mut_ptr().add(cur_base);
+            let registers = unsafe { thread.stack.as_mut_ptr().add(cur_base) };
             dispatch!();
         }
         FunctionKind::Native(_native) => {
