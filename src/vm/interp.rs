@@ -990,6 +990,15 @@ extern "rust-preserve-none" fn op_call<'gc>(
             if thread.stack.len() < needed {
                 thread.stack.resize(needed, Value::Nil);
             }
+            // Nil-fill parameter slots the caller didn't supply.
+            // args == 0 means variable arg count (top-based, not yet supported).
+            if nargs > 0 {
+                let caller_provided = nargs as usize - 1;
+                let num_params = closure.proto.num_params as usize;
+                for i in caller_provided..num_params {
+                    thread.stack[new_base + i] = Value::Nil;
+                }
+            }
             // Push new call frame
             thread.frames.push(CallFrame {
                 closure,
@@ -1048,6 +1057,11 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
             let needed = cur_base + closure.proto.max_stack_size as usize;
             if thread.stack.len() < needed {
                 thread.stack.resize(needed, Value::Nil);
+            }
+            // Nil-fill parameter slots the caller didn't supply.
+            let num_params = closure.proto.num_params as usize;
+            for i in nargs..num_params {
+                thread.stack[cur_base + i] = Value::Nil;
             }
             // Rebind ip and registers
             ip = closure.proto.code.as_ptr();
