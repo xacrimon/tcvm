@@ -3,7 +3,7 @@ use crate::vm::num::{self, op_arith, op_bit};
 use crate::env::Value;
 use crate::env::string::LuaString;
 use crate::env::table::Table;
-use crate::env::function::UpvalueState;
+use crate::env::function::{Function, FunctionKind, UpvalueState};
 use crate::env::thread::{CallFrame, ThreadState, ThreadStatus};
 use crate::dmm::Mutation;
 
@@ -80,6 +80,7 @@ type Registers<'gc, 'a> = *mut Value<'gc>;
 
 type Handler<'gc> = extern "rust-preserve-none" fn(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
@@ -87,7 +88,7 @@ type Handler<'gc> = extern "rust-preserve-none" fn(
 ) -> Result<(), Box<Error>>;
 
 macro_rules! helpers {
-    ($instruction:expr, $thread:expr, $registers:expr, $ip:expr, $handlers:expr) => {
+    ($instruction:expr, $mc:expr, $thread:expr, $registers:expr, $ip:expr, $handlers:expr) => {
         #[allow(unused_macros)]
         macro_rules! dispatch {
             () => {{
@@ -103,7 +104,7 @@ macro_rules! helpers {
                     debug_assert!(pos < handler_array!('static).len());
                     let handler = *$handlers.cast::<Handler<'gc>>().add(pos);
                     let ip = $ip.add(1);
-                    become handler(instruction, $thread, $registers, ip, $handlers);
+                    become handler(instruction, $mc, $thread, $registers, ip, $handlers);
                 }
             }};
         }
@@ -121,7 +122,7 @@ macro_rules! helpers {
         #[allow(unused_macros)]
         macro_rules! raise {
             () => {{
-                become impl_error($instruction, $thread, $registers, $ip, $handlers);
+                become impl_error($instruction, $mc, $thread, $registers, $ip, $handlers);
             }};
         }
 
@@ -187,9 +188,9 @@ macro_rules! helpers {
 }
 
 #[inline(never)]
-pub fn run<'gc>(tape: &[Instruction], thread: &mut ThreadState<'gc>) {
+pub fn run<'gc>(mc: &Mutation<'gc>, tape: &[Instruction], thread: &mut ThreadState<'gc>) {
     let ip = tape.as_ptr();
-    let handlers=  handler_array!('gc);
+    let handlers = handler_array!('gc);
     let handlers = handlers.as_ptr() as *const ();
 
     #[cfg(debug_assertions)]
@@ -198,7 +199,7 @@ pub fn run<'gc>(tape: &[Instruction], thread: &mut ThreadState<'gc>) {
     #[cfg(not(debug_assertions))]
     let registers = std::ptr::null_mut();
 
-    op_nop(Instruction::NOP, thread, registers, ip, handlers).unwrap();
+    op_nop(Instruction::NOP, mc, thread, registers, ip, handlers).unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +210,7 @@ pub fn run<'gc>(tape: &[Instruction], thread: &mut ThreadState<'gc>) {
 #[inline(never)]
 extern "rust-preserve-none" fn impl_error<'gc>(
     _instruction: Instruction,
+    _mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     _registers: Registers<'gc, '_>,
     ip: *const Instruction,
@@ -225,12 +227,13 @@ extern "rust-preserve-none" fn impl_error<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_move<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (dst, src) = args!(Instruction::MOVE { dst, src });
     *reg!(mut dst) = reg!(src);
     dispatch!();
@@ -240,12 +243,13 @@ extern "rust-preserve-none" fn op_move<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_load<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (dst, idx) = args!(Instruction::LOAD { dst, idx });
     *reg!(mut dst) = constant!(idx);
     dispatch!();
@@ -255,12 +259,13 @@ extern "rust-preserve-none" fn op_load<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_lfalseskip<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let src = args!(Instruction::LFALSESKIP { src });
     *reg!(mut src) = Value::Boolean(false);
     skip!();
@@ -274,12 +279,13 @@ extern "rust-preserve-none" fn op_lfalseskip<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_getupval<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (dst, idx) = args!(Instruction::GETUPVAL { dst, idx });
     let uv = upvalue!(idx);
     let val = match &*uv.borrow() {
@@ -293,21 +299,23 @@ extern "rust-preserve-none" fn op_getupval<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_setupval<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (src, idx) = args!(Instruction::SETUPVAL { src, idx });
     let val = reg!(src);
     let uv = upvalue!(idx);
-    // TODO: needs &Mutation for borrow_mut
-    // let mut uv_ref = uv.borrow_mut(mc);
-    // match &mut *uv_ref {
-    //     UpvalueState::Open { thread: t, index } => { t.borrow_mut(mc).stack[*index] = val; }
-    //     UpvalueState::Closed(v) => *v = val,
-    // }
+    let mut uv_ref = uv.borrow_mut(mc);
+    match &mut *uv_ref {
+        UpvalueState::Open { thread: t, index } => {
+            t.borrow_mut(mc).stack[*index] = val;
+        }
+        UpvalueState::Closed(v) => *v = val,
+    }
     dispatch!();
 }
 
@@ -319,12 +327,13 @@ extern "rust-preserve-none" fn op_setupval<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_gettabup<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (dst, idx, key) = args!(Instruction::GETTABUP { dst, idx, key });
     let uv = upvalue!(idx);
     let table_val = match &*uv.borrow() {
@@ -341,12 +350,13 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_settabup<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (src, idx, key) = args!(Instruction::SETTABUP { src, idx, key });
     let uv = upvalue!(idx);
     let table_val = match &*uv.borrow() {
@@ -356,8 +366,7 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
     let table = table_val.get_table().unwrap();
     let key = constant!(key);
     let val = reg!(src);
-    // TODO: needs &Mutation for raw_set
-    // table.raw_set(mc, key, val);
+    table.raw_set(mc, key, val);
     dispatch!();
 }
 
@@ -369,12 +378,13 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_gettable<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (dst, table, key) = args!(Instruction::GETTABLE { dst, table, key });
     let t = reg!(table).get_table().unwrap();
     let k = reg!(key);
@@ -387,18 +397,19 @@ extern "rust-preserve-none" fn op_gettable<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_settable<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (src, table, key) = args!(Instruction::SETTABLE { src, table, key });
-    let _t = reg!(table).get_table().unwrap();
-    let _k = reg!(key);
-    let _v = reg!(src);
-    // TODO: needs &Mutation for raw_set
-    // t.raw_set(mc, k, v);
+    let t = reg!(table).get_table().unwrap();
+    let k = reg!(key);
+    let v = reg!(src);
+    // TODO: __newindex metamethod fallback
+    t.raw_set(mc, k, v);
     dispatch!();
 }
 
@@ -406,15 +417,15 @@ extern "rust-preserve-none" fn op_settable<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_newtable<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    let _dst = args!(Instruction::NEWTABLE { dst });
-    // TODO: needs &Mutation for Table::new
-    // *reg!(mut dst) = Value::Table(Table::new(mc));
+    helpers!(instruction, mc, thread, registers, ip, handlers);
+    let dst = args!(Instruction::NEWTABLE { dst });
+    *reg!(mut dst) = Value::Table(Table::new(mc));
     dispatch!();
 }
 
@@ -425,12 +436,13 @@ extern "rust-preserve-none" fn op_newtable<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_add<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (dst, lhs, rhs) = args!(Instruction::ADD { dst, lhs, rhs });
     let (lhs, rhs) = (reg!(lhs), reg!(rhs));
     if let Some(v) = op_arith::<num::Add>(lhs, rhs) {
@@ -443,12 +455,13 @@ extern "rust-preserve-none" fn op_add<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_sub<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (dst, lhs, rhs) = args!(Instruction::SUB { dst, lhs, rhs });
     let (lhs, rhs) = (reg!(lhs), reg!(rhs));
     if let Some(v) = op_arith::<num::Sub>(lhs, rhs) {
@@ -460,12 +473,13 @@ extern "rust-preserve-none" fn op_sub<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_mul<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (dst, lhs, rhs) = args!(Instruction::MUL { dst, lhs, rhs });
     let (lhs, rhs) = (reg!(lhs), reg!(rhs));
     if let Some(v) = op_arith::<num::Mul>(lhs, rhs) {
@@ -477,12 +491,13 @@ extern "rust-preserve-none" fn op_mul<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_mod<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (dst, lhs, rhs) = args!(Instruction::MOD { dst, lhs, rhs });
     let (lhs, rhs) = (reg!(lhs), reg!(rhs));
     if let Some(v) = op_arith::<num::Mod>(lhs, rhs) {
@@ -494,12 +509,13 @@ extern "rust-preserve-none" fn op_mod<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_pow<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (dst, lhs, rhs) = args!(Instruction::POW { dst, lhs, rhs });
     let (lhs, rhs) = (reg!(lhs), reg!(rhs));
     if let Some(v) = op_arith::<num::Pow>(lhs, rhs) {
@@ -511,12 +527,13 @@ extern "rust-preserve-none" fn op_pow<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_div<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (dst, lhs, rhs) = args!(Instruction::DIV { dst, lhs, rhs });
     let (lhs, rhs) = (reg!(lhs), reg!(rhs));
     if let Some(v) = op_arith::<num::Div>(lhs, rhs) {
@@ -528,12 +545,13 @@ extern "rust-preserve-none" fn op_div<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_idiv<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (dst, lhs, rhs) = args!(Instruction::IDIV { dst, lhs, rhs });
     let (lhs, rhs) = (reg!(lhs), reg!(rhs));
     if let Some(v) = op_arith::<num::IDiv>(lhs, rhs) {
@@ -549,12 +567,13 @@ extern "rust-preserve-none" fn op_idiv<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_band<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (dst, lhs, rhs) = args!(Instruction::BAND { dst, lhs, rhs });
     let (lhs, rhs) = (reg!(lhs), reg!(rhs));
     if let Some(v) = op_bit::<num::BAnd>(lhs, rhs) {
@@ -566,12 +585,13 @@ extern "rust-preserve-none" fn op_band<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_bor<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (dst, lhs, rhs) = args!(Instruction::BOR { dst, lhs, rhs });
     let (lhs, rhs) = (reg!(lhs), reg!(rhs));
     if let Some(v) = op_bit::<num::BOr>(lhs, rhs) {
@@ -583,12 +603,13 @@ extern "rust-preserve-none" fn op_bor<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_bxor<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (dst, lhs, rhs) = args!(Instruction::BXOR { dst, lhs, rhs });
     let (lhs, rhs) = (reg!(lhs), reg!(rhs));
     if let Some(v) = op_bit::<num::BXor>(lhs, rhs) {
@@ -600,12 +621,13 @@ extern "rust-preserve-none" fn op_bxor<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_shl<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (dst, lhs, rhs) = args!(Instruction::SHL { dst, lhs, rhs });
     let (lhs, rhs) = (reg!(lhs), reg!(rhs));
     if let Some(v) = op_bit::<num::Shl>(lhs, rhs) {
@@ -617,12 +639,13 @@ extern "rust-preserve-none" fn op_shl<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_shr<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (dst, lhs, rhs) = args!(Instruction::SHR { dst, lhs, rhs });
     let (lhs, rhs) = (reg!(lhs), reg!(rhs));
     if let Some(v) = op_bit::<num::Shr>(lhs, rhs) {
@@ -638,12 +661,13 @@ extern "rust-preserve-none" fn op_shr<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_mmbin<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (_lhs, _rhs, _metamethod) = args!(Instruction::MMBIN {
         lhs,
         rhs,
@@ -661,12 +685,13 @@ extern "rust-preserve-none" fn op_mmbin<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_unm<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (dst, src) = args!(Instruction::UNM { dst, src });
     let val = reg!(src);
     let result = match val {
@@ -683,12 +708,13 @@ extern "rust-preserve-none" fn op_unm<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_bnot<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (dst, src) = args!(Instruction::BNOT { dst, src });
     let val = reg!(src);
     let result = match val {
@@ -704,12 +730,13 @@ extern "rust-preserve-none" fn op_bnot<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_not<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (dst, src) = args!(Instruction::NOT { dst, src });
     let val = reg!(src);
     *reg!(mut dst) = Value::Boolean(val.is_falsy());
@@ -720,12 +747,13 @@ extern "rust-preserve-none" fn op_not<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_len<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (dst, src) = args!(Instruction::LEN { dst, src });
     let val = reg!(src);
     let result = match val {
@@ -742,26 +770,26 @@ extern "rust-preserve-none" fn op_len<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_concat<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (dst, lhs, rhs) = args!(Instruction::CONCAT { dst, lhs, rhs });
-    let _a = reg!(lhs);
-    let _b = reg!(rhs);
-    // TODO: needs &Mutation for LuaString::new
-    // Also: number-to-string coercion, __concat metamethod
-    // match (a, b) {
-    //     (Value::String(a), Value::String(b)) => {
-    //         let mut buf = Vec::with_capacity(a.len() + b.len());
-    //         buf.extend_from_slice(a.as_bytes());
-    //         buf.extend_from_slice(b.as_bytes());
-    //         *reg!(mut dst) = Value::String(LuaString::new(mc, &buf));
-    //     }
-    //     _ => { raise!(); }
-    // }
+    let a = reg!(lhs);
+    let b = reg!(rhs);
+    // TODO: number-to-string coercion, __concat metamethod
+    match (a, b) {
+        (Value::String(a), Value::String(b)) => {
+            let mut buf = Vec::with_capacity(a.len() + b.len());
+            buf.extend_from_slice(a.as_bytes());
+            buf.extend_from_slice(b.as_bytes());
+            *reg!(mut dst) = Value::String(LuaString::new(mc, &buf));
+        }
+        _ => { raise!(); }
+    }
     dispatch!();
 }
 
@@ -773,18 +801,17 @@ extern "rust-preserve-none" fn op_concat<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_close<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    let _start = args!(Instruction::CLOSE { start });
-    // TODO: needs &Mutation for upvalue borrow_mut
-    // let base = thread.frames.last().map_or(0, |f| f.base);
-    // let start_idx = base + start as usize;
-    // Close all open upvalues pointing at stack indices >= start_idx
-    // by capturing the current stack value into UpvalueState::Closed.
+    helpers!(instruction, mc, thread, registers, ip, handlers);
+    let start = args!(Instruction::CLOSE { start });
+    let base = thread.frames.last().map_or(0, |f| f.base);
+    let start_idx = base + start as usize;
+    close_upvalues(mc, thread, start_idx);
     dispatch!();
 }
 
@@ -792,12 +819,13 @@ extern "rust-preserve-none" fn op_close<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_tbc<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let _val = args!(Instruction::TBC { val });
     // TODO: mark variable as to-be-closed for __close metamethod
     dispatch!();
@@ -811,12 +839,13 @@ extern "rust-preserve-none" fn op_tbc<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_jmp<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let offset = args!(Instruction::JMP { offset });
     ip = unsafe { ip.offset(offset as isize) };
     dispatch!();
@@ -826,12 +855,13 @@ extern "rust-preserve-none" fn op_jmp<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_eq<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (lhs, rhs, inverted) = args!(Instruction::EQ { lhs, rhs, inverted });
     let equal = reg!(lhs) == reg!(rhs);
     if equal != inverted {
@@ -844,12 +874,13 @@ extern "rust-preserve-none" fn op_eq<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_lt<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (lhs, rhs, inverted) = args!(Instruction::LT { lhs, rhs, inverted });
     let a = reg!(lhs);
     let b = reg!(rhs);
@@ -872,12 +903,13 @@ extern "rust-preserve-none" fn op_lt<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_le<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (lhs, rhs, inverted) = args!(Instruction::LE { lhs, rhs, inverted });
     let a = reg!(lhs);
     let b = reg!(rhs);
@@ -900,12 +932,13 @@ extern "rust-preserve-none" fn op_le<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_test<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (src, inverted) = args!(Instruction::TEST { src, inverted });
     let truthy = !reg!(src).is_falsy();
     if truthy != inverted {
@@ -922,72 +955,162 @@ extern "rust-preserve-none" fn op_test<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_call<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    let (_func, _args, _returns) = args!(Instruction::CALL {
+    helpers!(instruction, mc, thread, registers, ip, handlers);
+    let (func, nargs, returns) = args!(Instruction::CALL {
         func,
         args,
         returns
     });
-    // TODO: full call implementation requires &Mutation and careful
-    // register/ip rebinding. Rough logic:
-    //
-    // 1. let func_val = reg!(func).get_function().unwrap()
-    // 2. For Lua closures:
-    //    - Save caller PC in current frame
-    //    - Push new CallFrame { function, base: func_idx+1, pc: 0, num_results: returns }
-    //    - Ensure stack has room (resize if needed)
-    //    - Set ip = proto.code.as_ptr()
-    //    - Rebind registers to new base
-    //    - Dispatch first instruction
-    // 3. For native closures:
-    //    - Call the native fn with arguments
-    //    - Place results in registers
-    dispatch!();
+    let base = thread.frames.last().map_or(0, |f| f.base);
+    let func_idx = base + func as usize;
+    let func_val = thread.stack[func_idx].get_function().unwrap();
+    match &*func_val.inner() {
+        FunctionKind::Lua(closure) => {
+            let closure = *closure;
+            let new_base = func_idx + 1;
+            // Save caller's PC (offset from current code start)
+            if let Some(frame) = thread.frames.last_mut() {
+                let code_start = frame.closure.proto.code.as_ptr();
+                frame.pc = unsafe { ip.offset_from_unsigned(code_start) };
+            }
+            // Ensure stack is large enough
+            let needed = new_base + closure.proto.max_stack_size as usize;
+            if thread.stack.len() < needed {
+                thread.stack.resize(needed, Value::Nil);
+            }
+            // Push new call frame
+            thread.frames.push(CallFrame {
+                closure,
+                base: new_base,
+                pc: 0,
+                num_results: returns,
+            });
+            // Rebind ip and registers to new frame
+            ip = closure.proto.code.as_ptr();
+            #[cfg(debug_assertions)]
+            let registers = &mut thread.stack[new_base..];
+            #[cfg(not(debug_assertions))]
+            let registers = thread.stack.as_mut_ptr().add(new_base);
+            dispatch!();
+        }
+        FunctionKind::Native(_native) => {
+            // TODO: native function calls
+            raise!();
+        }
+    }
 }
 
 /// return R[func](R[func+1], ..., R[func+args-1])  — tail call
 #[inline(never)]
 extern "rust-preserve-none" fn op_tailcall<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    let (_func, _args) = args!(Instruction::TAILCALL { func, args });
-    // TODO: like CALL but reuses the current frame:
-    //
-    // 1. Move arguments down to current frame's base
-    // 2. Replace current frame's function/pc
-    // 3. Set ip to new proto's code, rebind registers
-    // 4. Dispatch
-    dispatch!();
+    helpers!(instruction, mc, thread, registers, ip, handlers);
+    let (func, nargs) = args!(Instruction::TAILCALL { func, args });
+    let base = thread.frames.last().map_or(0, |f| f.base);
+    let func_idx = base + func as usize;
+    let func_val = thread.stack[func_idx].get_function().unwrap();
+    match &*func_val.inner() {
+        FunctionKind::Lua(closure) => {
+            let closure = *closure;
+            let cur_base = thread.frames.last().unwrap().base;
+            // Move function + arguments down to current frame's base - 1
+            let nargs = if nargs == 0 { 0 } else { nargs as usize - 1 };
+            let src_start = func_idx + 1;
+            for i in 0..nargs {
+                thread.stack[cur_base + i] = thread.stack[src_start + i];
+            }
+            // Close upvalues for the current frame
+            close_upvalues(mc, thread, cur_base);
+            // Replace current frame
+            let frame = thread.frames.last_mut().unwrap();
+            frame.closure = closure;
+            frame.pc = 0;
+            // num_results stays the same (caller's expectation)
+            // Ensure stack is large enough
+            let needed = cur_base + closure.proto.max_stack_size as usize;
+            if thread.stack.len() < needed {
+                thread.stack.resize(needed, Value::Nil);
+            }
+            // Rebind ip and registers
+            ip = closure.proto.code.as_ptr();
+            #[cfg(debug_assertions)]
+            let registers = &mut thread.stack[cur_base..];
+            #[cfg(not(debug_assertions))]
+            let registers = thread.stack.as_mut_ptr().add(cur_base);
+            dispatch!();
+        }
+        FunctionKind::Native(_native) => {
+            // TODO: native tail calls
+            raise!();
+        }
+    }
 }
 
 /// return R[values], ..., R[values+count-2]
 #[inline(never)]
 extern "rust-preserve-none" fn op_return<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    let (_values, _count) = args!(Instruction::RETURN { values, count });
-    // TODO: full return implementation. Rough logic:
-    //
-    // 1. Pop current frame
-    // 2. If no caller frame -> set status = Dead, return Ok(())
-    // 3. Copy nresults return values into caller's expected slots
-    // 4. Restore caller's ip and registers base
-    // 5. Dispatch next instruction in caller
+    helpers!(instruction, mc, thread, registers, ip, handlers);
+    let (values, count) = args!(Instruction::RETURN { values, count });
+    let frame = thread.frames.last().unwrap();
+    let cur_base = frame.base;
+    let num_results = frame.num_results;
+    let nret = if count == 0 { 0 } else { count as usize - 1 };
+
+    // Close upvalues for the departing frame
+    close_upvalues(mc, thread, cur_base);
+
+    // Pop current frame
+    thread.frames.pop();
+
+    if thread.frames.is_empty() {
+        // Top-level return — copy results to stack base and finish
+        let dst_start = cur_base - 1; // func slot
+        for i in 0..nret {
+            thread.stack[dst_start + i] = thread.stack[cur_base + values as usize + i];
+        }
+        thread.status = ThreadStatus::Dead;
+        return Ok(());
+    }
+
+    // Copy return values into caller's expected slots
+    let dst_start = cur_base - 1; // func slot in caller's frame
+    let wanted = if num_results == 0 { 0 } else { num_results as usize - 1 };
+    let to_copy = nret.min(wanted);
+    for i in 0..to_copy {
+        thread.stack[dst_start + i] = thread.stack[cur_base + values as usize + i];
+    }
+    // Nil-fill remaining expected results
+    for i in to_copy..wanted {
+        thread.stack[dst_start + i] = Value::Nil;
+    }
+
+    // Restore caller's ip and registers
+    let caller = thread.frames.last().unwrap();
+    let caller_base = caller.base;
+    ip = unsafe { caller.closure.proto.code.as_ptr().add(caller.pc) };
+    #[cfg(debug_assertions)]
+    let registers = &mut thread.stack[caller_base..];
+    #[cfg(not(debug_assertions))]
+    let registers = unsafe { thread.stack.as_mut_ptr().add(caller_base) };
     dispatch!();
 }
 
@@ -1001,12 +1124,13 @@ extern "rust-preserve-none" fn op_return<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_forprep<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (base, offset) = args!(Instruction::FORPREP { base, offset });
 
     let init = reg!(base);
@@ -1040,12 +1164,13 @@ extern "rust-preserve-none" fn op_forprep<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_forloop<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (base, offset) = args!(Instruction::FORLOOP { base, offset });
 
     let step = reg!(base + 2);
@@ -1085,12 +1210,13 @@ extern "rust-preserve-none" fn op_forloop<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_tforprep<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (_base, offset) = args!(Instruction::TFORPREP { base, offset });
     ip = unsafe { ip.offset(offset as isize) };
     dispatch!();
@@ -1100,12 +1226,13 @@ extern "rust-preserve-none" fn op_tforprep<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_tforcall<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (_base, _count) = args!(Instruction::TFORCALL { base, count });
     // TODO: Call R[base](R[base+1], R[base+2]) and store `count` results
     // starting at R[base+4]. Requires the function call machinery.
@@ -1116,12 +1243,13 @@ extern "rust-preserve-none" fn op_tforcall<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_tforloop<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let (base, offset) = args!(Instruction::TFORLOOP { base, offset });
     let control = reg!(base + 2);
     if !control.is_nil() {
@@ -1139,26 +1267,26 @@ extern "rust-preserve-none" fn op_tforloop<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_setlist<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    let (_table, _count, _offset) = args!(Instruction::SETLIST {
+    helpers!(instruction, mc, thread, registers, ip, handlers);
+    let (table, count, offset) = args!(Instruction::SETLIST {
         table,
         count,
         offset
     });
-    // TODO: needs &Mutation for table.raw_set
-    // let t = reg!(table).get_table().unwrap();
-    // let n = count as usize;
-    // let off = offset as i64;
-    // for i in 1..=n {
-    //     let val = reg!(table + i as u8);
-    //     let key = Value::Integer(off + i as i64);
-    //     t.raw_set(mc, key, val);
-    // }
+    let t = reg!(table).get_table().unwrap();
+    let n = count as usize;
+    let off = offset as i64;
+    for i in 1..=n {
+        let val = reg!(table + i as u8);
+        let key = Value::Integer(off + i as i64);
+        t.raw_set(mc, key, val);
+    }
     dispatch!();
 }
 
@@ -1170,18 +1298,19 @@ extern "rust-preserve-none" fn op_setlist<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_closure<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    let (_dst, _proto_idx) = args!(Instruction::CLOSURE { dst, proto });
-    // TODO: needs &Mutation for Function::new_lua / Gc::new
-    // let frame = thread.frames.last().unwrap();
-    // let proto = frame.closure.proto.prototypes[proto_idx as usize];
-    // let func = Function::new_lua(mc, proto, Box::new([]));
-    // *reg!(mut dst) = Value::Function(func);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
+    let (dst, proto_idx) = args!(Instruction::CLOSURE { dst, proto });
+    let frame = thread.frames.last().unwrap();
+    let proto = frame.closure.proto.prototypes[proto_idx as usize];
+    // TODO: capture upvalues from enclosing scope based on proto.upvalue_desc
+    let func = Function::new_lua(mc, proto, Box::new([]));
+    *reg!(mut dst) = Value::Function(func);
     dispatch!();
 }
 
@@ -1193,16 +1322,26 @@ extern "rust-preserve-none" fn op_closure<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_vararg<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
-    let (_dst, _count) = args!(Instruction::VARARG { dst, count });
-    // TODO: Copy vararg values from below the current frame's base into
-    // R[dst]..R[dst+count-2]. Varargs are the arguments beyond num_fixed
-    // that were passed to the current function.
+    helpers!(instruction, mc, thread, registers, ip, handlers);
+    let (dst, count) = args!(Instruction::VARARG { dst, count });
+    let frame = thread.frames.last().unwrap();
+    let base = frame.base;
+    let num_fixed = frame.closure.proto.num_params as usize;
+    // Varargs are stored below base: stack[base - num_varargs .. base - num_fixed]
+    // Actually they're at stack[base - num_extra .. base] where the caller put them
+    // For now: the varargs sit in the slots between (base - num_extra) and base
+    // The exact number of varargs depends on how many args were actually passed.
+    // TODO: track actual arg count to properly copy varargs
+    let wanted = if count == 0 { 0 } else { count as usize - 1 };
+    for i in 0..wanted {
+        *reg!(mut dst + i as u8) = Value::Nil;
+    }
     dispatch!();
 }
 
@@ -1210,15 +1349,18 @@ extern "rust-preserve-none" fn op_vararg<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_varargprep<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     let _num_fixed = args!(Instruction::VARARGPREP { num_fixed });
-    // TODO: Move fixed params into proper positions and save extra args
-    // as varargs below the frame base.
+    // VARARGPREP is the first instruction of a vararg function.
+    // In Lua 5.4, this adjusts the stack so that fixed params are in the
+    // right place and extra args are accessible by VARARG.
+    // TODO: implement vararg stack adjustment when we track actual arg count
     dispatch!();
 }
 
@@ -1229,12 +1371,13 @@ extern "rust-preserve-none" fn op_varargprep<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_nop<'gc>(
     instruction: Instruction,
+    mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, thread, registers, ip, handlers);
+    helpers!(instruction, mc, thread, registers, ip, handlers);
     args!(Instruction::NOP {});
     dispatch!();
 }
@@ -1242,12 +1385,13 @@ extern "rust-preserve-none" fn op_nop<'gc>(
 #[inline(never)]
 extern "rust-preserve-none" fn op_stop<'gc>(
     instruction: Instruction,
+    _mc: &Mutation<'gc>,
     _thread: &mut ThreadState<'gc>,
     _registers: Registers<'gc, '_>,
     _ip: *const Instruction,
     _handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, _thread, _registers, _ip, _handlers);
+    helpers!(instruction, _mc, _thread, _registers, _ip, _handlers);
     args!(Instruction::STOP {});
     Ok(())
 }
@@ -1262,4 +1406,31 @@ fn to_number(v: Value) -> Option<f64> {
         Value::Float(f) => Some(f),
         _ => None,
     }
+}
+
+/// Close all open upvalues pointing at stack indices >= `start_idx`.
+/// Each open upvalue is converted to Closed by capturing the current stack value.
+fn close_upvalues<'gc>(mc: &Mutation<'gc>, thread: &mut ThreadState<'gc>, start_idx: usize) {
+    thread.open_upvalues.retain(|uv| {
+        let should_close = {
+            let borrowed = uv.borrow();
+            match &*borrowed {
+                UpvalueState::Open { index, .. } => *index >= start_idx,
+                UpvalueState::Closed(_) => false,
+            }
+        };
+        if should_close {
+            let val = thread.stack[{
+                let b = uv.borrow();
+                match &*b {
+                    UpvalueState::Open { index, .. } => *index,
+                    _ => unreachable!(),
+                }
+            }];
+            *uv.borrow_mut(mc) = UpvalueState::Closed(val);
+            false // remove from open list
+        } else {
+            true // keep
+        }
+    });
 }
