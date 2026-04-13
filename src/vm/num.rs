@@ -267,3 +267,21 @@ pub fn write_float(buf: &mut Vec<u8>, f: f64) {
         buf.extend_from_slice(s.as_bytes());
     }
 }
+
+pub fn coerce_to_bytes(buf: &mut Vec<u8>, val: Value) -> bool {
+    match val {
+        Value::String(s) => {
+            buf.extend_from_slice(s.as_bytes());
+            true
+        }
+        Value::Integer(n) => {
+            buf.extend_from_slice(n.to_string().as_bytes());
+            true
+        }
+        Value::Float(f) => {
+            write_float(buf, f);
+            true
+        }
+        _ => false,
+    }
+}
