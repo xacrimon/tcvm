@@ -14,4 +14,3 @@ Ready to implement (design decisions needed):
 
   Lower priority (correctness refinements):
   5. Metamethod dispatch (MMBIN, __index, __newindex, __lt, __le, __unm, __bnot, __len, __concat, __close)
-  7. TBC (to-be-closed variable marking)
