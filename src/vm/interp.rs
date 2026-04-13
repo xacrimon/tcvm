@@ -812,6 +812,7 @@ extern "rust-preserve-none" fn op_close<'gc>(
     let base = thread.frames.last().map_or(0, |f| f.base);
     let start_idx = base + start as usize;
     close_upvalues(mc, thread, start_idx);
+    close_tbc_vars(mc, thread, start_idx);
     dispatch!();
 }
 
@@ -826,8 +827,9 @@ extern "rust-preserve-none" fn op_tbc<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, mc, thread, registers, ip, handlers);
-    let _val = args!(Instruction::TBC { val });
-    // TODO: mark variable as to-be-closed for __close metamethod
+    let val = args!(Instruction::TBC { val });
+    let base = thread.frames.last().map_or(0, |f| f.base);
+    thread.tbc_slots.push(base + val as usize);
     dispatch!();
 }
 
@@ -1079,8 +1081,9 @@ extern "rust-preserve-none" fn op_return<'gc>(
     let num_results = frame.num_results;
     let nret = if count == 0 { 0 } else { count as usize - 1 };
 
-    // Close upvalues for the departing frame
+    // Close upvalues and TBC variables for the departing frame
     close_upvalues(mc, thread, cur_base);
+    close_tbc_vars(mc, thread, cur_base);
 
     // Pop current frame
     thread.frames.pop();
@@ -1418,6 +1421,19 @@ fn to_number(v: Value) -> Option<f64> {
         Value::Float(f) => Some(f),
         _ => None,
     }
+}
+
+/// Close all TBC variables at stack indices >= `start_idx`.
+/// Removes them from the tracking list; __close invocation is TODO.
+fn close_tbc_vars<'gc>(_mc: &Mutation<'gc>, thread: &mut ThreadState<'gc>, start_idx: usize) {
+    thread.tbc_slots.retain(|&slot| {
+        if slot >= start_idx {
+            // TODO: invoke __close metamethod on thread.stack[slot]
+            false
+        } else {
+            true
+        }
+    });
 }
 
 /// Close all open upvalues pointing at stack indices >= `start_idx`.

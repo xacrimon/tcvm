@@ -34,6 +34,7 @@ pub struct ThreadState<'gc> {
     pub stack: Vec<Value<'gc>>,
     pub frames: Vec<CallFrame<'gc>>,
     pub open_upvalues: Vec<Upvalue<'gc>>,
+    pub tbc_slots: Vec<usize>,
     pub status: ThreadStatus,
 }
 
@@ -43,6 +44,7 @@ impl<'gc> Thread<'gc> {
             stack: Vec::new(),
             frames: Vec::new(),
             open_upvalues: Vec::new(),
+            tbc_slots: Vec::new(),
             status: ThreadStatus::Suspended,
         };
         Thread(Gc::new(mc, RefLock::new(state)))
