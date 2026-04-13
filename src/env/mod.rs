@@ -1,13 +1,13 @@
-pub mod value;
-pub mod table;
-pub mod string;
 pub mod function;
+pub mod string;
+pub mod table;
 pub mod thread;
 pub mod userdata;
+pub mod value;
 
-pub use value::Value;
-pub use table::Table;
-pub use string::LuaString;
 pub use function::{Function, Prototype};
+pub use string::LuaString;
+pub use table::Table;
 pub use thread::Thread;
 pub use userdata::Userdata;
+pub use value::Value;

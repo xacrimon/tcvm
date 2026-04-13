@@ -7,7 +7,7 @@
 #![feature(super_let)]
 
 pub mod dmm;
+pub mod env;
 mod instruction;
 mod parser;
 mod vm;
-pub mod env;

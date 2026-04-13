@@ -1,4 +1,4 @@
-use crate::dmm::{allocator_api::MetricsAlloc, Collect, Gc, Mutation, RefLock};
+use crate::dmm::{Collect, Gc, Mutation, RefLock, allocator_api::MetricsAlloc};
 use crate::env::value::Value;
 
 #[derive(Clone, Copy, Collect)]
