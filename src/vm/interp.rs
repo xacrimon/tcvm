@@ -1,5 +1,5 @@
 use crate::instruction::Instruction;
-use crate::vm::num::{self, op_arith, op_bit};
+use crate::vm::num::{self, coerce_to_bytes, op_arith, op_bit};
 use crate::env::Value;
 use crate::env::string::LuaString;
 use crate::env::table::Table;
@@ -780,16 +780,11 @@ extern "rust-preserve-none" fn op_concat<'gc>(
     let (dst, lhs, rhs) = args!(Instruction::CONCAT { dst, lhs, rhs });
     let a = reg!(lhs);
     let b = reg!(rhs);
-    // TODO: number-to-string coercion, __concat metamethod
-    match (a, b) {
-        (Value::String(a), Value::String(b)) => {
-            let mut buf = Vec::with_capacity(a.len() + b.len());
-            buf.extend_from_slice(a.as_bytes());
-            buf.extend_from_slice(b.as_bytes());
-            *reg!(mut dst) = Value::String(LuaString::new(mc, &buf));
-        }
-        _ => { raise!(); }
-    }
+    // TODO: __concat metamethod
+    let mut buf = Vec::new();
+    check!(coerce_to_bytes(&mut buf, a));
+    check!(coerce_to_bytes(&mut buf, b));
+    *reg!(mut dst) = Value::String(LuaString::new(mc, &buf));
     dispatch!();
 }
 
