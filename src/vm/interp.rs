@@ -11,7 +11,7 @@ macro_rules! handler_array {
     ($gc:lifetime) => {
         {
             type H<'a> = Handler<'a>;
-            let handlers: &[Handler<$gc>] = &[
+            super let handlers: &[Handler<$gc>] = &[
                 op_move as H,
                 op_load as H,
                 op_lfalseskip as H,
