@@ -30,11 +30,11 @@ expression: output
 0011  LT              R5 R8 inv=false
 0012  LFALSESKIP      R9
 0013  TEST            R9 inv=true
-0014  JMP             +18
+0014  JMP             +17
 0015  MOVE            R1 R3
 0016  CALL            R0 args=2 ret=2
 0017  TEST            R0 inv=true
-0018  JMP             +9
+0018  JMP             +8
 0019  LOAD            R10 K5  ; 1
 0020  ADD             R11 R5 R10
 0021  MMBIN           R5 R10 ADD
@@ -43,16 +43,15 @@ expression: output
 0024  CONCAT          R13 R3 R12
 0025  CONCAT          R14 R7 R13
 0026  MOVE            R7 R14
-0027  JMP             +0
-0028  LOAD            R10 K7  ; 1
-0029  ADD             R11 R3 R10
-0030  MMBIN           R3 R10 ADD
-0031  MOVE            R3 R11
-0032  JMP             -24
-0033  GETTABUP        R8 U0 K8  ; "print"
-0034  MOVE            R9 R7
-0035  CALL            R8 args=2 ret=2
-0036  RETURN          R0 count=1
+0027  LOAD            R10 K7  ; 1
+0028  ADD             R11 R3 R10
+0029  MMBIN           R3 R10 ADD
+0030  MOVE            R3 R11
+0031  JMP             -23
+0032  GETTABUP        R8 U0 K8  ; "print"
+0033  MOVE            R9 R7
+0034  CALL            R8 args=2 ret=2
+0035  RETURN          R0 count=1
 
 ; prototype 0:
   ; function (params=1, vararg=false, stack=13, upvalues=0)
@@ -72,7 +71,7 @@ expression: output
   0004  MMBIN           R0 R3 SUB
   0005  MOVE            R5 R4
   0006  LOAD            R6 K2  ; 1
-  0007  FORPREP         R2 +13
+  0007  FORPREP         R2 +12
   0008  MOD             R8 R0 R7
   0009  MMBIN           R0 R7 MOD
   0010  LOAD            R9 K3  ; 0
@@ -80,12 +79,11 @@ expression: output
   0012  EQ              R8 R9 inv=false
   0013  LFALSESKIP      R10
   0014  TEST            R10 inv=true
-  0015  JMP             +4
+  0015  JMP             +3
   0016  LOAD            R12 K5  ; false
   0017  MOVE            R11 R12
   0018  RETURN          R11 count=2
-  0019  JMP             +0
-  0020  FORLOOP         R2 -13
-  0021  LOAD            R2 K6  ; true
-  0022  MOVE            R1 R2
-  0023  RETURN          R1 count=2
+  0019  FORLOOP         R2 -12
+  0020  LOAD            R2 K6  ; true
+  0021  MOVE            R1 R2
+  0022  RETURN          R1 count=2
