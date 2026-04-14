@@ -57,39 +57,39 @@ impl<'cache, 'source> DerefMut for Parser<'cache, 'source> {
     }
 }
 
-//#[cfg(test)]
-//mod tests {
-//    use std::fs;
-//
-//    use cstree::NodeCache;
-//    use insta::assert_snapshot;
-//    use paste::paste;
-//
-//    use super::parse;
-//
-//    macro_rules! test {
-//        ($name:ident, $path:literal) => {
-//            paste! {
-//                #[test]
-//                fn [<test_parse_ $name>]() {
-//                    let mut cache = NodeCache::new();
-//                    let source = fs::read_to_string($path).unwrap();
-//                    let (syntax_tree, reports) = parse(&mut cache, &source);
-//                    let syntax_tree = syntax_tree.debug(cache.interner(), true);
-//                    assert!(reports.is_empty());
-//                    assert_snapshot!(syntax_tree);
-//                }
-//            }
-//        };
-//    }
-//
-//    test!(function, "test-files/function.lua");
-//    test!(op_prec, "test-files/op_prec.lua");
-//    test!(if, "test-files/if.lua");
-//    test!(declare, "test-files/declare.lua");
-//    test!(literal, "test-files/literal.lua");
-//    test!(comment, "test-files/comment.lua");
-//    test!(primes, "test-files/primes.lua");
-//    // test!(nbody, "test-files/nbody.lua");
-//    // test!(nbody, "test-files/mixed.lua");
-//}
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use cstree::NodeCache;
+    use insta::assert_snapshot;
+    use paste::paste;
+
+    use super::parse;
+
+    macro_rules! test {
+        ($name:ident, $path:literal) => {
+            paste! {
+                #[test]
+                fn [<test_parse_ $name>]() {
+                    let mut cache = NodeCache::new();
+                    let source = fs::read_to_string($path).unwrap();
+                    let (syntax_tree, reports) = parse(&mut cache, &source);
+                    let syntax_tree = syntax_tree.debug(cache.interner(), true);
+                    assert!(reports.is_empty());
+                    assert_snapshot!(syntax_tree);
+                }
+            }
+        };
+    }
+
+    test!(function, "test-files/function.lua");
+    test!(op_prec, "test-files/op_prec.lua");
+    test!(if, "test-files/if.lua");
+    test!(declare, "test-files/declare.lua");
+    test!(literal, "test-files/literal.lua");
+    test!(comment, "test-files/comment.lua");
+    test!(primes, "test-files/primes.lua");
+    // test!(nbody, "test-files/nbody.lua");
+    // test!(nbody, "test-files/mixed.lua");
+}
