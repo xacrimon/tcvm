@@ -1544,7 +1544,11 @@ fn compile_if_chain(ctx: &mut Ctx, item: If, end_label: u16) -> Result<(), Compi
         Ok(())
     })?;
 
-    ctx.emit_jump(end_label);
+    // Only emit jump-to-end when there's an else/elseif (otherwise we just fall through)
+    if item.else_chain().is_some() {
+        ctx.emit_jump(end_label);
+    }
+
     ctx.set_label(else_label, ctx.next_offset());
 
     // Else chain
