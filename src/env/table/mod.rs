@@ -16,7 +16,7 @@ pub struct TableState<'gc> {
 #[collect(internal, no_drop)]
 pub struct RawTable<'gc> {
     array: Vec<Value<'gc>>,
-    hash: hashbrown::HashMap<Value<'gc>, Value<'gc>, foldhash::fast::FixedState, MetricsAlloc<'gc>>,
+    hash: hashbrown::HashMap<Value<'gc>, Value<'gc>, foldhash::fast::RandomState, MetricsAlloc<'gc>>,
 }
 
 impl<'gc> Table<'gc> {
@@ -24,7 +24,7 @@ impl<'gc> Table<'gc> {
         let raw = RawTable {
             array: Vec::new(),
             hash: hashbrown::HashMap::with_hasher_in(
-                foldhash::fast::FixedState::with_seed(0),
+                foldhash::fast::RandomState::default(),
                 MetricsAlloc::new(mc),
             ),
         };

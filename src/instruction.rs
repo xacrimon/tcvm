@@ -269,6 +269,15 @@ impl Instruction {
     }
 }
 
+/// Describes how to capture an upvalue when creating a closure.
+#[derive(Debug, Clone, Copy)]
+pub enum UpValueDescriptor {
+    /// Capture from the enclosing function's local register at the given index.
+    ParentLocal(u8),
+    /// Copy from the enclosing function's upvalue at the given index.
+    ParentUpvalue(u8),
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum MetaMethod {
     INDEX,

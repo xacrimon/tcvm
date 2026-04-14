@@ -8,6 +8,7 @@
 
 pub mod dmm;
 pub mod env;
-mod instruction;
+pub(crate) mod instruction;
 mod parser;
 mod vm;
+mod compiler;
