@@ -1,0 +1,85 @@
+---
+source: src/compiler/snapshot_tests.rs
+expression: output
+---
+; function (params=0, vararg=true, stack=19, upvalues=1)
+; constants:
+;   K0 = 3
+;   K1 = 4
+;   K2 = 3
+;   K3 = 1
+;   K4 = 6
+;   K5 = "print"
+; upvalues:
+;   U0 = local R0
+; code:
+0000  VARARGPREP      fixed=0
+0001  CLOSURE         R1 P0
+0002  MOVE            R0 R1
+0003  CLOSURE         R3 P1
+0004  MOVE            R2 R3
+0005  CLOSURE         R5 P2
+0006  MOVE            R4 R5
+0007  CLOSURE         R7 P3
+0008  MOVE            R6 R7
+0009  LOAD            R8 K0  ; 3
+0010  MOVE            R5 R8
+0011  LOAD            R9 K1  ; 4
+0012  MOVE            R6 R9
+0013  CALL            R4 args=3 ret=2
+0014  MOVE            R10 R4
+0015  LOAD            R11 K2  ; 3
+0016  MOVE            R3 R11
+0017  LOAD            R12 K3  ; 1
+0018  MOVE            R4 R12
+0019  CALL            R2 args=3 ret=2
+0020  MOVE            R13 R2
+0021  LOAD            R14 K4  ; 6
+0022  MOVE            R7 R14
+0023  MOVE            R8 R13
+0024  CALL            R6 args=3 ret=2
+0025  MOVE            R15 R6
+0026  MOVE            R1 R10
+0027  MOVE            R2 R15
+0028  CALL            R0 args=3 ret=2
+0029  MOVE            R16 R0
+0030  GETTABUP        R17 U0 K5  ; "print"
+0031  MOVE            R18 R16
+0032  CALL            R17 args=2 ret=2
+0033  RETURN          R0 count=1
+
+; prototype 0:
+  ; function (params=2, vararg=false, stack=4, upvalues=0)
+  ; code:
+  0000  ADD             R3 R0 R1
+  0001  MMBIN           R0 R1 ADD
+  0002  MOVE            R2 R3
+  0003  RETURN          R2 count=2
+  0004  RETURN          R0 count=1
+
+; prototype 1:
+  ; function (params=2, vararg=false, stack=4, upvalues=0)
+  ; code:
+  0000  SUB             R3 R0 R1
+  0001  MMBIN           R0 R1 SUB
+  0002  MOVE            R2 R3
+  0003  RETURN          R2 count=2
+  0004  RETURN          R0 count=1
+
+; prototype 2:
+  ; function (params=2, vararg=false, stack=4, upvalues=0)
+  ; code:
+  0000  MUL             R3 R0 R1
+  0001  MMBIN           R0 R1 MUL
+  0002  MOVE            R2 R3
+  0003  RETURN          R2 count=2
+  0004  RETURN          R0 count=1
+
+; prototype 3:
+  ; function (params=2, vararg=false, stack=4, upvalues=0)
+  ; code:
+  0000  DIV             R3 R0 R1
+  0001  MMBIN           R0 R1 DIV
+  0002  MOVE            R2 R3
+  0003  RETURN          R2 count=2
+  0004  RETURN          R0 count=1

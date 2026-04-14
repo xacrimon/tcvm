@@ -1,0 +1,36 @@
+---
+source: src/compiler/snapshot_tests.rs
+expression: output
+---
+; function (params=0, vararg=true, stack=11, upvalues=1)
+; constants:
+;   K0 = 5
+;   K1 = 6
+;   K2 = 3
+;   K3 = 6
+;   K4 = 3
+;   K5 = "num"
+;   K6 = 5
+;   K7 = "num"
+; upvalues:
+;   U0 = local R0
+; code:
+0000  VARARGPREP      fixed=0
+0001  LOAD            R0 K0  ; 5
+0002  LOAD            R1 K1  ; 6
+0003  LOAD            R2 K2  ; 3
+0004  MUL             R3 R1 R2
+0005  MMBIN           R1 R2 MUL
+0006  ADD             R4 R0 R3
+0007  MMBIN           R0 R3 ADD
+0008  LOAD            R5 K3  ; 6
+0009  LOAD            R6 K4  ; 3
+0010  DIV             R7 R5 R6
+0011  MMBIN           R5 R6 DIV
+0012  SUB             R8 R4 R7
+0013  MMBIN           R4 R7 SUB
+0014  SETTABUP        R8 U0 K5  ; "num"
+0015  LOAD            R9 K6  ; 5
+0016  UNM             R10 R9
+0017  SETTABUP        R10 U0 K7  ; "num"
+0018  RETURN          R0 count=1
