@@ -89,4 +89,3 @@ expression: output
   0021  LOAD            R2 K6  ; true
   0022  MOVE            R1 R2
   0023  RETURN          R1 count=2
-  0024  RETURN          R0 count=1
