@@ -55,7 +55,6 @@ expression: output
   0001  MMBIN           R0 R1 ADD
   0002  MOVE            R2 R3
   0003  RETURN          R2 count=2
-  0004  RETURN          R0 count=1
 
 ; prototype 1:
   ; function (params=2, vararg=false, stack=4, upvalues=0)
@@ -64,7 +63,6 @@ expression: output
   0001  MMBIN           R0 R1 SUB
   0002  MOVE            R2 R3
   0003  RETURN          R2 count=2
-  0004  RETURN          R0 count=1
 
 ; prototype 2:
   ; function (params=2, vararg=false, stack=4, upvalues=0)
@@ -73,7 +71,6 @@ expression: output
   0001  MMBIN           R0 R1 MUL
   0002  MOVE            R2 R3
   0003  RETURN          R2 count=2
-  0004  RETURN          R0 count=1
 
 ; prototype 3:
   ; function (params=2, vararg=false, stack=4, upvalues=0)
@@ -82,4 +79,3 @@ expression: output
   0001  MMBIN           R0 R1 DIV
   0002  MOVE            R2 R3
   0003  RETURN          R2 count=2
-  0004  RETURN          R0 count=1

@@ -345,11 +345,14 @@ fn compile_function_to_chunk<'gc>(
         compile_stmt(&mut ctx, stmt)?;
     }
 
-    // Emit implicit return at the end
-    ctx.emit(Instruction::RETURN {
-        values: 0,
-        count: 1,
-    });
+    // Emit implicit return at the end (skip if the last instruction is already a return)
+    let needs_return = !matches!(ctx.chunk.tape.last(), Some(Instruction::RETURN { .. }));
+    if needs_return {
+        ctx.emit(Instruction::RETURN {
+            values: 0,
+            count: 1,
+        });
+    }
 
     let close_regs = ctx.pop_scope()?;
     if let Some(first) = close_regs.first() {
