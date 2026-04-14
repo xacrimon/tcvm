@@ -1,0 +1,73 @@
+---
+source: src/parser/mod.rs
+expression: syntax_tree
+---
+Root@0..190
+  IfStmt@0..37
+    If@0..2 "if"
+    BinOp@2..5
+      Ident@2..3
+        Ident@2..3 "x"
+      LAngle@3..4 "<"
+      LiteralExpr@4..5
+        Int@4..5 "5"
+    Then@5..9 "then"
+    StmtList@9..34
+      FuncCall@9..34
+        Ident@9..14
+          Ident@9..14 "print"
+        FuncArgs@14..34
+          LParen@14..15 "("
+          LiteralExpr@15..33
+            String@15..33 "\"x is less than 5\""
+          RParen@33..34 ")"
+    End@34..37 "end"
+  IfStmt@37..190
+    If@37..39 "if"
+    BinOp@39..42
+      Ident@39..40
+        Ident@39..40 "z"
+      LAngle@40..41 "<"
+      LiteralExpr@41..42
+        Int@41..42 "5"
+    Then@42..46 "then"
+    StmtList@46..71
+      FuncCall@46..71
+        Ident@46..51
+          Ident@46..51 "print"
+        FuncArgs@51..71
+          LParen@51..52 "("
+          LiteralExpr@52..70
+            String@52..70 "\"z is less than 5\""
+          RParen@70..71 ")"
+    ElseChain@71..190
+      IfStmt@71..190
+        ElseIf@71..77 "elseif"
+        BinOp@77..81
+          Ident@77..78
+            Ident@77..78 "z"
+          RAngle@78..79 ">"
+          LiteralExpr@79..81
+            Int@79..81 "10"
+        Then@81..85 "then"
+        StmtList@85..114
+          FuncCall@85..114
+            Ident@85..90
+              Ident@85..90 "print"
+            FuncArgs@90..114
+              LParen@90..91 "("
+              LiteralExpr@91..113
+                String@91..113 "\"z is greater than 10\""
+              RParen@113..114 ")"
+        ElseChain@114..190
+          Else@114..118 "else"
+          StmtList@118..187
+            FuncCall@118..187
+              Ident@118..123
+                Ident@118..123 "print"
+              FuncArgs@123..187
+                LParen@123..124 "("
+                LiteralExpr@124..186
+                  String@124..186 "\"z is greater than or ..."
+                RParen@186..187 ")"
+          End@187..190 "end"

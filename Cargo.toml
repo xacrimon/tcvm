@@ -31,3 +31,6 @@ hexponent = "0.3.1"
 ariadne = "0.1.5"
 paste = "1.0.15"
 genawaiter = "0.99.1"
+
+[dev-dependencies]
+insta = { version = "1.46.1", features = ["yaml"] }

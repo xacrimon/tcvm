@@ -1,0 +1,39 @@
+---
+source: src/parser/mod.rs
+expression: syntax_tree
+---
+Root@0..19
+  AssignStmt@0..13
+    AssignList@0..3
+      Ident@0..3
+        Ident@0..3 "num"
+    Assign@3..4 "="
+    ExprList@4..13
+      BinOp@4..13
+        BinOp@4..9
+          LiteralExpr@4..5
+            Int@4..5 "5"
+          Plus@5..6 "+"
+          BinOp@6..9
+            LiteralExpr@6..7
+              Int@6..7 "6"
+            Star@7..8 "*"
+            LiteralExpr@8..9
+              Int@8..9 "3"
+        Minus@9..10 "-"
+        BinOp@10..13
+          LiteralExpr@10..11
+            Int@10..11 "6"
+          Slash@11..12 "/"
+          LiteralExpr@12..13
+            Int@12..13 "3"
+  AssignStmt@13..19
+    AssignList@13..16
+      Ident@13..16
+        Ident@13..16 "num"
+    Assign@16..17 "="
+    ExprList@17..19
+      PrefixOp@17..19
+        Minus@17..18 "-"
+        LiteralExpr@18..19
+          Int@18..19 "5"
