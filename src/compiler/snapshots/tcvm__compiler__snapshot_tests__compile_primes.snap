@@ -1,0 +1,92 @@
+---
+source: src/compiler/snapshot_tests.rs
+expression: output
+---
+; function (params=0, vararg=true, stack=15, upvalues=1)
+; constants:
+;   K0 = 2
+;   K1 = 0
+;   K2 = ""
+;   K3 = 1000
+;   K4 = true
+;   K5 = 1
+;   K6 = "\n"
+;   K7 = 1
+;   K8 = "print"
+; upvalues:
+;   U0 = local R0
+; code:
+0000  VARARGPREP      fixed=0
+0001  CLOSURE         R1 P0
+0002  MOVE            R0 R1
+0003  LOAD            R2 K0  ; 2
+0004  MOVE            R3 R2
+0005  LOAD            R4 K1  ; 0
+0006  MOVE            R5 R4
+0007  LOAD            R6 K2  ; ""
+0008  MOVE            R7 R6
+0009  LOAD            R8 K3  ; 1000
+0010  LOAD            R9 K4  ; true
+0011  LT              R5 R8 inv=false
+0012  LFALSESKIP      R9
+0013  TEST            R9 inv=true
+0014  JMP             +18
+0015  MOVE            R1 R3
+0016  CALL            R0 args=2 ret=2
+0017  TEST            R0 inv=true
+0018  JMP             +9
+0019  LOAD            R10 K5  ; 1
+0020  ADD             R11 R5 R10
+0021  MMBIN           R5 R10 ADD
+0022  MOVE            R5 R11
+0023  LOAD            R12 K6  ; "\n"
+0024  CONCAT          R13 R3 R12
+0025  CONCAT          R14 R7 R13
+0026  MOVE            R7 R14
+0027  JMP             +0
+0028  LOAD            R10 K7  ; 1
+0029  ADD             R11 R3 R10
+0030  MMBIN           R3 R10 ADD
+0031  MOVE            R3 R11
+0032  JMP             -24
+0033  GETTABUP        R8 U0 K8  ; "print"
+0034  MOVE            R9 R7
+0035  CALL            R8 args=2 ret=2
+0036  RETURN          R0 count=1
+
+; prototype 0:
+  ; function (params=1, vararg=false, stack=13, upvalues=0)
+  ; constants:
+  ;   K0 = 2
+  ;   K1 = 1
+  ;   K2 = 1
+  ;   K3 = 0
+  ;   K4 = true
+  ;   K5 = false
+  ;   K6 = true
+  ; code:
+  0000  LOAD            R1 K0  ; 2
+  0001  MOVE            R2 R1
+  0002  LOAD            R3 K1  ; 1
+  0003  SUB             R4 R0 R3
+  0004  MMBIN           R0 R3 SUB
+  0005  MOVE            R5 R4
+  0006  LOAD            R6 K2  ; 1
+  0007  FORPREP         R2 +13
+  0008  MOD             R8 R0 R7
+  0009  MMBIN           R0 R7 MOD
+  0010  LOAD            R9 K3  ; 0
+  0011  LOAD            R10 K4  ; true
+  0012  EQ              R8 R9 inv=false
+  0013  LFALSESKIP      R10
+  0014  TEST            R10 inv=true
+  0015  JMP             +4
+  0016  LOAD            R12 K5  ; false
+  0017  MOVE            R11 R12
+  0018  RETURN          R11 count=2
+  0019  JMP             +0
+  0020  FORLOOP         R2 -13
+  0021  LOAD            R2 K6  ; true
+  0022  MOVE            R1 R2
+  0023  RETURN          R1 count=2
+  0024  RETURN          R0 count=1

@@ -1,5 +1,7 @@
 pub(crate) mod defs;
 mod rules;
+#[cfg(test)]
+mod snapshot_tests;
 
 use std::fmt;
 

@@ -1,0 +1,64 @@
+---
+source: src/compiler/snapshot_tests.rs
+expression: output
+---
+; function (params=0, vararg=true, stack=11, upvalues=1)
+; constants:
+;   K0 = "x"
+;   K1 = 5
+;   K2 = true
+;   K3 = "print"
+;   K4 = "x is less than 5"
+;   K5 = "z"
+;   K6 = 5
+;   K7 = true
+;   K8 = "print"
+;   K9 = "z is less than 5"
+;   K10 = "z"
+;   K11 = 10
+;   K12 = true
+;   K13 = "print"
+;   K14 = "z is greater than 10"
+;   K15 = "print"
+;   K16 = "z is greater than or equal to 5 and less than or equal to 10"
+; upvalues:
+;   U0 = local R0
+; code:
+0000  VARARGPREP      fixed=0
+0001  GETTABUP        R0 U0 K0  ; "x"
+0002  LOAD            R1 K1  ; 5
+0003  LOAD            R2 K2  ; true
+0004  LT              R0 R1 inv=false
+0005  LFALSESKIP      R2
+0006  TEST            R2 inv=true
+0007  JMP             +4
+0008  GETTABUP        R3 U0 K3  ; "print"
+0009  LOAD            R4 K4  ; "x is less than 5"
+0010  CALL            R3 args=2 ret=2
+0011  JMP             +0
+0012  GETTABUP        R3 U0 K5  ; "z"
+0013  LOAD            R4 K6  ; 5
+0014  LOAD            R5 K7  ; true
+0015  LT              R3 R4 inv=false
+0016  LFALSESKIP      R5
+0017  TEST            R5 inv=true
+0018  JMP             +4
+0019  GETTABUP        R6 U0 K8  ; "print"
+0020  LOAD            R7 K9  ; "z is less than 5"
+0021  CALL            R6 args=2 ret=2
+0022  JMP             +14
+0023  GETTABUP        R6 U0 K10  ; "z"
+0024  LOAD            R7 K11  ; 10
+0025  LOAD            R8 K12  ; true
+0026  LT              R7 R6 inv=false
+0027  LFALSESKIP      R8
+0028  TEST            R8 inv=true
+0029  JMP             +4
+0030  GETTABUP        R9 U0 K13  ; "print"
+0031  LOAD            R10 K14  ; "z is greater than 10"
+0032  CALL            R9 args=2 ret=2
+0033  JMP             +3
+0034  GETTABUP        R9 U0 K15  ; "print"
+0035  LOAD            R10 K16  ; "z is greater than or equal to 5 and less than or equal to 10"
+0036  CALL            R9 args=2 ret=2
+0037  RETURN          R0 count=1
