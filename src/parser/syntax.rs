@@ -236,8 +236,8 @@ impl Literal {
 pub enum LiteralValue {
     Nil,
     Bool(bool),
-    Int(i32),
-    Float(f32),
+    Int(i64),
+    Float(f64),
     String(Vec<u8>),
 }
 

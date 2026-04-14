@@ -1,10 +1,10 @@
-use crate::dmm::Mutation;
+use crate::dmm::{Gc, Mutation, RefLock};
 use crate::env::Value;
-use crate::env::function::{Function, FunctionKind, UpvalueState};
+use crate::env::function::{Function, FunctionKind, Upvalue, UpvalueState};
 use crate::env::string::LuaString;
 use crate::env::table::Table;
-use crate::env::thread::{CallFrame, ThreadState, ThreadStatus};
-use crate::instruction::Instruction;
+use crate::env::thread::{CallFrame, Thread, ThreadState, ThreadStatus};
+use crate::instruction::{Instruction, UpValueDescriptor};
 use crate::vm::num::{self, op_arith, op_bit};
 
 macro_rules! handler_array {
@@ -1336,9 +1336,44 @@ extern "rust-preserve-none" fn op_closure<'gc>(
     helpers!(instruction, mc, thread, registers, ip, handlers);
     let (dst, proto_idx) = args!(Instruction::CLOSURE { dst, proto });
     let frame = thread.frames.last().unwrap();
-    let proto = frame.closure.proto.prototypes[proto_idx as usize];
-    // TODO: capture upvalues from enclosing scope based on proto.upvalue_desc
-    let func = Function::new_lua(mc, proto, Box::new([]));
+    let parent_closure = frame.closure;
+    let base = frame.base;
+    let proto = parent_closure.proto.prototypes[proto_idx as usize];
+
+    // Capture upvalues based on the prototype's upvalue descriptors
+    let thread_handle = thread.thread_handle.expect("thread must have a handle");
+    let mut upvalues_vec = Vec::with_capacity(proto.upvalue_desc.len());
+    for desc in proto.upvalue_desc.iter() {
+        let uv = match desc {
+            UpValueDescriptor::ParentLocal(idx) => {
+                let stack_idx = base + *idx as usize;
+                // Check if there's already an open upvalue for this stack slot
+                let existing = thread.open_upvalues.iter().find(|uv| {
+                    matches!(&*uv.borrow(), UpvalueState::Open { index, .. } if *index == stack_idx)
+                });
+                if let Some(uv) = existing {
+                    *uv
+                } else {
+                    let uv: Upvalue<'gc> = Gc::new(
+                        mc,
+                        RefLock::new(UpvalueState::Open {
+                            thread: thread_handle,
+                            index: stack_idx,
+                        }),
+                    );
+                    thread.open_upvalues.push(uv);
+                    uv
+                }
+            }
+            UpValueDescriptor::ParentUpvalue(idx) => {
+                parent_closure.upvalues[*idx as usize]
+            }
+        };
+        upvalues_vec.push(uv);
+    }
+    let upvalues: Box<[Upvalue<'gc>]> = upvalues_vec.into_boxed_slice();
+
+    let func = Function::new_lua(mc, proto, upvalues);
     *reg!(mut dst) = Value::Function(func);
     dispatch!();
 }

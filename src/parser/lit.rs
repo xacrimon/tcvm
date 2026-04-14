@@ -3,20 +3,20 @@ use std::num::{ParseFloatError, ParseIntError};
 use hexponent::FloatLiteral;
 use logos::Logos;
 
-pub fn parse_int(s: &str) -> Result<i32, ParseIntError> {
+pub fn parse_int(s: &str) -> Result<i64, ParseIntError> {
     s.parse()
 }
 
-pub fn parse_hex_int(s: &str) -> Result<i32, ParseIntError> {
-    i32::from_str_radix(s, 16)
+pub fn parse_hex_int(s: &str) -> Result<i64, ParseIntError> {
+    i64::from_str_radix(s, 16)
 }
 
-pub fn parse_float(s: &str) -> Result<f32, ParseFloatError> {
+pub fn parse_float(s: &str) -> Result<f64, ParseFloatError> {
     s.parse()
 }
 
-pub fn parse_hex_float(s: &str) -> Result<f32, hexponent::ParseError> {
-    Ok(s.parse::<FloatLiteral>()?.convert::<f32>().inner())
+pub fn parse_hex_float(s: &str) -> Result<f64, hexponent::ParseError> {
+    Ok(s.parse::<FloatLiteral>()?.convert::<f64>().inner())
 }
 
 pub fn parse_string(s: &str) -> Vec<u8> {

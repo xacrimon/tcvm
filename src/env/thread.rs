@@ -36,6 +36,8 @@ pub struct ThreadState<'gc> {
     pub open_upvalues: Vec<Upvalue<'gc>>,
     pub tbc_slots: Vec<usize>,
     pub status: ThreadStatus,
+    /// Back-reference to the owning Thread handle, needed for creating open upvalues.
+    pub thread_handle: Option<Thread<'gc>>,
 }
 
 impl<'gc> Thread<'gc> {
@@ -46,8 +48,12 @@ impl<'gc> Thread<'gc> {
             open_upvalues: Vec::new(),
             tbc_slots: Vec::new(),
             status: ThreadStatus::Suspended,
+            thread_handle: None,
         };
-        Thread(Gc::new(mc, RefLock::new(state)))
+        let thread = Thread(Gc::new(mc, RefLock::new(state)));
+        // Store the back-reference
+        thread.borrow_mut(mc).thread_handle = Some(thread);
+        thread
     }
 
     pub fn borrow(self) -> std::cell::Ref<'gc, ThreadState<'gc>> {

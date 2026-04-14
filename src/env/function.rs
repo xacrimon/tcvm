@@ -1,6 +1,7 @@
 use crate::dmm::{Collect, Gc, Mutation, RefLock};
 use crate::env::string::LuaString;
 use crate::env::value::Value;
+use crate::instruction::UpValueDescriptor;
 
 /// A compiled Lua function. Immutable once created.
 /// Shared by all closures created from the same function definition.
@@ -11,6 +12,8 @@ pub struct Prototype<'gc> {
     pub code: Box<[crate::instruction::Instruction]>,
     pub constants: Box<[Value<'gc>]>,
     pub prototypes: Box<[Gc<'gc, Prototype<'gc>>]>,
+    #[collect(require_static)]
+    pub upvalue_desc: Box<[UpValueDescriptor]>,
     pub num_params: u8,
     pub is_vararg: bool,
     pub max_stack_size: u8,
