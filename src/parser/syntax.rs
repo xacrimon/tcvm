@@ -1,33 +1,26 @@
-use cstree::{self, NodeOrToken, SyntaxText, interning::TokenInterner};
+use cstree::{RawSyntaxKind, Syntax, syntax::SyntaxText, util::NodeOrToken, interning::TokenInterner};
 
 use super::{kind::SyntaxKind, lit};
 use crate::T;
 
-impl From<SyntaxKind> for cstree::SyntaxKind {
-    fn from(token: SyntaxKind) -> Self {
-        Self(token as u16)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Lang {}
-
-impl cstree::Language for Lang {
-    type Kind = SyntaxKind;
-
-    fn kind_from_raw(raw: cstree::SyntaxKind) -> Self::Kind {
-        debug_assert!(raw.0 < T![__LAST] as u16);
+impl Syntax for SyntaxKind {
+    fn from_raw(raw: RawSyntaxKind) -> Self {
+        debug_assert!(raw.0 < T![__LAST] as u32);
         unsafe { std::mem::transmute(raw.0) }
     }
 
-    fn kind_to_raw(kind: Self::Kind) -> cstree::SyntaxKind {
-        kind.into()
+    fn into_raw(self) -> RawSyntaxKind {
+        RawSyntaxKind(self as u32)
+    }
+
+    fn static_text(self) -> Option<&'static str> {
+        None
     }
 }
 
-pub type SyntaxNode = cstree::SyntaxNode<Lang>;
-pub type SyntaxToken = cstree::SyntaxToken<Lang>;
-pub type SyntaxElement = cstree::NodeOrToken<SyntaxNode, SyntaxToken>;
+pub type SyntaxNode = cstree::syntax::SyntaxNode<SyntaxKind>;
+pub type SyntaxToken = cstree::syntax::SyntaxToken<SyntaxKind>;
+pub type SyntaxElement = NodeOrToken<SyntaxNode, SyntaxToken>;
 
 macro_rules! ast_node {
     ($name:ident, $kind:expr) => {
@@ -406,7 +399,7 @@ impl Func {
     pub fn name<'a>(
         &self,
         interner: &'a TokenInterner,
-    ) -> Option<SyntaxText<'_, 'a, TokenInterner, Lang>> {
+    ) -> Option<SyntaxText<'_, 'a, TokenInterner, SyntaxKind>> {
         Some(self.0.first_child()?.resolve_text(interner))
     }
 

@@ -4,7 +4,7 @@ use logos::{Lexer, Logos};
 
 #[allow(clippy::manual_non_exhaustive)]
 #[derive(Logos, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
-#[repr(u16)]
+#[repr(u32)]
 pub enum SyntaxKind {
     Invalid,
     Tombstone,

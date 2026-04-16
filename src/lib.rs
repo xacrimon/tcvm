@@ -4,7 +4,6 @@
 #![feature(likely_unlikely)]
 #![feature(allocator_api)]
 #![feature(rust_preserve_none_cc)]
-#![feature(super_let)]
 
 mod compiler;
 pub mod dmm;
