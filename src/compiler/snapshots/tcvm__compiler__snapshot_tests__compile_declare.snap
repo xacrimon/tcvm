@@ -8,19 +8,18 @@ expression: output
 ;   K1 = "x"
 ;   K2 = 10
 ;   K3 = nil
-;   K4 = nil
-;   K5 = 15
-;   K6 = "abs"
-;   K7 = "get"
-;   K8 = "other1"
-;   K9 = "i"
-;   K10 = "k"
-;   K11 = "getf"
-;   K12 = "other2"
-;   K13 = "getw"
-;   K14 = "other3"
-;   K15 = "getq"
-;   K16 = "other4"
+;   K4 = 15
+;   K5 = "abs"
+;   K6 = "get"
+;   K7 = "other1"
+;   K8 = "i"
+;   K9 = "k"
+;   K10 = "getf"
+;   K11 = "other2"
+;   K12 = "getw"
+;   K13 = "other3"
+;   K14 = "getq"
+;   K15 = "other4"
 ; upvalues:
 ;   U0 = local R0
 ; code:
@@ -29,26 +28,26 @@ expression: output
 0002  SETTABUP        R0 U0 K1  ; "x"
 0003  LOAD            R1 K2  ; 10
 0004  LOAD            R2 K3  ; nil
-0005  LOAD            R3 K4  ; nil
-0006  LOAD            R4 K5  ; 15
-0007  LOAD            R5 K6  ; "abs"
+0005  LOAD            R3 K3  ; nil
+0006  LOAD            R4 K4  ; 15
+0007  LOAD            R5 K5  ; "abs"
 0008  TBC             R5
-0009  GETTABUP        R6 U0 K7  ; "get"
+0009  GETTABUP        R6 U0 K6  ; "get"
 0010  CALL            R6 args=1 ret=2
-0011  LOAD            R7 K8  ; "other1"
-0012  SETTABUP        R6 U0 K9  ; "i"
-0013  SETTABUP        R7 U0 K10  ; "k"
-0014  GETTABUP        R10 U0 K11  ; "getf"
+0011  LOAD            R7 K7  ; "other1"
+0012  SETTABUP        R6 U0 K8  ; "i"
+0013  SETTABUP        R7 U0 K9  ; "k"
+0014  GETTABUP        R10 U0 K10  ; "getf"
 0015  CALL            R10 args=1 ret=2
-0016  LOAD            R9 K12  ; "other2"
+0016  LOAD            R9 K11  ; "other2"
 0017  MOVE            R8 R10
-0018  GETTABUP        R13 U0 K13  ; "getw"
+0018  GETTABUP        R13 U0 K12  ; "getw"
 0019  CALL            R13 args=1 ret=2
-0020  LOAD            R12 K14  ; "other3"
+0020  LOAD            R12 K13  ; "other3"
 0021  MOVE            R11 R13
-0022  GETTABUP        R16 U0 K15  ; "getq"
+0022  GETTABUP        R16 U0 K14  ; "getq"
 0023  CALL            R16 args=1 ret=2
-0024  LOAD            R15 K16  ; "other4"
+0024  LOAD            R15 K15  ; "other4"
 0025  MOVE            R14 R16
 0026  TBC             R14
 0027  TBC             R15

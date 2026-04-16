@@ -20,32 +20,28 @@ expression: output
 ;   K13 = "g"
 ;   K14 = "woos"
 ;   K15 = "h"
-;   K16 = "woos"
-;   K17 = "i"
-;   K18 = 50000.0
-;   K19 = "l"
-;   K20 = 206.0625
-;   K21 = "j"
-;   K22 = 0.1953125
-;   K23 = "k"
-;   K24 = "t"
-;   K25 = 59
-;   K26 = 63
-;   K27 = "tl"
-;   K28 = "anna"
-;   K29 = 15
-;   K30 = "james"
-;   K31 = 20
-;   K32 = "tr"
-;   K33 = 0
-;   K34 = 10
-;   K35 = "anna"
-;   K36 = 15
-;   K37 = "james"
-;   K38 = "20"
-;   K39 = "tg"
-;   K40 = 18
-;   K41 = "y"
+;   K16 = "i"
+;   K17 = 50000.0
+;   K18 = "l"
+;   K19 = 206.0625
+;   K20 = "j"
+;   K21 = 0.1953125
+;   K22 = "k"
+;   K23 = "t"
+;   K24 = 59
+;   K25 = 63
+;   K26 = "tl"
+;   K27 = "anna"
+;   K28 = 15
+;   K29 = "james"
+;   K30 = 20
+;   K31 = "tr"
+;   K32 = 0
+;   K33 = 10
+;   K34 = "20"
+;   K35 = "tg"
+;   K36 = 18
+;   K37 = "y"
 ; upvalues:
 ;   U0 = local R0
 ; code:
@@ -66,43 +62,43 @@ expression: output
 0014  SETTABUP        R6 U0 K13  ; "g"
 0015  LOAD            R7 K14  ; "woos"
 0016  SETTABUP        R7 U0 K15  ; "h"
-0017  LOAD            R8 K16  ; "woos"
-0018  SETTABUP        R8 U0 K17  ; "i"
-0019  LOAD            R9 K18  ; 50000.0
-0020  SETTABUP        R9 U0 K19  ; "l"
-0021  LOAD            R10 K20  ; 206.0625
-0022  SETTABUP        R10 U0 K21  ; "j"
-0023  LOAD            R11 K22  ; 0.1953125
-0024  SETTABUP        R11 U0 K23  ; "k"
+0017  LOAD            R8 K14  ; "woos"
+0018  SETTABUP        R8 U0 K16  ; "i"
+0019  LOAD            R9 K17  ; 50000.0
+0020  SETTABUP        R9 U0 K18  ; "l"
+0021  LOAD            R10 K19  ; 206.0625
+0022  SETTABUP        R10 U0 K20  ; "j"
+0023  LOAD            R11 K21  ; 0.1953125
+0024  SETTABUP        R11 U0 K22  ; "k"
 0025  NEWTABLE        R12
-0026  SETTABUP        R12 U0 K24  ; "t"
+0026  SETTABUP        R12 U0 K23  ; "t"
 0027  NEWTABLE        R13
-0028  LOAD            R14 K25  ; 59
+0028  LOAD            R14 K24  ; 59
 0029  MOVE            R15 R14
-0030  LOAD            R16 K26  ; 63
+0030  LOAD            R16 K25  ; 63
 0031  MOVE            R17 R16
 0032  SETLIST         R13 count=2 offset=0
-0033  SETTABUP        R13 U0 K27  ; "tl"
+0033  SETTABUP        R13 U0 K26  ; "tl"
 0034  NEWTABLE        R18
-0035  LOAD            R19 K28  ; "anna"
-0036  LOAD            R20 K29  ; 15
+0035  LOAD            R19 K27  ; "anna"
+0036  LOAD            R20 K28  ; 15
 0037  SETTABLE        R20 R18 R19
-0038  LOAD            R21 K30  ; "james"
-0039  LOAD            R22 K31  ; 20
+0038  LOAD            R21 K29  ; "james"
+0039  LOAD            R22 K30  ; 20
 0040  SETTABLE        R22 R18 R21
-0041  SETTABUP        R18 U0 K32  ; "tr"
+0041  SETTABUP        R18 U0 K31  ; "tr"
 0042  NEWTABLE        R23
-0043  LOAD            R24 K33  ; 0
-0044  LOAD            R25 K34  ; 10
+0043  LOAD            R24 K32  ; 0
+0044  LOAD            R25 K33  ; 10
 0045  SETTABLE        R25 R23 R24
-0046  LOAD            R26 K35  ; "anna"
-0047  LOAD            R27 K36  ; 15
+0046  LOAD            R26 K27  ; "anna"
+0047  LOAD            R27 K28  ; 15
 0048  SETTABLE        R27 R23 R26
-0049  LOAD            R28 K37  ; "james"
-0050  LOAD            R29 K38  ; "20"
+0049  LOAD            R28 K29  ; "james"
+0050  LOAD            R29 K34  ; "20"
 0051  SETTABLE        R29 R23 R28
-0052  SETTABUP        R23 U0 K39  ; "tg"
-0053  LOAD            R30 K40  ; 18
+0052  SETTABUP        R23 U0 K35  ; "tg"
+0053  LOAD            R30 K36  ; 18
 0054  UNM             R31 R30
-0055  SETTABUP        R31 U0 K41  ; "y"
+0055  SETTABUP        R31 U0 K37  ; "y"
 0056  RETURN          R0 count=1
