@@ -2,7 +2,7 @@
 source: src/compiler/snapshot_tests.rs
 expression: output
 ---
-; function (params=0, vararg=true, stack=23, upvalues=1)
+; function (params=0, vararg=true, stack=17, upvalues=1)
 ; constants:
 ;   K0 = 5
 ;   K1 = "x"
@@ -28,35 +28,29 @@ expression: output
 0001  LOAD            R0 K0  ; 5
 0002  SETTABUP        R0 U0 K1  ; "x"
 0003  LOAD            R1 K2  ; 10
-0004  MOVE            R2 R1
-0005  LOAD            R3 K3  ; nil
-0006  LOAD            R4 K4  ; nil
-0007  LOAD            R5 K5  ; 15
-0008  MOVE            R6 R5
-0009  LOAD            R7 K6  ; "abs"
-0010  MOVE            R8 R7
-0011  TBC             R8
-0012  GETTABUP        R9 U0 K7  ; "get"
-0013  CALL            R9 args=1 ret=2
-0014  LOAD            R10 K8  ; "other1"
-0015  SETTABUP        R9 U0 K9  ; "i"
-0016  SETTABUP        R10 U0 K10  ; "k"
-0017  GETTABUP        R11 U0 K11  ; "getf"
-0018  CALL            R11 args=1 ret=2
-0019  LOAD            R12 K12  ; "other2"
-0020  MOVE            R13 R11
-0021  MOVE            R14 R12
-0022  GETTABUP        R15 U0 K13  ; "getw"
-0023  CALL            R15 args=1 ret=2
-0024  LOAD            R16 K14  ; "other3"
-0025  MOVE            R17 R15
-0026  MOVE            R18 R16
-0027  GETTABUP        R19 U0 K15  ; "getq"
-0028  CALL            R19 args=1 ret=2
-0029  LOAD            R20 K16  ; "other4"
-0030  MOVE            R21 R19
-0031  TBC             R21
-0032  MOVE            R22 R20
-0033  TBC             R22
-0034  CLOSE           R8
-0035  RETURN          R0 count=1
+0004  LOAD            R2 K3  ; nil
+0005  LOAD            R3 K4  ; nil
+0006  LOAD            R4 K5  ; 15
+0007  LOAD            R5 K6  ; "abs"
+0008  TBC             R5
+0009  GETTABUP        R6 U0 K7  ; "get"
+0010  CALL            R6 args=1 ret=2
+0011  LOAD            R7 K8  ; "other1"
+0012  SETTABUP        R6 U0 K9  ; "i"
+0013  SETTABUP        R7 U0 K10  ; "k"
+0014  GETTABUP        R10 U0 K11  ; "getf"
+0015  CALL            R10 args=1 ret=2
+0016  LOAD            R9 K12  ; "other2"
+0017  MOVE            R8 R10
+0018  GETTABUP        R13 U0 K13  ; "getw"
+0019  CALL            R13 args=1 ret=2
+0020  LOAD            R12 K14  ; "other3"
+0021  MOVE            R11 R13
+0022  GETTABUP        R16 U0 K15  ; "getq"
+0023  CALL            R16 args=1 ret=2
+0024  LOAD            R15 K16  ; "other4"
+0025  MOVE            R14 R16
+0026  TBC             R14
+0027  TBC             R15
+0028  CLOSE           R5
+0029  RETURN          R0 count=1
