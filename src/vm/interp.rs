@@ -445,8 +445,8 @@ extern "rust-preserve-none" fn op_add<'gc>(
     let (lhs, rhs) = (reg!(lhs), reg!(rhs));
     if let Some(v) = op_arith::<num::Add>(lhs, rhs) {
         *reg!(mut dst) = v;
+        skip!();
     }
-    // TODO: if None, next instruction should be MMBIN for metamethod fallback
     dispatch!();
 }
 
@@ -464,6 +464,7 @@ extern "rust-preserve-none" fn op_sub<'gc>(
     let (lhs, rhs) = (reg!(lhs), reg!(rhs));
     if let Some(v) = op_arith::<num::Sub>(lhs, rhs) {
         *reg!(mut dst) = v;
+        skip!();
     }
     dispatch!();
 }
@@ -482,6 +483,7 @@ extern "rust-preserve-none" fn op_mul<'gc>(
     let (lhs, rhs) = (reg!(lhs), reg!(rhs));
     if let Some(v) = op_arith::<num::Mul>(lhs, rhs) {
         *reg!(mut dst) = v;
+        skip!();
     }
     dispatch!();
 }
@@ -500,6 +502,7 @@ extern "rust-preserve-none" fn op_mod<'gc>(
     let (lhs, rhs) = (reg!(lhs), reg!(rhs));
     if let Some(v) = op_arith::<num::Mod>(lhs, rhs) {
         *reg!(mut dst) = v;
+        skip!();
     }
     dispatch!();
 }
@@ -518,6 +521,7 @@ extern "rust-preserve-none" fn op_pow<'gc>(
     let (lhs, rhs) = (reg!(lhs), reg!(rhs));
     if let Some(v) = op_arith::<num::Pow>(lhs, rhs) {
         *reg!(mut dst) = v;
+        skip!();
     }
     dispatch!();
 }
@@ -536,6 +540,7 @@ extern "rust-preserve-none" fn op_div<'gc>(
     let (lhs, rhs) = (reg!(lhs), reg!(rhs));
     if let Some(v) = op_arith::<num::Div>(lhs, rhs) {
         *reg!(mut dst) = v;
+        skip!();
     }
     dispatch!();
 }
@@ -554,6 +559,7 @@ extern "rust-preserve-none" fn op_idiv<'gc>(
     let (lhs, rhs) = (reg!(lhs), reg!(rhs));
     if let Some(v) = op_arith::<num::IDiv>(lhs, rhs) {
         *reg!(mut dst) = v;
+        skip!();
     }
     dispatch!();
 }
@@ -576,6 +582,7 @@ extern "rust-preserve-none" fn op_band<'gc>(
     let (lhs, rhs) = (reg!(lhs), reg!(rhs));
     if let Some(v) = op_bit::<num::BAnd>(lhs, rhs) {
         *reg!(mut dst) = v;
+        skip!();
     }
     dispatch!();
 }
@@ -594,6 +601,7 @@ extern "rust-preserve-none" fn op_bor<'gc>(
     let (lhs, rhs) = (reg!(lhs), reg!(rhs));
     if let Some(v) = op_bit::<num::BOr>(lhs, rhs) {
         *reg!(mut dst) = v;
+        skip!();
     }
     dispatch!();
 }
@@ -612,6 +620,7 @@ extern "rust-preserve-none" fn op_bxor<'gc>(
     let (lhs, rhs) = (reg!(lhs), reg!(rhs));
     if let Some(v) = op_bit::<num::BXor>(lhs, rhs) {
         *reg!(mut dst) = v;
+        skip!();
     }
     dispatch!();
 }
@@ -630,6 +639,7 @@ extern "rust-preserve-none" fn op_shl<'gc>(
     let (lhs, rhs) = (reg!(lhs), reg!(rhs));
     if let Some(v) = op_bit::<num::Shl>(lhs, rhs) {
         *reg!(mut dst) = v;
+        skip!();
     }
     dispatch!();
 }
@@ -648,6 +658,7 @@ extern "rust-preserve-none" fn op_shr<'gc>(
     let (lhs, rhs) = (reg!(lhs), reg!(rhs));
     if let Some(v) = op_bit::<num::Shr>(lhs, rhs) {
         *reg!(mut dst) = v;
+        skip!();
     }
     dispatch!();
 }

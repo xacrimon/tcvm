@@ -12,6 +12,7 @@ use crate::parser::syntax::{
     FuncCall, FuncExpr, Goto, Ident, If, Index, Label, Literal, LiteralValue, MethodCall,
     PrefixOp, PrefixOperator, Repeat, Return, Root, Stmt, Table, TableEntry, While,
 };
+use std::cell::RefCell;
 
 // ---------------------------------------------------------------------------
 // Error helper
@@ -183,59 +184,10 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         self.alloc_constant(Value::String(lua_str))
     }
 
+    /// Resolve a variable name as an upvalue from enclosing scopes.
+    /// Deduplication is handled inside the capture callback (see `compile_nested`).
     fn resolve_upvalue(&mut self, name: &str) -> Option<u8> {
-        // Check if we already captured this name
-        for (i, desc) in self.upvalue_desc.iter().enumerate() {
-            // We need to match by name, so we track names separately
-            // Actually, upvalue_desc doesn't store names. We need a side map.
-            // For now, delegate to the capture callback which handles dedup.
-            let _ = (i, desc);
-        }
         (self.capture)(name)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Upvalue capture helper
-// ---------------------------------------------------------------------------
-
-/// Resolve a variable name as an upvalue by searching enclosing scopes.
-fn make_capture_fn<'gc, 'a>(
-    parent_scope: &'a [HashMap<String, VariableData>],
-    parent_capture: &'a mut dyn FnMut(&str) -> Option<u8>,
-    captured: &'a mut Vec<(String, UpValueDescriptor)>,
-) -> impl FnMut(&str) -> Option<u8> + 'a {
-    move |name: &str| -> Option<u8> {
-        // Already captured?
-        for (i, (n, _)) in captured.iter().enumerate() {
-            if n == name {
-                return Some(i as u8);
-            }
-        }
-
-        // Search parent's local scopes
-        for scope in parent_scope.iter().rev() {
-            if let Some(data) = scope.get(name) {
-                let idx = captured.len() as u8;
-                captured.push((
-                    name.to_owned(),
-                    UpValueDescriptor::ParentLocal(data.register.0),
-                ));
-                return Some(idx);
-            }
-        }
-
-        // Delegate to parent's capture (it's an upvalue of the parent too)
-        if let Some(parent_idx) = parent_capture(name) {
-            let idx = captured.len() as u8;
-            captured.push((
-                name.to_owned(),
-                UpValueDescriptor::ParentUpvalue(parent_idx),
-            ));
-            return Some(idx);
-        }
-
-        None
     }
 }
 
@@ -797,7 +749,7 @@ fn compile_nested<'gc>(
     let interner = ctx.interner;
     let parent_capture = &mut *ctx.capture;
 
-    let capture_list = std::cell::RefCell::new(Vec::<(String, UpValueDescriptor)>::new());
+    let capture_list = RefCell::new(Vec::<(String, UpValueDescriptor)>::new());
 
     let mut capture_fn = |name: &str| -> Option<u8> {
         let mut list = capture_list.borrow_mut();
