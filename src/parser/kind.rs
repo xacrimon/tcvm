@@ -241,10 +241,6 @@ pub enum SyntaxKind {
 
     #[token(";")]
     Semicolon,
-
-    #[doc(hidden)]
-    #[allow(clippy::upper_case_acronyms)]
-    __LAST,
 }
 
 impl SyntaxKind {
@@ -430,7 +426,6 @@ macro_rules! T {
     [;] => { $crate::parser::kind::SyntaxKind::Semicolon };
     [whitespace] => { $crate::parser::kind::SyntaxKind::Whitespace };
     [comment] => { $crate::parser::kind::SyntaxKind::Comment };
-    [__LAST] => { $crate::parser::kind::SyntaxKind::__LAST };
 }
 
 impl Display for SyntaxKind {
@@ -540,7 +535,6 @@ impl Display for SyntaxKind {
                 T![;] => ";",
                 T![whitespace] => "whitespace",
                 T![comment] => "comment",
-                T![__LAST] => "__LAST",
             }
         )
     }
