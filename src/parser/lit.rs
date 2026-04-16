@@ -1,6 +1,5 @@
 use std::num::{ParseFloatError, ParseIntError};
 
-use hexponent::FloatLiteral;
 use logos::Logos;
 
 pub fn parse_int(s: &str) -> Result<i64, ParseIntError> {
@@ -8,6 +7,7 @@ pub fn parse_int(s: &str) -> Result<i64, ParseIntError> {
 }
 
 pub fn parse_hex_int(s: &str) -> Result<i64, ParseIntError> {
+    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
     i64::from_str_radix(s, 16)
 }
 
@@ -15,8 +15,39 @@ pub fn parse_float(s: &str) -> Result<f64, ParseFloatError> {
     s.parse()
 }
 
-pub fn parse_hex_float(s: &str) -> Result<f64, hexponent::ParseError> {
-    Ok(s.parse::<FloatLiteral>()?.convert::<f64>().inner())
+pub fn parse_hex_float(s: &str) -> Option<f64> {
+    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))?;
+
+    let (mantissa, exp_str) = match s.find(['p', 'P']) {
+        Some(i) => (&s[..i], Some(&s[i + 1..])),
+        None => (s, None),
+    };
+
+    let (int_str, frac_str) = match mantissa.find('.') {
+        Some(i) => (&mantissa[..i], Some(&mantissa[i + 1..])),
+        None => (mantissa, None),
+    };
+
+    let mut value = if int_str.is_empty() {
+        0.0
+    } else {
+        u64::from_str_radix(int_str, 16).ok()? as f64
+    };
+
+    if let Some(frac) = frac_str {
+        let mut place = 1.0 / 16.0;
+        for ch in frac.chars() {
+            value += ch.to_digit(16)? as f64 * place;
+            place /= 16.0;
+        }
+    }
+
+    if let Some(exp) = exp_str {
+        let exp: i32 = exp.parse().ok()?;
+        value *= (2.0f64).powi(exp);
+    }
+
+    Some(value)
 }
 
 pub fn parse_string(s: &str) -> Vec<u8> {
