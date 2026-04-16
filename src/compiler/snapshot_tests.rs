@@ -1,6 +1,6 @@
 use std::fs;
 
-use cstree::NodeCache;
+use cstree::build::NodeCache;
 use insta::assert_snapshot;
 use paste::paste;
 

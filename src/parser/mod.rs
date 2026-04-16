@@ -6,7 +6,7 @@ pub mod syntax;
 
 use std::ops::{Deref, DerefMut};
 
-use cstree::NodeCache;
+use cstree::build::NodeCache;
 use machinery::{Span, State};
 use syntax::SyntaxNode;
 
@@ -61,7 +61,7 @@ impl<'cache, 'source> DerefMut for Parser<'cache, 'source> {
 mod tests {
     use std::fs;
 
-    use cstree::NodeCache;
+    use cstree::build::NodeCache;
     use insta::assert_snapshot;
     use paste::paste;
 

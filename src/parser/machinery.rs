@@ -5,7 +5,8 @@ use std::{
     ops::{self, Index, Not},
 };
 
-use cstree::{GreenNode, GreenNodeBuilder, NodeCache};
+use cstree::build::{GreenNodeBuilder, NodeCache};
+use cstree::green::GreenNode;
 use logos::Logos;
 
 use super::kind::SyntaxKind;
@@ -414,7 +415,7 @@ impl Display for Span {
 }
 
 struct Sink<'cache, 'source> {
-    builder: GreenNodeBuilder<'cache, 'static>,
+    builder: GreenNodeBuilder<'cache, 'static, SyntaxKind>,
     tokens: &'source [(SyntaxKind, Span)],
     cursor: usize,
     events: Vec<Event>,
@@ -439,7 +440,7 @@ impl<'cache, 'source> Sink<'cache, 'source> {
 
     fn token(&mut self, kind: SyntaxKind, text: &str) {
         self.cursor += 1;
-        self.builder.token(kind.into(), text);
+        self.builder.token(kind, text);
     }
 
     fn finish(mut self) -> GreenNode {
@@ -471,7 +472,7 @@ impl<'cache, 'source> Sink<'cache, 'source> {
 
                     #[allow(clippy::iter_with_drain)]
                     for kind in preceded_nodes.drain(..).rev() {
-                        self.builder.start_node(kind.into());
+                        self.builder.start_node(kind);
                     }
                 }
 
