@@ -1,0 +1,20 @@
+---
+source: src/compiler/snapshot_tests.rs
+expression: output
+---
+; function (params=0, vararg=true, stack=5, upvalues=1)
+; constants:
+;   K0 = "Hello"
+;   K1 = ", World"
+;   K2 = "print"
+; upvalues:
+;   U0 = local R0
+; code:
+0000  VARARGPREP      fixed=0
+0001  LOAD            R1 K0  ; "Hello"
+0002  LOAD            R2 K1  ; ", World"
+0003  CONCAT          R0 R1 R2
+0004  GETTABUP        R3 U0 K2  ; "print"
+0005  MOVE            R4 R0
+0006  CALL            R3 args=2 ret=2
+0007  RETURN          R0 count=1

@@ -1,0 +1,193 @@
+---
+source: src/parser/mod.rs
+expression: syntax_tree
+---
+Root@0..174
+  AssignStmt@0..5
+    AssignList@0..1
+      Ident@0..1
+        Ident@0..1 "a"
+    Assign@1..2 "="
+    ExprList@2..5
+      LiteralExpr@2..5
+        Int@2..5 "581"
+  AssignStmt@5..11
+    AssignList@5..6
+      Ident@5..6
+        Ident@5..6 "b"
+    Assign@6..7 "="
+    ExprList@7..11
+      LiteralExpr@7..11
+        HexInt@7..11 "0xFF"
+  AssignStmt@11..16
+    AssignList@11..12
+      Ident@11..12
+        Ident@11..12 "c"
+    Assign@12..13 "="
+    ExprList@13..16
+      LiteralExpr@13..16
+        Nil@13..16 "nil"
+  AssignStmt@16..22
+    AssignList@16..17
+      Ident@16..17
+        Ident@16..17 "d"
+    Assign@17..18 "="
+    ExprList@18..22
+      LiteralExpr@18..22
+        True@18..22 "true"
+  AssignStmt@22..29
+    AssignList@22..23
+      Ident@22..23
+        Ident@22..23 "e"
+    Assign@23..24 "="
+    ExprList@24..29
+      LiteralExpr@24..29
+        False@24..29 "false"
+  AssignStmt@29..38
+    AssignList@29..30
+      Ident@29..30
+        Ident@29..30 "f"
+    Assign@30..31 "="
+    ExprList@31..38
+      LiteralExpr@31..38
+        String@31..38 "\"hello\""
+  AssignStmt@38..47
+    AssignList@38..39
+      Ident@38..39
+        Ident@38..39 "g"
+    Assign@39..40 "="
+    ExprList@40..47
+      LiteralExpr@40..47
+        String@40..47 "'world'"
+  AssignStmt@47..58
+    AssignList@47..48
+      Ident@47..48
+        Ident@47..48 "h"
+    Assign@48..49 "="
+    ExprList@49..58
+      LiteralExpr@49..58
+        LongString@49..58 "[[woosh]]"
+  AssignStmt@58..71
+    AssignList@58..59
+      Ident@58..59
+        Ident@58..59 "i"
+    Assign@59..60 "="
+    ExprList@60..71
+      LiteralExpr@60..71
+        LongString@60..71 "[=[woosh]=]"
+  AssignStmt@71..78
+    AssignList@71..72
+      Ident@71..72
+        Ident@71..72 "l"
+    Assign@72..73 "="
+    ExprList@73..78
+      LiteralExpr@73..78
+        Float@73..78 "0.5e5"
+  AssignStmt@78..86
+    AssignList@78..79
+      Ident@78..79
+        Ident@78..79 "j"
+    Assign@79..80 "="
+    ExprList@80..86
+      LiteralExpr@80..86
+        HexFloat@80..86 "0xce.1"
+  AssignStmt@86..96
+    AssignList@86..87
+      Ident@86..87
+        Ident@86..87 "k"
+    Assign@87..88 "="
+    ExprList@88..96
+      LiteralExpr@88..96
+        HexFloat@88..96 "0x1.9p-3"
+  AssignStmt@96..100
+    AssignList@96..97
+      Ident@96..97
+        Ident@96..97 "t"
+    Assign@97..98 "="
+    ExprList@98..100
+      TableExpr@98..100
+        LCurly@98..99 "{"
+        RCurly@99..100 "}"
+  AssignStmt@100..110
+    AssignList@100..102
+      Ident@100..102
+        Ident@100..102 "tl"
+    Assign@102..103 "="
+    ExprList@103..110
+      TableExpr@103..110
+        LCurly@103..104 "{"
+        TableArrayElem@104..106
+          LiteralExpr@104..106
+            Int@104..106 "59"
+        Comma@106..107 ","
+        TableArrayElem@107..109
+          LiteralExpr@107..109
+            Int@107..109 "63"
+        RCurly@109..110 "}"
+  AssignStmt@110..131
+    AssignList@110..112
+      Ident@110..112
+        Ident@110..112 "tr"
+    Assign@112..113 "="
+    ExprList@113..131
+      TableExpr@113..131
+        LCurly@113..114 "{"
+        TableMapElem@114..121
+          Ident@114..118
+            Ident@114..118 "anna"
+          Assign@118..119 "="
+          LiteralExpr@119..121
+            Int@119..121 "15"
+        Comma@121..122 ","
+        TableMapElem@122..130
+          Ident@122..127
+            Ident@122..127 "james"
+          Assign@127..128 "="
+          LiteralExpr@128..130
+            Int@128..130 "20"
+        RCurly@130..131 "}"
+  AssignStmt@131..169
+    AssignList@131..133
+      Ident@131..133
+        Ident@131..133 "tg"
+    Assign@133..134 "="
+    ExprList@134..169
+      TableExpr@134..169
+        LCurly@134..135 "{"
+        TableGenericElem@135..141
+          LBracket@135..136 "["
+          LiteralExpr@136..137
+            Int@136..137 "0"
+          RBracket@137..138 "]"
+          Assign@138..139 "="
+          LiteralExpr@139..141
+            Int@139..141 "10"
+        Comma@141..142 ","
+        TableGenericElem@142..153
+          LBracket@142..143 "["
+          LiteralExpr@143..149
+            String@143..149 "\"anna\""
+          RBracket@149..150 "]"
+          Assign@150..151 "="
+          LiteralExpr@151..153
+            Int@151..153 "15"
+        Comma@153..154 ","
+        TableGenericElem@154..168
+          LBracket@154..155 "["
+          LiteralExpr@155..162
+            String@155..162 "\"james\""
+          RBracket@162..163 "]"
+          Assign@163..164 "="
+          LiteralExpr@164..168
+            String@164..168 "\"20\""
+        RCurly@168..169 "}"
+  AssignStmt@169..174
+    AssignList@169..170
+      Ident@169..170
+        Ident@169..170 "y"
+    Assign@170..171 "="
+    ExprList@171..174
+      PrefixOp@171..174
+        Minus@171..172 "-"
+        LiteralExpr@172..174
+          Int@172..174 "18"

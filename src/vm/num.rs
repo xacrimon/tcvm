@@ -5,8 +5,8 @@ fn exact_float_to_int(f: f64) -> Option<i64> {
         return None;
     }
 
-    const MIN: i64 = -(2<<53 - 1);
-    const MAX: i64 = 2<<53 - 1;
+    const MIN: i64 = -(2 << 53 - 1);
+    const MAX: i64 = 2 << 53 - 1;
 
     if f < MIN as f64 || f > MAX as f64 {
         return None;
@@ -207,5 +207,29 @@ impl BitOp for Shr {
     #[inline(always)]
     fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc> {
         Value::Integer(lhs.wrapping_shr(rhs as u32))
+    }
+}
+
+pub fn write_float(dst: &mut Vec<u8>, f: f64) {
+    let mut buf = zmij::Buffer::new();
+    let s = buf.format(f);
+    dst.extend_from_slice(s.as_bytes());
+}
+
+pub fn coerce_to_str(buf: &mut Vec<u8>, val: Value) -> bool {
+    match val {
+        Value::String(s) => {
+            buf.extend_from_slice(s.as_bytes());
+            true
+        }
+        Value::Integer(n) => {
+            buf.extend_from_slice(n.to_string().as_bytes());
+            true
+        }
+        Value::Float(f) => {
+            write_float(buf, f);
+            true
+        }
+        _ => false,
     }
 }

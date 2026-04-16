@@ -1,0 +1,189 @@
+---
+source: src/parser/mod.rs
+expression: syntax_tree
+---
+Root@0..200
+  DeclStmt@0..33
+    Local@0..5 "local"
+    FuncStmt@5..33
+      Function@5..13 "function"
+      Ident@13..16
+        Ident@13..16 "add"
+      FuncArgs@16..21
+        LParen@16..17 "("
+        Ident@17..18
+          Ident@17..18 "a"
+        Comma@18..19 ","
+        Ident@19..20
+          Ident@19..20 "b"
+        RParen@20..21 ")"
+      StmtList@21..30
+        ReturnStmt@21..30
+          Return@21..27 "return"
+          ExprList@27..30
+            BinOp@27..30
+              Ident@27..28
+                Ident@27..28 "a"
+              Plus@28..29 "+"
+              Ident@29..30
+                Ident@29..30 "b"
+      End@30..33 "end"
+  DeclStmt@33..66
+    Local@33..38 "local"
+    FuncStmt@38..66
+      Function@38..46 "function"
+      Ident@46..49
+        Ident@46..49 "sub"
+      FuncArgs@49..54
+        LParen@49..50 "("
+        Ident@50..51
+          Ident@50..51 "a"
+        Comma@51..52 ","
+        Ident@52..53
+          Ident@52..53 "b"
+        RParen@53..54 ")"
+      StmtList@54..63
+        ReturnStmt@54..63
+          Return@54..60 "return"
+          ExprList@60..63
+            BinOp@60..63
+              Ident@60..61
+                Ident@60..61 "a"
+              Minus@61..62 "-"
+              Ident@62..63
+                Ident@62..63 "b"
+      End@63..66 "end"
+  DeclStmt@66..99
+    Local@66..71 "local"
+    FuncStmt@71..99
+      Function@71..79 "function"
+      Ident@79..82
+        Ident@79..82 "mul"
+      FuncArgs@82..87
+        LParen@82..83 "("
+        Ident@83..84
+          Ident@83..84 "a"
+        Comma@84..85 ","
+        Ident@85..86
+          Ident@85..86 "b"
+        RParen@86..87 ")"
+      StmtList@87..96
+        ReturnStmt@87..96
+          Return@87..93 "return"
+          ExprList@93..96
+            BinOp@93..96
+              Ident@93..94
+                Ident@93..94 "a"
+              Star@94..95 "*"
+              Ident@95..96
+                Ident@95..96 "b"
+      End@96..99 "end"
+  DeclStmt@99..132
+    Local@99..104 "local"
+    FuncStmt@104..132
+      Function@104..112 "function"
+      Ident@112..115
+        Ident@112..115 "div"
+      FuncArgs@115..120
+        LParen@115..116 "("
+        Ident@116..117
+          Ident@116..117 "a"
+        Comma@117..118 ","
+        Ident@118..119
+          Ident@118..119 "b"
+        RParen@119..120 ")"
+      StmtList@120..129
+        ReturnStmt@120..129
+          Return@120..126 "return"
+          ExprList@126..129
+            BinOp@126..129
+              Ident@126..127
+                Ident@126..127 "a"
+              Slash@127..128 "/"
+              Ident@128..129
+                Ident@128..129 "b"
+      End@129..132 "end"
+  DeclStmt@132..147
+    Local@132..137 "local"
+    AssignList@137..138
+      DeclTarget@137..138
+        Ident@137..138
+          Ident@137..138 "a"
+    Assign@138..139 "="
+    ExprList@139..147
+      FuncCall@139..147
+        Ident@139..142
+          Ident@139..142 "mul"
+        FuncArgs@142..147
+          LParen@142..143 "("
+          LiteralExpr@143..144
+            Int@143..144 "3"
+          Comma@144..145 ","
+          LiteralExpr@145..146
+            Int@145..146 "4"
+          RParen@146..147 ")"
+  DeclStmt@147..162
+    Local@147..152 "local"
+    AssignList@152..153
+      DeclTarget@152..153
+        Ident@152..153
+          Ident@152..153 "b"
+    Assign@153..154 "="
+    ExprList@154..162
+      FuncCall@154..162
+        Ident@154..157
+          Ident@154..157 "sub"
+        FuncArgs@157..162
+          LParen@157..158 "("
+          LiteralExpr@158..159
+            Int@158..159 "3"
+          Comma@159..160 ","
+          LiteralExpr@160..161
+            Int@160..161 "1"
+          RParen@161..162 ")"
+  DeclStmt@162..177
+    Local@162..167 "local"
+    AssignList@167..168
+      DeclTarget@167..168
+        Ident@167..168
+          Ident@167..168 "c"
+    Assign@168..169 "="
+    ExprList@169..177
+      FuncCall@169..177
+        Ident@169..172
+          Ident@169..172 "div"
+        FuncArgs@172..177
+          LParen@172..173 "("
+          LiteralExpr@173..174
+            Int@173..174 "6"
+          Comma@174..175 ","
+          Ident@175..176
+            Ident@175..176 "b"
+          RParen@176..177 ")"
+  DeclStmt@177..192
+    Local@177..182 "local"
+    AssignList@182..183
+      DeclTarget@182..183
+        Ident@182..183
+          Ident@182..183 "d"
+    Assign@183..184 "="
+    ExprList@184..192
+      FuncCall@184..192
+        Ident@184..187
+          Ident@184..187 "add"
+        FuncArgs@187..192
+          LParen@187..188 "("
+          Ident@188..189
+            Ident@188..189 "a"
+          Comma@189..190 ","
+          Ident@190..191
+            Ident@190..191 "c"
+          RParen@191..192 ")"
+  FuncCall@192..200
+    Ident@192..197
+      Ident@192..197 "print"
+    FuncArgs@197..200
+      LParen@197..198 "("
+      Ident@198..199
+        Ident@198..199 "d"
+      RParen@199..200 ")"
