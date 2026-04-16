@@ -31,14 +31,13 @@ impl<'cache, 'source> State<'cache, 'source> {
         );
 
         tokens.push((T![eof], Span::from_range(0..0)));
-        let estimated_events = source.len() / 4;
 
         State {
             cache,
             tokens,
             cursor: 0,
             source,
-            events: Vec::with_capacity(estimated_events),
+            events: Vec::new(),
             reports: Vec::new(),
         }
     }
