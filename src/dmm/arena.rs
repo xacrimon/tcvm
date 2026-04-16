@@ -34,7 +34,8 @@ impl<'a, T: ?Sized + Rootable<'a>> Rootable<'a> for __DynRootable<T> {
 /// the branding lifetime.
 ///
 /// ```
-/// # use gc_arena::{Arena, Collect, Gc, Rootable};
+/// # use tcvm::dmm::{Arena, Gc, Collect};
+/// # use tcvm::Rootable;
 /// #
 /// # fn main() {
 /// #[derive(Collect)]
@@ -54,7 +55,8 @@ impl<'a, T: ?Sized + Rootable<'a>> Rootable<'a> for __DynRootable<T> {
 /// parameters, though in complex cases it may be better to implement `Rootable` directly.
 ///
 /// ```
-/// # use gc_arena::{Arena, Collect, Gc, Rootable};
+/// # use tcvm::dmm::{Arena, Gc, Collect};
+/// # use tcvm::Rootable;
 /// #
 /// # fn main() {
 /// #[derive(Collect)]
@@ -71,10 +73,10 @@ macro_rules! Rootable {
     ($gc:lifetime => $root:ty) => {
         // Instead of generating an impl of `Rootable`, we use a trait object. Thus, we avoid the
         // need to generate a new type for each invocation of this macro.
-        $crate::__DynRootable::<dyn for<$gc> $crate::Rootable<$gc, Root = $root>>
+        $crate::dmm::__DynRootable::<dyn for<$gc> $crate::dmm::Rootable<$gc, Root = $root>>
     };
     ($root:ty) => {
-        $crate::Rootable!['__gc => $crate::__unelide_lifetimes!('__gc; $root)]
+        $crate::Rootable!['__gc => $crate::dmm::__unelide_lifetimes!('__gc; $root)]
     };
 }
 
