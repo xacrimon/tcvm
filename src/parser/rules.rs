@@ -218,7 +218,7 @@ impl<'cache, 'source> Parser<'cache, 'source> {
     fn r_do(&mut self) -> Option<CompletedMarker> {
         let marker = self.start(T![do_stmt]);
         self.expect(T![do]);
-        self.r_block(|t| t == T![end]);
+        self.r_block(&|t| t == T![end]);
         self.expect(T![end]);
         Some(marker.complete(self))
     }
@@ -234,7 +234,7 @@ impl<'cache, 'source> Parser<'cache, 'source> {
     fn r_repeat(&mut self) -> Option<CompletedMarker> {
         let marker = self.start(T![repeat_stmt]);
         self.expect(T![repeat]);
-        self.r_block(|t| t == T![until]);
+        self.r_block(&|t| t == T![until]);
         self.expect(T![until]);
         self.r_expr();
         Some(marker.complete(self))
@@ -245,7 +245,7 @@ impl<'cache, 'source> Parser<'cache, 'source> {
         self.expect(if_kind);
         self.r_expr();
         self.expect(T![then]);
-        self.r_block(|t| matches!(t, T![end] | T![elseif] | T![else]));
+        self.r_block(&|t| matches!(t, T![end] | T![elseif] | T![else]));
 
         match self.at() {
             T![end] => {
@@ -281,7 +281,7 @@ impl<'cache, 'source> Parser<'cache, 'source> {
         match self.at() {
             T![else] => {
                 self.expect(T![else]);
-                self.r_block(|t| t == T![end]);
+                self.r_block(&|t| t == T![end]);
                 self.expect(T![end]);
             }
             T![elseif] => {
@@ -347,9 +347,7 @@ impl<'cache, 'source> Parser<'cache, 'source> {
         Some(marker.complete(self))
     }
 
-    fn r_block<F>(&mut self, stop: F) -> Option<CompletedMarker>
-    where
-        F: Fn(SyntaxKind) -> bool,
+    fn r_block(&mut self, stop: &dyn Fn(SyntaxKind) -> bool) -> Option<CompletedMarker>
     {
         let marker = self.start(T![stmt_list]);
         while !stop(self.at()) {
@@ -395,7 +393,7 @@ impl<'cache, 'source> Parser<'cache, 'source> {
         }
 
         self.r_func_def_args();
-        self.r_block(|t| t == T![end]);
+        self.r_block(&|t| t == T![end]);
         self.expect(T![end]);
         Some(marker.complete(self))
     }
