@@ -16,7 +16,8 @@ pub struct TableState<'gc> {
 #[collect(internal, no_drop)]
 pub struct RawTable<'gc> {
     array: Vec<Value<'gc>>,
-    hash: hashbrown::HashMap<Value<'gc>, Value<'gc>, foldhash::fast::RandomState, MetricsAlloc<'gc>>,
+    hash:
+        hashbrown::HashMap<Value<'gc>, Value<'gc>, foldhash::fast::RandomState, MetricsAlloc<'gc>>,
 }
 
 impl<'gc> Table<'gc> {

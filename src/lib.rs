@@ -6,9 +6,9 @@
 #![feature(rust_preserve_none_cc)]
 #![feature(super_let)]
 
+mod compiler;
 pub mod dmm;
 pub mod env;
 pub(crate) mod instruction;
 mod parser;
 mod vm;
-mod compiler;

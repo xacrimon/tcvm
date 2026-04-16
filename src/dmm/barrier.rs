@@ -266,7 +266,9 @@ macro_rules! __field {
             &$crate::dmm::barrier::Write {
                 __inner: $type { ref $field, .. },
                 ..
-            } => unsafe { $crate::dmm::barrier::Write::__from_ref_and_ptr($field, $field as *const _) },
+            } => unsafe {
+                $crate::dmm::barrier::Write::__from_ref_and_ptr($field, $field as *const _)
+            },
         }
     };
 }

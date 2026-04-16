@@ -7,7 +7,10 @@ pub fn parse_int(s: &str) -> Result<i64, ParseIntError> {
 }
 
 pub fn parse_hex_int(s: &str) -> Result<i64, ParseIntError> {
-    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let s = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     i64::from_str_radix(s, 16)
 }
 

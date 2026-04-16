@@ -347,8 +347,7 @@ impl<'cache, 'source> Parser<'cache, 'source> {
         Some(marker.complete(self))
     }
 
-    fn r_block(&mut self, stop: &dyn Fn(SyntaxKind) -> bool) -> Option<CompletedMarker>
-    {
+    fn r_block(&mut self, stop: &dyn Fn(SyntaxKind) -> bool) -> Option<CompletedMarker> {
         let marker = self.start(T![stmt_list]);
         while !stop(self.at()) {
             self.r_stmt();

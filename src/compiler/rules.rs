@@ -9,8 +9,8 @@ use crate::env::{LuaString, Prototype, Value};
 use crate::instruction::{Instruction, MetaMethod, UpValueDescriptor};
 use crate::parser::syntax::{
     Assign, BinaryOp, BinaryOperator, Break, Decl, DeclModifier, Do, Expr, ForGen, ForNum, Func,
-    FuncCall, FuncExpr, Goto, Ident, If, Index, Label, Literal, LiteralValue, MethodCall,
-    PrefixOp, PrefixOperator, Repeat, Return, Root, Stmt, Table, TableEntry, While,
+    FuncCall, FuncExpr, Goto, Ident, If, Index, Label, Literal, LiteralValue, MethodCall, PrefixOp,
+    PrefixOperator, Repeat, Return, Root, Stmt, Table, TableEntry, While,
 };
 use std::cell::RefCell;
 
@@ -153,10 +153,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     }
 
     fn define(&mut self, name: String, data: VariableData) -> Result<(), CompileError> {
-        let scope = self
-            .scope
-            .last_mut()
-            .ok_or_else(|| ice("missing scope"))?;
+        let scope = self.scope.last_mut().ok_or_else(|| ice("missing scope"))?;
         scope.insert(name, data);
         Ok(())
     }
@@ -327,9 +324,7 @@ fn compile_function_to_chunk<'gc>(
     if let Some(first) = close_regs.first() {
         // Insert CLOSE before the final RETURN
         let return_instr = ctx.chunk.tape.pop().unwrap();
-        ctx.chunk
-            .tape
-            .push(Instruction::CLOSE { start: first.0 });
+        ctx.chunk.tape.push(Instruction::CLOSE { start: first.0 });
         ctx.chunk.tape.push(return_instr);
     }
 
@@ -528,7 +523,13 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
             ctx.mark_close(reg)?;
         }
 
-        ctx.define(name, VariableData { register: reg, is_const })?;
+        ctx.define(
+            name,
+            VariableData {
+                register: reg,
+                is_const,
+            },
+        )?;
     }
 
     Ok(())
@@ -589,10 +590,7 @@ fn compile_assign(ctx: &mut Ctx, item: Assign) -> Result<(), CompileError> {
     while sources.len() < num_targets {
         let reg = ctx.alloc_register()?;
         let idx = ctx.alloc_constant(Value::Nil)?;
-        ctx.emit(Instruction::LOAD {
-            dst: reg.0,
-            idx,
-        });
+        ctx.emit(Instruction::LOAD { dst: reg.0, idx });
         sources.push(reg.0);
     }
 
@@ -646,12 +644,8 @@ fn compile_assign_lhs(ctx: &mut Ctx, target: Expr, value: u8) -> Result<(), Comp
         }
 
         Expr::Index(index) => {
-            let table_expr = index
-                .target()
-                .ok_or_else(|| ice("index without target"))?;
-            let key_expr = index
-                .index()
-                .ok_or_else(|| ice("index without key"))?;
+            let table_expr = index.target().ok_or_else(|| ice("index without target"))?;
+            let key_expr = index.index().ok_or_else(|| ice("index without key"))?;
             let table = compile_expr(ctx, table_expr, None)?;
             let key = compile_expr(ctx, key_expr, None)?;
             ctx.emit(Instruction::SETTABLE {
@@ -828,7 +822,10 @@ fn compile_expr(
         Expr::Index(item) => compile_expr_index(ctx, item, dst),
         Expr::VarArg => {
             let dst = ctx.dst_or_alloc(dst)?;
-            ctx.emit(Instruction::VARARG { dst: dst.0, count: 2 });
+            ctx.emit(Instruction::VARARG {
+                dst: dst.0,
+                count: 2,
+            });
             Ok(dst)
         }
     }
@@ -941,7 +938,9 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
     for entry in item.entries() {
         match entry {
             TableEntry::Array(arr) => {
-                let value_expr = arr.value().ok_or_else(|| ice("table array without value"))?;
+                let value_expr = arr
+                    .value()
+                    .ok_or_else(|| ice("table array without value"))?;
                 let val = compile_expr(ctx, value_expr, None)?;
 
                 // Place value in register after table for SETLIST
@@ -1129,31 +1128,227 @@ fn compile_expr_binary_op(
 
     // Arithmetic and bitwise operations
     match op {
-        BinaryOperator::Add => emit_arith(ctx, lhs, rhs, Instruction::ADD { dst: 0, lhs: lhs.0, rhs: rhs.0 }, MetaMethod::ADD, dst),
-        BinaryOperator::Sub => emit_arith(ctx, lhs, rhs, Instruction::SUB { dst: 0, lhs: lhs.0, rhs: rhs.0 }, MetaMethod::SUB, dst),
-        BinaryOperator::Mul => emit_arith(ctx, lhs, rhs, Instruction::MUL { dst: 0, lhs: lhs.0, rhs: rhs.0 }, MetaMethod::MUL, dst),
-        BinaryOperator::Div => emit_arith(ctx, lhs, rhs, Instruction::DIV { dst: 0, lhs: lhs.0, rhs: rhs.0 }, MetaMethod::DIV, dst),
-        BinaryOperator::IntDiv => emit_arith(ctx, lhs, rhs, Instruction::IDIV { dst: 0, lhs: lhs.0, rhs: rhs.0 }, MetaMethod::IDIV, dst),
-        BinaryOperator::Mod => emit_arith(ctx, lhs, rhs, Instruction::MOD { dst: 0, lhs: lhs.0, rhs: rhs.0 }, MetaMethod::MOD, dst),
-        BinaryOperator::Exp => emit_arith(ctx, lhs, rhs, Instruction::POW { dst: 0, lhs: lhs.0, rhs: rhs.0 }, MetaMethod::POW, dst),
-        BinaryOperator::BitAnd => emit_arith(ctx, lhs, rhs, Instruction::BAND { dst: 0, lhs: lhs.0, rhs: rhs.0 }, MetaMethod::BAND, dst),
-        BinaryOperator::BitOr => emit_arith(ctx, lhs, rhs, Instruction::BOR { dst: 0, lhs: lhs.0, rhs: rhs.0 }, MetaMethod::BOR, dst),
-        BinaryOperator::BitXor => emit_arith(ctx, lhs, rhs, Instruction::BXOR { dst: 0, lhs: lhs.0, rhs: rhs.0 }, MetaMethod::BXOR, dst),
-        BinaryOperator::LShift => emit_arith(ctx, lhs, rhs, Instruction::SHL { dst: 0, lhs: lhs.0, rhs: rhs.0 }, MetaMethod::SHL, dst),
-        BinaryOperator::RShift => emit_arith(ctx, lhs, rhs, Instruction::SHR { dst: 0, lhs: lhs.0, rhs: rhs.0 }, MetaMethod::SHR, dst),
+        BinaryOperator::Add => emit_arith(
+            ctx,
+            lhs,
+            rhs,
+            Instruction::ADD {
+                dst: 0,
+                lhs: lhs.0,
+                rhs: rhs.0,
+            },
+            MetaMethod::ADD,
+            dst,
+        ),
+        BinaryOperator::Sub => emit_arith(
+            ctx,
+            lhs,
+            rhs,
+            Instruction::SUB {
+                dst: 0,
+                lhs: lhs.0,
+                rhs: rhs.0,
+            },
+            MetaMethod::SUB,
+            dst,
+        ),
+        BinaryOperator::Mul => emit_arith(
+            ctx,
+            lhs,
+            rhs,
+            Instruction::MUL {
+                dst: 0,
+                lhs: lhs.0,
+                rhs: rhs.0,
+            },
+            MetaMethod::MUL,
+            dst,
+        ),
+        BinaryOperator::Div => emit_arith(
+            ctx,
+            lhs,
+            rhs,
+            Instruction::DIV {
+                dst: 0,
+                lhs: lhs.0,
+                rhs: rhs.0,
+            },
+            MetaMethod::DIV,
+            dst,
+        ),
+        BinaryOperator::IntDiv => emit_arith(
+            ctx,
+            lhs,
+            rhs,
+            Instruction::IDIV {
+                dst: 0,
+                lhs: lhs.0,
+                rhs: rhs.0,
+            },
+            MetaMethod::IDIV,
+            dst,
+        ),
+        BinaryOperator::Mod => emit_arith(
+            ctx,
+            lhs,
+            rhs,
+            Instruction::MOD {
+                dst: 0,
+                lhs: lhs.0,
+                rhs: rhs.0,
+            },
+            MetaMethod::MOD,
+            dst,
+        ),
+        BinaryOperator::Exp => emit_arith(
+            ctx,
+            lhs,
+            rhs,
+            Instruction::POW {
+                dst: 0,
+                lhs: lhs.0,
+                rhs: rhs.0,
+            },
+            MetaMethod::POW,
+            dst,
+        ),
+        BinaryOperator::BitAnd => emit_arith(
+            ctx,
+            lhs,
+            rhs,
+            Instruction::BAND {
+                dst: 0,
+                lhs: lhs.0,
+                rhs: rhs.0,
+            },
+            MetaMethod::BAND,
+            dst,
+        ),
+        BinaryOperator::BitOr => emit_arith(
+            ctx,
+            lhs,
+            rhs,
+            Instruction::BOR {
+                dst: 0,
+                lhs: lhs.0,
+                rhs: rhs.0,
+            },
+            MetaMethod::BOR,
+            dst,
+        ),
+        BinaryOperator::BitXor => emit_arith(
+            ctx,
+            lhs,
+            rhs,
+            Instruction::BXOR {
+                dst: 0,
+                lhs: lhs.0,
+                rhs: rhs.0,
+            },
+            MetaMethod::BXOR,
+            dst,
+        ),
+        BinaryOperator::LShift => emit_arith(
+            ctx,
+            lhs,
+            rhs,
+            Instruction::SHL {
+                dst: 0,
+                lhs: lhs.0,
+                rhs: rhs.0,
+            },
+            MetaMethod::SHL,
+            dst,
+        ),
+        BinaryOperator::RShift => emit_arith(
+            ctx,
+            lhs,
+            rhs,
+            Instruction::SHR {
+                dst: 0,
+                lhs: lhs.0,
+                rhs: rhs.0,
+            },
+            MetaMethod::SHR,
+            dst,
+        ),
         BinaryOperator::Concat => {
             let dst = ctx.dst_or_alloc(dst)?;
-            ctx.emit(Instruction::CONCAT { dst: dst.0, lhs: lhs.0, rhs: rhs.0 });
+            ctx.emit(Instruction::CONCAT {
+                dst: dst.0,
+                lhs: lhs.0,
+                rhs: rhs.0,
+            });
             Ok(dst)
         }
 
         // Comparisons — these produce a boolean result
-        BinaryOperator::Eq => compile_comparison(ctx, lhs, rhs, |l, r| Instruction::EQ { lhs: l, rhs: r, inverted: false }, dst),
-        BinaryOperator::NEq => compile_comparison(ctx, lhs, rhs, |l, r| Instruction::EQ { lhs: l, rhs: r, inverted: true }, dst),
-        BinaryOperator::Lt => compile_comparison(ctx, lhs, rhs, |l, r| Instruction::LT { lhs: l, rhs: r, inverted: false }, dst),
-        BinaryOperator::Gt => compile_comparison(ctx, lhs, rhs, |l, r| Instruction::LT { lhs: r, rhs: l, inverted: false }, dst),
-        BinaryOperator::LEq => compile_comparison(ctx, lhs, rhs, |l, r| Instruction::LE { lhs: l, rhs: r, inverted: false }, dst),
-        BinaryOperator::GEq => compile_comparison(ctx, lhs, rhs, |l, r| Instruction::LE { lhs: r, rhs: l, inverted: false }, dst),
+        BinaryOperator::Eq => compile_comparison(
+            ctx,
+            lhs,
+            rhs,
+            |l, r| Instruction::EQ {
+                lhs: l,
+                rhs: r,
+                inverted: false,
+            },
+            dst,
+        ),
+        BinaryOperator::NEq => compile_comparison(
+            ctx,
+            lhs,
+            rhs,
+            |l, r| Instruction::EQ {
+                lhs: l,
+                rhs: r,
+                inverted: true,
+            },
+            dst,
+        ),
+        BinaryOperator::Lt => compile_comparison(
+            ctx,
+            lhs,
+            rhs,
+            |l, r| Instruction::LT {
+                lhs: l,
+                rhs: r,
+                inverted: false,
+            },
+            dst,
+        ),
+        BinaryOperator::Gt => compile_comparison(
+            ctx,
+            lhs,
+            rhs,
+            |l, r| Instruction::LT {
+                lhs: r,
+                rhs: l,
+                inverted: false,
+            },
+            dst,
+        ),
+        BinaryOperator::LEq => compile_comparison(
+            ctx,
+            lhs,
+            rhs,
+            |l, r| Instruction::LE {
+                lhs: l,
+                rhs: r,
+                inverted: false,
+            },
+            dst,
+        ),
+        BinaryOperator::GEq => compile_comparison(
+            ctx,
+            lhs,
+            rhs,
+            |l, r| Instruction::LE {
+                lhs: r,
+                rhs: l,
+                inverted: false,
+            },
+            dst,
+        ),
 
         BinaryOperator::And | BinaryOperator::Or => unreachable!("handled above"),
         BinaryOperator::Property | BinaryOperator::Method => unreachable!("handled above"),
@@ -1415,9 +1610,7 @@ fn compile_expr_index(
     item: Index,
     dst: Option<RegisterIndex>,
 ) -> Result<RegisterIndex, CompileError> {
-    let target_expr = item
-        .target()
-        .ok_or_else(|| ice("index without target"))?;
+    let target_expr = item.target().ok_or_else(|| ice("index without target"))?;
     let key_expr = item.index().ok_or_else(|| ice("index without key"))?;
     let table = compile_expr(ctx, target_expr, None)?;
     let key = compile_expr(ctx, key_expr, None)?;
@@ -1498,9 +1691,7 @@ fn compile_while(ctx: &mut Ctx, item: While) -> Result<(), CompileError> {
         let loop_start = ctx.new_label();
         ctx.set_label(loop_start, ctx.next_offset());
 
-        let cond_expr = item
-            .cond()
-            .ok_or_else(|| ice("while without condition"))?;
+        let cond_expr = item.cond().ok_or_else(|| ice("while without condition"))?;
         let cond = compile_expr(ctx, cond_expr, None)?;
 
         // If condition is falsy, jump to break label (end of loop)
@@ -1544,9 +1735,7 @@ fn compile_repeat(ctx: &mut Ctx, item: Repeat) -> Result<(), CompileError> {
             }
 
             // Compile condition
-            let cond_expr = item
-                .cond()
-                .ok_or_else(|| ice("repeat without condition"))?;
+            let cond_expr = item.cond().ok_or_else(|| ice("repeat without condition"))?;
             let cond = compile_expr(ctx, cond_expr, None)?;
 
             // If condition is falsy, loop back
@@ -1625,9 +1814,7 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
             .ok_or_else(|| ice("ident without name"))?
             .to_owned();
 
-        let limit_expr = item
-            .end()
-            .ok_or_else(|| ice("for_num without limit"))?;
+        let limit_expr = item.end().ok_or_else(|| ice("for_num without limit"))?;
 
         // Pre-allocate consecutive registers: base, base+1, base+2
         let base = ctx.alloc_register()?;
