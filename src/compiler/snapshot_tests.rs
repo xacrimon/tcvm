@@ -141,7 +141,11 @@ fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -> String {
         Instruction::BXOR { dst, lhs, rhs } => format!("BXOR            R{dst} R{lhs} R{rhs}"),
         Instruction::SHL { dst, lhs, rhs } => format!("SHL             R{dst} R{lhs} R{rhs}"),
         Instruction::SHR { dst, lhs, rhs } => format!("SHR             R{dst} R{lhs} R{rhs}"),
-        Instruction::MMBIN { lhs, rhs, metamethod } => {
+        Instruction::MMBIN {
+            lhs,
+            rhs,
+            metamethod,
+        } => {
             format!("MMBIN           R{lhs} R{rhs} {:?}", metamethod)
         }
         Instruction::UNM { dst, src } => format!("UNM             R{dst} R{src}"),
@@ -166,7 +170,11 @@ fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -> String {
         Instruction::TEST { src, inverted } => {
             format!("TEST            R{src} inv={inverted}")
         }
-        Instruction::CALL { func, args, returns } => {
+        Instruction::CALL {
+            func,
+            args,
+            returns,
+        } => {
             format!("CALL            R{func} args={args} ret={returns}")
         }
         Instruction::TAILCALL { func, args } => {
@@ -190,7 +198,11 @@ fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -> String {
         Instruction::TFORLOOP { base, offset } => {
             format!("TFORLOOP        R{base} {offset:+}")
         }
-        Instruction::SETLIST { table, count, offset } => {
+        Instruction::SETLIST {
+            table,
+            count,
+            offset,
+        } => {
             format!("SETLIST         R{table} count={count} offset={offset}")
         }
         Instruction::CLOSURE { dst, proto } => {
