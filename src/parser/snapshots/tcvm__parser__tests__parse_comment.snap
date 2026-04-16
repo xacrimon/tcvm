@@ -1,0 +1,33 @@
+---
+source: src/parser/mod.rs
+expression: syntax_tree
+---
+Root@0..17
+  DeclStmt@0..8
+    Local@0..5 "local"
+    AssignList@5..6
+      DeclTarget@5..6
+        Ident@5..6
+          Ident@5..6 "x"
+    Assign@6..7 "="
+    ExprList@7..8
+      LiteralExpr@7..8
+        Int@7..8 "5"
+  AssignStmt@8..12
+    AssignList@8..9
+      Ident@8..9
+        Ident@8..9 "y"
+    Assign@9..10 "="
+    ExprList@10..12
+      PrefixOp@10..12
+        Minus@10..11 "-"
+        LiteralExpr@11..12
+          Int@11..12 "6"
+  AssignStmt@12..17
+    AssignList@12..13
+      Ident@12..13
+        Ident@12..13 "z"
+    Assign@13..14 "="
+    ExprList@14..17
+      LiteralExpr@14..17
+        Float@14..17 "2e7"

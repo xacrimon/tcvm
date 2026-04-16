@@ -14,9 +14,10 @@ use crate::dmm::{
 ///
 /// ```rust
 /// # use std::fmt::Display;
-/// # use gc_arena::{Gc, unsize};
+/// # use tcvm::dmm::Gc;
+/// # use tcvm::unsize;
 /// # fn main() {
-/// # gc_arena::arena::rootless_mutate(|mc| {
+/// # tcvm::dmm::arena::rootless_mutate(|mc| {
 /// // Unsizing arrays to slices.
 /// let mut slice;
 /// slice = unsize!(Gc::new(mc, [1, 2]) => [u8]);
@@ -38,9 +39,10 @@ use crate::dmm::{
 /// incompatible types.
 /// ```rust,compile_fail
 /// # use std::error::Error;
-/// # use gc_arena::{Gc, unsize};
+/// # use tcvm::dmm::Gc;
+/// # use tcvm::unsize;
 /// # fn main() {
-/// # gc_arena::arena::rootless_mutate(|mc| {
+/// # tcvm::dmm::arena::rootless_mutate(|mc| {
 /// // Error: `Option<char>` doesn't implement `Error`.
 /// let _ = unsize!(Gc::new(mc, Some('💥')) => dyn Error);
 /// # })
@@ -54,7 +56,7 @@ macro_rules! unsize {
         // coercion, if it compiles. Additionally, the `__CoercePtrInternal` trait
         // ensures that the resulting GC pointer has the correct `'gc` lifetime.
         unsafe {
-            $crate::__CoercePtrInternal::__coerce_unchecked(gc, |p: *mut _| -> *mut $ty { p })
+            $crate::dmm::__CoercePtrInternal::__coerce_unchecked(gc, |p: *mut _| -> *mut $ty { p })
         }
     }};
 }

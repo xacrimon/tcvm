@@ -12,7 +12,7 @@ use std::vec::Vec;
 use std::{collections::HashMap, hash::BuildHasher, hash::Hash};
 
 #[cfg(doc)]
-use crate::Gc;
+use crate::dmm::Gc;
 #[cfg(doc)]
 use core::ops::IndexMut;
 
@@ -232,7 +232,7 @@ pub trait Unlock {
 /// # Usage
 ///
 /// ```
-/// # use gc_arena::barrier::{field, Write};
+/// # use tcvm::dmm::barrier::{field, Write};
 /// struct Container<T> {
 ///     field: T,
 /// }
@@ -263,10 +263,12 @@ macro_rules! __field {
         // - similarly, the `__from_ref_and_ptr` method takes both a reference (for the lifetime)
         //   and a pointer, causing a compilation failure if the first argument was coerced.
         match $value {
-            &$crate::barrier::Write {
+            &$crate::dmm::barrier::Write {
                 __inner: $type { ref $field, .. },
                 ..
-            } => unsafe { $crate::barrier::Write::__from_ref_and_ptr($field, $field as *const _) },
+            } => unsafe {
+                $crate::dmm::barrier::Write::__from_ref_and_ptr($field, $field as *const _)
+            },
         }
     };
 }
@@ -280,6 +282,6 @@ pub use crate::__unlock as unlock;
 #[doc(hidden)]
 macro_rules! __unlock {
     ($value:expr, $type:path, $field:ident) => {
-        $crate::barrier::field!($value, $type, $field).unlock()
+        $crate::dmm::barrier::field!($value, $type, $field).unlock()
     };
 }

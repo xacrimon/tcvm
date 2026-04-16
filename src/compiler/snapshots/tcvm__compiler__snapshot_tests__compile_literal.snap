@@ -1,0 +1,104 @@
+---
+source: src/compiler/snapshot_tests.rs
+expression: output
+---
+; function (params=0, vararg=true, stack=32, upvalues=1)
+; constants:
+;   K0 = 581
+;   K1 = "a"
+;   K2 = 255
+;   K3 = "b"
+;   K4 = nil
+;   K5 = "c"
+;   K6 = true
+;   K7 = "d"
+;   K8 = false
+;   K9 = "e"
+;   K10 = "hello"
+;   K11 = "f"
+;   K12 = "world"
+;   K13 = "g"
+;   K14 = "woosh"
+;   K15 = "h"
+;   K16 = "i"
+;   K17 = 50000.0
+;   K18 = "l"
+;   K19 = 206.0625
+;   K20 = "j"
+;   K21 = 0.1953125
+;   K22 = "k"
+;   K23 = "t"
+;   K24 = 59
+;   K25 = 63
+;   K26 = "tl"
+;   K27 = "anna"
+;   K28 = 15
+;   K29 = "james"
+;   K30 = 20
+;   K31 = "tr"
+;   K32 = 0
+;   K33 = 10
+;   K34 = "20"
+;   K35 = "tg"
+;   K36 = 18
+;   K37 = "y"
+; upvalues:
+;   U0 = local R0
+; code:
+0000  VARARGPREP      fixed=0
+0001  LOAD            R0 K0  ; 581
+0002  SETTABUP        R0 U0 K1  ; "a"
+0003  LOAD            R1 K2  ; 255
+0004  SETTABUP        R1 U0 K3  ; "b"
+0005  LOAD            R2 K4  ; nil
+0006  SETTABUP        R2 U0 K5  ; "c"
+0007  LOAD            R3 K6  ; true
+0008  SETTABUP        R3 U0 K7  ; "d"
+0009  LOAD            R4 K8  ; false
+0010  SETTABUP        R4 U0 K9  ; "e"
+0011  LOAD            R5 K10  ; "hello"
+0012  SETTABUP        R5 U0 K11  ; "f"
+0013  LOAD            R6 K12  ; "world"
+0014  SETTABUP        R6 U0 K13  ; "g"
+0015  LOAD            R7 K14  ; "woosh"
+0016  SETTABUP        R7 U0 K15  ; "h"
+0017  LOAD            R8 K14  ; "woosh"
+0018  SETTABUP        R8 U0 K16  ; "i"
+0019  LOAD            R9 K17  ; 50000.0
+0020  SETTABUP        R9 U0 K18  ; "l"
+0021  LOAD            R10 K19  ; 206.0625
+0022  SETTABUP        R10 U0 K20  ; "j"
+0023  LOAD            R11 K21  ; 0.1953125
+0024  SETTABUP        R11 U0 K22  ; "k"
+0025  NEWTABLE        R12
+0026  SETTABUP        R12 U0 K23  ; "t"
+0027  NEWTABLE        R13
+0028  LOAD            R14 K24  ; 59
+0029  MOVE            R15 R14
+0030  LOAD            R16 K25  ; 63
+0031  MOVE            R17 R16
+0032  SETLIST         R13 count=2 offset=0
+0033  SETTABUP        R13 U0 K26  ; "tl"
+0034  NEWTABLE        R18
+0035  LOAD            R19 K27  ; "anna"
+0036  LOAD            R20 K28  ; 15
+0037  SETTABLE        R20 R18 R19
+0038  LOAD            R21 K29  ; "james"
+0039  LOAD            R22 K30  ; 20
+0040  SETTABLE        R22 R18 R21
+0041  SETTABUP        R18 U0 K31  ; "tr"
+0042  NEWTABLE        R23
+0043  LOAD            R24 K32  ; 0
+0044  LOAD            R25 K33  ; 10
+0045  SETTABLE        R25 R23 R24
+0046  LOAD            R26 K27  ; "anna"
+0047  LOAD            R27 K28  ; 15
+0048  SETTABLE        R27 R23 R26
+0049  LOAD            R28 K29  ; "james"
+0050  LOAD            R29 K34  ; "20"
+0051  SETTABLE        R29 R23 R28
+0052  SETTABUP        R23 U0 K35  ; "tg"
+0053  LOAD            R30 K36  ; 18
+0054  UNM             R31 R30
+0055  SETTABUP        R31 U0 K37  ; "y"
+0056  RETURN          R0 count=1

@@ -1,0 +1,22 @@
+---
+source: src/compiler/snapshot_tests.rs
+expression: output
+---
+; function (params=0, vararg=true, stack=4, upvalues=1)
+; constants:
+;   K0 = 5
+;   K1 = 6
+;   K2 = "y"
+;   K3 = 20000000.0
+;   K4 = "z"
+; upvalues:
+;   U0 = local R0
+; code:
+0000  VARARGPREP      fixed=0
+0001  LOAD            R0 K0  ; 5
+0002  LOAD            R1 K1  ; 6
+0003  UNM             R2 R1
+0004  SETTABUP        R2 U0 K2  ; "y"
+0005  LOAD            R3 K3  ; 20000000.0
+0006  SETTABUP        R3 U0 K4  ; "z"
+0007  RETURN          R0 count=1

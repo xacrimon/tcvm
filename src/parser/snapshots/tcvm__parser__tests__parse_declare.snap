@@ -1,0 +1,140 @@
+---
+source: src/parser/mod.rs
+expression: syntax_tree
+---
+Root@0..175
+  AssignStmt@0..3
+    AssignList@0..1
+      Ident@0..1
+        Ident@0..1 "x"
+    Assign@1..2 "="
+    ExprList@2..3
+      LiteralExpr@2..3
+        Int@2..3 "5"
+  DeclStmt@3..12
+    Local@3..8 "local"
+    AssignList@8..9
+      DeclTarget@8..9
+        Ident@8..9
+          Ident@8..9 "y"
+    Assign@9..10 "="
+    ExprList@10..12
+      LiteralExpr@10..12
+        Int@10..12 "10"
+  DeclStmt@12..22
+    Local@12..17 "local"
+    AssignList@17..22
+      DeclTarget@17..19
+        Ident@17..19
+          Ident@17..19 "aq"
+      Comma@19..20 ","
+      DeclTarget@20..22
+        Ident@20..22
+          Ident@20..22 "bf"
+  DeclStmt@22..38
+    Local@22..27 "local"
+    AssignList@27..35
+      DeclTarget@27..35
+        Ident@27..28
+          Ident@27..28 "z"
+        Const@28..35 "<const>"
+    Assign@35..36 "="
+    ExprList@36..38
+      LiteralExpr@36..38
+        Int@36..38 "15"
+  DeclStmt@38..57
+    Local@38..43 "local"
+    AssignList@43..51
+      DeclTarget@43..51
+        Ident@43..44
+          Ident@43..44 "w"
+        Close@44..51 "<close>"
+    Assign@51..52 "="
+    ExprList@52..57
+      LiteralExpr@52..57
+        String@52..57 "\"abs\""
+  AssignStmt@57..75
+    AssignList@57..60
+      Ident@57..58
+        Ident@57..58 "i"
+      Comma@58..59 ","
+      Ident@59..60
+        Ident@59..60 "k"
+    Assign@60..61 "="
+    ExprList@61..75
+      FuncCall@61..66
+        Ident@61..64
+          Ident@61..64 "get"
+        FuncArgs@64..66
+          LParen@64..65 "("
+          RParen@65..66 ")"
+      Comma@66..67 ","
+      LiteralExpr@67..75
+        String@67..75 "\"other1\""
+  DeclStmt@75..99
+    Local@75..80 "local"
+    AssignList@80..83
+      DeclTarget@80..81
+        Ident@80..81
+          Ident@80..81 "r"
+      Comma@81..82 ","
+      DeclTarget@82..83
+        Ident@82..83
+          Ident@82..83 "g"
+    Assign@83..84 "="
+    ExprList@84..99
+      FuncCall@84..90
+        Ident@84..88
+          Ident@84..88 "getf"
+        FuncArgs@88..90
+          LParen@88..89 "("
+          RParen@89..90 ")"
+      Comma@90..91 ","
+      LiteralExpr@91..99
+        String@91..99 "\"other2\""
+  DeclStmt@99..137
+    Local@99..104 "local"
+    AssignList@104..121
+      DeclTarget@104..112
+        Ident@104..105
+          Ident@104..105 "f"
+        Const@105..112 "<const>"
+      Comma@112..113 ","
+      DeclTarget@113..121
+        Ident@113..114
+          Ident@113..114 "v"
+        Const@114..121 "<const>"
+    Assign@121..122 "="
+    ExprList@122..137
+      FuncCall@122..128
+        Ident@122..126
+          Ident@122..126 "getw"
+        FuncArgs@126..128
+          LParen@126..127 "("
+          RParen@127..128 ")"
+      Comma@128..129 ","
+      LiteralExpr@129..137
+        String@129..137 "\"other3\""
+  DeclStmt@137..175
+    Local@137..142 "local"
+    AssignList@142..159
+      DeclTarget@142..150
+        Ident@142..143
+          Ident@142..143 "p"
+        Close@143..150 "<close>"
+      Comma@150..151 ","
+      DeclTarget@151..159
+        Ident@151..152
+          Ident@151..152 "o"
+        Close@152..159 "<close>"
+    Assign@159..160 "="
+    ExprList@160..175
+      FuncCall@160..166
+        Ident@160..164
+          Ident@160..164 "getq"
+        FuncArgs@164..166
+          LParen@164..165 "("
+          RParen@165..166 ")"
+      Comma@166..167 ","
+      LiteralExpr@167..175
+        String@167..175 "\"other4\""

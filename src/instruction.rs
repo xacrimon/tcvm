@@ -213,23 +213,50 @@ pub enum Instruction {
         count: u8,
     },
 
-    FORLOOP {},
+    FORLOOP {
+        base: Register,
+        offset: i32,
+    },
 
-    FORPREP {},
+    FORPREP {
+        base: Register,
+        offset: i32,
+    },
 
-    TFORPREP {},
+    TFORPREP {
+        base: Register,
+        offset: i32,
+    },
 
-    TFORCALL {},
+    TFORCALL {
+        base: Register,
+        count: u8,
+    },
 
-    TFORLOOP {},
+    TFORLOOP {
+        base: Register,
+        offset: i32,
+    },
 
-    SETLIST {},
+    SETLIST {
+        table: Register,
+        count: u8,
+        offset: u16,
+    },
 
-    CLOSURE {},
+    CLOSURE {
+        dst: Register,
+        proto: u16,
+    },
 
-    VARARG {},
+    VARARG {
+        dst: Register,
+        count: u8,
+    },
 
-    VARARGPREP {},
+    VARARGPREP {
+        num_fixed: u8,
+    },
 
     NOP,
 
@@ -240,6 +267,15 @@ impl Instruction {
     pub fn discriminant(self) -> u8 {
         unsafe { *<*const _>::from(&self).cast::<u8>() }
     }
+}
+
+/// Describes how to capture an upvalue when creating a closure.
+#[derive(Debug, Clone, Copy)]
+pub enum UpValueDescriptor {
+    /// Capture from the enclosing function's local register at the given index.
+    ParentLocal(u8),
+    /// Copy from the enclosing function's upvalue at the given index.
+    ParentUpvalue(u8),
 }
 
 #[derive(Debug, Clone, Copy)]
