@@ -83,13 +83,14 @@ mod tests {
         };
     }
 
-    test!(function, "test-files/function.lua");
-    test!(op_prec, "test-files/op_prec.lua");
-    test!(if, "test-files/if.lua");
-    test!(declare, "test-files/declare.lua");
-    test!(literal, "test-files/literal.lua");
     test!(comment, "test-files/comment.lua");
+    test!(declare, "test-files/declare.lua");
+    test!(function, "test-files/function.lua");
+    test!(hello, "test-files/hello.lua");
+    test!(if, "test-files/if.lua");
+    test!(literal, "test-files/literal.lua");
+    //test!(metalua, "test-files/metalua.lua");
+    //test!(nbody, "test-files/nbody.lua");
+    test!(op_prec, "test-files/op_prec.lua");
     test!(primes, "test-files/primes.lua");
-    // test!(nbody, "test-files/nbody.lua");
-    // test!(nbody, "test-files/mixed.lua");
 }

@@ -1,0 +1,27 @@
+---
+source: src/parser/mod.rs
+expression: syntax_tree
+---
+Root@0..37
+  DeclStmt@0..27
+    Local@0..5 "local"
+    AssignList@5..8
+      DeclTarget@5..8
+        Ident@5..8
+          Ident@5..8 "msg"
+    Assign@8..9 "="
+    ExprList@9..27
+      BinOp@9..27
+        LiteralExpr@9..16
+          String@9..16 "\"Hello\""
+        DDot@16..18 ".."
+        LiteralExpr@18..27
+          String@18..27 "\", World\""
+  FuncCall@27..37
+    Ident@27..32
+      Ident@27..32 "print"
+    FuncArgs@32..37
+      LParen@32..33 "("
+      Ident@33..36
+        Ident@33..36 "msg"
+      RParen@36..37 ")"
