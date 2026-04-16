@@ -7,11 +7,7 @@ expression: output
 ;   K0 = 5
 ;   K1 = 6
 ;   K2 = 3
-;   K3 = 6
-;   K4 = 3
-;   K5 = "num"
-;   K6 = 5
-;   K7 = "num"
+;   K3 = "num"
 ; upvalues:
 ;   U0 = local R0
 ; code:
@@ -23,14 +19,14 @@ expression: output
 0005  MMBIN           R1 R2 MUL
 0006  ADD             R4 R0 R3
 0007  MMBIN           R0 R3 ADD
-0008  LOAD            R5 K3  ; 6
-0009  LOAD            R6 K4  ; 3
+0008  LOAD            R5 K1  ; 6
+0009  LOAD            R6 K2  ; 3
 0010  DIV             R7 R5 R6
 0011  MMBIN           R5 R6 DIV
 0012  SUB             R8 R4 R7
 0013  MMBIN           R4 R7 SUB
-0014  SETTABUP        R8 U0 K5  ; "num"
-0015  LOAD            R9 K6  ; 5
+0014  SETTABUP        R8 U0 K3  ; "num"
+0015  LOAD            R9 K0  ; 5
 0016  UNM             R10 R9
-0017  SETTABUP        R10 U0 K7  ; "num"
+0017  SETTABUP        R10 U0 K3  ; "num"
 0018  RETURN          R0 count=1

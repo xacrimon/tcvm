@@ -168,6 +168,20 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     }
 
     fn alloc_constant(&mut self, value: Value<'gc>) -> Result<u16, CompileError> {
+        // Check for an existing identical constant (exact type match, no int/float coercion).
+        let existing = self.chunk.constants.iter().position(|c| match (c, &value) {
+            (Value::Nil, Value::Nil) => true,
+            (Value::Boolean(a), Value::Boolean(b)) => a == b,
+            (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
+            (Value::String(a), Value::String(b)) => a == b,
+            _ => false,
+        });
+
+        if let Some(idx) = existing {
+            return Ok(idx as u16);
+        }
+
         if self.chunk.constants.len() >= u16::MAX as usize {
             return Err(err(CompileErrorKind::Constants, LineNumber(0)));
         }
