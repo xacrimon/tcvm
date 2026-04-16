@@ -18,7 +18,7 @@ expression: output
 ;   K11 = "f"
 ;   K12 = "world"
 ;   K13 = "g"
-;   K14 = "woos"
+;   K14 = "woosh"
 ;   K15 = "h"
 ;   K16 = "i"
 ;   K17 = 50000.0
@@ -60,9 +60,9 @@ expression: output
 0012  SETTABUP        R5 U0 K11  ; "f"
 0013  LOAD            R6 K12  ; "world"
 0014  SETTABUP        R6 U0 K13  ; "g"
-0015  LOAD            R7 K14  ; "woos"
+0015  LOAD            R7 K14  ; "woosh"
 0016  SETTABUP        R7 U0 K15  ; "h"
-0017  LOAD            R8 K14  ; "woos"
+0017  LOAD            R8 K14  ; "woosh"
 0018  SETTABUP        R8 U0 K16  ; "i"
 0019  LOAD            R9 K17  ; 50000.0
 0020  SETTABUP        R9 U0 K18  ; "l"
