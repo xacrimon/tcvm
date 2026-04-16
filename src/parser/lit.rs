@@ -54,7 +54,7 @@ pub fn parse_hex_float(s: &str) -> Option<f64> {
 }
 
 pub fn parse_string(s: &str) -> Vec<u8> {
-    parse_string_fragment(&s[1..s.len()])
+    parse_string_fragment(&s[1..s.len() - 1])
 }
 
 pub fn parse_long_string(s: &str) -> Vec<u8> {
@@ -112,10 +112,6 @@ enum StringToken {
 
     #[regex(r"\\u\{[0-9a-fA-F]+\}")]
     Unicode,
-
-    #[token(".+", priority = 1000)]
-    #[error]
-    Other,
 }
 
 fn parse_string_fragment(s: &str) -> Vec<u8> {
@@ -124,21 +120,21 @@ fn parse_string_fragment(s: &str) -> Vec<u8> {
 
     for (token, span) in StringToken::lexer(s).spanned() {
         match token {
-            StringToken::Bell => bytes.push(0x07),
-            StringToken::Backspace => bytes.push(0x08),
-            StringToken::FormFeed => bytes.push(0x0C),
-            StringToken::Newline => bytes.push(0x0A),
-            StringToken::CarriageReturn => bytes.push(0x0D),
-            StringToken::Tab => bytes.push(0x09),
-            StringToken::VerticalTab => bytes.push(0x0B),
-            StringToken::Backslash => bytes.push(0x5C),
-            StringToken::DoubleQuote => bytes.push(0x22),
-            StringToken::Quote => bytes.push(0x27),
-            StringToken::LeftBracket => bytes.push(0x5B),
-            StringToken::RightBracket => bytes.push(0x5D),
-            StringToken::Hex => parse_hex_escape(&mut bytes, &s[span]),
-            StringToken::Unicode => parse_unicode_escape(&mut bytes, &s[span]),
-            StringToken::Other => bytes.extend_from_slice(&b[span]),
+            Ok(StringToken::Bell) => bytes.push(0x07),
+            Ok(StringToken::Backspace) => bytes.push(0x08),
+            Ok(StringToken::FormFeed) => bytes.push(0x0C),
+            Ok(StringToken::Newline) => bytes.push(0x0A),
+            Ok(StringToken::CarriageReturn) => bytes.push(0x0D),
+            Ok(StringToken::Tab) => bytes.push(0x09),
+            Ok(StringToken::VerticalTab) => bytes.push(0x0B),
+            Ok(StringToken::Backslash) => bytes.push(0x5C),
+            Ok(StringToken::DoubleQuote) => bytes.push(0x22),
+            Ok(StringToken::Quote) => bytes.push(0x27),
+            Ok(StringToken::LeftBracket) => bytes.push(0x5B),
+            Ok(StringToken::RightBracket) => bytes.push(0x5D),
+            Ok(StringToken::Hex) => parse_hex_escape(&mut bytes, &s[span]),
+            Ok(StringToken::Unicode) => parse_unicode_escape(&mut bytes, &s[span]),
+            Err(()) => bytes.extend_from_slice(&b[span]),
         }
     }
 
@@ -156,4 +152,17 @@ fn parse_unicode_escape(dst: &mut Vec<u8>, s: &str) {
     let buf = &mut [0; 4];
     let subs = ch.encode_utf8(buf).as_bytes();
     dst.extend_from_slice(subs);
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::*;
+    #[test]
+    fn probe() {
+        eprintln!("long [[woosh]]: {:?}", String::from_utf8_lossy(&parse_long_string("[[woosh]]")));
+        eprintln!("long [=[woosh]=]: {:?}", String::from_utf8_lossy(&parse_long_string("[=[woosh]=]")));
+        eprintln!("'world': {:?}", String::from_utf8_lossy(&parse_string("'world'")));
+        eprintln!("\"hello\": {:?}", String::from_utf8_lossy(&parse_string("\"hello\"")));
+        eprintln!("\"\\n\": {:?}", String::from_utf8_lossy(&parse_string("\"\\n\"")));
+    }
 }

@@ -26,7 +26,7 @@ impl<'cache, 'source> State<'cache, 'source> {
         tokens.extend(
             SyntaxKind::lexer(source)
                 .spanned()
-                .map(|(kind, range)| (kind, Span::from_range(range))),
+                .map(|(kind, range)| (kind.unwrap_or(T![invalid]), Span::from_range(range))),
         );
 
         tokens.push((T![eof], Span::from_range(0..0)));

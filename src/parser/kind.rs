@@ -6,9 +6,7 @@ use logos::{Lexer, Logos};
 #[derive(Logos, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
 #[repr(u16)]
 pub enum SyntaxKind {
-    #[error]
-    Invalid = 0,
-
+    Invalid,
     Tombstone,
 
     Eof,
@@ -196,10 +194,10 @@ pub enum SyntaxKind {
     #[regex(r"\[=*\[", long_string)]
     LongString,
 
-    #[regex(r"[0-9]+", priority = 2)]
+    #[regex(r"[0-9]+", priority = 3)]
     Int,
 
-    #[regex(r"0x[0-9a-fA-F]+", priority = 6)]
+    #[regex(r"0x[0-9a-fA-F]+", priority = 7)]
     HexInt,
 
     #[regex(r"[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?")]
