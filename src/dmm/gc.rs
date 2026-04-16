@@ -103,9 +103,9 @@ impl<'gc, T: 'static> Gc<'gc, T> {
     /// following code:
     ///
     /// ```rust
-    /// # use gc_arena::{Gc, Static};
+    /// # use tcvm::dmm::{Gc, Static};
     /// # fn main() {
-    /// # gc_arena::arena::rootless_mutate(|mc| {
+    /// # tcvm::dmm::arena::rootless_mutate(|mc| {
     /// struct MyStaticStruct;
     /// let p = Gc::new(mc, Static(MyStaticStruct));
     /// // This is allowed because `Static` is `#[repr(transparent)]`

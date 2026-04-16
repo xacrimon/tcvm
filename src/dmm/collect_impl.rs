@@ -55,6 +55,8 @@ static_collect!(std::ffi::OsString);
 /// formed? WELL, there are currently some neat compiler bugs, observe...
 ///
 /// ```rust,compile_fail
+/// use tcvm::dmm::{Arena, Gc};
+/// use tcvm::Rootable;
 /// let arena = Arena::<Rootable![&'static Gc<'gc, i32>]>::new(Default::default(), |mc| {
 ///     Box::leak(Box::new(Gc::new(mc, 4)))
 /// });
