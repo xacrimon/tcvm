@@ -153,16 +153,3 @@ fn parse_unicode_escape(dst: &mut Vec<u8>, s: &str) {
     let subs = ch.encode_utf8(buf).as_bytes();
     dst.extend_from_slice(subs);
 }
-
-#[cfg(test)]
-mod debug_tests {
-    use super::*;
-    #[test]
-    fn probe() {
-        eprintln!("long [[woosh]]: {:?}", String::from_utf8_lossy(&parse_long_string("[[woosh]]")));
-        eprintln!("long [=[woosh]=]: {:?}", String::from_utf8_lossy(&parse_long_string("[=[woosh]=]")));
-        eprintln!("'world': {:?}", String::from_utf8_lossy(&parse_string("'world'")));
-        eprintln!("\"hello\": {:?}", String::from_utf8_lossy(&parse_string("\"hello\"")));
-        eprintln!("\"\\n\": {:?}", String::from_utf8_lossy(&parse_string("\"\\n\"")));
-    }
-}

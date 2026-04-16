@@ -1,11 +1,15 @@
-use cstree::{RawSyntaxKind, Syntax, syntax::SyntaxText, util::NodeOrToken, interning::TokenInterner};
+use std::mem;
+
+use cstree::{
+    RawSyntaxKind, Syntax, interning::TokenInterner, syntax::SyntaxText, util::NodeOrToken,
+};
 
 use super::{kind::SyntaxKind, lit};
 use crate::T;
 
 impl Syntax for SyntaxKind {
     fn from_raw(raw: RawSyntaxKind) -> Self {
-        debug_assert!(raw.0 < T![__LAST] as u32);
+        debug_assert!(raw.0 < mem::variant_count::<SyntaxKind>() as u32);
         unsafe { std::mem::transmute(raw.0) }
     }
 
