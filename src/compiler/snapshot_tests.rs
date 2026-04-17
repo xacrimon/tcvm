@@ -163,6 +163,9 @@ fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -> String {
         Instruction::TEST { src, inverted } => {
             format!("TEST            R{src} inv={inverted}")
         }
+        Instruction::TESTSET { dst, src, inverted } => {
+            format!("TESTSET         R{dst} R{src} inv={inverted}")
+        }
         Instruction::CALL {
             func,
             args,

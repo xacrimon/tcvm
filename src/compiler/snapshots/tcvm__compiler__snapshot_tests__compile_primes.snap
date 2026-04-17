@@ -2,16 +2,15 @@
 source: src/compiler/snapshot_tests.rs
 expression: output
 ---
-; function (params=0, vararg=true, stack=9, upvalues=1)
+; function (params=0, vararg=true, stack=8, upvalues=1)
 ; constants:
 ;   K0 = 2
 ;   K1 = 0
 ;   K2 = ""
 ;   K3 = 1000
-;   K4 = true
-;   K5 = 1
-;   K6 = "\n"
-;   K7 = "print"
+;   K4 = 1
+;   K5 = "\n"
+;   K6 = "print"
 ; upvalues:
 ;   U0 = local R0
 ; code:
@@ -21,50 +20,44 @@ expression: output
 0003  LOAD            R2 K1  ; 0
 0004  LOAD            R3 K2  ; ""
 0005  LOAD            R4 K3  ; 1000
-0006  LOAD            R5 K4  ; true
-0007  LT              R2 R4 inv=false
-0008  LFALSESKIP      R5
-0009  TEST            R5 inv=true
-0010  JMP             +11
-0011  CALL            R0 args=2 ret=2
-0012  TEST            R0 inv=true
-0013  JMP             +5
-0014  LOAD            R6 K5  ; 1
-0015  ADD             R2 R2 R6
-0016  LOAD            R7 K6  ; "\n"
-0017  CONCAT          R8 R1 R7
-0018  CONCAT          R3 R3 R8
-0019  LOAD            R6 K5  ; 1
-0020  ADD             R1 R1 R6
-0021  JMP             -17
-0022  GETTABUP        R4 U0 K7  ; "print"
-0023  MOVE            R5 R3
-0024  CALL            R4 args=2 ret=2
-0025  RETURN          R0 count=1
+0006  LT              R2 R4 inv=false
+0007  JMP             +11
+0008  CALL            R0 args=2 ret=2
+0009  TEST            R0 inv=false
+0010  JMP             +5
+0011  LOAD            R5 K4  ; 1
+0012  ADD             R2 R2 R5
+0013  LOAD            R6 K5  ; "\n"
+0014  CONCAT          R7 R1 R6
+0015  CONCAT          R3 R3 R7
+0016  LOAD            R5 K4  ; 1
+0017  ADD             R1 R1 R5
+0018  JMP             -14
+0019  GETTABUP        R4 U0 K6  ; "print"
+0020  MOVE            R5 R3
+0021  CALL            R4 args=2 ret=2
+0022  RETURN          R0 count=1
 
 ; prototype 0:
-  ; function (params=1, vararg=false, stack=10, upvalues=0)
+  ; function (params=1, vararg=false, stack=9, upvalues=0)
   ; constants:
   ;   K0 = 2
   ;   K1 = 1
   ;   K2 = 0
-  ;   K3 = true
-  ;   K4 = false
+  ;   K3 = false
+  ;   K4 = true
   ; code:
   0000  LOAD            R1 K0  ; 2
   0001  LOAD            R4 K1  ; 1
   0002  SUB             R2 R0 R4
   0003  LOAD            R3 K1  ; 1
-  0004  FORPREP         R1 +10
+  0004  FORPREP         R1 +7
   0005  MOD             R6 R0 R5
   0006  LOAD            R7 K2  ; 0
-  0007  LOAD            R8 K3  ; true
-  0008  EQ              R6 R7 inv=false
-  0009  LFALSESKIP      R8
-  0010  TEST            R8 inv=true
-  0011  JMP             +2
-  0012  LOAD            R9 K4  ; false
-  0013  RETURN          R9 count=2
-  0014  FORLOOP         R1 -10
-  0015  LOAD            R1 K3  ; true
-  0016  RETURN          R1 count=2
+  0007  EQ              R6 R7 inv=false
+  0008  JMP             +2
+  0009  LOAD            R8 K3  ; false
+  0010  RETURN          R8 count=2
+  0011  FORLOOP         R1 -7
+  0012  LOAD            R1 K4  ; true
+  0013  RETURN          R1 count=2

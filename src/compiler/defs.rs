@@ -6,6 +6,72 @@ use crate::instruction::{Instruction, UpValueDescriptor};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RegisterIndex(pub u8);
 
+/// A list of unfilled `JMP` (or conditional-fall-through `JMP`) instructions
+/// in the tape whose offset fields still need to be patched to a target. The
+/// two lists attached to an `ExprDesc` represent the expression's "true" and
+/// "false" exit paths — jumps in `true_list` are taken when the expression
+/// evaluates to a truthy value, jumps in `false_list` fire when falsy.
+#[derive(Debug, Clone, Default)]
+pub(super) struct JumpList {
+    pub(super) jumps: Vec<usize>,
+}
+
+impl JumpList {
+    pub(super) fn new() -> Self {
+        JumpList { jumps: Vec::new() }
+    }
+
+    pub(super) fn single(idx: usize) -> Self {
+        JumpList { jumps: vec![idx] }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.jumps.is_empty()
+    }
+
+    /// Consume `other`, appending its jumps onto `self`.
+    pub(super) fn concat(&mut self, mut other: JumpList) {
+        self.jumps.append(&mut other.jumps);
+    }
+}
+
+/// Where an expression's value currently lives during compilation, with any
+/// pending short-circuit jumps that will be patched by the consumer.
+#[derive(Debug, Clone)]
+pub(super) struct ExprDesc {
+    pub(super) kind: ExprKind,
+    pub(super) true_list: JumpList,
+    pub(super) false_list: JumpList,
+}
+
+/// The shape of an expression's current representation. For the first pass
+/// everything is eagerly discharged to a register — `Jump` is only produced
+/// by relational operators and short-circuit chains, and `discharge_to_reg`
+/// turns them back into `Reg`.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum ExprKind {
+    /// Value already sits in this register.
+    Reg(RegisterIndex),
+    /// Expression exists purely as the pair of jump lists; any fall-through
+    /// between them represents "evaluated the test, haven't materialised the
+    /// boolean". Produced by bare comparisons.
+    Jump,
+}
+
+impl ExprDesc {
+    pub(super) fn from_reg(reg: RegisterIndex) -> Self {
+        ExprDesc {
+            kind: ExprKind::Reg(reg),
+            true_list: JumpList::new(),
+            false_list: JumpList::new(),
+        }
+    }
+
+    pub(super) fn has_jumps(&self) -> bool {
+        !self.true_list.is_empty() || !self.false_list.is_empty()
+    }
+}
+
 /// Mutable accumulator used during compilation of a single function.
 pub struct Chunk<'gc> {
     pub(super) tape: Vec<Instruction>,

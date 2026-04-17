@@ -191,6 +191,12 @@ pub enum Instruction {
         inverted: bool,
     },
 
+    TESTSET {
+        dst: Register,
+        src: Register,
+        inverted: bool,
+    },
+
     CALL {
         func: Register,
         args: u8,
