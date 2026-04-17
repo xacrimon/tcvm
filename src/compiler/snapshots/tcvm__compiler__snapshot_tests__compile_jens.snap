@@ -11,29 +11,25 @@ expression: output
 0002  RETURN          R0 count=1
 
 ; prototype 0:
-  ; function (params=1, vararg=false, stack=8, upvalues=1)
+  ; function (params=1, vararg=false, stack=7, upvalues=1)
   ; constants:
   ;   K0 = 2
-  ;   K1 = true
-  ;   K2 = 1
+  ;   K1 = 1
   ; upvalues:
   ;   U0 = local R0
   ; code:
   0000  LOAD            R1 K0  ; 2
-  0001  LOAD            R2 K1  ; true
-  0002  LT              R0 R1 inv=false
-  0003  LFALSESKIP      R2
-  0004  TEST            R2 inv=true
-  0005  JMP             +2
-  0006  MOVE            R3 R0
-  0007  RETURN          R3 count=2
-  0008  GETUPVAL        R4 U0
-  0009  LOAD            R5 K2  ; 1
-  0010  SUB             R5 R0 R5
-  0011  CALL            R4 args=2 ret=2
-  0012  GETUPVAL        R6 U0
-  0013  LOAD            R7 K0  ; 2
-  0014  SUB             R7 R0 R7
-  0015  CALL            R6 args=2 ret=2
-  0016  ADD             R3 R4 R6
-  0017  RETURN          R3 count=2
+  0001  LT              R0 R1 inv=false
+  0002  JMP             +2
+  0003  MOVE            R2 R0
+  0004  RETURN          R2 count=2
+  0005  GETUPVAL        R3 U0
+  0006  LOAD            R4 K1  ; 1
+  0007  SUB             R4 R0 R4
+  0008  CALL            R3 args=2 ret=2
+  0009  GETUPVAL        R5 U0
+  0010  LOAD            R6 K0  ; 2
+  0011  SUB             R6 R0 R6
+  0012  CALL            R5 args=2 ret=2
+  0013  ADD             R2 R3 R5
+  0014  RETURN          R2 count=2

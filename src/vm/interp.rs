@@ -42,6 +42,7 @@ static HANDLERS: &[Handler] = &[
     op_lt,
     op_le,
     op_test,
+    op_testset,
     op_call,
     op_tailcall,
     op_return,
@@ -947,6 +948,29 @@ extern "rust-preserve-none" fn op_test<'gc>(
     let truthy = !reg!(src).is_falsy();
     if truthy != inverted {
         skip!();
+    }
+    dispatch!();
+}
+
+/// If (truthy(R[src]) == inverted) then skip next instruction;
+/// otherwise R[dst] := R[src] and fall through. Matches Lua 5.4 TESTSET.
+#[inline(never)]
+extern "rust-preserve-none" fn op_testset<'gc>(
+    instruction: Instruction,
+    mc: &Mutation<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+) -> Result<(), Box<Error>> {
+    helpers!(instruction, mc, thread, registers, ip, handlers);
+    let (dst, src, inverted) = args!(Instruction::TESTSET { dst, src, inverted });
+    let val = reg!(src);
+    let truthy = !val.is_falsy();
+    if truthy == inverted {
+        skip!();
+    } else {
+        *reg!(mut dst) = val;
     }
     dispatch!();
 }

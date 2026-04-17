@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use cstree::interning::TokenInterner;
 
-use super::defs::{Chunk, RegisterIndex};
+use super::defs::{Chunk, ExprDesc, ExprKind, JumpList, RegisterIndex};
 use super::{CompileError, CompileErrorKind, LineNumber};
 use crate::dmm::{Gc, Mutation};
 use crate::env::{LuaString, Prototype, Value};
@@ -125,6 +125,208 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         let idx = self.next_offset();
         self.chunk.jump_patches.push((idx, label));
         self.emit(instr);
+    }
+
+    // ---------------------------------------------------------------------
+    // Jump-list primitives (Lua 5.4-style true/false list patching)
+    // ---------------------------------------------------------------------
+
+    /// Emit a `JMP` with a placeholder offset and return its tape index so
+    /// the caller can thread it through a `JumpList`.
+    fn emit_unfilled_jmp(&mut self) -> usize {
+        let idx = self.next_offset();
+        self.emit(Instruction::JMP { offset: 0 });
+        idx
+    }
+
+    /// Patch every jump in `list` so it targets the instruction at `target`.
+    fn patch_to(&mut self, list: JumpList, target: usize) {
+        for idx in list.jumps {
+            let offset = target as i32 - (idx as i32 + 1);
+            match &mut self.chunk.tape[idx] {
+                Instruction::JMP { offset: o } => *o = offset,
+                _ => panic!("jump-list entry is not a JMP"),
+            }
+        }
+    }
+
+    /// Patch every jump in `list` to the current tape position (the next
+    /// instruction to be emitted).
+    fn patch_to_here(&mut self, list: JumpList) {
+        let target = self.next_offset();
+        self.patch_to(list, target);
+    }
+
+    /// Emit a test + unfilled jump that fires when the value in `src` matches
+    /// `jump_if_truthy`. Returns the tape index of the emitted JMP so the
+    /// caller can append it to the appropriate list.
+    fn emit_test_jump(&mut self, src: RegisterIndex, jump_if_truthy: bool) -> usize {
+        // op_test skips iff `truthy != inverted`, so to make the JMP fire
+        // when the value has the desired truthiness we set `inverted` equal
+        // to that desired truthiness. Then skip iff truthy != desired → JMP
+        // runs iff truthy == desired.
+        self.emit(Instruction::TEST {
+            src: src.0,
+            inverted: jump_if_truthy,
+        });
+        self.emit_unfilled_jmp()
+    }
+
+    /// Swap the true/false lists of `expr` and flip the `inverted` flag on
+    /// each list's associated control instruction (the CMP/TEST immediately
+    /// before each pending JMP). Lets callers reuse a pending conditional
+    /// jump when they need the opposite polarity — no extra instructions.
+    fn negate_cond(&mut self, expr: &mut ExprDesc) {
+        for &jmp_idx in expr
+            .true_list
+            .jumps
+            .iter()
+            .chain(expr.false_list.jumps.iter())
+        {
+            // Only conditional jumps have a preceding control instruction.
+            // Unconditional JMPs (produced during list merges) have no test
+            // instruction in front of them and are left untouched — callers
+            // avoid negating such expressions.
+            if jmp_idx == 0 {
+                continue;
+            }
+            match &mut self.chunk.tape[jmp_idx - 1] {
+                Instruction::LT { inverted, .. }
+                | Instruction::LE { inverted, .. }
+                | Instruction::EQ { inverted, .. }
+                | Instruction::TEST { inverted, .. }
+                | Instruction::TESTSET { inverted, .. } => {
+                    *inverted = !*inverted;
+                }
+                _ => {}
+            }
+        }
+        std::mem::swap(&mut expr.true_list, &mut expr.false_list);
+    }
+
+    /// Ensure `expr` has a pending jump in its true-list — i.e. one that
+    /// fires exactly when the expression evaluates to truthy. Leaves
+    /// fall-through as the falsy path.
+    fn goiftrue(&mut self, expr: &mut ExprDesc) -> Result<(), CompileError> {
+        match expr.kind {
+            ExprKind::Jump => {
+                // If the pending jumps already fire on truthy (true_list
+                // populated), we're done — fall-through is the falsy path.
+                // If they only fire on falsy, invert polarity so they move
+                // into true_list.
+                if expr.true_list.is_empty() && !expr.false_list.is_empty() {
+                    self.negate_cond(expr);
+                }
+            }
+            ExprKind::Reg(reg) => {
+                let jmp = self.emit_test_jump(reg, true);
+                expr.true_list.jumps.push(jmp);
+            }
+        }
+        Ok(())
+    }
+
+    /// Ensure `expr` has a pending jump in its false-list — fires when the
+    /// expression evaluates to falsy, fall-through is the truthy path.
+    fn goiffalse(&mut self, expr: &mut ExprDesc) -> Result<(), CompileError> {
+        match expr.kind {
+            ExprKind::Jump => {
+                if expr.false_list.is_empty() && !expr.true_list.is_empty() {
+                    self.negate_cond(expr);
+                }
+            }
+            ExprKind::Reg(reg) => {
+                let jmp = self.emit_test_jump(reg, false);
+                expr.false_list.jumps.push(jmp);
+            }
+        }
+        Ok(())
+    }
+
+    /// Discharge an expression to a concrete register. If either jump list
+    /// is non-empty, emit a fixup tail so every exit path materialises a
+    /// boolean in `dst`:
+    ///
+    /// ```text
+    ///   <value in dst — for Reg kinds; Jump kinds have no "fall-through"
+    ///    value because the preceding CMP/TEST fully routes into the lists>
+    ///   JMP end                          ; skip past fixup (Reg path only)
+    ///   LFALSESKIP dst                   ; false_list patches here
+    ///   LOAD        dst K(true)          ; true_list patches here
+    /// end:
+    /// ```
+    ///
+    /// For a Jump expression the fall-through at the moment of discharge is
+    /// already the "truthy" outcome of the pending comparison, so we route
+    /// that into `true_list` first by emitting an unconditional JMP and
+    /// appending it. That reduces the pattern to the fixup tail alone.
+    fn discharge_to_reg_mut(
+        &mut self,
+        expr: &mut ExprDesc,
+        hint: Option<RegisterIndex>,
+    ) -> Result<RegisterIndex, CompileError> {
+        // For a plain Reg with no pending jumps, return the register where
+        // the value already lives. The `hint` is advisory — honouring it
+        // here would emit a MOVE that many callers then re-emit themselves,
+        // flipping instruction order and inflating the frame size. Callers
+        // that need the value in a specific register check the returned
+        // register and MOVE themselves.
+        if matches!(expr.kind, ExprKind::Reg(_)) && !expr.has_jumps() {
+            if let ExprKind::Reg(reg) = expr.kind {
+                return Ok(reg);
+            }
+        }
+
+        let dst = match expr.kind {
+            ExprKind::Reg(reg) => reg,
+            ExprKind::Jump => self.dst_or_alloc(hint)?,
+        };
+
+        let is_jump = matches!(expr.kind, ExprKind::Jump);
+        if is_jump {
+            // Route the comparison's truthy fall-through into true_list so
+            // the fixup tail below is the only materialisation site.
+            let jmp = self.emit_unfilled_jmp();
+            expr.true_list.jumps.push(jmp);
+        }
+
+        if expr.has_jumps() {
+            // For a Reg-kind with pending jumps (e.g. value-context `and`/`or`
+            // whose LHS short-circuited into the lists), the fall-through at
+            // this point is the LHS's already-materialised value in `dst`.
+            // Skip over the fixup so we keep that value.
+            let skip_fixup = if !is_jump {
+                Some(self.emit_unfilled_jmp())
+            } else {
+                None
+            };
+
+            let false_target = self.next_offset();
+            self.emit(Instruction::LFALSESKIP { src: dst.0 });
+
+            let true_target = self.next_offset();
+            let true_idx = self.alloc_constant(Value::Boolean(true))?;
+            self.emit(Instruction::LOAD {
+                dst: dst.0,
+                idx: true_idx,
+            });
+
+            let fl = std::mem::take(&mut expr.false_list);
+            let tl = std::mem::take(&mut expr.true_list);
+            self.patch_to(fl, false_target);
+            self.patch_to(tl, true_target);
+
+            if let Some(idx) = skip_fixup {
+                let end = self.next_offset();
+                let offset = end as i32 - (idx as i32 + 1);
+                if let Instruction::JMP { offset: o } = &mut self.chunk.tape[idx] {
+                    *o = offset;
+                }
+            }
+        }
+
+        expr.kind = ExprKind::Reg(dst);
+        Ok(dst)
     }
 
     fn push_scope(&mut self) {
@@ -358,7 +560,7 @@ fn compile_stmt(ctx: &mut Ctx, item: Stmt) -> Result<(), CompileError> {
         Stmt::Assign(item) => compile_assign(ctx, item),
         Stmt::Func(item) => compile_func(ctx, item),
         Stmt::Expr(item) => {
-            compile_expr(ctx, item, None)?;
+            compile_expr_to_reg(ctx, item, None)?;
             Ok(())
         }
         Stmt::Break(item) => compile_break(ctx, item),
@@ -496,7 +698,7 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
 
         // Pass the target local's register as a destination hint
         let hint = local_regs.get(i).copied();
-        let reg = compile_expr(ctx, expr, hint)?;
+        let reg = compile_expr_to_reg(ctx, expr, hint)?;
         value_regs.push(reg);
     }
 
@@ -596,7 +798,7 @@ fn compile_assign(ctx: &mut Ctx, item: Assign) -> Result<(), CompileError> {
         }
 
         let hint = hints.get(i).copied().flatten();
-        let reg = compile_expr(ctx, expr, hint)?;
+        let reg = compile_expr_to_reg(ctx, expr, hint)?;
         sources.push(reg.0);
     }
 
@@ -660,8 +862,8 @@ fn compile_assign_lhs(ctx: &mut Ctx, target: Expr, value: u8) -> Result<(), Comp
         Expr::Index(index) => {
             let table_expr = index.target().ok_or_else(|| ice("index without target"))?;
             let key_expr = index.index().ok_or_else(|| ice("index without key"))?;
-            let table = compile_expr(ctx, table_expr, None)?;
-            let key = compile_expr(ctx, key_expr, None)?;
+            let table = compile_expr_to_reg(ctx, table_expr, None)?;
+            let key = compile_expr_to_reg(ctx, key_expr, None)?;
             ctx.emit(Instruction::SETTABLE {
                 src: value,
                 table: table.0,
@@ -676,7 +878,7 @@ fn compile_assign_lhs(ctx: &mut Ctx, target: Expr, value: u8) -> Result<(), Comp
             if op == BinaryOperator::Property {
                 let table_expr = binop.lhs().ok_or_else(|| ice("binop without lhs"))?;
                 let field = binop.rhs().ok_or_else(|| ice("binop without rhs"))?;
-                let table = compile_expr(ctx, table_expr, None)?;
+                let table = compile_expr_to_reg(ctx, table_expr, None)?;
                 let key = compile_property_key(ctx, field, None)?;
                 ctx.emit(Instruction::SETTABLE {
                     src: value,
@@ -813,36 +1015,50 @@ fn compile_nested<'gc>(
 // Expression compilation
 // ---------------------------------------------------------------------------
 
+/// Compile an expression, returning an `ExprDesc` that may carry pending
+/// jump lists instead of a materialised value (for comparisons, `not`, and
+/// short-circuit `and`/`or`). Callers who need a concrete register call
+/// `compile_expr_to_reg` instead, which discharges through the standard
+/// `LFALSESKIP` / `LOAD true` fixup tail when lists are non-empty.
 fn compile_expr(
     ctx: &mut Ctx,
     item: Expr,
     dst: Option<RegisterIndex>,
-) -> Result<RegisterIndex, CompileError> {
+) -> Result<ExprDesc, CompileError> {
     match item {
-        Expr::Method(item) => {
-            let regs = compile_expr_method_call(ctx, item, 1)?;
-            Ok(regs[0])
-        }
-        Expr::Ident(item) => compile_expr_ident(ctx, item, dst),
-        Expr::Literal(item) => compile_expr_literal(ctx, item, dst),
-        Expr::Func(item) => compile_expr_func(ctx, item, dst),
-        Expr::Table(item) => compile_expr_table(ctx, item),
         Expr::PrefixOp(item) => compile_expr_prefix_op(ctx, item, dst),
         Expr::BinaryOp(item) => compile_expr_binary_op(ctx, item, dst),
+        Expr::Method(item) => {
+            let regs = compile_expr_method_call(ctx, item, 1)?;
+            Ok(ExprDesc::from_reg(regs[0]))
+        }
+        Expr::Ident(item) => compile_expr_ident(ctx, item, dst).map(ExprDesc::from_reg),
+        Expr::Literal(item) => compile_expr_literal(ctx, item, dst).map(ExprDesc::from_reg),
+        Expr::Func(item) => compile_expr_func(ctx, item, dst).map(ExprDesc::from_reg),
+        Expr::Table(item) => compile_expr_table(ctx, item).map(ExprDesc::from_reg),
         Expr::FuncCall(item) => {
             let regs = compile_expr_func_call(ctx, item, 1)?;
-            Ok(regs[0])
+            Ok(ExprDesc::from_reg(regs[0]))
         }
-        Expr::Index(item) => compile_expr_index(ctx, item, dst),
+        Expr::Index(item) => compile_expr_index(ctx, item, dst).map(ExprDesc::from_reg),
         Expr::VarArg => {
             let dst = ctx.dst_or_alloc(dst)?;
             ctx.emit(Instruction::VARARG {
                 dst: dst.0,
                 count: 2,
             });
-            Ok(dst)
+            Ok(ExprDesc::from_reg(dst))
         }
     }
+}
+
+fn compile_expr_to_reg(
+    ctx: &mut Ctx,
+    item: Expr,
+    dst: Option<RegisterIndex>,
+) -> Result<RegisterIndex, CompileError> {
+    let mut expr = compile_expr(ctx, item, dst)?;
+    ctx.discharge_to_reg_mut(&mut expr, dst)
 }
 
 fn compile_expr_ident(
@@ -938,7 +1154,7 @@ fn compile_property_key(
         Ok(reg)
     } else {
         // Fallback: compile as expression
-        compile_expr(ctx, field, dst)
+        compile_expr_to_reg(ctx, field, dst)
     }
 }
 
@@ -955,7 +1171,7 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
                 let value_expr = arr
                     .value()
                     .ok_or_else(|| ice("table array without value"))?;
-                let val = compile_expr(ctx, value_expr, None)?;
+                let val = compile_expr_to_reg(ctx, value_expr, None)?;
 
                 // Place value in register after table for SETLIST
                 let slot = ctx.alloc_register()?;
@@ -1002,7 +1218,7 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
                 });
 
                 let value_expr = map.value().ok_or_else(|| ice("table map without value"))?;
-                let val = compile_expr(ctx, value_expr, None)?;
+                let val = compile_expr_to_reg(ctx, value_expr, None)?;
 
                 ctx.emit(Instruction::SETTABLE {
                     src: val.0,
@@ -1028,8 +1244,8 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
                 let val_expr = r#gen
                     .value()
                     .ok_or_else(|| ice("table generic without value"))?;
-                let key = compile_expr(ctx, key_expr, None)?;
-                let val = compile_expr(ctx, val_expr, None)?;
+                let key = compile_expr_to_reg(ctx, key_expr, None)?;
+                let val = compile_expr_to_reg(ctx, val_expr, None)?;
 
                 ctx.emit(Instruction::SETTABLE {
                     src: val.0,
@@ -1056,15 +1272,39 @@ fn compile_expr_prefix_op(
     ctx: &mut Ctx,
     item: PrefixOp,
     dst: Option<RegisterIndex>,
-) -> Result<RegisterIndex, CompileError> {
+) -> Result<ExprDesc, CompileError> {
     let op = item.op().ok_or_else(|| ice("prefix op without operator"))?;
     let rhs_expr = item.rhs().ok_or_else(|| ice("prefix op without operand"))?;
-    let src = compile_expr(ctx, rhs_expr, None)?;
 
-    match op {
+    // `not <expr>`: when the operand is a jump-list expression (comparison,
+    // `not`-of-comparison, etc.) we swap its true/false lists and flip the
+    // polarity of every pending control instruction — no NOT opcode, no
+    // materialisation. For plain register/value operands fall back to the
+    // NOT opcode so fall-through polarity stays consistent with the kind.
+    if matches!(op, PrefixOperator::Not) {
+        let mut inner = compile_expr(ctx, rhs_expr, None)?;
+        match inner.kind {
+            ExprKind::Jump => {
+                ctx.negate_cond(&mut inner);
+                return Ok(inner);
+            }
+            ExprKind::Reg(src) => {
+                let dst = ctx.dst_or_alloc(dst)?;
+                ctx.emit(Instruction::NOT {
+                    dst: dst.0,
+                    src: src.0,
+                });
+                return Ok(ExprDesc::from_reg(dst));
+            }
+        }
+    }
+
+    let src = compile_expr_to_reg(ctx, rhs_expr, None)?;
+
+    let result_reg = match op {
         PrefixOperator::None => {
             // Unary + is a no-op
-            Ok(src)
+            src
         }
         PrefixOperator::Neg => {
             let dst = ctx.dst_or_alloc(dst)?;
@@ -1072,23 +1312,16 @@ fn compile_expr_prefix_op(
                 dst: dst.0,
                 src: src.0,
             });
-            Ok(dst)
+            dst
         }
-        PrefixOperator::Not => {
-            let dst = ctx.dst_or_alloc(dst)?;
-            ctx.emit(Instruction::NOT {
-                dst: dst.0,
-                src: src.0,
-            });
-            Ok(dst)
-        }
+        PrefixOperator::Not => unreachable!("handled above"),
         PrefixOperator::Len => {
             let dst = ctx.dst_or_alloc(dst)?;
             ctx.emit(Instruction::LEN {
                 dst: dst.0,
                 src: src.0,
             });
-            Ok(dst)
+            dst
         }
         PrefixOperator::BitNot => {
             let dst = ctx.dst_or_alloc(dst)?;
@@ -1096,12 +1329,38 @@ fn compile_expr_prefix_op(
                 dst: dst.0,
                 src: src.0,
             });
-            Ok(dst)
+            dst
         }
-    }
+    };
+    Ok(ExprDesc::from_reg(result_reg))
 }
 
 fn compile_expr_binary_op(
+    ctx: &mut Ctx,
+    item: BinaryOp,
+    dst: Option<RegisterIndex>,
+) -> Result<ExprDesc, CompileError> {
+    let op = item.op().ok_or_else(|| ice("binary op without operator"))?;
+
+    // Comparisons produce a jump-list expression so callers that only branch
+    // on the result (if/while/repeat, `not`) can avoid the LOAD-true /
+    // LFALSESKIP materialisation entirely. `and`/`or` still go through the
+    // register-returning path for now — full jump-list treatment of those
+    // comes in a later pass alongside TESTSET.
+    match op {
+        BinaryOperator::Eq
+        | BinaryOperator::NEq
+        | BinaryOperator::Lt
+        | BinaryOperator::Gt
+        | BinaryOperator::LEq
+        | BinaryOperator::GEq => return compile_comparison_desc(ctx, item, op),
+        _ => {}
+    }
+
+    compile_expr_binary_op_to_reg(ctx, item, dst).map(ExprDesc::from_reg)
+}
+
+fn compile_expr_binary_op_to_reg(
     ctx: &mut Ctx,
     item: BinaryOp,
     dst: Option<RegisterIndex>,
@@ -1119,7 +1378,7 @@ fn compile_expr_binary_op(
     if op == BinaryOperator::Property {
         let lhs = item.lhs().ok_or_else(|| ice("binop without lhs"))?;
         let rhs = item.rhs().ok_or_else(|| ice("binop without rhs"))?;
-        let table = compile_expr(ctx, lhs, None)?;
+        let table = compile_expr_to_reg(ctx, lhs, None)?;
         let key = compile_property_key(ctx, rhs, None)?;
         let dst = ctx.dst_or_alloc(dst)?;
         ctx.emit(Instruction::GETTABLE {
@@ -1137,8 +1396,8 @@ fn compile_expr_binary_op(
 
     let lhs_expr = item.lhs().ok_or_else(|| ice("binop without lhs"))?;
     let rhs_expr = item.rhs().ok_or_else(|| ice("binop without rhs"))?;
-    let lhs = compile_expr(ctx, lhs_expr, None)?;
-    let rhs = compile_expr(ctx, rhs_expr, None)?;
+    let lhs = compile_expr_to_reg(ctx, lhs_expr, None)?;
+    let rhs = compile_expr_to_reg(ctx, rhs_expr, None)?;
 
     // Arithmetic and bitwise operations
     match op {
@@ -1284,73 +1543,12 @@ fn compile_expr_binary_op(
             Ok(dst)
         }
 
-        // Comparisons — these produce a boolean result
-        BinaryOperator::Eq => compile_comparison(
-            ctx,
-            lhs,
-            rhs,
-            |l, r| Instruction::EQ {
-                lhs: l,
-                rhs: r,
-                inverted: false,
-            },
-            dst,
-        ),
-        BinaryOperator::NEq => compile_comparison(
-            ctx,
-            lhs,
-            rhs,
-            |l, r| Instruction::EQ {
-                lhs: l,
-                rhs: r,
-                inverted: true,
-            },
-            dst,
-        ),
-        BinaryOperator::Lt => compile_comparison(
-            ctx,
-            lhs,
-            rhs,
-            |l, r| Instruction::LT {
-                lhs: l,
-                rhs: r,
-                inverted: false,
-            },
-            dst,
-        ),
-        BinaryOperator::Gt => compile_comparison(
-            ctx,
-            lhs,
-            rhs,
-            |l, r| Instruction::LT {
-                lhs: r,
-                rhs: l,
-                inverted: false,
-            },
-            dst,
-        ),
-        BinaryOperator::LEq => compile_comparison(
-            ctx,
-            lhs,
-            rhs,
-            |l, r| Instruction::LE {
-                lhs: l,
-                rhs: r,
-                inverted: false,
-            },
-            dst,
-        ),
-        BinaryOperator::GEq => compile_comparison(
-            ctx,
-            lhs,
-            rhs,
-            |l, r| Instruction::LE {
-                lhs: r,
-                rhs: l,
-                inverted: false,
-            },
-            dst,
-        ),
+        BinaryOperator::Eq
+        | BinaryOperator::NEq
+        | BinaryOperator::Lt
+        | BinaryOperator::Gt
+        | BinaryOperator::LEq
+        | BinaryOperator::GEq => unreachable!("comparisons handled by compile_comparison_desc"),
 
         BinaryOperator::And | BinaryOperator::Or => unreachable!("handled above"),
         BinaryOperator::Property | BinaryOperator::Method => unreachable!("handled above"),
@@ -1385,26 +1583,127 @@ fn emit_arith(
     Ok(dst)
 }
 
-fn compile_comparison(
+/// Compile a comparison (`==`, `~=`, `<`, `>`, `<=`, `>=`) as a jump-list
+/// expression: emit just `CMP` + an unfilled `JMP` and return an
+/// `ExprDesc::Jump` whose false-list holds the JMP. Consumers that branch
+/// on the result patch the list directly (2 instructions); consumers that
+/// need a boolean in a register call `discharge_to_reg_mut`, which emits
+/// the standard `LFALSESKIP` / `LOAD K(true)` fixup tail.
+fn compile_comparison_desc(
     ctx: &mut Ctx,
-    lhs: RegisterIndex,
-    rhs: RegisterIndex,
-    make_cmp: impl FnOnce(u8, u8) -> Instruction,
+    item: BinaryOp,
+    op: BinaryOperator,
+) -> Result<ExprDesc, CompileError> {
+    let lhs_expr = item.lhs().ok_or_else(|| ice("cmp without lhs"))?;
+    let rhs_expr = item.rhs().ok_or_else(|| ice("cmp without rhs"))?;
+    let lhs = compile_expr_to_reg(ctx, lhs_expr, None)?;
+    let rhs = compile_expr_to_reg(ctx, rhs_expr, None)?;
+
+    // `inverted = false` on all comparison ops: the VM's `op_cmp` skips the
+    // following instruction iff `(cmp_result != inverted) == true`, i.e.
+    // skip when the comparison succeeds. So the unfilled JMP fires when the
+    // comparison FAILS, which is exactly a "jump on false" — append into
+    // `false_list`.
+    let instr = match op {
+        BinaryOperator::Eq => Instruction::EQ {
+            lhs: lhs.0,
+            rhs: rhs.0,
+            inverted: false,
+        },
+        BinaryOperator::NEq => Instruction::EQ {
+            lhs: lhs.0,
+            rhs: rhs.0,
+            inverted: true,
+        },
+        BinaryOperator::Lt => Instruction::LT {
+            lhs: lhs.0,
+            rhs: rhs.0,
+            inverted: false,
+        },
+        BinaryOperator::Gt => Instruction::LT {
+            lhs: rhs.0,
+            rhs: lhs.0,
+            inverted: false,
+        },
+        BinaryOperator::LEq => Instruction::LE {
+            lhs: lhs.0,
+            rhs: rhs.0,
+            inverted: false,
+        },
+        BinaryOperator::GEq => Instruction::LE {
+            lhs: rhs.0,
+            rhs: lhs.0,
+            inverted: false,
+        },
+        _ => return Err(ice("compile_comparison_desc called with non-comparison op")),
+    };
+    ctx.emit(instr);
+    let jmp = ctx.emit_unfilled_jmp();
+
+    Ok(ExprDesc {
+        kind: ExprKind::Jump,
+        true_list: JumpList::new(),
+        false_list: JumpList::single(jmp),
+    })
+}
+
+/// Compile `lhs and rhs` / `lhs or rhs` with TESTSET-based short-circuiting
+/// so the result preserves the operand that decided the short-circuit.
+///
+/// `and`: if `lhs` is falsy, the whole expression is `lhs` — skip `rhs` and
+/// keep `lhs` in `dst`. If `lhs` is truthy, evaluate `rhs` (which overwrites
+/// `dst`) and its value is the result.
+///
+/// `or`: symmetric. Truthy `lhs` short-circuits with `lhs` as the result.
+///
+/// The TESTSET does the "assign `lhs` into `dst` on the short-circuit leg"
+/// work in one instruction, replacing the old TEST + MOVE pattern.
+fn compile_logical_short_circuit(
+    ctx: &mut Ctx,
+    item: BinaryOp,
     dst: Option<RegisterIndex>,
+    is_and: bool,
 ) -> Result<RegisterIndex, CompileError> {
+    let kw = if is_and { "and" } else { "or" };
+    let lhs_expr = item.lhs().ok_or_else(|| ice("short-circuit without lhs"))?;
+    let rhs_expr = item.rhs().ok_or_else(|| {
+        ice(if is_and {
+            "and without rhs"
+        } else {
+            "or without rhs"
+        })
+    })?;
+    let _ = kw; // kw only used for error text in ice() above; silence unused warning
+
     let dst = ctx.dst_or_alloc(dst)?;
+    let lhs = compile_expr_to_reg(ctx, lhs_expr, Some(dst))?;
 
-    // Emit: load true, comparison (skip next if true), LFALSESKIP, JMP over
-    let true_idx = ctx.alloc_constant(Value::Boolean(true))?;
-    ctx.emit(Instruction::LOAD {
+    // TESTSET semantics (our impl): `if truthy(src) == inverted then skip; else R[dst] := R[src]`.
+    //
+    // `and` (is_and=true): short-circuit when lhs is FALSY, result = lhs.
+    //   Use inverted=true → truthy path skips next (JMP), no assign needed
+    //   because truthy means we're going to evaluate rhs and overwrite dst.
+    //   Falsy path assigns dst := lhs and falls through to the JMP → end.
+    // `or`: short-circuit when lhs is TRUTHY, result = lhs.
+    //   Use inverted=false → falsy path skips next (JMP), truthy path assigns
+    //   dst := lhs and falls through to the JMP → end.
+    let end_label = ctx.new_label();
+    ctx.emit(Instruction::TESTSET {
         dst: dst.0,
-        idx: true_idx,
+        src: lhs.0,
+        inverted: is_and,
     });
-    ctx.emit(make_cmp(lhs.0, rhs.0));
-    // If comparison is true, skip the next instruction (which loads false)
-    // If false, execute the LFALSESKIP which sets to false and skips the jump
-    ctx.emit(Instruction::LFALSESKIP { src: dst.0 });
+    ctx.emit_jump(end_label);
 
+    let rhs = compile_expr_to_reg(ctx, rhs_expr, Some(dst))?;
+    if rhs != dst {
+        ctx.emit(Instruction::MOVE {
+            dst: dst.0,
+            src: rhs.0,
+        });
+    }
+
+    ctx.set_label(end_label, ctx.next_offset());
     Ok(dst)
 }
 
@@ -1413,36 +1712,7 @@ fn compile_logical_and(
     item: BinaryOp,
     dst: Option<RegisterIndex>,
 ) -> Result<RegisterIndex, CompileError> {
-    let lhs_expr = item.lhs().ok_or_else(|| ice("and without lhs"))?;
-
-    let dst = ctx.dst_or_alloc(dst)?;
-    let lhs = compile_expr(ctx, lhs_expr, Some(dst))?;
-    if lhs != dst {
-        ctx.emit(Instruction::MOVE {
-            dst: dst.0,
-            src: lhs.0,
-        });
-    }
-
-    // TEST: if lhs is falsy, skip JMP (short-circuit, result is lhs)
-    let end_label = ctx.new_label();
-    ctx.emit(Instruction::TEST {
-        src: dst.0,
-        inverted: true,
-    });
-    ctx.emit_jump(end_label);
-
-    let rhs_expr = item.rhs().ok_or_else(|| ice("and without rhs"))?;
-    let rhs = compile_expr(ctx, rhs_expr, Some(dst))?;
-    if rhs != dst {
-        ctx.emit(Instruction::MOVE {
-            dst: dst.0,
-            src: rhs.0,
-        });
-    }
-
-    ctx.set_label(end_label, ctx.next_offset());
-    Ok(dst)
+    compile_logical_short_circuit(ctx, item, dst, true)
 }
 
 fn compile_logical_or(
@@ -1450,36 +1720,7 @@ fn compile_logical_or(
     item: BinaryOp,
     dst: Option<RegisterIndex>,
 ) -> Result<RegisterIndex, CompileError> {
-    let lhs_expr = item.lhs().ok_or_else(|| ice("or without lhs"))?;
-
-    let dst = ctx.dst_or_alloc(dst)?;
-    let lhs = compile_expr(ctx, lhs_expr, Some(dst))?;
-    if lhs != dst {
-        ctx.emit(Instruction::MOVE {
-            dst: dst.0,
-            src: lhs.0,
-        });
-    }
-
-    // TEST: if lhs is truthy, skip JMP (short-circuit, result is lhs)
-    let end_label = ctx.new_label();
-    ctx.emit(Instruction::TEST {
-        src: dst.0,
-        inverted: false,
-    });
-    ctx.emit_jump(end_label);
-
-    let rhs_expr = item.rhs().ok_or_else(|| ice("or without rhs"))?;
-    let rhs = compile_expr(ctx, rhs_expr, Some(dst))?;
-    if rhs != dst {
-        ctx.emit(Instruction::MOVE {
-            dst: dst.0,
-            src: rhs.0,
-        });
-    }
-
-    ctx.set_label(end_label, ctx.next_offset());
-    Ok(dst)
+    compile_logical_short_circuit(ctx, item, dst, false)
 }
 
 fn compile_expr_func_call(
@@ -1490,7 +1731,7 @@ fn compile_expr_func_call(
     let target = item
         .target()
         .ok_or_else(|| ice("func call without target"))?;
-    let func = compile_expr(ctx, target, None)?;
+    let func = compile_expr_to_reg(ctx, target, None)?;
 
     let args: Vec<_> = item.args().map(|a| a.collect()).unwrap_or_default();
     let nargs = args.len();
@@ -1498,7 +1739,7 @@ fn compile_expr_func_call(
     // Compile arguments into consecutive registers after func
     for (i, arg_expr) in args.into_iter().enumerate() {
         let expected_reg = RegisterIndex(func.0 + 1 + i as u8);
-        let arg = compile_expr(ctx, arg_expr, Some(expected_reg))?;
+        let arg = compile_expr_to_reg(ctx, arg_expr, Some(expected_reg))?;
         if arg != expected_reg {
             // Need to ensure we have the register allocated
             while ctx.chunk.register_count <= expected_reg.0 as usize {
@@ -1540,7 +1781,7 @@ fn compile_expr_method_call(
         .name(ctx.interner)
         .ok_or_else(|| ice("ident without name"))?;
 
-    let object = compile_expr(ctx, object_expr, None)?;
+    let object = compile_expr_to_reg(ctx, object_expr, None)?;
 
     // Load method name as key
     let key_idx = ctx.alloc_string_constant(method_name.as_bytes())?;
@@ -1574,7 +1815,7 @@ fn compile_expr_method_call(
 
     for (i, arg_expr) in args.into_iter().enumerate() {
         let expected_reg = RegisterIndex(func.0 + 2 + i as u8);
-        let arg = compile_expr(ctx, arg_expr, Some(expected_reg))?;
+        let arg = compile_expr_to_reg(ctx, arg_expr, Some(expected_reg))?;
         if arg != expected_reg {
             while ctx.chunk.register_count <= expected_reg.0 as usize {
                 ctx.alloc_register()?;
@@ -1606,8 +1847,8 @@ fn compile_expr_index(
 ) -> Result<RegisterIndex, CompileError> {
     let target_expr = item.target().ok_or_else(|| ice("index without target"))?;
     let key_expr = item.index().ok_or_else(|| ice("index without key"))?;
-    let table = compile_expr(ctx, target_expr, None)?;
-    let key = compile_expr(ctx, key_expr, None)?;
+    let table = compile_expr_to_reg(ctx, target_expr, None)?;
+    let key = compile_expr_to_reg(ctx, key_expr, None)?;
     let dst = ctx.dst_or_alloc(dst)?;
     ctx.emit(Instruction::GETTABLE {
         dst: dst.0,
@@ -1646,7 +1887,7 @@ fn compile_return(ctx: &mut Ctx, item: Return) -> Result<(), CompileError> {
 
     for (i, expr) in exprs.into_iter().enumerate() {
         let target = RegisterIndex(first_reg.0 + i as u8);
-        let reg = compile_expr(ctx, expr, Some(target))?;
+        let reg = compile_expr_to_reg(ctx, expr, Some(target))?;
         if reg != target {
             while ctx.chunk.register_count <= target.0 as usize {
                 ctx.alloc_register()?;
@@ -1680,24 +1921,30 @@ fn compile_do(ctx: &mut Ctx, item: Do) -> Result<(), CompileError> {
     })
 }
 
+/// Compile `cond` as the condition of a branching construct. Returns the
+/// list of jumps that should be patched to the branch-out target (i.e. the
+/// "else" of an `if`, the "break" of a `while`, the loop-back of a
+/// `repeat ... until`). The fall-through after this call is the path taken
+/// when the condition evaluates to truthy.
+fn compile_branch_cond_false(ctx: &mut Ctx, cond_expr: Expr) -> Result<JumpList, CompileError> {
+    let mut desc = compile_expr(ctx, cond_expr, None)?;
+    ctx.goiffalse(&mut desc)?;
+    // After goiffalse, `false_list` holds every jump that fires on falsy
+    // (the caller patches these to the branch-out target) and `true_list`
+    // holds any jumps accumulated during LHS evaluation of an `and`/`or`
+    // chain that need to land here at the truthy-fall-through position.
+    let true_list = std::mem::take(&mut desc.true_list);
+    ctx.patch_to_here(true_list);
+    Ok(desc.false_list)
+}
+
 fn compile_while(ctx: &mut Ctx, item: While) -> Result<(), CompileError> {
     scope_lexical_break(ctx, |ctx| {
         let loop_start = ctx.new_label();
         ctx.set_label(loop_start, ctx.next_offset());
 
         let cond_expr = item.cond().ok_or_else(|| ice("while without condition"))?;
-        let cond = compile_expr(ctx, cond_expr, None)?;
-
-        // If condition is falsy, jump to break label (end of loop)
-        let break_label = *ctx
-            .control_end_label
-            .last()
-            .ok_or_else(|| ice("missing break label"))?;
-        ctx.emit(Instruction::TEST {
-            src: cond.0,
-            inverted: true,
-        });
-        ctx.emit_jump(break_label);
+        let break_list = compile_branch_cond_false(ctx, cond_expr)?;
 
         // Compile body
         if let Some(block) = item.block() {
@@ -1709,6 +1956,17 @@ fn compile_while(ctx: &mut Ctx, item: While) -> Result<(), CompileError> {
 
         // Jump back to condition check
         ctx.emit_jump(loop_start);
+
+        // Patch all "condition false" jumps to the post-loop break target.
+        let break_label = *ctx
+            .control_end_label
+            .last()
+            .ok_or_else(|| ice("missing break label"))?;
+        let break_target_idx = break_label as usize;
+        for idx in break_list.jumps {
+            ctx.chunk.jump_patches.push((idx, break_target_idx as u16));
+        }
+
         Ok(())
     })
 }
@@ -1719,8 +1977,7 @@ fn compile_repeat(ctx: &mut Ctx, item: Repeat) -> Result<(), CompileError> {
         // locals defined in the body. So we wrap the body AND condition
         // in the same lexical scope.
         scope_lexical(ctx, |ctx| {
-            let loop_start = ctx.new_label();
-            ctx.set_label(loop_start, ctx.next_offset());
+            let loop_start_off = ctx.next_offset();
 
             // Compile body
             let stmts: Vec<_> = item.block().map(|b| b.collect()).unwrap_or_default();
@@ -1728,16 +1985,12 @@ fn compile_repeat(ctx: &mut Ctx, item: Repeat) -> Result<(), CompileError> {
                 compile_stmt(ctx, stmt)?;
             }
 
-            // Compile condition
+            // Compile condition — jumps from false_list (condition falsy)
+            // get patched back to the loop start. Truthy fall-through exits
+            // the loop.
             let cond_expr = item.cond().ok_or_else(|| ice("repeat without condition"))?;
-            let cond = compile_expr(ctx, cond_expr, None)?;
-
-            // If condition is falsy, loop back
-            ctx.emit(Instruction::TEST {
-                src: cond.0,
-                inverted: true,
-            });
-            ctx.emit_jump(loop_start);
+            let false_list = compile_branch_cond_false(ctx, cond_expr)?;
+            ctx.patch_to(false_list, loop_start_off);
 
             Ok(())
         })
@@ -1755,14 +2008,7 @@ fn compile_if(ctx: &mut Ctx, item: If) -> Result<(), CompileError> {
 
 fn compile_if_chain(ctx: &mut Ctx, item: If, end_label: u16) -> Result<(), CompileError> {
     let cond_expr = item.cond().ok_or_else(|| ice("if without condition"))?;
-    let cond = compile_expr(ctx, cond_expr, None)?;
-
-    let else_label = ctx.new_label();
-    ctx.emit(Instruction::TEST {
-        src: cond.0,
-        inverted: true,
-    });
-    ctx.emit_jump(else_label);
+    let else_list = compile_branch_cond_false(ctx, cond_expr)?;
 
     // Then block
     scope_lexical(ctx, |ctx| {
@@ -1778,7 +2024,8 @@ fn compile_if_chain(ctx: &mut Ctx, item: If, end_label: u16) -> Result<(), Compi
         ctx.emit_jump(end_label);
     }
 
-    ctx.set_label(else_label, ctx.next_offset());
+    // Patch the "condition false" jumps to this point (start of else branch).
+    ctx.patch_to_here(else_list);
 
     // Else chain
     if let Some(chain) = item.else_chain() {
@@ -1816,7 +2063,7 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
         let step_reg = ctx.alloc_register()?;
 
         // Compile init, limit, step with destination hints
-        let init = compile_expr(ctx, init_expr, Some(base))?;
+        let init = compile_expr_to_reg(ctx, init_expr, Some(base))?;
         if init != base {
             ctx.emit(Instruction::MOVE {
                 dst: base.0,
@@ -1824,7 +2071,7 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
             });
         }
 
-        let limit = compile_expr(ctx, limit_expr, Some(limit_reg))?;
+        let limit = compile_expr_to_reg(ctx, limit_expr, Some(limit_reg))?;
         if limit != limit_reg {
             ctx.emit(Instruction::MOVE {
                 dst: limit_reg.0,
@@ -1833,7 +2080,7 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
         }
 
         if let Some(step_expr) = item.step() {
-            let step = compile_expr(ctx, step_expr, Some(step_reg))?;
+            let step = compile_expr_to_reg(ctx, step_expr, Some(step_reg))?;
             if step != step_reg {
                 ctx.emit(Instruction::MOVE {
                     dst: step_reg.0,
@@ -1921,7 +2168,7 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
         // Compile up to 3 iterator values with destination hints
         for (i, val_expr) in values.into_iter().enumerate().take(3) {
             let target_reg = RegisterIndex(base.0 + i as u8);
-            let val = compile_expr(ctx, val_expr, Some(target_reg))?;
+            let val = compile_expr_to_reg(ctx, val_expr, Some(target_reg))?;
             if val != target_reg {
                 while ctx.chunk.register_count <= target_reg.0 as usize {
                     ctx.alloc_register()?;
