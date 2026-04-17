@@ -1,0 +1,63 @@
+---
+source: src/parser/mod.rs
+expression: syntax_tree
+---
+Root@0..64
+  DeclStmt@0..64
+    Local@0..5 "local"
+    FuncStmt@5..64
+      Function@5..13 "function"
+      Ident@13..16
+        Ident@13..16 "fib"
+      FuncArgs@16..19
+        LParen@16..17 "("
+        Ident@17..18
+          Ident@17..18 "n"
+        RParen@18..19 ")"
+      StmtList@19..61
+        IfStmt@19..38
+          If@19..21 "if"
+          BinOp@21..24
+            Ident@21..22
+              Ident@21..22 "n"
+            LAngle@22..23 "<"
+            LiteralExpr@23..24
+              Int@23..24 "2"
+          Then@24..28 "then"
+          StmtList@28..35
+            ReturnStmt@28..35
+              Return@28..34 "return"
+              ExprList@34..35
+                Ident@34..35
+                  Ident@34..35 "n"
+          End@35..38 "end"
+        ReturnStmt@38..61
+          Return@38..44 "return"
+          ExprList@44..61
+            BinOp@44..61
+              FuncCall@44..52
+                Ident@44..47
+                  Ident@44..47 "fib"
+                FuncArgs@47..52
+                  LParen@47..48 "("
+                  BinOp@48..51
+                    Ident@48..49
+                      Ident@48..49 "n"
+                    Minus@49..50 "-"
+                    LiteralExpr@50..51
+                      Int@50..51 "1"
+                  RParen@51..52 ")"
+              Plus@52..53 "+"
+              FuncCall@53..61
+                Ident@53..56
+                  Ident@53..56 "fib"
+                FuncArgs@56..61
+                  LParen@56..57 "("
+                  BinOp@57..60
+                    Ident@57..58
+                      Ident@57..58 "n"
+                    Minus@58..59 "-"
+                    LiteralExpr@59..60
+                      Int@59..60 "2"
+                  RParen@60..61 ")"
+      End@61..64 "end"
