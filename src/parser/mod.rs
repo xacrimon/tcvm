@@ -88,6 +88,7 @@ mod tests {
     test!(function, "test-files/function.lua");
     test!(hello, "test-files/hello.lua");
     test!(if, "test-files/if.lua");
+    test!(jens, "test-files/jens.lua");
     test!(literal, "test-files/literal.lua");
     test!(nbody, "test-files/nbody.lua");
     test!(op_prec, "test-files/op_prec.lua");
