@@ -16,17 +16,13 @@ expression: output
 0002  LOAD            R1 K1  ; 6
 0003  LOAD            R2 K2  ; 3
 0004  MUL             R3 R1 R2
-0005  MMBIN           R1 R2 MUL
-0006  ADD             R4 R0 R3
-0007  MMBIN           R0 R3 ADD
-0008  LOAD            R5 K1  ; 6
-0009  LOAD            R6 K2  ; 3
-0010  DIV             R7 R5 R6
-0011  MMBIN           R5 R6 DIV
-0012  SUB             R8 R4 R7
-0013  MMBIN           R4 R7 SUB
-0014  SETTABUP        R8 U0 K3  ; "num"
-0015  LOAD            R9 K0  ; 5
-0016  UNM             R10 R9
-0017  SETTABUP        R10 U0 K3  ; "num"
-0018  RETURN          R0 count=1
+0005  ADD             R4 R0 R3
+0006  LOAD            R5 K1  ; 6
+0007  LOAD            R6 K2  ; 3
+0008  DIV             R7 R5 R6
+0009  SUB             R8 R4 R7
+0010  SETTABUP        R8 U0 K3  ; "num"
+0011  LOAD            R9 K0  ; 5
+0012  UNM             R10 R9
+0013  SETTABUP        R10 U0 K3  ; "num"
+0014  RETURN          R0 count=1

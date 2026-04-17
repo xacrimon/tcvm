@@ -41,26 +41,22 @@ expression: output
   ; function (params=2, vararg=false, stack=3, upvalues=0)
   ; code:
   0000  ADD             R2 R0 R1
-  0001  MMBIN           R0 R1 ADD
-  0002  RETURN          R2 count=2
+  0001  RETURN          R2 count=2
 
 ; prototype 1:
   ; function (params=2, vararg=false, stack=3, upvalues=0)
   ; code:
   0000  SUB             R2 R0 R1
-  0001  MMBIN           R0 R1 SUB
-  0002  RETURN          R2 count=2
+  0001  RETURN          R2 count=2
 
 ; prototype 2:
   ; function (params=2, vararg=false, stack=3, upvalues=0)
   ; code:
   0000  MUL             R2 R0 R1
-  0001  MMBIN           R0 R1 MUL
-  0002  RETURN          R2 count=2
+  0001  RETURN          R2 count=2
 
 ; prototype 3:
   ; function (params=2, vararg=false, stack=3, upvalues=0)
   ; code:
   0000  DIV             R2 R0 R1
-  0001  MMBIN           R0 R1 DIV
-  0002  RETURN          R2 count=2
+  0001  RETURN          R2 count=2
