@@ -1,0 +1,39 @@
+---
+source: src/compiler/snapshot_tests.rs
+expression: output
+---
+; function (params=0, vararg=true, stack=1, upvalues=1)
+; upvalues:
+;   U0 = local R0
+; code:
+0000  VARARGPREP      fixed=0
+0001  CLOSURE         R0 P0
+0002  RETURN          R0 count=1
+
+; prototype 0:
+  ; function (params=1, vararg=false, stack=8, upvalues=1)
+  ; constants:
+  ;   K0 = 2
+  ;   K1 = true
+  ;   K2 = 1
+  ; upvalues:
+  ;   U0 = local R0
+  ; code:
+  0000  LOAD            R1 K0  ; 2
+  0001  LOAD            R2 K1  ; true
+  0002  LT              R0 R1 inv=false
+  0003  LFALSESKIP      R2
+  0004  TEST            R2 inv=true
+  0005  JMP             +2
+  0006  MOVE            R3 R0
+  0007  RETURN          R3 count=2
+  0008  GETUPVAL        R4 U0
+  0009  LOAD            R5 K2  ; 1
+  0010  SUB             R5 R0 R5
+  0011  CALL            R4 args=2 ret=2
+  0012  GETUPVAL        R6 U0
+  0013  LOAD            R7 K0  ; 2
+  0014  SUB             R7 R0 R7
+  0015  CALL            R6 args=2 ret=2
+  0016  ADD             R3 R4 R6
+  0017  RETURN          R3 count=2

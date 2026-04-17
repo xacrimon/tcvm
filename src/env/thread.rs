@@ -1,6 +1,7 @@
 use crate::dmm::{Collect, Gc, Mutation, RefLock};
 use crate::env::function::{LuaClosure, Upvalue};
 use crate::env::value::Value;
+use crate::vm::interp::Continuation;
 
 /// Copy wrapper stored in Value.
 #[derive(Clone, Copy, Collect)]
@@ -25,12 +26,18 @@ pub struct CallFrame<'gc> {
     pub base: usize,
     pub pc: usize,
     pub num_results: u8,
+    /// Fixup dispatched by `op_return` when this frame unwinds. `None` for
+    /// normal calls; set by metamethod/iterator helpers that need
+    /// post-return processing.
+    #[collect(require_static)]
+    pub continuation: Option<Continuation>,
 }
 
 /// The mutable state of a thread/coroutine.
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub struct ThreadState<'gc> {
+    // TODO: custom collect impl to avoid unused stack slots keeping values alive.
     pub stack: Vec<Value<'gc>>,
     pub frames: Vec<CallFrame<'gc>>,
     pub open_upvalues: Vec<Upvalue<'gc>>,

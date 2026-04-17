@@ -130,12 +130,6 @@ pub enum Instruction {
         rhs: Register,
     },
 
-    MMBIN {
-        lhs: Register,
-        rhs: Register,
-        metamethod: MetaMethod,
-    },
-
     UNM {
         dst: Register,
         src: Register,
@@ -276,33 +270,4 @@ pub enum UpValueDescriptor {
     ParentLocal(u8),
     /// Copy from the enclosing function's upvalue at the given index.
     ParentUpvalue(u8),
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum MetaMethod {
-    INDEX,
-    NEWINDEX,
-    GC,
-    MODE,
-    LEN,
-    EQ,
-    ADD,
-    SUB,
-    MUL,
-    MOD,
-    POW,
-    DIV,
-    IDIV,
-    BAND,
-    BOR,
-    BXOR,
-    SHL,
-    SHR,
-    UNM,
-    BNOT,
-    LT,
-    LE,
-    CONCAT,
-    CALL,
-    CLOSE,
 }

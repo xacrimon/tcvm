@@ -6,7 +6,7 @@ use super::defs::{Chunk, RegisterIndex};
 use super::{CompileError, CompileErrorKind, LineNumber};
 use crate::dmm::{Gc, Mutation};
 use crate::env::{LuaString, Prototype, Value};
-use crate::instruction::{Instruction, MetaMethod, UpValueDescriptor};
+use crate::instruction::{Instruction, UpValueDescriptor};
 use crate::parser::syntax::{
     Assign, BinaryOp, BinaryOperator, Break, Decl, DeclModifier, Do, Expr, ForGen, ForNum, Func,
     FuncCall, FuncExpr, Goto, Ident, If, Index, Label, Literal, LiteralValue, MethodCall, PrefixOp,
@@ -1151,7 +1151,6 @@ fn compile_expr_binary_op(
                 lhs: lhs.0,
                 rhs: rhs.0,
             },
-            MetaMethod::ADD,
             dst,
         ),
         BinaryOperator::Sub => emit_arith(
@@ -1163,7 +1162,6 @@ fn compile_expr_binary_op(
                 lhs: lhs.0,
                 rhs: rhs.0,
             },
-            MetaMethod::SUB,
             dst,
         ),
         BinaryOperator::Mul => emit_arith(
@@ -1175,7 +1173,6 @@ fn compile_expr_binary_op(
                 lhs: lhs.0,
                 rhs: rhs.0,
             },
-            MetaMethod::MUL,
             dst,
         ),
         BinaryOperator::Div => emit_arith(
@@ -1187,7 +1184,6 @@ fn compile_expr_binary_op(
                 lhs: lhs.0,
                 rhs: rhs.0,
             },
-            MetaMethod::DIV,
             dst,
         ),
         BinaryOperator::IntDiv => emit_arith(
@@ -1199,7 +1195,6 @@ fn compile_expr_binary_op(
                 lhs: lhs.0,
                 rhs: rhs.0,
             },
-            MetaMethod::IDIV,
             dst,
         ),
         BinaryOperator::Mod => emit_arith(
@@ -1211,7 +1206,6 @@ fn compile_expr_binary_op(
                 lhs: lhs.0,
                 rhs: rhs.0,
             },
-            MetaMethod::MOD,
             dst,
         ),
         BinaryOperator::Exp => emit_arith(
@@ -1223,7 +1217,6 @@ fn compile_expr_binary_op(
                 lhs: lhs.0,
                 rhs: rhs.0,
             },
-            MetaMethod::POW,
             dst,
         ),
         BinaryOperator::BitAnd => emit_arith(
@@ -1235,7 +1228,6 @@ fn compile_expr_binary_op(
                 lhs: lhs.0,
                 rhs: rhs.0,
             },
-            MetaMethod::BAND,
             dst,
         ),
         BinaryOperator::BitOr => emit_arith(
@@ -1247,7 +1239,6 @@ fn compile_expr_binary_op(
                 lhs: lhs.0,
                 rhs: rhs.0,
             },
-            MetaMethod::BOR,
             dst,
         ),
         BinaryOperator::BitXor => emit_arith(
@@ -1259,7 +1250,6 @@ fn compile_expr_binary_op(
                 lhs: lhs.0,
                 rhs: rhs.0,
             },
-            MetaMethod::BXOR,
             dst,
         ),
         BinaryOperator::LShift => emit_arith(
@@ -1271,7 +1261,6 @@ fn compile_expr_binary_op(
                 lhs: lhs.0,
                 rhs: rhs.0,
             },
-            MetaMethod::SHL,
             dst,
         ),
         BinaryOperator::RShift => emit_arith(
@@ -1283,7 +1272,6 @@ fn compile_expr_binary_op(
                 lhs: lhs.0,
                 rhs: rhs.0,
             },
-            MetaMethod::SHR,
             dst,
         ),
         BinaryOperator::Concat => {
@@ -1374,12 +1362,9 @@ fn emit_arith(
     lhs: RegisterIndex,
     rhs: RegisterIndex,
     mut instr: Instruction,
-    metamethod: MetaMethod,
     dst: Option<RegisterIndex>,
 ) -> Result<RegisterIndex, CompileError> {
-    // Reject hint if it overlaps with an operand — MMBIN needs original values
-    let safe_hint = dst.filter(|&d| d != lhs && d != rhs);
-    let dst = ctx.dst_or_alloc(safe_hint)?;
+    let dst = ctx.dst_or_alloc(dst)?;
     // Patch the dst field in the instruction
     match &mut instr {
         Instruction::ADD { dst: d, .. }
@@ -1397,11 +1382,6 @@ fn emit_arith(
         _ => unreachable!(),
     }
     ctx.emit(instr);
-    ctx.emit(Instruction::MMBIN {
-        lhs: lhs.0,
-        rhs: rhs.0,
-        metamethod,
-    });
     Ok(dst)
 }
 

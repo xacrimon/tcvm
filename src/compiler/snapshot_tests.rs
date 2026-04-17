@@ -6,7 +6,7 @@ use paste::paste;
 
 use crate::dmm::{Arena, Static};
 use crate::env::{Prototype, Value};
-use crate::instruction::{Instruction, MetaMethod, UpValueDescriptor};
+use crate::instruction::{Instruction, UpValueDescriptor};
 use crate::parser::{self, syntax::Root};
 
 use super::compile_chunk;
@@ -141,13 +141,6 @@ fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -> String {
         Instruction::BXOR { dst, lhs, rhs } => format!("BXOR            R{dst} R{lhs} R{rhs}"),
         Instruction::SHL { dst, lhs, rhs } => format!("SHL             R{dst} R{lhs} R{rhs}"),
         Instruction::SHR { dst, lhs, rhs } => format!("SHR             R{dst} R{lhs} R{rhs}"),
-        Instruction::MMBIN {
-            lhs,
-            rhs,
-            metamethod,
-        } => {
-            format!("MMBIN           R{lhs} R{rhs} {:?}", metamethod)
-        }
         Instruction::UNM { dst, src } => format!("UNM             R{dst} R{src}"),
         Instruction::BNOT { dst, src } => format!("BNOT            R{dst} R{src}"),
         Instruction::NOT { dst, src } => format!("NOT             R{dst} R{src}"),
@@ -235,6 +228,7 @@ test!(declare, "test-files/declare.lua");
 test!(function, "test-files/function.lua");
 test!(hello, "test-files/hello.lua");
 test!(if, "test-files/if.lua");
+test!(jens, "test-files/jens.lua");
 test!(literal, "test-files/literal.lua");
 test!(nbody, "test-files/nbody.lua");
 test!(op_prec, "test-files/op_prec.lua");
