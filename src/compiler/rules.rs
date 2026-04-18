@@ -299,85 +299,109 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         self.emit_unfilled_jmp()
     }
 
+    /// Flip the `inverted` flag of the CMP/TEST/TESTSET preceding `jmp_idx`.
+    /// Shared helper for `negate_cond` and the pending-flip done by `not`.
+    fn flip_control_polarity(&mut self, jmp_idx: usize) {
+        // Defensive: a JMP at tape index 0 has no predecessor to invert.
+        // Doesn't arise in practice (functions start with VARARGPREP) but
+        // cheap to guard against underflow.
+        if jmp_idx == 0 {
+            return;
+        }
+        match &mut self.chunk.tape[jmp_idx - 1] {
+            Instruction::LT { inverted, .. }
+            | Instruction::LE { inverted, .. }
+            | Instruction::EQ { inverted, .. }
+            | Instruction::TEST { inverted, .. }
+            | Instruction::TESTSET { inverted, .. } => {
+                *inverted = !*inverted;
+            }
+            other => unreachable!(
+                "flip_control_polarity: jump at {jmp_idx} has no \
+                 CMP/TEST control instruction (found {other:?})"
+            ),
+        }
+    }
+
     /// Flip the polarity of every pending conditional jump in `expr`: invert
-    /// the `inverted` flag of each control instruction (CMP/TEST/TESTSET),
-    /// swap the true/false lists, and flip `fall_truthy`. After the call
-    /// every pending JMP fires on the opposite runtime condition and the
-    /// lists / fall-through semantics are re-labelled to match — the whole
-    /// `ExprDesc` stays internally consistent. Used by `goiftrue`/`goiffalse`
-    /// to reuse a pending jump when the caller needs the opposite polarity.
+    /// the `inverted` flag of each control instruction (CMP/TEST/TESTSET)
+    /// and swap the true/false lists. After the call every pending JMP
+    /// fires on the opposite runtime condition and the lists are re-labelled
+    /// to match — the whole `ExprDesc` stays internally consistent.
     ///
-    /// **Invariant:** every entry in either list is preceded by a CMP, TEST,
-    /// or TESTSET. By construction this holds for every list that reaches
-    /// `negate_cond`: comparisons emit CMP + JMP, `emit_test_jump` emits
-    /// TESTSET + JMP, and the only unconditional JMP pushed into a list
-    /// (the fall-through router in `discharge_to_reg_mut`) is pushed during
-    /// discharge, which is terminal and clears the lists — no subsequent
-    /// `negate_cond` ever sees it.
+    /// **Precondition:** the Jump-kind pending head (if the expression is
+    /// Jump-kind) must have been absorbed beforehand, and every jump in
+    /// `true_list` ∪ `false_list` must fire on the same runtime polarity
+    /// (i.e. one of the two lists is empty). `goiftrue` / `goiffalse`
+    /// enforce both conditions. In mixed-polarity states (lists populated
+    /// from both short-circuit edges of an `and`/`or`) flipping every
+    /// entry would miscompile composed expressions.
     fn negate_cond(&mut self, expr: &mut ExprDesc) {
-        for &jmp_idx in expr
+        assert!(
+            expr.pending().is_none(),
+            "negate_cond requires the pending head to be absorbed first"
+        );
+
+        let indices = expr
             .true_list
             .jumps
             .iter()
-            .chain(expr.false_list.jumps.iter())
-        {
-            // Defensive: a JMP at tape index 0 has no predecessor to invert.
-            // Doesn't arise in practice (functions start with VARARGPREP)
-            // but cheap to guard against underflow.
-            if jmp_idx == 0 {
-                continue;
-            }
-            match &mut self.chunk.tape[jmp_idx - 1] {
-                Instruction::LT { inverted, .. }
-                | Instruction::LE { inverted, .. }
-                | Instruction::EQ { inverted, .. }
-                | Instruction::TEST { inverted, .. }
-                | Instruction::TESTSET { inverted, .. } => {
-                    *inverted = !*inverted;
-                }
-                other => unreachable!(
-                    "negate_cond: jump-list entry at {jmp_idx} has no \
-                     CMP/TEST control instruction (found {other:?})"
-                ),
-            }
+            .chain(expr.false_list.jumps.iter());
+
+        for &jmp_idx in indices {
+            self.flip_control_polarity(jmp_idx);
         }
+
         std::mem::swap(&mut expr.true_list, &mut expr.false_list);
-        expr.fall_truthy = !expr.fall_truthy;
     }
 
-    /// Ensure `expr` has a pending jump in its true-list — i.e. one that
-    /// fires exactly when the expression evaluates to truthy. Leaves
-    /// fall-through as the falsy path.
+    /// "Go if true": arrange for control to fall through when `expr` is
+    /// truthy and to jump otherwise. Produces a jump that fires on falsy,
+    /// stored in `false_list`. Mirrors Lua 5.4's `luaK_goiftrue`.
     fn goiftrue(&mut self, expr: &mut ExprDesc) {
         match expr.kind {
-            ExprKind::Jump => {
-                // If the pending jumps already fire on truthy (true_list
-                // populated), we're done — fall-through is the falsy path.
-                // If they only fire on falsy, invert polarity so they move
-                // into true_list.
-                if expr.true_list.is_empty() && !expr.false_list.is_empty() {
-                    self.negate_cond(expr);
-                }
-            }
-            ExprKind::Reg(reg) => {
-                let jmp = self.emit_test_jump(reg, true);
-                expr.true_list.jumps.push(jmp);
-            }
-        }
-    }
-
-    /// Ensure `expr` has a pending jump in its false-list — fires when the
-    /// expression evaluates to falsy, fall-through is the truthy path.
-    fn goiffalse(&mut self, expr: &mut ExprDesc) {
-        match expr.kind {
-            ExprKind::Jump => {
-                if expr.false_list.is_empty() && !expr.true_list.is_empty() {
+            ExprKind::Jump(_) => {
+                if let Some(idx) = expr.take_pending() {
+                    // Absorb the pending head into false_list. Pending
+                    // fires on truthy, so flip its CMP first to make it
+                    // fire on falsy.
+                    self.flip_control_polarity(idx);
+                    expr.false_list.jumps.push(idx);
+                } else if expr.false_list.is_empty() && !expr.true_list.is_empty() {
+                    // No pending head; if the remaining jumps all fire on
+                    // truthy (populating `true_list` only), flip polarity
+                    // so they land in `false_list` with falsy-firing
+                    // semantics.
                     self.negate_cond(expr);
                 }
             }
             ExprKind::Reg(reg) => {
                 let jmp = self.emit_test_jump(reg, false);
                 expr.false_list.jumps.push(jmp);
+            }
+        }
+    }
+
+    /// "Go if false": arrange for control to fall through when `expr` is
+    /// falsy and to jump otherwise. Produces a jump that fires on truthy,
+    /// stored in `true_list`. Mirrors Lua 5.4's `luaK_goiffalse`.
+    fn goiffalse(&mut self, expr: &mut ExprDesc) {
+        match expr.kind {
+            ExprKind::Jump(_) => {
+                if let Some(idx) = expr.take_pending() {
+                    // Absorb the pending head into true_list (it already
+                    // fires on truthy by construction).
+                    expr.true_list.jumps.push(idx);
+                } else if expr.true_list.is_empty() && !expr.false_list.is_empty() {
+                    // No pending head; if every jump fires on falsy, flip
+                    // polarity so they move into `true_list` with
+                    // truthy-firing semantics.
+                    self.negate_cond(expr);
+                }
+            }
+            ExprKind::Reg(reg) => {
+                let jmp = self.emit_test_jump(reg, true);
+                expr.true_list.jumps.push(jmp);
             }
         }
     }
@@ -397,9 +421,12 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     /// * For a Reg-kind expression with pending jumps, the fall-through at
     ///   the moment of discharge already holds the RHS value in `dst`; we
     ///   emit a JMP over the tail so the fall-through value survives.
-    /// * For a Jump-kind expression (no register yet), fall-through is the
-    ///   outcome indicated by `expr.fall_truthy` — route it into the
-    ///   corresponding list via an unconditional JMP so the tail handles it.
+    /// * For a Jump-kind expression we absorb the `pending` head into
+    ///   `true_list` (mirroring Lua's `luaK_concat(&e->t, e->u.info)`).
+    ///   Physical fall-through of the last control instruction is
+    ///   guaranteed falsy by our invariants, so it lands naturally on
+    ///   `LFALSESKIP` (the false_target) and produces the correct boolean
+    ///   — no routing JMP needed.
     fn discharge_to_reg_mut(
         &mut self,
         expr: &mut ExprDesc,
@@ -415,7 +442,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             }
         }
 
-        let is_jump = matches!(expr.kind, ExprKind::Jump);
+        let is_jump = matches!(expr.kind, ExprKind::Jump(_));
         let dst = match expr.kind {
             ExprKind::Reg(reg) => {
                 // Reg with pending jumps. Honor the hint: jumps in the list
@@ -439,21 +466,16 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                     reg
                 }
             }
-            ExprKind::Jump => self.dst_or_alloc(hint)?,
+            ExprKind::Jump(_) => self.dst_or_alloc(hint)?,
         };
 
         if is_jump {
-            // Fall-through after the last emitted control instruction
-            // represents either the truthy or falsy outcome of the whole
-            // expression depending on how it was built (a bare comparison
-            // has truthy fall-through; `not` of a comparison swaps). Route
-            // the fall-through into whichever list corresponds, so the
-            // materialisation tail dispatches it to the right side.
-            let jmp = self.emit_unfilled_jmp();
-            if expr.fall_truthy {
-                expr.true_list.jumps.push(jmp);
-            } else {
-                expr.false_list.jumps.push(jmp);
+            // Absorb pending head into true_list (fires on truthy by
+            // construction). Fall-through past this JMP is guaranteed
+            // falsy, so the LFALSESKIP tail handles it without a routing
+            // JMP.
+            if let Some(idx) = expr.take_pending() {
+                expr.true_list.jumps.push(idx);
             }
         }
 
@@ -462,7 +484,8 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
 
             // Reg-kind with a live fall-through value needs to skip past
             // the boolean fixup tail so the value stays in `dst`. Jump-kind
-            // has no fall-through (it was routed above), so no skip jump.
+            // has no fall-through value (physical fall-through is falsy
+            // and is meant to land on LFALSESKIP), so no skip jump.
             let skip_fixup = if !is_jump && need_tail {
                 Some(self.emit_unfilled_jmp())
             } else {
@@ -1452,20 +1475,30 @@ fn compile_expr_prefix_op(
     let rhs_expr = item.rhs().ok_or_else(|| ice("prefix op without operand"))?;
 
     // `not <expr>`: when the operand is a jump-list expression (comparison,
-    // `not`-of-comparison, etc.) we just swap its true/false lists — the
-    // pending jumps still fire on the same runtime condition; only the
-    // label ("this outcome represents TRUE vs FALSE of the surrounding
-    // expression") flips. No control-instruction rewrite (unlike
-    // `negate_cond`, which both flips the control and swaps lists for the
-    // case where the caller wants the JMP to fire on the opposite runtime
-    // condition). For plain Reg operands fall back to the NOT opcode.
+    // `not`-of-comparison, etc.) we relabel its lists and flip the
+    // `pending` head's CMP polarity in place (Lua's `codenot` on VJMP).
+    // The polarity flip is what keeps "pending fires on current truthy"
+    // and "fall-through is falsy" invariant after the label change: each
+    // still-in-list jump retains its runtime firing condition (its former
+    // list-label relabels to the opposite meaning via the swap), but the
+    // tail CMP flip ensures physical fall-through now represents outer
+    // falsy instead of outer truthy. For plain Reg operands fall back to
+    // the NOT opcode.
     if matches!(op, PrefixOperator::Not) {
         let mut inner = compile_expr(ctx, rhs_expr, None)?;
         match inner.kind {
-            ExprKind::Jump => {
+            ExprKind::Jump(Some(idx)) => {
+                ctx.flip_control_polarity(idx);
                 std::mem::swap(&mut inner.true_list, &mut inner.false_list);
-                inner.fall_truthy = !inner.fall_truthy;
                 return Ok(inner);
+            }
+            // Jump-kind without a pending head is only reachable after a
+            // `goif*` or `discharge_to_reg_mut` consumes it, and `compile_expr` never returns such a
+            // state. If we ever got here, relabeling lists without
+            // flipping the physical fall-through would silently invert
+            // the materialised boolean — fail loudly instead.
+            ExprKind::Jump(None) => {
+                return Err(ice("not on Jump-kind ExprDesc with no pending head"));
             }
             ExprKind::Reg(src) => {
                 let dst = ctx.dst_or_alloc(dst)?;
@@ -1766,11 +1799,12 @@ fn emit_arith(
 }
 
 /// Compile a comparison (`==`, `~=`, `<`, `>`, `<=`, `>=`) as a jump-list
-/// expression: emit just `CMP` + an unfilled `JMP` and return an
-/// `ExprDesc::Jump` whose false-list holds the JMP. Consumers that branch
-/// on the result patch the list directly (2 instructions); consumers that
-/// need a boolean in a register call `discharge_to_reg_mut`, which emits
-/// the standard `LFALSESKIP` / `LOAD K(true)` fixup tail.
+/// expression: emit just `CMP` + an unfilled `JMP` and return a `Jump`-kind
+/// `ExprDesc` whose `pending` head holds the JMP (fires on truthy).
+/// Consumers that branch on the result call `goiffalse` / `goiftrue` to
+/// absorb the head into the right list; consumers that need a boolean in
+/// a register call `discharge_to_reg_mut`, which emits the standard
+/// `LFALSESKIP` / `LOAD K(true)` fixup tail.
 fn compile_comparison_desc(
     ctx: &mut Ctx,
     item: BinaryOp,
@@ -1781,41 +1815,45 @@ fn compile_comparison_desc(
     let lhs = compile_expr_to_reg(ctx, lhs_expr, None)?;
     let rhs = compile_expr_to_reg(ctx, rhs_expr, None)?;
 
-    // `inverted = false` on all comparison ops: the VM's `op_cmp` skips the
-    // following instruction iff `(cmp_result != inverted) == true`, i.e.
-    // skip when the comparison succeeds. So the unfilled JMP fires when the
-    // comparison FAILS, which is exactly a "jump on false" — append into
-    // `false_list`.
+    // Lua 5.4 convention: emit the CMP so the paired JMP fires on the
+    // TRUTHY outcome of the comparison. The VM's `op_lt` / `op_le` /
+    // `op_eq` handlers skip the following instruction iff
+    // `(cmp_result != inverted) == true` — with `inverted=true`, the skip
+    // fires on falsy and the JMP fires on truthy, which is the polarity
+    // we want for value contexts (`discharge_to_reg_mut` emits
+    // `LFALSESKIP`-first, so fall-through naturally produces the falsy
+    // boolean). NEq / opposite-comparisons carry `inverted=false` to
+    // cancel the surface-level negation.
     let instr = match op {
         BinaryOperator::Eq => Instruction::EQ {
             lhs: lhs.0,
             rhs: rhs.0,
-            inverted: false,
+            inverted: true,
         },
         BinaryOperator::NEq => Instruction::EQ {
             lhs: lhs.0,
             rhs: rhs.0,
-            inverted: true,
+            inverted: false,
         },
         BinaryOperator::Lt => Instruction::LT {
             lhs: lhs.0,
             rhs: rhs.0,
-            inverted: false,
+            inverted: true,
         },
         BinaryOperator::Gt => Instruction::LT {
             lhs: rhs.0,
             rhs: lhs.0,
-            inverted: false,
+            inverted: true,
         },
         BinaryOperator::LEq => Instruction::LE {
             lhs: lhs.0,
             rhs: rhs.0,
-            inverted: false,
+            inverted: true,
         },
         BinaryOperator::GEq => Instruction::LE {
             lhs: rhs.0,
             rhs: lhs.0,
-            inverted: false,
+            inverted: true,
         },
         _ => return Err(ice("compile_comparison_desc called with non-comparison op")),
     };
@@ -1823,18 +1861,17 @@ fn compile_comparison_desc(
     let jmp = ctx.emit_unfilled_jmp();
 
     Ok(ExprDesc {
-        kind: ExprKind::Jump,
+        // Pending head — fires on truthy of this expression. `goiftrue` /
+        // `goiffalse` / discharge absorb it into a concrete list; `not`
+        // flips its CMP polarity in place.
+        kind: ExprKind::Jump(Some(jmp)),
         true_list: JumpList::new(),
-        false_list: JumpList::single(jmp),
-        // `inverted=false` + our VM's `op_lt` means the JMP fires when the
-        // comparison is FALSE; skipping the JMP (fall-through) means it was
-        // TRUE. So fall-through is truthy.
-        fall_truthy: true,
+        false_list: JumpList::new(),
     })
 }
 
 /// Jump-list compilation of `lhs and rhs`. When `lhs` is falsy the whole
-/// expression's value is `lhs` — `goiffalse` arranges a jump on falsy that
+/// expression's value is `lhs` — `goiftrue` arranges a jump on falsy that
 /// exits the expression (and, for Reg operands, the TESTSET it emits
 /// preserves `lhs`'s value on that edge). When `lhs` is truthy, control
 /// falls through to the RHS evaluation and the result is `rhs`.
@@ -1857,7 +1894,7 @@ fn compile_logical_and_desc(
     // to TEST by `patch_list_aux`) — saving the intermediate register
     // and MOVE that a fresh-register allocation would otherwise need.
     let mut lhs = compile_expr(ctx, lhs_expr, dst)?;
-    ctx.goiffalse(&mut lhs);
+    ctx.goiftrue(&mut lhs);
 
     // LHS truthy path: evaluate RHS here. Any TESTSETs in lhs.true_list
     // represent paths whose values are discarded (RHS's value wins), so
@@ -1872,7 +1909,7 @@ fn compile_logical_and_desc(
 }
 
 /// Jump-list compilation of `lhs or rhs`. Symmetric to `and`: truthy `lhs`
-/// short-circuits with `lhs`'s value (via `goiftrue`'s TESTSET), falsy
+/// short-circuits with `lhs`'s value (via `goiffalse`'s TESTSET), falsy
 /// `lhs` falls through to RHS evaluation.
 fn compile_logical_or_desc(
     ctx: &mut Ctx,
@@ -1883,7 +1920,7 @@ fn compile_logical_or_desc(
     let rhs_expr = item.rhs().ok_or_else(|| ice("or without rhs"))?;
 
     let mut lhs = compile_expr(ctx, lhs_expr, dst)?;
-    ctx.goiftrue(&mut lhs);
+    ctx.goiffalse(&mut lhs);
 
     let lhs_false = std::mem::take(&mut lhs.false_list);
     ctx.patch_to_here(lhs_false);
@@ -2099,8 +2136,8 @@ fn compile_do(ctx: &mut Ctx, item: Do) -> Result<(), CompileError> {
 /// when the condition evaluates to truthy.
 fn compile_branch_cond_false(ctx: &mut Ctx, cond_expr: Expr) -> Result<JumpList, CompileError> {
     let mut desc = compile_expr(ctx, cond_expr, None)?;
-    ctx.goiffalse(&mut desc);
-    // After goiffalse, `false_list` holds every jump that fires on falsy
+    ctx.goiftrue(&mut desc);
+    // After `goiftrue`, `false_list` holds every jump that fires on falsy
     // (the caller patches these to the branch-out target) and `true_list`
     // holds any jumps accumulated during LHS evaluation of an `and`/`or`
     // chain that need to land here at the truthy-fall-through position.

@@ -37,22 +37,21 @@ impl JumpList {
 
 /// Where an expression's value currently lives during compilation, with any
 /// pending short-circuit jumps that will be patched by the consumer.
+///
+/// **Invariants** (matching Lua 5.4's `expdesc` conventions):
+/// * A `JMP` in `true_list` fires when the expression is truthy.
+/// * A `JMP` in `false_list` fires when the expression is falsy.
+/// * A `Jump(Some(idx))` head is the last-emitted control jump for this
+///   expression; it fires on truthy and its fall-through is falsy.
+/// * Comparisons emit `CMP` with `inverted=true` so the paired `JMP` fires
+///   on truthy — fall-through is falsy. This mirrors Lua's convention and
+///   lets the `LFALSESKIP` / `LOAD true` materialisation tail handle
+///   fall-through correctly without a routing jump.
 #[derive(Debug, Clone)]
 pub(super) struct ExprDesc {
     pub(super) kind: ExprKind,
     pub(super) true_list: JumpList,
     pub(super) false_list: JumpList,
-    /// Truthiness of the fall-through path at the point where this
-    /// expression's last instruction was emitted. Our comparison convention
-    /// (`CMP inv=false` + JMP-on-falsy) makes fall-through the truthy
-    /// outcome of a bare comparison, so this defaults to `true`. `not <e>`
-    /// flips it — the same pending JMPs fire on the same runtime condition,
-    /// but they now represent the opposite truthiness of the surrounding
-    /// expression.
-    ///
-    /// `discharge_to_reg_mut` uses this to decide which list the routing
-    /// JMP belongs in when materialising a Jump-kind expression.
-    pub(super) fall_truthy: bool,
 }
 
 /// The shape of an expression's current representation. Comparisons, `not`
@@ -67,10 +66,16 @@ pub(super) enum ExprKind {
     /// fall-through put the value here); the consumer must resolve them.
     Reg(RegisterIndex),
     /// No register yet — the expression's truthiness is encoded entirely
-    /// by the pending `true_list` / `false_list` jumps plus `fall_truthy`.
-    /// Produced by bare comparisons and propagated through `not` / `and` /
-    /// `or` chains whose last operand is itself a comparison.
-    Jump,
+    /// by the pending jumps (`true_list` / `false_list` plus the optional
+    /// pending head embedded here). The inner `Option<usize>` is the
+    /// "pending" head: when `Some(idx)`, the `JMP` at `tape[idx]` has not
+    /// yet been absorbed into either list; `goiftrue` / `goiffalse` /
+    /// `discharge_to_reg_mut` absorb it; `not` flips its CMP polarity in
+    /// place so the invariant "pending fires on current truthy" continues
+    /// to hold across the label flip. The `None` state is reached after
+    /// a `goif*` consumes the head; it represents a mixed-polarity list
+    /// composition (from `and`/`or`) with no standalone tail jump.
+    Jump(Option<usize>),
 }
 
 impl ExprDesc {
@@ -79,12 +84,33 @@ impl ExprDesc {
             kind: ExprKind::Reg(reg),
             true_list: JumpList::new(),
             false_list: JumpList::new(),
-            fall_truthy: true,
         }
     }
 
     pub(super) fn has_jumps(&self) -> bool {
-        !self.true_list.is_empty() || !self.false_list.is_empty()
+        !self.true_list.is_empty()
+            || !self.false_list.is_empty()
+            || matches!(self.kind, ExprKind::Jump(Some(_)))
+    }
+
+    /// Peek at the Jump-kind pending head without consuming it. Returns
+    /// `None` for non-Jump kinds.
+    pub(super) fn pending(&self) -> Option<usize> {
+        if let ExprKind::Jump(p) = self.kind {
+            p
+        } else {
+            None
+        }
+    }
+
+    /// Take the Jump-kind pending head, clearing the slot. Returns `None`
+    /// (and leaves the expression untouched) for non-Jump kinds.
+    pub(super) fn take_pending(&mut self) -> Option<usize> {
+        if let ExprKind::Jump(ref mut p) = self.kind {
+            p.take()
+        } else {
+            None
+        }
     }
 }
 
