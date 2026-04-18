@@ -437,10 +437,10 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         // honouring it here would emit a MOVE that many callers re-emit,
         // flipping instruction order and inflating frame size. Callers that
         // want the value in a specific register MOVE it themselves.
-        if matches!(expr.kind, ExprKind::Reg(_)) && !expr.has_jumps() {
-            if let ExprKind::Reg(reg) = expr.kind {
-                return Ok(reg);
-            }
+        if let ExprKind::Reg(reg) = expr.kind
+            && !expr.has_jumps()
+        {
+            return Ok(reg);
         }
 
         let is_jump = matches!(expr.kind, ExprKind::Jump(_));
