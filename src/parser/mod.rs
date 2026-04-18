@@ -15,7 +15,7 @@ use crate::T;
 pub fn parse(
     cache: &mut NodeCache<'static>,
     source: &str,
-) -> (SyntaxNode, Vec<ariadne::Report<Span>>) {
+) -> (SyntaxNode, Vec<ariadne::Report<'static, Span>>) {
     Parser::new(cache, source).run()
 }
 
@@ -36,7 +36,7 @@ impl<'cache, 'source> Parser<'cache, 'source> {
         marker.complete(self);
     }
 
-    fn run(mut self) -> (SyntaxNode, Vec<ariadne::Report<Span>>) {
+    fn run(mut self) -> (SyntaxNode, Vec<ariadne::Report<'static, Span>>) {
         self.root();
         let (root, reports) = self.state.finish();
         (SyntaxNode::new_root(root), reports)
