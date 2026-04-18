@@ -36,11 +36,10 @@ expression: output
 0021  JMP             +1
 0022  MOVE            R5 R1
 0023  LT              R0 R1 inv=false
-0024  JMP             +2
-0025  JMP             +0
-0026  LFALSESKIP      R6
-0027  LOAD            R6 K4  ; true
-0028  MOVE            R7 R4
-0029  MOVE            R8 R5
-0030  MOVE            R9 R6
-0031  RETURN          R7 count=4
+0024  JMP             +1
+0025  LFALSESKIP      R6
+0026  LOAD            R6 K4  ; true
+0027  MOVE            R7 R4
+0028  MOVE            R8 R5
+0029  MOVE            R9 R6
+0030  RETURN          R7 count=4
