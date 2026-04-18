@@ -18,7 +18,7 @@ pub struct State<'cache, 'source> {
     cursor: usize,
     source: &'source str,
     events: Vec<Event>,
-    reports: Vec<ariadne::Report<Span>>,
+    reports: Vec<ariadne::Report<'static, Span>>,
 }
 
 impl<'cache, 'source> State<'cache, 'source> {
@@ -84,12 +84,12 @@ impl<'cache, 'source> State<'cache, 'source> {
         }
     }
 
-    pub fn report(&mut self, error: ariadne::Report<Span>) {
+    pub fn report(&mut self, error: ariadne::Report<'static, Span>) {
         self.reports.push(error);
     }
 
-    pub fn new_error(&self) -> ariadne::ReportBuilder<Span> {
-        ariadne::Report::build(ariadne::ReportKind::Error, (), self.span().start() as usize)
+    pub fn new_error(&self) -> ariadne::ReportBuilder<'static, Span> {
+        ariadne::Report::build(ariadne::ReportKind::Error, self.span())
     }
 
     pub fn new_label(&self) -> ariadne::Label<Span> {
@@ -121,7 +121,7 @@ impl<'cache, 'source> State<'cache, 'source> {
         last_span
     }
 
-    pub fn finish(self) -> (GreenNode, Vec<ariadne::Report<Span>>) {
+    pub fn finish(self) -> (GreenNode, Vec<ariadne::Report<'static, Span>>) {
         let tree = Sink::new(self.cache, &self.tokens, self.events, self.source).finish();
         (tree, self.reports)
     }
