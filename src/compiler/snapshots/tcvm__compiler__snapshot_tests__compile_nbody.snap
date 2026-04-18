@@ -215,7 +215,7 @@ expression: output
 0151  CLOSURE         R115 P2
 0152  GETTABUP        R117 U0 K41  ; "tonumber"
 0153  GETTABUP        R118 U0 K42  ; "arg"
-0154  TESTSET         R118 R118 inv=true
+0154  TEST            R118 inv=false
 0155  JMP             +3
 0156  GETTABUP        R119 U0 K42  ; "arg"
 0157  LOAD            R120 K43  ; 1

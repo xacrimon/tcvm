@@ -42,19 +42,34 @@ pub(super) struct ExprDesc {
     pub(super) kind: ExprKind,
     pub(super) true_list: JumpList,
     pub(super) false_list: JumpList,
+    /// Truthiness of the fall-through path at the point where this
+    /// expression's last instruction was emitted. Our comparison convention
+    /// (`CMP inv=false` + JMP-on-falsy) makes fall-through the truthy
+    /// outcome of a bare comparison, so this defaults to `true`. `not <e>`
+    /// flips it — the same pending JMPs fire on the same runtime condition,
+    /// but they now represent the opposite truthiness of the surrounding
+    /// expression.
+    ///
+    /// `discharge_to_reg_mut` uses this to decide which list the routing
+    /// JMP belongs in when materialising a Jump-kind expression.
+    pub(super) fall_truthy: bool,
 }
 
-/// The shape of an expression's current representation. For the first pass
-/// everything is eagerly discharged to a register — `Jump` is only produced
-/// by relational operators and short-circuit chains, and `discharge_to_reg`
-/// turns them back into `Reg`.
+/// The shape of an expression's current representation. Comparisons, `not`
+/// on comparisons, and short-circuit `and`/`or` whose tail operand is a
+/// comparison all stay as `Jump` until the consumer decides how to use the
+/// result — branches patch the lists directly, value contexts turn them
+/// back into `Reg` via `discharge_to_reg_mut`.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum ExprKind {
-    /// Value already sits in this register.
+    /// Value already sits in this register. `ExprDesc` may still carry
+    /// pending jumps (e.g. short-circuit paths from `and`/`or` whose
+    /// fall-through put the value here); the consumer must resolve them.
     Reg(RegisterIndex),
-    /// Expression exists purely as the pair of jump lists; any fall-through
-    /// between them represents "evaluated the test, haven't materialised the
-    /// boolean". Produced by bare comparisons.
+    /// No register yet — the expression's truthiness is encoded entirely
+    /// by the pending `true_list` / `false_list` jumps plus `fall_truthy`.
+    /// Produced by bare comparisons and propagated through `not` / `and` /
+    /// `or` chains whose last operand is itself a comparison.
     Jump,
 }
 
@@ -64,6 +79,7 @@ impl ExprDesc {
             kind: ExprKind::Reg(reg),
             true_list: JumpList::new(),
             false_list: JumpList::new(),
+            fall_truthy: true,
         }
     }
 
