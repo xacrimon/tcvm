@@ -14,6 +14,19 @@ use crate::parser::syntax::{
 };
 use std::cell::RefCell;
 
+/// Sentinel value used as the `dst` field of a `TESTSET` while the real
+/// destination register is still unknown — i.e. the jump is pending in a
+/// jump list and its ultimate consumer (a value-context discharge or a
+/// branch-context patch) hasn't been reached yet.
+///
+/// `patch_list_aux` rewrites `NO_REG` to the concrete destination register
+/// when discharging to a register; `downgrade_testsets` rewrites the whole
+/// `TESTSET` to a plain `TEST` when the list is consumed in branch context
+/// (no value preservation needed). Every `TESTSET` with this sentinel must
+/// be patched or downgraded before the chunk is assembled — executing one
+/// at runtime would write to an out-of-bounds register.
+const NO_REG: u8 = u8::MAX;
+
 // ---------------------------------------------------------------------------
 // Error helper
 // ---------------------------------------------------------------------------
@@ -139,8 +152,41 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         idx
     }
 
-    /// Patch every jump in `list` so it targets the instruction at `target`.
+    /// Downgrade any `TESTSET` with a `NO_REG` dst preceding a jump in the
+    /// list to a plain `TEST`. Called when a list is about to be consumed
+    /// in a context that doesn't need value preservation — mid-expression
+    /// fall-through patches and branch-context patches both qualify.
+    ///
+    /// Mid-expression patching is safe to downgrade because the jumps being
+    /// patched correspond to paths whose values are discarded by the
+    /// enclosing logical operator. For example, in `a and b`, LHS's
+    /// `true_list` gets patched to RHS's start — LHS's truthy value is
+    /// not the result (RHS's is), so preservation would be wasted.
+    fn downgrade_testsets(&mut self, list: &JumpList) {
+        for &jmp_idx in &list.jumps {
+            if jmp_idx == 0 {
+                continue;
+            }
+            if let Instruction::TESTSET { dst, src, inverted } = self.chunk.tape[jmp_idx - 1]
+                && dst == NO_REG
+            {
+                // TEST skips on `truthy != inverted`; TESTSET skips on
+                // `truthy == inverted`. They're inverses, so preserving
+                // the same skip behaviour across the rewrite requires
+                // flipping the flag.
+                self.chunk.tape[jmp_idx - 1] = Instruction::TEST {
+                    src,
+                    inverted: !inverted,
+                };
+            }
+        }
+    }
+
+    /// Patch every jump in `list` to `target`. Downgrades any `TESTSET`
+    /// controls that still hold `NO_REG` as their dst — this path is for
+    /// branch/fall-through consumers that don't materialise a value.
     fn patch_to(&mut self, list: JumpList, target: usize) {
+        self.downgrade_testsets(&list);
         for idx in list.jumps {
             let offset = target as i32 - (idx as i32 + 1);
             match &mut self.chunk.tape[idx] {
@@ -157,25 +203,117 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         self.patch_to(list, target);
     }
 
-    /// Emit a test + unfilled jump that fires when the value in `src` matches
-    /// `jump_if_truthy`. Returns the tape index of the emitted JMP so the
-    /// caller can append it to the appropriate list.
+    /// Does this list contain any jump whose control instruction can't
+    /// self-materialise a boolean value? TESTSET-controlled jumps preserve
+    /// the operand value on the taken edge; TEST/LT/LE/EQ jumps don't. The
+    /// caller uses this to decide whether the `LFALSESKIP` / `LOAD true`
+    /// fixup tail is needed at discharge.
+    fn need_value(&self, list: &JumpList) -> bool {
+        list.jumps.iter().any(|&idx| {
+            if idx == 0 {
+                return true;
+            }
+            !matches!(
+                self.chunk.tape[idx - 1],
+                Instruction::TESTSET { dst: NO_REG, .. }
+            )
+        })
+    }
+
+    /// Value-context patching of a jump list. For each jump, if its control
+    /// is a `TESTSET { dst: NO_REG, .. }`, patch the dst to `reg` and aim
+    /// the JMP at `vtarget` (the final/merge point — the TESTSET preserves
+    /// value on the taken edge so we don't need the fixup tail).
+    /// Self-assigning TESTSETs (src == reg) are downgraded to TEST and
+    /// aimed at `dtarget` along with every non-TESTSET-controlled jump.
+    fn patch_list_aux(
+        &mut self,
+        list: JumpList,
+        vtarget: usize,
+        reg: RegisterIndex,
+        dtarget: usize,
+    ) {
+        for jmp_idx in list.jumps {
+            let target = if jmp_idx == 0 {
+                dtarget
+            } else {
+                let ctrl_idx = jmp_idx - 1;
+                match self.chunk.tape[ctrl_idx] {
+                    Instruction::TESTSET {
+                        dst: NO_REG,
+                        src,
+                        inverted,
+                    } => {
+                        // Both arms preserve the operand value at `reg`:
+                        // the assignment case writes `src` → `reg`, the
+                        // self-assign case has the value already in `reg`.
+                        // Either way the jump skips the materialisation
+                        // tail and lands on `vtarget`.
+                        if src == reg.0 {
+                            self.chunk.tape[ctrl_idx] = Instruction::TEST {
+                                src,
+                                inverted: !inverted,
+                            };
+                        } else {
+                            self.chunk.tape[ctrl_idx] = Instruction::TESTSET {
+                                dst: reg.0,
+                                src,
+                                inverted,
+                            };
+                        }
+                        vtarget
+                    }
+                    _ => dtarget,
+                }
+            };
+            let offset = target as i32 - (jmp_idx as i32 + 1);
+            if let Instruction::JMP { offset: o } = &mut self.chunk.tape[jmp_idx] {
+                *o = offset;
+            }
+        }
+    }
+
+    /// Emit a TESTSET + unfilled JMP that fires when the value at `src`
+    /// matches `jump_if_truthy`, assigning the TESTSET's dst to the source
+    /// value on the same edge. The `dst` field is left as `NO_REG`: if this
+    /// jump is ultimately consumed by a value-context discharge,
+    /// `patch_list_aux` rewrites the dst to the final destination register;
+    /// otherwise `downgrade_testsets` rewrites the TESTSET to a plain TEST.
+    ///
+    /// Why TESTSET instead of TEST: for `a or b` in value context we need
+    /// the truthy short-circuit to preserve `a`'s value in the destination
+    /// register. The TESTSET does that assign on the same path as the JMP,
+    /// so no extra MOVE is needed.
     fn emit_test_jump(&mut self, src: RegisterIndex, jump_if_truthy: bool) -> usize {
-        // op_test skips iff `truthy != inverted`, so to make the JMP fire
-        // when the value has the desired truthiness we set `inverted` equal
-        // to that desired truthiness. Then skip iff truthy != desired → JMP
-        // runs iff truthy == desired.
-        self.emit(Instruction::TEST {
+        // TESTSET semantics: skip iff `truthy(src) == inverted`, else
+        // `R[dst] := R[src]` and fall through. We want the fall-through
+        // path (which leads to the JMP) to be the "wanted truthiness" path.
+        //   jump_if_truthy=true  → fall-through on truthy → assign on truthy
+        //                          → `truthy != inverted` → inverted = false
+        //   jump_if_truthy=false → fall-through on falsy  → inverted = true
+        self.emit(Instruction::TESTSET {
+            dst: NO_REG,
             src: src.0,
-            inverted: jump_if_truthy,
+            inverted: !jump_if_truthy,
         });
         self.emit_unfilled_jmp()
     }
 
-    /// Swap the true/false lists of `expr` and flip the `inverted` flag on
-    /// each list's associated control instruction (the CMP/TEST immediately
-    /// before each pending JMP). Lets callers reuse a pending conditional
-    /// jump when they need the opposite polarity — no extra instructions.
+    /// Flip the polarity of every pending conditional jump in `expr`: invert
+    /// the `inverted` flag of each control instruction (CMP/TEST/TESTSET),
+    /// swap the true/false lists, and flip `fall_truthy`. After the call
+    /// every pending JMP fires on the opposite runtime condition and the
+    /// lists / fall-through semantics are re-labelled to match — the whole
+    /// `ExprDesc` stays internally consistent. Used by `goiftrue`/`goiffalse`
+    /// to reuse a pending jump when the caller needs the opposite polarity.
+    ///
+    /// **Invariant:** every entry in either list is preceded by a CMP, TEST,
+    /// or TESTSET. By construction this holds for every list that reaches
+    /// `negate_cond`: comparisons emit CMP + JMP, `emit_test_jump` emits
+    /// TESTSET + JMP, and the only unconditional JMP pushed into a list
+    /// (the fall-through router in `discharge_to_reg_mut`) is pushed during
+    /// discharge, which is terminal and clears the lists — no subsequent
+    /// `negate_cond` ever sees it.
     fn negate_cond(&mut self, expr: &mut ExprDesc) {
         for &jmp_idx in expr
             .true_list
@@ -183,10 +321,9 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             .iter()
             .chain(expr.false_list.jumps.iter())
         {
-            // Only conditional jumps have a preceding control instruction.
-            // Unconditional JMPs (produced during list merges) have no test
-            // instruction in front of them and are left untouched — callers
-            // avoid negating such expressions.
+            // Defensive: a JMP at tape index 0 has no predecessor to invert.
+            // Doesn't arise in practice (functions start with VARARGPREP)
+            // but cheap to guard against underflow.
             if jmp_idx == 0 {
                 continue;
             }
@@ -198,16 +335,20 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                 | Instruction::TESTSET { inverted, .. } => {
                     *inverted = !*inverted;
                 }
-                _ => {}
+                other => unreachable!(
+                    "negate_cond: jump-list entry at {jmp_idx} has no \
+                     CMP/TEST control instruction (found {other:?})"
+                ),
             }
         }
         std::mem::swap(&mut expr.true_list, &mut expr.false_list);
+        expr.fall_truthy = !expr.fall_truthy;
     }
 
     /// Ensure `expr` has a pending jump in its true-list — i.e. one that
     /// fires exactly when the expression evaluates to truthy. Leaves
     /// fall-through as the falsy path.
-    fn goiftrue(&mut self, expr: &mut ExprDesc) -> Result<(), CompileError> {
+    fn goiftrue(&mut self, expr: &mut ExprDesc) {
         match expr.kind {
             ExprKind::Jump => {
                 // If the pending jumps already fire on truthy (true_list
@@ -223,12 +364,11 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                 expr.true_list.jumps.push(jmp);
             }
         }
-        Ok(())
     }
 
     /// Ensure `expr` has a pending jump in its false-list — fires when the
     /// expression evaluates to falsy, fall-through is the truthy path.
-    fn goiffalse(&mut self, expr: &mut ExprDesc) -> Result<(), CompileError> {
+    fn goiffalse(&mut self, expr: &mut ExprDesc) {
         match expr.kind {
             ExprKind::Jump => {
                 if expr.false_list.is_empty() && !expr.true_list.is_empty() {
@@ -240,81 +380,116 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                 expr.false_list.jumps.push(jmp);
             }
         }
-        Ok(())
     }
 
-    /// Discharge an expression to a concrete register. If either jump list
-    /// is non-empty, emit a fixup tail so every exit path materialises a
-    /// boolean in `dst`:
+    /// Discharge an expression to a concrete register, resolving any pending
+    /// jump lists. The emitted shape follows Lua 5.4's `exp2reg`:
     ///
-    /// ```text
-    ///   <value in dst — for Reg kinds; Jump kinds have no "fall-through"
-    ///    value because the preceding CMP/TEST fully routes into the lists>
-    ///   JMP end                          ; skip past fixup (Reg path only)
-    ///   LFALSESKIP dst                   ; false_list patches here
-    ///   LOAD        dst K(true)          ; true_list patches here
-    /// end:
-    /// ```
-    ///
-    /// For a Jump expression the fall-through at the moment of discharge is
-    /// already the "truthy" outcome of the pending comparison, so we route
-    /// that into `true_list` first by emitting an unconditional JMP and
-    /// appending it. That reduces the pattern to the fixup tail alone.
+    /// * If every pending jump is TESTSET-controlled (all preserve their
+    ///   operand value via the assign-on-short-circuit edge) we skip the
+    ///   `LFALSESKIP` / `LOAD K(true)` fixup tail entirely — `patch_list_aux`
+    ///   redirects those jumps to the final merge point, no boolean
+    ///   materialisation needed.
+    /// * Otherwise we emit the two-instruction tail. TESTSET jumps still
+    ///   skip to the merge point (preserving their value); plain TEST /
+    ///   CMP jumps land on LFALSESKIP or LOADTRUE to produce a boolean in
+    ///   `dst`.
+    /// * For a Reg-kind expression with pending jumps, the fall-through at
+    ///   the moment of discharge already holds the RHS value in `dst`; we
+    ///   emit a JMP over the tail so the fall-through value survives.
+    /// * For a Jump-kind expression (no register yet), fall-through is the
+    ///   outcome indicated by `expr.fall_truthy` — route it into the
+    ///   corresponding list via an unconditional JMP so the tail handles it.
     fn discharge_to_reg_mut(
         &mut self,
         expr: &mut ExprDesc,
         hint: Option<RegisterIndex>,
     ) -> Result<RegisterIndex, CompileError> {
-        // For a plain Reg with no pending jumps, return the register where
-        // the value already lives. The `hint` is advisory — honouring it
-        // here would emit a MOVE that many callers then re-emit themselves,
-        // flipping instruction order and inflating the frame size. Callers
-        // that need the value in a specific register check the returned
-        // register and MOVE themselves.
+        // Fast path: plain Reg with no pending jumps. `hint` is advisory —
+        // honouring it here would emit a MOVE that many callers re-emit,
+        // flipping instruction order and inflating frame size. Callers that
+        // want the value in a specific register MOVE it themselves.
         if matches!(expr.kind, ExprKind::Reg(_)) && !expr.has_jumps() {
             if let ExprKind::Reg(reg) = expr.kind {
                 return Ok(reg);
             }
         }
 
+        let is_jump = matches!(expr.kind, ExprKind::Jump);
         let dst = match expr.kind {
-            ExprKind::Reg(reg) => reg,
+            ExprKind::Reg(reg) => {
+                // Reg with pending jumps. Honor the hint: jumps in the list
+                // preserve the short-circuit operand by having their TESTSET
+                // dst patched to our `dst`. If we used `reg` directly and
+                // `reg` happens to be a local's register (e.g. `b` in
+                // `local x = a and b`), the TESTSETs would overwrite that
+                // local on the falsy short-circuit — a real miscompile. So
+                // MOVE the fall-through value into the hint, then patching
+                // can target hint safely.
+                if let Some(h) = hint
+                    && h != reg
+                {
+                    self.dst_or_alloc(Some(h))?;
+                    self.emit(Instruction::MOVE {
+                        dst: h.0,
+                        src: reg.0,
+                    });
+                    h
+                } else {
+                    reg
+                }
+            }
             ExprKind::Jump => self.dst_or_alloc(hint)?,
         };
 
-        let is_jump = matches!(expr.kind, ExprKind::Jump);
         if is_jump {
-            // Route the comparison's truthy fall-through into true_list so
-            // the fixup tail below is the only materialisation site.
+            // Fall-through after the last emitted control instruction
+            // represents either the truthy or falsy outcome of the whole
+            // expression depending on how it was built (a bare comparison
+            // has truthy fall-through; `not` of a comparison swaps). Route
+            // the fall-through into whichever list corresponds, so the
+            // materialisation tail dispatches it to the right side.
             let jmp = self.emit_unfilled_jmp();
-            expr.true_list.jumps.push(jmp);
+            if expr.fall_truthy {
+                expr.true_list.jumps.push(jmp);
+            } else {
+                expr.false_list.jumps.push(jmp);
+            }
         }
 
         if expr.has_jumps() {
-            // For a Reg-kind with pending jumps (e.g. value-context `and`/`or`
-            // whose LHS short-circuited into the lists), the fall-through at
-            // this point is the LHS's already-materialised value in `dst`.
-            // Skip over the fixup so we keep that value.
-            let skip_fixup = if !is_jump {
+            let need_tail = self.need_value(&expr.false_list) || self.need_value(&expr.true_list);
+
+            // Reg-kind with a live fall-through value needs to skip past
+            // the boolean fixup tail so the value stays in `dst`. Jump-kind
+            // has no fall-through (it was routed above), so no skip jump.
+            let skip_fixup = if !is_jump && need_tail {
                 Some(self.emit_unfilled_jmp())
             } else {
                 None
             };
 
-            let false_target = self.next_offset();
-            self.emit(Instruction::LFALSESKIP { src: dst.0 });
+            let (false_target, true_target) = if need_tail {
+                let ft = self.next_offset();
+                self.emit(Instruction::LFALSESKIP { src: dst.0 });
+                let tt = self.next_offset();
+                let true_idx = self.alloc_constant(Value::Boolean(true))?;
+                self.emit(Instruction::LOAD {
+                    dst: dst.0,
+                    idx: true_idx,
+                });
+                (ft, tt)
+            } else {
+                // Unused: every jump in both lists is TESTSET-controlled and
+                // will be redirected to `final_pos` by patch_list_aux.
+                (0, 0)
+            };
 
-            let true_target = self.next_offset();
-            let true_idx = self.alloc_constant(Value::Boolean(true))?;
-            self.emit(Instruction::LOAD {
-                dst: dst.0,
-                idx: true_idx,
-            });
-
+            let final_pos = self.next_offset();
             let fl = std::mem::take(&mut expr.false_list);
             let tl = std::mem::take(&mut expr.true_list);
-            self.patch_to(fl, false_target);
-            self.patch_to(tl, true_target);
+            self.patch_list_aux(fl, final_pos, dst, false_target);
+            self.patch_list_aux(tl, final_pos, dst, true_target);
 
             if let Some(idx) = skip_fixup {
                 let end = self.next_offset();
@@ -1277,15 +1452,19 @@ fn compile_expr_prefix_op(
     let rhs_expr = item.rhs().ok_or_else(|| ice("prefix op without operand"))?;
 
     // `not <expr>`: when the operand is a jump-list expression (comparison,
-    // `not`-of-comparison, etc.) we swap its true/false lists and flip the
-    // polarity of every pending control instruction — no NOT opcode, no
-    // materialisation. For plain register/value operands fall back to the
-    // NOT opcode so fall-through polarity stays consistent with the kind.
+    // `not`-of-comparison, etc.) we just swap its true/false lists — the
+    // pending jumps still fire on the same runtime condition; only the
+    // label ("this outcome represents TRUE vs FALSE of the surrounding
+    // expression") flips. No control-instruction rewrite (unlike
+    // `negate_cond`, which both flips the control and swaps lists for the
+    // case where the caller wants the JMP to fire on the opposite runtime
+    // condition). For plain Reg operands fall back to the NOT opcode.
     if matches!(op, PrefixOperator::Not) {
         let mut inner = compile_expr(ctx, rhs_expr, None)?;
         match inner.kind {
             ExprKind::Jump => {
-                ctx.negate_cond(&mut inner);
+                std::mem::swap(&mut inner.true_list, &mut inner.false_list);
+                inner.fall_truthy = !inner.fall_truthy;
                 return Ok(inner);
             }
             ExprKind::Reg(src) => {
@@ -1342,11 +1521,10 @@ fn compile_expr_binary_op(
 ) -> Result<ExprDesc, CompileError> {
     let op = item.op().ok_or_else(|| ice("binary op without operator"))?;
 
-    // Comparisons produce a jump-list expression so callers that only branch
-    // on the result (if/while/repeat, `not`) can avoid the LOAD-true /
-    // LFALSESKIP materialisation entirely. `and`/`or` still go through the
-    // register-returning path for now — full jump-list treatment of those
-    // comes in a later pass alongside TESTSET.
+    // Comparisons and logical operators produce jump-list expressions so
+    // callers that branch on the result can avoid the LOAD-true / LFALSESKIP
+    // materialisation tail, and nested chains (`a < b and c < d`,
+    // `x or y or z`) short-circuit through the shared list machinery.
     match op {
         BinaryOperator::Eq
         | BinaryOperator::NEq
@@ -1354,6 +1532,8 @@ fn compile_expr_binary_op(
         | BinaryOperator::Gt
         | BinaryOperator::LEq
         | BinaryOperator::GEq => return compile_comparison_desc(ctx, item, op),
+        BinaryOperator::And => return compile_logical_and_desc(ctx, item, dst),
+        BinaryOperator::Or => return compile_logical_or_desc(ctx, item, dst),
         _ => {}
     }
 
@@ -1366,13 +1546,6 @@ fn compile_expr_binary_op_to_reg(
     dst: Option<RegisterIndex>,
 ) -> Result<RegisterIndex, CompileError> {
     let op = item.op().ok_or_else(|| ice("binary op without operator"))?;
-
-    // Short-circuit logical operators
-    match op {
-        BinaryOperator::And => return compile_logical_and(ctx, item, dst),
-        BinaryOperator::Or => return compile_logical_or(ctx, item, dst),
-        _ => {}
-    }
 
     // Property access: a.b
     if op == BinaryOperator::Property {
@@ -1548,10 +1721,19 @@ fn compile_expr_binary_op_to_reg(
         | BinaryOperator::Lt
         | BinaryOperator::Gt
         | BinaryOperator::LEq
-        | BinaryOperator::GEq => unreachable!("comparisons handled by compile_comparison_desc"),
-
-        BinaryOperator::And | BinaryOperator::Or => unreachable!("handled above"),
-        BinaryOperator::Property | BinaryOperator::Method => unreachable!("handled above"),
+        | BinaryOperator::GEq => {
+            unreachable!(
+                "comparisons intercepted by compile_expr_binary_op → compile_comparison_desc"
+            )
+        }
+        BinaryOperator::And | BinaryOperator::Or => {
+            unreachable!(
+                "and/or intercepted by compile_expr_binary_op → compile_logical_{{and,or}}_desc"
+            )
+        }
+        BinaryOperator::Property | BinaryOperator::Method => {
+            unreachable!("property/method handled earlier in this function")
+        }
     }
 }
 
@@ -1644,83 +1826,72 @@ fn compile_comparison_desc(
         kind: ExprKind::Jump,
         true_list: JumpList::new(),
         false_list: JumpList::single(jmp),
+        // `inverted=false` + our VM's `op_lt` means the JMP fires when the
+        // comparison is FALSE; skipping the JMP (fall-through) means it was
+        // TRUE. So fall-through is truthy.
+        fall_truthy: true,
     })
 }
 
-/// Compile `lhs and rhs` / `lhs or rhs` with TESTSET-based short-circuiting
-/// so the result preserves the operand that decided the short-circuit.
+/// Jump-list compilation of `lhs and rhs`. When `lhs` is falsy the whole
+/// expression's value is `lhs` — `goiffalse` arranges a jump on falsy that
+/// exits the expression (and, for Reg operands, the TESTSET it emits
+/// preserves `lhs`'s value on that edge). When `lhs` is truthy, control
+/// falls through to the RHS evaluation and the result is `rhs`.
 ///
-/// `and`: if `lhs` is falsy, the whole expression is `lhs` — skip `rhs` and
-/// keep `lhs` in `dst`. If `lhs` is truthy, evaluate `rhs` (which overwrites
-/// `dst`) and its value is the result.
-///
-/// `or`: symmetric. Truthy `lhs` short-circuits with `lhs` as the result.
-///
-/// The TESTSET does the "assign `lhs` into `dst` on the short-circuit leg"
-/// work in one instruction, replacing the old TEST + MOVE pattern.
-fn compile_logical_short_circuit(
+/// The merged `ExprDesc` has:
+///   * `false_list = lhs.false_list ∪ rhs.false_list` — any falsy exit
+///     from either operand short-circuits the whole expression as falsy.
+///   * `true_list  = rhs.true_list` — only `rhs` being truthy makes the
+///     whole thing truthy.
+fn compile_logical_and_desc(
     ctx: &mut Ctx,
     item: BinaryOp,
     dst: Option<RegisterIndex>,
-    is_and: bool,
-) -> Result<RegisterIndex, CompileError> {
-    let kw = if is_and { "and" } else { "or" };
-    let lhs_expr = item.lhs().ok_or_else(|| ice("short-circuit without lhs"))?;
-    let rhs_expr = item.rhs().ok_or_else(|| {
-        ice(if is_and {
-            "and without rhs"
-        } else {
-            "or without rhs"
-        })
-    })?;
-    let _ = kw; // kw only used for error text in ice() above; silence unused warning
+) -> Result<ExprDesc, CompileError> {
+    let lhs_expr = item.lhs().ok_or_else(|| ice("and without lhs"))?;
+    let rhs_expr = item.rhs().ok_or_else(|| ice("and without rhs"))?;
 
-    let dst = ctx.dst_or_alloc(dst)?;
-    let lhs = compile_expr_to_reg(ctx, lhs_expr, Some(dst))?;
+    // Thread the destination hint to both operands so the short-circuit
+    // TESTSET can end up as a `TESTSET dst dst` (self-assign, downgraded
+    // to TEST by `patch_list_aux`) — saving the intermediate register
+    // and MOVE that a fresh-register allocation would otherwise need.
+    let mut lhs = compile_expr(ctx, lhs_expr, dst)?;
+    ctx.goiffalse(&mut lhs);
 
-    // TESTSET semantics (our impl): `if truthy(src) == inverted then skip; else R[dst] := R[src]`.
-    //
-    // `and` (is_and=true): short-circuit when lhs is FALSY, result = lhs.
-    //   Use inverted=true → truthy path skips next (JMP), no assign needed
-    //   because truthy means we're going to evaluate rhs and overwrite dst.
-    //   Falsy path assigns dst := lhs and falls through to the JMP → end.
-    // `or`: short-circuit when lhs is TRUTHY, result = lhs.
-    //   Use inverted=false → falsy path skips next (JMP), truthy path assigns
-    //   dst := lhs and falls through to the JMP → end.
-    let end_label = ctx.new_label();
-    ctx.emit(Instruction::TESTSET {
-        dst: dst.0,
-        src: lhs.0,
-        inverted: is_and,
-    });
-    ctx.emit_jump(end_label);
+    // LHS truthy path: evaluate RHS here. Any TESTSETs in lhs.true_list
+    // represent paths whose values are discarded (RHS's value wins), so
+    // `patch_to_here` downgrades them to plain TESTs.
+    let lhs_true = std::mem::take(&mut lhs.true_list);
+    ctx.patch_to_here(lhs_true);
 
-    let rhs = compile_expr_to_reg(ctx, rhs_expr, Some(dst))?;
-    if rhs != dst {
-        ctx.emit(Instruction::MOVE {
-            dst: dst.0,
-            src: rhs.0,
-        });
-    }
+    let mut rhs = compile_expr(ctx, rhs_expr, dst)?;
 
-    ctx.set_label(end_label, ctx.next_offset());
-    Ok(dst)
+    rhs.false_list.concat(lhs.false_list);
+    Ok(rhs)
 }
 
-fn compile_logical_and(
+/// Jump-list compilation of `lhs or rhs`. Symmetric to `and`: truthy `lhs`
+/// short-circuits with `lhs`'s value (via `goiftrue`'s TESTSET), falsy
+/// `lhs` falls through to RHS evaluation.
+fn compile_logical_or_desc(
     ctx: &mut Ctx,
     item: BinaryOp,
     dst: Option<RegisterIndex>,
-) -> Result<RegisterIndex, CompileError> {
-    compile_logical_short_circuit(ctx, item, dst, true)
-}
+) -> Result<ExprDesc, CompileError> {
+    let lhs_expr = item.lhs().ok_or_else(|| ice("or without lhs"))?;
+    let rhs_expr = item.rhs().ok_or_else(|| ice("or without rhs"))?;
 
-fn compile_logical_or(
-    ctx: &mut Ctx,
-    item: BinaryOp,
-    dst: Option<RegisterIndex>,
-) -> Result<RegisterIndex, CompileError> {
-    compile_logical_short_circuit(ctx, item, dst, false)
+    let mut lhs = compile_expr(ctx, lhs_expr, dst)?;
+    ctx.goiftrue(&mut lhs);
+
+    let lhs_false = std::mem::take(&mut lhs.false_list);
+    ctx.patch_to_here(lhs_false);
+
+    let mut rhs = compile_expr(ctx, rhs_expr, dst)?;
+
+    rhs.true_list.concat(lhs.true_list);
+    Ok(rhs)
 }
 
 fn compile_expr_func_call(
@@ -1928,7 +2099,7 @@ fn compile_do(ctx: &mut Ctx, item: Do) -> Result<(), CompileError> {
 /// when the condition evaluates to truthy.
 fn compile_branch_cond_false(ctx: &mut Ctx, cond_expr: Expr) -> Result<JumpList, CompileError> {
     let mut desc = compile_expr(ctx, cond_expr, None)?;
-    ctx.goiffalse(&mut desc)?;
+    ctx.goiffalse(&mut desc);
     // After goiffalse, `false_list` holds every jump that fires on falsy
     // (the caller patches these to the branch-out target) and `true_list`
     // holds any jumps accumulated during LHS evaluation of an `and`/`or`
@@ -1962,9 +2133,14 @@ fn compile_while(ctx: &mut Ctx, item: While) -> Result<(), CompileError> {
             .control_end_label
             .last()
             .ok_or_else(|| ice("missing break label"))?;
-        let break_target_idx = break_label as usize;
+        // Jumps in `break_list` are branch-context: their targets get
+        // resolved by the label-based `jump_patches` system at assemble
+        // time, which only touches JMP offsets. Downgrade any TESTSETs
+        // now (while we still have the list) so no `NO_REG` placeholder
+        // makes it into the final chunk.
+        ctx.downgrade_testsets(&break_list);
         for idx in break_list.jumps {
-            ctx.chunk.jump_patches.push((idx, break_target_idx as u16));
+            ctx.chunk.jump_patches.push((idx, break_label));
         }
 
         Ok(())
