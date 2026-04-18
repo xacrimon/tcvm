@@ -13,6 +13,7 @@ use crate::parser::syntax::{
     PrefixOperator, Repeat, Return, Root, Stmt, Table, TableEntry, While,
 };
 use std::cell::RefCell;
+use std::mem;
 
 /// Sentinel value used as the `dst` field of a `TESTSET` while the real
 /// destination register is still unknown — i.e. the jump is pending in a
@@ -352,7 +353,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             self.flip_control_polarity(jmp_idx);
         }
 
-        std::mem::swap(&mut expr.true_list, &mut expr.false_list);
+        mem::swap(&mut expr.true_list, &mut expr.false_list);
     }
 
     /// "Go if true": arrange for control to fall through when `expr` is
@@ -509,8 +510,8 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             };
 
             let final_pos = self.next_offset();
-            let fl = std::mem::take(&mut expr.false_list);
-            let tl = std::mem::take(&mut expr.true_list);
+            let fl = mem::take(&mut expr.false_list);
+            let tl = mem::take(&mut expr.true_list);
             self.patch_list_aux(fl, final_pos, dst, false_target);
             self.patch_list_aux(tl, final_pos, dst, true_target);
 
@@ -1489,7 +1490,7 @@ fn compile_expr_prefix_op(
         match inner.kind {
             ExprKind::Jump(Some(idx)) => {
                 ctx.flip_control_polarity(idx);
-                std::mem::swap(&mut inner.true_list, &mut inner.false_list);
+                mem::swap(&mut inner.true_list, &mut inner.false_list);
                 return Ok(inner);
             }
             // Jump-kind without a pending head is only reachable after a
@@ -1899,7 +1900,7 @@ fn compile_logical_and_desc(
     // LHS truthy path: evaluate RHS here. Any TESTSETs in lhs.true_list
     // represent paths whose values are discarded (RHS's value wins), so
     // `patch_to_here` downgrades them to plain TESTs.
-    let lhs_true = std::mem::take(&mut lhs.true_list);
+    let lhs_true = mem::take(&mut lhs.true_list);
     ctx.patch_to_here(lhs_true);
 
     let mut rhs = compile_expr(ctx, rhs_expr, dst)?;
@@ -1922,7 +1923,7 @@ fn compile_logical_or_desc(
     let mut lhs = compile_expr(ctx, lhs_expr, dst)?;
     ctx.goiffalse(&mut lhs);
 
-    let lhs_false = std::mem::take(&mut lhs.false_list);
+    let lhs_false = mem::take(&mut lhs.false_list);
     ctx.patch_to_here(lhs_false);
 
     let mut rhs = compile_expr(ctx, rhs_expr, dst)?;
@@ -2141,7 +2142,7 @@ fn compile_branch_cond_false(ctx: &mut Ctx, cond_expr: Expr) -> Result<JumpList,
     // (the caller patches these to the branch-out target) and `true_list`
     // holds any jumps accumulated during LHS evaluation of an `and`/`or`
     // chain that need to land here at the truthy-fall-through position.
-    let true_list = std::mem::take(&mut desc.true_list);
+    let true_list = mem::take(&mut desc.true_list);
     ctx.patch_to_here(true_list);
     Ok(desc.false_list)
 }
