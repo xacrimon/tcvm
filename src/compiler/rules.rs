@@ -153,6 +153,33 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         idx
     }
 
+    /// Debug-only check of the `JumpList` predecessor invariant: for any
+    /// `jmp_idx` stored in a list, `tape[jmp_idx - 1]` must be a CMP/TEST/
+    /// TESTSET control instruction (or `jmp_idx == 0`, which every consumer
+    /// shortcuts). See the `JumpList` doc comment.
+    #[cfg(debug_assertions)]
+    fn assert_ctrl_predecessor(&self, jmp_idx: usize) {
+        if jmp_idx == 0 {
+            return;
+        }
+        let prev = &self.chunk.tape[jmp_idx - 1];
+        debug_assert!(
+            matches!(
+                prev,
+                Instruction::EQ { .. }
+                    | Instruction::LT { .. }
+                    | Instruction::LE { .. }
+                    | Instruction::TEST { .. }
+                    | Instruction::TESTSET { .. }
+            ),
+            "JumpList invariant violated: tape[{}] = {:?} is not a \
+             CMP/TEST/TESTSET control instruction for JMP at tape[{}]",
+            jmp_idx - 1,
+            prev,
+            jmp_idx,
+        );
+    }
+
     /// Downgrade any `TESTSET` with a `NO_REG` dst preceding a jump in the
     /// list to a plain `TEST`. Called when a list is about to be consumed
     /// in a context that doesn't need value preservation — mid-expression
@@ -163,11 +190,15 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     /// enclosing logical operator. For example, in `a and b`, LHS's
     /// `true_list` gets patched to RHS's start — LHS's truthy value is
     /// not the result (RHS's is), so preservation would be wasted.
+    ///
+    /// Reads `tape[jmp_idx - 1]`; see the `JumpList` invariant.
     fn downgrade_testsets(&mut self, list: &JumpList) {
         for &jmp_idx in &list.jumps {
             if jmp_idx == 0 {
                 continue;
             }
+            #[cfg(debug_assertions)]
+            self.assert_ctrl_predecessor(jmp_idx);
             if let Instruction::TESTSET { dst, src, inverted } = self.chunk.tape[jmp_idx - 1]
                 && dst == NO_REG
             {
@@ -209,11 +240,15 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     /// the operand value on the taken edge; TEST/LT/LE/EQ jumps don't. The
     /// caller uses this to decide whether the `LFALSESKIP` / `LOAD true`
     /// fixup tail is needed at discharge.
+    ///
+    /// Reads `tape[idx - 1]`; see the `JumpList` invariant.
     fn need_value(&self, list: &JumpList) -> bool {
         list.jumps.iter().any(|&idx| {
             if idx == 0 {
                 return true;
             }
+            #[cfg(debug_assertions)]
+            self.assert_ctrl_predecessor(idx);
             !matches!(
                 self.chunk.tape[idx - 1],
                 Instruction::TESTSET { dst: NO_REG, .. }
@@ -227,6 +262,8 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     /// value on the taken edge so we don't need the fixup tail).
     /// Self-assigning TESTSETs (src == reg) are downgraded to TEST and
     /// aimed at `dtarget` along with every non-TESTSET-controlled jump.
+    ///
+    /// Reads `tape[jmp_idx - 1]`; see the `JumpList` invariant.
     fn patch_list_aux(
         &mut self,
         list: JumpList,
@@ -238,6 +275,8 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             let target = if jmp_idx == 0 {
                 dtarget
             } else {
+                #[cfg(debug_assertions)]
+                self.assert_ctrl_predecessor(jmp_idx);
                 let ctrl_idx = jmp_idx - 1;
                 match self.chunk.tape[ctrl_idx] {
                     Instruction::TESTSET {

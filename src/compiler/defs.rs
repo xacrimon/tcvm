@@ -11,6 +11,16 @@ pub struct RegisterIndex(pub u8);
 /// two lists attached to an `ExprDesc` represent the expression's "true" and
 /// "false" exit paths — jumps in `true_list` are taken when the expression
 /// evaluates to a truthy value, jumps in `false_list` fire when falsy.
+///
+/// **Invariant (control-instruction predecessor):** every `jmp_idx` stored in
+/// `jumps` must satisfy either `jmp_idx == 0` (the sentinel tolerated by every
+/// consumer) or `tape[jmp_idx - 1]` is one of `EQ`, `LT`, `LE`, `TEST`,
+/// `TESTSET` — the control instruction whose taken-vs-fall-through decision
+/// the `JMP` at `tape[jmp_idx]` realises. The consumers `need_value`,
+/// `downgrade_testsets`, `patch_list_aux`, and `flip_control_polarity` all
+/// read `tape[jmp_idx - 1]` under this assumption. Only `emit_test_jump`
+/// (TESTSET + JMP) and `compile_comparison_desc` (CMP + JMP) mint jump indices
+/// that may enter a list; pushing any other JMP here would silently miscompile.
 #[derive(Debug, Clone, Default)]
 pub(super) struct JumpList {
     pub(super) jumps: Vec<usize>,
