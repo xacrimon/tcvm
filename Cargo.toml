@@ -31,4 +31,4 @@ ariadne = "0.6.0"
 paste = "1.0.15"
 
 [dev-dependencies]
-insta = { version = "1.47.2", features = ["yaml"] }
+insta = "1.47.2"
