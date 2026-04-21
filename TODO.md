@@ -2,6 +2,7 @@ todo:
 - varargs
 - register index width issues
 - nargs overflow in resolve_call_chain
+- stdlib
 
 Explicitly out of scope (documented TODOs)
  - Native target reached via a __call metamethod chain.
@@ -18,28 +19,9 @@ Explicitly out of scope (documented TODOs)
  boundary: native Err triggers the existing raise!() path, so
  RuntimeError::Opcode { pc } is all the host sees, same as any other
  runtime error today. Plumbing the message is a separate change.
- - GC-valued errors.
-
-1. run_thread holds a long-lived RefMut on the thread — same-thread open upvalue access will panic.                
-                                                                                
-  run_thread (src/vm/interp.rs:215-234) takes ts = thread.borrow_mut(mc) and keeps it alive across the entire        
-  tail-call dispatch chain. Handlers like op_getupval (line 324) and op_setupval (line 346) look up upvalues and, for
-   the UpvalueState::Open branch, call t.borrow() on the upvalue's owning thread. op_closure (line 1398) populates   
-  these upvalues with thread_handle — the same thread that's currently running. Any Lua script that reads a captured 
-  local while the enclosing frame is still live (textbook closures like function outer() local n = 10; local inner = 
-  function() return n end; return inner() end) will hit RefCell::borrow while a borrow_mut is active → panic.
-                                                                                                                     
-  This is pre-existing — the old run() had the same shape — but the MVP makes it reachable for the first time because
-   we can now actually drive the VM. Fixing it probably requires either (a) releasing the RefMut and borrowing per   
-  handler, (b) bypassing the RefCell via raw pointers in the hot path (what piccolo does — it uses Gc::as_ptr through
-   the stack handle), or (c) restructuring so open upvalues don't go through RefCell at all.                         
-                                                                                
-  2. Executor::start panics on native functions.   
-                 
-  src/lua/executor.rs:55-57 uses expect("Executor::start: native functions not yet supported"). A host process
-  shouldn't abort on this — should be Result<Self, RuntimeError> with a NotALuaFunction variant (or similar). Same   
-  smell: the expect("run_thread requires a seeded frame") in run_thread.
-                                                                                                                     
+ - GC-valued errors.                      
+                      
+                                                                                                    
   3. op_return top-level truncation assumes cur_base >= 1.                      
                                                      
   src/vm/interp.rs:1140 — thread.stack.truncate(dst_start + nret) where dst_start = cur_base - 1. If a caller ever
@@ -158,9 +140,6 @@ Explicitly out of scope (documented TODOs)
   but every new FromValue type means remembering to add a line here. Consider documenting or consolidating.          
                                                                                 
   Missing to make this a usable library                                                                              
-                                                                                
-  22. Native function calling. The fn() placeholder blocks every stdlib item (print, pairs, tostring, math.*, etc.). 
-  This is the single biggest gap and the memory already flagged it as unresolved design.
                                                                                                                      
   23. Lua-level error propagation. Runtime errors in opcodes raise!() to impl_error which returns Err(Box<Error { pc:
    0 }>) — pc is hardcoded to 0 (src/vm/interp.rs:240, existing TODO). We surface a useless RuntimeError::Opcode {   
