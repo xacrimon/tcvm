@@ -184,34 +184,6 @@ pub fn token_is_unary_op(token: SyntaxKind) -> bool {
     matches!(token, T![not] | T![+] | T![-] | T![#] | T![~])
 }
 
-pub fn token_is_binary_op(token: SyntaxKind) -> bool {
-    matches!(
-        token,
-        T![or]
-            | T![and]
-            | T![+]
-            | T![-]
-            | T![*]
-            | T![/]
-            | T![D/]
-            | T![^]
-            | T![%]
-            | T![&]
-            | T![|]
-            | T![<<]
-            | T![>>]
-            | T![==]
-            | T![~]
-            | T![~=]
-            | T![<=]
-            | T![>=]
-            | T![>]
-            | T![<]
-            | T![.]
-            | T![..]
-    )
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Event {
     Enter {
