@@ -320,11 +320,7 @@ extern "rust-preserve-none" fn op_getupval<'gc>(
     helpers!(instruction, mc, thread, registers, ip, handlers);
     let (dst, idx) = args!(Instruction::GETUPVAL { dst, idx });
     let uv = upvalue!(idx);
-    let val = match &*uv.borrow() {
-        UpvalueState::Open { thread: t, index } => t.borrow().stack[*index],
-        UpvalueState::Closed(v) => *v,
-    };
-    *reg!(mut dst) = val;
+    *reg!(mut dst) = read_upvalue(thread, uv);
     dispatch!();
 }
 
@@ -341,13 +337,7 @@ extern "rust-preserve-none" fn op_setupval<'gc>(
     let (src, idx) = args!(Instruction::SETUPVAL { src, idx });
     let val = reg!(src);
     let uv = upvalue!(idx);
-    let mut uv_ref = uv.borrow_mut(mc);
-    match &mut *uv_ref {
-        UpvalueState::Open { thread: t, index } => {
-            t.borrow_mut(mc).stack[*index] = val;
-        }
-        UpvalueState::Closed(v) => *v = val,
-    }
+    write_upvalue(mc, thread, uv, val);
     dispatch!();
 }
 
@@ -368,10 +358,7 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
     helpers!(instruction, mc, thread, registers, ip, handlers);
     let (dst, idx, key) = args!(Instruction::GETTABUP { dst, idx, key });
     let uv = upvalue!(idx);
-    let table_val = match &*uv.borrow() {
-        UpvalueState::Open { thread: t, index } => t.borrow().stack[*index],
-        UpvalueState::Closed(v) => *v,
-    };
+    let table_val = read_upvalue(thread, uv);
     let Some(table) = table_val.get_table() else {
         raise!();
     };
@@ -409,10 +396,7 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
     helpers!(instruction, mc, thread, registers, ip, handlers);
     let (src, idx, key) = args!(Instruction::SETTABUP { src, idx, key });
     let uv = upvalue!(idx);
-    let table_val = match &*uv.borrow() {
-        UpvalueState::Open { thread: t, index } => t.borrow().stack[*index],
-        UpvalueState::Closed(v) => *v,
-    };
+    let table_val = read_upvalue(thread, uv);
     let Some(table) = table_val.get_table() else {
         raise!();
     };
@@ -1519,6 +1503,53 @@ fn close_tbc_vars<'gc>(_mc: &Mutation<'gc>, thread: &mut ThreadState<'gc>, start
             true
         }
     });
+}
+
+/// Read the value of an upvalue without taking a `RefCell` borrow on the
+/// currently running thread. Same-thread open upvalues are served directly
+/// from the `&mut ThreadState` the interpreter already holds; cross-thread
+/// upvalues fall back to `RefCell::borrow` (safe because another thread
+/// cannot be simultaneously mutably borrowed).
+fn read_upvalue<'gc>(thread: &ThreadState<'gc>, uv: Upvalue<'gc>) -> Value<'gc> {
+    match &*uv.borrow() {
+        UpvalueState::Closed(v) => *v,
+        UpvalueState::Open { thread: t, index } => {
+            let running = thread
+                .thread_handle
+                .expect("running thread must have a handle")
+                .inner();
+            if Gc::ptr_eq(t.inner(), running) {
+                thread.stack[*index]
+            } else {
+                t.borrow().stack[*index]
+            }
+        }
+    }
+}
+
+/// Write to an upvalue with the same same-thread / cross-thread split as
+/// [`read_upvalue`].
+fn write_upvalue<'gc>(
+    mc: &Mutation<'gc>,
+    thread: &mut ThreadState<'gc>,
+    uv: Upvalue<'gc>,
+    val: Value<'gc>,
+) {
+    let running = thread
+        .thread_handle
+        .expect("running thread must have a handle")
+        .inner();
+    let mut uv_ref = uv.borrow_mut(mc);
+    match &mut *uv_ref {
+        UpvalueState::Closed(v) => *v = val,
+        UpvalueState::Open { thread: t, index } => {
+            if Gc::ptr_eq(t.inner(), running) {
+                thread.stack[*index] = val;
+            } else {
+                t.borrow_mut(mc).stack[*index] = val;
+            }
+        }
+    }
 }
 
 /// Close all open upvalues pointing at stack indices >= `start_idx`.
