@@ -47,8 +47,116 @@ pub struct LuaClosure<'gc> {
 #[collect(internal, no_drop)]
 pub struct NativeClosure<'gc> {
     #[collect(require_static)]
-    pub function: fn(),
+    pub function: NativeFn,
     pub upvalues: Box<[Value<'gc>]>,
+}
+
+/// Signature of a native callback invoked by the VM on `CALL` / `TAILCALL`.
+///
+/// Arguments are read from the `Stack` view; return values are produced by
+/// leaving them on the stack above `bottom`. Return `Ok(())` for a normal
+/// return, `Err(NativeError)` to trigger a VM error (the message is dropped
+/// at the boundary for now — see the `native_call` plan for future
+/// plumbing).
+pub type NativeFn =
+    for<'gc, 'a> fn(ctx: NativeContext<'gc, 'a>, stack: Stack<'gc, 'a>) -> Result<(), NativeError>;
+
+/// Contextual handles passed to a native callback alongside its `Stack`.
+pub struct NativeContext<'gc, 'a> {
+    pub mc: &'a Mutation<'gc>,
+    pub upvalues: &'a [Value<'gc>],
+}
+
+/// A mutable view into the running thread's value stack, starting at
+/// `bottom`. The callback sees `stack[0..len()]` as its arguments on entry;
+/// any values it leaves on the stack (via `push`, `extend`, or `replace`)
+/// become the callback's return values.
+pub struct Stack<'gc, 'a> {
+    values: &'a mut Vec<Value<'gc>>,
+    bottom: usize,
+}
+
+impl<'gc, 'a> Stack<'gc, 'a> {
+    #[inline]
+    pub(crate) fn new(values: &'a mut Vec<Value<'gc>>, bottom: usize) -> Self {
+        debug_assert!(bottom <= values.len());
+        Stack { values, bottom }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.values.len() - self.bottom
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.values.len() == self.bottom
+    }
+
+    /// Read the value at index `i` within the callback's window, or `Nil`
+    /// if `i` is past the end. Mirrors Lua's "missing args are nil" rule.
+    #[inline]
+    pub fn get(&self, i: usize) -> Value<'gc> {
+        self.values
+            .get(self.bottom + i)
+            .copied()
+            .unwrap_or(Value::Nil)
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[Value<'gc>] {
+        &self.values[self.bottom..]
+    }
+
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [Value<'gc>] {
+        &mut self.values[self.bottom..]
+    }
+
+    /// Discard everything in the window (args included).
+    #[inline]
+    pub fn clear(&mut self) {
+        self.values.truncate(self.bottom);
+    }
+
+    #[inline]
+    pub fn push(&mut self, v: Value<'gc>) {
+        self.values.push(v);
+    }
+
+    #[inline]
+    pub fn extend<I: IntoIterator<Item = Value<'gc>>>(&mut self, iter: I) {
+        self.values.extend(iter);
+    }
+
+    /// Convenience for the common "clear args, push N results" pattern.
+    #[inline]
+    pub fn replace(&mut self, values: &[Value<'gc>]) {
+        self.values.truncate(self.bottom);
+        self.values.extend_from_slice(values);
+    }
+}
+
+impl<'gc, 'a> std::ops::Index<usize> for Stack<'gc, 'a> {
+    type Output = Value<'gc>;
+    #[inline]
+    fn index(&self, i: usize) -> &Value<'gc> {
+        &self.values[self.bottom + i]
+    }
+}
+
+/// Error returned by a [`NativeFn`] to abort execution.
+#[derive(Debug, Clone)]
+pub struct NativeError {
+    pub message: String,
+}
+
+impl NativeError {
+    pub fn new(message: impl Into<String>) -> Self {
+        NativeError {
+            message: message.into(),
+        }
+    }
 }
 
 /// Copy wrapper stored in Value. Single Gc pointer for size efficiency.
@@ -73,7 +181,7 @@ impl<'gc> Function<'gc> {
         Function(Gc::new(mc, FunctionKind::Lua(closure)))
     }
 
-    pub fn new_native(mc: &Mutation<'gc>, function: fn(), upvalues: Box<[Value<'gc>]>) -> Self {
+    pub fn new_native(mc: &Mutation<'gc>, function: NativeFn, upvalues: Box<[Value<'gc>]>) -> Self {
         Function(Gc::new(
             mc,
             FunctionKind::Native(NativeClosure { function, upvalues }),
@@ -83,6 +191,13 @@ impl<'gc> Function<'gc> {
     pub fn as_lua(self) -> Option<Gc<'gc, LuaClosure<'gc>>> {
         match &*self.0 {
             FunctionKind::Lua(cl) => Some(*cl),
+            _ => None,
+        }
+    }
+
+    pub fn as_native(self) -> Option<&'gc NativeClosure<'gc>> {
+        match self.0.as_ref() {
+            FunctionKind::Native(nc) => Some(nc),
             _ => None,
         }
     }

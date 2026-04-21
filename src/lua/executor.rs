@@ -45,16 +45,15 @@ impl<'gc> Executor<'gc> {
     /// Seed `main_thread` with `function(args...)` and return a Normal-mode
     /// executor. Any previous state on the main thread is cleared.
     ///
-    /// Panics if `function` is not a Lua closure (native calls are not yet
-    /// supported).
+    /// Accepts both Lua closures and native functions as the entry point.
+    /// For Lua entry, a call frame is pushed and the body runs on `step`.
+    /// For native entry, no call frame is pushed — `step` invokes the
+    /// native callback directly.
     pub fn start<A: IntoMultiValue<'gc>>(
         ctx: Context<'gc>,
         function: Function<'gc>,
         args: A,
     ) -> Self {
-        let closure = function
-            .as_lua()
-            .expect("Executor::start: native functions not yet supported");
         let thread = ctx.main_thread();
         {
             let mc = ctx.mutation();
@@ -67,19 +66,23 @@ impl<'gc> Executor<'gc> {
             ts.stack.push(Value::Function(function));
             args.push_into(&mut ts.stack);
 
-            let base = 1usize;
-            let needed = base + closure.proto.max_stack_size as usize;
-            if ts.stack.len() < needed {
-                ts.stack.resize(needed, Value::Nil);
-            }
+            if let Some(closure) = function.as_lua() {
+                let base = 1usize;
+                let needed = base + closure.proto.max_stack_size as usize;
+                if ts.stack.len() < needed {
+                    ts.stack.resize(needed, Value::Nil);
+                }
 
-            ts.frames.push(CallFrame {
-                closure,
-                base,
-                pc: 0,
-                num_results: 0, // accept all returns
-                continuation: None,
-            });
+                ts.frames.push(CallFrame {
+                    closure,
+                    base,
+                    pc: 0,
+                    num_results: 0, // accept all returns
+                    continuation: None,
+                });
+            }
+            // Native entry: leave frames empty; `step` will detect this and
+            // invoke the callback directly.
             ts.status = ThreadStatus::Running;
         }
 
@@ -105,10 +108,31 @@ impl<'gc> Executor<'gc> {
             inner.thread
         };
 
-        vm::interp::run_thread(ctx.mutation(), thread)
-            .map_err(|e| RuntimeError::Opcode { pc: e.pc })?;
+        let mc = ctx.mutation();
+        let native_entry = thread.borrow().frames.is_empty();
 
-        let mut inner = self.0.borrow_mut(ctx.mutation());
+        if native_entry {
+            let mut ts = thread.borrow_mut(mc);
+            let entry_fn = ts.stack[0]
+                .get_function()
+                .expect("native entry: stack[0] must be a Function");
+            let nc = entry_fn
+                .as_native()
+                .expect("native entry: function must be native");
+            let argc = ts.stack.len() - 1;
+            let retc = vm::interp::invoke_native(mc, &mut *ts, nc, 1, argc)
+                .map_err(|_| RuntimeError::Opcode { pc: 0 })?;
+            // Move results from stack[1..1+retc] down to stack[0..retc].
+            for i in 0..retc {
+                ts.stack[i] = ts.stack[1 + i];
+            }
+            ts.stack.truncate(retc);
+            ts.status = ThreadStatus::Dead;
+        } else {
+            vm::interp::run_thread(mc, thread).map_err(|e| RuntimeError::Opcode { pc: e.pc })?;
+        }
+
+        let mut inner = self.0.borrow_mut(mc);
         inner.mode = ExecutorMode::Result;
         Ok(())
     }

@@ -1,6 +1,9 @@
 use crate::dmm::{Gc, Mutation, RefLock};
 use crate::env::Value;
-use crate::env::function::{Function, FunctionKind, LuaClosure, Upvalue, UpvalueState};
+use crate::env::function::{
+    Function, FunctionKind, LuaClosure, NativeClosure, NativeContext, NativeError, Stack, Upvalue,
+    UpvalueState,
+};
 use crate::env::string::LuaString;
 use crate::env::table::Table;
 use crate::env::thread::{CallFrame, Thread, ThreadState, ThreadStatus};
@@ -993,42 +996,76 @@ extern "rust-preserve-none" fn op_call<'gc>(
     });
     let base = thread.frames.last().map_or(0, |f| f.base);
     let func_idx = base + func as usize;
-    let Some((closure, nargs)) = resolve_call_chain(mc, thread, func_idx, nargs) else {
+    let Some((target, nargs)) = resolve_call_chain(mc, thread, func_idx, nargs) else {
         raise!();
     };
 
-    let new_base = func_idx + 1;
-    // Save caller's PC (offset from current code start)
-    if let Some(frame) = thread.frames.last_mut() {
-        let code_start = frame.closure.proto.code.as_ptr();
-        frame.pc = unsafe { ip.offset_from_unsigned(code_start) };
-    }
-    // Ensure stack is large enough
-    let needed = new_base + closure.proto.max_stack_size as usize;
-    if thread.stack.len() < needed {
-        thread.stack.resize(needed, Value::Nil);
-    }
-    // Nil-fill parameter slots the caller didn't supply.
-    // args == 0 means variable arg count (top-based, not yet supported).
-    if nargs > 0 {
-        let caller_provided = nargs as usize - 1;
-        let num_params = closure.proto.num_params as usize;
-        for i in caller_provided..num_params {
-            thread.stack[new_base + i] = Value::Nil;
+    match target {
+        CallTarget::Lua(closure) => {
+            let new_base = func_idx + 1;
+            // Save caller's PC (offset from current code start)
+            if let Some(frame) = thread.frames.last_mut() {
+                let code_start = frame.closure.proto.code.as_ptr();
+                frame.pc = unsafe { ip.offset_from_unsigned(code_start) };
+            }
+            // Ensure stack is large enough
+            let needed = new_base + closure.proto.max_stack_size as usize;
+            if thread.stack.len() < needed {
+                thread.stack.resize(needed, Value::Nil);
+            }
+            // Nil-fill parameter slots the caller didn't supply.
+            // args == 0 means variable arg count (top-based, not yet supported).
+            if nargs > 0 {
+                let caller_provided = nargs as usize - 1;
+                let num_params = closure.proto.num_params as usize;
+                for i in caller_provided..num_params {
+                    thread.stack[new_base + i] = Value::Nil;
+                }
+            }
+            // Push new call frame
+            thread.frames.push(CallFrame {
+                closure,
+                base: new_base,
+                pc: 0,
+                num_results: returns,
+                continuation: None,
+            });
+            // Rebind ip and registers to new frame
+            ip = closure.proto.code.as_ptr();
+            registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
+            dispatch!();
+        }
+        CallTarget::Native(nc) => {
+            let args_base = func_idx + 1;
+            let argc = if nargs == 0 {
+                thread.stack.len() - args_base
+            } else {
+                nargs as usize - 1
+            };
+            let retc = match invoke_native(mc, thread, nc, args_base, argc) {
+                Ok(n) => n,
+                Err(_) => raise!(),
+            };
+            // Place results at stack[func_idx..] following Lua convention.
+            let wanted = if returns == 0 {
+                retc
+            } else {
+                returns as usize - 1
+            };
+            let to_copy = retc.min(wanted);
+            for i in 0..to_copy {
+                thread.stack[func_idx + i] = thread.stack[args_base + i];
+            }
+            for i in to_copy..wanted {
+                thread.stack[func_idx + i] = Value::Nil;
+            }
+            if returns == 0 {
+                thread.stack.truncate(func_idx + retc);
+            }
+            registers = unsafe { thread.stack.as_mut_ptr().add(base) };
+            dispatch!();
         }
     }
-    // Push new call frame
-    thread.frames.push(CallFrame {
-        closure,
-        base: new_base,
-        pc: 0,
-        num_results: returns,
-        continuation: None,
-    });
-    // Rebind ip and registers to new frame
-    ip = closure.proto.code.as_ptr();
-    registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
-    dispatch!();
 }
 
 /// return R[func](R[func+1], ..., R[func+args-1])  — tail call
@@ -1045,38 +1082,65 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
     let (func, nargs) = args!(Instruction::TAILCALL { func, args });
     let base = thread.frames.last().map_or(0, |f| f.base);
     let func_idx = base + func as usize;
-    let Some((closure, nargs)) = resolve_call_chain(mc, thread, func_idx, nargs) else {
+    let Some((target, nargs)) = resolve_call_chain(mc, thread, func_idx, nargs) else {
         raise!();
     };
 
-    let cur_base = thread.frames.last().unwrap().base;
-    // Move function + arguments down to current frame's base - 1
-    let nargs = if nargs == 0 { 0 } else { nargs as usize - 1 };
-    let src_start = func_idx + 1;
-    for i in 0..nargs {
-        thread.stack[cur_base + i] = thread.stack[src_start + i];
+    match target {
+        CallTarget::Lua(closure) => {
+            let cur_base = thread.frames.last().unwrap().base;
+            // Move function + arguments down to current frame's base - 1
+            let nargs = if nargs == 0 { 0 } else { nargs as usize - 1 };
+            let src_start = func_idx + 1;
+            for i in 0..nargs {
+                thread.stack[cur_base + i] = thread.stack[src_start + i];
+            }
+            // Close upvalues for the current frame
+            close_upvalues(mc, thread, cur_base);
+            // Replace current frame
+            let frame = thread.frames.last_mut().unwrap();
+            frame.closure = closure;
+            frame.pc = 0;
+            // num_results stays the same (caller's expectation)
+            // Ensure stack is large enough
+            let needed = cur_base + closure.proto.max_stack_size as usize;
+            if thread.stack.len() < needed {
+                thread.stack.resize(needed, Value::Nil);
+            }
+            // Nil-fill parameter slots the caller didn't supply.
+            let num_params = closure.proto.num_params as usize;
+            for i in nargs..num_params {
+                thread.stack[cur_base + i] = Value::Nil;
+            }
+            // Rebind ip and registers
+            ip = closure.proto.code.as_ptr();
+            registers = unsafe { thread.stack.as_mut_ptr().add(cur_base) };
+            dispatch!();
+        }
+        CallTarget::Native(nc) => {
+            let args_base = func_idx + 1;
+            let argc = if nargs == 0 {
+                thread.stack.len() - args_base
+            } else {
+                nargs as usize - 1
+            };
+            let retc = match invoke_native(mc, thread, nc, args_base, argc) {
+                Ok(n) => n,
+                Err(_) => raise!(),
+            };
+            match frame_return(mc, thread, args_base, retc) {
+                FrameReturn::Continuation(func) => {
+                    become func(instruction, mc, thread, registers, ip, handlers);
+                }
+                FrameReturn::TopLevel => return Ok(()),
+                FrameReturn::Caller { new_base, new_ip } => {
+                    ip = new_ip;
+                    registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
+                    dispatch!();
+                }
+            }
+        }
     }
-    // Close upvalues for the current frame
-    close_upvalues(mc, thread, cur_base);
-    // Replace current frame
-    let frame = thread.frames.last_mut().unwrap();
-    frame.closure = closure;
-    frame.pc = 0;
-    // num_results stays the same (caller's expectation)
-    // Ensure stack is large enough
-    let needed = cur_base + closure.proto.max_stack_size as usize;
-    if thread.stack.len() < needed {
-        thread.stack.resize(needed, Value::Nil);
-    }
-    // Nil-fill parameter slots the caller didn't supply.
-    let num_params = closure.proto.num_params as usize;
-    for i in nargs..num_params {
-        thread.stack[cur_base + i] = Value::Nil;
-    }
-    // Rebind ip and registers
-    ip = closure.proto.code.as_ptr();
-    registers = unsafe { thread.stack.as_mut_ptr().add(cur_base) };
-    dispatch!();
 }
 
 /// return R[values], ..., R[values+count-2]
@@ -1092,66 +1156,21 @@ extern "rust-preserve-none" fn op_return<'gc>(
     helpers!(instruction, mc, thread, registers, ip, handlers);
     let (values, count) = args!(Instruction::RETURN { values, count });
 
-    // If the departing frame has a continuation, fill in the return-value
-    // location and tail-call it. The continuation pops the frame and restores
-    // the caller — op_return does no cleanup in this path.
-    let (cur_base, continuation) = {
-        let frame = thread.frames.last().unwrap();
-        (frame.base, frame.continuation)
-    };
-    if let Some(mut cont) = continuation {
-        let nret = if count == 0 { 0 } else { count as usize - 1 };
-        cont.results_base = cur_base + values as usize;
-        cont.nret = nret as u8;
-        thread.frames.last_mut().unwrap().continuation = Some(cont);
-        become (cont.func)(instruction, mc, thread, registers, ip, handlers);
-    }
-
-    let num_results = thread.frames.last().unwrap().num_results;
+    let cur_base = thread.frames.last().unwrap().base;
     let nret = if count == 0 { 0 } else { count as usize - 1 };
+    let values_base = cur_base + values as usize;
 
-    // Close upvalues and TBC variables for the departing frame
-    close_upvalues(mc, thread, cur_base);
-    close_tbc_vars(mc, thread, cur_base);
-
-    // Pop current frame
-    thread.frames.pop();
-
-    if thread.frames.is_empty() {
-        // Top-level return — copy results to stack base and finish.
-        // Truncate the stack to `nret` so the host can read back `stack[0..nret]`
-        // as the return values.
-        let dst_start = cur_base - 1; // func slot
-        for i in 0..nret {
-            thread.stack[dst_start + i] = thread.stack[cur_base + values as usize + i];
+    match frame_return(mc, thread, values_base, nret) {
+        FrameReturn::Continuation(func) => {
+            become func(instruction, mc, thread, registers, ip, handlers);
         }
-        thread.stack.truncate(dst_start + nret);
-        thread.status = ThreadStatus::Dead;
-        return Ok(());
+        FrameReturn::TopLevel => return Ok(()),
+        FrameReturn::Caller { new_base, new_ip } => {
+            ip = new_ip;
+            registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
+            dispatch!();
+        }
     }
-
-    // Copy return values into caller's expected slots
-    let dst_start = cur_base - 1; // func slot in caller's frame
-    let wanted = if num_results == 0 {
-        0
-    } else {
-        num_results as usize - 1
-    };
-    let to_copy = nret.min(wanted);
-    for i in 0..to_copy {
-        thread.stack[dst_start + i] = thread.stack[cur_base + values as usize + i];
-    }
-    // Nil-fill remaining expected results
-    for i in to_copy..wanted {
-        thread.stack[dst_start + i] = Value::Nil;
-    }
-
-    // Restore caller's ip and registers
-    let caller = thread.frames.last().unwrap();
-    let caller_base = caller.base;
-    ip = unsafe { caller.closure.proto.code.as_ptr().add(caller.pc) };
-    registers = unsafe { thread.stack.as_mut_ptr().add(caller_base) };
-    dispatch!();
 }
 
 // ---------------------------------------------------------------------------
@@ -1552,6 +1571,108 @@ fn write_upvalue<'gc>(
     }
 }
 
+/// Invoke a native callback. Clips the thread's stack so the callback sees
+/// exactly `[args_base .. args_base + argc]` as its arguments, constructs a
+/// `Stack` / `NativeContext`, and calls the function. On return, any values
+/// the callback left on the stack above `args_base` are its return values;
+/// the count is `thread.stack.len() - args_base`.
+pub(crate) fn invoke_native<'gc>(
+    mc: &Mutation<'gc>,
+    thread: &mut ThreadState<'gc>,
+    nc: &NativeClosure<'gc>,
+    args_base: usize,
+    argc: usize,
+) -> Result<usize, NativeError> {
+    let end = args_base + argc;
+    if thread.stack.len() > end {
+        thread.stack.truncate(end);
+    } else if thread.stack.len() < end {
+        thread.stack.resize(end, Value::Nil);
+    }
+    let ctx = NativeContext {
+        mc,
+        upvalues: &nc.upvalues,
+    };
+    let stack = Stack::new(&mut thread.stack, args_base);
+    (nc.function)(ctx, stack)?;
+    Ok(thread.stack.len() - args_base)
+}
+
+/// What should happen after a frame returns with values at
+/// `stack[values_base .. values_base + nret]`. Produced by [`frame_return`],
+/// consumed by `op_return` and the native-tailcall path in `op_tailcall`.
+pub(crate) enum FrameReturn {
+    /// A continuation was attached to the departing frame; caller must
+    /// tail-call `func`. The continuation's `results_base` / `nret` have
+    /// already been written back into the top frame.
+    Continuation(ContinuationFn),
+    /// The departing frame was the outermost one; thread is now `Dead`.
+    /// Caller should return `Ok(())` from the handler.
+    TopLevel,
+    /// Normal return to the caller frame, which has been restored to the
+    /// top of the frame stack. Caller updates `ip` / `registers` and
+    /// dispatches.
+    Caller {
+        new_base: usize,
+        new_ip: *const Instruction,
+    },
+}
+
+/// Unwind the top-of-stack frame assuming it returned the values at
+/// `stack[values_base .. values_base + nret]`. Shared by the bytecode
+/// `RETURN` handler and the native-tailcall path.
+pub(crate) fn frame_return<'gc>(
+    mc: &Mutation<'gc>,
+    thread: &mut ThreadState<'gc>,
+    values_base: usize,
+    nret: usize,
+) -> FrameReturn {
+    let (cur_base, num_results, continuation) = {
+        let f = thread.frames.last().unwrap();
+        (f.base, f.num_results, f.continuation)
+    };
+
+    if let Some(mut cont) = continuation {
+        cont.results_base = values_base;
+        cont.nret = nret as u8;
+        thread.frames.last_mut().unwrap().continuation = Some(cont);
+        return FrameReturn::Continuation(cont.func);
+    }
+
+    close_upvalues(mc, thread, cur_base);
+    close_tbc_vars(mc, thread, cur_base);
+    thread.frames.pop();
+
+    if thread.frames.is_empty() {
+        let dst_start = cur_base - 1;
+        for i in 0..nret {
+            thread.stack[dst_start + i] = thread.stack[values_base + i];
+        }
+        thread.stack.truncate(dst_start + nret);
+        thread.status = ThreadStatus::Dead;
+        return FrameReturn::TopLevel;
+    }
+
+    let dst_start = cur_base - 1;
+    let wanted = if num_results == 0 {
+        0
+    } else {
+        num_results as usize - 1
+    };
+    let to_copy = nret.min(wanted);
+    for i in 0..to_copy {
+        thread.stack[dst_start + i] = thread.stack[values_base + i];
+    }
+    for i in to_copy..wanted {
+        thread.stack[dst_start + i] = Value::Nil;
+    }
+
+    let caller = thread.frames.last().unwrap();
+    let new_base = caller.base;
+    let new_ip = unsafe { caller.closure.proto.code.as_ptr().add(caller.pc) };
+    FrameReturn::Caller { new_base, new_ip }
+}
+
 /// Close all open upvalues pointing at stack indices >= `start_idx`.
 /// Each open upvalue is converted to Closed by capturing the current stack value.
 fn close_upvalues<'gc>(mc: &Mutation<'gc>, thread: &mut ThreadState<'gc>, start_idx: usize) {
@@ -1678,26 +1799,34 @@ fn resolve_newindex_chain<'gc>(
     None
 }
 
-/// Walk the `__call` chain at `thread.stack[func_idx]` until we hit a Lua
-/// closure, shifting args right by one on each hop to prepend the current
-/// callee as the first argument (Lua 5.4 `tryfuncTM` behavior). Returns the
-/// resolved closure and the (possibly adjusted) `nargs`, or `None` if the
-/// chain is unresolvable: non-callable value, native target (TODO), variadic
-/// call with `__call` (TODO), or `MAX_TAG_LOOP` exhaustion. Callers raise
-/// on `None`.
+/// The resolved target of a call: either a Lua bytecode closure (which the
+/// caller must push a frame for) or a native Rust callback (which the caller
+/// invokes inline).
+pub(crate) enum CallTarget<'gc> {
+    Lua(Gc<'gc, LuaClosure<'gc>>),
+    Native(&'gc NativeClosure<'gc>),
+}
+
+/// Walk the `__call` chain at `thread.stack[func_idx]` until we hit a
+/// callable target, shifting args right by one on each hop to prepend the
+/// current callee as the first argument (Lua 5.4 `tryfuncTM` behavior).
+/// Returns the resolved target and the (possibly adjusted) `nargs`, or
+/// `None` if the chain is unresolvable: non-callable value, variadic call
+/// with `__call` (TODO), or `MAX_TAG_LOOP` exhaustion. Callers raise on
+/// `None`.
 #[inline]
 fn resolve_call_chain<'gc>(
     mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     func_idx: usize,
     mut nargs: u8,
-) -> Option<(Gc<'gc, LuaClosure<'gc>>, u8)> {
+) -> Option<(CallTarget<'gc>, u8)> {
     for _ in 0..MAX_TAG_LOOP {
         let func_val = thread.stack[func_idx];
         if let Some(f) = func_val.get_function() {
-            return match &*f.inner() {
-                FunctionKind::Lua(c) => Some((*c, nargs)),
-                FunctionKind::Native(_) => None,
+            return match f.inner().as_ref() {
+                FunctionKind::Lua(c) => Some((CallTarget::Lua(*c), nargs)),
+                FunctionKind::Native(nc) => Some((CallTarget::Native(nc), nargs)),
             };
         }
         let mm = match func_val.get_table() {
@@ -1803,7 +1932,14 @@ fn schedule_meta_call<'gc>(
     // function slot), so `args.len() + 1`.
     debug_assert!(args.len() < u8::MAX as usize);
     let nargs = (args.len() + 1) as u8;
-    let (closure, final_nargs) = resolve_call_chain(mc, thread, scratch_func, nargs)?;
+    let (target, final_nargs) = resolve_call_chain(mc, thread, scratch_func, nargs)?;
+    // TODO: support native metamethod targets. Today `__call`/`__index`/etc.
+    // resolving to a native callback is rejected — handling it requires either
+    // a Callback-kind frame or a per-continuation native dispatch path.
+    let closure = match target {
+        CallTarget::Lua(c) => c,
+        CallTarget::Native(_) => return None,
+    };
     let actual_args = final_nargs as usize - 1;
 
     // Grow stack to fit the resolved closure's full frame.
