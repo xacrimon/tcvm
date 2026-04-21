@@ -184,6 +184,61 @@ mod tests {
     // like `return add(2, 3)` inside a nested function.
 
     #[test]
+    fn nested_function_reads_global() {
+        // Previously panicked in GETTABUP because the nested function's
+        // `upvalue_desc` didn't include _ENV. With _ENV routed through
+        // `resolve_or_capture`, the nested closure picks up _ENV from
+        // the enclosing chunk's upvalue 0.
+        let mut lua = Lua::new();
+        let ex = lua
+            .try_enter(|ctx| -> Result<_, LoadError> {
+                let add =
+                    Function::new_native(ctx.mutation(), native_add as NativeFn, Box::new([]));
+                let key = Value::String(LuaString::new(ctx.mutation(), b"add"));
+                ctx.globals()
+                    .raw_set(ctx.mutation(), key, Value::Function(add));
+
+                let chunk = ctx.load(
+                    "local function f() return add(2, 3) end return f()",
+                    Some("nested_global"),
+                )?;
+                Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+            })
+            .expect("load + register");
+        let result: i64 = lua.execute(&ex).expect("run");
+        assert_eq!(result, 5);
+    }
+
+    #[test]
+    fn doubly_nested_function_reads_global() {
+        // _ENV capture must cascade: inner reads a global, so the
+        // middle function captures _ENV from the main chunk and the
+        // inner captures it from the middle.
+        let mut lua = Lua::new();
+        let ex = lua
+            .try_enter(|ctx| -> Result<_, LoadError> {
+                let add =
+                    Function::new_native(ctx.mutation(), native_add as NativeFn, Box::new([]));
+                let key = Value::String(LuaString::new(ctx.mutation(), b"add"));
+                ctx.globals()
+                    .raw_set(ctx.mutation(), key, Value::Function(add));
+
+                let chunk = ctx.load(
+                    "local function outer() \
+                       local function inner() return add(1, 2) end \
+                       return inner() \
+                     end \
+                     return outer()",
+                    Some("cascade_env"),
+                )?;
+                Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+            })
+            .expect("load + register");
+        let result: i64 = lua.execute(&ex).expect("run");
+        assert_eq!(result, 3);
+    }
+
+    #[test]
     fn native_entry_via_executor_start() {
         // Top-level native entry: Executor::start with a native function
         // directly, step runs the callback and take_result reads results.

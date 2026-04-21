@@ -1,5 +1,6 @@
 ---
 source: src/compiler/snapshot_tests.rs
+assertion_line: 240
 expression: output
 ---
 ; function (params=0, vararg=true, stack=1, upvalues=1)
@@ -11,12 +12,14 @@ expression: output
 0002  RETURN          R0 count=1
 
 ; prototype 0:
-  ; function (params=0, vararg=false, stack=7, upvalues=0)
+  ; function (params=0, vararg=false, stack=7, upvalues=1)
   ; constants:
   ;   K0 = 0
   ;   K1 = 10000
   ;   K2 = 1
   ;   K3 = "print"
+  ; upvalues:
+  ;   U0 = upvalue U0
   ; code:
   0000  LOAD            R0 K0  ; 0
   0001  LOAD            R1 K1  ; 10000

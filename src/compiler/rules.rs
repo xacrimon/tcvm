@@ -12,7 +12,6 @@ use crate::parser::syntax::{
     FuncCall, FuncExpr, Goto, Ident, If, Index, Label, Literal, LiteralValue, MethodCall, PrefixOp,
     PrefixOperator, Repeat, Return, Root, Stmt, Table, TableEntry, While,
 };
-use std::cell::RefCell;
 use std::mem;
 
 /// Sentinel value used as the `dst` field of a `TESTSET` while the real
@@ -56,6 +55,14 @@ struct VariableData {
 // Compilation context
 // ---------------------------------------------------------------------------
 
+/// Implemented by a function's compilation context so a nested function
+/// can ask what `UpValueDescriptor` it should use to reference a free
+/// variable from this scope. The parent captures from its own parent
+/// on demand as the lookup cascades upward.
+trait UpvalueResolver {
+    fn resolve_for_child(&mut self, name: &str) -> Option<UpValueDescriptor>;
+}
+
 struct Ctx<'gc, 'a> {
     interner: &'a TokenInterner,
     mc: &'a Mutation<'gc>,
@@ -74,11 +81,14 @@ struct Ctx<'gc, 'a> {
     /// Named labels for goto/label statements (name → label index).
     goto_labels: HashMap<String, u16>,
 
-    /// Callback to resolve a name as an upvalue from the enclosing function.
-    /// Returns the upvalue index if found.
-    capture: Box<dyn FnMut(&str) -> Option<u8> + 'a>,
-    /// Upvalue descriptors accumulated for this function.
-    upvalue_desc: Vec<UpValueDescriptor>,
+    /// Parent function's resolver, or `None` for the main chunk. A nested
+    /// function calls this to walk the lexical chain when it encounters a
+    /// free variable.
+    capture: Option<&'a mut dyn UpvalueResolver>,
+    /// This function's upvalue list, with names retained so children can
+    /// look entries up by name. Flattened to
+    /// `Chunk::upvalue_desc: Box<[UpValueDescriptor]>` at assembly time.
+    upvalues: Vec<(String, UpValueDescriptor)>,
 }
 
 impl<'gc, 'a> Ctx<'gc, 'a> {
@@ -635,10 +645,53 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         self.alloc_constant(Value::String(lua_str))
     }
 
+    /// Resolve `name` into an index in THIS function's upvalue list,
+    /// capturing on first reference (via the parent's
+    /// `resolve_for_child`). Returns `None` if the name isn't reachable
+    /// through any enclosing scope.
+    fn resolve_or_capture(&mut self, name: &str) -> Option<u8> {
+        if let Some(i) = self.upvalues.iter().position(|(n, _)| n == name) {
+            return Some(i as u8);
+        }
+        let parent = self.capture.as_deref_mut()?;
+        let desc = parent.resolve_for_child(name)?;
+        let i = self.upvalues.len() as u8;
+        self.upvalues.push((name.to_owned(), desc));
+        Some(i)
+    }
+
     /// Resolve a variable name as an upvalue from enclosing scopes.
-    /// Deduplication is handled inside the capture callback (see `compile_nested`).
+    /// Returns the index in this function's upvalue list, capturing on
+    /// first reference.
     fn resolve_upvalue(&mut self, name: &str) -> Option<u8> {
-        (self.capture)(name)
+        self.resolve_or_capture(name)
+    }
+}
+
+impl<'gc, 'a> UpvalueResolver for Ctx<'gc, 'a> {
+    /// Given a free-variable reference from a direct child of this
+    /// function, return the `UpValueDescriptor` the child should put in
+    /// its own upvalue list. `ParentLocal(reg)` when `name` is a local
+    /// here; `ParentUpvalue(i)` when it sits in this function's upvalue
+    /// list (captured now if necessary).
+    fn resolve_for_child(&mut self, name: &str) -> Option<UpValueDescriptor> {
+        // 1. Own local? The child references our register directly — no
+        //    entry is added to our own upvalues.
+        if let Some(reg) = self.resolve_local(name).map(|d| d.register.0) {
+            return Some(UpValueDescriptor::ParentLocal(reg));
+        }
+        // 2. Already captured in our upvalue list?
+        if let Some(i) = self.upvalues.iter().position(|(n, _)| n == name) {
+            return Some(UpValueDescriptor::ParentUpvalue(i as u8));
+        }
+        // 3. Cascade to our own parent; if it resolves, we capture the
+        //    returned descriptor into our upvalue list and the child
+        //    references that new slot.
+        let parent = self.capture.as_deref_mut()?;
+        let desc = parent.resolve_for_child(name)?;
+        let i = self.upvalues.len() as u8;
+        self.upvalues.push((name.to_owned(), desc));
+        Some(UpValueDescriptor::ParentUpvalue(i))
     }
 }
 
@@ -689,36 +742,37 @@ pub fn compile<'gc>(
     root: &Root,
     interner: &TokenInterner,
 ) -> Result<Gc<'gc, Prototype<'gc>>, CompileError> {
-    // The main chunk has one upvalue: _ENV (index 0).
-    let mut no_parent_capture = |_name: &str| -> Option<u8> { None };
-
-    let mut chunk = compile_function_to_chunk(
+    let chunk = compile_function_to_chunk(
         mc,
         interner,
-        &mut no_parent_capture,
+        None, // main chunk has no enclosing function
         root.block(),
         std::iter::empty(),
         true, // main chunk is vararg
         0,
         None,
+        // Pre-seed `_ENV` at upvalue 0. The runtime wiring in
+        // `src/lua/context.rs` (ctx.load) sets the top-level closure's
+        // upvalues directly, so the descriptor here is purely a
+        // placeholder — nested functions reference this slot by
+        // cascading ParentUpvalue(0).
+        vec![("_ENV".to_owned(), UpValueDescriptor::ParentLocal(0))],
     )?;
-
-    chunk.upvalue_desc = vec![UpValueDescriptor::ParentLocal(0)]; // _ENV
     Ok(chunk.assemble(mc))
 }
 
 /// Compile a function body into a Chunk (not yet assembled).
-/// The caller is responsible for setting `chunk.upvalue_desc` and calling `chunk.assemble(mc)`.
 #[allow(clippy::too_many_arguments)]
-fn compile_function_to_chunk<'gc>(
-    mc: &Mutation<'gc>,
-    interner: &TokenInterner,
-    parent_capture: &mut dyn FnMut(&str) -> Option<u8>,
+fn compile_function_to_chunk<'gc, 'a>(
+    mc: &'a Mutation<'gc>,
+    interner: &'a TokenInterner,
+    parent_capture: Option<&'a mut dyn UpvalueResolver>,
     stmts: impl Iterator<Item = Stmt>,
     params: impl Iterator<Item = Ident>,
     is_vararg: bool,
     arity: u8,
     source: Option<LuaString<'gc>>,
+    initial_upvalues: Vec<(String, UpValueDescriptor)>,
 ) -> Result<Chunk<'gc>, CompileError> {
     let mut chunk = Chunk::new();
     chunk.is_vararg = is_vararg;
@@ -734,8 +788,8 @@ fn compile_function_to_chunk<'gc>(
         scope_register_base: Vec::new(),
         scope_close: Vec::new(),
         goto_labels: HashMap::new(),
-        capture: Box::new(parent_capture),
-        upvalue_desc: Vec::new(),
+        capture: parent_capture,
+        upvalues: initial_upvalues,
     };
 
     ctx.push_scope();
@@ -782,7 +836,8 @@ fn compile_function_to_chunk<'gc>(
         ctx.chunk.tape.push(return_instr);
     }
 
-    // The caller must set chunk.upvalue_desc before assembling.
+    // Flatten the named upvalue list into the chunk's descriptor array.
+    ctx.chunk.upvalue_desc = ctx.upvalues.into_iter().map(|(_, d)| d).collect();
     Ok(ctx.chunk)
 }
 
@@ -1089,9 +1144,12 @@ fn compile_assign_lhs(ctx: &mut Ctx, target: Expr, value: u8) -> Result<(), Comp
 
             // Global: _ENV[name]
             let key = ctx.alloc_string_constant(name.as_bytes())?;
+            let env_idx = ctx
+                .resolve_or_capture("_ENV")
+                .ok_or_else(|| ice("_ENV must resolve; main chunk pre-seeds it"))?;
             ctx.emit(Instruction::SETTABUP {
                 src: value,
-                idx: 0,
+                idx: env_idx,
                 key,
             });
             Ok(())
@@ -1172,7 +1230,12 @@ fn compile_func_body(
     Ok(dst)
 }
 
-/// Compile a nested function, handling upvalue capture from the parent context.
+/// Compile a nested function, handling upvalue capture from the parent
+/// context. Upvalues are resolved on demand: the child's
+/// `resolve_or_capture` calls back into `ctx` (the parent) through the
+/// `UpvalueResolver` trait, which cascades upward from any depth and
+/// inserts `ParentLocal` / `ParentUpvalue` descriptors into each
+/// function's list as it goes.
 fn compile_nested<'gc>(
     ctx: &mut Ctx<'gc, '_>,
     stmts: Vec<Stmt>,
@@ -1180,71 +1243,21 @@ fn compile_nested<'gc>(
     is_vararg: bool,
     arity: u8,
 ) -> Result<Gc<'gc, Prototype<'gc>>, CompileError> {
-    // Snapshot parent scope for the capture closure
-    let scope_snapshot: Vec<HashMap<String, (u8, bool)>> = ctx
-        .scope
-        .iter()
-        .map(|s| {
-            s.iter()
-                .map(|(k, v)| (k.clone(), (v.register.0, v.is_const)))
-                .collect()
-        })
-        .collect();
-
-    // Extract what we need from ctx before creating the closure,
-    // to avoid borrowing all of ctx in the closure.
     let mc = ctx.mc;
     let interner = ctx.interner;
-    let parent_capture = &mut *ctx.capture;
+    let parent: &mut dyn UpvalueResolver = ctx;
 
-    let capture_list = RefCell::new(Vec::<(String, UpValueDescriptor)>::new());
-
-    let mut capture_fn = |name: &str| -> Option<u8> {
-        let mut list = capture_list.borrow_mut();
-
-        // Already captured?
-        for (i, (n, _)) in list.iter().enumerate() {
-            if n == name {
-                return Some(i as u8);
-            }
-        }
-
-        // Search parent's local scopes
-        for scope in scope_snapshot.iter().rev() {
-            if let Some(&(reg, _)) = scope.get(name) {
-                let idx = list.len() as u8;
-                list.push((name.to_owned(), UpValueDescriptor::ParentLocal(reg)));
-                return Some(idx);
-            }
-        }
-
-        // Delegate to parent's upvalue resolution
-        if let Some(parent_idx) = parent_capture(name) {
-            let idx = list.len() as u8;
-            list.push((
-                name.to_owned(),
-                UpValueDescriptor::ParentUpvalue(parent_idx),
-            ));
-            return Some(idx);
-        }
-
-        None
-    };
-
-    let mut chunk = compile_function_to_chunk(
+    let chunk = compile_function_to_chunk(
         mc,
         interner,
-        &mut capture_fn,
+        Some(parent),
         stmts.into_iter(),
         params.into_iter(),
         is_vararg,
         arity,
         None,
+        Vec::new(),
     )?;
-
-    // Inject the upvalue descriptors that were accumulated by capture_fn
-    let list = capture_list.into_inner();
-    chunk.upvalue_desc = list.into_iter().map(|(_, desc)| desc).collect();
 
     Ok(chunk.assemble(mc))
 }
@@ -1323,9 +1336,12 @@ fn compile_expr_ident(
     // Global: _ENV[name]
     let key = ctx.alloc_string_constant(name.as_bytes())?;
     let dst = ctx.dst_or_alloc(dst)?;
+    let env_idx = ctx
+        .resolve_or_capture("_ENV")
+        .ok_or_else(|| ice("_ENV must resolve; main chunk pre-seeds it"))?;
     ctx.emit(Instruction::GETTABUP {
         dst: dst.0,
-        idx: 0,
+        idx: env_idx,
         key,
     });
     Ok(dst)
