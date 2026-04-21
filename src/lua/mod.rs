@@ -94,6 +94,7 @@ impl Lua {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::env::function::{Function, NativeFn};
     use crate::env::{LuaString, Value};
 
     #[test]
@@ -139,5 +140,73 @@ mod tests {
             })
             .expect("load");
         lua.execute::<()>(&ex).expect("run");
+    }
+
+    // Native callback used by the native_* tests below. Integer add with an
+    // arity/type check so we can also exercise the NativeError path.
+    fn native_add<'gc>(
+        _ctx: crate::env::NativeContext<'gc, '_>,
+        mut stack: crate::env::Stack<'gc, '_>,
+    ) -> Result<(), crate::env::NativeError> {
+        let (a, b) = (stack.get(0), stack.get(1));
+        let sum = match (a, b) {
+            (Value::Integer(x), Value::Integer(y)) => Value::Integer(x + y),
+            _ => return Err(crate::env::NativeError::new("bad args")),
+        };
+        stack.replace(&[sum]);
+        Ok(())
+    }
+
+    #[test]
+    fn native_call_from_lua() {
+        // Lua calls a Rust-native `add(2, 3)` via CALL; expects 5.
+        let mut lua = Lua::new();
+        let ex = lua
+            .try_enter(|ctx| -> Result<_, LoadError> {
+                let add =
+                    Function::new_native(ctx.mutation(), native_add as NativeFn, Box::new([]));
+                let key = Value::String(LuaString::new(ctx.mutation(), b"add"));
+                ctx.globals()
+                    .raw_set(ctx.mutation(), key, Value::Function(add));
+
+                let chunk = ctx.load("return add(2, 3)", Some("native_call"))?;
+                Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+            })
+            .expect("load + register");
+        let result: i64 = lua.execute(&ex).expect("run");
+        assert_eq!(result, 5);
+    }
+
+    // TODO: add a test that exercises op_tailcall's native branch. The
+    // current compiler does not emit TAILCALL — every call site uses
+    // CALL + RETURN — so a Lua-source test can't reach it yet. Once the
+    // compiler emits TAILCALL (or via a hand-built Prototype), add a test
+    // like `return add(2, 3)` inside a nested function.
+
+    #[test]
+    fn native_entry_via_executor_start() {
+        // Top-level native entry: Executor::start with a native function
+        // directly, step runs the callback and take_result reads results.
+        let mut lua = Lua::new();
+        let ex = lua.enter(|ctx| {
+            let add = Function::new_native(ctx.mutation(), native_add as NativeFn, Box::new([]));
+            ctx.stash(Executor::start(ctx, add, (10i64, 32i64)))
+        });
+        let result: i64 = lua.execute(&ex).expect("run native entry");
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn native_error_becomes_runtime_error() {
+        // A NativeError should surface as RuntimeError::Opcode (message
+        // dropped at the VM boundary by design in this MVP).
+        let mut lua = Lua::new();
+        let ex = lua.enter(|ctx| {
+            let add = Function::new_native(ctx.mutation(), native_add as NativeFn, Box::new([]));
+            // Pass a float to trigger native_add's Err path (it requires Integer).
+            ctx.stash(Executor::start(ctx, add, (1i64, 2.5f64)))
+        });
+        let err = lua.execute::<i64>(&ex).expect_err("should error");
+        assert!(matches!(err, RuntimeError::Opcode { .. }));
     }
 }
