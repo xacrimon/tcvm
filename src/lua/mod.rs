@@ -177,11 +177,65 @@ mod tests {
         assert_eq!(result, 5);
     }
 
-    // TODO: add a test that exercises op_tailcall's native branch. The
-    // current compiler does not emit TAILCALL — every call site uses
-    // CALL + RETURN — so a Lua-source test can't reach it yet. Once the
-    // compiler emits TAILCALL (or via a hand-built Prototype), add a test
-    // like `return add(2, 3)` inside a nested function.
+    #[test]
+    fn native_tailcall_from_lua() {
+        // Exercise op_tailcall's native branch. The compiler currently
+        // emits CALL + RETURN for every call site, so we hand-build a
+        // Prototype that issues a TAILCALL into a native function:
+        //
+        //     GETUPVAL R0 U0     -- load `add` from upvalue 0
+        //     LOAD     R1 K0     -- R1 = 2
+        //     LOAD     R2 K1     -- R2 = 3
+        //     TAILCALL R0 args=3 -- tail-call add(2, 3)
+        //
+        // The Lua closure wraps one upvalue holding the native `add`.
+        // frame_return's TopLevel path should unwind the sole frame
+        // and leave the result at stack[0] for take_result.
+        use crate::dmm::{Gc, RefLock};
+        use crate::env::Prototype;
+        use crate::env::function::{UpvalueState, Upvalue as UpvalueT};
+        use crate::instruction::{Instruction, UpValueDescriptor};
+
+        let mut lua = Lua::new();
+        let ex = lua.enter(|ctx| {
+            let mc = ctx.mutation();
+            let add =
+                Function::new_native(mc, native_add as NativeFn, Box::new([]));
+
+            let code: Box<[Instruction]> = Box::new([
+                Instruction::GETUPVAL { dst: 0, idx: 0 },
+                Instruction::LOAD { dst: 1, idx: 0 },
+                Instruction::LOAD { dst: 2, idx: 1 },
+                Instruction::TAILCALL { func: 0, args: 3 },
+            ]);
+            let proto = Gc::new(
+                mc,
+                Prototype {
+                    code,
+                    constants: Box::new([Value::Integer(2), Value::Integer(3)]),
+                    prototypes: Box::new([]),
+                    // Placeholder; the main-chunk closure is host-instantiated,
+                    // not created via op_closure, so the descriptor isn't read.
+                    upvalue_desc: Box::new([UpValueDescriptor::ParentLocal(0)]),
+                    num_params: 0,
+                    is_vararg: false,
+                    max_stack_size: 3,
+                    num_upvalues: 1,
+                    source: None,
+                },
+            );
+
+            let add_uv: UpvalueT<'_> = Gc::new(
+                mc,
+                RefLock::new(UpvalueState::Closed(Value::Function(add))),
+            );
+            let func = Function::new_lua(mc, proto, Box::from([add_uv]));
+
+            ctx.stash(Executor::start(ctx, func, ()))
+        });
+        let result: i64 = lua.execute(&ex).expect("run");
+        assert_eq!(result, 5);
+    }
 
     #[test]
     fn nested_function_reads_global() {
