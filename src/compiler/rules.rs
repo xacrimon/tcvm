@@ -1987,11 +1987,14 @@ fn compile_logical_or_desc(
     Ok(rhs)
 }
 
-fn compile_expr_func_call(
+/// Compile the target expression and arguments of a plain (non-method)
+/// call into consecutive registers `func`, `func+1`, `func+2`, ... ready
+/// for a `CALL` or `TAILCALL` instruction. Returns the function register
+/// and argument count (excluding the function slot itself).
+fn emit_func_call_setup(
     ctx: &mut Ctx,
-    item: FuncCall,
-    want: usize,
-) -> Result<Vec<RegisterIndex>, CompileError> {
+    item: &FuncCall,
+) -> Result<(RegisterIndex, usize), CompileError> {
     let target = item
         .target()
         .ok_or_else(|| ice("func call without target"))?;
@@ -2000,12 +2003,10 @@ fn compile_expr_func_call(
     let args: Vec<_> = item.args().map(|a| a.collect()).unwrap_or_default();
     let nargs = args.len();
 
-    // Compile arguments into consecutive registers after func
     for (i, arg_expr) in args.into_iter().enumerate() {
         let expected_reg = RegisterIndex(func.0 + 1 + i as u8);
         let arg = compile_expr_to_reg(ctx, arg_expr, Some(expected_reg))?;
         if arg != expected_reg {
-            // Need to ensure we have the register allocated
             while ctx.chunk.register_count <= expected_reg.0 as usize {
                 ctx.alloc_register()?;
             }
@@ -2015,6 +2016,16 @@ fn compile_expr_func_call(
             });
         }
     }
+
+    Ok((func, nargs))
+}
+
+fn compile_expr_func_call(
+    ctx: &mut Ctx,
+    item: FuncCall,
+    want: usize,
+) -> Result<Vec<RegisterIndex>, CompileError> {
+    let (func, nargs) = emit_func_call_setup(ctx, &item)?;
 
     ctx.emit(Instruction::CALL {
         func: func.0,
@@ -2030,11 +2041,39 @@ fn compile_expr_func_call(
     Ok(results)
 }
 
-fn compile_expr_method_call(
+/// Tail-call form of [`compile_expr_func_call`]: emits `TAILCALL` with
+/// no trailing `RETURN` (the VM's TAILCALL is self-unwinding — the Lua
+/// path replaces the current frame, the native path goes through
+/// `frame_return`).
+fn compile_tail_func_call(ctx: &mut Ctx, item: FuncCall) -> Result<(), CompileError> {
+    let (func, nargs) = emit_func_call_setup(ctx, &item)?;
+    ctx.emit(Instruction::TAILCALL {
+        func: func.0,
+        args: nargs as u8 + 1,
+    });
+    Ok(())
+}
+
+/// Tail-call form of [`compile_expr_method_call`]. Same setup as the
+/// CALL variant, but emits `TAILCALL` and does not produce a result
+/// register list.
+fn compile_tail_method_call(ctx: &mut Ctx, item: MethodCall) -> Result<(), CompileError> {
+    let (func, nargs) = emit_method_call_setup(ctx, &item)?;
+    ctx.emit(Instruction::TAILCALL {
+        func: func.0,
+        args: nargs as u8 + 1,
+    });
+    Ok(())
+}
+
+/// Set up a method call `obj:m(args)` in registers `func`, `func+1=self`,
+/// `func+2..func+1+nargs` so a `CALL` or `TAILCALL` can be emitted with
+/// that register as its function slot. Returns the function register and
+/// total argument count (including the implicit `self`).
+fn emit_method_call_setup(
     ctx: &mut Ctx,
-    item: MethodCall,
-    want: usize,
-) -> Result<Vec<RegisterIndex>, CompileError> {
+    item: &MethodCall,
+) -> Result<(RegisterIndex, usize), CompileError> {
     let object_expr = item
         .object()
         .ok_or_else(|| ice("method call without object"))?;
@@ -2047,7 +2086,6 @@ fn compile_expr_method_call(
 
     let object = compile_expr_to_reg(ctx, object_expr, None)?;
 
-    // Load method name as key
     let key_idx = ctx.alloc_string_constant(method_name.as_bytes())?;
     let key_reg = ctx.alloc_register()?;
     ctx.emit(Instruction::LOAD {
@@ -2055,7 +2093,6 @@ fn compile_expr_method_call(
         idx: key_idx,
     });
 
-    // Get the method function: R[func] = R[object][key]
     let func = ctx.alloc_register()?;
     ctx.emit(Instruction::GETTABLE {
         dst: func.0,
@@ -2063,7 +2100,6 @@ fn compile_expr_method_call(
         key: key_reg.0,
     });
 
-    // First argument is self (the object)
     let self_reg = RegisterIndex(func.0 + 1);
     while ctx.chunk.register_count <= self_reg.0 as usize {
         ctx.alloc_register()?;
@@ -2073,7 +2109,6 @@ fn compile_expr_method_call(
         src: object.0,
     });
 
-    // Compile remaining arguments
     let args: Vec<_> = item.args().map(|a| a.collect()).unwrap_or_default();
     let nargs = args.len() + 1; // +1 for self
 
@@ -2090,6 +2125,16 @@ fn compile_expr_method_call(
             });
         }
     }
+
+    Ok((func, nargs))
+}
+
+fn compile_expr_method_call(
+    ctx: &mut Ctx,
+    item: MethodCall,
+    want: usize,
+) -> Result<Vec<RegisterIndex>, CompileError> {
+    let (func, nargs) = emit_method_call_setup(ctx, &item)?;
 
     ctx.emit(Instruction::CALL {
         func: func.0,
@@ -2136,8 +2181,31 @@ fn compile_break(ctx: &mut Ctx, _item: Break) -> Result<(), CompileError> {
 }
 
 fn compile_return(ctx: &mut Ctx, item: Return) -> Result<(), CompileError> {
-    let exprs: Vec<_> = item.exprs().map(|e| e.collect()).unwrap_or_default();
+    let mut exprs: Vec<_> = item.exprs().map(|e| e.collect()).unwrap_or_default();
 
+    // Tail-call optimisation: `return f(args)` / `return obj:m(args)` —
+    // exactly one return expression, directly a call. Matches Lua 5.4's
+    // tail-call rule.
+    //
+    // TODO: Lua 5.4 does NOT tail-call parenthesised `return (f())`
+    // because the parens force adjust-to-one. The parser here doesn't
+    // surface a distinct paren node, so we over-eagerly tail-call that
+    // form for now.
+    if exprs.len() == 1 {
+        let only = exprs.pop().unwrap();
+        match only {
+            Expr::FuncCall(call) => return compile_tail_func_call(ctx, call),
+            Expr::Method(call) => return compile_tail_method_call(ctx, call),
+            other => exprs.push(other),
+        }
+    }
+
+    compile_return_generic(ctx, exprs)
+}
+
+/// Compile a plain `return ...` — the fallback for any return that
+/// doesn't qualify for `TAILCALL`.
+fn compile_return_generic(ctx: &mut Ctx, exprs: Vec<Expr>) -> Result<(), CompileError> {
     if exprs.is_empty() {
         ctx.emit(Instruction::RETURN {
             values: 0,

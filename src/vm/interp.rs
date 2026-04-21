@@ -1089,14 +1089,17 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
     match target {
         CallTarget::Lua(closure) => {
             let cur_base = thread.frames.last().unwrap().base;
-            // Move function + arguments down to current frame's base - 1
+            // Close upvalues for the current frame BEFORE we overwrite
+            // its stack slots with the tail-call's arguments; otherwise
+            // an open upvalue pointing into this frame captures the
+            // arg value instead of the local it used to reference.
+            close_upvalues(mc, thread, cur_base);
+            // Move function + arguments down to current frame's base.
             let nargs = if nargs == 0 { 0 } else { nargs as usize - 1 };
             let src_start = func_idx + 1;
             for i in 0..nargs {
                 thread.stack[cur_base + i] = thread.stack[src_start + i];
             }
-            // Close upvalues for the current frame
-            close_upvalues(mc, thread, cur_base);
             // Replace current frame
             let frame = thread.frames.last_mut().unwrap();
             frame.closure = closure;

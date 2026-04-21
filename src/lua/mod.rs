@@ -178,63 +178,25 @@ mod tests {
     }
 
     #[test]
-    fn native_tailcall_from_lua() {
-        // Exercise op_tailcall's native branch. The compiler currently
-        // emits CALL + RETURN for every call site, so we hand-build a
-        // Prototype that issues a TAILCALL into a native function:
-        //
-        //     GETUPVAL R0 U0     -- load `add` from upvalue 0
-        //     LOAD     R1 K0     -- R1 = 2
-        //     LOAD     R2 K1     -- R2 = 3
-        //     TAILCALL R0 args=3 -- tail-call add(2, 3)
-        //
-        // The Lua closure wraps one upvalue holding the native `add`.
-        // frame_return's TopLevel path should unwind the sole frame
-        // and leave the result at stack[0] for take_result.
-        use crate::dmm::{Gc, RefLock};
-        use crate::env::Prototype;
-        use crate::env::function::{UpvalueState, Upvalue as UpvalueT};
-        use crate::instruction::{Instruction, UpValueDescriptor};
-
+    fn tailcall_into_lua_closure() {
+        // Exercise op_tailcall's Lua branch: `return outer(41)` is a
+        // tail call into the Lua closure `outer`, whose body is
+        // `return inner(x)` — another tail call into the Lua closure
+        // `inner`. Both compile to TAILCALL.
         let mut lua = Lua::new();
-        let ex = lua.enter(|ctx| {
-            let mc = ctx.mutation();
-            let add =
-                Function::new_native(mc, native_add as NativeFn, Box::new([]));
-
-            let code: Box<[Instruction]> = Box::new([
-                Instruction::GETUPVAL { dst: 0, idx: 0 },
-                Instruction::LOAD { dst: 1, idx: 0 },
-                Instruction::LOAD { dst: 2, idx: 1 },
-                Instruction::TAILCALL { func: 0, args: 3 },
-            ]);
-            let proto = Gc::new(
-                mc,
-                Prototype {
-                    code,
-                    constants: Box::new([Value::Integer(2), Value::Integer(3)]),
-                    prototypes: Box::new([]),
-                    // Placeholder; the main-chunk closure is host-instantiated,
-                    // not created via op_closure, so the descriptor isn't read.
-                    upvalue_desc: Box::new([UpValueDescriptor::ParentLocal(0)]),
-                    num_params: 0,
-                    is_vararg: false,
-                    max_stack_size: 3,
-                    num_upvalues: 1,
-                    source: None,
-                },
-            );
-
-            let add_uv: UpvalueT<'_> = Gc::new(
-                mc,
-                RefLock::new(UpvalueState::Closed(Value::Function(add))),
-            );
-            let func = Function::new_lua(mc, proto, Box::from([add_uv]));
-
-            ctx.stash(Executor::start(ctx, func, ()))
-        });
+        let ex = lua
+            .try_enter(|ctx| -> Result<_, LoadError> {
+                let chunk = ctx.load(
+                    "local function inner(x) return x + 1 end \
+                     local function outer(x) return inner(x) end \
+                     return outer(41)",
+                    Some("lua_tailcall"),
+                )?;
+                Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+            })
+            .expect("load");
         let result: i64 = lua.execute(&ex).expect("run");
-        assert_eq!(result, 5);
+        assert_eq!(result, 42);
     }
 
     #[test]
