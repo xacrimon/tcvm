@@ -3,7 +3,7 @@ use crate::env::Value;
 use crate::env::function::{Function, FunctionKind, LuaClosure, Upvalue, UpvalueState};
 use crate::env::string::LuaString;
 use crate::env::table::Table;
-use crate::env::thread::{CallFrame, ThreadState, ThreadStatus};
+use crate::env::thread::{CallFrame, Thread, ThreadState, ThreadStatus};
 use crate::instruction::{Instruction, UpValueDescriptor};
 use crate::vm::num::{self, op_arith, op_bit};
 
@@ -212,14 +212,26 @@ macro_rules! helpers {
     };
 }
 
+/// Drive the VM on `thread` until the top-level frame returns.
+///
+/// The caller must have seeded the thread with at least one `CallFrame`,
+/// sized `stack` to at least `base + max_stack_size`, and placed
+/// the callee + arguments at `stack[base-1..]`. See `Executor::start`.
 #[inline(never)]
-pub fn run<'gc>(mc: &Mutation<'gc>, tape: &[Instruction], thread: &mut ThreadState<'gc>) {
-    let ip = tape.as_ptr();
+pub(crate) fn run_thread<'gc>(mc: &Mutation<'gc>, thread: Thread<'gc>) -> Result<(), Box<Error>> {
+    let mut ts = thread.borrow_mut(mc);
+    let (ip, base) = {
+        let frame = ts
+            .frames
+            .last()
+            .expect("run_thread requires a seeded frame");
+        let code_ptr = frame.closure.proto.code.as_ptr();
+        let ip = unsafe { code_ptr.add(frame.pc) };
+        (ip, frame.base)
+    };
+    let registers = unsafe { ts.stack.as_mut_ptr().add(base) };
     let handlers = HANDLERS.as_ptr() as *const ();
-
-    let registers = std::ptr::null_mut();
-
-    op_nop(Instruction::NOP, mc, thread, registers, ip, handlers).unwrap();
+    op_nop(Instruction::NOP, mc, &mut *ts, registers, ip, handlers)
 }
 
 // ---------------------------------------------------------------------------
@@ -1122,11 +1134,14 @@ extern "rust-preserve-none" fn op_return<'gc>(
     thread.frames.pop();
 
     if thread.frames.is_empty() {
-        // Top-level return — copy results to stack base and finish
+        // Top-level return — copy results to stack base and finish.
+        // Truncate the stack to `nret` so the host can read back `stack[0..nret]`
+        // as the return values.
         let dst_start = cur_base - 1; // func slot
         for i in 0..nret {
             thread.stack[dst_start + i] = thread.stack[cur_base + values as usize + i];
         }
+        thread.stack.truncate(dst_start + nret);
         thread.status = ThreadStatus::Dead;
         return Ok(());
     }

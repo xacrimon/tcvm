@@ -1,0 +1,143 @@
+//! Outer Lua API. Wraps the GC arena and exposes a small surface for
+//! instantiating an interpreter, loading Lua source, and calling functions
+//! from Rust.
+
+mod context;
+mod convert;
+mod error;
+mod executor;
+mod stash;
+
+use crate::Rootable;
+use crate::dmm::{Arena, Collect, DynamicRootSet, Mutation};
+use crate::env::{Table, Thread};
+
+pub use context::Context;
+pub use convert::{FromMultiValue, FromValue, IntoMultiValue, IntoValue};
+pub use error::{LoadError, RuntimeError, TypeError};
+pub use executor::{Executor, ExecutorMode};
+pub use stash::{
+    Fetchable, Stashable, StashedExecutor, StashedFunction, StashedTable, StashedThread,
+};
+
+/// Root object of the GC arena. Holds the globals table, the main thread,
+/// and the dynamic root set used to stash values across `enter` boundaries.
+#[derive(Collect)]
+#[collect(internal, no_drop)]
+pub struct State<'gc> {
+    pub(crate) globals: Table<'gc>,
+    pub(crate) main_thread: Thread<'gc>,
+    pub(crate) roots: DynamicRootSet<'gc>,
+}
+
+/// A Lua runtime instance.
+pub struct Lua {
+    arena: Arena<Rootable![State<'_>]>,
+}
+
+impl Default for Lua {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Lua {
+    pub fn new() -> Self {
+        let arena = Arena::<Rootable![State<'_>]>::new(|mc: &Mutation<'_>| State {
+            globals: Table::new(mc),
+            main_thread: Thread::new(mc),
+            roots: DynamicRootSet::new(mc),
+        });
+        Lua { arena }
+    }
+
+    /// Run `f` inside the arena's mutation context.
+    pub fn enter<F, T>(&mut self, f: F) -> T
+    where
+        F: for<'gc> FnOnce(Context<'gc>) -> T,
+    {
+        self.arena.mutate(|mc, state| f(Context::new(mc, state)))
+    }
+
+    /// `enter` variant that threads a `Result` through.
+    pub fn try_enter<F, T, E>(&mut self, f: F) -> Result<T, E>
+    where
+        F: for<'gc> FnOnce(Context<'gc>) -> Result<T, E>,
+    {
+        self.enter(f)
+    }
+
+    /// Run the given executor until completion.
+    ///
+    /// MVP: single-shot (no fuel). Returns when the executor's thread reaches
+    /// `Dead` or an error is raised.
+    pub fn finish(&mut self, ex: &StashedExecutor) -> Result<(), RuntimeError> {
+        self.try_enter(|ctx| {
+            let executor = ctx.fetch(ex);
+            executor.step(ctx)
+        })
+    }
+
+    /// `finish` then take typed results from the executor.
+    pub fn execute<R>(&mut self, ex: &StashedExecutor) -> Result<R, RuntimeError>
+    where
+        R: for<'gc> FromMultiValue<'gc>,
+    {
+        self.finish(ex)?;
+        self.try_enter(|ctx| {
+            let executor = ctx.fetch(ex);
+            executor.take_result::<R>(ctx)
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::env::{LuaString, Value};
+
+    #[test]
+    fn roundtrip_add_function() {
+        let mut lua = Lua::new();
+
+        let ex = lua
+            .try_enter(|ctx| -> Result<_, LoadError> {
+                let chunk = ctx.load("function add(a,b) return a+b end", Some("test"))?;
+                let executor = Executor::start(ctx, chunk, ());
+                Ok(ctx.stash(executor))
+            })
+            .expect("load + start");
+        lua.execute::<()>(&ex).expect("run top-level");
+
+        let ex = lua
+            .try_enter(|ctx| -> Result<_, RuntimeError> {
+                let key = Value::String(LuaString::new(ctx.mutation(), b"add"));
+                let add = ctx
+                    .globals()
+                    .raw_get(key)
+                    .get_function()
+                    .ok_or(TypeError::Mismatch {
+                        expected: "function",
+                        got: "nil",
+                    })?;
+                let executor = Executor::start(ctx, add, (2i64, 3i64));
+                Ok(ctx.stash(executor))
+            })
+            .expect("look up + start");
+
+        let result: i64 = lua.execute(&ex).expect("run add");
+        assert_eq!(result, 5);
+    }
+
+    #[test]
+    fn empty_return_unit() {
+        let mut lua = Lua::new();
+        let ex = lua
+            .try_enter(|ctx| -> Result<_, LoadError> {
+                let chunk = ctx.load("local x = 1 + 2", None)?;
+                Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+            })
+            .expect("load");
+        lua.execute::<()>(&ex).expect("run");
+    }
+}

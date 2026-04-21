@@ -78,4 +78,8 @@ impl<'gc> Thread<'gc> {
     pub fn inner(self) -> Gc<'gc, RefLock<ThreadState<'gc>>> {
         self.0
     }
+
+    pub(crate) fn from_inner(g: Gc<'gc, RefLock<ThreadState<'gc>>>) -> Self {
+        Thread(g)
+    }
 }

@@ -90,4 +90,8 @@ impl<'gc> Function<'gc> {
     pub fn inner(self) -> Gc<'gc, FunctionKind<'gc>> {
         self.0
     }
+
+    pub(crate) fn from_inner(g: Gc<'gc, FunctionKind<'gc>>) -> Self {
+        Function(g)
+    }
 }

@@ -104,6 +104,10 @@ impl<'gc> Table<'gc> {
     pub fn inner(self) -> Gc<'gc, RefLock<TableState<'gc>>> {
         self.0
     }
+
+    pub(crate) fn from_inner(g: Gc<'gc, RefLock<TableState<'gc>>>) -> Self {
+        Table(g)
+    }
 }
 
 /// Extract a valid array index from a Value (1-based positive integer).
