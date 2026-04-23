@@ -166,3 +166,5 @@ Explicitly out of scope (documented TODOs)
                                                                
   27. No way to pre-populate globals from Rust at construction. Lua::new() creates an empty globals table. For       
   scripting an app we'd want Lua::builder() or similar to register host functions before loading user code.
+
+How do prototypes for native fns work, like how does it know how many return values are available etc?

@@ -107,8 +107,11 @@ fn lua_pcall<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Resul
     todo!()
 }
 
-fn lua_print<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
-    todo!()
+fn lua_print<'gc>(_ctx: NativeContext<'gc, '_>, stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+    let arg = stack[0];
+    let num = arg.get_integer().unwrap();
+    println!("{}", num);
+    Ok(())
 }
 
 fn lua_rawequal<'gc>(
