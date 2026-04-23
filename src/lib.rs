@@ -6,6 +6,7 @@
 #![feature(rust_preserve_none_cc)]
 #![feature(variant_count)]
 
+mod builtin;
 pub(crate) mod compiler;
 pub mod dmm;
 pub mod env;

@@ -9,6 +9,7 @@ mod executor;
 mod stash;
 
 use crate::Rootable;
+use crate::builtin;
 use crate::dmm::{Arena, Collect, DynamicRootSet, Mutation};
 use crate::env::{Table, Thread};
 
@@ -88,6 +89,21 @@ impl Lua {
             let executor = ctx.fetch(ex);
             executor.take_result::<R>(ctx)
         })
+    }
+
+    pub fn load_all(&mut self) {
+        self.enter(|ctx| {
+            builtin::load_basic(ctx);
+            builtin::load_coroutine(ctx);
+            builtin::load_debug(ctx);
+            builtin::load_io(ctx);
+            builtin::load_math(ctx);
+            builtin::load_os(ctx);
+            builtin::load_package(ctx);
+            builtin::load_string(ctx);
+            builtin::load_table(ctx);
+            builtin::load_utf8(ctx);
+        });
     }
 }
 

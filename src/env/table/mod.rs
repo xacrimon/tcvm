@@ -16,7 +16,7 @@ pub struct TableState<'gc> {
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub struct RawTable<'gc> {
-    array: Vec<Value<'gc>>,
+    array: Vec<Value<'gc>, MetricsAlloc<'gc>>,
     hash:
         hashbrown::HashMap<Value<'gc>, Value<'gc>, foldhash::fast::RandomState, MetricsAlloc<'gc>>,
 }
@@ -24,7 +24,7 @@ pub struct RawTable<'gc> {
 impl<'gc> Table<'gc> {
     pub fn new(mc: &Mutation<'gc>) -> Self {
         let raw = RawTable {
-            array: Vec::new(),
+            array: Vec::new_in(MetricsAlloc::new(mc)),
             hash: hashbrown::HashMap::with_hasher_in(
                 foldhash::fast::RandomState::default(),
                 MetricsAlloc::new(mc),

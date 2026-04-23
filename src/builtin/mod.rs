@@ -1,0 +1,21 @@
+mod basic;
+mod coroutine;
+mod debug;
+mod io;
+mod math;
+mod os;
+mod package;
+mod string;
+mod table;
+mod utf8;
+
+pub use basic::load as load_basic;
+pub use coroutine::load as load_coroutine;
+pub use debug::load as load_debug;
+pub use io::load as load_io;
+pub use math::load as load_math;
+pub use os::load as load_os;
+pub use package::load as load_package;
+pub use string::load as load_string;
+pub use table::load as load_table;
+pub use utf8::load as load_utf8;

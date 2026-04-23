@@ -1,5 +1,6 @@
 use core::cell::{Cell, RefCell};
 use core::marker::PhantomData;
+use std::alloc::Allocator;
 use std::boxed::Box;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, LinkedList, VecDeque};
 use std::collections::{HashMap, HashSet};
@@ -79,7 +80,7 @@ unsafe impl<'gc, T: ?Sized + 'static> Collect<'gc> for &'static T {
     const NEEDS_TRACE: bool = false;
 }
 
-unsafe impl<'gc, T: ?Sized + Collect<'gc>> Collect<'gc> for Box<T> {
+unsafe impl<'gc, T: ?Sized + Collect<'gc>, A: Allocator> Collect<'gc> for Box<T, A> {
     const NEEDS_TRACE: bool = T::NEEDS_TRACE;
 
     #[inline]
@@ -122,7 +123,7 @@ unsafe impl<'gc, T: Collect<'gc>, E: Collect<'gc>> Collect<'gc> for Result<T, E>
     }
 }
 
-unsafe impl<'gc, T: Collect<'gc>> Collect<'gc> for Vec<T> {
+unsafe impl<'gc, T: Collect<'gc>, A: Allocator> Collect<'gc> for Vec<T, A> {
     const NEEDS_TRACE: bool = T::NEEDS_TRACE;
 
     #[inline]
@@ -133,7 +134,7 @@ unsafe impl<'gc, T: Collect<'gc>> Collect<'gc> for Vec<T> {
     }
 }
 
-unsafe impl<'gc, T: Collect<'gc>> Collect<'gc> for VecDeque<T> {
+unsafe impl<'gc, T: Collect<'gc>, A: Allocator> Collect<'gc> for VecDeque<T, A> {
     const NEEDS_TRACE: bool = T::NEEDS_TRACE;
 
     #[inline]
@@ -144,7 +145,7 @@ unsafe impl<'gc, T: Collect<'gc>> Collect<'gc> for VecDeque<T> {
     }
 }
 
-unsafe impl<'gc, T: Collect<'gc>> Collect<'gc> for LinkedList<T> {
+unsafe impl<'gc, T: Collect<'gc>, A: Allocator> Collect<'gc> for LinkedList<T, A> {
     const NEEDS_TRACE: bool = T::NEEDS_TRACE;
 
     #[inline]
@@ -155,11 +156,12 @@ unsafe impl<'gc, T: Collect<'gc>> Collect<'gc> for LinkedList<T> {
     }
 }
 
-unsafe impl<'gc, K, V, S> Collect<'gc> for HashMap<K, V, S>
+unsafe impl<'gc, K, V, S, A> Collect<'gc> for HashMap<K, V, S, A>
 where
     K: Collect<'gc>,
     V: Collect<'gc>,
     S: 'static,
+    A: Allocator,
 {
     const NEEDS_TRACE: bool = K::NEEDS_TRACE || V::NEEDS_TRACE;
 
@@ -172,10 +174,11 @@ where
     }
 }
 
-unsafe impl<'gc, T, S> Collect<'gc> for HashSet<T, S>
+unsafe impl<'gc, T, S, A> Collect<'gc> for HashSet<T, S, A>
 where
     T: Collect<'gc>,
     S: 'static,
+    A: Allocator,
 {
     const NEEDS_TRACE: bool = T::NEEDS_TRACE;
 
@@ -187,10 +190,11 @@ where
     }
 }
 
-unsafe impl<'gc, K, V> Collect<'gc> for BTreeMap<K, V>
+unsafe impl<'gc, K, V, A> Collect<'gc> for BTreeMap<K, V, A>
 where
     K: Collect<'gc>,
     V: Collect<'gc>,
+    A: Allocator + Clone,
 {
     const NEEDS_TRACE: bool = K::NEEDS_TRACE || V::NEEDS_TRACE;
 
@@ -203,9 +207,10 @@ where
     }
 }
 
-unsafe impl<'gc, T> Collect<'gc> for BTreeSet<T>
+unsafe impl<'gc, T, A> Collect<'gc> for BTreeSet<T, A>
 where
     T: Collect<'gc>,
+    A: Allocator + Clone,
 {
     const NEEDS_TRACE: bool = T::NEEDS_TRACE;
 
@@ -217,9 +222,10 @@ where
     }
 }
 
-unsafe impl<'gc, T> Collect<'gc> for BinaryHeap<T>
+unsafe impl<'gc, T, A> Collect<'gc> for BinaryHeap<T, A>
 where
     T: Collect<'gc>,
+    A: Allocator,
 {
     const NEEDS_TRACE: bool = T::NEEDS_TRACE;
 
@@ -231,9 +237,10 @@ where
     }
 }
 
-unsafe impl<'gc, T> Collect<'gc> for Rc<T>
+unsafe impl<'gc, T, A> Collect<'gc> for Rc<T, A>
 where
     T: ?Sized + Collect<'gc>,
+    A: Allocator,
 {
     const NEEDS_TRACE: bool = T::NEEDS_TRACE;
 
@@ -243,9 +250,10 @@ where
     }
 }
 
-unsafe impl<'gc, T> Collect<'gc> for std::sync::Arc<T>
+unsafe impl<'gc, T, A> Collect<'gc> for std::sync::Arc<T, A>
 where
     T: ?Sized + Collect<'gc>,
+    A: Allocator,
 {
     const NEEDS_TRACE: bool = T::NEEDS_TRACE;
 
