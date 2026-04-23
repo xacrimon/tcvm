@@ -238,3 +238,4 @@ test!(nbody, "test-files/nbody.lua");
 test!(op_prec, "test-files/op_prec.lua");
 test!(primes, "test-files/primes.lua");
 test!(jens2, "test-files/jens2.lua");
+test!(nested_call, "test-files/nested_call.lua");

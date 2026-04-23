@@ -168,3 +168,4 @@ Explicitly out of scope (documented TODOs)
   scripting an app we'd want Lua::builder() or similar to register host functions before loading user code.
 
 How do prototypes for native fns work, like how does it know how many return values are available etc?
+Improve call/return by allowing negative register offsets to reference args/return values.

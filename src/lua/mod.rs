@@ -296,4 +296,107 @@ mod tests {
         let err = lua.execute::<i64>(&ex).expect_err("should error");
         assert!(matches!(err, RuntimeError::Opcode { .. }));
     }
+
+    // Native identity callback used as a `print`-shaped probe: returns its
+    // first integer arg unchanged so we can assert results from the VM.
+    fn native_id<'gc>(
+        _ctx: crate::env::NativeContext<'gc, '_>,
+        mut stack: crate::env::Stack<'gc, '_>,
+    ) -> Result<(), crate::env::NativeError> {
+        let v = stack.get(0);
+        let out = match v {
+            Value::Integer(_) => v,
+            _ => return Err(crate::env::NativeError::new("bad args")),
+        };
+        stack.replace(&[out]);
+        Ok(())
+    }
+
+    fn run_returning_int(src: &str) -> i64 {
+        let mut lua = Lua::new();
+        let ex = lua
+            .try_enter(|ctx| -> Result<_, LoadError> {
+                let probe =
+                    Function::new_native(ctx.mutation(), native_id as NativeFn, Box::new([]));
+                let key = Value::String(LuaString::new(ctx.mutation(), b"probe"));
+                ctx.globals()
+                    .raw_set(ctx.mutation(), key, Value::Function(probe));
+                let chunk = ctx.load(src, Some("test"))?;
+                Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+            })
+            .expect("load");
+        lua.execute::<i64>(&ex).expect("run")
+    }
+
+    #[test]
+    fn local_call_inside_native_call() {
+        // Direct repro of the register-clobber bug: `probe(f(5))` where `f` is
+        // a low-register local and `probe` is a global. Before the fix, the
+        // inner f(5) setup overwrote probe's register.
+        let n = run_returning_int(
+            "local function f(n) return n + 1 end \
+             return probe(f(5))",
+        );
+        assert_eq!(n, 6);
+    }
+
+    #[test]
+    fn triple_nested_local_calls() {
+        // Three locals at consecutive low registers, each calling the next.
+        let n = run_returning_int(
+            "local function h(x) return x + 1 end \
+             local function g(x) return h(x) + 1 end \
+             local function f(x) return g(x) + 1 end \
+             return f(0)",
+        );
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn recursive_fib() {
+        // Self-recursive upvalue capture combined with the patched call setup.
+        let n = run_returning_int(
+            "local function fib(n) \
+                if n < 2 then return n \
+                else return fib(n - 1) + fib(n - 2) end \
+             end \
+             return fib(10)",
+        );
+        assert_eq!(n, 55);
+    }
+
+    #[test]
+    fn call_in_table_constructor_with_local_target() {
+        // Table-array entries with a low-register-local function target;
+        // fix in emit_func_call_setup also protects the table register.
+        let n = run_returning_int(
+            "local function f() return 7 end \
+             local t = {f(), f(), f()} \
+             return t[1] + t[2] + t[3]",
+        );
+        assert_eq!(n, 21);
+    }
+
+    #[test]
+    fn local_func_called_with_itself_as_arg() {
+        // `f(f(2))` — both calls resolve to the same local register, so the
+        // inner CALL would overwrite f if it weren't preserved first.
+        let n = run_returning_int(
+            "local function f(n) return n + 1 end \
+             return f(f(2))",
+        );
+        assert_eq!(n, 4);
+    }
+
+    #[test]
+    fn call_as_for_num_bound() {
+        // for-num bound expression as a call to a low-register local.
+        let n = run_returning_int(
+            "local function lim() return 3 end \
+             local s = 0 \
+             for i = 1, lim() do s = s + i end \
+             return s",
+        );
+        assert_eq!(n, 6);
+    }
 }

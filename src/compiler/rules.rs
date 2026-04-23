@@ -617,6 +617,17 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         None
     }
 
+    /// True if `reg` is currently bound to a named local in any live scope.
+    /// Used to decide when a value must be preserved across a CALL — a CALL
+    /// writes its result into the function register, so a local at that slot
+    /// would be destroyed and any later reference to the same name would
+    /// read the call result instead.
+    fn is_local_register(&self, reg: RegisterIndex) -> bool {
+        self.scope
+            .iter()
+            .any(|s| s.values().any(|v| v.register == reg))
+    }
+
     fn alloc_constant(&mut self, value: Value<'gc>) -> Result<u16, CompileError> {
         // Check for an existing identical constant (exact type match, no int/float coercion).
         let existing = self.chunk.constants.iter().position(|c| match (c, &value) {
@@ -2000,6 +2011,32 @@ fn emit_func_call_setup(
         .ok_or_else(|| ice("func call without target"))?;
     let func = compile_expr_to_reg(ctx, target, None)?;
 
+    // Two situations force a copy of the function value to a fresh top
+    // register before arg setup:
+    //   1. Anything is already live at or above func+1 (typical when target
+    //      resolves to a low local while higher temps/locals live above it).
+    //      Without the copy, arg setup writes into func+1.. and clobbers
+    //      that state.
+    //   2. func is a register bound to a named local. CALL writes its result
+    //      back to func, so leaving the local there destroys it; subsequent
+    //      reads of the same name (including the next iteration of a chain
+    //      like `f(f(x))`) would see the call result instead of the local.
+    //
+    // Fresh temps (GETUPVAL/GETTABUP/GETTABLE results, etc.) at the top of
+    // stack are safe to overwrite since nothing else references them.
+    let needs_copy =
+        (func.0 as usize) + 1 < ctx.chunk.register_count || ctx.is_local_register(func);
+    let func = if needs_copy {
+        let top = ctx.alloc_register()?;
+        ctx.emit(Instruction::MOVE {
+            dst: top.0,
+            src: func.0,
+        });
+        top
+    } else {
+        func
+    };
+
     let args: Vec<_> = item.args().map(|a| a.collect()).unwrap_or_default();
     let nargs = args.len();
 
@@ -2433,8 +2470,15 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
             });
         }
 
+        // FORPREP/FORLOOP hardcode the loop variable at base+3, so reclaim
+        // any temps the init/limit/step expressions may have leaked above
+        // step_reg before allocating loop_var. (max_register_count is
+        // unaffected — it tracks peak.)
+        ctx.chunk.register_count = step_reg.0 as usize + 1;
+
         // base+3 is the visible loop variable
         let loop_var = ctx.alloc_register()?;
+        debug_assert_eq!(loop_var.0, base.0 + 3);
         ctx.define(
             counter_name,
             VariableData {
@@ -2517,13 +2561,19 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
             }
         }
 
+        // TFORCALL/TFORLOOP hardcode loop variables at base+3..base+2+count,
+        // so reclaim any temps the iterator-value expressions leaked above
+        // base+2 before allocating loop variables.
+        ctx.chunk.register_count = base.0 as usize + 3;
+
         // Allocate registers for loop variables and bind them
-        for target_ident in targets {
+        for (i, target_ident) in targets.into_iter().enumerate() {
             let name = target_ident
                 .name(ctx.interner)
                 .ok_or_else(|| ice("ident without name"))?
                 .to_owned();
             let reg = ctx.alloc_register()?;
+            debug_assert_eq!(reg.0, base.0 + 3 + i as u8);
             ctx.define(
                 name,
                 VariableData {
