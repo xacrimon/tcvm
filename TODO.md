@@ -169,3 +169,21 @@ Explicitly out of scope (documented TODOs)
 
 How do prototypes for native fns work, like how does it know how many return values are available etc?
 Improve call/return by allowing negative register offsets to reference args/return values.
+
+Const folding?
+
+LOADI / LOADF — immediate small integer / float constants without a K entry
+
+ADDI / SUBI / MULI / MODI — immediate-operand arith. Large win for loops (i = i + 1), table index arithmetic.
+
+SETTABUP with K source / SETFIELD / SETI — avoid the LOAD before a global or field assignment. Single biggest
+ remaining win for literal.lua-style code.
+
+NEWTABLE size hints — pass expected array/hash counts. Needs EXTRAARG-style instruction for large sizes.
+
+N-way CONCAT — instruction takes count, single emit for a..b..c..d. Relevant for nbody's string.format(...) .. "\n"
+  patterns.
+
+Specialized return0, return1, return2?
+
+local function f ... end pre-alloc pattern optimization (separate from the regular-local-decl restructure)

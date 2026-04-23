@@ -21,10 +21,10 @@ expression: output
 0009  RETURN          R0 count=1
 
 ; prototype 0:
-  ; function (params=1, vararg=false, stack=3, upvalues=0)
+  ; function (params=1, vararg=false, stack=2, upvalues=0)
   ; constants:
   ;   K0 = 1
   ; code:
-  0000  LOAD            R2 K0  ; 1
-  0001  ADD             R1 R0 R2
+  0000  LOAD            R1 K0  ; 1
+  0001  ADD             R1 R0 R1
   0002  RETURN          R1 count=2

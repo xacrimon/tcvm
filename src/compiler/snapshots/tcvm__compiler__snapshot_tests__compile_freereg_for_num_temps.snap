@@ -20,8 +20,7 @@ expression: output
 0008  FORPREP         R2 +2
 0009  ADD             R1 R1 R5
 0010  FORLOOP         R2 -2
-0011  MOVE            R2 R1
-0012  RETURN          R2 count=2
+0011  RETURN          R1 count=2
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=1, upvalues=0)

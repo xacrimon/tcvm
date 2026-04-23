@@ -443,4 +443,43 @@ mod tests {
         );
         assert_eq!(n, 109);
     }
+
+    #[test]
+    fn local_decl_self_shadowing() {
+        // `local x = x` must resolve the RHS `x` to the OUTER binding,
+        // not to the one being defined. The new compile_decl delays
+        // adjust_locals until after all initializers compile.
+        let n = run_returning_int(
+            "local x = 7 \
+             do \
+               local x = x \
+               return x \
+             end",
+        );
+        assert_eq!(n, 7);
+    }
+
+    #[test]
+    fn local_decl_later_refs_earlier() {
+        // Across two separate decl statements, the second must see
+        // locals bound by the first.
+        let n = run_returning_int(
+            "local a = 3 \
+             local b = a + 1 \
+             return a + b",
+        );
+        assert_eq!(n, 7);
+    }
+
+    #[test]
+    fn local_decl_multi_return_call() {
+        // `local a, b = f()` with f returning 2 values places them in
+        // consecutive locals starting at base.
+        let n = run_returning_int(
+            "local function f() return 10, 20 end \
+             local a, b = f() \
+             return a + b",
+        );
+        assert_eq!(n, 30);
+    }
 }

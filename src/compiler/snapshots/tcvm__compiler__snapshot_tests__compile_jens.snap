@@ -11,7 +11,7 @@ expression: output
 0002  RETURN          R0 count=1
 
 ; prototype 0:
-  ; function (params=1, vararg=false, stack=5, upvalues=1)
+  ; function (params=1, vararg=false, stack=4, upvalues=1)
   ; constants:
   ;   K0 = 2
   ;   K1 = 1
@@ -20,16 +20,15 @@ expression: output
   ; code:
   0000  LOAD            R1 K0  ; 2
   0001  LT              R0 R1 inv=false
-  0002  JMP             +2
-  0003  MOVE            R1 R0
-  0004  RETURN          R1 count=2
-  0005  GETUPVAL        R2 U0
-  0006  LOAD            R3 K1  ; 1
-  0007  SUB             R3 R0 R3
-  0008  CALL            R2 args=2 ret=2
-  0009  GETUPVAL        R3 U0
-  0010  LOAD            R4 K0  ; 2
-  0011  SUB             R4 R0 R4
-  0012  CALL            R3 args=2 ret=2
-  0013  ADD             R1 R2 R3
-  0014  RETURN          R1 count=2
+  0002  JMP             +1
+  0003  RETURN          R0 count=2
+  0004  GETUPVAL        R1 U0
+  0005  LOAD            R2 K1  ; 1
+  0006  SUB             R2 R0 R2
+  0007  CALL            R1 args=2 ret=2
+  0008  GETUPVAL        R2 U0
+  0009  LOAD            R3 K0  ; 2
+  0010  SUB             R3 R0 R3
+  0011  CALL            R2 args=2 ret=2
+  0012  ADD             R1 R1 R2
+  0013  RETURN          R1 count=2

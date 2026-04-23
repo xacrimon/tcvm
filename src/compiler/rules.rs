@@ -1070,46 +1070,81 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
     let num_targets = targets.len();
     let num_values = values.len();
 
-    // Pre-allocate registers for all local variables
-    let mut local_regs = Vec::with_capacity(num_targets);
-    for _ in 0..num_targets {
-        local_regs.push(ctx.alloc_register()?);
-    }
+    // Target slots will land contiguously at [base, base+num_targets).
+    // Don't pre-reserve: compile each value expression into the next free
+    // slot, letting its natural register placement (e.g. CALL's result
+    // slot, LOAD dst) line up with the target. This avoids the
+    // "pre-allocate then MOVE result down" pattern for calls, literals,
+    // and arithmetic. MOVEs are only emitted when the expression returns
+    // a register that's not at the expected slot (e.g. `local x = y`
+    // where `y` is an existing local).
+    let base = ctx.chunk.freereg;
 
-    // Compile values into registers, using local register hints where possible
-    let mut value_regs = Vec::new();
     for (i, expr) in values.into_iter().enumerate() {
         let is_last = i == num_values - 1;
+        let expected = base + i as u8;
 
         if is_last && num_targets > num_values {
-            // Last value in a multi-target declaration — try to get multiple returns
+            // Last RHS supplies multiple values via call or vararg.
             if let Expr::FuncCall(call) = expr {
                 let want = num_targets - i;
                 let regs = compile_expr_func_call(ctx, call, want)?;
-                value_regs.extend(regs);
+                // Results occupy [regs[0], regs[0]+want); in practice this
+                // lines up with `expected` because the call's func slot
+                // is freereg at setup time, which is `expected`.
+                debug_assert_eq!(regs[0].0, expected);
                 continue;
             }
             if let Expr::VarArg = expr {
                 let want = num_targets - i;
-                let dst = ctx.alloc_register()?;
+                let dst = ctx.reserve_regs(want as u8)?;
+                debug_assert_eq!(dst.0, expected);
                 ctx.emit(Instruction::VARARG {
                     dst: dst.0,
                     count: want as u8 + 1,
                 });
-                for j in 0..want {
-                    value_regs.push(RegisterIndex(dst.0 + j as u8));
-                }
                 continue;
             }
         }
 
-        // Pass the target local's register as a destination hint
-        let hint = local_regs.get(i).copied();
-        let reg = compile_expr_to_reg(ctx, expr, hint)?;
-        value_regs.push(reg);
+        // Regular single-value expression. Compile without a pre-reserved
+        // slot so CALL / LOAD / arith destinations land naturally at
+        // `expected`. If the expression returns a different register
+        // (e.g. a local Ident that `compile_expr_ident` returned bare, or
+        // a short-circuit expression whose fall-through landed mid-stack),
+        // emit a MOVE. Either way, end this iteration with freereg =
+        // expected + 1 — any temps the expression leaked above are dead.
+        let reg = compile_expr_to_reg(ctx, expr, None)?;
+        if reg.0 != expected {
+            // Reclaim any leaked temps, then reserve the target slot
+            // (reserve_reg updates max_stack).
+            ctx.chunk.freereg = expected;
+            let slot = ctx.reserve_reg()?;
+            debug_assert_eq!(slot.0, expected);
+            ctx.emit(Instruction::MOVE {
+                dst: slot.0,
+                src: reg.0,
+            });
+        } else if ctx.chunk.freereg > expected + 1 {
+            // Expression landed at `expected` but leaked additional temps
+            // above (e.g. short-circuit fall-through). Drop them. The
+            // previous expression compilation already updated max_stack to
+            // reflect this peak.
+            ctx.chunk.freereg = expected + 1;
+        }
     }
 
-    // Bind each target to its value (or nil)
+    // Pad with nil for any targets without supplied values. A multi-return
+    // call or vararg may have already filled extra slots above the last
+    // non-expander value, so check freereg rather than iterating by index.
+    let target_top = base + num_targets as u8;
+    while ctx.chunk.freereg < target_top {
+        let slot = ctx.reserve_reg()?;
+        let idx = ctx.alloc_constant(Value::Nil)?;
+        ctx.emit(Instruction::LOAD { dst: slot.0, idx });
+    }
+
+    // Bind each target name to its slot and handle `<close>` / `<const>`.
     for (i, target) in targets.into_iter().enumerate() {
         let name = target
             .name()
@@ -1122,24 +1157,7 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
         let is_const = matches!(modifier, Some(DeclModifier::Const));
         let is_close = matches!(modifier, Some(DeclModifier::Close));
 
-        let local_reg = local_regs[i];
-        let reg = if let Some(&val_reg) = value_regs.get(i) {
-            if val_reg != local_reg {
-                ctx.emit(Instruction::MOVE {
-                    dst: local_reg.0,
-                    src: val_reg.0,
-                });
-            }
-            local_reg
-        } else {
-            // No value supplied — initialize to nil
-            let idx = ctx.alloc_constant(Value::Nil)?;
-            ctx.emit(Instruction::LOAD {
-                dst: local_reg.0,
-                idx,
-            });
-            local_reg
-        };
+        let reg = RegisterIndex(base + i as u8);
 
         if is_close {
             ctx.emit(Instruction::TBC { val: reg.0 });
@@ -1153,17 +1171,6 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
                 is_const,
             },
         )?;
-    }
-
-    // Reclaim any temps that value-expression compilation left above the
-    // targets' slots (common with calls and varargs whose results land at
-    // a producer-chosen register and then get MOVEd into place). Locals
-    // below `local_regs` are unaffected.
-    if let Some(last_local) = local_regs.last() {
-        let after_locals = last_local.0 + 1;
-        if ctx.chunk.freereg > after_locals {
-            ctx.chunk.freereg = after_locals;
-        }
     }
 
     // Promote the freshly bound targets to active locals so their slots
@@ -2416,11 +2423,46 @@ fn compile_return(ctx: &mut Ctx, item: Return) -> Result<(), CompileError> {
 
 /// Compile a plain `return ...` — the fallback for any return that
 /// doesn't qualify for `TAILCALL`.
-fn compile_return_generic(ctx: &mut Ctx, exprs: Vec<Expr>) -> Result<(), CompileError> {
+fn compile_return_generic(ctx: &mut Ctx, mut exprs: Vec<Expr>) -> Result<(), CompileError> {
     if exprs.is_empty() {
         ctx.emit(Instruction::RETURN {
             values: 0,
             count: 1,
+        });
+        return Ok(());
+    }
+
+    // Single-value fast path: if the expression discharges to a plain Reg
+    // with no pending jumps, RETURN directly from that register. Saves a
+    // fresh reservation and a MOVE for the common `return local_var`
+    // pattern. Jump-kind expressions (comparisons, short-circuit logic)
+    // fall through to the contiguous-slot path since LFALSESKIP/LOAD-true
+    // materialisation needs a concrete dst.
+    if exprs.len() == 1 {
+        let only = exprs.pop().unwrap();
+        let mut desc = compile_expr(ctx, only, None)?;
+        if !desc.has_jumps()
+            && let ExprKind::Reg(reg) = desc.kind
+        {
+            ctx.emit(Instruction::RETURN {
+                values: reg.0,
+                count: 2,
+            });
+            return Ok(());
+        }
+        // Fall through to the generic path, discharging through a fresh
+        // register slot so pending jumps get materialised correctly.
+        let first_reg = ctx.alloc_register()?;
+        let reg = ctx.discharge_to_reg_mut(&mut desc, Some(first_reg))?;
+        if reg != first_reg {
+            ctx.emit(Instruction::MOVE {
+                dst: first_reg.0,
+                src: reg.0,
+            });
+        }
+        ctx.emit(Instruction::RETURN {
+            values: first_reg.0,
+            count: 2,
         });
         return Ok(());
     }
