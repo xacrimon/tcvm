@@ -130,8 +130,18 @@ pub struct Chunk<'gc> {
     pub(super) constants: Vec<Value<'gc>>,
     pub(super) prototypes: Vec<Gc<'gc, Prototype<'gc>>>,
     pub(super) upvalue_desc: Vec<UpValueDescriptor>,
-    pub(super) register_count: usize,
-    pub(super) max_register_count: usize,
+    /// Next free register slot; cursor for temp allocation. Locals occupy
+    /// `[0, nactvar)`, temps occupy `[nactvar, freereg)`. Matches Lua 5.4's
+    /// `fs->freereg` semantics.
+    pub(super) freereg: u8,
+    /// Number of active named locals. Registers `[0, nactvar)` are reserved
+    /// for bound locals and must not be reclaimed before scope exit —
+    /// upvalue descriptors (see `UpValueDescriptor::ParentLocal`) embed
+    /// these register numbers and rely on their stability.
+    pub(super) nactvar: u8,
+    /// Peak register count seen during compilation; becomes the prototype's
+    /// `max_stack_size`.
+    pub(super) max_stack: u8,
     pub(super) arity: u8,
     pub(super) is_vararg: bool,
     pub(super) labels: Vec<usize>,
@@ -146,8 +156,9 @@ impl<'gc> Chunk<'gc> {
             constants: Vec::new(),
             prototypes: Vec::new(),
             upvalue_desc: Vec::new(),
-            register_count: 0,
-            max_register_count: 0,
+            freereg: 0,
+            nactvar: 0,
+            max_stack: 0,
             arity: 0,
             is_vararg: false,
             labels: Vec::new(),
@@ -183,7 +194,7 @@ impl<'gc> Chunk<'gc> {
                 upvalue_desc: self.upvalue_desc.into_boxed_slice(),
                 num_params: self.arity,
                 is_vararg: self.is_vararg,
-                max_stack_size: self.max_register_count as u8,
+                max_stack_size: self.max_stack,
                 num_upvalues,
                 source: self.source,
             },

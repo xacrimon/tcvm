@@ -51,6 +51,15 @@ struct VariableData {
     is_const: bool,
 }
 
+/// Snapshot of the register allocator's state at scope entry. Restored
+/// verbatim on `pop_scope` so nested scopes cleanly release any temps and
+/// named locals they allocated.
+#[derive(Clone, Copy)]
+struct ScopeMark {
+    freereg: u8,
+    nactvar: u8,
+}
+
 // ---------------------------------------------------------------------------
 // Compilation context
 // ---------------------------------------------------------------------------
@@ -73,8 +82,9 @@ struct Ctx<'gc, 'a> {
 
     /// Lexical scope stack: each frame maps variable names to register data.
     scope: Vec<HashMap<String, VariableData>>,
-    /// Saved register counts per scope (for restoring on pop).
-    scope_register_base: Vec<usize>,
+    /// Saved `(freereg, nactvar)` per scope entry, restored on pop so that
+    /// any temps or locals allocated within the scope are reclaimed together.
+    scope_marks: Vec<ScopeMark>,
     /// Registers that need CLOSE when scope is popped (to-be-closed variables).
     scope_close: Vec<Vec<RegisterIndex>>,
 
@@ -96,32 +106,122 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         self.chunk.tape.push(instruction);
     }
 
-    fn alloc_register(&mut self) -> Result<RegisterIndex, CompileError> {
-        if self.chunk.register_count >= 255 {
+    /// Reserve a single fresh temp register at `freereg` and return it.
+    /// Replaces the older `alloc_register` name to match Lua's
+    /// `luaK_reserveregs(fs, 1)`.
+    fn reserve_reg(&mut self) -> Result<RegisterIndex, CompileError> {
+        assert!(self.chunk.nactvar <= self.chunk.freereg);
+        if self.chunk.freereg == 255 {
+            // 255 is the last addressable slot; allocating a new one would
+            // wrap freereg to 0 and silently corrupt downstream allocations.
             return Err(err(CompileErrorKind::Registers, LineNumber(0)));
         }
-        let reg = self.chunk.register_count as u8;
-        self.chunk.register_count += 1;
-        if self.chunk.register_count > self.chunk.max_register_count {
-            self.chunk.max_register_count = self.chunk.register_count;
+        let reg = self.chunk.freereg;
+        self.chunk.freereg += 1;
+        if self.chunk.freereg > self.chunk.max_stack {
+            self.chunk.max_stack = self.chunk.freereg;
         }
         Ok(RegisterIndex(reg))
     }
 
-    /// Use a destination hint register if provided, otherwise allocate a fresh one.
+    /// Reserve `n` consecutive temp registers starting at `freereg`.
+    /// Returns the base register.
+    fn reserve_regs(&mut self, n: u8) -> Result<RegisterIndex, CompileError> {
+        assert!(self.chunk.nactvar <= self.chunk.freereg);
+        let base = self.chunk.freereg;
+        // `checked_add` returning Some guarantees the result fits in u8
+        // (<= 255), so no further range check is needed.
+        let end = base
+            .checked_add(n)
+            .ok_or_else(|| err(CompileErrorKind::Registers, LineNumber(0)))?;
+        self.chunk.freereg = end;
+        if end > self.chunk.max_stack {
+            self.chunk.max_stack = end;
+        }
+        Ok(RegisterIndex(base))
+    }
+
+    /// Back-compat alias kept so existing call sites compile unchanged
+    /// during the phased refactor. Phase 5 migrates remaining uses to
+    /// `reserve_reg`/`reserve_regs`.
+    fn alloc_register(&mut self) -> Result<RegisterIndex, CompileError> {
+        self.reserve_reg()
+    }
+
+    /// Free register `reg` iff it's a temp (`reg >= nactvar`). Constants
+    /// and locals are no-ops. Enforces LIFO stack discipline in debug:
+    /// the register being freed must be the most recently reserved
+    /// (`reg == freereg - 1`).
+    #[allow(dead_code)]
+    fn free_reg(&mut self, reg: RegisterIndex) {
+        if reg.0 >= self.chunk.nactvar {
+            assert!(
+                reg.0 + 1 == self.chunk.freereg,
+                "free_reg out of order: reg {} but freereg {}",
+                reg.0,
+                self.chunk.freereg,
+            );
+            self.chunk.freereg -= 1;
+        }
+    }
+
+    /// Free the register backing `expr` if it's a Reg-kind expression whose
+    /// register is a temp. No-op otherwise.
+    #[allow(dead_code)]
+    fn free_exp(&mut self, expr: &ExprDesc) {
+        if let ExprKind::Reg(reg) = expr.kind {
+            self.free_reg(reg);
+        }
+    }
+
+    /// Free two registers in correct (higher-first) order — matches
+    /// Lua 5.4's `freeregs(fs, r1, r2)`.
+    #[allow(dead_code)]
+    fn free_regs(&mut self, r1: RegisterIndex, r2: RegisterIndex) {
+        if r1.0 > r2.0 {
+            self.free_reg(r1);
+            self.free_reg(r2);
+        } else {
+            self.free_reg(r2);
+            self.free_reg(r1);
+        }
+    }
+
+    /// Free two ExprDescs in correct order — skips non-Reg-kind inputs.
+    #[allow(dead_code)]
+    fn free_exps(&mut self, e1: &ExprDesc, e2: &ExprDesc) {
+        match (e1.kind, e2.kind) {
+            (ExprKind::Reg(r1), ExprKind::Reg(r2)) => self.free_regs(r1, r2),
+            (ExprKind::Reg(r), _) | (_, ExprKind::Reg(r)) => self.free_reg(r),
+            _ => {}
+        }
+    }
+
+    /// Promote the top `n` temp slots to named-local status by advancing
+    /// `nactvar`. Called after a `local`-decl's initialiser has written
+    /// values into what were temps and the targets are about to be bound
+    /// by name. Must match a prior reserve; the caller's design ensures
+    /// `freereg >= nactvar + n` at call time.
+    fn adjust_locals(&mut self, n: u8) {
+        assert!(self.chunk.nactvar as usize + n as usize <= self.chunk.freereg as usize);
+        self.chunk.nactvar += n;
+    }
+
+    /// Use a destination hint register if provided, otherwise reserve a
+    /// fresh one. When the hint is beyond the current cursor, `freereg` is
+    /// bumped so later allocations sit above it.
     fn dst_or_alloc(&mut self, dst: Option<RegisterIndex>) -> Result<RegisterIndex, CompileError> {
         match dst {
             Some(reg) => {
-                // Ensure register counter is past this register
-                if self.chunk.register_count <= reg.0 as usize {
-                    self.chunk.register_count = reg.0 as usize + 1;
-                    if self.chunk.register_count > self.chunk.max_register_count {
-                        self.chunk.max_register_count = self.chunk.register_count;
+                if self.chunk.freereg <= reg.0 {
+                    self.chunk.freereg = reg.0 + 1;
+                    if self.chunk.freereg > self.chunk.max_stack {
+                        self.chunk.max_stack = self.chunk.freereg;
                     }
                 }
                 Ok(reg)
             }
-            None => self.alloc_register(),
+            None => self.reserve_reg(),
         }
     }
 
@@ -167,13 +267,12 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     /// `jmp_idx` stored in a list, `tape[jmp_idx - 1]` must be a CMP/TEST/
     /// TESTSET control instruction (or `jmp_idx == 0`, which every consumer
     /// shortcuts). See the `JumpList` doc comment.
-    #[cfg(debug_assertions)]
     fn assert_ctrl_predecessor(&self, jmp_idx: usize) {
         if jmp_idx == 0 {
             return;
         }
         let prev = &self.chunk.tape[jmp_idx - 1];
-        debug_assert!(
+        assert!(
             matches!(
                 prev,
                 Instruction::EQ { .. }
@@ -207,7 +306,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             if jmp_idx == 0 {
                 continue;
             }
-            #[cfg(debug_assertions)]
+
             self.assert_ctrl_predecessor(jmp_idx);
             if let Instruction::TESTSET { dst, src, inverted } = self.chunk.tape[jmp_idx - 1]
                 && dst == NO_REG
@@ -257,7 +356,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             if idx == 0 {
                 return true;
             }
-            #[cfg(debug_assertions)]
+
             self.assert_ctrl_predecessor(idx);
             !matches!(
                 self.chunk.tape[idx - 1],
@@ -285,7 +384,6 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             let target = if jmp_idx == 0 {
                 dtarget
             } else {
-                #[cfg(debug_assertions)]
                 self.assert_ctrl_predecessor(jmp_idx);
                 let ctrl_idx = jmp_idx - 1;
                 match self.chunk.tape[ctrl_idx] {
@@ -579,16 +677,21 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
 
     fn push_scope(&mut self) {
         self.scope.push(HashMap::new());
-        self.scope_register_base.push(self.chunk.register_count);
+        self.scope_marks.push(ScopeMark {
+            freereg: self.chunk.freereg,
+            nactvar: self.chunk.nactvar,
+        });
         self.scope_close.push(Vec::new());
     }
 
     fn pop_scope(&mut self) -> Result<Vec<RegisterIndex>, CompileError> {
         self.scope.pop().ok_or_else(|| ice("missing scope"))?;
-        self.chunk.register_count = self
-            .scope_register_base
+        let mark = self
+            .scope_marks
             .pop()
             .ok_or_else(|| ice("missing scope register base"))?;
+        self.chunk.freereg = mark.freereg;
+        self.chunk.nactvar = mark.nactvar;
         self.scope_close
             .pop()
             .ok_or_else(|| ice("missing scope close list"))
@@ -615,17 +718,6 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             }
         }
         None
-    }
-
-    /// True if `reg` is currently bound to a named local in any live scope.
-    /// Used to decide when a value must be preserved across a CALL — a CALL
-    /// writes its result into the function register, so a local at that slot
-    /// would be destroyed and any later reference to the same name would
-    /// read the call result instead.
-    fn is_local_register(&self, reg: RegisterIndex) -> bool {
-        self.scope
-            .iter()
-            .any(|s| s.values().any(|v| v.register == reg))
     }
 
     fn alloc_constant(&mut self, value: Value<'gc>) -> Result<u16, CompileError> {
@@ -796,7 +888,7 @@ fn compile_function_to_chunk<'gc, 'a>(
         chunk,
         control_end_label: Vec::new(),
         scope: Vec::new(),
-        scope_register_base: Vec::new(),
+        scope_marks: Vec::new(),
         scope_close: Vec::new(),
         goto_labels: HashMap::new(),
         capture: parent_capture,
@@ -811,6 +903,7 @@ fn compile_function_to_chunk<'gc, 'a>(
     }
 
     // Allocate registers for parameters and bind them in scope
+    let mut num_params: u8 = 0;
     for param in params {
         let name = param
             .name(interner)
@@ -823,7 +916,12 @@ fn compile_function_to_chunk<'gc, 'a>(
                 is_const: false,
             },
         )?;
+        num_params += 1;
     }
+    // Promote parameters to active locals so the body sees them as locals
+    // (upvalue capture by the body relies on `nactvar`) and temp reclaims
+    // never touch their slots.
+    ctx.adjust_locals(num_params);
 
     // Compile the body
     for stmt in stmts {
@@ -943,6 +1041,11 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
                 is_const: false,
             },
         )?;
+        // Promote to an active local BEFORE compiling the body so the
+        // child function's upvalue capture sees a stable parent register
+        // and any temps allocated during body compilation don't reclaim
+        // the local's slot.
+        ctx.adjust_locals(1);
 
         let func_reg = compile_func_body(ctx, &func, Some(reg))?;
         if func_reg != reg {
@@ -1052,6 +1155,22 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
         )?;
     }
 
+    // Reclaim any temps that value-expression compilation left above the
+    // targets' slots (common with calls and varargs whose results land at
+    // a producer-chosen register and then get MOVEd into place). Locals
+    // below `local_regs` are unaffected.
+    if let Some(last_local) = local_regs.last() {
+        let after_locals = last_local.0 + 1;
+        if ctx.chunk.freereg > after_locals {
+            ctx.chunk.freereg = after_locals;
+        }
+    }
+
+    // Promote the freshly bound targets to active locals so their slots
+    // are stable for the rest of the scope (upvalue-capture depends on
+    // the register staying put).
+    ctx.adjust_locals(num_targets as u8);
+
     Ok(())
 }
 
@@ -1087,18 +1206,24 @@ fn compile_assign(ctx: &mut Ctx, item: Assign) -> Result<(), CompileError> {
         })
         .collect();
 
+    // Snapshot freereg so we can reclaim all value-computation temps at
+    // the end of the assignment — sources may be either `local`'s fixed
+    // slots (no-op to free) or one-shot temps above nactvar.
+    let freereg_before = ctx.chunk.freereg;
+
     // Compile values
     let mut sources = Vec::new();
     for (i, expr) in values.into_iter().enumerate() {
         let is_last = i == num_values - 1;
 
-        if is_last && num_targets > num_values {
-            if let Expr::FuncCall(call) = expr {
-                let want = num_targets - i;
-                let regs = compile_expr_func_call(ctx, call, want)?;
-                sources.extend(regs.into_iter().map(|r| r.0));
-                continue;
-            }
+        if is_last
+            && num_targets > num_values
+            && let Expr::FuncCall(call) = expr
+        {
+            let want = num_targets - i;
+            let regs = compile_expr_func_call(ctx, call, want)?;
+            sources.extend(regs.into_iter().map(|r| r.0));
+            continue;
         }
 
         let hint = hints.get(i).copied().flatten();
@@ -1118,6 +1243,11 @@ fn compile_assign(ctx: &mut Ctx, item: Assign) -> Result<(), CompileError> {
     for (target, value) in targets.into_iter().zip(sources) {
         compile_assign_lhs(ctx, target, value)?;
     }
+
+    // Reclaim any temps left above nactvar that were computed for values.
+    // Locals stay put (their slots are below `freereg_before`).
+    assert!(ctx.chunk.freereg >= freereg_before);
+    ctx.chunk.freereg = freereg_before;
 
     Ok(())
 }
@@ -1176,6 +1306,7 @@ fn compile_assign_lhs(ctx: &mut Ctx, target: Expr, value: u8) -> Result<(), Comp
                 table: table.0,
                 key: key.0,
             });
+            ctx.free_regs(table, key);
             Ok(())
         }
 
@@ -1192,6 +1323,7 @@ fn compile_assign_lhs(ctx: &mut Ctx, target: Expr, value: u8) -> Result<(), Comp
                     table: table.0,
                     key: key.0,
                 });
+                ctx.free_regs(table, key);
                 Ok(())
             } else {
                 Err(ice("non-property binop as assignment target"))
@@ -1430,21 +1562,30 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
     let mut array_count: u16 = 0;
     let mut array_pending = 0u8;
 
+    // Reclaim per-entry temps back to this cursor after each SETLIST flush
+    // and after each Map/Generic SETTABLE.
+    let pending_base = ctx.chunk.freereg;
+
     for entry in item.entries() {
         match entry {
             TableEntry::Array(arr) => {
                 let value_expr = arr
                     .value()
                     .ok_or_else(|| ice("table array without value"))?;
-                let val = compile_expr_to_reg(ctx, value_expr, None)?;
-
-                // Place value in register after table for SETLIST
-                let slot = ctx.alloc_register()?;
+                // Compile the value into the next array slot (dst+1+pending).
+                let slot = RegisterIndex(pending_base + array_pending);
+                let val = compile_expr_to_reg(ctx, value_expr, Some(slot))?;
                 if val != slot {
+                    // Ensure the slot exists, then MOVE the value in and
+                    // free the source temp.
+                    while ctx.chunk.freereg <= slot.0 {
+                        ctx.alloc_register()?;
+                    }
                     ctx.emit(Instruction::MOVE {
                         dst: slot.0,
                         src: val.0,
                     });
+                    ctx.free_reg(val);
                 }
                 array_pending += 1;
                 array_count += 1;
@@ -1457,6 +1598,7 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
                         offset: array_count - array_pending as u16,
                     });
                     array_pending = 0;
+                    ctx.chunk.freereg = pending_base;
                 }
             }
 
@@ -1469,6 +1611,7 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
                         offset: array_count - array_pending as u16,
                     });
                     array_pending = 0;
+                    ctx.chunk.freereg = pending_base;
                 }
 
                 let field = map.field().ok_or_else(|| ice("table map without field"))?;
@@ -1490,6 +1633,8 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
                     table: dst.0,
                     key: key.0,
                 });
+                // Free val (higher) then key — SETTABLE has captured both.
+                ctx.free_regs(val, key);
             }
 
             TableEntry::Generic(r#gen) => {
@@ -1501,6 +1646,7 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
                         offset: array_count - array_pending as u16,
                     });
                     array_pending = 0;
+                    ctx.chunk.freereg = pending_base;
                 }
 
                 let key_expr = r#gen
@@ -1517,6 +1663,7 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
                     table: dst.0,
                     key: key.0,
                 });
+                ctx.free_regs(val, key);
             }
         }
     }
@@ -1528,6 +1675,7 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
             count: array_pending,
             offset: array_count - array_pending as u16,
         });
+        ctx.chunk.freereg = pending_base;
     }
 
     Ok(dst)
@@ -1568,6 +1716,7 @@ fn compile_expr_prefix_op(
                 return Err(ice("not on Jump-kind ExprDesc with no pending head"));
             }
             ExprKind::Reg(src) => {
+                ctx.free_reg(src);
                 let dst = ctx.dst_or_alloc(dst)?;
                 ctx.emit(Instruction::NOT {
                     dst: dst.0,
@@ -1582,10 +1731,11 @@ fn compile_expr_prefix_op(
 
     let result_reg = match op {
         PrefixOperator::None => {
-            // Unary + is a no-op
+            // Unary + is a no-op — keep `src` live, no free.
             src
         }
         PrefixOperator::Neg => {
+            ctx.free_reg(src);
             let dst = ctx.dst_or_alloc(dst)?;
             ctx.emit(Instruction::UNM {
                 dst: dst.0,
@@ -1595,6 +1745,7 @@ fn compile_expr_prefix_op(
         }
         PrefixOperator::Not => unreachable!("handled above"),
         PrefixOperator::Len => {
+            ctx.free_reg(src);
             let dst = ctx.dst_or_alloc(dst)?;
             ctx.emit(Instruction::LEN {
                 dst: dst.0,
@@ -1603,6 +1754,7 @@ fn compile_expr_prefix_op(
             dst
         }
         PrefixOperator::BitNot => {
+            ctx.free_reg(src);
             let dst = ctx.dst_or_alloc(dst)?;
             ctx.emit(Instruction::BNOT {
                 dst: dst.0,
@@ -1653,6 +1805,7 @@ fn compile_expr_binary_op_to_reg(
         let rhs = item.rhs().ok_or_else(|| ice("binop without rhs"))?;
         let table = compile_expr_to_reg(ctx, lhs, None)?;
         let key = compile_property_key(ctx, rhs, None)?;
+        ctx.free_regs(table, key);
         let dst = ctx.dst_or_alloc(dst)?;
         ctx.emit(Instruction::GETTABLE {
             dst: dst.0,
@@ -1807,6 +1960,7 @@ fn compile_expr_binary_op_to_reg(
             dst,
         ),
         BinaryOperator::Concat => {
+            ctx.free_regs(lhs, rhs);
             let dst = ctx.dst_or_alloc(dst)?;
             ctx.emit(Instruction::CONCAT {
                 dst: dst.0,
@@ -1844,6 +1998,9 @@ fn emit_arith(
     mut instr: Instruction,
     dst: Option<RegisterIndex>,
 ) -> Result<RegisterIndex, CompileError> {
+    // Free operand temps first so the dst allocation can reuse their
+    // slot(s). Locals are no-ops. Matches Lua's `codebinexpval`.
+    ctx.free_regs(lhs, rhs);
     let dst = ctx.dst_or_alloc(dst)?;
     // Patch the dst field in the instruction
     match &mut instr {
@@ -1926,6 +2083,9 @@ fn compile_comparison_desc(
     };
     ctx.emit(instr);
     let jmp = ctx.emit_unfilled_jmp();
+    // CMP + JMP have captured the operands; reclaim the temps so the
+    // enclosing jump-list discharge can use their slots.
+    ctx.free_regs(lhs, rhs);
 
     Ok(ExprDesc {
         // Pending head — fires on truthy of this expression. `goiftrue` /
@@ -2024,8 +2184,7 @@ fn emit_func_call_setup(
     //
     // Fresh temps (GETUPVAL/GETTABUP/GETTABLE results, etc.) at the top of
     // stack are safe to overwrite since nothing else references them.
-    let needs_copy =
-        (func.0 as usize) + 1 < ctx.chunk.register_count || ctx.is_local_register(func);
+    let needs_copy = (func.0 + 1 != ctx.chunk.freereg) || func.0 < ctx.chunk.nactvar;
     let func = if needs_copy {
         let top = ctx.alloc_register()?;
         ctx.emit(Instruction::MOVE {
@@ -2044,7 +2203,7 @@ fn emit_func_call_setup(
         let expected_reg = RegisterIndex(func.0 + 1 + i as u8);
         let arg = compile_expr_to_reg(ctx, arg_expr, Some(expected_reg))?;
         if arg != expected_reg {
-            while ctx.chunk.register_count <= expected_reg.0 as usize {
+            while ctx.chunk.freereg <= expected_reg.0 {
                 ctx.alloc_register()?;
             }
             ctx.emit(Instruction::MOVE {
@@ -2070,7 +2229,11 @@ fn compile_expr_func_call(
         returns: want as u8 + 1,
     });
 
-    // Results are placed starting at func register
+    // Results are placed starting at func register; arg temps above
+    // func+want are reclaimed (freereg snaps back to func+want). Preserves
+    // `max_stack` since it already recorded the peak during arg setup.
+    ctx.chunk.freereg = func.0 + want as u8;
+
     let mut results = Vec::with_capacity(want);
     for i in 0..want {
         results.push(RegisterIndex(func.0 + i as u8));
@@ -2088,6 +2251,10 @@ fn compile_tail_func_call(ctx: &mut Ctx, item: FuncCall) -> Result<(), CompileEr
         func: func.0,
         args: nargs as u8 + 1,
     });
+    // Frame is about to be torn down; conservatively snap freereg to func
+    // so any post-TAILCALL code in the compiler (there shouldn't be any
+    // reachable) sees a clean cursor.
+    ctx.chunk.freereg = func.0;
     Ok(())
 }
 
@@ -2100,6 +2267,7 @@ fn compile_tail_method_call(ctx: &mut Ctx, item: MethodCall) -> Result<(), Compi
         func: func.0,
         args: nargs as u8 + 1,
     });
+    ctx.chunk.freereg = func.0;
     Ok(())
 }
 
@@ -2138,7 +2306,7 @@ fn emit_method_call_setup(
     });
 
     let self_reg = RegisterIndex(func.0 + 1);
-    while ctx.chunk.register_count <= self_reg.0 as usize {
+    while ctx.chunk.freereg <= self_reg.0 {
         ctx.alloc_register()?;
     }
     ctx.emit(Instruction::MOVE {
@@ -2153,7 +2321,7 @@ fn emit_method_call_setup(
         let expected_reg = RegisterIndex(func.0 + 2 + i as u8);
         let arg = compile_expr_to_reg(ctx, arg_expr, Some(expected_reg))?;
         if arg != expected_reg {
-            while ctx.chunk.register_count <= expected_reg.0 as usize {
+            while ctx.chunk.freereg <= expected_reg.0 {
                 ctx.alloc_register()?;
             }
             ctx.emit(Instruction::MOVE {
@@ -2179,6 +2347,9 @@ fn compile_expr_method_call(
         returns: want as u8 + 1,
     });
 
+    // Results occupy [func, func+want); reclaim arg temps above.
+    ctx.chunk.freereg = func.0 + want as u8;
+
     let mut results = Vec::with_capacity(want);
     for i in 0..want {
         results.push(RegisterIndex(func.0 + i as u8));
@@ -2195,6 +2366,9 @@ fn compile_expr_index(
     let key_expr = item.index().ok_or_else(|| ice("index without key"))?;
     let table = compile_expr_to_reg(ctx, target_expr, None)?;
     let key = compile_expr_to_reg(ctx, key_expr, None)?;
+    // Both operands have been captured into the upcoming GETTABLE; free
+    // their temps (higher first) so `dst` can reuse the slot.
+    ctx.free_regs(table, key);
     let dst = ctx.dst_or_alloc(dst)?;
     ctx.emit(Instruction::GETTABLE {
         dst: dst.0,
@@ -2258,7 +2432,7 @@ fn compile_return_generic(ctx: &mut Ctx, exprs: Vec<Expr>) -> Result<(), Compile
         let target = RegisterIndex(first_reg.0 + i as u8);
         let reg = compile_expr_to_reg(ctx, expr, Some(target))?;
         if reg != target {
-            while ctx.chunk.register_count <= target.0 as usize {
+            while ctx.chunk.freereg <= target.0 {
                 ctx.alloc_register()?;
             }
             ctx.emit(Instruction::MOVE {
@@ -2436,13 +2610,17 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
         let limit_reg = ctx.alloc_register()?;
         let step_reg = ctx.alloc_register()?;
 
-        // Compile init, limit, step with destination hints
+        // Compile init, limit, step with destination hints. Each sub-MOVE
+        // path frees the source temp so freereg settles at step_reg+1
+        // when this block finishes — the explicit reset is no longer
+        // needed (see the assert below).
         let init = compile_expr_to_reg(ctx, init_expr, Some(base))?;
         if init != base {
             ctx.emit(Instruction::MOVE {
                 dst: base.0,
                 src: init.0,
             });
+            ctx.free_reg(init);
         }
 
         let limit = compile_expr_to_reg(ctx, limit_expr, Some(limit_reg))?;
@@ -2451,6 +2629,7 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
                 dst: limit_reg.0,
                 src: limit.0,
             });
+            ctx.free_reg(limit);
         }
 
         if let Some(step_expr) = item.step() {
@@ -2460,6 +2639,7 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
                     dst: step_reg.0,
                     src: step.0,
                 });
+                ctx.free_reg(step);
             }
         } else {
             // Default step = 1
@@ -2470,15 +2650,20 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
             });
         }
 
-        // FORPREP/FORLOOP hardcode the loop variable at base+3, so reclaim
-        // any temps the init/limit/step expressions may have leaked above
-        // step_reg before allocating loop_var. (max_register_count is
-        // unaffected — it tracks peak.)
-        ctx.chunk.register_count = step_reg.0 as usize + 1;
+        // FORPREP/FORLOOP hardcode the loop variable at base+3; with
+        // freereg discipline wired into the subexpression pipeline, this
+        // invariant holds without the former `= step_reg+1` reset.
+        assert_eq!(ctx.chunk.freereg, step_reg.0 + 1);
+
+        // Promote the 3 anonymous control slots to "protected locals" so
+        // subexpressions inside the body can't reclaim them via free_reg.
+        // They're unnamed so upvalue capture won't find them; nactvar's
+        // sole role here is as the free_reg cutoff.
+        ctx.adjust_locals(3);
 
         // base+3 is the visible loop variable
         let loop_var = ctx.alloc_register()?;
-        debug_assert_eq!(loop_var.0, base.0 + 3);
+        assert_eq!(loop_var.0, base.0 + 3);
         ctx.define(
             counter_name,
             VariableData {
@@ -2486,6 +2671,9 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
                 is_const: false,
             },
         )?;
+        // Promote the loop variable to an active local so upvalue-capture
+        // logic sees it and temp reclaims don't touch it.
+        ctx.adjust_locals(1);
 
         let loop_body = ctx.new_label();
         let loop_end = ctx.new_label();
@@ -2546,34 +2734,41 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
         ctx.alloc_register()?; // base+1
         ctx.alloc_register()?; // base+2
 
-        // Compile up to 3 iterator values with destination hints
+        // Compile up to 3 iterator values with destination hints. Each
+        // MOVE path frees its source temp so freereg settles at base+3
+        // naturally.
         for (i, val_expr) in values.into_iter().enumerate().take(3) {
             let target_reg = RegisterIndex(base.0 + i as u8);
             let val = compile_expr_to_reg(ctx, val_expr, Some(target_reg))?;
             if val != target_reg {
-                while ctx.chunk.register_count <= target_reg.0 as usize {
+                while ctx.chunk.freereg <= target_reg.0 {
                     ctx.alloc_register()?;
                 }
                 ctx.emit(Instruction::MOVE {
                     dst: target_reg.0,
                     src: val.0,
                 });
+                ctx.free_reg(val);
             }
         }
 
-        // TFORCALL/TFORLOOP hardcode loop variables at base+3..base+2+count,
-        // so reclaim any temps the iterator-value expressions leaked above
-        // base+2 before allocating loop variables.
-        ctx.chunk.register_count = base.0 as usize + 3;
+        // TFORCALL/TFORLOOP hardcode loop variables at base+3..base+2+count.
+        // The per-expression MOVE frees above keep the cursor disciplined.
+        assert_eq!(ctx.chunk.freereg, base.0 + 3);
+
+        // Promote the 3 anonymous control slots (iterator, state, control)
+        // so body subexpressions can't reclaim them via free_reg.
+        ctx.adjust_locals(3);
 
         // Allocate registers for loop variables and bind them
+        let num_loop_vars = targets.len();
         for (i, target_ident) in targets.into_iter().enumerate() {
             let name = target_ident
                 .name(ctx.interner)
                 .ok_or_else(|| ice("ident without name"))?
                 .to_owned();
             let reg = ctx.alloc_register()?;
-            debug_assert_eq!(reg.0, base.0 + 3 + i as u8);
+            assert_eq!(reg.0, base.0 + 3 + i as u8);
             ctx.define(
                 name,
                 VariableData {
@@ -2582,6 +2777,8 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
                 },
             )?;
         }
+        // Promote the loop variables to active locals.
+        ctx.adjust_locals(num_loop_vars as u8);
 
         let loop_body = ctx.new_label();
         let loop_test = ctx.new_label();

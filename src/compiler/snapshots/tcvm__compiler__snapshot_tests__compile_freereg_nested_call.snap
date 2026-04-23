@@ -1,0 +1,29 @@
+---
+source: src/compiler/snapshot_tests.rs
+expression: output
+---
+; function (params=0, vararg=true, stack=5, upvalues=1)
+; constants:
+;   K0 = 2
+; upvalues:
+;   U0 = local R0
+; code:
+0000  VARARGPREP      fixed=0
+0001  CLOSURE         R0 P0
+0002  MOVE            R1 R0
+0003  MOVE            R2 R0
+0004  MOVE            R3 R0
+0005  LOAD            R4 K0  ; 2
+0006  CALL            R3 args=2 ret=2
+0007  CALL            R2 args=2 ret=2
+0008  TAILCALL        R1 args=2
+0009  RETURN          R0 count=1
+
+; prototype 0:
+  ; function (params=1, vararg=false, stack=3, upvalues=0)
+  ; constants:
+  ;   K0 = 1
+  ; code:
+  0000  LOAD            R2 K0  ; 1
+  0001  ADD             R1 R0 R2
+  0002  RETURN          R1 count=2

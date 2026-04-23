@@ -239,3 +239,14 @@ test!(op_prec, "test-files/op_prec.lua");
 test!(primes, "test-files/primes.lua");
 test!(jens2, "test-files/jens2.lua");
 test!(nested_call, "test-files/nested_call.lua");
+test!(freereg_chain, "test-files/freereg_chain.lua");
+test!(
+    freereg_call_arg_reclaim,
+    "test-files/freereg_call_arg_reclaim.lua"
+);
+test!(freereg_nested_call, "test-files/freereg_nested_call.lua");
+test!(freereg_and_call, "test-files/freereg_and_call.lua");
+test!(
+    freereg_for_num_temps,
+    "test-files/freereg_for_num_temps.lua"
+);

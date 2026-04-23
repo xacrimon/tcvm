@@ -399,4 +399,48 @@ mod tests {
         );
         assert_eq!(n, 6);
     }
+
+    #[test]
+    fn upvalue_captured_after_temps() {
+        // Two-level closure where the inner captures a parent local that was
+        // defined AFTER heavy temp usage. The freereg refactor must keep
+        // the parent's `x` register stable — `free_reg`'s nactvar guard is
+        // the structural pin here.
+        let n = run_returning_int(
+            "local function outer() \
+               local heavy = (1+2)*(3+4) \
+               local x = heavy + 1 \
+               return (function() return x end)() \
+             end \
+             return outer()",
+        );
+        assert_eq!(n, 22); // (1+2)*(3+4) = 21, +1 = 22
+    }
+
+    #[test]
+    fn deeply_nested_calls() {
+        // f(g(h(i(j(1))))) five-deep; each returns arg+1. Stresses that
+        // freereg discipline gives bounded stack growth per call depth.
+        let n = run_returning_int(
+            "local function j(x) return x + 1 end \
+             local function i(x) return j(x) + 1 end \
+             local function h(x) return i(x) + 1 end \
+             local function g(x) return h(x) + 1 end \
+             local function f(x) return g(x) + 1 end \
+             return f(1)",
+        );
+        assert_eq!(n, 6);
+    }
+
+    #[test]
+    fn and_call_local_preservation() {
+        // `a and probe(99)` — short-circuit into a call. The LHS local `a`
+        // must survive; the call's result lands in the destination slot.
+        let n = run_returning_int(
+            "local a = 10 \
+             local b = a and probe(99) \
+             return a + b",
+        );
+        assert_eq!(n, 109);
+    }
 }

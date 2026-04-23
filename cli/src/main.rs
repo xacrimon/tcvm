@@ -1,7 +1,7 @@
 use clap::Parser;
-use std::path::PathBuf;
 use std::fs;
-use tcvm::{Lua, Executor};
+use std::path::PathBuf;
+use tcvm::{Executor, Lua};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
