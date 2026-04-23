@@ -928,8 +928,12 @@ fn compile_function_to_chunk<'gc, 'a>(
         compile_stmt(&mut ctx, stmt)?;
     }
 
-    // Emit implicit return at the end (skip if the last instruction is already a return)
-    let needs_return = !matches!(ctx.chunk.tape.last(), Some(Instruction::RETURN { .. }));
+    // Emit implicit return at the end (skip if the last instruction already
+    // terminates the frame — RETURN, or TAILCALL which is self-unwinding).
+    let needs_return = !matches!(
+        ctx.chunk.tape.last(),
+        Some(Instruction::RETURN { .. } | Instruction::TAILCALL { .. }),
+    );
     if needs_return {
         ctx.emit(Instruction::RETURN {
             values: 0,
@@ -939,7 +943,7 @@ fn compile_function_to_chunk<'gc, 'a>(
 
     let close_regs = ctx.pop_scope()?;
     if let Some(first) = close_regs.first() {
-        // Insert CLOSE before the final RETURN
+        // Insert CLOSE before the final RETURN/TAILCALL
         let return_instr = ctx.chunk.tape.pop().unwrap();
         ctx.chunk.tape.push(Instruction::CLOSE { start: first.0 });
         ctx.chunk.tape.push(return_instr);
