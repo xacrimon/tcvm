@@ -187,3 +187,5 @@ N-way CONCAT — instruction takes count, single emit for a..b..c..d. Relevant f
 Specialized return0, return1, return2?
 
 local function f ... end pre-alloc pattern optimization (separate from the regular-local-decl restructure)
+
+latent bugs with loops in closures and upvalues/tbc
