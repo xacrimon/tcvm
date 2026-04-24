@@ -189,3 +189,5 @@ Specialized return0, return1, return2?
 local function f ... end pre-alloc pattern optimization (separate from the regular-local-decl restructure)
 
 latent bugs with loops in closures and upvalues/tbc
+
+CPS interpreter and adel
