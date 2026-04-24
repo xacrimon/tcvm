@@ -1,4 +1,5 @@
 pub(crate) mod defs;
+pub(crate) mod format;
 mod rules;
 #[cfg(test)]
 mod snapshot_tests;
