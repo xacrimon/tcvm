@@ -1315,24 +1315,7 @@ fn compile_assign(ctx: &mut Ctx, item: Assign) -> Result<(), CompileError> {
     // Pass 4: emit stores for the non-hinted slots.
     for (lv, src) in lvalues.into_iter().zip(&pending) {
         let Some(val) = *src else { continue };
-        match lv {
-            Lvalue::Local { dst } if dst.0 != val => ctx.emit(Instruction::MOVE {
-                dst: dst.0,
-                src: val,
-            }),
-            Lvalue::Local { .. } => {} // self-MOVE; skip
-            Lvalue::Upvalue { idx } => ctx.emit(Instruction::SETUPVAL { src: val, idx }),
-            Lvalue::Global { env_idx, key } => ctx.emit(Instruction::SETTABUP {
-                src: val,
-                idx: env_idx,
-                key,
-            }),
-            Lvalue::Indexed { table, key } => ctx.emit(Instruction::SETTABLE {
-                src: val,
-                table: table.0,
-                key: key.0,
-            }),
-        }
+        emit_store(ctx, lv, val);
     }
 
     assert!(ctx.chunk.freereg >= freereg_before);
@@ -1504,86 +1487,35 @@ fn expr_reads(ctx: &Ctx, expr: &Expr, reg: u8) -> Result<bool, CompileError> {
     })
 }
 
-fn compile_assign_lhs(ctx: &mut Ctx, target: Expr, value: u8) -> Result<(), CompileError> {
-    match target {
-        Expr::Ident(ident) => {
-            let name = ident
-                .name(ctx.interner)
-                .ok_or_else(|| ice("ident without name"))?;
-
-            // Local variable
-            if let Some(data) = ctx.resolve_local(name) {
-                if data.is_const {
-                    return Err(err(
-                        CompileErrorKind::Internal("assignment to const variable"),
-                        LineNumber(0),
-                    ));
-                }
-                let dst = data.register;
-                if dst.0 != value {
-                    ctx.emit(Instruction::MOVE {
-                        dst: dst.0,
-                        src: value,
-                    });
-                }
-                return Ok(());
-            }
-
-            // Upvalue
-            if let Some(idx) = ctx.resolve_upvalue(name) {
-                ctx.emit(Instruction::SETUPVAL { src: value, idx });
-                return Ok(());
-            }
-
-            // Global: _ENV[name]
-            let key = ctx.alloc_string_constant(name.as_bytes())?;
-            let env_idx = ctx
-                .resolve_or_capture("_ENV")
-                .ok_or_else(|| ice("_ENV must resolve; main chunk pre-seeds it"))?;
-            ctx.emit(Instruction::SETTABUP {
-                src: value,
-                idx: env_idx,
-                key,
-            });
-            Ok(())
-        }
-
-        Expr::Index(index) => {
-            let table_expr = index.target().ok_or_else(|| ice("index without target"))?;
-            let key_expr = index.index().ok_or_else(|| ice("index without key"))?;
-            let table = compile_expr_to_reg(ctx, table_expr, None)?;
-            let key = compile_expr_to_reg(ctx, key_expr, None)?;
-            ctx.emit(Instruction::SETTABLE {
-                src: value,
-                table: table.0,
-                key: key.0,
-            });
-            ctx.free_regs(table, key);
-            Ok(())
-        }
-
-        Expr::BinaryOp(binop) => {
-            // Property access: a.b = value
-            let op = binop.op().ok_or_else(|| ice("binop without op"))?;
-            if op == BinaryOperator::Property {
-                let table_expr = binop.lhs().ok_or_else(|| ice("binop without lhs"))?;
-                let field = binop.rhs().ok_or_else(|| ice("binop without rhs"))?;
-                let table = compile_expr_to_reg(ctx, table_expr, None)?;
-                let key = compile_property_key(ctx, field, None)?;
-                ctx.emit(Instruction::SETTABLE {
-                    src: value,
-                    table: table.0,
-                    key: key.0,
-                });
-                ctx.free_regs(table, key);
-                Ok(())
-            } else {
-                Err(ice("non-property binop as assignment target"))
-            }
-        }
-
-        _ => Err(ice("invalid assignment target")),
+/// Emit the store instruction for a resolved Lvalue from a source register.
+/// Local self-stores are elided.
+fn emit_store(ctx: &mut Ctx, lv: Lvalue, src: u8) {
+    match lv {
+        Lvalue::Local { dst } if dst.0 != src => ctx.emit(Instruction::MOVE { dst: dst.0, src }),
+        Lvalue::Local { .. } => {} // self-MOVE; skip
+        Lvalue::Upvalue { idx } => ctx.emit(Instruction::SETUPVAL { src, idx }),
+        Lvalue::Global { env_idx, key } => ctx.emit(Instruction::SETTABUP {
+            src,
+            idx: env_idx,
+            key,
+        }),
+        Lvalue::Indexed { table, key } => ctx.emit(Instruction::SETTABLE {
+            src,
+            table: table.0,
+            key: key.0,
+        }),
     }
+}
+
+/// Single-target assignment: resolve the LHS and emit the store. Used by
+/// `function name() ... end`, where there's exactly one target and no
+/// aliasing to guard against.
+fn compile_assign_lhs(ctx: &mut Ctx, target: Expr, value: u8) -> Result<(), CompileError> {
+    let freereg_before = ctx.chunk.freereg;
+    let lv = compile_lvalue(ctx, target, &[])?;
+    emit_store(ctx, lv, value);
+    ctx.chunk.freereg = freereg_before;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1867,15 +1799,7 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
                 }
 
                 let field = map.field().ok_or_else(|| ice("table map without field"))?;
-                let field_name = field
-                    .name(ctx.interner)
-                    .ok_or_else(|| ice("ident without name"))?;
-                let key_idx = ctx.alloc_string_constant(field_name.as_bytes())?;
-                let key = ctx.alloc_register()?;
-                ctx.emit(Instruction::LOAD {
-                    dst: key.0,
-                    idx: key_idx,
-                });
+                let key = compile_property_key(ctx, Expr::Ident(field), None)?;
 
                 let value_expr = map.value().ok_or_else(|| ice("table map without value"))?;
                 let val = compile_expr_to_reg(ctx, value_expr, None)?;
