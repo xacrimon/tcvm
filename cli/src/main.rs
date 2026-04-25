@@ -24,9 +24,7 @@ fn main() {
     if args.list {
         let listing = lua.enter(|ctx| {
             let chunk = ctx.load(&source, Some("test")).unwrap();
-            let closure = chunk
-                .as_lua()
-                .expect("loaded chunk must be a Lua closure");
+            let closure = chunk.as_lua().expect("loaded chunk must be a Lua closure");
             format_prototype(&closure.proto)
         });
         print!("{listing}");

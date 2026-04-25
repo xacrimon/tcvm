@@ -1,0 +1,21 @@
+---
+source: src/compiler/snapshot_tests.rs
+expression: output
+---
+; function (params=0, vararg=true, stack=4, upvalues=1)
+; constants:
+;   K0 = 3
+;   K1 = 1
+;   K2 = 20
+; upvalues:
+;   U0 = local R0
+; code:
+0000  VARARGPREP      fixed=0
+0001  LOAD            R0 K0  ; 3
+0002  NEWTABLE        R1
+0003  MOVE            R2 R0
+0004  LOAD            R3 K1  ; 1
+0005  ADD             R0 R0 R3
+0006  LOAD            R3 K2  ; 20
+0007  SETTABLE        R3 R1 R2
+0008  RETURN          R0 count=1

@@ -5,18 +5,18 @@ expression: output
 ; function (params=0, vararg=true, stack=2, upvalues=1)
 ; constants:
 ;   K0 = 5
-;   K1 = 6
-;   K2 = "y"
-;   K3 = 20000000.0
-;   K4 = "z"
+;   K1 = "y"
+;   K2 = 6
+;   K3 = "z"
+;   K4 = 20000000.0
 ; upvalues:
 ;   U0 = local R0
 ; code:
 0000  VARARGPREP      fixed=0
 0001  LOAD            R0 K0  ; 5
-0002  LOAD            R1 K1  ; 6
+0002  LOAD            R1 K2  ; 6
 0003  UNM             R1 R1
-0004  SETTABUP        R1 U0 K2  ; "y"
-0005  LOAD            R1 K3  ; 20000000.0
-0006  SETTABUP        R1 U0 K4  ; "z"
+0004  SETTABUP        R1 U0 K1  ; "y"
+0005  LOAD            R1 K4  ; 20000000.0
+0006  SETTABUP        R1 U0 K3  ; "z"
 0007  RETURN          R0 count=1

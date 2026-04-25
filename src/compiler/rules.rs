@@ -1189,78 +1189,319 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
 // Assignment
 // ---------------------------------------------------------------------------
 
+/// Pre-resolved LHS of a multi-assignment. Index/Property targets carry
+/// their table-and-key registers, computed eagerly so later RHS values
+/// or earlier-slot stores can't clobber them before the SETTABLE fires.
+enum Lvalue {
+    Local {
+        dst: RegisterIndex,
+    },
+    Upvalue {
+        idx: u8,
+    },
+    Global {
+        env_idx: u8,
+        key: u16,
+    },
+    Indexed {
+        table: RegisterIndex,
+        key: RegisterIndex,
+    },
+}
+
+/// Lua 5.4 §3.3.3 specifies "first evaluate all its expressions and only
+/// then perform the assignments." We honour that without losing the
+/// hint-into-target optimisation by:
+///
+///   1. resolving every LHS to an `Lvalue` up front (Index/Property
+///      sub-expressions land in registers, copied to temps if they
+///      reference a local that's also a target);
+///   2. compiling each RHS, hinting into the slot's target local iff no
+///      later RHS reads it — that lets value computation perform the
+///      assignment as a side effect (no MOVE in pass 4);
+///   3. saving any non-hinted source register that aliases an earlier
+///      target local, so the earlier store doesn't clobber the value a
+///      later store still needs (`b, a = a, b` cycles);
+///   4. emitting the surviving stores.
 fn compile_assign(ctx: &mut Ctx, item: Assign) -> Result<(), CompileError> {
     let targets: Vec<_> = item
         .targets()
         .ok_or_else(|| ice("assign without targets"))?
         .collect();
-    let values: Vec<_> = item
+    let values: Vec<Expr> = item
         .values()
         .ok_or_else(|| ice("assign without values"))?
         .collect();
 
     let num_targets = targets.len();
     let num_values = values.len();
-
-    // Resolve destination hints for local variable targets
-    let hints: Vec<Option<RegisterIndex>> = targets
-        .iter()
-        .map(|target| {
-            if let Expr::Ident(ident) = target {
-                let name = ident.name(ctx.interner)?;
-                let data = ctx.resolve_local(name)?;
-                if !data.is_const {
-                    return Some(data.register);
-                }
-            }
-            None
-        })
-        .collect();
-
-    // Snapshot freereg so we can reclaim all value-computation temps at
-    // the end of the assignment — sources may be either `local`'s fixed
-    // slots (no-op to free) or one-shot temps above nactvar.
     let freereg_before = ctx.chunk.freereg;
 
-    // Compile values
-    let mut sources = Vec::new();
+    // Set of local registers that are themselves LHS targets — drives
+    // the conflict checks in pass 1 and pass 3.
+    let target_local_regs: Vec<u8> = targets
+        .iter()
+        .filter_map(|t| target_local_reg(ctx, t))
+        .collect();
+
+    // Pass 1: resolve LHS targets.
+    let mut lvalues: Vec<Lvalue> = Vec::with_capacity(num_targets);
+    for target in targets {
+        lvalues.push(compile_lvalue(ctx, target, &target_local_regs)?);
+    }
+
+    // Decide per-slot whether it's safe to hint the RHS directly into
+    // the target local: only when the target is a local AND no later
+    // RHS reads that local (an in-place hint *is* an early assignment).
+    let mut hints: Vec<Option<RegisterIndex>> = Vec::with_capacity(num_values);
+    for i in 0..num_values {
+        let h = match local_dst(&lvalues[i]) {
+            Some(dst) if !any_reads(ctx, &values[i + 1..], dst.0)? => Some(dst),
+            _ => None,
+        };
+        hints.push(h);
+    }
+
+    // Pass 2: compile RHS values. `pending[i] = Some(reg)` means pass 4
+    // must emit a store from `reg`; `None` means the value was hinted
+    // straight into the target local already.
+    let mut pending: Vec<Option<u8>> = Vec::with_capacity(num_targets);
     for (i, expr) in values.into_iter().enumerate() {
         let is_last = i == num_values - 1;
-
         if is_last
             && num_targets > num_values
             && let Expr::FuncCall(call) = expr
         {
-            let want = num_targets - i;
-            let regs = compile_expr_func_call(ctx, call, want)?;
-            sources.extend(regs.into_iter().map(|r| r.0));
+            let want = num_targets - pending.len();
+            for r in compile_expr_func_call(ctx, call, want)? {
+                pending.push(Some(r.0));
+            }
             continue;
         }
-
-        let hint = hints.get(i).copied().flatten();
+        let hint = hints[i];
         let reg = compile_expr_to_reg(ctx, expr, hint)?;
-        sources.push(reg.0);
+        pending.push(if hint == Some(reg) { None } else { Some(reg.0) });
     }
 
-    // Pad with nil if fewer values than targets
-    while sources.len() < num_targets {
-        let reg = ctx.alloc_register()?;
-        let idx = ctx.alloc_constant(Value::Nil)?;
-        ctx.emit(Instruction::LOAD { dst: reg.0, idx });
-        sources.push(reg.0);
+    // Pad with nil if fewer values than targets. A nil pad reads nothing,
+    // so hinting into a Local target is always safe.
+    while pending.len() < num_targets {
+        let i = pending.len();
+        let nil = ctx.alloc_constant(Value::Nil)?;
+        let hint = local_dst(&lvalues[i]);
+        let reg = ctx.dst_or_alloc(hint)?;
+        ctx.emit(Instruction::LOAD {
+            dst: reg.0,
+            idx: nil,
+        });
+        pending.push(if hint == Some(reg) { None } else { Some(reg.0) });
     }
 
-    // Assign each target
-    for (target, value) in targets.into_iter().zip(sources) {
-        compile_assign_lhs(ctx, target, value)?;
+    // Pass 3: any source register that aliases an earlier slot's target
+    // local will be clobbered by that earlier store — save it now.
+    for j in 0..num_targets {
+        let Some(r) = pending[j] else { continue };
+        let collides = (0..j).any(|i| local_dst(&lvalues[i]).is_some_and(|d| d.0 == r));
+        if collides {
+            let temp = ctx.alloc_register()?;
+            ctx.emit(Instruction::MOVE {
+                dst: temp.0,
+                src: r,
+            });
+            pending[j] = Some(temp.0);
+        }
     }
 
-    // Reclaim any temps left above nactvar that were computed for values.
-    // Locals stay put (their slots are below `freereg_before`).
+    // Pass 4: emit stores for the non-hinted slots.
+    for (lv, src) in lvalues.into_iter().zip(&pending) {
+        let Some(val) = *src else { continue };
+        match lv {
+            Lvalue::Local { dst } if dst.0 != val => ctx.emit(Instruction::MOVE {
+                dst: dst.0,
+                src: val,
+            }),
+            Lvalue::Local { .. } => {} // self-MOVE; skip
+            Lvalue::Upvalue { idx } => ctx.emit(Instruction::SETUPVAL { src: val, idx }),
+            Lvalue::Global { env_idx, key } => ctx.emit(Instruction::SETTABUP {
+                src: val,
+                idx: env_idx,
+                key,
+            }),
+            Lvalue::Indexed { table, key } => ctx.emit(Instruction::SETTABLE {
+                src: val,
+                table: table.0,
+                key: key.0,
+            }),
+        }
+    }
+
     assert!(ctx.chunk.freereg >= freereg_before);
     ctx.chunk.freereg = freereg_before;
-
     Ok(())
+}
+
+/// Resolve an LHS target to an `Lvalue`. Index/Property sub-expressions
+/// are materialised into registers; any sub-expression result that
+/// happens to be a target local is copied into a temp so that a later
+/// assignment to that local cannot disturb this Indexed's table or key.
+fn compile_lvalue(
+    ctx: &mut Ctx,
+    target: Expr,
+    target_local_regs: &[u8],
+) -> Result<Lvalue, CompileError> {
+    match target {
+        Expr::Ident(ident) => {
+            let name = ident
+                .name(ctx.interner)
+                .ok_or_else(|| ice("ident without name"))?;
+            if let Some(data) = ctx.resolve_local(name) {
+                if data.is_const {
+                    return Err(err(
+                        CompileErrorKind::Internal("assignment to const variable"),
+                        LineNumber(0),
+                    ));
+                }
+                Ok(Lvalue::Local { dst: data.register })
+            } else if let Some(idx) = ctx.resolve_upvalue(name) {
+                Ok(Lvalue::Upvalue { idx })
+            } else {
+                let key = ctx.alloc_string_constant(name.as_bytes())?;
+                let env_idx = ctx
+                    .resolve_or_capture("_ENV")
+                    .ok_or_else(|| ice("_ENV must resolve; main chunk pre-seeds it"))?;
+                Ok(Lvalue::Global { env_idx, key })
+            }
+        }
+        Expr::Index(index) => {
+            let t = index.target().ok_or_else(|| ice("index without target"))?;
+            let k = index.index().ok_or_else(|| ice("index without key"))?;
+            let table = compile_indexed_subexpr(ctx, t, target_local_regs)?;
+            let key = compile_indexed_subexpr(ctx, k, target_local_regs)?;
+            Ok(Lvalue::Indexed { table, key })
+        }
+        Expr::BinaryOp(binop) if binop.op() == Some(BinaryOperator::Property) => {
+            let t = binop.lhs().ok_or_else(|| ice("binop without lhs"))?;
+            let f = binop.rhs().ok_or_else(|| ice("binop without rhs"))?;
+            let table = compile_indexed_subexpr(ctx, t, target_local_regs)?;
+            // Property key is a freshly-LOADed string constant — its
+            // register is a fresh temp, never a target local.
+            let key = compile_property_key(ctx, f, None)?;
+            Ok(Lvalue::Indexed { table, key })
+        }
+        Expr::BinaryOp(_) => Err(ice("non-property binop as assignment target")),
+        _ => Err(ice("invalid assignment target")),
+    }
+}
+
+/// Compile a sub-expression of an Indexed lvalue (table or key) into a
+/// register, copying to a fresh temp if the result coincides with a
+/// local that's also a target.
+fn compile_indexed_subexpr(
+    ctx: &mut Ctx,
+    expr: Expr,
+    target_local_regs: &[u8],
+) -> Result<RegisterIndex, CompileError> {
+    let reg = compile_expr_to_reg(ctx, expr, None)?;
+    if !target_local_regs.contains(&reg.0) {
+        return Ok(reg);
+    }
+    let temp = ctx.alloc_register()?;
+    ctx.emit(Instruction::MOVE {
+        dst: temp.0,
+        src: reg.0,
+    });
+    Ok(temp)
+}
+
+/// The local register a non-const local-ident target compiles into,
+/// or `None` for any other target shape.
+fn target_local_reg(ctx: &Ctx, target: &Expr) -> Option<u8> {
+    let Expr::Ident(ident) = target else {
+        return None;
+    };
+    let name = ident.name(ctx.interner)?;
+    let data = ctx.resolve_local(name)?;
+    (!data.is_const).then_some(data.register.0)
+}
+
+fn local_dst(lv: &Lvalue) -> Option<RegisterIndex> {
+    match lv {
+        Lvalue::Local { dst } => Some(*dst),
+        _ => None,
+    }
+}
+
+/// True if any of `exprs`, evaluated immediately, performs a register
+/// read from `reg`. Used to gate hint-into-target — if a later RHS
+/// reads the local, hinting would corrupt that read.
+///
+/// `function ... end` literals don't count: the body's reads happen at
+/// call time via upvalues. Field-name idents under `.`/`:` don't count
+/// either: they're string keys, not variable reads.
+fn any_reads(ctx: &Ctx, exprs: &[Expr], reg: u8) -> Result<bool, CompileError> {
+    for e in exprs {
+        if expr_reads(ctx, e, reg)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn expr_reads(ctx: &Ctx, expr: &Expr, reg: u8) -> Result<bool, CompileError> {
+    let any = |opt: Option<Expr>| -> Result<bool, CompileError> {
+        opt.as_ref().map_or(Ok(false), |e| expr_reads(ctx, e, reg))
+    };
+    Ok(match expr {
+        Expr::Literal(_) | Expr::VarArg | Expr::Func(_) => false,
+        Expr::Ident(ident) => ident
+            .name(ctx.interner)
+            .and_then(|n| ctx.resolve_local(n))
+            .is_some_and(|d| d.register.0 == reg),
+        Expr::PrefixOp(p) => any(p.rhs())?,
+        Expr::BinaryOp(b) => {
+            let skip_rhs = matches!(
+                b.op(),
+                Some(BinaryOperator::Property | BinaryOperator::Method)
+            );
+            any(b.lhs())? || (!skip_rhs && any(b.rhs())?)
+        }
+        Expr::Index(i) => any(i.target())? || any(i.index())?,
+        Expr::FuncCall(c) => {
+            if any(c.target())? {
+                return Ok(true);
+            }
+            for arg in c.args().into_iter().flatten() {
+                if expr_reads(ctx, &arg, reg)? {
+                    return Ok(true);
+                }
+            }
+            false
+        }
+        Expr::Method(m) => {
+            if any(m.object())? {
+                return Ok(true);
+            }
+            for arg in m.args().into_iter().flatten() {
+                if expr_reads(ctx, &arg, reg)? {
+                    return Ok(true);
+                }
+            }
+            false
+        }
+        Expr::Table(t) => {
+            for entry in t.entries() {
+                let touched = match entry {
+                    TableEntry::Array(a) => any(a.value())?,
+                    TableEntry::Map(m) => any(m.value())?,
+                    TableEntry::Generic(g) => any(g.index())? || any(g.value())?,
+                };
+                if touched {
+                    return Ok(true);
+                }
+            }
+            false
+        }
+    })
 }
 
 fn compile_assign_lhs(ctx: &mut Ctx, target: Expr, value: u8) -> Result<(), CompileError> {

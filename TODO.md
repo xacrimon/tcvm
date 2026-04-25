@@ -191,3 +191,5 @@ local function f ... end pre-alloc pattern optimization (separate from the regul
 latent bugs with loops in closures and upvalues/tbc
 
 CPS interpreter and adel
+
+what else dues lua do for better code that we don't?

@@ -61,3 +61,17 @@ test!(
     freereg_for_num_temps,
     "test-files/freereg_for_num_temps.lua"
 );
+test!(multi_assign_swap, "test-files/multi_assign_swap.lua");
+test!(multi_assign_cycle, "test-files/multi_assign_cycle.lua");
+test!(
+    multi_assign_index_conflict,
+    "test-files/multi_assign_index_conflict.lua"
+);
+test!(
+    multi_assign_property_conflict,
+    "test-files/multi_assign_property_conflict.lua"
+);
+test!(
+    multi_assign_no_conflict,
+    "test-files/multi_assign_no_conflict.lua"
+);

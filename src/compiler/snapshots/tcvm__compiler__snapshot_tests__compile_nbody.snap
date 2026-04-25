@@ -277,7 +277,7 @@ expression: output
 0213  RETURN          R0 count=1
 
 ; prototype 0:
-  ; function (params=3, vararg=false, stack=29, upvalues=1)
+  ; function (params=3, vararg=false, stack=30, upvalues=1)
   ; constants:
   ;   K0 = 1
   ;   K1 = "x"
@@ -345,23 +345,23 @@ expression: output
   0052  MUL             R27 R22 R26
   0053  SUB             R14 R14 R27
   0054  LOAD            R27 K5  ; "vx"
-  0055  GETTABLE        R27 R19 R27
-  0056  MUL             R28 R20 R25
-  0057  ADD             R27 R27 R28
-  0058  LOAD            R28 K5  ; "vx"
-  0059  SETTABLE        R27 R19 R28
+  0055  LOAD            R28 K5  ; "vx"
+  0056  GETTABLE        R28 R19 R28
+  0057  MUL             R29 R20 R25
+  0058  ADD             R28 R28 R29
+  0059  SETTABLE        R28 R19 R27
   0060  LOAD            R27 K6  ; "vy"
-  0061  GETTABLE        R27 R19 R27
-  0062  MUL             R28 R21 R25
-  0063  ADD             R27 R27 R28
-  0064  LOAD            R28 K6  ; "vy"
-  0065  SETTABLE        R27 R19 R28
+  0061  LOAD            R28 K6  ; "vy"
+  0062  GETTABLE        R28 R19 R28
+  0063  MUL             R29 R21 R25
+  0064  ADD             R28 R28 R29
+  0065  SETTABLE        R28 R19 R27
   0066  LOAD            R27 K7  ; "vz"
-  0067  GETTABLE        R27 R19 R27
-  0068  MUL             R28 R22 R25
-  0069  ADD             R27 R27 R28
-  0070  LOAD            R28 K7  ; "vz"
-  0071  SETTABLE        R27 R19 R28
+  0067  LOAD            R28 K7  ; "vz"
+  0068  GETTABLE        R28 R19 R28
+  0069  MUL             R29 R22 R25
+  0070  ADD             R28 R28 R29
+  0071  SETTABLE        R28 R19 R27
   0072  FORLOOP         R15 -49
   0073  LOAD            R15 K5  ; "vx"
   0074  SETTABLE        R12 R7 R15
@@ -376,29 +376,29 @@ expression: output
   0083  FORPREP         R3 +26
   0084  GETTABLE        R7 R0 R6
   0085  LOAD            R8 K1  ; "x"
-  0086  GETTABLE        R8 R7 R8
-  0087  LOAD            R9 K5  ; "vx"
-  0088  GETTABLE        R9 R7 R9
-  0089  MUL             R9 R2 R9
-  0090  ADD             R8 R8 R9
-  0091  LOAD            R9 K1  ; "x"
-  0092  SETTABLE        R8 R7 R9
+  0086  LOAD            R9 K1  ; "x"
+  0087  GETTABLE        R9 R7 R9
+  0088  LOAD            R10 K5  ; "vx"
+  0089  GETTABLE        R10 R7 R10
+  0090  MUL             R10 R2 R10
+  0091  ADD             R9 R9 R10
+  0092  SETTABLE        R9 R7 R8
   0093  LOAD            R8 K2  ; "y"
-  0094  GETTABLE        R8 R7 R8
-  0095  LOAD            R9 K6  ; "vy"
-  0096  GETTABLE        R9 R7 R9
-  0097  MUL             R9 R2 R9
-  0098  ADD             R8 R8 R9
-  0099  LOAD            R9 K2  ; "y"
-  0100  SETTABLE        R8 R7 R9
+  0094  LOAD            R9 K2  ; "y"
+  0095  GETTABLE        R9 R7 R9
+  0096  LOAD            R10 K6  ; "vy"
+  0097  GETTABLE        R10 R7 R10
+  0098  MUL             R10 R2 R10
+  0099  ADD             R9 R9 R10
+  0100  SETTABLE        R9 R7 R8
   0101  LOAD            R8 K3  ; "z"
-  0102  GETTABLE        R8 R7 R8
-  0103  LOAD            R9 K7  ; "vz"
-  0104  GETTABLE        R9 R7 R9
-  0105  MUL             R9 R2 R9
-  0106  ADD             R8 R8 R9
-  0107  LOAD            R9 K3  ; "z"
-  0108  SETTABLE        R8 R7 R9
+  0102  LOAD            R9 K3  ; "z"
+  0103  GETTABLE        R9 R7 R9
+  0104  LOAD            R10 K7  ; "vz"
+  0105  GETTABLE        R10 R7 R10
+  0106  MUL             R10 R2 R10
+  0107  ADD             R9 R9 R10
+  0108  SETTABLE        R9 R7 R8
   0109  FORLOOP         R3 -26
   0110  RETURN          R0 count=1
 
@@ -513,25 +513,25 @@ expression: output
   0020  MUL             R11 R11 R10
   0021  ADD             R4 R4 R11
   0022  FORLOOP         R5 -16
-  0023  UNM             R5 R2
-  0024  GETUPVAL        R6 U0
-  0025  DIV             R5 R5 R6
-  0026  LOAD            R6 K1  ; 1
-  0027  GETTABLE        R6 R0 R6
-  0028  LOAD            R7 K3  ; "vx"
-  0029  SETTABLE        R5 R6 R7
-  0030  UNM             R5 R3
-  0031  GETUPVAL        R6 U0
-  0032  DIV             R5 R5 R6
-  0033  LOAD            R6 K1  ; 1
-  0034  GETTABLE        R6 R0 R6
-  0035  LOAD            R7 K4  ; "vy"
-  0036  SETTABLE        R5 R6 R7
-  0037  UNM             R5 R4
-  0038  GETUPVAL        R6 U0
-  0039  DIV             R5 R5 R6
-  0040  LOAD            R6 K1  ; 1
-  0041  GETTABLE        R6 R0 R6
-  0042  LOAD            R7 K5  ; "vz"
-  0043  SETTABLE        R5 R6 R7
+  0023  LOAD            R5 K1  ; 1
+  0024  GETTABLE        R5 R0 R5
+  0025  LOAD            R6 K3  ; "vx"
+  0026  UNM             R7 R2
+  0027  GETUPVAL        R8 U0
+  0028  DIV             R7 R7 R8
+  0029  SETTABLE        R7 R5 R6
+  0030  LOAD            R5 K1  ; 1
+  0031  GETTABLE        R5 R0 R5
+  0032  LOAD            R6 K4  ; "vy"
+  0033  UNM             R7 R3
+  0034  GETUPVAL        R8 U0
+  0035  DIV             R7 R7 R8
+  0036  SETTABLE        R7 R5 R6
+  0037  LOAD            R5 K1  ; 1
+  0038  GETTABLE        R5 R0 R5
+  0039  LOAD            R6 K5  ; "vz"
+  0040  UNM             R7 R4
+  0041  GETUPVAL        R8 U0
+  0042  DIV             R7 R7 R8
+  0043  SETTABLE        R7 R5 R6
   0044  RETURN          R0 count=1
