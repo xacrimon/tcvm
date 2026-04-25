@@ -37,7 +37,7 @@ pub struct CallFrame<'gc> {
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub struct ThreadState<'gc> {
-    // TODO: custom collect impl to avoid unused stack slots keeping values alive.
+    // See #43: custom Collect impl to avoid unused stack slots keeping values alive.
     pub stack: Vec<Value<'gc>>,
     pub frames: Vec<CallFrame<'gc>>,
     pub open_upvalues: Vec<Upvalue<'gc>>,

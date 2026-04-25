@@ -5,6 +5,7 @@ use crate::dmm::gc::Gc;
 use crate::dmm::types::GcBox;
 
 use core::fmt::{self, Debug};
+use std::ptr;
 
 pub struct GcWeak<'gc, T: ?Sized + 'gc> {
     pub(crate) inner: Gc<'gc, T>,
@@ -104,9 +105,7 @@ impl<'gc, T: ?Sized + 'gc> GcWeak<'gc, T> {
     /// pointers.
     #[inline]
     pub fn ptr_eq(this: GcWeak<'gc, T>, other: GcWeak<'gc, T>) -> bool {
-        // TODO: Equivalent to `core::ptr::addr_eq`:
-        // https://github.com/rust-lang/rust/issues/116324
-        this.as_ptr() as *const () == other.as_ptr() as *const ()
+        ptr::addr_eq( this.as_ptr(), other.as_ptr())
     }
 
     #[inline]

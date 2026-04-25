@@ -5,7 +5,7 @@ use core::{
     hash::{Hash, Hasher},
     marker::PhantomData,
     ops::Deref,
-    ptr::NonNull,
+    ptr::{self, NonNull},
 };
 
 use crate::dmm::{
@@ -213,9 +213,7 @@ impl<'gc, T: ?Sized + 'gc> Gc<'gc, T> {
     /// pointers.
     #[inline]
     pub fn ptr_eq(this: Gc<'gc, T>, other: Gc<'gc, T>) -> bool {
-        // TODO: Equivalent to `core::ptr::addr_eq`:
-        // https://github.com/rust-lang/rust/issues/116324
-        Gc::as_ptr(this) as *const () == Gc::as_ptr(other) as *const ()
+        ptr::addr_eq( Gc::as_ptr(this), Gc::as_ptr(other))
     }
 
     #[inline]

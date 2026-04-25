@@ -1,7 +1,7 @@
 use crate::Context;
 use crate::env::{Function, LuaString, NativeContext, NativeError, NativeFn, Stack, Table, Value};
 
-// TODO: predefined handles — stdin, stdout, stderr
+// See #27: predefined handles — stdin, stdout, stderr
 
 pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[
@@ -80,7 +80,7 @@ fn lua_write<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Resul
     todo!()
 }
 
-// TODO: file-handle methods — registered on the file-userdata metatable once
+// See #27: file-handle methods — registered on the file-userdata metatable once
 // userdata plumbing exists.
 
 #[allow(dead_code)]

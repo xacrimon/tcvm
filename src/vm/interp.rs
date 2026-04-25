@@ -251,7 +251,7 @@ extern "rust-preserve-none" fn impl_error<'gc>(
     ip: *const Instruction,
     _handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    // TODO: compute proper PC from current frame's prototype code base
+    // See #44: compute proper PC from current frame's prototype code base.
     Err(Box::new(Error { pc: 0 }))
 }
 
@@ -1443,7 +1443,7 @@ extern "rust-preserve-none" fn op_vararg<'gc>(
     // Actually they're at stack[base - num_extra .. base] where the caller put them
     // For now: the varargs sit in the slots between (base - num_extra) and base
     // The exact number of varargs depends on how many args were actually passed.
-    // TODO: track actual arg count to properly copy varargs
+    // See #26: track actual arg count to properly copy varargs.
     let wanted = if count == 0 { 0 } else { count as usize - 1 };
     for i in 0..wanted {
         *reg!(mut dst + i as u8) = Value::Nil;
@@ -1466,7 +1466,7 @@ extern "rust-preserve-none" fn op_varargprep<'gc>(
     // VARARGPREP is the first instruction of a vararg function.
     // In Lua 5.4, this adjusts the stack so that fixed params are in the
     // right place and extra args are accessible by VARARG.
-    // TODO: implement vararg stack adjustment when we track actual arg count
+    // See #26: implement vararg stack adjustment when we track actual arg count.
     dispatch!();
 }
 
@@ -1515,11 +1515,11 @@ fn to_number(v: Value) -> Option<f64> {
 }
 
 /// Close all TBC variables at stack indices >= `start_idx`.
-/// Removes them from the tracking list; __close invocation is TODO.
+/// Removes them from the tracking list; __close invocation is pending (see #45).
 fn close_tbc_vars<'gc>(_mc: &Mutation<'gc>, thread: &mut ThreadState<'gc>, start_idx: usize) {
     thread.tbc_slots.retain(|&slot| {
         if slot >= start_idx {
-            // TODO: invoke __close metamethod on thread.stack[slot]
+            // See #45: invoke __close metamethod on thread.stack[slot].
             false
         } else {
             true
@@ -1815,7 +1815,7 @@ pub(crate) enum CallTarget<'gc> {
 /// current callee as the first argument (Lua 5.4 `tryfuncTM` behavior).
 /// Returns the resolved target and the (possibly adjusted) `nargs`, or
 /// `None` if the chain is unresolvable: non-callable value, variadic call
-/// with `__call` (TODO), or `MAX_TAG_LOOP` exhaustion. Callers raise on
+/// with `__call` (see #46), or `MAX_TAG_LOOP` exhaustion. Callers raise on
 /// `None`.
 #[inline]
 fn resolve_call_chain<'gc>(
@@ -1840,7 +1840,7 @@ fn resolve_call_chain<'gc>(
             return None;
         }
         if nargs == 0 {
-            // Variadic + __call not yet supported.
+            // See #46: variadic + __call not yet supported.
             return None;
         }
         let actual_args = nargs as usize - 1;
@@ -1860,7 +1860,7 @@ fn resolve_call_chain<'gc>(
 
 /// Look up a binary metamethod on `lhs` first, then `rhs`. Only checks
 /// metatables on tables; userdata metatables and the string metatable are
-/// TODO until those subsystems are in.
+/// pending those subsystems (see #47).
 #[inline]
 fn binop_metamethod<'gc>(
     mc: &Mutation<'gc>,
@@ -1895,7 +1895,7 @@ fn unop_metamethod<'gc>(mc: &Mutation<'gc>, val: Value<'gc>, name: &[u8]) -> Val
 /// `resolve_call_chain` walks any `__call` hops until it reaches a Lua
 /// closure. On success, returns `(new_ip, new_base)` which the caller should
 /// use to rebind `ip`/`registers` before dispatching. Returns `None` when the
-/// chain is unresolvable — non-callable value, native target (TODO), or
+/// chain is unresolvable — non-callable value, native target (see #32), or
 /// depth exhaustion — in which case callers raise.
 #[inline(never)]
 fn schedule_meta_call<'gc>(
@@ -1936,7 +1936,7 @@ fn schedule_meta_call<'gc>(
     debug_assert!(args.len() < u8::MAX as usize);
     let nargs = (args.len() + 1) as u8;
     let (target, final_nargs) = resolve_call_chain(mc, thread, scratch_func, nargs)?;
-    // TODO: support native metamethod targets. Today `__call`/`__index`/etc.
+    // See #32: support native metamethod targets. Today `__call`/`__index`/etc.
     // resolving to a native callback is rejected — handling it requires either
     // a Callback-kind frame or a per-continuation native dispatch path.
     let closure = match target {

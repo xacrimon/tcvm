@@ -2574,7 +2574,7 @@ fn compile_return(ctx: &mut Ctx, item: Return) -> Result<(), CompileError> {
     // exactly one return expression, directly a call. Matches Lua 5.4's
     // tail-call rule.
     //
-    // TODO: Lua 5.4 does NOT tail-call parenthesised `return (f())`
+    // See #48: Lua 5.4 does NOT tail-call parenthesised `return (f())`
     // because the parens force adjust-to-one. The parser here doesn't
     // surface a distinct paren node, so we over-eagerly tail-call that
     // form for now.

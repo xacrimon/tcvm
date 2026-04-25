@@ -264,7 +264,7 @@ impl Metrics {
     /// debt.
     #[inline]
     pub fn mark_external_allocation(&self, bytes: usize) {
-        cell_update(&self.0.total_external_bytes, |b| b.saturating_add(bytes));
+        self.0.total_external_bytes.update(|b| b.saturating_add(bytes));
     }
 
     /// Call to mark that bytes which have been marked as allocated with
@@ -278,7 +278,7 @@ impl Metrics {
     /// allocation.
     #[inline]
     pub fn mark_external_deallocation(&self, bytes: usize) {
-        cell_update(&self.0.total_external_bytes, |b| b.saturating_sub(bytes));
+        self.0.total_external_bytes.update(|b| b.saturating_sub(bytes));
     }
 
     /// Add artificial debt equivalent to allocating the given number of bytes.
@@ -288,7 +288,7 @@ impl Metrics {
     /// speeds up collection.
     #[inline]
     pub fn add_debt(&self, bytes: usize) {
-        cell_update(&self.0.artificial_debt, |d| d + bytes as f64);
+        self.0.artificial_debt.update(|d| d + bytes as f64);
     }
 
     /// All arena allocation causes the arena to accumulate "allocation debt". This debt is then
@@ -370,51 +370,44 @@ impl Metrics {
 
     #[inline]
     pub(crate) fn mark_gc_allocated(&self, bytes: usize) {
-        cell_update(&self.0.total_gcs, |c| c + 1);
-        cell_update(&self.0.total_gc_bytes, |b| b + bytes);
-        cell_update(&self.0.allocated_gc_bytes, |b| b.saturating_add(bytes));
+        self.0.total_gcs.update(|c| c + 1);
+        self.0.total_gc_bytes.update(|b| b + bytes);
+        self.0.allocated_gc_bytes.update(|b| b.saturating_add(bytes));
     }
 
     #[inline]
     pub(crate) fn mark_gc_dropped(&self, bytes: usize) {
-        cell_update(&self.0.dropped_gc_bytes, |b| b.saturating_add(bytes));
+        self.0.dropped_gc_bytes.update(|b| b.saturating_add(bytes));
     }
 
     #[inline]
     pub(crate) fn mark_gc_freed(&self, bytes: usize) {
-        cell_update(&self.0.total_gcs, |c| c - 1);
-        cell_update(&self.0.total_gc_bytes, |b| b - bytes);
-        cell_update(&self.0.freed_gc_bytes, |b| b.saturating_add(bytes));
+        self.0.total_gcs.update(|c| c - 1);
+        self.0.total_gc_bytes.update(|b| b - bytes);
+        self.0.freed_gc_bytes.update(|b| b.saturating_add(bytes));
     }
 
     #[inline]
     pub(crate) fn mark_gc_marked(&self, bytes: usize) {
-        cell_update(&self.0.marked_gcs, |c| c + 1);
-        cell_update(&self.0.marked_gc_bytes, |b| b + bytes);
+        self.0.marked_gcs.update(|c| c + 1);
+        self.0.marked_gc_bytes.update(|b| b + bytes);
     }
 
     #[inline]
     pub(crate) fn mark_gc_traced(&self, bytes: usize) {
-        cell_update(&self.0.traced_gcs, |c| c + 1);
-        cell_update(&self.0.traced_gc_bytes, |b| b + bytes);
+        self.0.traced_gcs.update(|c| c + 1);
+        self.0.traced_gc_bytes.update(|b| b + bytes);
     }
 
     #[inline]
     pub(crate) fn mark_gc_untraced(&self, bytes: usize) {
-        cell_update(&self.0.traced_gcs, |c| c - 1);
-        cell_update(&self.0.traced_gc_bytes, |b| b - bytes);
+        self.0.traced_gcs.update(|c| c - 1);
+        self.0.traced_gc_bytes.update(|b| b - bytes);
     }
 
     #[inline]
     pub(crate) fn mark_gc_remembered(&self, bytes: usize) {
-        cell_update(&self.0.remembered_gcs, |c| c + 1);
-        cell_update(&self.0.remembered_gc_bytes, |b| b + bytes);
+        self.0.remembered_gcs.update(|c| c + 1);
+        self.0.remembered_gc_bytes.update(|b| b + bytes);
     }
-}
-
-// TODO: Use `Cell::update` when it is available, see:
-// https://github.com/rust-lang/rust/issues/50186
-#[inline]
-fn cell_update<T: Copy>(c: &Cell<T>, f: impl FnOnce(T) -> T) {
-    c.set(f(c.get()))
 }

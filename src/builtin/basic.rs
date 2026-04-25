@@ -1,7 +1,7 @@
 use crate::Context;
 use crate::env::{Function, LuaString, NativeContext, NativeError, NativeFn, Stack, Value};
 
-// TODO: _G, _VERSION
+// See #27: _G, _VERSION
 
 // let add =
 //                    Function::new_native(ctx.mutation(), native_add as NativeFn, Box::new([]));

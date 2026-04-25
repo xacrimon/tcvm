@@ -1,7 +1,7 @@
 use crate::Context;
 use crate::env::{Function, LuaString, NativeContext, NativeError, NativeFn, Stack, Table, Value};
 
-// TODO: constant — charpattern
+// See #27: constant — charpattern
 
 pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[

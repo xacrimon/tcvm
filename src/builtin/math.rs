@@ -1,7 +1,7 @@
 use crate::Context;
 use crate::env::{Function, LuaString, NativeContext, NativeError, NativeFn, Stack, Table, Value};
 
-// TODO: constants — huge, maxinteger, mininteger, pi
+// See #27: constants — huge, maxinteger, mininteger, pi
 
 pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[
