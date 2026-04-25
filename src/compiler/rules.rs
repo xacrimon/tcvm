@@ -610,6 +610,22 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                         src: reg.0,
                     });
                     h
+                } else if hint.is_none() && reg.0 < self.chunk.nactvar {
+                    // No hint and `reg` aliases an active local. Patching
+                    // TESTSETs / emitting LFALSESKIP through `reg` would
+                    // clobber the local on the falsy short-circuit edge.
+                    // Allocate a fresh temp; pre-existing TESTSET/CMP+JMPs
+                    // (emitted by goiftrue/goiffalse above this call)
+                    // still carry NO_REG, so patch_list_aux below rewrites
+                    // their dst to `fresh` and aims them at `final_pos`
+                    // past this MOVE. The truthy fall-through executes the
+                    // MOVE so `fresh` ends up holding the RHS value.
+                    let fresh = self.reserve_reg()?;
+                    self.emit(Instruction::MOVE {
+                        dst: fresh.0,
+                        src: reg.0,
+                    });
+                    fresh
                 } else {
                     reg
                 }

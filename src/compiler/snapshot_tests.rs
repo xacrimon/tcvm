@@ -75,3 +75,7 @@ test!(
     multi_assign_no_conflict,
     "test-files/multi_assign_no_conflict.lua"
 );
+test!(
+    short_circuit_local_clobber,
+    "test-files/short_circuit_local_clobber.lua"
+);

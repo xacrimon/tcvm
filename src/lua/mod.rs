@@ -482,4 +482,57 @@ mod tests {
         );
         assert_eq!(n, 30);
     }
+
+    #[test]
+    fn short_circuit_and_preserves_local_b() {
+        // Issue #3: `local x = a and b` must not clobber the RHS local `b`
+        // on the falsy short-circuit edge (TESTSET dst patched into b's reg).
+        let n = run_returning_int(
+            "local a = false \
+             local b = 5 \
+             local x = a and b \
+             return b",
+        );
+        assert_eq!(n, 5);
+    }
+
+    #[test]
+    fn short_circuit_or_preserves_local_b() {
+        // Issue #3: `local x = a or b` must not clobber the RHS local `b`
+        // on the truthy short-circuit edge.
+        let n = run_returning_int(
+            "local a = 7 \
+             local b = 5 \
+             local x = a or b \
+             return b",
+        );
+        assert_eq!(n, 5);
+    }
+
+    #[test]
+    fn short_circuit_cmp_preserves_local_b() {
+        // Issue #3: `local x = (b == 5) and b` — falsy CMP edge would emit
+        // LFALSESKIP src=b's reg, clobbering the local. Result of the falsy
+        // path must be the boolean `false` while `b` survives.
+        let n = run_returning_int(
+            "local b = 7 \
+             local x = (b == 5) and b \
+             return b",
+        );
+        assert_eq!(n, 7);
+    }
+
+    #[test]
+    fn short_circuit_and_x_value_truthy_lhs() {
+        // Truthy-lhs path: `local x = a and b` evaluates to `b` when `a` is
+        // truthy. Sanity-check that the fresh-temp routing didn't break the
+        // value-correct fall-through.
+        let n = run_returning_int(
+            "local a = 10 \
+             local b = 5 \
+             local x = a and b \
+             return x",
+        );
+        assert_eq!(n, 5);
+    }
 }

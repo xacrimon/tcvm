@@ -1,5 +1,6 @@
 ---
 source: src/compiler/snapshot_tests.rs
+assertion_line: 46
 expression: output
 ---
 ; function (params=0, vararg=true, stack=10, upvalues=1)
@@ -29,11 +30,11 @@ expression: output
 0014  JMP             +2
 0015  LOAD            R4 K1  ; 2
 0016  RETURN          R4 count=2
-0017  TESTSET         R1 R0 inv=true
-0018  JMP             +0
+0017  TESTSET         R4 R0 inv=true
+0018  JMP             +1
 0019  MOVE            R4 R1
-0020  TESTSET         R1 R0 inv=false
-0021  JMP             +0
+0020  TESTSET         R5 R0 inv=false
+0021  JMP             +1
 0022  MOVE            R5 R1
 0023  LT              R0 R1 inv=false
 0024  JMP             +1
