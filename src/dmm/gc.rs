@@ -213,7 +213,7 @@ impl<'gc, T: ?Sized + 'gc> Gc<'gc, T> {
     /// pointers.
     #[inline]
     pub fn ptr_eq(this: Gc<'gc, T>, other: Gc<'gc, T>) -> bool {
-        ptr::addr_eq( Gc::as_ptr(this), Gc::as_ptr(other))
+        ptr::addr_eq(Gc::as_ptr(this), Gc::as_ptr(other))
     }
 
     #[inline]

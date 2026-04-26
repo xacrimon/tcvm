@@ -105,7 +105,7 @@ impl<'gc, T: ?Sized + 'gc> GcWeak<'gc, T> {
     /// pointers.
     #[inline]
     pub fn ptr_eq(this: GcWeak<'gc, T>, other: GcWeak<'gc, T>) -> bool {
-        ptr::addr_eq( this.as_ptr(), other.as_ptr())
+        ptr::addr_eq(this.as_ptr(), other.as_ptr())
     }
 
     #[inline]

@@ -264,7 +264,9 @@ impl Metrics {
     /// debt.
     #[inline]
     pub fn mark_external_allocation(&self, bytes: usize) {
-        self.0.total_external_bytes.update(|b| b.saturating_add(bytes));
+        self.0
+            .total_external_bytes
+            .update(|b| b.saturating_add(bytes));
     }
 
     /// Call to mark that bytes which have been marked as allocated with
@@ -278,7 +280,9 @@ impl Metrics {
     /// allocation.
     #[inline]
     pub fn mark_external_deallocation(&self, bytes: usize) {
-        self.0.total_external_bytes.update(|b| b.saturating_sub(bytes));
+        self.0
+            .total_external_bytes
+            .update(|b| b.saturating_sub(bytes));
     }
 
     /// Add artificial debt equivalent to allocating the given number of bytes.
@@ -372,7 +376,9 @@ impl Metrics {
     pub(crate) fn mark_gc_allocated(&self, bytes: usize) {
         self.0.total_gcs.update(|c| c + 1);
         self.0.total_gc_bytes.update(|b| b + bytes);
-        self.0.allocated_gc_bytes.update(|b| b.saturating_add(bytes));
+        self.0
+            .allocated_gc_bytes
+            .update(|b| b.saturating_add(bytes));
     }
 
     #[inline]
