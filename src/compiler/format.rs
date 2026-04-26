@@ -182,6 +182,9 @@ fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -> String {
         Instruction::VARARGPREP { num_fixed } => {
             format!("VARARGPREP      fixed={num_fixed}")
         }
+        Instruction::ERRNNIL { src, name_key } => {
+            format!("ERRNNIL         R{src} name=K{name_key}")
+        }
         Instruction::NOP => "NOP".to_string(),
         Instruction::STOP => "STOP".to_string(),
     }

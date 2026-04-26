@@ -1,0 +1,32 @@
+---
+source: src/parser/mod.rs
+expression: syntax_tree
+---
+Root@0..31
+  GlobalStmt@0..20
+    Global@0..6 "global"
+    Const@6..13 "<const>"
+    AssignList@13..20
+      GlobalTarget@13..14
+        Ident@13..14
+          Ident@13..14 "X"
+      Comma@14..15 ","
+      GlobalTarget@15..20
+        Ident@15..20
+          Ident@15..20 "print"
+  AssignStmt@20..23
+    AssignList@20..21
+      Ident@20..21
+        Ident@20..21 "X"
+    Assign@21..22 "="
+    ExprList@22..23
+      LiteralExpr@22..23
+        Int@22..23 "1"
+  FuncCall@23..31
+    Ident@23..28
+      Ident@23..28 "print"
+    FuncArgs@28..31
+      LParen@28..29 "("
+      Ident@29..30
+        Ident@29..30 "X"
+      RParen@30..31 ")"

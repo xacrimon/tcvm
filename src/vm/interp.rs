@@ -58,6 +58,7 @@ static HANDLERS: &[Handler] = &[
     op_closure,
     op_vararg,
     op_varargprep,
+    op_errnnil,
     op_nop,
     op_stop,
 ];
@@ -815,7 +816,7 @@ extern "rust-preserve-none" fn op_eq<'gc>(
         dispatch!();
     }
 
-    // Lua 5.4: __eq fires only when both operands are the same non-primitive
+    // Lua 5.5: __eq fires only when both operands are the same non-primitive
     // type (tables or userdata) and raw equality fails.
     let try_meta = matches!(
         (a, b),
@@ -952,7 +953,7 @@ extern "rust-preserve-none" fn op_test<'gc>(
 }
 
 /// If (truthy(R[src]) == inverted) then skip next instruction;
-/// otherwise R[dst] := R[src] and fall through. Matches Lua 5.4 TESTSET.
+/// otherwise R[dst] := R[src] and fall through. Matches Lua 5.5 TESTSET.
 #[inline(never)]
 extern "rust-preserve-none" fn op_testset<'gc>(
     instruction: Instruction,
@@ -1464,9 +1465,26 @@ extern "rust-preserve-none" fn op_varargprep<'gc>(
     helpers!(instruction, mc, thread, registers, ip, handlers);
     let _num_fixed = args!(Instruction::VARARGPREP { num_fixed });
     // VARARGPREP is the first instruction of a vararg function.
-    // In Lua 5.4, this adjusts the stack so that fixed params are in the
+    // In Lua 5.5, this adjusts the stack so that fixed params are in the
     // right place and extra args are accessible by VARARG.
     // See #26: implement vararg stack adjustment when we track actual arg count.
+    dispatch!();
+}
+
+/// Lua 5.5 ERRNNIL: raise if `R[src]` is **not** nil.
+#[inline(never)]
+extern "rust-preserve-none" fn op_errnnil<'gc>(
+    instruction: Instruction,
+    mc: &Mutation<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+) -> Result<(), Box<Error>> {
+    helpers!(instruction, mc, thread, registers, ip, handlers);
+    // TODO: surface the name (see #28).
+    let (src, _name_key) = args!(Instruction::ERRNNIL { src, name_key });
+    check!(reg!(src).is_nil());
     dispatch!();
 }
 
@@ -1812,7 +1830,7 @@ pub(crate) enum CallTarget<'gc> {
 
 /// Walk the `__call` chain at `thread.stack[func_idx]` until we hit a
 /// callable target, shifting args right by one on each hop to prepend the
-/// current callee as the first argument (Lua 5.4 `tryfuncTM` behavior).
+/// current callee as the first argument (Lua 5.5 `tryfuncTM` behavior).
 /// Returns the resolved target and the (possibly adjusted) `nargs`, or
 /// `None` if the chain is unresolvable: non-callable value, variadic call
 /// with `__call` (see #46), or `MAX_TAG_LOOP` exhaustion. Callers raise on

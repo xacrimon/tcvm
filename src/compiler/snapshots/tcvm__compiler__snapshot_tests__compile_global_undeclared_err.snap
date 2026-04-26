@@ -1,0 +1,5 @@
+---
+source: src/compiler/snapshot_tests.rs
+expression: output
+---
+compiler error at line 1: internal compiler error: undeclared global

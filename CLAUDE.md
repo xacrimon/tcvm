@@ -28,7 +28,7 @@ Edition 2024.
 
 ## What This Is
 
-TCVM is a Lua 5.4 bytecode virtual machine written in Rust. It interprets Lua bytecode (does not compile from source yet — the parser is incomplete/early-stage). Reference projects: [piccolo](https://github.com/kyren/piccolo), [dolang](https://github.com/bkoropoff/dolang).
+TCVM is a Lua 5.5 bytecode virtual machine written in Rust. It interprets Lua bytecode (does not compile from source yet — the parser is incomplete/early-stage). Reference projects: [piccolo](https://github.com/kyren/piccolo), [dolang](https://github.com/bkoropoff/dolang).
 
 ## Architecture
 
@@ -56,13 +56,13 @@ Lua runtime value types, all GC-aware:
 
 ### VM Interpreter (`src/vm/`)
 
-- **`interp.rs`** (~1400 lines): Direct-threaded interpreter with 48 opcode handlers. Each handler is a function using `extern "rust-preserve-none"` calling convention. Dispatch works via an array of function pointers and explicit tail calls (`become handler(...)`). Debug builds use bounds-checked register access; release uses raw pointer arithmetic.
+- **`interp.rs`** (~1500 lines): Direct-threaded interpreter with 49 opcode handlers. Each handler is a function using `extern "rust-preserve-none"` calling convention. Dispatch works via an array of function pointers and explicit tail calls (`become handler(...)`). Debug builds use bounds-checked register access; release uses raw pointer arithmetic.
 - **`num.rs`**: Arithmetic and bitwise operation helpers.
 
 ### Instruction Set (`src/instruction.rs`)
 
-48 Lua 5.4 bytecodes covering moves, loads, table ops, arithmetic, bitwise, comparisons, control flow, calls, returns, closures, varargs, and metamethods.
+49 Lua 5.5 bytecodes covering moves, loads, table ops, arithmetic, bitwise, comparisons, control flow, calls, returns, closures, varargs, metamethods, and the 5.5 `ERRNNIL` global-declaration check.
 
 ### Lua reference
 
-A copy of the raw Lua 5.4 reference manual exists in lua_manual.of, you can reference this to obtain and verify language specifics.
+A copy of the raw Lua 5.5 reference manual exists in `manual.of`; reference it to verify language specifics.

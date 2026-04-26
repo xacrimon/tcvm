@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use cstree::interning::TokenInterner;
 
@@ -9,8 +11,8 @@ use crate::env::{LuaString, Prototype, Value};
 use crate::instruction::{Instruction, UpValueDescriptor};
 use crate::parser::syntax::{
     Assign, BinaryOp, BinaryOperator, Break, Decl, DeclModifier, Do, Expr, ForGen, ForNum, Func,
-    FuncCall, FuncExpr, Goto, Ident, If, Index, Label, Literal, LiteralValue, MethodCall, PrefixOp,
-    PrefixOperator, Repeat, Return, Root, Stmt, Table, TableEntry, While,
+    FuncCall, FuncExpr, Global, Goto, Ident, If, Index, Label, Literal, LiteralValue, MethodCall,
+    PrefixOp, PrefixOperator, Repeat, Return, Root, Stmt, Table, TableEntry, While,
 };
 use std::mem;
 
@@ -46,9 +48,76 @@ fn err(kind: CompileErrorKind, line: LineNumber) -> CompileError {
 // Variable tracking
 // ---------------------------------------------------------------------------
 
+/// Local variable kind, mirroring Lua 5.5's `RDK*` enum (`lparser.h`).
+/// Globals (`GDKREG` / `GDKCONST`) are tracked separately on `Ctx::globals`
+/// since they don't occupy a register slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VarKind {
+    /// Regular mutable local (RDKREG).
+    Reg,
+    /// Local declared with `<const>`, plus for-loop control variables
+    /// (RDKCONST / LOOPVARKIND in upstream).
+    Const,
+    /// Local declared with `<close>` — a to-be-closed variable (RDKTOCLOSE).
+    ToClose,
+}
+
+impl VarKind {
+    fn is_const(self) -> bool {
+        matches!(self, VarKind::Const)
+    }
+}
+
+/// Kind of a declared global. Tracks whether a global is read-only
+/// (`global <const> X`) for compile-time assignment rejection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GlobalKind {
+    /// `global X` — writable.
+    Reg,
+    /// `global <const> X` — read-only at the syntactic level.
+    Const,
+}
+
+impl GlobalKind {
+    fn is_const(self) -> bool {
+        matches!(self, GlobalKind::Const)
+    }
+}
+
+/// Lua 5.5 chunk-level global declaration state. Shared by reference
+/// across every nested-function `Ctx` in the same chunk so that a
+/// `global` declaration anywhere in the chunk is visible to every
+/// function. Without this sharing, an inner function would see only
+/// its own (empty) declaration table and miss the outer's.
+struct GlobalEnv {
+    /// Names introduced by an *explicit* `global Name` declaration.
+    /// Reads of these emit `ERRNNIL` after `GETTABUP` (a never-assigned
+    /// declared global is an error in 5.5 — `manual.of:1700`).
+    decls: HashMap<String, GlobalKind>,
+    /// `true` while undeclared free names are allowed and treated as
+    /// implicit globals of `default_kind`. Starts `true` because every
+    /// chunk has an implicit `global *` (`manual.of:225-228`); set to
+    /// `false` by any `global Name(...)` declaration; re-set to `true`
+    /// by an explicit `global<attrib>? *`.
+    default_active: bool,
+    /// Default kind for the implicit / collective `*` declaration.
+    /// Initially `GlobalKind::Reg` to match the preamble's `global *`.
+    default_kind: GlobalKind,
+}
+
+impl GlobalEnv {
+    fn new() -> Self {
+        Self {
+            decls: HashMap::new(),
+            default_active: true,
+            default_kind: GlobalKind::Reg,
+        }
+    }
+}
+
 struct VariableData {
     register: RegisterIndex,
-    is_const: bool,
+    kind: VarKind,
 }
 
 /// Snapshot of the register allocator's state at scope entry. Restored
@@ -99,6 +168,10 @@ struct Ctx<'gc, 'a> {
     /// look entries up by name. Flattened to
     /// `Chunk::upvalue_desc: Box<[UpValueDescriptor]>` at assembly time.
     upvalues: Vec<(String, UpValueDescriptor)>,
+
+    /// Lua 5.5 chunk-level global state. Shared across every nested
+    /// `Ctx` in the same chunk.
+    globals: Rc<RefCell<GlobalEnv>>,
 }
 
 impl<'gc, 'a> Ctx<'gc, 'a> {
@@ -175,7 +248,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     }
 
     /// Free two registers in correct (higher-first) order — matches
-    /// Lua 5.4's `freeregs(fs, r1, r2)`.
+    /// Lua 5.5's `freeregs(fs, r1, r2)`.
     #[allow(dead_code)]
     fn free_regs(&mut self, r1: RegisterIndex, r2: RegisterIndex) {
         if r1.0 > r2.0 {
@@ -252,7 +325,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     }
 
     // ---------------------------------------------------------------------
-    // Jump-list primitives (Lua 5.4-style true/false list patching)
+    // Jump-list primitives (Lua 5.5-style true/false list patching)
     // ---------------------------------------------------------------------
 
     /// Emit a `JMP` with a placeholder offset and return its tape index so
@@ -505,7 +578,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
 
     /// "Go if true": arrange for control to fall through when `expr` is
     /// truthy and to jump otherwise. Produces a jump that fires on falsy,
-    /// stored in `false_list`. Mirrors Lua 5.4's `luaK_goiftrue`.
+    /// stored in `false_list`. Mirrors Lua 5.5's `luaK_goiftrue`.
     fn goiftrue(&mut self, expr: &mut ExprDesc) {
         match expr.kind {
             ExprKind::Jump(_) => {
@@ -532,7 +605,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
 
     /// "Go if false": arrange for control to fall through when `expr` is
     /// falsy and to jump otherwise. Produces a jump that fires on truthy,
-    /// stored in `true_list`. Mirrors Lua 5.4's `luaK_goiffalse`.
+    /// stored in `true_list`. Mirrors Lua 5.5's `luaK_goiffalse`.
     fn goiffalse(&mut self, expr: &mut ExprDesc) {
         match expr.kind {
             ExprKind::Jump(_) => {
@@ -555,7 +628,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     }
 
     /// Discharge an expression to a concrete register, resolving any pending
-    /// jump lists. The emitted shape follows Lua 5.4's `exp2reg`:
+    /// jump lists. The emitted shape follows Lua 5.5's `exp2reg`:
     ///
     /// * If every pending jump is TESTSET-controlled (all preserve their
     ///   operand value via the assign-on-short-circuit edge) we skip the
@@ -861,6 +934,10 @@ pub fn compile<'gc>(
     root: &Root,
     interner: &TokenInterner,
 ) -> Result<Gc<'gc, Prototype<'gc>>, CompileError> {
+    // One `GlobalEnv` per chunk, threaded through nested-function
+    // compilation so a `global` declaration in any function is visible
+    // to every other function in the same chunk.
+    let globals = Rc::new(RefCell::new(GlobalEnv::new()));
     let chunk = compile_function_to_chunk(
         mc,
         interner,
@@ -876,6 +953,7 @@ pub fn compile<'gc>(
         // placeholder — nested functions reference this slot by
         // cascading ParentUpvalue(0).
         vec![("_ENV".to_owned(), UpValueDescriptor::ParentLocal(0))],
+        globals,
     )?;
     Ok(chunk.assemble(mc))
 }
@@ -892,6 +970,7 @@ fn compile_function_to_chunk<'gc, 'a>(
     arity: u8,
     source: Option<LuaString<'gc>>,
     initial_upvalues: Vec<(String, UpValueDescriptor)>,
+    globals: Rc<RefCell<GlobalEnv>>,
 ) -> Result<Chunk<'gc>, CompileError> {
     let mut chunk = Chunk::new();
     chunk.is_vararg = is_vararg;
@@ -909,6 +988,7 @@ fn compile_function_to_chunk<'gc, 'a>(
         goto_labels: HashMap::new(),
         capture: parent_capture,
         upvalues: initial_upvalues,
+        globals,
     };
 
     ctx.push_scope();
@@ -929,7 +1009,7 @@ fn compile_function_to_chunk<'gc, 'a>(
             name.to_owned(),
             VariableData {
                 register: reg,
-                is_const: false,
+                kind: VarKind::Reg,
             },
         )?;
         num_params += 1;
@@ -979,6 +1059,7 @@ fn compile_stmt(ctx: &mut Ctx, item: Stmt) -> Result<(), CompileError> {
         Stmt::Label(item) => compile_label(ctx, item),
         Stmt::Goto(item) => compile_goto(ctx, item),
         Stmt::Decl(item) => compile_decl(ctx, item),
+        Stmt::Global(item) => compile_global(ctx, item),
         Stmt::Assign(item) => compile_assign(ctx, item),
         Stmt::Func(item) => compile_func(ctx, item),
         Stmt::Expr(item) => {
@@ -1058,7 +1139,7 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
             name,
             VariableData {
                 register: reg,
-                is_const: false,
+                kind: VarKind::Reg,
             },
         )?;
         // Promote to an active local BEFORE compiling the body so the
@@ -1112,13 +1193,13 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
                 // Results occupy [regs[0], regs[0]+want); in practice this
                 // lines up with `expected` because the call's func slot
                 // is freereg at setup time, which is `expected`.
-                debug_assert_eq!(regs[0].0, expected);
+                assert_eq!(regs[0].0, expected);
                 continue;
             }
             if let Expr::VarArg = expr {
                 let want = num_targets - i;
                 let dst = ctx.reserve_regs(want as u8)?;
-                debug_assert_eq!(dst.0, expected);
+                assert_eq!(dst.0, expected);
                 ctx.emit(Instruction::VARARG {
                     dst: dst.0,
                     count: want as u8 + 1,
@@ -1140,7 +1221,7 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
             // (reserve_reg updates max_stack).
             ctx.chunk.freereg = expected;
             let slot = ctx.reserve_reg()?;
-            debug_assert_eq!(slot.0, expected);
+            assert_eq!(slot.0, expected);
             ctx.emit(Instruction::MOVE {
                 dst: slot.0,
                 src: reg.0,
@@ -1174,12 +1255,15 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
             .to_owned();
 
         let modifier = target.modifier();
-        let is_const = matches!(modifier, Some(DeclModifier::Const));
-        let is_close = matches!(modifier, Some(DeclModifier::Close));
+        let kind = match modifier {
+            Some(DeclModifier::Const) => VarKind::Const,
+            Some(DeclModifier::Close) => VarKind::ToClose,
+            None => VarKind::Reg,
+        };
 
         let reg = RegisterIndex(base + i as u8);
 
-        if is_close {
+        if matches!(kind, VarKind::ToClose) {
             ctx.emit(Instruction::TBC { val: reg.0 });
             ctx.mark_close(reg)?;
         }
@@ -1188,7 +1272,7 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
             name,
             VariableData {
                 register: reg,
-                is_const,
+                kind,
             },
         )?;
     }
@@ -1197,6 +1281,191 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
     // are stable for the rest of the scope (upvalue-capture depends on
     // the register staying put).
     ctx.adjust_locals(num_targets as u8);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Lua 5.5 global declarations
+// ---------------------------------------------------------------------------
+
+/// Compile a `global` statement. There are three syntactic forms (see
+/// `manual.of:1655-1738` and upstream `lparser.c:1940-1977`):
+///
+///   * `global function NAME body` — initialization-form: declares
+///     `NAME` as a global and assigns the closure, guarded at runtime
+///     by `ERRNNIL` so a previously-set global is detected.
+///   * `global <attrib>? *` — collective: re-enables the default
+///     catch-all so undeclared free names are accepted as implicit
+///     globals of `default_kind`. No code emitted; only flag flips.
+///   * `global <attrib>? Name <attrib>? (',' Name <attrib>?)* ('=' explist)?` —
+///     explicit list. Without `=`, just registers names (the global
+///     variable is "left unchanged" per `manual.of:1665`). With `=`,
+///     each name is initialized by emitting `GETTABUP+ERRNNIL+SETTABUP`
+///     so the runtime errors if the variable is already non-nil
+///     (`manual.of:1668-1671`).
+fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
+    // Form 1: `global function NAME body`. Initialization form.
+    if let Some(func) = item.function() {
+        let name = func
+            .name(ctx.interner)
+            .ok_or_else(|| ice("global function without name"))?
+            .to_string();
+
+        // Register first so the body can reference it as a declared
+        // global. List-form declarations (this included) void the
+        // implicit `global *` per `manual.of:225-228`.
+        {
+            let mut env = ctx.globals.borrow_mut();
+            env.default_active = false;
+            env.decls.insert(name.clone(), GlobalKind::Reg);
+        }
+
+        // Compile the closure into a register. `compile_func_body`
+        // honours the dst hint, so `func_reg == target_reg` (asserted
+        // below).
+        let target_reg = ctx.alloc_register()?;
+        let func_reg = compile_func_body(ctx, &func, Some(target_reg))?;
+        assert_eq!(func_reg, target_reg);
+
+        // Initialization guard + assignment: emit
+        //   GETTABUP guard, _ENV, name
+        //   ERRNNIL  guard, name
+        //   SETTABUP closure, _ENV, name
+        // Mirrors upstream `globalfunc` (`lparser.c:1956-1968`), which
+        // emits the same guard via `checkglobal` + `luaK_storevar`.
+        let key = ctx.alloc_string_constant(name.as_bytes())?;
+        let env_idx = ctx
+            .resolve_or_capture("_ENV")
+            .ok_or_else(|| ice("_ENV must resolve; main chunk pre-seeds it"))?;
+        let guard_reg = ctx.alloc_register()?;
+        ctx.emit(Instruction::GETTABUP {
+            dst: guard_reg.0,
+            idx: env_idx,
+            key,
+        });
+        ctx.emit(Instruction::ERRNNIL {
+            src: guard_reg.0,
+            name_key: key,
+        });
+        ctx.emit(Instruction::SETTABUP {
+            src: func_reg.0,
+            idx: env_idx,
+            key,
+        });
+        ctx.free_reg(guard_reg);
+        ctx.free_reg(target_reg);
+        return Ok(());
+    }
+
+    let default_const = item.default_const();
+    let default_kind = if default_const {
+        GlobalKind::Const
+    } else {
+        GlobalKind::Reg
+    };
+
+    if item.is_star() {
+        // Form 2: `global <attrib>? *`.
+        let mut env = ctx.globals.borrow_mut();
+        env.default_active = true;
+        env.default_kind = default_kind;
+        return Ok(());
+    }
+
+    // Form 3: `global <attrib>? Name <attrib>? (',' …)* ('=' explist)?`.
+    let targets: Vec<_> = item
+        .targets()
+        .ok_or_else(|| ice("global stmt without star or targets"))?
+        .collect();
+    let values: Vec<Expr> = item.values().map(|v| v.collect()).unwrap_or_default();
+
+    // Register each name *before* compiling initializers so the
+    // initializer expressions see the new declared globals (and so a
+    // self-referential `global X = X` resolves X as declared, not
+    // implicit). Voids the implicit `global *`.
+    let mut decl_kinds: Vec<(String, GlobalKind)> = Vec::with_capacity(targets.len());
+    {
+        let mut env = ctx.globals.borrow_mut();
+        env.default_active = false;
+        for target in &targets {
+            let name = target
+                .name()
+                .ok_or_else(|| ice("global target without name"))?
+                .name(ctx.interner)
+                .ok_or_else(|| ice("ident without name"))?
+                .to_owned();
+            let kind = if target.is_const() {
+                GlobalKind::Const
+            } else {
+                default_kind
+            };
+            env.decls.insert(name.clone(), kind);
+            decl_kinds.push((name, kind));
+        }
+    }
+
+    if values.is_empty() {
+        // No initializer: per `manual.of:1665`, "global variables are
+        // left unchanged". Just register the names and emit nothing.
+        return Ok(());
+    }
+
+    // Initializer form: lay the value expressions into a contiguous
+    // register block, padding with nil if fewer values than names.
+    // Then per name, emit `GETTABUP+ERRNNIL+SETTABUP` taking the value
+    // from the corresponding slot. (Forward order — equivalent to
+    // upstream's reverse-on-unwind emission, just simpler to read.)
+    let n_targets = decl_kinds.len();
+    let n_values = values.len();
+    let value_base = ctx.chunk.freereg;
+    for (i, expr) in values.into_iter().enumerate() {
+        let want = RegisterIndex(value_base + i as u8);
+        let got = compile_expr_to_reg(ctx, expr, Some(want))?;
+        if got != want {
+            ctx.emit(Instruction::MOVE {
+                dst: want.0,
+                src: got.0,
+            });
+        }
+    }
+    // Pad with nil for any names beyond the supplied values.
+    while ctx.chunk.freereg < value_base + n_targets as u8 {
+        let slot = ctx.reserve_reg()?;
+        let idx = ctx.alloc_constant(Value::Nil)?;
+        ctx.emit(Instruction::LOAD { dst: slot.0, idx });
+    }
+    // Drop any extra values past `n_targets` — they were computed
+    // (side-effects preserved) but are unused.
+    if n_values > n_targets {
+        ctx.chunk.freereg = value_base + n_targets as u8;
+    }
+
+    let env_idx = ctx
+        .resolve_or_capture("_ENV")
+        .ok_or_else(|| ice("_ENV must resolve; main chunk pre-seeds it"))?;
+    for (i, (name, _kind)) in decl_kinds.iter().enumerate() {
+        let key = ctx.alloc_string_constant(name.as_bytes())?;
+        let value_reg = value_base + i as u8;
+        let guard_reg = ctx.alloc_register()?;
+        ctx.emit(Instruction::GETTABUP {
+            dst: guard_reg.0,
+            idx: env_idx,
+            key,
+        });
+        ctx.emit(Instruction::ERRNNIL {
+            src: guard_reg.0,
+            name_key: key,
+        });
+        ctx.emit(Instruction::SETTABUP {
+            src: value_reg,
+            idx: env_idx,
+            key,
+        });
+        ctx.free_reg(guard_reg);
+    }
+    // Free the value-block.
+    ctx.chunk.freereg = value_base;
 
     Ok(())
 }
@@ -1225,7 +1494,7 @@ enum Lvalue {
     },
 }
 
-/// Lua 5.4 §3.3.3 specifies "first evaluate all its expressions and only
+/// Lua 5.5 §3.3.3 specifies "first evaluate all its expressions and only
 /// then perform the assignments." We honour that without losing the
 /// hint-into-target optimisation by:
 ///
@@ -1354,7 +1623,7 @@ fn compile_lvalue(
                 .name(ctx.interner)
                 .ok_or_else(|| ice("ident without name"))?;
             if let Some(data) = ctx.resolve_local(name) {
-                if data.is_const {
+                if data.kind.is_const() {
                     return Err(err(
                         CompileErrorKind::Internal("assignment to const variable"),
                         LineNumber(0),
@@ -1364,6 +1633,36 @@ fn compile_lvalue(
             } else if let Some(idx) = ctx.resolve_upvalue(name) {
                 Ok(Lvalue::Upvalue { idx })
             } else {
+                // Lua 5.5 global resolution. If the name appears in the
+                // chunk's global decl table, honour its kind: writes to
+                // `<const>` globals are rejected at compile time. Names
+                // not yet declared are accepted only while the implicit
+                // `global *` scope is in effect; once any explicit
+                // declaration has voided it, undeclared writes are
+                // rejected.
+                let env = ctx.globals.borrow();
+                if let Some(kind) = env.decls.get(name).copied() {
+                    if kind.is_const() {
+                        return Err(err(
+                            CompileErrorKind::Internal("assignment to read-only global"),
+                            LineNumber(0),
+                        ));
+                    }
+                } else if !env.default_active {
+                    return Err(err(
+                        CompileErrorKind::Internal("undeclared global"),
+                        LineNumber(0),
+                    ));
+                } else if env.default_kind.is_const() {
+                    // Under `global<const> *`, undeclared writes are
+                    // also rejected — the implicit declaration kind is
+                    // read-only.
+                    return Err(err(
+                        CompileErrorKind::Internal("assignment to read-only global"),
+                        LineNumber(0),
+                    ));
+                }
+                drop(env);
                 let key = ctx.alloc_string_constant(name.as_bytes())?;
                 let env_idx = ctx
                     .resolve_or_capture("_ENV")
@@ -1420,7 +1719,7 @@ fn target_local_reg(ctx: &Ctx, target: &Expr) -> Option<u8> {
     };
     let name = ident.name(ctx.interner)?;
     let data = ctx.resolve_local(name)?;
-    (!data.is_const).then_some(data.register.0)
+    (!data.kind.is_const()).then_some(data.register.0)
 }
 
 fn local_dst(lv: &Lvalue) -> Option<RegisterIndex> {
@@ -1588,6 +1887,7 @@ fn compile_nested<'gc>(
 ) -> Result<Gc<'gc, Prototype<'gc>>, CompileError> {
     let mc = ctx.mc;
     let interner = ctx.interner;
+    let globals = Rc::clone(&ctx.globals);
     let parent: &mut dyn UpvalueResolver = ctx;
 
     let chunk = compile_function_to_chunk(
@@ -1600,6 +1900,7 @@ fn compile_nested<'gc>(
         arity,
         None,
         Vec::new(),
+        globals,
     )?;
 
     Ok(chunk.assemble(mc))
@@ -1676,7 +1977,22 @@ fn compile_expr_ident(
         return Ok(dst);
     }
 
-    // Global: _ENV[name]
+    // Global: _ENV[name]. Lua 5.5 layers a single compile-time check
+    // on top of the GETTABUP-from-_ENV pattern: once any explicit
+    // `global` declaration has voided the implicit `global *`,
+    // undeclared free names are rejected. Reads of declared globals
+    // do *not* emit a runtime `ERRNNIL` — that opcode guards
+    // initialization (see `compile_global`), not plain reads.
+    let globals = ctx.globals.borrow();
+    let declared = globals.decls.contains_key(name);
+    if !declared && !globals.default_active {
+        return Err(err(
+            CompileErrorKind::Internal("undeclared global"),
+            LineNumber(0),
+        ));
+    }
+    drop(globals);
+
     let key = ctx.alloc_string_constant(name.as_bytes())?;
     let dst = ctx.dst_or_alloc(dst)?;
     let env_idx = ctx
@@ -2231,7 +2547,7 @@ fn compile_comparison_desc(
     let lhs = compile_expr_to_reg(ctx, lhs_expr, None)?;
     let rhs = compile_expr_to_reg(ctx, rhs_expr, None)?;
 
-    // Lua 5.4 convention: emit the CMP so the paired JMP fires on the
+    // Lua 5.5 convention: emit the CMP so the paired JMP fires on the
     // TRUTHY outcome of the comparison. The VM's `op_lt` / `op_le` /
     // `op_eq` handlers skip the following instruction iff
     // `(cmp_result != inverted) == true` — with `inverted=true`, the skip
@@ -2587,10 +2903,10 @@ fn compile_return(ctx: &mut Ctx, item: Return) -> Result<(), CompileError> {
     let mut exprs: Vec<_> = item.exprs().map(|e| e.collect()).unwrap_or_default();
 
     // Tail-call optimisation: `return f(args)` / `return obj:m(args)` —
-    // exactly one return expression, directly a call. Matches Lua 5.4's
+    // exactly one return expression, directly a call. Matches Lua 5.5's
     // tail-call rule.
     //
-    // See #48: Lua 5.4 does NOT tail-call parenthesised `return (f())`
+    // See #48: Lua 5.5 does NOT tail-call parenthesised `return (f())`
     // because the parens force adjust-to-one. The parser here doesn't
     // surface a distinct paren node, so we over-eagerly tail-call that
     // form for now.
@@ -2888,14 +3204,17 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
         // sole role here is as the free_reg cutoff.
         ctx.adjust_locals(3);
 
-        // base+3 is the visible loop variable
+        // base+3 is the visible loop variable. Lua 5.5 makes the
+        // numeric-for counter read-only (`#define LOOPVARKIND RDKCONST`
+        // in upstream `lparser.c`); assignment inside the body is
+        // rejected at compile time.
         let loop_var = ctx.alloc_register()?;
         assert_eq!(loop_var.0, base.0 + 3);
         ctx.define(
             counter_name,
             VariableData {
                 register: loop_var,
-                is_const: false,
+                kind: VarKind::Const,
             },
         )?;
         // Promote the loop variable to an active local so upvalue-capture
@@ -2996,11 +3315,13 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
                 .to_owned();
             let reg = ctx.alloc_register()?;
             assert_eq!(reg.0, base.0 + 3 + i as u8);
+            // Generic-for control variables are likewise read-only in
+            // Lua 5.5 (LOOPVARKIND).
             ctx.define(
                 name,
                 VariableData {
                     register: reg,
-                    is_const: false,
+                    kind: VarKind::Const,
                 },
             )?;
         }

@@ -1,0 +1,33 @@
+---
+source: src/parser/mod.rs
+expression: syntax_tree
+---
+Root@0..36
+  GlobalStmt@0..7
+    Global@0..6 "global"
+    AssignList@6..7
+      GlobalTarget@6..7
+        Ident@6..7
+          Ident@6..7 "X"
+  DeclStmt@7..33
+    Local@7..12 "local"
+    FuncStmt@12..33
+      Function@12..20 "function"
+      Ident@20..21
+        Ident@20..21 "f"
+      FuncArgs@21..23
+        LParen@21..22 "("
+        RParen@22..23 ")"
+      StmtList@23..30
+        GlobalStmt@23..30
+          Global@23..29 "global"
+          Star@29..30 "*"
+      End@30..33 "end"
+  AssignStmt@33..36
+    AssignList@33..34
+      Ident@33..34
+        Ident@33..34 "A"
+    Assign@34..35 "="
+    ExprList@35..36
+      LiteralExpr@35..36
+        Int@35..36 "1"

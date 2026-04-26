@@ -1,0 +1,17 @@
+---
+source: src/parser/mod.rs
+expression: syntax_tree
+---
+Root@0..28
+  GlobalStmt@0..14
+    Global@0..6 "global"
+    Const@6..13 "<const>"
+    Star@13..14 "*"
+  FuncCall@14..28
+    Ident@14..19
+      Ident@14..19 "print"
+    FuncArgs@19..28
+      LParen@19..20 "("
+      LiteralExpr@20..27
+        String@20..27 "\"hello\""
+      RParen@27..28 ")"

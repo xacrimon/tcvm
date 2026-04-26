@@ -21,6 +21,7 @@ const STATEMENT_RECOVERY: &[SyntaxKind] = &[
     T![break],
     T![function],
     T![local],
+    T![global],
 ];
 
 impl<'cache, 'source> Parser<'cache, 'source> {
@@ -43,6 +44,7 @@ impl<'cache, 'source> Parser<'cache, 'source> {
             T![break] => self.r_break(),
             T![function] => self.r_func(false),
             T![local] => self.r_decl(),
+            T![global] => self.r_global(),
             T![::] => self.r_label(),
             T![goto] => self.r_goto(),
             T![ident] | T!['('] => self.r_maybe_assign(),
@@ -624,6 +626,64 @@ impl<'cache, 'source> Parser<'cache, 'source> {
         let t = self.at();
 
         if matches!(t, T![const] | T![close]) {
+            self.expect(t);
+        }
+    }
+
+    fn r_global(&mut self) -> Option<CompletedMarker> {
+        let marker = self.start(T![global_stmt]);
+        self.expect(T![global]);
+
+        if self.at() == T![function] {
+            self.r_func(false);
+        } else {
+            self.r_global_attrib();
+
+            if self.at() == T![*] {
+                self.expect(T![*]);
+            } else {
+                let assign_list_marker = self.start(T![assign_list]);
+                self.r_global_target();
+
+                while self.at() == T![,] {
+                    self.expect(T![,]);
+                    self.r_global_target();
+                }
+
+                assign_list_marker.complete(self);
+
+                if self.at() == T![=] {
+                    self.expect(T![=]);
+                    self.r_expr_list();
+                }
+            }
+        }
+
+        Some(marker.complete(self))
+    }
+
+    fn r_global_target(&mut self) -> Option<CompletedMarker> {
+        let marker = self.start(T![global_target]);
+        self.r_ident();
+        self.r_global_attrib();
+        Some(marker.complete(self))
+    }
+
+    fn r_global_attrib(&mut self) {
+        let t = self.at();
+
+        if t == T![const] {
+            self.expect(t);
+        } else if t == T![close] {
+            let error = self
+                .new_error()
+                .with_message("global variables cannot be to-be-closed")
+                .with_label(
+                    self.new_label()
+                        .with_message("'<close>' is not allowed on global declarations"),
+                )
+                .finish();
+            self.report(error);
             self.expect(t);
         }
     }

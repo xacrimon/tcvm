@@ -4,6 +4,7 @@ use crate::env::{Function, LuaString, NativeContext, NativeError, NativeFn, Stac
 pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[
         ("concat", lua_concat),
+        ("create", lua_create),
         ("insert", lua_insert),
         ("move", lua_move),
         ("pack", lua_pack),
@@ -25,6 +26,13 @@ pub fn load<'gc>(ctx: Context<'gc>) {
 }
 
 fn lua_concat<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<(), NativeError> {
+    todo!()
+}
+
+fn lua_create<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
 ) -> Result<(), NativeError> {

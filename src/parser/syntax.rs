@@ -58,6 +58,7 @@ pub enum Stmt {
     Label(Label),
     Goto(Goto),
     Decl(Decl),
+    Global(Global),
     Assign(Assign),
     Func(Func),
     Expr(Expr),
@@ -77,6 +78,7 @@ impl Stmt {
             T![label] => Label::cast(node).map(Self::Label)?,
             T![goto] => Goto::cast(node).map(Self::Goto)?,
             T![decl_stmt] => Decl::cast(node).map(Self::Decl)?,
+            T![global_stmt] => Global::cast(node).map(Self::Global)?,
             T![assign_stmt] => Assign::cast(node).map(Self::Assign)?,
             T![func_stmt] => Func::cast(node).map(Self::Func)?,
             T![break_stmt] => Break::cast(node).map(Self::Break)?,
@@ -204,6 +206,70 @@ impl DeclModifier {
             T![close] => Self::Close,
             _ => return None,
         })
+    }
+}
+
+ast_node!(Global, T![global_stmt]);
+
+impl Global {
+    pub fn function(&self) -> Option<Func> {
+        self.0.first_child().and_then(Func::cast)
+    }
+
+    pub fn default_const(&self) -> bool {
+        for tok in self.0.children_with_tokens() {
+            if let NodeOrToken::Token(t) = tok {
+                match t.kind() {
+                    T![global] => continue,
+                    T![const] => return true,
+                    _ => return false,
+                }
+            } else {
+                return false;
+            }
+        }
+        false
+    }
+
+    pub fn is_star(&self) -> bool {
+        self.0
+            .children_with_tokens()
+            .any(|or| matches!(or, NodeOrToken::Token(t) if t.kind() == T![*]))
+    }
+
+    pub fn targets(&self) -> Option<impl Iterator<Item = GlobalTarget> + '_> {
+        Some(
+            self.0
+                .first_child()?
+                .children()
+                .filter_map(GlobalTarget::cast),
+        )
+    }
+
+    /// Iterator over the optional initializer expressions in
+    /// `global X, Y = e1, e2`. Returns `None` when there is no
+    /// initializer (single child: the assign_list, or — for the
+    /// function form — the Func node).
+    pub fn values(&self) -> Option<impl Iterator<Item = Expr> + '_> {
+        let mut nodes = self.0.children();
+        nodes.next()?;
+        let expr_list = nodes.last()?;
+        Some(expr_list.children().filter_map(Expr::cast))
+    }
+}
+
+ast_node!(GlobalTarget, T![global_target]);
+
+impl GlobalTarget {
+    pub fn name(&self) -> Option<Ident> {
+        self.0.first_child().and_then(Ident::cast)
+    }
+
+    pub fn is_const(&self) -> bool {
+        self.0
+            .last_token()
+            .map(|t| t.kind() == T![const])
+            .unwrap_or(false)
     }
 }
 

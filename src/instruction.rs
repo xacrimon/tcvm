@@ -5,6 +5,7 @@ type ConstantIndex = u16;
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 #[repr(align(8))]
+#[allow(clippy::upper_case_acronyms)]
 pub enum Instruction {
     MOVE {
         dst: Register,
@@ -256,6 +257,11 @@ pub enum Instruction {
 
     VARARGPREP {
         num_fixed: u8,
+    },
+
+    ERRNNIL {
+        src: Register,
+        name_key: ConstantIndex,
     },
 
     NOP,

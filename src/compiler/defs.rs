@@ -48,7 +48,7 @@ impl JumpList {
 /// Where an expression's value currently lives during compilation, with any
 /// pending short-circuit jumps that will be patched by the consumer.
 ///
-/// **Invariants** (matching Lua 5.4's `expdesc` conventions):
+/// **Invariants** (matching Lua 5.5's `expdesc` conventions):
 /// * A `JMP` in `true_list` fires when the expression is truthy.
 /// * A `JMP` in `false_list` fires when the expression is falsy.
 /// * A `Jump(Some(idx))` head is the last-emitted control jump for this
@@ -131,7 +131,7 @@ pub struct Chunk<'gc> {
     pub(super) prototypes: Vec<Gc<'gc, Prototype<'gc>>>,
     pub(super) upvalue_desc: Vec<UpValueDescriptor>,
     /// Next free register slot; cursor for temp allocation. Locals occupy
-    /// `[0, nactvar)`, temps occupy `[nactvar, freereg)`. Matches Lua 5.4's
+    /// `[0, nactvar)`, temps occupy `[nactvar, freereg)`. Matches Lua 5.5's
     /// `fs->freereg` semantics.
     pub(super) freereg: u8,
     /// Number of active named locals. Registers `[0, nactvar)` are reserved

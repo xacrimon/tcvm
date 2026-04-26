@@ -1,0 +1,2 @@
+global <const> *
+print("hello")

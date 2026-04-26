@@ -24,6 +24,20 @@ fn compile_and_format(source: &str) -> String {
     })
 }
 
+fn compile_err_and_format(source: &str) -> String {
+    let mut cache = NodeCache::new();
+    let (syntax_tree, reports) = parser::parse(&mut cache, source);
+    assert!(reports.is_empty(), "parse errors: {}", reports.len());
+    let root = Root::new(syntax_tree).expect("not a root node");
+    let interner = cache.interner();
+
+    let arena = Arena::<Static<()>>::new(|_mc| Static(()));
+    arena.mutate(|mc, _| match compile_chunk(mc, &root, interner) {
+        Err(e) => format!("{e}"),
+        Ok(_) => panic!("expected compile error, got success"),
+    })
+}
+
 macro_rules! test {
     ($name:ident, $path:literal) => {
         paste! {
@@ -31,6 +45,19 @@ macro_rules! test {
             fn [<test_compile_ $name>]() {
                 let source = fs::read_to_string($path).unwrap();
                 let output = compile_and_format(&source);
+                assert_snapshot!(output);
+            }
+        }
+    };
+}
+
+macro_rules! test_err {
+    ($name:ident, $path:literal) => {
+        paste! {
+            #[test]
+            fn [<test_compile_ $name>]() {
+                let source = fs::read_to_string($path).unwrap();
+                let output = compile_err_and_format(&source);
                 assert_snapshot!(output);
             }
         }
@@ -79,3 +106,24 @@ test!(
     short_circuit_local_clobber,
     "test-files/short_circuit_local_clobber.lua"
 );
+test!(global_decl, "test-files/global_decl.lua");
+test!(global_star, "test-files/global_star.lua");
+test!(errnnil_runtime, "test-files/errnnil_runtime.lua");
+test_err!(
+    global_const_assign_err,
+    "test-files/global_const_assign_err.lua"
+);
+test_err!(
+    global_undeclared_err,
+    "test-files/global_undeclared_err.lua"
+);
+test_err!(
+    for_counter_readonly_err,
+    "test-files/for_counter_readonly_err.lua"
+);
+test!(
+    global_nested_propagation,
+    "test-files/global_nested_propagation.lua"
+);
+test!(global_star_nested, "test-files/global_star_nested.lua");
+test!(global_const_star, "test-files/global_const_star.lua");

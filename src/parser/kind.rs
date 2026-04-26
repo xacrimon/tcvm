@@ -42,6 +42,8 @@ pub enum SyntaxKind {
     AssignList,
     Label,
     MethodCall,
+    GlobalStmt,
+    GlobalTarget,
 
     #[regex(r"[ \n\t\f\r]+", logos::skip)]
     Whitespace,
@@ -117,6 +119,9 @@ pub enum SyntaxKind {
 
     #[token("local")]
     Local,
+
+    #[token("global")]
+    Global,
 
     #[token("function")]
     Function,
@@ -361,6 +366,8 @@ macro_rules! T {
     [assign_list] => { $crate::parser::kind::SyntaxKind::AssignList };
     [label] => { $crate::parser::kind::SyntaxKind::Label };
     [method_call] => { $crate::parser::kind::SyntaxKind::MethodCall };
+    [global_stmt] => { $crate::parser::kind::SyntaxKind::GlobalStmt };
+    [global_target] => { $crate::parser::kind::SyntaxKind::GlobalTarget };
     [+] => { $crate::parser::kind::SyntaxKind::Plus };
     [-] => { $crate::parser::kind::SyntaxKind::Minus };
     [*] => { $crate::parser::kind::SyntaxKind::Star };
@@ -382,6 +389,7 @@ macro_rules! T {
     [=] => { $crate::parser::kind::SyntaxKind::Assign };
     [D/] => { $crate::parser::kind::SyntaxKind::DSlash };
     [local] => { $crate::parser::kind::SyntaxKind::Local };
+    [global] => { $crate::parser::kind::SyntaxKind::Global };
     [function] => { $crate::parser::kind::SyntaxKind::Function };
     [end] => { $crate::parser::kind::SyntaxKind::End };
     [in] => { $crate::parser::kind::SyntaxKind::In };
@@ -470,6 +478,8 @@ impl Display for SyntaxKind {
                 T![assign_list] => "assign_list",
                 T![label] => "label",
                 T![method_call] => "method_call",
+                T![global_stmt] => "global_stmt",
+                T![global_target] => "global_target",
                 T![+] => "+",
                 T![-] => "-",
                 T![*] => "*",
@@ -491,6 +501,7 @@ impl Display for SyntaxKind {
                 T![=] => "=",
                 T![D/] => "D/",
                 T![local] => "local",
+                T![global] => "global",
                 T![function] => "function",
                 T![end] => "end",
                 T![in] => "in",

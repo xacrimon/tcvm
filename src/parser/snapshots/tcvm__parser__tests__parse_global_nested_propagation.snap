@@ -1,0 +1,44 @@
+---
+source: src/parser/mod.rs
+expression: syntax_tree
+---
+Root@0..48
+  GlobalStmt@0..11
+    Global@0..6 "global"
+    AssignList@6..11
+      GlobalTarget@6..11
+        Ident@6..11
+          Ident@6..11 "print"
+  DeclStmt@11..37
+    Local@11..16 "local"
+    FuncStmt@16..37
+      Function@16..24 "function"
+      Ident@24..25
+        Ident@24..25 "f"
+      FuncArgs@25..27
+        LParen@25..26 "("
+        RParen@26..27 ")"
+      StmtList@27..34
+        GlobalStmt@27..34
+          Global@27..33 "global"
+          AssignList@33..34
+            GlobalTarget@33..34
+              Ident@33..34
+                Ident@33..34 "Y"
+      End@34..37 "end"
+  AssignStmt@37..40
+    AssignList@37..38
+      Ident@37..38
+        Ident@37..38 "Y"
+    Assign@38..39 "="
+    ExprList@39..40
+      LiteralExpr@39..40
+        Int@39..40 "1"
+  FuncCall@40..48
+    Ident@40..45
+      Ident@40..45 "print"
+    FuncArgs@45..48
+      LParen@45..46 "("
+      Ident@46..47
+        Ident@46..47 "Y"
+      RParen@47..48 ")"

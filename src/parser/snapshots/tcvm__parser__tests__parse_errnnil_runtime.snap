@@ -1,0 +1,23 @@
+---
+source: src/parser/mod.rs
+expression: syntax_tree
+---
+Root@0..12
+  AssignStmt@0..3
+    AssignList@0..1
+      Ident@0..1
+        Ident@0..1 "X"
+    Assign@1..2 "="
+    ExprList@2..3
+      LiteralExpr@2..3
+        Int@2..3 "1"
+  GlobalStmt@3..12
+    Global@3..9 "global"
+    AssignList@9..10
+      GlobalTarget@9..10
+        Ident@9..10
+          Ident@9..10 "X"
+    Assign@10..11 "="
+    ExprList@11..12
+      LiteralExpr@11..12
+        Int@11..12 "2"
