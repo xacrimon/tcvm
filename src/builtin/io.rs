@@ -21,13 +21,13 @@ pub fn load<'gc>(ctx: Context<'gc>) {
     let lib = Table::new(ctx.mutation());
     for &(name, handler) in fns {
         let handler = Function::new_native(ctx.mutation(), handler, Box::new([]));
-        let key = Value::String(LuaString::new(ctx, name.as_bytes()));
-        lib.raw_set(ctx.mutation(), key, Value::Function(handler));
+        let key = Value::string(LuaString::new(ctx, name.as_bytes()));
+        lib.raw_set(ctx.mutation(), key, Value::function(handler));
     }
 
-    let lib_name = Value::String(LuaString::new(ctx, b"io"));
+    let lib_name = Value::string(LuaString::new(ctx, b"io"));
     ctx.globals()
-        .raw_set(ctx.mutation(), lib_name, Value::Table(lib));
+        .raw_set(ctx.mutation(), lib_name, Value::table(lib));
 }
 
 fn lua_close<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
@@ -84,26 +84,25 @@ fn lua_write<'gc>(
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     for v in stack.as_slice() {
-        let res = match v {
-            Value::String(s) => out.write_all(s.as_bytes()),
-            Value::Integer(i) => write!(out, "{i}"),
-            Value::Float(f) => {
-                // Lua's default number-to-string is "%.14g"; Rust's `{}` for
-                // f64 is close enough for typical values and doesn't add a
-                // trailing ".0" when the value rounds to an integer in our
-                // current usage. The full "%.14g" goes through string.format.
-                if f.is_finite() && f.fract() == 0.0 && f.abs() < 1e16 {
-                    write!(out, "{}", *f as i64)
-                } else {
-                    write!(out, "{}", f)
-                }
+        let res = if let Some(s) = v.get_string() {
+            out.write_all(s.as_bytes())
+        } else if let Some(i) = v.get_integer() {
+            write!(out, "{i}")
+        } else if let Some(f) = v.get_float() {
+            // Lua's default number-to-string is "%.14g"; Rust's `{}` for
+            // f64 is close enough for typical values and doesn't add a
+            // trailing ".0" when the value rounds to an integer in our
+            // current usage. The full "%.14g" goes through string.format.
+            if f.is_finite() && f.fract() == 0.0 && f.abs() < 1e16 {
+                write!(out, "{}", f as i64)
+            } else {
+                write!(out, "{}", f)
             }
-            other => {
-                return Err(NativeError::new(format!(
-                    "bad argument to 'write' (string expected, got {})",
-                    other.type_name()
-                )));
-            }
+        } else {
+            return Err(NativeError::new(format!(
+                "bad argument to 'write' (string expected, got {})",
+                v.type_name()
+            )));
         };
         if let Err(e) = res {
             return Err(NativeError::new(format!("io.write: {e}")));

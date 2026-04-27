@@ -35,9 +35,9 @@ impl<'gc> Table<'gc> {
 
     pub fn get_metamethod(self, ctx: Context<'gc>, name: &[u8]) -> Value<'gc> {
         let Some(mt) = self.metatable() else {
-            return Value::Nil;
+            return Value::nil();
         };
-        let key = Value::String(LuaString::new(ctx, name));
+        let key = Value::string(LuaString::new(ctx, name));
         mt.raw_get(key)
     }
 
@@ -84,13 +84,13 @@ impl<'gc> TableState<'gc> {
         if let Some(index) = array_index(key) {
             return match self.array.get(index - 1) {
                 Some(value) => *value,
-                None => Value::Nil,
+                None => Value::nil(),
             };
         }
 
         match self.hash.get(&key) {
             Some(value) => *value,
-            None => Value::Nil,
+            None => Value::nil(),
         }
     }
 
@@ -98,7 +98,7 @@ impl<'gc> TableState<'gc> {
     pub fn raw_set(&mut self, key: Value<'gc>, value: Value<'gc>) {
         if let Some(index) = array_index(key) {
             if index > self.array.len() {
-                self.array.resize(index, Value::Nil);
+                self.array.resize(index, Value::nil());
             }
 
             self.array[index - 1] = value;
@@ -119,18 +119,22 @@ impl<'gc> TableState<'gc> {
 
 /// Extract a valid array index from a Value (1-based positive integer).
 fn array_index(key: Value) -> Option<usize> {
-    match key {
-        Value::Integer(i) if i >= 1 => Some(i as usize),
-        Value::Float(f) => {
-            let i = f as i64;
-            if i >= 1 && (i as f64) == f {
-                Some(i as usize)
-            } else {
-                None
-            }
+    if let Some(i) = key.get_integer() {
+        if i >= 1 {
+            return Some(i as usize);
         }
-        _ => None,
+        return None;
     }
+
+    if let Some(f) = key.get_float() {
+        let i = f as i64;
+        if i >= 1 && (i as f64) == f {
+            return Some(i as usize);
+        }
+        return None;
+    }
+
+    None
 }
 
 bitflags! {

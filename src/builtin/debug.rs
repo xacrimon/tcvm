@@ -24,13 +24,13 @@ pub fn load<'gc>(ctx: Context<'gc>) {
     let lib = Table::new(ctx.mutation());
     for &(name, handler) in fns {
         let handler = Function::new_native(ctx.mutation(), handler, Box::new([]));
-        let key = Value::String(LuaString::new(ctx, name.as_bytes()));
-        lib.raw_set(ctx.mutation(), key, Value::Function(handler));
+        let key = Value::string(LuaString::new(ctx, name.as_bytes()));
+        lib.raw_set(ctx.mutation(), key, Value::function(handler));
     }
 
-    let lib_name = Value::String(LuaString::new(ctx, b"debug"));
+    let lib_name = Value::string(LuaString::new(ctx, b"debug"));
     ctx.globals()
-        .raw_set(ctx.mutation(), lib_name, Value::Table(lib));
+        .raw_set(ctx.mutation(), lib_name, Value::table(lib));
 }
 
 fn lua_debug<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {

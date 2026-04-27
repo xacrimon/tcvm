@@ -25,13 +25,13 @@ pub fn load<'gc>(ctx: Context<'gc>) {
     let lib = Table::new(ctx.mutation());
     for &(name, handler) in fns {
         let handler = Function::new_native(ctx.mutation(), handler, Box::new([]));
-        let key = Value::String(LuaString::new(ctx, name.as_bytes()));
-        lib.raw_set(ctx.mutation(), key, Value::Function(handler));
+        let key = Value::string(LuaString::new(ctx, name.as_bytes()));
+        lib.raw_set(ctx.mutation(), key, Value::function(handler));
     }
 
-    let lib_name = Value::String(LuaString::new(ctx, b"string"));
+    let lib_name = Value::string(LuaString::new(ctx, b"string"));
     ctx.globals()
-        .raw_set(ctx.mutation(), lib_name, Value::Table(lib));
+        .raw_set(ctx.mutation(), lib_name, Value::table(lib));
 }
 
 fn lua_byte<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
@@ -86,7 +86,7 @@ fn lua_format<'gc>(
     }
 
     let s = LuaString::new(ctx.ctx, &out);
-    stack.replace(&[Value::String(s)]);
+    stack.replace(&[Value::string(s)]);
     Ok(())
 }
 
@@ -205,35 +205,38 @@ fn arg_type_err(expected: &str, arg: &Value<'_>) -> NativeError {
 }
 
 fn to_integer<'gc>(v: Value<'gc>) -> Option<i64> {
-    match v {
-        Value::Integer(i) => Some(i),
-        Value::Float(f) => {
-            if f.is_finite() && f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
-                Some(f as i64)
-            } else {
-                None
-            }
-        }
-        Value::String(s) => {
-            let t = std::str::from_utf8(s.as_bytes()).ok()?.trim();
-            t.parse::<i64>().ok().or_else(|| {
-                t.parse::<f64>()
-                    .ok()
-                    .filter(|f| f.fract() == 0.0)
-                    .map(|f| f as i64)
-            })
-        }
-        _ => None,
+    if let Some(i) = v.get_integer() {
+        return Some(i);
     }
+    if let Some(f) = v.get_float() {
+        if f.is_finite() && f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+            return Some(f as i64);
+        }
+        return None;
+    }
+    if let Some(s) = v.get_string() {
+        let t = std::str::from_utf8(s.as_bytes()).ok()?.trim();
+        return t.parse::<i64>().ok().or_else(|| {
+            t.parse::<f64>()
+                .ok()
+                .filter(|f| f.fract() == 0.0)
+                .map(|f| f as i64)
+        });
+    }
+    None
 }
 
 fn to_float<'gc>(v: Value<'gc>) -> Option<f64> {
-    match v {
-        Value::Integer(i) => Some(i as f64),
-        Value::Float(f) => Some(f),
-        Value::String(s) => std::str::from_utf8(s.as_bytes()).ok()?.trim().parse().ok(),
-        _ => None,
+    if let Some(i) = v.get_integer() {
+        return Some(i as f64);
     }
+    if let Some(f) = v.get_float() {
+        return Some(f);
+    }
+    if let Some(s) = v.get_string() {
+        return std::str::from_utf8(s.as_bytes()).ok()?.trim().parse().ok();
+    }
+    None
 }
 
 // ---------- integer formatting ----------
@@ -448,20 +451,20 @@ fn strip_trailing_zeros(s: &mut String) {
 
 fn fmt_string<'gc>(out: &mut Vec<u8>, spec: &FmtSpec, arg: Value<'gc>) {
     let owned: String;
-    let bytes: &[u8] = match arg {
-        Value::String(s) => s.as_bytes(),
-        Value::Nil => b"nil",
-        Value::Boolean(true) => b"true",
-        Value::Boolean(false) => b"false",
-        Value::Integer(i) => {
-            owned = format!("{i}");
-            owned.as_bytes()
-        }
-        Value::Float(f) => {
-            owned = format!("{f}");
-            owned.as_bytes()
-        }
-        _ => b"<value>",
+    let bytes: &[u8] = if let Some(s) = arg.get_string() {
+        s.as_bytes()
+    } else if arg.is_nil() {
+        b"nil"
+    } else if let Some(b) = arg.get_boolean() {
+        if b { b"true" } else { b"false" }
+    } else if let Some(i) = arg.get_integer() {
+        owned = format!("{i}");
+        owned.as_bytes()
+    } else if let Some(f) = arg.get_float() {
+        owned = format!("{f}");
+        owned.as_bytes()
+    } else {
+        b"<value>"
     };
     let trimmed: &[u8] = if let Some(p) = spec.precision {
         &bytes[..bytes.len().min(p)]
@@ -472,41 +475,37 @@ fn fmt_string<'gc>(out: &mut Vec<u8>, spec: &FmtSpec, arg: Value<'gc>) {
 }
 
 fn fmt_q<'gc>(out: &mut Vec<u8>, arg: Value<'gc>) {
-    match arg {
-        Value::Nil => out.extend_from_slice(b"nil"),
-        Value::Boolean(true) => out.extend_from_slice(b"true"),
-        Value::Boolean(false) => out.extend_from_slice(b"false"),
-        Value::Integer(i) => {
-            let s = format!("{i}");
-            out.extend_from_slice(s.as_bytes());
-        }
-        Value::Float(f) => {
-            // TODO: use %a (hex float) for exact round-trip per Lua spec.
-            let s = format!("{f:?}");
-            out.extend_from_slice(s.as_bytes());
-        }
-        Value::String(s) => {
-            out.push(b'"');
-            for &b in s.as_bytes() {
-                match b {
-                    b'"' => out.extend_from_slice(b"\\\""),
-                    b'\\' => out.extend_from_slice(b"\\\\"),
-                    b'\n' => out.extend_from_slice(b"\\n"),
-                    b'\r' => out.extend_from_slice(b"\\r"),
-                    0 => out.extend_from_slice(b"\\0"),
-                    b if b < 0x20 || b == 0x7f => {
-                        let s = format!("\\{}", b);
-                        out.extend_from_slice(s.as_bytes());
-                    }
-                    b => out.push(b),
+    if arg.is_nil() {
+        out.extend_from_slice(b"nil");
+    } else if let Some(b) = arg.get_boolean() {
+        out.extend_from_slice(if b { b"true" } else { b"false" });
+    } else if let Some(i) = arg.get_integer() {
+        let s = format!("{i}");
+        out.extend_from_slice(s.as_bytes());
+    } else if let Some(f) = arg.get_float() {
+        // TODO: use %a (hex float) for exact round-trip per Lua spec.
+        let s = format!("{f:?}");
+        out.extend_from_slice(s.as_bytes());
+    } else if let Some(s) = arg.get_string() {
+        out.push(b'"');
+        for &b in s.as_bytes() {
+            match b {
+                b'"' => out.extend_from_slice(b"\\\""),
+                b'\\' => out.extend_from_slice(b"\\\\"),
+                b'\n' => out.extend_from_slice(b"\\n"),
+                b'\r' => out.extend_from_slice(b"\\r"),
+                0 => out.extend_from_slice(b"\\0"),
+                b if b < 0x20 || b == 0x7f => {
+                    let s = format!("\\{}", b);
+                    out.extend_from_slice(s.as_bytes());
                 }
+                b => out.push(b),
             }
-            out.push(b'"');
         }
-        _ => {
-            let s = format!("<{}>", arg.type_name());
-            out.extend_from_slice(s.as_bytes());
-        }
+        out.push(b'"');
+    } else {
+        let s = format!("<{}>", arg.type_name());
+        out.extend_from_slice(s.as_bytes());
     }
 }
 

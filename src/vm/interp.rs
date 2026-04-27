@@ -1,5 +1,4 @@
 use crate::dmm::{Gc, Mutation, RefLock};
-use crate::env::Value;
 use crate::env::function::{
     Function, FunctionKind, LuaClosure, NativeClosure, NativeContext, NativeError, Stack, Upvalue,
     UpvalueState,
@@ -7,6 +6,7 @@ use crate::env::function::{
 use crate::env::string::LuaString;
 use crate::env::table::{Metamethod, Table};
 use crate::env::thread::{CallFrame, Thread, ThreadState, ThreadStatus};
+use crate::env::{Value, ValueKind};
 use crate::instruction::{Instruction, UpValueDescriptor};
 use crate::lua::Context;
 use crate::vm::num::{self, op_arith, op_bit};
@@ -310,7 +310,7 @@ extern "rust-preserve-none" fn op_lfalseskip<'gc>(
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
     let src = args!(Instruction::LFALSESKIP { src });
-    *reg!(mut src) = Value::Boolean(false);
+    *reg!(mut src) = Value::boolean(false);
     skip!();
     dispatch!();
 }
@@ -630,7 +630,7 @@ extern "rust-preserve-none" fn op_newtable<'gc>(
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
     let dst = args!(Instruction::NEWTABLE { dst });
-    *reg!(mut dst) = Value::Table(Table::new(ctx.mutation()));
+    *reg!(mut dst) = Value::table(Table::new(ctx.mutation()));
     dispatch!();
 }
 
@@ -701,16 +701,13 @@ extern "rust-preserve-none" fn op_unm<'gc>(
     helpers!(instruction, ctx, thread, registers, ip, handlers);
     let (dst, src) = args!(Instruction::UNM { dst, src });
     let val = reg!(src);
-    match val {
-        Value::Integer(i) => {
-            *reg!(mut dst) = Value::Integer(i.wrapping_neg());
-            dispatch!();
-        }
-        Value::Float(f) => {
-            *reg!(mut dst) = Value::Float(-f);
-            dispatch!();
-        }
-        _ => {}
+    if let Some(i) = val.get_integer() {
+        *reg!(mut dst) = Value::integer(i.wrapping_neg());
+        dispatch!();
+    }
+    if let Some(f) = val.get_float() {
+        *reg!(mut dst) = Value::float(-f);
+        dispatch!();
     }
     let meta_fn = unop_metamethod(ctx, val, b"__unm");
     if meta_fn.is_nil() {
@@ -739,8 +736,8 @@ extern "rust-preserve-none" fn op_bnot<'gc>(
     helpers!(instruction, ctx, thread, registers, ip, handlers);
     let (dst, src) = args!(Instruction::BNOT { dst, src });
     let val = reg!(src);
-    if let Value::Integer(i) = val {
-        *reg!(mut dst) = Value::Integer(!i);
+    if let Some(i) = val.get_integer() {
+        *reg!(mut dst) = Value::integer(!i);
         dispatch!();
     }
     let meta_fn = unop_metamethod(ctx, val, b"__bnot");
@@ -769,7 +766,7 @@ extern "rust-preserve-none" fn op_not<'gc>(
     helpers!(instruction, ctx, thread, registers, ip, handlers);
     let (dst, src) = args!(Instruction::NOT { dst, src });
     let val = reg!(src);
-    *reg!(mut dst) = Value::Boolean(val.is_falsy());
+    *reg!(mut dst) = Value::boolean(val.is_falsy());
     dispatch!();
 }
 
@@ -788,22 +785,21 @@ extern "rust-preserve-none" fn op_len<'gc>(
     let val = reg!(src);
 
     // Strings never consult __len; return byte length directly.
-    if let Value::String(s) = val {
-        *reg!(mut dst) = Value::Integer(s.len() as i64);
+    if let Some(s) = val.get_string() {
+        *reg!(mut dst) = Value::integer(s.len() as i64);
         dispatch!();
     }
 
     // Tables consult __len first; fall back to raw_len only if absent.
-    let meta_fn = match val {
-        Value::Table(t) => {
-            let mm = t.get_metamethod(ctx, b"__len");
-            if mm.is_nil() {
-                *reg!(mut dst) = Value::Integer(t.raw_len() as i64);
-                dispatch!();
-            }
-            mm
+    let meta_fn = if let Some(t) = val.get_table() {
+        let mm = t.get_metamethod(ctx, b"__len");
+        if mm.is_nil() {
+            *reg!(mut dst) = Value::integer(t.raw_len() as i64);
+            dispatch!();
         }
-        _ => raise!(),
+        mm
+    } else {
+        raise!()
     };
 
     let cont = Continuation {
@@ -832,7 +828,7 @@ extern "rust-preserve-none" fn op_concat<'gc>(
     // Fast path: both coerce to strings/numbers.
     let mut buf = Vec::new();
     if num::coerce_to_str(&mut buf, a) && num::coerce_to_str(&mut buf, b) {
-        *reg!(mut dst) = Value::String(LuaString::new(ctx, &buf));
+        *reg!(mut dst) = Value::string(LuaString::new(ctx, &buf));
         dispatch!();
     }
     let meta_fn = binop_metamethod(ctx, a, b, b"__concat");
@@ -933,10 +929,8 @@ extern "rust-preserve-none" fn op_eq<'gc>(
 
     // Lua 5.5: __eq fires only when both operands are the same non-primitive
     // type (tables or userdata) and raw equality fails.
-    let try_meta = matches!(
-        (a, b),
-        (Value::Table(_), Value::Table(_)) | (Value::Userdata(_), Value::Userdata(_))
-    );
+    let try_meta = (a.kind() == ValueKind::Table && b.kind() == ValueKind::Table)
+        || (a.kind() == ValueKind::Userdata && b.kind() == ValueKind::Userdata);
     if try_meta {
         let meta_fn = binop_metamethod(ctx, a, b, b"__eq");
         if !meta_fn.is_nil() {
@@ -974,13 +968,18 @@ extern "rust-preserve-none" fn op_lt<'gc>(
     let (lhs, rhs, inverted) = args!(Instruction::LT { lhs, rhs, inverted });
     let a = reg!(lhs);
     let b = reg!(rhs);
-    let primitive = match (a, b) {
-        (Value::Integer(x), Value::Integer(y)) => Some(x < y),
-        (Value::Float(x), Value::Float(y)) => Some(x < y),
-        (Value::Integer(x), Value::Float(y)) => Some((x as f64) < y),
-        (Value::Float(x), Value::Integer(y)) => Some(x < (y as f64)),
-        (Value::String(x), Value::String(y)) => Some(x < y),
-        _ => None,
+    let primitive = if let (Some(x), Some(y)) = (a.get_integer(), b.get_integer()) {
+        Some(x < y)
+    } else if let (Some(x), Some(y)) = (a.get_float(), b.get_float()) {
+        Some(x < y)
+    } else if let (Some(x), Some(y)) = (a.get_integer(), b.get_float()) {
+        Some((x as f64) < y)
+    } else if let (Some(x), Some(y)) = (a.get_float(), b.get_integer()) {
+        Some(x < (y as f64))
+    } else if let (Some(x), Some(y)) = (a.get_string(), b.get_string()) {
+        Some(x < y)
+    } else {
+        None
     };
     if let Some(r) = primitive {
         if r != inverted {
@@ -1018,13 +1017,18 @@ extern "rust-preserve-none" fn op_le<'gc>(
     let (lhs, rhs, inverted) = args!(Instruction::LE { lhs, rhs, inverted });
     let a = reg!(lhs);
     let b = reg!(rhs);
-    let primitive = match (a, b) {
-        (Value::Integer(x), Value::Integer(y)) => Some(x <= y),
-        (Value::Float(x), Value::Float(y)) => Some(x <= y),
-        (Value::Integer(x), Value::Float(y)) => Some((x as f64) <= y),
-        (Value::Float(x), Value::Integer(y)) => Some(x <= (y as f64)),
-        (Value::String(x), Value::String(y)) => Some(x <= y),
-        _ => None,
+    let primitive = if let (Some(x), Some(y)) = (a.get_integer(), b.get_integer()) {
+        Some(x <= y)
+    } else if let (Some(x), Some(y)) = (a.get_float(), b.get_float()) {
+        Some(x <= y)
+    } else if let (Some(x), Some(y)) = (a.get_integer(), b.get_float()) {
+        Some((x as f64) <= y)
+    } else if let (Some(x), Some(y)) = (a.get_float(), b.get_integer()) {
+        Some(x <= (y as f64))
+    } else if let (Some(x), Some(y)) = (a.get_string(), b.get_string()) {
+        Some(x <= y)
+    } else {
+        None
     };
     if let Some(r) = primitive {
         if r != inverted {
@@ -1127,7 +1131,7 @@ extern "rust-preserve-none" fn op_call<'gc>(
             // Ensure stack is large enough
             let needed = new_base + closure.proto.max_stack_size as usize;
             if thread.stack.len() < needed {
-                thread.stack.resize(needed, Value::Nil);
+                thread.stack.resize(needed, Value::nil());
             }
             // Nil-fill parameter slots the caller didn't supply.
             // args == 0 means variable arg count (top-based, not yet supported).
@@ -1135,7 +1139,7 @@ extern "rust-preserve-none" fn op_call<'gc>(
                 let caller_provided = nargs as usize - 1;
                 let num_params = closure.proto.num_params as usize;
                 for i in caller_provided..num_params {
-                    thread.stack[new_base + i] = Value::Nil;
+                    thread.stack[new_base + i] = Value::nil();
                 }
             }
             // Push new call frame
@@ -1177,7 +1181,7 @@ extern "rust-preserve-none" fn op_call<'gc>(
                 if let Some(frame) = thread.frames.last() {
                     let needed = frame.base + frame.closure.proto.max_stack_size as usize;
                     if thread.stack.len() < needed {
-                        thread.stack.resize(needed, Value::Nil);
+                        thread.stack.resize(needed, Value::nil());
                     }
                 }
             }
@@ -1185,7 +1189,7 @@ extern "rust-preserve-none" fn op_call<'gc>(
                 thread.stack[func_idx + i] = thread.stack[args_base + i];
             }
             for i in to_copy..wanted {
-                thread.stack[func_idx + i] = Value::Nil;
+                thread.stack[func_idx + i] = Value::nil();
             }
             if returns == 0 {
                 thread.stack.truncate(func_idx + retc);
@@ -1236,12 +1240,12 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
             // Ensure stack is large enough
             let needed = cur_base + closure.proto.max_stack_size as usize;
             if thread.stack.len() < needed {
-                thread.stack.resize(needed, Value::Nil);
+                thread.stack.resize(needed, Value::nil());
             }
             // Nil-fill parameter slots the caller didn't supply.
             let num_params = closure.proto.num_params as usize;
             for i in nargs..num_params {
-                thread.stack[cur_base + i] = Value::Nil;
+                thread.stack[cur_base + i] = Value::nil();
             }
             // Rebind ip and registers
             ip = closure.proto.code.as_ptr();
@@ -1327,20 +1331,15 @@ extern "rust-preserve-none" fn op_forprep<'gc>(
     let limit = reg!(base + 1);
     let step = reg!(base + 2);
 
-    let should_run = match (init, limit, step) {
-        (Value::Integer(i), Value::Integer(lim), Value::Integer(s)) => {
-            if s > 0 {
-                i <= lim
-            } else {
-                i >= lim
-            }
-        }
-        _ => {
-            let i = to_number(init).unwrap_or(0.0);
-            let lim = to_number(limit).unwrap_or(0.0);
-            let s = to_number(step).unwrap_or(0.0);
-            if s > 0.0 { i <= lim } else { i >= lim }
-        }
+    let should_run = if let (Some(i), Some(lim), Some(s)) =
+        (init.get_integer(), limit.get_integer(), step.get_integer())
+    {
+        if s > 0 { i <= lim } else { i >= lim }
+    } else {
+        let i = to_number(init).unwrap_or(0.0);
+        let lim = to_number(limit).unwrap_or(0.0);
+        let s = to_number(step).unwrap_or(0.0);
+        if s > 0.0 { i <= lim } else { i >= lim }
     };
 
     if !should_run {
@@ -1369,27 +1368,28 @@ extern "rust-preserve-none" fn op_forloop<'gc>(
 
     let step = reg!(base + 2);
 
-    match (reg!(base), reg!(base + 1), step) {
-        (Value::Integer(i), Value::Integer(lim), Value::Integer(s)) => {
-            let next = i.wrapping_add(s);
-            let cont = if s > 0 { next <= lim } else { next >= lim };
-            if cont {
-                *reg!(mut base) = Value::Integer(next);
-                *reg!(mut base + 3) = Value::Integer(next);
-                ip = unsafe { ip.offset(offset as isize) };
-            }
+    let cur = reg!(base);
+    let lim_v = reg!(base + 1);
+    if let (Some(i), Some(lim), Some(s)) =
+        (cur.get_integer(), lim_v.get_integer(), step.get_integer())
+    {
+        let next = i.wrapping_add(s);
+        let cont = if s > 0 { next <= lim } else { next >= lim };
+        if cont {
+            *reg!(mut base) = Value::integer(next);
+            *reg!(mut base + 3) = Value::integer(next);
+            ip = unsafe { ip.offset(offset as isize) };
         }
-        _ => {
-            let i = to_number(reg!(base)).unwrap_or(0.0);
-            let lim = to_number(reg!(base + 1)).unwrap_or(0.0);
-            let s = to_number(step).unwrap_or(0.0);
-            let next = i + s;
-            let cont = if s > 0.0 { next <= lim } else { next >= lim };
-            if cont {
-                *reg!(mut base) = Value::Float(next);
-                *reg!(mut base + 3) = Value::Float(next);
-                ip = unsafe { ip.offset(offset as isize) };
-            }
+    } else {
+        let i = to_number(cur).unwrap_or(0.0);
+        let lim = to_number(lim_v).unwrap_or(0.0);
+        let s = to_number(step).unwrap_or(0.0);
+        let next = i + s;
+        let cont = if s > 0.0 { next <= lim } else { next >= lim };
+        if cont {
+            *reg!(mut base) = Value::float(next);
+            *reg!(mut base + 3) = Value::float(next);
+            ip = unsafe { ip.offset(offset as isize) };
         }
     }
 
@@ -1485,7 +1485,7 @@ extern "rust-preserve-none" fn op_setlist<'gc>(
     let off = offset as i64;
     for i in 1..=n {
         let val = reg!(table + i as u8);
-        let key = Value::Integer(off + i as i64);
+        let key = Value::integer(off + i as i64);
         t.raw_set(ctx.mutation(), key, val);
     }
     dispatch!();
@@ -1544,7 +1544,7 @@ extern "rust-preserve-none" fn op_closure<'gc>(
     let upvalues: Box<[Upvalue<'gc>]> = upvalues_vec.into_boxed_slice();
 
     let func = Function::new_lua(ctx.mutation(), proto, upvalues);
-    *reg!(mut dst) = Value::Function(func);
+    *reg!(mut dst) = Value::function(func);
     dispatch!();
 }
 
@@ -1574,7 +1574,7 @@ extern "rust-preserve-none" fn op_vararg<'gc>(
     // See #26: track actual arg count to properly copy varargs.
     let wanted = if count == 0 { 0 } else { count as usize - 1 };
     for i in 0..wanted {
-        *reg!(mut dst + i as u8) = Value::Nil;
+        *reg!(mut dst + i as u8) = Value::nil();
     }
     dispatch!();
 }
@@ -1652,11 +1652,13 @@ extern "rust-preserve-none" fn op_stop<'gc>(
 // ---------------------------------------------------------------------------
 
 fn to_number(v: Value) -> Option<f64> {
-    match v {
-        Value::Integer(i) => Some(i as f64),
-        Value::Float(f) => Some(f),
-        _ => None,
+    if let Some(i) = v.get_integer() {
+        return Some(i as f64);
     }
+    if let Some(f) = v.get_float() {
+        return Some(f);
+    }
+    None
 }
 
 /// Close all TBC variables at stack indices >= `start_idx`.
@@ -1728,7 +1730,7 @@ pub(crate) fn invoke_native<'gc>(
     if thread.stack.len() > end {
         thread.stack.truncate(end);
     } else if thread.stack.len() < end {
-        thread.stack.resize(end, Value::Nil);
+        thread.stack.resize(end, Value::nil());
     }
     let ctx = NativeContext {
         ctx,
@@ -1805,7 +1807,7 @@ pub(crate) fn frame_return<'gc>(
         thread.stack[dst_start + i] = thread.stack[values_base + i];
     }
     for i in to_copy..wanted {
-        thread.stack[dst_start + i] = Value::Nil;
+        thread.stack[dst_start + i] = Value::nil();
     }
 
     let caller = thread.frames.last().unwrap();
@@ -1878,19 +1880,17 @@ fn resolve_index_chain<'gc>(
             return Some(IndexChain::Resolved(v));
         }
         let mm = t.get_metamethod(ctx, b"__index");
-        match mm {
-            Value::Nil => return Some(IndexChain::Resolved(Value::Nil)),
-            Value::Table(next) => {
-                t = next;
-                continue;
-            }
-            _ => {
-                return Some(IndexChain::Invoke {
-                    func: mm,
-                    receiver: Value::Table(t),
-                });
-            }
+        if mm.is_nil() {
+            return Some(IndexChain::Resolved(Value::nil()));
         }
+        if let Some(next) = mm.get_table() {
+            t = next;
+            continue;
+        }
+        return Some(IndexChain::Invoke {
+            func: mm,
+            receiver: Value::table(t),
+        });
     }
     None
 }
@@ -1923,19 +1923,17 @@ fn resolve_newindex_chain<'gc>(
             return Some(NewIndexChain::RawSet(t));
         }
         let mm = t.get_metamethod(ctx, b"__newindex");
-        match mm {
-            Value::Nil => return Some(NewIndexChain::RawSet(t)),
-            Value::Table(next) => {
-                t = next;
-                continue;
-            }
-            _ => {
-                return Some(NewIndexChain::Invoke {
-                    func: mm,
-                    receiver: Value::Table(t),
-                });
-            }
+        if mm.is_nil() {
+            return Some(NewIndexChain::RawSet(t));
         }
+        if let Some(next) = mm.get_table() {
+            t = next;
+            continue;
+        }
+        return Some(NewIndexChain::Invoke {
+            func: mm,
+            receiver: Value::table(t),
+        });
     }
     None
 }
@@ -1984,7 +1982,7 @@ fn resolve_call_chain<'gc>(
         let actual_args = nargs as usize - 1;
         let end = func_idx + 2 + actual_args;
         if thread.stack.len() < end {
-            thread.stack.resize(end, Value::Nil);
+            thread.stack.resize(end, Value::nil());
         }
         for i in (0..actual_args).rev() {
             thread.stack[func_idx + 2 + i] = thread.stack[func_idx + 1 + i];
@@ -2015,7 +2013,7 @@ fn binop_metamethod<'gc>(
     if let Some(t) = rhs.get_table() {
         return t.get_metamethod(ctx, name);
     }
-    Value::Nil
+    Value::nil()
 }
 
 /// Look up a unary metamethod on `val`. Same caveat as `binop_metamethod`.
@@ -2024,7 +2022,7 @@ fn unop_metamethod<'gc>(ctx: Context<'gc>, val: Value<'gc>, name: &[u8]) -> Valu
     if let Some(t) = val.get_table() {
         return t.get_metamethod(ctx, name);
     }
-    Value::Nil
+    Value::nil()
 }
 
 /// Set up a Lua call frame to invoke a metamethod (or other helper function),
@@ -2062,7 +2060,7 @@ fn schedule_meta_call<'gc>(
     // Stage meta_fn + args so resolve_call_chain sees them in op_call layout.
     let staged_end = new_base + args.len();
     if thread.stack.len() < staged_end {
-        thread.stack.resize(staged_end, Value::Nil);
+        thread.stack.resize(staged_end, Value::nil());
     }
     thread.stack[scratch_func] = meta_fn;
     for (i, &a) in args.iter().enumerate() {
@@ -2086,13 +2084,13 @@ fn schedule_meta_call<'gc>(
     // Grow stack to fit the resolved closure's full frame.
     let needed = new_base + closure.proto.max_stack_size as usize;
     if thread.stack.len() < needed {
-        thread.stack.resize(needed, Value::Nil);
+        thread.stack.resize(needed, Value::nil());
     }
 
     // Nil-fill any parameter slots not covered by the (possibly shifted) args.
     let num_params = closure.proto.num_params as usize;
     for i in actual_args..num_params {
-        thread.stack[new_base + i] = Value::Nil;
+        thread.stack[new_base + i] = Value::nil();
     }
 
     thread.frames.push(CallFrame {
@@ -2160,7 +2158,7 @@ extern "rust-preserve-none" fn cont_store_result<'gc>(
     let result = if cont.nret > 0 {
         thread.stack[cont.results_base]
     } else {
-        Value::Nil
+        Value::nil()
     };
     *reg!(mut dst) = result;
     dispatch!();
@@ -2204,7 +2202,7 @@ extern "rust-preserve-none" fn cont_cond_jump<'gc>(
     let result = if cont.nret > 0 {
         thread.stack[cont.results_base]
     } else {
-        Value::Nil
+        Value::nil()
     };
     let truthy = !result.is_falsy();
     if truthy != inverted {
@@ -2241,7 +2239,7 @@ extern "rust-preserve-none" fn cont_tforcall<'gc>(
         *reg!(mut base + 4 + i as u8) = thread.stack[cont.results_base + i];
     }
     for i in to_copy..count as usize {
-        *reg!(mut base + 4 + i as u8) = Value::Nil;
+        *reg!(mut base + 4 + i as u8) = Value::nil();
     }
     dispatch!();
 }

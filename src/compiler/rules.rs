@@ -734,7 +734,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                 let ft = self.next_offset();
                 self.emit(Instruction::LFALSESKIP { src: dst.0 });
                 let tt = self.next_offset();
-                let true_idx = self.alloc_constant(Value::Boolean(true))?;
+                let true_idx = self.alloc_constant(Value::boolean(true))?;
                 self.emit(Instruction::LOAD {
                     dst: dst.0,
                     idx: true_idx,
@@ -812,13 +812,26 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
 
     fn alloc_constant(&mut self, value: Value<'gc>) -> Result<u16, CompileError> {
         // Check for an existing identical constant (exact type match, no int/float coercion).
-        let existing = self.chunk.constants.iter().position(|c| match (c, &value) {
-            (Value::Nil, Value::Nil) => true,
-            (Value::Boolean(a), Value::Boolean(b)) => a == b,
-            (Value::Integer(a), Value::Integer(b)) => a == b,
-            (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
-            (Value::String(a), Value::String(b)) => a == b,
-            _ => false,
+        let existing = self.chunk.constants.iter().position(|c| {
+            if c.kind() != value.kind() {
+                return false;
+            }
+            if c.is_nil() {
+                return true;
+            }
+            if let (Some(a), Some(b)) = (c.get_boolean(), value.get_boolean()) {
+                return a == b;
+            }
+            if let (Some(a), Some(b)) = (c.get_integer(), value.get_integer()) {
+                return a == b;
+            }
+            if let (Some(a), Some(b)) = (c.get_float(), value.get_float()) {
+                return a.to_bits() == b.to_bits();
+            }
+            if let (Some(a), Some(b)) = (c.get_string(), value.get_string()) {
+                return a == b;
+            }
+            false
         });
 
         if let Some(idx) = existing {
@@ -835,7 +848,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
 
     fn alloc_string_constant(&mut self, s: &[u8]) -> Result<u16, CompileError> {
         let lua_str = LuaString::new(self.ctx, s);
-        self.alloc_constant(Value::String(lua_str))
+        self.alloc_constant(Value::string(lua_str))
     }
 
     /// Resolve `name` into an index in THIS function's upvalue list,
@@ -1242,7 +1255,7 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
     let target_top = base + num_targets as u8;
     while ctx.chunk.freereg < target_top {
         let slot = ctx.reserve_reg()?;
-        let idx = ctx.alloc_constant(Value::Nil)?;
+        let idx = ctx.alloc_constant(Value::nil())?;
         ctx.emit(Instruction::LOAD { dst: slot.0, idx });
     }
 
@@ -1433,7 +1446,7 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
     // Pad with nil for any names beyond the supplied values.
     while ctx.chunk.freereg < value_base + n_targets as u8 {
         let slot = ctx.reserve_reg()?;
-        let idx = ctx.alloc_constant(Value::Nil)?;
+        let idx = ctx.alloc_constant(Value::nil())?;
         ctx.emit(Instruction::LOAD { dst: slot.0, idx });
     }
     // Drop any extra values past `n_targets` — they were computed
@@ -1577,7 +1590,7 @@ fn compile_assign(ctx: &mut Ctx, item: Assign) -> Result<(), CompileError> {
     // so hinting into a Local target is always safe.
     while pending.len() < num_targets {
         let i = pending.len();
-        let nil = ctx.alloc_constant(Value::Nil)?;
+        let nil = ctx.alloc_constant(Value::nil())?;
         let hint = local_dst(&lvalues[i]);
         let reg = ctx.dst_or_alloc(hint)?;
         ctx.emit(Instruction::LOAD {
@@ -2028,11 +2041,11 @@ fn compile_expr_literal(
         .ok_or_else(|| ice("literal without value"))?;
 
     let constant = match value {
-        LiteralValue::Nil => Value::Nil,
-        LiteralValue::Bool(b) => Value::Boolean(b),
-        LiteralValue::Int(n) => Value::Integer(n),
-        LiteralValue::Float(n) => Value::Float(n),
-        LiteralValue::String(bytes) => Value::String(LuaString::new(ctx.ctx, &bytes)),
+        LiteralValue::Nil => Value::nil(),
+        LiteralValue::Bool(b) => Value::boolean(b),
+        LiteralValue::Int(n) => Value::integer(n),
+        LiteralValue::Float(n) => Value::float(n),
+        LiteralValue::String(bytes) => Value::string(LuaString::new(ctx.ctx, &bytes)),
     };
 
     let idx = ctx.alloc_constant(constant)?;
@@ -3221,7 +3234,7 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
             }
         } else {
             // Default step = 1
-            let one_idx = ctx.alloc_constant(Value::Integer(1))?;
+            let one_idx = ctx.alloc_constant(Value::integer(1))?;
             ctx.emit(Instruction::LOAD {
                 dst: step_reg.0,
                 idx: one_idx,

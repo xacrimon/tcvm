@@ -101,7 +101,7 @@ impl<'gc, 'a> Stack<'gc, 'a> {
         self.values
             .get(self.bottom + i)
             .copied()
-            .unwrap_or(Value::Nil)
+            .unwrap_or(Value::nil())
     }
 
     #[inline]

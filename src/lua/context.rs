@@ -64,7 +64,7 @@ impl<'gc> Context<'gc> {
         // Main chunk's upvalue 0 is _ENV. Pre-close it onto globals.
         let env_uv = Gc::new(
             self.mutation,
-            RefLock::new(UpvalueState::Closed(Value::Table(self.state.globals))),
+            RefLock::new(UpvalueState::Closed(Value::table(self.state.globals))),
         );
         Ok(Function::new_lua(self.mutation, proto, Box::from([env_uv])))
     }

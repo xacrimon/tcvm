@@ -24,7 +24,7 @@ pub enum ValueKind {
     Userdata,
 }
 
-#[derive(Clone, Copy, Collect)]
+#[derive(Clone, Copy, Collect, PartialEq)]
 #[collect(internal, no_drop)]
 pub struct Value<'gc> {
     kind: ValueKind,
@@ -183,8 +183,7 @@ impl<'gc> Value<'gc> {
     }
 
     pub fn is_falsy(&self) -> bool {
-        //matches!(self, Value::Nil | Value::Boolean(false))
-        todo!()
+        self.kind == ValueKind::Nil || self.get_boolean() == Some(false)
     }
 
     pub fn kind(self) -> ValueKind {
@@ -205,16 +204,10 @@ impl<'gc> Value<'gc> {
     }
 }
 
-impl<'gc> PartialEq for Value<'gc> {
-    fn eq(&self, other: &Self) -> bool {
-        todo!()
-    }
-}
-
 impl<'gc> Eq for Value<'gc> {}
 
 impl<'gc> Hash for Value<'gc> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        todo!()
+        state.write_u64(self.data);
     }
 }

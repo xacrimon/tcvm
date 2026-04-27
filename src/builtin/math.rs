@@ -33,13 +33,13 @@ pub fn load<'gc>(ctx: Context<'gc>) {
     let lib = Table::new(ctx.mutation());
     for &(name, handler) in fns {
         let handler = Function::new_native(ctx.mutation(), handler, Box::new([]));
-        let key = Value::String(LuaString::new(ctx, name.as_bytes()));
-        lib.raw_set(ctx.mutation(), key, Value::Function(handler));
+        let key = Value::string(LuaString::new(ctx, name.as_bytes()));
+        lib.raw_set(ctx.mutation(), key, Value::function(handler));
     }
 
-    let lib_name = Value::String(LuaString::new(ctx, b"math"));
+    let lib_name = Value::string(LuaString::new(ctx, b"math"));
     ctx.globals()
-        .raw_set(ctx.mutation(), lib_name, Value::Table(lib));
+        .raw_set(ctx.mutation(), lib_name, Value::table(lib));
 }
 
 fn lua_abs<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
@@ -125,17 +125,17 @@ fn lua_sqrt<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<(), NativeError> {
     let v = stack.get(0);
-    let f = match v {
-        Value::Float(f) => f,
-        Value::Integer(i) => i as f64,
-        other => {
-            return Err(NativeError::new(format!(
-                "bad argument #1 to 'sqrt' (number expected, got {})",
-                other.type_name()
-            )));
-        }
+    let f = if let Some(f) = v.get_float() {
+        f
+    } else if let Some(i) = v.get_integer() {
+        i as f64
+    } else {
+        return Err(NativeError::new(format!(
+            "bad argument #1 to 'sqrt' (number expected, got {})",
+            v.type_name()
+        )));
     };
-    stack.replace(&[Value::Float(f.sqrt())]);
+    stack.replace(&[Value::float(f.sqrt())]);
     Ok(())
 }
 

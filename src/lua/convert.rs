@@ -42,7 +42,7 @@ impl<'gc> FromValue<'gc> for Value<'gc> {
 
 impl<'gc> IntoValue<'gc> for bool {
     fn into_value(self) -> Value<'gc> {
-        Value::Boolean(self)
+        Value::boolean(self)
     }
 }
 
@@ -57,45 +57,51 @@ impl<'gc> FromValue<'gc> for bool {
 
 impl<'gc> IntoValue<'gc> for i64 {
     fn into_value(self) -> Value<'gc> {
-        Value::Integer(self)
+        Value::integer(self)
     }
 }
 
 impl<'gc> FromValue<'gc> for i64 {
     fn from_value(v: Value<'gc>) -> Result<Self, TypeError> {
-        match v {
-            Value::Integer(i) => Ok(i),
-            Value::Float(f) if f.fract() == 0.0 && f.is_finite() => Ok(f as i64),
-            other => Err(TypeError::Mismatch {
-                expected: "integer",
-                got: other.type_name(),
-            }),
+        if let Some(i) = v.get_integer() {
+            return Ok(i);
         }
+        if let Some(f) = v.get_float() {
+            if f.fract() == 0.0 && f.is_finite() {
+                return Ok(f as i64);
+            }
+        }
+        Err(TypeError::Mismatch {
+            expected: "integer",
+            got: v.type_name(),
+        })
     }
 }
 
 impl<'gc> IntoValue<'gc> for f64 {
     fn into_value(self) -> Value<'gc> {
-        Value::Float(self)
+        Value::float(self)
     }
 }
 
 impl<'gc> FromValue<'gc> for f64 {
     fn from_value(v: Value<'gc>) -> Result<Self, TypeError> {
-        match v {
-            Value::Integer(i) => Ok(i as f64),
-            Value::Float(f) => Ok(f),
-            other => Err(TypeError::Mismatch {
-                expected: "number",
-                got: other.type_name(),
-            }),
+        if let Some(i) = v.get_integer() {
+            return Ok(i as f64);
         }
+        if let Some(f) = v.get_float() {
+            return Ok(f);
+        }
+        Err(TypeError::Mismatch {
+            expected: "number",
+            got: v.type_name(),
+        })
     }
 }
 
 impl<'gc> IntoValue<'gc> for LuaString<'gc> {
     fn into_value(self) -> Value<'gc> {
-        Value::String(self)
+        Value::string(self)
     }
 }
 
@@ -110,7 +116,7 @@ impl<'gc> FromValue<'gc> for LuaString<'gc> {
 
 impl<'gc> IntoValue<'gc> for Table<'gc> {
     fn into_value(self) -> Value<'gc> {
-        Value::Table(self)
+        Value::table(self)
     }
 }
 
@@ -125,7 +131,7 @@ impl<'gc> FromValue<'gc> for Table<'gc> {
 
 impl<'gc> IntoValue<'gc> for Function<'gc> {
     fn into_value(self) -> Value<'gc> {
-        Value::Function(self)
+        Value::function(self)
     }
 }
 
@@ -140,7 +146,7 @@ impl<'gc> FromValue<'gc> for Function<'gc> {
 
 impl<'gc> IntoValue<'gc> for Thread<'gc> {
     fn into_value(self) -> Value<'gc> {
-        Value::Thread(self)
+        Value::thread(self)
     }
 }
 
@@ -166,7 +172,7 @@ impl<'gc, T: FromValue<'gc>> FromValue<'gc> for Option<T> {
 impl<'gc, T: IntoValue<'gc>> IntoValue<'gc> for Option<T> {
     fn into_value(self) -> Value<'gc> {
         match self {
-            None => Value::Nil,
+            None => Value::nil(),
             Some(t) => t.into_value(),
         }
     }
@@ -228,7 +234,7 @@ macro_rules! from_multi_single {
     ($t:ty) => {
         impl<'gc> FromMultiValue<'gc> for $t {
             fn from_multi_value(values: &[Value<'gc>]) -> Result<Self, TypeError> {
-                let v = values.first().copied().unwrap_or(Value::Nil);
+                let v = values.first().copied().unwrap_or(Value::nil());
                 <$t as FromValue<'gc>>::from_value(v)
             }
         }
@@ -246,7 +252,7 @@ from_multi_single!(Thread<'gc>);
 
 impl<'gc, T: FromValue<'gc>> FromMultiValue<'gc> for Option<T> {
     fn from_multi_value(values: &[Value<'gc>]) -> Result<Self, TypeError> {
-        let v = values.first().copied().unwrap_or(Value::Nil);
+        let v = values.first().copied().unwrap_or(Value::nil());
         <Option<T> as FromValue<'gc>>::from_value(v)
     }
 }
@@ -260,7 +266,7 @@ macro_rules! from_multi_tuple {
             fn from_multi_value(values: &[Value<'gc>]) -> Result<Self, TypeError> {
                 Ok(($(
                     <$t as FromValue<'gc>>::from_value(
-                        values.get($idx).copied().unwrap_or(Value::Nil),
+                        values.get($idx).copied().unwrap_or(Value::nil()),
                     )?,
                 )+))
             }

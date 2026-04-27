@@ -63,14 +63,14 @@ impl<'gc> Executor<'gc> {
             ts.open_upvalues.clear();
             ts.tbc_slots.clear();
 
-            ts.stack.push(Value::Function(function));
+            ts.stack.push(Value::function(function));
             args.push_into(&mut ts.stack);
 
             if let Some(closure) = function.as_lua() {
                 let base = 1usize;
                 let needed = base + closure.proto.max_stack_size as usize;
                 if ts.stack.len() < needed {
-                    ts.stack.resize(needed, Value::Nil);
+                    ts.stack.resize(needed, Value::nil());
                 }
 
                 ts.frames.push(CallFrame {

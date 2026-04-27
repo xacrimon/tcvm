@@ -38,10 +38,10 @@ pub fn load<'gc>(ctx: Context<'gc>) {
 
     for &(name, handler) in fns {
         let handler = Function::new_native(ctx.mutation(), handler, Box::new([]));
-        let key = Value::String(LuaString::new(ctx, name.as_bytes()));
+        let key = Value::string(LuaString::new(ctx, name.as_bytes()));
 
         ctx.globals()
-            .raw_set(ctx.mutation(), key, Value::Function(handler));
+            .raw_set(ctx.mutation(), key, Value::function(handler));
     }
 }
 
@@ -162,15 +162,16 @@ fn lua_tonumber<'gc>(
 ) -> Result<(), NativeError> {
     // TODO: 2-arg form `tonumber(s, base)` for integer parsing in arbitrary base.
     let v = stack.get(0);
-    let result = match v {
-        Value::Nil => Value::Nil,
-        Value::Integer(_) | Value::Float(_) => v,
-        Value::String(s) => {
-            let bytes = s.as_bytes();
-            let trimmed = trim_ascii(bytes);
-            parse_lua_number(trimmed).unwrap_or(Value::Nil)
-        }
-        _ => Value::Nil,
+    let result = if v.is_nil() {
+        Value::nil()
+    } else if v.get_integer().is_some() || v.get_float().is_some() {
+        v
+    } else if let Some(s) = v.get_string() {
+        let bytes = s.as_bytes();
+        let trimmed = trim_ascii(bytes);
+        parse_lua_number(trimmed).unwrap_or(Value::nil())
+    } else {
+        Value::nil()
     };
     stack.replace(&[result]);
     Ok(())
@@ -195,10 +196,10 @@ fn parse_lua_number<'gc>(b: &[u8]) -> Option<Value<'gc>> {
     let s = std::str::from_utf8(b).ok()?;
     // TODO: hex literals (0x...) and hex floats (0x1.8p3) per Lua spec.
     if let Ok(i) = s.parse::<i64>() {
-        return Some(Value::Integer(i));
+        return Some(Value::integer(i));
     }
     if let Ok(f) = s.parse::<f64>() {
-        return Some(Value::Float(f));
+        return Some(Value::float(f));
     }
     None
 }
