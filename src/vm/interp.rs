@@ -368,29 +368,34 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
     helpers!(instruction, mc, thread, registers, ip, handlers);
     let (dst, idx, key) = args!(Instruction::GETTABUP { dst, idx, key });
     let uv = upvalue!(idx);
-    let table_val = read_upvalue(thread, uv);
-    let Some(table) = table_val.get_table() else {
+    let t = read_upvalue(thread, uv);
+
+    let Some(t) = t.get_table() else {
         raise!();
     };
-    let key = constant!(key);
-    let Some(resolved) = resolve_index_chain(mc, table, key) else {
-        raise!();
-    };
-    match resolved {
-        IndexChain::Resolved(v) => {
-            *reg!(mut dst) = v;
-            dispatch!();
-        }
-        IndexChain::Invoke { func, receiver } => {
-            let cont = Continuation {
-                func: cont_store_result,
-                payload: ContinuationPayload::StoreResult { dst },
-                results_base: 0,
-                nret: 0,
-            };
-            invoke_metamethod!(func, &[receiver, key], cont);
-        }
+
+    let t = t.inner().borrow();
+
+    if t.has_metamethod(Metamethod::INDEX) {
+        become gettabup_slow(instruction, mc, thread, registers, ip, handlers);
     }
+
+    let k = constant!(key);
+    let v = t.raw_get(k);
+    *reg!(mut dst) = v;
+    dispatch!();
+}
+
+#[inline(never)]
+extern "rust-preserve-none" fn gettabup_slow<'gc>(
+    instruction: Instruction,
+    mc: &Mutation<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+) -> Result<(), Box<Error>> {
+    todo!()
 }
 
 /// UpValue[idx][K[key]] = R[src]
@@ -406,30 +411,34 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
     helpers!(instruction, mc, thread, registers, ip, handlers);
     let (src, idx, key) = args!(Instruction::SETTABUP { src, idx, key });
     let uv = upvalue!(idx);
-    let table_val = read_upvalue(thread, uv);
-    let Some(table) = table_val.get_table() else {
+    let t = read_upvalue(thread, uv);
+
+    let Some(t) = t.get_table() else {
         raise!();
     };
-    let key = constant!(key);
-    let val = reg!(src);
-    let Some(resolved) = resolve_newindex_chain(mc, table, key) else {
-        raise!();
-    };
-    match resolved {
-        NewIndexChain::RawSet(target) => {
-            target.raw_set(mc, key, val);
-            dispatch!();
-        }
-        NewIndexChain::Invoke { func, receiver } => {
-            let cont = Continuation {
-                func: cont_ignore_result,
-                payload: ContinuationPayload::IgnoreResult,
-                results_base: 0,
-                nret: 0,
-            };
-            invoke_metamethod!(func, &[receiver, key, val], cont);
-        }
+
+    let mut t = t.inner().borrow_mut(mc);
+
+    if t.has_metamethod(Metamethod::NEWINDEX) {
+        become settabup_slow(instruction, mc, thread, registers, ip, handlers);
     }
+
+    let k = constant!(key);
+    let v = reg!(src);
+    t.raw_set(k, v);
+    dispatch!()
+}
+
+#[inline(never)]
+extern "rust-preserve-none" fn settabup_slow<'gc>(
+    instruction: Instruction,
+    mc: &Mutation<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+) -> Result<(), Box<Error>> {
+    todo!()
 }
 
 // ---------------------------------------------------------------------------
@@ -448,28 +457,33 @@ extern "rust-preserve-none" fn op_gettable<'gc>(
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, mc, thread, registers, ip, handlers);
     let (dst, table, key) = args!(Instruction::GETTABLE { dst, table, key });
+
     let Some(t) = reg!(table).get_table() else {
         raise!();
     };
-    let k = reg!(key);
-    let Some(resolved) = resolve_index_chain(mc, t, k) else {
-        raise!();
-    };
-    match resolved {
-        IndexChain::Resolved(v) => {
-            *reg!(mut dst) = v;
-            dispatch!();
-        }
-        IndexChain::Invoke { func, receiver } => {
-            let cont = Continuation {
-                func: cont_store_result,
-                payload: ContinuationPayload::StoreResult { dst },
-                results_base: 0,
-                nret: 0,
-            };
-            invoke_metamethod!(func, &[receiver, k], cont);
-        }
+
+    let t = t.inner().borrow();
+
+    if t.has_metamethod(Metamethod::INDEX) {
+        become gettable_slow(instruction, mc, thread, registers, ip, handlers);
     }
+
+    let k = reg!(key);
+    let v = t.raw_get(k);
+    *reg!(mut dst) = v;
+    dispatch!();
+}
+
+#[inline(never)]
+extern "rust-preserve-none" fn gettable_slow<'gc>(
+    instruction: Instruction,
+    mc: &Mutation<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+) -> Result<(), Box<Error>> {
+    todo!()
 }
 
 /// R[table][R[key]] = R[src]
@@ -484,29 +498,33 @@ extern "rust-preserve-none" fn op_settable<'gc>(
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, mc, thread, registers, ip, handlers);
     let (src, table, key) = args!(Instruction::SETTABLE { src, table, key });
+
     let Some(t) = reg!(table).get_table() else {
         raise!();
     };
+
+    let mut t = t.inner().borrow_mut(mc);
+
+    if t.has_metamethod(Metamethod::NEWINDEX) {
+        become settable_slow(instruction, mc, thread, registers, ip, handlers);
+    }
+
     let k = reg!(key);
     let v = reg!(src);
-    let Some(resolved) = resolve_newindex_chain(mc, t, k) else {
-        raise!();
-    };
-    match resolved {
-        NewIndexChain::RawSet(target) => {
-            target.raw_set(mc, k, v);
-            dispatch!();
-        }
-        NewIndexChain::Invoke { func, receiver } => {
-            let cont = Continuation {
-                func: cont_ignore_result,
-                payload: ContinuationPayload::IgnoreResult,
-                results_base: 0,
-                nret: 0,
-            };
-            invoke_metamethod!(func, &[receiver, k, v], cont);
-        }
-    }
+    t.raw_set(k, v);
+    dispatch!()
+}
+
+#[inline(never)]
+extern "rust-preserve-none" fn settable_slow<'gc>(
+    instruction: Instruction,
+    mc: &Mutation<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+) -> Result<(), Box<Error>> {
+    todo!()
 }
 
 /// R[dst] = R[table][K[key_idx]]
@@ -552,24 +570,6 @@ extern "rust-preserve-none" fn getfield_slow<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     todo!()
-    //let Some(resolved) = resolve_index_chain(mc, t, k) else {
-    //    raise!();
-    //};
-    //match resolved {
-    //    IndexChain::Resolved(v) => {
-    //        *reg!(mut dst) = v;
-    //        dispatch!();
-    //    }
-    //    IndexChain::Invoke { func, receiver } => {
-    //        let cont = Continuation {
-    //            func: cont_store_result,
-    //            payload: ContinuationPayload::StoreResult { dst },
-    //            results_base: 0,
-    //            nret: 0,
-    //        };
-    //        invoke_metamethod!(func, &[receiver, k], cont);
-    //    }
-    //}
 }
 
 /// R[table][K[key_idx]] = R[src]
@@ -615,24 +615,6 @@ extern "rust-preserve-none" fn setfield_slow<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     todo!()
-    //let Some(resolved) = resolve_newindex_chain(mc, t, k) else {
-    //    raise!();
-    //};
-    //match resolved {
-    //    NewIndexChain::RawSet(target) => {
-    //        target.raw_set(mc, k, v);
-    //        dispatch!();
-    //    }
-    //    NewIndexChain::Invoke { func, receiver } => {
-    //        let cont = Continuation {
-    //            func: cont_ignore_result,
-    //            payload: ContinuationPayload::IgnoreResult,
-    //            results_base: 0,
-    //            nret: 0,
-    //        };
-    //        invoke_metamethod!(func, &[receiver, k, v], cont);
-    //    }
-    //}
 }
 
 /// R[dst] = {}
@@ -1689,48 +1671,41 @@ fn close_tbc_vars<'gc>(_mc: &Mutation<'gc>, thread: &mut ThreadState<'gc>, start
     });
 }
 
-/// Read the value of an upvalue without taking a `RefCell` borrow on the
-/// currently running thread. Same-thread open upvalues are served directly
-/// from the `&mut ThreadState` the interpreter already holds; cross-thread
-/// upvalues fall back to `RefCell::borrow` (safe because another thread
-/// cannot be simultaneously mutably borrowed).
+#[inline(always)]
 fn read_upvalue<'gc>(thread: &ThreadState<'gc>, uv: Upvalue<'gc>) -> Value<'gc> {
     match &*uv.borrow() {
         UpvalueState::Closed(v) => *v,
-        UpvalueState::Open { thread: t, index } => {
-            let running = thread
-                .thread_handle
-                .expect("running thread must have a handle")
-                .inner();
+        UpvalueState::Open { thread: t, index } => unsafe {
+            let running = thread.thread_handle.unwrap_unchecked().inner();
+
             if Gc::ptr_eq(t.inner(), running) {
-                thread.stack[*index]
+                *thread.stack.get_unchecked(*index)
             } else {
-                t.borrow().stack[*index]
+                *t.borrow().stack.get_unchecked(*index)
             }
-        }
+        },
     }
 }
 
-/// Write to an upvalue with the same same-thread / cross-thread split as
-/// [`read_upvalue`].
+#[inline(always)]
 fn write_upvalue<'gc>(
     mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     uv: Upvalue<'gc>,
     val: Value<'gc>,
 ) {
-    let running = thread
-        .thread_handle
-        .expect("running thread must have a handle")
-        .inner();
-    let mut uv_ref = uv.borrow_mut(mc);
-    match &mut *uv_ref {
-        UpvalueState::Closed(v) => *v = val,
-        UpvalueState::Open { thread: t, index } => {
-            if Gc::ptr_eq(t.inner(), running) {
-                thread.stack[*index] = val;
-            } else {
-                t.borrow_mut(mc).stack[*index] = val;
+    unsafe {
+        let running = thread.thread_handle.unwrap_unchecked().inner();
+
+        let mut uv_ref = uv.borrow_mut(mc);
+        match &mut *uv_ref {
+            UpvalueState::Closed(v) => *v = val,
+            UpvalueState::Open { thread: t, index } => {
+                if Gc::ptr_eq(t.inner(), running) {
+                    *thread.stack.get_unchecked_mut(*index) = val;
+                } else {
+                    *t.borrow_mut(mc).stack.get_unchecked_mut(*index) = val;
+                }
             }
         }
     }
