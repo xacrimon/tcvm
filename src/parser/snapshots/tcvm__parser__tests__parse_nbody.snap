@@ -2,7 +2,7 @@
 source: src/parser/mod.rs
 expression: syntax_tree
 ---
-Root@0..2575
+Root@0..2564
   DeclStmt@0..19
     Local@0..5 "local"
     AssignList@5..9
@@ -1624,136 +1624,128 @@ Root@0..2575
           Ident@2355..2362
             Ident@2355..2362 "Neptune"
         RCurly@2362..2363 "}"
-  DeclStmt@2363..2392
+  DeclStmt@2363..2381
     Local@2363..2368 "local"
     AssignList@2368..2373
       DeclTarget@2368..2373
         Ident@2368..2373
           Ident@2368..2373 "nbody"
     Assign@2373..2374 "="
-    ExprList@2374..2392
-      FuncCall@2374..2392
-        BinOp@2374..2384
-          Ident@2374..2379
-            Ident@2374..2379 "table"
-          Dot@2379..2380 "."
-          LiteralExpr@2380..2384
-            Ident@2380..2384 "getn"
-        FuncArgs@2384..2392
-          LParen@2384..2385 "("
-          Ident@2385..2391
-            Ident@2385..2391 "bodies"
-          RParen@2391..2392 ")"
-  FuncCall@2392..2420
-    Ident@2392..2406
-      Ident@2392..2406 "offsetMomentum"
-    FuncArgs@2406..2420
-      LParen@2406..2407 "("
-      Ident@2407..2413
-        Ident@2407..2413 "bodies"
-      Comma@2413..2414 ","
-      Ident@2414..2419
-        Ident@2414..2419 "nbody"
-      RParen@2419..2420 ")"
-  FuncCall@2420..2478
-    BinOp@2420..2428
-      Ident@2420..2422
-        Ident@2420..2422 "io"
-      Dot@2422..2423 "."
-      LiteralExpr@2423..2428
-        Ident@2423..2428 "write"
-    FuncArgs@2428..2478
-      LParen@2428..2429 "("
-      FuncCall@2429..2472
-        BinOp@2429..2442
-          Ident@2429..2435
-            Ident@2429..2435 "string"
-          Dot@2435..2436 "."
-          LiteralExpr@2436..2442
-            Ident@2436..2442 "format"
-        FuncArgs@2442..2472
-          LParen@2442..2443 "("
-          LiteralExpr@2443..2450
-            String@2443..2450 "\"%0.9f\""
-          Comma@2450..2451 ","
-          FuncCall@2451..2471
-            Ident@2451..2457
-              Ident@2451..2457 "energy"
-            FuncArgs@2457..2471
-              LParen@2457..2458 "("
-              Ident@2458..2464
-                Ident@2458..2464 "bodies"
-              Comma@2464..2465 ","
-              Ident@2465..2470
-                Ident@2465..2470 "nbody"
-              RParen@2470..2471 ")"
-          RParen@2471..2472 ")"
-      Comma@2472..2473 ","
-      LiteralExpr@2473..2477
-        String@2473..2477 "\"\\n\""
-      RParen@2477..2478 ")"
-  ForNumStmt@2478..2517
-    For@2478..2481 "for"
-    Ident@2481..2482
-      Ident@2481..2482 "i"
-    Assign@2482..2483 "="
-    LiteralExpr@2483..2484
-      Int@2483..2484 "1"
-    Comma@2484..2485 ","
-    Ident@2485..2486
-      Ident@2485..2486 "N"
-    DoStmt@2486..2517
-      Do@2486..2488 "do"
-      StmtList@2488..2514
-        FuncCall@2488..2514
-          Ident@2488..2495
-            Ident@2488..2495 "advance"
-          FuncArgs@2495..2514
-            LParen@2495..2496 "("
-            Ident@2496..2502
-              Ident@2496..2502 "bodies"
-            Comma@2502..2503 ","
-            Ident@2503..2508
-              Ident@2503..2508 "nbody"
-            Comma@2508..2509 ","
-            LiteralExpr@2509..2513
-              Float@2509..2513 "0.01"
-            RParen@2513..2514 ")"
-      End@2514..2517 "end"
-  FuncCall@2517..2575
-    BinOp@2517..2525
-      Ident@2517..2519
-        Ident@2517..2519 "io"
-      Dot@2519..2520 "."
-      LiteralExpr@2520..2525
-        Ident@2520..2525 "write"
-    FuncArgs@2525..2575
-      LParen@2525..2526 "("
-      FuncCall@2526..2569
-        BinOp@2526..2539
-          Ident@2526..2532
-            Ident@2526..2532 "string"
-          Dot@2532..2533 "."
-          LiteralExpr@2533..2539
-            Ident@2533..2539 "format"
-        FuncArgs@2539..2569
-          LParen@2539..2540 "("
-          LiteralExpr@2540..2547
-            String@2540..2547 "\"%0.9f\""
-          Comma@2547..2548 ","
-          FuncCall@2548..2568
-            Ident@2548..2554
-              Ident@2548..2554 "energy"
-            FuncArgs@2554..2568
-              LParen@2554..2555 "("
-              Ident@2555..2561
-                Ident@2555..2561 "bodies"
-              Comma@2561..2562 ","
-              Ident@2562..2567
-                Ident@2562..2567 "nbody"
-              RParen@2567..2568 ")"
-          RParen@2568..2569 ")"
-      Comma@2569..2570 ","
-      LiteralExpr@2570..2574
-        String@2570..2574 "\"\\n\""
-      RParen@2574..2575 ")"
+    ExprList@2374..2381
+      PrefixOp@2374..2381
+        Hash@2374..2375 "#"
+        Ident@2375..2381
+          Ident@2375..2381 "bodies"
+  FuncCall@2381..2409
+    Ident@2381..2395
+      Ident@2381..2395 "offsetMomentum"
+    FuncArgs@2395..2409
+      LParen@2395..2396 "("
+      Ident@2396..2402
+        Ident@2396..2402 "bodies"
+      Comma@2402..2403 ","
+      Ident@2403..2408
+        Ident@2403..2408 "nbody"
+      RParen@2408..2409 ")"
+  FuncCall@2409..2467
+    BinOp@2409..2417
+      Ident@2409..2411
+        Ident@2409..2411 "io"
+      Dot@2411..2412 "."
+      LiteralExpr@2412..2417
+        Ident@2412..2417 "write"
+    FuncArgs@2417..2467
+      LParen@2417..2418 "("
+      FuncCall@2418..2461
+        BinOp@2418..2431
+          Ident@2418..2424
+            Ident@2418..2424 "string"
+          Dot@2424..2425 "."
+          LiteralExpr@2425..2431
+            Ident@2425..2431 "format"
+        FuncArgs@2431..2461
+          LParen@2431..2432 "("
+          LiteralExpr@2432..2439
+            String@2432..2439 "\"%0.9f\""
+          Comma@2439..2440 ","
+          FuncCall@2440..2460
+            Ident@2440..2446
+              Ident@2440..2446 "energy"
+            FuncArgs@2446..2460
+              LParen@2446..2447 "("
+              Ident@2447..2453
+                Ident@2447..2453 "bodies"
+              Comma@2453..2454 ","
+              Ident@2454..2459
+                Ident@2454..2459 "nbody"
+              RParen@2459..2460 ")"
+          RParen@2460..2461 ")"
+      Comma@2461..2462 ","
+      LiteralExpr@2462..2466
+        String@2462..2466 "\"\\n\""
+      RParen@2466..2467 ")"
+  ForNumStmt@2467..2506
+    For@2467..2470 "for"
+    Ident@2470..2471
+      Ident@2470..2471 "i"
+    Assign@2471..2472 "="
+    LiteralExpr@2472..2473
+      Int@2472..2473 "1"
+    Comma@2473..2474 ","
+    Ident@2474..2475
+      Ident@2474..2475 "N"
+    DoStmt@2475..2506
+      Do@2475..2477 "do"
+      StmtList@2477..2503
+        FuncCall@2477..2503
+          Ident@2477..2484
+            Ident@2477..2484 "advance"
+          FuncArgs@2484..2503
+            LParen@2484..2485 "("
+            Ident@2485..2491
+              Ident@2485..2491 "bodies"
+            Comma@2491..2492 ","
+            Ident@2492..2497
+              Ident@2492..2497 "nbody"
+            Comma@2497..2498 ","
+            LiteralExpr@2498..2502
+              Float@2498..2502 "0.01"
+            RParen@2502..2503 ")"
+      End@2503..2506 "end"
+  FuncCall@2506..2564
+    BinOp@2506..2514
+      Ident@2506..2508
+        Ident@2506..2508 "io"
+      Dot@2508..2509 "."
+      LiteralExpr@2509..2514
+        Ident@2509..2514 "write"
+    FuncArgs@2514..2564
+      LParen@2514..2515 "("
+      FuncCall@2515..2558
+        BinOp@2515..2528
+          Ident@2515..2521
+            Ident@2515..2521 "string"
+          Dot@2521..2522 "."
+          LiteralExpr@2522..2528
+            Ident@2522..2528 "format"
+        FuncArgs@2528..2558
+          LParen@2528..2529 "("
+          LiteralExpr@2529..2536
+            String@2529..2536 "\"%0.9f\""
+          Comma@2536..2537 ","
+          FuncCall@2537..2557
+            Ident@2537..2543
+              Ident@2537..2543 "energy"
+            FuncArgs@2543..2557
+              LParen@2543..2544 "("
+              Ident@2544..2550
+                Ident@2544..2550 "bodies"
+              Comma@2550..2551 ","
+              Ident@2551..2556
+                Ident@2551..2556 "nbody"
+              RParen@2556..2557 ")"
+          RParen@2557..2558 ")"
+      Comma@2558..2559 ","
+      LiteralExpr@2559..2563
+        String@2559..2563 "\"\\n\""
+      RParen@2563..2564 ")"

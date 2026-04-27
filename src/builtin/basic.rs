@@ -158,9 +158,49 @@ fn lua_setmetatable<'gc>(
 
 fn lua_tonumber<'gc>(
     _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<(), NativeError> {
-    todo!()
+    // TODO: 2-arg form `tonumber(s, base)` for integer parsing in arbitrary base.
+    let v = stack.get(0);
+    let result = match v {
+        Value::Nil => Value::Nil,
+        Value::Integer(_) | Value::Float(_) => v,
+        Value::String(s) => {
+            let bytes = s.as_bytes();
+            let trimmed = trim_ascii(bytes);
+            parse_lua_number(trimmed).unwrap_or(Value::Nil)
+        }
+        _ => Value::Nil,
+    };
+    stack.replace(&[result]);
+    Ok(())
+}
+
+fn trim_ascii(b: &[u8]) -> &[u8] {
+    let mut start = 0;
+    let mut end = b.len();
+    while start < end && b[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    while end > start && b[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    &b[start..end]
+}
+
+fn parse_lua_number<'gc>(b: &[u8]) -> Option<Value<'gc>> {
+    if b.is_empty() {
+        return None;
+    }
+    let s = std::str::from_utf8(b).ok()?;
+    // TODO: hex literals (0x...) and hex floats (0x1.8p3) per Lua spec.
+    if let Ok(i) = s.parse::<i64>() {
+        return Some(Value::Integer(i));
+    }
+    if let Ok(f) = s.parse::<f64>() {
+        return Some(Value::Float(f));
+    }
+    None
 }
 
 fn lua_tostring<'gc>(

@@ -120,8 +120,23 @@ fn lua_sin<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<
     todo!()
 }
 
-fn lua_sqrt<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
-    todo!()
+fn lua_sqrt<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
+) -> Result<(), NativeError> {
+    let v = stack.get(0);
+    let f = match v {
+        Value::Float(f) => f,
+        Value::Integer(i) => i as f64,
+        other => {
+            return Err(NativeError::new(format!(
+                "bad argument #1 to 'sqrt' (number expected, got {})",
+                other.type_name()
+            )));
+        }
+    };
+    stack.replace(&[Value::Float(f.sqrt())]);
+    Ok(())
 }
 
 fn lua_tan<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {

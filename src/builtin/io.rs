@@ -76,8 +76,42 @@ fn lua_type<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result
     todo!()
 }
 
-fn lua_write<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
-    todo!()
+fn lua_write<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
+) -> Result<(), NativeError> {
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    for v in stack.as_slice() {
+        let res = match v {
+            Value::String(s) => out.write_all(s.as_bytes()),
+            Value::Integer(i) => write!(out, "{i}"),
+            Value::Float(f) => {
+                // Lua's default number-to-string is "%.14g"; Rust's `{}` for
+                // f64 is close enough for typical values and doesn't add a
+                // trailing ".0" when the value rounds to an integer in our
+                // current usage. The full "%.14g" goes through string.format.
+                if f.is_finite() && f.fract() == 0.0 && f.abs() < 1e16 {
+                    write!(out, "{}", *f as i64)
+                } else {
+                    write!(out, "{}", f)
+                }
+            }
+            other => {
+                return Err(NativeError::new(format!(
+                    "bad argument to 'write' (string expected, got {})",
+                    other.type_name()
+                )));
+            }
+        };
+        if let Err(e) = res {
+            return Err(NativeError::new(format!("io.write: {e}")));
+        }
+    }
+    // TODO: return the file handle once io userdata exists.
+    stack.replace(&[]);
+    Ok(())
 }
 
 // See #27: file-handle methods — registered on the file-userdata metatable once

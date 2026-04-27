@@ -1054,6 +1054,18 @@ extern "rust-preserve-none" fn op_call<'gc>(
                 returns as usize - 1
             };
             let to_copy = retc.min(wanted);
+            // `invoke_native` truncates the stack to `args_base + retc`. For a
+            // fixed-results call, restore the caller frame's working window so
+            // the result-write loop and subsequent register accesses (through
+            // the raw `registers` pointer) stay within `Vec::len()`.
+            if returns != 0 {
+                if let Some(frame) = thread.frames.last() {
+                    let needed = frame.base + frame.closure.proto.max_stack_size as usize;
+                    if thread.stack.len() < needed {
+                        thread.stack.resize(needed, Value::Nil);
+                    }
+                }
+            }
             for i in 0..to_copy {
                 thread.stack[func_idx + i] = thread.stack[args_base + i];
             }
