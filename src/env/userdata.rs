@@ -50,4 +50,8 @@ impl<'gc> Userdata<'gc> {
     pub fn inner(self) -> Gc<'gc, RefLock<UserdataState<'gc>>> {
         self.0
     }
+
+    pub(crate) fn from_inner(g: Gc<'gc, RefLock<UserdataState<'gc>>>) -> Self {
+        Userdata(g)
+    }
 }

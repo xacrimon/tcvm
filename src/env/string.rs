@@ -32,6 +32,10 @@ impl<'gc> LuaString<'gc> {
     pub fn inner(&self) -> Gc<'gc, StringData> {
         self.0
     }
+
+    pub(crate) fn from_inner(inner: Gc<'gc, StringData>) -> Self {
+        Self(inner)
+    }
 }
 
 impl<'gc> PartialEq for LuaString<'gc> {
