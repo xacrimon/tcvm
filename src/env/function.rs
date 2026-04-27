@@ -1,3 +1,4 @@
+use crate::Context;
 use crate::dmm::{Collect, Gc, Mutation, RefLock};
 use crate::env::string::LuaString;
 use crate::env::value::Value;
@@ -63,7 +64,7 @@ pub type NativeFn =
 
 /// Contextual handles passed to a native callback alongside its `Stack`.
 pub struct NativeContext<'gc, 'a> {
-    pub mc: &'a Mutation<'gc>,
+    pub ctx: Context<'gc>,
     pub upvalues: &'a [Value<'gc>],
 }
 

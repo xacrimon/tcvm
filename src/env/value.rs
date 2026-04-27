@@ -76,7 +76,7 @@ impl<'gc> PartialEq for Value<'gc> {
             (Value::Float(a), Value::Float(b)) => a == b,
             (Value::Integer(a), Value::Float(b)) => (*a as f64) == *b && (*b as i64) == *a,
             (Value::Float(a), Value::Integer(b)) => *a == (*b as f64) && (*a as i64) == *b,
-            (Value::String(a), Value::String(b)) => a == b,
+            (Value::String(a), Value::String(b)) => Gc::ptr_eq(a.inner(), b.inner()),
             (Value::Table(a), Value::Table(b)) => Gc::ptr_eq(a.inner(), b.inner()),
             (Value::Function(a), Value::Function(b)) => Gc::ptr_eq(a.inner(), b.inner()),
             (Value::Thread(a), Value::Thread(b)) => Gc::ptr_eq(a.inner(), b.inner()),

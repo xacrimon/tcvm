@@ -13,6 +13,7 @@ use crate::builtin;
 use crate::dmm::{Arena, Collect, DynamicRootSet, Mutation};
 use crate::env::{Table, Thread};
 
+use crate::env::string::Interner;
 pub use context::Context;
 pub use convert::{FromMultiValue, FromValue, IntoMultiValue, IntoValue};
 pub use error::{LoadError, RuntimeError, TypeError};
@@ -29,6 +30,7 @@ pub struct State<'gc> {
     pub(crate) globals: Table<'gc>,
     pub(crate) main_thread: Thread<'gc>,
     pub(crate) roots: DynamicRootSet<'gc>,
+    pub(crate) interner: Interner<'gc>,
 }
 
 /// A Lua runtime instance.
@@ -48,6 +50,7 @@ impl Lua {
             globals: Table::new(mc),
             main_thread: Thread::new(mc),
             roots: DynamicRootSet::new(mc),
+            interner: Interner::new(mc),
         });
         Lua { arena }
     }
@@ -128,7 +131,7 @@ mod tests {
 
         let ex = lua
             .try_enter(|ctx| -> Result<_, RuntimeError> {
-                let key = Value::String(LuaString::new(ctx.mutation(), b"add"));
+                let key = Value::String(LuaString::new(ctx, b"add"));
                 let add = ctx
                     .globals()
                     .raw_get(key)
@@ -181,7 +184,7 @@ mod tests {
             .try_enter(|ctx| -> Result<_, LoadError> {
                 let add =
                     Function::new_native(ctx.mutation(), native_add as NativeFn, Box::new([]));
-                let key = Value::String(LuaString::new(ctx.mutation(), b"add"));
+                let key = Value::String(LuaString::new(ctx, b"add"));
                 ctx.globals()
                     .raw_set(ctx.mutation(), key, Value::Function(add));
 
@@ -226,7 +229,7 @@ mod tests {
             .try_enter(|ctx| -> Result<_, LoadError> {
                 let add =
                     Function::new_native(ctx.mutation(), native_add as NativeFn, Box::new([]));
-                let key = Value::String(LuaString::new(ctx.mutation(), b"add"));
+                let key = Value::String(LuaString::new(ctx, b"add"));
                 ctx.globals()
                     .raw_set(ctx.mutation(), key, Value::Function(add));
 
@@ -251,7 +254,7 @@ mod tests {
             .try_enter(|ctx| -> Result<_, LoadError> {
                 let add =
                     Function::new_native(ctx.mutation(), native_add as NativeFn, Box::new([]));
-                let key = Value::String(LuaString::new(ctx.mutation(), b"add"));
+                let key = Value::String(LuaString::new(ctx, b"add"));
                 ctx.globals()
                     .raw_set(ctx.mutation(), key, Value::Function(add));
 
@@ -318,7 +321,7 @@ mod tests {
             .try_enter(|ctx| -> Result<_, LoadError> {
                 let probe =
                     Function::new_native(ctx.mutation(), native_id as NativeFn, Box::new([]));
-                let key = Value::String(LuaString::new(ctx.mutation(), b"probe"));
+                let key = Value::String(LuaString::new(ctx, b"probe"));
                 ctx.globals()
                     .raw_set(ctx.mutation(), key, Value::Function(probe));
                 let chunk = ctx.load(src, Some("test"))?;

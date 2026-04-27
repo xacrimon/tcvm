@@ -3,6 +3,7 @@ use cstree::build::NodeCache;
 use crate::compiler::compile_chunk;
 use crate::dmm::{DynamicRootSet, Gc, Mutation, RefLock};
 use crate::env::function::{Function, UpvalueState};
+use crate::env::string::Interner;
 use crate::env::{Table, Thread, Value};
 use crate::lua::stash::{Fetchable, Stashable};
 use crate::lua::{LoadError, State};
@@ -36,6 +37,10 @@ impl<'gc> Context<'gc> {
         self.state.roots
     }
 
+    pub(crate) fn interner(&self) -> &Interner<'gc> {
+        &self.state.interner
+    }
+
     pub fn stash<S: Stashable<'gc>>(self, s: S) -> S::Stashed {
         s.stash(self.mutation, self.state.roots)
     }
@@ -54,7 +59,7 @@ impl<'gc> Context<'gc> {
         }
         let root = parser::syntax::Root::new(syntax)
             .ok_or(LoadError::Internal("parser did not produce a Root node"))?;
-        let proto = compile_chunk(self.mutation, &root, cache.interner())?;
+        let proto = compile_chunk(self, &root, cache.interner())?;
 
         // Main chunk's upvalue 0 is _ENV. Pre-close it onto globals.
         let env_uv = Gc::new(

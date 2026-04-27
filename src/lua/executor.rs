@@ -120,7 +120,7 @@ impl<'gc> Executor<'gc> {
                 .as_native()
                 .expect("native entry: function must be native");
             let argc = ts.stack.len() - 1;
-            let retc = vm::interp::invoke_native(mc, &mut *ts, nc, 1, argc)
+            let retc = vm::interp::invoke_native(ctx, &mut *ts, nc, 1, argc)
                 .map_err(|_| RuntimeError::Opcode { pc: 0 })?;
             // Move results from stack[1..1+retc] down to stack[0..retc].
             for i in 0..retc {
@@ -129,7 +129,7 @@ impl<'gc> Executor<'gc> {
             ts.stack.truncate(retc);
             ts.status = ThreadStatus::Dead;
         } else {
-            vm::interp::run_thread(mc, thread).map_err(|e| RuntimeError::Opcode { pc: e.pc })?;
+            vm::interp::run_thread(ctx, thread).map_err(|e| RuntimeError::Opcode { pc: e.pc })?;
         }
 
         let mut inner = self.0.borrow_mut(mc);

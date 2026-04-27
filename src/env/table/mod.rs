@@ -1,3 +1,4 @@
+use crate::Context;
 use crate::dmm::{Collect, Gc, Mutation, RefLock, allocator_api::MetricsAlloc};
 use crate::env::string::LuaString;
 use crate::env::value::Value;
@@ -32,11 +33,11 @@ impl<'gc> Table<'gc> {
         self.0.borrow_mut(mc).metatable = mt;
     }
 
-    pub fn get_metamethod(self, mc: &Mutation<'gc>, name: &[u8]) -> Value<'gc> {
+    pub fn get_metamethod(self, ctx: Context<'gc>, name: &[u8]) -> Value<'gc> {
         let Some(mt) = self.metatable() else {
             return Value::Nil;
         };
-        let key = Value::String(LuaString::new(mc, name));
+        let key = Value::String(LuaString::new(ctx, name));
         mt.raw_get(key)
     }
 

@@ -40,17 +40,17 @@ fn main() {
 
     lua.enter(|ctx| {
         let arg_tbl = Table::new(ctx.mutation());
-        let path_str = LuaString::new(ctx.mutation(), &file_path);
+        let path_str = LuaString::new(ctx, &file_path);
         arg_tbl.raw_set(ctx.mutation(), Value::Integer(0), Value::String(path_str));
         for (i, s) in script_args.iter().enumerate() {
-            let v = LuaString::new(ctx.mutation(), s.as_bytes());
+            let v = LuaString::new(ctx, s.as_bytes());
             arg_tbl.raw_set(
                 ctx.mutation(),
                 Value::Integer((i + 1) as i64),
                 Value::String(v),
             );
         }
-        let key = LuaString::new(ctx.mutation(), b"arg");
+        let key = LuaString::new(ctx, b"arg");
         ctx.globals()
             .raw_set(ctx.mutation(), Value::String(key), Value::Table(arg_tbl));
     });

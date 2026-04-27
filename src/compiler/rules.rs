@@ -6,9 +6,10 @@ use cstree::interning::TokenInterner;
 
 use super::defs::{Chunk, ExprDesc, ExprKind, JumpList, RegisterIndex};
 use super::{CompileError, CompileErrorKind, LineNumber};
-use crate::dmm::{Gc, Mutation};
+use crate::dmm::Gc;
 use crate::env::{LuaString, Prototype, Value};
 use crate::instruction::{Instruction, UpValueDescriptor};
+use crate::lua;
 use crate::parser::syntax::{
     Assign, BinaryOp, BinaryOperator, Break, Decl, DeclModifier, Do, Expr, ForGen, ForNum, Func,
     FuncCall, FuncExpr, Global, Goto, Ident, If, Index, Label, Literal, LiteralValue, MethodCall,
@@ -143,7 +144,7 @@ trait UpvalueResolver {
 
 struct Ctx<'gc, 'a> {
     interner: &'a TokenInterner,
-    mc: &'a Mutation<'gc>,
+    ctx: lua::Context<'gc>,
     chunk: Chunk<'gc>,
 
     /// Stack of break-target labels for nested loops.
@@ -833,7 +834,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     }
 
     fn alloc_string_constant(&mut self, s: &[u8]) -> Result<u16, CompileError> {
-        let lua_str = LuaString::new(self.mc, s);
+        let lua_str = LuaString::new(self.ctx, s);
         self.alloc_constant(Value::String(lua_str))
     }
 
@@ -930,7 +931,7 @@ where
 // ---------------------------------------------------------------------------
 
 pub fn compile<'gc>(
-    mc: &Mutation<'gc>,
+    ctx: lua::Context<'gc>,
     root: &Root,
     interner: &TokenInterner,
 ) -> Result<Gc<'gc, Prototype<'gc>>, CompileError> {
@@ -939,7 +940,7 @@ pub fn compile<'gc>(
     // to every other function in the same chunk.
     let globals = Rc::new(RefCell::new(GlobalEnv::new()));
     let chunk = compile_function_to_chunk(
-        mc,
+        ctx,
         interner,
         None, // main chunk has no enclosing function
         root.block(),
@@ -955,13 +956,13 @@ pub fn compile<'gc>(
         vec![("_ENV".to_owned(), UpValueDescriptor::ParentLocal(0))],
         globals,
     )?;
-    Ok(chunk.assemble(mc))
+    Ok(chunk.assemble(ctx.mutation()))
 }
 
 /// Compile a function body into a Chunk (not yet assembled).
 #[allow(clippy::too_many_arguments)]
 fn compile_function_to_chunk<'gc, 'a>(
-    mc: &'a Mutation<'gc>,
+    ctx: lua::Context<'gc>,
     interner: &'a TokenInterner,
     parent_capture: Option<&'a mut dyn UpvalueResolver>,
     stmts: impl Iterator<Item = Stmt>,
@@ -979,7 +980,7 @@ fn compile_function_to_chunk<'gc, 'a>(
 
     let mut ctx = Ctx {
         interner,
-        mc,
+        ctx,
         chunk,
         control_end_label: Vec::new(),
         scope: Vec::new(),
@@ -1896,13 +1897,13 @@ fn compile_nested<'gc>(
     is_vararg: bool,
     arity: u8,
 ) -> Result<Gc<'gc, Prototype<'gc>>, CompileError> {
-    let mc = ctx.mc;
+    let lua_ctx = ctx.ctx;
     let interner = ctx.interner;
     let globals = Rc::clone(&ctx.globals);
     let parent: &mut dyn UpvalueResolver = ctx;
 
     let chunk = compile_function_to_chunk(
-        mc,
+        lua_ctx,
         interner,
         Some(parent),
         stmts.into_iter(),
@@ -1914,7 +1915,7 @@ fn compile_nested<'gc>(
         globals,
     )?;
 
-    Ok(chunk.assemble(mc))
+    Ok(chunk.assemble(lua_ctx.mutation()))
 }
 
 // ---------------------------------------------------------------------------
@@ -2031,7 +2032,7 @@ fn compile_expr_literal(
         LiteralValue::Bool(b) => Value::Boolean(b),
         LiteralValue::Int(n) => Value::Integer(n),
         LiteralValue::Float(n) => Value::Float(n),
-        LiteralValue::String(bytes) => Value::String(LuaString::new(ctx.mc, &bytes)),
+        LiteralValue::String(bytes) => Value::String(LuaString::new(ctx.ctx, &bytes)),
     };
 
     let idx = ctx.alloc_constant(constant)?;

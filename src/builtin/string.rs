@@ -25,11 +25,11 @@ pub fn load<'gc>(ctx: Context<'gc>) {
     let lib = Table::new(ctx.mutation());
     for &(name, handler) in fns {
         let handler = Function::new_native(ctx.mutation(), handler, Box::new([]));
-        let key = Value::String(LuaString::new(ctx.mutation(), name.as_bytes()));
+        let key = Value::String(LuaString::new(ctx, name.as_bytes()));
         lib.raw_set(ctx.mutation(), key, Value::Function(handler));
     }
 
-    let lib_name = Value::String(LuaString::new(ctx.mutation(), b"string"));
+    let lib_name = Value::String(LuaString::new(ctx, b"string"));
     ctx.globals()
         .raw_set(ctx.mutation(), lib_name, Value::Table(lib));
 }
@@ -85,7 +85,7 @@ fn lua_format<'gc>(
         format_one(&mut out, &spec, arg)?;
     }
 
-    let s = LuaString::new(ctx.mc, &out);
+    let s = LuaString::new(ctx.ctx, &out);
     stack.replace(&[Value::String(s)]);
     Ok(())
 }
