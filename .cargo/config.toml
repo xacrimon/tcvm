@@ -1,0 +1,5 @@
+[profile.release]
+debug = true
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-Clink-arg=-Wl,--no-rosegment"]

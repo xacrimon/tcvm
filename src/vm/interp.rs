@@ -5,7 +5,7 @@ use crate::env::function::{
     UpvalueState,
 };
 use crate::env::string::LuaString;
-use crate::env::table::Table;
+use crate::env::table::{Metamethod, Table};
 use crate::env::thread::{CallFrame, Thread, ThreadState, ThreadStatus};
 use crate::instruction::{Instruction, UpValueDescriptor};
 use crate::vm::num::{self, op_arith, op_bit};
@@ -180,16 +180,20 @@ macro_rules! helpers {
         #[allow(unused_macros)]
         macro_rules! constant {
             ($$idx:expr) => {{
-                let frame = $thread.frames.last().unwrap();
-                frame.closure.proto.constants[$$idx as usize]
+                unsafe {
+                    let frame = $thread.frames.last().unwrap_unchecked();
+                    *frame.closure.proto.constants.get_unchecked($$idx as usize)
+                }
             }};
         }
 
         #[allow(unused_macros)]
         macro_rules! upvalue {
             ($$idx:expr) => {{
-                let frame = $thread.frames.last().unwrap();
-                frame.closure.upvalues[$$idx as usize]
+                unsafe {
+                    let frame = $thread.frames.last().unwrap_unchecked();
+                    *frame.closure.upvalues.get_unchecked($$idx as usize)
+                }
             }};
         }
 
@@ -521,28 +525,51 @@ extern "rust-preserve-none" fn op_getfield<'gc>(
         table,
         key_idx
     });
+
     let Some(t) = reg!(table).get_table() else {
         raise!();
     };
-    let k = constant!(key_idx);
-    let Some(resolved) = resolve_index_chain(mc, t, k) else {
-        raise!();
-    };
-    match resolved {
-        IndexChain::Resolved(v) => {
-            *reg!(mut dst) = v;
-            dispatch!();
-        }
-        IndexChain::Invoke { func, receiver } => {
-            let cont = Continuation {
-                func: cont_store_result,
-                payload: ContinuationPayload::StoreResult { dst },
-                results_base: 0,
-                nret: 0,
-            };
-            invoke_metamethod!(func, &[receiver, k], cont);
-        }
+
+    let t = t.inner().borrow();
+
+    if t.has_metamethod(Metamethod::INDEX) {
+        become getfield_slow(instruction, mc, thread, registers, ip, handlers);
     }
+
+    let k = constant!(key_idx);
+    let v = t.raw_get(k);
+    *reg!(mut dst) = v;
+    dispatch!();
+}
+
+#[inline(never)]
+extern "rust-preserve-none" fn getfield_slow<'gc>(
+    instruction: Instruction,
+    mc: &Mutation<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+) -> Result<(), Box<Error>> {
+    todo!()
+    //let Some(resolved) = resolve_index_chain(mc, t, k) else {
+    //    raise!();
+    //};
+    //match resolved {
+    //    IndexChain::Resolved(v) => {
+    //        *reg!(mut dst) = v;
+    //        dispatch!();
+    //    }
+    //    IndexChain::Invoke { func, receiver } => {
+    //        let cont = Continuation {
+    //            func: cont_store_result,
+    //            payload: ContinuationPayload::StoreResult { dst },
+    //            results_base: 0,
+    //            nret: 0,
+    //        };
+    //        invoke_metamethod!(func, &[receiver, k], cont);
+    //    }
+    //}
 }
 
 /// R[table][K[key_idx]] = R[src]
@@ -561,29 +588,51 @@ extern "rust-preserve-none" fn op_setfield<'gc>(
         table,
         key_idx
     });
+
     let Some(t) = reg!(table).get_table() else {
         raise!();
     };
+
+    let mut t = t.inner().borrow_mut(mc);
+
+    if t.has_metamethod(Metamethod::NEWINDEX) {
+        become setfield_slow(instruction, mc, thread, registers, ip, handlers);
+    }
+
     let k = constant!(key_idx);
     let v = reg!(src);
-    let Some(resolved) = resolve_newindex_chain(mc, t, k) else {
-        raise!();
-    };
-    match resolved {
-        NewIndexChain::RawSet(target) => {
-            target.raw_set(mc, k, v);
-            dispatch!();
-        }
-        NewIndexChain::Invoke { func, receiver } => {
-            let cont = Continuation {
-                func: cont_ignore_result,
-                payload: ContinuationPayload::IgnoreResult,
-                results_base: 0,
-                nret: 0,
-            };
-            invoke_metamethod!(func, &[receiver, k, v], cont);
-        }
-    }
+    t.raw_set(k, v);
+    dispatch!()
+}
+
+#[inline(never)]
+extern "rust-preserve-none" fn setfield_slow<'gc>(
+    instruction: Instruction,
+    mc: &Mutation<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+) -> Result<(), Box<Error>> {
+    todo!()
+    //let Some(resolved) = resolve_newindex_chain(mc, t, k) else {
+    //    raise!();
+    //};
+    //match resolved {
+    //    NewIndexChain::RawSet(target) => {
+    //        target.raw_set(mc, k, v);
+    //        dispatch!();
+    //    }
+    //    NewIndexChain::Invoke { func, receiver } => {
+    //        let cont = Continuation {
+    //            func: cont_ignore_result,
+    //            payload: ContinuationPayload::IgnoreResult,
+    //            results_base: 0,
+    //            nret: 0,
+    //        };
+    //        invoke_metamethod!(func, &[receiver, k, v], cont);
+    //    }
+    //}
 }
 
 /// R[dst] = {}

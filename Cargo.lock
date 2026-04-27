@@ -580,6 +580,7 @@ name = "tcvm"
 version = "0.1.0"
 dependencies = [
  "ariadne",
+ "bitflags",
  "cstree",
  "foldhash 0.2.0",
  "hashbrown 0.17.0",

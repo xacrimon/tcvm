@@ -1,4 +1,4 @@
-use core::hash::{BuildHasher, Hash, Hasher};
+use core::hash::{Hash, Hasher};
 use std::cmp::Ordering;
 
 use crate::dmm::{Collect, Gc, Mutation};
@@ -10,21 +10,12 @@ pub struct LuaString<'gc>(Gc<'gc, StringData>);
 #[derive(Collect)]
 #[collect(internal, require_static)]
 pub struct StringData {
-    hash: u64,
     bytes: Box<[u8]>,
-}
-
-fn compute_hash(bytes: &[u8]) -> u64 {
-    let mut hasher = foldhash::fast::FixedState::with_seed(0).build_hasher();
-    bytes.hash(&mut hasher);
-    hasher.finish()
 }
 
 impl<'gc> LuaString<'gc> {
     pub fn new(mc: &Mutation<'gc>, bytes: &[u8]) -> Self {
-        let hash = compute_hash(bytes);
         let data = StringData {
-            hash,
             bytes: bytes.into(),
         };
         LuaString(Gc::new(mc, data))
@@ -36,10 +27,6 @@ impl<'gc> LuaString<'gc> {
 
     pub fn len(self) -> usize {
         Gc::as_ref(self.0).bytes.len()
-    }
-
-    pub fn cached_hash(self) -> u64 {
-        Gc::as_ref(self.0).hash
     }
 }
 
@@ -68,6 +55,6 @@ impl<'gc> Ord for LuaString<'gc> {
 
 impl<'gc> Hash for LuaString<'gc> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u64(self.cached_hash());
+        state.write(&self.0.bytes);
     }
 }
