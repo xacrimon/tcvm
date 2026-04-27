@@ -1492,6 +1492,10 @@ enum Lvalue {
         table: RegisterIndex,
         key: RegisterIndex,
     },
+    Field {
+        table: RegisterIndex,
+        key_idx: u16,
+    },
 }
 
 /// Lua 5.5 §3.3.3 specifies "first evaluate all its expressions and only
@@ -1681,8 +1685,10 @@ fn compile_lvalue(
             let t = binop.lhs().ok_or_else(|| ice("binop without lhs"))?;
             let f = binop.rhs().ok_or_else(|| ice("binop without rhs"))?;
             let table = compile_indexed_subexpr(ctx, t, target_local_regs)?;
-            // Property key is a freshly-LOADed string constant — its
-            // register is a fresh temp, never a target local.
+            if let Some(key_idx) = try_property_key_constant(ctx, &f)? {
+                return Ok(Lvalue::Field { table, key_idx });
+            }
+            // Fallback: non-ident RHS still goes through LOAD K + SETTABLE.
             let key = compile_property_key(ctx, f, None)?;
             Ok(Lvalue::Indexed { table, key })
         }
@@ -1818,6 +1824,11 @@ fn emit_store(ctx: &mut Ctx, lv: Lvalue, src: u8) {
             src,
             table: table.0,
             key: key.0,
+        }),
+        Lvalue::Field { table, key_idx } => ctx.emit(Instruction::SETFIELD {
+            src,
+            table: table.0,
+            key_idx,
         }),
     }
 }
@@ -2071,6 +2082,18 @@ fn compile_property_key(
     }
 }
 
+fn try_property_key_constant(ctx: &mut Ctx, field: &Expr) -> Result<Option<u16>, CompileError> {
+    let bytes: Vec<u8> = match field {
+        Expr::Ident(ident) => ident
+            .name(ctx.interner)
+            .ok_or_else(|| ice("ident without name"))?
+            .as_bytes()
+            .to_vec(),
+        _ => return Ok(None),
+    };
+    Ok(Some(ctx.alloc_string_constant(&bytes)?))
+}
+
 fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, CompileError> {
     let dst = ctx.alloc_register()?;
     ctx.emit(Instruction::NEWTABLE { dst: dst.0 });
@@ -2131,18 +2154,19 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
                 }
 
                 let field = map.field().ok_or_else(|| ice("table map without field"))?;
-                let key = compile_property_key(ctx, Expr::Ident(field), None)?;
+                let field_expr = Expr::Ident(field);
+                let key_idx = try_property_key_constant(ctx, &field_expr)?
+                    .ok_or_else(|| ice("table map field without name"))?;
 
                 let value_expr = map.value().ok_or_else(|| ice("table map without value"))?;
                 let val = compile_expr_to_reg(ctx, value_expr, None)?;
 
-                ctx.emit(Instruction::SETTABLE {
+                ctx.emit(Instruction::SETFIELD {
                     src: val.0,
                     table: dst.0,
-                    key: key.0,
+                    key_idx,
                 });
-                // Free val (higher) then key — SETTABLE has captured both.
-                ctx.free_regs(val, key);
+                ctx.free_reg(val);
             }
 
             TableEntry::Generic(r#gen) => {
@@ -2312,6 +2336,16 @@ fn compile_expr_binary_op_to_reg(
         let lhs = item.lhs().ok_or_else(|| ice("binop without lhs"))?;
         let rhs = item.rhs().ok_or_else(|| ice("binop without rhs"))?;
         let table = compile_expr_to_reg(ctx, lhs, None)?;
+        if let Some(key_idx) = try_property_key_constant(ctx, &rhs)? {
+            ctx.free_reg(table);
+            let dst = ctx.dst_or_alloc(dst)?;
+            ctx.emit(Instruction::GETFIELD {
+                dst: dst.0,
+                table: table.0,
+                key_idx,
+            });
+            return Ok(dst);
+        }
         let key = compile_property_key(ctx, rhs, None)?;
         ctx.free_regs(table, key);
         let dst = ctx.dst_or_alloc(dst)?;

@@ -55,6 +55,18 @@ pub enum Instruction {
         key: Register,
     },
 
+    GETFIELD {
+        dst: Register,
+        table: Register,
+        key_idx: ConstantIndex,
+    },
+
+    SETFIELD {
+        src: Register,
+        table: Register,
+        key_idx: ConstantIndex,
+    },
+
     NEWTABLE {
         dst: Register,
     },

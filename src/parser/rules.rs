@@ -146,7 +146,7 @@ impl<'cache, 'source> Parser<'cache, 'source> {
                 self.expect(t);
 
                 if T![.] == t {
-                    let _rhs = self.r_literal()?;
+                    let _rhs = self.r_ident()?;
                 } else {
                     let _rhs = self.r_expr_inner(r_bp)?;
                 }
@@ -554,7 +554,7 @@ impl<'cache, 'source> Parser<'cache, 'source> {
             if t == T![.] || t == T![:] {
                 let n = lhs.precede(self, T![bin_op]);
                 self.expect(t);
-                let _rhs = self.r_literal();
+                let _rhs = self.r_ident();
                 lhs = n.complete(self);
                 continue;
             }

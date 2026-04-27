@@ -61,217 +61,177 @@ expression: output
 ; code:
 0000  VARARGPREP      fixed=0
 0001  GETTABUP        R0 U0 K0  ; "math"
-0002  LOAD            R1 K1  ; "sqrt"
-0003  GETTABLE        R0 R0 R1
-0004  LOAD            R1 K2  ; 3.141592653589793
-0005  LOAD            R2 K3  ; 4
+0002  GETFIELD        R0 R0 K1  ; "sqrt"
+0003  LOAD            R1 K2  ; 3.141592653589793
+0004  LOAD            R2 K3  ; 4
+0005  MUL             R2 R2 R1
 0006  MUL             R2 R2 R1
-0007  MUL             R2 R2 R1
-0008  LOAD            R3 K4  ; 365.24
-0009  NEWTABLE        R4
-0010  LOAD            R5 K5  ; "x"
-0011  LOAD            R6 K6  ; 4.841431442464721
-0012  SETTABLE        R6 R4 R5
-0013  LOAD            R5 K7  ; "y"
-0014  LOAD            R6 K8  ; 1.1603200440274284
-0015  UNM             R6 R6
-0016  SETTABLE        R6 R4 R5
-0017  LOAD            R5 K9  ; "z"
-0018  LOAD            R6 K10  ; 0.10362204447112311
-0019  UNM             R6 R6
-0020  SETTABLE        R6 R4 R5
-0021  LOAD            R5 K11  ; "vx"
-0022  LOAD            R6 K12  ; 0.001660076642744037
-0023  MUL             R6 R6 R3
-0024  SETTABLE        R6 R4 R5
-0025  LOAD            R5 K13  ; "vy"
-0026  LOAD            R6 K14  ; 0.007699011184197404
-0027  MUL             R6 R6 R3
-0028  SETTABLE        R6 R4 R5
-0029  LOAD            R5 K15  ; "vz"
-0030  LOAD            R6 K16  ; 6.90460016972063e-5
-0031  UNM             R6 R6
-0032  MUL             R6 R6 R3
-0033  SETTABLE        R6 R4 R5
-0034  LOAD            R5 K17  ; "mass"
-0035  LOAD            R6 K18  ; 0.0009547919384243266
-0036  MUL             R6 R6 R2
-0037  SETTABLE        R6 R4 R5
-0038  NEWTABLE        R5
-0039  LOAD            R6 K5  ; "x"
-0040  LOAD            R7 K19  ; 8.34336671824458
-0041  SETTABLE        R7 R5 R6
-0042  LOAD            R6 K7  ; "y"
-0043  LOAD            R7 K20  ; 4.124798564124305
-0044  SETTABLE        R7 R5 R6
-0045  LOAD            R6 K9  ; "z"
-0046  LOAD            R7 K21  ; 0.4035234171143214
-0047  UNM             R7 R7
-0048  SETTABLE        R7 R5 R6
-0049  LOAD            R6 K11  ; "vx"
-0050  LOAD            R7 K22  ; 0.002767425107268624
-0051  UNM             R7 R7
-0052  MUL             R7 R7 R3
-0053  SETTABLE        R7 R5 R6
-0054  LOAD            R6 K13  ; "vy"
-0055  LOAD            R7 K23  ; 0.004998528012349172
-0056  MUL             R7 R7 R3
-0057  SETTABLE        R7 R5 R6
-0058  LOAD            R6 K15  ; "vz"
-0059  LOAD            R7 K24  ; 2.3041729757376393e-5
-0060  MUL             R7 R7 R3
-0061  SETTABLE        R7 R5 R6
-0062  LOAD            R6 K17  ; "mass"
-0063  LOAD            R7 K25  ; 0.0002858859806661308
-0064  MUL             R7 R7 R2
-0065  SETTABLE        R7 R5 R6
-0066  NEWTABLE        R6
-0067  LOAD            R7 K5  ; "x"
-0068  LOAD            R8 K26  ; 12.894369562139131
-0069  SETTABLE        R8 R6 R7
-0070  LOAD            R7 K7  ; "y"
-0071  LOAD            R8 K27  ; 15.111151401698631
-0072  UNM             R8 R8
-0073  SETTABLE        R8 R6 R7
-0074  LOAD            R7 K9  ; "z"
-0075  LOAD            R8 K28  ; 0.22330757889265573
-0076  UNM             R8 R8
-0077  SETTABLE        R8 R6 R7
-0078  LOAD            R7 K11  ; "vx"
-0079  LOAD            R8 K29  ; 0.002964601375647616
-0080  MUL             R8 R8 R3
-0081  SETTABLE        R8 R6 R7
-0082  LOAD            R7 K13  ; "vy"
-0083  LOAD            R8 K30  ; 0.0023784717395948095
-0084  MUL             R8 R8 R3
-0085  SETTABLE        R8 R6 R7
-0086  LOAD            R7 K15  ; "vz"
-0087  LOAD            R8 K31  ; 2.9658956854023756e-5
+0007  LOAD            R3 K4  ; 365.24
+0008  NEWTABLE        R4
+0009  LOAD            R5 K6  ; 4.841431442464721
+0010  SETFIELD        R5 R4 K5  ; "x"
+0011  LOAD            R5 K8  ; 1.1603200440274284
+0012  UNM             R5 R5
+0013  SETFIELD        R5 R4 K7  ; "y"
+0014  LOAD            R5 K10  ; 0.10362204447112311
+0015  UNM             R5 R5
+0016  SETFIELD        R5 R4 K9  ; "z"
+0017  LOAD            R5 K12  ; 0.001660076642744037
+0018  MUL             R5 R5 R3
+0019  SETFIELD        R5 R4 K11  ; "vx"
+0020  LOAD            R5 K14  ; 0.007699011184197404
+0021  MUL             R5 R5 R3
+0022  SETFIELD        R5 R4 K13  ; "vy"
+0023  LOAD            R5 K16  ; 6.90460016972063e-5
+0024  UNM             R5 R5
+0025  MUL             R5 R5 R3
+0026  SETFIELD        R5 R4 K15  ; "vz"
+0027  LOAD            R5 K18  ; 0.0009547919384243266
+0028  MUL             R5 R5 R2
+0029  SETFIELD        R5 R4 K17  ; "mass"
+0030  NEWTABLE        R5
+0031  LOAD            R6 K19  ; 8.34336671824458
+0032  SETFIELD        R6 R5 K5  ; "x"
+0033  LOAD            R6 K20  ; 4.124798564124305
+0034  SETFIELD        R6 R5 K7  ; "y"
+0035  LOAD            R6 K21  ; 0.4035234171143214
+0036  UNM             R6 R6
+0037  SETFIELD        R6 R5 K9  ; "z"
+0038  LOAD            R6 K22  ; 0.002767425107268624
+0039  UNM             R6 R6
+0040  MUL             R6 R6 R3
+0041  SETFIELD        R6 R5 K11  ; "vx"
+0042  LOAD            R6 K23  ; 0.004998528012349172
+0043  MUL             R6 R6 R3
+0044  SETFIELD        R6 R5 K13  ; "vy"
+0045  LOAD            R6 K24  ; 2.3041729757376393e-5
+0046  MUL             R6 R6 R3
+0047  SETFIELD        R6 R5 K15  ; "vz"
+0048  LOAD            R6 K25  ; 0.0002858859806661308
+0049  MUL             R6 R6 R2
+0050  SETFIELD        R6 R5 K17  ; "mass"
+0051  NEWTABLE        R6
+0052  LOAD            R7 K26  ; 12.894369562139131
+0053  SETFIELD        R7 R6 K5  ; "x"
+0054  LOAD            R7 K27  ; 15.111151401698631
+0055  UNM             R7 R7
+0056  SETFIELD        R7 R6 K7  ; "y"
+0057  LOAD            R7 K28  ; 0.22330757889265573
+0058  UNM             R7 R7
+0059  SETFIELD        R7 R6 K9  ; "z"
+0060  LOAD            R7 K29  ; 0.002964601375647616
+0061  MUL             R7 R7 R3
+0062  SETFIELD        R7 R6 K11  ; "vx"
+0063  LOAD            R7 K30  ; 0.0023784717395948095
+0064  MUL             R7 R7 R3
+0065  SETFIELD        R7 R6 K13  ; "vy"
+0066  LOAD            R7 K31  ; 2.9658956854023756e-5
+0067  UNM             R7 R7
+0068  MUL             R7 R7 R3
+0069  SETFIELD        R7 R6 K15  ; "vz"
+0070  LOAD            R7 K32  ; 4.366244043351563e-5
+0071  MUL             R7 R7 R2
+0072  SETFIELD        R7 R6 K17  ; "mass"
+0073  NEWTABLE        R7
+0074  LOAD            R8 K33  ; 15.379697114850917
+0075  SETFIELD        R8 R7 K5  ; "x"
+0076  LOAD            R8 K34  ; 25.919314609987964
+0077  UNM             R8 R8
+0078  SETFIELD        R8 R7 K7  ; "y"
+0079  LOAD            R8 K35  ; 0.17925877295037118
+0080  SETFIELD        R8 R7 K9  ; "z"
+0081  LOAD            R8 K36  ; 0.0026806777249038932
+0082  MUL             R8 R8 R3
+0083  SETFIELD        R8 R7 K11  ; "vx"
+0084  LOAD            R8 K37  ; 0.001628241700382423
+0085  MUL             R8 R8 R3
+0086  SETFIELD        R8 R7 K13  ; "vy"
+0087  LOAD            R8 K38  ; 9.515922545197159e-5
 0088  UNM             R8 R8
 0089  MUL             R8 R8 R3
-0090  SETTABLE        R8 R6 R7
-0091  LOAD            R7 K17  ; "mass"
-0092  LOAD            R8 K32  ; 4.366244043351563e-5
-0093  MUL             R8 R8 R2
-0094  SETTABLE        R8 R6 R7
-0095  NEWTABLE        R7
-0096  LOAD            R8 K5  ; "x"
-0097  LOAD            R9 K33  ; 15.379697114850917
-0098  SETTABLE        R9 R7 R8
-0099  LOAD            R8 K7  ; "y"
-0100  LOAD            R9 K34  ; 25.919314609987964
-0101  UNM             R9 R9
-0102  SETTABLE        R9 R7 R8
-0103  LOAD            R8 K9  ; "z"
-0104  LOAD            R9 K35  ; 0.17925877295037118
-0105  SETTABLE        R9 R7 R8
-0106  LOAD            R8 K11  ; "vx"
-0107  LOAD            R9 K36  ; 0.0026806777249038932
-0108  MUL             R9 R9 R3
-0109  SETTABLE        R9 R7 R8
-0110  LOAD            R8 K13  ; "vy"
-0111  LOAD            R9 K37  ; 0.001628241700382423
-0112  MUL             R9 R9 R3
-0113  SETTABLE        R9 R7 R8
-0114  LOAD            R8 K15  ; "vz"
-0115  LOAD            R9 K38  ; 9.515922545197159e-5
-0116  UNM             R9 R9
-0117  MUL             R9 R9 R3
-0118  SETTABLE        R9 R7 R8
-0119  LOAD            R8 K17  ; "mass"
-0120  LOAD            R9 K39  ; 5.1513890204661145e-5
-0121  MUL             R9 R9 R2
-0122  SETTABLE        R9 R7 R8
-0123  NEWTABLE        R8
-0124  LOAD            R9 K5  ; "x"
-0125  LOAD            R10 K40  ; 0
-0126  SETTABLE        R10 R8 R9
-0127  LOAD            R9 K7  ; "y"
-0128  LOAD            R10 K40  ; 0
-0129  SETTABLE        R10 R8 R9
-0130  LOAD            R9 K9  ; "z"
-0131  LOAD            R10 K40  ; 0
-0132  SETTABLE        R10 R8 R9
-0133  LOAD            R9 K11  ; "vx"
-0134  LOAD            R10 K40  ; 0
-0135  SETTABLE        R10 R8 R9
-0136  LOAD            R9 K13  ; "vy"
-0137  LOAD            R10 K40  ; 0
-0138  SETTABLE        R10 R8 R9
-0139  LOAD            R9 K15  ; "vz"
-0140  LOAD            R10 K40  ; 0
-0141  SETTABLE        R10 R8 R9
-0142  LOAD            R9 K17  ; "mass"
-0143  SETTABLE        R2 R8 R9
-0144  CLOSURE         R9 P0
-0145  CLOSURE         R10 P1
-0146  CLOSURE         R11 P2
-0147  GETTABUP        R12 U0 K41  ; "tonumber"
-0148  GETTABUP        R13 U0 K42  ; "arg"
-0149  TEST            R13 inv=false
-0150  JMP             +3
-0151  GETTABUP        R14 U0 K42  ; "arg"
-0152  LOAD            R15 K43  ; 1
-0153  GETTABLE        R13 R14 R15
-0154  CALL            R12 args=2 ret=2
-0155  TESTSET         R13 R12 inv=false
-0156  JMP             +1
-0157  LOAD            R13 K44  ; 1000
-0158  MOVE            R12 R13
-0159  NEWTABLE        R13
-0160  MOVE            R14 R8
-0161  MOVE            R15 R4
-0162  MOVE            R16 R5
-0163  MOVE            R17 R6
-0164  MOVE            R18 R7
-0165  SETLIST         R13 count=5 offset=0
-0166  LEN             R14 R13
-0167  MOVE            R15 R11
-0168  MOVE            R16 R13
-0169  MOVE            R17 R14
-0170  CALL            R15 args=3 ret=2
-0171  GETTABUP        R16 U0 K45  ; "io"
-0172  LOAD            R17 K46  ; "write"
-0173  GETTABLE        R16 R16 R17
-0174  GETTABUP        R17 U0 K47  ; "string"
-0175  LOAD            R18 K48  ; "format"
-0176  GETTABLE        R17 R17 R18
-0177  LOAD            R18 K49  ; "%0.9f"
-0178  MOVE            R19 R10
-0179  MOVE            R20 R13
-0180  MOVE            R21 R14
-0181  CALL            R19 args=3 ret=2
-0182  CALL            R17 args=3 ret=2
-0183  LOAD            R18 K50  ; "\n"
-0184  CALL            R16 args=3 ret=2
-0185  LOAD            R17 K43  ; 1
-0186  MOVE            R18 R12
-0187  LOAD            R19 K43  ; 1
-0188  FORPREP         R17 +6
-0189  MOVE            R21 R9
-0190  MOVE            R22 R13
-0191  MOVE            R23 R14
-0192  LOAD            R24 K51  ; 0.01
-0193  CALL            R21 args=4 ret=2
-0194  FORLOOP         R17 -6
-0195  GETTABUP        R17 U0 K45  ; "io"
-0196  LOAD            R18 K46  ; "write"
-0197  GETTABLE        R17 R17 R18
-0198  GETTABUP        R18 U0 K47  ; "string"
-0199  LOAD            R19 K48  ; "format"
-0200  GETTABLE        R18 R18 R19
-0201  LOAD            R19 K49  ; "%0.9f"
-0202  MOVE            R20 R10
-0203  MOVE            R21 R13
-0204  MOVE            R22 R14
-0205  CALL            R20 args=3 ret=2
-0206  CALL            R18 args=3 ret=2
-0207  LOAD            R19 K50  ; "\n"
-0208  CALL            R17 args=3 ret=2
-0209  RETURN          R0 count=1
+0090  SETFIELD        R8 R7 K15  ; "vz"
+0091  LOAD            R8 K39  ; 5.1513890204661145e-5
+0092  MUL             R8 R8 R2
+0093  SETFIELD        R8 R7 K17  ; "mass"
+0094  NEWTABLE        R8
+0095  LOAD            R9 K40  ; 0
+0096  SETFIELD        R9 R8 K5  ; "x"
+0097  LOAD            R9 K40  ; 0
+0098  SETFIELD        R9 R8 K7  ; "y"
+0099  LOAD            R9 K40  ; 0
+0100  SETFIELD        R9 R8 K9  ; "z"
+0101  LOAD            R9 K40  ; 0
+0102  SETFIELD        R9 R8 K11  ; "vx"
+0103  LOAD            R9 K40  ; 0
+0104  SETFIELD        R9 R8 K13  ; "vy"
+0105  LOAD            R9 K40  ; 0
+0106  SETFIELD        R9 R8 K15  ; "vz"
+0107  SETFIELD        R2 R8 K17  ; "mass"
+0108  CLOSURE         R9 P0
+0109  CLOSURE         R10 P1
+0110  CLOSURE         R11 P2
+0111  GETTABUP        R12 U0 K41  ; "tonumber"
+0112  GETTABUP        R13 U0 K42  ; "arg"
+0113  TEST            R13 inv=false
+0114  JMP             +3
+0115  GETTABUP        R14 U0 K42  ; "arg"
+0116  LOAD            R15 K43  ; 1
+0117  GETTABLE        R13 R14 R15
+0118  CALL            R12 args=2 ret=2
+0119  TESTSET         R13 R12 inv=false
+0120  JMP             +1
+0121  LOAD            R13 K44  ; 1000
+0122  MOVE            R12 R13
+0123  NEWTABLE        R13
+0124  MOVE            R14 R8
+0125  MOVE            R15 R4
+0126  MOVE            R16 R5
+0127  MOVE            R17 R6
+0128  MOVE            R18 R7
+0129  SETLIST         R13 count=5 offset=0
+0130  LEN             R14 R13
+0131  MOVE            R15 R11
+0132  MOVE            R16 R13
+0133  MOVE            R17 R14
+0134  CALL            R15 args=3 ret=2
+0135  GETTABUP        R16 U0 K45  ; "io"
+0136  GETFIELD        R16 R16 K46  ; "write"
+0137  GETTABUP        R17 U0 K47  ; "string"
+0138  GETFIELD        R17 R17 K48  ; "format"
+0139  LOAD            R18 K49  ; "%0.9f"
+0140  MOVE            R19 R10
+0141  MOVE            R20 R13
+0142  MOVE            R21 R14
+0143  CALL            R19 args=3 ret=2
+0144  CALL            R17 args=3 ret=2
+0145  LOAD            R18 K50  ; "\n"
+0146  CALL            R16 args=3 ret=2
+0147  LOAD            R17 K43  ; 1
+0148  MOVE            R18 R12
+0149  LOAD            R19 K43  ; 1
+0150  FORPREP         R17 +6
+0151  MOVE            R21 R9
+0152  MOVE            R22 R13
+0153  MOVE            R23 R14
+0154  LOAD            R24 K51  ; 0.01
+0155  CALL            R21 args=4 ret=2
+0156  FORLOOP         R17 -6
+0157  GETTABUP        R17 U0 K45  ; "io"
+0158  GETFIELD        R17 R17 K46  ; "write"
+0159  GETTABUP        R18 U0 K47  ; "string"
+0160  GETFIELD        R18 R18 K48  ; "format"
+0161  LOAD            R19 K49  ; "%0.9f"
+0162  MOVE            R20 R10
+0163  MOVE            R21 R13
+0164  MOVE            R22 R14
+0165  CALL            R20 args=3 ret=2
+0166  CALL            R18 args=3 ret=2
+0167  LOAD            R19 K50  ; "\n"
+0168  CALL            R17 args=3 ret=2
+0169  RETURN          R0 count=1
 
 ; prototype 0:
-  ; function (params=3, vararg=false, stack=30, upvalues=1)
+  ; function (params=3, vararg=false, stack=29, upvalues=1)
   ; constants:
   ;   K0 = 1
   ;   K1 = "x"
@@ -287,114 +247,85 @@ expression: output
   0000  LOAD            R3 K0  ; 1
   0001  MOVE            R4 R1
   0002  LOAD            R5 K0  ; 1
-  0003  FORPREP         R3 +76
+  0003  FORPREP         R3 +56
   0004  GETTABLE        R7 R0 R6
-  0005  LOAD            R8 K1  ; "x"
-  0006  GETTABLE        R8 R7 R8
-  0007  LOAD            R9 K2  ; "y"
-  0008  GETTABLE        R9 R7 R9
-  0009  LOAD            R10 K3  ; "z"
-  0010  GETTABLE        R10 R7 R10
-  0011  LOAD            R11 K4  ; "mass"
-  0012  GETTABLE        R11 R7 R11
-  0013  LOAD            R12 K5  ; "vx"
-  0014  GETTABLE        R12 R7 R12
-  0015  LOAD            R13 K6  ; "vy"
-  0016  GETTABLE        R13 R7 R13
-  0017  LOAD            R14 K7  ; "vz"
-  0018  GETTABLE        R14 R7 R14
-  0019  LOAD            R18 K0  ; 1
-  0020  ADD             R15 R6 R18
-  0021  MOVE            R16 R1
-  0022  LOAD            R17 K0  ; 1
-  0023  FORPREP         R15 +49
-  0024  GETTABLE        R19 R0 R18
-  0025  LOAD            R20 K1  ; "x"
-  0026  GETTABLE        R20 R19 R20
-  0027  SUB             R20 R8 R20
-  0028  LOAD            R21 K2  ; "y"
-  0029  GETTABLE        R21 R19 R21
-  0030  SUB             R21 R9 R21
-  0031  LOAD            R22 K3  ; "z"
-  0032  GETTABLE        R22 R19 R22
-  0033  SUB             R22 R10 R22
-  0034  GETUPVAL        R23 U0
-  0035  MUL             R24 R20 R20
-  0036  MUL             R25 R21 R21
-  0037  ADD             R24 R24 R25
-  0038  MUL             R25 R22 R22
-  0039  ADD             R24 R24 R25
-  0040  CALL            R23 args=2 ret=2
-  0041  MUL             R24 R23 R23
-  0042  MUL             R24 R24 R23
-  0043  DIV             R24 R2 R24
-  0044  MUL             R25 R11 R24
-  0045  LOAD            R26 K4  ; "mass"
-  0046  GETTABLE        R26 R19 R26
-  0047  MUL             R26 R26 R24
-  0048  MUL             R27 R20 R26
-  0049  SUB             R12 R12 R27
-  0050  MUL             R27 R21 R26
-  0051  SUB             R13 R13 R27
-  0052  MUL             R27 R22 R26
-  0053  SUB             R14 R14 R27
-  0054  LOAD            R27 K5  ; "vx"
-  0055  LOAD            R28 K5  ; "vx"
-  0056  GETTABLE        R28 R19 R28
-  0057  MUL             R29 R20 R25
-  0058  ADD             R28 R28 R29
-  0059  SETTABLE        R28 R19 R27
-  0060  LOAD            R27 K6  ; "vy"
-  0061  LOAD            R28 K6  ; "vy"
-  0062  GETTABLE        R28 R19 R28
-  0063  MUL             R29 R21 R25
-  0064  ADD             R28 R28 R29
-  0065  SETTABLE        R28 R19 R27
-  0066  LOAD            R27 K7  ; "vz"
-  0067  LOAD            R28 K7  ; "vz"
-  0068  GETTABLE        R28 R19 R28
-  0069  MUL             R29 R22 R25
-  0070  ADD             R28 R28 R29
-  0071  SETTABLE        R28 R19 R27
-  0072  FORLOOP         R15 -49
-  0073  LOAD            R15 K5  ; "vx"
-  0074  SETTABLE        R12 R7 R15
-  0075  LOAD            R15 K6  ; "vy"
-  0076  SETTABLE        R13 R7 R15
-  0077  LOAD            R15 K7  ; "vz"
-  0078  SETTABLE        R14 R7 R15
-  0079  FORLOOP         R3 -76
-  0080  LOAD            R3 K0  ; 1
-  0081  MOVE            R4 R1
-  0082  LOAD            R5 K0  ; 1
-  0083  FORPREP         R3 +26
-  0084  GETTABLE        R7 R0 R6
-  0085  LOAD            R8 K1  ; "x"
-  0086  LOAD            R9 K1  ; "x"
-  0087  GETTABLE        R9 R7 R9
-  0088  LOAD            R10 K5  ; "vx"
-  0089  GETTABLE        R10 R7 R10
-  0090  MUL             R10 R2 R10
-  0091  ADD             R9 R9 R10
-  0092  SETTABLE        R9 R7 R8
-  0093  LOAD            R8 K2  ; "y"
-  0094  LOAD            R9 K2  ; "y"
-  0095  GETTABLE        R9 R7 R9
-  0096  LOAD            R10 K6  ; "vy"
-  0097  GETTABLE        R10 R7 R10
-  0098  MUL             R10 R2 R10
-  0099  ADD             R9 R9 R10
-  0100  SETTABLE        R9 R7 R8
-  0101  LOAD            R8 K3  ; "z"
-  0102  LOAD            R9 K3  ; "z"
-  0103  GETTABLE        R9 R7 R9
-  0104  LOAD            R10 K7  ; "vz"
-  0105  GETTABLE        R10 R7 R10
-  0106  MUL             R10 R2 R10
-  0107  ADD             R9 R9 R10
-  0108  SETTABLE        R9 R7 R8
-  0109  FORLOOP         R3 -26
-  0110  RETURN          R0 count=1
+  0005  GETFIELD        R8 R7 K1  ; "x"
+  0006  GETFIELD        R9 R7 K2  ; "y"
+  0007  GETFIELD        R10 R7 K3  ; "z"
+  0008  GETFIELD        R11 R7 K4  ; "mass"
+  0009  GETFIELD        R12 R7 K5  ; "vx"
+  0010  GETFIELD        R13 R7 K6  ; "vy"
+  0011  GETFIELD        R14 R7 K7  ; "vz"
+  0012  LOAD            R18 K0  ; 1
+  0013  ADD             R15 R6 R18
+  0014  MOVE            R16 R1
+  0015  LOAD            R17 K0  ; 1
+  0016  FORPREP         R15 +39
+  0017  GETTABLE        R19 R0 R18
+  0018  GETFIELD        R20 R19 K1  ; "x"
+  0019  SUB             R20 R8 R20
+  0020  GETFIELD        R21 R19 K2  ; "y"
+  0021  SUB             R21 R9 R21
+  0022  GETFIELD        R22 R19 K3  ; "z"
+  0023  SUB             R22 R10 R22
+  0024  GETUPVAL        R23 U0
+  0025  MUL             R24 R20 R20
+  0026  MUL             R25 R21 R21
+  0027  ADD             R24 R24 R25
+  0028  MUL             R25 R22 R22
+  0029  ADD             R24 R24 R25
+  0030  CALL            R23 args=2 ret=2
+  0031  MUL             R24 R23 R23
+  0032  MUL             R24 R24 R23
+  0033  DIV             R24 R2 R24
+  0034  MUL             R25 R11 R24
+  0035  GETFIELD        R26 R19 K4  ; "mass"
+  0036  MUL             R26 R26 R24
+  0037  MUL             R27 R20 R26
+  0038  SUB             R12 R12 R27
+  0039  MUL             R27 R21 R26
+  0040  SUB             R13 R13 R27
+  0041  MUL             R27 R22 R26
+  0042  SUB             R14 R14 R27
+  0043  GETFIELD        R27 R19 K5  ; "vx"
+  0044  MUL             R28 R20 R25
+  0045  ADD             R27 R27 R28
+  0046  SETFIELD        R27 R19 K5  ; "vx"
+  0047  GETFIELD        R27 R19 K6  ; "vy"
+  0048  MUL             R28 R21 R25
+  0049  ADD             R27 R27 R28
+  0050  SETFIELD        R27 R19 K6  ; "vy"
+  0051  GETFIELD        R27 R19 K7  ; "vz"
+  0052  MUL             R28 R22 R25
+  0053  ADD             R27 R27 R28
+  0054  SETFIELD        R27 R19 K7  ; "vz"
+  0055  FORLOOP         R15 -39
+  0056  SETFIELD        R12 R7 K5  ; "vx"
+  0057  SETFIELD        R13 R7 K6  ; "vy"
+  0058  SETFIELD        R14 R7 K7  ; "vz"
+  0059  FORLOOP         R3 -56
+  0060  LOAD            R3 K0  ; 1
+  0061  MOVE            R4 R1
+  0062  LOAD            R5 K0  ; 1
+  0063  FORPREP         R3 +17
+  0064  GETTABLE        R7 R0 R6
+  0065  GETFIELD        R8 R7 K1  ; "x"
+  0066  GETFIELD        R9 R7 K5  ; "vx"
+  0067  MUL             R9 R2 R9
+  0068  ADD             R8 R8 R9
+  0069  SETFIELD        R8 R7 K1  ; "x"
+  0070  GETFIELD        R8 R7 K2  ; "y"
+  0071  GETFIELD        R9 R7 K6  ; "vy"
+  0072  MUL             R9 R2 R9
+  0073  ADD             R8 R8 R9
+  0074  SETFIELD        R8 R7 K2  ; "y"
+  0075  GETFIELD        R8 R7 K3  ; "z"
+  0076  GETFIELD        R9 R7 K7  ; "vz"
+  0077  MUL             R9 R2 R9
+  0078  ADD             R8 R8 R9
+  0079  SETFIELD        R8 R7 K3  ; "z"
+  0080  FORLOOP         R3 -17
+  0081  RETURN          R0 count=1
 
 ; prototype 1:
   ; function (params=2, vararg=false, stack=23, upvalues=1)
@@ -416,61 +347,50 @@ expression: output
   0001  LOAD            R3 K1  ; 1
   0002  MOVE            R4 R1
   0003  LOAD            R5 K1  ; 1
-  0004  FORPREP         R3 +53
+  0004  FORPREP         R3 +42
   0005  GETTABLE        R7 R0 R6
-  0006  LOAD            R8 K2  ; "vx"
-  0007  GETTABLE        R8 R7 R8
-  0008  LOAD            R9 K3  ; "vy"
-  0009  GETTABLE        R9 R7 R9
-  0010  LOAD            R10 K4  ; "vz"
-  0011  GETTABLE        R10 R7 R10
-  0012  LOAD            R11 K5  ; "mass"
-  0013  GETTABLE        R11 R7 R11
-  0014  LOAD            R12 K6  ; 0.5
-  0015  MUL             R12 R12 R11
-  0016  MUL             R13 R8 R8
-  0017  MUL             R14 R9 R9
-  0018  ADD             R13 R13 R14
-  0019  MUL             R14 R10 R10
-  0020  ADD             R13 R13 R14
-  0021  MUL             R12 R12 R13
-  0022  ADD             R2 R2 R12
-  0023  LOAD            R15 K1  ; 1
-  0024  ADD             R12 R6 R15
-  0025  MOVE            R13 R1
-  0026  LOAD            R14 K1  ; 1
-  0027  FORPREP         R12 +29
-  0028  GETTABLE        R16 R0 R15
-  0029  LOAD            R17 K7  ; "x"
-  0030  GETTABLE        R17 R7 R17
-  0031  LOAD            R18 K7  ; "x"
-  0032  GETTABLE        R18 R16 R18
-  0033  SUB             R17 R17 R18
-  0034  LOAD            R18 K8  ; "y"
-  0035  GETTABLE        R18 R7 R18
-  0036  LOAD            R19 K8  ; "y"
-  0037  GETTABLE        R19 R16 R19
-  0038  SUB             R18 R18 R19
-  0039  LOAD            R19 K9  ; "z"
-  0040  GETTABLE        R19 R7 R19
-  0041  LOAD            R20 K9  ; "z"
-  0042  GETTABLE        R20 R16 R20
-  0043  SUB             R19 R19 R20
-  0044  GETUPVAL        R20 U0
-  0045  MUL             R21 R17 R17
-  0046  MUL             R22 R18 R18
-  0047  ADD             R21 R21 R22
-  0048  MUL             R22 R19 R19
-  0049  ADD             R21 R21 R22
-  0050  CALL            R20 args=2 ret=2
-  0051  LOAD            R21 K5  ; "mass"
-  0052  GETTABLE        R21 R16 R21
-  0053  MUL             R21 R11 R21
-  0054  DIV             R21 R21 R20
-  0055  SUB             R2 R2 R21
-  0056  FORLOOP         R12 -29
-  0057  FORLOOP         R3 -53
-  0058  RETURN          R2 count=2
+  0006  GETFIELD        R8 R7 K2  ; "vx"
+  0007  GETFIELD        R9 R7 K3  ; "vy"
+  0008  GETFIELD        R10 R7 K4  ; "vz"
+  0009  GETFIELD        R11 R7 K5  ; "mass"
+  0010  LOAD            R12 K6  ; 0.5
+  0011  MUL             R12 R12 R11
+  0012  MUL             R13 R8 R8
+  0013  MUL             R14 R9 R9
+  0014  ADD             R13 R13 R14
+  0015  MUL             R14 R10 R10
+  0016  ADD             R13 R13 R14
+  0017  MUL             R12 R12 R13
+  0018  ADD             R2 R2 R12
+  0019  LOAD            R15 K1  ; 1
+  0020  ADD             R12 R6 R15
+  0021  MOVE            R13 R1
+  0022  LOAD            R14 K1  ; 1
+  0023  FORPREP         R12 +22
+  0024  GETTABLE        R16 R0 R15
+  0025  GETFIELD        R17 R7 K7  ; "x"
+  0026  GETFIELD        R18 R16 K7  ; "x"
+  0027  SUB             R17 R17 R18
+  0028  GETFIELD        R18 R7 K8  ; "y"
+  0029  GETFIELD        R19 R16 K8  ; "y"
+  0030  SUB             R18 R18 R19
+  0031  GETFIELD        R19 R7 K9  ; "z"
+  0032  GETFIELD        R20 R16 K9  ; "z"
+  0033  SUB             R19 R19 R20
+  0034  GETUPVAL        R20 U0
+  0035  MUL             R21 R17 R17
+  0036  MUL             R22 R18 R18
+  0037  ADD             R21 R21 R22
+  0038  MUL             R22 R19 R19
+  0039  ADD             R21 R21 R22
+  0040  CALL            R20 args=2 ret=2
+  0041  GETFIELD        R21 R16 K5  ; "mass"
+  0042  MUL             R21 R11 R21
+  0043  DIV             R21 R21 R20
+  0044  SUB             R2 R2 R21
+  0045  FORLOOP         R12 -22
+  0046  FORLOOP         R3 -42
+  0047  RETURN          R2 count=2
 
 ; prototype 2:
   ; function (params=2, vararg=false, stack=12, upvalues=1)
@@ -490,42 +410,35 @@ expression: output
   0003  LOAD            R5 K1  ; 1
   0004  MOVE            R6 R1
   0005  LOAD            R7 K1  ; 1
-  0006  FORPREP         R5 +16
+  0006  FORPREP         R5 +12
   0007  GETTABLE        R9 R0 R8
-  0008  LOAD            R10 K2  ; "mass"
-  0009  GETTABLE        R10 R9 R10
-  0010  LOAD            R11 K3  ; "vx"
-  0011  GETTABLE        R11 R9 R11
-  0012  MUL             R11 R11 R10
-  0013  ADD             R2 R2 R11
-  0014  LOAD            R11 K4  ; "vy"
-  0015  GETTABLE        R11 R9 R11
+  0008  GETFIELD        R10 R9 K2  ; "mass"
+  0009  GETFIELD        R11 R9 K3  ; "vx"
+  0010  MUL             R11 R11 R10
+  0011  ADD             R2 R2 R11
+  0012  GETFIELD        R11 R9 K4  ; "vy"
+  0013  MUL             R11 R11 R10
+  0014  ADD             R3 R3 R11
+  0015  GETFIELD        R11 R9 K5  ; "vz"
   0016  MUL             R11 R11 R10
-  0017  ADD             R3 R3 R11
-  0018  LOAD            R11 K5  ; "vz"
-  0019  GETTABLE        R11 R9 R11
-  0020  MUL             R11 R11 R10
-  0021  ADD             R4 R4 R11
-  0022  FORLOOP         R5 -16
-  0023  LOAD            R5 K1  ; 1
-  0024  GETTABLE        R5 R0 R5
-  0025  LOAD            R6 K3  ; "vx"
-  0026  UNM             R7 R2
-  0027  GETUPVAL        R8 U0
-  0028  DIV             R7 R7 R8
-  0029  SETTABLE        R7 R5 R6
-  0030  LOAD            R5 K1  ; 1
-  0031  GETTABLE        R5 R0 R5
-  0032  LOAD            R6 K4  ; "vy"
-  0033  UNM             R7 R3
-  0034  GETUPVAL        R8 U0
-  0035  DIV             R7 R7 R8
-  0036  SETTABLE        R7 R5 R6
-  0037  LOAD            R5 K1  ; 1
-  0038  GETTABLE        R5 R0 R5
-  0039  LOAD            R6 K5  ; "vz"
-  0040  UNM             R7 R4
-  0041  GETUPVAL        R8 U0
-  0042  DIV             R7 R7 R8
-  0043  SETTABLE        R7 R5 R6
-  0044  RETURN          R0 count=1
+  0017  ADD             R4 R4 R11
+  0018  FORLOOP         R5 -12
+  0019  LOAD            R5 K1  ; 1
+  0020  GETTABLE        R5 R0 R5
+  0021  UNM             R6 R2
+  0022  GETUPVAL        R7 U0
+  0023  DIV             R6 R6 R7
+  0024  SETFIELD        R6 R5 K3  ; "vx"
+  0025  LOAD            R5 K1  ; 1
+  0026  GETTABLE        R5 R0 R5
+  0027  UNM             R6 R3
+  0028  GETUPVAL        R7 U0
+  0029  DIV             R6 R6 R7
+  0030  SETFIELD        R6 R5 K4  ; "vy"
+  0031  LOAD            R5 K1  ; 1
+  0032  GETTABLE        R5 R0 R5
+  0033  UNM             R6 R4
+  0034  GETUPVAL        R7 U0
+  0035  DIV             R6 R6 R7
+  0036  SETFIELD        R6 R5 K5  ; "vz"
+  0037  RETURN          R0 count=1

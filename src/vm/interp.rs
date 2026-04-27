@@ -20,6 +20,8 @@ static HANDLERS: &[Handler] = &[
     op_settabup,
     op_gettable,
     op_settable,
+    op_getfield,
+    op_setfield,
     op_newtable,
     op_add,
     op_sub,
@@ -482,6 +484,87 @@ extern "rust-preserve-none" fn op_settable<'gc>(
         raise!();
     };
     let k = reg!(key);
+    let v = reg!(src);
+    let Some(resolved) = resolve_newindex_chain(mc, t, k) else {
+        raise!();
+    };
+    match resolved {
+        NewIndexChain::RawSet(target) => {
+            target.raw_set(mc, k, v);
+            dispatch!();
+        }
+        NewIndexChain::Invoke { func, receiver } => {
+            let cont = Continuation {
+                func: cont_ignore_result,
+                payload: ContinuationPayload::IgnoreResult,
+                results_base: 0,
+                nret: 0,
+            };
+            invoke_metamethod!(func, &[receiver, k, v], cont);
+        }
+    }
+}
+
+/// R[dst] = R[table][K[key_idx]]
+#[inline(never)]
+extern "rust-preserve-none" fn op_getfield<'gc>(
+    instruction: Instruction,
+    mc: &Mutation<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+) -> Result<(), Box<Error>> {
+    helpers!(instruction, mc, thread, registers, ip, handlers);
+    let (dst, table, key_idx) = args!(Instruction::GETFIELD {
+        dst,
+        table,
+        key_idx
+    });
+    let Some(t) = reg!(table).get_table() else {
+        raise!();
+    };
+    let k = constant!(key_idx);
+    let Some(resolved) = resolve_index_chain(mc, t, k) else {
+        raise!();
+    };
+    match resolved {
+        IndexChain::Resolved(v) => {
+            *reg!(mut dst) = v;
+            dispatch!();
+        }
+        IndexChain::Invoke { func, receiver } => {
+            let cont = Continuation {
+                func: cont_store_result,
+                payload: ContinuationPayload::StoreResult { dst },
+                results_base: 0,
+                nret: 0,
+            };
+            invoke_metamethod!(func, &[receiver, k], cont);
+        }
+    }
+}
+
+/// R[table][K[key_idx]] = R[src]
+#[inline(never)]
+extern "rust-preserve-none" fn op_setfield<'gc>(
+    instruction: Instruction,
+    mc: &Mutation<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+) -> Result<(), Box<Error>> {
+    helpers!(instruction, mc, thread, registers, ip, handlers);
+    let (src, table, key_idx) = args!(Instruction::SETFIELD {
+        src,
+        table,
+        key_idx
+    });
+    let Some(t) = reg!(table).get_table() else {
+        raise!();
+    };
+    let k = constant!(key_idx);
     let v = reg!(src);
     let Some(resolved) = resolve_newindex_chain(mc, t, k) else {
         raise!();

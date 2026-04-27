@@ -102,6 +102,26 @@ fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -> String {
         Instruction::SETTABLE { src, table, key } => {
             format!("SETTABLE        R{src} R{table} R{key}")
         }
+        Instruction::GETFIELD {
+            dst,
+            table,
+            key_idx,
+        } => {
+            format!(
+                "GETFIELD        R{dst} R{table} K{key_idx}{}",
+                const_comment(constants, key_idx)
+            )
+        }
+        Instruction::SETFIELD {
+            src,
+            table,
+            key_idx,
+        } => {
+            format!(
+                "SETFIELD        R{src} R{table} K{key_idx}{}",
+                const_comment(constants, key_idx)
+            )
+        }
         Instruction::NEWTABLE { dst } => format!("NEWTABLE        R{dst}"),
         Instruction::ADD { dst, lhs, rhs } => format!("ADD             R{dst} R{lhs} R{rhs}"),
         Instruction::SUB { dst, lhs, rhs } => format!("SUB             R{dst} R{lhs} R{rhs}"),

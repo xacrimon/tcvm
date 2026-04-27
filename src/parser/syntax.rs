@@ -290,7 +290,6 @@ impl Literal {
             T![hex_float] => LiteralValue::Float(lit::parse_hex_float(s)?),
             T![string] => LiteralValue::String(lit::parse_string(s)),
             T![long_string] => LiteralValue::String(lit::parse_long_string(s)),
-            T![ident] => LiteralValue::String(s.as_bytes().to_vec()),
             _ => unreachable!(),
         })
     }
