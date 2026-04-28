@@ -9,3 +9,5 @@ https://crates.io/crates/rhai
 https://luau.org/performance/
 
 luajit bytecode
+
+https://sillycross.github.io/2022/11/22/2022-11-22/index.html
