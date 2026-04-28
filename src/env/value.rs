@@ -2,7 +2,7 @@ use core::hash::{Hash, Hasher};
 use std::hint;
 use std::marker::PhantomData;
 
-use crate::dmm::{Collect, Gc};
+use crate::dmm::{Collect, Gc, collect::Trace};
 use crate::env::function::Function;
 use crate::env::string::LuaString;
 use crate::env::table::Table;
@@ -24,8 +24,7 @@ pub enum ValueKind {
     Userdata,
 }
 
-#[derive(Clone, Copy, Collect, PartialEq)]
-#[collect(internal, no_drop)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct Value<'gc> {
     kind: ValueKind,
     data: u64,
@@ -209,5 +208,21 @@ impl<'gc> Eq for Value<'gc> {}
 impl<'gc> Hash for Value<'gc> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         state.write_u64(self.data);
+    }
+}
+
+unsafe impl<'gc> Collect<'gc> for Value<'gc> {
+    #[inline]
+    fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
+        unsafe {
+            match self.kind {
+                ValueKind::String => self.get_string().unwrap_unchecked().trace(cc),
+                ValueKind::Table => self.get_table().unwrap_unchecked().trace(cc),
+                ValueKind::Function => self.get_function().unwrap_unchecked().trace(cc),
+                ValueKind::Thread => self.get_thread().unwrap_unchecked().trace(cc),
+                ValueKind::Userdata => self.get_userdata().unwrap_unchecked().trace(cc),
+                _ => (),
+            }
+        }
     }
 }
