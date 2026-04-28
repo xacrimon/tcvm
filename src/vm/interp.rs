@@ -189,6 +189,20 @@ macro_rules! helpers {
         }
 
         #[allow(unused_macros)]
+        macro_rules! field_constant {
+            ($$idx:expr) => {{
+                unsafe {
+                    let frame = $thread.frames.last().unwrap_unchecked();
+                    *frame
+                        .closure
+                        .proto
+                        .field_constants
+                        .get_unchecked($$idx as usize)
+                }
+            }};
+        }
+
+        #[allow(unused_macros)]
         macro_rules! upvalue {
             ($$idx:expr) => {{
                 unsafe {
@@ -381,7 +395,8 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
         become gettabup_slow(instruction, ctx, thread, registers, ip, handlers);
     }
 
-    let k = constant!(key);
+    let fc = field_constant!(key);
+    let k = Value::string(fc.name);
     let v = t.raw_get(k);
     *reg!(mut dst) = v;
     dispatch!();
@@ -424,7 +439,8 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
         become settabup_slow(instruction, ctx, thread, registers, ip, handlers);
     }
 
-    let k = constant!(key);
+    let fc = field_constant!(key);
+    let k = Value::string(fc.name);
     let v = reg!(src);
     t.raw_set(k, v);
     dispatch!()
@@ -555,7 +571,8 @@ extern "rust-preserve-none" fn op_getfield<'gc>(
         become getfield_slow(instruction, ctx, thread, registers, ip, handlers);
     }
 
-    let k = constant!(key_idx);
+    let fc = field_constant!(key_idx);
+    let k = Value::string(fc.name);
     let v = t.raw_get(k);
     *reg!(mut dst) = v;
     dispatch!();
@@ -600,7 +617,8 @@ extern "rust-preserve-none" fn op_setfield<'gc>(
         become setfield_slow(instruction, ctx, thread, registers, ip, handlers);
     }
 
-    let k = constant!(key_idx);
+    let fc = field_constant!(key_idx);
+    let k = Value::string(fc.name);
     let v = reg!(src);
     t.raw_set(k, v);
     dispatch!()

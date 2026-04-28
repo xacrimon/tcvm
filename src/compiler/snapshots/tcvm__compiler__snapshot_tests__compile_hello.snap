@@ -6,7 +6,8 @@ expression: output
 ; constants:
 ;   K0 = "Hello"
 ;   K1 = ", World"
-;   K2 = "print"
+; field constants:
+;   F0 = "print"
 ; upvalues:
 ;   U0 = local R0
 ; code:
@@ -14,7 +15,7 @@ expression: output
 0001  LOAD            R0 K0  ; "Hello"
 0002  LOAD            R1 K1  ; ", World"
 0003  CONCAT          R0 R0 R1
-0004  GETTABUP        R1 U0 K2  ; "print"
+0004  GETTABUP        R1 U0 F0  ; "print"
 0005  MOVE            R2 R0
 0006  CALL            R1 args=2 ret=2
 0007  RETURN          R0 count=1

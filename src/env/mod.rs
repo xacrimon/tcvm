@@ -5,7 +5,9 @@ pub mod thread;
 pub mod userdata;
 pub mod value;
 
-pub use function::{Function, NativeContext, NativeError, NativeFn, Prototype, Stack};
+pub use function::{
+    FieldConstant, Function, NativeContext, NativeError, NativeFn, Prototype, Stack,
+};
 pub use string::LuaString;
 pub use table::Table;
 pub use thread::Thread;

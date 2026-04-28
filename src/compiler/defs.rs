@@ -1,5 +1,5 @@
 use crate::dmm::{Gc, Mutation};
-use crate::env::{LuaString, Prototype, Value};
+use crate::env::{FieldConstant, LuaString, Prototype, Value};
 use crate::instruction::{Instruction, UpValueDescriptor};
 
 /// Newtype for register indices, providing type safety over raw u8.
@@ -128,6 +128,7 @@ impl ExprDesc {
 pub struct Chunk<'gc> {
     pub(super) tape: Vec<Instruction>,
     pub(super) constants: Vec<Value<'gc>>,
+    pub(super) field_constants: Vec<FieldConstant<'gc>>,
     pub(super) prototypes: Vec<Gc<'gc, Prototype<'gc>>>,
     pub(super) upvalue_desc: Vec<UpValueDescriptor>,
     /// Next free register slot; cursor for temp allocation. Locals occupy
@@ -154,6 +155,7 @@ impl<'gc> Chunk<'gc> {
         Chunk {
             tape: Vec::new(),
             constants: Vec::new(),
+            field_constants: Vec::new(),
             prototypes: Vec::new(),
             upvalue_desc: Vec::new(),
             freereg: 0,
@@ -190,6 +192,7 @@ impl<'gc> Chunk<'gc> {
             Prototype {
                 code: self.tape.into_boxed_slice(),
                 constants: self.constants.into_boxed_slice(),
+                field_constants: self.field_constants.into_boxed_slice(),
                 prototypes: self.prototypes.into_boxed_slice(),
                 upvalue_desc: self.upvalue_desc.into_boxed_slice(),
                 num_params: self.arity,

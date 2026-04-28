@@ -1,4 +1,4 @@
-use crate::env::{Prototype, Value};
+use crate::env::{FieldConstant, Prototype, Value};
 use crate::instruction::{Instruction, UpValueDescriptor};
 
 pub fn format_prototype(proto: &Prototype<'_>) -> String {
@@ -22,6 +22,17 @@ fn format_prototype_into(out: &mut String, proto: &Prototype<'_>, depth: usize) 
         }
     }
 
+    if !proto.field_constants.is_empty() {
+        out.push_str(&format!("{indent}; field constants:\n"));
+        for (i, fc) in proto.field_constants.iter().enumerate() {
+            let name = match std::str::from_utf8(fc.name.as_bytes()) {
+                Ok(text) => format!("{text:?}"),
+                Err(_) => format!("<bytes:{}>", fc.name.len()),
+            };
+            out.push_str(&format!("{indent};   F{i} = {name}\n"));
+        }
+    }
+
     if !proto.upvalue_desc.is_empty() {
         out.push_str(&format!("{indent}; upvalues:\n"));
         for (i, desc) in proto.upvalue_desc.iter().enumerate() {
@@ -37,7 +48,7 @@ fn format_prototype_into(out: &mut String, proto: &Prototype<'_>, depth: usize) 
     for (i, instr) in proto.code.iter().enumerate() {
         out.push_str(&format!(
             "{indent}{i:04}  {}\n",
-            format_instruction(instr, &proto.constants)
+            format_instruction(instr, &proto.constants, &proto.field_constants)
         ));
     }
 
@@ -68,10 +79,26 @@ fn format_value(v: &Value<'_>) -> String {
     }
 }
 
-fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -> String {
+fn format_instruction(
+    instr: &Instruction,
+    constants: &[Value<'_>],
+    field_constants: &[FieldConstant<'_>],
+) -> String {
     fn const_comment(constants: &[Value<'_>], idx: u16) -> String {
         if let Some(v) = constants.get(idx as usize) {
             format!("  ; {}", format_value(v))
+        } else {
+            String::new()
+        }
+    }
+
+    fn field_comment(field_constants: &[FieldConstant<'_>], idx: u16) -> String {
+        if let Some(fc) = field_constants.get(idx as usize) {
+            let name = match std::str::from_utf8(fc.name.as_bytes()) {
+                Ok(text) => format!("{text:?}"),
+                Err(_) => format!("<bytes:{}>", fc.name.len()),
+            };
+            format!("  ; {name}")
         } else {
             String::new()
         }
@@ -90,14 +117,14 @@ fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -> String {
         Instruction::SETUPVAL { src, idx } => format!("SETUPVAL        R{src} U{idx}"),
         Instruction::GETTABUP { dst, idx, key } => {
             format!(
-                "GETTABUP        R{dst} U{idx} K{key}{}",
-                const_comment(constants, key)
+                "GETTABUP        R{dst} U{idx} F{key}{}",
+                field_comment(field_constants, key)
             )
         }
         Instruction::SETTABUP { src, idx, key } => {
             format!(
-                "SETTABUP        R{src} U{idx} K{key}{}",
-                const_comment(constants, key)
+                "SETTABUP        R{src} U{idx} F{key}{}",
+                field_comment(field_constants, key)
             )
         }
         Instruction::GETTABLE { dst, table, key } => {
@@ -112,8 +139,8 @@ fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -> String {
             key_idx,
         } => {
             format!(
-                "GETFIELD        R{dst} R{table} K{key_idx}{}",
-                const_comment(constants, key_idx)
+                "GETFIELD        R{dst} R{table} F{key_idx}{}",
+                field_comment(field_constants, key_idx)
             )
         }
         Instruction::SETFIELD {
@@ -122,8 +149,8 @@ fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -> String {
             key_idx,
         } => {
             format!(
-                "SETFIELD        R{src} R{table} K{key_idx}{}",
-                const_comment(constants, key_idx)
+                "SETFIELD        R{src} R{table} F{key_idx}{}",
+                field_comment(field_constants, key_idx)
             )
         }
         Instruction::NEWTABLE { dst } => format!("NEWTABLE        R{dst}"),
@@ -207,7 +234,10 @@ fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -> String {
             format!("VARARGPREP      fixed={num_fixed}")
         }
         Instruction::ERRNNIL { src, name_key } => {
-            format!("ERRNNIL         R{src} name=K{name_key}")
+            format!(
+                "ERRNNIL         R{src} name=F{name_key}{}",
+                field_comment(field_constants, name_key)
+            )
         }
         Instruction::NOP => "NOP".to_string(),
         Instruction::STOP => "STOP".to_string(),

@@ -4,17 +4,18 @@ expression: output
 ---
 ; function (params=0, vararg=true, stack=5, upvalues=1)
 ; constants:
-;   K0 = "print"
-;   K1 = 2
+;   K0 = 2
+; field constants:
+;   F0 = "print"
 ; upvalues:
 ;   U0 = local R0
 ; code:
 0000  VARARGPREP      fixed=0
 0001  CLOSURE         R0 P0
-0002  GETTABUP        R1 U0 K0  ; "print"
+0002  GETTABUP        R1 U0 F0  ; "print"
 0003  MOVE            R2 R0
 0004  MOVE            R3 R0
-0005  LOAD            R4 K1  ; 2
+0005  LOAD            R4 K0  ; 2
 0006  CALL            R3 args=2 ret=2
 0007  CALL            R2 args=2 ret=2
 0008  CALL            R1 args=2 ret=2

@@ -7,7 +7,7 @@ use cstree::interning::TokenInterner;
 use super::defs::{Chunk, ExprDesc, ExprKind, JumpList, RegisterIndex};
 use super::{CompileError, CompileErrorKind, LineNumber};
 use crate::dmm::Gc;
-use crate::env::{LuaString, Prototype, Value};
+use crate::env::{FieldConstant, LuaString, Prototype, Value};
 use crate::instruction::{Instruction, UpValueDescriptor};
 use crate::lua;
 use crate::parser::syntax::{
@@ -15,6 +15,7 @@ use crate::parser::syntax::{
     FuncCall, FuncExpr, Global, Goto, Ident, If, Index, Label, Literal, LiteralValue, MethodCall,
     PrefixOp, PrefixOperator, Repeat, Return, Root, Stmt, Table, TableEntry, While,
 };
+use std::hash::BuildHasher;
 use std::mem;
 
 /// Sentinel value used as the `dst` field of a `TESTSET` while the real
@@ -851,6 +852,41 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         self.alloc_constant(Value::string(lua_str))
     }
 
+    /// Allocate a field-name string into the prototype's separate
+    /// `field_constants` pool, paired with its precomputed table hash.
+    /// Used for keys consumed by GETFIELD / SETFIELD / GETTABUP / SETTABUP
+    /// / ERRNNIL — opcodes whose `ConstantIndex` is reinterpreted as an
+    /// index into `field_constants` instead of `constants`.
+    ///
+    /// The hash is computed with the same `foldhash::fast::FixedState` the
+    /// table's BuildHasher uses, hashing the `Value::string(name)` form
+    /// (which is what Table::raw_get sees at lookup time).
+    fn alloc_field_constant(&mut self, s: &[u8]) -> Result<u16, CompileError> {
+        let name = LuaString::new(self.ctx, s);
+
+        if let Some(idx) = self
+            .chunk
+            .field_constants
+            .iter()
+            .position(|f| f.name == name)
+        {
+            return Ok(idx as u16);
+        }
+
+        if self.chunk.field_constants.len() >= u16::MAX as usize {
+            return Err(err(CompileErrorKind::Constants, LineNumber(0)));
+        }
+
+        let value = Value::string(name);
+        let hash = foldhash::fast::FixedState::default().hash_one(&value);
+
+        let idx = self.chunk.field_constants.len() as u16;
+        self.chunk
+            .field_constants
+            .push(FieldConstant { name, hash });
+        Ok(idx)
+    }
+
     /// Resolve `name` into an index in THIS function's upvalue list,
     /// capturing on first reference (via the parent's
     /// `resolve_for_child`). Returns `None` if the name isn't reachable
@@ -1348,7 +1384,7 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         //   SETTABUP closure, _ENV, name
         // Mirrors upstream `globalfunc` (`lparser.c:1956-1968`), which
         // emits the same guard via `checkglobal` + `luaK_storevar`.
-        let key = ctx.alloc_string_constant(name.as_bytes())?;
+        let key = ctx.alloc_field_constant(name.as_bytes())?;
         let env_idx = ctx
             .resolve_or_capture("_ENV")
             .ok_or_else(|| ice("_ENV must resolve; main chunk pre-seeds it"))?;
@@ -1459,7 +1495,7 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         .resolve_or_capture("_ENV")
         .ok_or_else(|| ice("_ENV must resolve; main chunk pre-seeds it"))?;
     for (i, (name, _kind)) in decl_kinds.iter().enumerate() {
-        let key = ctx.alloc_string_constant(name.as_bytes())?;
+        let key = ctx.alloc_field_constant(name.as_bytes())?;
         let value_reg = value_base + i as u8;
         let guard_reg = ctx.alloc_register()?;
         ctx.emit(Instruction::GETTABUP {
@@ -1681,7 +1717,7 @@ fn compile_lvalue(
                     ));
                 }
                 drop(env);
-                let key = ctx.alloc_string_constant(name.as_bytes())?;
+                let key = ctx.alloc_field_constant(name.as_bytes())?;
                 let env_idx = ctx
                     .resolve_or_capture("_ENV")
                     .ok_or_else(|| ice("_ENV must resolve; main chunk pre-seeds it"))?;
@@ -2018,7 +2054,7 @@ fn compile_expr_ident(
     }
     drop(globals);
 
-    let key = ctx.alloc_string_constant(name.as_bytes())?;
+    let key = ctx.alloc_field_constant(name.as_bytes())?;
     let dst = ctx.dst_or_alloc(dst)?;
     let env_idx = ctx
         .resolve_or_capture("_ENV")
@@ -2105,7 +2141,7 @@ fn try_property_key_constant(ctx: &mut Ctx, field: &Expr) -> Result<Option<u16>,
             .to_vec(),
         _ => return Ok(None),
     };
-    Ok(Some(ctx.alloc_string_constant(&bytes)?))
+    Ok(Some(ctx.alloc_field_constant(&bytes)?))
 }
 
 fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, CompileError> {

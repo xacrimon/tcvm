@@ -4,6 +4,21 @@ use crate::env::string::LuaString;
 use crate::env::value::Value;
 use crate::instruction::UpValueDescriptor;
 
+/// A field-name string constant paired with its precomputed table hash.
+///
+/// Populated by the compiler for keys consumed by GETFIELD / SETFIELD /
+/// GETTABUP / SETTABUP / ERRNNIL. The hash is produced with
+/// `foldhash::fast::FixedState::default()` over a `Value::string(name)`
+/// and matches what the table's BuildHasher will compute at lookup
+/// time, so the hot-path lookup can skip rehashing.
+#[derive(Clone, Copy, Collect)]
+#[collect(internal, no_drop)]
+pub struct FieldConstant<'gc> {
+    pub name: LuaString<'gc>,
+    #[collect(require_static)]
+    pub hash: u64,
+}
+
 /// A compiled Lua function. Immutable once created.
 /// Shared by all closures created from the same function definition.
 #[derive(Collect)]
@@ -12,6 +27,7 @@ pub struct Prototype<'gc> {
     #[collect(require_static)]
     pub code: Box<[crate::instruction::Instruction]>,
     pub constants: Box<[Value<'gc>]>,
+    pub field_constants: Box<[FieldConstant<'gc>]>,
     pub prototypes: Box<[Gc<'gc, Prototype<'gc>>]>,
     #[collect(require_static)]
     pub upvalue_desc: Box<[UpValueDescriptor]>,
