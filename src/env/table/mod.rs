@@ -54,7 +54,8 @@ impl<'gc> Table<'gc> {
 #[collect(internal, no_drop)]
 pub struct TableState<'gc> {
     array: Vec<Value<'gc>, MetricsAlloc<'gc>>,
-    hash: hashbrown::HashMap<Value<'gc>, Value<'gc>, foldhash::fast::FixedState, MetricsAlloc<'gc>>,
+    hash:
+        hashbrown::HashMap<Value<'gc>, Value<'gc>, foldhash::fast::RandomState, MetricsAlloc<'gc>>,
     metatable: Option<Table<'gc>>,
     #[collect(require_static)]
     metamethods: Metamethod,
@@ -65,7 +66,7 @@ impl<'gc> TableState<'gc> {
         Self {
             array: Vec::new_in(MetricsAlloc::new(mc)),
             hash: hashbrown::HashMap::with_hasher_in(
-                foldhash::fast::FixedState::default(),
+                foldhash::fast::RandomState::default(),
                 MetricsAlloc::new(mc),
             ),
             metatable: None,

@@ -4,44 +4,43 @@ expression: output
 ---
 ; function (params=0, vararg=true, stack=2, upvalues=1)
 ; constants:
-;   K0 = 5
-;   K1 = "x is less than 5"
-;   K2 = "z is less than 5"
-;   K3 = 10
-;   K4 = "z is greater than 10"
-;   K5 = "z is greater than or equal to 5 and less than or equal to 10"
-; field constants:
-;   F0 = "x"
-;   F1 = "print"
-;   F2 = "z"
+;   K0 = "x"
+;   K1 = 5
+;   K2 = "print"
+;   K3 = "x is less than 5"
+;   K4 = "z"
+;   K5 = "z is less than 5"
+;   K6 = 10
+;   K7 = "z is greater than 10"
+;   K8 = "z is greater than or equal to 5 and less than or equal to 10"
 ; upvalues:
 ;   U0 = local R0
 ; code:
 0000  VARARGPREP      fixed=0
-0001  GETTABUP        R0 U0 F0  ; "x"
-0002  LOAD            R1 K0  ; 5
+0001  GETTABUP        R0 U0 K0  ; "x"
+0002  LOAD            R1 K1  ; 5
 0003  LT              R0 R1 inv=false
 0004  JMP             +3
-0005  GETTABUP        R0 U0 F1  ; "print"
-0006  LOAD            R1 K1  ; "x is less than 5"
+0005  GETTABUP        R0 U0 K2  ; "print"
+0006  LOAD            R1 K3  ; "x is less than 5"
 0007  CALL            R0 args=2 ret=2
-0008  GETTABUP        R0 U0 F2  ; "z"
-0009  LOAD            R1 K0  ; 5
+0008  GETTABUP        R0 U0 K4  ; "z"
+0009  LOAD            R1 K1  ; 5
 0010  LT              R0 R1 inv=false
 0011  JMP             +4
-0012  GETTABUP        R0 U0 F1  ; "print"
-0013  LOAD            R1 K2  ; "z is less than 5"
+0012  GETTABUP        R0 U0 K2  ; "print"
+0013  LOAD            R1 K5  ; "z is less than 5"
 0014  CALL            R0 args=2 ret=2
 0015  JMP             +11
-0016  GETTABUP        R0 U0 F2  ; "z"
-0017  LOAD            R1 K3  ; 10
+0016  GETTABUP        R0 U0 K4  ; "z"
+0017  LOAD            R1 K6  ; 10
 0018  LT              R1 R0 inv=false
 0019  JMP             +4
-0020  GETTABUP        R0 U0 F1  ; "print"
-0021  LOAD            R1 K4  ; "z is greater than 10"
+0020  GETTABUP        R0 U0 K2  ; "print"
+0021  LOAD            R1 K7  ; "z is greater than 10"
 0022  CALL            R0 args=2 ret=2
 0023  JMP             +3
-0024  GETTABUP        R0 U0 F1  ; "print"
-0025  LOAD            R1 K5  ; "z is greater than or equal to 5 and less than or equal to 10"
+0024  GETTABUP        R0 U0 K2  ; "print"
+0025  LOAD            R1 K8  ; "z is greater than or equal to 5 and less than or equal to 10"
 0026  CALL            R0 args=2 ret=2
 0027  RETURN          R0 count=1

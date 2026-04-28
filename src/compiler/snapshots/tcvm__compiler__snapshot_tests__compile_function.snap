@@ -8,8 +8,7 @@ expression: output
 ;   K1 = 4
 ;   K2 = 1
 ;   K3 = 6
-; field constants:
-;   F0 = "print"
+;   K4 = "print"
 ; upvalues:
 ;   U0 = local R0
 ; code:
@@ -34,7 +33,7 @@ expression: output
 0018  MOVE            R8 R4
 0019  MOVE            R9 R6
 0020  CALL            R7 args=3 ret=2
-0021  GETTABUP        R8 U0 F0  ; "print"
+0021  GETTABUP        R8 U0 K4  ; "print"
 0022  MOVE            R9 R7
 0023  CALL            R8 args=2 ret=2
 0024  RETURN          R0 count=1
