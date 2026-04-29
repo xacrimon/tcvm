@@ -6,7 +6,7 @@ use crate::env::function::{
 use crate::env::string::LuaString;
 use crate::env::table::{Metamethod, Table};
 use crate::env::thread::{CallFrame, Thread, ThreadState, ThreadStatus};
-use crate::env::{Value, ValueKind};
+use crate::env::value::{Value, ValueKind, key_hash_to_u64};
 use crate::instruction::{Instruction, UpValueDescriptor};
 use crate::lua::Context;
 use crate::vm::num::{self, op_arith, op_bit};
@@ -367,7 +367,7 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (dst, idx, _key_hash, key) = args!(Instruction::GETTABUP {
+    let (dst, idx, key_hash, key) = args!(Instruction::GETTABUP {
         dst,
         idx,
         key_hash,
@@ -387,7 +387,7 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
     }
 
     let k = constant!(key);
-    let v = t.raw_get(k);
+    let v = t.raw_get_with_hash(k, key_hash_to_u64(key_hash));
     *reg!(mut dst) = v;
     dispatch!();
 }
@@ -415,7 +415,7 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (src, idx, _key_hash, key) = args!(Instruction::SETTABUP {
+    let (src, idx, key_hash, key) = args!(Instruction::SETTABUP {
         src,
         idx,
         key_hash,
@@ -436,7 +436,7 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
 
     let k = constant!(key);
     let v = reg!(src);
-    t.raw_set(k, v);
+    t.raw_set_with_hash(k, v, key_hash_to_u64(key_hash));
     dispatch!()
 }
 
@@ -549,7 +549,7 @@ extern "rust-preserve-none" fn op_getfield<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (dst, table, _key_hash, key_idx) = args!(Instruction::GETFIELD {
+    let (dst, table, key_hash, key_idx) = args!(Instruction::GETFIELD {
         dst,
         table,
         key_hash,
@@ -567,7 +567,7 @@ extern "rust-preserve-none" fn op_getfield<'gc>(
     }
 
     let k = constant!(key_idx);
-    let v = t.raw_get(k);
+    let v = t.raw_get_with_hash(k, key_hash_to_u64(key_hash));
     *reg!(mut dst) = v;
     dispatch!();
 }
@@ -595,7 +595,7 @@ extern "rust-preserve-none" fn op_setfield<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (src, table, _key_hash, key_idx) = args!(Instruction::SETFIELD {
+    let (src, table, key_hash, key_idx) = args!(Instruction::SETFIELD {
         src,
         table,
         key_hash,
@@ -614,7 +614,7 @@ extern "rust-preserve-none" fn op_setfield<'gc>(
 
     let k = constant!(key_idx);
     let v = reg!(src);
-    t.raw_set(k, v);
+    t.raw_set_with_hash(k, v, key_hash_to_u64(key_hash));
     dispatch!()
 }
 

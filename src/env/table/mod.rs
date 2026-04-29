@@ -1,8 +1,11 @@
+use std::hint;
+
 use crate::Context;
 use crate::dmm::{Collect, Gc, Mutation, RefLock, allocator_api::MetricsAlloc};
 use crate::env::string::LuaString;
-use crate::env::value::Value;
+use crate::env::value::{Value, value_hash};
 use bitflags::bitflags;
+use hashbrown::{HashTable, hash_table};
 
 #[derive(Clone, Copy, Collect)]
 #[collect(internal, no_drop)]
@@ -19,6 +22,20 @@ impl<'gc> Table<'gc> {
 
     pub fn raw_set(self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>) {
         self.0.borrow_mut(mc).raw_set(key, value);
+    }
+
+    pub fn raw_get_with_hash(self, key: Value<'gc>, hash: u64) -> Value<'gc> {
+        self.0.borrow().raw_get_with_hash(key, hash)
+    }
+
+    pub fn raw_set_with_hash(
+        self,
+        mc: &Mutation<'gc>,
+        key: Value<'gc>,
+        value: Value<'gc>,
+        hash: u64,
+    ) {
+        self.0.borrow_mut(mc).raw_set_with_hash(key, value, hash);
     }
 
     pub fn raw_len(self) -> usize {
@@ -54,7 +71,7 @@ impl<'gc> Table<'gc> {
 #[collect(internal, no_drop)]
 pub struct TableState<'gc> {
     array: Vec<Value<'gc>, MetricsAlloc<'gc>>,
-    hash: hashbrown::HashMap<Value<'gc>, Value<'gc>, foldhash::fast::FixedState, MetricsAlloc<'gc>>,
+    hash: HashTable<(Value<'gc>, Value<'gc>), MetricsAlloc<'gc>>,
     metatable: Option<Table<'gc>>,
     #[collect(require_static)]
     metamethods: Metamethod,
@@ -64,10 +81,7 @@ impl<'gc> TableState<'gc> {
     fn new(mc: &Mutation<'gc>) -> Self {
         Self {
             array: Vec::new_in(MetricsAlloc::new(mc)),
-            hash: hashbrown::HashMap::with_hasher_in(
-                foldhash::fast::FixedState::default(),
-                MetricsAlloc::new(mc),
-            ),
+            hash: HashTable::new_in(MetricsAlloc::new(mc)),
             metatable: None,
             metamethods: Metamethod::empty(),
         }
@@ -87,8 +101,14 @@ impl<'gc> TableState<'gc> {
             };
         }
 
-        match self.hash.get(&key) {
-            Some(value) => *value,
+        self.raw_get_with_hash(key, value_hash(key))
+    }
+
+    #[inline(always)]
+    pub fn raw_get_with_hash(&self, key: Value<'gc>, hash: u64) -> Value<'gc> {
+        debug_assert_eq!(hash, value_hash(key));
+        match self.hash.find(hash, |(k, _)| *k == key) {
+            Some((_, v)) => *v,
             None => Value::nil(),
         }
     }
@@ -101,12 +121,33 @@ impl<'gc> TableState<'gc> {
             }
 
             self.array[index - 1] = value;
+            return;
         }
 
-        if !key.is_nil() {
-            self.hash.insert(key, value);
-        } else {
-            self.hash.remove(&key);
+        if key.is_nil() {
+            todo!();
+        }
+
+        self.raw_set_with_hash(key, value, value_hash(key));
+    }
+
+    #[inline(always)]
+    pub fn raw_set_with_hash(&mut self, key: Value<'gc>, value: Value<'gc>, hash: u64) {
+        debug_assert_eq!(hash, value_hash(key));
+        match self
+            .hash
+            .entry(hash, |(k, _)| *k == key, |(k, _)| value_hash(*k))
+        {
+            hash_table::Entry::Occupied(mut e) => {
+                if value.is_nil() {
+                    e.remove();
+                } else {
+                    e.get_mut().1 = value;
+                }
+            }
+            hash_table::Entry::Vacant(e) => {
+                e.insert((key, value));
+            }
         }
     }
 

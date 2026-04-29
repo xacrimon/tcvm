@@ -7,7 +7,10 @@ use cstree::interning::TokenInterner;
 use super::defs::{Chunk, ExprDesc, ExprKind, JumpList, RegisterIndex};
 use super::{CompileError, CompileErrorKind, LineNumber};
 use crate::dmm::Gc;
-use crate::env::{LuaString, Prototype, Value, precomputed_key_hash};
+use crate::env::{
+    LuaString, Prototype,
+    value::{Value, precomputed_key_hash},
+};
 use crate::instruction::{Instruction, UpValueDescriptor};
 use crate::lua;
 use crate::parser::syntax::{
