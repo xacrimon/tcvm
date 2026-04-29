@@ -211,6 +211,23 @@ impl<'gc> Hash for Value<'gc> {
     }
 }
 
+/// Compute the 24-bit precomputed key hash that the field-access opcodes
+/// (GETFIELD/SETFIELD/GETTABUP/SETTABUP) carry inline.
+///
+/// hashbrown uses 7 bits as the H2 control byte and the rest as the H1
+/// bucket index — 24 bits leaves ~17 bits of bucket entropy, plenty for
+/// any reasonable Lua table.
+pub fn precomputed_key_hash(name: LuaString<'_>) -> [u8; 3] {
+    use std::hash::BuildHasher;
+    let v = Value::string(name);
+    let h = foldhash::fast::FixedState::default().hash_one(v);
+    [
+        (h & 0xff) as u8,
+        ((h >> 8) & 0xff) as u8,
+        ((h >> 16) & 0xff) as u8,
+    ]
+}
+
 unsafe impl<'gc> Collect<'gc> for Value<'gc> {
     #[inline]
     fn trace<T: Trace<'gc>>(&self, cc: &mut T) {

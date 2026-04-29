@@ -7,7 +7,7 @@ use cstree::interning::TokenInterner;
 use super::defs::{Chunk, ExprDesc, ExprKind, JumpList, RegisterIndex};
 use super::{CompileError, CompileErrorKind, LineNumber};
 use crate::dmm::Gc;
-use crate::env::{LuaString, Prototype, Value};
+use crate::env::{LuaString, Prototype, Value, precomputed_key_hash};
 use crate::instruction::{Instruction, UpValueDescriptor};
 use crate::lua;
 use crate::parser::syntax::{
@@ -851,6 +851,16 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         self.alloc_constant(Value::string(lua_str))
     }
 
+    /// Allocate a string constant for use as a field/global key, and
+    /// alongside compute the 24-bit precomputed key hash that
+    /// GETFIELD/SETFIELD/GETTABUP/SETTABUP carry inline.
+    fn alloc_field_key(&mut self, s: &[u8]) -> Result<(u16, [u8; 3]), CompileError> {
+        let lua_str = LuaString::new(self.ctx, s);
+        let idx = self.alloc_constant(Value::string(lua_str))?;
+        let hash = precomputed_key_hash(lua_str);
+        Ok((idx, hash))
+    }
+
     /// Resolve `name` into an index in THIS function's upvalue list,
     /// capturing on first reference (via the parent's
     /// `resolve_for_child`). Returns `None` if the name isn't reachable
@@ -1348,7 +1358,7 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         //   SETTABUP closure, _ENV, name
         // Mirrors upstream `globalfunc` (`lparser.c:1956-1968`), which
         // emits the same guard via `checkglobal` + `luaK_storevar`.
-        let key = ctx.alloc_string_constant(name.as_bytes())?;
+        let (key, key_hash) = ctx.alloc_field_key(name.as_bytes())?;
         let env_idx = ctx
             .resolve_or_capture("_ENV")
             .ok_or_else(|| ice("_ENV must resolve; main chunk pre-seeds it"))?;
@@ -1356,6 +1366,7 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         ctx.emit(Instruction::GETTABUP {
             dst: guard_reg.0,
             idx: env_idx,
+            key_hash,
             key,
         });
         ctx.emit(Instruction::ERRNNIL {
@@ -1365,6 +1376,7 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         ctx.emit(Instruction::SETTABUP {
             src: func_reg.0,
             idx: env_idx,
+            key_hash,
             key,
         });
         ctx.free_reg(guard_reg);
@@ -1459,12 +1471,13 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         .resolve_or_capture("_ENV")
         .ok_or_else(|| ice("_ENV must resolve; main chunk pre-seeds it"))?;
     for (i, (name, _kind)) in decl_kinds.iter().enumerate() {
-        let key = ctx.alloc_string_constant(name.as_bytes())?;
+        let (key, key_hash) = ctx.alloc_field_key(name.as_bytes())?;
         let value_reg = value_base + i as u8;
         let guard_reg = ctx.alloc_register()?;
         ctx.emit(Instruction::GETTABUP {
             dst: guard_reg.0,
             idx: env_idx,
+            key_hash,
             key,
         });
         ctx.emit(Instruction::ERRNNIL {
@@ -1474,6 +1487,7 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         ctx.emit(Instruction::SETTABUP {
             src: value_reg,
             idx: env_idx,
+            key_hash,
             key,
         });
         ctx.free_reg(guard_reg);
@@ -1501,6 +1515,7 @@ enum Lvalue {
     Global {
         env_idx: u8,
         key: u16,
+        key_hash: [u8; 3],
     },
     Indexed {
         table: RegisterIndex,
@@ -1509,6 +1524,7 @@ enum Lvalue {
     Field {
         table: RegisterIndex,
         key_idx: u16,
+        key_hash: [u8; 3],
     },
 }
 
@@ -1681,11 +1697,15 @@ fn compile_lvalue(
                     ));
                 }
                 drop(env);
-                let key = ctx.alloc_string_constant(name.as_bytes())?;
+                let (key, key_hash) = ctx.alloc_field_key(name.as_bytes())?;
                 let env_idx = ctx
                     .resolve_or_capture("_ENV")
                     .ok_or_else(|| ice("_ENV must resolve; main chunk pre-seeds it"))?;
-                Ok(Lvalue::Global { env_idx, key })
+                Ok(Lvalue::Global {
+                    env_idx,
+                    key,
+                    key_hash,
+                })
             }
         }
         Expr::Index(index) => {
@@ -1699,8 +1719,12 @@ fn compile_lvalue(
             let t = binop.lhs().ok_or_else(|| ice("binop without lhs"))?;
             let f = binop.rhs().ok_or_else(|| ice("binop without rhs"))?;
             let table = compile_indexed_subexpr(ctx, t, target_local_regs)?;
-            if let Some(key_idx) = try_property_key_constant(ctx, &f)? {
-                return Ok(Lvalue::Field { table, key_idx });
+            if let Some((key_idx, key_hash)) = try_property_key_constant(ctx, &f)? {
+                return Ok(Lvalue::Field {
+                    table,
+                    key_idx,
+                    key_hash,
+                });
             }
             // Fallback: non-ident RHS still goes through LOAD K + SETTABLE.
             let key = compile_property_key(ctx, f, None)?;
@@ -1829,9 +1853,14 @@ fn emit_store(ctx: &mut Ctx, lv: Lvalue, src: u8) {
         Lvalue::Local { dst } if dst.0 != src => ctx.emit(Instruction::MOVE { dst: dst.0, src }),
         Lvalue::Local { .. } => {} // self-MOVE; skip
         Lvalue::Upvalue { idx } => ctx.emit(Instruction::SETUPVAL { src, idx }),
-        Lvalue::Global { env_idx, key } => ctx.emit(Instruction::SETTABUP {
+        Lvalue::Global {
+            env_idx,
+            key,
+            key_hash,
+        } => ctx.emit(Instruction::SETTABUP {
             src,
             idx: env_idx,
+            key_hash,
             key,
         }),
         Lvalue::Indexed { table, key } => ctx.emit(Instruction::SETTABLE {
@@ -1839,9 +1868,14 @@ fn emit_store(ctx: &mut Ctx, lv: Lvalue, src: u8) {
             table: table.0,
             key: key.0,
         }),
-        Lvalue::Field { table, key_idx } => ctx.emit(Instruction::SETFIELD {
+        Lvalue::Field {
+            table,
+            key_idx,
+            key_hash,
+        } => ctx.emit(Instruction::SETFIELD {
             src,
             table: table.0,
+            key_hash,
             key_idx,
         }),
     }
@@ -2018,7 +2052,7 @@ fn compile_expr_ident(
     }
     drop(globals);
 
-    let key = ctx.alloc_string_constant(name.as_bytes())?;
+    let (key, key_hash) = ctx.alloc_field_key(name.as_bytes())?;
     let dst = ctx.dst_or_alloc(dst)?;
     let env_idx = ctx
         .resolve_or_capture("_ENV")
@@ -2026,6 +2060,7 @@ fn compile_expr_ident(
     ctx.emit(Instruction::GETTABUP {
         dst: dst.0,
         idx: env_idx,
+        key_hash,
         key,
     });
     Ok(dst)
@@ -2096,7 +2131,10 @@ fn compile_property_key(
     }
 }
 
-fn try_property_key_constant(ctx: &mut Ctx, field: &Expr) -> Result<Option<u16>, CompileError> {
+fn try_property_key_constant(
+    ctx: &mut Ctx,
+    field: &Expr,
+) -> Result<Option<(u16, [u8; 3])>, CompileError> {
     let bytes: Vec<u8> = match field {
         Expr::Ident(ident) => ident
             .name(ctx.interner)
@@ -2105,7 +2143,7 @@ fn try_property_key_constant(ctx: &mut Ctx, field: &Expr) -> Result<Option<u16>,
             .to_vec(),
         _ => return Ok(None),
     };
-    Ok(Some(ctx.alloc_string_constant(&bytes)?))
+    Ok(Some(ctx.alloc_field_key(&bytes)?))
 }
 
 fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, CompileError> {
@@ -2169,7 +2207,7 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
 
                 let field = map.field().ok_or_else(|| ice("table map without field"))?;
                 let field_expr = Expr::Ident(field);
-                let key_idx = try_property_key_constant(ctx, &field_expr)?
+                let (key_idx, key_hash) = try_property_key_constant(ctx, &field_expr)?
                     .ok_or_else(|| ice("table map field without name"))?;
 
                 let value_expr = map.value().ok_or_else(|| ice("table map without value"))?;
@@ -2178,6 +2216,7 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
                 ctx.emit(Instruction::SETFIELD {
                     src: val.0,
                     table: dst.0,
+                    key_hash,
                     key_idx,
                 });
                 ctx.free_reg(val);
@@ -2350,12 +2389,13 @@ fn compile_expr_binary_op_to_reg(
         let lhs = item.lhs().ok_or_else(|| ice("binop without lhs"))?;
         let rhs = item.rhs().ok_or_else(|| ice("binop without rhs"))?;
         let table = compile_expr_to_reg(ctx, lhs, None)?;
-        if let Some(key_idx) = try_property_key_constant(ctx, &rhs)? {
+        if let Some((key_idx, key_hash)) = try_property_key_constant(ctx, &rhs)? {
             ctx.free_reg(table);
             let dst = ctx.dst_or_alloc(dst)?;
             ctx.emit(Instruction::GETFIELD {
                 dst: dst.0,
                 table: table.0,
+                key_hash,
                 key_idx,
             });
             return Ok(dst);

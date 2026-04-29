@@ -10,4 +10,4 @@ pub use string::LuaString;
 pub use table::Table;
 pub use thread::Thread;
 pub use userdata::Userdata;
-pub use value::{Value, ValueKind};
+pub use value::{Value, ValueKind, precomputed_key_hash};

@@ -367,7 +367,12 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (dst, idx, key) = args!(Instruction::GETTABUP { dst, idx, key });
+    let (dst, idx, _key_hash, key) = args!(Instruction::GETTABUP {
+        dst,
+        idx,
+        key_hash,
+        key
+    });
     let uv = upvalue!(idx);
     let t = read_upvalue(thread, uv);
 
@@ -410,7 +415,12 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (src, idx, key) = args!(Instruction::SETTABUP { src, idx, key });
+    let (src, idx, _key_hash, key) = args!(Instruction::SETTABUP {
+        src,
+        idx,
+        key_hash,
+        key
+    });
     let uv = upvalue!(idx);
     let t = read_upvalue(thread, uv);
 
@@ -539,9 +549,10 @@ extern "rust-preserve-none" fn op_getfield<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (dst, table, key_idx) = args!(Instruction::GETFIELD {
+    let (dst, table, _key_hash, key_idx) = args!(Instruction::GETFIELD {
         dst,
         table,
+        key_hash,
         key_idx
     });
 
@@ -584,9 +595,10 @@ extern "rust-preserve-none" fn op_setfield<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (src, table, key_idx) = args!(Instruction::SETFIELD {
+    let (src, table, _key_hash, key_idx) = args!(Instruction::SETFIELD {
         src,
         table,
+        key_hash,
         key_idx
     });
 

@@ -88,13 +88,23 @@ fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -> String {
         Instruction::LFALSESKIP { src } => format!("LFALSESKIP      R{src}"),
         Instruction::GETUPVAL { dst, idx } => format!("GETUPVAL        R{dst} U{idx}"),
         Instruction::SETUPVAL { src, idx } => format!("SETUPVAL        R{src} U{idx}"),
-        Instruction::GETTABUP { dst, idx, key } => {
+        Instruction::GETTABUP {
+            dst,
+            idx,
+            key_hash: _,
+            key,
+        } => {
             format!(
                 "GETTABUP        R{dst} U{idx} K{key}{}",
                 const_comment(constants, key)
             )
         }
-        Instruction::SETTABUP { src, idx, key } => {
+        Instruction::SETTABUP {
+            src,
+            idx,
+            key_hash: _,
+            key,
+        } => {
             format!(
                 "SETTABUP        R{src} U{idx} K{key}{}",
                 const_comment(constants, key)
@@ -109,6 +119,7 @@ fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -> String {
         Instruction::GETFIELD {
             dst,
             table,
+            key_hash: _,
             key_idx,
         } => {
             format!(
@@ -119,6 +130,7 @@ fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -> String {
         Instruction::SETFIELD {
             src,
             table,
+            key_hash: _,
             key_idx,
         } => {
             format!(
