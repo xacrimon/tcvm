@@ -242,7 +242,7 @@ pub(crate) fn run_thread<'gc>(ctx: Context<'gc>, thread: Thread<'gc>) -> Result<
     };
     let registers = unsafe { ts.stack.as_mut_ptr().add(base) };
     let handlers = HANDLERS.as_ptr() as *const ();
-    op_nop(Instruction::NOP, ctx, &mut *ts, registers, ip, handlers)
+    op_nop(Instruction::NOP, ctx, &mut ts, registers, ip, handlers)
 }
 
 // ---------------------------------------------------------------------------
