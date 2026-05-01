@@ -290,7 +290,6 @@ impl Literal {
             T![hex_float] => LiteralValue::Float(lit::parse_hex_float(s)?),
             T![string] => LiteralValue::String(lit::parse_string(s)),
             T![long_string] => LiteralValue::String(lit::parse_long_string(s)),
-            T![ident] => LiteralValue::String(s.as_bytes().to_vec()),
             _ => unreachable!(),
         })
     }
@@ -338,6 +337,7 @@ impl PrefixOp {
     }
 }
 
+#[derive(Clone, Copy)]
 pub enum PrefixOperator {
     None,
     Neg,
@@ -381,7 +381,7 @@ impl BinaryOp {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOperator {
     And,
     Or,

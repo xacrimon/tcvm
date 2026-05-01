@@ -4,16 +4,21 @@ use std::rc::Rc;
 
 use cstree::interning::TokenInterner;
 
-use super::defs::{Chunk, ExprDesc, ExprKind, JumpList, RegisterIndex};
+use super::defs::{Chunk, ExprDesc, ExprKind, JumpList, Numeral, RegisterIndex};
 use super::{CompileError, CompileErrorKind, LineNumber};
-use crate::dmm::{Gc, Mutation};
-use crate::env::{LuaString, Prototype, Value};
+use crate::dmm::Gc;
+use crate::env::{
+    LuaString, Prototype,
+    value::{Value, precomputed_key_hash},
+};
 use crate::instruction::{Instruction, UpValueDescriptor};
+use crate::lua;
 use crate::parser::syntax::{
     Assign, BinaryOp, BinaryOperator, Break, Decl, DeclModifier, Do, Expr, ForGen, ForNum, Func,
     FuncCall, FuncExpr, Global, Goto, Ident, If, Index, Label, Literal, LiteralValue, MethodCall,
     PrefixOp, PrefixOperator, Repeat, Return, Root, Stmt, Table, TableEntry, While,
 };
+use crate::vm::num;
 use std::mem;
 
 /// Sentinel value used as the `dst` field of a `TESTSET` while the real
@@ -44,6 +49,112 @@ fn err(kind: CompileErrorKind, line: LineNumber) -> CompileError {
     }
 }
 
+/// Convert a constant `ExprKind` to the runtime `Value` that should be
+/// stored in the constant table when discharging. Returns `None` for
+/// `Reg`/`Jump` kinds, which don't carry a constant value.
+fn const_kind_to_value<'gc>(kind: ExprKind) -> Option<Value<'gc>> {
+    match kind {
+        ExprKind::Numeral(Numeral::Int(n)) => Some(Value::integer(n)),
+        ExprKind::Numeral(Numeral::Float(f)) => Some(Value::float(f)),
+        ExprKind::Bool(b) => Some(Value::boolean(b)),
+        ExprKind::Nil => Some(Value::nil()),
+        ExprKind::Reg(_) | ExprKind::Jump(_) => None,
+    }
+}
+
+fn numeral_to_value<'gc>(n: Numeral) -> Value<'gc> {
+    match n {
+        Numeral::Int(i) => Value::integer(i),
+        Numeral::Float(f) => Value::float(f),
+    }
+}
+
+fn value_to_numeral(v: Value<'_>) -> Option<Numeral> {
+    if let Some(i) = v.get_integer() {
+        Some(Numeral::Int(i))
+    } else {
+        v.get_float().map(Numeral::Float)
+    }
+}
+
+fn numeral_is_int_convertible(n: Numeral) -> bool {
+    match n {
+        Numeral::Int(_) => true,
+        Numeral::Float(f) => num::exact_float_to_int(f).is_some(),
+    }
+}
+
+fn numeral_is_zero(n: Numeral) -> bool {
+    match n {
+        Numeral::Int(n) => n == 0,
+        Numeral::Float(f) => f == 0.0,
+    }
+}
+
+/// Compile-time fold of a binary arithmetic / bitwise op on two numeric
+/// constants. Returns `None` if folding would either disagree with runtime
+/// semantics (div by zero, non-integer-convertible bitwise operand) or
+/// silently lose information (`-0.0` collapse, NaN-result float). Reuses
+/// the runtime helpers in `vm/num.rs` so folded results match runtime
+/// bit-for-bit.
+fn try_fold_binop(op: BinaryOperator, lhs: Numeral, rhs: Numeral) -> Option<Numeral> {
+    use crate::vm::num::{
+        Add, BAnd, BOr, BXor, Div, IDiv, Mod, Mul, Pow, Shl, Shr, Sub, op_arith, op_bit,
+    };
+
+    // validop: bitwise operands must convert to integer.
+    let is_bitwise = matches!(
+        op,
+        BinaryOperator::BitAnd
+            | BinaryOperator::BitOr
+            | BinaryOperator::BitXor
+            | BinaryOperator::LShift
+            | BinaryOperator::RShift
+    );
+    if is_bitwise && (!numeral_is_int_convertible(lhs) || !numeral_is_int_convertible(rhs)) {
+        return None;
+    }
+
+    // validop: division by zero.
+    if matches!(
+        op,
+        BinaryOperator::Div | BinaryOperator::IntDiv | BinaryOperator::Mod
+    ) && numeral_is_zero(rhs)
+    {
+        return None;
+    }
+
+    let lv = numeral_to_value(lhs);
+    let rv = numeral_to_value(rhs);
+
+    let result: Value<'_> = match op {
+        BinaryOperator::Add => op_arith::<Add>(lv, rv),
+        BinaryOperator::Sub => op_arith::<Sub>(lv, rv),
+        BinaryOperator::Mul => op_arith::<Mul>(lv, rv),
+        BinaryOperator::Div => op_arith::<Div>(lv, rv),
+        BinaryOperator::IntDiv => op_arith::<IDiv>(lv, rv),
+        BinaryOperator::Mod => op_arith::<Mod>(lv, rv),
+        BinaryOperator::Exp => op_arith::<Pow>(lv, rv),
+        BinaryOperator::BitAnd => op_bit::<BAnd>(lv, rv),
+        BinaryOperator::BitOr => op_bit::<BOr>(lv, rv),
+        BinaryOperator::BitXor => op_bit::<BXor>(lv, rv),
+        BinaryOperator::LShift => op_bit::<Shl>(lv, rv),
+        BinaryOperator::RShift => op_bit::<Shr>(lv, rv),
+        _ => return None,
+    }?;
+
+    // Avoid folding a float result whose bit pattern depends on operand
+    // signs (`-0.0` vs `0.0`) or whose value is NaN — Lua's `constfolding`
+    // bails on these to keep later sign-aware ops well-defined.
+    if let Some(f) = result.get_float()
+        && (f.is_nan() || f == 0.0)
+    {
+        return None;
+    }
+
+    value_to_numeral(result)
+}
+
 // ---------------------------------------------------------------------------
 // Variable tracking
 // ---------------------------------------------------------------------------
@@ -51,20 +162,53 @@ fn err(kind: CompileErrorKind, line: LineNumber) -> CompileError {
 /// Local variable kind, mirroring Lua 5.5's `RDK*` enum (`lparser.h`).
 /// Globals (`GDKREG` / `GDKCONST`) are tracked separately on `Ctx::globals`
 /// since they don't occupy a register slot.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 enum VarKind {
     /// Regular mutable local (RDKREG).
     Reg,
     /// Local declared with `<const>`, plus for-loop control variables
-    /// (RDKCONST / LOOPVARKIND in upstream).
-    Const,
+    /// (RDKCONST / LOOPVARKIND in upstream). `Some(v)` carries the
+    /// compile-time value when the initializer folded to a const expdesc;
+    /// `None` for `<const>` whose RHS isn't compile-time foldable
+    /// (e.g. `local k <const> = f()`) — the binding still rejects
+    /// assignment but doesn't inline at reference sites.
+    Const(Option<ConstVal>),
     /// Local declared with `<close>` — a to-be-closed variable (RDKTOCLOSE).
     ToClose,
 }
 
 impl VarKind {
     fn is_const(self) -> bool {
-        matches!(self, VarKind::Const)
+        matches!(self, VarKind::Const(_))
+    }
+}
+
+/// Compile-time value bound to a `<const>` local. Mirrors the const-kind
+/// `ExprKind` variants so that ident resolution can return a fresh
+/// const-kind `ExprDesc` for inlining.
+#[derive(Clone, Copy, Debug)]
+enum ConstVal {
+    Numeral(Numeral),
+    Bool(bool),
+    Nil,
+}
+
+impl ConstVal {
+    fn from_expr_kind(k: ExprKind) -> Option<Self> {
+        match k {
+            ExprKind::Numeral(n) => Some(ConstVal::Numeral(n)),
+            ExprKind::Bool(b) => Some(ConstVal::Bool(b)),
+            ExprKind::Nil => Some(ConstVal::Nil),
+            _ => None,
+        }
+    }
+
+    fn to_expr_desc(self) -> ExprDesc {
+        match self {
+            ConstVal::Numeral(n) => ExprDesc::from_numeral(n),
+            ConstVal::Bool(b) => ExprDesc::from_bool(b),
+            ConstVal::Nil => ExprDesc::from_nil(),
+        }
     }
 }
 
@@ -134,16 +278,34 @@ struct ScopeMark {
 // ---------------------------------------------------------------------------
 
 /// Implemented by a function's compilation context so a nested function
-/// can ask what `UpValueDescriptor` it should use to reference a free
-/// variable from this scope. The parent captures from its own parent
-/// on demand as the lookup cascades upward.
+/// can ask how it should reference a free variable bound in this scope.
+/// The parent captures from its own parent on demand as the lookup
+/// cascades upward.
 trait UpvalueResolver {
-    fn resolve_for_child(&mut self, name: &str) -> Option<UpValueDescriptor>;
+    fn resolve_for_child(&mut self, name: &str) -> Option<ChildResolution>;
+}
+
+/// Result of resolving a name from a child function's perspective. A
+/// `Const` short-circuits the upvalue chain entirely — the value is
+/// inlined at the child's reference site without registering an upvalue
+/// at any intermediate level. An `Upvalue` carries the `UpValueDescriptor`
+/// the child should add to its own upvalue list.
+enum ChildResolution {
+    Const(ConstVal),
+    Upvalue(UpValueDescriptor),
+}
+
+/// Result of resolving a name in the current function. `Const` is the
+/// inlined-const case; `Upvalue` is an index into this function's own
+/// upvalue list (registered if necessary).
+enum ResolvedName {
+    Const(ConstVal),
+    Upvalue(u8),
 }
 
 struct Ctx<'gc, 'a> {
     interner: &'a TokenInterner,
-    mc: &'a Mutation<'gc>,
+    ctx: lua::Context<'gc>,
     chunk: Chunk<'gc>,
 
     /// Stack of break-target labels for nested loops.
@@ -579,7 +741,20 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     /// "Go if true": arrange for control to fall through when `expr` is
     /// truthy and to jump otherwise. Produces a jump that fires on falsy,
     /// stored in `false_list`. Mirrors Lua 5.5's `luaK_goiftrue`.
-    fn goiftrue(&mut self, expr: &mut ExprDesc) {
+    fn goiftrue(&mut self, expr: &mut ExprDesc) -> Result<(), CompileError> {
+        // Truthy compile-time const: control always falls through, no
+        // jump emitted. Mirrors Lua's `goiftrue` on `VKINT`/`VKFLT`/`VTRUE`.
+        if matches!(expr.kind, ExprKind::Numeral(_) | ExprKind::Bool(true)) {
+            return Ok(());
+        }
+        // Falsy compile-time const: same path as a register operand —
+        // discharge so the existing `TEST + JMP` machinery (and the
+        // `JumpList` invariant that lists only contain TEST/TESTSET/CMP-
+        // predecessor jumps) is preserved. Lua does the equivalent via
+        // `jumponcond` on `VFALSE`/`VNIL`.
+        if matches!(expr.kind, ExprKind::Bool(false) | ExprKind::Nil) {
+            self.discharge_to_reg_mut(expr, None)?;
+        }
         match expr.kind {
             ExprKind::Jump(_) => {
                 if let Some(idx) = expr.take_pending() {
@@ -600,13 +775,27 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                 let jmp = self.emit_test_jump(reg, false);
                 expr.false_list.jumps.push(jmp);
             }
+            ExprKind::Numeral(_) | ExprKind::Bool(_) | ExprKind::Nil => {
+                unreachable!("truthy consts returned above; falsy consts discharged")
+            }
         }
+        Ok(())
     }
 
     /// "Go if false": arrange for control to fall through when `expr` is
     /// falsy and to jump otherwise. Produces a jump that fires on truthy,
     /// stored in `true_list`. Mirrors Lua 5.5's `luaK_goiffalse`.
-    fn goiffalse(&mut self, expr: &mut ExprDesc) {
+    fn goiffalse(&mut self, expr: &mut ExprDesc) -> Result<(), CompileError> {
+        // Falsy compile-time const: control always falls through, no
+        // jump emitted.
+        if matches!(expr.kind, ExprKind::Bool(false) | ExprKind::Nil) {
+            return Ok(());
+        }
+        // Truthy compile-time const: same path as a register operand —
+        // discharge so the existing `TEST + JMP` machinery is preserved.
+        if matches!(expr.kind, ExprKind::Numeral(_) | ExprKind::Bool(true)) {
+            self.discharge_to_reg_mut(expr, None)?;
+        }
         match expr.kind {
             ExprKind::Jump(_) => {
                 if let Some(idx) = expr.take_pending() {
@@ -624,7 +813,11 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                 let jmp = self.emit_test_jump(reg, true);
                 expr.true_list.jumps.push(jmp);
             }
+            ExprKind::Numeral(_) | ExprKind::Bool(_) | ExprKind::Nil => {
+                unreachable!("falsy consts returned above; truthy consts discharged")
+            }
         }
+        Ok(())
     }
 
     /// Discharge an expression to a concrete register, resolving any pending
@@ -661,6 +854,27 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             && !expr.has_jumps()
         {
             return Ok(reg);
+        }
+
+        // Compile-time constants: allocate the constant slot and emit
+        // LOAD here, lazily. Without pending jumps this is the whole
+        // discharge — return immediately. With pending jumps (e.g. the
+        // RHS of `tonumber(x) or 1000` is a literal that arrived here
+        // carrying the `or`'s TESTSET-controlled true_list), the LOAD
+        // becomes the falsy fall-through value: the TESTSET fires on
+        // truthy and patches the operand into `dst`, otherwise control
+        // falls through past the JMP and our LOAD writes the const.
+        // The boolean fixup tail (LFALSESKIP / LOAD-true) is normally
+        // skipped on this path because TESTSET-controlled jumps satisfy
+        // `need_value` without it.
+        if let Some(value) = const_kind_to_value(expr.kind) {
+            let idx = self.alloc_constant(value)?;
+            let dst = self.dst_or_alloc(hint)?;
+            self.emit(Instruction::LOAD { dst: dst.0, idx });
+            expr.kind = ExprKind::Reg(dst);
+            if !expr.has_jumps() {
+                return Ok(dst);
+            }
         }
 
         let is_jump = matches!(expr.kind, ExprKind::Jump(_));
@@ -704,6 +918,9 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                 }
             }
             ExprKind::Jump(_) => self.dst_or_alloc(hint)?,
+            ExprKind::Numeral(_) | ExprKind::Bool(_) | ExprKind::Nil => {
+                unreachable!("const kinds materialized to Reg above")
+            }
         };
 
         if is_jump {
@@ -733,7 +950,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                 let ft = self.next_offset();
                 self.emit(Instruction::LFALSESKIP { src: dst.0 });
                 let tt = self.next_offset();
-                let true_idx = self.alloc_constant(Value::Boolean(true))?;
+                let true_idx = self.alloc_constant(Value::boolean(true))?;
                 self.emit(Instruction::LOAD {
                     dst: dst.0,
                     idx: true_idx,
@@ -811,13 +1028,26 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
 
     fn alloc_constant(&mut self, value: Value<'gc>) -> Result<u16, CompileError> {
         // Check for an existing identical constant (exact type match, no int/float coercion).
-        let existing = self.chunk.constants.iter().position(|c| match (c, &value) {
-            (Value::Nil, Value::Nil) => true,
-            (Value::Boolean(a), Value::Boolean(b)) => a == b,
-            (Value::Integer(a), Value::Integer(b)) => a == b,
-            (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
-            (Value::String(a), Value::String(b)) => a == b,
-            _ => false,
+        let existing = self.chunk.constants.iter().position(|c| {
+            if c.kind() != value.kind() {
+                return false;
+            }
+            if c.is_nil() {
+                return true;
+            }
+            if let (Some(a), Some(b)) = (c.get_boolean(), value.get_boolean()) {
+                return a == b;
+            }
+            if let (Some(a), Some(b)) = (c.get_integer(), value.get_integer()) {
+                return a == b;
+            }
+            if let (Some(a), Some(b)) = (c.get_float(), value.get_float()) {
+                return a.to_bits() == b.to_bits();
+            }
+            if let (Some(a), Some(b)) = (c.get_string(), value.get_string()) {
+                return a == b;
+            }
+            false
         });
 
         if let Some(idx) = existing {
@@ -833,57 +1063,96 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     }
 
     fn alloc_string_constant(&mut self, s: &[u8]) -> Result<u16, CompileError> {
-        let lua_str = LuaString::new(self.mc, s);
-        self.alloc_constant(Value::String(lua_str))
+        let lua_str = LuaString::new(self.ctx, s);
+        self.alloc_constant(Value::string(lua_str))
     }
 
-    /// Resolve `name` into an index in THIS function's upvalue list,
-    /// capturing on first reference (via the parent's
-    /// `resolve_for_child`). Returns `None` if the name isn't reachable
-    /// through any enclosing scope.
-    fn resolve_or_capture(&mut self, name: &str) -> Option<u8> {
+    /// Allocate a string constant for use as a field/global key, and
+    /// alongside compute the 24-bit precomputed key hash that
+    /// GETFIELD/SETFIELD/GETTABUP/SETTABUP carry inline.
+    fn alloc_field_key(&mut self, s: &[u8]) -> Result<(u16, [u8; 3]), CompileError> {
+        let lua_str = LuaString::new(self.ctx, s);
+        let idx = self.alloc_constant(Value::string(lua_str))?;
+        let hash = precomputed_key_hash(lua_str);
+        Ok((idx, hash))
+    }
+
+    /// Convenience for `_ENV` resolution. `_ENV` is always a captured
+    /// upvalue (or root local in the main chunk) — it can never be a
+    /// `<const>` local with a compile-time value, so the `Const` arm of
+    /// `resolve_or_capture` is unreachable here.
+    fn resolve_env_upvalue(&mut self) -> Option<u8> {
+        match self.resolve_or_capture("_ENV")? {
+            ResolvedName::Upvalue(idx) => Some(idx),
+            ResolvedName::Const(_) => unreachable!("_ENV is never a const"),
+        }
+    }
+
+    /// Resolve `name` from an enclosing scope into either an inlined
+    /// const value (for `<const>`-attributed locals with a known
+    /// compile-time value) or an upvalue index in THIS function's
+    /// upvalue list (capturing on first reference). Returns `None` if
+    /// the name isn't reachable through any enclosing scope.
+    fn resolve_or_capture(&mut self, name: &str) -> Option<ResolvedName> {
         if let Some(i) = self.upvalues.iter().position(|(n, _)| n == name) {
-            return Some(i as u8);
+            return Some(ResolvedName::Upvalue(i as u8));
         }
         let parent = self.capture.as_deref_mut()?;
-        let desc = parent.resolve_for_child(name)?;
-        let i = self.upvalues.len() as u8;
-        self.upvalues.push((name.to_owned(), desc));
-        Some(i)
-    }
-
-    /// Resolve a variable name as an upvalue from enclosing scopes.
-    /// Returns the index in this function's upvalue list, capturing on
-    /// first reference.
-    fn resolve_upvalue(&mut self, name: &str) -> Option<u8> {
-        self.resolve_or_capture(name)
+        match parent.resolve_for_child(name)? {
+            ChildResolution::Const(v) => Some(ResolvedName::Const(v)),
+            ChildResolution::Upvalue(desc) => {
+                let i = self.upvalues.len() as u8;
+                self.upvalues.push((name.to_owned(), desc));
+                Some(ResolvedName::Upvalue(i))
+            }
+        }
     }
 }
 
 impl<'gc, 'a> UpvalueResolver for Ctx<'gc, 'a> {
     /// Given a free-variable reference from a direct child of this
-    /// function, return the `UpValueDescriptor` the child should put in
-    /// its own upvalue list. `ParentLocal(reg)` when `name` is a local
-    /// here; `ParentUpvalue(i)` when it sits in this function's upvalue
-    /// list (captured now if necessary).
-    fn resolve_for_child(&mut self, name: &str) -> Option<UpValueDescriptor> {
-        // 1. Own local? The child references our register directly — no
-        //    entry is added to our own upvalues.
-        if let Some(reg) = self.resolve_local(name).map(|d| d.register.0) {
-            return Some(UpValueDescriptor::ParentLocal(reg));
+    /// function, return either the `UpValueDescriptor` the child should
+    /// register or a `ConstVal` for the child to inline directly without
+    /// any upvalue allocated at any level. The `Const` short-circuit is
+    /// what eliminates the upvalue chain when a `<const>` from an outer
+    /// scope is referenced — matching Lua 5.5's parser, which folds the
+    /// const value into the child's expdesc when it walks up to find the
+    /// name.
+    fn resolve_for_child(&mut self, name: &str) -> Option<ChildResolution> {
+        // 1. Own local? `<const>` with a compile-time value flows back to
+        //    the child as `Const` — no upvalue is allocated here. Plain
+        //    locals (and `<const>` whose initializer didn't fold) flow
+        //    back as a `ParentLocal` descriptor.
+        if let Some(data) = self.resolve_local(name) {
+            if let VarKind::Const(Some(v)) = data.kind {
+                return Some(ChildResolution::Const(v));
+            }
+            return Some(ChildResolution::Upvalue(UpValueDescriptor::ParentLocal(
+                data.register.0,
+            )));
         }
         // 2. Already captured in our upvalue list?
         if let Some(i) = self.upvalues.iter().position(|(n, _)| n == name) {
-            return Some(UpValueDescriptor::ParentUpvalue(i as u8));
+            return Some(ChildResolution::Upvalue(UpValueDescriptor::ParentUpvalue(
+                i as u8,
+            )));
         }
-        // 3. Cascade to our own parent; if it resolves, we capture the
-        //    returned descriptor into our upvalue list and the child
-        //    references that new slot.
+        // 3. Cascade. If a deeper ancestor resolves to a `Const`, we
+        //    pass it through unchanged — no upvalue is allocated at this
+        //    level either. If it's an `Upvalue`, we capture the returned
+        //    descriptor into our own upvalue list and the child references
+        //    that new slot.
         let parent = self.capture.as_deref_mut()?;
-        let desc = parent.resolve_for_child(name)?;
-        let i = self.upvalues.len() as u8;
-        self.upvalues.push((name.to_owned(), desc));
-        Some(UpValueDescriptor::ParentUpvalue(i))
+        match parent.resolve_for_child(name)? {
+            ChildResolution::Const(v) => Some(ChildResolution::Const(v)),
+            ChildResolution::Upvalue(desc) => {
+                let i = self.upvalues.len() as u8;
+                self.upvalues.push((name.to_owned(), desc));
+                Some(ChildResolution::Upvalue(UpValueDescriptor::ParentUpvalue(
+                    i,
+                )))
+            }
+        }
     }
 }
 
@@ -930,7 +1199,7 @@ where
 // ---------------------------------------------------------------------------
 
 pub fn compile<'gc>(
-    mc: &Mutation<'gc>,
+    ctx: lua::Context<'gc>,
     root: &Root,
     interner: &TokenInterner,
 ) -> Result<Gc<'gc, Prototype<'gc>>, CompileError> {
@@ -939,7 +1208,7 @@ pub fn compile<'gc>(
     // to every other function in the same chunk.
     let globals = Rc::new(RefCell::new(GlobalEnv::new()));
     let chunk = compile_function_to_chunk(
-        mc,
+        ctx,
         interner,
         None, // main chunk has no enclosing function
         root.block(),
@@ -955,13 +1224,13 @@ pub fn compile<'gc>(
         vec![("_ENV".to_owned(), UpValueDescriptor::ParentLocal(0))],
         globals,
     )?;
-    Ok(chunk.assemble(mc))
+    Ok(chunk.assemble(ctx.mutation()))
 }
 
 /// Compile a function body into a Chunk (not yet assembled).
 #[allow(clippy::too_many_arguments)]
 fn compile_function_to_chunk<'gc, 'a>(
-    mc: &'a Mutation<'gc>,
+    ctx: lua::Context<'gc>,
     interner: &'a TokenInterner,
     parent_capture: Option<&'a mut dyn UpvalueResolver>,
     stmts: impl Iterator<Item = Stmt>,
@@ -979,7 +1248,7 @@ fn compile_function_to_chunk<'gc, 'a>(
 
     let mut ctx = Ctx {
         interner,
-        mc,
+        ctx,
         chunk,
         control_end_label: Vec::new(),
         scope: Vec::new(),
@@ -1181,6 +1450,22 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
     // where `y` is an existing local).
     let base = ctx.chunk.freereg;
 
+    // Per-target capture of the RHS's compile-time value, used to inline
+    // `<const>` references later. Only populated when at least one target
+    // is `<const>`-attributed — keeps the common (no-const) path
+    // allocation-free. `None` entries cover non-foldable RHS, multi-return
+    // expansion slots, and indices that don't bind to a target. Each
+    // entry corresponds to target index `i` (not RHS index — they align
+    // except when multi-return fills multiple targets from one RHS).
+    let any_const_target = targets
+        .iter()
+        .any(|t| matches!(t.modifier(), Some(DeclModifier::Const)));
+    let mut target_const_vals: Vec<Option<ConstVal>> = if any_const_target {
+        vec![None; num_targets]
+    } else {
+        Vec::new()
+    };
+
     for (i, expr) in values.into_iter().enumerate() {
         let is_last = i == num_values - 1;
         let expected = base + i as u8;
@@ -1215,7 +1500,13 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
         // a short-circuit expression whose fall-through landed mid-stack),
         // emit a MOVE. Either way, end this iteration with freereg =
         // expected + 1 — any temps the expression leaked above are dead.
-        let reg = compile_expr_to_reg(ctx, expr, None)?;
+        let mut desc = compile_expr(ctx, expr, None)?;
+        // Capture compile-time value for `<const>`-attributed targets
+        // before discharge erases the const-kind info.
+        if any_const_target && i < num_targets && !desc.has_jumps() {
+            target_const_vals[i] = ConstVal::from_expr_kind(desc.kind);
+        }
+        let reg = ctx.discharge_to_reg_mut(&mut desc, None)?;
         if reg.0 != expected {
             // Reclaim any leaked temps, then reserve the target slot
             // (reserve_reg updates max_stack).
@@ -1241,8 +1532,16 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
     let target_top = base + num_targets as u8;
     while ctx.chunk.freereg < target_top {
         let slot = ctx.reserve_reg()?;
-        let idx = ctx.alloc_constant(Value::Nil)?;
+        let idx = ctx.alloc_constant(Value::nil())?;
         ctx.emit(Instruction::LOAD { dst: slot.0, idx });
+        // Padding-nil slot at `slot - base` is a compile-time nil.
+        // `slot.0 >= base` because `reserve_reg` only moves freereg
+        // upward and `base` was the freereg before any RHS compiled.
+        debug_assert!(slot.0 >= base);
+        let target_idx = (slot.0 - base) as usize;
+        if any_const_target && target_idx < num_targets {
+            target_const_vals[target_idx] = Some(ConstVal::Nil);
+        }
     }
 
     // Bind each target name to its slot and handle `<close>` / `<const>`.
@@ -1256,7 +1555,10 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
 
         let modifier = target.modifier();
         let kind = match modifier {
-            Some(DeclModifier::Const) => VarKind::Const,
+            // The `Const` arm is only reachable when at least one target
+            // had the `Const` modifier, which is exactly when
+            // `target_const_vals` was allocated to `num_targets` entries.
+            Some(DeclModifier::Const) => VarKind::Const(target_const_vals[i]),
             Some(DeclModifier::Close) => VarKind::ToClose,
             None => VarKind::Reg,
         };
@@ -1334,14 +1636,15 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         //   SETTABUP closure, _ENV, name
         // Mirrors upstream `globalfunc` (`lparser.c:1956-1968`), which
         // emits the same guard via `checkglobal` + `luaK_storevar`.
-        let key = ctx.alloc_string_constant(name.as_bytes())?;
+        let (key, key_hash) = ctx.alloc_field_key(name.as_bytes())?;
         let env_idx = ctx
-            .resolve_or_capture("_ENV")
+            .resolve_env_upvalue()
             .ok_or_else(|| ice("_ENV must resolve; main chunk pre-seeds it"))?;
         let guard_reg = ctx.alloc_register()?;
         ctx.emit(Instruction::GETTABUP {
             dst: guard_reg.0,
             idx: env_idx,
+            key_hash,
             key,
         });
         ctx.emit(Instruction::ERRNNIL {
@@ -1351,6 +1654,7 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         ctx.emit(Instruction::SETTABUP {
             src: func_reg.0,
             idx: env_idx,
+            key_hash,
             key,
         });
         ctx.free_reg(guard_reg);
@@ -1432,7 +1736,7 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
     // Pad with nil for any names beyond the supplied values.
     while ctx.chunk.freereg < value_base + n_targets as u8 {
         let slot = ctx.reserve_reg()?;
-        let idx = ctx.alloc_constant(Value::Nil)?;
+        let idx = ctx.alloc_constant(Value::nil())?;
         ctx.emit(Instruction::LOAD { dst: slot.0, idx });
     }
     // Drop any extra values past `n_targets` — they were computed
@@ -1442,15 +1746,16 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
     }
 
     let env_idx = ctx
-        .resolve_or_capture("_ENV")
+        .resolve_env_upvalue()
         .ok_or_else(|| ice("_ENV must resolve; main chunk pre-seeds it"))?;
     for (i, (name, _kind)) in decl_kinds.iter().enumerate() {
-        let key = ctx.alloc_string_constant(name.as_bytes())?;
+        let (key, key_hash) = ctx.alloc_field_key(name.as_bytes())?;
         let value_reg = value_base + i as u8;
         let guard_reg = ctx.alloc_register()?;
         ctx.emit(Instruction::GETTABUP {
             dst: guard_reg.0,
             idx: env_idx,
+            key_hash,
             key,
         });
         ctx.emit(Instruction::ERRNNIL {
@@ -1460,6 +1765,7 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         ctx.emit(Instruction::SETTABUP {
             src: value_reg,
             idx: env_idx,
+            key_hash,
             key,
         });
         ctx.free_reg(guard_reg);
@@ -1487,10 +1793,16 @@ enum Lvalue {
     Global {
         env_idx: u8,
         key: u16,
+        key_hash: [u8; 3],
     },
     Indexed {
         table: RegisterIndex,
         key: RegisterIndex,
+    },
+    Field {
+        table: RegisterIndex,
+        key_idx: u16,
+        key_hash: [u8; 3],
     },
 }
 
@@ -1572,7 +1884,7 @@ fn compile_assign(ctx: &mut Ctx, item: Assign) -> Result<(), CompileError> {
     // so hinting into a Local target is always safe.
     while pending.len() < num_targets {
         let i = pending.len();
-        let nil = ctx.alloc_constant(Value::Nil)?;
+        let nil = ctx.alloc_constant(Value::nil())?;
         let hint = local_dst(&lvalues[i]);
         let reg = ctx.dst_or_alloc(hint)?;
         ctx.emit(Instruction::LOAD {
@@ -1630,8 +1942,14 @@ fn compile_lvalue(
                     ));
                 }
                 Ok(Lvalue::Local { dst: data.register })
-            } else if let Some(idx) = ctx.resolve_upvalue(name) {
-                Ok(Lvalue::Upvalue { idx })
+            } else if let Some(resolution) = ctx.resolve_or_capture(name) {
+                match resolution {
+                    ResolvedName::Const(_) => Err(err(
+                        CompileErrorKind::Internal("assignment to const variable"),
+                        LineNumber(0),
+                    )),
+                    ResolvedName::Upvalue(idx) => Ok(Lvalue::Upvalue { idx }),
+                }
             } else {
                 // Lua 5.5 global resolution. If the name appears in the
                 // chunk's global decl table, honour its kind: writes to
@@ -1663,11 +1981,15 @@ fn compile_lvalue(
                     ));
                 }
                 drop(env);
-                let key = ctx.alloc_string_constant(name.as_bytes())?;
+                let (key, key_hash) = ctx.alloc_field_key(name.as_bytes())?;
                 let env_idx = ctx
-                    .resolve_or_capture("_ENV")
+                    .resolve_env_upvalue()
                     .ok_or_else(|| ice("_ENV must resolve; main chunk pre-seeds it"))?;
-                Ok(Lvalue::Global { env_idx, key })
+                Ok(Lvalue::Global {
+                    env_idx,
+                    key,
+                    key_hash,
+                })
             }
         }
         Expr::Index(index) => {
@@ -1681,8 +2003,14 @@ fn compile_lvalue(
             let t = binop.lhs().ok_or_else(|| ice("binop without lhs"))?;
             let f = binop.rhs().ok_or_else(|| ice("binop without rhs"))?;
             let table = compile_indexed_subexpr(ctx, t, target_local_regs)?;
-            // Property key is a freshly-LOADed string constant — its
-            // register is a fresh temp, never a target local.
+            if let Some((key_idx, key_hash)) = try_property_key_constant(ctx, &f)? {
+                return Ok(Lvalue::Field {
+                    table,
+                    key_idx,
+                    key_hash,
+                });
+            }
+            // Fallback: non-ident RHS still goes through LOAD K + SETTABLE.
             let key = compile_property_key(ctx, f, None)?;
             Ok(Lvalue::Indexed { table, key })
         }
@@ -1809,15 +2137,30 @@ fn emit_store(ctx: &mut Ctx, lv: Lvalue, src: u8) {
         Lvalue::Local { dst } if dst.0 != src => ctx.emit(Instruction::MOVE { dst: dst.0, src }),
         Lvalue::Local { .. } => {} // self-MOVE; skip
         Lvalue::Upvalue { idx } => ctx.emit(Instruction::SETUPVAL { src, idx }),
-        Lvalue::Global { env_idx, key } => ctx.emit(Instruction::SETTABUP {
+        Lvalue::Global {
+            env_idx,
+            key,
+            key_hash,
+        } => ctx.emit(Instruction::SETTABUP {
             src,
             idx: env_idx,
+            key_hash,
             key,
         }),
         Lvalue::Indexed { table, key } => ctx.emit(Instruction::SETTABLE {
             src,
             table: table.0,
             key: key.0,
+        }),
+        Lvalue::Field {
+            table,
+            key_idx,
+            key_hash,
+        } => ctx.emit(Instruction::SETFIELD {
+            src,
+            table: table.0,
+            key_hash,
+            key_idx,
         }),
     }
 }
@@ -1885,13 +2228,13 @@ fn compile_nested<'gc>(
     is_vararg: bool,
     arity: u8,
 ) -> Result<Gc<'gc, Prototype<'gc>>, CompileError> {
-    let mc = ctx.mc;
+    let lua_ctx = ctx.ctx;
     let interner = ctx.interner;
     let globals = Rc::clone(&ctx.globals);
     let parent: &mut dyn UpvalueResolver = ctx;
 
     let chunk = compile_function_to_chunk(
-        mc,
+        lua_ctx,
         interner,
         Some(parent),
         stmts.into_iter(),
@@ -1903,7 +2246,7 @@ fn compile_nested<'gc>(
         globals,
     )?;
 
-    Ok(chunk.assemble(mc))
+    Ok(chunk.assemble(lua_ctx.mutation()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1927,8 +2270,8 @@ fn compile_expr(
             let regs = compile_expr_method_call(ctx, item, 1)?;
             Ok(ExprDesc::from_reg(regs[0]))
         }
-        Expr::Ident(item) => compile_expr_ident(ctx, item, dst).map(ExprDesc::from_reg),
-        Expr::Literal(item) => compile_expr_literal(ctx, item, dst).map(ExprDesc::from_reg),
+        Expr::Ident(item) => compile_expr_ident(ctx, item, dst),
+        Expr::Literal(item) => compile_expr_literal(ctx, item, dst),
         Expr::Func(item) => compile_expr_func(ctx, item, dst).map(ExprDesc::from_reg),
         Expr::Table(item) => compile_expr_table(ctx, item).map(ExprDesc::from_reg),
         Expr::FuncCall(item) => {
@@ -1960,21 +2303,36 @@ fn compile_expr_ident(
     ctx: &mut Ctx,
     item: Ident,
     dst: Option<RegisterIndex>,
-) -> Result<RegisterIndex, CompileError> {
+) -> Result<ExprDesc, CompileError> {
     let name = item
         .name(ctx.interner)
         .ok_or_else(|| ice("ident without name"))?;
 
-    // Local variable — returns its own register, ignores dst hint
+    // Local variable — `<const>` with a known compile-time value inlines
+    // as a const expdesc so enclosing operators can fold against it
+    // without ever loading from the local's register. Plain locals (and
+    // const-locals whose initializer didn't fold) return their register.
     if let Some(data) = ctx.resolve_local(name) {
-        return Ok(data.register);
+        if let VarKind::Const(Some(v)) = data.kind {
+            return Ok(v.to_expr_desc());
+        }
+        return Ok(ExprDesc::from_reg(data.register));
     }
 
-    // Upvalue
-    if let Some(idx) = ctx.resolve_upvalue(name) {
-        let dst = ctx.dst_or_alloc(dst)?;
-        ctx.emit(Instruction::GETUPVAL { dst: dst.0, idx });
-        return Ok(dst);
+    // Upvalue path. An outer-scope `<const>` with a known value
+    // short-circuits as an inlined `ChildResolution::Const`, fully
+    // bypassing upvalue registration so the resulting prototype carries
+    // no descriptor for it (matches Lua 5.5: const refs across function
+    // boundaries don't appear in the inner function's upvalue list).
+    if let Some(resolution) = ctx.resolve_or_capture(name) {
+        match resolution {
+            ResolvedName::Const(v) => return Ok(v.to_expr_desc()),
+            ResolvedName::Upvalue(idx) => {
+                let dst = ctx.dst_or_alloc(dst)?;
+                ctx.emit(Instruction::GETUPVAL { dst: dst.0, idx });
+                return Ok(ExprDesc::from_reg(dst));
+            }
+        }
     }
 
     // Global: _ENV[name]. Lua 5.5 layers a single compile-time check
@@ -1993,40 +2351,46 @@ fn compile_expr_ident(
     }
     drop(globals);
 
-    let key = ctx.alloc_string_constant(name.as_bytes())?;
+    let (key, key_hash) = ctx.alloc_field_key(name.as_bytes())?;
     let dst = ctx.dst_or_alloc(dst)?;
     let env_idx = ctx
-        .resolve_or_capture("_ENV")
+        .resolve_env_upvalue()
         .ok_or_else(|| ice("_ENV must resolve; main chunk pre-seeds it"))?;
     ctx.emit(Instruction::GETTABUP {
         dst: dst.0,
         idx: env_idx,
+        key_hash,
         key,
     });
-    Ok(dst)
+    Ok(ExprDesc::from_reg(dst))
 }
 
 fn compile_expr_literal(
     ctx: &mut Ctx,
     item: Literal,
     dst: Option<RegisterIndex>,
-) -> Result<RegisterIndex, CompileError> {
+) -> Result<ExprDesc, CompileError> {
     let value = item
         .value(ctx.interner)
         .ok_or_else(|| ice("literal without value"))?;
 
-    let constant = match value {
-        LiteralValue::Nil => Value::Nil,
-        LiteralValue::Bool(b) => Value::Boolean(b),
-        LiteralValue::Int(n) => Value::Integer(n),
-        LiteralValue::Float(n) => Value::Float(n),
-        LiteralValue::String(bytes) => Value::String(LuaString::new(ctx.mc, &bytes)),
-    };
-
-    let idx = ctx.alloc_constant(constant)?;
-    let dst = ctx.dst_or_alloc(dst)?;
-    ctx.emit(Instruction::LOAD { dst: dst.0, idx });
-    Ok(dst)
+    // Numeric/boolean/nil literals stay in the expdesc — no constant slot
+    // or LOAD is emitted until `discharge_to_reg_mut` materializes them.
+    // String literals continue to take the eager LOAD path because there's
+    // no `Str` expdesc kind yet.
+    match value {
+        LiteralValue::Int(n) => Ok(ExprDesc::from_numeral(Numeral::Int(n))),
+        LiteralValue::Float(n) => Ok(ExprDesc::from_numeral(Numeral::Float(n))),
+        LiteralValue::Bool(b) => Ok(ExprDesc::from_bool(b)),
+        LiteralValue::Nil => Ok(ExprDesc::from_nil()),
+        LiteralValue::String(bytes) => {
+            let constant = Value::string(LuaString::new(ctx.ctx, &bytes));
+            let idx = ctx.alloc_constant(constant)?;
+            let dst = ctx.dst_or_alloc(dst)?;
+            ctx.emit(Instruction::LOAD { dst: dst.0, idx });
+            Ok(ExprDesc::from_reg(dst))
+        }
+    }
 }
 
 fn compile_expr_func(
@@ -2069,6 +2433,21 @@ fn compile_property_key(
         // Fallback: compile as expression
         compile_expr_to_reg(ctx, field, dst)
     }
+}
+
+fn try_property_key_constant(
+    ctx: &mut Ctx,
+    field: &Expr,
+) -> Result<Option<(u16, [u8; 3])>, CompileError> {
+    let bytes: Vec<u8> = match field {
+        Expr::Ident(ident) => ident
+            .name(ctx.interner)
+            .ok_or_else(|| ice("ident without name"))?
+            .as_bytes()
+            .to_vec(),
+        _ => return Ok(None),
+    };
+    Ok(Some(ctx.alloc_field_key(&bytes)?))
 }
 
 fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, CompileError> {
@@ -2131,18 +2510,20 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
                 }
 
                 let field = map.field().ok_or_else(|| ice("table map without field"))?;
-                let key = compile_property_key(ctx, Expr::Ident(field), None)?;
+                let field_expr = Expr::Ident(field);
+                let (key_idx, key_hash) = try_property_key_constant(ctx, &field_expr)?
+                    .ok_or_else(|| ice("table map field without name"))?;
 
                 let value_expr = map.value().ok_or_else(|| ice("table map without value"))?;
                 let val = compile_expr_to_reg(ctx, value_expr, None)?;
 
-                ctx.emit(Instruction::SETTABLE {
+                ctx.emit(Instruction::SETFIELD {
                     src: val.0,
                     table: dst.0,
-                    key: key.0,
+                    key_hash,
+                    key_idx,
                 });
-                // Free val (higher) then key — SETTABLE has captured both.
-                ctx.free_regs(val, key);
+                ctx.free_reg(val);
             }
 
             TableEntry::Generic(r#gen) => {
@@ -2197,18 +2578,43 @@ fn compile_expr_prefix_op(
     let op = item.op().ok_or_else(|| ice("prefix op without operator"))?;
     let rhs_expr = item.rhs().ok_or_else(|| ice("prefix op without operand"))?;
 
+    // Compile the operand without forcing discharge — preserves const
+    // expdescs (Numeral/Bool/Nil) so we can fold them.
+    let mut inner = compile_expr(ctx, rhs_expr, None)?;
+
+    // Constant fold paths. Each returns a fresh const expdesc that the
+    // enclosing operator can fold against again.
+    match (op, inner.kind) {
+        (PrefixOperator::Neg, ExprKind::Numeral(Numeral::Int(n))) => {
+            return Ok(ExprDesc::from_numeral(Numeral::Int(n.wrapping_neg())));
+        }
+        (PrefixOperator::Neg, ExprKind::Numeral(Numeral::Float(f))) => {
+            return Ok(ExprDesc::from_numeral(Numeral::Float(-f)));
+        }
+        (PrefixOperator::BitNot, ExprKind::Numeral(Numeral::Int(n))) => {
+            return Ok(ExprDesc::from_numeral(Numeral::Int(!n)));
+        }
+        (PrefixOperator::BitNot, ExprKind::Numeral(Numeral::Float(f))) => {
+            // Lua: bitwise on float requires exact integer convertibility.
+            if let Some(i) = num::exact_float_to_int(f) {
+                return Ok(ExprDesc::from_numeral(Numeral::Int(!i)));
+            }
+            // else fall through — runtime will raise if non-convertible.
+        }
+        (PrefixOperator::Not, ExprKind::Numeral(_) | ExprKind::Bool(true)) => {
+            return Ok(ExprDesc::from_bool(false));
+        }
+        (PrefixOperator::Not, ExprKind::Bool(false) | ExprKind::Nil) => {
+            return Ok(ExprDesc::from_bool(true));
+        }
+        _ => {}
+    }
+
     // `not <expr>`: when the operand is a jump-list expression (comparison,
     // `not`-of-comparison, etc.) we relabel its lists and flip the
     // `pending` head's CMP polarity in place (Lua's `codenot` on VJMP).
-    // The polarity flip is what keeps "pending fires on current truthy"
-    // and "fall-through is falsy" invariant after the label change: each
-    // still-in-list jump retains its runtime firing condition (its former
-    // list-label relabels to the opposite meaning via the swap), but the
-    // tail CMP flip ensures physical fall-through now represents outer
-    // falsy instead of outer truthy. For plain Reg operands fall back to
-    // the NOT opcode.
+    // For plain Reg operands fall back to the NOT opcode.
     if matches!(op, PrefixOperator::Not) {
-        let mut inner = compile_expr(ctx, rhs_expr, None)?;
         match inner.kind {
             ExprKind::Jump(Some(idx)) => {
                 ctx.flip_control_polarity(idx);
@@ -2216,10 +2622,11 @@ fn compile_expr_prefix_op(
                 return Ok(inner);
             }
             // Jump-kind without a pending head is only reachable after a
-            // `goif*` or `discharge_to_reg_mut` consumes it, and `compile_expr` never returns such a
-            // state. If we ever got here, relabeling lists without
-            // flipping the physical fall-through would silently invert
-            // the materialised boolean — fail loudly instead.
+            // `goif*` or `discharge_to_reg_mut` consumes it, and
+            // `compile_expr` never returns such a state. If we ever got
+            // here, relabeling lists without flipping the physical
+            // fall-through would silently invert the materialised
+            // boolean — fail loudly instead.
             ExprKind::Jump(None) => {
                 return Err(ice("not on Jump-kind ExprDesc with no pending head"));
             }
@@ -2232,10 +2639,14 @@ fn compile_expr_prefix_op(
                 });
                 return Ok(ExprDesc::from_reg(dst));
             }
+            ExprKind::Numeral(_) | ExprKind::Bool(_) | ExprKind::Nil => {
+                unreachable!("const kinds folded above")
+            }
         }
     }
 
-    let src = compile_expr_to_reg(ctx, rhs_expr, None)?;
+    // Non-fold case: discharge operand to a register and emit the unary op.
+    let src = ctx.discharge_to_reg_mut(&mut inner, None)?;
 
     let result_reg = match op {
         PrefixOperator::None => {
@@ -2297,21 +2708,22 @@ fn compile_expr_binary_op(
         _ => {}
     }
 
-    compile_expr_binary_op_to_reg(ctx, item, dst).map(ExprDesc::from_reg)
-}
-
-fn compile_expr_binary_op_to_reg(
-    ctx: &mut Ctx,
-    item: BinaryOp,
-    dst: Option<RegisterIndex>,
-) -> Result<RegisterIndex, CompileError> {
-    let op = item.op().ok_or_else(|| ice("binary op without operator"))?;
-
     // Property access: a.b
     if op == BinaryOperator::Property {
         let lhs = item.lhs().ok_or_else(|| ice("binop without lhs"))?;
         let rhs = item.rhs().ok_or_else(|| ice("binop without rhs"))?;
         let table = compile_expr_to_reg(ctx, lhs, None)?;
+        if let Some((key_idx, key_hash)) = try_property_key_constant(ctx, &rhs)? {
+            ctx.free_reg(table);
+            let dst = ctx.dst_or_alloc(dst)?;
+            ctx.emit(Instruction::GETFIELD {
+                dst: dst.0,
+                table: table.0,
+                key_hash,
+                key_idx,
+            });
+            return Ok(ExprDesc::from_reg(dst));
+        }
         let key = compile_property_key(ctx, rhs, None)?;
         ctx.free_regs(table, key);
         let dst = ctx.dst_or_alloc(dst)?;
@@ -2320,7 +2732,7 @@ fn compile_expr_binary_op_to_reg(
             table: table.0,
             key: key.0,
         });
-        return Ok(dst);
+        return Ok(ExprDesc::from_reg(dst));
     }
 
     // Method syntax in expressions (a:b) — should not appear here, handled by MethodCall
@@ -2330,11 +2742,25 @@ fn compile_expr_binary_op_to_reg(
 
     let lhs_expr = item.lhs().ok_or_else(|| ice("binop without lhs"))?;
     let rhs_expr = item.rhs().ok_or_else(|| ice("binop without rhs"))?;
-    let lhs = compile_expr_to_reg(ctx, lhs_expr, None)?;
-    let rhs = compile_expr_to_reg(ctx, rhs_expr, None)?;
+    let mut lhs_desc = compile_expr(ctx, lhs_expr, None)?;
+    let mut rhs_desc = compile_expr(ctx, rhs_expr, None)?;
 
-    // Arithmetic and bitwise operations
-    match op {
+    // Constant fold: both operands are numeric literals, op is foldable,
+    // and `validop` (no div-by-zero, no NaN/0 float result, bitwise needs
+    // integer-convertible operands) passes.
+    if let (ExprKind::Numeral(l), ExprKind::Numeral(r)) = (lhs_desc.kind, rhs_desc.kind)
+        && !lhs_desc.has_jumps()
+        && !rhs_desc.has_jumps()
+        && let Some(folded) = try_fold_binop(op, l, r)
+    {
+        return Ok(ExprDesc::from_numeral(folded));
+    }
+
+    // Non-fold path: discharge both operands and emit the runtime op.
+    let lhs = ctx.discharge_to_reg_mut(&mut lhs_desc, None)?;
+    let rhs = ctx.discharge_to_reg_mut(&mut rhs_desc, None)?;
+
+    let reg = match op {
         BinaryOperator::Add => emit_arith(
             ctx,
             lhs,
@@ -2345,7 +2771,7 @@ fn compile_expr_binary_op_to_reg(
                 rhs: rhs.0,
             },
             dst,
-        ),
+        )?,
         BinaryOperator::Sub => emit_arith(
             ctx,
             lhs,
@@ -2356,7 +2782,7 @@ fn compile_expr_binary_op_to_reg(
                 rhs: rhs.0,
             },
             dst,
-        ),
+        )?,
         BinaryOperator::Mul => emit_arith(
             ctx,
             lhs,
@@ -2367,7 +2793,7 @@ fn compile_expr_binary_op_to_reg(
                 rhs: rhs.0,
             },
             dst,
-        ),
+        )?,
         BinaryOperator::Div => emit_arith(
             ctx,
             lhs,
@@ -2378,7 +2804,7 @@ fn compile_expr_binary_op_to_reg(
                 rhs: rhs.0,
             },
             dst,
-        ),
+        )?,
         BinaryOperator::IntDiv => emit_arith(
             ctx,
             lhs,
@@ -2389,7 +2815,7 @@ fn compile_expr_binary_op_to_reg(
                 rhs: rhs.0,
             },
             dst,
-        ),
+        )?,
         BinaryOperator::Mod => emit_arith(
             ctx,
             lhs,
@@ -2400,7 +2826,7 @@ fn compile_expr_binary_op_to_reg(
                 rhs: rhs.0,
             },
             dst,
-        ),
+        )?,
         BinaryOperator::Exp => emit_arith(
             ctx,
             lhs,
@@ -2411,7 +2837,7 @@ fn compile_expr_binary_op_to_reg(
                 rhs: rhs.0,
             },
             dst,
-        ),
+        )?,
         BinaryOperator::BitAnd => emit_arith(
             ctx,
             lhs,
@@ -2422,7 +2848,7 @@ fn compile_expr_binary_op_to_reg(
                 rhs: rhs.0,
             },
             dst,
-        ),
+        )?,
         BinaryOperator::BitOr => emit_arith(
             ctx,
             lhs,
@@ -2433,7 +2859,7 @@ fn compile_expr_binary_op_to_reg(
                 rhs: rhs.0,
             },
             dst,
-        ),
+        )?,
         BinaryOperator::BitXor => emit_arith(
             ctx,
             lhs,
@@ -2444,7 +2870,7 @@ fn compile_expr_binary_op_to_reg(
                 rhs: rhs.0,
             },
             dst,
-        ),
+        )?,
         BinaryOperator::LShift => emit_arith(
             ctx,
             lhs,
@@ -2455,7 +2881,7 @@ fn compile_expr_binary_op_to_reg(
                 rhs: rhs.0,
             },
             dst,
-        ),
+        )?,
         BinaryOperator::RShift => emit_arith(
             ctx,
             lhs,
@@ -2466,7 +2892,7 @@ fn compile_expr_binary_op_to_reg(
                 rhs: rhs.0,
             },
             dst,
-        ),
+        )?,
         BinaryOperator::Concat => {
             ctx.free_regs(lhs, rhs);
             let dst = ctx.dst_or_alloc(dst)?;
@@ -2475,7 +2901,7 @@ fn compile_expr_binary_op_to_reg(
                 lhs: lhs.0,
                 rhs: rhs.0,
             });
-            Ok(dst)
+            dst
         }
 
         BinaryOperator::Eq
@@ -2496,7 +2922,8 @@ fn compile_expr_binary_op_to_reg(
         BinaryOperator::Property | BinaryOperator::Method => {
             unreachable!("property/method handled earlier in this function")
         }
-    }
+    };
+    Ok(ExprDesc::from_reg(reg))
 }
 
 fn emit_arith(
@@ -2629,7 +3056,7 @@ fn compile_logical_and_desc(
     // to TEST by `patch_list_aux`) — saving the intermediate register
     // and MOVE that a fresh-register allocation would otherwise need.
     let mut lhs = compile_expr(ctx, lhs_expr, dst)?;
-    ctx.goiftrue(&mut lhs);
+    ctx.goiftrue(&mut lhs)?;
 
     // LHS truthy path: evaluate RHS here. Any TESTSETs in lhs.true_list
     // represent paths whose values are discarded (RHS's value wins), so
@@ -2655,7 +3082,7 @@ fn compile_logical_or_desc(
     let rhs_expr = item.rhs().ok_or_else(|| ice("or without rhs"))?;
 
     let mut lhs = compile_expr(ctx, lhs_expr, dst)?;
-    ctx.goiffalse(&mut lhs);
+    ctx.goiffalse(&mut lhs)?;
 
     let lhs_false = mem::take(&mut lhs.false_list);
     ctx.patch_to_here(lhs_false);
@@ -3014,7 +3441,7 @@ fn compile_do(ctx: &mut Ctx, item: Do) -> Result<(), CompileError> {
 /// when the condition evaluates to truthy.
 fn compile_branch_cond_false(ctx: &mut Ctx, cond_expr: Expr) -> Result<JumpList, CompileError> {
     let mut desc = compile_expr(ctx, cond_expr, None)?;
-    ctx.goiftrue(&mut desc);
+    ctx.goiftrue(&mut desc)?;
     // After `goiftrue`, `false_list` holds every jump that fires on falsy
     // (the caller patches these to the branch-out target) and `true_list`
     // holds any jumps accumulated during LHS evaluation of an `and`/`or`
@@ -3186,7 +3613,7 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
             }
         } else {
             // Default step = 1
-            let one_idx = ctx.alloc_constant(Value::Integer(1))?;
+            let one_idx = ctx.alloc_constant(Value::integer(1))?;
             ctx.emit(Instruction::LOAD {
                 dst: step_reg.0,
                 idx: one_idx,
@@ -3214,7 +3641,7 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
             counter_name,
             VariableData {
                 register: loop_var,
-                kind: VarKind::Const,
+                kind: VarKind::Const(None),
             },
         )?;
         // Promote the loop variable to an active local so upvalue-capture
@@ -3321,7 +3748,7 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
                 name,
                 VariableData {
                     register: reg,
-                    kind: VarKind::Const,
+                    kind: VarKind::Const(None),
                 },
             )?;
         }

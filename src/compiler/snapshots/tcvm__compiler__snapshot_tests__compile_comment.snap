@@ -1,12 +1,13 @@
 ---
 source: src/compiler/snapshot_tests.rs
+assertion_line: 67
 expression: output
 ---
 ; function (params=0, vararg=true, stack=2, upvalues=1)
 ; constants:
 ;   K0 = 5
 ;   K1 = "y"
-;   K2 = 6
+;   K2 = -6
 ;   K3 = "z"
 ;   K4 = 20000000.0
 ; upvalues:
@@ -14,9 +15,8 @@ expression: output
 ; code:
 0000  VARARGPREP      fixed=0
 0001  LOAD            R0 K0  ; 5
-0002  LOAD            R1 K2  ; 6
-0003  UNM             R1 R1
-0004  SETTABUP        R1 U0 K1  ; "y"
-0005  LOAD            R1 K4  ; 20000000.0
-0006  SETTABUP        R1 U0 K3  ; "z"
-0007  RETURN          R0 count=1
+0002  LOAD            R1 K2  ; -6
+0003  SETTABUP        R1 U0 K1  ; "y"
+0004  LOAD            R1 K4  ; 20000000.0
+0005  SETTABUP        R1 U0 K3  ; "z"
+0006  RETURN          R0 count=1

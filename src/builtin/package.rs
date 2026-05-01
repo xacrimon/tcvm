@@ -9,18 +9,18 @@ pub fn load<'gc>(ctx: Context<'gc>) {
     let lib = Table::new(ctx.mutation());
     for &(name, handler) in fns {
         let handler = Function::new_native(ctx.mutation(), handler, Box::new([]));
-        let key = Value::String(LuaString::new(ctx.mutation(), name.as_bytes()));
-        lib.raw_set(ctx.mutation(), key, Value::Function(handler));
+        let key = Value::string(LuaString::new(ctx, name.as_bytes()));
+        lib.raw_set(ctx.mutation(), key, Value::function(handler));
     }
 
-    let lib_name = Value::String(LuaString::new(ctx.mutation(), b"package"));
+    let lib_name = Value::string(LuaString::new(ctx, b"package"));
     ctx.globals()
-        .raw_set(ctx.mutation(), lib_name, Value::Table(lib));
+        .raw_set(ctx.mutation(), lib_name, Value::table(lib));
 
     let require = Function::new_native(ctx.mutation(), lua_require, Box::new([]));
-    let require_key = Value::String(LuaString::new(ctx.mutation(), b"require"));
+    let require_key = Value::string(LuaString::new(ctx, b"require"));
     ctx.globals()
-        .raw_set(ctx.mutation(), require_key, Value::Function(require));
+        .raw_set(ctx.mutation(), require_key, Value::function(require));
 }
 
 fn lua_loadlib<'gc>(

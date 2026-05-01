@@ -1,0 +1,29 @@
+---
+source: src/compiler/snapshot_tests.rs
+assertion_line: 133
+expression: output
+---
+; function (params=0, vararg=true, stack=3, upvalues=1)
+; constants:
+;   K0 = "num"
+;   K1 = "a"
+;   K2 = "b"
+;   K3 = "c"
+; upvalues:
+;   U0 = local R0
+; code:
+0000  VARARGPREP      fixed=0
+0001  GETTABUP        R0 U0 K1  ; "a"
+0002  GETTABUP        R1 U0 K2  ; "b"
+0003  GETTABUP        R2 U0 K3  ; "c"
+0004  MUL             R1 R1 R2
+0005  ADD             R0 R0 R1
+0006  GETTABUP        R1 U0 K2  ; "b"
+0007  GETTABUP        R2 U0 K3  ; "c"
+0008  DIV             R1 R1 R2
+0009  SUB             R0 R0 R1
+0010  SETTABUP        R0 U0 K0  ; "num"
+0011  GETTABUP        R0 U0 K1  ; "a"
+0012  UNM             R0 R0
+0013  SETTABUP        R0 U0 K0  ; "num"
+0014  RETURN          R0 count=1

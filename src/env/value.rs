@@ -1,87 +1,204 @@
 use core::hash::{Hash, Hasher};
+use std::hint;
+use std::marker::PhantomData;
 
-use crate::dmm::{Collect, Gc};
+use crate::dmm::{Collect, Gc, collect::Trace};
 use crate::env::function::Function;
 use crate::env::string::LuaString;
 use crate::env::table::Table;
 use crate::env::thread::Thread;
 use crate::env::userdata::Userdata;
 
-#[derive(Clone, Copy, Collect)]
-#[collect(internal, no_drop)]
-#[repr(align(8))]
-pub enum Value<'gc> {
+#[derive(Clone, Copy, Collect, PartialEq, Eq)]
+#[collect(internal, require_static)]
+#[repr(u8)]
+pub enum ValueKind {
     Nil,
-    Boolean(bool),
-    Integer(i64),
-    Float(f64),
-    String(LuaString<'gc>),
-    Table(Table<'gc>),
-    Function(Function<'gc>),
-    Thread(Thread<'gc>),
-    Userdata(Userdata<'gc>),
+    Boolean,
+    Integer,
+    Float,
+    String,
+    Table,
+    Function,
+    Thread,
+    Userdata,
 }
 
-macro_rules! type_methods {
-    ($variant:ident, $lowercase:ident, $type:ty) => {
-        paste::paste! {
-            pub fn [<get_ $lowercase>](self) -> Option<$type> {
-                match self {
-                    Self::$variant(v) => Some(v),
-                    _ => None,
-                }
-            }
-        }
-    };
+#[derive(Clone, Copy, PartialEq)]
+pub struct Value<'gc> {
+    kind: ValueKind,
+    data: u64,
+    _marker: PhantomData<&'gc ()>,
 }
 
 impl<'gc> Value<'gc> {
-    type_methods!(Boolean, boolean, bool);
-    type_methods!(Integer, integer, i64);
-    type_methods!(Float, float, f64);
-    type_methods!(String, string, LuaString<'gc>);
-    type_methods!(Table, table, Table<'gc>);
-    type_methods!(Function, function, Function<'gc>);
-    type_methods!(Thread, thread, Thread<'gc>);
-    type_methods!(Userdata, userdata, Userdata<'gc>);
+    pub fn nil() -> Self {
+        Self {
+            kind: ValueKind::Nil,
+            data: 0,
+            _marker: PhantomData,
+        }
+    }
 
     pub fn is_nil(&self) -> bool {
-        matches!(self, Value::Nil)
+        self.kind == ValueKind::Nil
+    }
+
+    pub fn boolean(v: bool) -> Self {
+        Self {
+            kind: ValueKind::Boolean,
+            data: v as u64,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn get_boolean(self) -> Option<bool> {
+        if self.kind != ValueKind::Boolean {
+            return None;
+        }
+
+        Some(match self.data {
+            0 => false,
+            1 => true,
+            _ => unsafe { hint::unreachable_unchecked() },
+        })
+    }
+
+    pub fn integer(v: i64) -> Self {
+        Self {
+            kind: ValueKind::Integer,
+            data: v as u64,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn get_integer(self) -> Option<i64> {
+        if self.kind != ValueKind::Integer {
+            return None;
+        }
+
+        Some(self.data as i64)
+    }
+
+    pub fn float(v: f64) -> Self {
+        Self {
+            kind: ValueKind::Float,
+            data: v.to_bits(),
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn get_float(self) -> Option<f64> {
+        if self.kind != ValueKind::Float {
+            return None;
+        }
+
+        Some(f64::from_bits(self.data))
+    }
+
+    pub fn string(v: LuaString<'gc>) -> Self {
+        Self {
+            kind: ValueKind::String,
+            data: Gc::as_ptr(v.inner()) as usize as u64,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn get_string(self) -> Option<LuaString<'gc>> {
+        if self.kind != ValueKind::String {
+            return None;
+        }
+
+        let ptr = unsafe { Gc::from_ptr(self.data as usize as *const _) };
+        Some(LuaString::from_inner(ptr))
+    }
+
+    pub fn table(v: Table<'gc>) -> Self {
+        Self {
+            kind: ValueKind::Table,
+            data: Gc::as_ptr(v.inner()) as usize as u64,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn get_table(self) -> Option<Table<'gc>> {
+        if self.kind != ValueKind::Table {
+            return None;
+        }
+
+        let ptr = unsafe { Gc::from_ptr(self.data as usize as *const _) };
+        Some(Table::from_inner(ptr))
+    }
+
+    pub fn function(v: Function<'gc>) -> Self {
+        Self {
+            kind: ValueKind::Function,
+            data: Gc::as_ptr(v.inner()) as usize as u64,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn get_function(self) -> Option<Function<'gc>> {
+        if self.kind != ValueKind::Function {
+            return None;
+        }
+
+        let ptr = unsafe { Gc::from_ptr(self.data as usize as *const _) };
+        Some(Function::from_inner(ptr))
+    }
+
+    pub fn thread(v: Thread<'gc>) -> Self {
+        Self {
+            kind: ValueKind::Thread,
+            data: Gc::as_ptr(v.inner()) as usize as u64,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn get_thread(self) -> Option<Thread<'gc>> {
+        if self.kind != ValueKind::Thread {
+            return None;
+        }
+
+        let ptr = unsafe { Gc::from_ptr(self.data as usize as *const _) };
+        Some(Thread::from_inner(ptr))
+    }
+
+    pub fn userdata(v: Userdata<'gc>) -> Self {
+        Self {
+            kind: ValueKind::Userdata,
+            data: Gc::as_ptr(v.inner()) as usize as u64,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn get_userdata(self) -> Option<Userdata<'gc>> {
+        if self.kind != ValueKind::Userdata {
+            return None;
+        }
+
+        let ptr = unsafe { Gc::from_ptr(self.data as usize as *const _) };
+        Some(Userdata::from_inner(ptr))
     }
 
     pub fn is_falsy(&self) -> bool {
-        matches!(self, Value::Nil | Value::Boolean(false))
+        self.kind == ValueKind::Nil || self.get_boolean() == Some(false)
+    }
+
+    pub fn kind(self) -> ValueKind {
+        self.kind
     }
 
     pub fn type_name(&self) -> &'static str {
-        match self {
-            Value::Nil => "nil",
-            Value::Boolean(_) => "boolean",
-            Value::Integer(_) | Value::Float(_) => "number",
-            Value::String(_) => "string",
-            Value::Table(_) => "table",
-            Value::Function(_) => "function",
-            Value::Thread(_) => "thread",
-            Value::Userdata(_) => "userdata",
-        }
-    }
-}
-
-impl<'gc> PartialEq for Value<'gc> {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Value::Nil, Value::Nil) => true,
-            (Value::Boolean(a), Value::Boolean(b)) => a == b,
-            (Value::Integer(a), Value::Integer(b)) => a == b,
-            (Value::Float(a), Value::Float(b)) => a == b,
-            (Value::Integer(a), Value::Float(b)) => (*a as f64) == *b && (*b as i64) == *a,
-            (Value::Float(a), Value::Integer(b)) => *a == (*b as f64) && (*a as i64) == *b,
-            (Value::String(a), Value::String(b)) => a == b,
-            (Value::Table(a), Value::Table(b)) => Gc::ptr_eq(a.inner(), b.inner()),
-            (Value::Function(a), Value::Function(b)) => Gc::ptr_eq(a.inner(), b.inner()),
-            (Value::Thread(a), Value::Thread(b)) => Gc::ptr_eq(a.inner(), b.inner()),
-            (Value::Userdata(a), Value::Userdata(b)) => Gc::ptr_eq(a.inner(), b.inner()),
-            _ => false,
+        match self.kind {
+            ValueKind::Nil => "nil",
+            ValueKind::Boolean => "boolean",
+            ValueKind::Integer | ValueKind::Float => "number",
+            ValueKind::String => "string",
+            ValueKind::Table => "table",
+            ValueKind::Function => "function",
+            ValueKind::Thread => "thread",
+            ValueKind::Userdata => "userdata",
         }
     }
 }
@@ -90,46 +207,41 @@ impl<'gc> Eq for Value<'gc> {}
 
 impl<'gc> Hash for Value<'gc> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        match self {
-            Value::Nil => 0u8.hash(state),
-            Value::Boolean(b) => {
-                1u8.hash(state);
-                b.hash(state);
-            }
-            Value::Integer(i) => {
-                2u8.hash(state);
-                i.hash(state);
-            }
-            Value::Float(f) => {
-                let i = *f as i64;
-                if f.fract() == 0.0 && f.is_finite() && (i as f64) == *f {
-                    // Must hash identically to the equivalent integer
-                    2u8.hash(state);
-                    i.hash(state);
-                } else {
-                    3u8.hash(state);
-                    f.to_bits().hash(state);
-                }
-            }
-            Value::String(s) => {
-                4u8.hash(state);
-                s.hash(state);
-            }
-            Value::Table(t) => {
-                5u8.hash(state);
-                Gc::as_ptr(t.inner()).hash(state);
-            }
-            Value::Function(f) => {
-                6u8.hash(state);
-                Gc::as_ptr(f.inner()).hash(state);
-            }
-            Value::Thread(t) => {
-                7u8.hash(state);
-                Gc::as_ptr(t.inner()).hash(state);
-            }
-            Value::Userdata(u) => {
-                8u8.hash(state);
-                Gc::as_ptr(u.inner()).hash(state);
+        state.write_u64(self.data);
+    }
+}
+
+#[inline]
+pub(crate) fn value_hash(v: Value<'_>) -> u64 {
+    use std::hash::BuildHasher;
+    foldhash::fast::FixedState::default().hash_one(v) & 0xff_ffff
+}
+
+pub(crate) fn precomputed_key_hash(name: LuaString<'_>) -> [u8; 3] {
+    let h = value_hash(Value::string(name));
+    [
+        (h & 0xff) as u8,
+        ((h >> 8) & 0xff) as u8,
+        ((h >> 16) & 0xff) as u8,
+    ]
+}
+
+#[inline]
+pub(crate) fn key_hash_to_u64(b: [u8; 3]) -> u64 {
+    (b[0] as u64) | ((b[1] as u64) << 8) | ((b[2] as u64) << 16)
+}
+
+unsafe impl<'gc> Collect<'gc> for Value<'gc> {
+    #[inline]
+    fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
+        unsafe {
+            match self.kind {
+                ValueKind::String => self.get_string().unwrap_unchecked().trace(cc),
+                ValueKind::Table => self.get_table().unwrap_unchecked().trace(cc),
+                ValueKind::Function => self.get_function().unwrap_unchecked().trace(cc),
+                ValueKind::Thread => self.get_thread().unwrap_unchecked().trace(cc),
+                ValueKind::Userdata => self.get_userdata().unwrap_unchecked().trace(cc),
+                _ => (),
             }
         }
     }

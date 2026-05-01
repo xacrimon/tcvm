@@ -34,12 +34,14 @@ pub enum Instruction {
     GETTABUP {
         dst: Register,
         idx: UpvalueIndex,
+        key_hash: [u8; 3],
         key: ConstantIndex,
     },
 
     SETTABUP {
         src: Register,
         idx: UpvalueIndex,
+        key_hash: [u8; 3],
         key: ConstantIndex,
     },
 
@@ -53,6 +55,20 @@ pub enum Instruction {
         src: Register,
         table: Register,
         key: Register,
+    },
+
+    GETFIELD {
+        dst: Register,
+        table: Register,
+        key_hash: [u8; 3],
+        key_idx: ConstantIndex,
+    },
+
+    SETFIELD {
+        src: Register,
+        table: Register,
+        key_hash: [u8; 3],
+        key_idx: ConstantIndex,
     },
 
     NEWTABLE {

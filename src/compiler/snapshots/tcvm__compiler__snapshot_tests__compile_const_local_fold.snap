@@ -1,0 +1,43 @@
+---
+source: src/compiler/snapshot_tests.rs
+assertion_line: 134
+expression: output
+---
+; function (params=0, vararg=true, stack=5, upvalues=1)
+; constants:
+;   K0 = 5
+;   K1 = 7
+;   K2 = true
+;   K3 = nil
+;   K4 = "a"
+;   K5 = 8
+;   K6 = "b"
+;   K7 = 14
+;   K8 = "c"
+;   K9 = -5
+;   K10 = "d"
+;   K11 = false
+;   K12 = "e"
+;   K13 = "f"
+;   K14 = 36
+; upvalues:
+;   U0 = local R0
+; code:
+0000  VARARGPREP      fixed=0
+0001  LOAD            R0 K0  ; 5
+0002  LOAD            R1 K1  ; 7
+0003  LOAD            R2 K2  ; true
+0004  LOAD            R3 K3  ; nil
+0005  LOAD            R4 K5  ; 8
+0006  SETTABUP        R4 U0 K4  ; "a"
+0007  LOAD            R4 K7  ; 14
+0008  SETTABUP        R4 U0 K6  ; "b"
+0009  LOAD            R4 K9  ; -5
+0010  SETTABUP        R4 U0 K8  ; "c"
+0011  LOAD            R4 K11  ; false
+0012  SETTABUP        R4 U0 K10  ; "d"
+0013  LOAD            R4 K2  ; true
+0014  SETTABUP        R4 U0 K12  ; "e"
+0015  LOAD            R4 K14  ; 36
+0016  SETTABUP        R4 U0 K13  ; "f"
+0017  RETURN          R0 count=1

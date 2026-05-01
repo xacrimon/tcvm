@@ -1,28 +1,19 @@
 ---
 source: src/compiler/snapshot_tests.rs
+assertion_line: 76
 expression: output
 ---
-; function (params=0, vararg=true, stack=3, upvalues=1)
+; function (params=0, vararg=true, stack=1, upvalues=1)
 ; constants:
 ;   K0 = "num"
-;   K1 = 5
-;   K2 = 6
-;   K3 = 3
+;   K1 = 21.0
+;   K2 = -5
 ; upvalues:
 ;   U0 = local R0
 ; code:
 0000  VARARGPREP      fixed=0
-0001  LOAD            R0 K1  ; 5
-0002  LOAD            R1 K2  ; 6
-0003  LOAD            R2 K3  ; 3
-0004  MUL             R1 R1 R2
-0005  ADD             R0 R0 R1
-0006  LOAD            R1 K2  ; 6
-0007  LOAD            R2 K3  ; 3
-0008  DIV             R1 R1 R2
-0009  SUB             R0 R0 R1
-0010  SETTABUP        R0 U0 K0  ; "num"
-0011  LOAD            R0 K1  ; 5
-0012  UNM             R0 R0
-0013  SETTABUP        R0 U0 K0  ; "num"
-0014  RETURN          R0 count=1
+0001  LOAD            R0 K1  ; 21.0
+0002  SETTABUP        R0 U0 K0  ; "num"
+0003  LOAD            R0 K2  ; -5
+0004  SETTABUP        R0 U0 K0  ; "num"
+0005  RETURN          R0 count=1

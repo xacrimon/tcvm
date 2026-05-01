@@ -20,7 +20,7 @@ impl<'gc> Userdata<'gc> {
     pub fn new<T: 'static>(mc: &Mutation<'gc>, data: T, num_user_values: usize) -> Self {
         let state = UserdataState {
             data: Box::new(data),
-            user_values: vec![Value::Nil; num_user_values],
+            user_values: vec![Value::nil(); num_user_values],
             metatable: None,
         };
         Userdata(Gc::new(mc, RefLock::new(state)))
@@ -40,7 +40,7 @@ impl<'gc> Userdata<'gc> {
             .user_values
             .get(index)
             .copied()
-            .unwrap_or(Value::Nil)
+            .unwrap_or(Value::nil())
     }
 
     pub fn set_user_value(self, mc: &Mutation<'gc>, index: usize, value: Value<'gc>) {
@@ -49,5 +49,9 @@ impl<'gc> Userdata<'gc> {
 
     pub fn inner(self) -> Gc<'gc, RefLock<UserdataState<'gc>>> {
         self.0
+    }
+
+    pub(crate) fn from_inner(g: Gc<'gc, RefLock<UserdataState<'gc>>>) -> Self {
+        Userdata(g)
     }
 }

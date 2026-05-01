@@ -13,6 +13,7 @@ use crate::builtin;
 use crate::dmm::{Arena, Collect, DynamicRootSet, Mutation};
 use crate::env::{Table, Thread};
 
+use crate::env::string::Interner;
 pub use context::Context;
 pub use convert::{FromMultiValue, FromValue, IntoMultiValue, IntoValue};
 pub use error::{LoadError, RuntimeError, TypeError};
@@ -29,6 +30,7 @@ pub struct State<'gc> {
     pub(crate) globals: Table<'gc>,
     pub(crate) main_thread: Thread<'gc>,
     pub(crate) roots: DynamicRootSet<'gc>,
+    pub(crate) interner: Interner<'gc>,
 }
 
 /// A Lua runtime instance.
@@ -48,6 +50,7 @@ impl Lua {
             globals: Table::new(mc),
             main_thread: Thread::new(mc),
             roots: DynamicRootSet::new(mc),
+            interner: Interner::new(mc),
         });
         Lua { arena }
     }
@@ -128,7 +131,7 @@ mod tests {
 
         let ex = lua
             .try_enter(|ctx| -> Result<_, RuntimeError> {
-                let key = Value::String(LuaString::new(ctx.mutation(), b"add"));
+                let key = Value::string(LuaString::new(ctx, b"add"));
                 let add = ctx
                     .globals()
                     .raw_get(key)
@@ -165,8 +168,8 @@ mod tests {
         mut stack: crate::env::Stack<'gc, '_>,
     ) -> Result<(), crate::env::NativeError> {
         let (a, b) = (stack.get(0), stack.get(1));
-        let sum = match (a, b) {
-            (Value::Integer(x), Value::Integer(y)) => Value::Integer(x + y),
+        let sum = match (a.get_integer(), b.get_integer()) {
+            (Some(x), Some(y)) => Value::integer(x + y),
             _ => return Err(crate::env::NativeError::new("bad args")),
         };
         stack.replace(&[sum]);
@@ -181,9 +184,9 @@ mod tests {
             .try_enter(|ctx| -> Result<_, LoadError> {
                 let add =
                     Function::new_native(ctx.mutation(), native_add as NativeFn, Box::new([]));
-                let key = Value::String(LuaString::new(ctx.mutation(), b"add"));
+                let key = Value::string(LuaString::new(ctx, b"add"));
                 ctx.globals()
-                    .raw_set(ctx.mutation(), key, Value::Function(add));
+                    .raw_set(ctx.mutation(), key, Value::function(add));
 
                 let chunk = ctx.load("return add(2, 3)", Some("native_call"))?;
                 Ok(ctx.stash(Executor::start(ctx, chunk, ())))
@@ -226,9 +229,9 @@ mod tests {
             .try_enter(|ctx| -> Result<_, LoadError> {
                 let add =
                     Function::new_native(ctx.mutation(), native_add as NativeFn, Box::new([]));
-                let key = Value::String(LuaString::new(ctx.mutation(), b"add"));
+                let key = Value::string(LuaString::new(ctx, b"add"));
                 ctx.globals()
-                    .raw_set(ctx.mutation(), key, Value::Function(add));
+                    .raw_set(ctx.mutation(), key, Value::function(add));
 
                 let chunk = ctx.load(
                     "local function f() return add(2, 3) end return f()",
@@ -251,9 +254,9 @@ mod tests {
             .try_enter(|ctx| -> Result<_, LoadError> {
                 let add =
                     Function::new_native(ctx.mutation(), native_add as NativeFn, Box::new([]));
-                let key = Value::String(LuaString::new(ctx.mutation(), b"add"));
+                let key = Value::string(LuaString::new(ctx, b"add"));
                 ctx.globals()
-                    .raw_set(ctx.mutation(), key, Value::Function(add));
+                    .raw_set(ctx.mutation(), key, Value::function(add));
 
                 let chunk = ctx.load(
                     "local function outer() \
@@ -304,9 +307,10 @@ mod tests {
         mut stack: crate::env::Stack<'gc, '_>,
     ) -> Result<(), crate::env::NativeError> {
         let v = stack.get(0);
-        let out = match v {
-            Value::Integer(_) => v,
-            _ => return Err(crate::env::NativeError::new("bad args")),
+        let out = if v.get_integer().is_some() {
+            v
+        } else {
+            return Err(crate::env::NativeError::new("bad args"));
         };
         stack.replace(&[out]);
         Ok(())
@@ -318,9 +322,9 @@ mod tests {
             .try_enter(|ctx| -> Result<_, LoadError> {
                 let probe =
                     Function::new_native(ctx.mutation(), native_id as NativeFn, Box::new([]));
-                let key = Value::String(LuaString::new(ctx.mutation(), b"probe"));
+                let key = Value::string(LuaString::new(ctx, b"probe"));
                 ctx.globals()
-                    .raw_set(ctx.mutation(), key, Value::Function(probe));
+                    .raw_set(ctx.mutation(), key, Value::function(probe));
                 let chunk = ctx.load(src, Some("test"))?;
                 Ok(ctx.stash(Executor::start(ctx, chunk, ())))
             })

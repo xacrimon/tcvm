@@ -48,19 +48,23 @@ fn format_prototype_into(out: &mut String, proto: &Prototype<'_>, depth: usize) 
 }
 
 fn format_value(v: &Value<'_>) -> String {
-    match v {
-        Value::Nil => "nil".to_string(),
-        Value::Boolean(b) => b.to_string(),
-        Value::Integer(n) => n.to_string(),
-        Value::Float(n) => format!("{n:?}"),
-        Value::String(s) => match std::str::from_utf8(s.as_bytes()) {
-            Ok(text) => format!("{text:?}"),
-            Err(_) => format!("<bytes:{}>", s.len()),
-        },
-        Value::Table(_) => "<table>".to_string(),
-        Value::Function(_) => "<function>".to_string(),
-        Value::Thread(_) => "<thread>".to_string(),
-        Value::Userdata(_) => "<userdata>".to_string(),
+    use crate::env::ValueKind;
+    match v.kind() {
+        ValueKind::Nil => "nil".to_string(),
+        ValueKind::Boolean => v.get_boolean().unwrap().to_string(),
+        ValueKind::Integer => v.get_integer().unwrap().to_string(),
+        ValueKind::Float => format!("{:?}", v.get_float().unwrap()),
+        ValueKind::String => {
+            let s = v.get_string().unwrap();
+            match std::str::from_utf8(s.as_bytes()) {
+                Ok(text) => format!("{text:?}"),
+                Err(_) => format!("<bytes:{}>", s.len()),
+            }
+        }
+        ValueKind::Table => "<table>".to_string(),
+        ValueKind::Function => "<function>".to_string(),
+        ValueKind::Thread => "<thread>".to_string(),
+        ValueKind::Userdata => "<userdata>".to_string(),
     }
 }
 
@@ -84,13 +88,23 @@ fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -> String {
         Instruction::LFALSESKIP { src } => format!("LFALSESKIP      R{src}"),
         Instruction::GETUPVAL { dst, idx } => format!("GETUPVAL        R{dst} U{idx}"),
         Instruction::SETUPVAL { src, idx } => format!("SETUPVAL        R{src} U{idx}"),
-        Instruction::GETTABUP { dst, idx, key } => {
+        Instruction::GETTABUP {
+            dst,
+            idx,
+            key_hash: _,
+            key,
+        } => {
             format!(
                 "GETTABUP        R{dst} U{idx} K{key}{}",
                 const_comment(constants, key)
             )
         }
-        Instruction::SETTABUP { src, idx, key } => {
+        Instruction::SETTABUP {
+            src,
+            idx,
+            key_hash: _,
+            key,
+        } => {
             format!(
                 "SETTABUP        R{src} U{idx} K{key}{}",
                 const_comment(constants, key)
@@ -101,6 +115,28 @@ fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -> String {
         }
         Instruction::SETTABLE { src, table, key } => {
             format!("SETTABLE        R{src} R{table} R{key}")
+        }
+        Instruction::GETFIELD {
+            dst,
+            table,
+            key_hash: _,
+            key_idx,
+        } => {
+            format!(
+                "GETFIELD        R{dst} R{table} K{key_idx}{}",
+                const_comment(constants, key_idx)
+            )
+        }
+        Instruction::SETFIELD {
+            src,
+            table,
+            key_hash: _,
+            key_idx,
+        } => {
+            format!(
+                "SETFIELD        R{src} R{table} K{key_idx}{}",
+                const_comment(constants, key_idx)
+            )
         }
         Instruction::NEWTABLE { dst } => format!("NEWTABLE        R{dst}"),
         Instruction::ADD { dst, lhs, rhs } => format!("ADD             R{dst} R{lhs} R{rhs}"),

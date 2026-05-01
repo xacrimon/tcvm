@@ -5,7 +5,7 @@ use crate::env::{Function, LuaString, NativeContext, NativeError, NativeFn, Stac
 
 // let add =
 //                    Function::new_native(ctx.mutation(), native_add as NativeFn, Box::new([]));
-//                let key = Value::String(LuaString::new(ctx.mutation(), b"add"));
+//                let key = Value::String(LuaString::new(ctx, b"add"));
 //                ctx.globals()
 //                    .raw_set(ctx.mutation(), key, Value::Function(add));
 
@@ -38,10 +38,10 @@ pub fn load<'gc>(ctx: Context<'gc>) {
 
     for &(name, handler) in fns {
         let handler = Function::new_native(ctx.mutation(), handler, Box::new([]));
-        let key = Value::String(LuaString::new(ctx.mutation(), name.as_bytes()));
+        let key = Value::string(LuaString::new(ctx, name.as_bytes()));
 
         ctx.globals()
-            .raw_set(ctx.mutation(), key, Value::Function(handler));
+            .raw_set(ctx.mutation(), key, Value::function(handler));
     }
 }
 
@@ -158,9 +158,50 @@ fn lua_setmetatable<'gc>(
 
 fn lua_tonumber<'gc>(
     _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<(), NativeError> {
-    todo!()
+    // TODO: 2-arg form `tonumber(s, base)` for integer parsing in arbitrary base.
+    let v = stack.get(0);
+    let result = if v.is_nil() {
+        Value::nil()
+    } else if v.get_integer().is_some() || v.get_float().is_some() {
+        v
+    } else if let Some(s) = v.get_string() {
+        let bytes = s.as_bytes();
+        let trimmed = trim_ascii(bytes);
+        parse_lua_number(trimmed).unwrap_or(Value::nil())
+    } else {
+        Value::nil()
+    };
+    stack.replace(&[result]);
+    Ok(())
+}
+
+fn trim_ascii(b: &[u8]) -> &[u8] {
+    let mut start = 0;
+    let mut end = b.len();
+    while start < end && b[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    while end > start && b[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    &b[start..end]
+}
+
+fn parse_lua_number<'gc>(b: &[u8]) -> Option<Value<'gc>> {
+    if b.is_empty() {
+        return None;
+    }
+    let s = std::str::from_utf8(b).ok()?;
+    // TODO: hex literals (0x...) and hex floats (0x1.8p3) per Lua spec.
+    if let Ok(i) = s.parse::<i64>() {
+        return Some(Value::integer(i));
+    }
+    if let Ok(f) = s.parse::<f64>() {
+        return Some(Value::float(f));
+    }
+    None
 }
 
 fn lua_tostring<'gc>(

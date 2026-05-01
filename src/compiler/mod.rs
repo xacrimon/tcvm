@@ -9,16 +9,17 @@ use std::fmt;
 use cstree::interning::TokenInterner;
 use thiserror::Error;
 
-use crate::dmm::{Collect, Gc, Mutation};
+use crate::dmm::{Collect, Gc};
 use crate::env::Prototype;
+use crate::lua;
 use crate::parser::syntax;
 
 pub fn compile_chunk<'gc>(
-    mc: &Mutation<'gc>,
+    ctx: lua::Context<'gc>,
     root: &syntax::Root,
     interner: &TokenInterner,
 ) -> Result<Gc<'gc, Prototype<'gc>>, CompileError> {
-    rules::compile(mc, root, interner)
+    rules::compile(ctx, root, interner)
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Collect)]

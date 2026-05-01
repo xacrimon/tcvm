@@ -4,7 +4,7 @@ use cstree::build::NodeCache;
 use insta::assert_snapshot;
 use paste::paste;
 
-use crate::dmm::{Arena, Static};
+use crate::Lua;
 use crate::parser::{self, syntax::Root};
 
 use super::compile_chunk;
@@ -17,9 +17,9 @@ fn compile_and_format(source: &str) -> String {
     let root = Root::new(syntax_tree).expect("not a root node");
     let interner = cache.interner();
 
-    let arena = Arena::<Static<()>>::new(|_mc| Static(()));
-    arena.mutate(|mc, _| {
-        let proto = compile_chunk(mc, &root, interner).unwrap();
+    let mut lua = Lua::new();
+    lua.enter(|ctx| {
+        let proto = compile_chunk(ctx, &root, interner).unwrap();
         format_prototype(&proto)
     })
 }
@@ -31,8 +31,8 @@ fn compile_err_and_format(source: &str) -> String {
     let root = Root::new(syntax_tree).expect("not a root node");
     let interner = cache.interner();
 
-    let arena = Arena::<Static<()>>::new(|_mc| Static(()));
-    arena.mutate(|mc, _| match compile_chunk(mc, &root, interner) {
+    let mut lua = Lua::new();
+    lua.enter(|ctx| match compile_chunk(ctx, &root, interner) {
         Err(e) => format!("{e}"),
         Ok(_) => panic!("expected compile error, got success"),
     })
@@ -127,3 +127,17 @@ test!(
 );
 test!(global_star_nested, "test-files/global_star_nested.lua");
 test!(global_const_star, "test-files/global_const_star.lua");
+test!(const_fold, "test-files/const_fold.lua");
+test!(const_no_fold, "test-files/const_no_fold.lua");
+test!(const_fold_branch, "test-files/const_fold_branch.lua");
+test!(op_prec_runtime, "test-files/op_prec_runtime.lua");
+test!(const_local_fold, "test-files/const_local_fold.lua");
+test!(const_local_no_fold, "test-files/const_local_no_fold.lua");
+test!(
+    const_local_outer_fold,
+    "test-files/const_local_outer_fold.lua"
+);
+test!(
+    const_local_multi_level,
+    "test-files/const_local_multi_level.lua"
+);

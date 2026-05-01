@@ -1,5 +1,6 @@
 ---
 source: src/compiler/snapshot_tests.rs
+assertion_line: 74
 expression: output
 ---
 ; function (params=0, vararg=true, stack=3, upvalues=1)
@@ -41,7 +42,7 @@ expression: output
 ;   K34 = 10
 ;   K35 = "20"
 ;   K36 = "y"
-;   K37 = 18
+;   K37 = -18
 ; upvalues:
 ;   U0 = local R0
 ; code:
@@ -78,25 +79,22 @@ expression: output
 0030  SETLIST         R0 count=2 offset=0
 0031  SETTABUP        R0 U0 K24  ; "tl"
 0032  NEWTABLE        R0
-0033  LOAD            R1 K28  ; "anna"
-0034  LOAD            R2 K29  ; 15
-0035  SETTABLE        R2 R0 R1
-0036  LOAD            R1 K30  ; "james"
-0037  LOAD            R2 K31  ; 20
-0038  SETTABLE        R2 R0 R1
-0039  SETTABUP        R0 U0 K27  ; "tr"
-0040  NEWTABLE        R0
-0041  LOAD            R1 K33  ; 0
-0042  LOAD            R2 K34  ; 10
-0043  SETTABLE        R2 R0 R1
-0044  LOAD            R1 K28  ; "anna"
-0045  LOAD            R2 K29  ; 15
-0046  SETTABLE        R2 R0 R1
-0047  LOAD            R1 K30  ; "james"
-0048  LOAD            R2 K35  ; "20"
-0049  SETTABLE        R2 R0 R1
-0050  SETTABUP        R0 U0 K32  ; "tg"
-0051  LOAD            R0 K37  ; 18
-0052  UNM             R0 R0
-0053  SETTABUP        R0 U0 K36  ; "y"
-0054  RETURN          R0 count=1
+0033  LOAD            R1 K29  ; 15
+0034  SETFIELD        R1 R0 K28  ; "anna"
+0035  LOAD            R1 K31  ; 20
+0036  SETFIELD        R1 R0 K30  ; "james"
+0037  SETTABUP        R0 U0 K27  ; "tr"
+0038  NEWTABLE        R0
+0039  LOAD            R1 K33  ; 0
+0040  LOAD            R2 K34  ; 10
+0041  SETTABLE        R2 R0 R1
+0042  LOAD            R1 K28  ; "anna"
+0043  LOAD            R2 K29  ; 15
+0044  SETTABLE        R2 R0 R1
+0045  LOAD            R1 K30  ; "james"
+0046  LOAD            R2 K35  ; "20"
+0047  SETTABLE        R2 R0 R1
+0048  SETTABUP        R0 U0 K32  ; "tg"
+0049  LOAD            R0 K37  ; -18
+0050  SETTABUP        R0 U0 K36  ; "y"
+0051  RETURN          R0 count=1
