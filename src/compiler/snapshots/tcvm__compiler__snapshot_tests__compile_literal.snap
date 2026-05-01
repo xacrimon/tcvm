@@ -1,5 +1,6 @@
 ---
 source: src/compiler/snapshot_tests.rs
+assertion_line: 74
 expression: output
 ---
 ; function (params=0, vararg=true, stack=3, upvalues=1)
@@ -41,7 +42,7 @@ expression: output
 ;   K34 = 10
 ;   K35 = "20"
 ;   K36 = "y"
-;   K37 = 18
+;   K37 = -18
 ; upvalues:
 ;   U0 = local R0
 ; code:
@@ -94,7 +95,6 @@ expression: output
 0046  LOAD            R2 K35  ; "20"
 0047  SETTABLE        R2 R0 R1
 0048  SETTABUP        R0 U0 K32  ; "tg"
-0049  LOAD            R0 K37  ; 18
-0050  UNM             R0 R0
-0051  SETTABUP        R0 U0 K36  ; "y"
-0052  RETURN          R0 count=1
+0049  LOAD            R0 K37  ; -18
+0050  SETTABUP        R0 U0 K36  ; "y"
+0051  RETURN          R0 count=1

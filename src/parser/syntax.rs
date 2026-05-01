@@ -337,6 +337,7 @@ impl PrefixOp {
     }
 }
 
+#[derive(Clone, Copy)]
 pub enum PrefixOperator {
     None,
     Neg,
@@ -380,7 +381,7 @@ impl BinaryOp {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOperator {
     And,
     Or,

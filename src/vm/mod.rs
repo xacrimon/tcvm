@@ -1,2 +1,2 @@
 pub(crate) mod interp;
-mod num;
+pub(crate) mod num;

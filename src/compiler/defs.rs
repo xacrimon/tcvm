@@ -69,6 +69,13 @@ pub(super) struct ExprDesc {
 /// comparison all stay as `Jump` until the consumer decides how to use the
 /// result — branches patch the lists directly, value contexts turn them
 /// back into `Reg` via `discharge_to_reg_mut`.
+///
+/// `Numeral`, `Bool`, and `Nil` mirror Lua 5.5's `VKINT`/`VKFLT`/`VTRUE`/
+/// `VFALSE`/`VNIL` expdesc kinds: the literal value lives inside the
+/// expdesc (no constant slot, no instruction emitted) until discharge.
+/// Operators inspect their operands' kinds and fold by mutating the
+/// expdesc, so a folded sub-expression remains foldable by the enclosing
+/// operator without any intermediate bytecode.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum ExprKind {
     /// Value already sits in this register. `ExprDesc` may still carry
@@ -86,12 +93,52 @@ pub(super) enum ExprKind {
     /// a `goif*` consumes the head; it represents a mixed-polarity list
     /// composition (from `and`/`or`) with no standalone tail jump.
     Jump(Option<usize>),
+    /// Compile-time numeric constant. The value lives in this kind; no
+    /// constant slot is reserved until `discharge_to_reg_mut` fires.
+    Numeral(Numeral),
+    /// Compile-time boolean constant.
+    Bool(bool),
+    /// Compile-time nil.
+    Nil,
+}
+
+/// Numeric literal value held in an `ExprKind::Numeral`. Matches the
+/// integer/float split of Lua values exactly so folded results round-trip
+/// through `Value::integer` / `Value::float` without loss.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum Numeral {
+    Int(i64),
+    Float(f64),
 }
 
 impl ExprDesc {
     pub(super) fn from_reg(reg: RegisterIndex) -> Self {
         ExprDesc {
             kind: ExprKind::Reg(reg),
+            true_list: JumpList::new(),
+            false_list: JumpList::new(),
+        }
+    }
+
+    pub(super) fn from_numeral(n: Numeral) -> Self {
+        ExprDesc {
+            kind: ExprKind::Numeral(n),
+            true_list: JumpList::new(),
+            false_list: JumpList::new(),
+        }
+    }
+
+    pub(super) fn from_bool(b: bool) -> Self {
+        ExprDesc {
+            kind: ExprKind::Bool(b),
+            true_list: JumpList::new(),
+            false_list: JumpList::new(),
+        }
+    }
+
+    pub(super) fn from_nil() -> Self {
+        ExprDesc {
+            kind: ExprKind::Nil,
             true_list: JumpList::new(),
             false_list: JumpList::new(),
         }

@@ -1,0 +1,58 @@
+---
+source: src/compiler/snapshot_tests.rs
+assertion_line: 131
+expression: output
+---
+; function (params=0, vararg=true, stack=2, upvalues=1)
+; constants:
+;   K0 = "a"
+;   K1 = 1
+;   K2 = 0
+;   K3 = "b"
+;   K4 = "c"
+;   K5 = 5
+;   K6 = "d"
+;   K7 = 1.5
+;   K8 = 2
+;   K9 = "e"
+;   K10 = 0.0
+;   K11 = "f"
+;   K12 = "x"
+;   K13 = "g"
+;   K14 = "h"
+;   K15 = "abc"
+; upvalues:
+;   U0 = local R0
+; code:
+0000  VARARGPREP      fixed=0
+0001  LOAD            R0 K1  ; 1
+0002  LOAD            R1 K2  ; 0
+0003  DIV             R0 R0 R1
+0004  SETTABUP        R0 U0 K0  ; "a"
+0005  LOAD            R0 K1  ; 1
+0006  LOAD            R1 K2  ; 0
+0007  IDIV            R0 R0 R1
+0008  SETTABUP        R0 U0 K3  ; "b"
+0009  LOAD            R0 K5  ; 5
+0010  LOAD            R1 K2  ; 0
+0011  MOD             R0 R0 R1
+0012  SETTABUP        R0 U0 K4  ; "c"
+0013  LOAD            R0 K7  ; 1.5
+0014  LOAD            R1 K8  ; 2
+0015  BAND            R0 R0 R1
+0016  SETTABUP        R0 U0 K6  ; "d"
+0017  LOAD            R0 K10  ; 0.0
+0018  LOAD            R1 K10  ; 0.0
+0019  SUB             R0 R0 R1
+0020  SETTABUP        R0 U0 K9  ; "e"
+0021  GETTABUP        R0 U0 K12  ; "x"
+0022  LOAD            R1 K1  ; 1
+0023  ADD             R0 R0 R1
+0024  SETTABUP        R0 U0 K11  ; "f"
+0025  GETTABUP        R0 U0 K12  ; "x"
+0026  UNM             R0 R0
+0027  SETTABUP        R0 U0 K13  ; "g"
+0028  LOAD            R0 K15  ; "abc"
+0029  LEN             R0 R0
+0030  SETTABUP        R0 U0 K14  ; "h"
+0031  RETURN          R0 count=1

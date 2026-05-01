@@ -127,3 +127,17 @@ test!(
 );
 test!(global_star_nested, "test-files/global_star_nested.lua");
 test!(global_const_star, "test-files/global_const_star.lua");
+test!(const_fold, "test-files/const_fold.lua");
+test!(const_no_fold, "test-files/const_no_fold.lua");
+test!(const_fold_branch, "test-files/const_fold_branch.lua");
+test!(op_prec_runtime, "test-files/op_prec_runtime.lua");
+test!(const_local_fold, "test-files/const_local_fold.lua");
+test!(const_local_no_fold, "test-files/const_local_no_fold.lua");
+test!(
+    const_local_outer_fold,
+    "test-files/const_local_outer_fold.lua"
+);
+test!(
+    const_local_multi_level,
+    "test-files/const_local_multi_level.lua"
+);

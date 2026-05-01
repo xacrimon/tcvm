@@ -1,6 +1,6 @@
 use crate::env::Value;
 
-fn exact_float_to_int(f: f64) -> Option<i64> {
+pub fn exact_float_to_int(f: f64) -> Option<i64> {
     if !f.is_finite() {
         return None;
     }
@@ -97,12 +97,26 @@ pub struct Mod;
 impl ArithOp for Mod {
     #[inline(always)]
     fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc> {
-        Value::integer(lhs.wrapping_rem(rhs))
+        let r = lhs.wrapping_rem(rhs);
+        let adjusted = if r != 0 && (r ^ rhs) < 0 {
+            r.wrapping_add(rhs)
+        } else {
+            r
+        };
+
+        Value::integer(adjusted)
     }
 
     #[inline(always)]
     fn float<'gc>(lhs: f64, rhs: f64) -> Value<'gc> {
-        Value::float(lhs % rhs)
+        let r = lhs % rhs;
+        let adjusted = if (r > 0.0 && rhs < 0.0) || (r < 0.0 && rhs > 0.0) {
+            r + rhs
+        } else {
+            r
+        };
+
+        Value::float(adjusted)
     }
 }
 
@@ -139,7 +153,15 @@ pub struct IDiv;
 impl ArithOp for IDiv {
     #[inline(always)]
     fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc> {
-        Value::integer(lhs.wrapping_div(rhs))
+        let q = lhs.wrapping_div(rhs);
+        let r = lhs.wrapping_rem(rhs);
+        let adjusted = if r != 0 && (lhs ^ rhs) < 0 {
+            q.wrapping_sub(1)
+        } else {
+            q
+        };
+
+        Value::integer(adjusted)
     }
 
     #[inline(always)]

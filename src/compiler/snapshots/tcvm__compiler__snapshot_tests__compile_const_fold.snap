@@ -1,0 +1,85 @@
+---
+source: src/compiler/snapshot_tests.rs
+assertion_line: 130
+expression: output
+---
+; function (params=0, vararg=true, stack=1, upvalues=1)
+; constants:
+;   K0 = "a"
+;   K1 = 21
+;   K2 = "b"
+;   K3 = 21.0
+;   K4 = "c"
+;   K5 = 1024.0
+;   K6 = "d"
+;   K7 = 2
+;   K8 = "e"
+;   K9 = 3
+;   K10 = "f"
+;   K11 = 5.5
+;   K12 = "g"
+;   K13 = 2.5
+;   K14 = "h"
+;   K15 = 255
+;   K16 = "i"
+;   K17 = 15
+;   K18 = "j"
+;   K19 = 240
+;   K20 = "k"
+;   K21 = 256
+;   K22 = "l"
+;   K23 = 16
+;   K24 = "m"
+;   K25 = -5
+;   K26 = "n"
+;   K27 = 5
+;   K28 = "o"
+;   K29 = "p"
+;   K30 = false
+;   K31 = "q"
+;   K32 = true
+;   K33 = "r"
+;   K34 = "s"
+; upvalues:
+;   U0 = local R0
+; code:
+0000  VARARGPREP      fixed=0
+0001  LOAD            R0 K1  ; 21
+0002  SETTABUP        R0 U0 K0  ; "a"
+0003  LOAD            R0 K3  ; 21.0
+0004  SETTABUP        R0 U0 K2  ; "b"
+0005  LOAD            R0 K5  ; 1024.0
+0006  SETTABUP        R0 U0 K4  ; "c"
+0007  LOAD            R0 K7  ; 2
+0008  SETTABUP        R0 U0 K6  ; "d"
+0009  LOAD            R0 K9  ; 3
+0010  SETTABUP        R0 U0 K8  ; "e"
+0011  LOAD            R0 K11  ; 5.5
+0012  SETTABUP        R0 U0 K10  ; "f"
+0013  LOAD            R0 K13  ; 2.5
+0014  SETTABUP        R0 U0 K12  ; "g"
+0015  LOAD            R0 K15  ; 255
+0016  SETTABUP        R0 U0 K14  ; "h"
+0017  LOAD            R0 K17  ; 15
+0018  SETTABUP        R0 U0 K16  ; "i"
+0019  LOAD            R0 K19  ; 240
+0020  SETTABUP        R0 U0 K18  ; "j"
+0021  LOAD            R0 K21  ; 256
+0022  SETTABUP        R0 U0 K20  ; "k"
+0023  LOAD            R0 K23  ; 16
+0024  SETTABUP        R0 U0 K22  ; "l"
+0025  LOAD            R0 K25  ; -5
+0026  SETTABUP        R0 U0 K24  ; "m"
+0027  LOAD            R0 K27  ; 5
+0028  SETTABUP        R0 U0 K26  ; "n"
+0029  LOAD            R0 K15  ; 255
+0030  SETTABUP        R0 U0 K28  ; "o"
+0031  LOAD            R0 K30  ; false
+0032  SETTABUP        R0 U0 K29  ; "p"
+0033  LOAD            R0 K32  ; true
+0034  SETTABUP        R0 U0 K31  ; "q"
+0035  LOAD            R0 K30  ; false
+0036  SETTABUP        R0 U0 K33  ; "r"
+0037  LOAD            R0 K32  ; true
+0038  SETTABUP        R0 U0 K34  ; "s"
+0039  RETURN          R0 count=1
