@@ -138,6 +138,16 @@ fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -> String {
                 const_comment(constants, key_idx)
             )
         }
+        Instruction::SELF {
+            dst,
+            object,
+            key_idx,
+        } => {
+            format!(
+                "SELF            R{dst} R{object} K{key_idx}{}",
+                const_comment(constants, key_idx)
+            )
+        }
         Instruction::NEWTABLE { dst } => format!("NEWTABLE        R{dst}"),
         Instruction::ADD { dst, lhs, rhs } => format!("ADD             R{dst} R{lhs} R{rhs}"),
         Instruction::SUB { dst, lhs, rhs } => format!("SUB             R{dst} R{lhs} R{rhs}"),

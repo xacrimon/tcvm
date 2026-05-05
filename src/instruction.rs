@@ -74,6 +74,18 @@ pub enum Instruction {
         key_idx: ConstantIndex,
     },
 
+    /// Method-call setup: `R[dst] = R[object][K[key_idx]]; R[dst+1] = R[object]`.
+    /// Backs `obj:m(...)` codegen. Falls back to the slow path on
+    /// `__index` when the direct lookup is nil. No inline cache —
+    /// caching this site needs a wider IC payload than the current
+    /// fixed-width opcode encoding can carry; revisit when bytecode
+    /// supports variable-width instructions.
+    SELF {
+        dst: Register,
+        object: Register,
+        key_idx: ConstantIndex,
+    },
+
     NEWTABLE {
         dst: Register,
     },

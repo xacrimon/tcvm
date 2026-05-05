@@ -3224,27 +3224,21 @@ fn emit_method_call_setup(
     let object = compile_expr_to_reg(ctx, object_expr, None)?;
 
     let key_idx = ctx.alloc_string_constant(method_name.as_bytes())?;
-    let key_reg = ctx.alloc_register()?;
-    ctx.emit(Instruction::LOAD {
-        dst: key_reg.0,
-        idx: key_idx,
-    });
 
     let func = ctx.alloc_register()?;
-    ctx.emit(Instruction::GETTABLE {
+    ctx.emit(Instruction::SELF {
         dst: func.0,
-        table: object.0,
-        key: key_reg.0,
+        object: object.0,
+        key_idx,
     });
 
+    // SELF writes both `func` and `func+1` (self); reserve the second
+    // slot so subsequent arg compilation lands at func+2 and freereg /
+    // max_stack track the SELF output.
     let self_reg = RegisterIndex(func.0 + 1);
     while ctx.chunk.freereg <= self_reg.0 {
         ctx.alloc_register()?;
     }
-    ctx.emit(Instruction::MOVE {
-        dst: self_reg.0,
-        src: object.0,
-    });
 
     let args: Vec<_> = item.args().map(|a| a.collect()).unwrap_or_default();
     let nargs = args.len() + 1; // +1 for self

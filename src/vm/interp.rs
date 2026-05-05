@@ -24,6 +24,7 @@ static HANDLERS: &[Handler] = &[
     op_settable,
     op_getfield,
     op_setfield,
+    op_self,
     op_newtable,
     op_add,
     op_sub,
@@ -894,6 +895,98 @@ extern "rust-preserve-none" fn setfield_slow<'gc>(
     let v = reg!(src);
     fill_ic_for_constant_key(ctx, thread, ic_idx, t, k);
     table_set_slow_body!(ctx, thread, registers, ip, handlers, t, k, v);
+}
+
+// ---------------------------------------------------------------------------
+// SELF — method-call setup
+// ---------------------------------------------------------------------------
+
+/// Backs `obj:m(...)`. Writes the method into `R[dst]` and the
+/// receiver into `R[dst+1]`. No inline cache for now — see the
+/// instruction definition.
+#[inline(never)]
+extern "rust-preserve-none" fn op_self<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+) -> Result<(), Box<Error>> {
+    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    let (dst, object, key_idx) = args!(Instruction::SELF {
+        dst,
+        object,
+        key_idx
+    });
+
+    let recv_val = reg!(object);
+    let Some(recv) = recv_val.get_table() else {
+        raise!();
+    };
+
+    let key = constant!(key_idx);
+    let (method, need_index) = {
+        let recv_state = recv.inner().borrow();
+        let v = recv_state.raw_get(key);
+        let need = v.is_nil() && recv_state.shape().has_mm(MetamethodBits::INDEX);
+        (v, need)
+    };
+
+    if need_index {
+        become op_self_slow(instruction, ctx, thread, registers, ip, handlers);
+    }
+
+    *reg!(mut dst) = method;
+    *reg!(mut (dst + 1)) = recv_val;
+    dispatch!();
+}
+
+#[inline(never)]
+extern "rust-preserve-none" fn op_self_slow<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+) -> Result<(), Box<Error>> {
+    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    let (dst, object, key_idx) = args!(Instruction::SELF {
+        dst,
+        object,
+        key_idx
+    });
+
+    let recv_val = reg!(object);
+    let Some(recv) = recv_val.get_table() else {
+        raise!();
+    };
+    let key = constant!(key_idx);
+
+    // Reachable only when raw_get returned nil and the INDEX bit is set,
+    // so we go straight to the chain walk.
+    let mt = unsafe { recv.metatable().unwrap_unchecked() };
+    match walk_index_chain(recv, mt, key, ctx.symbols().mm_index) {
+        IndexChain::Resolved(method) => {
+            *reg!(mut dst) = method;
+            *reg!(mut (dst + 1)) = recv_val;
+            dispatch!();
+        }
+        IndexChain::Invoke { func, receiver } => {
+            // Functional __index. Pre-place self at dst+1; the
+            // continuation writes the resolved method into dst.
+            *reg!(mut (dst + 1)) = recv_val;
+            let cont = Continuation {
+                func: cont_store_result,
+                payload: ContinuationPayload::StoreResult { dst },
+                results_base: 0,
+                nret: 0,
+            };
+            invoke_metamethod!(func, &[receiver, key], cont);
+        }
+        IndexChain::Exhausted => raise!(),
+    }
 }
 
 /// R[dst] = {}

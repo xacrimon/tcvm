@@ -141,3 +141,4 @@ test!(
     const_local_multi_level,
     "test-files/const_local_multi_level.lua"
 );
+test!(method_call, "test-files/method_call.lua");
