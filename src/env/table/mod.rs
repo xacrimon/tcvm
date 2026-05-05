@@ -192,8 +192,8 @@ impl<'gc> TableState<'gc> {
     /// Read the slot directly. Caller is responsible for ensuring `slot`
     /// is in range — used by the IC fast path on a verified shape match.
     #[inline]
-    pub fn property_at(&self, slot: u32) -> Value<'gc> {
-        self.properties[slot as usize]
+    pub unsafe fn property_at(&self, slot: u32) -> Value<'gc> {
+        unsafe { *self.properties.get_unchecked(slot as usize) }
     }
 
     #[inline]

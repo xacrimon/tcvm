@@ -572,7 +572,7 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
     let t_state = t.inner().borrow();
     if let Some(slot) = ic_check(cache, t_state.shape()) {
         if slot != InlineCache::ABSENT_SLOT {
-            let v = t_state.property_at(slot);
+            let v = unsafe { t_state.property_at(slot) };
             if !(v.is_nil() && t_state.shape().maybe_has_mm(MetamethodBits::INDEX)) {
                 drop(t_state);
                 *reg!(mut dst) = v;
@@ -639,7 +639,7 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
     let t_state = t.inner().borrow();
     if let Some(slot) = ic_check(cache, t_state.shape()) {
         if slot != InlineCache::ABSENT_SLOT {
-            let existing = t_state.property_at(slot);
+            let existing = unsafe { t_state.property_at(slot) };
             // __newindex fires only on currently-nil keys.
             if !(existing.is_nil() && t_state.shape().maybe_has_mm(MetamethodBits::NEWINDEX)) {
                 drop(t_state);
@@ -823,7 +823,7 @@ extern "rust-preserve-none" fn op_getfield<'gc>(
     let t_state = t.inner().borrow();
     if let Some(slot) = ic_check(cache, t_state.shape()) {
         if slot != InlineCache::ABSENT_SLOT {
-            let v = t_state.property_at(slot);
+            let v = unsafe { t_state.property_at(slot) };
             if !(v.is_nil() && t_state.shape().maybe_has_mm(MetamethodBits::INDEX)) {
                 drop(t_state);
                 *reg!(mut dst) = v;
@@ -886,7 +886,7 @@ extern "rust-preserve-none" fn op_setfield<'gc>(
     let t_state = t.inner().borrow();
     if let Some(slot) = ic_check(cache, t_state.shape()) {
         if slot != InlineCache::ABSENT_SLOT {
-            let existing = t_state.property_at(slot);
+            let existing = unsafe { t_state.property_at(slot) };
             if !(existing.is_nil() && t_state.shape().maybe_has_mm(MetamethodBits::NEWINDEX)) {
                 drop(t_state);
                 let mut state = t.inner().borrow_mut(ctx.mutation());
