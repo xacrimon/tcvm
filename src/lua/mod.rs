@@ -32,6 +32,10 @@ pub struct State<'gc> {
     /// transition tree so two tables that grow through the same key
     /// sequence converge on the same shape pointer.
     pub(crate) empty_shape: Shape<'gc>,
+    /// Shared dict-mode sentinel for tables migrating to dict mode
+    /// while carrying no metatable. Tables with a metatable use the
+    /// per-`MtCache` sentinel via `MtCache::ensure_dict_sentinel`.
+    pub(crate) empty_dict_sentinel: Shape<'gc>,
     /// Globally-interned ambient `LuaString` symbols (metamethod names
     /// and friends). Accessed via `Context::symbols()`.
     pub(crate) symbols: Symbols<'gc>,
@@ -56,10 +60,12 @@ impl Lua {
     pub fn new() -> Self {
         let arena = Arena::<Rootable![State<'_>]>::new(|mc: &Mutation<'_>| {
             let empty_shape = Shape::root_empty(mc);
+            let empty_dict_sentinel = Shape::dict_sentinel(mc, None);
             let interner = Interner::new(mc);
             let symbols = Symbols::intern_all(mc, &interner);
             State {
                 empty_shape,
+                empty_dict_sentinel,
                 symbols,
                 globals: Table::new_with_shape(mc, empty_shape),
                 main_thread: Thread::new(mc),
@@ -200,8 +206,7 @@ mod tests {
                 let add =
                     Function::new_native(ctx.mutation(), native_add as NativeFn, Box::new([]));
                 let key = Value::string(LuaString::new(ctx, b"add"));
-                ctx.globals()
-                    .raw_set(ctx.mutation(), key, Value::function(add));
+                ctx.globals().raw_set(ctx, key, Value::function(add));
 
                 let chunk = ctx.load("return add(2, 3)", Some("native_call"))?;
                 Ok(ctx.stash(Executor::start(ctx, chunk, ())))
@@ -245,8 +250,7 @@ mod tests {
                 let add =
                     Function::new_native(ctx.mutation(), native_add as NativeFn, Box::new([]));
                 let key = Value::string(LuaString::new(ctx, b"add"));
-                ctx.globals()
-                    .raw_set(ctx.mutation(), key, Value::function(add));
+                ctx.globals().raw_set(ctx, key, Value::function(add));
 
                 let chunk = ctx.load(
                     "local function f() return add(2, 3) end return f()",
@@ -270,8 +274,7 @@ mod tests {
                 let add =
                     Function::new_native(ctx.mutation(), native_add as NativeFn, Box::new([]));
                 let key = Value::string(LuaString::new(ctx, b"add"));
-                ctx.globals()
-                    .raw_set(ctx.mutation(), key, Value::function(add));
+                ctx.globals().raw_set(ctx, key, Value::function(add));
 
                 let chunk = ctx.load(
                     "local function outer() \
@@ -338,8 +341,7 @@ mod tests {
                 let probe =
                     Function::new_native(ctx.mutation(), native_id as NativeFn, Box::new([]));
                 let key = Value::string(LuaString::new(ctx, b"probe"));
-                ctx.globals()
-                    .raw_set(ctx.mutation(), key, Value::function(probe));
+                ctx.globals().raw_set(ctx, key, Value::function(probe));
                 let chunk = ctx.load(src, Some("test"))?;
                 Ok(ctx.stash(Executor::start(ctx, chunk, ())))
             })
@@ -622,8 +624,7 @@ mod tests {
                 let probe =
                     Function::new_native(ctx.mutation(), native_id as NativeFn, Box::new([]));
                 let key = Value::string(LuaString::new(ctx, b"probe"));
-                ctx.globals()
-                    .raw_set(ctx.mutation(), key, Value::function(probe));
+                ctx.globals().raw_set(ctx, key, Value::function(probe));
                 let chunk = ctx.load(src, Some("test"))?;
                 Ok(ctx.stash(Executor::start(ctx, chunk, ())))
             })
@@ -820,10 +821,10 @@ mod tests {
             let kx = Value::string(LuaString::new(ctx, b"x"));
             let ky = Value::string(LuaString::new(ctx, b"y"));
 
-            a.raw_set(ctx.mutation(), kx, Value::integer(1));
-            a.raw_set(ctx.mutation(), ky, Value::integer(2));
-            b.raw_set(ctx.mutation(), kx, Value::integer(10));
-            b.raw_set(ctx.mutation(), ky, Value::integer(20));
+            a.raw_set(ctx, kx, Value::integer(1));
+            a.raw_set(ctx, ky, Value::integer(2));
+            b.raw_set(ctx, kx, Value::integer(10));
+            b.raw_set(ctx, ky, Value::integer(20));
 
             assert!(
                 Shape::ptr_eq(a.shape(), b.shape()),
@@ -832,8 +833,8 @@ mod tests {
 
             // Different ordering -> different shape pointer.
             let c = Table::new(ctx);
-            c.raw_set(ctx.mutation(), ky, Value::integer(2));
-            c.raw_set(ctx.mutation(), kx, Value::integer(1));
+            c.raw_set(ctx, ky, Value::integer(2));
+            c.raw_set(ctx, kx, Value::integer(1));
             assert!(
                 !Shape::ptr_eq(a.shape(), c.shape()),
                 "tables grown through different key orders should have distinct shapes"

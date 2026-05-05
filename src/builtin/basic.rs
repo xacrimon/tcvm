@@ -7,7 +7,7 @@ use crate::env::{Function, LuaString, NativeContext, NativeError, NativeFn, Stac
 //                    Function::new_native(ctx.mutation(), native_add as NativeFn, Box::new([]));
 //                let key = Value::String(LuaString::new(ctx, b"add"));
 //                ctx.globals()
-//                    .raw_set(ctx.mutation(), key, Value::Function(add));
+//                    .raw_set(ctx, key, Value::Function(add));
 
 pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[
@@ -40,8 +40,7 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         let handler = Function::new_native(ctx.mutation(), handler, Box::new([]));
         let key = Value::string(LuaString::new(ctx, name.as_bytes()));
 
-        ctx.globals()
-            .raw_set(ctx.mutation(), key, Value::function(handler));
+        ctx.globals().raw_set(ctx, key, Value::function(handler));
     }
 }
 
@@ -166,7 +165,7 @@ fn lua_rawset<'gc>(
             "bad argument #1 to 'rawset' (table expected)",
         ));
     };
-    t.raw_set(nctx.ctx.mutation(), key, value);
+    t.raw_set(nctx.ctx, key, value);
     stack.replace(&[Value::table(t)]);
     Ok(())
 }
@@ -201,6 +200,16 @@ fn lua_setmetatable<'gc>(
             "bad argument #2 to 'setmetatable' (nil or table expected)",
         ));
     };
+    // If the existing metatable carries a `__metatable` field, the
+    // metatable is locked: refuse the change. Matches Lua 5.5 reference
+    // behavior (`luaL_error("cannot change a protected metatable")`).
+    if let Some(existing) = t.metatable() {
+        let lock_key = LuaString::new(nctx.ctx, b"__metatable");
+        let lock_val = existing.raw_get(Value::string(lock_key));
+        if !lock_val.is_nil() {
+            return Err(NativeError::new("cannot change a protected metatable"));
+        }
+    }
     t.set_metatable(nctx.ctx, mt);
     stack.replace(&[Value::table(t)]);
     Ok(())

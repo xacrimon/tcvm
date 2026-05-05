@@ -1,15 +1,31 @@
+#[cfg(any(debug_assertions, test))]
+use core::cell::Cell;
 use core::{
-    cell::{Cell, UnsafeCell},
+    cell::UnsafeCell,
     cmp::Ordering,
     fmt,
     ops::{Deref, DerefMut},
 };
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 type BorrowFlag = isize;
 
+/// Stripped-down `RefCell<T>` used as the cell behind `RefLock`.
+///
+/// Behaves like `RefCell` under debug builds and under `cfg(test)`:
+/// `borrow` / `borrow_mut` track outstanding borrows in a `Cell<isize>`
+/// flag and panic on aliasing. Under release-without-tests, both
+/// methods skip the check entirely and rely on the caller to uphold
+/// Rust's aliasing rules manually.
+///
+/// **Safety contract for release builds:** at any moment, the
+/// outstanding borrows on a single `CheckedCell` must satisfy Rust's
+/// `&` / `&mut` rules. Concretely: never call `borrow_mut` while a
+/// `Ref` is live, and never call `borrow` while a `RefMut` is live.
+/// VM hot paths follow a strict drop-then-reborrow discipline; tests
+/// (run in debug or with `cfg(test)`) catch violations.
 pub struct CheckedCell<T: ?Sized> {
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, test))]
     flag: Cell<BorrowFlag>,
     value: UnsafeCell<T>,
 }
@@ -18,7 +34,7 @@ impl<T> CheckedCell<T> {
     #[inline]
     pub const fn new(t: T) -> Self {
         Self {
-            #[cfg(debug_assertions)]
+            #[cfg(any(debug_assertions, test))]
             flag: Cell::new(0),
             value: UnsafeCell::new(t),
         }
@@ -61,7 +77,7 @@ impl<T: ?Sized> CheckedCell<T> {
 
     #[inline]
     pub fn try_borrow(&self) -> Result<Ref<'_, T>, BorrowError> {
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, test))]
         {
             let f = self.flag.get();
             if f < 0 {
@@ -73,10 +89,11 @@ impl<T: ?Sized> CheckedCell<T> {
                 flag: &self.flag,
             })
         }
-        #[cfg(not(debug_assertions))]
+        #[cfg(not(any(debug_assertions, test)))]
         {
-            // SAFETY: borrow checking is disabled in release; callers must
-            // ensure no `RefMut` is outstanding. Debug builds verify this.
+            // SAFETY: borrow checking is disabled in release-without-tests;
+            // callers must ensure no `RefMut` is outstanding. Debug and
+            // test builds verify this via the flag.
             Ok(Ref {
                 value: unsafe { &*self.value.get() },
             })
@@ -94,7 +111,7 @@ impl<T: ?Sized> CheckedCell<T> {
 
     #[inline]
     pub fn try_borrow_mut(&self) -> Result<RefMut<'_, T>, BorrowMutError> {
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, test))]
         {
             let f = self.flag.get();
             if f != 0 {
@@ -106,10 +123,11 @@ impl<T: ?Sized> CheckedCell<T> {
                 flag: &self.flag,
             })
         }
-        #[cfg(not(debug_assertions))]
+        #[cfg(not(any(debug_assertions, test)))]
         {
-            // SAFETY: borrow checking is disabled in release; callers must
-            // ensure no other borrows exist. Debug builds verify this.
+            // SAFETY: borrow checking is disabled in release-without-tests;
+            // callers must ensure no other borrows exist. Debug and test
+            // builds verify this via the flag.
             Ok(RefMut {
                 value: unsafe { &mut *self.value.get() },
             })
@@ -195,7 +213,7 @@ impl fmt::Display for BorrowMutError {
 
 pub struct Ref<'b, T: ?Sized + 'b> {
     value: &'b T,
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, test))]
     flag: &'b Cell<BorrowFlag>,
 }
 
@@ -208,7 +226,7 @@ impl<T: ?Sized> Deref for Ref<'_, T> {
     }
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 impl<T: ?Sized> Drop for Ref<'_, T> {
     #[inline]
     fn drop(&mut self) {
@@ -232,7 +250,7 @@ impl<T: ?Sized + fmt::Display> fmt::Display for Ref<'_, T> {
 
 pub struct RefMut<'b, T: ?Sized + 'b> {
     value: &'b mut T,
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, test))]
     flag: &'b Cell<BorrowFlag>,
 }
 
@@ -252,7 +270,7 @@ impl<T: ?Sized> DerefMut for RefMut<'_, T> {
     }
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 impl<T: ?Sized> Drop for RefMut<'_, T> {
     #[inline]
     fn drop(&mut self) {

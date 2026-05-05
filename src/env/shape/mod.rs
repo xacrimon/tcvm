@@ -22,7 +22,8 @@ use hashbrown::{HashTable, hash_table};
 
 use crate::dmm::allocator_api::MetricsAlloc;
 use crate::dmm::barrier::unlock;
-use crate::dmm::{Collect, Gc, GcWeak, Mutation, RefLock};
+use crate::dmm::{Collect, Gc, GcWeak, Lock, Mutation, RefLock};
+use crate::env::for_each_metamethod;
 use crate::env::string::LuaString;
 
 /// V8-style "Map" / hidden class. Copy wrapper over a single Gc pointer
@@ -40,12 +41,12 @@ pub struct Shape<'gc>(Gc<'gc, ShapeData<'gc>>);
 /// in place across mutations of `__index` / `__newindex` / etc.
 #[derive(Clone, Copy, Collect)]
 #[collect(internal, no_drop)]
-pub struct MtCache<'gc>(Gc<'gc, MtCacheData>);
+pub struct MtCache<'gc>(Gc<'gc, MtCacheData<'gc>>);
 
 /// One descriptor entry: a string key and the slot it occupies in
-/// `TableState::properties`. Stored in `ShapeData::descriptors` sorted
-/// by `LuaString` pointer identity for O(log n) binary search on slow
-/// paths.
+/// `TableState::properties`. Stored in `ShapeData::descriptors` in
+/// insertion order; slow-path lookups are linear, capped by
+/// `MAX_PROPERTIES_FAST = 64`.
 #[derive(Clone, Copy, Collect)]
 #[collect(internal, no_drop)]
 pub struct Descriptor<'gc> {
@@ -57,33 +58,16 @@ pub struct Descriptor<'gc> {
 #[collect(internal, require_static)]
 pub struct MetamethodBits(u32);
 
-bitflags! {
-    impl MetamethodBits: u32 {
-        const INDEX     = 1 << 0;
-        const NEWINDEX  = 1 << 1;
-        const ADD       = 1 << 2;
-        const SUB       = 1 << 3;
-        const MUL       = 1 << 4;
-        const DIV       = 1 << 5;
-        const MOD       = 1 << 6;
-        const POW       = 1 << 7;
-        const IDIV      = 1 << 8;
-        const BAND      = 1 << 9;
-        const BOR       = 1 << 10;
-        const BXOR      = 1 << 11;
-        const BNOT      = 1 << 12;
-        const SHL       = 1 << 13;
-        const SHR       = 1 << 14;
-        const UNM       = 1 << 15;
-        const EQ        = 1 << 16;
-        const LT        = 1 << 17;
-        const LE        = 1 << 18;
-        const CONCAT    = 1 << 19;
-        const LEN       = 1 << 20;
-        const CALL      = 1 << 21;
-        const TOSTRING  = 1 << 22;
-    }
+macro_rules! emit_bitflags {
+    ($(($upper:ident, $bit:literal, $bytes:literal, $field:ident);)*) => {
+        bitflags! {
+            impl MetamethodBits: u32 {
+                $(const $upper = 1 << $bit;)*
+            }
+        }
+    };
 }
+for_each_metamethod!(emit_bitflags);
 
 /// Maximum string-keyed properties a table can hold in fast mode.
 /// Beyond this, set_string_key migrates the table to dictionary mode
@@ -98,31 +82,14 @@ pub const MAX_PROPERTIES_FAST: u32 = 64;
 ///   - `Table::ensure_mt_cache` (read-side at first-adoption: walk
 ///     the metatable's slots and OR together the bits for each
 ///     present metamethod to seed the cache).
-pub const METAMETHOD_TABLE: &[(&[u8], MetamethodBits)] = &[
-    (b"__index", MetamethodBits::INDEX),
-    (b"__newindex", MetamethodBits::NEWINDEX),
-    (b"__add", MetamethodBits::ADD),
-    (b"__sub", MetamethodBits::SUB),
-    (b"__mul", MetamethodBits::MUL),
-    (b"__div", MetamethodBits::DIV),
-    (b"__mod", MetamethodBits::MOD),
-    (b"__pow", MetamethodBits::POW),
-    (b"__idiv", MetamethodBits::IDIV),
-    (b"__band", MetamethodBits::BAND),
-    (b"__bor", MetamethodBits::BOR),
-    (b"__bxor", MetamethodBits::BXOR),
-    (b"__bnot", MetamethodBits::BNOT),
-    (b"__shl", MetamethodBits::SHL),
-    (b"__shr", MetamethodBits::SHR),
-    (b"__unm", MetamethodBits::UNM),
-    (b"__eq", MetamethodBits::EQ),
-    (b"__lt", MetamethodBits::LT),
-    (b"__le", MetamethodBits::LE),
-    (b"__concat", MetamethodBits::CONCAT),
-    (b"__len", MetamethodBits::LEN),
-    (b"__call", MetamethodBits::CALL),
-    (b"__tostring", MetamethodBits::TOSTRING),
-];
+macro_rules! emit_byte_table {
+    ($(($upper:ident, $bit:literal, $bytes:literal, $field:ident);)*) => {
+        pub const METAMETHOD_TABLE: &[(&[u8], MetamethodBits)] = &[
+            $(($bytes, MetamethodBits::$upper),)*
+        ];
+    };
+}
+for_each_metamethod!(emit_byte_table);
 
 /// Map a key's bytes to its metamethod bit, if any. Cheap match-on-bytes
 /// lookup — no `Context`/`State` access needed, callable from any
@@ -208,12 +175,19 @@ pub struct ShapeData<'gc> {
 }
 
 #[derive(Collect)]
-#[collect(internal, require_static)]
-pub struct MtCacheData {
+#[collect(internal, no_drop)]
+pub struct MtCacheData<'gc> {
+    #[collect(require_static)]
     pub bits: Cell<MetamethodBits>,
+    /// Lazily-allocated dict-mode sentinel for tables that drop into
+    /// dict mode while carrying this metatable. Populated on the first
+    /// call to `MtCache::ensure_dict_sentinel`; subsequent calls return
+    /// the same `Shape` pointer so dict-mode tables sharing a metatable
+    /// also share a shape.
+    pub dict_sentinel: Lock<Option<Shape<'gc>>>,
 }
 
-impl MtCacheData {
+impl<'gc> MtCacheData<'gc> {
     #[inline]
     pub fn get(&self) -> MetamethodBits {
         self.bits.get()
@@ -253,8 +227,26 @@ impl<'gc> MtCache<'gc> {
             mc,
             MtCacheData {
                 bits: Cell::new(bits),
+                dict_sentinel: Lock::new(None),
             },
         ))
+    }
+
+    /// Lazily allocate the dict-mode sentinel shape that all tables
+    /// carrying this metatable share once they migrate to dict mode.
+    /// Hit-side cost is one Gc deref + one option load.
+    #[inline]
+    pub fn ensure_dict_sentinel(self, mc: &Mutation<'gc>) -> Shape<'gc> {
+        if let Some(s) = self.0.dict_sentinel.get() {
+            return s;
+        }
+        let new_shape = Shape::dict_sentinel(mc, Some(self));
+        // We're adopting a fresh `Shape` Gc through the `Lock<Option<Shape>>`
+        // field, so emit the backward barrier on the parent MtCacheData
+        // before writing through `as_cell()`.
+        mc.backward_barrier(Gc::erase(self.0), None);
+        unsafe { self.0.dict_sentinel.as_cell() }.set(Some(new_shape));
+        new_shape
     }
 
     #[inline]
@@ -278,7 +270,7 @@ impl<'gc> MtCache<'gc> {
     }
 
     #[inline]
-    pub fn inner(self) -> Gc<'gc, MtCacheData> {
+    pub fn inner(self) -> Gc<'gc, MtCacheData<'gc>> {
         self.0
     }
 
@@ -364,24 +356,16 @@ impl<'gc> Shape<'gc> {
         &self.data().descriptors
     }
 
-    /// Look up a string key in this shape. Linear scan for very small
-    /// shapes; binary search by `LuaString` pointer identity above the
-    /// cutoff. Returns the slot index if present.
+    /// Look up a string key in this shape. Linear scan over descriptors,
+    /// bounded by `MAX_PROPERTIES_FAST`. The IC fast path bypasses this
+    /// entirely; only slow paths reach here.
     pub fn find_slot(self, key: LuaString<'gc>) -> Option<u32> {
-        let descs = self.descriptors();
-        if descs.len() <= 8 {
-            for d in descs {
-                if d.key == key {
-                    return Some(d.slot);
-                }
+        for d in self.descriptors() {
+            if d.key == key {
+                return Some(d.slot);
             }
-            return None;
         }
-        let key_ptr = Gc::as_ptr(key.inner()) as usize;
-        descs
-            .binary_search_by_key(&key_ptr, |d| Gc::as_ptr(d.key.inner()) as usize)
-            .ok()
-            .map(|i| descs[i].slot)
+        None
     }
 
     /// Returns `true` if the metatable behind this shape currently has
@@ -442,9 +426,6 @@ pub fn transition_add_prop<'gc>(
         key,
         slot: new_slot,
     });
-    // Keep descriptors sorted by LuaString pointer identity so
-    // `Shape::find_slot` can binary-search the larger ones.
-    new_descs.sort_by_key(|d| Gc::as_ptr(d.key.inner()) as usize);
 
     let child_data = Gc::new(
         mc,
@@ -496,11 +477,25 @@ pub fn transition_add_prop<'gc>(
 /// Switch the metatable on `parent`, returning a shape with the same
 /// ordered key list but the new `mt_cache`. Caches transitions on
 /// `parent` so repeated `setmetatable(t, mt)` calls share shapes.
+///
+/// For dict-mode parents the call routes to the per-`mt_cache` dict
+/// sentinel (`MtCache::ensure_dict_sentinel`) or, when stripping the
+/// metatable, to `State::empty_dict_sentinel` provided by the caller.
 pub fn transition_set_metatable<'gc>(
     mc: &Mutation<'gc>,
     parent: Shape<'gc>,
     new_mt: Option<MtCache<'gc>>,
+    no_mt_dict_sentinel: Shape<'gc>,
 ) -> Shape<'gc> {
+    // Dict-mode parent: never go through the prop-transition tree.
+    // Route to the unique dict sentinel for the new metatable.
+    if parent.is_dict() {
+        return match new_mt {
+            Some(c) => c.ensure_dict_sentinel(mc),
+            None => no_mt_dict_sentinel,
+        };
+    }
+
     // Fast path: existing edge.
     {
         let table = parent.data().transitions.borrow();
@@ -512,19 +507,37 @@ pub fn transition_set_metatable<'gc>(
         }
     }
 
-    // Slow path: rebuild the same key list under the new mt_cache. We
-    // walk the parent chain to collect ordered keys, then re-resolve
-    // from the empty shape via `transition_add_prop`. This is O(slots)
-    // and rare (setmetatable is not a hot path).
-    let keys = collect_keys_in_order(parent);
-    let empty = empty_shape_for(mc, new_mt);
-    let mut shape = empty;
-    for k in keys {
-        shape = transition_add_prop(mc, shape, k);
-    }
+    // Slow path: produce a sibling shape with the same descriptors
+    // (and slot mapping) but the new `mt_cache`. We don't rebuild the
+    // parent chain via N transitions — descriptors carry slot identity
+    // directly, and `collect_keys_in_order` walking the new shape
+    // still works because we keep `parent` / `last_key` pointing into
+    // `parent`'s chain. Future prop additions on the result will mint
+    // their own edges normally.
+    let descriptors: Box<[Descriptor<'gc>]> = parent.descriptors().to_vec().into_boxed_slice();
+    let child_data = Gc::new(
+        mc,
+        ShapeData {
+            // Anchor the chain on `parent` itself: walking
+            // (None last_key, Some parent) from the new shape reaches
+            // `parent.last_key` -> `parent.parent.last_key` -> ...,
+            // recovering the same key sequence.
+            parent: Some(parent),
+            last_key: None,
+            slot_count: parent.slot_count(),
+            mt_cache: new_mt,
+            is_dict: false,
+            transitions: RefLock::new(TransitionTable {
+                by_prop: HashTable::new_in(MetricsAlloc::new(mc)),
+                by_mt: HashTable::new_in(MetricsAlloc::new(mc)),
+            }),
+            descriptors,
+        },
+    );
+    let child = Shape(child_data);
 
-    // Install the edge on `parent` (not `empty`) so future
-    // setmetatable calls from this same starting shape share.
+    // Install the edge on `parent` so future setmetatable calls from
+    // this same starting shape share the result.
     {
         let parent_write = Gc::write(mc, parent.0);
         let mut table = unlock!(parent_write, ShapeData, transitions).borrow_mut();
@@ -538,58 +551,19 @@ pub fn transition_set_metatable<'gc>(
             hash_table::Entry::Occupied(mut o) => {
                 *o.get_mut() = MtEdge {
                     mt_cache: new_mt,
-                    child: Gc::downgrade(shape.0),
+                    child: Gc::downgrade(child_data),
                 };
             }
             hash_table::Entry::Vacant(v) => {
                 v.insert(MtEdge {
                     mt_cache: new_mt,
-                    child: Gc::downgrade(shape.0),
+                    child: Gc::downgrade(child_data),
                 });
             }
         }
     }
 
-    shape
-}
-
-fn collect_keys_in_order<'gc>(shape: Shape<'gc>) -> Vec<LuaString<'gc>> {
-    // Walk up the parent chain to gather keys in insertion order.
-    let mut keys: Vec<LuaString<'gc>> = Vec::with_capacity(shape.slot_count() as usize);
-    let mut s = shape;
-    loop {
-        if let Some(k) = s.data().last_key {
-            keys.push(k);
-        }
-        match s.data().parent {
-            Some(p) => s = p,
-            None => break,
-        }
-    }
-    keys.reverse();
-    keys
-}
-
-fn empty_shape_for<'gc>(mc: &Mutation<'gc>, mt_cache: Option<MtCache<'gc>>) -> Shape<'gc> {
-    // For now we allocate a fresh empty-with-mt root each call; the
-    // caller (typically `set_metatable`) caches the result via the
-    // transition edge above. A future optimization can pre-register
-    // these in `State`.
-    Shape(Gc::new(
-        mc,
-        ShapeData {
-            parent: None,
-            last_key: None,
-            slot_count: 0,
-            mt_cache,
-            is_dict: false,
-            transitions: RefLock::new(TransitionTable {
-                by_prop: HashTable::new_in(MetricsAlloc::new(mc)),
-                by_mt: HashTable::new_in(MetricsAlloc::new(mc)),
-            }),
-            descriptors: Box::from([]),
-        },
-    ))
+    child
 }
 
 #[inline]

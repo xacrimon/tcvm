@@ -10,17 +10,16 @@ pub fn load<'gc>(ctx: Context<'gc>) {
     for &(name, handler) in fns {
         let handler = Function::new_native(ctx.mutation(), handler, Box::new([]));
         let key = Value::string(LuaString::new(ctx, name.as_bytes()));
-        lib.raw_set(ctx.mutation(), key, Value::function(handler));
+        lib.raw_set(ctx, key, Value::function(handler));
     }
 
     let lib_name = Value::string(LuaString::new(ctx, b"package"));
-    ctx.globals()
-        .raw_set(ctx.mutation(), lib_name, Value::table(lib));
+    ctx.globals().raw_set(ctx, lib_name, Value::table(lib));
 
     let require = Function::new_native(ctx.mutation(), lua_require, Box::new([]));
     let require_key = Value::string(LuaString::new(ctx, b"require"));
     ctx.globals()
-        .raw_set(ctx.mutation(), require_key, Value::function(require));
+        .raw_set(ctx, require_key, Value::function(require));
 }
 
 fn lua_loadlib<'gc>(

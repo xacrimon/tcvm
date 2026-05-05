@@ -253,7 +253,7 @@ macro_rules! table_get_slow_body {
 
         // INDEX bit implies metatable is Some.
         let __mt = unsafe { __t.metatable().unwrap_unchecked() };
-        match walk_index_chain($ctx, __t, __mt, __k, $ctx.symbols().mm_index) {
+        match walk_index_chain(__t, __mt, __k, $ctx.symbols().mm_index) {
             IndexChain::Resolved(__rv) => {
                 *reg!(mut __dst_reg) = __rv;
                 dispatch!();
@@ -286,9 +286,9 @@ macro_rules! table_set_slow_body {
         let __k: Value<'gc> = $k;
         let __new_val: Value<'gc> = $v;
 
-        match walk_newindex_chain($ctx, __t, __k, $ctx.symbols().mm_newindex) {
+        match walk_newindex_chain(__t, __k, $ctx.symbols().mm_newindex) {
             NewIndexChain::RawSet(__target) => {
-                __target.raw_set($ctx.mutation(), __k, __new_val);
+                __target.raw_set($ctx, __k, __new_val);
                 dispatch!();
             }
             NewIndexChain::Invoke {
@@ -376,8 +376,11 @@ fn fill_ic_for_constant_key<'gc>(
     t: Table<'gc>,
     k: Value<'gc>,
 ) {
-    // GETFIELD/SETFIELD/GETTABUP/SETTABUP only carry constant string
-    // keys — non-string would be a compiler bug, so be defensive.
+    // GETFIELD/SETFIELD/GETTABUP/SETTABUP only carry constant string keys.
+    debug_assert!(
+        k.get_string().is_some(),
+        "IC fill on non-string key — compiler invariant violation"
+    );
     let Some(key_str) = k.get_string() else {
         return;
     };
@@ -622,16 +625,7 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
                 drop(t_state);
                 let mut state = t.inner().borrow_mut(ctx.mutation());
                 state.properties[slot as usize] = v;
-                // Mirror metamethod-named writes into the shared
-                // `MtCache` bitset. Inlined to avoid raw_set_with_hash's
-                // duplicate slot lookup.
-                let k = constant!(key);
-                if let Some(s) = k.get_string()
-                    && let Some(cache) = state.mt_cache()
-                    && let Some(bit) = crate::env::shape::metamethod_bit_of_bytes(s.as_bytes())
-                {
-                    cache.update(bit, v);
-                }
+                state.maybe_update_mt_bit(constant!(key), v);
                 dispatch!()
             }
         }
@@ -751,7 +745,7 @@ extern "rust-preserve-none" fn op_settable<'gc>(
     }
 
     let mut t_state = t.inner().borrow_mut(ctx.mutation());
-    t_state.raw_set(ctx.mutation(), k, v);
+    t_state.raw_set(ctx, k, v);
     dispatch!()
 }
 
@@ -868,13 +862,7 @@ extern "rust-preserve-none" fn op_setfield<'gc>(
                 drop(t_state);
                 let mut state = t.inner().borrow_mut(ctx.mutation());
                 state.properties[slot as usize] = v;
-                let k = constant!(key_idx);
-                if let Some(s) = k.get_string()
-                    && let Some(cache) = state.mt_cache()
-                    && let Some(bit) = crate::env::shape::metamethod_bit_of_bytes(s.as_bytes())
-                {
-                    cache.update(bit, v);
-                }
+                state.maybe_update_mt_bit(constant!(key_idx), v);
                 dispatch!()
             }
         }
@@ -1770,13 +1758,15 @@ extern "rust-preserve-none" fn op_setlist<'gc>(
         count,
         offset
     });
-    let t = reg!(table).get_table().unwrap();
+    let Some(t) = reg!(table).get_table() else {
+        raise!();
+    };
     let n = count as usize;
     let off = offset as i64;
     for i in 1..=n {
         let val = reg!(table + i as u8);
         let key = Value::integer(off + i as i64);
-        t.raw_set(ctx.mutation(), key, val);
+        t.raw_set(ctx, key, val);
     }
     dispatch!();
 }
@@ -2138,8 +2128,8 @@ fn close_upvalues<'gc>(mc: &Mutation<'gc>, thread: &mut ThreadState<'gc>, start_
 // ---------------------------------------------------------------------------
 
 /// Maximum depth of `__index` / `__newindex` / `__call` chains before we
-/// give up and raise (matches Lua's `MAXTAGLOOP`).
-const MAX_TAG_LOOP: usize = 200;
+/// give up and raise (matches Lua 5.4's `MAXTAGLOOP`).
+const MAX_TAG_LOOP: usize = 2000;
 
 /// Result of walking an `__index` chain.
 enum IndexChain<'gc> {
@@ -2163,7 +2153,6 @@ enum IndexChain<'gc> {
 /// pre-interned `__index` LuaString — the function never re-interns it.
 #[inline]
 fn walk_index_chain<'gc>(
-    ctx: Context<'gc>,
     start: Table<'gc>,
     start_metatable: Table<'gc>,
     key: Value<'gc>,
@@ -2219,7 +2208,6 @@ enum NewIndexChain<'gc> {
 /// LuaString — the function never re-interns it.
 #[inline]
 fn walk_newindex_chain<'gc>(
-    _ctx: Context<'gc>,
     table: Table<'gc>,
     key: Value<'gc>,
     mm_newindex_name: LuaString<'gc>,

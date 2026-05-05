@@ -29,24 +29,8 @@ impl<'gc> Table<'gc> {
         self.0.borrow().raw_get(key)
     }
 
-    pub fn raw_set(self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>) {
-        self.0.borrow_mut(mc).raw_set(mc, key, value);
-    }
-
-    pub fn raw_get_with_hash(self, key: Value<'gc>, hash: u64) -> Value<'gc> {
-        self.0.borrow().raw_get_with_hash(key, hash)
-    }
-
-    pub fn raw_set_with_hash(
-        self,
-        mc: &Mutation<'gc>,
-        key: Value<'gc>,
-        value: Value<'gc>,
-        hash: u64,
-    ) {
-        self.0
-            .borrow_mut(mc)
-            .raw_set_with_hash(mc, key, value, hash);
+    pub fn raw_set(self, ctx: Context<'gc>, key: Value<'gc>, value: Value<'gc>) {
+        self.0.borrow_mut(ctx.mutation()).raw_set(ctx, key, value);
     }
 
     pub fn raw_len(self) -> usize {
@@ -68,7 +52,12 @@ impl<'gc> Table<'gc> {
             None => None,
         };
         let mut state = self.0.borrow_mut(ctx.mutation());
-        state.shape = shape::transition_set_metatable(ctx.mutation(), state.shape, new_cache);
+        state.shape = shape::transition_set_metatable(
+            ctx.mutation(),
+            state.shape,
+            new_cache,
+            ctx.empty_dict_sentinel(),
+        );
         state.metatable = mt;
     }
 
@@ -199,6 +188,21 @@ impl<'gc> TableState<'gc> {
         self.mt_cache
     }
 
+    /// If `key` is a metamethod-named string and this table has been
+    /// adopted as a metatable, mirror the write into the shared
+    /// `MtCache` bitset so downstream shapes observe the change without
+    /// a freshness check. Cheap on the common path: short-circuits when
+    /// `mt_cache` is None.
+    #[inline]
+    pub fn maybe_update_mt_bit(&self, key: Value<'gc>, value: Value<'gc>) {
+        if let Some(s) = key.get_string()
+            && let Some(cache) = self.mt_cache
+            && let Some(bit) = shape::metamethod_bit_of_bytes(s.as_bytes())
+        {
+            cache.update(bit, value);
+        }
+    }
+
     /// Read the slot directly. Caller is responsible for ensuring `slot`
     /// is in range — used by the IC fast path on a verified shape match.
     #[inline]
@@ -218,20 +222,6 @@ impl<'gc> TableState<'gc> {
             };
         }
         self.misc_hash_get(key, value_hash(key))
-    }
-
-    #[inline]
-    pub fn raw_get_with_hash(&self, key: Value<'gc>, hash: u64) -> Value<'gc> {
-        if let Some(s) = key.get_string() {
-            return self.get_string_key(s);
-        }
-        if let Some(index) = array_index(key) {
-            return match self.array.get(index - 1) {
-                Some(value) => *value,
-                None => Value::nil(),
-            };
-        }
-        self.misc_hash_get(key, hash)
     }
 
     #[inline]
@@ -263,9 +253,9 @@ impl<'gc> TableState<'gc> {
     }
 
     #[inline]
-    pub fn raw_set(&mut self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>) {
+    pub fn raw_set(&mut self, ctx: Context<'gc>, key: Value<'gc>, value: Value<'gc>) {
         if let Some(s) = key.get_string() {
-            self.set_string_key(mc, s, value);
+            self.set_string_key(ctx, s, value);
             return;
         }
         if let Some(index) = array_index(key) {
@@ -281,34 +271,9 @@ impl<'gc> TableState<'gc> {
         self.misc_hash_set(key, value, value_hash(key));
     }
 
-    #[inline]
-    pub fn raw_set_with_hash(
-        &mut self,
-        mc: &Mutation<'gc>,
-        key: Value<'gc>,
-        value: Value<'gc>,
-        hash: u64,
-    ) {
-        if let Some(s) = key.get_string() {
-            self.set_string_key(mc, s, value);
-            return;
-        }
-        if let Some(index) = array_index(key) {
-            if index > self.array.len() {
-                self.array.resize(index, Value::nil());
-            }
-            self.array[index - 1] = value;
-            return;
-        }
-        if key.is_nil() {
-            todo!();
-        }
-        self.misc_hash_set(key, value, hash);
-    }
-
-    fn set_string_key(&mut self, mc: &Mutation<'gc>, key: LuaString<'gc>, value: Value<'gc>) {
+    fn set_string_key(&mut self, ctx: Context<'gc>, key: LuaString<'gc>, value: Value<'gc>) {
         if self.dict.is_some() {
-            self.set_string_key_dict(mc, key, value);
+            self.set_string_key_dict(key, value);
             return;
         }
 
@@ -319,8 +284,8 @@ impl<'gc> TableState<'gc> {
                 // dict mode so the shape tree doesn't carry a dead slot
                 // forever. ICs that cached this shape will miss next
                 // access (different shape pointer post-migration).
-                self.migrate_to_dict(mc);
-                self.set_string_key_dict(mc, key, value);
+                self.migrate_to_dict(ctx);
+                self.set_string_key_dict(key, value);
                 return;
             }
             self.properties[slot as usize] = value;
@@ -328,27 +293,19 @@ impl<'gc> TableState<'gc> {
             // New slot. Cap shape growth to bound the transition tree;
             // beyond MAX_PROPERTIES_FAST, fall back to dict mode.
             if self.shape.slot_count() >= MAX_PROPERTIES_FAST {
-                self.migrate_to_dict(mc);
-                self.set_string_key_dict(mc, key, value);
+                self.migrate_to_dict(ctx);
+                self.set_string_key_dict(key, value);
                 return;
             }
-            let new_shape = shape::transition_add_prop(mc, self.shape, key);
+            let new_shape = shape::transition_add_prop(ctx.mutation(), self.shape, key);
             debug_assert_eq!(new_shape.slot_count() as usize, self.properties.len() + 1);
             self.shape = new_shape;
             self.properties.push(value);
         }
-        // If *this* table has been adopted as a metatable, mirror the
-        // write into the shared `MtCache` bitset so downstream shapes
-        // observe the metamethod's new presence (or absence on
-        // deletion) without a freshness check.
-        if let Some(cache) = self.mt_cache
-            && let Some(bit) = shape::metamethod_bit_of_bytes(key.as_bytes())
-        {
-            cache.update(bit, value);
-        }
+        self.maybe_update_mt_bit(Value::string(key), value);
     }
 
-    fn set_string_key_dict(&mut self, _mc: &Mutation<'gc>, key: LuaString<'gc>, value: Value<'gc>) {
+    fn set_string_key_dict(&mut self, key: LuaString<'gc>, value: Value<'gc>) {
         let dict = self
             .dict
             .as_mut()
@@ -371,24 +328,22 @@ impl<'gc> TableState<'gc> {
                 }
             }
         }
-        if let Some(cache) = self.mt_cache
-            && let Some(bit) = shape::metamethod_bit_of_bytes(key.as_bytes())
-        {
-            cache.update(bit, value);
-        }
+        self.maybe_update_mt_bit(Value::string(key), value);
     }
 
     /// Move from fast (shape-indexed `properties`) to dict mode. Copy
     /// existing slot values into a new `DictState`, discard the
-    /// properties Vec, swap `shape` for a dict sentinel anchored on
-    /// the same `mt_cache`. One-way for v1.
-    fn migrate_to_dict(&mut self, mc: &Mutation<'gc>) {
+    /// properties Vec, swap `shape` for the unique dict sentinel
+    /// anchored on the same `mt_cache` (per-`MtCache` registry, or
+    /// `State::empty_dict_sentinel` when there's no metatable).
+    /// One-way for v1.
+    fn migrate_to_dict(&mut self, ctx: Context<'gc>) {
         debug_assert!(
             self.dict.is_none(),
             "migrate_to_dict called on already-dict table"
         );
         let descs = self.shape.descriptors();
-        let mut table = HashTable::with_capacity_in(descs.len(), MetricsAlloc::new(mc));
+        let mut table = HashTable::with_capacity_in(descs.len(), MetricsAlloc::new(ctx.mutation()));
         for d in descs {
             let v = self.properties[d.slot as usize];
             if v.is_nil() {
@@ -398,7 +353,10 @@ impl<'gc> TableState<'gc> {
             table.insert_unique(h, (d.key, v), |(k, _)| lua_string_hash(*k));
         }
         self.properties.clear();
-        self.shape = Shape::dict_sentinel(mc, self.shape.mt_cache());
+        self.shape = match self.shape.mt_cache() {
+            Some(c) => c.ensure_dict_sentinel(ctx.mutation()),
+            None => ctx.empty_dict_sentinel(),
+        };
         self.dict = Some(DictState { table });
     }
 

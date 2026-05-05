@@ -36,6 +36,14 @@ impl<'gc> Context<'gc> {
         self.state.empty_shape
     }
 
+    /// Dict-mode sentinel for tables with no metatable. Tables that
+    /// migrate to dict mode while carrying a metatable use the
+    /// per-`MtCache` sentinel instead.
+    #[inline]
+    pub fn empty_dict_sentinel(self) -> Shape<'gc> {
+        self.state.empty_dict_sentinel
+    }
+
     /// Globally-interned ambient `LuaString` symbols (metamethod
     /// names and friends). Slow paths read this to skip per-call
     /// interning; `Table::ensure_mt_cache` reads it to walk a
