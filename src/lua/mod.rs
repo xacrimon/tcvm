@@ -11,8 +11,8 @@ mod stash;
 use crate::Rootable;
 use crate::builtin;
 use crate::dmm::{Arena, Collect, DynamicRootSet, Mutation};
-use crate::env::shape::{METAMETHOD_TABLE, MetamethodBits, Shape};
-use crate::env::{LuaString, Table, Thread};
+use crate::env::shape::Shape;
+use crate::env::{Symbols, Table, Thread};
 
 use crate::env::string::Interner;
 pub use context::Context;
@@ -32,11 +32,9 @@ pub struct State<'gc> {
     /// transition tree so two tables that grow through the same key
     /// sequence converge on the same shape pointer.
     pub(crate) empty_shape: Shape<'gc>,
-    /// Pre-interned metamethod-name LuaStrings paired with their
-    /// `MetamethodBits`. Used by `Shape::recompute_mm_cache` (slow
-    /// path) to walk a metatable in identity-equality lookups instead
-    /// of allocating per-name LuaStrings every time.
-    pub(crate) metamethod_names: Box<[(LuaString<'gc>, MetamethodBits)]>,
+    /// Globally-interned ambient `LuaString` symbols (metamethod names
+    /// and friends). Accessed via `Context::symbols()`.
+    pub(crate) symbols: Symbols<'gc>,
     pub(crate) globals: Table<'gc>,
     pub(crate) main_thread: Thread<'gc>,
     pub(crate) roots: DynamicRootSet<'gc>,
@@ -59,14 +57,10 @@ impl Lua {
         let arena = Arena::<Rootable![State<'_>]>::new(|mc: &Mutation<'_>| {
             let empty_shape = Shape::root_empty(mc);
             let interner = Interner::new(mc);
-            let metamethod_names = METAMETHOD_TABLE
-                .iter()
-                .map(|(name, bit)| (interner.intern(mc, name), *bit))
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
+            let symbols = Symbols::intern_all(mc, &interner);
             State {
                 empty_shape,
-                metamethod_names,
+                symbols,
                 globals: Table::new_with_shape(mc, empty_shape),
                 main_thread: Thread::new(mc),
                 roots: DynamicRootSet::new(mc),
@@ -702,10 +696,10 @@ mod tests {
 
     #[test]
     fn metamethod_mt_mutation_invalidates_cache() {
-        // After setmetatable, install __index lazily on the metatable,
-        // confirming that the MtToken generation bump triggers a cache
-        // refresh on the next access. This exercises Phase 2's
-        // generation-bump-on-metamethod-named-write path.
+        // After setmetatable, install __index lazily on the metatable;
+        // the metamethod-named write updates the shared MtCache bitset
+        // in place, so the next access observes __index without a
+        // freshness check.
         let n = run_returning_int_with_basic(
             "local mt = {} \
              local t = setmetatable({}, mt) \
@@ -765,8 +759,8 @@ mod tests {
     #[test]
     fn dict_mode_preserves_metatable_chain() {
         // Even after dict migration, __index lookups on the metatable
-        // still work — the dict sentinel keeps `mt_token`, so
-        // `mm_cache` lookup paths keep functioning.
+        // still work — the dict sentinel inherits the same `mt_cache`
+        // pointer, so `has_mm` reads keep functioning.
         let n = run_returning_int_with_basic(
             "local mt = {__index = function(_, _) return 99 end} \
              local t = setmetatable({}, mt) \
@@ -865,5 +859,112 @@ mod tests {
              return t.x + t.y + t[1] + t[2]",
         );
         assert_eq!(n, 310);
+    }
+
+    #[test]
+    fn metamethod_bitset_clears_on_deletion() {
+        // Setting then nil'ing __index must clear the INDEX bit so the
+        // next access sees no metamethod (returns nil, not the f's
+        // result).
+        let mut lua = Lua::new();
+        let ex = lua
+            .try_enter(|ctx| -> Result<_, LoadError> {
+                builtin::load_basic(ctx);
+                let chunk = ctx.load(
+                    "local mt = {} \
+                     local t = setmetatable({}, mt) \
+                     mt.__index = function() return 7 end \
+                     local first = t.x \
+                     mt.__index = nil \
+                     local second = t.x \
+                     if second == nil then return first else return -1 end",
+                    Some("bitset_clear"),
+                )?;
+                Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+            })
+            .expect("load");
+        let result: i64 = lua.execute(&ex).expect("run");
+        assert_eq!(result, 7);
+    }
+
+    #[test]
+    fn metamethod_bitset_resets_after_delete_then_restore() {
+        // Set, delete, restore __index — the bit toggles correctly
+        // through all three states.
+        let n = run_returning_int_with_basic(
+            "local mt = {} \
+             local t = setmetatable({}, mt) \
+             mt.__index = function() return 1 end \
+             local a = t.x \
+             mt.__index = nil \
+             mt.__index = function() return 5 end \
+             local b = t.x \
+             return a + b",
+        );
+        assert_eq!(n, 6);
+    }
+
+    #[test]
+    fn metamethod_multi_hop_index_chain() {
+        // a -> b -> c, with c.fallback set. Each hop refreshes its
+        // own MtCache via has_mm short-circuit; deep chains resolve.
+        let n = run_returning_int_with_basic(
+            "local c = {} \
+             c.fallback = 7 \
+             local b = setmetatable({}, {__index = c}) \
+             local a = setmetatable({}, {__index = b}) \
+             return a.fallback",
+        );
+        assert_eq!(n, 7);
+    }
+
+    #[test]
+    fn metamethod_mid_chain_mutation() {
+        // After the first read, mutate b.__index to point elsewhere;
+        // the next read must observe the change.
+        let n = run_returning_int_with_basic(
+            "local c1 = {fallback = 1} \
+             local c2 = {fallback = 100} \
+             local mtb = {__index = c1} \
+             local b = setmetatable({}, mtb) \
+             local a = setmetatable({}, {__index = b}) \
+             local first = a.fallback \
+             mtb.__index = c2 \
+             local second = a.fallback \
+             return first + second",
+        );
+        assert_eq!(n, 101);
+    }
+
+    #[test]
+    fn metamethod_metatable_dict_mode() {
+        // Force the *metatable* into dict mode by populating it past
+        // MAX_PROPERTIES_FAST = 64, then assign __index. The dict
+        // path's bit-update must still fire so reads through __index
+        // see the function.
+        let mut prog = String::from("local mt = {}\n");
+        for i in 0..70 {
+            prog.push_str(&format!("mt.k{} = {}\n", i, i));
+        }
+        prog.push_str("mt.__index = function() return 42 end\n");
+        prog.push_str("local t = setmetatable({}, mt)\n");
+        prog.push_str("return t.missing");
+        let n = run_returning_int_with_basic(&prog);
+        assert_eq!(n, 42);
+    }
+
+    #[test]
+    fn metamethod_shared_metatable_two_tables() {
+        // Two tables share one metatable; mutating __index after
+        // setmetatable must affect both — the MtCache bitset is
+        // shared.
+        let n = run_returning_int_with_basic(
+            "local mt = {} \
+             local t1 = setmetatable({}, mt) \
+             local t2 = setmetatable({}, mt) \
+             mt.__index = function() return 50 end \
+             return t1.x + t2.x",
+        );
+        assert_eq!(n, 100);
     }
 }

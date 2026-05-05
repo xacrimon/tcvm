@@ -6,7 +6,8 @@
 //! properties currently stored on the table, plus the identity of the
 //! table's metatable. Two tables with the same shape have the same
 //! storage layout (same string keys live at the same `properties`
-//! slots) and share metamethod-presence information.
+//! slots) and observe the same metamethod-presence bitset (via the
+//! shared `MtCache` pointer).
 //!
 //! Shapes form a transition tree: starting from `EMPTY_SHAPE`,
 //! adding a string key transitions to a child shape; assigning a new
@@ -20,7 +21,8 @@ use bitflags::bitflags;
 use hashbrown::{HashTable, hash_table};
 
 use crate::dmm::allocator_api::MetricsAlloc;
-use crate::dmm::{Collect, Gc, GcWeak, Lock, Mutation, RefLock};
+use crate::dmm::barrier::unlock;
+use crate::dmm::{Collect, Gc, GcWeak, Mutation, RefLock};
 use crate::env::string::LuaString;
 
 /// V8-style "Map" / hidden class. Copy wrapper over a single Gc pointer
@@ -29,12 +31,16 @@ use crate::env::string::LuaString;
 #[collect(internal, no_drop)]
 pub struct Shape<'gc>(Gc<'gc, ShapeData<'gc>>);
 
-/// Identity token for a metatable instance. Generation counter bumps
-/// when the metatable is mutated on a metamethod-named key — the cached
-/// `mm_cache` on shapes that observe this token must then be re-derived.
+/// Per-metatable metamethod-presence bitset. Allocated lazily when a
+/// table is first adopted as a metatable; updated eagerly by every
+/// metamethod-named write to the metatable. Multiple shapes (one per
+/// distinct (key-list, metatable) pair) share a single `MtCache`
+/// pointer for the same metatable. Identity (the `Gc` address) is
+/// what `MtEdge` keys transitions on; the inner `bits` field changes
+/// in place across mutations of `__index` / `__newindex` / etc.
 #[derive(Clone, Copy, Collect)]
 #[collect(internal, no_drop)]
-pub struct MtToken<'gc>(Gc<'gc, MtTokenData>);
+pub struct MtCache<'gc>(Gc<'gc, MtCacheData>);
 
 /// One descriptor entry: a string key and the slot it occupies in
 /// `TableState::properties`. Stored in `ShapeData::descriptors` sorted
@@ -47,12 +53,12 @@ pub struct Descriptor<'gc> {
     pub slot: u32,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Default, Collect)]
+#[collect(internal, require_static)]
+pub struct MetamethodBits(u32);
+
 bitflags! {
-    /// Per-metamethod presence cache. Computed lazily on slow paths
-    /// from the metatable's contents at the shape's `mt_token`'s
-    /// generation snapshot.
-    #[derive(Clone, Copy, PartialEq, Eq, Default)]
-    pub struct MetamethodBits: u32 {
+    impl MetamethodBits: u32 {
         const INDEX     = 1 << 0;
         const NEWINDEX  = 1 << 1;
         const ADD       = 1 << 2;
@@ -87,10 +93,11 @@ pub const MAX_PROPERTIES_FAST: u32 = 64;
 /// Pairing of metamethod byte-name and the bit it occupies in
 /// `MetamethodBits`. Used by:
 ///   - `metamethod_bit_of_bytes` (write-side: detect metatable
-///     mutation that affects metamethod presence; bumps `MtToken`
-///     generation).
-///   - `Shape::recompute_mm_cache` (read-side: walk the metatable
-///     and OR together the bits for each present metamethod).
+///     mutation that affects metamethod presence; updates the
+///     metatable's `MtCache` bitset in place).
+///   - `Table::ensure_mt_cache` (read-side at first-adoption: walk
+///     the metatable's slots and OR together the bits for each
+///     present metamethod to seed the cache).
 pub const METAMETHOD_TABLE: &[(&[u8], MetamethodBits)] = &[
     (b"__index", MetamethodBits::INDEX),
     (b"__newindex", MetamethodBits::NEWINDEX),
@@ -133,29 +140,17 @@ pub fn metamethod_bit_of_bytes(name: &[u8]) -> Option<MetamethodBits> {
     None
 }
 
-/// Cached metamethod bits + the `mt_token` generation those bits were
-/// derived under. Slow paths refresh when the live generation has
-/// advanced past `gen_at_compute`.
-#[derive(Clone, Copy, Default)]
-pub struct MmCache {
-    pub bits: u32,
-    /// `u32::MAX` sentinel = never computed; recompute on first read.
-    pub gen_at_compute: u32,
-}
-
-const MM_CACHE_UNCOMPUTED: u32 = u32::MAX;
-
-/// The transition table is a side-allocated Gc-managed map living off
-/// each shape. Insertion goes through `borrow_mut(mc)` which emits the
-/// backward barrier — children adopted as `GcWeak` won't retain their
-/// targets, so a transient sub-shape can be reclaimed by GC even while
-/// its parent is alive.
+/// The transition table is held inline inside `ShapeData` (mirrors
+/// `Prototype.ic_table`). Mutation goes through `Gc::write` on the
+/// owning `ShapeData` to emit the backward barrier — children adopted
+/// as `GcWeak` won't retain their targets, so a transient sub-shape
+/// can be reclaimed by GC even while its parent is alive.
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub struct TransitionTable<'gc> {
     /// Property-add edges keyed by the added LuaString.
     pub by_prop: HashTable<PropEdge<'gc>, MetricsAlloc<'gc>>,
-    /// Set-metatable edges keyed by the new metatable token (None = no MT).
+    /// Set-metatable edges keyed by the new MtCache identity (None = no MT).
     pub by_mt: HashTable<MtEdge<'gc>, MetricsAlloc<'gc>>,
 }
 
@@ -169,7 +164,7 @@ pub struct PropEdge<'gc> {
 #[derive(Clone, Copy, Collect)]
 #[collect(internal, no_drop)]
 pub struct MtEdge<'gc> {
-    pub mt_token: Option<MtToken<'gc>>,
+    pub mt_cache: Option<MtCache<'gc>>,
     pub child: GcWeak<'gc, ShapeData<'gc>>,
 }
 
@@ -189,24 +184,22 @@ pub struct ShapeData<'gc> {
     /// transitions; preserved across metatable transitions.
     pub slot_count: u32,
 
-    /// Identity of the metatable for tables of this shape. `None` = no
-    /// metatable. Different metatables → different shapes.
-    pub mt_token: Option<MtToken<'gc>>,
+    /// Metatable identity + live metamethod bits. `None` = no
+    /// metatable. Different metatables → different shapes; transitions
+    /// go through `transition_set_metatable`.
+    pub mt_cache: Option<MtCache<'gc>>,
 
     /// True if this shape represents a table that's gone slow
-    /// (dictionary mode). Only one dictionary shape per `mt_token` —
+    /// (dictionary mode). Only one dictionary shape per `mt_cache` —
     /// see the per-`State` registry. Dictionary shapes have
     /// `slot_count = 0` and an empty `descriptors`.
     #[collect(require_static)]
     pub is_dict: bool,
 
-    /// Cached metamethod bits + generation-at-compute. Mutable; reads
-    /// without barrier, writes via `Gc::write` over the parent shape.
-    pub mm_cache: Lock<MmCacheRepr>,
-
-    /// Outgoing transition edges. Side-allocated `Gc<RefLock>` so we
-    /// can mutate without rewriting the immutable shape body.
-    pub transitions: Gc<'gc, RefLock<TransitionTable<'gc>>>,
+    /// Outgoing transition edges, held inline (no separate `Gc`
+    /// allocation). Mutation goes through `Gc::write` on the parent
+    /// `Gc<ShapeData>` to emit the barrier.
+    pub transitions: RefLock<TransitionTable<'gc>>,
 
     /// Full ordered descriptor list (parent's prefix + this shape's
     /// last_key, if any). Eager rather than lazy — keeps slow paths
@@ -214,79 +207,78 @@ pub struct ShapeData<'gc> {
     pub descriptors: Box<[Descriptor<'gc>]>,
 }
 
-/// Newtype wrapper for `Lock<T>` cooperation: `Lock<T>` requires
-/// `T: Copy + Collect`. `MmCache` is two u32s; this repr makes that
-/// trivially Copy + 'static.
-#[derive(Clone, Copy, Default)]
-#[repr(C)]
-pub struct MmCacheRepr {
-    pub bits: u32,
-    pub gen_at_compute: u32,
+#[derive(Collect)]
+#[collect(internal, require_static)]
+pub struct MtCacheData {
+    pub bits: Cell<MetamethodBits>,
 }
 
-unsafe impl<'gc> Collect<'gc> for MmCacheRepr {
-    const NEEDS_TRACE: bool = false;
-    fn trace<T: crate::dmm::collect::Trace<'gc>>(&self, _cc: &mut T) {}
-}
+impl MtCacheData {
+    #[inline]
+    pub fn get(&self) -> MetamethodBits {
+        self.bits.get()
+    }
 
-unsafe impl<'gc> Collect<'gc> for MetamethodBits {
-    const NEEDS_TRACE: bool = false;
-    fn trace<T: crate::dmm::collect::Trace<'gc>>(&self, _cc: &mut T) {}
-}
+    /// Set `bit` (if not already set). Safe regardless of mutation
+    /// context — the underlying type is `Cell<MetamethodBits>` (a
+    /// `u32` repr) with no Gc adoption, so no write barrier required.
+    #[inline]
+    pub fn set_bit(&self, bit: MetamethodBits) {
+        self.bits.set(self.bits.get() | bit);
+    }
 
-impl MmCacheRepr {
-    pub const fn uncomputed() -> Self {
-        Self {
-            bits: 0,
-            gen_at_compute: MM_CACHE_UNCOMPUTED,
+    /// Clear `bit` (if not already clear). Same barrier-free
+    /// rationale as `set_bit`.
+    #[inline]
+    pub fn clear_bit(&self, bit: MetamethodBits) {
+        self.bits.set(self.bits.get() & !bit);
+    }
+
+    /// Set or clear `bit` based on whether `value` is nil. Used by
+    /// metatable-mutation paths that observe a metamethod-named
+    /// `raw_set`.
+    #[inline]
+    pub fn update(&self, bit: MetamethodBits, value: crate::env::value::Value<'_>) {
+        if value.is_nil() {
+            self.clear_bit(bit);
+        } else {
+            self.set_bit(bit);
         }
     }
 }
 
-#[derive(Collect)]
-#[collect(internal, require_static)]
-pub struct MtTokenData {
-    pub generation: Cell<u32>,
-}
-
-impl MtTokenData {
-    #[inline]
-    pub fn current_gen(&self) -> u32 {
-        self.generation.get()
-    }
-
-    /// Bump the generation. Safe regardless of mutation context — the
-    /// underlying type is `Cell<u32>` with no Gc adoption, so no write
-    /// barrier is required (mutation only touches non-Gc state).
-    #[inline]
-    pub fn bump(&self) {
-        let next = self.generation.get().wrapping_add(1);
-        self.generation.set(next);
-    }
-}
-
-impl<'gc> MtToken<'gc> {
-    pub fn new(mc: &Mutation<'gc>) -> Self {
-        MtToken(Gc::new(
+impl<'gc> MtCache<'gc> {
+    pub fn new(mc: &Mutation<'gc>, bits: MetamethodBits) -> Self {
+        MtCache(Gc::new(
             mc,
-            MtTokenData {
-                generation: Cell::new(0),
+            MtCacheData {
+                bits: Cell::new(bits),
             },
         ))
     }
 
     #[inline]
-    pub fn current_gen(self) -> u32 {
-        self.0.current_gen()
+    pub fn get(self) -> MetamethodBits {
+        self.0.get()
     }
 
     #[inline]
-    pub fn bump(self) {
-        self.0.bump();
+    pub fn set_bit(self, bit: MetamethodBits) {
+        self.0.set_bit(bit);
     }
 
     #[inline]
-    pub fn inner(self) -> Gc<'gc, MtTokenData> {
+    pub fn clear_bit(self, bit: MetamethodBits) {
+        self.0.clear_bit(bit);
+    }
+
+    #[inline]
+    pub fn update(self, bit: MetamethodBits, value: crate::env::value::Value<'gc>) {
+        self.0.update(bit, value);
+    }
+
+    #[inline]
+    pub fn inner(self) -> Gc<'gc, MtCacheData> {
         self.0
     }
 
@@ -300,48 +292,38 @@ impl<'gc> Shape<'gc> {
     /// Allocate the global empty / root shape. There is exactly one
     /// per `State` — see `State::empty_shape`.
     pub fn root_empty(mc: &Mutation<'gc>) -> Self {
-        let transitions = Gc::new(
-            mc,
-            RefLock::new(TransitionTable {
-                by_prop: HashTable::new_in(MetricsAlloc::new(mc)),
-                by_mt: HashTable::new_in(MetricsAlloc::new(mc)),
-            }),
-        );
         Shape(Gc::new(
             mc,
             ShapeData {
                 parent: None,
                 last_key: None,
                 slot_count: 0,
-                mt_token: None,
+                mt_cache: None,
                 is_dict: false,
-                mm_cache: Lock::new(MmCacheRepr::uncomputed()),
-                transitions,
+                transitions: RefLock::new(TransitionTable {
+                    by_prop: HashTable::new_in(MetricsAlloc::new(mc)),
+                    by_mt: HashTable::new_in(MetricsAlloc::new(mc)),
+                }),
                 descriptors: Box::from([]),
             },
         ))
     }
 
     /// Allocate the dictionary-mode sentinel shape for a given metatable
-    /// token. Held in `State`'s per-token registry.
-    pub fn dict_sentinel(mc: &Mutation<'gc>, mt_token: Option<MtToken<'gc>>) -> Self {
-        let transitions = Gc::new(
-            mc,
-            RefLock::new(TransitionTable {
-                by_prop: HashTable::new_in(MetricsAlloc::new(mc)),
-                by_mt: HashTable::new_in(MetricsAlloc::new(mc)),
-            }),
-        );
+    /// cache. Held in `State`'s per-cache registry.
+    pub fn dict_sentinel(mc: &Mutation<'gc>, mt_cache: Option<MtCache<'gc>>) -> Self {
         Shape(Gc::new(
             mc,
             ShapeData {
                 parent: None,
                 last_key: None,
                 slot_count: 0,
-                mt_token,
+                mt_cache,
                 is_dict: true,
-                mm_cache: Lock::new(MmCacheRepr::uncomputed()),
-                transitions,
+                transitions: RefLock::new(TransitionTable {
+                    by_prop: HashTable::new_in(MetricsAlloc::new(mc)),
+                    by_mt: HashTable::new_in(MetricsAlloc::new(mc)),
+                }),
                 descriptors: Box::from([]),
             },
         ))
@@ -373,8 +355,8 @@ impl<'gc> Shape<'gc> {
     }
 
     #[inline]
-    pub fn mt_token(self) -> Option<MtToken<'gc>> {
-        self.data().mt_token
+    pub fn mt_cache(self) -> Option<MtCache<'gc>> {
+        self.data().mt_cache
     }
 
     #[inline]
@@ -402,109 +384,26 @@ impl<'gc> Shape<'gc> {
             .map(|i| descs[i].slot)
     }
 
-    /// Read the cached `MetamethodBits`. The caller must check
-    /// `mm_cache_stale` against the current `mt_token` generation
-    /// before trusting the result.
+    /// Returns `true` if the metatable behind this shape currently has
+    /// `bit` set in its live metamethod bitset. With no metatable,
+    /// always `false`. The bitset is updated eagerly by writes to the
+    /// metatable, so this read is always live (no freshness check).
     #[inline]
-    pub fn mm_cache(self) -> MmCacheRepr {
-        self.data().mm_cache.get()
-    }
-
-    /// True if the cached `mm_cache` has never been filled or is older
-    /// than the current `mt_token` generation. With no metatable the
-    /// cache is trivially fresh (empty bits).
-    #[inline]
-    pub fn mm_cache_stale(self) -> bool {
-        match self.mt_token() {
+    pub fn has_mm(self, bit: MetamethodBits) -> bool {
+        match self.mt_cache() {
             None => false,
-            Some(t) => {
-                let cache = self.mm_cache();
-                cache.gen_at_compute == MM_CACHE_UNCOMPUTED
-                    || t.current_gen() != cache.gen_at_compute
-            }
+            Some(c) => c.get().contains(bit),
         }
     }
 
-    /// Pessimistic metamethod-presence check used in interpreter fast
-    /// paths: returns `true` if the shape *might* expose `bit`. Reads
-    /// the cached bits; returns `true` if the cache is stale (forces
-    /// the slow path to refresh). With no metatable, always `false`.
+    /// Returns `true` if the metatable has *any* metamethod set. Used
+    /// to short-circuit fast paths that don't care which one.
     #[inline]
-    pub fn maybe_has_mm(self, bit: MetamethodBits) -> bool {
-        if self.mt_token().is_none() {
-            return false;
+    pub fn has_any_mm(self) -> bool {
+        match self.mt_cache() {
+            None => false,
+            Some(c) => !c.get().is_empty(),
         }
-        let cache = self.mm_cache();
-        if cache.gen_at_compute == MM_CACHE_UNCOMPUTED {
-            return true;
-        }
-        if let Some(t) = self.mt_token()
-            && t.current_gen() != cache.gen_at_compute
-        {
-            return true;
-        }
-        (cache.bits & bit.bits()) != 0
-    }
-
-    /// Pessimistic check for *any* metamethod. Slightly cheaper than
-    /// `maybe_has_mm(INDEX) || maybe_has_mm(NEWINDEX) || …`.
-    #[inline]
-    pub fn maybe_has_any_mm(self) -> bool {
-        if self.mt_token().is_none() {
-            return false;
-        }
-        let cache = self.mm_cache();
-        if cache.gen_at_compute == MM_CACHE_UNCOMPUTED {
-            return true;
-        }
-        if let Some(t) = self.mt_token()
-            && t.current_gen() != cache.gen_at_compute
-        {
-            return true;
-        }
-        cache.bits != 0
-    }
-
-    /// Store freshly computed metamethod bits. Caller is responsible
-    /// for having computed `bits` against `mt_gen` from the current
-    /// metatable contents.
-    #[inline]
-    pub fn store_mm_cache(self, mc: &Mutation<'gc>, bits: MetamethodBits, mt_gen: u32) {
-        // Lock<T> as a field needs to go through Gc::write to emit the
-        // barrier. The contained Cell<MmCacheRepr> has no Gc, so the
-        // barrier is precautionary.
-        let write = Gc::write(mc, self.0);
-        crate::dmm::barrier::unlock!(write, ShapeData, mm_cache).set(MmCacheRepr {
-            bits: bits.bits(),
-            gen_at_compute: mt_gen,
-        });
-    }
-
-    /// Refresh `mm_cache` from the live metatable's contents. Reads
-    /// each known metamethod name out of `metatable` (using identity
-    /// equality on pre-interned `LuaString`s) and ORs the corresponding
-    /// bits into the result, then stores at the live `mt_token`
-    /// generation. Idempotent if already fresh.
-    pub fn refresh_mm_cache(
-        self,
-        mc: &Mutation<'gc>,
-        metatable: Option<crate::env::table::Table<'gc>>,
-        metamethod_names: &[(crate::env::LuaString<'gc>, MetamethodBits)],
-    ) {
-        let token_gen = match self.mt_token() {
-            None => 0,
-            Some(t) => t.current_gen(),
-        };
-        let mut bits = MetamethodBits::empty();
-        if let Some(mt) = metatable {
-            for (name, bit) in metamethod_names {
-                let v = mt.raw_get(crate::env::Value::string(*name));
-                if !v.is_nil() {
-                    bits |= *bit;
-                }
-            }
-        }
-        self.store_mm_cache(mc, bits, token_gen);
     }
 }
 
@@ -547,31 +446,26 @@ pub fn transition_add_prop<'gc>(
     // `Shape::find_slot` can binary-search the larger ones.
     new_descs.sort_by_key(|d| Gc::as_ptr(d.key.inner()) as usize);
 
-    let transitions = Gc::new(
-        mc,
-        RefLock::new(TransitionTable {
-            by_prop: HashTable::new_in(MetricsAlloc::new(mc)),
-            by_mt: HashTable::new_in(MetricsAlloc::new(mc)),
-        }),
-    );
-
     let child_data = Gc::new(
         mc,
         ShapeData {
             parent: Some(parent),
             last_key: Some(key),
             slot_count: new_slot + 1,
-            mt_token: parent.data().mt_token,
+            mt_cache: parent.data().mt_cache,
             is_dict: false,
-            mm_cache: Lock::new(MmCacheRepr::uncomputed()),
-            transitions,
+            transitions: RefLock::new(TransitionTable {
+                by_prop: HashTable::new_in(MetricsAlloc::new(mc)),
+                by_mt: HashTable::new_in(MetricsAlloc::new(mc)),
+            }),
             descriptors: new_descs.into_boxed_slice(),
         },
     );
     let child = Shape(child_data);
 
     {
-        let mut table = parent.data().transitions.borrow_mut(mc);
+        let parent_write = Gc::write(mc, parent.0);
+        let mut table = unlock!(parent_write, ShapeData, transitions).borrow_mut();
         let key_ptr = Gc::as_ptr(key.inner()) as usize;
         let h = key_ptr as u64;
         let entry = table.by_prop.entry(
@@ -600,25 +494,25 @@ pub fn transition_add_prop<'gc>(
 }
 
 /// Switch the metatable on `parent`, returning a shape with the same
-/// ordered key list but the new `mt_token`. Caches transitions on
+/// ordered key list but the new `mt_cache`. Caches transitions on
 /// `parent` so repeated `setmetatable(t, mt)` calls share shapes.
 pub fn transition_set_metatable<'gc>(
     mc: &Mutation<'gc>,
     parent: Shape<'gc>,
-    new_mt: Option<MtToken<'gc>>,
+    new_mt: Option<MtCache<'gc>>,
 ) -> Shape<'gc> {
     // Fast path: existing edge.
     {
         let table = parent.data().transitions.borrow();
         let h = mt_edge_hash(new_mt);
-        if let Some(edge) = table.by_mt.find(h, |e| mt_edge_eq(e.mt_token, new_mt)) {
+        if let Some(edge) = table.by_mt.find(h, |e| mt_edge_eq(e.mt_cache, new_mt)) {
             if let Some(child) = edge.child.upgrade(mc) {
                 return Shape(child);
             }
         }
     }
 
-    // Slow path: rebuild the same key list under the new mt_token. We
+    // Slow path: rebuild the same key list under the new mt_cache. We
     // walk the parent chain to collect ordered keys, then re-resolve
     // from the empty shape via `transition_add_prop`. This is O(slots)
     // and rare (setmetatable is not a hot path).
@@ -632,23 +526,24 @@ pub fn transition_set_metatable<'gc>(
     // Install the edge on `parent` (not `empty`) so future
     // setmetatable calls from this same starting shape share.
     {
-        let mut table = parent.data().transitions.borrow_mut(mc);
+        let parent_write = Gc::write(mc, parent.0);
+        let mut table = unlock!(parent_write, ShapeData, transitions).borrow_mut();
         let h = mt_edge_hash(new_mt);
         let entry = table.by_mt.entry(
             h,
-            |e| mt_edge_eq(e.mt_token, new_mt),
-            |e| mt_edge_hash(e.mt_token),
+            |e| mt_edge_eq(e.mt_cache, new_mt),
+            |e| mt_edge_hash(e.mt_cache),
         );
         match entry {
             hash_table::Entry::Occupied(mut o) => {
                 *o.get_mut() = MtEdge {
-                    mt_token: new_mt,
+                    mt_cache: new_mt,
                     child: Gc::downgrade(shape.0),
                 };
             }
             hash_table::Entry::Vacant(v) => {
                 v.insert(MtEdge {
-                    mt_token: new_mt,
+                    mt_cache: new_mt,
                     child: Gc::downgrade(shape.0),
                 });
             }
@@ -675,46 +570,41 @@ fn collect_keys_in_order<'gc>(shape: Shape<'gc>) -> Vec<LuaString<'gc>> {
     keys
 }
 
-fn empty_shape_for<'gc>(mc: &Mutation<'gc>, mt_token: Option<MtToken<'gc>>) -> Shape<'gc> {
+fn empty_shape_for<'gc>(mc: &Mutation<'gc>, mt_cache: Option<MtCache<'gc>>) -> Shape<'gc> {
     // For now we allocate a fresh empty-with-mt root each call; the
     // caller (typically `set_metatable`) caches the result via the
     // transition edge above. A future optimization can pre-register
     // these in `State`.
-    let transitions = Gc::new(
-        mc,
-        RefLock::new(TransitionTable {
-            by_prop: HashTable::new_in(MetricsAlloc::new(mc)),
-            by_mt: HashTable::new_in(MetricsAlloc::new(mc)),
-        }),
-    );
     Shape(Gc::new(
         mc,
         ShapeData {
             parent: None,
             last_key: None,
             slot_count: 0,
-            mt_token,
+            mt_cache,
             is_dict: false,
-            mm_cache: Lock::new(MmCacheRepr::uncomputed()),
-            transitions,
+            transitions: RefLock::new(TransitionTable {
+                by_prop: HashTable::new_in(MetricsAlloc::new(mc)),
+                by_mt: HashTable::new_in(MetricsAlloc::new(mc)),
+            }),
             descriptors: Box::from([]),
         },
     ))
 }
 
 #[inline]
-fn mt_edge_hash<'gc>(token: Option<MtToken<'gc>>) -> u64 {
-    match token {
-        Some(t) => Gc::as_ptr(t.inner()) as usize as u64,
+fn mt_edge_hash<'gc>(cache: Option<MtCache<'gc>>) -> u64 {
+    match cache {
+        Some(c) => Gc::as_ptr(c.inner()) as usize as u64,
         None => 0,
     }
 }
 
 #[inline]
-fn mt_edge_eq<'gc>(a: Option<MtToken<'gc>>, b: Option<MtToken<'gc>>) -> bool {
+fn mt_edge_eq<'gc>(a: Option<MtCache<'gc>>, b: Option<MtCache<'gc>>) -> bool {
     match (a, b) {
         (None, None) => true,
-        (Some(x), Some(y)) => MtToken::ptr_eq(x, y),
+        (Some(x), Some(y)) => MtCache::ptr_eq(x, y),
         _ => false,
     }
 }

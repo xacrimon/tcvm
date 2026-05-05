@@ -229,11 +229,9 @@ macro_rules! helpers {
 /// so `dispatch!`, `raise!`, `invoke_metamethod!`, and `reg!` resolve.
 ///
 /// Steps:
-///   1. Refresh the shape's `mm_cache` from the metatable's contents
-///      if the cache snapshot is stale.
-///   2. Try a direct `raw_get`. Non-nil result is the answer.
-///   3. Nil result + no `__index` → answer is nil.
-///   4. Nil result + `__index` → walk the chain. Resolved values
+///   1. Try a direct `raw_get`. Non-nil result is the answer.
+///   2. Nil result + no `__index` → answer is nil.
+///   3. Nil result + `__index` → walk the chain. Resolved values
 ///      land in `$dst`; functions fire via `invoke_metamethod!`.
 macro_rules! table_get_slow_body {
     ($ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr,
@@ -242,34 +240,28 @@ macro_rules! table_get_slow_body {
         let __k: Value<'gc> = $k;
         let __dst_reg: u8 = $dst;
 
-        let (__shape, __metatable) = {
-            let s = __t.inner().borrow();
-            (s.shape(), s.metatable())
-        };
-        if __shape.mm_cache_stale() {
-            __shape.refresh_mm_cache($ctx.mutation(), __metatable, $ctx.metamethod_names());
-        }
-
         let __v = __t.raw_get(__k);
         if !__v.is_nil() {
             *reg!(mut __dst_reg) = __v;
             dispatch!();
         }
 
-        if !__shape.maybe_has_mm(MetamethodBits::INDEX) {
+        if !__t.shape().has_mm(MetamethodBits::INDEX) {
             *reg!(mut __dst_reg) = Value::nil();
             dispatch!();
         }
 
-        match resolve_index_chain($ctx, __t, __k) {
-            Some(IndexChain::Resolved(__rv)) => {
+        // INDEX bit implies metatable is Some.
+        let __mt = unsafe { __t.metatable().unwrap_unchecked() };
+        match walk_index_chain($ctx, __t, __mt, __k, $ctx.symbols().mm_index) {
+            IndexChain::Resolved(__rv) => {
                 *reg!(mut __dst_reg) = __rv;
                 dispatch!();
             }
-            Some(IndexChain::Invoke {
+            IndexChain::Invoke {
                 func: __mm_func,
                 receiver: __mm_recv,
-            }) => {
+            } => {
                 let __cont = Continuation {
                     func: cont_store_result,
                     payload: ContinuationPayload::StoreResult { dst: __dst_reg },
@@ -278,15 +270,14 @@ macro_rules! table_get_slow_body {
                 };
                 invoke_metamethod!(__mm_func, &[__mm_recv, __k], __cont);
             }
-            None => raise!(),
+            IndexChain::Exhausted => raise!(),
         }
     }};
 }
 
 /// Inflates the slow-path body for "table set with metamethod".
-/// Same prelude rules as `table_get_slow_body!`.
 ///
-/// Walks the `__newindex` chain via `resolve_newindex_chain`, which
+/// Walks the `__newindex` chain via `walk_newindex_chain`, which
 /// returns either the table to raw-write into, or a callable to invoke.
 macro_rules! table_set_slow_body {
     ($ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr,
@@ -295,23 +286,15 @@ macro_rules! table_set_slow_body {
         let __k: Value<'gc> = $k;
         let __new_val: Value<'gc> = $v;
 
-        let (__shape, __metatable) = {
-            let s = __t.inner().borrow();
-            (s.shape(), s.metatable())
-        };
-        if __shape.mm_cache_stale() {
-            __shape.refresh_mm_cache($ctx.mutation(), __metatable, $ctx.metamethod_names());
-        }
-
-        match resolve_newindex_chain($ctx, __t, __k) {
-            Some(NewIndexChain::RawSet(__target)) => {
+        match walk_newindex_chain($ctx, __t, __k, $ctx.symbols().mm_newindex) {
+            NewIndexChain::RawSet(__target) => {
                 __target.raw_set($ctx.mutation(), __k, __new_val);
                 dispatch!();
             }
-            Some(NewIndexChain::Invoke {
+            NewIndexChain::Invoke {
                 func: __mm_func,
                 receiver: __mm_recv,
-            }) => {
+            } => {
                 let __cont = Continuation {
                     func: cont_ignore_result,
                     payload: ContinuationPayload::IgnoreResult,
@@ -320,7 +303,7 @@ macro_rules! table_set_slow_body {
                 };
                 invoke_metamethod!(__mm_func, &[__mm_recv, __k, __new_val], __cont);
             }
-            None => raise!(),
+            NewIndexChain::Exhausted => raise!(),
         }
     }};
 }
@@ -361,15 +344,14 @@ fn fill_ic<'gc>(
         // through `as_cell()` — `Lock::as_cell` is `unsafe` precisely
         // because it skips the automatic barrier `Lock::set` on
         // `Gc<Lock<T>>` would emit.
-        ctx.mutation()
-            .backward_barrier(Gc::erase(proto_gc), None);
+        ctx.mutation().backward_barrier(Gc::erase(proto_gc), None);
         unsafe { slot_lock.as_cell() }.set(value);
     }
 }
 
 /// Verify a cached IC entry against the live shape. Returns `Some(slot)`
 /// on a fresh hit, `None` on miss. Metatable-mutation staleness is
-/// handled downstream by `Shape::maybe_has_mm` — see `InlineCache`.
+/// handled downstream by `Shape::has_mm` — see `InlineCache`.
 #[inline(always)]
 fn ic_check<'gc>(cache: InlineCache<'gc>, live_shape: Shape<'gc>) -> Option<u32> {
     if let InlineCache::Mono { shape, slot } = cache
@@ -568,7 +550,7 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
     if let Some(slot) = ic_check(cache, t_state.shape()) {
         if slot != InlineCache::ABSENT_SLOT {
             let v = unsafe { t_state.property_at(slot) };
-            if !(v.is_nil() && t_state.shape().maybe_has_mm(MetamethodBits::INDEX)) {
+            if !(v.is_nil() && t_state.shape().has_mm(MetamethodBits::INDEX)) {
                 drop(t_state);
                 *reg!(mut dst) = v;
                 dispatch!();
@@ -636,19 +618,19 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
         if slot != InlineCache::ABSENT_SLOT {
             let existing = unsafe { t_state.property_at(slot) };
             // __newindex fires only on currently-nil keys.
-            if !(existing.is_nil() && t_state.shape().maybe_has_mm(MetamethodBits::NEWINDEX)) {
+            if !(existing.is_nil() && t_state.shape().has_mm(MetamethodBits::NEWINDEX)) {
                 drop(t_state);
                 let mut state = t.inner().borrow_mut(ctx.mutation());
                 state.properties[slot as usize] = v;
-                // mt_token bump if we just wrote a metamethod-named key
-                // on a metatable. Inlined to avoid raw_set_with_hash's
+                // Mirror metamethod-named writes into the shared
+                // `MtCache` bitset. Inlined to avoid raw_set_with_hash's
                 // duplicate slot lookup.
                 let k = constant!(key);
                 if let Some(s) = k.get_string()
-                    && let Some(token) = state.mt_token()
-                    && crate::env::shape::metamethod_bit_of_bytes(s.as_bytes()).is_some()
+                    && let Some(cache) = state.mt_cache()
+                    && let Some(bit) = crate::env::shape::metamethod_bit_of_bytes(s.as_bytes())
                 {
-                    token.bump();
+                    cache.update(bit, v);
                 }
                 dispatch!()
             }
@@ -710,7 +692,7 @@ extern "rust-preserve-none" fn op_gettable<'gc>(
     let (v, need_index) = {
         let t_state = t.inner().borrow();
         let v = t_state.raw_get(k);
-        let need = v.is_nil() && t_state.shape().maybe_has_mm(MetamethodBits::INDEX);
+        let need = v.is_nil() && t_state.shape().has_mm(MetamethodBits::INDEX);
         (v, need)
     };
 
@@ -761,7 +743,7 @@ extern "rust-preserve-none" fn op_settable<'gc>(
     let v = reg!(src);
     let needs_newindex = {
         let t_state = t.inner().borrow();
-        t_state.shape().maybe_has_mm(MetamethodBits::NEWINDEX) && t_state.raw_get(k).is_nil()
+        t_state.shape().has_mm(MetamethodBits::NEWINDEX) && t_state.raw_get(k).is_nil()
     };
 
     if needs_newindex {
@@ -819,7 +801,7 @@ extern "rust-preserve-none" fn op_getfield<'gc>(
     if let Some(slot) = ic_check(cache, t_state.shape()) {
         if slot != InlineCache::ABSENT_SLOT {
             let v = unsafe { t_state.property_at(slot) };
-            if !(v.is_nil() && t_state.shape().maybe_has_mm(MetamethodBits::INDEX)) {
+            if !(v.is_nil() && t_state.shape().has_mm(MetamethodBits::INDEX)) {
                 drop(t_state);
                 *reg!(mut dst) = v;
                 dispatch!();
@@ -882,16 +864,16 @@ extern "rust-preserve-none" fn op_setfield<'gc>(
     if let Some(slot) = ic_check(cache, t_state.shape()) {
         if slot != InlineCache::ABSENT_SLOT {
             let existing = unsafe { t_state.property_at(slot) };
-            if !(existing.is_nil() && t_state.shape().maybe_has_mm(MetamethodBits::NEWINDEX)) {
+            if !(existing.is_nil() && t_state.shape().has_mm(MetamethodBits::NEWINDEX)) {
                 drop(t_state);
                 let mut state = t.inner().borrow_mut(ctx.mutation());
                 state.properties[slot as usize] = v;
                 let k = constant!(key_idx);
                 if let Some(s) = k.get_string()
-                    && let Some(token) = state.mt_token()
-                    && crate::env::shape::metamethod_bit_of_bytes(s.as_bytes()).is_some()
+                    && let Some(cache) = state.mt_cache()
+                    && let Some(bit) = crate::env::shape::metamethod_bit_of_bytes(s.as_bytes())
                 {
-                    token.bump();
+                    cache.update(bit, v);
                 }
                 dispatch!()
             }
@@ -947,7 +929,7 @@ extern "rust-preserve-none" fn op_newtable<'gc>(
 // ---------------------------------------------------------------------------
 
 macro_rules! binop_handler {
-    ($fn_name:ident, $instr:ident, $op:ident, $num_kind:ty, $mm:expr) => {
+    ($fn_name:ident, $instr:ident, $op:ident, $num_kind:ty, $mm:ident) => {
         #[inline(never)]
         extern "rust-preserve-none" fn $fn_name<'gc>(
             instruction: Instruction,
@@ -964,7 +946,7 @@ macro_rules! binop_handler {
                 *reg!(mut dst) = v;
                 dispatch!();
             }
-            let meta_fn = binop_metamethod(ctx, a, b, $mm);
+            let meta_fn = binop_metamethod(a, b, ctx.symbols().$mm);
             if meta_fn.is_nil() {
                 raise!();
             }
@@ -979,18 +961,18 @@ macro_rules! binop_handler {
     };
 }
 
-binop_handler!(op_add, ADD, op_arith, num::Add, b"__add");
-binop_handler!(op_sub, SUB, op_arith, num::Sub, b"__sub");
-binop_handler!(op_mul, MUL, op_arith, num::Mul, b"__mul");
-binop_handler!(op_mod, MOD, op_arith, num::Mod, b"__mod");
-binop_handler!(op_pow, POW, op_arith, num::Pow, b"__pow");
-binop_handler!(op_div, DIV, op_arith, num::Div, b"__div");
-binop_handler!(op_idiv, IDIV, op_arith, num::IDiv, b"__idiv");
-binop_handler!(op_band, BAND, op_bit, num::BAnd, b"__band");
-binop_handler!(op_bor, BOR, op_bit, num::BOr, b"__bor");
-binop_handler!(op_bxor, BXOR, op_bit, num::BXor, b"__bxor");
-binop_handler!(op_shl, SHL, op_bit, num::Shl, b"__shl");
-binop_handler!(op_shr, SHR, op_bit, num::Shr, b"__shr");
+binop_handler!(op_add, ADD, op_arith, num::Add, mm_add);
+binop_handler!(op_sub, SUB, op_arith, num::Sub, mm_sub);
+binop_handler!(op_mul, MUL, op_arith, num::Mul, mm_mul);
+binop_handler!(op_mod, MOD, op_arith, num::Mod, mm_mod);
+binop_handler!(op_pow, POW, op_arith, num::Pow, mm_pow);
+binop_handler!(op_div, DIV, op_arith, num::Div, mm_div);
+binop_handler!(op_idiv, IDIV, op_arith, num::IDiv, mm_idiv);
+binop_handler!(op_band, BAND, op_bit, num::BAnd, mm_band);
+binop_handler!(op_bor, BOR, op_bit, num::BOr, mm_bor);
+binop_handler!(op_bxor, BXOR, op_bit, num::BXor, mm_bxor);
+binop_handler!(op_shl, SHL, op_bit, num::Shl, mm_shl);
+binop_handler!(op_shr, SHR, op_bit, num::Shr, mm_shr);
 
 // ---------------------------------------------------------------------------
 // Unary operations
@@ -1017,7 +999,7 @@ extern "rust-preserve-none" fn op_unm<'gc>(
         *reg!(mut dst) = Value::float(-f);
         dispatch!();
     }
-    let meta_fn = unop_metamethod(ctx, val, b"__unm");
+    let meta_fn = unop_metamethod(val, ctx.symbols().mm_unm);
     if meta_fn.is_nil() {
         raise!();
     }
@@ -1048,7 +1030,7 @@ extern "rust-preserve-none" fn op_bnot<'gc>(
         *reg!(mut dst) = Value::integer(!i);
         dispatch!();
     }
-    let meta_fn = unop_metamethod(ctx, val, b"__bnot");
+    let meta_fn = unop_metamethod(val, ctx.symbols().mm_bnot);
     if meta_fn.is_nil() {
         raise!();
     }
@@ -1100,7 +1082,7 @@ extern "rust-preserve-none" fn op_len<'gc>(
 
     // Tables consult __len first; fall back to raw_len only if absent.
     let meta_fn = if let Some(t) = val.get_table() {
-        let mm = t.get_metamethod(ctx, b"__len");
+        let mm = t.get_metamethod(ctx.symbols().mm_len);
         if mm.is_nil() {
             *reg!(mut dst) = Value::integer(t.raw_len() as i64);
             dispatch!();
@@ -1139,7 +1121,7 @@ extern "rust-preserve-none" fn op_concat<'gc>(
         *reg!(mut dst) = Value::string(LuaString::new(ctx, &buf));
         dispatch!();
     }
-    let meta_fn = binop_metamethod(ctx, a, b, b"__concat");
+    let meta_fn = binop_metamethod(a, b, ctx.symbols().mm_concat);
     if meta_fn.is_nil() {
         raise!();
     }
@@ -1240,7 +1222,7 @@ extern "rust-preserve-none" fn op_eq<'gc>(
     let try_meta = (a.kind() == ValueKind::Table && b.kind() == ValueKind::Table)
         || (a.kind() == ValueKind::Userdata && b.kind() == ValueKind::Userdata);
     if try_meta {
-        let meta_fn = binop_metamethod(ctx, a, b, b"__eq");
+        let meta_fn = binop_metamethod(a, b, ctx.symbols().mm_eq);
         if !meta_fn.is_nil() {
             let cont = Continuation {
                 func: cont_cond_jump,
@@ -1295,7 +1277,7 @@ extern "rust-preserve-none" fn op_lt<'gc>(
         }
         dispatch!();
     }
-    let meta_fn = binop_metamethod(ctx, a, b, b"__lt");
+    let meta_fn = binop_metamethod(a, b, ctx.symbols().mm_lt);
     if meta_fn.is_nil() {
         raise!();
     }
@@ -1344,7 +1326,7 @@ extern "rust-preserve-none" fn op_le<'gc>(
         }
         dispatch!();
     }
-    let meta_fn = binop_metamethod(ctx, a, b, b"__le");
+    let meta_fn = binop_metamethod(a, b, ctx.symbols().mm_le);
     if meta_fn.is_nil() {
         raise!();
     }
@@ -2170,37 +2152,51 @@ enum IndexChain<'gc> {
         func: Value<'gc>,
         receiver: Value<'gc>,
     },
+    /// Chain depth exceeded `MAX_TAG_LOOP`; caller should raise.
+    Exhausted,
 }
 
-/// Walk the `__index` chain starting from `table`. Returns the resolved
-/// value or a pending function call. `None` means the chain exceeded
-/// `MAX_TAG_LOOP` and the caller should raise.
+/// Walk the `__index` chain. Caller has already verified that
+/// `start.raw_get(key)` was nil and `start_metatable.has_mm(INDEX)` is
+/// set, so the walk begins at `start_metatable.raw_get(__index)` and
+/// follows `__index` hops from there. `mm_index_name` is the
+/// pre-interned `__index` LuaString — the function never re-interns it.
 #[inline]
-fn resolve_index_chain<'gc>(
+fn walk_index_chain<'gc>(
     ctx: Context<'gc>,
-    table: Table<'gc>,
+    start: Table<'gc>,
+    start_metatable: Table<'gc>,
     key: Value<'gc>,
-) -> Option<IndexChain<'gc>> {
-    let mut t = table;
+    mm_index_name: LuaString<'gc>,
+) -> IndexChain<'gc> {
+    let mut current_table = start;
+    let mut mm = start_metatable.raw_get(Value::string(mm_index_name));
     for _ in 0..MAX_TAG_LOOP {
-        let v = t.raw_get(key);
-        if !v.is_nil() {
-            return Some(IndexChain::Resolved(v));
-        }
-        let mm = t.get_metamethod(ctx, b"__index");
         if mm.is_nil() {
-            return Some(IndexChain::Resolved(Value::nil()));
+            return IndexChain::Resolved(Value::nil());
         }
-        if let Some(next) = mm.get_table() {
-            t = next;
-            continue;
+        let next = match mm.get_table() {
+            Some(t) => t,
+            None => {
+                return IndexChain::Invoke {
+                    func: mm,
+                    receiver: Value::table(current_table),
+                };
+            }
+        };
+        let v = next.raw_get(key);
+        if !v.is_nil() {
+            return IndexChain::Resolved(v);
         }
-        return Some(IndexChain::Invoke {
-            func: mm,
-            receiver: Value::table(t),
-        });
+        if !next.shape().has_mm(MetamethodBits::INDEX) {
+            return IndexChain::Resolved(Value::nil());
+        }
+        // INDEX bit implies metatable is Some.
+        let next_mt = unsafe { next.metatable().unwrap_unchecked() };
+        mm = next_mt.raw_get(Value::string(mm_index_name));
+        current_table = next;
     }
-    None
+    IndexChain::Exhausted
 }
 
 /// Result of walking a `__newindex` chain.
@@ -2212,38 +2208,47 @@ enum NewIndexChain<'gc> {
         func: Value<'gc>,
         receiver: Value<'gc>,
     },
+    /// Chain depth exceeded `MAX_TAG_LOOP`; caller should raise.
+    Exhausted,
 }
 
-/// Walk the `__newindex` chain. If the key already exists in `table`, do a
-/// raw set there. Otherwise follow `__newindex` tables; terminate at the
-/// first callable or at a table that has the key (or has no `__newindex`).
-/// `None` means the chain exceeded `MAX_TAG_LOOP` and the caller should raise.
+/// Walk the `__newindex` chain. If the key already exists in `table`, do
+/// a raw set there. Otherwise follow `__newindex` tables; terminate at
+/// the first callable or at a table that has the key (or has no
+/// `__newindex`). `mm_newindex_name` is the pre-interned `__newindex`
+/// LuaString — the function never re-interns it.
 #[inline]
-fn resolve_newindex_chain<'gc>(
-    ctx: Context<'gc>,
+fn walk_newindex_chain<'gc>(
+    _ctx: Context<'gc>,
     table: Table<'gc>,
     key: Value<'gc>,
-) -> Option<NewIndexChain<'gc>> {
+    mm_newindex_name: LuaString<'gc>,
+) -> NewIndexChain<'gc> {
     let mut t = table;
     for _ in 0..MAX_TAG_LOOP {
         // If the key already has a value, skip __newindex and raw_set here.
         if !t.raw_get(key).is_nil() {
-            return Some(NewIndexChain::RawSet(t));
+            return NewIndexChain::RawSet(t);
         }
-        let mm = t.get_metamethod(ctx, b"__newindex");
+        if !t.shape().has_mm(MetamethodBits::NEWINDEX) {
+            return NewIndexChain::RawSet(t);
+        }
+        // NEWINDEX bit implies metatable is Some.
+        let mt = unsafe { t.metatable().unwrap_unchecked() };
+        let mm = mt.raw_get(Value::string(mm_newindex_name));
         if mm.is_nil() {
-            return Some(NewIndexChain::RawSet(t));
+            return NewIndexChain::RawSet(t);
         }
         if let Some(next) = mm.get_table() {
             t = next;
             continue;
         }
-        return Some(NewIndexChain::Invoke {
+        return NewIndexChain::Invoke {
             func: mm,
             receiver: Value::table(t),
-        });
+        };
     }
-    None
+    NewIndexChain::Exhausted
 }
 
 /// The resolved target of a call: either a Lua bytecode closure (which the
@@ -2277,7 +2282,7 @@ fn resolve_call_chain<'gc>(
             };
         }
         let mm = match func_val.get_table() {
-            Some(t) => t.get_metamethod(ctx, b"__call"),
+            Some(t) => t.get_metamethod(ctx.symbols().mm_call),
             None => return None,
         };
         if mm.is_nil() {
@@ -2303,32 +2308,28 @@ fn resolve_call_chain<'gc>(
 }
 
 /// Look up a binary metamethod on `lhs` first, then `rhs`. Only checks
-/// metatables on tables; userdata metatables and the string metatable are
-/// pending those subsystems (see #47).
+/// metatables on tables; userdata metatables and the string metatable
+/// are pending those subsystems (see #47). `name` is the pre-interned
+/// LuaString from `Context::symbols()`.
 #[inline]
-fn binop_metamethod<'gc>(
-    ctx: Context<'gc>,
-    lhs: Value<'gc>,
-    rhs: Value<'gc>,
-    name: &[u8],
-) -> Value<'gc> {
+fn binop_metamethod<'gc>(lhs: Value<'gc>, rhs: Value<'gc>, name: LuaString<'gc>) -> Value<'gc> {
     if let Some(t) = lhs.get_table() {
-        let m = t.get_metamethod(ctx, name);
+        let m = t.get_metamethod(name);
         if !m.is_nil() {
             return m;
         }
     }
     if let Some(t) = rhs.get_table() {
-        return t.get_metamethod(ctx, name);
+        return t.get_metamethod(name);
     }
     Value::nil()
 }
 
 /// Look up a unary metamethod on `val`. Same caveat as `binop_metamethod`.
 #[inline]
-fn unop_metamethod<'gc>(ctx: Context<'gc>, val: Value<'gc>, name: &[u8]) -> Value<'gc> {
+fn unop_metamethod<'gc>(val: Value<'gc>, name: LuaString<'gc>) -> Value<'gc> {
     if let Some(t) = val.get_table() {
-        return t.get_metamethod(ctx, name);
+        return t.get_metamethod(name);
     }
     Value::nil()
 }

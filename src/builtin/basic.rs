@@ -201,7 +201,7 @@ fn lua_setmetatable<'gc>(
             "bad argument #2 to 'setmetatable' (nil or table expected)",
         ));
     };
-    t.set_metatable(nctx.ctx.mutation(), mt);
+    t.set_metatable(nctx.ctx, mt);
     stack.replace(&[Value::table(t)]);
     Ok(())
 }

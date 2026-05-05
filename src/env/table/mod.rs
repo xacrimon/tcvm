@@ -59,24 +59,29 @@ impl<'gc> Table<'gc> {
 
     /// Replace the metatable. Re-shapes the table along the
     /// `set_metatable` transition edge so subsequent metamethod queries
-    /// see the new metatable's identity. Subsequent in-place mutations
-    /// of the metatable bump its `MtToken` generation.
-    pub fn set_metatable(self, mc: &Mutation<'gc>, mt: Option<Table<'gc>>) {
-        let mut state = self.0.borrow_mut(mc);
-        let new_token = match mt {
-            Some(t) => Some(t.ensure_mt_token(mc)),
+    /// observe the new metatable's identity. Subsequent in-place
+    /// mutations of the metatable update its shared `MtCache` bitset
+    /// in place.
+    pub fn set_metatable(self, ctx: Context<'gc>, mt: Option<Table<'gc>>) {
+        let new_cache = match mt {
+            Some(t) => Some(t.ensure_mt_cache(ctx)),
             None => None,
         };
-        state.shape = shape::transition_set_metatable(mc, state.shape, new_token);
+        let mut state = self.0.borrow_mut(ctx.mutation());
+        state.shape = shape::transition_set_metatable(ctx.mutation(), state.shape, new_cache);
         state.metatable = mt;
     }
 
-    pub fn get_metamethod(self, ctx: Context<'gc>, name: &[u8]) -> Value<'gc> {
+    /// Look up a metamethod by pre-interned name. The runtime keeps
+    /// every metamethod-name `LuaString` interned in `Context::symbols()`,
+    /// so callers always have the identity in hand and we never
+    /// re-intern at the call site.
+    #[inline]
+    pub fn get_metamethod(self, name: LuaString<'gc>) -> Value<'gc> {
         let Some(mt) = self.metatable() else {
             return Value::nil();
         };
-        let key = Value::string(LuaString::new(ctx, name));
-        mt.raw_get(key)
+        mt.raw_get(Value::string(name))
     }
 
     pub fn shape(self) -> Shape<'gc> {
@@ -91,27 +96,30 @@ impl<'gc> Table<'gc> {
         Table(g)
     }
 
-    /// Lazily lazily allocate this table's `MtToken` and return it.
-    /// The token's identity is invariant across mutations of the table
-    /// itself; only writes to *this table* via `raw_set` against a
-    /// metamethod-named key bump its generation (Phase 2).
-    pub(crate) fn ensure_mt_token(self, mc: &Mutation<'gc>) -> shape::MtToken<'gc> {
+    /// Lazily allocate this table's `MtCache` and return it. The
+    /// cache's identity is invariant across mutations of *this table*;
+    /// metamethod-named writes mutate the cache's bitset in place.
+    /// First-adoption walks the table once to compute initial bits.
+    pub(crate) fn ensure_mt_cache(self, ctx: Context<'gc>) -> shape::MtCache<'gc> {
         {
             let state = self.0.borrow();
-            if let Some(t) = state.mt_token {
-                return t;
+            if let Some(c) = state.mt_cache {
+                return c;
             }
         }
-        let token = shape::MtToken::new(mc);
-        self.0.borrow_mut(mc).mt_token = Some(token);
-        token
-    }
-
-    /// Return the existing `MtToken` for this table without allocating
-    /// one. Used by metatable-mutation paths that should *not* allocate
-    /// a token if one isn't already present.
-    pub(crate) fn mt_token_opt(self) -> Option<shape::MtToken<'gc>> {
-        self.0.borrow().mt_token
+        // First adoption: walk the table once to compute initial bits.
+        let mut bits = shape::MetamethodBits::empty();
+        {
+            let state = self.0.borrow();
+            for (name, bit) in ctx.symbols().metamethods() {
+                if !state.raw_get(Value::string(name)).is_nil() {
+                    bits |= bit;
+                }
+            }
+        }
+        let cache = shape::MtCache::new(ctx.mutation(), bits);
+        self.0.borrow_mut(ctx.mutation()).mt_cache = Some(cache);
+        cache
     }
 }
 
@@ -138,12 +146,14 @@ pub struct TableState<'gc> {
     /// where shape-tree maintenance becomes hostile to ICs.
     dict: Option<DictState<'gc>>,
     /// Live metatable handle (for `getmetatable` and metamethod
-    /// invocation). Identity is mirrored in `shape.mt_token`.
+    /// invocation). Identity is mirrored in `shape.mt_cache`.
     metatable: Option<Table<'gc>>,
-    /// Identity token for *this* table when it's used as a metatable
-    /// (lazily allocated on first adoption). Carries the generation
-    /// counter that downstream shapes' `mm_cache` snapshots against.
-    mt_token: Option<shape::MtToken<'gc>>,
+    /// Metamethod-presence cache for *this* table when it's used as a
+    /// metatable (lazily allocated on first adoption). The cache's
+    /// `bits` field is updated in place by every metamethod-named
+    /// write to this table; downstream shapes share this same `Gc`
+    /// pointer and observe the updates without a freshness check.
+    mt_cache: Option<shape::MtCache<'gc>>,
 }
 
 /// Slow / dictionary-mode storage for string-keyed properties. Replaces
@@ -170,7 +180,7 @@ impl<'gc> TableState<'gc> {
             misc_hash: HashTable::new_in(MetricsAlloc::new(mc)),
             dict: None,
             metatable: None,
-            mt_token: None,
+            mt_cache: None,
         }
     }
 
@@ -185,8 +195,8 @@ impl<'gc> TableState<'gc> {
     }
 
     #[inline]
-    pub fn mt_token(&self) -> Option<shape::MtToken<'gc>> {
-        self.mt_token
+    pub fn mt_cache(&self) -> Option<shape::MtCache<'gc>> {
+        self.mt_cache
     }
 
     /// Read the slot directly. Caller is responsible for ensuring `slot`
@@ -327,13 +337,14 @@ impl<'gc> TableState<'gc> {
             self.shape = new_shape;
             self.properties.push(value);
         }
-        // If *this* table has been adopted as a metatable, a write to a
-        // metamethod-named key invalidates downstream shapes' cached
-        // `mm_cache`. Bump the generation so they re-derive on next read.
-        if let Some(token) = self.mt_token
-            && shape::metamethod_bit_of_bytes(key.as_bytes()).is_some()
+        // If *this* table has been adopted as a metatable, mirror the
+        // write into the shared `MtCache` bitset so downstream shapes
+        // observe the metamethod's new presence (or absence on
+        // deletion) without a freshness check.
+        if let Some(cache) = self.mt_cache
+            && let Some(bit) = shape::metamethod_bit_of_bytes(key.as_bytes())
         {
-            token.bump();
+            cache.update(bit, value);
         }
     }
 
@@ -360,17 +371,17 @@ impl<'gc> TableState<'gc> {
                 }
             }
         }
-        if let Some(token) = self.mt_token
-            && shape::metamethod_bit_of_bytes(key.as_bytes()).is_some()
+        if let Some(cache) = self.mt_cache
+            && let Some(bit) = shape::metamethod_bit_of_bytes(key.as_bytes())
         {
-            token.bump();
+            cache.update(bit, value);
         }
     }
 
     /// Move from fast (shape-indexed `properties`) to dict mode. Copy
     /// existing slot values into a new `DictState`, discard the
     /// properties Vec, swap `shape` for a dict sentinel anchored on
-    /// the same `mt_token`. One-way for v1.
+    /// the same `mt_cache`. One-way for v1.
     fn migrate_to_dict(&mut self, mc: &Mutation<'gc>) {
         debug_assert!(
             self.dict.is_none(),
@@ -387,7 +398,7 @@ impl<'gc> TableState<'gc> {
             table.insert_unique(h, (d.key, v), |(k, _)| lua_string_hash(*k));
         }
         self.properties.clear();
-        self.shape = Shape::dict_sentinel(mc, self.shape.mt_token());
+        self.shape = Shape::dict_sentinel(mc, self.shape.mt_cache());
         self.dict = Some(DictState { table });
     }
 

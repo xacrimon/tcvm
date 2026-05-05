@@ -36,12 +36,11 @@ pub struct Prototype<'gc> {
 /// path fills it on first miss with the observed shape and slot. Future
 /// hits skip the metatable lookup entirely.
 ///
-/// Metatable-mutation staleness is handled by `Shape::maybe_has_mm`
-/// (called from the fast path when the slot value is nil) — its
-/// `mm_cache` snapshot is filled by the same slow path that fills this
-/// IC, so they always carry the same generation. Storing a separate
-/// `mt_gen` here would only force fast-path misses for non-nil-value
-/// accesses, where Lua semantics already bypass the metatable.
+/// Metatable-mutation tracking is handled by `Shape::has_mm`, which
+/// reads the live `MtCache` bitset on the metatable. Bits are updated
+/// in place by every metamethod-named write to the metatable, so a
+/// `Shape` pointer cached here remains a valid identity even as the
+/// metatable's metamethod set evolves.
 #[derive(Clone, Copy, Collect, Default)]
 #[collect(internal, no_drop)]
 pub enum InlineCache<'gc> {

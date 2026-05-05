@@ -5,7 +5,7 @@ use crate::dmm::{DynamicRootSet, Gc, Mutation, RefLock};
 use crate::env::function::{Function, UpvalueState};
 use crate::env::shape::Shape;
 use crate::env::string::Interner;
-use crate::env::{Table, Thread, Value};
+use crate::env::{Symbols, Table, Thread, Value};
 use crate::lua::stash::{Fetchable, Stashable};
 use crate::lua::{LoadError, State};
 use crate::parser;
@@ -36,14 +36,13 @@ impl<'gc> Context<'gc> {
         self.state.empty_shape
     }
 
-    /// Pre-interned `(name, bit)` pairs for every Lua metamethod.
-    /// Used by `Shape::recompute_mm_cache` to walk a metatable in
-    /// pointer-identity lookups instead of allocating per-name
-    /// LuaStrings.
-    pub(crate) fn metamethod_names(
-        self,
-    ) -> &'gc [(crate::env::LuaString<'gc>, crate::env::MetamethodBits)] {
-        &self.state.metamethod_names
+    /// Globally-interned ambient `LuaString` symbols (metamethod
+    /// names and friends). Slow paths read this to skip per-call
+    /// interning; `Table::ensure_mt_cache` reads it to walk a
+    /// metatable's slots at adoption time.
+    #[inline]
+    pub fn symbols(self) -> &'gc Symbols<'gc> {
+        &self.state.symbols
     }
 
     pub fn main_thread(self) -> Thread<'gc> {
