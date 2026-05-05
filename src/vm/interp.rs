@@ -353,12 +353,7 @@ fn fill_ic<'gc>(
     slot: u32,
 ) {
     let proto_gc = unsafe { thread.frames.last().unwrap_unchecked().closure.proto };
-    let mt_gen = shape.mt_token().map_or(0, |t| t.current_gen());
-    let value = InlineCache::Mono {
-        shape,
-        mt_gen,
-        slot,
-    };
+    let value = InlineCache::Mono { shape, slot };
     if let Some(slot_lock) = proto_gc.ic_table.get(ic_idx as usize) {
         // We're adopting a fresh `Shape` Gc pointer through this slot
         // (transitively reachable from the parent `Prototype`), so emit
@@ -372,22 +367,15 @@ fn fill_ic<'gc>(
     }
 }
 
-/// Verify a cached IC entry against the live shape and metatable
-/// generation. Returns `Some(slot)` on a fresh hit, `None` on miss.
+/// Verify a cached IC entry against the live shape. Returns `Some(slot)`
+/// on a fresh hit, `None` on miss. Metatable-mutation staleness is
+/// handled downstream by `Shape::maybe_has_mm` — see `InlineCache`.
 #[inline(always)]
 fn ic_check<'gc>(cache: InlineCache<'gc>, live_shape: Shape<'gc>) -> Option<u32> {
-    if let InlineCache::Mono {
-        shape,
-        mt_gen,
-        slot,
-    } = cache
+    if let InlineCache::Mono { shape, slot } = cache
+        && Shape::ptr_eq(live_shape, shape)
     {
-        if Shape::ptr_eq(live_shape, shape) {
-            let live_gen = shape.mt_token().map_or(0, |t| t.current_gen());
-            if live_gen == mt_gen {
-                return Some(slot);
-            }
-        }
+        return Some(slot);
     }
     None
 }

@@ -35,6 +35,13 @@ pub struct Prototype<'gc> {
 /// Per-call-site monomorphic inline cache. `Empty` initially; a slow
 /// path fills it on first miss with the observed shape and slot. Future
 /// hits skip the metatable lookup entirely.
+///
+/// Metatable-mutation staleness is handled by `Shape::maybe_has_mm`
+/// (called from the fast path when the slot value is nil) — its
+/// `mm_cache` snapshot is filled by the same slow path that fills this
+/// IC, so they always carry the same generation. Storing a separate
+/// `mt_gen` here would only force fast-path misses for non-nil-value
+/// accesses, where Lua semantics already bypass the metatable.
 #[derive(Clone, Copy, Collect, Default)]
 #[collect(internal, no_drop)]
 pub enum InlineCache<'gc> {
@@ -43,10 +50,6 @@ pub enum InlineCache<'gc> {
     Mono {
         /// Shape pointer the cache was filled against.
         shape: Shape<'gc>,
-        /// `MtToken` generation snapshot at fill time.
-        /// Mismatch → invalidate.
-        #[collect(require_static)]
-        mt_gen: u32,
         /// Slot index in `TableState::properties`. `u32::MAX` =
         /// "key absent in shape" (so a get returns the metamethod
         /// chain on this branch and a set must transition).
