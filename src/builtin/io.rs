@@ -18,7 +18,7 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         ("write", lua_write),
     ];
 
-    let lib = Table::new(ctx.mutation());
+    let lib = Table::new(ctx);
     for &(name, handler) in fns {
         let handler = Function::new_native(ctx.mutation(), handler, Box::new([]));
         let key = Value::string(LuaString::new(ctx, name.as_bytes()));

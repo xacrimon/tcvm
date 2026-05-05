@@ -91,7 +91,7 @@ fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -> String {
         Instruction::GETTABUP {
             dst,
             idx,
-            key_hash: _,
+            ic_idx: _,
             key,
         } => {
             format!(
@@ -102,7 +102,7 @@ fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -> String {
         Instruction::SETTABUP {
             src,
             idx,
-            key_hash: _,
+            ic_idx: _,
             key,
         } => {
             format!(
@@ -119,7 +119,7 @@ fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -> String {
         Instruction::GETFIELD {
             dst,
             table,
-            key_hash: _,
+            ic_idx: _,
             key_idx,
         } => {
             format!(
@@ -130,7 +130,7 @@ fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -> String {
         Instruction::SETFIELD {
             src,
             table,
-            key_hash: _,
+            ic_idx: _,
             key_idx,
         } => {
             format!(

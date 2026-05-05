@@ -6,7 +6,7 @@ use crate::env::{Function, LuaString, NativeContext, NativeError, NativeFn, Stac
 pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[("loadlib", lua_loadlib), ("searchpath", lua_searchpath)];
 
-    let lib = Table::new(ctx.mutation());
+    let lib = Table::new(ctx);
     for &(name, handler) in fns {
         let handler = Function::new_native(ctx.mutation(), handler, Box::new([]));
         let key = Value::string(LuaString::new(ctx, name.as_bytes()));

@@ -3,6 +3,7 @@ use cstree::build::NodeCache;
 use crate::compiler::compile_chunk;
 use crate::dmm::{DynamicRootSet, Gc, Mutation, RefLock};
 use crate::env::function::{Function, UpvalueState};
+use crate::env::shape::Shape;
 use crate::env::string::Interner;
 use crate::env::{Table, Thread, Value};
 use crate::lua::stash::{Fetchable, Stashable};
@@ -27,6 +28,22 @@ impl<'gc> Context<'gc> {
 
     pub fn globals(self) -> Table<'gc> {
         self.state.globals
+    }
+
+    /// Shared empty / root shape — every newly-allocated table starts
+    /// here. Stable for the lifetime of the runtime.
+    pub fn empty_shape(self) -> Shape<'gc> {
+        self.state.empty_shape
+    }
+
+    /// Pre-interned `(name, bit)` pairs for every Lua metamethod.
+    /// Used by `Shape::recompute_mm_cache` to walk a metatable in
+    /// pointer-identity lookups instead of allocating per-name
+    /// LuaStrings.
+    pub(crate) fn metamethod_names(
+        self,
+    ) -> &'gc [(crate::env::LuaString<'gc>, crate::env::MetamethodBits)] {
+        &self.state.metamethod_names
     }
 
     pub fn main_thread(self) -> Thread<'gc> {

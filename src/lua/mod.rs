@@ -11,7 +11,8 @@ mod stash;
 use crate::Rootable;
 use crate::builtin;
 use crate::dmm::{Arena, Collect, DynamicRootSet, Mutation};
-use crate::env::{Table, Thread};
+use crate::env::shape::{METAMETHOD_TABLE, MetamethodBits, Shape};
+use crate::env::{LuaString, Table, Thread};
 
 use crate::env::string::Interner;
 pub use context::Context;
@@ -27,6 +28,15 @@ pub use stash::{
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub struct State<'gc> {
+    /// Shared root shape for all freshly created tables. Anchors the
+    /// transition tree so two tables that grow through the same key
+    /// sequence converge on the same shape pointer.
+    pub(crate) empty_shape: Shape<'gc>,
+    /// Pre-interned metamethod-name LuaStrings paired with their
+    /// `MetamethodBits`. Used by `Shape::recompute_mm_cache` (slow
+    /// path) to walk a metatable in identity-equality lookups instead
+    /// of allocating per-name LuaStrings every time.
+    pub(crate) metamethod_names: Box<[(LuaString<'gc>, MetamethodBits)]>,
     pub(crate) globals: Table<'gc>,
     pub(crate) main_thread: Thread<'gc>,
     pub(crate) roots: DynamicRootSet<'gc>,
@@ -46,11 +56,22 @@ impl Default for Lua {
 
 impl Lua {
     pub fn new() -> Self {
-        let arena = Arena::<Rootable![State<'_>]>::new(|mc: &Mutation<'_>| State {
-            globals: Table::new(mc),
-            main_thread: Thread::new(mc),
-            roots: DynamicRootSet::new(mc),
-            interner: Interner::new(mc),
+        let arena = Arena::<Rootable![State<'_>]>::new(|mc: &Mutation<'_>| {
+            let empty_shape = Shape::root_empty(mc);
+            let interner = Interner::new(mc);
+            let metamethod_names = METAMETHOD_TABLE
+                .iter()
+                .map(|(name, bit)| (interner.intern(mc, name), *bit))
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            State {
+                empty_shape,
+                metamethod_names,
+                globals: Table::new_with_shape(mc, empty_shape),
+                main_thread: Thread::new(mc),
+                roots: DynamicRootSet::new(mc),
+                interner,
+            }
         });
         Lua { arena }
     }
@@ -538,5 +559,311 @@ mod tests {
              return x",
         );
         assert_eq!(n, 5);
+    }
+
+    #[test]
+    fn shape_transition_basic() {
+        // Set two string-keyed properties on a fresh table, read them back.
+        // Exercises shape::transition_add_prop + property slot routing.
+        let n = run_returning_int(
+            "local t = {} \
+             t.x = 10 \
+             t.y = 32 \
+             return t.x + t.y",
+        );
+        assert_eq!(n, 42);
+    }
+
+    #[test]
+    fn shape_sharing_across_tables() {
+        // Two tables grown through the same key sequence must share a shape
+        // (otherwise IC monomorphism in Phase 4 will fail). Observable here
+        // only as identical functional behaviour, but the shape pointer
+        // identity is checked indirectly: if sharing failed, no IC would
+        // help us in Phase 4. This locks in correctness of the read paths.
+        let n = run_returning_int(
+            "local function pt() local t = {} t.x = 3 t.y = 4 return t end \
+             local a = pt() \
+             local b = pt() \
+             return a.x + a.y + b.x + b.y",
+        );
+        assert_eq!(n, 14);
+    }
+
+    #[test]
+    fn shape_overwrite_existing_slot() {
+        // Re-assigning an existing string key updates the slot in place;
+        // no new transition.
+        let n = run_returning_int(
+            "local t = {} \
+             t.k = 1 \
+             t.k = 5 \
+             t.k = 9 \
+             return t.k",
+        );
+        assert_eq!(n, 9);
+    }
+
+    #[test]
+    fn array_part_unchanged_by_shape() {
+        // Integer-keyed inserts go through the array part, NOT the shape.
+        // Confirms the routing split between string keys and array keys.
+        let n = run_returning_int(
+            "local t = {} \
+             t[1] = 10 \
+             t[2] = 20 \
+             t[3] = 30 \
+             return t[1] + t[2] + t[3]",
+        );
+        assert_eq!(n, 60);
+    }
+
+    fn run_returning_int_with_basic(src: &str) -> i64 {
+        // Same as run_returning_int but loads the basic builtins
+        // (setmetatable, rawget, rawset, ...) into _G first.
+        let mut lua = Lua::new();
+        let ex = lua
+            .try_enter(|ctx| -> Result<_, LoadError> {
+                builtin::load_basic(ctx);
+                let probe =
+                    Function::new_native(ctx.mutation(), native_id as NativeFn, Box::new([]));
+                let key = Value::string(LuaString::new(ctx, b"probe"));
+                ctx.globals()
+                    .raw_set(ctx.mutation(), key, Value::function(probe));
+                let chunk = ctx.load(src, Some("test"))?;
+                Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+            })
+            .expect("load");
+        lua.execute::<i64>(&ex).expect("run")
+    }
+
+    #[test]
+    fn metamethod_index_table_fallback() {
+        // __index as a table: missing key on `t` falls back to `proto`.
+        let n = run_returning_int_with_basic(
+            "local proto = {} \
+             proto.fallback = 42 \
+             local t = {} \
+             setmetatable(t, {__index = proto}) \
+             return t.fallback",
+        );
+        assert_eq!(n, 42);
+    }
+
+    #[test]
+    fn metamethod_index_function_fallback() {
+        // __index as a function: missing key calls __index(t, k).
+        let n = run_returning_int_with_basic(
+            "local mt = {__index = function(_t, _k) return 7 end} \
+             local t = setmetatable({}, mt) \
+             return t.anything",
+        );
+        assert_eq!(n, 7);
+    }
+
+    #[test]
+    fn metamethod_existing_key_skips_index() {
+        // Present key skips __index entirely.
+        let n = run_returning_int_with_basic(
+            "local mt = {__index = function() error('should not fire') end} \
+             local t = setmetatable({}, mt) \
+             t.x = 99 \
+             return t.x",
+        );
+        assert_eq!(n, 99);
+    }
+
+    #[test]
+    fn metamethod_newindex_function_intercept() {
+        // __newindex as a function: writing a fresh key calls
+        // __newindex(t, k, v) instead of writing on the table.
+        let n = run_returning_int_with_basic(
+            "local stored \
+             local mt = {__newindex = function(_t, _k, v) stored = v end} \
+             local t = setmetatable({}, mt) \
+             t.fresh = 17 \
+             return stored",
+        );
+        assert_eq!(n, 17);
+    }
+
+    #[test]
+    fn metamethod_newindex_existing_key_skips() {
+        // __newindex doesn't fire when the key already has a value.
+        let n = run_returning_int_with_basic(
+            "local mt = {__newindex = function() error('should not fire') end} \
+             local t = setmetatable({}, mt) \
+             rawset(t, 'x', 5) \
+             t.x = 13 \
+             return t.x",
+        );
+        assert_eq!(n, 13);
+    }
+
+    #[test]
+    fn metamethod_mt_mutation_invalidates_cache() {
+        // After setmetatable, install __index lazily on the metatable,
+        // confirming that the MtToken generation bump triggers a cache
+        // refresh on the next access. This exercises Phase 2's
+        // generation-bump-on-metamethod-named-write path.
+        let n = run_returning_int_with_basic(
+            "local mt = {} \
+             local t = setmetatable({}, mt) \
+             mt.__index = function(_t, _k) return 99 end \
+             return t.missing",
+        );
+        assert_eq!(n, 99);
+    }
+
+    #[test]
+    fn ic_hot_loop() {
+        // Repeated reads of the same string-keyed property in a tight
+        // loop. Phase 4: after the first slow-path miss, the IC fills
+        // and subsequent iterations take the fast path. Functional
+        // result is independent of hit/miss; this confirms correctness
+        // under sustained IC use.
+        let n = run_returning_int(
+            "local t = {} \
+             t.x = 1 \
+             local s = 0 \
+             for i = 1, 1000 do s = s + t.x end \
+             return s",
+        );
+        assert_eq!(n, 1000);
+    }
+
+    #[test]
+    fn ic_set_hot_loop() {
+        // Repeated writes to the same string-keyed property in a tight
+        // loop. After the first slow-path miss, the SET IC hits and
+        // the property is updated in place via direct slot access.
+        let n = run_returning_int(
+            "local t = {} \
+             t.counter = 0 \
+             for i = 1, 500 do t.counter = t.counter + 1 end \
+             return t.counter",
+        );
+        assert_eq!(n, 500);
+    }
+
+    #[test]
+    fn dict_mode_after_string_key_deletion() {
+        // `t.x = nil` for an existing slot triggers dict-mode
+        // migration. The table still works correctly afterward.
+        let n = run_returning_int_with_basic(
+            "local t = {} \
+             t.a = 1 \
+             t.b = 2 \
+             t.c = 3 \
+             t.b = nil \
+             rawset(t, 'b', 20) \
+             return t.a + t.b + t.c",
+        );
+        assert_eq!(n, 24);
+    }
+
+    #[test]
+    fn dict_mode_preserves_metatable_chain() {
+        // Even after dict migration, __index lookups on the metatable
+        // still work — the dict sentinel keeps `mt_token`, so
+        // `mm_cache` lookup paths keep functioning.
+        let n = run_returning_int_with_basic(
+            "local mt = {__index = function(_, _) return 99 end} \
+             local t = setmetatable({}, mt) \
+             t.a = 1 \
+             t.b = 2 \
+             t.a = nil \
+             return t.missing",
+        );
+        assert_eq!(n, 99);
+    }
+
+    #[test]
+    fn dict_mode_via_slot_cap() {
+        // Adding more than MAX_PROPERTIES_FAST string keys forces
+        // dict-mode migration. Subsequent reads still resolve.
+        // MAX_PROPERTIES_FAST is 64; we go past that.
+        let mut prog = String::from("local t = {}\n");
+        for i in 0..70 {
+            prog.push_str(&format!("t.k{} = {}\n", i, i));
+        }
+        prog.push_str("return t.k0 + t.k60 + t.k69");
+        let n = run_returning_int(&prog);
+        assert_eq!(n, 0 + 60 + 69);
+    }
+
+    #[test]
+    fn ic_polymorphic_thrashes_correctly() {
+        // Two tables with different shapes hit the same SETFIELD/
+        // GETFIELD instruction. Monomorphic IC will thrash but stay
+        // correct — values must not leak between tables.
+        let n = run_returning_int(
+            "local function box(v) local t = {} t.v = v return t end \
+             local function read(t) return t.v end \
+             local a = box(3) \
+             local b = box(4) \
+             local c = box(5) \
+             return read(a) + read(b) + read(c)",
+        );
+        assert_eq!(n, 12);
+    }
+
+    #[test]
+    fn shape_pointer_sharing() {
+        // Two empty tables share the empty shape; after identical key
+        // sequences they end up at the same shape pointer (transition
+        // tree dedup).
+        use crate::env::shape::Shape;
+        let mut lua = Lua::new();
+        lua.enter(|ctx| {
+            let a = Table::new(ctx);
+            let b = Table::new(ctx);
+            assert!(
+                Shape::ptr_eq(a.shape(), b.shape()),
+                "fresh tables should share the empty shape"
+            );
+
+            let kx = Value::string(LuaString::new(ctx, b"x"));
+            let ky = Value::string(LuaString::new(ctx, b"y"));
+
+            a.raw_set(ctx.mutation(), kx, Value::integer(1));
+            a.raw_set(ctx.mutation(), ky, Value::integer(2));
+            b.raw_set(ctx.mutation(), kx, Value::integer(10));
+            b.raw_set(ctx.mutation(), ky, Value::integer(20));
+
+            assert!(
+                Shape::ptr_eq(a.shape(), b.shape()),
+                "tables with the same key sequence should share a shape"
+            );
+
+            // Different ordering -> different shape pointer.
+            let c = Table::new(ctx);
+            c.raw_set(ctx.mutation(), ky, Value::integer(2));
+            c.raw_set(ctx.mutation(), kx, Value::integer(1));
+            assert!(
+                !Shape::ptr_eq(a.shape(), c.shape()),
+                "tables grown through different key orders should have distinct shapes"
+            );
+
+            // Read-back consistency.
+            assert_eq!(a.raw_get(kx).get_integer(), Some(1));
+            assert_eq!(b.raw_get(ky).get_integer(), Some(20));
+            assert_eq!(c.raw_get(kx).get_integer(), Some(1));
+        });
+    }
+
+    #[test]
+    fn mixed_string_and_int_keys() {
+        // String keys on the shape, integer keys in the array part —
+        // they must not collide.
+        let n = run_returning_int(
+            "local t = {} \
+             t.x = 100 \
+             t[1] = 7 \
+             t.y = 200 \
+             t[2] = 3 \
+             return t.x + t.y + t[1] + t[2]",
+        );
+        assert_eq!(n, 310);
     }
 }

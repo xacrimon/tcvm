@@ -34,14 +34,17 @@ pub enum Instruction {
     GETTABUP {
         dst: Register,
         idx: UpvalueIndex,
-        key_hash: [u8; 3],
+        /// Index into the prototype's `ic_table` reserved for this
+        /// call site. One IC slot is allocated per emitted GETTABUP/
+        /// SETTABUP/GETFIELD/SETFIELD; sites are not deduped.
+        ic_idx: u16,
         key: ConstantIndex,
     },
 
     SETTABUP {
         src: Register,
         idx: UpvalueIndex,
-        key_hash: [u8; 3],
+        ic_idx: u16,
         key: ConstantIndex,
     },
 
@@ -60,14 +63,14 @@ pub enum Instruction {
     GETFIELD {
         dst: Register,
         table: Register,
-        key_hash: [u8; 3],
+        ic_idx: u16,
         key_idx: ConstantIndex,
     },
 
     SETFIELD {
         src: Register,
         table: Register,
-        key_hash: [u8; 3],
+        ic_idx: u16,
         key_idx: ConstantIndex,
     },
 

@@ -1,5 +1,6 @@
 use crate::Context;
 use crate::dmm::{Collect, Gc, Mutation, RefLock};
+use crate::env::shape::Shape;
 use crate::env::string::LuaString;
 use crate::env::value::Value;
 use crate::instruction::UpValueDescriptor;
@@ -20,6 +21,40 @@ pub struct Prototype<'gc> {
     pub max_stack_size: u8,
     pub num_upvalues: u8,
     pub source: Option<LuaString<'gc>>,
+    /// Inline-cache table indexed by `ic_idx` embedded in
+    /// GETTABUP/SETTABUP/GETFIELD/SETFIELD instructions. One entry
+    /// per cache site (call site, not instruction count). Shared
+    /// across all closures over this prototype, mutated through
+    /// `borrow_mut(mc)` so the GC barrier fires when caching shape
+    /// pointers. See `src/env/shape/mod.rs` for the IC payload.
+    pub ic_table: Gc<'gc, RefLock<Box<[InlineCache<'gc>]>>>,
+}
+
+/// Per-call-site monomorphic inline cache. `Empty` initially; a slow
+/// path fills it on first miss with the observed shape and slot. Future
+/// hits skip the metatable lookup entirely.
+#[derive(Clone, Copy, Collect, Default)]
+#[collect(internal, no_drop)]
+pub enum InlineCache<'gc> {
+    #[default]
+    Empty,
+    Mono {
+        /// Shape pointer the cache was filled against.
+        shape: Shape<'gc>,
+        /// `MtToken` generation snapshot at fill time.
+        /// Mismatch → invalidate.
+        #[collect(require_static)]
+        mt_gen: u32,
+        /// Slot index in `TableState::properties`. `u32::MAX` =
+        /// "key absent in shape" (so a get returns the metamethod
+        /// chain on this branch and a set must transition).
+        #[collect(require_static)]
+        slot: u32,
+    },
+}
+
+impl<'gc> InlineCache<'gc> {
+    pub const ABSENT_SLOT: u32 = u32::MAX;
 }
 
 /// An upvalue — open (references a stack slot) or closed (owns the value).

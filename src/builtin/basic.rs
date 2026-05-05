@@ -71,10 +71,20 @@ fn lua_error<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Resul
 }
 
 fn lua_getmetatable<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    _nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<(), NativeError> {
-    todo!()
+    let v = stack.get(0);
+    let result = if let Some(t) = v.get_table() {
+        match t.metatable() {
+            Some(mt) => Value::table(mt),
+            None => Value::nil(),
+        }
+    } else {
+        Value::nil()
+    };
+    stack.replace(&[result]);
+    Ok(())
 }
 
 fn lua_ipairs<'gc>(
@@ -122,10 +132,19 @@ fn lua_rawequal<'gc>(
 }
 
 fn lua_rawget<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    _nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<(), NativeError> {
-    todo!()
+    let t_arg = stack.get(0);
+    let key = stack.get(1);
+    let Some(t) = t_arg.get_table() else {
+        return Err(NativeError::new(
+            "bad argument #1 to 'rawget' (table expected)",
+        ));
+    };
+    let v = t.raw_get(key);
+    stack.replace(&[v]);
+    Ok(())
 }
 
 fn lua_rawlen<'gc>(
@@ -136,10 +155,20 @@ fn lua_rawlen<'gc>(
 }
 
 fn lua_rawset<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<(), NativeError> {
-    todo!()
+    let t_arg = stack.get(0);
+    let key = stack.get(1);
+    let value = stack.get(2);
+    let Some(t) = t_arg.get_table() else {
+        return Err(NativeError::new(
+            "bad argument #1 to 'rawset' (table expected)",
+        ));
+    };
+    t.raw_set(nctx.ctx.mutation(), key, value);
+    stack.replace(&[Value::table(t)]);
+    Ok(())
 }
 
 fn lua_select<'gc>(
@@ -149,11 +178,32 @@ fn lua_select<'gc>(
     todo!()
 }
 
+/// `setmetatable(t, mt)` — attach `mt` (a table or nil) as `t`'s
+/// metatable, returning `t`. Drives a shape transition along the
+/// `set_metatable` edge so future accesses observe the new identity.
 fn lua_setmetatable<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<(), NativeError> {
-    todo!()
+    let t_arg = stack.get(0);
+    let mt_arg = stack.get(1);
+    let Some(t) = t_arg.get_table() else {
+        return Err(NativeError::new(
+            "bad argument #1 to 'setmetatable' (table expected)",
+        ));
+    };
+    let mt = if mt_arg.is_nil() {
+        None
+    } else if let Some(mt) = mt_arg.get_table() {
+        Some(mt)
+    } else {
+        return Err(NativeError::new(
+            "bad argument #2 to 'setmetatable' (nil or table expected)",
+        ));
+    };
+    t.set_metatable(nctx.ctx.mutation(), mt);
+    stack.replace(&[Value::table(t)]);
+    Ok(())
 }
 
 fn lua_tonumber<'gc>(

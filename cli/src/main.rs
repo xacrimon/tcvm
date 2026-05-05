@@ -39,7 +39,7 @@ fn main() {
     let script_args = args.script_args.clone();
 
     lua.enter(|ctx| {
-        let arg_tbl = Table::new(ctx.mutation());
+        let arg_tbl = Table::new(ctx);
         let path_str = LuaString::new(ctx, &file_path);
         arg_tbl.raw_set(ctx.mutation(), Value::integer(0), Value::string(path_str));
         for (i, s) in script_args.iter().enumerate() {

@@ -1,12 +1,13 @@
 use crate::dmm::{Gc, Mutation, RefLock};
 use crate::env::function::{
-    Function, FunctionKind, LuaClosure, NativeClosure, NativeContext, NativeError, Stack, Upvalue,
-    UpvalueState,
+    Function, FunctionKind, InlineCache, LuaClosure, NativeClosure, NativeContext, NativeError,
+    Stack, Upvalue, UpvalueState,
 };
+use crate::env::shape::{MetamethodBits, Shape};
 use crate::env::string::LuaString;
-use crate::env::table::{Metamethod, Table};
+use crate::env::table::Table;
 use crate::env::thread::{CallFrame, Thread, ThreadState, ThreadStatus};
-use crate::env::value::{Value, ValueKind, key_hash_to_u64};
+use crate::env::value::{Value, ValueKind};
 use crate::instruction::{Instruction, UpValueDescriptor};
 use crate::lua::Context;
 use crate::vm::num::{self, op_arith, op_bit};
@@ -223,6 +224,193 @@ macro_rules! helpers {
     };
 }
 
+/// Inflates the slow-path body for "table get with metamethod".
+/// Expects `helpers!(...)` to have been invoked in the enclosing handler
+/// so `dispatch!`, `raise!`, `invoke_metamethod!`, and `reg!` resolve.
+///
+/// Steps:
+///   1. Refresh the shape's `mm_cache` from the metatable's contents
+///      if the cache snapshot is stale.
+///   2. Try a direct `raw_get`. Non-nil result is the answer.
+///   3. Nil result + no `__index` → answer is nil.
+///   4. Nil result + `__index` → walk the chain. Resolved values
+///      land in `$dst`; functions fire via `invoke_metamethod!`.
+macro_rules! table_get_slow_body {
+    ($ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr,
+     $t:expr, $k:expr, $dst:expr) => {{
+        let __t: Table<'gc> = $t;
+        let __k: Value<'gc> = $k;
+        let __dst_reg: u8 = $dst;
+
+        let (__shape, __metatable) = {
+            let s = __t.inner().borrow();
+            (s.shape(), s.metatable())
+        };
+        if __shape.mm_cache_stale() {
+            __shape.refresh_mm_cache($ctx.mutation(), __metatable, $ctx.metamethod_names());
+        }
+
+        let __v = __t.raw_get(__k);
+        if !__v.is_nil() {
+            *reg!(mut __dst_reg) = __v;
+            dispatch!();
+        }
+
+        if !__shape.maybe_has_mm(MetamethodBits::INDEX) {
+            *reg!(mut __dst_reg) = Value::nil();
+            dispatch!();
+        }
+
+        match resolve_index_chain($ctx, __t, __k) {
+            Some(IndexChain::Resolved(__rv)) => {
+                *reg!(mut __dst_reg) = __rv;
+                dispatch!();
+            }
+            Some(IndexChain::Invoke {
+                func: __mm_func,
+                receiver: __mm_recv,
+            }) => {
+                let __cont = Continuation {
+                    func: cont_store_result,
+                    payload: ContinuationPayload::StoreResult { dst: __dst_reg },
+                    results_base: 0,
+                    nret: 0,
+                };
+                invoke_metamethod!(__mm_func, &[__mm_recv, __k], __cont);
+            }
+            None => raise!(),
+        }
+    }};
+}
+
+/// Inflates the slow-path body for "table set with metamethod".
+/// Same prelude rules as `table_get_slow_body!`.
+///
+/// Walks the `__newindex` chain via `resolve_newindex_chain`, which
+/// returns either the table to raw-write into, or a callable to invoke.
+macro_rules! table_set_slow_body {
+    ($ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr,
+     $t:expr, $k:expr, $v:expr) => {{
+        let __t: Table<'gc> = $t;
+        let __k: Value<'gc> = $k;
+        let __new_val: Value<'gc> = $v;
+
+        let (__shape, __metatable) = {
+            let s = __t.inner().borrow();
+            (s.shape(), s.metatable())
+        };
+        if __shape.mm_cache_stale() {
+            __shape.refresh_mm_cache($ctx.mutation(), __metatable, $ctx.metamethod_names());
+        }
+
+        match resolve_newindex_chain($ctx, __t, __k) {
+            Some(NewIndexChain::RawSet(__target)) => {
+                __target.raw_set($ctx.mutation(), __k, __new_val);
+                dispatch!();
+            }
+            Some(NewIndexChain::Invoke {
+                func: __mm_func,
+                receiver: __mm_recv,
+            }) => {
+                let __cont = Continuation {
+                    func: cont_ignore_result,
+                    payload: ContinuationPayload::IgnoreResult,
+                    results_base: 0,
+                    nret: 0,
+                };
+                invoke_metamethod!(__mm_func, &[__mm_recv, __k, __new_val], __cont);
+            }
+            None => raise!(),
+        }
+    }};
+}
+
+// ---------------------------------------------------------------------------
+// Inline cache helpers
+// ---------------------------------------------------------------------------
+
+/// Read the IC entry for the current call site. The handler must have
+/// validated `ic_idx` came from a `GETFIELD`/`SETFIELD`/`GETTABUP`/
+/// `SETTABUP` instruction whose prototype was assembled with a matching
+/// `ic_table` length.
+#[inline(always)]
+fn read_ic<'gc>(thread: &ThreadState<'gc>, ic_idx: u16) -> InlineCache<'gc> {
+    // SAFETY: ic_idx is allocated at compile-time within the prototype's
+    // IC count; debug-asserted in alloc_ic_slot's saturating_add.
+    let proto = unsafe { &thread.frames.last().unwrap_unchecked().closure.proto };
+    let table = proto.ic_table.borrow();
+    debug_assert!((ic_idx as usize) < table.len());
+    *unsafe { table.get_unchecked(ic_idx as usize) }
+}
+
+/// Refill the IC entry. Called by slow paths after they've done a full
+/// shape lookup; subsequent same-shape accesses skip the slow path.
+#[inline(always)]
+fn fill_ic<'gc>(
+    ctx: Context<'gc>,
+    thread: &ThreadState<'gc>,
+    ic_idx: u16,
+    shape: Shape<'gc>,
+    slot: u32,
+) {
+    let proto = unsafe { &thread.frames.last().unwrap_unchecked().closure.proto };
+    let mut table = proto.ic_table.borrow_mut(ctx.mutation());
+    if let Some(slot_ref) = table.get_mut(ic_idx as usize) {
+        let mt_gen = shape.mt_token().map_or(0, |t| t.current_gen());
+        *slot_ref = InlineCache::Mono {
+            shape,
+            mt_gen,
+            slot,
+        };
+    }
+}
+
+/// Verify a cached IC entry against the live shape and metatable
+/// generation. Returns `Some(slot)` on a fresh hit, `None` on miss.
+#[inline(always)]
+fn ic_check<'gc>(cache: InlineCache<'gc>, live_shape: Shape<'gc>) -> Option<u32> {
+    if let InlineCache::Mono {
+        shape,
+        mt_gen,
+        slot,
+    } = cache
+    {
+        if Shape::ptr_eq(live_shape, shape) {
+            let live_gen = shape.mt_token().map_or(0, |t| t.current_gen());
+            if live_gen == mt_gen {
+                return Some(slot);
+            }
+        }
+    }
+    None
+}
+
+/// Fill the IC entry from the table's *current* shape + slot for the
+/// given constant key. Called at the start of constant-key slow paths
+/// so subsequent same-shape accesses can take the fast path. For SET
+/// paths that end up transitioning `t`'s shape (fresh-key write with no
+/// `__newindex`), this leaves a one-step-stale IC entry that the next
+/// access fixes up — acceptable on cold paths.
+#[inline(always)]
+fn fill_ic_for_constant_key<'gc>(
+    ctx: Context<'gc>,
+    thread: &ThreadState<'gc>,
+    ic_idx: u16,
+    t: Table<'gc>,
+    k: Value<'gc>,
+) {
+    // GETFIELD/SETFIELD/GETTABUP/SETTABUP only carry constant string
+    // keys — non-string would be a compiler bug, so be defensive.
+    let Some(key_str) = k.get_string() else {
+        return;
+    };
+    let state = t.inner().borrow();
+    let shape = state.shape();
+    let slot = shape.find_slot(key_str).unwrap_or(InlineCache::ABSENT_SLOT);
+    drop(state);
+    fill_ic(ctx, thread, ic_idx, shape, slot);
+}
+
 /// Drive the VM on `thread` until the top-level frame returns.
 ///
 /// The caller must have seeded the thread with at least one `CallFrame`,
@@ -367,29 +555,33 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (dst, idx, key_hash, key) = args!(Instruction::GETTABUP {
+    let (dst, idx, ic_idx, _key) = args!(Instruction::GETTABUP {
         dst,
         idx,
-        key_hash,
+        ic_idx,
         key
     });
     let uv = upvalue!(idx);
-    let t = read_upvalue(thread, uv);
+    let t_val = read_upvalue(thread, uv);
 
-    let Some(t) = t.get_table() else {
+    let Some(t) = t_val.get_table() else {
         raise!();
     };
 
-    let t = t.inner().borrow();
-
-    if t.has_metamethod(Metamethod::INDEX) {
-        become gettabup_slow(instruction, ctx, thread, registers, ip, handlers);
+    let cache = read_ic(thread, ic_idx);
+    let t_state = t.inner().borrow();
+    if let Some(slot) = ic_check(cache, t_state.shape()) {
+        if slot != InlineCache::ABSENT_SLOT {
+            let v = t_state.property_at(slot);
+            if !(v.is_nil() && t_state.shape().maybe_has_mm(MetamethodBits::INDEX)) {
+                drop(t_state);
+                *reg!(mut dst) = v;
+                dispatch!();
+            }
+        }
     }
-
-    let k = constant!(key);
-    let v = t.raw_get_with_hash(k, key_hash_to_u64(key_hash));
-    *reg!(mut dst) = v;
-    dispatch!();
+    drop(t_state);
+    become gettabup_slow(instruction, ctx, thread, registers, ip, handlers);
 }
 
 #[inline(never)]
@@ -401,7 +593,21 @@ extern "rust-preserve-none" fn gettabup_slow<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    todo!()
+    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    let (dst, idx, ic_idx, key) = args!(Instruction::GETTABUP {
+        dst,
+        idx,
+        ic_idx,
+        key
+    });
+    let uv = upvalue!(idx);
+    let t_val = read_upvalue(thread, uv);
+    let Some(t) = t_val.get_table() else {
+        raise!();
+    };
+    let k = constant!(key);
+    fill_ic_for_constant_key(ctx, thread, ic_idx, t, k);
+    table_get_slow_body!(ctx, thread, registers, ip, handlers, t, k, dst);
 }
 
 /// UpValue[idx][K[key]] = R[src]
@@ -415,29 +621,46 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (src, idx, key_hash, key) = args!(Instruction::SETTABUP {
+    let (src, idx, ic_idx, key) = args!(Instruction::SETTABUP {
         src,
         idx,
-        key_hash,
+        ic_idx,
         key
     });
     let uv = upvalue!(idx);
-    let t = read_upvalue(thread, uv);
+    let t_val = read_upvalue(thread, uv);
 
-    let Some(t) = t.get_table() else {
+    let Some(t) = t_val.get_table() else {
         raise!();
     };
 
-    let mut t = t.inner().borrow_mut(ctx.mutation());
-
-    if t.has_metamethod(Metamethod::NEWINDEX) {
-        become settabup_slow(instruction, ctx, thread, registers, ip, handlers);
-    }
-
-    let k = constant!(key);
     let v = reg!(src);
-    t.raw_set_with_hash(k, v, key_hash_to_u64(key_hash));
-    dispatch!()
+    let cache = read_ic(thread, ic_idx);
+    let t_state = t.inner().borrow();
+    if let Some(slot) = ic_check(cache, t_state.shape()) {
+        if slot != InlineCache::ABSENT_SLOT {
+            let existing = t_state.property_at(slot);
+            // __newindex fires only on currently-nil keys.
+            if !(existing.is_nil() && t_state.shape().maybe_has_mm(MetamethodBits::NEWINDEX)) {
+                drop(t_state);
+                let mut state = t.inner().borrow_mut(ctx.mutation());
+                state.properties[slot as usize] = v;
+                // mt_token bump if we just wrote a metamethod-named key
+                // on a metatable. Inlined to avoid raw_set_with_hash's
+                // duplicate slot lookup.
+                let k = constant!(key);
+                if let Some(s) = k.get_string()
+                    && let Some(token) = state.mt_token()
+                    && crate::env::shape::metamethod_bit_of_bytes(s.as_bytes()).is_some()
+                {
+                    token.bump();
+                }
+                dispatch!()
+            }
+        }
+    }
+    drop(t_state);
+    become settabup_slow(instruction, ctx, thread, registers, ip, handlers);
 }
 
 #[inline(never)]
@@ -449,7 +672,22 @@ extern "rust-preserve-none" fn settabup_slow<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    todo!()
+    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    let (src, idx, ic_idx, key) = args!(Instruction::SETTABUP {
+        src,
+        idx,
+        ic_idx,
+        key
+    });
+    let uv = upvalue!(idx);
+    let t_val = read_upvalue(thread, uv);
+    let Some(t) = t_val.get_table() else {
+        raise!();
+    };
+    let k = constant!(key);
+    let v = reg!(src);
+    fill_ic_for_constant_key(ctx, thread, ic_idx, t, k);
+    table_set_slow_body!(ctx, thread, registers, ip, handlers, t, k, v);
 }
 
 // ---------------------------------------------------------------------------
@@ -473,14 +711,18 @@ extern "rust-preserve-none" fn op_gettable<'gc>(
         raise!();
     };
 
-    let t = t.inner().borrow();
+    let k = reg!(key);
+    let (v, need_index) = {
+        let t_state = t.inner().borrow();
+        let v = t_state.raw_get(k);
+        let need = v.is_nil() && t_state.shape().maybe_has_mm(MetamethodBits::INDEX);
+        (v, need)
+    };
 
-    if t.has_metamethod(Metamethod::INDEX) {
+    if need_index {
         become gettable_slow(instruction, ctx, thread, registers, ip, handlers);
     }
 
-    let k = reg!(key);
-    let v = t.raw_get(k);
     *reg!(mut dst) = v;
     dispatch!();
 }
@@ -494,7 +736,13 @@ extern "rust-preserve-none" fn gettable_slow<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    todo!()
+    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    let (dst, table, key) = args!(Instruction::GETTABLE { dst, table, key });
+    let Some(t) = reg!(table).get_table() else {
+        raise!();
+    };
+    let k = reg!(key);
+    table_get_slow_body!(ctx, thread, registers, ip, handlers, t, k, dst);
 }
 
 /// R[table][R[key]] = R[src]
@@ -514,15 +762,19 @@ extern "rust-preserve-none" fn op_settable<'gc>(
         raise!();
     };
 
-    let mut t = t.inner().borrow_mut(ctx.mutation());
+    let k = reg!(key);
+    let v = reg!(src);
+    let needs_newindex = {
+        let t_state = t.inner().borrow();
+        t_state.shape().maybe_has_mm(MetamethodBits::NEWINDEX) && t_state.raw_get(k).is_nil()
+    };
 
-    if t.has_metamethod(Metamethod::NEWINDEX) {
+    if needs_newindex {
         become settable_slow(instruction, ctx, thread, registers, ip, handlers);
     }
 
-    let k = reg!(key);
-    let v = reg!(src);
-    t.raw_set(k, v);
+    let mut t_state = t.inner().borrow_mut(ctx.mutation());
+    t_state.raw_set(ctx.mutation(), k, v);
     dispatch!()
 }
 
@@ -535,7 +787,14 @@ extern "rust-preserve-none" fn settable_slow<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    todo!()
+    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    let (src, table, key) = args!(Instruction::SETTABLE { src, table, key });
+    let Some(t) = reg!(table).get_table() else {
+        raise!();
+    };
+    let k = reg!(key);
+    let v = reg!(src);
+    table_set_slow_body!(ctx, thread, registers, ip, handlers, t, k, v);
 }
 
 /// R[dst] = R[table][K[key_idx]]
@@ -549,10 +808,10 @@ extern "rust-preserve-none" fn op_getfield<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (dst, table, key_hash, key_idx) = args!(Instruction::GETFIELD {
+    let (dst, table, ic_idx, _key_idx) = args!(Instruction::GETFIELD {
         dst,
         table,
-        key_hash,
+        ic_idx,
         key_idx
     });
 
@@ -560,16 +819,20 @@ extern "rust-preserve-none" fn op_getfield<'gc>(
         raise!();
     };
 
-    let t = t.inner().borrow();
-
-    if t.has_metamethod(Metamethod::INDEX) {
-        become getfield_slow(instruction, ctx, thread, registers, ip, handlers);
+    let cache = read_ic(thread, ic_idx);
+    let t_state = t.inner().borrow();
+    if let Some(slot) = ic_check(cache, t_state.shape()) {
+        if slot != InlineCache::ABSENT_SLOT {
+            let v = t_state.property_at(slot);
+            if !(v.is_nil() && t_state.shape().maybe_has_mm(MetamethodBits::INDEX)) {
+                drop(t_state);
+                *reg!(mut dst) = v;
+                dispatch!();
+            }
+        }
     }
-
-    let k = constant!(key_idx);
-    let v = t.raw_get_with_hash(k, key_hash_to_u64(key_hash));
-    *reg!(mut dst) = v;
-    dispatch!();
+    drop(t_state);
+    become getfield_slow(instruction, ctx, thread, registers, ip, handlers);
 }
 
 #[inline(never)]
@@ -581,7 +844,19 @@ extern "rust-preserve-none" fn getfield_slow<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    todo!()
+    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    let (dst, table, ic_idx, key_idx) = args!(Instruction::GETFIELD {
+        dst,
+        table,
+        ic_idx,
+        key_idx
+    });
+    let Some(t) = reg!(table).get_table() else {
+        raise!();
+    };
+    let k = constant!(key_idx);
+    fill_ic_for_constant_key(ctx, thread, ic_idx, t, k);
+    table_get_slow_body!(ctx, thread, registers, ip, handlers, t, k, dst);
 }
 
 /// R[table][K[key_idx]] = R[src]
@@ -595,10 +870,10 @@ extern "rust-preserve-none" fn op_setfield<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (src, table, key_hash, key_idx) = args!(Instruction::SETFIELD {
+    let (src, table, ic_idx, key_idx) = args!(Instruction::SETFIELD {
         src,
         table,
-        key_hash,
+        ic_idx,
         key_idx
     });
 
@@ -606,16 +881,29 @@ extern "rust-preserve-none" fn op_setfield<'gc>(
         raise!();
     };
 
-    let mut t = t.inner().borrow_mut(ctx.mutation());
-
-    if t.has_metamethod(Metamethod::NEWINDEX) {
-        become setfield_slow(instruction, ctx, thread, registers, ip, handlers);
-    }
-
-    let k = constant!(key_idx);
     let v = reg!(src);
-    t.raw_set_with_hash(k, v, key_hash_to_u64(key_hash));
-    dispatch!()
+    let cache = read_ic(thread, ic_idx);
+    let t_state = t.inner().borrow();
+    if let Some(slot) = ic_check(cache, t_state.shape()) {
+        if slot != InlineCache::ABSENT_SLOT {
+            let existing = t_state.property_at(slot);
+            if !(existing.is_nil() && t_state.shape().maybe_has_mm(MetamethodBits::NEWINDEX)) {
+                drop(t_state);
+                let mut state = t.inner().borrow_mut(ctx.mutation());
+                state.properties[slot as usize] = v;
+                let k = constant!(key_idx);
+                if let Some(s) = k.get_string()
+                    && let Some(token) = state.mt_token()
+                    && crate::env::shape::metamethod_bit_of_bytes(s.as_bytes()).is_some()
+                {
+                    token.bump();
+                }
+                dispatch!()
+            }
+        }
+    }
+    drop(t_state);
+    become setfield_slow(instruction, ctx, thread, registers, ip, handlers);
 }
 
 #[inline(never)]
@@ -627,7 +915,20 @@ extern "rust-preserve-none" fn setfield_slow<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    todo!()
+    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    let (src, table, ic_idx, key_idx) = args!(Instruction::SETFIELD {
+        src,
+        table,
+        ic_idx,
+        key_idx
+    });
+    let Some(t) = reg!(table).get_table() else {
+        raise!();
+    };
+    let k = constant!(key_idx);
+    let v = reg!(src);
+    fill_ic_for_constant_key(ctx, thread, ic_idx, t, k);
+    table_set_slow_body!(ctx, thread, registers, ip, handlers, t, k, v);
 }
 
 /// R[dst] = {}
@@ -642,7 +943,7 @@ extern "rust-preserve-none" fn op_newtable<'gc>(
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
     let dst = args!(Instruction::NEWTABLE { dst });
-    *reg!(mut dst) = Value::table(Table::new(ctx.mutation()));
+    *reg!(mut dst) = Value::table(Table::new(ctx));
     dispatch!();
 }
 
