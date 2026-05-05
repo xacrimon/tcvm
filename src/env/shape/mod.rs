@@ -13,9 +13,6 @@
 //! metatable transitions along a different edge. Shapes are deduped
 //! via per-shape transition tables, so two tables that grow through
 //! the same key sequence converge on the same shape pointer.
-//!
-//! See `/Users/joelwejdenstal/.claude/plans/in-a-previous-pr-validated-wind.md`
-//! for the full plan; this module implements its Phase 1 + 5 skeleton.
 
 use core::cell::Cell;
 
