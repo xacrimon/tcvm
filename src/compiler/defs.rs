@@ -1,4 +1,5 @@
-use crate::dmm::{Gc, Mutation};
+use crate::dmm::{Gc, Lock, Mutation};
+use crate::env::function::InlineCache;
 use crate::env::{LuaString, Prototype, Value};
 use crate::instruction::{Instruction, UpValueDescriptor};
 
@@ -194,6 +195,10 @@ pub struct Chunk<'gc> {
     pub(super) labels: Vec<usize>,
     pub(super) jump_patches: Vec<(usize, u16)>,
     pub(super) source: Option<LuaString<'gc>>,
+    /// Number of IC slots reserved so far. Incremented once per emitted
+    /// GETFIELD/SETFIELD/GETTABUP/SETTABUP. The final count seeds the
+    /// prototype's `ic_table` length.
+    pub(super) next_ic_idx: u16,
 }
 
 impl<'gc> Chunk<'gc> {
@@ -211,7 +216,20 @@ impl<'gc> Chunk<'gc> {
             labels: Vec::new(),
             jump_patches: Vec::new(),
             source: None,
+            next_ic_idx: 0,
         }
+    }
+
+    /// Reserve a fresh inline-cache slot. Returns the index to embed in
+    /// the GETFIELD/SETFIELD/GETTABUP/SETTABUP instruction. Slots are
+    /// **not** deduped across call sites — sharing would defeat ICs at
+    /// any non-monomorphic shared use.
+    pub(super) fn alloc_ic_slot(&mut self) -> u16 {
+        let i = self.next_ic_idx;
+        // u16::MAX cache sites per prototype is more than ample; if we
+        // ever hit it, fall back to "no cache" (Empty stays).
+        self.next_ic_idx = self.next_ic_idx.saturating_add(1);
+        i
     }
 
     /// Resolve jump patches and convert into an immutable Prototype.
@@ -232,6 +250,9 @@ impl<'gc> Chunk<'gc> {
 
         let num_upvalues = self.upvalue_desc.len() as u8;
 
+        let ic_table =
+            vec![Lock::new(InlineCache::Empty); self.next_ic_idx as usize].into_boxed_slice();
+
         Gc::new(
             mc,
             Prototype {
@@ -244,6 +265,7 @@ impl<'gc> Chunk<'gc> {
                 max_stack_size: self.max_stack,
                 num_upvalues,
                 source: self.source,
+                ic_table,
             },
         )
     }

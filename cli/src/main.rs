@@ -39,20 +39,16 @@ fn main() {
     let script_args = args.script_args.clone();
 
     lua.enter(|ctx| {
-        let arg_tbl = Table::new(ctx.mutation());
+        let arg_tbl = Table::new(ctx);
         let path_str = LuaString::new(ctx, &file_path);
-        arg_tbl.raw_set(ctx.mutation(), Value::integer(0), Value::string(path_str));
+        arg_tbl.raw_set(ctx, Value::integer(0), Value::string(path_str));
         for (i, s) in script_args.iter().enumerate() {
             let v = LuaString::new(ctx, s.as_bytes());
-            arg_tbl.raw_set(
-                ctx.mutation(),
-                Value::integer((i + 1) as i64),
-                Value::string(v),
-            );
+            arg_tbl.raw_set(ctx, Value::integer((i + 1) as i64), Value::string(v));
         }
         let key = LuaString::new(ctx, b"arg");
         ctx.globals()
-            .raw_set(ctx.mutation(), Value::string(key), Value::table(arg_tbl));
+            .raw_set(ctx, Value::string(key), Value::table(arg_tbl));
     });
 
     let ex = lua.enter(|ctx| {

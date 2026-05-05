@@ -13,16 +13,15 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         ("unpack", lua_unpack),
     ];
 
-    let lib = Table::new(ctx.mutation());
+    let lib = Table::new(ctx);
     for &(name, handler) in fns {
         let handler = Function::new_native(ctx.mutation(), handler, Box::new([]));
         let key = Value::string(LuaString::new(ctx, name.as_bytes()));
-        lib.raw_set(ctx.mutation(), key, Value::function(handler));
+        lib.raw_set(ctx, key, Value::function(handler));
     }
 
     let lib_name = Value::string(LuaString::new(ctx, b"table"));
-    ctx.globals()
-        .raw_set(ctx.mutation(), lib_name, Value::table(lib));
+    ctx.globals().raw_set(ctx, lib_name, Value::table(lib));
 }
 
 fn lua_concat<'gc>(

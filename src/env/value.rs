@@ -217,20 +217,6 @@ pub(crate) fn value_hash(v: Value<'_>) -> u64 {
     foldhash::fast::FixedState::default().hash_one(v) & 0xff_ffff
 }
 
-pub(crate) fn precomputed_key_hash(name: LuaString<'_>) -> [u8; 3] {
-    let h = value_hash(Value::string(name));
-    [
-        (h & 0xff) as u8,
-        ((h >> 8) & 0xff) as u8,
-        ((h >> 16) & 0xff) as u8,
-    ]
-}
-
-#[inline]
-pub(crate) fn key_hash_to_u64(b: [u8; 3]) -> u64 {
-    (b[0] as u64) | ((b[1] as u64) << 8) | ((b[2] as u64) << 16)
-}
-
 unsafe impl<'gc> Collect<'gc> for Value<'gc> {
     #[inline]
     fn trace<T: Trace<'gc>>(&self, cc: &mut T) {

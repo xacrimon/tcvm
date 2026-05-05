@@ -3,8 +3,9 @@ use cstree::build::NodeCache;
 use crate::compiler::compile_chunk;
 use crate::dmm::{DynamicRootSet, Gc, Mutation, RefLock};
 use crate::env::function::{Function, UpvalueState};
+use crate::env::shape::Shape;
 use crate::env::string::Interner;
-use crate::env::{Table, Thread, Value};
+use crate::env::{Symbols, Table, Thread, Value};
 use crate::lua::stash::{Fetchable, Stashable};
 use crate::lua::{LoadError, State};
 use crate::parser;
@@ -27,6 +28,29 @@ impl<'gc> Context<'gc> {
 
     pub fn globals(self) -> Table<'gc> {
         self.state.globals
+    }
+
+    /// Shared empty / root shape — every newly-allocated table starts
+    /// here. Stable for the lifetime of the runtime.
+    pub fn empty_shape(self) -> Shape<'gc> {
+        self.state.empty_shape
+    }
+
+    /// Dict-mode sentinel for tables with no metatable. Tables that
+    /// migrate to dict mode while carrying a metatable use the
+    /// per-`MtCache` sentinel instead.
+    #[inline]
+    pub fn empty_dict_sentinel(self) -> Shape<'gc> {
+        self.state.empty_dict_sentinel
+    }
+
+    /// Globally-interned ambient `LuaString` symbols (metamethod
+    /// names and friends). Slow paths read this to skip per-call
+    /// interning; `Table::ensure_mt_cache` reads it to walk a
+    /// metatable's slots at adoption time.
+    #[inline]
+    pub fn symbols(self) -> &'gc Symbols<'gc> {
+        &self.state.symbols
     }
 
     pub fn main_thread(self) -> Thread<'gc> {
