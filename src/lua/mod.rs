@@ -968,4 +968,136 @@ mod tests {
         );
         assert_eq!(n, 100);
     }
+
+    // ---------------------------------------------------------------------
+    // SELF opcode (`obj:m(...)`).
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn self_method_on_receiver_direct() {
+        // Method lives directly on the receiver.
+        let n = run_returning_int(
+            "local t = {} \
+             function t.add(self, x) return self.v + x end \
+             t.v = 10 \
+             return t:add(5)",
+        );
+        assert_eq!(n, 15);
+    }
+
+    #[test]
+    fn self_oop_idiom_via_metatable_self_index() {
+        // Canonical Lua OOP: `mt.__index = mt`, methods on mt, instances
+        // setmetatable'd to mt.
+        let n = run_returning_int_with_basic(
+            "local Box = {} \
+             Box.__index = Box \
+             function Box.new(v) return setmetatable({v = v}, Box) end \
+             function Box.get(self) return self.v end \
+             local b = Box.new(7) \
+             return b:get()",
+        );
+        assert_eq!(n, 7);
+    }
+
+    #[test]
+    fn self_oop_hot_loop_repeated_dispatch() {
+        // Same call site executes 1000 times against the same instance.
+        // Uses recursion rather than `for` because method-call statements
+        // inside `for` bodies hit a separate parser path.
+        let n = run_returning_int_with_basic(
+            "local C = {} \
+             C.__index = C \
+             function C.bump(self) self.v = self.v + 1 end \
+             function C.get(self) return self.v end \
+             local function loop(x, n) \
+                 if n == 0 then return x:get() end \
+                 local r = x:bump() \
+                 return loop(x, n - 1) \
+             end \
+             local x = setmetatable({v = 0}, C) \
+             return loop(x, 1000)",
+        );
+        assert_eq!(n, 1000);
+    }
+
+    #[test]
+    fn self_index_table_distinct_proto() {
+        // __index points at a separate proto table (not mt itself).
+        let n = run_returning_int_with_basic(
+            "local proto = {} \
+             function proto.val(self) return 42 end \
+             local mt = {__index = proto} \
+             local t = setmetatable({}, mt) \
+             return t:val()",
+        );
+        assert_eq!(n, 42);
+    }
+
+    #[test]
+    fn self_index_function_metamethod() {
+        // __index is a function. SELF must invoke it as (recv, key) and
+        // call the returned method with self as first arg.
+        let n = run_returning_int_with_basic(
+            "local function dispatch(_, k) \
+                 if k == 'twice' then return function(s) return s.v * 2 end end \
+                 error('unknown method') \
+             end \
+             local t = setmetatable({v = 21}, {__index = dispatch}) \
+             return t:twice()",
+        );
+        assert_eq!(n, 42);
+    }
+
+    #[test]
+    fn self_method_swap_on_proto() {
+        // Replacing the method on the proto must take effect on the next
+        // dispatch.
+        let n = run_returning_int_with_basic(
+            "local C = {} \
+             C.__index = C \
+             function C.f(self) return 1 end \
+             local t = setmetatable({}, C) \
+             local a = t:f() \
+             function C.f(self) return 99 end \
+             local b = t:f() \
+             return a + b",
+        );
+        assert_eq!(n, 1 + 99);
+    }
+
+    #[test]
+    fn self_index_redirect() {
+        // Reassigning __index on the metatable must redirect dispatch.
+        let n = run_returning_int_with_basic(
+            "local A = {} \
+             A.__index = A \
+             function A.f(self) return 1 end \
+             local B = {} \
+             function B.f(self) return 50 end \
+             local t = setmetatable({}, A) \
+             local a = t:f() \
+             A.__index = B \
+             local b = t:f() \
+             return a + b",
+        );
+        assert_eq!(n, 1 + 50);
+    }
+
+    #[test]
+    fn self_receiver_grows_method_directly() {
+        // Adding the method to the instance directly takes precedence
+        // over the proto.
+        let n = run_returning_int_with_basic(
+            "local C = {} \
+             C.__index = C \
+             function C.f(self) return 1 end \
+             local t = setmetatable({}, C) \
+             local a = t:f() \
+             function t.f(self) return 200 end \
+             local b = t:f() \
+             return a + b",
+        );
+        assert_eq!(n, 1 + 200);
+    }
 }
