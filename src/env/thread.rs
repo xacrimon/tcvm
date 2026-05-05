@@ -1,4 +1,4 @@
-use crate::dmm::{Collect, Gc, Mutation, RefLock};
+use crate::dmm::{Collect, Gc, Mutation, Ref, RefLock, RefMut};
 use crate::env::function::{LuaClosure, Upvalue};
 use crate::env::value::Value;
 use crate::vm::interp::Continuation;
@@ -63,11 +63,11 @@ impl<'gc> Thread<'gc> {
         thread
     }
 
-    pub fn borrow(self) -> std::cell::Ref<'gc, ThreadState<'gc>> {
+    pub fn borrow(self) -> Ref<'gc, ThreadState<'gc>> {
         self.0.borrow()
     }
 
-    pub fn borrow_mut(self, mc: &Mutation<'gc>) -> std::cell::RefMut<'gc, ThreadState<'gc>> {
+    pub fn borrow_mut(self, mc: &Mutation<'gc>) -> RefMut<'gc, ThreadState<'gc>> {
         self.0.borrow_mut(mc)
     }
 

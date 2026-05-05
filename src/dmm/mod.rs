@@ -2,6 +2,7 @@
 
 pub mod arena;
 pub mod barrier;
+pub mod checked_cell;
 pub mod collect;
 mod collect_impl;
 mod context;
@@ -27,6 +28,7 @@ pub use self::{arena::__DynRootable, no_drop::__MustNotImplDrop, unsize::__Coerc
 
 pub use self::{
     arena::{Arena, Rootable},
+    checked_cell::{BorrowError, BorrowMutError, Ref, RefMut},
     collect::Collect,
     context::{Finalization, Mutation},
     dynamic_roots::{DynamicRoot, DynamicRootSet},

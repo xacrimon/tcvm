@@ -1,7 +1,7 @@
 //! GC-aware interior mutability types.
 
 use core::{
-    cell::{BorrowError, BorrowMutError, Cell, OnceCell, Ref, RefCell, RefMut},
+    cell::{Cell, OnceCell},
     cmp::Ordering,
     fmt,
 };
@@ -9,6 +9,7 @@ use core::{
 use crate::dmm::{
     Gc, Mutation,
     barrier::Unlock,
+    checked_cell::{BorrowError, BorrowMutError, CheckedCell, Ref, RefMut},
     collect::{Collect, Trace},
 };
 
@@ -222,7 +223,7 @@ impl<T: Ord + Copy> Ord for Lock<T> {
 make_lock_wrapper!(
     #[derive(Clone, Default, Eq, PartialEq, Ord, PartialOrd)]
     locked = RefLock as GcRefLock;
-    unlocked = RefCell unsafe as_ref_cell;
+    unlocked = CheckedCell unsafe as_checked_cell;
     impl Sized {
         #[inline]
         pub fn take(&self) -> T where T: Default {
