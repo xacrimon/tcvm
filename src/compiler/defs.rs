@@ -1,4 +1,4 @@
-use crate::dmm::{Gc, Mutation, RefLock};
+use crate::dmm::{Gc, Lock, Mutation};
 use crate::env::function::InlineCache;
 use crate::env::{LuaString, Prototype, Value};
 use crate::instruction::{Instruction, UpValueDescriptor};
@@ -250,8 +250,8 @@ impl<'gc> Chunk<'gc> {
 
         let num_upvalues = self.upvalue_desc.len() as u8;
 
-        let ic_slots = vec![InlineCache::Empty; self.next_ic_idx as usize].into_boxed_slice();
-        let ic_table = Gc::new(mc, RefLock::new(ic_slots));
+        let ic_table =
+            vec![Lock::new(InlineCache::Empty); self.next_ic_idx as usize].into_boxed_slice();
 
         Gc::new(
             mc,

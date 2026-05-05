@@ -338,9 +338,8 @@ fn read_ic<'gc>(thread: &ThreadState<'gc>, ic_idx: u16) -> InlineCache<'gc> {
     // SAFETY: ic_idx is allocated at compile-time within the prototype's
     // IC count; debug-asserted in alloc_ic_slot's saturating_add.
     let proto = unsafe { &thread.frames.last().unwrap_unchecked().closure.proto };
-    let table = proto.ic_table.borrow();
-    debug_assert!((ic_idx as usize) < table.len());
-    *unsafe { table.get_unchecked(ic_idx as usize) }
+    debug_assert!((ic_idx as usize) < proto.ic_table.len());
+    unsafe { proto.ic_table.get_unchecked(ic_idx as usize) }.get()
 }
 
 /// Refill the IC entry. Called by slow paths after they've done a full
@@ -353,15 +352,23 @@ fn fill_ic<'gc>(
     shape: Shape<'gc>,
     slot: u32,
 ) {
-    let proto = unsafe { &thread.frames.last().unwrap_unchecked().closure.proto };
-    let mut table = proto.ic_table.borrow_mut(ctx.mutation());
-    if let Some(slot_ref) = table.get_mut(ic_idx as usize) {
-        let mt_gen = shape.mt_token().map_or(0, |t| t.current_gen());
-        *slot_ref = InlineCache::Mono {
-            shape,
-            mt_gen,
-            slot,
-        };
+    let proto_gc = unsafe { thread.frames.last().unwrap_unchecked().closure.proto };
+    let mt_gen = shape.mt_token().map_or(0, |t| t.current_gen());
+    let value = InlineCache::Mono {
+        shape,
+        mt_gen,
+        slot,
+    };
+    if let Some(slot_lock) = proto_gc.ic_table.get(ic_idx as usize) {
+        // We're adopting a fresh `Shape` Gc pointer through this slot
+        // (transitively reachable from the parent `Prototype`), so emit
+        // the backward barrier on the Prototype manually before writing
+        // through `as_cell()` — `Lock::as_cell` is `unsafe` precisely
+        // because it skips the automatic barrier `Lock::set` on
+        // `Gc<Lock<T>>` would emit.
+        ctx.mutation()
+            .backward_barrier(Gc::erase(proto_gc), None);
+        unsafe { slot_lock.as_cell() }.set(value);
     }
 }
 

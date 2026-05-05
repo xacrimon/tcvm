@@ -1,5 +1,5 @@
 use crate::Context;
-use crate::dmm::{Collect, Gc, Mutation, RefLock};
+use crate::dmm::{Collect, Gc, Lock, Mutation, RefLock};
 use crate::env::shape::Shape;
 use crate::env::string::LuaString;
 use crate::env::value::Value;
@@ -23,11 +23,13 @@ pub struct Prototype<'gc> {
     pub source: Option<LuaString<'gc>>,
     /// Inline-cache table indexed by `ic_idx` embedded in
     /// GETTABUP/SETTABUP/GETFIELD/SETFIELD instructions. One entry
-    /// per cache site (call site, not instruction count). Shared
-    /// across all closures over this prototype, mutated through
-    /// `borrow_mut(mc)` so the GC barrier fires when caching shape
-    /// pointers. See `src/env/shape/mod.rs` for the IC payload.
-    pub ic_table: Gc<'gc, RefLock<Box<[InlineCache<'gc>]>>>,
+    /// per cache site (call site, not instruction count). The slice
+    /// lives inline in the prototype (no separate `Gc` allocation,
+    /// no `RefLock`); per-slot `Lock<InlineCache>` exposes
+    /// counter-free reads via `get()` and barrier-aware writes via
+    /// the parent `Prototype`'s `Gc`. See `src/env/shape/mod.rs` for
+    /// the IC payload.
+    pub ic_table: Box<[Lock<InlineCache<'gc>>]>,
 }
 
 /// Per-call-site monomorphic inline cache. `Empty` initially; a slow
