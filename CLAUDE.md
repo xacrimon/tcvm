@@ -2,6 +2,23 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Verification Standards
+- Never claim Lua semantics or reference compiler (luac) behavior without actually running it to verify. If asserting behavior, show the command and output.
+- When comparing against a reference implementation, cite the actual file/line or run the binary; do not fabricate output.
+Add as a new section near the top of CLAUDE.md, before tool-specific guidance.
+
+## Planning & Brainstorming
+- When the user invokes brainstorming or planning, engage in collaborative dialogue and ask clarifying questions ONE AT A TIME. Do not jump straight to creating tasks, invoking subagents, or writing plan files.
+- Wait for explicit approval before transitioning from discussion to execution.
+Add under a ## Code Style section (create if missing).
+
+## Code Style
+- Prefer inline match expressions over extracted helper functions for small primitive operations (e.g., comparisons). Do not introduce helpers like `primitive_lt`/`primitive_le` unless asked.
+- Skip confirmations for routine sed/file edits once a refactor is approved.
+
+## Git & PR Conventions
+- Never add `Co-Authored-By: Claude` trailers, Claude Code footers, or any Claude attribution to commits or PRs.
+
 ## Build Commands
 
 ```bash
