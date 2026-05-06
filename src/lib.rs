@@ -13,11 +13,11 @@ pub mod env;
 pub(crate) mod instruction;
 pub mod lua;
 pub(crate) mod parser;
-pub(crate) mod vm;
+pub mod vm;
 
 pub use compiler::format::format_prototype;
 pub use lua::{
     Context, Executor, ExecutorMode, Fetchable, FromMultiValue, FromValue, IntoMultiValue,
-    IntoValue, LoadError, Lua, RuntimeError, Stashable, StashedExecutor, StashedFunction,
-    StashedTable, StashedThread, TypeError,
+    IntoValue, LoadError, Lua, RuntimeError, Stashable, StashedError, StashedExecutor,
+    StashedFunction, StashedTable, StashedThread, StashedValue, StepResult, TypeError,
 };

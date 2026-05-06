@@ -1,5 +1,6 @@
 use crate::Context;
-use crate::env::{Function, LuaString, NativeContext, NativeError, NativeFn, Stack, Value};
+use crate::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Value};
+use crate::vm::sequence::CallbackAction;
 
 // See #27: _G, _VERSION
 
@@ -47,32 +48,35 @@ pub fn load<'gc>(ctx: Context<'gc>) {
 fn lua_assert<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_collectgarbage<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_dofile<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_error<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_error<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_getmetatable<'gc>(
     _nctx: NativeContext<'gc, '_>,
     mut stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let v = stack.get(0);
     let result = if let Some(t) = v.get_table() {
         match t.metatable() {
@@ -83,97 +87,114 @@ fn lua_getmetatable<'gc>(
         Value::nil()
     };
     stack.replace(&[result]);
-    Ok(())
+    Ok(CallbackAction::Return)
 }
 
 fn lua_ipairs<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_load<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_load<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_loadfile<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_next<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_next<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_pairs<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_pairs<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_pcall<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_pcall<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_print<'gc>(_ctx: NativeContext<'gc, '_>, stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_print<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let arg = stack[0];
     let num = arg.get_integer().unwrap();
     println!("{}", num);
-    Ok(())
+    Ok(CallbackAction::Return)
 }
 
 fn lua_rawequal<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_rawget<'gc>(
-    _nctx: NativeContext<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
     mut stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let t_arg = stack.get(0);
     let key = stack.get(1);
     let Some(t) = t_arg.get_table() else {
-        return Err(NativeError::new(
+        return Err(Error::from_str(
+            nctx.ctx,
             "bad argument #1 to 'rawget' (table expected)",
         ));
     };
     let v = t.raw_get(key);
     stack.replace(&[v]);
-    Ok(())
+    Ok(CallbackAction::Return)
 }
 
 fn lua_rawlen<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_rawset<'gc>(
     nctx: NativeContext<'gc, '_>,
     mut stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let t_arg = stack.get(0);
     let key = stack.get(1);
     let value = stack.get(2);
     let Some(t) = t_arg.get_table() else {
-        return Err(NativeError::new(
+        return Err(Error::from_str(
+            nctx.ctx,
             "bad argument #1 to 'rawset' (table expected)",
         ));
     };
     t.raw_set(nctx.ctx, key, value);
     stack.replace(&[Value::table(t)]);
-    Ok(())
+    Ok(CallbackAction::Return)
 }
 
 fn lua_select<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
@@ -183,11 +204,12 @@ fn lua_select<'gc>(
 fn lua_setmetatable<'gc>(
     nctx: NativeContext<'gc, '_>,
     mut stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let t_arg = stack.get(0);
     let mt_arg = stack.get(1);
     let Some(t) = t_arg.get_table() else {
-        return Err(NativeError::new(
+        return Err(Error::from_str(
+            nctx.ctx,
             "bad argument #1 to 'setmetatable' (table expected)",
         ));
     };
@@ -196,7 +218,8 @@ fn lua_setmetatable<'gc>(
     } else if let Some(mt) = mt_arg.get_table() {
         Some(mt)
     } else {
-        return Err(NativeError::new(
+        return Err(Error::from_str(
+            nctx.ctx,
             "bad argument #2 to 'setmetatable' (nil or table expected)",
         ));
     };
@@ -207,18 +230,21 @@ fn lua_setmetatable<'gc>(
         let lock_key = LuaString::new(nctx.ctx, b"__metatable");
         let lock_val = existing.raw_get(Value::string(lock_key));
         if !lock_val.is_nil() {
-            return Err(NativeError::new("cannot change a protected metatable"));
+            return Err(Error::from_str(
+                nctx.ctx,
+                "cannot change a protected metatable",
+            ));
         }
     }
     t.set_metatable(nctx.ctx, mt);
     stack.replace(&[Value::table(t)]);
-    Ok(())
+    Ok(CallbackAction::Return)
 }
 
 fn lua_tonumber<'gc>(
     _ctx: NativeContext<'gc, '_>,
     mut stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     // TODO: 2-arg form `tonumber(s, base)` for integer parsing in arbitrary base.
     let v = stack.get(0);
     let result = if v.is_nil() {
@@ -233,7 +259,7 @@ fn lua_tonumber<'gc>(
         Value::nil()
     };
     stack.replace(&[result]);
-    Ok(())
+    Ok(CallbackAction::Return)
 }
 
 fn trim_ascii(b: &[u8]) -> &[u8] {
@@ -266,21 +292,27 @@ fn parse_lua_number<'gc>(b: &[u8]) -> Option<Value<'gc>> {
 fn lua_tostring<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_type<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_type<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_warn<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_warn<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_xpcall<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }

@@ -1,5 +1,8 @@
 use crate::Context;
-use crate::env::{Function, LuaString, NativeContext, NativeError, NativeFn, Stack, Table, Value};
+use crate::env::{
+    Error, Function, LuaString, NativeContext, NativeError, NativeFn, Stack, Table, Value,
+};
+use crate::vm::sequence::CallbackAction;
 
 pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[
@@ -33,32 +36,48 @@ pub fn load<'gc>(ctx: Context<'gc>) {
     ctx.globals().raw_set(ctx, lib_name, Value::table(lib));
 }
 
-fn lua_byte<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_byte<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_char<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_char<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_dump<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_dump<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_find<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_find<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_format<'gc>(
     ctx: NativeContext<'gc, '_>,
     mut stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
+    let lift = |e: NativeError| Error::from_str(ctx.ctx, &e.message);
     let fmt_val = stack.get(0);
     let fmt_str = fmt_val.get_string().ok_or_else(|| {
-        NativeError::new(format!(
-            "bad argument #1 to 'format' (string expected, got {})",
-            fmt_val.type_name()
-        ))
+        Error::from_str(
+            ctx.ctx,
+            &format!(
+                "bad argument #1 to 'format' (string expected, got {})",
+                fmt_val.type_name()
+            ),
+        )
     })?;
     let fmt = fmt_str.as_bytes();
 
@@ -73,7 +92,7 @@ fn lua_format<'gc>(
             continue;
         }
         // parse flags/width/precision/conv starting at fmt[i+1]
-        let (spec, next) = parse_spec(fmt, i + 1)?;
+        let (spec, next) = parse_spec(fmt, i + 1).map_err(lift)?;
         i = next;
         if spec.conv == b'%' {
             out.push(b'%');
@@ -81,12 +100,12 @@ fn lua_format<'gc>(
         }
         let arg = stack.get(arg_idx);
         arg_idx += 1;
-        format_one(&mut out, &spec, arg)?;
+        format_one(&mut out, &spec, arg).map_err(lift)?;
     }
 
     let s = LuaString::new(ctx.ctx, &out);
     stack.replace(&[Value::string(s)]);
-    Ok(())
+    Ok(CallbackAction::Return)
 }
 
 #[derive(Default)]
@@ -546,59 +565,83 @@ fn apply_width(out: &mut Vec<u8>, spec: &FmtSpec, sign: &[u8], prefix: &[u8], bo
 fn lua_gmatch<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_gsub<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_gsub<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_len<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_len<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_lower<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_lower<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_match<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_match<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_pack<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_pack<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_packsize<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_rep<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_rep<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_reverse<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_sub<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_sub<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_unpack<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_upper<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_upper<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }

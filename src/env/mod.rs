@@ -1,3 +1,4 @@
+pub mod error;
 pub mod function;
 pub mod shape;
 pub mod string;
@@ -51,6 +52,7 @@ macro_rules! for_each_metamethod {
 }
 pub(crate) use for_each_metamethod;
 
+pub use error::Error;
 pub use function::{Function, NativeContext, NativeError, NativeFn, Prototype, Stack};
 pub use shape::{MetamethodBits, MtCache, Shape};
 pub use string::LuaString;
