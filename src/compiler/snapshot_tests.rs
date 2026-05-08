@@ -83,6 +83,10 @@ test!(
     "test-files/freereg_call_arg_reclaim.lua"
 );
 test!(freereg_nested_call, "test-files/freereg_nested_call.lua");
+test!(
+    freereg_discarded_call,
+    "test-files/freereg_discarded_call.lua"
+);
 test!(freereg_and_call, "test-files/freereg_and_call.lua");
 test!(
     freereg_for_num_temps,

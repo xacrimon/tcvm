@@ -1,6 +1,6 @@
 ---
 source: src/compiler/snapshot_tests.rs
-assertion_line: 240
+assertion_line: 78
 expression: output
 ---
 ; function (params=0, vararg=true, stack=1, upvalues=1)
@@ -32,5 +32,5 @@ expression: output
   0008  FORLOOP         R2 -3
   0009  GETTABUP        R2 U0 K3  ; "print"
   0010  MOVE            R3 R0
-  0011  CALL            R2 args=2 ret=2
+  0011  CALL            R2 args=2 ret=1
   0012  RETURN          R0 count=1

@@ -1328,10 +1328,7 @@ fn compile_stmt(ctx: &mut Ctx, item: Stmt) -> Result<(), CompileError> {
         Stmt::Global(item) => compile_global(ctx, item),
         Stmt::Assign(item) => compile_assign(ctx, item),
         Stmt::Func(item) => compile_func(ctx, item),
-        Stmt::Expr(item) => {
-            compile_expr_to_reg(ctx, item, None)?;
-            Ok(())
-        }
+        Stmt::Expr(item) => compile_stmt_expr(ctx, item),
         Stmt::Break(item) => compile_break(ctx, item),
         Stmt::Return(item) => compile_return(ctx, item),
         Stmt::Do(item) => compile_do(ctx, item),
@@ -3201,6 +3198,45 @@ fn compile_tail_method_call(ctx: &mut Ctx, item: MethodCall) -> Result<(), Compi
     });
     ctx.chunk.freereg = func.0;
     Ok(())
+}
+
+/// Compile an expression statement. In Lua only function and method
+/// calls may stand as statements; for those we emit a `CALL` with
+/// `returns = 1` (the wire encoding for "0 results") and snap freereg
+/// back to the func slot.
+///
+/// Other expression shapes are not legal as statements in Lua; the
+/// parser currently doesn't reject them, so we fall back to discharging
+/// the value and reclaiming any leaked temps.
+fn compile_stmt_expr(ctx: &mut Ctx, item: Expr) -> Result<(), CompileError> {
+    match item {
+        Expr::FuncCall(call) => {
+            let (func, nargs) = emit_func_call_setup(ctx, &call)?;
+            ctx.emit(Instruction::CALL {
+                func: func.0,
+                args: nargs as u8 + 1,
+                returns: 1,
+            });
+            ctx.chunk.freereg = func.0;
+            Ok(())
+        }
+        Expr::Method(call) => {
+            let (func, nargs) = emit_method_call_setup(ctx, &call)?;
+            ctx.emit(Instruction::CALL {
+                func: func.0,
+                args: nargs as u8 + 1,
+                returns: 1,
+            });
+            ctx.chunk.freereg = func.0;
+            Ok(())
+        }
+        other => {
+            compile_expr_to_reg(ctx, other, None)?;
+            debug_assert!(ctx.chunk.freereg >= ctx.chunk.nactvar);
+            ctx.chunk.freereg = ctx.chunk.nactvar;
+            Ok(())
+        }
+    }
 }
 
 /// Set up a method call `obj:m(args)` in registers `func`, `func+1=self`,
