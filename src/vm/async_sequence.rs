@@ -357,20 +357,7 @@ where
     F: Future<Output = Result<SequenceReturn, StashedError>> + 'static,
 {
     fn trace_pointers(&self, cc: &mut dyn Trace<'gc>) {
-        // Delegate to DynamicRootSet's own trace through the standard
-        // Collect impl. We hop through a Sized adapter so we can call
-        // the generic Collect::trace method.
-        struct Adapter<'a, 'gc>(&'a mut dyn Trace<'gc>);
-        impl<'a, 'gc> Trace<'gc> for Adapter<'a, 'gc> {
-            fn trace_gc(&mut self, gc: crate::dmm::Gc<'gc, ()>) {
-                self.0.trace_gc(gc)
-            }
-            fn trace_gc_weak(&mut self, gc: crate::dmm::GcWeak<'gc, ()>) {
-                self.0.trace_gc_weak(gc)
-            }
-        }
-        let mut a = Adapter(cc);
-        Collect::trace(&self.roots, &mut a);
+        crate::seq_trace_pointers!(self, cc);
     }
 
     fn poll(
