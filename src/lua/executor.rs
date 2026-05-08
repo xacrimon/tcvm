@@ -297,21 +297,15 @@ impl<'gc> Executor<'gc> {
                     // For a Lua entry: push function value at slot 0, then
                     // a LuaFrame with base=1.
                     if let Some(closure) = f.as_lua() {
-                        // Re-arrange: put function at slot 0, args at [1..].
-                        let argc = ts.stack.len();
+                        // Put function at slot 0, args at [1..]; the
+                        // resize that follows nil-pads any missing
+                        // parameters into the frame's stack window.
                         ts.stack.insert(0, Value::function(f));
-                        let _ = argc;
                         let base = 1usize;
                         let needed = base + closure.proto.max_stack_size as usize;
                         if ts.stack.len() < needed {
                             ts.stack.resize(needed, Value::nil());
                         }
-                        // Nil-fill missing params.
-                        let num_params = closure.proto.num_params as usize;
-                        let provided = ts.stack.len() - 1; // already grew
-                        let _ = provided;
-                        // Actually we already grew with nils; nothing more to do.
-                        let _ = num_params;
                         ts.push_lua(LuaFrame {
                             closure,
                             base,
