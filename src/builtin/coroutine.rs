@@ -84,9 +84,8 @@ fn lua_yield<'gc>(
 }
 
 /// `coroutine.status(co)` — return one of `"suspended" | "normal" |
-/// "running" | "dead"`. Phase 7: cross-checks against the executor's
-/// thread stack via `Execution` arrives in P8; for now we report the
-/// thread's local status.
+/// "running" | "dead"`. The currently-running thread is detected by
+/// pointer-comparing `co` against `Execution::current_thread`.
 fn lua_status<'gc>(
     nctx: NativeContext<'gc, '_>,
     mut stack: Stack<'gc, '_>,
@@ -94,10 +93,14 @@ fn lua_status<'gc>(
     let co = stack.get(0).get_thread().ok_or_else(|| {
         Error::from_str(nctx.ctx, "bad argument #1 to 'status' (coroutine expected)")
     })?;
-    let s: &[u8] = match co.status() {
-        ThreadStatus::Stopped | ThreadStatus::Result { .. } => b"dead",
-        ThreadStatus::Suspended => b"suspended",
-        ThreadStatus::Normal => b"normal",
+    let s: &[u8] = if co.ptr_eq(nctx.exec.current_thread()) {
+        b"running"
+    } else {
+        match co.status() {
+            ThreadStatus::Stopped | ThreadStatus::Result { .. } => b"dead",
+            ThreadStatus::Suspended => b"suspended",
+            ThreadStatus::Normal => b"normal",
+        }
     };
     let v = Value::string(LuaString::new(nctx.ctx, s));
     stack.replace(&[v]);
@@ -105,25 +108,36 @@ fn lua_status<'gc>(
 }
 
 /// `coroutine.running()` — `(currently_running_thread, is_main_thread)`.
-/// Phase 7 stub: returns `(main, true)` until the executor handle exposes
-/// its thread stack via `Execution` (P8). Most code uses the boolean.
 fn lua_running<'gc>(
     nctx: NativeContext<'gc, '_>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let main = nctx.ctx.main_thread();
-    stack.replace(&[Value::thread(main), Value::boolean(true)]);
+    let cur = nctx.exec.current_thread();
+    let is_main = cur.ptr_eq(nctx.ctx.main_thread());
+    stack.replace(&[Value::thread(cur), Value::boolean(is_main)]);
     Ok(CallbackAction::Return)
 }
 
 /// `coroutine.isyieldable([co])` — true iff `co` (defaults to running) is
-/// not the main thread. Phase 7 stub: returns `false` (main is the only
-/// thing currently exposed via `Execution`).
+/// not the main thread. (TCVM doesn't yet model non-yieldable C frames;
+/// the main-thread test is the only blocker.)
 fn lua_isyieldable<'gc>(
-    _nctx: NativeContext<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    stack.replace(&[Value::boolean(false)]);
+    let arg = stack.get(0);
+    let target = if arg.is_nil() {
+        nctx.exec.current_thread()
+    } else {
+        arg.get_thread().ok_or_else(|| {
+            Error::from_str(
+                nctx.ctx,
+                "bad argument #1 to 'isyieldable' (coroutine expected)",
+            )
+        })?
+    };
+    let yieldable = !target.ptr_eq(nctx.ctx.main_thread());
+    stack.replace(&[Value::boolean(yieldable)]);
     Ok(CallbackAction::Return)
 }
 

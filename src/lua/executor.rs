@@ -628,10 +628,11 @@ fn pump_sequence<'gc>(
     let poll_result = {
         let mut ts = top.borrow_mut(mc);
         let stack_view = crate::env::function::Stack::new(&mut ts.stack, bottom);
+        let exec = Execution::new(top);
         if let Some(err) = pending_error {
-            seq.error(ctx, Execution::new(), err, stack_view)
+            seq.error(ctx, exec, err, stack_view)
         } else {
-            seq.poll(ctx, Execution::new(), stack_view)
+            seq.poll(ctx, exec, stack_view)
         }
     };
     match poll_result {

@@ -86,24 +86,25 @@ pub enum CallbackAction<'gc> {
 }
 
 /// Read-only view of the executor that is passed to a native callback or
-/// sequence poll. Phase 1 placeholder; richer fields (current thread,
-/// `&[Thread<'gc>]` thread stack, fuel handle) come in P6.
+/// sequence poll. Carries the currently-running thread; richer fields
+/// (full `&[Thread<'gc>]` thread stack, fuel handle) come in P8.
 #[derive(Clone, Copy)]
 pub struct Execution<'gc, 'a> {
+    current_thread: Thread<'gc>,
     _marker: std::marker::PhantomData<&'a Thread<'gc>>,
 }
 
 impl<'gc, 'a> Execution<'gc, 'a> {
-    pub fn new() -> Self {
+    pub fn new(current_thread: Thread<'gc>) -> Self {
         Execution {
+            current_thread,
             _marker: std::marker::PhantomData,
         }
     }
-}
 
-impl<'gc, 'a> Default for Execution<'gc, 'a> {
-    fn default() -> Self {
-        Self::new()
+    /// Thread the native callback / sequence is running on top of.
+    pub fn current_thread(self) -> Thread<'gc> {
+        self.current_thread
     }
 }
 

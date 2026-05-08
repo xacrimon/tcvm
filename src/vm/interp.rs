@@ -2084,10 +2084,13 @@ pub(crate) fn invoke_native<'gc>(
     } else if thread.stack.len() < end {
         thread.stack.resize(end, Value::nil());
     }
+    let current_thread = thread
+        .thread_handle
+        .expect("ThreadState missing back-reference");
     let nctx = NativeContext {
         ctx,
         upvalues: &nc.upvalues,
-        exec: crate::vm::sequence::Execution::new(),
+        exec: crate::vm::sequence::Execution::new(current_thread),
     };
     let stack = Stack::new(&mut thread.stack, args_base);
     (nc.function)(nctx, stack)

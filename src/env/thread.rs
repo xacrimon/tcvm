@@ -217,6 +217,11 @@ impl<'gc> Thread<'gc> {
         self.0.borrow().status
     }
 
+    /// Pointer equality between two thread handles.
+    pub fn ptr_eq(self, other: Thread<'gc>) -> bool {
+        Gc::ptr_eq(self.0, other.0)
+    }
+
     pub fn inner(self) -> Gc<'gc, RefLock<ThreadState<'gc>>> {
         self.0
     }
