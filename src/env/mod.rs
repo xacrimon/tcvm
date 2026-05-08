@@ -53,7 +53,7 @@ macro_rules! for_each_metamethod {
 pub(crate) use for_each_metamethod;
 
 pub use error::Error;
-pub use function::{Function, NativeContext, NativeError, NativeFn, Prototype, Stack};
+pub use function::{Function, NativeContext, NativeFn, Prototype, Stack};
 pub use shape::{MetamethodBits, MtCache, Shape};
 pub use string::LuaString;
 pub use symbols::Symbols;

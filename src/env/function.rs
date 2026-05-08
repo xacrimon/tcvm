@@ -208,20 +208,6 @@ impl<'gc, 'a> std::ops::Index<usize> for Stack<'gc, 'a> {
     }
 }
 
-/// Error returned by a [`NativeFn`] to abort execution.
-#[derive(Debug, Clone)]
-pub struct NativeError {
-    pub message: String,
-}
-
-impl NativeError {
-    pub fn new(message: impl Into<String>) -> Self {
-        NativeError {
-            message: message.into(),
-        }
-    }
-}
-
 /// Copy wrapper stored in Value. Single Gc pointer for size efficiency.
 #[derive(Clone, Copy, Collect)]
 #[collect(internal, no_drop)]

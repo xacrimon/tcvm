@@ -1,7 +1,7 @@
 use crate::dmm::{Gc, Mutation, RefLock};
 use crate::env::function::{
-    Function, FunctionKind, InlineCache, LuaClosure, NativeClosure, NativeContext, NativeError,
-    Stack, Upvalue, UpvalueState,
+    Function, FunctionKind, InlineCache, LuaClosure, NativeClosure, NativeContext, Stack, Upvalue,
+    UpvalueState,
 };
 use crate::env::shape::{MetamethodBits, Shape};
 use crate::env::string::LuaString;

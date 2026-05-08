@@ -1,5 +1,4 @@
 use crate::dmm::{Collect, Gc, RefLock};
-use crate::env::error::Error;
 use crate::env::function::Function;
 use crate::env::thread::{Frame, LuaFrame, PendingAction, ThreadStatus};
 use crate::env::{Thread, Value};
