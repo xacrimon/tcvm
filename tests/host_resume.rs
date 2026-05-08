@@ -64,3 +64,68 @@ fn host_resume_round_trip() {
         .expect("take_result");
     assert_eq!(result, 30, "chunk should sum the resume-args");
 }
+
+/// Two host yield/resume cycles in a row: chunk yields, host resumes
+/// with a value, chunk yields again with a value derived from the resume,
+/// host resumes once more, chunk completes. Drives at the `Executor`
+/// level so we can intercept each yield (`Lua::resume` would otherwise
+/// surface the second yield as `MainYielded`).
+#[test]
+fn host_resume_two_cycles() {
+    let mut lua = Lua::new();
+    let ex = lua
+        .try_enter(|ctx| -> Result<_, LoadError> {
+            let y = Function::new_native(ctx.mutation(), yielder as NativeFn, Box::new([]));
+            let key = Value::string(LuaString::new(ctx, b"yielder"));
+            ctx.globals().raw_set(ctx, key, Value::function(y));
+            let chunk = ctx.load(
+                "local a = yielder(1)\n\
+                 local b = yielder(a + 10)\n\
+                 return a + b",
+                Some("host_resume_two"),
+            )?;
+            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+        })
+        .expect("load");
+
+    // Cycle 1: chunk yields (1).
+    let first: i64 = lua
+        .try_enter(|ctx| -> Result<_, RuntimeError> {
+            match ctx.fetch(&ex).step(ctx)? {
+                StepResult::Yielded(vs) => Ok(vs[0].get_integer().unwrap()),
+                _ => panic!("expected first yield"),
+            }
+        })
+        .expect("step1");
+    assert_eq!(first, 1);
+
+    // Cycle 2: feed 5 back; chunk yields (a + 10) = 15.
+    let second: i64 = lua
+        .try_enter(|ctx| -> Result<_, RuntimeError> {
+            let executor = ctx.fetch(&ex);
+            executor.resume(ctx, (5i64,))?;
+            match executor.step(ctx)? {
+                StepResult::Yielded(vs) => Ok(vs[0].get_integer().unwrap()),
+                _ => panic!("expected second yield"),
+            }
+        })
+        .expect("step2");
+    assert_eq!(second, 15);
+
+    // Cycle 3: feed 100 back; chunk completes.
+    lua.try_enter(|ctx| -> Result<(), RuntimeError> {
+        let executor = ctx.fetch(&ex);
+        executor.resume(ctx, (100i64,))?;
+        match executor.step(ctx)? {
+            StepResult::Done => Ok(()),
+            _ => panic!("expected Done"),
+        }
+    })
+    .expect("step3");
+
+    let result: i64 = lua
+        .try_enter(|ctx| ctx.fetch(&ex).take_result::<i64>(ctx))
+        .expect("take_result");
+    // a=5, b=100; sum=105.
+    assert_eq!(result, 105);
+}
