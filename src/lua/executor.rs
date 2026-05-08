@@ -195,11 +195,22 @@ impl<'gc> Executor<'gc> {
                     return Ok(StepResult::Done);
                 }
                 ThreadStatus::Suspended if stack_len == 1 && self.0.borrow().main_yielded => {
-                    // The yielded values aren't surfaced to the host yet
-                    // (no resume API); return an empty Vec for now.
+                    // Extract yielded values from the top thread's stack
+                    // window, identified by the pending_action stash that
+                    // apply_pending_action::Yield / pump_sequence::Yield
+                    // installed.
+                    let values: Vec<Value<'gc>> = {
+                        let ts = top.borrow();
+                        let bottom = ts
+                            .pending_action
+                            .as_ref()
+                            .map(|p| p.bottom)
+                            .expect("main yield must have stashed pending_action");
+                        ts.stack[bottom..].to_vec()
+                    };
                     let mut inner = self.0.borrow_mut(mc);
                     inner.mode = ExecutorMode::Yielded;
-                    return Ok(StepResult::Yielded(Vec::new()));
+                    return Ok(StepResult::Yielded(values));
                 }
                 ThreadStatus::Stopped => return Err(RuntimeError::BadMode),
                 _ => {}
