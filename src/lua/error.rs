@@ -18,16 +18,15 @@ pub enum LoadError {
 #[derive(Debug, Error)]
 pub enum RuntimeError {
     /// Internal VM error (type mismatch, missing metamethod, etc.). Carries
-    /// the offending PC for debugging. Phase 6 will fold these into Lua-level
-    /// errors carrying a structured payload.
+    /// the offending PC for debugging.
     #[error("vm error at pc {pc}")]
     Opcode { pc: usize },
     #[error("bad executor mode")]
     BadMode,
-    /// The main thread yielded to the host before completing. The host
-    /// must `resume` the executor to continue (P8); plain `finish`/
+    /// The main thread yielded to the host before completing. `finish`/
     /// `execute` have no path to surface the yielded values, so they
     /// turn this into an error rather than reporting bogus completion.
+    /// A host-side resume API isn't implemented yet.
     #[error("main thread yielded; resume not yet supported")]
     MainYielded,
     /// User-thrown Lua error (`error(value)`); payload is the stashed value.

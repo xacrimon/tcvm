@@ -8,9 +8,6 @@
 //! frame stack and traced as part of the normal GC walk. Each `poll` (or
 //! `error`) call gets a fresh `'gc` brand, mirroring how a `Mutation<'gc>`
 //! flows through `Lua::enter`.
-//!
-//! See `/Users/joelwejdenstal/.claude/plans/i-d-like-you-work-gleaming-hickey.md`
-//! for the full design document.
 
 use std::alloc::Allocator;
 use std::pin::Pin;
@@ -87,7 +84,8 @@ pub enum CallbackAction<'gc> {
 
 /// Read-only view of the executor that is passed to a native callback or
 /// sequence poll. Carries the currently-running thread; richer fields
-/// (full `&[Thread<'gc>]` thread stack, fuel handle) come in P8.
+/// (full `&[Thread<'gc>]` thread stack, fuel handle) aren't implemented
+/// yet.
 #[derive(Clone, Copy)]
 pub struct Execution<'gc, 'a> {
     current_thread: Thread<'gc>,

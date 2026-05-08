@@ -17,8 +17,8 @@ pub enum ExecutorMode {
     Normal,
     /// Thread has returned; results are available on its stack.
     Result,
-    /// Top thread yielded; values were drained on the last `step`. Caller
-    /// may `resume` (Phase 8 public API) or treat as terminal.
+    /// Top thread yielded; values were drained on the last `step`. The
+    /// host-side resume API to continue from here isn't implemented yet.
     Yielded,
 }
 
@@ -26,11 +26,11 @@ pub enum ExecutorMode {
 pub enum StepResult<'gc> {
     /// Top thread reached terminal `Result` state. Caller may `take_result`.
     Done,
-    /// Top thread yielded these values to the host. Caller may `resume`
-    /// the executor with new arguments.
+    /// Top thread yielded these values to the host. The host-side
+    /// resume API isn't implemented yet.
     Yielded(Vec<Value<'gc>>),
     /// Reserved for future fuel-based time-slicing — caller should call
-    /// `step` again to continue. Phase 4 never produces this variant.
+    /// `step` again to continue. Not currently produced by the executor.
     Pending,
 }
 
@@ -42,7 +42,7 @@ pub(crate) struct ExecutorInner<'gc> {
     pub(crate) thread: Thread<'gc>,
     /// Stack of currently-active threads. The top is the thread the driver
     /// is pumping; lower entries are `WaitThread`-suspended resumers.
-    /// Coroutine `resume` pushes onto this stack in P7+.
+    /// Coroutine `resume` pushes onto this stack.
     pub(crate) thread_stack: Vec<Thread<'gc>>,
     pub(crate) mode: ExecutorMode,
     /// Set when the main thread yielded to the host. Used by the driver to
@@ -131,13 +131,13 @@ impl<'gc> Executor<'gc> {
     /// Returns:
     /// - [`StepResult::Done`] — the main thread completed; call `take_result`.
     /// - [`StepResult::Yielded(values)`] — the main thread yielded to the
-    ///   host. Use `resume` to continue (Phase 8 surface).
+    ///   host. The host-side resume API isn't implemented yet.
     /// - [`StepResult::Pending`] — reserved for fuel-based slicing.
     ///
     /// The hot path (Lua-only execution, sync natives) makes a single call
     /// into `run_thread` and exits. Coroutine resume / sequence pump cycles
     /// loop here until something terminal happens or values cross the host
-    /// boundary. There is no fuel limit yet — see plan §P10.
+    /// boundary. There is no fuel limit yet.
     pub fn step(self, ctx: Context<'gc>) -> Result<StepResult<'gc>, RuntimeError> {
         {
             let inner = self.0.borrow();
@@ -195,8 +195,8 @@ impl<'gc> Executor<'gc> {
                     return Ok(StepResult::Done);
                 }
                 ThreadStatus::Suspended if stack_len == 1 && self.0.borrow().main_yielded => {
-                    // P8: surface as StepResult::Yielded once the yield-to-
-                    // host channel is wired. For now, treat as Done.
+                    // The yielded values aren't surfaced to the host yet
+                    // (no resume API); return an empty Vec for now.
                     let mut inner = self.0.borrow_mut(mc);
                     inner.mode = ExecutorMode::Yielded;
                     return Ok(StepResult::Yielded(Vec::new()));
@@ -243,8 +243,9 @@ impl<'gc> Executor<'gc> {
                         .map_err(|e| RuntimeError::Opcode { pc: e.pc })?;
                 }
                 FrameKind::Empty => {
-                    // Native-entry shortcut: pre-P7 path; eventually folded
-                    // into Frame::Start. Stack[0] = native fn, [1..] = args.
+                    // Native-entry shortcut. Should eventually be folded into
+                    // Frame::Start so native and Lua entry share one path.
+                    // Stack[0] = native fn, [1..] = args.
                     let mut ts = top.borrow_mut(mc);
                     let entry_fn = ts.stack[0]
                         .get_function()
@@ -327,8 +328,8 @@ impl<'gc> Executor<'gc> {
         }
     }
 
-    /// Re-arm a `Yielded` executor with fresh resume arguments. Phase 4
-    /// stub: full implementation lands with coroutine support in P7/P8.
+    /// Re-arm a `Yielded` executor with fresh resume arguments. Not
+    /// yet implemented — currently always returns `BadMode`.
     pub fn resume<A: IntoMultiValue<'gc>>(
         self,
         ctx: Context<'gc>,
@@ -441,9 +442,10 @@ fn apply_pending_action<'gc>(
             schedule_call_at(&mut ts, ctx, bottom, function, returns)?;
         }
         CallbackAction::Yield { to_thread: _, then } => {
-            // Phase 7 ships `to_thread = None` only (yield to immediate
-            // resumer). `to_thread = Some(_)` (cross-coroutine yield)
-            // requires extra thread-stack walking; deferred to P8.
+            // Currently only `to_thread = None` (yield to immediate
+            // resumer) is honored. `to_thread = Some(_)` (cross-coroutine
+            // yield) would need extra thread-stack walking and isn't
+            // implemented yet.
             let mut ts = top.borrow_mut(mc);
             if let Some(seq) = then {
                 ts.frames.push(Frame::Sequence {
@@ -732,7 +734,7 @@ fn pump_sequence<'gc>(
             thread: _target,
             bottom: _rel,
         }) => {
-            // Resume from inside a sequence: defer to P8 polish.
+            // Resume-from-sequence isn't implemented yet.
             return Err(RuntimeError::BadMode);
         }
         Ok(SequencePoll::TailResume(_target)) => {

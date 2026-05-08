@@ -98,8 +98,8 @@ impl Lua {
     /// Returns `Ok(())` when the main thread terminates with results
     /// (subsequent `take_result` succeeds). Returns
     /// [`RuntimeError::MainYielded`] if the main thread yielded to the
-    /// host — `finish` has no way to surface yielded values, and the
-    /// public resume API arrives in P8.
+    /// host — `finish` has no way to surface yielded values, and a
+    /// public host-side resume API isn't implemented yet.
     pub fn finish(&mut self, ex: &StashedExecutor) -> Result<(), RuntimeError> {
         enum Outcome {
             Done,

@@ -164,9 +164,10 @@ fn lua_wrap<'gc>(
     Ok(CallbackAction::Return)
 }
 
-/// `coroutine.close(co)` — Phase 7 simplified: clear the thread's stack/
-/// frames, set status to `Stopped`, return `true`. Full Lua-5.4 `__close`
-/// invocation is out of scope (tracks alongside the TBC `__close` work).
+/// `coroutine.close(co)` — clear the thread's stack/frames, set status
+/// to `Stopped`, return `true`. Does NOT yet invoke `__close`
+/// metamethods on the thread's to-be-closed variables; that ships with
+/// the broader TBC `__close` work.
 fn lua_close<'gc>(
     nctx: NativeContext<'gc, '_>,
     mut stack: Stack<'gc, '_>,
