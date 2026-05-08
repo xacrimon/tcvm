@@ -94,8 +94,8 @@ pub enum SequenceReturn {
     Return,
     /// Tail-call this function with stack values as args.
     Call(StashedFunction),
-    /// Tail-yield stack values to the resumer (or to `to_thread`).
-    Yield(Option<StashedThread>),
+    /// Tail-yield stack values to the resumer.
+    Yield,
     /// Tail-resume `thread` with stack values as args.
     Resume(StashedThread),
 }
@@ -198,16 +198,9 @@ impl AsyncSequence {
 
     /// Yield stack values starting at `bottom`. On resumption, resume-args
     /// are placed at `bottom..` for the sequence to consume.
-    pub async fn lua_yield(
-        &mut self,
-        to_thread: Option<&StashedThread>,
-        bottom: usize,
-    ) -> Result<(), StashedError> {
+    pub async fn lua_yield(&mut self, bottom: usize) -> Result<(), StashedError> {
         self.shared.visit(|shared| {
-            shared.set_next_op(SequenceOp::Yield {
-                to_thread: to_thread.map(|t| t.fetch(shared.roots)),
-                bottom,
-            });
+            shared.set_next_op(SequenceOp::Yield { bottom });
         });
         wait_once().await;
         self.shared.visit(|shared| {
@@ -336,9 +329,7 @@ where
                     Ok(SequenceReturn::Call(function)) => {
                         Ok(SequencePoll::TailCall(function.fetch(roots_local)))
                     }
-                    Ok(SequenceReturn::Yield(to_thread)) => Ok(SequencePoll::TailYield(
-                        to_thread.map(|t| t.fetch(roots_local)),
-                    )),
+                    Ok(SequenceReturn::Yield) => Ok(SequencePoll::TailYield),
                     Ok(SequenceReturn::Resume(thread)) => {
                         Ok(SequencePoll::TailResume(thread.fetch(roots_local)))
                     }
@@ -351,9 +342,7 @@ where
                     SequenceOp::Call { function, bottom } => {
                         SequencePoll::Call { function, bottom }
                     }
-                    SequenceOp::Yield { to_thread, bottom } => {
-                        SequencePoll::Yield { to_thread, bottom }
-                    }
+                    SequenceOp::Yield { bottom } => SequencePoll::Yield { bottom },
                     SequenceOp::Resume { thread, bottom } => {
                         SequencePoll::Resume { thread, bottom }
                     }
@@ -415,7 +404,6 @@ enum SequenceOp<'gc> {
         bottom: usize,
     },
     Yield {
-        to_thread: Option<Thread<'gc>>,
         bottom: usize,
     },
     Resume {

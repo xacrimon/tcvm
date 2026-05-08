@@ -77,10 +77,7 @@ fn lua_yield<'gc>(
     _nctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    Ok(CallbackAction::Yield {
-        to_thread: None,
-        then: None,
-    })
+    Ok(CallbackAction::Yield { then: None })
 }
 
 /// `coroutine.status(co)` — return one of `"suspended" | "normal" |

@@ -32,13 +32,9 @@ pub enum SequencePoll<'gc> {
         function: Function<'gc>,
         bottom: usize,
     },
-    /// Yield values at `bottom..` to `to_thread` (or to the resumer, if `None`).
-    /// On resumption, this sequence is polled again with the resume-args at
-    /// `bottom..`.
-    Yield {
-        to_thread: Option<Thread<'gc>>,
-        bottom: usize,
-    },
+    /// Yield values at `bottom..` to the resumer. On resumption, this
+    /// sequence is polled again with the resume-args at `bottom..`.
+    Yield { bottom: usize },
     /// Resume `thread` with values at `bottom..`. On the resumed thread
     /// yielding/returning, this sequence is polled with those values at
     /// `bottom..`.
@@ -47,7 +43,7 @@ pub enum SequencePoll<'gc> {
     /// sequence's caller, not back to this sequence.
     TailCall(Function<'gc>),
     /// Tail yield; sequence consumed.
-    TailYield(Option<Thread<'gc>>),
+    TailYield,
     /// Tail resume; sequence consumed.
     TailResume(Thread<'gc>),
 }
@@ -68,12 +64,9 @@ pub enum CallbackAction<'gc> {
         function: Function<'gc>,
         then: Option<BoxSequence<'gc>>,
     },
-    /// Yield to the resumer (or to a specific thread). Optional follow-up
-    /// sequence runs on the resumption with the resume-args on the stack.
-    Yield {
-        to_thread: Option<Thread<'gc>>,
-        then: Option<BoxSequence<'gc>>,
-    },
+    /// Yield to the resumer. Optional follow-up sequence runs on
+    /// resumption with the resume-args on the stack.
+    Yield { then: Option<BoxSequence<'gc>> },
     /// Resume `thread`. Optional follow-up sequence runs on the inner thread
     /// yielding/returning with those values on the stack.
     Resume {

@@ -441,11 +441,7 @@ fn apply_pending_action<'gc>(
             // Now stack[bottom] = function, stack[bottom+1..] = args.
             schedule_call_at(&mut ts, ctx, bottom, function, returns)?;
         }
-        CallbackAction::Yield { to_thread: _, then } => {
-            // Currently only `to_thread = None` (yield to immediate
-            // resumer) is honored. `to_thread = Some(_)` (cross-coroutine
-            // yield) would need extra thread-stack walking and isn't
-            // implemented yet.
+        CallbackAction::Yield { then } => {
             let mut ts = top.borrow_mut(mc);
             if let Some(seq) = then {
                 ts.frames.push(Frame::Sequence {
@@ -690,10 +686,7 @@ fn pump_sequence<'gc>(
             ts.stack[func_idx] = Value::function(function);
             schedule_call_at(&mut ts, ctx, func_idx, function, returns)?;
         }
-        Ok(SequencePoll::Yield {
-            to_thread: _,
-            bottom: rel,
-        }) => {
+        Ok(SequencePoll::Yield { bottom: rel }) => {
             let abs_bottom = bottom + rel;
             let mut ts = top.borrow_mut(mc);
             // Re-push self to be re-polled with resume-args at stack[bottom..].
@@ -716,7 +709,7 @@ fn pump_sequence<'gc>(
                 exec.0.borrow_mut(mc).main_yielded = true;
             }
         }
-        Ok(SequencePoll::TailYield(_to_thread)) => {
+        Ok(SequencePoll::TailYield) => {
             let mut ts = top.borrow_mut(mc);
             ts.pending_action = Some(PendingAction {
                 action: CallbackAction::Return,
