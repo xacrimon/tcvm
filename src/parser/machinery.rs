@@ -282,6 +282,10 @@ pub struct CompletedMarker {
 }
 
 impl CompletedMarker {
+    pub fn kind(&self) -> SyntaxKind {
+        self.kind
+    }
+
     pub fn precede(self, state: &mut State, kind: SyntaxKind) -> Marker {
         let marker = state.start(kind);
 
