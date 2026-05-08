@@ -72,10 +72,9 @@ impl<'gc> Executor<'gc> {
     /// Seed `main_thread` with `function(args...)` and return a Normal-mode
     /// executor. Any previous state on the main thread is cleared.
     ///
-    /// Accepts both Lua closures and native functions as the entry point.
-    /// For Lua entry, a call frame is pushed and the body runs on `step`.
-    /// For native entry, no call frame is pushed — `step` invokes the
-    /// native callback directly.
+    /// Lua and native entry share the same shape: args at `stack[0..]`
+    /// and a `Frame::Start(function)` on top. The driver's `Frame::Start`
+    /// handler builds the call frame on first dispatch.
     pub fn start<A: IntoMultiValue<'gc>>(
         ctx: Context<'gc>,
         function: Function<'gc>,
@@ -90,27 +89,8 @@ impl<'gc> Executor<'gc> {
             ts.open_upvalues.clear();
             ts.tbc_slots.clear();
 
-            ts.stack.push(Value::function(function));
             args.push_into(&mut ts.stack);
-
-            if let Some(closure) = function.as_lua() {
-                let base = 1usize;
-                let needed = base + closure.proto.max_stack_size as usize;
-                if ts.stack.len() < needed {
-                    ts.stack.resize(needed, Value::nil());
-                }
-
-                ts.push_lua(LuaFrame {
-                    closure,
-                    base,
-                    pc: 0,
-                    num_results: 0, // accept all returns
-                    continuation: None,
-                });
-            }
-            // Native entry: leave frames empty; `step` will detect this and
-            // invoke the callback directly. `Suspended` here means
-            // "primed-and-ready"; `step` flips to `Result` on completion.
+            ts.frames.push(Frame::Start(function));
             ts.status = ThreadStatus::Suspended;
         }
 
@@ -234,7 +214,6 @@ impl<'gc> Executor<'gc> {
                 Start,
                 WaitThread,
                 Error,
-                Empty,
             }
             let kind = {
                 let ts = top.borrow();
@@ -244,7 +223,9 @@ impl<'gc> Executor<'gc> {
                     Some(Frame::Start(_)) => FrameKind::Start,
                     Some(Frame::WaitThread { .. }) => FrameKind::WaitThread,
                     Some(Frame::Error(_)) => FrameKind::Error,
-                    None => FrameKind::Empty,
+                    None => unreachable!(
+                        "active thread with empty frames violates the executor invariant"
+                    ),
                 }
             };
 
@@ -253,75 +234,29 @@ impl<'gc> Executor<'gc> {
                     vm::interp::run_thread(ctx, top)
                         .map_err(|e| RuntimeError::Opcode { pc: e.pc })?;
                 }
-                FrameKind::Empty => {
-                    // Native-entry shortcut. Should eventually be folded into
-                    // Frame::Start so native and Lua entry share one path.
-                    // Stack[0] = native fn, [1..] = args.
-                    let mut ts = top.borrow_mut(mc);
-                    let entry_fn = ts.stack[0]
-                        .get_function()
-                        .expect("native entry: stack[0] must be a Function");
-                    let nc = entry_fn
-                        .as_native()
-                        .expect("native entry: function must be native");
-                    let argc = ts.stack.len() - 1;
-                    let action =
-                        vm::interp::invoke_native(ctx, &mut *ts, nc, 1, argc).map_err(|e| {
-                            RuntimeError::Lua(crate::lua::Stashable::stash(e, mc, ctx.roots()))
-                        })?;
-                    match action {
-                        CallbackAction::Return => {
-                            let retc = ts.stack.len() - 1;
-                            for i in 0..retc {
-                                ts.stack[i] = ts.stack[1 + i];
-                            }
-                            ts.stack.truncate(retc);
-                            ts.status = ThreadStatus::Result { bottom: 0 };
-                        }
-                        _ => return Err(RuntimeError::BadMode),
-                    }
-                }
                 FrameKind::Sequence => {
                     pump_sequence(self, ctx, top)?;
                 }
                 FrameKind::Start => {
-                    // First-resume of a coroutine. Pop Frame::Start(f),
-                    // build a one-shot call frame for `f` with the args
-                    // currently on the stack as its parameters.
+                    // First-resume / first-dispatch. Pop Frame::Start(f),
+                    // insert the function before the args, and delegate
+                    // to schedule_call_at — which builds a LuaFrame for a
+                    // Lua callee or invokes a native one inline.
                     let mut ts = top.borrow_mut(mc);
                     let f = match ts.frames.pop() {
                         Some(Frame::Start(f)) => f,
                         _ => unreachable!(),
                     };
-                    // Args were placed by the resumer at stack[0..].
-                    // For a Lua entry: push function value at slot 0, then
-                    // a LuaFrame with base=1.
-                    if let Some(closure) = f.as_lua() {
-                        // Put function at slot 0, args at [1..]; the
-                        // resize that follows nil-pads any missing
-                        // parameters into the frame's stack window.
-                        ts.stack.insert(0, Value::function(f));
-                        let base = 1usize;
-                        let needed = base + closure.proto.max_stack_size as usize;
-                        if ts.stack.len() < needed {
-                            ts.stack.resize(needed, Value::nil());
-                        }
-                        ts.push_lua(LuaFrame {
-                            closure,
-                            base,
-                            pc: 0,
-                            num_results: 0, // accept all returns
-                            continuation: None,
-                        });
+                    ts.stack.insert(0, Value::function(f));
+                    schedule_call_at(&mut ts, ctx, 0, f, 0)?;
+                    if ts.frames.is_empty() && ts.pending_action.is_none() {
+                        // Native entry returned `Return` synchronously;
+                        // results sit at stack[0..] and the thread is
+                        // done.
+                        ts.status = ThreadStatus::Result { bottom: 0 };
                     } else {
-                        // Native entry — invoke directly next iteration via
-                        // the Empty branch. We re-create the empty-stack
-                        // shape: stack[0] = function, [1..] = args.
-                        let cur_args: Vec<Value<'gc>> = ts.stack.drain(..).collect();
-                        ts.stack.push(Value::function(f));
-                        ts.stack.extend(cur_args);
+                        ts.status = ThreadStatus::Normal;
                     }
-                    ts.status = ThreadStatus::Normal;
                 }
                 FrameKind::WaitThread => {
                     unreachable!("WaitThread on top of the *active* thread is invariant-violating");
