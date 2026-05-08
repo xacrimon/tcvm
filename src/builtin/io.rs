@@ -1,5 +1,6 @@
 use crate::Context;
-use crate::env::{Function, LuaString, NativeContext, NativeError, NativeFn, Stack, Table, Value};
+use crate::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Table, Value};
+use crate::vm::sequence::CallbackAction;
 
 // See #27: predefined handles — stdin, stdout, stderr
 
@@ -29,56 +30,80 @@ pub fn load<'gc>(ctx: Context<'gc>) {
     ctx.globals().raw_set(ctx, lib_name, Value::table(lib));
 }
 
-fn lua_close<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_close<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_flush<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_flush<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_input<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_input<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_lines<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_lines<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_open<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_open<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_output<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_popen<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_popen<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_read<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_read<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_tmpfile<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_type<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_type<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_write<'gc>(
-    _ctx: NativeContext<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
     mut stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     use std::io::Write;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -98,18 +123,21 @@ fn lua_write<'gc>(
                 write!(out, "{}", f)
             }
         } else {
-            return Err(NativeError::new(format!(
-                "bad argument to 'write' (string expected, got {})",
-                v.type_name()
-            )));
+            return Err(Error::from_str(
+                nctx.ctx,
+                &format!(
+                    "bad argument to 'write' (string expected, got {})",
+                    v.type_name()
+                ),
+            ));
         };
         if let Err(e) = res {
-            return Err(NativeError::new(format!("io.write: {e}")));
+            return Err(Error::from_str(nctx.ctx, &format!("io.write: {e}")));
         }
     }
     // TODO: return the file handle once io userdata exists.
     stack.replace(&[]);
-    Ok(())
+    Ok(CallbackAction::Return)
 }
 
 // See #27: file-handle methods — registered on the file-userdata metatable once
@@ -119,7 +147,7 @@ fn lua_write<'gc>(
 fn lua_file_close<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
@@ -127,7 +155,7 @@ fn lua_file_close<'gc>(
 fn lua_file_flush<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
@@ -135,7 +163,7 @@ fn lua_file_flush<'gc>(
 fn lua_file_lines<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
@@ -143,7 +171,7 @@ fn lua_file_lines<'gc>(
 fn lua_file_read<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
@@ -151,7 +179,7 @@ fn lua_file_read<'gc>(
 fn lua_file_seek<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
@@ -159,7 +187,7 @@ fn lua_file_seek<'gc>(
 fn lua_file_setvbuf<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
@@ -167,6 +195,6 @@ fn lua_file_setvbuf<'gc>(
 fn lua_file_write<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }

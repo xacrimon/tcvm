@@ -27,9 +27,10 @@ pub use tcvm_derive::__unelide_lifetimes;
 pub use self::{arena::__DynRootable, no_drop::__MustNotImplDrop, unsize::__CoercePtrInternal};
 
 pub use self::{
+    allocator_api::MetricsAlloc,
     arena::{Arena, Rootable},
     checked_cell::{BorrowError, BorrowMutError, Ref, RefMut},
-    collect::Collect,
+    collect::{Collect, Trace},
     context::{Finalization, Mutation},
     dynamic_roots::{DynamicRoot, DynamicRootSet},
     gc::Gc,

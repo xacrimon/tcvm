@@ -1,5 +1,6 @@
 use crate::Context;
-use crate::env::{Function, LuaString, NativeContext, NativeError, NativeFn, Stack, Table, Value};
+use crate::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Table, Value};
+use crate::vm::sequence::CallbackAction;
 
 pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[
@@ -33,32 +34,47 @@ pub fn load<'gc>(ctx: Context<'gc>) {
     ctx.globals().raw_set(ctx, lib_name, Value::table(lib));
 }
 
-fn lua_byte<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_byte<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_char<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_char<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_dump<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_dump<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_find<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_find<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_format<'gc>(
     ctx: NativeContext<'gc, '_>,
     mut stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let fmt_val = stack.get(0);
     let fmt_str = fmt_val.get_string().ok_or_else(|| {
-        NativeError::new(format!(
-            "bad argument #1 to 'format' (string expected, got {})",
-            fmt_val.type_name()
-        ))
+        Error::from_str(
+            ctx.ctx,
+            &format!(
+                "bad argument #1 to 'format' (string expected, got {})",
+                fmt_val.type_name()
+            ),
+        )
     })?;
     let fmt = fmt_str.as_bytes();
 
@@ -73,7 +89,7 @@ fn lua_format<'gc>(
             continue;
         }
         // parse flags/width/precision/conv starting at fmt[i+1]
-        let (spec, next) = parse_spec(fmt, i + 1)?;
+        let (spec, next) = parse_spec(ctx.ctx, fmt, i + 1)?;
         i = next;
         if spec.conv == b'%' {
             out.push(b'%');
@@ -81,12 +97,12 @@ fn lua_format<'gc>(
         }
         let arg = stack.get(arg_idx);
         arg_idx += 1;
-        format_one(&mut out, &spec, arg)?;
+        format_one(ctx.ctx, &mut out, &spec, arg)?;
     }
 
     let s = LuaString::new(ctx.ctx, &out);
     stack.replace(&[Value::string(s)]);
-    Ok(())
+    Ok(CallbackAction::Return)
 }
 
 #[derive(Default)]
@@ -101,7 +117,11 @@ struct FmtSpec {
     conv: u8,
 }
 
-fn parse_spec(fmt: &[u8], mut i: usize) -> Result<(FmtSpec, usize), NativeError> {
+fn parse_spec<'gc>(
+    ctx: Context<'gc>,
+    fmt: &[u8],
+    mut i: usize,
+) -> Result<(FmtSpec, usize), Error<'gc>> {
     let mut spec = FmtSpec::default();
     while i < fmt.len() {
         match fmt[i] {
@@ -117,7 +137,7 @@ fn parse_spec(fmt: &[u8], mut i: usize) -> Result<(FmtSpec, usize), NativeError>
     while i < fmt.len() && fmt[i].is_ascii_digit() {
         spec.width = spec.width * 10 + (fmt[i] - b'0') as usize;
         if spec.width > 99 {
-            return Err(NativeError::new("invalid format (width too large)"));
+            return Err(Error::from_str(ctx, "invalid format (width too large)"));
         }
         i += 1;
     }
@@ -127,56 +147,62 @@ fn parse_spec(fmt: &[u8], mut i: usize) -> Result<(FmtSpec, usize), NativeError>
         while i < fmt.len() && fmt[i].is_ascii_digit() {
             p = p * 10 + (fmt[i] - b'0') as usize;
             if p > 99 {
-                return Err(NativeError::new("invalid format (precision too large)"));
+                return Err(Error::from_str(ctx, "invalid format (precision too large)"));
             }
             i += 1;
         }
         spec.precision = Some(p);
     }
     if i >= fmt.len() {
-        return Err(NativeError::new("invalid conversion '%' (missing)"));
+        return Err(Error::from_str(ctx, "invalid conversion '%' (missing)"));
     }
     spec.conv = fmt[i];
     Ok((spec, i + 1))
 }
 
-fn format_one<'gc>(out: &mut Vec<u8>, spec: &FmtSpec, arg: Value<'gc>) -> Result<(), NativeError> {
+fn format_one<'gc>(
+    ctx: Context<'gc>,
+    out: &mut Vec<u8>,
+    spec: &FmtSpec,
+    arg: Value<'gc>,
+) -> Result<(), Error<'gc>> {
     match spec.conv {
         b'd' | b'i' | b'u' => {
-            let n = to_integer(arg).ok_or_else(|| arg_type_err("integer", &arg))?;
+            let n = to_integer(arg).ok_or_else(|| arg_type_err(ctx, "integer", &arg))?;
             fmt_int_signed(out, spec, n);
         }
         b'o' => {
-            let n = to_integer(arg).ok_or_else(|| arg_type_err("integer", &arg))?;
+            let n = to_integer(arg).ok_or_else(|| arg_type_err(ctx, "integer", &arg))?;
             fmt_int_unsigned(out, spec, n as u64, 8, false);
         }
         b'x' => {
-            let n = to_integer(arg).ok_or_else(|| arg_type_err("integer", &arg))?;
+            let n = to_integer(arg).ok_or_else(|| arg_type_err(ctx, "integer", &arg))?;
             fmt_int_unsigned(out, spec, n as u64, 16, false);
         }
         b'X' => {
-            let n = to_integer(arg).ok_or_else(|| arg_type_err("integer", &arg))?;
+            let n = to_integer(arg).ok_or_else(|| arg_type_err(ctx, "integer", &arg))?;
             fmt_int_unsigned(out, spec, n as u64, 16, true);
         }
         b'c' => {
-            let n = to_integer(arg).ok_or_else(|| arg_type_err("integer", &arg))?;
+            let n = to_integer(arg).ok_or_else(|| arg_type_err(ctx, "integer", &arg))?;
             if !(0..=255).contains(&n) {
-                return Err(NativeError::new(
+                return Err(Error::from_str(
+                    ctx,
                     "bad argument to 'format' (value out of range)",
                 ));
             }
             out.push(n as u8);
         }
         b'f' | b'F' => {
-            let f = to_float(arg).ok_or_else(|| arg_type_err("number", &arg))?;
+            let f = to_float(arg).ok_or_else(|| arg_type_err(ctx, "number", &arg))?;
             fmt_float_fixed(out, spec, f);
         }
         b'e' | b'E' => {
-            let f = to_float(arg).ok_or_else(|| arg_type_err("number", &arg))?;
+            let f = to_float(arg).ok_or_else(|| arg_type_err(ctx, "number", &arg))?;
             fmt_float_exp(out, spec, f, spec.conv == b'E');
         }
         b'g' | b'G' => {
-            let f = to_float(arg).ok_or_else(|| arg_type_err("number", &arg))?;
+            let f = to_float(arg).ok_or_else(|| arg_type_err(ctx, "number", &arg))?;
             fmt_float_g(out, spec, f, spec.conv == b'G');
         }
         b's' => {
@@ -186,21 +212,24 @@ fn format_one<'gc>(out: &mut Vec<u8>, spec: &FmtSpec, arg: Value<'gc>) -> Result
             fmt_q(out, arg);
         }
         c => {
-            return Err(NativeError::new(format!(
-                "invalid conversion '%{}' to 'format'",
-                c as char
-            )));
+            return Err(Error::from_str(
+                ctx,
+                &format!("invalid conversion '%{}' to 'format'", c as char),
+            ));
         }
     }
     Ok(())
 }
 
-fn arg_type_err(expected: &str, arg: &Value<'_>) -> NativeError {
-    NativeError::new(format!(
-        "bad argument to 'format' ({} expected, got {})",
-        expected,
-        arg.type_name()
-    ))
+fn arg_type_err<'gc>(ctx: Context<'gc>, expected: &str, arg: &Value<'gc>) -> Error<'gc> {
+    Error::from_str(
+        ctx,
+        &format!(
+            "bad argument to 'format' ({} expected, got {})",
+            expected,
+            arg.type_name()
+        ),
+    )
 }
 
 fn to_integer<'gc>(v: Value<'gc>) -> Option<i64> {
@@ -546,59 +575,83 @@ fn apply_width(out: &mut Vec<u8>, spec: &FmtSpec, sign: &[u8], prefix: &[u8], bo
 fn lua_gmatch<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_gsub<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_gsub<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_len<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_len<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_lower<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_lower<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_match<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_match<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_pack<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_pack<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_packsize<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_rep<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_rep<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_reverse<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_sub<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_sub<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_unpack<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_upper<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_upper<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }

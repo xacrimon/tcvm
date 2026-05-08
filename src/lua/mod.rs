@@ -6,7 +6,7 @@ mod context;
 mod convert;
 mod error;
 mod executor;
-mod stash;
+pub(crate) mod stash;
 
 use crate::Rootable;
 use crate::builtin;
@@ -18,9 +18,10 @@ use crate::env::string::Interner;
 pub use context::Context;
 pub use convert::{FromMultiValue, FromValue, IntoMultiValue, IntoValue};
 pub use error::{LoadError, RuntimeError, TypeError};
-pub use executor::{Executor, ExecutorMode};
+pub use executor::{Executor, ExecutorMode, StepResult};
 pub use stash::{
-    Fetchable, Stashable, StashedExecutor, StashedFunction, StashedTable, StashedThread,
+    Fetchable, Stashable, StashedError, StashedExecutor, StashedFunction, StashedTable,
+    StashedThread, StashedValue,
 };
 
 /// Root object of the GC arena. Holds the globals table, the main thread,
@@ -92,15 +93,38 @@ impl Lua {
         self.enter(f)
     }
 
-    /// Run the given executor until completion.
+    /// Drive the executor until the main thread completes.
     ///
-    /// MVP: single-shot (no fuel). Returns when the executor's thread reaches
-    /// `Dead` or an error is raised.
+    /// Returns `Ok(())` when the main thread terminates with results
+    /// (subsequent `take_result` succeeds). Returns
+    /// [`RuntimeError::MainYielded`] if the main thread yielded to the
+    /// host — `finish` has no way to surface yielded values, and a
+    /// public host-side resume API isn't implemented yet.
     pub fn finish(&mut self, ex: &StashedExecutor) -> Result<(), RuntimeError> {
-        self.try_enter(|ctx| {
-            let executor = ctx.fetch(ex);
-            executor.step(ctx)
-        })
+        enum Outcome {
+            Done,
+            Yielded,
+            Pending,
+        }
+        loop {
+            // The enter-closure can't return `StepResult<'gc>` across the
+            // arena boundary (it carries `'gc`-branded `Value`s). Reduce
+            // to a `'static` outcome inside the closure; the result values
+            // surface through `take_result`.
+            let outcome = self.try_enter(|ctx| -> Result<Outcome, RuntimeError> {
+                let executor = ctx.fetch(ex);
+                Ok(match executor.step(ctx)? {
+                    StepResult::Done => Outcome::Done,
+                    StepResult::Yielded(_) => Outcome::Yielded,
+                    StepResult::Pending => Outcome::Pending,
+                })
+            })?;
+            match outcome {
+                Outcome::Done => return Ok(()),
+                Outcome::Yielded => return Err(RuntimeError::MainYielded),
+                Outcome::Pending => continue,
+            }
+        }
     }
 
     /// `finish` then take typed results from the executor.
@@ -113,6 +137,23 @@ impl Lua {
             let executor = ctx.fetch(ex);
             executor.take_result::<R>(ctx)
         })
+    }
+
+    /// Re-arm a yielded executor with new arguments and drive until the
+    /// main thread completes.
+    ///
+    /// Returns `Ok(())` when the main thread terminates with results
+    /// (subsequent `take_result` succeeds), or [`RuntimeError::MainYielded`]
+    /// if the main thread yielded again.
+    pub fn resume<A>(&mut self, ex: &StashedExecutor, args: A) -> Result<(), RuntimeError>
+    where
+        A: for<'gc> IntoMultiValue<'gc>,
+    {
+        self.try_enter(|ctx| {
+            let executor = ctx.fetch(ex);
+            executor.resume(ctx, args)
+        })?;
+        self.finish(ex)
     }
 
     pub fn load_all(&mut self) {
@@ -183,18 +224,18 @@ mod tests {
     }
 
     // Native callback used by the native_* tests below. Integer add with an
-    // arity/type check so we can also exercise the NativeError path.
+    // arity/type check so we can also exercise the error path.
     fn native_add<'gc>(
-        _ctx: crate::env::NativeContext<'gc, '_>,
+        nctx: crate::env::NativeContext<'gc, '_>,
         mut stack: crate::env::Stack<'gc, '_>,
-    ) -> Result<(), crate::env::NativeError> {
+    ) -> Result<crate::vm::sequence::CallbackAction<'gc>, crate::env::Error<'gc>> {
         let (a, b) = (stack.get(0), stack.get(1));
         let sum = match (a.get_integer(), b.get_integer()) {
             (Some(x), Some(y)) => Value::integer(x + y),
-            _ => return Err(crate::env::NativeError::new("bad args")),
+            _ => return Err(crate::env::Error::from_str(nctx.ctx, "bad args")),
         };
         stack.replace(&[sum]);
-        Ok(())
+        Ok(crate::vm::sequence::CallbackAction::Return)
     }
 
     #[test]
@@ -306,8 +347,8 @@ mod tests {
 
     #[test]
     fn native_error_becomes_runtime_error() {
-        // A NativeError should surface as RuntimeError::Opcode (message
-        // dropped at the VM boundary by design in this MVP).
+        // A native callback's `Error<'gc>` surfaces as `RuntimeError::Lua`
+        // with the payload stashed (native-entry path).
         let mut lua = Lua::new();
         let ex = lua.enter(|ctx| {
             let add = Function::new_native(ctx.mutation(), native_add as NativeFn, Box::new([]));
@@ -315,23 +356,32 @@ mod tests {
             ctx.stash(Executor::start(ctx, add, (1i64, 2.5f64)))
         });
         let err = lua.execute::<i64>(&ex).expect_err("should error");
-        assert!(matches!(err, RuntimeError::Opcode { .. }));
+        let stashed = match err {
+            RuntimeError::Lua(s) => s,
+            other => panic!("expected RuntimeError::Lua, got {other:?}"),
+        };
+        let msg = lua.enter(|ctx| {
+            let e = ctx.fetch(&stashed);
+            let s = e.value().get_string().expect("error payload is a string");
+            std::str::from_utf8(s.as_bytes()).unwrap().to_owned()
+        });
+        assert_eq!(msg, "bad args");
     }
 
     // Native identity callback used as a `print`-shaped probe: returns its
     // first integer arg unchanged so we can assert results from the VM.
     fn native_id<'gc>(
-        _ctx: crate::env::NativeContext<'gc, '_>,
+        nctx: crate::env::NativeContext<'gc, '_>,
         mut stack: crate::env::Stack<'gc, '_>,
-    ) -> Result<(), crate::env::NativeError> {
+    ) -> Result<crate::vm::sequence::CallbackAction<'gc>, crate::env::Error<'gc>> {
         let v = stack.get(0);
         let out = if v.get_integer().is_some() {
             v
         } else {
-            return Err(crate::env::NativeError::new("bad args"));
+            return Err(crate::env::Error::from_str(nctx.ctx, "bad args"));
         };
         stack.replace(&[out]);
-        Ok(())
+        Ok(crate::vm::sequence::CallbackAction::Return)
     }
 
     fn run_returning_int(src: &str) -> i64 {

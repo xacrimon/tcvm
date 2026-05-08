@@ -1,9 +1,11 @@
 use crate::Context;
 use crate::dmm::{Collect, Gc, Lock, Mutation, RefLock};
+use crate::env::error::Error;
 use crate::env::shape::Shape;
 use crate::env::string::LuaString;
 use crate::env::value::Value;
 use crate::instruction::UpValueDescriptor;
+use crate::vm::sequence::{CallbackAction, Execution};
 
 /// A compiled Lua function. Immutable once created.
 /// Shared by all closures created from the same function definition.
@@ -94,17 +96,25 @@ pub struct NativeClosure<'gc> {
 /// Signature of a native callback invoked by the VM on `CALL` / `TAILCALL`.
 ///
 /// Arguments are read from the `Stack` view; return values are produced by
-/// leaving them on the stack above `bottom`. Return `Ok(())` for a normal
-/// return, `Err(NativeError)` to trigger a VM error (the message is dropped
-/// at the boundary for now — see the `native_call` plan for future
-/// plumbing).
-pub type NativeFn =
-    for<'gc, 'a> fn(ctx: NativeContext<'gc, 'a>, stack: Stack<'gc, 'a>) -> Result<(), NativeError>;
+/// leaving them on the stack above `bottom`. The returned [`CallbackAction`]
+/// tells the executor what to do next:
+///   - `Return` keeps the hot path (sync return, results in the stack window).
+///   - `Sequence`, `Call`, `Yield`, `Resume` are the suspension paths handled
+///     by the executor's driver loop.
+///
+/// On error, return [`Error`] (any Lua value); the executor unwinds Lua
+/// frames until a `Sequence` catcher (e.g. `pcall`) handles it, or surfaces
+/// it to the host as `RuntimeError::Lua`.
+pub type NativeFn = for<'gc, 'a> fn(
+    ctx: NativeContext<'gc, 'a>,
+    stack: Stack<'gc, 'a>,
+) -> Result<CallbackAction<'gc>, Error<'gc>>;
 
 /// Contextual handles passed to a native callback alongside its `Stack`.
 pub struct NativeContext<'gc, 'a> {
     pub ctx: Context<'gc>,
     pub upvalues: &'a [Value<'gc>],
+    pub exec: Execution<'gc, 'a>,
 }
 
 /// A mutable view into the running thread's value stack, starting at
@@ -121,6 +131,19 @@ impl<'gc, 'a> Stack<'gc, 'a> {
     pub(crate) fn new(values: &'a mut Vec<Value<'gc>>, bottom: usize) -> Self {
         debug_assert!(bottom <= values.len());
         Stack { values, bottom }
+    }
+
+    /// Destructure the borrowed view back into its underlying parts. Used
+    /// by `async_sequence` to ferry the live stack through a `SharedSlot`.
+    #[inline]
+    pub(crate) fn into_parts(self) -> (&'a mut Vec<Value<'gc>>, usize) {
+        (self.values, self.bottom)
+    }
+
+    /// Stack-bottom index relative to the underlying vec.
+    #[inline]
+    pub fn bottom(&self) -> usize {
+        self.bottom
     }
 
     #[inline]
@@ -182,20 +205,6 @@ impl<'gc, 'a> std::ops::Index<usize> for Stack<'gc, 'a> {
     #[inline]
     fn index(&self, i: usize) -> &Value<'gc> {
         &self.values[self.bottom + i]
-    }
-}
-
-/// Error returned by a [`NativeFn`] to abort execution.
-#[derive(Debug, Clone)]
-pub struct NativeError {
-    pub message: String,
-}
-
-impl NativeError {
-    pub fn new(message: impl Into<String>) -> Self {
-        NativeError {
-            message: message.into(),
-        }
     }
 }
 

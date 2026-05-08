@@ -1,5 +1,6 @@
 use crate::Context;
-use crate::env::{Function, LuaString, NativeContext, NativeError, NativeFn, Stack, Table, Value};
+use crate::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Table, Value};
+use crate::vm::sequence::CallbackAction;
 
 pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[
@@ -27,67 +28,79 @@ pub fn load<'gc>(ctx: Context<'gc>) {
     ctx.globals().raw_set(ctx, lib_name, Value::table(lib));
 }
 
-fn lua_clock<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_clock<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_date<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_date<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_difftime<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_execute<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_exit<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_exit<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_getenv<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_remove<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_rename<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_setlocale<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
-fn lua_time<'gc>(_ctx: NativeContext<'gc, '_>, _stack: Stack<'gc, '_>) -> Result<(), NativeError> {
+fn lua_time<'gc>(
+    _ctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_tmpname<'gc>(
     _ctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
-) -> Result<(), NativeError> {
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
