@@ -669,12 +669,23 @@ fn pump_sequence<'gc>(
             schedule_call_at(&mut ts, ctx, abs_bottom, function, 0)?;
         }
         Ok(SequencePoll::TailCall(function)) => {
-            // Sequence is done; the call's results go directly to the
-            // caller. Insert function at bottom, args (already at [bottom..])
-            // are after.
+            // Sequence is done; the call's results must land at the
+            // original CALL site `func_idx`. Args sit at stack[bottom..],
+            // which is adjacent to `func_idx` after a normal CALL but not
+            // after a TAILCALL→native→sequence chain (where bottom lives
+            // inside the popped tail-callee's window). Compact the args
+            // down to func_idx+1, then place the function at func_idx.
             let mut ts = top.borrow_mut(mc);
-            ts.stack.insert(bottom, Value::function(function));
-            schedule_call_at(&mut ts, ctx, bottom, function, returns)?;
+            let argc = ts.stack.len() - bottom;
+            let new_args_base = func_idx + 1;
+            if new_args_base < bottom {
+                for i in 0..argc {
+                    ts.stack[new_args_base + i] = ts.stack[bottom + i];
+                }
+                ts.stack.truncate(new_args_base + argc);
+            }
+            ts.stack[func_idx] = Value::function(function);
+            schedule_call_at(&mut ts, ctx, func_idx, function, returns)?;
         }
         Ok(SequencePoll::Yield {
             to_thread: _,
