@@ -21,7 +21,10 @@ fn main_thread_introspection() {
         })
         .expect("load");
     let result: i64 = lua.execute(&ex).expect("run");
-    assert_eq!(result, 1, "main: is_main should be true and isyieldable false");
+    assert_eq!(
+        result, 1,
+        "main: is_main should be true and isyieldable false"
+    );
 }
 
 /// Inside a coroutine body, `running()` reports `is_main = false`,

@@ -53,7 +53,10 @@ fn lua_create<'gc>(
 
 /// `coroutine.resume(co, ...)` — switch to `co`, passing the rest as args.
 /// On `co` yielding/returning, the [`PCallSequence`] wraps the values as
-/// `(true, ...)`; on error, it produces `(false, msg)`.
+/// `(true, ...)`; on error, it produces `(false, msg)`. If `co` isn't
+/// resumable (dead, currently running, on the resume stack as a parent, or
+/// the main thread) we return `(false, msg)` directly per the manual
+/// instead of routing through the executor.
 fn lua_resume<'gc>(
     nctx: NativeContext<'gc, '_>,
     mut stack: Stack<'gc, '_>,
@@ -61,6 +64,11 @@ fn lua_resume<'gc>(
     let co = stack.get(0).get_thread().ok_or_else(|| {
         Error::from_str(nctx.ctx, "bad argument #1 to 'resume' (coroutine expected)")
     })?;
+    if let Some(msg) = unresumable_reason(co, &nctx) {
+        let m = Value::string(LuaString::new(nctx.ctx, msg.as_bytes()));
+        stack.replace(&[Value::boolean(false), m]);
+        return Ok(CallbackAction::Return);
+    }
     // Drop the thread-handle slot — args to pass start at index 1.
     let args: Vec<Value<'gc>> = stack.as_slice()[1..].to_vec();
     stack.replace(&args);
@@ -69,6 +77,24 @@ fn lua_resume<'gc>(
         thread: co,
         then: Some(then),
     })
+}
+
+/// `None` if `co` can be resumed, else the Lua-spec error message that
+/// `(false, msg)` should carry. Covers main thread, dead, and any
+/// non-suspended status (which subsumes `running` and `normal`).
+///
+/// Pointer-eq checks against `current_thread` come first because the
+/// running thread's `RefLock` is already mutably borrowed by the
+/// interpreter — calling `co.status()` on it would re-borrow and panic.
+fn unresumable_reason<'gc>(co: Thread<'gc>, nctx: &NativeContext<'gc, '_>) -> Option<&'static str> {
+    if co.ptr_eq(nctx.ctx.main_thread()) || co.ptr_eq(nctx.exec.current_thread()) {
+        return Some("cannot resume non-suspended coroutine");
+    }
+    match co.status() {
+        ThreadStatus::Suspended => None,
+        ThreadStatus::Result { .. } | ThreadStatus::Stopped => Some("cannot resume dead coroutine"),
+        ThreadStatus::Normal => Some("cannot resume non-suspended coroutine"),
+    }
 }
 
 /// `coroutine.yield(...)` — yield values to the resumer; on resumption,
@@ -162,9 +188,15 @@ fn lua_wrap<'gc>(
 }
 
 /// `coroutine.close(co)` — clear the thread's stack/frames, set status
-/// to `Stopped`, return `true`. Does NOT yet invoke `__close`
-/// metamethods on the thread's to-be-closed variables; that ships with
-/// the broader TBC `__close` work.
+/// to `Stopped`, return `true`. Per the manual, valid only for dead /
+/// suspended / running coroutines; for any other status we return
+/// `(nil, "cannot close a non-suspended coroutine")` instead of
+/// corrupting executor invariants.
+///
+/// The running-self case has special "does not return" semantics in the
+/// reference, which depend on `__close` machinery we haven't built yet —
+/// we reject it for now via the same path. Does NOT yet invoke `__close`
+/// metamethods on TBC variables; that ships with the broader TBC work.
 fn lua_close<'gc>(
     nctx: NativeContext<'gc, '_>,
     mut stack: Stack<'gc, '_>,
@@ -172,19 +204,39 @@ fn lua_close<'gc>(
     let co = stack.get(0).get_thread().ok_or_else(|| {
         Error::from_str(nctx.ctx, "bad argument #1 to 'close' (coroutine expected)")
     })?;
-    {
-        let mc = nctx.ctx.mutation();
-        let mut ts = co.borrow_mut(mc);
-        ts.stack.clear();
-        ts.frames.clear();
-        ts.open_upvalues.clear();
-        ts.tbc_slots.clear();
-        ts.pending_action = None;
-        ts.yield_bottom = None;
-        ts.status = ThreadStatus::Stopped;
+    // Pointer-eq against current first to avoid re-borrowing the running
+    // thread's RefLock (mut-borrowed by the interpreter).
+    if co.ptr_eq(nctx.exec.current_thread()) {
+        let m = Value::string(LuaString::new(
+            nctx.ctx,
+            b"cannot close a non-suspended coroutine",
+        ));
+        stack.replace(&[Value::nil(), m]);
+        return Ok(CallbackAction::Return);
     }
-    stack.replace(&[Value::boolean(true)]);
-    Ok(CallbackAction::Return)
+    match co.status() {
+        ThreadStatus::Suspended | ThreadStatus::Stopped | ThreadStatus::Result { .. } => {
+            let mc = nctx.ctx.mutation();
+            let mut ts = co.borrow_mut(mc);
+            ts.stack.clear();
+            ts.frames.clear();
+            ts.open_upvalues.clear();
+            ts.tbc_slots.clear();
+            ts.pending_action = None;
+            ts.yield_bottom = None;
+            ts.status = ThreadStatus::Stopped;
+            stack.replace(&[Value::boolean(true)]);
+            Ok(CallbackAction::Return)
+        }
+        ThreadStatus::Normal => {
+            let m = Value::string(LuaString::new(
+                nctx.ctx,
+                b"cannot close a non-suspended coroutine",
+            ));
+            stack.replace(&[Value::nil(), m]);
+            Ok(CallbackAction::Return)
+        }
+    }
 }
 
 /// Body of the closure returned by `coroutine.wrap`. Upvalue 0 carries the

@@ -2021,7 +2021,11 @@ fn to_number(v: Value) -> Option<f64> {
 
 /// Close all TBC variables at stack indices >= `start_idx`.
 /// Removes them from the tracking list; __close invocation is pending (see #45).
-fn close_tbc_vars<'gc>(_mc: &Mutation<'gc>, thread: &mut ThreadState<'gc>, start_idx: usize) {
+pub(crate) fn close_tbc_vars<'gc>(
+    _mc: &Mutation<'gc>,
+    thread: &mut ThreadState<'gc>,
+    start_idx: usize,
+) {
     thread.tbc_slots.retain(|&slot| {
         if slot >= start_idx {
             // See #45: invoke __close metamethod on thread.stack[slot].
@@ -2198,7 +2202,11 @@ pub(crate) fn frame_return<'gc>(
 
 /// Close all open upvalues pointing at stack indices >= `start_idx`.
 /// Each open upvalue is converted to Closed by capturing the current stack value.
-fn close_upvalues<'gc>(mc: &Mutation<'gc>, thread: &mut ThreadState<'gc>, start_idx: usize) {
+pub(crate) fn close_upvalues<'gc>(
+    mc: &Mutation<'gc>,
+    thread: &mut ThreadState<'gc>,
+    start_idx: usize,
+) {
     thread.open_upvalues.retain(|uv| {
         let should_close = {
             let borrowed = uv.borrow();

@@ -52,7 +52,8 @@ fn sequence_tailcall_lands_at_original_func_idx() {
 
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let forward_fn = Function::new_native(ctx.mutation(), forward as NativeFn, Box::new([]));
+            let forward_fn =
+                Function::new_native(ctx.mutation(), forward as NativeFn, Box::new([]));
             let key = Value::string(LuaString::new(ctx, b"forward"));
             ctx.globals().raw_set(ctx, key, Value::function(forward_fn));
             let chunk = ctx.load(
@@ -64,5 +65,8 @@ fn sequence_tailcall_lands_at_original_func_idx() {
         })
         .expect("load");
     let result: i64 = lua.execute(&ex).expect("run");
-    assert_eq!(result, 42, "TailCall result should land where the caller expected");
+    assert_eq!(
+        result, 42,
+        "TailCall result should land where the caller expected"
+    );
 }

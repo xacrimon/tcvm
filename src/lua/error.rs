@@ -24,10 +24,12 @@ pub enum RuntimeError {
     #[error("bad executor mode")]
     BadMode,
     /// The main thread yielded to the host before completing. `finish`/
-    /// `execute` have no path to surface the yielded values, so they
-    /// turn this into an error rather than reporting bogus completion.
-    /// A host-side resume API isn't implemented yet.
-    #[error("main thread yielded; resume not yet supported")]
+    /// `execute` can't surface yielded values across their `'gc`
+    /// boundary, so they raise this rather than reporting bogus
+    /// completion. To consume the yielded values and feed resume args
+    /// back, drive the executor manually with `Executor::step` /
+    /// `Lua::resume` instead.
+    #[error("main thread yielded; use Lua::resume to continue")]
     MainYielded,
     /// User-thrown Lua error (`error(value)`); payload is the stashed value.
     /// Inspect / display via `Lua::enter` + `Fetchable::fetch`.

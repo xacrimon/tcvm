@@ -125,26 +125,28 @@ impl<'gc> Stashable<'gc> for Value<'gc> {
             ValueKind::String => StashedValue::String(
                 roots.stash::<Rootable![StringData]>(mc, self.get_string().unwrap().inner()),
             ),
-            ValueKind::Table => StashedValue::Table(
-                roots
-                    .stash::<Rootable![RefLock<TableState<'_>>]>(mc, self.get_table().unwrap().inner()),
-            ),
+            ValueKind::Table => {
+                StashedValue::Table(roots.stash::<Rootable![RefLock<TableState<'_>>]>(
+                    mc,
+                    self.get_table().unwrap().inner(),
+                ))
+            }
             ValueKind::Function => StashedValue::Function(
                 roots
                     .stash::<Rootable![FunctionKind<'_>]>(mc, self.get_function().unwrap().inner()),
             ),
-            ValueKind::Thread => StashedValue::Thread(
-                roots.stash::<Rootable![RefLock<ThreadState<'_>>]>(
+            ValueKind::Thread => {
+                StashedValue::Thread(roots.stash::<Rootable![RefLock<ThreadState<'_>>]>(
                     mc,
                     self.get_thread().unwrap().inner(),
-                ),
-            ),
-            ValueKind::Userdata => StashedValue::Userdata(
-                roots.stash::<Rootable![RefLock<UserdataState<'_>>]>(
+                ))
+            }
+            ValueKind::Userdata => {
+                StashedValue::Userdata(roots.stash::<Rootable![RefLock<UserdataState<'_>>]>(
                     mc,
                     self.get_userdata().unwrap().inner(),
-                ),
-            ),
+                ))
+            }
         }
     }
 }
@@ -157,9 +159,9 @@ impl Fetchable for StashedValue {
             StashedValue::Boolean(b) => Value::boolean(*b),
             StashedValue::Integer(i) => Value::integer(*i),
             StashedValue::Float(f) => Value::float(*f),
-            StashedValue::String(r) => {
-                Value::string(LuaString::from_inner(roots.fetch::<Rootable![StringData]>(r)))
-            }
+            StashedValue::String(r) => Value::string(LuaString::from_inner(
+                roots.fetch::<Rootable![StringData]>(r),
+            )),
             StashedValue::Table(r) => Value::table(Table::from_inner(
                 roots.fetch::<Rootable![RefLock<TableState<'_>>]>(r),
             )),

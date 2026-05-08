@@ -17,8 +17,9 @@ pub enum ExecutorMode {
     Normal,
     /// Thread has returned; results are available on its stack.
     Result,
-    /// Top thread yielded; values were drained on the last `step`. The
-    /// host-side resume API to continue from here isn't implemented yet.
+    /// Top thread yielded; values were drained on the last `step`. Feed
+    /// resume args back via [`Executor::resume`] (or [`crate::Lua::resume`])
+    /// to flip the executor back to `Normal` and continue.
     Yielded,
 }
 
@@ -26,11 +27,12 @@ pub enum ExecutorMode {
 pub enum StepResult<'gc> {
     /// Top thread reached terminal `Result` state. Caller may `take_result`.
     Done,
-    /// Top thread yielded these values to the host. The host-side
-    /// resume API isn't implemented yet.
+    /// Top thread yielded these values to the host. Feed resume args via
+    /// [`Executor::resume`] (mode → `Normal`) and call `step` again.
     Yielded(Vec<Value<'gc>>),
-    /// Reserved for future fuel-based time-slicing — caller should call
-    /// `step` again to continue. Not currently produced by the executor.
+    /// A `Sequence` returned `SequencePoll::Pending`, asking the host to
+    /// interleave other work / consult fuel. Mode stays `Normal`; call
+    /// `step` again to keep going.
     Pending,
 }
 
@@ -105,13 +107,15 @@ impl<'gc> Executor<'gc> {
     /// Returns:
     /// - [`StepResult::Done`] — the main thread completed; call `take_result`.
     /// - [`StepResult::Yielded(values)`] — the main thread yielded to the
-    ///   host. The host-side resume API isn't implemented yet.
-    /// - [`StepResult::Pending`] — reserved for fuel-based slicing.
+    ///   host. Feed args back via [`Executor::resume`] then `step` again.
+    /// - [`StepResult::Pending`] — a `Sequence` returned `Pending`; the
+    ///   driver yielded so the host can interleave other work. Call
+    ///   `step` again to continue. (No fuel limit is enforced yet.)
     ///
     /// The hot path (Lua-only execution, sync natives) makes a single call
     /// into `run_thread` and exits. Coroutine resume / sequence pump cycles
     /// loop here until something terminal happens or values cross the host
-    /// boundary. There is no fuel limit yet.
+    /// boundary.
     pub fn step(self, ctx: Context<'gc>) -> Result<StepResult<'gc>, RuntimeError> {
         {
             let inner = self.0.borrow();
@@ -169,8 +173,8 @@ impl<'gc> Executor<'gc> {
                     return Ok(StepResult::Done);
                 }
                 ThreadStatus::Suspended if stack_len == 1 => {
-                    // Main thread is suspended at the bottom of the
-                    // executor stack. yield_bottom == Some means it
+                    // Top thread (== main) is suspended at the bottom of
+                    // the executor stack. yield_bottom == Some means it
                     // yielded to the host; yield_bottom == None means
                     // it's freshly seeded (Frame::Start on top), which
                     // the dispatch step below handles. Don't conflate.
@@ -227,7 +231,11 @@ impl<'gc> Executor<'gc> {
                         .map_err(|e| RuntimeError::Opcode { pc: e.pc })?;
                 }
                 FrameKind::Sequence => {
-                    pump_sequence(self, ctx, top)?;
+                    if matches!(pump_sequence(self, ctx, top)?, PumpOutcome::Pending) {
+                        // Sequence asked for cooperative re-poll. Mode stays
+                        // Normal so a follow-up `step` resumes the driver.
+                        return Ok(StepResult::Pending);
+                    }
                 }
                 FrameKind::Start => {
                     // First-resume / first-dispatch. Pop Frame::Start(f),
@@ -388,6 +396,11 @@ fn apply_pending_action<'gc>(
             // If `then` provided, the sequence is the call's "completion
             // handler"; it inherits the caller's expected_returns. The
             // sequence sees the called function's results at stack[bottom..].
+            //
+            // We push `then` BEFORE scheduling the call so that if the
+            // called native errors immediately, schedule_call_at's
+            // Frame::Error (see #2 in review.md) lands above this
+            // sequence and the unwinder routes the error to it.
             if let Some(seq) = then {
                 ts.frames.push(Frame::Sequence {
                     seq,
@@ -534,9 +547,18 @@ fn schedule_call_at<'gc>(
             .expect("function is neither Lua nor Native");
         let args_base = slot + 1;
         let argc = ts.stack.len() - args_base;
-        let action = vm::interp::invoke_native(ctx, ts, nc, args_base, argc).map_err(|e| {
-            RuntimeError::Lua(crate::lua::Stashable::stash(e, ctx.mutation(), ctx.roots()))
-        })?;
+        let action = match vm::interp::invoke_native(ctx, ts, nc, args_base, argc) {
+            Ok(a) => a,
+            Err(e) => {
+                // Mirror op_call's native-error path: push Frame::Error so the
+                // executor unwinder can find the nearest Sequence catcher
+                // (e.g. a PCallSequence wrapping coroutine.resume). Returning
+                // Err here would short-circuit past any catcher pushed by
+                // apply_pending_action / pump_sequence before this call.
+                ts.frames.push(Frame::Error(e));
+                return Ok(());
+            }
+        };
         match action {
             CallbackAction::Return => {
                 // Move stack[args_base..] down to stack[slot..]. (Slot is
@@ -564,6 +586,16 @@ fn schedule_call_at<'gc>(
     }
 }
 
+/// What to do after pumping the top frame.
+#[derive(Clone, Copy)]
+enum PumpOutcome {
+    /// Default — continue the driver loop.
+    Continue,
+    /// Sequence returned `Pending`; surface to the host so it can
+    /// interleave other work / consult fuel.
+    Pending,
+}
+
 /// Pump a `Frame::Sequence` on top of `top`. Pops the frame, invokes
 /// `seq.poll()` (or `seq.error()` if `pending_error.is_some()`), and
 /// translates the [`SequencePoll`] back to frame ops.
@@ -571,7 +603,7 @@ fn pump_sequence<'gc>(
     exec: Executor<'gc>,
     ctx: Context<'gc>,
     top: Thread<'gc>,
-) -> Result<(), RuntimeError> {
+) -> Result<PumpOutcome, RuntimeError> {
     use crate::vm::sequence::{Execution, SequencePoll};
     let mc = ctx.mutation();
     // Pop the sequence frame and call poll/error.
@@ -603,6 +635,7 @@ fn pump_sequence<'gc>(
                 call_site,
                 pending_error: None,
             });
+            return Ok(PumpOutcome::Pending);
         }
         Ok(SequencePoll::Return) => {
             // Sequence finished. Land values at the original CALL's expected
@@ -697,7 +730,7 @@ fn pump_sequence<'gc>(
             top.borrow_mut(mc).frames.push(Frame::Error(err));
         }
     }
-    Ok(())
+    Ok(PumpOutcome::Continue)
 }
 
 /// After an inner thread terminated or yielded, transfer its result-bottom
@@ -719,10 +752,10 @@ fn propagate_inner_to_resumer<'gc>(
     // Pop the inner thread.
     exec.0.borrow_mut(mc).thread_stack.pop();
     // If the inner is just yielded (not terminated), keep its state for
-    // future resumes; the inner's pending_action retained the bottom.
+    // future resumes; its `yield_bottom` already points at where its
+    // resume-args should land. After Result, clear the inner's stack
+    // so subsequent fetches see an empty thread.
     if !inner_yielded {
-        // After Result, clear the inner's stack so subsequent fetches see
-        // an empty thread.
         let mut ts = inner.borrow_mut(mc);
         ts.stack.clear();
     }
@@ -818,7 +851,8 @@ fn unwind_error<'gc>(
                 Some(Frame::Lua(lf)) => {
                     let base = lf.base;
                     ts.frames.pop();
-                    close_upvalues_at(&mut ts, ctx, base);
+                    vm::interp::close_upvalues(mc, &mut ts, base);
+                    vm::interp::close_tbc_vars(mc, &mut ts, base);
                     ts.stack.truncate(base);
                 }
                 Some(Frame::Sequence { .. }) => {
@@ -835,7 +869,9 @@ fn unwind_error<'gc>(
                     // that hasn't run yet, so it can't have errored.
                     // Frame::Error is removed by the next driver pump
                     // (which enters this function), so two can't coexist.
-                    unreachable!("Frame::Start / Frame::Error mid-unwind violates the executor invariant");
+                    unreachable!(
+                        "Frame::Start / Frame::Error mid-unwind violates the executor invariant"
+                    );
                 }
                 None => break err,
             }
@@ -865,39 +901,4 @@ fn unwind_error<'gc>(
         mc,
         ctx.roots(),
     )))
-}
-
-/// Close open upvalues and TBC variables whose stack indices are >=
-/// `start_idx`. Mirrors `interp::close_upvalues` but lives in executor.rs
-/// to avoid an interp-private dependency in the unwinder.
-fn close_upvalues_at<'gc>(
-    ts: &mut crate::env::thread::ThreadState<'gc>,
-    ctx: Context<'gc>,
-    start_idx: usize,
-) {
-    use crate::env::function::UpvalueState;
-    let mc = ctx.mutation();
-    ts.open_upvalues.retain(|uv| {
-        let should_close = {
-            let b = uv.borrow();
-            match &*b {
-                UpvalueState::Open { index, .. } => *index >= start_idx,
-                UpvalueState::Closed(_) => false,
-            }
-        };
-        if should_close {
-            let val = ts.stack[{
-                let b = uv.borrow();
-                match &*b {
-                    UpvalueState::Open { index, .. } => *index,
-                    _ => unreachable!(),
-                }
-            }];
-            *uv.borrow_mut(mc) = UpvalueState::Closed(val);
-            false
-        } else {
-            true
-        }
-    });
-    ts.tbc_slots.retain(|&i| i < start_idx);
 }
