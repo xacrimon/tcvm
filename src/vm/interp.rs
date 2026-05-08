@@ -6,7 +6,9 @@ use crate::env::function::{
 use crate::env::shape::{MetamethodBits, Shape};
 use crate::env::string::LuaString;
 use crate::env::table::Table;
-use crate::env::thread::{Frame, LuaFrame, PendingAction, Thread, ThreadState, ThreadStatus};
+use crate::env::thread::{
+    CallSite, Frame, LuaFrame, PendingAction, Thread, ThreadState, ThreadStatus,
+};
 use crate::env::value::{Value, ValueKind};
 use crate::instruction::{Instruction, UpValueDescriptor};
 use crate::lua::Context;
@@ -1500,9 +1502,11 @@ extern "rust-preserve-none" fn op_call<'gc>(
                     }
                     thread.pending_action = Some(PendingAction {
                         action,
-                        bottom: args_base,
-                        func_idx,
-                        returns,
+                        call_site: CallSite {
+                            bottom: args_base,
+                            func_idx,
+                            returns,
+                        },
                     });
                     return Ok(());
                 }
@@ -1616,9 +1620,11 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
                     thread.frames.pop();
                     thread.pending_action = Some(PendingAction {
                         action,
-                        bottom: args_base,
-                        func_idx: cur_base - 1,
-                        returns: num_results,
+                        call_site: CallSite {
+                            bottom: args_base,
+                            func_idx: cur_base - 1,
+                            returns: num_results,
+                        },
                     });
                     return Ok(());
                 }

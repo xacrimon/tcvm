@@ -1,6 +1,6 @@
 use crate::dmm::{Collect, Gc, RefLock};
 use crate::env::function::Function;
-use crate::env::thread::{Frame, LuaFrame, PendingAction, ThreadStatus, YieldBottom};
+use crate::env::thread::{CallSite, Frame, LuaFrame, PendingAction, ThreadStatus};
 use crate::env::{Thread, Value};
 use crate::lua::RuntimeError;
 use crate::lua::context::Context;
@@ -286,13 +286,11 @@ impl<'gc> Executor<'gc> {
         // Recover where the yielded values live and the original CALL
         // landing slot from the yield_bottom stash installed by the
         // Yield path.
-        let (bottom, func_idx, returns) = {
+        let cs = {
             let mut ts = top.borrow_mut(mc);
-            let y = ts
-                .yield_bottom
+            ts.yield_bottom
                 .take()
-                .expect("Yielded mode must have stashed yield_bottom");
-            (y.bottom, y.func_idx, y.returns)
+                .expect("Yielded mode must have stashed yield_bottom")
         };
         // Materialize the resume-args into a temporary vec and place
         // them at stack[bottom..], replacing the previously-yielded
@@ -301,7 +299,7 @@ impl<'gc> Executor<'gc> {
         args.push_into(&mut buf);
         {
             let mut ts = top.borrow_mut(mc);
-            ts.stack.truncate(bottom);
+            ts.stack.truncate(cs.bottom);
             ts.stack.extend(buf);
             // Branch on top frame: a Sequence consumes values from
             // stack[seq.bottom..] on its next poll, so we leave them at
@@ -310,7 +308,7 @@ impl<'gc> Executor<'gc> {
             // standard call-return convention so dispatch resumes
             // correctly.
             if !matches!(ts.frames.last(), Some(Frame::Sequence { .. })) {
-                land_call_results(&mut ts, bottom, func_idx, returns);
+                land_call_results(&mut ts, cs);
             }
             ts.status = ThreadStatus::Normal;
         }
@@ -370,15 +368,10 @@ fn apply_pending_action<'gc>(
     p: PendingAction<'gc>,
 ) -> Result<(), RuntimeError> {
     let mc = ctx.mutation();
-    let PendingAction {
-        action,
-        bottom,
-        func_idx,
-        returns,
-    } = p;
+    let PendingAction { action, call_site } = p;
     match action {
         CallbackAction::Return => {
-            // op_call/tailcall handle Return inline. With yield-bottom
+            // op_call/tailcall handle Return inline. With yield_bottom
             // factored out into its own field, no sentinel use remains.
             unreachable!("apply_pending_action: Return is handled inline");
         }
@@ -386,9 +379,7 @@ fn apply_pending_action<'gc>(
             let mut ts = top.borrow_mut(mc);
             ts.frames.push(Frame::Sequence {
                 seq,
-                bottom,
-                func_idx,
-                returns,
+                call_site,
                 pending_error: None,
             });
         }
@@ -400,43 +391,31 @@ fn apply_pending_action<'gc>(
             if let Some(seq) = then {
                 ts.frames.push(Frame::Sequence {
                     seq,
-                    bottom,
-                    func_idx,
-                    returns,
+                    call_site,
                     pending_error: None,
                 });
             }
-            // Now schedule the call. For a Lua target, push a LuaFrame.
-            // For a Native target, push a Frame::Start hand-off (driver
-            // pumps it next iteration).
-            // The function and args layout: stack[bottom] becomes the
-            // function slot, args at [bottom+1..]. But the callback that
-            // pushed `Call` already left its desired args at stack[bottom..]
-            // (per piccolo convention), with no function slot in front. We
-            // need to insert the function in front.
-            ts.stack.insert(bottom, Value::function(function));
-            // Now stack[bottom] = function, stack[bottom+1..] = args.
-            schedule_call_at(&mut ts, ctx, bottom, function, returns)?;
+            // Now schedule the call. The callback that produced `Call`
+            // left its desired args at stack[bottom..] with no function
+            // slot in front; insert the function so the layout matches
+            // schedule_call_at's convention (function at slot, args
+            // after).
+            ts.stack.insert(call_site.bottom, Value::function(function));
+            schedule_call_at(&mut ts, ctx, call_site.bottom, function, call_site.returns)?;
         }
         CallbackAction::Yield { then } => {
             let mut ts = top.borrow_mut(mc);
             if let Some(seq) = then {
                 ts.frames.push(Frame::Sequence {
                     seq,
-                    bottom,
-                    func_idx,
-                    returns,
+                    call_site,
                     pending_error: None,
                 });
             }
             // Yielded values live at stack[bottom..]. Mark thread
             // suspended and stash where they are so the next pump can
             // find them (propagation to resumer, host-side resume, etc.).
-            ts.yield_bottom = Some(YieldBottom {
-                bottom,
-                func_idx,
-                returns,
-            });
+            ts.yield_bottom = Some(call_site);
             ts.status = ThreadStatus::Suspended;
         }
         CallbackAction::Resume {
@@ -448,13 +427,11 @@ fn apply_pending_action<'gc>(
             if let Some(seq) = then {
                 top.borrow_mut(mc).frames.push(Frame::Sequence {
                     seq,
-                    bottom,
-                    func_idx,
-                    returns,
+                    call_site,
                     pending_error: None,
                 });
             }
-            schedule_thread_resume(exec, ctx, top, target, bottom, bottom, func_idx, returns)?;
+            schedule_thread_resume(exec, ctx, top, target, call_site.bottom, call_site)?;
         }
     }
     Ok(())
@@ -462,10 +439,10 @@ fn apply_pending_action<'gc>(
 
 /// Hand off control from `resumer` to `target`.
 ///
-/// Pushes a `Frame::WaitThread { wt_bottom, wt_func_idx, wt_returns }`
-/// onto the resumer (this is what `propagate_inner_to_resumer` will pop
-/// when the target eventually yields/returns), drains the resume-args
-/// from `resumer.stack[args_abs_bottom..]`, transitions the target into
+/// Pushes a `Frame::WaitThread { wt }` onto the resumer (this is what
+/// `propagate_inner_to_resumer` will pop when the target eventually
+/// yields/returns), drains the resume-args from
+/// `resumer.stack[args_abs_bottom..]`, transitions the target into
 /// `Normal` (handling first-resume and mid-resume cases), and pushes the
 /// target onto the executor's thread stack.
 ///
@@ -478,18 +455,12 @@ fn schedule_thread_resume<'gc>(
     resumer: Thread<'gc>,
     target: Thread<'gc>,
     args_abs_bottom: usize,
-    wt_bottom: usize,
-    wt_func_idx: usize,
-    wt_returns: u8,
+    wt: CallSite,
 ) -> Result<(), RuntimeError> {
     let mc = ctx.mutation();
     {
         let mut rs = resumer.borrow_mut(mc);
-        rs.frames.push(Frame::WaitThread {
-            bottom: wt_bottom,
-            func_idx: wt_func_idx,
-            returns: wt_returns,
-        });
+        rs.frames.push(Frame::WaitThread { call_site: wt });
         rs.status = ThreadStatus::Normal;
     }
     let args: Vec<Value<'gc>> = {
@@ -519,7 +490,7 @@ fn schedule_thread_resume<'gc>(
             ts.stack.truncate(y.bottom);
             ts.stack.extend(args);
             if !matches!(ts.frames.last(), Some(Frame::Sequence { .. })) {
-                land_call_results(&mut ts, y.bottom, y.func_idx, y.returns);
+                land_call_results(&mut ts, y);
             }
             ts.status = ThreadStatus::Normal;
         } else {
@@ -581,9 +552,11 @@ fn schedule_call_at<'gc>(
             other => {
                 ts.pending_action = Some(PendingAction {
                     action: other,
-                    bottom: args_base,
-                    func_idx: slot,
-                    returns: caller_returns,
+                    call_site: CallSite {
+                        bottom: args_base,
+                        func_idx: slot,
+                        returns: caller_returns,
+                    },
                 });
                 Ok(())
             }
@@ -602,22 +575,20 @@ fn pump_sequence<'gc>(
     use crate::vm::sequence::{Execution, SequencePoll};
     let mc = ctx.mutation();
     // Pop the sequence frame and call poll/error.
-    let (mut seq, bottom, func_idx, returns, pending_error) = {
+    let (mut seq, call_site, pending_error) = {
         let mut ts = top.borrow_mut(mc);
         match ts.frames.pop() {
             Some(Frame::Sequence {
                 seq,
-                bottom,
-                func_idx,
-                returns,
+                call_site,
                 pending_error,
-            }) => (seq, bottom, func_idx, returns, pending_error),
+            }) => (seq, call_site, pending_error),
             _ => unreachable!("pump_sequence: top wasn't Frame::Sequence"),
         }
     };
     let poll_result = {
         let mut ts = top.borrow_mut(mc);
-        let stack_view = crate::env::function::Stack::new(&mut ts.stack, bottom);
+        let stack_view = crate::env::function::Stack::new(&mut ts.stack, call_site.bottom);
         let exec = Execution::new(top);
         if let Some(err) = pending_error {
             seq.error(ctx, exec, err, stack_view)
@@ -629,30 +600,26 @@ fn pump_sequence<'gc>(
         Ok(SequencePoll::Pending) => {
             top.borrow_mut(mc).frames.push(Frame::Sequence {
                 seq,
-                bottom,
-                func_idx,
-                returns,
+                call_site,
                 pending_error: None,
             });
         }
         Ok(SequencePoll::Return) => {
             // Sequence finished. Land values at the original CALL's expected
-            // window: stack[func_idx..func_idx+wanted].
+            // window.
             let mut ts = top.borrow_mut(mc);
-            land_call_results(&mut ts, bottom, func_idx, returns);
+            land_call_results(&mut ts, call_site);
         }
         Ok(SequencePoll::Call {
             function,
             bottom: rel,
         }) => {
-            let abs_bottom = bottom + rel;
+            let abs_bottom = call_site.bottom + rel;
             let mut ts = top.borrow_mut(mc);
             // Re-push self to be re-polled with results at stack[bottom..].
             ts.frames.push(Frame::Sequence {
                 seq,
-                bottom,
-                func_idx,
-                returns,
+                call_site,
                 pending_error: None,
             });
             // Schedule the call: insert function at abs_bottom, args after.
@@ -661,48 +628,48 @@ fn pump_sequence<'gc>(
         }
         Ok(SequencePoll::TailCall(function)) => {
             // Sequence is done; the call's results must land at the
-            // original CALL site `func_idx`. Args sit at stack[bottom..],
-            // which is adjacent to `func_idx` after a normal CALL but not
-            // after a TAILCALL→native→sequence chain (where bottom lives
-            // inside the popped tail-callee's window). Compact the args
-            // down to func_idx+1, then place the function at func_idx.
+            // original CALL site `call_site.func_idx`. Args sit at
+            // stack[bottom..], adjacent to func_idx after a normal CALL
+            // but not after a TAILCALL→native→sequence chain (where
+            // bottom lives inside the popped tail-callee's window).
+            // Compact down to func_idx+1, then place the function.
             let mut ts = top.borrow_mut(mc);
-            let argc = ts.stack.len() - bottom;
-            let new_args_base = func_idx + 1;
-            if new_args_base < bottom {
+            let argc = ts.stack.len() - call_site.bottom;
+            let new_args_base = call_site.func_idx + 1;
+            if new_args_base < call_site.bottom {
                 for i in 0..argc {
-                    ts.stack[new_args_base + i] = ts.stack[bottom + i];
+                    ts.stack[new_args_base + i] = ts.stack[call_site.bottom + i];
                 }
                 ts.stack.truncate(new_args_base + argc);
             }
-            ts.stack[func_idx] = Value::function(function);
-            schedule_call_at(&mut ts, ctx, func_idx, function, returns)?;
+            ts.stack[call_site.func_idx] = Value::function(function);
+            schedule_call_at(
+                &mut ts,
+                ctx,
+                call_site.func_idx,
+                function,
+                call_site.returns,
+            )?;
         }
         Ok(SequencePoll::Yield { bottom: rel }) => {
-            let abs_bottom = bottom + rel;
+            let abs_bottom = call_site.bottom + rel;
             let mut ts = top.borrow_mut(mc);
             // Re-push self to be re-polled with resume-args at stack[bottom..].
             ts.frames.push(Frame::Sequence {
                 seq,
-                bottom,
-                func_idx,
-                returns,
+                call_site,
                 pending_error: None,
             });
-            ts.yield_bottom = Some(YieldBottom {
+            ts.yield_bottom = Some(CallSite {
                 bottom: abs_bottom,
-                func_idx,
-                returns,
+                func_idx: call_site.func_idx,
+                returns: call_site.returns,
             });
             ts.status = ThreadStatus::Suspended;
         }
         Ok(SequencePoll::TailYield) => {
             let mut ts = top.borrow_mut(mc);
-            ts.yield_bottom = Some(YieldBottom {
-                bottom,
-                func_idx,
-                returns,
-            });
+            ts.yield_bottom = Some(call_site);
             ts.status = ThreadStatus::Suspended;
         }
         Ok(SequencePoll::Resume {
@@ -712,21 +679,19 @@ fn pump_sequence<'gc>(
             // Re-push self so propagate_inner_to_resumer finds the
             // sequence beneath the WaitThread and lands target's
             // eventual values at seq.bottom for the next poll.
-            let abs_bottom = bottom + rel;
+            let abs_bottom = call_site.bottom + rel;
             top.borrow_mut(mc).frames.push(Frame::Sequence {
                 seq,
-                bottom,
-                func_idx,
-                returns,
+                call_site,
                 pending_error: None,
             });
-            schedule_thread_resume(exec, ctx, top, target, abs_bottom, bottom, func_idx, returns)?;
+            schedule_thread_resume(exec, ctx, top, target, abs_bottom, call_site)?;
         }
         Ok(SequencePoll::TailResume(target)) => {
             // Sequence is consumed; target's eventual values go straight
-            // to the original CALL site via the WaitThread frame's
-            // (bottom, func_idx, returns) when no Sequence is beneath.
-            schedule_thread_resume(exec, ctx, top, target, bottom, bottom, func_idx, returns)?;
+            // to the original CALL site via the WaitThread call_site
+            // when no Sequence is beneath.
+            schedule_thread_resume(exec, ctx, top, target, call_site.bottom, call_site)?;
         }
         Err(err) => {
             top.borrow_mut(mc).frames.push(Frame::Error(err));
@@ -763,25 +728,21 @@ fn propagate_inner_to_resumer<'gc>(
     }
     let resumer = *exec.0.borrow().thread_stack.last().unwrap();
     let mut rs = resumer.borrow_mut(mc);
-    let (wt_bottom, wt_func_idx, wt_returns) = match rs.frames.pop() {
-        Some(Frame::WaitThread {
-            bottom,
-            func_idx,
-            returns,
-        }) => (bottom, func_idx, returns),
+    let wt = match rs.frames.pop() {
+        Some(Frame::WaitThread { call_site }) => call_site,
         _ => unreachable!("propagate_inner_to_resumer: resumer top is not WaitThread"),
     };
-    // Land values at resumer.stack[wt_bottom..] for the next sequence /
+    // Land values at resumer.stack[wt.bottom..] for the next sequence /
     // call frame to consume. If a `then` sequence sits underneath, it'll
-    // pick them up at its own `bottom == wt_bottom`. If not, do the
+    // pick them up at its own `bottom == wt.bottom`. If not, do the
     // standard CALL-landing right now.
-    rs.stack.truncate(wt_bottom);
+    rs.stack.truncate(wt.bottom);
     rs.stack.extend(values);
     let next_is_sequence = matches!(rs.frames.last(), Some(Frame::Sequence { .. }));
     if !next_is_sequence {
         // No follow-up sequence: deliver results directly to the original
         // Lua CALL window.
-        land_call_results(&mut rs, wt_bottom, wt_func_idx, wt_returns);
+        land_call_results(&mut rs, wt);
     }
     // `land_call_results` may have terminated the resumer (frames went
     // empty → status Result). Only revert to Normal if it didn't.
@@ -796,12 +757,12 @@ fn propagate_inner_to_resumer<'gc>(
 /// after the move (e.g., a tailcalled native suspended and the calling
 /// Lua frame was already popped at TAILCALL time), terminate the thread
 /// with `ThreadStatus::Result { bottom: func_idx }`.
-fn land_call_results<'gc>(
-    ts: &mut crate::env::thread::ThreadState<'gc>,
-    bottom: usize,
-    func_idx: usize,
-    returns: u8,
-) {
+fn land_call_results<'gc>(ts: &mut crate::env::thread::ThreadState<'gc>, cs: CallSite) {
+    let CallSite {
+        bottom,
+        func_idx,
+        returns,
+    } = cs;
     let retc = ts.stack.len() - bottom;
     let wanted = if returns == 0 {
         retc

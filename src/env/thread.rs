@@ -50,6 +50,23 @@ pub struct LuaFrame<'gc> {
     pub continuation: Option<Continuation>,
 }
 
+/// Stack-window metadata threaded through every suspension point.
+///
+/// - `bottom` is the callback's `args_base` — `stack[bottom..]` is the
+///   active window (yielded values, sequence args, etc.).
+/// - `func_idx == bottom - 1` (typically) is where the original Lua CALL
+///   expects results to land.
+/// - `returns` is the CALL instruction's `returns` field (0 = "all").
+///
+/// Stored on `Frame::Sequence`, `Frame::WaitThread`, `PendingAction`,
+/// and as the yielded-state stash on `ThreadState`.
+#[derive(Clone, Copy, Debug)]
+pub struct CallSite {
+    pub bottom: usize,
+    pub func_idx: usize,
+    pub returns: u8,
+}
+
 /// A frame on a thread's frame stack. The interpreter only pushes
 /// `Frame::Lua`; the executor driver pushes the others when a callback
 /// suspends, an error unwinds, a coroutine waits, etc.
@@ -58,32 +75,25 @@ pub struct LuaFrame<'gc> {
 pub enum Frame<'gc> {
     /// Running Lua bytecode.
     Lua(LuaFrame<'gc>),
-    /// A pinned multi-step native callback awaiting (re-)poll. `bottom` is
-    /// the sequence's stack window; `func_idx` and `returns` are inherited
-    /// from the original Lua CALL so terminal `SequencePoll::Return`
-    /// lands results in the right place.
+    /// A pinned multi-step native callback awaiting (re-)poll. The
+    /// `call_site` mirrors the original Lua CALL so terminal
+    /// `SequencePoll::Return` lands results in the right place.
     Sequence {
         seq: BoxSequence<'gc>,
-        bottom: usize,
-        func_idx: usize,
         #[collect(require_static)]
-        returns: u8,
+        call_site: CallSite,
         pending_error: Option<Error<'gc>>,
     },
     /// A coroutine that hasn't been resumed yet. Replaced on first resume by
     /// a real call frame.
     Start(Function<'gc>),
-    /// Current thread is waiting on an inner thread it resumed; on the inner
-    /// thread reaching a terminal/yielded state, the executor pops this
-    /// frame and lands the inner thread's values into the original CALL's
-    /// expected slot. `bottom` is where the inner's values should land
-    /// (== original args_base); `func_idx`/`returns` mirror the CALL
-    /// metadata so the driver can do the standard truncate / nil-fill.
+    /// Current thread is waiting on an inner thread it resumed; on the
+    /// inner thread reaching a terminal/yielded state, the executor pops
+    /// this frame and lands the inner thread's values into the original
+    /// CALL's expected slot.
     WaitThread {
-        bottom: usize,
-        func_idx: usize,
         #[collect(require_static)]
-        returns: u8,
+        call_site: CallSite,
     },
     /// Unwinding marker. The driver pops Lua/Wait frames (closing upvalues)
     /// until a `Sequence` frame is found and stamped with `pending_error`,
@@ -114,36 +124,17 @@ pub struct ThreadState<'gc> {
     /// where the call's results should land. `None` outside of yielded
     /// state.
     #[collect(require_static)]
-    pub yield_bottom: Option<YieldBottom>,
+    pub yield_bottom: Option<CallSite>,
 }
 
 /// A native callback wants to suspend / call / yield / resume; the executor
 /// driver translates this into frame-stack operations on the next pump.
-///
-/// Carries enough context to "land" the eventual results at the original
-/// Lua CALL's expected stack slot:
-/// - `bottom` is the callback's `args_base` — `stack[bottom..]` is its window.
-/// - `func_idx == bottom - 1` is where Lua expects results.
-/// - `returns` is the CALL instruction's `returns` field (0 = "all").
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub struct PendingAction<'gc> {
     pub action: CallbackAction<'gc>,
-    pub bottom: usize,
-    pub func_idx: usize,
     #[collect(require_static)]
-    pub returns: u8,
-}
-
-/// Yielded-state stash. On resume, the executor truncates the thread's
-/// stack to `bottom`, places resume-args, and either lands them at
-/// `func_idx` per Lua call convention (Lua frame on top) or leaves them
-/// at `bottom` for a `Frame::Sequence` to read on its next poll.
-#[derive(Clone, Copy, Debug)]
-pub struct YieldBottom {
-    pub bottom: usize,
-    pub func_idx: usize,
-    pub returns: u8,
+    pub call_site: CallSite,
 }
 
 impl<'gc> ThreadState<'gc> {
