@@ -532,69 +532,89 @@ fn apply_pending_action<'gc>(
         } => {
             // Optional `then` fires when target yields/returns; install on
             // the resumer first so it's seen *after* the WaitThread frame.
-            {
-                let mut ts = top.borrow_mut(mc);
-                if let Some(seq) = then {
-                    ts.frames.push(Frame::Sequence {
-                        seq,
-                        bottom,
-                        func_idx,
-                        returns,
-                        pending_error: None,
-                    });
-                }
-                ts.frames.push(Frame::WaitThread {
+            if let Some(seq) = then {
+                top.borrow_mut(mc).frames.push(Frame::Sequence {
+                    seq,
                     bottom,
                     func_idx,
                     returns,
+                    pending_error: None,
                 });
-                ts.status = ThreadStatus::Normal;
             }
-            // Move the args (currently at resumer's stack[bottom..]) onto
-            // target's stack at [0..]; the target's `Frame::Start(f)` will
-            // consume them as parameters on first pump.
-            let args: Vec<Value<'gc>> = {
-                let mut rs = top.borrow_mut(mc);
-                rs.stack.drain(bottom..).collect()
-            };
-            {
-                let mut ts = target.borrow_mut(mc);
-                if matches!(ts.status, ThreadStatus::Suspended)
-                    && matches!(ts.frames.last(), Some(Frame::Start(_)))
-                {
-                    // First-resume: stash args at the bottom of the stack;
-                    // the `Frame::Start` handler will set up the call frame.
-                    ts.stack.clear();
-                    ts.stack.extend(args);
-                    ts.status = ThreadStatus::Normal;
-                } else if matches!(ts.status, ThreadStatus::Suspended) {
-                    // Mid-coroutine resume: the inner thread previously
-                    // yielded. Drain the yield's pending_action and place
-                    // the resume-args at stack[inner_bottom..]. If a
-                    // Sequence frame is on top, it will pick the values
-                    // up directly on its next poll; if a Lua frame is on
-                    // top (yield-from-native-CALL), land via the standard
-                    // call-return convention so dispatch resumes at the
-                    // right slot.
-                    let yp = ts.pending_action.take();
-                    let (inner_bottom, inner_func_idx, inner_returns) = match yp {
-                        Some(p) => (p.bottom, p.func_idx, p.returns),
-                        None => return Err(RuntimeError::BadMode),
-                    };
-                    ts.stack.truncate(inner_bottom);
-                    ts.stack.extend(args);
-                    if !matches!(ts.frames.last(), Some(Frame::Sequence { .. })) {
-                        land_call_results(&mut ts, inner_bottom, inner_func_idx, inner_returns);
-                    }
-                    ts.status = ThreadStatus::Normal;
-                } else {
-                    return Err(RuntimeError::BadMode);
-                }
-            }
-            // Push target onto the executor's thread stack.
-            exec.0.borrow_mut(mc).thread_stack.push(target);
+            schedule_thread_resume(exec, ctx, top, target, bottom, bottom, func_idx, returns)?;
         }
     }
+    Ok(())
+}
+
+/// Hand off control from `resumer` to `target`.
+///
+/// Pushes a `Frame::WaitThread { wt_bottom, wt_func_idx, wt_returns }`
+/// onto the resumer (this is what `propagate_inner_to_resumer` will pop
+/// when the target eventually yields/returns), drains the resume-args
+/// from `resumer.stack[args_abs_bottom..]`, transitions the target into
+/// `Normal` (handling first-resume and mid-resume cases), and pushes the
+/// target onto the executor's thread stack.
+///
+/// Callers that want a follow-up `Sequence` on the resumer for the
+/// returned values must push it BEFORE calling this helper (so it sits
+/// beneath the WaitThread frame in stack order).
+fn schedule_thread_resume<'gc>(
+    exec: Executor<'gc>,
+    ctx: Context<'gc>,
+    resumer: Thread<'gc>,
+    target: Thread<'gc>,
+    args_abs_bottom: usize,
+    wt_bottom: usize,
+    wt_func_idx: usize,
+    wt_returns: u8,
+) -> Result<(), RuntimeError> {
+    let mc = ctx.mutation();
+    {
+        let mut rs = resumer.borrow_mut(mc);
+        rs.frames.push(Frame::WaitThread {
+            bottom: wt_bottom,
+            func_idx: wt_func_idx,
+            returns: wt_returns,
+        });
+        rs.status = ThreadStatus::Normal;
+    }
+    let args: Vec<Value<'gc>> = {
+        let mut rs = resumer.borrow_mut(mc);
+        rs.stack.drain(args_abs_bottom..).collect()
+    };
+    {
+        let mut ts = target.borrow_mut(mc);
+        if matches!(ts.status, ThreadStatus::Suspended)
+            && matches!(ts.frames.last(), Some(Frame::Start(_)))
+        {
+            // First-resume: stash args at the bottom of the stack; the
+            // `Frame::Start` handler sets up the call frame on next pump.
+            ts.stack.clear();
+            ts.stack.extend(args);
+            ts.status = ThreadStatus::Normal;
+        } else if matches!(ts.status, ThreadStatus::Suspended) {
+            // Mid-resume: target previously yielded. Drain the stash to
+            // recover where the yielded native CALL landed, place the
+            // resume-args, then either land via call-return convention
+            // (Lua frame on top) or leave at bottom (Sequence on top —
+            // it reads stack[seq.bottom..] directly on next poll).
+            let yp = ts.pending_action.take();
+            let (inner_bottom, inner_func_idx, inner_returns) = match yp {
+                Some(p) => (p.bottom, p.func_idx, p.returns),
+                None => return Err(RuntimeError::BadMode),
+            };
+            ts.stack.truncate(inner_bottom);
+            ts.stack.extend(args);
+            if !matches!(ts.frames.last(), Some(Frame::Sequence { .. })) {
+                land_call_results(&mut ts, inner_bottom, inner_func_idx, inner_returns);
+            }
+            ts.status = ThreadStatus::Normal;
+        } else {
+            return Err(RuntimeError::BadMode);
+        }
+    }
+    exec.0.borrow_mut(mc).thread_stack.push(target);
     Ok(())
 }
 
@@ -784,14 +804,27 @@ fn pump_sequence<'gc>(
             }
         }
         Ok(SequencePoll::Resume {
-            thread: _target,
-            bottom: _rel,
+            thread: target,
+            bottom: rel,
         }) => {
-            // Resume-from-sequence isn't implemented yet.
-            return Err(RuntimeError::BadMode);
+            // Re-push self so propagate_inner_to_resumer finds the
+            // sequence beneath the WaitThread and lands target's
+            // eventual values at seq.bottom for the next poll.
+            let abs_bottom = bottom + rel;
+            top.borrow_mut(mc).frames.push(Frame::Sequence {
+                seq,
+                bottom,
+                func_idx,
+                returns,
+                pending_error: None,
+            });
+            schedule_thread_resume(exec, ctx, top, target, abs_bottom, bottom, func_idx, returns)?;
         }
-        Ok(SequencePoll::TailResume(_target)) => {
-            return Err(RuntimeError::BadMode);
+        Ok(SequencePoll::TailResume(target)) => {
+            // Sequence is consumed; target's eventual values go straight
+            // to the original CALL site via the WaitThread frame's
+            // (bottom, func_idx, returns) when no Sequence is beneath.
+            schedule_thread_resume(exec, ctx, top, target, bottom, bottom, func_idx, returns)?;
         }
         Err(err) => {
             top.borrow_mut(mc).frames.push(Frame::Error(err));
@@ -848,7 +881,11 @@ fn propagate_inner_to_resumer<'gc>(
         // Lua CALL window.
         land_call_results(&mut rs, wt_bottom, wt_func_idx, wt_returns);
     }
-    rs.status = ThreadStatus::Normal;
+    // `land_call_results` may have terminated the resumer (frames went
+    // empty → status Result). Only revert to Normal if it didn't.
+    if !matches!(rs.status, ThreadStatus::Result { .. }) {
+        rs.status = ThreadStatus::Normal;
+    }
     Ok(())
 }
 
