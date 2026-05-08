@@ -551,7 +551,13 @@ impl<'cache, 'source> Parser<'cache, 'source> {
                 continue;
             }
 
-            if t == T![.] || t == T![:] {
+            if t == T![:] {
+                let n = lhs.precede(self, T![method_call]);
+                lhs = self.r_method_call(n)?;
+                continue;
+            }
+
+            if t == T![.] {
                 let n = lhs.precede(self, T![bin_op]);
                 self.expect(t);
                 let _rhs = self.r_ident();
@@ -574,6 +580,19 @@ impl<'cache, 'source> Parser<'cache, 'source> {
         } else {
             assign_list_marker.abandon(self);
             assign_marker.abandon(self);
+            if let Some(m) = &expr_marker
+                && !matches!(m.kind(), T![func_call] | T![method_call])
+            {
+                let label = self
+                    .new_label()
+                    .with_message("expression statement must be a function or method call");
+                let error = self
+                    .new_error()
+                    .with_message("syntax error")
+                    .with_label(label)
+                    .finish();
+                self.report(error);
+            }
             expr_marker
         }
     }

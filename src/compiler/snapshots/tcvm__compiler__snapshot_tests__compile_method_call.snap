@@ -1,6 +1,6 @@
 ---
 source: src/compiler/snapshot_tests.rs
-assertion_line: 144
+assertion_line: 148
 expression: output
 ---
 ; function (params=0, vararg=true, stack=11, upvalues=1)
@@ -39,7 +39,7 @@ expression: output
 0023  MOVE            R8 R9
 0024  CLOSURE         R9 P4
 0025  MOVE            R10 R0
-0026  CALL            R9 args=2 ret=2
+0026  CALL            R9 args=2 ret=1
 0027  RETURN          R5 count=2
 
 ; prototype 0:
