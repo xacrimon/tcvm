@@ -139,6 +139,23 @@ impl Lua {
         })
     }
 
+    /// Re-arm a yielded executor with new arguments and drive until the
+    /// main thread completes.
+    ///
+    /// Returns `Ok(())` when the main thread terminates with results
+    /// (subsequent `take_result` succeeds), or [`RuntimeError::MainYielded`]
+    /// if the main thread yielded again.
+    pub fn resume<A>(&mut self, ex: &StashedExecutor, args: A) -> Result<(), RuntimeError>
+    where
+        A: for<'gc> IntoMultiValue<'gc>,
+    {
+        self.try_enter(|ctx| {
+            let executor = ctx.fetch(ex);
+            executor.resume(ctx, args)
+        })?;
+        self.finish(ex)
+    }
+
     pub fn load_all(&mut self) {
         self.enter(|ctx| {
             builtin::load_basic(ctx);

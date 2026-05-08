@@ -339,21 +339,66 @@ impl<'gc> Executor<'gc> {
         }
     }
 
-    /// Re-arm a `Yielded` executor with fresh resume arguments. Not
-    /// yet implemented — currently always returns `BadMode`.
+    /// Re-arm a `Yielded` executor with fresh resume arguments. The
+    /// previously-yielded values on the top thread's stack are replaced
+    /// by `args`, executor mode flips back to `Normal`, and the next
+    /// `step` call resumes the program.
     pub fn resume<A: IntoMultiValue<'gc>>(
         self,
         ctx: Context<'gc>,
-        _args: A,
+        args: A,
     ) -> Result<(), RuntimeError> {
-        let inner = self.0.borrow();
-        if inner.mode != ExecutorMode::Yielded {
-            return Err(RuntimeError::BadMode);
+        let mc = ctx.mutation();
+        {
+            let inner = self.0.borrow();
+            if inner.mode != ExecutorMode::Yielded {
+                return Err(RuntimeError::BadMode);
+            }
         }
-        let _ = ctx;
-        // Real impl: push args onto top thread's stack at the yielded
-        // bottom, flip executor mode back to Normal, return Ok(()).
-        Err(RuntimeError::BadMode)
+        let top = {
+            let inner = self.0.borrow();
+            *inner
+                .thread_stack
+                .last()
+                .expect("Yielded executor must have a top thread")
+        };
+        // Recover where the yielded values live and the original CALL
+        // landing slot from the pending_action stash installed by
+        // apply_pending_action::Yield / pump_sequence::Yield.
+        let (bottom, func_idx, returns) = {
+            let mut ts = top.borrow_mut(mc);
+            let p = ts
+                .pending_action
+                .take()
+                .expect("Yielded mode must have stashed pending_action");
+            (p.bottom, p.func_idx, p.returns)
+        };
+        // Materialize the resume-args into a temporary vec and place
+        // them at stack[bottom..], replacing the previously-yielded
+        // values.
+        let mut buf: Vec<Value<'gc>> = Vec::new();
+        args.push_into(&mut buf);
+        {
+            let mut ts = top.borrow_mut(mc);
+            ts.stack.truncate(bottom);
+            ts.stack.extend(buf);
+            // Branch on top frame: a Sequence consumes values from
+            // stack[seq.bottom..] on its next poll, so we leave them at
+            // `bottom`. A Lua frame on top means the yield came from a
+            // native CALL inline — land the args at func_idx via the
+            // standard call-return convention so dispatch resumes
+            // correctly.
+            if !matches!(ts.frames.last(), Some(Frame::Sequence { .. })) {
+                land_call_results(&mut ts, bottom, func_idx, returns);
+            }
+            ts.status = ThreadStatus::Normal;
+        }
+        {
+            let mut inner = self.0.borrow_mut(mc);
+            inner.mode = ExecutorMode::Normal;
+            inner.main_yielded = false;
+        }
+        Ok(())
     }
 
     /// Extract typed results from the finished thread's stack and reset the
@@ -523,12 +568,14 @@ fn apply_pending_action<'gc>(
                     ts.stack.extend(args);
                     ts.status = ThreadStatus::Normal;
                 } else if matches!(ts.status, ThreadStatus::Suspended) {
-                    // Mid-coroutine resume: the inner thread yielded from
-                    // its own native CALL site. Drain the yield's
-                    // pending_action to recover where the CALL expected
-                    // results to land, place the resume-args there per the
-                    // standard Lua call-return convention, then re-enter
-                    // dispatch (next pump).
+                    // Mid-coroutine resume: the inner thread previously
+                    // yielded. Drain the yield's pending_action and place
+                    // the resume-args at stack[inner_bottom..]. If a
+                    // Sequence frame is on top, it will pick the values
+                    // up directly on its next poll; if a Lua frame is on
+                    // top (yield-from-native-CALL), land via the standard
+                    // call-return convention so dispatch resumes at the
+                    // right slot.
                     let yp = ts.pending_action.take();
                     let (inner_bottom, inner_func_idx, inner_returns) = match yp {
                         Some(p) => (p.bottom, p.func_idx, p.returns),
@@ -536,7 +583,9 @@ fn apply_pending_action<'gc>(
                     };
                     ts.stack.truncate(inner_bottom);
                     ts.stack.extend(args);
-                    land_call_results(&mut ts, inner_bottom, inner_func_idx, inner_returns);
+                    if !matches!(ts.frames.last(), Some(Frame::Sequence { .. })) {
+                        land_call_results(&mut ts, inner_bottom, inner_func_idx, inner_returns);
+                    }
                     ts.status = ThreadStatus::Normal;
                 } else {
                     return Err(RuntimeError::BadMode);
