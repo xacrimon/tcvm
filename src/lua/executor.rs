@@ -968,7 +968,11 @@ fn unwind_error<'gc>(
                     ts.frames.pop();
                 }
                 Some(Frame::Start(_)) | Some(Frame::Error(_)) => {
-                    ts.frames.pop();
+                    // Frame::Start is only on a freshly-created thread
+                    // that hasn't run yet, so it can't have errored.
+                    // Frame::Error is removed by the next driver pump
+                    // (which enters this function), so two can't coexist.
+                    unreachable!("Frame::Start / Frame::Error mid-unwind violates the executor invariant");
                 }
                 None => break err,
             }
