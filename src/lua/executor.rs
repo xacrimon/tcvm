@@ -45,11 +45,6 @@ pub(crate) struct ExecutorInner<'gc> {
     /// Coroutine `resume` pushes onto this stack.
     pub(crate) thread_stack: Vec<Thread<'gc>>,
     pub(crate) mode: ExecutorMode,
-    /// Set when the main thread yielded to the host. Used by the driver to
-    /// distinguish "main yielded" from "main is running and happens to be
-    /// in Suspended status mid-pump". Cleared by `resume`.
-    #[collect(require_static)]
-    pub(crate) main_yielded: bool,
 }
 
 #[derive(Clone, Copy, Collect)]
@@ -100,7 +95,6 @@ impl<'gc> Executor<'gc> {
                 thread,
                 thread_stack: vec![thread],
                 mode: ExecutorMode::Normal,
-                main_yielded: false,
             }),
         ))
     }
@@ -174,21 +168,21 @@ impl<'gc> Executor<'gc> {
                     inner.mode = ExecutorMode::Result;
                     return Ok(StepResult::Done);
                 }
-                ThreadStatus::Suspended if stack_len == 1 && self.0.borrow().main_yielded => {
-                    // Extract yielded values from the top thread's stack
-                    // window, identified by the yield_bottom stash that
-                    // the Yield action installed.
-                    let values: Vec<Value<'gc>> = {
+                ThreadStatus::Suspended if stack_len == 1 => {
+                    // Main thread is suspended at the bottom of the
+                    // executor stack. yield_bottom == Some means it
+                    // yielded to the host; yield_bottom == None means
+                    // it's freshly seeded (Frame::Start on top), which
+                    // the dispatch step below handles. Don't conflate.
+                    let values: Option<Vec<Value<'gc>>> = {
                         let ts = top.borrow();
-                        let bottom = ts
-                            .yield_bottom
-                            .map(|y| y.bottom)
-                            .expect("main yield must have stashed yield_bottom");
-                        ts.stack[bottom..].to_vec()
+                        ts.yield_bottom.map(|y| ts.stack[y.bottom..].to_vec())
                     };
-                    let mut inner = self.0.borrow_mut(mc);
-                    inner.mode = ExecutorMode::Yielded;
-                    return Ok(StepResult::Yielded(values));
+                    if let Some(values) = values {
+                        let mut inner = self.0.borrow_mut(mc);
+                        inner.mode = ExecutorMode::Yielded;
+                        return Ok(StepResult::Yielded(values));
+                    }
                 }
                 ThreadStatus::Stopped => return Err(RuntimeError::BadMode),
                 _ => {}
@@ -323,7 +317,6 @@ impl<'gc> Executor<'gc> {
         {
             let mut inner = self.0.borrow_mut(mc);
             inner.mode = ExecutorMode::Normal;
-            inner.main_yielded = false;
         }
         Ok(())
     }
@@ -445,11 +438,6 @@ fn apply_pending_action<'gc>(
                 returns,
             });
             ts.status = ThreadStatus::Suspended;
-
-            let stack_len = exec.0.borrow().thread_stack.len();
-            if stack_len == 1 {
-                exec.0.borrow_mut(mc).main_yielded = true;
-            }
         }
         CallbackAction::Resume {
             thread: target,
@@ -707,10 +695,6 @@ fn pump_sequence<'gc>(
                 returns,
             });
             ts.status = ThreadStatus::Suspended;
-            let stack_len = exec.0.borrow().thread_stack.len();
-            if stack_len == 1 {
-                exec.0.borrow_mut(mc).main_yielded = true;
-            }
         }
         Ok(SequencePoll::TailYield) => {
             let mut ts = top.borrow_mut(mc);
@@ -720,10 +704,6 @@ fn pump_sequence<'gc>(
                 returns,
             });
             ts.status = ThreadStatus::Suspended;
-            let stack_len = exec.0.borrow().thread_stack.len();
-            if stack_len == 1 {
-                exec.0.borrow_mut(mc).main_yielded = true;
-            }
         }
         Ok(SequencePoll::Resume {
             thread: target,
