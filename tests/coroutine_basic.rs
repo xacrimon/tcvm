@@ -1,6 +1,6 @@
 //! Basic Lua coroutine round-trip via `coroutine.create` / `resume` / `yield`.
 
-use tcvm::{Executor, LoadError, Lua, RuntimeError};
+use tcvm::{Executor, LoadError, Lua};
 
 /// `coroutine.create(f)`, `coroutine.resume(co)` once with no yield —
 /// `f` returns `42`; resume returns `(true, 42)`.
@@ -50,7 +50,8 @@ fn yield_and_resume_with_value() {
     assert_eq!(result, 1 + 15, "y1=1 (yielded), y2=15 (returned)");
 }
 
-/// Resuming a finished coroutine returns the dead-coroutine flag.
+/// After a coroutine returns, its status is `"dead"`, and a further
+/// `resume` returns `(false, "cannot resume dead coroutine")`.
 #[test]
 fn resume_dead_coroutine() {
     let mut lua = Lua::new();
@@ -61,21 +62,12 @@ fn resume_dead_coroutine() {
             let chunk = ctx.load(
                 "local co = coroutine.create(function() return 1 end)\n\
                  coroutine.resume(co)\n\
-                 return coroutine.status(co) == 'dead'",
+                 if coroutine.status(co) == 'dead' then return 1 else return 0 end",
                 Some("resume_dead"),
             )?;
             Ok(ctx.stash(Executor::start(ctx, chunk, ())))
         })
         .expect("load");
-    // The chunk evaluates to a boolean. Bridge through integer for now —
-    // tcvm's IntoMultiValue may not have bool yet, so compare via if-else.
-    let _ = result_or_bool_via_int(&mut lua);
-    let _ = RuntimeError::BadMode; // touch import
-}
-
-/// Convenience: not all type conversions are wired, so the actual harness
-/// compiles boolean → integer via Lua source. Stub kept for symmetry with
-/// other tests.
-fn result_or_bool_via_int(_lua: &mut Lua) -> i64 {
-    0
+    let result: i64 = lua.execute(&ex).expect("run");
+    assert_eq!(result, 1, "finished coroutine reports status='dead'");
 }
