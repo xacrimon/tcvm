@@ -24,6 +24,12 @@ pub enum RuntimeError {
     Opcode { pc: usize },
     #[error("bad executor mode")]
     BadMode,
+    /// The main thread yielded to the host before completing. The host
+    /// must `resume` the executor to continue (P8); plain `finish`/
+    /// `execute` have no path to surface the yielded values, so they
+    /// turn this into an error rather than reporting bogus completion.
+    #[error("main thread yielded; resume not yet supported")]
+    MainYielded,
     /// User-thrown Lua error (`error(value)`); payload is the stashed value.
     /// Inspect / display via `Lua::enter` + `Fetchable::fetch`.
     #[error("lua error")]

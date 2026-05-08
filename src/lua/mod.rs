@@ -93,32 +93,36 @@ impl Lua {
         self.enter(f)
     }
 
-    /// Drive the executor until it reaches a terminal state.
+    /// Drive the executor until the main thread completes.
     ///
-    /// Returns `Ok(())` when the main thread completes (subsequent
-    /// `take_result` succeeds). The synchronous path remains a single
-    /// `step` round-trip. Yielded values aren't surfaced through this
-    /// API yet; the public yield-to-host channel arrives in P8 alongside
-    /// `Lua::resume`.
+    /// Returns `Ok(())` when the main thread terminates with results
+    /// (subsequent `take_result` succeeds). Returns
+    /// [`RuntimeError::MainYielded`] if the main thread yielded to the
+    /// host — `finish` has no way to surface yielded values, and the
+    /// public resume API arrives in P8.
     pub fn finish(&mut self, ex: &StashedExecutor) -> Result<(), RuntimeError> {
+        enum Outcome {
+            Done,
+            Yielded,
+            Pending,
+        }
         loop {
             // The enter-closure can't return `StepResult<'gc>` across the
             // arena boundary (it carries `'gc`-branded `Value`s). Reduce
-            // to a `'static` "done?" flag inside the closure; the values
-            // surface through `take_result` as today.
-            let done = self.try_enter(|ctx| -> Result<bool, RuntimeError> {
+            // to a `'static` outcome inside the closure; the result values
+            // surface through `take_result`.
+            let outcome = self.try_enter(|ctx| -> Result<Outcome, RuntimeError> {
                 let executor = ctx.fetch(ex);
-                match executor.step(ctx)? {
-                    StepResult::Done => Ok(true),
-                    // P4 doesn't produce these; treat as done for now.
-                    // P8 wires Yielded through to the public API with
-                    // stashed values.
-                    StepResult::Yielded(_) => Ok(true),
-                    StepResult::Pending => Ok(false),
-                }
+                Ok(match executor.step(ctx)? {
+                    StepResult::Done => Outcome::Done,
+                    StepResult::Yielded(_) => Outcome::Yielded,
+                    StepResult::Pending => Outcome::Pending,
+                })
             })?;
-            if done {
-                return Ok(());
+            match outcome {
+                Outcome::Done => return Ok(()),
+                Outcome::Yielded => return Err(RuntimeError::MainYielded),
+                Outcome::Pending => continue,
             }
         }
     }
