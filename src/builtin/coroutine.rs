@@ -110,7 +110,7 @@ fn lua_running<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let cur = nctx.exec.current_thread();
-    let is_main = cur.ptr_eq(nctx.ctx.main_thread());
+    let is_main = nctx.exec.is_main(nctx.ctx);
     stack.replace(&[Value::thread(cur), Value::boolean(is_main)]);
     Ok(CallbackAction::Return)
 }
@@ -123,17 +123,17 @@ fn lua_isyieldable<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let arg = stack.get(0);
-    let target = if arg.is_nil() {
-        nctx.exec.current_thread()
+    let yieldable = if arg.is_nil() {
+        !nctx.exec.is_main(nctx.ctx)
     } else {
-        arg.get_thread().ok_or_else(|| {
+        let target = arg.get_thread().ok_or_else(|| {
             Error::from_str(
                 nctx.ctx,
                 "bad argument #1 to 'isyieldable' (coroutine expected)",
             )
-        })?
+        })?;
+        !target.ptr_eq(nctx.ctx.main_thread())
     };
-    let yieldable = !target.ptr_eq(nctx.ctx.main_thread());
     stack.replace(&[Value::boolean(yieldable)]);
     Ok(CallbackAction::Return)
 }

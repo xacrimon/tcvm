@@ -97,6 +97,11 @@ impl<'gc, 'a> Execution<'gc, 'a> {
     pub fn current_thread(self) -> Thread<'gc> {
         self.current_thread
     }
+
+    /// Whether the running thread is the executor's main (entry) thread.
+    pub fn is_main(self, ctx: crate::lua::Context<'gc>) -> bool {
+        self.current_thread.ptr_eq(ctx.main_thread())
+    }
 }
 
 /// A multi-step / suspendable native callback.
