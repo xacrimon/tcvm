@@ -1,6 +1,6 @@
 use crate::dmm::{Collect, Gc, RefLock};
 use crate::env::function::Function;
-use crate::env::thread::{Frame, LuaFrame, PendingAction, ThreadStatus};
+use crate::env::thread::{Frame, LuaFrame, PendingAction, ThreadStatus, YieldBottom};
 use crate::env::{Thread, Value};
 use crate::lua::RuntimeError;
 use crate::lua::context::Context;
@@ -155,10 +155,10 @@ impl<'gc> Executor<'gc> {
                     ThreadStatus::Suspended => {
                         // Inner yielded. The yielded values live at
                         // stack[bottom..] where `bottom` is the inner's
-                        // pending_action.bottom (yield action stashed it).
+                        // yield_bottom (the Yield path stashed it).
                         let bottom = {
                             let ts = top.borrow();
-                            ts.pending_action.as_ref().map(|p| p.bottom).unwrap_or(0)
+                            ts.yield_bottom.map(|y| y.bottom).unwrap_or(0)
                         };
                         propagate_inner_to_resumer(self, ctx, top, bottom, true)?;
                         continue;
@@ -176,16 +176,14 @@ impl<'gc> Executor<'gc> {
                 }
                 ThreadStatus::Suspended if stack_len == 1 && self.0.borrow().main_yielded => {
                     // Extract yielded values from the top thread's stack
-                    // window, identified by the pending_action stash that
-                    // apply_pending_action::Yield / pump_sequence::Yield
-                    // installed.
+                    // window, identified by the yield_bottom stash that
+                    // the Yield action installed.
                     let values: Vec<Value<'gc>> = {
                         let ts = top.borrow();
                         let bottom = ts
-                            .pending_action
-                            .as_ref()
-                            .map(|p| p.bottom)
-                            .expect("main yield must have stashed pending_action");
+                            .yield_bottom
+                            .map(|y| y.bottom)
+                            .expect("main yield must have stashed yield_bottom");
                         ts.stack[bottom..].to_vec()
                     };
                     let mut inner = self.0.borrow_mut(mc);
@@ -292,15 +290,15 @@ impl<'gc> Executor<'gc> {
                 .expect("Yielded executor must have a top thread")
         };
         // Recover where the yielded values live and the original CALL
-        // landing slot from the pending_action stash installed by
-        // apply_pending_action::Yield / pump_sequence::Yield.
+        // landing slot from the yield_bottom stash installed by the
+        // Yield path.
         let (bottom, func_idx, returns) = {
             let mut ts = top.borrow_mut(mc);
-            let p = ts
-                .pending_action
+            let y = ts
+                .yield_bottom
                 .take()
-                .expect("Yielded mode must have stashed pending_action");
-            (p.bottom, p.func_idx, p.returns)
+                .expect("Yielded mode must have stashed yield_bottom");
+            (y.bottom, y.func_idx, y.returns)
         };
         // Materialize the resume-args into a temporary vec and place
         // them at stack[bottom..], replacing the previously-yielded
@@ -387,8 +385,9 @@ fn apply_pending_action<'gc>(
     } = p;
     match action {
         CallbackAction::Return => {
-            // op_call/tailcall handle Return inline; should never get here.
-            unreachable!("apply_pending_action: Return should be handled inline");
+            // op_call/tailcall handle Return inline. With yield-bottom
+            // factored out into its own field, no sentinel use remains.
+            unreachable!("apply_pending_action: Return is handled inline");
         }
         CallbackAction::Sequence(seq) => {
             let mut ts = top.borrow_mut(mc);
@@ -437,13 +436,10 @@ fn apply_pending_action<'gc>(
                     pending_error: None,
                 });
             }
-            // Yielded values live at stack[bottom..]. Mark thread suspended;
-            // the next driver iteration sees Suspended + (we're below the
-            // top of thread_stack) → propagate to resumer.
-            // Re-stash the bottom on a fresh `pending_action` so the driver
-            // can find it when propagating yields.
-            ts.pending_action = Some(PendingAction {
-                action: CallbackAction::Return, // sentinel; only `bottom` matters
+            // Yielded values live at stack[bottom..]. Mark thread
+            // suspended and stash where they are so the next pump can
+            // find them (propagation to resumer, host-side resume, etc.).
+            ts.yield_bottom = Some(YieldBottom {
                 bottom,
                 func_idx,
                 returns,
@@ -523,20 +519,19 @@ fn schedule_thread_resume<'gc>(
             ts.stack.extend(args);
             ts.status = ThreadStatus::Normal;
         } else if matches!(ts.status, ThreadStatus::Suspended) {
-            // Mid-resume: target previously yielded. Drain the stash to
-            // recover where the yielded native CALL landed, place the
+            // Mid-resume: target previously yielded. Drain yield_bottom
+            // to recover where the yielded native CALL landed, place the
             // resume-args, then either land via call-return convention
             // (Lua frame on top) or leave at bottom (Sequence on top —
             // it reads stack[seq.bottom..] directly on next poll).
-            let yp = ts.pending_action.take();
-            let (inner_bottom, inner_func_idx, inner_returns) = match yp {
-                Some(p) => (p.bottom, p.func_idx, p.returns),
+            let y = match ts.yield_bottom.take() {
+                Some(y) => y,
                 None => return Err(RuntimeError::BadMode),
             };
-            ts.stack.truncate(inner_bottom);
+            ts.stack.truncate(y.bottom);
             ts.stack.extend(args);
             if !matches!(ts.frames.last(), Some(Frame::Sequence { .. })) {
-                land_call_results(&mut ts, inner_bottom, inner_func_idx, inner_returns);
+                land_call_results(&mut ts, y.bottom, y.func_idx, y.returns);
             }
             ts.status = ThreadStatus::Normal;
         } else {
@@ -706,8 +701,7 @@ fn pump_sequence<'gc>(
                 returns,
                 pending_error: None,
             });
-            ts.pending_action = Some(PendingAction {
-                action: CallbackAction::Return,
+            ts.yield_bottom = Some(YieldBottom {
                 bottom: abs_bottom,
                 func_idx,
                 returns,
@@ -720,8 +714,7 @@ fn pump_sequence<'gc>(
         }
         Ok(SequencePoll::TailYield) => {
             let mut ts = top.borrow_mut(mc);
-            ts.pending_action = Some(PendingAction {
-                action: CallbackAction::Return,
+            ts.yield_bottom = Some(YieldBottom {
                 bottom,
                 func_idx,
                 returns,

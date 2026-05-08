@@ -180,6 +180,7 @@ fn lua_close<'gc>(
         ts.open_upvalues.clear();
         ts.tbc_slots.clear();
         ts.pending_action = None;
+        ts.yield_bottom = None;
         ts.status = ThreadStatus::Stopped;
     }
     stack.replace(&[Value::boolean(true)]);

@@ -105,10 +105,16 @@ pub struct ThreadState<'gc> {
     pub thread_handle: Option<Thread<'gc>>,
     /// A native callback's non-`Return` `CallbackAction` deposited by
     /// `op_call`/`op_tailcall` and consumed by the executor driver loop on
-    /// the next pump. Carries the stack `bottom` the action operates against.
-    /// `None` between pumps. The interpreter never observes this (it bails
-    /// out via `return Ok(())` immediately after setting it).
+    /// the next pump. `None` between pumps. The interpreter never observes
+    /// this (it bails out via `return Ok(())` immediately after setting it).
     pub pending_action: Option<PendingAction<'gc>>,
+    /// Where the thread's yielded values currently live. Set when the
+    /// thread suspends via a `Yield` action (or a sequence's
+    /// `SequencePoll::Yield`/`TailYield`). Consumed on resume to recover
+    /// where the call's results should land. `None` outside of yielded
+    /// state.
+    #[collect(require_static)]
+    pub yield_bottom: Option<YieldBottom>,
 }
 
 /// A native callback wants to suspend / call / yield / resume; the executor
@@ -126,6 +132,17 @@ pub struct PendingAction<'gc> {
     pub bottom: usize,
     pub func_idx: usize,
     #[collect(require_static)]
+    pub returns: u8,
+}
+
+/// Yielded-state stash. On resume, the executor truncates the thread's
+/// stack to `bottom`, places resume-args, and either lands them at
+/// `func_idx` per Lua call convention (Lua frame on top) or leaves them
+/// at `bottom` for a `Frame::Sequence` to read on its next poll.
+#[derive(Clone, Copy, Debug)]
+pub struct YieldBottom {
+    pub bottom: usize,
+    pub func_idx: usize,
     pub returns: u8,
 }
 
@@ -198,6 +215,7 @@ impl<'gc> Thread<'gc> {
             status: ThreadStatus::Stopped,
             thread_handle: None,
             pending_action: None,
+            yield_bottom: None,
         };
         let thread = Thread(Gc::new(mc, RefLock::new(state)));
         // Store the back-reference
