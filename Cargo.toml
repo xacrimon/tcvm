@@ -21,7 +21,7 @@ repository.workspace = true
 
 [dependencies]
 tcvm-derive = { path = "derive", version = "0.1.0" }
-hashbrown = { version = "0.17.0", default-features = false, features = ["nightly"] }
+hashbrown = { version = "0.17.1", default-features = false, features = ["nightly"] }
 foldhash = { version = "0.2.0", default-features = false }
 bitflags = "2.11.1"
 zmij = "1.0.21"
