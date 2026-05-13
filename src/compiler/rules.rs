@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use cstree::interning::TokenInterner;
 
-use super::defs::{Chunk, ExprDesc, ExprKind, JumpList, Numeral, RegisterIndex, Want};
+use super::defs::{Chunk, ExprDesc, ExprKind, JumpList, Numeral, RegisterIndex, VarargInfo, Want};
 use super::{CompileError, CompileErrorKind, LineNumber};
 use crate::dmm::Gc;
 use crate::env::{LuaString, Prototype, value::Value};
@@ -172,6 +172,14 @@ enum VarKind {
     Const(Option<ConstVal>),
     /// Local declared with `<close>` — a to-be-closed variable (RDKTOCLOSE).
     ToClose,
+    /// The named-vararg parameter (`function f(...args)`). Holds the
+    /// vararg table when materialized; `nil` sentinel otherwise.
+    /// Accesses of the form `args[expr]` / `args.id` lower to
+    /// `VARARGGET` (whose handler dispatches on the runtime type of
+    /// `R[base]`), so the same bytecode works in both the optimized
+    /// and materialized paths. Bare use (`local b = args`) or upvalue
+    /// capture forces materialization at the function's epilogue.
+    VarargParam,
 }
 
 impl VarKind {
@@ -1127,11 +1135,22 @@ impl<'gc, 'a> UpvalueResolver for Ctx<'gc, 'a> {
         //    locals (and `<const>` whose initializer didn't fold) flow
         //    back as a `ParentLocal` descriptor.
         if let Some(data) = self.resolve_local(name) {
-            if let VarKind::Const(Some(v)) = data.kind {
+            let kind = data.kind;
+            let register = data.register;
+            if let VarKind::Const(Some(v)) = kind {
                 return Some(ChildResolution::Const(v));
             }
+            // A nested closure capturing the named vararg local forces
+            // materialization in this function: the child's upvalue
+            // points at `args_reg`, and that register must hold a real
+            // table (not the nil sentinel) once it escapes the frame.
+            if matches!(kind, VarKind::VarargParam)
+                && let Some(info) = self.chunk.vararg_info.as_mut()
+            {
+                info.captured = true;
+            }
             return Some(ChildResolution::Upvalue(UpValueDescriptor::ParentLocal(
-                data.register.0,
+                register.0,
             )));
         }
         // 2. Already captured in our upvalue list?
@@ -1217,6 +1236,7 @@ pub fn compile<'gc>(
         root.block(),
         std::iter::empty(),
         true, // main chunk is vararg
+        None, // main chunk has no named vararg parameter
         0,
         None,
         // Pre-seed `_ENV` at upvalue 0. The runtime wiring in
@@ -1239,6 +1259,7 @@ fn compile_function_to_chunk<'gc, 'a>(
     stmts: impl Iterator<Item = Stmt>,
     params: impl Iterator<Item = Ident>,
     is_vararg: bool,
+    vararg_name: Option<String>,
     arity: u8,
     source: Option<LuaString<'gc>>,
     initial_upvalues: Vec<(String, UpValueDescriptor)>,
@@ -1290,6 +1311,49 @@ fn compile_function_to_chunk<'gc, 'a>(
     // (upvalue capture by the body relies on `nactvar`) and temp reclaims
     // never touch their slots.
     ctx.adjust_locals(num_params);
+
+    // Named-vararg setup: register `name` as a `VarargParam` local at a
+    // reserved register and lay out the prologue. The 6 instruction
+    // slots starting at `prologue_slot` begin life as a `LOAD nil` into
+    // `args_reg` followed by five `NOP`s; if escape analysis during
+    // body compilation flips a usage flag, the epilogue overwrites
+    // them with the materialization sequence.
+    if let Some(name) = vararg_name {
+        let args_reg = ctx.alloc_register()?;
+        let tmp_base = ctx.alloc_register()?;
+        let n_key_reg = ctx.alloc_register()?;
+        let count_reg = ctx.alloc_register()?;
+        let nil_sentinel_reg = ctx.alloc_register()?;
+        ctx.define(
+            name,
+            VariableData {
+                register: args_reg,
+                kind: VarKind::VarargParam,
+            },
+        )?;
+        ctx.adjust_locals(num_params + 5);
+
+        let prologue_slot = ctx.chunk.tape.len();
+        let nil_idx = ctx.alloc_constant(Value::nil())?;
+        ctx.emit(Instruction::LOAD {
+            dst: args_reg.0,
+            idx: nil_idx,
+        });
+        for _ in 0..5 {
+            ctx.emit(Instruction::NOP);
+        }
+
+        ctx.chunk.vararg_info = Some(VarargInfo {
+            args_reg: args_reg.0,
+            tmp_base: tmp_base.0,
+            n_key_reg: n_key_reg.0,
+            count_reg: count_reg.0,
+            nil_sentinel_reg: nil_sentinel_reg.0,
+            prologue_slot,
+            used_as_non_base: false,
+            captured: false,
+        });
+    }
 
     // Compile the body
     for stmt in stmts {
@@ -2208,9 +2272,13 @@ fn compile_func_body(
     let params: Vec<_> = item.args().map(|a| a.collect()).unwrap_or_default();
     let stmts: Vec<_> = item.block().map(|b| b.collect()).unwrap_or_default();
     let arity = params.len() as u8;
-    let is_vararg = item.vararg().is_some();
+    let vararg = item.vararg();
+    let is_vararg = vararg.is_some();
+    let vararg_name = vararg
+        .and_then(|v| v.name())
+        .and_then(|i| i.name(ctx.interner).map(str::to_owned));
 
-    let proto = compile_nested(ctx, stmts, params, is_vararg, arity)?;
+    let proto = compile_nested(ctx, stmts, params, is_vararg, vararg_name, arity)?;
 
     let proto_idx = ctx.chunk.prototypes.len() as u16;
     ctx.chunk.prototypes.push(proto);
@@ -2234,6 +2302,7 @@ fn compile_nested<'gc>(
     stmts: Vec<Stmt>,
     params: Vec<Ident>,
     is_vararg: bool,
+    vararg_name: Option<String>,
     arity: u8,
 ) -> Result<Gc<'gc, Prototype<'gc>>, CompileError> {
     let lua_ctx = ctx.ctx;
@@ -2248,6 +2317,7 @@ fn compile_nested<'gc>(
         stmts.into_iter(),
         params.into_iter(),
         is_vararg,
+        vararg_name,
         arity,
         None,
         Vec::new(),
@@ -2321,10 +2391,24 @@ fn compile_expr_ident(
     // without ever loading from the local's register. Plain locals (and
     // const-locals whose initializer didn't fold) return their register.
     if let Some(data) = ctx.resolve_local(name) {
-        if let VarKind::Const(Some(v)) = data.kind {
+        let kind = data.kind;
+        let register = data.register;
+        if let VarKind::Const(Some(v)) = kind {
             return Ok(v.to_expr_desc());
         }
-        return Ok(ExprDesc::from_reg(data.register));
+        // The named-vararg local is reached here only when it's used as
+        // a value (anything other than the base of `t[exp]` / `t.id`,
+        // which `compile_expr_index` / `compile_expr_binary_op`
+        // intercept before recursing). Flip the materialization flag —
+        // the epilogue will fill the reserved prologue slots so
+        // `R[args_reg]` holds a real table by the time this MOVE/use
+        // runs.
+        if matches!(kind, VarKind::VarargParam)
+            && let Some(info) = ctx.chunk.vararg_info.as_mut()
+        {
+            info.used_as_non_base = true;
+        }
+        return Ok(ExprDesc::from_reg(register));
     }
 
     // Upvalue path. An outer-scope `<const>` with a known value
@@ -2409,9 +2493,13 @@ fn compile_expr_func(
     let params: Vec<_> = item.args().map(|a| a.collect()).unwrap_or_default();
     let stmts: Vec<_> = item.block().map(|b| b.collect()).unwrap_or_default();
     let arity = params.len() as u8;
-    let is_vararg = item.vararg().is_some();
+    let vararg = item.vararg();
+    let is_vararg = vararg.is_some();
+    let vararg_name = vararg
+        .and_then(|v| v.name())
+        .and_then(|i| i.name(ctx.interner).map(str::to_owned));
 
-    let proto = compile_nested(ctx, stmts, params, is_vararg, arity)?;
+    let proto = compile_nested(ctx, stmts, params, is_vararg, vararg_name, arity)?;
 
     let proto_idx = ctx.chunk.prototypes.len() as u16;
     ctx.chunk.prototypes.push(proto);
@@ -2457,6 +2545,24 @@ fn try_property_key_constant(
         _ => return Ok(None),
     };
     Ok(Some(ctx.alloc_field_key(&bytes)?))
+}
+
+/// Extract the property field name as bytes from an Ident-shaped RHS
+/// (the standard `target.field` form). Returns `None` for non-Ident
+/// RHSes — the caller treats those as a compile-time impossibility for
+/// the vararg dot-access intercept (the parser would have produced an
+/// `Index` instead).
+fn property_field_name(ctx: &Ctx, field: &Expr) -> Result<Option<Vec<u8>>, CompileError> {
+    match field {
+        Expr::Ident(ident) => Ok(Some(
+            ident
+                .name(ctx.interner)
+                .ok_or_else(|| ice("ident without name"))?
+                .as_bytes()
+                .to_vec(),
+        )),
+        _ => Ok(None),
+    }
 }
 
 fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, CompileError> {
@@ -2778,6 +2884,30 @@ fn compile_expr_binary_op(
     if op == BinaryOperator::Property {
         let lhs = item.lhs().ok_or_else(|| ice("binop without lhs"))?;
         let rhs = item.rhs().ok_or_else(|| ice("binop without rhs"))?;
+
+        // `args.id` on the named-vararg local: lower to VARARGGET with
+        // the field name as a string constant. The handler routes
+        // string keys other than `"n"` to nil, so this also covers
+        // typoed lookups without a separate runtime check.
+        if let Some(args_reg) = resolve_vararg_base(ctx, &lhs) {
+            let key_bytes = property_field_name(ctx, &rhs)?
+                .ok_or_else(|| ice("vararg property without static key"))?;
+            let key_const = ctx.alloc_string_constant(&key_bytes)?;
+            let key_reg = ctx.alloc_register()?;
+            ctx.emit(Instruction::LOAD {
+                dst: key_reg.0,
+                idx: key_const,
+            });
+            ctx.free_reg(key_reg);
+            let dst = ctx.dst_or_alloc(dst)?;
+            ctx.emit(Instruction::VARARGGET {
+                dst: dst.0,
+                base: args_reg,
+                key: key_reg.0,
+            });
+            return Ok(ExprDesc::from_reg(dst));
+        }
+
         let table = compile_expr_to_reg(ctx, lhs, None)?;
         if let Some((key_idx, ic_idx)) = try_property_key_constant(ctx, &rhs)? {
             ctx.free_reg(table);
@@ -3491,6 +3621,25 @@ fn compile_expr_index(
 ) -> Result<RegisterIndex, CompileError> {
     let target_expr = item.target().ok_or_else(|| ice("index without target"))?;
     let key_expr = item.index().ok_or_else(|| ice("index without key"))?;
+
+    // `args[expr]` on the named-vararg local lowers to `VARARGGET`,
+    // bypassing the GETTABLE path. The VM handler dispatches on
+    // `R[args_reg]`'s runtime type: nil sentinel → below-base read,
+    // table → indexed get. Either way, this access stays inside the
+    // "used only as base of t[exp]" condition, so no materialization
+    // flag is flipped here.
+    if let Some(args_reg) = resolve_vararg_base(ctx, &target_expr) {
+        let key = compile_expr_to_reg(ctx, key_expr, None)?;
+        ctx.free_reg(key);
+        let dst = ctx.dst_or_alloc(dst)?;
+        ctx.emit(Instruction::VARARGGET {
+            dst: dst.0,
+            base: args_reg,
+            key: key.0,
+        });
+        return Ok(dst);
+    }
+
     let table = compile_expr_to_reg(ctx, target_expr, None)?;
     let key = compile_expr_to_reg(ctx, key_expr, None)?;
     // Both operands have been captured into the upcoming GETTABLE; free
@@ -3503,6 +3652,23 @@ fn compile_expr_index(
         key: key.0,
     });
     Ok(dst)
+}
+
+/// If `expr` is a bare `Ident` resolving to the named-vararg local of
+/// the current chunk, return its register so the caller can emit a
+/// `VARARGGET`. Returns `None` otherwise — the caller falls back to
+/// `GETTABLE` / `GETFIELD`.
+fn resolve_vararg_base(ctx: &Ctx, expr: &Expr) -> Option<u8> {
+    let Expr::Ident(ident) = expr else {
+        return None;
+    };
+    let name = ident.name(ctx.interner)?;
+    let data = ctx.resolve_local(name)?;
+    if matches!(data.kind, VarKind::VarargParam) {
+        Some(data.register.0)
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------

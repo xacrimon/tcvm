@@ -7,6 +7,31 @@ use crate::instruction::{Instruction, UpValueDescriptor};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RegisterIndex(pub u8);
 
+/// Bookkeeping for a function that declares a Lua 5.5 named vararg
+/// parameter (`function f(...name)`). One per `Chunk`. The
+/// compiler reserves `args_reg` plus three temp slots and a nil
+/// sentinel inside `max_stack`; the prologue sits at
+/// `[prologue_slot, prologue_slot + 6)` and starts as a sequence
+/// of `NOP`s plus a `LOAD nil` into `args_reg`. If escape analysis
+/// during body compilation flips a flag, the epilogue overwrites
+/// the slot with the materialization sequence (`NEWTABLE`, `VARARG
+/// count=0`, `SETLIST count=0`, `LOAD "n"`, `VARARGGET`, `SETFIELD
+/// "n"`) so `R[args_reg]` becomes a real table.
+#[derive(Debug, Clone, Copy)]
+pub struct VarargInfo {
+    pub args_reg: u8,
+    pub tmp_base: u8,
+    pub n_key_reg: u8,
+    pub count_reg: u8,
+    pub nil_sentinel_reg: u8,
+    /// Bytecode index of the first prologue slot reserved for the
+    /// materialization patch. Six contiguous instruction slots are
+    /// reserved at `[prologue_slot, prologue_slot + 6)`.
+    pub prologue_slot: usize,
+    pub used_as_non_base: bool,
+    pub captured: bool,
+}
+
 /// How many results a multires-capable expression (function call,
 /// `...`) is expected to produce. Threaded through `compile_expr*`
 /// helpers so the last expression of a multires context (last argument
@@ -211,6 +236,13 @@ pub struct Chunk<'gc> {
     pub(super) max_stack: u8,
     pub(super) arity: u8,
     pub(super) is_vararg: bool,
+    /// Per-chunk metadata for the Lua 5.5 named-vararg parameter
+    /// (`function f(...name)`). `Some` iff the function declares one.
+    /// The epilogue inspects the usage flags to decide whether to
+    /// fill the reserved prologue slots with the materialization
+    /// sequence; if neither flag fires, the slots stay as `NOP`s
+    /// and `VARARGGET` falls into its optimized below-base read.
+    pub(super) vararg_info: Option<VarargInfo>,
     pub(super) labels: Vec<usize>,
     pub(super) jump_patches: Vec<(usize, u16)>,
     /// Highest bytecode position that any label has resolved to or that any
@@ -237,6 +269,7 @@ impl<'gc> Chunk<'gc> {
             max_stack: 0,
             arity: 0,
             is_vararg: false,
+            vararg_info: None,
             labels: Vec::new(),
             jump_patches: Vec::new(),
             last_target: 0,
