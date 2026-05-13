@@ -286,6 +286,18 @@ pub enum Instruction {
         count: u8,
     },
 
+    /// `R[dst] := R[base][R[key]]` where `R[base]` is the named-vararg
+    /// register slot. Path-polymorphic on the runtime type of `R[base]`:
+    /// a real table dispatches through normal indexed get; a `nil`
+    /// sentinel triggers the optimized below-base read (integer index
+    /// `k` in 1..=num_extras, `"n"` for the count, anything else nil).
+    /// Mirrors Lua 5.5 `OP_GETVARG A B C`.
+    VARARGGET {
+        dst: Register,
+        base: Register,
+        key: Register,
+    },
+
     VARARGPREP {
         num_fixed: u8,
     },

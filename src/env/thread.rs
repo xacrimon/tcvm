@@ -43,6 +43,10 @@ pub struct LuaFrame<'gc> {
     pub base: usize,
     pub pc: usize,
     pub num_results: u8,
+    /// Number of caller-supplied arguments beyond `num_params`. `VARARG` and
+    /// `VARARGGET` read from `stack[base - num_extras .. base]`. Set by
+    /// `VARARGPREP` for vararg functions; stays 0 for non-vararg frames.
+    pub num_extras: u32,
     /// Fixup dispatched by `op_return` when this frame unwinds. `None` for
     /// normal calls; set by metamethod/iterator helpers that need
     /// post-return processing.
@@ -111,6 +115,12 @@ pub struct ThreadState<'gc> {
     pub open_upvalues: Vec<Upvalue<'gc>>,
     pub tbc_slots: Vec<usize>,
     pub status: ThreadStatus,
+    /// Dynamic top register. Written by multires producers (`VARARG`
+    /// `count=0`, `CALL`/`TAILCALL` `returns=0`, native multi-return) and
+    /// read by multires consumers (`CALL` `args=0`, `RETURN` `count=0`,
+    /// `SETLIST` `count=0`). Outside those windows the value is undefined
+    /// and must not be relied upon.
+    pub top: usize,
     /// Back-reference to the owning Thread handle, needed for creating open upvalues.
     pub thread_handle: Option<Thread<'gc>>,
     /// A native callback's non-`Return` `CallbackAction` deposited by
@@ -204,6 +214,7 @@ impl<'gc> Thread<'gc> {
             open_upvalues: Vec::new(),
             tbc_slots: Vec::new(),
             status: ThreadStatus::Stopped,
+            top: 0,
             thread_handle: None,
             pending_action: None,
             yield_bottom: None,

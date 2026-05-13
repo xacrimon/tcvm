@@ -481,6 +481,14 @@ impl Func {
         Some(self.0.children().nth(1)?.children().filter_map(Ident::cast))
     }
 
+    pub fn vararg(&self) -> Option<VarArgParam> {
+        self.0
+            .children()
+            .nth(1)?
+            .children()
+            .find_map(VarArgParam::cast)
+    }
+
     pub fn block(&self) -> Option<impl Iterator<Item = Stmt> + '_> {
         Some(self.0.last_child()?.children().filter_map(Stmt::cast))
     }
@@ -493,8 +501,20 @@ impl FuncExpr {
         Some(self.0.first_child()?.children().filter_map(Ident::cast))
     }
 
+    pub fn vararg(&self) -> Option<VarArgParam> {
+        self.0.first_child()?.children().find_map(VarArgParam::cast)
+    }
+
     pub fn block(&self) -> Option<impl Iterator<Item = Stmt> + '_> {
         Some(self.0.last_child()?.children().filter_map(Stmt::cast))
+    }
+}
+
+ast_node!(VarArgParam, T![vararg_param]);
+
+impl VarArgParam {
+    pub fn name(&self) -> Option<Ident> {
+        self.0.first_child().and_then(Ident::cast)
     }
 }
 

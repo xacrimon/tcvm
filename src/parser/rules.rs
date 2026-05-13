@@ -410,7 +410,15 @@ impl<'cache, 'source> Parser<'cache, 'source> {
                     break;
                 }
                 T![...] => {
+                    let vararg = self.start(T![vararg_param]);
                     self.expect(T![...]);
+                    if self.at() == T![ident] {
+                        self.r_ident();
+                    }
+                    vararg.complete(self);
+                    // `...` (and `...name`) must be the last parameter.
+                    self.expect(T![')']);
+                    break;
                 }
                 T![ident] => {
                     self.r_ident();
