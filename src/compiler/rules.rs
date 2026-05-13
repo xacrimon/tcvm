@@ -2208,8 +2208,9 @@ fn compile_func_body(
     let params: Vec<_> = item.args().map(|a| a.collect()).unwrap_or_default();
     let stmts: Vec<_> = item.block().map(|b| b.collect()).unwrap_or_default();
     let arity = params.len() as u8;
+    let is_vararg = item.vararg().is_some();
 
-    let proto = compile_nested(ctx, stmts, params, false, arity)?;
+    let proto = compile_nested(ctx, stmts, params, is_vararg, arity)?;
 
     let proto_idx = ctx.chunk.prototypes.len() as u16;
     ctx.chunk.prototypes.push(proto);
@@ -2408,8 +2409,9 @@ fn compile_expr_func(
     let params: Vec<_> = item.args().map(|a| a.collect()).unwrap_or_default();
     let stmts: Vec<_> = item.block().map(|b| b.collect()).unwrap_or_default();
     let arity = params.len() as u8;
+    let is_vararg = item.vararg().is_some();
 
-    let proto = compile_nested(ctx, stmts, params, false, arity)?;
+    let proto = compile_nested(ctx, stmts, params, is_vararg, arity)?;
 
     let proto_idx = ctx.chunk.prototypes.len() as u16;
     ctx.chunk.prototypes.push(proto);
@@ -2486,7 +2488,12 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
                 // results into the table via SETLIST with `count=0`
                 // (MULTRET). Flush any pending non-multires elements first
                 // so the trailing SETLIST sees a clean slot at pending_base.
-                if is_last && matches!(&value_expr, Expr::FuncCall(_) | Expr::Method(_)) {
+                if is_last
+                    && matches!(
+                        &value_expr,
+                        Expr::FuncCall(_) | Expr::Method(_) | Expr::VarArg
+                    )
+                {
                     if array_pending > 0 {
                         ctx.emit(Instruction::SETLIST {
                             table: dst.0,
@@ -2505,6 +2512,15 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
                         }
                         Expr::Method(call) => {
                             compile_expr_method_call(ctx, call, Want::MultRet)?;
+                        }
+                        Expr::VarArg => {
+                            while ctx.chunk.freereg <= pending_base {
+                                ctx.alloc_register()?;
+                            }
+                            ctx.emit(Instruction::VARARG {
+                                dst: pending_base,
+                                count: 0,
+                            });
                         }
                         _ => unreachable!(),
                     }
@@ -3395,6 +3411,16 @@ fn compile_call_args(
                     compile_expr_method_call(ctx, inner, Want::MultRet)?;
                     return Ok(0);
                 }
+                Expr::VarArg => {
+                    while ctx.chunk.freereg <= expected_reg.0 {
+                        ctx.alloc_register()?;
+                    }
+                    ctx.emit(Instruction::VARARG {
+                        dst: expected_reg.0,
+                        count: 0,
+                    });
+                    return Ok(0);
+                }
                 other => {
                     let arg = compile_expr_to_reg(ctx, other, Some(expected_reg))?;
                     if arg != expected_reg {
@@ -3534,6 +3560,19 @@ fn compile_return_generic(ctx: &mut Ctx, mut exprs: Vec<Expr>) -> Result<(), Com
     // materialisation needs a concrete dst.
     if exprs.len() == 1 {
         let only = exprs.pop().unwrap();
+        // `return ...` propagates every vararg to the caller via MULTRET.
+        if matches!(&only, Expr::VarArg) {
+            let dst = ctx.alloc_register()?;
+            ctx.emit(Instruction::VARARG {
+                dst: dst.0,
+                count: 0,
+            });
+            ctx.emit(Instruction::RETURN {
+                values: dst.0,
+                count: 0,
+            });
+            return Ok(());
+        }
         let mut desc = compile_expr(ctx, only, None)?;
         if !desc.has_jumps()
             && let ExprKind::Reg(reg) = desc.kind
@@ -3585,6 +3624,17 @@ fn compile_return_generic(ctx: &mut Ctx, mut exprs: Vec<Expr>) -> Result<(), Com
                         ctx.alloc_register()?;
                     }
                     compile_expr_method_call(ctx, call, Want::MultRet)?;
+                    multret = true;
+                    break;
+                }
+                Expr::VarArg => {
+                    while ctx.chunk.freereg <= target.0 {
+                        ctx.alloc_register()?;
+                    }
+                    ctx.emit(Instruction::VARARG {
+                        dst: target.0,
+                        count: 0,
+                    });
                     multret = true;
                     break;
                 }

@@ -1642,13 +1642,24 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
 
     match target {
         CallTarget::Lua(closure) => {
-            let cur_base = thread.top_lua().unwrap().base;
+            // Recover the *original* func slot of the current frame in its
+            // own caller — that's where the new (tail-called) frame's
+            // results must ultimately land. If the current frame is a
+            // vararg function whose VARARGPREP shifted its base past extras
+            // at `[base - num_extras .. base]`, those extras vanish with
+            // the tail-call and the new frame collapses back to that slot.
+            let (cur_base, cur_num_extras) = {
+                let f = thread.top_lua().unwrap();
+                (f.base, f.num_extras as usize)
+            };
+            let caller_func_idx = cur_base - 1 - cur_num_extras;
+            let new_base = caller_func_idx + 1;
             // Close upvalues for the current frame BEFORE we overwrite
             // its stack slots with the tail-call's arguments; otherwise
             // an open upvalue pointing into this frame captures the
             // arg value instead of the local it used to reference.
-            close_upvalues(ctx.mutation(), thread, cur_base);
-            // Move function + arguments down to current frame's base.
+            close_upvalues(ctx.mutation(), thread, new_base);
+            // Move function + arguments down to the original func slot.
             // `nargs == 0` is MULTRET — read the runtime count from
             // `thread.top` (set by the most recent multires producer).
             let src_start = func_idx + 1;
@@ -1658,17 +1669,17 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
                 nargs as usize - 1
             };
             for i in 0..nargs {
-                thread.stack[cur_base + i] = thread.stack[src_start + i];
+                thread.stack[new_base + i] = thread.stack[src_start + i];
             }
             // Replace current frame
             let frame = thread.top_lua_mut().unwrap();
             frame.closure = closure;
             frame.pc = 0;
-            // Reset base in case the previous frame's VARARGPREP shifted it.
-            // The tail-call moved args to cur_base; the new frame starts there.
-            frame.base = cur_base;
-            // Recompute num_extras for the new function. Becomes the input to
-            // the new frame's VARARGPREP (if any).
+            // The new frame starts at the original func slot's caller; the
+            // old VARARGPREP shift is discarded along with the old frame.
+            frame.base = new_base;
+            // Recompute num_extras for the new function. Becomes the input
+            // to the new frame's VARARGPREP (if any).
             let num_params = closure.proto.num_params as usize;
             frame.num_extras = if closure.proto.is_vararg {
                 nargs.saturating_sub(num_params) as u32
@@ -1677,17 +1688,17 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
             };
             // num_results stays the same (caller's expectation)
             // Ensure stack is large enough
-            let needed = cur_base + closure.proto.max_stack_size as usize;
+            let needed = new_base + closure.proto.max_stack_size as usize;
             if thread.stack.len() < needed {
                 thread.stack.resize(needed, Value::nil());
             }
             // Nil-fill parameter slots the caller didn't supply.
             for i in nargs..num_params {
-                thread.stack[cur_base + i] = Value::nil();
+                thread.stack[new_base + i] = Value::nil();
             }
             // Rebind ip and registers
             ip = closure.proto.code.as_ptr();
-            registers = unsafe { thread.stack.as_mut_ptr().add(cur_base) };
+            registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
             dispatch!();
         }
         CallTarget::Native(nc) => {
@@ -2385,9 +2396,14 @@ pub(crate) fn frame_return<'gc>(
     values_base: usize,
     nret: usize,
 ) -> FrameReturn {
-    let (cur_base, num_results, continuation) = {
+    let (cur_base, num_results, num_extras, continuation) = {
         let f = thread.top_lua().unwrap();
-        (f.base, f.num_results, f.continuation)
+        (
+            f.base,
+            f.num_results,
+            f.num_extras as usize,
+            f.continuation,
+        )
     };
 
     if let Some(mut cont) = continuation {
@@ -2397,12 +2413,18 @@ pub(crate) fn frame_return<'gc>(
         return FrameReturn::Continuation(cont.func);
     }
 
+    // The caller placed this function at slot `cur_base - 1 - num_extras` —
+    // VARARGPREP shifted the frame's base past the extras (stored at
+    // `[cur_base - num_extras .. cur_base]`), so the func slot lives below
+    // the extras region. For non-vararg frames `num_extras == 0` and this
+    // is just `cur_base - 1`.
     close_upvalues(mc, thread, cur_base);
     close_tbc_vars(mc, thread, cur_base);
     thread.frames.pop();
 
+    let dst_start = cur_base - 1 - num_extras;
+
     if thread.frames.is_empty() {
-        let dst_start = cur_base - 1;
         for i in 0..nret {
             thread.stack[dst_start + i] = thread.stack[values_base + i];
         }
@@ -2410,8 +2432,6 @@ pub(crate) fn frame_return<'gc>(
         thread.status = ThreadStatus::Result { bottom: dst_start };
         return FrameReturn::TopLevel;
     }
-
-    let dst_start = cur_base - 1;
     // `num_results == 0` (the CALL's `returns` operand) is MULTRET: deliver
     // all `nret` values and publish `thread.top` for the next consumer.
     if num_results == 0 {
