@@ -1506,18 +1506,19 @@ extern "rust-preserve-none" fn op_call<'gc>(
                 thread.stack.resize(needed, Value::nil());
             }
             // Nil-fill parameter slots the caller didn't supply.
-            // args == 0 means variable arg count (top-based, not yet supported).
-            let num_extras = if nargs > 0 {
-                let caller_provided = nargs as usize - 1;
-                let num_params = closure.proto.num_params as usize;
-                for i in caller_provided..num_params {
-                    thread.stack[new_base + i] = Value::nil();
-                }
-                if closure.proto.is_vararg {
-                    (caller_provided.saturating_sub(num_params)) as u32
-                } else {
-                    0
-                }
+            // `nargs == 0` is the MULTRET sentinel — caller_provided is read
+            // from `thread.top` (set by the most recent multires producer).
+            let caller_provided = if nargs == 0 {
+                thread.top - new_base
+            } else {
+                nargs as usize - 1
+            };
+            let num_params = closure.proto.num_params as usize;
+            for i in caller_provided..num_params {
+                thread.stack[new_base + i] = Value::nil();
+            }
+            let num_extras = if closure.proto.is_vararg {
+                caller_provided.saturating_sub(num_params) as u32
             } else {
                 0
             };
@@ -1538,7 +1539,7 @@ extern "rust-preserve-none" fn op_call<'gc>(
         CallTarget::Native(nc) => {
             let args_base = func_idx + 1;
             let argc = if nargs == 0 {
-                thread.stack.len() - args_base
+                thread.top - args_base
             } else {
                 nargs as usize - 1
             };
@@ -1589,6 +1590,10 @@ extern "rust-preserve-none" fn op_call<'gc>(
                     }
                     if returns == 0 {
                         thread.stack.truncate(func_idx + retc);
+                        // MULTRET: publish the dynamic top so the next
+                        // multires consumer (outer CALL/RETURN/SETLIST) sees
+                        // the run-time count.
+                        thread.top = func_idx + retc;
                     }
                     registers = unsafe { thread.stack.as_mut_ptr().add(base) };
                     dispatch!();
@@ -1643,8 +1648,14 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
             // arg value instead of the local it used to reference.
             close_upvalues(ctx.mutation(), thread, cur_base);
             // Move function + arguments down to current frame's base.
-            let nargs = if nargs == 0 { 0 } else { nargs as usize - 1 };
+            // `nargs == 0` is MULTRET — read the runtime count from
+            // `thread.top` (set by the most recent multires producer).
             let src_start = func_idx + 1;
+            let nargs = if nargs == 0 {
+                thread.top - src_start
+            } else {
+                nargs as usize - 1
+            };
             for i in 0..nargs {
                 thread.stack[cur_base + i] = thread.stack[src_start + i];
             }
@@ -1681,7 +1692,7 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
         CallTarget::Native(nc) => {
             let args_base = func_idx + 1;
             let argc = if nargs == 0 {
-                thread.stack.len() - args_base
+                thread.top - args_base
             } else {
                 nargs as usize - 1
             };
@@ -1758,8 +1769,14 @@ extern "rust-preserve-none" fn op_return<'gc>(
     let (values, count) = args!(Instruction::RETURN { values, count });
 
     let cur_base = thread.top_lua().unwrap().base;
-    let nret = if count == 0 { 0 } else { count as usize - 1 };
     let values_base = cur_base + values as usize;
+    // `count == 0` is MULTRET — read the run-time count from `thread.top`
+    // (set by the multires producer immediately preceding RETURN).
+    let nret = if count == 0 {
+        thread.top - values_base
+    } else {
+        count as usize - 1
+    };
 
     match frame_return(ctx.mutation(), thread, values_base, nret) {
         FrameReturn::Continuation(func) => {
@@ -1950,10 +1967,20 @@ extern "rust-preserve-none" fn op_setlist<'gc>(
     let Some(t) = reg!(table).get_table() else {
         raise!();
     };
-    let n = count as usize;
+    // `count == 0` is MULTRET — number of elements is determined by
+    // `thread.top` relative to the slot after the table register. The
+    // count can exceed u8 here (a VARARG count=0 spread can produce
+    // hundreds of elements), so we use usize-indexed register access.
+    let base = thread.top_lua().unwrap().base;
+    let elements_start = base + table as usize + 1;
+    let n = if count == 0 {
+        thread.top - elements_start
+    } else {
+        count as usize
+    };
     let off = offset as i64;
     for i in 1..=n {
-        let val = reg!(table + i as u8);
+        let val = thread.stack[elements_start + i - 1];
         let key = Value::integer(off + i as i64);
         t.raw_set(ctx, key, val);
     }
@@ -2327,17 +2354,22 @@ pub(crate) fn frame_return<'gc>(
     }
 
     let dst_start = cur_base - 1;
-    let wanted = if num_results == 0 {
-        0
+    // `num_results == 0` (the CALL's `returns` operand) is MULTRET: deliver
+    // all `nret` values and publish `thread.top` for the next consumer.
+    if num_results == 0 {
+        for i in 0..nret {
+            thread.stack[dst_start + i] = thread.stack[values_base + i];
+        }
+        thread.top = dst_start + nret;
     } else {
-        num_results as usize - 1
-    };
-    let to_copy = nret.min(wanted);
-    for i in 0..to_copy {
-        thread.stack[dst_start + i] = thread.stack[values_base + i];
-    }
-    for i in to_copy..wanted {
-        thread.stack[dst_start + i] = Value::nil();
+        let wanted = num_results as usize - 1;
+        let to_copy = nret.min(wanted);
+        for i in 0..to_copy {
+            thread.stack[dst_start + i] = thread.stack[values_base + i];
+        }
+        for i in to_copy..wanted {
+            thread.stack[dst_start + i] = Value::nil();
+        }
     }
 
     // If the parent isn't a Lua frame (Sequence/WaitThread/etc.), the
