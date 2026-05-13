@@ -1250,6 +1250,65 @@ pub fn compile<'gc>(
     Ok(chunk.assemble(ctx.mutation()))
 }
 
+/// Overwrite the six prologue slots reserved at function entry with
+/// the named-vararg materialization sequence. Called from
+/// `compile_function_to_chunk`'s epilogue when escape analysis on the
+/// `args` local determined that materialization is required.
+///
+/// Layout:
+/// ```text
+///   slot+0  NEWTABLE   args_reg                    ; fresh empty table
+///   slot+1  VARARG     tmp_base count=0            ; copy all extras + set top
+///   slot+2  SETLIST    args_reg count=0 offset=0   ; pop tmp_base..top into table
+///   slot+3  LOAD       n_key_reg, "n"              ; const string key
+///   slot+4  VARARGGET  count_reg, nil_sentinel, n_key
+///   slot+5  SETFIELD   args_reg "n" count_reg
+/// ```
+///
+/// Slot 4 deliberately uses the nil-sentinel register as `base` so the
+/// handler falls into its optimized below-base read for `"n"` — at
+/// this point `R[args_reg]` is already a table (just populated by
+/// slots 0–2), and reading `"n"` from the table would observe the
+/// missing field (still nil) instead of `num_extras`.
+fn patch_vararg_materialization(
+    ctx: &mut Ctx,
+    info: &VarargInfo,
+) -> Result<(), CompileError> {
+    let n_key = ctx.alloc_string_constant(b"n")?;
+    let slot = info.prologue_slot;
+    let tape = &mut ctx.chunk.tape;
+    tape[slot] = Instruction::NEWTABLE {
+        dst: info.args_reg,
+    };
+    tape[slot + 1] = Instruction::VARARG {
+        dst: info.tmp_base,
+        count: 0,
+    };
+    tape[slot + 2] = Instruction::SETLIST {
+        table: info.args_reg,
+        count: 0,
+        offset: 0,
+    };
+    tape[slot + 3] = Instruction::LOAD {
+        dst: info.n_key_reg,
+        idx: n_key,
+    };
+    tape[slot + 4] = Instruction::VARARGGET {
+        dst: info.count_reg,
+        base: info.nil_sentinel_reg,
+        key: info.n_key_reg,
+    };
+    let (key_idx, ic_idx) = ctx.alloc_field_key(b"n")?;
+    let tape = &mut ctx.chunk.tape;
+    tape[slot + 5] = Instruction::SETFIELD {
+        src: info.count_reg,
+        table: info.args_reg,
+        ic_idx,
+        key_idx,
+    };
+    Ok(())
+}
+
 /// Compile a function body into a Chunk (not yet assembled).
 #[allow(clippy::too_many_arguments)]
 fn compile_function_to_chunk<'gc, 'a>(
@@ -1358,6 +1417,19 @@ fn compile_function_to_chunk<'gc, 'a>(
     // Compile the body
     for stmt in stmts {
         compile_stmt(&mut ctx, stmt)?;
+    }
+
+    // Named-vararg epilogue patch. If `args` escaped the function via a
+    // closure upvalue or was used as a bare value (anything other than
+    // `args[exp]` / `args.id` base position), the reserved prologue
+    // slots are overwritten with a materialization sequence that
+    // promotes `R[args_reg]` from the nil sentinel to a real vararg
+    // table. `VARARGGET` and downstream uses transparently switch to
+    // the table path on the next instruction.
+    if let Some(info) = ctx.chunk.vararg_info
+        && (info.used_as_non_base || info.captured)
+    {
+        patch_vararg_materialization(&mut ctx, &info)?;
     }
 
     // Emit implicit return at the end. The frame already terminates when
