@@ -536,6 +536,7 @@ fn schedule_call_at<'gc>(
             base,
             pc: 0,
             num_results: caller_returns,
+            num_extras: 0,
             continuation: None,
         });
         Ok(())

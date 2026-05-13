@@ -1520,6 +1520,7 @@ extern "rust-preserve-none" fn op_call<'gc>(
                 base: new_base,
                 pc: 0,
                 num_results: returns,
+                num_extras: 0,
                 continuation: None,
             });
             // Rebind ip and registers to new frame
@@ -2597,6 +2598,7 @@ fn schedule_meta_call<'gc>(
         // reads return values directly from the stack via `cont.results_base`.
         pc: 0,
         num_results: 0,
+        num_extras: 0,
         continuation: Some(cont),
     });
 
