@@ -69,6 +69,10 @@ test!(declare, "test-files/declare.lua");
 test!(function, "test-files/function.lua");
 test!(hello, "test-files/hello.lua");
 test!(if, "test-files/if.lua");
+test!(
+    issue_65_conditional_return,
+    "test-files/issue_65_conditional_return.lua"
+);
 test!(jens, "test-files/jens.lua");
 test!(logic, "test-files/logic.lua");
 test!(literal, "test-files/literal.lua");

@@ -469,6 +469,9 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
 
     fn set_label(&mut self, label: u16, offset: usize) {
         self.chunk.labels[label as usize] = offset;
+        if offset > self.chunk.last_target {
+            self.chunk.last_target = offset;
+        }
     }
 
     fn emit_jump(&mut self, label: u16) {
@@ -566,6 +569,9 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                 Instruction::JMP { offset: o } => *o = offset,
                 _ => panic!("jump-list entry is not a JMP"),
             }
+        }
+        if target > self.chunk.last_target {
+            self.chunk.last_target = target;
         }
     }
 
@@ -1290,12 +1296,19 @@ fn compile_function_to_chunk<'gc, 'a>(
         compile_stmt(&mut ctx, stmt)?;
     }
 
-    // Emit implicit return at the end (skip if the last instruction already
-    // terminates the frame — RETURN, or TAILCALL which is self-unwinding).
-    let needs_return = !matches!(
+    // Emit implicit return at the end. The frame already terminates when
+    // both: (a) the physically last instruction is RETURN/TAILCALL, and
+    // (b) no forward jump merges into the current position (otherwise the
+    // jump's falsy/skip edge falls through past the conditional return).
+    // Mirrors LuaJIT's `fs_fixup_ret`: `lastpc <= fs->lasttarget` flags a
+    // merge point at the current PC; without this check we'd miss the case
+    // `if cond then return end` at the tail of a function (issue #65).
+    let last_pc = ctx.chunk.tape.len();
+    let last_is_terminator = matches!(
         ctx.chunk.tape.last(),
         Some(Instruction::RETURN { .. } | Instruction::TAILCALL { .. }),
     );
+    let needs_return = last_pc <= ctx.chunk.last_target || !last_is_terminator;
     if needs_return {
         ctx.emit(Instruction::RETURN {
             values: 0,

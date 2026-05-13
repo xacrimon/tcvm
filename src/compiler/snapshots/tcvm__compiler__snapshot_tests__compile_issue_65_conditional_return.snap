@@ -1,0 +1,27 @@
+---
+source: src/compiler/snapshot_tests.rs
+assertion_line: 72
+expression: output
+---
+; function (params=0, vararg=true, stack=4, upvalues=1)
+; constants:
+;   K0 = 1
+; upvalues:
+;   U0 = local R0
+; code:
+0000  VARARGPREP      fixed=0
+0001  CLOSURE         R0 P0
+0002  MOVE            R1 R0
+0003  CALL            R1 args=1 ret=1
+0004  LOAD            R1 K0  ; 1
+0005  NOT             R2 R1
+0006  TEST            R2 inv=false
+0007  JMP             +2
+0008  LOAD            R3 K0  ; 1
+0009  RETURN          R3 count=2
+0010  RETURN          R0 count=1
+
+; prototype 0:
+  ; function (params=0, vararg=false, stack=0, upvalues=0)
+  ; code:
+  0000  RETURN          R0 count=1

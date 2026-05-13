@@ -194,6 +194,11 @@ pub struct Chunk<'gc> {
     pub(super) is_vararg: bool,
     pub(super) labels: Vec<usize>,
     pub(super) jump_patches: Vec<(usize, u16)>,
+    /// Highest bytecode position that any label has resolved to or that any
+    /// jump list has been patched to. Used at end-of-function to detect
+    /// whether fall-through to the implicit RETURN is reachable from a
+    /// forward jump (LuaJIT-style `lasttarget`).
+    pub(super) last_target: usize,
     pub(super) source: Option<LuaString<'gc>>,
     /// Number of IC slots reserved so far. Incremented once per emitted
     /// GETFIELD/SETFIELD/GETTABUP/SETTABUP. The final count seeds the
@@ -215,6 +220,7 @@ impl<'gc> Chunk<'gc> {
             is_vararg: false,
             labels: Vec::new(),
             jump_patches: Vec::new(),
+            last_target: 0,
             source: None,
             next_ic_idx: 0,
         }
