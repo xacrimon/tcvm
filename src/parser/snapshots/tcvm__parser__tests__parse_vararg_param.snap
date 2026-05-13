@@ -1,0 +1,141 @@
+---
+source: src/parser/mod.rs
+expression: syntax_tree
+---
+Root@0..181
+  DeclStmt@0..35
+    Local@0..5 "local"
+    FuncStmt@5..35
+      Function@5..13 "function"
+      Ident@13..14
+        Ident@13..14 "f"
+      FuncArgs@14..23
+        LParen@14..15 "("
+        Ident@15..16
+          Ident@15..16 "a"
+        Comma@16..17 ","
+        Ident@17..18
+          Ident@17..18 "b"
+        Comma@18..19 ","
+        VarArgParam@19..22
+          TDot@19..22 "..."
+        RParen@22..23 ")"
+      StmtList@23..32
+        ReturnStmt@23..32
+          Return@23..29 "return"
+          ExprList@29..32
+            Ident@29..30
+              Ident@29..30 "a"
+            Comma@30..31 ","
+            Ident@31..32
+              Ident@31..32 "b"
+      End@32..35 "end"
+  DeclStmt@35..73
+    Local@35..40 "local"
+    FuncStmt@40..73
+      Function@40..48 "function"
+      Ident@48..49
+        Ident@48..49 "g"
+      FuncArgs@49..60
+        LParen@49..50 "("
+        Ident@50..51
+          Ident@50..51 "a"
+        Comma@51..52 ","
+        VarArgParam@52..59
+          TDot@52..55 "..."
+          Ident@55..59
+            Ident@55..59 "args"
+        RParen@59..60 ")"
+      StmtList@60..70
+        ReturnStmt@60..70
+          Return@60..66 "return"
+          ExprList@66..70
+            Ident@66..70
+              Ident@66..70 "args"
+      End@70..73 "end"
+  DeclStmt@73..104
+    Local@73..78 "local"
+    FuncStmt@78..104
+      Function@78..86 "function"
+      Ident@86..87
+        Ident@86..87 "h"
+      FuncArgs@87..92
+        LParen@87..88 "("
+        VarArgParam@88..91
+          TDot@88..91 "..."
+        RParen@91..92 ")"
+      StmtList@92..101
+        ReturnStmt@92..101
+          Return@92..98 "return"
+          ExprList@98..101
+            VarArgExpr@98..101
+              TDot@98..101 "..."
+      End@101..104 "end"
+  DeclStmt@104..140
+    Local@104..109 "local"
+    FuncStmt@109..140
+      Function@109..117 "function"
+      Ident@117..118
+        Ident@117..118 "k"
+      FuncArgs@118..127
+        LParen@118..119 "("
+        VarArgParam@119..126
+          TDot@119..122 "..."
+          Ident@122..126
+            Ident@122..126 "rest"
+        RParen@126..127 ")"
+      StmtList@127..137
+        ReturnStmt@127..137
+          Return@127..133 "return"
+          ExprList@133..137
+            Ident@133..137
+              Ident@133..137 "rest"
+      End@137..140 "end"
+  ReturnStmt@140..181
+    Return@140..146 "return"
+    ExprList@146..181
+      FuncCall@146..154
+        Ident@146..147
+          Ident@146..147 "f"
+        FuncArgs@147..154
+          LParen@147..148 "("
+          LiteralExpr@148..149
+            Int@148..149 "1"
+          Comma@149..150 ","
+          LiteralExpr@150..151
+            Int@150..151 "2"
+          Comma@151..152 ","
+          LiteralExpr@152..153
+            Int@152..153 "3"
+          RParen@153..154 ")"
+      Comma@154..155 ","
+      FuncCall@155..163
+        Ident@155..156
+          Ident@155..156 "g"
+        FuncArgs@156..163
+          LParen@156..157 "("
+          LiteralExpr@157..159
+            Int@157..159 "10"
+          Comma@159..160 ","
+          LiteralExpr@160..162
+            Int@160..162 "20"
+          RParen@162..163 ")"
+      Comma@163..164 ","
+      FuncCall@164..177
+        Ident@164..165
+          Ident@164..165 "h"
+        FuncArgs@165..177
+          LParen@165..166 "("
+          LiteralExpr@166..170
+            True@166..170 "true"
+          Comma@170..171 ","
+          LiteralExpr@171..176
+            False@171..176 "false"
+          RParen@176..177 ")"
+      Comma@177..178 ","
+      FuncCall@178..181
+        Ident@178..179
+          Ident@178..179 "k"
+        FuncArgs@179..181
+          LParen@179..180 "("
+          RParen@180..181 ")"
