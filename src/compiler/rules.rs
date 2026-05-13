@@ -2468,12 +2468,55 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
     // and after each Map/Generic SETTABLE.
     let pending_base = ctx.chunk.freereg;
 
-    for entry in item.entries() {
+    // Materialize the entry list up front so we can recognize the last
+    // array entry — that's the multires hook (`{1, 2, f()}` /
+    // `{..., a, b, f()}` should spread the call's results, not adjust to one).
+    let entries: Vec<TableEntry> = item.entries().collect();
+    let total = entries.len();
+
+    for (i, entry) in entries.into_iter().enumerate() {
+        let is_last = i + 1 == total;
         match entry {
             TableEntry::Array(arr) => {
                 let value_expr = arr
                     .value()
                     .ok_or_else(|| ice("table array without value"))?;
+
+                // Last array entry that's a call expression spreads its
+                // results into the table via SETLIST with `count=0`
+                // (MULTRET). Flush any pending non-multires elements first
+                // so the trailing SETLIST sees a clean slot at pending_base.
+                if is_last && matches!(&value_expr, Expr::FuncCall(_) | Expr::Method(_)) {
+                    if array_pending > 0 {
+                        ctx.emit(Instruction::SETLIST {
+                            table: dst.0,
+                            count: array_pending,
+                            offset: array_count - array_pending as u16,
+                        });
+                        array_pending = 0;
+                        ctx.chunk.freereg = pending_base;
+                    }
+                    while ctx.chunk.freereg < pending_base {
+                        ctx.alloc_register()?;
+                    }
+                    match value_expr {
+                        Expr::FuncCall(call) => {
+                            compile_expr_func_call(ctx, call, Want::MultRet)?;
+                        }
+                        Expr::Method(call) => {
+                            compile_expr_method_call(ctx, call, Want::MultRet)?;
+                        }
+                        _ => unreachable!(),
+                    }
+                    ctx.emit(Instruction::SETLIST {
+                        table: dst.0,
+                        count: 0,
+                        offset: array_count,
+                    });
+                    ctx.chunk.freereg = pending_base;
+                    continue;
+                }
+
                 // Compile the value into the next array slot (dst+1+pending).
                 let slot = RegisterIndex(pending_base + array_pending);
                 let val = compile_expr_to_reg(ctx, value_expr, Some(slot))?;
@@ -3102,12 +3145,19 @@ fn compile_logical_or_desc(
 
 /// Compile the target expression and arguments of a plain (non-method)
 /// call into consecutive registers `func`, `func+1`, `func+2`, ... ready
-/// for a `CALL` or `TAILCALL` instruction. Returns the function register
-/// and argument count (excluding the function slot itself).
+/// for a `CALL` or `TAILCALL` instruction.
+///
+/// Returns `(func, args_wire)` where `args_wire` is the value the caller
+/// should write into the CALL/TAILCALL's `args` operand: `n + 1` for a
+/// fixed-arity call carrying `n` arguments, or `0` (MULTRET) when the
+/// last argument was itself a multires expression (`f(g())`,
+/// `f(obj:m())`) — in that case the inner call propagated `returns=0`,
+/// so the outer call reads `thread.top` at run time to determine its
+/// argc.
 fn emit_func_call_setup(
     ctx: &mut Ctx,
     item: &FuncCall,
-) -> Result<(RegisterIndex, usize), CompileError> {
+) -> Result<(RegisterIndex, u8), CompileError> {
     let target = item
         .target()
         .ok_or_else(|| ice("func call without target"))?;
@@ -3140,22 +3190,10 @@ fn emit_func_call_setup(
 
     let args: Vec<_> = item.args().map(|a| a.collect()).unwrap_or_default();
     let nargs = args.len();
+    let args_wire = compile_call_args(ctx, args, func, 1)?;
+    debug_assert!(args_wire == 0 || args_wire as usize == nargs + 1);
 
-    for (i, arg_expr) in args.into_iter().enumerate() {
-        let expected_reg = RegisterIndex(func.0 + 1 + i as u8);
-        let arg = compile_expr_to_reg(ctx, arg_expr, Some(expected_reg))?;
-        if arg != expected_reg {
-            while ctx.chunk.freereg <= expected_reg.0 {
-                ctx.alloc_register()?;
-            }
-            ctx.emit(Instruction::MOVE {
-                dst: expected_reg.0,
-                src: arg.0,
-            });
-        }
-    }
-
-    Ok((func, nargs))
+    Ok((func, args_wire))
 }
 
 /// Emit a `CALL` for the given function-call expression.
@@ -3171,7 +3209,7 @@ fn compile_expr_func_call(
     item: FuncCall,
     want: Want,
 ) -> Result<Vec<RegisterIndex>, CompileError> {
-    let (func, nargs) = emit_func_call_setup(ctx, &item)?;
+    let (func, args_wire) = emit_func_call_setup(ctx, &item)?;
 
     let returns = match want {
         Want::Exact(n) => n + 1,
@@ -3179,7 +3217,7 @@ fn compile_expr_func_call(
     };
     ctx.emit(Instruction::CALL {
         func: func.0,
-        args: nargs as u8 + 1,
+        args: args_wire,
         returns,
     });
 
@@ -3209,10 +3247,10 @@ fn compile_expr_func_call(
 /// path replaces the current frame, the native path goes through
 /// `frame_return`).
 fn compile_tail_func_call(ctx: &mut Ctx, item: FuncCall) -> Result<(), CompileError> {
-    let (func, nargs) = emit_func_call_setup(ctx, &item)?;
+    let (func, args_wire) = emit_func_call_setup(ctx, &item)?;
     ctx.emit(Instruction::TAILCALL {
         func: func.0,
-        args: nargs as u8 + 1,
+        args: args_wire,
     });
     // Frame is about to be torn down; conservatively snap freereg to func
     // so any post-TAILCALL code in the compiler (there shouldn't be any
@@ -3225,10 +3263,10 @@ fn compile_tail_func_call(ctx: &mut Ctx, item: FuncCall) -> Result<(), CompileEr
 /// CALL variant, but emits `TAILCALL` and does not produce a result
 /// register list.
 fn compile_tail_method_call(ctx: &mut Ctx, item: MethodCall) -> Result<(), CompileError> {
-    let (func, nargs) = emit_method_call_setup(ctx, &item)?;
+    let (func, args_wire) = emit_method_call_setup(ctx, &item)?;
     ctx.emit(Instruction::TAILCALL {
         func: func.0,
-        args: nargs as u8 + 1,
+        args: args_wire,
     });
     ctx.chunk.freereg = func.0;
     Ok(())
@@ -3245,20 +3283,20 @@ fn compile_tail_method_call(ctx: &mut Ctx, item: MethodCall) -> Result<(), Compi
 fn compile_stmt_expr(ctx: &mut Ctx, item: Expr) -> Result<(), CompileError> {
     match item {
         Expr::FuncCall(call) => {
-            let (func, nargs) = emit_func_call_setup(ctx, &call)?;
+            let (func, args_wire) = emit_func_call_setup(ctx, &call)?;
             ctx.emit(Instruction::CALL {
                 func: func.0,
-                args: nargs as u8 + 1,
+                args: args_wire,
                 returns: 1,
             });
             ctx.chunk.freereg = func.0;
             Ok(())
         }
         Expr::Method(call) => {
-            let (func, nargs) = emit_method_call_setup(ctx, &call)?;
+            let (func, args_wire) = emit_method_call_setup(ctx, &call)?;
             ctx.emit(Instruction::CALL {
                 func: func.0,
-                args: nargs as u8 + 1,
+                args: args_wire,
                 returns: 1,
             });
             ctx.chunk.freereg = func.0;
@@ -3280,7 +3318,7 @@ fn compile_stmt_expr(ctx: &mut Ctx, item: Expr) -> Result<(), CompileError> {
 fn emit_method_call_setup(
     ctx: &mut Ctx,
     item: &MethodCall,
-) -> Result<(RegisterIndex, usize), CompileError> {
+) -> Result<(RegisterIndex, u8), CompileError> {
     let object_expr = item
         .object()
         .ok_or_else(|| ice("method call without object"))?;
@@ -3311,23 +3349,80 @@ fn emit_method_call_setup(
     }
 
     let args: Vec<_> = item.args().map(|a| a.collect()).unwrap_or_default();
-    let nargs = args.len() + 1; // +1 for self
+    let args_wire = compile_call_args(ctx, args, func, 2)?;
+    Ok((func, args_wire))
+}
+
+/// Compile each argument expression into the consecutive register slot
+/// starting at `func + offset` (offset is `1` for a plain call, `2` for
+/// a method call so the implicit `self` slot is preserved). If the last
+/// argument is itself a `FuncCall` / `MethodCall`, lower it with
+/// `Want::MultRet` so the inner call emits `returns == 0` and the outer
+/// call's `args` operand becomes the MULTRET sentinel (`0`).
+///
+/// Returns the wire-encoded `args` value: `0` for MULTRET, else
+/// `total_nargs + 1` (where `total_nargs` includes the implicit
+/// `self` for a method call).
+fn compile_call_args(
+    ctx: &mut Ctx,
+    args: Vec<Expr>,
+    func: RegisterIndex,
+    offset: u8,
+) -> Result<u8, CompileError> {
+    let n = args.len();
+    let total = n as u8 + (offset - 1); // for method calls: +1 for self
 
     for (i, arg_expr) in args.into_iter().enumerate() {
-        let expected_reg = RegisterIndex(func.0 + 2 + i as u8);
-        let arg = compile_expr_to_reg(ctx, arg_expr, Some(expected_reg))?;
-        if arg != expected_reg {
-            while ctx.chunk.freereg <= expected_reg.0 {
-                ctx.alloc_register()?;
+        let is_last = i + 1 == n;
+        let expected_reg = RegisterIndex(func.0 + offset + i as u8);
+
+        if is_last {
+            match arg_expr {
+                Expr::FuncCall(inner) => {
+                    // Bring freereg up to expected_reg so the inner call's
+                    // freshly-allocated func slot lands there, and its
+                    // results overwrite that slot in place.
+                    while ctx.chunk.freereg < expected_reg.0 {
+                        ctx.alloc_register()?;
+                    }
+                    compile_expr_func_call(ctx, inner, Want::MultRet)?;
+                    return Ok(0);
+                }
+                Expr::Method(inner) => {
+                    while ctx.chunk.freereg < expected_reg.0 {
+                        ctx.alloc_register()?;
+                    }
+                    compile_expr_method_call(ctx, inner, Want::MultRet)?;
+                    return Ok(0);
+                }
+                other => {
+                    let arg = compile_expr_to_reg(ctx, other, Some(expected_reg))?;
+                    if arg != expected_reg {
+                        while ctx.chunk.freereg <= expected_reg.0 {
+                            ctx.alloc_register()?;
+                        }
+                        ctx.emit(Instruction::MOVE {
+                            dst: expected_reg.0,
+                            src: arg.0,
+                        });
+                    }
+                }
             }
-            ctx.emit(Instruction::MOVE {
-                dst: expected_reg.0,
-                src: arg.0,
-            });
+        } else {
+            let arg = compile_expr_to_reg(ctx, arg_expr, Some(expected_reg))?;
+            if arg != expected_reg {
+                while ctx.chunk.freereg <= expected_reg.0 {
+                    ctx.alloc_register()?;
+                }
+                ctx.emit(Instruction::MOVE {
+                    dst: expected_reg.0,
+                    src: arg.0,
+                });
+            }
         }
     }
 
-    Ok((func, nargs))
+    Ok(total + 1)
 }
 
 /// Method-call equivalent of [`compile_expr_func_call`]. Same `Want`
@@ -3338,7 +3433,7 @@ fn compile_expr_method_call(
     item: MethodCall,
     want: Want,
 ) -> Result<Vec<RegisterIndex>, CompileError> {
-    let (func, nargs) = emit_method_call_setup(ctx, &item)?;
+    let (func, args_wire) = emit_method_call_setup(ctx, &item)?;
 
     let returns = match want {
         Want::Exact(n) => n + 1,
@@ -3346,7 +3441,7 @@ fn compile_expr_method_call(
     };
     ctx.emit(Instruction::CALL {
         func: func.0,
-        args: nargs as u8 + 1,
+        args: args_wire,
         returns,
     });
 
@@ -3468,24 +3563,61 @@ fn compile_return_generic(ctx: &mut Ctx, mut exprs: Vec<Expr>) -> Result<(), Com
 
     let n = exprs.len();
     let first_reg = ctx.alloc_register()?;
+    let last_idx = n - 1;
+    let mut multret = false;
 
     for (i, expr) in exprs.into_iter().enumerate() {
         let target = RegisterIndex(first_reg.0 + i as u8);
-        let reg = compile_expr_to_reg(ctx, expr, Some(target))?;
-        if reg != target {
-            while ctx.chunk.freereg <= target.0 {
-                ctx.alloc_register()?;
+        let is_last = i == last_idx;
+
+        if is_last {
+            match expr {
+                Expr::FuncCall(call) => {
+                    while ctx.chunk.freereg < target.0 {
+                        ctx.alloc_register()?;
+                    }
+                    compile_expr_func_call(ctx, call, Want::MultRet)?;
+                    multret = true;
+                    break;
+                }
+                Expr::Method(call) => {
+                    while ctx.chunk.freereg < target.0 {
+                        ctx.alloc_register()?;
+                    }
+                    compile_expr_method_call(ctx, call, Want::MultRet)?;
+                    multret = true;
+                    break;
+                }
+                other => {
+                    let reg = compile_expr_to_reg(ctx, other, Some(target))?;
+                    if reg != target {
+                        while ctx.chunk.freereg <= target.0 {
+                            ctx.alloc_register()?;
+                        }
+                        ctx.emit(Instruction::MOVE {
+                            dst: target.0,
+                            src: reg.0,
+                        });
+                    }
+                }
             }
-            ctx.emit(Instruction::MOVE {
-                dst: target.0,
-                src: reg.0,
-            });
+        } else {
+            let reg = compile_expr_to_reg(ctx, expr, Some(target))?;
+            if reg != target {
+                while ctx.chunk.freereg <= target.0 {
+                    ctx.alloc_register()?;
+                }
+                ctx.emit(Instruction::MOVE {
+                    dst: target.0,
+                    src: reg.0,
+                });
+            }
         }
     }
 
     ctx.emit(Instruction::RETURN {
         values: first_reg.0,
-        count: n as u8 + 1,
+        count: if multret { 0 } else { n as u8 + 1 },
     });
 
     Ok(())
