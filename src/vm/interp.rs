@@ -64,6 +64,7 @@ static HANDLERS: &[Handler] = &[
     op_setlist,
     op_closure,
     op_vararg,
+    op_varargget,
     op_varargprep,
     op_errnnil,
     op_nop,
@@ -2097,6 +2098,63 @@ extern "rust-preserve-none" fn op_vararg<'gc>(
             *reg!(mut dst + i as u8) = Value::nil();
         }
     }
+    dispatch!();
+}
+
+/// `R[dst] := R[base][R[key]]` where `R[base]` is the register slot the
+/// named vararg local lives in.
+///
+/// Two paths, distinguished at run time by inspecting `R[base]`:
+/// - **Materialized**: `R[base]` is a real table (`function f(...args)`
+///   where escape analysis forced the compiler's prologue patch to
+///   build a vararg table). Falls through to a raw indexed get — the
+///   vararg table is opaque to user metatables since the compiler is
+///   the sole writer.
+/// - **Optimized**: `R[base]` is the sentinel `nil`. The handler reads
+///   the below-base vararg region directly, treating integer keys
+///   `1..=num_extras` as 1-indexed extras, the string `"n"` as the
+///   extras count, and everything else as `nil`.
+///
+/// Mirrors Lua 5.5 `OP_GETVARG`.
+#[inline(never)]
+extern "rust-preserve-none" fn op_varargget<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+) -> Result<(), Box<Error>> {
+    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    let (dst, base, key) = args!(Instruction::VARARGGET { dst, base, key });
+    let base_val = reg!(base);
+    let key_val = reg!(key);
+    let v = if let Some(t) = base_val.get_table() {
+        // Materialized path: raw indexed get. The compiler-built vararg
+        // table has no metatable, so a raw read suffices.
+        t.inner().borrow().raw_get(key_val)
+    } else {
+        // Optimized path: read from below-base.
+        let frame = thread.top_lua().unwrap();
+        let num_extras = frame.num_extras as usize;
+        let extras_start = frame.base - num_extras;
+        if let Some(k) = key_val.get_integer() {
+            if k >= 1 && (k as usize) <= num_extras {
+                thread.stack[extras_start + (k as usize) - 1]
+            } else {
+                Value::nil()
+            }
+        } else if let Some(s) = key_val.get_string() {
+            if s.as_bytes() == b"n" {
+                Value::integer(num_extras as i64)
+            } else {
+                Value::nil()
+            }
+        } else {
+            Value::nil()
+        }
+    };
+    *reg!(mut dst) = v;
     dispatch!();
 }
 

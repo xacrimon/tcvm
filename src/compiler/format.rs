@@ -225,6 +225,9 @@ fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -> String {
             format!("CLOSURE         R{dst} P{proto}")
         }
         Instruction::VARARG { dst, count } => format!("VARARG          R{dst} count={count}"),
+        Instruction::VARARGGET { dst, base, key } => {
+            format!("VARARGGET       R{dst} R{base} R{key}")
+        }
         Instruction::VARARGPREP { num_fixed } => {
             format!("VARARGPREP      fixed={num_fixed}")
         }
