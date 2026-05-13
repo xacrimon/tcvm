@@ -1507,20 +1507,27 @@ extern "rust-preserve-none" fn op_call<'gc>(
             }
             // Nil-fill parameter slots the caller didn't supply.
             // args == 0 means variable arg count (top-based, not yet supported).
-            if nargs > 0 {
+            let num_extras = if nargs > 0 {
                 let caller_provided = nargs as usize - 1;
                 let num_params = closure.proto.num_params as usize;
                 for i in caller_provided..num_params {
                     thread.stack[new_base + i] = Value::nil();
                 }
-            }
+                if closure.proto.is_vararg {
+                    (caller_provided.saturating_sub(num_params)) as u32
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
             // Push new call frame
             thread.push_lua(LuaFrame {
                 closure,
                 base: new_base,
                 pc: 0,
                 num_results: returns,
-                num_extras: 0,
+                num_extras,
                 continuation: None,
             });
             // Rebind ip and registers to new frame
@@ -1645,6 +1652,17 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
             let frame = thread.top_lua_mut().unwrap();
             frame.closure = closure;
             frame.pc = 0;
+            // Reset base in case the previous frame's VARARGPREP shifted it.
+            // The tail-call moved args to cur_base; the new frame starts there.
+            frame.base = cur_base;
+            // Recompute num_extras for the new function. Becomes the input to
+            // the new frame's VARARGPREP (if any).
+            let num_params = closure.proto.num_params as usize;
+            frame.num_extras = if closure.proto.is_vararg {
+                nargs.saturating_sub(num_params) as u32
+            } else {
+                0
+            };
             // num_results stays the same (caller's expectation)
             // Ensure stack is large enough
             let needed = cur_base + closure.proto.max_stack_size as usize;
@@ -1652,7 +1670,6 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
                 thread.stack.resize(needed, Value::nil());
             }
             // Nil-fill parameter slots the caller didn't supply.
-            let num_params = closure.proto.num_params as usize;
             for i in nargs..num_params {
                 thread.stack[cur_base + i] = Value::nil();
             }
@@ -2005,12 +2022,18 @@ extern "rust-preserve-none" fn op_closure<'gc>(
 // ---------------------------------------------------------------------------
 
 /// Copy varargs into R[dst], R[dst+1], ...
+///
+/// `count == 0` is the MULTRET sentinel: copy *all* extras and update
+/// `thread.top` to `base + dst + num_extras`. Grows the stack if necessary
+/// and rebinds the cached `registers` pointer after a potential reallocation.
+///
+/// `count > 0` copies up to `count - 1` extras, nil-padding the shortfall.
 #[inline(never)]
 extern "rust-preserve-none" fn op_vararg<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
-    registers: Registers<'gc, '_>,
+    mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -2018,35 +2041,78 @@ extern "rust-preserve-none" fn op_vararg<'gc>(
     let (dst, count) = args!(Instruction::VARARG { dst, count });
     let frame = thread.top_lua().unwrap();
     let base = frame.base;
-    let num_fixed = frame.closure.proto.num_params as usize;
-    // Varargs are stored below base: stack[base - num_varargs .. base - num_fixed]
-    // Actually they're at stack[base - num_extra .. base] where the caller put them
-    // For now: the varargs sit in the slots between (base - num_extra) and base
-    // The exact number of varargs depends on how many args were actually passed.
-    // See #26: track actual arg count to properly copy varargs.
-    let wanted = if count == 0 { 0 } else { count as usize - 1 };
-    for i in 0..wanted {
-        *reg!(mut dst + i as u8) = Value::nil();
+    let num_extras = frame.num_extras as usize;
+    let extras_start = base - num_extras;
+    let target = base + dst as usize;
+
+    if count == 0 {
+        // MULTRET: copy all extras and publish the new dynamic top.
+        let new_top = target + num_extras;
+        if thread.stack.len() < new_top {
+            thread.stack.resize(new_top, Value::nil());
+            registers = unsafe { thread.stack.as_mut_ptr().add(base) };
+        }
+        if num_extras > 0 {
+            thread
+                .stack
+                .copy_within(extras_start..extras_start + num_extras, target);
+        }
+        thread.top = new_top;
+    } else {
+        let wanted = count as usize - 1;
+        let to_copy = num_extras.min(wanted);
+        if to_copy > 0 {
+            thread
+                .stack
+                .copy_within(extras_start..extras_start + to_copy, target);
+        }
+        for i in to_copy..wanted {
+            *reg!(mut dst + i as u8) = Value::nil();
+        }
     }
     dispatch!();
 }
 
-/// Adjust stack for varargs on function entry.
+/// Adjust stack on entry to a vararg function.
+///
+/// The CALL handler stages args at `stack[base..base + caller_provided]` and
+/// pre-computes `frame.num_extras = caller_provided.saturating_sub(num_params)`.
+/// VARARGPREP rotates the leading `num_params` slots past the extras so that
+/// the layout becomes `[extras... fixed_params...]`, then advances
+/// `frame.base` so the function's locals start past the extras. A subsequent
+/// `VARARG` reads from `stack[new_base - num_extras .. new_base]`.
 #[inline(never)]
 extern "rust-preserve-none" fn op_varargprep<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
-    registers: Registers<'gc, '_>,
+    mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
     let _num_fixed = args!(Instruction::VARARGPREP { num_fixed });
-    // VARARGPREP is the first instruction of a vararg function.
-    // In Lua 5.5, this adjusts the stack so that fixed params are in the
-    // right place and extra args are accessible by VARARG.
-    // See #26: implement vararg stack adjustment when we track actual arg count.
+    let (num_extras, num_params, base, max_stack) = {
+        let frame = thread.top_lua().unwrap();
+        (
+            frame.num_extras as usize,
+            frame.closure.proto.num_params as usize,
+            frame.base,
+            frame.closure.proto.max_stack_size as usize,
+        )
+    };
+    if num_extras > 0 {
+        let total = num_extras + num_params;
+        // [fixed..., extras...].rotate_left(num_params) => [extras..., fixed...]
+        thread.stack[base..base + total].rotate_left(num_params);
+        let new_base = base + num_extras;
+        let needed = new_base + max_stack;
+        if thread.stack.len() < needed {
+            thread.stack.resize(needed, Value::nil());
+        }
+        thread.top_lua_mut().unwrap().base = new_base;
+        registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
+    }
     dispatch!();
 }
 
@@ -2590,6 +2656,11 @@ fn schedule_meta_call<'gc>(
     for i in actual_args..num_params {
         thread.stack[new_base + i] = Value::nil();
     }
+    let num_extras = if closure.proto.is_vararg {
+        actual_args.saturating_sub(num_params) as u32
+    } else {
+        0
+    };
 
     thread.push_lua(LuaFrame {
         closure,
@@ -2598,7 +2669,7 @@ fn schedule_meta_call<'gc>(
         // reads return values directly from the stack via `cont.results_base`.
         pc: 0,
         num_results: 0,
-        num_extras: 0,
+        num_extras,
         continuation: Some(cont),
     });
 
