@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use cstree::interning::TokenInterner;
 
-use super::defs::{Chunk, ExprDesc, ExprKind, JumpList, Numeral, RegisterIndex};
+use super::defs::{Chunk, ExprDesc, ExprKind, JumpList, Numeral, RegisterIndex, Want};
 use super::{CompileError, CompileErrorKind, LineNumber};
 use crate::dmm::Gc;
 use crate::env::{LuaString, Prototype, value::Value};
@@ -1480,8 +1480,8 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
         if is_last && num_targets > num_values {
             // Last RHS supplies multiple values via call or vararg.
             if let Expr::FuncCall(call) = expr {
-                let want = num_targets - i;
-                let regs = compile_expr_func_call(ctx, call, want)?;
+                let want = (num_targets - i) as u8;
+                let regs = compile_expr_func_call(ctx, call, Want::Exact(want))?;
                 // Results occupy [regs[0], regs[0]+want); in practice this
                 // lines up with `expected` because the call's func slot
                 // is freereg at setup time, which is `expected`.
@@ -1876,8 +1876,8 @@ fn compile_assign(ctx: &mut Ctx, item: Assign) -> Result<(), CompileError> {
             && num_targets > num_values
             && let Expr::FuncCall(call) = expr
         {
-            let want = num_targets - pending.len();
-            for r in compile_expr_func_call(ctx, call, want)? {
+            let want = (num_targets - pending.len()) as u8;
+            for r in compile_expr_func_call(ctx, call, Want::Exact(want))? {
                 pending.push(Some(r.0));
             }
             continue;
@@ -2274,7 +2274,7 @@ fn compile_expr(
         Expr::PrefixOp(item) => compile_expr_prefix_op(ctx, item, dst),
         Expr::BinaryOp(item) => compile_expr_binary_op(ctx, item, dst),
         Expr::Method(item) => {
-            let regs = compile_expr_method_call(ctx, item, 1)?;
+            let regs = compile_expr_method_call(ctx, item, Want::Exact(1))?;
             Ok(ExprDesc::from_reg(regs[0]))
         }
         Expr::Ident(item) => compile_expr_ident(ctx, item, dst),
@@ -2282,7 +2282,7 @@ fn compile_expr(
         Expr::Func(item) => compile_expr_func(ctx, item, dst).map(ExprDesc::from_reg),
         Expr::Table(item) => compile_expr_table(ctx, item).map(ExprDesc::from_reg),
         Expr::FuncCall(item) => {
-            let regs = compile_expr_func_call(ctx, item, 1)?;
+            let regs = compile_expr_func_call(ctx, item, Want::Exact(1))?;
             Ok(ExprDesc::from_reg(regs[0]))
         }
         Expr::Index(item) => compile_expr_index(ctx, item, dst).map(ExprDesc::from_reg),
@@ -3158,29 +3158,50 @@ fn emit_func_call_setup(
     Ok((func, nargs))
 }
 
+/// Emit a `CALL` for the given function-call expression.
+///
+/// `want == Want::Exact(n)` produces exactly `n` results at registers
+/// `[func, func+n)`; the returned `Vec` enumerates them. `want ==
+/// Want::MultRet` emits the MULTRET sentinel (`returns == 0`) — the
+/// outer instruction (a CALL `args=0`, RETURN `count=0`, or SETLIST
+/// `count=0`) consumes via `thread.top` at run time, so no fixed result
+/// register list exists and the returned `Vec` is empty.
 fn compile_expr_func_call(
     ctx: &mut Ctx,
     item: FuncCall,
-    want: usize,
+    want: Want,
 ) -> Result<Vec<RegisterIndex>, CompileError> {
     let (func, nargs) = emit_func_call_setup(ctx, &item)?;
 
+    let returns = match want {
+        Want::Exact(n) => n + 1,
+        Want::MultRet => 0,
+    };
     ctx.emit(Instruction::CALL {
         func: func.0,
         args: nargs as u8 + 1,
-        returns: want as u8 + 1,
+        returns,
     });
 
-    // Results are placed starting at func register; arg temps above
-    // func+want are reclaimed (freereg snaps back to func+want). Preserves
-    // `max_stack` since it already recorded the peak during arg setup.
-    ctx.chunk.freereg = func.0 + want as u8;
-
-    let mut results = Vec::with_capacity(want);
-    for i in 0..want {
-        results.push(RegisterIndex(func.0 + i as u8));
+    match want {
+        Want::Exact(n) => {
+            // Results are placed starting at func register; arg temps above
+            // func+n are reclaimed (freereg snaps back to func+n). Preserves
+            // `max_stack` since it already recorded the peak during arg setup.
+            ctx.chunk.freereg = func.0 + n;
+            let mut results = Vec::with_capacity(n as usize);
+            for i in 0..n {
+                results.push(RegisterIndex(func.0 + i));
+            }
+            Ok(results)
+        }
+        Want::MultRet => {
+            // MULTRET: result count is dynamic. Caller (the outer multires
+            // consumer) reads `thread.top` at run time. We leave `freereg`
+            // unchanged so the outer instruction sees the unbounded extent.
+            Ok(Vec::new())
+        }
     }
-    Ok(results)
 }
 
 /// Tail-call form of [`compile_expr_func_call`]: emits `TAILCALL` with
@@ -3309,27 +3330,37 @@ fn emit_method_call_setup(
     Ok((func, nargs))
 }
 
+/// Method-call equivalent of [`compile_expr_func_call`]. Same `Want`
+/// semantics: an exact-`n` request returns `n` result registers; a
+/// MULTRET request emits `returns == 0` and returns an empty list.
 fn compile_expr_method_call(
     ctx: &mut Ctx,
     item: MethodCall,
-    want: usize,
+    want: Want,
 ) -> Result<Vec<RegisterIndex>, CompileError> {
     let (func, nargs) = emit_method_call_setup(ctx, &item)?;
 
+    let returns = match want {
+        Want::Exact(n) => n + 1,
+        Want::MultRet => 0,
+    };
     ctx.emit(Instruction::CALL {
         func: func.0,
         args: nargs as u8 + 1,
-        returns: want as u8 + 1,
+        returns,
     });
 
-    // Results occupy [func, func+want); reclaim arg temps above.
-    ctx.chunk.freereg = func.0 + want as u8;
-
-    let mut results = Vec::with_capacity(want);
-    for i in 0..want {
-        results.push(RegisterIndex(func.0 + i as u8));
+    match want {
+        Want::Exact(n) => {
+            ctx.chunk.freereg = func.0 + n;
+            let mut results = Vec::with_capacity(n as usize);
+            for i in 0..n {
+                results.push(RegisterIndex(func.0 + i));
+            }
+            Ok(results)
+        }
+        Want::MultRet => Ok(Vec::new()),
     }
-    Ok(results)
 }
 
 fn compile_expr_index(

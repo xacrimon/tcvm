@@ -7,6 +7,25 @@ use crate::instruction::{Instruction, UpValueDescriptor};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RegisterIndex(pub u8);
 
+/// How many results a multires-capable expression (function call,
+/// `...`) is expected to produce. Threaded through `compile_expr*`
+/// helpers so the last expression of a multires context (last argument
+/// of a call, last initializer of a table, last RHS of a multi-assign,
+/// last expression of `return`, generic-`for` initializer) can request
+/// `MultRet` and have the resulting `CALL` / `VARARG` emit the
+/// MULTRET sentinel (`returns == 0` / `count == 0`) so the outer
+/// instruction reads `thread.top` at run time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Want {
+    /// Materialize exactly this many results, nil-padding the
+    /// shortfall and discarding the excess. `Exact(0)` discards all
+    /// returns (the bare-call-as-statement form).
+    Exact(u8),
+    /// Variadic multires: all available results, dynamic top tracked
+    /// via `thread.top`.
+    MultRet,
+}
+
 /// A list of unfilled `JMP` (or conditional-fall-through `JMP`) instructions
 /// in the tape whose offset fields still need to be patched to a target. The
 /// two lists attached to an `ExprDesc` represent the expression's "true" and
