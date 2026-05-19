@@ -329,8 +329,7 @@ fn is_long_delimiter(slice: &str, delim: char) -> bool {
     slice.chars().filter(|c| *c == '=').count() + 2 == slice.len()
 }
 
-#[macro_export]
-macro_rules! T {
+macro_rules! __T {
     [invalid] => { $crate::parser::kind::SyntaxKind::Invalid };
     [tombstone] => { $crate::parser::kind::SyntaxKind::Tombstone };
     [eof] => { $crate::parser::kind::SyntaxKind::Eof };
@@ -437,6 +436,8 @@ macro_rules! T {
     [whitespace] => { $crate::parser::kind::SyntaxKind::Whitespace };
     [comment] => { $crate::parser::kind::SyntaxKind::Comment };
 }
+
+pub(crate) use __T as T;
 
 impl Display for SyntaxKind {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {

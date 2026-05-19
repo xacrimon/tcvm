@@ -3,7 +3,7 @@
 
 use std::fmt;
 
-use crate::Rootable;
+use crate::dmm::Rootable;
 use crate::dmm::{DynamicRoot, DynamicRootSet, Mutation, RefLock};
 use crate::env::error::Error;
 use crate::env::function::FunctionKind;

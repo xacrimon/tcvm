@@ -12,7 +12,6 @@ use crate::dmm::collect::{Collect, Trace};
 
 /// If a type is static, we know that it can never hold `Gc` pointers, so it is safe to provide a
 /// simple empty `Collect` implementation.
-#[macro_export]
 macro_rules! static_collect {
     ($type:ty) => {
         unsafe impl<'gc> Collect<'gc> for $type
@@ -57,7 +56,7 @@ static_collect!(std::ffi::OsString);
 ///
 /// ```rust,compile_fail
 /// use tcvm::dmm::{Arena, Gc};
-/// use tcvm::Rootable;
+/// use tcvm::dmm::Rootable;
 /// let arena = Arena::<Rootable![&'static Gc<'gc, i32>]>::new(Default::default(), |mc| {
 ///     Box::leak(Box::new(Gc::new(mc, 4)))
 /// });

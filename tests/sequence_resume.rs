@@ -27,7 +27,7 @@ unsafe impl<'gc> Collect<'gc> for ResumeAndAddOne<'gc> {
 
 impl<'gc> Sequence<'gc> for ResumeAndAddOne<'gc> {
     fn trace_pointers(&self, cc: &mut dyn Trace<'gc>) {
-        tcvm::seq_trace_pointers!(self, cc);
+        tcvm::vm::sequence::seq_trace_pointers!(self, cc);
     }
 
     fn poll(

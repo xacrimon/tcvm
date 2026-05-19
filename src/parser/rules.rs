@@ -1,10 +1,9 @@
 use super::{
     Parser,
-    kind::SyntaxKind,
+    kind::{SyntaxKind, T},
     machinery::{CompletedMarker, Marker, token_is_expr_start},
 };
 use crate::{
-    T,
     parser::machinery::{
         CALL_BINDING_POWER, INDEX_BINDING_POWER, infix_binding_power, prefix_binding_power,
         token_is_literal, token_is_unary_op,

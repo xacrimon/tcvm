@@ -4,8 +4,7 @@ use cstree::{
     RawSyntaxKind, Syntax, interning::TokenInterner, syntax::SyntaxText, util::NodeOrToken,
 };
 
-use super::{kind::SyntaxKind, lit};
-use crate::T;
+use super::{kind::{SyntaxKind, T}, lit};
 
 impl Syntax for SyntaxKind {
     fn from_raw(raw: RawSyntaxKind) -> Self {

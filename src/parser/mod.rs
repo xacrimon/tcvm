@@ -10,7 +10,7 @@ use cstree::build::NodeCache;
 use machinery::{Span, State};
 use syntax::SyntaxNode;
 
-use crate::T;
+use kind::T;
 
 pub fn parse(
     cache: &mut NodeCache<'static>,

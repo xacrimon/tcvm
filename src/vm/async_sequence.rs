@@ -357,7 +357,7 @@ where
     F: Future<Output = Result<SequenceReturn, StashedError>> + 'static,
 {
     fn trace_pointers(&self, cc: &mut dyn Trace<'gc>) {
-        crate::seq_trace_pointers!(self, cc);
+        crate::vm::sequence::seq_trace_pointers!(self, cc);
     }
 
     fn poll(

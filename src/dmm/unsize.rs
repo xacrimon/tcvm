@@ -48,8 +48,9 @@ use crate::dmm::{
 /// # })
 /// # }
 /// ```
+#[doc(hidden)]
 #[macro_export]
-macro_rules! unsize {
+macro_rules! __unsize {
     ($gc:expr => $ty:ty) => {{
         let gc = $gc;
         // SAFETY: the closure has a trivial body and must be a valid pointer
@@ -60,6 +61,9 @@ macro_rules! unsize {
         }
     }};
 }
+
+#[doc(inline)]
+pub use __unsize as unsize;
 
 // Not public API; implementation detail of the `unsize` macro.
 //
