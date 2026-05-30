@@ -2586,27 +2586,7 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
                         array_pending = 0;
                         ctx.chunk.freereg = pending_base;
                     }
-                    while ctx.chunk.freereg < pending_base {
-                        ctx.alloc_register()?;
-                    }
-                    match value_expr {
-                        Expr::FuncCall(call) => {
-                            compile_expr_func_call(ctx, call, Want::MultRet)?;
-                        }
-                        Expr::Method(call) => {
-                            compile_expr_method_call(ctx, call, Want::MultRet)?;
-                        }
-                        Expr::VarArg => {
-                            while ctx.chunk.freereg <= pending_base {
-                                ctx.alloc_register()?;
-                            }
-                            ctx.emit(Instruction::VARARG {
-                                dst: pending_base,
-                                count: 0,
-                            });
-                        }
-                        _ => unreachable!(),
-                    }
+                    compile_trailing_multires(ctx, value_expr, RegisterIndex(pending_base))?;
                     ctx.emit(Instruction::SETLIST {
                         table: dst.0,
                         count: 0,
@@ -3460,6 +3440,61 @@ fn emit_method_call_setup(
     Ok((func, args_wire))
 }
 
+/// Compile `expr` in a trailing multires position, emitting its result(s)
+/// starting at register `target`. Returns `true` if it produced an unbounded
+/// (MULTRET) result — a `CALL`/`VARARG` with the `0` sentinel — and `false`
+/// if it produced a single value left in `target`.
+///
+/// The `<` vs `<=` alloc distinction is the subtle part kept in one place: a
+/// call's func slot must *land on* `target` (align `freereg` up to it, the
+/// call setup then claims it), whereas `VARARG`/`MOVE` write `target` directly
+/// (so `target` itself must already be allocated).
+fn compile_trailing_multires(
+    ctx: &mut Ctx,
+    expr: Expr,
+    target: RegisterIndex,
+) -> Result<bool, CompileError> {
+    match expr {
+        Expr::FuncCall(call) => {
+            while ctx.chunk.freereg < target.0 {
+                ctx.alloc_register()?;
+            }
+            compile_expr_func_call(ctx, call, Want::MultRet)?;
+            Ok(true)
+        }
+        Expr::Method(call) => {
+            while ctx.chunk.freereg < target.0 {
+                ctx.alloc_register()?;
+            }
+            compile_expr_method_call(ctx, call, Want::MultRet)?;
+            Ok(true)
+        }
+        Expr::VarArg => {
+            while ctx.chunk.freereg <= target.0 {
+                ctx.alloc_register()?;
+            }
+            ctx.emit(Instruction::VARARG {
+                dst: target.0,
+                count: 0,
+            });
+            Ok(true)
+        }
+        other => {
+            let reg = compile_expr_to_reg(ctx, other, Some(target))?;
+            if reg != target {
+                while ctx.chunk.freereg <= target.0 {
+                    ctx.alloc_register()?;
+                }
+                ctx.emit(Instruction::MOVE {
+                    dst: target.0,
+                    src: reg.0,
+                });
+            }
+            Ok(false)
+        }
+    }
+}
+
 /// Compile arguments into consecutive slots from `func + offset` (`offset` is
 /// `1` for a plain call, `2` for a method call to leave room for `self`). A
 /// trailing call/`...` is lowered as `Want::MultRet`. Returns the `args`
@@ -3478,45 +3513,9 @@ fn compile_call_args(
         let expected_reg = RegisterIndex(func.0 + offset + i as u8);
 
         if is_last {
-            match arg_expr {
-                Expr::FuncCall(inner) => {
-                    // Align freereg so the inner call's func slot lands at
-                    // expected_reg and its results spread from there.
-                    while ctx.chunk.freereg < expected_reg.0 {
-                        ctx.alloc_register()?;
-                    }
-                    compile_expr_func_call(ctx, inner, Want::MultRet)?;
-                    return Ok(0);
-                }
-                Expr::Method(inner) => {
-                    while ctx.chunk.freereg < expected_reg.0 {
-                        ctx.alloc_register()?;
-                    }
-                    compile_expr_method_call(ctx, inner, Want::MultRet)?;
-                    return Ok(0);
-                }
-                Expr::VarArg => {
-                    while ctx.chunk.freereg <= expected_reg.0 {
-                        ctx.alloc_register()?;
-                    }
-                    ctx.emit(Instruction::VARARG {
-                        dst: expected_reg.0,
-                        count: 0,
-                    });
-                    return Ok(0);
-                }
-                other => {
-                    let arg = compile_expr_to_reg(ctx, other, Some(expected_reg))?;
-                    if arg != expected_reg {
-                        while ctx.chunk.freereg <= expected_reg.0 {
-                            ctx.alloc_register()?;
-                        }
-                        ctx.emit(Instruction::MOVE {
-                            dst: expected_reg.0,
-                            src: arg.0,
-                        });
-                    }
-                }
+            // Trailing arg: a call/`...` spreads as MULTRET (`args == 0`).
+            if compile_trailing_multires(ctx, arg_expr, expected_reg)? {
+                return Ok(0);
             }
         } else {
             let arg = compile_expr_to_reg(ctx, arg_expr, Some(expected_reg))?;
@@ -3723,47 +3722,9 @@ fn compile_return_generic(ctx: &mut Ctx, mut exprs: Vec<Expr>) -> Result<(), Com
         let is_last = i == last_idx;
 
         if is_last {
-            match expr {
-                Expr::FuncCall(call) => {
-                    while ctx.chunk.freereg < target.0 {
-                        ctx.alloc_register()?;
-                    }
-                    compile_expr_func_call(ctx, call, Want::MultRet)?;
-                    multret = true;
-                    break;
-                }
-                Expr::Method(call) => {
-                    while ctx.chunk.freereg < target.0 {
-                        ctx.alloc_register()?;
-                    }
-                    compile_expr_method_call(ctx, call, Want::MultRet)?;
-                    multret = true;
-                    break;
-                }
-                Expr::VarArg => {
-                    while ctx.chunk.freereg <= target.0 {
-                        ctx.alloc_register()?;
-                    }
-                    ctx.emit(Instruction::VARARG {
-                        dst: target.0,
-                        count: 0,
-                    });
-                    multret = true;
-                    break;
-                }
-                other => {
-                    let reg = compile_expr_to_reg(ctx, other, Some(target))?;
-                    if reg != target {
-                        while ctx.chunk.freereg <= target.0 {
-                            ctx.alloc_register()?;
-                        }
-                        ctx.emit(Instruction::MOVE {
-                            dst: target.0,
-                            src: reg.0,
-                        });
-                    }
-                }
-            }
+            // Trailing value: a call/`...` propagates all results via MULTRET.
+            multret = compile_trailing_multires(ctx, expr, target)?;
+            break;
         } else {
             let reg = compile_expr_to_reg(ctx, expr, Some(target))?;
             if reg != target {

@@ -2146,7 +2146,14 @@ extern "rust-preserve-none" fn op_varargget<'gc>(
     let frame = thread.top_lua().unwrap();
     let num_extras = frame.num_extras as usize;
     let extras_start = frame.base - num_extras;
-    let v = if let Some(k) = key_val.get_integer() {
+    // Normalize integral float keys (`args[1.0]` == `args[1]`) so the optimized
+    // path agrees with the GETTABLE an escaped vararg would use.
+    let int_key = key_val.get_integer().or_else(|| {
+        let f = key_val.get_float()?;
+        let i = f as i64;
+        (i as f64 == f).then_some(i)
+    });
+    let v = if let Some(k) = int_key {
         if k >= 1 && (k as usize) <= num_extras {
             thread.stack[extras_start + (k as usize) - 1]
         } else {
