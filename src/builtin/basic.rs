@@ -2,13 +2,7 @@ use crate::Context;
 use crate::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Value};
 use crate::vm::sequence::CallbackAction;
 
-// See #27: _G, _VERSION
-
-// let add =
-//                    Function::new_native(ctx.mutation(), native_add as NativeFn, Box::new([]));
-//                let key = Value::String(LuaString::new(ctx, b"add"));
-//                ctx.globals()
-//                    .raw_set(ctx, key, Value::Function(add));
+// TODO(#27): _G, _VERSION
 
 pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[

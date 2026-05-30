@@ -1496,12 +1496,10 @@ extern "rust-preserve-none" fn op_call<'gc>(
     match target {
         CallTarget::Lua(closure) => {
             let new_base = func_idx + 1;
-            // Save caller's PC (offset from current code start)
             if let Some(frame) = thread.top_lua_mut() {
                 let code_start = frame.closure.proto.code.as_ptr();
                 frame.pc = unsafe { ip.offset_from_unsigned(code_start) };
             }
-            // Ensure stack is large enough
             let needed = new_base + closure.proto.max_stack_size as usize;
             if thread.stack.len() < needed {
                 thread.stack.resize(needed, Value::nil());
@@ -1521,7 +1519,6 @@ extern "rust-preserve-none" fn op_call<'gc>(
             } else {
                 0
             };
-            // Push new call frame
             thread.push_lua(LuaFrame {
                 closure,
                 base: new_base,
@@ -1530,7 +1527,6 @@ extern "rust-preserve-none" fn op_call<'gc>(
                 num_extras,
                 continuation: None,
             });
-            // Rebind ip and registers to new frame
             ip = closure.proto.code.as_ptr();
             registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
             dispatch!();
@@ -2000,7 +1996,6 @@ extern "rust-preserve-none" fn op_closure<'gc>(
     let base = frame.base;
     let proto = parent_closure.proto.prototypes[proto_idx as usize];
 
-    // Capture upvalues based on the prototype's upvalue descriptors
     let thread_handle = thread.thread_handle.expect("thread must have a handle");
     let mut upvalues_vec = Vec::with_capacity(proto.upvalue_desc.len());
     for desc in proto.upvalue_desc.iter() {

@@ -116,8 +116,8 @@ impl<'gc> Table<'gc> {
 #[collect(internal, no_drop)]
 pub struct TableState<'gc> {
     /// Hidden class describing string-keyed property layout + metatable
-    /// identity. Replaces the dead `metamethods` bitset. In dict mode,
-    /// this is a per-table sentinel shape; ICs naturally bypass.
+    /// identity. In dict mode, this is a per-table sentinel shape; ICs
+    /// naturally bypass.
     pub(crate) shape: Shape<'gc>,
     /// String-keyed property values, indexed by `shape.find_slot(key)`.
     /// `properties.len() == shape.slot_count()` post-set. Empty in

@@ -343,8 +343,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     }
 
     /// Reserve a single fresh temp register at `freereg` and return it.
-    /// Replaces the older `alloc_register` name to match Lua's
-    /// `luaK_reserveregs(fs, 1)`.
+    /// Lua's `luaK_reserveregs(fs, 1)`.
     fn reserve_reg(&mut self) -> Result<RegisterIndex, CompileError> {
         assert!(self.chunk.nactvar <= self.chunk.freereg);
         if self.chunk.freereg == 255 {
@@ -377,9 +376,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         Ok(RegisterIndex(base))
     }
 
-    /// Back-compat alias kept so existing call sites compile unchanged
-    /// during the phased refactor. Phase 5 migrates remaining uses to
-    /// `reserve_reg`/`reserve_regs`.
+    /// Alias for `reserve_reg`.
     fn alloc_register(&mut self) -> Result<RegisterIndex, CompileError> {
         self.reserve_reg()
     }
@@ -3898,15 +3895,13 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
 
         let limit_expr = item.end().ok_or_else(|| ice("for_num without limit"))?;
 
-        // Pre-allocate consecutive registers: base, base+1, base+2
+        // FORPREP requires the control triple in consecutive registers.
         let base = ctx.alloc_register()?;
         let limit_reg = ctx.alloc_register()?;
         let step_reg = ctx.alloc_register()?;
 
-        // Compile init, limit, step with destination hints. Each sub-MOVE
-        // path frees the source temp so freereg settles at step_reg+1
-        // when this block finishes — the explicit reset is no longer
-        // needed (see the assert below).
+        // Each sub-MOVE path frees the source temp, so freereg settles at
+        // step_reg+1 when this block finishes (asserted below).
         let init = compile_expr_to_reg(ctx, init_expr, Some(base))?;
         if init != base {
             ctx.emit(Instruction::MOVE {
