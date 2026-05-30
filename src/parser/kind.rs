@@ -23,6 +23,7 @@ pub enum SyntaxKind {
     ForGenStmt,
     FuncStmt,
     FuncArgs,
+    VarArgParam,
     Expr,
     VarArgExpr,
     BinOp,
@@ -328,8 +329,7 @@ fn is_long_delimiter(slice: &str, delim: char) -> bool {
     slice.chars().filter(|c| *c == '=').count() + 2 == slice.len()
 }
 
-#[macro_export]
-macro_rules! T {
+macro_rules! __T {
     [invalid] => { $crate::parser::kind::SyntaxKind::Invalid };
     [tombstone] => { $crate::parser::kind::SyntaxKind::Tombstone };
     [eof] => { $crate::parser::kind::SyntaxKind::Eof };
@@ -346,6 +346,7 @@ macro_rules! T {
     [for_gen_stmt] => { $crate::parser::kind::SyntaxKind::ForGenStmt };
     [func_stmt] => { $crate::parser::kind::SyntaxKind::FuncStmt };
     [func_args] => { $crate::parser::kind::SyntaxKind::FuncArgs };
+    [vararg_param] => { $crate::parser::kind::SyntaxKind::VarArgParam };
     [expr] => { $crate::parser::kind::SyntaxKind::Expr };
     [vararg_expr] => { $crate::parser::kind::SyntaxKind::VarArgExpr };
     [bin_op] => { $crate::parser::kind::SyntaxKind::BinOp };
@@ -436,6 +437,8 @@ macro_rules! T {
     [comment] => { $crate::parser::kind::SyntaxKind::Comment };
 }
 
+pub(crate) use __T as T;
+
 impl Display for SyntaxKind {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
@@ -458,6 +461,7 @@ impl Display for SyntaxKind {
                 T![for_gen_stmt] => "for_gen_stmt",
                 T![func_stmt] => "func_stmt",
                 T![func_args] => "func_args",
+                T![vararg_param] => "vararg_param",
                 T![expr] => "expr",
                 T![vararg_expr] => "vararg_expr",
                 T![bin_op] => "bin_op",

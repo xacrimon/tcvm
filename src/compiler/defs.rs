@@ -7,6 +7,37 @@ use crate::instruction::{Instruction, UpValueDescriptor};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RegisterIndex(pub u8);
 
+/// Escape-analysis state for a named vararg parameter (`function f(...name)`).
+/// `Some` on the `Chunk` iff one is declared. If either flag is set by the end
+/// of the body the function materializes a vararg table (see `needs_table`).
+#[derive(Debug, Clone, Copy)]
+pub struct VarargInfo {
+    /// `name` used as a value, i.e. anywhere but the base of `name[exp]` / `name.id`.
+    pub used_as_non_base: bool,
+    /// `name` captured as an upvalue by a nested closure.
+    pub captured: bool,
+}
+
+impl VarargInfo {
+    /// Per the Lua 5.5 manual §3.4, a named vararg stays optimized only while
+    /// not captured and used solely as the base of `t[exp]` / `t.id`.
+    pub fn needs_table(&self) -> bool {
+        self.used_as_non_base || self.captured
+    }
+}
+
+/// Result-count request for a multires-capable expression (call or `...`),
+/// threaded through `compile_expr*`. `MultRet` makes the emitted CALL/VARARG
+/// use the MULTRET sentinel (`returns`/`count == 0`) so the consumer reads
+/// `thread.top` at run time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Want {
+    /// Exactly this many results, nil-padding/truncating. `Exact(0)` discards all.
+    Exact(u8),
+    /// All available results; count tracked via `thread.top`.
+    MultRet,
+}
+
 /// A list of unfilled `JMP` (or conditional-fall-through `JMP`) instructions
 /// in the tape whose offset fields still need to be patched to a target. The
 /// two lists attached to an `ExprDesc` represent the expression's "true" and
@@ -192,6 +223,10 @@ pub struct Chunk<'gc> {
     pub(super) max_stack: u8,
     pub(super) arity: u8,
     pub(super) is_vararg: bool,
+    /// Escape-analysis state for the named vararg parameter; `Some` iff one is
+    /// declared. Drives the epilogue's `VARARGGET`->`GETTABLE` rewrite and
+    /// `Prototype::needs_vararg_table`.
+    pub(super) vararg_info: Option<VarargInfo>,
     pub(super) labels: Vec<usize>,
     pub(super) jump_patches: Vec<(usize, u16)>,
     /// Highest bytecode position that any label has resolved to or that any
@@ -218,6 +253,7 @@ impl<'gc> Chunk<'gc> {
             max_stack: 0,
             arity: 0,
             is_vararg: false,
+            vararg_info: None,
             labels: Vec::new(),
             jump_patches: Vec::new(),
             last_target: 0,
@@ -268,6 +304,7 @@ impl<'gc> Chunk<'gc> {
                 upvalue_desc: self.upvalue_desc.into_boxed_slice(),
                 num_params: self.arity,
                 is_vararg: self.is_vararg,
+                needs_vararg_table: self.vararg_info.is_some_and(|i| i.needs_table()),
                 max_stack_size: self.max_stack,
                 num_upvalues,
                 source: self.source,

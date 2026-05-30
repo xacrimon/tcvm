@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use cstree::interning::TokenInterner;
 
-use super::defs::{Chunk, ExprDesc, ExprKind, JumpList, Numeral, RegisterIndex};
+use super::defs::{Chunk, ExprDesc, ExprKind, JumpList, Numeral, RegisterIndex, VarargInfo, Want};
 use super::{CompileError, CompileErrorKind, LineNumber};
 use crate::dmm::Gc;
 use crate::env::{LuaString, Prototype, value::Value};
@@ -172,6 +172,10 @@ enum VarKind {
     Const(Option<ConstVal>),
     /// Local declared with `<close>` — a to-be-closed variable (RDKTOCLOSE).
     ToClose,
+    /// The named-vararg parameter (`function f(...args)`). `args[expr]` /
+    /// `args.id` lower to `VARARGGET`; any other use (`local b = args`) or
+    /// upvalue capture forces materialization (see [`VarargInfo`]).
+    VarargParam,
 }
 
 impl VarKind {
@@ -1127,11 +1131,20 @@ impl<'gc, 'a> UpvalueResolver for Ctx<'gc, 'a> {
         //    locals (and `<const>` whose initializer didn't fold) flow
         //    back as a `ParentLocal` descriptor.
         if let Some(data) = self.resolve_local(name) {
-            if let VarKind::Const(Some(v)) = data.kind {
+            let kind = data.kind;
+            let register = data.register;
+            if let VarKind::Const(Some(v)) = kind {
                 return Some(ChildResolution::Const(v));
             }
+            // Capturing the named vararg as an upvalue forces materialization:
+            // the upvalue must point at a real table, not the below-base region.
+            if matches!(kind, VarKind::VarargParam)
+                && let Some(info) = self.chunk.vararg_info.as_mut()
+            {
+                info.captured = true;
+            }
             return Some(ChildResolution::Upvalue(UpValueDescriptor::ParentLocal(
-                data.register.0,
+                register.0,
             )));
         }
         // 2. Already captured in our upvalue list?
@@ -1217,6 +1230,7 @@ pub fn compile<'gc>(
         root.block(),
         std::iter::empty(),
         true, // main chunk is vararg
+        None, // main chunk has no named vararg parameter
         0,
         None,
         // Pre-seed `_ENV` at upvalue 0. The runtime wiring in
@@ -1239,6 +1253,7 @@ fn compile_function_to_chunk<'gc, 'a>(
     stmts: impl Iterator<Item = Stmt>,
     params: impl Iterator<Item = Ident>,
     is_vararg: bool,
+    vararg_name: Option<String>,
     arity: u8,
     source: Option<LuaString<'gc>>,
     initial_upvalues: Vec<(String, UpValueDescriptor)>,
@@ -1291,9 +1306,45 @@ fn compile_function_to_chunk<'gc, 'a>(
     // never touch their slots.
     ctx.adjust_locals(num_params);
 
+    // Named-vararg setup: bind `name` to the reserved register `R[num_params]`.
+    // No prologue bytecode — if it escapes, `VARARGPREP` builds the table at
+    // run time and the epilogue rewrites the accesses (see below).
+    if let Some(name) = vararg_name {
+        let args_reg = ctx.alloc_register()?;
+        ctx.define(
+            name,
+            VariableData {
+                register: args_reg,
+                kind: VarKind::VarargParam,
+            },
+        )?;
+        ctx.adjust_locals(num_params + 1);
+
+        ctx.chunk.vararg_info = Some(VarargInfo {
+            used_as_non_base: false,
+            captured: false,
+        });
+    }
+
     // Compile the body
     for stmt in stmts {
         compile_stmt(&mut ctx, stmt)?;
+    }
+
+    // Named-vararg finalization (Lua's `luaK_finish`): if the vararg escaped,
+    // it materializes a table, so rewrite each optimistic `VARARGGET` to a
+    // `GETTABLE` reading from the table register. (`needs_vararg_table`, set
+    // at assemble time, makes `VARARGPREP` build it.)
+    if ctx.chunk.vararg_info.is_some_and(|i| i.needs_table()) {
+        for instr in ctx.chunk.tape.iter_mut() {
+            if let Instruction::VARARGGET { dst, base, key } = *instr {
+                *instr = Instruction::GETTABLE {
+                    dst,
+                    table: base,
+                    key,
+                };
+            }
+        }
     }
 
     // Emit implicit return at the end. The frame already terminates when
@@ -1480,8 +1531,8 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
         if is_last && num_targets > num_values {
             // Last RHS supplies multiple values via call or vararg.
             if let Expr::FuncCall(call) = expr {
-                let want = num_targets - i;
-                let regs = compile_expr_func_call(ctx, call, want)?;
+                let want = (num_targets - i) as u8;
+                let regs = compile_expr_func_call(ctx, call, Want::Exact(want))?;
                 // Results occupy [regs[0], regs[0]+want); in practice this
                 // lines up with `expected` because the call's func slot
                 // is freereg at setup time, which is `expected`.
@@ -1876,8 +1927,8 @@ fn compile_assign(ctx: &mut Ctx, item: Assign) -> Result<(), CompileError> {
             && num_targets > num_values
             && let Expr::FuncCall(call) = expr
         {
-            let want = num_targets - pending.len();
-            for r in compile_expr_func_call(ctx, call, want)? {
+            let want = (num_targets - pending.len()) as u8;
+            for r in compile_expr_func_call(ctx, call, Want::Exact(want))? {
                 pending.push(Some(r.0));
             }
             continue;
@@ -2208,8 +2259,13 @@ fn compile_func_body(
     let params: Vec<_> = item.args().map(|a| a.collect()).unwrap_or_default();
     let stmts: Vec<_> = item.block().map(|b| b.collect()).unwrap_or_default();
     let arity = params.len() as u8;
+    let vararg = item.vararg();
+    let is_vararg = vararg.is_some();
+    let vararg_name = vararg
+        .and_then(|v| v.name())
+        .and_then(|i| i.name(ctx.interner).map(str::to_owned));
 
-    let proto = compile_nested(ctx, stmts, params, false, arity)?;
+    let proto = compile_nested(ctx, stmts, params, is_vararg, vararg_name, arity)?;
 
     let proto_idx = ctx.chunk.prototypes.len() as u16;
     ctx.chunk.prototypes.push(proto);
@@ -2233,6 +2289,7 @@ fn compile_nested<'gc>(
     stmts: Vec<Stmt>,
     params: Vec<Ident>,
     is_vararg: bool,
+    vararg_name: Option<String>,
     arity: u8,
 ) -> Result<Gc<'gc, Prototype<'gc>>, CompileError> {
     let lua_ctx = ctx.ctx;
@@ -2247,6 +2304,7 @@ fn compile_nested<'gc>(
         stmts.into_iter(),
         params.into_iter(),
         is_vararg,
+        vararg_name,
         arity,
         None,
         Vec::new(),
@@ -2274,7 +2332,7 @@ fn compile_expr(
         Expr::PrefixOp(item) => compile_expr_prefix_op(ctx, item, dst),
         Expr::BinaryOp(item) => compile_expr_binary_op(ctx, item, dst),
         Expr::Method(item) => {
-            let regs = compile_expr_method_call(ctx, item, 1)?;
+            let regs = compile_expr_method_call(ctx, item, Want::Exact(1))?;
             Ok(ExprDesc::from_reg(regs[0]))
         }
         Expr::Ident(item) => compile_expr_ident(ctx, item, dst),
@@ -2282,7 +2340,7 @@ fn compile_expr(
         Expr::Func(item) => compile_expr_func(ctx, item, dst).map(ExprDesc::from_reg),
         Expr::Table(item) => compile_expr_table(ctx, item).map(ExprDesc::from_reg),
         Expr::FuncCall(item) => {
-            let regs = compile_expr_func_call(ctx, item, 1)?;
+            let regs = compile_expr_func_call(ctx, item, Want::Exact(1))?;
             Ok(ExprDesc::from_reg(regs[0]))
         }
         Expr::Index(item) => compile_expr_index(ctx, item, dst).map(ExprDesc::from_reg),
@@ -2320,10 +2378,20 @@ fn compile_expr_ident(
     // without ever loading from the local's register. Plain locals (and
     // const-locals whose initializer didn't fold) return their register.
     if let Some(data) = ctx.resolve_local(name) {
-        if let VarKind::Const(Some(v)) = data.kind {
+        let kind = data.kind;
+        let register = data.register;
+        if let VarKind::Const(Some(v)) = kind {
             return Ok(v.to_expr_desc());
         }
-        return Ok(ExprDesc::from_reg(data.register));
+        // A named vararg reaching this path is used as a value (the `t[exp]` /
+        // `t.id` base cases are intercepted before recursing here), which
+        // forces materialization.
+        if matches!(kind, VarKind::VarargParam)
+            && let Some(info) = ctx.chunk.vararg_info.as_mut()
+        {
+            info.used_as_non_base = true;
+        }
+        return Ok(ExprDesc::from_reg(register));
     }
 
     // Upvalue path. An outer-scope `<const>` with a known value
@@ -2408,8 +2476,13 @@ fn compile_expr_func(
     let params: Vec<_> = item.args().map(|a| a.collect()).unwrap_or_default();
     let stmts: Vec<_> = item.block().map(|b| b.collect()).unwrap_or_default();
     let arity = params.len() as u8;
+    let vararg = item.vararg();
+    let is_vararg = vararg.is_some();
+    let vararg_name = vararg
+        .and_then(|v| v.name())
+        .and_then(|i| i.name(ctx.interner).map(str::to_owned));
 
-    let proto = compile_nested(ctx, stmts, params, false, arity)?;
+    let proto = compile_nested(ctx, stmts, params, is_vararg, vararg_name, arity)?;
 
     let proto_idx = ctx.chunk.prototypes.len() as u16;
     ctx.chunk.prototypes.push(proto);
@@ -2457,6 +2530,21 @@ fn try_property_key_constant(
     Ok(Some(ctx.alloc_field_key(&bytes)?))
 }
 
+/// The field name of a `target.field` RHS, or `None` if the RHS isn't an
+/// `Ident` (the parser would have produced an `Index` instead).
+fn property_field_name(ctx: &Ctx, field: &Expr) -> Result<Option<Vec<u8>>, CompileError> {
+    match field {
+        Expr::Ident(ident) => Ok(Some(
+            ident
+                .name(ctx.interner)
+                .ok_or_else(|| ice("ident without name"))?
+                .as_bytes()
+                .to_vec(),
+        )),
+        _ => Ok(None),
+    }
+}
+
 fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, CompileError> {
     let dst = ctx.alloc_register()?;
     ctx.emit(Instruction::NEWTABLE { dst: dst.0 });
@@ -2468,12 +2556,42 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
     // and after each Map/Generic SETTABLE.
     let pending_base = ctx.chunk.freereg;
 
-    for entry in item.entries() {
+    // Collected up front so the last array entry can be detected: a trailing
+    // call/`...` spreads its results rather than adjusting to one.
+    let entries: Vec<TableEntry> = item.entries().collect();
+    let total = entries.len();
+
+    for (i, entry) in entries.into_iter().enumerate() {
+        let is_last = i + 1 == total;
         match entry {
             TableEntry::Array(arr) => {
                 let value_expr = arr
                     .value()
                     .ok_or_else(|| ice("table array without value"))?;
+
+                // Trailing call/`...`: spread via a single MULTRET `SETLIST`.
+                // The pending fixed elements stay on the stack below the
+                // multires slot; `op_setlist` with `count=0` sweeps from
+                // `table+1` to `top`, so one SETLIST covers the whole batch
+                // (matches luac — no intermediate flush).
+                if is_last
+                    && matches!(
+                        &value_expr,
+                        Expr::FuncCall(_) | Expr::Method(_) | Expr::VarArg
+                    )
+                {
+                    let slot = RegisterIndex(pending_base + array_pending);
+                    compile_trailing_multires(ctx, value_expr, slot)?;
+                    ctx.emit(Instruction::SETLIST {
+                        table: dst.0,
+                        count: 0,
+                        offset: array_count - array_pending as u16,
+                    });
+                    array_pending = 0;
+                    ctx.chunk.freereg = pending_base;
+                    continue;
+                }
+
                 // Compile the value into the next array slot (dst+1+pending).
                 let slot = RegisterIndex(pending_base + array_pending);
                 let val = compile_expr_to_reg(ctx, value_expr, Some(slot))?;
@@ -2719,6 +2837,28 @@ fn compile_expr_binary_op(
     if op == BinaryOperator::Property {
         let lhs = item.lhs().ok_or_else(|| ice("binop without lhs"))?;
         let rhs = item.rhs().ok_or_else(|| ice("binop without rhs"))?;
+
+        // `args.id` on a named vararg lowers to `VARARGGET` with the field
+        // name loaded as a string-constant key.
+        if let Some(args_reg) = resolve_vararg_base(ctx, &lhs) {
+            let key_bytes = property_field_name(ctx, &rhs)?
+                .ok_or_else(|| ice("vararg property without static key"))?;
+            let key_const = ctx.alloc_string_constant(&key_bytes)?;
+            let key_reg = ctx.alloc_register()?;
+            ctx.emit(Instruction::LOAD {
+                dst: key_reg.0,
+                idx: key_const,
+            });
+            ctx.free_reg(key_reg);
+            let dst = ctx.dst_or_alloc(dst)?;
+            ctx.emit(Instruction::VARARGGET {
+                dst: dst.0,
+                base: args_reg,
+                key: key_reg.0,
+            });
+            return Ok(ExprDesc::from_reg(dst));
+        }
+
         let table = compile_expr_to_reg(ctx, lhs, None)?;
         if let Some((key_idx, ic_idx)) = try_property_key_constant(ctx, &rhs)? {
             ctx.free_reg(table);
@@ -3102,12 +3242,15 @@ fn compile_logical_or_desc(
 
 /// Compile the target expression and arguments of a plain (non-method)
 /// call into consecutive registers `func`, `func+1`, `func+2`, ... ready
-/// for a `CALL` or `TAILCALL` instruction. Returns the function register
-/// and argument count (excluding the function slot itself).
+/// for a `CALL` or `TAILCALL` instruction.
+///
+/// Returns `(func, args_wire)`, where `args_wire` is the `args` operand:
+/// `n + 1` for `n` fixed arguments, or `0` (MULTRET) when the last argument
+/// was itself a multires expression that propagated `returns=0`.
 fn emit_func_call_setup(
     ctx: &mut Ctx,
     item: &FuncCall,
-) -> Result<(RegisterIndex, usize), CompileError> {
+) -> Result<(RegisterIndex, u8), CompileError> {
     let target = item
         .target()
         .ok_or_else(|| ice("func call without target"))?;
@@ -3140,47 +3283,46 @@ fn emit_func_call_setup(
 
     let args: Vec<_> = item.args().map(|a| a.collect()).unwrap_or_default();
     let nargs = args.len();
+    let args_wire = compile_call_args(ctx, args, func, 1)?;
+    debug_assert!(args_wire == 0 || args_wire as usize == nargs + 1);
 
-    for (i, arg_expr) in args.into_iter().enumerate() {
-        let expected_reg = RegisterIndex(func.0 + 1 + i as u8);
-        let arg = compile_expr_to_reg(ctx, arg_expr, Some(expected_reg))?;
-        if arg != expected_reg {
-            while ctx.chunk.freereg <= expected_reg.0 {
-                ctx.alloc_register()?;
-            }
-            ctx.emit(Instruction::MOVE {
-                dst: expected_reg.0,
-                src: arg.0,
-            });
-        }
-    }
-
-    Ok((func, nargs))
+    Ok((func, args_wire))
 }
 
+/// Emit a `CALL`. `Want::Exact(n)` returns the `n` result registers
+/// `[func, func+n)`; `Want::MultRet` emits `returns == 0` and returns an
+/// empty `Vec` (the outer consumer reads `thread.top`).
 fn compile_expr_func_call(
     ctx: &mut Ctx,
     item: FuncCall,
-    want: usize,
+    want: Want,
 ) -> Result<Vec<RegisterIndex>, CompileError> {
-    let (func, nargs) = emit_func_call_setup(ctx, &item)?;
+    let (func, args_wire) = emit_func_call_setup(ctx, &item)?;
 
+    let returns = match want {
+        Want::Exact(n) => n + 1,
+        Want::MultRet => 0,
+    };
     ctx.emit(Instruction::CALL {
         func: func.0,
-        args: nargs as u8 + 1,
-        returns: want as u8 + 1,
+        args: args_wire,
+        returns,
     });
 
-    // Results are placed starting at func register; arg temps above
-    // func+want are reclaimed (freereg snaps back to func+want). Preserves
-    // `max_stack` since it already recorded the peak during arg setup.
-    ctx.chunk.freereg = func.0 + want as u8;
-
-    let mut results = Vec::with_capacity(want);
-    for i in 0..want {
-        results.push(RegisterIndex(func.0 + i as u8));
+    match want {
+        Want::Exact(n) => {
+            // Results land at func..func+n; reclaim arg temps above.
+            ctx.chunk.freereg = func.0 + n;
+            let mut results = Vec::with_capacity(n as usize);
+            for i in 0..n {
+                results.push(RegisterIndex(func.0 + i));
+            }
+            Ok(results)
+        }
+        // MULTRET: leave `freereg` past the args so the outer instruction sees
+        // the unbounded extent.
+        Want::MultRet => Ok(Vec::new()),
     }
-    Ok(results)
 }
 
 /// Tail-call form of [`compile_expr_func_call`]: emits `TAILCALL` with
@@ -3188,10 +3330,10 @@ fn compile_expr_func_call(
 /// path replaces the current frame, the native path goes through
 /// `frame_return`).
 fn compile_tail_func_call(ctx: &mut Ctx, item: FuncCall) -> Result<(), CompileError> {
-    let (func, nargs) = emit_func_call_setup(ctx, &item)?;
+    let (func, args_wire) = emit_func_call_setup(ctx, &item)?;
     ctx.emit(Instruction::TAILCALL {
         func: func.0,
-        args: nargs as u8 + 1,
+        args: args_wire,
     });
     // Frame is about to be torn down; conservatively snap freereg to func
     // so any post-TAILCALL code in the compiler (there shouldn't be any
@@ -3204,10 +3346,10 @@ fn compile_tail_func_call(ctx: &mut Ctx, item: FuncCall) -> Result<(), CompileEr
 /// CALL variant, but emits `TAILCALL` and does not produce a result
 /// register list.
 fn compile_tail_method_call(ctx: &mut Ctx, item: MethodCall) -> Result<(), CompileError> {
-    let (func, nargs) = emit_method_call_setup(ctx, &item)?;
+    let (func, args_wire) = emit_method_call_setup(ctx, &item)?;
     ctx.emit(Instruction::TAILCALL {
         func: func.0,
-        args: nargs as u8 + 1,
+        args: args_wire,
     });
     ctx.chunk.freereg = func.0;
     Ok(())
@@ -3224,20 +3366,20 @@ fn compile_tail_method_call(ctx: &mut Ctx, item: MethodCall) -> Result<(), Compi
 fn compile_stmt_expr(ctx: &mut Ctx, item: Expr) -> Result<(), CompileError> {
     match item {
         Expr::FuncCall(call) => {
-            let (func, nargs) = emit_func_call_setup(ctx, &call)?;
+            let (func, args_wire) = emit_func_call_setup(ctx, &call)?;
             ctx.emit(Instruction::CALL {
                 func: func.0,
-                args: nargs as u8 + 1,
+                args: args_wire,
                 returns: 1,
             });
             ctx.chunk.freereg = func.0;
             Ok(())
         }
         Expr::Method(call) => {
-            let (func, nargs) = emit_method_call_setup(ctx, &call)?;
+            let (func, args_wire) = emit_method_call_setup(ctx, &call)?;
             ctx.emit(Instruction::CALL {
                 func: func.0,
-                args: nargs as u8 + 1,
+                args: args_wire,
                 returns: 1,
             });
             ctx.chunk.freereg = func.0;
@@ -3259,7 +3401,7 @@ fn compile_stmt_expr(ctx: &mut Ctx, item: Expr) -> Result<(), CompileError> {
 fn emit_method_call_setup(
     ctx: &mut Ctx,
     item: &MethodCall,
-) -> Result<(RegisterIndex, usize), CompileError> {
+) -> Result<(RegisterIndex, u8), CompileError> {
     let object_expr = item
         .object()
         .ok_or_else(|| ice("method call without object"))?;
@@ -3290,46 +3432,134 @@ fn emit_method_call_setup(
     }
 
     let args: Vec<_> = item.args().map(|a| a.collect()).unwrap_or_default();
-    let nargs = args.len() + 1; // +1 for self
+    let args_wire = compile_call_args(ctx, args, func, 2)?;
+    Ok((func, args_wire))
+}
 
-    for (i, arg_expr) in args.into_iter().enumerate() {
-        let expected_reg = RegisterIndex(func.0 + 2 + i as u8);
-        let arg = compile_expr_to_reg(ctx, arg_expr, Some(expected_reg))?;
-        if arg != expected_reg {
-            while ctx.chunk.freereg <= expected_reg.0 {
+/// Compile `expr` in a trailing multires position, emitting its result(s)
+/// starting at register `target`. Returns `true` if it produced an unbounded
+/// (MULTRET) result — a `CALL`/`VARARG` with the `0` sentinel — and `false`
+/// if it produced a single value left in `target`.
+///
+/// The `<` vs `<=` alloc distinction is the subtle part kept in one place: a
+/// call's func slot must *land on* `target` (align `freereg` up to it, the
+/// call setup then claims it), whereas `VARARG`/`MOVE` write `target` directly
+/// (so `target` itself must already be allocated).
+fn compile_trailing_multires(
+    ctx: &mut Ctx,
+    expr: Expr,
+    target: RegisterIndex,
+) -> Result<bool, CompileError> {
+    match expr {
+        Expr::FuncCall(call) => {
+            while ctx.chunk.freereg < target.0 {
                 ctx.alloc_register()?;
             }
-            ctx.emit(Instruction::MOVE {
-                dst: expected_reg.0,
-                src: arg.0,
+            compile_expr_func_call(ctx, call, Want::MultRet)?;
+            Ok(true)
+        }
+        Expr::Method(call) => {
+            while ctx.chunk.freereg < target.0 {
+                ctx.alloc_register()?;
+            }
+            compile_expr_method_call(ctx, call, Want::MultRet)?;
+            Ok(true)
+        }
+        Expr::VarArg => {
+            while ctx.chunk.freereg <= target.0 {
+                ctx.alloc_register()?;
+            }
+            ctx.emit(Instruction::VARARG {
+                dst: target.0,
+                count: 0,
             });
+            Ok(true)
+        }
+        other => {
+            let reg = compile_expr_to_reg(ctx, other, Some(target))?;
+            if reg != target {
+                while ctx.chunk.freereg <= target.0 {
+                    ctx.alloc_register()?;
+                }
+                ctx.emit(Instruction::MOVE {
+                    dst: target.0,
+                    src: reg.0,
+                });
+            }
+            Ok(false)
+        }
+    }
+}
+
+/// Compile arguments into consecutive slots from `func + offset` (`offset` is
+/// `1` for a plain call, `2` for a method call to leave room for `self`). A
+/// trailing call/`...` is lowered as `Want::MultRet`. Returns the `args`
+/// operand: `0` for MULTRET, else `nargs + 1` (counting `self`).
+fn compile_call_args(
+    ctx: &mut Ctx,
+    args: Vec<Expr>,
+    func: RegisterIndex,
+    offset: u8,
+) -> Result<u8, CompileError> {
+    let n = args.len();
+    let total = n as u8 + (offset - 1); // for method calls: +1 for self
+
+    for (i, arg_expr) in args.into_iter().enumerate() {
+        let is_last = i + 1 == n;
+        let expected_reg = RegisterIndex(func.0 + offset + i as u8);
+
+        if is_last {
+            // Trailing arg: a call/`...` spreads as MULTRET (`args == 0`).
+            if compile_trailing_multires(ctx, arg_expr, expected_reg)? {
+                return Ok(0);
+            }
+        } else {
+            let arg = compile_expr_to_reg(ctx, arg_expr, Some(expected_reg))?;
+            if arg != expected_reg {
+                while ctx.chunk.freereg <= expected_reg.0 {
+                    ctx.alloc_register()?;
+                }
+                ctx.emit(Instruction::MOVE {
+                    dst: expected_reg.0,
+                    src: arg.0,
+                });
+            }
         }
     }
 
-    Ok((func, nargs))
+    Ok(total + 1)
 }
 
+/// Method-call equivalent of [`compile_expr_func_call`], with the same `Want`
+/// semantics.
 fn compile_expr_method_call(
     ctx: &mut Ctx,
     item: MethodCall,
-    want: usize,
+    want: Want,
 ) -> Result<Vec<RegisterIndex>, CompileError> {
-    let (func, nargs) = emit_method_call_setup(ctx, &item)?;
+    let (func, args_wire) = emit_method_call_setup(ctx, &item)?;
 
+    let returns = match want {
+        Want::Exact(n) => n + 1,
+        Want::MultRet => 0,
+    };
     ctx.emit(Instruction::CALL {
         func: func.0,
-        args: nargs as u8 + 1,
-        returns: want as u8 + 1,
+        args: args_wire,
+        returns,
     });
 
-    // Results occupy [func, func+want); reclaim arg temps above.
-    ctx.chunk.freereg = func.0 + want as u8;
-
-    let mut results = Vec::with_capacity(want);
-    for i in 0..want {
-        results.push(RegisterIndex(func.0 + i as u8));
+    match want {
+        Want::Exact(n) => {
+            ctx.chunk.freereg = func.0 + n;
+            let mut results = Vec::with_capacity(n as usize);
+            for i in 0..n {
+                results.push(RegisterIndex(func.0 + i));
+            }
+            Ok(results)
+        }
+        Want::MultRet => Ok(Vec::new()),
     }
-    Ok(results)
 }
 
 fn compile_expr_index(
@@ -3339,6 +3569,21 @@ fn compile_expr_index(
 ) -> Result<RegisterIndex, CompileError> {
     let target_expr = item.target().ok_or_else(|| ice("index without target"))?;
     let key_expr = item.index().ok_or_else(|| ice("index without key"))?;
+
+    // `args[expr]` on a named vararg lowers to `VARARGGET`. This is a base-
+    // position use, so it does not force materialization.
+    if let Some(args_reg) = resolve_vararg_base(ctx, &target_expr) {
+        let key = compile_expr_to_reg(ctx, key_expr, None)?;
+        ctx.free_reg(key);
+        let dst = ctx.dst_or_alloc(dst)?;
+        ctx.emit(Instruction::VARARGGET {
+            dst: dst.0,
+            base: args_reg,
+            key: key.0,
+        });
+        return Ok(dst);
+    }
+
     let table = compile_expr_to_reg(ctx, target_expr, None)?;
     let key = compile_expr_to_reg(ctx, key_expr, None)?;
     // Both operands have been captured into the upcoming GETTABLE; free
@@ -3351,6 +3596,21 @@ fn compile_expr_index(
         key: key.0,
     });
     Ok(dst)
+}
+
+/// The register of the named-vararg local if `expr` names it, else `None`
+/// (the caller then falls back to a normal table access).
+fn resolve_vararg_base(ctx: &Ctx, expr: &Expr) -> Option<u8> {
+    let Expr::Ident(ident) = expr else {
+        return None;
+    };
+    let name = ident.name(ctx.interner)?;
+    let data = ctx.resolve_local(name)?;
+    if matches!(data.kind, VarKind::VarargParam) {
+        Some(data.register.0)
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3408,6 +3668,19 @@ fn compile_return_generic(ctx: &mut Ctx, mut exprs: Vec<Expr>) -> Result<(), Com
     // materialisation needs a concrete dst.
     if exprs.len() == 1 {
         let only = exprs.pop().unwrap();
+        // `return ...` propagates every vararg to the caller via MULTRET.
+        if matches!(&only, Expr::VarArg) {
+            let dst = ctx.alloc_register()?;
+            ctx.emit(Instruction::VARARG {
+                dst: dst.0,
+                count: 0,
+            });
+            ctx.emit(Instruction::RETURN {
+                values: dst.0,
+                count: 0,
+            });
+            return Ok(());
+        }
         let mut desc = compile_expr(ctx, only, None)?;
         if !desc.has_jumps()
             && let ExprKind::Reg(reg) = desc.kind
@@ -3437,24 +3710,34 @@ fn compile_return_generic(ctx: &mut Ctx, mut exprs: Vec<Expr>) -> Result<(), Com
 
     let n = exprs.len();
     let first_reg = ctx.alloc_register()?;
+    let last_idx = n - 1;
+    let mut multret = false;
 
     for (i, expr) in exprs.into_iter().enumerate() {
         let target = RegisterIndex(first_reg.0 + i as u8);
-        let reg = compile_expr_to_reg(ctx, expr, Some(target))?;
-        if reg != target {
-            while ctx.chunk.freereg <= target.0 {
-                ctx.alloc_register()?;
+        let is_last = i == last_idx;
+
+        if is_last {
+            // Trailing value: a call/`...` propagates all results via MULTRET.
+            multret = compile_trailing_multires(ctx, expr, target)?;
+            break;
+        } else {
+            let reg = compile_expr_to_reg(ctx, expr, Some(target))?;
+            if reg != target {
+                while ctx.chunk.freereg <= target.0 {
+                    ctx.alloc_register()?;
+                }
+                ctx.emit(Instruction::MOVE {
+                    dst: target.0,
+                    src: reg.0,
+                });
             }
-            ctx.emit(Instruction::MOVE {
-                dst: target.0,
-                src: reg.0,
-            });
         }
     }
 
     ctx.emit(Instruction::RETURN {
         values: first_reg.0,
-        count: n as u8 + 1,
+        count: if multret { 0 } else { n as u8 + 1 },
     });
 
     Ok(())
@@ -3726,7 +4009,6 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
 
 fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
     scope_lexical_break(ctx, |ctx| {
-        // Compile iterator expressions into base, base+1, base+2
         let values: Vec<_> = item
             .values()
             .ok_or_else(|| ice("for_gen without values"))?
@@ -3737,37 +4019,68 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
             .collect();
         let num_targets = targets.len();
 
-        // We need 3 control registers + N target registers
-        // R[base] = iterator function
-        // R[base+1] = state
-        // R[base+2] = initial control variable
-        // R[base+3]..R[base+2+N] = loop variables
-        let base = ctx.alloc_register()?;
-        // Pre-allocate the remaining two control registers
-        ctx.alloc_register()?; // base+1
-        ctx.alloc_register()?; // base+2
+        // Control registers land contiguously at [base, base+3): iterator,
+        // state, control; loop variables follow at base+3. Adjust the iterator
+        // explist to exactly 3 values like `compile_decl` does a multi-assign —
+        // a trailing call / `...` spreads to fill the remaining control slots
+        // (so `for k,v in pairs(t)` works), a shortfall is nil-padded, and
+        // values past the third are evaluated and discarded.
+        const NCTRL: u8 = 3;
+        let base = RegisterIndex(ctx.chunk.freereg);
+        let num_values = values.len();
 
-        // Compile up to 3 iterator values with destination hints. Each
-        // MOVE path frees its source temp so freereg settles at base+3
-        // naturally.
-        for (i, val_expr) in values.into_iter().enumerate().take(3) {
-            let target_reg = RegisterIndex(base.0 + i as u8);
-            let val = compile_expr_to_reg(ctx, val_expr, Some(target_reg))?;
-            if val != target_reg {
-                while ctx.chunk.freereg <= target_reg.0 {
-                    ctx.alloc_register()?;
+        for (i, val_expr) in values.into_iter().enumerate() {
+            let is_last = i + 1 == num_values;
+            let expected = base.0 + i as u8;
+
+            if is_last && (NCTRL as usize) > num_values {
+                let want = NCTRL - i as u8;
+                match val_expr {
+                    Expr::FuncCall(call) => {
+                        let regs = compile_expr_func_call(ctx, call, Want::Exact(want))?;
+                        assert_eq!(regs[0].0, expected);
+                        continue;
+                    }
+                    Expr::Method(call) => {
+                        let regs = compile_expr_method_call(ctx, call, Want::Exact(want))?;
+                        assert_eq!(regs[0].0, expected);
+                        continue;
+                    }
+                    Expr::VarArg => {
+                        let dst = ctx.reserve_regs(want)?;
+                        assert_eq!(dst.0, expected);
+                        ctx.emit(Instruction::VARARG {
+                            dst: dst.0,
+                            count: want + 1,
+                        });
+                        continue;
+                    }
+                    _ => {}
                 }
+            }
+
+            let mut desc = compile_expr(ctx, val_expr, None)?;
+            let reg = ctx.discharge_to_reg_mut(&mut desc, None)?;
+            if reg.0 != expected {
+                ctx.chunk.freereg = expected;
+                let slot = ctx.reserve_reg()?;
                 ctx.emit(Instruction::MOVE {
-                    dst: target_reg.0,
-                    src: val.0,
+                    dst: slot.0,
+                    src: reg.0,
                 });
-                ctx.free_reg(val);
+            } else if ctx.chunk.freereg > expected + 1 {
+                ctx.chunk.freereg = expected + 1;
             }
         }
 
-        // TFORCALL/TFORLOOP hardcode loop variables at base+3..base+2+count.
-        // The per-expression MOVE frees above keep the cursor disciplined.
-        assert_eq!(ctx.chunk.freereg, base.0 + 3);
+        // Nil-pad unfilled control slots; drop temps from any surplus values.
+        let ctrl_top = base.0 + NCTRL;
+        while ctx.chunk.freereg < ctrl_top {
+            let slot = ctx.reserve_reg()?;
+            let idx = ctx.alloc_constant(Value::nil())?;
+            ctx.emit(Instruction::LOAD { dst: slot.0, idx });
+        }
+        ctx.chunk.freereg = ctrl_top;
 
         // Promote the 3 anonymous control slots (iterator, state, control)
         // so body subexpressions can't reclaim them via free_reg.

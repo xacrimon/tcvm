@@ -15,7 +15,7 @@ use crate::dmm::{
 /// ```rust
 /// # use std::fmt::Display;
 /// # use tcvm::dmm::Gc;
-/// # use tcvm::unsize;
+/// # use tcvm::dmm::unsize;
 /// # fn main() {
 /// # tcvm::dmm::arena::rootless_mutate(|mc| {
 /// // Unsizing arrays to slices.
@@ -40,7 +40,7 @@ use crate::dmm::{
 /// ```rust,compile_fail
 /// # use std::error::Error;
 /// # use tcvm::dmm::Gc;
-/// # use tcvm::unsize;
+/// # use tcvm::dmm::unsize;
 /// # fn main() {
 /// # tcvm::dmm::arena::rootless_mutate(|mc| {
 /// // Error: `Option<char>` doesn't implement `Error`.
@@ -48,8 +48,9 @@ use crate::dmm::{
 /// # })
 /// # }
 /// ```
+#[doc(hidden)]
 #[macro_export]
-macro_rules! unsize {
+macro_rules! __unsize {
     ($gc:expr => $ty:ty) => {{
         let gc = $gc;
         // SAFETY: the closure has a trivial body and must be a valid pointer
@@ -60,6 +61,9 @@ macro_rules! unsize {
         }
     }};
 }
+
+#[doc(inline)]
+pub use __unsize as unsize;
 
 // Not public API; implementation detail of the `unsize` macro.
 //

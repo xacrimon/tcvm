@@ -24,7 +24,7 @@ mod hashbrown;
 pub use tcvm_derive::__unelide_lifetimes;
 
 #[doc(hidden)]
-pub use self::{arena::__DynRootable, no_drop::__MustNotImplDrop, unsize::__CoercePtrInternal};
+pub use self::{arena::__DynRootable, no_drop::__MustNotImplDrop, unsize::{__CoercePtrInternal, unsize}};
 
 pub use self::{
     allocator_api::MetricsAlloc,

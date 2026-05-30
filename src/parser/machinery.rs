@@ -9,8 +9,7 @@ use cstree::build::{GreenNodeBuilder, NodeCache};
 use cstree::green::GreenNode;
 use logos::Logos;
 
-use super::kind::SyntaxKind;
-use crate::T;
+use super::kind::{SyntaxKind, T};
 
 pub struct State<'cache, 'source> {
     cache: &'cache mut NodeCache<'static>,

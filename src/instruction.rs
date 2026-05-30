@@ -286,6 +286,16 @@ pub enum Instruction {
         count: u8,
     },
 
+    /// Optimized below-base read of an un-escaped named vararg: integer key
+    /// `1..=num_extras`, `"n"` for the count, else nil. `base` is unused at
+    /// run time but is the table operand when the epilogue rewrites this to
+    /// `GETTABLE` for an escaped vararg. Lua 5.5 `OP_GETVARG`.
+    VARARGGET {
+        dst: Register,
+        base: Register,
+        key: Register,
+    },
+
     VARARGPREP {
         num_fixed: u8,
     },

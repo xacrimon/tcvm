@@ -527,15 +527,27 @@ fn schedule_call_at<'gc>(
 ) -> Result<(), RuntimeError> {
     if let Some(closure) = function.as_lua() {
         let base = slot + 1;
+        let caller_provided = ts.stack.len().saturating_sub(base);
+        let num_params = closure.proto.num_params as usize;
+        let num_extras = if closure.proto.is_vararg {
+            caller_provided.saturating_sub(num_params) as u32
+        } else {
+            0
+        };
         let needed = base + closure.proto.max_stack_size as usize;
         if ts.stack.len() < needed {
             ts.stack.resize(needed, Value::nil());
+        }
+        // Nil-fill fixed params the caller didn't supply.
+        for i in caller_provided..num_params {
+            ts.stack[base + i] = Value::nil();
         }
         ts.push_lua(LuaFrame {
             closure,
             base,
             pc: 0,
             num_results: caller_returns,
+            num_extras,
             continuation: None,
         });
         Ok(())

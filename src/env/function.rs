@@ -20,6 +20,10 @@ pub struct Prototype<'gc> {
     pub upvalue_desc: Box<[UpValueDescriptor]>,
     pub num_params: u8,
     pub is_vararg: bool,
+    /// Lua 5.5 `PF_VATAB`: a named vararg parameter that escaped the optimized
+    /// below-base form, so `VARARGPREP` materializes a real table in
+    /// `R[num_params]`. When `false`, varargs stay below-base.
+    pub needs_vararg_table: bool,
     pub max_stack_size: u8,
     pub num_upvalues: u8,
     pub source: Option<LuaString<'gc>>,

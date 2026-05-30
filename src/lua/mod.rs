@@ -8,7 +8,7 @@ mod error;
 mod executor;
 pub(crate) mod stash;
 
-use crate::Rootable;
+use crate::dmm::Rootable;
 use crate::builtin;
 use crate::dmm::{Arena, Collect, DynamicRootSet, Mutation};
 use crate::env::shape::Shape;

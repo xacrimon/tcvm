@@ -10,7 +10,7 @@ use cstree::build::NodeCache;
 use machinery::{Span, State};
 use syntax::SyntaxNode;
 
-use crate::T;
+use kind::T;
 
 pub fn parse(
     cache: &mut NodeCache<'static>,
@@ -114,4 +114,5 @@ mod tests {
     );
     test!(global_star_nested, "test-files/global_star_nested.lua");
     test!(global_const_star, "test-files/global_const_star.lua");
+    test!(vararg_param, "test-files/vararg_param.lua");
 }

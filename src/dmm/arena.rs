@@ -35,7 +35,7 @@ impl<'a, T: ?Sized + Rootable<'a>> Rootable<'a> for __DynRootable<T> {
 ///
 /// ```
 /// # use tcvm::dmm::{Arena, Gc, Collect};
-/// # use tcvm::Rootable;
+/// # use tcvm::dmm::Rootable;
 /// #
 /// # fn main() {
 /// #[derive(Collect)]
@@ -56,7 +56,7 @@ impl<'a, T: ?Sized + Rootable<'a>> Rootable<'a> for __DynRootable<T> {
 ///
 /// ```
 /// # use tcvm::dmm::{Arena, Gc, Collect};
-/// # use tcvm::Rootable;
+/// # use tcvm::dmm::Rootable;
 /// #
 /// # fn main() {
 /// #[derive(Collect)]
@@ -68,17 +68,21 @@ impl<'a, T: ?Sized + Rootable<'a>> Rootable<'a> for __DynRootable<T> {
 /// type MyGenericArena<T> = Arena<Rootable![MyGenericRoot<'_, T>]>;
 /// # }
 /// ```
+#[doc(hidden)]
 #[macro_export]
-macro_rules! Rootable {
+macro_rules! __Rootable {
     ($gc:lifetime => $root:ty) => {
         // Instead of generating an impl of `Rootable`, we use a trait object. Thus, we avoid the
         // need to generate a new type for each invocation of this macro.
         $crate::dmm::__DynRootable::<dyn for<$gc> $crate::dmm::Rootable<$gc, Root = $root>>
     };
     ($root:ty) => {
-        $crate::Rootable!['__gc => $crate::dmm::__unelide_lifetimes!('__gc; $root)]
+        $crate::dmm::Rootable!['__gc => $crate::dmm::__unelide_lifetimes!('__gc; $root)]
     };
 }
+
+#[doc(inline)]
+pub use __Rootable as Rootable;
 
 /// A helper type alias for a `Rootable::Root` for a specific lifetime.
 pub type Root<'a, R> = <R as Rootable<'a>>::Root;

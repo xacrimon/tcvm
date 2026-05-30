@@ -143,8 +143,9 @@ pub trait Sequence<'gc>: 'gc {
 /// Helper macro for `Sequence::trace_pointers`: wraps a `&mut dyn Trace<'gc>`
 /// into a `Sized` adapter, then delegates to the type's derived
 /// `Collect::trace`. Call as `seq_trace_pointers!(self, cc)`.
+#[doc(hidden)]
 #[macro_export]
-macro_rules! seq_trace_pointers {
+macro_rules! __seq_trace_pointers {
     ($self:expr, $cc:expr) => {{
         struct __DynTraceAdapter<'__a, '__gc>(&'__a mut dyn $crate::dmm::Trace<'__gc>);
         impl<'__a, '__gc> $crate::dmm::Trace<'__gc> for __DynTraceAdapter<'__a, '__gc> {
@@ -161,6 +162,8 @@ macro_rules! seq_trace_pointers {
         $crate::dmm::Collect::trace($self, &mut __adapter);
     }};
 }
+
+pub use __seq_trace_pointers as seq_trace_pointers;
 
 /// Owning, pinned, GC-traced handle to a [`Sequence`]. Stored on a thread's
 /// frame stack as part of `Frame::Sequence`.
