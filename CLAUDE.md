@@ -15,6 +15,7 @@ Add under a ## Code Style section (create if missing).
 ## Code Style
 - Prefer inline match expressions over extracted helper functions for small primitive operations (e.g., comparisons). Do not introduce helpers like `primitive_lt`/`primitive_le` unless asked.
 - Skip confirmations for routine sed/file edits once a refactor is approved.
+- Comments: comment the non-obvious — invariants, "why this and not the obvious alternative", subtle safety/GC/ordering constraints. Do not narrate what the code plainly does, restate the function name, or annotate each step of a self-evident sequence. Prefer one tight sentence over a paragraph. Doc comments on public items are fine but should be terse.
 
 ## Git & PR Conventions
 - Never add `Co-Authored-By: Claude` trailers, Claude Code footers, or any Claude attribution to commits or PRs.

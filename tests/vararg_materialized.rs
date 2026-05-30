@@ -55,9 +55,8 @@ fn materialized_when_captured() {
 
 #[test]
 fn vararg_expr_reflects_table_mutation() {
-    // The key semantic the old below-base-only design got wrong: once the
-    // table is materialized, mutating it must be visible through a `...`
-    // expression (which reads elements 1..t.n from the table).
+    // Once materialized, mutations must be visible through `...` (which reads
+    // elements 1..t.n from the table), not just through `args[i]`.
     assert_eq!(
         run("local function first(a) return a end\n\
              local function f(...args)\n\

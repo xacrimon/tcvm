@@ -1506,9 +1506,7 @@ extern "rust-preserve-none" fn op_call<'gc>(
             if thread.stack.len() < needed {
                 thread.stack.resize(needed, Value::nil());
             }
-            // Nil-fill parameter slots the caller didn't supply.
-            // `nargs == 0` is the MULTRET sentinel — caller_provided is read
-            // from `thread.top` (set by the most recent multires producer).
+            // `nargs == 0` is the MULTRET sentinel: read the count from `thread.top`.
             let caller_provided = if nargs == 0 {
                 thread.top - new_base
             } else {
@@ -1590,10 +1588,8 @@ extern "rust-preserve-none" fn op_call<'gc>(
                         thread.stack[func_idx + i] = Value::nil();
                     }
                     if returns == 0 {
+                        // MULTRET: publish the dynamic top for the next consumer.
                         thread.stack.truncate(func_idx + retc);
-                        // MULTRET: publish the dynamic top so the next
-                        // multires consumer (outer CALL/RETURN/SETLIST) sees
-                        // the run-time count.
                         thread.top = func_idx + retc;
                     }
                     registers = unsafe { thread.stack.as_mut_ptr().add(base) };
@@ -1642,26 +1638,19 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
 
     match target {
         CallTarget::Lua(closure) => {
-            // Recover the *original* func slot of the current frame in its
-            // own caller — that's where the new (tail-called) frame's
-            // results must ultimately land. If the current frame is a
-            // vararg function whose VARARGPREP shifted its base past extras
-            // at `[base - num_extras .. base]`, those extras vanish with
-            // the tail-call and the new frame collapses back to that slot.
+            // Results must land in this frame's *original* func slot in its
+            // caller. A vararg frame's VARARGPREP shifted base past the extras
+            // at `[base - num_extras .. base]`, so that slot is below them.
             let (cur_base, cur_num_extras) = {
                 let f = thread.top_lua().unwrap();
                 (f.base, f.num_extras as usize)
             };
             let caller_func_idx = cur_base - 1 - cur_num_extras;
             let new_base = caller_func_idx + 1;
-            // Close upvalues for the current frame BEFORE we overwrite
-            // its stack slots with the tail-call's arguments; otherwise
-            // an open upvalue pointing into this frame captures the
-            // arg value instead of the local it used to reference.
+            // Close upvalues before overwriting these slots with args, so an
+            // open upvalue keeps referencing the local, not the arg value.
             close_upvalues(ctx.mutation(), thread, new_base);
-            // Move function + arguments down to the original func slot.
-            // `nargs == 0` is MULTRET — read the runtime count from
-            // `thread.top` (set by the most recent multires producer).
+            // `nargs == 0` is MULTRET: read the count from `thread.top`.
             let src_start = func_idx + 1;
             let nargs = if nargs == 0 {
                 thread.top - src_start
@@ -1671,32 +1660,25 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
             for i in 0..nargs {
                 thread.stack[new_base + i] = thread.stack[src_start + i];
             }
-            // Replace current frame
             let frame = thread.top_lua_mut().unwrap();
             frame.closure = closure;
             frame.pc = 0;
-            // The new frame starts at the original func slot's caller; the
-            // old VARARGPREP shift is discarded along with the old frame.
             frame.base = new_base;
-            // Recompute num_extras for the new function. Becomes the input
-            // to the new frame's VARARGPREP (if any).
+            // num_extras feeds the new frame's own VARARGPREP; num_results is
+            // left as-is (still the original caller's expectation).
             let num_params = closure.proto.num_params as usize;
             frame.num_extras = if closure.proto.is_vararg {
                 nargs.saturating_sub(num_params) as u32
             } else {
                 0
             };
-            // num_results stays the same (caller's expectation)
-            // Ensure stack is large enough
             let needed = new_base + closure.proto.max_stack_size as usize;
             if thread.stack.len() < needed {
                 thread.stack.resize(needed, Value::nil());
             }
-            // Nil-fill parameter slots the caller didn't supply.
             for i in nargs..num_params {
                 thread.stack[new_base + i] = Value::nil();
             }
-            // Rebind ip and registers
             ip = closure.proto.code.as_ptr();
             registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
             dispatch!();
@@ -1782,8 +1764,7 @@ extern "rust-preserve-none" fn op_return<'gc>(
 
     let cur_base = thread.top_lua().unwrap().base;
     let values_base = cur_base + values as usize;
-    // `count == 0` is MULTRET — read the run-time count from `thread.top`
-    // (set by the multires producer immediately preceding RETURN).
+    // `count == 0` is MULTRET: read the count from `thread.top`.
     let nret = if count == 0 {
         thread.top - values_base
     } else {
@@ -1979,10 +1960,8 @@ extern "rust-preserve-none" fn op_setlist<'gc>(
     let Some(t) = reg!(table).get_table() else {
         raise!();
     };
-    // `count == 0` is MULTRET — number of elements is determined by
-    // `thread.top` relative to the slot after the table register. The
-    // count can exceed u8 here (a VARARG count=0 spread can produce
-    // hundreds of elements), so we use usize-indexed register access.
+    // `count == 0` is MULTRET: element count comes from `thread.top`. It can
+    // exceed u8 (a `VARARG count=0` spread), so index the stack by usize.
     let base = thread.top_lua().unwrap().base;
     let elements_start = base + table as usize + 1;
     let n = if count == 0 {
@@ -2060,18 +2039,12 @@ extern "rust-preserve-none" fn op_closure<'gc>(
 // Varargs
 // ---------------------------------------------------------------------------
 
-/// Copy varargs into R[dst], R[dst+1], ...
+/// Copy varargs into `R[dst..]`. `count == 0` is MULTRET (copy all, set
+/// `thread.top`); `count > 0` copies `count - 1`, nil-padding short.
 ///
-/// `count == 0` is the MULTRET sentinel: copy *all* available varargs and
-/// update `thread.top` accordingly. `count > 0` copies up to `count - 1`
-/// varargs, nil-padding the shortfall. Grows the stack if necessary and
-/// rebinds the cached `registers` pointer after a potential reallocation.
-///
-/// The source of the varargs depends on `Prototype::needs_vararg_table`
-/// (Lua 5.5's `k` flag on `OP_VARARG`): the optimized form reads the
-/// below-base region `stack[base - num_extras .. base]`; the materialized
-/// form reads elements `1..=t.n` from the vararg table in `R[num_params]`,
-/// so mutations to the table are reflected.
+/// Source depends on `Prototype::needs_vararg_table` (Lua's `OP_VARARG` `k`
+/// flag): optimized reads the below-base region; materialized reads `1..=t.n`
+/// from the table in `R[num_params]`, so mutations to it are visible.
 #[inline(never)]
 extern "rust-preserve-none" fn op_vararg<'gc>(
     instruction: Instruction,
@@ -2083,8 +2056,7 @@ extern "rust-preserve-none" fn op_vararg<'gc>(
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
     let (dst, count) = args!(Instruction::VARARG { dst, count });
-    // Copy the scalars/`Gc` out of the frame so the borrow ends before we
-    // touch `thread.stack` mutably. `proto` is a `Gc` (Copy).
+    // Copy scalars/`Gc` out so the frame borrow ends before touching the stack.
     let (base, num_extras, proto) = {
         let frame = thread.top_lua().unwrap();
         (frame.base, frame.num_extras as usize, frame.closure.proto)
@@ -2154,16 +2126,10 @@ extern "rust-preserve-none" fn op_vararg<'gc>(
     dispatch!();
 }
 
-/// `R[dst] := <vararg>[R[key]]` — the optimized below-base read for an
-/// un-escaped named vararg. Integer keys `1..=num_extras` yield the
-/// 1-indexed extra, the string `"n"` yields the extras count, anything
-/// else yields `nil`.
-///
-/// Only the optimized form survives to run time: if the named vararg
-/// escapes, the compiler's epilogue (Lua's `luaK_finish`) rewrites every
-/// `VARARGGET` to `GETTABLE`, so this handler never inspects `R[base]`
-/// (it stays vestigial, kept only as the `table` operand for that rewrite).
-/// Mirrors Lua 5.5 `OP_GETVARG`, whose handler likewise ignores `B`.
+/// Optimized below-base read of an un-escaped named vararg: integer key
+/// `1..=num_extras`, `"n"` = count, else nil. Escaped varargs are rewritten
+/// to `GETTABLE` at compile time, so `base` is unused here (kept only as that
+/// rewrite's table operand). Lua 5.5 `OP_GETVARG`, which also ignores `B`.
 #[inline(never)]
 extern "rust-preserve-none" fn op_varargget<'gc>(
     instruction: Instruction,
@@ -2198,20 +2164,14 @@ extern "rust-preserve-none" fn op_varargget<'gc>(
     dispatch!();
 }
 
-/// Adjust stack on entry to a vararg function.
+/// Adjust the stack on entry to a vararg function: rotate the leading
+/// `num_params` slots past the extras (layout becomes `[extras... fixed...]`)
+/// and advance `frame.base` past the extras, so `VARARG` can read
+/// `stack[base - num_extras .. base]`.
 ///
-/// The CALL handler stages args at `stack[base..base + caller_provided]` and
-/// pre-computes `frame.num_extras = caller_provided.saturating_sub(num_params)`.
-/// VARARGPREP rotates the leading `num_params` slots past the extras so that
-/// the layout becomes `[extras... fixed_params...]`, then advances
-/// `frame.base` so the function's locals start past the extras. A subsequent
-/// `VARARG` reads from `stack[new_base - num_extras .. new_base]`.
-///
-/// When `Prototype::needs_vararg_table` is set (a named vararg that escaped),
-/// it additionally materializes a real vararg table `{ extras...; n = count }`
-/// into `R[num_params]`, the reserved named-vararg slot. This is the port of
-/// Lua 5.5's `createvarargtab`; `VARARG` / `GETTABLE` then read from the table
-/// instead of the below-base region, so mutations to the table are observed.
+/// When `needs_vararg_table` is set, also materializes `{ extras...; n=count }`
+/// into `R[num_params]` (Lua's `createvarargtab`); `VARARG` / `GETTABLE` then
+/// read the table, so mutations to it are observed.
 #[inline(never)]
 extern "rust-preserve-none" fn op_varargprep<'gc>(
     instruction: Instruction,
@@ -2249,10 +2209,8 @@ extern "rust-preserve-none" fn op_varargprep<'gc>(
         base
     };
     if needs_table {
-        // Materialize `{ extras...; n = num_extras }` into the reserved
-        // named-vararg slot. Root the table via the stack slot before
-        // filling it (mirrors `op_newtable`), so an allocation mid-fill
-        // can't collect it.
+        // Store into the stack slot before filling so a mid-fill alloc can't
+        // collect the table (mirrors `op_newtable`).
         let extras_start = new_base - num_extras;
         let table = Table::new(ctx);
         thread.stack[new_base + num_params] = Value::table(table);
@@ -2465,11 +2423,9 @@ pub(crate) fn frame_return<'gc>(
         return FrameReturn::Continuation(cont.func);
     }
 
-    // The caller placed this function at slot `cur_base - 1 - num_extras` —
-    // VARARGPREP shifted the frame's base past the extras (stored at
-    // `[cur_base - num_extras .. cur_base]`), so the func slot lives below
-    // the extras region. For non-vararg frames `num_extras == 0` and this
-    // is just `cur_base - 1`.
+    // The func slot sits at `cur_base - 1 - num_extras`: VARARGPREP shifted
+    // base past the extras at `[cur_base - num_extras .. cur_base]` (0 for
+    // non-vararg frames).
     close_upvalues(mc, thread, cur_base);
     close_tbc_vars(mc, thread, cur_base);
     thread.frames.pop();
@@ -2484,8 +2440,7 @@ pub(crate) fn frame_return<'gc>(
         thread.status = ThreadStatus::Result { bottom: dst_start };
         return FrameReturn::TopLevel;
     }
-    // `num_results == 0` (the CALL's `returns` operand) is MULTRET: deliver
-    // all `nret` values and publish `thread.top` for the next consumer.
+    // `num_results == 0` is the CALL's MULTRET: deliver all `nret` and publish `thread.top`.
     if num_results == 0 {
         for i in 0..nret {
             thread.stack[dst_start + i] = thread.stack[values_base + i];

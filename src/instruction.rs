@@ -286,12 +286,10 @@ pub enum Instruction {
         count: u8,
     },
 
-    /// `R[dst] := R[base][R[key]]` where `R[base]` is the named-vararg
-    /// register slot. Path-polymorphic on the runtime type of `R[base]`:
-    /// a real table dispatches through normal indexed get; a `nil`
-    /// sentinel triggers the optimized below-base read (integer index
-    /// `k` in 1..=num_extras, `"n"` for the count, anything else nil).
-    /// Mirrors Lua 5.5 `OP_GETVARG A B C`.
+    /// Optimized below-base read of an un-escaped named vararg: integer key
+    /// `1..=num_extras`, `"n"` for the count, else nil. `base` is unused at
+    /// run time but is the table operand when the epilogue rewrites this to
+    /// `GETTABLE` for an escaped vararg. Lua 5.5 `OP_GETVARG`.
     VARARGGET {
         dst: Register,
         base: Register,

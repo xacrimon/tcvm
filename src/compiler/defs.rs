@@ -7,49 +7,34 @@ use crate::instruction::{Instruction, UpValueDescriptor};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RegisterIndex(pub u8);
 
-/// Escape-analysis bookkeeping for a function that declares a Lua 5.5
-/// named vararg parameter (`function f(...name)`). `Some` on the `Chunk`
-/// iff such a parameter exists. The single reserved register holding the
-/// vararg table lives at `R[num_params]` (decided in the VM, not the
-/// compiler). During body compilation either flag may flip; at the
-/// epilogue, `used_as_non_base || captured` decides whether the function
-/// materializes a table — recorded as `Prototype::needs_vararg_table` and
-/// consumed by the `VARARGPREP` handler, which builds the table directly.
+/// Escape-analysis state for a named vararg parameter (`function f(...name)`).
+/// `Some` on the `Chunk` iff one is declared. If either flag is set by the end
+/// of the body the function materializes a vararg table (see `needs_table`).
 #[derive(Debug, Clone, Copy)]
 pub struct VarargInfo {
-    /// Set when `name` is used as a value (anything other than the base of
-    /// `name[exp]` / `name.id`), e.g. `local b = name` or `f(name)`.
+    /// `name` used as a value, i.e. anywhere but the base of `name[exp]` / `name.id`.
     pub used_as_non_base: bool,
-    /// Set when a nested closure captures `name` as an upvalue.
+    /// `name` captured as an upvalue by a nested closure.
     pub captured: bool,
 }
 
 impl VarargInfo {
-    /// Whether escape analysis forces materialization of a real vararg
-    /// table. Mirrors the conditions in the Lua 5.5 manual (§3.4): a named
-    /// vararg stays optimized only while it is *not* captured as an upvalue
-    /// and is used *only* as the base table of `t[exp]` / `t.id`.
+    /// Per the Lua 5.5 manual §3.4, a named vararg stays optimized only while
+    /// not captured and used solely as the base of `t[exp]` / `t.id`.
     pub fn needs_table(&self) -> bool {
         self.used_as_non_base || self.captured
     }
 }
 
-/// How many results a multires-capable expression (function call,
-/// `...`) is expected to produce. Threaded through `compile_expr*`
-/// helpers so the last expression of a multires context (last argument
-/// of a call, last initializer of a table, last RHS of a multi-assign,
-/// last expression of `return`, generic-`for` initializer) can request
-/// `MultRet` and have the resulting `CALL` / `VARARG` emit the
-/// MULTRET sentinel (`returns == 0` / `count == 0`) so the outer
-/// instruction reads `thread.top` at run time.
+/// Result-count request for a multires-capable expression (call or `...`),
+/// threaded through `compile_expr*`. `MultRet` makes the emitted CALL/VARARG
+/// use the MULTRET sentinel (`returns`/`count == 0`) so the consumer reads
+/// `thread.top` at run time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Want {
-    /// Materialize exactly this many results, nil-padding the
-    /// shortfall and discarding the excess. `Exact(0)` discards all
-    /// returns (the bare-call-as-statement form).
+    /// Exactly this many results, nil-padding/truncating. `Exact(0)` discards all.
     Exact(u8),
-    /// Variadic multires: all available results, dynamic top tracked
-    /// via `thread.top`.
+    /// All available results; count tracked via `thread.top`.
     MultRet,
 }
 
@@ -238,12 +223,9 @@ pub struct Chunk<'gc> {
     pub(super) max_stack: u8,
     pub(super) arity: u8,
     pub(super) is_vararg: bool,
-    /// Per-chunk escape-analysis state for the Lua 5.5 named-vararg
-    /// parameter (`function f(...name)`). `Some` iff the function declares
-    /// one. The epilogue inspects the usage flags: if either fires, every
-    /// `VARARGGET` is rewritten to `GETTABLE` and `Prototype::needs_vararg_table`
-    /// is set so the VM builds a real table; otherwise the accesses stay as
-    /// optimized below-base `VARARGGET` reads.
+    /// Escape-analysis state for the named vararg parameter; `Some` iff one is
+    /// declared. Drives the epilogue's `VARARGGET`->`GETTABLE` rewrite and
+    /// `Prototype::needs_vararg_table`.
     pub(super) vararg_info: Option<VarargInfo>,
     pub(super) labels: Vec<usize>,
     pub(super) jump_patches: Vec<(usize, u16)>,
