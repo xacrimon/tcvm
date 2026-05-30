@@ -1,0 +1,66 @@
+---
+source: src/compiler/snapshot_tests.rs
+expression: output
+---
+; function (params=0, vararg=true, stack=14, upvalues=1)
+; constants:
+;   K0 = 1
+;   K1 = 2
+;   K2 = 3
+;   K3 = true
+;   K4 = false
+;   K5 = 0
+; upvalues:
+;   U0 = local R0
+; code:
+0000  VARARGPREP      fixed=0
+0001  LOAD            R0 K0  ; 1
+0002  LOAD            R1 K1  ; 2
+0003  LOAD            R2 K2  ; 3
+0004  TEST            R0 inv=false
+0005  JMP             +3
+0006  NOT             R3 R1
+0007  JMP             +2
+0008  LFALSESKIP      R3
+0009  LOAD            R3 K3  ; true
+0010  TEST            R0 inv=true
+0011  JMP             +2
+0012  NOT             R4 R1
+0013  JMP             +2
+0014  LFALSESKIP      R4
+0015  LOAD            R4 K3  ; true
+0016  TEST            R0 inv=false
+0017  JMP             +5
+0018  TEST            R1 inv=false
+0019  JMP             +3
+0020  NOT             R5 R2
+0021  JMP             +2
+0022  LFALSESKIP      R5
+0023  LOAD            R5 K3  ; true
+0024  TEST            R0 inv=true
+0025  JMP             +4
+0026  TEST            R1 inv=true
+0027  JMP             +2
+0028  NOT             R6 R2
+0029  JMP             +2
+0030  LFALSESKIP      R6
+0031  LOAD            R6 K3  ; true
+0032  TEST            R0 inv=false
+0033  JMP             +3
+0034  LOAD            R7 K4  ; false
+0035  JMP             +2
+0036  LFALSESKIP      R7
+0037  LOAD            R7 K3  ; true
+0038  TEST            R0 inv=false
+0039  JMP             +3
+0040  NOT             R8 R1
+0041  TEST            R8 inv=false
+0042  JMP             +2
+0043  LOAD            R9 K5  ; 0
+0044  RETURN          R9 count=2
+0045  MOVE            R9 R3
+0046  MOVE            R10 R4
+0047  MOVE            R11 R5
+0048  MOVE            R12 R6
+0049  MOVE            R13 R7
+0050  RETURN          R9 count=6

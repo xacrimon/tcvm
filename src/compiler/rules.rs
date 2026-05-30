@@ -2705,31 +2705,36 @@ fn compile_expr_prefix_op(
     let mut inner = compile_expr(ctx, rhs_expr, None)?;
 
     // Constant fold paths. Each returns a fresh const expdesc that the
-    // enclosing operator can fold against again.
-    match (op, inner.kind) {
-        (PrefixOperator::Neg, ExprKind::Numeral(Numeral::Int(n))) => {
-            return Ok(ExprDesc::from_numeral(Numeral::Int(n.wrapping_neg())));
-        }
-        (PrefixOperator::Neg, ExprKind::Numeral(Numeral::Float(f))) => {
-            return Ok(ExprDesc::from_numeral(Numeral::Float(-f)));
-        }
-        (PrefixOperator::BitNot, ExprKind::Numeral(Numeral::Int(n))) => {
-            return Ok(ExprDesc::from_numeral(Numeral::Int(!n)));
-        }
-        (PrefixOperator::BitNot, ExprKind::Numeral(Numeral::Float(f))) => {
-            // Lua: bitwise on float requires exact integer convertibility.
-            if let Some(i) = num::exact_float_to_int(f) {
-                return Ok(ExprDesc::from_numeral(Numeral::Int(!i)));
+    // enclosing operator can fold against again. Only valid when the
+    // operand carries no pending short-circuit jumps: `a and 5` has kind
+    // `Numeral(5)` but a live `false_list`, so folding it would silently
+    // drop the falsy-`a` edge (and produce a wrong constant).
+    if !inner.has_jumps() {
+        match (op, inner.kind) {
+            (PrefixOperator::Neg, ExprKind::Numeral(Numeral::Int(n))) => {
+                return Ok(ExprDesc::from_numeral(Numeral::Int(n.wrapping_neg())));
             }
-            // else fall through — runtime will raise if non-convertible.
+            (PrefixOperator::Neg, ExprKind::Numeral(Numeral::Float(f))) => {
+                return Ok(ExprDesc::from_numeral(Numeral::Float(-f)));
+            }
+            (PrefixOperator::BitNot, ExprKind::Numeral(Numeral::Int(n))) => {
+                return Ok(ExprDesc::from_numeral(Numeral::Int(!n)));
+            }
+            (PrefixOperator::BitNot, ExprKind::Numeral(Numeral::Float(f))) => {
+                // Lua: bitwise on float requires exact integer convertibility.
+                if let Some(i) = num::exact_float_to_int(f) {
+                    return Ok(ExprDesc::from_numeral(Numeral::Int(!i)));
+                }
+                // else fall through — runtime will raise if non-convertible.
+            }
+            (PrefixOperator::Not, ExprKind::Numeral(_) | ExprKind::Bool(true)) => {
+                return Ok(ExprDesc::from_bool(false));
+            }
+            (PrefixOperator::Not, ExprKind::Bool(false) | ExprKind::Nil) => {
+                return Ok(ExprDesc::from_bool(true));
+            }
+            _ => {}
         }
-        (PrefixOperator::Not, ExprKind::Numeral(_) | ExprKind::Bool(true)) => {
-            return Ok(ExprDesc::from_bool(false));
-        }
-        (PrefixOperator::Not, ExprKind::Bool(false) | ExprKind::Nil) => {
-            return Ok(ExprDesc::from_bool(true));
-        }
-        _ => {}
     }
 
     // `not <expr>`: when the operand is a jump-list expression (comparison,
@@ -2759,10 +2764,30 @@ fn compile_expr_prefix_op(
                     dst: dst.0,
                     src: src.0,
                 });
-                return Ok(ExprDesc::from_reg(dst));
+                // codenot: the NOT result is the fall-through value; the
+                // operand's short-circuit jumps are the other boolean edge.
+                // Their preserved values are useless once negated, so
+                // downgrade TESTSET→TEST, then swap true/false. The
+                // consumer's discharge materialises the swapped lists.
+                ctx.downgrade_testsets(&inner.true_list);
+                ctx.downgrade_testsets(&inner.false_list);
+                let mut result = ExprDesc::from_reg(dst);
+                result.true_list = inner.false_list;
+                result.false_list = inner.true_list;
+                return Ok(result);
             }
+            // Const operand still carrying short-circuit jumps, e.g.
+            // `not (a and 5)`: the folded `not <const>` is the fall-through
+            // value, the jumps the other edge. (A jump-free const was
+            // folded above.) Same codenot list handling as `Reg`.
             ExprKind::Numeral(_) | ExprKind::Bool(_) | ExprKind::Nil => {
-                unreachable!("const kinds folded above")
+                let folded = matches!(inner.kind, ExprKind::Bool(false) | ExprKind::Nil);
+                ctx.downgrade_testsets(&inner.true_list);
+                ctx.downgrade_testsets(&inner.false_list);
+                let mut result = ExprDesc::from_bool(folded);
+                result.true_list = inner.false_list;
+                result.false_list = inner.true_list;
+                return Ok(result);
             }
         }
     }
