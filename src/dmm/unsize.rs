@@ -15,7 +15,7 @@ use crate::dmm::{
 /// ```rust
 /// # use std::fmt::Display;
 /// # use tcvm::dmm::Gc;
-/// # use tcvm::unsize;
+/// # use tcvm::dmm::unsize;
 /// # fn main() {
 /// # tcvm::dmm::arena::rootless_mutate(|mc| {
 /// // Unsizing arrays to slices.
@@ -40,7 +40,7 @@ use crate::dmm::{
 /// ```rust,compile_fail
 /// # use std::error::Error;
 /// # use tcvm::dmm::Gc;
-/// # use tcvm::unsize;
+/// # use tcvm::dmm::unsize;
 /// # fn main() {
 /// # tcvm::dmm::arena::rootless_mutate(|mc| {
 /// // Error: `Option<char>` doesn't implement `Error`.
