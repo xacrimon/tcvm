@@ -1893,7 +1893,7 @@ extern "rust-preserve-none" fn op_tforprep<'gc>(
     dispatch!();
 }
 
-/// Generic for call: R[base+4], ... = R[base](R[base+1], R[base+2])
+/// Generic for call: R[base+3], ... = R[base](R[base+1], R[base+2])
 #[inline(never)]
 extern "rust-preserve-none" fn op_tforcall<'gc>(
     instruction: Instruction,
@@ -1917,7 +1917,8 @@ extern "rust-preserve-none" fn op_tforcall<'gc>(
     invoke_metamethod!(iter, &[state, control], cont);
 }
 
-/// Generic for loop test: if R[base+2] != nil then R[base] = R[base+2] and jump back.
+/// Generic for loop test: if the first result R[base+3] != nil, copy it into
+/// the control R[base+2] and jump back to the body.
 #[inline(never)]
 extern "rust-preserve-none" fn op_tforloop<'gc>(
     instruction: Instruction,
@@ -1929,9 +1930,9 @@ extern "rust-preserve-none" fn op_tforloop<'gc>(
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
     let (base, offset) = args!(Instruction::TFORLOOP { base, offset });
-    let control = reg!(base + 2);
-    if !control.is_nil() {
-        *reg!(mut base) = control;
+    let first = reg!(base + 3);
+    if !first.is_nil() {
+        *reg!(mut base + 2) = first;
         ip = unsafe { ip.offset(offset as isize) };
     }
     dispatch!();
@@ -2917,16 +2918,16 @@ extern "rust-preserve-none" fn cont_tforcall<'gc>(
         _ => unsafe { std::hint::unreachable_unchecked() },
     };
     debug_assert!(
-        base as usize + 4 + count as usize <= u8::MAX as usize + 1,
+        base as usize + 3 + count as usize <= u8::MAX as usize + 1,
         "TFORCALL destination range exceeds u8 register space",
     );
 
     let to_copy = (cont.nret as usize).min(count as usize);
     for i in 0..to_copy {
-        *reg!(mut base + 4 + i as u8) = thread.stack[cont.results_base + i];
+        *reg!(mut base + 3 + i as u8) = thread.stack[cont.results_base + i];
     }
     for i in to_copy..count as usize {
-        *reg!(mut base + 4 + i as u8) = Value::nil();
+        *reg!(mut base + 3 + i as u8) = Value::nil();
     }
     dispatch!();
 }
