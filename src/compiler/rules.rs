@@ -2569,29 +2569,25 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
                     .value()
                     .ok_or_else(|| ice("table array without value"))?;
 
-                // Trailing call/`...`: spread via `SETLIST count=0`. Flush any
-                // pending fixed elements first so it starts at `pending_base`.
+                // Trailing call/`...`: spread via a single MULTRET `SETLIST`.
+                // The pending fixed elements stay on the stack below the
+                // multires slot; `op_setlist` with `count=0` sweeps from
+                // `table+1` to `top`, so one SETLIST covers the whole batch
+                // (matches luac — no intermediate flush).
                 if is_last
                     && matches!(
                         &value_expr,
                         Expr::FuncCall(_) | Expr::Method(_) | Expr::VarArg
                     )
                 {
-                    if array_pending > 0 {
-                        ctx.emit(Instruction::SETLIST {
-                            table: dst.0,
-                            count: array_pending,
-                            offset: array_count - array_pending as u16,
-                        });
-                        array_pending = 0;
-                        ctx.chunk.freereg = pending_base;
-                    }
-                    compile_trailing_multires(ctx, value_expr, RegisterIndex(pending_base))?;
+                    let slot = RegisterIndex(pending_base + array_pending);
+                    compile_trailing_multires(ctx, value_expr, slot)?;
                     ctx.emit(Instruction::SETLIST {
                         table: dst.0,
                         count: 0,
-                        offset: array_count,
+                        offset: array_count - array_pending as u16,
                     });
+                    array_pending = 0;
                     ctx.chunk.freereg = pending_base;
                     continue;
                 }
