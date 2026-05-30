@@ -578,7 +578,32 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
 
     /// Patch every jump in `list` to the current tape position (the next
     /// instruction to be emitted).
-    fn patch_to_here(&mut self, list: JumpList) {
+    ///
+    /// Trailing no-op jumps are elided rather than patched to offset 0: a
+    /// list jump that is the last instruction on the tape, controlled by a
+    /// side-effect-free `TEST`/`TESTSET`, would jump to its own successor —
+    /// a dead `TEST; JMP +0` pair (reference Lua leaves these in; we don't).
+    /// Pop both. Sound only at the tail, where no other live tape index
+    /// shifts, and only for `TEST`/`TESTSET` controls — a `CMP` predecessor
+    /// may run a metamethod and must stay.
+    fn patch_to_here(&mut self, mut list: JumpList) {
+        loop {
+            let end = self.next_offset();
+            let Some(pos) = list.jumps.iter().position(|&j| j + 1 == end) else {
+                break;
+            };
+            let j = list.jumps[pos];
+            if j == 0
+                || !matches!(
+                    self.chunk.tape[j - 1],
+                    Instruction::TEST { .. } | Instruction::TESTSET { .. }
+                )
+            {
+                break;
+            }
+            self.chunk.tape.truncate(j - 1);
+            list.jumps.remove(pos);
+        }
         let target = self.next_offset();
         self.patch_to(list, target);
     }
