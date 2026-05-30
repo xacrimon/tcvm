@@ -2745,6 +2745,13 @@ fn compile_expr_prefix_op(
         match inner.kind {
             ExprKind::Jump(Some(idx)) => {
                 ctx.flip_control_polarity(idx);
+                // codenot: the lists' preserved values are useless once
+                // negated, so downgrade TESTSET→TEST (Lua's `removevalues`)
+                // before swapping. Without this, a `not (a or <cmp>)`-style
+                // operand keeps the `or`'s value-preserving TESTSET and the
+                // expression yields the operand value instead of a boolean.
+                ctx.downgrade_testsets(&inner.true_list);
+                ctx.downgrade_testsets(&inner.false_list);
                 mem::swap(&mut inner.true_list, &mut inner.false_list);
                 return Ok(inner);
             }

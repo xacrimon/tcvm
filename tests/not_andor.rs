@@ -16,6 +16,17 @@ fn eval_bool(src: &str) -> bool {
     lua.execute::<bool>(&ex).expect("run")
 }
 
+fn eval_int(src: &str) -> i64 {
+    let mut lua = Lua::new();
+    let ex = lua
+        .try_enter(|ctx| -> Result<_, LoadError> {
+            let chunk = ctx.load(src, Some("not_andor"))?;
+            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+        })
+        .expect("load");
+    lua.execute::<i64>(&ex).expect("run")
+}
+
 #[test]
 fn not_of_and_falsy_lhs() {
     // a falsy => (a and b) falsy => not(...) true
@@ -68,6 +79,42 @@ fn not_of_andor_in_branch() {
     ));
     assert!(!eval_bool(
         "local a, b = 1, 2; if not (a and b) then return true else return false end"
+    ));
+}
+
+#[test]
+fn not_of_or_with_comparison_tail() {
+    // `not (a or (b<c))`: the `or`'s value-preserving TESTSET must be
+    // downgraded to a TEST by the `not`, else the expression yields the
+    // operand value instead of a boolean. a truthy => short-circuits to a
+    // => not(a) false.
+    assert!(!eval_bool(
+        "local a, b, c = 2, 1, 9; return not (a or (b < c))"
+    ));
+    // a falsy => evaluate b<c. 1<9 true => not(true) false.
+    assert!(!eval_bool(
+        "local a, b, c = false, 1, 9; return not (a or (b < c))"
+    ));
+    // a falsy, 9<1 false => not(false) true.
+    assert!(eval_bool(
+        "local a, b, c = false, 9, 1; return not (a or (b < c))"
+    ));
+    // projected through a further `and`/`or` (the shape the sweep caught):
+    assert_eq!(
+        eval_int("local a, b, c = 2, 1, 9; return (not (a or (b < c))) and 1 or 0"),
+        0
+    );
+}
+
+#[test]
+fn not_of_and_with_comparison_tail() {
+    // a truthy, b<c true => `a and (b<c)` true => not(...) false.
+    assert!(!eval_bool(
+        "local a, b, c = 1, 1, 9; return not (a and (b < c))"
+    ));
+    // a falsy => `a and (b<c)` false => not(...) true.
+    assert!(eval_bool(
+        "local a, b, c = false, 1, 9; return not (a and (b < c))"
     ));
 }
 
