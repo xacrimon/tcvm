@@ -29,6 +29,22 @@ fn explicit_three_value_iterator() {
 }
 
 #[test]
+fn multi_value_iterator_call() {
+    // A single call returning (iter, state, control) must spread into the
+    // three control slots (the multires adjustment).
+    assert_eq!(
+        run(
+            "local function iter(_, c) if c < 3 then return c + 1 end end\n\
+             local function mk() return iter, nil, 0 end\n\
+             local sum = 0\n\
+             for x in mk() do sum = sum + x end\n\
+             return sum"
+        ),
+        6
+    );
+}
+
+#[test]
 fn two_loop_variables() {
     // Iterator returning two values per step (key-like, value-like).
     assert_eq!(
@@ -52,5 +68,25 @@ fn empty_iteration() {
              for x in iter, nil, 0 do n = n + 1 end\n\
              return n"),
         0
+    );
+}
+
+#[test]
+fn pairs_style_over_table() {
+    // Hand-rolled stateful iterator over an array-like table, returned as a
+    // single multi-value call — the realistic `for k,v in pairs(t)` shape.
+    assert_eq!(
+        run("local t = { 10, 20, 30, 40 }\n\
+             local function inext(tbl, i)\n\
+             \x20 i = i + 1\n\
+             \x20 local v = tbl[i]\n\
+             \x20 if v ~= nil then return i, v end\n\
+             end\n\
+             local function each(tbl) return inext, tbl, 0 end\n\
+             local sum = 0\n\
+             for i, v in each(t) do sum = sum + i + v end\n\
+             return sum"),
+        // i: 1+2+3+4=10, v: 10+20+30+40=100
+        110
     );
 }

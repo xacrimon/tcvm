@@ -4052,7 +4052,6 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
 
 fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
     scope_lexical_break(ctx, |ctx| {
-        // Compile iterator expressions into base, base+1, base+2
         let values: Vec<_> = item
             .values()
             .ok_or_else(|| ice("for_gen without values"))?
@@ -4063,37 +4062,68 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
             .collect();
         let num_targets = targets.len();
 
-        // We need 3 control registers + N target registers
-        // R[base] = iterator function
-        // R[base+1] = state
-        // R[base+2] = initial control variable
-        // R[base+3]..R[base+2+N] = loop variables
-        let base = ctx.alloc_register()?;
-        // Pre-allocate the remaining two control registers
-        ctx.alloc_register()?; // base+1
-        ctx.alloc_register()?; // base+2
+        // Control registers land contiguously at [base, base+3): iterator,
+        // state, control; loop variables follow at base+3. Adjust the iterator
+        // explist to exactly 3 values like `compile_decl` does a multi-assign —
+        // a trailing call / `...` spreads to fill the remaining control slots
+        // (so `for k,v in pairs(t)` works), a shortfall is nil-padded, and
+        // values past the third are evaluated and discarded.
+        const NCTRL: u8 = 3;
+        let base = RegisterIndex(ctx.chunk.freereg);
+        let num_values = values.len();
 
-        // Compile up to 3 iterator values with destination hints. Each
-        // MOVE path frees its source temp so freereg settles at base+3
-        // naturally.
-        for (i, val_expr) in values.into_iter().enumerate().take(3) {
-            let target_reg = RegisterIndex(base.0 + i as u8);
-            let val = compile_expr_to_reg(ctx, val_expr, Some(target_reg))?;
-            if val != target_reg {
-                while ctx.chunk.freereg <= target_reg.0 {
-                    ctx.alloc_register()?;
+        for (i, val_expr) in values.into_iter().enumerate() {
+            let is_last = i + 1 == num_values;
+            let expected = base.0 + i as u8;
+
+            if is_last && (NCTRL as usize) > num_values {
+                let want = NCTRL - i as u8;
+                match val_expr {
+                    Expr::FuncCall(call) => {
+                        let regs = compile_expr_func_call(ctx, call, Want::Exact(want))?;
+                        assert_eq!(regs[0].0, expected);
+                        continue;
+                    }
+                    Expr::Method(call) => {
+                        let regs = compile_expr_method_call(ctx, call, Want::Exact(want))?;
+                        assert_eq!(regs[0].0, expected);
+                        continue;
+                    }
+                    Expr::VarArg => {
+                        let dst = ctx.reserve_regs(want)?;
+                        assert_eq!(dst.0, expected);
+                        ctx.emit(Instruction::VARARG {
+                            dst: dst.0,
+                            count: want + 1,
+                        });
+                        continue;
+                    }
+                    _ => {}
                 }
+            }
+
+            let mut desc = compile_expr(ctx, val_expr, None)?;
+            let reg = ctx.discharge_to_reg_mut(&mut desc, None)?;
+            if reg.0 != expected {
+                ctx.chunk.freereg = expected;
+                let slot = ctx.reserve_reg()?;
                 ctx.emit(Instruction::MOVE {
-                    dst: target_reg.0,
-                    src: val.0,
+                    dst: slot.0,
+                    src: reg.0,
                 });
-                ctx.free_reg(val);
+            } else if ctx.chunk.freereg > expected + 1 {
+                ctx.chunk.freereg = expected + 1;
             }
         }
 
-        // TFORCALL/TFORLOOP hardcode loop variables at base+3..base+2+count.
-        // The per-expression MOVE frees above keep the cursor disciplined.
-        assert_eq!(ctx.chunk.freereg, base.0 + 3);
+        // Nil-pad unfilled control slots; drop temps from any surplus values.
+        let ctrl_top = base.0 + NCTRL;
+        while ctx.chunk.freereg < ctrl_top {
+            let slot = ctx.reserve_reg()?;
+            let idx = ctx.alloc_constant(Value::nil())?;
+            ctx.emit(Instruction::LOAD { dst: slot.0, idx });
+        }
+        ctx.chunk.freereg = ctrl_top;
 
         // Promote the 3 anonymous control slots (iterator, state, control)
         // so body subexpressions can't reclaim them via free_reg.
