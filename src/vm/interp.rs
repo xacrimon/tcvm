@@ -2062,11 +2062,16 @@ extern "rust-preserve-none" fn op_closure<'gc>(
 
 /// Copy varargs into R[dst], R[dst+1], ...
 ///
-/// `count == 0` is the MULTRET sentinel: copy *all* extras and update
-/// `thread.top` to `base + dst + num_extras`. Grows the stack if necessary
-/// and rebinds the cached `registers` pointer after a potential reallocation.
+/// `count == 0` is the MULTRET sentinel: copy *all* available varargs and
+/// update `thread.top` accordingly. `count > 0` copies up to `count - 1`
+/// varargs, nil-padding the shortfall. Grows the stack if necessary and
+/// rebinds the cached `registers` pointer after a potential reallocation.
 ///
-/// `count > 0` copies up to `count - 1` extras, nil-padding the shortfall.
+/// The source of the varargs depends on `Prototype::needs_vararg_table`
+/// (Lua 5.5's `k` flag on `OP_VARARG`): the optimized form reads the
+/// below-base region `stack[base - num_extras .. base]`; the materialized
+/// form reads elements `1..=t.n` from the vararg table in `R[num_params]`,
+/// so mutations to the table are reflected.
 #[inline(never)]
 extern "rust-preserve-none" fn op_vararg<'gc>(
     instruction: Instruction,
@@ -2078,12 +2083,49 @@ extern "rust-preserve-none" fn op_vararg<'gc>(
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
     let (dst, count) = args!(Instruction::VARARG { dst, count });
-    let frame = thread.top_lua().unwrap();
-    let base = frame.base;
-    let num_extras = frame.num_extras as usize;
-    let extras_start = base - num_extras;
+    // Copy the scalars/`Gc` out of the frame so the borrow ends before we
+    // touch `thread.stack` mutably. `proto` is a `Gc` (Copy).
+    let (base, num_extras, proto) = {
+        let frame = thread.top_lua().unwrap();
+        (frame.base, frame.num_extras as usize, frame.closure.proto)
+    };
     let target = base + dst as usize;
 
+    if proto.needs_vararg_table {
+        // Materialized: read elements `1..=t.n` from the vararg table.
+        let table = thread.stack[base + proto.num_params as usize]
+            .get_table()
+            .expect("materialized vararg slot must hold a table");
+        // Read `t.n` in a tight borrow so it's released before the resize.
+        let navail = table
+            .inner()
+            .borrow()
+            .raw_get(Value::string(LuaString::new(ctx, b"n")))
+            .get_integer()
+            .filter(|n| *n >= 0)
+            .unwrap_or(0) as usize;
+        let wanted = if count == 0 {
+            navail
+        } else {
+            count as usize - 1
+        };
+        let new_top = target + wanted;
+        if thread.stack.len() < new_top {
+            thread.stack.resize(new_top, Value::nil());
+            registers = unsafe { thread.stack.as_mut_ptr().add(base) };
+        }
+        let t = table.inner().borrow();
+        for i in 0..wanted {
+            thread.stack[target + i] = t.raw_get(Value::integer(i as i64 + 1));
+        }
+        if count == 0 {
+            thread.top = new_top;
+        }
+        dispatch!();
+    }
+
+    // Optimized: read the below-base region directly.
+    let extras_start = base - num_extras;
     if count == 0 {
         // MULTRET: copy all extras and publish the new dynamic top.
         let new_top = target + num_extras;
@@ -2112,21 +2154,16 @@ extern "rust-preserve-none" fn op_vararg<'gc>(
     dispatch!();
 }
 
-/// `R[dst] := R[base][R[key]]` where `R[base]` is the register slot the
-/// named vararg local lives in.
+/// `R[dst] := <vararg>[R[key]]` — the optimized below-base read for an
+/// un-escaped named vararg. Integer keys `1..=num_extras` yield the
+/// 1-indexed extra, the string `"n"` yields the extras count, anything
+/// else yields `nil`.
 ///
-/// Two paths, distinguished at run time by inspecting `R[base]`:
-/// - **Materialized**: `R[base]` is a real table (`function f(...args)`
-///   where escape analysis forced the compiler's prologue patch to
-///   build a vararg table). Falls through to a raw indexed get — the
-///   vararg table is opaque to user metatables since the compiler is
-///   the sole writer.
-/// - **Optimized**: `R[base]` is the sentinel `nil`. The handler reads
-///   the below-base vararg region directly, treating integer keys
-///   `1..=num_extras` as 1-indexed extras, the string `"n"` as the
-///   extras count, and everything else as `nil`.
-///
-/// Mirrors Lua 5.5 `OP_GETVARG`.
+/// Only the optimized form survives to run time: if the named vararg
+/// escapes, the compiler's epilogue (Lua's `luaK_finish`) rewrites every
+/// `VARARGGET` to `GETTABLE`, so this handler never inspects `R[base]`
+/// (it stays vestigial, kept only as the `table` operand for that rewrite).
+/// Mirrors Lua 5.5 `OP_GETVARG`, whose handler likewise ignores `B`.
 #[inline(never)]
 extern "rust-preserve-none" fn op_varargget<'gc>(
     instruction: Instruction,
@@ -2137,33 +2174,25 @@ extern "rust-preserve-none" fn op_varargget<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (dst, base, key) = args!(Instruction::VARARGGET { dst, base, key });
-    let base_val = reg!(base);
+    let (dst, _base, key) = args!(Instruction::VARARGGET { dst, base, key });
     let key_val = reg!(key);
-    let v = if let Some(t) = base_val.get_table() {
-        // Materialized path: raw indexed get. The compiler-built vararg
-        // table has no metatable, so a raw read suffices.
-        t.inner().borrow().raw_get(key_val)
-    } else {
-        // Optimized path: read from below-base.
-        let frame = thread.top_lua().unwrap();
-        let num_extras = frame.num_extras as usize;
-        let extras_start = frame.base - num_extras;
-        if let Some(k) = key_val.get_integer() {
-            if k >= 1 && (k as usize) <= num_extras {
-                thread.stack[extras_start + (k as usize) - 1]
-            } else {
-                Value::nil()
-            }
-        } else if let Some(s) = key_val.get_string() {
-            if s.as_bytes() == b"n" {
-                Value::integer(num_extras as i64)
-            } else {
-                Value::nil()
-            }
+    let frame = thread.top_lua().unwrap();
+    let num_extras = frame.num_extras as usize;
+    let extras_start = frame.base - num_extras;
+    let v = if let Some(k) = key_val.get_integer() {
+        if k >= 1 && (k as usize) <= num_extras {
+            thread.stack[extras_start + (k as usize) - 1]
         } else {
             Value::nil()
         }
+    } else if let Some(s) = key_val.get_string() {
+        if s.as_bytes() == b"n" {
+            Value::integer(num_extras as i64)
+        } else {
+            Value::nil()
+        }
+    } else {
+        Value::nil()
     };
     *reg!(mut dst) = v;
     dispatch!();
@@ -2177,6 +2206,12 @@ extern "rust-preserve-none" fn op_varargget<'gc>(
 /// the layout becomes `[extras... fixed_params...]`, then advances
 /// `frame.base` so the function's locals start past the extras. A subsequent
 /// `VARARG` reads from `stack[new_base - num_extras .. new_base]`.
+///
+/// When `Prototype::needs_vararg_table` is set (a named vararg that escaped),
+/// it additionally materializes a real vararg table `{ extras...; n = count }`
+/// into `R[num_params]`, the reserved named-vararg slot. This is the port of
+/// Lua 5.5's `createvarargtab`; `VARARG` / `GETTABLE` then read from the table
+/// instead of the below-base region, so mutations to the table are observed.
 #[inline(never)]
 extern "rust-preserve-none" fn op_varargprep<'gc>(
     instruction: Instruction,
@@ -2188,16 +2223,17 @@ extern "rust-preserve-none" fn op_varargprep<'gc>(
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
     let _num_fixed = args!(Instruction::VARARGPREP { num_fixed });
-    let (num_extras, num_params, base, max_stack) = {
+    let (num_extras, num_params, base, max_stack, needs_table) = {
         let frame = thread.top_lua().unwrap();
         (
             frame.num_extras as usize,
             frame.closure.proto.num_params as usize,
             frame.base,
             frame.closure.proto.max_stack_size as usize,
+            frame.closure.proto.needs_vararg_table,
         )
     };
-    if num_extras > 0 {
+    let new_base = if num_extras > 0 {
         let total = num_extras + num_params;
         // [fixed..., extras...].rotate_left(num_params) => [extras..., fixed...]
         thread.stack[base..base + total].rotate_left(num_params);
@@ -2208,6 +2244,27 @@ extern "rust-preserve-none" fn op_varargprep<'gc>(
         }
         thread.top_lua_mut().unwrap().base = new_base;
         registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
+        new_base
+    } else {
+        base
+    };
+    if needs_table {
+        // Materialize `{ extras...; n = num_extras }` into the reserved
+        // named-vararg slot. Root the table via the stack slot before
+        // filling it (mirrors `op_newtable`), so an allocation mid-fill
+        // can't collect it.
+        let extras_start = new_base - num_extras;
+        let table = Table::new(ctx);
+        thread.stack[new_base + num_params] = Value::table(table);
+        for i in 0..num_extras {
+            let v = thread.stack[extras_start + i];
+            table.raw_set(ctx, Value::integer(i as i64 + 1), v);
+        }
+        table.raw_set(
+            ctx,
+            Value::string(LuaString::new(ctx, b"n")),
+            Value::integer(num_extras as i64),
+        );
     }
     dispatch!();
 }
@@ -2398,12 +2455,7 @@ pub(crate) fn frame_return<'gc>(
 ) -> FrameReturn {
     let (cur_base, num_results, num_extras, continuation) = {
         let f = thread.top_lua().unwrap();
-        (
-            f.base,
-            f.num_results,
-            f.num_extras as usize,
-            f.continuation,
-        )
+        (f.base, f.num_results, f.num_extras as usize, f.continuation)
     };
 
     if let Some(mut cont) = continuation {

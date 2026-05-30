@@ -1,5 +1,5 @@
 -- Named vararg, materialized path: `args` is used as a value (passed
--- to a function), forcing the prologue patch to build a real table.
+-- to a function), forcing VARARGPREP to build a real vararg table.
 
 local function unwrap_first(t)
     return t[1]
@@ -7,17 +7,16 @@ end
 
 local function passthrough(...args)
     -- `args` here escapes — used as a value (passed to unwrap_first).
-    -- This flips `used_as_non_base`, so the epilogue patches the
-    -- prologue to materialize a vararg table.
+    -- This flips `used_as_non_base`, so `needs_vararg_table` is set and
+    -- the VARARGPREP handler materializes the table at run time.
     return unwrap_first(args)
 end
 
 print(passthrough(42, 99, 7))   -- 42
 
--- Mixed: some accesses are optimized-style (args[1]) AND args is used
--- as a value. Materialization wins (table is built), and the optimized
--- VARARGGET sites still work because the handler dispatches on the
--- table at R[args_reg].
+-- Mixed: some accesses are index-style (args[1]) AND args is used as a
+-- value. Materialization wins, and the index sites are rewritten from
+-- VARARGGET to GETTABLE at the epilogue so they read the same table.
 local function both(...args)
     local first = args[1]
     return unwrap_first(args) + first

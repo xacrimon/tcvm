@@ -7,29 +7,31 @@ use crate::instruction::{Instruction, UpValueDescriptor};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RegisterIndex(pub u8);
 
-/// Bookkeeping for a function that declares a Lua 5.5 named vararg
-/// parameter (`function f(...name)`). One per `Chunk`. The
-/// compiler reserves `args_reg` plus three temp slots and a nil
-/// sentinel inside `max_stack`; the prologue sits at
-/// `[prologue_slot, prologue_slot + 6)` and starts as a sequence
-/// of `NOP`s plus a `LOAD nil` into `args_reg`. If escape analysis
-/// during body compilation flips a flag, the epilogue overwrites
-/// the slot with the materialization sequence (`NEWTABLE`, `VARARG
-/// count=0`, `SETLIST count=0`, `LOAD "n"`, `VARARGGET`, `SETFIELD
-/// "n"`) so `R[args_reg]` becomes a real table.
+/// Escape-analysis bookkeeping for a function that declares a Lua 5.5
+/// named vararg parameter (`function f(...name)`). `Some` on the `Chunk`
+/// iff such a parameter exists. The single reserved register holding the
+/// vararg table lives at `R[num_params]` (decided in the VM, not the
+/// compiler). During body compilation either flag may flip; at the
+/// epilogue, `used_as_non_base || captured` decides whether the function
+/// materializes a table — recorded as `Prototype::needs_vararg_table` and
+/// consumed by the `VARARGPREP` handler, which builds the table directly.
 #[derive(Debug, Clone, Copy)]
 pub struct VarargInfo {
-    pub args_reg: u8,
-    pub tmp_base: u8,
-    pub n_key_reg: u8,
-    pub count_reg: u8,
-    pub nil_sentinel_reg: u8,
-    /// Bytecode index of the first prologue slot reserved for the
-    /// materialization patch. Six contiguous instruction slots are
-    /// reserved at `[prologue_slot, prologue_slot + 6)`.
-    pub prologue_slot: usize,
+    /// Set when `name` is used as a value (anything other than the base of
+    /// `name[exp]` / `name.id`), e.g. `local b = name` or `f(name)`.
     pub used_as_non_base: bool,
+    /// Set when a nested closure captures `name` as an upvalue.
     pub captured: bool,
+}
+
+impl VarargInfo {
+    /// Whether escape analysis forces materialization of a real vararg
+    /// table. Mirrors the conditions in the Lua 5.5 manual (§3.4): a named
+    /// vararg stays optimized only while it is *not* captured as an upvalue
+    /// and is used *only* as the base table of `t[exp]` / `t.id`.
+    pub fn needs_table(&self) -> bool {
+        self.used_as_non_base || self.captured
+    }
 }
 
 /// How many results a multires-capable expression (function call,
@@ -236,12 +238,12 @@ pub struct Chunk<'gc> {
     pub(super) max_stack: u8,
     pub(super) arity: u8,
     pub(super) is_vararg: bool,
-    /// Per-chunk metadata for the Lua 5.5 named-vararg parameter
-    /// (`function f(...name)`). `Some` iff the function declares one.
-    /// The epilogue inspects the usage flags to decide whether to
-    /// fill the reserved prologue slots with the materialization
-    /// sequence; if neither flag fires, the slots stay as `NOP`s
-    /// and `VARARGGET` falls into its optimized below-base read.
+    /// Per-chunk escape-analysis state for the Lua 5.5 named-vararg
+    /// parameter (`function f(...name)`). `Some` iff the function declares
+    /// one. The epilogue inspects the usage flags: if either fires, every
+    /// `VARARGGET` is rewritten to `GETTABLE` and `Prototype::needs_vararg_table`
+    /// is set so the VM builds a real table; otherwise the accesses stay as
+    /// optimized below-base `VARARGGET` reads.
     pub(super) vararg_info: Option<VarargInfo>,
     pub(super) labels: Vec<usize>,
     pub(super) jump_patches: Vec<(usize, u16)>,
@@ -320,6 +322,7 @@ impl<'gc> Chunk<'gc> {
                 upvalue_desc: self.upvalue_desc.into_boxed_slice(),
                 num_params: self.arity,
                 is_vararg: self.is_vararg,
+                needs_vararg_table: self.vararg_info.is_some_and(|i| i.needs_table()),
                 max_stack_size: self.max_stack,
                 num_upvalues,
                 source: self.source,

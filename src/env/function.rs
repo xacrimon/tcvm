@@ -20,6 +20,13 @@ pub struct Prototype<'gc> {
     pub upvalue_desc: Box<[UpValueDescriptor]>,
     pub num_params: u8,
     pub is_vararg: bool,
+    /// Lua 5.5 `PF_VATAB`: the function declares a named vararg parameter
+    /// (`function f(...args)`) that escaped the optimized below-base form
+    /// (used as a value or captured by a nested closure), so `VARARGPREP`
+    /// must materialize a real vararg table in `R[num_params]`. When `false`
+    /// the named/anonymous varargs stay in the below-base region and are
+    /// read directly by `VARARG` / `VARARGGET`.
+    pub needs_vararg_table: bool,
     pub max_stack_size: u8,
     pub num_upvalues: u8,
     pub source: Option<LuaString<'gc>>,

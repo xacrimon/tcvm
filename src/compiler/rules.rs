@@ -1250,65 +1250,6 @@ pub fn compile<'gc>(
     Ok(chunk.assemble(ctx.mutation()))
 }
 
-/// Overwrite the six prologue slots reserved at function entry with
-/// the named-vararg materialization sequence. Called from
-/// `compile_function_to_chunk`'s epilogue when escape analysis on the
-/// `args` local determined that materialization is required.
-///
-/// Layout:
-/// ```text
-///   slot+0  NEWTABLE   args_reg                    ; fresh empty table
-///   slot+1  VARARG     tmp_base count=0            ; copy all extras + set top
-///   slot+2  SETLIST    args_reg count=0 offset=0   ; pop tmp_base..top into table
-///   slot+3  LOAD       n_key_reg, "n"              ; const string key
-///   slot+4  VARARGGET  count_reg, nil_sentinel, n_key
-///   slot+5  SETFIELD   args_reg "n" count_reg
-/// ```
-///
-/// Slot 4 deliberately uses the nil-sentinel register as `base` so the
-/// handler falls into its optimized below-base read for `"n"` — at
-/// this point `R[args_reg]` is already a table (just populated by
-/// slots 0–2), and reading `"n"` from the table would observe the
-/// missing field (still nil) instead of `num_extras`.
-fn patch_vararg_materialization(
-    ctx: &mut Ctx,
-    info: &VarargInfo,
-) -> Result<(), CompileError> {
-    let n_key = ctx.alloc_string_constant(b"n")?;
-    let slot = info.prologue_slot;
-    let tape = &mut ctx.chunk.tape;
-    tape[slot] = Instruction::NEWTABLE {
-        dst: info.args_reg,
-    };
-    tape[slot + 1] = Instruction::VARARG {
-        dst: info.tmp_base,
-        count: 0,
-    };
-    tape[slot + 2] = Instruction::SETLIST {
-        table: info.args_reg,
-        count: 0,
-        offset: 0,
-    };
-    tape[slot + 3] = Instruction::LOAD {
-        dst: info.n_key_reg,
-        idx: n_key,
-    };
-    tape[slot + 4] = Instruction::VARARGGET {
-        dst: info.count_reg,
-        base: info.nil_sentinel_reg,
-        key: info.n_key_reg,
-    };
-    let (key_idx, ic_idx) = ctx.alloc_field_key(b"n")?;
-    let tape = &mut ctx.chunk.tape;
-    tape[slot + 5] = Instruction::SETFIELD {
-        src: info.count_reg,
-        table: info.args_reg,
-        ic_idx,
-        key_idx,
-    };
-    Ok(())
-}
-
 /// Compile a function body into a Chunk (not yet assembled).
 #[allow(clippy::too_many_arguments)]
 fn compile_function_to_chunk<'gc, 'a>(
@@ -1371,18 +1312,14 @@ fn compile_function_to_chunk<'gc, 'a>(
     // never touch their slots.
     ctx.adjust_locals(num_params);
 
-    // Named-vararg setup: register `name` as a `VarargParam` local at a
-    // reserved register and lay out the prologue. The 6 instruction
-    // slots starting at `prologue_slot` begin life as a `LOAD nil` into
-    // `args_reg` followed by five `NOP`s; if escape analysis during
-    // body compilation flips a usage flag, the epilogue overwrites
-    // them with the materialization sequence.
+    // Named-vararg setup: register `name` as a `VarargParam` local at the
+    // single reserved register `R[num_params]`. No prologue bytecode is
+    // emitted — if escape analysis forces materialization, the `VARARGPREP`
+    // handler builds the table into that slot at run time (see the epilogue
+    // and `op_varargprep`). Accesses lower to `VARARGGET` optimistically and
+    // are rewritten to `GETTABLE` at the epilogue when materialized.
     if let Some(name) = vararg_name {
         let args_reg = ctx.alloc_register()?;
-        let tmp_base = ctx.alloc_register()?;
-        let n_key_reg = ctx.alloc_register()?;
-        let count_reg = ctx.alloc_register()?;
-        let nil_sentinel_reg = ctx.alloc_register()?;
         ctx.define(
             name,
             VariableData {
@@ -1390,25 +1327,9 @@ fn compile_function_to_chunk<'gc, 'a>(
                 kind: VarKind::VarargParam,
             },
         )?;
-        ctx.adjust_locals(num_params + 5);
-
-        let prologue_slot = ctx.chunk.tape.len();
-        let nil_idx = ctx.alloc_constant(Value::nil())?;
-        ctx.emit(Instruction::LOAD {
-            dst: args_reg.0,
-            idx: nil_idx,
-        });
-        for _ in 0..5 {
-            ctx.emit(Instruction::NOP);
-        }
+        ctx.adjust_locals(num_params + 1);
 
         ctx.chunk.vararg_info = Some(VarargInfo {
-            args_reg: args_reg.0,
-            tmp_base: tmp_base.0,
-            n_key_reg: n_key_reg.0,
-            count_reg: count_reg.0,
-            nil_sentinel_reg: nil_sentinel_reg.0,
-            prologue_slot,
             used_as_non_base: false,
             captured: false,
         });
@@ -1419,17 +1340,23 @@ fn compile_function_to_chunk<'gc, 'a>(
         compile_stmt(&mut ctx, stmt)?;
     }
 
-    // Named-vararg epilogue patch. If `args` escaped the function via a
-    // closure upvalue or was used as a bare value (anything other than
-    // `args[exp]` / `args.id` base position), the reserved prologue
-    // slots are overwritten with a materialization sequence that
-    // promotes `R[args_reg]` from the nil sentinel to a real vararg
-    // table. `VARARGGET` and downstream uses transparently switch to
-    // the table path on the next instruction.
-    if let Some(info) = ctx.chunk.vararg_info
-        && (info.used_as_non_base || info.captured)
-    {
-        patch_vararg_materialization(&mut ctx, &info)?;
+    // Named-vararg finalization (Lua's `luaK_finish`). If `args` escaped —
+    // captured by a nested closure or used as a bare value (anything other
+    // than the base of `args[exp]` / `args.id`) — the function materializes
+    // a real vararg table. `Prototype::needs_vararg_table` (set at assemble
+    // time from these flags) makes `VARARGPREP` build the table in
+    // `R[num_params]`, and every optimistically-emitted `VARARGGET` is
+    // rewritten to a `GETTABLE` reading from that table register.
+    if ctx.chunk.vararg_info.is_some_and(|i| i.needs_table()) {
+        for instr in ctx.chunk.tape.iter_mut() {
+            if let Instruction::VARARGGET { dst, base, key } = *instr {
+                *instr = Instruction::GETTABLE {
+                    dst,
+                    table: base,
+                    key,
+                };
+            }
+        }
     }
 
     // Emit implicit return at the end. The frame already terminates when
