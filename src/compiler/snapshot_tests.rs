@@ -150,3 +150,5 @@ test!(
     "test-files/const_local_multi_level.lua"
 );
 test!(method_call, "test-files/method_call.lua");
+test!(not_andor, "test-files/not_andor.lua");
+test!(jmp_elim, "test-files/jmp_elim.lua");

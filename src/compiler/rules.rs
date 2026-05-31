@@ -578,7 +578,46 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
 
     /// Patch every jump in `list` to the current tape position (the next
     /// instruction to be emitted).
-    fn patch_to_here(&mut self, list: JumpList) {
+    ///
+    /// Trailing no-op jumps are elided rather than patched to offset 0: a
+    /// list jump that is the last instruction on the tape, controlled by a
+    /// side-effect-free `TEST`/`TESTSET`, would jump to its own successor —
+    /// a dead `TEST; JMP +0` pair (reference Lua leaves these in; we don't).
+    /// Pop both. Sound only at the tail, where no other live tape index
+    /// shifts, and only for the controls `patch_to` would itself drop: a
+    /// plain `TEST` or a `NO_REG` `TESTSET` (which `downgrade_testsets`
+    /// turns into a value-less `TEST`). A `CMP` predecessor may run a
+    /// metamethod, and a real-dst `TESTSET` preserves a value, so both stay.
+    fn patch_to_here(&mut self, mut list: JumpList) {
+        loop {
+            let end = self.next_offset();
+            let Some(pos) = list.jumps.iter().position(|&j| j + 1 == end) else {
+                break;
+            };
+            let j = list.jumps[pos];
+            if j == 0
+                || !matches!(
+                    self.chunk.tape[j - 1],
+                    Instruction::TEST { .. } | Instruction::TESTSET { dst: NO_REG, .. }
+                )
+            {
+                break;
+            }
+            // Elision is sound only because nothing else targets the tail
+            // pair: the control + JMP were just emitted for this expression,
+            // and goto/break patches and labels resolve to statement
+            // boundaries, never mid-expression. Guard that invariant.
+            debug_assert!(
+                !self.chunk.jump_patches.iter().any(|&(idx, _)| idx >= j - 1),
+                "no-op jump elision would orphan a pending jump_patch"
+            );
+            debug_assert!(
+                !self.chunk.labels.iter().any(|&target| target >= j - 1),
+                "no-op jump elision would orphan a label target"
+            );
+            self.chunk.tape.truncate(j - 1);
+            list.jumps.remove(pos);
+        }
         let target = self.next_offset();
         self.patch_to(list, target);
     }
@@ -707,6 +746,22 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                 "flip_control_polarity: jump at {jmp_idx} has no \
                  CMP/TEST control instruction (found {other:?})"
             ),
+        }
+    }
+
+    /// Lua's `codenot` list handling: negating an expression swaps its truthy
+    /// and falsy exits, and the values its short-circuit jumps preserve are
+    /// useless once negated — so downgrade their TESTSETs to plain TESTs
+    /// (`removevalues`) before swapping. `result_kind` is the negated
+    /// fall-through value: the `NOT` result, the unchanged `Jump` head (after
+    /// the caller flips its polarity), or a folded boolean.
+    fn codenot(&mut self, operand: ExprDesc, result_kind: ExprKind) -> ExprDesc {
+        self.downgrade_testsets(&operand.true_list);
+        self.downgrade_testsets(&operand.false_list);
+        ExprDesc {
+            kind: result_kind,
+            true_list: operand.false_list,
+            false_list: operand.true_list,
         }
     }
 
@@ -2705,43 +2760,46 @@ fn compile_expr_prefix_op(
     let mut inner = compile_expr(ctx, rhs_expr, None)?;
 
     // Constant fold paths. Each returns a fresh const expdesc that the
-    // enclosing operator can fold against again.
-    match (op, inner.kind) {
-        (PrefixOperator::Neg, ExprKind::Numeral(Numeral::Int(n))) => {
-            return Ok(ExprDesc::from_numeral(Numeral::Int(n.wrapping_neg())));
-        }
-        (PrefixOperator::Neg, ExprKind::Numeral(Numeral::Float(f))) => {
-            return Ok(ExprDesc::from_numeral(Numeral::Float(-f)));
-        }
-        (PrefixOperator::BitNot, ExprKind::Numeral(Numeral::Int(n))) => {
-            return Ok(ExprDesc::from_numeral(Numeral::Int(!n)));
-        }
-        (PrefixOperator::BitNot, ExprKind::Numeral(Numeral::Float(f))) => {
-            // Lua: bitwise on float requires exact integer convertibility.
-            if let Some(i) = num::exact_float_to_int(f) {
-                return Ok(ExprDesc::from_numeral(Numeral::Int(!i)));
+    // enclosing operator can fold against again. Only valid when the
+    // operand carries no pending short-circuit jumps: `a and 5` has kind
+    // `Numeral(5)` but a live `false_list`, so folding it would silently
+    // drop the falsy-`a` edge (and produce a wrong constant).
+    if !inner.has_jumps() {
+        match (op, inner.kind) {
+            (PrefixOperator::Neg, ExprKind::Numeral(Numeral::Int(n))) => {
+                return Ok(ExprDesc::from_numeral(Numeral::Int(n.wrapping_neg())));
             }
-            // else fall through — runtime will raise if non-convertible.
+            (PrefixOperator::Neg, ExprKind::Numeral(Numeral::Float(f))) => {
+                return Ok(ExprDesc::from_numeral(Numeral::Float(-f)));
+            }
+            (PrefixOperator::BitNot, ExprKind::Numeral(Numeral::Int(n))) => {
+                return Ok(ExprDesc::from_numeral(Numeral::Int(!n)));
+            }
+            (PrefixOperator::BitNot, ExprKind::Numeral(Numeral::Float(f))) => {
+                // Lua: bitwise on float requires exact integer convertibility.
+                if let Some(i) = num::exact_float_to_int(f) {
+                    return Ok(ExprDesc::from_numeral(Numeral::Int(!i)));
+                }
+                // else fall through — runtime will raise if non-convertible.
+            }
+            (PrefixOperator::Not, ExprKind::Numeral(_) | ExprKind::Bool(true)) => {
+                return Ok(ExprDesc::from_bool(false));
+            }
+            (PrefixOperator::Not, ExprKind::Bool(false) | ExprKind::Nil) => {
+                return Ok(ExprDesc::from_bool(true));
+            }
+            _ => {}
         }
-        (PrefixOperator::Not, ExprKind::Numeral(_) | ExprKind::Bool(true)) => {
-            return Ok(ExprDesc::from_bool(false));
-        }
-        (PrefixOperator::Not, ExprKind::Bool(false) | ExprKind::Nil) => {
-            return Ok(ExprDesc::from_bool(true));
-        }
-        _ => {}
     }
 
-    // `not <expr>`: when the operand is a jump-list expression (comparison,
-    // `not`-of-comparison, etc.) we relabel its lists and flip the
-    // `pending` head's CMP polarity in place (Lua's `codenot` on VJMP).
-    // For plain Reg operands fall back to the NOT opcode.
+    // `not <expr>` where the operand carries pending jumps: apply `codenot`
+    // (swap exits + drop preserved values). The fall-through value differs
+    // by kind — a flipped Jump head, the NOT opcode, or a folded boolean.
     if matches!(op, PrefixOperator::Not) {
         match inner.kind {
             ExprKind::Jump(Some(idx)) => {
                 ctx.flip_control_polarity(idx);
-                mem::swap(&mut inner.true_list, &mut inner.false_list);
-                return Ok(inner);
+                return Ok(ctx.codenot(inner, ExprKind::Jump(Some(idx))));
             }
             // Jump-kind without a pending head is only reachable after a
             // `goif*` or `discharge_to_reg_mut` consumes it, and
@@ -2759,10 +2817,17 @@ fn compile_expr_prefix_op(
                     dst: dst.0,
                     src: src.0,
                 });
-                return Ok(ExprDesc::from_reg(dst));
+                return Ok(ctx.codenot(inner, ExprKind::Reg(dst)));
             }
-            ExprKind::Numeral(_) | ExprKind::Bool(_) | ExprKind::Nil => {
-                unreachable!("const kinds folded above")
+            // Const operand still carrying short-circuit jumps, e.g.
+            // `not (a and 5)`: the folded `not <const>` is the fall-through
+            // value, the jumps the other edge. (A jump-free const was folded
+            // above.) Mirrors the const-fold arms.
+            ExprKind::Numeral(_) | ExprKind::Bool(true) => {
+                return Ok(ctx.codenot(inner, ExprKind::Bool(false)));
+            }
+            ExprKind::Bool(false) | ExprKind::Nil => {
+                return Ok(ctx.codenot(inner, ExprKind::Bool(true)));
             }
         }
     }
