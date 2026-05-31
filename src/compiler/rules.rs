@@ -603,6 +603,18 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             {
                 break;
             }
+            // Elision is sound only because nothing else targets the tail
+            // pair: the control + JMP were just emitted for this expression,
+            // and goto/break patches and labels resolve to statement
+            // boundaries, never mid-expression. Guard that invariant.
+            debug_assert!(
+                !self.chunk.jump_patches.iter().any(|&(idx, _)| idx >= j - 1),
+                "no-op jump elision would orphan a pending jump_patch"
+            );
+            debug_assert!(
+                !self.chunk.labels.iter().any(|&target| target >= j - 1),
+                "no-op jump elision would orphan a label target"
+            );
             self.chunk.tape.truncate(j - 1);
             list.jumps.remove(pos);
         }
