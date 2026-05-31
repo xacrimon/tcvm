@@ -749,6 +749,22 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         }
     }
 
+    /// Lua's `codenot` list handling: negating an expression swaps its truthy
+    /// and falsy exits, and the values its short-circuit jumps preserve are
+    /// useless once negated — so downgrade their TESTSETs to plain TESTs
+    /// (`removevalues`) before swapping. `result_kind` is the negated
+    /// fall-through value: the `NOT` result, the unchanged `Jump` head (after
+    /// the caller flips its polarity), or a folded boolean.
+    fn codenot(&mut self, operand: ExprDesc, result_kind: ExprKind) -> ExprDesc {
+        self.downgrade_testsets(&operand.true_list);
+        self.downgrade_testsets(&operand.false_list);
+        ExprDesc {
+            kind: result_kind,
+            true_list: operand.false_list,
+            false_list: operand.true_list,
+        }
+    }
+
     /// Flip the polarity of every pending conditional jump in `expr`: invert
     /// the `inverted` flag of each control instruction (CMP/TEST/TESTSET)
     /// and swap the true/false lists. After the call every pending JMP
@@ -2776,23 +2792,14 @@ fn compile_expr_prefix_op(
         }
     }
 
-    // `not <expr>`: when the operand is a jump-list expression (comparison,
-    // `not`-of-comparison, etc.) we relabel its lists and flip the
-    // `pending` head's CMP polarity in place (Lua's `codenot` on VJMP).
-    // For plain Reg operands fall back to the NOT opcode.
+    // `not <expr>` where the operand carries pending jumps: apply `codenot`
+    // (swap exits + drop preserved values). The fall-through value differs
+    // by kind — a flipped Jump head, the NOT opcode, or a folded boolean.
     if matches!(op, PrefixOperator::Not) {
         match inner.kind {
             ExprKind::Jump(Some(idx)) => {
                 ctx.flip_control_polarity(idx);
-                // codenot: the lists' preserved values are useless once
-                // negated, so downgrade TESTSET→TEST (Lua's `removevalues`)
-                // before swapping. Without this, a `not (a or <cmp>)`-style
-                // operand keeps the `or`'s value-preserving TESTSET and the
-                // expression yields the operand value instead of a boolean.
-                ctx.downgrade_testsets(&inner.true_list);
-                ctx.downgrade_testsets(&inner.false_list);
-                mem::swap(&mut inner.true_list, &mut inner.false_list);
-                return Ok(inner);
+                return Ok(ctx.codenot(inner, ExprKind::Jump(Some(idx))));
             }
             // Jump-kind without a pending head is only reachable after a
             // `goif*` or `discharge_to_reg_mut` consumes it, and
@@ -2810,30 +2817,17 @@ fn compile_expr_prefix_op(
                     dst: dst.0,
                     src: src.0,
                 });
-                // codenot: the NOT result is the fall-through value; the
-                // operand's short-circuit jumps are the other boolean edge.
-                // Their preserved values are useless once negated, so
-                // downgrade TESTSET→TEST, then swap true/false. The
-                // consumer's discharge materialises the swapped lists.
-                ctx.downgrade_testsets(&inner.true_list);
-                ctx.downgrade_testsets(&inner.false_list);
-                let mut result = ExprDesc::from_reg(dst);
-                result.true_list = inner.false_list;
-                result.false_list = inner.true_list;
-                return Ok(result);
+                return Ok(ctx.codenot(inner, ExprKind::Reg(dst)));
             }
             // Const operand still carrying short-circuit jumps, e.g.
             // `not (a and 5)`: the folded `not <const>` is the fall-through
-            // value, the jumps the other edge. (A jump-free const was
-            // folded above.) Same codenot list handling as `Reg`.
-            ExprKind::Numeral(_) | ExprKind::Bool(_) | ExprKind::Nil => {
-                let folded = matches!(inner.kind, ExprKind::Bool(false) | ExprKind::Nil);
-                ctx.downgrade_testsets(&inner.true_list);
-                ctx.downgrade_testsets(&inner.false_list);
-                let mut result = ExprDesc::from_bool(folded);
-                result.true_list = inner.false_list;
-                result.false_list = inner.true_list;
-                return Ok(result);
+            // value, the jumps the other edge. (A jump-free const was folded
+            // above.) Mirrors the const-fold arms.
+            ExprKind::Numeral(_) | ExprKind::Bool(true) => {
+                return Ok(ctx.codenot(inner, ExprKind::Bool(false)));
+            }
+            ExprKind::Bool(false) | ExprKind::Nil => {
+                return Ok(ctx.codenot(inner, ExprKind::Bool(true)));
             }
         }
     }
