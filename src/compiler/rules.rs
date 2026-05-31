@@ -584,8 +584,10 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     /// side-effect-free `TEST`/`TESTSET`, would jump to its own successor —
     /// a dead `TEST; JMP +0` pair (reference Lua leaves these in; we don't).
     /// Pop both. Sound only at the tail, where no other live tape index
-    /// shifts, and only for `TEST`/`TESTSET` controls — a `CMP` predecessor
-    /// may run a metamethod and must stay.
+    /// shifts, and only for the controls `patch_to` would itself drop: a
+    /// plain `TEST` or a `NO_REG` `TESTSET` (which `downgrade_testsets`
+    /// turns into a value-less `TEST`). A `CMP` predecessor may run a
+    /// metamethod, and a real-dst `TESTSET` preserves a value, so both stay.
     fn patch_to_here(&mut self, mut list: JumpList) {
         loop {
             let end = self.next_offset();
@@ -596,7 +598,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             if j == 0
                 || !matches!(
                     self.chunk.tape[j - 1],
-                    Instruction::TEST { .. } | Instruction::TESTSET { .. }
+                    Instruction::TEST { .. } | Instruction::TESTSET { dst: NO_REG, .. }
                 )
             {
                 break;
