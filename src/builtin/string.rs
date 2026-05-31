@@ -282,8 +282,12 @@ fn format_one<'gc>(
             let f = to_float(arg).ok_or_else(|| arg_type_err(ctx, "number", &arg))?;
             fmt_float_g(out, spec, f, spec.conv == b'G');
         }
+        b'a' | b'A' => {
+            let f = to_float(arg).ok_or_else(|| arg_type_err(ctx, "number", &arg))?;
+            fmt_hex_float(out, spec, f, spec.conv == b'A');
+        }
         b's' => {
-            fmt_string(out, spec, arg);
+            fmt_string(ctx, out, spec, arg);
         }
         b'q' => {
             fmt_q(out, arg);
@@ -454,7 +458,7 @@ fn fmt_float_g(out: &mut Vec<u8>, spec: &FmtSpec, f: f64, upper: bool) {
         format!("{abs:.p$}")
     };
     if !spec.flag_hash {
-        strip_trailing_zeros(&mut body);
+        strip_g_trailing_zeros(&mut body);
     }
     apply_width(out, spec, sign.as_bytes(), b"", body.as_bytes());
 }
@@ -552,25 +556,132 @@ fn strip_trailing_zeros(s: &mut String) {
     }
 }
 
+/// `%g` trailing-zero trimming: strip only the *mantissa*, never the exponent
+/// digits. `strip_trailing_zeros` on a whole `"1.20000e+20"` would chew the
+/// `0` off the exponent (`...e+2`); split at `e`/`E` and trim just the front.
+fn strip_g_trailing_zeros(s: &mut String) {
+    match s.find(['e', 'E']) {
+        Some(epos) => {
+            let mut mant = s[..epos].to_string();
+            strip_trailing_zeros(&mut mant);
+            mant.push_str(&s[epos..]);
+            *s = mant;
+        }
+        None => strip_trailing_zeros(s),
+    }
+}
+
+/// Format `abs` (finite, non-negative) as a C `%a`/`%A` hex float — `0x1.fep+7`
+/// style. Without `prec`, emits the minimal fraction digits (trailing zeros
+/// trimmed); with `prec`, emits exactly that many fraction nibbles.
+fn format_hex_float(abs: f64, upper: bool, prec: Option<usize>) -> String {
+    let bits = abs.to_bits();
+    let exp_bits = ((bits >> 52) & 0x7ff) as i64;
+    let raw_frac = bits & 0x000f_ffff_ffff_ffff;
+    // (leading hex digit, unbiased exponent, 52-bit fraction below the lead).
+    let (mut lead, exp, frac) = if exp_bits == 0 {
+        if raw_frac == 0 {
+            (0u8, 0i64, 0u64) // ±0
+        } else {
+            // Subnormal: normalize to a leading `1` digit (matches C/Lua).
+            let hb = 63 - raw_frac.leading_zeros() as i64; // highest set bit, 0..=51
+            let frac = (raw_frac << (52 - hb as u32)) & 0x000f_ffff_ffff_ffff;
+            (1u8, hb - 1074, frac)
+        }
+    } else {
+        (1u8, exp_bits - 1023, raw_frac)
+    };
+    // 13 hex digits of the fraction, most-significant nibble first.
+    let mut digits: Vec<u8> = (0..13)
+        .map(|i| ((frac >> (48 - i * 4)) & 0xf) as u8)
+        .collect();
+    match prec {
+        Some(p) => {
+            // Round half-up at the p-th nibble; a carry can ripple into `lead`.
+            if p < digits.len() && digits[p] >= 8 {
+                digits.truncate(p);
+                let mut carry = true;
+                let mut i = digits.len();
+                while carry && i > 0 {
+                    i -= 1;
+                    if digits[i] == 0xf {
+                        digits[i] = 0;
+                    } else {
+                        digits[i] += 1;
+                        carry = false;
+                    }
+                }
+                if carry {
+                    lead += 1;
+                }
+            } else {
+                digits.truncate(p);
+            }
+        }
+        None => {
+            while digits.last() == Some(&0) {
+                digits.pop();
+            }
+        }
+    }
+    let hexdig = |d: u8| -> char {
+        let c = if d < 10 {
+            b'0' + d
+        } else if upper {
+            b'A' + (d - 10)
+        } else {
+            b'a' + (d - 10)
+        };
+        c as char
+    };
+    let mut s = String::from(if upper { "0X" } else { "0x" });
+    s.push((b'0' + lead) as char);
+    if !digits.is_empty() || matches!(prec, Some(p) if p > 0) {
+        s.push('.');
+        for &d in &digits {
+            s.push(hexdig(d));
+        }
+        if let Some(p) = prec {
+            for _ in digits.len()..p {
+                s.push('0');
+            }
+        }
+    }
+    s.push(if upper { 'P' } else { 'p' });
+    s.push(if exp < 0 { '-' } else { '+' });
+    s.push_str(&exp.unsigned_abs().to_string());
+    s
+}
+
+fn fmt_hex_float(out: &mut Vec<u8>, spec: &FmtSpec, f: f64, upper: bool) {
+    if let Some(s) = special_float(f, spec) {
+        apply_width(out, spec, b"", b"", s.as_bytes());
+        return;
+    }
+    // Unlike the decimal float specs, `%a` keeps the sign of `-0.0`.
+    let sign: &str = if f.is_sign_negative() {
+        "-"
+    } else if spec.flag_plus {
+        "+"
+    } else if spec.flag_space {
+        " "
+    } else {
+        ""
+    };
+    let body = format_hex_float(f.abs(), upper, spec.precision);
+    apply_width(out, spec, sign.as_bytes(), b"", body.as_bytes());
+}
+
 // ---------- string and q ----------
 
-fn fmt_string<'gc>(out: &mut Vec<u8>, spec: &FmtSpec, arg: Value<'gc>) {
-    let owned: String;
-    let bytes: &[u8] = if let Some(s) = arg.get_string() {
-        s.as_bytes()
-    } else if arg.is_nil() {
-        b"nil"
-    } else if let Some(b) = arg.get_boolean() {
-        if b { b"true" } else { b"false" }
-    } else if let Some(i) = arg.get_integer() {
-        owned = format!("{i}");
-        owned.as_bytes()
-    } else if let Some(f) = arg.get_float() {
-        owned = format!("{f}");
-        owned.as_bytes()
-    } else {
-        b"<value>"
-    };
+fn fmt_string<'gc>(ctx: Context<'gc>, out: &mut Vec<u8>, spec: &FmtSpec, arg: Value<'gc>) {
+    // Lua's %s applies tostring (`luaL_tolstring`) to non-strings — booleans,
+    // numbers (in Lua form), nil, and the `type: 0xADDR` form for the rest.
+    // Honoring `__tostring` needs native->Lua calls (deferred with #27).
+    let ls = arg
+        .get_string()
+        .unwrap_or_else(|| crate::builtin::util::basic_tostring(ctx, arg));
+    let bytes = ls.as_bytes();
     let trimmed: &[u8] = if let Some(p) = spec.precision {
         &bytes[..bytes.len().min(p)]
     } else {
@@ -588,21 +699,39 @@ fn fmt_q<'gc>(out: &mut Vec<u8>, arg: Value<'gc>) {
         let s = format!("{i}");
         out.extend_from_slice(s.as_bytes());
     } else if let Some(f) = arg.get_float() {
-        // TODO: use %a (hex float) for exact round-trip per Lua spec.
-        let s = format!("{f:?}");
-        out.extend_from_slice(s.as_bytes());
+        // %q must read back to the exact value: hex-float for finite numbers,
+        // Lua's literal forms for the specials.
+        if f.is_nan() {
+            out.extend_from_slice(b"(0/0)");
+        } else if f.is_infinite() {
+            out.extend_from_slice(if f < 0.0 { b"-1e9999" } else { b"1e9999" });
+        } else {
+            if f.is_sign_negative() {
+                out.push(b'-');
+            }
+            out.extend_from_slice(format_hex_float(f.abs(), false, None).as_bytes());
+        }
     } else if let Some(s) = arg.get_string() {
+        // Mirror Lua's `addquoted`: `"` / `\` / `\n` -> backslash + the char;
+        // control bytes (0..31, 127) -> decimal `\ddd`, zero-padded to 3
+        // digits *only* when the next byte is an ASCII digit (so they can't
+        // merge); everything else (printable and high bytes) emitted raw.
+        let bytes = s.as_bytes();
         out.push(b'"');
-        for &b in s.as_bytes() {
+        for (i, &b) in bytes.iter().enumerate() {
             match b {
-                b'"' => out.extend_from_slice(b"\\\""),
-                b'\\' => out.extend_from_slice(b"\\\\"),
-                b'\n' => out.extend_from_slice(b"\\n"),
-                b'\r' => out.extend_from_slice(b"\\r"),
-                0 => out.extend_from_slice(b"\\0"),
+                b'"' | b'\\' | b'\n' => {
+                    out.push(b'\\');
+                    out.push(b);
+                }
                 b if b < 0x20 || b == 0x7f => {
-                    let s = format!("\\{}", b);
-                    out.extend_from_slice(s.as_bytes());
+                    let next_is_digit = bytes.get(i + 1).is_some_and(u8::is_ascii_digit);
+                    let esc = if next_is_digit {
+                        format!("\\{b:03}")
+                    } else {
+                        format!("\\{b}")
+                    };
+                    out.extend_from_slice(esc.as_bytes());
                 }
                 b => out.push(b),
             }

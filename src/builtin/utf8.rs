@@ -273,11 +273,11 @@ fn lua_offset<'gc>(
         ));
     }
 
-    let result = if n == 0 {
+    let found = if n == 0 {
         while posi > 1 && iscont(bytes, posi) {
             posi -= 1;
         }
-        Value::integer(posi)
+        Some(posi)
     } else if posi <= len as i64 && iscont(bytes, posi) {
         return Err(Error::from_str(
             nctx.ctx,
@@ -292,11 +292,7 @@ fn lua_offset<'gc>(
             }
             n -= 1;
         }
-        if n > 0 {
-            Value::nil()
-        } else {
-            Value::integer(posi)
-        }
+        if n > 0 { None } else { Some(posi) }
     } else {
         let mut n = n;
         while n < 0 && posi > 1 {
@@ -306,13 +302,25 @@ fn lua_offset<'gc>(
             }
             n += 1;
         }
-        if n < 0 {
-            Value::nil()
-        } else {
-            Value::integer(posi)
-        }
+        if n < 0 { None } else { Some(posi) }
     };
-    stack.replace(&[result]);
+    match found {
+        // Lua 5.5 returns the start position AND the byte index of that
+        // character's last byte (the start itself when past the end).
+        Some(p) => {
+            let end = if p > len as i64 {
+                p
+            } else {
+                let mut e = p;
+                while e < len as i64 && iscont(bytes, e + 1) {
+                    e += 1;
+                }
+                e
+            };
+            stack.replace(&[Value::integer(p), Value::integer(end)]);
+        }
+        None => stack.replace(&[Value::nil()]),
+    }
     Ok(CallbackAction::Return)
 }
 

@@ -70,13 +70,19 @@ fn lua_assert<'gc>(
 /// control/introspection API this needs. Recognized options return
 /// plausible values; collection requests are accepted as no-ops.
 fn lua_collectgarbage<'gc>(
-    _nctx: NativeContext<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let opt = stack.get(0);
     let opt = opt.get_string().map_or(&b"collect"[..], |s| s.as_bytes());
     match opt {
-        b"count" => stack.replace(&[Value::float(0.0), Value::integer(0)]),
+        // Lua returns a single value: total memory in use, in Kbytes. (The
+        // absolute figure differs from PUC-Lua — different allocator — but the
+        // shape/units match; full GC accounting tracked in #62.)
+        b"count" => {
+            let kb = nctx.ctx.mutation().metrics().total_allocation() as f64 / 1024.0;
+            stack.replace(&[Value::float(kb)]);
+        }
         b"isrunning" => stack.replace(&[Value::boolean(true)]),
         b"step" => stack.replace(&[Value::boolean(false)]),
         _ => stack.replace(&[Value::integer(0)]),
@@ -104,13 +110,21 @@ fn lua_error<'gc>(
 }
 
 fn lua_getmetatable<'gc>(
-    _nctx: NativeContext<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let v = stack.get(0);
     let result = if let Some(t) = v.get_table() {
         match t.metatable() {
-            Some(mt) => Value::table(mt),
+            // A `__metatable` field shadows the real metatable (protection).
+            Some(mt) => {
+                let prot = mt.raw_get(Value::string(LuaString::new(nctx.ctx, b"__metatable")));
+                if prot.is_nil() {
+                    Value::table(mt)
+                } else {
+                    prot
+                }
+            }
             None => Value::nil(),
         }
     } else {
@@ -361,51 +375,41 @@ fn lua_setmetatable<'gc>(
 }
 
 fn lua_tonumber<'gc>(
-    _ctx: NativeContext<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    // TODO: 2-arg form `tonumber(s, base)` for integer parsing in arbitrary base.
     let v = stack.get(0);
-    let result = if v.is_nil() {
-        Value::nil()
+    let base_arg = stack.get(1);
+    let result = if !base_arg.is_nil() {
+        // 2-arg form `tonumber(s, base)`: `s` is an integer string in `base`.
+        let base = base_arg
+            .get_integer()
+            .filter(|b| (2..=36).contains(b))
+            .ok_or_else(|| {
+                Error::from_str(
+                    nctx.ctx,
+                    "bad argument #2 to 'tonumber' (base out of range)",
+                )
+            })?;
+        let s = v.get_string().ok_or_else(|| {
+            Error::from_str(
+                nctx.ctx,
+                &format!(
+                    "bad argument #1 to 'tonumber' (string expected, got {})",
+                    v.type_name()
+                ),
+            )
+        })?;
+        util::str_to_int_base(s.as_bytes(), base as u32).map_or(Value::nil(), Value::integer)
     } else if v.get_integer().is_some() || v.get_float().is_some() {
         v
     } else if let Some(s) = v.get_string() {
-        let bytes = s.as_bytes();
-        let trimmed = trim_ascii(bytes);
-        parse_lua_number(trimmed).unwrap_or(Value::nil())
+        util::str_to_number(s.as_bytes()).unwrap_or(Value::nil())
     } else {
         Value::nil()
     };
     stack.replace(&[result]);
     Ok(CallbackAction::Return)
-}
-
-fn trim_ascii(b: &[u8]) -> &[u8] {
-    let mut start = 0;
-    let mut end = b.len();
-    while start < end && b[start].is_ascii_whitespace() {
-        start += 1;
-    }
-    while end > start && b[end - 1].is_ascii_whitespace() {
-        end -= 1;
-    }
-    &b[start..end]
-}
-
-fn parse_lua_number<'gc>(b: &[u8]) -> Option<Value<'gc>> {
-    if b.is_empty() {
-        return None;
-    }
-    let s = std::str::from_utf8(b).ok()?;
-    // TODO: hex literals (0x...) and hex floats (0x1.8p3) per Lua spec.
-    if let Ok(i) = s.parse::<i64>() {
-        return Some(Value::integer(i));
-    }
-    if let Ok(f) = s.parse::<f64>() {
-        return Some(Value::float(f));
-    }
-    None
 }
 
 /// `tostring(v)` — default string representation. TODO(#27): honor

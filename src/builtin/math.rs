@@ -169,8 +169,9 @@ fn lua_modf<'gc>(
     let x = check_number(nctx.ctx, stack.get(0), "modf", 1)?;
     // Lua 5.5 returns the integral part as an integer when it fits (pushnumint).
     let (ip, fp) = if x.is_infinite() {
-        // C modf: integral part is ±inf, fractional part is ±0.
-        (Value::float(x), 0.0_f64.copysign(x))
+        // Lua's modf returns the integral part (±inf) and a +0.0 fractional
+        // part (it special-cases `n == ip`), regardless of sign.
+        (Value::float(x), 0.0_f64)
     } else {
         (num_to_value(x.trunc()), x.fract())
     };
@@ -271,6 +272,16 @@ fn lua_tointeger<'gc>(
         Value::integer(i)
     } else if let Some(f) = v.get_float() {
         float_to_integer(f).map_or(Value::nil(), Value::integer)
+    } else if let Some(s) = v.get_string() {
+        // Lua coerces a numeric string, then applies the same int/float rule.
+        match crate::builtin::util::str_to_number(s.as_bytes()) {
+            Some(n) if n.get_integer().is_some() => n,
+            Some(n) => n
+                .get_float()
+                .and_then(float_to_integer)
+                .map_or(Value::nil(), Value::integer),
+            None => Value::nil(),
+        }
     } else {
         Value::nil()
     };

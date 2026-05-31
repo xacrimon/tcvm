@@ -11,6 +11,100 @@ pub(crate) fn push_int(out: &mut Vec<u8>, i: i64) {
     out.extend_from_slice(i.to_string().as_bytes());
 }
 
+/// Convert a string to a Lua number following the lexer's rules: optional
+/// surrounding whitespace and sign, decimal integer/float, and `0x` hex
+/// integer (wrapping, per Lua) / hex float (`0x1.8p3`). Returns `None` for
+/// anything non-numeric — notably `"inf"`/`"nan"`, which Rust's `f64::parse`
+/// would otherwise accept but Lua rejects. Shared by `tonumber` and
+/// `math.tointeger`.
+pub(crate) fn str_to_number<'gc>(b: &[u8]) -> Option<Value<'gc>> {
+    let s = std::str::from_utf8(b)
+        .ok()?
+        .trim_matches(|c: char| c.is_ascii_whitespace());
+    if s.is_empty() {
+        return None;
+    }
+    let (neg, body) = match s.as_bytes()[0] {
+        b'+' => (false, &s[1..]),
+        b'-' => (true, &s[1..]),
+        _ => (false, s),
+    };
+    if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        if hex.is_empty() {
+            return None;
+        }
+        // `.`/`p` means a hex float; otherwise a (wrapping) hex integer.
+        if hex.contains(['.', 'p', 'P']) {
+            let f = crate::parser::lit::parse_hex_float(body)?;
+            return Some(Value::float(if neg { -f } else { f }));
+        }
+        let mut acc: u64 = 0;
+        for c in hex.bytes() {
+            let d = (c as char).to_digit(16)? as u64;
+            acc = acc.wrapping_mul(16).wrapping_add(d);
+        }
+        let i = acc as i64;
+        return Some(Value::integer(if neg { i.wrapping_neg() } else { i }));
+    }
+    // Decimal. Restrict to numeric characters so `f64::parse` can't sneak in
+    // `inf`/`nan`/`infinity`.
+    if !body
+        .bytes()
+        .all(|c| c.is_ascii_digit() || matches!(c, b'.' | b'e' | b'E' | b'+' | b'-'))
+        || !body.bytes().any(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    if let Ok(i) = s.parse::<i64>() {
+        return Some(Value::integer(i));
+    }
+    s.parse::<f64>().ok().map(Value::float)
+}
+
+/// Parse `b` as an integer written in `base` (2..=36), with optional
+/// surrounding whitespace and sign, accumulating with wrapping arithmetic
+/// (Lua's `l_str2int`). Letters `a..z`/`A..Z` are digits 10..35. Returns
+/// `None` on an empty string or any digit `>= base`.
+pub(crate) fn str_to_int_base(b: &[u8], base: u32) -> Option<i64> {
+    let trimmed = {
+        let s = b;
+        let mut start = 0;
+        let mut end = s.len();
+        while start < end && s[start].is_ascii_whitespace() {
+            start += 1;
+        }
+        while end > start && s[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        &s[start..end]
+    };
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (neg, digits) = match trimmed[0] {
+        b'+' => (false, &trimmed[1..]),
+        b'-' => (true, &trimmed[1..]),
+        _ => (false, trimmed),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let mut acc: i64 = 0;
+    for &c in digits {
+        let d = match c {
+            b'0'..=b'9' => (c - b'0') as u32,
+            b'a'..=b'z' => (c - b'a') as u32 + 10,
+            b'A'..=b'Z' => (c - b'A') as u32 + 10,
+            _ => return None,
+        };
+        if d >= base {
+            return None;
+        }
+        acc = acc.wrapping_mul(base as i64).wrapping_add(d as i64);
+    }
+    Some(if neg { acc.wrapping_neg() } else { acc })
+}
+
 /// Append the canonical Lua 5.5 textual form of a float. Lua picks the
 /// shortest `"%.Ng"` that reads back to the same value, scanning `N` upward
 /// from the historical default of 14 to the round-trip-sufficient 17, then

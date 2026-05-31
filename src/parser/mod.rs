@@ -1,5 +1,5 @@
 pub mod kind;
-mod lit;
+pub(crate) mod lit;
 pub mod machinery;
 mod rules;
 pub mod syntax;
