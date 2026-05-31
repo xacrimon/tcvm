@@ -6,6 +6,7 @@ use crate::lua::RuntimeError;
 use crate::lua::context::Context;
 use crate::lua::convert::{FromMultiValue, IntoMultiValue};
 use crate::vm;
+use crate::vm::interp::{Continuation, ContinuationPayload};
 use crate::vm::sequence::CallbackAction;
 
 #[derive(Clone, Copy, PartialEq, Eq, Collect)]
@@ -590,6 +591,7 @@ fn schedule_call_at<'gc>(
                         bottom: args_base,
                         func_idx: slot,
                         returns: caller_returns,
+                        cont: None,
                     },
                 });
                 Ok(())
@@ -709,6 +711,7 @@ fn pump_sequence<'gc>(
                 bottom: abs_bottom,
                 func_idx: call_site.func_idx,
                 returns: call_site.returns,
+                cont: call_site.cont,
             });
             ts.status = ThreadStatus::Suspended;
         }
@@ -803,10 +806,17 @@ fn propagate_inner_to_resumer<'gc>(
 /// Lua frame was already popped at TAILCALL time), terminate the thread
 /// with `ThreadStatus::Result { bottom: func_idx }`.
 fn land_call_results<'gc>(ts: &mut crate::env::thread::ThreadState<'gc>, cs: CallSite) {
+    // Continuation-backed native metamethod/iterator: apply the parked
+    // continuation against the caller frame rather than the plain landing.
+    if let Some(cont) = cs.cont {
+        apply_native_continuation(ts, cs.bottom, cont);
+        return;
+    }
     let CallSite {
         bottom,
         func_idx,
         returns,
+        cont: _,
     } = cs;
     let retc = ts.stack.len() - bottom;
     let wanted = if returns == 0 {
@@ -835,6 +845,67 @@ fn land_call_results<'gc>(ts: &mut crate::env::thread::ThreadState<'gc>, cs: Cal
     }
     if ts.frames.is_empty() {
         ts.status = ThreadStatus::Result { bottom: func_idx };
+    }
+}
+
+/// Apply a [`Continuation`]'s payload after a *suspended native* metamethod /
+/// iterator finally produces its results at `stack[bottom..]`. This is the
+/// executor-side twin of the interpreter's `apply_cont_payload!`: the native
+/// has no Lua frame to carry the continuation, so the executor replays the
+/// payload directly against the caller frame (which is on top — no frame was
+/// pushed for the native) and lets the next pump resume it.
+///
+/// `StoreResult`/`TForCall` write into the caller's register window;
+/// `CondJump` bumps the caller frame's resume `pc` (choosing whether to skip
+/// the comparison's following `JMP`); `IgnoreResult` discards. Results were
+/// staged in scratch above the window, so the window is always in bounds.
+fn apply_native_continuation<'gc>(
+    ts: &mut crate::env::thread::ThreadState<'gc>,
+    bottom: usize,
+    cont: Continuation,
+) {
+    let retc = ts.stack.len() - bottom;
+    let result0 = if retc > 0 {
+        ts.stack[bottom]
+    } else {
+        Value::nil()
+    };
+    let base = ts
+        .top_lua()
+        .expect("native continuation must resume into a caller Lua frame")
+        .base;
+
+    match cont.payload {
+        ContinuationPayload::StoreResult { dst } => {
+            ts.stack[base + dst as usize] = result0;
+        }
+        ContinuationPayload::IgnoreResult => {}
+        ContinuationPayload::CondJump { offset, inverted } => {
+            if !result0.is_falsy() != inverted {
+                let frame = ts.top_lua_mut().unwrap();
+                frame.pc = (frame.pc as i64 + offset as i64) as usize;
+            }
+        }
+        ContinuationPayload::TForCall { base: reg, count } => {
+            let dst = base + reg as usize + 3;
+            let to_copy = retc.min(count as usize);
+            for i in 0..to_copy {
+                ts.stack[dst + i] = ts.stack[bottom + i];
+            }
+            for i in to_copy..count as usize {
+                ts.stack[dst + i] = Value::nil();
+            }
+        }
+    }
+
+    // Restore the caller's full register window (scratch staging / the
+    // suspended call may have left the stack shorter).
+    let needed = {
+        let frame = ts.top_lua().unwrap();
+        frame.base + frame.closure.proto.max_stack_size as usize
+    };
+    if ts.stack.len() < needed {
+        ts.stack.resize(needed, Value::nil());
     }
 }
 

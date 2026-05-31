@@ -68,6 +68,15 @@ pub struct CallSite {
     pub bottom: usize,
     pub func_idx: usize,
     pub returns: u8,
+    /// Set only when this call site backs a continuation-driven native
+    /// metamethod/iterator (`schedule_meta_call`) that suspended. On result
+    /// delivery the executor applies this `Continuation`'s payload against the
+    /// caller frame (`apply_native_continuation`) instead of the plain
+    /// `func_idx`/`returns` landing — this is how a suspended native target
+    /// replays `StoreResult`/`CondJump`/`TForCall`/`IgnoreResult`, since it
+    /// has no Lua frame to park the continuation on. `None` for ordinary
+    /// calls, where `func_idx`/`returns` drive the landing.
+    pub cont: Option<Continuation>,
 }
 
 /// A frame on a thread's frame stack. The interpreter only pushes

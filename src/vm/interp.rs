@@ -1680,6 +1680,7 @@ extern "rust-preserve-none" fn op_call<'gc>(
                             bottom: args_base,
                             func_idx,
                             returns,
+                            cont: None,
                         },
                     });
                     return Ok(());
@@ -1811,6 +1812,7 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
                             bottom: args_base,
                             func_idx: cur_base - 1,
                             returns: num_results,
+                            cont: None,
                         },
                     });
                     return Ok(());
@@ -2953,56 +2955,36 @@ fn schedule_native_meta_call<'gc>(
                 nret,
             }
         }
-        // Suspending native. Map the continuation payload to a CallSite so the
-        // executor's standard landing (`land_call_results`) deposits the
-        // results in the same register window the payload would have written,
-        // then resumes the caller frame at the saved pc. `returns == count + 1`
-        // for `count` landed values; `func_idx` is the absolute slot of the
-        // first destination register.
+        // A native that wants to call back into Lua (`Call`) delivers its
+        // result through the normal frame-return path, which doesn't run
+        // `land_call_results` and so can't replay our continuation. It's not a
+        // shape any current metamethod/iterator native produces; reject it
+        // cleanly rather than silently dropping the continuation.
+        CallbackAction::Call { .. } => {
+            let err = crate::env::Error::from_str(
+                ctx,
+                "metamethod/iterator native cannot tail-call into Lua across the continuation",
+            );
+            thread.frames.push(Frame::Error(err));
+            MetaDispatch::Suspended
+        }
+        // Suspending native (`Yield`/`Resume`/`Sequence`). Park the full
+        // continuation on the `CallSite`; when the suspension resolves, its
+        // results funnel through `land_call_results`, which applies the
+        // continuation against the caller frame (`apply_native_continuation`).
+        // This replays every payload uniformly — including `CondJump`, whose
+        // branch decision (a `pc` bump) can't be expressed as a plain landing.
         other => {
-            let call_site = match cont.payload {
-                ContinuationPayload::StoreResult { dst } => CallSite {
-                    bottom: args_base,
-                    func_idx: caller_base + dst as usize,
-                    returns: 2,
-                },
-                ContinuationPayload::IgnoreResult => CallSite {
-                    bottom: args_base,
-                    // No value is landed (returns == 1 → wanted 0); func_idx is
-                    // unused but must stay in-bounds.
-                    func_idx: caller_base,
-                    returns: 1,
-                },
-                ContinuationPayload::TForCall { base, count } => {
-                    // `count + 1` can't overflow u8: valid bytecode keeps the
-                    // result registers `base+3 .. base+3+count` within u8 space.
-                    debug_assert!(
-                        base as usize + 3 + count as usize <= u8::MAX as usize + 1,
-                        "TFORCALL destination range exceeds u8 register space",
-                    );
-                    CallSite {
-                        bottom: args_base,
-                        func_idx: caller_base + base as usize + 3,
-                        returns: count + 1,
-                    }
-                }
-                // A suspended comparison can't decide its branch retroactively
-                // (the result arrives after the conditional jump would run), and
-                // a plain CallSite landing can't express a `pc` bump. Reject it
-                // cleanly; the next commit lifts this by carrying the full
-                // continuation across the suspension.
-                ContinuationPayload::CondJump { .. } => {
-                    let err = crate::env::Error::from_str(
-                        ctx,
-                        "comparison metamethod cannot suspend (yield/coroutine)",
-                    );
-                    thread.frames.push(Frame::Error(err));
-                    return MetaDispatch::Suspended;
-                }
-            };
             thread.pending_action = Some(PendingAction {
                 action: other,
-                call_site,
+                call_site: CallSite {
+                    bottom: args_base,
+                    // Unused while `cont` is set (the continuation drives the
+                    // landing), but kept in-bounds / meaningful as a fallback.
+                    func_idx: caller_base,
+                    returns: 0,
+                    cont: Some(cont),
+                },
             });
             MetaDispatch::Suspended
         }
