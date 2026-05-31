@@ -8,6 +8,7 @@ mod package;
 mod string;
 mod table;
 mod utf8;
+mod util;
 
 pub use basic::load as load_basic;
 pub use coroutine::load as load_coroutine;

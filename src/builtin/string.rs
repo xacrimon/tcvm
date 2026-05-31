@@ -1,6 +1,42 @@
 use crate::Context;
+use crate::builtin::util;
 use crate::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Table, Value};
 use crate::vm::sequence::CallbackAction;
+
+/// Coerce a string-or-number argument to a `LuaString`, mirroring
+/// `luaL_checkstring` (numbers are accepted and stringified).
+fn check_str<'gc>(
+    ctx: Context<'gc>,
+    v: Value<'gc>,
+    fname: &str,
+    n: usize,
+) -> Result<LuaString<'gc>, Error<'gc>> {
+    if let Some(s) = v.get_string() {
+        Ok(s)
+    } else if v.get_integer().is_some() || v.get_float().is_some() {
+        Ok(util::basic_tostring(ctx, v))
+    } else {
+        Err(Error::from_str(
+            ctx,
+            &format!(
+                "bad argument #{n} to '{fname}' (string expected, got {})",
+                v.type_name()
+            ),
+        ))
+    }
+}
+
+/// Lua's `posrelat`: translate a possibly-negative 1-based string position into
+/// an absolute 1-based position (negatives count from the end; 0 stays 0).
+fn posrelat(pos: i64, len: usize) -> i64 {
+    if pos >= 0 {
+        pos
+    } else if pos.unsigned_abs() > len as u64 {
+        0
+    } else {
+        len as i64 + pos + 1
+    }
+}
 
 pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[
@@ -34,18 +70,59 @@ pub fn load<'gc>(ctx: Context<'gc>) {
     ctx.globals().raw_set(ctx, lib_name, Value::table(lib));
 }
 
+/// `byte(s [, i [, j]])` — the numeric codes of `s[i..j]` (1-based, negatives
+/// from the end; `i` defaults to 1, `j` to `i`).
 fn lua_byte<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    let s = check_str(nctx.ctx, stack.get(0), "byte", 1)?;
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let i_arg = stack.get(1);
+    let i = if i_arg.is_nil() {
+        1
+    } else {
+        util::check_integer(nctx.ctx, i_arg, "byte", 2)?
+    };
+    let j_arg = stack.get(2);
+    let j = if j_arg.is_nil() {
+        i
+    } else {
+        util::check_integer(nctx.ctx, j_arg, "byte", 3)?
+    };
+    let start = posrelat(i, len).max(1);
+    let end = posrelat(j, len).min(len as i64);
+    let mut out = Vec::new();
+    let mut k = start;
+    while k <= end {
+        out.push(Value::integer(bytes[(k - 1) as usize] as i64));
+        k += 1;
+    }
+    stack.replace(&out);
+    Ok(CallbackAction::Return)
 }
 
+/// `char(...)` — a string built from the given byte values (each 0–255).
 fn lua_char<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    let n = stack.len();
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let c = util::check_integer(nctx.ctx, stack.get(i), "char", i + 1)?;
+        if !(0..=255).contains(&c) {
+            return Err(Error::from_str(
+                nctx.ctx,
+                &format!("bad argument #{} to 'char' (value out of range)", i + 1),
+            ));
+        }
+        out.push(c as u8);
+    }
+    let r = LuaString::new(nctx.ctx, &out);
+    stack.replace(&[Value::string(r)]);
+    Ok(CallbackAction::Return)
 }
 
 fn lua_dump<'gc>(
@@ -586,18 +663,25 @@ fn lua_gsub<'gc>(
     todo!()
 }
 
+/// `len(s)` — number of bytes in `s`.
 fn lua_len<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    let s = check_str(nctx.ctx, stack.get(0), "len", 1)?;
+    stack.replace(&[Value::integer(s.len() as i64)]);
+    Ok(CallbackAction::Return)
 }
 
+/// `lower(s)` — ASCII-lowercased copy of `s` (C locale).
 fn lua_lower<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    let s = check_str(nctx.ctx, stack.get(0), "lower", 1)?;
+    let lowered: Vec<u8> = s.as_bytes().iter().map(u8::to_ascii_lowercase).collect();
+    stack.replace(&[Value::string(LuaString::new(nctx.ctx, &lowered))]);
+    Ok(CallbackAction::Return)
 }
 
 fn lua_match<'gc>(
@@ -621,25 +705,89 @@ fn lua_packsize<'gc>(
     todo!()
 }
 
+/// `rep(s, n [, sep])` — `s` repeated `n` times, with `sep` between copies.
+/// `n <= 0` yields the empty string.
 fn lua_rep<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    let s = check_str(nctx.ctx, stack.get(0), "rep", 1)?;
+    let n = util::check_integer(nctx.ctx, stack.get(1), "rep", 2)?;
+    let sep_arg = stack.get(2);
+    let sep = if sep_arg.is_nil() {
+        Vec::new()
+    } else {
+        check_str(nctx.ctx, sep_arg, "rep", 3)?.as_bytes().to_vec()
+    };
+    let out = if n <= 0 {
+        Vec::new()
+    } else {
+        let n = n as usize;
+        let body = s.as_bytes();
+        // Guard against overflow on pathological sizes (Lua: "too large").
+        let total = body
+            .len()
+            .checked_add(sep.len())
+            .and_then(|per| per.checked_mul(n))
+            .map(|t| t - sep.len());
+        let Some(total) = total else {
+            return Err(Error::from_str(nctx.ctx, "resulting string too large"));
+        };
+        let mut out = Vec::with_capacity(total);
+        for k in 0..n {
+            if k > 0 {
+                out.extend_from_slice(&sep);
+            }
+            out.extend_from_slice(body);
+        }
+        out
+    };
+    stack.replace(&[Value::string(LuaString::new(nctx.ctx, &out))]);
+    Ok(CallbackAction::Return)
 }
 
+/// `reverse(s)` — `s` with its bytes in reverse order.
 fn lua_reverse<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    let s = check_str(nctx.ctx, stack.get(0), "reverse", 1)?;
+    let mut bytes = s.as_bytes().to_vec();
+    bytes.reverse();
+    stack.replace(&[Value::string(LuaString::new(nctx.ctx, &bytes))]);
+    Ok(CallbackAction::Return)
 }
 
+/// `sub(s, i [, j])` — substring `s[i..j]` (1-based, negatives from the end;
+/// `i` defaults to 1, `j` to -1).
 fn lua_sub<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    let s = check_str(nctx.ctx, stack.get(0), "sub", 1)?;
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let i_arg = stack.get(1);
+    let i = if i_arg.is_nil() {
+        1
+    } else {
+        util::check_integer(nctx.ctx, i_arg, "sub", 2)?
+    };
+    let j_arg = stack.get(2);
+    let j = if j_arg.is_nil() {
+        -1
+    } else {
+        util::check_integer(nctx.ctx, j_arg, "sub", 3)?
+    };
+    let start = posrelat(i, len).max(1);
+    let end = posrelat(j, len).min(len as i64);
+    let result = if start <= end {
+        LuaString::new(nctx.ctx, &bytes[(start - 1) as usize..end as usize])
+    } else {
+        LuaString::new(nctx.ctx, b"")
+    };
+    stack.replace(&[Value::string(result)]);
+    Ok(CallbackAction::Return)
 }
 
 fn lua_unpack<'gc>(
@@ -649,9 +797,13 @@ fn lua_unpack<'gc>(
     todo!()
 }
 
+/// `upper(s)` — ASCII-uppercased copy of `s` (C locale).
 fn lua_upper<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    let s = check_str(nctx.ctx, stack.get(0), "upper", 1)?;
+    let uppered: Vec<u8> = s.as_bytes().iter().map(u8::to_ascii_uppercase).collect();
+    stack.replace(&[Value::string(LuaString::new(nctx.ctx, &uppered))]);
+    Ok(CallbackAction::Return)
 }

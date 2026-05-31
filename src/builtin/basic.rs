@@ -1,6 +1,8 @@
 use crate::Context;
+use crate::builtin::util;
 use crate::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Value};
 use crate::vm::sequence::CallbackAction;
+use std::io::Write;
 
 // TODO(#27): _G, _VERSION
 
@@ -39,18 +41,47 @@ pub fn load<'gc>(ctx: Context<'gc>) {
     }
 }
 
+/// `assert(v [, message, ...])` — if `v` is truthy, return all arguments
+/// unchanged; otherwise raise `message` (default `"assertion failed!"`). The
+/// message is raised verbatim, matching `assert`'s delegation to `error`
+/// (no position prefix is added when the caller is a native frame).
 fn lua_assert<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
+    stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    if stack.is_empty() {
+        return Err(Error::from_str(
+            nctx.ctx,
+            "bad argument #1 to 'assert' (value expected)",
+        ));
+    }
+    if !stack.get(0).is_falsy() {
+        // Leaving the window untouched returns all arguments.
+        return Ok(CallbackAction::Return);
+    }
+    if stack.len() >= 2 {
+        Err(Error::new(stack.get(1)))
+    } else {
+        Err(Error::from_str(nctx.ctx, "assertion failed!"))
+    }
 }
 
+/// `collectgarbage([opt [, arg]])` — light stand-in until the GC exposes the
+/// control/introspection API this needs. Recognized options return
+/// plausible values; collection requests are accepted as no-ops.
 fn lua_collectgarbage<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    _nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    let opt = stack.get(0);
+    let opt = opt.get_string().map_or(&b"collect"[..], |s| s.as_bytes());
+    match opt {
+        b"count" => stack.replace(&[Value::float(0.0), Value::integer(0)]),
+        b"isrunning" => stack.replace(&[Value::boolean(true)]),
+        b"step" => stack.replace(&[Value::boolean(false)]),
+        _ => stack.replace(&[Value::integer(0)]),
+    }
+    Ok(CallbackAction::Return)
 }
 
 fn lua_dofile<'gc>(
@@ -60,11 +91,16 @@ fn lua_dofile<'gc>(
     todo!()
 }
 
+/// `error(message [, level])` — raise `message` as a Lua error. The `level`
+/// argument selects which call frame's position is prepended to a string
+/// message; we don't yet have native access to caller line info, so the value
+/// is raised verbatim (equivalent to `level == 0`). TODO(#27): prepend
+/// `"source:line:"` for `level >= 1` once reachable from a native frame.
 fn lua_error<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    _nctx: NativeContext<'gc, '_>,
+    stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    Err(Error::new(stack.get(0)))
 }
 
 fn lua_getmetatable<'gc>(
@@ -84,11 +120,48 @@ fn lua_getmetatable<'gc>(
     Ok(CallbackAction::Return)
 }
 
+/// `ipairs(t)` — returns `(iterator, t, 0)`. The iterator yields `1,t[1]`,
+/// `2,t[2]`, … stopping at the first absent index.
+///
+/// Indexing is raw (no `__index`); Lua 5.3+ routes `ipairs` through
+/// metamethod-aware `geti`, but that requires invoking `__index`, which can
+/// re-enter Lua. TODO(#27): honor `__index` once native→Lua calls are wired.
 fn lua_ipairs<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    if stack.is_empty() {
+        return Err(Error::from_str(
+            nctx.ctx,
+            "bad argument #1 to 'ipairs' (value expected)",
+        ));
+    }
+    let t = stack.get(0);
+    let iter = Function::new_native(nctx.ctx.mutation(), ipairs_aux, Box::new([]));
+    stack.replace(&[Value::function(iter), t, Value::integer(0)]);
+    Ok(CallbackAction::Return)
+}
+
+/// Stateless iterator body for `ipairs`: `(t, i) -> (i+1, t[i+1])`, or a lone
+/// `nil` once the array part ends.
+fn ipairs_aux<'gc>(
+    nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
+    let t = stack.get(0).get_table().ok_or_else(|| {
+        Error::from_str(
+            nctx.ctx,
+            "bad argument #1 to 'ipairs iterator' (table expected)",
+        )
+    })?;
+    let i = stack.get(1).get_integer().unwrap_or(0) + 1;
+    let v = t.raw_get(Value::integer(i));
+    if v.is_nil() {
+        stack.replace(&[Value::nil()]);
+    } else {
+        stack.replace(&[Value::integer(i), v]);
+    }
+    Ok(CallbackAction::Return)
 }
 
 fn lua_load<'gc>(
@@ -126,21 +199,36 @@ fn lua_pcall<'gc>(
     todo!()
 }
 
+/// `print(...)` — write each argument's `tostring` form to stdout, separated
+/// by tabs and followed by a newline. Uses the default representation;
+/// TODO(#27): honor `__tostring` once metamethod calls from natives exist.
 fn lua_print<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    stack: Stack<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let arg = stack[0];
-    let num = arg.get_integer().unwrap();
-    println!("{}", num);
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let n = stack.len();
+    for i in 0..n {
+        if i > 0 {
+            let _ = out.write_all(b"\t");
+        }
+        let s = util::basic_tostring(nctx.ctx, stack.get(i));
+        let _ = out.write_all(s.as_bytes());
+    }
+    let _ = out.write_all(b"\n");
+    stack.replace(&[]);
     Ok(CallbackAction::Return)
 }
 
+/// `rawequal(a, b)` — primitive equality, bypassing `__eq`.
 fn lua_rawequal<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    _nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    let eq = util::raw_eq(stack.get(0), stack.get(1));
+    stack.replace(&[Value::boolean(eq)]);
+    Ok(CallbackAction::Return)
 }
 
 fn lua_rawget<'gc>(
@@ -160,11 +248,22 @@ fn lua_rawget<'gc>(
     Ok(CallbackAction::Return)
 }
 
+/// `rawlen(v)` — length of a table (border) or string (byte count), bypassing
+/// `__len`.
 fn lua_rawlen<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    let v = stack.get(0);
+    let len = if let Some(s) = v.get_string() {
+        s.len() as i64
+    } else if let Some(t) = v.get_table() {
+        t.raw_len() as i64
+    } else {
+        return Err(Error::from_str(nctx.ctx, "table or string expected"));
+    };
+    stack.replace(&[Value::integer(len)]);
+    Ok(CallbackAction::Return)
 }
 
 fn lua_rawset<'gc>(
@@ -185,11 +284,37 @@ fn lua_rawset<'gc>(
     Ok(CallbackAction::Return)
 }
 
+/// `select('#', ...)` returns the count of extra arguments; `select(n, ...)`
+/// returns the arguments from position `n` onward (negative `n` counts from
+/// the end).
 fn lua_select<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    let m = stack.len().saturating_sub(1); // count of arguments after the selector
+    let sel = stack.get(0);
+    if let Some(s) = sel.get_string()
+        && s.as_bytes() == b"#"
+    {
+        stack.replace(&[Value::integer(m as i64)]);
+        return Ok(CallbackAction::Return);
+    }
+    let i = util::check_integer(nctx.ctx, sel, "select", 1)?;
+    let pos = if i < 0 { m as i64 + i + 1 } else { i };
+    if pos < 1 {
+        return Err(Error::from_str(
+            nctx.ctx,
+            "bad argument #1 to 'select' (index out of range)",
+        ));
+    }
+    let mut out = Vec::new();
+    let mut k = pos as usize;
+    while k <= m {
+        out.push(stack.get(k));
+        k += 1;
+    }
+    stack.replace(&out);
+    Ok(CallbackAction::Return)
 }
 
 /// `setmetatable(t, mt)` — attach `mt` (a table or nil) as `t`'s
@@ -283,25 +408,67 @@ fn parse_lua_number<'gc>(b: &[u8]) -> Option<Value<'gc>> {
     None
 }
 
+/// `tostring(v)` — default string representation. TODO(#27): honor
+/// `__tostring`/`__name`, which require calling back into Lua.
 fn lua_tostring<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    if stack.is_empty() {
+        return Err(Error::from_str(
+            nctx.ctx,
+            "bad argument #1 to 'tostring' (value expected)",
+        ));
+    }
+    let s = util::basic_tostring(nctx.ctx, stack.get(0));
+    stack.replace(&[Value::string(s)]);
+    Ok(CallbackAction::Return)
 }
 
+/// `type(v)` — the type name of `v` as a string.
 fn lua_type<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    if stack.is_empty() {
+        return Err(Error::from_str(
+            nctx.ctx,
+            "bad argument #1 to 'type' (value expected)",
+        ));
+    }
+    let name = stack.get(0).type_name();
+    stack.replace(&[Value::string(LuaString::new(nctx.ctx, name.as_bytes()))]);
+    Ok(CallbackAction::Return)
 }
 
+/// `warn(msg, ...)` — Lua's warning system defaults to off and we do not yet
+/// track the on/off toggle, so this validates that all arguments are strings
+/// (as Lua does) and otherwise does nothing. TODO(#27): emit to stderr and
+/// honor `@on`/`@off` control messages once warning state lives in `State`.
 fn lua_warn<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
+    stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    if stack.is_empty() {
+        return Err(Error::from_str(
+            nctx.ctx,
+            "bad argument #1 to 'warn' (string expected, got no value)",
+        ));
+    }
+    for i in 0..stack.len() {
+        let v = stack.get(i);
+        if v.get_string().is_none() {
+            return Err(Error::from_str(
+                nctx.ctx,
+                &format!(
+                    "bad argument #{} to 'warn' (string expected, got {})",
+                    i + 1,
+                    v.type_name()
+                ),
+            ));
+        }
+    }
+    Ok(CallbackAction::Return)
 }
 
 fn lua_xpcall<'gc>(

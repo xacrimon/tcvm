@@ -1,4 +1,5 @@
 use crate::Context;
+use crate::builtin::util;
 use crate::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Table, Value};
 use crate::vm::sequence::CallbackAction;
 
@@ -111,17 +112,13 @@ fn lua_write<'gc>(
         let res = if let Some(s) = v.get_string() {
             out.write_all(s.as_bytes())
         } else if let Some(i) = v.get_integer() {
-            write!(out, "{i}")
+            let mut buf = Vec::new();
+            util::push_int(&mut buf, i);
+            out.write_all(&buf)
         } else if let Some(f) = v.get_float() {
-            // Lua's default number-to-string is "%.14g"; Rust's `{}` for
-            // f64 is close enough for typical values and doesn't add a
-            // trailing ".0" when the value rounds to an integer in our
-            // current usage. The full "%.14g" goes through string.format.
-            if f.is_finite() && f.fract() == 0.0 && f.abs() < 1e16 {
-                write!(out, "{}", f as i64)
-            } else {
-                write!(out, "{}", f)
-            }
+            let mut buf = Vec::new();
+            util::push_float(&mut buf, f);
+            out.write_all(&buf)
         } else {
             return Err(Error::from_str(
                 nctx.ctx,
