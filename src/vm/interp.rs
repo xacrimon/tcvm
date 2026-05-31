@@ -343,7 +343,7 @@ macro_rules! table_get_slow_body {
 
         // INDEX bit implies metatable is Some.
         let __mt = unsafe { __t.metatable().unwrap_unchecked() };
-        match walk_index_chain(__t, __mt, __k, $ctx.symbols().mm_index) {
+        match walk_index_chain(Value::table(__t), __mt, __k, $ctx.symbols().mm_index) {
             IndexChain::Resolved(__rv) => {
                 *reg!(mut __dst_reg) = __rv;
                 dispatch!();
@@ -360,6 +360,41 @@ macro_rules! table_get_slow_body {
                 invoke_metamethod!(__mm_func, &[__mm_recv, __k], __cont);
             }
             IndexChain::Exhausted => raise!(),
+        }
+    }};
+}
+
+/// Inflates the slow-path body for "userdata get via `__index`". Unlike
+/// the table case, a userdata with no metatable or a nil `__index` is an
+/// "attempt to index" error (`userdata_index_chain` returns `Err`), since
+/// userdata has no raw indexing to fall back to. A key absent from the
+/// `__index` table still resolves to nil.
+macro_rules! userdata_get_slow_body {
+    ($ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr,
+     $u:expr, $recv:expr, $k:expr, $dst:expr) => {{
+        let __u = $u;
+        let __recv: Value<'gc> = $recv;
+        let __k: Value<'gc> = $k;
+        let __dst_reg: u8 = $dst;
+
+        match userdata_index_chain(__u, __recv, __k, $ctx.symbols().mm_index) {
+            Err(()) => raise!(),
+            Ok(IndexChain::Resolved(__rv)) => {
+                *reg!(mut __dst_reg) = __rv;
+                dispatch!();
+            }
+            Ok(IndexChain::Invoke {
+                func: __mm_func,
+                receiver: __mm_recv,
+            }) => {
+                let __cont = Continuation {
+                    payload: ContinuationPayload::StoreResult { dst: __dst_reg },
+                    results_base: 0,
+                    nret: 0,
+                };
+                invoke_metamethod!(__mm_func, &[__mm_recv, __k], __cont);
+            }
+            Ok(IndexChain::Exhausted) => raise!(),
         }
     }};
 }
@@ -766,7 +801,8 @@ extern "rust-preserve-none" fn op_gettable<'gc>(
     let (dst, table, key) = args!(Instruction::GETTABLE { dst, table, key });
 
     let Some(t) = reg!(table).get_table() else {
-        raise!();
+        // Non-table (userdata `__index`, or error) — handled by the slow path.
+        become gettable_slow(instruction, ctx, thread, registers, ip, handlers);
     };
 
     let k = reg!(key);
@@ -796,11 +832,15 @@ extern "rust-preserve-none" fn gettable_slow<'gc>(
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
     let (dst, table, key) = args!(Instruction::GETTABLE { dst, table, key });
-    let Some(t) = reg!(table).get_table() else {
+    let recv = reg!(table);
+    let k = reg!(key);
+    if let Some(t) = recv.get_table() {
+        table_get_slow_body!(ctx, thread, registers, ip, handlers, t, k, dst);
+    }
+    let Some(u) = recv.get_userdata() else {
         raise!();
     };
-    let k = reg!(key);
-    table_get_slow_body!(ctx, thread, registers, ip, handlers, t, k, dst);
+    userdata_get_slow_body!(ctx, thread, registers, ip, handlers, u, recv, k, dst);
 }
 
 /// R[table][R[key]] = R[src]
@@ -874,7 +914,8 @@ extern "rust-preserve-none" fn op_getfield<'gc>(
     });
 
     let Some(t) = reg!(table).get_table() else {
-        raise!();
+        // Non-table (userdata `__index`, or error) — handled by the slow path.
+        become getfield_slow(instruction, ctx, thread, registers, ip, handlers);
     };
 
     let cache = read_ic(thread, ic_idx);
@@ -909,12 +950,16 @@ extern "rust-preserve-none" fn getfield_slow<'gc>(
         ic_idx,
         key_idx
     });
-    let Some(t) = reg!(table).get_table() else {
+    let recv = reg!(table);
+    let k = constant!(key_idx);
+    if let Some(t) = recv.get_table() {
+        fill_ic_for_constant_key(ctx, thread, ic_idx, t, k);
+        table_get_slow_body!(ctx, thread, registers, ip, handlers, t, k, dst);
+    }
+    let Some(u) = recv.get_userdata() else {
         raise!();
     };
-    let k = constant!(key_idx);
-    fill_ic_for_constant_key(ctx, thread, ic_idx, t, k);
-    table_get_slow_body!(ctx, thread, registers, ip, handlers, t, k, dst);
+    userdata_get_slow_body!(ctx, thread, registers, ip, handlers, u, recv, k, dst);
 }
 
 /// R[table][K[key_idx]] = R[src]
@@ -1008,7 +1053,8 @@ extern "rust-preserve-none" fn op_self<'gc>(
 
     let recv_val = reg!(object);
     let Some(recv) = recv_val.get_table() else {
-        raise!();
+        // Non-table receiver (userdata method dispatch, or an error).
+        become op_self_nontable(instruction, ctx, thread, registers, ip, handlers);
     };
 
     let key = constant!(key_idx);
@@ -1053,7 +1099,7 @@ extern "rust-preserve-none" fn op_self_slow<'gc>(
     // Reachable only when raw_get returned nil and the INDEX bit is set,
     // so we go straight to the chain walk.
     let mt = unsafe { recv.metatable().unwrap_unchecked() };
-    match walk_index_chain(recv, mt, key, ctx.symbols().mm_index) {
+    match walk_index_chain(recv_val, mt, key, ctx.symbols().mm_index) {
         IndexChain::Resolved(method) => {
             *reg!(mut dst) = method;
             *reg!(mut (dst + 1)) = recv_val;
@@ -1062,6 +1108,58 @@ extern "rust-preserve-none" fn op_self_slow<'gc>(
         IndexChain::Invoke { func, receiver } => {
             // Functional __index. Pre-place self at dst+1; the
             // continuation writes the resolved method into dst.
+            *reg!(mut (dst + 1)) = recv_val;
+            let cont = Continuation {
+                payload: ContinuationPayload::StoreResult { dst },
+                results_base: 0,
+                nret: 0,
+            };
+            invoke_metamethod!(func, &[receiver, key], cont);
+        }
+        IndexChain::Exhausted => raise!(),
+    }
+}
+
+/// SELF on a non-table receiver. Userdata dispatches through its
+/// metatable's `__index`; unlike GETTABLE, a missing method is *not* an
+/// error here — we write `nil` into `R[dst]` and let the subsequent CALL
+/// raise "attempt to call a nil value (method ...)", matching Lua. A
+/// userdata with no metatable / nil `__index` likewise yields a nil
+/// method (the CALL raises). Any other non-table receiver raises.
+#[inline(never)]
+extern "rust-preserve-none" fn op_self_nontable<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+) -> Result<(), Box<Error>> {
+    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    let (dst, object, key_idx) = args!(Instruction::SELF {
+        dst,
+        object,
+        key_idx
+    });
+
+    let recv_val = reg!(object);
+    let Some(u) = recv_val.get_userdata() else {
+        raise!();
+    };
+    let key = constant!(key_idx);
+
+    let chain = match userdata_index_chain(u, recv_val, key, ctx.symbols().mm_index) {
+        // No metatable or nil `__index`: nil method, CALL raises.
+        Err(()) => IndexChain::Resolved(Value::nil()),
+        Ok(c) => c,
+    };
+    match chain {
+        IndexChain::Resolved(method) => {
+            *reg!(mut dst) = method;
+            *reg!(mut (dst + 1)) = recv_val;
+            dispatch!();
+        }
+        IndexChain::Invoke { func, receiver } => {
             *reg!(mut (dst + 1)) = recv_val;
             let cont = Continuation {
                 payload: ContinuationPayload::StoreResult { dst },
@@ -2610,19 +2708,21 @@ enum IndexChain<'gc> {
     Exhausted,
 }
 
-/// Walk the `__index` chain. Caller has already verified that
-/// `start.raw_get(key)` was nil and `start_metatable.has_mm(INDEX)` is
-/// set, so the walk begins at `start_metatable.raw_get(__index)` and
-/// follows `__index` hops from there. `mm_index_name` is the
-/// pre-interned `__index` LuaString — the function never re-interns it.
+/// Walk the `__index` chain starting from `start_metatable`'s `__index`
+/// slot. `start_receiver` is the value originally indexed — a `Table`
+/// for the table paths, a `Userdata` for the userdata path — and is the
+/// `receiver` handed to a functional `__index` resolved at depth 0
+/// (deeper hops use the intermediate `__index` table as receiver, per
+/// `luaV_finishget`). `mm_index_name` is the pre-interned `__index`
+/// LuaString — the function never re-interns it.
 #[inline]
 fn walk_index_chain<'gc>(
-    start: Table<'gc>,
+    start_receiver: Value<'gc>,
     start_metatable: Table<'gc>,
     key: Value<'gc>,
     mm_index_name: LuaString<'gc>,
 ) -> IndexChain<'gc> {
-    let mut current_table = start;
+    let mut current_receiver = start_receiver;
     let mut mm = start_metatable.raw_get(Value::string(mm_index_name));
     for _ in 0..MAX_TAG_LOOP {
         if mm.is_nil() {
@@ -2633,7 +2733,7 @@ fn walk_index_chain<'gc>(
             None => {
                 return IndexChain::Invoke {
                     func: mm,
-                    receiver: Value::table(current_table),
+                    receiver: current_receiver,
                 };
             }
         };
@@ -2647,9 +2747,30 @@ fn walk_index_chain<'gc>(
         // INDEX bit implies metatable is Some.
         let next_mt = unsafe { next.metatable().unwrap_unchecked() };
         mm = next_mt.raw_get(Value::string(mm_index_name));
-        current_table = next;
+        current_receiver = Value::table(next);
     }
     IndexChain::Exhausted
+}
+
+/// Result of resolving an index on a *userdata* receiver: walk the
+/// userdata metatable's `__index` chain, or signal "raise" when the
+/// userdata has no metatable or a nil `__index` (no raw indexing exists
+/// for userdata, so this is the "attempt to index" case — see
+/// `luaV_finishget`). Callers that tolerate a missing method (SELF) must
+/// not use this; they treat the absent `__index` as a nil result so the
+/// subsequent CALL raises instead.
+#[inline]
+fn userdata_index_chain<'gc>(
+    u: crate::env::Userdata<'gc>,
+    recv_val: Value<'gc>,
+    key: Value<'gc>,
+    mm_index_name: LuaString<'gc>,
+) -> Result<IndexChain<'gc>, ()> {
+    let mt = u.metatable().ok_or(())?;
+    if mt.raw_get(Value::string(mm_index_name)).is_nil() {
+        return Err(());
+    }
+    Ok(walk_index_chain(recv_val, mt, key, mm_index_name))
 }
 
 /// Result of walking a `__newindex` chain.

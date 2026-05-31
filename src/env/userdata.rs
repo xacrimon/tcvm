@@ -34,6 +34,18 @@ impl<'gc> Userdata<'gc> {
         self.0.borrow_mut(mc).metatable = mt;
     }
 
+    /// Borrow the boxed payload as `&T` for the duration of `f`, returning
+    /// `None` if the stored type isn't `T`. The closure receives a shared
+    /// borrow held only while it runs — the guard never escapes, so the
+    /// returned `R` must be owned. The closure must not re-enter this
+    /// userdata's mutators (`set_metatable`/`set_user_value`); those take a
+    /// conflicting `borrow_mut`. Payloads needing mutation should carry their
+    /// own interior mutability (e.g. a `RefCell`) so a shared borrow suffices.
+    pub fn with_data<T: 'static, R>(self, f: impl FnOnce(&T) -> R) -> Option<R> {
+        let state = self.0.borrow();
+        state.data.downcast_ref::<T>().map(f)
+    }
+
     pub fn get_user_value(self, index: usize) -> Value<'gc> {
         self.0
             .borrow()

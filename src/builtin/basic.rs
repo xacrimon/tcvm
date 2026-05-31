@@ -114,21 +114,23 @@ fn lua_getmetatable<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let v = stack.get(0);
-    let result = if let Some(t) = v.get_table() {
-        match t.metatable() {
-            // A `__metatable` field shadows the real metatable (protection).
-            Some(mt) => {
-                let prot = mt.raw_get(Value::string(LuaString::new(nctx.ctx, b"__metatable")));
-                if prot.is_nil() {
-                    Value::table(mt)
-                } else {
-                    prot
-                }
-            }
-            None => Value::nil(),
-        }
+    // A `__metatable` field shadows the real metatable (protection); tables
+    // and userdata both carry per-object metatables.
+    let metatable = if let Some(t) = v.get_table() {
+        t.metatable()
     } else {
-        Value::nil()
+        v.get_userdata().and_then(|u| u.metatable())
+    };
+    let result = match metatable {
+        Some(mt) => {
+            let prot = mt.raw_get(Value::string(LuaString::new(nctx.ctx, b"__metatable")));
+            if prot.is_nil() {
+                Value::table(mt)
+            } else {
+                prot
+            }
+        }
+        None => Value::nil(),
     };
     stack.replace(&[result]);
     Ok(CallbackAction::Return)
