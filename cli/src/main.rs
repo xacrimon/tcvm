@@ -2,7 +2,7 @@ use clap::Parser;
 use std::fs;
 use std::path::PathBuf;
 use tcvm::env::{LuaString, Table, Value};
-use tcvm::{Executor, Lua, format_prototype};
+use tcvm::{Executor, Lua, RuntimeError, format_prototype};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -57,5 +57,20 @@ fn main() {
         ctx.stash(executor)
     });
 
-    lua.execute::<()>(&ex).unwrap();
+    if let Err(e) = lua.execute::<()>(&ex) {
+        match e {
+            RuntimeError::Lua(stashed) => {
+                let msg = lua.enter(|ctx| {
+                    let err = ctx.fetch(&stashed);
+                    match err.value().get_string() {
+                        Some(s) => String::from_utf8_lossy(s.as_bytes()).into_owned(),
+                        None => format!("(error object is a {} value)", err.value().type_name()),
+                    }
+                });
+                eprintln!("tcvm: {msg}");
+            }
+            other => eprintln!("tcvm: {other}"),
+        }
+        std::process::exit(1);
+    }
 }
