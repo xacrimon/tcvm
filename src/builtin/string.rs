@@ -273,14 +273,11 @@ fn format_one<'gc>(
             fmt_int_unsigned(out, spec, n as u64, 16, true);
         }
         b'c' => {
+            // C's `%c` casts the integer to `unsigned char`; Lua adds no range
+            // check, so out-of-range values wrap to the low byte. Width/`-`
+            // flags still apply (via apply_width).
             let n = check_fmt_int(ctx, arg)?;
-            if !(0..=255).contains(&n) {
-                return Err(Error::from_str(
-                    ctx,
-                    "bad argument to 'format' (value out of range)",
-                ));
-            }
-            out.push(n as u8);
+            apply_width(out, spec, b"", b"", &[n as u8]);
         }
         b'f' | b'F' => {
             let f = to_float(arg).ok_or_else(|| arg_type_err(ctx, "number", &arg))?;
