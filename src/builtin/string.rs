@@ -742,6 +742,10 @@ fn apply_width(out: &mut Vec<u8>, spec: &FmtSpec, sign: &[u8], prefix: &[u8], bo
         out.extend_from_slice(body);
         return;
     }
+    // C printf: a precision suppresses the `0` flag only for the integer
+    // conversions (d/i/o/u/x/X); for floats (f/e/g/a) the `0` flag still pads.
+    let int_conv = matches!(spec.conv, b'd' | b'i' | b'u' | b'o' | b'x' | b'X');
+    let zero_pad = spec.flag_zero && !(int_conv && spec.precision.is_some());
     if spec.flag_minus {
         out.extend_from_slice(sign);
         out.extend_from_slice(prefix);
@@ -749,7 +753,7 @@ fn apply_width(out: &mut Vec<u8>, spec: &FmtSpec, sign: &[u8], prefix: &[u8], bo
         for _ in 0..pad {
             out.push(b' ');
         }
-    } else if spec.flag_zero && spec.precision.is_none() {
+    } else if zero_pad {
         out.extend_from_slice(sign);
         out.extend_from_slice(prefix);
         for _ in 0..pad {
