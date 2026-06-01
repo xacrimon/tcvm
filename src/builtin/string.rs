@@ -176,6 +176,14 @@ fn lua_format<'gc>(
             out.push(b'%');
             continue;
         }
+        // A conversion consumes the next argument; a missing one is an error
+        // ("no value"), distinct from an explicitly-passed nil.
+        if arg_idx >= stack.len() {
+            return Err(Error::from_str(
+                ctx.ctx,
+                &format!("bad argument #{} to 'format' (no value)", arg_idx + 1),
+            ));
+        }
         let arg = stack.get(arg_idx);
         arg_idx += 1;
         format_one(ctx.ctx, &mut out, &spec, arg)?;
