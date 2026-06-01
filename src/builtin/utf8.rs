@@ -39,10 +39,15 @@ pub fn load<'gc>(ctx: Context<'gc>) {
 // Codec helpers
 // ---------------------------------------------------------------------------
 
-/// Decode one code point starting at 0-based `pos`. Returns `(code, next_pos)`
-/// or `None` for a malformed sequence. Validates structure (lead/continuation
-/// bytes) but, like Lua's lax mode, does not reject surrogates.
-fn decode(bytes: &[u8], pos: usize) -> Option<(u32, usize)> {
+/// Decode one code point starting at 0-based `pos`, returning `(code,
+/// next_pos)` or `None` for a malformed sequence. Mirrors PUC-Lua's
+/// `utf8_decode`: it always rejects ill-formed structure and overlong
+/// encodings; with `strict` it additionally rejects surrogates and code
+/// points above `0x10FFFF` (the default for `codepoint`/`len`/`codes`).
+fn decode(bytes: &[u8], pos: usize, strict: bool) -> Option<(u32, usize)> {
+    // Minimum value representable by an N-byte sequence, indexed by the number
+    // of continuation bytes (`lead - 1`); a result below it is overlong.
+    const LIMITS: [u32; 6] = [0, 0x80, 0x800, 0x10000, 0x20_0000, 0x400_0000];
     let c = *bytes.get(pos)?;
     let lead = c.leading_ones();
     if lead == 0 {
@@ -58,6 +63,12 @@ fn decode(bytes: &[u8], pos: usize) -> Option<(u32, usize)> {
             return None;
         }
         code = (code << 6) | (cc & 0x3f) as u32;
+    }
+    if code < LIMITS[lead as usize - 1] {
+        return None; // overlong encoding
+    }
+    if strict && (code > 0x10_FFFF || (0xD800..=0xDFFF).contains(&code)) {
+        return None; // surrogate or above the Unicode range
     }
     Some((code, pos + lead as usize))
 }
@@ -177,11 +188,12 @@ fn lua_codepoint<'gc>(
             "bad argument #3 to 'codepoint' (out of bounds)",
         ));
     }
+    let strict = stack.get(3).is_falsy(); // optional `lax` flag (arg #4): lax ⇒ not strict
     let mut out = Vec::new();
     let mut pos = (posi - 1) as usize;
     let end = posj as usize;
     while pos < end {
-        match decode(bytes, pos) {
+        match decode(bytes, pos, strict) {
             Some((code, next)) => {
                 out.push(Value::integer(code as i64));
                 pos = next;
@@ -229,9 +241,10 @@ fn lua_len<'gc>(
             "bad argument #3 to 'len' (final position out of bounds)",
         ));
     }
+    let strict = stack.get(3).is_falsy(); // optional `lax` flag (arg #4)
     let mut count = 0i64;
     while posi <= posj {
-        match decode(bytes, (posi - 1) as usize) {
+        match decode(bytes, (posi - 1) as usize, strict) {
             Some((_, next)) => {
                 count += 1;
                 posi = next as i64 + 1;
@@ -346,11 +359,12 @@ fn codes_aux<'gc>(
     let bytes = s.as_bytes();
     let len = bytes.len();
     let i = stack.get(1).get_integer().unwrap_or(0);
+    // `utf8.codes` decodes strictly by default (matching PUC-Lua).
     // Advance past the previously decoded character (if any).
     let pos = if i == 0 {
         0
     } else {
-        match decode(bytes, (i - 1) as usize) {
+        match decode(bytes, (i - 1) as usize, true) {
             Some((_, next)) => next,
             None => return Err(Error::from_str(nctx.ctx, "invalid UTF-8 code")),
         }
@@ -359,7 +373,7 @@ fn codes_aux<'gc>(
         stack.replace(&[]);
         return Ok(CallbackAction::Return);
     }
-    match decode(bytes, pos) {
+    match decode(bytes, pos, true) {
         Some((code, _)) => {
             stack.replace(&[Value::integer(pos as i64 + 1), Value::integer(code as i64)]);
             Ok(CallbackAction::Return)
