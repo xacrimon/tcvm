@@ -388,7 +388,11 @@ fn read_number<R: BufRead>(r: &mut R) -> std::io::Result<ReadOne> {
         let accept = if b.is_ascii_digit() || b == b'.' {
             true
         } else if b == b'+' || b == b'-' {
-            tok.is_empty() || matches!(tok.last(), Some(b'e' | b'E' | b'p' | b'P'))
+            // A sign starts the token or follows the exponent marker — which is
+            // `p`/`P` in hex (where `e`/`E` are mantissa digits) and `e`/`E` in
+            // decimal.
+            let exp_mark = if seen_hex { (b'p', b'P') } else { (b'e', b'E') };
+            tok.is_empty() || matches!(tok.last(), Some(&c) if c == exp_mark.0 || c == exp_mark.1)
         } else if !seen_hex && (b == b'x' || b == b'X') {
             matches!(tok.as_slice(), b"0" | b"-0" | b"+0")
         } else if seen_hex && b.is_ascii_hexdigit() {
