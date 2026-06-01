@@ -18,7 +18,7 @@
 
 use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 
 use crate::Context;
 use crate::builtin::util;
@@ -347,19 +347,14 @@ fn read_one<R: BufRead>(r: &mut R, fmt: ReadFmt) -> std::io::Result<ReadOne> {
             }
         }
         ReadFmt::Bytes(n) => {
-            let mut buf = vec![0u8; n];
-            let mut filled = 0;
-            while filled < n {
-                let got = r.read(&mut buf[filled..])?;
-                if got == 0 {
-                    break;
-                }
-                filled += got;
-            }
-            if filled == 0 {
+            // Grow the buffer as bytes actually arrive rather than allocating
+            // `n` up front: a caller-supplied `read(1<<60)` must surface as a
+            // catchable error, not an eager multi-exabyte allocation abort.
+            let mut buf = Vec::new();
+            r.take(n as u64).read_to_end(&mut buf)?;
+            if buf.is_empty() {
                 Ok(ReadOne::Nil)
             } else {
-                buf.truncate(filled);
                 Ok(ReadOne::Bytes(buf))
             }
         }
