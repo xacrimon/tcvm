@@ -1,5 +1,9 @@
 use crate::Context;
 use crate::builtin::util;
+// `%d`/`%f` argument coercion reuses the shared `util` helpers so the
+// integer-representation and numeric-string rules (including `inf`/`nan`
+// rejection) match `tonumber`/`math.*` and don't drift.
+use crate::builtin::util::{to_integer, to_number as to_float};
 use crate::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Table, Value};
 use crate::vm::sequence::CallbackAction;
 
@@ -245,23 +249,23 @@ fn format_one<'gc>(
 ) -> Result<(), Error<'gc>> {
     match spec.conv {
         b'd' | b'i' | b'u' => {
-            let n = to_integer(arg).ok_or_else(|| arg_type_err(ctx, "integer", &arg))?;
+            let n = check_fmt_int(ctx, arg)?;
             fmt_int_signed(out, spec, n);
         }
         b'o' => {
-            let n = to_integer(arg).ok_or_else(|| arg_type_err(ctx, "integer", &arg))?;
+            let n = check_fmt_int(ctx, arg)?;
             fmt_int_unsigned(out, spec, n as u64, 8, false);
         }
         b'x' => {
-            let n = to_integer(arg).ok_or_else(|| arg_type_err(ctx, "integer", &arg))?;
+            let n = check_fmt_int(ctx, arg)?;
             fmt_int_unsigned(out, spec, n as u64, 16, false);
         }
         b'X' => {
-            let n = to_integer(arg).ok_or_else(|| arg_type_err(ctx, "integer", &arg))?;
+            let n = check_fmt_int(ctx, arg)?;
             fmt_int_unsigned(out, spec, n as u64, 16, true);
         }
         b'c' => {
-            let n = to_integer(arg).ok_or_else(|| arg_type_err(ctx, "integer", &arg))?;
+            let n = check_fmt_int(ctx, arg)?;
             if !(0..=255).contains(&n) {
                 return Err(Error::from_str(
                     ctx,
@@ -313,40 +317,24 @@ fn arg_type_err<'gc>(ctx: Context<'gc>, expected: &str, arg: &Value<'gc>) -> Err
     )
 }
 
-fn to_integer<'gc>(v: Value<'gc>) -> Option<i64> {
-    if let Some(i) = v.get_integer() {
-        return Some(i);
+/// Coerce a `%d`/`%x`/`%c`/… argument to an integer, distinguishing — as Lua
+/// does — a non-number ("number expected, got X") from a number with no exact
+/// integer value ("number has no integer representation").
+fn check_fmt_int<'gc>(ctx: Context<'gc>, arg: Value<'gc>) -> Result<i64, Error<'gc>> {
+    if let Some(i) = to_integer(arg) {
+        return Ok(i);
     }
-    if let Some(f) = v.get_float() {
-        if f.is_finite() && f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
-            return Some(f as i64);
-        }
-        return None;
-    }
-    if let Some(s) = v.get_string() {
-        let t = std::str::from_utf8(s.as_bytes()).ok()?.trim();
-        return t.parse::<i64>().ok().or_else(|| {
-            t.parse::<f64>()
-                .ok()
-                .filter(|f| f.fract() == 0.0)
-                .map(|f| f as i64)
-        });
-    }
-    None
+    let msg = if to_float(arg).is_some() {
+        "bad argument to 'format' (number has no integer representation)".to_string()
+    } else {
+        format!(
+            "bad argument to 'format' (number expected, got {})",
+            arg.type_name()
+        )
+    };
+    Err(Error::from_str(ctx, &msg))
 }
 
-fn to_float<'gc>(v: Value<'gc>) -> Option<f64> {
-    if let Some(i) = v.get_integer() {
-        return Some(i as f64);
-    }
-    if let Some(f) = v.get_float() {
-        return Some(f);
-    }
-    if let Some(s) = v.get_string() {
-        return std::str::from_utf8(s.as_bytes()).ok()?.trim().parse().ok();
-    }
-    None
-}
 
 // ---------- integer formatting ----------
 

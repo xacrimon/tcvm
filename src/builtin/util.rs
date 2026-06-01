@@ -267,7 +267,10 @@ pub(crate) fn to_number<'gc>(v: Value<'gc>) -> Option<f64> {
     } else if let Some(f) = v.get_float() {
         Some(f)
     } else if let Some(s) = v.get_string() {
-        std::str::from_utf8(s.as_bytes()).ok()?.trim().parse().ok()
+        // Via the lexer rules (`str_to_number`), not raw `f64::parse`, so
+        // `"inf"`/`"nan"` are rejected as Lua's `luaL_checknumber` does.
+        let n = str_to_number(s.as_bytes())?;
+        n.get_integer().map(|i| i as f64).or_else(|| n.get_float())
     } else {
         None
     }
@@ -283,11 +286,11 @@ pub(crate) fn to_integer<'gc>(v: Value<'gc>) -> Option<i64> {
         return float_to_integer(f);
     }
     if let Some(s) = v.get_string() {
-        let t = std::str::from_utf8(s.as_bytes()).ok()?.trim();
-        if let Ok(i) = t.parse::<i64>() {
-            return Some(i);
-        }
-        return t.parse::<f64>().ok().and_then(float_to_integer);
+        // Same lexer-rule coercion as `to_number`, then the int/float rule.
+        let n = str_to_number(s.as_bytes())?;
+        return n
+            .get_integer()
+            .or_else(|| n.get_float().and_then(float_to_integer));
     }
     None
 }
