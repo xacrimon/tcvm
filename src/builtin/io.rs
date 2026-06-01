@@ -593,11 +593,23 @@ fn open_file<'gc>(
 }
 
 /// `(nil, "what: msg", errno)` from a failed `std::io::Error`.
-fn io_fail<'gc>(ctx: Context<'gc>, what: &str, e: &std::io::Error) -> [Value<'gc>; 3] {
-    let msg = LuaString::new(ctx, format!("{what}: {e}").as_bytes());
+fn io_fail<'gc>(ctx: Context<'gc>, fname: Option<&str>, e: &std::io::Error) -> [Value<'gc>; 3] {
+    // `luaL_fileresult`: the message is bare `strerror(errno)`, prefixed with
+    // the *filename* only (never the operation name) and only when one is
+    // available. Rust's `Display` appends " (os error N)", which Lua omits, so
+    // strip it back to the strerror text.
+    let raw = e.to_string();
+    let bare = match raw.find(" (os error ") {
+        Some(cut) => &raw[..cut],
+        None => &raw,
+    };
+    let text = match fname {
+        Some(f) => format!("{f}: {bare}"),
+        None => bare.to_string(),
+    };
     [
         Value::nil(),
-        Value::string(msg),
+        Value::string(LuaString::new(ctx, text.as_bytes())),
         Value::integer(e.raw_os_error().unwrap_or(0) as i64),
     ]
 }
@@ -627,7 +639,7 @@ fn lua_open<'gc>(
         Ok(u) => stack.replace(&[Value::userdata(u)]),
         Err(e) => {
             let what = std::str::from_utf8(name.as_bytes()).unwrap_or("");
-            stack.replace(&io_fail(nctx.ctx, what, &e));
+            stack.replace(&io_fail(nctx.ctx, Some(what), &e));
         }
     }
     Ok(CallbackAction::Return)
@@ -647,7 +659,7 @@ fn lua_write<'gc>(
     match do_write(&nctx, out, &vals, "write", 1)? {
         WriteOutcome::Ok => stack.replace(&[out_val]),
         WriteOutcome::Closed => return Err(closed_file_error(nctx.ctx)),
-        WriteOutcome::Io(e) => stack.replace(&io_fail(nctx.ctx, "write", &e)),
+        WriteOutcome::Io(e) => stack.replace(&io_fail(nctx.ctx, None, &e)),
     }
     Ok(CallbackAction::Return)
 }
@@ -693,7 +705,7 @@ fn lua_flush<'gc>(
         .expect("io-state output must be a file handle");
     match out.with_data::<LuaFile, _>(|lf| flush_stream(&mut lf.state.borrow_mut())) {
         Some(WriteOutcome::Closed) => return Err(closed_file_error(nctx.ctx)),
-        Some(WriteOutcome::Io(e)) => stack.replace(&io_fail(nctx.ctx, "flush", &e)),
+        Some(WriteOutcome::Io(e)) => stack.replace(&io_fail(nctx.ctx, None, &e)),
         _ => stack.replace(&[out_val]),
     }
     Ok(CallbackAction::Return)
@@ -811,7 +823,7 @@ fn lua_tmpfile<'gc>(
             );
             stack.replace(&[Value::userdata(u)]);
         }
-        Err(e) => stack.replace(&io_fail(nctx.ctx, "tmpfile", &e)),
+        Err(e) => stack.replace(&io_fail(nctx.ctx, None, &e)),
     }
     Ok(CallbackAction::Return)
 }
@@ -839,7 +851,7 @@ fn lua_file_write<'gc>(
     match do_write(&nctx, u, &vals, "write", 2)? {
         WriteOutcome::Ok => stack.replace(&[self_val]),
         WriteOutcome::Closed => return Err(closed_file_error(nctx.ctx)),
-        WriteOutcome::Io(e) => stack.replace(&io_fail(nctx.ctx, "write", &e)),
+        WriteOutcome::Io(e) => stack.replace(&io_fail(nctx.ctx, None, &e)),
     }
     Ok(CallbackAction::Return)
 }
@@ -896,9 +908,12 @@ fn lua_file_seek<'gc>(
         }
     };
     let pos = match whence {
-        b"set" => SeekFrom::Start(offset.max(0) as u64),
-        b"cur" => SeekFrom::Current(offset),
-        b"end" => SeekFrom::End(offset),
+        // A negative absolute offset is invalid; surface the OS EINVAL the
+        // underlying lseek would return rather than clamping to the start.
+        b"set" if offset < 0 => None,
+        b"set" => Some(SeekFrom::Start(offset as u64)),
+        b"cur" => Some(SeekFrom::Current(offset)),
+        b"end" => Some(SeekFrom::End(offset)),
         _ => {
             return Err(Error::from_str(
                 nctx.ctx,
@@ -906,13 +921,16 @@ fn lua_file_seek<'gc>(
             ));
         }
     };
-    match u
-        .with_data::<LuaFile, _>(|lf| seek_stream(&mut lf.state.borrow_mut(), pos))
-        .expect("file handle must carry a LuaFile payload")
-    {
+    let outcome = match pos {
+        Some(pos) => u
+            .with_data::<LuaFile, _>(|lf| seek_stream(&mut lf.state.borrow_mut(), pos))
+            .expect("file handle must carry a LuaFile payload"),
+        None => SeekOutcome::Io(std::io::Error::from_raw_os_error(22)), // EINVAL
+    };
+    match outcome {
         SeekOutcome::Pos(n) => stack.replace(&[Value::integer(n as i64)]),
         SeekOutcome::Closed => return Err(closed_file_error(nctx.ctx)),
-        SeekOutcome::Io(e) => stack.replace(&io_fail(nctx.ctx, "seek", &e)),
+        SeekOutcome::Io(e) => stack.replace(&io_fail(nctx.ctx, None, &e)),
     }
     Ok(CallbackAction::Return)
 }
@@ -930,7 +948,7 @@ fn lua_file_flush<'gc>(
     {
         WriteOutcome::Ok => stack.replace(&[self_val]),
         WriteOutcome::Closed => return Err(closed_file_error(nctx.ctx)),
-        WriteOutcome::Io(e) => stack.replace(&io_fail(nctx.ctx, "flush", &e)),
+        WriteOutcome::Io(e) => stack.replace(&io_fail(nctx.ctx, None, &e)),
     }
     Ok(CallbackAction::Return)
 }
