@@ -190,10 +190,32 @@ fn lua_move<'gc>(
     };
 
     if e >= f {
+        // PUC-Lua's two bounds: the element count `e - f + 1` must fit a Lua
+        // integer (else `e - f` itself overflows), and the destination range
+        // `t .. t + n - 1` must not wrap past maxinteger.
+        if !(f > 0 || e < i64::MAX + f) {
+            return Err(Error::from_str(
+                nctx.ctx,
+                "bad argument #3 to 'move' (too many elements to move)",
+            ));
+        }
+        let n = e - f + 1;
+        if t > i64::MAX - n + 1 {
+            return Err(Error::from_str(
+                nctx.ctx,
+                "bad argument #4 to 'move' (destination wrap around)",
+            ));
+        }
         let same = crate::dmm::Gc::ptr_eq(a1.inner(), a2.inner());
-        // Copy backward when the destination overlaps the tail of the source.
-        if same && t > f && t <= e {
-            let mut i = e - f;
+        // Copy forward unless the destination overlaps the tail of the source
+        // within the same table; the guards above keep `f + i` / `t + i` in range.
+        if t > e || t <= f || !same {
+            for i in 0..n {
+                let v = a1.raw_get(Value::integer(f + i));
+                a2.raw_set(nctx.ctx, Value::integer(t + i), v);
+            }
+        } else {
+            let mut i = n - 1;
             loop {
                 let v = a1.raw_get(Value::integer(f + i));
                 a2.raw_set(nctx.ctx, Value::integer(t + i), v);
@@ -201,13 +223,6 @@ fn lua_move<'gc>(
                     break;
                 }
                 i -= 1;
-            }
-        } else {
-            let mut i = 0;
-            while i <= e - f {
-                let v = a1.raw_get(Value::integer(f + i));
-                a2.raw_set(nctx.ctx, Value::integer(t + i), v);
-                i += 1;
             }
         }
     }
