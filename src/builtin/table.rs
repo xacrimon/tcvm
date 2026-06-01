@@ -312,12 +312,25 @@ fn lua_unpack<'gc>(
     } else {
         util::check_integer(nctx.ctx, j_arg, "unpack", 3)?
     };
-    let mut out = Vec::new();
+    if i > j {
+        stack.replace(&[]); // empty range
+        return Ok(CallbackAction::Return);
+    }
+    // `n - 1` as unsigned, so a full-i64-span range can't overflow the
+    // subtraction (PUC-Lua's `tunpack`). Cap the count at i32::MAX results.
+    let n_minus_1 = (j as u64).wrapping_sub(i as u64);
+    if n_minus_1 >= i32::MAX as u64 {
+        return Err(Error::from_str(nctx.ctx, "too many results to unpack"));
+    }
+    let mut out = Vec::with_capacity(n_minus_1 as usize + 1);
+    // Iterate `k < j` then push `t[j]` separately, so `k += 1` never steps
+    // past i64::MAX when `j == i64::MAX`.
     let mut k = i;
-    while k <= j {
+    while k < j {
         out.push(t.raw_get(Value::integer(k)));
         k += 1;
     }
+    out.push(t.raw_get(Value::integer(j)));
     stack.replace(&out);
     Ok(CallbackAction::Return)
 }
