@@ -399,6 +399,51 @@ mod tests {
         lua.execute::<i64>(&ex).expect("run")
     }
 
+    fn run_returning_float(src: &str) -> f64 {
+        let mut lua = Lua::new();
+        let ex = lua
+            .try_enter(|ctx| -> Result<_, LoadError> {
+                let chunk = ctx.load(src, Some("test"))?;
+                Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+            })
+            .expect("load");
+        lua.execute::<f64>(&ex).expect("run")
+    }
+
+    #[test]
+    fn hex_numeral_literals() {
+        // Issue #99: the lexer rejected several valid Lua 5.5 hex numerals at
+        // chunk-load time. `.expect("load")` inside the helpers guards the
+        // original symptom (a parse error); the values are cross-checked
+        // against lua5.5. All are exact dyadic rationals, so `==` is safe.
+
+        // Unsigned binary exponent.
+        assert_eq!(run_returning_float("return 0x1p4"), 16.0);
+        // Fractional part with an unsigned exponent.
+        assert_eq!(run_returning_float("return 0x1.8p0"), 1.5);
+        // Uppercase 0X prefix with a fractional part.
+        assert_eq!(run_returning_float("return 0X1.8"), 1.5);
+        // Leading radix point (no digit before the `.`).
+        assert_eq!(run_returning_float("return 0x.8"), 0.5);
+        // Leading radix point plus a signed exponent.
+        assert_eq!(run_returning_float("return 0x.8p+1"), 1.0);
+        // Trailing radix point (no digit after the `.`).
+        assert_eq!(run_returning_float("return 0x1."), 1.0);
+        // Uppercase prefix + leading dot + uppercase exponent mark.
+        assert_eq!(run_returning_float("return 0X.8P-2"), 0.125);
+        // The binary exponent is DECIMAL: `p10` is 2^10, not 2^16.
+        assert_eq!(run_returning_float("return 0x1p10"), 1024.0);
+
+        // Uppercase 0X prefix with no `.`/exponent stays an integer literal.
+        assert_eq!(run_returning_int("return 0X10"), 16);
+
+        // Regression guards for forms that already lexed.
+        assert_eq!(run_returning_float("return 0x1p+4"), 16.0);
+        assert_eq!(run_returning_float("return 0x1.9p-3"), 0.1953125);
+        assert_eq!(run_returning_float("return 0xce.1"), 206.0625);
+        assert_eq!(run_returning_int("return 0xFF"), 255);
+    }
+
     #[test]
     fn local_call_inside_native_call() {
         // Direct repro of the register-clobber bug: `probe(f(5))` where `f` is
