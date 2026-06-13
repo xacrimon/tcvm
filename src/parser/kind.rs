@@ -203,13 +203,18 @@ pub enum SyntaxKind {
     #[regex(r"[0-9]+", priority = 3)]
     Int,
 
-    #[regex(r"0x[0-9a-fA-F]+", priority = 7)]
+    #[regex(r"0[xX][0-9a-fA-F]+", priority = 7)]
     HexInt,
 
     #[regex(r"[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?")]
     Float,
 
-    #[regex(r"0x[0-9a-fA-F]+(\.[0-9a-fA-F]+)?([pP][+-][0-9a-fA-F]+)?")]
+    // Lua 5.5 hex float: `0[xX]`, then a mantissa that must carry a `.` or a
+    // binary exponent (else it's a HexInt). Each branch keeps >=1 hex digit:
+    // `digits.digits?` (trailing `.` ok), `.digits`, or `digits` with a
+    // mandatory exponent. The exponent is a DECIMAL integer with an OPTIONAL
+    // sign (`0x1p4` == 16.0); hex digits in the exponent are malformed.
+    #[regex(r"0[xX]([0-9a-fA-F]+\.[0-9a-fA-F]*([pP][+-]?[0-9]+)?|\.[0-9a-fA-F]+([pP][+-]?[0-9]+)?|[0-9a-fA-F]+[pP][+-]?[0-9]+)")]
     HexFloat,
 
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", priority = 3)]

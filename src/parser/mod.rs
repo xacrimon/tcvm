@@ -90,6 +90,7 @@ mod tests {
     test!(if, "test-files/if.lua");
     test!(jens, "test-files/jens.lua");
     test!(literal, "test-files/literal.lua");
+    test!(hex_numeral, "test-files/hex_numeral.lua");
     test!(nbody, "test-files/nbody.lua");
     test!(op_prec, "test-files/op_prec.lua");
     test!(primes, "test-files/primes.lua");

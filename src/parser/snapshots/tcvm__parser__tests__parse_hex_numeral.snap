@@ -1,0 +1,93 @@
+---
+source: src/parser/mod.rs
+expression: syntax_tree
+---
+Root@0..83
+  AssignStmt@0..7
+    AssignList@0..1
+      Ident@0..1
+        Ident@0..1 "a"
+    Assign@1..2 "="
+    ExprList@2..7
+      LiteralExpr@2..7
+        HexFloat@2..7 "0x1p4"
+  AssignStmt@7..16
+    AssignList@7..8
+      Ident@7..8
+        Ident@7..8 "b"
+    Assign@8..9 "="
+    ExprList@9..16
+      LiteralExpr@9..16
+        HexFloat@9..16 "0x1.8p0"
+  AssignStmt@16..22
+    AssignList@16..17
+      Ident@16..17
+        Ident@16..17 "c"
+    Assign@17..18 "="
+    ExprList@18..22
+      LiteralExpr@18..22
+        HexInt@18..22 "0X10"
+  AssignStmt@22..29
+    AssignList@22..23
+      Ident@22..23
+        Ident@22..23 "d"
+    Assign@23..24 "="
+    ExprList@24..29
+      LiteralExpr@24..29
+        HexFloat@24..29 "0X1.8"
+  AssignStmt@29..35
+    AssignList@29..30
+      Ident@29..30
+        Ident@29..30 "e"
+    Assign@30..31 "="
+    ExprList@31..35
+      LiteralExpr@31..35
+        HexFloat@31..35 "0x.8"
+  AssignStmt@35..44
+    AssignList@35..36
+      Ident@35..36
+        Ident@35..36 "f"
+    Assign@36..37 "="
+    ExprList@37..44
+      LiteralExpr@37..44
+        HexFloat@37..44 "0x.8p+1"
+  AssignStmt@44..50
+    AssignList@44..45
+      Ident@44..45
+        Ident@44..45 "g"
+    Assign@45..46 "="
+    ExprList@46..50
+      LiteralExpr@46..50
+        HexFloat@46..50 "0x1."
+  AssignStmt@50..59
+    AssignList@50..51
+      Ident@50..51
+        Ident@50..51 "h"
+    Assign@51..52 "="
+    ExprList@52..59
+      LiteralExpr@52..59
+        HexFloat@52..59 "0X.8P-2"
+  AssignStmt@59..67
+    AssignList@59..60
+      Ident@59..60
+        Ident@59..60 "i"
+    Assign@60..61 "="
+    ExprList@61..67
+      LiteralExpr@61..67
+        HexFloat@61..67 "0x1p+4"
+  AssignStmt@67..77
+    AssignList@67..68
+      Ident@67..68
+        Ident@67..68 "j"
+    Assign@68..69 "="
+    ExprList@69..77
+      LiteralExpr@69..77
+        HexFloat@69..77 "0x1.9p-3"
+  AssignStmt@77..83
+    AssignList@77..78
+      Ident@77..78
+        Ident@77..78 "k"
+    Assign@78..79 "="
+    ExprList@79..83
+      LiteralExpr@79..83
+        HexInt@79..83 "0xFF"
