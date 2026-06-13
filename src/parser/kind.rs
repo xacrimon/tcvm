@@ -206,7 +206,11 @@ pub enum SyntaxKind {
     #[regex(r"0[xX][0-9a-fA-F]+", priority = 7)]
     HexInt,
 
-    #[regex(r"[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?")]
+    // Lua 5.5 decimal float: a mantissa that must carry a `.` or an exponent
+    // (else it's an Int). Each branch keeps >=1 digit: `digits.digits?`
+    // (trailing `.` ok), `.digits` (leading `.` ok), or `digits` with a
+    // mandatory exponent.
+    #[regex(r"[0-9]+\.[0-9]*([eE][+-]?[0-9]+)?|\.[0-9]+([eE][+-]?[0-9]+)?|[0-9]+[eE][+-]?[0-9]+")]
     Float,
 
     // Lua 5.5 hex float: `0[xX]`, then a mantissa that must carry a `.` or a

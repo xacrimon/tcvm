@@ -111,7 +111,11 @@ impl<'cache, 'source> State<'cache, 'source> {
     pub fn error_eat_until(&mut self, one_of: &[SyntaxKind]) -> Span {
         let marker = self.start(T![invalid]);
         let mut last_span = self.span();
-        while !one_of.contains(&self.at()) {
+        // Stop at EOF even when it isn't a recovery token, or the loop would
+        // bump past the end of the stream and `span()` would index out of
+        // bounds. Reachable on any malformed tail with no recovery token
+        // before EOF (e.g. `1.2.3`, `foo @ bar`).
+        while self.at() != T![eof] && !one_of.contains(&self.at()) {
             self.bump();
             last_span = self.span();
         }
