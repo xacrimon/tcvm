@@ -87,18 +87,14 @@ pub(crate) type Handler = for<'gc> extern "rust-preserve-none" fn(
     handlers: *const (),
 ) -> Result<(), Box<Error>>;
 
-/// Function pointer called by `op_return` when a frame's continuation is set.
-/// Uses the same signature as `Handler` so it can be tail-called via `become`.
-pub(crate) type ContinuationFn = Handler;
-
 /// A pending fixup attached to a callee frame. When `op_return` sees this on
 /// the current frame, it fills in `results_base` and `nret`, then tail-calls
-/// `func`. The continuation reads its own data from `thread.top_lua()`,
-/// pops the frame, restores caller state, does its payload-specific fixup,
-/// and dispatches.
+/// `cont_resume`, which reads its own data from `thread.top_lua()`, pops the
+/// frame, restores caller state, applies the payload-specific fixup, and
+/// dispatches. `payload` fully determines the fixup, so no per-variant
+/// function pointer is stored.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Continuation {
-    pub func: ContinuationFn,
     pub payload: ContinuationPayload,
     /// Stack index of the first returned value — written by `op_return`.
     pub results_base: usize,
@@ -210,22 +206,112 @@ macro_rules! helpers {
             }};
         }
 
-        /// Schedule a Lua metamethod call and dispatch into it. On native
-        /// metamethods (not yet supported) or non-function metamethods, raises.
+        /// Schedule a metamethod (or iterator) call and dispatch into it.
+        /// A Lua target dispatches into a fresh frame whose `op_return` resumes
+        /// the continuation; a native target runs inline — synchronously the
+        /// continuation payload fires immediately, otherwise the call suspends
+        /// through the executor (`schedule_meta_call` installs the pending
+        /// action / error frame). A non-callable target raises.
         #[allow(unused_macros)]
         macro_rules! invoke_metamethod {
             ($$meta:expr, $$args:expr, $$cont:expr) => {{
-                match schedule_meta_call($ctx, $thread, $$meta, $$args, $$cont, $ip) {
-                    Some((new_ip, new_base)) => {
+                let __mm_cont: Continuation = $$cont;
+                match schedule_meta_call($ctx, $thread, $$meta, $$args, __mm_cont, $ip) {
+                    MetaDispatch::Lua { new_ip, new_base } => {
                         $ip = new_ip;
                         $registers = unsafe { $thread.stack.as_mut_ptr().add(new_base) };
                         dispatch!();
                     }
-                    None => raise!(),
+                    MetaDispatch::NativeReturn { results_base, nret } => {
+                        // The native ran inline with no pushed frame, so the
+                        // caller is still on top — but staging / `invoke_native`
+                        // may have reallocated the stack, so rebind `registers`
+                        // (the Lua arm rebinds for the same reason) before the
+                        // payload writes through it.
+                        let (__cb, __ms) = {
+                            let __f = $thread.top_lua().unwrap();
+                            (__f.base, __f.closure.proto.max_stack_size as usize)
+                        };
+                        // The args/results were staged *above* the caller window
+                        // (at `__cb + __ms + 1 ..`), so `invoke_native` never
+                        // truncates below it: the window the payload writes
+                        // through is always in bounds. Assert that invariant.
+                        debug_assert!(
+                            $thread.stack.len() >= __cb + __ms,
+                            "native return left caller register window out of bounds"
+                        );
+                        $registers = unsafe { $thread.stack.as_mut_ptr().add(__cb) };
+                        apply_cont_payload!(
+                            __mm_cont, results_base, nret,
+                            $ctx, $thread, $registers, $ip, $handlers
+                        );
+                    }
+                    // Native target suspended (or errored): the executor will
+                    // resume / unwind from the installed frame state.
+                    MetaDispatch::Suspended => return Ok(()),
+                    MetaDispatch::Unresolvable => raise!(),
                 }
             }};
         }
     };
+}
+
+/// Applies a [`Continuation`]'s payload given its returned values at
+/// `stack[results_base .. results_base + nret]`, then dispatches. Shared by
+/// the Lua-return path (`cont_resume`, after popping the callee frame) and the
+/// synchronous-native path (`invoke_metamethod!`, with the caller frame still
+/// current). Expects `helpers!(...)` to have run in the enclosing handler so
+/// `reg!` / `dispatch!` resolve; `$registers` / `$ip` must already be bound to
+/// the *caller's* window.
+macro_rules! apply_cont_payload {
+    ($cont:expr, $results_base:expr, $nret:expr,
+     $ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr) => {{
+        let __cont: Continuation = $cont;
+        let __results_base: usize = $results_base;
+        let __nret: usize = $nret as usize;
+        match __cont.payload {
+            ContinuationPayload::StoreResult { dst } => {
+                let __r = if __nret > 0 {
+                    $thread.stack[__results_base]
+                } else {
+                    Value::nil()
+                };
+                *reg!(mut dst) = __r;
+                dispatch!();
+            }
+            ContinuationPayload::IgnoreResult => {
+                dispatch!();
+            }
+            ContinuationPayload::CondJump { offset, inverted } => {
+                let __r = if __nret > 0 {
+                    $thread.stack[__results_base]
+                } else {
+                    Value::nil()
+                };
+                if !__r.is_falsy() != inverted {
+                    $ip = unsafe { $ip.offset(offset as isize) };
+                }
+                dispatch!();
+            }
+            ContinuationPayload::TForCall { base, count } => {
+                // Destination registers are `base+3 .. base+3+count`; they must
+                // fit u8 register space, which bounds `count <= 253` (so the
+                // `count + 1` in the suspend path can't overflow `u8`).
+                debug_assert!(
+                    base as usize + 3 + count as usize <= u8::MAX as usize + 1,
+                    "TFORCALL destination range exceeds u8 register space",
+                );
+                let __to_copy = __nret.min(count as usize);
+                for i in 0..__to_copy {
+                    *reg!(mut base + 3 + i as u8) = $thread.stack[__results_base + i];
+                }
+                for i in __to_copy..count as usize {
+                    *reg!(mut base + 3 + i as u8) = Value::nil();
+                }
+                dispatch!();
+            }
+        }
+    }};
 }
 
 /// Inflates the slow-path body for "table get with metamethod".
@@ -257,7 +343,7 @@ macro_rules! table_get_slow_body {
 
         // INDEX bit implies metatable is Some.
         let __mt = unsafe { __t.metatable().unwrap_unchecked() };
-        match walk_index_chain(__t, __mt, __k, $ctx.symbols().mm_index) {
+        match walk_index_chain(Value::table(__t), __mt, __k, $ctx.symbols().mm_index) {
             IndexChain::Resolved(__rv) => {
                 *reg!(mut __dst_reg) = __rv;
                 dispatch!();
@@ -267,7 +353,6 @@ macro_rules! table_get_slow_body {
                 receiver: __mm_recv,
             } => {
                 let __cont = Continuation {
-                    func: cont_store_result,
                     payload: ContinuationPayload::StoreResult { dst: __dst_reg },
                     results_base: 0,
                     nret: 0,
@@ -275,6 +360,41 @@ macro_rules! table_get_slow_body {
                 invoke_metamethod!(__mm_func, &[__mm_recv, __k], __cont);
             }
             IndexChain::Exhausted => raise!(),
+        }
+    }};
+}
+
+/// Inflates the slow-path body for "userdata get via `__index`". Unlike
+/// the table case, a userdata with no metatable or a nil `__index` is an
+/// "attempt to index" error (`userdata_index_chain` returns `Err`), since
+/// userdata has no raw indexing to fall back to. A key absent from the
+/// `__index` table still resolves to nil.
+macro_rules! userdata_get_slow_body {
+    ($ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr,
+     $u:expr, $recv:expr, $k:expr, $dst:expr) => {{
+        let __u = $u;
+        let __recv: Value<'gc> = $recv;
+        let __k: Value<'gc> = $k;
+        let __dst_reg: u8 = $dst;
+
+        match userdata_index_chain(__u, __recv, __k, $ctx.symbols().mm_index) {
+            Err(()) => raise!(),
+            Ok(IndexChain::Resolved(__rv)) => {
+                *reg!(mut __dst_reg) = __rv;
+                dispatch!();
+            }
+            Ok(IndexChain::Invoke {
+                func: __mm_func,
+                receiver: __mm_recv,
+            }) => {
+                let __cont = Continuation {
+                    payload: ContinuationPayload::StoreResult { dst: __dst_reg },
+                    results_base: 0,
+                    nret: 0,
+                };
+                invoke_metamethod!(__mm_func, &[__mm_recv, __k], __cont);
+            }
+            Ok(IndexChain::Exhausted) => raise!(),
         }
     }};
 }
@@ -300,7 +420,6 @@ macro_rules! table_set_slow_body {
                 receiver: __mm_recv,
             } => {
                 let __cont = Continuation {
-                    func: cont_ignore_result,
                     payload: ContinuationPayload::IgnoreResult,
                     results_base: 0,
                     nret: 0,
@@ -682,7 +801,8 @@ extern "rust-preserve-none" fn op_gettable<'gc>(
     let (dst, table, key) = args!(Instruction::GETTABLE { dst, table, key });
 
     let Some(t) = reg!(table).get_table() else {
-        raise!();
+        // Non-table (userdata `__index`, or error) — handled by the slow path.
+        become gettable_slow(instruction, ctx, thread, registers, ip, handlers);
     };
 
     let k = reg!(key);
@@ -712,11 +832,15 @@ extern "rust-preserve-none" fn gettable_slow<'gc>(
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
     let (dst, table, key) = args!(Instruction::GETTABLE { dst, table, key });
-    let Some(t) = reg!(table).get_table() else {
+    let recv = reg!(table);
+    let k = reg!(key);
+    if let Some(t) = recv.get_table() {
+        table_get_slow_body!(ctx, thread, registers, ip, handlers, t, k, dst);
+    }
+    let Some(u) = recv.get_userdata() else {
         raise!();
     };
-    let k = reg!(key);
-    table_get_slow_body!(ctx, thread, registers, ip, handlers, t, k, dst);
+    userdata_get_slow_body!(ctx, thread, registers, ip, handlers, u, recv, k, dst);
 }
 
 /// R[table][R[key]] = R[src]
@@ -790,7 +914,8 @@ extern "rust-preserve-none" fn op_getfield<'gc>(
     });
 
     let Some(t) = reg!(table).get_table() else {
-        raise!();
+        // Non-table (userdata `__index`, or error) — handled by the slow path.
+        become getfield_slow(instruction, ctx, thread, registers, ip, handlers);
     };
 
     let cache = read_ic(thread, ic_idx);
@@ -825,12 +950,16 @@ extern "rust-preserve-none" fn getfield_slow<'gc>(
         ic_idx,
         key_idx
     });
-    let Some(t) = reg!(table).get_table() else {
+    let recv = reg!(table);
+    let k = constant!(key_idx);
+    if let Some(t) = recv.get_table() {
+        fill_ic_for_constant_key(ctx, thread, ic_idx, t, k);
+        table_get_slow_body!(ctx, thread, registers, ip, handlers, t, k, dst);
+    }
+    let Some(u) = recv.get_userdata() else {
         raise!();
     };
-    let k = constant!(key_idx);
-    fill_ic_for_constant_key(ctx, thread, ic_idx, t, k);
-    table_get_slow_body!(ctx, thread, registers, ip, handlers, t, k, dst);
+    userdata_get_slow_body!(ctx, thread, registers, ip, handlers, u, recv, k, dst);
 }
 
 /// R[table][K[key_idx]] = R[src]
@@ -924,7 +1053,8 @@ extern "rust-preserve-none" fn op_self<'gc>(
 
     let recv_val = reg!(object);
     let Some(recv) = recv_val.get_table() else {
-        raise!();
+        // Non-table receiver (userdata method dispatch, or an error).
+        become op_self_nontable(instruction, ctx, thread, registers, ip, handlers);
     };
 
     let key = constant!(key_idx);
@@ -969,7 +1099,7 @@ extern "rust-preserve-none" fn op_self_slow<'gc>(
     // Reachable only when raw_get returned nil and the INDEX bit is set,
     // so we go straight to the chain walk.
     let mt = unsafe { recv.metatable().unwrap_unchecked() };
-    match walk_index_chain(recv, mt, key, ctx.symbols().mm_index) {
+    match walk_index_chain(recv_val, mt, key, ctx.symbols().mm_index) {
         IndexChain::Resolved(method) => {
             *reg!(mut dst) = method;
             *reg!(mut (dst + 1)) = recv_val;
@@ -980,7 +1110,58 @@ extern "rust-preserve-none" fn op_self_slow<'gc>(
             // continuation writes the resolved method into dst.
             *reg!(mut (dst + 1)) = recv_val;
             let cont = Continuation {
-                func: cont_store_result,
+                payload: ContinuationPayload::StoreResult { dst },
+                results_base: 0,
+                nret: 0,
+            };
+            invoke_metamethod!(func, &[receiver, key], cont);
+        }
+        IndexChain::Exhausted => raise!(),
+    }
+}
+
+/// SELF on a non-table receiver. Userdata dispatches through its
+/// metatable's `__index`; unlike GETTABLE, a missing method is *not* an
+/// error here — we write `nil` into `R[dst]` and let the subsequent CALL
+/// raise "attempt to call a nil value (method ...)", matching Lua. A
+/// userdata with no metatable / nil `__index` likewise yields a nil
+/// method (the CALL raises). Any other non-table receiver raises.
+#[inline(never)]
+extern "rust-preserve-none" fn op_self_nontable<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+) -> Result<(), Box<Error>> {
+    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    let (dst, object, key_idx) = args!(Instruction::SELF {
+        dst,
+        object,
+        key_idx
+    });
+
+    let recv_val = reg!(object);
+    let Some(u) = recv_val.get_userdata() else {
+        raise!();
+    };
+    let key = constant!(key_idx);
+
+    let chain = match userdata_index_chain(u, recv_val, key, ctx.symbols().mm_index) {
+        // No metatable or nil `__index`: nil method, CALL raises.
+        Err(()) => IndexChain::Resolved(Value::nil()),
+        Ok(c) => c,
+    };
+    match chain {
+        IndexChain::Resolved(method) => {
+            *reg!(mut dst) = method;
+            *reg!(mut (dst + 1)) = recv_val;
+            dispatch!();
+        }
+        IndexChain::Invoke { func, receiver } => {
+            *reg!(mut (dst + 1)) = recv_val;
+            let cont = Continuation {
                 payload: ContinuationPayload::StoreResult { dst },
                 results_base: 0,
                 nret: 0,
@@ -1034,7 +1215,6 @@ macro_rules! binop_handler {
                 raise!();
             }
             let cont = Continuation {
-                func: cont_store_result,
                 payload: ContinuationPayload::StoreResult { dst },
                 results_base: 0,
                 nret: 0,
@@ -1087,7 +1267,6 @@ extern "rust-preserve-none" fn op_unm<'gc>(
         raise!();
     }
     let cont = Continuation {
-        func: cont_store_result,
         payload: ContinuationPayload::StoreResult { dst },
         results_base: 0,
         nret: 0,
@@ -1118,7 +1297,6 @@ extern "rust-preserve-none" fn op_bnot<'gc>(
         raise!();
     }
     let cont = Continuation {
-        func: cont_store_result,
         payload: ContinuationPayload::StoreResult { dst },
         results_base: 0,
         nret: 0,
@@ -1176,7 +1354,6 @@ extern "rust-preserve-none" fn op_len<'gc>(
     };
 
     let cont = Continuation {
-        func: cont_store_result,
         payload: ContinuationPayload::StoreResult { dst },
         results_base: 0,
         nret: 0,
@@ -1209,7 +1386,6 @@ extern "rust-preserve-none" fn op_concat<'gc>(
         raise!();
     }
     let cont = Continuation {
-        func: cont_store_result,
         payload: ContinuationPayload::StoreResult { dst },
         results_base: 0,
         nret: 0,
@@ -1308,7 +1484,6 @@ extern "rust-preserve-none" fn op_eq<'gc>(
         let meta_fn = binop_metamethod(a, b, ctx.symbols().mm_eq);
         if !meta_fn.is_nil() {
             let cont = Continuation {
-                func: cont_cond_jump,
                 payload: ContinuationPayload::CondJump {
                     offset: 1,
                     inverted,
@@ -1365,7 +1540,6 @@ extern "rust-preserve-none" fn op_lt<'gc>(
         raise!();
     }
     let cont = Continuation {
-        func: cont_cond_jump,
         payload: ContinuationPayload::CondJump {
             offset: 1,
             inverted,
@@ -1414,7 +1588,6 @@ extern "rust-preserve-none" fn op_le<'gc>(
         raise!();
     }
     let cont = Continuation {
-        func: cont_cond_jump,
         payload: ContinuationPayload::CondJump {
             offset: 1,
             inverted,
@@ -1605,6 +1778,7 @@ extern "rust-preserve-none" fn op_call<'gc>(
                             bottom: args_base,
                             func_idx,
                             returns,
+                            cont: None,
                         },
                     });
                     return Ok(());
@@ -1705,8 +1879,8 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
                 crate::vm::sequence::CallbackAction::Return => {
                     let retc = thread.stack.len() - args_base;
                     match frame_return(ctx.mutation(), thread, args_base, retc) {
-                        FrameReturn::Continuation(func) => {
-                            become func(instruction, ctx, thread, registers, ip, handlers);
+                        FrameReturn::Continuation => {
+                            become cont_resume(instruction, ctx, thread, registers, ip, handlers);
                         }
                         FrameReturn::TopLevel => return Ok(()),
                         FrameReturn::ToNonLua => return Ok(()),
@@ -1736,6 +1910,7 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
                             bottom: args_base,
                             func_idx: cur_base - 1,
                             returns: num_results,
+                            cont: None,
                         },
                     });
                     return Ok(());
@@ -1768,8 +1943,8 @@ extern "rust-preserve-none" fn op_return<'gc>(
     };
 
     match frame_return(ctx.mutation(), thread, values_base, nret) {
-        FrameReturn::Continuation(func) => {
-            become func(instruction, ctx, thread, registers, ip, handlers);
+        FrameReturn::Continuation => {
+            become cont_resume(instruction, ctx, thread, registers, ip, handlers);
         }
         FrameReturn::TopLevel => return Ok(()),
         FrameReturn::ToNonLua => return Ok(()),
@@ -1905,7 +2080,6 @@ extern "rust-preserve-none" fn op_tforcall<'gc>(
     let state = reg!(base + 1);
     let control = reg!(base + 2);
     let cont = Continuation {
-        func: cont_tforcall,
         payload: ContinuationPayload::TForCall { base, count },
         results_base: 0,
         nret: 0,
@@ -2385,9 +2559,9 @@ pub(crate) fn invoke_native<'gc>(
 /// consumed by `op_return` and the native-tailcall path in `op_tailcall`.
 pub(crate) enum FrameReturn {
     /// A continuation was attached to the departing frame; caller must
-    /// tail-call `func`. The continuation's `results_base` / `nret` have
-    /// already been written back into the top frame.
-    Continuation(ContinuationFn),
+    /// tail-call `cont_resume`. The continuation's `results_base` / `nret`
+    /// have already been written back into the top frame.
+    Continuation,
     /// The departing frame was the outermost one; thread is now `Result`.
     /// Caller should return `Ok(())` from the handler.
     TopLevel,
@@ -2423,7 +2597,7 @@ pub(crate) fn frame_return<'gc>(
         cont.results_base = values_base;
         cont.nret = nret as u8;
         thread.top_lua_mut().unwrap().continuation = Some(cont);
-        return FrameReturn::Continuation(cont.func);
+        return FrameReturn::Continuation;
     }
 
     // The func slot sits at `cur_base - 1 - num_extras`: VARARGPREP shifted
@@ -2443,6 +2617,25 @@ pub(crate) fn frame_return<'gc>(
         thread.status = ThreadStatus::Result { bottom: dst_start };
         return FrameReturn::TopLevel;
     }
+
+    // If the parent isn't a Lua frame (Sequence/WaitThread/etc.), the executor
+    // driver picks up here: place all `nret` values at `stack[dst_start..]` for
+    // the parent's window. This MUST be handled before the `num_results`
+    // branch below — doing both copies would run two overlapping forward
+    // moves of the same source range, and the first would clobber the source
+    // of the second whenever `nret` is large enough that `dst_start + nret`
+    // reaches into `[values_base..]` (e.g. a sort comparator returning 4+
+    // values). A single copy is safe because `dst_start < values_base`, so each
+    // write lands on a slot already consumed.
+    if thread.top_lua().is_none() {
+        for i in 0..nret {
+            thread.stack[dst_start + i] = thread.stack[values_base + i];
+        }
+        thread.stack.truncate(dst_start + nret);
+        thread.top = dst_start + nret;
+        return FrameReturn::ToNonLua;
+    }
+
     // `num_results == 0` is the CALL's MULTRET: deliver all `nret` and publish `thread.top`.
     if num_results == 0 {
         for i in 0..nret {
@@ -2458,20 +2651,6 @@ pub(crate) fn frame_return<'gc>(
         for i in to_copy..wanted {
             thread.stack[dst_start + i] = Value::nil();
         }
-    }
-
-    // If the parent isn't a Lua frame (Sequence/WaitThread/etc.), the
-    // executor driver picks up here. Place all returned values at
-    // `stack[dst_start..]` for the parent's window to see and exit.
-    if thread.top_lua().is_none() {
-        // Use the full `nret` since the non-Lua parent doesn't have a
-        // `num_results`-style truncation expectation; the driver/sequence
-        // gets all the returned values.
-        for i in 0..nret {
-            thread.stack[dst_start + i] = thread.stack[values_base + i];
-        }
-        thread.stack.truncate(dst_start + nret);
-        return FrameReturn::ToNonLua;
     }
 
     let caller = thread.top_lua().unwrap();
@@ -2534,19 +2713,21 @@ enum IndexChain<'gc> {
     Exhausted,
 }
 
-/// Walk the `__index` chain. Caller has already verified that
-/// `start.raw_get(key)` was nil and `start_metatable.has_mm(INDEX)` is
-/// set, so the walk begins at `start_metatable.raw_get(__index)` and
-/// follows `__index` hops from there. `mm_index_name` is the
-/// pre-interned `__index` LuaString — the function never re-interns it.
+/// Walk the `__index` chain starting from `start_metatable`'s `__index`
+/// slot. `start_receiver` is the value originally indexed — a `Table`
+/// for the table paths, a `Userdata` for the userdata path — and is the
+/// `receiver` handed to a functional `__index` resolved at depth 0
+/// (deeper hops use the intermediate `__index` table as receiver, per
+/// `luaV_finishget`). `mm_index_name` is the pre-interned `__index`
+/// LuaString — the function never re-interns it.
 #[inline]
 fn walk_index_chain<'gc>(
-    start: Table<'gc>,
+    start_receiver: Value<'gc>,
     start_metatable: Table<'gc>,
     key: Value<'gc>,
     mm_index_name: LuaString<'gc>,
 ) -> IndexChain<'gc> {
-    let mut current_table = start;
+    let mut current_receiver = start_receiver;
     let mut mm = start_metatable.raw_get(Value::string(mm_index_name));
     for _ in 0..MAX_TAG_LOOP {
         if mm.is_nil() {
@@ -2557,7 +2738,7 @@ fn walk_index_chain<'gc>(
             None => {
                 return IndexChain::Invoke {
                     func: mm,
-                    receiver: Value::table(current_table),
+                    receiver: current_receiver,
                 };
             }
         };
@@ -2571,9 +2752,30 @@ fn walk_index_chain<'gc>(
         // INDEX bit implies metatable is Some.
         let next_mt = unsafe { next.metatable().unwrap_unchecked() };
         mm = next_mt.raw_get(Value::string(mm_index_name));
-        current_table = next;
+        current_receiver = Value::table(next);
     }
     IndexChain::Exhausted
+}
+
+/// Result of resolving an index on a *userdata* receiver: walk the
+/// userdata metatable's `__index` chain, or signal "raise" when the
+/// userdata has no metatable or a nil `__index` (no raw indexing exists
+/// for userdata, so this is the "attempt to index" case — see
+/// `luaV_finishget`). Callers that tolerate a missing method (SELF) must
+/// not use this; they treat the absent `__index` as a nil result so the
+/// subsequent CALL raises instead.
+#[inline]
+fn userdata_index_chain<'gc>(
+    u: crate::env::Userdata<'gc>,
+    recv_val: Value<'gc>,
+    key: Value<'gc>,
+    mm_index_name: LuaString<'gc>,
+) -> Result<IndexChain<'gc>, ()> {
+    let mt = u.metatable().ok_or(())?;
+    if mt.raw_get(Value::string(mm_index_name)).is_nil() {
+        return Err(());
+    }
+    Ok(walk_index_chain(recv_val, mt, key, mm_index_name))
 }
 
 /// Result of walking a `__newindex` chain.
@@ -2633,6 +2835,28 @@ fn walk_newindex_chain<'gc>(
 pub(crate) enum CallTarget<'gc> {
     Lua(Gc<'gc, LuaClosure<'gc>>),
     Native(&'gc NativeClosure<'gc>),
+}
+
+/// Outcome of [`schedule_meta_call`], consumed by the `invoke_metamethod!`
+/// macro. Captures the three ways a continuation-driven call can proceed.
+pub(crate) enum MetaDispatch {
+    /// Resolved to a Lua closure; a frame carrying the continuation was
+    /// pushed. The caller rebinds `ip`/`registers` to this and dispatches.
+    Lua {
+        new_ip: *const Instruction,
+        new_base: usize,
+    },
+    /// Resolved to a native callback that returned synchronously. Its results
+    /// sit at `stack[results_base .. results_base + nret]`; the caller applies
+    /// the continuation payload inline.
+    NativeReturn { results_base: usize, nret: u8 },
+    /// Native callback suspended (Call/Yield/Resume/Sequence) or errored — a
+    /// `pending_action` or `Frame::Error` was installed for the executor. The
+    /// caller returns `Ok(())` to exit dispatch.
+    Suspended,
+    /// Target is not callable (or a suspending comparison metamethod, which we
+    /// don't support). The caller raises.
+    Unresolvable,
 }
 
 /// Walk the `__call` chain at `thread.stack[func_idx]` until we hit a
@@ -2710,14 +2934,24 @@ fn unop_metamethod<'gc>(val: Value<'gc>, name: LuaString<'gc>) -> Value<'gc> {
     Value::nil()
 }
 
-/// Set up a Lua call frame to invoke a metamethod (or other helper function),
-/// attaching a post-return continuation. The function + args are placed above
-/// the caller's max_stack_size so no live register is clobbered, then
-/// `resolve_call_chain` walks any `__call` hops until it reaches a Lua
-/// closure. On success, returns `(new_ip, new_base)` which the caller should
-/// use to rebind `ip`/`registers` before dispatching. Returns `None` when the
-/// chain is unresolvable — non-callable value, native target (see #32), or
-/// depth exhaustion — in which case callers raise.
+/// Invoke a metamethod / iterator (or other helper) with a post-return
+/// continuation. The function + args are staged above the caller's
+/// `max_stack_size` so no live register is clobbered, then `resolve_call_chain`
+/// walks any `__call` hops to the callable target.
+///
+/// A Lua target gets a frame carrying the continuation pushed and returns
+/// [`MetaDispatch::Lua`]. A native target is invoked inline: a synchronous
+/// `Return` surfaces its results via [`MetaDispatch::NativeReturn`] for the
+/// caller to apply the payload to; a suspending action (Call/Yield/Resume/
+/// Sequence) is mapped to a `pending_action` whose `CallSite` lands the
+/// results exactly where the continuation would, then re-enters the caller
+/// frame at the saved pc — so `op_return`-style continuation logic isn't
+/// needed for the suspend case. A native error installs a `Frame::Error`.
+///
+/// The native suspend path replays all four continuation payloads uniformly via
+/// `apply_native_continuation`: `StoreResult`, `IgnoreResult`, `TForCall`, and
+/// `CondJump` (which bumps the caller frame's saved `pc` by the payload's offset
+/// to select the branch once the suspended comparison's result arrives).
 #[inline(never)]
 fn schedule_meta_call<'gc>(
     ctx: Context<'gc>,
@@ -2726,8 +2960,10 @@ fn schedule_meta_call<'gc>(
     args: &[Value<'gc>],
     cont: Continuation,
     caller_ip: *const Instruction,
-) -> Option<(*const Instruction, usize)> {
-    // Save caller's pc; no decisions here depend on knowing the final closure.
+) -> MetaDispatch {
+    // Save caller's pc; no decisions here depend on knowing the final target.
+    // The native suspend path relies on this so the executor re-enters the
+    // caller frame at the instruction following the one that scheduled us.
     if let Some(frame) = thread.top_lua_mut() {
         let code_start = frame.closure.proto.code.as_ptr();
         frame.pc = unsafe { caller_ip.offset_from_unsigned(code_start) };
@@ -2735,10 +2971,12 @@ fn schedule_meta_call<'gc>(
 
     // schedule_meta_call is only reachable from inside a handler via
     // invoke_metamethod!, so an active caller frame is always present.
-    let caller = thread
+    let caller_base = thread
         .top_lua()
-        .expect("schedule_meta_call called without an active Lua frame");
-    let scratch_func = caller.base + caller.closure.proto.max_stack_size as usize;
+        .expect("schedule_meta_call called without an active Lua frame")
+        .base;
+    let scratch_func =
+        caller_base + thread.top_lua().unwrap().closure.proto.max_stack_size as usize;
     let new_base = scratch_func + 1;
 
     // Stage meta_fn + args so resolve_call_chain sees them in op_call layout.
@@ -2755,15 +2993,25 @@ fn schedule_meta_call<'gc>(
     // function slot), so `args.len() + 1`.
     debug_assert!(args.len() < u8::MAX as usize);
     let nargs = (args.len() + 1) as u8;
-    let (target, final_nargs) = resolve_call_chain(ctx, thread, scratch_func, nargs)?;
-    // See #32: support native metamethod targets. Today `__call`/`__index`/etc.
-    // resolving to a native callback is rejected — handling it requires either
-    // a Callback-kind frame or a per-continuation native dispatch path.
-    let closure = match target {
-        CallTarget::Lua(c) => c,
-        CallTarget::Native(_) => return None,
+    let Some((target, final_nargs)) = resolve_call_chain(ctx, thread, scratch_func, nargs) else {
+        return MetaDispatch::Unresolvable;
     };
     let actual_args = final_nargs as usize - 1;
+
+    let closure = match target {
+        CallTarget::Lua(c) => c,
+        CallTarget::Native(nc) => {
+            return schedule_native_meta_call(
+                ctx,
+                thread,
+                nc,
+                cont,
+                caller_base,
+                new_base,
+                actual_args,
+            );
+        }
+    };
 
     // Grow stack to fit the resolved closure's full frame.
     let needed = new_base + closure.proto.max_stack_size as usize;
@@ -2794,7 +3042,78 @@ fn schedule_meta_call<'gc>(
     });
 
     let new_ip = closure.proto.code.as_ptr();
-    Some((new_ip, new_base))
+    MetaDispatch::Lua { new_ip, new_base }
+}
+
+/// Native arm of [`schedule_meta_call`]. The callable native `nc` and its
+/// `actual_args` arguments are already staged at `new_base - 1` / `new_base..`.
+/// Drives the callback and translates its [`CallbackAction`] into a
+/// [`MetaDispatch`].
+fn schedule_native_meta_call<'gc>(
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    nc: &'gc NativeClosure<'gc>,
+    cont: Continuation,
+    caller_base: usize,
+    new_base: usize,
+    actual_args: usize,
+) -> MetaDispatch {
+    use crate::vm::sequence::CallbackAction;
+
+    let args_base = new_base;
+    let action = match invoke_native(ctx, thread, nc, args_base, actual_args) {
+        Ok(a) => a,
+        Err(err) => {
+            // Mirror op_call's native-error path: a Frame::Error lets the
+            // executor's unwinder route to the nearest catcher (e.g. pcall).
+            thread.frames.push(Frame::Error(err));
+            return MetaDispatch::Suspended;
+        }
+    };
+
+    match action {
+        CallbackAction::Return => {
+            // `invoke_native` truncated the stack to `args_base + retc`.
+            let nret = (thread.stack.len() - args_base) as u8;
+            MetaDispatch::NativeReturn {
+                results_base: args_base,
+                nret,
+            }
+        }
+        // A native that wants to call back into Lua (`Call`) delivers its
+        // result through the normal frame-return path, which doesn't run
+        // `land_call_results` and so can't replay our continuation. It's not a
+        // shape any current metamethod/iterator native produces; reject it
+        // cleanly rather than silently dropping the continuation.
+        CallbackAction::Call { .. } => {
+            let err = crate::env::Error::from_str(
+                ctx,
+                "metamethod/iterator native cannot tail-call into Lua across the continuation",
+            );
+            thread.frames.push(Frame::Error(err));
+            MetaDispatch::Suspended
+        }
+        // Suspending native (`Yield`/`Resume`/`Sequence`). Park the full
+        // continuation on the `CallSite`; when the suspension resolves, its
+        // results funnel through `land_call_results`, which applies the
+        // continuation against the caller frame (`apply_native_continuation`).
+        // This replays every payload uniformly — including `CondJump`, whose
+        // branch decision (a `pc` bump) can't be expressed as a plain landing.
+        other => {
+            thread.pending_action = Some(PendingAction {
+                action: other,
+                call_site: CallSite {
+                    bottom: args_base,
+                    // Unused while `cont` is set (the continuation drives the
+                    // landing), but kept in-bounds / meaningful as a fallback.
+                    func_idx: caller_base,
+                    returns: 0,
+                    cont: Some(cont),
+                },
+            });
+            MetaDispatch::Suspended
+        }
+    }
 }
 
 /// Shared skeleton used by every `cont_*` function: extract the continuation
@@ -2826,11 +3145,15 @@ macro_rules! finalize_return {
     };
 }
 
-/// Continuation for unary and binary metamethods that produce a single result
-/// written into the scheduling handler's `R[dst]`. Pops the metamethod's
-/// frame, restores the caller, stores the result, and dispatches.
+/// The single continuation entry point, tail-called by `op_return` /
+/// `op_tailcall` once a frame carrying a [`Continuation`] returns. Pops the
+/// callee frame, restores the caller's `ip`/`registers`, then applies the
+/// payload to the returned values (`stack[results_base .. +nret]`, written by
+/// `frame_return`). The synchronous-native path in `invoke_metamethod!`
+/// applies the same payload via `apply_cont_payload!` without this frame
+/// teardown, since no callee frame exists there.
 #[inline(never)]
-extern "rust-preserve-none" fn cont_store_result<'gc>(
+extern "rust-preserve-none" fn cont_resume<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
@@ -2839,97 +3162,14 @@ extern "rust-preserve-none" fn cont_store_result<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     finalize_return!(instruction, ctx, thread, registers, ip, handlers, cont: cont);
-
-    let dst = match cont.payload {
-        ContinuationPayload::StoreResult { dst } => dst,
-        _ => unsafe { std::hint::unreachable_unchecked() },
-    };
-
-    let result = if cont.nret > 0 {
-        thread.stack[cont.results_base]
-    } else {
-        Value::nil()
-    };
-    *reg!(mut dst) = result;
-    dispatch!();
-}
-
-/// Continuation that discards results — used by `__newindex` and `__close`,
-/// which are invoked for their side effects.
-#[inline(never)]
-extern "rust-preserve-none" fn cont_ignore_result<'gc>(
-    instruction: Instruction,
-    ctx: Context<'gc>,
-    thread: &mut ThreadState<'gc>,
-    mut registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    finalize_return!(instruction, ctx, thread, registers, ip, handlers, cont: _cont);
-    dispatch!();
-}
-
-/// Continuation for comparison metamethods (`__eq`, `__lt`, `__le`). Coerces
-/// the result to a bool and, if it matches the expected sense, advances `ip`
-/// by `offset` — which for the current comparison ops is `1`, effectively
-/// skipping the adjacent `JMP` (matching the fast-path `skip!()` behavior).
-#[inline(never)]
-extern "rust-preserve-none" fn cont_cond_jump<'gc>(
-    instruction: Instruction,
-    ctx: Context<'gc>,
-    thread: &mut ThreadState<'gc>,
-    mut registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    finalize_return!(instruction, ctx, thread, registers, ip, handlers, cont: cont);
-
-    let (offset, inverted) = match cont.payload {
-        ContinuationPayload::CondJump { offset, inverted } => (offset, inverted),
-        _ => unsafe { std::hint::unreachable_unchecked() },
-    };
-
-    let result = if cont.nret > 0 {
-        thread.stack[cont.results_base]
-    } else {
-        Value::nil()
-    };
-    let truthy = !result.is_falsy();
-    if truthy != inverted {
-        ip = unsafe { ip.offset(offset as isize) };
-    }
-    dispatch!();
-}
-
-/// Continuation for generic-for (`TFORCALL`): copy up to `count` results
-/// into `R[base+4..]`, nil-filling the shortfall. `TFORLOOP` follows
-/// immediately after and handles the termination check.
-#[inline(never)]
-extern "rust-preserve-none" fn cont_tforcall<'gc>(
-    instruction: Instruction,
-    ctx: Context<'gc>,
-    thread: &mut ThreadState<'gc>,
-    mut registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
-    handlers: *const (),
-) -> Result<(), Box<Error>> {
-    finalize_return!(instruction, ctx, thread, registers, ip, handlers, cont: cont);
-
-    let (base, count) = match cont.payload {
-        ContinuationPayload::TForCall { base, count } => (base, count),
-        _ => unsafe { std::hint::unreachable_unchecked() },
-    };
-    debug_assert!(
-        base as usize + 3 + count as usize <= u8::MAX as usize + 1,
-        "TFORCALL destination range exceeds u8 register space",
+    apply_cont_payload!(
+        cont,
+        cont.results_base,
+        cont.nret,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers
     );
-
-    let to_copy = (cont.nret as usize).min(count as usize);
-    for i in 0..to_copy {
-        *reg!(mut base + 3 + i as u8) = thread.stack[cont.results_base + i];
-    }
-    for i in to_copy..count as usize {
-        *reg!(mut base + 3 + i as u8) = Value::nil();
-    }
-    dispatch!();
 }
