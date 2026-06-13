@@ -11,6 +11,18 @@ pub(crate) fn push_int(out: &mut Vec<u8>, i: i64) {
     out.extend_from_slice(i.to_string().as_bytes());
 }
 
+/// The VM's "attempt to compare …" runtime-error message for an ordering of two
+/// non-comparable values, in operand order (`a < b`). Used where native code
+/// applies the `<` operator (`math.max`/`min`, `table.sort`'s default order).
+pub(crate) fn compare_error_msg<'gc>(a: Value<'gc>, b: Value<'gc>) -> String {
+    let (ta, tb) = (a.type_name(), b.type_name());
+    if ta == tb {
+        format!("attempt to compare two {ta} values")
+    } else {
+        format!("attempt to compare {ta} with {tb}")
+    }
+}
+
 /// Convert a string to a Lua number following the lexer's rules: optional
 /// surrounding whitespace and sign, decimal integer/float, and `0x` hex
 /// integer (wrapping, per Lua) / hex float (`0x1.8p3`). Returns `None` for
@@ -105,10 +117,11 @@ pub(crate) fn str_to_int_base(b: &[u8], base: u32) -> Option<i64> {
     Some(if neg { acc.wrapping_neg() } else { acc })
 }
 
-/// Append the canonical Lua 5.5 textual form of a float. Lua picks the
-/// shortest `"%.Ng"` that reads back to the same value, scanning `N` upward
-/// from the historical default of 14 to the round-trip-sufficient 17, then
-/// tags any integer-looking result with a trailing `".0"`.
+/// Append the canonical Lua 5.5 textual form of a float. Lua formats with
+/// `LUA_NUMBER_FMT` (`"%.15g"`) and, only if that fails to read back exactly,
+/// falls straight to `LUA_NUMBER_FMT_N` (`"%.17g"`) — there is no scan through
+/// the intermediate precisions, so e.g. `1/3` prints `0.33333333333333331`, not
+/// the shorter `%.16g` form. Any integer-looking result gets a trailing `".0"`.
 pub(crate) fn push_float(out: &mut Vec<u8>, f: f64) {
     if f.is_nan() {
         out.extend_from_slice(b"nan");
@@ -118,16 +131,13 @@ pub(crate) fn push_float(out: &mut Vec<u8>, f: f64) {
         out.extend_from_slice(if f < 0.0 { b"-inf" } else { b"inf" });
         return;
     }
-    // 17 significant digits always round-trip an f64, so the loop terminates
-    // with a faithful representation even if 14..16 never match.
-    let mut s = format_g(f, 17);
-    for p in 14..17 {
-        let cand = format_g(f, p);
-        if cand.parse::<f64>() == Ok(f) {
-            s = cand;
-            break;
-        }
-    }
+    // `%.15g`, else `%.17g` (which always round-trips an f64).
+    let s15 = format_g(f, 15);
+    let mut s = if s15.parse::<f64>() == Ok(f) {
+        s15
+    } else {
+        format_g(f, 17)
+    };
     // Tag an otherwise integer-looking float so round-trips stay floats.
     if !s
         .bytes()

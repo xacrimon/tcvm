@@ -19,6 +19,7 @@
 use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::os::unix::ffi::OsStrExt;
 
 use crate::Context;
 use crate::builtin::util;
@@ -241,7 +242,29 @@ fn closed_file_error<'gc>(ctx: Context<'gc>) -> Error<'gc> {
 enum WriteOutcome {
     Ok,
     Closed,
-    Io(std::io::Error),
+    /// I/O error plus the number of bytes successfully written before it — Lua's
+    /// failed `file:write` returns `(nil, msg, errno, bytes_written)`.
+    Io(std::io::Error, u64),
+}
+
+/// `write_all`, but reporting the byte count reached so a failure can surface it
+/// (the count is 0 for an immediate `EBADF`, the common forced-failure case).
+fn count_write<W: Write>(w: &mut W, buf: &[u8]) -> (std::io::Result<()>, u64) {
+    let mut written = 0u64;
+    while (written as usize) < buf.len() {
+        match w.write(&buf[written as usize..]) {
+            Ok(0) => {
+                return (
+                    Err(std::io::Error::from(std::io::ErrorKind::WriteZero)),
+                    written,
+                );
+            }
+            Ok(n) => written += n as u64,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return (Err(e), written),
+        }
+    }
+    (Ok(()), written)
 }
 
 fn write_bytes(fs: &mut FileState, buf: &[u8]) -> WriteOutcome {
@@ -253,17 +276,17 @@ fn write_bytes(fs: &mut FileState, buf: &[u8]) -> WriteOutcome {
     };
     if !writable {
         // Mirror the OS EBADF a write to a non-writable handle would hit.
-        return WriteOutcome::Io(std::io::Error::from_raw_os_error(9));
+        return WriteOutcome::Io(std::io::Error::from_raw_os_error(9), 0);
     }
-    let res = match stream {
-        Stream::File(br) => br.get_mut().write_all(buf),
-        Stream::Stdout => std::io::stdout().write_all(buf),
-        Stream::Stderr => std::io::stderr().write_all(buf),
-        Stream::Stdin => Err(std::io::Error::from_raw_os_error(9)),
+    let (res, written) = match stream {
+        Stream::File(br) => count_write(br.get_mut(), buf),
+        Stream::Stdout => count_write(&mut std::io::stdout(), buf),
+        Stream::Stderr => count_write(&mut std::io::stderr(), buf),
+        Stream::Stdin => (Err(std::io::Error::from_raw_os_error(9)), 0),
     };
     match res {
         Ok(()) => WriteOutcome::Ok,
-        Err(e) => WriteOutcome::Io(e),
+        Err(e) => WriteOutcome::Io(e, written),
     }
 }
 
@@ -280,7 +303,7 @@ fn flush_stream(fs: &mut FileState) -> WriteOutcome {
     };
     match res {
         Ok(()) => WriteOutcome::Ok,
-        Err(e) => WriteOutcome::Io(e),
+        Err(e) => WriteOutcome::Io(e, 0),
     }
 }
 
@@ -378,35 +401,63 @@ fn read_number<R: BufRead>(r: &mut R) -> std::io::Result<ReadOne> {
             break;
         }
     }
+    // Mirror PUC-Lua's `read_number`: at most one decimal point and at most one
+    // exponent marker, exponent only after a digit. Without these "already
+    // seen" guards the flat accept-loop would swallow `1.2.3` or `1e2e3` whole
+    // and then fail to parse, eating the rest of the stream.
     let mut tok: Vec<u8> = Vec::new();
     let mut seen_hex = false;
+    let mut seen_dot = false;
+    let mut seen_exp = false;
+    let mut digits = 0usize;
     loop {
         let b = match r.fill_buf()?.first() {
             Some(&b) => b,
             None => break,
         };
-        let accept = if b.is_ascii_digit() || b == b'.' {
-            true
-        } else if b == b'+' || b == b'-' {
-            // A sign starts the token or follows the exponent marker — which is
-            // `p`/`P` in hex (where `e`/`E` are mantissa digits) and `e`/`E` in
-            // decimal.
+        let mut is_digit = false;
+        let accept = if b == b'+' || b == b'-' {
+            // A sign starts the token or follows the exponent marker (`p`/`P` in
+            // hex, `e`/`E` in decimal).
             let exp_mark = if seen_hex { (b'p', b'P') } else { (b'e', b'E') };
             tok.is_empty() || matches!(tok.last(), Some(&c) if c == exp_mark.0 || c == exp_mark.1)
+        } else if b == b'.' {
+            !seen_dot && !seen_exp
         } else if !seen_hex && (b == b'x' || b == b'X') {
             matches!(tok.as_slice(), b"0" | b"-0" | b"+0")
-        } else if seen_hex && b.is_ascii_hexdigit() {
-            true
-        } else if seen_hex && (b == b'p' || b == b'P') {
+        } else if seen_hex {
+            if seen_exp {
+                // After `p`/`P` the exponent is decimal, so `a`..`f` stop here.
+                is_digit = b.is_ascii_digit();
+                is_digit
+            } else if b.is_ascii_hexdigit() {
+                is_digit = true;
+                true
+            } else {
+                (b == b'p' || b == b'P') && digits > 0
+            }
+        } else if b.is_ascii_digit() {
+            is_digit = true;
             true
         } else {
-            !seen_hex && (b == b'e' || b == b'E')
+            (b == b'e' || b == b'E') && !seen_exp && digits > 0
         };
         if !accept {
             break;
         }
-        if (b == b'x' || b == b'X') && !seen_hex {
+        if b == b'.' {
+            seen_dot = true;
+        } else if (b == b'x' || b == b'X') && !seen_hex {
             seen_hex = true;
+            // The leading '0' of the "0x" prefix is not a mantissa digit; the
+            // exponent gate counts only digits after the prefix (Lua).
+            digits = 0;
+        } else if (seen_hex && (b == b'p' || b == b'P')) || (!seen_hex && (b == b'e' || b == b'E'))
+        {
+            seen_exp = true;
+        }
+        if is_digit {
+            digits += 1;
         }
         tok.push(b);
         r.consume(1);
@@ -583,9 +634,10 @@ fn open_file<'gc>(
         }
         _ => return Err(std::io::Error::from_raw_os_error(22)), // EINVAL: bad mode
     }
-    let p = std::path::Path::new(std::ffi::OsStr::new(
-        std::str::from_utf8(path).unwrap_or(""),
-    ));
+    // The OS takes raw bytes; wrap them in an `OsStr` without UTF-8 validation
+    // (a lossy `from_utf8` would silently target the wrong path on non-UTF-8
+    // names) — matching C's `fopen` on the raw `const char*`.
+    let p = std::path::Path::new(std::ffi::OsStr::from_bytes(path));
     let file = opts.open(p)?;
     let readable = base == b'r' || plus;
     let writable = base != b'r' || plus;
@@ -596,26 +648,54 @@ fn open_file<'gc>(
     ))
 }
 
+/// Bare `strerror(errno)` text for an error: Rust's `Display` appends
+/// " (os error N)", which Lua (using `strerror`) omits, so strip it.
+fn bare_io_msg(e: &std::io::Error) -> String {
+    let raw = e.to_string();
+    match raw.find(" (os error ") {
+        Some(cut) => raw[..cut].to_string(),
+        None => raw,
+    }
+}
+
+/// The l_checkmode regex `[rwa]\+?b*` — the only mode strings Lua's `io.open`
+/// accepts. An invalid mode is a raised argument error, not a file result.
+fn check_mode(mode: &[u8]) -> bool {
+    let Some((&first, rest)) = mode.split_first() else {
+        return false;
+    };
+    if !matches!(first, b'r' | b'w' | b'a') {
+        return false;
+    }
+    let rest = match rest.split_first() {
+        Some((&b'+', tail)) => tail,
+        _ => rest,
+    };
+    rest.iter().all(|&c| c == b'b')
+}
+
 /// `(nil, "what: msg", errno)` from a failed `std::io::Error`.
 fn io_fail<'gc>(ctx: Context<'gc>, fname: Option<&str>, e: &std::io::Error) -> [Value<'gc>; 3] {
     // `luaL_fileresult`: the message is bare `strerror(errno)`, prefixed with
     // the *filename* only (never the operation name) and only when one is
-    // available. Rust's `Display` appends " (os error N)", which Lua omits, so
-    // strip it back to the strerror text.
-    let raw = e.to_string();
-    let bare = match raw.find(" (os error ") {
-        Some(cut) => &raw[..cut],
-        None => &raw,
-    };
+    // available.
+    let bare = bare_io_msg(e);
     let text = match fname {
         Some(f) => format!("{f}: {bare}"),
-        None => bare.to_string(),
+        None => bare,
     };
     [
         Value::nil(),
         Value::string(LuaString::new(ctx, text.as_bytes())),
         Value::integer(e.raw_os_error().unwrap_or(0) as i64),
     ]
+}
+
+/// A failed `write`'s return tuple: `io_fail` plus the bytes-written counter
+/// Lua appends as a 4th value (`g_write`).
+fn write_fail<'gc>(ctx: Context<'gc>, e: &std::io::Error, written: u64) -> [Value<'gc>; 4] {
+    let [a, b, c] = io_fail(ctx, None, e);
+    [a, b, c, Value::integer(written as i64)]
 }
 
 // ---------------------------------------------------------------------------
@@ -639,11 +719,19 @@ fn lua_open<'gc>(
             Error::from_str(nctx.ctx, "bad argument #2 to 'open' (string expected)")
         })?
     };
+    // An invalid mode is a raised argument error, not a `(nil, msg, errno)`
+    // return (Lua's `luaL_argcheck(l_checkmode(...))`).
+    if !check_mode(mode) {
+        return Err(Error::from_str(
+            nctx.ctx,
+            "bad argument #2 to 'open' (invalid mode)",
+        ));
+    }
     match open_file(&nctx, name.as_bytes(), mode) {
         Ok(u) => stack.replace(&[Value::userdata(u)]),
         Err(e) => {
-            let what = std::str::from_utf8(name.as_bytes()).unwrap_or("");
-            stack.replace(&io_fail(nctx.ctx, Some(what), &e));
+            let what = String::from_utf8_lossy(name.as_bytes());
+            stack.replace(&io_fail(nctx.ctx, Some(&what), &e));
         }
     }
     Ok(CallbackAction::Return)
@@ -663,7 +751,7 @@ fn lua_write<'gc>(
     match do_write(&nctx, out, &vals, "write", 1)? {
         WriteOutcome::Ok => stack.replace(&[out_val]),
         WriteOutcome::Closed => return Err(closed_file_error(nctx.ctx)),
-        WriteOutcome::Io(e) => stack.replace(&io_fail(nctx.ctx, None, &e)),
+        WriteOutcome::Io(e, written) => stack.replace(&write_fail(nctx.ctx, &e, written)),
     }
     Ok(CallbackAction::Return)
 }
@@ -709,7 +797,7 @@ fn lua_flush<'gc>(
         .expect("io-state output must be a file handle");
     match out.with_data::<LuaFile, _>(|lf| flush_stream(&mut lf.state.borrow_mut())) {
         Some(WriteOutcome::Closed) => return Err(closed_file_error(nctx.ctx)),
-        Some(WriteOutcome::Io(e)) => stack.replace(&io_fail(nctx.ctx, None, &e)),
+        Some(WriteOutcome::Io(e, _)) => stack.replace(&io_fail(nctx.ctx, None, &e)),
         _ => stack.replace(&[out_val]),
     }
     Ok(CallbackAction::Return)
@@ -743,8 +831,11 @@ fn default_file<'gc>(
     if !arg.is_nil() {
         let handle = if let Some(s) = arg.get_string() {
             open_file(&nctx, s.as_bytes(), mode).map_err(|e| {
-                let what = std::str::from_utf8(s.as_bytes()).unwrap_or("");
-                Error::from_str(nctx.ctx, &format!("{what}: {e}"))
+                let what = String::from_utf8_lossy(s.as_bytes());
+                Error::from_str(
+                    nctx.ctx,
+                    &format!("cannot open file '{what}' ({})", bare_io_msg(&e)),
+                )
             })?
         } else {
             check_file(&nctx, arg, fname, 1)?
@@ -767,8 +858,11 @@ fn lua_lines<'gc>(
     let (handle, close_eof, fmt_args): (Value<'gc>, bool, &[Value<'gc>]) =
         if let Some(s) = first.get_string() {
             let u = open_file(&nctx, s.as_bytes(), b"r").map_err(|e| {
-                let what = std::str::from_utf8(s.as_bytes()).unwrap_or("");
-                Error::from_str(nctx.ctx, &format!("{what}: {e}"))
+                let what = String::from_utf8_lossy(s.as_bytes());
+                Error::from_str(
+                    nctx.ctx,
+                    &format!("cannot open file '{what}' ({})", bare_io_msg(&e)),
+                )
             })?;
             (Value::userdata(u), true, &stack.as_slice()[1..])
         } else {
@@ -834,10 +928,10 @@ fn lua_tmpfile<'gc>(
 
 /// `io.popen` — subprocess plumbing deferred to #27.
 fn lua_popen<'gc>(
-    _nctx: NativeContext<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!("io.popen needs subprocess plumbing (#27)")
+    Err(Error::from_str(nctx.ctx, "io.popen is not implemented"))
 }
 
 // ---------------------------------------------------------------------------
@@ -855,7 +949,7 @@ fn lua_file_write<'gc>(
     match do_write(&nctx, u, &vals, "write", 2)? {
         WriteOutcome::Ok => stack.replace(&[self_val]),
         WriteOutcome::Closed => return Err(closed_file_error(nctx.ctx)),
-        WriteOutcome::Io(e) => stack.replace(&io_fail(nctx.ctx, None, &e)),
+        WriteOutcome::Io(e, written) => stack.replace(&write_fail(nctx.ctx, &e, written)),
     }
     Ok(CallbackAction::Return)
 }
@@ -952,7 +1046,7 @@ fn lua_file_flush<'gc>(
     {
         WriteOutcome::Ok => stack.replace(&[self_val]),
         WriteOutcome::Closed => return Err(closed_file_error(nctx.ctx)),
-        WriteOutcome::Io(e) => stack.replace(&io_fail(nctx.ctx, None, &e)),
+        WriteOutcome::Io(e, _) => stack.replace(&io_fail(nctx.ctx, None, &e)),
     }
     Ok(CallbackAction::Return)
 }
@@ -966,15 +1060,39 @@ fn lua_file_close<'gc>(
     close_handle(nctx.ctx, u, &mut stack)
 }
 
-/// `file:setvbuf(mode [, size])` — accepted, no-op (we don't expose buffer
-/// control); returns `self`.
+/// `file:setvbuf(mode [, size])` — buffering control is a no-op here, but the
+/// mode is still validated against `{no, full, line}` (Lua's `luaL_checkoption`)
+/// and `true` is returned, matching `luaL_fileresult` on success.
 fn lua_file_setvbuf<'gc>(
     nctx: NativeContext<'gc, '_>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let self_val = stack.get(0);
-    check_file(&nctx, self_val, "setvbuf", 1)?;
-    stack.replace(&[self_val]);
+    check_file(&nctx, stack.get(0), "setvbuf", 1)?;
+    let mode = stack.get(1);
+    match mode.get_string().map(|s| s.as_bytes()) {
+        Some(b"no") | Some(b"full") | Some(b"line") => {}
+        Some(other) => {
+            return Err(Error::from_str(
+                nctx.ctx,
+                &format!(
+                    "bad argument #2 to 'setvbuf' (invalid option '{}')",
+                    String::from_utf8_lossy(other)
+                ),
+            ));
+        }
+        None => {
+            let got = if stack.len() < 2 {
+                "no value"
+            } else {
+                mode.type_name()
+            };
+            return Err(Error::from_str(
+                nctx.ctx,
+                &format!("bad argument #2 to 'setvbuf' (string expected, got {got})"),
+            ));
+        }
+    }
+    stack.replace(&[Value::boolean(true)]);
     Ok(CallbackAction::Return)
 }
 

@@ -1,6 +1,8 @@
 use crate::Context;
 use crate::builtin::util;
 use crate::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Table, Value};
+use crate::lua::{StashedError, StashedFunction, StashedTable};
+use crate::vm::async_sequence::{AsyncSequence, SequenceReturn, async_sequence};
 use crate::vm::sequence::CallbackAction;
 
 /// Fetch argument 1 as a table or raise the standard bad-argument error.
@@ -122,10 +124,16 @@ fn lua_create<'gc>(
     } else {
         util::check_integer(nctx.ctx, m_arg, "create", 2)?
     };
-    if n < 0 || m < 0 {
+    if n < 0 {
         return Err(Error::from_str(
             nctx.ctx,
-            "bad argument #1 to 'create' (size out of bounds)",
+            "bad argument #1 to 'create' (out of range)",
+        ));
+    }
+    if m < 0 {
+        return Err(Error::from_str(
+            nctx.ctx,
+            "bad argument #2 to 'create' (out of range)",
         ));
     }
     stack.replace(&[Value::table(Table::new(nctx.ctx))]);
@@ -283,14 +291,240 @@ fn lua_remove<'gc>(
     Ok(CallbackAction::Return)
 }
 
-// `table.sort` accepts an optional Lua comparator that must be invoked between
-// elements, which requires re-entering the interpreter from native code (a
-// `Sequence`-driven sort). Deferred to #27 follow-up alongside `pcall`.
+/// `sort(t [, comp])` — sort `t[1..#t]` in place. With no comparator the default
+/// `<` order is used (numbers, strings, or an `__lt` metamethod); otherwise
+/// `comp(a, b)` must return true when `a` should precede `b`. An inconsistent
+/// comparator raises "invalid order function for sorting". Because a comparator
+/// (or an `__lt` metamethod) re-enters the interpreter, the work runs as an
+/// async `Sequence`; a comparator-free primitive sort still completes in a
+/// single poll without ever suspending.
 fn lua_sort<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!("table.sort: comparator callback needs native->Lua call support")
+    let t = check_table(nctx.ctx, stack.get(0), "sort")?;
+    let n = t.raw_len();
+    if n <= 1 {
+        // Nothing to do — and, matching Lua, the comparator argument is not even
+        // type-checked for a trivial array.
+        stack.replace(&[]);
+        return Ok(CallbackAction::Return);
+    }
+    if n >= i32::MAX as usize {
+        return Err(Error::from_str(
+            nctx.ctx,
+            "bad argument #1 to 'sort' (array too big)",
+        ));
+    }
+    let comp_arg = stack.get(1);
+    let comp = if comp_arg.is_nil() {
+        None
+    } else if let Some(f) = comp_arg.get_function() {
+        Some(f)
+    } else {
+        return Err(Error::from_str(
+            nctx.ctx,
+            &format!(
+                "bad argument #2 to 'sort' (function expected, got {})",
+                comp_arg.type_name()
+            ),
+        ));
+    };
+
+    let mc = nctx.ctx.mutation();
+    let seq = async_sequence(mc, move |locals, seq| {
+        let t = locals.stash(mc, t);
+        let comp = comp.map(|f| locals.stash(mc, f));
+        async move {
+            let mut seq = seq;
+            sort_run(&mut seq, t, comp, n).await?;
+            seq.enter(|_ctx, _locals, _exec, mut stack| stack.replace(&[]));
+            Ok(SequenceReturn::Return)
+        }
+    });
+    Ok(CallbackAction::Sequence(seq))
+}
+
+/// Iterative quicksort (median-of-3 pivot) over the 1-based range `[1, n]`,
+/// faithfully mirroring PUC-Lua's `auxsort`/`partition` — including its
+/// detection of an inconsistent comparator. Recurses on the smaller side and
+/// loops on the larger, so the explicit work stack stays shallow.
+async fn sort_run(
+    seq: &mut AsyncSequence,
+    t: StashedTable,
+    comp: Option<StashedFunction>,
+    n: usize,
+) -> Result<(), StashedError> {
+    let mut work = vec![(1usize, n)];
+    while let Some((mut lo, mut up)) = work.pop() {
+        while lo < up {
+            // order the endpoints: a[lo] <= a[up]
+            if sort_less(seq, &t, &comp, up, lo).await? {
+                sort_swap(seq, &t, lo, up);
+            }
+            if up - lo == 1 {
+                break;
+            }
+            let p = (lo + up) / 2;
+            // median of 3: leave a[lo] <= a[p] <= a[up]
+            if sort_less(seq, &t, &comp, p, lo).await? {
+                sort_swap(seq, &t, p, lo);
+            } else if sort_less(seq, &t, &comp, up, p).await? {
+                sort_swap(seq, &t, p, up);
+            }
+            if up - lo == 2 {
+                break;
+            }
+            // stash the pivot at a[up-1], then partition (lo, up)
+            sort_swap(seq, &t, p, up - 1);
+            let piv = up - 1;
+            let mut i = lo;
+            let mut j = up - 1;
+            let part = loop {
+                // advance i past elements strictly less than the pivot
+                loop {
+                    i += 1;
+                    if !sort_less(seq, &t, &comp, i, piv).await? {
+                        break;
+                    }
+                    if i == up - 1 {
+                        return Err(invalid_order_err(seq));
+                    }
+                }
+                // retreat j past elements strictly greater than the pivot
+                loop {
+                    j -= 1;
+                    if !sort_less(seq, &t, &comp, piv, j).await? {
+                        break;
+                    }
+                    if j < i {
+                        return Err(invalid_order_err(seq));
+                    }
+                }
+                if j < i {
+                    sort_swap(seq, &t, piv, i); // move pivot into place
+                    break i;
+                }
+                sort_swap(seq, &t, i, j);
+            };
+            // recurse on the smaller interval, loop on the larger
+            if part - lo < up - part {
+                work.push((lo, part - 1));
+                lo = part + 1;
+            } else {
+                work.push((part + 1, up));
+                up = part - 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `a[xi] < a[yi]` under the active order. Primitive number/string pairs resolve
+/// without re-entering the VM; a comparator or `__lt` metamethod is called via
+/// the sequence (the only suspending case).
+async fn sort_less(
+    seq: &mut AsyncSequence,
+    t: &StashedTable,
+    comp: &Option<StashedFunction>,
+    xi: usize,
+    yi: usize,
+) -> Result<bool, StashedError> {
+    enum Plan {
+        Ready(bool),
+        CallComp,
+        CallMeta(StashedFunction),
+    }
+    let plan = seq.try_enter(|ctx, locals, _exec, mut stack| {
+        let tbl = locals.fetch(t);
+        let a = tbl.raw_get(Value::integer(xi as i64));
+        let b = tbl.raw_get(Value::integer(yi as i64));
+        if comp.is_some() {
+            stack.replace(&[a, b]);
+            return Ok(Plan::CallComp);
+        }
+        // Default order follows the `<` operator (no string→number coercion).
+        let prim = if let (Some(x), Some(y)) = (a.get_integer(), b.get_integer()) {
+            Some(x < y)
+        } else if let (Some(x), Some(y)) = (a.get_float(), b.get_float()) {
+            Some(x < y)
+        } else if let (Some(x), Some(y)) = (a.get_integer(), b.get_float()) {
+            Some((x as f64) < y)
+        } else if let (Some(x), Some(y)) = (a.get_float(), b.get_integer()) {
+            Some(x < (y as f64))
+        } else if let (Some(x), Some(y)) = (a.get_string(), b.get_string()) {
+            Some(x < y)
+        } else {
+            None
+        };
+        if let Some(r) = prim {
+            return Ok(Plan::Ready(r));
+        }
+        let m = lt_metamethod(ctx, a, b);
+        if let Some(f) = m.get_function() {
+            stack.replace(&[a, b]);
+            Ok(Plan::CallMeta(locals.stash(ctx.mutation(), f)))
+        } else {
+            Err(Error::from_str(ctx, &util::compare_error_msg(a, b)))
+        }
+    })?;
+    match plan {
+        Plan::Ready(r) => Ok(r),
+        Plan::CallComp => {
+            seq.call(comp.as_ref().unwrap(), 0).await?;
+            Ok(sort_truthy(seq))
+        }
+        Plan::CallMeta(f) => {
+            seq.call(&f, 0).await?;
+            Ok(sort_truthy(seq))
+        }
+    }
+}
+
+/// Swap `a[x]` and `a[y]` in place (raw, no metamethods).
+fn sort_swap(seq: &mut AsyncSequence, t: &StashedTable, x: usize, y: usize) {
+    seq.enter(|ctx, locals, _exec, _stack| {
+        let tbl = locals.fetch(t);
+        let kx = Value::integer(x as i64);
+        let ky = Value::integer(y as i64);
+        let vx = tbl.raw_get(kx);
+        let vy = tbl.raw_get(ky);
+        tbl.raw_set(ctx, kx, vy);
+        tbl.raw_set(ctx, ky, vx);
+    });
+}
+
+/// Truthiness (anything but `nil`/`false`) of the comparator's first result,
+/// left at the sequence window's bottom by the preceding `call`.
+fn sort_truthy(seq: &mut AsyncSequence) -> bool {
+    seq.enter(|_ctx, _locals, _exec, stack| {
+        let v = stack.get(0);
+        !(v.is_nil() || v.get_boolean() == Some(false))
+    })
+}
+
+/// The `__lt` metamethod for an ordering of `a < b` (checked on `a` then `b`),
+/// mirroring the VM's `binop_metamethod`.
+fn lt_metamethod<'gc>(ctx: Context<'gc>, a: Value<'gc>, b: Value<'gc>) -> Value<'gc> {
+    let name = ctx.symbols().mm_lt;
+    if let Some(t) = a.get_table() {
+        let m = t.get_metamethod(name);
+        if !m.is_nil() {
+            return m;
+        }
+    }
+    if let Some(t) = b.get_table() {
+        return t.get_metamethod(name);
+    }
+    Value::nil()
+}
+
+/// Build the "invalid order function for sorting" error as a stashed error.
+fn invalid_order_err(seq: &mut AsyncSequence) -> StashedError {
+    seq.try_enter(|ctx, _locals, _exec, _stack| {
+        Result::<(), _>::Err(Error::from_str(ctx, "invalid order function for sorting"))
+    })
+    .unwrap_err()
 }
 
 /// `unpack(t [, i [, j]])` — return `t[i]..t[j]` (`i` defaults to 1, `j` to

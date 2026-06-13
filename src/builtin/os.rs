@@ -2,26 +2,38 @@ use crate::Context;
 use crate::builtin::util;
 use crate::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Table, Value};
 use crate::vm::sequence::CallbackAction;
+use std::os::unix::ffi::OsStrExt;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// `luaL_fileresult`-style outcome: `true` on success, `(nil, "msg", errno?)`
-/// on failure.
+/// on failure. The message is bare `strerror(errno)` (Rust's `Display` appends
+/// " (os error N)", which Lua omits), prefixed with the filename only when one
+/// is given — `os.remove` passes the path, `os.rename` passes `None` (C calls
+/// `luaL_fileresult` with a NULL filename there, so no prefix).
 fn file_result<'gc>(
     nctx: &NativeContext<'gc, '_>,
     stack: &mut Stack<'gc, '_>,
     res: std::io::Result<()>,
-    what: &str,
+    fname: Option<&str>,
 ) {
     match res {
         Ok(()) => stack.replace(&[Value::boolean(true)]),
         Err(e) => {
-            let msg = LuaString::new(nctx.ctx, format!("{what}: {e}").as_bytes());
+            let raw = e.to_string();
+            let bare = match raw.find(" (os error ") {
+                Some(cut) => &raw[..cut],
+                None => &raw,
+            };
+            let text = match fname {
+                Some(f) => format!("{f}: {bare}"),
+                None => bare.to_string(),
+            };
             let errno = e.raw_os_error().unwrap_or(0);
             stack.replace(&[
                 Value::nil(),
-                Value::string(msg),
+                Value::string(LuaString::new(nctx.ctx, text.as_bytes())),
                 Value::integer(errno as i64),
             ]);
         }
@@ -91,18 +103,26 @@ fn lua_date<'gc>(
     todo!()
 }
 
-/// `difftime(t2 [, t1])` — `t2 - t1` in seconds (`t1` defaults to 0).
+/// `difftime(t2, t1)` — `t2 - t1` in seconds. Lua 5.5 requires both arguments
+/// (5.3/5.4 defaulted `t1` to 0; that changed).
 fn lua_difftime<'gc>(
     nctx: NativeContext<'gc, '_>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
+    if stack.is_empty() {
+        return Err(Error::from_str(
+            nctx.ctx,
+            "bad argument #1 to 'difftime' (number expected, got no value)",
+        ));
+    }
     let t2 = util::check_number(nctx.ctx, stack.get(0), "difftime", 1)?;
-    let t1_arg = stack.get(1);
-    let t1 = if t1_arg.is_nil() {
-        0.0
-    } else {
-        util::check_number(nctx.ctx, t1_arg, "difftime", 2)?
-    };
+    if stack.len() < 2 {
+        return Err(Error::from_str(
+            nctx.ctx,
+            "bad argument #2 to 'difftime' (number expected, got no value)",
+        ));
+    }
+    let t1 = util::check_number(nctx.ctx, stack.get(1), "difftime", 2)?;
     stack.replace(&[Value::float(t2 - t1)]);
     Ok(CallbackAction::Return)
 }
@@ -118,18 +138,18 @@ fn lua_execute<'gc>(
 /// (`true`→0, `false`→1), an integer status, or nil (0). The `close` flag is
 /// ignored (we always run normal process teardown).
 fn lua_exit<'gc>(
-    _nctx: NativeContext<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
     stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let arg = stack.get(0);
-    let code = if let Some(i) = arg.get_integer() {
-        i as i32
+    // Boolean: true→0, false→1. Otherwise (and for nil/none) an integer status,
+    // via `luaL_optinteger` — so non-integers raise rather than silently exit 0.
+    let code = if let Some(b) = arg.get_boolean() {
+        if b { 0 } else { 1 }
     } else if arg.is_nil() {
-        0 // os.exit() / os.exit(nil) / os.exit(true) -> success
-    } else if arg.is_falsy() {
-        1 // os.exit(false) -> failure
-    } else {
         0
+    } else {
+        util::check_integer(nctx.ctx, arg, "exit", 1)? as i32
     };
     use std::io::Write;
     let _ = std::io::stdout().flush();
@@ -142,11 +162,10 @@ fn lua_getenv<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let name = check_str_arg(nctx.ctx, stack.get(0), "getenv", 1)?;
-    let val = std::str::from_utf8(name.as_bytes())
-        .ok()
-        .and_then(|k| std::env::var(k).ok());
+    // Look up by raw bytes (env vars/values needn't be UTF-8), matching C.
+    let val = std::env::var_os(std::ffi::OsStr::from_bytes(name.as_bytes()));
     let result = match val {
-        Some(v) => Value::string(LuaString::new(nctx.ctx, v.as_bytes())),
+        Some(v) => Value::string(LuaString::new(nctx.ctx, v.as_os_str().as_bytes())),
         None => Value::nil(),
     };
     stack.replace(&[result]);
@@ -160,13 +179,12 @@ fn lua_remove<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let name = check_str_arg(nctx.ctx, stack.get(0), "remove", 1)?;
-    let path = std::path::Path::new(std::ffi::OsStr::new(
-        std::str::from_utf8(name.as_bytes()).unwrap_or(""),
-    ));
+    let path = std::path::Path::new(std::ffi::OsStr::from_bytes(name.as_bytes()));
     // C `remove` deletes files and empty directories; try the file path first.
     let res = std::fs::remove_file(path).or_else(|_| std::fs::remove_dir(path));
-    let what = std::str::from_utf8(name.as_bytes()).unwrap_or("");
-    file_result(&nctx, &mut stack, res, what);
+    // `os.remove` passes the filename to `luaL_fileresult`, so it prefixes.
+    let what = String::from_utf8_lossy(name.as_bytes());
+    file_result(&nctx, &mut stack, res, Some(&what));
     Ok(CallbackAction::Return)
 }
 
@@ -178,10 +196,12 @@ fn lua_rename<'gc>(
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let from = check_str_arg(nctx.ctx, stack.get(0), "rename", 1)?;
     let to = check_str_arg(nctx.ctx, stack.get(1), "rename", 2)?;
-    let from_s = std::str::from_utf8(from.as_bytes()).unwrap_or("");
-    let to_s = std::str::from_utf8(to.as_bytes()).unwrap_or("");
-    let res = std::fs::rename(from_s, to_s);
-    file_result(&nctx, &mut stack, res, from_s);
+    let from_p = std::path::Path::new(std::ffi::OsStr::from_bytes(from.as_bytes()));
+    let to_p = std::path::Path::new(std::ffi::OsStr::from_bytes(to.as_bytes()));
+    let res = std::fs::rename(from_p, to_p);
+    // Unlike `remove`, C's `os_rename` passes NULL to `luaL_fileresult`, so the
+    // error message carries no filename prefix.
+    file_result(&nctx, &mut stack, res, None);
     Ok(CallbackAction::Return)
 }
 

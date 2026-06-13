@@ -2617,6 +2617,25 @@ pub(crate) fn frame_return<'gc>(
         thread.status = ThreadStatus::Result { bottom: dst_start };
         return FrameReturn::TopLevel;
     }
+
+    // If the parent isn't a Lua frame (Sequence/WaitThread/etc.), the executor
+    // driver picks up here: place all `nret` values at `stack[dst_start..]` for
+    // the parent's window. This MUST be handled before the `num_results`
+    // branch below — doing both copies would run two overlapping forward
+    // moves of the same source range, and the first would clobber the source
+    // of the second whenever `nret` is large enough that `dst_start + nret`
+    // reaches into `[values_base..]` (e.g. a sort comparator returning 4+
+    // values). A single copy is safe because `dst_start < values_base`, so each
+    // write lands on a slot already consumed.
+    if thread.top_lua().is_none() {
+        for i in 0..nret {
+            thread.stack[dst_start + i] = thread.stack[values_base + i];
+        }
+        thread.stack.truncate(dst_start + nret);
+        thread.top = dst_start + nret;
+        return FrameReturn::ToNonLua;
+    }
+
     // `num_results == 0` is the CALL's MULTRET: deliver all `nret` and publish `thread.top`.
     if num_results == 0 {
         for i in 0..nret {
@@ -2632,20 +2651,6 @@ pub(crate) fn frame_return<'gc>(
         for i in to_copy..wanted {
             thread.stack[dst_start + i] = Value::nil();
         }
-    }
-
-    // If the parent isn't a Lua frame (Sequence/WaitThread/etc.), the
-    // executor driver picks up here. Place all returned values at
-    // `stack[dst_start..]` for the parent's window to see and exit.
-    if thread.top_lua().is_none() {
-        // Use the full `nret` since the non-Lua parent doesn't have a
-        // `num_results`-style truncation expectation; the driver/sequence
-        // gets all the returned values.
-        for i in 0..nret {
-            thread.stack[dst_start + i] = thread.stack[values_base + i];
-        }
-        thread.stack.truncate(dst_start + nret);
-        return FrameReturn::ToNonLua;
     }
 
     let caller = thread.top_lua().unwrap();
@@ -2943,11 +2948,10 @@ fn unop_metamethod<'gc>(val: Value<'gc>, name: LuaString<'gc>) -> Value<'gc> {
 /// frame at the saved pc — so `op_return`-style continuation logic isn't
 /// needed for the suspend case. A native error installs a `Frame::Error`.
 ///
-/// The native suspend path can faithfully replay `StoreResult`, `IgnoreResult`,
-/// and `TForCall` (each is "land N results at a register window"), but not
-/// `CondJump`: a suspended comparison can't decide its branch retroactively, so
-/// a suspending comparison metamethod yields a `Frame::Error` rather than
-/// silently mis-jumping.
+/// The native suspend path replays all four continuation payloads uniformly via
+/// `apply_native_continuation`: `StoreResult`, `IgnoreResult`, `TForCall`, and
+/// `CondJump` (which bumps the caller frame's saved `pc` by the payload's offset
+/// to select the branch once the suspended comparison's result arrives).
 #[inline(never)]
 fn schedule_meta_call<'gc>(
     ctx: Context<'gc>,

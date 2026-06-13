@@ -8,7 +8,9 @@ mod package;
 mod string;
 mod table;
 mod utf8;
-mod util;
+// `pub(crate)` so the VM concat path (`vm::num::write_float`) can share the
+// canonical float-stringification (`push_float`) with `tostring`/`print`.
+pub(crate) mod util;
 
 pub use basic::load as load_basic;
 pub use coroutine::load as load_coroutine;

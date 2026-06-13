@@ -1,6 +1,15 @@
+use std::cell::RefCell;
+
+use rand_core::Rng;
+use rand_pcg::Pcg64;
+
 use crate::Context;
-use crate::builtin::util::{check_integer, check_number, float_to_integer, num_to_value};
-use crate::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Table, Value};
+use crate::builtin::util::{
+    check_integer, check_number, compare_error_msg, float_to_integer, num_to_value,
+};
+use crate::env::{
+    Error, Function, LuaString, NativeContext, NativeFn, Stack, Table, Userdata, Value,
+};
 use crate::vm::sequence::CallbackAction;
 
 pub fn load<'gc>(ctx: Context<'gc>) {
@@ -30,9 +39,18 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         ("ult", lua_ult),
     ];
 
+    // Shared PRNG state for `random`/`randomseed`, mirroring Lua's per-closure
+    // `RanState` userdata held as upvalue 0 of both functions.
+    let rng = Userdata::new(ctx.mutation(), RefCell::new(RngState::from_entropy()), 0);
+
     let lib = Table::new(ctx);
     for &(name, handler) in fns {
-        let handler = Function::new_native(ctx.mutation(), handler, Box::new([]));
+        let upvalues: Box<[Value<'gc>]> = if name == "random" || name == "randomseed" {
+            Box::new([Value::userdata(rng)])
+        } else {
+            Box::new([])
+        };
+        let handler = Function::new_native(ctx.mutation(), handler, upvalues);
         let key = Value::string(LuaString::new(ctx, name.as_bytes()));
         lib.raw_set(ctx, key, Value::function(handler));
     }
@@ -227,8 +245,10 @@ fn lua_min<'gc>(
 }
 
 /// Shared `max`/`min` body: returns the argument that is largest (or smallest),
-/// preserving its original integer/float subtype. Requires at least one
-/// argument and that all arguments be numbers.
+/// preserving its original subtype. Per the manual the result is selected "with
+/// the `<` operator", so comparisons use Lua ordering semantics (no string→
+/// number coercion); a non-orderable pair raises the VM's "attempt to compare"
+/// error rather than a bad-argument error. Requires at least one argument.
 fn select_extreme<'gc>(
     nctx: NativeContext<'gc, '_>,
     mut stack: Stack<'gc, '_>,
@@ -239,22 +259,29 @@ fn select_extreme<'gc>(
     if n == 0 {
         return Err(Error::from_str(
             nctx.ctx,
-            &format!("bad argument #1 to '{fname}' (number expected, got no value)"),
+            &format!("bad argument #1 to '{fname}' (value expected)"),
         ));
     }
     let mut best = stack.get(0);
-    let mut best_key = check_number(nctx.ctx, best, fname, 1)?;
     for i in 1..n {
         let v = stack.get(i);
-        let key = check_number(nctx.ctx, v, fname, i + 1)?;
-        let take = if want_min {
-            key < best_key
+        // max keeps `v` when best < v; min keeps `v` when v < best.
+        let (lhs, rhs) = if want_min { (v, best) } else { (best, v) };
+        let lt = if let (Some(x), Some(y)) = (lhs.get_integer(), rhs.get_integer()) {
+            x < y
+        } else if let (Some(x), Some(y)) = (lhs.get_float(), rhs.get_float()) {
+            x < y
+        } else if let (Some(x), Some(y)) = (lhs.get_integer(), rhs.get_float()) {
+            (x as f64) < y
+        } else if let (Some(x), Some(y)) = (lhs.get_float(), rhs.get_integer()) {
+            x < (y as f64)
+        } else if let (Some(x), Some(y)) = (lhs.get_string(), rhs.get_string()) {
+            x < y
         } else {
-            key > best_key
+            return Err(Error::from_str(nctx.ctx, &compare_error_msg(lhs, rhs)));
         };
-        if take {
+        if lt {
             best = v;
-            best_key = key;
         }
     }
     stack.replace(&[best]);
@@ -317,20 +344,185 @@ fn lua_ult<'gc>(
     Ok(CallbackAction::Return)
 }
 
-// `math.random` / `math.randomseed` need a home for the PRNG state (Lua 5.5
-// uses a per-state xoshiro256**). Where that state lives — function upvalues,
-// a `State` field, or a thread-local — is a design decision left for #27
-// follow-up; stubbed for now.
-fn lua_random<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!("math.random: PRNG state location is an open design decision")
+// ---------------------------------------------------------------------------
+// PRNG (`random` / `randomseed`)
+// ---------------------------------------------------------------------------
+//
+// Lua 5.5 ships a per-state xoshiro256**. We deliberately back ours with
+// `rand_pcg` instead, so the value *stream* differs from PUC-Lua, but every
+// observable *semantic* matches: `random()` floats in `[0,1)`, inclusive
+// integer ranges, the `random(0)` full-width case, the rejection-sampling
+// projection, and the two-integer `randomseed` return. The state lives in a
+// `RefCell` inside a `Userdata` shared as upvalue 0 of both functions —
+// the direct analogue of Lua's shared `RanState` upvalue.
+
+struct RngState {
+    rng: Pcg64,
 }
 
-fn lua_randomseed<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+impl RngState {
+    fn from_seeds(n1: u64, n2: u64) -> Self {
+        // Map the two seed words onto PCG's 128-bit state/stream, then discard
+        // a few outputs to wash out the low-quality initial state (Lua discards
+        // 16 nextrand values after seeding for the same reason).
+        let state = ((n1 as u128) << 64) | n2 as u128;
+        let stream = ((n2 as u128) << 64) | 0x9e37_79b9_7f4a_7c15;
+        let mut rng = Pcg64::new(state, stream);
+        for _ in 0..16 {
+            rng.next_u64();
+        }
+        RngState { rng }
+    }
+
+    fn from_entropy() -> Self {
+        let n1 = make_seed();
+        let n2 = make_seed()
+            .rotate_left(17)
+            .wrapping_add(0x9e37_79b9_7f4a_7c15);
+        Self::from_seeds(n1, n2)
+    }
+
+    #[inline]
+    fn next_u64(&mut self) -> u64 {
+        self.rng.next_u64()
+    }
+}
+
+/// Non-cryptographic entropy for `randomseed()` with no argument, mixing the
+/// wall clock with a stack address (the spirit of `luaL_makeseed`).
+fn make_seed() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let addr = &nanos as *const u64 as u64;
+    nanos ^ addr.rotate_left(32)
+}
+
+/// A 53-bit random value scaled into `[0, 1)` (Lua's `I2d`).
+#[inline]
+fn unit_float(rv: u64) -> f64 {
+    (rv >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+}
+
+/// Lua's `project`: rejection-sample `ran` uniformly into `[0, n]`. `lim` is the
+/// smallest Mersenne number `>= n`; we keep drawing while the masked value
+/// exceeds `n`.
+fn project(mut ran: u64, n: u64, st: &mut RngState) -> u64 {
+    let mut lim = n;
+    let mut sh = 1u32;
+    while lim & lim.wrapping_add(1) != 0 {
+        lim |= lim >> sh;
+        sh <<= 1;
+    }
+    loop {
+        ran &= lim;
+        if ran <= n {
+            return ran;
+        }
+        ran = st.next_u64();
+    }
+}
+
+#[inline]
+fn rng_state<'gc>(nctx: &NativeContext<'gc, '_>) -> Userdata<'gc> {
+    nctx.upvalues[0]
+        .get_userdata()
+        .expect("random/randomseed upvalue 0 must be the RNG userdata")
+}
+
+/// `random([m [, n]])` — float in `[0,1)` (no args); a full-width random integer
+/// (`random(0)`); or an integer in `[1,m]` / `[m,n]`.
+fn lua_random<'gc>(
+    nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!("math.randomseed: PRNG state location is an open design decision")
+    // Parse + validate before drawing so error paths don't perturb the stream.
+    #[derive(Clone, Copy)]
+    enum Mode {
+        Float,
+        Bits,
+        Range(i64, i64),
+    }
+    let mode = match stack.len() {
+        0 => Mode::Float,
+        1 => {
+            let up = check_integer(nctx.ctx, stack.get(0), "random", 1)?;
+            if up == 0 {
+                Mode::Bits
+            } else {
+                Mode::Range(1, up)
+            }
+        }
+        2 => {
+            let low = check_integer(nctx.ctx, stack.get(0), "random", 1)?;
+            let up = check_integer(nctx.ctx, stack.get(1), "random", 2)?;
+            Mode::Range(low, up)
+        }
+        _ => return Err(Error::from_str(nctx.ctx, "wrong number of arguments")),
+    };
+    if let Mode::Range(low, up) = mode
+        && low > up
+    {
+        return Err(Error::from_str(
+            nctx.ctx,
+            "bad argument #1 to 'random' (interval is empty)",
+        ));
+    }
+
+    let result = rng_state(&nctx)
+        .with_data::<RefCell<RngState>, Value<'gc>>(|cell| {
+            let mut st = cell.borrow_mut();
+            let rv = st.next_u64();
+            match mode {
+                Mode::Float => Value::float(unit_float(rv)),
+                Mode::Bits => Value::integer(rv as i64),
+                Mode::Range(low, up) => {
+                    let span = (up as u64).wrapping_sub(low as u64);
+                    let p = project(rv, span, &mut st);
+                    Value::integer(p.wrapping_add(low as u64) as i64)
+                }
+            }
+        })
+        .expect("RNG userdata payload type mismatch");
+
+    stack.replace(&[result]);
+    Ok(CallbackAction::Return)
+}
+
+/// `randomseed([x [, y]])` — reseed (from entropy with no argument) and return
+/// the two seed integers actually used.
+fn lua_randomseed<'gc>(
+    nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
+    // No argument at all → entropy reseed; an explicit arg (even nil) goes
+    // through `check_integer`, like Lua's `luaL_checkinteger`.
+    let provided = if stack.len() == 0 {
+        None
+    } else {
+        let n1 = check_integer(nctx.ctx, stack.get(0), "randomseed", 1)? as u64;
+        let n2 = if stack.get(1).is_nil() {
+            0
+        } else {
+            check_integer(nctx.ctx, stack.get(1), "randomseed", 2)? as u64
+        };
+        Some((n1, n2))
+    };
+
+    let (s1, s2) = rng_state(&nctx)
+        .with_data::<RefCell<RngState>, (u64, u64)>(|cell| {
+            let mut st = cell.borrow_mut();
+            let seeds = match provided {
+                Some(pair) => pair,
+                None => (make_seed(), st.next_u64()),
+            };
+            *st = RngState::from_seeds(seeds.0, seeds.1);
+            seeds
+        })
+        .expect("RNG userdata payload type mismatch");
+
+    stack.replace(&[Value::integer(s1 as i64), Value::integer(s2 as i64)]);
+    Ok(CallbackAction::Return)
 }

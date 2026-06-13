@@ -186,7 +186,9 @@ fn lua_format<'gc>(
         }
         let arg = stack.get(arg_idx);
         arg_idx += 1;
-        format_one(ctx.ctx, &mut out, &spec, arg)?;
+        // After the increment, `arg_idx` is the 1-based Lua argument number of
+        // the argument just consumed (the format string is #1).
+        format_one(ctx.ctx, &mut out, &spec, arg, arg_idx)?;
     }
 
     let s = LuaString::new(ctx.ctx, &out);
@@ -211,6 +213,7 @@ fn parse_spec<'gc>(
     fmt: &[u8],
     mut i: usize,
 ) -> Result<(FmtSpec, usize), Error<'gc>> {
+    let start = i - 1; // the '%'
     let mut spec = FmtSpec::default();
     while i < fmt.len() {
         match fmt[i] {
@@ -223,30 +226,52 @@ fn parse_spec<'gc>(
         }
         i += 1;
     }
+    // Lua's `get2digits`: only the first two digits set the value; a third digit
+    // is left in place so the conversion char ends up non-alpha and the spec is
+    // rejected as malformed below (matches `checkformat`). Max width/prec = 99.
+    let mut wdigits = 0;
     while i < fmt.len() && fmt[i].is_ascii_digit() {
-        spec.width = spec.width * 10 + (fmt[i] - b'0') as usize;
-        if spec.width > 99 {
-            return Err(Error::from_str(ctx, "invalid format (width too large)"));
+        if wdigits < 2 {
+            spec.width = spec.width * 10 + (fmt[i] - b'0') as usize;
         }
+        wdigits += 1;
         i += 1;
     }
+    let mut pdigits = 0;
     if i < fmt.len() && fmt[i] == b'.' {
         i += 1;
         let mut p = 0usize;
         while i < fmt.len() && fmt[i].is_ascii_digit() {
-            p = p * 10 + (fmt[i] - b'0') as usize;
-            if p > 99 {
-                return Err(Error::from_str(ctx, "invalid format (precision too large)"));
+            if pdigits < 2 {
+                p = p * 10 + (fmt[i] - b'0') as usize;
             }
+            pdigits += 1;
             i += 1;
         }
         spec.precision = Some(p);
     }
     if i >= fmt.len() {
-        return Err(Error::from_str(ctx, "invalid conversion '%' (missing)"));
+        return Err(invalid_conv_spec(ctx, &fmt[start..]));
     }
     spec.conv = fmt[i];
+    // `%%` is handled by the caller; otherwise the conversion char must be a
+    // letter and the width/precision at most two digits (Lua's `checkformat`).
+    if spec.conv != b'%' && (!spec.conv.is_ascii_alphabetic() || wdigits > 2 || pdigits > 2) {
+        return Err(invalid_conv_spec(ctx, &fmt[start..=i]));
+    }
     Ok((spec, i + 1))
+}
+
+/// Lua's "invalid conversion specification: '%...'" error, echoing the offending
+/// spec verbatim (`form` includes the leading `%`).
+fn invalid_conv_spec<'gc>(ctx: Context<'gc>, form: &[u8]) -> Error<'gc> {
+    Error::from_str(
+        ctx,
+        &format!(
+            "invalid conversion specification: '{}'",
+            String::from_utf8_lossy(form)
+        ),
+    )
 }
 
 fn format_one<'gc>(
@@ -254,52 +279,53 @@ fn format_one<'gc>(
     out: &mut Vec<u8>,
     spec: &FmtSpec,
     arg: Value<'gc>,
+    arg_num: usize,
 ) -> Result<(), Error<'gc>> {
     match spec.conv {
         b'd' | b'i' | b'u' => {
-            let n = check_fmt_int(ctx, arg)?;
+            let n = check_fmt_int(ctx, arg, arg_num)?;
             fmt_int_signed(out, spec, n);
         }
         b'o' => {
-            let n = check_fmt_int(ctx, arg)?;
+            let n = check_fmt_int(ctx, arg, arg_num)?;
             fmt_int_unsigned(out, spec, n as u64, 8, false);
         }
         b'x' => {
-            let n = check_fmt_int(ctx, arg)?;
+            let n = check_fmt_int(ctx, arg, arg_num)?;
             fmt_int_unsigned(out, spec, n as u64, 16, false);
         }
         b'X' => {
-            let n = check_fmt_int(ctx, arg)?;
+            let n = check_fmt_int(ctx, arg, arg_num)?;
             fmt_int_unsigned(out, spec, n as u64, 16, true);
         }
         b'c' => {
             // C's `%c` casts the integer to `unsigned char`; Lua adds no range
             // check, so out-of-range values wrap to the low byte. Width/`-`
             // flags still apply (via apply_width).
-            let n = check_fmt_int(ctx, arg)?;
+            let n = check_fmt_int(ctx, arg, arg_num)?;
             apply_width(out, spec, b"", b"", &[n as u8]);
         }
         b'f' | b'F' => {
-            let f = to_float(arg).ok_or_else(|| arg_type_err(ctx, "number", &arg))?;
+            let f = to_float(arg).ok_or_else(|| arg_type_err(ctx, "number", &arg, arg_num))?;
             fmt_float_fixed(out, spec, f);
         }
         b'e' | b'E' => {
-            let f = to_float(arg).ok_or_else(|| arg_type_err(ctx, "number", &arg))?;
+            let f = to_float(arg).ok_or_else(|| arg_type_err(ctx, "number", &arg, arg_num))?;
             fmt_float_exp(out, spec, f, spec.conv == b'E');
         }
         b'g' | b'G' => {
-            let f = to_float(arg).ok_or_else(|| arg_type_err(ctx, "number", &arg))?;
+            let f = to_float(arg).ok_or_else(|| arg_type_err(ctx, "number", &arg, arg_num))?;
             fmt_float_g(out, spec, f, spec.conv == b'G');
         }
         b'a' | b'A' => {
-            let f = to_float(arg).ok_or_else(|| arg_type_err(ctx, "number", &arg))?;
+            let f = to_float(arg).ok_or_else(|| arg_type_err(ctx, "number", &arg, arg_num))?;
             fmt_hex_float(out, spec, f, spec.conv == b'A');
         }
         b's' => {
             fmt_string(ctx, out, spec, arg);
         }
         b'q' => {
-            fmt_q(out, arg);
+            fmt_q(ctx, out, arg, arg_num)?;
         }
         c => {
             return Err(Error::from_str(
@@ -311,11 +337,16 @@ fn format_one<'gc>(
     Ok(())
 }
 
-fn arg_type_err<'gc>(ctx: Context<'gc>, expected: &str, arg: &Value<'gc>) -> Error<'gc> {
+fn arg_type_err<'gc>(
+    ctx: Context<'gc>,
+    expected: &str,
+    arg: &Value<'gc>,
+    arg_num: usize,
+) -> Error<'gc> {
     Error::from_str(
         ctx,
         &format!(
-            "bad argument to 'format' ({} expected, got {})",
+            "bad argument #{arg_num} to 'format' ({} expected, got {})",
             expected,
             arg.type_name()
         ),
@@ -325,21 +356,24 @@ fn arg_type_err<'gc>(ctx: Context<'gc>, expected: &str, arg: &Value<'gc>) -> Err
 /// Coerce a `%d`/`%x`/`%c`/… argument to an integer, distinguishing — as Lua
 /// does — a non-number ("number expected, got X") from a number with no exact
 /// integer value ("number has no integer representation").
-fn check_fmt_int<'gc>(ctx: Context<'gc>, arg: Value<'gc>) -> Result<i64, Error<'gc>> {
+fn check_fmt_int<'gc>(
+    ctx: Context<'gc>,
+    arg: Value<'gc>,
+    arg_num: usize,
+) -> Result<i64, Error<'gc>> {
     if let Some(i) = to_integer(arg) {
         return Ok(i);
     }
     let msg = if to_float(arg).is_some() {
-        "bad argument to 'format' (number has no integer representation)".to_string()
+        format!("bad argument #{arg_num} to 'format' (number has no integer representation)")
     } else {
         format!(
-            "bad argument to 'format' (number expected, got {})",
+            "bad argument #{arg_num} to 'format' (number expected, got {})",
             arg.type_name()
         )
     };
     Err(Error::from_str(ctx, &msg))
 }
-
 
 // ---------- integer formatting ----------
 
@@ -590,22 +624,42 @@ fn format_hex_float(abs: f64, upper: bool, prec: Option<usize>) -> String {
         .collect();
     match prec {
         Some(p) => {
-            // Round half-up at the p-th nibble; a carry can ripple into `lead`.
-            if p < digits.len() && digits[p] >= 8 {
+            // Round to `p` fraction nibbles using round-half-to-even (the IEEE
+            // 754 default). This is chosen for cross-platform determinism: C's
+            // `%a` tie-breaking is host-`printf`-defined (glibc rounds to even,
+            // macOS toward zero), which we deliberately do not inherit. The
+            // discarded part is exactly `digits[p..]` — the 52-bit fraction is
+            // 13 nibbles, so nothing lies beyond. A carry can ripple into `lead`.
+            if p < digits.len() {
+                let first = digits[p];
+                let rest_nonzero = digits[p + 1..].iter().any(|&d| d != 0);
+                let round_up = if first > 8 {
+                    true
+                } else if first < 8 {
+                    false
+                } else if rest_nonzero {
+                    true // past the halfway point
+                } else {
+                    // Exactly halfway: round so the last kept nibble is even.
+                    let last_kept = if p == 0 { lead } else { digits[p - 1] };
+                    last_kept & 1 == 1
+                };
                 digits.truncate(p);
-                let mut carry = true;
-                let mut i = digits.len();
-                while carry && i > 0 {
-                    i -= 1;
-                    if digits[i] == 0xf {
-                        digits[i] = 0;
-                    } else {
-                        digits[i] += 1;
-                        carry = false;
+                if round_up {
+                    let mut carry = true;
+                    let mut i = digits.len();
+                    while carry && i > 0 {
+                        i -= 1;
+                        if digits[i] == 0xf {
+                            digits[i] = 0;
+                        } else {
+                            digits[i] += 1;
+                            carry = false;
+                        }
                     }
-                }
-                if carry {
-                    lead += 1;
+                    if carry {
+                        lead += 1;
+                    }
                 }
             } else {
                 digits.truncate(p);
@@ -662,7 +716,16 @@ fn fmt_hex_float(out: &mut Vec<u8>, spec: &FmtSpec, f: f64, upper: bool) {
         ""
     };
     let body = format_hex_float(f.abs(), upper, spec.precision);
-    apply_width(out, spec, sign.as_bytes(), b"", body.as_bytes());
+    // Split the `0x`/`0X` prefix so the `0` flag zero-pads *after* it
+    // (`%010a` -> `0x00001p+0`, not `00000x1p+0`).
+    let (prefix, rest) = body.split_at(2);
+    apply_width(
+        out,
+        spec,
+        sign.as_bytes(),
+        prefix.as_bytes(),
+        rest.as_bytes(),
+    );
 }
 
 // ---------- string and q ----------
@@ -683,14 +746,26 @@ fn fmt_string<'gc>(ctx: Context<'gc>, out: &mut Vec<u8>, spec: &FmtSpec, arg: Va
     apply_width(out, spec, b"", b"", trimmed);
 }
 
-fn fmt_q<'gc>(out: &mut Vec<u8>, arg: Value<'gc>) {
+fn fmt_q<'gc>(
+    ctx: Context<'gc>,
+    out: &mut Vec<u8>,
+    arg: Value<'gc>,
+    arg_num: usize,
+) -> Result<(), Error<'gc>> {
     if arg.is_nil() {
         out.extend_from_slice(b"nil");
     } else if let Some(b) = arg.get_boolean() {
         out.extend_from_slice(if b { b"true" } else { b"false" });
     } else if let Some(i) = arg.get_integer() {
-        let s = format!("{i}");
-        out.extend_from_slice(s.as_bytes());
+        // `LUA_MININTEGER` has no decimal literal form (`-9223372036854775808`
+        // parses as negation of an out-of-range literal), so Lua emits it as
+        // unsigned hex, which reads back as the same integer.
+        if i == i64::MIN {
+            out.extend_from_slice(b"0x8000000000000000");
+        } else {
+            let s = format!("{i}");
+            out.extend_from_slice(s.as_bytes());
+        }
     } else if let Some(f) = arg.get_float() {
         // %q must read back to the exact value: hex-float for finite numbers,
         // Lua's literal forms for the specials.
@@ -731,9 +806,13 @@ fn fmt_q<'gc>(out: &mut Vec<u8>, arg: Value<'gc>) {
         }
         out.push(b'"');
     } else {
-        let s = format!("<{}>", arg.type_name());
-        out.extend_from_slice(s.as_bytes());
+        // Tables, functions, threads, userdata have no literal form.
+        return Err(Error::from_str(
+            ctx,
+            &format!("bad argument #{arg_num} to 'format' (value has no literal form)"),
+        ));
     }
+    Ok(())
 }
 
 // ---------- shared width/padding ----------
@@ -850,12 +929,17 @@ fn lua_rep<'gc>(
     } else {
         let n = n as usize;
         let body = s.as_bytes();
-        // Guard against overflow on pathological sizes (Lua: "too large").
+        // Bound the result by Lua's `MAX_SIZE` (= `LUA_MAXINTEGER` on 64-bit),
+        // not just by `usize` arithmetic: `(len+sep)*n` can fit `usize` yet still
+        // be an absurd allocation (e.g. `rep("ab", maxinteger)`), so cap at
+        // `i64::MAX` to raise a catchable error instead of aborting on a
+        // `Vec::with_capacity` overflow.
         let total = body
             .len()
             .checked_add(sep.len())
             .and_then(|per| per.checked_mul(n))
-            .map(|t| t - sep.len());
+            .and_then(|t| t.checked_sub(sep.len()))
+            .filter(|&t| t <= i64::MAX as usize);
         let Some(total) = total else {
             return Err(Error::from_str(nctx.ctx, "resulting string too large"));
         };

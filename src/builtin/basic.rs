@@ -276,7 +276,15 @@ fn lua_rawlen<'gc>(
     } else if let Some(t) = v.get_table() {
         t.raw_len() as i64
     } else {
-        return Err(Error::from_str(nctx.ctx, "table or string expected"));
+        let got = if stack.is_empty() {
+            "no value"
+        } else {
+            v.type_name()
+        };
+        return Err(Error::from_str(
+            nctx.ctx,
+            &format!("bad argument #1 to 'rawlen' (table or string expected, got {got})"),
+        ));
     };
     stack.replace(&[Value::integer(len)]);
     Ok(CallbackAction::Return)
@@ -383,16 +391,11 @@ fn lua_tonumber<'gc>(
     let v = stack.get(0);
     let base_arg = stack.get(1);
     let result = if !base_arg.is_nil() {
-        // 2-arg form `tonumber(s, base)`: `s` is an integer string in `base`.
-        let base = base_arg
-            .get_integer()
-            .filter(|b| (2..=36).contains(b))
-            .ok_or_else(|| {
-                Error::from_str(
-                    nctx.ctx,
-                    "bad argument #2 to 'tonumber' (base out of range)",
-                )
-            })?;
+        // 2-arg form `tonumber(s, base)`. Lua's argument order: the base must be
+        // an integer (#2), then `s` must be a string (#1), and only then is the
+        // base range validated (#2) — so e.g. `tonumber(nil, 99)` complains
+        // about #1, not the out-of-range base.
+        let base = util::check_integer(nctx.ctx, base_arg, "tonumber", 2)?;
         let s = v.get_string().ok_or_else(|| {
             Error::from_str(
                 nctx.ctx,
@@ -402,6 +405,12 @@ fn lua_tonumber<'gc>(
                 ),
             )
         })?;
+        if !(2..=36).contains(&base) {
+            return Err(Error::from_str(
+                nctx.ctx,
+                "bad argument #2 to 'tonumber' (base out of range)",
+            ));
+        }
         util::str_to_int_base(s.as_bytes(), base as u32).map_or(Value::nil(), Value::integer)
     } else if v.get_integer().is_some() || v.get_float().is_some() {
         v
@@ -448,9 +457,10 @@ fn lua_type<'gc>(
 }
 
 /// `warn(msg, ...)` — Lua's warning system defaults to off and we do not yet
-/// track the on/off toggle, so this validates that all arguments are strings
-/// (as Lua does) and otherwise does nothing. TODO(#27): emit to stderr and
-/// honor `@on`/`@off` control messages once warning state lives in `State`.
+/// track the on/off toggle, so this validates the arguments (as Lua does, via
+/// `luaL_checkstring`, which accepts strings *and* numbers) and otherwise does
+/// nothing. TODO(#27): emit to stderr and honor `@on`/`@off` control messages
+/// once warning state lives in `State`.
 fn lua_warn<'gc>(
     nctx: NativeContext<'gc, '_>,
     stack: Stack<'gc, '_>,
@@ -463,7 +473,9 @@ fn lua_warn<'gc>(
     }
     for i in 0..stack.len() {
         let v = stack.get(i);
-        if v.get_string().is_none() {
+        // `luaL_checkstring` coerces numbers to their string form, so integers
+        // and floats are accepted; only truly non-coercible types error.
+        if v.get_string().is_none() && v.get_integer().is_none() && v.get_float().is_none() {
             return Err(Error::from_str(
                 nctx.ctx,
                 &format!(
