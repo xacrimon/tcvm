@@ -193,8 +193,14 @@ pub enum SyntaxKind {
     #[token("false")]
     False,
 
-    #[regex(r#""(\\[\\"]|[^"])*""#)]
-    #[regex(r#"'(\\[\\']|[^'])*'"#)]
+    // A backslash always begins a two-char escape unit (`\\` followed by any
+    // byte, newline included); the unescaped branch must therefore exclude
+    // backslash. Decoding the escape happens later — the regex only needs to
+    // find the string's bounds. Letting the unescaped branch match `\` made a
+    // literal ending in `\\` ambiguous, and maximal munch swallowed the next
+    // string's opening quote (`"a\\", "x"` tokenized as one string).
+    #[regex(r#""(\\[\s\S]|[^"\\])*""#)]
+    #[regex(r#"'(\\[\s\S]|[^'\\])*'"#)]
     String,
 
     #[regex(r"\[=*\[", long_string)]
