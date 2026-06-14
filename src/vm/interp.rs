@@ -1,3 +1,4 @@
+use crate::builtin::util;
 use crate::dmm::{Gc, Mutation, RefLock};
 use crate::env::function::{
     Function, FunctionKind, InlineCache, LuaClosure, NativeClosure, NativeContext, Stack, Upvalue,
@@ -1468,8 +1469,9 @@ extern "rust-preserve-none" fn op_eq<'gc>(
     let a = reg!(lhs);
     let b = reg!(rhs);
 
-    if a == b {
-        // Primitive or pointer-equal — no metamethod consultation.
+    if util::raw_eq(a, b) {
+        // Raw-equal (value across the int/float divide, else pointer/content) —
+        // no metamethod consultation. Bitwise `a == b` would miss `1 == 1.0`.
         if !inverted {
             skip!();
         }
@@ -1516,19 +1518,10 @@ extern "rust-preserve-none" fn op_lt<'gc>(
     let (lhs, rhs, inverted) = args!(Instruction::LT { lhs, rhs, inverted });
     let a = reg!(lhs);
     let b = reg!(rhs);
-    let primitive = if let (Some(x), Some(y)) = (a.get_integer(), b.get_integer()) {
-        Some(x < y)
-    } else if let (Some(x), Some(y)) = (a.get_float(), b.get_float()) {
-        Some(x < y)
-    } else if let (Some(x), Some(y)) = (a.get_integer(), b.get_float()) {
-        Some((x as f64) < y)
-    } else if let (Some(x), Some(y)) = (a.get_float(), b.get_integer()) {
-        Some(x < (y as f64))
-    } else if let (Some(x), Some(y)) = (a.get_string(), b.get_string()) {
-        Some(x < y)
-    } else {
-        None
-    };
+    let primitive = util::num_lt(a, b).or_else(|| match (a.get_string(), b.get_string()) {
+        (Some(x), Some(y)) => Some(x < y),
+        _ => None,
+    });
     if let Some(r) = primitive {
         if r != inverted {
             skip!();
@@ -1564,19 +1557,10 @@ extern "rust-preserve-none" fn op_le<'gc>(
     let (lhs, rhs, inverted) = args!(Instruction::LE { lhs, rhs, inverted });
     let a = reg!(lhs);
     let b = reg!(rhs);
-    let primitive = if let (Some(x), Some(y)) = (a.get_integer(), b.get_integer()) {
-        Some(x <= y)
-    } else if let (Some(x), Some(y)) = (a.get_float(), b.get_float()) {
-        Some(x <= y)
-    } else if let (Some(x), Some(y)) = (a.get_integer(), b.get_float()) {
-        Some((x as f64) <= y)
-    } else if let (Some(x), Some(y)) = (a.get_float(), b.get_integer()) {
-        Some(x <= (y as f64))
-    } else if let (Some(x), Some(y)) = (a.get_string(), b.get_string()) {
-        Some(x <= y)
-    } else {
-        None
-    };
+    let primitive = util::num_le(a, b).or_else(|| match (a.get_string(), b.get_string()) {
+        (Some(x), Some(y)) => Some(x <= y),
+        _ => None,
+    });
     if let Some(r) = primitive {
         if r != inverted {
             skip!();
