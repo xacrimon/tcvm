@@ -110,6 +110,11 @@ enum StringToken {
     #[regex(r"\\x[0-9a-fA-F][0-9a-fA-F]")]
     Hex,
 
+    // Greedy 1-3 decimal digits: `\195` takes all three, matching Lua, which
+    // then rejects values > 255 rather than falling back to fewer digits.
+    #[regex(r"\\[0-9][0-9]?[0-9]?")]
+    Decimal,
+
     #[regex(r"\\u\{[0-9a-fA-F]+\}")]
     Unicode,
 }
@@ -133,6 +138,7 @@ fn parse_string_fragment(s: &str) -> Vec<u8> {
             Ok(StringToken::LeftBracket) => bytes.push(0x5B),
             Ok(StringToken::RightBracket) => bytes.push(0x5D),
             Ok(StringToken::Hex) => parse_hex_escape(&mut bytes, &s[span]),
+            Ok(StringToken::Decimal) => parse_decimal_escape(&mut bytes, &s[span]),
             Ok(StringToken::Unicode) => parse_unicode_escape(&mut bytes, &s[span]),
             Err(()) => bytes.extend_from_slice(&b[span]),
         }
@@ -146,10 +152,54 @@ fn parse_hex_escape(dst: &mut Vec<u8>, s: &str) {
     dst.push(char);
 }
 
+fn parse_decimal_escape(dst: &mut Vec<u8>, s: &str) {
+    let char = s[1..].parse::<u8>().unwrap();
+    dst.push(char);
+}
+
 fn parse_unicode_escape(dst: &mut Vec<u8>, s: &str) {
     let codepoint = u32::from_str_radix(&s[2..s.len() - 1], 16).unwrap();
     let ch = char::from_u32(codepoint).unwrap();
     let buf = &mut [0; 4];
     let subs = ch.encode_utf8(buf).as_bytes();
     dst.extend_from_slice(subs);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_string;
+
+    // `parse_string` expects the surrounding quotes; the raw strings below are
+    // the literal source bytes, so `r#""\195\169""#` is the Lua literal "\195\169".
+    #[test]
+    fn decimal_escape_multibyte() {
+        assert_eq!(parse_string(r#""\195\169""#), vec![195, 169]);
+    }
+
+    #[test]
+    fn decimal_escape_ascii() {
+        assert_eq!(parse_string(r#""\65\66\67""#), b"ABC");
+    }
+
+    #[test]
+    fn decimal_escape_embedded_nul() {
+        assert_eq!(parse_string(r#""a\0b""#), vec![b'a', 0, b'b']);
+    }
+
+    #[test]
+    fn decimal_escape_is_greedy_then_literal() {
+        // `\065` munches three digits (= 65, 'A'), leaving '3' as a literal.
+        assert_eq!(parse_string(r#""\0653""#), vec![65, b'3']);
+    }
+
+    #[test]
+    fn decimal_escape_does_not_cross_escaped_backslash() {
+        // `\\` is one escaped backslash; the following `65` stay literal.
+        assert_eq!(parse_string(r#""\\65""#), vec![b'\\', b'6', b'5']);
+    }
+
+    #[test]
+    fn decimal_escape_max_byte() {
+        assert_eq!(parse_string(r#""\255""#), vec![255]);
+    }
 }
