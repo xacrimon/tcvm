@@ -1,0 +1,85 @@
+---
+source: src/parser/mod.rs
+expression: syntax_tree
+---
+Root@0..51
+  AssignStmt@0..4
+    AssignList@0..1
+      Ident@0..1
+        Ident@0..1 "a"
+    Assign@1..2 "="
+    ExprList@2..4
+      LiteralExpr@2..4
+        Float@2..4 ".5"
+  AssignStmt@4..8
+    AssignList@4..5
+      Ident@4..5
+        Ident@4..5 "b"
+    Assign@5..6 "="
+    ExprList@6..8
+      LiteralExpr@6..8
+        Float@6..8 "1."
+  AssignStmt@8..14
+    AssignList@8..9
+      Ident@8..9
+        Ident@8..9 "c"
+    Assign@9..10 "="
+    ExprList@10..14
+      LiteralExpr@10..14
+        Float@10..14 ".5e2"
+  AssignStmt@14..20
+    AssignList@14..15
+      Ident@14..15
+        Ident@14..15 "d"
+    Assign@15..16 "="
+    ExprList@16..20
+      LiteralExpr@16..20
+        Float@16..20 "1.e5"
+  AssignStmt@20..24
+    AssignList@20..21
+      Ident@20..21
+        Ident@20..21 "e"
+    Assign@21..22 "="
+    ExprList@22..24
+      LiteralExpr@22..24
+        Float@22..24 ".0"
+  AssignStmt@24..28
+    AssignList@24..25
+      Ident@24..25
+        Ident@24..25 "f"
+    Assign@25..26 "="
+    ExprList@26..28
+      LiteralExpr@26..28
+        Float@26..28 "5."
+  AssignStmt@28..33
+    AssignList@28..29
+      Ident@28..29
+        Ident@28..29 "g"
+    Assign@29..30 "="
+    ExprList@30..33
+      LiteralExpr@30..33
+        Float@30..33 "1.5"
+  AssignStmt@33..38
+    AssignList@33..34
+      Ident@33..34
+        Ident@33..34 "h"
+    Assign@34..35 "="
+    ExprList@35..38
+      LiteralExpr@35..38
+        Float@35..38 "1e5"
+  AssignStmt@38..45
+    AssignList@38..39
+      Ident@38..39
+        Ident@38..39 "i"
+    Assign@39..40 "="
+    ExprList@40..45
+      LiteralExpr@40..45
+        Float@40..45 "0.5e5"
+  AssignStmt@45..51
+    AssignList@45..46
+      Ident@45..46
+        Ident@45..46 "j"
+    Assign@46..47 "="
+    ExprList@47..51
+      LiteralExpr@47..51
+        Float@47..51 "3.14"

@@ -91,6 +91,7 @@ mod tests {
     test!(jens, "test-files/jens.lua");
     test!(literal, "test-files/literal.lua");
     test!(hex_numeral, "test-files/hex_numeral.lua");
+    test!(decimal_numeral, "test-files/decimal_numeral.lua");
     test!(nbody, "test-files/nbody.lua");
     test!(op_prec, "test-files/op_prec.lua");
     test!(primes, "test-files/primes.lua");
@@ -116,4 +117,22 @@ mod tests {
     test!(global_star_nested, "test-files/global_star_nested.lua");
     test!(global_const_star, "test-files/global_const_star.lua");
     test!(vararg_param, "test-files/vararg_param.lua");
+
+    // A malformed tail with no statement-recovery token before EOF (e.g. the
+    // adjacent `Float Float` from `1.2.3` / `10..20`) must yield a parse error
+    // report, not run the recovery loop past EOF and panic.
+    #[test]
+    fn malformed_numeral_reports_without_panic() {
+        for src in [
+            "1.2.3",
+            "x = 10..20",
+            "print(.5.5)",
+            "y = 0x1.2.3",
+            "foo @ bar",
+        ] {
+            let mut cache = NodeCache::new();
+            let (_tree, reports) = parse(&mut cache, src);
+            assert!(!reports.is_empty(), "expected a parse error for {src:?}");
+        }
+    }
 }

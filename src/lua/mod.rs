@@ -445,6 +445,32 @@ mod tests {
     }
 
     #[test]
+    fn decimal_numeral_literals() {
+        // The lexer rejected decimal floats with a leading or trailing radix
+        // point. `.expect("load")` guards the original symptom (a parse error);
+        // values are cross-checked against lua5.5. Each decimal-to-f64
+        // conversion rounds the same way in Rust and Lua, so `==` is exact.
+
+        // Leading radix point.
+        assert_eq!(run_returning_float("return .5"), 0.5);
+        // Trailing radix point.
+        assert_eq!(run_returning_float("return 1."), 1.0);
+        assert_eq!(run_returning_float("return 5."), 5.0);
+        // Leading radix point + exponent.
+        assert_eq!(run_returning_float("return .5e2"), 50.0);
+        // Trailing radix point + exponent.
+        assert_eq!(run_returning_float("return 1.e5"), 100000.0);
+        // Leading radix point, zero fraction.
+        assert_eq!(run_returning_float("return .0"), 0.0);
+        assert_eq!(run_returning_float("return .5E-2"), 0.005);
+
+        // Regression guards for forms that already lexed.
+        assert_eq!(run_returning_float("return 1.5"), 1.5);
+        assert_eq!(run_returning_float("return 1e5"), 100000.0);
+        assert_eq!(run_returning_float("return 3.14"), 3.14);
+    }
+
+    #[test]
     fn local_call_inside_native_call() {
         // Direct repro of the register-clobber bug: `probe(f(5))` where `f` is
         // a low-register local and `probe` is a global. Before the fix, the
