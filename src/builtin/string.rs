@@ -254,10 +254,50 @@ fn parse_spec<'gc>(
         return Err(invalid_conv_spec(ctx, &fmt[start..]));
     }
     spec.conv = fmt[i];
-    // `%%` is handled by the caller; otherwise the conversion char must be a
-    // letter and the width/precision at most two digits (Lua's `checkformat`).
-    if spec.conv != b'%' && (!spec.conv.is_ascii_alphabetic() || wdigits > 2 || pdigits > 2) {
-        return Err(invalid_conv_spec(ctx, &fmt[start..=i]));
+    // `%%` is handled by the caller; no flags or modifiers apply to it.
+    if spec.conv == b'%' {
+        return Ok((spec, i + 1));
+    }
+    // `%q` accepts no flags, width, or precision at all (its own error).
+    if spec.conv == b'q' {
+        let has_mods = spec.flag_minus
+            || spec.flag_plus
+            || spec.flag_space
+            || spec.flag_hash
+            || spec.flag_zero
+            || spec.width != 0
+            || spec.precision.is_some();
+        if has_mods {
+            return Err(Error::from_str(ctx, "specifier '%q' cannot have modifiers"));
+        }
+        return Ok((spec, i + 1));
+    }
+    let form = &fmt[start..=i];
+    // The conversion char must be a letter and width/precision at most two
+    // digits (Lua's `get2digits` caps both at 2).
+    if !spec.conv.is_ascii_alphabetic() || wdigits > 2 || pdigits > 2 {
+        return Err(invalid_conv_spec(ctx, form));
+    }
+    // Per-specifier flag/precision validation (Lua's `checkformat`): each
+    // conversion accepts only a subset of flags, and `c` forbids a precision.
+    let (allowed_flags, precision_ok): (&[u8], bool) = match spec.conv {
+        b'd' | b'i' => (b"-+0 ", true),
+        b'u' => (b"-0", true),
+        b'o' | b'x' | b'X' => (b"-#0", true),
+        b'a' | b'A' | b'e' | b'E' | b'f' | b'F' | b'g' | b'G' => (b"-+#0 ", true),
+        b'c' => (b"-", false),
+        b's' => (b"-", true),
+        // Unknown letters fall through to `format_one`'s
+        // "invalid conversion '%c' to 'format'".
+        _ => return Ok((spec, i + 1)),
+    };
+    let flag_rejected = (spec.flag_minus && !allowed_flags.contains(&b'-'))
+        || (spec.flag_plus && !allowed_flags.contains(&b'+'))
+        || (spec.flag_space && !allowed_flags.contains(&b' '))
+        || (spec.flag_hash && !allowed_flags.contains(&b'#'))
+        || (spec.flag_zero && !allowed_flags.contains(&b'0'));
+    if flag_rejected || (spec.precision.is_some() && !precision_ok) {
+        return Err(invalid_conv_spec(ctx, form));
     }
     Ok((spec, i + 1))
 }
@@ -282,9 +322,15 @@ fn format_one<'gc>(
     arg_num: usize,
 ) -> Result<(), Error<'gc>> {
     match spec.conv {
-        b'd' | b'i' | b'u' => {
+        b'd' | b'i' => {
             let n = check_fmt_int(ctx, arg, arg_num)?;
             fmt_int_signed(out, spec, n);
+        }
+        b'u' => {
+            // `%u` formats the integer's unsigned 64-bit value, not its signed
+            // form: `-1` -> "18446744073709551615".
+            let n = check_fmt_int(ctx, arg, arg_num)?;
+            fmt_int_unsigned(out, spec, n as u64, 10, false);
         }
         b'o' => {
             let n = check_fmt_int(ctx, arg, arg_num)?;
@@ -407,6 +453,7 @@ fn fmt_int_signed(out: &mut Vec<u8>, spec: &FmtSpec, n: i64) {
 fn fmt_int_unsigned(out: &mut Vec<u8>, spec: &FmtSpec, n: u64, radix: u32, upper: bool) {
     let mut digits = match radix {
         8 => format!("{n:o}"),
+        10 => format!("{n}"),
         16 if upper => format!("{n:X}"),
         16 => format!("{n:x}"),
         _ => unreachable!(),
@@ -545,30 +592,18 @@ fn format_exp_abs(abs: f64, prec: usize, upper: bool, hash: bool) -> String {
 }
 
 fn decompose_exp(abs: f64, prec: usize) -> (String, i32) {
-    // Use Rust's `{:e}` (which formats as "d.dddde-N"/"d.ddddeN") and then
-    // re-shape the mantissa to a fixed precision. This avoids reimplementing
-    // Grisu/Dragon for now; precision adjustment is handled by `format!`.
-    if abs == 0.0 {
-        let mantissa = if prec == 0 {
-            "0".to_string()
-        } else {
-            format!("0.{}", "0".repeat(prec))
-        };
-        return (mantissa, 0);
-    }
-    let exp = abs.abs().log10().floor() as i32;
-    let scale = 10f64.powi(-exp);
-    let mantissa_val = abs * scale;
-    // Rounding can push mantissa to >=10; renormalize.
-    let mut m = format!("{mantissa_val:.prec$}");
-    let mut e = exp;
-    if m.starts_with("10") {
-        // Rounding overflow, e.g. "10.000" — shift to "1.000" with exp+1.
-        let new_val = mantissa_val / 10.0;
-        m = format!("{new_val:.prec$}");
-        e += 1;
-    }
-    (m, e)
+    // Rust's `{:e}` formatting rounds, renormalizes (e.g. 9.9 at prec 0 -> "1e1"),
+    // and handles subnormals correctly. Scaling the mantissa by `10^-exp` by hand
+    // instead overflowed to `inf` for denormal exponents (~1e-309 and below),
+    // producing garbage like "infe-309". Split the mantissa from the exponent.
+    // `.abs()` strips a `-0.0` sign bit, which the caller already accounts for and
+    // which `{:e}` would otherwise re-emit as a duplicate '-'.
+    let s = format!("{:.prec$e}", abs.abs());
+    let epos = s.find('e').expect("exponential format always contains 'e'");
+    let exp = s[epos + 1..]
+        .parse::<i32>()
+        .expect("exponent is a valid integer");
+    (s[..epos].to_string(), exp)
 }
 
 fn strip_trailing_zeros(s: &mut String) {
