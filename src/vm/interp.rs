@@ -2118,7 +2118,7 @@ extern "rust-preserve-none" fn op_setlist<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
-    registers: Registers<'gc, '_>,
+    mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
@@ -2133,7 +2133,10 @@ extern "rust-preserve-none" fn op_setlist<'gc>(
     };
     // `count == 0` is MULTRET: element count comes from `thread.top`. It can
     // exceed u8 (a `VARARG count=0` spread), so index the stack by usize.
-    let base = thread.top_lua().unwrap().base;
+    let (base, max_stack) = {
+        let f = thread.top_lua().unwrap();
+        (f.base, f.closure.proto.max_stack_size as usize)
+    };
     let elements_start = base + table as usize + 1;
     let n = if count == 0 {
         thread.top - elements_start
@@ -2145,6 +2148,18 @@ extern "rust-preserve-none" fn op_setlist<'gc>(
         let val = thread.stack[elements_start + i - 1];
         let key = Value::integer(off + i as i64);
         t.raw_set(ctx, key, val);
+    }
+    if count == 0 {
+        // A MULTRET spread leaves `thread.stack` truncated to `thread.top` by
+        // the producer (e.g. a native call's variadic return). Restore the
+        // frame's register window so subsequent fixed-register ops stay in
+        // bounds — mirrors `op_call`'s post-return restore (PUC's
+        // `L->top = ci->top`). A resize may reallocate, so refresh `registers`.
+        let needed = base + max_stack;
+        if thread.stack.len() < needed {
+            thread.stack.resize(needed, Value::nil());
+            registers = unsafe { thread.stack.as_mut_ptr().add(base) };
+        }
     }
     dispatch!();
 }
