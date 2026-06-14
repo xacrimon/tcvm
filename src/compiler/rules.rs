@@ -831,6 +831,12 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                 }
             }
             ExprKind::Reg(reg) => {
+                // Mirror Lua's `freeexp` in `jumponcond`: release the operand
+                // temp before recording the TESTSET so the short-circuit value
+                // and the fall-through value materialise into one register (no
+                // orphan, no unifying MOVE). The TESTSET reads `reg` before any
+                // reuse overwrites it (emission order guarantees read-then-load).
+                self.free_reg(reg);
                 let jmp = self.emit_test_jump(reg, false);
                 expr.false_list.jumps.push(jmp);
             }
@@ -869,6 +875,9 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                 }
             }
             ExprKind::Reg(reg) => {
+                // See `goiftrue`: free the operand temp (Lua's `freeexp`) so the
+                // short-circuit and fall-through values share one register.
+                self.free_reg(reg);
                 let jmp = self.emit_test_jump(reg, true);
                 expr.true_list.jumps.push(jmp);
             }
@@ -2952,11 +2961,25 @@ fn compile_expr_binary_op(
     let lhs_expr = item.lhs().ok_or_else(|| ice("binop without lhs"))?;
     let rhs_expr = item.rhs().ok_or_else(|| ice("binop without rhs"))?;
     let mut lhs_desc = compile_expr(ctx, lhs_expr, None)?;
+
+    // Infix (mirrors Lua's `luaK_infix`): settle the LHS *before* compiling the
+    // RHS, so a jump-carrying RHS (an `and`/`or`/comparison) can't have the
+    // LHS's value-load emitted into its short-circuit span — where the
+    // short-circuit `JMP` would skip it. We keep a foldable numeral LHS lazy so
+    // a numeric RHS can still constant-fold; `CONCAT` is the exception — its
+    // operands must occupy consecutive ascending registers, so its LHS is
+    // materialised here regardless to take the lower register.
+    let lhs_lazy_numeral = matches!(lhs_desc.kind, ExprKind::Numeral(_)) && !lhs_desc.has_jumps();
+    let materialise_lhs_early = op == BinaryOperator::Concat || !lhs_lazy_numeral;
+    if materialise_lhs_early {
+        ctx.discharge_to_reg_mut(&mut lhs_desc, None)?;
+    }
+
     let mut rhs_desc = compile_expr(ctx, rhs_expr, None)?;
 
-    // Constant fold: both operands are numeric literals, op is foldable,
-    // and `validop` (no div-by-zero, no NaN/0 float result, bitwise needs
-    // integer-convertible operands) passes.
+    // Constant fold: both operands are numeric literals, op is foldable, and
+    // `validop` passes. Only reachable when the LHS stayed a lazy numeral
+    // (otherwise its kind is now `Reg` and this match fails).
     if let (ExprKind::Numeral(l), ExprKind::Numeral(r)) = (lhs_desc.kind, rhs_desc.kind)
         && !lhs_desc.has_jumps()
         && !rhs_desc.has_jumps()
@@ -2965,9 +2988,19 @@ fn compile_expr_binary_op(
         return Ok(ExprDesc::from_numeral(folded));
     }
 
-    // Non-fold path: discharge both operands and emit the runtime op.
-    let lhs = ctx.discharge_to_reg_mut(&mut lhs_desc, None)?;
-    let rhs = ctx.discharge_to_reg_mut(&mut rhs_desc, None)?;
+    // Postfix: materialise both operands, then emit. When the LHS is still a
+    // lazy numeral and the RHS carries short-circuit jumps, discharge the RHS
+    // first so the LHS's `LOAD` lands *after* the RHS's jump span (tcvm has no
+    // immediate arithmetic operands, so the constant must occupy a register).
+    let (lhs, rhs) = if !materialise_lhs_early && rhs_desc.has_jumps() {
+        let rhs = ctx.discharge_to_reg_mut(&mut rhs_desc, None)?;
+        let lhs = ctx.discharge_to_reg_mut(&mut lhs_desc, None)?;
+        (lhs, rhs)
+    } else {
+        let lhs = ctx.discharge_to_reg_mut(&mut lhs_desc, None)?;
+        let rhs = ctx.discharge_to_reg_mut(&mut rhs_desc, None)?;
+        (lhs, rhs)
+    };
 
     let reg = match op {
         BinaryOperator::Add => emit_arith(
