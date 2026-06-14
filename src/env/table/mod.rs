@@ -1,11 +1,12 @@
 use core::hash::BuildHasher;
 
+use hashbrown::{HashTable, hash_table};
+
 use crate::Context;
 use crate::dmm::{Collect, Gc, Mutation, RefLock, allocator_api::MetricsAlloc};
 use crate::env::shape::{self, MAX_PROPERTIES_FAST, Shape};
 use crate::env::string::LuaString;
 use crate::env::value::{Value, ValueKind, value_hash};
-use hashbrown::{HashTable, hash_table};
 
 #[derive(Clone, Copy, Collect)]
 #[collect(internal, no_drop)]

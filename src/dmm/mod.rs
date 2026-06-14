@@ -23,9 +23,6 @@ mod hashbrown;
 #[doc(hidden)]
 pub use tcvm_derive::__unelide_lifetimes;
 
-#[doc(hidden)]
-pub use self::{arena::__DynRootable, no_drop::__MustNotImplDrop, unsize::{__CoercePtrInternal, unsize}};
-
 pub use self::{
     allocator_api::MetricsAlloc,
     arena::{Arena, Rootable},
@@ -37,4 +34,10 @@ pub use self::{
     gc_weak::GcWeak,
     lock::{GcLock, GcRefLock, Lock, RefLock},
     static_collect::Static,
+};
+#[doc(hidden)]
+pub use self::{
+    arena::__DynRootable,
+    no_drop::__MustNotImplDrop,
+    unsize::{__CoercePtrInternal, unsize},
 };

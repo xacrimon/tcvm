@@ -1,11 +1,12 @@
-use crate::Context;
-use crate::builtin::util;
-use crate::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Table, Value};
-use crate::vm::sequence::CallbackAction;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use crate::Context;
+use crate::builtin::util;
+use crate::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Table, Value};
+use crate::vm::sequence::CallbackAction;
 
 /// `luaL_fileresult`-style outcome: `true` on success, `(nil, "msg", errno?)`
 /// on failure. The message is bare `strerror(errno)` (Rust's `Display` appends

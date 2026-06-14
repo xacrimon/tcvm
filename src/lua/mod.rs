@@ -8,13 +8,6 @@ mod error;
 mod executor;
 pub(crate) mod stash;
 
-use crate::dmm::Rootable;
-use crate::builtin;
-use crate::dmm::{Arena, Collect, DynamicRootSet, Mutation};
-use crate::env::shape::Shape;
-use crate::env::{Symbols, Table, Thread};
-
-use crate::env::string::Interner;
 pub use context::Context;
 pub use convert::{FromMultiValue, FromValue, IntoMultiValue, IntoValue};
 pub use error::{LoadError, RuntimeError, TypeError};
@@ -23,6 +16,13 @@ pub use stash::{
     Fetchable, Stashable, StashedError, StashedExecutor, StashedFunction, StashedTable,
     StashedThread, StashedValue,
 };
+
+use crate::builtin;
+use crate::dmm::Rootable;
+use crate::dmm::{Arena, Collect, DynamicRootSet, Mutation};
+use crate::env::shape::Shape;
+use crate::env::string::Interner;
+use crate::env::{Symbols, Table, Thread};
 
 /// Root object of the GC arena. Holds the globals table, the main thread,
 /// and the dynamic root set used to stash values across `enter` boundaries.

@@ -1,6 +1,5 @@
 mod inner {
     use core::hash::{BuildHasher, Hash};
-
     use std::alloc::Allocator;
 
     use crate::dmm::barrier::IndexWrite;

@@ -4,11 +4,10 @@ use cstree::build::NodeCache;
 use insta::assert_snapshot;
 use paste::paste;
 
-use crate::Lua;
-use crate::parser::{self, syntax::Root};
-
 use super::compile_chunk;
 use super::format::format_prototype;
+use crate::Lua;
+use crate::parser::{self, syntax::Root};
 
 fn compile_and_format(source: &str) -> String {
     let mut cache = NodeCache::new();

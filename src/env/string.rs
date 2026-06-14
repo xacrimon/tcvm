@@ -1,10 +1,12 @@
+use core::hash::{Hash, Hasher};
+use std::cmp::Ordering;
+use std::hash::BuildHasher;
+
+use hashbrown::{HashTable, hash_table};
+
 use crate::dmm::allocator_api::MetricsAlloc;
 use crate::dmm::{Collect, Gc, Mutation, RefLock};
 use crate::lua::Context;
-use core::hash::{Hash, Hasher};
-use hashbrown::{HashTable, hash_table};
-use std::cmp::Ordering;
-use std::hash::BuildHasher;
 
 #[derive(Clone, Copy, Collect)]
 #[collect(internal, no_drop)]

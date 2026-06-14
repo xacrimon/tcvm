@@ -2,19 +2,17 @@
 
 use core::borrow::Borrow;
 use core::mem;
+#[cfg(doc)]
+use core::ops::IndexMut;
 use core::ops::{
     Deref, DerefMut, Index, Range, RangeFrom, RangeInclusive, RangeTo, RangeToInclusive,
 };
-
 use std::collections::{BTreeMap, VecDeque};
 use std::vec::Vec;
-
 use std::{collections::HashMap, hash::BuildHasher, hash::Hash};
 
 #[cfg(doc)]
 use crate::dmm::Gc;
-#[cfg(doc)]
-use core::ops::IndexMut;
 
 /// An (interiorly-)mutable reference inside a GC'd object graph.
 ///

@@ -1,5 +1,4 @@
 use core::{alloc::Layout, marker::PhantomData, ptr::NonNull};
-
 use std::alloc::{AllocError, Allocator, Global};
 
 use crate::dmm::{collect::Collect, context::Mutation, metrics::Metrics, types::Invariant};

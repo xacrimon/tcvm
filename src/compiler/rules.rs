@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::mem;
 use std::rc::Rc;
 
 use cstree::interning::TokenInterner;
@@ -16,7 +17,6 @@ use crate::parser::syntax::{
     PrefixOp, PrefixOperator, Repeat, Return, Root, Stmt, Table, TableEntry, While,
 };
 use crate::vm::num;
-use std::mem;
 
 /// Sentinel value used as the `dst` field of a `TESTSET` while the real
 /// destination register is still unknown — i.e. the jump is pending in a

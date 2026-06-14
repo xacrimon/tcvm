@@ -7,10 +7,9 @@ pub mod syntax;
 use std::ops::{Deref, DerefMut};
 
 use cstree::build::NodeCache;
+use kind::T;
 use machinery::{Span, State};
 use syntax::SyntaxNode;
-
-use kind::T;
 
 pub fn parse(
     cache: &mut NodeCache<'static>,

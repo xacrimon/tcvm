@@ -1,6 +1,7 @@
-use clap::Parser;
 use std::fs;
 use std::path::PathBuf;
+
+use clap::Parser;
 use tcvm::env::{LuaString, Table, Value};
 use tcvm::{Executor, Lua, RuntimeError, format_prototype};
 

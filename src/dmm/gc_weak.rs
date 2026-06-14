@@ -1,11 +1,11 @@
+use core::fmt::{self, Debug};
+use std::ptr;
+
 use crate::dmm::Mutation;
 use crate::dmm::collect::{Collect, Trace};
 use crate::dmm::context::Finalization;
 use crate::dmm::gc::Gc;
 use crate::dmm::types::GcBox;
-
-use core::fmt::{self, Debug};
-use std::ptr;
 
 pub struct GcWeak<'gc, T: ?Sized + 'gc> {
     pub(crate) inner: Gc<'gc, T>,

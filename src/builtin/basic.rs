@@ -1,8 +1,9 @@
+use std::io::Write;
+
 use crate::Context;
 use crate::builtin::util;
 use crate::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Value};
 use crate::vm::sequence::CallbackAction;
-use std::io::Write;
 
 // TODO(#27): _G, _VERSION
 
