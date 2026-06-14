@@ -505,6 +505,47 @@ mod tests {
         assert_eq!(run_returning_float("return 3.14"), 3.14);
     }
 
+    fn run_expecting_error(src: &str) -> RuntimeError {
+        let mut lua = Lua::new();
+        let ex = lua
+            .try_enter(|ctx| -> Result<_, LoadError> {
+                let chunk = ctx.load(src, Some("test"))?;
+                Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+            })
+            .expect("load");
+        lua.execute::<i64>(&ex)
+            .expect_err("expected a runtime error")
+    }
+
+    #[test]
+    fn integer_div_mod_by_zero_raises() {
+        // Lua raises on integer `//` / `%` by a zero divisor. Previously this
+        // panicked the VM (`wrapping_div` / `wrapping_rem` by zero); now it
+        // surfaces as a runtime error like any other arithmetic failure.
+        for src in [
+            "return 7 // 0",
+            "return 0 // 0",
+            "return (-5) // 0",
+            "return 7 % 0",
+            "return (-5) % 0",
+        ] {
+            assert!(
+                matches!(run_expecting_error(src), RuntimeError::Opcode { .. }),
+                "expected a runtime error for {src:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn integer_div_mod_nonzero_still_works() {
+        // Regression guard: the zero-divisor check must not disturb the normal
+        // integer floor-div / modulo path (values per lua5.5).
+        assert_eq!(run_returning_int("return 7 // 2"), 3);
+        assert_eq!(run_returning_int("return (-7) // 2"), -4);
+        assert_eq!(run_returning_int("return 7 % 3"), 1);
+        assert_eq!(run_returning_int("return (-7) % 2"), 1);
+    }
+
     #[test]
     fn local_call_inside_native_call() {
         // Direct repro of the register-clobber bug: `probe(f(5))` where `f` is
