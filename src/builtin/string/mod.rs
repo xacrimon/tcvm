@@ -15,12 +15,13 @@ use crate::vm::async_sequence::{AsyncSequence, SequenceReturn, async_sequence};
 use crate::vm::interp::{IndexChain, walk_index_chain};
 use crate::vm::sequence::CallbackAction;
 
+mod pack;
 mod pattern;
 use pattern::{CapValue, MatchState, PatError};
 
 /// Coerce a string-or-number argument to a `LuaString`, mirroring
 /// `luaL_checkstring` (numbers are accepted and stringified).
-fn check_str<'gc>(
+pub(super) fn check_str<'gc>(
     ctx: Context<'gc>,
     v: Value<'gc>,
     fname: &str,
@@ -43,7 +44,7 @@ fn check_str<'gc>(
 
 /// Lua's `posrelat`: translate a possibly-negative 1-based string position into
 /// an absolute 1-based position (negatives count from the end; 0 stays 0).
-fn posrelat(pos: i64, len: usize) -> i64 {
+pub(super) fn posrelat(pos: i64, len: usize) -> i64 {
     if pos >= 0 {
         pos
     } else if pos.unsigned_abs() > len as u64 {
@@ -65,12 +66,12 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         ("len", lua_len),
         ("lower", lua_lower),
         ("match", lua_match),
-        ("pack", lua_pack),
-        ("packsize", lua_packsize),
+        ("pack", pack::lua_pack),
+        ("packsize", pack::lua_packsize),
         ("rep", lua_rep),
         ("reverse", lua_reverse),
         ("sub", lua_sub),
-        ("unpack", lua_unpack),
+        ("unpack", pack::lua_unpack),
         ("upper", lua_upper),
     ];
 
@@ -1553,20 +1554,6 @@ fn lua_match<'gc>(
     Ok(CallbackAction::Return)
 }
 
-fn lua_pack<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
-}
-
-fn lua_packsize<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
-}
-
 /// `rep(s, n [, sep])` — `s` repeated `n` times, with `sep` between copies.
 /// `n <= 0` yields the empty string.
 fn lua_rep<'gc>(
@@ -1655,13 +1642,6 @@ fn lua_sub<'gc>(
     };
     stack.replace(&[Value::string(result)]);
     Ok(CallbackAction::Return)
-}
-
-fn lua_unpack<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
 }
 
 /// `upper(s)` — ASCII-uppercased copy of `s` (C locale).
