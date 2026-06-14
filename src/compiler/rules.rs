@@ -1894,12 +1894,21 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
     if has_values {
         for (i, expr) in values.into_iter().enumerate() {
             let want = RegisterIndex(value_base + i as u8);
-            let got = compile_expr_to_reg(ctx, expr, Some(want))?;
+            let got = compile_expr_to_reg(ctx, expr, None)?;
             if got != want {
+                // Bare local/upvalue (or a mid-stack short-circuit result):
+                // reclaim any leaked temps, reserve the value slot so the
+                // nil-pad loop below can't overwrite it, then MOVE down.
+                ctx.chunk.freereg = want.0;
+                let slot = ctx.reserve_reg()?;
+                debug_assert_eq!(slot.0, want.0);
                 ctx.emit(Instruction::MOVE {
                     dst: want.0,
                     src: got.0,
                 });
+            } else if ctx.chunk.freereg > want.0 + 1 {
+                // Landed at `want` but leaked temps above; drop them.
+                ctx.chunk.freereg = want.0 + 1;
             }
         }
         // Pad with nil for any names beyond the supplied values.

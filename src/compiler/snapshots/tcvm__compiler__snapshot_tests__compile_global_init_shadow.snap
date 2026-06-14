@@ -1,0 +1,38 @@
+---
+source: src/compiler/snapshot_tests.rs
+expression: output
+---
+; function (params=0, vararg=true, stack=5, upvalues=1)
+; constants:
+;   K0 = "P"
+;   K1 = "Q"
+;   K2 = "p"
+;   K3 = "q"
+;   K4 = "print"
+;   K5 = "a"
+;   K6 = "b"
+;   K7 = "A"
+;   K8 = "B"
+; upvalues:
+;   U0 = local R0
+; code:
+0000  VARARGPREP      fixed=0
+0001  LOAD            R0 K0  ; "P"
+0002  LOAD            R1 K1  ; "Q"
+0003  MOVE            R2 R0
+0004  MOVE            R3 R1
+0005  GETTABUP        R4 U0 K2  ; "p"
+0006  ERRNNIL         R4 name=K2
+0007  SETTABUP        R2 U0 K2  ; "p"
+0008  GETTABUP        R4 U0 K3  ; "q"
+0009  ERRNNIL         R4 name=K3
+0010  SETTABUP        R3 U0 K3  ; "q"
+0011  GETTABUP        R2 U0 K4  ; "print"
+0012  GETTABUP        R3 U0 K2  ; "p"
+0013  GETTABUP        R4 U0 K3  ; "q"
+0014  CALL            R2 args=3 ret=1
+0015  LOAD            R2 K7  ; "A"
+0016  LOAD            R3 K8  ; "B"
+0017  SETTABUP        R2 U0 K5  ; "a"
+0018  SETTABUP        R3 U0 K6  ; "b"
+0019  RETURN          R0 count=1
