@@ -151,3 +151,5 @@ test!(
 test!(method_call, "test-files/method_call.lua");
 test!(not_andor, "test-files/not_andor.lua");
 test!(jmp_elim, "test-files/jmp_elim.lua");
+test!(if_empty_nested, "test-files/if_empty_nested.lua");
+test!(if_empty_goto, "test-files/if_empty_goto.lua");

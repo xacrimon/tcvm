@@ -1,0 +1,14 @@
+---
+source: src/compiler/snapshot_tests.rs
+expression: output
+---
+; function (params=0, vararg=true, stack=1, upvalues=1)
+; constants:
+;   K0 = nil
+; upvalues:
+;   U0 = local R0
+; code:
+0000  VARARGPREP      fixed=0
+0001  LOAD            R0 K0  ; nil
+0002  JMP             +0
+0003  RETURN          R0 count=1
