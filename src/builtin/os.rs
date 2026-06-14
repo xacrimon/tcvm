@@ -85,8 +85,7 @@ pub fn load<'gc>(ctx: Context<'gc>) {
 }
 
 /// `clock()` — seconds of program runtime as a float. Approximated by
-/// wall-clock elapsed since first call; TODO(#27): use real per-process CPU
-/// time (no portable `std` API today).
+/// wall-clock elapsed since first call.
 fn lua_clock<'gc>(
     _nctx: NativeContext<'gc, '_>,
     mut stack: Stack<'gc, '_>,
@@ -154,6 +153,7 @@ fn lua_exit<'gc>(
     };
     use std::io::Write;
     let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
     std::process::exit(code);
 }
 
@@ -207,10 +207,10 @@ fn lua_rename<'gc>(
 }
 
 fn lua_setlocale<'gc>(
-    _ctx: NativeContext<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    Err(Error::from_str(nctx.ctx, "os.setlocale is not implemented"))
 }
 
 /// `time([table])` — with no argument, the current Unix time as an integer.

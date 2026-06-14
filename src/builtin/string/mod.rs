@@ -141,10 +141,10 @@ fn lua_char<'gc>(
 }
 
 fn lua_dump<'gc>(
-    _ctx: NativeContext<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    Err(Error::from_str(nctx.ctx, "string.dump is not implemented"))
 }
 
 // ---------- pattern matching: shared helpers ----------
