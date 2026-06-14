@@ -611,9 +611,20 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                 !self.chunk.jump_patches.iter().any(|&(idx, _)| idx >= j - 1),
                 "no-op jump elision would orphan a pending jump_patch"
             );
+            // Only a *live* label — one a jump_patch resolves at assemble time
+            // — can be orphaned; dead labels (e.g. the unused end_label of an
+            // empty `if ... then end` with no else) are never read. A live
+            // target at exactly `j - 1` is fine: it slides forward onto the
+            // next emitted instruction. A live target past `j - 1` would point
+            // into the elided pair, which can't happen because labels resolve
+            // to statement boundaries, never between a condition's TEST and JMP.
             debug_assert!(
-                !self.chunk.labels.iter().any(|&target| target >= j - 1),
-                "no-op jump elision would orphan a label target"
+                !self
+                    .chunk
+                    .jump_patches
+                    .iter()
+                    .any(|&(_, lbl)| self.chunk.labels[lbl as usize] > j - 1),
+                "no-op jump elision would orphan a live jump target"
             );
             self.chunk.tape.truncate(j - 1);
             list.jumps.remove(pos);
