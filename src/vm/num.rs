@@ -23,6 +23,14 @@ pub fn exact_float_to_int(f: f64) -> Option<i64> {
 #[inline(always)]
 pub fn op_arith<'gc, Op: ArithOp>(lhs: Value, rhs: Value) -> Option<Value<'gc>> {
     if let (Some(li), Some(ri)) = (lhs.get_integer(), rhs.get_integer()) {
+        // Lua raises on integer `//`/`%` by zero; without this guard the
+        // `wrapping_div`/`wrapping_rem` in `Op::int` would panic. Returning
+        // `None` takes the handler's error path (integers carry no metamethod),
+        // matching every other arithmetic error. Float `/0` is unaffected — it
+        // yields inf/nan down in the float branch.
+        if Op::INT_ZERO_DIVISOR_RAISES && ri == 0 {
+            return None;
+        }
         return Some(Op::int(li, ri));
     }
 
@@ -46,6 +54,10 @@ pub fn op_arith<'gc, Op: ArithOp>(lhs: Value, rhs: Value) -> Option<Value<'gc>> 
 }
 
 pub trait ArithOp {
+    /// `//` and `%` set this so `op_arith` raises on an integer zero divisor
+    /// instead of computing (and panicking in `wrapping_div`/`wrapping_rem`).
+    const INT_ZERO_DIVISOR_RAISES: bool = false;
+
     fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc>;
     fn float<'gc>(lhs: f64, rhs: f64) -> Value<'gc>;
 }
@@ -95,6 +107,8 @@ impl ArithOp for Mul {
 pub struct Mod;
 
 impl ArithOp for Mod {
+    const INT_ZERO_DIVISOR_RAISES: bool = true;
+
     #[inline(always)]
     fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc> {
         let r = lhs.wrapping_rem(rhs);
@@ -151,6 +165,8 @@ impl ArithOp for Div {
 pub struct IDiv;
 
 impl ArithOp for IDiv {
+    const INT_ZERO_DIVISOR_RAISES: bool = true;
+
     #[inline(always)]
     fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc> {
         let q = lhs.wrapping_div(rhs);
