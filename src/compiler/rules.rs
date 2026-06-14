@@ -174,6 +174,12 @@ enum VarKind {
     /// `args.id` lower to `VARARGGET`; any other use (`local b = args`) or
     /// upvalue capture forces materialization (see [`VarargInfo`]).
     VarargParam,
+    /// A `global Name` declaration in scope (no register). Lives in the
+    /// lexical scope stack purely so it shadows an enclosing `local`/upvalue
+    /// of the same name with correct lexical recency (`manual.of:251-253`);
+    /// the name's kind/declared-ness is tracked on `Ctx::globals`. References
+    /// resolving to this fall through to global (`_ENV`) resolution.
+    Global,
 }
 
 impl VarKind {
@@ -1236,6 +1242,12 @@ impl<'gc, 'a> UpvalueResolver for Ctx<'gc, 'a> {
         if let Some(data) = self.resolve_local(name) {
             let kind = data.kind;
             let register = data.register;
+            // A `global` decl in scope here shadows anything more outer and
+            // is not a capturable local — the child reaches its own global
+            // resolution (`manual.of:251-253`).
+            if matches!(kind, VarKind::Global) {
+                return None;
+            }
             if let VarKind::Const(Some(v)) = kind {
                 return Some(ChildResolution::Const(v));
             }
@@ -1777,10 +1789,17 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
             .to_string();
 
         // Register first so the body can reference it as a declared
-        // global. List-form declarations (this included) void the
-        // implicit `global *` per `manual.of:225-228`.
+        // global (recursion goes through `_ENV`). List-form declarations
+        // (this included) void the implicit `global *` per `manual.of:225-228`.
         ctx.globals.void_preamble();
         ctx.globals.decls.insert(name.clone(), GlobalKind::Reg);
+        ctx.define(
+            name.clone(),
+            VariableData {
+                register: RegisterIndex(0),
+                kind: VarKind::Global,
+            },
+        )?;
 
         // Compile the closure into a register. `compile_func_body`
         // honours the dst hint, so `func_reg == target_reg` (asserted
@@ -1843,10 +1862,9 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         .collect();
     let values: Vec<Expr> = item.values().map(|v| v.collect()).unwrap_or_default();
 
-    // Register each name *before* compiling initializers so the
-    // initializer expressions see the new declared globals (and so a
-    // self-referential `global X = X` resolves X as declared, not
-    // implicit). Voids the implicit `global *`.
+    // Collect the declared names/kinds (reading the AST only). The
+    // declarations don't take effect until *after* the initializers are
+    // compiled — see below.
     let mut decl_kinds: Vec<(String, GlobalKind)> = Vec::with_capacity(targets.len());
     for target in &targets {
         let name = target
@@ -1862,47 +1880,65 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         };
         decl_kinds.push((name, kind));
     }
+
+    // Initializer form: lay the value expressions into a contiguous
+    // register block, padding with nil if fewer values than names.
+    // Compile the initializers BEFORE the declarations take effect — a
+    // declaration's scope begins at the *next* statement (`manual.of:245-248`),
+    // so the RHS of `global x = x` (or `global y = y + 1` shadowing an outer
+    // `y`) refers to the outer/undeclared name, not the one being declared.
+    let n_targets = decl_kinds.len();
+    let n_values = values.len();
+    let has_values = !values.is_empty();
+    let value_base = ctx.chunk.freereg;
+    if has_values {
+        for (i, expr) in values.into_iter().enumerate() {
+            let want = RegisterIndex(value_base + i as u8);
+            let got = compile_expr_to_reg(ctx, expr, Some(want))?;
+            if got != want {
+                ctx.emit(Instruction::MOVE {
+                    dst: want.0,
+                    src: got.0,
+                });
+            }
+        }
+        // Pad with nil for any names beyond the supplied values.
+        while ctx.chunk.freereg < value_base + n_targets as u8 {
+            let slot = ctx.reserve_reg()?;
+            let idx = ctx.alloc_constant(Value::nil())?;
+            ctx.emit(Instruction::LOAD { dst: slot.0, idx });
+        }
+        // Drop any extra values past `n_targets` — they were computed
+        // (side-effects preserved) but are unused.
+        if n_values > n_targets {
+            ctx.chunk.freereg = value_base + n_targets as u8;
+        }
+    }
+
+    // The declarations now take effect: void the implicit `global *`, record
+    // the declared names/kinds, and add lexical-scope markers so they shadow
+    // any enclosing local/upvalue of the same name (`manual.of:251-253`).
     ctx.globals.void_preamble();
     for (name, kind) in &decl_kinds {
         ctx.globals.decls.insert(name.clone(), *kind);
+        ctx.define(
+            name.clone(),
+            VariableData {
+                register: RegisterIndex(0),
+                kind: VarKind::Global,
+            },
+        )?;
     }
 
-    if values.is_empty() {
+    if !has_values {
         // No initializer: per `manual.of:1665`, "global variables are
         // left unchanged". Just register the names and emit nothing.
         return Ok(());
     }
 
-    // Initializer form: lay the value expressions into a contiguous
-    // register block, padding with nil if fewer values than names.
-    // Then per name, emit `GETTABUP+ERRNNIL+SETTABUP` taking the value
-    // from the corresponding slot. (Forward order — equivalent to
-    // upstream's reverse-on-unwind emission, just simpler to read.)
-    let n_targets = decl_kinds.len();
-    let n_values = values.len();
-    let value_base = ctx.chunk.freereg;
-    for (i, expr) in values.into_iter().enumerate() {
-        let want = RegisterIndex(value_base + i as u8);
-        let got = compile_expr_to_reg(ctx, expr, Some(want))?;
-        if got != want {
-            ctx.emit(Instruction::MOVE {
-                dst: want.0,
-                src: got.0,
-            });
-        }
-    }
-    // Pad with nil for any names beyond the supplied values.
-    while ctx.chunk.freereg < value_base + n_targets as u8 {
-        let slot = ctx.reserve_reg()?;
-        let idx = ctx.alloc_constant(Value::nil())?;
-        ctx.emit(Instruction::LOAD { dst: slot.0, idx });
-    }
-    // Drop any extra values past `n_targets` — they were computed
-    // (side-effects preserved) but are unused.
-    if n_values > n_targets {
-        ctx.chunk.freereg = value_base + n_targets as u8;
-    }
-
+    // Per name, emit `GETTABUP+ERRNNIL+SETTABUP` taking the value from the
+    // corresponding slot. (Forward order — equivalent to upstream's
+    // reverse-on-unwind emission, just simpler to read.)
     let env_idx = ctx
         .resolve_env_upvalue()
         .ok_or_else(|| ice("_ENV must resolve; main chunk pre-seeds it"))?;
@@ -2092,15 +2128,20 @@ fn compile_lvalue(
             let name = ident
                 .name(ctx.interner)
                 .ok_or_else(|| ice("ident without name"))?;
-            if let Some(data) = ctx.resolve_local(name) {
-                if data.kind.is_const() {
+            // A `global` decl in scope shadows an enclosing local/upvalue of
+            // the same name (manual.of:251-253), so it skips both local and
+            // upvalue resolution and falls through to global resolution.
+            let local = ctx.resolve_local(name).map(|d| (d.kind, d.register));
+            let shadow_global = matches!(local, Some((VarKind::Global, _)));
+            if let Some((kind, register)) = local.filter(|_| !shadow_global) {
+                if kind.is_const() {
                     return Err(err(
                         CompileErrorKind::Internal("assignment to const variable"),
                         LineNumber(0),
                     ));
                 }
-                Ok(Lvalue::Local { dst: data.register })
-            } else if let Some(resolution) = ctx.resolve_or_capture(name) {
+                Ok(Lvalue::Local { dst: register })
+            } else if !shadow_global && let Some(resolution) = ctx.resolve_or_capture(name) {
                 match resolution {
                     ResolvedName::Const(_) => Err(err(
                         CompileErrorKind::Internal("assignment to const variable"),
@@ -2209,6 +2250,9 @@ fn target_local_reg(ctx: &Ctx, target: &Expr) -> Option<u8> {
     };
     let name = ident.name(ctx.interner)?;
     let data = ctx.resolve_local(name)?;
+    if matches!(data.kind, VarKind::Global) {
+        return None;
+    }
     (!data.kind.is_const()).then_some(data.register.0)
 }
 
@@ -2244,7 +2288,7 @@ fn expr_reads(ctx: &Ctx, expr: &Expr, reg: u8) -> Result<bool, CompileError> {
         Expr::Ident(ident) => ident
             .name(ctx.interner)
             .and_then(|n| ctx.resolve_local(n))
-            .is_some_and(|d| d.register.0 == reg),
+            .is_some_and(|d| !matches!(d.kind, VarKind::Global) && d.register.0 == reg),
         Expr::PrefixOp(p) => any(p.rhs())?,
         Expr::BinaryOp(b) => {
             let skip_rhs = matches!(
@@ -2484,9 +2528,12 @@ fn compile_expr_ident(
     // as a const expdesc so enclosing operators can fold against it
     // without ever loading from the local's register. Plain locals (and
     // const-locals whose initializer didn't fold) return their register.
-    if let Some(data) = ctx.resolve_local(name) {
-        let kind = data.kind;
-        let register = data.register;
+    // A `global` decl in scope shadows an enclosing local/upvalue of the
+    // same name (manual.of:251-253); such a reference skips both local and
+    // upvalue resolution and falls through to global resolution below.
+    let local = ctx.resolve_local(name).map(|d| (d.kind, d.register));
+    let shadow_global = matches!(local, Some((VarKind::Global, _)));
+    if let Some((kind, register)) = local.filter(|_| !shadow_global) {
         if let VarKind::Const(Some(v)) = kind {
             return Ok(v.to_expr_desc());
         }
@@ -2506,7 +2553,7 @@ fn compile_expr_ident(
     // bypassing upvalue registration so the resulting prototype carries
     // no descriptor for it (matches Lua 5.5: const refs across function
     // boundaries don't appear in the inner function's upvalue list).
-    if let Some(resolution) = ctx.resolve_or_capture(name) {
+    if !shadow_global && let Some(resolution) = ctx.resolve_or_capture(name) {
         match resolution {
             ResolvedName::Const(v) => return Ok(v.to_expr_desc()),
             ResolvedName::Upvalue(idx) => {
