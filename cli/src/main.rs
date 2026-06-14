@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use tcvm::env::{LuaString, Table, Value};
-use tcvm::{Executor, Lua, RuntimeError, format_prototype};
+use tcvm::{Executor, LoadError, Lua, RuntimeError, format_prototype};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -18,6 +18,13 @@ struct Args {
     script_args: Vec<String>,
 }
 
+/// Print a clean diagnostic to stderr and exit with failure — used for
+/// load/compile errors so a Lua source error doesn't surface as a panic.
+fn die(e: &dyn std::fmt::Display) -> ! {
+    eprintln!("tcvm: {e}");
+    std::process::exit(1);
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -28,11 +35,14 @@ fn main() {
 
     if args.list {
         let listing = lua.enter(|ctx| {
-            let chunk = ctx.load(&source, Some("test")).unwrap();
+            let chunk = ctx.load(&source, Some("test"))?;
             let closure = chunk.as_lua().expect("loaded chunk must be a Lua closure");
-            format_prototype(&closure.proto)
+            Ok::<_, LoadError>(format_prototype(&closure.proto))
         });
-        print!("{listing}");
+        match listing {
+            Ok(listing) => print!("{listing}"),
+            Err(e) => die(&e),
+        }
         return;
     }
 
@@ -53,10 +63,14 @@ fn main() {
     });
 
     let ex = lua.enter(|ctx| {
-        let chunk = ctx.load(&source, Some("test")).unwrap();
+        let chunk = ctx.load(&source, Some("test"))?;
         let executor = Executor::start(ctx, chunk, ());
-        ctx.stash(executor)
+        Ok::<_, LoadError>(ctx.stash(executor))
     });
+    let ex = match ex {
+        Ok(ex) => ex,
+        Err(e) => die(&e),
+    };
 
     if let Err(e) = lua.execute::<()>(&ex) {
         match e {
