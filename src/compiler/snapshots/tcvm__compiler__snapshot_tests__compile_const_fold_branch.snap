@@ -1,9 +1,9 @@
 ---
 source: src/compiler/snapshot_tests.rs
-assertion_line: 132
+assertion_line: 139
 expression: output
 ---
-; function (params=0, vararg=true, stack=2, upvalues=1)
+; function (params=0, vararg=true, stack=1, upvalues=1)
 ; constants:
 ;   K0 = "a"
 ;   K1 = 1
@@ -23,10 +23,10 @@ expression: output
 0003  LOAD            R0 K2  ; false
 0004  TEST            R0 inv=false
 0005  JMP             +2
-0006  LOAD            R1 K4  ; 2
-0007  SETTABUP        R1 U0 K3  ; "b"
-0008  LOAD            R1 K6  ; 5
-0009  SETTABUP        R1 U0 K5  ; "c"
-0010  LOAD            R1 K8  ; 7
-0011  SETTABUP        R1 U0 K7  ; "d"
+0006  LOAD            R0 K4  ; 2
+0007  SETTABUP        R0 U0 K3  ; "b"
+0008  LOAD            R0 K6  ; 5
+0009  SETTABUP        R0 U0 K5  ; "c"
+0010  LOAD            R0 K8  ; 7
+0011  SETTABUP        R0 U0 K7  ; "d"
 0012  RETURN          R0 count=1

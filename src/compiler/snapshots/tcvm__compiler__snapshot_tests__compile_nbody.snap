@@ -1,5 +1,6 @@
 ---
 source: src/compiler/snapshot_tests.rs
+assertion_line: 78
 expression: output
 ---
 ; function (params=0, vararg=true, stack=23, upvalues=1)
@@ -164,61 +165,60 @@ expression: output
 0102  GETTABUP        R13 U0 K42  ; "arg"
 0103  TEST            R13 inv=false
 0104  JMP             +3
-0105  GETTABUP        R14 U0 K42  ; "arg"
-0106  LOAD            R15 K43  ; 1
-0107  GETTABLE        R13 R14 R15
+0105  GETTABUP        R13 U0 K42  ; "arg"
+0106  LOAD            R14 K43  ; 1
+0107  GETTABLE        R13 R13 R14
 0108  CALL            R12 args=2 ret=2
-0109  TESTSET         R13 R12 inv=false
+0109  TEST            R12 inv=true
 0110  JMP             +1
-0111  LOAD            R13 K44  ; 1000
-0112  MOVE            R12 R13
-0113  NEWTABLE        R13
-0114  MOVE            R14 R8
-0115  MOVE            R15 R4
-0116  MOVE            R16 R5
-0117  MOVE            R17 R6
-0118  MOVE            R18 R7
-0119  SETLIST         R13 count=5 offset=0
-0120  LEN             R14 R13
-0121  MOVE            R15 R11
-0122  MOVE            R16 R13
-0123  MOVE            R17 R14
-0124  CALL            R15 args=3 ret=1
-0125  GETTABUP        R15 U0 K45  ; "io"
-0126  GETFIELD        R15 R15 K46  ; "write"
-0127  GETTABUP        R16 U0 K47  ; "string"
-0128  GETFIELD        R16 R16 K48  ; "format"
-0129  LOAD            R17 K49  ; "%0.9f"
-0130  MOVE            R18 R10
-0131  MOVE            R19 R13
-0132  MOVE            R20 R14
-0133  CALL            R18 args=3 ret=0
-0134  CALL            R16 args=0 ret=2
-0135  LOAD            R17 K50  ; "\n"
-0136  CALL            R15 args=3 ret=1
-0137  LOAD            R15 K43  ; 1
-0138  MOVE            R16 R12
-0139  LOAD            R17 K43  ; 1
-0140  FORPREP         R15 +6
-0141  MOVE            R19 R9
-0142  MOVE            R20 R13
-0143  MOVE            R21 R14
-0144  LOAD            R22 K51  ; 0.01
-0145  CALL            R19 args=4 ret=1
-0146  FORLOOP         R15 -6
-0147  GETTABUP        R15 U0 K45  ; "io"
-0148  GETFIELD        R15 R15 K46  ; "write"
-0149  GETTABUP        R16 U0 K47  ; "string"
-0150  GETFIELD        R16 R16 K48  ; "format"
-0151  LOAD            R17 K49  ; "%0.9f"
-0152  MOVE            R18 R10
-0153  MOVE            R19 R13
-0154  MOVE            R20 R14
-0155  CALL            R18 args=3 ret=0
-0156  CALL            R16 args=0 ret=2
-0157  LOAD            R17 K50  ; "\n"
-0158  CALL            R15 args=3 ret=1
-0159  RETURN          R0 count=1
+0111  LOAD            R12 K44  ; 1000
+0112  NEWTABLE        R13
+0113  MOVE            R14 R8
+0114  MOVE            R15 R4
+0115  MOVE            R16 R5
+0116  MOVE            R17 R6
+0117  MOVE            R18 R7
+0118  SETLIST         R13 count=5 offset=0
+0119  LEN             R14 R13
+0120  MOVE            R15 R11
+0121  MOVE            R16 R13
+0122  MOVE            R17 R14
+0123  CALL            R15 args=3 ret=1
+0124  GETTABUP        R15 U0 K45  ; "io"
+0125  GETFIELD        R15 R15 K46  ; "write"
+0126  GETTABUP        R16 U0 K47  ; "string"
+0127  GETFIELD        R16 R16 K48  ; "format"
+0128  LOAD            R17 K49  ; "%0.9f"
+0129  MOVE            R18 R10
+0130  MOVE            R19 R13
+0131  MOVE            R20 R14
+0132  CALL            R18 args=3 ret=0
+0133  CALL            R16 args=0 ret=2
+0134  LOAD            R17 K50  ; "\n"
+0135  CALL            R15 args=3 ret=1
+0136  LOAD            R15 K43  ; 1
+0137  MOVE            R16 R12
+0138  LOAD            R17 K43  ; 1
+0139  FORPREP         R15 +6
+0140  MOVE            R19 R9
+0141  MOVE            R20 R13
+0142  MOVE            R21 R14
+0143  LOAD            R22 K51  ; 0.01
+0144  CALL            R19 args=4 ret=1
+0145  FORLOOP         R15 -6
+0146  GETTABUP        R15 U0 K45  ; "io"
+0147  GETFIELD        R15 R15 K46  ; "write"
+0148  GETTABUP        R16 U0 K47  ; "string"
+0149  GETFIELD        R16 R16 K48  ; "format"
+0150  LOAD            R17 K49  ; "%0.9f"
+0151  MOVE            R18 R10
+0152  MOVE            R19 R13
+0153  MOVE            R20 R14
+0154  CALL            R18 args=3 ret=0
+0155  CALL            R16 args=0 ret=2
+0156  LOAD            R17 K50  ; "\n"
+0157  CALL            R15 args=3 ret=1
+0158  RETURN          R0 count=1
 
 ; prototype 0:
   ; function (params=3, vararg=false, stack=29, upvalues=1)

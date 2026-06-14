@@ -1,8 +1,9 @@
 ---
 source: src/compiler/snapshot_tests.rs
+assertion_line: 152
 expression: output
 ---
-; function (params=0, vararg=true, stack=14, upvalues=1)
+; function (params=0, vararg=true, stack=13, upvalues=1)
 ; constants:
 ;   K0 = 1
 ;   K1 = 2
@@ -56,11 +57,11 @@ expression: output
 0040  NOT             R8 R1
 0041  TEST            R8 inv=false
 0042  JMP             +2
-0043  LOAD            R9 K5  ; 0
-0044  RETURN          R9 count=2
-0045  MOVE            R9 R3
-0046  MOVE            R10 R4
-0047  MOVE            R11 R5
-0048  MOVE            R12 R6
-0049  MOVE            R13 R7
-0050  RETURN          R9 count=6
+0043  LOAD            R8 K5  ; 0
+0044  RETURN          R8 count=2
+0045  MOVE            R8 R3
+0046  MOVE            R9 R4
+0047  MOVE            R10 R5
+0048  MOVE            R11 R6
+0049  MOVE            R12 R7
+0050  RETURN          R8 count=6

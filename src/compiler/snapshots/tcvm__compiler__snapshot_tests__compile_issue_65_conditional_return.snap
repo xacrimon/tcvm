@@ -1,9 +1,9 @@
 ---
 source: src/compiler/snapshot_tests.rs
-assertion_line: 72
+assertion_line: 71
 expression: output
 ---
-; function (params=0, vararg=true, stack=4, upvalues=1)
+; function (params=0, vararg=true, stack=3, upvalues=1)
 ; constants:
 ;   K0 = 1
 ; upvalues:
@@ -17,8 +17,8 @@ expression: output
 0005  NOT             R2 R1
 0006  TEST            R2 inv=false
 0007  JMP             +2
-0008  LOAD            R3 K0  ; 1
-0009  RETURN          R3 count=2
+0008  LOAD            R2 K0  ; 1
+0009  RETURN          R2 count=2
 0010  RETURN          R0 count=1
 
 ; prototype 0:
