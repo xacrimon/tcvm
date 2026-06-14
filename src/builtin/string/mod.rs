@@ -1,11 +1,22 @@
+use std::cell::RefCell;
+
 use crate::Context;
 use crate::builtin::util;
 // `%d`/`%f` argument coercion reuses the shared `util` helpers so the
 // integer-representation and numeric-string rules (including `inf`/`nan`
 // rejection) match `tonumber`/`math.*` and don't drift.
 use crate::builtin::util::{to_integer, to_number as to_float};
-use crate::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Table, Value};
+use crate::env::{
+    Error, Function, LuaString, MetamethodBits, NativeContext, NativeFn, Stack, Table, Userdata,
+    Value,
+};
+use crate::lua::{StashedError, StashedFunction, StashedTable, StashedValue};
+use crate::vm::async_sequence::{AsyncSequence, SequenceReturn, async_sequence};
+use crate::vm::interp::{IndexChain, walk_index_chain};
 use crate::vm::sequence::CallbackAction;
+
+mod pattern;
+use pattern::{CapValue, MatchState, PatError};
 
 /// Coerce a string-or-number argument to a `LuaString`, mirroring
 /// `luaL_checkstring` (numbers are accepted and stringified).
@@ -136,11 +147,101 @@ fn lua_dump<'gc>(
     todo!()
 }
 
+// ---------- pattern matching: shared helpers ----------
+
+/// Turn a `PatError` from the matcher into a Lua error at the call boundary.
+fn pat_err<'gc>(ctx: Context<'gc>, e: PatError) -> Error<'gc> {
+    Error::from_str(ctx, &e.message())
+}
+
+/// Build a `Value` from a resolved capture (substring or position).
+fn cap_to_value<'gc>(ctx: Context<'gc>, src: &[u8], cv: CapValue) -> Value<'gc> {
+    match cv {
+        CapValue::Str { start, end } => Value::string(LuaString::new(ctx, &src[start..end])),
+        CapValue::Pos(n) => Value::integer(n),
+    }
+}
+
+/// `posrelatI(pos, len) - 1`: the 0-based start index for `find`/`match`/
+/// `gmatch`. Returns `None` when the requested start is past the end of the
+/// string (`init > len`), which the callers treat as "no match" (or, for
+/// `gmatch`, "iterate nothing").
+fn init_pos(pos: i64, len: usize) -> Option<usize> {
+    // Mirrors `posrelatI`: positive is absolute, 0 -> 1, very negative clips to
+    // 1, otherwise counts from the end. The i128 compare avoids any overflow.
+    let one_based: usize = if pos > 0 {
+        pos as usize
+    } else if pos == 0 || (pos as i128) < -(len as i128) {
+        1 // 0 -> 1; anything more negative than -len clips to 1
+    } else {
+        (len as i64 + pos + 1) as usize // count from the end
+    };
+    let init = one_based - 1;
+    (init <= len).then_some(init)
+}
+
+/// `find(s, pattern [, init [, plain]])` — locate `pattern` in `s` from `init`
+/// (1-based, negatives from the end). Returns the 1-based start/end indices
+/// plus any captures, or nil. A `plain` flag — or a pattern with no magic
+/// characters — switches to a plain substring search.
 fn lua_find<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    let ctx = nctx.ctx;
+    let s = check_str(ctx, stack.get(0), "find", 1)?;
+    let p = check_str(ctx, stack.get(1), "find", 2)?;
+    let src = s.as_bytes();
+    let pat = p.as_bytes();
+
+    let init_arg = stack.get(2);
+    let init_raw = if init_arg.is_nil() {
+        1
+    } else {
+        util::check_integer(ctx, init_arg, "find", 3)?
+    };
+    let Some(init) = init_pos(init_raw, src.len()) else {
+        stack.replace(&[Value::nil()]);
+        return Ok(CallbackAction::Return);
+    };
+
+    // Plain search on explicit request or a pattern with no magic chars.
+    if !stack.get(3).is_falsy() || pattern::nospecials(pat) {
+        match pattern::plain_find(&src[init..], pat) {
+            Some(off) => {
+                let start = init + off;
+                stack.replace(&[
+                    Value::integer(start as i64 + 1),
+                    Value::integer((start + pat.len()) as i64),
+                ]);
+            }
+            None => stack.replace(&[Value::nil()]),
+        }
+        return Ok(CallbackAction::Return);
+    }
+
+    let anchor = pat.first() == Some(&b'^');
+    let body = if anchor { &pat[1..] } else { pat };
+    let mut ms = MatchState::new(src, body);
+    let mut s1 = init;
+    loop {
+        if let Some(e) = ms.match_at(s1).map_err(|e| pat_err(ctx, e))? {
+            // start, end, then the explicit captures (no whole-match fallback).
+            let mut out = vec![Value::integer(s1 as i64 + 1), Value::integer(e as i64)];
+            for i in 0..ms.num_captures(false) {
+                let cv = ms.get_onecapture(i, s1, e).map_err(|e| pat_err(ctx, e))?;
+                out.push(cap_to_value(ctx, src, cv));
+            }
+            stack.replace(&out);
+            return Ok(CallbackAction::Return);
+        }
+        if anchor || s1 >= src.len() {
+            break;
+        }
+        s1 += 1;
+    }
+    stack.replace(&[Value::nil()]);
+    Ok(CallbackAction::Return)
 }
 
 fn lua_format<'gc>(
@@ -889,18 +990,498 @@ fn apply_width(out: &mut Vec<u8>, spec: &FmtSpec, sign: &[u8], prefix: &[u8], bo
     }
 }
 
-fn lua_gmatch<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+/// Iterator state for `gmatch`, owned by the closure's userdata upvalue. The
+/// subject and pattern bytes are copied in so the closure needn't keep the
+/// argument strings rooted (mirroring PUC's `lua_settop` + userdata).
+struct GmatchState {
+    src: Vec<u8>,
+    pat: Vec<u8>,
+    /// Next subject byte to try matching from.
+    pos: usize,
+    /// End of the previous match — empty matches at this exact spot are
+    /// skipped so iteration always advances (PUC's `e != lastmatch`).
+    lastmatch: Option<usize>,
 }
 
-fn lua_gsub<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+/// `gmatch(s, pattern [, init])` — return an iterator that, on each call,
+/// yields the captures of the next match (whole match if no captures). Unlike
+/// `find`/`match`/`gsub`, a leading `^` is *not* an anchor here — it matches a
+/// literal `^` — because the iterator never strips it.
+fn lua_gmatch<'gc>(
+    nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    let ctx = nctx.ctx;
+    let s = check_str(ctx, stack.get(0), "gmatch", 1)?;
+    let p = check_str(ctx, stack.get(1), "gmatch", 2)?;
+    let init_arg = stack.get(2);
+    let init_raw = if init_arg.is_nil() {
+        1
+    } else {
+        util::check_integer(ctx, init_arg, "gmatch", 3)?
+    };
+    // `init > len` clamps to len+1 (iterate nothing) rather than erroring.
+    let pos = init_pos(init_raw, s.len()).unwrap_or(s.len() + 1);
+    let state = GmatchState {
+        src: s.as_bytes().to_vec(),
+        pat: p.as_bytes().to_vec(),
+        pos,
+        lastmatch: None,
+    };
+    let ud = Userdata::new(ctx.mutation(), RefCell::new(state), 0);
+    let iter = Function::new_native(ctx.mutation(), gmatch_aux, Box::new([Value::userdata(ud)]));
+    stack.replace(&[Value::function(iter)]);
+    Ok(CallbackAction::Return)
+}
+
+/// One step of a `gmatch` iterator: advance from the stored position to the
+/// next match and return its captures, or nothing when exhausted.
+fn gmatch_aux<'gc>(
+    nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
+    let ctx = nctx.ctx;
+    let ud = nctx.upvalues[0]
+        .get_userdata()
+        .expect("gmatch iterator upvalue must be a userdata");
+    let result = ud
+        .with_data::<RefCell<GmatchState>, _>(|cell| {
+            let mut st = cell.borrow_mut();
+            let st = &mut *st;
+            let mut ms = MatchState::new(&st.src, &st.pat);
+            let mut src_pos = st.pos;
+            loop {
+                if src_pos > st.src.len() {
+                    return Ok(None);
+                }
+                match ms.match_at(src_pos)? {
+                    Some(e) if Some(e) != st.lastmatch => {
+                        let n = ms.num_captures(true);
+                        let mut caps = Vec::with_capacity(n);
+                        for i in 0..n {
+                            let cv = ms.get_onecapture(i, src_pos, e)?;
+                            caps.push(cap_to_value(ctx, &st.src, cv));
+                        }
+                        // `ms` is unused past here, so its borrow of `st.src`/
+                        // `st.pat` ends and these field writes are allowed.
+                        st.pos = e;
+                        st.lastmatch = Some(e);
+                        return Ok(Some(caps));
+                    }
+                    _ => {}
+                }
+                src_pos += 1;
+            }
+        })
+        .expect("gmatch userdata payload type mismatch");
+    match result {
+        Err(e) => Err(pat_err(ctx, e)),
+        Ok(None) => {
+            stack.replace(&[]);
+            Ok(CallbackAction::Return)
+        }
+        Ok(Some(caps)) => {
+            stack.replace(&caps);
+            Ok(CallbackAction::Return)
+        }
+    }
+}
+
+/// `gsub(s, pattern, repl [, n])` — replace up to `n` (default: all)
+/// non-overlapping matches of `pattern` in `s`. `repl` may be a template
+/// string (`%0`–`%9`, `%%`), a number, a table (indexed by the first capture,
+/// honoring `__index`), or a function (called with the captures). Returns the
+/// result string and the substitution count.
+///
+/// A string/number `repl` resolves entirely in Rust (a synchronous return). A
+/// table/function `repl` re-enters the interpreter per match, so the work runs
+/// as an async `Sequence` (the same mechanism `table.sort` uses for its
+/// comparator).
+fn lua_gsub<'gc>(
+    nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
+    let ctx = nctx.ctx;
+    let s = check_str(ctx, stack.get(0), "gsub", 1)?;
+    let p = check_str(ctx, stack.get(1), "gsub", 2)?;
+    let repl = stack.get(2);
+    let n_arg = stack.get(3);
+    // Default cap is `len+1`: at most one match per position plus the empty
+    // match past the end, so this never truncates a real "replace all".
+    let max_n = if n_arg.is_nil() {
+        s.len() as i64 + 1
+    } else {
+        util::check_integer(ctx, n_arg, "gsub", 4)?
+    };
+
+    // Fast path: string/number replacement template, fully synchronous.
+    if let Some(template) = repl_template(ctx, repl) {
+        let (result, count) = gsub_string(ctx, s.as_bytes(), p.as_bytes(), &template, max_n)?;
+        stack.replace(&[result, Value::integer(count)]);
+        return Ok(CallbackAction::Return);
+    }
+
+    // Table/function replacement: re-enters the VM, so drive a sequence.
+    let repl_fn = repl.get_function();
+    let repl_tbl = repl.get_table();
+    if repl_fn.is_none() && repl_tbl.is_none() {
+        return Err(Error::from_str(
+            ctx,
+            &format!(
+                "bad argument #3 to 'gsub' (string/function/table expected, got {})",
+                repl.type_name()
+            ),
+        ));
+    }
+
+    let mc = ctx.mutation();
+    let src = s.as_bytes().to_vec();
+    let pat = p.as_bytes().to_vec();
+    let seq = async_sequence(mc, move |locals, seq| {
+        let repl = match (repl_fn, repl_tbl) {
+            (Some(f), _) => Repl::Func(locals.stash(mc, f)),
+            (_, Some(t)) => Repl::Table(locals.stash(mc, t)),
+            _ => unreachable!("repl kind validated above"),
+        };
+        async move {
+            let mut seq = seq;
+            let (result, count) = gsub_run(&mut seq, src, pat, repl, max_n).await?;
+            seq.enter(|_ctx, locals, _exec, mut stack| {
+                let result = locals.fetch(&result);
+                stack.replace(&[result, Value::integer(count)]);
+            });
+            Ok(SequenceReturn::Return)
+        }
+    });
+    Ok(CallbackAction::Sequence(seq))
+}
+
+/// The replacement template for a string/number `repl`, or `None` for other
+/// types. Numbers are stringified (as `lua_tolstring` would).
+fn repl_template<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> Option<Vec<u8>> {
+    if let Some(s) = v.get_string() {
+        Some(s.as_bytes().to_vec())
+    } else if v.get_integer().is_some() || v.get_float().is_some() {
+        Some(util::basic_tostring(ctx, v).as_bytes().to_vec())
+    } else {
+        None
+    }
+}
+
+/// Synchronous `gsub` for a template `repl`. Returns the result string and the
+/// substitution count. The result is freshly interned; because identical bytes
+/// intern to the same `LuaString`, an all-misses run still yields the original
+/// string object (so PUC's "return the original on no change" identity holds).
+fn gsub_string<'gc>(
+    ctx: Context<'gc>,
+    src: &[u8],
+    pat: &[u8],
+    template: &[u8],
+    max_n: i64,
+) -> Result<(Value<'gc>, i64), Error<'gc>> {
+    let anchor = pat.first() == Some(&b'^');
+    let body = if anchor { &pat[1..] } else { pat };
+    let mut ms = MatchState::new(src, body);
+    let mut out: Vec<u8> = Vec::new();
+    let mut pos = 0usize;
+    let mut lastmatch: Option<usize> = None;
+    let mut count: i64 = 0;
+    while count < max_n {
+        let m = ms.match_at(pos).map_err(|e| pat_err(ctx, e))?;
+        match m {
+            Some(e) if Some(e) != lastmatch => {
+                count += 1;
+                add_s(ctx, &mut out, &ms, src, pos, e, template)?;
+                pos = e;
+                lastmatch = Some(e);
+            }
+            _ => {
+                if pos < src.len() {
+                    out.push(src[pos]);
+                    pos += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        if anchor {
+            break;
+        }
+    }
+    out.extend_from_slice(&src[pos..]);
+    Ok((Value::string(LuaString::new(ctx, &out)), count))
+}
+
+/// Expand a replacement template (`add_s`) for the match `src[s..e]` into
+/// `out`: `%0` is the whole match, `%1`–`%9` the captures, `%%` a literal `%`;
+/// any other `%x` is an error.
+fn add_s<'gc>(
+    ctx: Context<'gc>,
+    out: &mut Vec<u8>,
+    ms: &MatchState,
+    src: &[u8],
+    s: usize,
+    e: usize,
+    template: &[u8],
+) -> Result<(), Error<'gc>> {
+    let invalid = || Error::from_str(ctx, "invalid use of '%' in replacement string");
+    let mut i = 0;
+    while i < template.len() {
+        let b = template[i];
+        if b != b'%' {
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let c = *template.get(i).ok_or_else(invalid)?;
+        i += 1;
+        if c == b'%' {
+            out.push(b'%');
+        } else if c == b'0' {
+            out.extend_from_slice(&src[s..e]);
+        } else if c.is_ascii_digit() {
+            match ms
+                .get_onecapture((c - b'1') as usize, s, e)
+                .map_err(|er| pat_err(ctx, er))?
+            {
+                CapValue::Str { start, end } => out.extend_from_slice(&src[start..end]),
+                CapValue::Pos(n) => util::push_int(out, n),
+            }
+        } else {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+/// Stashed table/function replacement target for the sequence path.
+enum Repl {
+    Func(StashedFunction),
+    Table(StashedTable),
+}
+
+/// A capture extracted into owned bytes (or a position) so it can outlive the
+/// transient `MatchState` borrow across an `.await`.
+enum OwnedCap {
+    Bytes(Vec<u8>),
+    Pos(i64),
+}
+
+impl OwnedCap {
+    fn to_value<'gc>(&self, ctx: Context<'gc>) -> Value<'gc> {
+        match self {
+            OwnedCap::Bytes(b) => Value::string(LuaString::new(ctx, b)),
+            OwnedCap::Pos(n) => Value::integer(*n),
+        }
+    }
+}
+
+/// What a single match's replacement resolves to.
+enum ReplResult {
+    /// Keep the original matched text (function/table returned nil/false).
+    Keep,
+    /// Substitute these bytes.
+    Bytes(Vec<u8>),
+}
+
+/// One iteration's matching decision, extracted synchronously so the borrow of
+/// the subject/pattern by `MatchState` never spans an `.await`.
+enum GsubStep {
+    /// A match ending at `e`; `whole` is the matched text and `caps` the
+    /// replacement arguments (all captures for a function, just the first for
+    /// a table).
+    Replace {
+        whole: Vec<u8>,
+        caps: Vec<OwnedCap>,
+        e: usize,
+    },
+    /// No match here: copy one subject byte and advance.
+    SkipChar,
+    /// End of subject: stop.
+    End,
+}
+
+/// Async `gsub` for a table/function `repl`. Mirrors `gsub_string`'s loop but
+/// resolves each replacement by re-entering the VM (`seq.call` for a function,
+/// a `__index`-honoring index for a table).
+async fn gsub_run(
+    seq: &mut AsyncSequence,
+    src: Vec<u8>,
+    pat: Vec<u8>,
+    repl: Repl,
+    max_n: i64,
+) -> Result<(StashedValue, i64), StashedError> {
+    let anchor = pat.first() == Some(&b'^');
+    let pat_off = if anchor { 1 } else { 0 };
+    let is_func = matches!(repl, Repl::Func(_));
+
+    let mut out: Vec<u8> = Vec::new();
+    let mut pos = 0usize;
+    let mut lastmatch: Option<usize> = None;
+    let mut count: i64 = 0;
+
+    while count < max_n {
+        // Synchronous matching block — `MatchState` lives and dies here, so its
+        // borrow of `src`/`pat` never crosses the awaits below.
+        let step: Result<GsubStep, PatError> = (|| {
+            let mut ms = MatchState::new(&src, &pat[pat_off..]);
+            match ms.match_at(pos)? {
+                Some(e) if Some(e) != lastmatch => {
+                    // Function: all captures as call args. Table: just the
+                    // first capture (whole match if there are no captures).
+                    let n = if is_func { ms.num_captures(true) } else { 1 };
+                    let mut caps = Vec::with_capacity(n);
+                    for i in 0..n {
+                        caps.push(match ms.get_onecapture(i, pos, e)? {
+                            CapValue::Str { start, end } => {
+                                OwnedCap::Bytes(src[start..end].to_vec())
+                            }
+                            CapValue::Pos(p) => OwnedCap::Pos(p),
+                        });
+                    }
+                    Ok(GsubStep::Replace {
+                        whole: src[pos..e].to_vec(),
+                        caps,
+                        e,
+                    })
+                }
+                _ => Ok(if pos < src.len() {
+                    GsubStep::SkipChar
+                } else {
+                    GsubStep::End
+                }),
+            }
+        })();
+
+        match step.map_err(|e| stash_pat_err(seq, e))? {
+            GsubStep::Replace { whole, caps, e } => {
+                count += 1;
+                let res = match &repl {
+                    Repl::Func(f) => call_func_repl(seq, f, &caps).await?,
+                    Repl::Table(t) => table_index_repl(seq, t, &caps[0]).await?,
+                };
+                match res {
+                    ReplResult::Keep => out.extend_from_slice(&whole),
+                    ReplResult::Bytes(b) => out.extend_from_slice(&b),
+                }
+                pos = e;
+                lastmatch = Some(e);
+            }
+            GsubStep::SkipChar => {
+                out.push(src[pos]);
+                pos += 1;
+            }
+            GsubStep::End => break,
+        }
+        if anchor {
+            break;
+        }
+    }
+    out.extend_from_slice(&src[pos..]);
+
+    let result = seq.enter(|ctx, locals, _exec, _stack| {
+        locals.stash(ctx.mutation(), Value::string(LuaString::new(ctx, &out)))
+    });
+    Ok((result, count))
+}
+
+/// Call a function `repl` with the captures as arguments and classify its
+/// first result.
+async fn call_func_repl(
+    seq: &mut AsyncSequence,
+    f: &StashedFunction,
+    caps: &[OwnedCap],
+) -> Result<ReplResult, StashedError> {
+    seq.enter(|ctx, _locals, _exec, mut stack| {
+        stack.clear();
+        for c in caps {
+            stack.push(c.to_value(ctx));
+        }
+    });
+    seq.call(f, 0).await?;
+    seq.try_enter(|ctx, _locals, _exec, stack| classify_repl_result(ctx, stack.get(0)))
+}
+
+/// Index a table `repl` by `key` (honoring `__index`, which may itself be a
+/// function requiring a call) and classify the result.
+async fn table_index_repl(
+    seq: &mut AsyncSequence,
+    t: &StashedTable,
+    key: &OwnedCap,
+) -> Result<ReplResult, StashedError> {
+    enum Plan {
+        Resolved(ReplResult),
+        CallIndex(StashedFunction),
+    }
+    let plan = seq.try_enter(|ctx, locals, _exec, mut stack| {
+        let tbl = locals.fetch(t);
+        let key_val = key.to_value(ctx);
+        let v = tbl.raw_get(key_val);
+        if !v.is_nil() {
+            return Ok(Plan::Resolved(classify_repl_result(ctx, v)?));
+        }
+        if !tbl.shape().has_mm(MetamethodBits::INDEX) {
+            return Ok(Plan::Resolved(ReplResult::Keep)); // nil -> keep original
+        }
+        // INDEX bit implies a metatable is present.
+        let mt = tbl
+            .metatable()
+            .expect("INDEX metamethod implies a metatable");
+        match walk_index_chain(Value::table(tbl), mt, key_val, ctx.symbols().mm_index) {
+            IndexChain::Resolved(rv) => Ok(Plan::Resolved(classify_repl_result(ctx, rv)?)),
+            IndexChain::Invoke { func, receiver } => match func.get_function() {
+                Some(f) => {
+                    stack.replace(&[receiver, key_val]);
+                    Ok(Plan::CallIndex(locals.stash(ctx.mutation(), f)))
+                }
+                // A non-function, non-table `__index` (e.g. a callable userdata
+                // with its own `__call`) is too exotic to drive here; calling a
+                // plain non-function would raise anyway.
+                None => Err(Error::from_str(
+                    ctx,
+                    &format!("attempt to call a {} value", func.type_name()),
+                )),
+            },
+            IndexChain::Exhausted => Err(Error::from_str(
+                ctx,
+                "'__index' chain too long; possible loop",
+            )),
+        }
+    })?;
+    match plan {
+        Plan::Resolved(r) => Ok(r),
+        Plan::CallIndex(f) => {
+            seq.call(&f, 0).await?;
+            seq.try_enter(|ctx, _locals, _exec, stack| classify_repl_result(ctx, stack.get(0)))
+        }
+    }
+}
+
+/// Classify a function/table replacement result: nil/false keeps the original;
+/// a string or number substitutes; anything else is an error (matching PUC's
+/// `lua_isstring` test, which accepts numbers).
+fn classify_repl_result<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> Result<ReplResult, Error<'gc>> {
+    if v.is_falsy() {
+        Ok(ReplResult::Keep)
+    } else if let Some(s) = v.get_string() {
+        Ok(ReplResult::Bytes(s.as_bytes().to_vec()))
+    } else if v.get_integer().is_some() || v.get_float().is_some() {
+        Ok(ReplResult::Bytes(
+            util::basic_tostring(ctx, v).as_bytes().to_vec(),
+        ))
+    } else {
+        Err(Error::from_str(
+            ctx,
+            &format!("invalid replacement value (a {})", v.type_name()),
+        ))
+    }
+}
+
+/// Convert a matcher `PatError` into a `StashedError` from inside a sequence.
+fn stash_pat_err(seq: &mut AsyncSequence, e: PatError) -> StashedError {
+    seq.try_enter(|ctx, _locals, _exec, _stack| Result::<(), _>::Err(pat_err(ctx, e)))
+        .unwrap_err()
 }
 
 /// `len(s)` — number of bytes in `s`.
@@ -924,11 +1505,52 @@ fn lua_lower<'gc>(
     Ok(CallbackAction::Return)
 }
 
+/// `match(s, pattern [, init])` — return the captures of the first match of
+/// `pattern` in `s` from `init`, or the whole match if the pattern has no
+/// captures; nil if there is no match.
 fn lua_match<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    let ctx = nctx.ctx;
+    let s = check_str(ctx, stack.get(0), "match", 1)?;
+    let p = check_str(ctx, stack.get(1), "match", 2)?;
+    let src = s.as_bytes();
+    let pat = p.as_bytes();
+
+    let init_arg = stack.get(2);
+    let init_raw = if init_arg.is_nil() {
+        1
+    } else {
+        util::check_integer(ctx, init_arg, "match", 3)?
+    };
+    let Some(init) = init_pos(init_raw, src.len()) else {
+        stack.replace(&[Value::nil()]);
+        return Ok(CallbackAction::Return);
+    };
+
+    let anchor = pat.first() == Some(&b'^');
+    let body = if anchor { &pat[1..] } else { pat };
+    let mut ms = MatchState::new(src, body);
+    let mut s1 = init;
+    loop {
+        if let Some(e) = ms.match_at(s1).map_err(|e| pat_err(ctx, e))? {
+            let n = ms.num_captures(true); // whole match if no captures
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                let cv = ms.get_onecapture(i, s1, e).map_err(|e| pat_err(ctx, e))?;
+                out.push(cap_to_value(ctx, src, cv));
+            }
+            stack.replace(&out);
+            return Ok(CallbackAction::Return);
+        }
+        if anchor || s1 >= src.len() {
+            break;
+        }
+        s1 += 1;
+    }
+    stack.replace(&[Value::nil()]);
+    Ok(CallbackAction::Return)
 }
 
 fn lua_pack<'gc>(

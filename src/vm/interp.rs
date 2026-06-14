@@ -2699,7 +2699,7 @@ pub(crate) fn close_upvalues<'gc>(
 const MAX_TAG_LOOP: usize = 2000;
 
 /// Result of walking an `__index` chain.
-enum IndexChain<'gc> {
+pub(crate) enum IndexChain<'gc> {
     /// The chain resolved synchronously to a value (possibly `Nil`).
     Resolved(Value<'gc>),
     /// The chain ended in a callable that must be invoked with
@@ -2721,7 +2721,7 @@ enum IndexChain<'gc> {
 /// `luaV_finishget`). `mm_index_name` is the pre-interned `__index`
 /// LuaString — the function never re-interns it.
 #[inline]
-fn walk_index_chain<'gc>(
+pub(crate) fn walk_index_chain<'gc>(
     start_receiver: Value<'gc>,
     start_metatable: Table<'gc>,
     key: Value<'gc>,

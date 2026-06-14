@@ -832,7 +832,11 @@ fn land_call_results<'gc>(ts: &mut crate::env::thread::ThreadState<'gc>, cs: Cal
         ts.stack[func_idx + i] = Value::nil();
     }
     if returns == 0 {
+        // MULTRET: publish the dynamic top for the next consumer, mirroring
+        // the inline native-return path in `op_call` (a fixed-results call
+        // reads registers, not `top`, so only this branch must set it).
         ts.stack.truncate(func_idx + retc);
+        ts.top = func_idx + retc;
     } else {
         // Keep stack >= func_idx + wanted; restore caller's max_stack_size
         // window if a Lua frame is on top.
