@@ -444,6 +444,41 @@ mod tests {
         assert_eq!(run_returning_int("return 0xFF"), 255);
     }
 
+    fn run_with_stdlib_bool(src: &str) -> bool {
+        let mut lua = Lua::new();
+        lua.load_all();
+        let ex = lua
+            .try_enter(|ctx| -> Result<_, LoadError> {
+                let chunk = ctx.load(src, Some("test"))?;
+                Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+            })
+            .expect("load");
+        lua.execute::<bool>(&ex).expect("run")
+    }
+
+    #[test]
+    fn floor_div_with_float_operand_is_float() {
+        // `//` with any float operand returns a float (Lua: `floor(a/b)`), not
+        // an integer. Type checked via `math.type`; values cross-checked
+        // against lua5.5. The `1e300` case guards the old `as i64` cast, which
+        // saturated the quotient to i64::MAX.
+        assert!(run_with_stdlib_bool(
+            "return math.type(16.0 // 2) == 'float'"
+        ));
+        assert!(run_with_stdlib_bool(
+            "return math.type(16 // 2.0) == 'float'"
+        ));
+        assert!(run_with_stdlib_bool("return 16.0 // 2 == 8.0"));
+        assert!(run_with_stdlib_bool("return 7.5 // 2 == 3.0"));
+        assert!(run_with_stdlib_bool("return -7.0 // 2 == -4.0"));
+        assert!(run_with_stdlib_bool("return 1e300 // 1 == 1e300"));
+        // Integer `//` is unaffected: still an integer.
+        assert!(run_with_stdlib_bool(
+            "return math.type(16 // 2) == 'integer'"
+        ));
+        assert!(run_with_stdlib_bool("return 16 // 2 == 8"));
+    }
+
     #[test]
     fn decimal_numeral_literals() {
         // The lexer rejected decimal floats with a leading or trailing radix

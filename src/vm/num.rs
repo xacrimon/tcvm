@@ -166,7 +166,9 @@ impl ArithOp for IDiv {
 
     #[inline(always)]
     fn float<'gc>(lhs: f64, rhs: f64) -> Value<'gc> {
-        Value::integer((lhs / rhs).floor() as i64)
+        // Lua's `//` on floats is `floor(a/b)` and stays a float — keep the
+        // float type (and inf/nan; `as i64` would saturate large quotients).
+        Value::float((lhs / rhs).floor())
     }
 }
 
