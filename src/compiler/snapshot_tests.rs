@@ -128,11 +128,11 @@ test_err!(
     for_counter_readonly_err,
     "test-files/for_counter_readonly_err.lua"
 );
-test!(
+test_err!(
     global_nested_propagation,
     "test-files/global_nested_propagation.lua"
 );
-test!(global_star_nested, "test-files/global_star_nested.lua");
+test_err!(global_star_nested, "test-files/global_star_nested.lua");
 test!(global_const_star, "test-files/global_const_star.lua");
 test!(const_fold, "test-files/const_fold.lua");
 test!(const_no_fold, "test-files/const_no_fold.lua");

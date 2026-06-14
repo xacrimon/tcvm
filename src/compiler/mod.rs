@@ -69,6 +69,10 @@ pub struct LexError {}
 pub enum CompileErrorKind {
     #[error("internal compiler error: {0}")]
     Internal(&'static str),
+    #[error("variable '{0}' not declared")]
+    UndeclaredGlobal(String),
+    #[error("attempt to assign to const variable '{0}'")]
+    ConstGlobalAssign(String),
     #[error("insufficient available registers")]
     Registers,
     #[error("too many upvalues")]

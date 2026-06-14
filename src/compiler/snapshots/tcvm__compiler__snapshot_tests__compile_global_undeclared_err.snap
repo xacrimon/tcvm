@@ -2,4 +2,4 @@
 source: src/compiler/snapshot_tests.rs
 expression: output
 ---
-compiler error at line 1: internal compiler error: undeclared global
+compiler error at line 1: variable 'Z' not declared

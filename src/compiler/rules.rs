@@ -1,7 +1,5 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::mem;
-use std::rc::Rc;
 
 use cstree::interning::TokenInterner;
 
@@ -229,33 +227,55 @@ impl GlobalKind {
     }
 }
 
-/// Lua 5.5 chunk-level global declaration state. Shared by reference
-/// across every nested-function `Ctx` in the same chunk so that a
-/// `global` declaration anywhere in the chunk is visible to every
-/// function. Without this sharing, an inner function would see only
-/// its own (empty) declaration table and miss the outer's.
+/// What happens to a free name that has no explicit `global` declaration
+/// in scope. The two `*`-bearing variants are deliberately distinct: a
+/// list-form `global Name` voids the *preambular* `global *` only
+/// (`manual.of:225-228`), so a `global Name` after an explicit
+/// `global *` leaves the explicit one in force.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DefaultPolicy {
+    /// The implicit chunk preamble `global *` (read-write). Voided to
+    /// `None` by any list-form `global Name` declaration in scope.
+    Preamble,
+    /// An explicit `global *` / `global<const> *` declaration in scope.
+    /// Not voided by a later `global Name`.
+    Star(GlobalKind),
+    /// No default in scope: every free name must be declared.
+    None,
+}
+
+/// Lua 5.5 `global` declaration state. Lexically scoped exactly like a
+/// `local` (`manual.of:245-249`): a declaration's scope runs from the
+/// statement after it to the end of the innermost enclosing block. We
+/// enforce that by snapshotting this whole struct on `push_scope` and
+/// restoring it on `pop_scope`, and by handing each nested function a
+/// *clone* of the parent's current state — so outer declarations are
+/// visible inward, but an inner block's or function's declarations
+/// never leak back out to the enclosing or sibling scopes.
+#[derive(Clone)]
 struct GlobalEnv {
     /// Names introduced by an *explicit* `global Name` declaration.
     /// Reads of these emit `ERRNNIL` after `GETTABUP` (a never-assigned
     /// declared global is an error in 5.5 — `manual.of:1700`).
     decls: HashMap<String, GlobalKind>,
-    /// `true` while undeclared free names are allowed and treated as
-    /// implicit globals of `default_kind`. Starts `true` because every
-    /// chunk has an implicit `global *` (`manual.of:225-228`); set to
-    /// `false` by any `global Name(...)` declaration; re-set to `true`
-    /// by an explicit `global<attrib>? *`.
-    default_active: bool,
-    /// Default kind for the implicit / collective `*` declaration.
-    /// Initially `GlobalKind::Reg` to match the preamble's `global *`.
-    default_kind: GlobalKind,
+    /// Policy for free names with no declaration in scope.
+    default: DefaultPolicy,
 }
 
 impl GlobalEnv {
     fn new() -> Self {
         Self {
             decls: HashMap::new(),
-            default_active: true,
-            default_kind: GlobalKind::Reg,
+            default: DefaultPolicy::Preamble,
+        }
+    }
+
+    /// A list-form `global Name` declaration voids the implicit preamble
+    /// but leaves an explicit `global *` in force (`manual.of:225-228` —
+    /// only the *preambular* declaration becomes void).
+    fn void_preamble(&mut self) {
+        if self.default == DefaultPolicy::Preamble {
+            self.default = DefaultPolicy::None;
         }
     }
 }
@@ -332,9 +352,13 @@ struct Ctx<'gc, 'a> {
     /// `Chunk::upvalue_desc: Box<[UpValueDescriptor]>` at assembly time.
     upvalues: Vec<(String, UpValueDescriptor)>,
 
-    /// Lua 5.5 chunk-level global state. Shared across every nested
-    /// `Ctx` in the same chunk.
-    globals: Rc<RefCell<GlobalEnv>>,
+    /// Lua 5.5 global-declaration state, currently in scope. Owned per
+    /// function; nested functions receive a clone (see `compile_nested`).
+    globals: GlobalEnv,
+    /// `globals` snapshot saved on each `push_scope`, restored on the
+    /// matching `pop_scope` so a block-local `global` decl is scoped to
+    /// its block.
+    scope_globals: Vec<GlobalEnv>,
 }
 
 impl<'gc, 'a> Ctx<'gc, 'a> {
@@ -1067,6 +1091,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             nactvar: self.chunk.nactvar,
         });
         self.scope_close.push(Vec::new());
+        self.scope_globals.push(self.globals.clone());
     }
 
     fn pop_scope(&mut self) -> Result<Vec<RegisterIndex>, CompileError> {
@@ -1077,6 +1102,12 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             .ok_or_else(|| ice("missing scope register base"))?;
         self.chunk.freereg = mark.freereg;
         self.chunk.nactvar = mark.nactvar;
+        // Drop any `global` declarations made within this block — their
+        // lexical scope ends here (`manual.of:245-249`).
+        self.globals = self
+            .scope_globals
+            .pop()
+            .ok_or_else(|| ice("missing scope global mark"))?;
         self.scope_close
             .pop()
             .ok_or_else(|| ice("missing scope close list"))
@@ -1291,10 +1322,10 @@ pub fn compile<'gc>(
     root: &Root,
     interner: &TokenInterner,
 ) -> Result<Gc<'gc, Prototype<'gc>>, CompileError> {
-    // One `GlobalEnv` per chunk, threaded through nested-function
-    // compilation so a `global` declaration in any function is visible
-    // to every other function in the same chunk.
-    let globals = Rc::new(RefCell::new(GlobalEnv::new()));
+    // The chunk starts with the implicit `global *` (global-by-default);
+    // nested functions inherit a clone of whatever is in scope at their
+    // definition site (see `compile_nested`).
+    let globals = GlobalEnv::new();
     let chunk = compile_function_to_chunk(
         ctx,
         interner,
@@ -1329,7 +1360,7 @@ fn compile_function_to_chunk<'gc, 'a>(
     arity: u8,
     source: Option<LuaString<'gc>>,
     initial_upvalues: Vec<(String, UpValueDescriptor)>,
-    globals: Rc<RefCell<GlobalEnv>>,
+    globals: GlobalEnv,
 ) -> Result<Chunk<'gc>, CompileError> {
     let mut chunk = Chunk::new();
     chunk.is_vararg = is_vararg;
@@ -1348,6 +1379,7 @@ fn compile_function_to_chunk<'gc, 'a>(
         capture: parent_capture,
         upvalues: initial_upvalues,
         globals,
+        scope_globals: Vec::new(),
     };
 
     ctx.push_scope();
@@ -1747,11 +1779,8 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         // Register first so the body can reference it as a declared
         // global. List-form declarations (this included) void the
         // implicit `global *` per `manual.of:225-228`.
-        {
-            let mut env = ctx.globals.borrow_mut();
-            env.default_active = false;
-            env.decls.insert(name.clone(), GlobalKind::Reg);
-        }
+        ctx.globals.void_preamble();
+        ctx.globals.decls.insert(name.clone(), GlobalKind::Reg);
 
         // Compile the closure into a register. `compile_func_body`
         // honours the dst hint, so `func_reg == target_reg` (asserted
@@ -1800,10 +1829,10 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
     };
 
     if item.is_star() {
-        // Form 2: `global <attrib>? *`.
-        let mut env = ctx.globals.borrow_mut();
-        env.default_active = true;
-        env.default_kind = default_kind;
+        // Form 2: `global <attrib>? *`. Establishes an explicit default
+        // for the rest of this block; unlike the preamble, a later
+        // `global Name` won't void it.
+        ctx.globals.default = DefaultPolicy::Star(default_kind);
         return Ok(());
     }
 
@@ -1819,24 +1848,23 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
     // self-referential `global X = X` resolves X as declared, not
     // implicit). Voids the implicit `global *`.
     let mut decl_kinds: Vec<(String, GlobalKind)> = Vec::with_capacity(targets.len());
-    {
-        let mut env = ctx.globals.borrow_mut();
-        env.default_active = false;
-        for target in &targets {
-            let name = target
-                .name()
-                .ok_or_else(|| ice("global target without name"))?
-                .name(ctx.interner)
-                .ok_or_else(|| ice("ident without name"))?
-                .to_owned();
-            let kind = if target.is_const() {
-                GlobalKind::Const
-            } else {
-                default_kind
-            };
-            env.decls.insert(name.clone(), kind);
-            decl_kinds.push((name, kind));
-        }
+    for target in &targets {
+        let name = target
+            .name()
+            .ok_or_else(|| ice("global target without name"))?
+            .name(ctx.interner)
+            .ok_or_else(|| ice("ident without name"))?
+            .to_owned();
+        let kind = if target.is_const() {
+            GlobalKind::Const
+        } else {
+            default_kind
+        };
+        decl_kinds.push((name, kind));
+    }
+    ctx.globals.void_preamble();
+    for (name, kind) in &decl_kinds {
+        ctx.globals.decls.insert(name.clone(), *kind);
     }
 
     if values.is_empty() {
@@ -2088,29 +2116,33 @@ fn compile_lvalue(
                 // `global *` scope is in effect; once any explicit
                 // declaration has voided it, undeclared writes are
                 // rejected.
-                let env = ctx.globals.borrow();
-                if let Some(kind) = env.decls.get(name).copied() {
+                if let Some(kind) = ctx.globals.decls.get(name).copied() {
                     if kind.is_const() {
                         return Err(err(
-                            CompileErrorKind::Internal("assignment to read-only global"),
+                            CompileErrorKind::ConstGlobalAssign(name.to_owned()),
                             LineNumber(0),
                         ));
                     }
-                } else if !env.default_active {
-                    return Err(err(
-                        CompileErrorKind::Internal("undeclared global"),
-                        LineNumber(0),
-                    ));
-                } else if env.default_kind.is_const() {
-                    // Under `global<const> *`, undeclared writes are
-                    // also rejected — the implicit declaration kind is
-                    // read-only.
-                    return Err(err(
-                        CompileErrorKind::Internal("assignment to read-only global"),
-                        LineNumber(0),
-                    ));
+                } else {
+                    match ctx.globals.default {
+                        // No default in scope: undeclared write rejected.
+                        DefaultPolicy::None => {
+                            return Err(err(
+                                CompileErrorKind::UndeclaredGlobal(name.to_owned()),
+                                LineNumber(0),
+                            ));
+                        }
+                        // Under `global<const> *` the implicit kind is
+                        // read-only, so undeclared writes are rejected too.
+                        DefaultPolicy::Star(GlobalKind::Const) => {
+                            return Err(err(
+                                CompileErrorKind::ConstGlobalAssign(name.to_owned()),
+                                LineNumber(0),
+                            ));
+                        }
+                        DefaultPolicy::Preamble | DefaultPolicy::Star(GlobalKind::Reg) => {}
+                    }
                 }
-                drop(env);
                 let (key, ic_idx) = ctx.alloc_field_key(name.as_bytes())?;
                 let env_idx = ctx
                     .resolve_env_upvalue()
@@ -2366,7 +2398,10 @@ fn compile_nested<'gc>(
 ) -> Result<Gc<'gc, Prototype<'gc>>, CompileError> {
     let lua_ctx = ctx.ctx;
     let interner = ctx.interner;
-    let globals = Rc::clone(&ctx.globals);
+    // The child inherits the declarations in scope at its definition site,
+    // but mutates its own copy — its `global` decls don't leak back to the
+    // parent or to sibling functions (`manual.of:245-249`).
+    let globals = ctx.globals.clone();
     let parent: &mut dyn UpvalueResolver = ctx;
 
     let chunk = compile_function_to_chunk(
@@ -2488,15 +2523,13 @@ fn compile_expr_ident(
     // undeclared free names are rejected. Reads of declared globals
     // do *not* emit a runtime `ERRNNIL` — that opcode guards
     // initialization (see `compile_global`), not plain reads.
-    let globals = ctx.globals.borrow();
-    let declared = globals.decls.contains_key(name);
-    if !declared && !globals.default_active {
+    let declared = ctx.globals.decls.contains_key(name);
+    if !declared && ctx.globals.default == DefaultPolicy::None {
         return Err(err(
-            CompileErrorKind::Internal("undeclared global"),
+            CompileErrorKind::UndeclaredGlobal(name.to_owned()),
             LineNumber(0),
         ));
     }
-    drop(globals);
 
     let (key, ic_idx) = ctx.alloc_field_key(name.as_bytes())?;
     let dst = ctx.dst_or_alloc(dst)?;
