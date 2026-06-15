@@ -1655,6 +1655,11 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
                 assert_eq!(regs[0].0, expected);
                 continue;
             }
+            if let Expr::Method(call) = expr {
+                let want = (num_targets - i) as u8;
+                expand_method_call(ctx, call, RegisterIndex(expected), want)?;
+                continue;
+            }
             if let Expr::VarArg = expr {
                 let want = num_targets - i;
                 let dst = ctx.reserve_regs(want as u8)?;
@@ -1764,6 +1769,53 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
 // ---------------------------------------------------------------------------
 // Lua 5.5 global declarations
 // ---------------------------------------------------------------------------
+
+/// Validate a trailing-multires expansion count for the `n+1` wire
+/// encoding used by `CALL.returns` / `VARARG.count`. The result count must
+/// fit in a `u8` after the `+1`, so `n` must be `< 255`; otherwise we'd
+/// silently overflow. Returns the count as `u8` on success.
+fn expand_count(n: usize) -> Result<u8, CompileError> {
+    if n >= u8::MAX as usize {
+        return Err(err(CompileErrorKind::Registers, LineNumber(0)));
+    }
+    Ok(n as u8)
+}
+
+/// Expand a trailing method-call initializer into `n` result registers at
+/// `[base, base + n)` for a `local`/`global` multi-target decl.
+///
+/// Unlike a plain `CALL` — whose func slot is forced to `freereg` (== `base`)
+/// by the call setup — a method call first evaluates the receiver. When the
+/// receiver is a temp it occupies `base`, so `SELF` lands the func one slot
+/// *above* `base` and the `CALL` results land at `[base + 1, ...)`. (When the
+/// receiver is an existing local below `base`, no temp is consumed and the
+/// results already land at `base`.) Detect the offset and MOVE the results
+/// down into `[base, base + n)` so the caller's nil-pad / SETTABUP loop —
+/// which keys off `base` and `freereg` — reads the right slots. Ascending
+/// order is collision-free since every destination is strictly below its
+/// source.
+fn expand_method_call(
+    ctx: &mut Ctx,
+    call: MethodCall,
+    base: RegisterIndex,
+    n: u8,
+) -> Result<(), CompileError> {
+    let regs = compile_expr_method_call(ctx, call, Want::Exact(n))?;
+    let landed = regs[0];
+    if landed.0 != base.0 {
+        debug_assert!(landed.0 > base.0);
+        for k in 0..n {
+            ctx.emit(Instruction::MOVE {
+                dst: base.0 + k,
+                src: landed.0 + k,
+            });
+        }
+        // Results now occupy `[base, base + n)`; reclaim the temp slots the
+        // receiver and the shifted call block left above.
+        ctx.chunk.freereg = base.0 + n;
+    }
+    Ok(())
+}
 
 /// Compile a `global` statement. There are three syntactic forms (see
 /// `manual.of:1655-1738` and upstream `lparser.c:1940-1977`):
@@ -1893,7 +1945,40 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
     let value_base = ctx.chunk.freereg;
     if has_values {
         for (i, expr) in values.into_iter().enumerate() {
+            let is_last = i == n_values - 1;
             let want = RegisterIndex(value_base + i as u8);
+
+            // Last initializer supplies multiple values via a bare call or
+            // vararg: expand it across the remaining target slots, mirroring
+            // `compile_decl`. A parenthesized `(f())` / `(...)` is
+            // `Expr::Paren`, which doesn't match these arms — it falls
+            // through to the single-value path and adjusts to one value, so
+            // no per-site paren check is needed.
+            if is_last && n_targets > n_values {
+                let n = n_targets - i;
+                if let Expr::FuncCall(call) = expr {
+                    let n = expand_count(n)?;
+                    let regs = compile_expr_func_call(ctx, call, Want::Exact(n))?;
+                    debug_assert_eq!(regs[0].0, want.0);
+                    continue;
+                }
+                if let Expr::Method(call) = expr {
+                    let n = expand_count(n)?;
+                    expand_method_call(ctx, call, want, n)?;
+                    continue;
+                }
+                if let Expr::VarArg = expr {
+                    let n = expand_count(n)?;
+                    let dst = ctx.reserve_regs(n)?;
+                    debug_assert_eq!(dst.0, want.0);
+                    ctx.emit(Instruction::VARARG {
+                        dst: dst.0,
+                        count: n + 1,
+                    });
+                    continue;
+                }
+            }
+
             let got = compile_expr_to_reg(ctx, expr, None)?;
             if got != want {
                 // Bare local/upvalue (or a mid-stack short-circuit result):
@@ -2342,6 +2427,7 @@ fn expr_reads(ctx: &Ctx, expr: &Expr, reg: u8) -> Result<bool, CompileError> {
             }
             false
         }
+        Expr::Paren(inner) => expr_reads(ctx, inner, reg)?,
     })
 }
 
@@ -2512,6 +2598,14 @@ fn compile_expr(
             });
             Ok(ExprDesc::from_reg(dst))
         }
+        // Transparent recurse: the paren only matters at multi-value
+        // expansion sites (which match the concrete FuncCall/Method/VarArg
+        // variants, so a Paren wrapper there naturally adjusts to one
+        // value). For single-value compilation it has no effect, so we
+        // return the inner ExprDesc unchanged WITHOUT forcing a register
+        // discharge — discharging here would run before const-folding and
+        // short-circuit/jump lowering and defeat them for every `(expr)`.
+        Expr::Paren(inner) => compile_expr(ctx, *inner, dst),
     }
 }
 
@@ -3828,10 +3922,11 @@ fn compile_return(ctx: &mut Ctx, item: Return) -> Result<(), CompileError> {
     // exactly one return expression, directly a call. Matches Lua 5.5's
     // tail-call rule.
     //
-    // See #48: Lua 5.5 does NOT tail-call parenthesised `return (f())`
-    // because the parens force adjust-to-one. The parser here doesn't
-    // surface a distinct paren node, so we over-eagerly tail-call that
-    // form for now.
+    // Per #48, Lua 5.5 does NOT tail-call parenthesised `return (f())`
+    // because the parens force adjust-to-one. The parser preserves the
+    // paren as `Expr::Paren`, which doesn't match the FuncCall/Method
+    // arms here, so it falls through to `compile_return_generic` and
+    // correctly returns a single value (`manual.of:1573`).
     if exprs.len() == 1 {
         let only = exprs.pop().unwrap();
         match only {

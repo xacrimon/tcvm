@@ -156,3 +156,8 @@ test!(not_andor, "test-files/not_andor.lua");
 test!(jmp_elim, "test-files/jmp_elim.lua");
 test!(if_empty_nested, "test-files/if_empty_nested.lua");
 test!(if_empty_goto, "test-files/if_empty_goto.lua");
+test!(paren_adjust, "test-files/paren_adjust.lua");
+test!(
+    global_multiret_expand,
+    "test-files/global_multiret_expand.lua"
+);
