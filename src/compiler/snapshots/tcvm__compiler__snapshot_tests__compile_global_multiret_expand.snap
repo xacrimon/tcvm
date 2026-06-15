@@ -1,0 +1,163 @@
+---
+source: src/compiler/snapshot_tests.rs
+expression: output
+---
+; function (params=0, vararg=true, stack=5, upvalues=1)
+; constants:
+;   K0 = 100
+;   K1 = 200
+; upvalues:
+;   U0 = local R0
+; code:
+0000  VARARGPREP      fixed=0
+0001  CLOSURE         R0 P0
+0002  CLOSURE         R1 P1
+0003  MOVE            R2 R1
+0004  LOAD            R3 K0  ; 100
+0005  LOAD            R4 K1  ; 200
+0006  CALL            R2 args=3 ret=1
+0007  RETURN          R0 count=1
+
+; prototype 0:
+  ; function (params=0, vararg=false, stack=2, upvalues=0)
+  ; constants:
+  ;   K0 = 10
+  ;   K1 = 20
+  ; code:
+  0000  LOAD            R0 K0  ; 10
+  0001  LOAD            R1 K1  ; 20
+  0002  RETURN          R0 count=3
+
+; prototype 1:
+  ; function (params=0, vararg=true, stack=14, upvalues=2)
+  ; constants:
+  ;   K0 = "a"
+  ;   K1 = "b"
+  ;   K2 = nil
+  ;   K3 = "c"
+  ;   K4 = "d"
+  ;   K5 = "e"
+  ;   K6 = "g"
+  ;   K7 = "h"
+  ;   K8 = "i"
+  ;   K9 = "m"
+  ;   K10 = "j"
+  ;   K11 = "k"
+  ;   K12 = "l"
+  ;   K13 = "n"
+  ;   K14 = "print"
+  ; upvalues:
+  ;   U0 = local R0
+  ;   U1 = upvalue U0
+  ; code:
+  0000  VARARGPREP      fixed=0
+  0001  GETUPVAL        R0 U0
+  0002  CALL            R0 args=1 ret=3
+  0003  GETTABUP        R2 U1 K0  ; "a"
+  0004  ERRNNIL         R2 name=K0
+  0005  SETTABUP        R0 U1 K0  ; "a"
+  0006  GETTABUP        R2 U1 K1  ; "b"
+  0007  ERRNNIL         R2 name=K1
+  0008  SETTABUP        R1 U1 K1  ; "b"
+  0009  GETUPVAL        R0 U0
+  0010  CALL            R0 args=1 ret=2
+  0011  LOAD            R1 K2  ; nil
+  0012  GETTABUP        R2 U1 K3  ; "c"
+  0013  ERRNNIL         R2 name=K3
+  0014  SETTABUP        R0 U1 K3  ; "c"
+  0015  GETTABUP        R2 U1 K4  ; "d"
+  0016  ERRNNIL         R2 name=K4
+  0017  SETTABUP        R1 U1 K4  ; "d"
+  0018  VARARG          R0 count=3
+  0019  GETTABUP        R2 U1 K5  ; "e"
+  0020  ERRNNIL         R2 name=K5
+  0021  SETTABUP        R0 U1 K5  ; "e"
+  0022  GETTABUP        R2 U1 K6  ; "g"
+  0023  ERRNNIL         R2 name=K6
+  0024  SETTABUP        R1 U1 K6  ; "g"
+  0025  VARARG          R0 count=2
+  0026  LOAD            R1 K2  ; nil
+  0027  GETTABUP        R2 U1 K7  ; "h"
+  0028  ERRNNIL         R2 name=K7
+  0029  SETTABUP        R0 U1 K7  ; "h"
+  0030  GETTABUP        R2 U1 K8  ; "i"
+  0031  ERRNNIL         R2 name=K8
+  0032  SETTABUP        R1 U1 K8  ; "i"
+  0033  NEWTABLE        R0
+  0034  CLOSURE         R1 P0
+  0035  SETFIELD        R1 R0 K9  ; "m"
+  0036  SELF            R1 R0 K9  ; "m"
+  0037  CALL            R1 args=2 ret=3
+  0038  GETTABUP        R3 U1 K10  ; "j"
+  0039  ERRNNIL         R3 name=K10
+  0040  SETTABUP        R1 U1 K10  ; "j"
+  0041  GETTABUP        R3 U1 K11  ; "k"
+  0042  ERRNNIL         R3 name=K11
+  0043  SETTABUP        R2 U1 K11  ; "k"
+  0044  SELF            R1 R0 K9  ; "m"
+  0045  CALL            R1 args=2 ret=2
+  0046  LOAD            R2 K2  ; nil
+  0047  GETTABUP        R3 U1 K12  ; "l"
+  0048  ERRNNIL         R3 name=K12
+  0049  SETTABUP        R1 U1 K12  ; "l"
+  0050  GETTABUP        R3 U1 K13  ; "n"
+  0051  ERRNNIL         R3 name=K13
+  0052  SETTABUP        R2 U1 K13  ; "n"
+  0053  GETTABUP        R1 U1 K14  ; "print"
+  0054  GETTABUP        R2 U1 K0  ; "a"
+  0055  GETTABUP        R3 U1 K1  ; "b"
+  0056  GETTABUP        R4 U1 K3  ; "c"
+  0057  GETTABUP        R5 U1 K4  ; "d"
+  0058  GETTABUP        R6 U1 K5  ; "e"
+  0059  GETTABUP        R7 U1 K6  ; "g"
+  0060  GETTABUP        R8 U1 K7  ; "h"
+  0061  GETTABUP        R9 U1 K8  ; "i"
+  0062  GETTABUP        R10 U1 K10  ; "j"
+  0063  GETTABUP        R11 U1 K11  ; "k"
+  0064  GETTABUP        R12 U1 K12  ; "l"
+  0065  GETTABUP        R13 U1 K13  ; "n"
+  0066  CALL            R1 args=13 ret=1
+  0067  CLOSURE         R1 P1
+  0068  MOVE            R2 R1
+  0069  CALL            R2 args=1 ret=1
+  0070  RETURN          R0 count=1
+
+  ; prototype 0:
+    ; function (params=1, vararg=false, stack=3, upvalues=0)
+    ; constants:
+    ;   K0 = 10
+    ;   K1 = 20
+    ; code:
+    0000  LOAD            R1 K0  ; 10
+    0001  LOAD            R2 K1  ; 20
+    0002  RETURN          R1 count=3
+
+  ; prototype 1:
+    ; function (params=0, vararg=false, stack=4, upvalues=2)
+    ; constants:
+    ;   K0 = "m"
+    ;   K1 = "o"
+    ;   K2 = "p"
+    ;   K3 = "print"
+    ;   K4 = "up_recv"
+    ; upvalues:
+    ;   U0 = local R0
+    ;   U1 = upvalue U1
+    ; code:
+    0000  GETUPVAL        R0 U0
+    0001  SELF            R1 R0 K0  ; "m"
+    0002  CALL            R1 args=2 ret=3
+    0003  MOVE            R0 R1
+    0004  MOVE            R1 R2
+    0005  GETTABUP        R2 U1 K1  ; "o"
+    0006  ERRNNIL         R2 name=K1
+    0007  SETTABUP        R0 U1 K1  ; "o"
+    0008  GETTABUP        R2 U1 K2  ; "p"
+    0009  ERRNNIL         R2 name=K2
+    0010  SETTABUP        R1 U1 K2  ; "p"
+    0011  GETTABUP        R0 U1 K3  ; "print"
+    0012  LOAD            R1 K4  ; "up_recv"
+    0013  GETTABUP        R2 U1 K1  ; "o"
+    0014  GETTABUP        R3 U1 K2  ; "p"
+    0015  CALL            R0 args=4 ret=1
+    0016  RETURN          R0 count=1

@@ -1,0 +1,115 @@
+---
+source: src/compiler/snapshot_tests.rs
+expression: output
+---
+; function (params=0, vararg=true, stack=26, upvalues=1)
+; constants:
+;   K0 = nil
+;   K1 = "meth"
+; upvalues:
+;   U0 = local R0
+; code:
+0000  VARARGPREP      fixed=0
+0001  CLOSURE         R0 P0
+0002  MOVE            R1 R0
+0003  CALL            R1 args=1 ret=3
+0004  MOVE            R3 R0
+0005  CALL            R3 args=1 ret=2
+0006  LOAD            R4 K0  ; nil
+0007  NEWTABLE        R5
+0008  CLOSURE         R6 P1
+0009  SETFIELD        R6 R5 K1  ; "meth"
+0010  SELF            R6 R5 K1  ; "meth"
+0011  CALL            R6 args=2 ret=3
+0012  SELF            R8 R5 K1  ; "meth"
+0013  CALL            R8 args=2 ret=2
+0014  LOAD            R9 K0  ; nil
+0015  CLOSURE         R10 P2
+0016  CLOSURE         R11 P3
+0017  CLOSURE         R12 P4
+0018  CLOSURE         R13 P5
+0019  MOVE            R14 R1
+0020  MOVE            R15 R2
+0021  MOVE            R16 R3
+0022  MOVE            R17 R4
+0023  MOVE            R18 R6
+0024  MOVE            R19 R7
+0025  MOVE            R20 R8
+0026  MOVE            R21 R9
+0027  MOVE            R22 R11
+0028  MOVE            R23 R12
+0029  MOVE            R24 R13
+0030  MOVE            R25 R10
+0031  RETURN          R14 count=13
+
+; prototype 0:
+  ; function (params=0, vararg=false, stack=2, upvalues=0)
+  ; constants:
+  ;   K0 = 10
+  ;   K1 = 20
+  ; code:
+  0000  LOAD            R0 K0  ; 10
+  0001  LOAD            R1 K1  ; 20
+  0002  RETURN          R0 count=3
+
+; prototype 1:
+  ; function (params=1, vararg=false, stack=3, upvalues=0)
+  ; constants:
+  ;   K0 = 10
+  ;   K1 = 20
+  ; code:
+  0000  LOAD            R1 K0  ; 10
+  0001  LOAD            R2 K1  ; 20
+  0002  RETURN          R1 count=3
+
+; prototype 2:
+  ; function (params=0, vararg=false, stack=4, upvalues=1)
+  ; constants:
+  ;   K0 = "meth"
+  ; upvalues:
+  ;   U0 = local R5
+  ; code:
+  0000  GETUPVAL        R0 U0
+  0001  SELF            R1 R0 K0  ; "meth"
+  0002  CALL            R1 args=2 ret=3
+  0003  MOVE            R0 R1
+  0004  MOVE            R1 R2
+  0005  MOVE            R2 R0
+  0006  MOVE            R3 R1
+  0007  RETURN          R2 count=3
+
+; prototype 3:
+  ; function (params=0, vararg=true, stack=12, upvalues=0)
+  ; constants:
+  ;   K0 = nil
+  ; code:
+  0000  VARARGPREP      fixed=0
+  0001  VARARG          R0 count=3
+  0002  VARARG          R2 count=2
+  0003  LOAD            R3 K0  ; nil
+  0004  VARARG          R4 count=2
+  0005  LOAD            R5 K0  ; nil
+  0006  MOVE            R6 R0
+  0007  MOVE            R7 R1
+  0008  MOVE            R8 R2
+  0009  MOVE            R9 R3
+  0010  MOVE            R10 R4
+  0011  MOVE            R11 R5
+  0012  RETURN          R6 count=7
+
+; prototype 4:
+  ; function (params=0, vararg=false, stack=1, upvalues=1)
+  ; upvalues:
+  ;   U0 = local R0
+  ; code:
+  0000  GETUPVAL        R0 U0
+  0001  CALL            R0 args=1 ret=2
+  0002  RETURN          R0 count=2
+
+; prototype 5:
+  ; function (params=0, vararg=false, stack=1, upvalues=1)
+  ; upvalues:
+  ;   U0 = local R0
+  ; code:
+  0000  GETUPVAL        R0 U0
+  0001  TAILCALL        R0 args=1

@@ -123,6 +123,10 @@ pub enum Expr {
     FuncCall(FuncCall),
     Index(Index),
     VarArg,
+    /// A parenthesized expression `(e)`. Preserved (rather than unwrapped)
+    /// because the parens force a multi-value expression to adjust to one
+    /// value, e.g. `local a, b = (f())` binds `b` to nil (`manual.of:1573`).
+    Paren(Box<Expr>),
 }
 
 impl Expr {
@@ -137,7 +141,10 @@ impl Expr {
             T![bin_op] => BinaryOp::cast(node).map(Self::BinaryOp)?,
             T![func_call] => FuncCall::cast(node).map(Self::FuncCall)?,
             T![index] => Index::cast(node).map(Self::Index)?,
-            T![expr] => node.first_child().and_then(Expr::cast)?,
+            T![expr] => {
+                let inner = node.first_child().and_then(Expr::cast)?;
+                Self::Paren(Box::new(inner))
+            }
             T![literal_expr] => Literal::cast(node).map(Self::Literal)?,
             _ => return None,
         })
