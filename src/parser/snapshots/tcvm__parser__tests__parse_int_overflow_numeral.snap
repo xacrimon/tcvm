@@ -1,0 +1,109 @@
+---
+source: src/parser/mod.rs
+expression: syntax_tree
+---
+Root@0..212
+  AssignStmt@0..21
+    AssignList@0..1
+      Ident@0..1
+        Ident@0..1 "a"
+    Assign@1..2 "="
+    ExprList@2..21
+      LiteralExpr@2..21
+        Int@2..21 "9223372036854775808"
+  AssignStmt@21..46
+    AssignList@21..22
+      Ident@21..22
+        Ident@21..22 "b"
+    Assign@22..23 "="
+    ExprList@23..46
+      LiteralExpr@23..46
+        Int@23..46 "99999999999999999999999"
+  AssignStmt@46..68
+    AssignList@46..47
+      Ident@46..47
+        Ident@46..47 "c"
+    Assign@47..48 "="
+    ExprList@48..68
+      LiteralExpr@48..68
+        Int@48..68 "18446744073709551616"
+  AssignStmt@68..89
+    AssignList@68..69
+      Ident@68..69
+        Ident@68..69 "d"
+    Assign@69..70 "="
+    ExprList@70..89
+      LiteralExpr@70..89
+        Int@70..89 "9223372036854775807"
+  AssignStmt@89..109
+    AssignList@89..90
+      Ident@89..90
+        Ident@89..90 "e"
+    Assign@90..91 "="
+    ExprList@91..109
+      LiteralExpr@91..109
+        HexInt@91..109 "0x7fffffffffffffff"
+  AssignStmt@109..129
+    AssignList@109..110
+      Ident@109..110
+        Ident@109..110 "f"
+    Assign@110..111 "="
+    ExprList@111..129
+      LiteralExpr@111..129
+        HexInt@111..129 "0x8000000000000000"
+  AssignStmt@129..149
+    AssignList@129..130
+      Ident@129..130
+        Ident@129..130 "g"
+    Assign@130..131 "="
+    ExprList@131..149
+      LiteralExpr@131..149
+        HexInt@131..149 "0xffffffffffffffff"
+  AssignStmt@149..170
+    AssignList@149..150
+      Ident@149..150
+        Ident@149..150 "h"
+    Assign@150..151 "="
+    ExprList@151..170
+      LiteralExpr@151..170
+        HexInt@151..170 "0x10000000000000000"
+  AssignStmt@170..192
+    AssignList@170..171
+      Ident@170..171
+        Ident@170..171 "i"
+    Assign@171..172 "="
+    ExprList@172..192
+      LiteralExpr@172..192
+        HexInt@172..192 "0xffffffffffffffffff"
+  AssignStmt@192..195
+    AssignList@192..193
+      Ident@192..193
+        Ident@192..193 "j"
+    Assign@193..194 "="
+    ExprList@194..195
+      LiteralExpr@194..195
+        Int@194..195 "0"
+  AssignStmt@195..199
+    AssignList@195..196
+      Ident@195..196
+        Ident@195..196 "k"
+    Assign@196..197 "="
+    ExprList@197..199
+      LiteralExpr@197..199
+        Int@197..199 "42"
+  AssignStmt@199..205
+    AssignList@199..200
+      Ident@199..200
+        Ident@199..200 "l"
+    Assign@200..201 "="
+    ExprList@201..205
+      LiteralExpr@201..205
+        HexInt@201..205 "0xff"
+  AssignStmt@205..212
+    AssignList@205..206
+      Ident@205..206
+        Ident@205..206 "m"
+    Assign@206..207 "="
+    ExprList@207..212
+      LiteralExpr@207..212
+        HexFloat@207..212 "0x1p4"
