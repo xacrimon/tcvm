@@ -286,8 +286,13 @@ impl Literal {
             T![nil] => LiteralValue::Nil,
             T![true] => LiteralValue::Bool(true),
             T![false] => LiteralValue::Bool(false),
-            T![int] => LiteralValue::Int(lit::parse_int(s).ok()?),
-            T![hex_int] => LiteralValue::Int(lit::parse_hex_int(s).ok()?),
+            // A decimal integer literal that overflows i64 reparses as a float
+            // (Lua's str2int-then-str2num fall-through); hex wraps mod 2^64.
+            T![int] => match lit::parse_int(s) {
+                Ok(n) => LiteralValue::Int(n),
+                Err(_) => LiteralValue::Float(lit::parse_float(s).ok()?),
+            },
+            T![hex_int] => LiteralValue::Int(lit::parse_hex_int(s)),
             T![float] => LiteralValue::Float(lit::parse_float(s).ok()?),
             T![hex_float] => LiteralValue::Float(lit::parse_hex_float(s)?),
             T![string] => LiteralValue::String(lit::parse_string(s)?),

@@ -91,6 +91,7 @@ mod tests {
     test!(literal, "test-files/literal.lua");
     test!(hex_numeral, "test-files/hex_numeral.lua");
     test!(decimal_numeral, "test-files/decimal_numeral.lua");
+    test!(int_overflow_numeral, "test-files/int_overflow_numeral.lua");
     test!(nbody, "test-files/nbody.lua");
     test!(op_prec, "test-files/op_prec.lua");
     test!(primes, "test-files/primes.lua");
