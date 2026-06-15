@@ -1765,6 +1765,16 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
 // Lua 5.5 global declarations
 // ---------------------------------------------------------------------------
 
+/// Number of values a trailing multires RHS should expand to, validated for
+/// the `n + 1` wire encoding (CALL `returns` / VARARG `count`). `> 254` can't
+/// be encoded, so surface a graceful `Registers` error instead of an overflow.
+fn expand_count(n: usize) -> Result<u8, CompileError> {
+    u8::try_from(n)
+        .ok()
+        .filter(|&n| n < u8::MAX)
+        .ok_or_else(|| err(CompileErrorKind::Registers, LineNumber(0)))
+}
+
 /// Compile a `global` statement. There are three syntactic forms (see
 /// `manual.of:1655-1738` and upstream `lparser.c:1940-1977`):
 ///
@@ -1861,6 +1871,10 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         .ok_or_else(|| ice("global stmt without star or targets"))?
         .collect();
     let values: Vec<Expr> = item.values().map(|v| v.collect()).unwrap_or_default();
+    // A parenthesized trailing `(f())` / `(...)` is adjusted to exactly one
+    // value, so it must NOT be expanded across the remaining targets. The
+    // `Expr` layer unwraps the paren node, so consult the raw syntax here.
+    let last_value_parenthesized = item.last_value_is_parenthesized();
 
     // Collect the declared names/kinds (reading the AST only). The
     // declarations don't take effect until *after* the initializers are
@@ -1893,7 +1907,31 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
     let value_base = ctx.chunk.freereg;
     if has_values {
         for (i, expr) in values.into_iter().enumerate() {
+            let is_last = i == n_values - 1;
             let want = RegisterIndex(value_base + i as u8);
+
+            // A trailing call/vararg expands across the remaining targets, but
+            // NOT when parenthesized (parens force exactly one value) — that
+            // falls through to the single-value path below.
+            if is_last && n_targets > n_values && !last_value_parenthesized {
+                if let Expr::FuncCall(call) = expr {
+                    let n = expand_count(n_targets - i)?;
+                    let regs = compile_expr_func_call(ctx, call, Want::Exact(n))?;
+                    debug_assert_eq!(regs[0].0, want.0);
+                    continue;
+                }
+                if let Expr::VarArg = expr {
+                    let n = expand_count(n_targets - i)?;
+                    let dst = ctx.reserve_regs(n)?;
+                    debug_assert_eq!(dst.0, want.0);
+                    ctx.emit(Instruction::VARARG {
+                        dst: dst.0,
+                        count: n + 1,
+                    });
+                    continue;
+                }
+            }
+
             let got = compile_expr_to_reg(ctx, expr, None)?;
             if got != want {
                 // Bare local/upvalue (or a mid-stack short-circuit result):

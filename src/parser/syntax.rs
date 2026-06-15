@@ -258,6 +258,26 @@ impl Global {
         let expr_list = nodes.last()?;
         Some(expr_list.children().filter_map(Expr::cast))
     }
+
+    /// Whether the LAST initializer value is wrapped in parentheses.
+    /// `Expr::cast` transparently unwraps a `T![expr]` paren node, so a
+    /// trailing `(f())` / `(...)` is indistinguishable from a bare call /
+    /// vararg at the `Expr` level. The compiler needs this to suppress
+    /// multi-value expansion: parentheses adjust a multires expression to
+    /// exactly one value (`manual.of:2490-2493`).
+    pub fn last_value_is_parenthesized(&self) -> bool {
+        let mut nodes = self.0.children();
+        if nodes.next().is_none() {
+            return false;
+        }
+        let Some(expr_list) = nodes.last() else {
+            return false;
+        };
+        expr_list
+            .children()
+            .last()
+            .is_some_and(|node| node.kind() == T![expr])
+    }
 }
 
 ast_node!(GlobalTarget, T![global_target]);
