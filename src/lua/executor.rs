@@ -969,6 +969,16 @@ fn unwind_error<'gc>(
     // the resumer's WaitThread → its next Sequence can catch.
     let stack_len = exec.0.borrow().thread_stack.len();
     if stack_len > 1 {
+        // Error terminates this coroutine: no result values, so `Stopped`
+        // (not `Result`) is its terminal/dead marker. Every coroutine the
+        // error unwinds through re-enters here on a later pump and is marked
+        // dead too, matching Lua's "kill the whole unwound chain". Stash the
+        // killing error so `coroutine.close` can surface it as `(false, err)`.
+        {
+            let mut ts = top.borrow_mut(mc);
+            ts.status = ThreadStatus::Stopped;
+            ts.death_error = Some(err.value());
+        }
         exec.0.borrow_mut(mc).thread_stack.pop();
         let resumer = *exec.0.borrow().thread_stack.last().unwrap();
         let mut rs = resumer.borrow_mut(mc);

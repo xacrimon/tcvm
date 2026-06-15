@@ -141,6 +141,11 @@ pub struct ThreadState<'gc> {
     /// state.
     #[collect(require_static)]
     pub yield_bottom: Option<CallSite>,
+    /// The error value that killed this coroutine, set when an uncaught error
+    /// unwinds out of it (status -> `Stopped`). `coroutine.close` surfaces it
+    /// as `(false, err)` and clears it; `None` for a coroutine that died by
+    /// normal return or was never run.
+    pub death_error: Option<Value<'gc>>,
 }
 
 /// A native callback wants to suspend / call / yield / resume; the executor
@@ -224,6 +229,7 @@ impl<'gc> Thread<'gc> {
             thread_handle: None,
             pending_action: None,
             yield_bottom: None,
+            death_error: None,
         };
         let thread = Thread(Gc::new(mc, RefLock::new(state)));
         // Store the back-reference
