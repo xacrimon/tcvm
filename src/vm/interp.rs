@@ -2671,6 +2671,15 @@ pub(crate) fn frame_return<'gc>(
     let caller = thread.top_lua().unwrap();
     let new_base = caller.base;
     let new_ip = unsafe { caller.closure.proto.code.as_ptr().add(caller.pc) };
+    // A native call in the returning frame (or a nested callee) may have
+    // truncated the shared stack to its own window. Restore the caller's full
+    // register window before resuming, or register writes through the raw
+    // `registers` pointer land in the Vec's spare capacity (beyond `len`) and a
+    // later `resize` nils them.
+    let needed = new_base + caller.closure.proto.max_stack_size as usize;
+    if thread.stack.len() < needed {
+        thread.stack.resize(needed, Value::nil());
+    }
     FrameReturn::Caller { new_base, new_ip }
 }
 
