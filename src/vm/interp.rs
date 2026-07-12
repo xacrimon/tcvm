@@ -233,9 +233,9 @@ macro_rules! helpers {
                             (__f.base, __f.closure.proto.max_stack_size as usize)
                         };
                         // The args/results were staged *above* the caller window
-                        // (at `__cb + __ms + 1 ..`), so `invoke_native` never
-                        // truncates below it: the window the payload writes
-                        // through is always in bounds. Assert that invariant.
+                        // (at `__cb + __ms + 1 ..`), and `invoke_native` never
+                        // shrinks the shared stack, so the window the payload
+                        // writes through is always in bounds. Assert that.
                         debug_assert!(
                             $thread.stack.len() >= __cb + __ms,
                             "native return left caller register window out of bounds"
@@ -1673,10 +1673,7 @@ extern "rust-preserve-none" fn op_call<'gc>(
                 let code_start = frame.closure.proto.code.as_ptr();
                 frame.pc = unsafe { ip.offset_from_unsigned(code_start) };
             }
-            let needed = new_base + closure.proto.max_stack_size as usize;
-            if thread.stack.len() < needed {
-                thread.stack.resize(needed, Value::nil());
-            }
+            thread.ensure_slots(new_base + closure.proto.max_stack_size as usize);
             // `nargs == 0` is the MULTRET sentinel: read the count from `thread.top`.
             let caller_provided = if nargs == 0 {
                 thread.top - new_base
@@ -1729,7 +1726,10 @@ extern "rust-preserve-none" fn op_call<'gc>(
             };
             match action {
                 crate::vm::sequence::CallbackAction::Return => {
-                    let retc = thread.stack.len() - args_base;
+                    // Result count comes via the logical top, not Vec::len:
+                    // `invoke_native` never shrinks the shared stack, so the
+                    // caller's register window is still fully covered.
+                    let retc = thread.top - args_base;
                     // Place results at stack[func_idx..] following Lua convention.
                     let wanted = if returns == 0 {
                         retc
@@ -1737,30 +1737,18 @@ extern "rust-preserve-none" fn op_call<'gc>(
                         returns as usize - 1
                     };
                     let to_copy = retc.min(wanted);
-                    // `invoke_native` truncates the stack to `args_base + retc`.
-                    // For a fixed-results call, restore the caller frame's
-                    // working window so the result-write loop and subsequent
-                    // register accesses (through the raw `registers` pointer)
-                    // stay within `Vec::len()`.
-                    if returns != 0 {
-                        if let Some(frame) = thread.top_lua() {
-                            let needed = frame.base + frame.closure.proto.max_stack_size as usize;
-                            if thread.stack.len() < needed {
-                                thread.stack.resize(needed, Value::nil());
-                            }
-                        }
-                    }
                     for i in 0..to_copy {
                         thread.stack[func_idx + i] = thread.stack[args_base + i];
                     }
                     for i in to_copy..wanted {
                         thread.stack[func_idx + i] = Value::nil();
                     }
-                    if returns == 0 {
-                        // MULTRET: publish the dynamic top for the next consumer.
-                        thread.stack.truncate(func_idx + retc);
-                        thread.top = func_idx + retc;
-                    }
+                    // Publish the logical top. For MULTRET this is the dynamic
+                    // count the next consumer reads; either way it nils the
+                    // function slot and the stale donor copies the down-shift
+                    // left above the results, which are dead scratch (a call's
+                    // function always sits at the caller's first free register).
+                    thread.set_top(func_idx + wanted);
                     registers = unsafe { thread.stack.as_mut_ptr().add(base) };
                     dispatch!();
                 }
@@ -1842,10 +1830,7 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
             } else {
                 0
             };
-            let needed = new_base + closure.proto.max_stack_size as usize;
-            if thread.stack.len() < needed {
-                thread.stack.resize(needed, Value::nil());
-            }
+            thread.ensure_slots(new_base + closure.proto.max_stack_size as usize);
             for i in nargs..num_params {
                 thread.stack[new_base + i] = Value::nil();
             }
@@ -1877,7 +1862,9 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
             };
             match action {
                 crate::vm::sequence::CallbackAction::Return => {
-                    let retc = thread.stack.len() - args_base;
+                    // Result count via the logical top (the shared stack was
+                    // never shrunk by the native call).
+                    let retc = thread.top - args_base;
                     match frame_return(ctx.mutation(), thread, args_base, retc) {
                         FrameReturn::Continuation => {
                             become cont_resume(instruction, ctx, thread, registers, ip, handlers);
@@ -2155,11 +2142,8 @@ extern "rust-preserve-none" fn op_setlist<'gc>(
         // frame's register window so subsequent fixed-register ops stay in
         // bounds — mirrors `op_call`'s post-return restore (PUC's
         // `L->top = ci->top`). A resize may reallocate, so refresh `registers`.
-        let needed = base + max_stack;
-        if thread.stack.len() < needed {
-            thread.stack.resize(needed, Value::nil());
-            registers = unsafe { thread.stack.as_mut_ptr().add(base) };
-        }
+        thread.ensure_slots(base + max_stack);
+        registers = unsafe { thread.stack.as_mut_ptr().add(base) };
     }
     dispatch!();
 }
@@ -2267,10 +2251,8 @@ extern "rust-preserve-none" fn op_vararg<'gc>(
             count as usize - 1
         };
         let new_top = target + wanted;
-        if thread.stack.len() < new_top {
-            thread.stack.resize(new_top, Value::nil());
-            registers = unsafe { thread.stack.as_mut_ptr().add(base) };
-        }
+        thread.ensure_slots(new_top);
+        registers = unsafe { thread.stack.as_mut_ptr().add(base) };
         let t = table.inner().borrow();
         for i in 0..wanted {
             thread.stack[target + i] = t.raw_get(Value::integer(i as i64 + 1));
@@ -2286,10 +2268,8 @@ extern "rust-preserve-none" fn op_vararg<'gc>(
     if count == 0 {
         // MULTRET: copy all extras and publish the new dynamic top.
         let new_top = target + num_extras;
-        if thread.stack.len() < new_top {
-            thread.stack.resize(new_top, Value::nil());
-            registers = unsafe { thread.stack.as_mut_ptr().add(base) };
-        }
+        thread.ensure_slots(new_top);
+        registers = unsafe { thread.stack.as_mut_ptr().add(base) };
         if num_extras > 0 {
             thread
                 .stack
@@ -2390,10 +2370,7 @@ extern "rust-preserve-none" fn op_varargprep<'gc>(
         // [fixed..., extras...].rotate_left(num_params) => [extras..., fixed...]
         thread.stack[base..base + total].rotate_left(num_params);
         let new_base = base + num_extras;
-        let needed = new_base + max_stack;
-        if thread.stack.len() < needed {
-            thread.stack.resize(needed, Value::nil());
-        }
+        thread.ensure_slots(new_base + max_stack);
         thread.top_lua_mut().unwrap().base = new_base;
         registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
         new_base
@@ -2539,11 +2516,12 @@ fn write_upvalue<'gc>(
     }
 }
 
-/// Invoke a native callback. Clips the thread's stack so the callback sees
-/// exactly `[args_base .. args_base + argc]` as its arguments, constructs a
-/// `Stack` / `NativeContext`, and calls the function. Returns the requested
-/// [`CallbackAction`]; for the hot `Return` path, results count is
-/// `thread.stack.len() - args_base` after the call.
+/// Invoke a native callback. Presents the callback a window whose logical
+/// length is `argc` (`thread.top` seeded to `args_base + argc`); the backing
+/// vec is grown to physically cover the window but is NEVER shrunk, so a
+/// native call cannot truncate the shared stack below an outer frame's
+/// register window. The callback signals its result count through the logical
+/// top: after the `Return` path, the results count is `thread.top - args_base`.
 pub(crate) fn invoke_native<'gc>(
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
@@ -2552,11 +2530,10 @@ pub(crate) fn invoke_native<'gc>(
     argc: usize,
 ) -> Result<crate::vm::sequence::CallbackAction<'gc>, crate::env::Error<'gc>> {
     let end = args_base + argc;
-    if thread.stack.len() > end {
-        thread.stack.truncate(end);
-    } else if thread.stack.len() < end {
-        thread.stack.resize(end, Value::nil());
-    }
+    // Grow-not-shrink: cover the arg window physically, but leave the slots
+    // above it — which may be an outer frame's registers — alone.
+    thread.ensure_slots(end);
+    thread.top = end;
     let current_thread = thread
         .thread_handle
         .expect("ThreadState missing back-reference");
@@ -2565,7 +2542,10 @@ pub(crate) fn invoke_native<'gc>(
         upvalues: &nc.upvalues,
         exec: crate::vm::sequence::Execution::new(current_thread),
     };
-    let stack = Stack::new(&mut thread.stack, args_base);
+    let stack = Stack::new(&mut thread.stack, &mut thread.top, args_base);
+    // The stack is grown-not-shrunk and may leave dead scratch above the logical
+    // top; that's fine because `ThreadState`'s `Collect` traces only the live
+    // high-water (derived from the frames + `top`), so dead slots never retain.
     (nc.function)(nctx, stack)
 }
 
@@ -2625,10 +2605,13 @@ pub(crate) fn frame_return<'gc>(
     let dst_start = cur_base - 1 - num_extras;
 
     if thread.frames.is_empty() {
-        for i in 0..nret {
-            thread.stack[dst_start + i] = thread.stack[values_base + i];
-        }
-        thread.stack.truncate(dst_start + nret);
+        thread
+            .stack
+            .copy_within(values_base..values_base + nret, dst_start);
+        // The thread is done, so nothing above the results is live: pair
+        // `Result { bottom }` with a `top` marking the result end, and release
+        // the rest. Consumers read `stack[bottom..top]`.
+        thread.discard_above(dst_start + nret);
         thread.status = ThreadStatus::Result { bottom: dst_start };
         return FrameReturn::TopLevel;
     }
@@ -2643,20 +2626,25 @@ pub(crate) fn frame_return<'gc>(
     // values). A single copy is safe because `dst_start < values_base`, so each
     // write lands on a slot already consumed.
     if thread.top_lua().is_none() {
-        for i in 0..nret {
-            thread.stack[dst_start + i] = thread.stack[values_base + i];
-        }
-        thread.stack.truncate(dst_start + nret);
-        thread.top = dst_start + nret;
+        thread
+            .stack
+            .copy_within(values_base..values_base + nret, dst_start);
+        // Parent is a Sequence / WaitThread, so no register window sits above
+        // the results — the shrink is legal, and it publishes the parent's
+        // input window as `stack[dst_start..top]`.
+        thread.discard_above(dst_start + nret);
         return FrameReturn::ToNonLua;
     }
 
     // `num_results == 0` is the CALL's MULTRET: deliver all `nret` and publish `thread.top`.
     if num_results == 0 {
-        for i in 0..nret {
-            thread.stack[dst_start + i] = thread.stack[values_base + i];
-        }
-        thread.top = dst_start + nret;
+        thread
+            .stack
+            .copy_within(values_base..values_base + nret, dst_start);
+        // Publishing through `set_top` also nils the donor copies the down-shift
+        // left in the popped callee's registers, which would otherwise stay
+        // traced as the caller's dead scratch.
+        thread.set_top(dst_start + nret);
     } else {
         let wanted = num_results as usize - 1;
         let to_copy = nret.min(wanted);
@@ -2666,6 +2654,13 @@ pub(crate) fn frame_return<'gc>(
         for i in to_copy..wanted {
             thread.stack[dst_start + i] = Value::nil();
         }
+        // Publish the landing end. Without this, a `top` left high by a multires
+        // producer *inside the callee* would still be the high-water long after
+        // the callee popped, so `live_top` would keep tracing its dead registers
+        // — the exact #43 leak, just via a stale `top` instead of the vec length.
+        // Also nils those registers, which are dead scratch: `dst_start` is the
+        // caller's function slot, and everything from there up is free.
+        thread.set_top(dst_start + wanted);
     }
 
     let caller = thread.top_lua().unwrap();
@@ -2908,10 +2903,7 @@ fn resolve_call_chain<'gc>(
             return None;
         }
         let actual_args = nargs as usize - 1;
-        let end = func_idx + 2 + actual_args;
-        if thread.stack.len() < end {
-            thread.stack.resize(end, Value::nil());
-        }
+        thread.ensure_slots(func_idx + 2 + actual_args);
         for i in (0..actual_args).rev() {
             thread.stack[func_idx + 2 + i] = thread.stack[func_idx + 1 + i];
         }
@@ -2995,10 +2987,7 @@ fn schedule_meta_call<'gc>(
     let new_base = scratch_func + 1;
 
     // Stage meta_fn + args so resolve_call_chain sees them in op_call layout.
-    let staged_end = new_base + args.len();
-    if thread.stack.len() < staged_end {
-        thread.stack.resize(staged_end, Value::nil());
-    }
+    thread.ensure_slots(new_base + args.len());
     thread.stack[scratch_func] = meta_fn;
     for (i, &a) in args.iter().enumerate() {
         thread.stack[new_base + i] = a;
@@ -3029,10 +3018,7 @@ fn schedule_meta_call<'gc>(
     };
 
     // Grow stack to fit the resolved closure's full frame.
-    let needed = new_base + closure.proto.max_stack_size as usize;
-    if thread.stack.len() < needed {
-        thread.stack.resize(needed, Value::nil());
-    }
+    thread.ensure_slots(new_base + closure.proto.max_stack_size as usize);
 
     // Nil-fill any parameter slots not covered by the (possibly shifted) args.
     let num_params = closure.proto.num_params as usize;
@@ -3088,8 +3074,9 @@ fn schedule_native_meta_call<'gc>(
 
     match action {
         CallbackAction::Return => {
-            // `invoke_native` truncated the stack to `args_base + retc`.
-            let nret = (thread.stack.len() - args_base) as u8;
+            // Result count via the logical top; the staged scratch window sits
+            // above the caller frame, so nothing shrank the caller's window.
+            let nret = (thread.top - args_base) as u8;
             MetaDispatch::NativeReturn {
                 results_base: args_base,
                 nret,

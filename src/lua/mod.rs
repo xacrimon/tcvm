@@ -77,6 +77,19 @@ impl Lua {
         Lua { arena }
     }
 
+    /// Force a full garbage-collection cycle (mark + sweep) to completion.
+    /// Exposed mainly as a GC-soundness test/debug hook; a real
+    /// `collectgarbage("collect")` would route here.
+    pub fn collect_all(&mut self) {
+        self.arena.finish_cycle();
+    }
+
+    /// Bytes currently held by live GC allocations. Only meaningful right
+    /// after [`Lua::collect_all`]; mid-cycle it still counts unswept garbage.
+    pub fn live_bytes(&self) -> usize {
+        self.arena.metrics().total_gc_allocation()
+    }
+
     /// Run `f` inside the arena's mutation context.
     pub fn enter<F, T>(&mut self, f: F) -> T
     where

@@ -1,4 +1,4 @@
-use crate::dmm::{Collect, Gc, Mutation, Ref, RefLock, RefMut};
+use crate::dmm::{Collect, Gc, Mutation, Ref, RefLock, RefMut, Trace};
 use crate::env::error::Error;
 use crate::env::function::{Function, LuaClosure, Upvalue};
 use crate::env::value::Value;
@@ -114,18 +114,45 @@ pub enum Frame<'gc> {
 }
 
 /// The mutable state of a thread/coroutine.
-#[derive(Collect)]
-#[collect(internal, no_drop)]
+///
+/// # The stack invariant
+///
+/// `stack` is *physical storage*; `top` is the *logical* stack top. They are
+/// not the same thing and `Vec::len()` must never be read as the logical end.
+/// Three rules, enforced by the `stack_*` accessors below — go through them
+/// rather than touching `stack`/`top` directly:
+///
+///  1. `top <= stack.len()` at all times.
+///  2. The vec is **grown, never shrunk**, while any frame is live. A native
+///     callback runs on the *same* vec as its caller, so a shrink would pull
+///     the backing store out from under an outer frame's register window (and
+///     the interpreter's raw `registers` pointer). The only sanctioned shrink
+///     is [`ThreadState::discard_above`], whose caller must guarantee nothing
+///     above the cut is live.
+///  3. Because of (2), removing values means **lowering `top` and nil-filling
+///     what it vacates** — the nil-fill is what actually releases them, since
+///     the slots stay physically present and everything below `live_top` is
+///     traced (see the `Collect` impl).
+///
+/// The *live region* is `[0 .. max(top, top_lua.base + max_stack_size))`: a
+/// Lua frame's register window is live regardless of `top` (the interpreter
+/// addresses registers off `base`, not `top`), while `top` covers the
+/// value-passing window — args and results in flight between frames — which
+/// can sit above the frames during a native call.
 pub struct ThreadState<'gc> {
-    // See #43: custom Collect impl to avoid unused stack slots keeping values alive.
+    /// Backing store. May hold dead slots above the live region; they are
+    /// kept nil so the `Collect` impl below cannot retain them.
     pub stack: Vec<Value<'gc>>,
     pub frames: Vec<Frame<'gc>>,
     pub open_upvalues: Vec<Upvalue<'gc>>,
     pub tbc_slots: Vec<usize>,
     pub status: ThreadStatus,
-    /// Dynamic top register: written by a multires producer (`VARARG`/`CALL`/
-    /// `TAILCALL` with the `0` sentinel, native multi-return) and read by the
-    /// matching consumer. Undefined outside that producer→consumer window.
+    /// Logical stack top — the end of the value-passing window. Always valid:
+    /// it is the sole signal of "how many values are here" across every
+    /// hand-off (native args/results, yields, sequence polls, thread resume,
+    /// `Result`). Multires producers (`VARARG`/`CALL`/`TAILCALL` with the `0`
+    /// sentinel, native multi-return) publish through it; their consumers read
+    /// it back.
     pub top: usize,
     /// Back-reference to the owning Thread handle, needed for creating open upvalues.
     pub thread_handle: Option<Thread<'gc>>,
@@ -139,8 +166,46 @@ pub struct ThreadState<'gc> {
     /// `SequencePoll::Yield`/`TailYield`). Consumed on resume to recover
     /// where the call's results should land. `None` outside of yielded
     /// state.
-    #[collect(require_static)]
     pub yield_bottom: Option<CallSite>,
+}
+
+// SAFETY: traces every field that can own a `Gc` pointer. The only subtlety is
+// `stack` (issue #43): it is grown-not-shrunk, so slots above the live region
+// are dead scratch and must NOT be traced — tracing the whole vec would retain
+// whatever a since-returned callee happened to leave in its registers.
+// `live_top` is the sound live high-water:
+//   * Lua registers live in `[base, base + max_stack)`; callee bases strictly
+//     increase up the stack, so the topmost Lua frame's `base + max_stack`
+//     bounds every frame's live registers (lower frames' live regs sit below
+//     their callee's base, which is <= the top frame's base). Varargs/extras
+//     sit below a base, so `[0..live_top]` covers them too.
+//   * `top` adds the value-passing window that can sit above the Lua frames
+//     (native args/results, a paused multires window). It is `max`ed with the
+//     frame floor, so it can only raise the bound, never lower it, and thus
+//     can never cause an under-trace.
+// Correctness therefore rests on rule (3) of the stack invariant: anything
+// dropped from the logical stack is nil-filled, so a dead slot that happens to
+// fall below `live_top` still retains nothing.
+// `tbc_slots`/`status`/`top`/`yield_bottom` hold no `Gc` pointers.
+unsafe impl<'gc> Collect<'gc> for ThreadState<'gc> {
+    fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
+        let live_top = self
+            .frames
+            .iter()
+            .filter_map(|f| match f {
+                Frame::Lua(lf) => Some(lf.base + lf.closure.proto.max_stack_size as usize),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+            .max(self.top)
+            .min(self.stack.len());
+        cc.trace(&self.stack[..live_top]);
+        cc.trace(&self.frames);
+        cc.trace(&self.open_upvalues);
+        cc.trace(&self.thread_handle);
+        cc.trace(&self.pending_action);
+    }
 }
 
 /// A native callback wants to suspend / call / yield / resume; the executor
@@ -209,6 +274,82 @@ impl<'gc> ThreadState<'gc> {
     #[inline]
     pub fn push_lua(&mut self, lf: LuaFrame<'gc>) {
         self.frames.push(Frame::Lua(lf));
+    }
+
+    // --- Stack accessors -------------------------------------------------
+    //
+    // These enforce the stack invariant documented on `ThreadState`. Prefer
+    // them over touching `stack` / `top` directly; the only code that should
+    // index `stack` raw is register access off a frame's `base`.
+
+    /// Make `stack[..n]` physically addressable. Grow-only, per rule (2).
+    #[inline]
+    pub fn ensure_slots(&mut self, n: usize) {
+        if self.stack.len() < n {
+            self.stack.resize(n, Value::nil());
+        }
+    }
+
+    /// The logical window `stack[bottom..top]`.
+    #[inline]
+    pub fn window(&self, bottom: usize) -> &[Value<'gc>] {
+        &self.stack[bottom..self.top]
+    }
+
+    /// Publish a new logical top, nil-filling any slots it vacates (rule 3).
+    /// Raising the top only exposes slots the caller has already written.
+    #[inline]
+    pub fn set_top(&mut self, n: usize) {
+        self.ensure_slots(n);
+        if n < self.top {
+            self.stack[n..self.top].fill(Value::nil());
+        }
+        self.top = n;
+    }
+
+    /// Replace the window at `bottom` with `values` and publish the new top.
+    pub fn set_window<I>(&mut self, bottom: usize, values: I)
+    where
+        I: IntoIterator<Item = Value<'gc>>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let values = values.into_iter();
+        let end = bottom + values.len();
+        self.ensure_slots(end);
+        for (i, v) in values.enumerate() {
+            self.stack[bottom + i] = v;
+        }
+        self.set_top(end);
+    }
+
+    /// Move the window at `bottom` out, leaving `top == bottom`.
+    pub fn take_window(&mut self, bottom: usize) -> Vec<Value<'gc>> {
+        let values = self.window(bottom).to_vec();
+        self.set_top(bottom);
+        values
+    }
+
+    /// Insert `v` at `at`, shifting `stack[at..top]` up one slot. The call
+    /// convention wants the function immediately below its args, but a
+    /// suspended callback leaves only args behind — this splices the function
+    /// back in.
+    pub fn insert_at(&mut self, at: usize, v: Value<'gc>) {
+        debug_assert!(at <= self.top);
+        self.ensure_slots(self.top + 1);
+        self.stack.copy_within(at..self.top, at + 1);
+        self.stack[at] = v;
+        self.top += 1;
+    }
+
+    /// Cut the stack down to exactly `n` slots, releasing the storage above it.
+    /// The **only** sanctioned shrink (rule 2): the caller must guarantee no
+    /// live frame window and no in-flight native call sits above `n` — i.e. a
+    /// thread being seeded, unwound, or terminated, never one with a native
+    /// callback on the stack.
+    pub fn discard_above(&mut self, n: usize) {
+        debug_assert!(n <= self.stack.len());
+        self.stack.truncate(n);
+        self.top = n;
     }
 }
 

@@ -81,13 +81,16 @@ impl<'gc> Executor<'gc> {
         let thread = ctx.main_thread();
         {
             let mc = ctx.mutation();
+            let mut buf: Vec<Value<'gc>> = Vec::new();
+            args.push_into(&mut buf);
+
             let mut ts = thread.borrow_mut(mc);
-            ts.stack.clear();
+            ts.discard_above(0);
             ts.frames.clear();
             ts.open_upvalues.clear();
             ts.tbc_slots.clear();
 
-            args.push_into(&mut ts.stack);
+            ts.set_window(0, buf);
             ts.frames.push(Frame::Start(function));
             ts.status = ThreadStatus::Suspended;
         }
@@ -181,7 +184,7 @@ impl<'gc> Executor<'gc> {
                     // the dispatch step below handles. Don't conflate.
                     let values: Option<Vec<Value<'gc>>> = {
                         let ts = top.borrow();
-                        ts.yield_bottom.map(|y| ts.stack[y.bottom..].to_vec())
+                        ts.yield_bottom.map(|y| ts.window(y.bottom).to_vec())
                     };
                     if let Some(values) = values {
                         let mut inner = self.0.borrow_mut(mc);
@@ -248,7 +251,7 @@ impl<'gc> Executor<'gc> {
                         Some(Frame::Start(f)) => f,
                         _ => unreachable!(),
                     };
-                    ts.stack.insert(0, Value::function(f));
+                    ts.insert_at(0, Value::function(f));
                     schedule_call_at(&mut ts, ctx, 0, f, 0)?;
                     if ts.frames.is_empty() && ts.pending_action.is_none() {
                         // Native entry returned `Return` synchronously;
@@ -308,8 +311,7 @@ impl<'gc> Executor<'gc> {
         args.push_into(&mut buf);
         {
             let mut ts = top.borrow_mut(mc);
-            ts.stack.truncate(cs.bottom);
-            ts.stack.extend(buf);
+            ts.set_window(cs.bottom, buf);
             // Branch on top frame: a Sequence consumes values from
             // stack[seq.bottom..] on its next poll, so we leave them at
             // `bottom`. A Lua frame on top means the yield came from a
@@ -319,7 +321,15 @@ impl<'gc> Executor<'gc> {
             if !matches!(ts.frames.last(), Some(Frame::Sequence { .. })) {
                 land_call_results(&mut ts, cs);
             }
-            ts.status = ThreadStatus::Normal;
+            // `land_call_results` may have *terminated* the thread: a tail-called
+            // native suspends with the calling Lua frame already popped, so the
+            // resume that lands its results empties the frame stack and sets
+            // `Result`. Clobbering that with `Normal` would send the driver back
+            // around the loop with no frame to pump. Same guard as
+            // `propagate_inner_to_resumer`.
+            if !matches!(ts.status, ThreadStatus::Result { .. }) {
+                ts.status = ThreadStatus::Normal;
+            }
         }
         {
             let mut inner = self.0.borrow_mut(mc);
@@ -339,9 +349,14 @@ impl<'gc> Executor<'gc> {
             return Err(RuntimeError::BadMode);
         }
 
+        // Results are the window `stack[bottom..top]` recorded by the
+        // `Result` status; the vec itself may run past `top` (grow-not-shrink).
         let values: Vec<Value<'gc>> = {
             let ts = thread.borrow();
-            ts.stack.clone()
+            let ThreadStatus::Result { bottom } = ts.status else {
+                return Err(RuntimeError::BadMode);
+            };
+            ts.window(bottom).to_vec()
         };
         let result = R::from_multi_value(&values).map_err(RuntimeError::from);
 
@@ -349,7 +364,7 @@ impl<'gc> Executor<'gc> {
         {
             let mc = ctx.mutation();
             let mut ts = thread.borrow_mut(mc);
-            ts.stack.clear();
+            ts.discard_above(0);
             ts.frames.clear();
             ts.open_upvalues.clear();
             ts.tbc_slots.clear();
@@ -414,7 +429,7 @@ fn apply_pending_action<'gc>(
             // slot in front; insert the function so the layout matches
             // schedule_call_at's convention (function at slot, args
             // after).
-            ts.stack.insert(call_site.bottom, Value::function(function));
+            ts.insert_at(call_site.bottom, Value::function(function));
             schedule_call_at(&mut ts, ctx, call_site.bottom, function, call_site.returns)?;
         }
         CallbackAction::Yield { then } => {
@@ -479,7 +494,7 @@ fn schedule_thread_resume<'gc>(
     }
     let args: Vec<Value<'gc>> = {
         let mut rs = resumer.borrow_mut(mc);
-        rs.stack.drain(args_abs_bottom..).collect()
+        rs.take_window(args_abs_bottom)
     };
     {
         let mut ts = target.borrow_mut(mc);
@@ -488,8 +503,8 @@ fn schedule_thread_resume<'gc>(
         {
             // First-resume: stash args at the bottom of the stack; the
             // `Frame::Start` handler sets up the call frame on next pump.
-            ts.stack.clear();
-            ts.stack.extend(args);
+            ts.discard_above(0);
+            ts.set_window(0, args);
             ts.status = ThreadStatus::Normal;
         } else if matches!(ts.status, ThreadStatus::Suspended) {
             // Mid-resume: target previously yielded. Drain yield_bottom
@@ -501,8 +516,7 @@ fn schedule_thread_resume<'gc>(
                 Some(y) => y,
                 None => return Err(RuntimeError::BadMode),
             };
-            ts.stack.truncate(y.bottom);
-            ts.stack.extend(args);
+            ts.set_window(y.bottom, args);
             if !matches!(ts.frames.last(), Some(Frame::Sequence { .. })) {
                 land_call_results(&mut ts, y);
             }
@@ -528,17 +542,14 @@ fn schedule_call_at<'gc>(
 ) -> Result<(), RuntimeError> {
     if let Some(closure) = function.as_lua() {
         let base = slot + 1;
-        let caller_provided = ts.stack.len().saturating_sub(base);
+        let caller_provided = ts.top.saturating_sub(base);
         let num_params = closure.proto.num_params as usize;
         let num_extras = if closure.proto.is_vararg {
             caller_provided.saturating_sub(num_params) as u32
         } else {
             0
         };
-        let needed = base + closure.proto.max_stack_size as usize;
-        if ts.stack.len() < needed {
-            ts.stack.resize(needed, Value::nil());
-        }
+        ts.ensure_slots(base + closure.proto.max_stack_size as usize);
         // Nil-fill fixed params the caller didn't supply.
         for i in caller_provided..num_params {
             ts.stack[base + i] = Value::nil();
@@ -559,7 +570,7 @@ fn schedule_call_at<'gc>(
             .as_native()
             .expect("function is neither Lua nor Native");
         let args_base = slot + 1;
-        let argc = ts.stack.len() - args_base;
+        let argc = ts.top - args_base;
         let action = match vm::interp::invoke_native(ctx, ts, nc, args_base, argc) {
             Ok(a) => a,
             Err(e) => {
@@ -574,14 +585,14 @@ fn schedule_call_at<'gc>(
         };
         match action {
             CallbackAction::Return => {
-                // Move stack[args_base..] down to stack[slot..]. (Slot is
+                // Move stack[args_base..top] down to stack[slot..]. (Slot is
                 // where the function used to sit; the function itself is
                 // stored back in [slot] before the call by the caller.)
-                let retc = ts.stack.len() - args_base;
-                for i in 0..retc {
-                    ts.stack[slot + i] = ts.stack[args_base + i];
-                }
-                ts.stack.truncate(slot + retc);
+                let retc = ts.top - args_base;
+                ts.stack.copy_within(args_base..args_base + retc, slot);
+                // Drops the function slot and the one stale donor copy the
+                // shift-by-one leaves behind, nil-filling both.
+                ts.set_top(slot + retc);
                 Ok(())
             }
             other => {
@@ -632,9 +643,16 @@ fn pump_sequence<'gc>(
             _ => unreachable!("pump_sequence: top wasn't Frame::Sequence"),
         }
     };
+    // The sequence's input values are the window `stack[call_site.bottom..top]`,
+    // already published by whoever produced them (the suspending native, a
+    // landed call, a resume). Its mutators write `top` back through the view.
     let poll_result = {
         let mut ts = top.borrow_mut(mc);
-        let stack_view = crate::env::function::Stack::new(&mut ts.stack, call_site.bottom);
+        // Split disjoint field borrows through a single deref of the RefMut
+        // (the compiler can't split borrows across `RefMut`'s `Deref`).
+        let ts: &mut crate::env::thread::ThreadState<'gc> = &mut ts;
+        let stack_view =
+            crate::env::function::Stack::new(&mut ts.stack, &mut ts.top, call_site.bottom);
         let exec = Execution::new(top);
         if let Some(err) = pending_error {
             seq.error(ctx, exec, err, stack_view)
@@ -670,7 +688,7 @@ fn pump_sequence<'gc>(
                 pending_error: None,
             });
             // Schedule the call: insert function at abs_bottom, args after.
-            ts.stack.insert(abs_bottom, Value::function(function));
+            ts.insert_at(abs_bottom, Value::function(function));
             schedule_call_at(&mut ts, ctx, abs_bottom, function, 0)?;
         }
         Ok(SequencePoll::TailCall(function)) => {
@@ -681,13 +699,14 @@ fn pump_sequence<'gc>(
             // bottom lives inside the popped tail-callee's window).
             // Compact down to func_idx+1, then place the function.
             let mut ts = top.borrow_mut(mc);
-            let argc = ts.stack.len() - call_site.bottom;
+            // The sequence left its tail-call args at `stack[bottom..top]`.
+            let argc = ts.top - call_site.bottom;
             let new_args_base = call_site.func_idx + 1;
             if new_args_base < call_site.bottom {
-                for i in 0..argc {
-                    ts.stack[new_args_base + i] = ts.stack[call_site.bottom + i];
-                }
-                ts.stack.truncate(new_args_base + argc);
+                ts.stack
+                    .copy_within(call_site.bottom..call_site.bottom + argc, new_args_base);
+                // Nils the stale copies the down-shift left above the args.
+                ts.set_top(new_args_base + argc);
             }
             ts.stack[call_site.func_idx] = Value::function(function);
             schedule_call_at(
@@ -762,7 +781,7 @@ fn propagate_inner_to_resumer<'gc>(
     let mc = ctx.mutation();
     let values: Vec<Value<'gc>> = {
         let ts = inner.borrow();
-        ts.stack[inner_bottom..].to_vec()
+        ts.window(inner_bottom).to_vec()
     };
     // Pop the inner thread.
     exec.0.borrow_mut(mc).thread_stack.pop();
@@ -771,8 +790,7 @@ fn propagate_inner_to_resumer<'gc>(
     // resume-args should land. After Result, clear the inner's stack
     // so subsequent fetches see an empty thread.
     if !inner_yielded {
-        let mut ts = inner.borrow_mut(mc);
-        ts.stack.clear();
+        inner.borrow_mut(mc).discard_above(0);
     }
     let resumer = *exec.0.borrow().thread_stack.last().unwrap();
     let mut rs = resumer.borrow_mut(mc);
@@ -784,8 +802,7 @@ fn propagate_inner_to_resumer<'gc>(
     // call frame to consume. If a `then` sequence sits underneath, it'll
     // pick them up at its own `bottom == wt.bottom`. If not, do the
     // standard CALL-landing right now.
-    rs.stack.truncate(wt.bottom);
-    rs.stack.extend(values);
+    rs.set_window(wt.bottom, values);
     let next_is_sequence = matches!(rs.frames.last(), Some(Frame::Sequence { .. }));
     if !next_is_sequence {
         // No follow-up sequence: deliver results directly to the original
@@ -818,12 +835,23 @@ fn land_call_results<'gc>(ts: &mut crate::env::thread::ThreadState<'gc>, cs: Cal
         returns,
         cont: _,
     } = cs;
-    let retc = ts.stack.len() - bottom;
+    // The producer published its value count through `top`.
+    let retc = ts.top - bottom;
     let wanted = if returns == 0 {
         retc
     } else {
         returns as usize - 1
     };
+    // Cover both the write range and — if a Lua caller is on top — its full
+    // register window, which the interpreter will address off `base` through a
+    // raw pointer the moment we hand control back.
+    let needed = match ts.top_lua() {
+        Some(frame) => {
+            (func_idx + wanted).max(frame.base + frame.closure.proto.max_stack_size as usize)
+        }
+        None => func_idx + wanted,
+    };
+    ts.ensure_slots(needed);
     let to_copy = retc.min(wanted);
     for i in 0..to_copy {
         ts.stack[func_idx + i] = ts.stack[bottom + i];
@@ -831,22 +859,12 @@ fn land_call_results<'gc>(ts: &mut crate::env::thread::ThreadState<'gc>, cs: Cal
     for i in to_copy..wanted {
         ts.stack[func_idx + i] = Value::nil();
     }
-    if returns == 0 {
-        // MULTRET: publish the dynamic top for the next consumer, mirroring
-        // the inline native-return path in `op_call` (a fixed-results call
-        // reads registers, not `top`, so only this branch must set it).
-        ts.stack.truncate(func_idx + retc);
-        ts.top = func_idx + retc;
-    } else {
-        // Keep stack >= func_idx + wanted; restore caller's max_stack_size
-        // window if a Lua frame is on top.
-        if let Some(frame) = ts.top_lua() {
-            let needed = frame.base + frame.closure.proto.max_stack_size as usize;
-            if ts.stack.len() < needed {
-                ts.stack.resize(needed, Value::nil());
-            }
-        }
-    }
+    // Publish the logical top: MULTRET delivers all `retc`, a fixed-results
+    // call exactly `wanted`. This also nils the stale copies the down-shift
+    // left above the results — safe because `func_idx` is where the CALL put
+    // the function, and everything at or above a call's function slot is free
+    // scratch in the caller's register allocation.
+    ts.set_top(func_idx + if returns == 0 { retc } else { wanted });
     if ts.frames.is_empty() {
         ts.status = ThreadStatus::Result { bottom: func_idx };
     }
@@ -868,7 +886,8 @@ fn apply_native_continuation<'gc>(
     bottom: usize,
     cont: Continuation,
 ) {
-    let retc = ts.stack.len() - bottom;
+    // Count via the logical top (set by the producing landing site).
+    let retc = ts.top - bottom;
     let result0 = if retc > 0 {
         ts.stack[bottom]
     } else {
@@ -885,7 +904,8 @@ fn apply_native_continuation<'gc>(
         }
         ContinuationPayload::IgnoreResult => {}
         ContinuationPayload::CondJump { offset, inverted } => {
-            if !result0.is_falsy() != inverted {
+            let truthy = !result0.is_falsy();
+            if truthy != inverted {
                 let frame = ts.top_lua_mut().unwrap();
                 frame.pc = (frame.pc as i64 + offset as i64) as usize;
             }
@@ -902,15 +922,15 @@ fn apply_native_continuation<'gc>(
         }
     }
 
-    // Restore the caller's full register window (scratch staging / the
-    // suspended call may have left the stack shorter).
-    let needed = {
+    // The payload is applied, so the staging window (`meta_fn` + args + results,
+    // all parked at `caller_top..`) is spent: drop it, which nils it. Doubles as
+    // the guarantee that the caller's register window is physically covered
+    // before the interpreter re-derives its raw register pointer off `base`.
+    let caller_top = {
         let frame = ts.top_lua().unwrap();
         frame.base + frame.closure.proto.max_stack_size as usize
     };
-    if ts.stack.len() < needed {
-        ts.stack.resize(needed, Value::nil());
-    }
+    ts.set_top(caller_top);
 }
 
 /// Walk a thread's frame stack popping Lua/Wait frames (closing upvalues
@@ -940,7 +960,9 @@ fn unwind_error<'gc>(
                     ts.frames.pop();
                     vm::interp::close_upvalues(mc, &mut ts, base);
                     vm::interp::close_tbc_vars(mc, &mut ts, base);
-                    ts.stack.truncate(base);
+                    // The frame and everything above it is dead, so this is one
+                    // of the few places a shrink is legal.
+                    ts.discard_above(base);
                 }
                 Some(Frame::Sequence { .. }) => {
                     if let Some(Frame::Sequence { pending_error, .. }) = ts.frames.last_mut() {
