@@ -116,7 +116,14 @@ impl AsyncSequence {
         self.shared.visit(move |shared| {
             // SAFETY: Re-borrowing the stack vec for the closure's
             // duration. `visit` already enforces the slot's lifetime.
-            let stack = Stack::new(shared.stack_buf, shared.stack_bottom);
+            // Reborrow both stack refs so each `enter` gets a fresh
+            // disjoint borrow; mutations to the logical top persist across
+            // calls (the borrow targets the live `thread.top`).
+            let stack = Stack::new(
+                &mut *shared.stack_buf,
+                &mut *shared.stack_top,
+                shared.stack_bottom,
+            );
             f(
                 shared.ctx,
                 Locals {
@@ -142,7 +149,14 @@ impl AsyncSequence {
     {
         self.shared.visit(move |shared| {
             let mc = shared.ctx.mutation();
-            let stack = Stack::new(shared.stack_buf, shared.stack_bottom);
+            // Reborrow both stack refs so each `enter` gets a fresh
+            // disjoint borrow; mutations to the logical top persist across
+            // calls (the borrow targets the live `thread.top`).
+            let stack = Stack::new(
+                &mut *shared.stack_buf,
+                &mut *shared.stack_top,
+                shared.stack_bottom,
+            );
             f(
                 shared.ctx,
                 Locals {
@@ -294,7 +308,7 @@ where
         let SequenceImpl { shared, roots, fut } = this;
         let roots_local = *roots;
 
-        let (stack_buf, stack_bottom) = stack.into_parts();
+        let (stack_buf, stack_top, stack_bottom) = stack.into_parts();
 
         let mut next_op: Option<SequenceOp<'gc>> = None;
 
@@ -304,6 +318,7 @@ where
                 ctx,
                 exec,
                 stack_buf,
+                stack_top,
                 stack_bottom,
                 error,
                 next_op: &mut next_op,
@@ -406,6 +421,11 @@ struct Shared<'gc, 'a> {
     /// Live mutable view of the underlying value-stack vec; used to
     /// reconstruct a `Stack<'gc, '_>` per `enter` call.
     stack_buf: &'a mut Vec<Value<'gc>>,
+    /// Live alias of `thread.top` — the authoritative logical window top.
+    /// Reborrowed into each reconstructed `Stack` so mutations persist
+    /// across `enter` calls and are visible to the executor after poll.
+    /// Rides the same whole-struct lifetime transmute as `stack_buf`.
+    stack_top: &'a mut usize,
     stack_bottom: usize,
     error: Option<Error<'gc>>,
     next_op: &'a mut Option<SequenceOp<'gc>>,

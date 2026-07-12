@@ -121,27 +121,43 @@ pub struct NativeContext<'gc, 'a> {
     pub exec: Execution<'gc, 'a>,
 }
 
-/// A mutable view into the running thread's value stack, starting at
-/// `bottom`. The callback sees `stack[0..len()]` as its arguments on entry;
-/// any values it leaves on the stack (via `push`, `extend`, or `replace`)
-/// become the callback's return values.
+/// A mutable view into the running thread's value stack, spanning
+/// `stack[bottom..*top]`. The callback sees `stack[0..len()]` as its
+/// arguments on entry; any values it leaves in the window (via `push`,
+/// `extend`, or `replace`) become the callback's return values.
+///
+/// The logical window length is carried by `*top` (an alias of
+/// `thread.top`), NOT by `Vec::len()`: the backing vec is treated as
+/// storage kept at its high-water length and is never shrunk by a
+/// callback. The result count is therefore signalled through the logical
+/// top, which the invoker reads back as `*top - bottom` after the call —
+/// decoupling the window from the shared vec so a native call can never
+/// truncate it below an outer frame's register window.
 pub struct Stack<'gc, 'a> {
     values: &'a mut Vec<Value<'gc>>,
+    /// Authoritative logical top (an alias of `thread.top`). Mutators
+    /// update it; read accessors bound by it.
+    top: &'a mut usize,
     bottom: usize,
 }
 
 impl<'gc, 'a> Stack<'gc, 'a> {
     #[inline]
-    pub(crate) fn new(values: &'a mut Vec<Value<'gc>>, bottom: usize) -> Self {
-        debug_assert!(bottom <= values.len());
-        Stack { values, bottom }
+    pub(crate) fn new(values: &'a mut Vec<Value<'gc>>, top: &'a mut usize, bottom: usize) -> Self {
+        debug_assert!(bottom <= *top && *top <= values.len());
+        Stack {
+            values,
+            top,
+            bottom,
+        }
     }
 
     /// Destructure the borrowed view back into its underlying parts. Used
-    /// by `async_sequence` to ferry the live stack through a `SharedSlot`.
+    /// by `async_sequence` to ferry the live stack (and logical top)
+    /// through a `SharedSlot`.
     #[inline]
-    pub(crate) fn into_parts(self) -> (&'a mut Vec<Value<'gc>>, usize) {
-        (self.values, self.bottom)
+    pub(crate) fn into_parts(self) -> (&'a mut Vec<Value<'gc>>, &'a mut usize, usize) {
+        (self.values, self.top, self.bottom)
     }
 
     /// Stack-bottom index relative to the underlying vec.
@@ -152,55 +168,68 @@ impl<'gc, 'a> Stack<'gc, 'a> {
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.values.len() - self.bottom
+        *self.top - self.bottom
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.values.len() == self.bottom
+        *self.top == self.bottom
     }
 
     /// Read the value at index `i` within the callback's window, or `Nil`
-    /// if `i` is past the end. Mirrors Lua's "missing args are nil" rule.
+    /// if `i` is past the logical top. Mirrors Lua's "missing args are
+    /// nil" rule.
     #[inline]
     pub fn get(&self, i: usize) -> Value<'gc> {
-        self.values
-            .get(self.bottom + i)
-            .copied()
-            .unwrap_or(Value::nil())
+        let idx = self.bottom + i;
+        if idx < *self.top {
+            self.values[idx]
+        } else {
+            Value::nil()
+        }
     }
 
     #[inline]
     pub fn as_slice(&self) -> &[Value<'gc>] {
-        &self.values[self.bottom..]
+        &self.values[self.bottom..*self.top]
     }
 
     #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [Value<'gc>] {
-        &mut self.values[self.bottom..]
+        &mut self.values[self.bottom..*self.top]
     }
 
-    /// Discard everything in the window (args included).
+    /// Discard everything in the window (args included). Lowers the logical top
+    /// without shrinking the backing vec; the discarded slots are nil-filled,
+    /// since leaving them set would let the GC trace still reach them.
     #[inline]
     pub fn clear(&mut self) {
-        self.values.truncate(self.bottom);
+        self.values[self.bottom..*self.top].fill(Value::nil());
+        *self.top = self.bottom;
     }
 
     #[inline]
     pub fn push(&mut self, v: Value<'gc>) {
-        self.values.push(v);
+        if *self.top == self.values.len() {
+            self.values.push(v);
+        } else {
+            self.values[*self.top] = v;
+        }
+        *self.top += 1;
     }
 
     #[inline]
     pub fn extend<I: IntoIterator<Item = Value<'gc>>>(&mut self, iter: I) {
-        self.values.extend(iter);
+        for v in iter {
+            self.push(v);
+        }
     }
 
     /// Convenience for the common "clear args, push N results" pattern.
     #[inline]
     pub fn replace(&mut self, values: &[Value<'gc>]) {
-        self.values.truncate(self.bottom);
-        self.values.extend_from_slice(values);
+        self.clear();
+        self.extend(values.iter().copied());
     }
 }
 
@@ -208,7 +237,9 @@ impl<'gc, 'a> std::ops::Index<usize> for Stack<'gc, 'a> {
     type Output = Value<'gc>;
     #[inline]
     fn index(&self, i: usize) -> &Value<'gc> {
-        &self.values[self.bottom + i]
+        let idx = self.bottom + i;
+        debug_assert!(idx < *self.top);
+        &self.values[idx]
     }
 }
 
