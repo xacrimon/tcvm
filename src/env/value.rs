@@ -1,3 +1,4 @@
+use core::cell::Cell;
 use core::hash::{Hash, Hasher};
 use std::hint;
 use std::marker::PhantomData;
@@ -199,6 +200,58 @@ impl<'gc> Value<'gc> {
             ValueKind::Function => "function",
             ValueKind::Thread => "thread",
             ValueKind::Userdata => "userdata",
+        }
+    }
+}
+
+bitflags::bitflags! {
+    /// A set of observed `ValueKind`s, one bit per kind.
+    ///
+    /// Recorded per inline-cache site so the JIT can learn what a load actually
+    /// produces. A shape proves *where* a field lives, never *what* it holds —
+    /// so without this a field read has to stay generic, and every arithmetic op
+    /// consuming it stays a metamethod-capable call.
+    ///
+    /// Booleans collapse to a single bit: no consumer of this cares which.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+    pub struct KindSet: u16 {
+        const NIL = 1 << 0;
+        const BOOLEAN = 1 << 1;
+        const INTEGER = 1 << 2;
+        const FLOAT = 1 << 3;
+        const STRING = 1 << 4;
+        const TABLE = 1 << 5;
+        const FUNCTION = 1 << 6;
+        const THREAD = 1 << 7;
+        const USERDATA = 1 << 8;
+    }
+}
+
+impl KindSet {
+    #[inline]
+    pub fn of(v: Value<'_>) -> Self {
+        match v.kind() {
+            ValueKind::Nil => Self::NIL,
+            ValueKind::Boolean => Self::BOOLEAN,
+            ValueKind::Integer => Self::INTEGER,
+            ValueKind::Float => Self::FLOAT,
+            ValueKind::String => Self::STRING,
+            ValueKind::Table => Self::TABLE,
+            ValueKind::Function => Self::FUNCTION,
+            ValueKind::Thread => Self::THREAD,
+            ValueKind::Userdata => Self::USERDATA,
+        }
+    }
+
+    /// Fold `v` into the set. Hot-path call: the common case is a set that
+    /// already contains the kind, so this is a load, a test, and a
+    /// well-predicted not-taken branch.
+    #[inline]
+    pub fn observe(cell: &Cell<Self>, v: Value<'_>) {
+        let k = Self::of(v);
+        let seen = cell.get();
+        if !seen.contains(k) {
+            cell.set(seen | k);
         }
     }
 }

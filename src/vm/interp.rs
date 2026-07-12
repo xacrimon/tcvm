@@ -440,6 +440,18 @@ macro_rules! table_set_slow_body {
 /// `SETTABUP` instruction whose prototype was assembled with a matching
 /// `ic_table` length.
 #[inline(always)]
+/// Fold the kind of a value produced by an IC site into that site's observed-kind
+/// record. The JIT's only source of *value*-type feedback — a shape proves where
+/// a field lives, not what it holds. Free of write barriers: `KindSet` holds no
+/// `Gc` pointer.
+#[inline]
+fn observe_ic_type<'gc>(thread: &ThreadState<'gc>, ic_idx: u16, v: Value<'gc>) {
+    let proto = unsafe { &thread.top_lua_unchecked().closure.proto };
+    if let Some(cell) = proto.ic_types.get(ic_idx as usize) {
+        crate::env::value::KindSet::observe(cell, v);
+    }
+}
+
 fn read_ic<'gc>(thread: &ThreadState<'gc>, ic_idx: u16) -> InlineCache<'gc> {
     // SAFETY: ic_idx is allocated at compile-time within the prototype's
     // IC count; debug-asserted in alloc_ic_slot's saturating_add.
@@ -677,6 +689,7 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
             let v = unsafe { t_state.property_at(slot) };
             if !(v.is_nil() && t_state.shape().has_mm(MetamethodBits::INDEX)) {
                 drop(t_state);
+                observe_ic_type(thread, ic_idx, v);
                 *reg!(mut dst) = v;
                 dispatch!();
             }
@@ -925,6 +938,7 @@ extern "rust-preserve-none" fn op_getfield<'gc>(
             let v = unsafe { t_state.property_at(slot) };
             if !(v.is_nil() && t_state.shape().has_mm(MetamethodBits::INDEX)) {
                 drop(t_state);
+                observe_ic_type(thread, ic_idx, v);
                 *reg!(mut dst) = v;
                 dispatch!();
             }

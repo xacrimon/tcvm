@@ -47,7 +47,7 @@ fn format_prototype_into(out: &mut String, proto: &Prototype<'_>, depth: usize) 
     }
 }
 
-fn format_value(v: &Value<'_>) -> String {
+pub(crate) fn format_value(v: &Value<'_>) -> String {
     use crate::env::ValueKind;
     match v.kind() {
         ValueKind::Nil => "nil".to_string(),
@@ -68,7 +68,7 @@ fn format_value(v: &Value<'_>) -> String {
     }
 }
 
-fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -> String {
+pub(crate) fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -> String {
     fn const_comment(constants: &[Value<'_>], idx: u16) -> String {
         if let Some(v) = constants.get(idx as usize) {
             format!("  ; {}", format_value(v))

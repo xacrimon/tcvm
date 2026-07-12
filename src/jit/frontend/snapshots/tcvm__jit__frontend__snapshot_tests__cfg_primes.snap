@@ -1,0 +1,27 @@
+---
+source: src/jit/frontend/snapshot_tests.rs
+expression: output
+---
+=== bytecode cfg: main (params=0, vararg=true, stack=6)
+  declined: Vararg(0)
+
+=== bytecode cfg: main/P0 (params=1, vararg=false, stack=7)
+  b0: succs=[b5, b12] live_in=[R0]
+    0000  LOAD            R1 K0  ; 2
+    0001  LOAD            R4 K1  ; 1
+    0002  SUB             R2 R0 R4
+    0003  LOAD            R3 K1  ; 1
+    0004  FORPREP         R1 +7
+  b5: succs=[b9, b11] live_in=[R0, R1, R2, R3, R4]
+    0005  MOD             R5 R0 R4
+    0006  LOAD            R6 K2  ; 0
+    0007  EQ              R5 R6 inv=false
+    0008  JMP             +2
+  b9: succs=[] live_in=[]
+    0009  LOAD            R5 K3  ; false
+    0010  RETURN          R5 count=2
+  b11: succs=[b12, b5] live_in=[R0, R1, R2, R3]
+    0011  FORLOOP         R1 -7
+  b12: succs=[] live_in=[]
+    0012  LOAD            R1 K4  ; true
+    0013  RETURN          R1 count=2

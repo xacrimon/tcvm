@@ -1,9 +1,11 @@
+use core::cell::Cell;
+
 use crate::Context;
 use crate::dmm::{Collect, Gc, Lock, Mutation, RefLock};
 use crate::env::error::Error;
 use crate::env::shape::Shape;
 use crate::env::string::LuaString;
-use crate::env::value::Value;
+use crate::env::value::{KindSet, Value};
 use crate::instruction::UpValueDescriptor;
 use crate::vm::sequence::{CallbackAction, Execution};
 
@@ -36,6 +38,16 @@ pub struct Prototype<'gc> {
     /// the parent `Prototype`'s `Gc`. See `src/env/shape/mod.rs` for
     /// the IC payload.
     pub ic_table: Box<[Lock<InlineCache<'gc>>]>,
+    /// Value kinds observed at each IC site, parallel to `ic_table`.
+    ///
+    /// The JIT's only source of *value*-type feedback: a `Shape` proves where a
+    /// field lives, never what it holds, so without this every field read stays
+    /// generic and so does every arithmetic op consuming it. Kept beside the IC
+    /// rather than inside it because these bits hold no `Gc` pointer — a
+    /// `Cell<KindSet>` write needs no barrier, so recording is free on the
+    /// interpreter's fast path.
+    #[collect(require_static)]
+    pub ic_types: Box<[Cell<KindSet>]>,
 }
 
 /// Per-call-site monomorphic inline cache. `Empty` initially; a slow

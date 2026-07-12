@@ -11,6 +11,7 @@ pub(crate) mod compiler;
 pub mod dmm;
 pub mod env;
 pub(crate) mod instruction;
+pub mod jit;
 pub mod lua;
 pub(crate) mod parser;
 pub mod vm;

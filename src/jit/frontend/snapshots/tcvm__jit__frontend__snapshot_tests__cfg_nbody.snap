@@ -1,0 +1,195 @@
+---
+source: src/jit/frontend/snapshot_tests.rs
+expression: output
+---
+=== bytecode cfg: main (params=0, vararg=true, stack=23)
+  declined: Vararg(0)
+
+=== bytecode cfg: main/P0 (params=3, vararg=false, stack=29)
+  b0: succs=[b4, b60] live_in=[R0, R1, R2]
+    0000  LOAD            R3 K0  ; 1
+    0001  MOVE            R4 R1
+    0002  LOAD            R5 K0  ; 1
+    0003  FORPREP         R3 +56
+  b4: succs=[b17, b56] live_in=[R0, R1, R2, R3, R4, R5, R6]
+    0004  GETTABLE        R7 R0 R6
+    0005  GETFIELD        R8 R7 K1  ; "x"
+    0006  GETFIELD        R9 R7 K2  ; "y"
+    0007  GETFIELD        R10 R7 K3  ; "z"
+    0008  GETFIELD        R11 R7 K4  ; "mass"
+    0009  GETFIELD        R12 R7 K5  ; "vx"
+    0010  GETFIELD        R13 R7 K6  ; "vy"
+    0011  GETFIELD        R14 R7 K7  ; "vz"
+    0012  LOAD            R18 K0  ; 1
+    0013  ADD             R15 R6 R18
+    0014  MOVE            R16 R1
+    0015  LOAD            R17 K0  ; 1
+    0016  FORPREP         R15 +39
+  b17: succs=[b56, b17] live_in=[R0, R1, R2, R3, R4, R5, R7, R8, R9, R10, R11, R12, R13, R14, R15, R16, R17, R18]
+    0017  GETTABLE        R19 R0 R18
+    0018  GETFIELD        R20 R19 K1  ; "x"
+    0019  SUB             R20 R8 R20
+    0020  GETFIELD        R21 R19 K2  ; "y"
+    0021  SUB             R21 R9 R21
+    0022  GETFIELD        R22 R19 K3  ; "z"
+    0023  SUB             R22 R10 R22
+    0024  GETUPVAL        R23 U0
+    0025  MUL             R24 R20 R20
+    0026  MUL             R25 R21 R21
+    0027  ADD             R24 R24 R25
+    0028  MUL             R25 R22 R22
+    0029  ADD             R24 R24 R25
+    0030  CALL            R23 args=2 ret=2
+    0031  MUL             R24 R23 R23
+    0032  MUL             R24 R24 R23
+    0033  DIV             R24 R2 R24
+    0034  MUL             R25 R11 R24
+    0035  GETFIELD        R26 R19 K4  ; "mass"
+    0036  MUL             R26 R26 R24
+    0037  MUL             R27 R20 R26
+    0038  SUB             R12 R12 R27
+    0039  MUL             R27 R21 R26
+    0040  SUB             R13 R13 R27
+    0041  MUL             R27 R22 R26
+    0042  SUB             R14 R14 R27
+    0043  GETFIELD        R27 R19 K5  ; "vx"
+    0044  MUL             R28 R20 R25
+    0045  ADD             R27 R27 R28
+    0046  SETFIELD        R27 R19 K5  ; "vx"
+    0047  GETFIELD        R27 R19 K6  ; "vy"
+    0048  MUL             R28 R21 R25
+    0049  ADD             R27 R27 R28
+    0050  SETFIELD        R27 R19 K6  ; "vy"
+    0051  GETFIELD        R27 R19 K7  ; "vz"
+    0052  MUL             R28 R22 R25
+    0053  ADD             R27 R27 R28
+    0054  SETFIELD        R27 R19 K7  ; "vz"
+    0055  FORLOOP         R15 -39
+  b56: succs=[b60, b4] live_in=[R0, R1, R2, R3, R4, R5, R7, R12, R13, R14]
+    0056  SETFIELD        R12 R7 K5  ; "vx"
+    0057  SETFIELD        R13 R7 K6  ; "vy"
+    0058  SETFIELD        R14 R7 K7  ; "vz"
+    0059  FORLOOP         R3 -56
+  b60: succs=[b64, b81] live_in=[R0, R1, R2]
+    0060  LOAD            R3 K0  ; 1
+    0061  MOVE            R4 R1
+    0062  LOAD            R5 K0  ; 1
+    0063  FORPREP         R3 +17
+  b64: succs=[b81, b64] live_in=[R0, R2, R3, R4, R5, R6]
+    0064  GETTABLE        R7 R0 R6
+    0065  GETFIELD        R8 R7 K1  ; "x"
+    0066  GETFIELD        R9 R7 K5  ; "vx"
+    0067  MUL             R9 R2 R9
+    0068  ADD             R8 R8 R9
+    0069  SETFIELD        R8 R7 K1  ; "x"
+    0070  GETFIELD        R8 R7 K2  ; "y"
+    0071  GETFIELD        R9 R7 K6  ; "vy"
+    0072  MUL             R9 R2 R9
+    0073  ADD             R8 R8 R9
+    0074  SETFIELD        R8 R7 K2  ; "y"
+    0075  GETFIELD        R8 R7 K3  ; "z"
+    0076  GETFIELD        R9 R7 K7  ; "vz"
+    0077  MUL             R9 R2 R9
+    0078  ADD             R8 R8 R9
+    0079  SETFIELD        R8 R7 K3  ; "z"
+    0080  FORLOOP         R3 -17
+  b81: succs=[] live_in=[]
+    0081  RETURN          R0 count=1
+
+=== bytecode cfg: main/P1 (params=2, vararg=false, stack=23)
+  b0: succs=[b5, b47] live_in=[R0, R1]
+    0000  LOAD            R2 K0  ; 0
+    0001  LOAD            R3 K1  ; 1
+    0002  MOVE            R4 R1
+    0003  LOAD            R5 K1  ; 1
+    0004  FORPREP         R3 +42
+  b5: succs=[b24, b46] live_in=[R0, R1, R2, R3, R4, R5, R6]
+    0005  GETTABLE        R7 R0 R6
+    0006  GETFIELD        R8 R7 K2  ; "vx"
+    0007  GETFIELD        R9 R7 K3  ; "vy"
+    0008  GETFIELD        R10 R7 K4  ; "vz"
+    0009  GETFIELD        R11 R7 K5  ; "mass"
+    0010  LOAD            R12 K6  ; 0.5
+    0011  MUL             R12 R12 R11
+    0012  MUL             R13 R8 R8
+    0013  MUL             R14 R9 R9
+    0014  ADD             R13 R13 R14
+    0015  MUL             R14 R10 R10
+    0016  ADD             R13 R13 R14
+    0017  MUL             R12 R12 R13
+    0018  ADD             R2 R2 R12
+    0019  LOAD            R15 K1  ; 1
+    0020  ADD             R12 R6 R15
+    0021  MOVE            R13 R1
+    0022  LOAD            R14 K1  ; 1
+    0023  FORPREP         R12 +22
+  b24: succs=[b46, b24] live_in=[R0, R1, R2, R3, R4, R5, R7, R11, R12, R13, R14, R15]
+    0024  GETTABLE        R16 R0 R15
+    0025  GETFIELD        R17 R7 K7  ; "x"
+    0026  GETFIELD        R18 R16 K7  ; "x"
+    0027  SUB             R17 R17 R18
+    0028  GETFIELD        R18 R7 K8  ; "y"
+    0029  GETFIELD        R19 R16 K8  ; "y"
+    0030  SUB             R18 R18 R19
+    0031  GETFIELD        R19 R7 K9  ; "z"
+    0032  GETFIELD        R20 R16 K9  ; "z"
+    0033  SUB             R19 R19 R20
+    0034  GETUPVAL        R20 U0
+    0035  MUL             R21 R17 R17
+    0036  MUL             R22 R18 R18
+    0037  ADD             R21 R21 R22
+    0038  MUL             R22 R19 R19
+    0039  ADD             R21 R21 R22
+    0040  CALL            R20 args=2 ret=2
+    0041  GETFIELD        R21 R16 K5  ; "mass"
+    0042  MUL             R21 R11 R21
+    0043  DIV             R21 R21 R20
+    0044  SUB             R2 R2 R21
+    0045  FORLOOP         R12 -22
+  b46: succs=[b47, b5] live_in=[R0, R1, R2, R3, R4, R5]
+    0046  FORLOOP         R3 -42
+  b47: succs=[] live_in=[R2]
+    0047  RETURN          R2 count=2
+
+=== bytecode cfg: main/P2 (params=2, vararg=false, stack=12)
+  b0: succs=[b7, b19] live_in=[R0, R1]
+    0000  LOAD            R2 K0  ; 0
+    0001  LOAD            R3 K0  ; 0
+    0002  LOAD            R4 K0  ; 0
+    0003  LOAD            R5 K1  ; 1
+    0004  MOVE            R6 R1
+    0005  LOAD            R7 K1  ; 1
+    0006  FORPREP         R5 +12
+  b7: succs=[b19, b7] live_in=[R0, R2, R3, R4, R5, R6, R7, R8]
+    0007  GETTABLE        R9 R0 R8
+    0008  GETFIELD        R10 R9 K2  ; "mass"
+    0009  GETFIELD        R11 R9 K3  ; "vx"
+    0010  MUL             R11 R11 R10
+    0011  ADD             R2 R2 R11
+    0012  GETFIELD        R11 R9 K4  ; "vy"
+    0013  MUL             R11 R11 R10
+    0014  ADD             R3 R3 R11
+    0015  GETFIELD        R11 R9 K5  ; "vz"
+    0016  MUL             R11 R11 R10
+    0017  ADD             R4 R4 R11
+    0018  FORLOOP         R5 -12
+  b19: succs=[] live_in=[R0, R2, R3, R4]
+    0019  LOAD            R5 K1  ; 1
+    0020  GETTABLE        R5 R0 R5
+    0021  UNM             R6 R2
+    0022  GETUPVAL        R7 U0
+    0023  DIV             R6 R6 R7
+    0024  SETFIELD        R6 R5 K3  ; "vx"
+    0025  LOAD            R5 K1  ; 1
+    0026  GETTABLE        R5 R0 R5
+    0027  UNM             R6 R3
+    0028  GETUPVAL        R7 U0
+    0029  DIV             R6 R6 R7
+    0030  SETFIELD        R6 R5 K4  ; "vy"
+    0031  LOAD            R5 K1  ; 1
+    0032  GETTABLE        R5 R0 R5
+    0033  UNM             R6 R4
+    0034  GETUPVAL        R7 U0
+    0035  DIV             R6 R6 R7
+    0036  SETFIELD        R6 R5 K5  ; "vz"
+    0037  RETURN          R0 count=1

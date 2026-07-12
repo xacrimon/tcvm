@@ -294,6 +294,11 @@ impl<'gc> Chunk<'gc> {
 
         let ic_table =
             vec![Lock::new(InlineCache::Empty); self.next_ic_idx as usize].into_boxed_slice();
+        let ic_types = vec![
+            core::cell::Cell::new(crate::env::value::KindSet::empty());
+            self.next_ic_idx as usize
+        ]
+        .into_boxed_slice();
 
         Gc::new(
             mc,
@@ -309,6 +314,7 @@ impl<'gc> Chunk<'gc> {
                 num_upvalues,
                 source: self.source,
                 ic_table,
+                ic_types,
             },
         )
     }
