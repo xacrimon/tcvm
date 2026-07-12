@@ -319,7 +319,15 @@ impl<'gc> Executor<'gc> {
             if !matches!(ts.frames.last(), Some(Frame::Sequence { .. })) {
                 land_call_results(&mut ts, cs);
             }
-            ts.status = ThreadStatus::Normal;
+            // `land_call_results` may have *terminated* the thread: a tail-called
+            // native suspends with the calling Lua frame already popped, so the
+            // resume that lands its results empties the frame stack and sets
+            // `Result`. Clobbering that with `Normal` would send the driver back
+            // around the loop with no frame to pump. Same guard as
+            // `propagate_inner_to_resumer`.
+            if !matches!(ts.status, ThreadStatus::Result { .. }) {
+                ts.status = ThreadStatus::Normal;
+            }
         }
         {
             let mut inner = self.0.borrow_mut(mc);
