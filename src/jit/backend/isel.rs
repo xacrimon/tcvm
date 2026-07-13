@@ -28,6 +28,7 @@ use crate::jit::backend::layout;
 use crate::jit::backend::mach::{
     AluOp, ExitId, ExitSrc, ExitStub, FAluOp, MBlock, MFunc, MInst, MOp, RegClass, Tag, VReg, Width,
 };
+use crate::jit::backend::regalloc::{Inst, RegallocFunc};
 use crate::jit::ir::op::{Cc, FloatOp, IntOp, Op};
 use crate::jit::ir::ty::{Rep, Ty, TypeSet};
 use crate::jit::ir::{Block, Func, Val};
@@ -97,6 +98,7 @@ impl<'a, 'gc> Isel<'a, 'gc> {
             .map(|_| ExitStub {
                 pc: 0,
                 slots: Vec::new(),
+                inst: usize::MAX,
             })
             .collect();
         self.m.pinned_regs = self.f.pinned_regs.clone();
@@ -246,8 +248,16 @@ impl<'a, 'gc> Isel<'a, 'gc> {
 
     // --- emission -----------------------------------------------------------
 
-    fn emit(&mut self, b: MBlock, op: MOp, defs: Vec<VReg>, uses: Vec<VReg>) {
-        self.m.push(b, MInst::new(op, defs, uses));
+    fn emit(&mut self, b: MBlock, op: MOp, defs: Vec<VReg>, uses: Vec<VReg>) -> Inst {
+        self.m.push(b, MInst::new(op, defs, uses))
+    }
+
+    /// Emit the instruction that branches to `e`'s stub, and tell the stub which
+    /// one it was. The stub reads its values out of this instruction's uses — it
+    /// has no operands of its own — so it cannot be encoded until it knows.
+    fn emit_exiting(&mut self, b: MBlock, op: MOp, uses: Vec<VReg>, e: ExitId) {
+        let i = self.emit(b, op, vec![], uses);
+        self.m.exits[e.0 as usize].inst = i;
     }
 
     fn emit_imm(&mut self, b: MBlock, imm: i64) -> VReg {
@@ -389,15 +399,15 @@ impl<'a, 'gc> Isel<'a, 'gc> {
                         self.stub(e, i);
                         let mut uses = vec![t];
                         uses.extend(self.stub_regs(i));
-                        self.emit(
+                        self.emit_exiting(
                             mb,
                             MOp::GuardCmpImm {
                                 cc: Cc::Eq,
                                 imm: layout::kind(want) as i64,
                                 exit: e,
                             },
-                            vec![],
                             uses,
+                            e,
                         );
                     }
                 }
@@ -431,14 +441,14 @@ impl<'a, 'gc> Isel<'a, 'gc> {
 
                 let mut uses = vec![got, want_reg];
                 uses.extend(self.stub_regs(i));
-                self.emit(
+                self.emit_exiting(
                     mb,
                     MOp::GuardCmp {
                         cc: Cc::Eq,
                         exit: e,
                     },
-                    vec![],
                     uses,
+                    e,
                 );
 
                 self.set(
@@ -455,7 +465,7 @@ impl<'a, 'gc> Isel<'a, 'gc> {
                 let c = self.int(args[0]);
                 let mut uses = vec![c];
                 uses.extend(self.stub_regs(i));
-                self.emit(mb, MOp::GuardNz { exit: e }, vec![], uses);
+                self.emit_exiting(mb, MOp::GuardNz { exit: e }, uses, e);
             }
             // A watchpoint, not a check. It emits nothing; the compiled artifact
             // records the dependency and a metatable write invalidates it.
@@ -623,7 +633,7 @@ impl<'a, 'gc> Isel<'a, 'gc> {
                 let e = ExitId(exit.expect("Deopt carries an exit").0);
                 self.stub(e, i);
                 let uses = self.stub_regs(i);
-                self.emit(mb, MOp::ExitTo(e), vec![], uses);
+                self.emit_exiting(mb, MOp::ExitTo(e), uses, e);
             }
             other => return Err(IselError::Unsupported(op_name(other))),
         }
@@ -727,7 +737,7 @@ impl<'a, 'gc> Isel<'a, 'gc> {
                 match s {
                     CopySrc::Reg(r) => self.emit(mb, MOp::Mov, vec![d], vec![r]),
                     CopySrc::Imm(v) => self.emit(mb, MOp::Imm(v), vec![d], vec![]),
-                }
+                };
             }
             pending = blocked;
         }
@@ -752,16 +762,29 @@ impl<'a, 'gc> Isel<'a, 'gc> {
             };
             slots.push((r as u8, src));
         }
-        self.m.exits[e.0 as usize] = ExitStub { pc, slots };
+        // `inst` is filled in by `emit_exiting`, once the guard that branches here
+        // exists to be named.
+        self.m.exits[e.0 as usize] = ExitStub {
+            pc,
+            slots,
+            inst: usize::MAX,
+        };
     }
 
     /// Every register the stub for this instruction's exit will read. These become
-    /// *uses* of the guard, which is what stops the allocator reassigning them.
+    /// *uses* of the guard, which is what stops the allocator reassigning them —
+    /// and, afterwards, what tells the stub where they ended up.
     fn stub_regs(&self, i: crate::jit::ir::Inst) -> Vec<VReg> {
         let fs = self
             .f
             .frame_state(self.f.inst(i).fs.expect("a guard carries a FrameState"));
-        let mut regs = Vec::new();
+
+        // The frame base among them: every store the stub makes is relative to it,
+        // so it is as much a value the stub reads as any of the frame's registers.
+        // Listing it here rather than telling the allocator it is live everywhere
+        // is the difference between a register the allocator may reuse after the
+        // last exit and one it may never touch.
+        let mut regs = vec![self.base];
         for entry in fs.regs.iter().flatten() {
             regs.extend(Self::regs_of(self.slot(*entry)));
         }

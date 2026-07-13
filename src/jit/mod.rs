@@ -105,8 +105,8 @@
 pub mod backend;
 pub mod frontend;
 pub mod ir;
-pub mod region;
 #[cfg(test)]
 mod probe;
+pub mod region;
 #[cfg(test)]
 mod runtime_tests;

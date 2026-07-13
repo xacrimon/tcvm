@@ -15,10 +15,13 @@ use std::fs;
 
 use crate::env::string::LuaString;
 use crate::env::value::{Value, ValueKind};
+use crate::jit::backend::aarch64::machine_env;
 use crate::jit::backend::aarch64::{Status, encode};
 use crate::jit::backend::isel::select;
 use crate::jit::backend::mach::MFunc;
-use crate::jit::backend::regalloc::{Allocation, linear_scan, spill_everything};
+use crate::jit::backend::regalloc::{
+    Allocation, MachineEnv, RegallocError, RegallocFunc, linear_scan, spill_everything,
+};
 use crate::jit::frontend::lower::lower;
 use crate::jit::ir::ty::{Rep, Ty, TypeSet};
 use crate::{Executor, Lua, StashedFunction, StashedTable};
@@ -38,10 +41,19 @@ type Region = extern "C" fn(*mut (), *mut Value<'static>) -> u64;
 /// `spill_everything` is the oracle: it is too dumb to have an interesting bug,
 /// so any program the two disagree on localizes the fault to `linear_scan`
 /// immediately. Keeping the naive one alive costs a few lines and buys a bisect.
-const ALLOCATORS: [(&str, fn(&MFunc) -> Allocation); 2] = [
+type Allocator = fn(&MFunc, &MachineEnv) -> Result<Allocation, RegallocError>;
+
+const ALLOCATORS: [(&str, Allocator); 2] = [
     ("spill_everything", spill_everything),
     ("linear_scan", linear_scan),
 ];
+
+/// Run one allocator over `m`, with aarch64's registers. Neither declines
+/// anything aarch64 emits — it constrains no operand and clobbers nothing — so a
+/// decline here is a bug, not a legal answer.
+fn allocate(alloc: Allocator, m: &MFunc) -> Allocation {
+    alloc(m, &machine_env()).expect("aarch64 asks for nothing either allocator declines")
+}
 
 /// Run `jit_loop_warm.lua`, which leaves `sum_field`'s inline caches warm, and
 /// hand back the function.
@@ -121,7 +133,7 @@ fn native_sum_field_matches_interpreter() {
                 let closure = ctx.fetch(&f).as_lua().expect("Lua closure");
                 let func = lower(closure.proto, 0, vec![TAB, INT]).expect("lower");
                 let m = select(&func).expect("isel");
-                let ra = alloc(&m);
+                let ra = allocate(alloc, &m);
                 let code = encode(&m, &func.pool, &ra).expect("encode");
 
                 // A stand-in Lua frame: `t` and `n` where the region's entry
@@ -168,7 +180,7 @@ fn shape_guard_deopts_with_a_resumable_frame() {
         let closure = ctx.fetch(&f).as_lua().expect("Lua closure");
         let func = lower(closure.proto, 0, vec![TAB, INT]).expect("lower");
         let m = select(&func).expect("isel");
-        let ra = spill_everything(&m);
+        let ra = allocate(spill_everything, &m);
         let code = encode(&m, &func.pool, &ra).expect("encode");
 
         let mut stack = vec![Value::nil(); m.max_lua_reg as usize + 1];
@@ -227,7 +239,7 @@ fn type_guard_deopts_mid_loop() {
             let closure = ctx.fetch(&f).as_lua().expect("Lua closure");
             let func = lower(closure.proto, 0, vec![TAB, INT]).expect("lower");
             let m = select(&func).expect("isel");
-            let ra = alloc(&m);
+            let ra = allocate(alloc, &m);
             let code = encode(&m, &func.pool, &ra).expect("encode");
 
             let mut stack = vec![Value::nil(); m.max_lua_reg as usize + 1];
@@ -284,12 +296,11 @@ fn dump_native() {
         let func = lower(closure.proto, 0, vec![TAB, INT]).expect("lower");
         let m = select(&func).expect("isel");
         for (name, alloc) in ALLOCATORS {
-            let ra = alloc(&m);
+            let ra = allocate(alloc, &m);
             let code = encode(&m, &func.pool, &ra).expect("encode");
             eprintln!(
-                "{name}: {} vregs -> {} in registers, {} spilled; {} instructions",
+                "{name}: {} vregs, {} spilled; {} instructions",
                 m.num_vregs(),
-                ra.num_in_regs(),
                 ra.num_spills,
                 code.bytes().len() / 4,
             );

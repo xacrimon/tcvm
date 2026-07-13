@@ -49,7 +49,7 @@ fn dump_is_prime() {
         let closure = ctx.fetch(&f).as_lua().expect("Lua closure");
         let func = lower(closure.proto, 0, vec![INT]).expect("lower");
         let m = select(&func).expect("isel");
-        let ra = linear_scan(&m);
+        let ra = linear_scan(&m, &crate::jit::backend::aarch64::machine_env()).expect("regalloc");
         let code = encode(&m, &func.pool, &ra).expect("encode");
 
         println!("=== BYTECODE");

@@ -35,25 +35,14 @@
 use std::fmt::{self, Write};
 
 use crate::env::value::ValueKind;
+// The register allocator owns this vocabulary, not this module: it is the leaf
+// that neither the machine IR nor the encoder is allowed to reach into, so the
+// types a program is *described in* live down there. Re-exported so the rest of
+// the backend still says `mach::VReg`.
+pub use crate::jit::backend::regalloc::{Block as MBlock, RegClass, VReg};
+use crate::jit::backend::regalloc::{Inst, Operand, RegallocFunc};
 use crate::jit::ir::op::Cc;
 use crate::jit::ir::pool::{ConstRef, ShapeRef};
-
-/// A virtual register. Holds exactly one machine word.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
-pub struct VReg(pub u32);
-
-/// Which register file a value lives in.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum RegClass {
-    /// General purpose: integers, pointers, tags, and float *bits* in transit.
-    Int,
-    /// Floating point.
-    Float,
-}
-
-/// A block in the machine IR.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
-pub struct MBlock(pub u32);
 
 /// An exit stub: one per IR `Exit`, plus the unconditional `Deopt`s.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
@@ -225,18 +214,37 @@ impl MOp {
 #[derive(Clone, Debug)]
 pub struct MInst {
     pub op: MOp,
-    pub defs: Vec<VReg>,
+    pub defs: Vec<Operand>,
     /// Operands, *plus* — on a guard — every register the exit stub will need to
-    /// write back. That is not bookkeeping: it is what keeps those values alive
-    /// through register allocation. A value the interpreter needs after a deopt
-    /// but that nothing on the fast path reads would otherwise die at its last
-    /// fast-path use, and the stub would spill a register holding something else.
-    pub uses: Vec<VReg>,
+    /// write back, the frame base among them. That is not bookkeeping: it is what
+    /// keeps those values alive through register allocation, and it is how the
+    /// stub finds them afterwards. A value the interpreter needs after a deopt but
+    /// that nothing on the fast path reads would otherwise die at its last
+    /// fast-path use, and the stub would read a register holding something else.
+    pub uses: Vec<Operand>,
 }
 
 impl MInst {
+    /// Every operand aarch64 emits is unconstrained: it takes a register or a
+    /// stack slot, and the encoder reloads a spilled one into scratch. A target
+    /// with two-address instructions or fixed registers builds its operands with
+    /// [`Operand::fixed`]/[`Operand::reuse`] instead.
     pub fn new(op: MOp, defs: Vec<VReg>, uses: Vec<VReg>) -> Self {
-        MInst { op, defs, uses }
+        MInst {
+            op,
+            defs: defs.into_iter().map(Operand::any).collect(),
+            uses: uses.into_iter().map(Operand::any).collect(),
+        }
+    }
+
+    /// The virtual register a use names — the common thing to want, since aarch64
+    /// never constrains one.
+    pub fn use_vreg(&self, k: usize) -> VReg {
+        self.uses[k].vreg
+    }
+
+    pub fn def_vreg(&self, k: usize) -> VReg {
+        self.defs[k].vreg
     }
 }
 
@@ -271,6 +279,12 @@ pub struct ExitStub {
     pub pc: u32,
     /// `(lua register, source)`, one per live register in the frame state.
     pub slots: Vec<(u8, ExitSrc)>,
+    /// The guard that branches here. Exactly one does — the frontend mints a fresh
+    /// `Exit` per guard — and naming it is what lets the stub ask *where a value
+    /// lives at that guard*, which is the only question a register allocator can
+    /// answer. A stub is not an instruction and has no operands of its own; every
+    /// value it reads is a use of this instruction, which is why they are there.
+    pub inst: Inst,
 }
 
 pub struct MFunc {
@@ -280,9 +294,11 @@ pub struct MFunc {
     pub entry: MBlock,
     /// The register holding the Lua frame base, defined by `EntryArg(1)`.
     ///
-    /// Named here because the exit stubs need it and are not instructions: they
-    /// are generated after the fact, and every store they make is relative to it.
-    /// It is therefore live across the whole region, including every exit.
+    /// Named here because the exit stubs address the Lua stack through it. It is
+    /// kept alive to each stub the same way every other value the stub reads is:
+    /// by being a use of the guard that branches there. It gets no special
+    /// treatment in the allocator, and must not — a value that the allocator is
+    /// told is live everywhere is a value it can never reuse the register of.
     pub frame_base: VReg,
     pub exits: Vec<ExitStub>,
     /// Shapes each `assume.no_mm` depends on. No code is emitted for those, but
@@ -318,32 +334,47 @@ impl MFunc {
         v
     }
 
-    pub fn class(&self, v: VReg) -> RegClass {
-        self.classes[v.0 as usize]
-    }
-
     pub fn new_block(&mut self) -> MBlock {
         let b = MBlock(self.blocks.len() as u32);
         self.blocks.push(MBlockData::default());
         b
     }
 
-    pub fn push(&mut self, b: MBlock, inst: MInst) {
+    pub fn push(&mut self, b: MBlock, inst: MInst) -> Inst {
         let i = self.insts.len();
         self.insts.push(inst);
         self.blocks[b.0 as usize].insts.push(i);
+        i
     }
 
     pub fn block(&self, b: MBlock) -> &MBlockData {
         &self.blocks[b.0 as usize]
     }
 
-    pub fn inst(&self, i: usize) -> &MInst {
+    pub fn inst(&self, i: Inst) -> &MInst {
         &self.insts[i]
     }
+}
 
-    pub fn num_vregs(&self) -> usize {
-        self.classes.len()
+/// The machine IR, as the register allocator sees it: a CFG, and the values each
+/// instruction reads and writes. Nothing above this line mentions aarch64, and
+/// nothing below it mentions a `MOp`.
+///
+/// `block_order` is inherited, deliberately. The encoder lays blocks out in the
+/// order this returns and the allocator numbers live intervals in it; two
+/// implementations that agree today would be a bug waiting for a CFG shape nobody
+/// has written yet.
+impl RegallocFunc for MFunc {
+    fn num_blocks(&self) -> usize {
+        self.blocks.len()
+    }
+
+    fn entry(&self) -> MBlock {
+        self.entry
+    }
+
+    fn block_insts(&self, b: MBlock) -> &[Inst] {
+        &self.block(b).insts
     }
 
     /// The successors of a block: whatever its terminator names.
@@ -351,42 +382,31 @@ impl MFunc {
     /// Exit stubs are deliberately absent. A guard's branch to its stub is not an
     /// edge — the stub does not rejoin, it leaves — and the values the stub needs
     /// are already on the guard's `uses` list, so liveness picks them up there.
-    pub fn succs(&self, b: MBlock) -> Vec<MBlock> {
+    fn succs(&self, b: MBlock) -> Vec<MBlock> {
         match self.block(b).insts.last() {
             Some(&i) => self.inst(i).op.targets(),
             None => vec![],
         }
     }
 
-    /// Reverse postorder from the entry.
-    ///
-    /// Both the encoder and the register allocator walk this. They *must* agree:
-    /// a live interval is an span of positions in a linearization, and if the two
-    /// disagree about what that linearization is, the allocator will free a
-    /// register the encoder still has a live value in.
-    pub fn block_order(&self) -> Vec<MBlock> {
-        let mut seen = vec![false; self.blocks.len()];
-        let mut post = Vec::with_capacity(self.blocks.len());
+    fn num_insts(&self) -> usize {
+        self.insts.len()
+    }
 
-        // Iterative, because a deeply nested region would blow a recursive stack.
-        let mut stack = vec![(self.entry, 0usize)];
-        seen[self.entry.0 as usize] = true;
-        while let Some((b, next)) = stack.pop() {
-            let succs = self.succs(b);
-            if next < succs.len() {
-                stack.push((b, next + 1));
-                let s = succs[next];
-                if !seen[s.0 as usize] {
-                    seen[s.0 as usize] = true;
-                    stack.push((s, 0));
-                }
-            } else {
-                post.push(b);
-            }
-        }
+    fn defs(&self, i: Inst) -> &[Operand] {
+        &self.insts[i].defs
+    }
 
-        post.reverse();
-        post
+    fn uses(&self, i: Inst) -> &[Operand] {
+        &self.insts[i].uses
+    }
+
+    fn num_vregs(&self) -> usize {
+        self.classes.len()
+    }
+
+    fn class(&self, v: VReg) -> RegClass {
+        self.classes[v.0 as usize]
     }
 }
 
@@ -404,12 +424,12 @@ pub fn print_mfunc(f: &MFunc) -> String {
             let inst = &f.insts[i];
             let _ = write!(s, "    ");
             if !inst.defs.is_empty() {
-                let ds: Vec<String> = inst.defs.iter().map(|d| format!("r{}", d.0)).collect();
+                let ds: Vec<String> = inst.defs.iter().map(|d| format!("r{}", d.vreg.0)).collect();
                 let _ = write!(s, "{} = ", ds.join(", "));
             }
             let _ = write!(s, "{}", fmt_op(inst.op));
             if !inst.uses.is_empty() {
-                let us: Vec<String> = inst.uses.iter().map(|u| format!("r{}", u.0)).collect();
+                let us: Vec<String> = inst.uses.iter().map(|u| format!("r{}", u.vreg.0)).collect();
                 let _ = write!(s, " {}", us.join(", "));
             }
             let _ = writeln!(s);

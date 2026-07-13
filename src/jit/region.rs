@@ -71,6 +71,11 @@ pub enum Declined {
     Lower,
     /// Instruction selection has no pattern for some op in the region.
     Isel,
+    /// The allocator met a constraint it does not implement. Unreachable from
+    /// aarch64, which constrains nothing — but a decline is always a legal answer,
+    /// and a target that does constrain something should not have to remember to
+    /// add this.
+    Regalloc,
     Encode,
     /// The region contains an op that can let the collector run, and nothing
     /// roots the values in its registers yet.
@@ -280,7 +285,7 @@ pub fn compile<'gc>(
     }
 
     let m = isel::select(&func).map_err(|_| Declined::Isel)?;
-    let ra = regalloc::linear_scan(&m);
+    let ra = regalloc::linear_scan(&m, &aarch64::machine_env()).map_err(|_| Declined::Regalloc)?;
     let code = aarch64::encode(&m, &func.pool, &ra).map_err(|_| Declined::Encode)?;
 
     let entry: Box<[(u8, TypeSet)]> = func
