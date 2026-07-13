@@ -102,5 +102,6 @@
 //! by tracking a field's representation in the Map itself, which costs map
 //! deprecation and object migration; we don't.)
 
+pub mod backend;
 pub mod frontend;
 pub mod ir;

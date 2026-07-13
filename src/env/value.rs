@@ -10,7 +10,7 @@ use crate::env::table::Table;
 use crate::env::thread::Thread;
 use crate::env::userdata::Userdata;
 
-#[derive(Clone, Copy, Collect, PartialEq, Eq)]
+#[derive(Clone, Copy, Collect, PartialEq, Eq, Hash, Debug)]
 #[collect(internal, require_static)]
 #[repr(u8)]
 pub enum ValueKind {
@@ -30,6 +30,24 @@ pub struct Value<'gc> {
     kind: ValueKind,
     data: u64,
     _marker: PhantomData<&'gc ()>,
+}
+
+/// Field offsets, for the JIT's encoder.
+///
+/// `Value` has no `#[repr(C)]`, so its field order is the compiler's business,
+/// not ours. Compiled code still has to load and store these fields at constant
+/// displacements, so the constants are *derived* — a field reorder moves the
+/// generated code with it instead of silently miscompiling it. A child module
+/// can see its parent's private fields, which is the only reason this works.
+pub mod layout {
+    use super::Value;
+
+    /// Offset of the type tag. One byte; the rest of its word is padding.
+    pub const KIND: usize = core::mem::offset_of!(Value<'static>, kind);
+    /// Offset of the payload: the integer, the float bits, or the `Gc` pointer.
+    pub const DATA: usize = core::mem::offset_of!(Value<'static>, data);
+    /// Stride of a `Value` in the thread's stack and in a table's slot arrays.
+    pub const SIZE: usize = size_of::<Value<'static>>();
 }
 
 impl<'gc> Value<'gc> {
@@ -188,6 +206,16 @@ impl<'gc> Value<'gc> {
 
     pub fn kind(self) -> ValueKind {
         self.kind
+    }
+
+    /// The raw payload bits — an integer, a float's bits, or a `Gc` address.
+    ///
+    /// This is exactly what compiled code holds in a register for this value, so
+    /// the JIT materializes a pool constant by emitting this alongside the tag.
+    /// Sound to hand out as an address only because the collector never moves an
+    /// object, and the pool keeps the referent alive.
+    pub fn raw_payload(self) -> u64 {
+        self.data
     }
 
     pub fn type_name(&self) -> &'static str {

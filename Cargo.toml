@@ -31,6 +31,7 @@ thiserror = "2.0.18"
 ariadne = "0.6.0"
 rand_pcg = "0.10.2"
 rand_core = "0.10.1"
+libc = "0.2"
 
 [dev-dependencies]
 paste = "1.0.15"

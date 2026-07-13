@@ -144,6 +144,14 @@ pub struct Func<'gc> {
     /// time, so they are read and written via `StackGet`/`StackSet` rather
     /// than living in SSA.
     pub pinned_regs: Vec<u8>,
+    /// The Lua register each *entry* block parameter came from, in order.
+    ///
+    /// Every other block receives its parameters on an edge. The entry block has
+    /// no predecessor, so its parameters are the region's live-in registers and
+    /// the backend has to load them off the Lua stack — which it cannot do
+    /// without knowing which register each one is. Nothing else in the IR carries
+    /// that fact.
+    pub entry_regs: Vec<u8>,
 }
 
 impl<'gc> Func<'gc> {
@@ -157,6 +165,7 @@ impl<'gc> Func<'gc> {
             pool: ConstPool::new(),
             entry: Block(0),
             pinned_regs: Vec::new(),
+            entry_regs: Vec::new(),
         };
         f.entry = f.new_block();
         f

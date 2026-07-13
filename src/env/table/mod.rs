@@ -1,3 +1,4 @@
+use core::cell::Cell;
 use core::hash::BuildHasher;
 
 use hashbrown::{HashTable, hash_table};
@@ -124,6 +125,18 @@ pub struct TableState<'gc> {
     /// `properties.len() == shape.slot_count()` post-set. Empty in
     /// dict mode (storage moves to `dict`).
     pub(crate) properties: Vec<Value<'gc>, MetricsAlloc<'gc>>,
+    /// `properties.as_ptr()`, mirrored so compiled code can reach the slots.
+    /// `Vec`'s field layout is unspecified and its fields are private, so a
+    /// JIT-emitted `slot.get` has no sound way to load the data pointer out of
+    /// one — it loads this instead. Held as an address rather than a
+    /// `*mut Value<'gc>` to keep it out of the trace: `properties` already
+    /// owns and traces these values, and a second edge to them would be a lie.
+    ///
+    /// Resynced by `sync_props` at every point the allocation can move, and
+    /// re-checked against the real `Vec` on each property read in debug builds,
+    /// so a missed resync fails a test rather than corrupting the heap.
+    #[collect(require_static)]
+    pub(crate) props_ptr: Cell<usize>,
     /// Array part for positive integer keys 1..n. Self-contained — no
     /// shape involvement.
     array: Vec<Value<'gc>, MetricsAlloc<'gc>>,
@@ -163,15 +176,36 @@ fn lua_string_hash(key: LuaString<'_>) -> u64 {
 
 impl<'gc> TableState<'gc> {
     fn new(mc: &Mutation<'gc>, shape: Shape<'gc>) -> Self {
+        let properties = Vec::new_in(MetricsAlloc::new(mc));
         Self {
+            props_ptr: Cell::new(properties.as_ptr() as usize),
             shape,
-            properties: Vec::new_in(MetricsAlloc::new(mc)),
+            properties,
             array: Vec::new_in(MetricsAlloc::new(mc)),
             misc_hash: HashTable::new_in(MetricsAlloc::new(mc)),
             dict: None,
             metatable: None,
             mt_cache: None,
         }
+    }
+
+    /// Republish `properties`' data pointer for compiled code. Call after any
+    /// mutation that can move the allocation.
+    #[inline]
+    fn sync_props(&self) {
+        self.props_ptr.set(self.properties.as_ptr() as usize);
+    }
+
+    /// Catch a `properties` mutation that forgot to `sync_props`, on every read,
+    /// in every debug and test build. Compiled code trusts `props_ptr`, so a
+    /// stale one is a use-after-free — it must not be able to reach release.
+    #[inline]
+    fn debug_check_props(&self) {
+        debug_assert_eq!(
+            self.props_ptr.get(),
+            self.properties.as_ptr() as usize,
+            "props_ptr is stale; a `properties` mutation is missing a sync_props"
+        );
     }
 
     #[inline]
@@ -208,6 +242,7 @@ impl<'gc> TableState<'gc> {
     /// is in range — used by the IC fast path on a verified shape match.
     #[inline]
     pub unsafe fn property_at(&self, slot: u32) -> Value<'gc> {
+        self.debug_check_props();
         unsafe { *self.properties.get_unchecked(slot as usize) }
     }
 
@@ -234,6 +269,7 @@ impl<'gc> TableState<'gc> {
                 .find(h, |(k, _)| *k == key)
                 .map_or(Value::nil(), |(_, v)| *v);
         }
+        self.debug_check_props();
         match self.shape.find_slot(key) {
             Some(slot) => self.properties[slot as usize],
             None => Value::nil(),
@@ -302,6 +338,7 @@ impl<'gc> TableState<'gc> {
             debug_assert_eq!(new_shape.slot_count() as usize, self.properties.len() + 1);
             self.shape = new_shape;
             self.properties.push(value);
+            self.sync_props();
         }
         self.maybe_update_mt_bit(Value::string(key), value);
     }
@@ -354,6 +391,7 @@ impl<'gc> TableState<'gc> {
             table.insert_unique(h, (d.key, v), |(k, _)| lua_string_hash(*k));
         }
         self.properties.clear();
+        self.sync_props();
         self.shape = match self.shape.mt_cache() {
             Some(c) => c.ensure_dict_sentinel(ctx.mutation()),
             None => ctx.empty_dict_sentinel(),

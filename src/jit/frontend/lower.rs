@@ -962,6 +962,13 @@ pub fn lower<'gc>(
         emit(&proto, &cfg, &pinned, &mut fb, &mut func, &mut versions)?;
     }
     func.pool = pool;
+    func.pinned_regs = pinned
+        .iter()
+        .enumerate()
+        .filter(|&(_, &p)| p)
+        .map(|(r, _)| r as u8)
+        .collect();
+    func.entry_regs = params_of(&cfg, &pinned, entry_pc);
     Ok(func)
 }
 
