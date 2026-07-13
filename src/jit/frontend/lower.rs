@@ -36,11 +36,11 @@ use crate::dmm::Gc;
 use crate::env::function::{InlineCache, Prototype};
 use crate::env::shape::MetamethodBits;
 use crate::env::value::KindSet;
-use crate::env::value::Value;
+use crate::env::value::{Value, ValueKind};
 use crate::instruction::Instruction;
 use crate::jit::frontend::cfg::{self, Cfg, Term, Unsupported};
 use crate::jit::frontend::sink::{
-    self, Decline, Feedback, IcFeedback, RegState, Sink, compare, step, to_val,
+    self, Decline, Feedback, IcFeedback, RegState, Scalar, Sink, compare, step, to_val,
 };
 use crate::jit::ir::op::{ArithKind, Cc, FloatOp, IntOp, Op};
 use crate::jit::ir::pool::{ConstPool, ConstRef, ProtoRef, ShapeRef, StrRef};
@@ -175,6 +175,15 @@ impl<'gc, 'a> Feedback for VmFeedback<'gc, 'a> {
         const_ty(self.pool, v)
     }
 
+    fn scalar(&mut self, idx: u16) -> Option<Scalar> {
+        let v = self.proto.constants[idx as usize];
+        match v.kind() {
+            ValueKind::Integer => Some(Scalar::Int(v.get_integer()?)),
+            ValueKind::Float => Some(Scalar::Float(v.get_float()?)),
+            _ => None,
+        }
+    }
+
     fn proto(&mut self, idx: u16) -> ProtoRef {
         self.pool.intern_proto(self.proto.prototypes[idx as usize])
     }
@@ -235,6 +244,9 @@ impl Sink for TySink {
     }
     fn iconst(&mut self, _v: i64) -> Ty {
         Ty::I64
+    }
+    fn fconst(&mut self, _v: f64) -> Ty {
+        Ty::F64
     }
     fn bconst(&mut self, _v: bool) -> Ty {
         Ty::B1
@@ -424,6 +436,9 @@ impl<'f, 'gc> Sink for IrSink<'f, 'gc> {
     }
     fn iconst(&mut self, v: i64) -> Val {
         self.emit1(Op::IConst(v), vec![], Ty::I64)
+    }
+    fn fconst(&mut self, v: f64) -> Val {
+        self.emit1(Op::FConst(v.to_bits()), vec![], Ty::F64)
     }
     fn bconst(&mut self, v: bool) -> Val {
         self.emit1(Op::BConst(v), vec![], Ty::B1)
@@ -821,10 +836,6 @@ struct Version {
     succs: Vec<usize>,
 }
 
-fn ctx_accepts(target: &TypeContext, src: &TypeContext) -> bool {
-    target.0.len() == src.0.len() && target.0.iter().zip(&src.0).all(|(&t, &s)| t.accepts(s))
-}
-
 struct Versions {
     all: Vec<Version>,
     /// pc -> version ids, in creation order.
@@ -839,20 +850,30 @@ impl Versions {
         }
     }
 
-    /// Find a version at `pc` that accepts `ctx`, or mint one. Past
+    /// Find the version at `pc` for exactly this `ctx`, or mint one. Past
     /// [`VERSION_CAP`] specialized versions we mint a single fully-generic
     /// version instead, which accepts everything — that, not lattice height, is
     /// what bounds the version count and makes the worklist terminate.
+    ///
+    /// A specialized version serves **one** entry context, matched exactly. It is
+    /// tempting to reuse a version whose parameters merely *subsume* the incoming
+    /// context — a `tab` parameter can certainly hold a `tab<S0>` — but that
+    /// silently widens the argument on the edge and throws the refinement away.
+    /// Do it to a shape and the loop header stops knowing the receiver's layout,
+    /// so the body re-guards on every iteration; do it to a representation and the
+    /// accumulator gets re-tagged on every back-edge. Refusing mints a second,
+    /// sharper version that self-loops — the peeled first iteration pays for the
+    /// fact, and the steady state runs without it.
     fn resolve(&mut self, pc: u32, ctx: TypeContext, work: &mut Vec<usize>) -> usize {
         let ids = self.by_pc.entry(pc).or_default();
 
-        // An exactly-matching specialized version wins; the generic one is the
-        // fallback of last resort, since routing to it throws specialization away.
+        // The generic version is the fallback of last resort: routing to it throws
+        // all specialization away, so it only wins when nothing else matches.
         let mut generic = None;
         for &id in ids.iter() {
             if self.all[id].generic {
                 generic = Some(id);
-            } else if ctx_accepts(&self.all[id].ctx, &ctx) {
+            } else if self.all[id].ctx == ctx {
                 return id;
             }
         }

@@ -39,6 +39,16 @@ pub trait Feedback {
     fn ic(&mut self, ic_idx: u16, mm: MetamethodBits) -> Option<IcFeedback>;
     /// Intern constant `idx` from the prototype's constant table.
     fn constant(&mut self, idx: u16) -> (ConstRef, Ty);
+    /// Constant `idx` as an unboxed scalar, if it is one.
+    ///
+    /// A `LOAD` of a number puts the raw `i64`/`f64` in the register rather than
+    /// the tagged `Value` the interpreter would have written. The register file is
+    /// ours to represent as we like — only the *boundaries* (calls, returns,
+    /// stores, deopt) have to agree with the interpreter — and loading numbers
+    /// boxed means immediately unpacking them at the first use, and worse,
+    /// splitting a loop header into a boxed version and an unboxed one just
+    /// because a counter was initialized from a constant.
+    fn scalar(&mut self, idx: u16) -> Option<Scalar>;
     /// Intern a sub-prototype for `CLOSURE`.
     fn proto(&mut self, idx: u16) -> ProtoRef;
     /// Intern a constant as a string key, for global access.
@@ -52,6 +62,15 @@ pub trait Feedback {
     /// is why `Refine::Const` no longer has to survive a merge — and therefore
     /// no longer has to be part of the versioning key.
     fn for_step(&mut self, base: u8) -> Option<i64>;
+}
+
+/// A constant with an unboxed representation. Booleans are deliberately absent:
+/// `Rep::B1` is a condition, not a Lua value, and a register that reaches a deopt
+/// must hold something the frame writer can turn back into a `Value`.
+#[derive(Clone, Copy, Debug)]
+pub enum Scalar {
+    Int(i64),
+    Float(f64),
 }
 
 /// What an inline cache tells us about one access site.
@@ -97,6 +116,7 @@ pub trait Sink {
 
     fn kconst(&mut self, c: ConstRef, ty: Ty) -> Self::V;
     fn iconst(&mut self, v: i64) -> Self::V;
+    fn fconst(&mut self, v: f64) -> Self::V;
     fn bconst(&mut self, v: bool) -> Self::V;
     fn knil(&mut self) -> Self::V;
 
@@ -177,8 +197,13 @@ impl<V: Copy> RegState<V> {
         }
     }
 
+    /// A pinned register's home is the thread's value stack, which holds tagged
+    /// `Value`s — an open upvalue or the collector may read that slot at any
+    /// time. So a pinned store packs, while an SSA register keeps whatever
+    /// representation specialization gave it.
     pub fn set<S: Sink<V = V>>(&mut self, s: &mut S, r: u8, v: V) {
         if self.pinned[r as usize] {
+            let v = to_val(s, v);
             s.stack_set(r, v);
             return;
         }
@@ -435,9 +460,17 @@ pub fn step<S: Sink, F: Feedback>(
             let v = st.get(s, src);
             st.set(s, dst, v);
         }
+        // Numbers load unboxed; everything else (nil, booleans, strings) has no
+        // unboxed form a register may hold, and stays a tagged `Value`.
         Instruction::LOAD { dst, idx } => {
-            let (c, ty) = fb.constant(idx);
-            let v = s.kconst(c, ty);
+            let v = match fb.scalar(idx) {
+                Some(Scalar::Int(n)) => s.iconst(n),
+                Some(Scalar::Float(x)) => s.fconst(x),
+                None => {
+                    let (c, ty) = fb.constant(idx);
+                    s.kconst(c, ty)
+                }
+            };
             st.set(s, dst, v);
         }
 
@@ -481,10 +514,13 @@ pub fn step<S: Sink, F: Feedback>(
             st.set(s, dst, r);
         }
         // `not` never consults a metamethod — it is pure truthiness, and folds
-        // outright when the type set already decides it.
+        // outright when the type set already decides it. The result is a Lua
+        // boolean, so it packs: a `B1` is a condition, and a register must hold
+        // something a deopt can write back as a `Value`.
         Instruction::NOT { dst, src } => {
             let a = st.get(s, src);
             let f = falsy(s, a);
+            let f = s.pack_bool(f);
             st.set(s, dst, f);
         }
         Instruction::LEN { dst, src } => {
@@ -663,6 +699,7 @@ pub fn step<S: Sink, F: Feedback>(
 
         Instruction::LFALSESKIP { src } => {
             let f = s.bconst(false);
+            let f = s.pack_bool(f);
             st.set(s, src, f);
         }
 
