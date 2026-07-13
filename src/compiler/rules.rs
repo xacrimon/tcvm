@@ -1434,7 +1434,9 @@ fn compile_function_to_chunk<'gc, 'a>(
                 kind: VarKind::VarargParam,
             },
         )?;
-        ctx.adjust_locals(num_params + 1);
+        // Only the vararg register: `adjust_locals` *advances* `nactvar`, and the
+        // parameters were already promoted above.
+        ctx.adjust_locals(1);
 
         ctx.chunk.vararg_info = Some(VarargInfo {
             used_as_non_base: false,

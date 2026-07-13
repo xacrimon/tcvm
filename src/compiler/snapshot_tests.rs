@@ -161,3 +161,6 @@ test!(
     global_multiret_expand,
     "test-files/global_multiret_expand.lua"
 );
+// A named vararg *following* named parameters. Nothing compiled this file, and
+// the combination tripped an assertion in `adjust_locals`.
+test!(vararg_param, "test-files/vararg_param.lua");
