@@ -115,6 +115,7 @@ impl<'a, 'gc> Isel<'a, 'gc> {
         self.base = self.m.new_vreg(RegClass::Int);
         let entry = self.m.entry;
         let base = self.base;
+        self.m.frame_base = base;
         self.m
             .push(entry, MInst::new(MOp::EntryArg(1), vec![base], vec![]));
 
@@ -596,8 +597,11 @@ impl<'a, 'gc> Isel<'a, 'gc> {
                 self.emit(mb, MOp::BrNz { then_, else_ }, vec![], vec![cond]);
             }
             Op::Ret => {
-                // Results land at the base of the frame, which is where the
-                // interpreter's `RETURN` leaves them.
+                // Results land at `base + 0..`, which the executor passes to
+                // `frame_return` as `values_base`. Deliberately *not* the register
+                // the bytecode `RETURN` names: compiled code never reaches
+                // `op_return`, so that operand is the interpreter's business and
+                // agreeing with the executor is the only constraint.
                 for (n, &a) in args.iter().enumerate() {
                     let slot = self.slot(a);
                     self.store_lua_reg(mb, n as u8, slot);

@@ -269,6 +269,12 @@ pub struct MFunc {
     pub insts: Vec<MInst>,
     pub classes: Vec<RegClass>,
     pub entry: MBlock,
+    /// The register holding the Lua frame base, defined by `EntryArg(1)`.
+    ///
+    /// Named here because the exit stubs need it and are not instructions: they
+    /// are generated after the fact, and every store they make is relative to it.
+    /// It is therefore live across the whole region, including every exit.
+    pub frame_base: VReg,
     pub exits: Vec<ExitStub>,
     /// Shapes each `assume.no_mm` depends on. No code is emitted for those, but
     /// the compiled artifact must record the dependency so a metatable write can
@@ -289,6 +295,7 @@ impl MFunc {
             insts: Vec::new(),
             classes: Vec::new(),
             entry: MBlock(0),
+            frame_base: VReg(0),
             exits: Vec::new(),
             watchpoints: Vec::new(),
             pinned_regs: Vec::new(),

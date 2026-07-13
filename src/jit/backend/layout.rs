@@ -56,10 +56,18 @@ const _: () = assert!(val::SIZE == 16, "Value stride must be 16 for slot.get");
 const _: () = assert!(val::KIND != val::DATA);
 const _: () = assert!(size_of::<value::ValueKind>() == 1);
 
+// `guard.shape` loads one word and compares it to a pool shape's address. That is
+// only the same thing if a `Shape` *is* its `Gc` pointer and nothing else.
+const _: () = assert!(size_of::<crate::env::shape::Shape<'static>>() == 8);
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::env::value::ValueKind;
+    use crate::Lua;
+    use crate::dmm::Gc;
+    use crate::env::string::LuaString;
+    use crate::env::table::Table;
+    use crate::env::value::{Value, ValueKind};
 
     /// The layout constants are only worth anything if they match what Rust
     /// actually laid out. Build a real `Value`, look at its bytes, and confirm
@@ -72,5 +80,45 @@ mod tests {
         assert_eq!(bytes[val::KIND], kind(ValueKind::Integer));
         let data = u64::from_le_bytes(bytes[val::DATA..val::DATA + 8].try_into().unwrap());
         assert_eq!(data as i64, -2);
+    }
+
+    /// Walk a real table exactly the way compiled code will: off the raw pointer,
+    /// through `SHAPE` and `PROPS_PTR`, into the property array.
+    ///
+    /// Worth a test of its own because the failure is silent. A wrong `SHAPE`
+    /// offset makes every `guard.shape` fail, every guard failure deopts, and the
+    /// program still produces the right answers — just never in native code. The
+    /// suite would stay green and the JIT would do nothing.
+    #[test]
+    fn table_walk_matches_reality() {
+        let mut lua = Lua::new();
+        lua.enter(|ctx| {
+            let t = Table::new(ctx);
+            t.raw_set(
+                ctx,
+                Value::string(LuaString::new(ctx, b"x")),
+                Value::integer(7),
+            );
+
+            let base = Gc::as_ptr(t.inner()) as *const u8;
+
+            // `box_addr`, not `as_ptr`: the field holds the collector's box, and
+            // the payload sits past its header. Compare the wrong one and the
+            // shape guard never matches.
+            let shape = unsafe { base.add(table::SHAPE).cast::<usize>().read() };
+            assert_eq!(
+                shape,
+                Gc::box_addr(t.shape().inner()),
+                "the word at table::SHAPE is not the shape pointer"
+            );
+
+            let props = unsafe { base.add(table::PROPS_PTR).cast::<*const Value>().read() };
+            let slot0 = unsafe { props.read() };
+            assert_eq!(
+                slot0.get_integer(),
+                Some(7),
+                "the first property is not where props_ptr says it is"
+            );
+        });
     }
 }
