@@ -10,6 +10,7 @@ pub mod op;
 pub mod pool;
 pub mod print;
 pub mod ty;
+pub mod verify;
 
 use crate::jit::ir::op::{Effects, Op};
 use crate::jit::ir::pool::ConstPool;
@@ -273,6 +274,22 @@ impl<'gc> Func<'gc> {
 
     pub fn num_values(&self) -> usize {
         self.values.len()
+    }
+
+    pub fn num_blocks(&self) -> usize {
+        self.blocks.len()
+    }
+
+    pub fn num_insts(&self) -> usize {
+        self.insts.len()
+    }
+
+    pub fn num_frame_states(&self) -> usize {
+        self.states.len()
+    }
+
+    pub fn num_exits(&self) -> usize {
+        self.exits.len()
     }
 }
 

@@ -15,7 +15,19 @@ use super::lower::lower;
 use super::print::format_cfgs;
 use crate::jit::ir::print::print_func;
 use crate::jit::ir::ty::{Ty, TypeSet};
+use crate::jit::ir::{Func, verify};
 use crate::{Executor, Lua};
+
+/// Print a lowered function, but only after it verifies. Every IR snapshot goes
+/// through here, so no snapshot can be accepted for IR that violates an
+/// invariant — the failure is a test failure, not a puzzling diff.
+fn checked(func: &Func<'_>) -> String {
+    let text = print_func(func);
+    if let Err(e) = verify::verify(func) {
+        panic!("IR failed verification:\n{e}\n--- ir ---\n{text}");
+    }
+    text
+}
 
 fn cfgs_of(source: &str) -> String {
     let mut lua = Lua::new();
@@ -38,7 +50,7 @@ fn ir_of(source: &str, entry: &[Ty]) -> String {
         let closure = chunk.as_lua().expect("chunk is a Lua closure");
         let inner = closure.proto.prototypes[0];
         match lower(inner, 0, entry.to_vec()) {
-            Ok(func) => print_func(&func),
+            Ok(func) => checked(&func),
             Err(e) => format!("declined: {e:?}\n"),
         }
     })
@@ -125,7 +137,7 @@ fn test_ir_loop_warm_ic() {
     let out = lua.enter(|ctx| {
         let closure = ctx.fetch(&f).as_lua().expect("Lua closure");
         match lower(closure.proto, 0, vec![TAB, INT]) {
-            Ok(func) => print_func(&func),
+            Ok(func) => checked(&func),
             Err(e) => format!("declined: {e:?}\n"),
         }
     });

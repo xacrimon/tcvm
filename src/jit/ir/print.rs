@@ -413,6 +413,10 @@ mod tests {
         assert_eq!(f.ty(t1).refine, Refine::Shape(s0));
         assert!(f.ty(hi).set.is_monomorphic());
 
+        if let Err(e) = crate::jit::ir::verify::verify(&f) {
+            panic!("hand-built IR failed verification:\n{e}");
+        }
+
         let text = print_func(&f);
         let expected = "\
 block0(v0: int, v1: int, v2: int, v3: tab):

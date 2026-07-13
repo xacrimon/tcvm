@@ -130,13 +130,22 @@ bitflags! {
 ///
 /// # The rooting rule
 ///
-/// At any op with `MAY_GC`, every live value with rep `Val` or `Ptr` must be
-/// *anchored*: either it is a Lua register named by the op's `FrameState` (and
-/// so spilled to its canonical stack slot, where `ThreadState::trace` finds
-/// it), or it is derived from a value that is. Derived pointers are sound to
-/// leave unrooted only because the collector does not move objects. Anything
-/// else spills to the traced JIT spill area. Lowering enforces this; the
-/// verifier checks it.
+/// At any op with `MAY_GC`, every live value that *carries a `Gc` pointer* — rep
+/// `Ptr`, or rep `Val` whose type set intersects `HEAP` — must be **anchored**.
+/// A packed integer is rep `Val` and holds no pointer, so it needs nothing.
+///
+/// A value is anchored if any of:
+///   - it is a Lua register named by the op's `FrameState`, and so spilled to its
+///     canonical stack slot, where `ThreadState::trace` finds it;
+///   - it is *derived* from an anchored value (`tab.props`, `tab.arr`,
+///     `unpack.ptr`, or a guard's refinement). Derived interior pointers are
+///     sound to leave unrooted only because the collector does not move objects:
+///     the base keeps the allocation alive and the pointer stays valid;
+///   - it is a pool constant or an upvalue cell, which the constant pool and the
+///     running closure respectively keep alive.
+///
+/// Anything else must spill to the traced JIT spill area. Lowering is responsible
+/// for arranging this; `jit::ir::verify` checks it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Effects {
     pub flags: Flags,

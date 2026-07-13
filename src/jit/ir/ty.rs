@@ -230,6 +230,22 @@ impl Ty {
         }
     }
 
+    /// Does a slot of this type accept a value of type `src`?
+    ///
+    /// Representations must match exactly. It is tempting to let a boxed target
+    /// swallow an unboxed source by packing on the edge — but that is precisely
+    /// how you end up re-tagging a loop accumulator on every back-edge. Refusing
+    /// forces a second block version whose parameter is the raw `i64`, which
+    /// self-loops: the first runs once with the entry types, the second runs
+    /// unboxed forever. That is the loop peeling, and it only happens if we
+    /// insist here. The fully-generic version is where packing legitimately
+    /// belongs.
+    pub fn accepts(self, src: Self) -> bool {
+        self.rep == src.rep
+            && self.set.contains(src.set)
+            && (self.refine == Refine::None || self.refine == src.refine)
+    }
+
     /// Drop everything but the representation. Used when a block accumulates
     /// too many versions and we give up on specializing it.
     pub fn widen(self) -> Self {

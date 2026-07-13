@@ -821,30 +821,8 @@ struct Version {
     succs: Vec<usize>,
 }
 
-/// Does a *specialized* block version with parameter types `target` accept an
-/// edge carrying `src`?
-///
-/// Representations must match exactly. It is tempting to let a boxed target
-/// swallow an unboxed source by packing on the edge — but that is precisely how
-/// you end up re-tagging a loop accumulator on every back-edge. Refusing forces
-/// a second version whose parameter is the raw `i64`, which self-loops: the
-/// first version runs once with the entry types, the second runs unboxed
-/// forever. That is the peeling, and it only happens if we insist here.
-///
-/// The generic version (see `Version::generic`) is the one that accepts
-/// anything, and it is where packing legitimately belongs.
-fn accepts(target: Ty, src: Ty) -> bool {
-    if target.rep != src.rep {
-        return false;
-    }
-    if !target.set.contains(src.set) {
-        return false;
-    }
-    target.refine == Refine::None || target.refine == src.refine
-}
-
 fn ctx_accepts(target: &TypeContext, src: &TypeContext) -> bool {
-    target.0.len() == src.0.len() && target.0.iter().zip(&src.0).all(|(&t, &s)| accepts(t, s))
+    target.0.len() == src.0.len() && target.0.iter().zip(&src.0).all(|(&t, &s)| t.accepts(s))
 }
 
 struct Versions {
