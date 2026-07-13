@@ -336,6 +336,49 @@ impl MFunc {
     pub fn num_vregs(&self) -> usize {
         self.classes.len()
     }
+
+    /// The successors of a block: whatever its terminator names.
+    ///
+    /// Exit stubs are deliberately absent. A guard's branch to its stub is not an
+    /// edge — the stub does not rejoin, it leaves — and the values the stub needs
+    /// are already on the guard's `uses` list, so liveness picks them up there.
+    pub fn succs(&self, b: MBlock) -> Vec<MBlock> {
+        match self.block(b).insts.last() {
+            Some(&i) => self.inst(i).op.targets(),
+            None => vec![],
+        }
+    }
+
+    /// Reverse postorder from the entry.
+    ///
+    /// Both the encoder and the register allocator walk this. They *must* agree:
+    /// a live interval is an span of positions in a linearization, and if the two
+    /// disagree about what that linearization is, the allocator will free a
+    /// register the encoder still has a live value in.
+    pub fn block_order(&self) -> Vec<MBlock> {
+        let mut seen = vec![false; self.blocks.len()];
+        let mut post = Vec::with_capacity(self.blocks.len());
+
+        // Iterative, because a deeply nested region would blow a recursive stack.
+        let mut stack = vec![(self.entry, 0usize)];
+        seen[self.entry.0 as usize] = true;
+        while let Some((b, next)) = stack.pop() {
+            let succs = self.succs(b);
+            if next < succs.len() {
+                stack.push((b, next + 1));
+                let s = succs[next];
+                if !seen[s.0 as usize] {
+                    seen[s.0 as usize] = true;
+                    stack.push((s, 0));
+                }
+            } else {
+                post.push(b);
+            }
+        }
+
+        post.reverse();
+        post
+    }
 }
 
 impl Default for MFunc {

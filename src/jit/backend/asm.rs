@@ -126,8 +126,30 @@ impl Asm {
         l
     }
 
+    /// Bind a label here, dropping a branch that was about to jump to it.
+    ///
+    /// An unconditional `b` that is the last instruction before its own target is
+    /// a no-op. Catching it here rather than in the encoder is what makes the rule
+    /// general: it is a property of the branch and the label, so it holds whatever
+    /// emitted the branch — a block's `jump`, the fallthrough arm of a two-way
+    /// branch, or the last exit stub's return to the epilogue. The encoder gets to
+    /// stay ignorant of what happens to be laid out next.
+    ///
+    /// Only ever the *last* instruction, and only an unconditional one: a `cbnz`
+    /// to the next instruction is not dead, it is a branch whose fallthrough and
+    /// target coincide, and dropping it would drop the test with it.
     pub fn bind(&mut self, l: Label) {
         debug_assert_eq!(self.labels[l.0 as usize], UNBOUND, "label bound twice");
+
+        if let Some(f) = self.fixups.last()
+            && f.at + 1 == self.words.len()
+            && f.label == l
+            && matches!(f.kind, FixupKind::B26)
+        {
+            self.fixups.pop();
+            self.words.pop();
+        }
+
         self.labels[l.0 as usize] = self.words.len() as u32;
     }
 
@@ -919,6 +941,38 @@ mod tests {
             assert_eq!(g, w, "word {i}: got {g:#010x}, clang says {w:#010x}");
         }
         assert_eq!(got.len(), want.len());
+    }
+
+    /// A `b` to the very next instruction is dropped; a conditional one is not.
+    #[test]
+    fn branch_to_the_next_instruction_is_dropped() {
+        let mut a = Asm::new();
+        let l = a.new_label();
+        a.mov_imm(X0, 7);
+        a.b(l);
+        a.bind(l);
+        a.ret();
+        assert_eq!(a.finish().len(), 2, "the `b` should be gone");
+
+        // The conditional must survive: its fallthrough and its target coincide,
+        // but the *test* still has to run — and here it feeds a `cset` after it.
+        let mut a = Asm::new();
+        let l = a.new_label();
+        a.cbnz(X0, l);
+        a.bind(l);
+        a.ret();
+        assert_eq!(a.finish().len(), 2, "the `cbnz` must stay");
+
+        // And only the *last* instruction: an intervening one makes it live.
+        let mut a = Asm::new();
+        let l = a.new_label();
+        a.b(l);
+        a.mov_imm(X0, 7);
+        a.bind(l);
+        a.ret();
+        let words = a.finish();
+        assert_eq!(words.len(), 3);
+        assert_eq!(run_args(&words, 0, 0), 0, "the branch must skip the mov");
     }
 
     /// A frame push/pop, exercised by clobbering the stack in between.

@@ -17,7 +17,8 @@ use crate::env::string::LuaString;
 use crate::env::value::{Value, ValueKind};
 use crate::jit::backend::aarch64::{Status, encode};
 use crate::jit::backend::isel::select;
-use crate::jit::backend::regalloc::spill_everything;
+use crate::jit::backend::mach::MFunc;
+use crate::jit::backend::regalloc::{Allocation, linear_scan, spill_everything};
 use crate::jit::frontend::lower::lower;
 use crate::jit::ir::ty::{Rep, Ty, TypeSet};
 use crate::{Executor, Lua, StashedFunction, StashedTable};
@@ -31,6 +32,16 @@ const TAB: Ty = Ty::new(Rep::Val, TypeSet::TAB);
 /// nothing calls, allocates, or collects — so these tests pass null and the
 /// signature stays honest about what will eventually be needed.
 type Region = extern "C" fn(*mut (), *mut Value<'static>) -> u64;
+
+/// Every execution test runs under both allocators.
+///
+/// `spill_everything` is the oracle: it is too dumb to have an interesting bug,
+/// so any program the two disagree on localizes the fault to `linear_scan`
+/// immediately. Keeping the naive one alive costs a few lines and buys a bisect.
+const ALLOCATORS: [(&str, fn(&MFunc) -> Allocation); 2] = [
+    ("spill_everything", spill_everything),
+    ("linear_scan", linear_scan),
+];
 
 /// Run `jit_loop_warm.lua`, which leaves `sum_field`'s inline caches warm, and
 /// hand back the function.
@@ -105,33 +116,37 @@ fn native_sum_field_matches_interpreter() {
         let want = interpret(&mut lua, &f, &t, n);
         assert_eq!(want, 7 * n, "the interpreter itself disagrees");
 
-        lua.enter(|ctx| {
-            let closure = ctx.fetch(&f).as_lua().expect("Lua closure");
-            let func = lower(closure.proto, 0, vec![TAB, INT]).expect("lower");
-            let m = select(&func).expect("isel");
-            let ra = spill_everything(&m);
-            let code = encode(&m, &func.pool, &ra).expect("encode");
+        for (name, alloc) in ALLOCATORS {
+            lua.enter(|ctx| {
+                let closure = ctx.fetch(&f).as_lua().expect("Lua closure");
+                let func = lower(closure.proto, 0, vec![TAB, INT]).expect("lower");
+                let m = select(&func).expect("isel");
+                let ra = alloc(&m);
+                let code = encode(&m, &func.pool, &ra).expect("encode");
 
-            // A stand-in Lua frame: `t` and `n` where the region's entry context
-            // says they are, and room for every register its exits write back.
-            let mut stack = vec![Value::nil(); m.max_lua_reg as usize + 1];
-            stack[0] = Value::table(ctx.fetch(&t));
-            stack[1] = Value::integer(n);
+                // A stand-in Lua frame: `t` and `n` where the region's entry
+                // context says they are, and room for every register its exits
+                // write back.
+                let mut stack = vec![Value::nil(); m.max_lua_reg as usize + 1];
+                stack[0] = Value::table(ctx.fetch(&t));
+                stack[1] = Value::integer(n);
 
-            let region: Region = unsafe { std::mem::transmute(code.entry()) };
-            let status = Status::unpack(region(std::ptr::null_mut(), stack.as_mut_ptr().cast()));
+                let region: Region = unsafe { std::mem::transmute(code.entry()) };
+                let status =
+                    Status::unpack(region(std::ptr::null_mut(), stack.as_mut_ptr().cast()));
 
-            assert_eq!(
-                status,
-                Status::Return(1),
-                "expected a native return, not a deopt — a guard failed"
-            );
-            assert_eq!(
-                stack[0].get_integer(),
-                Some(want),
-                "native result disagrees with the interpreter for n = {n}"
-            );
-        });
+                assert_eq!(
+                    status,
+                    Status::Return(1),
+                    "{name}: expected a native return, not a deopt — a guard failed"
+                );
+                assert_eq!(
+                    stack[0].get_integer(),
+                    Some(want),
+                    "{name}: native result disagrees with the interpreter for n = {n}"
+                );
+            });
+        }
     }
 }
 
@@ -200,39 +215,42 @@ fn type_guard_deopts_mid_loop() {
 
     lua.enter(|ctx| {
         // Same shape — only the value in the slot changes.
-        let table = ctx.fetch(&t);
-        table.raw_set(
+        ctx.fetch(&t).raw_set(
             ctx,
             Value::string(LuaString::new(ctx, b"x")),
             Value::float(1.5),
         );
-
-        let closure = ctx.fetch(&f).as_lua().expect("Lua closure");
-        let func = lower(closure.proto, 0, vec![TAB, INT]).expect("lower");
-        let m = select(&func).expect("isel");
-        let ra = spill_everything(&m);
-        let code = encode(&m, &func.pool, &ra).expect("encode");
-
-        let mut stack = vec![Value::nil(); m.max_lua_reg as usize + 1];
-        stack[0] = Value::table(table);
-        stack[1] = Value::integer(4);
-
-        let region: Region = unsafe { std::mem::transmute(code.entry()) };
-        let status = Status::unpack(region(std::ptr::null_mut(), stack.as_mut_ptr().cast()));
-
-        // Exit 1 is the *type* guard on the peeled first iteration; exit 0 is the
-        // shape guard ahead of it (see the MIR snapshot). Naming it is the whole
-        // point of the test: writing a float through `raw_set` must not have moved
-        // the table's shape, so the shape guard has to pass and the tag check has
-        // to be what fails.
-        assert_eq!(
-            status,
-            Status::Deopt(1),
-            "expected the integer tag guard to fail, not the shape guard"
-        );
-        assert_eq!(stack[2].get_integer(), Some(0), "s is still 0");
-        assert_eq!(stack[3].get_integer(), Some(1), "i is still 1");
     });
+
+    for (name, alloc) in ALLOCATORS {
+        lua.enter(|ctx| {
+            let closure = ctx.fetch(&f).as_lua().expect("Lua closure");
+            let func = lower(closure.proto, 0, vec![TAB, INT]).expect("lower");
+            let m = select(&func).expect("isel");
+            let ra = alloc(&m);
+            let code = encode(&m, &func.pool, &ra).expect("encode");
+
+            let mut stack = vec![Value::nil(); m.max_lua_reg as usize + 1];
+            stack[0] = Value::table(ctx.fetch(&t));
+            stack[1] = Value::integer(4);
+
+            let region: Region = unsafe { std::mem::transmute(code.entry()) };
+            let status = Status::unpack(region(std::ptr::null_mut(), stack.as_mut_ptr().cast()));
+
+            // Exit 1 is the *type* guard on the peeled first iteration; exit 0 is
+            // the shape guard ahead of it (see the MIR snapshot). Naming it is the
+            // point: writing a float through `raw_set` must not have moved the
+            // table's shape, so the shape guard has to pass and the tag check has
+            // to be what fails.
+            assert_eq!(
+                status,
+                Status::Deopt(1),
+                "{name}: expected the integer tag guard to fail, not the shape guard"
+            );
+            assert_eq!(stack[2].get_integer(), Some(0), "{name}: s is still 0");
+            assert_eq!(stack[3].get_integer(), Some(1), "{name}: i is still 1");
+        });
+    }
 
     // And to be sure the table really did keep its shape, the interpreter agrees
     // this is a float sum now.
@@ -265,11 +283,21 @@ fn dump_native() {
         let closure = ctx.fetch(&f).as_lua().expect("Lua closure");
         let func = lower(closure.proto, 0, vec![TAB, INT]).expect("lower");
         let m = select(&func).expect("isel");
-        let ra = spill_everything(&m);
-        let code = encode(&m, &func.pool, &ra).expect("encode");
-        for b in code.bytes() {
-            print!("{b:02x}");
+        for (name, alloc) in ALLOCATORS {
+            let ra = alloc(&m);
+            let code = encode(&m, &func.pool, &ra).expect("encode");
+            eprintln!(
+                "{name}: {} vregs -> {} in registers, {} spilled; {} instructions",
+                m.num_vregs(),
+                ra.num_in_regs(),
+                ra.num_spills,
+                code.bytes().len() / 4,
+            );
+            print!("{name} ");
+            for b in code.bytes() {
+                print!("{b:02x}");
+            }
+            println!();
         }
-        println!();
     });
 }

@@ -110,6 +110,12 @@ pub struct Encoder<'a, 'gc> {
 }
 
 pub fn encode(m: &MFunc, pool: &ConstPool<'_>, ra: &Allocation) -> Result<Code, EncodeError> {
+    debug_assert!(
+        crate::jit::backend::regalloc::verify(m, ra).is_ok(),
+        "{}",
+        crate::jit::backend::regalloc::verify(m, ra).unwrap_err()
+    );
+
     let mut a = Asm::new();
     let blocks = (0..m.blocks.len()).map(|_| a.new_label()).collect();
     let exits = (0..m.exits.len()).map(|_| a.new_label()).collect();
@@ -148,14 +154,13 @@ impl Encoder<'_, '_> {
     fn run(&mut self) {
         self.prologue();
 
-        // The entry block first, so it falls through from the prologue; the rest in
-        // index order. Order is otherwise free — every edge is an explicit branch.
-        let entry = self.m.entry;
-        self.block(entry);
-        for b in 0..self.m.blocks.len() as u32 {
-            if MBlock(b) != entry {
-                self.block(MBlock(b));
-            }
+        // Reverse postorder, which puts the entry first so it falls through from
+        // the prologue. The order is not merely cosmetic: the register allocator
+        // computed its live intervals as spans of *this* linearization, so laying
+        // the blocks out differently would free registers that still hold live
+        // values here.
+        for b in self.m.block_order() {
+            self.block(b);
         }
 
         for e in 0..self.m.exits.len() as u32 {
