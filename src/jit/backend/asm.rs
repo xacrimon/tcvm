@@ -258,6 +258,56 @@ impl Asm {
         self.emit(0x9B00_7C00 | ((m.0 as u32) << 16) | ((n.0 as u32) << 5) | d.0 as u32);
     }
 
+    /// `sdiv xd, xn, xm` — truncating signed division.
+    ///
+    /// Traps on nothing: `n / 0` is 0 and `i64::MIN / -1` is `i64::MIN`. Both are
+    /// what Rust's `wrapping_div` produces, which is what the interpreter uses, so
+    /// the only divisor the JIT has to care about is the zero the frontend already
+    /// guards.
+    pub fn sdiv(&mut self, d: Gpr, n: Gpr, m: Gpr) {
+        self.emit(0x9AC0_0C00 | ((m.0 as u32) << 16) | ((n.0 as u32) << 5) | d.0 as u32);
+    }
+
+    /// `msub xd, xn, xm, xa` — `xd = xa - xn * xm`.
+    pub fn msub(&mut self, d: Gpr, n: Gpr, m: Gpr, a: Gpr) {
+        self.emit(
+            0x9B00_8000
+                | ((m.0 as u32) << 16)
+                | ((a.0 as u32) << 10)
+                | ((n.0 as u32) << 5)
+                | d.0 as u32,
+        );
+    }
+
+    /// `csel xd, xn, xm, cond` — `xd = cond ? xn : xm`.
+    pub fn csel(&mut self, d: Gpr, n: Gpr, m: Gpr, cond: Cond) {
+        self.emit(
+            0x9A80_0000
+                | ((m.0 as u32) << 16)
+                | ((cond as u32) << 12)
+                | ((n.0 as u32) << 5)
+                | d.0 as u32,
+        );
+    }
+
+    /// `ccmp xn, #imm, #nzcv, cond` — compare only if `cond` holds, otherwise
+    /// force the flags to `nzcv` outright.
+    ///
+    /// This is how you `&&` two conditions without a branch: the second compare
+    /// runs only when the first passed, and when it didn't, the flags are set to
+    /// something the final `csel` will read as false.
+    pub fn ccmp_imm(&mut self, n: Gpr, imm: u8, nzcv: u8, cond: Cond) {
+        debug_assert!(imm < 32, "ccmp immediate is 5 bits");
+        debug_assert!(nzcv < 16, "nzcv is 4 bits");
+        self.emit(
+            0xFA40_0800
+                | ((imm as u32) << 16)
+                | ((cond as u32) << 12)
+                | ((n.0 as u32) << 5)
+                | nzcv as u32,
+        );
+    }
+
     pub fn and(&mut self, d: Gpr, n: Gpr, m: Gpr) {
         self.alu_rrr(0x8A00_0000, d, n, m);
     }
@@ -840,6 +890,10 @@ mod tests {
         a.add(x0, x1, x2);
         a.sub(x0, x1, x2);
         a.mul(x0, x1, x2);
+        a.sdiv(x0, x1, x2);
+        a.msub(x0, x1, x2, Gpr(3));
+        a.csel(x0, x1, x2, Cond::Mi);
+        a.ccmp_imm(x1, 0, 0, Cond::Ne);
         a.and(x0, x1, x2);
         a.orr(x0, x1, x2);
         a.eor(x0, x1, x2);
@@ -893,6 +947,10 @@ mod tests {
             0x8b020020, // add   x0, x1, x2
             0xcb020020, // sub   x0, x1, x2
             0x9b027c20, // mul   x0, x1, x2
+            0x9ac20c20, // sdiv  x0, x1, x2
+            0x9b028c20, // msub  x0, x1, x2, x3
+            0x9a824020, // csel  x0, x1, x2, mi
+            0xfa401820, // ccmp  x1, #0, #0, ne
             0x8a020020, // and   x0, x1, x2
             0xaa020020, // orr   x0, x1, x2
             0xca020020, // eor   x0, x1, x2

@@ -171,6 +171,14 @@ fn log_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("TCVM_JIT_LOG").is_some())
 }
 
+/// `TCVM_JIT_OFF=1` keeps everything interpreted. The point is to A/B one binary:
+/// any difference in output between a run with this set and a run without it is a
+/// JIT bug, and any difference in time is the JIT's actual worth.
+fn jit_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("TCVM_JIT_OFF").is_some())
+}
+
 /// What the interpreter should do with a Lua frame it has just pushed.
 pub enum Outcome {
     /// There is no native code for this frame. Interpret it.
@@ -194,7 +202,7 @@ pub fn on_call<'gc>(
     base: usize,
 ) -> Outcome {
     let n = proto.jit_calls.get();
-    if n == DECLINED {
+    if n == DECLINED || jit_disabled() {
         return Outcome::Interpret;
     }
     if n < HOT_CALL {

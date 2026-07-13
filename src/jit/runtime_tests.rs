@@ -93,3 +93,21 @@ fn a_failed_guard_finishes_in_the_interpreter() {
     assert_eq!(r.deopts, 50, "every call on the foreign shape should deopt");
     assert_eq!(r.total, 250 * 10 * 7);
 }
+
+/// `%` and `//` over 1104 calls covering every sign quadrant plus `i64::MIN // -1`.
+///
+/// The checksum is `lua`'s, taken by running `test-files/jit_mod.lua` under the
+/// reference implementation — which is the only thing that could catch a floor
+/// correction applied in the wrong quadrant, since truncating and flooring agree
+/// wherever both operands are positive.
+#[test]
+fn floor_mod_and_idiv_match_the_reference() {
+    let r = run("test-files/jit_mod.lua");
+
+    assert_eq!(r.entries, 1104 - (NATIVE_FROM - 1) as u64);
+    assert_eq!(
+        r.deopts, 0,
+        "integer operands throughout; nothing to deopt on"
+    );
+    assert_eq!(r.total, 389927, "checksum disagrees with `lua`");
+}

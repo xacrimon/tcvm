@@ -90,6 +90,14 @@ pub enum EncodeError {
 const S0: Gpr = Gpr(9);
 const S1: Gpr = Gpr(10);
 const S2: Gpr = Gpr(11);
+
+/// Two more, for the macro-ops that expand to a sequence and need somewhere to
+/// keep an intermediate. Held apart from `S0..S2` because those may already be
+/// standing in for a spilled operand by the time the sequence starts. `x16`/`x17`
+/// are the platform's own scratch (IP0/IP1) and are outside `INT_REGS`, so the
+/// allocator never hands them out.
+const T0: Gpr = Gpr(16);
+const T1: Gpr = Gpr(17);
 const F0: Fpr = Fpr(16);
 const F1: Fpr = Fpr(17);
 const F2: Fpr = Fpr(18);
@@ -245,6 +253,43 @@ impl Encoder<'_, '_> {
         }
     }
 
+    // --- the floor-rounding divides -----------------------------------------
+    //
+    // `sdiv` truncates toward zero; Lua rounds toward negative infinity. The
+    // correction applies exactly when the remainder is non-zero *and* the operand
+    // signs differ, which is two conditions — hence `ccmp`, which evaluates the
+    // second only if the first held and otherwise stamps the flags with a value
+    // the `csel` reads as false. That keeps the whole thing branchless.
+    //
+    // Nothing here needs a zero-divisor check: `sdiv` by zero yields zero rather
+    // than trapping, and the frontend has already emitted the `guard.cond` that
+    // deopts before we get here (Lua raises on `x % 0`). Both of these also stay
+    // correct at `i64::MIN op -1`, where `sdiv` wraps to `i64::MIN` and the
+    // remainder is 0 — the same answers `wrapping_div`/`wrapping_rem` give the
+    // interpreter.
+
+    /// `d = n - floor(n / m) * m`, in the sign convention of Lua's `%`.
+    fn floor_mod(&mut self, d: Gpr, n: Gpr, m: Gpr) {
+        self.a.sdiv(T0, n, m); // q
+        self.a.msub(T0, T0, m, n); // r = n - q*m, truncated
+        self.a.eor(T1, T0, m); // sign bit set iff r and m disagree
+        assert!(self.a.try_cmp_imm(T0, 0)); // Z = (r == 0)
+        self.a.ccmp_imm(T1, 0, 0, Cond::Ne); // r != 0 ? flags of (r^m) : clear
+        self.a.add(T1, T0, m); // the corrected value — `add` leaves flags alone
+        self.a.csel(d, T1, T0, Cond::Mi);
+    }
+
+    /// `d = floor(n / m)`, in the sign convention of Lua's `//`.
+    fn floor_div(&mut self, d: Gpr, n: Gpr, m: Gpr) {
+        self.a.sdiv(T0, n, m); // q
+        self.a.msub(T1, T0, m, n); // r
+        assert!(self.a.try_cmp_imm(T1, 0)); // Z = (r == 0)
+        self.a.eor(T1, n, m); // r is dead; reuse it for the sign test
+        self.a.ccmp_imm(T1, 0, 0, Cond::Ne);
+        assert!(self.a.try_sub_imm(T1, T0, 1)); // q - 1
+        self.a.csel(d, T1, T0, Cond::Mi);
+    }
+
     // --- blocks -------------------------------------------------------------
 
     fn block(&mut self, b: MBlock) {
@@ -342,6 +387,8 @@ impl Encoder<'_, '_> {
                             AluOp::Shl => self.a.lslv(d, n, m),
                             AluOp::Sar => self.a.asrv(d, n, m),
                             AluOp::Lsr => self.a.lsrv(d, n, m),
+                            AluOp::Mod => self.floor_mod(d, n, m),
+                            AluOp::IDiv => self.floor_div(d, n, m),
                             AluOp::Neg | AluOp::Not => unreachable!("handled above"),
                         }
                         d
@@ -369,6 +416,8 @@ impl Encoder<'_, '_> {
                         AluOp::Shl => self.a.lslv(d, n, S1),
                         AluOp::Sar => self.a.asrv(d, n, S1),
                         AluOp::Lsr => self.a.lsrv(d, n, S1),
+                        AluOp::Mod => self.floor_mod(d, n, S1),
+                        AluOp::IDiv => self.floor_div(d, n, S1),
                         AluOp::Neg | AluOp::Not => panic!("{o:?} takes no immediate"),
                     }
                 }

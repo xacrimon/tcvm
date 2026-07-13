@@ -85,6 +85,15 @@ pub enum AluOp {
     Lsr,
     Neg,
     Not,
+
+    // The only two that are not a single machine instruction. Lua's `%` and `//`
+    // round toward *negative infinity*; every hardware divide truncates toward
+    // zero. The difference is a correction term that the encoder expands inline,
+    // so these stay one MIR op — splitting them into the seven real instructions
+    // here would mean teaching the allocator about temporaries that only exist
+    // between them.
+    Mod,
+    IDiv,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]

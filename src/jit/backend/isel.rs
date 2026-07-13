@@ -893,8 +893,10 @@ fn int_alu(o: IntOp) -> Result<AluOp, IselError> {
         // 64 or more yields zero, where aarch64 masks to 6 bits and yields the
         // operand. Needs a guard or a select; not yet.
         IntOp::Shl | IntOp::Shr => return Err(IselError::Unsupported("shift")),
-        // Floor semantics and a zero-divisor exit. Not yet.
-        IntOp::IDiv | IntOp::Mod => return Err(IselError::Unsupported("idiv/mod")),
+        // The zero divisor is not our problem: lowering has already put a
+        // `guard.cond` in front of these, because Lua raises on `x % 0`.
+        IntOp::Mod => AluOp::Mod,
+        IntOp::IDiv => AluOp::IDiv,
     })
 }
 
