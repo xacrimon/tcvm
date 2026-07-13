@@ -48,6 +48,20 @@ pub struct Prototype<'gc> {
     /// interpreter's fast path.
     #[collect(require_static)]
     pub ic_types: Box<[Cell<KindSet>]>,
+
+    /// Calls seen so far, saturating at `jit::region::HOT_CALL` (or pinned at a
+    /// sentinel once compilation has been refused). Read on every Lua-to-Lua
+    /// call, which is why it is a bare `Cell` and not behind the `RefLock` below.
+    #[collect(require_static)]
+    pub jit_calls: Cell<u32>,
+    /// Native code for this prototype, once there is any.
+    ///
+    /// The extra `Gc` hop is what makes the field writable at all: storing a
+    /// `Gc` into an already-allocated object needs a write barrier, and
+    /// `Gc<RefLock<_>>::borrow_mut` is where that barrier lives. A `RefLock`
+    /// field *inside* the prototype would have to reach for `Gc::write` and
+    /// project through it by hand.
+    pub jit: Gc<'gc, RefLock<Option<Gc<'gc, crate::jit::region::Region<'gc>>>>>,
 }
 
 /// Per-call-site monomorphic inline cache. `Empty` initially; a slow

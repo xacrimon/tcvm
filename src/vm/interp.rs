@@ -11,6 +11,7 @@ use crate::env::thread::{
 };
 use crate::env::value::{Value, ValueKind};
 use crate::instruction::{Instruction, UpValueDescriptor};
+use crate::jit;
 use crate::lua::Context;
 use crate::vm::num::{self, op_arith, op_bit};
 
@@ -1711,6 +1712,40 @@ extern "rust-preserve-none" fn op_call<'gc>(
                 num_extras,
                 continuation: None,
             });
+
+            // The JIT's only entry point. The frame is already pushed and its
+            // registers are in place, so a region can run over it as-is, and a
+            // deopt out of one leaves a frame the interpreter can simply pick up.
+            match jit::region::on_call(ctx, thread, closure.proto, new_base) {
+                jit::region::Outcome::Interpret => {}
+                jit::region::Outcome::Deopt(pc) => {
+                    thread.top_lua_mut().unwrap().pc = pc;
+                    ip = unsafe { closure.proto.code.as_ptr().add(pc) };
+                    registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
+                    dispatch!();
+                }
+                jit::region::Outcome::Returned(nret) => {
+                    // Native code lands its results at `base + 0` — which is what
+                    // makes this the same unwind `op_return` does, just with the
+                    // count coming from the status word instead of the bytecode.
+                    match frame_return(ctx.mutation(), thread, new_base, nret) {
+                        FrameReturn::TopLevel | FrameReturn::ToNonLua => return Ok(()),
+                        FrameReturn::Caller {
+                            new_base: caller_base,
+                            new_ip,
+                        } => {
+                            ip = new_ip;
+                            registers = unsafe { thread.stack.as_mut_ptr().add(caller_base) };
+                            dispatch!();
+                        }
+                        // Continuations are attached by the metamethod helpers to
+                        // frames *they* push; this one was pushed a dozen lines up
+                        // with `continuation: None`.
+                        FrameReturn::Continuation => unreachable!("op_call pushed no continuation"),
+                    }
+                }
+            }
+
             ip = closure.proto.code.as_ptr();
             registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
             dispatch!();
