@@ -19,6 +19,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["jit"]
+# The optimizing JIT. Functional only on aarch64 macOS; enabling it elsewhere
+# compiles the pipeline but the code allocator falls back to per-function maps.
+jit = []
+
 [dependencies]
 tcvm-derive = { path = "derive", version = "0.1.0" }
 hashbrown = { version = "0.17.1", default-features = false, features = ["nightly"] }

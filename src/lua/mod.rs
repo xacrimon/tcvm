@@ -49,6 +49,22 @@ pub struct State<'gc> {
 /// A Lua runtime instance.
 pub struct Lua {
     arena: Arena<Rootable![State<'_>]>,
+    /// Host-side state owned by this instance but not traced by the GC.
+    ///
+    /// Declared *after* `arena` so it drops *after* it: when the arena tears
+    /// down, every `Region` is dropped — each freeing its code back into a
+    /// segment — while those segments are still mapped. Reversing the order would
+    /// `munmap` first and turn those frees into use-after-frees.
+    off_heap: OffHeap,
+}
+
+/// Non-GC, per-`Lua` state. Reached from inside the arena via a raw pointer in
+/// [`Context`], refreshed each `enter`.
+#[derive(Default)]
+struct OffHeap {
+    /// The JIT code allocator. See `jit::backend::alloc`.
+    #[cfg(all(feature = "jit", target_os = "macos", target_arch = "aarch64"))]
+    code_alloc: crate::jit::backend::alloc::CodeAllocator,
 }
 
 impl Default for Lua {
@@ -74,7 +90,10 @@ impl Lua {
                 interner,
             }
         });
-        Lua { arena }
+        Lua {
+            arena,
+            off_heap: OffHeap::default(),
+        }
     }
 
     /// Force a full garbage-collection cycle (mark + sweep) to completion.
@@ -95,7 +114,21 @@ impl Lua {
     where
         F: for<'gc> FnOnce(Context<'gc>) -> T,
     {
-        self.arena.mutate(|mc, state| f(Context::new(mc, state)))
+        // Recompute the allocator pointer here rather than caching it: `&mut
+        // self` pins `Lua` for the call, so `&off_heap` is valid throughout, and
+        // a `Lua` that moved between calls gets a fresh pointer next time. Forming
+        // the raw pointer ends the borrow, leaving `arena.mutate` free to borrow.
+        #[cfg(all(feature = "jit", target_os = "macos", target_arch = "aarch64"))]
+        {
+            let code_alloc: *const crate::jit::backend::alloc::CodeAllocator =
+                &self.off_heap.code_alloc;
+            self.arena
+                .mutate(|mc, state| f(Context::new(mc, state, code_alloc)))
+        }
+        #[cfg(not(all(feature = "jit", target_os = "macos", target_arch = "aarch64")))]
+        {
+            self.arena.mutate(|mc, state| f(Context::new(mc, state)))
+        }
     }
 
     /// `enter` variant that threads a `Result` through.

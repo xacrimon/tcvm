@@ -11,7 +11,7 @@ end
 local x = 2
 local found = 0
 local s = ""
-while found < 1000 do
+while found < 10000 do
     if is_prime(x) then
         found = found + 1
         s = s .. x .. "\n"

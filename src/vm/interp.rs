@@ -11,6 +11,7 @@ use crate::env::thread::{
 };
 use crate::env::value::{Value, ValueKind};
 use crate::instruction::{Instruction, UpValueDescriptor};
+#[cfg(feature = "jit")]
 use crate::jit;
 use crate::lua::Context;
 use crate::vm::num::{self, op_arith, op_bit};
@@ -1716,6 +1717,7 @@ extern "rust-preserve-none" fn op_call<'gc>(
             // The JIT's only entry point. The frame is already pushed and its
             // registers are in place, so a region can run over it as-is, and a
             // deopt out of one leaves a frame the interpreter can simply pick up.
+            #[cfg(feature = "jit")]
             match jit::region::on_call(ctx, thread, closure.proto, new_base) {
                 jit::region::Outcome::Interpret => {}
                 jit::region::Outcome::Deopt(pc) => {

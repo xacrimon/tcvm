@@ -83,7 +83,7 @@ impl CodeBuf {
     pub fn new(len: usize) -> io::Result<Self> {
         assert!(len > 0, "empty code buffer");
         let mapped = len.next_multiple_of(page_size());
-        let (rw, rx) = map_dual(mapped)?;
+        let (rw, rx) = map_dual(mapped, 0)?;
         Ok(CodeBuf {
             rw,
             rx,
@@ -133,6 +133,20 @@ impl Drop for CodeBuf {
 pub struct Code(CodeBuf);
 
 impl Code {
+    /// Map, fill, and seal a one-off region from a little-endian instruction
+    /// stream. This is the per-function path used by tests and by targets
+    /// without the segment allocator; the allocator itself does not go through
+    /// `CodeBuf`.
+    pub fn from_words(words: &[u32]) -> io::Result<Code> {
+        let mut buf = CodeBuf::new(words.len() * 4)?;
+        buf.write(|code| {
+            for (i, w) in words.iter().enumerate() {
+                code[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+            }
+        });
+        Ok(buf.finalize())
+    }
+
     /// Address of the first byte of the executable region.
     ///
     /// # Safety
@@ -163,31 +177,44 @@ fn page_size() -> usize {
     n as usize
 }
 
-/// Map `mapped` bytes twice: a read/write alias and a read/execute alias of the
+/// Map `size` bytes twice: a read/write alias and a read/execute alias of the
 /// same physical pages. Returns `(rw, rx)`.
+///
+/// `align_mask` constrains the *RW* alias's base: bits set in the mask are forced
+/// to zero in the returned address (`0` for natural page alignment, `SEG-1` for a
+/// 64 KiB-aligned segment). The RX alias needs no such alignment — the allocator
+/// only ever masks the RW pointer to recover a segment header — so its remap is
+/// left to land wherever the kernel picks.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-// `mach_task_self` is deprecated in `libc` in favour of the `mach2` crate; the
-// underlying trap-free port read is stable, and a whole dependency for one call
-// is not worth it.
+// `mach_task_self` / `mach_vm_map` are deprecated in `libc` in favour of the
+// `mach2` crate; the underlying calls are stable and a whole dependency for two
+// of them is not worth it.
 #[allow(deprecated)]
-fn map_dual(mapped: usize) -> io::Result<(NonNull<u8>, NonNull<u8>)> {
+pub(crate) fn map_dual(size: usize, align_mask: u64) -> io::Result<(NonNull<u8>, NonNull<u8>)> {
     let task = unsafe { libc::mach_task_self() };
 
-    // The writable alias: a plain anonymous mapping. Its maximum protection
-    // includes execute (the default for anonymous mappings), which is what lets
-    // the remapped alias be raised to R+X below.
-    let rw = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            mapped,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANON,
-            -1,
-            0,
+    // Writable alias via `mach_vm_map` rather than `mmap`, because only mach lets
+    // us demand an alignment (`mask`). `object = 0` makes it anonymous
+    // zero-filled; the max protection includes execute so the RX alias can be
+    // raised to R+X below — the RW alias's *current* protection never is.
+    let mut rw_addr: libc::mach_vm_address_t = 0;
+    let kr = unsafe {
+        libc::mach_vm_map(
+            task,
+            &mut rw_addr,
+            size as libc::mach_vm_size_t,
+            align_mask as libc::mach_vm_offset_t,
+            libc::VM_FLAGS_ANYWHERE,
+            0, // object: anonymous
+            0, // offset
+            0, // copy = FALSE
+            libc::VM_PROT_READ | libc::VM_PROT_WRITE,
+            libc::VM_PROT_READ | libc::VM_PROT_WRITE | libc::VM_PROT_EXECUTE,
+            VM_INHERIT_NONE,
         )
     };
-    if rw == libc::MAP_FAILED {
-        return Err(io::Error::last_os_error());
+    if kr != libc::KERN_SUCCESS {
+        return Err(io::Error::other(format!("mach_vm_map failed: {kr}")));
     }
 
     // Alias the same pages at a fresh address. `copy = FALSE` shares the backing
@@ -200,11 +227,11 @@ fn map_dual(mapped: usize) -> io::Result<(NonNull<u8>, NonNull<u8>)> {
         mach_vm_remap(
             task,
             &mut rx_addr,
-            mapped as libc::mach_vm_size_t,
+            size as libc::mach_vm_size_t,
             0,
             libc::VM_FLAGS_ANYWHERE,
             task,
-            rw as libc::mach_vm_address_t,
+            rw_addr,
             0, // FALSE
             &mut cur,
             &mut max,
@@ -212,7 +239,7 @@ fn map_dual(mapped: usize) -> io::Result<(NonNull<u8>, NonNull<u8>)> {
         )
     };
     if kr != libc::KERN_SUCCESS {
-        unsafe { libc::munmap(rw, mapped) };
+        unsafe { libc::munmap(rw_addr as *mut libc::c_void, size) };
         return Err(io::Error::other(format!("mach_vm_remap failed: {kr}")));
     }
 
@@ -220,20 +247,20 @@ fn map_dual(mapped: usize) -> io::Result<(NonNull<u8>, NonNull<u8>)> {
         mach_vm_protect(
             task,
             rx_addr,
-            mapped as libc::mach_vm_size_t,
+            size as libc::mach_vm_size_t,
             0, // set_maximum = FALSE
             libc::VM_PROT_READ | libc::VM_PROT_EXECUTE,
         )
     };
     if kr != libc::KERN_SUCCESS {
         unsafe {
-            libc::munmap(rw, mapped);
-            libc::munmap(rx_addr as *mut libc::c_void, mapped);
+            libc::munmap(rw_addr as *mut libc::c_void, size);
+            libc::munmap(rx_addr as *mut libc::c_void, size);
         }
         return Err(io::Error::other(format!("mach_vm_protect failed: {kr}")));
     }
 
-    let rw = NonNull::new(rw.cast()).expect("mmap returned null without MAP_FAILED");
+    let rw = NonNull::new(rw_addr as *mut u8).expect("mach_vm_map returned null");
     let rx = NonNull::new(rx_addr as *mut u8).expect("mach_vm_remap returned null");
     Ok((rw, rx))
 }
@@ -244,13 +271,14 @@ fn map_dual(mapped: usize) -> io::Result<(NonNull<u8>, NonNull<u8>)> {
 const VM_INHERIT_NONE: libc::vm_inherit_t = 2;
 
 /// Fallback for platforms without a dual mapping: one RWX page, both aliases the
-/// same address.
+/// same address. `align_mask` is ignored (the segment allocator, the only caller
+/// that needs alignment, is not compiled here).
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-fn map_dual(mapped: usize) -> io::Result<(NonNull<u8>, NonNull<u8>)> {
+pub(crate) fn map_dual(size: usize, _align_mask: u64) -> io::Result<(NonNull<u8>, NonNull<u8>)> {
     let p = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
-            mapped,
+            size,
             libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
             libc::MAP_PRIVATE | libc::MAP_ANON,
             -1,
@@ -270,7 +298,7 @@ fn map_dual(mapped: usize) -> io::Result<(NonNull<u8>, NonNull<u8>)> {
 /// physical address, so cleaning the RW range and invalidating the RX range
 /// reach the same lines.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn sync_icache(_rw: *mut u8, rx: *mut u8, len: usize) {
+pub(crate) unsafe fn sync_icache(_rw: *mut u8, rx: *mut u8, len: usize) {
     use std::arch::asm;
 
     // Apple Silicon minimum cache line, per libplatform (see module docs). No
@@ -296,7 +324,7 @@ unsafe fn sync_icache(_rw: *mut u8, rx: *mut u8, len: usize) {
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-unsafe fn sync_icache(_rw: *mut u8, _rx: *mut u8, _len: usize) {}
+pub(crate) unsafe fn sync_icache(_rw: *mut u8, _rx: *mut u8, _len: usize) {}
 
 #[cfg(test)]
 mod tests {

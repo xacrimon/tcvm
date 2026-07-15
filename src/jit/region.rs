@@ -33,7 +33,6 @@ use crate::env::shape::MetamethodBits;
 use crate::env::thread::ThreadState;
 use crate::env::value::Value;
 use crate::jit::backend::aarch64::{self, Status};
-use crate::jit::backend::code::Code;
 use crate::jit::backend::isel;
 use crate::jit::backend::regalloc;
 use crate::jit::frontend::lower;
@@ -41,6 +40,14 @@ use crate::jit::ir::Func;
 use crate::jit::ir::op::{Flags, Op};
 use crate::jit::ir::pool::{ConstPool, ShapeRef};
 use crate::jit::ir::ty::{Rep, Ty, TypeSet};
+
+/// The compiled-code handle a `Region` owns. On aarch64 macOS it is a
+/// [`CodeBlock`] sub-allocated from a shared segment; elsewhere it is a one-off
+/// [`Code`] mapping. Both expose `entry()`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use crate::jit::backend::alloc::CodeBlock as Compiled;
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+use crate::jit::backend::code::Code as Compiled;
 
 /// Native calls into a region: `(thread, frame base) -> packed status`.
 ///
@@ -101,7 +108,7 @@ struct ExitInfo {
 #[collect(internal, unsafe_drop)]
 pub struct Region<'gc> {
     #[collect(require_static)]
-    code: Code,
+    code: Compiled,
     pool: ConstPool<'gc>,
     #[collect(require_static)]
     exits: Box<[ExitInfo]>,
@@ -286,7 +293,13 @@ pub fn compile<'gc>(
 
     let m = isel::select(&func).map_err(|_| Declined::Isel)?;
     let ra = regalloc::linear_scan(&m, &aarch64::machine_env()).map_err(|_| Declined::Regalloc)?;
-    let code = aarch64::encode(&m, &func.pool, &ra).map_err(|_| Declined::Encode)?;
+    let words = aarch64::encode(&m, &func.pool, &ra).map_err(|_| Declined::Encode)?;
+    // Placing the encoded words is where the two targets diverge: the segment
+    // allocator on aarch64 macOS, a per-function mapping elsewhere.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let code = ctx.code_alloc().alloc(&words).map_err(|_| Declined::Encode)?;
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let code = Compiled::from_words(&words).map_err(|_| Declined::Encode)?;
 
     let entry: Box<[(u8, TypeSet)]> = func
         .entry_regs

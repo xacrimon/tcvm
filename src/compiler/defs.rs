@@ -1,4 +1,6 @@
-use crate::dmm::{Gc, Lock, Mutation, RefLock};
+use crate::dmm::{Gc, Lock, Mutation};
+#[cfg(feature = "jit")]
+use crate::dmm::RefLock;
 use crate::env::function::InlineCache;
 use crate::env::{LuaString, Prototype, Value};
 use crate::instruction::{Instruction, UpValueDescriptor};
@@ -315,7 +317,9 @@ impl<'gc> Chunk<'gc> {
                 source: self.source,
                 ic_table,
                 ic_types,
+                #[cfg(feature = "jit")]
                 jit_calls: core::cell::Cell::new(0),
+                #[cfg(feature = "jit")]
                 jit: Gc::new(mc, RefLock::new(None)),
             },
         )

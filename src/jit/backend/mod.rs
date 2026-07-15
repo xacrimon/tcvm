@@ -13,6 +13,8 @@
 //! them. A second target adds a sibling of `aarch64` and touches nothing else.
 
 pub mod aarch64;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub mod alloc;
 pub mod asm;
 pub mod code;
 pub mod isel;

@@ -31,7 +31,6 @@
 
 use crate::env::value::ValueKind;
 use crate::jit::backend::asm::{Asm, Cond, FP, Fpr, Gpr, LR, Label, SP};
-use crate::jit::backend::code::{Code, CodeBuf};
 use crate::jit::backend::layout;
 use crate::jit::backend::mach::{
     AluOp, ExitId, ExitSrc, FAluOp, MBlock, MFunc, MOp, RegClass, Tag, VReg, Width,
@@ -162,7 +161,11 @@ pub struct Encoder<'a, 'gc> {
     frame: u32,
 }
 
-pub fn encode(m: &MFunc, pool: &ConstPool<'_>, ra: &Allocation) -> Result<Code, EncodeError> {
+/// Encode `m` to a flat little-endian instruction stream. Placing those words in
+/// executable memory is the allocator's job (or, in tests, [`Code::from_words`]);
+/// the encoder does not know the final size until it is done, so it builds into a
+/// plain `Vec` first.
+pub fn encode(m: &MFunc, pool: &ConstPool<'_>, ra: &Allocation) -> Result<Vec<u32>, EncodeError> {
     debug_assert!(
         crate::jit::backend::regalloc::verify(m, ra).is_ok(),
         "{}",
@@ -193,14 +196,7 @@ pub fn encode(m: &MFunc, pool: &ConstPool<'_>, ra: &Allocation) -> Result<Code, 
     };
     e.run();
 
-    let words = e.a.finish();
-    let mut buf = CodeBuf::new(words.len() * 4).expect("mmap code");
-    buf.write(|code| {
-        for (i, w) in words.iter().enumerate() {
-            code[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
-        }
-    });
-    Ok(buf.finalize())
+    Ok(e.a.finish())
 }
 
 impl Encoder<'_, '_> {
@@ -772,6 +768,7 @@ fn float_cond(cc: Cc) -> Cond {
 mod tests {
     use super::*;
     use crate::env::value::Value;
+    use crate::jit::backend::code::Code;
     use crate::jit::backend::mach::{AluOp, MInst, Width};
     use crate::jit::backend::regalloc::{Alloc, AllocationBuilder, VReg};
 
@@ -876,7 +873,8 @@ mod tests {
         );
 
         let ra = b.finish(num_spills);
-        let code = encode(&m, &ConstPool::new(), &ra).expect("encode");
+        let words = encode(&m, &ConstPool::new(), &ra).expect("encode");
+        let code = Code::from_words(&words).expect("map code");
 
         let mut stack = vec![Value::nil(); 1];
         let region: Region = unsafe { std::mem::transmute(code.entry()) };
