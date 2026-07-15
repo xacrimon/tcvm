@@ -106,8 +106,7 @@ impl SegHeader {
             debug_assert!(!self.test(i), "double-allocated unit {i}");
             self.set(i);
         }
-        self.used_units
-            .set(self.used_units.get() + len as u16);
+        self.used_units.set(self.used_units.get() + len as u16);
     }
 
     fn free(&self, start: usize, len: usize) {
@@ -115,8 +114,7 @@ impl SegHeader {
             debug_assert!(self.test(i), "double-freed unit {i}");
             self.clear(i);
         }
-        self.used_units
-            .set(self.used_units.get() - len as u16);
+        self.used_units.set(self.used_units.get() - len as u16);
     }
 }
 
@@ -286,7 +284,10 @@ impl Inner {
 
         // Nothing suitable: map a new segment and make it primary.
         let seg = Segment::new()?;
-        let u = seg.header().find_free(len_units).expect("fresh segment fits");
+        let u = seg
+            .header()
+            .find_free(len_units)
+            .expect("fresh segment fits");
         seg.header().mark(u, len_units);
         self.segments.push(seg);
         let idx = self.segments.len() - 1;

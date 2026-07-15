@@ -270,10 +270,112 @@ pub(crate) fn map_dual(size: usize, align_mask: u64) -> io::Result<(NonNull<u8>,
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const VM_INHERIT_NONE: libc::vm_inherit_t = 2;
 
+/// Linux dual mapping. Two `MAP_SHARED` views of one anonymous `memfd` give the
+/// same physical pages an RW alias and an RX alias, the W^X-safe equivalent of
+/// the Mach aliasing above; the fd is closed once mapped, the views keep it live.
+///
+/// `align_mask` constrains the RW base (see the macOS variant). Linux `mmap` has
+/// no alignment request, so a non-zero mask is honoured by reserving an oversized
+/// anonymous window, mapping the fd `MAP_FIXED` over its aligned interior, and
+/// trimming the slack. The RX alias needs no alignment.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+pub(crate) fn map_dual(size: usize, align_mask: u64) -> io::Result<(NonNull<u8>, NonNull<u8>)> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    let fd = unsafe { libc::memfd_create(c"tcvm-jit".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Owned so every early return closes it; the established mappings outlive it.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let raw = fd.as_raw_fd();
+    if unsafe { libc::ftruncate(raw, size as libc::off_t) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let rw = if align_mask == 0 {
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                raw,
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        p
+    } else {
+        let align = align_mask as usize + 1;
+        // Reserve address space, then drop the fd mapping into its aligned interior.
+        let reserve = size + align;
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                reserve,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        let base = base as usize;
+        let aligned = (base + align_mask as usize) & !(align_mask as usize);
+        let rw = unsafe {
+            libc::mmap(
+                aligned as *mut libc::c_void,
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_FIXED,
+                raw,
+                0,
+            )
+        };
+        if rw == libc::MAP_FAILED {
+            let err = io::Error::last_os_error();
+            unsafe { libc::munmap(base as *mut libc::c_void, reserve) };
+            return Err(err);
+        }
+        // Trim the reservation slack the `MAP_FIXED` window did not replace.
+        if aligned > base {
+            unsafe { libc::munmap(base as *mut libc::c_void, aligned - base) };
+        }
+        let tail = aligned + size;
+        unsafe { libc::munmap(tail as *mut libc::c_void, base + reserve - tail) };
+        rw
+    };
+
+    let rx = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_EXEC,
+            libc::MAP_SHARED,
+            raw,
+            0,
+        )
+    };
+    if rx == libc::MAP_FAILED {
+        let err = io::Error::last_os_error();
+        unsafe { libc::munmap(rw, size) };
+        return Err(err);
+    }
+
+    let rw = NonNull::new(rw.cast()).expect("mmap returned null without MAP_FAILED");
+    let rx = NonNull::new(rx.cast()).expect("mmap returned null without MAP_FAILED");
+    Ok((rw, rx))
+}
+
 /// Fallback for platforms without a dual mapping: one RWX page, both aliases the
 /// same address. `align_mask` is ignored (the segment allocator, the only caller
 /// that needs alignment, is not compiled here).
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[cfg(not(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux"))))]
 pub(crate) fn map_dual(size: usize, _align_mask: u64) -> io::Result<(NonNull<u8>, NonNull<u8>)> {
     let p = unsafe {
         libc::mmap(
@@ -323,7 +425,53 @@ pub(crate) unsafe fn sync_icache(_rw: *mut u8, rx: *mut u8, len: usize) {
     }
 }
 
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+/// Make bytes written through `rw` fetchable through `rx` on Linux aarch64.
+///
+/// `CTR_EL0` is readable from EL0 here (it faults on Darwin, which is why the
+/// macOS variant hardcodes its constants), so the cache-line sizes and the
+/// coherency bits come straight from it. `IDC = 1` means stores already reach the
+/// point of unification and the `dc cvau` clean is unnecessary; `DIC = 1` means
+/// the `ic ivau` invalidate is unnecessary. Generic aarch64 cores may report
+/// either as `0`, so neither step can be assumed away the way Apple Silicon lets
+/// the macOS path drop the clean.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+pub(crate) unsafe fn sync_icache(rw: *mut u8, rx: *mut u8, len: usize) {
+    use std::arch::asm;
+
+    let ctr: u64;
+    unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack, preserves_flags)) };
+    // IminLine/DminLine hold log2 of the line size in 4-byte words.
+    let dline = 4usize << ((ctr >> 16) & 0xf);
+    let iline = 4usize << (ctr & 0xf);
+    let idc = (ctr >> 28) & 1 != 0;
+    let dic = (ctr >> 29) & 1 != 0;
+
+    // Clean the stores through the RW alias to the PoU; same physical lines the
+    // RX alias fetches, reached by physical address despite the differing VA.
+    if !idc {
+        let mut p = rw as usize & !(dline - 1);
+        let end = rw as usize + len;
+        while p < end {
+            unsafe { asm!("dc cvau, {}", in(reg) p, options(nostack, preserves_flags)) };
+            p += dline;
+        }
+        unsafe { asm!("dsb ish", options(nostack, preserves_flags)) };
+    }
+
+    if !dic {
+        let mut p = rx as usize & !(iline - 1);
+        let end = rx as usize + len;
+        while p < end {
+            unsafe { asm!("ic ivau, {}", in(reg) p, options(nostack, preserves_flags)) };
+            p += iline;
+        }
+        unsafe { asm!("dsb ish", options(nostack, preserves_flags)) };
+    }
+
+    unsafe { asm!("isb", options(nostack, preserves_flags)) };
+}
+
+#[cfg(not(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux"))))]
 pub(crate) unsafe fn sync_icache(_rw: *mut u8, _rx: *mut u8, _len: usize) {}
 
 #[cfg(test)]

@@ -135,7 +135,8 @@ fn native_sum_field_matches_interpreter() {
                 let func = lower(closure.proto, 0, vec![TAB, INT]).expect("lower");
                 let m = select(&func).expect("isel");
                 let ra = allocate(alloc, &m);
-                let code = Code::from_words(&encode(&m, &func.pool, &ra).expect("encode")).expect("map code");
+                let code = Code::from_words(&encode(&m, &func.pool, &ra).expect("encode"))
+                    .expect("map code");
 
                 // A stand-in Lua frame: `t` and `n` where the region's entry
                 // context says they are, and room for every register its exits
@@ -182,7 +183,8 @@ fn shape_guard_deopts_with_a_resumable_frame() {
         let func = lower(closure.proto, 0, vec![TAB, INT]).expect("lower");
         let m = select(&func).expect("isel");
         let ra = allocate(spill_everything, &m);
-        let code = Code::from_words(&encode(&m, &func.pool, &ra).expect("encode")).expect("map code");
+        let code =
+            Code::from_words(&encode(&m, &func.pool, &ra).expect("encode")).expect("map code");
 
         let mut stack = vec![Value::nil(); m.max_lua_reg as usize + 1];
         stack[0] = Value::table(ctx.fetch(&other));
@@ -241,7 +243,8 @@ fn type_guard_deopts_mid_loop() {
             let func = lower(closure.proto, 0, vec![TAB, INT]).expect("lower");
             let m = select(&func).expect("isel");
             let ra = allocate(alloc, &m);
-            let code = Code::from_words(&encode(&m, &func.pool, &ra).expect("encode")).expect("map code");
+            let code =
+                Code::from_words(&encode(&m, &func.pool, &ra).expect("encode")).expect("map code");
 
             let mut stack = vec![Value::nil(); m.max_lua_reg as usize + 1];
             stack[0] = Value::table(ctx.fetch(&t));
@@ -298,7 +301,8 @@ fn dump_native() {
         let m = select(&func).expect("isel");
         for (name, alloc) in ALLOCATORS {
             let ra = allocate(alloc, &m);
-            let code = Code::from_words(&encode(&m, &func.pool, &ra).expect("encode")).expect("map code");
+            let code =
+                Code::from_words(&encode(&m, &func.pool, &ra).expect("encode")).expect("map code");
             eprintln!(
                 "{name}: {} vregs, {} spilled; {} instructions",
                 m.num_vregs(),

@@ -63,7 +63,11 @@ pub struct Lua {
 #[derive(Default)]
 struct OffHeap {
     /// The JIT code allocator. See `jit::backend::alloc`.
-    #[cfg(all(feature = "jit", target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux")
+    ))]
     code_alloc: crate::jit::backend::alloc::CodeAllocator,
 }
 
@@ -118,14 +122,22 @@ impl Lua {
         // self` pins `Lua` for the call, so `&off_heap` is valid throughout, and
         // a `Lua` that moved between calls gets a fresh pointer next time. Forming
         // the raw pointer ends the borrow, leaving `arena.mutate` free to borrow.
-        #[cfg(all(feature = "jit", target_os = "macos", target_arch = "aarch64"))]
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux")
+        ))]
         {
             let code_alloc: *const crate::jit::backend::alloc::CodeAllocator =
                 &self.off_heap.code_alloc;
             self.arena
                 .mutate(|mc, state| f(Context::new(mc, state, code_alloc)))
         }
-        #[cfg(not(all(feature = "jit", target_os = "macos", target_arch = "aarch64")))]
+        #[cfg(not(all(
+            feature = "jit",
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux")
+        )))]
         {
             self.arena.mutate(|mc, state| f(Context::new(mc, state)))
         }

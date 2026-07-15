@@ -21,7 +21,7 @@ repository.workspace = true
 
 [features]
 default = ["jit"]
-# The optimizing JIT. Functional only on aarch64 macOS; enabling it elsewhere
+# The optimizing JIT. Functional on aarch64 macOS and Linux; enabling it elsewhere
 # compiles the pipeline but the code allocator falls back to per-function maps.
 jit = []
 

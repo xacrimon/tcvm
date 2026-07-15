@@ -1,6 +1,6 @@
-use crate::dmm::{Gc, Lock, Mutation};
 #[cfg(feature = "jit")]
 use crate::dmm::RefLock;
+use crate::dmm::{Gc, Lock, Mutation};
 use crate::env::function::InlineCache;
 use crate::env::{LuaString, Prototype, Value};
 use crate::instruction::{Instruction, UpValueDescriptor};
