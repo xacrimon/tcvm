@@ -1,4 +1,4 @@
-#[cfg(feature = "jit")]
+#[cfg(jit_enabled)]
 use crate::dmm::RefLock;
 use crate::dmm::{Gc, Lock, Mutation};
 use crate::env::function::InlineCache;
@@ -317,9 +317,9 @@ impl<'gc> Chunk<'gc> {
                 source: self.source,
                 ic_table,
                 ic_types,
-                #[cfg(feature = "jit")]
+                #[cfg(jit_enabled)]
                 jit_calls: core::cell::Cell::new(0),
-                #[cfg(feature = "jit")]
+                #[cfg(jit_enabled)]
                 jit: Gc::new(mc, RefLock::new(None)),
             },
         )

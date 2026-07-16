@@ -11,7 +11,7 @@ pub(crate) mod compiler;
 pub mod dmm;
 pub mod env;
 pub(crate) mod instruction;
-#[cfg(feature = "jit")]
+#[cfg(jit_enabled)]
 pub mod jit;
 pub mod lua;
 pub(crate) mod parser;

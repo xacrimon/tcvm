@@ -52,7 +52,7 @@ pub struct Prototype<'gc> {
     /// Calls seen so far, saturating at `jit::region::HOT_CALL` (or pinned at a
     /// sentinel once compilation has been refused). Read on every Lua-to-Lua
     /// call, which is why it is a bare `Cell` and not behind the `RefLock` below.
-    #[cfg(feature = "jit")]
+    #[cfg(jit_enabled)]
     #[collect(require_static)]
     pub jit_calls: Cell<u32>,
     /// Native code for this prototype, once there is any.
@@ -62,7 +62,7 @@ pub struct Prototype<'gc> {
     /// `Gc<RefLock<_>>::borrow_mut` is where that barrier lives. A `RefLock`
     /// field *inside* the prototype would have to reach for `Gc::write` and
     /// project through it by hand.
-    #[cfg(feature = "jit")]
+    #[cfg(jit_enabled)]
     pub jit: Gc<'gc, RefLock<Option<Gc<'gc, crate::jit::region::Region<'gc>>>>>,
 }
 

@@ -11,7 +11,7 @@ use crate::env::thread::{
 };
 use crate::env::value::{Value, ValueKind};
 use crate::instruction::{Instruction, UpValueDescriptor};
-#[cfg(feature = "jit")]
+#[cfg(jit_enabled)]
 use crate::jit;
 use crate::lua::Context;
 use crate::vm::num::{self, op_arith, op_bit};
@@ -442,11 +442,6 @@ macro_rules! table_set_slow_body {
 /// `SETTABUP` instruction whose prototype was assembled with a matching
 /// `ic_table` length.
 #[inline(always)]
-/// Fold the kind of a value produced by an IC site into that site's observed-kind
-/// record. The JIT's only source of *value*-type feedback — a shape proves where
-/// a field lives, not what it holds. Free of write barriers: `KindSet` holds no
-/// `Gc` pointer.
-#[inline]
 fn observe_ic_type<'gc>(thread: &ThreadState<'gc>, ic_idx: u16, v: Value<'gc>) {
     let proto = unsafe { &thread.top_lua_unchecked().closure.proto };
     if let Some(cell) = proto.ic_types.get(ic_idx as usize) {
@@ -1717,7 +1712,7 @@ extern "rust-preserve-none" fn op_call<'gc>(
             // The JIT's only entry point. The frame is already pushed and its
             // registers are in place, so a region can run over it as-is, and a
             // deopt out of one leaves a frame the interpreter can simply pick up.
-            #[cfg(feature = "jit")]
+            #[cfg(jit_enabled)]
             match jit::region::on_call(ctx, thread, closure.proto, new_base) {
                 jit::region::Outcome::Interpret => {}
                 jit::region::Outcome::Deopt(pc) => {

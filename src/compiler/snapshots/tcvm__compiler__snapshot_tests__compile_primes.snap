@@ -1,6 +1,5 @@
 ---
 source: src/compiler/snapshot_tests.rs
-assertion_line: 80
 expression: output
 ---
 ; function (params=0, vararg=true, stack=6, upvalues=1)
@@ -8,7 +7,7 @@ expression: output
 ;   K0 = 2
 ;   K1 = 0
 ;   K2 = ""
-;   K3 = 1000
+;   K3 = 10000
 ;   K4 = 1
 ;   K5 = "\n"
 ;   K6 = "print"
@@ -20,7 +19,7 @@ expression: output
 0002  LOAD            R1 K0  ; 2
 0003  LOAD            R2 K1  ; 0
 0004  LOAD            R3 K2  ; ""
-0005  LOAD            R4 K3  ; 1000
+0005  LOAD            R4 K3  ; 10000
 0006  LT              R2 R4 inv=false
 0007  JMP             +13
 0008  MOVE            R4 R0

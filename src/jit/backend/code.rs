@@ -65,8 +65,7 @@ unsafe extern "C" {
 pub struct CodeBuf {
     /// Writable alias. All writes go here; never executable.
     rw: NonNull<u8>,
-    /// Executable alias of the same physical pages. Equal to `rw` on platforms
-    /// with no dual mapping (where a single RWX page is used instead).
+    /// Executable alias of the same physical pages; never writable.
     rx: NonNull<u8>,
     /// Rounded up to a page. `munmap` needs the mapped length, not the used one.
     mapped: usize,
@@ -120,11 +119,10 @@ impl CodeBuf {
 
 impl Drop for CodeBuf {
     fn drop(&mut self) {
-        unsafe { libc::munmap(self.rw.as_ptr().cast(), self.mapped) };
-        // Distinct aliases are two independent mappings of the same pages; free
-        // both. When they coincide (no dual mapping) one `munmap` is enough.
-        if self.rx != self.rw {
-            unsafe { libc::munmap(self.rx.as_ptr().cast(), self.mapped) };
+        // Two independent mappings of the same physical pages; free both.
+        unsafe {
+            libc::munmap(self.rw.as_ptr().cast(), self.mapped);
+            libc::munmap(self.rx.as_ptr().cast(), self.mapped);
         }
     }
 }
@@ -134,9 +132,8 @@ pub struct Code(CodeBuf);
 
 impl Code {
     /// Map, fill, and seal a one-off region from a little-endian instruction
-    /// stream. This is the per-function path used by tests and by targets
-    /// without the segment allocator; the allocator itself does not go through
-    /// `CodeBuf`.
+    /// stream. Used by tests; the runtime path goes through the segment
+    /// allocator, which does not use `CodeBuf`.
     pub fn from_words(words: &[u32]) -> io::Result<Code> {
         let mut buf = CodeBuf::new(words.len() * 4)?;
         buf.write(|code| {
@@ -372,28 +369,6 @@ pub(crate) fn map_dual(size: usize, align_mask: u64) -> io::Result<(NonNull<u8>,
     Ok((rw, rx))
 }
 
-/// Fallback for platforms without a dual mapping: one RWX page, both aliases the
-/// same address. `align_mask` is ignored (the segment allocator, the only caller
-/// that needs alignment, is not compiled here).
-#[cfg(not(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux"))))]
-pub(crate) fn map_dual(size: usize, _align_mask: u64) -> io::Result<(NonNull<u8>, NonNull<u8>)> {
-    let p = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            size,
-            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-            libc::MAP_PRIVATE | libc::MAP_ANON,
-            -1,
-            0,
-        )
-    };
-    if p == libc::MAP_FAILED {
-        return Err(io::Error::last_os_error());
-    }
-    let p = NonNull::new(p.cast()).expect("mmap returned null without MAP_FAILED");
-    Ok((p, p))
-}
-
 /// Make bytes written through `rw` fetchable through `rx`: clean the data cache
 /// to the point of unification, then invalidate the instruction cache. The two
 /// aliases share physical pages, and both `dc cvau` / `ic ivau` operate by
@@ -470,9 +445,6 @@ pub(crate) unsafe fn sync_icache(rw: *mut u8, rx: *mut u8, len: usize) {
 
     unsafe { asm!("isb", options(nostack, preserves_flags)) };
 }
-
-#[cfg(not(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux"))))]
-pub(crate) unsafe fn sync_icache(_rw: *mut u8, _rx: *mut u8, _len: usize) {}
 
 #[cfg(test)]
 mod tests {
