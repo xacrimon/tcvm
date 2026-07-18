@@ -32,12 +32,12 @@ use crate::env::function::Prototype;
 use crate::env::shape::MetamethodBits;
 use crate::env::thread::ThreadState;
 use crate::env::value::Value;
-use crate::jit::backend::aarch64::{self, Status};
 /// The compiled-code handle a `Region` owns: a [`CodeBlock`] sub-allocated from a
 /// shared segment. Exposes `entry()`.
 use crate::jit::backend::alloc::CodeBlock as Compiled;
 use crate::jit::backend::isel;
 use crate::jit::backend::regalloc;
+use crate::jit::backend::target::{self, Status};
 use crate::jit::frontend::lower;
 use crate::jit::ir::Func;
 use crate::jit::ir::op::{Flags, Op};
@@ -96,7 +96,7 @@ struct ExitInfo {
 
 /// Compiled native code for one `Prototype`, entered at pc 0.
 ///
-/// The `pool` is not dead weight: [`aarch64::encode`] bakes shape *box
+/// The `pool` is not dead weight: [`target::encode`] bakes shape *box
 /// addresses* into the guard sequences, so the region is only valid while those
 /// shapes are alive. Holding the pool is what keeps them alive.
 #[derive(Collect)]
@@ -287,8 +287,8 @@ pub fn compile<'gc>(
     }
 
     let m = isel::select(&func).map_err(|_| Declined::Isel)?;
-    let ra = regalloc::linear_scan(&m, &aarch64::machine_env()).map_err(|_| Declined::Regalloc)?;
-    let words = aarch64::encode(&m, &func.pool, &ra).map_err(|_| Declined::Encode)?;
+    let ra = regalloc::linear_scan(&m, &target::machine_env()).map_err(|_| Declined::Regalloc)?;
+    let words = target::encode(&m, &func.pool, &ra).map_err(|_| Declined::Encode)?;
     let code = ctx
         .code_alloc()
         .alloc(&words)

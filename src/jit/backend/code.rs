@@ -275,7 +275,13 @@ const VM_INHERIT_NONE: libc::vm_inherit_t = 2;
 /// no alignment request, so a non-zero mask is honoured by reserving an oversized
 /// anonymous window, mapping the fd `MAP_FIXED` over its aligned interior, and
 /// trimming the slack. The RX alias needs no alignment.
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+///
+/// Architecture-independent — the memfd aliasing dance is the same on aarch64 and
+/// x86-64; only [`sync_icache`] differs between them.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
 pub(crate) fn map_dual(size: usize, align_mask: u64) -> io::Result<(NonNull<u8>, NonNull<u8>)> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -446,7 +452,23 @@ pub(crate) unsafe fn sync_icache(rw: *mut u8, rx: *mut u8, len: usize) {
     unsafe { asm!("isb", options(nostack, preserves_flags)) };
 }
 
-#[cfg(test)]
+/// Publish freshly written code on x86-64 Linux.
+///
+/// x86-64 keeps its instruction cache coherent with the data side in hardware:
+/// a store is snooped out of any stale instruction-cache line, so there is no
+/// `ic`/`dc` maintenance to perform (the whole reason the aarch64 paths exist).
+/// The one thing that *is* required is that the stores through the RW alias be
+/// globally visible before the CPU fetches through the RX alias — otherwise a
+/// core could fetch stale bytes that were still sitting in the store buffer. A
+/// full fence drains it; nothing else is needed, and the aliases share physical
+/// pages so no address translation of the written range matters here.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(crate) unsafe fn sync_icache(_rw: *mut u8, _rx: *mut u8, _len: usize) {
+    use std::arch::asm;
+    unsafe { asm!("mfence", options(nostack, preserves_flags)) };
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
 mod tests {
     use super::*;
 
@@ -499,6 +521,62 @@ mod tests {
         buf.write(|code| {
             // mov x0, #7
             code[0..4].copy_from_slice(&0xD280_00E0u32.to_le_bytes());
+        });
+        let code = buf.finalize();
+        let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(code.entry()) };
+        assert_eq!(f(), 7);
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tests {
+    use super::*;
+
+    /// The whole platform story in one test: map, write, seal, call.
+    #[test]
+    fn map_write_execute() {
+        let mut buf = CodeBuf::new(16).expect("mmap");
+        buf.write(|code| {
+            // mov eax, 42 ; ret
+            code[0..5].copy_from_slice(&[0xB8, 42, 0, 0, 0]);
+            code[5] = 0xC3;
+        });
+        let code = buf.finalize();
+
+        let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(code.entry()) };
+        assert_eq!(f(), 42);
+    }
+
+    /// Arguments in and out, so the entry ABI is exercised rather than assumed.
+    /// System V passes the first two integer args in rdi, rsi.
+    #[test]
+    fn passes_arguments() {
+        let mut buf = CodeBuf::new(16).expect("mmap");
+        buf.write(|code| {
+            // mov rax, rdi ; add rax, rsi ; ret
+            code[0..3].copy_from_slice(&[0x48, 0x89, 0xF8]); // mov rax, rdi
+            code[3..6].copy_from_slice(&[0x48, 0x01, 0xF0]); // add rax, rsi
+            code[6] = 0xC3;
+        });
+        let code = buf.finalize();
+
+        let f: extern "C" fn(u64, u64) -> u64 = unsafe { std::mem::transmute(code.entry()) };
+        assert_eq!(f(3, 39), 42);
+    }
+
+    /// The RX alias must observe writes made through the RW alias, even a rewrite
+    /// before sealing.
+    #[test]
+    fn alias_observes_writes() {
+        let mut buf = CodeBuf::new(16).expect("mmap");
+        buf.write(|code| {
+            // mov eax, 1 ; ret
+            code[0..5].copy_from_slice(&[0xB8, 1, 0, 0, 0]);
+            code[5] = 0xC3;
+        });
+        buf.write(|code| {
+            // mov eax, 7
+            code[0..5].copy_from_slice(&[0xB8, 7, 0, 0, 0]);
         });
         let code = buf.finalize();
         let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(code.entry()) };

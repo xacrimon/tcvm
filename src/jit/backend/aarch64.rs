@@ -30,7 +30,7 @@
 //! interpreter looks, so `Ret` has already stored them there.
 
 use crate::env::value::ValueKind;
-use crate::jit::backend::asm::{Asm, Cond, FP, Fpr, Gpr, LR, Label, SP};
+use crate::jit::backend::aarch64_asm::{Asm, Cond, FP, Fpr, Gpr, LR, Label, SP};
 use crate::jit::backend::layout;
 use crate::jit::backend::mach::{
     AluOp, ExitId, ExitSrc, FAluOp, MBlock, MFunc, MOp, RegClass, Tag, VReg, Width,

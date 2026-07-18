@@ -15,14 +15,14 @@ use std::fs;
 
 use crate::env::string::LuaString;
 use crate::env::value::{Value, ValueKind};
-use crate::jit::backend::aarch64::machine_env;
-use crate::jit::backend::aarch64::{Status, encode};
 use crate::jit::backend::code::Code;
 use crate::jit::backend::isel::select;
 use crate::jit::backend::mach::MFunc;
 use crate::jit::backend::regalloc::{
     Allocation, MachineEnv, RegallocError, RegallocFunc, linear_scan, spill_everything,
 };
+use crate::jit::backend::target::machine_env;
+use crate::jit::backend::target::{Status, encode};
 use crate::jit::frontend::lower::lower;
 use crate::jit::ir::ty::{Rep, Ty, TypeSet};
 use crate::{Executor, Lua, StashedFunction, StashedTable};
@@ -49,11 +49,11 @@ const ALLOCATORS: [(&str, Allocator); 2] = [
     ("linear_scan", linear_scan),
 ];
 
-/// Run one allocator over `m`, with aarch64's registers. Neither declines
-/// anything aarch64 emits — it constrains no operand and clobbers nothing — so a
-/// decline here is a bug, not a legal answer.
+/// Run one allocator over `m`, with the host target's registers. Neither declines
+/// anything the backend emits — it constrains no operand and clobbers nothing — so
+/// a decline here is a bug, not a legal answer.
 fn allocate(alloc: Allocator, m: &MFunc) -> Allocation {
-    alloc(m, &machine_env()).expect("aarch64 asks for nothing either allocator declines")
+    alloc(m, &machine_env()).expect("the backend asks for nothing either allocator declines")
 }
 
 /// Run `jit_loop_warm.lua`, which leaves `sum_field`'s inline caches warm, and

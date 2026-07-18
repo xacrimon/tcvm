@@ -232,9 +232,12 @@ impl CodeAllocator {
         let rw = unsafe { seg.rw.as_ptr().add(off) };
         let rx = unsafe { seg.header().rx_base.add(off) };
 
-        // The RW alias is always writable, so the code goes in with a plain copy
-        // (host is little-endian aarch64, matching the encoded word order). Then
-        // make just this range fetchable through the RX alias.
+        // The RW alias is always writable, so the code goes in with a plain copy.
+        // The encoder hands back the instruction stream as little-endian `u32`s
+        // and the host is little-endian, so the bytes land in fetch order; on a
+        // variable-length ISA the encoder packs its byte stream into those words
+        // (tail-padded), and this copy reproduces it byte for byte. Then make just
+        // this range fetchable through the RX alias.
         unsafe {
             std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), rw, len_bytes);
             sync_icache(rw, rx, len_bytes);
@@ -300,13 +303,36 @@ impl Inner {
 mod tests {
     use super::*;
 
-    /// Encode `mov x0, #imm; ret`, allocate it, and call it — the allocator's
-    /// end-to-end contract in one shot.
+    /// Encode `return imm`, allocate it, and call it — the allocator's end-to-end
+    /// contract in one shot. The instruction bytes are the host ISA's.
     fn ret_const(alloc: &CodeAllocator, imm: u16) -> CodeBlock {
-        // mov x0, #imm  (MOVZ x0, #imm) ; ret
-        let movz = 0xD280_0000u32 | ((imm as u32) << 5);
-        let ret = 0xD65F_03C0u32;
-        alloc.alloc(&[movz, ret]).expect("alloc")
+        #[cfg(target_arch = "aarch64")]
+        let words = {
+            // mov x0, #imm  (MOVZ x0, #imm) ; ret
+            let movz = 0xD280_0000u32 | ((imm as u32) << 5);
+            let ret = 0xD65F_03C0u32;
+            [movz, ret]
+        };
+        #[cfg(target_arch = "x86_64")]
+        let words = {
+            // mov eax, imm32 ; ret, tail-padded to a word boundary with int3:
+            // B8 imm32 (5 bytes), C3 (1 byte), then two 0xCC.
+            let bytes = [
+                0xB8u8,
+                imm as u8,
+                (imm >> 8) as u8,
+                0x00,
+                0x00,
+                0xC3,
+                0xCC,
+                0xCC,
+            ];
+            [
+                u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+                u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            ]
+        };
+        alloc.alloc(&words).expect("alloc")
     }
 
     fn call(block: &CodeBlock) -> u64 {
