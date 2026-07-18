@@ -42,6 +42,8 @@ pub use aarch64 as target;
 #[cfg(target_arch = "x86_64")]
 pub use x64 as target;
 
+#[cfg(all(test, target_arch = "aarch64"))]
+mod asm_dump;
 #[cfg(test)]
 mod exec_tests;
 #[cfg(test)]
