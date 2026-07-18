@@ -18,18 +18,13 @@
 //! (`movz`/`movk`) is a real materialization and is deliberately *not* counted.
 
 use super::isel::select;
-use super::regalloc::{Allocation, MachineEnv, RegallocError, linear_scan, spill_everything};
+use super::regalloc::allocate;
 use super::target::{encode, machine_env};
+use crate::Lua;
 use crate::jit::frontend::lower::lower;
 use crate::jit::ir::ty::{Rep, Ty, TypeSet};
-use crate::Lua;
 
 const INT: Ty = Ty::new(Rep::Val, TypeSet::INT);
-
-type Allocator = fn(
-    &super::mach::MFunc,
-    &MachineEnv,
-) -> Result<Allocation, RegallocError>;
 
 /// `mov xd, xn` is `orr xd, xzr, xn`: ORR (shifted register), `Rn == 31`, no
 /// shift. Mask out `Rm` (bits 16-20) and `Rd` (bits 0-4) and match the rest.
@@ -49,7 +44,8 @@ fn is_reg_move(w: u32) -> bool {
 /// The first nested prototype of `test-files/primes.lua` is `is_prime(x)`. Load
 /// the file but do not run it — the chunk's proto carries its children — and pull
 /// the function out by position.
-fn dump(name: &str, alloc: Allocator) {
+#[test]
+fn dump_is_prime_asm() {
     let source = std::fs::read_to_string("test-files/primes.lua").unwrap();
     let mut lua = Lua::new();
     lua.load_all();
@@ -60,8 +56,9 @@ fn dump(name: &str, alloc: Allocator) {
         let is_prime = closure.proto.prototypes[0];
 
         let func = lower(is_prime, 0, vec![INT]).expect("lower is_prime");
-        let m = select(&func).expect("isel");
-        let ra = alloc(&m, &machine_env()).expect("allocate");
+        let mut m = select(&func).expect("isel");
+        super::target::annotate(&mut m);
+        let ra = allocate(&m, &machine_env()).expect("allocate");
         encode(&m, &func.pool, &ra).expect("encode")
     });
 
@@ -73,20 +70,10 @@ fn dump(name: &str, alloc: Allocator) {
         100.0 * moves as f64 / total as f64
     };
 
-    eprintln!("\n=== is_prime under {name} ===");
+    eprintln!("\n=== is_prime ===");
     eprintln!("  {total} instructions, {moves} reg-reg moves ({pct:.1}%)");
     for (i, &w) in words.iter().enumerate() {
         let mark = if is_reg_move(w) { "  <- move" } else { "" };
         eprintln!("  {i:3}  {w:08x}{mark}");
-    }
-}
-
-#[test]
-fn dump_is_prime_asm() {
-    for (name, alloc) in [
-        ("linear_scan", linear_scan as Allocator),
-        ("spill_everything", spill_everything as Allocator),
-    ] {
-        dump(name, alloc);
     }
 }

@@ -32,6 +32,7 @@
 //! branches out-of-line to its exit stub, falling through on success. Keeping
 //! them inside blocks is what lets a block with six guards stay one block.
 
+use std::collections::HashMap;
 use std::fmt::{self, Write};
 
 use crate::env::value::ValueKind;
@@ -40,7 +41,7 @@ use crate::env::value::ValueKind;
 // types a program is *described in* live down there. Re-exported so the rest of
 // the backend still says `mach::VReg`.
 pub use crate::jit::backend::regalloc::{Block as MBlock, RegClass, VReg};
-use crate::jit::backend::regalloc::{Inst, Operand, RegallocFunc};
+use crate::jit::backend::regalloc::{Inst, Operand, PReg, RegallocFunc};
 use crate::jit::ir::op::Cc;
 use crate::jit::ir::pool::{ConstRef, ShapeRef};
 
@@ -221,20 +222,37 @@ pub struct MInst {
     /// stub finds them afterwards. A value the interpreter needs after a deopt but
     /// that nothing on the fast path reads would otherwise die at its last
     /// fast-path use, and the stub would read a register holding something else.
+    ///
+    /// The real operands come first and carry a `Reg` constraint; the guard
+    /// keepalives follow and are `Any`, so a spilled one stays on the stack for the
+    /// stub to read rather than wasting a register.
     pub uses: Vec<Operand>,
+    /// Scratch registers the encoder needs to realize this instruction — a wide
+    /// immediate's holder, a macro-op's working registers. Filled in after isel by
+    /// the target's `annotate` pass, since how many are needed is an encoding fact.
+    pub temps: Vec<Operand>,
 }
 
 impl MInst {
-    /// Every operand aarch64 emits is unconstrained: it takes a register or a
-    /// stack slot, and the encoder reloads a spilled one into scratch. A target
-    /// with two-address instructions or fixed registers builds its operands with
-    /// [`Operand::fixed`]/[`Operand::reuse`] instead.
+    /// A real machine instruction: every operand takes a register (aarch64 is
+    /// load/store, so a spilled one is reloaded by the allocator before the use).
+    /// A target with two-address instructions or fixed registers builds its
+    /// operands with [`Operand::fixed`]/[`Operand::reuse`] instead.
     pub fn new(op: MOp, defs: Vec<VReg>, uses: Vec<VReg>) -> Self {
         MInst {
             op,
-            defs: defs.into_iter().map(Operand::any).collect(),
-            uses: uses.into_iter().map(Operand::any).collect(),
+            defs: defs.into_iter().map(Operand::reg).collect(),
+            uses: uses.into_iter().map(Operand::reg).collect(),
+            temps: Vec::new(),
         }
+    }
+
+    /// A guard: real operands take registers, but the trailing exit-stub keepalives
+    /// are `Any` — a spilled keepalive is read from its slot by the stub.
+    pub fn guard(op: MOp, uses: Vec<VReg>, keepalives: Vec<VReg>) -> Self {
+        let mut m = MInst::new(op, vec![], uses);
+        m.uses.extend(keepalives.into_iter().map(Operand::any));
+        m
     }
 
     /// The virtual register a use names — the common thing to want, since aarch64
@@ -311,6 +329,15 @@ pub struct MFunc {
     /// Highest Lua register the region touches; the deopt stubs and the entry
     /// sequence bound their stack traffic by this.
     pub max_lua_reg: u8,
+    /// Soft register preferences the target's `annotate` pass fills in — an entry
+    /// argument would rather stay in the register it arrived in, eliding the copy
+    /// off it. The allocator honours one when it fits and ignores it otherwise.
+    pub phys_hints: HashMap<VReg, PReg>,
+    /// Values the target's `annotate` pass found rematerializable: defined once, by
+    /// a pure constant that depends on no register, so a spill reload can replay the
+    /// defining instruction instead of touching a slot. Maps the value to that
+    /// instruction. The allocator reads it through [`RegallocFunc::remat`].
+    pub remat: HashMap<VReg, Inst>,
 }
 
 impl MFunc {
@@ -325,6 +352,8 @@ impl MFunc {
             watchpoints: Vec::new(),
             pinned_regs: Vec::new(),
             max_lua_reg: 0,
+            phys_hints: HashMap::new(),
+            remat: HashMap::new(),
         }
     }
 
@@ -407,6 +436,25 @@ impl RegallocFunc for MFunc {
 
     fn class(&self, v: VReg) -> RegClass {
         self.classes[v.0 as usize]
+    }
+
+    /// A `Mov` is the only pure copy the machine IR has: `def0 <- use0`, same
+    /// class. Block-parameter resolution emits these by the dozen on edges, and
+    /// coalescing them is the whole point of telling the allocator they exist.
+    fn is_copy(&self, i: Inst) -> Option<(usize, usize)> {
+        matches!(self.insts[i].op, MOp::Mov).then_some((0, 0))
+    }
+
+    fn temps(&self, i: Inst) -> &[Operand] {
+        &self.insts[i].temps
+    }
+
+    fn phys_hint(&self, v: VReg) -> Option<PReg> {
+        self.phys_hints.get(&v).copied()
+    }
+
+    fn remat(&self, v: VReg) -> Option<Inst> {
+        self.remat.get(&v).copied()
     }
 }
 

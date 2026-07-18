@@ -286,8 +286,9 @@ pub fn compile<'gc>(
         return Err(Declined::MayGc);
     }
 
-    let m = isel::select(&func).map_err(|_| Declined::Isel)?;
-    let ra = regalloc::linear_scan(&m, &target::machine_env()).map_err(|_| Declined::Regalloc)?;
+    let mut m = isel::select(&func).map_err(|_| Declined::Isel)?;
+    target::annotate(&mut m);
+    let ra = regalloc::allocate(&m, &target::machine_env()).map_err(|_| Declined::Regalloc)?;
     let words = target::encode(&m, &func.pool, &ra).map_err(|_| Declined::Encode)?;
     let code = ctx
         .code_alloc()

@@ -2,9 +2,9 @@
 //!
 //! `sum_field` compiled end to end — lowered, selected, allocated, encoded — then
 //! entered directly and compared against the interpreter's answer for the same
-//! inputs. The register allocator underneath is [`spill_everything`], which is
-//! deliberate: it makes these tests a check on the *encoder*, so that when linear
-//! scan lands, anything it breaks is a register allocation bug and nothing else.
+//! inputs. Any disagreement is a bug somewhere in that pipeline; the allocation is
+//! independently screened by `verify` in the encoder, so a failure here points at
+//! isel or the encoder rather than the allocator.
 //!
 //! Entering compiled code here is a test hook, not the real thing. There is no
 //! hotness counter, no OSR, and the executor does not yet know these regions
@@ -18,9 +18,7 @@ use crate::env::value::{Value, ValueKind};
 use crate::jit::backend::code::Code;
 use crate::jit::backend::isel::select;
 use crate::jit::backend::mach::MFunc;
-use crate::jit::backend::regalloc::{
-    Allocation, MachineEnv, RegallocError, RegallocFunc, linear_scan, spill_everything,
-};
+use crate::jit::backend::regalloc::{Allocation, RegallocFunc, allocate as run_alloc};
 use crate::jit::backend::target::machine_env;
 use crate::jit::backend::target::{Status, encode};
 use crate::jit::frontend::lower::lower;
@@ -37,23 +35,15 @@ const TAB: Ty = Ty::new(Rep::Val, TypeSet::TAB);
 /// signature stays honest about what will eventually be needed.
 type Region = extern "C" fn(*mut (), *mut Value<'static>) -> u64;
 
-/// Every execution test runs under both allocators.
+/// Allocate `m` with the host target's registers. The backend constrains no
+/// operand and clobbers nothing, so a decline here is a bug, not a legal answer.
 ///
-/// `spill_everything` is the oracle: it is too dumb to have an interesting bug,
-/// so any program the two disagree on localizes the fault to `linear_scan`
-/// immediately. Keeping the naive one alive costs a few lines and buys a bisect.
-type Allocator = fn(&MFunc, &MachineEnv) -> Result<Allocation, RegallocError>;
-
-const ALLOCATORS: [(&str, Allocator); 2] = [
-    ("spill_everything", spill_everything),
-    ("linear_scan", linear_scan),
-];
-
-/// Run one allocator over `m`, with the host target's registers. Neither declines
-/// anything the backend emits — it constrains no operand and clobbers nothing — so
-/// a decline here is a bug, not a legal answer.
-fn allocate(alloc: Allocator, m: &MFunc) -> Allocation {
-    alloc(m, &machine_env()).expect("the backend asks for nothing either allocator declines")
+/// Correctness rests on two independent checks that need no second allocator: the
+/// encoder runs `verify` on the allocation, and every test below compares native
+/// output against the interpreter.
+fn allocate(m: &mut MFunc) -> Allocation {
+    crate::jit::backend::target::annotate(m);
+    run_alloc(m, &machine_env()).expect("the backend asks for nothing the allocator declines")
 }
 
 /// Run `jit_loop_warm.lua`, which leaves `sum_field`'s inline caches warm, and
@@ -129,38 +119,79 @@ fn native_sum_field_matches_interpreter() {
         let want = interpret(&mut lua, &f, &t, n);
         assert_eq!(want, 7 * n, "the interpreter itself disagrees");
 
-        for (name, alloc) in ALLOCATORS {
-            lua.enter(|ctx| {
-                let closure = ctx.fetch(&f).as_lua().expect("Lua closure");
-                let func = lower(closure.proto, 0, vec![TAB, INT]).expect("lower");
-                let m = select(&func).expect("isel");
-                let ra = allocate(alloc, &m);
-                let code = Code::from_words(&encode(&m, &func.pool, &ra).expect("encode"))
-                    .expect("map code");
+        lua.enter(|ctx| {
+            let closure = ctx.fetch(&f).as_lua().expect("Lua closure");
+            let func = lower(closure.proto, 0, vec![TAB, INT]).expect("lower");
+            let mut m = select(&func).expect("isel");
+            let ra = allocate(&mut m);
+            let code =
+                Code::from_words(&encode(&m, &func.pool, &ra).expect("encode")).expect("map code");
 
-                // A stand-in Lua frame: `t` and `n` where the region's entry
-                // context says they are, and room for every register its exits
-                // write back.
-                let mut stack = vec![Value::nil(); m.max_lua_reg as usize + 1];
-                stack[0] = Value::table(ctx.fetch(&t));
-                stack[1] = Value::integer(n);
+            // A stand-in Lua frame: `t` and `n` where the region's entry context
+            // says they are, and room for every register its exits write back.
+            let mut stack = vec![Value::nil(); m.max_lua_reg as usize + 1];
+            stack[0] = Value::table(ctx.fetch(&t));
+            stack[1] = Value::integer(n);
 
-                let region: Region = unsafe { std::mem::transmute(code.entry()) };
-                let status =
-                    Status::unpack(region(std::ptr::null_mut(), stack.as_mut_ptr().cast()));
+            let region: Region = unsafe { std::mem::transmute(code.entry()) };
+            let status = Status::unpack(region(std::ptr::null_mut(), stack.as_mut_ptr().cast()));
 
-                assert_eq!(
-                    status,
-                    Status::Return(1),
-                    "{name}: expected a native return, not a deopt — a guard failed"
-                );
-                assert_eq!(
-                    stack[0].get_integer(),
-                    Some(want),
-                    "{name}: native result disagrees with the interpreter for n = {n}"
-                );
-            });
-        }
+            assert_eq!(
+                status,
+                Status::Return(1),
+                "expected a native return, not a deopt — a guard failed"
+            );
+            assert_eq!(
+                stack[0].get_integer(),
+                Some(want),
+                "native result disagrees with the interpreter for n = {n}"
+            );
+        });
+    }
+}
+
+/// `is_prime(x)` end to end: a numeric `for` loop, `%`, an early `return false`,
+/// and a `return true`. It exercises what `sum_field` does not — the floor-mod
+/// expansion's allocator temps and a loop-carried block parameter — so a bug in
+/// the temp mechanism or the reload phase shows up as a wrong answer here.
+#[test]
+fn native_is_prime_matches_interpreter() {
+    let mut lua = Lua::new();
+    lua.load_all();
+    let source = fs::read_to_string("test-files/primes.lua").unwrap();
+
+    for (x, want) in [
+        (2i64, true),
+        (3, true),
+        (4, false),
+        (5, true),
+        (7, true),
+        (9, false),
+        (11, true),
+        (12, false),
+    ] {
+        lua.enter(|ctx| {
+            let chunk = ctx.load(&source, Some("primes")).expect("compile");
+            let is_prime = chunk.as_lua().expect("closure").proto.prototypes[0];
+            let func = lower(is_prime, 0, vec![INT]).expect("lower");
+            let mut m = select(&func).expect("isel");
+            let ra = allocate(&mut m);
+            let code =
+                Code::from_words(&encode(&m, &func.pool, &ra).expect("encode")).expect("map code");
+
+            let mut stack = vec![Value::nil(); m.max_lua_reg as usize + 1];
+            stack[0] = Value::integer(x);
+
+            let region: Region = unsafe { std::mem::transmute(code.entry()) };
+            let status = Status::unpack(region(std::ptr::null_mut(), stack.as_mut_ptr().cast()));
+
+            assert_eq!(
+                status,
+                Status::Return(1),
+                "is_prime({x}) should run natively"
+            );
+            assert_eq!(stack[0].get_boolean(), Some(want), "is_prime({x})");
+        });
     }
 }
 
@@ -181,8 +212,8 @@ fn shape_guard_deopts_with_a_resumable_frame() {
     lua.enter(|ctx| {
         let closure = ctx.fetch(&f).as_lua().expect("Lua closure");
         let func = lower(closure.proto, 0, vec![TAB, INT]).expect("lower");
-        let m = select(&func).expect("isel");
-        let ra = allocate(spill_everything, &m);
+        let mut m = select(&func).expect("isel");
+        let ra = allocate(&mut m);
         let code =
             Code::from_words(&encode(&m, &func.pool, &ra).expect("encode")).expect("map code");
 
@@ -237,36 +268,33 @@ fn type_guard_deopts_mid_loop() {
         );
     });
 
-    for (name, alloc) in ALLOCATORS {
-        lua.enter(|ctx| {
-            let closure = ctx.fetch(&f).as_lua().expect("Lua closure");
-            let func = lower(closure.proto, 0, vec![TAB, INT]).expect("lower");
-            let m = select(&func).expect("isel");
-            let ra = allocate(alloc, &m);
-            let code =
-                Code::from_words(&encode(&m, &func.pool, &ra).expect("encode")).expect("map code");
+    lua.enter(|ctx| {
+        let closure = ctx.fetch(&f).as_lua().expect("Lua closure");
+        let func = lower(closure.proto, 0, vec![TAB, INT]).expect("lower");
+        let mut m = select(&func).expect("isel");
+        let ra = allocate(&mut m);
+        let code =
+            Code::from_words(&encode(&m, &func.pool, &ra).expect("encode")).expect("map code");
 
-            let mut stack = vec![Value::nil(); m.max_lua_reg as usize + 1];
-            stack[0] = Value::table(ctx.fetch(&t));
-            stack[1] = Value::integer(4);
+        let mut stack = vec![Value::nil(); m.max_lua_reg as usize + 1];
+        stack[0] = Value::table(ctx.fetch(&t));
+        stack[1] = Value::integer(4);
 
-            let region: Region = unsafe { std::mem::transmute(code.entry()) };
-            let status = Status::unpack(region(std::ptr::null_mut(), stack.as_mut_ptr().cast()));
+        let region: Region = unsafe { std::mem::transmute(code.entry()) };
+        let status = Status::unpack(region(std::ptr::null_mut(), stack.as_mut_ptr().cast()));
 
-            // Exit 1 is the *type* guard on the peeled first iteration; exit 0 is
-            // the shape guard ahead of it (see the MIR snapshot). Naming it is the
-            // point: writing a float through `raw_set` must not have moved the
-            // table's shape, so the shape guard has to pass and the tag check has
-            // to be what fails.
-            assert_eq!(
-                status,
-                Status::Deopt(1),
-                "{name}: expected the integer tag guard to fail, not the shape guard"
-            );
-            assert_eq!(stack[2].get_integer(), Some(0), "{name}: s is still 0");
-            assert_eq!(stack[3].get_integer(), Some(1), "{name}: i is still 1");
-        });
-    }
+        // Exit 1 is the *type* guard on the peeled first iteration; exit 0 is the
+        // shape guard ahead of it (see the MIR snapshot). Naming it is the point:
+        // writing a float through `raw_set` must not have moved the table's shape,
+        // so the shape guard has to pass and the tag check has to be what fails.
+        assert_eq!(
+            status,
+            Status::Deopt(1),
+            "expected the integer tag guard to fail, not the shape guard"
+        );
+        assert_eq!(stack[2].get_integer(), Some(0), "s is still 0");
+        assert_eq!(stack[3].get_integer(), Some(1), "i is still 1");
+    });
 
     // And to be sure the table really did keep its shape, the interpreter agrees
     // this is a float sum now.
@@ -298,22 +326,19 @@ fn dump_native() {
     lua.enter(|ctx| {
         let closure = ctx.fetch(&f).as_lua().expect("Lua closure");
         let func = lower(closure.proto, 0, vec![TAB, INT]).expect("lower");
-        let m = select(&func).expect("isel");
-        for (name, alloc) in ALLOCATORS {
-            let ra = allocate(alloc, &m);
-            let code =
-                Code::from_words(&encode(&m, &func.pool, &ra).expect("encode")).expect("map code");
-            eprintln!(
-                "{name}: {} vregs, {} spilled; {} instructions",
-                m.num_vregs(),
-                ra.num_spills,
-                code.bytes().len() / 4,
-            );
-            print!("{name} ");
-            for b in code.bytes() {
-                print!("{b:02x}");
-            }
-            println!();
+        let mut m = select(&func).expect("isel");
+        let ra = allocate(&mut m);
+        let code =
+            Code::from_words(&encode(&m, &func.pool, &ra).expect("encode")).expect("map code");
+        eprintln!(
+            "{} vregs, {} spilled; {} instructions",
+            m.num_vregs(),
+            ra.num_spills,
+            code.bytes().len() / 4,
+        );
+        for b in code.bytes() {
+            print!("{b:02x}");
         }
+        println!();
     });
 }

@@ -255,8 +255,18 @@ impl<'a, 'gc> Isel<'a, 'gc> {
     /// Emit the instruction that branches to `e`'s stub, and tell the stub which
     /// one it was. The stub reads its values out of this instruction's uses — it
     /// has no operands of its own — so it cannot be encoded until it knows.
-    fn emit_exiting(&mut self, b: MBlock, op: MOp, uses: Vec<VReg>, e: ExitId) {
-        let i = self.emit(b, op, vec![], uses);
+    ///
+    /// `uses` are the guard's real operands (registers); `keepalives` are the
+    /// stub's values, held alive but left wherever they landed.
+    fn emit_exiting(
+        &mut self,
+        b: MBlock,
+        op: MOp,
+        uses: Vec<VReg>,
+        keepalives: Vec<VReg>,
+        e: ExitId,
+    ) {
+        let i = self.m.push(b, MInst::guard(op, uses, keepalives));
         self.m.exits[e.0 as usize].inst = i;
     }
 
@@ -397,8 +407,6 @@ impl<'a, 'gc> Isel<'a, 'gc> {
                     }
                     Tag::Dyn(t) => {
                         self.stub(e, i);
-                        let mut uses = vec![t];
-                        uses.extend(self.stub_regs(i));
                         self.emit_exiting(
                             mb,
                             MOp::GuardCmpImm {
@@ -406,7 +414,8 @@ impl<'a, 'gc> Isel<'a, 'gc> {
                                 imm: layout::kind(want) as i64,
                                 exit: e,
                             },
-                            uses,
+                            vec![t],
+                            self.stub_regs(i),
                             e,
                         );
                     }
@@ -439,15 +448,14 @@ impl<'a, 'gc> Isel<'a, 'gc> {
                 let want_reg = self.m.new_vreg(RegClass::Int);
                 self.emit(mb, MOp::ShapeAddr(s), vec![want_reg], vec![]);
 
-                let mut uses = vec![got, want_reg];
-                uses.extend(self.stub_regs(i));
                 self.emit_exiting(
                     mb,
                     MOp::GuardCmp {
                         cc: Cc::Eq,
                         exit: e,
                     },
-                    uses,
+                    vec![got, want_reg],
+                    self.stub_regs(i),
                     e,
                 );
 
@@ -463,9 +471,7 @@ impl<'a, 'gc> Isel<'a, 'gc> {
                 let e = ExitId(exit.expect("a guard carries an exit").0);
                 self.stub(e, i);
                 let c = self.int(args[0]);
-                let mut uses = vec![c];
-                uses.extend(self.stub_regs(i));
-                self.emit_exiting(mb, MOp::GuardNz { exit: e }, uses, e);
+                self.emit_exiting(mb, MOp::GuardNz { exit: e }, vec![c], self.stub_regs(i), e);
             }
             // A watchpoint, not a check. It emits nothing; the compiled artifact
             // records the dependency and a metatable write invalidates it.
@@ -616,24 +622,28 @@ impl<'a, 'gc> Isel<'a, 'gc> {
                     let slot = self.slot(a);
                     self.store_lua_reg(mb, n as u8, slot);
                 }
-                let uses: Vec<VReg> = args
+                // The results are already on the stack; these uses only keep them
+                // alive to the return, so they are keepalives, not register
+                // operands — a spilled one need not be reloaded for a `ret`.
+                let keepalives: Vec<VReg> = args
                     .iter()
                     .flat_map(|&a| Self::regs_of(self.slot(a)))
                     .collect();
-                self.emit(
+                self.m.push(
                     mb,
-                    MOp::Ret {
-                        nret: args.len() as u8,
-                    },
-                    vec![],
-                    uses,
+                    MInst::guard(
+                        MOp::Ret {
+                            nret: args.len() as u8,
+                        },
+                        vec![],
+                        keepalives,
+                    ),
                 );
             }
             Op::Deopt => {
                 let e = ExitId(exit.expect("Deopt carries an exit").0);
                 self.stub(e, i);
-                let uses = self.stub_regs(i);
-                self.emit_exiting(mb, MOp::ExitTo(e), uses, e);
+                self.emit_exiting(mb, MOp::ExitTo(e), vec![], self.stub_regs(i), e);
             }
             other => return Err(IselError::Unsupported(op_name(other))),
         }

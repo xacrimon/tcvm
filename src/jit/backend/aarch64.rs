@@ -36,7 +36,7 @@ use crate::jit::backend::mach::{
     AluOp, ExitId, ExitSrc, FAluOp, MBlock, MFunc, MOp, RegClass, Tag, VReg, Width,
 };
 use crate::jit::backend::regalloc::{
-    Alloc, Allocation, Inst, MachineEnv, Move, PReg, ProgPoint, RegallocFunc,
+    Alloc, Allocation, Edit, Inst, MachineEnv, Move, Operand, PReg, ProgPoint, RegallocFunc,
 };
 use crate::jit::ir::op::Cc;
 use crate::jit::ir::pool::ConstPool;
@@ -80,33 +80,20 @@ pub enum EncodeError {
     FrameTooLarge(u32),
 }
 
-/// Scratch registers.
-///
-/// Caller-saved and never allocated to a virtual register, so an instruction may
-/// clobber them freely between one value's load and the next. Compiled code makes
-/// no calls, so nothing else can clobber them either.
-///
-/// Three integer scratches is the most any one instruction needs: two operands
-/// and a destination.
-const S0: Gpr = Gpr(9);
-const S1: Gpr = Gpr(10);
-const S2: Gpr = Gpr(11);
-
-/// Two more, for the macro-ops that expand to a sequence and need somewhere to
-/// keep an intermediate. Held apart from `S0..S2` because those may already be
-/// standing in for a spilled operand by the time the sequence starts. `x16`/`x17`
-/// are the platform's own scratch (IP0/IP1).
-const T0: Gpr = Gpr(16);
-const T1: Gpr = Gpr(17);
+/// Float scratch — `d16`–`d18`, never allocated. The encoder still reaches for
+/// `F0` in an exit stub to move a float payload through a general register; floats
+/// are rarely under pressure, so reclaiming these buys little and is left alone.
 const F0: Fpr = Fpr(16);
-const F1: Fpr = Fpr(17);
-const F2: Fpr = Fpr(18);
 
-/// Where an edit's move goes through when it is stack-to-stack. Free between
-/// instructions by construction: an edit sits *between* two instructions, and
-/// every scratch is dead at that point.
-const E0: Gpr = Gpr(16);
-const E1: Fpr = Fpr(16);
+/// The integer registers the allocator may hand out — and the pool the exit stubs
+/// pick their scratch from, since the stubs run out-of-line and can use anything a
+/// keepalive is not holding. `x0`/`x1` come last: they arrive holding the incoming
+/// arguments and `x0` is overwritten with the status word at every return, so
+/// preferring them last keeps the common case clear of the ABI registers while
+/// still letting pressure spill into them.
+const INT_POOL: &[u8] = &[
+    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 29, 30, 0, 1,
+];
 
 /// The two incoming arguments: the thread, and the Lua frame base.
 const ARG: [Gpr; 2] = [Gpr(0), Gpr(1)];
@@ -114,33 +101,105 @@ const ARG: [Gpr; 2] = [Gpr(0), Gpr(1)];
 /// One spill slot is one machine word.
 const SLOT: i32 = 8;
 
+/// Does `imm` fit the 12-bit (optionally shifted) immediate of an add/sub/cmp?
+/// When it does, the encoder folds it into the instruction and needs no scratch;
+/// when it does not, it materializes the constant into a temp first.
+fn wide_imm_fits(imm: i64) -> bool {
+    match imm.checked_abs() {
+        Some(a) => {
+            let a = a as u64;
+            a < 4096 || (a & 0xfff == 0 && a < (4096u64 << 12))
+        }
+        None => false,
+    }
+}
+
+/// How many scratch registers the encoder needs to realize `op` — separate from
+/// its operands, which the allocator has already placed in registers. All of them
+/// are general-purpose here; no float op needs one.
+///
+/// This is the encoding fact that [`annotate`] turns into temp operands the
+/// allocator can satisfy from the free pool, which is what lets `x9`–`x11` be
+/// ordinary registers rather than reserved scratch.
+fn temps_needed(op: MOp) -> usize {
+    match op {
+        // The floor-rounding divides expand to a sequence with two working
+        // registers; by immediate, add one more to hold the materialized divisor.
+        MOp::Alu(AluOp::Mod | AluOp::IDiv) => 2,
+        MOp::AluImm(AluOp::Mod | AluOp::IDiv, _) => 3,
+        // A wide immediate has to be materialized into a register first; a folded
+        // one needs nothing.
+        MOp::AluImm(AluOp::Add | AluOp::Sub, imm) => usize::from(!wide_imm_fits(imm)),
+        MOp::GuardCmpImm { imm, .. } => usize::from(!wide_imm_fits(imm)),
+        // Every other immediate ALU op always materializes its immediate.
+        MOp::AluImm(_, _) => 1,
+        _ => 0,
+    }
+}
+
+/// Attach each instruction's scratch registers as temp operands, so register
+/// allocation gives them free registers instead of the encoder reaching for fixed
+/// ones. Runs on the machine IR after isel and before allocation.
+pub fn annotate(m: &mut MFunc) {
+    for i in 0..m.insts.len() {
+        for _ in 0..temps_needed(m.insts[i].op) {
+            let t = m.new_vreg(RegClass::Int);
+            m.insts[i].temps.push(Operand::reg(t));
+        }
+        // An entry argument would rather stay in the register it arrived in, so the
+        // `mov` off it folds away. Soft: if pressure wants that register, the value
+        // moves and the copy stays.
+        if let MOp::EntryArg(n) = m.insts[i].op {
+            let v = m.insts[i].def_vreg(0);
+            m.phys_hints
+                .insert(v, PReg::new(RegClass::Int, ARG[n as usize].0));
+        }
+    }
+
+    // Rematerializable constants: a value defined exactly once by a pure constant
+    // (no register inputs) can be recomputed at a use, so a spill of it needs no
+    // slot and no store. `EntryArg` is *not* one — it reads an argument register
+    // that the pool may have reused by then. Restricted to the integer class the
+    // encoder can `mov_imm`.
+    let mut def_count = vec![0u32; m.classes.len()];
+    for inst in &m.insts {
+        for o in &inst.defs {
+            def_count[o.vreg.0 as usize] += 1;
+        }
+    }
+    for i in 0..m.insts.len() {
+        let const_op = matches!(
+            m.insts[i].op,
+            MOp::Imm(_) | MOp::ShapeAddr(_) | MOp::ConstPayload(_)
+        );
+        if !const_op || m.insts[i].defs.len() != 1 {
+            continue;
+        }
+        let v = m.insts[i].defs[0].vreg;
+        if def_count[v.0 as usize] == 1 && m.classes[v.0 as usize] == RegClass::Int {
+            m.remat.insert(v, i);
+        }
+    }
+}
+
 /// The registers the allocator may hand out.
 ///
-/// Caller-saved only. Compiled regions are leaves — they call nothing — so a
-/// caller-saved register costs nothing to use, while a callee-saved one would have
-/// to be spilled and restored in the prologue for no gain at the register counts
-/// these regions actually reach. If pressure ever justifies it, x19–x28 and d8–d15
-/// are sitting there.
-///
-/// What is *missing* from this list is the load-bearing part, and it is missing for
-/// reasons that live in this file — which is why the list does too, rather than in
-/// the allocator:
-///
-///   x0, x1   incoming arguments, and x0 is the status word on the way out
-///   x9-x11   `S0`–`S2`, the encoder's integer scratch
-///   x16, x17 `T0`/`T1`, and the linker may insert a veneer that clobbers them
-///   x18      reserved by the platform on Darwin
-///   x29, x30 frame pointer and link register
-///   d16-d18  `F0`–`F2`, the encoder's float scratch
+/// Caller-saved first — compiled regions are leaves, so a caller-saved register
+/// costs nothing to use — with `x29`/`x30` last, since the prologue saves them
+/// regardless. Only three general registers stay out of the integer pool: `x0`
+/// (the status word at return), `x18` (platform-reserved on Darwin), and — kept
+/// out for now, not by necessity — `x1`, the frame base's incoming register. The
+/// encoder reserves no scratch: operand reloads and wide-immediate temporaries all
+/// come from the pool, and the exit stubs borrow from it too (see [`Encoder::exit_stub`]).
 pub fn machine_env() -> MachineEnv {
-    const INT: &[u8] = &[2, 3, 4, 5, 6, 7, 8, 12, 13, 14, 15];
+    let int: Vec<u8> = INT_POOL.to_vec();
     const FLOAT: &[u8] = &[
         0, 1, 2, 3, 4, 5, 6, 7, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
     ];
 
     MachineEnv {
         allocation_order: [
-            INT.iter().map(|&r| PReg::new(RegClass::Int, r)).collect(),
+            int.iter().map(|&r| PReg::new(RegClass::Int, r)).collect(),
             FLOAT
                 .iter()
                 .map(|&r| PReg::new(RegClass::Float, r))
@@ -218,14 +277,24 @@ impl Encoder<'_, '_> {
 
         let epilogue = self.epilogue;
         self.a.bind(epilogue);
-        self.a.mov_sp(SP, FP);
+        if self.frame > 0 {
+            assert!(
+                self.a.try_add_imm(SP, SP, self.frame as i64),
+                "frame size checked at entry"
+            );
+        }
         self.a.ldp_post(FP, LR, SP, 16);
         self.a.ret();
     }
 
+    /// Save `x29`/`x30` because the AAPCS caller expects them preserved, then leave
+    /// them alone: no frame-pointer chain is set up, so both are ordinary
+    /// allocatable registers in the body. The frame is torn down in the epilogue by
+    /// adding it straight back to `SP` rather than restoring from a saved `FP`. The
+    /// cost is that a debugger cannot unwind through a JIT frame — an acceptable
+    /// trade for two more registers in code this hot.
     fn prologue(&mut self) {
         self.a.stp_pre(FP, LR, SP, -16);
-        self.a.mov_sp(FP, SP);
         if self.frame > 0 {
             assert!(
                 self.a.try_sub_imm(SP, SP, self.frame as i64),
@@ -264,47 +333,48 @@ impl Encoder<'_, '_> {
         }
     }
 
-    /// The register holding use `k` of instruction `i`.
-    fn use_g(&mut self, i: Inst, k: usize, scratch: Gpr) -> Gpr {
+    /// The register holding use `k` of instruction `i`. Always a register: the
+    /// allocator has already reloaded a spilled operand before the instruction.
+    fn use_g(&self, i: Inst, k: usize) -> Gpr {
         debug_assert_eq!(self.m.class(self.m.inst(i).use_vreg(k)), RegClass::Int);
-        let a = self.ra.use_(i, k);
-        self.read_g(a, scratch)
+        match self.ra.use_(i, k) {
+            Alloc::Reg(r) => Gpr(r.num()),
+            Alloc::Spill(_) => unreachable!("a Reg operand is never on the stack"),
+        }
     }
 
-    fn use_f(&mut self, i: Inst, k: usize, scratch: Fpr) -> Fpr {
+    fn use_f(&self, i: Inst, k: usize) -> Fpr {
         debug_assert_eq!(self.m.class(self.m.inst(i).use_vreg(k)), RegClass::Float);
-        let a = self.ra.use_(i, k);
-        self.read_f(a, scratch)
+        match self.ra.use_(i, k) {
+            Alloc::Reg(r) => Fpr(r.num()),
+            Alloc::Spill(_) => unreachable!("a Reg operand is never on the stack"),
+        }
     }
 
-    /// Where to write def `k` of instruction `i`. Pair every call with
-    /// [`Self::def_done`], which is a no-op for a value in a register and the spill
-    /// store otherwise.
-    fn def_g(&mut self, i: Inst, k: usize, scratch: Gpr) -> Gpr {
+    /// The register the allocator handed this instruction as temp `k`.
+    fn temp_g(&self, i: Inst, k: usize) -> Gpr {
+        match self.ra.temp(i, k) {
+            Alloc::Reg(r) => Gpr(r.num()),
+            Alloc::Spill(_) => unreachable!("a temp is always a register"),
+        }
+    }
+
+    /// Where to write def `k` of instruction `i` — always a register. A spilled
+    /// result is stored back by the allocator's edit after the instruction, so the
+    /// encoder just writes the register it is given.
+    fn def_g(&self, i: Inst, k: usize) -> Gpr {
         debug_assert_eq!(self.m.class(self.m.inst(i).def_vreg(k)), RegClass::Int);
         match self.ra.def(i, k) {
             Alloc::Reg(r) => Gpr(r.num()),
-            Alloc::Spill(_) => scratch,
+            Alloc::Spill(_) => unreachable!("a Reg def is never on the stack"),
         }
     }
 
-    fn def_f(&mut self, i: Inst, k: usize, scratch: Fpr) -> Fpr {
+    fn def_f(&self, i: Inst, k: usize) -> Fpr {
         debug_assert_eq!(self.m.class(self.m.inst(i).def_vreg(k)), RegClass::Float);
         match self.ra.def(i, k) {
             Alloc::Reg(r) => Fpr(r.num()),
-            Alloc::Spill(_) => scratch,
-        }
-    }
-
-    fn def_done(&mut self, i: Inst, k: usize, from: Gpr) {
-        if let Alloc::Spill(s) = self.ra.def(i, k) {
-            assert!(self.a.try_str(from, SP, s as i32 * SLOT));
-        }
-    }
-
-    fn def_done_f(&mut self, i: Inst, k: usize, from: Fpr) {
-        if let Alloc::Spill(s) = self.ra.def(i, k) {
-            assert!(self.a.try_str_f(from, SP, s as i32 * SLOT));
+            Alloc::Spill(_) => unreachable!("a Reg def is never on the stack"),
         }
     }
 
@@ -332,9 +402,32 @@ impl Encoder<'_, '_> {
         self.ra.use_(i, k)
     }
 
-    /// A move the allocator asked for. Neither allocator in `regalloc` asks — they
-    /// assign whole values, so a value never has to move — but a splitting one does
-    /// nothing else, and this is what it would need the encoder to be able to do.
+    /// Two general registers the stub for `guard` may use as scratch: any two the
+    /// guard's values are not sitting in. The stub is cold and hands control back
+    /// to the interpreter, so every register a keepalive does not occupy holds a
+    /// dead fast-path value. The pool always outnumbers a guard's live set by more
+    /// than two, so this cannot come up empty.
+    fn stub_scratch(&self, guard: Inst) -> (Gpr, Gpr) {
+        let mut busy = [false; 32];
+        for k in 0..self.m.inst(guard).uses.len() {
+            if let Alloc::Reg(r) = self.ra.use_(guard, k)
+                && r.class() == RegClass::Int
+            {
+                busy[r.num() as usize] = true;
+            }
+        }
+        let mut free = INT_POOL.iter().copied().filter(|&r| !busy[r as usize]);
+        let base = free
+            .next()
+            .expect("the pool outnumbers a guard's keepalives");
+        let tmp = free
+            .next()
+            .expect("the pool outnumbers a guard's keepalives");
+        (Gpr(base), Gpr(tmp))
+    }
+
+    /// A move the allocator asked for: the reload phase spilling a value to its slot
+    /// or loading it back into a register around a use.
     fn emit_move(&mut self, m: Move) {
         match m.class {
             RegClass::Int => match (m.from, m.to) {
@@ -345,9 +438,10 @@ impl Encoder<'_, '_> {
                 (Alloc::Spill(s), Alloc::Reg(t)) => {
                     assert!(self.a.try_ldr(Gpr(t.num()), SP, s as i32 * SLOT));
                 }
-                (Alloc::Spill(f), Alloc::Spill(t)) => {
-                    assert!(self.a.try_ldr(E0, SP, f as i32 * SLOT));
-                    assert!(self.a.try_str(E0, SP, t as i32 * SLOT));
+                // The allocator's only edits are reloads — a value moves between its
+                // slot and a register, never slot to slot — so this cannot arise.
+                (Alloc::Spill(_), Alloc::Spill(_)) => {
+                    unreachable!("no allocator edit is stack to stack")
                 }
             },
             RegClass::Float => match (m.from, m.to) {
@@ -358,17 +452,34 @@ impl Encoder<'_, '_> {
                 (Alloc::Spill(s), Alloc::Reg(t)) => {
                     assert!(self.a.try_ldr_f(Fpr(t.num()), SP, s as i32 * SLOT));
                 }
-                (Alloc::Spill(f), Alloc::Spill(t)) => {
-                    assert!(self.a.try_ldr_f(E1, SP, f as i32 * SLOT));
-                    assert!(self.a.try_str_f(E1, SP, t as i32 * SLOT));
+                (Alloc::Spill(_), Alloc::Spill(_)) => {
+                    unreachable!("no allocator edit is stack to stack")
                 }
             },
         }
     }
 
+    /// Replay a spilled constant into `to` instead of loading a slot it never got.
+    /// The source is one of the pure, input-free constant ops (never `EntryArg`,
+    /// which reads a since-reused argument register); `annotate` guarantees that.
+    fn emit_remat(&mut self, src: Inst, to: Gpr) {
+        match self.m.inst(src).op {
+            MOp::Imm(v) => self.a.mov_imm(to, v),
+            MOp::ShapeAddr(s) => self.a.mov_imm(to, self.shape_word(s)),
+            MOp::ConstPayload(c) => {
+                let bits = self.pool.value(c).raw_payload() as i64;
+                self.a.mov_imm(to, bits);
+            }
+            op => unreachable!("remat source is a pure constant, got {op:?}"),
+        }
+    }
+
     fn edits_at(&mut self, p: ProgPoint) {
-        for m in self.ra.edits_at(p).copied().collect::<Vec<_>>() {
-            self.emit_move(m);
+        for e in self.ra.edits_at(p).copied().collect::<Vec<_>>() {
+            match e {
+                Edit::Move(m) => self.emit_move(m),
+                Edit::Remat { src, to, .. } => self.emit_remat(src, Gpr(to.num())),
+            }
         }
     }
 
@@ -388,25 +499,25 @@ impl Encoder<'_, '_> {
     // interpreter.
 
     /// `d = n - floor(n / m) * m`, in the sign convention of Lua's `%`.
-    fn floor_mod(&mut self, d: Gpr, n: Gpr, m: Gpr) {
-        self.a.sdiv(T0, n, m); // q
-        self.a.msub(T0, T0, m, n); // r = n - q*m, truncated
-        self.a.eor(T1, T0, m); // sign bit set iff r and m disagree
-        assert!(self.a.try_cmp_imm(T0, 0)); // Z = (r == 0)
-        self.a.ccmp_imm(T1, 0, 0, Cond::Ne); // r != 0 ? flags of (r^m) : clear
-        self.a.add(T1, T0, m); // the corrected value — `add` leaves flags alone
-        self.a.csel(d, T1, T0, Cond::Mi);
+    fn floor_mod(&mut self, d: Gpr, n: Gpr, m: Gpr, t0: Gpr, t1: Gpr) {
+        self.a.sdiv(t0, n, m); // q
+        self.a.msub(t0, t0, m, n); // r = n - q*m, truncated
+        self.a.eor(t1, t0, m); // sign bit set iff r and m disagree
+        assert!(self.a.try_cmp_imm(t0, 0)); // Z = (r == 0)
+        self.a.ccmp_imm(t1, 0, 0, Cond::Ne); // r != 0 ? flags of (r^m) : clear
+        self.a.add(t1, t0, m); // the corrected value — `add` leaves flags alone
+        self.a.csel(d, t1, t0, Cond::Mi);
     }
 
     /// `d = floor(n / m)`, in the sign convention of Lua's `//`.
-    fn floor_div(&mut self, d: Gpr, n: Gpr, m: Gpr) {
-        self.a.sdiv(T0, n, m); // q
-        self.a.msub(T1, T0, m, n); // r
-        assert!(self.a.try_cmp_imm(T1, 0)); // Z = (r == 0)
-        self.a.eor(T1, n, m); // r is dead; reuse it for the sign test
-        self.a.ccmp_imm(T1, 0, 0, Cond::Ne);
-        assert!(self.a.try_sub_imm(T1, T0, 1)); // q - 1
-        self.a.csel(d, T1, T0, Cond::Mi);
+    fn floor_div(&mut self, d: Gpr, n: Gpr, m: Gpr, t0: Gpr, t1: Gpr) {
+        self.a.sdiv(t0, n, m); // q
+        self.a.msub(t1, t0, m, n); // r
+        assert!(self.a.try_cmp_imm(t1, 0)); // Z = (r == 0)
+        self.a.eor(t1, n, m); // r is dead; reuse it for the sign test
+        self.a.ccmp_imm(t1, 0, 0, Cond::Ne);
+        assert!(self.a.try_sub_imm(t1, t0, 1)); // q - 1
+        self.a.csel(d, t1, t0, Cond::Mi);
     }
 
     // --- blocks -------------------------------------------------------------
@@ -427,53 +538,46 @@ impl Encoder<'_, '_> {
                 // The incoming argument registers are still live here: the entry
                 // block runs before anything can clobber them, and the scratch
                 // registers deliberately do not overlap `x0`/`x1`.
-                let d = self.def_g(i, 0, S0);
+                let d = self.def_g(i, 0);
                 self.a.mov(d, ARG[n as usize]);
-                self.def_done(i, 0, d);
             }
             MOp::Imm(v) => {
-                let d = self.def_g(i, 0, S0);
+                let d = self.def_g(i, 0);
                 self.a.mov_imm(d, v);
-                self.def_done(i, 0, d);
             }
             MOp::ShapeAddr(s) => {
-                let d = self.def_g(i, 0, S0);
+                let d = self.def_g(i, 0);
                 self.a.mov_imm(d, self.shape_word(s));
-                self.def_done(i, 0, d);
             }
             MOp::ConstPayload(c) => {
-                let d = self.def_g(i, 0, S0);
+                let d = self.def_g(i, 0);
                 let bits = self.pool.value(c).raw_payload() as i64;
                 self.a.mov_imm(d, bits);
-                self.def_done(i, 0, d);
             }
             MOp::Mov => match self.m.class(self.m.inst(i).def_vreg(0)) {
                 RegClass::Int => {
-                    let s = self.use_g(i, 0, S0);
-                    let d = self.def_g(i, 0, S1);
+                    let s = self.use_g(i, 0);
+                    let d = self.def_g(i, 0);
                     self.a.mov(d, s);
-                    self.def_done(i, 0, d);
                 }
                 RegClass::Float => {
-                    let s = self.use_f(i, 0, F0);
-                    let d = self.def_f(i, 0, F1);
+                    let s = self.use_f(i, 0);
+                    let d = self.def_f(i, 0);
                     self.a.fmov(d, s);
-                    self.def_done_f(i, 0, d);
                 }
             },
             MOp::Load { off, width } => {
-                let base = self.use_g(i, 0, S0);
-                let d = self.def_g(i, 0, S1);
+                let base = self.use_g(i, 0);
+                let d = self.def_g(i, 0);
                 let ok = match width {
                     Width::U64 => self.a.try_ldr(d, base, off),
                     Width::U8 => self.a.try_ldrb(d, base, off),
                 };
                 assert!(ok, "load offset {off} out of range");
-                self.def_done(i, 0, d);
             }
             MOp::Store { off, width } => {
-                let base = self.use_g(i, 0, S0);
-                let val = self.use_g(i, 1, S1);
+                let base = self.use_g(i, 0);
+                let val = self.use_g(i, 1);
                 let ok = match width {
                     Width::U64 => self.a.try_str(val, base, off),
                     Width::U8 => self.a.try_strb(val, base, off),
@@ -481,10 +585,10 @@ impl Encoder<'_, '_> {
                 assert!(ok, "store offset {off} out of range");
             }
             MOp::Alu(o) => {
-                let d = match o {
+                let _ = match o {
                     AluOp::Neg | AluOp::Not => {
-                        let n = self.use_g(i, 0, S0);
-                        let d = self.def_g(i, 0, S2);
+                        let n = self.use_g(i, 0);
+                        let d = self.def_g(i, 0);
                         match o {
                             AluOp::Neg => self.a.neg(d, n),
                             _ => self.a.mvn(d, n),
@@ -492,9 +596,9 @@ impl Encoder<'_, '_> {
                         d
                     }
                     _ => {
-                        let n = self.use_g(i, 0, S0);
-                        let m = self.use_g(i, 1, S1);
-                        let d = self.def_g(i, 0, S2);
+                        let n = self.use_g(i, 0);
+                        let m = self.use_g(i, 1);
+                        let d = self.def_g(i, 0);
                         match o {
                             AluOp::Add => self.a.add(d, n, m),
                             AluOp::Sub => self.a.sub(d, n, m),
@@ -505,54 +609,61 @@ impl Encoder<'_, '_> {
                             AluOp::Shl => self.a.lslv(d, n, m),
                             AluOp::Sar => self.a.asrv(d, n, m),
                             AluOp::Lsr => self.a.lsrv(d, n, m),
-                            AluOp::Mod => self.floor_mod(d, n, m),
-                            AluOp::IDiv => self.floor_div(d, n, m),
+                            AluOp::Mod => {
+                                self.floor_mod(d, n, m, self.temp_g(i, 0), self.temp_g(i, 1))
+                            }
+                            AluOp::IDiv => {
+                                self.floor_div(d, n, m, self.temp_g(i, 0), self.temp_g(i, 1))
+                            }
                             AluOp::Neg | AluOp::Not => unreachable!("handled above"),
                         }
                         d
                     }
                 };
-                self.def_done(i, 0, d);
             }
             MOp::AluImm(o, imm) => {
-                let n = self.use_g(i, 0, S0);
-                let d = self.def_g(i, 0, S2);
+                let n = self.use_g(i, 0);
+                let d = self.def_g(i, 0);
                 let folded = match o {
                     AluOp::Add => self.a.try_add_imm(d, n, imm),
                     AluOp::Sub => self.a.try_sub_imm(d, n, imm),
                     _ => false,
                 };
                 if !folded {
-                    self.a.mov_imm(S1, imm);
+                    // `temps_needed` reserved exactly one temp for the unfolded path.
+                    let t = self.temp_g(i, 0);
+                    self.a.mov_imm(t, imm);
                     match o {
-                        AluOp::Add => self.a.add(d, n, S1),
-                        AluOp::Sub => self.a.sub(d, n, S1),
-                        AluOp::Mul => self.a.mul(d, n, S1),
-                        AluOp::And => self.a.and(d, n, S1),
-                        AluOp::Or => self.a.orr(d, n, S1),
-                        AluOp::Xor => self.a.eor(d, n, S1),
-                        AluOp::Shl => self.a.lslv(d, n, S1),
-                        AluOp::Sar => self.a.asrv(d, n, S1),
-                        AluOp::Lsr => self.a.lsrv(d, n, S1),
-                        AluOp::Mod => self.floor_mod(d, n, S1),
-                        AluOp::IDiv => self.floor_div(d, n, S1),
+                        AluOp::Add => self.a.add(d, n, t),
+                        AluOp::Sub => self.a.sub(d, n, t),
+                        AluOp::Mul => self.a.mul(d, n, t),
+                        AluOp::And => self.a.and(d, n, t),
+                        AluOp::Or => self.a.orr(d, n, t),
+                        AluOp::Xor => self.a.eor(d, n, t),
+                        AluOp::Shl => self.a.lslv(d, n, t),
+                        AluOp::Sar => self.a.asrv(d, n, t),
+                        AluOp::Lsr => self.a.lsrv(d, n, t),
+                        // The immediate is in temp 0; the expansion gets temps 1, 2.
+                        AluOp::Mod => self.floor_mod(d, n, t, self.temp_g(i, 1), self.temp_g(i, 2)),
+                        AluOp::IDiv => {
+                            self.floor_div(d, n, t, self.temp_g(i, 1), self.temp_g(i, 2))
+                        }
                         AluOp::Neg | AluOp::Not => panic!("{o:?} takes no immediate"),
                     }
                 }
-                self.def_done(i, 0, d);
             }
             MOp::FAlu(o) => {
-                let d = match o {
+                let _ = match o {
                     FAluOp::Neg => {
-                        let n = self.use_f(i, 0, F0);
-                        let d = self.def_f(i, 0, F2);
+                        let n = self.use_f(i, 0);
+                        let d = self.def_f(i, 0);
                         self.a.fneg(d, n);
                         d
                     }
                     _ => {
-                        let n = self.use_f(i, 0, F0);
-                        let m = self.use_f(i, 1, F1);
-                        let d = self.def_f(i, 0, F2);
+                        let n = self.use_f(i, 0);
+                        let m = self.use_f(i, 1);
+                        let d = self.def_f(i, 0);
                         match o {
                             FAluOp::Add => self.a.fadd(d, n, m),
                             FAluOp::Sub => self.a.fsub(d, n, m),
@@ -563,41 +674,35 @@ impl Encoder<'_, '_> {
                         d
                     }
                 };
-                self.def_done_f(i, 0, d);
             }
             MOp::ICmpSet(cc) => {
-                let n = self.use_g(i, 0, S0);
-                let m = self.use_g(i, 1, S1);
-                let d = self.def_g(i, 0, S2);
+                let n = self.use_g(i, 0);
+                let m = self.use_g(i, 1);
+                let d = self.def_g(i, 0);
                 self.a.cmp(n, m);
                 self.a.cset(d, int_cond(cc));
-                self.def_done(i, 0, d);
             }
             MOp::FCmpSet(cc) => {
-                let n = self.use_f(i, 0, F0);
-                let m = self.use_f(i, 1, F1);
-                let d = self.def_g(i, 0, S2);
+                let n = self.use_f(i, 0);
+                let m = self.use_f(i, 1);
+                let d = self.def_g(i, 0);
                 self.a.fcmp(n, m);
                 self.a.cset(d, float_cond(cc));
-                self.def_done(i, 0, d);
             }
             MOp::BitsToFloat => {
-                let s = self.use_g(i, 0, S0);
-                let d = self.def_f(i, 0, F0);
+                let s = self.use_g(i, 0);
+                let d = self.def_f(i, 0);
                 self.a.fmov_to_fpr(d, s);
-                self.def_done_f(i, 0, d);
             }
             MOp::FloatToBits => {
-                let s = self.use_f(i, 0, F0);
-                let d = self.def_g(i, 0, S0);
+                let s = self.use_f(i, 0);
+                let d = self.def_g(i, 0);
                 self.a.fmov_to_gpr(d, s);
-                self.def_done(i, 0, d);
             }
             MOp::SiToFp => {
-                let s = self.use_g(i, 0, S0);
-                let d = self.def_f(i, 0, F0);
+                let s = self.use_g(i, 0);
+                let d = self.def_f(i, 0);
                 self.a.scvtf(d, s);
-                self.def_done_f(i, 0, d);
             }
 
             // A guard branches to its stub when the condition it asserts is
@@ -605,23 +710,24 @@ impl Encoder<'_, '_> {
             // frame-state keepalives; they exist to hold registers open for the
             // stub and produce no code here.
             MOp::GuardCmp { cc, exit } => {
-                let n = self.use_g(i, 0, S0);
-                let m = self.use_g(i, 1, S1);
+                let n = self.use_g(i, 0);
+                let m = self.use_g(i, 1);
                 self.a.cmp(n, m);
                 let target = self.exits[exit.0 as usize];
                 self.a.b_cond(int_cond(cc).invert(), target);
             }
             MOp::GuardCmpImm { cc, imm, exit } => {
-                let n = self.use_g(i, 0, S0);
+                let n = self.use_g(i, 0);
                 if !self.a.try_cmp_imm(n, imm) {
-                    self.a.mov_imm(S1, imm);
-                    self.a.cmp(n, S1);
+                    let t = self.temp_g(i, 0);
+                    self.a.mov_imm(t, imm);
+                    self.a.cmp(n, t);
                 }
                 let target = self.exits[exit.0 as usize];
                 self.a.b_cond(int_cond(cc).invert(), target);
             }
             MOp::GuardNz { exit } => {
-                let n = self.use_g(i, 0, S0);
+                let n = self.use_g(i, 0);
                 let target = self.exits[exit.0 as usize];
                 self.a.cbz(n, target);
             }
@@ -631,7 +737,7 @@ impl Encoder<'_, '_> {
                 self.a.b(target);
             }
             MOp::BrNz { then_, else_ } => {
-                let c = self.use_g(i, 0, S0);
+                let c = self.use_g(i, 0);
                 let t = self.blocks[then_.0 as usize];
                 let e = self.blocks[else_.0 as usize];
                 self.a.cbnz(c, t);
@@ -674,10 +780,13 @@ impl Encoder<'_, '_> {
 
         let stub = self.m.exits[e.0 as usize].clone();
 
-        // The base has to survive every value the stub loads, so it takes the one
-        // scratch register the loads below never touch.
+        // The stub runs out-of-line after a guard fails, so every register except
+        // the keepalives it is about to read holds a dead fast-path value — free for
+        // the taking. `sc_base` survives every load (it holds the frame base); each
+        // payload and tag passes through `sc_tmp`, one at a time.
+        let (sc_base, sc_tmp) = self.stub_scratch(stub.inst);
         let base_at = self.at_exit(e, self.m.frame_base);
-        let base = self.read_g(base_at, S2);
+        let base = self.read_g(base_at, sc_base);
 
         for (reg, src) in stub.slots {
             let slot = reg as i32 * layout::val::SIZE as i32;
@@ -689,33 +798,33 @@ impl Encoder<'_, '_> {
             let (payload, tag) = match src {
                 ExitSrc::Boxed { payload, tag } => {
                     let a = self.at_exit(e, payload);
-                    (self.read_g(a, S0), tag)
+                    (self.read_g(a, sc_tmp), tag)
                 }
                 ExitSrc::Int(v) => {
                     let a = self.at_exit(e, v);
-                    (self.read_g(a, S0), Tag::Const(ValueKind::Integer))
+                    (self.read_g(a, sc_tmp), Tag::Const(ValueKind::Integer))
                 }
                 ExitSrc::Float(v) => {
                     let a = self.at_exit(e, v);
                     let f = self.read_f(a, F0);
-                    self.a.fmov_to_gpr(S0, f);
-                    (S0, Tag::Const(ValueKind::Float))
+                    self.a.fmov_to_gpr(sc_tmp, f);
+                    (sc_tmp, Tag::Const(ValueKind::Float))
                 }
                 ExitSrc::Const { payload, tag } => {
-                    self.a.mov_imm(S0, payload as i64);
-                    (S0, Tag::Const(tag))
+                    self.a.mov_imm(sc_tmp, payload as i64);
+                    (sc_tmp, Tag::Const(tag))
                 }
             };
             assert!(self.a.try_str(payload, base, payload_off));
 
             let tag_reg = match tag {
                 Tag::Const(k) => {
-                    self.a.mov_imm(S1, layout::kind(k) as i64);
-                    S1
+                    self.a.mov_imm(sc_tmp, layout::kind(k) as i64);
+                    sc_tmp
                 }
                 Tag::Dyn(t) => {
                     let a = self.at_exit(e, t);
-                    self.read_g(a, S1)
+                    self.read_g(a, sc_tmp)
                 }
             };
             assert!(self.a.try_strb(tag_reg, base, kind_off));
@@ -847,12 +956,13 @@ mod tests {
     /// nothing in `regalloc` asks. Neither allocator splits a live range, so the
     /// edit list is always empty and the code path would otherwise never run.
     ///
-    /// It is the path a splitting allocator (regalloc3) would live or die on, so it
-    /// is driven by hand: an allocation that computes the sum in x2, moves it out,
-    /// and lets the very next instruction take x2 over. Drop the move and the
-    /// region returns `0x7fffdead`.
-    fn split_sum_through(dest: Alloc, num_spills: u32) -> i64 {
-        let (m, sum, def_sum, store) = add_and_store();
+    /// It is the path the allocator's reload phase drives constantly, but is easier
+    /// to read driven by hand: an allocation that computes the sum in x2, moves it
+    /// out through `edits`, and lets the very next instruction take x2 over — with
+    /// the store finally reading it from `store_use`. Drop the moves and the region
+    /// returns `0x7fffdead`.
+    fn split_sum_through(store_use: Alloc, edits: Vec<(ProgPoint, Move)>, num_spills: u32) -> i64 {
+        let (m, sum, _def_sum, store) = add_and_store();
 
         let mut b = AllocationBuilder::new(&m);
         b.assign(m.frame_base, Alloc::Reg(x(3)));
@@ -862,15 +972,10 @@ mod tests {
 
         b.assign(sum, Alloc::Reg(x(2)));
         b.assign(VReg(4), Alloc::Reg(x(2))); // junk, which takes x2 over
-        b.set_use(store, 1, dest);
-        b.edit(
-            ProgPoint::after(def_sum),
-            Move {
-                from: Alloc::Reg(x(2)),
-                to: dest,
-                class: RegClass::Int,
-            },
-        );
+        b.set_use(store, 1, store_use);
+        for (p, mv) in edits {
+            b.edit(p, Edit::Move(mv));
+        }
 
         let ra = b.finish(num_spills);
         let words = encode(&m, &ConstPool::new(), &ra).expect("encode");
@@ -884,13 +989,40 @@ mod tests {
         stack[0].get_integer().expect("an integer result")
     }
 
-    #[test]
-    fn a_split_into_a_register_emits_its_move() {
-        assert_eq!(split_sum_through(Alloc::Reg(x(5)), 0), 42);
+    fn mv(from: Alloc, to: Alloc) -> Move {
+        Move {
+            from,
+            to,
+            class: RegClass::Int,
+        }
     }
 
+    /// One move: x2 to x5, so the store reads the sum from x5.
     #[test]
-    fn a_split_onto_the_stack_emits_its_move() {
-        assert_eq!(split_sum_through(Alloc::Spill(0), 1), 42);
+    fn a_split_into_a_register_emits_its_move() {
+        let (_, _, def_sum, _) = add_and_store();
+        let edits = vec![(
+            ProgPoint::after(def_sum),
+            mv(Alloc::Reg(x(2)), Alloc::Reg(x(5))),
+        )];
+        assert_eq!(split_sum_through(Alloc::Reg(x(5)), edits, 0), 42);
+    }
+
+    /// Two moves through a slot — spill then reload — the exact shape the reload
+    /// phase emits for a value that lives on the stack between its def and a use.
+    #[test]
+    fn a_split_onto_the_stack_emits_its_moves() {
+        let (_, _, def_sum, store) = add_and_store();
+        let edits = vec![
+            (
+                ProgPoint::after(def_sum),
+                mv(Alloc::Reg(x(2)), Alloc::Spill(0)),
+            ),
+            (
+                ProgPoint::before(store),
+                mv(Alloc::Spill(0), Alloc::Reg(x(5))),
+            ),
+        ];
+        assert_eq!(split_sum_through(Alloc::Reg(x(5)), edits, 1), 42);
     }
 }

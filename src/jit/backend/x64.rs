@@ -45,7 +45,7 @@ use crate::jit::backend::mach::{
     AluOp, ExitId, ExitSrc, FAluOp, MBlock, MFunc, MOp, RegClass, Tag, VReg, Width,
 };
 use crate::jit::backend::regalloc::{
-    Alloc, Allocation, Inst, MachineEnv, Move, PReg, ProgPoint, RegallocFunc,
+    Alloc, Allocation, Edit, Inst, MachineEnv, Move, PReg, ProgPoint, RegallocFunc,
 };
 use crate::jit::backend::x64_asm::{Asm, Cond, Gpr, Label, RAX, RBP, RCX, RDX, RSP, Xmm};
 use crate::jit::ir::op::Cc;
@@ -372,8 +372,14 @@ impl Encoder<'_, '_> {
     }
 
     fn edits_at(&mut self, p: ProgPoint) {
-        for m in self.ra.edits_at(p).copied().collect::<Vec<_>>() {
-            self.emit_move(m);
+        for e in self.ra.edits_at(p).copied().collect::<Vec<_>>() {
+            match e {
+                Edit::Move(m) => self.emit_move(m),
+                // No x64 `annotate` populates `MFunc::remat`, so the allocator emits
+                // no remat edits for this target yet. When it does, this backend
+                // grows an `emit_remat` alongside the aarch64 one.
+                Edit::Remat { .. } => unreachable!("x64 does not rematerialize yet"),
+            }
         }
     }
 
@@ -938,11 +944,11 @@ mod tests {
         b.set_use(store, 1, dest);
         b.edit(
             ProgPoint::after(def_sum),
-            Move {
+            Edit::Move(Move {
                 from: Alloc::Reg(x(8)),
                 to: dest,
                 class: RegClass::Int,
-            },
+            }),
         );
 
         let ra = b.finish(num_spills);
