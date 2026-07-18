@@ -21,9 +21,6 @@ repository.workspace = true
 
 [features]
 default = ["jit"]
-# The optimizing JIT, for aarch64 macOS and Linux. Requesting it on any other
-# target is a no-op: `build.rs` only sets the `jit_enabled` cfg on a supported
-# target, so elsewhere the JIT is compiled out entirely (see build.rs).
 jit = []
 
 [dependencies]
