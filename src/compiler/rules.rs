@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::mem;
 
 use cstree::interning::TokenInterner;
+use foldhash::fast::RandomState;
 
 use super::defs::{Chunk, ExprDesc, ExprKind, JumpList, Numeral, RegisterIndex, VarargInfo, Want};
 use super::{CompileError, CompileErrorKind, LineNumber};
@@ -263,7 +264,7 @@ struct GlobalEnv {
     /// Names introduced by an *explicit* `global Name` declaration.
     /// Reads of these emit `ERRNNIL` after `GETTABUP` (a never-assigned
     /// declared global is an error in 5.5 — `manual.of:1700`).
-    decls: HashMap<String, GlobalKind>,
+    decls: HashMap<String, GlobalKind, RandomState>,
     /// Policy for free names with no declaration in scope.
     default: DefaultPolicy,
 }
@@ -271,7 +272,7 @@ struct GlobalEnv {
 impl GlobalEnv {
     fn new() -> Self {
         Self {
-            decls: HashMap::new(),
+            decls: HashMap::default(),
             default: DefaultPolicy::Preamble,
         }
     }
@@ -339,7 +340,7 @@ struct Ctx<'gc, 'a> {
     control_end_label: Vec<u16>,
 
     /// Lexical scope stack: each frame maps variable names to register data.
-    scope: Vec<HashMap<String, VariableData>>,
+    scope: Vec<HashMap<String, VariableData, RandomState>>,
     /// Saved `(freereg, nactvar)` per scope entry, restored on pop so that
     /// any temps or locals allocated within the scope are reclaimed together.
     scope_marks: Vec<ScopeMark>,
@@ -347,7 +348,7 @@ struct Ctx<'gc, 'a> {
     scope_close: Vec<Vec<RegisterIndex>>,
 
     /// Named labels for goto/label statements (name → label index).
-    goto_labels: HashMap<String, u16>,
+    goto_labels: HashMap<String, u16, RandomState>,
 
     /// Parent function's resolver, or `None` for the main chunk. A nested
     /// function calls this to walk the lexical chain when it encounters a
@@ -1091,7 +1092,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     }
 
     fn push_scope(&mut self) {
-        self.scope.push(HashMap::new());
+        self.scope.push(HashMap::default());
         self.scope_marks.push(ScopeMark {
             freereg: self.chunk.freereg,
             nactvar: self.chunk.nactvar,
@@ -1387,7 +1388,7 @@ fn compile_function_to_chunk<'gc, 'a>(
         scope: Vec::new(),
         scope_marks: Vec::new(),
         scope_close: Vec::new(),
-        goto_labels: HashMap::new(),
+        goto_labels: HashMap::default(),
         capture: parent_capture,
         upvalues: initial_upvalues,
         globals,

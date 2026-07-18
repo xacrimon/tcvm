@@ -7,6 +7,8 @@
 
 use std::collections::HashMap;
 
+use foldhash::fast::RandomState;
+
 use crate::dmm::{Collect, Gc};
 use crate::env::function::Prototype;
 use crate::env::shape::Shape;
@@ -55,13 +57,13 @@ pub struct ConstPool<'gc> {
     // Interning tables. Keyed by raw bits / pointer identity, so they hold no
     // `Gc` pointers of their own and need no tracing.
     #[collect(require_static)]
-    value_dedup: HashMap<(u8, u64), ConstRef>,
+    value_dedup: HashMap<(u8, u64), ConstRef, RandomState>,
     #[collect(require_static)]
-    shape_dedup: HashMap<usize, ShapeRef>,
+    shape_dedup: HashMap<usize, ShapeRef, RandomState>,
     #[collect(require_static)]
-    proto_dedup: HashMap<usize, ProtoRef>,
+    proto_dedup: HashMap<usize, ProtoRef, RandomState>,
     #[collect(require_static)]
-    string_dedup: HashMap<usize, StrRef>,
+    string_dedup: HashMap<usize, StrRef, RandomState>,
 }
 
 impl<'gc> ConstPool<'gc> {
@@ -71,10 +73,10 @@ impl<'gc> ConstPool<'gc> {
             shapes: Vec::new(),
             protos: Vec::new(),
             strings: Vec::new(),
-            value_dedup: HashMap::new(),
-            shape_dedup: HashMap::new(),
-            proto_dedup: HashMap::new(),
-            string_dedup: HashMap::new(),
+            value_dedup: HashMap::default(),
+            shape_dedup: HashMap::default(),
+            proto_dedup: HashMap::default(),
+            string_dedup: HashMap::default(),
         }
     }
 

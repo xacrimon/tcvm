@@ -32,6 +32,8 @@
 
 use std::collections::HashMap;
 
+use foldhash::fast::RandomState;
+
 use crate::dmm::Gc;
 use crate::env::function::{InlineCache, Prototype};
 use crate::env::shape::MetamethodBits;
@@ -839,14 +841,14 @@ struct Version {
 struct Versions {
     all: Vec<Version>,
     /// pc -> version ids, in creation order.
-    by_pc: HashMap<u32, Vec<usize>>,
+    by_pc: HashMap<u32, Vec<usize>, RandomState>,
 }
 
 impl Versions {
     fn new() -> Self {
         Versions {
             all: Vec::new(),
-            by_pc: HashMap::new(),
+            by_pc: HashMap::default(),
         }
     }
 

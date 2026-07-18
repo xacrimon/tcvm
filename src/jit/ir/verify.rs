@@ -25,6 +25,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use foldhash::fast::RandomState;
+
 use crate::jit::ir::op::{ArithKind, Flags, FloatOp, IntOp, Op};
 use crate::jit::ir::ty::{Refine, Rep, Ty, TypeSet};
 use crate::jit::ir::{Block, Def, FsRef, Func, Inst, Val};
@@ -86,7 +88,7 @@ struct Verifier<'a, 'gc> {
     errs: Vec<Error>,
     at: (Option<Block>, Option<Inst>),
     /// Where each instruction sits: its block and its position within it.
-    pos: HashMap<Inst, (Block, usize)>,
+    pos: HashMap<Inst, (Block, usize), RandomState>,
     preds: Vec<Vec<Block>>,
     /// Reverse postorder from the entry. Unreachable blocks are absent.
     rpo: Vec<Block>,
@@ -101,7 +103,7 @@ impl<'a, 'gc> Verifier<'a, 'gc> {
             f,
             errs: Vec::new(),
             at: (None, None),
-            pos: HashMap::new(),
+            pos: HashMap::default(),
             preds: vec![Vec::new(); n],
             rpo: Vec::new(),
             rpo_num: vec![None; n],
@@ -847,7 +849,7 @@ impl<'a, 'gc> Verifier<'a, 'gc> {
     /// are sound to leave unrooted only because the collector never moves
     /// objects; the base keeps the allocation alive and the interior pointer
     /// stays valid.
-    fn anchored(&self, v: Val, roots: &HashSet<Val>) -> bool {
+    fn anchored(&self, v: Val, roots: &HashSet<Val, RandomState>) -> bool {
         let mut cur = v;
         // A use-def walk in an already-dominance-checked SSA graph cannot cycle;
         // the bound is belt and braces.
@@ -884,7 +886,7 @@ impl<'a, 'gc> Verifier<'a, 'gc> {
             if self.rpo_num[b.index()].is_none() {
                 continue;
             }
-            let mut live: HashSet<Val> = self
+            let mut live: HashSet<Val, RandomState> = self
                 .succs(b)
                 .iter()
                 .flat_map(|s| live_in[s.index()].iter().copied())
@@ -901,7 +903,7 @@ impl<'a, 'gc> Verifier<'a, 'gc> {
 
                 if d.op.effects().flags.contains(Flags::MAY_GC) {
                     let fs = d.fs.expect("a MAY_GC op carries a FrameState");
-                    let roots: HashSet<Val> = self.fs_values(fs).into_iter().collect();
+                    let roots: HashSet<Val, RandomState> = self.fs_values(fs).into_iter().collect();
                     // What survives the op, plus what the op holds while it runs.
                     let mut bad: Vec<Val> = live
                         .iter()
@@ -944,13 +946,14 @@ impl<'a, 'gc> Verifier<'a, 'gc> {
     /// Backward liveness to a fixpoint. Block parameters are definitions, so a
     /// value handed along an edge is a use in the *predecessor's* terminator and
     /// does not escape into the successor's live-in.
-    fn liveness(&self) -> Vec<HashSet<Val>> {
-        let mut live_in: Vec<HashSet<Val>> = vec![HashSet::new(); self.f.num_blocks()];
+    fn liveness(&self) -> Vec<HashSet<Val, RandomState>> {
+        let mut live_in: Vec<HashSet<Val, RandomState>> =
+            vec![HashSet::default(); self.f.num_blocks()];
         let mut changed = true;
         while changed {
             changed = false;
             for &b in self.rpo.iter().rev() {
-                let mut live: HashSet<Val> = self
+                let mut live: HashSet<Val, RandomState> = self
                     .succs(b)
                     .iter()
                     .flat_map(|s| live_in[s.index()].iter().copied())

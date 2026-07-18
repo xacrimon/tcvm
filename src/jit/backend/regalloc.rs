@@ -37,6 +37,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use foldhash::fast::RandomState;
+
 // --- the vocabulary ---------------------------------------------------------
 //
 // Owned here rather than in the machine IR, so that this module is the leaf: it
@@ -654,7 +656,7 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
         let bto = be * 2;
 
         // Live-out is what any successor needs live on entry.
-        let mut open: HashMap<VReg, u32> = HashMap::new();
+        let mut open: HashMap<VReg, u32, RandomState> = HashMap::default();
         for &s in &f.succs(b) {
             for &v in &live_in[s.0 as usize] {
                 open.entry(v).or_insert(bto);
@@ -692,7 +694,7 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
 
     // Copy affinities, both directions: whichever end is placed first pulls the
     // other toward its register.
-    let mut affin: HashMap<VReg, Vec<VReg>> = HashMap::new();
+    let mut affin: HashMap<VReg, Vec<VReg>, RandomState> = HashMap::default();
     for i in 0..f.num_insts() {
         if let Some((dk, uk)) = f.is_copy(i) {
             let d = f.defs(i)[dk].vreg;
@@ -1240,9 +1242,9 @@ pub fn verify(f: &impl RegallocFunc, ra: &Allocation) -> Result<(), String> {
     // state, so iterating to a fixpoint converges — and errors are only reported
     // after it does, because an optimistic intermediate state can name a location
     // as holding a value it does not yet hold.
-    type State = HashMap<Alloc, VReg>;
+    type State = HashMap<Alloc, VReg, RandomState>;
     let mut entry_state: Vec<Option<State>> = vec![None; f.num_blocks()];
-    entry_state[f.entry().0 as usize] = Some(State::new());
+    entry_state[f.entry().0 as usize] = Some(State::default());
 
     loop {
         let mut changed = false;
@@ -1287,9 +1289,9 @@ fn transfer(
     f: &impl RegallocFunc,
     ra: &Allocation,
     b: Block,
-    mut state: HashMap<Alloc, VReg>,
+    mut state: HashMap<Alloc, VReg, RandomState>,
     report: &mut impl FnMut(String) -> Result<(), String>,
-) -> Result<HashMap<Alloc, VReg>, String> {
+) -> Result<HashMap<Alloc, VReg, RandomState>, String> {
     for &i in f.block_insts(b) {
         for e in ra.edits_at(ProgPoint::before(i)) {
             apply_edit(&mut state, e);
@@ -1342,7 +1344,7 @@ fn transfer(
 /// afterward, and whatever `to` held is gone — which the checker notices at the
 /// next use of it, if there is one. A remat reconstitutes its named value in `to`
 /// from nothing, so it holds regardless of what was reachable before.
-fn apply_edit(state: &mut HashMap<Alloc, VReg>, e: &Edit) {
+fn apply_edit(state: &mut HashMap<Alloc, VReg, RandomState>, e: &Edit) {
     match *e {
         Edit::Move(m) => match state.get(&m.from).copied() {
             Some(v) => {
@@ -1423,8 +1425,8 @@ mod tests {
         temps: Vec<Vec<Operand>>,
         clobbers: Vec<Vec<PReg>>,
         classes: Vec<RegClass>,
-        phys: HashMap<VReg, PReg>,
-        remat: HashMap<VReg, Inst>,
+        phys: HashMap<VReg, PReg, RandomState>,
+        remat: HashMap<VReg, Inst, RandomState>,
     }
 
     impl TestFunc {

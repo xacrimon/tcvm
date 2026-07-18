@@ -35,6 +35,8 @@
 use std::collections::HashMap;
 use std::fmt::{self, Write};
 
+use foldhash::fast::RandomState;
+
 use crate::env::value::ValueKind;
 // The register allocator owns this vocabulary, not this module: it is the leaf
 // that neither the machine IR nor the encoder is allowed to reach into, so the
@@ -332,12 +334,12 @@ pub struct MFunc {
     /// Soft register preferences the target's `annotate` pass fills in — an entry
     /// argument would rather stay in the register it arrived in, eliding the copy
     /// off it. The allocator honours one when it fits and ignores it otherwise.
-    pub phys_hints: HashMap<VReg, PReg>,
+    pub phys_hints: HashMap<VReg, PReg, RandomState>,
     /// Values the target's `annotate` pass found rematerializable: defined once, by
     /// a pure constant that depends on no register, so a spill reload can replay the
     /// defining instruction instead of touching a slot. Maps the value to that
     /// instruction. The allocator reads it through [`RegallocFunc::remat`].
-    pub remat: HashMap<VReg, Inst>,
+    pub remat: HashMap<VReg, Inst, RandomState>,
 }
 
 impl MFunc {
@@ -352,8 +354,8 @@ impl MFunc {
             watchpoints: Vec::new(),
             pinned_regs: Vec::new(),
             max_lua_reg: 0,
-            phys_hints: HashMap::new(),
-            remat: HashMap::new(),
+            phys_hints: HashMap::default(),
+            remat: HashMap::default(),
         }
     }
 

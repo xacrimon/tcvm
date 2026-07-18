@@ -12,6 +12,8 @@
 
 use std::collections::HashMap;
 
+use foldhash::fast::RandomState;
+
 use crate::instruction::Instruction;
 
 /// A construct we've chosen not to compile. Since guard failure deopts to the
@@ -59,7 +61,7 @@ pub enum Term {
 pub struct Cfg {
     pub blocks: Vec<BcBlock>,
     /// Leader pc -> index into `blocks`.
-    pub index_of: HashMap<u32, usize>,
+    pub index_of: HashMap<u32, usize, RandomState>,
 }
 
 impl Cfg {
@@ -246,7 +248,7 @@ pub fn build(code: &[Instruction]) -> Result<Cfg, Unsupported> {
         });
     }
 
-    let index_of: HashMap<u32, usize> = blocks
+    let index_of: HashMap<u32, usize, RandomState> = blocks
         .iter()
         .enumerate()
         .map(|(n, b)| (b.start, n))
