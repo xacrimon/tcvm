@@ -444,19 +444,10 @@ async fn sort_less(
             return Ok(Plan::CallComp);
         }
         // Default order follows the `<` operator (no string→number coercion).
-        let prim = if let (Some(x), Some(y)) = (a.get_integer(), b.get_integer()) {
-            Some(x < y)
-        } else if let (Some(x), Some(y)) = (a.get_float(), b.get_float()) {
-            Some(x < y)
-        } else if let (Some(x), Some(y)) = (a.get_integer(), b.get_float()) {
-            Some((x as f64) < y)
-        } else if let (Some(x), Some(y)) = (a.get_float(), b.get_integer()) {
-            Some(x < (y as f64))
-        } else if let (Some(x), Some(y)) = (a.get_string(), b.get_string()) {
-            Some(x < y)
-        } else {
-            None
-        };
+        let prim = util::num_lt(a, b).or_else(|| match (a.get_string(), b.get_string()) {
+            (Some(x), Some(y)) => Some(x < y),
+            _ => None,
+        });
         if let Some(r) = prim {
             return Ok(Plan::Ready(r));
         }

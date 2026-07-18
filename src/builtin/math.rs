@@ -5,7 +5,7 @@ use rand_pcg::Pcg64;
 
 use crate::Context;
 use crate::builtin::util::{
-    check_integer, check_number, compare_error_msg, float_to_integer, num_to_value,
+    self, check_integer, check_number, compare_error_msg, float_to_integer, num_to_value,
 };
 use crate::env::{
     Error, Function, LuaString, NativeContext, NativeFn, Stack, Table, Userdata, Value,
@@ -267,18 +267,12 @@ fn select_extreme<'gc>(
         let v = stack.get(i);
         // max keeps `v` when best < v; min keeps `v` when v < best.
         let (lhs, rhs) = if want_min { (v, best) } else { (best, v) };
-        let lt = if let (Some(x), Some(y)) = (lhs.get_integer(), rhs.get_integer()) {
-            x < y
-        } else if let (Some(x), Some(y)) = (lhs.get_float(), rhs.get_float()) {
-            x < y
-        } else if let (Some(x), Some(y)) = (lhs.get_integer(), rhs.get_float()) {
-            (x as f64) < y
-        } else if let (Some(x), Some(y)) = (lhs.get_float(), rhs.get_integer()) {
-            x < (y as f64)
-        } else if let (Some(x), Some(y)) = (lhs.get_string(), rhs.get_string()) {
-            x < y
-        } else {
-            return Err(Error::from_str(nctx.ctx, &compare_error_msg(lhs, rhs)));
+        let lt = match util::num_lt(lhs, rhs) {
+            Some(r) => r,
+            None => match (lhs.get_string(), rhs.get_string()) {
+                (Some(x), Some(y)) => x < y,
+                _ => return Err(Error::from_str(nctx.ctx, &compare_error_msg(lhs, rhs))),
+            },
         };
         if lt {
             best = v;

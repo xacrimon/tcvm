@@ -343,6 +343,110 @@ fn float_eq_int(f: f64, i: i64) -> bool {
     float_to_integer(f) == Some(i)
 }
 
+/// Lua 5.5 `<` over two numbers (`lvm.c` `LTnum`), returning `None` when the
+/// operands are not both numbers so the caller keeps its string/metamethod
+/// path. The naive `i64 as f64` cast rounds large integers (e.g.
+/// `maxinteger` → `2^63`), so int/float pairs are compared exactly via the
+/// `LTintfloat`/`LTfloatint` ceil/floor trick instead.
+#[inline]
+pub(crate) fn num_lt<'gc>(a: Value<'gc>, b: Value<'gc>) -> Option<bool> {
+    use crate::env::ValueKind::{Float, Integer};
+    match (a.kind(), b.kind()) {
+        (Integer, Integer) => Some(a.get_integer().unwrap() < b.get_integer().unwrap()),
+        (Float, Float) => Some(a.get_float().unwrap() < b.get_float().unwrap()),
+        (Integer, Float) => Some(lt_int_float(
+            a.get_integer().unwrap(),
+            b.get_float().unwrap(),
+        )),
+        (Float, Integer) => Some(lt_float_int(
+            a.get_float().unwrap(),
+            b.get_integer().unwrap(),
+        )),
+        _ => None,
+    }
+}
+
+/// Lua 5.5 `<=` over two numbers (`lvm.c` `LEnum`); see [`num_lt`].
+#[inline]
+pub(crate) fn num_le<'gc>(a: Value<'gc>, b: Value<'gc>) -> Option<bool> {
+    use crate::env::ValueKind::{Float, Integer};
+    match (a.kind(), b.kind()) {
+        (Integer, Integer) => Some(a.get_integer().unwrap() <= b.get_integer().unwrap()),
+        (Float, Float) => Some(a.get_float().unwrap() <= b.get_float().unwrap()),
+        (Integer, Float) => Some(le_int_float(
+            a.get_integer().unwrap(),
+            b.get_float().unwrap(),
+        )),
+        (Float, Integer) => Some(le_float_int(
+            a.get_float().unwrap(),
+            b.get_integer().unwrap(),
+        )),
+        _ => None,
+    }
+}
+
+/// `|i|` representable exactly in `f64` (mantissa is 53 bits, so `|i| <= 2^53`).
+#[inline]
+fn int_fits_f64(i: i64) -> bool {
+    (-(1i64 << 53)..=(1i64 << 53)).contains(&i)
+}
+
+/// `lvm.c` `LTintfloat`: `i < f`. NaN-safe (all `<`/`<=` return false on NaN).
+#[inline]
+fn lt_int_float(i: i64, f: f64) -> bool {
+    if int_fits_f64(i) {
+        (i as f64) < f
+    } else {
+        // i < f  <=>  i < ceil(f); if ceil(f) is out of range, f's sign decides.
+        match float_to_integer(f.ceil()) {
+            Some(fi) => i < fi,
+            None => f > 0.0,
+        }
+    }
+}
+
+/// `lvm.c` `LEintfloat`: `i <= f`.
+#[inline]
+fn le_int_float(i: i64, f: f64) -> bool {
+    if int_fits_f64(i) {
+        (i as f64) <= f
+    } else {
+        // i <= f  <=>  i <= floor(f).
+        match float_to_integer(f.floor()) {
+            Some(fi) => i <= fi,
+            None => f > 0.0,
+        }
+    }
+}
+
+/// `lvm.c` `LTfloatint`: `f < i`.
+#[inline]
+fn lt_float_int(f: f64, i: i64) -> bool {
+    if int_fits_f64(i) {
+        f < (i as f64)
+    } else {
+        // f < i  <=>  floor(f) < i; if floor(f) is out of range, f's sign decides.
+        match float_to_integer(f.floor()) {
+            Some(fi) => fi < i,
+            None => f < 0.0,
+        }
+    }
+}
+
+/// `lvm.c` `LEfloatint`: `f <= i`.
+#[inline]
+fn le_float_int(f: f64, i: i64) -> bool {
+    if int_fits_f64(i) {
+        f <= (i as f64)
+    } else {
+        // f <= i  <=>  ceil(f) <= i.
+        match float_to_integer(f.ceil()) {
+            Some(fi) => fi <= i,
+            None => f < 0.0,
+        }
+    }
+}
+
 fn push_addr(out: &mut Vec<u8>, kind: &str, ptr: *const ()) {
     out.extend_from_slice(kind.as_bytes());
     out.extend_from_slice(b": ");
