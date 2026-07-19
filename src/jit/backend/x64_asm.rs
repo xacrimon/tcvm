@@ -910,6 +910,11 @@ mod tests {
     /// Every encoding, against the GNU assembler. Execution proves the semantics;
     /// this catches a byte that happens to run while differing from the canonical
     /// form (a stray prefix, say), which disassembles as garbage under objdump.
+    ///
+    /// Linux-only: it is a differential test against GNU `as`/`objdump`. On macOS
+    /// (where the x86-64 backend runs under Rosetta) the system `as` is LLVM's and
+    /// rejects the GAS-syntax reference, so there is no canonical form to compare to.
+    #[cfg(target_os = "linux")]
     #[test]
     fn matches_system_assembler() {
         use std::io::Write;

@@ -233,6 +233,10 @@ pub struct MInst {
     /// immediate's holder, a macro-op's working registers. Filled in after isel by
     /// the target's `annotate` pass, since how many are needed is an encoding fact.
     pub temps: Vec<Operand>,
+    /// Physical registers this instruction destroys without defining — `idiv`'s
+    /// `rdx`, a macro-op's internal scratch. The allocator keeps live values out of
+    /// them across the instruction. Filled in by `annotate`.
+    pub clobbers: Vec<PReg>,
 }
 
 impl MInst {
@@ -246,6 +250,7 @@ impl MInst {
             defs: defs.into_iter().map(Operand::reg).collect(),
             uses: uses.into_iter().map(Operand::reg).collect(),
             temps: Vec::new(),
+            clobbers: Vec::new(),
         }
     }
 
@@ -449,6 +454,10 @@ impl RegallocFunc for MFunc {
 
     fn temps(&self, i: Inst) -> &[Operand] {
         &self.insts[i].temps
+    }
+
+    fn clobbers(&self, i: Inst) -> &[PReg] {
+        &self.insts[i].clobbers
     }
 
     fn phys_hint(&self, v: VReg) -> Option<PReg> {

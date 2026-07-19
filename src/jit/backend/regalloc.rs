@@ -675,10 +675,23 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
                 let end = open.remove(&o.vreg).unwrap_or(slot + 2);
                 raw[o.vreg.0 as usize].push((slot + 1, end));
             }
-            for o in f.uses(i) {
+            // A two-address def reuses exactly one input's register; every *other*
+            // input must survive across the def, or the op would clobber it.
+            let reused_uk = f.defs(i).iter().find_map(|o| match o.constraint {
+                Constraint::Reuse(uk) => Some(uk),
+                _ => None,
+            });
+            for (k, o) in f.uses(i).iter().enumerate() {
                 // First seen going backward is the latest use, hence the furthest
-                // end; keep it.
-                open.entry(o.vreg).or_insert(slot + 1);
+                // end; keep it. The reused input ends at the def slot so it can
+                // coalesce; a non-reused input at a reuse op extends one slot past,
+                // to interfere with the def and land elsewhere.
+                let end = if reused_uk.is_some() && Some(k) != reused_uk {
+                    slot + 2
+                } else {
+                    slot + 1
+                };
+                open.entry(o.vreg).or_insert(end);
             }
         }
 
@@ -693,7 +706,9 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
     let ranges: Vec<Vec<(u32, u32)>> = raw.into_iter().map(merge_ranges).collect();
 
     // Copy affinities, both directions: whichever end is placed first pulls the
-    // other toward its register.
+    // other toward its register. A `Reuse` def is coalesced the same way — put it
+    // in the register of the source it reuses so the two-address op needs no copy —
+    // but where a copy affinity is a hint, `Reuse` is enforced in the reload phase.
     let mut affin: HashMap<VReg, Vec<VReg>, RandomState> = HashMap::default();
     for i in 0..f.num_insts() {
         if let Some((dk, uk)) = f.is_copy(i) {
@@ -702,6 +717,13 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
             affin.entry(d).or_default().push(s);
             affin.entry(s).or_default().push(d);
         }
+        for o in f.defs(i) {
+            if let Constraint::Reuse(uk) = o.constraint {
+                let s = f.uses(i)[uk].vreg;
+                affin.entry(o.vreg).or_default().push(s);
+                affin.entry(s).or_default().push(o.vreg);
+            }
+        }
     }
 
     // Clobbers, as instruction-wide register reservations. A clobbered register is
@@ -709,11 +731,22 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
     // macro-op's exit stub writes it — so a value whose interval covers that slot
     // cannot live there. Stored by slot start; the two sub-slots are `lo` and
     // `lo + 1`.
+    //
+    // A `Fixed(preg)` operand reserves its register the same way, but for the scan
+    // only: no *other* value may hold `preg` across the instruction (the reload
+    // phase then moves the fixed value in and out of `preg`). Unlike a real clobber
+    // this is not shown to the client's checker — the fixed mention legitimately
+    // writes `preg` — so it is added here rather than to `clobbers(i)`.
     let mut clobbers: Vec<(u32, PReg)> = Vec::new();
     for (i, &p) in pos.iter().enumerate() {
         let lo = p * 2;
         for &r in f.clobbers(i) {
             clobbers.push((lo, r));
+        }
+        for o in f.defs(i).iter().chain(f.uses(i)) {
+            if let Constraint::Fixed(r) = o.constraint {
+                clobbers.push((lo, r));
+            }
         }
     }
 
@@ -991,99 +1024,248 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
             remat_spilled[v.0 as usize] || matches!(loc[v.0 as usize], Some(Alloc::Spill(_)))
         };
 
+        // Reserve every fixed register up front, so an ordinary reload for another
+        // operand never lands on one before the fixed operand claims it.
+        for o in f.defs(i).iter().chain(f.uses(i)) {
+            if let Constraint::Fixed(r) = o.constraint
+                && !used.contains(&r)
+            {
+                used.push(r);
+            }
+        }
+
+        // Where each use ended up, so a `Reuse` def can take the same register.
+        let mut use_final: Vec<Alloc> = vec![Alloc::Spill(u32::MAX); f.uses(i).len()];
+
+        // The input a two-address def reuses is handled entirely by that def (it is
+        // moved into the def's register there), so the use loop leaves it alone.
+        let reused_uk = f.defs(i).iter().find_map(|o| match o.constraint {
+            Constraint::Reuse(uk) => Some(uk),
+            _ => None,
+        });
+
         for (k, o) in f.uses(i).iter().enumerate() {
-            if !spilled(o.vreg) || o.constraint != Constraint::Reg {
+            if Some(k) == reused_uk {
                 continue;
             }
             let class = f.class(o.vreg);
-            let (r, bounce) = reload_reg(
-                &mut b,
-                &mut spills,
-                ProgPoint::before(i),
-                p * 2,
-                class,
-                &used,
-                env,
-                &loc,
-                &ranges,
-            )?;
-            used.push(r);
-            // Save (from `reload_reg`) is already in; the load/replay follows it, and
-            // the restore follows the load — all at their right points.
-            if remat_spilled[o.vreg.0 as usize] {
-                let src = remat_src[o.vreg.0 as usize].unwrap();
-                b.edit(
-                    ProgPoint::before(i),
-                    Edit::Remat {
-                        val: o.vreg,
-                        src,
-                        to: r,
-                    },
-                );
-            } else if let Some(Alloc::Spill(s)) = loc[o.vreg.0 as usize] {
-                b.edit(
-                    ProgPoint::before(i),
-                    Edit::Move(Move {
-                        from: Alloc::Spill(s),
-                        to: Alloc::Reg(r),
+            match o.constraint {
+                // The instruction demands this value in a specific register: move it
+                // there (or replay it there), leaving its home untouched.
+                Constraint::Fixed(preg) => {
+                    if remat_spilled[o.vreg.0 as usize] {
+                        let src = remat_src[o.vreg.0 as usize].unwrap();
+                        b.edit(
+                            ProgPoint::before(i),
+                            Edit::Remat {
+                                val: o.vreg,
+                                src,
+                                to: preg,
+                            },
+                        );
+                    } else {
+                        let from = loc[o.vreg.0 as usize].expect("a mentioned value has a home");
+                        b.edit(
+                            ProgPoint::before(i),
+                            Edit::Move(Move {
+                                from,
+                                to: Alloc::Reg(preg),
+                                class,
+                            }),
+                        );
+                    }
+                    b.set_use(i, k, Alloc::Reg(preg));
+                    use_final[k] = Alloc::Reg(preg);
+                }
+                Constraint::Reg if spilled(o.vreg) => {
+                    let (r, bounce) = reload_reg(
+                        &mut b,
+                        &mut spills,
+                        ProgPoint::before(i),
+                        p * 2,
                         class,
-                    }),
-                );
-            }
-            b.set_use(i, k, Alloc::Reg(r));
-            if let Some(bs) = bounce {
-                b.edit(
-                    ProgPoint::after(i),
-                    Edit::Move(Move {
-                        from: Alloc::Spill(bs),
-                        to: Alloc::Reg(r),
-                        class,
-                    }),
-                );
+                        &used,
+                        env,
+                        &loc,
+                        &ranges,
+                    )?;
+                    used.push(r);
+                    // Save (from `reload_reg`) is already in; the load/replay follows
+                    // it, and the restore follows the load — all at their right points.
+                    if remat_spilled[o.vreg.0 as usize] {
+                        let src = remat_src[o.vreg.0 as usize].unwrap();
+                        b.edit(
+                            ProgPoint::before(i),
+                            Edit::Remat {
+                                val: o.vreg,
+                                src,
+                                to: r,
+                            },
+                        );
+                    } else if let Some(Alloc::Spill(s)) = loc[o.vreg.0 as usize] {
+                        b.edit(
+                            ProgPoint::before(i),
+                            Edit::Move(Move {
+                                from: Alloc::Spill(s),
+                                to: Alloc::Reg(r),
+                                class,
+                            }),
+                        );
+                    }
+                    b.set_use(i, k, Alloc::Reg(r));
+                    use_final[k] = Alloc::Reg(r);
+                    if let Some(bs) = bounce {
+                        b.edit(
+                            ProgPoint::after(i),
+                            Edit::Move(Move {
+                                from: Alloc::Spill(bs),
+                                to: Alloc::Reg(r),
+                                class,
+                            }),
+                        );
+                    }
+                }
+                // A `Reg` use already in a register, or an `Any` use: the scan put it
+                // where it belongs. Record it for a possible `Reuse`.
+                _ => {
+                    use_final[k] = loc[o.vreg.0 as usize].expect("a mentioned value has a home");
+                }
             }
         }
 
         for (k, o) in f.defs(i).iter().enumerate() {
-            if !spilled(o.vreg) || o.constraint != Constraint::Reg {
-                continue;
-            }
             let class = f.class(o.vreg);
-            let (r, bounce) = reload_reg(
-                &mut b,
-                &mut spills,
-                ProgPoint::before(i),
-                p * 2 + 1,
-                class,
-                &used,
-                env,
-                &loc,
-                &ranges,
-            )?;
-            used.push(r);
-            b.set_def(i, k, Alloc::Reg(r));
-            // A rematerializable def computes its constant into `r` and drops it —
-            // every reader replays it instead — so there is nothing to store.
-            if !remat_spilled[o.vreg.0 as usize]
-                && let Some(Alloc::Spill(s)) = loc[o.vreg.0 as usize]
-            {
-                b.edit(
-                    ProgPoint::after(i),
-                    Edit::Move(Move {
-                        from: Alloc::Reg(r),
-                        to: Alloc::Spill(s),
+            match o.constraint {
+                // Written into a specific register; ferry it to its home afterward.
+                Constraint::Fixed(preg) => {
+                    b.set_def(i, k, Alloc::Reg(preg));
+                    if !remat_spilled[o.vreg.0 as usize] {
+                        let home = loc[o.vreg.0 as usize].expect("a defined value has a home");
+                        if home != Alloc::Reg(preg) {
+                            b.edit(
+                                ProgPoint::after(i),
+                                Edit::Move(Move {
+                                    from: Alloc::Reg(preg),
+                                    to: home,
+                                    class,
+                                }),
+                            );
+                        }
+                    }
+                }
+                // A two-address def: the op reads and writes one register `d`. Bring
+                // the reused source into `d` first — a no-op once coalescing has put
+                // the def in a dead source's register — so the op overwrites `d` (the
+                // result) while the source survives untouched in its own home. Because
+                // the source is copied rather than consumed, it may be live afterward;
+                // the non-reused inputs were made to interfere with the def, so `d` is
+                // clear of them.
+                Constraint::Reuse(uk) => {
+                    let src = f.uses(i)[uk].vreg;
+                    let (d, bounce) = match loc[o.vreg.0 as usize] {
+                        Some(Alloc::Reg(r)) => (r, None),
+                        // A spilled two-address result still computes in a register.
+                        _ => reload_reg(
+                            &mut b,
+                            &mut spills,
+                            ProgPoint::before(i),
+                            p * 2 + 1,
+                            class,
+                            &used,
+                            env,
+                            &loc,
+                            &ranges,
+                        )?,
+                    };
+                    used.push(d);
+                    if remat_spilled[src.0 as usize] {
+                        let s = remat_src[src.0 as usize].unwrap();
+                        b.edit(
+                            ProgPoint::before(i),
+                            Edit::Remat {
+                                val: src,
+                                src: s,
+                                to: d,
+                            },
+                        );
+                    } else {
+                        let from = loc[src.0 as usize].expect("a reused source has a home");
+                        if from != Alloc::Reg(d) {
+                            b.edit(
+                                ProgPoint::before(i),
+                                Edit::Move(Move {
+                                    from,
+                                    to: Alloc::Reg(d),
+                                    class,
+                                }),
+                            );
+                        }
+                    }
+                    b.set_use(i, uk, Alloc::Reg(d));
+                    b.set_def(i, k, Alloc::Reg(d));
+                    if !remat_spilled[o.vreg.0 as usize]
+                        && let Some(Alloc::Spill(s)) = loc[o.vreg.0 as usize]
+                    {
+                        b.edit(
+                            ProgPoint::after(i),
+                            Edit::Move(Move {
+                                from: Alloc::Reg(d),
+                                to: Alloc::Spill(s),
+                                class,
+                            }),
+                        );
+                    }
+                    if let Some(bs) = bounce {
+                        b.edit(
+                            ProgPoint::after(i),
+                            Edit::Move(Move {
+                                from: Alloc::Spill(bs),
+                                to: Alloc::Reg(d),
+                                class,
+                            }),
+                        );
+                    }
+                }
+                Constraint::Reg if spilled(o.vreg) => {
+                    let (r, bounce) = reload_reg(
+                        &mut b,
+                        &mut spills,
+                        ProgPoint::before(i),
+                        p * 2 + 1,
                         class,
-                    }),
-                );
-            }
-            if let Some(bs) = bounce {
-                b.edit(
-                    ProgPoint::after(i),
-                    Edit::Move(Move {
-                        from: Alloc::Spill(bs),
-                        to: Alloc::Reg(r),
-                        class,
-                    }),
-                );
+                        &used,
+                        env,
+                        &loc,
+                        &ranges,
+                    )?;
+                    used.push(r);
+                    b.set_def(i, k, Alloc::Reg(r));
+                    // A rematerializable def computes its constant into `r` and drops
+                    // it — every reader replays it instead — so there is nothing to store.
+                    if !remat_spilled[o.vreg.0 as usize]
+                        && let Some(Alloc::Spill(s)) = loc[o.vreg.0 as usize]
+                    {
+                        b.edit(
+                            ProgPoint::after(i),
+                            Edit::Move(Move {
+                                from: Alloc::Reg(r),
+                                to: Alloc::Spill(s),
+                                class,
+                            }),
+                        );
+                    }
+                    if let Some(bs) = bounce {
+                        b.edit(
+                            ProgPoint::after(i),
+                            Edit::Move(Move {
+                                from: Alloc::Spill(bs),
+                                to: Alloc::Reg(r),
+                                class,
+                            }),
+                        );
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -1148,15 +1330,15 @@ fn reload_reg(
     Ok((r, Some(bs)))
 }
 
-/// The allocator honours `Any`, `Reg`, and clobbers. It does not yet honour a
-/// `Fixed`/`Reuse` operand — x86 will need both — so it declines rather than
-/// allocating around one and producing code that runs and is wrong.
+/// The allocator honours `Any`, `Reg`, `Fixed`, and `Reuse`. The one shape it
+/// rejects is a `Reuse` on a *use*: reuse is a def-only relationship — a
+/// two-address def taking the register of one of its sources — so a `Reuse` use
+/// is a client bug that would otherwise be silently ignored.
 fn reject_unsupported(f: &impl RegallocFunc) -> Result<(), RegallocError> {
     for i in 0..f.num_insts() {
-        for o in f.defs(i).iter().chain(f.uses(i)) {
-            match o.constraint {
-                Constraint::Any | Constraint::Reg => {}
-                c => return Err(RegallocError::UnsupportedConstraint(c)),
+        for o in f.uses(i) {
+            if let Constraint::Reuse(_) = o.constraint {
+                return Err(RegallocError::UnsupportedConstraint(o.constraint));
             }
         }
     }
@@ -1801,28 +1983,155 @@ mod tests {
         assert!(err.contains("nothing"), "{err}");
     }
 
-    /// The allocator declines what it cannot honour, rather than allocating
-    /// around it and producing code that runs and is wrong.
+    /// `Reuse` describes a def taking a source's register; on a *use* it is
+    /// meaningless, and the allocator says so rather than ignoring it.
     #[test]
-    fn exotic_constraints_are_declined() {
-        let x0 = PReg::new(RegClass::Int, 0);
-        for constraint in [Constraint::Fixed(x0), Constraint::Reuse(0)] {
-            let mut f = TestFunc::default();
-            let b = f.block();
-            let (v, w) = (f.int(), f.int());
-            f.inst(b, vec![Operand::any(w)], vec![]);
-            f.inst(
-                b,
-                vec![Operand {
-                    vreg: v,
-                    constraint,
-                }],
-                vec![Operand::any(w)],
-            );
+    fn a_reuse_on_a_use_is_declined() {
+        let mut f = TestFunc::default();
+        let b = f.block();
+        let v = f.int();
+        f.inst(b, vec![Operand::any(v)], vec![]);
+        f.inst(b, vec![], vec![Operand::reuse(v, 0)]);
 
-            let declined = allocate(&f, &env(4)).err().expect("must decline");
-            assert_eq!(declined, RegallocError::UnsupportedConstraint(constraint));
-        }
+        assert_eq!(
+            allocate(&f, &env(4)).err(),
+            Some(RegallocError::UnsupportedConstraint(Constraint::Reuse(0))),
+            "reuse is a def-only relationship"
+        );
+    }
+
+    /// A `Fixed` use puts the value in the demanded register for the instruction,
+    /// with a move off its home to get it there, and leaves the home alone.
+    #[test]
+    fn a_fixed_use_moves_the_value_into_its_register() {
+        let mut f = TestFunc::default();
+        let b = f.block();
+        let v = f.int();
+        let x0 = PReg::new(RegClass::Int, 0);
+
+        f.inst(b, vec![Operand::any(v)], vec![]);
+        let u = f.inst(b, vec![], vec![Operand::fixed(v, x0)]);
+
+        let ra = allocate(&f, &env(4)).expect("a fixed operand is honoured");
+        verify(&f, &ra).expect("the value really is in x0 at the use");
+        assert_eq!(
+            ra.use_(u, 0),
+            Alloc::Reg(x0),
+            "the use reads x0 as demanded"
+        );
+        assert!(
+            ra.edits_at(ProgPoint::before(u)).next().is_some(),
+            "a move brings the value into x0 before the use"
+        );
+    }
+
+    /// A `Fixed` def is written in the demanded register and then ferried to the
+    /// value's home, which — being clear of that register — a later use reads.
+    #[test]
+    fn a_fixed_def_ferries_the_value_out_of_its_register() {
+        let mut f = TestFunc::default();
+        let b = f.block();
+        let v = f.int();
+        let x0 = PReg::new(RegClass::Int, 0);
+
+        let d = f.inst(b, vec![Operand::fixed(v, x0)], vec![]);
+        let u = f.inst(b, vec![], vec![Operand::reg(v)]);
+
+        let ra = allocate(&f, &env(4)).expect("a fixed def is honoured");
+        verify(&f, &ra).expect("the result is carried out of x0 intact");
+        assert_eq!(ra.def(d, 0), Alloc::Reg(x0), "the def writes x0");
+        assert_ne!(ra.use_(u, 0), Alloc::Reg(x0), "the home is clear of x0");
+        assert!(
+            ra.edits_at(ProgPoint::after(d)).next().is_some(),
+            "a move carries the result out of x0"
+        );
+    }
+
+    /// A value live across a fixed-register instruction must dodge that register —
+    /// the fixed mention would otherwise overwrite it.
+    #[test]
+    fn a_fixed_register_is_kept_clear_of_a_live_value() {
+        let mut f = TestFunc::default();
+        let b = f.block();
+        let (carried, v) = (f.int(), f.int());
+        let x0 = PReg::new(RegClass::Int, 0);
+
+        f.inst(b, vec![Operand::any(carried)], vec![]);
+        f.inst(b, vec![Operand::any(v)], vec![]);
+        f.inst(b, vec![], vec![Operand::fixed(v, x0)]); // v pinned to x0 here
+        f.inst(b, vec![], vec![Operand::any(carried)]); // carried still needed
+
+        let ra = allocate(&f, &env(4)).expect("room to keep carried clear of x0");
+        verify(&f, &ra).expect("carried survives the fixed use");
+        assert_ne!(
+            ra.use_(3, 0),
+            Alloc::Reg(x0),
+            "carried is live across the fixed use, so it dodges x0"
+        );
+    }
+
+    /// A two-address `Reuse` def takes its dead source's register: the def and the
+    /// reused use share a register, and coalescing removes any separate move.
+    #[test]
+    fn a_reuse_def_takes_its_dead_sources_register() {
+        let mut f = TestFunc::default();
+        let b = f.block();
+        let (s1, s2, dst) = (f.int(), f.int(), f.int());
+
+        f.inst(b, vec![Operand::any(s1)], vec![]);
+        f.inst(b, vec![Operand::any(s2)], vec![]);
+        // dst = s1 OP s2 as one two-address op; s1 dies here.
+        let op = f.inst(
+            b,
+            vec![Operand::reuse(dst, 0)],
+            vec![Operand::reg(s1), Operand::reg(s2)],
+        );
+        f.inst(b, vec![], vec![Operand::any(dst)]);
+
+        let ra = allocate(&f, &env(4)).expect("a reuse def is honoured");
+        verify(&f, &ra).expect("the two-address result is where the reuse says");
+        assert_eq!(
+            ra.def(op, 0),
+            ra.use_(op, 0),
+            "the def and its reused source share a register"
+        );
+        assert!(
+            ra.edits_at(ProgPoint::after(op)).next().is_none(),
+            "coalescing put the def in its reused register: no reconciling move"
+        );
+    }
+
+    /// A reused source that is still live is *copied* into the def's register, not
+    /// consumed: the two-address op overwrites the copy while the original survives
+    /// for its later use. The def still shares a register with the reused operand.
+    #[test]
+    fn a_reuse_copies_a_live_source_instead_of_consuming_it() {
+        let mut f = TestFunc::default();
+        let b = f.block();
+        let (s1, s2, dst) = (f.int(), f.int(), f.int());
+
+        f.inst(b, vec![Operand::any(s1)], vec![]);
+        f.inst(b, vec![Operand::any(s2)], vec![]);
+        let op = f.inst(
+            b,
+            vec![Operand::reuse(dst, 0)],
+            vec![Operand::reg(s1), Operand::reg(s2)],
+        );
+        f.inst(b, vec![], vec![Operand::any(dst)]);
+        let us1 = f.inst(b, vec![], vec![Operand::reg(s1)]); // s1 still live afterward
+
+        let ra = allocate(&f, &env(4)).expect("a live reused source is handled");
+        verify(&f, &ra).expect("s1 survives the op that reused it");
+        assert_eq!(
+            ra.def(op, 0),
+            ra.use_(op, 0),
+            "the def still shares the reused operand's register"
+        );
+        assert_ne!(
+            ra.def(op, 0),
+            ra.use_(us1, 0),
+            "but that register is a copy — s1's own register is untouched"
+        );
     }
 
     /// The constraints have no allocator behind them yet, but they are not inert:

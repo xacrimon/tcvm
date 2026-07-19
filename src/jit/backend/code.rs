@@ -31,7 +31,7 @@
 use std::io;
 use std::ptr::NonNull;
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     // libSystem Mach VM calls, not surfaced by the `libc` crate.
     fn mach_vm_remap(
@@ -182,7 +182,9 @@ fn page_size() -> usize {
 /// 64 KiB-aligned segment). The RX alias needs no such alignment — the allocator
 /// only ever masks the RW pointer to recover a segment header — so its remap is
 /// left to land wherever the kernel picks.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+// The Mach aliasing dance is architecture-neutral — only [`sync_icache`] differs
+// between aarch64 and x86-64 — so it serves x86-64 macOS (e.g. under Rosetta) too.
+#[cfg(target_os = "macos")]
 // `mach_task_self` / `mach_vm_map` are deprecated in `libc` in favour of the
 // `mach2` crate; the underlying calls are stable and a whole dependency for two
 // of them is not worth it.
@@ -264,7 +266,7 @@ pub(crate) fn map_dual(size: usize, align_mask: u64) -> io::Result<(NonNull<u8>,
 
 /// `VM_INHERIT_NONE` — not surfaced by `libc`. JIT pages are not inherited
 /// across `fork`.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(target_os = "macos")]
 const VM_INHERIT_NONE: libc::vm_inherit_t = 2;
 
 /// Linux dual mapping. Two `MAP_SHARED` views of one anonymous `memfd` give the
@@ -462,7 +464,7 @@ pub(crate) unsafe fn sync_icache(rw: *mut u8, rx: *mut u8, len: usize) {
 /// core could fetch stale bytes that were still sitting in the store buffer. A
 /// full fence drains it; nothing else is needed, and the aliases share physical
 /// pages so no address translation of the written range matters here.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn sync_icache(_rw: *mut u8, _rx: *mut u8, _len: usize) {
     use std::arch::asm;
     unsafe { asm!("mfence", options(nostack, preserves_flags)) };
