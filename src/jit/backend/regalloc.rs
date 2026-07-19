@@ -681,7 +681,57 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
 
     // Merge once; the scan reads these per class, and the reload phase reads them
     // again to know which register is free where.
-    let ranges: Vec<Vec<(u32, u32)>> = raw.into_iter().map(merge_ranges).collect();
+    let mut ranges: Vec<Vec<(u32, u32)>> = raw.into_iter().map(merge_ranges).collect();
+
+    let ord_idx = {
+        let mut m = vec![0u32; f.num_blocks()];
+        for (k, &b) in order.iter().enumerate() {
+            m[b.0 as usize] = k as u32;
+        }
+        m
+    };
+    let mut loops: Vec<(u32, u32)> = Vec::new();
+    for &b in &order {
+        for s in f.succs(b) {
+            if ord_idx[s.0 as usize] <= ord_idx[b.0 as usize] {
+                loops.push((span[s.0 as usize].0 * 2, span[b.0 as usize].1 * 2));
+            }
+        }
+    }
+
+    // A value may be merged with another only if a single location can serve every
+    // mention of both. Three cannot: a temp is scratch with no home of its own, a
+    // rematerializable value has no home at all (it is replayed), and a value with
+    // a fixed-register mention is already pinned somewhere a merge could contradict.
+    let eligible: Vec<bool> = {
+        let mut ok = vec![true; f.num_vregs()];
+        for i in 0..f.num_insts() {
+            for o in f.temps(i) {
+                ok[o.vreg.0 as usize] = false;
+            }
+            for o in f.defs(i).iter().chain(f.uses(i)) {
+                if matches!(o.constraint, Constraint::Fixed(_)) {
+                    ok[o.vreg.0 as usize] = false;
+                }
+            }
+        }
+        for v in 0..f.num_vregs() {
+            if f.remat(VReg(v as u32)).is_some() {
+                ok[v] = false;
+            }
+        }
+        ok
+    };
+
+    let mut sets = coalesce(f, &order, &ranges, &span, &loops, &eligible);
+    // Every member reports its *set's* live range from here on: the set holds one
+    // location for that whole extent, so anything asking "is this register busy at
+    // p" has to see it. Only the leader is handed to the scan, below.
+    for v in 0..f.num_vregs() {
+        let leader = sets.find(v as u32);
+        ranges[v] = sets.ranges[leader as usize].clone();
+    }
+    let ranges = ranges;
 
     // Copy affinities, both directions: whichever end is placed first pulls the
     // other toward its register. A `Reuse` def is coalesced the same way — put it
@@ -697,23 +747,6 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
             }
         }
     }
-    // An edge is a copy too, and the machine IR holds no instruction for it — the
-    // only record is the argument list. Without this an argument and its parameter
-    // are pulled together by nothing at all, and share a register only when the
-    // scan's arbitrary choice happens to agree on both sides of the edge. Every
-    // pair here is a move `resolve_edges` then does not have to emit.
-    for b in (0..f.num_blocks()).map(|b| Block(b as u32)) {
-        let args = f.jump_args(b);
-        if args.is_empty() {
-            continue;
-        }
-        let succ = f.succs(b)[0];
-        for (&a, &p) in args.iter().zip(f.block_params(succ)) {
-            affin.entry(a).or_default().push(p);
-            affin.entry(p).or_default().push(a);
-        }
-    }
-
     // Clobbers, as instruction-wide register reservations. A clobbered register is
     // busy across the whole slot `[2·pos, 2·pos + 2)` — a call destroys it, a
     // macro-op's exit stub writes it — so a value whose interval covers that slot
@@ -752,21 +785,6 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
     // already placed when its predecessor `b` is) makes `[start(s), end(b))` a loop
     // body. A value whose live range meets a loop range is expensive to spill there
     // — the reload lands in the loop — and nesting counts once per enclosing loop.
-    let ord_idx = {
-        let mut m = vec![0u32; f.num_blocks()];
-        for (k, &b) in order.iter().enumerate() {
-            m[b.0 as usize] = k as u32;
-        }
-        m
-    };
-    let mut loops: Vec<(u32, u32)> = Vec::new();
-    for &b in &order {
-        for s in f.succs(b) {
-            if ord_idx[s.0 as usize] <= ord_idx[b.0 as usize] {
-                loops.push((span[s.0 as usize].0 * 2, span[b.0 as usize].1 * 2));
-            }
-        }
-    }
     let vreg_loop: Vec<u32> = (0..f.num_vregs())
         .map(|v| {
             if ranges[v].is_empty() {
@@ -805,7 +823,11 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
 
         let mut ivs: Vec<Segs> = (0..f.num_vregs() as u32)
             .map(VReg)
-            .filter(|v| f.class(*v) == class && !ranges[v.0 as usize].is_empty())
+            .filter(|v| {
+                // One interval per *set*, not per value: a merged set has one
+                // location, so its members must not compete with each other.
+                sets.find(v.0) == v.0 && f.class(*v) == class && !ranges[v.0 as usize].is_empty()
+            })
             .map(|v| Segs {
                 v,
                 ranges: ranges[v.0 as usize].clone(),
@@ -974,6 +996,16 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
                 loc[victim.0 as usize] = Some(Alloc::Spill(spills));
                 spills += 1;
             }
+        }
+    }
+
+    // Members follow their leader: that is what makes the merge real rather than a
+    // preference, and what makes an edge's `from == to` and cost nothing.
+    for v in 0..f.num_vregs() {
+        let leader = sets.find(v as u32) as usize;
+        if leader != v {
+            loc[v] = loc[leader];
+            remat_spilled[v] = remat_spilled[leader];
         }
     }
 
@@ -1352,6 +1384,141 @@ fn reject_unsupported(f: &impl RegallocFunc) -> Result<(), RegallocError> {
         }
     }
     Ok(())
+}
+
+/// Values merged into a single allocation unit, by union-find.
+///
+/// The point of coalescing on SSA form: an edge is a copy with no instruction to
+/// hold it, so a value and the parameter it feeds are two names for one thing. If
+/// they get one location the edge costs nothing; if they get two, it costs a move
+/// — and, once the register file is full, a move with nowhere to route through.
+///
+/// The merge is *not* a hint. A hint is consulted while placing a value and
+/// dropped when the register it wanted is taken, which is exactly what happens
+/// under the pressure that makes coalescing matter. A merged set is one interval
+/// with one location, so it cannot come apart. It also lowers pressure directly:
+/// twenty-eight accumulators become twenty-eight units rather than the fifty-odd
+/// values naming them.
+///
+/// The one thing a merge may never do is put two values that are live at the same
+/// time in one register, so a pair is merged only when their live ranges are
+/// disjoint. Following regalloc3, the merge order is by priority rather than
+/// arbitrary: merging A with B can make A–C impossible, so the edges that would
+/// execute most often get first claim.
+struct Coalesced {
+    parent: Vec<u32>,
+    /// Merged live ranges, valid for a set's leader.
+    ranges: Vec<Vec<(u32, u32)>>,
+}
+
+impl Coalesced {
+    fn find(&mut self, v: u32) -> u32 {
+        let mut r = v;
+        while self.parent[r as usize] != r {
+            r = self.parent[r as usize];
+        }
+        // Path compression, so a long chain is walked once.
+        let mut c = v;
+        while self.parent[c as usize] != r {
+            let next = self.parent[c as usize];
+            self.parent[c as usize] = r;
+            c = next;
+        }
+        r
+    }
+
+    /// Merge the sets of `a` and `b` if their live ranges are disjoint.
+    fn try_union(&mut self, a: VReg, b: VReg) -> bool {
+        let (ra, rb) = (self.find(a.0), self.find(b.0));
+        if ra == rb {
+            return true;
+        }
+
+        if overlap(&self.ranges[ra as usize], &self.ranges[rb as usize]) {
+            return false;
+        }
+        let merged = union_ranges(&self.ranges[ra as usize], &self.ranges[rb as usize]);
+        self.parent[rb as usize] = ra;
+        self.ranges[ra as usize] = merged;
+        self.ranges[rb as usize] = Vec::new();
+        true
+    }
+}
+
+/// Whether two sorted, disjoint range lists share any position. One lockstep walk.
+fn overlap(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i].0 >= b[j].1 {
+            j += 1;
+        } else if a[i].1 <= b[j].0 {
+            i += 1;
+        } else {
+            return true;
+        }
+    }
+    false
+}
+
+fn union_ranges(a: &[(u32, u32)], b: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() || j < b.len() {
+        let take_a = j >= b.len() || (i < a.len() && a[i].0 <= b[j].0);
+        out.push(if take_a {
+            i += 1;
+            a[i - 1]
+        } else {
+            j += 1;
+            b[j - 1]
+        });
+    }
+    out
+}
+
+/// Merge each edge's arguments with the parameters they feed.
+///
+/// `loop_depth` orders the work: an edge inside a loop executes more often than
+/// one outside it, and since an early merge can block a later one, the expensive
+/// edges get first refusal.
+fn coalesce(
+    f: &impl RegallocFunc,
+    order: &[Block],
+    ranges: &[Vec<(u32, u32)>],
+    span: &[(u32, u32)],
+    loops: &[(u32, u32)],
+    eligible: &[bool],
+) -> Coalesced {
+    let mut c = Coalesced {
+        parent: (0..f.num_vregs() as u32).collect(),
+        ranges: ranges.to_vec(),
+    };
+
+    let depth = |b: Block| {
+        let (lo, hi) = span[b.0 as usize];
+        loops
+            .iter()
+            .filter(|&&(a, z)| lo * 2 < z && a < hi * 2)
+            .count()
+    };
+
+    let mut edges: Vec<Block> = order
+        .iter()
+        .copied()
+        .filter(|&b| !f.jump_args(b).is_empty())
+        .collect();
+    // Hottest first; among equals, keep the layout order so this is deterministic.
+    edges.sort_by_key(|&b| std::cmp::Reverse(depth(b)));
+
+    for b in edges {
+        let succ = f.succs(b)[0];
+        for (&a, &p) in f.jump_args(b).iter().zip(f.block_params(succ)) {
+            if eligible[a.0 as usize] && eligible[p.0 as usize] && f.class(a) == f.class(p) {
+                c.try_union(a, p);
+            }
+        }
+    }
+    c
 }
 
 /// Lifetime intervals, in one reverse pass and without a dataflow analysis.
@@ -2182,6 +2349,47 @@ mod tests {
             ra.block_param(target, 0),
             ra.use_(both, 1),
             "the parameter must land in its argument's register, not the first free one",
+        );
+    }
+
+    /// The safety property. A parameter still read after its back-edge argument is
+    /// computed genuinely interferes with it, so the merge must be refused and the
+    /// edge must pay for a real move. Coalescing that ignored interference would
+    /// put two simultaneously-live values in one register and silently lose one.
+    #[test]
+    fn coalescing_refuses_an_interfering_pair() {
+        let mut f = TestFunc::default();
+        // `latch` is the edge block a conditional branch's successors always are:
+        // only a single-successor block may carry arguments.
+        let (entry, header, latch, exit) = (f.block(), f.block(), f.block(), f.block());
+        let (init, param, next) = (f.int(), f.int(), f.int());
+
+        f.inst(entry, vec![Operand::any(init)], vec![]);
+        f.inst(entry, vec![], vec![]);
+        f.goto(entry, &[header]);
+        f.pass(entry, &[init]);
+
+        f.params(header, &[param]);
+        f.inst(header, vec![Operand::any(next)], vec![Operand::any(param)]);
+        // The parameter is read again, after `next` exists: the two are live at the
+        // same time and cannot share a register.
+        f.inst(header, vec![], vec![Operand::any(param)]);
+        f.inst(header, vec![], vec![]);
+        f.goto(header, &[latch, exit]);
+
+        f.inst(latch, vec![], vec![]);
+        f.goto(latch, &[header]);
+        f.pass(latch, &[next]);
+
+        f.inst(exit, vec![], vec![]);
+
+        let ra = allocate(&f, &env(4)).expect("allocates");
+        verify(&f, &ra).expect("verifies");
+
+        let term = *f.block_insts(latch).last().unwrap();
+        assert!(
+            ra.edits_at(ProgPoint::before(term)).count() > 0,
+            "the back edge must move: parameter and argument interfere",
         );
     }
 
