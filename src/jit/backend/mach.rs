@@ -195,6 +195,16 @@ pub enum MOp {
         then_: MBlock,
         else_: MBlock,
     },
+    /// `use0 cc imm ? then_ : else_`. The immediate-operand form of [`MOp::BrCmp`]:
+    /// isel emits it when the fused compare's other operand is a constant used
+    /// nowhere else, so the constant is folded into the compare rather than
+    /// materialized into a register.
+    BrCmpImm {
+        cc: Cc,
+        imm: i64,
+        then_: MBlock,
+        else_: MBlock,
+    },
     /// Return to the executor. The results have already been stored to the Lua
     /// stack by preceding `Store`s; this just reports how many.
     Ret {
@@ -208,7 +218,12 @@ impl MOp {
     pub fn is_terminator(self) -> bool {
         matches!(
             self,
-            MOp::Jump(_) | MOp::BrNz { .. } | MOp::BrCmp { .. } | MOp::Ret { .. } | MOp::ExitTo(_)
+            MOp::Jump(_)
+                | MOp::BrNz { .. }
+                | MOp::BrCmp { .. }
+                | MOp::BrCmpImm { .. }
+                | MOp::Ret { .. }
+                | MOp::ExitTo(_)
         )
     }
 
@@ -217,7 +232,9 @@ impl MOp {
     pub fn targets(self) -> Vec<MBlock> {
         match self {
             MOp::Jump(b) => vec![b],
-            MOp::BrNz { then_, else_ } | MOp::BrCmp { then_, else_, .. } => vec![then_, else_],
+            MOp::BrNz { then_, else_ }
+            | MOp::BrCmp { then_, else_, .. }
+            | MOp::BrCmpImm { then_, else_, .. } => vec![then_, else_],
             _ => vec![],
         }
     }
@@ -539,6 +556,12 @@ fn fmt_op(op: MOp) -> String {
         MOp::BrCmp { cc, then_, else_ } => {
             format!("brcmp.{} mb{}, mb{}", fmt_cc(cc), then_.0, else_.0)
         }
+        MOp::BrCmpImm {
+            cc,
+            imm,
+            then_,
+            else_,
+        } => format!("brcmp.{} #{imm} mb{}, mb{}", fmt_cc(cc), then_.0, else_.0),
         MOp::Ret { nret } => format!("ret {nret}"),
         MOp::ExitTo(e) => format!("deopt -> exit{}", e.0),
     }

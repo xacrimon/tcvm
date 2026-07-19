@@ -60,6 +60,15 @@ enum CopySrc {
     Imm(i64),
 }
 
+/// A compare fused into its branch, resolved to machine registers. `Imm` is the
+/// folded form: one operand was a constant used nowhere else, so it rides in the
+/// instruction instead of a register.
+#[derive(Clone, Copy, Debug)]
+enum FusedCmp {
+    Reg(Cc, VReg, VReg),
+    Imm(Cc, VReg, i64),
+}
+
 pub fn select(f: &Func<'_>) -> Result<MFunc, IselError> {
     let mut isel = Isel {
         f,
@@ -245,18 +254,56 @@ impl<'a, 'gc> Isel<'a, 'gc> {
                 // The def must be in this same block. `di < i` and both in `b`
                 // means the compare precedes the branch; the block list order
                 // gives that, so a bare membership check suffices.
-                if matches!(self.f.inst(di).op, Op::ICmp(_)) && self.f.block(b).insts.contains(&di)
+                if !matches!(self.f.inst(di).op, Op::ICmp(_))
+                    || !self.f.block(b).insts.contains(&di)
                 {
-                    self.fused[di.index()] = true;
+                    continue;
+                }
+                self.fused[di.index()] = true;
+
+                // Fold a compare operand to an immediate only when it is a
+                // constant used nowhere else: its defining `iconst` is then
+                // skipped entirely, turning a `mov`+register compare into one
+                // immediate compare. RHS preferred; a LHS fold swaps the
+                // condition at the branch (see `fused_cmp_of`). At most one side.
+                let cmp = self.f.inst(di);
+                for &operand in &[cmp.args[1], cmp.args[0]] {
+                    if uses[operand.index()] != 1 {
+                        continue;
+                    }
+                    let Def::Inst(ki) = self.f.def(operand) else {
+                        continue;
+                    };
+                    if matches!(self.f.inst(ki).op, Op::IConst(_)) {
+                        self.fused[ki.index()] = true;
+                        break;
+                    }
                 }
             }
         }
     }
 
-    /// If `cond` is the result of a fused compare, its condition and the machine
-    /// registers to compare. The operands' slots are still valid: they were
-    /// selected before the skipped `ICmp`, hence before this branch.
-    fn fused_cmp_of(&self, cond: Val) -> Option<(Cc, VReg, VReg)> {
+    /// The constant an operand folds to, if its defining `iconst` was marked
+    /// skipped by [`Self::mark_fused_compares`] — i.e. it is a compare operand
+    /// eligible to ride in the instruction instead of a register.
+    fn folded(&self, v: Val) -> Option<i64> {
+        let Def::Inst(di) = self.f.def(v) else {
+            return None;
+        };
+        if !self.fused[di.index()] {
+            return None;
+        }
+        match self.f.inst(di).op {
+            Op::IConst(n) => Some(n),
+            _ => None,
+        }
+    }
+
+    /// If `cond` is the result of a fused compare, its condition and operands,
+    /// resolved to machine locations — a register pair, or a register against a
+    /// folded immediate. The operands' slots are still valid: they were selected
+    /// before the skipped `ICmp`, hence before this branch.
+    fn fused_cmp_of(&self, cond: Val) -> Option<FusedCmp> {
         let Def::Inst(di) = self.f.def(cond) else {
             return None;
         };
@@ -265,7 +312,14 @@ impl<'a, 'gc> Isel<'a, 'gc> {
         }
         let d = self.f.inst(di);
         let Op::ICmp(cc) = d.op else { return None };
-        Some((cc, self.int(d.args[0]), self.int(d.args[1])))
+        let (a, b) = (d.args[0], d.args[1]);
+        if let Some(n) = self.folded(b) {
+            Some(FusedCmp::Imm(cc, self.int(a), n))
+        } else if let Some(n) = self.folded(a) {
+            Some(FusedCmp::Imm(cc.swapped(), self.int(b), n))
+        } else {
+            Some(FusedCmp::Reg(cc, self.int(a), self.int(b)))
+        }
     }
 
     // --- value slots --------------------------------------------------------
@@ -376,6 +430,13 @@ impl<'a, 'gc> Isel<'a, 'gc> {
     }
 
     fn inst(&mut self, mb: MBlock, i: crate::jit::ir::Inst) -> Result<(), IselError> {
+        // Folded into a consumer — a compare fused into its branch, or the
+        // constant folded into that compare's immediate. Emits nothing and
+        // defines no slot; the branch reads it through `fused_cmp_of`.
+        if self.fused[i.index()] {
+            return Ok(());
+        }
+
         let d = self.f.inst(i);
         let args = d.args.clone();
         let results = d.results.clone();
@@ -555,17 +616,31 @@ impl<'a, 'gc> Isel<'a, 'gc> {
                 self.stub(e, i);
                 // `GuardCmp` exits unless `a cc b`; `GuardCond` exits unless its
                 // condition holds — the same thing when the condition is `a cc b`.
-                if let Some((cc, a, b)) = self.fused_cmp_of(args[0]) {
-                    self.emit_exiting(
+                match self.fused_cmp_of(args[0]) {
+                    Some(FusedCmp::Reg(cc, a, b)) => self.emit_exiting(
                         mb,
                         MOp::GuardCmp { cc, exit: e },
                         vec![a, b],
                         self.stub_regs(i),
                         e,
-                    );
-                } else {
-                    let c = self.int(args[0]);
-                    self.emit_exiting(mb, MOp::GuardNz { exit: e }, vec![c], self.stub_regs(i), e);
+                    ),
+                    Some(FusedCmp::Imm(cc, a, imm)) => self.emit_exiting(
+                        mb,
+                        MOp::GuardCmpImm { cc, imm, exit: e },
+                        vec![a],
+                        self.stub_regs(i),
+                        e,
+                    ),
+                    None => {
+                        let c = self.int(args[0]);
+                        self.emit_exiting(
+                            mb,
+                            MOp::GuardNz { exit: e },
+                            vec![c],
+                            self.stub_regs(i),
+                            e,
+                        );
+                    }
                 }
             }
             // A watchpoint, not a check. It emits nothing; the compiled artifact
@@ -657,14 +732,13 @@ impl<'a, 'gc> Isel<'a, 'gc> {
                 self.set(results[0], Slot::Float(d));
             }
             Op::ICmp(cc) => {
-                // A compare consumed only by a branch/guard is fused into it and
-                // leaves no value here — see `mark_fused_compares`.
-                if !self.fused[i.index()] {
-                    let d = self.m.new_vreg(RegClass::Int);
-                    let uses = vec![self.int(args[0]), self.int(args[1])];
-                    self.emit(mb, MOp::ICmpSet(cc), vec![d], uses);
-                    self.set(results[0], Slot::Int(d));
-                }
+                // A compare consumed only by a branch/guard was marked fused and
+                // never reaches here — see `mark_fused_compares` and the early
+                // return above. What remains materializes a boolean.
+                let d = self.m.new_vreg(RegClass::Int);
+                let uses = vec![self.int(args[0]), self.int(args[1])];
+                self.emit(mb, MOp::ICmpSet(cc), vec![d], uses);
+                self.set(results[0], Slot::Int(d));
             }
             Op::FCmp(cc) => {
                 let d = self.m.new_vreg(RegClass::Int);
@@ -710,11 +784,27 @@ impl<'a, 'gc> Isel<'a, 'gc> {
                 // its branch.
                 let then_ = self.edge_block(&targets[0]);
                 let else_ = self.edge_block(&targets[1]);
-                if let Some((cc, a, b)) = self.fused_cmp_of(args[0]) {
-                    self.emit(mb, MOp::BrCmp { cc, then_, else_ }, vec![], vec![a, b]);
-                } else {
-                    let cond = self.int(args[0]);
-                    self.emit(mb, MOp::BrNz { then_, else_ }, vec![], vec![cond]);
+                match self.fused_cmp_of(args[0]) {
+                    Some(FusedCmp::Reg(cc, a, b)) => {
+                        self.emit(mb, MOp::BrCmp { cc, then_, else_ }, vec![], vec![a, b]);
+                    }
+                    Some(FusedCmp::Imm(cc, a, imm)) => {
+                        self.emit(
+                            mb,
+                            MOp::BrCmpImm {
+                                cc,
+                                imm,
+                                then_,
+                                else_,
+                            },
+                            vec![],
+                            vec![a],
+                        );
+                    }
+                    None => {
+                        let cond = self.int(args[0]);
+                        self.emit(mb, MOp::BrNz { then_, else_ }, vec![], vec![cond]);
+                    }
                 }
             }
             Op::Ret => {

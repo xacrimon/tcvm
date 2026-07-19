@@ -130,7 +130,9 @@ fn temps_needed(op: MOp) -> usize {
         // A wide immediate has to be materialized into a register first; a folded
         // one needs nothing.
         MOp::AluImm(AluOp::Add | AluOp::Sub, imm) => usize::from(!wide_imm_fits(imm)),
-        MOp::GuardCmpImm { imm, .. } => usize::from(!wide_imm_fits(imm)),
+        MOp::GuardCmpImm { imm, .. } | MOp::BrCmpImm { imm, .. } => {
+            usize::from(!wide_imm_fits(imm))
+        }
         // Every other immediate ALU op always materializes its immediate.
         MOp::AluImm(_, _) => 1,
         _ => 0,
@@ -718,13 +720,22 @@ impl Encoder<'_, '_> {
             }
             MOp::GuardCmpImm { cc, imm, exit } => {
                 let n = self.use_g(i, 0);
-                if !self.a.try_cmp_imm(n, imm) {
-                    let t = self.temp_g(i, 0);
-                    self.a.mov_imm(t, imm);
-                    self.a.cmp(n, t);
-                }
                 let target = self.exits[exit.0 as usize];
-                self.a.b_cond(int_cond(cc).invert(), target);
+                // `cbz`/`cbnz` fold the zero-compare and the branch into one
+                // instruction. A guard exits *unless* its condition holds, so the
+                // sense inverts: assert `== 0` leaves on non-zero, and vice versa.
+                match (imm, cc) {
+                    (0, Cc::Eq) => self.a.cbnz(n, target),
+                    (0, Cc::Ne) => self.a.cbz(n, target),
+                    _ => {
+                        if !self.a.try_cmp_imm(n, imm) {
+                            let t = self.temp_g(i, 0);
+                            self.a.mov_imm(t, imm);
+                            self.a.cmp(n, t);
+                        }
+                        self.a.b_cond(int_cond(cc).invert(), target);
+                    }
+                }
             }
             MOp::GuardNz { exit } => {
                 let n = self.use_g(i, 0);
@@ -753,6 +764,30 @@ impl Encoder<'_, '_> {
                 let t = self.blocks[then_.0 as usize];
                 let e = self.blocks[else_.0 as usize];
                 self.a.b_cond(int_cond(cc), t);
+                self.a.b(e);
+            }
+            MOp::BrCmpImm {
+                cc,
+                imm,
+                then_,
+                else_,
+            } => {
+                let n = self.use_g(i, 0);
+                let t = self.blocks[then_.0 as usize];
+                let e = self.blocks[else_.0 as usize];
+                // `cbz`/`cbnz` combine the zero-compare with the taken branch.
+                match (imm, cc) {
+                    (0, Cc::Eq) => self.a.cbz(n, t),
+                    (0, Cc::Ne) => self.a.cbnz(n, t),
+                    _ => {
+                        if !self.a.try_cmp_imm(n, imm) {
+                            let tmp = self.temp_g(i, 0);
+                            self.a.mov_imm(tmp, imm);
+                            self.a.cmp(n, tmp);
+                        }
+                        self.a.b_cond(int_cond(cc), t);
+                    }
+                }
                 self.a.b(e);
             }
             MOp::Ret { nret } => {

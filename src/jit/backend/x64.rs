@@ -149,7 +149,9 @@ fn fits_i32(imm: i64) -> bool {
 fn temp_classes(op: MOp) -> &'static [RegClass] {
     match op {
         // A compare against a wide immediate materializes it into a register first.
-        MOp::GuardCmpImm { imm, .. } if !fits_i32(imm) => &[RegClass::Int],
+        MOp::GuardCmpImm { imm, .. } | MOp::BrCmpImm { imm, .. } if !fits_i32(imm) => {
+            &[RegClass::Int]
+        }
         // Float negate flips the sign bit with a mask built in a gpr and an xmm.
         MOp::FAlu(FAluOp::Neg) => &[RegClass::Int, RegClass::Float],
         // `==`/`~=` on floats fold the parity flag through a second setcc register.
@@ -687,15 +689,7 @@ impl Encoder<'_, '_> {
                 self.a.jcc(int_cond(cc).invert(), target);
             }
             MOp::GuardCmpImm { cc, imm, exit } => {
-                let n = self.use_g(i, 0);
-                if fits_i32(imm) {
-                    let ok = self.a.try_cmp_imm(n, imm);
-                    debug_assert!(ok, "a 32-bit immediate must encode");
-                } else {
-                    let t = self.temp_g(i, 0);
-                    self.a.mov_imm(t, imm);
-                    self.a.cmp(n, t);
-                }
+                self.cmp_imm(i, cc, imm);
                 let target = self.exits[exit.0 as usize];
                 self.a.jcc(int_cond(cc).invert(), target);
             }
@@ -730,6 +724,18 @@ impl Encoder<'_, '_> {
                 self.a.jcc(int_cond(cc), t);
                 self.a.jmp(e);
             }
+            MOp::BrCmpImm {
+                cc,
+                imm,
+                then_,
+                else_,
+            } => {
+                self.cmp_imm(i, cc, imm);
+                let t = self.blocks[then_.0 as usize];
+                let e = self.blocks[else_.0 as usize];
+                self.a.jcc(int_cond(cc), t);
+                self.a.jmp(e);
+            }
             MOp::Ret { nret } => {
                 self.a.mov_imm(ACC, Status::packed(TAG_RETURN, nret as u32));
                 let ep = self.epilogue;
@@ -747,6 +753,24 @@ impl Encoder<'_, '_> {
             "inst {i} is a terminator; an edit after it is unreachable"
         );
         self.edits_at(ProgPoint::after(i));
+    }
+
+    /// Set flags for `use0 cc imm`, for a guard or branch that folded a constant
+    /// operand. `cc` is passed only to spot the `== 0`/`!= 0` case, where `test`
+    /// is a byte shorter than `cmp $0` and needs no immediate; the caller still
+    /// issues the conditional jump.
+    fn cmp_imm(&mut self, i: Inst, cc: Cc, imm: i64) {
+        let n = self.use_g(i, 0);
+        if imm == 0 && matches!(cc, Cc::Eq | Cc::Ne) {
+            self.a.test(n, n);
+        } else if fits_i32(imm) {
+            let ok = self.a.try_cmp_imm(n, imm);
+            debug_assert!(ok, "a 32-bit immediate must encode");
+        } else {
+            let t = self.temp_g(i, 0);
+            self.a.mov_imm(t, imm);
+            self.a.cmp(n, t);
+        }
     }
 
     /// A two-address integer op. Every form but the divides writes its result in

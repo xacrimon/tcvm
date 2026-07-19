@@ -79,6 +79,22 @@ pub enum Cc {
     Ge,
 }
 
+impl Cc {
+    /// The condition for the operands reversed: `a cc b` ≡ `b cc.swapped() a`.
+    /// Used when folding a compare's *left* operand into an immediate, since the
+    /// immediate has to become the right-hand side.
+    pub fn swapped(self) -> Cc {
+        match self {
+            Cc::Eq => Cc::Eq,
+            Cc::Ne => Cc::Ne,
+            Cc::Lt => Cc::Gt,
+            Cc::Le => Cc::Ge,
+            Cc::Gt => Cc::Lt,
+            Cc::Ge => Cc::Le,
+        }
+    }
+}
+
 bitflags! {
     /// Alias classes. v1 disambiguates by class only, not by base value: two
     /// `TAB_PROPS` accesses on different tables are assumed to may-alias.
