@@ -195,6 +195,122 @@ fn native_is_prime_matches_interpreter() {
     }
 }
 
+/// `mix(n)` end to end: a numeric `for` loop over twelve simultaneously-live
+/// integer accumulators mixed with add/sub/mul/mod/shift/xor. Nothing boxes,
+/// guards, or calls — it is pure unboxed integer arithmetic — so this is the
+/// register-allocation stress test the other cases are not: far more live values
+/// than hardware registers, forcing spills and reloads. A wrong answer here
+/// points at the allocator's spill/reload machinery rather than at any guard.
+///
+/// It is also the only case that exercises shift selection: `mix` uses `<<`/`>>`
+/// with constant counts, which isel folds to a single machine shift-by-immediate.
+#[test]
+fn native_mix_matches_interpreter() {
+    let mut lua = Lua::new();
+    lua.load_all();
+    let source = fs::read_to_string("test-files/mix.lua").unwrap();
+
+    for n in [1i64, 2, 5, 13, 50, 137] {
+        let want = interpret_unary(&mut lua, &source, "mix", n);
+
+        lua.enter(|ctx| {
+            let chunk = ctx.load(&source, Some("mix")).expect("compile");
+            let mix = chunk.as_lua().expect("closure").proto.prototypes[0];
+            let func = lower(mix, 0, vec![INT]).expect("lower");
+            let mut m = select(&func).expect("isel");
+            let ra = allocate(&mut m);
+            let code =
+                Code::from_words(&encode(&m, &func.pool, &ra).expect("encode")).expect("map code");
+
+            let mut stack = vec![Value::nil(); m.max_lua_reg as usize + 1];
+            stack[0] = Value::integer(n);
+
+            let region: Region = unsafe { std::mem::transmute(code.entry()) };
+            let status = Status::unpack(region(std::ptr::null_mut(), stack.as_mut_ptr().cast()));
+
+            assert_eq!(status, Status::Return(1), "mix({n}) should run natively");
+            assert_eq!(stack[0].get_integer(), Some(want), "mix({n})");
+        });
+    }
+}
+
+/// Shift selection's edge cases, which `mix` (only `<< 1`, `<< 2`, `>> 2`) never
+/// reaches: a right shift that must zero-fill rather than sign-extend, a count of
+/// exactly 64 that clears every bit, and a negative count that reverses the
+/// direction. Each `f(x)` is compiled and its native answer checked against the
+/// interpreter — itself verified against reference Lua in `test-files/mix.lua`.
+#[test]
+fn native_shift_edge_cases_match_interpreter() {
+    let mut lua = Lua::new();
+    lua.load_all();
+
+    let cases = [
+        "local function f(x) return x >> 2 end",  // logical: zero-fills negatives
+        "local function f(x) return x >> 64 end", // |count| >= 64 -> 0
+        "local function f(x) return x << 64 end", // |count| >= 64 -> 0
+        "local function f(x) return x >> -3 end", // negative count reverses to << 3
+        "local function f(x) return x << -3 end", // negative count reverses to >> 3
+        "local function f(x) return x << 0 end",  // identity
+    ];
+
+    for src in cases {
+        for x in [-100i64, -1, 0, 3, 12345, i64::MAX, i64::MIN] {
+            let want = interpret_unary(&mut lua, src, "f", x);
+
+            lua.enter(|ctx| {
+                let chunk = ctx.load(src, Some("shift")).expect("compile");
+                let f = chunk.as_lua().expect("closure").proto.prototypes[0];
+                let func = lower(f, 0, vec![INT]).expect("lower");
+                let mut m = select(&func).expect("isel");
+                let ra = allocate(&mut m);
+                let code = Code::from_words(&encode(&m, &func.pool, &ra).expect("encode"))
+                    .expect("map code");
+
+                let mut stack = vec![Value::nil(); m.max_lua_reg as usize + 1];
+                stack[0] = Value::integer(x);
+
+                let region: Region = unsafe { std::mem::transmute(code.entry()) };
+                let status =
+                    Status::unpack(region(std::ptr::null_mut(), stack.as_mut_ptr().cast()));
+
+                assert_eq!(status, Status::Return(1), "`{src}` x={x} should run natively");
+                assert_eq!(stack[0].get_integer(), Some(want), "`{src}` x={x}");
+            });
+        }
+    }
+}
+
+/// Run `src`'s first nested function (named for readability only) on a single
+/// integer argument through the interpreter and return its integer result. The
+/// nested prototype is wrapped in a closure with fresh nil upvalue cells — `mix`
+/// captures nothing, so their contents never matter, only their count.
+fn interpret_unary(lua: &mut Lua, src: &str, _name: &str, arg: i64) -> i64 {
+    use crate::dmm::{Gc, RefLock};
+    use crate::env::function::{Function, UpvalueState};
+
+    let ex = lua
+        .try_enter(|ctx| {
+            let chunk = ctx.load(src, Some("interp")).expect("compile");
+            let proto = chunk.as_lua().expect("closure").proto.prototypes[0];
+            let upvalues = (0..proto.num_upvalues)
+                .map(|_| Gc::new(ctx.mutation(), RefLock::new(UpvalueState::Closed(Value::nil()))))
+                .collect();
+            let closure = Function::new_lua(ctx.mutation(), proto, upvalues);
+            Ok::<_, crate::RuntimeError>(
+                ctx.stash(Executor::start(ctx, closure, (Value::integer(arg),))),
+            )
+        })
+        .expect("start");
+    lua.finish(&ex).expect("run");
+    lua.enter(|ctx| {
+        ctx.fetch(&ex)
+            .take_result::<Value>(ctx)
+            .expect("result")
+            .get_integer()
+            .expect("an integer")
+    })
+}
+
 /// The same code, a table of a different shape. Every path out of compiled code
 /// that is not a `return` is a deopt, and the stub it lands in has to leave the
 /// frame exactly as the interpreter would have had it at that pc — otherwise

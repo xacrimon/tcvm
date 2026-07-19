@@ -373,6 +373,24 @@ impl Asm {
         self.rr(&[], true, &[0xD3], 7, d.0);
     }
 
+    /// `shl d, imm8` — `C1 /4 ib`. The immediate-count forms; the encoder only
+    /// selects these with a count already reduced to `1..=63`, so the hardware's
+    /// `& 63` masking of the byte never matters.
+    pub fn shl_imm(&mut self, d: Gpr, imm: u8) {
+        self.rr(&[], true, &[0xC1], 4, d.0);
+        self.emit(imm);
+    }
+
+    pub fn shr_imm(&mut self, d: Gpr, imm: u8) {
+        self.rr(&[], true, &[0xC1], 5, d.0);
+        self.emit(imm);
+    }
+
+    pub fn sar_imm(&mut self, d: Gpr, imm: u8) {
+        self.rr(&[], true, &[0xC1], 7, d.0);
+        self.emit(imm);
+    }
+
     /// `op d, #imm`, sign-extended. Uses the compact 8-bit form (`83 /ext ib`)
     /// when the immediate fits a signed byte, else the 32-bit form (`81 /ext id`).
     /// `ext` selects the operation.

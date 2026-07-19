@@ -185,6 +185,10 @@ pub fn annotate(m: &mut MFunc) {
             // Every other integer op is two-address (`d = d op b`) or unary in place
             // (`neg d`): the result reuses its first source's register.
             MOp::Alu(_) => m.insts[i].defs[0].constraint = Constraint::Reuse(0),
+            // Shift-by-immediate is two-address too: it rewrites its source in place.
+            MOp::AluImm(AluOp::Shl | AluOp::Lsr | AluOp::Sar, _) => {
+                m.insts[i].defs[0].constraint = Constraint::Reuse(0)
+            }
             // Float arithmetic is two-address the same way.
             MOp::FAlu(_) => m.insts[i].defs[0].constraint = Constraint::Reuse(0),
             _ => {}
@@ -624,7 +628,22 @@ impl Encoder<'_, '_> {
                 }
             }
             MOp::Alu(o) => self.alu(i, o),
-            MOp::AluImm(..) => unreachable!("isel lowers immediates into an `Imm` + `Alu`"),
+            // Only shifts arrive as `AluImm`: x86 has a shift-by-immediate form,
+            // and using it dodges the `cl`-only variable shift (and its fixed-`rcx`
+            // constraint). Every other immediate is still lowered to `Imm` + `Alu`.
+            MOp::AluImm(o @ (AluOp::Shl | AluOp::Lsr | AluOp::Sar), imm) => {
+                // Two-address: `annotate` marked the def `Reuse(0)`, so it already
+                // holds the value to shift; the op rewrites it in place.
+                let d = self.def_g(i, 0);
+                let amt = imm as u8;
+                match o {
+                    AluOp::Shl => self.a.shl_imm(d, amt),
+                    AluOp::Lsr => self.a.shr_imm(d, amt),
+                    AluOp::Sar => self.a.sar_imm(d, amt),
+                    _ => unreachable!("outer match restricts these"),
+                }
+            }
+            MOp::AluImm(..) => unreachable!("isel lowers non-shift immediates into an `Imm` + `Alu`"),
             // Two-address: the def already holds its first source (`annotate` marked
             // it `Reuse(0)`, the allocator copied it in), so the op writes the def.
             MOp::FAlu(o) => match o {
@@ -810,7 +829,9 @@ impl Encoder<'_, '_> {
                     _ => unreachable!("outer match restricts these"),
                 }
             }
-            AluOp::Shl | AluOp::Sar | AluOp::Lsr => unreachable!("isel does not emit shifts"),
+            // Shifts are only ever emitted by immediate (`AluImm`), never as a
+            // register-register `Alu`, so this variant cannot appear.
+            AluOp::Shl | AluOp::Sar | AluOp::Lsr => unreachable!("shifts are emitted as AluImm"),
         }
     }
 

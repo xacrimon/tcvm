@@ -99,7 +99,7 @@ struct Isel<'a, 'gc> {
 
 impl<'a, 'gc> Isel<'a, 'gc> {
     fn run(&mut self) -> Result<(), IselError> {
-        self.mark_fused_compares();
+        self.mark_fusions();
 
         // Machine blocks mirror IR blocks one-to-one; edge blocks are appended
         // afterwards, so this index mapping stays valid.
@@ -214,7 +214,12 @@ impl<'a, 'gc> Isel<'a, 'gc> {
     /// is only trivially sound when the consumer sits in the block the operands
     /// are already live in. Single-use covers the boolean not also being
     /// materialized, stored, or held by a frame state.
-    fn mark_fused_compares(&mut self) {
+    /// Also fuses shift-count constants: a shift reads its count as an immediate
+    /// (see [`Self::shift`]), so a count `iconst` referenced by nothing else is a
+    /// dead materialization — the same single-use soundness argument as the
+    /// compare fold, since the sole reference is the shift's count operand and no
+    /// register or frame state still needs it.
+    fn mark_fusions(&mut self) {
         self.fused = vec![false; self.f.num_insts()];
 
         let mut uses = vec![0u32; self.f.num_values()];
@@ -281,10 +286,29 @@ impl<'a, 'gc> Isel<'a, 'gc> {
                 }
             }
         }
+
+        for b in self.f.blocks() {
+            for &i in &self.f.block(b).insts {
+                let d = self.f.inst(i);
+                if !matches!(d.op, Op::IntArith(IntOp::Shl | IntOp::Shr)) {
+                    continue;
+                }
+                let count = d.args[1];
+                if uses[count.index()] != 1 {
+                    continue;
+                }
+                let Def::Inst(ki) = self.f.def(count) else {
+                    continue;
+                };
+                if matches!(self.f.inst(ki).op, Op::IConst(_)) {
+                    self.fused[ki.index()] = true;
+                }
+            }
+        }
     }
 
     /// The constant an operand folds to, if its defining `iconst` was marked
-    /// skipped by [`Self::mark_fused_compares`] — i.e. it is a compare operand
+    /// skipped by [`Self::mark_fusions`] — i.e. it is a compare operand
     /// eligible to ride in the instruction instead of a register.
     fn folded(&self, v: Val) -> Option<i64> {
         let Def::Inst(di) = self.f.def(v) else {
@@ -411,6 +435,62 @@ impl<'a, 'gc> Isel<'a, 'gc> {
         let r = self.m.new_vreg(RegClass::Int);
         self.emit(b, MOp::Imm(imm), vec![r], vec![]);
         r
+    }
+
+    /// The compile-time integer an operand holds, if it is a plain `iconst`.
+    fn int_const(&self, v: Val) -> Option<i64> {
+        let Def::Inst(di) = self.f.def(v) else {
+            return None;
+        };
+        match self.f.inst(di).op {
+            Op::IConst(n) => Some(n),
+            _ => None,
+        }
+    }
+
+    /// Lower a Lua shift (`args[0] <dir> args[1]`) whose count is a compile-time
+    /// constant, folding the language's edge rules into a single machine
+    /// shift-by-immediate — or a constant zero. A dynamic count would need the
+    /// full branchy `luaV_shiftl` expansion (compare against 0 and 64, pick a
+    /// direction, select), which we don't emit yet, so it is declined.
+    ///
+    /// Because the count is known here, the machine shift never sees an
+    /// out-of-range amount, so the target's count-masking (aarch64's low 6 bits,
+    /// x86's `& 63`) never bites — we have already turned every such case into a 0.
+    fn shift(&mut self, mb: MBlock, dir: IntOp, args: &[Val], result: Val) -> Result<(), IselError> {
+        let count = self
+            .int_const(args[1])
+            .ok_or(IselError::Unsupported("dynamic shift count"))?;
+
+        // |count| >= 64 shifts every bit out; Lua defines the result as 0.
+        if !(-63..=63).contains(&count) {
+            let d = self.emit_imm(mb, 0);
+            self.set(result, Slot::Int(d));
+            return Ok(());
+        }
+
+        // A negative count reverses the direction; `n` is then a real bit count
+        // in `1..=63` (`-count` cannot overflow, count is bounded above).
+        let want_left = matches!(dir, IntOp::Shl);
+        let (left, n) = if count >= 0 {
+            (want_left, count)
+        } else {
+            (!want_left, -count)
+        };
+        if n == 0 {
+            // Shift by zero is the identity; forward the source unchanged.
+            self.set(result, self.slot(args[0]));
+            return Ok(());
+        }
+
+        // Lua's shifts are logical in both directions, so a right shift is `Lsr`,
+        // never the sign-propagating `Sar`.
+        let alu = if left { AluOp::Shl } else { AluOp::Lsr };
+        let x = self.int(args[0]);
+        let d = self.m.new_vreg(RegClass::Int);
+        self.emit(mb, MOp::AluImm(alu, n), vec![d], vec![x]);
+        self.set(result, Slot::Int(d));
+        Ok(())
     }
 
     // --- blocks -------------------------------------------------------------
@@ -709,6 +789,13 @@ impl<'a, 'gc> Isel<'a, 'gc> {
             }
 
             // --- arithmetic ----------------------------------------------------
+            // Shifts are not an ordinary two-register ALU op: Lua's semantics
+            // (logical fill, negative count reverses direction, |count| >= 64
+            // yields zero) diverge from every machine shift, so they get their own
+            // lowering that folds those rules against a constant count.
+            Op::IntArith(o @ (IntOp::Shl | IntOp::Shr)) => {
+                self.shift(mb, o, &args, results[0])?;
+            }
             Op::IntArith(o) => {
                 let alu = int_alu(o)?;
                 let d = self.m.new_vreg(RegClass::Int);
@@ -733,7 +820,7 @@ impl<'a, 'gc> Isel<'a, 'gc> {
             }
             Op::ICmp(cc) => {
                 // A compare consumed only by a branch/guard was marked fused and
-                // never reaches here — see `mark_fused_compares` and the early
+                // never reaches here — see `mark_fusions` and the early
                 // return above. What remains materializes a boolean.
                 let d = self.m.new_vreg(RegClass::Int);
                 let uses = vec![self.int(args[0]), self.int(args[1])];
@@ -1117,9 +1204,9 @@ fn int_alu(o: IntOp) -> Result<AluOp, IselError> {
         IntOp::BXor => AluOp::Xor,
         IntOp::Neg => AluOp::Neg,
         IntOp::BNot => AluOp::Not,
-        // Lua's shifts are not the machine's: the count is unmasked and a shift of
-        // 64 or more yields zero, where aarch64 masks to 6 bits and yields the
-        // operand. Needs a guard or a select; not yet.
+        // Shifts never reach here: `inst` intercepts `IntArith(Shl | Shr)` and
+        // lowers them in `shift`, which folds Lua's count semantics against a
+        // constant. A dynamic count is declined there, not here.
         IntOp::Shl | IntOp::Shr => return Err(IselError::Unsupported("shift")),
         // The zero divisor is not our problem: lowering has already put a
         // `guard.cond` in front of these, because Lua raises on `x % 0`.
