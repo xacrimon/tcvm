@@ -721,6 +721,23 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
             }
         }
     }
+    // An edge is a copy too, and after SSA deconstruction moved into `resolve_edges`
+    // it is the *only* copy left that matters: there is no `Mov` for `is_copy` to
+    // report, so without this an argument and its parameter are pulled together by
+    // nothing at all and share a register only when the scan's arbitrary choice
+    // happens to agree on both sides. Every pair here is a move `resolve_edges` does
+    // not have to emit.
+    for b in (0..f.num_blocks()).map(|b| Block(b as u32)) {
+        let args = f.jump_args(b);
+        if args.is_empty() {
+            continue;
+        }
+        let succ = f.succs(b)[0];
+        for (&a, &p) in args.iter().zip(f.block_params(succ)) {
+            affin.entry(a).or_default().push(p);
+            affin.entry(p).or_default().push(a);
+        }
+    }
 
     // Clobbers, as instruction-wide register reservations. A clobbered register is
     // busy across the whole slot `[2·pos, 2·pos + 2)` — a call destroys it, a
@@ -1598,7 +1615,16 @@ fn resolve_edges(
             continue;
         }
 
+        // The moves go before the block's last instruction. That is only sound
+        // because a block carrying arguments ends in a bare control transfer: any
+        // operand on it would be read *after* these moves had already overwritten
+        // the registers holding it.
         let term = *f.block_insts(pred).last().expect("block has a terminator");
+        debug_assert!(
+            f.uses(term).is_empty() && f.defs(term).is_empty(),
+            "mb{}'s terminator has operands, so edge moves cannot precede it",
+            pred.0,
+        );
         let at = ProgPoint::before(term);
 
         // Registers holding a live value at the end of this block, plus every
@@ -2122,6 +2148,48 @@ mod tests {
         fn jump_args(&self, b: Block) -> &[VReg] {
             &self.jump_args[b.0 as usize]
         }
+    }
+
+    /// An edge is a copy, and after SSA deconstruction moved into the allocator it
+    /// is the only copy with no `Mov` for `is_copy` to report. Without an affinity
+    /// across it the parameter takes whatever register is free first, which is not
+    /// the argument's, and the edge pays for a move that never needed to exist.
+    ///
+    /// Here `a` and `b` interfere, so they get different registers; `a` is then dead
+    /// at the target, so the lowest free register there is `a`'s, not `b`'s. The
+    /// parameter must follow `b` anyway.
+    #[test]
+    fn an_edge_coalesces_its_argument_with_its_parameter() {
+        let mut f = TestFunc::default();
+        let (entry, target) = (f.block(), f.block());
+        let (a, b, param) = (f.int(), f.int(), f.int());
+
+        f.inst(entry, vec![Operand::any(a)], vec![]);
+        f.inst(entry, vec![Operand::any(b)], vec![]);
+        let both = f.inst(entry, vec![], vec![Operand::any(a), Operand::any(b)]);
+        // A terminator, as every machine-IR block has: the edge's moves go before
+        // it, so it must not be an instruction that still reads anything.
+        f.inst(entry, vec![], vec![]);
+        f.goto(entry, &[target]);
+        f.pass(entry, &[b]);
+
+        f.params(target, &[param]);
+        f.inst(target, vec![], vec![Operand::any(param)]);
+        f.inst(target, vec![], vec![]);
+
+        let ra = allocate(&f, &env(4)).expect("allocates");
+        verify(&f, &ra).expect("verifies");
+
+        assert_ne!(
+            ra.use_(both, 0),
+            ra.use_(both, 1),
+            "a and b interfere, so the test is only meaningful if they differ"
+        );
+        assert_eq!(
+            ra.block_param(target, 0),
+            ra.use_(both, 1),
+            "the parameter must land in its argument's register, not the first free one",
+        );
     }
 
     /// Whether two merged interval lists share any position.
