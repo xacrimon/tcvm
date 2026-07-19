@@ -186,6 +186,15 @@ pub enum MOp {
         then_: MBlock,
         else_: MBlock,
     },
+    /// `use0 cc use1 ? then_ : else_`. A comparison fused into its sole-consuming
+    /// branch: the boolean is never materialized into a register, it flows through
+    /// the flags straight into the branch. isel emits this in place of an
+    /// `ICmpSet` + `BrNz` pair when the compare feeds nothing but this branch.
+    BrCmp {
+        cc: Cc,
+        then_: MBlock,
+        else_: MBlock,
+    },
     /// Return to the executor. The results have already been stored to the Lua
     /// stack by preceding `Store`s; this just reports how many.
     Ret {
@@ -199,7 +208,7 @@ impl MOp {
     pub fn is_terminator(self) -> bool {
         matches!(
             self,
-            MOp::Jump(_) | MOp::BrNz { .. } | MOp::Ret { .. } | MOp::ExitTo(_)
+            MOp::Jump(_) | MOp::BrNz { .. } | MOp::BrCmp { .. } | MOp::Ret { .. } | MOp::ExitTo(_)
         )
     }
 
@@ -208,7 +217,7 @@ impl MOp {
     pub fn targets(self) -> Vec<MBlock> {
         match self {
             MOp::Jump(b) => vec![b],
-            MOp::BrNz { then_, else_ } => vec![then_, else_],
+            MOp::BrNz { then_, else_ } | MOp::BrCmp { then_, else_, .. } => vec![then_, else_],
             _ => vec![],
         }
     }
@@ -527,6 +536,9 @@ fn fmt_op(op: MOp) -> String {
         MOp::GuardNz { exit } => format!("guard.nz -> exit{}", exit.0),
         MOp::Jump(b) => format!("jump mb{}", b.0),
         MOp::BrNz { then_, else_ } => format!("brnz mb{}, mb{}", then_.0, else_.0),
+        MOp::BrCmp { cc, then_, else_ } => {
+            format!("brcmp.{} mb{}, mb{}", fmt_cc(cc), then_.0, else_.0)
+        }
         MOp::Ret { nret } => format!("ret {nret}"),
         MOp::ExitTo(e) => format!("deopt -> exit{}", e.0),
     }

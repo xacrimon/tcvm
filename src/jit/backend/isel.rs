@@ -31,7 +31,7 @@ use crate::jit::backend::mach::{
 use crate::jit::backend::regalloc::{Inst, RegallocFunc};
 use crate::jit::ir::op::{Cc, FloatOp, IntOp, Op};
 use crate::jit::ir::ty::{Rep, Ty, TypeSet};
-use crate::jit::ir::{Block, Func, Val};
+use crate::jit::ir::{Block, Def, Func, Val};
 
 #[derive(Debug)]
 pub enum IselError {
@@ -65,6 +65,7 @@ pub fn select(f: &Func<'_>) -> Result<MFunc, IselError> {
         f,
         m: MFunc::new(),
         slots: vec![None; f.num_values()],
+        fused: Vec::new(),
         bmap: Vec::new(),
         base: VReg(0),
     };
@@ -76,6 +77,11 @@ struct Isel<'a, 'gc> {
     f: &'a Func<'gc>,
     m: MFunc,
     slots: Vec<Option<Slot>>,
+    /// One entry per IR instruction: true for an `ICmp` whose sole consumer is a
+    /// `Br`/`GuardCond` in the same block. Such a compare is not emitted on its
+    /// own — its consumer fuses it into a flags-driven branch — so its result
+    /// never gets a machine slot.
+    fused: Vec<bool>,
     bmap: Vec<MBlock>,
     /// The Lua frame base pointer, `&stack[base]`. Every stack access is relative
     /// to this.
@@ -84,6 +90,8 @@ struct Isel<'a, 'gc> {
 
 impl<'a, 'gc> Isel<'a, 'gc> {
     fn run(&mut self) -> Result<(), IselError> {
+        self.mark_fused_compares();
+
         // Machine blocks mirror IR blocks one-to-one; edge blocks are appended
         // afterwards, so this index mapping stays valid.
         for _ in 0..self.f.num_blocks() {
@@ -183,6 +191,81 @@ impl<'a, 'gc> Isel<'a, 'gc> {
         }
         order.reverse();
         order
+    }
+
+    // --- compare/branch fusion ----------------------------------------------
+
+    /// Mark every `ICmp` whose result feeds nothing but one `Br`/`GuardCond` in
+    /// the same block. The comparison is then realized as flags at that branch
+    /// rather than materialized into a register with `ICmpSet` — the compiler's
+    /// job #1 (a value's machine location) answered as "the flags", which is
+    /// exactly how a guard's own compare already lowers.
+    ///
+    /// Same-block is required: deferring the (pure) compare down to its consumer
+    /// is only trivially sound when the consumer sits in the block the operands
+    /// are already live in. Single-use covers the boolean not also being
+    /// materialized, stored, or held by a frame state.
+    fn mark_fused_compares(&mut self) {
+        self.fused = vec![false; self.f.num_insts()];
+
+        let mut uses = vec![0u32; self.f.num_values()];
+        for b in self.f.blocks() {
+            for &i in &self.f.block(b).insts {
+                let d = self.f.inst(i);
+                for &a in &d.args {
+                    uses[a.index()] += 1;
+                }
+                for t in &d.targets {
+                    for &a in &t.args {
+                        uses[a.index()] += 1;
+                    }
+                }
+            }
+        }
+        for s in 0..self.f.num_frame_states() {
+            let fs = self.f.frame_state(crate::jit::ir::FsRef(s as u32));
+            for v in fs.regs.iter().flatten() {
+                uses[v.index()] += 1;
+            }
+        }
+
+        for b in self.f.blocks() {
+            for &i in &self.f.block(b).insts {
+                let d = self.f.inst(i);
+                let cond = match d.op {
+                    Op::Br | Op::GuardCond => d.args[0],
+                    _ => continue,
+                };
+                if uses[cond.index()] != 1 {
+                    continue;
+                }
+                let Def::Inst(di) = self.f.def(cond) else {
+                    continue;
+                };
+                // The def must be in this same block. `di < i` and both in `b`
+                // means the compare precedes the branch; the block list order
+                // gives that, so a bare membership check suffices.
+                if matches!(self.f.inst(di).op, Op::ICmp(_)) && self.f.block(b).insts.contains(&di)
+                {
+                    self.fused[di.index()] = true;
+                }
+            }
+        }
+    }
+
+    /// If `cond` is the result of a fused compare, its condition and the machine
+    /// registers to compare. The operands' slots are still valid: they were
+    /// selected before the skipped `ICmp`, hence before this branch.
+    fn fused_cmp_of(&self, cond: Val) -> Option<(Cc, VReg, VReg)> {
+        let Def::Inst(di) = self.f.def(cond) else {
+            return None;
+        };
+        if !self.fused[di.index()] {
+            return None;
+        }
+        let d = self.f.inst(di);
+        let Op::ICmp(cc) = d.op else { return None };
+        Some((cc, self.int(d.args[0]), self.int(d.args[1])))
     }
 
     // --- value slots --------------------------------------------------------
@@ -470,8 +553,20 @@ impl<'a, 'gc> Isel<'a, 'gc> {
             Op::GuardCond => {
                 let e = ExitId(exit.expect("a guard carries an exit").0);
                 self.stub(e, i);
-                let c = self.int(args[0]);
-                self.emit_exiting(mb, MOp::GuardNz { exit: e }, vec![c], self.stub_regs(i), e);
+                // `GuardCmp` exits unless `a cc b`; `GuardCond` exits unless its
+                // condition holds — the same thing when the condition is `a cc b`.
+                if let Some((cc, a, b)) = self.fused_cmp_of(args[0]) {
+                    self.emit_exiting(
+                        mb,
+                        MOp::GuardCmp { cc, exit: e },
+                        vec![a, b],
+                        self.stub_regs(i),
+                        e,
+                    );
+                } else {
+                    let c = self.int(args[0]);
+                    self.emit_exiting(mb, MOp::GuardNz { exit: e }, vec![c], self.stub_regs(i), e);
+                }
             }
             // A watchpoint, not a check. It emits nothing; the compiled artifact
             // records the dependency and a metatable write invalidates it.
@@ -562,10 +657,14 @@ impl<'a, 'gc> Isel<'a, 'gc> {
                 self.set(results[0], Slot::Float(d));
             }
             Op::ICmp(cc) => {
-                let d = self.m.new_vreg(RegClass::Int);
-                let uses = vec![self.int(args[0]), self.int(args[1])];
-                self.emit(mb, MOp::ICmpSet(cc), vec![d], uses);
-                self.set(results[0], Slot::Int(d));
+                // A compare consumed only by a branch/guard is fused into it and
+                // leaves no value here — see `mark_fused_compares`.
+                if !self.fused[i.index()] {
+                    let d = self.m.new_vreg(RegClass::Int);
+                    let uses = vec![self.int(args[0]), self.int(args[1])];
+                    self.emit(mb, MOp::ICmpSet(cc), vec![d], uses);
+                    self.set(results[0], Slot::Int(d));
+                }
             }
             Op::FCmp(cc) => {
                 let d = self.m.new_vreg(RegClass::Int);
@@ -602,15 +701,21 @@ impl<'a, 'gc> Isel<'a, 'gc> {
                 self.emit(mb, MOp::Jump(dst), vec![], vec![]);
             }
             Op::Br => {
-                let cond = self.int(args[0]);
                 // Two successors: this is a critical edge whenever the target has
                 // more than one predecessor, and the copies have nowhere to live
                 // but on the edge itself. Always giving each side its own block is
                 // simpler than detecting criticality, and costs at most one branch
-                // that block layout can later fold away.
+                // that block layout can later fold away. The parameter copies go in
+                // those edge blocks, so nothing lands between a fused compare and
+                // its branch.
                 let then_ = self.edge_block(&targets[0]);
                 let else_ = self.edge_block(&targets[1]);
-                self.emit(mb, MOp::BrNz { then_, else_ }, vec![], vec![cond]);
+                if let Some((cc, a, b)) = self.fused_cmp_of(args[0]) {
+                    self.emit(mb, MOp::BrCmp { cc, then_, else_ }, vec![], vec![a, b]);
+                } else {
+                    let cond = self.int(args[0]);
+                    self.emit(mb, MOp::BrNz { then_, else_ }, vec![], vec![cond]);
+                }
             }
             Op::Ret => {
                 // Results land at `base + 0..`, which the executor passes to

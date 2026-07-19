@@ -718,6 +718,18 @@ impl Encoder<'_, '_> {
                 self.a.jcc(Cond::Ne, t);
                 self.a.jmp(e);
             }
+            // The compare fused in: taken on the condition itself, not its inverse
+            // (a guard inverts because it branches on *failure*; this branches on
+            // success to `then_`).
+            MOp::BrCmp { cc, then_, else_ } => {
+                let n = self.use_g(i, 0);
+                let m = self.use_g(i, 1);
+                self.a.cmp(n, m);
+                let t = self.blocks[then_.0 as usize];
+                let e = self.blocks[else_.0 as usize];
+                self.a.jcc(int_cond(cc), t);
+                self.a.jmp(e);
+            }
             MOp::Ret { nret } => {
                 self.a.mov_imm(ACC, Status::packed(TAG_RETURN, nret as u32));
                 let ep = self.epilogue;
