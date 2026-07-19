@@ -1307,6 +1307,7 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
             &loc,
             &remat_spilled,
             &remat_src,
+            &mut spills,
             &mut b,
         )?;
     }
@@ -1695,6 +1696,7 @@ fn resolve_edges(
     loc: &[Option<Alloc>],
     remat_spilled: &[bool],
     remat_src: &[Option<Inst>],
+    spills: &mut u32,
     b: &mut AllocationBuilder,
 ) -> Result<(), RegallocError> {
     for &pred in order {
@@ -1776,16 +1778,9 @@ fn resolve_edges(
                 busy.push(r);
             }
         }
-        let scratch = |class: RegClass| -> Result<Alloc, RegallocError> {
-            env.order(class)
-                .iter()
-                .copied()
-                .find(|r| !busy.contains(r))
-                .map(Alloc::Reg)
-                // No reserved scratch register exists, by design, so when the
-                // machine genuinely has nothing free the region stays interpreted
-                // rather than compiling a clobber.
-                .ok_or(RegallocError::OutOfRegisters)
+        // A register nothing needs across this edge, if the machine has one left.
+        let free_reg = |class: RegClass| -> Option<PReg> {
+            env.order(class).iter().copied().find(|r| !busy.contains(r))
         };
 
         // Emit every move whose destination nothing else still has to read; when
@@ -1812,7 +1807,17 @@ fn resolve_edges(
                 let EdgeSrc::Loc(from) = from else {
                     unreachable!("a replay cannot be part of a permutation cycle")
                 };
-                let tmp = scratch(class)?;
+                // A cycle needs somewhere to park one value, not specifically a
+                // register: `reg -> slot` and `slot -> reg` are both legal, so a
+                // fresh slot breaks it without disturbing anything else.
+                let tmp = match free_reg(class) {
+                    Some(r) => Alloc::Reg(r),
+                    None => {
+                        let s = Alloc::Spill(*spills);
+                        *spills += 1;
+                        s
+                    }
+                };
                 seq.push((EdgeSrc::Loc(from), tmp, class));
                 pending = blocked
                     .into_iter()
@@ -1830,54 +1835,93 @@ fn resolve_edges(
             pending = blocked;
         }
 
+        // Split out the moves that genuinely need a *register* to pass through: a
+        // slot-to-slot move (no machine here moves memory to memory) and a replay
+        // into a slot (the instruction being replayed writes a register). The rest
+        // are emitted as they stand.
+        let mut needs_reg: Vec<(EdgeSrc, Alloc, RegClass)> = Vec::new();
         for (from, to, class) in seq {
             match (from, to) {
-                // A replay lands in a register directly; into a slot it needs one to
-                // pass through, since the instruction it replays writes a register.
                 (EdgeSrc::Remat(val, src), Alloc::Reg(r)) => {
                     b.edit(at, Edit::Remat { val, src, to: r });
                 }
-                (EdgeSrc::Remat(val, src), Alloc::Spill(_)) => {
-                    let tmp = scratch(class)?;
-                    let Alloc::Reg(r) = tmp else {
-                        unreachable!("scratch is always a register")
-                    };
-                    b.edit(at, Edit::Remat { val, src, to: r });
-                    b.edit(
-                        at,
-                        Edit::Move(Move {
-                            from: tmp,
-                            to,
-                            class,
-                        }),
-                    );
-                }
-                // No machine here moves memory to memory, and a parameter can land
-                // in a slot while its argument sits in another — route through a
-                // register. Safe to reuse one scratch: it is free at this point and
-                // is neither a source nor a destination of any move on this edge.
-                (EdgeSrc::Loc(from @ Alloc::Spill(_)), Alloc::Spill(_)) => {
-                    let tmp = scratch(class)?;
-                    b.edit(
-                        at,
-                        Edit::Move(Move {
-                            from,
-                            to: tmp,
-                            class,
-                        }),
-                    );
-                    b.edit(
-                        at,
-                        Edit::Move(Move {
-                            from: tmp,
-                            to,
-                            class,
-                        }),
-                    );
-                }
+                (EdgeSrc::Loc(Alloc::Spill(_)), Alloc::Spill(_))
+                | (EdgeSrc::Remat(..), Alloc::Spill(_)) => needs_reg.push((from, to, class)),
                 (EdgeSrc::Loc(from), _) => {
                     b.edit(at, Edit::Move(Move { from, to, class }));
                 }
+            }
+        }
+
+        // Now the ones that need a register, after every ordinary move is done. If
+        // none is free the register file is saturated — which is exactly when this
+        // path is reached — so one is *bounced*: saved to a fresh slot, borrowed,
+        // restored. Whatever it held, a live-through value or a parameter just
+        // delivered, comes back untouched.
+        //
+        // Any register will do, precisely because it is saved and restored, and an
+        // edge has no operands of its own to work around. That is what makes edge
+        // resolution total: unlike an over-subscribed instruction, an edge can
+        // always be resolved, so it never declines the region.
+        //
+        // Edits at one program point keep the order they were pushed, which is what
+        // makes the save and the restore actually bracket the borrow.
+        for class in RegClass::ALL {
+            let group: Vec<_> = needs_reg
+                .iter()
+                .copied()
+                .filter(|&(_, _, c)| c == class)
+                .collect();
+            if group.is_empty() {
+                continue;
+            }
+            let (reg, bounced_to) = match free_reg(class) {
+                Some(r) => (r, None),
+                None => {
+                    let r = env.order(class)[0];
+                    let slot = Alloc::Spill(*spills);
+                    *spills += 1;
+                    b.edit(
+                        at,
+                        Edit::Move(Move {
+                            from: Alloc::Reg(r),
+                            to: slot,
+                            class,
+                        }),
+                    );
+                    (r, Some(slot))
+                }
+            };
+            for (from, to, c) in group {
+                match from {
+                    EdgeSrc::Remat(val, src) => b.edit(at, Edit::Remat { val, src, to: reg }),
+                    EdgeSrc::Loc(from) => b.edit(
+                        at,
+                        Edit::Move(Move {
+                            from,
+                            to: Alloc::Reg(reg),
+                            class: c,
+                        }),
+                    ),
+                }
+                b.edit(
+                    at,
+                    Edit::Move(Move {
+                        from: Alloc::Reg(reg),
+                        to,
+                        class: c,
+                    }),
+                );
+            }
+            if let Some(slot) = bounced_to {
+                b.edit(
+                    at,
+                    Edit::Move(Move {
+                        from: slot,
+                        to: Alloc::Reg(reg),
+                        class,
+                    }),
+                );
             }
         }
     }
@@ -2390,6 +2434,74 @@ mod tests {
         assert!(
             ra.edits_at(ProgPoint::before(term)).count() > 0,
             "the back edge must move: parameter and argument interfere",
+        );
+    }
+
+    /// Edge resolution must be *total*: when the register file is saturated and a
+    /// move still has to pass through a register, one is bounced — saved to a fresh
+    /// slot, borrowed, restored — rather than the region being declined.
+    ///
+    /// The setup: `live1`/`live2` are live across everything and take both
+    /// registers, while `param` and its back-edge argument `next` interfere (the
+    /// parameter is read after `next` is computed) so coalescing must refuse them
+    /// and both land in slots. The back edge then needs a slot-to-slot move with no
+    /// register free for it.
+    ///
+    /// x86-64 declined `mix2` on exactly this shape before the bounce existed.
+    #[test]
+    fn a_saturated_edge_bounces_a_register_rather_than_declining() {
+        let mut f = TestFunc::default();
+        let (entry, header, latch, exit) = (f.block(), f.block(), f.block(), f.block());
+        let (i1, i2) = (f.int(), f.int());
+        let (p1, p2, n1, n2) = (f.int(), f.int(), f.int(), f.int());
+
+        f.inst(entry, vec![Operand::any(i1)], vec![]);
+        f.inst(entry, vec![Operand::any(i2)], vec![]);
+        f.inst(entry, vec![], vec![]);
+        f.goto(entry, &[header]);
+        f.pass(entry, &[i1, i2]);
+
+        f.params(header, &[p1, p2]);
+        f.inst(header, vec![Operand::any(n1)], vec![Operand::any(p1)]);
+        f.inst(header, vec![Operand::any(n2)], vec![Operand::any(p2)]);
+        // Each parameter is read again after its back-edge argument exists, so the
+        // two interfere and coalescing must refuse them.
+        f.inst(header, vec![], vec![Operand::any(p1), Operand::any(p2)]);
+        f.inst(header, vec![], vec![]);
+        f.goto(header, &[latch, exit]);
+
+        f.inst(latch, vec![], vec![]);
+        f.goto(latch, &[header]);
+        f.pass(latch, &[n1, n2]);
+
+        f.inst(exit, vec![], vec![]);
+
+        // One register for four simultaneously-live values: the back edge has to
+        // move slot to slot with nothing free to route through.
+        let ra = allocate(&f, &env(1)).expect("a saturated edge must not decline");
+        verify(&f, &ra).expect("the bounced register must be restored intact");
+
+        // The precondition, so this cannot quietly stop testing the bounce.
+        let term = *f.block_insts(latch).last().unwrap();
+        let edits: Vec<&Edit> = ra.edits_at(ProgPoint::before(term)).collect();
+        let saved = edits.iter().find_map(|e| match e {
+            Edit::Move(m) => match (m.from, m.to) {
+                (Alloc::Reg(r), Alloc::Spill(_)) => Some(r),
+                _ => None,
+            },
+            _ => None,
+        });
+        let restored = edits.iter().rev().find_map(|e| match e {
+            Edit::Move(m) => match (m.from, m.to) {
+                (Alloc::Spill(_), Alloc::Reg(r)) => Some(r),
+                _ => None,
+            },
+            _ => None,
+        });
+        assert!(saved.is_some(), "no bounce happened: {edits:?}");
+        assert_eq!(
+            saved, restored,
+            "the edge must restore the register it borrowed: {edits:?}",
         );
     }
 
