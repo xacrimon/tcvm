@@ -24,6 +24,7 @@
 //! trivially safe — both columns are defined at the same block entry.
 
 use std::collections::HashMap;
+use foldhash::fast::RandomState;
 
 use super::{Block, Def, Func, Inst, Val};
 
@@ -44,15 +45,15 @@ impl<'gc> Func<'gc> {
 
         // The value a param was proven equal to. Targets are stored already
         // resolved, so `resolve` chases chains at most one deep and cannot cycle.
-        let mut repl: HashMap<Val, Val> = HashMap::new();
+        let mut repl: HashMap<Val, Val, RandomState> = HashMap::default();
         // Which params name a value as a *raw* operand. When that value is
         // eliminated, those params may in turn become trivial or congruent.
-        let mut users: HashMap<Val, Vec<Val>> = HashMap::new();
+        let mut users: HashMap<Val, Vec<Val>, RandomState> = HashMap::default();
         // The canonical param registered for a `(block, resolved operands)`
         // signature, plus each param's currently-registered signature so a
         // reprocess can retract a stale one before it wrongly attracts others.
-        let mut canon: HashMap<(Block, Vec<Val>), Val> = HashMap::new();
-        let mut sig_of_param: HashMap<Val, Vec<Val>> = HashMap::new();
+        let mut canon: HashMap<(Block, Vec<Val>), Val, RandomState> = HashMap::default();
+        let mut sig_of_param: HashMap<Val, Vec<Val>, RandomState> = HashMap::default();
 
         let mut work: Vec<Val> = Vec::new();
         for (b, pred_edges) in preds.iter().enumerate() {
@@ -138,7 +139,7 @@ impl<'gc> Func<'gc> {
 
     /// Rewrite every use of an eliminated param to its replacement, then delete
     /// the dead columns from each block and the matching arg from every edge.
-    fn apply(&mut self, repl: &HashMap<Val, Val>, preds: &[Vec<(Inst, usize)>]) {
+    fn apply(&mut self, repl: &HashMap<Val, Val, RandomState>, preds: &[Vec<(Inst, usize)>]) {
         // 1. Uses: instruction args, edge args, and frame-state registers. Defs
         //    (results, params) are left alone; a deleted param's column goes in
         //    step 2.
@@ -190,8 +191,8 @@ impl<'gc> Func<'gc> {
 fn eliminate(
     p: Val,
     v: Val,
-    repl: &mut HashMap<Val, Val>,
-    users: &HashMap<Val, Vec<Val>>,
+    repl: &mut HashMap<Val, Val, RandomState>,
+    users: &HashMap<Val, Vec<Val>, RandomState>,
     work: &mut Vec<Val>,
 ) {
     let v = resolve(repl, v);
@@ -204,7 +205,7 @@ fn eliminate(
     }
 }
 
-fn resolve(repl: &HashMap<Val, Val>, mut v: Val) -> Val {
+fn resolve(repl: &HashMap<Val, Val, RandomState>, mut v: Val) -> Val {
     while let Some(&n) = repl.get(&v) {
         if n == v {
             break;
