@@ -24,6 +24,7 @@ pub mod code;
 pub mod isel;
 pub mod layout;
 pub mod mach;
+pub mod order;
 pub mod regalloc;
 
 #[cfg(target_arch = "aarch64")]

@@ -341,8 +341,8 @@ impl Encoder<'_, '_> {
         // Exit stubs borrow scratch that can reach the callee-saved registers; the
         // same choice `exit_stub` makes, so the saves match what the stubs clobber.
         for e in 0..self.m.exits.len() {
-            let (base, s0, s1, _) = self.stub_scratch(self.m.exits[e].inst);
-            for g in [base, s0, s1] {
+            let (base, s0, _) = self.stub_scratch(self.m.exits[e].inst);
+            for g in [base, s0] {
                 used[g.0 as usize] = true;
             }
         }
@@ -643,7 +643,9 @@ impl Encoder<'_, '_> {
                     _ => unreachable!("outer match restricts these"),
                 }
             }
-            MOp::AluImm(..) => unreachable!("isel lowers non-shift immediates into an `Imm` + `Alu`"),
+            MOp::AluImm(..) => {
+                unreachable!("isel lowers non-shift immediates into an `Imm` + `Alu`")
+            }
             // Two-address: the def already holds its first source (`annotate` marked
             // it `Reuse(0)`, the allocator copied it in), so the op writes the def.
             MOp::FAlu(o) => match o {
@@ -892,9 +894,15 @@ impl Encoder<'_, '_> {
     /// Scratch for an exit stub: registers no keepalive of `guard` occupies, so
     /// loading spilled keepalives into them destroys nothing the stub still has to
     /// write back. The stub is cold, so any non-keepalive register holds a dead
-    /// fast-path value. Two gprs carry the payload and tag words, a third holds the
-    /// frame base across the run, and one xmm unpacks a spilled float.
-    fn stub_scratch(&self, guard: Inst) -> (Gpr, Gpr, Gpr, Xmm) {
+    /// fast-path value. One gpr holds the frame base across the run, a second
+    /// ferries each slot's words, and one xmm unpacks a spilled float.
+    ///
+    /// Only *two* gprs, not one per word: a slot's payload is stored before its tag
+    /// is materialized, so the ferry register is dead again by the time the tag
+    /// needs it. That matters — the pool is 13 registers and a guard in a hot loop
+    /// can keep 11 of them alive, so every scratch register this does not demand is
+    /// one the fast path gets to use.
+    fn stub_scratch(&self, guard: Inst) -> (Gpr, Gpr, Xmm) {
         let mut busy_i = [false; 16];
         let mut busy_f = [false; 16];
         for k in 0..self.m.inst(guard).uses.len() {
@@ -910,13 +918,13 @@ impl Encoder<'_, '_> {
                 .next()
                 .expect("the pool outnumbers a guard's keepalives"))
         };
-        let (base, s0, s1) = (next(), next(), next());
+        let (base, s0) = (next(), next());
         let f0 = FLOAT_POOL
             .iter()
             .copied()
             .find(|&r| !busy_f[r as usize])
             .expect("an xmm register is free of the keepalives");
-        (base, s0, s1, Xmm(f0))
+        (base, s0, Xmm(f0))
     }
 
     /// Materialize the interpreter's view of the frame, then return. Every store
@@ -926,7 +934,7 @@ impl Encoder<'_, '_> {
         self.a.bind(label);
 
         let stub = self.m.exits[e.0 as usize].clone();
-        let (sc_base, sc0, sc1, sc_f) = self.stub_scratch(stub.inst);
+        let (sc_base, sc0, sc_f) = self.stub_scratch(stub.inst);
 
         // The base survives every value the stub loads; a keepalive already in a
         // register stays there, otherwise it comes off the stack into `sc_base`.
@@ -962,14 +970,15 @@ impl Encoder<'_, '_> {
             };
             self.a.store(base, payload_off, payload);
 
+            // `sc0` is free again: whatever it held has just been stored.
             let tag_reg = match tag {
                 Tag::Const(k) => {
-                    self.a.mov_imm(sc1, layout::kind(k) as i64);
-                    sc1
+                    self.a.mov_imm(sc0, layout::kind(k) as i64);
+                    sc0
                 }
                 Tag::Dyn(t) => {
                     let a = self.at_exit(e, t);
-                    self.read_g(a, sc1)
+                    self.read_g(a, sc0)
                 }
             };
             self.a.store8(base, kind_off, tag_reg);
@@ -1074,6 +1083,7 @@ mod tests {
         );
         m.push(b, MInst::new(MOp::Ret { nret: 1 }, vec![], vec![]));
 
+        m.set_layout().expect("single block is reducible");
         (m, sum, def_sum, store)
     }
 

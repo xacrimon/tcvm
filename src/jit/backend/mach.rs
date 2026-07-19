@@ -38,6 +38,7 @@ use std::fmt::{self, Write};
 use foldhash::fast::RandomState;
 
 use crate::env::value::ValueKind;
+use crate::jit::backend::order::{self, Layout};
 // The register allocator owns this vocabulary, not this module: it is the leaf
 // that neither the machine IR nor the encoder is allowed to reach into, so the
 // types a program is *described in* live down there. Re-exported so the rest of
@@ -302,6 +303,23 @@ impl MInst {
 #[derive(Clone, Debug, Default)]
 pub struct MBlockData {
     pub insts: Vec<usize>,
+    /// Values this block receives on every incoming edge — the machine-level form
+    /// of the IR's block parameters. Empty unless isel kept SSA (see
+    /// [`crate::jit::backend::isel::select_ssa`]); the destructing path lowers them
+    /// into `Mov`s on the edge instead.
+    ///
+    /// One IR parameter can be *two* of these: a `Rep::Val` whose tag is not known
+    /// statically needs a payload register and a tag register. So this is a list of
+    /// machine registers, not of IR values, and its length is not the IR block's
+    /// parameter count.
+    pub params: Vec<VReg>,
+    /// The values this block passes to its unique successor, positionally matching
+    /// that successor's `params`.
+    ///
+    /// Lives on the block rather than the instruction because only a `Jump` ever
+    /// carries arguments: a conditional branch's successors are always edge blocks,
+    /// and each of those does its own single `Jump`.
+    pub jump_args: Vec<VReg>,
 }
 
 /// How one Lua register is reconstructed on the way out.
@@ -371,6 +389,9 @@ pub struct MFunc {
     /// defining instruction instead of touching a slot. Maps the value to that
     /// instruction. The allocator reads it through [`RegallocFunc::remat`].
     pub remat: HashMap<VReg, Inst, RandomState>,
+    /// Block layout order and loop forest, from [`order::compute`]. Set once the
+    /// CFG is complete — see [`MFunc::set_layout`].
+    layout: Option<Layout>,
 }
 
 impl MFunc {
@@ -387,7 +408,26 @@ impl MFunc {
             max_lua_reg: 0,
             phys_hints: HashMap::default(),
             remat: HashMap::default(),
+            layout: None,
         }
+    }
+
+    /// Compute the block layout order and loop forest, once the CFG is complete.
+    ///
+    /// Must be called before the allocator or an encoder touches this function:
+    /// both work in this linearization, and [`RegallocFunc::block_order`] serves
+    /// it from here rather than recomputing. Fails only on irreducible control
+    /// flow, which the frontend should never produce — see [`order`].
+    pub fn set_layout(&mut self) -> Result<(), order::Irreducible> {
+        self.layout = Some(order::compute(self)?);
+        Ok(())
+    }
+
+    /// The loop forest, for spill weighting and (later) Braun–Hack's edge lengths.
+    pub fn layout(&self) -> &Layout {
+        self.layout
+            .as_ref()
+            .expect("MFunc::set_layout must run before the layout is read")
     }
 
     pub fn new_vreg(&mut self, class: RegClass) -> VReg {
@@ -422,10 +462,12 @@ impl MFunc {
 /// instruction reads and writes. Nothing above this line mentions aarch64, and
 /// nothing below it mentions a `MOp`.
 ///
-/// `block_order` is inherited, deliberately. The encoder lays blocks out in the
-/// order this returns and the allocator numbers live intervals in it; two
-/// implementations that agree today would be a bug waiting for a CFG shape nobody
-/// has written yet.
+/// `block_order` is served from the stored [`Layout`] rather than recomputed. The
+/// encoder lays blocks out in the order this returns and the allocator numbers
+/// live intervals in it; two implementations that agree today would be a bug
+/// waiting for a CFG shape nobody has written yet. The trait's own reverse
+/// postorder is *not* good enough here — it does not keep a loop's blocks
+/// contiguous, which lifetime interval construction requires.
 impl RegallocFunc for MFunc {
     fn num_blocks(&self) -> usize {
         self.blocks.len()
@@ -493,6 +535,18 @@ impl RegallocFunc for MFunc {
     fn remat(&self, v: VReg) -> Option<Inst> {
         self.remat.get(&v).copied()
     }
+
+    fn block_order(&self) -> Vec<MBlock> {
+        self.layout().order.clone()
+    }
+
+    fn block_params(&self, b: MBlock) -> &[VReg] {
+        &self.block(b).params
+    }
+
+    fn jump_args(&self, b: MBlock) -> &[VReg] {
+        &self.block(b).jump_args
+    }
 }
 
 impl Default for MFunc {
@@ -504,7 +558,12 @@ impl Default for MFunc {
 pub fn print_mfunc(f: &MFunc) -> String {
     let mut s = String::new();
     for (bi, blk) in f.blocks.iter().enumerate() {
-        let _ = writeln!(s, "mb{bi}:");
+        if blk.params.is_empty() {
+            let _ = writeln!(s, "mb{bi}:");
+        } else {
+            let ps: Vec<String> = blk.params.iter().map(|p| format!("r{}", p.0)).collect();
+            let _ = writeln!(s, "mb{bi}({}):", ps.join(", "));
+        }
         for &i in &blk.insts {
             let inst = &f.insts[i];
             let _ = write!(s, "    ");
@@ -516,6 +575,12 @@ pub fn print_mfunc(f: &MFunc) -> String {
             if !inst.uses.is_empty() {
                 let us: Vec<String> = inst.uses.iter().map(|u| format!("r{}", u.vreg.0)).collect();
                 let _ = write!(s, " {}", us.join(", "));
+            }
+            // The arguments ride the terminator, which is where a reader expects
+            // them even though they are stored on the block.
+            if inst.op.is_terminator() && !blk.jump_args.is_empty() {
+                let as_: Vec<String> = blk.jump_args.iter().map(|a| format!("r{}", a.0)).collect();
+                let _ = write!(s, "({})", as_.join(", "));
             }
             let _ = writeln!(s);
         }

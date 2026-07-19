@@ -245,12 +245,12 @@ fn native_shift_edge_cases_match_interpreter() {
     lua.load_all();
 
     let cases = [
-        "local function f(x) return x >> 2 end",  // logical: zero-fills negatives
+        "local function f(x) return x >> 2 end", // logical: zero-fills negatives
         "local function f(x) return x >> 64 end", // |count| >= 64 -> 0
         "local function f(x) return x << 64 end", // |count| >= 64 -> 0
         "local function f(x) return x >> -3 end", // negative count reverses to << 3
         "local function f(x) return x << -3 end", // negative count reverses to >> 3
-        "local function f(x) return x << 0 end",  // identity
+        "local function f(x) return x << 0 end", // identity
     ];
 
     for src in cases {
@@ -273,7 +273,11 @@ fn native_shift_edge_cases_match_interpreter() {
                 let status =
                     Status::unpack(region(std::ptr::null_mut(), stack.as_mut_ptr().cast()));
 
-                assert_eq!(status, Status::Return(1), "`{src}` x={x} should run natively");
+                assert_eq!(
+                    status,
+                    Status::Return(1),
+                    "`{src}` x={x} should run natively"
+                );
                 assert_eq!(stack[0].get_integer(), Some(want), "`{src}` x={x}");
             });
         }
@@ -293,12 +297,19 @@ fn interpret_unary(lua: &mut Lua, src: &str, _name: &str, arg: i64) -> i64 {
             let chunk = ctx.load(src, Some("interp")).expect("compile");
             let proto = chunk.as_lua().expect("closure").proto.prototypes[0];
             let upvalues = (0..proto.num_upvalues)
-                .map(|_| Gc::new(ctx.mutation(), RefLock::new(UpvalueState::Closed(Value::nil()))))
+                .map(|_| {
+                    Gc::new(
+                        ctx.mutation(),
+                        RefLock::new(UpvalueState::Closed(Value::nil())),
+                    )
+                })
                 .collect();
             let closure = Function::new_lua(ctx.mutation(), proto, upvalues);
-            Ok::<_, crate::RuntimeError>(
-                ctx.stash(Executor::start(ctx, closure, (Value::integer(arg),))),
-            )
+            Ok::<_, crate::RuntimeError>(ctx.stash(Executor::start(
+                ctx,
+                closure,
+                (Value::integer(arg),),
+            )))
         })
         .expect("start");
     lua.finish(&ex).expect("run");

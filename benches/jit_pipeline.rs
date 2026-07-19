@@ -14,15 +14,15 @@
 use std::fs;
 
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
+use tcvm::Lua;
 use tcvm::bench_support;
 use tcvm::env::value::Value;
 use tcvm::jit::backend::code::Code;
-use tcvm::jit::backend::isel::select;
+use tcvm::jit::backend::isel::{select, select_ssa};
 use tcvm::jit::backend::regalloc::allocate;
 use tcvm::jit::backend::target::{Status, annotate, encode, machine_env};
 use tcvm::jit::frontend::lower::lower;
 use tcvm::jit::ir::ty::{Rep, Ty, TypeSet};
-use tcvm::Lua;
 
 const INT: Ty = Ty::new(Rep::Val, TypeSet::INT);
 
@@ -90,7 +90,11 @@ fn jit_pipeline(c: &mut Criterion) {
         // `mix(EXEC_N)` to a native return before timing it.
         stack[0] = Value::integer(EXEC_N);
         let status = Status::unpack(region(std::ptr::null_mut(), stack.as_mut_ptr().cast()));
-        assert_eq!(status, Status::Return(1), "exec benchmark must run natively");
+        assert_eq!(
+            status,
+            Status::Return(1),
+            "exec benchmark must run natively"
+        );
 
         // Stage 3 — lower to IR.
         group.bench_function("frontend::lower", |b| {
@@ -118,6 +122,32 @@ fn jit_pipeline(c: &mut Criterion) {
         group.bench_function("regalloc::allocate", |b| {
             b.iter(|| black_box(allocate(black_box(&m), &env).expect("regalloc")));
         });
+
+        // The SSA path, stage for stage against the destructing one. `select_ssa`
+        // leaves the block parameters in place, so `select` does no parallel-copy
+        // sequencing and `allocate` builds intervals in one reverse pass instead of
+        // iterating a live-set dataflow to a fixpoint — at the cost of resolving the
+        // edges itself. These three lines are what say whether that trade pays.
+        {
+            let mut m_ssa = select_ssa(&func).expect("isel ssa");
+            annotate(&mut m_ssa);
+
+            group.bench_function("isel::select_ssa", |b| {
+                b.iter(|| black_box(select_ssa(black_box(&func)).expect("isel ssa")));
+            });
+            group.bench_function("regalloc::allocate (ssa)", |b| {
+                b.iter(|| black_box(allocate(black_box(&m_ssa), &env).expect("regalloc")));
+            });
+            group.bench_function("full (lower..encode, ssa)", |b| {
+                b.iter(|| {
+                    let func = lower(black_box(mix), 0, vec![INT]).expect("lower");
+                    let mut m = select_ssa(&func).expect("isel ssa");
+                    annotate(&mut m);
+                    let ra = allocate(&m, &env).expect("regalloc");
+                    black_box(encode(&m, &func.pool, &ra).expect("encode"))
+                });
+            });
+        }
 
         // Stage 6 — encode to machine bytes.
         group.bench_function("target::encode", |b| {

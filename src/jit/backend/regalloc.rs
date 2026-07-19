@@ -269,6 +269,29 @@ pub trait RegallocFunc {
     fn num_vregs(&self) -> usize;
     fn class(&self, v: VReg) -> RegClass;
 
+    /// Values this block receives on every incoming edge, defined at its entry.
+    ///
+    /// Non-empty only when the client kept SSA form: a block parameter is a
+    /// definition with no defining instruction, so the allocator must build its
+    /// intervals and resolve its edges accordingly. A client that destructs SSA
+    /// before allocation — lowering parameters into copies on the edges — answers
+    /// empty, which is what makes this an extension rather than a change.
+    fn block_params(&self, _b: Block) -> &[VReg] {
+        &[]
+    }
+
+    /// The values `b` passes to its sole successor, positionally matching that
+    /// successor's [`RegallocFunc::block_params`].
+    fn jump_args(&self, _b: Block) -> &[VReg] {
+        &[]
+    }
+
+    /// Whether any block has parameters — i.e. whether this function is in SSA
+    /// form. The allocator needs it to pick a code path.
+    fn has_block_params(&self) -> bool {
+        (0..self.num_blocks()).any(|b| !self.block_params(Block(b as u32)).is_empty())
+    }
+
     /// If this instruction is a pure register-to-register copy — its def `dk`
     /// receives exactly its use `uk`, same class, no other effect — say so.
     ///
@@ -396,6 +419,14 @@ pub struct Allocation {
     ntemps: Vec<u32>,
     /// Sorted by program point.
     edits: Vec<(ProgPoint, Edit)>,
+    /// Where each block's parameters live, per block. Empty for a function whose
+    /// SSA was destructed before allocation.
+    ///
+    /// Parameters are not operands of any instruction, so nothing in `allocs`
+    /// records where one is *defined*. The encoder does not need to know, but the
+    /// checker does: without this it cannot tell whether an edge's moves actually
+    /// delivered each parameter to the place its block reads it from.
+    block_params: Vec<Vec<Alloc>>,
     pub num_spills: u32,
 }
 
@@ -424,6 +455,11 @@ impl Allocation {
         self.allocs[end - self.ntemps[i] as usize + k]
     }
 
+    /// Where parameter `k` of block `b` lives.
+    pub fn block_param(&self, b: Block, k: usize) -> Alloc {
+        self.block_params[b.0 as usize][k]
+    }
+
     /// The fix-ups to emit at `p`, in insertion order among equal points.
     pub fn edits_at(&self, p: ProgPoint) -> impl Iterator<Item = &Edit> {
         let lo = self.edits.partition_point(|&(q, _)| q < p);
@@ -448,6 +484,7 @@ pub struct AllocationBuilder {
     /// find every mention of a value without walking the function again.
     slot_vreg: Vec<VReg>,
     edits: Vec<(ProgPoint, Edit)>,
+    block_params: Vec<Vec<Alloc>>,
 }
 
 impl AllocationBuilder {
@@ -480,7 +517,15 @@ impl AllocationBuilder {
             ntemps,
             slot_vreg,
             edits: Vec::new(),
+            block_params: (0..f.num_blocks())
+                .map(|b| vec![Alloc::Spill(u32::MAX); f.block_params(Block(b as u32)).len()])
+                .collect(),
         }
+    }
+
+    /// Record where parameter `k` of block `b` lives.
+    pub fn set_block_param(&mut self, b: Block, k: usize, a: Alloc) {
+        self.block_params[b.0 as usize][k] = a;
     }
 
     /// Put every mention of `v` in the same place. What a non-splitting allocator
@@ -522,6 +567,7 @@ impl AllocationBuilder {
             ndefs: self.ndefs,
             ntemps: self.ntemps,
             edits: self.edits,
+            block_params: self.block_params,
             num_spills,
         }
     }
@@ -641,65 +687,15 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
         span[b.0 as usize] = (start, p);
     }
 
-    let live_in = liveness(f, &order);
-
-    // Build segments on a doubled axis: instruction `i` uses at `2·pos` and defs at
-    // `2·pos + 1`, so a use segment `[.., 2·pos + 1)` and a def segment
-    // `[2·pos + 1, ..)` touch without overlapping. That adjacency is what lets a
-    // copy's ends — and a two-address op's dying source and its dest — share a
-    // register, while a source that outlives the op extends past the def slot and
-    // correctly interferes.
-    let mut raw: Vec<Vec<(u32, u32)>> = vec![Vec::new(); f.num_vregs()];
-    for &b in &order {
-        let (bs, be) = span[b.0 as usize];
-        let bfrom = bs * 2;
-        let bto = be * 2;
-
-        // Live-out is what any successor needs live on entry.
-        let mut open: HashMap<VReg, u32, RandomState> = HashMap::default();
-        for &s in &f.succs(b) {
-            for &v in &live_in[s.0 as usize] {
-                open.entry(v).or_insert(bto);
-            }
-        }
-
-        for &i in f.block_insts(b).iter().rev() {
-            let slot = pos[i] * 2;
-            // A temp spans the whole instruction slot, so it collides with every
-            // operand and with the other temps and lands in its own register.
-            for o in f.temps(i) {
-                raw[o.vreg.0 as usize].push((slot, slot + 2));
-            }
-            for o in f.defs(i) {
-                // A def ends the value's open segment; a dead def gets a minimal one.
-                let end = open.remove(&o.vreg).unwrap_or(slot + 2);
-                raw[o.vreg.0 as usize].push((slot + 1, end));
-            }
-            // A two-address def reuses exactly one input's register; every *other*
-            // input must survive across the def, or the op would clobber it.
-            let reused_uk = f.defs(i).iter().find_map(|o| match o.constraint {
-                Constraint::Reuse(uk) => Some(uk),
-                _ => None,
-            });
-            for (k, o) in f.uses(i).iter().enumerate() {
-                // First seen going backward is the latest use, hence the furthest
-                // end; keep it. The reused input ends at the def slot so it can
-                // coalesce; a non-reused input at a reuse op extends one slot past,
-                // to interfere with the def and land elsewhere.
-                let end = if reused_uk.is_some() && Some(k) != reused_uk {
-                    slot + 2
-                } else {
-                    slot + 1
-                };
-                open.entry(o.vreg).or_insert(end);
-            }
-        }
-
-        // Whatever is still open is live from the block's start.
-        for (v, end) in open {
-            raw[v.0 as usize].push((bfrom, end));
-        }
-    }
+    // SSA input takes the one-pass construction; destructed input keeps the
+    // fixpoint. Not interchangeable — see [`build_intervals_ssa`] for why the
+    // one-pass version pessimizes a multi-def function rather than merely being
+    // slower to reach.
+    let raw = if f.has_block_params() {
+        build_intervals_ssa(f, &order, &pos, &span)
+    } else {
+        build_intervals_destructed(f, &order, &pos, &span)
+    };
 
     // Merge once; the scan reads these per class, and the reload phase reads them
     // again to know which register is free where.
@@ -1270,6 +1266,17 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
         }
     }
 
+    if f.has_block_params() {
+        for &blk in &order {
+            for (k, &p) in f.block_params(blk).iter().enumerate() {
+                if let Some(a) = loc[p.0 as usize] {
+                    b.set_block_param(blk, k, a);
+                }
+            }
+        }
+        resolve_edges(f, env, &order, &pos, &ranges, &loc, &mut b)?;
+    }
+
     Ok(b.finish(spills))
 }
 
@@ -1339,6 +1346,355 @@ fn reject_unsupported(f: &impl RegallocFunc) -> Result<(), RegallocError> {
         for o in f.uses(i) {
             if let Constraint::Reuse(_) = o.constraint {
                 return Err(RegallocError::UnsupportedConstraint(o.constraint));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Lifetime intervals, in one reverse pass and without a dataflow analysis.
+///
+/// Wimmer & Franz, CGO'10 Fig. 4. Segments live on a doubled axis: instruction
+/// `i` uses at `2·pos` and defs at `2·pos + 1`, so a use segment `[.., 2·pos + 1)`
+/// and a def segment `[2·pos + 1, ..)` touch without overlapping. That adjacency
+/// is what lets a copy's ends — and a two-address op's dying source and its dest —
+/// share a register, while a source that outlives the op extends past the def slot
+/// and correctly interferes.
+///
+/// # Why this needs no fixpoint
+///
+/// A value live across a back edge cannot be seen in one backward sweep: when the
+/// loop's last block is processed the header has not been, so the header's live-in
+/// is still empty. The repair is the loop-header case at the bottom — everything
+/// live at a loop header is live through the *whole* loop, and because the layout
+/// keeps a loop's blocks contiguous (see [`super::order`]) that entire extent is
+/// **one range**. One range add per live value, instead of iterating a live-set
+/// dataflow to convergence.
+///
+/// The `live_in` sets this leaves behind are therefore deliberately *incomplete* —
+/// the loop case adds ranges without updating them. Nothing downstream reads them,
+/// which is the only reason that is allowed.
+///
+/// # Why this is an SSA algorithm and not a general one
+///
+/// The loop case is *sound* on a multi-def function but it is a pessimization
+/// there, so this must not be pointed at destructed input. Its justification is
+/// SSA dominance: a value live at a loop header is necessarily defined before the
+/// loop, hence genuinely live throughout it. Destruct SSA first and that stops
+/// being true — a loop-carried value becomes a vreg with a `Mov` def *inside* the
+/// loop, still live-in at the header but dead through the tail of the body where
+/// the next iteration's value is computed. Extending it across the whole loop
+/// fills in exactly the hole that lets the two ends share a register, and the
+/// back-edge copy that would have coalesced away comes back as a real move.
+///
+/// [`build_intervals_destructed`] keeps the dataflow fixpoint for that form.
+fn build_intervals_ssa(
+    f: &impl RegallocFunc,
+    order: &[Block],
+    pos: &[u32],
+    span: &[(u32, u32)],
+) -> Vec<Vec<(u32, u32)>> {
+    let mut raw: Vec<Vec<(u32, u32)>> = vec![Vec::new(); f.num_vregs()];
+    let mut live_in: Vec<Vec<VReg>> = vec![Vec::new(); f.num_blocks()];
+
+    let mut ord_idx = vec![u32::MAX; f.num_blocks()];
+    for (k, &b) in order.iter().enumerate() {
+        ord_idx[b.0 as usize] = k as u32;
+    }
+
+    // How far each loop header's loop extends. A successor already placed is a back
+    // edge and its source is inside the loop; the furthest such source's end is the
+    // loop's end. Exact, not approximate, because the layout keeps a loop contiguous.
+    let mut loop_end = vec![0u32; f.num_blocks()];
+    for &b in order {
+        for s in f.succs(b) {
+            if ord_idx[s.0 as usize] <= ord_idx[b.0 as usize] {
+                let e = span[b.0 as usize].1 * 2;
+                let slot = &mut loop_end[s.0 as usize];
+                *slot = (*slot).max(e);
+            }
+        }
+    }
+
+    for &b in order.iter().rev() {
+        let (bs, be) = span[b.0 as usize];
+        let (bfrom, bto) = (bs * 2, be * 2);
+
+        let mut open: HashMap<VReg, u32, RandomState> = HashMap::default();
+        for &s in &f.succs(b) {
+            for &v in &live_in[s.0 as usize] {
+                open.entry(v).or_insert(bto);
+            }
+        }
+        // A successor's parameters are supplied by this block's arguments. The
+        // argument is live to the end of this block and the parameter starts at the
+        // successor's entry, so the two never overlap — which is exactly what lets
+        // them share a register and the edge cost nothing.
+        for &a in f.jump_args(b) {
+            open.entry(a).or_insert(bto);
+        }
+
+        for &i in f.block_insts(b).iter().rev() {
+            let slot = pos[i] * 2;
+            // A temp spans the whole instruction slot, so it collides with every
+            // operand and with the other temps and lands in its own register.
+            for o in f.temps(i) {
+                raw[o.vreg.0 as usize].push((slot, slot + 2));
+            }
+            for o in f.defs(i) {
+                // A def ends the value's open segment; a dead def gets a minimal one.
+                let end = open.remove(&o.vreg).unwrap_or(slot + 2);
+                raw[o.vreg.0 as usize].push((slot + 1, end));
+            }
+            // A two-address def reuses exactly one input's register; every *other*
+            // input must survive across the def, or the op would clobber it.
+            let reused_uk = f.defs(i).iter().find_map(|o| match o.constraint {
+                Constraint::Reuse(uk) => Some(uk),
+                _ => None,
+            });
+            for (k, o) in f.uses(i).iter().enumerate() {
+                let end = if reused_uk.is_some() && Some(k) != reused_uk {
+                    slot + 2
+                } else {
+                    slot + 1
+                };
+                open.entry(o.vreg).or_insert(end);
+            }
+        }
+
+        // A parameter is defined at this block's entry. It closes here and must not
+        // propagate to the predecessors — they supply it as an argument instead.
+        for &p in f.block_params(b) {
+            let end = open.remove(&p).unwrap_or(bfrom + 1);
+            raw[p.0 as usize].push((bfrom, end));
+        }
+
+        // Whatever is still open is live from the block's start.
+        for (&v, &end) in open.iter() {
+            raw[v.0 as usize].push((bfrom, end));
+        }
+
+        // The loop case: everything live at a loop header is live for the whole loop.
+        let lend = loop_end[b.0 as usize];
+        if lend > bto {
+            for &v in open.keys() {
+                raw[v.0 as usize].push((bfrom, lend));
+            }
+        }
+
+        let mut live: Vec<VReg> = open.into_keys().collect();
+        live.sort();
+        live_in[b.0 as usize] = live;
+    }
+
+    raw
+}
+
+/// Lifetime intervals for a function whose SSA has already been destructed.
+///
+/// The pre-SSA path: a live-set dataflow fixpoint, then one forward sweep turning
+/// those sets into segments. [`build_intervals_ssa`] is what replaces this — see
+/// there for why it cannot simply be pointed at this form.
+fn build_intervals_destructed(
+    f: &impl RegallocFunc,
+    order: &[Block],
+    pos: &[u32],
+    span: &[(u32, u32)],
+) -> Vec<Vec<(u32, u32)>> {
+    let live_in = liveness(f, order);
+    let mut raw: Vec<Vec<(u32, u32)>> = vec![Vec::new(); f.num_vregs()];
+
+    for &b in order {
+        let (bs, be) = span[b.0 as usize];
+        let bfrom = bs * 2;
+        let bto = be * 2;
+
+        let mut open: HashMap<VReg, u32, RandomState> = HashMap::default();
+        for &s in &f.succs(b) {
+            for &v in &live_in[s.0 as usize] {
+                open.entry(v).or_insert(bto);
+            }
+        }
+
+        for &i in f.block_insts(b).iter().rev() {
+            let slot = pos[i] * 2;
+            for o in f.temps(i) {
+                raw[o.vreg.0 as usize].push((slot, slot + 2));
+            }
+            for o in f.defs(i) {
+                let end = open.remove(&o.vreg).unwrap_or(slot + 2);
+                raw[o.vreg.0 as usize].push((slot + 1, end));
+            }
+            let reused_uk = f.defs(i).iter().find_map(|o| match o.constraint {
+                Constraint::Reuse(uk) => Some(uk),
+                _ => None,
+            });
+            for (k, o) in f.uses(i).iter().enumerate() {
+                let end = if reused_uk.is_some() && Some(k) != reused_uk {
+                    slot + 2
+                } else {
+                    slot + 1
+                };
+                open.entry(o.vreg).or_insert(end);
+            }
+        }
+
+        for (v, end) in open {
+            raw[v.0 as usize].push((bfrom, end));
+        }
+    }
+
+    raw
+}
+
+/// SSA deconstruction, fused into edge resolution (Wimmer & Franz, CGO'10 Fig. 7).
+///
+/// A block parameter has to arrive where its block expects it, from wherever the
+/// predecessor's matching argument ended up. `isel` materializes an edge block for
+/// every conditional branch, so a block that passes arguments has exactly one
+/// successor: the moves go before its terminator, and there is no critical edge
+/// left to split here.
+///
+/// The moves on one edge are a **parallel** copy — they happen simultaneously, so
+/// a loop that rotates values through each other forms a cycle that naive in-order
+/// emission would clobber. This is the sequencing that used to live in `isel`, now
+/// over physical locations rather than virtual registers, which is the point of
+/// moving it: at this level the allocator knows which registers are actually free
+/// and can borrow one, instead of inventing a vreg for the stage above to place.
+fn resolve_edges(
+    f: &impl RegallocFunc,
+    env: &MachineEnv,
+    order: &[Block],
+    pos: &[u32],
+    ranges: &[Vec<(u32, u32)>],
+    loc: &[Option<Alloc>],
+    b: &mut AllocationBuilder,
+) -> Result<(), RegallocError> {
+    for &pred in order {
+        let args = f.jump_args(pred);
+        if args.is_empty() {
+            continue;
+        }
+        let succs = f.succs(pred);
+        debug_assert_eq!(
+            succs.len(),
+            1,
+            "only a single-successor block passes arguments"
+        );
+        let params = f.block_params(succs[0]);
+        debug_assert_eq!(args.len(), params.len(), "edge arity");
+
+        let mut pending: Vec<(Alloc, Alloc, RegClass)> = args
+            .iter()
+            .zip(params)
+            .filter_map(|(&a, &p)| {
+                let (from, to) = (loc[a.0 as usize]?, loc[p.0 as usize]?);
+                // The coalesced case: argument and parameter already share a
+                // location, so the edge costs nothing.
+                (from != to).then_some((from, to, f.class(p)))
+            })
+            .collect();
+        if pending.is_empty() {
+            continue;
+        }
+
+        let term = *f.block_insts(pred).last().expect("block has a terminator");
+        let at = ProgPoint::before(term);
+
+        // Registers holding a live value at the end of this block, plus every
+        // location these moves themselves name. A scratch must avoid all of them.
+        let at_pos = pos[term] * 2;
+        let mut busy: Vec<PReg> = Vec::new();
+        for v in 0..f.num_vregs() {
+            if let Some(Alloc::Reg(r)) = loc[v] {
+                if ranges[v]
+                    .iter()
+                    .any(|&(lo, hi)| lo <= at_pos && at_pos < hi)
+                {
+                    busy.push(r);
+                }
+            }
+        }
+        for &(from, to, _) in &pending {
+            for a in [from, to] {
+                if let Alloc::Reg(r) = a {
+                    busy.push(r);
+                }
+            }
+        }
+        let scratch = |class: RegClass| -> Result<Alloc, RegallocError> {
+            env.order(class)
+                .iter()
+                .copied()
+                .find(|r| !busy.contains(r))
+                .map(Alloc::Reg)
+                // No reserved scratch register exists, by design, so when the
+                // machine genuinely has nothing free the region stays interpreted
+                // rather than compiling a clobber.
+                .ok_or(RegallocError::OutOfRegisters)
+        };
+
+        // Emit every move whose destination nothing else still has to read; when
+        // none qualifies, what remains is a permutation cycle, which one scratch
+        // location breaks.
+        let mut seq: Vec<Move> = Vec::new();
+        while !pending.is_empty() {
+            let srcs: Vec<Alloc> = pending.iter().map(|&(from, _, _)| from).collect();
+            let (ready, blocked): (Vec<_>, Vec<_>) = pending
+                .into_iter()
+                .partition(|&(_, to, _)| !srcs.contains(&to));
+
+            if ready.is_empty() {
+                let (from, _, class) = blocked[0];
+                let tmp = scratch(class)?;
+                seq.push(Move {
+                    from,
+                    to: tmp,
+                    class,
+                });
+                pending = blocked
+                    .into_iter()
+                    .map(|(f_, t_, c)| {
+                        if f_ == from {
+                            (tmp, t_, c)
+                        } else {
+                            (f_, t_, c)
+                        }
+                    })
+                    .collect();
+                continue;
+            }
+            for (from, to, class) in ready {
+                seq.push(Move { from, to, class });
+            }
+            pending = blocked;
+        }
+
+        // No machine here can move memory to memory, and a parameter can land in a
+        // slot while its argument sits in another — so route those through a
+        // register. Safe to reuse one scratch across them: it is free at this point
+        // and is neither a source nor a destination of any move on this edge.
+        for m in seq {
+            if let (Alloc::Spill(_), Alloc::Spill(_)) = (m.from, m.to) {
+                let tmp = scratch(m.class)?;
+                b.edit(
+                    at,
+                    Edit::Move(Move {
+                        from: m.from,
+                        to: tmp,
+                        class: m.class,
+                    }),
+                );
+                b.edit(
+                    at,
+                    Edit::Move(Move {
+                        from: tmp,
+                        to: m.to,
+                        class: m.class,
+                    }),
+                );
+            } else {
+                b.edit(at, Edit::Move(m));
             }
         }
     }
@@ -1437,11 +1793,12 @@ pub fn verify(f: &impl RegallocFunc, ra: &Allocation) -> Result<(), String> {
             let after = transfer(f, ra, b, before, &mut |_| Ok(())).expect("no errors reported");
 
             for s in f.succs(b) {
+                let crossed = cross_edge(f, ra, b, s, after.clone());
                 let merged = match &entry_state[s.0 as usize] {
-                    None => after.clone(),
+                    None => crossed.clone(),
                     Some(old) => old
                         .iter()
-                        .filter(|(loc, v)| after.get(loc) == Some(v))
+                        .filter(|(loc, v)| crossed.get(loc) == Some(v))
                         .map(|(&loc, &v)| (loc, v))
                         .collect(),
                 };
@@ -1463,6 +1820,48 @@ pub fn verify(f: &impl RegallocFunc, ra: &Allocation) -> Result<(), String> {
         transfer(f, ra, b, before, &mut |e| Err(e))?;
     }
     Ok(())
+}
+
+/// A predecessor's exit state, as the successor sees it on entry.
+///
+/// The edge's resolving moves have already run by this point (they sit before the
+/// terminator), so each parameter's location holds the *argument's* value. Crossing
+/// the edge renames it: the parameter is what the successor's instructions read.
+///
+/// Renaming rather than seeding is what makes this a real check. If resolution
+/// failed to deliver an argument, the location holds something else and the rename
+/// does not fire, so the successor's first use of that parameter reports a mismatch
+/// instead of being quietly papered over.
+fn cross_edge(
+    f: &impl RegallocFunc,
+    ra: &Allocation,
+    pred: Block,
+    succ: Block,
+    mut state: HashMap<Alloc, VReg, RandomState>,
+) -> HashMap<Alloc, VReg, RandomState> {
+    let params = f.block_params(succ);
+    if params.is_empty() {
+        return state;
+    }
+    let args = f.jump_args(pred);
+    let renamed: Vec<(Alloc, VReg)> = params
+        .iter()
+        .enumerate()
+        .filter_map(|(k, &p)| {
+            let at = ra.block_param(succ, k);
+            let arg = *args.get(k)?;
+            // The location must hold the argument feeding this parameter — moved
+            // there by resolution, or already there because the two coalesced.
+            (state.get(&at) == Some(&arg)).then_some((at, p))
+        })
+        .collect();
+    // Drop every parameter location first: one that resolution did not satisfy must
+    // not keep whatever stale value it happens to hold.
+    for k in 0..params.len() {
+        state.remove(&ra.block_param(succ, k));
+    }
+    state.extend(renamed);
+    state
 }
 
 /// Run one block's instructions over the symbolic state, reporting each use that
@@ -1607,6 +2006,8 @@ mod tests {
         temps: Vec<Vec<Operand>>,
         clobbers: Vec<Vec<PReg>>,
         classes: Vec<RegClass>,
+        params: Vec<Vec<VReg>>,
+        jump_args: Vec<Vec<VReg>>,
         phys: HashMap<VReg, PReg, RandomState>,
         remat: HashMap<VReg, Inst, RandomState>,
     }
@@ -1615,7 +2016,19 @@ mod tests {
         fn block(&mut self) -> Block {
             self.blocks.push(Vec::new());
             self.succs.push(Vec::new());
+            self.params.push(Vec::new());
+            self.jump_args.push(Vec::new());
             Block(self.blocks.len() as u32 - 1)
+        }
+
+        /// Give `b` these parameters — i.e. keep this function in SSA form.
+        fn params(&mut self, b: Block, ps: &[VReg]) {
+            self.params[b.0 as usize] = ps.to_vec();
+        }
+
+        /// The arguments `b` passes along its outgoing edge.
+        fn pass(&mut self, b: Block, args: &[VReg]) {
+            self.jump_args[b.0 as usize] = args.to_vec();
         }
 
         fn vreg(&mut self, class: RegClass) -> VReg {
@@ -1703,6 +2116,203 @@ mod tests {
         fn remat(&self, v: VReg) -> Option<Inst> {
             self.remat.get(&v).copied()
         }
+        fn block_params(&self, b: Block) -> &[VReg] {
+            &self.params[b.0 as usize]
+        }
+        fn jump_args(&self, b: Block) -> &[VReg] {
+            &self.jump_args[b.0 as usize]
+        }
+    }
+
+    /// Whether two merged interval lists share any position.
+    fn overlaps(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
+        a.iter()
+            .any(|&(al, ah)| b.iter().any(|&(bl, bh)| al < bh && bl < ah))
+    }
+
+    /// Positions and block spans, exactly as `allocate` computes them.
+    fn axis(f: &impl RegallocFunc) -> (Vec<Block>, Vec<u32>, Vec<(u32, u32)>) {
+        let order = f.block_order();
+        let mut pos = vec![0u32; f.num_insts()];
+        let mut span = vec![(0u32, 0u32); f.num_blocks()];
+        let mut p = 0u32;
+        for &b in &order {
+            let start = p;
+            for &i in f.block_insts(b) {
+                pos[i] = p;
+                p += 1;
+            }
+            span[b.0 as usize] = (start, p);
+        }
+        (order, pos, span)
+    }
+
+    fn ssa_ranges(f: &impl RegallocFunc) -> (Vec<Vec<(u32, u32)>>, Vec<(u32, u32)>) {
+        let (order, pos, span) = axis(f);
+        let ranges = build_intervals_ssa(f, &order, &pos, &span)
+            .into_iter()
+            .map(merge_ranges)
+            .collect();
+        (ranges, span)
+    }
+
+    /// The one-pass construction must not lose liveness the dataflow fixpoint
+    /// finds. Containment, not equality: the loop case deliberately
+    /// over-approximates — everything live at a header is given the whole loop — so
+    /// the intervals are a superset. It is the missing direction that would
+    /// miscompile, so that is the direction asserted.
+    fn assert_intervals_cover_liveness(f: &impl RegallocFunc) {
+        let (order, _, span) = axis(f);
+        let (ranges, _) = ssa_ranges(f);
+        let live_in = liveness(f, &order);
+
+        for &b in &order {
+            let at = span[b.0 as usize].0 * 2;
+            for &v in &live_in[b.0 as usize] {
+                assert!(
+                    ranges[v.0 as usize]
+                        .iter()
+                        .any(|&(lo, hi)| lo <= at && at < hi),
+                    "v{} is live-in at mb{} (position {at}) but its interval {:?} does not cover it",
+                    v.0,
+                    b.0,
+                    ranges[v.0 as usize],
+                );
+            }
+        }
+    }
+
+    /// The straight-line case: no loop, so the one pass is trivially complete.
+    #[test]
+    fn intervals_match_liveness_without_loops() {
+        assert_intervals_cover_liveness(&add_func());
+    }
+
+    /// The case the fixpoint existed for. Processing the body in reverse sees the
+    /// header's live-in as still empty, so `carried` is only rescued by the
+    /// loop-header range add.
+    #[test]
+    fn intervals_cover_a_value_live_across_a_back_edge() {
+        let mut f = TestFunc::default();
+        let (entry, body, exit) = (f.block(), f.block(), f.block());
+        let (carried, scratch) = (f.int(), f.int());
+
+        f.inst(entry, vec![Operand::any(carried)], vec![]);
+        f.goto(entry, &[body]);
+        f.inst(body, vec![Operand::any(scratch)], vec![]);
+        f.inst(
+            body,
+            vec![],
+            vec![Operand::any(scratch), Operand::any(carried)],
+        );
+        f.goto(body, &[body, exit]);
+        f.inst(exit, vec![], vec![Operand::any(carried)]);
+
+        assert_intervals_cover_liveness(&f);
+
+        let (ranges, span) = ssa_ranges(&f);
+        let (body_from, body_to) = span[body.0 as usize];
+        assert!(
+            ranges[carried.0 as usize]
+                .iter()
+                .any(|&(lo, hi)| lo <= body_from * 2 && hi >= body_to * 2),
+            "carried must be live across the entire loop body, got {:?}",
+            ranges[carried.0 as usize],
+        );
+    }
+
+    /// A block parameter is defined at its block's entry and its argument dies at
+    /// the end of the predecessor. The two must *not* overlap — that
+    /// non-interference is what lets an edge cost nothing.
+    #[test]
+    fn a_block_parameter_does_not_overlap_its_argument() {
+        let mut f = TestFunc::default();
+        let (entry, target) = (f.block(), f.block());
+        let (arg, param) = (f.int(), f.int());
+
+        f.inst(entry, vec![Operand::any(arg)], vec![]);
+        f.goto(entry, &[target]);
+        f.pass(entry, &[arg]);
+        f.params(target, &[param]);
+        f.inst(target, vec![], vec![Operand::any(param)]);
+
+        assert!(f.has_block_params());
+
+        let (ranges, span) = ssa_ranges(&f);
+        assert!(
+            !overlaps(&ranges[arg.0 as usize], &ranges[param.0 as usize]),
+            "argument {:?} and parameter {:?} must not interfere",
+            ranges[arg.0 as usize],
+            ranges[param.0 as usize],
+        );
+        assert_eq!(ranges[param.0 as usize][0].0, span[target.0 as usize].0 * 2);
+    }
+
+    /// A loop-carried parameter whose last use precedes the definition of its
+    /// back-edge argument does *not* interfere with it — the parameter is dead
+    /// through the tail of the body, where the next iteration's value is computed.
+    ///
+    /// This hole is the whole point: it is what lets both ends share one register
+    /// and turns the back-edge copy into nothing at all.
+    #[test]
+    fn a_loop_carried_parameter_can_share_its_arguments_register() {
+        let mut f = TestFunc::default();
+        let (entry, header, exit) = (f.block(), f.block(), f.block());
+        let (init, param, next) = (f.int(), f.int(), f.int());
+
+        f.inst(entry, vec![Operand::any(init)], vec![]);
+        f.goto(entry, &[header]);
+        f.pass(entry, &[init]);
+
+        f.params(header, &[param]);
+        // `next = op(param)` — the parameter's last use is *before* next's def.
+        f.inst(header, vec![Operand::any(next)], vec![Operand::any(param)]);
+        f.goto(header, &[header, exit]);
+        f.pass(header, &[next]);
+        f.inst(exit, vec![], vec![]);
+
+        let (ranges, span) = ssa_ranges(&f);
+        assert!(
+            !overlaps(&ranges[param.0 as usize], &ranges[next.0 as usize]),
+            "parameter {:?} and its back-edge argument {:?} should not interfere",
+            ranges[param.0 as usize],
+            ranges[next.0 as usize],
+        );
+        assert_eq!(
+            ranges[param.0 as usize][0].0,
+            span[header.0 as usize].0 * 2,
+            "the parameter is still defined at the header's entry",
+        );
+    }
+
+    /// The converse, so the hole above is not mistaken for a blanket rule: when the
+    /// parameter is still read *after* its back-edge argument is computed, the two
+    /// genuinely interfere and the edge really does need a move. Splitting cannot
+    /// remove this one.
+    #[test]
+    fn a_parameter_read_after_its_argument_is_defined_interferes() {
+        let mut f = TestFunc::default();
+        let (entry, header, exit) = (f.block(), f.block(), f.block());
+        let (init, param, next) = (f.int(), f.int(), f.int());
+
+        f.inst(entry, vec![Operand::any(init)], vec![]);
+        f.goto(entry, &[header]);
+        f.pass(entry, &[init]);
+
+        f.params(header, &[param]);
+        f.inst(header, vec![Operand::any(next)], vec![Operand::any(param)]);
+        f.inst(header, vec![], vec![Operand::any(param)]);
+        f.goto(header, &[header, exit]);
+        f.pass(header, &[next]);
+        f.inst(exit, vec![], vec![]);
+
+        let (ranges, _) = ssa_ranges(&f);
+        assert!(
+            overlaps(&ranges[param.0 as usize], &ranges[next.0 as usize]),
+            "parameter {:?} outlives its argument's definition {:?} and must interfere",
+            ranges[param.0 as usize],
+            ranges[next.0 as usize],
+        );
     }
 
     /// `n` integer registers and `n` float ones, numbered from zero.

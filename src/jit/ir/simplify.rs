@@ -24,6 +24,7 @@
 //! trivially safe — both columns are defined at the same block entry.
 
 use std::collections::HashMap;
+
 use foldhash::fast::RandomState;
 
 use super::{Block, Def, Func, Inst, Val};

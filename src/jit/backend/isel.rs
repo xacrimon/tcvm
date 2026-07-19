@@ -40,6 +40,10 @@ pub enum IselError {
     /// A guard whose target set is not a single Lua type, so it cannot become one
     /// tag compare.
     PolymorphicGuard(TypeSet),
+    /// A loop with more than one entry. Lifetime interval construction cannot see
+    /// liveness through one (see `order`), and Lua's structured loops should never
+    /// produce one — so this is a decline rather than a case to support.
+    IrreducibleLoop,
 }
 
 /// The machine realization of one IR value.
@@ -70,6 +74,22 @@ enum FusedCmp {
 }
 
 pub fn select(f: &Func<'_>) -> Result<MFunc, IselError> {
+    select_with(f, false)
+}
+
+/// Select without destructing SSA: block parameters survive into the machine IR
+/// as `MBlockData::params` and the edges carry `jump_args`, leaving the allocator
+/// to resolve them.
+///
+/// The destructing path ([`select`]) is still the default while the allocator
+/// grows the interval construction and edge resolution that this form needs. Two
+/// paths rather than a fork: the difference is one flag, and keeping both lets the
+/// same function be selected each way and the results compared.
+pub fn select_ssa(f: &Func<'_>) -> Result<MFunc, IselError> {
+    select_with(f, true)
+}
+
+fn select_with(f: &Func<'_>, ssa: bool) -> Result<MFunc, IselError> {
     let mut isel = Isel {
         f,
         m: MFunc::new(),
@@ -77,8 +97,14 @@ pub fn select(f: &Func<'_>) -> Result<MFunc, IselError> {
         fused: Vec::new(),
         bmap: Vec::new(),
         base: VReg(0),
+        ssa,
     };
     isel.run()?;
+    // The CFG is complete only now: edge blocks are created as their branches are
+    // selected. Everything downstream works in this linearization.
+    isel.m
+        .set_layout()
+        .map_err(|_| IselError::IrreducibleLoop)?;
     Ok(isel.m)
 }
 
@@ -95,6 +121,8 @@ struct Isel<'a, 'gc> {
     /// The Lua frame base pointer, `&stack[base]`. Every stack access is relative
     /// to this.
     base: VReg,
+    /// Keep block parameters instead of lowering them into edge copies.
+    ssa: bool,
 }
 
 impl<'a, 'gc> Isel<'a, 'gc> {
@@ -162,6 +190,20 @@ impl<'a, 'gc> Isel<'a, 'gc> {
         );
         for (&p, &r) in params.iter().zip(&regs) {
             self.load_lua_reg(entry, r, p);
+        }
+
+        // Under SSA the parameters stay parameters. The entry is deliberately
+        // excluded: it has no incoming edge, and the loads just emitted *are* the
+        // definitions of its parameters.
+        if self.ssa {
+            for b in self.f.blocks() {
+                if b == self.f.entry {
+                    continue;
+                }
+                let ps = self.machine_params(b);
+                let mb = self.bmap[b.index()];
+                self.m.blocks[mb.0 as usize].params = ps;
+            }
         }
 
         // Reverse postorder, so every definition is selected before its uses and
@@ -457,7 +499,13 @@ impl<'a, 'gc> Isel<'a, 'gc> {
     /// Because the count is known here, the machine shift never sees an
     /// out-of-range amount, so the target's count-masking (aarch64's low 6 bits,
     /// x86's `& 63`) never bites — we have already turned every such case into a 0.
-    fn shift(&mut self, mb: MBlock, dir: IntOp, args: &[Val], result: Val) -> Result<(), IselError> {
+    fn shift(
+        &mut self,
+        mb: MBlock,
+        dir: IntOp,
+        args: &[Val],
+        result: Val,
+    ) -> Result<(), IselError> {
         let count = self
             .int_const(args[1])
             .ok_or(IselError::Unsupported("dynamic shift count"))?;
@@ -855,10 +903,15 @@ impl<'a, 'gc> Isel<'a, 'gc> {
             Op::Jump => {
                 // One successor, so the predecessor has nowhere else to send
                 // control: the copies can sit in this block.
-                let t = &targets[0];
-                let copies = self.edge_copies(t.block, &t.args);
-                self.parallel_copy(mb, copies);
+                let t = targets[0].clone();
                 let dst = self.bmap[t.block.index()];
+                if self.ssa {
+                    let a = self.edge_args(mb, t.block, &t.args);
+                    self.m.blocks[mb.0 as usize].jump_args = a;
+                } else {
+                    let copies = self.edge_copies(t.block, &t.args);
+                    self.parallel_copy(mb, copies);
+                }
                 self.emit(mb, MOp::Jump(dst), vec![], vec![]);
             }
             Op::Br => {
@@ -934,13 +987,79 @@ impl<'a, 'gc> Isel<'a, 'gc> {
     }
 
     /// A block holding just this edge's parameter copies, then a jump.
+    ///
+    /// Under `ssa` it holds only the jump and the edge's arguments — and is then
+    /// empty whenever the allocator manages to give an argument and its parameter
+    /// the same register, at which point block placement can fold it away.
     fn edge_block(&mut self, call: &crate::jit::ir::BlockCall) -> MBlock {
         let eb = self.m.new_block();
-        let copies = self.edge_copies(call.block, &call.args);
-        self.parallel_copy(eb, copies);
         let dst = self.bmap[call.block.index()];
+        if self.ssa {
+            let a = self.edge_args(eb, call.block, &call.args);
+            self.m.blocks[eb.0 as usize].jump_args = a;
+        } else {
+            let copies = self.edge_copies(call.block, &call.args);
+            self.parallel_copy(eb, copies);
+        }
         self.emit(eb, MOp::Jump(dst), vec![], vec![]);
         eb
+    }
+
+    /// A block's parameters as machine registers, in the order an edge must supply
+    /// them. One IR parameter yields two registers when its tag is dynamic.
+    fn machine_params(&self, target: Block) -> Vec<VReg> {
+        let mut out = Vec::new();
+        for &p in &self.f.block(target).params {
+            match self.slot(p) {
+                Slot::Int(v) | Slot::Float(v) => out.push(v),
+                Slot::Boxed { payload, tag } => {
+                    out.push(payload);
+                    if let Tag::Dyn(t) = tag {
+                        out.push(t);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The registers one edge supplies, positionally matching [`Self::machine_params`]
+    /// of the target.
+    fn edge_args(&mut self, mb: MBlock, target: Block, args: &[Val]) -> Vec<VReg> {
+        let params = self.f.block(target).params.clone();
+        assert_eq!(params.len(), args.len(), "edge arity");
+
+        let mut out = Vec::new();
+        for (&p, &a) in params.iter().zip(args) {
+            match (self.slot(p), self.slot(a)) {
+                (Slot::Int(_), Slot::Int(sa)) | (Slot::Float(_), Slot::Float(sa)) => out.push(sa),
+                (
+                    Slot::Boxed { tag: dt, .. },
+                    Slot::Boxed {
+                        payload: sp,
+                        tag: st,
+                    },
+                ) => {
+                    out.push(sp);
+                    match (dt, st) {
+                        (Tag::Dyn(_), Tag::Dyn(s)) => out.push(s),
+                        (Tag::Dyn(_), Tag::Const(k)) => {
+                            // The parameter's set is polymorphic but this argument
+                            // knew its tag statically. An edge carries registers
+                            // only, so materialize it here rather than teaching the
+                            // allocator about constant arguments — `Imm` is
+                            // rematerializable, so the reload cost comes back.
+                            let t = self.m.new_vreg(RegClass::Int);
+                            self.emit(mb, MOp::Imm(layout::kind(k) as i64), vec![t], vec![]);
+                            out.push(t);
+                        }
+                        (Tag::Const(_), _) => {}
+                    }
+                }
+                (dst, src) => panic!("edge type mismatch: {dst:?} <- {src:?}"),
+            }
+        }
+        out
     }
 
     /// The moves that realize one edge: each argument into its parameter's
@@ -1265,5 +1384,120 @@ trait IsTerm {
 impl IsTerm for Op {
     fn is_terminator(self) -> bool {
         matches!(self, Op::Jump | Op::Br | Op::Ret | Op::Deopt)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Lua;
+    use crate::jit::backend::regalloc::RegallocFunc;
+    use crate::jit::frontend::lower::lower;
+
+    const INT: Ty = Ty::new(Rep::Val, TypeSet::INT);
+
+    /// `is_prime` from test-files/primes.lua, selected both ways — a loop with two
+    /// diamonds, which is what makes it worth comparing.
+    fn is_prime_both() -> (MFunc, MFunc) {
+        let source = std::fs::read_to_string("test-files/primes.lua").unwrap();
+        let mut lua = Lua::new();
+        lua.load_all();
+        lua.enter(|ctx| {
+            let chunk = ctx.load(&source, Some("primes")).expect("compile");
+            let closure = chunk.as_lua().expect("chunk is a Lua closure");
+            let proto = closure.proto.prototypes[0];
+            let func = lower(proto, 0, vec![INT]).expect("lower is_prime");
+            (
+                select(&func).expect("isel"),
+                select_ssa(&func).expect("isel ssa"),
+            )
+        })
+    }
+
+    /// Every edge supplies exactly the registers its target declares, of matching
+    /// class. This is the invariant edge resolution will rely on, so it is worth
+    /// pinning at the source rather than discovering downstream.
+    #[test]
+    fn ssa_edges_match_their_target_parameters() {
+        let (_, m) = is_prime_both();
+        assert!(m.has_block_params(), "is_prime has a loop-carried value");
+
+        for b in m.block_order() {
+            let args = m.jump_args(b);
+            if !args.is_empty() {
+                let succs = m.succs(b);
+                assert_eq!(succs.len(), 1, "only a Jump may carry arguments");
+                let params = m.block_params(succs[0]);
+                assert_eq!(args.len(), params.len(), "arity on mb{}", b.0);
+                for (a, p) in args.iter().zip(params) {
+                    assert_eq!(m.class(*a), m.class(*p), "class mismatch on edge");
+                }
+            }
+            // ...and a block with parameters is supplied by *every* predecessor.
+            for s in m.succs(b) {
+                if !m.block_params(s).is_empty() {
+                    assert_eq!(
+                        m.jump_args(b).len(),
+                        m.block_params(s).len(),
+                        "mb{} -> mb{} supplies nothing",
+                        b.0,
+                        s.0
+                    );
+                }
+            }
+        }
+    }
+
+    /// The point of the exercise: the copies isel used to sequentialize are gone.
+    #[test]
+    fn ssa_selection_emits_no_edge_movs() {
+        let (destructed, ssa) = is_prime_both();
+        let movs = |m: &MFunc| {
+            (0..m.num_insts())
+                .filter(|&i| matches!(m.inst(i).op, MOp::Mov))
+                .count()
+        };
+        assert!(movs(&destructed) > 0, "destructing path emits edge copies");
+        assert_eq!(movs(&ssa), 0, "SSA form has parameters, not copies");
+    }
+
+    /// The entry block's parameters are the region's live-in Lua registers, loaded
+    /// from the stack by the prologue. It has no incoming edge, so they must not be
+    /// modelled as block parameters — nothing would ever supply them.
+    #[test]
+    fn ssa_entry_block_has_no_parameters() {
+        let (_, m) = is_prime_both();
+        assert!(m.block_params(m.entry()).is_empty());
+    }
+
+    /// The SSA form allocates and verifies end to end: interval construction sees
+    /// the parameters, and edge resolution delivers each argument to where its
+    /// parameter is read from. `verify` is the real assertion here — it is
+    /// symbolic and checks every location against the value it should hold.
+    #[test]
+    fn ssa_form_allocates_and_verifies() {
+        use crate::jit::backend::regalloc::{allocate, verify};
+        use crate::jit::backend::target::{annotate, machine_env};
+
+        let (_, mut ssa) = is_prime_both();
+        annotate(&mut ssa);
+        let ra = allocate(&ssa, &machine_env()).expect("SSA form allocates");
+        verify(&ssa, &ra).expect("SSA allocation must check out");
+    }
+
+    /// Both selections of the same function must allocate to code that verifies.
+    /// The point is that dropping SSA destruction changed no invariant the checker
+    /// enforces — only who performs the deconstruction, and when.
+    #[test]
+    fn both_selections_verify() {
+        use crate::jit::backend::regalloc::{allocate, verify};
+        use crate::jit::backend::target::{annotate, machine_env};
+
+        let (mut destructed, mut ssa) = is_prime_both();
+        for m in [&mut destructed, &mut ssa] {
+            annotate(m);
+            let ra = allocate(m, &machine_env()).expect("allocates");
+            verify(m, &ra).expect("verifies");
+        }
     }
 }

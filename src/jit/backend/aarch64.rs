@@ -996,6 +996,7 @@ mod tests {
         );
         m.push(b, MInst::new(MOp::Ret { nret: 1 }, vec![], vec![]));
 
+        m.set_layout().expect("single block is reducible");
         (m, sum, def_sum, store)
     }
 
