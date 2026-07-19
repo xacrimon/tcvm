@@ -8,32 +8,32 @@ block0(v0: tab, v1: int):
       v15 = iconst 1
       v16 = unpack.int v1
       v17 = icmp le v14, v16
-            br v17 block1(v0, v13, v14, v1, v15), block2(v13)
-block1(v2: tab, v3: i64, v4: i64, v5: int, v6: i64):
-      v18 = guard.shape v2, S0  ; exit0
+            br v17 block1, block2(v13)
+block1:
+      v18 = guard.shape v0, S0  ; exit0
             assume.no_mm S0, INDEX
       v19 = tab.props v18
       v20 = slot.get v19, 0
       v21 = guard.type v20, int  ; exit1
       v22 = unpack.int v21
-      v23 = add.i64 v3, v22
-      v24 = unpack.int v5
+      v23 = add.i64 v13, v22
+      v24 = unpack.int v1
       v25 = iconst 1
-      v26 = add.i64 v4, v25
+      v26 = add.i64 v14, v25
       v27 = icmp le v26, v24
-            br v27 block3(v18, v23, v26, v5, v6), block2(v23)
+            br v27 block3(v23, v26), block2(v23)
 block2(v7: i64):
       v28 = pack.int v7
             ret v28
-block3(v8: tab<S0>, v9: i64, v10: i64, v11: int, v12: i64):
+block3(v9: i64, v10: i64):
             assume.no_mm S0, INDEX
-      v29 = tab.props v8
+      v29 = tab.props v18
       v30 = slot.get v29, 0
       v31 = guard.type v30, int  ; exit2
       v32 = unpack.int v31
       v33 = add.i64 v9, v32
-      v34 = unpack.int v11
+      v34 = unpack.int v1
       v35 = iconst 1
       v36 = add.i64 v10, v35
       v37 = icmp le v36, v34
-            br v37 block3(v8, v33, v36, v11, v12), block2(v33)
+            br v37 block3(v33, v36), block2(v33)

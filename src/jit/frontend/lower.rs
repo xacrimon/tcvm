@@ -963,6 +963,10 @@ pub fn lower<'gc>(
         let mut fb = VmFeedback::new(proto, &mut pool, entry_types);
         emit(&proto, &cfg, &pinned, &mut fb, &mut func, &mut versions)?;
     }
+    // Liveness placed a phi for every live-in register; collapse the trivial and
+    // congruent ones (e.g. a numeric `for`'s counter and visible variable, one
+    // value carried in two columns) before the backend sees them.
+    func.simplify_params();
     func.pool = pool;
     func.pinned_regs = pinned
         .iter()

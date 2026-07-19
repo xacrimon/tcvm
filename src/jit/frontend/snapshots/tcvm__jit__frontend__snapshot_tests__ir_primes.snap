@@ -9,24 +9,24 @@ block0(v0: int):
       v13 = sub.i64 v12, v11
       v14 = iconst 1
       v15 = icmp le v10, v13
-            br v15 block1(v0, v10, v13, v14, v10), block2
-block1(v1: int, v2: i64, v3: i64, v4: i64, v5: i64):
-      v16 = unpack.int v1
+            br v15 block1(v10), block2
+block1(v5: i64):
+      v16 = unpack.int v0
       v17 = iconst 0
       v18 = icmp ne v5, v17
             guard.cond v18  ; exit0
       v19 = mod.i64 v16, v5
       v20 = iconst 0
       v21 = icmp eq v19, v20
-            br v21 block3, block4(v1, v2, v3, v4)
+            br v21 block3, block4
 block2:
       v22 = kconst true
             ret v22
 block3:
       v23 = kconst false
             ret v23
-block4(v6: int, v7: i64, v8: i64, v9: i64):
+block4:
       v24 = iconst 1
-      v25 = add.i64 v7, v24
-      v26 = icmp le v25, v8
-            br v26 block1(v6, v25, v8, v9, v25), block2
+      v25 = add.i64 v5, v24
+      v26 = icmp le v25, v13
+            br v26 block1(v25), block2

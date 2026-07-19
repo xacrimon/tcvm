@@ -9,6 +9,7 @@
 pub mod op;
 pub mod pool;
 pub mod print;
+pub mod simplify;
 pub mod ty;
 pub mod verify;
 

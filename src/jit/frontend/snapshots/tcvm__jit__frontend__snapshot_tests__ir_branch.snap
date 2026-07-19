@@ -7,21 +7,21 @@ block0(v0: int, v1: int):
       v10 = unpack.int v0
       v11 = unpack.int v1
       v12 = icmp lt v10, v11
-            br v12 block1(v0), block2(v0)
-block1(v2: int):
+            br v12 block1, block2
+block1:
       v13 = iconst 1
-            jump block3(v2, v13)
-block2(v3: int):
+            jump block3(v13)
+block2:
       v14 = iconst 2
-            jump block3(v3, v14)
-block3(v4: int, v5: i64):
+            jump block3(v14)
+block3(v5: i64):
       v15 = iconst 10
       v16 = icmp lt v5, v15
-            br v16 block4(v4, v5), block5(v5)
-block4(v6: int, v7: i64):
-      v17 = unpack.int v6
-      v18 = add.i64 v7, v17
-            jump block3(v6, v18)
-block5(v8: i64):
-      v19 = pack.int v8
+            br v16 block4, block5
+block4:
+      v17 = unpack.int v0
+      v18 = add.i64 v5, v17
+            jump block3(v18)
+block5:
+      v19 = pack.int v5
             ret v19

@@ -8,28 +8,28 @@ block0(v0: tab, v1: int):
       v16 = iconst 1
       v17 = unpack.int v1
       v18 = icmp le v15, v17
-            br v18 block1(v0, v14, v15, v1, v16), block2(v14)
-block1(v2: tab, v3: i64, v4: i64, v5: int, v6: i64):
+            br v18 block1, block2
+block1:
       v19 = kconst "x"
-      v20 = lua.getindex v2, v19
-      v21 = pack.int v3
+      v20 = lua.getindex v0, v19
+      v21 = pack.int v14
       v22 = lua.add v21, v20
-      v23 = unpack.int v5
+      v23 = unpack.int v1
       v24 = iconst 1
-      v25 = add.i64 v4, v24
+      v25 = add.i64 v15, v24
       v26 = icmp le v25, v23
-            br v26 block3(v2, v22, v25, v5, v6), block4(v22)
-block2(v7: i64):
-      v27 = pack.int v7
+            br v26 block3(v22, v25), block4(v22)
+block2:
+      v27 = pack.int v14
             ret v27
-block3(v8: tab, v9: any, v10: i64, v11: int, v12: i64):
+block3(v9: any, v10: i64):
       v28 = kconst "x"
-      v29 = lua.getindex v8, v28
+      v29 = lua.getindex v0, v28
       v30 = lua.add v9, v29
-      v31 = unpack.int v11
+      v31 = unpack.int v1
       v32 = iconst 1
       v33 = add.i64 v10, v32
       v34 = icmp le v33, v31
-            br v34 block3(v8, v30, v33, v11, v12), block4(v30)
+            br v34 block3(v30, v33), block4(v30)
 block4(v13: any):
             ret v13
