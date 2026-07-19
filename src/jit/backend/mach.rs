@@ -5,10 +5,15 @@
 //!
 //! The optimizing IR is in SSA with block parameters and values whose
 //! representation (`Rep::Val`) does not fit in a machine register. Register
-//! allocation and encoding want neither. This level fixes both: every operand is
-//! a virtual register holding exactly one machine word, block parameters have
-//! been destroyed into copies, and each instruction corresponds to roughly one
-//! encoded instruction.
+//! allocation and encoding want neither. This level fixes the second: every
+//! operand is a virtual register holding exactly one machine word, and each
+//! instruction corresponds to roughly one encoded instruction.
+//!
+//! SSA is deliberately *kept*. Block parameters ride on [`MBlockData`] and their
+//! arguments on the edges, and the register allocator deconstructs them as part of
+//! the edge resolution it has to perform anyway. Destructing them here instead
+//! costs a dataflow liveness analysis downstream and roughly a fifth of backend
+//! compile time — see `regalloc::build_intervals`.
 //!
 //! # Boxed values
 //!
@@ -129,8 +134,6 @@ pub enum MOp {
     /// `def0 <- the raw payload of a pool constant`: an integer, a float's bits,
     /// or a `Gc` address. Symbolic for the same reason.
     ConstPayload(ConstRef),
-    /// `def0 <- use0`. Same register class.
-    Mov,
     /// `def0 <- [use0 + off]`.
     Load {
         off: i32,
@@ -305,8 +308,7 @@ pub struct MBlockData {
     pub insts: Vec<usize>,
     /// Values this block receives on every incoming edge — the machine-level form
     /// of the IR's block parameters. Empty unless isel kept SSA (see
-    /// [`crate::jit::backend::isel::select_ssa`]); the destructing path lowers them
-    /// into `Mov`s on the edge instead.
+    /// [`crate::jit::backend::isel::select`]).
     ///
     /// One IR parameter can be *two* of these: a `Rep::Val` whose tag is not known
     /// statically needs a payload register and a tag register. So this is a list of
@@ -513,13 +515,6 @@ impl RegallocFunc for MFunc {
         self.classes[v.0 as usize]
     }
 
-    /// A `Mov` is the only pure copy the machine IR has: `def0 <- use0`, same
-    /// class. Block-parameter resolution emits these by the dozen on edges, and
-    /// coalescing them is the whole point of telling the allocator they exist.
-    fn is_copy(&self, i: Inst) -> Option<(usize, usize)> {
-        matches!(self.insts[i].op, MOp::Mov).then_some((0, 0))
-    }
-
     fn temps(&self, i: Inst) -> &[Operand] {
         &self.insts[i].temps
     }
@@ -600,7 +595,6 @@ fn fmt_op(op: MOp) -> String {
         MOp::Imm(v) => format!("imm {v}"),
         MOp::ShapeAddr(s) => format!("shapeaddr S{}", s.0),
         MOp::ConstPayload(c) => format!("constpayload K{}", c.0),
-        MOp::Mov => "mov".into(),
         MOp::Load { off, width } => format!("load.{} [{off}]", fmt_width(width)),
         MOp::Store { off, width } => format!("store.{} [{off}]", fmt_width(width)),
         MOp::Alu(o) => format!("{o:?}").to_lowercase(),

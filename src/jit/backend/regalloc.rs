@@ -273,9 +273,9 @@ pub trait RegallocFunc {
     ///
     /// Non-empty only when the client kept SSA form: a block parameter is a
     /// definition with no defining instruction, so the allocator must build its
-    /// intervals and resolve its edges accordingly. A client that destructs SSA
-    /// before allocation — lowering parameters into copies on the edges — answers
-    /// empty, which is what makes this an extension rather than a change.
+    /// intervals and resolve its edges accordingly. A client that has no block
+    /// parameters at all — a single-block function, say — answers empty and the
+    /// allocator simply finds no edges to resolve.
     fn block_params(&self, _b: Block) -> &[VReg] {
         &[]
     }
@@ -290,18 +290,6 @@ pub trait RegallocFunc {
     /// form. The allocator needs it to pick a code path.
     fn has_block_params(&self) -> bool {
         (0..self.num_blocks()).any(|b| !self.block_params(Block(b as u32)).is_empty())
-    }
-
-    /// If this instruction is a pure register-to-register copy — its def `dk`
-    /// receives exactly its use `uk`, same class, no other effect — say so.
-    ///
-    /// The allocator uses it to *coalesce*: place both ends in one register so the
-    /// encoder's identity-move elision drops the copy entirely. Target-agnostic on
-    /// purpose — the allocator does not know what a `Mov` is, the client does. A
-    /// client that answers `None` for everything simply gets no coalescing, which
-    /// is what the old scan did.
-    fn is_copy(&self, _i: Inst) -> Option<(usize, usize)> {
-        None
     }
 
     /// A register this value would *prefer*, if one is free where it lands — an
@@ -420,7 +408,7 @@ pub struct Allocation {
     /// Sorted by program point.
     edits: Vec<(ProgPoint, Edit)>,
     /// Where each block's parameters live, per block. Empty for a function whose
-    /// SSA was destructed before allocation.
+    /// function with no block parameters at all.
     ///
     /// Parameters are not operands of any instruction, so nothing in `allocs`
     /// records where one is *defined*. The encoder does not need to know, but the
@@ -654,13 +642,15 @@ type EvictKey = (std::cmp::Reverse<u32>, bool, u32);
 ///     register for that gap (the `inactive` list). A value whose interval merely
 ///     *straddles* the current point without covering it reserves its register
 ///     only up to where it becomes live again, not unconditionally.
-///   - **Hints.** A [`RegallocFunc::is_copy`] links a copy's two ends; whichever is
-///     placed first biases the other toward the same register. Because a use of the
-///     source ends exactly where the def of the destination begins, the source's
-///     register is free at that point, so the bias lands and the encoder drops the
-///     move. Loop-carried parameters coalesce the same way: the parameter is placed
-///     when its header is seen, and the back-edge argument — computed in the loop
-///     tail, inside the parameter's hole — is hinted onto it.
+///   - **Hints.** An edge links each argument to the parameter it feeds, and a
+///     `Reuse` def links a two-address op's result to the input it overwrites;
+///     whichever end is placed first biases the other toward the same register.
+///     Because the argument's live range ends exactly where the parameter's
+///     begins, the argument's register is free at that point, so the bias lands
+///     and the edge needs no move at all. Loop-carried parameters coalesce the same
+///     way: the parameter is placed when its header is seen, and the back-edge
+///     argument — computed in the loop tail, inside the parameter's hole — is
+///     hinted onto it.
 ///
 /// The scan assigns whole values, so a value that keeps a register needs no edits
 /// and joins need no shuffle. Under pressure a value that will not fit whole is
@@ -687,15 +677,7 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
         span[b.0 as usize] = (start, p);
     }
 
-    // SSA input takes the one-pass construction; destructed input keeps the
-    // fixpoint. Not interchangeable — see [`build_intervals_ssa`] for why the
-    // one-pass version pessimizes a multi-def function rather than merely being
-    // slower to reach.
-    let raw = if f.has_block_params() {
-        build_intervals_ssa(f, &order, &pos, &span)
-    } else {
-        build_intervals_destructed(f, &order, &pos, &span)
-    };
+    let raw = build_intervals(f, &order, &pos, &span);
 
     // Merge once; the scan reads these per class, and the reload phase reads them
     // again to know which register is free where.
@@ -707,12 +689,6 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
     // but where a copy affinity is a hint, `Reuse` is enforced in the reload phase.
     let mut affin: HashMap<VReg, Vec<VReg>, RandomState> = HashMap::default();
     for i in 0..f.num_insts() {
-        if let Some((dk, uk)) = f.is_copy(i) {
-            let d = f.defs(i)[dk].vreg;
-            let s = f.uses(i)[uk].vreg;
-            affin.entry(d).or_default().push(s);
-            affin.entry(s).or_default().push(d);
-        }
         for o in f.defs(i) {
             if let Constraint::Reuse(uk) = o.constraint {
                 let s = f.uses(i)[uk].vreg;
@@ -721,12 +697,11 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
             }
         }
     }
-    // An edge is a copy too, and after SSA deconstruction moved into `resolve_edges`
-    // it is the *only* copy left that matters: there is no `Mov` for `is_copy` to
-    // report, so without this an argument and its parameter are pulled together by
-    // nothing at all and share a register only when the scan's arbitrary choice
-    // happens to agree on both sides. Every pair here is a move `resolve_edges` does
-    // not have to emit.
+    // An edge is a copy too, and the machine IR holds no instruction for it — the
+    // only record is the argument list. Without this an argument and its parameter
+    // are pulled together by nothing at all, and share a register only when the
+    // scan's arbitrary choice happens to agree on both sides of the edge. Every
+    // pair here is a move `resolve_edges` then does not have to emit.
     for b in (0..f.num_blocks()).map(|b| Block(b as u32)) {
         let args = f.jump_args(b);
         if args.is_empty() {
@@ -1291,7 +1266,17 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
                 }
             }
         }
-        resolve_edges(f, env, &order, &pos, &ranges, &loc, &mut b)?;
+        resolve_edges(
+            f,
+            env,
+            &order,
+            &pos,
+            &ranges,
+            &loc,
+            &remat_spilled,
+            &remat_src,
+            &mut b,
+        )?;
     }
 
     Ok(b.finish(spills))
@@ -1392,20 +1377,22 @@ fn reject_unsupported(f: &impl RegallocFunc) -> Result<(), RegallocError> {
 /// the loop case adds ranges without updating them. Nothing downstream reads them,
 /// which is the only reason that is allowed.
 ///
-/// # Why this is an SSA algorithm and not a general one
+/// # Precondition: one definition per value
 ///
 /// The loop case is *sound* on a multi-def function but it is a pessimization
-/// there, so this must not be pointed at destructed input. Its justification is
-/// SSA dominance: a value live at a loop header is necessarily defined before the
-/// loop, hence genuinely live throughout it. Destruct SSA first and that stops
-/// being true — a loop-carried value becomes a vreg with a `Mov` def *inside* the
-/// loop, still live-in at the header but dead through the tail of the body where
-/// the next iteration's value is computed. Extending it across the whole loop
-/// fills in exactly the hole that lets the two ends share a register, and the
-/// back-edge copy that would have coalesced away comes back as a real move.
+/// there, so this must not be handed one. Its justification is SSA dominance: a
+/// value live at a loop header is necessarily defined before the loop, hence
+/// genuinely live throughout it. Give a value two definitions and that stops being
+/// true — a loop-carried value defined *inside* the loop is live-in at the header
+/// yet dead through the tail of the body, where the next iteration's value is
+/// computed. Extending it across the whole loop fills in exactly the hole that
+/// lets the two ends share a register, and a back-edge copy that would have
+/// coalesced away comes back as a real move.
 ///
-/// [`build_intervals_destructed`] keeps the dataflow fixpoint for that form.
-fn build_intervals_ssa(
+/// This was measured, not reasoned about: pointing this at the old destructed form
+/// cost `is_prime` one move it had not needed.
+///
+fn build_intervals(
     f: &impl RegallocFunc,
     order: &[Block],
     pos: &[u32],
@@ -1507,61 +1494,15 @@ fn build_intervals_ssa(
     raw
 }
 
-/// Lifetime intervals for a function whose SSA has already been destructed.
+/// Where one edge assignment gets its value.
 ///
-/// The pre-SSA path: a live-set dataflow fixpoint, then one forward sweep turning
-/// those sets into segments. [`build_intervals_ssa`] is what replaces this — see
-/// there for why it cannot simply be pointed at this form.
-fn build_intervals_destructed(
-    f: &impl RegallocFunc,
-    order: &[Block],
-    pos: &[u32],
-    span: &[(u32, u32)],
-) -> Vec<Vec<(u32, u32)>> {
-    let live_in = liveness(f, order);
-    let mut raw: Vec<Vec<(u32, u32)>> = vec![Vec::new(); f.num_vregs()];
-
-    for &b in order {
-        let (bs, be) = span[b.0 as usize];
-        let bfrom = bs * 2;
-        let bto = be * 2;
-
-        let mut open: HashMap<VReg, u32, RandomState> = HashMap::default();
-        for &s in &f.succs(b) {
-            for &v in &live_in[s.0 as usize] {
-                open.entry(v).or_insert(bto);
-            }
-        }
-
-        for &i in f.block_insts(b).iter().rev() {
-            let slot = pos[i] * 2;
-            for o in f.temps(i) {
-                raw[o.vreg.0 as usize].push((slot, slot + 2));
-            }
-            for o in f.defs(i) {
-                let end = open.remove(&o.vreg).unwrap_or(slot + 2);
-                raw[o.vreg.0 as usize].push((slot + 1, end));
-            }
-            let reused_uk = f.defs(i).iter().find_map(|o| match o.constraint {
-                Constraint::Reuse(uk) => Some(uk),
-                _ => None,
-            });
-            for (k, o) in f.uses(i).iter().enumerate() {
-                let end = if reused_uk.is_some() && Some(k) != reused_uk {
-                    slot + 2
-                } else {
-                    slot + 1
-                };
-                open.entry(o.vreg).or_insert(end);
-            }
-        }
-
-        for (v, end) in open {
-            raw[v.0 as usize].push((bfrom, end));
-        }
-    }
-
-    raw
+/// Not simply an [`Alloc`], because a rematerializable argument that was spilled
+/// has no home to read: it carries no slot and is replayed at each mention. An
+/// edge has to replay it too.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EdgeSrc {
+    Loc(Alloc),
+    Remat(VReg, Inst),
 }
 
 /// SSA deconstruction, fused into edge resolution (Wimmer & Franz, CGO'10 Fig. 7).
@@ -1585,6 +1526,8 @@ fn resolve_edges(
     pos: &[u32],
     ranges: &[Vec<(u32, u32)>],
     loc: &[Option<Alloc>],
+    remat_spilled: &[bool],
+    remat_src: &[Option<Inst>],
     b: &mut AllocationBuilder,
 ) -> Result<(), RegallocError> {
     for &pred in order {
@@ -1601,14 +1544,23 @@ fn resolve_edges(
         let params = f.block_params(succs[0]);
         debug_assert_eq!(args.len(), params.len(), "edge arity");
 
-        let mut pending: Vec<(Alloc, Alloc, RegClass)> = args
+        let mut pending: Vec<(EdgeSrc, Alloc, RegClass)> = args
             .iter()
             .zip(params)
             .filter_map(|(&a, &p)| {
-                let (from, to) = (loc[a.0 as usize]?, loc[p.0 as usize]?);
+                let to = loc[p.0 as usize].expect("a block parameter has a home");
+                // A rematerializable argument that was spilled has *no* home to move
+                // from — it is replayed at each mention instead. Reading `loc` for it
+                // would find nothing, or worse a stale register from before it was
+                // evicted, so it has to be replayed here too.
+                if remat_spilled[a.0 as usize] {
+                    let src = remat_src[a.0 as usize].expect("a remat value names its def");
+                    return Some((EdgeSrc::Remat(a, src), to, f.class(p)));
+                }
+                let from = loc[a.0 as usize].expect("a live edge argument has a home");
                 // The coalesced case: argument and parameter already share a
                 // location, so the edge costs nothing.
-                (from != to).then_some((from, to, f.class(p)))
+                (from != to).then_some((EdgeSrc::Loc(from), to, f.class(p)))
             })
             .collect();
         if pending.is_empty() {
@@ -1632,6 +1584,14 @@ fn resolve_edges(
         let at_pos = pos[term] * 2;
         let mut busy: Vec<PReg> = Vec::new();
         for v in 0..f.num_vregs() {
+            // `loc` is not the truth for a rematerializable value that was spilled:
+            // it keeps whatever register the value held *before* it was evicted, and
+            // that register is long since somebody else's. Counting it here would
+            // reserve a register nothing occupies — which on a 13-register machine
+            // is the difference between finding a scratch and declining.
+            if remat_spilled[v] {
+                continue;
+            }
             if let Some(Alloc::Reg(r)) = loc[v] {
                 if ranges[v]
                     .iter()
@@ -1642,10 +1602,11 @@ fn resolve_edges(
             }
         }
         for &(from, to, _) in &pending {
-            for a in [from, to] {
-                if let Alloc::Reg(r) = a {
-                    busy.push(r);
-                }
+            if let EdgeSrc::Loc(Alloc::Reg(r)) = from {
+                busy.push(r);
+            }
+            if let Alloc::Reg(r) = to {
+                busy.push(r);
             }
         }
         let scratch = |class: RegClass| -> Result<Alloc, RegallocError> {
@@ -1663,26 +1624,34 @@ fn resolve_edges(
         // Emit every move whose destination nothing else still has to read; when
         // none qualifies, what remains is a permutation cycle, which one scratch
         // location breaks.
-        let mut seq: Vec<Move> = Vec::new();
+        let mut seq: Vec<(EdgeSrc, Alloc, RegClass)> = Vec::new();
         while !pending.is_empty() {
-            let srcs: Vec<Alloc> = pending.iter().map(|&(from, _, _)| from).collect();
+            let srcs: Vec<Alloc> = pending
+                .iter()
+                .filter_map(|&(from, _, _)| match from {
+                    EdgeSrc::Loc(a) => Some(a),
+                    // A replay reads nothing, so it constrains no ordering.
+                    EdgeSrc::Remat(..) => None,
+                })
+                .collect();
             let (ready, blocked): (Vec<_>, Vec<_>) = pending
                 .into_iter()
                 .partition(|&(_, to, _)| !srcs.contains(&to));
 
             if ready.is_empty() {
+                // Only real moves can form a cycle — a replay has no source to be
+                // waited on — so everything blocked here is a `Loc`.
                 let (from, _, class) = blocked[0];
+                let EdgeSrc::Loc(from) = from else {
+                    unreachable!("a replay cannot be part of a permutation cycle")
+                };
                 let tmp = scratch(class)?;
-                seq.push(Move {
-                    from,
-                    to: tmp,
-                    class,
-                });
+                seq.push((EdgeSrc::Loc(from), tmp, class));
                 pending = blocked
                     .into_iter()
                     .map(|(f_, t_, c)| {
-                        if f_ == from {
-                            (tmp, t_, c)
+                        if f_ == EdgeSrc::Loc(from) {
+                            (EdgeSrc::Loc(tmp), t_, c)
                         } else {
                             (f_, t_, c)
                         }
@@ -1690,37 +1659,58 @@ fn resolve_edges(
                     .collect();
                 continue;
             }
-            for (from, to, class) in ready {
-                seq.push(Move { from, to, class });
-            }
+            seq.extend(ready);
             pending = blocked;
         }
 
-        // No machine here can move memory to memory, and a parameter can land in a
-        // slot while its argument sits in another — so route those through a
-        // register. Safe to reuse one scratch across them: it is free at this point
-        // and is neither a source nor a destination of any move on this edge.
-        for m in seq {
-            if let (Alloc::Spill(_), Alloc::Spill(_)) = (m.from, m.to) {
-                let tmp = scratch(m.class)?;
-                b.edit(
-                    at,
-                    Edit::Move(Move {
-                        from: m.from,
-                        to: tmp,
-                        class: m.class,
-                    }),
-                );
-                b.edit(
-                    at,
-                    Edit::Move(Move {
-                        from: tmp,
-                        to: m.to,
-                        class: m.class,
-                    }),
-                );
-            } else {
-                b.edit(at, Edit::Move(m));
+        for (from, to, class) in seq {
+            match (from, to) {
+                // A replay lands in a register directly; into a slot it needs one to
+                // pass through, since the instruction it replays writes a register.
+                (EdgeSrc::Remat(val, src), Alloc::Reg(r)) => {
+                    b.edit(at, Edit::Remat { val, src, to: r });
+                }
+                (EdgeSrc::Remat(val, src), Alloc::Spill(_)) => {
+                    let tmp = scratch(class)?;
+                    let Alloc::Reg(r) = tmp else {
+                        unreachable!("scratch is always a register")
+                    };
+                    b.edit(at, Edit::Remat { val, src, to: r });
+                    b.edit(
+                        at,
+                        Edit::Move(Move {
+                            from: tmp,
+                            to,
+                            class,
+                        }),
+                    );
+                }
+                // No machine here moves memory to memory, and a parameter can land
+                // in a slot while its argument sits in another — route through a
+                // register. Safe to reuse one scratch: it is free at this point and
+                // is neither a source nor a destination of any move on this edge.
+                (EdgeSrc::Loc(from @ Alloc::Spill(_)), Alloc::Spill(_)) => {
+                    let tmp = scratch(class)?;
+                    b.edit(
+                        at,
+                        Edit::Move(Move {
+                            from,
+                            to: tmp,
+                            class,
+                        }),
+                    );
+                    b.edit(
+                        at,
+                        Edit::Move(Move {
+                            from: tmp,
+                            to,
+                            class,
+                        }),
+                    );
+                }
+                (EdgeSrc::Loc(from), _) => {
+                    b.edit(at, Edit::Move(Move { from, to, class }));
+                }
             }
         }
     }
@@ -1729,8 +1719,11 @@ fn resolve_edges(
 
 /// Live-in sets, to a fixpoint.
 ///
-/// Backwards over the block order, which converges in one pass for a loop-free
-/// region and in a couple more with a back edge.
+/// **Not a code path.** This is the pre-SSA liveness analysis, kept only as the
+/// independent oracle [`build_intervals`] is checked against in tests: it arrives
+/// at the same information by a completely different route, so agreement between
+/// them is evidence and not tautology. Nothing outside `#[cfg(test)]` calls it.
+#[cfg(test)]
 fn liveness(f: &impl RegallocFunc, order: &[Block]) -> Vec<Vec<VReg>> {
     let mut live_in: Vec<Vec<VReg>> = vec![Vec::new(); f.num_blocks()];
 
@@ -2150,8 +2143,8 @@ mod tests {
         }
     }
 
-    /// An edge is a copy, and after SSA deconstruction moved into the allocator it
-    /// is the only copy with no `Mov` for `is_copy` to report. Without an affinity
+    /// An edge is a copy that the machine IR holds no instruction for — the only
+    /// record of it is the argument list. Without an affinity
     /// across it the parameter takes whatever register is free first, which is not
     /// the argument's, and the edge pays for a move that never needed to exist.
     ///
@@ -2192,6 +2185,55 @@ mod tests {
         );
     }
 
+    /// An edge argument that is a *rematerializable* constant has no home to move
+    /// from: it carries no spill slot, and `loc` still names whatever register it
+    /// held before it was evicted — long since somebody else's. The edge has to
+    /// replay it, exactly as a use does.
+    ///
+    /// Found the hard way. Reading `loc` for such an argument silently delivered
+    /// nothing, so the parameter's slot was never written and its first use read an
+    /// uninitialised stack slot. It surfaced only on x86-64's 13-register pool,
+    /// where `mix` spills; aarch64 has too many registers to reach it.
+    #[test]
+    fn an_edge_replays_a_rematerializable_argument() {
+        let mut f = TestFunc::default();
+        let (entry, target) = (f.block(), f.block());
+        let (k, x, y, param) = (f.int(), f.int(), f.int(), f.int());
+
+        // `k` is a constant the allocator may recompute rather than spill. Every
+        // mention must be `Reg`-constrained or remat is disabled for it — an `Any`
+        // mention could read a slot the replay never writes.
+        let def_k = f.inst(entry, vec![Operand::reg(k)], vec![]);
+        f.set_remat(k, def_k);
+        f.inst(entry, vec![Operand::any(x)], vec![]);
+        f.inst(entry, vec![Operand::any(y)], vec![]);
+        // Both registers are taken here, so `k` — live across it to the edge — has
+        // to be evicted, and being rematerializable it gets no slot.
+        f.inst(entry, vec![], vec![Operand::any(x), Operand::any(y)]);
+        f.inst(entry, vec![], vec![]);
+        f.goto(entry, &[target]);
+        f.pass(entry, &[k]);
+
+        f.params(target, &[param]);
+        f.inst(target, vec![], vec![Operand::reg(param)]);
+        f.inst(target, vec![], vec![]);
+
+        let ra = allocate(&f, &env(2)).expect("allocates");
+
+        // The precondition, asserted so this cannot quietly stop testing anything:
+        // the edge really does have to replay the argument rather than move it.
+        let term = *f.block_insts(entry).last().unwrap();
+        assert!(
+            ra.edits_at(ProgPoint::before(term))
+                .any(|e| matches!(e, Edit::Remat { val, .. } if *val == k)),
+            "the setup should force `k` to be rematerialized on the edge",
+        );
+
+        // `verify` is the real assertion: it follows the value symbolically, so a
+        // parameter that was never delivered reads a location holding nothing.
+        verify(&f, &ra).expect("the edge must deliver the parameter");
+    }
+
     /// Whether two merged interval lists share any position.
     fn overlaps(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
         a.iter()
@@ -2217,7 +2259,7 @@ mod tests {
 
     fn ssa_ranges(f: &impl RegallocFunc) -> (Vec<Vec<(u32, u32)>>, Vec<(u32, u32)>) {
         let (order, pos, span) = axis(f);
-        let ranges = build_intervals_ssa(f, &order, &pos, &span)
+        let ranges = build_intervals(f, &order, &pos, &span)
             .into_iter()
             .map(merge_ranges)
             .collect();

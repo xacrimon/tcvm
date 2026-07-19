@@ -17,7 +17,7 @@
 //! output is a genuine shuffle the allocator failed to coalesce. Move-immediate
 //! (`movz`/`movk`) is a real materialization and is deliberately *not* counted.
 
-use super::isel::{select, select_ssa};
+use super::isel::select;
 use super::regalloc::allocate;
 use super::target::{encode, machine_env};
 use crate::Lua;
@@ -76,48 +76,4 @@ fn dump_is_prime_asm() {
         let mark = if is_reg_move(w) { "  <- move" } else { "" };
         eprintln!("  {i:3}  {w:08x}{mark}");
     }
-}
-
-/// The same function through the SSA path, for A/B against `dump_is_prime_asm`.
-///
-/// Same metric, same input: the only difference is whether isel destructed the
-/// block parameters or the allocator resolved them.
-#[test]
-fn dump_is_prime_asm_ssa() {
-    let source = std::fs::read_to_string("test-files/primes.lua").unwrap();
-    let mut lua = Lua::new();
-    lua.load_all();
-
-    let (words, ssa_words) = lua.enter(|ctx| {
-        let chunk = ctx.load(&source, Some("primes")).expect("compile");
-        let closure = chunk.as_lua().expect("chunk is a Lua closure");
-        let is_prime = closure.proto.prototypes[0];
-        let func = lower(is_prime, 0, vec![INT]).expect("lower is_prime");
-
-        let build = |mut m: super::mach::MFunc| {
-            super::target::annotate(&mut m);
-            let ra = allocate(&m, &machine_env()).expect("allocate");
-            encode(&m, &func.pool, &ra).expect("encode")
-        };
-        (
-            build(select(&func).expect("isel")),
-            build(select_ssa(&func).expect("isel ssa")),
-        )
-    });
-
-    let report = |tag: &str, w: &[u32]| {
-        let moves = w.iter().filter(|&&x| is_reg_move(x)).count();
-        let pct = if w.is_empty() {
-            0.0
-        } else {
-            100.0 * moves as f64 / w.len() as f64
-        };
-        eprintln!(
-            "  {tag:12} {:3} instructions, {moves} reg-reg moves ({pct:.1}%)",
-            w.len()
-        );
-    };
-    eprintln!("\n=== is_prime: destructed vs SSA ===");
-    report("destructed", &words);
-    report("ssa", &ssa_words);
 }

@@ -595,22 +595,6 @@ impl Encoder<'_, '_> {
                 let bits = self.pool.value(c).raw_payload() as i64;
                 self.a.mov_imm(d, bits);
             }
-            MOp::Mov => match self.m.class(self.m.inst(i).def_vreg(0)) {
-                RegClass::Int => {
-                    let s = self.use_g(i, 0);
-                    let d = self.def_g(i, 0);
-                    if d != s {
-                        self.a.mov(d, s);
-                    }
-                }
-                RegClass::Float => {
-                    let s = self.use_f(i, 0);
-                    let d = self.def_f(i, 0);
-                    if d != s {
-                        self.a.movsd(d, s);
-                    }
-                }
-            },
             MOp::Load { off, width } => {
                 let base = self.use_g(i, 0);
                 let d = self.def_g(i, 0);
