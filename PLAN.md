@@ -112,22 +112,21 @@ Algorithm 2, coupling code on edges.
 | target | | plan | today | Δ ops | Δ weighted |
 |---|---|---|---|---|---|
 | x86-64 (13 regs) | mix | 38 (w 344) | 69 (w 483) | **−45%** | **−29%** |
-| x86-64 (13 regs) | mix2 | 279 (w 2169) | 330 (w 2715) | **−15%** | **−20%** |
-| aarch64 (20 regs) | mix2 | 193 (w 1759) | 210 (w 1722) | −8% | +2% |
+| x86-64 (13 regs) | mix2 | 281 (w 2189) | 330 (w 2715) | **−15%** | **−19%** |
+| aarch64 (20 regs) | mix2 | 194 (w 1589) | 210 (w 1722) | **−8%** | **−8%** |
 
-**Read the two targets together, not separately.** The pass wins where there is
-genuine pressure and is a wash where there is not. That is the shape Braun09's own
-setup implies — they measured on x86 with **7** registers, picked precisely to
-stress spilling. aarch64's 20 leaves mix2 barely over the line, so there is little
-for a better policy to win; x86-64's 13 is much nearer the paper's setting and the
-benefit appears there.
+**Read the two targets together, not separately.** The benefit scales with
+pressure, which is the shape Braun09's own setup implies — they measured on x86
+with **7** registers, picked precisely to stress spilling. aarch64's 20 leaves
+mix2 only just over the line; x86-64's 13 is nearer the paper's setting and shows
+roughly twice the win.
 
 `is_prime` and `mix` on aarch64 both come out at exactly **zero** spill code,
 agreeing with an allocator that reached the same answer by an entirely different
 route. That is the strongest correctness signal available short of wiring it in.
 
-**Two things the papers get wrong or leave out**, both found by property tests
-rather than by reading:
+**Three things the papers get wrong or leave out**, all found by property tests or
+by a number that did not fit, none by reading the code:
 
 - §4.3's two coupling rules do not cover a value the predecessor held in a
   register, still live, that the successor has no room for. It leaves registers at
@@ -135,6 +134,14 @@ rather than by reading:
 - The printed transfer function `f_B` in §4.1 has no case for a value *defined* in
   the block, which makes a value defined in `B` and live out of `B` come out
   live-*in* at `B`.
+- §4.2's `p_L` estimate for admitting live-through values to a loop counts only
+  values live *across* instructions and nothing for the registers an instruction
+  needs for its own results, so it admits right up to `k` and the first
+  `limit(.., k - |defs|)` in the loop evicts one of them — a store in the body and a
+  reload on the back edge, every iteration, which is the Fig. 2d case the rule
+  exists to prevent. Their footnote 6 concedes the estimate "might be an
+  under-approximation". Keeping back the loop's widest instruction fixes it and is
+  worth 170 weighted on mix2, the difference between −8% and +2% on aarch64.
 
 **The invariant that found most of the bugs**: *nothing is reloaded that was never
 stored*. Zero stores against fifty reloads is incoherent on its face, and three
