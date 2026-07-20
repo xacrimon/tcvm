@@ -44,9 +44,17 @@ fn format_cfg(out: &mut String, cfg: &Cfg, proto: &Prototype<'_>) {
     for b in &cfg.blocks {
         let succs: Vec<String> = b.succs.iter().map(|s| format!("b{s}")).collect();
         let live: Vec<String> = b.live_in.iter().map(|r| format!("R{r}")).collect();
+        // Printed only where non-empty: a register a predecessor's terminator
+        // assigns on one edge only is rare, and always worth noticing.
+        let edge = if b.edge_params.is_empty() {
+            String::new()
+        } else {
+            let regs: Vec<String> = b.edge_params.iter().map(|r| format!("R{r}")).collect();
+            format!(" edge_params=[{}]", regs.join(", "))
+        };
         let _ = writeln!(
             out,
-            "  b{}: succs=[{}] live_in=[{}]",
+            "  b{}: succs=[{}] live_in=[{}]{edge}",
             b.start,
             succs.join(", "),
             live.join(", ")

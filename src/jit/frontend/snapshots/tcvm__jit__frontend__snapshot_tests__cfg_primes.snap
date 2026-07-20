@@ -1,6 +1,6 @@
 ---
 source: src/jit/frontend/snapshot_tests.rs
-expression: output
+expression: cfgs_of(& source)
 ---
 === bytecode cfg: main (params=0, vararg=true, stack=6)
   declined: Vararg(0)
@@ -12,7 +12,7 @@ expression: output
     0002  SUB             R2 R0 R4
     0003  LOAD            R3 K1  ; 1
     0004  FORPREP         R1 +7
-  b5: succs=[b9, b11] live_in=[R0, R1, R2, R3, R4]
+  b5: succs=[b9, b11] live_in=[R0, R1, R2, R3, R4] edge_params=[R1, R4]
     0005  MOD             R5 R0 R4
     0006  LOAD            R6 K2  ; 0
     0007  EQ              R5 R6 inv=false

@@ -32,20 +32,20 @@ mb3(r4, r5):
     r19 = load.u64 [0] r18
     r20 = load.u8 [8] r18
     guard.eq #2 -> exit2 r20, r0, r1, r2, r4, r5, r8
-    r21 = add r4, r19
+    r21 = add r5, r19
     r22 = imm 1
-    r23 = add r5, r22
+    r23 = add r4, r22
     brcmp.le mb8, mb9 r23, r2
 mb4:
     jump mb1
 mb5:
     jump mb2(r6)
 mb6:
-    jump mb3(r15, r17)
+    jump mb3(r17, r15)
 mb7:
     jump mb2(r15)
 mb8:
-    jump mb3(r21, r23)
+    jump mb3(r23, r21)
 mb9:
     jump mb2(r21)
 exit0: -> pc 5
@@ -62,7 +62,7 @@ exit1: -> pc 5
     R5 <- int r8
 exit2: -> pc 5
     R0 <- r1:Table
-    R2 <- int r4
-    R3 <- int r5
+    R2 <- int r5
+    R3 <- int r4
     R4 <- r2:Integer
     R5 <- int r8

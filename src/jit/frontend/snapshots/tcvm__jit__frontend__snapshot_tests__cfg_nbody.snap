@@ -1,6 +1,6 @@
 ---
 source: src/jit/frontend/snapshot_tests.rs
-expression: output
+expression: cfgs_of(& source)
 ---
 === bytecode cfg: main (params=0, vararg=true, stack=23)
   declined: Vararg(0)
@@ -11,7 +11,7 @@ expression: output
     0001  MOVE            R4 R1
     0002  LOAD            R5 K0  ; 1
     0003  FORPREP         R3 +56
-  b4: succs=[b17, b56] live_in=[R0, R1, R2, R3, R4, R5, R6]
+  b4: succs=[b17, b56] live_in=[R0, R1, R2, R3, R4, R5, R6] edge_params=[R3, R6]
     0004  GETTABLE        R7 R0 R6
     0005  GETFIELD        R8 R7 K1  ; "x"
     0006  GETFIELD        R9 R7 K2  ; "y"
@@ -25,7 +25,7 @@ expression: output
     0014  MOVE            R16 R1
     0015  LOAD            R17 K0  ; 1
     0016  FORPREP         R15 +39
-  b17: succs=[b56, b17] live_in=[R0, R1, R2, R3, R4, R5, R7, R8, R9, R10, R11, R12, R13, R14, R15, R16, R17, R18]
+  b17: succs=[b56, b17] live_in=[R0, R1, R2, R3, R4, R5, R7, R8, R9, R10, R11, R12, R13, R14, R15, R16, R17, R18] edge_params=[R15, R18]
     0017  GETTABLE        R19 R0 R18
     0018  GETFIELD        R20 R19 K1  ; "x"
     0019  SUB             R20 R8 R20
@@ -75,7 +75,7 @@ expression: output
     0061  MOVE            R4 R1
     0062  LOAD            R5 K0  ; 1
     0063  FORPREP         R3 +17
-  b64: succs=[b81, b64] live_in=[R0, R2, R3, R4, R5, R6]
+  b64: succs=[b81, b64] live_in=[R0, R2, R3, R4, R5, R6] edge_params=[R3, R6]
     0064  GETTABLE        R7 R0 R6
     0065  GETFIELD        R8 R7 K1  ; "x"
     0066  GETFIELD        R9 R7 K5  ; "vx"
@@ -103,7 +103,7 @@ expression: output
     0002  MOVE            R4 R1
     0003  LOAD            R5 K1  ; 1
     0004  FORPREP         R3 +42
-  b5: succs=[b24, b46] live_in=[R0, R1, R2, R3, R4, R5, R6]
+  b5: succs=[b24, b46] live_in=[R0, R1, R2, R3, R4, R5, R6] edge_params=[R3, R6]
     0005  GETTABLE        R7 R0 R6
     0006  GETFIELD        R8 R7 K2  ; "vx"
     0007  GETFIELD        R9 R7 K3  ; "vy"
@@ -123,7 +123,7 @@ expression: output
     0021  MOVE            R13 R1
     0022  LOAD            R14 K1  ; 1
     0023  FORPREP         R12 +22
-  b24: succs=[b46, b24] live_in=[R0, R1, R2, R3, R4, R5, R7, R11, R12, R13, R14, R15]
+  b24: succs=[b46, b24] live_in=[R0, R1, R2, R3, R4, R5, R7, R11, R12, R13, R14, R15] edge_params=[R12, R15]
     0024  GETTABLE        R16 R0 R15
     0025  GETFIELD        R17 R7 K7  ; "x"
     0026  GETFIELD        R18 R16 K7  ; "x"
@@ -160,7 +160,7 @@ expression: output
     0004  MOVE            R6 R1
     0005  LOAD            R7 K1  ; 1
     0006  FORPREP         R5 +12
-  b7: succs=[b19, b7] live_in=[R0, R2, R3, R4, R5, R6, R7, R8]
+  b7: succs=[b19, b7] live_in=[R0, R2, R3, R4, R5, R6, R7, R8] edge_params=[R5, R8]
     0007  GETTABLE        R9 R0 R8
     0008  GETFIELD        R10 R9 K2  ; "mass"
     0009  GETFIELD        R11 R9 K3  ; "vx"

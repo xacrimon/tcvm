@@ -21,19 +21,19 @@ block1:
       v25 = iconst 1
       v26 = add.i64 v14, v25
       v27 = icmp le v26, v24
-            br v27 block3(v23, v26), block2(v23)
+            br v27 block3(v26, v23), block2(v23)
 block2(v7: i64):
       v28 = pack.int v7
             ret v28
-block3(v9: i64, v10: i64):
+block3(v8: i64, v10: i64):
             assume.no_mm S0, INDEX
       v29 = tab.props v18
       v30 = slot.get v29, 0
       v31 = guard.type v30, int  ; exit2
       v32 = unpack.int v31
-      v33 = add.i64 v9, v32
+      v33 = add.i64 v10, v32
       v34 = unpack.int v1
       v35 = iconst 1
-      v36 = add.i64 v10, v35
+      v36 = add.i64 v8, v35
       v37 = icmp le v36, v34
-            br v37 block3(v33, v36), block2(v33)
+            br v37 block3(v36, v33), block2(v33)

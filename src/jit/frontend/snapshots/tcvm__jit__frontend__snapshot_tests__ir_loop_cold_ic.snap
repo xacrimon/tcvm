@@ -18,18 +18,18 @@ block1:
       v24 = iconst 1
       v25 = add.i64 v15, v24
       v26 = icmp le v25, v23
-            br v26 block3(v22, v25), block4(v22)
+            br v26 block3(v25, v22), block4(v22)
 block2:
       v27 = pack.int v14
             ret v27
-block3(v9: any, v10: i64):
+block3(v8: i64, v10: any):
       v28 = kconst "x"
       v29 = lua.getindex v0, v28
-      v30 = lua.add v9, v29
+      v30 = lua.add v10, v29
       v31 = unpack.int v1
       v32 = iconst 1
-      v33 = add.i64 v10, v32
+      v33 = add.i64 v8, v32
       v34 = icmp le v33, v31
-            br v34 block3(v30, v33), block4(v30)
+            br v34 block3(v33, v30), block4(v30)
 block4(v13: any):
             ret v13

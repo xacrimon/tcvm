@@ -44,6 +44,10 @@ pub struct BcBlock {
     pub succs: Vec<u32>,
     /// Live-in registers, ascending. These become the block's IR parameters.
     pub live_in: Vec<u8>,
+    /// Live-in registers that some predecessor's terminator assigns on one edge
+    /// only, so they hold a different value per incoming edge. Ascending, and a
+    /// subset of `live_in`. See [`edge_defs`].
+    pub edge_params: Vec<u8>,
 }
 
 /// How a block ends. `Branch` covers a compare/test paired with its trailing
@@ -245,6 +249,7 @@ pub fn build(code: &[Instruction]) -> Result<Cfg, Unsupported> {
             end,
             succs,
             live_in: Vec::new(),
+            edge_params: Vec::new(),
         });
     }
 
@@ -256,7 +261,65 @@ pub fn build(code: &[Instruction]) -> Result<Cfg, Unsupported> {
 
     let mut cfg = Cfg { blocks, index_of };
     liveness(code, &mut cfg)?;
+    edge_params(code, &mut cfg);
     Ok(cfg)
+}
+
+/// Registers a *branching* terminator assigns on one of its edges but not the
+/// other, so that the block has no single exit value for them.
+///
+/// On-the-fly SSA construction assumes one exit value per variable per block:
+/// a read that walks into a predecessor takes that predecessor's definition,
+/// with no way to say "but only along this edge". These registers therefore do
+/// not go through the builder at all — the target takes an explicit parameter
+/// and lowering supplies the right value per edge, exactly as it does today.
+///
+/// `FORPREP`/`FORLOOP` fold increment-and-branch into one instruction, so the
+/// counter and the visible loop variable advance on the body edge and not on
+/// the exit edge. `TESTSET` assigns `dst` only on the edge that does not skip.
+pub fn edge_defs(i: Instruction, out: &mut Vec<u8>) {
+    match i {
+        Instruction::FORPREP { base, .. } | Instruction::FORLOOP { base, .. } => {
+            out.push(base);
+            out.push(base + 3);
+        }
+        Instruction::TESTSET { dst, .. } => out.push(dst),
+        _ => {}
+    }
+}
+
+/// Propagate [`edge_defs`] from each branching terminator to its targets, and
+/// intersect with liveness: a register nothing reads needs no parameter.
+fn edge_params(code: &[Instruction], cfg: &mut Cfg) {
+    let mut per_block: Vec<Vec<u8>> = vec![Vec::new(); cfg.blocks.len()];
+    let mut defs = Vec::new();
+
+    for b in 0..cfg.blocks.len() {
+        let (start, end) = (cfg.blocks[b].start, cfg.blocks[b].end);
+        defs.clear();
+        for pc in start..end {
+            // `terminator` re-derives the block's ending instruction; it cannot
+            // fail here, `build` already walked the same range.
+            if let Ok(Term::Branch { .. }) = terminator(code, pc) {
+                edge_defs(code[pc as usize], &mut defs);
+                break;
+            }
+        }
+        if defs.is_empty() {
+            continue;
+        }
+        for &s in &cfg.blocks[b].succs {
+            per_block[cfg.index_of[&s]].extend_from_slice(&defs);
+        }
+    }
+
+    for (b, block) in cfg.blocks.iter_mut().enumerate() {
+        let mut regs = std::mem::take(&mut per_block[b]);
+        regs.retain(|r| block.live_in.contains(r));
+        regs.sort_unstable();
+        regs.dedup();
+        block.edge_params = regs;
+    }
 }
 
 /// Registers an instruction reads.

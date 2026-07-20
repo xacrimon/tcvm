@@ -939,13 +939,26 @@ fn pinned_regs(proto: &Prototype<'_>) -> Vec<bool> {
 
 /// The parameters of a block compiled from `pc`: its live-in registers, minus
 /// any that are stack-pinned (those live in memory, not SSA).
+///
+/// [`BcBlock::edge_params`](cfg::BcBlock::edge_params) lead. They are the ones
+/// lowering must supply per edge itself; the rest are what on-the-fly SSA
+/// construction will discover and append, and appending must not shift a column
+/// index already handed out.
 fn params_of(cfg: &Cfg, pinned: &[bool], pc: u32) -> Vec<u8> {
-    cfg.block_at(pc)
-        .live_in
+    let b = cfg.block_at(pc);
+    let mut params: Vec<u8> = b
+        .edge_params
         .iter()
         .copied()
         .filter(|&r| !pinned[r as usize])
-        .collect()
+        .collect();
+    params.extend(
+        b.live_in
+            .iter()
+            .copied()
+            .filter(|&r| !pinned[r as usize] && !b.edge_params.contains(&r)),
+    );
+    params
 }
 
 pub fn lower<'gc>(

@@ -73,6 +73,9 @@ cfg_test!(branch, "test-files/jit_branch.lua");
 cfg_test!(multret, "test-files/jit_multret.lua");
 cfg_test!(primes, "test-files/primes.lua");
 cfg_test!(nbody, "test-files/nbody.lua");
+// The only `TESTSET` in the corpus, and so the only `edge_params` that come
+// from anything but a numeric `for`.
+cfg_test!(testset, "test-files/jit_testset.lua");
 
 const INT: Ty = Ty::new(crate::jit::ir::ty::Rep::Val, TypeSet::INT);
 const TAB: Ty = Ty::new(crate::jit::ir::ty::Rep::Val, TypeSet::TAB);

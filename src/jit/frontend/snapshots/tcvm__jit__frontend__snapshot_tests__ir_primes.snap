@@ -10,12 +10,12 @@ block0(v0: int):
       v14 = iconst 1
       v15 = icmp le v10, v13
             br v15 block1(v10), block2
-block1(v5: i64):
+block1(v2: i64):
       v16 = unpack.int v0
       v17 = iconst 0
-      v18 = icmp ne v5, v17
+      v18 = icmp ne v2, v17
             guard.cond v18  ; exit0
-      v19 = mod.i64 v16, v5
+      v19 = mod.i64 v16, v2
       v20 = iconst 0
       v21 = icmp eq v19, v20
             br v21 block3, block4
@@ -27,6 +27,6 @@ block3:
             ret v23
 block4:
       v24 = iconst 1
-      v25 = add.i64 v5, v24
+      v25 = add.i64 v2, v24
       v26 = icmp le v25, v13
             br v26 block1(v25), block2
