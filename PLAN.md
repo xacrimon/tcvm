@@ -194,7 +194,53 @@ Three things the verifier caught, none of which unit tests would have:
 
 ---
 
-## 2. What is left: edge resolution over split values
+### Stage 5 — edge resolution over split values (`ba357cd`)
+
+`resolve_edges` now resolves **every value live at the successor's entry**, not only
+block parameters, and places moves at whichever end of the edge is private to it.
+Inert for the whole-value path — a value with one location for life agrees at both
+ends by construction — which its 289 unchanged tests confirm. Braun09's coupling
+code falls out of it for free: a value in a register on one side and a slot on the
+other *is* a reload, so there is no second list to keep in step.
+
+Runs are also clipped at block boundaries, and a reload is emitted only where a run
+follows a real gap rather than at every run start.
+
+**`primes` and `mix` passing at `99019a8` was luck**, not a regression since: runs
+were unclipped there and happened not to span a join on those two functions.
+
+---
+
+## 2. What is left: one defect, then measure
+
+**`allocate_presplit` anchors each value's first `Locations` entry at position 0**,
+copying what the whole-value scan did. Under splitting that makes `get` answer "in
+register R" for every position before the value's first run, including regions
+where nothing put it there. It presents as a register read that was never written.
+
+`mix`'s **v15** is the case to work from: a block parameter live for a single slot
+`[122, 123)` that the spiller keeps in a register until 152, so its one run is
+`[122, 152)`, its entry is written at 0, and `locs.get` answers `x2` from the start
+of the function. Two things, together:
+
+1. Anchor the first entry at the run's own start rather than 0 — then find what
+   still reads a location before a value is live. `resolve_edges`' `busy` scan is
+   the one to check, since it asks every value where it is.
+2. Decide what a value's location *is* outside its live range. `None` is honest and
+   would make (1) fall out, but every caller must then handle it and several
+   currently `.expect()`.
+
+Both split tests are `#[ignore]`d with this diagnosis in `check_split`'s doc.
+
+### Then measure, and only then consider making it the default
+
+**The plan's numbers do not count the shuffle.** A value split differently on two
+paths needs a *move* at the join, and Stage 2 worked hard to reach 0 reg-reg moves
+in loops. So the acceptance test is `spillcost` **and** `asm_dump`'s move counter,
+on emitted code. If splitting trades 15% of spill traffic for a pile of
+loop-carried moves it is not worth landing.
+
+### Superseded
 
 `resolve_edges` walks an edge's arguments against its successor's parameters and
 nothing else. Without splitting that is *complete*: every other value has a single
