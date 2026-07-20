@@ -44,6 +44,7 @@ use crate::jit::frontend::cfg::{self, Cfg, Term, Unsupported};
 use crate::jit::frontend::sink::{
     self, Decline, Feedback, IcFeedback, RegState, Scalar, Sink, compare, step, to_val,
 };
+use crate::jit::frontend::ssa::SsaBuilder;
 use crate::jit::ir::op::{ArithKind, Cc, FloatOp, IntOp, Op};
 use crate::jit::ir::pool::{ConstPool, ConstRef, ProtoRef, ShapeRef, StrRef};
 use crate::jit::ir::ty::{Refine, Rep, Ty, TypeContext, TypeSet};
@@ -976,14 +977,16 @@ pub fn lower<'gc>(
     };
 
     let mut func = Func::new();
-    {
+    let retired = {
         let mut fb = VmFeedback::new(proto, &mut pool, entry_types);
-        emit(&proto, &cfg, &pinned, &mut fb, &mut func, &mut versions)?;
-    }
-    // Liveness placed a phi for every live-in register; collapse the trivial and
-    // congruent ones (e.g. a numeric `for`'s counter and visible variable, one
-    // value carried in two columns) before the backend sees them.
-    func.simplify_params();
+        emit(&proto, &cfg, &pinned, &mut fb, &mut func, &mut versions)?
+    };
+    // Construction has already dropped the parameters it found redundant, but
+    // only as a map — this is what rewrites their uses and deletes the columns.
+    // It also collects the congruent ones, which are a property construction
+    // does not check: a numeric `for`'s counter and visible variable are one
+    // value carried in two columns.
+    func.simplify_params_seeded(retired);
     func.pool = pool;
     func.pinned_regs = pinned
         .iter()
@@ -1120,10 +1123,53 @@ fn emit<'gc>(
     fb: &mut VmFeedback<'gc, '_>,
     func: &mut Func<'gc>,
     versions: &mut Versions,
-) -> Result<(), LowerError> {
+) -> Result<HashMap<Val, Val, RandomState>, LowerError> {
+    let n = versions.all.len();
+
+    // The type each block declares for each register. `read_var` may place a
+    // parameter on a block *upstream* of the read — the chain walk picks it, not
+    // the caller — so the type has to be available per block rather than passed
+    // in. The version's entry context is exactly that table.
+    // Sized by the prototype's frame, not by the 256 a register index could
+    // name: these are per block, and zeroing 256 slots per block for a function
+    // that uses twenty of them is pure overhead on a small region.
+    let nvars = proto.max_stack_size as usize;
+    let mut reg_ty: Vec<Vec<Option<Ty>>> = vec![vec![None; nvars]; n];
+
+    // Each version's parameter registers, and how many of them lowering supplies
+    // itself. Computed once: `block_call` needs the target's list on every edge,
+    // and rebuilding it there was the shape of the cost this change exists to
+    // remove.
+    let regs_of: Vec<Vec<u8>> = (0..n)
+        .map(|id| params_of(cfg, pinned, versions.all[id].pc))
+        .collect();
+
+    let n_explicit: Vec<usize> = (0..n)
+        .map(|id| {
+            if id == 0 {
+                // The entry has no predecessor, so its parameters are the
+                // region's calling convention — the prologue loads them off the
+                // Lua stack and `entry_regs` names them. A region entered *at* a
+                // loop header has back-edges too, and then every one of them is
+                // also supplied per edge, which is consistent.
+                regs_of[id].len()
+            } else {
+                // `params_of` puts `edge_params` first precisely so this is a
+                // prefix: the registers a predecessor's terminator assigns along
+                // one edge alone, which on-the-fly construction cannot express
+                // because it assumes a single exit value per block.
+                cfg.block_at(versions.all[id].pc)
+                    .edge_params
+                    .iter()
+                    .filter(|&&r| !pinned[r as usize])
+                    .count()
+            }
+        })
+        .collect();
+
     // Create every block up front so edges can name blocks that aren't emitted
     // yet (back-edges, forward branches).
-    for id in 0..versions.all.len() {
+    for id in 0..n {
         let block = if id == 0 {
             func.entry
         } else {
@@ -1131,93 +1177,175 @@ fn emit<'gc>(
         };
         let pc = versions.all[id].pc;
         let ctx = versions.all[id].ctx.clone();
-        for &ty in &ctx.0 {
-            func.append_param(block, ty);
+        for (k, &r) in regs_of[id].iter().enumerate() {
+            reg_ty[block.index()][r as usize] = Some(ctx.0[k]);
+        }
+        // Only the parameters lowering has to supply itself are placed here; the
+        // rest are discovered by `read_var` and appended as they are found.
+        for k in 0..n_explicit[id] {
+            func.append_param(block, ctx.0[k]);
         }
         func.block_mut(block).origin = Some(crate::jit::ir::Origin { pc, ctx });
         versions.all[id].block = Some(block);
     }
 
-    for id in 0..versions.all.len() {
+    let mut ssa = SsaBuilder::new(func.num_blocks(), nvars, reg_ty);
+
+    // An edge may only be declared once its source is *filled*, and a block may
+    // only be sealed once every edge is in. So count the edges each version will
+    // receive, and seal as the last one arrives.
+    let mut want_edges = vec![0usize; n];
+    for id in 0..n {
+        for &t in &versions.all[id].succs {
+            want_edges[t] += 1;
+        }
+    }
+    let mut have_edges = vec![0usize; n];
+
+    // The explicit parameters are ordinary definitions as far as the builder is
+    // concerned: recording them here is what stops a read walking past a block
+    // that a per-edge assignment already gave a value.
+    for id in 0..n {
+        let block = versions.all[id].block.unwrap();
+        let params = func.block(block).params.clone();
+        for (k, &r) in regs_of[id][..n_explicit[id]].iter().enumerate() {
+            ssa.write_var(block, r, params[k]);
+        }
+    }
+
+    if want_edges[0] == 0 {
+        ssa.seal(func, versions.all[0].block.unwrap());
+    }
+
+    for id in 0..n {
         let pc = versions.all[id].pc;
         let block = versions.all[id].block.unwrap();
         let succs = versions.all[id].succs.clone();
 
+        // Fault in the live-in registers. Reading is not placing: a register
+        // whose value is the same on every path resolves to that definition and
+        // no parameter is created. A read of a block that is not yet sealed —
+        // a loop header whose back-edge is still to come — parks a parameter
+        // that sealing may find redundant, which is why the values recorded
+        // here are rewritten at the end rather than trusted as final.
         let mut st: RegState<Val> = RegState::new(256, pinned.to_vec());
-        let params = params_of(cfg, pinned, pc);
-        let block_params = func.block(block).params.clone();
-        for (n, &r) in params.iter().enumerate() {
-            st.regs[r as usize] = Some(block_params[n]);
+        for &r in regs_of[id].iter() {
+            st.regs[r as usize] = Some(ssa.read_var(func, block, r));
         }
-
-        let mut s = IrSink {
-            func,
-            block,
-            pc,
-            regs: st.regs.clone(),
-            ctx: versions.all[id].ctx.clone(),
-        };
 
         // Same walk as the analysis, with the IR sink. Each edge's out-state
         // becomes a BlockCall.
-        let out = run_body(proto, cfg, fb, &mut s, &mut st, pc)?;
+        let (inst, targets) = {
+            let mut s = IrSink {
+                func,
+                block,
+                pc,
+                regs: st.regs.clone(),
+                ctx: versions.all[id].ctx.clone(),
+            };
+            let out = run_body(proto, cfg, fb, &mut s, &mut st, pc)?;
 
-        match out {
-            TermOut::Jump(_, out_st) => {
-                let call = block_call(&mut s, versions, succs[0], cfg, pinned, &out_st);
-                let data = InstData {
-                    op: Op::Jump,
-                    args: vec![],
-                    targets: vec![call],
-                    results: vec![],
-                    fs: None,
-                    exit: None,
-                };
-                s.func.append_inst(block, data, &[]);
+            match out {
+                TermOut::Jump(_, out_st) => {
+                    let call =
+                        block_call(&mut s, versions, succs[0], &regs_of, &n_explicit, &out_st);
+                    let data = InstData {
+                        op: Op::Jump,
+                        args: vec![],
+                        targets: vec![call],
+                        results: vec![],
+                        fs: None,
+                        exit: None,
+                    };
+                    let (inst, _) = s.func.append_inst(block, data, &[]);
+                    (Some(inst), vec![succs[0]])
+                }
+                TermOut::Br { cond, t, f } => {
+                    let ct = block_call(&mut s, versions, succs[0], &regs_of, &n_explicit, &t.1);
+                    let cf = block_call(&mut s, versions, succs[1], &regs_of, &n_explicit, &f.1);
+                    let data = InstData {
+                        op: Op::Br,
+                        args: vec![cond],
+                        targets: vec![ct, cf],
+                        results: vec![],
+                        fs: None,
+                        exit: None,
+                    };
+                    let (inst, _) = s.func.append_inst(block, data, &[]);
+                    (Some(inst), vec![succs[0], succs[1]])
+                }
+                TermOut::Ret(vals) => {
+                    let data = InstData {
+                        op: Op::Ret,
+                        args: vals,
+                        targets: vec![],
+                        results: vec![],
+                        fs: None,
+                        exit: None,
+                    };
+                    s.func.append_inst(block, data, &[]);
+                    (None, vec![])
+                }
             }
-            TermOut::Br { cond, t, f } => {
-                let ct = block_call(&mut s, versions, succs[0], cfg, pinned, &t.1);
-                let cf = block_call(&mut s, versions, succs[1], cfg, pinned, &f.1);
-                let data = InstData {
-                    op: Op::Br,
-                    args: vec![cond],
-                    targets: vec![ct, cf],
-                    results: vec![],
-                    fs: None,
-                    exit: None,
-                };
-                s.func.append_inst(block, data, &[]);
+        };
+
+        // The block is filled: every definition in it is final. Record them
+        // before any edge out of it is declared, or a read that follows one
+        // would see a value that is not.
+        //
+        // `st` is the state *before* the terminator, which is the right one: a
+        // register a branching terminator assigns has no single exit value, and
+        // those registers reach their targets as explicit parameters instead.
+        for r in 0..nvars {
+            if !pinned[r] {
+                if let Some(v) = st.regs[r] {
+                    ssa.write_var(block, r as u8, v);
+                }
             }
-            TermOut::Ret(vals) => {
-                let data = InstData {
-                    op: Op::Ret,
-                    args: vals,
-                    targets: vec![],
-                    results: vec![],
-                    fs: None,
-                    exit: None,
-                };
-                s.func.append_inst(block, data, &[]);
+        }
+
+        if let Some(inst) = inst {
+            for (t, &target) in targets.iter().enumerate() {
+                ssa.add_pred(versions.all[target].block.unwrap(), block, inst, t);
+                have_edges[target] += 1;
+                if have_edges[target] == want_edges[target] {
+                    ssa.seal(func, versions.all[target].block.unwrap());
+                }
             }
         }
     }
-    Ok(())
+
+    debug_assert!(
+        (0..n).all(|id| ssa.is_sealed(versions.all[id].block.unwrap())),
+        "every block should be sealed once emission is done",
+    );
+
+    // A parameter read before its block was sealed may since have been found
+    // redundant, so uses recorded above can name a retired value. Handing the
+    // map back rather than applying it here lets one rewrite serve both this and
+    // the congruence pass.
+    Ok(ssa.into_replacements())
 }
 
 /// Build the argument list for an edge, coercing each value to the target
 /// version's parameter type. Only ever *packs*: an unboxed target accepts only
 /// its own representation (see `accepts`), so a mismatch means the target is
 /// boxed.
+///
+/// Only the target's [`explicit_params`] are supplied here. Parameters the
+/// builder discovers get their arguments appended to this same list as they are
+/// created, which keeps every edge's arguments parallel with the target's
+/// columns throughout.
 fn block_call(
     s: &mut IrSink<'_, '_>,
     versions: &Versions,
     target: usize,
-    cfg: &Cfg,
-    pinned: &[bool],
+    regs_of: &[Vec<u8>],
+    n_explicit: &[usize],
     st: &RegState<Val>,
 ) -> BlockCall {
     let v = &versions.all[target];
-    let params = params_of(cfg, pinned, v.pc);
+    let params = &regs_of[target][..n_explicit[target]];
     let mut args = Vec::with_capacity(params.len());
     for (n, &r) in params.iter().enumerate() {
         let val = st.regs[r as usize].expect("live-in register must be defined on this edge");

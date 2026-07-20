@@ -146,3 +146,83 @@ fn test_ir_loop_warm_ic() {
     });
     assert_snapshot!(out);
 }
+
+/// Every prototype in the corpus that lowers at all, run through the verifier.
+///
+/// The snapshots above verify what they print, but they cover four functions.
+/// On-the-fly SSA construction fails by placing *too few* parameters — a use
+/// that its definition no longer dominates — and that is exactly what
+/// `verify` checks, so pointing it at the whole corpus is the cheapest coverage
+/// available for the one failure mode that is a miscompile rather than a
+/// slowdown. Declining to compile is a legal answer and not counted.
+#[test]
+fn every_lowered_prototype_verifies() {
+    let mut checked = 0;
+    for entry in fs::read_dir("test-files").unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("lua") {
+            continue;
+        }
+        let Ok(source) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut lua = Lua::new();
+        lua.load_all();
+        lua.enter(|ctx| {
+            let Ok(chunk) = ctx.load(&source, Some("t")) else {
+                return;
+            };
+            let Some(closure) = chunk.as_lua() else {
+                return;
+            };
+            for proto in closure.proto.prototypes.iter() {
+                // Entry types the compile trigger would have read off the live
+                // stack; `any` is the honest stand-in and the widest case.
+                let entry = vec![Ty::ANY; proto.num_params as usize];
+                if let Ok(func) = lower(*proto, 0, entry) {
+                    if let Err(e) = verify::verify(&func) {
+                        panic!(
+                            "{} prototype failed verification:\n{e}\n--- ir ---\n{}",
+                            path.display(),
+                            print_func(&func)
+                        );
+                    }
+                    checked += 1;
+                }
+            }
+        });
+    }
+    assert!(
+        checked > 20,
+        "only {checked} prototypes lowered; corpus lost?"
+    );
+}
+
+/// `simplify_params` is meant to be re-run after later passes, so running it on
+/// freshly-built IR must be sound and must change nothing: construction already
+/// left no redundant parameter behind. A second run that fired would mean the
+/// seeded call had missed something; one that broke verification would mean the
+/// pass cannot be re-run at all.
+#[test]
+fn simplify_params_is_idempotent_after_construction() {
+    for name in ["mix", "mix2", "primes", "nbody", "jit_loop", "jit_branch"] {
+        let source = fs::read_to_string(format!("test-files/{name}.lua")).unwrap();
+        let mut lua = Lua::new();
+        lua.load_all();
+        lua.enter(|ctx| {
+            let chunk = ctx.load(&source, Some("t")).expect("compile");
+            let inner = chunk.as_lua().unwrap().proto.prototypes[0];
+            let entry = vec![Ty::ANY; inner.num_params as usize];
+            let Ok(mut func) = lower(inner, 0, entry) else {
+                return;
+            };
+            let before = print_func(&func);
+            func.simplify_params();
+            let after = print_func(&func);
+            assert_eq!(before, after, "{name}: a second run changed the IR");
+            if let Err(e) = verify::verify(&func) {
+                panic!("{name}: IR failed verification after a second run:\n{e}");
+            }
+        });
+    }
+}
