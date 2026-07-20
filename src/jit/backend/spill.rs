@@ -262,13 +262,16 @@ fn min_algorithm(
         // ...then room for the results, measured from the *next* instruction,
         // because once this one writes its results its own operands stop mattering.
         // Getting this second call wrong is what makes defs collide with uses.
-        // Likewise for results: an `Any` def may be written straight to its slot, so
-        // it needs no register reserved for it. A temp always does — it is scratch
-        // with no home to fall back on.
+        // Results are *not* discounted the way operands are, even an `Any` one. The
+        // encoders write every def to a register and let an edit store it afterwards
+        // (`aarch64::def_g` makes `Alloc::Spill` on a def `unreachable!`), so a def
+        // needs a register here whatever its constraint says it would tolerate.
+        // isel emits no `Any` defs today — 0 across all three benchmarks against 205
+        // `Any` uses on mix2 — so this costs nothing and stays on the safe side of a
+        // contract the spiller does not own.
         let ndefs = f
             .defs(i)
             .iter()
-            .filter(|o| o.constraint != Constraint::Any)
             .chain(f.temps(i))
             .filter(|o| f.class(o.vreg) == class)
             .count();
@@ -279,7 +282,7 @@ fn min_algorithm(
         limit(f, w, s, dist, j + 1, k.saturating_sub(ndefs), i, plan);
 
         for o in f.defs(i) {
-            if o.constraint != Constraint::Any && f.class(o.vreg) == class && !w.contains(&o.vreg) {
+            if f.class(o.vreg) == class && !w.contains(&o.vreg) {
                 w.push(o.vreg);
             }
         }
@@ -1106,7 +1109,7 @@ mod tests {
                             o.vreg.0
                         );
                     }
-                    for o in m.defs(i).iter().filter(|o| o.constraint != Constraint::Any) {
+                    for o in m.defs(i) {
                         assert!(
                             plan.w_after[i].contains(&o.vreg),
                             "{file} inst {i}: writes v{} to a register but the plan \
