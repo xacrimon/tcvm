@@ -1451,6 +1451,9 @@ pub fn allocate_with(
     Ok(b.finish(spills))
 }
 
+/// A run of the doubled position axis and the register it was given.
+type PlacedRun = ((u32, u32), PReg);
+
 /// Colour pre-split runs, for a function whose register pressure a spiller has
 /// already brought within the register file.
 ///
@@ -1479,18 +1482,26 @@ fn allocate_presplit(
     // order, so a run continues exactly when the previous slot ended where this one
     // begins.
     let mut runs: Vec<Vec<(u32, u32)>> = vec![Vec::new(); nv];
-    let mark = |runs: &mut Vec<Vec<(u32, u32)>>, v: VReg, at: u32| {
+    // A run never crosses a block boundary, even when the two blocks are adjacent in
+    // the layout. Positions are linear but control flow is not: a run spanning the
+    // join would tell edge resolution the value is in the same register on both
+    // sides of an edge that control may never take, so no move is emitted and on the
+    // path actually taken nothing ever put it there. Clipped here, continuity across
+    // a *real* edge is re-established by `resolve_edges` comparing the two ends —
+    // which costs nothing when they agree.
+    let mark = |runs: &mut Vec<Vec<(u32, u32)>>, v: VReg, at: u32, floor: u32| {
         let r = &mut runs[v.0 as usize];
         match r.last_mut() {
-            Some(last) if last.1 == at => last.1 = at + 1,
+            Some(last) if last.1 == at && last.0 >= floor => last.1 = at + 1,
             _ => r.push((at, at + 1)),
         }
     };
     for &b in order {
+        let floor = span[b.0 as usize].0 * 2;
         for &i in f.block_insts(b) {
             let p = pos[i];
             for &v in &sets.w_use[i] {
-                mark(&mut runs, v, p * 2);
+                mark(&mut runs, v, p * 2, floor);
             }
             // A temp is scratch belonging to this instruction, not a value that
             // flows between them, so no spiller tracks it — but it still needs a
@@ -1499,11 +1510,11 @@ fn allocate_presplit(
             // other temps and lands somewhere of its own. The spiller reserved the
             // room: temps are counted in the `k - |defs|` limit.
             for o in f.temps(i) {
-                mark(&mut runs, o.vreg, p * 2);
-                mark(&mut runs, o.vreg, p * 2 + 1);
+                mark(&mut runs, o.vreg, p * 2, floor);
+                mark(&mut runs, o.vreg, p * 2 + 1, floor);
             }
             for &v in &sets.w_after[i] {
-                mark(&mut runs, v, p * 2 + 1);
+                mark(&mut runs, v, p * 2 + 1, floor);
             }
         }
     }
@@ -1637,7 +1648,7 @@ fn allocate_presplit(
     // --- slots, locations, and the edits between them ------------------------
 
     // Runs per value, in position order, with the register each got.
-    let mut placed: Vec<Vec<((u32, u32), PReg)>> = vec![Vec::new(); nv];
+    let mut placed: Vec<Vec<PlacedRun>> = vec![Vec::new(); nv];
     for (x, &(v, r)) in iv.iter().enumerate() {
         if let Some(reg) = iv_reg[x] {
             placed[v.0 as usize].push((r, reg));
@@ -1691,12 +1702,22 @@ fn allocate_presplit(
                 // same way and edge resolution relies on it.
                 locs.put(vr, 0, Alloc::Reg(first_reg));
                 let mut prev_end = placed[v][0].0.1;
+                let mut prev_reg = placed[v][0].1;
                 for &((lo, hi), reg) in &placed[v][1..] {
-                    if let Some(h) = home {
-                        locs.put(vr, prev_end, h);
+                    if lo > prev_end {
+                        // A real gap: the value spent it in memory.
+                        if let Some(h) = home {
+                            locs.put(vr, prev_end, h);
+                        }
+                        locs.put(vr, lo, Alloc::Reg(reg));
+                    } else if reg != prev_reg {
+                        // Touching runs are one stretch in registers split by a block
+                        // boundary — the clipping above makes that the common case —
+                        // so the value never left. It only changed register.
+                        locs.put(vr, lo, Alloc::Reg(reg));
                     }
-                    locs.put(vr, lo, Alloc::Reg(reg));
                     prev_end = hi;
+                    prev_reg = reg;
                 }
                 if let Some(h) = home {
                     locs.put(vr, prev_end, h);
@@ -1752,17 +1773,25 @@ fn allocate_presplit(
         let vr = VReg(v as u32);
         let class = f.class(vr);
         let born = def_at[v];
-        for (n, &((lo, _), reg)) in placed[v].iter().enumerate() {
-            // The run the value is born in needs nothing: the definition puts it
-            // there. Nor does the very first run of a value with no definition of
-            // its own — an entry argument arrives in place.
-            let is_birth = born.is_some_and(|d| placed[v][n].0.0 <= d && d < placed[v][n].0.1);
-            if is_birth || (born.is_none() && n == 0) {
+        // A reload belongs where the value comes *back from memory*, which is where a
+        // run is preceded by a gap — not merely where a run starts. Since runs are
+        // clipped at every block boundary, most run starts are continuations that
+        // already have the value in hand; reloading at each of those would put a load
+        // at the top of every block the value passes through.
+        let mut prev_end: Option<u32> = None;
+        for &((lo, hi), reg) in &placed[v] {
+            let from_memory = match prev_end {
+                Some(pe) => lo > pe,
+                // The value's first run: it came from memory unless it is born here,
+                // or arrives already in place with no definition of its own.
+                None => born.is_some_and(|d| !(lo <= d && d < hi)),
+            };
+            prev_end = Some(hi);
+            if !from_memory {
                 continue;
             }
             let inst = at_pos[(lo / 2) as usize];
             if let Some(src) = remat_src[v] {
-                // Cheaper to recompute than to have kept it anywhere.
                 b.edit(
                     ProgPoint::before(inst),
                     Edit::Remat {
@@ -2222,239 +2251,285 @@ fn resolve_edges(
     spills: &mut u32,
     b: &mut AllocationBuilder,
 ) -> Result<(), RegallocError> {
+    // How many ways into each block, to decide where an edge's moves may go.
+    let mut npreds = vec![0usize; f.num_blocks()];
+    for &b in order {
+        for sb in f.succs(b) {
+            npreds[sb.0 as usize] += 1;
+        }
+    }
+
     for &pred in order {
-        let args = f.jump_args(pred);
-        if args.is_empty() {
-            continue;
-        }
         let succs = f.succs(pred);
-        debug_assert_eq!(
-            succs.len(),
-            1,
-            "only a single-successor block passes arguments"
-        );
-        let params = f.block_params(succs[0]);
-        debug_assert_eq!(args.len(), params.len(), "edge arity");
+        for &succ in &succs {
+            let term = *f.block_insts(pred).last().expect("block has a terminator");
+            let at_pos = pos[term] * 2;
+            let entry = span[succ.0 as usize].0 * 2;
 
-        // The moves go before the block's last instruction. That is only sound
-        // because a block carrying arguments ends in a bare control transfer: any
-        // operand on it would be read *after* these moves had already overwritten
-        // the registers holding it.
-        let term = *f.block_insts(pred).last().expect("block has a terminator");
-        debug_assert!(
-            f.uses(term).is_empty() && f.defs(term).is_empty(),
-            "mb{}'s terminator has operands, so edge moves cannot precede it",
-            pred.0,
-        );
-        let at = ProgPoint::before(term);
-        let at_pos = pos[term] * 2;
+            // Where the moves for this edge can be written. One of the two ends must
+            // belong to the edge alone, which is what splitting critical edges buys:
+            // if the predecessor branches only here, the end of it is the edge; if
+            // the successor is entered only from here, the top of it is.
+            let at = if succs.len() == 1 {
+                // Sound only because a block with a single successor ends in a bare
+                // control transfer: an operand on it would be read *after* these
+                // moves had overwritten the registers holding it.
+                debug_assert!(
+                    f.uses(term).is_empty() && f.defs(term).is_empty(),
+                    "mb{}'s terminator has operands, so edge moves cannot precede it",
+                    pred.0,
+                );
+                ProgPoint::before(term)
+            } else if npreds[succ.0 as usize] == 1 {
+                ProgPoint::before(*f.block_insts(succ).first().expect("block is non-empty"))
+            } else {
+                // Neither end is private to the edge. `isel` splits these, so
+                // reaching here means it did not.
+                return Err(RegallocError::OutOfRegisters);
+            };
 
-        // The two ends of the edge are read at their own positions, which is what
-        // makes this total under splitting: an argument split late in the
-        // predecessor and a parameter split early in the successor disagree, and
-        // that disagreement is precisely the move this pass exists to emit.
-        let entry = span[succs[0].0 as usize].0 * 2;
+            let params = f.block_params(succ);
+            let args = f.jump_args(pred);
+            debug_assert!(
+                params.is_empty() || args.len() == params.len(),
+                "edge arity"
+            );
 
-        let mut pending: Vec<(EdgeSrc, Alloc, RegClass)> = args
-            .iter()
-            .zip(params)
-            .filter_map(|(&a, &prm)| {
-                let to = locs
-                    .get(prm, entry)
-                    .expect("a block parameter has a home at its block's entry");
-                // A rematerializable argument that was spilled has *no* home to move
-                // from — it is replayed at each mention instead. Reading a location
-                // for it would find nothing, or worse a stale register from before it
-                // was evicted, so it has to be replayed here too.
-                if remat_spilled[a.0 as usize] {
-                    let src = remat_src[a.0 as usize].expect("a remat value names its def");
-                    return Some((EdgeSrc::Remat(a, src), to, f.class(prm)));
+            // Every value live where the successor starts, not only its parameters.
+            //
+            // Without splitting the two are equivalent: any other value holds one
+            // location for the whole of its life, so both ends of the edge agree by
+            // construction and the comparison below always yields nothing. With
+            // splitting they are not — a value split differently on two paths
+            // disagrees at the join exactly as a parameter does, and Wimmer10 Fig. 7
+            // resolves the two the same way. That is also what makes Braun09's
+            // coupling code fall out for free: a value in a register on one side and
+            // a slot on the other *is* a reload, and needs no separate list.
+            let mut pending: Vec<(EdgeSrc, Alloc, RegClass)> = Vec::new();
+            for v in 0..f.num_vregs() {
+                let vr = VReg(v as u32);
+                if !ranges[v].iter().any(|&(lo, hi)| lo <= entry && entry < hi) {
+                    continue;
                 }
-                let from = locs
-                    .get(a, at_pos)
-                    .expect("a live edge argument has a home at the branch");
-                // The coalesced case: argument and parameter already share a
-                // location, so the edge costs nothing.
-                (from != to).then_some((EdgeSrc::Loc(from), to, f.class(prm)))
-            })
-            .collect();
-        if pending.is_empty() {
-            continue;
-        }
+                let Some(to) = locs.get(vr, entry) else {
+                    continue;
+                };
 
-        // Registers holding a live value at the end of this block, plus every
-        // location these moves themselves name. A scratch must avoid all of them.
-        let mut busy: Vec<PReg> = Vec::new();
-        for v in 0..f.num_vregs() {
-            // A location is not the truth for a rematerializable value that was
-            // spilled: it keeps whatever register the value held *before* it was
-            // evicted, and that register is long since somebody else's. Counting it
-            // here would reserve a register nothing occupies — which on a
-            // 13-register machine is the difference between finding a scratch and
-            // declining.
-            if remat_spilled[v] {
+                match params.iter().position(|&p| p == vr) {
+                    // A parameter is delivered from the matching argument.
+                    Some(k) => {
+                        let a = args[k];
+                        // A rematerializable argument that was spilled has *no* home
+                        // to move from — it is replayed at each mention instead.
+                        // Reading a location for it would find nothing, or worse a
+                        // stale register from before it was evicted.
+                        if remat_spilled[a.0 as usize] {
+                            let src = remat_src[a.0 as usize].expect("a remat value names its def");
+                            pending.push((EdgeSrc::Remat(a, src), to, f.class(vr)));
+                            continue;
+                        }
+                        let from = locs
+                            .get(a, at_pos)
+                            .expect("a live edge argument has a home at the branch");
+                        // The coalesced case: argument and parameter already share a
+                        // location, so the edge costs nothing.
+                        if from != to {
+                            pending.push((EdgeSrc::Loc(from), to, f.class(vr)));
+                        }
+                    }
+                    // Anything else simply carries on across the edge. A replayed
+                    // value is in the same non-place on both sides, so it needs
+                    // nothing; everything else needs a move only where it moved.
+                    None => {
+                        if remat_spilled[v] {
+                            continue;
+                        }
+                        if let Some(from) = locs.get(vr, at_pos)
+                            && from != to
+                        {
+                            pending.push((EdgeSrc::Loc(from), to, f.class(vr)));
+                        }
+                    }
+                }
+            }
+            if pending.is_empty() {
                 continue;
             }
-            if let Some(Alloc::Reg(r)) = locs.get(VReg(v as u32), at_pos)
-                && ranges[v]
+
+            // Registers holding a live value at the end of this block, plus every
+            // location these moves themselves name. A scratch must avoid all of them.
+            let mut busy: Vec<PReg> = Vec::new();
+            for v in 0..f.num_vregs() {
+                // A location is not the truth for a rematerializable value that was
+                // spilled: it keeps whatever register the value held *before* it was
+                // evicted, and that register is long since somebody else's. Counting it
+                // here would reserve a register nothing occupies — which on a
+                // 13-register machine is the difference between finding a scratch and
+                // declining.
+                if remat_spilled[v] {
+                    continue;
+                }
+                if let Some(Alloc::Reg(r)) = locs.get(VReg(v as u32), at_pos)
+                    && ranges[v]
+                        .iter()
+                        .any(|&(lo, hi)| lo <= at_pos && at_pos < hi)
+                {
+                    busy.push(r);
+                }
+            }
+            for &(from, to, _) in &pending {
+                if let EdgeSrc::Loc(Alloc::Reg(r)) = from {
+                    busy.push(r);
+                }
+                if let Alloc::Reg(r) = to {
+                    busy.push(r);
+                }
+            }
+            // A register nothing needs across this edge, if the machine has one left.
+            let free_reg = |class: RegClass| -> Option<PReg> {
+                env.order(class).iter().copied().find(|r| !busy.contains(r))
+            };
+
+            // Emit every move whose destination nothing else still has to read; when
+            // none qualifies, what remains is a permutation cycle, which one scratch
+            // location breaks.
+            let mut seq: Vec<(EdgeSrc, Alloc, RegClass)> = Vec::new();
+            while !pending.is_empty() {
+                let srcs: Vec<Alloc> = pending
                     .iter()
-                    .any(|&(lo, hi)| lo <= at_pos && at_pos < hi)
-            {
-                busy.push(r);
-            }
-        }
-        for &(from, to, _) in &pending {
-            if let EdgeSrc::Loc(Alloc::Reg(r)) = from {
-                busy.push(r);
-            }
-            if let Alloc::Reg(r) = to {
-                busy.push(r);
-            }
-        }
-        // A register nothing needs across this edge, if the machine has one left.
-        let free_reg = |class: RegClass| -> Option<PReg> {
-            env.order(class).iter().copied().find(|r| !busy.contains(r))
-        };
-
-        // Emit every move whose destination nothing else still has to read; when
-        // none qualifies, what remains is a permutation cycle, which one scratch
-        // location breaks.
-        let mut seq: Vec<(EdgeSrc, Alloc, RegClass)> = Vec::new();
-        while !pending.is_empty() {
-            let srcs: Vec<Alloc> = pending
-                .iter()
-                .filter_map(|&(from, _, _)| match from {
-                    EdgeSrc::Loc(a) => Some(a),
-                    // A replay reads nothing, so it constrains no ordering.
-                    EdgeSrc::Remat(..) => None,
-                })
-                .collect();
-            let (ready, blocked): (Vec<_>, Vec<_>) = pending
-                .into_iter()
-                .partition(|&(_, to, _)| !srcs.contains(&to));
-
-            if ready.is_empty() {
-                // Only real moves can form a cycle — a replay has no source to be
-                // waited on — so everything blocked here is a `Loc`.
-                let (from, _, class) = blocked[0];
-                let EdgeSrc::Loc(from) = from else {
-                    unreachable!("a replay cannot be part of a permutation cycle")
-                };
-                // A cycle needs somewhere to park one value, not specifically a
-                // register: `reg -> slot` and `slot -> reg` are both legal, so a
-                // fresh slot breaks it without disturbing anything else.
-                let tmp = match free_reg(class) {
-                    Some(r) => Alloc::Reg(r),
-                    None => {
-                        let s = Alloc::Spill(*spills);
-                        *spills += 1;
-                        s
-                    }
-                };
-                seq.push((EdgeSrc::Loc(from), tmp, class));
-                pending = blocked
-                    .into_iter()
-                    .map(|(f_, t_, c)| {
-                        if f_ == EdgeSrc::Loc(from) {
-                            (EdgeSrc::Loc(tmp), t_, c)
-                        } else {
-                            (f_, t_, c)
-                        }
+                    .filter_map(|&(from, _, _)| match from {
+                        EdgeSrc::Loc(a) => Some(a),
+                        // A replay reads nothing, so it constrains no ordering.
+                        EdgeSrc::Remat(..) => None,
                     })
                     .collect();
-                continue;
-            }
-            seq.extend(ready);
-            pending = blocked;
-        }
+                let (ready, blocked): (Vec<_>, Vec<_>) = pending
+                    .into_iter()
+                    .partition(|&(_, to, _)| !srcs.contains(&to));
 
-        // Split out the moves that genuinely need a *register* to pass through: a
-        // slot-to-slot move (no machine here moves memory to memory) and a replay
-        // into a slot (the instruction being replayed writes a register). The rest
-        // are emitted as they stand.
-        let mut needs_reg: Vec<(EdgeSrc, Alloc, RegClass)> = Vec::new();
-        for (from, to, class) in seq {
-            match (from, to) {
-                (EdgeSrc::Remat(val, src), Alloc::Reg(r)) => {
-                    b.edit(at, Edit::Remat { val, src, to: r });
+                if ready.is_empty() {
+                    // Only real moves can form a cycle — a replay has no source to be
+                    // waited on — so everything blocked here is a `Loc`.
+                    let (from, _, class) = blocked[0];
+                    let EdgeSrc::Loc(from) = from else {
+                        unreachable!("a replay cannot be part of a permutation cycle")
+                    };
+                    // A cycle needs somewhere to park one value, not specifically a
+                    // register: `reg -> slot` and `slot -> reg` are both legal, so a
+                    // fresh slot breaks it without disturbing anything else.
+                    let tmp = match free_reg(class) {
+                        Some(r) => Alloc::Reg(r),
+                        None => {
+                            let s = Alloc::Spill(*spills);
+                            *spills += 1;
+                            s
+                        }
+                    };
+                    seq.push((EdgeSrc::Loc(from), tmp, class));
+                    pending = blocked
+                        .into_iter()
+                        .map(|(f_, t_, c)| {
+                            if f_ == EdgeSrc::Loc(from) {
+                                (EdgeSrc::Loc(tmp), t_, c)
+                            } else {
+                                (f_, t_, c)
+                            }
+                        })
+                        .collect();
+                    continue;
                 }
-                (EdgeSrc::Loc(Alloc::Spill(_)), Alloc::Spill(_))
-                | (EdgeSrc::Remat(..), Alloc::Spill(_)) => needs_reg.push((from, to, class)),
-                (EdgeSrc::Loc(from), _) => {
-                    b.edit(at, Edit::Move(Move { from, to, class }));
-                }
+                seq.extend(ready);
+                pending = blocked;
             }
-        }
 
-        // Now the ones that need a register, after every ordinary move is done. If
-        // none is free the register file is saturated — which is exactly when this
-        // path is reached — so one is *bounced*: saved to a fresh slot, borrowed,
-        // restored. Whatever it held, a live-through value or a parameter just
-        // delivered, comes back untouched.
-        //
-        // Any register will do, precisely because it is saved and restored, and an
-        // edge has no operands of its own to work around. That is what makes edge
-        // resolution total: unlike an over-subscribed instruction, an edge can
-        // always be resolved, so it never declines the region.
-        //
-        // Edits at one program point keep the order they were pushed, which is what
-        // makes the save and the restore actually bracket the borrow.
-        for class in RegClass::ALL {
-            let group: Vec<_> = needs_reg
-                .iter()
-                .copied()
-                .filter(|&(_, _, c)| c == class)
-                .collect();
-            if group.is_empty() {
-                continue;
+            // Split out the moves that genuinely need a *register* to pass through: a
+            // slot-to-slot move (no machine here moves memory to memory) and a replay
+            // into a slot (the instruction being replayed writes a register). The rest
+            // are emitted as they stand.
+            let mut needs_reg: Vec<(EdgeSrc, Alloc, RegClass)> = Vec::new();
+            for (from, to, class) in seq {
+                match (from, to) {
+                    (EdgeSrc::Remat(val, src), Alloc::Reg(r)) => {
+                        b.edit(at, Edit::Remat { val, src, to: r });
+                    }
+                    (EdgeSrc::Loc(Alloc::Spill(_)), Alloc::Spill(_))
+                    | (EdgeSrc::Remat(..), Alloc::Spill(_)) => needs_reg.push((from, to, class)),
+                    (EdgeSrc::Loc(from), _) => {
+                        b.edit(at, Edit::Move(Move { from, to, class }));
+                    }
+                }
             }
-            let (reg, bounced_to) = match free_reg(class) {
-                Some(r) => (r, None),
-                None => {
-                    let r = env.order(class)[0];
-                    let slot = Alloc::Spill(*spills);
-                    *spills += 1;
+
+            // Now the ones that need a register, after every ordinary move is done. If
+            // none is free the register file is saturated — which is exactly when this
+            // path is reached — so one is *bounced*: saved to a fresh slot, borrowed,
+            // restored. Whatever it held, a live-through value or a parameter just
+            // delivered, comes back untouched.
+            //
+            // Any register will do, precisely because it is saved and restored, and an
+            // edge has no operands of its own to work around. That is what makes edge
+            // resolution total: unlike an over-subscribed instruction, an edge can
+            // always be resolved, so it never declines the region.
+            //
+            // Edits at one program point keep the order they were pushed, which is what
+            // makes the save and the restore actually bracket the borrow.
+            for class in RegClass::ALL {
+                let group: Vec<_> = needs_reg
+                    .iter()
+                    .copied()
+                    .filter(|&(_, _, c)| c == class)
+                    .collect();
+                if group.is_empty() {
+                    continue;
+                }
+                let (reg, bounced_to) = match free_reg(class) {
+                    Some(r) => (r, None),
+                    None => {
+                        let r = env.order(class)[0];
+                        let slot = Alloc::Spill(*spills);
+                        *spills += 1;
+                        b.edit(
+                            at,
+                            Edit::Move(Move {
+                                from: Alloc::Reg(r),
+                                to: slot,
+                                class,
+                            }),
+                        );
+                        (r, Some(slot))
+                    }
+                };
+                for (from, to, c) in group {
+                    match from {
+                        EdgeSrc::Remat(val, src) => b.edit(at, Edit::Remat { val, src, to: reg }),
+                        EdgeSrc::Loc(from) => b.edit(
+                            at,
+                            Edit::Move(Move {
+                                from,
+                                to: Alloc::Reg(reg),
+                                class: c,
+                            }),
+                        ),
+                    }
                     b.edit(
                         at,
                         Edit::Move(Move {
-                            from: Alloc::Reg(r),
-                            to: slot,
+                            from: Alloc::Reg(reg),
+                            to,
+                            class: c,
+                        }),
+                    );
+                }
+                if let Some(slot) = bounced_to {
+                    b.edit(
+                        at,
+                        Edit::Move(Move {
+                            from: slot,
+                            to: Alloc::Reg(reg),
                             class,
                         }),
                     );
-                    (r, Some(slot))
                 }
-            };
-            for (from, to, c) in group {
-                match from {
-                    EdgeSrc::Remat(val, src) => b.edit(at, Edit::Remat { val, src, to: reg }),
-                    EdgeSrc::Loc(from) => b.edit(
-                        at,
-                        Edit::Move(Move {
-                            from,
-                            to: Alloc::Reg(reg),
-                            class: c,
-                        }),
-                    ),
-                }
-                b.edit(
-                    at,
-                    Edit::Move(Move {
-                        from: Alloc::Reg(reg),
-                        to,
-                        class: c,
-                    }),
-                );
-            }
-            if let Some(slot) = bounced_to {
-                b.edit(
-                    at,
-                    Edit::Move(Move {
-                        from: slot,
-                        to: Alloc::Reg(reg),
-                        class,
-                    }),
-                );
             }
         }
     }
