@@ -1,9 +1,10 @@
 # Plan: SSA-form register allocation with live-range splitting
 
-**Status: the Braun09 spiller exists, is tested, and measures well under real
-register pressure — but is not yet wired into `allocate`. That integration is
-the whole of what remains. See §1 Stage 3 for the numbers and §2 for what
-wiring it involves.**
+**Status: the split path works end to end — allocates, verifies on both
+targets, encodes on aarch64 — behind `allocate_with`, with `allocate` unchanged
+as the default. The Belady policy wins under pressure (x86-64 mix −36%
+weighted); the assignment gives much of it back at joins for want of
+coalescing. §2 has the numbers and the two named fixes.**
 
 Papers are in `papers/` (gitignored) with a distilled algorithm crib sheet at
 `papers/NOTES.md` — pseudocode, measured numbers, and correctness traps. Read
@@ -211,34 +212,75 @@ were unclipped there and happened not to span a join on those two functions.
 
 ---
 
-## 2. What is left: one defect, then measure
+### Stage 6 — the split path works end to end (`922a3b6`)
 
-**`allocate_presplit` anchors each value's first `Locations` entry at position 0**,
-copying what the whole-value scan did. Under splitting that makes `get` answer "in
-register R" for every position before the value's first run, including regions
-where nothing put it there. It presents as a register read that was never written.
+All three benchmarks allocate, **verify on both targets**, and encode on aarch64
+as genuinely split allocations; every prior test passes unchanged. The batch that
+got there, each item forced by the verifier or by x86-64's constraints:
 
-`mix`'s **v15** is the case to work from: a block parameter live for a single slot
-`[122, 123)` that the spiller keeps in a register until 152, so its one run is
-`[122, 152)`, its entry is written at 0, and `locs.get` answers `x2` from the start
-of the function. Two things, together:
+- **`Locations` is honest**: entries anchor at each value's birth, a spilled
+  value's gaps point at its slot, a replayed value's gaps say *nowhere* (a new
+  entry state). Everything downstream reads the table; nothing keeps its own
+  books.
+- **Runs clip at clobber/`Fixed` sites**, not only block boundaries — one register
+  per run means a clobber anywhere bans it everywhere, and a run crossing three
+  call-shaped sites accumulated every ban and declined. Wimmer05's split-at-calls,
+  before the scan. The boundary is a register hop, one move.
+- **Hops at one barrier are a parallel copy**, same as edge moves — emitted in
+  value order, two hops through one register clobber each other. The sequencing
+  moved out of `resolve_edges` into `emit_parallel`; both callers share it.
+- **The spiller models the machine**: `k − burned` at pinned/clobbering
+  instructions; a two-address op's non-reused inputs kept across the def (dying
+  inputs sort first under plain Belady — exactly wrong); Wimmer05's
+  must-have-register flag as a keep-set, because a deopt-shaped instruction reads
+  35 operands all at distance 0 and an arbitrary cut evicted the one that cannot
+  be read from a slot.
+- **Dying values leave `W` at their last read**, not block end — a lingering dead
+  parameter's register reads as busy at its own replacement's def, refusing the
+  affinity and rotating every accumulator one register off. Exempt: keep-sets,
+  dead defs, jump args.
+- **Guards whose keepalives could fill the register file declare two temps** for
+  their stub's scratch (`stub_temps`, aarch64). `stub_scratch`'s hunt only ever
+  worked because whole-value over-spilling left slack. Small guards pay nothing.
+  **x86-64's encoder has the same latent assumption and no fix yet** — its split
+  allocations verify but encoding them is unexercised.
 
-1. Anchor the first entry at the run's own start rather than 0 — then find what
-   still reads a location before a value is live. `resolve_edges`' `busy` scan is
-   the one to check, since it asks every value where it is.
-2. Decide what a value's location *is* outside its live range. `None` is honest and
-   would make (1) fall out, but every caller must then handle it and several
-   currently `.expect()`.
+## 2. What is left: the measurement says coalescing, twice
 
-Both split tests are `#[ignore]`d with this diagnosis in `check_split`'s doc.
+**Emitted aarch64** (`asm_dump::split_vs_whole_report`):
 
-### Then measure, and only then consider making it the default
+| | whole | split |
+|---|---|---|
+| is_prime | 57 insts, 0 moves | **57 insts, 0 moves — identical** |
+| mix | 273, 0 moves | 279, 6 moves |
+| mix2 | 1088, 11 moves, 210 ops (w 1722) | 1170, **64 moves**, 254 ops (**w 1937**) |
 
-**The plan's numbers do not count the shuffle.** A value split differently on two
-paths needs a *move* at the join, and Stage 2 worked hard to reach 0 reg-reg moves
-in loops. So the acceptance test is `spillcost` **and** `asm_dump`'s move counter,
-on emitted code. If splitting trades 15% of spill traffic for a pile of
-loop-carried moves it is not worth landing.
+**x86-64, allocation level** (`spill::tests::split_vs_whole_allocations`):
+
+| | whole | split |
+|---|---|---|
+| mix | 26 moves, 69 ops (w 483) | 38 moves, **41 ops (w 311, −36%)** |
+| mix2 | 31 moves, 330 ops (w 2715) | **85 moves**, 358 ops (w 2653, −2%) |
+
+Read together: **the Belady policy wins where pressure is real** — x64 mix −36%
+weighted is the paper's promise showing up — **and the assignment gives it back at
+joins**, because presplit colouring has a pairwise affinity where the whole-value
+path has transitive coalescing and shared spill slots. mix2's 14-parameter join
+pays per-edge slot deliveries (+24 stores over whole) and register shuffles (+53
+moves) that coalescing made free. The old §2.3 said splitting is the precondition
+that makes coalescing worth having; the measurement says the converse too.
+
+Two named fixes, then re-measure:
+
+1. **Spill-slot sharing across arg/param chains** — Braun09 §4.4's CSSA
+   precondition, deferred earlier because `slot_to_slot` measured zero; the cost
+   now shows as per-edge stores instead. One slot per phi-congruence class makes
+   the arg's store-at-def *be* the edge delivery.
+2. **Transitive affinity over runs** — union-find over non-interfering
+   arg/param/`Reuse` pairs, as `coalesce()` does over intervals, so a value
+   feeding two joins lands where both expect it.
+
+`allocate()` is unchanged and remains the default everywhere.
 
 ### Superseded
 
