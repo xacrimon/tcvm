@@ -220,3 +220,48 @@ fn disasm_mix2() {
     let (w, s) = compile_one("mix2", "mix2");
     disasm("mix2", &w, s);
 }
+
+/// The next-use analysis, against a function whose spilling is independently
+/// known. `mix2` spills on aarch64 and `mix` does not, so the computed peak
+/// pressure has to straddle the register pool — if it does not, the analysis is
+/// not measuring what it claims to.
+#[test]
+fn pressure_explains_which_benchmarks_spill() {
+    use super::nextuse;
+    use super::order;
+    use super::regalloc::RegClass;
+
+    let pool = machine_env().order(RegClass::Int).len() as u32;
+
+    let peak = |file: &str, chunk: &str| -> u32 {
+        let source = std::fs::read_to_string(format!("test-files/{file}.lua")).unwrap();
+        let mut lua = Lua::new();
+        lua.load_all();
+        lua.enter(|ctx| {
+            let c = ctx.load(&source, Some(chunk)).expect("compile");
+            let proto = c.as_lua().expect("lua closure").proto.prototypes[0];
+            let func = lower(proto, 0, vec![INT]).expect("lower");
+            let mut m = select(&func).expect("isel");
+            super::target::annotate(&mut m);
+            let layout = order::compute(&m).expect("reducible");
+            let nu = nextuse::analyze(&m, &layout);
+            nu.pressure
+                .iter()
+                .map(|p| p[RegClass::Int as usize])
+                .max()
+                .unwrap_or(0)
+        })
+    };
+
+    let (mix, mix2) = (peak("mix", "mix"), peak("mix2", "mix2"));
+    eprintln!("\n=== peak int pressure (pool {pool}) ===\n  mix {mix}\n  mix2 {mix2}");
+    assert!(
+        mix <= pool,
+        "mix allocates with no spills, so its peak pressure ({mix}) must fit the \
+         pool ({pool})"
+    );
+    assert!(
+        mix2 > pool,
+        "mix2 spills, so its peak pressure ({mix2}) must exceed the pool ({pool})"
+    );
+}

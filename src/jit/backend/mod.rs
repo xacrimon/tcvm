@@ -24,6 +24,7 @@ pub mod code;
 pub mod isel;
 pub mod layout;
 pub mod mach;
+pub mod nextuse;
 pub mod order;
 pub mod regalloc;
 pub mod spillcost;
@@ -50,3 +51,5 @@ mod asm_dump;
 mod exec_tests;
 #[cfg(test)]
 mod snapshot_tests;
+#[cfg(test)]
+pub mod testfunc;
