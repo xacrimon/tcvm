@@ -12,6 +12,7 @@ pub mod cfg;
 pub mod lower;
 pub mod print;
 pub mod sink;
+pub mod ssa;
 
 #[cfg(test)]
 mod snapshot_tests;
