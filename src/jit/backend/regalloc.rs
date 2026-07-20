@@ -526,8 +526,13 @@ impl AllocationBuilder {
         self.block_params[b.0 as usize][k] = a;
     }
 
-    /// Put every mention of `v` in the same place. What a non-splitting allocator
-    /// wants, and all the allocator below asks for.
+    /// Put every mention of `v` in the same place.
+    ///
+    /// What a non-splitting allocator wants. [`allocate`] no longer uses it — it
+    /// fills operands one at a time from a position-indexed table, so that a split
+    /// value can answer differently at different mentions — but a client
+    /// hand-building an allocation (the tests below, the encoders' fixtures) still
+    /// does.
     pub fn assign(&mut self, v: VReg, a: Alloc) {
         for (slot, &sv) in self.slot_vreg.iter().enumerate() {
             if sv == v {
@@ -622,6 +627,55 @@ impl Segs {
             }
         }
         None
+    }
+}
+
+/// Where each value lives, as a function of program position.
+///
+/// This is the one interface change splitting needs. A value that keeps a single
+/// location for its whole life has a single entry, and every query answers the
+/// same — which is what the scan produces today. A *split* value has several:
+/// `(from, alloc)` says the value is at `alloc` from position `from` until the next
+/// entry starts. Because asking always requires a position, a caller that has not
+/// been taught which position it means will not compile, rather than silently
+/// reading the wrong end of a split value.
+///
+/// Callers ask at the doubled positions [`allocate`] numbers by: a use of
+/// instruction `i` at `2·pos[i]`, a def or temp at `2·pos[i] + 1`, a block
+/// parameter at the start of its block.
+struct Locations {
+    /// Per value, `(from, alloc)` in increasing `from`.
+    at: Vec<Vec<(u32, Alloc)>>,
+}
+
+impl Locations {
+    fn new(num_vregs: usize) -> Self {
+        Locations {
+            at: vec![Vec::new(); num_vregs],
+        }
+    }
+
+    /// Record that `v` lives at `a` from `from` until whatever comes next.
+    ///
+    /// Entries must be pushed in increasing `from` per value.
+    fn put(&mut self, v: VReg, from: u32, a: Alloc) {
+        debug_assert!(
+            self.at[v.0 as usize].last().is_none_or(|&(f, _)| f < from),
+            "v{} split points must be pushed in order",
+            v.0
+        );
+        self.at[v.0 as usize].push((from, a));
+    }
+
+    /// Where `v` lives at position `p` — the latest split at or before `p`.
+    ///
+    /// `None` for a value with no location at all: one never mentioned, or a
+    /// rematerializable value that was dropped rather than spilled and is replayed
+    /// at each mention instead.
+    fn get(&self, v: VReg, p: u32) -> Option<Alloc> {
+        let e = &self.at[v.0 as usize];
+        let k = e.partition_point(|&(from, _)| from <= p);
+        (k > 0).then(|| e[k - 1].1)
     }
 }
 
@@ -1019,10 +1073,33 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
         }
     }
 
-    let mut b = AllocationBuilder::new(f);
+    // The scan assigns one location per value, so every entry starts at position 0
+    // and every query answers the same. A splitting spiller pushes several entries
+    // per value here instead; nothing downstream has to change for that, which is
+    // the point of routing every location read through this table.
+    let mut locs = Locations::new(f.num_vregs());
     for v in 0..f.num_vregs() as u32 {
         if let Some(a) = loc[v as usize] {
-            b.assign(VReg(v), a);
+            locs.put(VReg(v), 0, a);
+        }
+    }
+
+    let mut b = AllocationBuilder::new(f);
+    for (i, &p) in pos.iter().enumerate() {
+        for (k, o) in f.defs(i).iter().enumerate() {
+            if let Some(a) = locs.get(o.vreg, p * 2 + 1) {
+                b.set_def(i, k, a);
+            }
+        }
+        for (k, o) in f.uses(i).iter().enumerate() {
+            if let Some(a) = locs.get(o.vreg, p * 2) {
+                b.set_use(i, k, a);
+            }
+        }
+        for (k, o) in f.temps(i).iter().enumerate() {
+            if let Some(a) = locs.get(o.vreg, p * 2 + 1) {
+                b.set_temp(i, k, a);
+            }
         }
     }
 
@@ -1043,15 +1120,22 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
         // and whatever it clobbers. A reload avoids them, and a bounce victim is
         // chosen from *outside* this set, so it never disturbs the instruction.
         let mut used: Vec<PReg> = Vec::new();
-        for o in f.defs(i).iter().chain(f.uses(i)).chain(f.temps(i)) {
-            if let Some(Alloc::Reg(r)) = loc[o.vreg.0 as usize] {
+        for o in f.uses(i) {
+            if let Some(Alloc::Reg(r)) = locs.get(o.vreg, p * 2) {
+                used.push(r);
+            }
+        }
+        for o in f.defs(i).iter().chain(f.temps(i)) {
+            if let Some(Alloc::Reg(r)) = locs.get(o.vreg, p * 2 + 1) {
                 used.push(r);
             }
         }
         used.extend_from_slice(f.clobbers(i));
 
-        let spilled = |v: VReg| {
-            remat_spilled[v.0 as usize] || matches!(loc[v.0 as usize], Some(Alloc::Spill(_)))
+        // Whether `v` needs bringing back into a register at `q`: either it has no
+        // home at all (replayed) or its home there is a slot.
+        let spilled = |v: VReg, q: u32| {
+            remat_spilled[v.0 as usize] || matches!(locs.get(v, q), Some(Alloc::Spill(_)))
         };
 
         // Reserve every fixed register up front, so an ordinary reload for another
@@ -1094,7 +1178,9 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
                             },
                         );
                     } else {
-                        let from = loc[o.vreg.0 as usize].expect("a mentioned value has a home");
+                        let from = locs
+                            .get(o.vreg, p * 2)
+                            .expect("a mentioned value has a home");
                         b.edit(
                             ProgPoint::before(i),
                             Edit::Move(Move {
@@ -1107,7 +1193,7 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
                     b.set_use(i, k, Alloc::Reg(preg));
                     use_final[k] = Alloc::Reg(preg);
                 }
-                Constraint::Reg if spilled(o.vreg) => {
+                Constraint::Reg if spilled(o.vreg, p * 2) => {
                     let (r, bounce) = reload_reg(
                         &mut b,
                         &mut spills,
@@ -1132,7 +1218,7 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
                                 to: r,
                             },
                         );
-                    } else if let Some(Alloc::Spill(s)) = loc[o.vreg.0 as usize] {
+                    } else if let Some(Alloc::Spill(s)) = locs.get(o.vreg, p * 2) {
                         b.edit(
                             ProgPoint::before(i),
                             Edit::Move(Move {
@@ -1158,7 +1244,9 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
                 // A `Reg` use already in a register, or an `Any` use: the scan put it
                 // where it belongs. Record it for a possible `Reuse`.
                 _ => {
-                    use_final[k] = loc[o.vreg.0 as usize].expect("a mentioned value has a home");
+                    use_final[k] = locs
+                        .get(o.vreg, p * 2)
+                        .expect("a mentioned value has a home");
                 }
             }
         }
@@ -1170,7 +1258,9 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
                 Constraint::Fixed(preg) => {
                     b.set_def(i, k, Alloc::Reg(preg));
                     if !remat_spilled[o.vreg.0 as usize] {
-                        let home = loc[o.vreg.0 as usize].expect("a defined value has a home");
+                        let home = locs
+                            .get(o.vreg, p * 2 + 1)
+                            .expect("a defined value has a home");
                         if home != Alloc::Reg(preg) {
                             b.edit(
                                 ProgPoint::after(i),
@@ -1192,7 +1282,7 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
                 // clear of them.
                 Constraint::Reuse(uk) => {
                     let src = f.uses(i)[uk].vreg;
-                    let (d, bounce) = match loc[o.vreg.0 as usize] {
+                    let (d, bounce) = match locs.get(o.vreg, p * 2 + 1) {
                         Some(Alloc::Reg(r)) => (r, None),
                         // A spilled two-address result still computes in a register.
                         _ => reload_reg(
@@ -1219,7 +1309,7 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
                             },
                         );
                     } else {
-                        let from = loc[src.0 as usize].expect("a reused source has a home");
+                        let from = locs.get(src, p * 2).expect("a reused source has a home");
                         if from != Alloc::Reg(d) {
                             b.edit(
                                 ProgPoint::before(i),
@@ -1234,7 +1324,7 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
                     b.set_use(i, uk, Alloc::Reg(d));
                     b.set_def(i, k, Alloc::Reg(d));
                     if !remat_spilled[o.vreg.0 as usize]
-                        && let Some(Alloc::Spill(s)) = loc[o.vreg.0 as usize]
+                        && let Some(Alloc::Spill(s)) = locs.get(o.vreg, p * 2 + 1)
                     {
                         b.edit(
                             ProgPoint::after(i),
@@ -1256,7 +1346,7 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
                         );
                     }
                 }
-                Constraint::Reg if spilled(o.vreg) => {
+                Constraint::Reg if spilled(o.vreg, p * 2 + 1) => {
                     let (r, bounce) = reload_reg(
                         &mut b,
                         &mut spills,
@@ -1273,7 +1363,7 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
                     // A rematerializable def computes its constant into `r` and drops
                     // it — every reader replays it instead — so there is nothing to store.
                     if !remat_spilled[o.vreg.0 as usize]
-                        && let Some(Alloc::Spill(s)) = loc[o.vreg.0 as usize]
+                        && let Some(Alloc::Spill(s)) = locs.get(o.vreg, p * 2 + 1)
                     {
                         b.edit(
                             ProgPoint::after(i),
@@ -1302,8 +1392,11 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
 
     if f.has_block_params() {
         for &blk in &order {
-            for (k, &p) in f.block_params(blk).iter().enumerate() {
-                if let Some(a) = loc[p.0 as usize] {
+            // A parameter is defined at the start of its block, so that is where to
+            // ask: a split value may live somewhere else by the end of it.
+            let entry = span[blk.0 as usize].0 * 2;
+            for (k, &prm) in f.block_params(blk).iter().enumerate() {
+                if let Some(a) = locs.get(prm, entry) {
                     b.set_block_param(blk, k, a);
                 }
             }
@@ -1314,7 +1407,8 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
             &order,
             &pos,
             &ranges,
-            &loc,
+            &span,
+            &locs,
             &remat_spilled,
             &remat_src,
             &mut spills,
@@ -1697,13 +1791,15 @@ enum EdgeSrc {
 /// over physical locations rather than virtual registers, which is the point of
 /// moving it: at this level the allocator knows which registers are actually free
 /// and can borrow one, instead of inventing a vreg for the stage above to place.
+#[allow(clippy::too_many_arguments)]
 fn resolve_edges(
     f: &impl RegallocFunc,
     env: &MachineEnv,
     order: &[Block],
     pos: &[u32],
     ranges: &[Vec<(u32, u32)>],
-    loc: &[Option<Alloc>],
+    span: &[(u32, u32)],
+    locs: &Locations,
     remat_spilled: &[bool],
     remat_src: &[Option<Inst>],
     spills: &mut u32,
@@ -1723,29 +1819,6 @@ fn resolve_edges(
         let params = f.block_params(succs[0]);
         debug_assert_eq!(args.len(), params.len(), "edge arity");
 
-        let mut pending: Vec<(EdgeSrc, Alloc, RegClass)> = args
-            .iter()
-            .zip(params)
-            .filter_map(|(&a, &p)| {
-                let to = loc[p.0 as usize].expect("a block parameter has a home");
-                // A rematerializable argument that was spilled has *no* home to move
-                // from — it is replayed at each mention instead. Reading `loc` for it
-                // would find nothing, or worse a stale register from before it was
-                // evicted, so it has to be replayed here too.
-                if remat_spilled[a.0 as usize] {
-                    let src = remat_src[a.0 as usize].expect("a remat value names its def");
-                    return Some((EdgeSrc::Remat(a, src), to, f.class(p)));
-                }
-                let from = loc[a.0 as usize].expect("a live edge argument has a home");
-                // The coalesced case: argument and parameter already share a
-                // location, so the edge costs nothing.
-                (from != to).then_some((EdgeSrc::Loc(from), to, f.class(p)))
-            })
-            .collect();
-        if pending.is_empty() {
-            continue;
-        }
-
         // The moves go before the block's last instruction. That is only sound
         // because a block carrying arguments ends in a bare control transfer: any
         // operand on it would be read *after* these moves had already overwritten
@@ -1757,27 +1830,60 @@ fn resolve_edges(
             pred.0,
         );
         let at = ProgPoint::before(term);
+        let at_pos = pos[term] * 2;
+
+        // The two ends of the edge are read at their own positions, which is what
+        // makes this total under splitting: an argument split late in the
+        // predecessor and a parameter split early in the successor disagree, and
+        // that disagreement is precisely the move this pass exists to emit.
+        let entry = span[succs[0].0 as usize].0 * 2;
+
+        let mut pending: Vec<(EdgeSrc, Alloc, RegClass)> = args
+            .iter()
+            .zip(params)
+            .filter_map(|(&a, &prm)| {
+                let to = locs
+                    .get(prm, entry)
+                    .expect("a block parameter has a home at its block's entry");
+                // A rematerializable argument that was spilled has *no* home to move
+                // from — it is replayed at each mention instead. Reading a location
+                // for it would find nothing, or worse a stale register from before it
+                // was evicted, so it has to be replayed here too.
+                if remat_spilled[a.0 as usize] {
+                    let src = remat_src[a.0 as usize].expect("a remat value names its def");
+                    return Some((EdgeSrc::Remat(a, src), to, f.class(prm)));
+                }
+                let from = locs
+                    .get(a, at_pos)
+                    .expect("a live edge argument has a home at the branch");
+                // The coalesced case: argument and parameter already share a
+                // location, so the edge costs nothing.
+                (from != to).then_some((EdgeSrc::Loc(from), to, f.class(prm)))
+            })
+            .collect();
+        if pending.is_empty() {
+            continue;
+        }
 
         // Registers holding a live value at the end of this block, plus every
         // location these moves themselves name. A scratch must avoid all of them.
-        let at_pos = pos[term] * 2;
         let mut busy: Vec<PReg> = Vec::new();
         for v in 0..f.num_vregs() {
-            // `loc` is not the truth for a rematerializable value that was spilled:
-            // it keeps whatever register the value held *before* it was evicted, and
-            // that register is long since somebody else's. Counting it here would
-            // reserve a register nothing occupies — which on a 13-register machine
-            // is the difference between finding a scratch and declining.
+            // A location is not the truth for a rematerializable value that was
+            // spilled: it keeps whatever register the value held *before* it was
+            // evicted, and that register is long since somebody else's. Counting it
+            // here would reserve a register nothing occupies — which on a
+            // 13-register machine is the difference between finding a scratch and
+            // declining.
             if remat_spilled[v] {
                 continue;
             }
-            if let Some(Alloc::Reg(r)) = loc[v] {
-                if ranges[v]
+            if let Some(Alloc::Reg(r)) = locs.get(VReg(v as u32), at_pos)
+                && ranges[v]
                     .iter()
                     .any(|&(lo, hi)| lo <= at_pos && at_pos < hi)
-                {
-                    busy.push(r);
-                }
+            {
+                busy.push(r);
             }
         }
         for &(from, to, _) in &pending {
