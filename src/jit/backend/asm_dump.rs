@@ -265,3 +265,57 @@ fn pressure_explains_which_benchmarks_spill() {
         "mix2 spills, so its peak pressure ({mix2}) must exceed the pool ({pool})"
     );
 }
+
+/// The acceptance test for splitting, on emitted code: spill traffic *and* the
+/// shuffle, side by side. The plan's own numbers count neither the moves splitting
+/// inserts at joins and barriers nor the encoder's in-place loads, and Stage 2
+/// fought to get loop moves to zero — so a spill win that buys it back with
+/// reg-reg moves is not a win. Both columns, or the comparison lies.
+#[test]
+fn split_vs_whole_report() {
+    use super::regalloc::{RegisterSets, allocate_with, verify};
+    use super::{nextuse, order, spill, spillcost};
+
+    eprintln!("\n=== split vs whole (emitted aarch64) ===");
+    for (file, chunk) in [("primes", "primes"), ("mix", "mix"), ("mix2", "mix2")] {
+        let source = std::fs::read_to_string(format!("test-files/{file}.lua")).unwrap();
+        let mut lua = Lua::new();
+        lua.load_all();
+        lua.enter(|ctx| {
+            let c = ctx.load(&source, Some(chunk)).expect("compile");
+            let proto = c.as_lua().expect("lua closure").proto.prototypes[0];
+            let func = lower(proto, 0, vec![INT]).expect("lower");
+            let mut m = select(&func).expect("isel");
+            super::target::annotate(&mut m);
+            let env = machine_env();
+
+            let whole = allocate(&m, &env).expect("whole-value allocate");
+            verify(&m, &whole).expect("whole verifies");
+
+            let layout = order::compute(&m).expect("reducible");
+            let nu = nextuse::analyze(&m, &layout);
+            let plan = spill::plan(&m, &layout, &nu, &env);
+            let split = allocate_with(
+                &m,
+                &env,
+                Some(RegisterSets {
+                    w_use: &plan.w_use,
+                    w_after: &plan.w_after,
+                }),
+            )
+            .expect("split allocate");
+            verify(&m, &split).expect("split verifies");
+
+            let name = if file == "primes" { "is_prime" } else { file };
+            for (which, ra) in [("whole", &whole), ("split", &split)] {
+                let words = encode(&m, &func.pool, ra).expect("encode");
+                let moves = words.iter().filter(|&&w| is_reg_move(w)).count();
+                let cost = spillcost::measure(&m, ra).expect("reducible");
+                eprintln!(
+                    "  {name:9} {which}: {:4} insts, {moves:3} reg-reg moves, {cost}",
+                    words.len(),
+                );
+            }
+        });
+    }
+}

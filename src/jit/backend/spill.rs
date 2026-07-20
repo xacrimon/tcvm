@@ -51,7 +51,7 @@ use std::collections::hash_map::RandomState;
 
 use super::nextuse::{INF, NextUse, in_loop};
 use super::order::Layout;
-use super::regalloc::{Block, Constraint, Inst, MachineEnv, RegClass, RegallocFunc, VReg};
+use super::regalloc::{Block, Constraint, Inst, MachineEnv, PReg, RegClass, RegallocFunc, VReg};
 
 /// Where the spiller decided values should live.
 ///
@@ -241,12 +241,22 @@ fn limit(
     j: usize,
     m: usize,
     at: Inst,
+    keep: &[VReg],
     plan: &mut SpillPlan,
 ) {
     if w.len() <= m {
         return;
     }
-    sort_by_distance(w, dist, j);
+    // `keep` holds values this instruction forbids evicting whatever their
+    // distance says: the non-reused inputs of a two-address op, which must
+    // coexist with the results or the op clobbers them (`build_intervals`
+    // extends exactly these ranges for the same reason). They are usually dying
+    // — distance ∞ — which under plain Belady sorts them *first* out the door.
+    if keep.is_empty() {
+        sort_by_distance(w, dist, j);
+    } else {
+        w.sort_by_key(|&v| (!keep.contains(&v), dist.at(j, v), v.0));
+    }
     for &v in &w[m..] {
         // Nothing to store if it is already in memory, if it is never read again —
         // the value is simply dead — or if it will be replayed rather than reloaded.
@@ -273,7 +283,19 @@ fn min_algorithm(
     plan: &mut SpillPlan,
 ) {
     let insts = f.block_insts(b);
+    let args = f.jump_args(b);
     for (j, &i) in insts.iter().enumerate() {
+        // A dead value holds nothing; drop it the moment it dies rather than at
+        // the block's end. This is not merely tidiness. A loop-carried parameter
+        // is dead after its last use while its next iteration's replacement is
+        // computed — and if it lingers in `W`, its register reads as busy at the
+        // replacement's definition, the arg/param affinity is refused, and every
+        // accumulator pays a move on the back edge that coalescing used to make
+        // free. Intervals end at the last use; so must runs. (The keep-set from a
+        // previous instruction's two-address op dies here too, exactly one slot
+        // after the interference it existed to create.)
+        w.retain(|&v| dist.at(j, v) != INF);
+        s.retain(|v| w.contains(v));
         // Operands not in registers have to be brought back — but only the ones that
         // actually demand a register. Braun09 states the opposite assumption
         // outright ("each instruction requires that its operands are available in
@@ -305,6 +327,28 @@ fn min_algorithm(
             }
         }
 
+        // Registers this instruction pins or destroys are not available to values
+        // in `W` across it: a clobber is written over, and a `Fixed` operand's
+        // register is where that one value must sit, to the exclusion of all
+        // others. The spiller not modelling these is a decline at colouring time —
+        // on x86-64, whose isel pins shift counts and division, it was exactly
+        // that.
+        let mut burned: Vec<PReg> = Vec::new();
+        for &r in f.clobbers(i) {
+            if r.class() == class && !burned.contains(&r) {
+                burned.push(r);
+            }
+        }
+        for o in f.defs(i).iter().chain(f.uses(i)) {
+            if let Constraint::Fixed(r) = o.constraint
+                && r.class() == class
+                && !burned.contains(&r)
+            {
+                burned.push(r);
+            }
+        }
+        let kc = k.saturating_sub(burned.len());
+
         // Room for the operands, measured from this instruction — less whatever the
         // temps need. A temp is scratch that spans the *whole* instruction, so it
         // cannot share with an operand that dies here, and the register it occupies
@@ -316,7 +360,19 @@ fn min_algorithm(
             .iter()
             .filter(|o| f.class(o.vreg) == class)
             .count();
-        limit(f, w, s, dist, j, k.saturating_sub(ntemps), i, plan);
+        // Wimmer05's must-have-register flag (§2.3), as a keep-set. Every operand
+        // read here has distance 0, so among themselves they sort arbitrarily —
+        // and a deopt-shaped instruction reads more `Any` operands than the
+        // machine has registers, all tied. An arbitrary cut can evict the one
+        // operand the instruction *cannot* take from a slot while keeping
+        // thirty-four it happily can.
+        let must: Vec<VReg> = f
+            .uses(i)
+            .iter()
+            .filter(|o| o.constraint != Constraint::Any && f.class(o.vreg) == class)
+            .map(|o| o.vreg)
+            .collect();
+        limit(f, w, s, dist, j, kc.saturating_sub(ntemps), i, &must, plan);
 
         // ...then room for the results, measured from the *next* instruction,
         // because once this one writes its results its own operands stop mattering.
@@ -338,13 +394,62 @@ fn min_algorithm(
         // has already guaranteed every operand is in it.
         plan.w_use[i].extend(w.iter().copied());
 
-        limit(f, w, s, dist, j + 1, k.saturating_sub(ndefs), i, plan);
+        // The non-reused inputs of a two-address op must survive the write; see
+        // `limit`.
+        let keep: Vec<VReg> = match f.defs(i).iter().find_map(|o| match o.constraint {
+            Constraint::Reuse(uk) => Some(uk),
+            _ => None,
+        }) {
+            Some(uk) => f
+                .uses(i)
+                .iter()
+                .enumerate()
+                .filter(|&(k2, o)| k2 != uk && f.class(o.vreg) == class)
+                .map(|(_, o)| o.vreg)
+                .collect(),
+            None => Vec::new(),
+        };
+        limit(
+            f,
+            w,
+            s,
+            dist,
+            j + 1,
+            kc.saturating_sub(ndefs),
+            i,
+            &keep,
+            plan,
+        );
 
         for o in f.defs(i) {
             if f.class(o.vreg) == class && !w.contains(&o.vreg) {
                 w.push(o.vreg);
             }
         }
+
+        // A value whose last read was *this* instruction leaves `W` now, not at
+        // the next one: intervals end at the last use, and a run one slot longer
+        // is not a rounding error. `a1 = p1 + c` is the case — with `p1` lingering
+        // in `w_after`, its register reads as busy at `a1`'s definition, the
+        // arg/param affinity is refused, and every accumulator's argument lands
+        // one register off, which came out as a permutation of moves on the back
+        // edge. Three-address instructions may share a dying source's register
+        // with their result; the keep-set stays, because two-address ones must
+        // not.
+        //
+        // Three exemptions, all values that are dead by the distances yet still
+        // occupy a register: the keep-set (above), a *dead def* — never read, but
+        // the instruction still writes it somewhere, the minimal interval the
+        // whole-value scan also gives it — and the jump arguments, which the edge
+        // reads after the last instruction, so their runs must reach the block's
+        // end or the slot-gap test sees a one-slot hole and invents a spill.
+        w.retain(|&v| {
+            dist.at(j + 1, v) != INF
+                || keep.contains(&v)
+                || f.defs(i).iter().any(|o| o.vreg == v)
+                || args.contains(&v)
+        });
+        s.retain(|v| w.contains(v));
 
         plan.w_after[i].extend(w.iter().copied());
         plan.reload_before[i].extend_from_slice(&reloads);
@@ -757,7 +862,6 @@ mod tests {
     /// allocation was produced. This is the test that says whether splitting
     /// actually works, as opposed to whether the plan is sensible.
     #[test]
-    #[ignore = "blocked on the first-entry-at-0 defect; see check_split"]
     fn a_split_allocation_verifies() {
         for (file, chunk) in [("primes", "primes"), ("mix", "mix")] {
             check_split(file, chunk);
@@ -765,43 +869,92 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "blocked on the first-entry-at-0 defect; see check_split"]
     fn a_split_allocation_verifies_on_mix2() {
         check_split("mix2", "mix2");
+    }
+
+    /// The allocation-level A/B, on whichever target is being tested — x86-64's
+    /// 13 registers included, which is where the pressure is. Reg-reg move edits
+    /// stand in for the encoded shuffle; `spillcost` weights the memory traffic.
+    /// The aarch64-only `asm_dump::split_vs_whole_report` gives the same numbers
+    /// against real encoded output.
+    #[test]
+    fn split_vs_whole_allocations() {
+        use crate::Lua;
+        use crate::jit::backend::isel::select;
+        use crate::jit::backend::regalloc::{
+            Alloc, Edit, RegisterSets, allocate, allocate_with, verify,
+        };
+        use crate::jit::backend::spillcost;
+        use crate::jit::backend::target::{annotate, machine_env};
+        use crate::jit::frontend::lower::lower;
+        use crate::jit::ir::ty::{Rep, Ty, TypeSet};
+
+        const INT: Ty = Ty::new(Rep::Val, TypeSet::INT);
+
+        eprintln!("\n=== split vs whole (allocations) ===");
+        for (file, chunk) in [("primes", "primes"), ("mix", "mix"), ("mix2", "mix2")] {
+            let source = std::fs::read_to_string(format!("test-files/{file}.lua")).unwrap();
+            let mut lua = Lua::new();
+            lua.load_all();
+            lua.enter(|ctx| {
+                let c = ctx.load(&source, Some(chunk)).expect("compile");
+                let proto = c.as_lua().expect("lua closure").proto.prototypes[0];
+                let func = lower(proto, 0, vec![INT]).expect("lower");
+                let mut m = select(&func).expect("isel");
+                annotate(&mut m);
+                let env = machine_env();
+
+                let whole = allocate(&m, &env).expect("whole");
+                verify(&m, &whole).expect("whole verifies");
+                let layout = order::compute(&m).expect("reducible");
+                let nu = nextuse::analyze(&m, &layout);
+                let p = plan(&m, &layout, &nu, &env);
+                let split = allocate_with(
+                    &m,
+                    &env,
+                    Some(RegisterSets {
+                        w_use: &p.w_use,
+                        w_after: &p.w_after,
+                    }),
+                )
+                .expect("split");
+                verify(&m, &split).expect("split verifies");
+
+                for (which, ra) in [("whole", &whole), ("split", &split)] {
+                    let rr = ra
+                        .edits()
+                        .iter()
+                        .filter(|(_, e)| {
+                            matches!(
+                                e,
+                                Edit::Move(mv)
+                                    if matches!((mv.from, mv.to), (Alloc::Reg(_), Alloc::Reg(_)))
+                            )
+                        })
+                        .count();
+                    let cost = spillcost::measure(&m, ra).expect("reducible");
+                    eprintln!("  {file:7} {which}: {rr:3} reg-reg move edits, {cost}");
+                }
+            });
+        }
     }
 
     /// Allocate `file` from the spiller's decisions and put the result through the
     /// symbolic verifier, which knows nothing about how the allocation was made.
     ///
-    /// # Where this stops, and why
+    /// # What the split path rests on
     ///
-    /// `allocate_presplit` anchors each value's first `Locations` entry at position
-    /// **0**, copying what the whole-value scan did. That is wrong once values
-    /// split: `Locations::get` then answers "in register R" for every position
-    /// before the value's first run, including regions where nothing has put it
-    /// there. It presents as a register read that was never written.
-    ///
-    /// `mix`'s v15 is the case to work from. It is a block parameter, live for a
-    /// single slot `[122, 123)`, that the spiller keeps in a register until 152 — so
-    /// its one run is `[122, 152)`, its entry is written at 0, and `locs.get`
-    /// answers `x2` from the start of the function. Two things to fix together:
-    ///
-    /// 1. Anchor the first entry at the run's own start, not 0. Then check what
-    ///    still reads a location before a value is live — `resolve_edges`' `busy`
-    ///    scan is the one to look at, since it asks every value where it is.
-    /// 2. Decide what a value's location *is* outside its live range. `None` is
-    ///    honest and would make (1) fall out, but every caller then has to handle
-    ///    it, and some currently `.expect()`.
-    ///
-    /// What is already right and should be kept: runs are clipped at block
-    /// boundaries (a run must never imply continuity across an edge control may not
-    /// take), resolution covers every value live at the successor's entry rather
-    /// than only parameters (Wimmer10 Fig. 7), and a reload is emitted only where a
-    /// run follows a real gap rather than at every run start.
-    ///
-    /// Note that `primes` and `mix` passing at `99019a8` was luck, not a
-    /// regression since: runs were unclipped there and happened not to span a join
-    /// on those two functions.
+    /// `Locations` is *honest*: entries are anchored at each value's birth (never
+    /// position 0), every departure from registers is recorded — the slot for a
+    /// spilled value, **nowhere** for a replayed one — and everything downstream
+    /// reads locations instead of keeping its own books. Edge resolution compares
+    /// the two ends of every edge for every live value and emits exactly the
+    /// disagreements; runs are clipped at block boundaries so a run never claims
+    /// continuity across an edge control may not take; a reload is emitted in-block
+    /// only where a run follows a real gap mid-block, while gap-following runs that
+    /// start *at* a block entry are delivered by the edges — which is what hoists a
+    /// loop header's reload onto the entry edge and off the back edge.
     fn check_split(file: &str, chunk: &str) {
         use crate::Lua;
         use crate::jit::backend::isel::select;

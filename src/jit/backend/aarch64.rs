@@ -139,12 +139,34 @@ fn temps_needed(op: MOp) -> usize {
     }
 }
 
+/// Extra temps for an exit-carrying op whose stub could otherwise find no
+/// scratch. `stub_scratch` needs two registers clear of the guard's keepalives;
+/// with fewer keepalives than `pool − 2` that is true however they are
+/// allocated, and reserving anyway would cost every small guard two registers.
+/// Only a deopt-shaped op that names more values than the file holds can fill
+/// it, and only there is the room reserved. Hunting without any reservation
+/// worked while whole-value spilling happened to leave slack — a spiller that
+/// deliberately fills the register file at a guard leaves none, and
+/// `stub_scratch` panicked on exactly that.
+fn stub_temps(op: MOp, uses: usize) -> usize {
+    let exits = matches!(
+        op,
+        MOp::GuardCmp { .. } | MOp::GuardCmpImm { .. } | MOp::GuardNz { .. } | MOp::ExitTo(_)
+    );
+    if exits && uses > INT_POOL.len() - 2 {
+        2
+    } else {
+        0
+    }
+}
+
 /// Attach each instruction's scratch registers as temp operands, so register
 /// allocation gives them free registers instead of the encoder reaching for fixed
 /// ones. Runs on the machine IR after isel and before allocation.
 pub fn annotate(m: &mut MFunc) {
     for i in 0..m.insts.len() {
-        for _ in 0..temps_needed(m.insts[i].op) {
+        let n = temps_needed(m.insts[i].op) + stub_temps(m.insts[i].op, m.insts[i].uses.len());
+        for _ in 0..n {
             let t = m.new_vreg(RegClass::Int);
             m.insts[i].temps.push(Operand::reg(t));
         }
