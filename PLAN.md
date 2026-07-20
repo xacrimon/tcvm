@@ -165,11 +165,57 @@ was supposed to fill. Keep it.
 
 ---
 
-## 2. What is left: wiring the spiller into `allocate`
+### Stage 4 — colouring pre-split runs (`d0370a6`, `99019a8`)
 
-Everything above is built and tested. Nothing yet *uses* it — `allocate` still runs
-its own greedy scan with whole-value spilling, and the numbers in Stage 3 compare a
-plan against code produced without it. Closing that gap is the remaining work:
+`allocate_with(f, env, Some(sets))` takes the spiller's decisions and colours the
+runs they imply. **`primes` and `mix` pass the symbolic verifier as split
+allocations**; `mix2` does not, for the reason in §2. `allocate` itself is
+unchanged and still makes its own whole-value decisions, so nothing in the shipped
+pipeline has moved yet.
+
+The scan turned out to be the whole-value one with its hardest part deleted. At
+most `k` runs cover any position, so a free register always exists: no eviction
+heuristic, no spill-versus-evict decision, no retroactive re-spilling. Runs are
+contiguous, so there is no `inactive` list either — splitting *before* the scan
+turns holes into separate intervals rather than gaps to reason about.
+
+Three things the verifier caught, none of which unit tests would have:
+
+- **Temps get no run**, because no spiller tracks scratch. They must span the whole
+  instruction slot (as `build_intervals` has them) so they collide with every
+  operand — which means the spiller must reserve them from the *read* onwards, not
+  only the write.
+- **The slot test cannot compare totals.** A value stays in `W` after its last use
+  until something evicts it, so a run overhanging one end exactly offsets a real gap
+  in the middle; that reads as fully covered, allocates no slot, emits no reload,
+  and the register is read having never been written. Per position, not per sum.
+- **One store per value, after the definition** — Wimmer05 §4c, exact rather than
+  heuristic here, since SSA gives one definition and the slot never goes stale.
+
+---
+
+## 2. What is left: edge resolution over split values
+
+`resolve_edges` walks an edge's arguments against its successor's parameters and
+nothing else. Without splitting that is *complete*: every other value has a single
+location for its whole life, so both ends of an edge agree by construction and
+there is nothing to reconcile. With splitting it is not — Wimmer10 Fig. 7 resolves
+**every interval live at the successor's entry**, because a value split differently
+on two paths disagrees at the join exactly as a parameter would.
+
+This is the risk this file predicted, and it is where `mix2` stops. It presents as
+a register read that was never written: runs are built over the linearized position
+axis, so one can span from the end of one block into the next merely because they
+are adjacent *in layout*, and resolution then sees the same register at both ends
+of the real edge and emits nothing. Two halves:
+
+1. **Clip runs to block boundaries**, so a run never implies continuity across an
+   edge that control does not take.
+2. **Resolve every live value, not just parameters** — with the reload/store then
+   falling out of the two ends disagreeing, which is what makes coupling code and
+   split moves the same mechanism (Wimmer10 §6).
+
+Then re-measure, and only then consider making it the default. The rest:
 
 1. **Build intervals from the plan, not from liveness.** A value is currently one
    interval spanning its whole live range. Under the plan it is one interval per
