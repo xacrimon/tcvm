@@ -51,7 +51,7 @@ use std::collections::hash_map::RandomState;
 
 use super::nextuse::{INF, NextUse, in_loop};
 use super::order::Layout;
-use super::regalloc::{Block, Inst, MachineEnv, RegClass, RegallocFunc, VReg};
+use super::regalloc::{Block, Constraint, Inst, MachineEnv, RegClass, RegallocFunc, VReg};
 
 /// Where the spiller decided values should live.
 ///
@@ -67,6 +67,18 @@ pub struct SpillPlan {
     pub reload_before: Vec<Vec<VReg>>,
     /// Values to store to their slot before each instruction.
     pub spill_before: Vec<Vec<VReg>>,
+    /// The register set as each instruction *reads* it: after any reload the plan
+    /// calls for, before the instruction writes its results.
+    pub w_use: Vec<Vec<VReg>>,
+    /// The register set as each instruction *leaves* it: results written, evictions
+    /// done.
+    ///
+    /// Recorded rather than left to be replayed from the transition lists, because
+    /// it cannot be replayed from them. `limit` drops a dead value, and a
+    /// rematerializable one, without emitting any code — so a value can leave the
+    /// register set with nothing in `spill_before` to mark it, and a reader
+    /// reconstructing `W` from the transitions would believe it was still there.
+    pub w_after: Vec<Vec<VReg>>,
     /// Coupling code (§4.3): what an edge must reload to make its successor's entry
     /// set true. Keyed by `(predecessor, successor)`.
     pub edge_reload: HashMap<(Block, Block), Vec<VReg>, RandomState>,
@@ -82,6 +94,8 @@ impl SpillPlan {
             w_exit: vec![Vec::new(); f.num_blocks()],
             reload_before: vec![Vec::new(); f.num_insts()],
             spill_before: vec![Vec::new(); f.num_insts()],
+            w_use: vec![Vec::new(); f.num_insts()],
+            w_after: vec![Vec::new(); f.num_insts()],
             edge_reload: HashMap::default(),
             edge_spill: HashMap::default(),
         }
@@ -211,11 +225,25 @@ fn min_algorithm(
 ) {
     let insts = f.block_insts(b);
     for (j, &i) in insts.iter().enumerate() {
-        // Operands not in registers have to be brought back.
+        // Operands not in registers have to be brought back — but only the ones that
+        // actually demand a register. Braun09 states the opposite assumption
+        // outright ("each instruction requires that its operands are available in
+        // registers"), and it does not hold here: an `Any` operand is read from
+        // wherever the value already is, slot included.
+        //
+        // The distinction is not marginal. mix2's deopt stub takes 35 operands, 34
+        // of them `Any` — it names the whole VM state so the exit can rebuild an
+        // interpreter frame. Treating those as register operands asks for 34
+        // registers on a 20-register machine, which cannot be met, and the eviction
+        // it forces throws out values that genuinely did need one.
         let mut reloads: Vec<VReg> = Vec::new();
         for o in f.uses(i) {
             let v = o.vreg;
-            if f.class(v) == class && !w.contains(&v) && !reloads.contains(&v) {
+            if o.constraint != Constraint::Any
+                && f.class(v) == class
+                && !w.contains(&v)
+                && !reloads.contains(&v)
+            {
                 reloads.push(v);
             }
         }
@@ -234,20 +262,29 @@ fn min_algorithm(
         // ...then room for the results, measured from the *next* instruction,
         // because once this one writes its results its own operands stop mattering.
         // Getting this second call wrong is what makes defs collide with uses.
+        // Likewise for results: an `Any` def may be written straight to its slot, so
+        // it needs no register reserved for it. A temp always does — it is scratch
+        // with no home to fall back on.
         let ndefs = f
             .defs(i)
             .iter()
+            .filter(|o| o.constraint != Constraint::Any)
             .chain(f.temps(i))
             .filter(|o| f.class(o.vreg) == class)
             .count();
+        // What the instruction reads is `W` as it stands here: the first `limit`
+        // has already guaranteed every operand is in it.
+        plan.w_use[i].extend(w.iter().copied());
+
         limit(f, w, s, dist, j + 1, k.saturating_sub(ndefs), i, plan);
 
         for o in f.defs(i) {
-            if f.class(o.vreg) == class && !w.contains(&o.vreg) {
+            if o.constraint != Constraint::Any && f.class(o.vreg) == class && !w.contains(&o.vreg) {
                 w.push(o.vreg);
             }
         }
 
+        plan.w_after[i].extend(w.iter().copied());
         plan.reload_before[i].extend_from_slice(&reloads);
     }
 }
@@ -702,13 +739,13 @@ mod tests {
         let b = f.block();
         let (soon, later, third) = (f.int(), f.int(), f.int());
 
-        f.inst(b, vec![Operand::any(soon)], vec![]);
-        f.inst(b, vec![Operand::any(later)], vec![]);
+        f.inst(b, vec![Operand::reg(soon)], vec![]);
+        f.inst(b, vec![Operand::reg(later)], vec![]);
         // With k = 2 this third definition forces one of the two out.
-        f.inst(b, vec![Operand::any(third)], vec![]);
-        f.inst(b, vec![], vec![Operand::any(third)]);
-        f.inst(b, vec![], vec![Operand::any(soon)]);
-        f.inst(b, vec![], vec![Operand::any(later)]);
+        f.inst(b, vec![Operand::reg(third)], vec![]);
+        f.inst(b, vec![], vec![Operand::reg(third)]);
+        f.inst(b, vec![], vec![Operand::reg(soon)]);
+        f.inst(b, vec![], vec![Operand::reg(later)]);
 
         let p = plan_of(&f, 2);
         assert_within_k(&f, &p, 2);
@@ -737,16 +774,16 @@ mod tests {
 
         // `x` is defined early, then enough other values are defined and used that
         // `x` is evicted before the loop is reached.
-        f.inst(entry, vec![Operand::any(x)], vec![]);
-        f.inst(entry, vec![Operand::any(filler)], vec![]);
-        f.inst(entry, vec![], vec![Operand::any(filler)]);
+        f.inst(entry, vec![Operand::reg(x)], vec![]);
+        f.inst(entry, vec![Operand::reg(filler)], vec![]);
+        f.inst(entry, vec![], vec![Operand::reg(filler)]);
         f.inst(entry, vec![], vec![]);
         f.goto(entry, &[header]);
 
         f.inst(header, vec![], vec![]);
         f.goto(header, &[body, exit]);
 
-        f.inst(body, vec![], vec![Operand::any(x)]);
+        f.inst(body, vec![], vec![Operand::reg(x)]);
         f.inst(body, vec![], vec![]);
         f.goto(body, &[header]);
 
@@ -783,7 +820,7 @@ mod tests {
         let a = f.int();
         let b = f.int();
 
-        f.inst(entry, vec![Operand::any(through)], vec![]);
+        f.inst(entry, vec![Operand::reg(through)], vec![]);
         f.inst(entry, vec![], vec![]);
         f.goto(entry, &[header]);
 
@@ -792,14 +829,14 @@ mod tests {
 
         // The loop uses two values of its own, filling a two-register machine, so
         // `through` cannot also survive in a register.
-        f.inst(body, vec![Operand::any(a)], vec![]);
-        f.inst(body, vec![Operand::any(b)], vec![]);
-        f.inst(body, vec![], vec![Operand::any(a), Operand::any(b)]);
+        f.inst(body, vec![Operand::reg(a)], vec![]);
+        f.inst(body, vec![Operand::reg(b)], vec![]);
+        f.inst(body, vec![], vec![Operand::reg(a), Operand::reg(b)]);
         f.inst(body, vec![], vec![]);
         f.goto(body, &[header]);
 
         // `through` is read only here, after the loop.
-        f.inst(exit, vec![], vec![Operand::any(through)]);
+        f.inst(exit, vec![], vec![Operand::reg(through)]);
 
         let p = plan_of(&f, 2);
         assert_within_k(&f, &p, 2);
@@ -821,8 +858,8 @@ mod tests {
         let (entry, header, body, exit) = (f.block(), f.block(), f.block(), f.block());
         let (used, unused) = (f.int(), f.int());
 
-        f.inst(entry, vec![Operand::any(used)], vec![]);
-        f.inst(entry, vec![Operand::any(unused)], vec![]);
+        f.inst(entry, vec![Operand::reg(used)], vec![]);
+        f.inst(entry, vec![Operand::reg(unused)], vec![]);
         f.inst(entry, vec![], vec![]);
         f.goto(entry, &[header]);
 
@@ -832,10 +869,10 @@ mod tests {
         for _ in 0..10 {
             f.inst(body, vec![], vec![]);
         }
-        f.inst(body, vec![], vec![Operand::any(used)]);
+        f.inst(body, vec![], vec![Operand::reg(used)]);
         f.goto(body, &[header]);
 
-        f.inst(exit, vec![], vec![Operand::any(unused)]);
+        f.inst(exit, vec![], vec![Operand::reg(unused)]);
 
         // One register: exactly one of the two can be held.
         let p = plan_of(&f, 1);
@@ -860,13 +897,13 @@ mod tests {
         let victim = f.int();
         let others: Vec<VReg> = (0..4).map(|_| f.int()).collect();
 
-        f.inst(b, vec![Operand::any(victim)], vec![]);
+        f.inst(b, vec![Operand::reg(victim)], vec![]);
         // Repeatedly fill and drain the register file, reading `victim` in between
         // so it is reloaded and then evicted again.
         for &o in &others {
-            f.inst(b, vec![Operand::any(o)], vec![]);
-            f.inst(b, vec![], vec![Operand::any(o)]);
-            f.inst(b, vec![], vec![Operand::any(victim)]);
+            f.inst(b, vec![Operand::reg(o)], vec![]);
+            f.inst(b, vec![], vec![Operand::reg(o)]);
+            f.inst(b, vec![], vec![Operand::reg(victim)]);
         }
 
         let p = plan_of(&f, 2);
@@ -892,10 +929,10 @@ mod tests {
         let dead = f.int();
         let (a, c) = (f.int(), f.int());
 
-        f.inst(b, vec![Operand::any(dead)], vec![]); // never read again
-        f.inst(b, vec![Operand::any(a)], vec![]);
-        f.inst(b, vec![Operand::any(c)], vec![]);
-        f.inst(b, vec![], vec![Operand::any(a), Operand::any(c)]);
+        f.inst(b, vec![Operand::reg(dead)], vec![]); // never read again
+        f.inst(b, vec![Operand::reg(a)], vec![]);
+        f.inst(b, vec![Operand::reg(c)], vec![]);
+        f.inst(b, vec![], vec![Operand::reg(a), Operand::reg(c)]);
 
         let p = plan_of(&f, 2);
         let stored: Vec<VReg> = p.spill_before.iter().flatten().copied().collect();
@@ -991,6 +1028,7 @@ mod tests {
                 // replayed rather than loaded, so like `spillcost` it is counted apart
                 // from memory traffic rather than as some of it.
                 let mem = |v: &&VReg| m.remat(**v).is_none();
+
                 let ops = plan
                     .reload_before
                     .iter()
@@ -1007,6 +1045,26 @@ mod tests {
                         depth_of_inst[i] = layout.depth[b.0 as usize];
                     }
                 }
+
+                // An `Any` operand the plan leaves out of registers is still read
+                // from its slot when the code is emitted — the encoder loads it in
+                // place. Those are real memory accesses, and today's figure counts
+                // them (96 of mix2's 210 on aarch64), so leaving them out of the
+                // plan's figure would credit it for traffic that still happens.
+                let mut in_place = 0u32;
+                let mut in_place_weighted = 0u64;
+                for (i, &depth) in depth_of_inst.iter().enumerate() {
+                    for o in m.uses(i) {
+                        if o.constraint == Constraint::Any
+                            && !plan.w_use[i].contains(&o.vreg)
+                            && m.remat(o.vreg).is_none()
+                        {
+                            in_place += 1;
+                            in_place_weighted += 10u64.pow(depth);
+                        }
+                    }
+                }
+
                 for (i, (r, sp)) in plan
                     .reload_before
                     .iter()
@@ -1019,6 +1077,43 @@ mod tests {
                 for (&(p, _), vs) in plan.edge_reload.iter().chain(plan.edge_spill.iter()) {
                     let n = vs.iter().filter(mem).count();
                     weighted += n as u64 * 10u64.pow(layout.depth[p.0 as usize]);
+                }
+
+                // The contract the allocator will rely on: every operand really is
+                // in a register where its instruction reads it, and the register set
+                // never exceeds the file. Together these are what let the scan stop
+                // making spill decisions at all — if they hold, colouring cannot
+                // fail, which is the entire premise of decoupled spilling.
+                for i in 0..m.num_insts() {
+                    for class in RegClass::ALL {
+                        let k = env.order(class).len();
+                        for (what, set) in [("use", &plan.w_use[i]), ("after", &plan.w_after[i])] {
+                            let n = set.iter().filter(|&&v| m.class(v) == class).count();
+                            assert!(
+                                n <= k,
+                                "{file} inst {i} {what}: {n} {class:?} values in \
+                                 registers, k = {k}"
+                            );
+                        }
+                    }
+                    // Only operands that demand a register. An `Any` operand is read
+                    // from wherever the value is, so the plan owes it nothing.
+                    for o in m.uses(i).iter().filter(|o| o.constraint != Constraint::Any) {
+                        assert!(
+                            plan.w_use[i].contains(&o.vreg),
+                            "{file} inst {i}: reads v{} in a register but the plan \
+                             does not have it in one there",
+                            o.vreg.0
+                        );
+                    }
+                    for o in m.defs(i).iter().filter(|o| o.constraint != Constraint::Any) {
+                        assert!(
+                            plan.w_after[i].contains(&o.vreg),
+                            "{file} inst {i}: writes v{} to a register but the plan \
+                             does not have it in one afterwards",
+                            o.vreg.0
+                        );
+                    }
                 }
 
                 // Fig. 2d, as a property. A value the loop never reads, that the
@@ -1059,6 +1154,9 @@ mod tests {
                         }
                     }
                 }
+
+                let ops = ops + in_place as usize;
+                let weighted = weighted + in_place_weighted;
 
                 let now = spillcost::measure(&m, &allocate(&m, &env).expect("allocate"))
                     .expect("reducible");
