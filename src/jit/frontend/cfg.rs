@@ -473,25 +473,50 @@ pub fn reg_defs(i: Instruction, out: &mut Vec<u8>) {
 /// doesn't skip. Treating it as an unconditional def would kill a live value
 /// on the skip path, so it declares no def here and the lowering passes `dst`'s
 /// incoming value along the skip edge instead.
+/// A set of Lua registers. There are at most 256, so the whole set is four
+/// words: union and comparison are a handful of instructions rather than a loop,
+/// and the fixpoint allocates nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct RegSet([u64; 4]);
+
+impl RegSet {
+    fn insert(&mut self, r: u8) {
+        self.0[r as usize >> 6] |= 1 << (r & 63);
+    }
+
+    fn remove(&mut self, r: u8) {
+        self.0[r as usize >> 6] &= !(1 << (r & 63));
+    }
+
+    fn union(&mut self, other: &RegSet) {
+        for (a, b) in self.0.iter_mut().zip(&other.0) {
+            *a |= *b;
+        }
+    }
+    fn iter(&self) -> impl Iterator<Item = u8> + '_ {
+        (0u32..256)
+            .filter(|&r| self.0[r as usize >> 6] & (1 << (r & 63)) != 0)
+            .map(|r| r as u8)
+    }
+}
+
 fn liveness(code: &[Instruction], cfg: &mut Cfg) -> Result<(), Unsupported> {
     let n = cfg.blocks.len();
-    let mut live_in: Vec<Vec<bool>> = vec![vec![false; 256]; n];
+    let mut live_in: Vec<RegSet> = vec![RegSet::default(); n];
 
+    let mut uses = Vec::new();
+    let mut defs = Vec::new();
     let mut changed = true;
     while changed {
         changed = false;
         for b in (0..n).rev() {
-            let mut live = vec![false; 256];
+            let mut live = RegSet::default();
             for &s in &cfg.blocks[b].succs {
                 let si = cfg.index_of[&s];
-                for r in 0..256 {
-                    live[r] |= live_in[si][r];
-                }
+                live.union(&live_in[si]);
             }
 
             let (start, end) = (cfg.blocks[b].start, cfg.blocks[b].end);
-            let mut uses = Vec::new();
-            let mut defs = Vec::new();
             for pc in (start..end).rev() {
                 let i = code[pc as usize];
                 defs.clear();
@@ -499,10 +524,10 @@ fn liveness(code: &[Instruction], cfg: &mut Cfg) -> Result<(), Unsupported> {
                 reg_defs(i, &mut defs);
                 reg_uses(i, &mut uses);
                 for &r in &defs {
-                    live[r as usize] = false;
+                    live.remove(r);
                 }
                 for &r in &uses {
-                    live[r as usize] = true;
+                    live.insert(r);
                 }
             }
 
@@ -514,10 +539,7 @@ fn liveness(code: &[Instruction], cfg: &mut Cfg) -> Result<(), Unsupported> {
     }
 
     for (b, block) in cfg.blocks.iter_mut().enumerate() {
-        block.live_in = (0..256u32)
-            .filter(|&r| live_in[b][r as usize])
-            .map(|r| r as u8)
-            .collect();
+        block.live_in = live_in[b].iter().collect();
     }
     Ok(())
 }
