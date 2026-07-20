@@ -111,3 +111,19 @@ fn floor_mod_and_idiv_match_the_reference() {
     );
     assert_eq!(r.total, 389927, "checksum disagrees with `lua`");
 }
+
+/// `and`/`or`, i.e. `TESTSET` — the one control instruction that assigns on a
+/// single edge.
+///
+/// Its skip condition is the opposite of `TEST`'s for the same `inverted` flag,
+/// so lowering it as a `TEST` swaps both polarities and silently returns the
+/// other operand. Nothing in the rest of the corpus emits a `TESTSET` at all,
+/// which is why this exists: the case that can fail was the case never covered.
+#[test]
+fn and_or_picks_the_same_operand_as_the_reference() {
+    let r = run("test-files/jit_testset.lua");
+
+    assert_eq!(r.entries, (200 - NATIVE_FROM + 1) as u64 + 3);
+    assert_eq!(r.deopts, 0, "integers and `false` throughout");
+    assert_eq!(r.total, 20000, "checksum disagrees with `lua`");
+}

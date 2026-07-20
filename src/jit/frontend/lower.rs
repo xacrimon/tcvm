@@ -712,10 +712,14 @@ fn terminator<S: Sink, F: Feedback>(
                 let mut assigned = st.clone();
                 assigned.set(s, dst, v);
 
+                // `op_testset` skips when `truthy == inverted`; `op_test` skips
+                // when `truthy != inverted`. Same field, opposite sense — so the
+                // edges land the *other* way round from `TEST` above, and the
+                // assignment rides the edge that does not skip.
                 let (t, f) = if inverted {
-                    ((skip, st.clone()), (jump, assigned))
-                } else {
                     ((jump, assigned), (skip, st.clone()))
+                } else {
+                    ((skip, st.clone()), (jump, assigned))
                 };
                 TermOut::Br { cond: falsy, t, f }
             }
