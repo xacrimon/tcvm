@@ -26,6 +26,7 @@
 
 use super::isel::select;
 use super::regalloc::allocate;
+use super::spillcost;
 use super::target::{encode, machine_env};
 use crate::Lua;
 use crate::jit::frontend::lower::lower;
@@ -106,6 +107,46 @@ fn compile_one(file: &str, chunk_name: &str) -> (Vec<u32>, u32) {
         let words = encode(&m, &func.pool, &ra).expect("encode");
         (words, ra.num_spills)
     })
+}
+
+/// Compile one function and measure its spill traffic against the loop nesting.
+///
+/// The static count and the weighted one are both reported because they answer
+/// different questions, and the whole point of Braun–Hack is that they can move in
+/// opposite directions: hoisting a reload out of a loop leaves the static count
+/// alone and divides the weighted one by the trip count. See [`spillcost`].
+fn spill_cost_of(file: &str, chunk_name: &str) -> spillcost::SpillCost {
+    let source = std::fs::read_to_string(format!("test-files/{file}.lua")).unwrap();
+    let mut lua = Lua::new();
+    lua.load_all();
+    lua.enter(|ctx| {
+        let chunk = ctx.load(&source, Some(chunk_name)).expect("compile");
+        let proto = chunk
+            .as_lua()
+            .expect("chunk is a Lua closure")
+            .proto
+            .prototypes[0];
+        let func = lower(proto, 0, vec![INT]).expect("lower");
+        let mut m = select(&func).expect("isel");
+        super::target::annotate(&mut m);
+        let ra = allocate(&m, &machine_env()).expect("allocate");
+        spillcost::measure(&m, &ra).expect("reducible control flow")
+    })
+}
+
+/// The spilling yardstick. Run it before and after any change to the allocator's
+/// spill policy:
+///
+/// ```text
+/// cargo test -p tcvm --lib jit::backend::asm_dump::spill_traffic -- --nocapture
+/// ```
+#[test]
+fn spill_traffic_report() {
+    eprintln!("\n=== spill traffic ===");
+    for (file, chunk) in [("primes", "primes"), ("mix", "mix"), ("mix2", "mix2")] {
+        let name = if file == "primes" { "is_prime" } else { file };
+        eprintln!("  {name:9} {}", spill_cost_of(file, chunk));
+    }
 }
 
 /// Disassemble `words` by way of the system toolchain.

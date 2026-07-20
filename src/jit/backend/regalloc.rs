@@ -448,6 +448,16 @@ impl Allocation {
         self.block_params[b.0 as usize][k]
     }
 
+    /// Every fix-up, with where it goes, ordered by program point.
+    ///
+    /// For measurement rather than encoding — the encoder wants [`Self::edits_at`]
+    /// as it walks. Counting spill traffic needs the whole list *and* each edit's
+    /// position, because what a reload costs depends on the loop depth of the block
+    /// it lands in, not on how many there are.
+    pub fn edits(&self) -> &[(ProgPoint, Edit)] {
+        &self.edits
+    }
+
     /// The fix-ups to emit at `p`, in insertion order among equal points.
     pub fn edits_at(&self, p: ProgPoint) -> impl Iterator<Item = &Edit> {
         let lo = self.edits.partition_point(|&(q, _)| q < p);
