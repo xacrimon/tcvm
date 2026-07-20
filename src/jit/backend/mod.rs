@@ -27,6 +27,7 @@ pub mod mach;
 pub mod nextuse;
 pub mod order;
 pub mod regalloc;
+pub mod spill;
 pub mod spillcost;
 
 #[cfg(target_arch = "aarch64")]
