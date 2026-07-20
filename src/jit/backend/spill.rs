@@ -353,12 +353,48 @@ fn init_loop_header(
     // Room left over. `p_L - |T_B|` estimates the pressure from values the loop
     // actually uses, so `k - that` is how many live-through values can plausibly
     // survive the loop without being evicted.
+    //
+    // That estimate counts only values live *across* instructions, and none of the
+    // registers an instruction needs for its own results. Admit right up to it and
+    // the first `limit(.., k - |defs|)` inside the loop tips over `k` and evicts one
+    // of the very values just admitted — which then reloads on the back edge, every
+    // iteration, exactly the case Fig. 2d warns about. On mix2's inner loop the
+    // paper's figure admitted 13 live-through values into 20 registers against a
+    // working set of 7, and one came straight back out.
+    //
+    // So keep back what the widest instruction in the loop needs. The paper's
+    // footnote 6 already concedes this estimate "might be an under-approximation";
+    // this is the part of the shortfall that is cheap to see.
     let p_l = nu.loop_pressure(layout, b, class);
-    let free = (k + live_through.len()).saturating_sub(p_l as usize);
-    let room = free.min(k - cand.len());
+    let headroom = loop_headroom(f, layout, b, class);
+    let free = (k + live_through.len()).saturating_sub(p_l as usize + headroom);
+    let room = free.min(k.saturating_sub(cand.len()));
     live_through.sort_by_key(|&v| (nu.at_entry(b, v), v.0));
     cand.extend(live_through.into_iter().take(room));
     cand
+}
+
+/// The most registers any single instruction in the loop needs for its own results
+/// — its definitions and temps, which have to be somewhere the moment it executes
+/// and cannot share with anything live across it.
+fn loop_headroom(f: &impl RegallocFunc, layout: &Layout, b: Block, class: RegClass) -> usize {
+    let mut worst = 0;
+    for blk in 0..f.num_blocks() {
+        let blk = Block(blk as u32);
+        if !in_loop(layout, blk, b) {
+            continue;
+        }
+        for &i in f.block_insts(blk) {
+            let n = f
+                .defs(i)
+                .iter()
+                .chain(f.temps(i))
+                .filter(|o| f.class(o.vreg) == class)
+                .count();
+            worst = worst.max(n);
+        }
+    }
+    worst
 }
 
 /// Which of `vals` are read anywhere inside the loop headed by `b`.
@@ -983,6 +1019,45 @@ mod tests {
                 for (&(p, _), vs) in plan.edge_reload.iter().chain(plan.edge_spill.iter()) {
                     let n = vs.iter().filter(mem).count();
                     weighted += n as u64 * 10u64.pow(layout.depth[p.0 as usize]);
+                }
+
+                // Fig. 2d, as a property. A value the loop never reads, that the
+                // header nonetheless chose to keep in a register, must not then be
+                // evicted *inside* the loop: that buys a store in the body and a
+                // reload on the back edge, both executed every iteration, to serve a
+                // use after the loop. It is strictly worse than never admitting it.
+                //
+                // This is what the `p_L` estimate gets wrong when it is not given
+                // headroom for instruction results, and it cost mix2 two operations
+                // in its innermost loop — 200 of 1759 weighted, enough on its own to
+                // turn the whole aarch64 result from a 7.7% win into a 2% loss.
+                for h in 0..m.num_blocks() {
+                    let h = Block(h as u32);
+                    if !layout.is_header(h) {
+                        continue;
+                    }
+                    let used = used_in_loop(&m, &layout, h, &plan.w_entry[h.0 as usize]);
+                    for &v in &plan.w_entry[h.0 as usize] {
+                        if used.contains(&v) {
+                            continue;
+                        }
+                        for b in 0..m.num_blocks() {
+                            let b = Block(b as u32);
+                            if !in_loop(&layout, b, h) {
+                                continue;
+                            }
+                            for &i in m.block_insts(b) {
+                                assert!(
+                                    !plan.spill_before[i].contains(&v),
+                                    "{file}: v{} is held in a register at loop header \
+                                     mb{}, is never read in that loop, and is then \
+                                     spilled inside it at inst {i}",
+                                    v.0,
+                                    h.0
+                                );
+                            }
+                        }
+                    }
                 }
 
                 let now = spillcost::measure(&m, &allocate(&m, &env).expect("allocate"))
