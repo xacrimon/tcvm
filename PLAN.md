@@ -1,9 +1,9 @@
 # Plan: SSA-form register allocation with live-range splitting
 
-**Status: Stages 1, 2, 2b done. The spilling yardstick now exists and the
-allocation interface is position-indexed. What remains is the spiller itself,
-and the decision is to take it straight from Braun09 rather than build
-Wimmer05's in-scan splitting first — see §2.**
+**Status: the Braun09 spiller exists, is tested, and measures well under real
+register pressure — but is not yet wired into `allocate`. That integration is
+the whole of what remains. See §1 Stage 3 for the numbers and §2 for what
+wiring it involves.**
 
 Papers are in `papers/` (gitignored) with a distilled algorithm crib sheet at
 `papers/NOTES.md` — pseudocode, measured numbers, and correctness traps. Read
@@ -100,12 +100,84 @@ This is the precondition for everything below, and it is the *whole* of the
 interface change — the scan still assigns one location per value, so every entry
 starts at position 0.
 
+### Stage 3 — next-use analysis and the Belady spiller (`4e93e2a`, `f66dffc`, `5c6cbb3`)
+
+`nextuse.rs` is Braun09 §4.1: distances rather than live sets, joined by pointwise
+minimum, with loop-exit edges charged `M` so a use after a loop outranks any use
+inside it. `spill.rs` is §2 + §4.2 + §4.3: Algorithm 1 per block, `W_entry` from
+Algorithm 2, coupling code on edges.
+
+**Measured, plan against today's emitted code:**
+
+| target | | plan | today | Δ ops | Δ weighted |
+|---|---|---|---|---|---|
+| x86-64 (13 regs) | mix | 38 (w 344) | 69 (w 483) | **−45%** | **−29%** |
+| x86-64 (13 regs) | mix2 | 279 (w 2169) | 330 (w 2715) | **−15%** | **−20%** |
+| aarch64 (20 regs) | mix2 | 193 (w 1759) | 210 (w 1722) | −8% | +2% |
+
+**Read the two targets together, not separately.** The pass wins where there is
+genuine pressure and is a wash where there is not. That is the shape Braun09's own
+setup implies — they measured on x86 with **7** registers, picked precisely to
+stress spilling. aarch64's 20 leaves mix2 barely over the line, so there is little
+for a better policy to win; x86-64's 13 is much nearer the paper's setting and the
+benefit appears there.
+
+`is_prime` and `mix` on aarch64 both come out at exactly **zero** spill code,
+agreeing with an allocator that reached the same answer by an entirely different
+route. That is the strongest correctness signal available short of wiring it in.
+
+**Two things the papers get wrong or leave out**, both found by property tests
+rather than by reading:
+
+- §4.3's two coupling rules do not cover a value the predecessor held in a
+  register, still live, that the successor has no room for. It leaves registers at
+  the block boundary without passing through `limit`, so nothing stores it.
+- The printed transfer function `f_B` in §4.1 has no case for a value *defined* in
+  the block, which makes a value defined in `B` and live out of `B` come out
+  live-*in* at `B`.
+
+**The invariant that found most of the bugs**: *nothing is reloaded that was never
+stored*. Zero stores against fifty reloads is incoherent on its face, and three
+separate defects presented as exactly that — dead values occupying `W`, jump
+arguments dropped from `w_exit`, and block parameters reloaded from slots the edge
+was supposed to fill. Keep it.
+
 ---
 
-## 2. What is left, and why it is all one thing
+## 2. What is left: wiring the spiller into `allocate`
 
-**Splitting.** The allocator assigns one location per value for its whole life. Three
-separate problems trace to that, all measured on `mix2`:
+Everything above is built and tested. Nothing yet *uses* it — `allocate` still runs
+its own greedy scan with whole-value spilling, and the numbers in Stage 3 compare a
+plan against code produced without it. Closing that gap is the remaining work:
+
+1. **Build intervals from the plan, not from liveness.** A value is currently one
+   interval spanning its whole live range. Under the plan it is one interval per
+   maximal run where the plan says it is in a register — several per value, which
+   is what `Locations` was made position-indexed for.
+2. **Delete the scan's spill decisions.** With pressure already at `k` everywhere,
+   `TRYALLOCATEFREEREG` never fails, so the eviction heuristic, `EvictKey`, and the
+   `remat_spilled` bookkeeping all go. This should be a net *deletion*.
+3. **Emit the plan's edits.** A reload becomes `Edit::Move` slot→reg (or
+   `Edit::Remat`), a store reg→slot, at the points the plan names. Edge coupling
+   code joins the existing parallel copy in `resolve_edges`.
+4. **Re-measure.** The plan's own count is an estimate of what this will emit, not
+   a promise: the current allocator leaves `Any` operands in slots and lets the
+   encoder load them in place (96 of mix2's 157 aarch64 loads), and the plan has no
+   notion of that. Expect the real number to differ from Stage 3's table.
+
+**The risk is concentrated in `resolve_edges`.** A value split differently on two
+paths disagrees at every join, so the sequencer, cycle breaking and slot routing
+all get much busier than they are today. Stage 2b made resolution total, which is
+what makes this survivable — but "total" was established against a workload where
+almost nothing was split.
+
+### Why the old §2 no longer applies
+
+It read: *"Splitting. The allocator assigns one location per value for its whole
+life. Three separate problems trace to that."* Two of those three are now
+addressed by the pass above rather than by an in-scan splitter, and the third
+(`Reuse` coalescing being a net loss) is still open but is downstream of the
+integration, not of the algorithm. Kept below for the measurements, which stand:
 
 1. **Over-spilling.** 29 values spilled where the pressure peak needs ~16 in
    memory. A value live across the peak but used mostly outside it is spilled
@@ -122,6 +194,10 @@ separate problems trace to that, all measured on `mix2`:
 
 So splitting is not merely Stage 3's spilling improvement; it is the precondition
 that makes the rest of the coalescing worth having.
+
+Note that (1)'s "~16" was a guess when written and has since been confirmed
+independently: `nextuse` puts mix2's aarch64 peak at 36 against a 20-register
+pool, and 36 − 20 = 16 exactly.
 
 ### Splitting does not make Stage 2b redundant
 
