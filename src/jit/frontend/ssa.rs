@@ -83,8 +83,11 @@ enum Task {
 
 pub struct SsaBuilder {
     /// `currentDef`: what each variable holds in each block. Dense because the
-    /// register file is small and this is read on every variable access.
-    defs: Vec<Vec<Option<Val>>>,
+    /// register file is small and this is read on every variable access, and
+    /// flat because a row per block is `blocks` allocations and a pointer chase
+    /// on the hottest lookup in the builder.
+    defs: Vec<Option<Val>>,
+    num_vars: usize,
     blocks: Vec<BlockState>,
     /// Parameters found redundant, and what they turned out to be.
     repl: HashMap<Val, Val, RandomState>,
@@ -102,7 +105,8 @@ impl SsaBuilder {
     pub fn new(num_blocks: usize, num_vars: usize, reg_ty: Vec<Vec<Option<Ty>>>) -> Self {
         debug_assert_eq!(reg_ty.len(), num_blocks);
         SsaBuilder {
-            defs: vec![vec![None; num_vars]; num_blocks],
+            defs: vec![None; num_blocks * num_vars],
+            num_vars,
             blocks: vec![BlockState::default(); num_blocks],
             repl: HashMap::default(),
             tasks: Vec::new(),
@@ -110,6 +114,11 @@ impl SsaBuilder {
             seen: Vec::new(),
             reg_ty,
         }
+    }
+
+    #[inline]
+    fn slot(&self, block: Block, var: Var) -> usize {
+        block.index() * self.num_vars + var as usize
     }
 
     /// Declare an incoming edge. `inst` is `from`'s terminator and `target` its
@@ -130,18 +139,25 @@ impl SsaBuilder {
 
     /// Record that `var` holds `val` from here on in `block`.
     pub fn write_var(&mut self, block: Block, var: Var, val: Val) {
-        self.defs[block.index()][var as usize] = Some(val);
+        let slot = self.slot(block, var);
+        self.defs[slot] = Some(val);
     }
 
     /// Whether `var` has a definition in `block` itself, without consulting
     /// predecessors.
     pub fn has_local(&self, block: Block, var: Var) -> bool {
-        self.defs[block.index()][var as usize].is_some()
+        self.defs[self.slot(block, var)].is_some()
     }
 
     /// The value `var` holds at this point in `block`, minting parameters as
     /// needed.
     pub fn read_var(&mut self, func: &mut Func<'_>, block: Block, var: Var) -> Val {
+        // Local value numbering, which is most reads: everything the block
+        // defined itself, and everything an earlier read memoized onto it. This
+        // path is why a straight-line block pays almost nothing for the builder.
+        if let Some(v) = self.defs[self.slot(block, var)] {
+            return self.resolve(v);
+        }
         debug_assert!(self.tasks.is_empty() && self.results.is_empty());
         self.tasks.push(Task::Read { var, block });
         self.run(func);
@@ -210,7 +226,7 @@ impl SsaBuilder {
     }
 
     fn step_read(&mut self, func: &mut Func<'_>, var: Var, block: Block) {
-        if let Some(v) = self.defs[block.index()][var as usize] {
+        if let Some(v) = self.defs[self.slot(block, var)] {
             let v = self.resolve(v);
             self.results.push(v);
             return;
@@ -232,7 +248,7 @@ impl SsaBuilder {
             }
             self.seen.push(at);
             at = pred;
-            if let Some(v) = self.defs[at.index()][var as usize] {
+            if let Some(v) = self.defs[self.slot(at, var)] {
                 break Some(self.resolve(v));
             }
         };
@@ -246,7 +262,8 @@ impl SsaBuilder {
                 let ty = self.reg_ty[at.index()][var as usize]
                     .expect("a variable read through a block is live there");
                 let phi = func.append_param(at, ty);
-                self.defs[at.index()][var as usize] = Some(phi);
+                let slot = self.slot(at, var);
+                self.defs[slot] = Some(phi);
                 if self.blocks[at.index()].sealed {
                     self.schedule_operands(var, at, phi);
                 } else {
@@ -260,7 +277,8 @@ impl SsaBuilder {
         // Memoize onto every block the chain walked through.
         let mut b = block;
         while b != at {
-            self.defs[b.index()][var as usize] = Some(val);
+            let slot = self.slot(b, var);
+            self.defs[slot] = Some(val);
             b = self.blocks[b.index()]
                 .single_pred
                 .expect("the chain was walked through here");
@@ -285,14 +303,27 @@ impl SsaBuilder {
     }
 
     fn step_finish(&mut self, func: &mut Func<'_>, var: Var, block: Block, phi: Val) {
+        // The operands are already on the result stack, one per predecessor, in
+        // edge order. Reading them in place rather than lifting them out matters:
+        // this runs once per parameter created, and two `Vec`s per parameter was
+        // most of what the old placement-then-cleanup scheme cost in the first
+        // place.
         let n = self.blocks[block.index()].preds.len();
-        let ops: Vec<Val> = self.results.split_off(self.results.len() - n);
-        let ops: Vec<Val> = ops.into_iter().map(|v| self.resolve(v)).collect();
+        let base = self.results.len() - n;
+        for i in base..self.results.len() {
+            self.results[i] = self.resolve(self.results[i]);
+        }
 
         // Every operand becomes an argument on its edge whether or not the
         // parameter survives, so the columns stay parallel; a dropped one is
         // deleted along with its arguments in the final pass.
-        for (i, &op) in ops.iter().enumerate() {
+        //
+        // Redundant exactly when every operand other than the parameter itself is
+        // the same value. All-self-references means unreachable code; leave it.
+        let mut same: Option<Val> = None;
+        let mut agree = true;
+        for i in 0..n {
+            let op = self.results[base + i];
             debug_assert_eq!(
                 func.ty(op).rep,
                 func.ty(phi).rep,
@@ -302,20 +333,22 @@ impl SsaBuilder {
             );
             let p = self.blocks[block.index()].preds[i];
             func.inst_mut(p.inst).targets[p.target].args.push(op);
+
+            if op != phi {
+                match same {
+                    None => same = Some(op),
+                    Some(v) if v != op => agree = false,
+                    Some(_) => {}
+                }
+            }
         }
 
-        // Redundant exactly when every operand other than the parameter itself is
-        // the same value. All-self-references means unreachable code; leave it.
-        let mut others = ops.iter().copied().filter(|&o| o != phi);
-        let same = match others.next() {
-            Some(v) if others.all(|o| o == v) => Some(v),
-            _ => None,
-        };
-
-        match same {
+        self.results.truncate(base);
+        match same.filter(|_| agree) {
             Some(v) => {
                 self.repl.insert(phi, v);
-                self.defs[block.index()][var as usize] = Some(v);
+                let slot = self.slot(block, var);
+                self.defs[slot] = Some(v);
                 self.results.push(v);
             }
             None => self.results.push(phi),
@@ -323,6 +356,10 @@ impl SsaBuilder {
     }
 
     fn resolve(&self, mut v: Val) -> Val {
+        // Empty until the first parameter is dropped, and often empty for good.
+        if self.repl.is_empty() {
+            return v;
+        }
         while let Some(&next) = self.repl.get(&v) {
             v = next;
         }
