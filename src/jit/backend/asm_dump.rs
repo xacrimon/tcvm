@@ -12,6 +12,13 @@
 //! cargo test -p tcvm --lib jit::backend::asm_dump -- --nocapture
 //! ```
 //!
+//! For reading the code rather than counting it, the `disasm_*` tests print real
+//! disassembly. They are `#[ignore]`d because they shell out to the toolchain:
+//!
+//! ```text
+//! cargo test -p tcvm --lib disasm_mix2 -- --ignored --nocapture
+//! ```
+//!
 //! The metric is exact, not a heuristic: the assembler already elides `mov xd,xd`
 //! / `fmov dd,dd` (see `aarch64_asm`), so every move word that survives to the
 //! output is a genuine shuffle the allocator failed to coalesce. Move-immediate
@@ -76,4 +83,99 @@ fn dump_is_prime_asm() {
         let mark = if is_reg_move(w) { "  <- move" } else { "" };
         eprintln!("  {i:3}  {w:08x}{mark}");
     }
+}
+
+// --- disassembly, for reading the output by hand ---------------------------
+
+/// Compile one function and hand back its encoded words plus the spill count.
+fn compile_one(file: &str, chunk_name: &str) -> (Vec<u32>, u32) {
+    let source = std::fs::read_to_string(format!("test-files/{file}.lua")).unwrap();
+    let mut lua = Lua::new();
+    lua.load_all();
+    lua.enter(|ctx| {
+        let chunk = ctx.load(&source, Some(chunk_name)).expect("compile");
+        let proto = chunk
+            .as_lua()
+            .expect("chunk is a Lua closure")
+            .proto
+            .prototypes[0];
+        let func = lower(proto, 0, vec![INT]).expect("lower");
+        let mut m = select(&func).expect("isel");
+        super::target::annotate(&mut m);
+        let ra = allocate(&m, &machine_env()).expect("allocate");
+        let words = encode(&m, &func.pool, &ra).expect("encode");
+        (words, ra.num_spills)
+    })
+}
+
+/// Disassemble `words` by way of the system toolchain.
+///
+/// Apple's `objdump` will not read a flat binary, so the words go through an
+/// assembly file of `.word` directives and a real object file. If the toolchain
+/// is not there, say where the assembly was left rather than failing — this is a
+/// thing to read, not a thing to pass.
+fn disasm(name: &str, words: &[u32], spills: u32) {
+    let moves = words.iter().filter(|&&w| is_reg_move(w)).count();
+    eprintln!(
+        "\n=== {name}: {} instructions, {moves} reg-reg moves, {spills} spill slots ===",
+        words.len()
+    );
+
+    let dir = std::env::temp_dir();
+    let (asm, obj) = (dir.join(format!("{name}.s")), dir.join(format!("{name}.o")));
+    let body: String = words.iter().map(|w| format!(".word 0x{w:08x}\n")).collect();
+    if std::fs::write(&asm, format!(".text\n_{name}:\n{body}")).is_err() {
+        eprintln!("  (could not write {})", asm.display());
+        return;
+    }
+
+    let assembled = std::process::Command::new("clang")
+        .args(["-c", "-arch", "arm64"])
+        .arg(&asm)
+        .arg("-o")
+        .arg(&obj)
+        .status();
+    let dumped = match assembled {
+        Ok(st) if st.success() => std::process::Command::new("objdump")
+            .arg("-d")
+            .arg(&obj)
+            .output(),
+        _ => {
+            eprintln!("  (no assembler; disassemble {} yourself)", asm.display());
+            return;
+        }
+    };
+    let Ok(out) = dumped else {
+        eprintln!("  (no objdump; object left at {})", obj.display());
+        return;
+    };
+
+    // Spill traffic is what these dumps are usually being read for, so mark it:
+    // the frame base lives in its own register, which leaves `sp`-relative
+    // loads and stores as the spill area.
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let spill = line.contains("[sp") && (line.contains("ldr") || line.contains("str"));
+        eprintln!("{line}{}", if spill { "   <- spill" } else { "" });
+    }
+}
+
+#[test]
+#[ignore = "shells out to clang/objdump; for reading by hand"]
+fn disasm_is_prime() {
+    let (w, s) = compile_one("primes", "primes");
+    disasm("is_prime", &w, s);
+}
+
+#[test]
+#[ignore = "shells out to clang/objdump; for reading by hand"]
+fn disasm_mix() {
+    let (w, s) = compile_one("mix", "mix");
+    disasm("mix", &w, s);
+}
+
+#[test]
+#[ignore = "shells out to clang/objdump; for reading by hand"]
+fn disasm_mix2() {
+    let (w, s) = compile_one("mix2", "mix2");
+    disasm("mix2", &w, s);
 }

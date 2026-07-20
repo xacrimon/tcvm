@@ -1,19 +1,28 @@
 //! Timings for each stage of the JIT pipeline, from source text to running
-//! native code, on `test-files/mix.lua`'s register-heavy `mix` function.
+//! native code.
 //!
 //! The stages are timed in isolation so a regression can be attributed to the
 //! phase that caused it: parse -> compile (bytecode) -> lower (IR) -> select
 //! (machine IR) -> annotate (temps/constraints) -> allocate (registers) ->
 //! encode (bytes) -> exec (run it).
 //!
-//! `mix` is chosen because it is the largest thing the JIT currently compiles
-//! end to end: a numeric loop over twelve live integer accumulators, which puts
-//! real pressure on lowering, selection, and the register allocator without
-//! leaning on any op the backend declines.
+//! Two functions, because they measure different things:
+//!
+//!   * **`mix`** — twelve accumulators in one loop. It fits aarch64's twenty
+//!     integer registers with room to spare and spills nothing there, so it
+//!     measures the pipeline's cost on a function the allocator finds easy.
+//!   * **`mix2`** — twenty-eight accumulators, a nested loop, and a branch whose
+//!     arms write disjoint sets. It spills on every target (29 slots on aarch64,
+//!     44 on x86-64), so it is the one that moves when spilling or coalescing
+//!     changes. `exec` on it is the only runtime number here that responds to
+//!     reload traffic at all.
+//!
+//! The two are not comparable to each other — different functions doing different
+//! work. Each is a baseline for itself over time.
 
 use std::fs;
 
-use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use tcvm::Lua;
 use tcvm::bench_support;
 use tcvm::env::value::Value;
@@ -26,20 +35,28 @@ use tcvm::jit::ir::ty::{Rep, Ty, TypeSet};
 
 const INT: Ty = Ty::new(Rep::Val, TypeSet::INT);
 
-/// The compiled region's entry: `(thread, frame base) -> status word`. `mix`
-/// neither calls nor collects, so the thread pointer is unused.
+/// The compiled region's entry: `(thread, frame base) -> status word`. Neither
+/// function calls or collects, so the thread pointer is unused.
 type Region = extern "C" fn(*mut (), *mut Value<'static>) -> u64;
 
-/// How many loop iterations the `exec` benchmark drives `mix` through. Big
-/// enough that the steady-state loop, not the one-time entry, dominates.
+/// Loop iterations the `exec` benchmark drives each function through. Big enough
+/// that the steady-state loop, not the one-time entry, dominates. The same count
+/// for both, so each stays comparable with its own history — `mix2` does several
+/// times the work per iteration and is expected to be slower in absolute terms.
 const EXEC_N: i64 = 2000;
 
-fn jit_pipeline(c: &mut Criterion) {
-    let source = fs::read_to_string("test-files/mix.lua").expect("read mix.lua");
-    let mut group = c.benchmark_group("jit_pipeline");
+/// Every stage, for one function. `name` labels the benchmark; the prototype is
+/// the file's first nested function.
+fn bench_one(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    name: &str,
+) {
+    let path = format!("test-files/{name}.lua");
+    let source = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let id = |stage: &str| BenchmarkId::new(stage, name);
 
     // Stage 1 — parse. No arena needed, so it stands alone.
-    group.bench_function("parse", |b| {
+    group.bench_function(id("parse"), |b| {
         b.iter(|| black_box(bench_support::parse(black_box(&source))));
     });
 
@@ -51,7 +68,7 @@ fn jit_pipeline(c: &mut Criterion) {
         lua.load_all();
         let parsed = bench_support::parse(&source);
         let mut since_collect = 0u32;
-        group.bench_function("compile", |b| {
+        group.bench_function(id("compile"), |b| {
             b.iter(|| {
                 lua.enter(|ctx| {
                     let proto = bench_support::compile(ctx, black_box(&parsed)).expect("compile");
@@ -66,7 +83,7 @@ fn jit_pipeline(c: &mut Criterion) {
         });
     }
 
-    // Stages 3-7 all operate on the `mix` prototype. None of `lower`, `select`,
+    // Stages 3-7 all operate on the one prototype. None of `lower`, `select`,
     // `allocate`, or `encode` touches the arena, so they share one `enter` with no
     // growth — and each takes the previous stage's output, precomputed once here.
     let mut lua = Lua::new();
@@ -74,10 +91,10 @@ fn jit_pipeline(c: &mut Criterion) {
     let parsed = bench_support::parse(&source);
     lua.enter(|ctx| {
         let chunk = bench_support::compile(ctx, &parsed).expect("compile");
-        let mix = chunk.prototypes[0];
+        let proto = chunk.prototypes[0];
 
         let env = machine_env();
-        let func = lower(mix, 0, vec![INT]).expect("lower");
+        let func = lower(proto, 0, vec![INT]).expect("lower");
         let mut m = select(&func).expect("isel");
         annotate(&mut m);
         let ra = allocate(&m, &env).expect("regalloc");
@@ -87,29 +104,25 @@ fn jit_pipeline(c: &mut Criterion) {
         let mut stack = vec![Value::nil(); m.max_lua_reg as usize + 1];
 
         // Fail loudly rather than benchmark a deopt stub: confirm the region runs
-        // `mix(EXEC_N)` to a native return before timing it.
+        // to a native return before timing it.
         stack[0] = Value::integer(EXEC_N);
         let status = Status::unpack(region(std::ptr::null_mut(), stack.as_mut_ptr().cast()));
-        assert_eq!(
-            status,
-            Status::Return(1),
-            "exec benchmark must run natively"
-        );
+        assert_eq!(status, Status::Return(1), "{name}: exec must run natively");
 
         // Stage 3 — lower to IR.
-        group.bench_function("frontend::lower", |b| {
-            b.iter(|| black_box(lower(black_box(mix), 0, vec![INT]).expect("lower")));
+        group.bench_function(id("frontend::lower"), |b| {
+            b.iter(|| black_box(lower(black_box(proto), 0, vec![INT]).expect("lower")));
         });
 
         // Stage 4 — instruction selection.
-        group.bench_function("isel::select", |b| {
+        group.bench_function(id("isel::select"), |b| {
             b.iter(|| black_box(select(black_box(&func)).expect("isel")));
         });
 
         // Stage 5a — target annotation (temps + register constraints). It mutates
         // the MFunc in place and appends on each call, so it can't be re-run on one
         // function; every iteration anneals a fresh `select` output.
-        group.bench_function("target::annotate", |b| {
+        group.bench_function(id("target::annotate"), |b| {
             b.iter_batched_ref(
                 || select(&func).expect("isel"),
                 |m| annotate(black_box(m)),
@@ -118,13 +131,14 @@ fn jit_pipeline(c: &mut Criterion) {
         });
 
         // Stage 5b — register allocation. `allocate` reads `m` without mutating it,
-        // so the once-annotated `m` can be reused across iterations.
-        group.bench_function("regalloc::allocate", |b| {
+        // so the once-annotated `m` can be reused across iterations. This is the
+        // line that moves when coalescing or spilling changes.
+        group.bench_function(id("regalloc::allocate"), |b| {
             b.iter(|| black_box(allocate(black_box(&m), &env).expect("regalloc")));
         });
 
         // Stage 6 — encode to machine bytes.
-        group.bench_function("target::encode", |b| {
+        group.bench_function(id("target::encode"), |b| {
             b.iter(|| black_box(encode(black_box(&m), &func.pool, &ra).expect("encode")));
         });
 
@@ -132,9 +146,9 @@ fn jit_pipeline(c: &mut Criterion) {
         // stage feeding the next. This is the number to watch for end-to-end JIT
         // compile latency; the per-stage lines above only say where it went. All of
         // it is pure over the arena, so nothing needs sweeping between iterations.
-        group.bench_function("full (lower..encode)", |b| {
+        group.bench_function(id("full (lower..encode)"), |b| {
             b.iter(|| {
-                let func = lower(black_box(mix), 0, vec![INT]).expect("lower");
+                let func = lower(black_box(proto), 0, vec![INT]).expect("lower");
                 let mut m = select(&func).expect("isel");
                 annotate(&mut m);
                 let ra = allocate(&m, &env).expect("regalloc");
@@ -142,9 +156,9 @@ fn jit_pipeline(c: &mut Criterion) {
             });
         });
 
-        // Stage 7 — run the native code. `mix` reads its argument from R0 and
-        // writes the result back there, so only R0 is reset each iteration.
-        group.bench_function("exec", |b| {
+        // Stage 7 — run the native code. Both functions read their argument from R0
+        // and write the result back there, so only R0 is reset each iteration.
+        group.bench_function(id("exec"), |b| {
             b.iter(|| {
                 stack[0] = Value::integer(EXEC_N);
                 black_box(region(std::ptr::null_mut(), stack.as_mut_ptr().cast()))
@@ -154,7 +168,13 @@ fn jit_pipeline(c: &mut Criterion) {
         // Keep the executable mapping alive until every benchmark above has run.
         drop(code);
     });
+}
 
+fn jit_pipeline(c: &mut Criterion) {
+    let mut group = c.benchmark_group("jit_pipeline");
+    for name in ["mix", "mix2"] {
+        bench_one(&mut group, name);
+    }
     group.finish();
 }
 
