@@ -1,7 +1,9 @@
 # Plan: SSA-form register allocation with live-range splitting
 
-**Status: Stage 1 is done and measured. Splitting is the whole of what remains,
-and three separate things are now blocked on it.**
+**Status: Stages 1, 2, 2b done. The spilling yardstick now exists and the
+allocation interface is position-indexed. What remains is the spiller itself,
+and the decision is to take it straight from Braun09 rather than build
+Wimmer05's in-scan splitting first — see §2.**
 
 Papers are in `papers/` (gitignored) with a distilled algorithm crib sheet at
 `papers/NOTES.md` — pseudocode, measured numbers, and correctness traps. Read
@@ -67,6 +69,39 @@ makes resolution total. x86-64 no longer declines `mix2`.
 
 ---
 
+### Stage 2c — the spilling yardstick (`0e3ab0b`)
+
+`spillcost.rs` weights every memory operation by the loop depth of the block it
+lands in. This was §3's "missing dynamic reload metric", and it had to come first:
+Braun09's whole contribution is hoisting reloads out of loops, which leaves a
+static count unchanged while halving the executed one. Judged statically, the
+thing we are building looks like a no-op.
+
+Traffic comes from two disjoint places and both are counted — an `Edit` the
+allocator asked for, and an operand left at `Alloc::Spill`, which the encoder
+loads at the mention on its own (`aarch64::read_g`). Counting only edits misses 96
+of mix2's 157 loads.
+
+The counts are exact, not heuristic: mix2 reports 210 memory ops and `disasm_mix2`
+independently marks 210 `sp`-relative accesses, agreeing on loads and stores
+separately. Only the weighting is an estimate (`TRIP = 10` per nesting level).
+
+**Baseline:** is_prime 0, mix 0, **mix2 210 ops / weighted 1722, of which 1680
+(97.6%) is inside loops.** That last number is the target.
+
+### Stage 2d — position-indexed locations (`d60f1ad`)
+
+`loc: Vec<Option<Alloc>>` became a `Locations` table keyed by value *and*
+position. Callers must now say which mention they mean; one that has not been
+taught no longer compiles. Pure plumbing, verified neutral (mix2 210/1722
+unchanged, is_prime 57/0 unchanged).
+
+This is the precondition for everything below, and it is the *whole* of the
+interface change — the scan still assigns one location per value, so every entry
+starts at position 0.
+
+---
+
 ## 2. What is left, and why it is all one thing
 
 **Splitting.** The allocator assigns one location per value for its whole life. Three
@@ -99,17 +134,47 @@ less. Meanwhile resolution does *more* work under splitting, since a value split
 differently on two paths disagrees at every join, so the sequencer, cycle
 breaking and slot routing all get busier.
 
-### Then Braun–Hack
+### Decision: go straight to Braun–Hack, skip Wimmer05's splitting scan
 
-Once pressure can be lowered to *k* by splitting, Braun09's decoupled spilling
-decides *where* the splits go: global next-use analysis with loop-exit edge
-lengths (M ≈ 100000), loop-aware `W_entry` so reloads hoist out of loops, and
-coupling code on edges. Their −54.5% executed-reloads figure is measured against
-precisely the situation `mix2` is in now.
+Taken deliberately, and it contradicts an earlier version of this file which had
+Wimmer05's splitting scan as Stage 3 with Braun09 layered on top. NOTES.md §4 had
+it right: *"C subsumes most of Wimmer05's spill machinery. If C is the
+destination, build the minimum viable spiller in B."*
 
-Note the tension: Stage 1's win came from *deleting* a dataflow fixpoint, and
-Braun09 reintroduces one (richer, over `Var → N ∪ {∞}`). Neither paper measures
-the combination. Benchmark it; do not assume it.
+Under Braun09 the spiller runs **before** assignment and lowers max pressure to
+*k* everywhere; on SSA form register demand then equals max pressure, so the scan
+provably never spills again. That makes ALLOCATEBLOCKEDREG's whole apparatus —
+`nextUsePos`, spill-current-itself, loop pseudo-uses, out-of-loop split positions
+— dead weight the day it lands. They are all approximations of what the Belady
+pass does exactly.
+
+So the scan never needs to split. It only ever *colors already-split intervals*,
+which is a much smaller change than Stage 3 was.
+
+### Two things reading the paper changed (the crib sheet compressed them)
+
+- **§4.4's SSA reconstruction drops out entirely for us.** The paper inserts real
+  reload *instructions*, which is a second definition of `x0`, which breaks SSA and
+  forces a Sastry & Ju dominance-tree walk with lazy φ insertion (their Fig. 4).
+  We cannot mutate the IR and do not want to: a reload here is an `Edit` and a
+  split is an interval split, so there is never a second *definition*, only a
+  second *location*. `Locations::get(v, p)` answers the exact question SSA
+  reconstruction exists to answer. This is the payoff of the interface being
+  per-operand rather than per-vreg.
+- **§4.4's input requirement is real, and §4 below files it as optional.** The
+  paper *demands* conventional SSA — every φ-congruence class interference-free —
+  so a class shares one spill slot, "else spilled φ-functions result in memory
+  copy instructions". That is the "spill-slot coalescing" bullet in §4. Under
+  Braun09 it is a **precondition**, not a nicety: without it every spilled block
+  parameter degenerates into exactly the stack-to-stack moves that `resolve_edges`'
+  bounce exists to paper over.
+
+### The remaining tension
+
+Stage 1's win came from *deleting* a dataflow fixpoint, and Braun09 reintroduces
+one (richer, over `Var → N ∪ {∞}`). Neither paper measures the combination.
+Benchmark it; do not assume it. Braun09 reports 430 instructions/ms for the
+spilling phase alone and never measures a whole allocator against linear scan.
 
 ---
 
@@ -123,12 +188,11 @@ the combination. Benchmark it; do not assume it.
   slots on aarch64, 44 on x86-64. This is the case that measures splitting.
 - **`benches/jit_pipeline.rs`** — per-stage compile time on `mix`.
 - **`asm_dump`** — reg-reg move density on `is_prime` (aarch64 only).
-
-**Missing: a dynamic reload metric.** Static spill counts cannot see Braun09's
-central claim, which is about how often a reload *executes* — their loop-hoisting
-wins are invisible statically. They counted with marked NOPs under Valgrind; the
-cheap equivalent here is to weight edits by loop depth, or instrument the encoder
-to count. Decide this before Stage 3, because it is the yardstick for all of it.
+- **`spillcost.rs`** — loop-depth-weighted spill traffic, the spilling yardstick.
+  Run `cargo test --lib asm_dump::spill_traffic -- --nocapture` before and after
+  any change to spill policy. **Judge by `weighted in loops`, not by the op
+  count**: a successful hoist moves a reload out of a loop without deleting it, so
+  the static count can hold still or rise while the real cost falls tenfold.
 
 ---
 
@@ -138,10 +202,12 @@ to count. Decide this before Stage 3, because it is the yardstick for all of it.
   branches on `is_prime` (55 → 57) because placement is driven by contiguity, not
   fallthrough. Wimmer05 §2.1 accepts this trade for locality. Recovering it is a
   greedy chain-formation pass, not a tweak — real work for 2 instructions.
-- **Spill-slot coalescing.** Non-merged spilled values each take a fresh slot
-  (`spills += 1`). Giving a parameter and its argument the same slot when their
-  ranges do not overlap would cut both the slot count and the slot-to-slot moves
-  the bounce exists for (Wimmer10 §6 does exactly this).
+- **Spill-slot coalescing — promoted out of this section.** Non-merged spilled
+  values each take a fresh slot (`spills += 1`). Giving a parameter and its
+  argument the same slot when their ranges do not overlap would cut both the slot
+  count and the slot-to-slot moves the bounce exists for (Wimmer10 §6 does exactly
+  this). **This is no longer optional:** Braun09 §4.4 requires it as an input
+  condition. See §2.
 - **`MInst` allocation traffic.** Each instruction holds four `Vec`s and `defs`/
   `uses` always allocate. This was most of Stage 1's isel win; a `SmallVec` or a
   flat operand arena would attack the same cost across the whole MIR. Unprofiled.
