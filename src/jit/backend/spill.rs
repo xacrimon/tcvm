@@ -124,6 +124,55 @@ impl SpillPlan {
     }
 }
 
+impl SpillPlan {
+    /// Per value, the maximal runs of the doubled position axis over which the plan
+    /// keeps it in a register.
+    ///
+    /// This is the plan in the form the scan wants. Where liveness gives one
+    /// interval per value spanning its whole life, this gives one per stretch that
+    /// the value actually spends in a register — several per value, with the gaps
+    /// between them spent in a stack slot. Colouring these rather than the live
+    /// ranges *is* live-range splitting.
+    ///
+    /// The axis matches [`super::regalloc::allocate`]: instruction `i` reads at
+    /// `2·pos[i]` and writes at `2·pos[i] + 1`, so a run that ends where another
+    /// begins does not overlap it.
+    ///
+    /// Because `|W| ≤ k` at every point, at most `k` of these runs cover any one
+    /// position — which is exactly the condition under which a linear scan cannot
+    /// run out of registers.
+    pub fn register_runs(
+        &self,
+        f: &impl RegallocFunc,
+        order: &[Block],
+        pos: &[Inst],
+        num_vregs: usize,
+    ) -> Vec<Vec<(u32, u32)>> {
+        let mut runs: Vec<Vec<(u32, u32)>> = vec![Vec::new(); num_vregs];
+        let extend = |runs: &mut Vec<Vec<(u32, u32)>>, v: VReg, at: u32| {
+            let r = &mut runs[v.0 as usize];
+            match r.last_mut() {
+                // Positions arrive in increasing order, so a run continues exactly
+                // when the previous one ended where this slot begins.
+                Some(last) if last.1 == at => last.1 = at + 1,
+                _ => r.push((at, at + 1)),
+            }
+        };
+        for &b in order {
+            for &i in f.block_insts(b) {
+                let p = pos[i] as u32;
+                for &v in &self.w_use[i] {
+                    extend(&mut runs, v, p * 2);
+                }
+                for &v in &self.w_after[i] {
+                    extend(&mut runs, v, p * 2 + 1);
+                }
+            }
+        }
+        runs
+    }
+}
+
 /// Distances from each point in a block to the next use of each value.
 ///
 /// `d[j][v]` is measured from just before the block's `j`th instruction, and
@@ -1116,6 +1165,53 @@ mod tests {
                              does not have it in one afterwards",
                             o.vreg.0
                         );
+                    }
+                }
+
+                // The runs the scan will colour, and the premise it rests on: at
+                // most `k` of them cover any one position. If that holds, a linear
+                // scan over them provably cannot run out of registers, which is the
+                // whole reason the spilling decision was pulled out in front.
+                {
+                    let mut posn = vec![0usize; m.num_insts()];
+                    let mut n = 0usize;
+                    for &b in &layout.order {
+                        for &i in m.block_insts(b) {
+                            posn[i] = n;
+                            n += 1;
+                        }
+                    }
+                    let runs = plan.register_runs(&m, &layout.order, &posn, m.num_vregs());
+
+                    for class in RegClass::ALL {
+                        let k = env.order(class).len();
+                        let mut cover = vec![0u32; n * 2 + 2];
+                        for (v, rs) in runs.iter().enumerate() {
+                            if m.class(VReg(v as u32)) != class {
+                                continue;
+                            }
+                            for &(lo, hi) in rs {
+                                for c in cover.iter_mut().take(hi as usize).skip(lo as usize) {
+                                    *c += 1;
+                                }
+                            }
+                        }
+                        if let Some((at, &worst)) = cover.iter().enumerate().max_by_key(|&(_, c)| c)
+                        {
+                            assert!(
+                                worst as usize <= k,
+                                "{file}: {worst} {class:?} runs cover position {at}, \
+                                 k = {k} — the scan could not colour this"
+                            );
+                        }
+                    }
+
+                    // A run must be inside the value's live range, or the scan would
+                    // be reserving a register for a value that does not exist yet.
+                    for (v, rs) in runs.iter().enumerate() {
+                        for &(lo, hi) in rs {
+                            assert!(lo < hi, "{file}: v{v} has an empty run");
+                        }
                     }
                 }
 
