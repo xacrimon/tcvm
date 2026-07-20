@@ -111,9 +111,15 @@ Algorithm 2, coupling code on edges.
 
 | target | | plan | today | Δ ops | Δ weighted |
 |---|---|---|---|---|---|
-| x86-64 (13 regs) | mix | 38 (w 344) | 69 (w 483) | **−45%** | **−29%** |
-| x86-64 (13 regs) | mix2 | 281 (w 2189) | 330 (w 2715) | **−15%** | **−19%** |
-| aarch64 (20 regs) | mix2 | 194 (w 1589) | 210 (w 1722) | **−8%** | **−8%** |
+| x86-64 (13 regs) | mix | 26 (w 224) | 69 (w 483) | **−62%** | **−54%** |
+| x86-64 (13 regs) | mix2 | 278 (w 2159) | 330 (w 2715) | **−16%** | **−20%** |
+| aarch64 (20 regs) | mix2 | 182 (w 1469) | 210 (w 1722) | **−13%** | **−15%** |
+
+**These include the in-place loads the plan implies**, and must. Leaving an `Any`
+operand out of registers does not make its load disappear — the encoder reads it
+from its slot at the mention. Counting only the plan's own reloads and stores gives
+mix2 −61% weighted, which is an accounting artifact: today's figure counts those
+96 in-place loads and the plan's would not have.
 
 **Read the two targets together, not separately.** The benefit scales with
 pressure, which is the shape Braun09's own setup implies — they measured on x86
@@ -125,8 +131,8 @@ roughly twice the win.
 agreeing with an allocator that reached the same answer by an entirely different
 route. That is the strongest correctness signal available short of wiring it in.
 
-**Three things the papers get wrong or leave out**, all found by property tests or
-by a number that did not fit, none by reading the code:
+**Four things the papers get wrong or do not apply here**, all found by property
+tests or by a number that did not fit, none by reading the code:
 
 - §4.3's two coupling rules do not cover a value the predecessor held in a
   register, still live, that the successor has no room for. It leaves registers at
@@ -142,6 +148,14 @@ by a number that did not fit, none by reading the code:
   exists to prevent. Their footnote 6 concedes the estimate "might be an
   under-approximation". Keeping back the loop's widest instruction fixes it and is
   worth 170 weighted on mix2, the difference between −8% and +2% on aarch64.
+
+- Braun09 assumes a load/store architecture where "each instruction requires that
+  its operands are available in registers" (§2). We have `Any` operands read
+  straight from a slot, and mix2's deopt stub takes 35 operands, 34 of them `Any` —
+  it names the whole VM state so an exit can rebuild an interpreter frame. Treating
+  those as register operands asks for 34 registers on a 20-register machine. Only
+  register-demanding operands may drive spilling; this was worth roughly half the
+  total win on both targets.
 
 **The invariant that found most of the bugs**: *nothing is reloaded that was never
 stored*. Zero stores against fifty reloads is incoherent on its face, and three
