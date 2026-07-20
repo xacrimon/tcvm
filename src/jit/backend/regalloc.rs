@@ -725,6 +725,34 @@ type EvictKey = (std::cmp::Reverse<u32>, bool, u32);
 /// fit the register file: it declines only when one instruction cannot (see
 /// [`RegallocError::OutOfRegisters`]).
 pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, RegallocError> {
+    allocate_with(f, env, None)
+}
+
+/// Which values a spiller decided are in registers at each instruction.
+///
+/// Position-independent on purpose. The obvious alternative — handing the
+/// allocator ready-made intervals on the doubled axis — requires the spiller to
+/// number positions exactly as [`allocate_with`] does, and nothing would catch the
+/// two drifting apart. Per-instruction sets cannot drift: the allocator derives the
+/// runs itself, from its own numbering.
+#[derive(Clone, Copy)]
+pub struct RegisterSets<'a> {
+    /// Values in registers as each instruction reads it.
+    pub w_use: &'a [Vec<VReg>],
+    /// Values in registers as each instruction leaves it.
+    pub w_after: &'a [Vec<VReg>],
+}
+
+/// [`allocate`], optionally taking a spiller's decisions instead of making its own.
+///
+/// With `sets`, register pressure has already been lowered to the size of the
+/// register file everywhere, so the scan colours pre-split runs and never has to
+/// spill — see [`allocate_presplit`]. Without, it runs the whole-value scan below.
+pub fn allocate_with(
+    f: &impl RegallocFunc,
+    env: &MachineEnv,
+    sets: Option<RegisterSets<'_>>,
+) -> Result<Allocation, RegallocError> {
     reject_unsupported(f)?;
 
     let order = f.block_order();
@@ -739,6 +767,10 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
             p += 1;
         }
         span[b.0 as usize] = (start, p);
+    }
+
+    if let Some(sets) = sets {
+        return allocate_presplit(f, env, &order, &pos, &span, sets);
     }
 
     let raw = build_intervals(f, &order, &pos, &span);
@@ -1408,6 +1440,391 @@ pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, R
             &pos,
             &ranges,
             &span,
+            &locs,
+            &remat_spilled,
+            &remat_src,
+            &mut spills,
+            &mut b,
+        )?;
+    }
+
+    Ok(b.finish(spills))
+}
+
+/// Colour pre-split runs, for a function whose register pressure a spiller has
+/// already brought within the register file.
+///
+/// The scan here is the whole-value one with its hardest part removed. Because at
+/// most `k` runs cover any position, a free register always exists, so there is no
+/// eviction heuristic, no spill-versus-evict decision, and no retroactive
+/// re-spilling of an interval already placed. What is left is: walk runs by start,
+/// retire the ones that have ended, take a register.
+///
+/// Runs are contiguous by construction, so there is no `inactive` list either — a
+/// run either covers the current position or is finished. That is the difference
+/// between splitting *during* the scan and splitting before it: holes become
+/// separate intervals rather than gaps to reason about.
+fn allocate_presplit(
+    f: &impl RegallocFunc,
+    env: &MachineEnv,
+    order: &[Block],
+    pos: &[u32],
+    span: &[(u32, u32)],
+    sets: RegisterSets<'_>,
+) -> Result<Allocation, RegallocError> {
+    let nv = f.num_vregs();
+
+    // The runs to colour: maximal stretches of the doubled axis over which the
+    // spiller keeps a value in a register. Positions are visited in increasing
+    // order, so a run continues exactly when the previous slot ended where this one
+    // begins.
+    let mut runs: Vec<Vec<(u32, u32)>> = vec![Vec::new(); nv];
+    let mark = |runs: &mut Vec<Vec<(u32, u32)>>, v: VReg, at: u32| {
+        let r = &mut runs[v.0 as usize];
+        match r.last_mut() {
+            Some(last) if last.1 == at => last.1 = at + 1,
+            _ => r.push((at, at + 1)),
+        }
+    };
+    for &b in order {
+        for &i in f.block_insts(b) {
+            let p = pos[i];
+            for &v in &sets.w_use[i] {
+                mark(&mut runs, v, p * 2);
+            }
+            // A temp is scratch belonging to this instruction, not a value that
+            // flows between them, so no spiller tracks it — but it still needs a
+            // register here. It spans the whole instruction slot, as in
+            // `build_intervals`, so it collides with every operand and with the
+            // other temps and lands somewhere of its own. The spiller reserved the
+            // room: temps are counted in the `k - |defs|` limit.
+            for o in f.temps(i) {
+                mark(&mut runs, o.vreg, p * 2);
+                mark(&mut runs, o.vreg, p * 2 + 1);
+            }
+            for &v in &sets.w_after[i] {
+                mark(&mut runs, v, p * 2 + 1);
+            }
+        }
+    }
+
+    // Full live ranges as well: edge resolution needs to know which registers hold
+    // a live value at a branch, which is a question about liveness, not about where
+    // the spiller chose to keep things.
+    let live: Vec<Vec<(u32, u32)>> = build_intervals(f, order, pos, span)
+        .into_iter()
+        .map(merge_ranges)
+        .collect();
+
+    // A register a `Fixed` operand claims, or an instruction destroys, is not
+    // available to anything live across that instruction. Same treatment as the
+    // whole-value scan: reserved for the length of the instruction's slot.
+    let mut clobbers: Vec<(u32, PReg)> = Vec::new();
+    for (i, &p) in pos.iter().enumerate() {
+        let lo = p * 2;
+        for &r in f.clobbers(i) {
+            clobbers.push((lo, r));
+        }
+        for o in f.defs(i).iter().chain(f.uses(i)) {
+            if let Constraint::Fixed(r) = o.constraint {
+                clobbers.push((lo, r));
+            }
+        }
+    }
+
+    // Copy affinities, as in the whole-value scan: a two-address result wants the
+    // register of the input it overwrites.
+    let mut affin: HashMap<VReg, Vec<VReg>, RandomState> = HashMap::default();
+    for i in 0..f.num_insts() {
+        for o in f.defs(i) {
+            if let Constraint::Reuse(uk) = o.constraint {
+                let src = f.uses(i)[uk].vreg;
+                affin.entry(o.vreg).or_default().push(src);
+                affin.entry(src).or_default().push(o.vreg);
+            }
+        }
+    }
+
+    let mut all_reg = vec![true; nv];
+    for i in 0..f.num_insts() {
+        for o in f.defs(i).iter().chain(f.uses(i)) {
+            if o.constraint != Constraint::Reg {
+                all_reg[o.vreg.0 as usize] = false;
+            }
+        }
+    }
+    let remat_src: Vec<Option<Inst>> = (0..nv as u32)
+        .map(|v| f.remat(VReg(v)).filter(|_| all_reg[v as usize]))
+        .collect();
+
+    // --- colour the runs ----------------------------------------------------
+
+    // `(value, run)` pairs, and the register each is given.
+    let mut iv: Vec<(VReg, (u32, u32))> = Vec::new();
+    for (v, rs) in runs.iter().enumerate() {
+        for &r in rs {
+            iv.push((VReg(v as u32), r));
+        }
+    }
+    iv.sort_by_key(|&(v, (lo, hi))| (lo, hi, v.0));
+    let mut iv_reg: Vec<Option<PReg>> = vec![None; iv.len()];
+
+    for class in RegClass::ALL {
+        let pool = env.order(class);
+        if pool.is_empty() {
+            continue;
+        }
+        let ridx = |r: PReg| pool.iter().position(|&x| x == r);
+
+        let mine: Vec<usize> = (0..iv.len())
+            .filter(|&x| f.class(iv[x].0) == class)
+            .collect();
+
+        let mut active: Vec<usize> = Vec::new();
+        for &cur in &mine {
+            let (v, (lo, hi)) = iv[cur];
+            active.retain(|&a| iv[a].1.1 > lo);
+
+            let mut busy = vec![false; pool.len()];
+            for &a in &active {
+                if let Some(r) = iv_reg[a]
+                    && let Some(k) = ridx(r)
+                {
+                    busy[k] = true;
+                }
+            }
+            for &(cl, r) in &clobbers {
+                if r.class() == class
+                    && ((lo <= cl && cl < hi) || (lo <= cl + 1 && cl + 1 < hi))
+                    && let Some(k) = ridx(r)
+                {
+                    busy[k] = true;
+                }
+            }
+
+            // A copy partner's register first, then the target's preference, then
+            // first fit. Unlike the whole-value scan there is no fallback to
+            // spilling: the spiller has already guaranteed one of these lands.
+            let mut chosen = affin.get(&v).and_then(|parts| {
+                parts.iter().find_map(|pv| {
+                    iv.iter()
+                        .zip(&iv_reg)
+                        .find(|((w, (a, b)), _)| *w == *pv && *a <= lo && lo < *b)
+                        .and_then(|(_, r)| *r)
+                        .and_then(ridx)
+                        .filter(|&k| !busy[k])
+                })
+            });
+            if chosen.is_none()
+                && let Some(r) = f.phys_hint(v)
+            {
+                chosen = ridx(r).filter(|&k| !busy[k]);
+            }
+            if chosen.is_none() {
+                chosen = (0..pool.len()).find(|&k| !busy[k]);
+            }
+
+            let Some(k) = chosen else {
+                // Only reachable if clobbers took the register file below what the
+                // spiller was told it had; the spiller does not model them.
+                return Err(RegallocError::OutOfRegisters);
+            };
+            iv_reg[cur] = Some(pool[k]);
+            active.push(cur);
+        }
+    }
+
+    // --- slots, locations, and the edits between them ------------------------
+
+    // Runs per value, in position order, with the register each got.
+    let mut placed: Vec<Vec<((u32, u32), PReg)>> = vec![Vec::new(); nv];
+    for (x, &(v, r)) in iv.iter().enumerate() {
+        if let Some(reg) = iv_reg[x] {
+            placed[v.0 as usize].push((r, reg));
+        }
+    }
+    for p in placed.iter_mut() {
+        p.sort_by_key(|&((lo, _), _)| lo);
+    }
+
+    // A value needs a slot when it is ever live without being in a register — that
+    // memory has to exist for it. A rematerializable value never needs one: it is
+    // replayed rather than loaded.
+    //
+    // The test is per position, not a comparison of totals. Totals lie: a value
+    // stays in `W` after its last use until something evicts it, so its runs can
+    // reach past the end of its live range, and a run overhanging one end can
+    // exactly offset a genuine gap in the middle. That reads as "fully covered",
+    // no slot is allocated, no reload is emitted, and the register is read having
+    // never been written.
+    let mut spills = 0u32;
+    let mut slot: Vec<Option<u32>> = vec![None; nv];
+    for v in 0..nv {
+        if live[v].is_empty() || remat_src[v].is_some() {
+            continue;
+        }
+        let gap = live[v].iter().any(|&(lo, hi)| {
+            (lo..hi).any(|q| !placed[v].iter().any(|&((a, b), _)| a <= q && q < b))
+        });
+        // More than one run means the value left registers between them, whether or
+        // not the gap shows up as un-covered liveness.
+        if gap || placed[v].len() > 1 {
+            slot[v] = Some(spills);
+            spills += 1;
+        }
+    }
+
+    let mut locs = Locations::new(nv);
+    for v in 0..nv {
+        let vr = VReg(v as u32);
+        let home = slot[v].map(Alloc::Spill);
+        match placed[v].first() {
+            // Never in a register: it lives in its slot, or is replayed.
+            None => {
+                if let Some(h) = home {
+                    locs.put(vr, 0, h);
+                }
+            }
+            Some(&(_, first_reg)) => {
+                // From position 0 rather than from the run's start, so a query before
+                // the value is live still answers — the whole-value scan behaved the
+                // same way and edge resolution relies on it.
+                locs.put(vr, 0, Alloc::Reg(first_reg));
+                let mut prev_end = placed[v][0].0.1;
+                for &((lo, hi), reg) in &placed[v][1..] {
+                    if let Some(h) = home {
+                        locs.put(vr, prev_end, h);
+                    }
+                    locs.put(vr, lo, Alloc::Reg(reg));
+                    prev_end = hi;
+                }
+                if let Some(h) = home {
+                    locs.put(vr, prev_end, h);
+                }
+            }
+        }
+    }
+
+    let mut b = AllocationBuilder::new(f);
+    for (i, &p) in pos.iter().enumerate() {
+        for (k, o) in f.defs(i).iter().enumerate() {
+            if let Some(a) = locs.get(o.vreg, p * 2 + 1) {
+                b.set_def(i, k, a);
+            }
+        }
+        for (k, o) in f.uses(i).iter().enumerate() {
+            if let Some(a) = locs.get(o.vreg, p * 2) {
+                b.set_use(i, k, a);
+            }
+        }
+        for (k, o) in f.temps(i).iter().enumerate() {
+            if let Some(a) = locs.get(o.vreg, p * 2 + 1) {
+                b.set_temp(i, k, a);
+            }
+        }
+    }
+
+    // --- the edits that make a split real -----------------------------------
+    //
+    // Where the value is defined, and where it enters its first register. Every
+    // *other* run begins with the value coming back from memory, which is a reload;
+    // the run holding the definition begins with the definition itself.
+    let mut def_at: Vec<Option<u32>> = vec![None; nv];
+    for (i, &p) in pos.iter().enumerate() {
+        for o in f.defs(i) {
+            def_at[o.vreg.0 as usize] = Some(p * 2 + 1);
+        }
+    }
+    for &blk in order {
+        for &prm in f.block_params(blk) {
+            def_at[prm.0 as usize] = Some(span[blk.0 as usize].0 * 2);
+        }
+    }
+
+    // Instruction at each position, to turn a run boundary back into a program
+    // point.
+    let mut at_pos = vec![0usize; pos.len()];
+    for (i, &p) in pos.iter().enumerate() {
+        at_pos[p as usize] = i;
+    }
+
+    for v in 0..nv {
+        let vr = VReg(v as u32);
+        let class = f.class(vr);
+        let born = def_at[v];
+        for (n, &((lo, _), reg)) in placed[v].iter().enumerate() {
+            // The run the value is born in needs nothing: the definition puts it
+            // there. Nor does the very first run of a value with no definition of
+            // its own — an entry argument arrives in place.
+            let is_birth = born.is_some_and(|d| placed[v][n].0.0 <= d && d < placed[v][n].0.1);
+            if is_birth || (born.is_none() && n == 0) {
+                continue;
+            }
+            let inst = at_pos[(lo / 2) as usize];
+            if let Some(src) = remat_src[v] {
+                // Cheaper to recompute than to have kept it anywhere.
+                b.edit(
+                    ProgPoint::before(inst),
+                    Edit::Remat {
+                        val: vr,
+                        src,
+                        to: reg,
+                    },
+                );
+            } else if let Some(sl) = slot[v] {
+                b.edit(
+                    ProgPoint::before(inst),
+                    Edit::Move(Move {
+                        from: Alloc::Spill(sl),
+                        to: Alloc::Reg(reg),
+                        class,
+                    }),
+                );
+            }
+        }
+
+        // One store, immediately after the definition — Wimmer05 §4c's spill-store
+        // elimination, which is exact rather than heuristic here: SSA gives the
+        // value a single definition, so the slot's contents never go stale and every
+        // later store would be writing what is already there.
+        if let (Some(sl), Some(d)) = (slot[v], born)
+            && let Some(&(_, reg)) = placed[v].iter().find(|&&((lo, hi), _)| lo <= d && d < hi)
+        {
+            let store = Edit::Move(Move {
+                from: Alloc::Reg(reg),
+                to: Alloc::Spill(sl),
+                class,
+            });
+            match f
+                .defs(at_pos[(d / 2) as usize])
+                .iter()
+                .any(|o| o.vreg == vr)
+            {
+                true => b.edit(ProgPoint::after(at_pos[(d / 2) as usize]), store),
+                // A block parameter has no defining instruction; it is delivered by
+                // the edge, so the store goes at the top of its own block.
+                false => b.edit(ProgPoint::before(at_pos[(d / 2) as usize]), store),
+            }
+        }
+    }
+
+    if f.has_block_params() {
+        for &blk in order {
+            let entry = span[blk.0 as usize].0 * 2;
+            for (k, &prm) in f.block_params(blk).iter().enumerate() {
+                if let Some(a) = locs.get(prm, entry) {
+                    b.set_block_param(blk, k, a);
+                }
+            }
+        }
+        let remat_spilled = vec![false; nv];
+        resolve_edges(
+            f,
+            env,
+            order,
+            pos,
+            &live,
+            span,
             &locs,
             &remat_spilled,
             &remat_src,

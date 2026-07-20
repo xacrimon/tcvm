@@ -305,8 +305,18 @@ fn min_algorithm(
             }
         }
 
-        // Room for the operands, measured from this instruction...
-        limit(f, w, s, dist, j, k, i, plan);
+        // Room for the operands, measured from this instruction — less whatever the
+        // temps need. A temp is scratch that spans the *whole* instruction, so it
+        // cannot share with an operand that dies here, and the register it occupies
+        // is unavailable from the read onwards rather than only from the write.
+        // Reserving it at the write alone leaves the read point one over `k`, and
+        // the scan then has nowhere to put it.
+        let ntemps = f
+            .temps(i)
+            .iter()
+            .filter(|o| f.class(o.vreg) == class)
+            .count();
+        limit(f, w, s, dist, j, k.saturating_sub(ntemps), i, plan);
 
         // ...then room for the results, measured from the *next* instruction,
         // because once this one writes its results its own operands stop mattering.
@@ -742,6 +752,83 @@ fn couple(
 
 #[cfg(test)]
 mod tests {
+    /// End to end: hand the spiller's decisions to the allocator and check the
+    /// result with the symbolic verifier, which knows nothing about how the
+    /// allocation was produced. This is the test that says whether splitting
+    /// actually works, as opposed to whether the plan is sensible.
+    #[test]
+    fn a_split_allocation_verifies() {
+        for (file, chunk) in [("primes", "primes"), ("mix", "mix")] {
+            check_split(file, chunk);
+        }
+    }
+
+    /// `mix2` needs edge resolution over every value live across an edge, not just
+    /// block parameters. See [`check_split`].
+    #[test]
+    #[ignore = "needs resolve_edges extended past block parameters; see check_split"]
+    fn a_split_allocation_verifies_on_mix2() {
+        check_split("mix2", "mix2");
+    }
+
+    /// Allocate `file` from the spiller's decisions and put the result through the
+    /// symbolic verifier, which knows nothing about how the allocation was made.
+    ///
+    /// # The one thing still missing
+    ///
+    /// `resolve_edges` walks an edge's arguments against its successor's parameters
+    /// and nothing else. Without splitting that is complete: every other value has a
+    /// single location for its whole life, so the two ends of an edge agree by
+    /// construction and there is nothing to reconcile. With splitting it is not —
+    /// Wimmer10 Fig. 7 resolves *every* interval live at the successor's entry,
+    /// because a value split differently on two paths disagrees at the join like any
+    /// parameter would.
+    ///
+    /// It shows up as a register read that was never written. Runs are built over
+    /// the linearized position axis, so one can span from the end of one block into
+    /// the next merely because they are adjacent *in layout*; resolution then sees
+    /// the same register at both ends of the real edge, emits nothing, and on the
+    /// path actually taken nothing ever put the value there. Runs have to be clipped
+    /// to block boundaries and the reconciliation left to resolution — which is the
+    /// work above.
+    ///
+    /// `primes` and `mix` pass because neither splits a value across a join.
+    fn check_split(file: &str, chunk: &str) {
+        use crate::Lua;
+        use crate::jit::backend::isel::select;
+        use crate::jit::backend::regalloc::{RegisterSets, allocate_with, verify};
+        use crate::jit::backend::target::{annotate, machine_env};
+        use crate::jit::backend::{nextuse, order};
+        use crate::jit::frontend::lower::lower;
+        use crate::jit::ir::ty::{Rep, Ty, TypeSet};
+
+        const INT: Ty = Ty::new(Rep::Val, TypeSet::INT);
+
+        let source = std::fs::read_to_string(format!("test-files/{file}.lua")).unwrap();
+        let mut lua = Lua::new();
+        lua.load_all();
+        lua.enter(|ctx| {
+            let c = ctx.load(&source, Some(chunk)).expect("compile");
+            let proto = c.as_lua().expect("lua closure").proto.prototypes[0];
+            let func = lower(proto, 0, vec![INT]).expect("lower");
+            let mut m = select(&func).expect("isel");
+            annotate(&mut m);
+
+            let env = machine_env();
+            let layout = order::compute(&m).expect("reducible");
+            let nu = nextuse::analyze(&m, &layout);
+            let p = plan(&m, &layout, &nu, &env);
+
+            let sets = RegisterSets {
+                w_use: &p.w_use,
+                w_after: &p.w_after,
+            };
+            let ra = allocate_with(&m, &env, Some(sets))
+                .unwrap_or_else(|e| panic!("{file}: split allocation declined: {e:?}"));
+            verify(&m, &ra).unwrap_or_else(|e| panic!("{file}: {e}"));
+        });
+    }
+
     use super::*;
     use crate::jit::backend::nextuse;
     use crate::jit::backend::order;
