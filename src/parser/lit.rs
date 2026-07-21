@@ -6,12 +6,21 @@ pub fn parse_int(s: &str) -> Result<i64, ParseIntError> {
     s.parse()
 }
 
-pub fn parse_hex_int(s: &str) -> Result<i64, ParseIntError> {
+// Hex integer literals wrap mod 2^64 per Lua 5.5 lexical conventions, so fold
+// digit-by-digit ignoring overflow (matching `luaO_hexavalue`) rather than
+// `from_str_radix`, which would reject >16 digits instead of keeping the low 64.
+pub fn parse_hex_int(s: &str) -> i64 {
     let s = s
         .strip_prefix("0x")
         .or_else(|| s.strip_prefix("0X"))
         .unwrap_or(s);
-    i64::from_str_radix(s, 16)
+    let mut acc: u64 = 0;
+    for ch in s.chars() {
+        // The HexInt lexer regex guarantees every digit is valid hex.
+        let digit = ch.to_digit(16).expect("hex literal has only hex digits");
+        acc = acc.wrapping_mul(16).wrapping_add(digit as u64);
+    }
+    acc as i64
 }
 
 pub fn parse_float(s: &str) -> Result<f64, ParseFloatError> {
@@ -206,10 +215,34 @@ fn utf8_encode(dst: &mut Vec<u8>, cp: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_string;
+    use super::{parse_hex_int, parse_int, parse_string};
 
     fn parse(s: &str) -> Vec<u8> {
         super::parse_string(s).expect("well-formed literal")
+    }
+
+    // Hex int literals wrap mod 2^64; >16 digits keep the low 64 bits.
+    // Values cross-checked against lua 5.5.0.
+    #[test]
+    fn hex_int_wraps_mod_2_64() {
+        assert_eq!(parse_hex_int("0xff"), 255);
+        assert_eq!(parse_hex_int("0x7fffffffffffffff"), i64::MAX);
+        assert_eq!(parse_hex_int("0x8000000000000000"), i64::MIN);
+        assert_eq!(parse_hex_int("0xffffffffffffffff"), -1);
+        assert_eq!(parse_hex_int("0x10000000000000000"), 0); // 2^64 -> 0
+        assert_eq!(parse_hex_int("0xffffffffffffffffff"), -1); // >16 digits
+    }
+
+    // A decimal int at the i64 boundary stays integer; one past it overflows
+    // (the caller then reparses it as a float).
+    #[test]
+    fn decimal_int_boundary_and_overflow() {
+        assert_eq!(parse_int("9223372036854775807"), Ok(i64::MAX));
+        assert!(parse_int("9223372036854775808").is_err());
+        assert_eq!(
+            super::parse_float("9223372036854775808"),
+            Ok(9223372036854775808.0)
+        );
     }
 
     // `parse_string` expects the surrounding quotes; the raw strings below are
