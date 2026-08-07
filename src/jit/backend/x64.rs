@@ -160,6 +160,35 @@ fn temp_classes(op: MOp) -> &'static [RegClass] {
     }
 }
 
+/// Extra temps for an exit-carrying op whose stub could otherwise find no
+/// scratch — the aarch64 rule (`aarch64::stub_temps`), with x86-64's extra xmm:
+/// `stub_scratch` here needs two general registers *and* one float register
+/// clear of the guard's keepalives. Hunting without a reservation worked while
+/// whole-value spilling left slack; the split path deliberately fills the file
+/// at a guard and leaves none. Small guards pay nothing.
+fn stub_temps(m: &MFunc, i: usize) -> &'static [RegClass] {
+    let inst = &m.insts[i];
+    let exits = matches!(
+        inst.op,
+        MOp::GuardCmp { .. } | MOp::GuardCmpImm { .. } | MOp::GuardNz { .. } | MOp::ExitTo(_)
+    );
+    if !exits {
+        return &[];
+    }
+    let ints = inst
+        .uses
+        .iter()
+        .filter(|o| m.class(o.vreg) == RegClass::Int)
+        .count();
+    let floats = inst.uses.len() - ints;
+    match (ints > INT_POOL.len() - 2, floats > FLOAT_POOL.len() - 1) {
+        (true, true) => &[RegClass::Int, RegClass::Int, RegClass::Float],
+        (true, false) => &[RegClass::Int, RegClass::Int],
+        (false, true) => &[RegClass::Float],
+        (false, false) => &[],
+    }
+}
+
 /// Attach the ISA's operand constraints, clobbers, and scratch temps to the machine
 /// IR, so the allocator can hand out `rax`/`rcx`/`rdx` and the former scratch
 /// registers as ordinary registers. Runs after isel, before allocation.
@@ -169,7 +198,9 @@ pub fn annotate(m: &mut MFunc) {
     let rdx = PReg::new(RegClass::Int, 2);
 
     for i in 0..m.insts.len() {
-        for &class in temp_classes(m.insts[i].op) {
+        let mut scratch: Vec<RegClass> = temp_classes(m.insts[i].op).to_vec();
+        scratch.extend_from_slice(stub_temps(m, i));
+        for class in scratch {
             let t = m.new_vreg(class);
             m.insts[i].temps.push(Operand::reg(t));
         }
