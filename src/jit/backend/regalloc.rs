@@ -415,6 +415,12 @@ pub struct Allocation {
     /// checker does: without this it cannot tell whether an edge's moves actually
     /// delivered each parameter to the place its block reads it from.
     block_params: Vec<Vec<Alloc>>,
+    /// A second location some parameters hold at entry: their spill slot, filled
+    /// by the edges rather than by a store in the block. Declared so the checker
+    /// can credit the slot to the parameter — it renames the location only when
+    /// it provably holds the delivering argument, so an edge that failed to fill
+    /// it still fails verification.
+    param_homes: Vec<Vec<Option<Alloc>>>,
     pub num_spills: u32,
 }
 
@@ -446,6 +452,12 @@ impl Allocation {
     /// Where parameter `k` of block `b` lives.
     pub fn block_param(&self, b: Block, k: usize) -> Alloc {
         self.block_params[b.0 as usize][k]
+    }
+
+    /// The parameter's edge-filled home slot, if it has one besides
+    /// [`Self::block_param`].
+    pub fn block_param_home(&self, b: Block, k: usize) -> Option<Alloc> {
+        self.param_homes[b.0 as usize].get(k).copied().flatten()
     }
 
     /// Every fix-up, with where it goes, ordered by program point.
@@ -483,6 +495,7 @@ pub struct AllocationBuilder {
     slot_vreg: Vec<VReg>,
     edits: Vec<(ProgPoint, Edit)>,
     block_params: Vec<Vec<Alloc>>,
+    param_homes: Vec<Vec<Option<Alloc>>>,
 }
 
 impl AllocationBuilder {
@@ -518,12 +531,20 @@ impl AllocationBuilder {
             block_params: (0..f.num_blocks())
                 .map(|b| vec![Alloc::Spill(u32::MAX); f.block_params(Block(b as u32)).len()])
                 .collect(),
+            param_homes: (0..f.num_blocks())
+                .map(|b| vec![None; f.block_params(Block(b as u32)).len()])
+                .collect(),
         }
     }
 
     /// Record where parameter `k` of block `b` lives.
     pub fn set_block_param(&mut self, b: Block, k: usize, a: Alloc) {
         self.block_params[b.0 as usize][k] = a;
+    }
+
+    /// Record the parameter's edge-filled home slot.
+    pub fn set_block_param_home(&mut self, b: Block, k: usize, a: Alloc) {
+        self.param_homes[b.0 as usize][k] = Some(a);
     }
 
     /// Put every mention of `v` in the same place.
@@ -571,6 +592,7 @@ impl AllocationBuilder {
             ntemps: self.ntemps,
             edits: self.edits,
             block_params: self.block_params,
+            param_homes: self.param_homes,
             num_spills,
         }
     }
@@ -1994,8 +2016,17 @@ fn allocate_presplit(
         // elimination, which is exact rather than heuristic here: SSA gives the
         // value a single definition, so the slot's contents never go stale and every
         // later store would be writing what is already there.
+        //
+        // Only for values an instruction defines. A slotted block parameter's slot
+        // is filled by its edges instead (declared as the parameter's *home* below):
+        // a store at the top of its own block would run at every entry — every
+        // iteration, for a loop header — where the hot back edge usually shares the
+        // argument's slot and owes nothing.
         if let (Some(sl), Some(d)) = (slot[v], born)
             && let Some(&(_, reg)) = placed[v].iter().find(|&&((lo, hi), _)| lo <= d && d < hi)
+            && f.defs(at_pos[(d / 2) as usize])
+                .iter()
+                .any(|o| o.vreg == vr)
         {
             // A `Fixed` def computes in its pinned register; the ferry into the
             // run's register and this store are edits at the same point, so read
@@ -2009,21 +2040,14 @@ fn allocate_presplit(
                     _ => None,
                 })
                 .unwrap_or(reg);
-            let store = Edit::Move(Move {
-                from: Alloc::Reg(src_reg),
-                to: Alloc::Spill(sl),
-                class,
-            });
-            match f
-                .defs(at_pos[(d / 2) as usize])
-                .iter()
-                .any(|o| o.vreg == vr)
-            {
-                true => b.edit(ProgPoint::after(at_pos[(d / 2) as usize]), store),
-                // A block parameter has no defining instruction; it is delivered by
-                // the edge, so the store goes at the top of its own block.
-                false => b.edit(ProgPoint::before(at_pos[(d / 2) as usize]), store),
-            }
+            b.edit(
+                ProgPoint::after(at_pos[(d / 2) as usize]),
+                Edit::Move(Move {
+                    from: Alloc::Reg(src_reg),
+                    to: Alloc::Spill(sl),
+                    class,
+                }),
+            );
         }
     }
 
@@ -2149,6 +2173,16 @@ fn allocate_presplit(
             for (k, &prm) in f.block_params(blk).iter().enumerate() {
                 if let Some(a) = locs.get(prm, entry) {
                     b.set_block_param(blk, k, a);
+                    // A slotted parameter born in a register holds its slot as a
+                    // second location, filled by the edges in place of the deleted
+                    // block-top store. Declared so the checker credits the slot to
+                    // the parameter — and keeps demanding that some store put the
+                    // argument there.
+                    if let Some(sl) = slot[prm.0 as usize]
+                        && a != Alloc::Spill(sl)
+                    {
+                        b.set_block_param_home(blk, k, Alloc::Spill(sl));
+                    }
                 }
             }
         }
@@ -2639,41 +2673,56 @@ fn resolve_edges(
                 };
 
                 match params.iter().position(|&p| p == vr) {
-                    // A parameter is delivered from the matching argument.
+                    // A parameter is delivered from the matching argument — to its
+                    // entry location, and also to its home slot where it has one:
+                    // the slot has no block-top store, so each edge owes whatever
+                    // its own path did not already put there.
                     Some(k) => {
                         let a = args[k];
-                        // A rematerializable argument that was spilled has *no* home
-                        // to move from — it is replayed at each mention instead.
-                        // Reading a location for it would find nothing, or worse a
-                        // stale register from before it was evicted.
-                        if remat_spilled[a.0 as usize] {
-                            let src = remat_src[a.0 as usize].expect("a remat value names its def");
-                            pending.push((EdgeSrc::Remat(a, src), to, f.class(vr)));
-                            continue;
-                        }
-                        let Some(from) = locs.get(a, at_pos) else {
-                            // Nowhere at the branch: dropped rather than spilled,
-                            // which only a replayable value can be. Replay it into
-                            // the parameter's place.
-                            let src = remat_src[a.0 as usize]
-                                .expect("only a replayed value has no home at the branch");
-                            pending.push((EdgeSrc::Remat(a, src), to, f.class(vr)));
-                            continue;
-                        };
-                        // The coalesced case: argument and parameter already share a
-                        // location, so the edge costs nothing. A spilled parameter
-                        // whose argument shares its slot is likewise free — the
-                        // argument's store-at-def wrote that slot, and one
-                        // definition means it is never stale, so the store *is*
-                        // the delivery.
-                        let delivered = match to {
-                            Alloc::Spill(s) => {
-                                arg_slot.get(a.0 as usize).copied().flatten() == Some(s)
+                        let home = arg_slot
+                            .get(vr.0 as usize)
+                            .copied()
+                            .flatten()
+                            .map(Alloc::Spill)
+                            .filter(|&h| h != to);
+                        for target in std::iter::once(to).chain(home) {
+                            // A rematerializable argument that was spilled has *no*
+                            // home to move from — it is replayed at each mention
+                            // instead. Reading a location for it would find nothing,
+                            // or worse a stale register from before it was evicted.
+                            let from = if remat_spilled[a.0 as usize] {
+                                None
+                            } else {
+                                locs.get(a, at_pos)
+                            };
+                            // The coalesced case: argument and parameter already
+                            // share the location, so the edge costs nothing. A slot
+                            // target the argument's own slot matches is likewise
+                            // free — the argument's store-at-def wrote it, and one
+                            // definition means it is never stale, so the store *is*
+                            // the delivery.
+                            let delivered = match target {
+                                Alloc::Spill(s) => {
+                                    arg_slot.get(a.0 as usize).copied().flatten() == Some(s)
+                                }
+                                _ => false,
+                            };
+                            if delivered || from == Some(target) {
+                                continue;
                             }
-                            _ => false,
-                        };
-                        if from != to && !delivered {
-                            pending.push((EdgeSrc::Loc(from), to, f.class(vr)));
+                            match from {
+                                Some(fr) => {
+                                    pending.push((EdgeSrc::Loc(fr), target, f.class(vr)));
+                                }
+                                // Nowhere at the branch: dropped rather than
+                                // spilled, which only a replayable value can be.
+                                // Replay it into the parameter's place.
+                                None => {
+                                    let src = remat_src[a.0 as usize]
+                                        .expect("only a replayed value has no home at the branch");
+                                    pending.push((EdgeSrc::Remat(a, src), target, f.class(vr)));
+                                }
+                            }
                         }
                     }
                     // Anything else simply carries on across the edge, and needs
@@ -3066,21 +3115,30 @@ fn cross_edge(
         return state;
     }
     let args = f.jump_args(pred);
-    let renamed: Vec<(Alloc, VReg)> = params
-        .iter()
-        .enumerate()
-        .filter_map(|(k, &p)| {
-            let at = ra.block_param(succ, k);
-            let arg = *args.get(k)?;
-            // The location must hold the argument feeding this parameter — moved
-            // there by resolution, or already there because the two coalesced.
-            (state.get(&at) == Some(&arg)).then_some((at, p))
-        })
-        .collect();
+    let mut renamed: Vec<(Alloc, VReg)> = Vec::new();
+    for (k, &p) in params.iter().enumerate() {
+        let Some(&arg) = args.get(k) else { continue };
+        // The location must hold the argument feeding this parameter — moved
+        // there by resolution, or already there because the two coalesced. The
+        // same rule credits a declared home slot: the bits there are the
+        // parameter's exactly when they are the argument's.
+        let at = ra.block_param(succ, k);
+        if state.get(&at) == Some(&arg) {
+            renamed.push((at, p));
+        }
+        if let Some(h) = ra.block_param_home(succ, k)
+            && state.get(&h) == Some(&arg)
+        {
+            renamed.push((h, p));
+        }
+    }
     // Drop every parameter location first: one that resolution did not satisfy must
     // not keep whatever stale value it happens to hold.
     for k in 0..params.len() {
         state.remove(&ra.block_param(succ, k));
+        if let Some(h) = ra.block_param_home(succ, k) {
+            state.remove(&h);
+        }
     }
     state.extend(renamed);
     state
