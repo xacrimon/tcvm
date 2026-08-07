@@ -273,14 +273,32 @@ between their variants:
   column cannot tell an entry-edge shuffle from a join that runs every
   iteration.
 
+### Stage 7b — cost-aware tie-break, and parameter homes filled by edges
+
+Two follow-ups, each small and strictly positive:
+
+- **`limit` breaks distance ties against replayable values.** The full
+  cost-aware rule — evict replayable values first regardless of distance — was
+  tried and is *wrong*: it fragments constants' runs, and mix2's in-loop
+  weighted moves went 50 → 560. As a tie-break only it is free memory: mix2
+  220 → 215 ops on aarch64.
+- **A slotted, register-born block parameter no longer stores at the top of
+  its block** — that store ran at every entry, every iteration for a loop
+  header. Its slot is declared as the parameter's *home*
+  (`Allocation::block_param_home`) and the edges fill it: free where the
+  argument shares the class slot (the hot back edge), an explicit edge store
+  where it does not (typically the cold entry edge). The checker credits the
+  home only when it provably holds the delivering argument, so an edge that
+  fails to fill it still fails verification.
+
 ## 2. Where the measurement stands: flip is a judgment call, not a sweep
 
 **x86-64, allocation level** (13 regs — the pressure case):
 
 | | whole | split |
 |---|---|---|
-| mix | 69 ops (w 483, **460 in loops**), moves w 180 in loops | 41 ops (w 311, **300 in loops**, −35%), moves w 320 in loops |
-| mix2 | 330 ops (w 2715, **2650 in loops**), moves w 600 in loops | 282 ops (w 2271, **2210 in loops**, −17%), moves w 940 in loops |
+| mix | 69 ops (w 483, **460 in loops**), moves w 180 in loops | 41 ops (w 302, **290 in loops**, −37%), moves w 320 in loops |
+| mix2 | 330 ops (w 2715, **2650 in loops**), moves w 600 in loops | 292 ops (w 2299, **2230 in loops**, −16%), moves w 940 in loops |
 
 **Emitted aarch64** (20 regs — the no-pressure case):
 
@@ -288,21 +306,34 @@ between their variants:
 |---|---|---|
 | is_prime | 57 insts, 0 moves | **identical** |
 | mix | 273, 0 moves | 297, 24 moves (w 51, 30 in loops) |
-| mix2 | 1088, 11 moves, 210 ops (w 1722, 1680 in loops) | 1110, 38 moves, 220 ops (w 1759, 1710 in loops) |
+| mix2 | 1088, 11 moves, 210 ops (w 1722, 1680 in loops) | 1118, 35 moves, 221 ops (w 1751, 1700 in loops) |
 
-Stage 7 moved mix2's emitted split from 1170 insts / 64 moves / 254 ops
-(w 1937) to 1110 / 38 / 220 (w 1759). Read together: **under pressure the
+Stage 7 + 7b moved mix2's emitted split from 1170 insts / 64 moves / 254 ops
+(w 1937) to 1118 / 35 / 221 (w 1751). Read together: **under pressure the
 Belady policy plus shared slots wins memory traffic outright**, paying some of
 it back in register shuffle (a move costs a fraction of a load, so the trade is
-net-positive); **without pressure the split path now trails whole by ~2%
-in-loop memory and ~5 in-loop moves** instead of losing badly. The remaining
-gap is two-fold:
+net-positive); **without pressure the split path trails whole by ~1% in-loop
+memory (1700 vs 1680) plus ~5 in-loop moves**.
 
-1. **In-loop join shuffle** (mix2: w 50 vs 0 aarch64, 940 vs 600 x86-64) — a
-   hint loses ties that whole-value's hard merge wins by construction.
-2. **Remat regression**: split replays 16 constants where whole replays 31,
-   reloading the rest — the spiller's `limit` drops replayable values for
-   free but nothing biases it *toward* dropping them.
+### Where the rest of the gap lives: the spiller churns `W` across in-loop edges
+
+Diagnosed by dumping every in-loop edit on mix2, whole against split, and it is
+not a colouring problem. Mid-block, split's Belady traffic is *lower* than
+whole's. The difference is concentrated on the loop's internal edges — ~31
+ops/moves per iteration at the 14-parameter join and the back-edge block that
+whole handles with **zero** edge code. The signature is symmetric pairs across
+two boundaries: `r17→slot2` on one edge and `slot2→r17` on the next, values
+parking into memory on one side of the loop body and unparking on the other,
+every iteration. The spiller chooses `W_entry` per block (§4.2's header rule
+fires only at headers; `init_usual` serves mid-loop joins from predecessors'
+disagreeing exits), so two regions of one loop body settle on different
+resident sets and pay the coupling both ways, per iteration. Belady is locally
+optimal per block and globally wrong per loop.
+
+The Stage 8 shape: **loop-scoped residency** — decide once per loop which
+live-through values are register-resident (the header rule, extended to hold
+through the whole loop body), and let `limit` deviate only where an
+instruction's own demands force it. That is a spiller rework, not a tweak.
 
 ### What flipping the default still waits on
 
@@ -314,9 +345,16 @@ gap is two-fold:
   order+nextuse+plan+presplit costs against the whole-value scan on
   `jit_pipeline`.
 - **aarch64 is a small net loss today.** Flipping there trades mix's 0 moves
-  for 24 (30 weighted in loops) and mix2's 1680 for 1710. Either close the
-  two gaps above first, or accept ~2% on the unpressured target as the price
-  of one allocator.
+  for 24 (30 weighted in loops) and mix2's 1680 for 1700. Either land Stage
+  8's loop-scoped residency first, or accept ~1% on the unpressured target as
+  the price of one allocator.
+- **x86-64's full suite flakes under Rosetta, and did before this work** —
+  ~1 run in 20, a different jit test each time (`native_shift_edge_cases`,
+  `float_compare_is_nan_safe`), each passing deterministically in isolation
+  and on re-run. The victims execute freshly emitted code, which points at
+  code publication (shared segments / dual-map / icache) raced across
+  parallel test threads, possibly Rosetta-specific. File it; do not let a
+  flake be read as an allocator regression.
 
 ### Superseded
 
