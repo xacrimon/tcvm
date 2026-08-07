@@ -58,12 +58,22 @@ pub struct SpillCost {
     /// Constants replayed instead of reloaded. Not memory traffic — tracked so a
     /// fall in `reloads` that is really a shift into remat is visible as one.
     pub remats: u32,
+    /// Register-to-register move edits. Not memory traffic either, but the same
+    /// static-count trap applies: a shuffle on a once-executed entry edge is
+    /// nearly free while one at a loop join runs every iteration, so these carry
+    /// their own weighted figures below.
+    pub moves: u32,
     /// `Σ TRIP^depth` over reloads, stores, and twice each slot-to-slot move.
     pub weighted: u64,
     /// The same sum restricted to edits at depth ≥ 1 — the number Braun09 is
     /// actually trying to move, isolated from flat-code traffic that no amount of
     /// hoisting can help.
     pub weighted_in_loops: u64,
+    /// `Σ TRIP^depth` over register-to-register moves, kept apart from the memory
+    /// figures because a move costs a fraction of a load.
+    pub moves_weighted: u64,
+    /// The move sum restricted to depth ≥ 1.
+    pub moves_in_loops: u64,
 }
 
 impl SpillCost {
@@ -78,7 +88,8 @@ impl std::fmt::Display for SpillCost {
             f,
             "{} memory ops ({} reload, {} store, {} slot-to-slot, \
              {} in-place load, {} in-place store), {} remat; \
-             weighted {} ({} in loops)",
+             weighted {} ({} in loops); \
+             {} moves, weighted {} ({} in loops)",
             self.total(),
             self.reloads,
             self.stores,
@@ -88,6 +99,9 @@ impl std::fmt::Display for SpillCost {
             self.remats,
             self.weighted,
             self.weighted_in_loops,
+            self.moves,
+            self.moves_weighted,
+            self.moves_in_loops,
         )
     }
 }
@@ -137,9 +151,13 @@ pub fn measure_with(f: &impl RegallocFunc, ra: &Allocation, layout: &Layout) -> 
                     c.slot_to_slot += 1;
                     charge(2);
                 }
-                // A register-to-register move is the shuffle, not spill traffic;
-                // `asm_dump` already counts those.
-                _ => {}
+                (Alloc::Reg(_), Alloc::Reg(_)) => {
+                    c.moves += 1;
+                    c.moves_weighted += weight;
+                    if depth > 0 {
+                        c.moves_in_loops += weight;
+                    }
+                }
             },
             Edit::Remat { .. } => c.remats += 1,
         }
