@@ -252,11 +252,12 @@ fn limit(
     // coexist with the results or the op clobbers them (`build_intervals`
     // extends exactly these ranges for the same reason). They are usually dying
     // — distance ∞ — which under plain Belady sorts them *first* out the door.
-    if keep.is_empty() {
-        sort_by_distance(w, dist, j);
-    } else {
-        w.sort_by_key(|&v| (!keep.contains(&v), dist.at(j, v), v.0));
-    }
+    //
+    // Replayable values go out ahead of distance. Belady's rule prices every
+    // miss the same, but their miss is a mov-immediate where a real value's is
+    // a store here and a load at the next use — so a constant sitting close to
+    // its next use must not push a further-but-real value into memory.
+    w.sort_by_key(|&v| (!keep.contains(&v), dist.at(j, v), f.remat(v).is_some(), v.0));
     for &v in &w[m..] {
         // Nothing to store if it is already in memory, if it is never read again —
         // the value is simply dead — or if it will be replayed rather than reloaded.
