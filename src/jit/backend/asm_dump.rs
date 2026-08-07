@@ -273,7 +273,7 @@ fn pressure_explains_which_benchmarks_spill() {
 /// reg-reg moves is not a win. Both columns, or the comparison lies.
 #[test]
 fn split_vs_whole_report() {
-    use super::regalloc::{RegisterSets, allocate_with, verify};
+    use super::regalloc::{RegisterSets, allocate_whole, allocate_with, verify};
     use super::{nextuse, order, spill, spillcost};
 
     eprintln!("\n=== split vs whole (emitted aarch64) ===");
@@ -289,7 +289,7 @@ fn split_vs_whole_report() {
             super::target::annotate(&mut m);
             let env = machine_env();
 
-            let whole = allocate(&m, &env).expect("whole-value allocate");
+            let whole = allocate_whole(&m, &env).expect("whole-value allocate");
             verify(&m, &whole).expect("whole verifies");
 
             let layout = order::compute(&m).expect("reducible");

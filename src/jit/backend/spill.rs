@@ -941,7 +941,7 @@ mod tests {
         use crate::Lua;
         use crate::jit::backend::isel::select;
         use crate::jit::backend::regalloc::{
-            Alloc, Edit, RegisterSets, allocate, allocate_with, verify,
+            Alloc, Edit, RegisterSets, allocate_whole, allocate_with, verify,
         };
         use crate::jit::backend::spillcost;
         use crate::jit::backend::target::{annotate, machine_env};
@@ -963,7 +963,7 @@ mod tests {
                 annotate(&mut m);
                 let env = machine_env();
 
-                let whole = allocate(&m, &env).expect("whole");
+                let whole = allocate_whole(&m, &env).expect("whole");
                 verify(&m, &whole).expect("whole verifies");
                 let layout = order::compute(&m).expect("reducible");
                 let nu = nextuse::analyze(&m, &layout);

@@ -389,6 +389,9 @@ pub enum RegallocError {
     /// *around* an instruction; this fires only when the instruction *itself* is
     /// unsatisfiable. The region stays interpreted rather than compiling wrong code.
     OutOfRegisters,
+    /// Irreducible control flow: the layout pass has no sound linearization for
+    /// it (Wimmer10 §4.3), so the region stays interpreted.
+    Irreducible,
 }
 
 // --- the result -------------------------------------------------------------
@@ -760,6 +763,25 @@ type EvictKey = (std::cmp::Reverse<u32>, bool, u32);
 /// fit the register file: it declines only when one instruction cannot (see
 /// [`RegallocError::OutOfRegisters`]).
 pub fn allocate(f: &impl RegallocFunc, env: &MachineEnv) -> Result<Allocation, RegallocError> {
+    let layout = super::order::compute(f).map_err(|_| RegallocError::Irreducible)?;
+    let nu = super::nextuse::analyze(f, &layout);
+    let plan = super::spill::plan(f, &layout, &nu, env);
+    allocate_with(
+        f,
+        env,
+        Some(RegisterSets {
+            w_use: &plan.w_use,
+            w_after: &plan.w_after,
+        }),
+    )
+}
+
+/// The whole-value scan, kept while the split path above bakes as the default.
+/// Nothing in the shipped pipeline calls it; the split-versus-whole harnesses do.
+pub fn allocate_whole(
+    f: &impl RegallocFunc,
+    env: &MachineEnv,
+) -> Result<Allocation, RegallocError> {
     allocate_with(f, env, None)
 }
 
@@ -1586,6 +1608,22 @@ fn allocate_presplit(
             }
             for &v in &sets.w_after[i] {
                 mark(&mut runs, v, p * 2 + 1);
+            }
+            // The spiller honours `limit(m)` even when an instruction's own
+            // demands exceed `m` — its keep-set orders the cut, it cannot widen
+            // it. An instruction whose register-demanding operands and temps do
+            // not all fit the file is unsatisfiable: decline rather than let a
+            // `Reg` operand silently read from a slot.
+            // Defs are checked whatever their constraint: the encoders write every
+            // def to a register (`aarch64::def_g` makes a `Spill` def unreachable).
+            if f.uses(i)
+                .iter()
+                .any(|o| o.constraint != Constraint::Any && !sets.w_use[i].contains(&o.vreg))
+                || f.defs(i)
+                    .iter()
+                    .any(|o| !sets.w_after[i].contains(&o.vreg))
+            {
+                return Err(RegallocError::OutOfRegisters);
             }
         }
     }
@@ -3847,9 +3885,14 @@ mod tests {
             matches!(ra.use_(u2, 0), Alloc::Reg(_)),
             "the Reg use must be in a register, not on the stack"
         );
+        // Which of the three is evicted is the allocator's choice; that a store
+        // and a matching reload exist is not.
+        let edits: Vec<_> = ra.edits().iter().map(|&(_, e)| e).collect();
         assert!(
-            ra.edits_at(ProgPoint::before(u2)).next().is_some(),
-            "a reload edit must precede the use"
+            edits.iter().any(
+                |e| matches!(e, Edit::Move(m) if matches!(m.from, Alloc::Spill(_)) && matches!(m.to, Alloc::Reg(_)))
+            ),
+            "a value under pressure reloads at its register use"
         );
     }
 
@@ -4194,6 +4237,11 @@ mod tests {
     /// spilled value's use sits where every register holds a value live across it,
     /// one is bounced to a scratch slot for the instruction and restored right
     /// after — no register is ever reserved for the purpose.
+    ///
+    /// Pinned to the whole-value scan: its reload phase is where the bounce lives.
+    /// The split path plans the eviction instead and needs no bounce here (its
+    /// bounces are edge resolution's, which the edge-cycle tests cover). The test
+    /// goes when the scan goes.
     #[test]
     fn a_reload_bounces_a_live_value_when_no_register_is_free() {
         let mut f = TestFunc::default();
@@ -4208,7 +4256,7 @@ mod tests {
         f.inst(b, vec![], vec![Operand::reg(bb)]);
         f.inst(b, vec![], vec![Operand::reg(c)]); // c read again last: furthest end
 
-        let ra = allocate(&f, &env(2)).expect("a bounce makes the reload fit");
+        let ra = allocate_whole(&f, &env(2)).expect("a bounce makes the reload fit");
         verify(&f, &ra).expect("the bounced value is restored intact");
 
         assert!(
@@ -4281,16 +4329,27 @@ mod tests {
         let ra = allocate(&f, &env(1)).expect("one register, resolved by a spill");
         verify(&f, &ra).expect("whichever value spilled still reads back");
 
-        // `hot` keeps one register throughout; `cold`, not the loop value, is the
-        // one that had to move.
-        assert_eq!(
-            ra.use_(uhot_loop, 0),
-            ra.use_(uhot, 0),
-            "hot stays in a single register across the whole function"
-        );
+        // What loop residency actually promises: `hot` owns a register through
+        // the loop, and no spill traffic lands inside it. How the exit block
+        // resolves the pressure — reload `cold` at its use (whole) or park `hot`
+        // and serve `cold` straight from its defining register (split) — is the
+        // allocator's choice; `ucold` reading from a register is not.
         assert!(
-            ra.edits_at(ProgPoint::before(ucold)).next().is_some(),
-            "cold is the value spilled and reloaded, not hot"
+            matches!(ra.use_(uhot_loop, 0), Alloc::Reg(_)),
+            "hot's loop use is in a register"
+        );
+        for &i in f.block_insts(loop_) {
+            assert!(
+                ra.edits_at(ProgPoint::before(i))
+                    .chain(ra.edits_at(ProgPoint::after(i)))
+                    .next()
+                    .is_none(),
+                "no spill traffic lands inside the loop"
+            );
+        }
+        assert!(
+            matches!(ra.use_(ucold, 0), Alloc::Reg(_)) && matches!(ra.use_(uhot, 0), Alloc::Reg(_)),
+            "both exit uses read registers"
         );
     }
 }
