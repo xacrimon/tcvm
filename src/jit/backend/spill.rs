@@ -242,6 +242,7 @@ fn limit(
     m: usize,
     at: Inst,
     keep: &[VReg],
+    protect: &[bool],
     plan: &mut SpillPlan,
 ) {
     if w.len() <= m {
@@ -253,11 +254,28 @@ fn limit(
     // extends exactly these ranges for the same reason). They are usually dying
     // — distance ∞ — which under plain Belady sorts them *first* out the door.
     //
+    // `protect` marks the enclosing loop's resident set, which outranks distance:
+    // Belady is locally optimal per block and globally wrong per loop. Left to
+    // distances alone, two regions of one loop body settle on different resident
+    // sets, and every boundary between them pays coupling code both ways, every
+    // iteration — mix2 paid ~31 ops per iteration on edges where whole-value
+    // allocation pays nothing. A value the header admitted stays admitted; the
+    // churn falls on non-residents, whose traffic the loop was already paying.
+    //
     // Replayable values go out ahead of distance. Belady's rule prices every
     // miss the same, but their miss is a mov-immediate where a real value's is
     // a store here and a load at the next use — so a constant sitting close to
     // its next use must not push a further-but-real value into memory.
-    w.sort_by_key(|&v| (!keep.contains(&v), dist.at(j, v), f.remat(v).is_some(), v.0));
+    let shielded = |v: VReg| protect.get(v.0 as usize).copied().unwrap_or(false);
+    w.sort_by_key(|&v| {
+        (
+            !keep.contains(&v),
+            !shielded(v),
+            dist.at(j, v),
+            f.remat(v).is_some(),
+            v.0,
+        )
+    });
     for &v in &w[m..] {
         // Nothing to store if it is already in memory, if it is never read again —
         // the value is simply dead — or if it will be replayed rather than reloaded.
@@ -281,6 +299,7 @@ fn min_algorithm(
     dist: &BlockDistances,
     w: &mut Vec<VReg>,
     s: &mut Vec<VReg>,
+    protect: &[bool],
     plan: &mut SpillPlan,
 ) {
     let insts = f.block_insts(b);
@@ -373,7 +392,18 @@ fn min_algorithm(
             .filter(|o| o.constraint != Constraint::Any && f.class(o.vreg) == class)
             .map(|o| o.vreg)
             .collect();
-        limit(f, w, s, dist, j, kc.saturating_sub(ntemps), i, &must, plan);
+        limit(
+            f,
+            w,
+            s,
+            dist,
+            j,
+            kc.saturating_sub(ntemps),
+            i,
+            &must,
+            protect,
+            plan,
+        );
 
         // ...then room for the results, measured from the *next* instruction,
         // because once this one writes its results its own operands stop mattering.
@@ -419,6 +449,7 @@ fn min_algorithm(
             kc.saturating_sub(ndefs),
             i,
             &keep,
+            protect,
             plan,
         );
 
@@ -654,6 +685,9 @@ pub fn plan(f: &impl RegallocFunc, layout: &Layout, nu: &NextUse, env: &MachineE
         // long after the forward pass has moved on.
         let mut s_entry: Vec<Vec<VReg>> = vec![Vec::new(); nb];
         let mut processed = vec![false; nb];
+        // Each loop's resident set — the header's `W_entry`, held for `limit` to
+        // shield through every block of that loop. Indexed by header.
+        let mut resident: Vec<Option<Vec<bool>>> = vec![None; nb];
 
         for &b in &layout.order {
             let bi = b.0 as usize;
@@ -665,29 +699,37 @@ pub fn plan(f: &impl RegallocFunc, layout: &Layout, nu: &NextUse, env: &MachineE
                 init_usual(&preds[bi], &w_exit, nu, b, k, &processed)
             };
 
-            // Block parameters go in first. A parameter is defined at the entry and
-            // is usually read soon after, so it is the last thing worth evicting;
-            // appending it and truncating instead dropped one on `mix2` and then
-            // reloaded it from a slot the edge had never written. Nearest use first,
-            // measured inside this block, since a parameter's distance *from* the
-            // entry is meaningless — it is born there.
-            let mut params: Vec<VReg> = f
+            // Entry admission follows the same policy as `limit`: the enclosing
+            // loop's residents first, then everyone — parameters included — by
+            // nearest use, measured inside this block. Parameters used to go in
+            // unconditionally, and inside a loop that is exactly the churn `limit`'s
+            // shield cannot reach: a wide join's parameters would push the loop's
+            // residents out of `W` at entry, and every value so displaced pays
+            // coupling on the way out and back in, per iteration. A parameter that
+            // loses the seat is delivered to its slot by its edges instead — legal
+            // since edge-filled parameter homes exist, and the right trade when its
+            // next use is further than a resident's.
+            //
+            // A header is its own loop's authority, so nothing shields its entry:
+            // its result *is* the resident set.
+            let protect_entry: &[bool] = layout.loop_header[bi]
+                .and_then(|h| resident[h.0 as usize].as_deref())
+                .unwrap_or(&[]);
+            let sh = |v: VReg| protect_entry.get(v.0 as usize).copied().unwrap_or(false);
+            let mut cand: Vec<VReg> = f
                 .block_params(b)
                 .iter()
                 .copied()
                 .filter(|&p| f.class(p) == class)
                 .collect();
-            params.sort_by_key(|&p| (dist.at(0, p), p.0));
-
-            let mut w: Vec<VReg> = params.iter().copied().take(k).collect();
             for v in inherited {
-                if w.len() >= k {
-                    break;
-                }
-                if !w.contains(&v) {
-                    w.push(v);
+                if !cand.contains(&v) {
+                    cand.push(v);
                 }
             }
+            cand.sort_by_key(|&v| (!sh(v), dist.at(0, v), v.0));
+            cand.truncate(k);
+            let mut w: Vec<VReg> = cand;
 
             // `S` invariant: v is in `S` at a point iff it was spilled on *every*
             // path to that point. Union over predecessors, then narrowed to what is
@@ -704,6 +746,21 @@ pub fn plan(f: &impl RegallocFunc, layout: &Layout, nu: &NextUse, env: &MachineE
 
             plan.w_entry[bi].extend(w.iter().copied());
             s_entry[bi] = s.clone();
+
+            // A header's entry set is the loop's resident set from here on. The
+            // innermost enclosing loop decides a block's protection — an outer
+            // loop's residents inside an inner loop are the inner header's call
+            // to make, and it saw them as live-through candidates.
+            if layout.is_header(b) {
+                let mut r = vec![false; nv];
+                for &v in &w {
+                    r[v.0 as usize] = true;
+                }
+                resident[bi] = Some(r);
+            }
+            let protect: &[bool] = layout.loop_header[bi]
+                .and_then(|h| resident[h.0 as usize].as_deref())
+                .unwrap_or(&[]);
 
             // Coupling code, per §4.3. A predecessor not yet processed is a back
             // edge; the paper says to skip it and fix it up once that block has been
@@ -726,7 +783,7 @@ pub fn plan(f: &impl RegallocFunc, layout: &Layout, nu: &NextUse, env: &MachineE
                 );
             }
 
-            min_algorithm(f, b, class, k, &dist, &mut w, &mut s, &mut plan);
+            min_algorithm(f, b, class, k, &dist, &mut w, &mut s, protect, &mut plan);
 
             // Values dead at the exit are holding nothing anyone will read. Leaving
             // them in `W` would carry them into successors' entry sets, where the
