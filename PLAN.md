@@ -1,10 +1,11 @@
 # Plan: SSA-form register allocation with live-range splitting
 
-**Status: the split path works end to end — allocates, verifies on both
-targets, encodes on aarch64 — behind `allocate_with`, with `allocate` unchanged
-as the default. The Belady policy wins under pressure (x86-64 mix −36%
-weighted); the assignment gives much of it back at joins for want of
-coalescing. §2 has the numbers and the two named fixes.**
+**Status: Stage 7 landed the two coalescing fixes §2 named — CSSA slot sharing
+and transitive class affinity. Under pressure the split path now wins memory
+traffic outright (x86-64: mix −36%, mix2 −16% weighted) with the per-edge
+store problem gone; on aarch64 it is a near-tie that trails whole by ~2% in
+loops. `allocate` is still the default; §2 has the flip decision and what it
+waits on.**
 
 Papers are in `papers/` (gitignored) with a distilled algorithm crib sheet at
 `papers/NOTES.md` — pseudocode, measured numbers, and correctness traps. Read
@@ -245,42 +246,77 @@ got there, each item forced by the verifier or by x86-64's constraints:
   **x86-64's encoder has the same latent assumption and no fix yet** — its split
   allocations verify but encoding them is unexercised.
 
-## 2. What is left: the measurement says coalescing, twice
+### Stage 7 — CSSA slot sharing and transitive affinity
 
-**Emitted aarch64** (`asm_dump::split_vs_whole_report`):
+The two fixes the old §2 named, plus the yardstick extension that arbitrated
+between their variants:
+
+- **One spill slot per phi-congruence class** (Braun09 §4.4). The classes are
+  the same union-find `coalesce()` runs for the whole-value scan — arg/param
+  pairs, hottest edges first — extended with two-address `Reuse` pairs; only
+  temps are barred, since a bias cannot be contradicted the way a merged
+  location can. Members' live ranges are disjoint, so along any executed path
+  the slot's most recent store is by the member the reader wants — and an
+  argument's store-at-def now *is* the edge's delivery into a spilled
+  parameter (`resolve_edges` skips a delivery into the argument's own slot).
+  This is what deleted mix2's per-edge slot deliveries: x86-64 stores 69
+  against whole's 80, where the pre-fix split paid +24 *over* whole.
+- **The colouring hint is per class, not per pair** — `class_reg`, the class's
+  most recent placement, replacing the pairwise scan. Two steering rules, both
+  measured: deeper placements displace shallower ones (the carried chain is
+  led from inside the loop, not by whichever cold path coloured first), and a
+  replayed constant follows its class but never steers it.
+- **`spillcost` now weights reg-reg moves by loop depth** too. This existed to
+  be wrong about: every variant of the steering rules that looked better on
+  static moves (constants leading: mix 24 → 6) was worse where it runs —
+  mix2's in-loop weighted moves went 50 → 460 under the same rule. The static
+  column cannot tell an entry-edge shuffle from a join that runs every
+  iteration.
+
+## 2. Where the measurement stands: flip is a judgment call, not a sweep
+
+**x86-64, allocation level** (13 regs — the pressure case):
 
 | | whole | split |
 |---|---|---|
-| is_prime | 57 insts, 0 moves | **57 insts, 0 moves — identical** |
-| mix | 273, 0 moves | 279, 6 moves |
-| mix2 | 1088, 11 moves, 210 ops (w 1722) | 1170, **64 moves**, 254 ops (**w 1937**) |
+| mix | 69 ops (w 483, **460 in loops**), moves w 180 in loops | 41 ops (w 311, **300 in loops**, −35%), moves w 320 in loops |
+| mix2 | 330 ops (w 2715, **2650 in loops**), moves w 600 in loops | 282 ops (w 2271, **2210 in loops**, −17%), moves w 940 in loops |
 
-**x86-64, allocation level** (`spill::tests::split_vs_whole_allocations`):
+**Emitted aarch64** (20 regs — the no-pressure case):
 
 | | whole | split |
 |---|---|---|
-| mix | 26 moves, 69 ops (w 483) | 38 moves, **41 ops (w 311, −36%)** |
-| mix2 | 31 moves, 330 ops (w 2715) | **85 moves**, 358 ops (w 2653, −2%) |
+| is_prime | 57 insts, 0 moves | **identical** |
+| mix | 273, 0 moves | 297, 24 moves (w 51, 30 in loops) |
+| mix2 | 1088, 11 moves, 210 ops (w 1722, 1680 in loops) | 1110, 38 moves, 220 ops (w 1759, 1710 in loops) |
 
-Read together: **the Belady policy wins where pressure is real** — x64 mix −36%
-weighted is the paper's promise showing up — **and the assignment gives it back at
-joins**, because presplit colouring has a pairwise affinity where the whole-value
-path has transitive coalescing and shared spill slots. mix2's 14-parameter join
-pays per-edge slot deliveries (+24 stores over whole) and register shuffles (+53
-moves) that coalescing made free. The old §2.3 said splitting is the precondition
-that makes coalescing worth having; the measurement says the converse too.
+Stage 7 moved mix2's emitted split from 1170 insts / 64 moves / 254 ops
+(w 1937) to 1110 / 38 / 220 (w 1759). Read together: **under pressure the
+Belady policy plus shared slots wins memory traffic outright**, paying some of
+it back in register shuffle (a move costs a fraction of a load, so the trade is
+net-positive); **without pressure the split path now trails whole by ~2%
+in-loop memory and ~5 in-loop moves** instead of losing badly. The remaining
+gap is two-fold:
 
-Two named fixes, then re-measure:
+1. **In-loop join shuffle** (mix2: w 50 vs 0 aarch64, 940 vs 600 x86-64) — a
+   hint loses ties that whole-value's hard merge wins by construction.
+2. **Remat regression**: split replays 16 constants where whole replays 31,
+   reloading the rest — the spiller's `limit` drops replayable values for
+   free but nothing biases it *toward* dropping them.
 
-1. **Spill-slot sharing across arg/param chains** — Braun09 §4.4's CSSA
-   precondition, deferred earlier because `slot_to_slot` measured zero; the cost
-   now shows as per-edge stores instead. One slot per phi-congruence class makes
-   the arg's store-at-def *be* the edge delivery.
-2. **Transitive affinity over runs** — union-find over non-interfering
-   arg/param/`Reuse` pairs, as `coalesce()` does over intervals, so a value
-   feeding two joins lands where both expect it.
+### What flipping the default still waits on
 
-`allocate()` is unchanged and remains the default everywhere.
+- **x86-64's encoder cannot yet encode split allocations** — `stub_scratch`'s
+  hunt assumes the slack whole-value over-spilling leaves (Stage 6's last
+  bullet). aarch64 got `stub_temps`; x86-64 needs the same.
+- **Compile time is unmeasured.** Braun09 reintroduces the dataflow fixpoint
+  Stage 1 deleted (`nextuse`), and no measurement yet says what
+  order+nextuse+plan+presplit costs against the whole-value scan on
+  `jit_pipeline`.
+- **aarch64 is a small net loss today.** Flipping there trades mix's 0 moves
+  for 24 (30 weighted in loops) and mix2's 1680 for 1710. Either close the
+  two gaps above first, or accept ~2% on the unpressured target as the price
+  of one allocator.
 
 ### Superseded
 
