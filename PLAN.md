@@ -1,11 +1,13 @@
 # Plan: SSA-form register allocation with live-range splitting
 
-**Status: Stage 7 landed the two coalescing fixes §2 named — CSSA slot sharing
-and transitive class affinity. Under pressure the split path now wins memory
-traffic outright (x86-64: mix −36%, mix2 −16% weighted) with the per-edge
-store problem gone; on aarch64 it is a near-tie that trails whole by ~2% in
-loops. `allocate` is still the default; §2 has the flip decision and what it
-waits on.**
+**Status: the split pipeline IS the default — `allocate` runs
+order → nextuse → plan → presplit colouring on both targets, and Stage 8's
+loop-scoped residency made it win everywhere quality is measured: mix2's
+emitted code beats whole by 5% in-loop weighted memory on aarch64 and
+executes 16% faster; x86-64 is −24%/−22% in-loop weighted. The price is
+compile time (allocate ×1.8–1.9) — see §2. The whole-value scan survives as
+`allocate_whole` for the comparison harnesses only; §5 lists what remains
+open, including its deletion.**
 
 Papers are in `papers/` (gitignored) with a distilled algorithm crib sheet at
 `papers/NOTES.md` — pseudocode, measured numbers, and correctness traps. Read
@@ -291,70 +293,76 @@ Two follow-ups, each small and strictly positive:
   home only when it provably holds the delivering argument, so an edge that
   fails to fill it still fails verification.
 
-## 2. Where the measurement stands: flip is a judgment call, not a sweep
+### Stage 8 — loop-scoped residency (the churn fix)
 
-**x86-64, allocation level** (13 regs — the pressure case):
+Diagnosed by dumping every in-loop edit on mix2, whole against split: mid-block,
+split's Belady traffic was already *lower* than whole's; the entire loss sat on
+the loop's internal edges — ~31 ops per iteration at the 14-parameter join and
+the back-edge block, where whole pays zero. Symmetric pairs (`r17→slot2` on one
+edge, `slot2→r17` on the next): values parking into memory on one side of the
+loop body and unparking on the other, every iteration, because `W_entry` is
+chosen per block and two regions of one loop settle on different resident sets.
+Belady is locally optimal per block and globally wrong per loop.
 
-| | whole | split |
+Two changes, and the second is the one that mattered:
+
+- **`limit` shields the enclosing loop's residents** — the header's `W_entry`,
+  held as the loop's resident set, outranks next-use distance in the eviction
+  sort. Alone this did *nothing* (memory flat, moves 50 → 380 weighted): the
+  residents were not leaving through `limit` at all.
+- **Entry admission follows the same policy.** Parameters used to enter `W`
+  unconditionally; a wide in-loop join's parameters displaced the residents at
+  entry, where no eviction sort ever saw them. Now everything — parameters
+  included — competes by (resident, nearest use), and a parameter that loses
+  the seat is delivered to its slot by its edges, which Stage 7b's parameter
+  homes made legal. This is what deleted the churn.
+
+Also forced out by the flip: **the split path now declines an unsatisfiable
+instruction** (register-demanding operands plus temps exceeding the file) —
+the spiller honours `limit(m)` by cutting, so `allocate_presplit` checks every
+non-`Any` operand actually sits in `W` at its instruction and returns
+`OutOfRegisters` otherwise. Found by an existing whole-path test the flip
+re-aimed; without the check a `Reg` operand silently read from a slot.
+
+### Stage 9 — the split pipeline is the default
+
+`allocate` = `order::compute` → `nextuse::analyze` → `spill::plan` →
+presplit colouring. The whole-value scan survives as `allocate_whole`, called
+only by the split-versus-whole harnesses, and goes away entirely once the
+default has baked. x86-64 needed one port to encode split allocations:
+`stub_temps` (the aarch64 rule, plus an xmm) — a guard whose keepalives could
+fill the file declares its stub scratch as temps, because the hunt in
+`stub_scratch` only ever worked on the slack whole-value over-spilling left.
+Three behaviour tests pinned to the whole scan's victim choices were re-aimed
+at the properties they exist for; the bounce test stays on `allocate_whole`
+and goes when the scan goes.
+
+## 2. Where the measurement stands
+
+**In-loop weighted spill traffic** (the yardstick; `TRIP = 10` per level):
+
+| | whole | split (default) |
 |---|---|---|
-| mix | 69 ops (w 483, **460 in loops**), moves w 180 in loops | 41 ops (w 302, **290 in loops**, −37%), moves w 320 in loops |
-| mix2 | 330 ops (w 2715, **2650 in loops**), moves w 600 in loops | 292 ops (w 2299, **2230 in loops**, −16%), moves w 940 in loops |
+| x86-64 mix | mem 460, moves 180 | mem **350 (−24%)**, moves 200 |
+| x86-64 mix2 | mem 2650, moves 600 | mem **2080 (−22%)**, moves 700 |
+| aarch64 mix | 0 / 0 | 0 / 30 (24 static moves, all cold but ~3) |
+| aarch64 mix2 | mem 1680, moves 0 | mem **1590 (−5%)**, moves 30 |
 
-**Emitted aarch64** (20 regs — the no-pressure case):
+Emitted aarch64 mix2: 1106 insts / 34 moves / 209 ops (w 1640) against whole's
+1088 / 11 / 210 (w 1722) — and `is_prime` is still byte-identical at 57/0/0.
+For history: the pre-Stage-7 split was 1170 / 64 / 254 (w 1937).
 
-| | whole | split |
-|---|---|---|
-| is_prime | 57 insts, 0 moves | **identical** |
-| mix | 273, 0 moves | 297, 24 moves (w 51, 30 in loops) |
-| mix2 | 1088, 11 moves, 210 ops (w 1722, 1680 in loops) | 1118, 35 moves, 221 ops (w 1751, 1700 in loops) |
+**Execution** (`jit_pipeline` `exec`, aarch64): **mix2 −16.3%** (73.3 → 61.4 µs)
+— the reload traffic the tables above count, showing up in wall-clock. mix is
+unchanged (no spills on either path).
 
-Stage 7 + 7b moved mix2's emitted split from 1170 insts / 64 moves / 254 ops
-(w 1937) to 1118 / 35 / 221 (w 1751). Read together: **under pressure the
-Belady policy plus shared slots wins memory traffic outright**, paying some of
-it back in register shuffle (a move costs a fraction of a load, so the trade is
-net-positive); **without pressure the split path trails whole by ~1% in-loop
-memory (1700 vs 1680) plus ~5 in-loop moves**.
-
-### Where the rest of the gap lives: the spiller churns `W` across in-loop edges
-
-Diagnosed by dumping every in-loop edit on mix2, whole against split, and it is
-not a colouring problem. Mid-block, split's Belady traffic is *lower* than
-whole's. The difference is concentrated on the loop's internal edges — ~31
-ops/moves per iteration at the 14-parameter join and the back-edge block that
-whole handles with **zero** edge code. The signature is symmetric pairs across
-two boundaries: `r17→slot2` on one edge and `slot2→r17` on the next, values
-parking into memory on one side of the loop body and unparking on the other,
-every iteration. The spiller chooses `W_entry` per block (§4.2's header rule
-fires only at headers; `init_usual` serves mid-loop joins from predecessors'
-disagreeing exits), so two regions of one loop body settle on different
-resident sets and pay the coupling both ways, per iteration. Belady is locally
-optimal per block and globally wrong per loop.
-
-The Stage 8 shape: **loop-scoped residency** — decide once per loop which
-live-through values are register-resident (the header rule, extended to hold
-through the whole loop body), and let `limit` deviate only where an
-instruction's own demands force it. That is a spiller rework, not a tweak.
-
-### What flipping the default still waits on
-
-- **x86-64's encoder cannot yet encode split allocations** — `stub_scratch`'s
-  hunt assumes the slack whole-value over-spilling leaves (Stage 6's last
-  bullet). aarch64 got `stub_temps`; x86-64 needs the same.
-- **Compile time is unmeasured.** Braun09 reintroduces the dataflow fixpoint
-  Stage 1 deleted (`nextuse`), and no measurement yet says what
-  order+nextuse+plan+presplit costs against the whole-value scan on
-  `jit_pipeline`.
-- **aarch64 is a small net loss today.** Flipping there trades mix's 0 moves
-  for 24 (30 weighted in loops) and mix2's 1680 for 1700. Either land Stage
-  8's loop-scoped residency first, or accept ~1% on the unpressured target as
-  the price of one allocator.
-- **x86-64's full suite flakes under Rosetta, and did before this work** —
-  ~1 run in 20, a different jit test each time (`native_shift_edge_cases`,
-  `float_compare_is_nan_safe`), each passing deterministically in isolation
-  and on re-run. The victims execute freshly emitted code, which points at
-  code publication (shared segments / dual-map / icache) raced across
-  parallel test threads, possibly Rosetta-specific. File it; do not let a
-  flake be read as an allocator regression.
+**Compile time** (`jit_pipeline`, back-to-back baselines): `allocate` 39 → 76 µs
+on mix (**×1.93**), 158 → 287 µs on mix2 (**×1.81**); full lower..encode ×1.5.
+That is the reintroduced dataflow (`nextuse`) plus the spiller plus a layout
+recompute, exactly the tension §"remaining tension" predicted. Caveat on
+precision: the untouched `parse` stage moved +20% between the same two
+binaries, so ±20% of any single number here is binary-layout noise — the ×1.8–1.9
+on allocate is far outside it, the smaller per-stage deltas are not.
 
 ### Superseded
 
@@ -483,7 +491,30 @@ spilling phase alone and never measures a whole allocator against linear scan.
 
 ---
 
-## 3. Benchmarks
+## 3. Open tasks — do not lose these
+
+- **Delete the whole-value scan** once the split default has baked:
+  `allocate_whole`, the eviction machinery (`EvictKey`, spill-versus-evict,
+  `remat_spilled` bookkeeping), the bounce-in-reload-phase path and its test.
+  The split-versus-whole harnesses go with it; keep the absolute yardstick
+  numbers in this file.
+- **Compile time.** `allocate` recomputes `order::compute` though `MFunc`
+  already carries the layout; `nextuse` is a per-value-map fixpoint that has
+  had zero optimization attention. Budget: get the ×1.8 down before regions
+  get bigger.
+- **The x86-64 Rosetta test flake — pre-existing, unfiled.** ~1 full-suite run
+  in 20 fails a random jit exec/asm test (`native_shift_edge_cases`,
+  `float_compare_is_nan_safe` observed), each passing deterministically in
+  isolation; reproduced at the Stage 6 commit, so not introduced by any of
+  this. Victims execute freshly emitted code → suspect code publication
+  (shared segments / dual-map / icache) raced across parallel test threads,
+  possibly Rosetta-specific. **File a GitHub issue**; do not read a flake as
+  an allocator regression.
+- **`mix`'s 24 cold split moves** (aarch64, 0 for whole): entry-edge shuffle
+  the class affinity misses. Cosmetic (weight ~1 each), but it is the last
+  place whole still reads better on any table.
+
+## 4. Benchmarks
 
 - **`test-files/mix.lua`** — 12 accumulators, one loop. Fits aarch64's 20-register
   pool with room to spare (0 spills), so it cannot judge spilling there; spills 8
@@ -501,7 +532,7 @@ spilling phase alone and never measures a whole allocator against linear scan.
 
 ---
 
-## 4. Smaller things
+## 5. Smaller things
 
 - **Fallthroughs (2 instructions).** Loop-contiguous ordering costs 2 extra
   branches on `is_prime` (55 → 57) because placement is driven by contiguity, not
@@ -519,7 +550,7 @@ spilling phase alone and never measures a whole allocator against linear scan.
 
 ---
 
-## 5. Corrections to earlier versions of this plan
+## 6. Corrections to earlier versions of this plan
 
 Recorded because each was believed and acted on:
 
