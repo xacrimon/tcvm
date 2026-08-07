@@ -782,16 +782,6 @@ pub fn allocate_with(
         span[b.0 as usize] = (start, p);
     }
 
-    if let Some(sets) = sets {
-        return allocate_presplit(f, env, &order, &pos, &span, sets);
-    }
-
-    let raw = build_intervals(f, &order, &pos, &span);
-
-    // Merge once; the scan reads these per class, and the reload phase reads them
-    // again to know which register is free where.
-    let mut ranges: Vec<Vec<(u32, u32)>> = raw.into_iter().map(merge_ranges).collect();
-
     let ord_idx = {
         let mut m = vec![0u32; f.num_blocks()];
         for (k, &b) in order.iter().enumerate() {
@@ -831,6 +821,16 @@ pub fn allocate_with(
         }
         ok
     };
+
+    if let Some(sets) = sets {
+        return allocate_presplit(f, env, &order, &pos, &span, &loops, sets);
+    }
+
+    let raw = build_intervals(f, &order, &pos, &span);
+
+    // Merge once; the scan reads these per class, and the reload phase reads them
+    // again to know which register is free where.
+    let mut ranges: Vec<Vec<(u32, u32)>> = raw.into_iter().map(merge_ranges).collect();
 
     let mut sets = coalesce(f, &order, &ranges, &span, &loops, &eligible);
     // Every member reports its *set's* live range from here on: the set holds one
@@ -1456,6 +1456,7 @@ pub fn allocate_with(
             &locs,
             &remat_spilled,
             &remat_src,
+            &[],
             &mut spills,
             &mut b,
         )?;
@@ -1486,6 +1487,7 @@ fn allocate_presplit(
     order: &[Block],
     pos: &[u32],
     span: &[(u32, u32)],
+    loops: &[(u32, u32)],
     sets: RegisterSets<'_>,
 ) -> Result<Allocation, RegallocError> {
     let nv = f.num_vregs();
@@ -1590,35 +1592,41 @@ fn allocate_presplit(
         }
     }
 
-    // Copy affinities: a two-address result wants the register of the input it
-    // overwrites, and a block parameter wants its arguments' — the pairs the
-    // whole-value scan *merges* outright. There is no union-find here; runs are
-    // coloured independently and the affinity is only a bias. It is also the only
-    // defence against the shuffle splitting invites: every arg/param pair the bias
-    // misses is a move on that edge, where coalescing used to make it free.
-    let mut affin: HashMap<VReg, Vec<VReg>, RandomState> = HashMap::default();
+    // Copy affinities, transitive: the same union-find over non-interfering
+    // arg/param pairs that the whole-value scan merges outright, extended with
+    // two-address `Reuse` pairs. Runs are still coloured independently — a class
+    // is a shared bias, not a claim — but transitivity is what a pairwise map
+    // could not give: a value feeding two joins lands where both expect it, and a
+    // chain of block parameters agrees on one register end to end. The classes
+    // also share spill slots below (Braun09 §4.4's CSSA precondition), which is
+    // what lets an argument's store-at-def double as the edge's delivery into a
+    // spilled parameter.
+    //
+    // Only temps are barred. The whole-value scan's stricter eligibility exists
+    // because a merged set holds *one location for life*, which a fixed-register
+    // mention or a homeless remat value can contradict; a bias cannot be
+    // contradicted, and slot sharing skips replayed values on its own.
+    let unionable: Vec<bool> = {
+        let mut ok = vec![true; nv];
+        for i in 0..f.num_insts() {
+            for o in f.temps(i) {
+                ok[o.vreg.0 as usize] = false;
+            }
+        }
+        ok
+    };
+    let mut classes = coalesce(f, order, &live, span, loops, &unionable);
     for i in 0..f.num_insts() {
         for o in f.defs(i) {
             if let Constraint::Reuse(uk) = o.constraint {
                 let src = f.uses(i)[uk].vreg;
-                affin.entry(o.vreg).or_default().push(src);
-                affin.entry(src).or_default().push(o.vreg);
+                if unionable[o.vreg.0 as usize] && unionable[src.0 as usize] {
+                    classes.try_union(o.vreg, src);
+                }
             }
         }
     }
-    for &blk in order {
-        let args = f.jump_args(blk);
-        if args.is_empty() {
-            continue;
-        }
-        let params = f.block_params(f.succs(blk)[0]);
-        for (&a, &prm) in args.iter().zip(params) {
-            if f.class(a) == f.class(prm) {
-                affin.entry(a).or_default().push(prm);
-                affin.entry(prm).or_default().push(a);
-            }
-        }
-    }
+    let leader: Vec<u32> = (0..nv as u32).map(|v| classes.find(v)).collect();
 
     let mut all_reg = vec![true; nv];
     for i in 0..f.num_insts() {
@@ -1660,6 +1668,28 @@ fn allocate_presplit(
         // barrier — keeps its register when it can. Without this a value pays a
         // move at every block boundary and clobber site it merely crosses.
         let mut last_reg: Vec<Option<PReg>> = vec![None; f.num_vregs()];
+        // And the register each *class* held last, with the loop depth of the
+        // placement that set it. Runs arrive by start position, so this is the
+        // most recent placement of any class member at or before the current run —
+        // the pairs worth chasing never overlap (a two-address source dies exactly
+        // where its def begins; a back-edge argument's run ends at its block's
+        // exit while the parameter's began at the header), and where two members
+        // are simultaneously live `busy` forbids the register anyway. A hint, not
+        // a claim.
+        //
+        // Two rules on who may steer, both measured (judge by *in-loop weighted*
+        // moves, not the static count — a cold entry-edge shuffle is nearly free):
+        //
+        //   - Deeper placements displace shallower ones, so a loop's carried chain
+        //     is led by a value inside the loop, not by whatever cold path was
+        //     coloured first.
+        //   - A replayed constant follows its class — materialized straight into
+        //     the class's register when free — but never steers it. Letting
+        //     constants lead read well statically (mix 24 → 6 moves, all cold)
+        //     and cost mix2 460 in-loop weighted against 50: their placements are
+        //     on once-executed paths, and the hot values got dragged after them.
+        let mut class_reg: Vec<Option<(usize, PReg)>> = vec![None; f.num_vregs()];
+        let depth_at = |q: u32| loops.iter().filter(|&&(a, z)| a <= q && q < z).count();
         for &cur in &mine {
             let (v, (lo, hi)) = iv[cur];
             active.retain(|&a| iv[a].1.1 > lo);
@@ -1682,30 +1712,14 @@ fn allocate_presplit(
             }
 
             // The value's own previous register first — free continuity across a
-            // barrier — then a copy partner's, then the target's preference, then
-            // first fit. Unlike the whole-value scan there is no fallback to
-            // spilling: the spiller has already guaranteed one of these lands.
-            //
-            // The partner's *most recent* placement at or before this run's start —
-            // not a placement covering it. The pairs worth chasing never overlap: a
-            // two-address source dies exactly where its def begins, and a back-edge
-            // argument's run ends at its block's exit while the parameter's began at
-            // the header blocks earlier. A covering test finds neither (and where it
-            // would find one, the two are simultaneously live and `busy` forbids the
-            // register anyway). A hint, not a claim.
+            // barrier — then the class's, then the target's preference, then first
+            // fit. Unlike the whole-value scan there is no fallback to spilling:
+            // the spiller has already guaranteed one of these lands.
             let mut chosen = last_reg[v.0 as usize].and_then(ridx).filter(|&k| !busy[k]);
             if chosen.is_none() {
-                chosen = affin.get(&v).and_then(|parts| {
-                    parts.iter().find_map(|pv| {
-                        iv.iter()
-                            .zip(&iv_reg)
-                            .filter(|((w, (a, _)), r)| *w == *pv && *a <= lo && r.is_some())
-                            .max_by_key(|((_, (a, _)), _)| *a)
-                            .and_then(|(_, r)| *r)
-                            .and_then(ridx)
-                            .filter(|&k| !busy[k])
-                    })
-                });
+                chosen = class_reg[leader[v.0 as usize] as usize]
+                    .and_then(|(_, r)| ridx(r))
+                    .filter(|&k| !busy[k]);
             }
             if chosen.is_none()
                 && let Some(r) = f.phys_hint(v)
@@ -1723,6 +1737,11 @@ fn allocate_presplit(
             };
             iv_reg[cur] = Some(pool[k]);
             last_reg[v.0 as usize] = Some(pool[k]);
+            let cl = leader[v.0 as usize] as usize;
+            let d = depth_at(lo);
+            if remat_src[v.0 as usize].is_none() && class_reg[cl].is_none_or(|(pd, _)| d >= pd) {
+                class_reg[cl] = Some((d, pool[k]));
+            }
             active.push(cur);
         }
     }
@@ -1750,8 +1769,14 @@ fn allocate_presplit(
     // exactly offset a genuine gap in the middle. That reads as "fully covered",
     // no slot is allocated, no reload is emitted, and the register is read having
     // never been written.
+    // One slot per congruence class, not per value — Braun09 §4.4's CSSA
+    // precondition. Members' live ranges are disjoint, so along any executed path
+    // the slot's most recent store is by the member the reader wants; and an
+    // argument sharing its parameter's slot makes the argument's store-at-def
+    // *be* the edge's delivery (`resolve_edges` skips what is already there).
     let mut spills = 0u32;
     let mut slot: Vec<Option<u32>> = vec![None; nv];
+    let mut class_slot: HashMap<u32, u32, RandomState> = HashMap::default();
     for v in 0..nv {
         if live[v].is_empty() || remat_src[v].is_some() {
             continue;
@@ -1767,8 +1792,11 @@ fn allocate_presplit(
             (lo..hi).any(|q| !placed[v].iter().any(|&((a, b), _)| a <= q && q < b))
         });
         if gap {
-            slot[v] = Some(spills);
-            spills += 1;
+            slot[v] = Some(*class_slot.entry(leader[v]).or_insert_with(|| {
+                let s = spills;
+                spills += 1;
+                s
+            }));
         }
     }
 
@@ -2135,6 +2163,7 @@ fn allocate_presplit(
             &locs,
             &remat_spilled,
             &remat_src,
+            &slot,
             &mut spills,
             &mut b,
         )?;
@@ -2526,6 +2555,10 @@ fn resolve_edges(
     locs: &Locations,
     remat_spilled: &[bool],
     remat_src: &[Option<Inst>],
+    // Each value's spill slot, where the caller shares them across phi-congruence
+    // classes; empty when it does not (the whole-value path, where argument and
+    // parameter share a location outright or not at all).
+    arg_slot: &[Option<u32>],
     spills: &mut u32,
     b: &mut AllocationBuilder,
 ) -> Result<(), RegallocError> {
@@ -2628,8 +2661,18 @@ fn resolve_edges(
                             continue;
                         };
                         // The coalesced case: argument and parameter already share a
-                        // location, so the edge costs nothing.
-                        if from != to {
+                        // location, so the edge costs nothing. A spilled parameter
+                        // whose argument shares its slot is likewise free — the
+                        // argument's store-at-def wrote that slot, and one
+                        // definition means it is never stale, so the store *is*
+                        // the delivery.
+                        let delivered = match to {
+                            Alloc::Spill(s) => {
+                                arg_slot.get(a.0 as usize).copied().flatten() == Some(s)
+                            }
+                            _ => false,
+                        };
+                        if from != to && !delivered {
                             pending.push((EdgeSrc::Loc(from), to, f.class(vr)));
                         }
                     }
