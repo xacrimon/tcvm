@@ -498,10 +498,23 @@ spilling phase alone and never measures a whole allocator against linear scan.
   `remat_spilled` bookkeeping), the bounce-in-reload-phase path and its test.
   The split-versus-whole harnesses go with it; keep the absolute yardstick
   numbers in this file.
-- **Compile time.** `allocate` recomputes `order::compute` though `MFunc`
-  already carries the layout; `nextuse` is a per-value-map fixpoint that has
-  had zero optimization attention. Budget: get the ×1.8 down before regions
-  get bigger.
+- **Compile time — profiled; the answer is allocation traffic, again.**
+  Phase breakdown on mix2 (release, `spill::tests::phase_times`): order 3µs,
+  nextuse 34µs, plan 83µs, presplit colouring 153µs — the colouring costs the
+  same as the whole scan it replaced (they share `build_intervals`+`coalesce`),
+  so the pipeline's real overhead over whole ≈ nextuse + plan. A sampling
+  profile (`profile_spin` + `/usr/bin/sample`) then showed **~30% of the whole
+  of `allocate` is malloc/free/memset/Vec-growth**, against 18% presplit self,
+  10% nextuse self, 8% plan self; every named pass is ≤3% each. This is
+  Stage 1's `MInst` lesson repeating: `SpillPlan` allocates two Vecs *per
+  instruction* (`w_use`/`w_after`) plus reload/spill lists, `min_algorithm`
+  builds `reloads`/`must`/`keep`/`burned` fresh per instruction, `init_usual`
+  a HashMap per block. The fix is flat arenas / reused scratch buffers, not
+  better algorithms. Cheap structural fixes already landed (shared per-block
+  distance tables: plan 105→83µs; position-indexed clobbers; per-block
+  liveness lists in `resolve_edges` — the latter two measured neutral here
+  but scale right). Note the phase harness drifts ±10% between invocations;
+  trust the profiler and multi-run medians, not single runs.
 - **The x86-64 Rosetta test flake — pre-existing, unfiled.** ~1 full-suite run
   in 20 fails a random jit exec/asm test (`native_shift_edge_cases`,
   `float_compare_is_nan_safe` observed), each passing deterministically in
