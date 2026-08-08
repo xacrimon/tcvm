@@ -1619,9 +1619,7 @@ fn allocate_presplit(
             if f.uses(i)
                 .iter()
                 .any(|o| o.constraint != Constraint::Any && !sets.w_use[i].contains(&o.vreg))
-                || f.defs(i)
-                    .iter()
-                    .any(|o| !sets.w_after[i].contains(&o.vreg))
+                || f.defs(i).iter().any(|o| !sets.w_after[i].contains(&o.vreg))
             {
                 return Err(RegallocError::OutOfRegisters);
             }
@@ -1639,6 +1637,8 @@ fn allocate_presplit(
     // A register a `Fixed` operand claims, or an instruction destroys, is not
     // available to anything live across that instruction. Same treatment as the
     // whole-value scan: reserved for the length of the instruction's slot.
+    // Sorted by position so the colouring loop can window into it instead of
+    // scanning the whole list per run.
     let mut clobbers: Vec<(u32, PReg)> = Vec::new();
     for (i, &p) in pos.iter().enumerate() {
         let lo = p * 2;
@@ -1651,6 +1651,7 @@ fn allocate_presplit(
             }
         }
     }
+    clobbers.sort_by_key(|&(cl, _)| cl);
 
     // Copy affinities, transitive: the same union-find over non-interfering
     // arg/param pairs that the whole-value scan merges outright, extended with
@@ -1762,7 +1763,10 @@ fn allocate_presplit(
                     busy[k] = true;
                 }
             }
-            for &(cl, r) in &clobbers {
+            // A clobber at `cl` collides with runs covering `cl` or `cl + 1`, so
+            // the window is `cl ∈ [lo − 1, hi)`; the list is position-sorted.
+            let from = clobbers.partition_point(|&(cl, _)| cl + 1 < lo);
+            for &(cl, r) in clobbers[from..].iter().take_while(|&&(cl, _)| cl < hi) {
                 if r.class() == class
                     && ((lo <= cl && cl < hi) || (lo <= cl + 1 && cl + 1 < hi))
                     && let Some(k) = ridx(r)
@@ -2654,6 +2658,38 @@ fn resolve_edges(
         }
     }
 
+    // Which values are live at each block's entry, and at each block's
+    // terminator — inverted from `ranges` once, so the per-edge work below
+    // touches only values that can matter instead of sweeping every vreg per
+    // edge, twice. Entry and terminator positions are ascending in layout
+    // order, so each range maps to a contiguous window of blocks. Values are
+    // appended in ascending vreg order, preserving the old iteration order.
+    // (A temp's interval never covers a terminator — the terminator carries no
+    // operands — so skipping temps changes nothing there either.)
+    let entry_pos: Vec<u32> = order.iter().map(|&b| span[b.0 as usize].0 * 2).collect();
+    let term_pos: Vec<u32> = order
+        .iter()
+        .map(|&b| pos[*f.block_insts(b).last().expect("block has a terminator")] * 2)
+        .collect();
+    let mut live_entry: Vec<Vec<VReg>> = vec![Vec::new(); f.num_blocks()];
+    let mut live_term: Vec<Vec<VReg>> = vec![Vec::new(); f.num_blocks()];
+    for v in 0..f.num_vregs() {
+        if is_temp[v] {
+            continue;
+        }
+        for &(lo, hi) in &ranges[v] {
+            for (positions, out) in [(&entry_pos, &mut live_entry), (&term_pos, &mut live_term)] {
+                let from = positions.partition_point(|&q| q < lo);
+                for idx in from..positions.len() {
+                    if positions[idx] >= hi {
+                        break;
+                    }
+                    out[order[idx].0 as usize].push(VReg(v as u32));
+                }
+            }
+        }
+    }
+
     for &pred in order {
         let succs = f.succs(pred);
         for &succ in &succs {
@@ -2701,11 +2737,7 @@ fn resolve_edges(
             // coupling code fall out for free: a value in a register on one side and
             // a slot on the other *is* a reload, and needs no separate list.
             let mut pending: Vec<(EdgeSrc, Alloc, RegClass)> = Vec::new();
-            for v in 0..f.num_vregs() {
-                let vr = VReg(v as u32);
-                if is_temp[v] || !ranges[v].iter().any(|&(lo, hi)| lo <= entry && entry < hi) {
-                    continue;
-                }
+            for &vr in &live_entry[succ.0 as usize] {
                 let Some(to) = locs.get(vr, entry) else {
                     continue;
                 };
@@ -2766,7 +2798,7 @@ fn resolve_edges(
                     // Anything else simply carries on across the edge, and needs
                     // something only where the two ends disagree.
                     None => {
-                        if remat_spilled[v] {
+                        if remat_spilled[vr.0 as usize] {
                             continue;
                         }
                         match (locs.get(vr, at_pos), to) {
@@ -2786,7 +2818,7 @@ fn resolve_edges(
                             // for a loop header puts the replay on the entry edge
                             // and leaves the back edge, still holding it, free.
                             (None, Alloc::Reg(_)) => {
-                                let src = remat_src[v]
+                                let src = remat_src[vr.0 as usize]
                                     .expect("only a replayed value has no home at the branch");
                                 pending.push((EdgeSrc::Remat(vr, src), to, f.class(vr)));
                             }
@@ -2806,21 +2838,17 @@ fn resolve_edges(
             // Registers holding a live value at the end of this block, plus every
             // location these moves themselves name. A scratch must avoid all of them.
             let mut busy: Vec<PReg> = Vec::new();
-            for v in 0..f.num_vregs() {
+            for &vr in &live_term[pred.0 as usize] {
                 // A location is not the truth for a rematerializable value that was
                 // spilled: it keeps whatever register the value held *before* it was
                 // evicted, and that register is long since somebody else's. Counting it
                 // here would reserve a register nothing occupies — which on a
                 // 13-register machine is the difference between finding a scratch and
                 // declining.
-                if remat_spilled[v] {
+                if remat_spilled[vr.0 as usize] {
                     continue;
                 }
-                if let Some(Alloc::Reg(r)) = locs.get(VReg(v as u32), at_pos)
-                    && ranges[v]
-                        .iter()
-                        .any(|&(lo, hi)| lo <= at_pos && at_pos < hi)
-                {
+                if let Some(Alloc::Reg(r)) = locs.get(vr, at_pos) {
                     busy.push(r);
                 }
             }

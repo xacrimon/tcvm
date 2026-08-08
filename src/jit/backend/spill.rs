@@ -243,6 +243,7 @@ fn limit(
     at: Inst,
     keep: &[VReg],
     protect: &[bool],
+    remat: &[bool],
     plan: &mut SpillPlan,
 ) {
     if w.len() <= m {
@@ -272,14 +273,14 @@ fn limit(
             !keep.contains(&v),
             !shielded(v),
             dist.at(j, v),
-            f.remat(v).is_some(),
+            remat[v.0 as usize],
             v.0,
         )
     });
     for &v in &w[m..] {
         // Nothing to store if it is already in memory, if it is never read again —
         // the value is simply dead — or if it will be replayed rather than reloaded.
-        if !s.contains(&v) && dist.at(j, v) != INF && f.remat(v).is_none() {
+        if !s.contains(&v) && dist.at(j, v) != INF && !remat[v.0 as usize] {
             plan.spill_before[at].push(v);
             s.push(v);
         }
@@ -300,6 +301,7 @@ fn min_algorithm(
     w: &mut Vec<VReg>,
     s: &mut Vec<VReg>,
     protect: &[bool],
+    remat: &[bool],
     plan: &mut SpillPlan,
 ) {
     let insts = f.block_insts(b);
@@ -402,6 +404,7 @@ fn min_algorithm(
             i,
             &must,
             protect,
+            remat,
             plan,
         );
 
@@ -450,6 +453,7 @@ fn min_algorithm(
             i,
             &keep,
             protect,
+            remat,
             plan,
         );
 
@@ -672,9 +676,24 @@ pub fn plan(f: &impl RegallocFunc, layout: &Layout, nu: &NextUse, env: &MachineE
         }
     }
 
+    // Per-block next-use tables, shared by every class pass below: the distances
+    // are class-agnostic (they are filled from every use), and rebuilding these
+    // dense tables per class was a third of the spiller's whole cost.
+    let mut dists: Vec<Option<BlockDistances>> = (0..nb).map(|_| None).collect();
+    for &b in &layout.order {
+        dists[b.0 as usize] = Some(BlockDistances::build(f, b, nu, nv));
+    }
+    // Replayability, precomputed: `limit` consults it inside a sort key.
+    let remat: Vec<bool> = (0..nv as u32).map(|v| f.remat(VReg(v)).is_some()).collect();
+
     for class in RegClass::ALL {
         let k = env.order(class).len();
         if k == 0 {
+            continue;
+        }
+        // A class with no values has nothing to plan; mix2 is pure-integer, and
+        // its Float pass was a full walk of every block for nothing.
+        if !(0..nv as u32).any(|v| f.class(VReg(v)) == class) {
             continue;
         }
 
@@ -691,7 +710,9 @@ pub fn plan(f: &impl RegallocFunc, layout: &Layout, nu: &NextUse, env: &MachineE
 
         for &b in &layout.order {
             let bi = b.0 as usize;
-            let dist = BlockDistances::build(f, b, nu, nv);
+            let dist = dists[bi]
+                .as_ref()
+                .expect("every laid-out block has distances");
 
             let inherited = if layout.is_header(b) {
                 init_loop_header(f, layout, nu, b, class, k)
@@ -783,7 +804,9 @@ pub fn plan(f: &impl RegallocFunc, layout: &Layout, nu: &NextUse, env: &MachineE
                 );
             }
 
-            min_algorithm(f, b, class, k, &dist, &mut w, &mut s, protect, &mut plan);
+            min_algorithm(
+                f, b, class, k, dist, &mut w, &mut s, protect, &remat, &mut plan,
+            );
 
             // Values dead at the exit are holding nothing anyone will read. Leaving
             // them in `W` would carry them into successors' entry sets, where the
@@ -1590,5 +1613,104 @@ mod tests {
                 }
             });
         }
+    }
+    // Scratch diagnostic: per-phase compile time of the split pipeline. Delete
+    // once the breakdown is recorded. Run:
+    //   cargo test --release --lib phase_times -- --ignored --nocapture
+    #[test]
+    #[ignore = "timing harness, run by hand in release"]
+    fn phase_times() {
+        use std::time::Instant;
+
+        use crate::Lua;
+        use crate::jit::backend::isel::select;
+        use crate::jit::backend::regalloc::{
+            RegisterSets, allocate, allocate_whole, allocate_with,
+        };
+        use crate::jit::backend::target::{annotate, machine_env};
+        use crate::jit::frontend::lower::lower;
+        use crate::jit::ir::ty::{Rep, Ty, TypeSet};
+
+        const INT: Ty = Ty::new(Rep::Val, TypeSet::INT);
+        for file in ["mix", "mix2"] {
+            let source = std::fs::read_to_string(format!("test-files/{file}.lua")).unwrap();
+            let mut lua = Lua::new();
+            lua.load_all();
+            lua.enter(|ctx| {
+                let c = ctx.load(&source, Some(file)).expect("compile");
+                let proto = c.as_lua().expect("lua closure").proto.prototypes[0];
+                let func = lower(proto, 0, vec![INT]).expect("lower");
+                let mut m = select(&func).expect("isel");
+                annotate(&mut m);
+                let env = machine_env();
+                const N: u32 = 2000;
+                let time = |f: &mut dyn FnMut()| {
+                    let t = Instant::now();
+                    for _ in 0..N {
+                        f();
+                    }
+                    t.elapsed().as_nanos() as f64 / N as f64 / 1000.0
+                };
+                let layout = order::compute(&m).expect("reducible");
+                let nu = nextuse::analyze(&m, &layout);
+                let p = plan(&m, &layout, &nu, &env);
+                let sets = RegisterSets {
+                    w_use: &p.w_use,
+                    w_after: &p.w_after,
+                };
+                let t_order = time(&mut || {
+                    std::hint::black_box(order::compute(&m).unwrap());
+                });
+                let t_nu = time(&mut || {
+                    std::hint::black_box(nextuse::analyze(&m, &layout));
+                });
+                let t_plan = time(&mut || {
+                    std::hint::black_box(plan(&m, &layout, &nu, &env));
+                });
+                let t_colour = time(&mut || {
+                    std::hint::black_box(allocate_with(&m, &env, Some(sets)).unwrap());
+                });
+                let t_all = time(&mut || {
+                    std::hint::black_box(allocate(&m, &env).unwrap());
+                });
+                let t_whole = time(&mut || {
+                    std::hint::black_box(allocate_whole(&m, &env).unwrap());
+                });
+                eprintln!(
+                    "{file}: order {t_order:.1}us  nextuse {t_nu:.1}us  plan {t_plan:.1}us  \
+                     colour {t_colour:.1}us  | allocate {t_all:.1}us  whole {t_whole:.1}us"
+                );
+            });
+        }
+    }
+
+    #[test]
+    #[ignore = "spin loop for the sampling profiler; run by hand"]
+    fn profile_spin() {
+        use std::time::Instant;
+
+        use crate::Lua;
+        use crate::jit::backend::isel::select;
+        use crate::jit::backend::regalloc::allocate;
+        use crate::jit::backend::target::{annotate, machine_env};
+        use crate::jit::frontend::lower::lower;
+        use crate::jit::ir::ty::{Rep, Ty, TypeSet};
+
+        const INT: Ty = Ty::new(Rep::Val, TypeSet::INT);
+        let source = std::fs::read_to_string("test-files/mix2.lua").unwrap();
+        let mut lua = Lua::new();
+        lua.load_all();
+        lua.enter(|ctx| {
+            let c = ctx.load(&source, Some("mix2")).expect("compile");
+            let proto = c.as_lua().expect("lua closure").proto.prototypes[0];
+            let func = lower(proto, 0, vec![INT]).expect("lower");
+            let mut m = select(&func).expect("isel");
+            annotate(&mut m);
+            let env = machine_env();
+            let t = Instant::now();
+            while t.elapsed().as_secs() < 12 {
+                std::hint::black_box(allocate(&m, &env).unwrap());
+            }
+        });
     }
 }
