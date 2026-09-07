@@ -14,7 +14,7 @@ use crate::instruction::{Instruction, UpValueDescriptor};
 #[cfg(jit_enabled)]
 use crate::jit;
 use crate::lua::Context;
-use crate::vm::num::{self, op_arith, op_bit};
+use crate::vm::num::{self, op_arith, op_arith_float, op_arith_int, op_bit, op_bit_int};
 
 static HANDLERS: &[Handler] = &[
     op_move,
@@ -174,7 +174,13 @@ macro_rules! helpers {
                 }
             }};
 
-            (mut $$idx:expr) => {{
+            (ref $$idx:expr) => {{
+                unsafe {
+                    &*$registers.add($$idx as usize)
+                }
+            }};
+
+            (ref mut $$idx:expr) => {{
                 unsafe {
                     &mut *$registers.add($$idx as usize)
                 }
@@ -278,7 +284,7 @@ macro_rules! apply_cont_payload {
                 } else {
                     Value::nil()
                 };
-                *reg!(mut dst) = __r;
+                *reg!(ref mut dst) = __r;
                 dispatch!();
             }
             ContinuationPayload::IgnoreResult => {
@@ -305,10 +311,10 @@ macro_rules! apply_cont_payload {
                 );
                 let __to_copy = __nret.min(count as usize);
                 for i in 0..__to_copy {
-                    *reg!(mut base + 3 + i as u8) = $thread.stack[__results_base + i];
+                    *reg!(ref mut base + 3 + i as u8) = $thread.stack[__results_base + i];
                 }
                 for i in __to_copy..count as usize {
-                    *reg!(mut base + 3 + i as u8) = Value::nil();
+                    *reg!(ref mut base + 3 + i as u8) = Value::nil();
                 }
                 dispatch!();
             }
@@ -334,12 +340,12 @@ macro_rules! table_get_slow_body {
 
         let __v = __t.raw_get(__k);
         if !__v.is_nil() {
-            *reg!(mut __dst_reg) = __v;
+            *reg!(ref mut __dst_reg) = __v;
             dispatch!();
         }
 
         if !__t.shape().has_mm(MetamethodBits::INDEX) {
-            *reg!(mut __dst_reg) = Value::nil();
+            *reg!(ref mut __dst_reg) = Value::nil();
             dispatch!();
         }
 
@@ -347,7 +353,7 @@ macro_rules! table_get_slow_body {
         let __mt = unsafe { __t.metatable().unwrap_unchecked() };
         match walk_index_chain(Value::table(__t), __mt, __k, $ctx.symbols().mm_index) {
             IndexChain::Resolved(__rv) => {
-                *reg!(mut __dst_reg) = __rv;
+                *reg!(ref mut __dst_reg) = __rv;
                 dispatch!();
             }
             IndexChain::Invoke {
@@ -382,7 +388,7 @@ macro_rules! userdata_get_slow_body {
         match userdata_index_chain(__u, __recv, __k, $ctx.symbols().mm_index) {
             Err(()) => raise!(),
             Ok(IndexChain::Resolved(__rv)) => {
-                *reg!(mut __dst_reg) = __rv;
+                *reg!(ref mut __dst_reg) = __rv;
                 dispatch!();
             }
             Ok(IndexChain::Invoke {
@@ -577,7 +583,7 @@ extern "rust-preserve-none" fn op_move<'gc>(
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
     let (dst, src) = args!(Instruction::MOVE { dst, src });
-    *reg!(mut dst) = reg!(src);
+    *reg!(ref mut dst) = reg!(src);
     dispatch!();
 }
 
@@ -593,7 +599,7 @@ extern "rust-preserve-none" fn op_load<'gc>(
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
     let (dst, idx) = args!(Instruction::LOAD { dst, idx });
-    *reg!(mut dst) = constant!(idx);
+    *reg!(ref mut dst) = constant!(idx);
     dispatch!();
 }
 
@@ -609,7 +615,7 @@ extern "rust-preserve-none" fn op_lfalseskip<'gc>(
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
     let src = args!(Instruction::LFALSESKIP { src });
-    *reg!(mut src) = Value::boolean(false);
+    *reg!(ref mut src) = Value::boolean(false);
     skip!();
     dispatch!();
 }
@@ -630,7 +636,7 @@ extern "rust-preserve-none" fn op_getupval<'gc>(
     helpers!(instruction, ctx, thread, registers, ip, handlers);
     let (dst, idx) = args!(Instruction::GETUPVAL { dst, idx });
     let uv = upvalue!(idx);
-    *reg!(mut dst) = read_upvalue(thread, uv);
+    *reg!(ref mut dst) = read_upvalue(thread, uv);
     dispatch!();
 }
 
@@ -687,7 +693,7 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
             if !(v.is_nil() && t_state.shape().has_mm(MetamethodBits::INDEX)) {
                 drop(t_state);
                 observe_ic_type(thread, ic_idx, v);
-                *reg!(mut dst) = v;
+                *reg!(ref mut dst) = v;
                 dispatch!();
             }
         }
@@ -827,7 +833,7 @@ extern "rust-preserve-none" fn op_gettable<'gc>(
         become gettable_slow(instruction, ctx, thread, registers, ip, handlers);
     }
 
-    *reg!(mut dst) = v;
+    *reg!(ref mut dst) = v;
     dispatch!();
 }
 
@@ -936,7 +942,7 @@ extern "rust-preserve-none" fn op_getfield<'gc>(
             if !(v.is_nil() && t_state.shape().has_mm(MetamethodBits::INDEX)) {
                 drop(t_state);
                 observe_ic_type(thread, ic_idx, v);
-                *reg!(mut dst) = v;
+                *reg!(ref mut dst) = v;
                 dispatch!();
             }
         }
@@ -1080,8 +1086,8 @@ extern "rust-preserve-none" fn op_self<'gc>(
         become op_self_slow(instruction, ctx, thread, registers, ip, handlers);
     }
 
-    *reg!(mut dst) = method;
-    *reg!(mut (dst + 1)) = recv_val;
+    *reg!(ref mut dst) = method;
+    *reg!(ref mut (dst + 1)) = recv_val;
     dispatch!();
 }
 
@@ -1112,14 +1118,14 @@ extern "rust-preserve-none" fn op_self_slow<'gc>(
     let mt = unsafe { recv.metatable().unwrap_unchecked() };
     match walk_index_chain(recv_val, mt, key, ctx.symbols().mm_index) {
         IndexChain::Resolved(method) => {
-            *reg!(mut dst) = method;
-            *reg!(mut (dst + 1)) = recv_val;
+            *reg!(ref mut dst) = method;
+            *reg!(ref mut (dst + 1)) = recv_val;
             dispatch!();
         }
         IndexChain::Invoke { func, receiver } => {
             // Functional __index. Pre-place self at dst+1; the
             // continuation writes the resolved method into dst.
-            *reg!(mut (dst + 1)) = recv_val;
+            *reg!(ref mut (dst + 1)) = recv_val;
             let cont = Continuation {
                 payload: ContinuationPayload::StoreResult { dst },
                 results_base: 0,
@@ -1166,12 +1172,12 @@ extern "rust-preserve-none" fn op_self_nontable<'gc>(
     };
     match chain {
         IndexChain::Resolved(method) => {
-            *reg!(mut dst) = method;
-            *reg!(mut (dst + 1)) = recv_val;
+            *reg!(ref mut dst) = method;
+            *reg!(ref mut (dst + 1)) = recv_val;
             dispatch!();
         }
         IndexChain::Invoke { func, receiver } => {
-            *reg!(mut (dst + 1)) = recv_val;
+            *reg!(ref mut (dst + 1)) = recv_val;
             let cont = Continuation {
                 payload: ContinuationPayload::StoreResult { dst },
                 results_base: 0,
@@ -1195,7 +1201,7 @@ extern "rust-preserve-none" fn op_newtable<'gc>(
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
     let dst = args!(Instruction::NEWTABLE { dst });
-    *reg!(mut dst) = Value::table(Table::new(ctx));
+    *reg!(ref mut dst) = Value::table(Table::new(ctx));
     dispatch!();
 }
 
@@ -1203,10 +1209,87 @@ extern "rust-preserve-none" fn op_newtable<'gc>(
 // Arithmetic and bitwise (register-register)
 // ---------------------------------------------------------------------------
 
-macro_rules! binop_handler {
-    ($fn_name:ident, $instr:ident, $op:ident, $num_kind:ty, $mm:ident) => {
+/// `R[dst] = R[lhs] <op> R[rhs]` for the arithmetic opcodes.
+macro_rules! arith_handler {
+    ($fn_name:ident, $slow_name:ident, $instr:ident, $num_kind:ty, $mm:ident) => {
         #[inline(never)]
         extern "rust-preserve-none" fn $fn_name<'gc>(
+            instruction: Instruction,
+            ctx: Context<'gc>,
+            thread: &mut ThreadState<'gc>,
+            registers: Registers<'gc, '_>,
+            ip: *const Instruction,
+            handlers: *const (),
+        ) -> Result<(), Box<Error>> {
+            helpers!(instruction, ctx, thread, registers, ip, handlers);
+            let (dst, lhs, rhs) = args!(Instruction::$instr { dst, lhs, rhs });
+
+            // same-type int/float
+            if let (Some(lhs), Some(rhs)) = (reg!(ref lhs).get_integer(), reg!(ref rhs).get_integer()) {
+                if let Some(v) = op_arith_int::<$num_kind>(lhs, rhs) {
+                    *reg!(ref mut dst) = v;
+                    dispatch!();
+                }
+            } else if let (Some(lhs), Some(rhs)) =
+                (reg!(ref lhs).get_float(), reg!(ref rhs).get_float())
+            {
+                *reg!(ref mut dst) = op_arith_float::<$num_kind>(lhs, rhs);
+                dispatch!();
+            }
+
+            // mixed int/float and fallback
+            let (lhs, rhs) = (reg!(lhs), reg!(rhs));
+            if let Some(v) = op_arith::<$num_kind>(lhs, rhs) {
+                *reg!(ref mut dst) = v;
+                dispatch!();
+            }
+
+            become $slow_name(instruction, ctx, thread, registers, ip, handlers);
+        }
+
+        binop_slow_handler!($slow_name, $instr, $mm);
+    };
+}
+
+/// `R[dst] = R[lhs] <op> R[rhs]` for the bitwise opcodes.
+macro_rules! bit_handler {
+    ($fn_name:ident, $slow_name:ident, $instr:ident, $num_kind:ty, $mm:ident) => {
+        #[inline(never)]
+        extern "rust-preserve-none" fn $fn_name<'gc>(
+            instruction: Instruction,
+            ctx: Context<'gc>,
+            thread: &mut ThreadState<'gc>,
+            registers: Registers<'gc, '_>,
+            ip: *const Instruction,
+            handlers: *const (),
+        ) -> Result<(), Box<Error>> {
+            helpers!(instruction, ctx, thread, registers, ip, handlers);
+            let (dst, lhs, rhs) = args!(Instruction::$instr { dst, lhs, rhs });
+
+            // same-type int/float
+            if let (Some(lhs), Some(rhs)) = (reg!(ref lhs).get_integer(), reg!(ref rhs).get_integer()) {
+                *reg!(ref mut dst) = op_bit_int::<$num_kind>(lhs, rhs);
+                dispatch!();
+            }
+
+            // mixed int/float and fallback
+            let (lhs, rhs) = (reg!(lhs), reg!(rhs));
+            if let Some(v) = op_bit::<$num_kind>(lhs, rhs) {
+                *reg!(ref mut dst) = v;
+                dispatch!();
+            }
+
+            become $slow_name(instruction, ctx, thread, registers, ip, handlers);
+        }
+
+        binop_slow_handler!($slow_name, $instr, $mm);
+    };
+}
+
+macro_rules! binop_slow_handler {
+    ($slow_name:ident, $instr:ident, $mm:ident) => {
+        #[inline(never)]
+        extern "rust-preserve-none" fn $slow_name<'gc>(
             instruction: Instruction,
             ctx: Context<'gc>,
             thread: &mut ThreadState<'gc>,
@@ -1216,37 +1299,35 @@ macro_rules! binop_handler {
         ) -> Result<(), Box<Error>> {
             helpers!(instruction, ctx, thread, registers, ip, handlers);
             let (dst, lhs, rhs) = args!(Instruction::$instr { dst, lhs, rhs });
-            let (a, b) = (reg!(lhs), reg!(rhs));
-            if let Some(v) = $op::<$num_kind>(a, b) {
-                *reg!(mut dst) = v;
-                dispatch!();
-            }
-            let meta_fn = binop_metamethod(a, b, ctx.symbols().$mm);
+
+            let (lhs, rhs) = (reg!(lhs), reg!(rhs));
+            let meta_fn = binop_metamethod(lhs, rhs, ctx.symbols().$mm);
             if meta_fn.is_nil() {
                 raise!();
             }
+
             let cont = Continuation {
                 payload: ContinuationPayload::StoreResult { dst },
                 results_base: 0,
                 nret: 0,
             };
-            invoke_metamethod!(meta_fn, &[a, b], cont);
+            invoke_metamethod!(meta_fn, &[lhs, rhs], cont);
         }
     };
 }
 
-binop_handler!(op_add, ADD, op_arith, num::Add, mm_add);
-binop_handler!(op_sub, SUB, op_arith, num::Sub, mm_sub);
-binop_handler!(op_mul, MUL, op_arith, num::Mul, mm_mul);
-binop_handler!(op_mod, MOD, op_arith, num::Mod, mm_mod);
-binop_handler!(op_pow, POW, op_arith, num::Pow, mm_pow);
-binop_handler!(op_div, DIV, op_arith, num::Div, mm_div);
-binop_handler!(op_idiv, IDIV, op_arith, num::IDiv, mm_idiv);
-binop_handler!(op_band, BAND, op_bit, num::BAnd, mm_band);
-binop_handler!(op_bor, BOR, op_bit, num::BOr, mm_bor);
-binop_handler!(op_bxor, BXOR, op_bit, num::BXor, mm_bxor);
-binop_handler!(op_shl, SHL, op_bit, num::Shl, mm_shl);
-binop_handler!(op_shr, SHR, op_bit, num::Shr, mm_shr);
+arith_handler!(op_add, op_add_meta, ADD, num::Add, mm_add);
+arith_handler!(op_sub, op_sub_meta, SUB, num::Sub, mm_sub);
+arith_handler!(op_mul, op_mul_meta, MUL, num::Mul, mm_mul);
+arith_handler!(op_mod, op_mod_meta, MOD, num::Mod, mm_mod);
+arith_handler!(op_pow, op_pow_meta, POW, num::Pow, mm_pow);
+arith_handler!(op_div, op_div_meta, DIV, num::Div, mm_div);
+arith_handler!(op_idiv, op_idiv_meta, IDIV, num::IDiv, mm_idiv);
+bit_handler!(op_band, op_band_meta, BAND, num::BAnd, mm_band);
+bit_handler!(op_bor, op_bor_meta, BOR, num::BOr, mm_bor);
+bit_handler!(op_bxor, op_bxor_meta, BXOR, num::BXor, mm_bxor);
+bit_handler!(op_shl, op_shl_meta, SHL, num::Shl, mm_shl);
+bit_handler!(op_shr, op_shr_meta, SHR, num::Shr, mm_shr);
 
 // ---------------------------------------------------------------------------
 // Unary operations
@@ -1266,11 +1347,11 @@ extern "rust-preserve-none" fn op_unm<'gc>(
     let (dst, src) = args!(Instruction::UNM { dst, src });
     let val = reg!(src);
     if let Some(i) = val.get_integer() {
-        *reg!(mut dst) = Value::integer(i.wrapping_neg());
+        *reg!(ref mut dst) = Value::integer(i.wrapping_neg());
         dispatch!();
     }
     if let Some(f) = val.get_float() {
-        *reg!(mut dst) = Value::float(-f);
+        *reg!(ref mut dst) = Value::float(-f);
         dispatch!();
     }
     let meta_fn = unop_metamethod(val, ctx.symbols().mm_unm);
@@ -1300,7 +1381,7 @@ extern "rust-preserve-none" fn op_bnot<'gc>(
     let (dst, src) = args!(Instruction::BNOT { dst, src });
     let val = reg!(src);
     if let Some(i) = val.get_integer() {
-        *reg!(mut dst) = Value::integer(!i);
+        *reg!(ref mut dst) = Value::integer(!i);
         dispatch!();
     }
     let meta_fn = unop_metamethod(val, ctx.symbols().mm_bnot);
@@ -1328,7 +1409,7 @@ extern "rust-preserve-none" fn op_not<'gc>(
     helpers!(instruction, ctx, thread, registers, ip, handlers);
     let (dst, src) = args!(Instruction::NOT { dst, src });
     let val = reg!(src);
-    *reg!(mut dst) = Value::boolean(val.is_falsy());
+    *reg!(ref mut dst) = Value::boolean(val.is_falsy());
     dispatch!();
 }
 
@@ -1348,7 +1429,7 @@ extern "rust-preserve-none" fn op_len<'gc>(
 
     // Strings never consult __len; return byte length directly.
     if let Some(s) = val.get_string() {
-        *reg!(mut dst) = Value::integer(s.len() as i64);
+        *reg!(ref mut dst) = Value::integer(s.len() as i64);
         dispatch!();
     }
 
@@ -1356,7 +1437,7 @@ extern "rust-preserve-none" fn op_len<'gc>(
     let meta_fn = if let Some(t) = val.get_table() {
         let mm = t.get_metamethod(ctx.symbols().mm_len);
         if mm.is_nil() {
-            *reg!(mut dst) = Value::integer(t.raw_len() as i64);
+            *reg!(ref mut dst) = Value::integer(t.raw_len() as i64);
             dispatch!();
         }
         mm
@@ -1389,7 +1470,7 @@ extern "rust-preserve-none" fn op_concat<'gc>(
     // Fast path: both coerce to strings/numbers.
     let mut buf = Vec::new();
     if num::coerce_to_str(&mut buf, a) && num::coerce_to_str(&mut buf, b) {
-        *reg!(mut dst) = Value::string(LuaString::new(ctx, &buf));
+        *reg!(ref mut dst) = Value::string(LuaString::new(ctx, &buf));
         dispatch!();
     }
     let meta_fn = binop_metamethod(a, b, ctx.symbols().mm_concat);
@@ -1476,9 +1557,9 @@ extern "rust-preserve-none" fn op_eq<'gc>(
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
     let (lhs, rhs, inverted) = args!(Instruction::EQ { lhs, rhs, inverted });
+
     let a = reg!(lhs);
     let b = reg!(rhs);
-
     if a == b {
         // Primitive or pointer-equal — no metamethod consultation.
         if !inverted {
@@ -1525,27 +1606,32 @@ extern "rust-preserve-none" fn op_lt<'gc>(
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
     let (lhs, rhs, inverted) = args!(Instruction::LT { lhs, rhs, inverted });
-    let a = reg!(lhs);
-    let b = reg!(rhs);
-    let primitive = if let (Some(x), Some(y)) = (a.get_integer(), b.get_integer()) {
-        Some(x < y)
-    } else if let (Some(x), Some(y)) = (a.get_float(), b.get_float()) {
-        Some(x < y)
-    } else if let (Some(x), Some(y)) = (a.get_integer(), b.get_float()) {
-        Some((x as f64) < y)
-    } else if let (Some(x), Some(y)) = (a.get_float(), b.get_integer()) {
-        Some(x < (y as f64))
-    } else if let (Some(x), Some(y)) = (a.get_string(), b.get_string()) {
-        Some(x < y)
-    } else {
-        None
+
+    let primitive = {
+        let (a, b) = (reg!(ref lhs), reg!(ref rhs));
+        if let (Some(x), Some(y)) = (a.get_integer(), b.get_integer()) {
+            Some(x < y)
+        } else if let (Some(x), Some(y)) = (a.get_float(), b.get_float()) {
+            Some(x < y)
+        } else if let (Some(x), Some(y)) = (a.get_integer(), b.get_float()) {
+            Some((x as f64) < y)
+        } else if let (Some(x), Some(y)) = (a.get_float(), b.get_integer()) {
+            Some(x < (y as f64))
+        } else if let (Some(x), Some(y)) = (a.get_string(), b.get_string()) {
+            Some(x < y)
+        } else {
+            None
+        }
     };
+
     if let Some(r) = primitive {
         if r != inverted {
             skip!();
         }
         dispatch!();
     }
+
+    let (a, b) = (reg!(lhs), reg!(rhs));
     let meta_fn = binop_metamethod(a, b, ctx.symbols().mm_lt);
     if meta_fn.is_nil() {
         raise!();
@@ -1573,27 +1659,32 @@ extern "rust-preserve-none" fn op_le<'gc>(
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
     let (lhs, rhs, inverted) = args!(Instruction::LE { lhs, rhs, inverted });
-    let a = reg!(lhs);
-    let b = reg!(rhs);
-    let primitive = if let (Some(x), Some(y)) = (a.get_integer(), b.get_integer()) {
-        Some(x <= y)
-    } else if let (Some(x), Some(y)) = (a.get_float(), b.get_float()) {
-        Some(x <= y)
-    } else if let (Some(x), Some(y)) = (a.get_integer(), b.get_float()) {
-        Some((x as f64) <= y)
-    } else if let (Some(x), Some(y)) = (a.get_float(), b.get_integer()) {
-        Some(x <= (y as f64))
-    } else if let (Some(x), Some(y)) = (a.get_string(), b.get_string()) {
-        Some(x <= y)
-    } else {
-        None
+
+    let primitive = {
+        let (a, b) = (reg!(ref lhs), reg!(ref rhs));
+        if let (Some(x), Some(y)) = (a.get_integer(), b.get_integer()) {
+            Some(x <= y)
+        } else if let (Some(x), Some(y)) = (a.get_float(), b.get_float()) {
+            Some(x <= y)
+        } else if let (Some(x), Some(y)) = (a.get_integer(), b.get_float()) {
+            Some((x as f64) <= y)
+        } else if let (Some(x), Some(y)) = (a.get_float(), b.get_integer()) {
+            Some(x <= (y as f64))
+        } else if let (Some(x), Some(y)) = (a.get_string(), b.get_string()) {
+            Some(x <= y)
+        } else {
+            None
+        }
     };
+
     if let Some(r) = primitive {
         if r != inverted {
             skip!();
         }
         dispatch!();
     }
+
+    let (a, b) = (reg!(lhs), reg!(rhs));
     let meta_fn = binop_metamethod(a, b, ctx.symbols().mm_le);
     if meta_fn.is_nil() {
         raise!();
@@ -1646,7 +1737,7 @@ extern "rust-preserve-none" fn op_testset<'gc>(
     if truthy == inverted {
         skip!();
     } else {
-        *reg!(mut dst) = val;
+        *reg!(ref mut dst) = val;
     }
     dispatch!();
 }
@@ -2028,7 +2119,7 @@ extern "rust-preserve-none" fn op_forprep<'gc>(
     }
 
     // R[base+3] is the visible loop variable (copy of init)
-    *reg!(mut base + 3) = init;
+    *reg!(ref mut base + 3) = init;
 
     dispatch!();
 }
@@ -2057,8 +2148,8 @@ extern "rust-preserve-none" fn op_forloop<'gc>(
         let next = i.wrapping_add(s);
         let cont = if s > 0 { next <= lim } else { next >= lim };
         if cont {
-            *reg!(mut base) = Value::integer(next);
-            *reg!(mut base + 3) = Value::integer(next);
+            *reg!(ref mut base) = Value::integer(next);
+            *reg!(ref mut base + 3) = Value::integer(next);
             ip = unsafe { ip.offset(offset as isize) };
         }
     } else {
@@ -2068,8 +2159,8 @@ extern "rust-preserve-none" fn op_forloop<'gc>(
         let next = i + s;
         let cont = if s > 0.0 { next <= lim } else { next >= lim };
         if cont {
-            *reg!(mut base) = Value::float(next);
-            *reg!(mut base + 3) = Value::float(next);
+            *reg!(ref mut base) = Value::float(next);
+            *reg!(ref mut base + 3) = Value::float(next);
             ip = unsafe { ip.offset(offset as isize) };
         }
     }
@@ -2135,7 +2226,7 @@ extern "rust-preserve-none" fn op_tforloop<'gc>(
     let (base, offset) = args!(Instruction::TFORLOOP { base, offset });
     let first = reg!(base + 3);
     if !first.is_nil() {
-        *reg!(mut base + 2) = first;
+        *reg!(ref mut base + 2) = first;
         ip = unsafe { ip.offset(offset as isize) };
     }
     dispatch!();
@@ -2246,7 +2337,7 @@ extern "rust-preserve-none" fn op_closure<'gc>(
     let upvalues: Box<[Upvalue<'gc>]> = upvalues_vec.into_boxed_slice();
 
     let func = Function::new_lua(ctx.mutation(), proto, upvalues);
-    *reg!(mut dst) = Value::function(func);
+    *reg!(ref mut dst) = Value::function(func);
     dispatch!();
 }
 
@@ -2331,7 +2422,7 @@ extern "rust-preserve-none" fn op_vararg<'gc>(
                 .copy_within(extras_start..extras_start + to_copy, target);
         }
         for i in to_copy..wanted {
-            *reg!(mut dst + i as u8) = Value::nil();
+            *reg!(ref mut dst + i as u8) = Value::nil();
         }
     }
     dispatch!();
@@ -2378,7 +2469,7 @@ extern "rust-preserve-none" fn op_varargget<'gc>(
     } else {
         Value::nil()
     };
-    *reg!(mut dst) = v;
+    *reg!(ref mut dst) = v;
     dispatch!();
 }
 

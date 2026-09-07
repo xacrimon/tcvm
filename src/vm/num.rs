@@ -21,17 +21,23 @@ pub fn exact_float_to_int(f: f64) -> Option<i64> {
 }
 
 #[inline(always)]
+pub fn op_arith_int<'gc, Op: ArithOp>(lhs: i64, rhs: i64) -> Option<Value<'gc>> {
+    if Op::INT_ZERO_DIVISOR_INVALID && rhs == 0 {
+        return None;
+    }
+
+    Some(Op::int(lhs, rhs))
+}
+
+#[inline(always)]
+pub fn op_arith_float<'gc, Op: ArithOp>(lhs: f64, rhs: f64) -> Value<'gc> {
+    Op::float(lhs, rhs)
+}
+
+#[inline(always)]
 pub fn op_arith<'gc, Op: ArithOp>(lhs: Value, rhs: Value) -> Option<Value<'gc>> {
     if let (Some(li), Some(ri)) = (lhs.get_integer(), rhs.get_integer()) {
-        // Lua raises on integer `//`/`%` by zero; without this guard the
-        // `wrapping_div`/`wrapping_rem` in `Op::int` would panic. Returning
-        // `None` takes the handler's error path (integers carry no metamethod),
-        // matching every other arithmetic error. Float `/0` is unaffected — it
-        // yields inf/nan down in the float branch.
-        if Op::INT_ZERO_DIVISOR_RAISES && ri == 0 {
-            return None;
-        }
-        return Some(Op::int(li, ri));
+        return op_arith_int::<Op>(li, ri);
     }
 
     let lhs = if let Some(v) = lhs.get_integer() {
@@ -50,13 +56,11 @@ pub fn op_arith<'gc, Op: ArithOp>(lhs: Value, rhs: Value) -> Option<Value<'gc>> 
         return None;
     };
 
-    Some(Op::float(lhs, rhs))
+    Some(op_arith_float::<Op>(lhs, rhs))
 }
 
 pub trait ArithOp {
-    /// `//` and `%` set this so `op_arith` raises on an integer zero divisor
-    /// instead of computing (and panicking in `wrapping_div`/`wrapping_rem`).
-    const INT_ZERO_DIVISOR_RAISES: bool = false;
+    const INT_ZERO_DIVISOR_INVALID: bool = false;
 
     fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc>;
     fn float<'gc>(lhs: f64, rhs: f64) -> Value<'gc>;
@@ -107,7 +111,7 @@ impl ArithOp for Mul {
 pub struct Mod;
 
 impl ArithOp for Mod {
-    const INT_ZERO_DIVISOR_RAISES: bool = true;
+    const INT_ZERO_DIVISOR_INVALID: bool = true;
 
     #[inline(always)]
     fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc> {
@@ -165,7 +169,7 @@ impl ArithOp for Div {
 pub struct IDiv;
 
 impl ArithOp for IDiv {
-    const INT_ZERO_DIVISOR_RAISES: bool = true;
+    const INT_ZERO_DIVISOR_INVALID: bool = true;
 
     #[inline(always)]
     fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc> {
@@ -189,11 +193,16 @@ impl ArithOp for IDiv {
 }
 
 #[inline(always)]
+pub fn op_bit_int<'gc, Op: BitOp>(lhs: i64, rhs: i64) -> Value<'gc> {
+    Op::int(lhs, rhs)
+}
+
+#[inline(always)]
 pub fn op_bit<'gc, Op: BitOp>(lhs: Value, rhs: Value) -> Option<Value<'gc>> {
     let lhs = if let Some(v) = lhs.get_integer() {
         v
     } else if let Some(v) = lhs.get_float() {
-        exact_float_to_int(v).unwrap()
+        exact_float_to_int(v)?
     } else {
         return None;
     };
@@ -201,7 +210,7 @@ pub fn op_bit<'gc, Op: BitOp>(lhs: Value, rhs: Value) -> Option<Value<'gc>> {
     let rhs = if let Some(v) = rhs.get_integer() {
         v
     } else if let Some(v) = rhs.get_float() {
-        exact_float_to_int(v).unwrap()
+        exact_float_to_int(v)?
     } else {
         return None;
     };
@@ -274,7 +283,7 @@ impl BitOp for Shr {
     #[inline(always)]
     fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc> {
         // `wrapping_neg` so `rhs == i64::MIN` (a right shift by 2^63) doesn't
-        // overflow; `shift_left` maps the resulting huge magnitude to 0 anyway.
+        // overflow. `shift_left` maps the resulting huge magnitude to 0.
         Value::integer(shift_left(lhs, rhs.wrapping_neg()))
     }
 }
