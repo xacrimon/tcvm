@@ -34,6 +34,26 @@ pub fn op_arith_float<'gc, Op: ArithOp>(lhs: f64, rhs: f64) -> Value<'gc> {
     Op::float(lhs, rhs)
 }
 
+/// Coerces a numeric operand to `f64`; `None` if it is not a number.
+#[inline(always)]
+fn to_float(v: &Value) -> Option<f64> {
+    if let Some(i) = v.get_integer() {
+        Some(i as f64)
+    } else {
+        v.get_float()
+    }
+}
+
+/// The mixed int/float arm. Callers must have excluded same-type operands
+/// first, so this never sees int-int and needs no zero-divisor guard.
+#[inline(always)]
+pub fn op_arith_mixed<'gc, Op: ArithOp>(lhs: &Value, rhs: &Value) -> Option<Value<'gc>> {
+    let lhs = to_float(lhs)?;
+    let rhs = to_float(rhs)?;
+
+    Some(op_arith_float::<Op>(lhs, rhs))
+}
+
 #[inline(always)]
 pub fn op_arith<'gc, Op: ArithOp>(lhs: Value, rhs: Value) -> Option<Value<'gc>> {
     if let (Some(li), Some(ri)) = (lhs.get_integer(), rhs.get_integer()) {

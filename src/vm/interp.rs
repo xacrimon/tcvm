@@ -14,7 +14,8 @@ use crate::instruction::{Instruction, UpValueDescriptor};
 #[cfg(jit_enabled)]
 use crate::jit;
 use crate::lua::Context;
-use crate::vm::num::{self, op_arith, op_arith_float, op_arith_int, op_bit, op_bit_int};
+use crate::vm::num::{self, op_arith_float, op_arith_int, op_arith_mixed, op_bit, op_bit_int};
+use std::hint;
 
 static HANDLERS: &[Handler] = &[
     op_move,
@@ -1224,24 +1225,40 @@ macro_rules! arith_handler {
             helpers!(instruction, ctx, thread, registers, ip, handlers);
             let (dst, lhs, rhs) = args!(Instruction::$instr { dst, lhs, rhs });
 
-            // same-type int/float
-            if let (Some(lhs), Some(rhs)) = (reg!(ref lhs).get_integer(), reg!(ref rhs).get_integer()) {
-                if let Some(v) = op_arith_int::<$num_kind>(lhs, rhs) {
+            // Testing that the tags match *before* either arm lets the
+            // second operand's check collapse into the first: inside the gate
+            // `rhs.get_integer()` is implied by `lhs.get_integer()`. Halves the
+            // integer path's tag compares (four to two).
+            let lk = reg!(ref lhs).kind();
+            if std::hint::likely(lk == reg!(ref rhs).kind()) {
+                if std::hint::likely(lk == ValueKind::Integer) {
+                    if let (Some(lhs), Some(rhs)) =
+                        (reg!(ref lhs).get_integer(), reg!(ref rhs).get_integer())
+                    {
+                        if let Some(v) = op_arith_int::<$num_kind>(lhs, rhs) {
+                            *reg!(ref mut dst) = v;
+                            dispatch!();
+                        }
+
+                        raise!(); // handle e.g. div by zero
+                    }
+                } else if lk == ValueKind::Float {
+                    if let (Some(lhs), Some(rhs)) =
+                        (reg!(ref lhs).get_float(), reg!(ref rhs).get_float())
+                    {
+                        *reg!(ref mut dst) = op_arith_float::<$num_kind>(lhs, rhs);
+                        dispatch!();
+                    }
+                }
+            }
+
+            // Mixed int/float; same-type pairs are all handled above.
+            let mixed = op_arith_mixed::<$num_kind>(reg!(ref lhs), reg!(ref rhs));
+            if std::hint::unlikely(mixed.is_some()) {
+                if let Some(v) = mixed {
                     *reg!(ref mut dst) = v;
                     dispatch!();
                 }
-            } else if let (Some(lhs), Some(rhs)) =
-                (reg!(ref lhs).get_float(), reg!(ref rhs).get_float())
-            {
-                *reg!(ref mut dst) = op_arith_float::<$num_kind>(lhs, rhs);
-                dispatch!();
-            }
-
-            // mixed int/float and fallback
-            let (lhs, rhs) = (reg!(lhs), reg!(rhs));
-            if let Some(v) = op_arith::<$num_kind>(lhs, rhs) {
-                *reg!(ref mut dst) = v;
-                dispatch!();
             }
 
             become $slow_name(instruction, ctx, thread, registers, ip, handlers);
