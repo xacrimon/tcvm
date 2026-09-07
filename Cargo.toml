@@ -19,6 +19,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["jit"]
+jit = []
+
 [dependencies]
 tcvm-derive = { path = "derive", version = "0.1.0" }
 hashbrown = { version = "0.17.1", default-features = false, features = ["nightly"] }
@@ -31,7 +35,13 @@ thiserror = "2.0.18"
 ariadne = "0.6.0"
 rand_pcg = "0.10.2"
 rand_core = "0.10.1"
+libc = "0.2"
 
 [dev-dependencies]
 paste = "1.0.15"
 insta = "1.47.2"
+criterion = "0.5"
+
+[[bench]]
+name = "jit_pipeline"
+harness = false

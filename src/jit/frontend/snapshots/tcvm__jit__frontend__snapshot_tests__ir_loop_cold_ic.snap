@@ -1,0 +1,35 @@
+---
+source: src/jit/frontend/snapshot_tests.rs
+expression: "ir_of(&source, &[TAB, INT])"
+---
+block0(v0: tab, v1: int):
+       v4 = iconst 0
+       v5 = iconst 1
+       v6 = iconst 1
+       v7 = unpack.int v1
+       v8 = icmp le v5, v7
+            br v8 block1, block2
+block1:
+       v9 = kconst "x"
+      v10 = lua.getindex v0, v9
+      v11 = pack.int v4
+      v12 = lua.add v11, v10
+      v13 = unpack.int v1
+      v14 = iconst 1
+      v15 = add.i64 v5, v14
+      v16 = icmp le v15, v13
+            br v16 block3(v15, v12), block4(v12)
+block2:
+      v17 = pack.int v4
+            ret v17
+block3(v3: i64, v19: any):
+      v22 = kconst "x"
+      v23 = lua.getindex v0, v22
+      v24 = lua.add v19, v23
+      v25 = unpack.int v1
+      v26 = iconst 1
+      v27 = add.i64 v3, v26
+      v28 = icmp le v27, v25
+            br v28 block3(v27, v24), block4(v24)
+block4(v29: any):
+            ret v29

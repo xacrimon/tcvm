@@ -11,6 +11,8 @@ use crate::env::thread::{
 };
 use crate::env::value::{Value, ValueKind};
 use crate::instruction::{Instruction, UpValueDescriptor};
+#[cfg(jit_enabled)]
+use crate::jit;
 use crate::lua::Context;
 use crate::vm::num::{self, op_arith, op_bit};
 
@@ -440,6 +442,13 @@ macro_rules! table_set_slow_body {
 /// `SETTABUP` instruction whose prototype was assembled with a matching
 /// `ic_table` length.
 #[inline(always)]
+fn observe_ic_type<'gc>(thread: &ThreadState<'gc>, ic_idx: u16, v: Value<'gc>) {
+    let proto = unsafe { &thread.top_lua_unchecked().closure.proto };
+    if let Some(cell) = proto.ic_types.get(ic_idx as usize) {
+        crate::env::value::KindSet::observe(cell, v);
+    }
+}
+
 fn read_ic<'gc>(thread: &ThreadState<'gc>, ic_idx: u16) -> InlineCache<'gc> {
     // SAFETY: ic_idx is allocated at compile-time within the prototype's
     // IC count; debug-asserted in alloc_ic_slot's saturating_add.
@@ -677,6 +686,7 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
             let v = unsafe { t_state.property_at(slot) };
             if !(v.is_nil() && t_state.shape().has_mm(MetamethodBits::INDEX)) {
                 drop(t_state);
+                observe_ic_type(thread, ic_idx, v);
                 *reg!(mut dst) = v;
                 dispatch!();
             }
@@ -925,6 +935,7 @@ extern "rust-preserve-none" fn op_getfield<'gc>(
             let v = unsafe { t_state.property_at(slot) };
             if !(v.is_nil() && t_state.shape().has_mm(MetamethodBits::INDEX)) {
                 drop(t_state);
+                observe_ic_type(thread, ic_idx, v);
                 *reg!(mut dst) = v;
                 dispatch!();
             }
@@ -1697,6 +1708,41 @@ extern "rust-preserve-none" fn op_call<'gc>(
                 num_extras,
                 continuation: None,
             });
+
+            // The JIT's only entry point. The frame is already pushed and its
+            // registers are in place, so a region can run over it as-is, and a
+            // deopt out of one leaves a frame the interpreter can simply pick up.
+            #[cfg(jit_enabled)]
+            match jit::region::on_call(ctx, thread, closure.proto, new_base) {
+                jit::region::Outcome::Interpret => {}
+                jit::region::Outcome::Deopt(pc) => {
+                    thread.top_lua_mut().unwrap().pc = pc;
+                    ip = unsafe { closure.proto.code.as_ptr().add(pc) };
+                    registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
+                    dispatch!();
+                }
+                jit::region::Outcome::Returned(nret) => {
+                    // Native code lands its results at `base + 0` — which is what
+                    // makes this the same unwind `op_return` does, just with the
+                    // count coming from the status word instead of the bytecode.
+                    match frame_return(ctx.mutation(), thread, new_base, nret) {
+                        FrameReturn::TopLevel | FrameReturn::ToNonLua => return Ok(()),
+                        FrameReturn::Caller {
+                            new_base: caller_base,
+                            new_ip,
+                        } => {
+                            ip = new_ip;
+                            registers = unsafe { thread.stack.as_mut_ptr().add(caller_base) };
+                            dispatch!();
+                        }
+                        // Continuations are attached by the metamethod helpers to
+                        // frames *they* push; this one was pushed a dozen lines up
+                        // with `continuation: None`.
+                        FrameReturn::Continuation => unreachable!("op_call pushed no continuation"),
+                    }
+                }
+            }
+
             ip = closure.proto.code.as_ptr();
             registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
             dispatch!();

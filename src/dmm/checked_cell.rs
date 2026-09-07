@@ -31,6 +31,15 @@ pub struct CheckedCell<T: ?Sized> {
 }
 
 impl<T> CheckedCell<T> {
+    /// Byte offset of the payload within the cell.
+    ///
+    /// Exposed for the JIT, whose generated code addresses fields off a raw
+    /// `Gc` pointer and so needs this as a constant. It is *not* a constant you
+    /// may write down: the borrow flag above exists only under
+    /// `debug_assertions` or `test`, so the payload sits at a different offset
+    /// in a release build than in every build you test in.
+    pub const PAYLOAD_OFFSET: usize = core::mem::offset_of!(Self, value);
+
     #[inline]
     pub const fn new(t: T) -> Self {
         Self {

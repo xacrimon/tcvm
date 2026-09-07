@@ -1,0 +1,12 @@
+---
+source: src/jit/frontend/snapshot_tests.rs
+expression: output
+---
+=== bytecode cfg: main (params=0, vararg=true, stack=4)
+  declined: Vararg(0)
+
+=== bytecode cfg: main/P0 (params=2, vararg=false, stack=4)
+  declined: MultRet(2)
+
+=== bytecode cfg: main/P1 (params=0, vararg=true, stack=2)
+  declined: Vararg(0)

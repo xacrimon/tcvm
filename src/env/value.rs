@@ -1,3 +1,4 @@
+use core::cell::Cell;
 use core::hash::{Hash, Hasher};
 use std::hint;
 use std::marker::PhantomData;
@@ -9,7 +10,7 @@ use crate::env::table::Table;
 use crate::env::thread::Thread;
 use crate::env::userdata::Userdata;
 
-#[derive(Clone, Copy, Collect, PartialEq, Eq)]
+#[derive(Clone, Copy, Collect, PartialEq, Eq, Hash, Debug)]
 #[collect(internal, require_static)]
 #[repr(u8)]
 pub enum ValueKind {
@@ -29,6 +30,24 @@ pub struct Value<'gc> {
     kind: ValueKind,
     data: u64,
     _marker: PhantomData<&'gc ()>,
+}
+
+/// Field offsets, for the JIT's encoder.
+///
+/// `Value` has no `#[repr(C)]`, so its field order is the compiler's business,
+/// not ours. Compiled code still has to load and store these fields at constant
+/// displacements, so the constants are *derived* — a field reorder moves the
+/// generated code with it instead of silently miscompiling it. A child module
+/// can see its parent's private fields, which is the only reason this works.
+pub mod layout {
+    use super::Value;
+
+    /// Offset of the type tag. One byte; the rest of its word is padding.
+    pub const KIND: usize = core::mem::offset_of!(Value<'static>, kind);
+    /// Offset of the payload: the integer, the float bits, or the `Gc` pointer.
+    pub const DATA: usize = core::mem::offset_of!(Value<'static>, data);
+    /// Stride of a `Value` in the thread's stack and in a table's slot arrays.
+    pub const SIZE: usize = size_of::<Value<'static>>();
 }
 
 impl<'gc> Value<'gc> {
@@ -189,6 +208,16 @@ impl<'gc> Value<'gc> {
         self.kind
     }
 
+    /// The raw payload bits — an integer, a float's bits, or a `Gc` address.
+    ///
+    /// This is exactly what compiled code holds in a register for this value, so
+    /// the JIT materializes a pool constant by emitting this alongside the tag.
+    /// Sound to hand out as an address only because the collector never moves an
+    /// object, and the pool keeps the referent alive.
+    pub fn raw_payload(self) -> u64 {
+        self.data
+    }
+
     pub fn type_name(&self) -> &'static str {
         match self.kind {
             ValueKind::Nil => "nil",
@@ -199,6 +228,58 @@ impl<'gc> Value<'gc> {
             ValueKind::Function => "function",
             ValueKind::Thread => "thread",
             ValueKind::Userdata => "userdata",
+        }
+    }
+}
+
+bitflags::bitflags! {
+    /// A set of observed `ValueKind`s, one bit per kind.
+    ///
+    /// Recorded per inline-cache site so the JIT can learn what a load actually
+    /// produces. A shape proves *where* a field lives, never *what* it holds —
+    /// so without this a field read has to stay generic, and every arithmetic op
+    /// consuming it stays a metamethod-capable call.
+    ///
+    /// Booleans collapse to a single bit: no consumer of this cares which.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+    pub struct KindSet: u16 {
+        const NIL = 1 << 0;
+        const BOOLEAN = 1 << 1;
+        const INTEGER = 1 << 2;
+        const FLOAT = 1 << 3;
+        const STRING = 1 << 4;
+        const TABLE = 1 << 5;
+        const FUNCTION = 1 << 6;
+        const THREAD = 1 << 7;
+        const USERDATA = 1 << 8;
+    }
+}
+
+impl KindSet {
+    #[inline]
+    pub fn of(v: Value<'_>) -> Self {
+        match v.kind() {
+            ValueKind::Nil => Self::NIL,
+            ValueKind::Boolean => Self::BOOLEAN,
+            ValueKind::Integer => Self::INTEGER,
+            ValueKind::Float => Self::FLOAT,
+            ValueKind::String => Self::STRING,
+            ValueKind::Table => Self::TABLE,
+            ValueKind::Function => Self::FUNCTION,
+            ValueKind::Thread => Self::THREAD,
+            ValueKind::Userdata => Self::USERDATA,
+        }
+    }
+
+    /// Fold `v` into the set. Hot-path call: the common case is a set that
+    /// already contains the kind, so this is a load, a test, and a
+    /// well-predicted not-taken branch.
+    #[inline]
+    pub fn observe(cell: &Cell<Self>, v: Value<'_>) {
+        let k = Self::of(v);
+        let seen = cell.get();
+        if !seen.contains(k) {
+            cell.set(seen | k);
         }
     }
 }

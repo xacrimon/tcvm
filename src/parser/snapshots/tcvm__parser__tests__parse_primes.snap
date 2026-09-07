@@ -2,7 +2,7 @@
 source: src/parser/mod.rs
 expression: syntax_tree
 ---
-Root@0..185
+Root@0..186
   DeclStmt@0..78
     Local@0..5 "local"
     FuncStmt@5..78
@@ -89,76 +89,76 @@ Root@0..185
     ExprList@105..107
       LiteralExpr@105..107
         String@105..107 "\"\""
-  WhileStmt@107..177
+  WhileStmt@107..178
     While@107..112 "while"
-    BinOp@112..122
+    BinOp@112..123
       Ident@112..117
         Ident@112..117 "found"
       LAngle@117..118 "<"
-      LiteralExpr@118..122
-        Int@118..122 "1000"
-    DoStmt@122..177
-      Do@122..124 "do"
-      StmtList@124..174
-        IfStmt@124..169
-          If@124..126 "if"
-          FuncCall@126..137
-            Ident@126..134
-              Ident@126..134 "is_prime"
-            FuncArgs@134..137
-              LParen@134..135 "("
-              Ident@135..136
-                Ident@135..136 "x"
-              RParen@136..137 ")"
-          Then@137..141 "then"
-          StmtList@141..166
-            AssignStmt@141..154
-              AssignList@141..146
-                Ident@141..146
-                  Ident@141..146 "found"
-              Assign@146..147 "="
-              ExprList@147..154
-                BinOp@147..154
-                  Ident@147..152
-                    Ident@147..152 "found"
-                  Plus@152..153 "+"
-                  LiteralExpr@153..154
-                    Int@153..154 "1"
-            AssignStmt@154..166
-              AssignList@154..155
-                Ident@154..155
-                  Ident@154..155 "s"
-              Assign@155..156 "="
-              ExprList@156..166
-                BinOp@156..166
-                  Ident@156..157
-                    Ident@156..157 "s"
-                  DDot@157..159 ".."
-                  BinOp@159..166
-                    Ident@159..160
-                      Ident@159..160 "x"
-                    DDot@160..162 ".."
-                    LiteralExpr@162..166
-                      String@162..166 "\"\\n\""
-          End@166..169 "end"
-        AssignStmt@169..174
-          AssignList@169..170
-            Ident@169..170
-              Ident@169..170 "x"
-          Assign@170..171 "="
-          ExprList@171..174
-            BinOp@171..174
-              Ident@171..172
-                Ident@171..172 "x"
-              Plus@172..173 "+"
-              LiteralExpr@173..174
-                Int@173..174 "1"
-      End@174..177 "end"
-  FuncCall@177..185
-    Ident@177..182
-      Ident@177..182 "print"
-    FuncArgs@182..185
-      LParen@182..183 "("
-      Ident@183..184
-        Ident@183..184 "s"
-      RParen@184..185 ")"
+      LiteralExpr@118..123
+        Int@118..123 "10000"
+    DoStmt@123..178
+      Do@123..125 "do"
+      StmtList@125..175
+        IfStmt@125..170
+          If@125..127 "if"
+          FuncCall@127..138
+            Ident@127..135
+              Ident@127..135 "is_prime"
+            FuncArgs@135..138
+              LParen@135..136 "("
+              Ident@136..137
+                Ident@136..137 "x"
+              RParen@137..138 ")"
+          Then@138..142 "then"
+          StmtList@142..167
+            AssignStmt@142..155
+              AssignList@142..147
+                Ident@142..147
+                  Ident@142..147 "found"
+              Assign@147..148 "="
+              ExprList@148..155
+                BinOp@148..155
+                  Ident@148..153
+                    Ident@148..153 "found"
+                  Plus@153..154 "+"
+                  LiteralExpr@154..155
+                    Int@154..155 "1"
+            AssignStmt@155..167
+              AssignList@155..156
+                Ident@155..156
+                  Ident@155..156 "s"
+              Assign@156..157 "="
+              ExprList@157..167
+                BinOp@157..167
+                  Ident@157..158
+                    Ident@157..158 "s"
+                  DDot@158..160 ".."
+                  BinOp@160..167
+                    Ident@160..161
+                      Ident@160..161 "x"
+                    DDot@161..163 ".."
+                    LiteralExpr@163..167
+                      String@163..167 "\"\\n\""
+          End@167..170 "end"
+        AssignStmt@170..175
+          AssignList@170..171
+            Ident@170..171
+              Ident@170..171 "x"
+          Assign@171..172 "="
+          ExprList@172..175
+            BinOp@172..175
+              Ident@172..173
+                Ident@172..173 "x"
+              Plus@173..174 "+"
+              LiteralExpr@174..175
+                Int@174..175 "1"
+      End@175..178 "end"
+  FuncCall@178..186
+    Ident@178..183
+      Ident@178..183 "print"
+    FuncArgs@183..186
+      LParen@183..184 "("
+      Ident@184..185
+        Ident@184..185 "s"
+      RParen@185..186 ")"

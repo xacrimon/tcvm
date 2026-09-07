@@ -245,6 +245,18 @@ make_lock_wrapper!(
     }
 );
 
+impl<T> RefLock<T> {
+    /// Byte offset of the payload from the start of the `RefLock`.
+    ///
+    /// Compiled code addresses a table's fields off the raw `Gc` pointer, so it
+    /// needs this as a constant — but it must never be *written down* as one:
+    /// `CheckedCell`'s borrow flag exists only under `debug_assertions` or
+    /// `test`, so the payload sits at one offset in every build you test in and
+    /// a different one in the release build you ship.
+    pub const PAYLOAD_OFFSET: usize =
+        core::mem::offset_of!(Self, cell) + CheckedCell::<T>::PAYLOAD_OFFSET;
+}
+
 impl<T: fmt::Debug + ?Sized> fmt::Debug for RefLock<T> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         let mut fmt = fmt.debug_tuple("RefLock");

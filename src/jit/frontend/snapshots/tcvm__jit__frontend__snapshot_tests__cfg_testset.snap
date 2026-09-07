@@ -1,0 +1,40 @@
+---
+source: src/jit/frontend/snapshot_tests.rs
+expression: cfgs_of(& source)
+---
+=== bytecode cfg: main (params=0, vararg=true, stack=8)
+  declined: Vararg(0)
+
+=== bytecode cfg: main/P0 (params=1, vararg=false, stack=8)
+  b0: succs=[b5, b21] live_in=[R0]
+    0000  LOAD            R1 K0  ; 0
+    0001  LOAD            R2 K1  ; 1
+    0002  MOVE            R3 R0
+    0003  LOAD            R4 K1  ; 1
+    0004  FORPREP         R2 +16
+  b5: succs=[b10, b12] live_in=[R1, R2, R3, R4, R5] edge_params=[R2, R5]
+    0005  LOAD            R6 K2  ; 3
+    0006  MOD             R6 R5 R6
+    0007  LOAD            R7 K0  ; 0
+    0008  EQ              R6 R7 inv=true
+    0009  JMP             +2
+  b10: succs=[b12, b13] live_in=[R1, R2, R3, R4, R5, R6, R7]
+    0010  TESTSET         R6 R5 inv=false
+    0011  JMP             +1
+  b12: succs=[b13] live_in=[R1, R2, R3, R4, R5, R7]
+    0012  LOAD            R6 K3  ; false
+  b13: succs=[b15, b17] live_in=[R1, R2, R3, R4, R5, R6, R7] edge_params=[R6]
+    0013  TESTSET         R7 R6 inv=true
+    0014  JMP             +2
+  b15: succs=[b17] live_in=[R1, R2, R3, R4, R5]
+    0015  LOAD            R7 K4  ; 2
+    0016  MUL             R7 R5 R7
+  b17: succs=[b19, b20] live_in=[R1, R2, R3, R4, R7] edge_params=[R7]
+    0017  TESTSET         R1 R7 inv=false
+    0018  JMP             +1
+  b19: succs=[b20] live_in=[R2, R3, R4]
+    0019  LOAD            R1 K5  ; -1
+  b20: succs=[b21, b5] live_in=[R1, R2, R3, R4] edge_params=[R1]
+    0020  FORLOOP         R2 -16
+  b21: succs=[] live_in=[R1]
+    0021  RETURN          R1 count=2

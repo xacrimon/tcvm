@@ -1,3 +1,5 @@
+#[cfg(jit_enabled)]
+use crate::dmm::RefLock;
 use crate::dmm::{Gc, Lock, Mutation};
 use crate::env::function::InlineCache;
 use crate::env::{LuaString, Prototype, Value};
@@ -294,6 +296,11 @@ impl<'gc> Chunk<'gc> {
 
         let ic_table =
             vec![Lock::new(InlineCache::Empty); self.next_ic_idx as usize].into_boxed_slice();
+        let ic_types = vec![
+            core::cell::Cell::new(crate::env::value::KindSet::empty());
+            self.next_ic_idx as usize
+        ]
+        .into_boxed_slice();
 
         Gc::new(
             mc,
@@ -309,6 +316,11 @@ impl<'gc> Chunk<'gc> {
                 num_upvalues,
                 source: self.source,
                 ic_table,
+                ic_types,
+                #[cfg(jit_enabled)]
+                jit_calls: core::cell::Cell::new(0),
+                #[cfg(jit_enabled)]
+                jit: Gc::new(mc, RefLock::new(None)),
             },
         )
     }

@@ -1,0 +1,39 @@
+---
+source: src/jit/frontend/snapshot_tests.rs
+expression: out
+---
+block0(v0: tab, v1: int):
+       v4 = iconst 0
+       v5 = iconst 1
+       v6 = iconst 1
+       v7 = unpack.int v1
+       v8 = icmp le v5, v7
+            br v8 block1, block2(v4)
+block1:
+       v9 = guard.shape v0, S0  ; exit0
+            assume.no_mm S0, INDEX
+      v10 = tab.props v9
+      v11 = slot.get v10, 0
+      v12 = guard.type v11, int  ; exit1
+      v13 = unpack.int v12
+      v14 = add.i64 v4, v13
+      v15 = unpack.int v1
+      v16 = iconst 1
+      v17 = add.i64 v5, v16
+      v18 = icmp le v17, v15
+            br v18 block3(v17, v14), block2(v14)
+block2(v19: i64):
+      v20 = pack.int v19
+            ret v20
+block3(v3: i64, v22: i64):
+            assume.no_mm S0, INDEX
+      v25 = tab.props v9
+      v26 = slot.get v25, 0
+      v27 = guard.type v26, int  ; exit2
+      v28 = unpack.int v27
+      v29 = add.i64 v22, v28
+      v30 = unpack.int v1
+      v31 = iconst 1
+      v32 = add.i64 v3, v31
+      v33 = icmp le v32, v30
+            br v33 block3(v32, v29), block2(v29)
