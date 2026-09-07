@@ -1,3 +1,5 @@
+use std::hint;
+
 use crate::dmm::{Gc, Mutation, RefLock};
 use crate::env::function::{
     Function, FunctionKind, InlineCache, LuaClosure, NativeClosure, NativeContext, Stack, Upvalue,
@@ -14,8 +16,7 @@ use crate::instruction::{Instruction, UpValueDescriptor};
 #[cfg(jit_enabled)]
 use crate::jit;
 use crate::lua::Context;
-use crate::vm::num::{self, op_arith_float, op_arith_int, op_arith_mixed, op_bit, op_bit_int};
-use std::hint;
+use crate::vm::num::{self, op_arith_float, op_arith_int, op_bit_int};
 
 static HANDLERS: &[Handler] = &[
     op_move,
@@ -1252,19 +1253,10 @@ macro_rules! arith_handler {
                 }
             }
 
-            // Mixed int/float; same-type pairs are all handled above.
-            let mixed = op_arith_mixed::<$num_kind>(reg!(ref lhs), reg!(ref rhs));
-            if std::hint::unlikely(mixed.is_some()) {
-                if let Some(v) = mixed {
-                    *reg!(ref mut dst) = v;
-                    dispatch!();
-                }
-            }
-
             become $slow_name(instruction, ctx, thread, registers, ip, handlers);
         }
 
-        binop_slow_handler!($slow_name, $instr, $mm);
+        binop_slow_handler!($slow_name, $instr, $num_kind, op_arith_mixed, $mm);
     };
 }
 
@@ -1284,27 +1276,22 @@ macro_rules! bit_handler {
             let (dst, lhs, rhs) = args!(Instruction::$instr { dst, lhs, rhs });
 
             // same-type int/float
-            if let (Some(lhs), Some(rhs)) = (reg!(ref lhs).get_integer(), reg!(ref rhs).get_integer()) {
+            if let (Some(lhs), Some(rhs)) =
+                (reg!(ref lhs).get_integer(), reg!(ref rhs).get_integer())
+            {
                 *reg!(ref mut dst) = op_bit_int::<$num_kind>(lhs, rhs);
-                dispatch!();
-            }
-
-            // mixed int/float and fallback
-            let (lhs, rhs) = (reg!(lhs), reg!(rhs));
-            if let Some(v) = op_bit::<$num_kind>(lhs, rhs) {
-                *reg!(ref mut dst) = v;
                 dispatch!();
             }
 
             become $slow_name(instruction, ctx, thread, registers, ip, handlers);
         }
 
-        binop_slow_handler!($slow_name, $instr, $mm);
+        binop_slow_handler!($slow_name, $instr, $num_kind, op_bit_mixed, $mm);
     };
 }
 
 macro_rules! binop_slow_handler {
-    ($slow_name:ident, $instr:ident, $mm:ident) => {
+    ($slow_name:ident, $instr:ident, $num_kind:ty, $num_mix_h:ident, $mm:ident) => {
         #[inline(never)]
         extern "rust-preserve-none" fn $slow_name<'gc>(
             instruction: Instruction,
@@ -1316,6 +1303,18 @@ macro_rules! binop_slow_handler {
         ) -> Result<(), Box<Error>> {
             helpers!(instruction, ctx, thread, registers, ip, handlers);
             let (dst, lhs, rhs) = args!(Instruction::$instr { dst, lhs, rhs });
+
+            {
+                let (lhs, rhs) = (reg!(ref lhs), reg!(ref rhs));
+                debug_assert_ne!(lhs.kind(), rhs.kind());
+                let mixed = num::$num_mix_h::<$num_kind>(lhs, rhs);
+                if std::hint::unlikely(mixed.is_some()) {
+                    if let Some(v) = mixed {
+                        *reg!(ref mut dst) = v;
+                        dispatch!();
+                    }
+                }
+            }
 
             let (lhs, rhs) = (reg!(lhs), reg!(rhs));
             let meta_fn = binop_metamethod(lhs, rhs, ctx.symbols().$mm);

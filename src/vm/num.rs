@@ -218,6 +218,23 @@ pub fn op_bit_int<'gc, Op: BitOp>(lhs: i64, rhs: i64) -> Value<'gc> {
 }
 
 #[inline(always)]
+fn bitwise_coerce_int(v: &Value) -> Option<i64> {
+    if let Some(i) = v.get_float() {
+        Some(i as i64)
+    } else {
+        v.get_integer()
+    }
+}
+
+#[inline(always)]
+pub fn op_bit_mixed<'gc, Op: BitOp>(lhs: &Value, rhs: &Value) -> Option<Value<'gc>> {
+    let lhs: i64 = bitwise_coerce_int(lhs)?;
+    let rhs = bitwise_coerce_int(rhs)?;
+
+    Some(op_bit_int::<Op>(lhs, rhs))
+}
+
+#[inline(always)]
 pub fn op_bit<'gc, Op: BitOp>(lhs: Value, rhs: Value) -> Option<Value<'gc>> {
     let lhs = if let Some(v) = lhs.get_integer() {
         v
