@@ -39,7 +39,7 @@ use crate::env::function::{InlineCache, Prototype};
 use crate::env::shape::MetamethodBits;
 use crate::env::value::KindSet;
 use crate::env::value::{Value, ValueKind};
-use crate::instruction::Instruction;
+use crate::instruction::{Instruction, Op as BcOp};
 use crate::jit::frontend::cfg::{self, Cfg, Term, Unsupported};
 use crate::jit::frontend::sink::{
     self, Decline, Feedback, IcFeedback, RegState, Scalar, Sink, compare, step, to_val,
@@ -213,9 +213,10 @@ impl<'gc, 'a> Feedback for VmFeedback<'gc, 'a> {
             // else writing the step register (including a second `for` loop that
             // reuses this base with a different step) means we can't pin the sign
             // down, so we decline the loop.
-            let Instruction::LOAD { idx, .. } = i else {
+            if i.op() != BcOp::LOAD {
                 return None;
-            };
+            }
+            let (_, idx) = i.ad();
             let v = self.proto.constants[idx as usize].get_integer()?;
             if step.is_some_and(|prev| prev != v) {
                 return None;
@@ -644,11 +645,12 @@ fn terminator<S: Sink, F: Feedback>(
         Term::Jump(t) => TermOut::Jump(t, st.clone()),
 
         Term::Return => {
-            let Instruction::RETURN { values, count } = i else {
+            if i.op() != BcOp::RETURN {
                 // STOP, or TAILCALL (which the CFG pass admits but we don't
                 // lower yet).
                 return Err(Decline::Op(pc));
-            };
+            }
+            let (values, count) = i.ab();
             let mut out = Vec::new();
             for n in 0..count.saturating_sub(1) {
                 let v = st.get(s, values + n);
@@ -657,10 +659,11 @@ fn terminator<S: Sink, F: Feedback>(
             TermOut::Ret(out)
         }
 
-        Term::Branch { skip, jump, .. } => match i {
+        Term::Branch { skip, jump, .. } => match i.op() {
             // Every compare/test skips the paired JMP iff `result != inverted`,
             // so an inverted test just swaps the edges — no negation op needed.
-            Instruction::EQ { lhs, rhs, inverted } => {
+            BcOp::EQ => {
+                let (lhs, rhs, inverted) = i.abc_flag();
                 let (a, b) = (st.get(s, lhs), st.get(s, rhs));
                 let c = compare(s, Cc::Eq, a, b);
                 let (t, f) = if inverted { (jump, skip) } else { (skip, jump) };
@@ -670,7 +673,8 @@ fn terminator<S: Sink, F: Feedback>(
                     f: (f, st.clone()),
                 }
             }
-            Instruction::LT { lhs, rhs, inverted } => {
+            BcOp::LT => {
+                let (lhs, rhs, inverted) = i.abc_flag();
                 let (a, b) = (st.get(s, lhs), st.get(s, rhs));
                 let c = compare(s, Cc::Lt, a, b);
                 let (t, f) = if inverted { (jump, skip) } else { (skip, jump) };
@@ -680,7 +684,8 @@ fn terminator<S: Sink, F: Feedback>(
                     f: (f, st.clone()),
                 }
             }
-            Instruction::LE { lhs, rhs, inverted } => {
+            BcOp::LE => {
+                let (lhs, rhs, inverted) = i.abc_flag();
                 let (a, b) = (st.get(s, lhs), st.get(s, rhs));
                 let c = compare(s, Cc::Le, a, b);
                 let (t, f) = if inverted { (jump, skip) } else { (skip, jump) };
@@ -690,7 +695,8 @@ fn terminator<S: Sink, F: Feedback>(
                     f: (f, st.clone()),
                 }
             }
-            Instruction::TEST { src, inverted } => {
+            BcOp::TEST => {
+                let (src, inverted) = i.ab_flag();
                 let v = st.get(s, src);
                 let falsy = sink::falsy(s, v);
                 // `falsy` is the negation of the test's `truthy`, so the edges
@@ -706,7 +712,8 @@ fn terminator<S: Sink, F: Feedback>(
             // is exactly the conditional definition that block parameters make
             // expressible: we hand the assigned value along one edge and the
             // incoming value along the other.
-            Instruction::TESTSET { dst, src, inverted } => {
+            BcOp::TESTSET => {
+                let (dst, src, inverted) = i.abc_flag();
                 let v = st.get(s, src);
                 let falsy = sink::falsy(s, v);
 
@@ -725,7 +732,8 @@ fn terminator<S: Sink, F: Feedback>(
                 TermOut::Br { cond: falsy, t, f }
             }
 
-            Instruction::FORPREP { base, .. } => {
+            BcOp::FORPREP => {
+                let base = i.a();
                 let (cond, body) = for_prep(s, st, fb, pc, base)?;
                 let exit = st.clone();
                 // `skip` is the fall-through into the body; `jump` skips the
@@ -736,7 +744,8 @@ fn terminator<S: Sink, F: Feedback>(
                     f: (jump, exit),
                 }
             }
-            Instruction::FORLOOP { base, .. } => {
+            BcOp::FORLOOP => {
+                let base = i.a();
                 let (cond, body) = for_loop(s, st, fb, pc, base)?;
                 let exit = st.clone();
                 // `jump` is the back-edge into the body; `skip` falls out.
@@ -927,7 +936,8 @@ impl Versions {
 fn pinned_regs(proto: &Prototype<'_>) -> Vec<bool> {
     let mut pinned = vec![false; 256];
     for i in proto.code.iter() {
-        if let Instruction::CLOSURE { proto: idx, .. } = *i {
+        if i.op() == BcOp::CLOSURE {
+            let (_, idx) = i.ad();
             for d in proto.prototypes[idx as usize].upvalue_desc.iter() {
                 if let crate::instruction::UpValueDescriptor::ParentLocal(r) = *d {
                     pinned[r as usize] = true;

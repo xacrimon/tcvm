@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use foldhash::fast::RandomState;
 
-use crate::instruction::Instruction;
+use crate::instruction::{Instruction, Op};
 
 /// A construct we've chosen not to compile. Since guard failure deopts to the
 /// interpreter anyway, refusing to compile is always a legal answer — the
@@ -83,14 +83,7 @@ fn jump_target(pc: u32, offset: i32) -> i64 {
 /// True if this opcode conditionally skips the following instruction (which the
 /// compiler always emits as a `JMP`).
 fn is_skip_test(i: Instruction) -> bool {
-    matches!(
-        i,
-        Instruction::EQ { .. }
-            | Instruction::LT { .. }
-            | Instruction::LE { .. }
-            | Instruction::TEST { .. }
-            | Instruction::TESTSET { .. }
-    )
+    i.is_control()
 }
 
 pub fn terminator(code: &[Instruction], pc: u32) -> Result<Term, Unsupported> {
@@ -105,13 +98,17 @@ pub fn terminator(code: &[Instruction], pc: u32) -> Result<Term, Unsupported> {
         Ok(t as u32)
     };
 
-    Ok(match i {
-        Instruction::JMP { offset } => Term::Jump(target(offset)?),
+    Ok(match i.op() {
+        Op::JMP => Term::Jump(target(i.imm())?),
 
         // The compare skips the `JMP` at pc+1 when it succeeds, so the two
         // edges are pc+2 and that `JMP`'s target.
         _ if is_skip_test(i) => {
-            let Some(Instruction::JMP { offset }) = code.get(next as usize).copied() else {
+            let Some(jmp) = code
+                .get(next as usize)
+                .copied()
+                .filter(|j| j.op() == Op::JMP)
+            else {
                 // The compiler always pairs these; anything else is a bytecode
                 // we don't understand, so decline the region.
                 return Err(Unsupported::BadJump(pc));
@@ -119,54 +116,56 @@ pub fn terminator(code: &[Instruction], pc: u32) -> Result<Term, Unsupported> {
             Term::Branch {
                 cond: pc,
                 skip: pc + 2,
-                jump: jump_target(next, offset) as u32,
+                jump: jump_target(next, jmp.imm()) as u32,
             }
         }
         // `LFALSESKIP` sets false and unconditionally skips the next
         // instruction — a jump, not a branch.
-        Instruction::LFALSESKIP { .. } => Term::Jump(pc + 2),
+        Op::LFALSESKIP => Term::Jump(pc + 2),
 
-        Instruction::RETURN { count, .. } => {
-            if count == 0 {
+        Op::RETURN => {
+            if i.b() == 0 {
                 return Err(Unsupported::MultRet(pc));
             }
             Term::Return
         }
-        Instruction::TAILCALL { args, .. } => {
-            if args == 0 {
+        Op::TAILCALL => {
+            if i.b() == 0 {
                 return Err(Unsupported::MultRet(pc));
             }
             Term::Return
         }
-        Instruction::STOP => Term::Return,
+        Op::STOP => Term::Return,
 
         // Jumps past the body when the loop shouldn't run at all; otherwise
         // falls into it.
-        Instruction::FORPREP { offset, .. } => Term::Branch {
+        Op::FORPREP => Term::Branch {
             cond: pc,
             skip: next,
-            jump: target(offset)?,
+            jump: target(i.imm())?,
         },
         // Jumps back to the body when the loop continues, else falls through.
-        Instruction::FORLOOP { offset, .. } => Term::Branch {
+        Op::FORLOOP => Term::Branch {
             cond: pc,
             skip: next,
-            jump: target(offset)?,
+            jump: target(i.imm())?,
         },
-        Instruction::TFORPREP { offset, .. } => Term::Jump(target(offset)?),
-        Instruction::TFORLOOP { offset, .. } => Term::Branch {
+        Op::TFORPREP => Term::Jump(target(i.imm())?),
+        Op::TFORLOOP => Term::Branch {
             cond: pc,
             skip: next,
-            jump: target(offset)?,
+            jump: target(i.imm())?,
         },
 
-        Instruction::VARARGPREP { .. } => return Err(Unsupported::Vararg(pc)),
-        Instruction::VARARG { .. } => return Err(Unsupported::Vararg(pc)),
-        Instruction::TBC { .. } => return Err(Unsupported::Tbc(pc)),
-        Instruction::CALL { args, returns, .. } if args == 0 || returns == 0 => {
+        Op::VARARGPREP => return Err(Unsupported::Vararg(pc)),
+        Op::VARARG => return Err(Unsupported::Vararg(pc)),
+        Op::TBC => return Err(Unsupported::Tbc(pc)),
+        // `args` / `returns`, and `SETLIST`'s `count`, are MULTRET sentinels
+        // when zero.
+        Op::CALL if i.b() == 0 || i.c() == 0 => {
             return Err(Unsupported::MultRet(pc));
         }
-        Instruction::SETLIST { count: 0, .. } => {
+        Op::SETLIST if i.b() == 0 => {
             return Err(Unsupported::MultRet(pc));
         }
 
@@ -278,12 +277,13 @@ pub fn build(code: &[Instruction]) -> Result<Cfg, Unsupported> {
 /// counter and the visible loop variable advance on the body edge and not on
 /// the exit edge. `TESTSET` assigns `dst` only on the edge that does not skip.
 pub fn edge_defs(i: Instruction, out: &mut Vec<u8>) {
-    match i {
-        Instruction::FORPREP { base, .. } | Instruction::FORLOOP { base, .. } => {
+    match i.op() {
+        Op::FORPREP | Op::FORLOOP => {
+            let base = i.a();
             out.push(base);
             out.push(base + 3);
         }
-        Instruction::TESTSET { dst, .. } => out.push(dst),
+        Op::TESTSET => out.push(i.a()),
         _ => {}
     }
 }
@@ -325,122 +325,98 @@ fn edge_params(code: &[Instruction], cfg: &mut Cfg) {
 /// Registers an instruction reads.
 pub fn reg_uses(i: Instruction, out: &mut Vec<u8>) {
     let mut push = |r: u8| out.push(r);
-    match i {
-        Instruction::MOVE { src, .. }
-        | Instruction::SETUPVAL { src, .. }
-        | Instruction::UNM { src, .. }
-        | Instruction::BNOT { src, .. }
-        | Instruction::NOT { src, .. }
-        | Instruction::LEN { src, .. }
-        | Instruction::TEST { src, .. }
-        | Instruction::TESTSET { src, .. }
-        | Instruction::LFALSESKIP { src }
-        | Instruction::ERRNNIL { src, .. } => push(src),
-
-        Instruction::SETTABUP { src, .. } => push(src),
-
-        Instruction::GETTABLE { table, key, .. } => {
-            push(table);
-            push(key);
-        }
-        Instruction::SETTABLE {
-            src, table, key, ..
-        } => {
-            push(src);
-            push(table);
-            push(key);
-        }
-        Instruction::GETFIELD { table, .. } => push(table),
-        Instruction::SETFIELD { src, table, .. } => {
-            push(src);
-            push(table);
-        }
-        Instruction::SELF { object, .. } => push(object),
-
-        Instruction::ADD { lhs, rhs, .. }
-        | Instruction::SUB { lhs, rhs, .. }
-        | Instruction::MUL { lhs, rhs, .. }
-        | Instruction::MOD { lhs, rhs, .. }
-        | Instruction::POW { lhs, rhs, .. }
-        | Instruction::DIV { lhs, rhs, .. }
-        | Instruction::IDIV { lhs, rhs, .. }
-        | Instruction::BAND { lhs, rhs, .. }
-        | Instruction::BOR { lhs, rhs, .. }
-        | Instruction::BXOR { lhs, rhs, .. }
-        | Instruction::SHL { lhs, rhs, .. }
-        | Instruction::SHR { lhs, rhs, .. }
-        | Instruction::CONCAT { lhs, rhs, .. }
-        | Instruction::EQ { lhs, rhs, .. }
-        | Instruction::LT { lhs, rhs, .. }
-        | Instruction::LE { lhs, rhs, .. } => {
-            push(lhs);
-            push(rhs);
+    match i.op() {
+        // Single source operand, in `b`.
+        Op::MOVE | Op::UNM | Op::BNOT | Op::NOT | Op::LEN | Op::TESTSET => push(i.b()),
+        // Single source operand, in `a`.
+        Op::SETUPVAL | Op::TEST | Op::LFALSESKIP | Op::ERRNNIL | Op::SETTABUP | Op::TBC => {
+            push(i.a())
         }
 
-        Instruction::CALL { func, args, .. } => {
-            // `args` counts the function plus its arguments.
+        Op::GETTABLE => {
+            push(i.b());
+            push(i.c());
+        }
+        Op::SETTABLE => {
+            push(i.a());
+            push(i.b());
+            push(i.c());
+        }
+        Op::GETFIELD => push(i.b()),
+        Op::SETFIELD => {
+            push(i.a());
+            push(i.b());
+        }
+        Op::SELF => push(i.b()),
+
+        // Binary operands in `b`/`c`.
+        Op::ADD
+        | Op::SUB
+        | Op::MUL
+        | Op::MOD
+        | Op::POW
+        | Op::DIV
+        | Op::IDIV
+        | Op::BAND
+        | Op::BOR
+        | Op::BXOR
+        | Op::SHL
+        | Op::SHR
+        | Op::CONCAT
+        | Op::VARARGGET => {
+            push(i.b());
+            push(i.c());
+        }
+        // Comparisons put their operands one slot lower, in `a`/`b`.
+        Op::EQ | Op::LT | Op::LE => {
+            push(i.a());
+            push(i.b());
+        }
+
+        // `args` counts the function plus its arguments.
+        Op::CALL | Op::TAILCALL => {
+            let (func, args) = (i.a(), i.b());
             for r in func..func.saturating_add(args) {
                 push(r);
             }
         }
-        Instruction::TAILCALL { func, args } => {
-            for r in func..func.saturating_add(args) {
-                push(r);
-            }
-        }
-        Instruction::RETURN { values, count } => {
+        Op::RETURN => {
+            let (values, count) = i.ab();
             for r in values..values.saturating_add(count.saturating_sub(1)) {
                 push(r);
             }
         }
 
-        // Control registers: init, limit, step.
-        Instruction::FORPREP { base, .. } | Instruction::FORLOOP { base, .. } => {
-            push(base);
-            push(base + 1);
-            push(base + 2);
-        }
-        // Iterator, state, control.
-        Instruction::TFORCALL { base, .. } => {
-            push(base);
-            push(base + 1);
-            push(base + 2);
-        }
-        Instruction::TFORPREP { base, .. } => {
+        // Control registers: init, limit, step. (`TFORCALL`/`TFORPREP`:
+        // iterator, state, control.)
+        Op::FORPREP | Op::FORLOOP | Op::TFORCALL | Op::TFORPREP => {
+            let base = i.a();
             push(base);
             push(base + 1);
             push(base + 2);
         }
         // Reads the first result to decide whether to loop.
-        Instruction::TFORLOOP { base, .. } => push(base + 3),
+        Op::TFORLOOP => push(i.a() + 3),
 
-        Instruction::SETLIST {
-            table,
-            count,
-            offset: _,
-        } => {
+        Op::SETLIST => {
+            let (table, count, _offset) = i.abd();
             push(table);
             for r in table + 1..=table.saturating_add(count) {
                 push(r);
             }
         }
-        Instruction::VARARGGET { base, key, .. } => {
-            push(base);
-            push(key);
-        }
-        Instruction::TBC { val } => push(val),
 
-        Instruction::LOAD { .. }
-        | Instruction::GETUPVAL { .. }
-        | Instruction::GETTABUP { .. }
-        | Instruction::NEWTABLE { .. }
-        | Instruction::CLOSE { .. }
-        | Instruction::JMP { .. }
-        | Instruction::CLOSURE { .. }
-        | Instruction::VARARG { .. }
-        | Instruction::VARARGPREP { .. }
-        | Instruction::NOP
-        | Instruction::STOP => {}
+        Op::LOAD
+        | Op::GETUPVAL
+        | Op::GETTABUP
+        | Op::NEWTABLE
+        | Op::CLOSE
+        | Op::JMP
+        | Op::CLOSURE
+        | Op::VARARG
+        | Op::VARARGPREP
+        | Op::NOP
+        | Op::STOP => {}
     }
 }
 
@@ -449,84 +425,90 @@ pub fn reg_uses(i: Instruction, out: &mut Vec<u8>) {
 /// it expressible in SSA at all.
 pub fn reg_defs(i: Instruction, out: &mut Vec<u8>) {
     let mut push = |r: u8| out.push(r);
-    match i {
-        Instruction::MOVE { dst, .. }
-        | Instruction::LOAD { dst, .. }
-        | Instruction::GETUPVAL { dst, .. }
-        | Instruction::GETTABUP { dst, .. }
-        | Instruction::GETTABLE { dst, .. }
-        | Instruction::GETFIELD { dst, .. }
-        | Instruction::NEWTABLE { dst }
-        | Instruction::ADD { dst, .. }
-        | Instruction::SUB { dst, .. }
-        | Instruction::MUL { dst, .. }
-        | Instruction::MOD { dst, .. }
-        | Instruction::POW { dst, .. }
-        | Instruction::DIV { dst, .. }
-        | Instruction::IDIV { dst, .. }
-        | Instruction::BAND { dst, .. }
-        | Instruction::BOR { dst, .. }
-        | Instruction::BXOR { dst, .. }
-        | Instruction::SHL { dst, .. }
-        | Instruction::SHR { dst, .. }
-        | Instruction::UNM { dst, .. }
-        | Instruction::BNOT { dst, .. }
-        | Instruction::NOT { dst, .. }
-        | Instruction::LEN { dst, .. }
-        | Instruction::CONCAT { dst, .. }
-        | Instruction::CLOSURE { dst, .. }
-        | Instruction::VARARGGET { dst, .. } => push(dst),
-
-        Instruction::LFALSESKIP { src } => push(src),
+    match i.op() {
+        // Destination register in `a`. (`LFALSESKIP` writes the register it
+        // names, which its shape calls `src`.)
+        Op::MOVE
+        | Op::LOAD
+        | Op::GETUPVAL
+        | Op::GETTABUP
+        | Op::GETTABLE
+        | Op::GETFIELD
+        | Op::NEWTABLE
+        | Op::ADD
+        | Op::SUB
+        | Op::MUL
+        | Op::MOD
+        | Op::POW
+        | Op::DIV
+        | Op::IDIV
+        | Op::BAND
+        | Op::BOR
+        | Op::BXOR
+        | Op::SHL
+        | Op::SHR
+        | Op::UNM
+        | Op::BNOT
+        | Op::NOT
+        | Op::LEN
+        | Op::CONCAT
+        | Op::CLOSURE
+        | Op::VARARGGET
+        | Op::LFALSESKIP => push(i.a()),
 
         // Method dispatch writes both the method and the receiver.
-        Instruction::SELF { dst, .. } => {
+        Op::SELF => {
+            let dst = i.a();
             push(dst);
             push(dst + 1);
         }
 
-        Instruction::CALL { func, returns, .. } => {
+        Op::CALL => {
+            let (func, _args, returns) = i.abc();
             for r in func..func.saturating_add(returns.saturating_sub(1)) {
                 push(r);
             }
         }
 
         // Writes the internal counter and the visible loop variable.
-        Instruction::FORPREP { base, .. } | Instruction::FORLOOP { base, .. } => {
+        Op::FORPREP | Op::FORLOOP => {
+            let base = i.a();
             push(base);
             push(base + 3);
         }
         // Results land at base+3.
-        Instruction::TFORCALL { base, count } => {
+        Op::TFORCALL => {
+            let (base, count) = i.ab();
             for r in base + 3..base.saturating_add(3).saturating_add(count) {
                 push(r);
             }
         }
         // Copies the first result into the control register.
-        Instruction::TFORLOOP { base, .. } => push(base + 2),
+        Op::TFORLOOP => push(i.a() + 2),
 
-        Instruction::TESTSET { .. } => {}
+        // Conditional write, modelled on the CFG edge instead.
+        Op::TESTSET => {}
 
-        Instruction::SETUPVAL { .. }
-        | Instruction::SETTABUP { .. }
-        | Instruction::SETTABLE { .. }
-        | Instruction::SETFIELD { .. }
-        | Instruction::CLOSE { .. }
-        | Instruction::TBC { .. }
-        | Instruction::JMP { .. }
-        | Instruction::EQ { .. }
-        | Instruction::LT { .. }
-        | Instruction::LE { .. }
-        | Instruction::TEST { .. }
-        | Instruction::TAILCALL { .. }
-        | Instruction::RETURN { .. }
-        | Instruction::TFORPREP { .. }
-        | Instruction::SETLIST { .. }
-        | Instruction::VARARG { .. }
-        | Instruction::VARARGPREP { .. }
-        | Instruction::ERRNNIL { .. }
-        | Instruction::NOP
-        | Instruction::STOP => {}
+        Op::SETUPVAL
+        | Op::SETTABUP
+        | Op::SETTABLE
+        | Op::SETFIELD
+        | Op::CLOSE
+        | Op::TBC
+        | Op::JMP
+        | Op::EQ
+        | Op::LT
+        | Op::LE
+        | Op::TEST
+        | Op::TAILCALL
+        | Op::RETURN
+        | Op::TFORPREP
+        | Op::SETLIST
+        | Op::VARARG
+        | Op::VARARGPREP
+        | Op::ERRNNIL
+        | Op::NOP
+        | Op::STOP => {}
     }
 }
 

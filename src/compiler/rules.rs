@@ -8,7 +8,9 @@ use super::defs::{Chunk, ExprDesc, ExprKind, JumpList, Numeral, RegisterIndex, V
 use super::{CompileError, CompileErrorKind, LineNumber};
 use crate::dmm::Gc;
 use crate::env::{LuaString, Prototype, value::Value};
-use crate::instruction::{Instruction, UpValueDescriptor};
+use crate::instruction::{
+    IcIdx, Instruction, KIdx, Op, ProtoIdx, Reg, Shape, UpIdx, UpValueDescriptor,
+};
 use crate::lua;
 use crate::parser::syntax::{
     Assign, BinaryOp, BinaryOperator, Break, Decl, DeclModifier, Do, Expr, ForGen, ForNum, Func,
@@ -29,6 +31,12 @@ use crate::vm::num;
 /// be patched or downgraded before the chunk is assembled — executing one
 /// at runtime would write to an out-of-bounds register.
 const NO_REG: u8 = u8::MAX;
+
+/// A control instruction whose taken edge preserves no value — a plain `TEST`,
+/// or a `TESTSET` still holding the `NO_REG` placeholder dst.
+fn is_valueless_ctrl(i: Instruction) -> bool {
+    i.op() == Op::TEST || (i.op() == Op::TESTSET && i.a() == NO_REG)
+}
 
 // ---------------------------------------------------------------------------
 // Error helper
@@ -509,7 +517,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     fn emit_jump(&mut self, label: u16) {
         let idx = self.next_offset();
         self.chunk.jump_patches.push((idx, label));
-        self.emit(Instruction::JMP { offset: 0 });
+        self.emit(Instruction::jmp(0));
     }
 
     fn emit_jump_instr(&mut self, label: u16, instr: Instruction) {
@@ -526,7 +534,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     /// the caller can thread it through a `JumpList`.
     fn emit_unfilled_jmp(&mut self) -> usize {
         let idx = self.next_offset();
-        self.emit(Instruction::JMP { offset: 0 });
+        self.emit(Instruction::jmp(0));
         idx
     }
 
@@ -540,14 +548,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         }
         let prev = &self.chunk.tape[jmp_idx - 1];
         assert!(
-            matches!(
-                prev,
-                Instruction::EQ { .. }
-                    | Instruction::LT { .. }
-                    | Instruction::LE { .. }
-                    | Instruction::TEST { .. }
-                    | Instruction::TESTSET { .. }
-            ),
+            prev.is_control(),
             "JumpList invariant violated: tape[{}] = {:?} is not a \
              CMP/TEST/TESTSET control instruction for JMP at tape[{}]",
             jmp_idx - 1,
@@ -575,17 +576,14 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             }
 
             self.assert_ctrl_predecessor(jmp_idx);
-            if let Instruction::TESTSET { dst, src, inverted } = self.chunk.tape[jmp_idx - 1]
-                && dst == NO_REG
-            {
+            let ctrl = self.chunk.tape[jmp_idx - 1];
+            if ctrl.op() == Op::TESTSET && ctrl.a() == NO_REG {
+                let (_, src, inverted) = ctrl.abc_flag();
                 // TEST skips on `truthy != inverted`; TESTSET skips on
                 // `truthy == inverted`. They're inverses, so preserving
                 // the same skip behaviour across the rewrite requires
                 // flipping the flag.
-                self.chunk.tape[jmp_idx - 1] = Instruction::TEST {
-                    src,
-                    inverted: !inverted,
-                };
+                self.chunk.tape[jmp_idx - 1] = Instruction::test(Reg(src), !inverted);
             }
         }
     }
@@ -597,10 +595,9 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         self.downgrade_testsets(&list);
         for idx in list.jumps {
             let offset = target as i32 - (idx as i32 + 1);
-            match &mut self.chunk.tape[idx] {
-                Instruction::JMP { offset: o } => *o = offset,
-                _ => panic!("jump-list entry is not a JMP"),
-            }
+            let jmp = &mut self.chunk.tape[idx];
+            assert!(jmp.op() == Op::JMP, "jump-list entry is not a JMP");
+            jmp.set_imm(offset);
         }
         if target > self.chunk.last_target {
             self.chunk.last_target = target;
@@ -626,12 +623,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                 break;
             };
             let j = list.jumps[pos];
-            if j == 0
-                || !matches!(
-                    self.chunk.tape[j - 1],
-                    Instruction::TEST { .. } | Instruction::TESTSET { dst: NO_REG, .. }
-                )
-            {
+            if j == 0 || !is_valueless_ctrl(self.chunk.tape[j - 1]) {
                 break;
             }
             // Elision is sound only because nothing else targets the tail
@@ -678,10 +670,8 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             }
 
             self.assert_ctrl_predecessor(idx);
-            !matches!(
-                self.chunk.tape[idx - 1],
-                Instruction::TESTSET { dst: NO_REG, .. }
-            )
+            let ctrl = self.chunk.tape[idx - 1];
+            !(ctrl.op() == Op::TESTSET && ctrl.a() == NO_REG)
         })
     }
 
@@ -706,37 +696,31 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             } else {
                 self.assert_ctrl_predecessor(jmp_idx);
                 let ctrl_idx = jmp_idx - 1;
-                match self.chunk.tape[ctrl_idx] {
-                    Instruction::TESTSET {
-                        dst: NO_REG,
-                        src,
-                        inverted,
-                    } => {
+                let ctrl = self.chunk.tape[ctrl_idx];
+                if ctrl.op() == Op::TESTSET && ctrl.a() == NO_REG {
+                    let (_, src, inverted) = ctrl.abc_flag();
+                    {
                         // Both arms preserve the operand value at `reg`:
                         // the assignment case writes `src` → `reg`, the
                         // self-assign case has the value already in `reg`.
                         // Either way the jump skips the materialisation
                         // tail and lands on `vtarget`.
                         if src == reg.0 {
-                            self.chunk.tape[ctrl_idx] = Instruction::TEST {
-                                src,
-                                inverted: !inverted,
-                            };
+                            self.chunk.tape[ctrl_idx] = Instruction::test(Reg(src), !inverted);
                         } else {
-                            self.chunk.tape[ctrl_idx] = Instruction::TESTSET {
-                                dst: reg.0,
-                                src,
-                                inverted,
-                            };
+                            self.chunk.tape[ctrl_idx] =
+                                Instruction::testset(reg, Reg(src), inverted);
                         }
                         vtarget
                     }
-                    _ => dtarget,
+                } else {
+                    dtarget
                 }
             };
             let offset = target as i32 - (jmp_idx as i32 + 1);
-            if let Instruction::JMP { offset: o } = &mut self.chunk.tape[jmp_idx] {
-                *o = offset;
+            let jmp = &mut self.chunk.tape[jmp_idx];
+            if jmp.op() == Op::JMP {
+                jmp.set_imm(offset);
             }
         }
     }
@@ -759,11 +743,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         //   jump_if_truthy=true  → fall-through on truthy → assign on truthy
         //                          → `truthy != inverted` → inverted = false
         //   jump_if_truthy=false → fall-through on falsy  → inverted = true
-        self.emit(Instruction::TESTSET {
-            dst: NO_REG,
-            src: src.0,
-            inverted: !jump_if_truthy,
-        });
+        self.emit(Instruction::testset(Reg(NO_REG), src, !jump_if_truthy));
         self.emit_unfilled_jmp()
     }
 
@@ -776,19 +756,13 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         if jmp_idx == 0 {
             return;
         }
-        match &mut self.chunk.tape[jmp_idx - 1] {
-            Instruction::LT { inverted, .. }
-            | Instruction::LE { inverted, .. }
-            | Instruction::EQ { inverted, .. }
-            | Instruction::TEST { inverted, .. }
-            | Instruction::TESTSET { inverted, .. } => {
-                *inverted = !*inverted;
-            }
-            other => unreachable!(
-                "flip_control_polarity: jump at {jmp_idx} has no \
-                 CMP/TEST control instruction (found {other:?})"
-            ),
-        }
+        let ctrl = &mut self.chunk.tape[jmp_idx - 1];
+        assert!(
+            ctrl.is_control(),
+            "flip_control_polarity: jump at {jmp_idx} has no \
+             CMP/TEST control instruction (found {ctrl:?})"
+        );
+        ctrl.set_inverted(!ctrl.inverted());
     }
 
     /// Lua's `codenot` list handling: negating an expression swaps its truthy
@@ -980,7 +954,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         if let Some(value) = const_kind_to_value(expr.kind) {
             let idx = self.alloc_constant(value)?;
             let dst = self.dst_or_alloc(hint)?;
-            self.emit(Instruction::LOAD { dst: dst.0, idx });
+            self.emit(Instruction::load(dst, KIdx(idx)));
             expr.kind = ExprKind::Reg(dst);
             if !expr.has_jumps() {
                 return Ok(dst);
@@ -1002,10 +976,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                     && h != reg
                 {
                     self.dst_or_alloc(Some(h))?;
-                    self.emit(Instruction::MOVE {
-                        dst: h.0,
-                        src: reg.0,
-                    });
+                    self.emit(Instruction::mov(h, reg));
                     h
                 } else if hint.is_none() && reg.0 < self.chunk.nactvar {
                     // No hint and `reg` aliases an active local. Patching
@@ -1018,10 +989,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                     // past this MOVE. The truthy fall-through executes the
                     // MOVE so `fresh` ends up holding the RHS value.
                     let fresh = self.reserve_reg()?;
-                    self.emit(Instruction::MOVE {
-                        dst: fresh.0,
-                        src: reg.0,
-                    });
+                    self.emit(Instruction::mov(fresh, reg));
                     fresh
                 } else {
                     reg
@@ -1058,13 +1026,10 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
 
             let (false_target, true_target) = if need_tail {
                 let ft = self.next_offset();
-                self.emit(Instruction::LFALSESKIP { src: dst.0 });
+                self.emit(Instruction::lfalseskip(dst));
                 let tt = self.next_offset();
                 let true_idx = self.alloc_constant(Value::boolean(true))?;
-                self.emit(Instruction::LOAD {
-                    dst: dst.0,
-                    idx: true_idx,
-                });
+                self.emit(Instruction::load(dst, KIdx(true_idx)));
                 (ft, tt)
             } else {
                 // Unused: every jump in both lists is TESTSET-controlled and
@@ -1081,8 +1046,9 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             if let Some(idx) = skip_fixup {
                 let end = self.next_offset();
                 let offset = end as i32 - (idx as i32 + 1);
-                if let Instruction::JMP { offset: o } = &mut self.chunk.tape[idx] {
-                    *o = offset;
+                let jmp = &mut self.chunk.tape[idx];
+                if jmp.op() == Op::JMP {
+                    jmp.set_imm(offset);
                 }
             }
         }
@@ -1301,7 +1267,7 @@ where
 
     let close_regs = ctx.pop_scope()?;
     if let Some(first) = close_regs.first() {
-        ctx.emit(Instruction::CLOSE { start: first.0 });
+        ctx.emit(Instruction::close(*first));
     }
 
     Ok(())
@@ -1399,7 +1365,7 @@ fn compile_function_to_chunk<'gc, 'a>(
 
     // Emit VARARGPREP for vararg functions
     if is_vararg {
-        ctx.emit(Instruction::VARARGPREP { num_fixed: arity });
+        ctx.emit(Instruction::varargprep(arity));
     }
 
     // Allocate registers for parameters and bind them in scope
@@ -1456,12 +1422,9 @@ fn compile_function_to_chunk<'gc, 'a>(
     // at assemble time, makes `VARARGPREP` build it.)
     if ctx.chunk.vararg_info.is_some_and(|i| i.needs_table()) {
         for instr in ctx.chunk.tape.iter_mut() {
-            if let Instruction::VARARGGET { dst, base, key } = *instr {
-                *instr = Instruction::GETTABLE {
-                    dst,
-                    table: base,
-                    key,
-                };
+            if instr.op() == Op::VARARGGET {
+                let (dst, base, key) = instr.abc();
+                *instr = Instruction::gettable(Reg(dst), Reg(base), Reg(key));
             }
         }
     }
@@ -1475,22 +1438,19 @@ fn compile_function_to_chunk<'gc, 'a>(
     // `if cond then return end` at the tail of a function (issue #65).
     let last_pc = ctx.chunk.tape.len();
     let last_is_terminator = matches!(
-        ctx.chunk.tape.last(),
-        Some(Instruction::RETURN { .. } | Instruction::TAILCALL { .. }),
+        ctx.chunk.tape.last().map(|i| i.op()),
+        Some(Op::RETURN | Op::TAILCALL),
     );
     let needs_return = last_pc <= ctx.chunk.last_target || !last_is_terminator;
     if needs_return {
-        ctx.emit(Instruction::RETURN {
-            values: 0,
-            count: 1,
-        });
+        ctx.emit(Instruction::ret(Reg(0), 1));
     }
 
     let close_regs = ctx.pop_scope()?;
     if let Some(first) = close_regs.first() {
         // Insert CLOSE before the final RETURN/TAILCALL
         let return_instr = ctx.chunk.tape.pop().unwrap();
-        ctx.chunk.tape.push(Instruction::CLOSE { start: first.0 });
+        ctx.chunk.tape.push(Instruction::close(*first));
         ctx.chunk.tape.push(return_instr);
     }
 
@@ -1596,10 +1556,7 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
 
         let func_reg = compile_func_body(ctx, &func, Some(reg))?;
         if func_reg != reg {
-            ctx.emit(Instruction::MOVE {
-                dst: reg.0,
-                src: func_reg.0,
-            });
+            ctx.emit(Instruction::mov(reg, func_reg));
         }
         return Ok(());
     }
@@ -1667,10 +1624,7 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
                 let want = num_targets - i;
                 let dst = ctx.reserve_regs(want as u8)?;
                 assert_eq!(dst.0, expected);
-                ctx.emit(Instruction::VARARG {
-                    dst: dst.0,
-                    count: want as u8 + 1,
-                });
+                ctx.emit(Instruction::vararg(dst, want as u8 + 1));
                 continue;
             }
         }
@@ -1695,10 +1649,7 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
             ctx.chunk.freereg = expected;
             let slot = ctx.reserve_reg()?;
             assert_eq!(slot.0, expected);
-            ctx.emit(Instruction::MOVE {
-                dst: slot.0,
-                src: reg.0,
-            });
+            ctx.emit(Instruction::mov(slot, reg));
         } else if ctx.chunk.freereg > expected + 1 {
             // Expression landed at `expected` but leaked additional temps
             // above (e.g. short-circuit fall-through). Drop them. The
@@ -1715,7 +1666,7 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
     while ctx.chunk.freereg < target_top {
         let slot = ctx.reserve_reg()?;
         let idx = ctx.alloc_constant(Value::nil())?;
-        ctx.emit(Instruction::LOAD { dst: slot.0, idx });
+        ctx.emit(Instruction::load(slot, KIdx(idx)));
         // Padding-nil slot at `slot - base` is a compile-time nil.
         // `slot.0 >= base` because `reserve_reg` only moves freereg
         // upward and `base` was the freereg before any RHS compiled.
@@ -1748,7 +1699,7 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
         let reg = RegisterIndex(base + i as u8);
 
         if matches!(kind, VarKind::ToClose) {
-            ctx.emit(Instruction::TBC { val: reg.0 });
+            ctx.emit(Instruction::tbc(reg));
             ctx.mark_close(reg)?;
         }
 
@@ -1808,10 +1759,7 @@ fn expand_method_call(
     if landed.0 != base.0 {
         debug_assert!(landed.0 > base.0);
         for k in 0..n {
-            ctx.emit(Instruction::MOVE {
-                dst: base.0 + k,
-                src: landed.0 + k,
-            });
+            ctx.emit(Instruction::mov(Reg(base.0 + k), Reg(landed.0 + k)));
         }
         // Results now occupy `[base, base + n)`; reclaim the temp slots the
         // receiver and the shifted call block left above.
@@ -1874,22 +1822,19 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
             .resolve_env_upvalue()
             .ok_or_else(|| ice("_ENV must resolve; main chunk pre-seeds it"))?;
         let guard_reg = ctx.alloc_register()?;
-        ctx.emit(Instruction::GETTABUP {
-            dst: guard_reg.0,
-            idx: env_idx,
-            ic_idx,
-            key,
-        });
-        ctx.emit(Instruction::ERRNNIL {
-            src: guard_reg.0,
-            name_key: key,
-        });
-        ctx.emit(Instruction::SETTABUP {
-            src: func_reg.0,
-            idx: env_idx,
-            ic_idx,
-            key,
-        });
+        ctx.emit(Instruction::gettabup(
+            guard_reg,
+            UpIdx(env_idx),
+            IcIdx(ic_idx),
+            KIdx(key),
+        ));
+        ctx.emit(Instruction::errnnil(guard_reg, KIdx(key)));
+        ctx.emit(Instruction::settabup(
+            func_reg,
+            UpIdx(env_idx),
+            IcIdx(ic_idx),
+            KIdx(key),
+        ));
         ctx.free_reg(guard_reg);
         ctx.free_reg(target_reg);
         return Ok(());
@@ -1974,10 +1919,7 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
                     let n = expand_count(n)?;
                     let dst = ctx.reserve_regs(n)?;
                     debug_assert_eq!(dst.0, want.0);
-                    ctx.emit(Instruction::VARARG {
-                        dst: dst.0,
-                        count: n + 1,
-                    });
+                    ctx.emit(Instruction::vararg(dst, n + 1));
                     continue;
                 }
             }
@@ -1990,10 +1932,7 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
                 ctx.chunk.freereg = want.0;
                 let slot = ctx.reserve_reg()?;
                 debug_assert_eq!(slot.0, want.0);
-                ctx.emit(Instruction::MOVE {
-                    dst: want.0,
-                    src: got.0,
-                });
+                ctx.emit(Instruction::mov(want, got));
             } else if ctx.chunk.freereg > want.0 + 1 {
                 // Landed at `want` but leaked temps above; drop them.
                 ctx.chunk.freereg = want.0 + 1;
@@ -2003,7 +1942,7 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         while ctx.chunk.freereg < value_base + n_targets as u8 {
             let slot = ctx.reserve_reg()?;
             let idx = ctx.alloc_constant(Value::nil())?;
-            ctx.emit(Instruction::LOAD { dst: slot.0, idx });
+            ctx.emit(Instruction::load(slot, KIdx(idx)));
         }
         // Drop any extra values past `n_targets` — they were computed
         // (side-effects preserved) but are unused.
@@ -2043,22 +1982,19 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         let (key, ic_idx) = ctx.alloc_field_key(name.as_bytes())?;
         let value_reg = value_base + i as u8;
         let guard_reg = ctx.alloc_register()?;
-        ctx.emit(Instruction::GETTABUP {
-            dst: guard_reg.0,
-            idx: env_idx,
-            ic_idx,
-            key,
-        });
-        ctx.emit(Instruction::ERRNNIL {
-            src: guard_reg.0,
-            name_key: key,
-        });
-        ctx.emit(Instruction::SETTABUP {
-            src: value_reg,
-            idx: env_idx,
-            ic_idx,
-            key,
-        });
+        ctx.emit(Instruction::gettabup(
+            guard_reg,
+            UpIdx(env_idx),
+            IcIdx(ic_idx),
+            KIdx(key),
+        ));
+        ctx.emit(Instruction::errnnil(guard_reg, KIdx(key)));
+        ctx.emit(Instruction::settabup(
+            Reg(value_reg),
+            UpIdx(env_idx),
+            IcIdx(ic_idx),
+            KIdx(key),
+        ));
         ctx.free_reg(guard_reg);
     }
     // Free the value-block.
@@ -2178,10 +2114,7 @@ fn compile_assign(ctx: &mut Ctx, item: Assign) -> Result<(), CompileError> {
         let nil = ctx.alloc_constant(Value::nil())?;
         let hint = local_dst(&lvalues[i]);
         let reg = ctx.dst_or_alloc(hint)?;
-        ctx.emit(Instruction::LOAD {
-            dst: reg.0,
-            idx: nil,
-        });
+        ctx.emit(Instruction::load(reg, KIdx(nil)));
         pending.push(if hint == Some(reg) { None } else { Some(reg.0) });
     }
 
@@ -2192,10 +2125,7 @@ fn compile_assign(ctx: &mut Ctx, item: Assign) -> Result<(), CompileError> {
         let collides = (0..j).any(|i| local_dst(&lvalues[i]).is_some_and(|d| d.0 == r));
         if collides {
             let temp = ctx.alloc_register()?;
-            ctx.emit(Instruction::MOVE {
-                dst: temp.0,
-                src: r,
-            });
+            ctx.emit(Instruction::mov(temp, Reg(r)));
             pending[j] = Some(temp.0);
         }
     }
@@ -2332,10 +2262,7 @@ fn compile_indexed_subexpr(
         return Ok(reg);
     }
     let temp = ctx.alloc_register()?;
-    ctx.emit(Instruction::MOVE {
-        dst: temp.0,
-        src: reg.0,
-    });
+    ctx.emit(Instruction::mov(temp, reg));
     Ok(temp)
 }
 
@@ -2438,34 +2365,30 @@ fn expr_reads(ctx: &Ctx, expr: &Expr, reg: u8) -> Result<bool, CompileError> {
 /// Local self-stores are elided.
 fn emit_store(ctx: &mut Ctx, lv: Lvalue, src: u8) {
     match lv {
-        Lvalue::Local { dst } if dst.0 != src => ctx.emit(Instruction::MOVE { dst: dst.0, src }),
+        Lvalue::Local { dst } if dst.0 != src => ctx.emit(Instruction::mov(dst, Reg(src))),
         Lvalue::Local { .. } => {} // self-MOVE; skip
-        Lvalue::Upvalue { idx } => ctx.emit(Instruction::SETUPVAL { src, idx }),
+        Lvalue::Upvalue { idx } => ctx.emit(Instruction::setupval(Reg(src), UpIdx(idx))),
         Lvalue::Global {
             env_idx,
             key,
             ic_idx,
-        } => ctx.emit(Instruction::SETTABUP {
-            src,
-            idx: env_idx,
-            ic_idx,
-            key,
-        }),
-        Lvalue::Indexed { table, key } => ctx.emit(Instruction::SETTABLE {
-            src,
-            table: table.0,
-            key: key.0,
-        }),
+        } => ctx.emit(Instruction::settabup(
+            Reg(src),
+            UpIdx(env_idx),
+            IcIdx(ic_idx),
+            KIdx(key),
+        )),
+        Lvalue::Indexed { table, key } => ctx.emit(Instruction::settable(Reg(src), table, key)),
         Lvalue::Field {
             table,
             key_idx,
             ic_idx,
-        } => ctx.emit(Instruction::SETFIELD {
-            src,
-            table: table.0,
-            ic_idx,
-            key_idx,
-        }),
+        } => ctx.emit(Instruction::setfield(
+            Reg(src),
+            table,
+            IcIdx(ic_idx),
+            KIdx(key_idx),
+        )),
     }
 }
 
@@ -2516,10 +2439,7 @@ fn compile_func_body(
     let proto_idx = ctx.chunk.prototypes.len() as u16;
     ctx.chunk.prototypes.push(proto);
     let dst = ctx.dst_or_alloc(dst)?;
-    ctx.emit(Instruction::CLOSURE {
-        dst: dst.0,
-        proto: proto_idx,
-    });
+    ctx.emit(Instruction::closure(dst, ProtoIdx(proto_idx)));
 
     Ok(dst)
 }
@@ -2595,10 +2515,7 @@ fn compile_expr(
         Expr::Index(item) => compile_expr_index(ctx, item, dst).map(ExprDesc::from_reg),
         Expr::VarArg => {
             let dst = ctx.dst_or_alloc(dst)?;
-            ctx.emit(Instruction::VARARG {
-                dst: dst.0,
-                count: 2,
-            });
+            ctx.emit(Instruction::vararg(dst, 2));
             Ok(ExprDesc::from_reg(dst))
         }
         // Transparent recurse: the paren only matters at multi-value
@@ -2664,7 +2581,7 @@ fn compile_expr_ident(
             ResolvedName::Const(v) => return Ok(v.to_expr_desc()),
             ResolvedName::Upvalue(idx) => {
                 let dst = ctx.dst_or_alloc(dst)?;
-                ctx.emit(Instruction::GETUPVAL { dst: dst.0, idx });
+                ctx.emit(Instruction::getupval(dst, UpIdx(idx)));
                 return Ok(ExprDesc::from_reg(dst));
             }
         }
@@ -2689,12 +2606,12 @@ fn compile_expr_ident(
     let env_idx = ctx
         .resolve_env_upvalue()
         .ok_or_else(|| ice("_ENV must resolve; main chunk pre-seeds it"))?;
-    ctx.emit(Instruction::GETTABUP {
-        dst: dst.0,
-        idx: env_idx,
-        ic_idx,
-        key,
-    });
+    ctx.emit(Instruction::gettabup(
+        dst,
+        UpIdx(env_idx),
+        IcIdx(ic_idx),
+        KIdx(key),
+    ));
     Ok(ExprDesc::from_reg(dst))
 }
 
@@ -2720,7 +2637,7 @@ fn compile_expr_literal(
             let constant = Value::string(LuaString::new(ctx.ctx, &bytes));
             let idx = ctx.alloc_constant(constant)?;
             let dst = ctx.dst_or_alloc(dst)?;
-            ctx.emit(Instruction::LOAD { dst: dst.0, idx });
+            ctx.emit(Instruction::load(dst, KIdx(idx)));
             Ok(ExprDesc::from_reg(dst))
         }
     }
@@ -2745,10 +2662,7 @@ fn compile_expr_func(
     let proto_idx = ctx.chunk.prototypes.len() as u16;
     ctx.chunk.prototypes.push(proto);
     let dst = ctx.dst_or_alloc(dst)?;
-    ctx.emit(Instruction::CLOSURE {
-        dst: dst.0,
-        proto: proto_idx,
-    });
+    ctx.emit(Instruction::closure(dst, ProtoIdx(proto_idx)));
 
     Ok(dst)
 }
@@ -2765,7 +2679,7 @@ fn compile_property_key(
             .ok_or_else(|| ice("ident without name"))?;
         let idx = ctx.alloc_string_constant(name.as_bytes())?;
         let reg = ctx.dst_or_alloc(dst)?;
-        ctx.emit(Instruction::LOAD { dst: reg.0, idx });
+        ctx.emit(Instruction::load(reg, KIdx(idx)));
         Ok(reg)
     } else {
         // Fallback: compile as expression
@@ -2805,7 +2719,7 @@ fn property_field_name(ctx: &Ctx, field: &Expr) -> Result<Option<Vec<u8>>, Compi
 
 fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, CompileError> {
     let dst = ctx.alloc_register()?;
-    ctx.emit(Instruction::NEWTABLE { dst: dst.0 });
+    ctx.emit(Instruction::newtable(dst));
 
     let mut array_count: u16 = 0;
     let mut array_pending = 0u8;
@@ -2840,11 +2754,11 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
                 {
                     let slot = RegisterIndex(pending_base + array_pending);
                     compile_trailing_multires(ctx, value_expr, slot)?;
-                    ctx.emit(Instruction::SETLIST {
-                        table: dst.0,
-                        count: 0,
-                        offset: array_count - array_pending as u16,
-                    });
+                    ctx.emit(Instruction::setlist(
+                        dst,
+                        0,
+                        array_count - array_pending as u16,
+                    ));
                     array_pending = 0;
                     ctx.chunk.freereg = pending_base;
                     continue;
@@ -2859,10 +2773,7 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
                     while ctx.chunk.freereg <= slot.0 {
                         ctx.alloc_register()?;
                     }
-                    ctx.emit(Instruction::MOVE {
-                        dst: slot.0,
-                        src: val.0,
-                    });
+                    ctx.emit(Instruction::mov(slot, val));
                     ctx.free_reg(val);
                 }
                 array_pending += 1;
@@ -2870,11 +2781,11 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
 
                 // Flush when we hit the batch limit
                 if array_pending >= 50 {
-                    ctx.emit(Instruction::SETLIST {
-                        table: dst.0,
-                        count: array_pending,
-                        offset: array_count - array_pending as u16,
-                    });
+                    ctx.emit(Instruction::setlist(
+                        dst,
+                        array_pending,
+                        array_count - array_pending as u16,
+                    ));
                     array_pending = 0;
                     ctx.chunk.freereg = pending_base;
                 }
@@ -2883,11 +2794,11 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
             TableEntry::Map(map) => {
                 // Flush pending array entries first
                 if array_pending > 0 {
-                    ctx.emit(Instruction::SETLIST {
-                        table: dst.0,
-                        count: array_pending,
-                        offset: array_count - array_pending as u16,
-                    });
+                    ctx.emit(Instruction::setlist(
+                        dst,
+                        array_pending,
+                        array_count - array_pending as u16,
+                    ));
                     array_pending = 0;
                     ctx.chunk.freereg = pending_base;
                 }
@@ -2900,23 +2811,23 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
                 let value_expr = map.value().ok_or_else(|| ice("table map without value"))?;
                 let val = compile_expr_to_reg(ctx, value_expr, None)?;
 
-                ctx.emit(Instruction::SETFIELD {
-                    src: val.0,
-                    table: dst.0,
-                    ic_idx,
-                    key_idx,
-                });
+                ctx.emit(Instruction::setfield(
+                    val,
+                    dst,
+                    IcIdx(ic_idx),
+                    KIdx(key_idx),
+                ));
                 ctx.free_reg(val);
             }
 
             TableEntry::Generic(r#gen) => {
                 // Flush pending array entries first
                 if array_pending > 0 {
-                    ctx.emit(Instruction::SETLIST {
-                        table: dst.0,
-                        count: array_pending,
-                        offset: array_count - array_pending as u16,
-                    });
+                    ctx.emit(Instruction::setlist(
+                        dst,
+                        array_pending,
+                        array_count - array_pending as u16,
+                    ));
                     array_pending = 0;
                     ctx.chunk.freereg = pending_base;
                 }
@@ -2930,11 +2841,7 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
                 let key = compile_expr_to_reg(ctx, key_expr, None)?;
                 let val = compile_expr_to_reg(ctx, val_expr, None)?;
 
-                ctx.emit(Instruction::SETTABLE {
-                    src: val.0,
-                    table: dst.0,
-                    key: key.0,
-                });
+                ctx.emit(Instruction::settable(val, dst, key));
                 ctx.free_regs(val, key);
             }
         }
@@ -2942,11 +2849,11 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
 
     // Flush remaining array entries
     if array_pending > 0 {
-        ctx.emit(Instruction::SETLIST {
-            table: dst.0,
-            count: array_pending,
-            offset: array_count - array_pending as u16,
-        });
+        ctx.emit(Instruction::setlist(
+            dst,
+            array_pending,
+            array_count - array_pending as u16,
+        ));
         ctx.chunk.freereg = pending_base;
     }
 
@@ -3019,10 +2926,7 @@ fn compile_expr_prefix_op(
             ExprKind::Reg(src) => {
                 ctx.free_reg(src);
                 let dst = ctx.dst_or_alloc(dst)?;
-                ctx.emit(Instruction::NOT {
-                    dst: dst.0,
-                    src: src.0,
-                });
+                ctx.emit(Instruction::not(dst, src));
                 return Ok(ctx.codenot(inner, ExprKind::Reg(dst)));
             }
             // Const operand still carrying short-circuit jumps, e.g.
@@ -3049,29 +2953,20 @@ fn compile_expr_prefix_op(
         PrefixOperator::Neg => {
             ctx.free_reg(src);
             let dst = ctx.dst_or_alloc(dst)?;
-            ctx.emit(Instruction::UNM {
-                dst: dst.0,
-                src: src.0,
-            });
+            ctx.emit(Instruction::unm(dst, src));
             dst
         }
         PrefixOperator::Not => unreachable!("handled above"),
         PrefixOperator::Len => {
             ctx.free_reg(src);
             let dst = ctx.dst_or_alloc(dst)?;
-            ctx.emit(Instruction::LEN {
-                dst: dst.0,
-                src: src.0,
-            });
+            ctx.emit(Instruction::len(dst, src));
             dst
         }
         PrefixOperator::BitNot => {
             ctx.free_reg(src);
             let dst = ctx.dst_or_alloc(dst)?;
-            ctx.emit(Instruction::BNOT {
-                dst: dst.0,
-                src: src.0,
-            });
+            ctx.emit(Instruction::bnot(dst, src));
             dst
         }
     };
@@ -3113,17 +3008,10 @@ fn compile_expr_binary_op(
                 .ok_or_else(|| ice("vararg property without static key"))?;
             let key_const = ctx.alloc_string_constant(&key_bytes)?;
             let key_reg = ctx.alloc_register()?;
-            ctx.emit(Instruction::LOAD {
-                dst: key_reg.0,
-                idx: key_const,
-            });
+            ctx.emit(Instruction::load(key_reg, KIdx(key_const)));
             ctx.free_reg(key_reg);
             let dst = ctx.dst_or_alloc(dst)?;
-            ctx.emit(Instruction::VARARGGET {
-                dst: dst.0,
-                base: args_reg,
-                key: key_reg.0,
-            });
+            ctx.emit(Instruction::varargget(dst, Reg(args_reg), key_reg));
             return Ok(ExprDesc::from_reg(dst));
         }
 
@@ -3131,22 +3019,18 @@ fn compile_expr_binary_op(
         if let Some((key_idx, ic_idx)) = try_property_key_constant(ctx, &rhs)? {
             ctx.free_reg(table);
             let dst = ctx.dst_or_alloc(dst)?;
-            ctx.emit(Instruction::GETFIELD {
-                dst: dst.0,
-                table: table.0,
-                ic_idx,
-                key_idx,
-            });
+            ctx.emit(Instruction::getfield(
+                dst,
+                table,
+                IcIdx(ic_idx),
+                KIdx(key_idx),
+            ));
             return Ok(ExprDesc::from_reg(dst));
         }
         let key = compile_property_key(ctx, rhs, None)?;
         ctx.free_regs(table, key);
         let dst = ctx.dst_or_alloc(dst)?;
-        ctx.emit(Instruction::GETTABLE {
-            dst: dst.0,
-            table: table.0,
-            key: key.0,
-        });
+        ctx.emit(Instruction::gettable(dst, table, key));
         return Ok(ExprDesc::from_reg(dst));
     }
 
@@ -3200,146 +3084,34 @@ fn compile_expr_binary_op(
     };
 
     let reg = match op {
-        BinaryOperator::Add => emit_arith(
-            ctx,
-            lhs,
-            rhs,
-            Instruction::ADD {
-                dst: 0,
-                lhs: lhs.0,
-                rhs: rhs.0,
-            },
-            dst,
-        )?,
-        BinaryOperator::Sub => emit_arith(
-            ctx,
-            lhs,
-            rhs,
-            Instruction::SUB {
-                dst: 0,
-                lhs: lhs.0,
-                rhs: rhs.0,
-            },
-            dst,
-        )?,
-        BinaryOperator::Mul => emit_arith(
-            ctx,
-            lhs,
-            rhs,
-            Instruction::MUL {
-                dst: 0,
-                lhs: lhs.0,
-                rhs: rhs.0,
-            },
-            dst,
-        )?,
-        BinaryOperator::Div => emit_arith(
-            ctx,
-            lhs,
-            rhs,
-            Instruction::DIV {
-                dst: 0,
-                lhs: lhs.0,
-                rhs: rhs.0,
-            },
-            dst,
-        )?,
-        BinaryOperator::IntDiv => emit_arith(
-            ctx,
-            lhs,
-            rhs,
-            Instruction::IDIV {
-                dst: 0,
-                lhs: lhs.0,
-                rhs: rhs.0,
-            },
-            dst,
-        )?,
-        BinaryOperator::Mod => emit_arith(
-            ctx,
-            lhs,
-            rhs,
-            Instruction::MOD {
-                dst: 0,
-                lhs: lhs.0,
-                rhs: rhs.0,
-            },
-            dst,
-        )?,
-        BinaryOperator::Exp => emit_arith(
-            ctx,
-            lhs,
-            rhs,
-            Instruction::POW {
-                dst: 0,
-                lhs: lhs.0,
-                rhs: rhs.0,
-            },
-            dst,
-        )?,
-        BinaryOperator::BitAnd => emit_arith(
-            ctx,
-            lhs,
-            rhs,
-            Instruction::BAND {
-                dst: 0,
-                lhs: lhs.0,
-                rhs: rhs.0,
-            },
-            dst,
-        )?,
-        BinaryOperator::BitOr => emit_arith(
-            ctx,
-            lhs,
-            rhs,
-            Instruction::BOR {
-                dst: 0,
-                lhs: lhs.0,
-                rhs: rhs.0,
-            },
-            dst,
-        )?,
-        BinaryOperator::BitXor => emit_arith(
-            ctx,
-            lhs,
-            rhs,
-            Instruction::BXOR {
-                dst: 0,
-                lhs: lhs.0,
-                rhs: rhs.0,
-            },
-            dst,
-        )?,
-        BinaryOperator::LShift => emit_arith(
-            ctx,
-            lhs,
-            rhs,
-            Instruction::SHL {
-                dst: 0,
-                lhs: lhs.0,
-                rhs: rhs.0,
-            },
-            dst,
-        )?,
-        BinaryOperator::RShift => emit_arith(
-            ctx,
-            lhs,
-            rhs,
-            Instruction::SHR {
-                dst: 0,
-                lhs: lhs.0,
-                rhs: rhs.0,
-            },
-            dst,
-        )?,
+        BinaryOperator::Add => emit_arith(ctx, lhs, rhs, Instruction::add(Reg(0), lhs, rhs), dst)?,
+        BinaryOperator::Sub => emit_arith(ctx, lhs, rhs, Instruction::sub(Reg(0), lhs, rhs), dst)?,
+        BinaryOperator::Mul => emit_arith(ctx, lhs, rhs, Instruction::mul(Reg(0), lhs, rhs), dst)?,
+        BinaryOperator::Div => emit_arith(ctx, lhs, rhs, Instruction::div(Reg(0), lhs, rhs), dst)?,
+        BinaryOperator::IntDiv => {
+            emit_arith(ctx, lhs, rhs, Instruction::idiv(Reg(0), lhs, rhs), dst)?
+        }
+        BinaryOperator::Mod => emit_arith(ctx, lhs, rhs, Instruction::mod_(Reg(0), lhs, rhs), dst)?,
+        BinaryOperator::Exp => emit_arith(ctx, lhs, rhs, Instruction::pow(Reg(0), lhs, rhs), dst)?,
+        BinaryOperator::BitAnd => {
+            emit_arith(ctx, lhs, rhs, Instruction::band(Reg(0), lhs, rhs), dst)?
+        }
+        BinaryOperator::BitOr => {
+            emit_arith(ctx, lhs, rhs, Instruction::bor(Reg(0), lhs, rhs), dst)?
+        }
+        BinaryOperator::BitXor => {
+            emit_arith(ctx, lhs, rhs, Instruction::bxor(Reg(0), lhs, rhs), dst)?
+        }
+        BinaryOperator::LShift => {
+            emit_arith(ctx, lhs, rhs, Instruction::shl(Reg(0), lhs, rhs), dst)?
+        }
+        BinaryOperator::RShift => {
+            emit_arith(ctx, lhs, rhs, Instruction::shr(Reg(0), lhs, rhs), dst)?
+        }
         BinaryOperator::Concat => {
             ctx.free_regs(lhs, rhs);
             let dst = ctx.dst_or_alloc(dst)?;
-            ctx.emit(Instruction::CONCAT {
-                dst: dst.0,
-                lhs: lhs.0,
-                rhs: rhs.0,
-            });
+            ctx.emit(Instruction::concat(dst, lhs, rhs));
             dst
         }
 
@@ -3376,22 +3148,9 @@ fn emit_arith(
     // slot(s). Locals are no-ops. Matches Lua's `codebinexpval`.
     ctx.free_regs(lhs, rhs);
     let dst = ctx.dst_or_alloc(dst)?;
-    // Patch the dst field in the instruction
-    match &mut instr {
-        Instruction::ADD { dst: d, .. }
-        | Instruction::SUB { dst: d, .. }
-        | Instruction::MUL { dst: d, .. }
-        | Instruction::DIV { dst: d, .. }
-        | Instruction::IDIV { dst: d, .. }
-        | Instruction::MOD { dst: d, .. }
-        | Instruction::POW { dst: d, .. }
-        | Instruction::BAND { dst: d, .. }
-        | Instruction::BOR { dst: d, .. }
-        | Instruction::BXOR { dst: d, .. }
-        | Instruction::SHL { dst: d, .. }
-        | Instruction::SHR { dst: d, .. } => *d = dst.0,
-        _ => unreachable!(),
-    }
+    // Every arithmetic opcode is `Abc`-shaped with `dst` in the `a` slot.
+    debug_assert_eq!(instr.op().shape(), Shape::Abc);
+    instr.set_a(dst.0);
     ctx.emit(instr);
     Ok(dst)
 }
@@ -3423,36 +3182,12 @@ fn compile_comparison_desc(
     // boolean). NEq / opposite-comparisons carry `inverted=false` to
     // cancel the surface-level negation.
     let instr = match op {
-        BinaryOperator::Eq => Instruction::EQ {
-            lhs: lhs.0,
-            rhs: rhs.0,
-            inverted: true,
-        },
-        BinaryOperator::NEq => Instruction::EQ {
-            lhs: lhs.0,
-            rhs: rhs.0,
-            inverted: false,
-        },
-        BinaryOperator::Lt => Instruction::LT {
-            lhs: lhs.0,
-            rhs: rhs.0,
-            inverted: true,
-        },
-        BinaryOperator::Gt => Instruction::LT {
-            lhs: rhs.0,
-            rhs: lhs.0,
-            inverted: true,
-        },
-        BinaryOperator::LEq => Instruction::LE {
-            lhs: lhs.0,
-            rhs: rhs.0,
-            inverted: true,
-        },
-        BinaryOperator::GEq => Instruction::LE {
-            lhs: rhs.0,
-            rhs: lhs.0,
-            inverted: true,
-        },
+        BinaryOperator::Eq => Instruction::eq(lhs, rhs, true),
+        BinaryOperator::NEq => Instruction::eq(lhs, rhs, false),
+        BinaryOperator::Lt => Instruction::lt(lhs, rhs, true),
+        BinaryOperator::Gt => Instruction::lt(rhs, lhs, true),
+        BinaryOperator::LEq => Instruction::le(lhs, rhs, true),
+        BinaryOperator::GEq => Instruction::le(rhs, lhs, true),
         _ => return Err(ice("compile_comparison_desc called with non-comparison op")),
     };
     ctx.emit(instr);
@@ -3564,10 +3299,7 @@ fn emit_func_call_setup(
     let needs_copy = (func.0 + 1 != ctx.chunk.freereg) || func.0 < ctx.chunk.nactvar;
     let func = if needs_copy {
         let top = ctx.alloc_register()?;
-        ctx.emit(Instruction::MOVE {
-            dst: top.0,
-            src: func.0,
-        });
+        ctx.emit(Instruction::mov(top, func));
         top
     } else {
         func
@@ -3595,11 +3327,7 @@ fn compile_expr_func_call(
         Want::Exact(n) => n + 1,
         Want::MultRet => 0,
     };
-    ctx.emit(Instruction::CALL {
-        func: func.0,
-        args: args_wire,
-        returns,
-    });
+    ctx.emit(Instruction::call(func, args_wire, returns));
 
     match want {
         Want::Exact(n) => {
@@ -3623,10 +3351,7 @@ fn compile_expr_func_call(
 /// `frame_return`).
 fn compile_tail_func_call(ctx: &mut Ctx, item: FuncCall) -> Result<(), CompileError> {
     let (func, args_wire) = emit_func_call_setup(ctx, &item)?;
-    ctx.emit(Instruction::TAILCALL {
-        func: func.0,
-        args: args_wire,
-    });
+    ctx.emit(Instruction::tailcall(func, args_wire));
     // Frame is about to be torn down; conservatively snap freereg to func
     // so any post-TAILCALL code in the compiler (there shouldn't be any
     // reachable) sees a clean cursor.
@@ -3639,10 +3364,7 @@ fn compile_tail_func_call(ctx: &mut Ctx, item: FuncCall) -> Result<(), CompileEr
 /// register list.
 fn compile_tail_method_call(ctx: &mut Ctx, item: MethodCall) -> Result<(), CompileError> {
     let (func, args_wire) = emit_method_call_setup(ctx, &item)?;
-    ctx.emit(Instruction::TAILCALL {
-        func: func.0,
-        args: args_wire,
-    });
+    ctx.emit(Instruction::tailcall(func, args_wire));
     ctx.chunk.freereg = func.0;
     Ok(())
 }
@@ -3659,21 +3381,13 @@ fn compile_stmt_expr(ctx: &mut Ctx, item: Expr) -> Result<(), CompileError> {
     match item {
         Expr::FuncCall(call) => {
             let (func, args_wire) = emit_func_call_setup(ctx, &call)?;
-            ctx.emit(Instruction::CALL {
-                func: func.0,
-                args: args_wire,
-                returns: 1,
-            });
+            ctx.emit(Instruction::call(func, args_wire, 1));
             ctx.chunk.freereg = func.0;
             Ok(())
         }
         Expr::Method(call) => {
             let (func, args_wire) = emit_method_call_setup(ctx, &call)?;
-            ctx.emit(Instruction::CALL {
-                func: func.0,
-                args: args_wire,
-                returns: 1,
-            });
+            ctx.emit(Instruction::call(func, args_wire, 1));
             ctx.chunk.freereg = func.0;
             Ok(())
         }
@@ -3709,11 +3423,7 @@ fn emit_method_call_setup(
     let key_idx = ctx.alloc_string_constant(method_name.as_bytes())?;
 
     let func = ctx.alloc_register()?;
-    ctx.emit(Instruction::SELF {
-        dst: func.0,
-        object: object.0,
-        key_idx,
-    });
+    ctx.emit(Instruction::self_(func, object, KIdx(key_idx)));
 
     // SELF writes both `func` and `func+1` (self); reserve the second
     // slot so subsequent arg compilation lands at func+2 and freereg /
@@ -3761,10 +3471,7 @@ fn compile_trailing_multires(
             while ctx.chunk.freereg <= target.0 {
                 ctx.alloc_register()?;
             }
-            ctx.emit(Instruction::VARARG {
-                dst: target.0,
-                count: 0,
-            });
+            ctx.emit(Instruction::vararg(target, 0));
             Ok(true)
         }
         other => {
@@ -3773,10 +3480,7 @@ fn compile_trailing_multires(
                 while ctx.chunk.freereg <= target.0 {
                     ctx.alloc_register()?;
                 }
-                ctx.emit(Instruction::MOVE {
-                    dst: target.0,
-                    src: reg.0,
-                });
+                ctx.emit(Instruction::mov(target, reg));
             }
             Ok(false)
         }
@@ -3811,10 +3515,7 @@ fn compile_call_args(
                 while ctx.chunk.freereg <= expected_reg.0 {
                     ctx.alloc_register()?;
                 }
-                ctx.emit(Instruction::MOVE {
-                    dst: expected_reg.0,
-                    src: arg.0,
-                });
+                ctx.emit(Instruction::mov(expected_reg, arg));
             }
         }
     }
@@ -3835,11 +3536,7 @@ fn compile_expr_method_call(
         Want::Exact(n) => n + 1,
         Want::MultRet => 0,
     };
-    ctx.emit(Instruction::CALL {
-        func: func.0,
-        args: args_wire,
-        returns,
-    });
+    ctx.emit(Instruction::call(func, args_wire, returns));
 
     match want {
         Want::Exact(n) => {
@@ -3868,11 +3565,7 @@ fn compile_expr_index(
         let key = compile_expr_to_reg(ctx, key_expr, None)?;
         ctx.free_reg(key);
         let dst = ctx.dst_or_alloc(dst)?;
-        ctx.emit(Instruction::VARARGGET {
-            dst: dst.0,
-            base: args_reg,
-            key: key.0,
-        });
+        ctx.emit(Instruction::varargget(dst, Reg(args_reg), key));
         return Ok(dst);
     }
 
@@ -3882,11 +3575,7 @@ fn compile_expr_index(
     // their temps (higher first) so `dst` can reuse the slot.
     ctx.free_regs(table, key);
     let dst = ctx.dst_or_alloc(dst)?;
-    ctx.emit(Instruction::GETTABLE {
-        dst: dst.0,
-        table: table.0,
-        key: key.0,
-    });
+    ctx.emit(Instruction::gettable(dst, table, key));
     Ok(dst)
 }
 
@@ -3946,10 +3635,7 @@ fn compile_return(ctx: &mut Ctx, item: Return) -> Result<(), CompileError> {
 /// doesn't qualify for `TAILCALL`.
 fn compile_return_generic(ctx: &mut Ctx, mut exprs: Vec<Expr>) -> Result<(), CompileError> {
     if exprs.is_empty() {
-        ctx.emit(Instruction::RETURN {
-            values: 0,
-            count: 1,
-        });
+        ctx.emit(Instruction::ret(Reg(0), 1));
         return Ok(());
     }
 
@@ -3964,24 +3650,15 @@ fn compile_return_generic(ctx: &mut Ctx, mut exprs: Vec<Expr>) -> Result<(), Com
         // `return ...` propagates every vararg to the caller via MULTRET.
         if matches!(&only, Expr::VarArg) {
             let dst = ctx.alloc_register()?;
-            ctx.emit(Instruction::VARARG {
-                dst: dst.0,
-                count: 0,
-            });
-            ctx.emit(Instruction::RETURN {
-                values: dst.0,
-                count: 0,
-            });
+            ctx.emit(Instruction::vararg(dst, 0));
+            ctx.emit(Instruction::ret(dst, 0));
             return Ok(());
         }
         let mut desc = compile_expr(ctx, only, None)?;
         if !desc.has_jumps()
             && let ExprKind::Reg(reg) = desc.kind
         {
-            ctx.emit(Instruction::RETURN {
-                values: reg.0,
-                count: 2,
-            });
+            ctx.emit(Instruction::ret(reg, 2));
             return Ok(());
         }
         // Fall through to the generic path, discharging through a fresh
@@ -3989,15 +3666,9 @@ fn compile_return_generic(ctx: &mut Ctx, mut exprs: Vec<Expr>) -> Result<(), Com
         let first_reg = ctx.alloc_register()?;
         let reg = ctx.discharge_to_reg_mut(&mut desc, Some(first_reg))?;
         if reg != first_reg {
-            ctx.emit(Instruction::MOVE {
-                dst: first_reg.0,
-                src: reg.0,
-            });
+            ctx.emit(Instruction::mov(first_reg, reg));
         }
-        ctx.emit(Instruction::RETURN {
-            values: first_reg.0,
-            count: 2,
-        });
+        ctx.emit(Instruction::ret(first_reg, 2));
         return Ok(());
     }
 
@@ -4020,18 +3691,15 @@ fn compile_return_generic(ctx: &mut Ctx, mut exprs: Vec<Expr>) -> Result<(), Com
                 while ctx.chunk.freereg <= target.0 {
                     ctx.alloc_register()?;
                 }
-                ctx.emit(Instruction::MOVE {
-                    dst: target.0,
-                    src: reg.0,
-                });
+                ctx.emit(Instruction::mov(target, reg));
             }
         }
     }
 
-    ctx.emit(Instruction::RETURN {
-        values: first_reg.0,
-        count: if multret { 0 } else { n as u8 + 1 },
-    });
+    ctx.emit(Instruction::ret(
+        first_reg,
+        if multret { 0 } else { n as u8 + 1 },
+    ));
 
     Ok(())
 }
@@ -4200,38 +3868,26 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
         // step_reg+1 when this block finishes (asserted below).
         let init = compile_expr_to_reg(ctx, init_expr, Some(base))?;
         if init != base {
-            ctx.emit(Instruction::MOVE {
-                dst: base.0,
-                src: init.0,
-            });
+            ctx.emit(Instruction::mov(base, init));
             ctx.free_reg(init);
         }
 
         let limit = compile_expr_to_reg(ctx, limit_expr, Some(limit_reg))?;
         if limit != limit_reg {
-            ctx.emit(Instruction::MOVE {
-                dst: limit_reg.0,
-                src: limit.0,
-            });
+            ctx.emit(Instruction::mov(limit_reg, limit));
             ctx.free_reg(limit);
         }
 
         if let Some(step_expr) = item.step() {
             let step = compile_expr_to_reg(ctx, step_expr, Some(step_reg))?;
             if step != step_reg {
-                ctx.emit(Instruction::MOVE {
-                    dst: step_reg.0,
-                    src: step.0,
-                });
+                ctx.emit(Instruction::mov(step_reg, step));
                 ctx.free_reg(step);
             }
         } else {
             // Default step = 1
             let one_idx = ctx.alloc_constant(Value::integer(1))?;
-            ctx.emit(Instruction::LOAD {
-                dst: step_reg.0,
-                idx: one_idx,
-            });
+            ctx.emit(Instruction::load(step_reg, KIdx(one_idx)));
         }
 
         // FORPREP/FORLOOP hardcode the loop variable at base+3; with
@@ -4266,13 +3922,7 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
         let loop_end = ctx.new_label();
 
         // FORPREP: initialize and jump past body if loop shouldn't execute
-        ctx.emit_jump_instr(
-            loop_end,
-            Instruction::FORPREP {
-                base: base.0,
-                offset: 0,
-            },
-        );
+        ctx.emit_jump_instr(loop_end, Instruction::forprep(base, 0));
 
         ctx.set_label(loop_body, ctx.next_offset());
 
@@ -4285,13 +3935,7 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
         }
 
         // FORLOOP: increment and jump back if still in range
-        ctx.emit_jump_instr(
-            loop_body,
-            Instruction::FORLOOP {
-                base: base.0,
-                offset: 0,
-            },
-        );
+        ctx.emit_jump_instr(loop_body, Instruction::forloop(base, 0));
 
         ctx.set_label(loop_end, ctx.next_offset());
         Ok(())
@@ -4340,10 +3984,7 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
                     Expr::VarArg => {
                         let dst = ctx.reserve_regs(want)?;
                         assert_eq!(dst.0, expected);
-                        ctx.emit(Instruction::VARARG {
-                            dst: dst.0,
-                            count: want + 1,
-                        });
+                        ctx.emit(Instruction::vararg(dst, want + 1));
                         continue;
                     }
                     _ => {}
@@ -4355,10 +3996,7 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
             if reg.0 != expected {
                 ctx.chunk.freereg = expected;
                 let slot = ctx.reserve_reg()?;
-                ctx.emit(Instruction::MOVE {
-                    dst: slot.0,
-                    src: reg.0,
-                });
+                ctx.emit(Instruction::mov(slot, reg));
             } else if ctx.chunk.freereg > expected + 1 {
                 ctx.chunk.freereg = expected + 1;
             }
@@ -4369,7 +4007,7 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
         while ctx.chunk.freereg < ctrl_top {
             let slot = ctx.reserve_reg()?;
             let idx = ctx.alloc_constant(Value::nil())?;
-            ctx.emit(Instruction::LOAD { dst: slot.0, idx });
+            ctx.emit(Instruction::load(slot, KIdx(idx)));
         }
         ctx.chunk.freereg = ctrl_top;
 
@@ -4403,13 +4041,7 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
         let loop_test = ctx.new_label();
 
         // TFORPREP: jump to the test
-        ctx.emit_jump_instr(
-            loop_test,
-            Instruction::TFORPREP {
-                base: base.0,
-                offset: 0,
-            },
-        );
+        ctx.emit_jump_instr(loop_test, Instruction::tforprep(base, 0));
 
         ctx.set_label(loop_body, ctx.next_offset());
 
@@ -4424,19 +4056,10 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
         ctx.set_label(loop_test, ctx.next_offset());
 
         // TFORCALL: call iterator, results go to base+3..base+2+count
-        ctx.emit(Instruction::TFORCALL {
-            base: base.0,
-            count: num_targets as u8,
-        });
+        ctx.emit(Instruction::tforcall(base, num_targets as u8));
 
         // TFORLOOP: if control variable is not nil, jump back to body
-        ctx.emit_jump_instr(
-            loop_body,
-            Instruction::TFORLOOP {
-                base: base.0,
-                offset: 0,
-            },
-        );
+        ctx.emit_jump_instr(loop_body, Instruction::tforloop(base, 0));
 
         Ok(())
     })
