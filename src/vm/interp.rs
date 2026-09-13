@@ -144,6 +144,7 @@ macro_rules! helpers {
         #[allow(unused_macros)]
         macro_rules! raise {
             () => {{
+                std::hint::cold_path();
                 become impl_error($instruction, $ctx, $thread, $registers, $ip, $handlers);
             }};
         }
@@ -532,7 +533,6 @@ pub(crate) fn run_thread<'gc>(ctx: Context<'gc>, thread: Thread<'gc>) -> Result<
 // Error
 // ---------------------------------------------------------------------------
 
-#[cold]
 #[inline(never)]
 extern "rust-preserve-none" fn impl_error<'gc>(
     _instruction: Instruction,
