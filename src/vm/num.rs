@@ -240,12 +240,31 @@ impl BitOp for BXor {
     }
 }
 
+/// Lua's `luaV_shiftl`: a logical left shift by `y` bits, zero-filling the vacant
+/// bits. A negative `y` shifts right instead, and any displacement with |y| >= 64
+/// shifts every bit out and yields 0 — so this is *not* Rust's `<<`, which both
+/// sign-extends on the right and masks the count mod 64. Right shift is this with
+/// `y` negated. (manual: "Both right and left shifts fill the vacant bits with
+/// zeros. Negative displacements shift to the other direction; displacements with
+/// absolute values equal to or higher than the number of bits ... result in zero".)
+#[inline(always)]
+fn shift_left(x: i64, y: i64) -> i64 {
+    const NBITS: i64 = i64::BITS as i64;
+    if y <= -NBITS || y >= NBITS {
+        0
+    } else if y >= 0 {
+        ((x as u64) << y) as i64
+    } else {
+        ((x as u64) >> -y) as i64
+    }
+}
+
 pub struct Shl;
 
 impl BitOp for Shl {
     #[inline(always)]
     fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc> {
-        Value::integer(lhs.wrapping_shl(rhs as u32))
+        Value::integer(shift_left(lhs, rhs))
     }
 }
 
@@ -254,7 +273,9 @@ pub struct Shr;
 impl BitOp for Shr {
     #[inline(always)]
     fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc> {
-        Value::integer(lhs.wrapping_shr(rhs as u32))
+        // `wrapping_neg` so `rhs == i64::MIN` (a right shift by 2^63) doesn't
+        // overflow; `shift_left` maps the resulting huge magnitude to 0 anyway.
+        Value::integer(shift_left(lhs, rhs.wrapping_neg()))
     }
 }
 
