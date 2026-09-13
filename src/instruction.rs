@@ -439,8 +439,9 @@ impl fmt::Debug for Instruction {
 /// constructor, operand shape, and the name and type of each operand.
 ///
 /// Adding an opcode here gives you the `Op` variant, the typed constructor and
-/// the shape metadata; the interpreter's handler array is keyed by `Op`, so
-/// the compiler will point at the missing handler.
+/// the shape metadata; the interpreter builds its handler array with
+/// [`Op::table`], which requires exactly one row per opcode, so a missing
+/// handler is a build error.
 macro_rules! instructions {
     ($(
         $(#[$meta:meta])*
@@ -466,6 +467,20 @@ macro_rules! instructions {
             /// Which operand slots this opcode uses.
             pub fn shape(self) -> Shape {
                 match self { $(Op::$op => Shape::$shape,)* }
+            }
+
+            pub const fn table<T: Copy>(rows: [(Op, T); Op::COUNT]) -> [T; Op::COUNT] {
+                let mut t = [rows[0].1; Op::COUNT];
+                let mut seen = [false; Op::COUNT];
+                let mut i = 0;
+                while i < rows.len() {
+                    let (op, v) = rows[i];
+                    assert!(!seen[op as usize], "opcode listed twice");
+                    seen[op as usize] = true;
+                    t[op as usize] = v;
+                    i += 1;
+                }
+                t
             }
         }
 

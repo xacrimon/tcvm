@@ -16,71 +16,62 @@ use crate::jit;
 use crate::lua::Context;
 use crate::vm::num::{self, op_arith_float, op_arith_int, op_bit_int};
 
-/// Opcode handlers, indexed by opcode number.
-///
-/// Entries are assigned by `Op` rather than written in positional order: the
-/// ISA table owns the numbering, so reordering or inserting an opcode there
-/// can't silently point one at its neighbour's handler.
-static HANDLERS: [Handler; Op::COUNT] = handler_table();
-
-const fn handler_table() -> [Handler; Op::COUNT] {
-    let mut t: [Handler; Op::COUNT] = [op_unimplemented; Op::COUNT];
-    t[Op::MOVE as usize] = op_move;
-    t[Op::LOAD as usize] = op_load;
-    t[Op::LFALSESKIP as usize] = op_lfalseskip;
-    t[Op::GETUPVAL as usize] = op_getupval;
-    t[Op::SETUPVAL as usize] = op_setupval;
-    t[Op::GETTABUP as usize] = op_gettabup;
-    t[Op::SETTABUP as usize] = op_settabup;
-    t[Op::GETTABLE as usize] = op_gettable;
-    t[Op::SETTABLE as usize] = op_settable;
-    t[Op::GETFIELD as usize] = op_getfield;
-    t[Op::SETFIELD as usize] = op_setfield;
-    t[Op::SELF as usize] = op_self;
-    t[Op::NEWTABLE as usize] = op_newtable;
-    t[Op::ADD as usize] = op_add;
-    t[Op::SUB as usize] = op_sub;
-    t[Op::MUL as usize] = op_mul;
-    t[Op::MOD as usize] = op_mod;
-    t[Op::POW as usize] = op_pow;
-    t[Op::DIV as usize] = op_div;
-    t[Op::IDIV as usize] = op_idiv;
-    t[Op::BAND as usize] = op_band;
-    t[Op::BOR as usize] = op_bor;
-    t[Op::BXOR as usize] = op_bxor;
-    t[Op::SHL as usize] = op_shl;
-    t[Op::SHR as usize] = op_shr;
-    t[Op::UNM as usize] = op_unm;
-    t[Op::BNOT as usize] = op_bnot;
-    t[Op::NOT as usize] = op_not;
-    t[Op::LEN as usize] = op_len;
-    t[Op::CONCAT as usize] = op_concat;
-    t[Op::CLOSE as usize] = op_close;
-    t[Op::TBC as usize] = op_tbc;
-    t[Op::JMP as usize] = op_jmp;
-    t[Op::EQ as usize] = op_eq;
-    t[Op::LT as usize] = op_lt;
-    t[Op::LE as usize] = op_le;
-    t[Op::TEST as usize] = op_test;
-    t[Op::TESTSET as usize] = op_testset;
-    t[Op::CALL as usize] = op_call;
-    t[Op::TAILCALL as usize] = op_tailcall;
-    t[Op::RETURN as usize] = op_return;
-    t[Op::FORLOOP as usize] = op_forloop;
-    t[Op::FORPREP as usize] = op_forprep;
-    t[Op::TFORPREP as usize] = op_tforprep;
-    t[Op::TFORCALL as usize] = op_tforcall;
-    t[Op::TFORLOOP as usize] = op_tforloop;
-    t[Op::SETLIST as usize] = op_setlist;
-    t[Op::CLOSURE as usize] = op_closure;
-    t[Op::VARARG as usize] = op_vararg;
-    t[Op::VARARGGET as usize] = op_varargget;
-    t[Op::VARARGPREP as usize] = op_varargprep;
-    t[Op::ERRNNIL as usize] = op_errnnil;
-    t[Op::NOP as usize] = op_nop;
-    t[Op::STOP as usize] = op_stop;
-    t
-}
+static HANDLERS: [Handler; Op::COUNT] = Op::table([
+    (Op::MOVE, op_move),
+    (Op::LOAD, op_load),
+    (Op::LFALSESKIP, op_lfalseskip),
+    (Op::GETUPVAL, op_getupval),
+    (Op::SETUPVAL, op_setupval),
+    (Op::GETTABUP, op_gettabup),
+    (Op::SETTABUP, op_settabup),
+    (Op::GETTABLE, op_gettable),
+    (Op::SETTABLE, op_settable),
+    (Op::GETFIELD, op_getfield),
+    (Op::SETFIELD, op_setfield),
+    (Op::SELF, op_self),
+    (Op::NEWTABLE, op_newtable),
+    (Op::ADD, op_add),
+    (Op::SUB, op_sub),
+    (Op::MUL, op_mul),
+    (Op::MOD, op_mod),
+    (Op::POW, op_pow),
+    (Op::DIV, op_div),
+    (Op::IDIV, op_idiv),
+    (Op::BAND, op_band),
+    (Op::BOR, op_bor),
+    (Op::BXOR, op_bxor),
+    (Op::SHL, op_shl),
+    (Op::SHR, op_shr),
+    (Op::UNM, op_unm),
+    (Op::BNOT, op_bnot),
+    (Op::NOT, op_not),
+    (Op::LEN, op_len),
+    (Op::CONCAT, op_concat),
+    (Op::CLOSE, op_close),
+    (Op::TBC, op_tbc),
+    (Op::JMP, op_jmp),
+    (Op::EQ, op_eq),
+    (Op::LT, op_lt),
+    (Op::LE, op_le),
+    (Op::TEST, op_test),
+    (Op::TESTSET, op_testset),
+    (Op::CALL, op_call),
+    (Op::TAILCALL, op_tailcall),
+    (Op::RETURN, op_return),
+    (Op::FORLOOP, op_forloop),
+    (Op::FORPREP, op_forprep),
+    (Op::TFORPREP, op_tforprep),
+    (Op::TFORCALL, op_tforcall),
+    (Op::TFORLOOP, op_tforloop),
+    (Op::SETLIST, op_setlist),
+    (Op::CLOSURE, op_closure),
+    (Op::VARARG, op_vararg),
+    (Op::VARARGGET, op_varargget),
+    (Op::VARARGPREP, op_varargprep),
+    (Op::ERRNNIL, op_errnnil),
+    (Op::NOP, op_nop),
+    (Op::STOP, op_stop),
+]);
 
 #[derive(Debug)]
 pub(crate) struct Error {
@@ -549,21 +540,6 @@ pub(crate) fn run_thread<'gc>(ctx: Context<'gc>, thread: Thread<'gc>) -> Result<
 // ---------------------------------------------------------------------------
 // Error
 // ---------------------------------------------------------------------------
-
-/// Placeholder for any opcode number the ISA table declares but
-/// `handler_table` never assigns. Unreachable unless the two drift apart.
-#[cold]
-#[inline(never)]
-extern "rust-preserve-none" fn op_unimplemented<'gc>(
-    instruction: Instruction,
-    _ctx: Context<'gc>,
-    _thread: &mut ThreadState<'gc>,
-    _registers: Registers<'gc, '_>,
-    _ip: *const Instruction,
-    _handlers: *const (),
-) -> Result<(), Box<Error>> {
-    unreachable!("no handler installed for {:?}", instruction.op())
-}
 
 #[cold]
 #[inline(never)]
