@@ -1,5 +1,5 @@
 use crate::env::{Prototype, Value};
-use crate::instruction::{Instruction, UpValueDescriptor};
+use crate::instruction::{Instruction, Op, UpValueDescriptor};
 
 pub fn format_prototype(proto: &Prototype<'_>) -> String {
     let mut out = String::new();
@@ -77,164 +77,234 @@ pub(crate) fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -
         }
     }
 
-    match *instr {
-        Instruction::MOVE { dst, src } => format!("MOVE            R{dst} R{src}"),
-        Instruction::LOAD { dst, idx } => {
+    match instr.op() {
+        Op::MOVE => {
+            let (dst, src) = instr.ab();
+            format!("MOVE            R{dst} R{src}")
+        }
+        Op::LOAD => {
+            let (dst, idx) = instr.ad();
             format!(
                 "LOAD            R{dst} K{idx}{}",
                 const_comment(constants, idx)
             )
         }
-        Instruction::LFALSESKIP { src } => format!("LFALSESKIP      R{src}"),
-        Instruction::GETUPVAL { dst, idx } => format!("GETUPVAL        R{dst} U{idx}"),
-        Instruction::SETUPVAL { src, idx } => format!("SETUPVAL        R{src} U{idx}"),
-        Instruction::GETTABUP {
-            dst,
-            idx,
-            ic_idx: _,
-            key,
-        } => {
+        Op::LFALSESKIP => {
+            let src = instr.a();
+            format!("LFALSESKIP      R{src}")
+        }
+        Op::GETUPVAL => {
+            let (dst, idx) = instr.ab();
+            format!("GETUPVAL        R{dst} U{idx}")
+        }
+        Op::SETUPVAL => {
+            let (src, idx) = instr.ab();
+            format!("SETUPVAL        R{src} U{idx}")
+        }
+        Op::GETTABUP => {
+            let (dst, idx, _, key) = instr.abde();
             format!(
                 "GETTABUP        R{dst} U{idx} K{key}{}",
                 const_comment(constants, key)
             )
         }
-        Instruction::SETTABUP {
-            src,
-            idx,
-            ic_idx: _,
-            key,
-        } => {
+        Op::SETTABUP => {
+            let (src, idx, _, key) = instr.abde();
             format!(
                 "SETTABUP        R{src} U{idx} K{key}{}",
                 const_comment(constants, key)
             )
         }
-        Instruction::GETTABLE { dst, table, key } => {
+        Op::GETTABLE => {
+            let (dst, table, key) = instr.abc();
             format!("GETTABLE        R{dst} R{table} R{key}")
         }
-        Instruction::SETTABLE { src, table, key } => {
+        Op::SETTABLE => {
+            let (src, table, key) = instr.abc();
             format!("SETTABLE        R{src} R{table} R{key}")
         }
-        Instruction::GETFIELD {
-            dst,
-            table,
-            ic_idx: _,
-            key_idx,
-        } => {
+        Op::GETFIELD => {
+            let (dst, table, _, key_idx) = instr.abde();
             format!(
                 "GETFIELD        R{dst} R{table} K{key_idx}{}",
                 const_comment(constants, key_idx)
             )
         }
-        Instruction::SETFIELD {
-            src,
-            table,
-            ic_idx: _,
-            key_idx,
-        } => {
+        Op::SETFIELD => {
+            let (src, table, _, key_idx) = instr.abde();
             format!(
                 "SETFIELD        R{src} R{table} K{key_idx}{}",
                 const_comment(constants, key_idx)
             )
         }
-        Instruction::SELF {
-            dst,
-            object,
-            key_idx,
-        } => {
+        Op::SELF => {
+            let (dst, object, key_idx) = instr.abd();
             format!(
                 "SELF            R{dst} R{object} K{key_idx}{}",
                 const_comment(constants, key_idx)
             )
         }
-        Instruction::NEWTABLE { dst } => format!("NEWTABLE        R{dst}"),
-        Instruction::ADD { dst, lhs, rhs } => format!("ADD             R{dst} R{lhs} R{rhs}"),
-        Instruction::SUB { dst, lhs, rhs } => format!("SUB             R{dst} R{lhs} R{rhs}"),
-        Instruction::MUL { dst, lhs, rhs } => format!("MUL             R{dst} R{lhs} R{rhs}"),
-        Instruction::MOD { dst, lhs, rhs } => format!("MOD             R{dst} R{lhs} R{rhs}"),
-        Instruction::POW { dst, lhs, rhs } => format!("POW             R{dst} R{lhs} R{rhs}"),
-        Instruction::DIV { dst, lhs, rhs } => format!("DIV             R{dst} R{lhs} R{rhs}"),
-        Instruction::IDIV { dst, lhs, rhs } => format!("IDIV            R{dst} R{lhs} R{rhs}"),
-        Instruction::BAND { dst, lhs, rhs } => format!("BAND            R{dst} R{lhs} R{rhs}"),
-        Instruction::BOR { dst, lhs, rhs } => format!("BOR             R{dst} R{lhs} R{rhs}"),
-        Instruction::BXOR { dst, lhs, rhs } => format!("BXOR            R{dst} R{lhs} R{rhs}"),
-        Instruction::SHL { dst, lhs, rhs } => format!("SHL             R{dst} R{lhs} R{rhs}"),
-        Instruction::SHR { dst, lhs, rhs } => format!("SHR             R{dst} R{lhs} R{rhs}"),
-        Instruction::UNM { dst, src } => format!("UNM             R{dst} R{src}"),
-        Instruction::BNOT { dst, src } => format!("BNOT            R{dst} R{src}"),
-        Instruction::NOT { dst, src } => format!("NOT             R{dst} R{src}"),
-        Instruction::LEN { dst, src } => format!("LEN             R{dst} R{src}"),
-        Instruction::CONCAT { dst, lhs, rhs } => {
+        Op::NEWTABLE => {
+            let dst = instr.a();
+            format!("NEWTABLE        R{dst}")
+        }
+        Op::ADD => {
+            let (dst, lhs, rhs) = instr.abc();
+            format!("ADD             R{dst} R{lhs} R{rhs}")
+        }
+        Op::SUB => {
+            let (dst, lhs, rhs) = instr.abc();
+            format!("SUB             R{dst} R{lhs} R{rhs}")
+        }
+        Op::MUL => {
+            let (dst, lhs, rhs) = instr.abc();
+            format!("MUL             R{dst} R{lhs} R{rhs}")
+        }
+        Op::MOD => {
+            let (dst, lhs, rhs) = instr.abc();
+            format!("MOD             R{dst} R{lhs} R{rhs}")
+        }
+        Op::POW => {
+            let (dst, lhs, rhs) = instr.abc();
+            format!("POW             R{dst} R{lhs} R{rhs}")
+        }
+        Op::DIV => {
+            let (dst, lhs, rhs) = instr.abc();
+            format!("DIV             R{dst} R{lhs} R{rhs}")
+        }
+        Op::IDIV => {
+            let (dst, lhs, rhs) = instr.abc();
+            format!("IDIV            R{dst} R{lhs} R{rhs}")
+        }
+        Op::BAND => {
+            let (dst, lhs, rhs) = instr.abc();
+            format!("BAND            R{dst} R{lhs} R{rhs}")
+        }
+        Op::BOR => {
+            let (dst, lhs, rhs) = instr.abc();
+            format!("BOR             R{dst} R{lhs} R{rhs}")
+        }
+        Op::BXOR => {
+            let (dst, lhs, rhs) = instr.abc();
+            format!("BXOR            R{dst} R{lhs} R{rhs}")
+        }
+        Op::SHL => {
+            let (dst, lhs, rhs) = instr.abc();
+            format!("SHL             R{dst} R{lhs} R{rhs}")
+        }
+        Op::SHR => {
+            let (dst, lhs, rhs) = instr.abc();
+            format!("SHR             R{dst} R{lhs} R{rhs}")
+        }
+        Op::UNM => {
+            let (dst, src) = instr.ab();
+            format!("UNM             R{dst} R{src}")
+        }
+        Op::BNOT => {
+            let (dst, src) = instr.ab();
+            format!("BNOT            R{dst} R{src}")
+        }
+        Op::NOT => {
+            let (dst, src) = instr.ab();
+            format!("NOT             R{dst} R{src}")
+        }
+        Op::LEN => {
+            let (dst, src) = instr.ab();
+            format!("LEN             R{dst} R{src}")
+        }
+        Op::CONCAT => {
+            let (dst, lhs, rhs) = instr.abc();
             format!("CONCAT          R{dst} R{lhs} R{rhs}")
         }
-        Instruction::CLOSE { start } => format!("CLOSE           R{start}"),
-        Instruction::TBC { val } => format!("TBC             R{val}"),
-        Instruction::JMP { offset } => format!("JMP             {offset:+}"),
-        Instruction::EQ { lhs, rhs, inverted } => {
+        Op::CLOSE => {
+            let start = instr.a();
+            format!("CLOSE           R{start}")
+        }
+        Op::TBC => {
+            let val = instr.a();
+            format!("TBC             R{val}")
+        }
+        Op::JMP => {
+            let offset = instr.imm();
+            format!("JMP             {offset:+}")
+        }
+        Op::EQ => {
+            let (lhs, rhs, inverted) = instr.abc_flag();
             format!("EQ              R{lhs} R{rhs} inv={inverted}")
         }
-        Instruction::LT { lhs, rhs, inverted } => {
+        Op::LT => {
+            let (lhs, rhs, inverted) = instr.abc_flag();
             format!("LT              R{lhs} R{rhs} inv={inverted}")
         }
-        Instruction::LE { lhs, rhs, inverted } => {
+        Op::LE => {
+            let (lhs, rhs, inverted) = instr.abc_flag();
             format!("LE              R{lhs} R{rhs} inv={inverted}")
         }
-        Instruction::TEST { src, inverted } => {
+        Op::TEST => {
+            let (src, inverted) = instr.ab_flag();
             format!("TEST            R{src} inv={inverted}")
         }
-        Instruction::TESTSET { dst, src, inverted } => {
+        Op::TESTSET => {
+            let (dst, src, inverted) = instr.abc_flag();
             format!("TESTSET         R{dst} R{src} inv={inverted}")
         }
-        Instruction::CALL {
-            func,
-            args,
-            returns,
-        } => {
+        Op::CALL => {
+            let (func, args, returns) = instr.abc();
             format!("CALL            R{func} args={args} ret={returns}")
         }
-        Instruction::TAILCALL { func, args } => {
+        Op::TAILCALL => {
+            let (func, args) = instr.ab();
             format!("TAILCALL        R{func} args={args}")
         }
-        Instruction::RETURN { values, count } => {
+        Op::RETURN => {
+            let (values, count) = instr.ab();
             format!("RETURN          R{values} count={count}")
         }
-        Instruction::FORLOOP { base, offset } => {
+        Op::FORLOOP => {
+            let (base, offset) = instr.a_imm();
             format!("FORLOOP         R{base} {offset:+}")
         }
-        Instruction::FORPREP { base, offset } => {
+        Op::FORPREP => {
+            let (base, offset) = instr.a_imm();
             format!("FORPREP         R{base} {offset:+}")
         }
-        Instruction::TFORPREP { base, offset } => {
+        Op::TFORPREP => {
+            let (base, offset) = instr.a_imm();
             format!("TFORPREP        R{base} {offset:+}")
         }
-        Instruction::TFORCALL { base, count } => {
+        Op::TFORCALL => {
+            let (base, count) = instr.ab();
             format!("TFORCALL        R{base} count={count}")
         }
-        Instruction::TFORLOOP { base, offset } => {
+        Op::TFORLOOP => {
+            let (base, offset) = instr.a_imm();
             format!("TFORLOOP        R{base} {offset:+}")
         }
-        Instruction::SETLIST {
-            table,
-            count,
-            offset,
-        } => {
+        Op::SETLIST => {
+            let (table, count, offset) = instr.abd();
             format!("SETLIST         R{table} count={count} offset={offset}")
         }
-        Instruction::CLOSURE { dst, proto } => {
+        Op::CLOSURE => {
+            let (dst, proto) = instr.ad();
             format!("CLOSURE         R{dst} P{proto}")
         }
-        Instruction::VARARG { dst, count } => format!("VARARG          R{dst} count={count}"),
-        Instruction::VARARGGET { dst, base, key } => {
+        Op::VARARG => {
+            let (dst, count) = instr.ab();
+            format!("VARARG          R{dst} count={count}")
+        }
+        Op::VARARGGET => {
+            let (dst, base, key) = instr.abc();
             format!("VARARGGET       R{dst} R{base} R{key}")
         }
-        Instruction::VARARGPREP { num_fixed } => {
+        Op::VARARGPREP => {
+            let num_fixed = instr.a();
             format!("VARARGPREP      fixed={num_fixed}")
         }
-        Instruction::ERRNNIL { src, name_key } => {
+        Op::ERRNNIL => {
+            let (src, name_key) = instr.ad();
             format!("ERRNNIL         R{src} name=K{name_key}")
         }
-        Instruction::NOP => "NOP".to_string(),
-        Instruction::STOP => "STOP".to_string(),
+        Op::NOP => "NOP".to_string(),
+        Op::STOP => "STOP".to_string(),
     }
 }

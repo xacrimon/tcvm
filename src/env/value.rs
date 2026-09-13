@@ -14,18 +14,18 @@ use crate::env::userdata::Userdata;
 #[collect(internal, require_static)]
 #[repr(u8)]
 pub enum ValueKind {
-    Nil,
-    Boolean,
-    Integer,
-    Float,
-    String,
-    Table,
-    Function,
-    Thread,
-    Userdata,
+    Nil = 0,
+    Boolean = 1,
+    Integer = 2,
+    Float = 3,
+    String = 4,
+    Table = 5,
+    Function = 6,
+    Thread = 7,
+    Userdata = 8,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Value<'gc> {
     kind: ValueKind,
     data: u64,
@@ -51,6 +51,7 @@ pub mod layout {
 }
 
 impl<'gc> Value<'gc> {
+    #[inline(always)]
     pub fn nil() -> Self {
         Self {
             kind: ValueKind::Nil,
@@ -59,10 +60,12 @@ impl<'gc> Value<'gc> {
         }
     }
 
+    #[inline(always)]
     pub fn is_nil(&self) -> bool {
         self.kind == ValueKind::Nil
     }
 
+    #[inline(always)]
     pub fn boolean(v: bool) -> Self {
         Self {
             kind: ValueKind::Boolean,
@@ -71,7 +74,8 @@ impl<'gc> Value<'gc> {
         }
     }
 
-    pub fn get_boolean(self) -> Option<bool> {
+    #[inline(always)]
+    pub fn get_boolean(&self) -> Option<bool> {
         if self.kind != ValueKind::Boolean {
             return None;
         }
@@ -83,6 +87,7 @@ impl<'gc> Value<'gc> {
         })
     }
 
+    #[inline(always)]
     pub fn integer(v: i64) -> Self {
         Self {
             kind: ValueKind::Integer,
@@ -91,7 +96,8 @@ impl<'gc> Value<'gc> {
         }
     }
 
-    pub fn get_integer(self) -> Option<i64> {
+    #[inline(always)]
+    pub fn get_integer(&self) -> Option<i64> {
         if self.kind != ValueKind::Integer {
             return None;
         }
@@ -99,6 +105,7 @@ impl<'gc> Value<'gc> {
         Some(self.data as i64)
     }
 
+    #[inline(always)]
     pub fn float(v: f64) -> Self {
         Self {
             kind: ValueKind::Float,
@@ -107,7 +114,8 @@ impl<'gc> Value<'gc> {
         }
     }
 
-    pub fn get_float(self) -> Option<f64> {
+    #[inline(always)]
+    pub fn get_float(&self) -> Option<f64> {
         if self.kind != ValueKind::Float {
             return None;
         }
@@ -115,6 +123,7 @@ impl<'gc> Value<'gc> {
         Some(f64::from_bits(self.data))
     }
 
+    #[inline(always)]
     pub fn string(v: LuaString<'gc>) -> Self {
         Self {
             kind: ValueKind::String,
@@ -123,7 +132,8 @@ impl<'gc> Value<'gc> {
         }
     }
 
-    pub fn get_string(self) -> Option<LuaString<'gc>> {
+    #[inline(always)]
+    pub fn get_string(&self) -> Option<LuaString<'gc>> {
         if self.kind != ValueKind::String {
             return None;
         }
@@ -132,6 +142,7 @@ impl<'gc> Value<'gc> {
         Some(LuaString::from_inner(ptr))
     }
 
+    #[inline(always)]
     pub fn table(v: Table<'gc>) -> Self {
         Self {
             kind: ValueKind::Table,
@@ -140,7 +151,8 @@ impl<'gc> Value<'gc> {
         }
     }
 
-    pub fn get_table(self) -> Option<Table<'gc>> {
+    #[inline(always)]
+    pub fn get_table(&self) -> Option<Table<'gc>> {
         if self.kind != ValueKind::Table {
             return None;
         }
@@ -149,6 +161,7 @@ impl<'gc> Value<'gc> {
         Some(Table::from_inner(ptr))
     }
 
+    #[inline(always)]
     pub fn function(v: Function<'gc>) -> Self {
         Self {
             kind: ValueKind::Function,
@@ -157,7 +170,8 @@ impl<'gc> Value<'gc> {
         }
     }
 
-    pub fn get_function(self) -> Option<Function<'gc>> {
+    #[inline(always)]
+    pub fn get_function(&self) -> Option<Function<'gc>> {
         if self.kind != ValueKind::Function {
             return None;
         }
@@ -166,6 +180,7 @@ impl<'gc> Value<'gc> {
         Some(Function::from_inner(ptr))
     }
 
+    #[inline(always)]
     pub fn thread(v: Thread<'gc>) -> Self {
         Self {
             kind: ValueKind::Thread,
@@ -174,7 +189,8 @@ impl<'gc> Value<'gc> {
         }
     }
 
-    pub fn get_thread(self) -> Option<Thread<'gc>> {
+    #[inline(always)]
+    pub fn get_thread(&self) -> Option<Thread<'gc>> {
         if self.kind != ValueKind::Thread {
             return None;
         }
@@ -183,6 +199,7 @@ impl<'gc> Value<'gc> {
         Some(Thread::from_inner(ptr))
     }
 
+    #[inline(always)]
     pub fn userdata(v: Userdata<'gc>) -> Self {
         Self {
             kind: ValueKind::Userdata,
@@ -191,7 +208,8 @@ impl<'gc> Value<'gc> {
         }
     }
 
-    pub fn get_userdata(self) -> Option<Userdata<'gc>> {
+    #[inline(always)]
+    pub fn get_userdata(&self) -> Option<Userdata<'gc>> {
         if self.kind != ValueKind::Userdata {
             return None;
         }
@@ -200,10 +218,12 @@ impl<'gc> Value<'gc> {
         Some(Userdata::from_inner(ptr))
     }
 
+    #[inline(always)]
     pub fn is_falsy(&self) -> bool {
         self.kind == ValueKind::Nil || self.get_boolean() == Some(false)
     }
 
+    #[inline(always)]
     pub fn kind(self) -> ValueKind {
         self.kind
     }
@@ -284,9 +304,8 @@ impl KindSet {
     }
 }
 
-impl<'gc> Eq for Value<'gc> {}
-
 impl<'gc> Hash for Value<'gc> {
+    #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         state.write_u64(self.data);
     }

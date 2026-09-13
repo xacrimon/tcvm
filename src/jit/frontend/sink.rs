@@ -15,7 +15,7 @@
 //! one function, so the phases cannot diverge. Not by convention: structurally.
 
 use crate::env::shape::MetamethodBits;
-use crate::instruction::Instruction;
+use crate::instruction::{Instruction, Op};
 use crate::jit::ir::op::{ArithKind, Cc, FloatOp, IntOp};
 use crate::jit::ir::pool::{ConstRef, ProtoRef, ShapeRef, StrRef};
 use crate::jit::ir::ty::{Rep, Ty, TypeSet};
@@ -446,23 +446,28 @@ pub fn step<S: Sink, F: Feedback>(
     pc: u32,
     i: Instruction,
 ) -> Result<(), Decline> {
+    // Every arithmetic and bitwise opcode is `Abc`-shaped: destination, then
+    // the two operands.
     macro_rules! binop {
-        ($f:ident, $k:expr, $dst:expr, $lhs:expr, $rhs:expr) => {{
-            let a = st.get(s, $lhs);
-            let b = st.get(s, $rhs);
+        ($f:ident, $k:expr) => {{
+            let (dst, lhs, rhs) = i.abc();
+            let a = st.get(s, lhs);
+            let b = st.get(s, rhs);
             let r = $f(s, $k, a, b);
-            st.set(s, $dst, r);
+            st.set(s, dst, r);
         }};
     }
 
-    match i {
-        Instruction::MOVE { dst, src } => {
+    match i.op() {
+        Op::MOVE => {
+            let (dst, src) = i.ab();
             let v = st.get(s, src);
             st.set(s, dst, v);
         }
         // Numbers load unboxed; everything else (nil, booleans, strings) has no
         // unboxed form a register may hold, and stays a tagged `Value`.
-        Instruction::LOAD { dst, idx } => {
+        Op::LOAD => {
+            let (dst, idx) = i.ad();
             let v = match fb.scalar(idx) {
                 Some(Scalar::Int(n)) => s.iconst(n),
                 Some(Scalar::Float(x)) => s.fconst(x),
@@ -474,20 +479,21 @@ pub fn step<S: Sink, F: Feedback>(
             st.set(s, dst, v);
         }
 
-        Instruction::ADD { dst, lhs, rhs } => binop!(arith, ArithKind::Add, dst, lhs, rhs),
-        Instruction::SUB { dst, lhs, rhs } => binop!(arith, ArithKind::Sub, dst, lhs, rhs),
-        Instruction::MUL { dst, lhs, rhs } => binop!(arith, ArithKind::Mul, dst, lhs, rhs),
-        Instruction::MOD { dst, lhs, rhs } => binop!(arith, ArithKind::Mod, dst, lhs, rhs),
-        Instruction::POW { dst, lhs, rhs } => binop!(arith, ArithKind::Pow, dst, lhs, rhs),
-        Instruction::DIV { dst, lhs, rhs } => binop!(arith, ArithKind::Div, dst, lhs, rhs),
-        Instruction::IDIV { dst, lhs, rhs } => binop!(arith, ArithKind::IDiv, dst, lhs, rhs),
-        Instruction::BAND { dst, lhs, rhs } => binop!(bitwise, ArithKind::BAnd, dst, lhs, rhs),
-        Instruction::BOR { dst, lhs, rhs } => binop!(bitwise, ArithKind::BOr, dst, lhs, rhs),
-        Instruction::BXOR { dst, lhs, rhs } => binop!(bitwise, ArithKind::BXor, dst, lhs, rhs),
-        Instruction::SHL { dst, lhs, rhs } => binop!(bitwise, ArithKind::Shl, dst, lhs, rhs),
-        Instruction::SHR { dst, lhs, rhs } => binop!(bitwise, ArithKind::Shr, dst, lhs, rhs),
+        Op::ADD => binop!(arith, ArithKind::Add),
+        Op::SUB => binop!(arith, ArithKind::Sub),
+        Op::MUL => binop!(arith, ArithKind::Mul),
+        Op::MOD => binop!(arith, ArithKind::Mod),
+        Op::POW => binop!(arith, ArithKind::Pow),
+        Op::DIV => binop!(arith, ArithKind::Div),
+        Op::IDIV => binop!(arith, ArithKind::IDiv),
+        Op::BAND => binop!(bitwise, ArithKind::BAnd),
+        Op::BOR => binop!(bitwise, ArithKind::BOr),
+        Op::BXOR => binop!(bitwise, ArithKind::BXor),
+        Op::SHL => binop!(bitwise, ArithKind::Shl),
+        Op::SHR => binop!(bitwise, ArithKind::Shr),
 
-        Instruction::UNM { dst, src } => {
+        Op::UNM => {
+            let (dst, src) = i.ab();
             let a = st.get(s, src);
             let set = s.ty(a).set;
             let r = if set == TypeSet::INT {
@@ -502,7 +508,8 @@ pub fn step<S: Sink, F: Feedback>(
             };
             st.set(s, dst, r);
         }
-        Instruction::BNOT { dst, src } => {
+        Op::BNOT => {
+            let (dst, src) = i.ab();
             let a = st.get(s, src);
             let r = if s.ty(a).set == TypeSet::INT {
                 let x = as_int(s, a);
@@ -517,19 +524,22 @@ pub fn step<S: Sink, F: Feedback>(
         // outright when the type set already decides it. The result is a Lua
         // boolean, so it packs: a `B1` is a condition, and a register must hold
         // something a deopt can write back as a `Value`.
-        Instruction::NOT { dst, src } => {
+        Op::NOT => {
+            let (dst, src) = i.ab();
             let a = st.get(s, src);
             let f = falsy(s, a);
             let f = s.pack_bool(f);
             st.set(s, dst, f);
         }
-        Instruction::LEN { dst, src } => {
+        Op::LEN => {
+            let (dst, src) = i.ab();
             let a = st.get(s, src);
             let a = to_val(s, a);
             let r = s.lua_len(a);
             st.set(s, dst, r);
         }
-        Instruction::CONCAT { dst, lhs, rhs } => {
+        Op::CONCAT => {
+            let (dst, lhs, rhs) = i.abc();
             let a = st.get(s, lhs);
             let b = st.get(s, rhs);
             let a = to_val(s, a);
@@ -538,7 +548,8 @@ pub fn step<S: Sink, F: Feedback>(
             st.set(s, dst, r);
         }
 
-        Instruction::NEWTABLE { dst } => {
+        Op::NEWTABLE => {
+            let dst = i.a();
             let t = s.tab_new();
             st.set(s, dst, t);
         }
@@ -547,12 +558,8 @@ pub fn step<S: Sink, F: Feedback>(
         // the shape gives us a constant slot offset, and the site's observed
         // value kinds let us speculate on what the load produces. `assume.no_mm`
         // is a watchpoint, not a check — it emits nothing.
-        Instruction::GETFIELD {
-            dst,
-            table,
-            ic_idx,
-            key_idx,
-        } => {
+        Op::GETFIELD => {
+            let (dst, table, ic_idx, key_idx) = i.abde();
             let t = st.get(s, table);
             let t = to_val(s, t);
             let r = match fb.ic(ic_idx, MetamethodBits::INDEX) {
@@ -576,12 +583,8 @@ pub fn step<S: Sink, F: Feedback>(
             };
             st.set(s, dst, r);
         }
-        Instruction::SETFIELD {
-            src,
-            table,
-            ic_idx,
-            key_idx,
-        } => {
+        Op::SETFIELD => {
+            let (src, table, ic_idx, key_idx) = i.abde();
             let t = st.get(s, table);
             let t = to_val(s, t);
             let v = st.get(s, src);
@@ -604,7 +607,8 @@ pub fn step<S: Sink, F: Feedback>(
                 }
             }
         }
-        Instruction::GETTABLE { dst, table, key } => {
+        Op::GETTABLE => {
+            let (dst, table, key) = i.abc();
             let t = st.get(s, table);
             let k = st.get(s, key);
             let t = to_val(s, t);
@@ -612,7 +616,8 @@ pub fn step<S: Sink, F: Feedback>(
             let r = s.lua_get_index(t, k);
             st.set(s, dst, r);
         }
-        Instruction::SETTABLE { src, table, key } => {
+        Op::SETTABLE => {
+            let (src, table, key) = i.abc();
             let t = st.get(s, table);
             let k = st.get(s, key);
             let v = st.get(s, src);
@@ -621,11 +626,8 @@ pub fn step<S: Sink, F: Feedback>(
             let v = to_val(s, v);
             s.lua_set_index(t, k, v);
         }
-        Instruction::SELF {
-            dst,
-            object,
-            key_idx,
-        } => {
+        Op::SELF => {
+            let (dst, object, key_idx) = i.abd();
             let obj = st.get(s, object);
             let obj = to_val(s, obj);
             let (c, ty) = fb.constant(key_idx);
@@ -634,11 +636,8 @@ pub fn step<S: Sink, F: Feedback>(
             st.set(s, dst, m);
             st.set(s, dst + 1, obj);
         }
-        Instruction::SETLIST {
-            table,
-            count,
-            offset,
-        } => {
+        Op::SETLIST => {
+            let (table, count, offset) = i.abd();
             let t = st.get(s, table);
             let t = to_val(s, t);
             for n in 0..count {
@@ -650,29 +649,37 @@ pub fn step<S: Sink, F: Feedback>(
             }
         }
 
-        Instruction::GETUPVAL { dst, idx } => {
+        Op::GETUPVAL => {
+            let (dst, idx) = i.ab();
             let v = s.upval_get(idx);
             st.set(s, dst, v);
         }
-        Instruction::SETUPVAL { src, idx } => {
+        Op::SETUPVAL => {
+            let (src, idx) = i.ab();
             let v = st.get(s, src);
             let v = to_val(s, v);
             s.upval_set(idx, v);
         }
-        Instruction::GETTABUP { dst, idx, key, .. } => {
+        Op::GETTABUP => {
+            let (dst, idx, _, key) = i.abde();
             let k = fb.key(key);
             let v = s.get_global(idx, k);
             st.set(s, dst, v);
         }
-        Instruction::SETTABUP { src, idx, key, .. } => {
+        Op::SETTABUP => {
+            let (src, idx, _, key) = i.abde();
             let v = st.get(s, src);
             let v = to_val(s, v);
             let k = fb.key(key);
             s.set_global(idx, k, v);
         }
-        Instruction::CLOSE { start } => s.upval_close(start),
+        Op::CLOSE => {
+            let start = i.a();
+            s.upval_close(start)
+        }
 
-        Instruction::CLOSURE { dst, proto } => {
+        Op::CLOSURE => {
+            let (dst, proto) = i.ad();
             let p = fb.proto(proto);
             let f = s.closure_new(p);
             st.set(s, dst, f);
@@ -680,11 +687,8 @@ pub fn step<S: Sink, F: Feedback>(
 
         // `args` counts the callee plus its arguments; `returns` counts the
         // results plus one. Both zero sentinels were rejected by the CFG pass.
-        Instruction::CALL {
-            func,
-            args,
-            returns,
-        } => {
+        Op::CALL => {
+            let (func, args, returns) = i.abc();
             let mut argv = Vec::with_capacity(args as usize);
             for n in 0..args {
                 let v = st.get(s, func + n);
@@ -697,39 +701,37 @@ pub fn step<S: Sink, F: Feedback>(
             }
         }
 
-        Instruction::LFALSESKIP { src } => {
+        Op::LFALSESKIP => {
+            let src = i.a();
             let f = s.bconst(false);
             let f = s.pack_bool(f);
             st.set(s, src, f);
         }
 
-        Instruction::NOP => {}
-        Instruction::ERRNNIL { .. } => return Err(Decline::ErrNNil(pc)),
+        Op::NOP => {}
+        Op::ERRNNIL => return Err(Decline::ErrNNil(pc)),
 
         // Terminators are the driver's business; the compare ops are consumed
         // there together with their paired JMP.
-        Instruction::JMP { .. }
-        | Instruction::EQ { .. }
-        | Instruction::LT { .. }
-        | Instruction::LE { .. }
-        | Instruction::TEST { .. }
-        | Instruction::TESTSET { .. }
-        | Instruction::RETURN { .. }
-        | Instruction::FORPREP { .. }
-        | Instruction::FORLOOP { .. }
-        | Instruction::TFORPREP { .. }
-        | Instruction::TFORLOOP { .. }
-        | Instruction::STOP => {
+        Op::JMP
+        | Op::EQ
+        | Op::LT
+        | Op::LE
+        | Op::TEST
+        | Op::TESTSET
+        | Op::RETURN
+        | Op::FORPREP
+        | Op::FORLOOP
+        | Op::TFORPREP
+        | Op::TFORLOOP
+        | Op::STOP => {
             debug_assert!(false, "terminator {i:?} reached step()");
             return Err(Decline::Op(pc));
         }
 
-        Instruction::TAILCALL { .. }
-        | Instruction::TFORCALL { .. }
-        | Instruction::TBC { .. }
-        | Instruction::VARARG { .. }
-        | Instruction::VARARGGET { .. }
-        | Instruction::VARARGPREP { .. } => return Err(Decline::Op(pc)),
+        Op::TAILCALL | Op::TFORCALL | Op::TBC | Op::VARARG | Op::VARARGGET | Op::VARARGPREP => {
+            return Err(Decline::Op(pc));
+        }
     }
     Ok(())
 }

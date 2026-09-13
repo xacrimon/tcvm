@@ -45,3 +45,6 @@ criterion = "0.5"
 [[bench]]
 name = "jit_pipeline"
 harness = false
+
+[profile.release]
+debug = true
