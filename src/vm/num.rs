@@ -13,6 +13,81 @@ pub fn exact_float_to_int(f: f64) -> Option<i64> {
     Some(f as i64)
 }
 
+/// Lua raw equality (`==` without metamethods).
+#[inline(always)]
+pub fn raw_eq(a: Value, b: Value) -> bool {
+    use crate::env::ValueKind::{Float, Integer};
+    if a.kind() == b.kind() && a.kind() != Float {
+        return a == b;
+    }
+    match (a.kind(), b.kind()) {
+        (Float, Float) => a.get_float() == b.get_float(),
+        (Integer, Float) => exact_float_to_int(b.get_float().unwrap()) == a.get_integer(),
+        (Float, Integer) => exact_float_to_int(a.get_float().unwrap()) == b.get_integer(),
+        _ => false,
+    }
+}
+
+// Mixed int/float ordering, following Lua's `LTintfloat` & co. When |i| <= 2^53
+// the `i as f64` cast is exact and a float compare decides. Beyond that the cast
+// rounds (`2^53+1 <= 2^53` would hold), so the float is rounded towards the
+// integer side of the inequality and compared as an integer; a float outside the
+// i64 range (or NaN) is decided by sign.
+
+/// Lua's `l_intfitsf`: `i` is exactly representable as an f64.
+#[inline(always)]
+fn int_fits_float(i: i64) -> bool {
+    (i as u64).wrapping_add(1 << 53) <= 1 << 54
+}
+
+/// `i < f`, `i < ceil(f)`
+#[inline(always)]
+pub fn lt_int_float(i: i64, f: f64) -> bool {
+    if int_fits_float(i) {
+        return (i as f64) < f;
+    }
+    match exact_float_to_int(f.ceil()) {
+        Some(fi) => i < fi,
+        None => f > 0.0,
+    }
+}
+
+/// `i <= f`, `i <= floor(f)`
+#[inline(always)]
+pub fn le_int_float(i: i64, f: f64) -> bool {
+    if int_fits_float(i) {
+        return (i as f64) <= f;
+    }
+    match exact_float_to_int(f.floor()) {
+        Some(fi) => i <= fi,
+        None => f > 0.0,
+    }
+}
+
+/// `f < i`, `floor(f) < i`
+#[inline(always)]
+pub fn lt_float_int(f: f64, i: i64) -> bool {
+    if int_fits_float(i) {
+        return f < (i as f64);
+    }
+    match exact_float_to_int(f.floor()) {
+        Some(fi) => fi < i,
+        None => f < 0.0,
+    }
+}
+
+/// `f <= i`, `ceil(f) <= i`
+#[inline(always)]
+pub fn le_float_int(f: f64, i: i64) -> bool {
+    if int_fits_float(i) {
+        return f <= (i as f64);
+    }
+    match exact_float_to_int(f.ceil()) {
+        Some(fi) => fi <= i,
+        None => f < 0.0,
+    }
+}
+
 #[inline(always)]
 pub fn op_arith_int<'gc, Op: ArithOp>(lhs: i64, rhs: i64) -> Option<Value<'gc>> {
     if Op::INT_ZERO_DIVISOR_INVALID && rhs == 0 {

@@ -1497,7 +1497,7 @@ extern "rust-preserve-none" fn op_eq<'gc>(
 
     let a = reg!(lhs);
     let b = reg!(rhs);
-    if a == b {
+    if num::raw_eq(a, b) {
         // Primitive or pointer-equal — no metamethod consultation.
         if !inverted {
             skip!();
@@ -1551,9 +1551,9 @@ extern "rust-preserve-none" fn op_lt<'gc>(
         } else if let (Some(x), Some(y)) = (a.get_float(), b.get_float()) {
             Some(x < y)
         } else if let (Some(x), Some(y)) = (a.get_integer(), b.get_float()) {
-            Some((x as f64) < y)
+            Some(num::lt_int_float(x, y))
         } else if let (Some(x), Some(y)) = (a.get_float(), b.get_integer()) {
-            Some(x < (y as f64))
+            Some(num::lt_float_int(x, y))
         } else if let (Some(x), Some(y)) = (a.get_string(), b.get_string()) {
             Some(x < y)
         } else {
@@ -1604,9 +1604,9 @@ extern "rust-preserve-none" fn op_le<'gc>(
         } else if let (Some(x), Some(y)) = (a.get_float(), b.get_float()) {
             Some(x <= y)
         } else if let (Some(x), Some(y)) = (a.get_integer(), b.get_float()) {
-            Some((x as f64) <= y)
+            Some(num::le_int_float(x, y))
         } else if let (Some(x), Some(y)) = (a.get_float(), b.get_integer()) {
-            Some(x <= (y as f64))
+            Some(num::le_float_int(x, y))
         } else if let (Some(x), Some(y)) = (a.get_string(), b.get_string()) {
             Some(x <= y)
         } else {

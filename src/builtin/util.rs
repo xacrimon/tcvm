@@ -324,24 +324,7 @@ pub(crate) fn num_to_value<'gc>(f: f64) -> Value<'gc> {
     }
 }
 
-/// Lua raw equality (`==` without metamethods): numbers compare by value across
-/// the integer/float divide, everything else by identity/content.
-pub(crate) fn raw_eq<'gc>(a: Value<'gc>, b: Value<'gc>) -> bool {
-    use crate::env::ValueKind::{Float, Integer};
-    match (a.kind(), b.kind()) {
-        (Integer, Integer) => a.get_integer() == b.get_integer(),
-        // Bitwise `Value` eq would mishandle NaN and -0.0, so compare as f64.
-        (Float, Float) => a.get_float() == b.get_float(),
-        (Integer, Float) => float_eq_int(b.get_float().unwrap(), a.get_integer().unwrap()),
-        (Float, Integer) => float_eq_int(a.get_float().unwrap(), b.get_integer().unwrap()),
-        (ka, kb) if ka == kb => a == b,
-        _ => false,
-    }
-}
-
-fn float_eq_int(f: f64, i: i64) -> bool {
-    float_to_integer(f) == Some(i)
-}
+pub(crate) use crate::vm::num::raw_eq;
 
 fn push_addr(out: &mut Vec<u8>, kind: &str, ptr: *const ()) {
     out.extend_from_slice(kind.as_bytes());
