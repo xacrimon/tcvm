@@ -224,6 +224,19 @@ impl<'gc, T: ?Sized + 'gc> Gc<'gc, T> {
         }
     }
 
+    /// The word a field of type `Gc<T>` actually holds: the address of the
+    /// collector's box, not of the value inside it.
+    ///
+    /// This is *not* `as_ptr`. `as_ptr` skips the box header, so the two differ by
+    /// `offset_of!(GcBoxInner<T>, value)`. Anything that reads a `Gc` field out of
+    /// an object as raw bytes — the JIT, when it loads a shape pointer and
+    /// compares it against a known shape — must compare against this, or it will
+    /// compare a box address to a payload address and never match.
+    #[inline]
+    pub fn box_addr(gc: Gc<'gc, T>) -> usize {
+        gc.ptr.as_ptr() as *const () as usize
+    }
+
     /// Returns true when a pointer is *dead* during finalization. This is equivalent to
     /// `GcWeak::is_dead` for strong pointers.
     ///

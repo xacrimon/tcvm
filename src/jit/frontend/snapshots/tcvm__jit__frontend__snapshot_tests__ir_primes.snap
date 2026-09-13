@@ -1,0 +1,32 @@
+---
+source: src/jit/frontend/snapshot_tests.rs
+expression: "ir_of(&source, &[INT])"
+---
+block0(v0: int):
+       v3 = iconst 2
+       v4 = iconst 1
+       v5 = unpack.int v0
+       v6 = sub.i64 v5, v4
+       v7 = iconst 1
+       v8 = icmp le v3, v6
+            br v8 block1(v3), block2
+block1(v2: i64):
+      v12 = unpack.int v0
+      v13 = iconst 0
+      v14 = icmp ne v2, v13
+            guard.cond v14  ; exit0
+      v15 = mod.i64 v12, v2
+      v16 = iconst 0
+      v17 = icmp eq v15, v16
+            br v17 block3, block4
+block2:
+      v18 = kconst true
+            ret v18
+block3:
+      v19 = kconst false
+            ret v19
+block4:
+      v20 = iconst 1
+      v21 = add.i64 v2, v20
+      v22 = icmp le v21, v6
+            br v22 block1(v21), block2

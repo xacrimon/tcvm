@@ -1,11 +1,13 @@
+#[cfg(jit_enabled)]
+use crate::dmm::RefLock;
 use crate::dmm::{Gc, Lock, Mutation};
 use crate::env::function::InlineCache;
 use crate::env::{LuaString, Prototype, Value};
-use crate::instruction::{Instruction, UpValueDescriptor};
-
-/// Newtype for register indices, providing type safety over raw u8.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct RegisterIndex(pub u8);
+/// Newtype for register indices, providing type safety over raw u8. Defined
+/// with the instruction word so the emitter can pass one straight to an
+/// instruction constructor.
+pub use crate::instruction::Reg as RegisterIndex;
+use crate::instruction::{Instruction, Op, UpValueDescriptor};
 
 /// Escape-analysis state for a named vararg parameter (`function f(...name)`).
 /// `Some` on the `Chunk` iff one is declared. If either flag is set by the end
@@ -280,20 +282,26 @@ impl<'gc> Chunk<'gc> {
         for &(instr_idx, label_idx) in &self.jump_patches {
             let target = self.labels[label_idx as usize];
             let offset = target as i32 - (instr_idx as i32 + 1);
-            match &mut self.tape[instr_idx] {
-                Instruction::JMP { offset: o } => *o = offset,
-                Instruction::FORPREP { offset: o, .. } => *o = offset,
-                Instruction::FORLOOP { offset: o, .. } => *o = offset,
-                Instruction::TFORPREP { offset: o, .. } => *o = offset,
-                Instruction::TFORLOOP { offset: o, .. } => *o = offset,
-                _ => panic!("jump patch on non-jump instruction"),
-            }
+            let instr = &mut self.tape[instr_idx];
+            assert!(
+                matches!(
+                    instr.op(),
+                    Op::JMP | Op::FORPREP | Op::FORLOOP | Op::TFORPREP | Op::TFORLOOP
+                ),
+                "jump patch on non-jump instruction: {instr:?}"
+            );
+            instr.set_imm(offset);
         }
 
         let num_upvalues = self.upvalue_desc.len() as u8;
 
         let ic_table =
             vec![Lock::new(InlineCache::Empty); self.next_ic_idx as usize].into_boxed_slice();
+        let ic_types = vec![
+            core::cell::Cell::new(crate::env::value::KindSet::empty());
+            self.next_ic_idx as usize
+        ]
+        .into_boxed_slice();
 
         Gc::new(
             mc,
@@ -309,6 +317,11 @@ impl<'gc> Chunk<'gc> {
                 num_upvalues,
                 source: self.source,
                 ic_table,
+                ic_types,
+                #[cfg(jit_enabled)]
+                jit_calls: core::cell::Cell::new(0),
+                #[cfg(jit_enabled)]
+                jit: Gc::new(mc, RefLock::new(None)),
             },
         )
     }

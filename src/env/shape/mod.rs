@@ -54,7 +54,7 @@ pub struct Descriptor<'gc> {
     pub slot: u32,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Default, Collect)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, Collect)]
 #[collect(internal, require_static)]
 pub struct MetamethodBits(u32);
 

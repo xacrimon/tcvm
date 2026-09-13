@@ -1,9 +1,11 @@
+use core::cell::Cell;
+
 use crate::Context;
 use crate::dmm::{Collect, Gc, Lock, Mutation, RefLock};
 use crate::env::error::Error;
 use crate::env::shape::Shape;
 use crate::env::string::LuaString;
-use crate::env::value::Value;
+use crate::env::value::{KindSet, Value};
 use crate::instruction::UpValueDescriptor;
 use crate::vm::sequence::{CallbackAction, Execution};
 
@@ -36,6 +38,32 @@ pub struct Prototype<'gc> {
     /// the parent `Prototype`'s `Gc`. See `src/env/shape/mod.rs` for
     /// the IC payload.
     pub ic_table: Box<[Lock<InlineCache<'gc>>]>,
+    /// Value kinds observed at each IC site, parallel to `ic_table`.
+    ///
+    /// The JIT's only source of *value*-type feedback: a `Shape` proves where a
+    /// field lives, never what it holds, so without this every field read stays
+    /// generic and so does every arithmetic op consuming it. Kept beside the IC
+    /// rather than inside it because these bits hold no `Gc` pointer — a
+    /// `Cell<KindSet>` write needs no barrier, so recording is free on the
+    /// interpreter's fast path.
+    #[collect(require_static)]
+    pub ic_types: Box<[Cell<KindSet>]>,
+
+    /// Calls seen so far, saturating at `jit::region::HOT_CALL` (or pinned at a
+    /// sentinel once compilation has been refused). Read on every Lua-to-Lua
+    /// call, which is why it is a bare `Cell` and not behind the `RefLock` below.
+    #[cfg(jit_enabled)]
+    #[collect(require_static)]
+    pub jit_calls: Cell<u32>,
+    /// Native code for this prototype, once there is any.
+    ///
+    /// The extra `Gc` hop is what makes the field writable at all: storing a
+    /// `Gc` into an already-allocated object needs a write barrier, and
+    /// `Gc<RefLock<_>>::borrow_mut` is where that barrier lives. A `RefLock`
+    /// field *inside* the prototype would have to reach for `Gc::write` and
+    /// project through it by hand.
+    #[cfg(jit_enabled)]
+    pub jit: Gc<'gc, RefLock<Option<Gc<'gc, crate::jit::region::Region<'gc>>>>>,
 }
 
 /// Per-call-site monomorphic inline cache. `Empty` initially; a slow

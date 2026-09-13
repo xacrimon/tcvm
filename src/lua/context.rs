@@ -15,11 +15,38 @@ use crate::parser;
 pub struct Context<'gc> {
     mutation: &'gc Mutation<'gc>,
     state: &'gc State<'gc>,
+    /// The per-`Lua` code allocator, which lives off the GC heap. Set afresh on
+    /// each `enter` from the (then-pinned) `Lua`, so it never dangles across a
+    /// move; dereferenced only during that enter, while the allocator is alive.
+    /// See `lua::OffHeap` and `Lua::enter`.
+    #[cfg(jit_enabled)]
+    code_alloc: *const crate::jit::backend::alloc::CodeAllocator,
 }
 
 impl<'gc> Context<'gc> {
+    #[cfg(not(jit_enabled))]
     pub(crate) fn new(mutation: &'gc Mutation<'gc>, state: &'gc State<'gc>) -> Self {
         Context { mutation, state }
+    }
+
+    #[cfg(jit_enabled)]
+    pub(crate) fn new(
+        mutation: &'gc Mutation<'gc>,
+        state: &'gc State<'gc>,
+        code_alloc: *const crate::jit::backend::alloc::CodeAllocator,
+    ) -> Self {
+        Context {
+            mutation,
+            state,
+            code_alloc,
+        }
+    }
+
+    /// The per-`Lua` code allocator. Sound because the pointer is refreshed each
+    /// `enter` from a pinned `Lua` and read only within that enter.
+    #[cfg(jit_enabled)]
+    pub(crate) fn code_alloc(self) -> &'gc crate::jit::backend::alloc::CodeAllocator {
+        unsafe { &*self.code_alloc }
     }
 
     pub fn mutation(self) -> &'gc Mutation<'gc> {
