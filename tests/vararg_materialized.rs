@@ -104,3 +104,32 @@ fn materialized_zero_extras() {
         0
     );
 }
+
+/// A named vararg *after* named parameters. `adjust_locals` advances `nactvar`
+/// rather than setting it, so passing `num_params + 1` double-counted the
+/// parameters and tripped its own assertion — but only when there was at least
+/// one named parameter, which no test had combined with a named vararg.
+#[test]
+fn named_vararg_after_named_params() {
+    assert_eq!(
+        run(
+            "local function f(a, b, ...rest) return a + b + rest.n end\n\
+             return f(1, 2, 30, 40, 50)"
+        ),
+        1 + 2 + 3
+    );
+    assert_eq!(
+        run(
+            "local function f(a, ...rest) return a + rest[1] + rest[2] end\n\
+             return f(1, 20, 300)"
+        ),
+        1 + 20 + 300
+    );
+    // Materialized form, with parameters preceding the vararg.
+    assert_eq!(
+        run("local function unwrap(t) return t[1] end\n\
+             local function f(a, b, ...rest) return a + b + unwrap(rest) end\n\
+             return f(1, 2, 300)"),
+        1 + 2 + 300
+    );
+}
