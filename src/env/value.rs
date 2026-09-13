@@ -9,7 +9,7 @@ use crate::env::table::Table;
 use crate::env::thread::Thread;
 use crate::env::userdata::Userdata;
 
-#[derive(Clone, Copy, Collect, PartialEq, Eq)]
+#[derive(Clone, Copy, Collect, PartialEq, Eq, Debug)]
 #[collect(internal, require_static)]
 #[repr(u8)]
 pub enum ValueKind {
