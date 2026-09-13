@@ -225,7 +225,13 @@ fn lua_close<'gc>(
             ts.pending_action = None;
             ts.yield_bottom = None;
             ts.status = ThreadStatus::Stopped;
-            stack.replace(&[Value::boolean(true)]);
+            // A coroutine that died via error re-surfaces that error as
+            // `(false, err)` (and only once — clear it so a second close is
+            // `true`, matching Lua). Otherwise close succeeds with `true`.
+            match ts.death_error.take() {
+                Some(err) => stack.replace(&[Value::boolean(false), err]),
+                None => stack.replace(&[Value::boolean(true)]),
+            }
             Ok(CallbackAction::Return)
         }
         ThreadStatus::Normal => {
@@ -249,6 +255,13 @@ fn wrap_callback<'gc>(
     let co = nctx.upvalues[0]
         .get_thread()
         .expect("wrap_callback upvalue 0 must be a thread");
+    // Gate the resume like `lua_resume` does; without this, resuming a dead
+    // (or otherwise non-suspended) thread reaches `schedule_thread_resume`
+    // and aborts the whole executor with `BadMode`. `wrap` re-raises errors
+    // rather than wrapping them, so we throw the reason directly.
+    if let Some(msg) = unresumable_reason(co, &nctx) {
+        return Err(Error::from_str(nctx.ctx, msg));
+    }
     let then = BoxSequence::new(nctx.ctx.mutation(), UnwrapResumeSequence);
     Ok(CallbackAction::Resume {
         thread: co,
