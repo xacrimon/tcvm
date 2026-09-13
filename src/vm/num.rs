@@ -1,23 +1,16 @@
 use crate::env::Value;
 
+/// Lua's `luaV_flttointns` with mode F2Ieq: the float must be integral and in
+/// [-2^63, 2^63).
 pub fn exact_float_to_int(f: f64) -> Option<i64> {
-    if !f.is_finite() {
+    const MIN: f64 = i64::MIN as f64;
+    const MAX: f64 = -MIN;
+
+    if !(MIN..MAX).contains(&f) || f.trunc() != f {
         return None;
     }
 
-    const MIN: i64 = -(2 << 53 - 1);
-    const MAX: i64 = 2 << 53 - 1;
-
-    if f < MIN as f64 || f > MAX as f64 {
-        return None;
-    }
-
-    if f.trunc() != f {
-        return None;
-    }
-
-    let i = unsafe { f.to_int_unchecked() };
-    Some(i)
+    Some(f as i64)
 }
 
 #[inline(always)]
@@ -218,20 +211,8 @@ pub fn op_bit_int<'gc, Op: BitOp>(lhs: i64, rhs: i64) -> Value<'gc> {
 }
 
 #[inline(always)]
-fn bitwise_coerce_int(v: &Value) -> Option<i64> {
-    if let Some(i) = v.get_float() {
-        Some(i as i64)
-    } else {
-        v.get_integer()
-    }
-}
-
-#[inline(always)]
 pub fn op_bit_mixed<'gc, Op: BitOp>(lhs: &Value, rhs: &Value) -> Option<Value<'gc>> {
-    let lhs: i64 = bitwise_coerce_int(lhs)?;
-    let rhs = bitwise_coerce_int(rhs)?;
-
-    Some(op_bit_int::<Op>(lhs, rhs))
+    op_bit::<Op>(*lhs, *rhs)
 }
 
 #[inline(always)]

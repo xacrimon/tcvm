@@ -1228,7 +1228,6 @@ macro_rules! binop_slow_handler {
 
             {
                 let (lhs, rhs) = (reg!(ref lhs), reg!(ref rhs));
-                debug_assert_ne!(lhs.kind(), rhs.kind());
                 let mixed = num::$num_mix_h::<$num_kind>(lhs, rhs);
                 if std::hint::unlikely(mixed.is_some()) {
                     if let Some(v) = mixed {
@@ -1254,18 +1253,18 @@ macro_rules! binop_slow_handler {
     };
 }
 
-arith_handler!(op_add, op_add_meta, ADD, num::Add, mm_add);
-arith_handler!(op_sub, op_sub_meta, SUB, num::Sub, mm_sub);
-arith_handler!(op_mul, op_mul_meta, MUL, num::Mul, mm_mul);
-arith_handler!(op_mod, op_mod_meta, MOD, num::Mod, mm_mod);
-arith_handler!(op_pow, op_pow_meta, POW, num::Pow, mm_pow);
-arith_handler!(op_div, op_div_meta, DIV, num::Div, mm_div);
-arith_handler!(op_idiv, op_idiv_meta, IDIV, num::IDiv, mm_idiv);
-bit_handler!(op_band, op_band_meta, BAND, num::BAnd, mm_band);
-bit_handler!(op_bor, op_bor_meta, BOR, num::BOr, mm_bor);
-bit_handler!(op_bxor, op_bxor_meta, BXOR, num::BXor, mm_bxor);
-bit_handler!(op_shl, op_shl_meta, SHL, num::Shl, mm_shl);
-bit_handler!(op_shr, op_shr_meta, SHR, num::Shr, mm_shr);
+arith_handler!(op_add, op_add_slow, ADD, num::Add, mm_add);
+arith_handler!(op_sub, op_sub_slow, SUB, num::Sub, mm_sub);
+arith_handler!(op_mul, op_mul_slow, MUL, num::Mul, mm_mul);
+arith_handler!(op_mod, op_mod_slow, MOD, num::Mod, mm_mod);
+arith_handler!(op_pow, op_pow_slow, POW, num::Pow, mm_pow);
+arith_handler!(op_div, op_div_slow, DIV, num::Div, mm_div);
+arith_handler!(op_idiv, op_idiv_slow, IDIV, num::IDiv, mm_idiv);
+bit_handler!(op_band, op_band_slow, BAND, num::BAnd, mm_band);
+bit_handler!(op_bor, op_bor_slow, BOR, num::BOr, mm_bor);
+bit_handler!(op_bxor, op_bxor_slow, BXOR, num::BXor, mm_bxor);
+bit_handler!(op_shl, op_shl_slow, SHL, num::Shl, mm_shl);
+bit_handler!(op_shr, op_shr_slow, SHR, num::Shr, mm_shr);
 
 // ---------------------------------------------------------------------------
 // Unary operations
