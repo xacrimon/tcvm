@@ -10,66 +10,66 @@ use crate::env::thread::{
     CallSite, Frame, LuaFrame, PendingAction, Thread, ThreadState, ThreadStatus,
 };
 use crate::env::value::{Value, ValueKind};
-use crate::instruction::{Instruction, UpValueDescriptor};
+use crate::instruction::{Instruction, Op, UpValueDescriptor};
 use crate::lua::Context;
-use crate::vm::num::{self, op_arith, op_bit};
+use crate::vm::num::{self, op_arith_float, op_arith_int, op_bit_int};
 
-static HANDLERS: &[Handler] = &[
-    op_move,
-    op_load,
-    op_lfalseskip,
-    op_getupval,
-    op_setupval,
-    op_gettabup,
-    op_settabup,
-    op_gettable,
-    op_settable,
-    op_getfield,
-    op_setfield,
-    op_self,
-    op_newtable,
-    op_add,
-    op_sub,
-    op_mul,
-    op_mod,
-    op_pow,
-    op_div,
-    op_idiv,
-    op_band,
-    op_bor,
-    op_bxor,
-    op_shl,
-    op_shr,
-    op_unm,
-    op_bnot,
-    op_not,
-    op_len,
-    op_concat,
-    op_close,
-    op_tbc,
-    op_jmp,
-    op_eq,
-    op_lt,
-    op_le,
-    op_test,
-    op_testset,
-    op_call,
-    op_tailcall,
-    op_return,
-    op_forloop,
-    op_forprep,
-    op_tforprep,
-    op_tforcall,
-    op_tforloop,
-    op_setlist,
-    op_closure,
-    op_vararg,
-    op_varargget,
-    op_varargprep,
-    op_errnnil,
-    op_nop,
-    op_stop,
-];
+static HANDLERS: [Handler; Op::COUNT] = Op::table([
+    (Op::MOVE, op_move),
+    (Op::LOAD, op_load),
+    (Op::LFALSESKIP, op_lfalseskip),
+    (Op::GETUPVAL, op_getupval),
+    (Op::SETUPVAL, op_setupval),
+    (Op::GETTABUP, op_gettabup),
+    (Op::SETTABUP, op_settabup),
+    (Op::GETTABLE, op_gettable),
+    (Op::SETTABLE, op_settable),
+    (Op::GETFIELD, op_getfield),
+    (Op::SETFIELD, op_setfield),
+    (Op::SELF, op_self),
+    (Op::NEWTABLE, op_newtable),
+    (Op::ADD, op_add),
+    (Op::SUB, op_sub),
+    (Op::MUL, op_mul),
+    (Op::MOD, op_mod),
+    (Op::POW, op_pow),
+    (Op::DIV, op_div),
+    (Op::IDIV, op_idiv),
+    (Op::BAND, op_band),
+    (Op::BOR, op_bor),
+    (Op::BXOR, op_bxor),
+    (Op::SHL, op_shl),
+    (Op::SHR, op_shr),
+    (Op::UNM, op_unm),
+    (Op::BNOT, op_bnot),
+    (Op::NOT, op_not),
+    (Op::LEN, op_len),
+    (Op::CONCAT, op_concat),
+    (Op::CLOSE, op_close),
+    (Op::TBC, op_tbc),
+    (Op::JMP, op_jmp),
+    (Op::EQ, op_eq),
+    (Op::LT, op_lt),
+    (Op::LE, op_le),
+    (Op::TEST, op_test),
+    (Op::TESTSET, op_testset),
+    (Op::CALL, op_call),
+    (Op::TAILCALL, op_tailcall),
+    (Op::RETURN, op_return),
+    (Op::FORLOOP, op_forloop),
+    (Op::FORPREP, op_forprep),
+    (Op::TFORPREP, op_tforprep),
+    (Op::TFORCALL, op_tforcall),
+    (Op::TFORLOOP, op_tforloop),
+    (Op::SETLIST, op_setlist),
+    (Op::CLOSURE, op_closure),
+    (Op::VARARG, op_vararg),
+    (Op::VARARGGET, op_varargget),
+    (Op::VARARGPREP, op_varargprep),
+    (Op::ERRNNIL, op_errnnil),
+    (Op::NOP, op_nop),
+    (Op::STOP, op_stop),
+]);
 
 #[derive(Debug)]
 pub(crate) struct Error {
@@ -125,11 +125,14 @@ macro_rules! helpers {
                     #[cfg(debug_assertions)]
                     {
                         let frame = $thread.top_lua_unchecked();
-                        debug_assert!($ip.offset_from_unsigned(frame.closure.proto.code.as_ptr()) < frame.closure.proto.code.len());
+                        debug_assert!(
+                            $ip.offset_from_unsigned(frame.closure.proto.code.as_ptr())
+                                < frame.closure.proto.code.len()
+                        );
                     }
                     let _ = $instruction;
                     let instruction = *$ip;
-                    let pos = instruction.discriminant() as usize;
+                    let pos = instruction.opcode() as usize;
                     debug_assert!(pos < HANDLERS.len());
                     let handler = *$handlers.cast::<Handler>().add(pos);
                     let ip = $ip.add(1);
@@ -139,18 +142,9 @@ macro_rules! helpers {
         }
 
         #[allow(unused_macros)]
-        macro_rules! args {
-            ($$kind:path { $$($$field:ident),* }) => {{
-                match $instruction {
-                    $$kind { $$($$field),* } => ( $$($$field),* ),
-                    _ => unsafe { std::hint::unreachable_unchecked() },
-                }
-            }};
-        }
-
-        #[allow(unused_macros)]
         macro_rules! raise {
             () => {{
+                std::hint::cold_path();
                 become impl_error($instruction, $ctx, $thread, $registers, $ip, $handlers);
             }};
         }
@@ -166,17 +160,11 @@ macro_rules! helpers {
 
         #[allow(unused_macros)]
         macro_rules! reg {
-            ($$idx:expr) => {{
-                unsafe {
-                    $registers.add($$idx as usize).read()
-                }
-            }};
+            ($$idx:expr) => {{ unsafe { $registers.add($$idx as usize).read() } }};
 
-            (mut $$idx:expr) => {{
-                unsafe {
-                    &mut *$registers.add($$idx as usize)
-                }
-            }};
+            (ref $$idx:expr) => {{ unsafe { &*$registers.add($$idx as usize) } }};
+
+            (ref mut $$idx:expr) => {{ unsafe { &mut *$registers.add($$idx as usize) } }};
         }
 
         #[allow(unused_macros)]
@@ -242,8 +230,14 @@ macro_rules! helpers {
                         );
                         $registers = unsafe { $thread.stack.as_mut_ptr().add(__cb) };
                         apply_cont_payload!(
-                            __mm_cont, results_base, nret,
-                            $ctx, $thread, $registers, $ip, $handlers
+                            __mm_cont,
+                            results_base,
+                            nret,
+                            $ctx,
+                            $thread,
+                            $registers,
+                            $ip,
+                            $handlers
                         );
                     }
                     // Native target suspended (or errored): the executor will
@@ -276,7 +270,7 @@ macro_rules! apply_cont_payload {
                 } else {
                     Value::nil()
                 };
-                *reg!(mut dst) = __r;
+                *reg!(ref mut dst) = __r;
                 dispatch!();
             }
             ContinuationPayload::IgnoreResult => {
@@ -303,10 +297,10 @@ macro_rules! apply_cont_payload {
                 );
                 let __to_copy = __nret.min(count as usize);
                 for i in 0..__to_copy {
-                    *reg!(mut base + 3 + i as u8) = $thread.stack[__results_base + i];
+                    *reg!(ref mut base + 3 + i as u8) = $thread.stack[__results_base + i];
                 }
                 for i in __to_copy..count as usize {
-                    *reg!(mut base + 3 + i as u8) = Value::nil();
+                    *reg!(ref mut base + 3 + i as u8) = Value::nil();
                 }
                 dispatch!();
             }
@@ -332,12 +326,12 @@ macro_rules! table_get_slow_body {
 
         let __v = __t.raw_get(__k);
         if !__v.is_nil() {
-            *reg!(mut __dst_reg) = __v;
+            *reg!(ref mut __dst_reg) = __v;
             dispatch!();
         }
 
         if !__t.shape().has_mm(MetamethodBits::INDEX) {
-            *reg!(mut __dst_reg) = Value::nil();
+            *reg!(ref mut __dst_reg) = Value::nil();
             dispatch!();
         }
 
@@ -345,7 +339,7 @@ macro_rules! table_get_slow_body {
         let __mt = unsafe { __t.metatable().unwrap_unchecked() };
         match walk_index_chain(Value::table(__t), __mt, __k, $ctx.symbols().mm_index) {
             IndexChain::Resolved(__rv) => {
-                *reg!(mut __dst_reg) = __rv;
+                *reg!(ref mut __dst_reg) = __rv;
                 dispatch!();
             }
             IndexChain::Invoke {
@@ -380,7 +374,7 @@ macro_rules! userdata_get_slow_body {
         match userdata_index_chain(__u, __recv, __k, $ctx.symbols().mm_index) {
             Err(()) => raise!(),
             Ok(IndexChain::Resolved(__rv)) => {
-                *reg!(mut __dst_reg) = __rv;
+                *reg!(ref mut __dst_reg) = __rv;
                 dispatch!();
             }
             Ok(IndexChain::Invoke {
@@ -532,14 +526,13 @@ pub(crate) fn run_thread<'gc>(ctx: Context<'gc>, thread: Thread<'gc>) -> Result<
     };
     let registers = unsafe { ts.stack.as_mut_ptr().add(base) };
     let handlers = HANDLERS.as_ptr() as *const ();
-    op_nop(Instruction::NOP, ctx, &mut ts, registers, ip, handlers)
+    op_nop(Instruction::nop(), ctx, &mut ts, registers, ip, handlers)
 }
 
 // ---------------------------------------------------------------------------
 // Error
 // ---------------------------------------------------------------------------
 
-#[cold]
 #[inline(never)]
 extern "rust-preserve-none" fn impl_error<'gc>(
     _instruction: Instruction,
@@ -567,8 +560,8 @@ extern "rust-preserve-none" fn op_move<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (dst, src) = args!(Instruction::MOVE { dst, src });
-    *reg!(mut dst) = reg!(src);
+    let (dst, src) = instruction.ab();
+    *reg!(ref mut dst) = reg!(src);
     dispatch!();
 }
 
@@ -583,8 +576,8 @@ extern "rust-preserve-none" fn op_load<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (dst, idx) = args!(Instruction::LOAD { dst, idx });
-    *reg!(mut dst) = constant!(idx);
+    let (dst, idx) = instruction.ad();
+    *reg!(ref mut dst) = constant!(idx);
     dispatch!();
 }
 
@@ -599,8 +592,8 @@ extern "rust-preserve-none" fn op_lfalseskip<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let src = args!(Instruction::LFALSESKIP { src });
-    *reg!(mut src) = Value::boolean(false);
+    let src = instruction.a();
+    *reg!(ref mut src) = Value::boolean(false);
     skip!();
     dispatch!();
 }
@@ -619,9 +612,9 @@ extern "rust-preserve-none" fn op_getupval<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (dst, idx) = args!(Instruction::GETUPVAL { dst, idx });
+    let (dst, idx) = instruction.ab();
     let uv = upvalue!(idx);
-    *reg!(mut dst) = read_upvalue(thread, uv);
+    *reg!(ref mut dst) = read_upvalue(thread, uv);
     dispatch!();
 }
 
@@ -635,7 +628,7 @@ extern "rust-preserve-none" fn op_setupval<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (src, idx) = args!(Instruction::SETUPVAL { src, idx });
+    let (src, idx) = instruction.ab();
     let val = reg!(src);
     let uv = upvalue!(idx);
     write_upvalue(ctx.mutation(), thread, uv, val);
@@ -657,12 +650,7 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (dst, idx, ic_idx, _key) = args!(Instruction::GETTABUP {
-        dst,
-        idx,
-        ic_idx,
-        key
-    });
+    let (dst, idx, ic_idx, _key) = instruction.abde();
     let uv = upvalue!(idx);
     let t_val = read_upvalue(thread, uv);
 
@@ -677,7 +665,7 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
             let v = unsafe { t_state.property_at(slot) };
             if !(v.is_nil() && t_state.shape().has_mm(MetamethodBits::INDEX)) {
                 drop(t_state);
-                *reg!(mut dst) = v;
+                *reg!(ref mut dst) = v;
                 dispatch!();
             }
         }
@@ -696,12 +684,7 @@ extern "rust-preserve-none" fn gettabup_slow<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (dst, idx, ic_idx, key) = args!(Instruction::GETTABUP {
-        dst,
-        idx,
-        ic_idx,
-        key
-    });
+    let (dst, idx, ic_idx, key) = instruction.abde();
     let uv = upvalue!(idx);
     let t_val = read_upvalue(thread, uv);
     let Some(t) = t_val.get_table() else {
@@ -723,12 +706,7 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (src, idx, ic_idx, key) = args!(Instruction::SETTABUP {
-        src,
-        idx,
-        ic_idx,
-        key
-    });
+    let (src, idx, ic_idx, key) = instruction.abde();
     let uv = upvalue!(idx);
     let t_val = read_upvalue(thread, uv);
 
@@ -766,12 +744,7 @@ extern "rust-preserve-none" fn settabup_slow<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (src, idx, ic_idx, key) = args!(Instruction::SETTABUP {
-        src,
-        idx,
-        ic_idx,
-        key
-    });
+    let (src, idx, ic_idx, key) = instruction.abde();
     let uv = upvalue!(idx);
     let t_val = read_upvalue(thread, uv);
     let Some(t) = t_val.get_table() else {
@@ -798,7 +771,7 @@ extern "rust-preserve-none" fn op_gettable<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (dst, table, key) = args!(Instruction::GETTABLE { dst, table, key });
+    let (dst, table, key) = instruction.abc();
 
     let Some(t) = reg!(table).get_table() else {
         // Non-table (userdata `__index`, or error) — handled by the slow path.
@@ -817,7 +790,7 @@ extern "rust-preserve-none" fn op_gettable<'gc>(
         become gettable_slow(instruction, ctx, thread, registers, ip, handlers);
     }
 
-    *reg!(mut dst) = v;
+    *reg!(ref mut dst) = v;
     dispatch!();
 }
 
@@ -831,7 +804,7 @@ extern "rust-preserve-none" fn gettable_slow<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (dst, table, key) = args!(Instruction::GETTABLE { dst, table, key });
+    let (dst, table, key) = instruction.abc();
     let recv = reg!(table);
     let k = reg!(key);
     if let Some(t) = recv.get_table() {
@@ -854,7 +827,7 @@ extern "rust-preserve-none" fn op_settable<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (src, table, key) = args!(Instruction::SETTABLE { src, table, key });
+    let (src, table, key) = instruction.abc();
 
     let Some(t) = reg!(table).get_table() else {
         raise!();
@@ -886,7 +859,7 @@ extern "rust-preserve-none" fn settable_slow<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (src, table, key) = args!(Instruction::SETTABLE { src, table, key });
+    let (src, table, key) = instruction.abc();
     let Some(t) = reg!(table).get_table() else {
         raise!();
     };
@@ -906,12 +879,7 @@ extern "rust-preserve-none" fn op_getfield<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (dst, table, ic_idx, _key_idx) = args!(Instruction::GETFIELD {
-        dst,
-        table,
-        ic_idx,
-        key_idx
-    });
+    let (dst, table, ic_idx, _key_idx) = instruction.abde();
 
     let Some(t) = reg!(table).get_table() else {
         // Non-table (userdata `__index`, or error) — handled by the slow path.
@@ -925,7 +893,7 @@ extern "rust-preserve-none" fn op_getfield<'gc>(
             let v = unsafe { t_state.property_at(slot) };
             if !(v.is_nil() && t_state.shape().has_mm(MetamethodBits::INDEX)) {
                 drop(t_state);
-                *reg!(mut dst) = v;
+                *reg!(ref mut dst) = v;
                 dispatch!();
             }
         }
@@ -944,12 +912,7 @@ extern "rust-preserve-none" fn getfield_slow<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (dst, table, ic_idx, key_idx) = args!(Instruction::GETFIELD {
-        dst,
-        table,
-        ic_idx,
-        key_idx
-    });
+    let (dst, table, ic_idx, key_idx) = instruction.abde();
     let recv = reg!(table);
     let k = constant!(key_idx);
     if let Some(t) = recv.get_table() {
@@ -973,12 +936,7 @@ extern "rust-preserve-none" fn op_setfield<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (src, table, ic_idx, key_idx) = args!(Instruction::SETFIELD {
-        src,
-        table,
-        ic_idx,
-        key_idx
-    });
+    let (src, table, ic_idx, key_idx) = instruction.abde();
 
     let Some(t) = reg!(table).get_table() else {
         raise!();
@@ -1013,12 +971,7 @@ extern "rust-preserve-none" fn setfield_slow<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (src, table, ic_idx, key_idx) = args!(Instruction::SETFIELD {
-        src,
-        table,
-        ic_idx,
-        key_idx
-    });
+    let (src, table, ic_idx, key_idx) = instruction.abde();
     let Some(t) = reg!(table).get_table() else {
         raise!();
     };
@@ -1045,11 +998,7 @@ extern "rust-preserve-none" fn op_self<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (dst, object, key_idx) = args!(Instruction::SELF {
-        dst,
-        object,
-        key_idx
-    });
+    let (dst, object, key_idx) = instruction.abd();
 
     let recv_val = reg!(object);
     let Some(recv) = recv_val.get_table() else {
@@ -1069,8 +1018,8 @@ extern "rust-preserve-none" fn op_self<'gc>(
         become op_self_slow(instruction, ctx, thread, registers, ip, handlers);
     }
 
-    *reg!(mut dst) = method;
-    *reg!(mut (dst + 1)) = recv_val;
+    *reg!(ref mut dst) = method;
+    *reg!(ref mut (dst + 1)) = recv_val;
     dispatch!();
 }
 
@@ -1084,11 +1033,7 @@ extern "rust-preserve-none" fn op_self_slow<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (dst, object, key_idx) = args!(Instruction::SELF {
-        dst,
-        object,
-        key_idx
-    });
+    let (dst, object, key_idx) = instruction.abd();
 
     let recv_val = reg!(object);
     let Some(recv) = recv_val.get_table() else {
@@ -1101,14 +1046,14 @@ extern "rust-preserve-none" fn op_self_slow<'gc>(
     let mt = unsafe { recv.metatable().unwrap_unchecked() };
     match walk_index_chain(recv_val, mt, key, ctx.symbols().mm_index) {
         IndexChain::Resolved(method) => {
-            *reg!(mut dst) = method;
-            *reg!(mut (dst + 1)) = recv_val;
+            *reg!(ref mut dst) = method;
+            *reg!(ref mut (dst + 1)) = recv_val;
             dispatch!();
         }
         IndexChain::Invoke { func, receiver } => {
             // Functional __index. Pre-place self at dst+1; the
             // continuation writes the resolved method into dst.
-            *reg!(mut (dst + 1)) = recv_val;
+            *reg!(ref mut (dst + 1)) = recv_val;
             let cont = Continuation {
                 payload: ContinuationPayload::StoreResult { dst },
                 results_base: 0,
@@ -1136,11 +1081,7 @@ extern "rust-preserve-none" fn op_self_nontable<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (dst, object, key_idx) = args!(Instruction::SELF {
-        dst,
-        object,
-        key_idx
-    });
+    let (dst, object, key_idx) = instruction.abd();
 
     let recv_val = reg!(object);
     let Some(u) = recv_val.get_userdata() else {
@@ -1155,12 +1096,12 @@ extern "rust-preserve-none" fn op_self_nontable<'gc>(
     };
     match chain {
         IndexChain::Resolved(method) => {
-            *reg!(mut dst) = method;
-            *reg!(mut (dst + 1)) = recv_val;
+            *reg!(ref mut dst) = method;
+            *reg!(ref mut (dst + 1)) = recv_val;
             dispatch!();
         }
         IndexChain::Invoke { func, receiver } => {
-            *reg!(mut (dst + 1)) = recv_val;
+            *reg!(ref mut (dst + 1)) = recv_val;
             let cont = Continuation {
                 payload: ContinuationPayload::StoreResult { dst },
                 results_base: 0,
@@ -1183,8 +1124,8 @@ extern "rust-preserve-none" fn op_newtable<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let dst = args!(Instruction::NEWTABLE { dst });
-    *reg!(mut dst) = Value::table(Table::new(ctx));
+    let dst = instruction.a();
+    *reg!(ref mut dst) = Value::table(Table::new(ctx));
     dispatch!();
 }
 
@@ -1192,10 +1133,89 @@ extern "rust-preserve-none" fn op_newtable<'gc>(
 // Arithmetic and bitwise (register-register)
 // ---------------------------------------------------------------------------
 
-macro_rules! binop_handler {
-    ($fn_name:ident, $instr:ident, $op:ident, $num_kind:ty, $mm:ident) => {
+/// `R[dst] = R[lhs] <op> R[rhs]` for the arithmetic opcodes.
+macro_rules! arith_handler {
+    ($fn_name:ident, $slow_name:ident, $instr:ident, $num_kind:ty, $mm:ident) => {
         #[inline(never)]
         extern "rust-preserve-none" fn $fn_name<'gc>(
+            instruction: Instruction,
+            ctx: Context<'gc>,
+            thread: &mut ThreadState<'gc>,
+            registers: Registers<'gc, '_>,
+            ip: *const Instruction,
+            handlers: *const (),
+        ) -> Result<(), Box<Error>> {
+            helpers!(instruction, ctx, thread, registers, ip, handlers);
+            let (dst, lhs, rhs) = instruction.abc();
+
+            // Testing that the tags match *before* either arm lets the
+            // second operand's check collapse into the first: inside the gate
+            // `rhs.get_integer()` is implied by `lhs.get_integer()`. Halves the
+            // integer path's tag compares (four to two).
+            let lk = reg!(ref lhs).kind();
+            if std::hint::likely(lk == reg!(ref rhs).kind()) {
+                if std::hint::likely(lk == ValueKind::Integer) {
+                    if let (Some(lhs), Some(rhs)) =
+                        (reg!(ref lhs).get_integer(), reg!(ref rhs).get_integer())
+                    {
+                        if let Some(v) = op_arith_int::<$num_kind>(lhs, rhs) {
+                            *reg!(ref mut dst) = v;
+                            dispatch!();
+                        }
+
+                        raise!(); // handle e.g. div by zero
+                    }
+                } else if lk == ValueKind::Float {
+                    if let (Some(lhs), Some(rhs)) =
+                        (reg!(ref lhs).get_float(), reg!(ref rhs).get_float())
+                    {
+                        *reg!(ref mut dst) = op_arith_float::<$num_kind>(lhs, rhs);
+                        dispatch!();
+                    }
+                }
+            }
+
+            become $slow_name(instruction, ctx, thread, registers, ip, handlers);
+        }
+
+        binop_slow_handler!($slow_name, $instr, $num_kind, op_arith_mixed, $mm);
+    };
+}
+
+/// `R[dst] = R[lhs] <op> R[rhs]` for the bitwise opcodes.
+macro_rules! bit_handler {
+    ($fn_name:ident, $slow_name:ident, $instr:ident, $num_kind:ty, $mm:ident) => {
+        #[inline(never)]
+        extern "rust-preserve-none" fn $fn_name<'gc>(
+            instruction: Instruction,
+            ctx: Context<'gc>,
+            thread: &mut ThreadState<'gc>,
+            registers: Registers<'gc, '_>,
+            ip: *const Instruction,
+            handlers: *const (),
+        ) -> Result<(), Box<Error>> {
+            helpers!(instruction, ctx, thread, registers, ip, handlers);
+            let (dst, lhs, rhs) = instruction.abc();
+
+            // same-type int/float
+            if let (Some(lhs), Some(rhs)) =
+                (reg!(ref lhs).get_integer(), reg!(ref rhs).get_integer())
+            {
+                *reg!(ref mut dst) = op_bit_int::<$num_kind>(lhs, rhs);
+                dispatch!();
+            }
+
+            become $slow_name(instruction, ctx, thread, registers, ip, handlers);
+        }
+
+        binop_slow_handler!($slow_name, $instr, $num_kind, op_bit_mixed, $mm);
+    };
+}
+
+macro_rules! binop_slow_handler {
+    ($slow_name:ident, $instr:ident, $num_kind:ty, $num_mix_h:ident, $mm:ident) => {
+        #[inline(never)]
+        extern "rust-preserve-none" fn $slow_name<'gc>(
             instruction: Instruction,
             ctx: Context<'gc>,
             thread: &mut ThreadState<'gc>,
@@ -1204,38 +1224,47 @@ macro_rules! binop_handler {
             handlers: *const (),
         ) -> Result<(), Box<Error>> {
             helpers!(instruction, ctx, thread, registers, ip, handlers);
-            let (dst, lhs, rhs) = args!(Instruction::$instr { dst, lhs, rhs });
-            let (a, b) = (reg!(lhs), reg!(rhs));
-            if let Some(v) = $op::<$num_kind>(a, b) {
-                *reg!(mut dst) = v;
-                dispatch!();
+            let (dst, lhs, rhs) = instruction.abc();
+
+            {
+                let (lhs, rhs) = (reg!(ref lhs), reg!(ref rhs));
+                let mixed = num::$num_mix_h::<$num_kind>(lhs, rhs);
+                if std::hint::unlikely(mixed.is_some()) {
+                    if let Some(v) = mixed {
+                        *reg!(ref mut dst) = v;
+                        dispatch!();
+                    }
+                }
             }
-            let meta_fn = binop_metamethod(a, b, ctx.symbols().$mm);
+
+            let (lhs, rhs) = (reg!(lhs), reg!(rhs));
+            let meta_fn = binop_metamethod(lhs, rhs, ctx.symbols().$mm);
             if meta_fn.is_nil() {
                 raise!();
             }
+
             let cont = Continuation {
                 payload: ContinuationPayload::StoreResult { dst },
                 results_base: 0,
                 nret: 0,
             };
-            invoke_metamethod!(meta_fn, &[a, b], cont);
+            invoke_metamethod!(meta_fn, &[lhs, rhs], cont);
         }
     };
 }
 
-binop_handler!(op_add, ADD, op_arith, num::Add, mm_add);
-binop_handler!(op_sub, SUB, op_arith, num::Sub, mm_sub);
-binop_handler!(op_mul, MUL, op_arith, num::Mul, mm_mul);
-binop_handler!(op_mod, MOD, op_arith, num::Mod, mm_mod);
-binop_handler!(op_pow, POW, op_arith, num::Pow, mm_pow);
-binop_handler!(op_div, DIV, op_arith, num::Div, mm_div);
-binop_handler!(op_idiv, IDIV, op_arith, num::IDiv, mm_idiv);
-binop_handler!(op_band, BAND, op_bit, num::BAnd, mm_band);
-binop_handler!(op_bor, BOR, op_bit, num::BOr, mm_bor);
-binop_handler!(op_bxor, BXOR, op_bit, num::BXor, mm_bxor);
-binop_handler!(op_shl, SHL, op_bit, num::Shl, mm_shl);
-binop_handler!(op_shr, SHR, op_bit, num::Shr, mm_shr);
+arith_handler!(op_add, op_add_slow, ADD, num::Add, mm_add);
+arith_handler!(op_sub, op_sub_slow, SUB, num::Sub, mm_sub);
+arith_handler!(op_mul, op_mul_slow, MUL, num::Mul, mm_mul);
+arith_handler!(op_mod, op_mod_slow, MOD, num::Mod, mm_mod);
+arith_handler!(op_pow, op_pow_slow, POW, num::Pow, mm_pow);
+arith_handler!(op_div, op_div_slow, DIV, num::Div, mm_div);
+arith_handler!(op_idiv, op_idiv_slow, IDIV, num::IDiv, mm_idiv);
+bit_handler!(op_band, op_band_slow, BAND, num::BAnd, mm_band);
+bit_handler!(op_bor, op_bor_slow, BOR, num::BOr, mm_bor);
+bit_handler!(op_bxor, op_bxor_slow, BXOR, num::BXor, mm_bxor);
+bit_handler!(op_shl, op_shl_slow, SHL, num::Shl, mm_shl);
+bit_handler!(op_shr, op_shr_slow, SHR, num::Shr, mm_shr);
 
 // ---------------------------------------------------------------------------
 // Unary operations
@@ -1252,14 +1281,14 @@ extern "rust-preserve-none" fn op_unm<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (dst, src) = args!(Instruction::UNM { dst, src });
+    let (dst, src) = instruction.ab();
     let val = reg!(src);
     if let Some(i) = val.get_integer() {
-        *reg!(mut dst) = Value::integer(i.wrapping_neg());
+        *reg!(ref mut dst) = Value::integer(i.wrapping_neg());
         dispatch!();
     }
     if let Some(f) = val.get_float() {
-        *reg!(mut dst) = Value::float(-f);
+        *reg!(ref mut dst) = Value::float(-f);
         dispatch!();
     }
     let meta_fn = unop_metamethod(val, ctx.symbols().mm_unm);
@@ -1286,10 +1315,10 @@ extern "rust-preserve-none" fn op_bnot<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (dst, src) = args!(Instruction::BNOT { dst, src });
+    let (dst, src) = instruction.ab();
     let val = reg!(src);
     if let Some(i) = val.get_integer() {
-        *reg!(mut dst) = Value::integer(!i);
+        *reg!(ref mut dst) = Value::integer(!i);
         dispatch!();
     }
     let meta_fn = unop_metamethod(val, ctx.symbols().mm_bnot);
@@ -1315,9 +1344,9 @@ extern "rust-preserve-none" fn op_not<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (dst, src) = args!(Instruction::NOT { dst, src });
+    let (dst, src) = instruction.ab();
     let val = reg!(src);
-    *reg!(mut dst) = Value::boolean(val.is_falsy());
+    *reg!(ref mut dst) = Value::boolean(val.is_falsy());
     dispatch!();
 }
 
@@ -1332,12 +1361,12 @@ extern "rust-preserve-none" fn op_len<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (dst, src) = args!(Instruction::LEN { dst, src });
+    let (dst, src) = instruction.ab();
     let val = reg!(src);
 
     // Strings never consult __len; return byte length directly.
     if let Some(s) = val.get_string() {
-        *reg!(mut dst) = Value::integer(s.len() as i64);
+        *reg!(ref mut dst) = Value::integer(s.len() as i64);
         dispatch!();
     }
 
@@ -1345,7 +1374,7 @@ extern "rust-preserve-none" fn op_len<'gc>(
     let meta_fn = if let Some(t) = val.get_table() {
         let mm = t.get_metamethod(ctx.symbols().mm_len);
         if mm.is_nil() {
-            *reg!(mut dst) = Value::integer(t.raw_len() as i64);
+            *reg!(ref mut dst) = Value::integer(t.raw_len() as i64);
             dispatch!();
         }
         mm
@@ -1372,13 +1401,13 @@ extern "rust-preserve-none" fn op_concat<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (dst, lhs, rhs) = args!(Instruction::CONCAT { dst, lhs, rhs });
+    let (dst, lhs, rhs) = instruction.abc();
     let a = reg!(lhs);
     let b = reg!(rhs);
     // Fast path: both coerce to strings/numbers.
     let mut buf = Vec::new();
     if num::coerce_to_str(&mut buf, a) && num::coerce_to_str(&mut buf, b) {
-        *reg!(mut dst) = Value::string(LuaString::new(ctx, &buf));
+        *reg!(ref mut dst) = Value::string(LuaString::new(ctx, &buf));
         dispatch!();
     }
     let meta_fn = binop_metamethod(a, b, ctx.symbols().mm_concat);
@@ -1408,7 +1437,7 @@ extern "rust-preserve-none" fn op_close<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let start = args!(Instruction::CLOSE { start });
+    let start = instruction.a();
     let base = thread.top_lua().map_or(0, |f| f.base);
     let start_idx = base + start as usize;
     close_upvalues(ctx.mutation(), thread, start_idx);
@@ -1427,7 +1456,7 @@ extern "rust-preserve-none" fn op_tbc<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let val = args!(Instruction::TBC { val });
+    let val = instruction.a();
     let base = thread.top_lua().map_or(0, |f| f.base);
     thread.tbc_slots.push(base + val as usize);
     dispatch!();
@@ -1448,7 +1477,7 @@ extern "rust-preserve-none" fn op_jmp<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let offset = args!(Instruction::JMP { offset });
+    let offset = instruction.imm();
     ip = unsafe { ip.offset(offset as isize) };
     dispatch!();
 }
@@ -1464,11 +1493,11 @@ extern "rust-preserve-none" fn op_eq<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (lhs, rhs, inverted) = args!(Instruction::EQ { lhs, rhs, inverted });
+    let (lhs, rhs, inverted) = instruction.abc_flag();
+
     let a = reg!(lhs);
     let b = reg!(rhs);
-
-    if a == b {
+    if num::raw_eq(a, b) {
         // Primitive or pointer-equal — no metamethod consultation.
         if !inverted {
             skip!();
@@ -1513,28 +1542,33 @@ extern "rust-preserve-none" fn op_lt<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (lhs, rhs, inverted) = args!(Instruction::LT { lhs, rhs, inverted });
-    let a = reg!(lhs);
-    let b = reg!(rhs);
-    let primitive = if let (Some(x), Some(y)) = (a.get_integer(), b.get_integer()) {
-        Some(x < y)
-    } else if let (Some(x), Some(y)) = (a.get_float(), b.get_float()) {
-        Some(x < y)
-    } else if let (Some(x), Some(y)) = (a.get_integer(), b.get_float()) {
-        Some((x as f64) < y)
-    } else if let (Some(x), Some(y)) = (a.get_float(), b.get_integer()) {
-        Some(x < (y as f64))
-    } else if let (Some(x), Some(y)) = (a.get_string(), b.get_string()) {
-        Some(x < y)
-    } else {
-        None
+    let (lhs, rhs, inverted) = instruction.abc_flag();
+
+    let primitive = {
+        let (a, b) = (reg!(ref lhs), reg!(ref rhs));
+        if let (Some(x), Some(y)) = (a.get_integer(), b.get_integer()) {
+            Some(x < y)
+        } else if let (Some(x), Some(y)) = (a.get_float(), b.get_float()) {
+            Some(x < y)
+        } else if let (Some(x), Some(y)) = (a.get_integer(), b.get_float()) {
+            Some(num::lt_int_float(x, y))
+        } else if let (Some(x), Some(y)) = (a.get_float(), b.get_integer()) {
+            Some(num::lt_float_int(x, y))
+        } else if let (Some(x), Some(y)) = (a.get_string(), b.get_string()) {
+            Some(x < y)
+        } else {
+            None
+        }
     };
+
     if let Some(r) = primitive {
         if r != inverted {
             skip!();
         }
         dispatch!();
     }
+
+    let (a, b) = (reg!(lhs), reg!(rhs));
     let meta_fn = binop_metamethod(a, b, ctx.symbols().mm_lt);
     if meta_fn.is_nil() {
         raise!();
@@ -1561,28 +1595,33 @@ extern "rust-preserve-none" fn op_le<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (lhs, rhs, inverted) = args!(Instruction::LE { lhs, rhs, inverted });
-    let a = reg!(lhs);
-    let b = reg!(rhs);
-    let primitive = if let (Some(x), Some(y)) = (a.get_integer(), b.get_integer()) {
-        Some(x <= y)
-    } else if let (Some(x), Some(y)) = (a.get_float(), b.get_float()) {
-        Some(x <= y)
-    } else if let (Some(x), Some(y)) = (a.get_integer(), b.get_float()) {
-        Some((x as f64) <= y)
-    } else if let (Some(x), Some(y)) = (a.get_float(), b.get_integer()) {
-        Some(x <= (y as f64))
-    } else if let (Some(x), Some(y)) = (a.get_string(), b.get_string()) {
-        Some(x <= y)
-    } else {
-        None
+    let (lhs, rhs, inverted) = instruction.abc_flag();
+
+    let primitive = {
+        let (a, b) = (reg!(ref lhs), reg!(ref rhs));
+        if let (Some(x), Some(y)) = (a.get_integer(), b.get_integer()) {
+            Some(x <= y)
+        } else if let (Some(x), Some(y)) = (a.get_float(), b.get_float()) {
+            Some(x <= y)
+        } else if let (Some(x), Some(y)) = (a.get_integer(), b.get_float()) {
+            Some(num::le_int_float(x, y))
+        } else if let (Some(x), Some(y)) = (a.get_float(), b.get_integer()) {
+            Some(num::le_float_int(x, y))
+        } else if let (Some(x), Some(y)) = (a.get_string(), b.get_string()) {
+            Some(x <= y)
+        } else {
+            None
+        }
     };
+
     if let Some(r) = primitive {
         if r != inverted {
             skip!();
         }
         dispatch!();
     }
+
+    let (a, b) = (reg!(lhs), reg!(rhs));
     let meta_fn = binop_metamethod(a, b, ctx.symbols().mm_le);
     if meta_fn.is_nil() {
         raise!();
@@ -1609,7 +1648,7 @@ extern "rust-preserve-none" fn op_test<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (src, inverted) = args!(Instruction::TEST { src, inverted });
+    let (src, inverted) = instruction.ab_flag();
     let truthy = !reg!(src).is_falsy();
     if truthy != inverted {
         skip!();
@@ -1629,13 +1668,13 @@ extern "rust-preserve-none" fn op_testset<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (dst, src, inverted) = args!(Instruction::TESTSET { dst, src, inverted });
+    let (dst, src, inverted) = instruction.abc_flag();
     let val = reg!(src);
     let truthy = !val.is_falsy();
     if truthy == inverted {
         skip!();
     } else {
-        *reg!(mut dst) = val;
+        *reg!(ref mut dst) = val;
     }
     dispatch!();
 }
@@ -1655,11 +1694,7 @@ extern "rust-preserve-none" fn op_call<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (func, nargs, returns) = args!(Instruction::CALL {
-        func,
-        args,
-        returns
-    });
+    let (func, nargs, returns) = instruction.abc();
     let base = thread.top_lua().map_or(0, |f| f.base);
     let func_idx = base + func as usize;
     let Some((target, nargs)) = resolve_call_chain(ctx, thread, func_idx, nargs) else {
@@ -1787,7 +1822,7 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (func, nargs) = args!(Instruction::TAILCALL { func, args });
+    let (func, nargs) = instruction.ab();
     let base = thread.top_lua().map_or(0, |f| f.base);
     let func_idx = base + func as usize;
     let Some((target, nargs)) = resolve_call_chain(ctx, thread, func_idx, nargs) else {
@@ -1918,7 +1953,7 @@ extern "rust-preserve-none" fn op_return<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (values, count) = args!(Instruction::RETURN { values, count });
+    let (values, count) = instruction.ab();
 
     let cur_base = thread.top_lua().unwrap().base;
     let values_base = cur_base + values as usize;
@@ -1960,7 +1995,7 @@ extern "rust-preserve-none" fn op_forprep<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (base, offset) = args!(Instruction::FORPREP { base, offset });
+    let (base, offset) = instruction.a_imm();
 
     let init = reg!(base);
     let limit = reg!(base + 1);
@@ -1982,7 +2017,7 @@ extern "rust-preserve-none" fn op_forprep<'gc>(
     }
 
     // R[base+3] is the visible loop variable (copy of init)
-    *reg!(mut base + 3) = init;
+    *reg!(ref mut base + 3) = init;
 
     dispatch!();
 }
@@ -1999,7 +2034,7 @@ extern "rust-preserve-none" fn op_forloop<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (base, offset) = args!(Instruction::FORLOOP { base, offset });
+    let (base, offset) = instruction.a_imm();
 
     let step = reg!(base + 2);
 
@@ -2011,8 +2046,8 @@ extern "rust-preserve-none" fn op_forloop<'gc>(
         let next = i.wrapping_add(s);
         let cont = if s > 0 { next <= lim } else { next >= lim };
         if cont {
-            *reg!(mut base) = Value::integer(next);
-            *reg!(mut base + 3) = Value::integer(next);
+            *reg!(ref mut base) = Value::integer(next);
+            *reg!(ref mut base + 3) = Value::integer(next);
             ip = unsafe { ip.offset(offset as isize) };
         }
     } else {
@@ -2022,8 +2057,8 @@ extern "rust-preserve-none" fn op_forloop<'gc>(
         let next = i + s;
         let cont = if s > 0.0 { next <= lim } else { next >= lim };
         if cont {
-            *reg!(mut base) = Value::float(next);
-            *reg!(mut base + 3) = Value::float(next);
+            *reg!(ref mut base) = Value::float(next);
+            *reg!(ref mut base + 3) = Value::float(next);
             ip = unsafe { ip.offset(offset as isize) };
         }
     }
@@ -2046,7 +2081,7 @@ extern "rust-preserve-none" fn op_tforprep<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (_base, offset) = args!(Instruction::TFORPREP { base, offset });
+    let (_base, offset) = instruction.a_imm();
     ip = unsafe { ip.offset(offset as isize) };
     dispatch!();
 }
@@ -2062,7 +2097,7 @@ extern "rust-preserve-none" fn op_tforcall<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (base, count) = args!(Instruction::TFORCALL { base, count });
+    let (base, count) = instruction.ab();
     let iter = reg!(base);
     let state = reg!(base + 1);
     let control = reg!(base + 2);
@@ -2086,10 +2121,10 @@ extern "rust-preserve-none" fn op_tforloop<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (base, offset) = args!(Instruction::TFORLOOP { base, offset });
+    let (base, offset) = instruction.a_imm();
     let first = reg!(base + 3);
     if !first.is_nil() {
-        *reg!(mut base + 2) = first;
+        *reg!(ref mut base + 2) = first;
         ip = unsafe { ip.offset(offset as isize) };
     }
     dispatch!();
@@ -2110,11 +2145,7 @@ extern "rust-preserve-none" fn op_setlist<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (table, count, offset) = args!(Instruction::SETLIST {
-        table,
-        count,
-        offset
-    });
+    let (table, count, offset) = instruction.abd();
     let Some(t) = reg!(table).get_table() else {
         raise!();
     };
@@ -2163,7 +2194,7 @@ extern "rust-preserve-none" fn op_closure<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (dst, proto_idx) = args!(Instruction::CLOSURE { dst, proto });
+    let (dst, proto_idx) = instruction.ad();
     let frame = thread.top_lua().unwrap();
     let parent_closure = frame.closure;
     let base = frame.base;
@@ -2200,7 +2231,7 @@ extern "rust-preserve-none" fn op_closure<'gc>(
     let upvalues: Box<[Upvalue<'gc>]> = upvalues_vec.into_boxed_slice();
 
     let func = Function::new_lua(ctx.mutation(), proto, upvalues);
-    *reg!(mut dst) = Value::function(func);
+    *reg!(ref mut dst) = Value::function(func);
     dispatch!();
 }
 
@@ -2224,7 +2255,7 @@ extern "rust-preserve-none" fn op_vararg<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (dst, count) = args!(Instruction::VARARG { dst, count });
+    let (dst, count) = instruction.ab();
     // Copy scalars/`Gc` out so the frame borrow ends before touching the stack.
     let (base, num_extras, proto) = {
         let frame = thread.top_lua().unwrap();
@@ -2285,7 +2316,7 @@ extern "rust-preserve-none" fn op_vararg<'gc>(
                 .copy_within(extras_start..extras_start + to_copy, target);
         }
         for i in to_copy..wanted {
-            *reg!(mut dst + i as u8) = Value::nil();
+            *reg!(ref mut dst + i as u8) = Value::nil();
         }
     }
     dispatch!();
@@ -2305,7 +2336,7 @@ extern "rust-preserve-none" fn op_varargget<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let (dst, _base, key) = args!(Instruction::VARARGGET { dst, base, key });
+    let (dst, _base, key) = instruction.abc();
     let key_val = reg!(key);
     let frame = thread.top_lua().unwrap();
     let num_extras = frame.num_extras as usize;
@@ -2332,7 +2363,7 @@ extern "rust-preserve-none" fn op_varargget<'gc>(
     } else {
         Value::nil()
     };
-    *reg!(mut dst) = v;
+    *reg!(ref mut dst) = v;
     dispatch!();
 }
 
@@ -2354,7 +2385,7 @@ extern "rust-preserve-none" fn op_varargprep<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    let _num_fixed = args!(Instruction::VARARGPREP { num_fixed });
+    let _num_fixed = instruction.a();
     let (num_extras, num_params, base, max_stack, needs_table) = {
         let frame = thread.top_lua().unwrap();
         (
@@ -2408,7 +2439,7 @@ extern "rust-preserve-none" fn op_errnnil<'gc>(
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
     // TODO: surface the name (see #28).
-    let (src, _name_key) = args!(Instruction::ERRNNIL { src, name_key });
+    let (src, _name_key) = instruction.ad();
     check!(reg!(src).is_nil());
     dispatch!();
 }
@@ -2427,21 +2458,18 @@ extern "rust-preserve-none" fn op_nop<'gc>(
     handlers: *const (),
 ) -> Result<(), Box<Error>> {
     helpers!(instruction, ctx, thread, registers, ip, handlers);
-    args!(Instruction::NOP {});
     dispatch!();
 }
 
 #[inline(never)]
 extern "rust-preserve-none" fn op_stop<'gc>(
-    instruction: Instruction,
+    _instruction: Instruction,
     _ctx: Context<'gc>,
     _thread: &mut ThreadState<'gc>,
     _registers: Registers<'gc, '_>,
     _ip: *const Instruction,
     _handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    helpers!(instruction, _ctx, _thread, _registers, _ip, _handlers);
-    args!(Instruction::STOP {});
     Ok(())
 }
 

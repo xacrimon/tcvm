@@ -1,37 +1,131 @@
 use crate::env::Value;
 
+/// Lua's `luaV_flttointns` with mode F2Ieq: the float must be integral and in
+/// [-2^63, 2^63).
 pub fn exact_float_to_int(f: f64) -> Option<i64> {
-    if !f.is_finite() {
+    const MIN: f64 = i64::MIN as f64;
+    const MAX: f64 = -MIN;
+
+    if !(MIN..MAX).contains(&f) || f.trunc() != f {
         return None;
     }
 
-    const MIN: i64 = -(2 << 53 - 1);
-    const MAX: i64 = 2 << 53 - 1;
+    Some(f as i64)
+}
 
-    if f < MIN as f64 || f > MAX as f64 {
+/// Lua raw equality (`==` without metamethods).
+#[inline(always)]
+pub fn raw_eq(a: Value, b: Value) -> bool {
+    use crate::env::ValueKind::{Float, Integer};
+    if a.kind() == b.kind() && a.kind() != Float {
+        return a == b;
+    }
+    match (a.kind(), b.kind()) {
+        (Float, Float) => a.get_float() == b.get_float(),
+        (Integer, Float) => exact_float_to_int(b.get_float().unwrap()) == a.get_integer(),
+        (Float, Integer) => exact_float_to_int(a.get_float().unwrap()) == b.get_integer(),
+        _ => false,
+    }
+}
+
+// Mixed int/float ordering, following Lua's `LTintfloat` & co. When |i| <= 2^53
+// the `i as f64` cast is exact and a float compare decides. Beyond that the cast
+// rounds (`2^53+1 <= 2^53` would hold), so the float is rounded towards the
+// integer side of the inequality and compared as an integer; a float outside the
+// i64 range (or NaN) is decided by sign.
+
+/// Lua's `l_intfitsf`: `i` is exactly representable as an f64.
+#[inline(always)]
+fn int_fits_float(i: i64) -> bool {
+    (i as u64).wrapping_add(1 << 53) <= 1 << 54
+}
+
+/// `i < f`, `i < ceil(f)`
+#[inline(always)]
+pub fn lt_int_float(i: i64, f: f64) -> bool {
+    if int_fits_float(i) {
+        return (i as f64) < f;
+    }
+    match exact_float_to_int(f.ceil()) {
+        Some(fi) => i < fi,
+        None => f > 0.0,
+    }
+}
+
+/// `i <= f`, `i <= floor(f)`
+#[inline(always)]
+pub fn le_int_float(i: i64, f: f64) -> bool {
+    if int_fits_float(i) {
+        return (i as f64) <= f;
+    }
+    match exact_float_to_int(f.floor()) {
+        Some(fi) => i <= fi,
+        None => f > 0.0,
+    }
+}
+
+/// `f < i`, `floor(f) < i`
+#[inline(always)]
+pub fn lt_float_int(f: f64, i: i64) -> bool {
+    if int_fits_float(i) {
+        return f < (i as f64);
+    }
+    match exact_float_to_int(f.floor()) {
+        Some(fi) => fi < i,
+        None => f < 0.0,
+    }
+}
+
+/// `f <= i`, `ceil(f) <= i`
+#[inline(always)]
+pub fn le_float_int(f: f64, i: i64) -> bool {
+    if int_fits_float(i) {
+        return f <= (i as f64);
+    }
+    match exact_float_to_int(f.ceil()) {
+        Some(fi) => fi <= i,
+        None => f < 0.0,
+    }
+}
+
+#[inline(always)]
+pub fn op_arith_int<'gc, Op: ArithOp>(lhs: i64, rhs: i64) -> Option<Value<'gc>> {
+    if Op::INT_ZERO_DIVISOR_INVALID && rhs == 0 {
         return None;
     }
 
-    if f.trunc() != f {
-        return None;
-    }
+    Some(Op::int(lhs, rhs))
+}
 
-    let i = unsafe { f.to_int_unchecked() };
-    Some(i)
+#[inline(always)]
+pub fn op_arith_float<'gc, Op: ArithOp>(lhs: f64, rhs: f64) -> Value<'gc> {
+    Op::float(lhs, rhs)
+}
+
+/// Coerces a numeric operand to `f64`; `None` if it is not a number.
+#[inline(always)]
+fn to_float(v: &Value) -> Option<f64> {
+    if let Some(i) = v.get_integer() {
+        Some(i as f64)
+    } else {
+        v.get_float()
+    }
+}
+
+/// The mixed int/float arm. Callers must have excluded same-type operands
+/// first, so this never sees int-int and needs no zero-divisor guard.
+#[inline(always)]
+pub fn op_arith_mixed<'gc, Op: ArithOp>(lhs: &Value, rhs: &Value) -> Option<Value<'gc>> {
+    let lhs = to_float(lhs)?;
+    let rhs = to_float(rhs)?;
+
+    Some(op_arith_float::<Op>(lhs, rhs))
 }
 
 #[inline(always)]
 pub fn op_arith<'gc, Op: ArithOp>(lhs: Value, rhs: Value) -> Option<Value<'gc>> {
     if let (Some(li), Some(ri)) = (lhs.get_integer(), rhs.get_integer()) {
-        // Lua raises on integer `//`/`%` by zero; without this guard the
-        // `wrapping_div`/`wrapping_rem` in `Op::int` would panic. Returning
-        // `None` takes the handler's error path (integers carry no metamethod),
-        // matching every other arithmetic error. Float `/0` is unaffected — it
-        // yields inf/nan down in the float branch.
-        if Op::INT_ZERO_DIVISOR_RAISES && ri == 0 {
-            return None;
-        }
-        return Some(Op::int(li, ri));
+        return op_arith_int::<Op>(li, ri);
     }
 
     let lhs = if let Some(v) = lhs.get_integer() {
@@ -50,13 +144,11 @@ pub fn op_arith<'gc, Op: ArithOp>(lhs: Value, rhs: Value) -> Option<Value<'gc>> 
         return None;
     };
 
-    Some(Op::float(lhs, rhs))
+    Some(op_arith_float::<Op>(lhs, rhs))
 }
 
 pub trait ArithOp {
-    /// `//` and `%` set this so `op_arith` raises on an integer zero divisor
-    /// instead of computing (and panicking in `wrapping_div`/`wrapping_rem`).
-    const INT_ZERO_DIVISOR_RAISES: bool = false;
+    const INT_ZERO_DIVISOR_INVALID: bool = false;
 
     fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc>;
     fn float<'gc>(lhs: f64, rhs: f64) -> Value<'gc>;
@@ -107,7 +199,7 @@ impl ArithOp for Mul {
 pub struct Mod;
 
 impl ArithOp for Mod {
-    const INT_ZERO_DIVISOR_RAISES: bool = true;
+    const INT_ZERO_DIVISOR_INVALID: bool = true;
 
     #[inline(always)]
     fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc> {
@@ -165,7 +257,7 @@ impl ArithOp for Div {
 pub struct IDiv;
 
 impl ArithOp for IDiv {
-    const INT_ZERO_DIVISOR_RAISES: bool = true;
+    const INT_ZERO_DIVISOR_INVALID: bool = true;
 
     #[inline(always)]
     fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc> {
@@ -189,11 +281,21 @@ impl ArithOp for IDiv {
 }
 
 #[inline(always)]
+pub fn op_bit_int<'gc, Op: BitOp>(lhs: i64, rhs: i64) -> Value<'gc> {
+    Op::int(lhs, rhs)
+}
+
+#[inline(always)]
+pub fn op_bit_mixed<'gc, Op: BitOp>(lhs: &Value, rhs: &Value) -> Option<Value<'gc>> {
+    op_bit::<Op>(*lhs, *rhs)
+}
+
+#[inline(always)]
 pub fn op_bit<'gc, Op: BitOp>(lhs: Value, rhs: Value) -> Option<Value<'gc>> {
     let lhs = if let Some(v) = lhs.get_integer() {
         v
     } else if let Some(v) = lhs.get_float() {
-        exact_float_to_int(v).unwrap()
+        exact_float_to_int(v)?
     } else {
         return None;
     };
@@ -201,7 +303,7 @@ pub fn op_bit<'gc, Op: BitOp>(lhs: Value, rhs: Value) -> Option<Value<'gc>> {
     let rhs = if let Some(v) = rhs.get_integer() {
         v
     } else if let Some(v) = rhs.get_float() {
-        exact_float_to_int(v).unwrap()
+        exact_float_to_int(v)?
     } else {
         return None;
     };
@@ -240,12 +342,31 @@ impl BitOp for BXor {
     }
 }
 
+/// Lua's `luaV_shiftl`: a logical left shift by `y` bits, zero-filling the vacant
+/// bits. A negative `y` shifts right instead, and any displacement with |y| >= 64
+/// shifts every bit out and yields 0 — so this is *not* Rust's `<<`, which both
+/// sign-extends on the right and masks the count mod 64. Right shift is this with
+/// `y` negated. (manual: "Both right and left shifts fill the vacant bits with
+/// zeros. Negative displacements shift to the other direction; displacements with
+/// absolute values equal to or higher than the number of bits ... result in zero".)
+#[inline(always)]
+fn shift_left(x: i64, y: i64) -> i64 {
+    const NBITS: i64 = i64::BITS as i64;
+    if y <= -NBITS || y >= NBITS {
+        0
+    } else if y >= 0 {
+        ((x as u64) << y) as i64
+    } else {
+        ((x as u64) >> -y) as i64
+    }
+}
+
 pub struct Shl;
 
 impl BitOp for Shl {
     #[inline(always)]
     fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc> {
-        Value::integer(lhs.wrapping_shl(rhs as u32))
+        Value::integer(shift_left(lhs, rhs))
     }
 }
 
@@ -254,7 +375,9 @@ pub struct Shr;
 impl BitOp for Shr {
     #[inline(always)]
     fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc> {
-        Value::integer(lhs.wrapping_shr(rhs as u32))
+        // `wrapping_neg` so `rhs == i64::MIN` (a right shift by 2^63) doesn't
+        // overflow. `shift_left` maps the resulting huge magnitude to 0.
+        Value::integer(shift_left(lhs, rhs.wrapping_neg()))
     }
 }
 
