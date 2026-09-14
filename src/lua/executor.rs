@@ -1008,6 +1008,7 @@ fn unwind_error<'gc>(
             Some(Frame::WaitThread { .. }) => {}
             _ => unreachable!("inner-thread error: resumer top isn't WaitThread"),
         }
+        // Already located on the inner thread; don't re-raise on the resumer.
         rs.frames.push(Frame::Error(err));
         rs.status = ThreadStatus::Normal;
         return Ok(());
