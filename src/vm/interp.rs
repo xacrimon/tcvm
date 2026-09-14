@@ -542,8 +542,10 @@ extern "rust-preserve-none" fn impl_error<'gc>(
     ip: *const Instruction,
     _handlers: *const (),
 ) -> Result<(), Box<Error>> {
-    // See #44: compute proper PC from current frame's prototype code base.
-    Err(Box::new(Error { pc: 0 }))
+    // `ip` already points past the faulting instruction (see `dispatch!`).
+    let frame = thread.top_lua().expect("raise! outside a Lua frame");
+    let pc = unsafe { ip.offset_from_unsigned(frame.closure.proto.code.as_ptr()) } - 1;
+    Err(Box::new(Error { pc }))
 }
 
 // ---------------------------------------------------------------------------
