@@ -2012,9 +2012,62 @@ extern "rust-preserve-none" fn op_return<'gc>(
 // Numeric for loop
 // ---------------------------------------------------------------------------
 
-/// Prepare numeric for: validate and set up counter.
-/// R[base] = initial value, R[base+1] = limit, R[base+2] = step
-/// If loop won't execute, jump forward by offset.
+/// Lua's `forlimit`: the limit of an integer loop, floored for an ascending
+/// loop and ceiled for a descending one. `Some(None)` means the loop must not
+/// run: either the limit already excludes `init`, or it lies beyond the i64
+/// range on the side no integer can reach. A limit beyond the range on the
+/// other side is clamped, since the loop then runs to the boundary. `None`
+/// is a limit that isn't a number at all.
+fn for_limit(init: i64, limit: Value, step: i64) -> Option<Option<i64>> {
+    // Numeric strings become numbers first (`luaV_tointeger`'s `l_strton`).
+    let num = match limit.get_string() {
+        Some(s) => crate::builtin::util::str_to_number(s.as_bytes())?,
+        None => limit,
+    };
+    let lim = if let Some(i) = num.get_integer() {
+        i
+    } else if let Some(f) = num.get_float() {
+        let rounded = if step < 0 { f.ceil() } else { f.floor() };
+        match num::exact_float_to_int(rounded) {
+            Some(i) => i,
+            // Out of range, infinite, or NaN. NaN fails `0 < f` and so is
+            // treated as too negative, like the reference.
+            None if 0.0 < f => {
+                if step < 0 {
+                    return Some(None);
+                }
+                i64::MAX
+            }
+            None => {
+                if step > 0 {
+                    return Some(None);
+                }
+                i64::MIN
+            }
+        }
+    } else {
+        return None;
+    };
+    let runs = if step > 0 { init <= lim } else { init >= lim };
+    Some(runs.then_some(lim))
+}
+
+/// Prepare a numeric for. Before: R[base] = init, R[base+1] = limit,
+/// R[base+2] = step. After: R[base] = the last value the control variable
+/// takes (integer loop) or the limit (float loop), R[base+1] = step,
+/// R[base+2] = the hidden control variable, R[base+3] = its visible copy.
+/// Jumps past the body if the loop won't run.
+///
+/// The reference collapses this to two hidden slots by making the visible
+/// variable the control variable. That is measurably slower here: the
+/// control slot is a loop-carried load/add/store chain through memory, and
+/// as soon as the body also loads that slot (any body that reads `i`) the
+/// chain stops forwarding cheaply and costs several extra cycles per
+/// iteration (`for i = 1, 2e8 do s = i end` on an M4 Pro: 0.39 s with the
+/// reference layout, matching lua 5.5.1 itself, against 0.26 s here). A
+/// store-only copy keeps the body off the chain, and comparing against a
+/// precomputed last value instead of decrementing a count keeps the chain
+/// to one slot.
 #[inline(never)]
 extern "rust-preserve-none" fn op_forprep<'gc>(
     instruction: Instruction,
@@ -2031,47 +2084,71 @@ extern "rust-preserve-none" fn op_forprep<'gc>(
     let limit = reg!(base + 1);
     let step = reg!(base + 2);
 
-    let should_run = if let (Some(i), Some(lim), Some(s)) =
-        (init.get_integer(), limit.get_integer(), step.get_integer())
-    {
+    // An integer loop needs only an integer init and step; the limit is
+    // folded into the iteration count, so it is never compared again.
+    let skip = if let (Some(i), Some(s)) = (init.get_integer(), step.get_integer()) {
         if s == 0 {
             raise!(OpError::ForStepZero);
         }
-        if s > 0 { i <= lim } else { i >= lim }
+        match for_limit(i, limit, s) {
+            None => raise!(OpError::ForNotNumber("limit", limit)),
+            Some(None) => true,
+            Some(Some(lim)) => {
+                // The reference's unsigned iteration count, turned back into
+                // the final value of the control variable: `last` lies in
+                // [init, lim], so the wrapping arithmetic is exact and
+                // `op_forloop` can stop on equality with no overflow check.
+                let count = if s > 0 {
+                    let span = (lim as u64).wrapping_sub(i as u64);
+                    if s == 1 { span } else { span / s as u64 }
+                } else {
+                    // `-(s + 1) + 1` avoids negating `i64::MIN`.
+                    (i as u64).wrapping_sub(lim as u64) / ((-(s + 1)) as u64 + 1)
+                };
+                let last = (i as u64).wrapping_add(count.wrapping_mul(s as u64)) as i64;
+                *reg!(ref mut base) = Value::integer(last);
+                *reg!(ref mut base + 1) = Value::integer(s);
+                *reg!(ref mut base + 2) = Value::integer(i);
+                *reg!(ref mut base + 3) = Value::integer(i);
+                false
+            }
+        }
     } else {
         // Same coercion and check order as the reference `forprep`: strings
         // that name numbers are accepted, everything else is a `bad 'for'`
         // error, and the coerced floats replace the control registers.
-        let Some(lim) = crate::builtin::util::to_number(limit) else {
+        use crate::builtin::util::to_number;
+        let Some(lim) = to_number(limit) else {
             raise!(OpError::ForNotNumber("limit", limit));
         };
-        let Some(s) = crate::builtin::util::to_number(step) else {
+        let Some(s) = to_number(step) else {
             raise!(OpError::ForNotNumber("step", step));
         };
-        let Some(i) = crate::builtin::util::to_number(init) else {
+        let Some(i) = to_number(init) else {
             raise!(OpError::ForNotNumber("initial value", init));
         };
         if s == 0.0 {
             raise!(OpError::ForStepZero);
         }
-        *reg!(ref mut base) = Value::float(i);
-        *reg!(ref mut base + 1) = Value::float(lim);
-        *reg!(ref mut base + 2) = Value::float(s);
-        if s > 0.0 { i <= lim } else { i >= lim }
+        let skip = if 0.0 < s { lim < i } else { i < lim };
+        if !skip {
+            *reg!(ref mut base) = Value::float(lim);
+            *reg!(ref mut base + 1) = Value::float(s);
+            *reg!(ref mut base + 2) = Value::float(i);
+            *reg!(ref mut base + 3) = Value::float(i);
+        }
+        skip
     };
 
-    if !should_run {
+    if skip {
         ip = unsafe { ip.offset(offset as isize) };
     }
-
-    // R[base+3] is the visible loop variable (copy of init)
-    *reg!(ref mut base + 3) = reg!(base);
 
     dispatch!();
 }
 
-/// Numeric for loop step: update counter and test.
-/// If loop continues, jump back by offset.
+/// Numeric for loop step: advance the control variable and jump back while
+/// iterations remain. Reads the layout `op_forprep` leaves behind.
 #[inline(never)]
 extern "rust-preserve-none" fn op_forloop<'gc>(
     instruction: Instruction,
@@ -2084,29 +2161,29 @@ extern "rust-preserve-none" fn op_forloop<'gc>(
     helpers!(instruction, ctx, thread, registers, ip, handlers);
     let (base, offset) = instruction.a_imm();
 
-    let step = reg!(base + 2);
-
-    let cur = reg!(base);
-    let lim_v = reg!(base + 1);
-    if let (Some(i), Some(lim), Some(s)) =
-        (cur.get_integer(), lim_v.get_integer(), step.get_integer())
-    {
-        let next = i.wrapping_add(s);
-        let cont = if s > 0 { next <= lim } else { next >= lim };
-        if cont {
-            *reg!(ref mut base) = Value::integer(next);
-            *reg!(ref mut base + 3) = Value::integer(next);
+    // The step's type tells the loop kind, and the hidden slots match it:
+    // `op_forprep` wrote them and nothing else can (they are unnamed, and
+    // the visible copy is `<const>` and never read here).
+    let step = reg!(base + 1);
+    if let Some(s) = step.get_integer() {
+        let last = unsafe { reg!(base).get_integer().unwrap_unchecked() };
+        let idx = unsafe { reg!(base + 2).get_integer().unwrap_unchecked() };
+        // `idx` walks init, init+step, ..., last exactly, so `idx != last`
+        // also guarantees `idx + step` stays in range.
+        if idx != last {
+            let idx = Value::integer(idx.wrapping_add(s));
+            *reg!(ref mut base + 2) = idx;
+            *reg!(ref mut base + 3) = idx;
             ip = unsafe { ip.offset(offset as isize) };
         }
     } else {
-        let i = to_number(cur).unwrap_or(0.0);
-        let lim = to_number(lim_v).unwrap_or(0.0);
-        let s = to_number(step).unwrap_or(0.0);
-        let next = i + s;
-        let cont = if s > 0.0 { next <= lim } else { next >= lim };
-        if cont {
-            *reg!(ref mut base) = Value::float(next);
-            *reg!(ref mut base + 3) = Value::float(next);
+        let s = unsafe { step.get_float().unwrap_unchecked() };
+        let lim = unsafe { reg!(base).get_float().unwrap_unchecked() };
+        let idx = unsafe { reg!(base + 2).get_float().unwrap_unchecked() } + s;
+        if if 0.0 < s { idx <= lim } else { lim <= idx } {
+            let idx = Value::float(idx);
+            *reg!(ref mut base + 2) = idx;
+            *reg!(ref mut base + 3) = idx;
             ip = unsafe { ip.offset(offset as isize) };
         }
     }
@@ -2524,16 +2601,6 @@ extern "rust-preserve-none" fn op_stop<'gc>(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn to_number(v: Value) -> Option<f64> {
-    if let Some(i) = v.get_integer() {
-        return Some(i as f64);
-    }
-    if let Some(f) = v.get_float() {
-        return Some(f);
-    }
-    None
-}
 
 /// Close all TBC variables at stack indices >= `start_idx`.
 /// Removes them from the tracking list; __close invocation is pending (see #45).
