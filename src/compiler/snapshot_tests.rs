@@ -7,33 +7,46 @@ use paste::paste;
 use super::compile_chunk;
 use super::format::format_prototype;
 use crate::Lua;
+use crate::env::LuaString;
 use crate::parser::{self, syntax::Root};
 
 fn compile_and_format(source: &str) -> String {
     let mut cache = NodeCache::new();
-    let (syntax_tree, reports) = parser::parse(&mut cache, source);
-    assert!(reports.is_empty(), "parse errors: {}", reports.len());
-    let root = Root::new(syntax_tree).expect("not a root node");
+    let parse = parser::parse(&mut cache, source);
+    assert!(
+        parse.reports.is_empty(),
+        "parse errors: {}",
+        parse.reports.len()
+    );
+    let root = Root::new(parse.root).expect("not a root node");
     let interner = cache.interner();
 
     let mut lua = Lua::new();
     lua.enter(|ctx| {
-        let proto = compile_chunk(ctx, &root, interner).unwrap();
+        let name = LuaString::new(ctx, b"=snapshot");
+        let proto = compile_chunk(ctx, &root, &parse.lines, interner, name).unwrap();
         format_prototype(&proto)
     })
 }
 
 fn compile_err_and_format(source: &str) -> String {
     let mut cache = NodeCache::new();
-    let (syntax_tree, reports) = parser::parse(&mut cache, source);
-    assert!(reports.is_empty(), "parse errors: {}", reports.len());
-    let root = Root::new(syntax_tree).expect("not a root node");
+    let parse = parser::parse(&mut cache, source);
+    assert!(
+        parse.reports.is_empty(),
+        "parse errors: {}",
+        parse.reports.len()
+    );
+    let root = Root::new(parse.root).expect("not a root node");
     let interner = cache.interner();
 
     let mut lua = Lua::new();
-    lua.enter(|ctx| match compile_chunk(ctx, &root, interner) {
-        Err(e) => format!("{e}"),
-        Ok(_) => panic!("expected compile error, got success"),
+    lua.enter(|ctx| {
+        let name = LuaString::new(ctx, b"=snapshot");
+        match compile_chunk(ctx, &root, &parse.lines, interner, name) {
+            Err(e) => format!("{e}"),
+            Ok(_) => panic!("expected compile error, got success"),
+        }
     })
 }
 

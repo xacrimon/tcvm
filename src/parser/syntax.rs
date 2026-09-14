@@ -40,6 +40,10 @@ macro_rules! ast_node {
                     None
                 }
             }
+
+            pub fn syntax(&self) -> &SyntaxNode {
+                &self.0
+            }
         }
     };
 }
@@ -75,6 +79,26 @@ pub enum Stmt {
 }
 
 impl Stmt {
+    pub fn syntax(&self) -> Option<&SyntaxNode> {
+        Some(match self {
+            Stmt::Label(s) => s.syntax(),
+            Stmt::Goto(s) => s.syntax(),
+            Stmt::Decl(s) => s.syntax(),
+            Stmt::Global(s) => s.syntax(),
+            Stmt::Assign(s) => s.syntax(),
+            Stmt::Func(s) => s.syntax(),
+            Stmt::Expr(s) => return s.syntax(),
+            Stmt::Break(s) => s.syntax(),
+            Stmt::Return(s) => s.syntax(),
+            Stmt::Do(s) => s.syntax(),
+            Stmt::While(s) => s.syntax(),
+            Stmt::Repeat(s) => s.syntax(),
+            Stmt::If(s) => s.syntax(),
+            Stmt::ForNum(s) => s.syntax(),
+            Stmt::ForGen(s) => s.syntax(),
+        })
+    }
+
     fn cast(node: &SyntaxNode) -> Option<Self> {
         Some(match node.kind() {
             T![label] => Label::cast(node).map(Self::Label)?,
@@ -130,6 +154,23 @@ pub enum Expr {
 }
 
 impl Expr {
+    /// `None` only for `...`, which carries no node.
+    pub fn syntax(&self) -> Option<&SyntaxNode> {
+        Some(match self {
+            Expr::Method(e) => e.syntax(),
+            Expr::Ident(e) => e.syntax(),
+            Expr::Literal(e) => e.syntax(),
+            Expr::Func(e) => e.syntax(),
+            Expr::Table(e) => e.syntax(),
+            Expr::PrefixOp(e) => e.syntax(),
+            Expr::BinaryOp(e) => e.syntax(),
+            Expr::FuncCall(e) => e.syntax(),
+            Expr::Index(e) => e.syntax(),
+            Expr::VarArg => return None,
+            Expr::Paren(inner) => return inner.syntax(),
+        })
+    }
+
     fn cast(node: &SyntaxNode) -> Option<Self> {
         Some(match node.kind() {
             T![method_call] => MethodCall::cast(node).map(Self::Method)?,
@@ -164,6 +205,11 @@ impl MethodCall {
 
     pub fn args(&self) -> Option<impl Iterator<Item = Expr> + '_> {
         Some(self.0.last_child()?.children().filter_map(Expr::cast))
+    }
+
+    /// The argument list node; its first token anchors the call's line.
+    pub fn args_node(&self) -> Option<&SyntaxNode> {
+        self.0.last_child()
     }
 }
 
@@ -388,14 +434,15 @@ impl PrefixOperator {
 ast_node!(BinaryOp, T![bin_op]);
 
 impl BinaryOp {
+    pub fn op_token(&self) -> Option<&SyntaxToken> {
+        match self.0.children_with_tokens().nth(1)? {
+            NodeOrToken::Token(t) => Some(t),
+            NodeOrToken::Node(_) => None,
+        }
+    }
+
     pub fn op(&self) -> Option<BinaryOperator> {
-        self.0
-            .children_with_tokens()
-            .nth(1)
-            .and_then(|or| match or {
-                NodeOrToken::Node(_) => unreachable!(),
-                NodeOrToken::Token(t) => BinaryOperator::cast(t),
-            })
+        self.op_token().and_then(BinaryOperator::cast)
     }
 
     pub fn lhs(&self) -> Option<Expr> {
@@ -486,6 +533,11 @@ impl FuncCall {
 
     pub fn args(&self) -> Option<impl Iterator<Item = Expr> + '_> {
         Some(self.0.last_child()?.children().filter_map(Expr::cast))
+    }
+
+    /// The argument list node; its first token anchors the call's line.
+    pub fn args_node(&self) -> Option<&SyntaxNode> {
+        self.0.last_child()
     }
 }
 

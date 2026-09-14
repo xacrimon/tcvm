@@ -2,4 +2,4 @@
 source: src/compiler/snapshot_tests.rs
 expression: output
 ---
-compiler error at line 1: variable 'x' not declared
+compiler error at line 2: variable 'x' not declared

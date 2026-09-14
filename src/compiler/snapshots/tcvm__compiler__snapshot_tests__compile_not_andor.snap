@@ -1,6 +1,5 @@
 ---
 source: src/compiler/snapshot_tests.rs
-assertion_line: 152
 expression: output
 ---
 ; function (params=0, vararg=true, stack=13, upvalues=1)
@@ -14,54 +13,54 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  VARARGPREP      fixed=0
-0001  LOAD            R0 K0  ; 1
-0002  LOAD            R1 K1  ; 2
-0003  LOAD            R2 K2  ; 3
-0004  TEST            R0 inv=false
-0005  JMP             +3
-0006  NOT             R3 R1
-0007  JMP             +2
-0008  LFALSESKIP      R3
-0009  LOAD            R3 K3  ; true
-0010  TEST            R0 inv=true
-0011  JMP             +2
-0012  NOT             R4 R1
-0013  JMP             +2
-0014  LFALSESKIP      R4
-0015  LOAD            R4 K3  ; true
-0016  TEST            R0 inv=false
-0017  JMP             +5
-0018  TEST            R1 inv=false
-0019  JMP             +3
-0020  NOT             R5 R2
-0021  JMP             +2
-0022  LFALSESKIP      R5
-0023  LOAD            R5 K3  ; true
-0024  TEST            R0 inv=true
-0025  JMP             +4
-0026  TEST            R1 inv=true
-0027  JMP             +2
-0028  NOT             R6 R2
-0029  JMP             +2
-0030  LFALSESKIP      R6
-0031  LOAD            R6 K3  ; true
-0032  TEST            R0 inv=false
-0033  JMP             +3
-0034  LOAD            R7 K4  ; false
-0035  JMP             +2
-0036  LFALSESKIP      R7
-0037  LOAD            R7 K3  ; true
-0038  TEST            R0 inv=false
-0039  JMP             +3
-0040  NOT             R8 R1
-0041  TEST            R8 inv=false
-0042  JMP             +2
-0043  LOAD            R8 K5  ; 0
-0044  RETURN          R8 count=2
-0045  MOVE            R8 R3
-0046  MOVE            R9 R4
-0047  MOVE            R10 R5
-0048  MOVE            R11 R6
-0049  MOVE            R12 R7
-0050  RETURN          R8 count=6
+0000  [  1]  VARARGPREP      fixed=0
+0001  [  5]  LOAD            R0 K0  ; 1
+0002  [  5]  LOAD            R1 K1  ; 2
+0003  [  5]  LOAD            R2 K2  ; 3
+0004  [  8]  TEST            R0 inv=false
+0005  [  8]  JMP             +3
+0006  [  8]  NOT             R3 R1
+0007  [  8]  JMP             +2
+0008  [  8]  LFALSESKIP      R3
+0009  [  8]  LOAD            R3 K3  ; true
+0010  [  9]  TEST            R0 inv=true
+0011  [  9]  JMP             +2
+0012  [  9]  NOT             R4 R1
+0013  [  9]  JMP             +2
+0014  [  9]  LFALSESKIP      R4
+0015  [  9]  LOAD            R4 K3  ; true
+0016  [ 10]  TEST            R0 inv=false
+0017  [ 10]  JMP             +5
+0018  [ 10]  TEST            R1 inv=false
+0019  [ 10]  JMP             +3
+0020  [ 10]  NOT             R5 R2
+0021  [ 10]  JMP             +2
+0022  [ 10]  LFALSESKIP      R5
+0023  [ 10]  LOAD            R5 K3  ; true
+0024  [ 11]  TEST            R0 inv=true
+0025  [ 11]  JMP             +4
+0026  [ 11]  TEST            R1 inv=true
+0027  [ 11]  JMP             +2
+0028  [ 11]  NOT             R6 R2
+0029  [ 11]  JMP             +2
+0030  [ 11]  LFALSESKIP      R6
+0031  [ 11]  LOAD            R6 K3  ; true
+0032  [ 12]  TEST            R0 inv=false
+0033  [ 12]  JMP             +3
+0034  [ 12]  LOAD            R7 K4  ; false
+0035  [ 12]  JMP             +2
+0036  [ 12]  LFALSESKIP      R7
+0037  [ 12]  LOAD            R7 K3  ; true
+0038  [ 15]  TEST            R0 inv=false
+0039  [ 15]  JMP             +3
+0040  [ 15]  NOT             R8 R1
+0041  [ 15]  TEST            R8 inv=false
+0042  [ 15]  JMP             +2
+0043  [ 16]  LOAD            R8 K5  ; 0
+0044  [ 16]  RETURN          R8 count=2
+0045  [ 19]  MOVE            R8 R3
+0046  [ 19]  MOVE            R9 R4
+0047  [ 19]  MOVE            R10 R5
+0048  [ 19]  MOVE            R11 R6
+0049  [ 19]  MOVE            R12 R7
+0050  [ 19]  RETURN          R8 count=6

@@ -1,6 +1,5 @@
 ---
 source: src/compiler/snapshot_tests.rs
-assertion_line: 139
 expression: output
 ---
 ; function (params=0, vararg=true, stack=1, upvalues=1)
@@ -17,16 +16,16 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  VARARGPREP      fixed=0
-0001  LOAD            R0 K1  ; 1
-0002  SETTABUP        R0 U0 K0  ; "a"
-0003  LOAD            R0 K2  ; false
-0004  TEST            R0 inv=false
-0005  JMP             +2
-0006  LOAD            R0 K4  ; 2
-0007  SETTABUP        R0 U0 K3  ; "b"
-0008  LOAD            R0 K6  ; 5
-0009  SETTABUP        R0 U0 K5  ; "c"
-0010  LOAD            R0 K8  ; 7
-0011  SETTABUP        R0 U0 K7  ; "d"
-0012  RETURN          R0 count=1
+0000  [  1]  VARARGPREP      fixed=0
+0001  [  5]  LOAD            R0 K1  ; 1
+0002  [  5]  SETTABUP        R0 U0 K0  ; "a"
+0003  [  8]  LOAD            R0 K2  ; false
+0004  [  8]  TEST            R0 inv=false
+0005  [  8]  JMP             +2
+0006  [  9]  LOAD            R0 K4  ; 2
+0007  [  9]  SETTABUP        R0 U0 K3  ; "b"
+0008  [ 13]  LOAD            R0 K6  ; 5
+0009  [ 13]  SETTABUP        R0 U0 K5  ; "c"
+0010  [ 14]  LOAD            R0 K8  ; 7
+0011  [ 14]  SETTABUP        R0 U0 K7  ; "d"
+0012  [ 14]  RETURN          R0 count=1

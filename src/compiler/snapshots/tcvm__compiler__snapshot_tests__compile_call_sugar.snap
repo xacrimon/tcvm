@@ -23,89 +23,89 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  VARARGPREP      fixed=0
-0001  GETTABUP        R0 U0 K0  ; "print"
-0002  LOAD            R1 K1  ; "hello"
-0003  CALL            R0 args=2 ret=1
-0004  GETTABUP        R0 U0 K0  ; "print"
-0005  LOAD            R1 K2  ; "long"
-0006  CALL            R0 args=2 ret=1
-0007  CLOSURE         R0 P0
-0008  GETTABUP        R1 U0 K0  ; "print"
-0009  MOVE            R2 R0
-0010  NEWTABLE        R3
-0011  LOAD            R4 K3  ; 1
-0012  LOAD            R5 K4  ; 2
-0013  LOAD            R6 K5  ; 3
-0014  SETLIST         R3 count=3 offset=0
-0015  CALL            R2 args=2 ret=0
-0016  CALL            R1 args=0 ret=1
-0017  GETTABUP        R1 U0 K6  ; "setmetatable"
-0018  NEWTABLE        R2
-0019  NEWTABLE        R3
-0020  NEWTABLE        R4
-0021  CLOSURE         R5 P1
-0022  SETFIELD        R5 R4 K8  ; "m"
-0023  SETFIELD        R4 R3 K7  ; "__index"
-0024  CALL            R1 args=3 ret=2
-0025  GETTABUP        R2 U0 K0  ; "print"
-0026  SELF            R3 R1 K8  ; "m"
-0027  LOAD            R5 K9  ; "str"
-0028  CALL            R3 args=3 ret=2
-0029  SELF            R4 R1 K8  ; "m"
-0030  NEWTABLE        R6
-0031  LOAD            R7 K10  ; 4
-0032  LOAD            R8 K11  ; 5
-0033  SETLIST         R6 count=2 offset=0
-0034  CALL            R4 args=3 ret=2
-0035  MOVE            R5 R0
-0036  NEWTABLE        R6
-0037  CALL            R5 args=2 ret=2
-0038  LOAD            R6 K3  ; 1
-0039  ADD             R5 R5 R6
-0040  CALL            R2 args=4 ret=1
-0041  GETTABUP        R2 U0 K0  ; "print"
-0042  GETTABUP        R3 U0 K12  ; "type"
-0043  LOAD            R4 K13  ; "x"
-0044  CALL            R3 args=2 ret=2
-0045  MOVE            R4 R0
-0046  NEWTABLE        R5
-0047  LOAD            R6 K3  ; 1
-0048  SETLIST         R5 count=1 offset=0
-0049  CALL            R4 args=2 ret=0
-0050  CALL            R2 args=0 ret=1
-0051  CLOSURE         R2 P2
-0052  GETTABUP        R3 U0 K0  ; "print"
-0053  MOVE            R4 R2
-0054  LOAD            R5 K14  ; "a"
-0055  CALL            R4 args=2 ret=2
-0056  LOAD            R5 K15  ; "b"
-0057  CALL            R4 args=2 ret=0
-0058  CALL            R3 args=0 ret=1
-0059  RETURN          R0 count=1
+0000  [  1]  VARARGPREP      fixed=0
+0001  [  1]  GETTABUP        R0 U0 K0  ; "print"
+0002  [  1]  LOAD            R1 K1  ; "hello"
+0003  [  1]  CALL            R0 args=2 ret=1
+0004  [  2]  GETTABUP        R0 U0 K0  ; "print"
+0005  [  2]  LOAD            R1 K2  ; "long"
+0006  [  2]  CALL            R0 args=2 ret=1
+0007  [  3]  CLOSURE         R0 P0
+0008  [  4]  GETTABUP        R1 U0 K0  ; "print"
+0009  [  4]  MOVE            R2 R0
+0010  [  4]  NEWTABLE        R3
+0011  [  4]  LOAD            R4 K3  ; 1
+0012  [  4]  LOAD            R5 K4  ; 2
+0013  [  4]  LOAD            R6 K5  ; 3
+0014  [  4]  SETLIST         R3 count=3 offset=0
+0015  [  4]  CALL            R2 args=2 ret=0
+0016  [  4]  CALL            R1 args=0 ret=1
+0017  [  5]  GETTABUP        R1 U0 K6  ; "setmetatable"
+0018  [  5]  NEWTABLE        R2
+0019  [  5]  NEWTABLE        R3
+0020  [  5]  NEWTABLE        R4
+0021  [  5]  CLOSURE         R5 P1
+0022  [  5]  SETFIELD        R5 R4 K8  ; "m"
+0023  [  5]  SETFIELD        R4 R3 K7  ; "__index"
+0024  [  5]  CALL            R1 args=3 ret=2
+0025  [  6]  GETTABUP        R2 U0 K0  ; "print"
+0026  [  6]  SELF            R3 R1 K8  ; "m"
+0027  [  6]  LOAD            R5 K9  ; "str"
+0028  [  6]  CALL            R3 args=3 ret=2
+0029  [  6]  SELF            R4 R1 K8  ; "m"
+0030  [  6]  NEWTABLE        R6
+0031  [  6]  LOAD            R7 K10  ; 4
+0032  [  6]  LOAD            R8 K11  ; 5
+0033  [  6]  SETLIST         R6 count=2 offset=0
+0034  [  6]  CALL            R4 args=3 ret=2
+0035  [  6]  MOVE            R5 R0
+0036  [  6]  NEWTABLE        R6
+0037  [  6]  CALL            R5 args=2 ret=2
+0038  [  6]  LOAD            R6 K3  ; 1
+0039  [  6]  ADD             R5 R5 R6
+0040  [  6]  CALL            R2 args=4 ret=1
+0041  [  7]  GETTABUP        R2 U0 K0  ; "print"
+0042  [  7]  GETTABUP        R3 U0 K12  ; "type"
+0043  [  7]  LOAD            R4 K13  ; "x"
+0044  [  7]  CALL            R3 args=2 ret=2
+0045  [  7]  MOVE            R4 R0
+0046  [  7]  NEWTABLE        R5
+0047  [  7]  LOAD            R6 K3  ; 1
+0048  [  7]  SETLIST         R5 count=1 offset=0
+0049  [  7]  CALL            R4 args=2 ret=0
+0050  [  7]  CALL            R2 args=0 ret=1
+0051  [  8]  CLOSURE         R2 P2
+0052  [  9]  GETTABUP        R3 U0 K0  ; "print"
+0053  [  9]  MOVE            R4 R2
+0054  [  9]  LOAD            R5 K14  ; "a"
+0055  [  9]  CALL            R4 args=2 ret=2
+0056  [  9]  LOAD            R5 K15  ; "b"
+0057  [  9]  CALL            R4 args=2 ret=0
+0058  [  9]  CALL            R3 args=0 ret=1
+0059  [  9]  RETURN          R0 count=1
 
 ; prototype 0:
   ; function (params=1, vararg=false, stack=2, upvalues=0)
   ; code:
-  0000  LEN             R1 R0
-  0001  RETURN          R1 count=2
+  0000  [  3]  LEN             R1 R0
+  0001  [  3]  RETURN          R1 count=2
 
 ; prototype 1:
   ; function (params=2, vararg=false, stack=2, upvalues=0)
   ; code:
-  0000  RETURN          R1 count=2
+  0000  [  5]  RETURN          R1 count=2
 
 ; prototype 2:
   ; function (params=1, vararg=false, stack=2, upvalues=0)
   ; code:
-  0000  CLOSURE         R1 P0
-  0001  RETURN          R1 count=2
+  0000  [  8]  CLOSURE         R1 P0
+  0001  [  8]  RETURN          R1 count=2
 
   ; prototype 0:
     ; function (params=1, vararg=false, stack=2, upvalues=1)
     ; upvalues:
     ;   U0 = local R0
     ; code:
-    0000  GETUPVAL        R1 U0
-    0001  CONCAT          R1 R1 R0
-    0002  RETURN          R1 count=2
+    0000  [  8]  GETUPVAL        R1 U0
+    0001  [  8]  CONCAT          R1 R1 R0
+    0002  [  8]  RETURN          R1 count=2

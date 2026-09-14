@@ -10,25 +10,28 @@ use cstree::interning::TokenInterner;
 use thiserror::Error;
 
 use crate::dmm::{Collect, Gc};
-use crate::env::Prototype;
+use crate::env::{LuaString, Prototype};
 use crate::lua;
-use crate::parser::syntax;
+use crate::parser::{LineMap, syntax};
 
 pub fn compile_chunk<'gc>(
     ctx: lua::Context<'gc>,
     root: &syntax::Root,
+    lines: &LineMap,
     interner: &TokenInterner,
+    source: LuaString<'gc>,
 ) -> Result<Gc<'gc, Prototype<'gc>>, CompileError> {
-    rules::compile(ctx, root, interner)
+    rules::compile(ctx, root, lines, interner, source)
 }
 
+/// 1-based source line; 0 when the error has no position (internal errors).
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Collect)]
 #[collect(internal, require_static)]
-pub struct LineNumber(pub u64);
+pub struct LineNumber(pub u32);
 
 impl fmt::Display for LineNumber {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", u128::from(self.0) + 1)
+        write!(f, "{}", self.0)
     }
 }
 

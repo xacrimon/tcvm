@@ -9,22 +9,22 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  VARARGPREP      fixed=0
-0001  CLOSURE         R0 P0
-0002  GETTABUP        R1 U0 K0  ; "print"
-0003  MOVE            R2 R0
-0004  MOVE            R3 R0
-0005  LOAD            R4 K1  ; 2
-0006  CALL            R3 args=2 ret=0
-0007  CALL            R2 args=0 ret=0
-0008  CALL            R1 args=0 ret=1
-0009  RETURN          R0 count=1
+0000  [  1]  VARARGPREP      fixed=0
+0001  [  1]  CLOSURE         R0 P0
+0002  [  2]  GETTABUP        R1 U0 K0  ; "print"
+0003  [  2]  MOVE            R2 R0
+0004  [  2]  MOVE            R3 R0
+0005  [  2]  LOAD            R4 K1  ; 2
+0006  [  2]  CALL            R3 args=2 ret=0
+0007  [  2]  CALL            R2 args=0 ret=0
+0008  [  2]  CALL            R1 args=0 ret=1
+0009  [  2]  RETURN          R0 count=1
 
 ; prototype 0:
   ; function (params=1, vararg=false, stack=2, upvalues=0)
   ; constants:
   ;   K0 = 1
   ; code:
-  0000  LOAD            R1 K0  ; 1
-  0001  ADD             R1 R0 R1
-  0002  RETURN          R1 count=2
+  0000  [  1]  LOAD            R1 K0  ; 1
+  0001  [  1]  ADD             R1 R0 R1
+  0002  [  1]  RETURN          R1 count=2

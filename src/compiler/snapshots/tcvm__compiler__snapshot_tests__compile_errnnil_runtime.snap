@@ -10,11 +10,11 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  VARARGPREP      fixed=0
-0001  LOAD            R0 K1  ; 1
-0002  SETTABUP        R0 U0 K0  ; "X"
-0003  LOAD            R0 K2  ; 2
-0004  GETTABUP        R1 U0 K0  ; "X"
-0005  ERRNNIL         R1 name=K0
-0006  SETTABUP        R0 U0 K0  ; "X"
-0007  RETURN          R0 count=1
+0000  [  1]  VARARGPREP      fixed=0
+0001  [  1]  LOAD            R0 K1  ; 1
+0002  [  1]  SETTABUP        R0 U0 K0  ; "X"
+0003  [  2]  LOAD            R0 K2  ; 2
+0004  [  2]  GETTABUP        R1 U0 K0  ; "X"
+0005  [  2]  ERRNNIL         R1 name=K0
+0006  [  2]  SETTABUP        R0 U0 K0  ; "X"
+0007  [  2]  RETURN          R0 count=1

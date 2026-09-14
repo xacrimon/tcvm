@@ -30,12 +30,15 @@ fn main() {
 
     let source = fs::read_to_string(&args.file).unwrap();
 
+    // Lua's `@` prefix marks a chunk name as a file path (`luaO_chunkid`).
+    let chunk_name = format!("@{}", args.file.display());
+
     let mut lua = Lua::new();
     lua.load_all();
 
     if args.list {
         let listing = lua.enter(|ctx| {
-            let chunk = ctx.load(&source, Some("test"))?;
+            let chunk = ctx.load(&source, Some(&chunk_name))?;
             let closure = chunk.as_lua().expect("loaded chunk must be a Lua closure");
             Ok::<_, LoadError>(format_prototype(&closure.proto))
         });
@@ -63,7 +66,7 @@ fn main() {
     });
 
     let ex = lua.enter(|ctx| {
-        let chunk = ctx.load(&source, Some("test"))?;
+        let chunk = ctx.load(&source, Some(&chunk_name))?;
         let executor = Executor::start(ctx, chunk, ());
         Ok::<_, LoadError>(ctx.stash(executor))
     });

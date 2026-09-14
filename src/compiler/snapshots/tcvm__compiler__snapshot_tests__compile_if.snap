@@ -1,6 +1,5 @@
 ---
 source: src/compiler/snapshot_tests.rs
-assertion_line: 71
 expression: output
 ---
 ; function (params=0, vararg=true, stack=2, upvalues=1)
@@ -17,31 +16,31 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  VARARGPREP      fixed=0
-0001  GETTABUP        R0 U0 K0  ; "x"
-0002  LOAD            R1 K1  ; 5
-0003  LT              R0 R1 inv=false
-0004  JMP             +3
-0005  GETTABUP        R0 U0 K2  ; "print"
-0006  LOAD            R1 K3  ; "x is less than 5"
-0007  CALL            R0 args=2 ret=1
-0008  GETTABUP        R0 U0 K4  ; "z"
-0009  LOAD            R1 K1  ; 5
-0010  LT              R0 R1 inv=false
-0011  JMP             +4
-0012  GETTABUP        R0 U0 K2  ; "print"
-0013  LOAD            R1 K5  ; "z is less than 5"
-0014  CALL            R0 args=2 ret=1
-0015  JMP             +11
-0016  GETTABUP        R0 U0 K4  ; "z"
-0017  LOAD            R1 K6  ; 10
-0018  LT              R1 R0 inv=false
-0019  JMP             +4
-0020  GETTABUP        R0 U0 K2  ; "print"
-0021  LOAD            R1 K7  ; "z is greater than 10"
-0022  CALL            R0 args=2 ret=1
-0023  JMP             +3
-0024  GETTABUP        R0 U0 K2  ; "print"
-0025  LOAD            R1 K8  ; "z is greater than or equal to 5 and less than or equal to 10"
-0026  CALL            R0 args=2 ret=1
-0027  RETURN          R0 count=1
+0000  [  1]  VARARGPREP      fixed=0
+0001  [  1]  GETTABUP        R0 U0 K0  ; "x"
+0002  [  1]  LOAD            R1 K1  ; 5
+0003  [  1]  LT              R0 R1 inv=false
+0004  [  1]  JMP             +3
+0005  [  2]  GETTABUP        R0 U0 K2  ; "print"
+0006  [  2]  LOAD            R1 K3  ; "x is less than 5"
+0007  [  2]  CALL            R0 args=2 ret=1
+0008  [  5]  GETTABUP        R0 U0 K4  ; "z"
+0009  [  5]  LOAD            R1 K1  ; 5
+0010  [  5]  LT              R0 R1 inv=false
+0011  [  5]  JMP             +4
+0012  [  6]  GETTABUP        R0 U0 K2  ; "print"
+0013  [  6]  LOAD            R1 K5  ; "z is less than 5"
+0014  [  6]  CALL            R0 args=2 ret=1
+0015  [  6]  JMP             +11
+0016  [  7]  GETTABUP        R0 U0 K4  ; "z"
+0017  [  7]  LOAD            R1 K6  ; 10
+0018  [  7]  LT              R1 R0 inv=false
+0019  [  7]  JMP             +4
+0020  [  8]  GETTABUP        R0 U0 K2  ; "print"
+0021  [  8]  LOAD            R1 K7  ; "z is greater than 10"
+0022  [  8]  CALL            R0 args=2 ret=1
+0023  [  8]  JMP             +3
+0024  [ 10]  GETTABUP        R0 U0 K2  ; "print"
+0025  [ 10]  LOAD            R1 K8  ; "z is greater than or equal to 5 and less than or equal to 10"
+0026  [ 10]  CALL            R0 args=2 ret=1
+0027  [ 11]  RETURN          R0 count=1

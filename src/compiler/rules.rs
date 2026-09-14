@@ -7,15 +7,18 @@ use foldhash::fast::RandomState;
 use super::defs::{Chunk, ExprDesc, ExprKind, JumpList, Numeral, RegisterIndex, VarargInfo, Want};
 use super::{CompileError, CompileErrorKind, LineNumber};
 use crate::dmm::Gc;
+use crate::env::function::LocVar;
 use crate::env::{LuaString, Prototype, value::Value};
 use crate::instruction::{
     IcIdx, Instruction, KIdx, Op, ProtoIdx, Reg, Shape, UpIdx, UpValueDescriptor,
 };
 use crate::lua;
+use crate::parser::LineMap;
 use crate::parser::syntax::{
     Assign, BinaryOp, BinaryOperator, Break, Decl, DeclModifier, Do, Expr, ForGen, ForNum, Func,
     FuncCall, FuncExpr, Global, Goto, Ident, If, Index, Label, Literal, LiteralValue, MethodCall,
-    PrefixOp, PrefixOperator, Repeat, Return, Root, Stmt, Table, TableEntry, VarArgParam, While,
+    PrefixOp, PrefixOperator, Repeat, Return, Root, Stmt, SyntaxNode, Table, TableEntry,
+    VarArgParam, While,
 };
 use crate::vm::num;
 
@@ -44,13 +47,6 @@ fn is_valueless_ctrl(i: Instruction) -> bool {
 
 fn ice(msg: &'static str) -> CompileError {
     CompileError::internal(msg)
-}
-
-fn err(kind: CompileErrorKind, line: LineNumber) -> CompileError {
-    CompileError {
-        kind,
-        line_number: line,
-    }
 }
 
 /// Convert a constant `ExprKind` to the runtime `Value` that should be
@@ -353,10 +349,25 @@ enum ResolvedName {
     Upvalue(u8),
 }
 
+/// Where a function sits in the source. `defined`/`last_defined` become the
+/// prototype's span (both 0 for a main chunk); `end` is the line stamped on
+/// the implicit RETURN — the `end` keyword, or a main chunk's last token.
+#[derive(Clone, Copy)]
+struct FuncLines {
+    defined: u32,
+    last_defined: u32,
+    end: u32,
+}
+
 struct Ctx<'gc, 'a> {
     interner: &'a TokenInterner,
+    lines: &'a LineMap,
     ctx: lua::Context<'gc>,
     chunk: Chunk<'gc>,
+    /// Source line stamped on each emitted instruction. Set from the node
+    /// being compiled (see `set_line`); operators and calls re-set it right
+    /// before their own instruction so operand code doesn't skew it.
+    cur_line: u32,
 
     /// Stack of `(break label, scope depth)` for nested loops; the depth
     /// is `scope_marks.len()` at loop entry, so scopes at or above it are
@@ -370,6 +381,8 @@ struct Ctx<'gc, 'a> {
     scope_marks: Vec<ScopeMark>,
     /// Registers that need CLOSE when scope is popped (to-be-closed variables).
     scope_close: Vec<Vec<RegisterIndex>>,
+    /// `chunk.locvars` indices declared in each scope, closed on pop.
+    scope_locvars: Vec<Vec<usize>>,
 
     /// `::name::` seen so far → (label, `nactvar` at the label), so a
     /// backward goto knows which locals it leaves.
@@ -398,6 +411,27 @@ struct Ctx<'gc, 'a> {
 impl<'gc, 'a> Ctx<'gc, 'a> {
     fn emit(&mut self, instruction: Instruction) {
         self.chunk.tape.push(instruction);
+        self.chunk.lineinfo.push(self.cur_line);
+    }
+
+    fn err(&self, kind: CompileErrorKind) -> CompileError {
+        CompileError {
+            kind,
+            line_number: LineNumber(self.cur_line),
+        }
+    }
+
+    fn line_of(&self, node: &SyntaxNode) -> u32 {
+        self.lines.line_at(node.text_range().start().into())
+    }
+
+    fn last_line_of(&self, node: &SyntaxNode) -> u32 {
+        let end: u32 = node.text_range().end().into();
+        self.lines.line_at(end.saturating_sub(1))
+    }
+
+    fn set_line(&mut self, node: &SyntaxNode) {
+        self.cur_line = self.line_of(node);
     }
 
     /// Reserve a single fresh temp register at `freereg` and return it.
@@ -407,7 +441,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         if self.chunk.freereg == 255 {
             // 255 is the last addressable slot; allocating a new one would
             // wrap freereg to 0 and silently corrupt downstream allocations.
-            return Err(err(CompileErrorKind::Registers, LineNumber(0)));
+            return Err(self.err(CompileErrorKind::Registers));
         }
         let reg = self.chunk.freereg;
         self.chunk.freereg += 1;
@@ -426,7 +460,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         // (<= 255), so no further range check is needed.
         let end = base
             .checked_add(n)
-            .ok_or_else(|| err(CompileErrorKind::Registers, LineNumber(0)))?;
+            .ok_or_else(|| self.err(CompileErrorKind::Registers))?;
         self.chunk.freereg = end;
         if end > self.chunk.max_stack {
             self.chunk.max_stack = end;
@@ -508,7 +542,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                     // Same ceiling as `reserve_reg`: a hint of 255 would
                     // wrap freereg to 0.
                     if reg.0 == u8::MAX {
-                        return Err(err(CompileErrorKind::Registers, LineNumber(0)));
+                        return Err(self.err(CompileErrorKind::Registers));
                     }
                     self.chunk.freereg = reg.0 + 1;
                     if self.chunk.freereg > self.chunk.max_stack {
@@ -674,6 +708,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                 "no-op jump elision would orphan a live jump target"
             );
             self.chunk.tape.truncate(j - 1);
+            self.chunk.lineinfo.truncate(j - 1);
             list.jumps.remove(pos);
         }
         let target = self.next_offset();
@@ -1089,6 +1124,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             captured: false,
         });
         self.scope_close.push(Vec::new());
+        self.scope_locvars.push(Vec::new());
         self.scope_globals.push(self.globals.clone());
     }
 
@@ -1103,6 +1139,14 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             .ok_or_else(|| ice("missing scope register base"))?;
         self.chunk.freereg = mark.freereg;
         self.chunk.nactvar = mark.nactvar;
+        let end_pc = self.chunk.tape.len() as u32;
+        for i in self
+            .scope_locvars
+            .pop()
+            .ok_or_else(|| ice("missing scope"))?
+        {
+            self.chunk.locvars[i].end_pc = end_pc;
+        }
         // Drop any `global` declarations made within this block — their
         // lexical scope ends here (`manual.of:245-249`).
         self.globals = self
@@ -1143,8 +1187,30 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     }
 
     fn define(&mut self, name: String, data: VariableData) -> Result<(), CompileError> {
+        // `global` declarations are scope entries but own no register, so
+        // they get no debug record (luac lists only real locals).
+        if !matches!(data.kind, VarKind::Global) {
+            self.record_locvar(&name)?;
+        }
         let scope = self.scope.last_mut().ok_or_else(|| ice("missing scope"))?;
         scope.insert(name, data);
+        Ok(())
+    }
+
+    /// Add a debug record for a register that becomes live at the next
+    /// instruction and dies with the current scope. Used for named locals
+    /// and for the hidden loop-control slots luac calls `(for state)`.
+    fn record_locvar(&mut self, name: &str) -> Result<(), CompileError> {
+        let idx = self.chunk.locvars.len();
+        self.chunk.locvars.push(LocVar {
+            name: LuaString::new(self.ctx, name.as_bytes()),
+            start_pc: self.chunk.tape.len() as u32,
+            end_pc: 0,
+        });
+        self.scope_locvars
+            .last_mut()
+            .ok_or_else(|| ice("missing scope"))?
+            .push(idx);
         Ok(())
     }
 
@@ -1186,7 +1252,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         }
 
         if self.chunk.constants.len() >= u16::MAX as usize {
-            return Err(err(CompileErrorKind::Constants, LineNumber(0)));
+            return Err(self.err(CompileErrorKind::Constants));
         }
         let idx = self.chunk.constants.len() as u16;
         self.chunk.constants.push(value);
@@ -1351,7 +1417,9 @@ where
 pub fn compile<'gc>(
     ctx: lua::Context<'gc>,
     root: &Root,
+    lines: &LineMap,
     interner: &TokenInterner,
+    source: LuaString<'gc>,
 ) -> Result<Gc<'gc, Prototype<'gc>>, CompileError> {
     // The chunk starts with the implicit `global *` (global-by-default);
     // nested functions inherit a clone of whatever is in scope at their
@@ -1359,6 +1427,7 @@ pub fn compile<'gc>(
     let globals = GlobalEnv::new();
     let chunk = compile_function_to_chunk(
         ctx,
+        lines,
         interner,
         None, // main chunk has no enclosing function
         root.block(),
@@ -1366,7 +1435,13 @@ pub fn compile<'gc>(
         true, // main chunk is vararg
         None, // main chunk has no named vararg parameter
         0,
-        None,
+        source,
+        // luac gives the main chunk span 0,0.
+        FuncLines {
+            defined: 0,
+            last_defined: 0,
+            end: lines.last_line(),
+        },
         // Pre-seed `_ENV` at upvalue 0. The runtime wiring in
         // `src/lua/context.rs` (ctx.load) sets the top-level closure's
         // upvalues directly, so the descriptor here is purely a
@@ -1382,6 +1457,7 @@ pub fn compile<'gc>(
 #[allow(clippy::too_many_arguments)]
 fn compile_function_to_chunk<'gc, 'a>(
     ctx: lua::Context<'gc>,
+    lines: &'a LineMap,
     interner: &'a TokenInterner,
     parent_capture: Option<&'a mut dyn UpvalueResolver>,
     stmts: impl Iterator<Item = Stmt>,
@@ -1389,23 +1465,28 @@ fn compile_function_to_chunk<'gc, 'a>(
     is_vararg: bool,
     vararg_name: Option<String>,
     arity: u8,
-    source: Option<LuaString<'gc>>,
+    source: LuaString<'gc>,
+    span: FuncLines,
     initial_upvalues: Vec<(String, UpValueDescriptor)>,
     globals: GlobalEnv,
 ) -> Result<Chunk<'gc>, CompileError> {
-    let mut chunk = Chunk::new();
+    let mut chunk = Chunk::new(source);
     chunk.is_vararg = is_vararg;
     chunk.arity = arity;
-    chunk.source = source;
+    chunk.line_defined = span.defined;
+    chunk.last_line_defined = span.last_defined;
 
     let mut ctx = Ctx {
         interner,
+        lines,
         ctx,
         chunk,
+        cur_line: span.defined.max(1),
         control_end_label: Vec::new(),
         scope: Vec::new(),
         scope_marks: Vec::new(),
         scope_close: Vec::new(),
+        scope_locvars: Vec::new(),
         labels: HashMap::default(),
         pending_gotos: Vec::new(),
         capture: parent_capture,
@@ -1492,6 +1573,7 @@ fn compile_function_to_chunk<'gc, 'a>(
         Some(Op::RETURN | Op::TAILCALL),
     );
     let needs_return = last_pc <= ctx.chunk.last_target || !last_is_terminator;
+    ctx.cur_line = span.end;
     if needs_return {
         ctx.emit(Instruction::ret(Reg(0), 1));
     }
@@ -1499,12 +1581,19 @@ fn compile_function_to_chunk<'gc, 'a>(
     if let Some(reg) = ctx.pop_scope()? {
         // Insert CLOSE before the final RETURN/TAILCALL
         let return_instr = ctx.chunk.tape.pop().unwrap();
-        ctx.chunk.tape.push(Instruction::close(reg));
-        ctx.chunk.tape.push(return_instr);
+        ctx.chunk.lineinfo.pop();
+        ctx.emit(Instruction::close(reg));
+        ctx.emit(return_instr);
     }
 
     // Flatten the named upvalue list into the chunk's descriptor array.
-    ctx.chunk.upvalue_desc = ctx.upvalues.into_iter().map(|(_, d)| d).collect();
+    let lua_ctx = ctx.ctx;
+    let (names, descs): (Vec<_>, Vec<_>) = ctx.upvalues.into_iter().unzip();
+    ctx.chunk.upvalue_desc = descs;
+    ctx.chunk.upvalue_names = names
+        .iter()
+        .map(|n| LuaString::new(lua_ctx, n.as_bytes()))
+        .collect();
     Ok(ctx.chunk)
 }
 
@@ -1513,6 +1602,9 @@ fn compile_function_to_chunk<'gc, 'a>(
 // ---------------------------------------------------------------------------
 
 fn compile_stmt(ctx: &mut Ctx, item: Stmt) -> Result<(), CompileError> {
+    if let Some(node) = item.syntax() {
+        ctx.set_line(node);
+    }
     match item {
         Stmt::Label(item) => compile_label(ctx, item),
         Stmt::Goto(item) => compile_goto(ctx, item),
@@ -1636,6 +1728,11 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
         if func_reg != reg {
             ctx.emit(Instruction::mov(reg, func_reg));
         }
+        // The local is bound early so the body can recurse, but debug info
+        // only sees it once the closure is stored (luac's `localfunc`).
+        if let Some(var) = ctx.chunk.locvars.last_mut() {
+            var.start_pc = ctx.chunk.tape.len() as u32;
+        }
         return Ok(());
     }
 
@@ -1687,7 +1784,7 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
 
         if is_last && num_targets > num_values {
             // Last RHS supplies multiple values via call or vararg.
-            let want = expand_count(num_targets - i)?;
+            let want = expand_count(ctx, num_targets - i)?;
             if let Expr::FuncCall(call) = expr {
                 let regs = compile_expr_func_call(ctx, call, Want::Exact(want))?;
                 // Results occupy [regs[0], regs[0]+want); in practice this
@@ -1779,7 +1876,7 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
 
         if matches!(kind, VarKind::ToClose) {
             if mem::replace(&mut has_close, true) {
-                return Err(err(CompileErrorKind::MultipleClose, LineNumber(0)));
+                return Err(ctx.err(CompileErrorKind::MultipleClose));
             }
             ctx.emit(Instruction::tbc(reg));
             ctx.mark_close(reg)?;
@@ -1810,9 +1907,9 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
 /// encoding used by `CALL.returns` / `VARARG.count`. The result count must
 /// fit in a `u8` after the `+1`, so `n` must be `< 255`; otherwise we'd
 /// silently overflow. Returns the count as `u8` on success.
-fn expand_count(n: usize) -> Result<u8, CompileError> {
+fn expand_count(ctx: &Ctx, n: usize) -> Result<u8, CompileError> {
     if n >= u8::MAX as usize {
-        return Err(err(CompileErrorKind::Registers, LineNumber(0)));
+        return Err(ctx.err(CompileErrorKind::Registers));
     }
     Ok(n as u8)
 }
@@ -1985,18 +2082,18 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
             if is_last && n_targets > n_values {
                 let n = n_targets - i;
                 if let Expr::FuncCall(call) = expr {
-                    let n = expand_count(n)?;
+                    let n = expand_count(ctx, n)?;
                     let regs = compile_expr_func_call(ctx, call, Want::Exact(n))?;
                     debug_assert_eq!(regs[0].0, want.0);
                     continue;
                 }
                 if let Expr::Method(call) = expr {
-                    let n = expand_count(n)?;
+                    let n = expand_count(ctx, n)?;
                     expand_method_call(ctx, call, want, n)?;
                     continue;
                 }
                 if let Expr::VarArg = expr {
-                    let n = expand_count(n)?;
+                    let n = expand_count(ctx, n)?;
                     let dst = ctx.reserve_regs(n)?;
                     debug_assert_eq!(dst.0, want.0);
                     ctx.emit(Instruction::vararg(dst, n + 1));
@@ -2176,7 +2273,7 @@ fn compile_assign(ctx: &mut Ctx, item: Assign) -> Result<(), CompileError> {
             && num_targets > num_values
             && matches!(expr, Expr::FuncCall(_) | Expr::Method(_) | Expr::VarArg)
         {
-            let want = expand_count(num_targets - pending.len())?;
+            let want = expand_count(ctx, num_targets - pending.len())?;
             let regs = match expr {
                 Expr::FuncCall(call) => compile_expr_func_call(ctx, call, Want::Exact(want))?,
                 Expr::Method(call) => compile_expr_method_call(ctx, call, Want::Exact(want))?,
@@ -2249,18 +2346,14 @@ fn compile_lvalue(
             let shadow_global = matches!(local, Some((VarKind::Global, _)));
             if let Some((kind, register)) = local.filter(|_| !shadow_global) {
                 if kind.is_const() {
-                    return Err(err(
-                        CompileErrorKind::ConstAssign(name.to_owned()),
-                        LineNumber(0),
-                    ));
+                    return Err(ctx.err(CompileErrorKind::ConstAssign(name.to_owned())));
                 }
                 Ok(Lvalue::Local { dst: register })
             } else if !shadow_global && let Some(resolution) = ctx.resolve_or_capture(name) {
                 match resolution {
-                    ResolvedName::Const(_) => Err(err(
-                        CompileErrorKind::ConstAssign(name.to_owned()),
-                        LineNumber(0),
-                    )),
+                    ResolvedName::Const(_) => {
+                        Err(ctx.err(CompileErrorKind::ConstAssign(name.to_owned())))
+                    }
                     ResolvedName::Upvalue(idx) => Ok(Lvalue::Upvalue { idx }),
                 }
             } else {
@@ -2273,27 +2366,20 @@ fn compile_lvalue(
                 // rejected.
                 if let Some(kind) = ctx.globals.decls.get(name).copied() {
                     if kind.is_const() {
-                        return Err(err(
-                            CompileErrorKind::ConstAssign(name.to_owned()),
-                            LineNumber(0),
-                        ));
+                        return Err(ctx.err(CompileErrorKind::ConstAssign(name.to_owned())));
                     }
                 } else {
                     match ctx.globals.default {
                         // No default in scope: undeclared write rejected.
                         DefaultPolicy::None => {
-                            return Err(err(
-                                CompileErrorKind::UndeclaredGlobal(name.to_owned()),
-                                LineNumber(0),
-                            ));
+                            return Err(
+                                ctx.err(CompileErrorKind::UndeclaredGlobal(name.to_owned()))
+                            );
                         }
                         // Under `global<const> *` the implicit kind is
                         // read-only, so undeclared writes are rejected too.
                         DefaultPolicy::Star(GlobalKind::Const) => {
-                            return Err(err(
-                                CompileErrorKind::ConstAssign(name.to_owned()),
-                                LineNumber(0),
-                            ));
+                            return Err(ctx.err(CompileErrorKind::ConstAssign(name.to_owned())));
                         }
                         DefaultPolicy::Preamble | DefaultPolicy::Star(GlobalKind::Reg) => {}
                     }
@@ -2524,7 +2610,7 @@ fn compile_func_body(
         .into_iter()
         .chain(param_names(ctx, item.args()))
         .collect();
-    emit_closure(ctx, params, item.block(), item.vararg(), dst)
+    emit_closure(ctx, params, item.block(), item.vararg(), item.syntax(), dst)
 }
 
 fn param_names(ctx: &Ctx, args: Option<impl Iterator<Item = Ident>>) -> Vec<String> {
@@ -2541,6 +2627,7 @@ fn emit_closure(
     params: Vec<String>,
     block: Option<impl Iterator<Item = Stmt>>,
     vararg: Option<VarArgParam>,
+    func_node: &SyntaxNode,
     dst: Option<RegisterIndex>,
 ) -> Result<RegisterIndex, CompileError> {
     let stmts: Vec<_> = block.map(|b| b.collect()).unwrap_or_default();
@@ -2549,11 +2636,19 @@ fn emit_closure(
         .and_then(|v| v.name())
         .and_then(|i| i.name(ctx.interner).map(str::to_owned));
 
-    let proto = compile_nested(ctx, stmts, params, is_vararg, vararg_name)?;
+    let last_line = ctx.last_line_of(func_node);
+    let span = FuncLines {
+        defined: ctx.line_of(func_node),
+        last_defined: last_line,
+        end: last_line,
+    };
+    let proto = compile_nested(ctx, stmts, params, is_vararg, vararg_name, span)?;
 
     let proto_idx = ctx.chunk.prototypes.len() as u16;
     ctx.chunk.prototypes.push(proto);
     let dst = ctx.dst_or_alloc(dst)?;
+    // luac stamps CLOSURE with the line of the closing `end`.
+    ctx.cur_line = last_line;
     ctx.emit(Instruction::closure(dst, ProtoIdx(proto_idx)));
 
     Ok(dst)
@@ -2571,10 +2666,13 @@ fn compile_nested<'gc>(
     params: Vec<String>,
     is_vararg: bool,
     vararg_name: Option<String>,
+    span: FuncLines,
 ) -> Result<Gc<'gc, Prototype<'gc>>, CompileError> {
     let arity = params.len() as u8;
     let lua_ctx = ctx.ctx;
     let interner = ctx.interner;
+    let lines = ctx.lines;
+    let source = ctx.chunk.source;
     // The child inherits the declarations in scope at its definition site,
     // but mutates its own copy — its `global` decls don't leak back to the
     // parent or to sibling functions (`manual.of:245-249`).
@@ -2583,6 +2681,7 @@ fn compile_nested<'gc>(
 
     let chunk = compile_function_to_chunk(
         lua_ctx,
+        lines,
         interner,
         Some(parent),
         stmts.into_iter(),
@@ -2590,7 +2689,8 @@ fn compile_nested<'gc>(
         is_vararg,
         vararg_name,
         arity,
-        None,
+        source,
+        span,
         Vec::new(),
         globals,
     )?;
@@ -2612,6 +2712,9 @@ fn compile_expr(
     item: Expr,
     dst: Option<RegisterIndex>,
 ) -> Result<ExprDesc, CompileError> {
+    if let Some(node) = item.syntax() {
+        ctx.set_line(node);
+    }
     match item {
         Expr::PrefixOp(item) => compile_expr_prefix_op(ctx, item, dst),
         Expr::BinaryOp(item) => compile_expr_binary_op(ctx, item, dst),
@@ -2710,10 +2813,7 @@ fn compile_expr_ident(
     // initialization (see `compile_global`), not plain reads.
     let declared = ctx.globals.decls.contains_key(name);
     if !declared && ctx.globals.default == DefaultPolicy::None {
-        return Err(err(
-            CompileErrorKind::UndeclaredGlobal(name.to_owned()),
-            LineNumber(0),
-        ));
+        return Err(ctx.err(CompileErrorKind::UndeclaredGlobal(name.to_owned())));
     }
 
     let (key, ic_idx) = ctx.alloc_field_key(name.as_bytes())?;
@@ -2764,7 +2864,7 @@ fn compile_expr_func(
     dst: Option<RegisterIndex>,
 ) -> Result<RegisterIndex, CompileError> {
     let params = param_names(ctx, item.args());
-    emit_closure(ctx, params, item.block(), item.vararg(), dst)
+    emit_closure(ctx, params, item.block(), item.vararg(), item.syntax(), dst)
 }
 
 fn compile_property_key(
@@ -2967,10 +3067,12 @@ fn compile_expr_prefix_op(
 ) -> Result<ExprDesc, CompileError> {
     let op = item.op().ok_or_else(|| ice("prefix op without operator"))?;
     let rhs_expr = item.rhs().ok_or_else(|| ice("prefix op without operand"))?;
+    let op_line = ctx.cur_line;
 
     // Compile the operand without forcing discharge — preserves const
     // expdescs (Numeral/Bool/Nil) so we can fold them.
     let mut inner = compile_expr(ctx, rhs_expr, None)?;
+    ctx.cur_line = op_line;
 
     // Constant fold paths. Each returns a fresh const expdesc that the
     // enclosing operator can fold against again. Only valid when the
@@ -3079,6 +3181,11 @@ fn compile_expr_binary_op(
     dst: Option<RegisterIndex>,
 ) -> Result<ExprDesc, CompileError> {
     let op = item.op().ok_or_else(|| ice("binary op without operator"))?;
+    // luac stamps the operator's instruction with the operator token's line
+    // (`luaK_posfix(..., line)`), not the last operand's.
+    let op_line = item.op_token().map_or(ctx.cur_line, |t| {
+        ctx.lines.line_at(t.text_range().start().into())
+    });
 
     // Comparisons and logical operators produce jump-list expressions so
     // callers that branch on the result can avoid the LOAD-true / LFALSESKIP
@@ -3090,7 +3197,7 @@ fn compile_expr_binary_op(
         | BinaryOperator::Lt
         | BinaryOperator::Gt
         | BinaryOperator::LEq
-        | BinaryOperator::GEq => return compile_comparison_desc(ctx, item, op),
+        | BinaryOperator::GEq => return compile_comparison_desc(ctx, item, op, op_line),
         BinaryOperator::And => return compile_logical_and_desc(ctx, item, dst),
         BinaryOperator::Or => return compile_logical_or_desc(ctx, item, dst),
         _ => {}
@@ -3116,6 +3223,9 @@ fn compile_expr_binary_op(
         }
 
         let table = compile_expr_to_reg(ctx, lhs, None)?;
+        if let Some(key_node) = rhs.syntax() {
+            ctx.set_line(key_node);
+        }
         if let Some((key_idx, ic_idx)) = try_property_key_constant(ctx, &rhs)? {
             ctx.free_reg(table);
             let dst = ctx.dst_or_alloc(dst)?;
@@ -3183,6 +3293,7 @@ fn compile_expr_binary_op(
         (lhs, rhs)
     };
 
+    ctx.cur_line = op_line;
     let reg = match op {
         BinaryOperator::Add => emit_arith(ctx, lhs, rhs, Instruction::add(Reg(0), lhs, rhs), dst)?,
         BinaryOperator::Sub => emit_arith(ctx, lhs, rhs, Instruction::sub(Reg(0), lhs, rhs), dst)?,
@@ -3266,11 +3377,13 @@ fn compile_comparison_desc(
     ctx: &mut Ctx,
     item: BinaryOp,
     op: BinaryOperator,
+    op_line: u32,
 ) -> Result<ExprDesc, CompileError> {
     let lhs_expr = item.lhs().ok_or_else(|| ice("cmp without lhs"))?;
     let rhs_expr = item.rhs().ok_or_else(|| ice("cmp without rhs"))?;
     let lhs = compile_expr_to_reg(ctx, lhs_expr, None)?;
     let rhs = compile_expr_to_reg(ctx, rhs_expr, None)?;
+    ctx.cur_line = op_line;
 
     // Lua 5.5 convention: emit the CMP so the paired JMP fires on the
     // TRUTHY outcome of the comparison. The VM's `op_lt` / `op_le` /
@@ -3410,6 +3523,10 @@ fn emit_func_call_setup(
     let args_wire = compile_call_args(ctx, args, func, 1)?;
     debug_assert!(args_wire == 0 || args_wire as usize == nargs + 1);
 
+    // luac stamps CALL with the line of the argument list's opening token.
+    if let Some(args_node) = item.args_node() {
+        ctx.set_line(args_node);
+    }
     Ok((func, args_wire))
 }
 
@@ -3516,6 +3633,7 @@ fn emit_method_call_setup(
         .ok_or_else(|| ice("ident without name"))?;
 
     let object = compile_expr_to_reg(ctx, object_expr, None)?;
+    ctx.set_line(method_ident.syntax());
 
     let key_idx = ctx.alloc_string_constant(method_name.as_bytes())?;
 
@@ -3539,6 +3657,9 @@ fn emit_method_call_setup(
 
     let args: Vec<_> = item.args().map(|a| a.collect()).unwrap_or_default();
     let args_wire = compile_call_args(ctx, args, func, 2)?;
+    if let Some(args_node) = item.args_node() {
+        ctx.set_line(args_node);
+    }
     Ok((func, args_wire))
 }
 
@@ -3671,7 +3792,9 @@ fn compile_expr_index(
     }
 
     let table = compile_expr_to_reg(ctx, target_expr, None)?;
+    let key_line = key_expr.syntax().map_or(ctx.cur_line, |n| ctx.line_of(n));
     let key = compile_expr_to_reg(ctx, key_expr, None)?;
+    ctx.cur_line = key_line;
     // Both operands have been captured into the upcoming GETTABLE; free
     // their temps (higher first) so `dst` can reuse the slot.
     ctx.free_regs(table, key);
@@ -3801,7 +3924,11 @@ fn compile_return_generic(ctx: &mut Ctx, mut exprs: Vec<Expr>) -> Result<(), Com
         }
     }
 
-    let count = if multret { 0 } else { expand_count(n)? + 1 };
+    let count = if multret {
+        0
+    } else {
+        expand_count(ctx, n)? + 1
+    };
     ctx.emit(Instruction::ret(first_reg, count));
 
     Ok(())
@@ -3970,6 +4097,7 @@ fn compile_if_chain(ctx: &mut Ctx, item: If, end_label: u16) -> Result<(), Compi
 }
 
 fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
+    let for_line = ctx.cur_line;
     scope_lexical_break(ctx, |ctx| {
         let (counter_ident, init_expr) = item
             .counter()
@@ -4022,6 +4150,9 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
         // They're unnamed so upvalue capture won't find them; nactvar's
         // sole role here is as the free_reg cutoff.
         ctx.adjust_locals(3);
+        for _ in 0..3 {
+            ctx.record_locvar("(for state)")?;
+        }
 
         let loop_body = ctx.new_label();
         let loop_end = ctx.new_label();
@@ -4060,7 +4191,9 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
             Ok(())
         })?;
 
-        // FORLOOP: increment and jump back if still in range
+        // FORLOOP: increment and jump back if still in range. luac stamps
+        // the loop-back instructions with the `for` line.
+        ctx.cur_line = for_line;
         ctx.emit_jump_instr(loop_body, Instruction::forloop(base, 0));
 
         ctx.set_label(loop_end, ctx.next_offset());
@@ -4069,6 +4202,7 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
 }
 
 fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
+    let for_line = ctx.cur_line;
     scope_lexical_break(ctx, |ctx| {
         let values: Vec<_> = item
             .values()
@@ -4140,6 +4274,9 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
         // Promote the 3 anonymous control slots (iterator, state, control)
         // so body subexpressions can't reclaim them via free_reg.
         ctx.adjust_locals(3);
+        for _ in 0..3 {
+            ctx.record_locvar("(for state)")?;
+        }
 
         let loop_body = ctx.new_label();
         let loop_test = ctx.new_label();
@@ -4182,6 +4319,7 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
         ctx.set_label(loop_test, ctx.next_offset());
 
         // TFORCALL: call iterator, results go to base+3..base+2+count
+        ctx.cur_line = for_line;
         ctx.emit(Instruction::tforcall(base, num_targets as u8));
 
         // TFORLOOP: if control variable is not nil, jump back to body

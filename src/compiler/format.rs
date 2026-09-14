@@ -35,8 +35,9 @@ fn format_prototype_into(out: &mut String, proto: &Prototype<'_>, depth: usize) 
 
     out.push_str(&format!("{indent}; code:\n"));
     for (i, instr) in proto.code.iter().enumerate() {
+        let line = proto.line_for_pc(i).unwrap_or(0);
         out.push_str(&format!(
-            "{indent}{i:04}  {}\n",
+            "{indent}{i:04}  [{line:>3}]  {}\n",
             format_instruction(instr, &proto.constants)
         ));
     }

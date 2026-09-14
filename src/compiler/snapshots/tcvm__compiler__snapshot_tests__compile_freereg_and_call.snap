@@ -8,19 +8,19 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  VARARGPREP      fixed=0
-0001  CLOSURE         R0 P0
-0002  LOAD            R1 K0  ; true
-0003  TESTSET         R2 R1 inv=true
-0004  JMP             +2
-0005  MOVE            R2 R0
-0006  CALL            R2 args=1 ret=2
-0007  RETURN          R2 count=2
+0000  [  1]  VARARGPREP      fixed=0
+0001  [  1]  CLOSURE         R0 P0
+0002  [  2]  LOAD            R1 K0  ; true
+0003  [  3]  TESTSET         R2 R1 inv=true
+0004  [  3]  JMP             +2
+0005  [  3]  MOVE            R2 R0
+0006  [  3]  CALL            R2 args=1 ret=2
+0007  [  4]  RETURN          R2 count=2
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=1, upvalues=0)
   ; constants:
   ;   K0 = 42
   ; code:
-  0000  LOAD            R0 K0  ; 42
-  0001  RETURN          R0 count=2
+  0000  [  1]  LOAD            R0 K0  ; 42
+  0001  [  1]  RETURN          R0 count=2

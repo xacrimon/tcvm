@@ -1,6 +1,5 @@
 ---
 source: src/compiler/snapshot_tests.rs
-assertion_line: 89
 expression: output
 ---
 ; function (params=0, vararg=true, stack=4, upvalues=1)
@@ -10,23 +9,23 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  VARARGPREP      fixed=0
-0001  CLOSURE         R0 P0
-0002  MOVE            R1 R0
-0003  CALL            R1 args=1 ret=1
-0004  MOVE            R1 R0
-0005  CALL            R1 args=1 ret=1
-0006  LOAD            R1 K0  ; 1
-0007  LOAD            R2 K1  ; 2
-0008  NOT             R3 R1
-0009  TEST            R3 inv=false
-0010  JMP             +2
-0011  LOAD            R3 K0  ; 1
-0012  RETURN          R3 count=2
-0013  ADD             R3 R1 R2
-0014  RETURN          R3 count=2
+0000  [  1]  VARARGPREP      fixed=0
+0001  [  1]  CLOSURE         R0 P0
+0002  [  2]  MOVE            R1 R0
+0003  [  2]  CALL            R1 args=1 ret=1
+0004  [  2]  MOVE            R1 R0
+0005  [  2]  CALL            R1 args=1 ret=1
+0006  [  3]  LOAD            R1 K0  ; 1
+0007  [  3]  LOAD            R2 K1  ; 2
+0008  [  4]  NOT             R3 R1
+0009  [  4]  TEST            R3 inv=false
+0010  [  4]  JMP             +2
+0011  [  4]  LOAD            R3 K0  ; 1
+0012  [  4]  RETURN          R3 count=2
+0013  [  5]  ADD             R3 R1 R2
+0014  [  5]  RETURN          R3 count=2
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=0, upvalues=0)
   ; code:
-  0000  RETURN          R0 count=1
+  0000  [  1]  RETURN          R0 count=1

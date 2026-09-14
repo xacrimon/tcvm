@@ -12,20 +12,20 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  VARARGPREP      fixed=0
-0001  LOAD            R0 K0  ; 1
-0002  LOAD            R1 K1  ; 2
-0003  LOAD            R2 K2  ; 3
-0004  LOAD            R3 K3  ; nil
-0005  TBC             R3
-0006  LOAD            R4 K3  ; nil
-0007  LOAD            R5 K4  ; 5
-0008  TBC             R4
-0009  LOAD            R6 K0  ; 1
-0010  LOAD            R7 K1  ; 2
-0011  LOAD            R8 K2  ; 3
-0012  MOVE            R9 R3
-0013  MOVE            R10 R4
-0014  LOAD            R11 K4  ; 5
-0015  CLOSE           R3
-0016  RETURN          R6 count=7
+0000  [  1]  VARARGPREP      fixed=0
+0001  [  1]  LOAD            R0 K0  ; 1
+0002  [  1]  LOAD            R1 K1  ; 2
+0003  [  2]  LOAD            R2 K2  ; 3
+0004  [  3]  LOAD            R3 K3  ; nil
+0005  [  3]  TBC             R3
+0006  [  4]  LOAD            R4 K3  ; nil
+0007  [  4]  LOAD            R5 K4  ; 5
+0008  [  4]  TBC             R4
+0009  [  5]  LOAD            R6 K0  ; 1
+0010  [  5]  LOAD            R7 K1  ; 2
+0011  [  5]  LOAD            R8 K2  ; 3
+0012  [  5]  MOVE            R9 R3
+0013  [  5]  MOVE            R10 R4
+0014  [  5]  LOAD            R11 K4  ; 5
+0015  [  5]  CLOSE           R3
+0016  [  5]  RETURN          R6 count=7

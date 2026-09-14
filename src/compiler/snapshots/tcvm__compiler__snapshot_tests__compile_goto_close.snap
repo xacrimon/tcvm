@@ -15,89 +15,89 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  VARARGPREP      fixed=0
-0001  NEWTABLE        R0
-0002  LOAD            R1 K0  ; 0
-0003  LOAD            R2 K1  ; 1
-0004  ADD             R1 R1 R2
-0005  MOVE            R2 R1
-0006  CLOSURE         R3 P0
-0007  SETTABLE        R3 R0 R1
-0008  LOAD            R3 K2  ; 3
-0009  LT              R1 R3 inv=false
-0010  JMP             +2
-0011  CLOSE           R2
-0012  JMP             -10
-0013  CLOSE           R2
-0014  NEWTABLE        R2
-0015  LOAD            R3 K0  ; 0
-0016  LOAD            R4 K1  ; 1
-0017  ADD             R3 R3 R4
-0018  MOVE            R4 R3
-0019  CLOSURE         R5 P1
-0020  SETTABLE        R5 R2 R3
-0021  LOAD            R5 K2  ; 3
-0022  LT              R3 R5 inv=false
-0023  JMP             +2
-0024  CLOSE           R4
-0025  JMP             -10
-0026  LOAD            R5 K3  ; nil
-0027  LOAD            R6 K4  ; 42
-0028  CLOSURE         R5 P2
-0029  JMP             +1
-0030  CLOSE           R6
-0031  CLOSE           R6
-0032  LOAD            R6 K5  ; 7
-0033  NEWTABLE        R7
-0034  LOAD            R8 K1  ; 1
-0035  LOAD            R9 K6  ; 4
-0036  LOAD            R10 K1  ; 1
-0037  FORPREP         R8 +14
-0038  MOVE            R12 R11
-0039  LOAD            R13 K7  ; 2
-0040  MOD             R13 R11 R13
-0041  LOAD            R14 K0  ; 0
-0042  EQ              R13 R14 inv=false
-0043  JMP             +1
-0044  JMP             +5
-0045  LEN             R13 R7
-0046  LOAD            R14 K1  ; 1
-0047  ADD             R13 R13 R14
-0048  CLOSURE         R14 P3
-0049  SETTABLE        R14 R7 R13
-0050  CLOSE           R11
-0051  FORLOOP         R8 -14
-0052  JMP             +0
-0053  RETURN          R0 count=1
+0000  [  1]  VARARGPREP      fixed=0
+0001  [  2]  NEWTABLE        R0
+0002  [  2]  LOAD            R1 K0  ; 0
+0003  [  4]  LOAD            R2 K1  ; 1
+0004  [  4]  ADD             R1 R1 R2
+0005  [  6]  MOVE            R2 R1
+0006  [  7]  CLOSURE         R3 P0
+0007  [  7]  SETTABLE        R3 R0 R1
+0008  [  8]  LOAD            R3 K2  ; 3
+0009  [  8]  LT              R1 R3 inv=false
+0010  [  8]  JMP             +2
+0011  [  8]  CLOSE           R2
+0012  [  8]  JMP             -10
+0013  [  8]  CLOSE           R2
+0014  [ 12]  NEWTABLE        R2
+0015  [ 12]  LOAD            R3 K0  ; 0
+0016  [ 14]  LOAD            R4 K1  ; 1
+0017  [ 14]  ADD             R3 R3 R4
+0018  [ 15]  MOVE            R4 R3
+0019  [ 16]  CLOSURE         R5 P1
+0020  [ 16]  SETTABLE        R5 R2 R3
+0021  [ 17]  LOAD            R5 K2  ; 3
+0022  [ 17]  LT              R3 R5 inv=false
+0023  [ 17]  JMP             +2
+0024  [ 17]  CLOSE           R4
+0025  [ 17]  JMP             -10
+0026  [ 20]  LOAD            R5 K3  ; nil
+0027  [ 22]  LOAD            R6 K4  ; 42
+0028  [ 23]  CLOSURE         R5 P2
+0029  [ 24]  JMP             +1
+0030  [ 24]  CLOSE           R6
+0031  [ 26]  CLOSE           R6
+0032  [ 27]  LOAD            R6 K5  ; 7
+0033  [ 30]  NEWTABLE        R7
+0034  [ 31]  LOAD            R8 K1  ; 1
+0035  [ 31]  LOAD            R9 K6  ; 4
+0036  [ 31]  LOAD            R10 K1  ; 1
+0037  [ 31]  FORPREP         R8 +14
+0038  [ 32]  MOVE            R12 R11
+0039  [ 33]  LOAD            R13 K7  ; 2
+0040  [ 33]  MOD             R13 R11 R13
+0041  [ 33]  LOAD            R14 K0  ; 0
+0042  [ 33]  EQ              R13 R14 inv=false
+0043  [ 33]  JMP             +1
+0044  [ 33]  JMP             +5
+0045  [ 34]  LEN             R13 R7
+0046  [ 34]  LOAD            R14 K1  ; 1
+0047  [ 34]  ADD             R13 R13 R14
+0048  [ 34]  CLOSURE         R14 P3
+0049  [ 34]  SETTABLE        R14 R7 R13
+0050  [ 35]  CLOSE           R11
+0051  [ 31]  FORLOOP         R8 -14
+0052  [ 39]  JMP             +0
+0053  [ 41]  RETURN          R0 count=1
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=1, upvalues=1)
   ; upvalues:
   ;   U0 = local R2
   ; code:
-  0000  GETUPVAL        R0 U0
-  0001  RETURN          R0 count=2
+  0000  [  7]  GETUPVAL        R0 U0
+  0001  [  7]  RETURN          R0 count=2
 
 ; prototype 1:
   ; function (params=0, vararg=false, stack=1, upvalues=1)
   ; upvalues:
   ;   U0 = local R4
   ; code:
-  0000  GETUPVAL        R0 U0
-  0001  RETURN          R0 count=2
+  0000  [ 16]  GETUPVAL        R0 U0
+  0001  [ 16]  RETURN          R0 count=2
 
 ; prototype 2:
   ; function (params=0, vararg=false, stack=1, upvalues=1)
   ; upvalues:
   ;   U0 = local R6
   ; code:
-  0000  GETUPVAL        R0 U0
-  0001  RETURN          R0 count=2
+  0000  [ 23]  GETUPVAL        R0 U0
+  0001  [ 23]  RETURN          R0 count=2
 
 ; prototype 3:
   ; function (params=0, vararg=false, stack=1, upvalues=1)
   ; upvalues:
   ;   U0 = local R12
   ; code:
-  0000  GETUPVAL        R0 U0
-  0001  RETURN          R0 count=2
+  0000  [ 34]  GETUPVAL        R0 U0
+  0001  [ 34]  RETURN          R0 count=2

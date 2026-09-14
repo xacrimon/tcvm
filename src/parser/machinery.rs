@@ -127,9 +127,9 @@ impl<'cache, 'source> State<'cache, 'source> {
         last_span
     }
 
-    pub fn finish(self) -> (GreenNode, Vec<ariadne::Report<'static, Span>>) {
-        let tree = Sink::new(self.cache, &self.tokens, self.events, self.source).finish();
-        (tree, self.reports)
+    pub fn finish(self) -> (GreenNode, LineMap, Vec<ariadne::Report<'static, Span>>) {
+        let (tree, lines) = Sink::new(self.cache, &self.tokens, self.events, self.source).finish();
+        (tree, lines, self.reports)
     }
 }
 
@@ -397,6 +397,15 @@ struct Sink<'cache, 'source> {
     cursor: usize,
     events: Vec<Event>,
     source: &'source str,
+    lines: LineMap,
+    /// Tree text offset of the next token. The lexer drops whitespace and
+    /// comments, so tree offsets are packed and `LineMap` is the only way
+    /// back to source lines.
+    tree_offset: u32,
+    /// Source offset and line of the last token seen, so newlines are
+    /// counted incrementally rather than from the start each time.
+    last_source_offset: u32,
+    last_line: u32,
 }
 
 impl<'cache, 'source> Sink<'cache, 'source> {
@@ -412,15 +421,35 @@ impl<'cache, 'source> Sink<'cache, 'source> {
             cursor: 0,
             events,
             source,
+            lines: LineMap::default(),
+            tree_offset: 0,
+            last_source_offset: 0,
+            last_line: 1,
         }
     }
 
-    fn token(&mut self, kind: SyntaxKind, text: &str) {
+    fn token(&mut self, kind: SyntaxKind, span: Span) {
         self.cursor += 1;
+        let text = &self.source[span];
+        let newlines = self.source[self.last_source_offset as usize..span.start as usize]
+            .bytes()
+            .filter(|&b| b == b'\n')
+            .count() as u32;
+        self.last_line += newlines;
+        self.last_source_offset = span.start;
+        if self
+            .lines
+            .entries
+            .last()
+            .is_none_or(|e| e.1 != self.last_line)
+        {
+            self.lines.entries.push((self.tree_offset, self.last_line));
+        }
+        self.tree_offset += text.len() as u32;
         self.builder.token(kind, text);
     }
 
-    fn finish(mut self) -> GreenNode {
+    fn finish(mut self) -> (GreenNode, LineMap) {
         let mut preceded_nodes = Vec::new();
         for idx in 0..self.events.len() {
             match mem::take(&mut self.events[idx]) {
@@ -458,11 +487,36 @@ impl<'cache, 'source> Sink<'cache, 'source> {
                 }
 
                 Event::Token { kind, span } => {
-                    self.token(kind, &self.source[span]);
+                    self.token(kind, span);
                 }
             }
         }
 
-        self.builder.finish().0
+        self.lines.last_line = self.last_line;
+        (self.builder.finish().0, self.lines)
+    }
+}
+
+/// Maps packed tree text offsets back to 1-based source lines.
+#[derive(Debug, Default, Clone)]
+pub struct LineMap {
+    /// `(tree offset of the first token on a line, line)`, ascending. Only
+    /// lines that own at least one token get an entry.
+    entries: Vec<(u32, u32)>,
+    last_line: u32,
+}
+
+impl LineMap {
+    /// Line containing the token at tree text offset `offset`.
+    pub fn line_at(&self, offset: u32) -> u32 {
+        match self.entries.partition_point(|&(start, _)| start <= offset) {
+            0 => 1,
+            i => self.entries[i - 1].1,
+        }
+    }
+
+    /// Line of the last token (where luac puts a chunk's implicit RETURN).
+    pub fn last_line(&self) -> u32 {
+        self.last_line.max(1)
     }
 }

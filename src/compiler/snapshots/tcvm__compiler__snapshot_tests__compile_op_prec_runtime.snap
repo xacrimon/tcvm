@@ -1,6 +1,5 @@
 ---
 source: src/compiler/snapshot_tests.rs
-assertion_line: 133
 expression: output
 ---
 ; function (params=0, vararg=true, stack=3, upvalues=1)
@@ -12,18 +11,18 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  VARARGPREP      fixed=0
-0001  GETTABUP        R0 U0 K1  ; "a"
-0002  GETTABUP        R1 U0 K2  ; "b"
-0003  GETTABUP        R2 U0 K3  ; "c"
-0004  MUL             R1 R1 R2
-0005  ADD             R0 R0 R1
-0006  GETTABUP        R1 U0 K2  ; "b"
-0007  GETTABUP        R2 U0 K3  ; "c"
-0008  DIV             R1 R1 R2
-0009  SUB             R0 R0 R1
-0010  SETTABUP        R0 U0 K0  ; "num"
-0011  GETTABUP        R0 U0 K1  ; "a"
-0012  UNM             R0 R0
-0013  SETTABUP        R0 U0 K0  ; "num"
-0014  RETURN          R0 count=1
+0000  [  1]  VARARGPREP      fixed=0
+0001  [  5]  GETTABUP        R0 U0 K1  ; "a"
+0002  [  5]  GETTABUP        R1 U0 K2  ; "b"
+0003  [  5]  GETTABUP        R2 U0 K3  ; "c"
+0004  [  5]  MUL             R1 R1 R2
+0005  [  5]  ADD             R0 R0 R1
+0006  [  5]  GETTABUP        R1 U0 K2  ; "b"
+0007  [  5]  GETTABUP        R2 U0 K3  ; "c"
+0008  [  5]  DIV             R1 R1 R2
+0009  [  5]  SUB             R0 R0 R1
+0010  [  5]  SETTABUP        R0 U0 K0  ; "num"
+0011  [  6]  GETTABUP        R0 U0 K1  ; "a"
+0012  [  6]  UNM             R0 R0
+0013  [  6]  SETTABUP        R0 U0 K0  ; "num"
+0014  [  6]  RETURN          R0 count=1

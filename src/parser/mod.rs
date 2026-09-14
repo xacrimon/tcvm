@@ -8,13 +8,17 @@ use std::ops::{Deref, DerefMut};
 
 use cstree::build::NodeCache;
 use kind::T;
+pub use machinery::LineMap;
 use machinery::{Span, State};
 use syntax::SyntaxNode;
 
-pub fn parse(
-    cache: &mut NodeCache<'static>,
-    source: &str,
-) -> (SyntaxNode, Vec<ariadne::Report<'static, Span>>) {
+pub struct Parse {
+    pub root: SyntaxNode,
+    pub lines: LineMap,
+    pub reports: Vec<ariadne::Report<'static, Span>>,
+}
+
+pub fn parse(cache: &mut NodeCache<'static>, source: &str) -> Parse {
     Parser::new(cache, source).run()
 }
 
@@ -35,10 +39,14 @@ impl<'cache, 'source> Parser<'cache, 'source> {
         marker.complete(self);
     }
 
-    fn run(mut self) -> (SyntaxNode, Vec<ariadne::Report<'static, Span>>) {
+    fn run(mut self) -> Parse {
         self.root();
-        let (root, reports) = self.state.finish();
-        (SyntaxNode::new_root(root), reports)
+        let (root, lines, reports) = self.state.finish();
+        Parse {
+            root: SyntaxNode::new_root(root),
+            lines,
+            reports,
+        }
     }
 }
 
@@ -73,9 +81,9 @@ mod tests {
                 fn [<test_parse_ $name>]() {
                     let mut cache = NodeCache::new();
                     let source = fs::read_to_string($path).unwrap();
-                    let (syntax_tree, reports) = parse(&mut cache, &source);
-                    let syntax_tree = syntax_tree.debug(cache.interner(), true);
-                    assert!(reports.is_empty());
+                    let parse = parse(&mut cache, &source);
+                    let syntax_tree = parse.root.debug(cache.interner(), true);
+                    assert!(parse.reports.is_empty());
                     assert_snapshot!(syntax_tree);
                 }
             }
@@ -135,9 +143,32 @@ mod tests {
             "foo @ bar",
         ] {
             let mut cache = NodeCache::new();
-            let (_tree, reports) = parse(&mut cache, src);
+            let reports = parse(&mut cache, src).reports;
             assert!(!reports.is_empty(), "expected a parse error for {src:?}");
         }
+    }
+
+    // Tree text offsets are packed (no trivia), so the line map must be
+    // consulted rather than counting newlines in the tree text.
+    #[test]
+    fn line_map_skips_trivia() {
+        let mut cache = NodeCache::new();
+        let p = parse(&mut cache, "a = 1\n\n-- c\n  b = 2\n\n");
+        assert!(p.reports.is_empty());
+        // Tokens: `a` `=` `1` on line 1 at packed offsets 0..3, then `b` `=`
+        // `2` on line 4 at 3..6.
+        let lines: Vec<u32> = (0..6).map(|o| p.lines.line_at(o)).collect();
+        assert_eq!(lines, [1, 1, 1, 4, 4, 4]);
+        assert_eq!(p.lines.last_line(), 4);
+
+        // Newlines inside a token (a long string here) count towards the
+        // tokens after it.
+        let p = parse(&mut cache, "x = [[a\nb]]\ny = 1");
+        assert!(p.reports.is_empty());
+        // `x` `=` `[[a\nb]]` occupy packed offsets 0..9; `y` starts at 9.
+        assert_eq!(p.lines.line_at(2), 1);
+        assert_eq!(p.lines.line_at(9), 3);
+        assert_eq!(p.lines.last_line(), 3);
     }
 
     // Assignment targets must be variables (#67); a parenthesised primary
@@ -157,7 +188,7 @@ mod tests {
             "x = 'a' .. 'b' :upper()",
         ] {
             let mut cache = NodeCache::new();
-            let (_tree, reports) = parse(&mut cache, src);
+            let reports = parse(&mut cache, src).reports;
             assert!(!reports.is_empty(), "expected a parse error for {src:?}");
         }
     }
