@@ -7,7 +7,9 @@ use crate::env::value::Value;
 use crate::instruction::UpValueDescriptor;
 use crate::vm::sequence::{CallbackAction, Execution};
 
-/// Debug record for a named local: active for `start_pc <= pc < end_pc`.
+/// Debug record for a local register: active for `start_pc <= pc < end_pc`.
+/// Hidden loop-control slots appear as `(for state)` like luac's, so every
+/// register a frame keeps live has a record.
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub struct LocVar<'gc> {

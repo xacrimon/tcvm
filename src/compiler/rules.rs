@@ -1180,19 +1180,27 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         // `global` declarations are scope entries but own no register, so
         // they get no debug record (luac lists only real locals).
         if !matches!(data.kind, VarKind::Global) {
-            let idx = self.chunk.locvars.len();
-            self.chunk.locvars.push(LocVar {
-                name: LuaString::new(self.ctx, name.as_bytes()),
-                start_pc: self.chunk.tape.len() as u32,
-                end_pc: 0,
-            });
-            self.scope_locvars
-                .last_mut()
-                .ok_or_else(|| ice("missing scope"))?
-                .push(idx);
+            self.record_locvar(&name)?;
         }
         let scope = self.scope.last_mut().ok_or_else(|| ice("missing scope"))?;
         scope.insert(name, data);
+        Ok(())
+    }
+
+    /// Add a debug record for a register that becomes live at the next
+    /// instruction and dies with the current scope. Used for named locals
+    /// and for the hidden loop-control slots luac calls `(for state)`.
+    fn record_locvar(&mut self, name: &str) -> Result<(), CompileError> {
+        let idx = self.chunk.locvars.len();
+        self.chunk.locvars.push(LocVar {
+            name: LuaString::new(self.ctx, name.as_bytes()),
+            start_pc: self.chunk.tape.len() as u32,
+            end_pc: 0,
+        });
+        self.scope_locvars
+            .last_mut()
+            .ok_or_else(|| ice("missing scope"))?
+            .push(idx);
         Ok(())
     }
 
@@ -4136,6 +4144,9 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
         // They're unnamed so upvalue capture won't find them; nactvar's
         // sole role here is as the free_reg cutoff.
         ctx.adjust_locals(3);
+        for _ in 0..3 {
+            ctx.record_locvar("(for state)")?;
+        }
 
         let loop_body = ctx.new_label();
         let loop_end = ctx.new_label();
@@ -4257,6 +4268,9 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
         // Promote the 3 anonymous control slots (iterator, state, control)
         // so body subexpressions can't reclaim them via free_reg.
         ctx.adjust_locals(3);
+        for _ in 0..3 {
+            ctx.record_locvar("(for state)")?;
+        }
 
         let loop_body = ctx.new_label();
         let loop_test = ctx.new_label();

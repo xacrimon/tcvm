@@ -96,3 +96,30 @@ fn global_declarations_are_not_locals() {
         assert_eq!(names, [b"y"]);
     });
 }
+
+#[test]
+fn loop_control_slots_are_recorded() {
+    let mut lua = Lua::new();
+    lua.load_all();
+    lua.enter(|ctx| {
+        let chunk = ctx
+            .load(
+                "for i = 1, 2 do end\nfor k, v in next, {} do end",
+                Some("=l"),
+            )
+            .expect("load");
+        let proto = chunk.as_lua().unwrap().proto;
+        let names: Vec<&[u8]> = proto.locvars.iter().map(|v| v.name.as_bytes()).collect();
+        let fs = &b"(for state)"[..];
+        assert_eq!(names, [fs, fs, fs, b"i", fs, fs, fs, b"k", b"v"]);
+        // Control slots live from FORPREP (pc 4) through FORLOOP (pc 5);
+        // the visible variable only inside the (empty) body.
+        assert_eq!((proto.locvars[0].start_pc, proto.locvars[0].end_pc), (4, 6));
+        assert_eq!((proto.locvars[3].start_pc, proto.locvars[3].end_pc), (5, 5));
+        // Generic loop: TFORPREP at 9, TFORLOOP at 11.
+        assert_eq!(
+            (proto.locvars[4].start_pc, proto.locvars[4].end_pc),
+            (9, 12)
+        );
+    });
+}
