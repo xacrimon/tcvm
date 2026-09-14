@@ -239,12 +239,19 @@ macro_rules! helpers {
         /// the continuation; a native target runs inline — synchronously the
         /// continuation payload fires immediately, otherwise the call suspends
         /// through the executor (`schedule_meta_call` installs the pending
-        /// action / error frame). A non-callable target raises.
+        /// action / error frame). A non-callable target raises `$$err`, an
+        /// `OpError` variant applied to the target: `Call` by default, but
+        /// `__index`/`__newindex` chains pass `Index`, since the reference
+        /// indexes a non-function metamethod value rather than calling it.
         #[allow(unused_macros)]
         macro_rules! invoke_metamethod {
-            ($$meta:expr, $$args:expr, $$cont:expr) => {{
+            ($$meta:expr, $$args:expr, $$cont:expr) => {
+                invoke_metamethod!($$meta, $$args, $$cont, Call)
+            };
+            ($$meta:expr, $$args:expr, $$cont:expr, $$err:ident) => {{
+                let __mm_meta: Value<'gc> = $$meta;
                 let __mm_cont: Continuation = $$cont;
-                match schedule_meta_call($ctx, $thread, $$meta, $$args, __mm_cont, $ip) {
+                match schedule_meta_call($ctx, $thread, __mm_meta, $$args, __mm_cont, $ip) {
                     MetaDispatch::Lua { new_ip, new_base } => {
                         $ip = new_ip;
                         $registers = unsafe { $thread.stack.as_mut_ptr().add(new_base) };
@@ -284,7 +291,7 @@ macro_rules! helpers {
                     // Native target suspended (or errored): the executor will
                     // resume / unwind from the installed frame state.
                     MetaDispatch::Suspended => return,
-                    MetaDispatch::Unresolvable => raise!(OpError::Call($$meta)),
+                    MetaDispatch::Unresolvable => raise!(OpError::$$err(__mm_meta)),
                 }
             }};
         }
@@ -392,7 +399,7 @@ macro_rules! table_get_slow_body {
                     results_base: 0,
                     nret: 0,
                 };
-                invoke_metamethod!(__mm_func, &[__mm_recv, __k], __cont);
+                invoke_metamethod!(__mm_func, &[__mm_recv, __k], __cont, Index);
             }
             IndexChain::Exhausted => raise!(OpError::IndexChainLoop),
         }
@@ -427,7 +434,7 @@ macro_rules! userdata_get_slow_body {
                     results_base: 0,
                     nret: 0,
                 };
-                invoke_metamethod!(__mm_func, &[__mm_recv, __k], __cont);
+                invoke_metamethod!(__mm_func, &[__mm_recv, __k], __cont, Index);
             }
             Ok(IndexChain::Exhausted) => raise!(OpError::IndexChainLoop),
         }
@@ -460,7 +467,7 @@ macro_rules! table_set_slow_body {
                     results_base: 0,
                     nret: 0,
                 };
-                invoke_metamethod!(__mm_func, &[__mm_recv, __k, __new_val], __cont);
+                invoke_metamethod!(__mm_func, &[__mm_recv, __k, __new_val], __cont, Index);
             }
             NewIndexChain::Exhausted => raise!(OpError::NewIndexChainLoop),
         }
@@ -1140,7 +1147,7 @@ extern "rust-preserve-none" fn op_self_slow<'gc>(
                 results_base: 0,
                 nret: 0,
             };
-            invoke_metamethod!(func, &[receiver, key], cont);
+            invoke_metamethod!(func, &[receiver, key], cont, Index);
         }
         IndexChain::Exhausted => raise!(OpError::IndexChainLoop),
     }
@@ -1189,7 +1196,7 @@ extern "rust-preserve-none" fn op_self_nontable<'gc>(
                 results_base: 0,
                 nret: 0,
             };
-            invoke_metamethod!(func, &[receiver, key], cont);
+            invoke_metamethod!(func, &[receiver, key], cont, Index);
         }
         IndexChain::Exhausted => raise!(OpError::IndexChainLoop),
     }
