@@ -1,13 +1,15 @@
-use crate::dmm::{Collect, Gc, RefLock};
+use std::pin::Pin;
+
+use crate::dmm::{Collect, Gc, RefLock, Trace};
 use crate::env::function::Function;
-use crate::env::thread::{CallSite, Frame, LuaFrame, PendingAction, ThreadStatus};
-use crate::env::{Thread, Value};
+use crate::env::thread::{CallSite, Frame, LuaFrame, PendingAction, ThreadState, ThreadStatus};
+use crate::env::{Error, Stack, Thread, Value};
 use crate::lua::RuntimeError;
 use crate::lua::context::Context;
 use crate::lua::convert::{FromMultiValue, IntoMultiValue};
 use crate::vm;
 use crate::vm::interp::{Continuation, ContinuationPayload};
-use crate::vm::sequence::CallbackAction;
+use crate::vm::sequence::{BoxSequence, CallbackAction, Execution, Sequence, SequencePoll};
 
 #[derive(Clone, Copy, PartialEq, Eq, Collect)]
 #[collect(internal, require_static)]
@@ -649,7 +651,7 @@ fn pump_sequence<'gc>(
         let ts: &mut crate::env::thread::ThreadState<'gc> = &mut ts;
         let stack_view =
             crate::env::function::Stack::new(&mut ts.stack, &mut ts.top, call_site.bottom);
-        let exec = Execution::new(top);
+        let exec = Execution::new(top, &ts.frames);
         if let Some(err) = pending_error {
             seq.error(ctx, exec, err, stack_view)
         } else {
@@ -929,13 +931,97 @@ fn apply_native_continuation<'gc>(
     ts.set_top(caller_top);
 }
 
+/// Call an `xpcall` message handler with `err` above the failing frames
+/// (`luaG_errormsg`). A `HandlerSequence` frame collects its result and
+/// re-raises it, marked handled, so the unwind then proceeds to the catcher
+/// without consulting the handler again.
+fn run_message_handler<'gc>(
+    ts: &mut ThreadState<'gc>,
+    ctx: Context<'gc>,
+    handler: Function<'gc>,
+    err: Error<'gc>,
+) -> Result<(), RuntimeError> {
+    // Stage above every live register. The innermost Lua frame's window is
+    // the highest on this thread (a sequence above it, e.g. the catcher
+    // itself when its callee failed immediately, may have left `top` inside
+    // that window), but a raising sequence can also have pushed `top` past
+    // it.
+    let slot = ts
+        .frames
+        .iter()
+        .rev()
+        .find_map(|f| match f {
+            Frame::Lua(lf) => Some(lf.base + lf.closure.proto.max_stack_size as usize),
+            _ => None,
+        })
+        .unwrap_or(0)
+        .max(ts.top);
+    ts.ensure_slots(slot + 2);
+    ts.stack[slot] = Value::function(handler);
+    ts.stack[slot + 1] = err.value();
+    ts.set_top(slot + 2);
+    ts.frames.push(Frame::Sequence {
+        seq: BoxSequence::new(ctx.mutation(), HandlerSequence),
+        call_site: CallSite {
+            bottom: slot,
+            func_idx: slot,
+            returns: 0,
+            cont: None,
+        },
+        pending_error: None,
+    });
+    schedule_call_at(ts, ctx, slot, handler, 0)
+}
+
+/// Completion of an `xpcall` message handler: its first result becomes the
+/// error value; an error inside the handler is "error in error handling".
+struct HandlerSequence;
+
+unsafe impl<'gc> Collect<'gc> for HandlerSequence {
+    const NEEDS_TRACE: bool = false;
+}
+
+impl<'gc> Sequence<'gc> for HandlerSequence {
+    fn trace_pointers(&self, _cc: &mut dyn Trace<'gc>) {}
+
+    fn poll(
+        self: Pin<&mut Self>,
+        _ctx: Context<'gc>,
+        _exec: Execution<'gc, '_>,
+        stack: Stack<'gc, '_>,
+    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
+        let value = if stack.is_empty() {
+            Value::nil()
+        } else {
+            stack.get(0)
+        };
+        Err(Error::new(value).mark_handled())
+    }
+
+    fn error(
+        self: Pin<&mut Self>,
+        ctx: Context<'gc>,
+        _exec: Execution<'gc, '_>,
+        _err: Error<'gc>,
+        _stack: Stack<'gc, '_>,
+    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
+        Err(Error::from_str(ctx, "error in error handling")
+            .with_level(0)
+            .mark_handled())
+    }
+}
+
 /// Walk a thread's frame stack popping Lua/Wait frames (closing upvalues
 /// at each `bottom`) until a `Sequence` frame can catch the error.
+///
+/// If the nearest catcher has a message handler (`xpcall`), the handler
+/// runs first, on top of the still-intact failing frames; see
+/// `run_message_handler`.
 ///
 /// On no-catcher: if the thread isn't the bottom of the executor's
 /// thread stack, route the error to the resumer's `Frame::WaitThread`
 /// and pop the inner thread. This lets a coroutine error propagate to
-/// the resumer's `PCallSequence::error`. If the thread *is* the bottom,
+/// the resumer's `ProtectedCall::error`. If the thread *is* the bottom,
 /// surface as `RuntimeError::Lua` to the host.
 fn unwind_error<'gc>(
     exec: Executor<'gc>,
@@ -949,6 +1035,22 @@ fn unwind_error<'gc>(
             Some(Frame::Error(e)) => e,
             _ => unreachable!(),
         };
+        if !err.is_handled() {
+            // Only the nearest catcher's handler applies (`L->errfunc`); a
+            // plain `pcall` in between shadows an outer `xpcall`.
+            let handler = ts
+                .frames
+                .iter()
+                .rev()
+                .find_map(|f| match f {
+                    Frame::Sequence { seq, .. } => Some(seq.message_handler()),
+                    _ => None,
+                })
+                .flatten();
+            if let Some(handler) = handler {
+                return run_message_handler(&mut ts, ctx, handler, err);
+            }
+        }
         loop {
             match ts.frames.last() {
                 Some(Frame::Lua(lf)) => {
