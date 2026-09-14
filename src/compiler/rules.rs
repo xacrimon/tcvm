@@ -1626,9 +1626,12 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
     // expansion slots, and indices that don't bind to a target. Each
     // entry corresponds to target index `i` (not RHS index — they align
     // except when multi-return fills multiple targets from one RHS).
-    let any_const_target = targets
+    let list_modifier = item.modifier();
+    let modifiers: Vec<_> = targets
         .iter()
-        .any(|t| matches!(t.modifier(), Some(DeclModifier::Const)));
+        .map(|t| t.modifier().max(list_modifier))
+        .collect();
+    let any_const_target = modifiers.contains(&Some(DeclModifier::Const));
     let mut target_const_vals: Vec<Option<ConstVal>> = if any_const_target {
         vec![None; num_targets]
     } else {
@@ -1720,8 +1723,7 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
             .ok_or_else(|| ice("ident without name"))?
             .to_owned();
 
-        let modifier = target.modifier();
-        let kind = match modifier {
+        let kind = match modifiers[i] {
             // The `Const` arm is only reachable when at least one target
             // had the `Const` modifier, which is exactly when
             // `target_const_vals` was allocated to `num_targets` entries.

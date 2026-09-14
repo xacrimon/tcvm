@@ -1,0 +1,88 @@
+---
+source: src/parser/mod.rs
+expression: syntax_tree
+---
+Root@0..98
+  DeclStmt@0..19
+    Local@0..5 "local"
+    Const@5..12 "<const>"
+    AssignList@12..15
+      DeclTarget@12..13
+        Ident@12..13
+          Ident@12..13 "a"
+      Comma@13..14 ","
+      DeclTarget@14..15
+        Ident@14..15
+          Ident@14..15 "b"
+    Assign@15..16 "="
+    ExprList@16..19
+      LiteralExpr@16..17
+        Int@16..17 "1"
+      Comma@17..18 ","
+      LiteralExpr@18..19
+        Int@18..19 "2"
+  DeclStmt@19..36
+    Local@19..24 "local"
+    Const@24..31 "<const>"
+    AssignList@31..32
+      DeclTarget@31..32
+        Ident@31..32
+          Ident@31..32 "c"
+    Assign@32..33 "="
+    ExprList@33..36
+      BinOp@33..36
+        Ident@33..34
+          Ident@33..34 "a"
+        Plus@34..35 "+"
+        Ident@35..36
+          Ident@35..36 "b"
+  DeclStmt@36..53
+    Local@36..41 "local"
+    Close@41..48 "<close>"
+    AssignList@48..49
+      DeclTarget@48..49
+        Ident@48..49
+          Ident@48..49 "d"
+    Assign@49..50 "="
+    ExprList@50..53
+      LiteralExpr@50..53
+        Nil@50..53 "nil"
+  DeclStmt@53..81
+    Local@53..58 "local"
+    Const@58..65 "<const>"
+    AssignList@65..75
+      DeclTarget@65..73
+        Ident@65..66
+          Ident@65..66 "e"
+        Close@66..73 "<close>"
+      Comma@73..74 ","
+      DeclTarget@74..75
+        Ident@74..75
+          Ident@74..75 "f"
+    Assign@75..76 "="
+    ExprList@76..81
+      LiteralExpr@76..79
+        Nil@76..79 "nil"
+      Comma@79..80 ","
+      LiteralExpr@80..81
+        Int@80..81 "5"
+  ReturnStmt@81..98
+    Return@81..87 "return"
+    ExprList@87..98
+      Ident@87..88
+        Ident@87..88 "a"
+      Comma@88..89 ","
+      Ident@89..90
+        Ident@89..90 "b"
+      Comma@90..91 ","
+      Ident@91..92
+        Ident@91..92 "c"
+      Comma@92..93 ","
+      Ident@93..94
+        Ident@93..94 "d"
+      Comma@94..95 ","
+      Ident@95..96
+        Ident@95..96 "e"
+      Comma@96..97 ","
+      Ident@97..98
+        Ident@97..98 "f"
