@@ -1745,11 +1745,9 @@ fn expand_count(n: usize) -> Result<u8, CompileError> {
 /// `[base, base + n)` for a `local`/`global` multi-target decl.
 ///
 /// Unlike a plain `CALL` — whose func slot is forced to `freereg` (== `base`)
-/// by the call setup — a method call first evaluates the receiver. When the
-/// receiver is a temp it occupies `base`, so `SELF` lands the func one slot
-/// *above* `base` and the `CALL` results land at `[base + 1, ...)`. (When the
-/// receiver is an existing local below `base`, no temp is consumed and the
-/// results already land at `base`.) Detect the offset and MOVE the results
+/// by the call setup — a method call first evaluates the receiver, and
+/// `SELF` only reuses its slot when it is the topmost temp. Otherwise the
+/// call block lands *above* `base`; detect the offset and MOVE the results
 /// down into `[base, base + n)` so the caller's nil-pad / SETTABUP loop —
 /// which keys off `base` and `freereg` — reads the right slots. Ascending
 /// order is collision-free since every destination is strictly below its
@@ -3428,7 +3426,14 @@ fn emit_method_call_setup(
 
     let key_idx = ctx.alloc_string_constant(method_name.as_bytes())?;
 
-    let func = ctx.alloc_register()?;
+    // A receiver temp at the top of the stack is dead once SELF has read it,
+    // so reuse its slot as `func` (luac's `luaK_self`). Leaving it below the
+    // call block would make a MULTRET consumer see it as an extra value.
+    let func = if object.0 >= ctx.chunk.nactvar && object.0 + 1 == ctx.chunk.freereg {
+        object
+    } else {
+        ctx.alloc_register()?
+    };
     ctx.emit(Instruction::self_(func, object, KIdx(key_idx)));
 
     // SELF writes both `func` and `func+1` (self); reserve the second

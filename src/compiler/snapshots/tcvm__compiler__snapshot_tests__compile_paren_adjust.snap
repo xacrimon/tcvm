@@ -70,13 +70,11 @@ expression: output
   ;   U0 = local R5
   ; code:
   0000  GETUPVAL        R0 U0
-  0001  SELF            R1 R0 K0  ; "meth"
-  0002  CALL            R1 args=2 ret=3
-  0003  MOVE            R0 R1
-  0004  MOVE            R1 R2
-  0005  MOVE            R2 R0
-  0006  MOVE            R3 R1
-  0007  RETURN          R2 count=3
+  0001  SELF            R0 R0 K0  ; "meth"
+  0002  CALL            R0 args=2 ret=3
+  0003  MOVE            R2 R0
+  0004  MOVE            R3 R1
+  0005  RETURN          R2 count=3
 
 ; prototype 3:
   ; function (params=0, vararg=true, stack=12, upvalues=0)
