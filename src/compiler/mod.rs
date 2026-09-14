@@ -24,13 +24,14 @@ pub fn compile_chunk<'gc>(
     rules::compile(ctx, root, lines, interner, source)
 }
 
+/// 1-based source line; 0 when the error has no position (internal errors).
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Collect)]
 #[collect(internal, require_static)]
-pub struct LineNumber(pub u64);
+pub struct LineNumber(pub u32);
 
 impl fmt::Display for LineNumber {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", u128::from(self.0) + 1)
+        write!(f, "{}", self.0)
     }
 }
 

@@ -417,7 +417,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     fn err(&self, kind: CompileErrorKind) -> CompileError {
         CompileError {
             kind,
-            line_number: LineNumber(u64::from(self.cur_line.saturating_sub(1))),
+            line_number: LineNumber(self.cur_line),
         }
     }
 
