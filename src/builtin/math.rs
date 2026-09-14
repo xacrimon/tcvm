@@ -10,6 +10,7 @@ use crate::builtin::util::{
 use crate::env::{
     Error, Function, LuaString, NativeContext, NativeFn, Stack, Table, Userdata, Value,
 };
+use crate::vm::num;
 use crate::vm::sequence::CallbackAction;
 
 pub fn load<'gc>(ctx: Context<'gc>) {
@@ -272,9 +273,9 @@ fn select_extreme<'gc>(
         } else if let (Some(x), Some(y)) = (lhs.get_float(), rhs.get_float()) {
             x < y
         } else if let (Some(x), Some(y)) = (lhs.get_integer(), rhs.get_float()) {
-            (x as f64) < y
+            num::lt_int_float(x, y)
         } else if let (Some(x), Some(y)) = (lhs.get_float(), rhs.get_integer()) {
-            x < (y as f64)
+            num::lt_float_int(x, y)
         } else if let (Some(x), Some(y)) = (lhs.get_string(), rhs.get_string()) {
             x < y
         } else {

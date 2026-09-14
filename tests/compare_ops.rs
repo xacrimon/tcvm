@@ -79,3 +79,18 @@ fn ordering_against_out_of_range_floats_and_nan() {
         "0"
     );
 }
+
+#[test]
+fn math_max_min_are_exact_at_the_i64_boundary() {
+    // `math.max`/`math.min` select with `<`, so a lossy `as f64` on the
+    // integer would keep maxinteger over 2^63 (regression for #85).
+    assert_eq!(
+        truth(&[
+            "math.type(math.max(math.maxinteger, 2^63)) == 'float'",
+            "math.max(bigf, big) == big",
+            "math.min(big, bigf) == bigf",
+            "math.type(math.min(math.mininteger, -2^63 - 2048)) == 'float'",
+        ]),
+        "1111"
+    );
+}
