@@ -436,8 +436,8 @@ ast_node!(BinaryOp, T![bin_op]);
 impl BinaryOp {
     pub fn op_token(&self) -> Option<&SyntaxToken> {
         match self.0.children_with_tokens().nth(1)? {
-            NodeOrToken::Node(_) => unreachable!(),
             NodeOrToken::Token(t) => Some(t),
+            NodeOrToken::Node(_) => None,
         }
     }
 

@@ -153,13 +153,22 @@ mod tests {
     #[test]
     fn line_map_skips_trivia() {
         let mut cache = NodeCache::new();
-        let parse = parse(&mut cache, "a = 1\n\n-- c\n  b = 2\n\n");
-        assert!(parse.reports.is_empty());
+        let p = parse(&mut cache, "a = 1\n\n-- c\n  b = 2\n\n");
+        assert!(p.reports.is_empty());
         // Tokens: `a` `=` `1` on line 1 at packed offsets 0..3, then `b` `=`
         // `2` on line 4 at 3..6.
-        let lines: Vec<u32> = (0..6).map(|o| parse.lines.line_at(o)).collect();
+        let lines: Vec<u32> = (0..6).map(|o| p.lines.line_at(o)).collect();
         assert_eq!(lines, [1, 1, 1, 4, 4, 4]);
-        assert_eq!(parse.lines.last_line(), 4);
+        assert_eq!(p.lines.last_line(), 4);
+
+        // Newlines inside a token (a long string here) count towards the
+        // tokens after it.
+        let p = parse(&mut cache, "x = [[a\nb]]\ny = 1");
+        assert!(p.reports.is_empty());
+        // `x` `=` `[[a\nb]]` occupy packed offsets 0..9; `y` starts at 9.
+        assert_eq!(p.lines.line_at(2), 1);
+        assert_eq!(p.lines.line_at(9), 3);
+        assert_eq!(p.lines.last_line(), 3);
     }
 
     // Assignment targets must be variables (#67); a parenthesised primary
