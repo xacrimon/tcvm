@@ -1757,7 +1757,7 @@ extern "rust-preserve-none" fn op_call<'gc>(
                         let code_start = frame.closure.proto.code.as_ptr();
                         frame.pc = unsafe { ip.offset_from_unsigned(code_start) };
                     }
-                    thread.frames.push(Frame::Error(err));
+                    thread.raise(ctx, err);
                     return Ok(());
                 }
             };
@@ -1885,10 +1885,15 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
             let action = match invoke_native(ctx, thread, nc, args_base, argc) {
                 Ok(a) => a,
                 Err(err) => {
-                    // Tailcall + native error: pop the tailcalling Lua
-                    // frame first (it's morally already gone), then push
-                    // Frame::Error onto the now-top frame for the
-                    // executor's unwinder.
+                    // Tailcall + native error: the message still names the
+                    // tailcalling Lua frame (a native never really tail
+                    // calls in the reference either), so locate it before
+                    // popping that frame and installing the unwind marker.
+                    if let Some(frame) = thread.top_lua_mut() {
+                        let code_start = frame.closure.proto.code.as_ptr();
+                        frame.pc = unsafe { ip.offset_from_unsigned(code_start) };
+                    }
+                    let err = crate::vm::debug::locate(ctx, thread, err);
                     let cur_base = thread.top_lua().unwrap().base;
                     close_upvalues(ctx.mutation(), thread, cur_base);
                     close_tbc_vars(ctx.mutation(), thread, cur_base);
@@ -3101,7 +3106,7 @@ fn schedule_native_meta_call<'gc>(
         Err(err) => {
             // Mirror op_call's native-error path: a Frame::Error lets the
             // executor's unwinder route to the nearest catcher (e.g. pcall).
-            thread.frames.push(Frame::Error(err));
+            thread.raise(ctx, err);
             return MetaDispatch::Suspended;
         }
     };
@@ -3126,7 +3131,7 @@ fn schedule_native_meta_call<'gc>(
                 ctx,
                 "metamethod/iterator native cannot tail-call into Lua across the continuation",
             );
-            thread.frames.push(Frame::Error(err));
+            thread.raise(ctx, err);
             MetaDispatch::Suspended
         }
         // Suspending native (`Yield`/`Resume`/`Sequence`). Park the full

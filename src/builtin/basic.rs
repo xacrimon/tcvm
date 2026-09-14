@@ -98,16 +98,20 @@ fn lua_dofile<'gc>(
     todo!()
 }
 
-/// `error(message [, level])` — raise `message` as a Lua error. The `level`
-/// argument selects which call frame's position is prepended to a string
-/// message; we don't yet have native access to caller line info, so the value
-/// is raised verbatim (equivalent to `level == 0`). TODO(#27): prepend
-/// `"source:line:"` for `level >= 1` once reachable from a native frame.
+/// `error(message [, level])`. The position prefix for `level >= 1` is
+/// applied when the error is raised (`ThreadState::raise`); levels beyond
+/// `u8` can't name a frame anyway, so they clamp to "no position".
 fn lua_error<'gc>(
-    _nctx: NativeContext<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
     stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    Err(Error::new(stack.get(0)))
+    let level = if stack.len() >= 2 && !stack.get(1).is_nil() {
+        let l = util::check_integer(nctx.ctx, stack.get(1), "error", 2)?;
+        u8::try_from(l.max(0)).unwrap_or(u8::MAX)
+    } else {
+        1
+    };
+    Err(Error::new(stack.get(0)).with_level(level))
 }
 
 fn lua_getmetatable<'gc>(

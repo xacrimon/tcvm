@@ -578,7 +578,7 @@ fn schedule_call_at<'gc>(
                 // (e.g. a PCallSequence wrapping coroutine.resume). Returning
                 // Err here would short-circuit past any catcher pushed by
                 // apply_pending_action / pump_sequence before this call.
-                ts.frames.push(Frame::Error(e));
+                ts.raise(ctx, e);
                 return Ok(());
             }
         };
@@ -760,7 +760,7 @@ fn pump_sequence<'gc>(
             schedule_thread_resume(exec, ctx, top, target, call_site.bottom, call_site)?;
         }
         Err(err) => {
-            top.borrow_mut(mc).frames.push(Frame::Error(err));
+            top.borrow_mut(mc).raise(ctx, err);
         }
     }
     Ok(PumpOutcome::Continue)

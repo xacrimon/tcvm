@@ -22,3 +22,4 @@ pub use package::load as load_package;
 pub use string::load as load_string;
 pub use table::load as load_table;
 pub use utf8::load as load_utf8;
+pub use util::basic_tostring;

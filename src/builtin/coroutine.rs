@@ -331,4 +331,16 @@ impl<'gc> Sequence<'gc> for UnwrapResumeSequence {
         // Pass through whatever the inner left on the stack.
         Ok(SequencePoll::Return)
     }
+
+    fn error(
+        self: Pin<&mut Self>,
+        _ctx: Context<'gc>,
+        _exec: Execution<'gc, '_>,
+        err: Error<'gc>,
+        _stack: Stack<'gc, '_>,
+    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
+        // `auxwrap` re-raises a string error with the wrap caller's position
+        // prepended on top of the coroutine's own.
+        Err(err.with_level(1))
+    }
 }

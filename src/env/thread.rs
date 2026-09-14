@@ -2,6 +2,7 @@ use crate::dmm::{Collect, Gc, Mutation, Ref, RefLock, RefMut, Trace};
 use crate::env::error::Error;
 use crate::env::function::{Function, LuaClosure, Upvalue};
 use crate::env::value::Value;
+use crate::lua::Context;
 use crate::vm::interp::Continuation;
 use crate::vm::sequence::{BoxSequence, CallbackAction};
 
@@ -273,6 +274,13 @@ impl<'gc> ThreadState<'gc> {
                 unsafe { std::hint::unreachable_unchecked() }
             }
         }
+    }
+
+    /// Raise `err` on this thread: resolve its position prefix against the
+    /// current frames, then install the unwinding marker for the executor.
+    pub(crate) fn raise(&mut self, ctx: Context<'gc>, err: Error<'gc>) {
+        let err = crate::vm::debug::locate(ctx, self, err);
+        self.frames.push(Frame::Error(err));
     }
 
     /// Push a new Lua frame. `base` must sit directly above the function
