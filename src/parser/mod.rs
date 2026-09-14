@@ -85,6 +85,7 @@ mod tests {
     test!(comment, "test-files/comment.lua");
     test!(declare, "test-files/declare.lua");
     test!(function, "test-files/function.lua");
+    test!(method_def, "test-files/method_def.lua");
     test!(hello, "test-files/hello.lua");
     test!(if, "test-files/if.lua");
     test!(jens, "test-files/jens.lua");

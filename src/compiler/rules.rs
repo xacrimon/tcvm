@@ -15,7 +15,7 @@ use crate::lua;
 use crate::parser::syntax::{
     Assign, BinaryOp, BinaryOperator, Break, Decl, DeclModifier, Do, Expr, ForGen, ForNum, Func,
     FuncCall, FuncExpr, Global, Goto, Ident, If, Index, Label, Literal, LiteralValue, MethodCall,
-    PrefixOp, PrefixOperator, Repeat, Return, Root, Stmt, Table, TableEntry, While,
+    PrefixOp, PrefixOperator, Repeat, Return, Root, Stmt, Table, TableEntry, VarArgParam, While,
 };
 use crate::vm::num;
 
@@ -1333,7 +1333,7 @@ fn compile_function_to_chunk<'gc, 'a>(
     interner: &'a TokenInterner,
     parent_capture: Option<&'a mut dyn UpvalueResolver>,
     stmts: impl Iterator<Item = Stmt>,
-    params: impl Iterator<Item = Ident>,
+    params: impl Iterator<Item = String>,
     is_vararg: bool,
     vararg_name: Option<String>,
     arity: u8,
@@ -1370,13 +1370,10 @@ fn compile_function_to_chunk<'gc, 'a>(
 
     // Allocate registers for parameters and bind them in scope
     let mut num_params: u8 = 0;
-    for param in params {
-        let name = param
-            .name(interner)
-            .ok_or_else(|| ice("parameter without name"))?;
+    for name in params {
         let reg = ctx.alloc_register()?;
         ctx.define(
-            name.to_owned(),
+            name,
             VariableData {
                 register: reg,
                 kind: VarKind::Reg,
@@ -2244,7 +2241,13 @@ fn compile_lvalue(
             let key = compile_indexed_subexpr(ctx, k, target_local_regs)?;
             Ok(Lvalue::Indexed { table, key })
         }
-        Expr::BinaryOp(binop) if binop.op() == Some(BinaryOperator::Property) => {
+        // `Method` only reaches here as the target of `function t:m()`.
+        Expr::BinaryOp(binop)
+            if matches!(
+                binop.op(),
+                Some(BinaryOperator::Property | BinaryOperator::Method)
+            ) =>
+        {
             let t = binop.lhs().ok_or_else(|| ice("binop without lhs"))?;
             let f = binop.rhs().ok_or_else(|| ice("binop without rhs"))?;
             let table = compile_indexed_subexpr(ctx, t, target_local_regs)?;
@@ -2440,16 +2443,38 @@ fn compile_func_body(
     item: &Func,
     dst: Option<RegisterIndex>,
 ) -> Result<RegisterIndex, CompileError> {
-    let params: Vec<_> = item.args().map(|a| a.collect()).unwrap_or_default();
-    let stmts: Vec<_> = item.block().map(|b| b.collect()).unwrap_or_default();
-    let arity = params.len() as u8;
-    let vararg = item.vararg();
+    // `function t:m(...)` is sugar for `t.m = function(self, ...)`.
+    let implicit_self = item.is_method().then(|| "self".to_owned());
+    let params = implicit_self
+        .into_iter()
+        .chain(param_names(ctx, item.args()))
+        .collect();
+    emit_closure(ctx, params, item.block(), item.vararg(), dst)
+}
+
+fn param_names(ctx: &Ctx, args: Option<impl Iterator<Item = Ident>>) -> Vec<String> {
+    args.into_iter()
+        .flatten()
+        .filter_map(|p| p.name(ctx.interner).map(|n| n.to_string()))
+        .collect()
+}
+
+/// Compile a function body into a nested prototype and emit `CLOSURE` for
+/// it into `dst`.
+fn emit_closure(
+    ctx: &mut Ctx,
+    params: Vec<String>,
+    block: Option<impl Iterator<Item = Stmt>>,
+    vararg: Option<VarArgParam>,
+    dst: Option<RegisterIndex>,
+) -> Result<RegisterIndex, CompileError> {
+    let stmts: Vec<_> = block.map(|b| b.collect()).unwrap_or_default();
     let is_vararg = vararg.is_some();
     let vararg_name = vararg
         .and_then(|v| v.name())
         .and_then(|i| i.name(ctx.interner).map(str::to_owned));
 
-    let proto = compile_nested(ctx, stmts, params, is_vararg, vararg_name, arity)?;
+    let proto = compile_nested(ctx, stmts, params, is_vararg, vararg_name)?;
 
     let proto_idx = ctx.chunk.prototypes.len() as u16;
     ctx.chunk.prototypes.push(proto);
@@ -2468,11 +2493,11 @@ fn compile_func_body(
 fn compile_nested<'gc>(
     ctx: &mut Ctx<'gc, '_>,
     stmts: Vec<Stmt>,
-    params: Vec<Ident>,
+    params: Vec<String>,
     is_vararg: bool,
     vararg_name: Option<String>,
-    arity: u8,
 ) -> Result<Gc<'gc, Prototype<'gc>>, CompileError> {
+    let arity = params.len() as u8;
     let lua_ctx = ctx.ctx;
     let interner = ctx.interner;
     // The child inherits the declarations in scope at its definition site,
@@ -2663,23 +2688,8 @@ fn compile_expr_func(
     item: FuncExpr,
     dst: Option<RegisterIndex>,
 ) -> Result<RegisterIndex, CompileError> {
-    let params: Vec<_> = item.args().map(|a| a.collect()).unwrap_or_default();
-    let stmts: Vec<_> = item.block().map(|b| b.collect()).unwrap_or_default();
-    let arity = params.len() as u8;
-    let vararg = item.vararg();
-    let is_vararg = vararg.is_some();
-    let vararg_name = vararg
-        .and_then(|v| v.name())
-        .and_then(|i| i.name(ctx.interner).map(str::to_owned));
-
-    let proto = compile_nested(ctx, stmts, params, is_vararg, vararg_name, arity)?;
-
-    let proto_idx = ctx.chunk.prototypes.len() as u16;
-    ctx.chunk.prototypes.push(proto);
-    let dst = ctx.dst_or_alloc(dst)?;
-    ctx.emit(Instruction::closure(dst, ProtoIdx(proto_idx)));
-
-    Ok(dst)
+    let params = param_names(ctx, item.args());
+    emit_closure(ctx, params, item.block(), item.vararg(), dst)
 }
 
 fn compile_property_key(

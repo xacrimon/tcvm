@@ -491,6 +491,15 @@ impl Func {
         self.0.first_child().and_then(Expr::cast)
     }
 
+    /// `function t:m()` — the target is a `:` bin_op and the body takes an
+    /// implicit leading `self` parameter.
+    pub fn is_method(&self) -> bool {
+        matches!(
+            self.target(),
+            Some(Expr::BinaryOp(b)) if b.op() == Some(BinaryOperator::Method)
+        )
+    }
+
     pub fn args(&self) -> Option<impl Iterator<Item = Ident> + '_> {
         Some(self.0.children().nth(1)?.children().filter_map(Ident::cast))
     }
