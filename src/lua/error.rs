@@ -17,10 +17,6 @@ pub enum LoadError {
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
-    /// Internal VM error (type mismatch, missing metamethod, etc.). Carries
-    /// the offending PC for debugging.
-    #[error("vm error at pc {pc}")]
-    Opcode { pc: usize },
     #[error("bad executor mode")]
     BadMode,
     /// The main thread yielded to the host before completing. `finish`/

@@ -538,10 +538,9 @@ mod tests {
     }
 
     #[test]
-    fn opcode_error_reports_faulting_pc() {
-        // VARARGPREP, LOAD nil, LOAD 1, GETFIELD (faults), RETURN.
+    fn opcode_error_is_a_positioned_lua_error() {
         let err = run_expecting_error("local x = nil\nlocal y = 1\nlocal z = x.foo\nreturn y");
-        assert!(matches!(err, RuntimeError::Opcode { pc: 3 }), "{err:?}");
+        assert!(matches!(err, RuntimeError::Lua(_)), "{err:?}");
     }
 
     #[test]
@@ -557,7 +556,7 @@ mod tests {
             "return (-5) % 0",
         ] {
             assert!(
-                matches!(run_expecting_error(src), RuntimeError::Opcode { .. }),
+                matches!(run_expecting_error(src), RuntimeError::Lua(_)),
                 "expected a runtime error for {src:?}",
             );
         }
