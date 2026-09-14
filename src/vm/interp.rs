@@ -571,10 +571,9 @@ fn impl_error<'gc>(
     thread: &mut ThreadState<'gc>,
     ip: *const Instruction,
 ) {
-    let frame = thread.top_lua_mut().expect("raise! outside a Lua frame");
     // `ip` already points past the faulting instruction (see `dispatch!`),
     // which is the convention `LuaFrame::pc` uses.
-    frame.pc = unsafe { ip.offset_from_unsigned(frame.closure.proto.code.as_ptr()) };
+    save_pc(thread, ip);
     let msg = crate::vm::debug::op_error_message(ctx, thread, kind);
     thread.raise(ctx, crate::env::Error::from_str(ctx, &msg));
 }
