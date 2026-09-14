@@ -1684,6 +1684,7 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
     }
 
     // Bind each target name to its slot and handle `<close>` / `<const>`.
+    let mut has_close = false;
     for (i, target) in targets.into_iter().enumerate() {
         let name = target
             .name()
@@ -1705,6 +1706,9 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
         let reg = RegisterIndex(base + i as u8);
 
         if matches!(kind, VarKind::ToClose) {
+            if mem::replace(&mut has_close, true) {
+                return Err(err(CompileErrorKind::MultipleClose, LineNumber(0)));
+            }
             ctx.emit(Instruction::tbc(reg));
             ctx.mark_close(reg)?;
         }
