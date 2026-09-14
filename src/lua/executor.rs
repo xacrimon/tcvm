@@ -351,14 +351,13 @@ impl<'gc> Executor<'gc> {
 
         // Results are the window `stack[bottom..top]` recorded by the
         // `Result` status; the vec itself may run past `top` (grow-not-shrink).
-        let values: Vec<Value<'gc>> = {
+        let result = {
             let ts = thread.borrow();
             let ThreadStatus::Result { bottom } = ts.status else {
                 return Err(RuntimeError::BadMode);
             };
-            ts.window(bottom).to_vec()
+            R::from_multi_value(ts.window(bottom)).map_err(RuntimeError::from)
         };
-        let result = R::from_multi_value(&values).map_err(RuntimeError::from);
 
         // Clear the thread so it can be reused.
         {
