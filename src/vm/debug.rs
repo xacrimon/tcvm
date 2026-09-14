@@ -55,10 +55,10 @@ pub(crate) fn frame_line(frame: &Frame<'_>) -> Option<u32> {
 /// `luaL_where`: `"chunk:line: "` for call `level`, counting the raising
 /// native as 0 and `ts.frames.last()` as 1. Empty when that level isn't a
 /// Lua function (or doesn't exist), exactly like the reference.
-pub(crate) fn where_prefix(ts: &ThreadState<'_>, level: u8) -> Vec<u8> {
+pub(crate) fn where_prefix(ts: &ThreadState<'_>, level: usize) -> Vec<u8> {
     let Some(frame) = level
         .checked_sub(1)
-        .and_then(|depth| ts.frames.iter().rev().nth(depth as usize))
+        .and_then(|depth| ts.frames.iter().rev().nth(depth))
     else {
         return Vec::new();
     };

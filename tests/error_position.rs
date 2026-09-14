@@ -74,6 +74,19 @@ fn error_level_two_names_the_callers_caller() {
     );
     // Level 2 from the main chunk has no Lua frame above it.
     assert_eq!(raise_str("error(\"m\", 2)"), "m");
+    assert_eq!(raise_str("error(\"m\", -1)"), "m");
+}
+
+#[test]
+fn deep_levels_count_every_frame() {
+    // 257 recursive frames on line 2 plus the main chunk on line 5.
+    let src = |level: u32| {
+        format!(
+            "local function f(n)\n  if n > 0 then f(n - 1)\n  else error(\"m\", {level}) end\nend\nf(257)"
+        )
+    };
+    assert_eq!(raise_str(&src(259)), "t:5: m");
+    assert_eq!(raise_str(&src(260)), "m");
 }
 
 #[test]

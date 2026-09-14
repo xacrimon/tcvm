@@ -16,7 +16,7 @@ pub struct Error<'gc> {
     /// `luaL_where` convention. Applied once by `ThreadState::raise`, which
     /// resets it to 0 so re-raising along the unwind path never prefixes
     /// twice.
-    level: u8,
+    level: usize,
 }
 
 impl<'gc> Error<'gc> {
@@ -31,7 +31,7 @@ impl<'gc> Error<'gc> {
         Error::new(Value::string(s)).with_level(1)
     }
 
-    pub fn with_level(self, level: u8) -> Self {
+    pub fn with_level(self, level: usize) -> Self {
         Error { level, ..self }
     }
 
@@ -39,7 +39,7 @@ impl<'gc> Error<'gc> {
         self.value
     }
 
-    pub fn level(self) -> u8 {
+    pub fn level(self) -> usize {
         self.level
     }
 }

@@ -98,15 +98,15 @@ fn lua_dofile<'gc>(
 }
 
 /// `error(message [, level])`. The position prefix for `level >= 1` is
-/// applied when the error is raised (`ThreadState::raise`); levels beyond
-/// `u8` can't name a frame anyway, so they clamp to "no position".
+/// applied when the error is raised (`ThreadState::raise`); a negative level
+/// names no frame, like any level past the bottom of the stack.
 fn lua_error<'gc>(
     nctx: NativeContext<'gc, '_>,
     stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let level = if stack.len() >= 2 && !stack.get(1).is_nil() {
         let l = util::check_integer(nctx.ctx, stack.get(1), "error", 2)?;
-        u8::try_from(l.max(0)).unwrap_or(u8::MAX)
+        usize::try_from(l).unwrap_or(0)
     } else {
         1
     };
