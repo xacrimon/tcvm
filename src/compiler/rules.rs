@@ -307,6 +307,10 @@ struct VariableData {
 struct ScopeMark {
     freereg: u8,
     nactvar: u8,
+    /// A local of this scope was captured as an upvalue, so leaving the
+    /// scope must CLOSE it (a loop back-edge would otherwise hand every
+    /// iteration's closure the same open upvalue).
+    captured: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -344,8 +348,10 @@ struct Ctx<'gc, 'a> {
     ctx: lua::Context<'gc>,
     chunk: Chunk<'gc>,
 
-    /// Stack of break-target labels for nested loops.
-    control_end_label: Vec<u16>,
+    /// Stack of `(break label, scope depth)` for nested loops; the depth
+    /// is `scope_marks.len()` at loop entry, so scopes at or above it are
+    /// the ones a `break` leaves.
+    control_end_label: Vec<(u16, usize)>,
 
     /// Lexical scope stack: each frame maps variable names to register data.
     scope: Vec<HashMap<String, VariableData, RandomState>>,
@@ -1067,12 +1073,16 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         self.scope_marks.push(ScopeMark {
             freereg: self.chunk.freereg,
             nactvar: self.chunk.nactvar,
+            captured: false,
         });
         self.scope_close.push(Vec::new());
         self.scope_globals.push(self.globals.clone());
     }
 
-    fn pop_scope(&mut self) -> Result<Vec<RegisterIndex>, CompileError> {
+    /// Pop the scope, returning the register to `CLOSE` at when leaving it
+    /// (if it holds to-be-closed or captured locals).
+    fn pop_scope(&mut self) -> Result<Option<RegisterIndex>, CompileError> {
+        let close = self.close_reg_from(self.scope_marks.len() - 1);
         self.scope.pop().ok_or_else(|| ice("missing scope"))?;
         let mark = self
             .scope_marks
@@ -1088,7 +1098,21 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             .ok_or_else(|| ice("missing scope global mark"))?;
         self.scope_close
             .pop()
-            .ok_or_else(|| ice("missing scope close list"))
+            .ok_or_else(|| ice("missing scope close list"))?;
+        Ok(close)
+    }
+
+    /// Register to `CLOSE` at when jumping out of every scope from `depth`
+    /// up, or `None` if none of them needs closing. A captured local closes
+    /// from the scope's base; TBC registers are listed in declaration order.
+    fn close_reg_from(&self, depth: usize) -> Option<RegisterIndex> {
+        let marks = &self.scope_marks[depth..];
+        if marks.iter().any(|m| m.captured) {
+            return Some(RegisterIndex(marks[0].nactvar));
+        }
+        self.scope_close[depth..]
+            .iter()
+            .find_map(|regs| regs.first().copied())
     }
 
     fn mark_close(&mut self, register: RegisterIndex) -> Result<(), CompileError> {
@@ -1211,7 +1235,8 @@ impl<'gc, 'a> UpvalueResolver for Ctx<'gc, 'a> {
         //    the child as `Const` — no upvalue is allocated here. Plain
         //    locals (and `<const>` whose initializer didn't fold) flow
         //    back as a `ParentLocal` descriptor.
-        if let Some(data) = self.resolve_local(name) {
+        if let Some(depth) = self.scope.iter().rposition(|s| s.contains_key(name)) {
+            let data = &self.scope[depth][name];
             let kind = data.kind;
             let register = data.register;
             // A `global` decl in scope here shadows anything more outer and
@@ -1222,6 +1247,10 @@ impl<'gc, 'a> UpvalueResolver for Ctx<'gc, 'a> {
             }
             if let VarKind::Const(Some(v)) = kind {
                 return Some(ChildResolution::Const(v));
+            }
+            // Scope 0 is the function's outermost block; RETURN closes it.
+            if depth > 0 {
+                self.scope_marks[depth].captured = true;
             }
             // Capturing the named vararg as an upvalue forces materialization:
             // the upvalue must point at a real table, not the below-base region.
@@ -1270,9 +1299,8 @@ where
     ctx.push_scope();
     compile(ctx)?;
 
-    let close_regs = ctx.pop_scope()?;
-    if let Some(first) = close_regs.first() {
-        ctx.emit(Instruction::close(*first));
+    if let Some(reg) = ctx.pop_scope()? {
+        ctx.emit(Instruction::close(reg));
     }
 
     Ok(())
@@ -1283,7 +1311,7 @@ where
     F: FnOnce(&mut Ctx) -> Result<(), CompileError>,
 {
     let label = ctx.new_label();
-    ctx.control_end_label.push(label);
+    ctx.control_end_label.push((label, ctx.scope_marks.len()));
     compile(ctx)?;
     ctx.set_label(label, ctx.next_offset());
     ctx.control_end_label.pop();
@@ -1448,11 +1476,10 @@ fn compile_function_to_chunk<'gc, 'a>(
         ctx.emit(Instruction::ret(Reg(0), 1));
     }
 
-    let close_regs = ctx.pop_scope()?;
-    if let Some(first) = close_regs.first() {
+    if let Some(reg) = ctx.pop_scope()? {
         // Insert CLOSE before the final RETURN/TAILCALL
         let return_instr = ctx.chunk.tape.pop().unwrap();
-        ctx.chunk.tape.push(Instruction::close(*first));
+        ctx.chunk.tape.push(Instruction::close(reg));
         ctx.chunk.tape.push(return_instr);
     }
 
@@ -3628,10 +3655,14 @@ fn resolve_vararg_base(ctx: &Ctx, expr: &Expr) -> Option<u8> {
 // ---------------------------------------------------------------------------
 
 fn compile_break(ctx: &mut Ctx, _item: Break) -> Result<(), CompileError> {
-    let label = *ctx
+    let (label, depth) = *ctx
         .control_end_label
         .last()
         .ok_or_else(|| ice("break outside of loop"))?;
+    // The jump skips the scope-exit CLOSEs of every scope it leaves.
+    if let Some(reg) = ctx.close_reg_from(depth) {
+        ctx.emit(Instruction::close(reg));
+    }
     ctx.emit_jump(label);
     Ok(())
 }
@@ -3770,19 +3801,22 @@ fn compile_while(ctx: &mut Ctx, item: While) -> Result<(), CompileError> {
         let cond_expr = item.cond().ok_or_else(|| ice("while without condition"))?;
         let break_list = compile_branch_cond_false(ctx, cond_expr)?;
 
-        // Compile body
-        if let Some(block) = item.block() {
-            let stmts: Vec<_> = block.stmts().map(|s| s.collect()).unwrap_or_default();
-            for stmt in stmts {
-                compile_stmt(ctx, stmt)?;
+        // The body is its own scope so its exit CLOSE runs every iteration.
+        scope_lexical(ctx, |ctx| {
+            if let Some(block) = item.block() {
+                let stmts: Vec<_> = block.stmts().map(|s| s.collect()).unwrap_or_default();
+                for stmt in stmts {
+                    compile_stmt(ctx, stmt)?;
+                }
             }
-        }
+            Ok(())
+        })?;
 
         // Jump back to condition check
         ctx.emit_jump(loop_start);
 
         // Patch all "condition false" jumps to the post-loop break target.
-        let break_label = *ctx
+        let (break_label, _) = *ctx
             .control_end_label
             .last()
             .ok_or_else(|| ice("missing break label"))?;
@@ -3819,7 +3853,23 @@ fn compile_repeat(ctx: &mut Ctx, item: Repeat) -> Result<(), CompileError> {
             // the loop.
             let cond_expr = item.cond().ok_or_else(|| ice("repeat without condition"))?;
             let false_list = compile_branch_cond_false(ctx, cond_expr)?;
-            ctx.patch_to(false_list, loop_start_off);
+            let depth = ctx.scope_marks.len() - 1;
+            match ctx.close_reg_from(depth) {
+                None => ctx.patch_to(false_list, loop_start_off),
+                // The condition can see the body's locals, so the back-edge
+                // must CLOSE after evaluating it; the truthy exit skips this
+                // and falls out through the scope-exit CLOSE.
+                Some(reg) => {
+                    let exit = ctx.new_label();
+                    let loop_start = ctx.new_label();
+                    ctx.set_label(loop_start, loop_start_off);
+                    ctx.emit_jump(exit);
+                    ctx.patch_to_here(false_list);
+                    ctx.emit(Instruction::close(reg));
+                    ctx.emit_jump(loop_start);
+                    ctx.set_label(exit, ctx.next_offset());
+                }
+            }
 
             Ok(())
         })
@@ -3928,23 +3978,6 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
         // sole role here is as the free_reg cutoff.
         ctx.adjust_locals(3);
 
-        // base+3 is the visible loop variable. Lua 5.5 makes the
-        // numeric-for counter read-only (`#define LOOPVARKIND RDKCONST`
-        // in upstream `lparser.c`); assignment inside the body is
-        // rejected at compile time.
-        let loop_var = ctx.alloc_register()?;
-        assert_eq!(loop_var.0, base.0 + 3);
-        ctx.define(
-            counter_name,
-            VariableData {
-                register: loop_var,
-                kind: VarKind::Const(None),
-            },
-        )?;
-        // Promote the loop variable to an active local so upvalue-capture
-        // logic sees it and temp reclaims don't touch it.
-        ctx.adjust_locals(1);
-
         let loop_body = ctx.new_label();
         let loop_end = ctx.new_label();
 
@@ -3953,13 +3986,34 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
 
         ctx.set_label(loop_body, ctx.next_offset());
 
-        // Body
-        if let Some(block) = item.block() {
-            let stmts: Vec<_> = block.stmts().map(|s| s.collect()).unwrap_or_default();
-            for stmt in stmts {
-                compile_stmt(ctx, stmt)?;
+        // The loop variable lives in the body scope, so a captured counter is
+        // CLOSEd before FORLOOP and each iteration's closure gets its own.
+        scope_lexical(ctx, |ctx| {
+            // base+3 is the visible loop variable. Lua 5.5 makes the
+            // numeric-for counter read-only (`#define LOOPVARKIND RDKCONST`
+            // in upstream `lparser.c`); assignment inside the body is
+            // rejected at compile time.
+            let loop_var = ctx.alloc_register()?;
+            assert_eq!(loop_var.0, base.0 + 3);
+            ctx.define(
+                counter_name,
+                VariableData {
+                    register: loop_var,
+                    kind: VarKind::Const(None),
+                },
+            )?;
+            // Promote the loop variable to an active local so upvalue-capture
+            // logic sees it and temp reclaims don't touch it.
+            ctx.adjust_locals(1);
+
+            if let Some(block) = item.block() {
+                let stmts: Vec<_> = block.stmts().map(|s| s.collect()).unwrap_or_default();
+                for stmt in stmts {
+                    compile_stmt(ctx, stmt)?;
+                }
             }
-        }
+            Ok(())
+        })?;
 
         // FORLOOP: increment and jump back if still in range
         ctx.emit_jump_instr(loop_body, Instruction::forloop(base, 0));
@@ -4042,28 +4096,6 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
         // so body subexpressions can't reclaim them via free_reg.
         ctx.adjust_locals(3);
 
-        // Allocate registers for loop variables and bind them
-        let num_loop_vars = targets.len();
-        for (i, target_ident) in targets.into_iter().enumerate() {
-            let name = target_ident
-                .name(ctx.interner)
-                .ok_or_else(|| ice("ident without name"))?
-                .to_owned();
-            let reg = ctx.alloc_register()?;
-            assert_eq!(reg.0, base.0 + 3 + i as u8);
-            // Generic-for control variables are likewise read-only in
-            // Lua 5.5 (LOOPVARKIND).
-            ctx.define(
-                name,
-                VariableData {
-                    register: reg,
-                    kind: VarKind::Const(None),
-                },
-            )?;
-        }
-        // Promote the loop variables to active locals.
-        ctx.adjust_locals(num_loop_vars as u8);
-
         let loop_body = ctx.new_label();
         let loop_test = ctx.new_label();
 
@@ -4072,13 +4104,35 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
 
         ctx.set_label(loop_body, ctx.next_offset());
 
-        // Body
-        if let Some(block) = item.block() {
-            let stmts: Vec<_> = block.stmts().map(|s| s.collect()).unwrap_or_default();
-            for stmt in stmts {
-                compile_stmt(ctx, stmt)?;
+        // Loop variables live in the body scope (see `compile_for_num`).
+        scope_lexical(ctx, |ctx| {
+            for (i, target_ident) in targets.into_iter().enumerate() {
+                let name = target_ident
+                    .name(ctx.interner)
+                    .ok_or_else(|| ice("ident without name"))?
+                    .to_owned();
+                let reg = ctx.alloc_register()?;
+                assert_eq!(reg.0, base.0 + 3 + i as u8);
+                // Generic-for control variables are likewise read-only in
+                // Lua 5.5 (LOOPVARKIND).
+                ctx.define(
+                    name,
+                    VariableData {
+                        register: reg,
+                        kind: VarKind::Const(None),
+                    },
+                )?;
             }
-        }
+            ctx.adjust_locals(num_targets as u8);
+
+            if let Some(block) = item.block() {
+                let stmts: Vec<_> = block.stmts().map(|s| s.collect()).unwrap_or_default();
+                for stmt in stmts {
+                    compile_stmt(ctx, stmt)?;
+                }
+            }
+            Ok(())
+        })?;
 
         ctx.set_label(loop_test, ctx.next_offset());
 
