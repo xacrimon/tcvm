@@ -130,9 +130,6 @@ impl<'cache, 'source> State<'cache, 'source> {
     }
 }
 
-pub const INDEX_BINDING_POWER: i32 = 22;
-pub const CALL_BINDING_POWER: i32 = 22;
-
 pub fn prefix_binding_power(op: SyntaxKind) -> ((), i32) {
     match op {
         T![not] | T![+] | T![-] | T![#] | T![~] => ((), 21),
@@ -153,7 +150,6 @@ pub fn infix_binding_power(op: SyntaxKind) -> Option<(i32, i32)> {
         T![+] | T![-] => (17, 18),
         T![*] | T![/] | T![D/] | T![%] => (19, 20),
         T![^] => (22, 21),
-        T![.] | T![:] => (24, 23),
         _ => return None,
     })
 }

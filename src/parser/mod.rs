@@ -119,6 +119,7 @@ mod tests {
     test!(global_const_star, "test-files/global_const_star.lua");
     test!(vararg_param, "test-files/vararg_param.lua");
     test!(paren_prefix, "test-files/paren_prefix.lua");
+    test!(call_sugar, "test-files/call_sugar.lua");
 
     // A malformed tail with no statement-recovery token before EOF (e.g. the
     // adjacent `Float Float` from `1.2.3` / `10..20`) must yield a parse error
@@ -149,6 +150,10 @@ mod tests {
             "a.b, f() = 1, 2",
             "(a) + b = 1",
             "(f()) = 1",
+            // Suffixes only follow a prefixexp (#150).
+            "x = {} (1)",
+            "x = 1 + 2 [1]",
+            "x = 'a' .. 'b' :upper()",
         ] {
             let mut cache = NodeCache::new();
             let (_tree, reports) = parse(&mut cache, src);

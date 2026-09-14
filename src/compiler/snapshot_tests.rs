@@ -161,6 +161,7 @@ test!(if_empty_nested, "test-files/if_empty_nested.lua");
 test!(if_empty_goto, "test-files/if_empty_goto.lua");
 test!(paren_adjust, "test-files/paren_adjust.lua");
 test!(paren_prefix, "test-files/paren_prefix.lua");
+test!(call_sugar, "test-files/call_sugar.lua");
 test!(
     global_multiret_expand,
     "test-files/global_multiret_expand.lua"
