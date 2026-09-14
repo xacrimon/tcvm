@@ -2903,9 +2903,8 @@ pub(crate) enum MetaDispatch {
 /// callable target, shifting args right by one on each hop to prepend the
 /// current callee as the first argument (Lua 5.5 `tryfuncTM` behavior).
 /// Returns the resolved target and the (possibly adjusted) `nargs`, or
-/// `None` if the chain is unresolvable: non-callable value, variadic call
-/// with `__call` (see #46), or `MAX_TAG_LOOP` exhaustion. Callers raise on
-/// `None`.
+/// `None` if the chain is unresolvable: non-callable value, `nargs`
+/// overflow, or `MAX_TAG_LOOP` exhaustion. Callers raise on `None`.
 #[inline]
 fn resolve_call_chain<'gc>(
     ctx: Context<'gc>,
@@ -2928,18 +2927,23 @@ fn resolve_call_chain<'gc>(
         if mm.is_nil() {
             return None;
         }
-        if nargs == 0 {
-            // See #46: variadic + __call not yet supported.
-            return None;
-        }
-        let actual_args = nargs as usize - 1;
+        // A MULTRET call (`nargs == 0`) carries its count in `thread.top`.
+        let actual_args = if nargs == 0 {
+            thread.top - (func_idx + 1)
+        } else {
+            nargs as usize - 1
+        };
         thread.ensure_slots(func_idx + 2 + actual_args);
         for i in (0..actual_args).rev() {
             thread.stack[func_idx + 2 + i] = thread.stack[func_idx + 1 + i];
         }
         thread.stack[func_idx + 1] = func_val;
         thread.stack[func_idx] = mm;
-        nargs += 1;
+        if nargs == 0 {
+            thread.set_top(thread.top + 1);
+        } else {
+            nargs = nargs.checked_add(1)?;
+        }
     }
     None
 }
