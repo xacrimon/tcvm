@@ -43,9 +43,8 @@ pub fn load<'gc>(ctx: Context<'gc>) {
 }
 
 /// `assert(v [, message, ...])` — if `v` is truthy, return all arguments
-/// unchanged; otherwise raise `message` (default `"assertion failed!"`). The
-/// message is raised verbatim, matching `assert`'s delegation to `error`
-/// (no position prefix is added when the caller is a native frame).
+/// unchanged; otherwise raise `message` (default `"assertion failed!"`) as
+/// `error(message)` would, i.e. with the caller's position when it's a string.
 fn lua_assert<'gc>(
     nctx: NativeContext<'gc, '_>,
     stack: Stack<'gc, '_>,
@@ -61,7 +60,7 @@ fn lua_assert<'gc>(
         return Ok(CallbackAction::Return);
     }
     if stack.len() >= 2 {
-        Err(Error::new(stack.get(1)))
+        Err(Error::new(stack.get(1)).with_level(1))
     } else {
         Err(Error::from_str(nctx.ctx, "assertion failed!"))
     }
@@ -98,16 +97,20 @@ fn lua_dofile<'gc>(
     todo!()
 }
 
-/// `error(message [, level])` — raise `message` as a Lua error. The `level`
-/// argument selects which call frame's position is prepended to a string
-/// message; we don't yet have native access to caller line info, so the value
-/// is raised verbatim (equivalent to `level == 0`). TODO(#27): prepend
-/// `"source:line:"` for `level >= 1` once reachable from a native frame.
+/// `error(message [, level])`. The position prefix for `level >= 1` is
+/// applied when the error is raised (`ThreadState::raise`); a negative level
+/// names no frame, like any level past the bottom of the stack.
 fn lua_error<'gc>(
-    _nctx: NativeContext<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
     stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    Err(Error::new(stack.get(0)))
+    let level = if stack.len() >= 2 && !stack.get(1).is_nil() {
+        let l = util::check_integer(nctx.ctx, stack.get(1), "error", 2)?;
+        usize::try_from(l).unwrap_or(0)
+    } else {
+        1
+    };
+    Err(Error::new(stack.get(0)).with_level(level))
 }
 
 fn lua_getmetatable<'gc>(

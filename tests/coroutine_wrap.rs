@@ -40,8 +40,9 @@ fn boomer<'gc>(
 }
 
 /// A wrapped function that errors propagates the error to the wrap-caller
-/// (no `(false, msg)` wrapping). With no Lua `pcall` yet, the error
-/// surfaces all the way to the host as `RuntimeError::Lua`.
+/// (no `(false, msg)` wrapping), with the wrap call's own position prepended
+/// like `auxwrap` does. With no Lua `pcall` yet, the error surfaces all the
+/// way to the host as `RuntimeError::Lua`.
 #[test]
 fn wrap_rethrows_error_to_caller() {
     let mut lua = Lua::new();
@@ -55,7 +56,7 @@ fn wrap_rethrows_error_to_caller() {
             let chunk = ctx.load(
                 "local f = coroutine.wrap(function() boom() end)\n\
                  f()",
-                Some("wrap_rethrow"),
+                Some("=wrap"),
             )?;
             Ok(ctx.stash(Executor::start(ctx, chunk, ())))
         })
@@ -70,5 +71,5 @@ fn wrap_rethrows_error_to_caller() {
         let s = e.value().get_string().expect("error payload is a string");
         std::str::from_utf8(s.as_bytes()).unwrap().to_owned()
     });
-    assert_eq!(msg, "boom");
+    assert_eq!(msg, "wrap:2: wrap:1: boom");
 }

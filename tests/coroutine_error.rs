@@ -13,7 +13,8 @@ fn boomer<'gc>(
     Err(Error::from_str(nctx.ctx, "boom"))
 }
 
-/// Coroutine calls `boomer()` (a native that errors); resume sees `(false, "boom")`.
+/// Coroutine calls `boomer()` (a native that errors); resume sees `(false, msg)`
+/// with the message positioned at the coroutine's calling line.
 #[test]
 fn native_error_inside_coroutine() {
     let mut lua = Lua::new();
@@ -29,9 +30,9 @@ fn native_error_inside_coroutine() {
                 "local co = coroutine.create(function() boom() end)\n\
                  local ok, msg = coroutine.resume(co)\n\
                  if ok then return -1\n\
-                 elseif msg == 'boom' then return 1\n\
+                 elseif msg == 'coro:1: boom' then return 1\n\
                  else return 0 end",
-                Some("native_error_in_coro"),
+                Some("=coro"),
             )?;
             Ok(ctx.stash(Executor::start(ctx, chunk, ())))
         })
@@ -122,7 +123,7 @@ fn close_error_dead_returns_false_and_error() {
                  coroutine.resume(c)\n\
                  local ok, e = coroutine.close(c)\n\
                  if ok ~= false then return 30 end\n\
-                 if e ~= 'x' then return 31 end\n\
+                 if e ~= 'close:1: x' then return 31 end\n\
                  if coroutine.close(c) ~= true then return 32 end\n\
                  local d = coroutine.create(function() return 1 end)\n\
                  coroutine.resume(d)\n\
@@ -133,7 +134,7 @@ fn close_error_dead_returns_false_and_error() {
                  if ok2 ~= false then return 34 end\n\
                  if type(v) ~= 'table' or v.code ~= 7 then return 35 end\n\
                  return 1",
-                Some("close_error_dead_returns_false_and_error"),
+                Some("=close"),
             )?;
             Ok(ctx.stash(Executor::start(ctx, chunk, ())))
         })

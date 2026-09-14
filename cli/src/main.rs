@@ -79,11 +79,8 @@ fn main() {
         match e {
             RuntimeError::Lua(stashed) => {
                 let msg = lua.enter(|ctx| {
-                    let err = ctx.fetch(&stashed);
-                    match err.value().get_string() {
-                        Some(s) => String::from_utf8_lossy(s.as_bytes()).into_owned(),
-                        None => format!("(error object is a {} value)", err.value().type_name()),
-                    }
+                    let s = ctx.fetch(&stashed).message(ctx);
+                    String::from_utf8_lossy(s.as_bytes()).into_owned()
                 });
                 eprintln!("tcvm: {msg}");
             }

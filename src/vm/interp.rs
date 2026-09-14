@@ -1706,10 +1706,7 @@ extern "rust-preserve-none" fn op_call<'gc>(
     match target {
         CallTarget::Lua(closure) => {
             let new_base = func_idx + 1;
-            if let Some(frame) = thread.top_lua_mut() {
-                let code_start = frame.closure.proto.code.as_ptr();
-                frame.pc = unsafe { ip.offset_from_unsigned(code_start) };
-            }
+            save_pc(thread, ip);
             thread.ensure_slots(new_base + closure.proto.max_stack_size as usize);
             // `nargs == 0` is the MULTRET sentinel: read the count from `thread.top`.
             let caller_provided = if nargs == 0 {
@@ -1753,11 +1750,8 @@ extern "rust-preserve-none" fn op_call<'gc>(
                     // PCallSequence under coroutine.resume). Persist
                     // caller's pc first so re-entry would work if anything
                     // catches and resumes.
-                    if let Some(frame) = thread.top_lua_mut() {
-                        let code_start = frame.closure.proto.code.as_ptr();
-                        frame.pc = unsafe { ip.offset_from_unsigned(code_start) };
-                    }
-                    thread.frames.push(Frame::Error(err));
+                    save_pc(thread, ip);
+                    thread.raise(ctx, err);
                     return Ok(());
                 }
             };
@@ -1793,10 +1787,7 @@ extern "rust-preserve-none" fn op_call<'gc>(
                     // Suspension path: persist caller's pc, stash the
                     // action on the thread for the executor to translate
                     // into frame ops, then exit the dispatch chain.
-                    if let Some(frame) = thread.top_lua_mut() {
-                        let code_start = frame.closure.proto.code.as_ptr();
-                        frame.pc = unsafe { ip.offset_from_unsigned(code_start) };
-                    }
+                    save_pc(thread, ip);
                     thread.pending_action = Some(PendingAction {
                         action,
                         call_site: CallSite {
@@ -1885,10 +1876,12 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
             let action = match invoke_native(ctx, thread, nc, args_base, argc) {
                 Ok(a) => a,
                 Err(err) => {
-                    // Tailcall + native error: pop the tailcalling Lua
-                    // frame first (it's morally already gone), then push
-                    // Frame::Error onto the now-top frame for the
-                    // executor's unwinder.
+                    // Tailcall + native error: the message still names the
+                    // tailcalling Lua frame (a native never really tail
+                    // calls in the reference either), so locate it before
+                    // popping that frame and installing the unwind marker.
+                    save_pc(thread, ip);
+                    let err = crate::vm::debug::locate(ctx, thread, err);
                     let cur_base = thread.top_lua().unwrap().base;
                     close_upvalues(ctx.mutation(), thread, cur_base);
                     close_tbc_vars(ctx.mutation(), thread, cur_base);
@@ -2546,6 +2539,20 @@ fn write_upvalue<'gc>(
     }
 }
 
+/// Persist the top Lua frame's resume point before leaving the dispatch
+/// chain (call, suspension, error), so the executor re-enters at the
+/// instruction after the one at `ip` and `debug::frame_line` can locate it.
+///
+/// SAFETY: `ip` points into the proto's `code` (the handler chain only ever
+/// advances it within that slice), so the offset is in bounds.
+#[inline]
+fn save_pc<'gc>(thread: &mut ThreadState<'gc>, ip: *const Instruction) {
+    if let Some(frame) = thread.top_lua_mut() {
+        let code_start = frame.closure.proto.code.as_ptr();
+        frame.pc = unsafe { ip.offset_from_unsigned(code_start) };
+    }
+}
+
 /// Invoke a native callback. Presents the callback a window whose logical
 /// length is `argc` (`thread.top` seeded to `args_base + argc`); the backing
 /// vec is grown to physically cover the window but is NEVER shrunk, so a
@@ -3005,10 +3012,7 @@ fn schedule_meta_call<'gc>(
     // Save caller's pc; no decisions here depend on knowing the final target.
     // The native suspend path relies on this so the executor re-enters the
     // caller frame at the instruction following the one that scheduled us.
-    if let Some(frame) = thread.top_lua_mut() {
-        let code_start = frame.closure.proto.code.as_ptr();
-        frame.pc = unsafe { caller_ip.offset_from_unsigned(code_start) };
-    }
+    save_pc(thread, caller_ip);
 
     // schedule_meta_call is only reachable from inside a handler via
     // invoke_metamethod!, so an active caller frame is always present.
@@ -3101,7 +3105,7 @@ fn schedule_native_meta_call<'gc>(
         Err(err) => {
             // Mirror op_call's native-error path: a Frame::Error lets the
             // executor's unwinder route to the nearest catcher (e.g. pcall).
-            thread.frames.push(Frame::Error(err));
+            thread.raise(ctx, err);
             return MetaDispatch::Suspended;
         }
     };
@@ -3126,7 +3130,7 @@ fn schedule_native_meta_call<'gc>(
                 ctx,
                 "metamethod/iterator native cannot tail-call into Lua across the continuation",
             );
-            thread.frames.push(Frame::Error(err));
+            thread.raise(ctx, err);
             MetaDispatch::Suspended
         }
         // Suspending native (`Yield`/`Resume`/`Sequence`). Park the full
