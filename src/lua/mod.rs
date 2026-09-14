@@ -531,6 +531,13 @@ mod tests {
     }
 
     #[test]
+    fn opcode_error_reports_faulting_pc() {
+        // VARARGPREP, LOAD nil, LOAD 1, GETFIELD (faults), RETURN.
+        let err = run_expecting_error("local x = nil\nlocal y = 1\nlocal z = x.foo\nreturn y");
+        assert!(matches!(err, RuntimeError::Opcode { pc: 3 }), "{err:?}");
+    }
+
+    #[test]
     fn integer_div_mod_by_zero_raises() {
         // Lua raises on integer `//` / `%` by a zero divisor. Previously this
         // panicked the VM (`wrapping_div` / `wrapping_rem` by zero); now it
