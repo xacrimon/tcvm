@@ -91,6 +91,8 @@ pub enum CompileErrorKind {
     JumpLocal,
     #[error("jump offset overflow")]
     JumpOverflow,
+    #[error("multiple to-be-closed variables in local list")]
+    MultipleClose,
 }
 
 #[derive(Debug, Clone, Error)]
