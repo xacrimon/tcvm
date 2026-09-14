@@ -149,6 +149,10 @@ mod tests {
             "a.b, f() = 1, 2",
             "(a) + b = 1",
             "(f()) = 1",
+            // Suffixes only follow a prefixexp (#150).
+            "x = {} (1)",
+            "x = 1 + 2 [1]",
+            "x = 'a' .. 'b' :upper()",
         ] {
             let mut cache = NodeCache::new();
             let (_tree, reports) = parse(&mut cache, src);

@@ -4,8 +4,7 @@ use super::{
     machinery::{CompletedMarker, Marker, token_is_expr_start},
 };
 use crate::parser::machinery::{
-    CALL_BINDING_POWER, INDEX_BINDING_POWER, infix_binding_power, prefix_binding_power,
-    token_is_literal, token_is_unary_op,
+    infix_binding_power, prefix_binding_power, token_is_literal, token_is_unary_op,
 };
 
 const STATEMENT_RECOVERY: &[SyntaxKind] = &[
@@ -112,28 +111,6 @@ impl<'cache, 'source> Parser<'cache, 'source> {
         loop {
             let t = self.at();
 
-            if t == T![:] {
-                let n = lhs.precede(self, T![method_call]);
-                lhs = self.r_method_call(n)?;
-                continue;
-            }
-
-            if t == T!['('] && CALL_BINDING_POWER >= min_bp {
-                let n = lhs.precede(self, T![func_call]);
-                let _rhs = self.r_func_call_args()?;
-                lhs = n.complete(self);
-                continue;
-            }
-
-            if t == T!['['] && INDEX_BINDING_POWER >= min_bp {
-                let n = lhs.precede(self, T![index]);
-                self.expect(T!['[']);
-                let _rhs = self.r_expr()?;
-                self.expect(T![']']);
-                lhs = n.complete(self);
-                continue;
-            }
-
             if let Some((l_bp, r_bp)) = infix_binding_power(t) {
                 if l_bp < min_bp {
                     break;
@@ -141,13 +118,7 @@ impl<'cache, 'source> Parser<'cache, 'source> {
 
                 let n = lhs.precede(self, T![bin_op]);
                 self.expect(t);
-
-                if T![.] == t {
-                    let _rhs = self.r_ident()?;
-                } else {
-                    let _rhs = self.r_expr_inner(r_bp)?;
-                }
-
+                let _rhs = self.r_expr_inner(r_bp)?;
                 lhs = n.complete(self);
                 continue;
             }
@@ -158,12 +129,14 @@ impl<'cache, 'source> Parser<'cache, 'source> {
         Some(lhs)
     }
 
+    /// `simpleexp` plus `suffixedexp`: call / index / field / method suffixes
+    /// only ever follow a Name or `(exp)` primary, so they are parsed there
+    /// and never in the binary-operator loop.
     fn r_expr_lhs(&mut self) -> Option<CompletedMarker> {
         match self.at() {
-            T![ident] => self.r_ident(),
+            T![ident] | T!['('] => self.r_simple_expr(true),
             T![...] => self.r_vararg(),
             T!['{'] => self.r_table(),
-            T!['('] => self.r_paren(),
             T![function] => self.r_func(true),
             t if token_is_unary_op(t) => self.r_expr_unary(),
             t if token_is_literal(t) => self.r_literal(),
