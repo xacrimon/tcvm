@@ -2205,7 +2205,7 @@ fn compile_lvalue(
             if let Some((kind, register)) = local.filter(|_| !shadow_global) {
                 if kind.is_const() {
                     return Err(err(
-                        CompileErrorKind::Internal("assignment to const variable"),
+                        CompileErrorKind::ConstAssign(name.to_owned()),
                         LineNumber(0),
                     ));
                 }
@@ -2213,7 +2213,7 @@ fn compile_lvalue(
             } else if !shadow_global && let Some(resolution) = ctx.resolve_or_capture(name) {
                 match resolution {
                     ResolvedName::Const(_) => Err(err(
-                        CompileErrorKind::Internal("assignment to const variable"),
+                        CompileErrorKind::ConstAssign(name.to_owned()),
                         LineNumber(0),
                     )),
                     ResolvedName::Upvalue(idx) => Ok(Lvalue::Upvalue { idx }),
@@ -2229,7 +2229,7 @@ fn compile_lvalue(
                 if let Some(kind) = ctx.globals.decls.get(name).copied() {
                     if kind.is_const() {
                         return Err(err(
-                            CompileErrorKind::ConstGlobalAssign(name.to_owned()),
+                            CompileErrorKind::ConstAssign(name.to_owned()),
                             LineNumber(0),
                         ));
                     }
@@ -2246,7 +2246,7 @@ fn compile_lvalue(
                         // read-only, so undeclared writes are rejected too.
                         DefaultPolicy::Star(GlobalKind::Const) => {
                             return Err(err(
-                                CompileErrorKind::ConstGlobalAssign(name.to_owned()),
+                                CompileErrorKind::ConstAssign(name.to_owned()),
                                 LineNumber(0),
                             ));
                         }

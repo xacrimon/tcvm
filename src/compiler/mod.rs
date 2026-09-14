@@ -72,7 +72,7 @@ pub enum CompileErrorKind {
     #[error("variable '{0}' not declared")]
     UndeclaredGlobal(String),
     #[error("attempt to assign to const variable '{0}'")]
-    ConstGlobalAssign(String),
+    ConstAssign(String),
     #[error("insufficient available registers")]
     Registers,
     #[error("too many upvalues")]

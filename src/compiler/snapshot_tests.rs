@@ -129,6 +129,14 @@ test_err!(
     "test-files/for_counter_readonly_err.lua"
 );
 test_err!(
+    const_local_assign_err,
+    "test-files/const_local_assign_err.lua"
+);
+test_err!(
+    const_upvalue_assign_err,
+    "test-files/const_upvalue_assign_err.lua"
+);
+test_err!(
     global_nested_propagation,
     "test-files/global_nested_propagation.lua"
 );
