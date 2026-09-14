@@ -551,12 +551,15 @@ impl<'cache, 'source> Parser<'cache, 'source> {
         Some(marker.complete(self))
     }
 
+    /// `suffixedexp ::= primaryexp { '.' Name | '[' exp ']' | ':' Name args | args }`
+    /// with `primaryexp ::= Name | '(' exp ')'`. Only suffixes may follow the
+    /// primary — infix operators are not accepted here.
     fn r_simple_expr(&mut self, allow_call: bool) -> Option<CompletedMarker> {
-        if self.at() == T!['('] {
-            return self.r_expr();
-        }
-
-        let mut lhs = self.r_ident()?;
+        let mut lhs = if self.at() == T!['('] {
+            self.r_paren()?
+        } else {
+            self.r_ident()?
+        };
 
         loop {
             let t = self.at();
@@ -602,6 +605,9 @@ impl<'cache, 'source> Parser<'cache, 'source> {
         let assign_list_marker = self.start(T![assign_list]);
         let expr_marker = self.r_simple_expr(true);
         if matches!(self.at(), T![=] | T![,]) {
+            if let Some(m) = &expr_marker {
+                self.check_assign_target(m.kind());
+            }
             self.r_assign(assign_marker, assign_list_marker)
         } else {
             assign_list_marker.abandon(self);
@@ -626,13 +632,31 @@ impl<'cache, 'source> Parser<'cache, 'source> {
     fn r_assign(&mut self, assign_marker: Marker, list_marker: Marker) -> Option<CompletedMarker> {
         while self.at() == T![,] {
             self.expect(T![,]);
-            self.r_simple_expr(true);
+            if let Some(m) = self.r_simple_expr(true) {
+                self.check_assign_target(m.kind());
+            }
         }
 
         list_marker.complete(self);
         self.expect(T![=]);
         self.r_expr_list();
         Some(assign_marker.complete(self))
+    }
+
+    /// `var ::= Name | prefixexp '[' exp ']' | prefixexp '.' Name`. The only
+    /// `bin_op` `r_simple_expr` builds is `.`, so the kind alone suffices.
+    fn check_assign_target(&mut self, kind: SyntaxKind) {
+        if !matches!(kind, T![ident] | T![index] | T![bin_op]) {
+            let label = self
+                .new_label()
+                .with_message("cannot assign to this expression");
+            let error = self
+                .new_error()
+                .with_message("syntax error")
+                .with_label(label)
+                .finish();
+            self.report(error);
+        }
     }
 
     fn r_decl(&mut self) -> Option<CompletedMarker> {

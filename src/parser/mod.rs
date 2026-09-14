@@ -118,6 +118,7 @@ mod tests {
     test!(global_star_nested, "test-files/global_star_nested.lua");
     test!(global_const_star, "test-files/global_const_star.lua");
     test!(vararg_param, "test-files/vararg_param.lua");
+    test!(paren_prefix, "test-files/paren_prefix.lua");
 
     // A malformed tail with no statement-recovery token before EOF (e.g. the
     // adjacent `Float Float` from `1.2.3` / `10..20`) must yield a parse error
@@ -130,6 +131,24 @@ mod tests {
             "print(.5.5)",
             "y = 0x1.2.3",
             "foo @ bar",
+        ] {
+            let mut cache = NodeCache::new();
+            let (_tree, reports) = parse(&mut cache, src);
+            assert!(!reports.is_empty(), "expected a parse error for {src:?}");
+        }
+    }
+
+    // Assignment targets must be variables (#67); a parenthesised primary
+    // only takes suffixes, never infix operators (#68).
+    #[test]
+    fn invalid_assignment_targets_are_rejected() {
+        for src in [
+            "f() = 1",
+            "a:m() = 1",
+            "(a) = 1",
+            "a.b, f() = 1, 2",
+            "(a) + b = 1",
+            "(f()) = 1",
         ] {
             let mut cache = NodeCache::new();
             let (_tree, reports) = parse(&mut cache, src);
