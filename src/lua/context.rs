@@ -85,7 +85,9 @@ impl<'gc> Context<'gc> {
         }
         let root = parser::syntax::Root::new(parse.root)
             .ok_or(LoadError::Internal("parser did not produce a Root node"))?;
-        let name = name.map(|n| LuaString::new(self, n.as_bytes()));
+        // Like Lua's `load`, an unnamed chunk is named by its own text
+        // (rendered as `[string "..."]` in messages).
+        let name = LuaString::new(self, name.unwrap_or(source).as_bytes());
         let proto = compile_chunk(self, &root, &parse.lines, cache.interner(), name)?;
 
         // Main chunk's upvalue 0 is _ENV. Pre-close it onto globals.

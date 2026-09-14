@@ -41,10 +41,10 @@ fn lines_per_instruction() {
 fn function_line_span_and_source() {
     with_proto(|proto| {
         assert_eq!((proto.line_defined, proto.last_line_defined), (0, 0));
-        assert_eq!(proto.source.unwrap().as_bytes(), b"=locs");
+        assert_eq!(proto.source.as_bytes(), b"=locs");
         let f = &proto.prototypes[0];
         assert_eq!((f.line_defined, f.last_line_defined), (7, 9));
-        assert_eq!(f.source.unwrap().as_bytes(), b"=locs");
+        assert_eq!(f.source.as_bytes(), b"=locs");
         assert_eq!(f.line_for_pc(0), Some(8));
     });
 }
@@ -121,5 +121,15 @@ fn loop_control_slots_are_recorded() {
             (proto.locvars[4].start_pc, proto.locvars[4].end_pc),
             (9, 12)
         );
+    });
+}
+
+#[test]
+fn unnamed_chunks_are_named_by_their_source() {
+    let mut lua = Lua::new();
+    lua.load_all();
+    lua.enter(|ctx| {
+        let chunk = ctx.load("return 1", None).expect("load");
+        assert_eq!(chunk.as_lua().unwrap().proto.source.as_bytes(), b"return 1");
     });
 }

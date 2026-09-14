@@ -7,6 +7,7 @@ use paste::paste;
 use super::compile_chunk;
 use super::format::format_prototype;
 use crate::Lua;
+use crate::env::LuaString;
 use crate::parser::{self, syntax::Root};
 
 fn compile_and_format(source: &str) -> String {
@@ -22,7 +23,8 @@ fn compile_and_format(source: &str) -> String {
 
     let mut lua = Lua::new();
     lua.enter(|ctx| {
-        let proto = compile_chunk(ctx, &root, &parse.lines, interner, None).unwrap();
+        let name = LuaString::new(ctx, b"=snapshot");
+        let proto = compile_chunk(ctx, &root, &parse.lines, interner, name).unwrap();
         format_prototype(&proto)
     })
 }
@@ -39,12 +41,13 @@ fn compile_err_and_format(source: &str) -> String {
     let interner = cache.interner();
 
     let mut lua = Lua::new();
-    lua.enter(
-        |ctx| match compile_chunk(ctx, &root, &parse.lines, interner, None) {
+    lua.enter(|ctx| {
+        let name = LuaString::new(ctx, b"=snapshot");
+        match compile_chunk(ctx, &root, &parse.lines, interner, name) {
             Err(e) => format!("{e}"),
             Ok(_) => panic!("expected compile error, got success"),
-        },
-    )
+        }
+    })
 }
 
 macro_rules! test {

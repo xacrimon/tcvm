@@ -37,8 +37,9 @@ pub struct Prototype<'gc> {
     pub needs_vararg_table: bool,
     pub max_stack_size: u8,
     pub num_upvalues: u8,
-    /// Chunk name as given to `load` (`@file`, `=name`, or the source text).
-    pub source: Option<LuaString<'gc>>,
+    /// Chunk name as given to `load` (`@file`, `=name`, or the source text
+    /// itself, which is `load`'s default); shared by nested prototypes.
+    pub source: LuaString<'gc>,
     /// Lines of the `function` keyword and its `end`; both 0 for a main chunk.
     pub line_defined: u32,
     pub last_line_defined: u32,

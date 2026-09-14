@@ -1419,7 +1419,7 @@ pub fn compile<'gc>(
     root: &Root,
     lines: &LineMap,
     interner: &TokenInterner,
-    source: Option<LuaString<'gc>>,
+    source: LuaString<'gc>,
 ) -> Result<Gc<'gc, Prototype<'gc>>, CompileError> {
     // The chunk starts with the implicit `global *` (global-by-default);
     // nested functions inherit a clone of whatever is in scope at their
@@ -1465,15 +1465,14 @@ fn compile_function_to_chunk<'gc, 'a>(
     is_vararg: bool,
     vararg_name: Option<String>,
     arity: u8,
-    source: Option<LuaString<'gc>>,
+    source: LuaString<'gc>,
     span: FuncLines,
     initial_upvalues: Vec<(String, UpValueDescriptor)>,
     globals: GlobalEnv,
 ) -> Result<Chunk<'gc>, CompileError> {
-    let mut chunk = Chunk::new();
+    let mut chunk = Chunk::new(source);
     chunk.is_vararg = is_vararg;
     chunk.arity = arity;
-    chunk.source = source;
     chunk.line_defined = span.defined;
     chunk.last_line_defined = span.last_defined;
 

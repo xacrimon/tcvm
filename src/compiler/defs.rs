@@ -240,7 +240,7 @@ pub struct Chunk<'gc> {
     /// whether fall-through to the implicit RETURN is reachable from a
     /// forward jump (LuaJIT-style `lasttarget`).
     pub(super) last_target: usize,
-    pub(super) source: Option<LuaString<'gc>>,
+    pub(super) source: LuaString<'gc>,
     /// Number of IC slots reserved so far. Incremented once per emitted
     /// GETFIELD/SETFIELD/GETTABUP/SETTABUP. The final count seeds the
     /// prototype's `ic_table` length.
@@ -248,7 +248,7 @@ pub struct Chunk<'gc> {
 }
 
 impl<'gc> Chunk<'gc> {
-    pub fn new() -> Self {
+    pub fn new(source: LuaString<'gc>) -> Self {
         Chunk {
             tape: Vec::new(),
             lineinfo: Vec::new(),
@@ -268,7 +268,7 @@ impl<'gc> Chunk<'gc> {
             labels: Vec::new(),
             jump_patches: Vec::new(),
             last_target: 0,
-            source: None,
+            source,
             next_ic_idx: 0,
         }
     }

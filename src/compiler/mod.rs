@@ -19,7 +19,7 @@ pub fn compile_chunk<'gc>(
     root: &syntax::Root,
     lines: &LineMap,
     interner: &TokenInterner,
-    source: Option<LuaString<'gc>>,
+    source: LuaString<'gc>,
 ) -> Result<Gc<'gc, Prototype<'gc>>, CompileError> {
     rules::compile(ctx, root, lines, interner, source)
 }
