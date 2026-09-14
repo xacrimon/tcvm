@@ -1480,7 +1480,13 @@ fn compile_stmt(ctx: &mut Ctx, item: Stmt) -> Result<(), CompileError> {
         Stmt::If(item) => compile_if(ctx, item),
         Stmt::ForNum(item) => compile_for_num(ctx, item),
         Stmt::ForGen(item) => compile_for_gen(ctx, item),
-    }
+    }?;
+    // Reclaim any temps the statement left behind (luac `statement()`):
+    // the next `local` binds at `freereg` and the temp/local checks in
+    // call setup assume `[nactvar, freereg)` holds only dead temps.
+    debug_assert!(ctx.chunk.freereg >= ctx.chunk.nactvar);
+    ctx.chunk.freereg = ctx.chunk.nactvar;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
