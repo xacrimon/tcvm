@@ -275,9 +275,15 @@ impl<'gc> ThreadState<'gc> {
         }
     }
 
-    /// Push a new Lua frame.
+    /// Push a new Lua frame. `base` must sit directly above the function
+    /// slot: `op_return` locates it as `base - 1 - num_extras` (VARARGPREP
+    /// later shifts `base` up by `num_extras`), which wraps for `base == 0`.
     #[inline]
     pub fn push_lua(&mut self, lf: LuaFrame<'gc>) {
+        debug_assert!(
+            lf.base >= 1,
+            "Lua frame base must leave room for the function slot"
+        );
         self.frames.push(Frame::Lua(lf));
     }
 
