@@ -2098,12 +2098,19 @@ fn compile_assign(ctx: &mut Ctx, item: Assign) -> Result<(), CompileError> {
         let is_last = i == num_values - 1;
         if is_last
             && num_targets > num_values
-            && let Expr::FuncCall(call) = expr
+            && matches!(expr, Expr::FuncCall(_) | Expr::Method(_) | Expr::VarArg)
         {
             let want = (num_targets - pending.len()) as u8;
-            for r in compile_expr_func_call(ctx, call, Want::Exact(want))? {
-                pending.push(Some(r.0));
-            }
+            let regs = match expr {
+                Expr::FuncCall(call) => compile_expr_func_call(ctx, call, Want::Exact(want))?,
+                Expr::Method(call) => compile_expr_method_call(ctx, call, Want::Exact(want))?,
+                _ => {
+                    let dst = ctx.reserve_regs(want)?;
+                    ctx.emit(Instruction::vararg(dst, want + 1));
+                    (0..want).map(|k| Reg(dst.0 + k)).collect()
+                }
+            };
+            pending.extend(regs.iter().map(|r| Some(r.0)));
             continue;
         }
         let hint = hints[i];
