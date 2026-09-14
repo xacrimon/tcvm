@@ -83,6 +83,13 @@ fn non_string_values_get_no_prefix() {
 }
 
 #[test]
+fn assert_raises_like_error() {
+    assert_eq!(raise_str("assert(false, \"m\")"), "t:1: m");
+    assert_eq!(raise_str("\nassert(false)"), "t:2: assertion failed!");
+    assert!(matches!(raise("assert(nil, 42)"), Raised::Int(42)));
+}
+
+#[test]
 fn library_errors_name_the_calling_lua_frame() {
     let msg = raise_str("local function f()\n  local s = string.rep()\nend\nf()");
     assert!(msg.starts_with("t:2: bad argument #1 to 'rep'"), "{msg}");

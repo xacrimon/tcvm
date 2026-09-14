@@ -43,9 +43,8 @@ pub fn load<'gc>(ctx: Context<'gc>) {
 }
 
 /// `assert(v [, message, ...])` — if `v` is truthy, return all arguments
-/// unchanged; otherwise raise `message` (default `"assertion failed!"`). The
-/// message is raised verbatim, matching `assert`'s delegation to `error`
-/// (no position prefix is added when the caller is a native frame).
+/// unchanged; otherwise raise `message` (default `"assertion failed!"`) as
+/// `error(message)` would, i.e. with the caller's position when it's a string.
 fn lua_assert<'gc>(
     nctx: NativeContext<'gc, '_>,
     stack: Stack<'gc, '_>,
@@ -61,7 +60,7 @@ fn lua_assert<'gc>(
         return Ok(CallbackAction::Return);
     }
     if stack.len() >= 2 {
-        Err(Error::new(stack.get(1)))
+        Err(Error::new(stack.get(1)).with_level(1))
     } else {
         Err(Error::from_str(nctx.ctx, "assertion failed!"))
     }
