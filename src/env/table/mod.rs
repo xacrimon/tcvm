@@ -261,9 +261,19 @@ impl<'gc> TableState<'gc> {
         }
         if let Some(index) = array_index(key) {
             if index > self.array.len() {
+                if value.is_nil() {
+                    return;
+                }
                 self.array.resize(index, Value::nil());
             }
             self.array[index - 1] = value;
+            // `raw_len` reports `array.len()`, which is only a border if the
+            // last slot is non-nil: trim trailing nils on deletion.
+            if value.is_nil() && index == self.array.len() {
+                while self.array.last().is_some_and(|v| v.is_nil()) {
+                    self.array.pop();
+                }
+            }
             return;
         }
         if key.is_nil() {
