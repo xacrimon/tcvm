@@ -486,6 +486,11 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         match dst {
             Some(reg) => {
                 if self.chunk.freereg <= reg.0 {
+                    // Same ceiling as `reserve_reg`: a hint of 255 would
+                    // wrap freereg to 0.
+                    if reg.0 == u8::MAX {
+                        return Err(err(CompileErrorKind::Registers, LineNumber(0)));
+                    }
                     self.chunk.freereg = reg.0 + 1;
                     if self.chunk.freereg > self.chunk.max_stack {
                         self.chunk.max_stack = self.chunk.freereg;
@@ -1609,8 +1614,8 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
 
         if is_last && num_targets > num_values {
             // Last RHS supplies multiple values via call or vararg.
+            let want = expand_count(num_targets - i)?;
             if let Expr::FuncCall(call) = expr {
-                let want = (num_targets - i) as u8;
                 let regs = compile_expr_func_call(ctx, call, Want::Exact(want))?;
                 // Results occupy [regs[0], regs[0]+want); in practice this
                 // lines up with `expected` because the call's func slot
@@ -1619,15 +1624,13 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
                 continue;
             }
             if let Expr::Method(call) = expr {
-                let want = (num_targets - i) as u8;
                 expand_method_call(ctx, call, RegisterIndex(expected), want)?;
                 continue;
             }
             if let Expr::VarArg = expr {
-                let want = num_targets - i;
-                let dst = ctx.reserve_regs(want as u8)?;
+                let dst = ctx.reserve_regs(want)?;
                 assert_eq!(dst.0, expected);
-                ctx.emit(Instruction::vararg(dst, want as u8 + 1));
+                ctx.emit(Instruction::vararg(dst, want + 1));
                 continue;
             }
         }
@@ -2101,7 +2104,7 @@ fn compile_assign(ctx: &mut Ctx, item: Assign) -> Result<(), CompileError> {
             && num_targets > num_values
             && matches!(expr, Expr::FuncCall(_) | Expr::Method(_) | Expr::VarArg)
         {
-            let want = (num_targets - pending.len()) as u8;
+            let want = expand_count(num_targets - pending.len())?;
             let regs = match expr {
                 Expr::FuncCall(call) => compile_expr_func_call(ctx, call, Want::Exact(want))?,
                 Expr::Method(call) => compile_expr_method_call(ctx, call, Want::Exact(want))?,
@@ -3357,12 +3360,9 @@ fn compile_expr_func_call(
     match want {
         Want::Exact(n) => {
             // Results land at func..func+n; reclaim arg temps above.
-            ctx.chunk.freereg = func.0 + n;
-            let mut results = Vec::with_capacity(n as usize);
-            for i in 0..n {
-                results.push(RegisterIndex(func.0 + i));
-            }
-            Ok(results)
+            ctx.chunk.freereg = func.0;
+            ctx.reserve_regs(n)?;
+            Ok((0..n).map(|i| Reg(func.0 + i)).collect())
         }
         // MULTRET: leave `freereg` past the args so the outer instruction sees
         // the unbounded extent.
@@ -3572,12 +3572,9 @@ fn compile_expr_method_call(
 
     match want {
         Want::Exact(n) => {
-            ctx.chunk.freereg = func.0 + n;
-            let mut results = Vec::with_capacity(n as usize);
-            for i in 0..n {
-                results.push(RegisterIndex(func.0 + i));
-            }
-            Ok(results)
+            ctx.chunk.freereg = func.0;
+            ctx.reserve_regs(n)?;
+            Ok((0..n).map(|i| Reg(func.0 + i)).collect())
         }
         Want::MultRet => Ok(Vec::new()),
     }
@@ -3728,10 +3725,8 @@ fn compile_return_generic(ctx: &mut Ctx, mut exprs: Vec<Expr>) -> Result<(), Com
         }
     }
 
-    ctx.emit(Instruction::ret(
-        first_reg,
-        if multret { 0 } else { n as u8 + 1 },
-    ));
+    let count = if multret { 0 } else { expand_count(n)? + 1 };
+    ctx.emit(Instruction::ret(first_reg, count));
 
     Ok(())
 }
