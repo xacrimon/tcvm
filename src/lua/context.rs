@@ -78,6 +78,8 @@ impl<'gc> Context<'gc> {
     pub fn load(self, source: &str, _name: Option<&str>) -> Result<Function<'gc>, LoadError> {
         let mut cache = NodeCache::new();
         let (syntax, reports) = parser::parse(&mut cache, source);
+        // The parser only reports errors (see `State::report`), so any report
+        // means the tree is unusable.
         if !reports.is_empty() {
             return Err(LoadError::Parse(reports));
         }
