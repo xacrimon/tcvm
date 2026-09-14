@@ -276,9 +276,10 @@ impl<'gc> TableState<'gc> {
             }
             return;
         }
-        if key.is_nil() {
-            todo!();
-        }
+        assert!(
+            !key.is_nil(),
+            "nil table key must be rejected before raw_set"
+        );
         self.misc_hash_set(key, value, value_hash(key));
     }
 

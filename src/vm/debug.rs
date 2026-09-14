@@ -6,6 +6,7 @@ use crate::env::string::LuaString;
 use crate::env::thread::{Frame, ThreadState};
 use crate::env::value::Value;
 use crate::lua::Context;
+use crate::vm::interp::OpError;
 
 /// `luaO_chunkid`: how a chunk name prints in messages, capped at
 /// `LUA_IDSIZE` (60) bytes. `=name` is literal, `@path` keeps the tail of
@@ -84,6 +85,94 @@ pub(crate) fn locate<'gc>(ctx: Context<'gc>, ts: &ThreadState<'gc>, err: Error<'
     }
     let text = [prefix.as_slice(), msg.as_bytes()].concat();
     Error::new(Value::string(LuaString::new(ctx, &text)))
+}
+
+/// `luaT_objtypename`: a table or userdata whose metatable has a string
+/// `__name` reports that instead of its basic type.
+pub(crate) fn object_type_name<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> String {
+    let mt = v
+        .get_table()
+        .and_then(|t| t.metatable())
+        .or_else(|| v.get_userdata().and_then(|u| u.metatable()));
+    let name = mt.map(|mt| mt.raw_get(Value::string(LuaString::new(ctx, b"__name"))));
+    match name.and_then(|n| n.get_string()) {
+        Some(s) => String::from_utf8_lossy(s.as_bytes()).into_owned(),
+        None => v.type_name().to_owned(),
+    }
+}
+
+/// The reference message for an opcode fault (ldebug.c's `luaG_*error`
+/// family), minus the variable-name suffix (`(local 'x')` etc.), which
+/// needs register-to-name attribution that isn't implemented yet.
+pub(crate) fn op_error_message<'gc>(
+    ctx: Context<'gc>,
+    ts: &ThreadState<'gc>,
+    kind: OpError<'gc>,
+) -> String {
+    let tn = |v| object_type_name(ctx, v);
+    let is_number = |v: Value<'gc>| v.get_integer().is_some() || v.get_float().is_some();
+    match kind {
+        OpError::Index(v) => format!("attempt to index a {} value", tn(v)),
+        OpError::Call(v) => format!("attempt to call a {} value", tn(v)),
+        OpError::Len(v) => format!("attempt to get length of a {} value", tn(v)),
+        // `luaG_opinterror`: blame the first operand unless it is a number.
+        OpError::Arith(a, b) => {
+            let culprit = if is_number(a) { b } else { a };
+            format!("attempt to perform arithmetic on a {} value", tn(culprit))
+        }
+        // `luaT_trybinTM`: two numbers that reach here failed integer
+        // conversion; otherwise blame the non-number.
+        OpError::Bitwise(a, b) if is_number(a) && is_number(b) => {
+            "number has no integer representation".to_owned()
+        }
+        OpError::Bitwise(a, b) => {
+            let culprit = if is_number(a) { b } else { a };
+            format!(
+                "attempt to perform bitwise operation on a {} value",
+                tn(culprit)
+            )
+        }
+        // `luaG_concaterror`: strings and numbers concatenate, so blame the
+        // other operand.
+        OpError::Concat(a, b) => {
+            let culprit = if a.get_string().is_some() || is_number(a) {
+                b
+            } else {
+                a
+            };
+            format!("attempt to concatenate a {} value", tn(culprit))
+        }
+        OpError::Compare(a, b) => {
+            let (t1, t2) = (tn(a), tn(b));
+            if t1 == t2 {
+                format!("attempt to compare two {t1} values")
+            } else {
+                format!("attempt to compare {t1} with {t2}")
+            }
+        }
+        OpError::DivByZero => "attempt to divide by zero".to_owned(),
+        OpError::ModByZero => "attempt to perform 'n%0'".to_owned(),
+        OpError::IndexChainLoop => "'__index' chain too long; possible loop".to_owned(),
+        OpError::NewIndexChainLoop => "'__newindex' chain too long; possible loop".to_owned(),
+        OpError::GlobalRedefined(k) => {
+            let name = ts
+                .top_lua()
+                .and_then(|lf| lf.closure.proto.constants.get(k as usize).copied())
+                .and_then(|v| v.get_string())
+                .map_or_else(
+                    || "?".to_owned(),
+                    |s| String::from_utf8_lossy(s.as_bytes()).into_owned(),
+                );
+            format!("global '{name}' already defined")
+        }
+        OpError::ForStepZero => "'for' step is zero".to_owned(),
+        OpError::ForNotNumber(what, v) => {
+            format!("bad 'for' {what} (number expected, got {})", tn(v))
+        }
+        OpError::NilIndex => "table index is nil".to_owned(),
+        OpError::NanIndex => "table index is NaN".to_owned(),
+        OpError::Internal(what) => format!("internal VM error: {what}"),
+    }
 }
 
 #[cfg(test)]

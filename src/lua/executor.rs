@@ -230,10 +230,7 @@ impl<'gc> Executor<'gc> {
             };
 
             match kind {
-                FrameKind::Lua => {
-                    vm::interp::run_thread(ctx, top)
-                        .map_err(|e| RuntimeError::Opcode { pc: e.pc })?;
-                }
+                FrameKind::Lua => vm::interp::run_thread(ctx, top),
                 FrameKind::Sequence => {
                     if matches!(pump_sequence(self, ctx, top)?, PumpOutcome::Pending) {
                         // Sequence asked for cooperative re-poll. Mode stays

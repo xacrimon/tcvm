@@ -307,6 +307,14 @@ fn lua_rawset<'gc>(
             "bad argument #1 to 'rawset' (table expected)",
         ));
     };
+    // `luaH_set` raises from inside the C function, so unlike argument
+    // errors these carry no position.
+    if key.is_nil() {
+        return Err(Error::from_str(nctx.ctx, "table index is nil").with_level(0));
+    }
+    if key.get_float().is_some_and(f64::is_nan) {
+        return Err(Error::from_str(nctx.ctx, "table index is NaN").with_level(0));
+    }
     t.raw_set(nctx.ctx, key, value);
     stack.replace(&[Value::table(t)]);
     Ok(CallbackAction::Return)
