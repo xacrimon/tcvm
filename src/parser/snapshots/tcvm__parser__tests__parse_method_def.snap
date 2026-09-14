@@ -1,0 +1,137 @@
+---
+source: src/parser/mod.rs
+expression: syntax_tree
+---
+Root@0..171
+  DeclStmt@0..23
+    Local@0..5 "local"
+    AssignList@5..8
+      DeclTarget@5..8
+        Ident@5..8
+          Ident@5..8 "obj"
+    Assign@8..9 "="
+    ExprList@9..23
+      TableExpr@9..23
+        LCurly@9..10 "{"
+        TableMapElem@10..13
+          Ident@10..11
+            Ident@10..11 "v"
+          Assign@11..12 "="
+          LiteralExpr@12..13
+            Int@12..13 "5"
+        Comma@13..14 ","
+        TableMapElem@14..22
+          Ident@14..19
+            Ident@14..19 "inner"
+          Assign@19..20 "="
+          TableExpr@20..22
+            LCurly@20..21 "{"
+            RCurly@21..22 "}"
+        RCurly@22..23 "}"
+  FuncStmt@23..55
+    Function@23..31 "function"
+    BinOp@31..38
+      Ident@31..34
+        Ident@31..34 "obj"
+      Colon@34..35 ":"
+      Ident@35..38
+        Ident@35..38 "get"
+    FuncArgs@38..40
+      LParen@38..39 "("
+      RParen@39..40 ")"
+    StmtList@40..52
+      ReturnStmt@40..52
+        Return@40..46 "return"
+        ExprList@46..52
+          BinOp@46..52
+            Ident@46..50
+              Ident@46..50 "self"
+            Dot@50..51 "."
+            Ident@51..52
+              Ident@51..52 "v"
+    End@52..55 "end"
+  FuncStmt@55..98
+    Function@55..63 "function"
+    BinOp@63..70
+      Ident@63..66
+        Ident@63..66 "obj"
+      Colon@66..67 ":"
+      Ident@67..70
+        Ident@67..70 "add"
+    FuncArgs@70..77
+      LParen@70..71 "("
+      Ident@71..72
+        Ident@71..72 "a"
+      Comma@72..73 ","
+      VarArgParam@73..76
+        TDot@73..76 "..."
+      RParen@76..77 ")"
+    StmtList@77..95
+      ReturnStmt@77..95
+        Return@77..83 "return"
+        ExprList@83..95
+          BinOp@83..91
+            BinOp@83..89
+              Ident@83..87
+                Ident@83..87 "self"
+              Dot@87..88 "."
+              Ident@88..89
+                Ident@88..89 "v"
+            Plus@89..90 "+"
+            Ident@90..91
+              Ident@90..91 "a"
+          Comma@91..92 ","
+          VarArgExpr@92..95
+            TDot@92..95 "..."
+    End@95..98 "end"
+  FuncStmt@98..135
+    Function@98..106 "function"
+    BinOp@106..117
+      BinOp@106..115
+        Ident@106..109
+          Ident@106..109 "obj"
+        Dot@109..110 "."
+        Ident@110..115
+          Ident@110..115 "inner"
+      Colon@115..116 ":"
+      Ident@116..117
+        Ident@116..117 "m"
+    FuncArgs@117..120
+      LParen@117..118 "("
+      Ident@118..119
+        Ident@118..119 "y"
+      RParen@119..120 ")"
+    StmtList@120..132
+      ReturnStmt@120..132
+        Return@120..126 "return"
+        ExprList@126..132
+          Ident@126..130
+            Ident@126..130 "self"
+          Comma@130..131 ","
+          Ident@131..132
+            Ident@131..132 "y"
+    End@132..135 "end"
+  FuncStmt@135..171
+    Function@135..143 "function"
+    BinOp@143..158
+      BinOp@143..152
+        Ident@143..146
+          Ident@143..146 "obj"
+        Dot@146..147 "."
+        Ident@147..152
+          Ident@147..152 "inner"
+      Dot@152..153 "."
+      Ident@153..158
+        Ident@153..158 "plain"
+    FuncArgs@158..161
+      LParen@158..159 "("
+      Ident@159..160
+        Ident@159..160 "y"
+      RParen@160..161 ")"
+    StmtList@161..168
+      ReturnStmt@161..168
+        Return@161..167 "return"
+        ExprList@167..168
+          Ident@167..168
+            Ident@167..168 "y"
+    End@168..171 "end"

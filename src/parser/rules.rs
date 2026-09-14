@@ -387,13 +387,34 @@ impl<'cache, 'source> Parser<'cache, 'source> {
         self.expect(T![function]);
 
         if !expr {
-            self.r_simple_expr(false);
+            self.r_func_name();
         }
 
         self.r_func_def_args();
         self.r_block(&|t| t == T![end]);
         self.expect(T![end]);
         Some(marker.complete(self))
+    }
+
+    /// `funcname ::= Name {'.' Name} [':' Name]`. Both separators produce a
+    /// `bin_op` so the compiler assigns to `t.m` either way; the `:` form
+    /// is detected from the operator token (`Func::is_method`).
+    fn r_func_name(&mut self) -> Option<CompletedMarker> {
+        let mut lhs = self.r_ident()?;
+        loop {
+            let t = self.at();
+            if !matches!(t, T![.] | T![:]) {
+                break;
+            }
+            let n = lhs.precede(self, T![bin_op]);
+            self.expect(t);
+            self.r_ident();
+            lhs = n.complete(self);
+            if t == T![:] {
+                break;
+            }
+        }
+        Some(lhs)
     }
 
     fn r_func_def_args(&mut self) -> Option<CompletedMarker> {
