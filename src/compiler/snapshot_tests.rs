@@ -165,6 +165,7 @@ test!(
 test!(method_call, "test-files/method_call.lua");
 test!(method_def, "test-files/method_def.lua");
 test!(loop_close, "test-files/loop_close.lua");
+test!(goto_close, "test-files/goto_close.lua");
 test!(not_andor, "test-files/not_andor.lua");
 test!(jmp_elim, "test-files/jmp_elim.lua");
 test!(if_empty_nested, "test-files/if_empty_nested.lua");
