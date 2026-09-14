@@ -1,0 +1,126 @@
+---
+source: src/parser/mod.rs
+expression: syntax_tree
+---
+Root@0..87
+  DeclStmt@0..28
+    Local@0..5 "local"
+    AssignList@5..6
+      DeclTarget@5..6
+        Ident@5..6
+          Ident@5..6 "f"
+    Assign@6..7 "="
+    ExprList@7..28
+      FuncExpr@7..28
+        Function@7..15 "function"
+        FuncArgs@15..17
+          LParen@15..16 "("
+          RParen@16..17 ")"
+        StmtList@17..25
+          ReturnStmt@17..25
+            Return@17..23 "return"
+            ExprList@23..25
+              TableExpr@23..25
+                LCurly@23..24 "{"
+                RCurly@24..25 "}"
+        End@25..28 "end"
+  Semicolon@28..29
+    Semicolon@28..29 ";"
+  DeclStmt@29..38
+    Local@29..34 "local"
+    AssignList@34..35
+      DeclTarget@34..35
+        Ident@34..35
+          Ident@34..35 "a"
+    Assign@35..36 "="
+    ExprList@36..38
+      TableExpr@36..38
+        LCurly@36..37 "{"
+        RCurly@37..38 "}"
+  Semicolon@38..39
+    Semicolon@38..39 ";"
+  AssignStmt@39..46
+    AssignList@39..44
+      BinOp@39..44
+        Expr@39..42
+          LParen@39..40 "("
+          Ident@40..41
+            Ident@40..41 "a"
+          RParen@41..42 ")"
+        Dot@42..43 "."
+        Ident@43..44
+          Ident@43..44 "b"
+    Assign@44..45 "="
+    ExprList@45..46
+      LiteralExpr@45..46
+        Int@45..46 "1"
+  Semicolon@46..47
+    Semicolon@46..47 ";"
+  AssignStmt@47..65
+    AssignList@47..61
+      BinOp@47..54
+        Expr@47..52
+          LParen@47..48 "("
+          FuncCall@48..51
+            Ident@48..49
+              Ident@48..49 "f"
+            FuncArgs@49..51
+              LParen@49..50 "("
+              RParen@50..51 ")"
+          RParen@51..52 ")"
+        Dot@52..53 "."
+        Ident@53..54
+          Ident@53..54 "x"
+      Comma@54..55 ","
+      Index@55..61
+        Expr@55..58
+          LParen@55..56 "("
+          Ident@56..57
+            Ident@56..57 "a"
+          RParen@57..58 ")"
+        LBracket@58..59 "["
+        LiteralExpr@59..60
+          Int@59..60 "1"
+        RBracket@60..61 "]"
+    Assign@61..62 "="
+    ExprList@62..65
+      LiteralExpr@62..63
+        Int@62..63 "2"
+      Comma@63..64 ","
+      LiteralExpr@64..65
+        Int@64..65 "3"
+  Semicolon@65..66
+    Semicolon@65..66 ";"
+  DeclStmt@66..87
+    Local@66..71 "local"
+    AssignList@71..72
+      DeclTarget@71..72
+        Ident@71..72
+          Ident@71..72 "n"
+    Assign@72..73 "="
+    ExprList@73..87
+      BinOp@73..87
+        BinOp@73..78
+          Expr@73..76
+            LParen@73..74 "("
+            Ident@74..75
+              Ident@74..75 "a"
+            RParen@75..76 ")"
+          Dot@76..77 "."
+          Ident@77..78
+            Ident@77..78 "b"
+        Plus@78..79 "+"
+        Index@79..87
+          Expr@79..84
+            LParen@79..80 "("
+            FuncCall@80..83
+              Ident@80..81
+                Ident@80..81 "f"
+              FuncArgs@81..83
+                LParen@81..82 "("
+                RParen@82..83 ")"
+            RParen@83..84 ")"
+          LBracket@84..85 "["
+          LiteralExpr@85..86
+            Int@85..86 "1"
+          RBracket@86..87 "]"
