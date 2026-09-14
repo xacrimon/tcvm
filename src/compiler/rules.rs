@@ -303,6 +303,16 @@ struct VariableData {
 /// Snapshot of the register allocator's state at scope entry. Restored
 /// verbatim on `pop_scope` so nested scopes cleanly release any temps and
 /// named locals they allocated.
+/// A forward `goto` whose `::label::` hasn't been compiled yet. `depth` is
+/// `scope_marks.len()` at the jump; `needs_close` is set when a scope it
+/// sits inside is popped with something to CLOSE, so the label emits one.
+struct PendingGoto {
+    name: String,
+    label: u16,
+    depth: usize,
+    needs_close: bool,
+}
+
 #[derive(Clone, Copy)]
 struct ScopeMark {
     freereg: u8,
@@ -361,8 +371,11 @@ struct Ctx<'gc, 'a> {
     /// Registers that need CLOSE when scope is popped (to-be-closed variables).
     scope_close: Vec<Vec<RegisterIndex>>,
 
-    /// Named labels for goto/label statements (name → label index).
-    goto_labels: HashMap<String, u16, RandomState>,
+    /// `::name::` seen so far → (label, `nactvar` at the label), so a
+    /// backward goto knows which locals it leaves.
+    labels: HashMap<String, (u16, u8), RandomState>,
+    /// Forward gotos awaiting their label.
+    pending_gotos: Vec<PendingGoto>,
 
     /// Parent function's resolver, or `None` for the main chunk. A nested
     /// function calls this to walk the lexical chain when it encounters a
@@ -1099,6 +1112,12 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         self.scope_close
             .pop()
             .ok_or_else(|| ice("missing scope close list"))?;
+        if close.is_some() {
+            let depth = self.scope_marks.len();
+            for g in self.pending_gotos.iter_mut().filter(|g| g.depth > depth) {
+                g.needs_close = true;
+            }
+        }
         Ok(close)
     }
 
@@ -1387,7 +1406,8 @@ fn compile_function_to_chunk<'gc, 'a>(
         scope: Vec::new(),
         scope_marks: Vec::new(),
         scope_close: Vec::new(),
-        goto_labels: HashMap::default(),
+        labels: HashMap::default(),
+        pending_gotos: Vec::new(),
         capture: parent_capture,
         upvalues: initial_upvalues,
         globals,
@@ -1530,14 +1550,22 @@ fn compile_label(ctx: &mut Ctx, item: Label) -> Result<(), CompileError> {
         .ok_or_else(|| ice("ident without name"))?
         .to_owned();
 
-    if let Some(&label_idx) = ctx.goto_labels.get(&name) {
-        // Forward reference already allocated — resolve it now
-        ctx.set_label(label_idx, ctx.next_offset());
-    } else {
-        let label_idx = ctx.new_label();
-        ctx.set_label(label_idx, ctx.next_offset());
-        ctx.goto_labels.insert(name, label_idx);
+    let nactvar = ctx.chunk.nactvar;
+    let pending: Vec<_> = ctx
+        .pending_gotos
+        .extract_if(.., |g| g.name == name)
+        .collect();
+    let label = match pending.first() {
+        Some(g) => g.label,
+        None => ctx.new_label(),
+    };
+    ctx.set_label(label, ctx.next_offset());
+    // Forward jumps that left a scope with open upvalues / TBC land here;
+    // falling through closes nothing live (luac `createlabel`).
+    if pending.iter().any(|g| g.needs_close) {
+        ctx.emit(Instruction::close(Reg(nactvar)));
     }
+    ctx.labels.insert(name, (label, nactvar));
 
     Ok(())
 }
@@ -1550,14 +1578,29 @@ fn compile_goto(ctx: &mut Ctx, item: Goto) -> Result<(), CompileError> {
         .ok_or_else(|| ice("ident without name"))?
         .to_owned();
 
-    if let Some(&label_idx) = ctx.goto_labels.get(&name) {
-        ctx.emit_jump(label_idx);
-    } else {
-        // Forward goto — allocate a label that will be resolved when ::name:: is encountered
-        let label_idx = ctx.new_label();
-        ctx.goto_labels.insert(name, label_idx);
-        ctx.emit_jump(label_idx);
-    }
+    let label = match ctx.labels.get(&name) {
+        // Backward jump: close whatever locals it leaves (luac `gotostat`).
+        Some(&(label, nactvar)) => {
+            if ctx.chunk.nactvar > nactvar {
+                ctx.emit(Instruction::close(Reg(nactvar)));
+            }
+            label
+        }
+        None => {
+            let label = match ctx.pending_gotos.iter().find(|g| g.name == name) {
+                Some(g) => g.label,
+                None => ctx.new_label(),
+            };
+            ctx.pending_gotos.push(PendingGoto {
+                name,
+                label,
+                depth: ctx.scope_marks.len(),
+                needs_close: false,
+            });
+            label
+        }
+    };
+    ctx.emit_jump(label);
 
     Ok(())
 }
