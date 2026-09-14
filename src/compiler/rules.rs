@@ -1177,16 +1177,20 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     }
 
     fn define(&mut self, name: String, data: VariableData) -> Result<(), CompileError> {
-        let idx = self.chunk.locvars.len();
-        self.chunk.locvars.push(LocVar {
-            name: LuaString::new(self.ctx, name.as_bytes()),
-            start_pc: self.chunk.tape.len() as u32,
-            end_pc: 0,
-        });
-        self.scope_locvars
-            .last_mut()
-            .ok_or_else(|| ice("missing scope"))?
-            .push(idx);
+        // `global` declarations are scope entries but own no register, so
+        // they get no debug record (luac lists only real locals).
+        if !matches!(data.kind, VarKind::Global) {
+            let idx = self.chunk.locvars.len();
+            self.chunk.locvars.push(LocVar {
+                name: LuaString::new(self.ctx, name.as_bytes()),
+                start_pc: self.chunk.tape.len() as u32,
+                end_pc: 0,
+            });
+            self.scope_locvars
+                .last_mut()
+                .ok_or_else(|| ice("missing scope"))?
+                .push(idx);
+        }
         let scope = self.scope.last_mut().ok_or_else(|| ice("missing scope"))?;
         scope.insert(name, data);
         Ok(())
@@ -1706,6 +1710,11 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
         let func_reg = compile_func_body(ctx, &func, Some(reg))?;
         if func_reg != reg {
             ctx.emit(Instruction::mov(reg, func_reg));
+        }
+        // The local is bound early so the body can recurse, but debug info
+        // only sees it once the closure is stored (luac's `localfunc`).
+        if let Some(var) = ctx.chunk.locvars.last_mut() {
+            var.start_pc = ctx.chunk.tape.len() as u32;
         }
         return Ok(());
     }

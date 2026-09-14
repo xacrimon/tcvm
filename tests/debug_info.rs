@@ -62,8 +62,8 @@ fn local_variable_ranges() {
             &vars[..3],
             [(&b"a"[..], 2, end), (b"b", 3, end), (b"c", 4, 7)]
         );
-        assert_eq!(vars[3].0, b"f");
-        assert_eq!(vars[3].2, end);
+        // `local function f` is visible to debug info only after CLOSURE.
+        assert_eq!((vars[3].0, vars[3].1, vars[3].2), (&b"f"[..], 8, end));
         let f = &proto.prototypes[0];
         assert_eq!(f.locvars.len(), 1);
         assert_eq!(f.locvars[0].name.as_bytes(), b"x");
@@ -77,5 +77,22 @@ fn upvalue_names() {
         let names: Vec<&[u8]> = proto.upvalue_names.iter().map(|n| n.as_bytes()).collect();
         assert_eq!(names, [b"_ENV"]);
         assert_eq!(proto.upvalue_names.len(), proto.upvalue_desc.len());
+    });
+}
+
+#[test]
+fn global_declarations_are_not_locals() {
+    let mut lua = Lua::new();
+    lua.load_all();
+    lua.enter(|ctx| {
+        let chunk = ctx
+            .load(
+                "global x\nx = 1\nlocal y = 2\nglobal function g() end",
+                Some("=g"),
+            )
+            .expect("load");
+        let proto = chunk.as_lua().unwrap().proto;
+        let names: Vec<&[u8]> = proto.locvars.iter().map(|v| v.name.as_bytes()).collect();
+        assert_eq!(names, [b"y"]);
     });
 }
