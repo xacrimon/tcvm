@@ -134,7 +134,7 @@ impl<'cache, 'source> Parser<'cache, 'source> {
     /// and never in the binary-operator loop.
     fn r_expr_lhs(&mut self) -> Option<CompletedMarker> {
         match self.at() {
-            T![ident] | T!['('] => self.r_simple_expr(true),
+            T![ident] | T!['('] => self.r_simple_expr(),
             T![...] => self.r_vararg(),
             T!['{'] => self.r_table(),
             T![function] => self.r_func(true),
@@ -328,9 +328,22 @@ impl<'cache, 'source> Parser<'cache, 'source> {
         Some(marker.complete(self))
     }
 
+    /// `args ::= '(' [explist] ')' | tableconstructor | LiteralString`
     fn r_func_call_args(&mut self) -> Option<CompletedMarker> {
         let marker = self.start(T![func_args]);
-        self.expect(T!['(']);
+        match self.at() {
+            T![string] | T![long_string] => {
+                self.r_literal();
+                return Some(marker.complete(self));
+            }
+            T!['{'] => {
+                self.r_table();
+                return Some(marker.complete(self));
+            }
+            _ => {
+                self.expect(T!['(']);
+            }
+        }
 
         loop {
             match self.at() {
@@ -527,7 +540,7 @@ impl<'cache, 'source> Parser<'cache, 'source> {
     /// `suffixedexp ::= primaryexp { '.' Name | '[' exp ']' | ':' Name args | args }`
     /// with `primaryexp ::= Name | '(' exp ')'`. Only suffixes may follow the
     /// primary — infix operators are not accepted here.
-    fn r_simple_expr(&mut self, allow_call: bool) -> Option<CompletedMarker> {
+    fn r_simple_expr(&mut self) -> Option<CompletedMarker> {
         let mut lhs = if self.at() == T!['('] {
             self.r_paren()?
         } else {
@@ -537,7 +550,7 @@ impl<'cache, 'source> Parser<'cache, 'source> {
         loop {
             let t = self.at();
 
-            if t == T!['('] && allow_call {
+            if matches!(t, T!['('] | T![string] | T![long_string] | T!['{']) {
                 let n = lhs.precede(self, T![func_call]);
                 let _rhs = self.r_func_call_args()?;
                 lhs = n.complete(self);
@@ -576,7 +589,7 @@ impl<'cache, 'source> Parser<'cache, 'source> {
     fn r_maybe_assign(&mut self) -> Option<CompletedMarker> {
         let assign_marker = self.start(T![assign_stmt]);
         let assign_list_marker = self.start(T![assign_list]);
-        let expr_marker = self.r_simple_expr(true);
+        let expr_marker = self.r_simple_expr();
         if matches!(self.at(), T![=] | T![,]) {
             if let Some(m) = &expr_marker {
                 self.check_assign_target(m.kind());
@@ -605,7 +618,7 @@ impl<'cache, 'source> Parser<'cache, 'source> {
     fn r_assign(&mut self, assign_marker: Marker, list_marker: Marker) -> Option<CompletedMarker> {
         while self.at() == T![,] {
             self.expect(T![,]);
-            if let Some(m) = self.r_simple_expr(true) {
+            if let Some(m) = self.r_simple_expr() {
                 self.check_assign_target(m.kind());
             }
         }

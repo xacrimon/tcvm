@@ -1,0 +1,232 @@
+---
+source: src/parser/mod.rs
+expression: syntax_tree
+---
+Root@0..246
+  FuncCall@0..12
+    Ident@0..5
+      Ident@0..5 "print"
+    FuncArgs@5..12
+      LiteralExpr@5..12
+        String@5..12 "\"hello\""
+  FuncCall@12..25
+    Ident@12..17
+      Ident@12..17 "print"
+    FuncArgs@17..25
+      LiteralExpr@17..25
+        LongString@17..25 "[[long]]"
+  DeclStmt@25..53
+    Local@25..30 "local"
+    FuncStmt@30..53
+      Function@30..38 "function"
+      Ident@38..39
+        Ident@38..39 "f"
+      FuncArgs@39..42
+        LParen@39..40 "("
+        Ident@40..41
+          Ident@40..41 "t"
+        RParen@41..42 ")"
+      StmtList@42..50
+        ReturnStmt@42..50
+          Return@42..48 "return"
+          ExprList@48..50
+            PrefixOp@48..50
+              Hash@48..49 "#"
+              Ident@49..50
+                Ident@49..50 "t"
+      End@50..53 "end"
+  FuncCall@53..68
+    Ident@53..58
+      Ident@53..58 "print"
+    FuncArgs@58..68
+      LParen@58..59 "("
+      FuncCall@59..67
+        Ident@59..60
+          Ident@59..60 "f"
+        FuncArgs@60..67
+          TableExpr@60..67
+            LCurly@60..61 "{"
+            TableArrayElem@61..62
+              LiteralExpr@61..62
+                Int@61..62 "1"
+            Comma@62..63 ","
+            TableArrayElem@63..64
+              LiteralExpr@63..64
+                Int@63..64 "2"
+            Comma@64..65 ","
+            TableArrayElem@65..66
+              LiteralExpr@65..66
+                Int@65..66 "3"
+            RCurly@66..67 "}"
+      RParen@67..68 ")"
+  DeclStmt@68..132
+    Local@68..73 "local"
+    AssignList@73..74
+      DeclTarget@73..74
+        Ident@73..74
+          Ident@73..74 "s"
+    Assign@74..75 "="
+    ExprList@75..132
+      FuncCall@75..132
+        Ident@75..87
+          Ident@75..87 "setmetatable"
+        FuncArgs@87..132
+          LParen@87..88 "("
+          TableExpr@88..90
+            LCurly@88..89 "{"
+            RCurly@89..90 "}"
+          Comma@90..91 ","
+          TableExpr@91..131
+            LCurly@91..92 "{"
+            TableMapElem@92..130
+              Ident@92..99
+                Ident@92..99 "__index"
+              Assign@99..100 "="
+              TableExpr@100..130
+                LCurly@100..101 "{"
+                TableMapElem@101..129
+                  Ident@101..102
+                    Ident@101..102 "m"
+                  Assign@102..103 "="
+                  FuncExpr@103..129
+                    Function@103..111 "function"
+                    FuncArgs@111..119
+                      LParen@111..112 "("
+                      Ident@112..116
+                        Ident@112..116 "self"
+                      Comma@116..117 ","
+                      Ident@117..118
+                        Ident@117..118 "x"
+                      RParen@118..119 ")"
+                    StmtList@119..126
+                      ReturnStmt@119..126
+                        Return@119..125 "return"
+                        ExprList@125..126
+                          Ident@125..126
+                            Ident@125..126 "x"
+                    End@126..129 "end"
+                RCurly@129..130 "}"
+            RCurly@130..131 "}"
+          RParen@131..132 ")"
+  FuncCall@132..162
+    Ident@132..137
+      Ident@132..137 "print"
+    FuncArgs@137..162
+      LParen@137..138 "("
+      MethodCall@138..146
+        Ident@138..139
+          Ident@138..139 "s"
+        Colon@139..140 ":"
+        Ident@140..141
+          Ident@140..141 "m"
+        FuncArgs@141..146
+          LiteralExpr@141..146
+            String@141..146 "\"str\""
+      Comma@146..147 ","
+      MethodCall@147..155
+        Ident@147..148
+          Ident@147..148 "s"
+        Colon@148..149 ":"
+        Ident@149..150
+          Ident@149..150 "m"
+        FuncArgs@150..155
+          TableExpr@150..155
+            LCurly@150..151 "{"
+            TableArrayElem@151..152
+              LiteralExpr@151..152
+                Int@151..152 "4"
+            Comma@152..153 ","
+            TableArrayElem@153..154
+              LiteralExpr@153..154
+                Int@153..154 "5"
+            RCurly@154..155 "}"
+      Comma@155..156 ","
+      BinOp@156..161
+        FuncCall@156..159
+          Ident@156..157
+            Ident@156..157 "f"
+          FuncArgs@157..159
+            TableExpr@157..159
+              LCurly@157..158 "{"
+              RCurly@158..159 "}"
+        Plus@159..160 "+"
+        LiteralExpr@160..161
+          Int@160..161 "1"
+      RParen@161..162 ")"
+  FuncCall@162..181
+    Ident@162..167
+      Ident@162..167 "print"
+    FuncArgs@167..181
+      LParen@167..168 "("
+      FuncCall@168..175
+        Ident@168..172
+          Ident@168..172 "type"
+        FuncArgs@172..175
+          LiteralExpr@172..175
+            String@172..175 "\"x\""
+      Comma@175..176 ","
+      FuncCall@176..180
+        Ident@176..177
+          Ident@176..177 "f"
+        FuncArgs@177..180
+          TableExpr@177..180
+            LCurly@177..178 "{"
+            TableArrayElem@178..179
+              LiteralExpr@178..179
+                Int@178..179 "1"
+            RCurly@179..180 "}"
+      RParen@180..181 ")"
+  DeclStmt@181..232
+    Local@181..186 "local"
+    AssignList@186..187
+      DeclTarget@186..187
+        Ident@186..187
+          Ident@186..187 "g"
+    Assign@187..188 "="
+    ExprList@188..232
+      FuncExpr@188..232
+        Function@188..196 "function"
+        FuncArgs@196..199
+          LParen@196..197 "("
+          Ident@197..198
+            Ident@197..198 "a"
+          RParen@198..199 ")"
+        StmtList@199..229
+          ReturnStmt@199..229
+            Return@199..205 "return"
+            ExprList@205..229
+              FuncExpr@205..229
+                Function@205..213 "function"
+                FuncArgs@213..216
+                  LParen@213..214 "("
+                  Ident@214..215
+                    Ident@214..215 "b"
+                  RParen@215..216 ")"
+                StmtList@216..226
+                  ReturnStmt@216..226
+                    Return@216..222 "return"
+                    ExprList@222..226
+                      BinOp@222..226
+                        Ident@222..223
+                          Ident@222..223 "a"
+                        DDot@223..225 ".."
+                        Ident@225..226
+                          Ident@225..226 "b"
+                End@226..229 "end"
+        End@229..232 "end"
+  FuncCall@232..246
+    Ident@232..237
+      Ident@232..237 "print"
+    FuncArgs@237..246
+      LParen@237..238 "("
+      FuncCall@238..245
+        FuncCall@238..242
+          Ident@238..239
+            Ident@238..239 "g"
+          FuncArgs@239..242
+            LiteralExpr@239..242
+              String@239..242 "\"a\""
+        FuncArgs@242..245
+          LiteralExpr@242..245
+            String@242..245 "\"b\""
+      RParen@245..246 ")"

@@ -119,6 +119,7 @@ mod tests {
     test!(global_const_star, "test-files/global_const_star.lua");
     test!(vararg_param, "test-files/vararg_param.lua");
     test!(paren_prefix, "test-files/paren_prefix.lua");
+    test!(call_sugar, "test-files/call_sugar.lua");
 
     // A malformed tail with no statement-recovery token before EOF (e.g. the
     // adjacent `Float Float` from `1.2.3` / `10..20`) must yield a parse error
