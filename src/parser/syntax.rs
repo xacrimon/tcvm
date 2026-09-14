@@ -183,6 +183,15 @@ impl Decl {
         )
     }
 
+    /// The list-level attribute in `local <attrib> a, b`, applying to every
+    /// target.
+    pub fn modifier(&self) -> Option<DeclModifier> {
+        self.0.children_with_tokens().find_map(|c| match c {
+            NodeOrToken::Token(t) => DeclModifier::cast(t),
+            NodeOrToken::Node(_) => None,
+        })
+    }
+
     pub fn values(&self) -> Option<impl Iterator<Item = Expr> + '_> {
         Some(self.0.last_child()?.children().filter_map(Expr::cast))
     }
@@ -203,6 +212,9 @@ impl DeclTarget {
     }
 }
 
+/// Ordered so that `max` combines a list-level and a per-name attribute:
+/// `close` implies `const`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DeclModifier {
     Const,
     Close,

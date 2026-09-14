@@ -652,6 +652,8 @@ impl<'cache, 'source> Parser<'cache, 'source> {
         if self.at() == T![function] {
             self.r_func(false);
         } else {
+            // List-level attribute: `local <const> a, b` (manual.of:1682).
+            self.r_attrib();
             let assign_list_marker = self.start(T![assign_list]);
             self.r_decl_target();
 
