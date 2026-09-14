@@ -349,6 +349,16 @@ enum ResolvedName {
     Upvalue(u8),
 }
 
+/// Where a function sits in the source. `defined`/`last_defined` become the
+/// prototype's span (both 0 for a main chunk); `end` is the line stamped on
+/// the implicit RETURN — the `end` keyword, or a main chunk's last token.
+#[derive(Clone, Copy)]
+struct FuncLines {
+    defined: u32,
+    last_defined: u32,
+    end: u32,
+}
+
 struct Ctx<'gc, 'a> {
     interner: &'a TokenInterner,
     lines: &'a LineMap,
@@ -1426,9 +1436,12 @@ pub fn compile<'gc>(
         None, // main chunk has no named vararg parameter
         0,
         source,
-        // luac gives the main chunk lines 0,0 and puts its implicit RETURN
-        // on the last source line.
-        (0, 0, lines.last_line()),
+        // luac gives the main chunk span 0,0.
+        FuncLines {
+            defined: 0,
+            last_defined: 0,
+            end: lines.last_line(),
+        },
         // Pre-seed `_ENV` at upvalue 0. The runtime wiring in
         // `src/lua/context.rs` (ctx.load) sets the top-level closure's
         // upvalues directly, so the descriptor here is purely a
@@ -1453,10 +1466,7 @@ fn compile_function_to_chunk<'gc, 'a>(
     vararg_name: Option<String>,
     arity: u8,
     source: Option<LuaString<'gc>>,
-    // `(line_defined, last_line_defined, end_line)`: the last is where the
-    // implicit RETURN goes — the function's `end` line, or the main chunk's
-    // final line.
-    (line_defined, last_line_defined, end_line): (u32, u32, u32),
+    span: FuncLines,
     initial_upvalues: Vec<(String, UpValueDescriptor)>,
     globals: GlobalEnv,
 ) -> Result<Chunk<'gc>, CompileError> {
@@ -1464,15 +1474,15 @@ fn compile_function_to_chunk<'gc, 'a>(
     chunk.is_vararg = is_vararg;
     chunk.arity = arity;
     chunk.source = source;
-    chunk.line_defined = line_defined;
-    chunk.last_line_defined = last_line_defined;
+    chunk.line_defined = span.defined;
+    chunk.last_line_defined = span.last_defined;
 
     let mut ctx = Ctx {
         interner,
         lines,
         ctx,
         chunk,
-        cur_line: line_defined.max(1),
+        cur_line: span.defined.max(1),
         control_end_label: Vec::new(),
         scope: Vec::new(),
         scope_marks: Vec::new(),
@@ -1564,7 +1574,7 @@ fn compile_function_to_chunk<'gc, 'a>(
         Some(Op::RETURN | Op::TAILCALL),
     );
     let needs_return = last_pc <= ctx.chunk.last_target || !last_is_terminator;
-    ctx.cur_line = end_line;
+    ctx.cur_line = span.end;
     if needs_return {
         ctx.emit(Instruction::ret(Reg(0), 1));
     }
@@ -2627,16 +2637,13 @@ fn emit_closure(
         .and_then(|v| v.name())
         .and_then(|i| i.name(ctx.interner).map(str::to_owned));
 
-    let line_defined = ctx.line_of(func_node);
     let last_line = ctx.last_line_of(func_node);
-    let proto = compile_nested(
-        ctx,
-        stmts,
-        params,
-        is_vararg,
-        vararg_name,
-        (line_defined, last_line),
-    )?;
+    let span = FuncLines {
+        defined: ctx.line_of(func_node),
+        last_defined: last_line,
+        end: last_line,
+    };
+    let proto = compile_nested(ctx, stmts, params, is_vararg, vararg_name, span)?;
 
     let proto_idx = ctx.chunk.prototypes.len() as u16;
     ctx.chunk.prototypes.push(proto);
@@ -2660,7 +2667,7 @@ fn compile_nested<'gc>(
     params: Vec<String>,
     is_vararg: bool,
     vararg_name: Option<String>,
-    (line_defined, last_line): (u32, u32),
+    span: FuncLines,
 ) -> Result<Gc<'gc, Prototype<'gc>>, CompileError> {
     let arity = params.len() as u8;
     let lua_ctx = ctx.ctx;
@@ -2684,7 +2691,7 @@ fn compile_nested<'gc>(
         vararg_name,
         arity,
         source,
-        (line_defined, last_line, last_line),
+        span,
         Vec::new(),
         globals,
     )?;
