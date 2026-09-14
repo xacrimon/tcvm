@@ -83,6 +83,9 @@ impl<'cache, 'source> State<'cache, 'source> {
         }
     }
 
+    /// Every report is a hard error: `ariadne::Report` hides its kind, so
+    /// consumers treat a non-empty report list as a failed parse. Warnings
+    /// would need their own channel rather than this list.
     pub fn report(&mut self, error: ariadne::Report<'static, Span>) {
         self.reports.push(error);
     }
