@@ -15,7 +15,6 @@ pub mod lua;
 pub(crate) mod parser;
 pub mod vm;
 
-pub use builtin::basic_tostring;
 pub use compiler::format::format_prototype;
 pub use lua::{
     Context, Executor, ExecutorMode, Fetchable, FromMultiValue, FromValue, IntoMultiValue,

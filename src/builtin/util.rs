@@ -191,7 +191,7 @@ fn strip_trailing_zeros(s: &mut String) {
 /// uses when there is no `__tostring`/`__name`. Numbers and strings get their
 /// literal form; all reference types get `"<type>: 0x<addr>"`, with native
 /// functions tagged `"function: builtin: ..."` to match PUC-Lua.
-pub fn basic_tostring<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> LuaString<'gc> {
+pub(crate) fn basic_tostring<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> LuaString<'gc> {
     if let Some(s) = v.get_string() {
         return s;
     }

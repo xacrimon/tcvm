@@ -42,4 +42,17 @@ impl<'gc> Error<'gc> {
     pub fn level(self) -> usize {
         self.level
     }
+
+    /// The error as a host-printable message, following `lua.c`'s
+    /// `msghandler`: strings and numbers as-is, anything else by type.
+    // TODO: honour `__tostring` once metamethods exist.
+    pub fn message(self, ctx: Context<'gc>) -> LuaString<'gc> {
+        let v = self.value;
+        if v.get_string().is_some() || v.get_integer().is_some() || v.get_float().is_some() {
+            crate::builtin::util::basic_tostring(ctx, v)
+        } else {
+            let text = format!("(error object is a {} value)", v.type_name());
+            LuaString::new(ctx, text.as_bytes())
+        }
+    }
 }
