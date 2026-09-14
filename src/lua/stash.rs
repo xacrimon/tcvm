@@ -45,6 +45,7 @@ impl Fetchable for StashedFunction {
 
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::type_complexity)]
 pub struct StashedTable(pub(crate) DynamicRoot<Rootable![RefLock<TableState<'_>>]>);
 
 impl<'gc> Stashable<'gc> for Table<'gc> {
@@ -63,6 +64,7 @@ impl Fetchable for StashedTable {
 
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::type_complexity)]
 pub struct StashedThread(pub(crate) DynamicRoot<Rootable![RefLock<ThreadState<'_>>]>);
 
 impl<'gc> Stashable<'gc> for Thread<'gc> {
@@ -81,6 +83,7 @@ impl Fetchable for StashedThread {
 
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::type_complexity)]
 pub struct StashedExecutor(pub(crate) DynamicRoot<Rootable![RefLock<ExecutorInner<'_>>]>);
 
 impl<'gc> Stashable<'gc> for Executor<'gc> {
@@ -102,6 +105,7 @@ impl Fetchable for StashedExecutor {
 /// `'static`-erased handle to a Lua [`Value`]. Primitive variants store
 /// their data inline (no allocation); Gc-pointer variants pin the inner
 /// `Gc` directly via the `DynamicRootSet` (no extra `Gc<Value>` wrapper).
+#[allow(clippy::type_complexity)]
 pub enum StashedValue {
     Nil,
     Boolean(bool),
