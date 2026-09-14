@@ -33,14 +33,13 @@ expression: output
 0018  CALL            R4 args=0 ret=2
 0019  SELF            R5 R0 K2  ; "chain"
 0020  CALL            R5 args=2 ret=2
-0021  SELF            R6 R5 K0  ; "id"
-0022  CALL            R6 args=2 ret=2
-0023  MOVE            R5 R6
-0024  CLOSURE         R6 P4
-0025  MOVE            R7 R6
-0026  MOVE            R8 R0
-0027  CALL            R7 args=2 ret=1
-0028  RETURN          R2 count=2
+0021  SELF            R5 R5 K0  ; "id"
+0022  CALL            R5 args=2 ret=2
+0023  CLOSURE         R6 P4
+0024  MOVE            R7 R6
+0025  MOVE            R8 R0
+0026  CALL            R7 args=2 ret=1
+0027  RETURN          R2 count=2
 
 ; prototype 0:
   ; function (params=1, vararg=false, stack=1, upvalues=0)

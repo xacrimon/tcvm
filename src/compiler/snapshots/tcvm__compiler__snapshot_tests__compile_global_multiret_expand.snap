@@ -145,19 +145,17 @@ expression: output
     ;   U1 = upvalue U1
     ; code:
     0000  GETUPVAL        R0 U0
-    0001  SELF            R1 R0 K0  ; "m"
-    0002  CALL            R1 args=2 ret=3
-    0003  MOVE            R0 R1
-    0004  MOVE            R1 R2
-    0005  GETTABUP        R2 U1 K1  ; "o"
-    0006  ERRNNIL         R2 name=K1
-    0007  SETTABUP        R0 U1 K1  ; "o"
-    0008  GETTABUP        R2 U1 K2  ; "p"
-    0009  ERRNNIL         R2 name=K2
-    0010  SETTABUP        R1 U1 K2  ; "p"
-    0011  GETTABUP        R0 U1 K3  ; "print"
-    0012  LOAD            R1 K4  ; "up_recv"
-    0013  GETTABUP        R2 U1 K1  ; "o"
-    0014  GETTABUP        R3 U1 K2  ; "p"
-    0015  CALL            R0 args=4 ret=1
-    0016  RETURN          R0 count=1
+    0001  SELF            R0 R0 K0  ; "m"
+    0002  CALL            R0 args=2 ret=3
+    0003  GETTABUP        R2 U1 K1  ; "o"
+    0004  ERRNNIL         R2 name=K1
+    0005  SETTABUP        R0 U1 K1  ; "o"
+    0006  GETTABUP        R2 U1 K2  ; "p"
+    0007  ERRNNIL         R2 name=K2
+    0008  SETTABUP        R1 U1 K2  ; "p"
+    0009  GETTABUP        R0 U1 K3  ; "print"
+    0010  LOAD            R1 K4  ; "up_recv"
+    0011  GETTABUP        R2 U1 K1  ; "o"
+    0012  GETTABUP        R3 U1 K2  ; "p"
+    0013  CALL            R0 args=4 ret=1
+    0014  RETURN          R0 count=1
