@@ -9,23 +9,23 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  VARARGPREP      fixed=0
-0001  CLOSURE         R0 P0
-0002  LOAD            R1 K0  ; 0
-0003  LOAD            R2 K1  ; 1
-0004  MOVE            R5 R0
-0005  CALL            R5 args=1 ret=2
-0006  MOVE            R3 R5
-0007  LOAD            R4 K1  ; 1
-0008  FORPREP         R2 +2
-0009  ADD             R1 R1 R5
-0010  FORLOOP         R2 -2
-0011  RETURN          R1 count=2
+0000  [  1]  VARARGPREP      fixed=0
+0001  [  1]  CLOSURE         R0 P0
+0002  [  2]  LOAD            R1 K0  ; 0
+0003  [  3]  LOAD            R2 K1  ; 1
+0004  [  3]  MOVE            R5 R0
+0005  [  3]  CALL            R5 args=1 ret=2
+0006  [  3]  MOVE            R3 R5
+0007  [  3]  LOAD            R4 K1  ; 1
+0008  [  3]  FORPREP         R2 +2
+0009  [  3]  ADD             R1 R1 R5
+0010  [  3]  FORLOOP         R2 -2
+0011  [  4]  RETURN          R1 count=2
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=1, upvalues=0)
   ; constants:
   ;   K0 = 3
   ; code:
-  0000  LOAD            R0 K0  ; 3
-  0001  RETURN          R0 count=2
+  0000  [  1]  LOAD            R0 K0  ; 3
+  0001  [  1]  RETURN          R0 count=2

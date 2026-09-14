@@ -1,6 +1,5 @@
 ---
 source: src/compiler/snapshot_tests.rs
-assertion_line: 134
 expression: output
 ---
 ; function (params=0, vararg=true, stack=5, upvalues=1)
@@ -23,21 +22,21 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  VARARGPREP      fixed=0
-0001  LOAD            R0 K0  ; 5
-0002  LOAD            R1 K1  ; 7
-0003  LOAD            R2 K2  ; true
-0004  LOAD            R3 K3  ; nil
-0005  LOAD            R4 K5  ; 8
-0006  SETTABUP        R4 U0 K4  ; "a"
-0007  LOAD            R4 K7  ; 14
-0008  SETTABUP        R4 U0 K6  ; "b"
-0009  LOAD            R4 K9  ; -5
-0010  SETTABUP        R4 U0 K8  ; "c"
-0011  LOAD            R4 K11  ; false
-0012  SETTABUP        R4 U0 K10  ; "d"
-0013  LOAD            R4 K2  ; true
-0014  SETTABUP        R4 U0 K12  ; "e"
-0015  LOAD            R4 K14  ; 36
-0016  SETTABUP        R4 U0 K13  ; "f"
-0017  RETURN          R0 count=1
+0000  [  1]  VARARGPREP      fixed=0
+0001  [  6]  LOAD            R0 K0  ; 5
+0002  [  7]  LOAD            R1 K1  ; 7
+0003  [  8]  LOAD            R2 K2  ; true
+0004  [  9]  LOAD            R3 K3  ; nil
+0005  [ 11]  LOAD            R4 K5  ; 8
+0006  [ 11]  SETTABUP        R4 U0 K4  ; "a"
+0007  [ 12]  LOAD            R4 K7  ; 14
+0008  [ 12]  SETTABUP        R4 U0 K6  ; "b"
+0009  [ 13]  LOAD            R4 K9  ; -5
+0010  [ 13]  SETTABUP        R4 U0 K8  ; "c"
+0011  [ 14]  LOAD            R4 K11  ; false
+0012  [ 14]  SETTABUP        R4 U0 K10  ; "d"
+0013  [ 15]  LOAD            R4 K2  ; true
+0014  [ 15]  SETTABUP        R4 U0 K12  ; "e"
+0015  [ 16]  LOAD            R4 K14  ; 36
+0016  [ 16]  SETTABUP        R4 U0 K13  ; "f"
+0017  [ 16]  RETURN          R0 count=1

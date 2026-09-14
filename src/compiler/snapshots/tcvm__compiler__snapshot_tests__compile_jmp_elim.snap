@@ -10,18 +10,18 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  VARARGPREP      fixed=0
-0001  LOAD            R0 K0  ; 1
-0002  LOAD            R1 K1  ; 2
-0003  LOAD            R2 K2  ; 3
-0004  MOVE            R3 R1
-0005  MOVE            R4 R0
-0006  MOVE            R5 R0
-0007  TEST            R1 inv=false
-0008  JMP             +1
-0009  LOAD            R2 K0  ; 1
-0010  MOVE            R6 R3
-0011  MOVE            R7 R4
-0012  MOVE            R8 R5
-0013  MOVE            R9 R2
-0014  RETURN          R6 count=5
+0000  [  1]  VARARGPREP      fixed=0
+0001  [  6]  LOAD            R0 K0  ; 1
+0002  [  6]  LOAD            R1 K1  ; 2
+0003  [  6]  LOAD            R2 K2  ; 3
+0004  [  8]  MOVE            R3 R1
+0005  [  9]  MOVE            R4 R0
+0006  [ 10]  MOVE            R5 R0
+0007  [ 11]  TEST            R1 inv=false
+0008  [ 11]  JMP             +1
+0009  [ 12]  LOAD            R2 K0  ; 1
+0010  [ 15]  MOVE            R6 R3
+0011  [ 15]  MOVE            R7 R4
+0012  [ 15]  MOVE            R8 R5
+0013  [ 15]  MOVE            R9 R2
+0014  [ 15]  RETURN          R6 count=5

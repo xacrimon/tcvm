@@ -5,7 +5,7 @@ use crate::dmm::{DynamicRootSet, Gc, Mutation, RefLock};
 use crate::env::function::{Function, UpvalueState};
 use crate::env::shape::Shape;
 use crate::env::string::Interner;
-use crate::env::{Symbols, Table, Thread, Value};
+use crate::env::{LuaString, Symbols, Table, Thread, Value};
 use crate::lua::stash::{Fetchable, Stashable};
 use crate::lua::{LoadError, State};
 use crate::parser;
@@ -75,17 +75,18 @@ impl<'gc> Context<'gc> {
 
     /// Parse and compile `source` into a `Function`, with `_ENV` bound to the
     /// runtime's globals table.
-    pub fn load(self, source: &str, _name: Option<&str>) -> Result<Function<'gc>, LoadError> {
+    pub fn load(self, source: &str, name: Option<&str>) -> Result<Function<'gc>, LoadError> {
         let mut cache = NodeCache::new();
-        let (syntax, reports) = parser::parse(&mut cache, source);
+        let parse = parser::parse(&mut cache, source);
         // The parser only reports errors (see `State::report`), so any report
         // means the tree is unusable.
-        if !reports.is_empty() {
-            return Err(LoadError::Parse(reports));
+        if !parse.reports.is_empty() {
+            return Err(LoadError::Parse(parse.reports));
         }
-        let root = parser::syntax::Root::new(syntax)
+        let root = parser::syntax::Root::new(parse.root)
             .ok_or(LoadError::Internal("parser did not produce a Root node"))?;
-        let proto = compile_chunk(self, &root, cache.interner())?;
+        let name = name.map(|n| LuaString::new(self, n.as_bytes()));
+        let proto = compile_chunk(self, &root, &parse.lines, cache.interner(), name)?;
 
         // Main chunk's upvalue 0 is _ENV. Pre-close it onto globals.
         let env_uv = Gc::new(

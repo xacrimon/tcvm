@@ -13,33 +13,33 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  VARARGPREP      fixed=0
-0001  CLOSURE         R0 P0
-0002  NEWTABLE        R1
-0003  LOAD            R2 K1  ; 1
-0004  SETFIELD        R2 R1 K0  ; "b"
-0005  MOVE            R2 R0
-0006  CALL            R2 args=1 ret=2
-0007  LOAD            R3 K1  ; 1
-0008  LOAD            R4 K3  ; 2
-0009  LOAD            R5 K4  ; 3
-0010  SETFIELD        R4 R2 K2  ; "x"
-0011  SETTABLE        R5 R1 R3
-0012  LOAD            R2 K4  ; 3
-0013  SETFIELD        R2 R1 K5  ; "c"
-0014  GETFIELD        R3 R1 K0  ; "b"
-0015  LOAD            R4 K3  ; 2
-0016  POW             R3 R3 R4
-0017  UNM             R3 R3
-0018  LOAD            R4 K1  ; 1
-0019  GETTABLE        R4 R1 R4
-0020  LEN             R5 R1
-0021  MUL             R4 R4 R5
-0022  ADD             R3 R3 R4
-0023  RETURN          R0 count=1
+0000  [  1]  VARARGPREP      fixed=0
+0001  [  1]  CLOSURE         R0 P0
+0002  [  2]  NEWTABLE        R1
+0003  [  3]  LOAD            R2 K1  ; 1
+0004  [  3]  SETFIELD        R2 R1 K0  ; "b"
+0005  [  4]  MOVE            R2 R0
+0006  [  4]  CALL            R2 args=1 ret=2
+0007  [  4]  LOAD            R3 K1  ; 1
+0008  [  4]  LOAD            R4 K3  ; 2
+0009  [  4]  LOAD            R5 K4  ; 3
+0010  [  4]  SETFIELD        R4 R2 K2  ; "x"
+0011  [  4]  SETTABLE        R5 R1 R3
+0012  [  5]  LOAD            R2 K4  ; 3
+0013  [  6]  SETFIELD        R2 R1 K5  ; "c"
+0014  [  7]  GETFIELD        R3 R1 K0  ; "b"
+0015  [  7]  LOAD            R4 K3  ; 2
+0016  [  7]  POW             R3 R3 R4
+0017  [  7]  UNM             R3 R3
+0018  [  7]  LOAD            R4 K1  ; 1
+0019  [  7]  GETTABLE        R4 R1 R4
+0020  [  7]  LEN             R5 R1
+0021  [  7]  MUL             R4 R4 R5
+0022  [  7]  ADD             R3 R3 R4
+0023  [  7]  RETURN          R0 count=1
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=1, upvalues=0)
   ; code:
-  0000  NEWTABLE        R0
-  0001  RETURN          R0 count=2
+  0000  [  1]  NEWTABLE        R0
+  0001  [  1]  RETURN          R0 count=2

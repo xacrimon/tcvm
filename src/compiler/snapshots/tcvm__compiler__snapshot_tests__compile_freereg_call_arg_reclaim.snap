@@ -10,30 +10,30 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  VARARGPREP      fixed=0
-0001  CLOSURE         R0 P0
-0002  NEWTABLE        R1
-0003  MOVE            R2 R0
-0004  LOAD            R3 K0  ; 1
-0005  CALL            R2 args=2 ret=2
-0006  MOVE            R3 R0
-0007  LOAD            R4 K1  ; 2
-0008  CALL            R3 args=2 ret=2
-0009  MOVE            R4 R0
-0010  LOAD            R5 K2  ; 3
-0011  CALL            R4 args=2 ret=0
-0012  SETLIST         R1 count=0 offset=0
-0013  LOAD            R2 K0  ; 1
-0014  GETTABLE        R2 R1 R2
-0015  LOAD            R3 K1  ; 2
-0016  GETTABLE        R3 R1 R3
-0017  ADD             R2 R2 R3
-0018  LOAD            R3 K2  ; 3
-0019  GETTABLE        R3 R1 R3
-0020  ADD             R2 R2 R3
-0021  RETURN          R2 count=2
+0000  [  1]  VARARGPREP      fixed=0
+0001  [  1]  CLOSURE         R0 P0
+0002  [  2]  NEWTABLE        R1
+0003  [  2]  MOVE            R2 R0
+0004  [  2]  LOAD            R3 K0  ; 1
+0005  [  2]  CALL            R2 args=2 ret=2
+0006  [  2]  MOVE            R3 R0
+0007  [  2]  LOAD            R4 K1  ; 2
+0008  [  2]  CALL            R3 args=2 ret=2
+0009  [  2]  MOVE            R4 R0
+0010  [  2]  LOAD            R5 K2  ; 3
+0011  [  2]  CALL            R4 args=2 ret=0
+0012  [  2]  SETLIST         R1 count=0 offset=0
+0013  [  3]  LOAD            R2 K0  ; 1
+0014  [  3]  GETTABLE        R2 R1 R2
+0015  [  3]  LOAD            R3 K1  ; 2
+0016  [  3]  GETTABLE        R3 R1 R3
+0017  [  3]  ADD             R2 R2 R3
+0018  [  3]  LOAD            R3 K2  ; 3
+0019  [  3]  GETTABLE        R3 R1 R3
+0020  [  3]  ADD             R2 R2 R3
+0021  [  3]  RETURN          R2 count=2
 
 ; prototype 0:
   ; function (params=1, vararg=false, stack=1, upvalues=0)
   ; code:
-  0000  RETURN          R0 count=2
+  0000  [  1]  RETURN          R0 count=2

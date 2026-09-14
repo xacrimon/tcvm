@@ -1,5 +1,5 @@
 use crate::dmm::{Gc, Lock, Mutation};
-use crate::env::function::InlineCache;
+use crate::env::function::{InlineCache, LocVar};
 use crate::env::{LuaString, Prototype, Value};
 /// Newtype for register indices, providing type safety over raw u8. Defined
 /// with the instruction word so the emitter can pass one straight to an
@@ -206,6 +206,12 @@ impl ExprDesc {
 /// Mutable accumulator used during compilation of a single function.
 pub struct Chunk<'gc> {
     pub(super) tape: Vec<Instruction>,
+    /// Parallel to `tape`; see `Ctx::emit`.
+    pub(super) lineinfo: Vec<u32>,
+    pub(super) locvars: Vec<LocVar<'gc>>,
+    pub(super) upvalue_names: Vec<LuaString<'gc>>,
+    pub(super) line_defined: u32,
+    pub(super) last_line_defined: u32,
     pub(super) constants: Vec<Value<'gc>>,
     pub(super) prototypes: Vec<Gc<'gc, Prototype<'gc>>>,
     pub(super) upvalue_desc: Vec<UpValueDescriptor>,
@@ -245,6 +251,11 @@ impl<'gc> Chunk<'gc> {
     pub fn new() -> Self {
         Chunk {
             tape: Vec::new(),
+            lineinfo: Vec::new(),
+            locvars: Vec::new(),
+            upvalue_names: Vec::new(),
+            line_defined: 0,
+            last_line_defined: 0,
             constants: Vec::new(),
             prototypes: Vec::new(),
             upvalue_desc: Vec::new(),
@@ -292,6 +303,7 @@ impl<'gc> Chunk<'gc> {
         }
 
         let num_upvalues = self.upvalue_desc.len() as u8;
+        debug_assert_eq!(self.tape.len(), self.lineinfo.len());
 
         let ic_table =
             vec![Lock::new(InlineCache::Empty); self.next_ic_idx as usize].into_boxed_slice();
@@ -309,6 +321,11 @@ impl<'gc> Chunk<'gc> {
                 max_stack_size: self.max_stack,
                 num_upvalues,
                 source: self.source,
+                line_defined: self.line_defined,
+                last_line_defined: self.last_line_defined,
+                lineinfo: self.lineinfo.into_boxed_slice(),
+                locvars: self.locvars.into_boxed_slice(),
+                upvalue_names: self.upvalue_names.into_boxed_slice(),
                 ic_table,
             },
         )

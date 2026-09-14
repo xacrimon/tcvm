@@ -7,6 +7,15 @@ use crate::env::value::Value;
 use crate::instruction::UpValueDescriptor;
 use crate::vm::sequence::{CallbackAction, Execution};
 
+/// Debug record for a named local: active for `start_pc <= pc < end_pc`.
+#[derive(Collect)]
+#[collect(internal, no_drop)]
+pub struct LocVar<'gc> {
+    pub name: LuaString<'gc>,
+    pub start_pc: u32,
+    pub end_pc: u32,
+}
+
 /// A compiled Lua function. Immutable once created.
 /// Shared by all closures created from the same function definition.
 #[derive(Collect)]
@@ -26,7 +35,17 @@ pub struct Prototype<'gc> {
     pub needs_vararg_table: bool,
     pub max_stack_size: u8,
     pub num_upvalues: u8,
+    /// Chunk name as given to `load` (`@file`, `=name`, or the source text).
     pub source: Option<LuaString<'gc>>,
+    /// Lines of the `function` keyword and its `end`; both 0 for a main chunk.
+    pub line_defined: u32,
+    pub last_line_defined: u32,
+    /// Source line per instruction, parallel to `code`.
+    pub(crate) lineinfo: Box<[u32]>,
+    /// Named locals in declaration order with their live pc ranges.
+    pub locvars: Box<[LocVar<'gc>]>,
+    /// Parallel to `upvalue_desc`.
+    pub upvalue_names: Box<[LuaString<'gc>]>,
     /// Inline-cache table indexed by `ic_idx` embedded in
     /// GETTABUP/SETTABUP/GETFIELD/SETFIELD instructions. One entry
     /// per cache site (call site, not instruction count). The slice
@@ -36,6 +55,12 @@ pub struct Prototype<'gc> {
     /// the parent `Prototype`'s `Gc`. See `src/env/shape/mod.rs` for
     /// the IC payload.
     pub ic_table: Box<[Lock<InlineCache<'gc>>]>,
+}
+
+impl<'gc> Prototype<'gc> {
+    pub fn line_for_pc(&self, pc: usize) -> Option<u32> {
+        self.lineinfo.get(pc).copied()
+    }
 }
 
 /// Per-call-site monomorphic inline cache. `Empty` initially; a slow

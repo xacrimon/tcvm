@@ -10,16 +10,18 @@ use cstree::interning::TokenInterner;
 use thiserror::Error;
 
 use crate::dmm::{Collect, Gc};
-use crate::env::Prototype;
+use crate::env::{LuaString, Prototype};
 use crate::lua;
-use crate::parser::syntax;
+use crate::parser::{LineMap, syntax};
 
 pub fn compile_chunk<'gc>(
     ctx: lua::Context<'gc>,
     root: &syntax::Root,
+    lines: &LineMap,
     interner: &TokenInterner,
+    source: Option<LuaString<'gc>>,
 ) -> Result<Gc<'gc, Prototype<'gc>>, CompileError> {
-    rules::compile(ctx, root, interner)
+    rules::compile(ctx, root, lines, interner, source)
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Collect)]

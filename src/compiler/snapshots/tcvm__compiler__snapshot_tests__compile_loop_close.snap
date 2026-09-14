@@ -13,111 +13,111 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  VARARGPREP      fixed=0
-0001  NEWTABLE        R0
-0002  LOAD            R1 K0  ; 1
-0003  LOAD            R2 K1  ; 3
-0004  LOAD            R3 K0  ; 1
-0005  FORPREP         R1 +4
-0006  CLOSURE         R5 P0
-0007  SETTABLE        R5 R0 R4
-0008  CLOSE           R4
-0009  FORLOOP         R1 -4
-0010  LOAD            R1 K2  ; 0
-0011  LOAD            R2 K1  ; 3
-0012  LT              R1 R2 inv=false
-0013  JMP             +7
-0014  LOAD            R2 K0  ; 1
-0015  ADD             R1 R1 R2
-0016  MOVE            R2 R1
-0017  CLOSURE         R3 P1
-0018  SETTABLE        R3 R0 R1
-0019  CLOSE           R2
-0020  JMP             -10
-0021  MOVE            R2 R1
-0022  CLOSURE         R3 P2
-0023  SETTABLE        R3 R0 R1
-0024  LOAD            R3 K0  ; 1
-0025  SUB             R1 R1 R3
-0026  LOAD            R3 K0  ; 1
-0027  LE              R2 R3 inv=false
-0028  JMP             +1
-0029  JMP             +2
-0030  CLOSE           R2
-0031  JMP             -11
-0032  CLOSE           R2
-0033  GETTABUP        R2 U0 K3  ; "ipairs"
-0034  MOVE            R3 R0
-0035  CALL            R2 args=2 ret=4
-0036  TFORPREP        R2 +3
-0037  CLOSURE         R7 P3
-0038  SETTABLE        R7 R0 R6
-0039  CLOSE           R5
-0040  TFORCALL        R2 count=2
-0041  TFORLOOP        R2 -5
-0042  LOAD            R2 K0  ; 1
-0043  CLOSURE         R3 P4
-0044  SETFIELD        R3 R0 K4  ; "f"
-0045  CLOSE           R2
-0046  LOAD            R2 K0  ; 1
-0047  LOAD            R3 K1  ; 3
-0048  LOAD            R4 K0  ; 1
-0049  FORPREP         R2 +9
-0050  CLOSURE         R6 P5
-0051  SETTABLE        R6 R0 R5
-0052  LOAD            R6 K5  ; 2
-0053  EQ              R5 R6 inv=false
-0054  JMP             +2
-0055  CLOSE           R5
-0056  JMP             +2
-0057  CLOSE           R5
-0058  FORLOOP         R2 -9
-0059  RETURN          R0 count=1
+0000  [  1]  VARARGPREP      fixed=0
+0001  [  1]  NEWTABLE        R0
+0002  [  2]  LOAD            R1 K0  ; 1
+0003  [  2]  LOAD            R2 K1  ; 3
+0004  [  2]  LOAD            R3 K0  ; 1
+0005  [  2]  FORPREP         R1 +4
+0006  [  2]  CLOSURE         R5 P0
+0007  [  2]  SETTABLE        R5 R0 R4
+0008  [  2]  CLOSE           R4
+0009  [  2]  FORLOOP         R1 -4
+0010  [  3]  LOAD            R1 K2  ; 0
+0011  [  4]  LOAD            R2 K1  ; 3
+0012  [  4]  LT              R1 R2 inv=false
+0013  [  4]  JMP             +7
+0014  [  4]  LOAD            R2 K0  ; 1
+0015  [  4]  ADD             R1 R1 R2
+0016  [  4]  MOVE            R2 R1
+0017  [  4]  CLOSURE         R3 P1
+0018  [  4]  SETTABLE        R3 R0 R1
+0019  [  4]  CLOSE           R2
+0020  [  4]  JMP             -10
+0021  [  5]  MOVE            R2 R1
+0022  [  5]  CLOSURE         R3 P2
+0023  [  5]  SETTABLE        R3 R0 R1
+0024  [  5]  LOAD            R3 K0  ; 1
+0025  [  5]  SUB             R1 R1 R3
+0026  [  5]  LOAD            R3 K0  ; 1
+0027  [  5]  LE              R2 R3 inv=false
+0028  [  5]  JMP             +1
+0029  [  5]  JMP             +2
+0030  [  5]  CLOSE           R2
+0031  [  5]  JMP             -11
+0032  [  5]  CLOSE           R2
+0033  [  6]  GETTABUP        R2 U0 K3  ; "ipairs"
+0034  [  6]  MOVE            R3 R0
+0035  [  6]  CALL            R2 args=2 ret=4
+0036  [  6]  TFORPREP        R2 +3
+0037  [  6]  CLOSURE         R7 P3
+0038  [  6]  SETTABLE        R7 R0 R6
+0039  [  6]  CLOSE           R5
+0040  [  6]  TFORCALL        R2 count=2
+0041  [  6]  TFORLOOP        R2 -5
+0042  [  7]  LOAD            R2 K0  ; 1
+0043  [  7]  CLOSURE         R3 P4
+0044  [  7]  SETFIELD        R3 R0 K4  ; "f"
+0045  [  7]  CLOSE           R2
+0046  [  8]  LOAD            R2 K0  ; 1
+0047  [  8]  LOAD            R3 K1  ; 3
+0048  [  8]  LOAD            R4 K0  ; 1
+0049  [  8]  FORPREP         R2 +9
+0050  [  8]  CLOSURE         R6 P5
+0051  [  8]  SETTABLE        R6 R0 R5
+0052  [  8]  LOAD            R6 K5  ; 2
+0053  [  8]  EQ              R5 R6 inv=false
+0054  [  8]  JMP             +2
+0055  [  8]  CLOSE           R5
+0056  [  8]  JMP             +2
+0057  [  8]  CLOSE           R5
+0058  [  8]  FORLOOP         R2 -9
+0059  [  8]  RETURN          R0 count=1
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=1, upvalues=1)
   ; upvalues:
   ;   U0 = local R4
   ; code:
-  0000  GETUPVAL        R0 U0
-  0001  RETURN          R0 count=2
+  0000  [  2]  GETUPVAL        R0 U0
+  0001  [  2]  RETURN          R0 count=2
 
 ; prototype 1:
   ; function (params=0, vararg=false, stack=1, upvalues=1)
   ; upvalues:
   ;   U0 = local R2
   ; code:
-  0000  GETUPVAL        R0 U0
-  0001  RETURN          R0 count=2
+  0000  [  4]  GETUPVAL        R0 U0
+  0001  [  4]  RETURN          R0 count=2
 
 ; prototype 2:
   ; function (params=0, vararg=false, stack=1, upvalues=1)
   ; upvalues:
   ;   U0 = local R2
   ; code:
-  0000  GETUPVAL        R0 U0
-  0001  RETURN          R0 count=2
+  0000  [  5]  GETUPVAL        R0 U0
+  0001  [  5]  RETURN          R0 count=2
 
 ; prototype 3:
   ; function (params=0, vararg=false, stack=1, upvalues=1)
   ; upvalues:
   ;   U0 = local R6
   ; code:
-  0000  GETUPVAL        R0 U0
-  0001  RETURN          R0 count=2
+  0000  [  6]  GETUPVAL        R0 U0
+  0001  [  6]  RETURN          R0 count=2
 
 ; prototype 4:
   ; function (params=0, vararg=false, stack=1, upvalues=1)
   ; upvalues:
   ;   U0 = local R2
   ; code:
-  0000  GETUPVAL        R0 U0
-  0001  RETURN          R0 count=2
+  0000  [  7]  GETUPVAL        R0 U0
+  0001  [  7]  RETURN          R0 count=2
 
 ; prototype 5:
   ; function (params=0, vararg=false, stack=1, upvalues=1)
   ; upvalues:
   ;   U0 = local R5
   ; code:
-  0000  GETUPVAL        R0 U0
-  0001  RETURN          R0 count=2
+  0000  [  8]  GETUPVAL        R0 U0
+  0001  [  8]  RETURN          R0 count=2

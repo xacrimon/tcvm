@@ -1,6 +1,5 @@
 ---
 source: src/compiler/snapshot_tests.rs
-assertion_line: 135
 expression: output
 ---
 ; function (params=0, vararg=true, stack=3, upvalues=1)
@@ -13,12 +12,12 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  VARARGPREP      fixed=0
-0001  LOAD            R0 K0  ; "hello"
-0002  NEWTABLE        R1
-0003  LOAD            R2 K1  ; "abc"
-0004  LEN             R2 R2
-0005  SETTABUP        R0 U0 K2  ; "a"
-0006  SETTABUP        R1 U0 K3  ; "b"
-0007  SETTABUP        R2 U0 K4  ; "c"
-0008  RETURN          R0 count=1
+0000  [  1]  VARARGPREP      fixed=0
+0001  [  6]  LOAD            R0 K0  ; "hello"
+0002  [  7]  NEWTABLE        R1
+0003  [  8]  LOAD            R2 K1  ; "abc"
+0004  [  8]  LEN             R2 R2
+0005  [ 10]  SETTABUP        R0 U0 K2  ; "a"
+0006  [ 11]  SETTABUP        R1 U0 K3  ; "b"
+0007  [ 12]  SETTABUP        R2 U0 K4  ; "c"
+0008  [ 12]  RETURN          R0 count=1

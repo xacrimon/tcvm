@@ -1,6 +1,5 @@
 ---
 source: src/compiler/snapshot_tests.rs
-assertion_line: 69
 expression: output
 ---
 ; function (params=0, vararg=true, stack=10, upvalues=1)
@@ -13,52 +12,52 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  VARARGPREP      fixed=0
-0001  CLOSURE         R0 P0
-0002  CLOSURE         R1 P1
-0003  CLOSURE         R2 P2
-0004  CLOSURE         R3 P3
-0005  MOVE            R4 R2
-0006  LOAD            R5 K0  ; 3
-0007  LOAD            R6 K1  ; 4
-0008  CALL            R4 args=3 ret=2
-0009  MOVE            R5 R1
-0010  LOAD            R6 K0  ; 3
-0011  LOAD            R7 K2  ; 1
-0012  CALL            R5 args=3 ret=2
-0013  MOVE            R6 R3
-0014  LOAD            R7 K3  ; 6
-0015  MOVE            R8 R5
-0016  CALL            R6 args=3 ret=2
-0017  MOVE            R7 R0
-0018  MOVE            R8 R4
-0019  MOVE            R9 R6
-0020  CALL            R7 args=3 ret=2
-0021  GETTABUP        R8 U0 K4  ; "print"
-0022  MOVE            R9 R7
-0023  CALL            R8 args=2 ret=1
-0024  RETURN          R0 count=1
+0000  [  1]  VARARGPREP      fixed=0
+0001  [  3]  CLOSURE         R0 P0
+0002  [  7]  CLOSURE         R1 P1
+0003  [ 11]  CLOSURE         R2 P2
+0004  [ 15]  CLOSURE         R3 P3
+0005  [ 17]  MOVE            R4 R2
+0006  [ 17]  LOAD            R5 K0  ; 3
+0007  [ 17]  LOAD            R6 K1  ; 4
+0008  [ 17]  CALL            R4 args=3 ret=2
+0009  [ 18]  MOVE            R5 R1
+0010  [ 18]  LOAD            R6 K0  ; 3
+0011  [ 18]  LOAD            R7 K2  ; 1
+0012  [ 18]  CALL            R5 args=3 ret=2
+0013  [ 19]  MOVE            R6 R3
+0014  [ 19]  LOAD            R7 K3  ; 6
+0015  [ 19]  MOVE            R8 R5
+0016  [ 19]  CALL            R6 args=3 ret=2
+0017  [ 20]  MOVE            R7 R0
+0018  [ 20]  MOVE            R8 R4
+0019  [ 20]  MOVE            R9 R6
+0020  [ 20]  CALL            R7 args=3 ret=2
+0021  [ 21]  GETTABUP        R8 U0 K4  ; "print"
+0022  [ 21]  MOVE            R9 R7
+0023  [ 21]  CALL            R8 args=2 ret=1
+0024  [ 21]  RETURN          R0 count=1
 
 ; prototype 0:
   ; function (params=2, vararg=false, stack=3, upvalues=0)
   ; code:
-  0000  ADD             R2 R0 R1
-  0001  RETURN          R2 count=2
+  0000  [  2]  ADD             R2 R0 R1
+  0001  [  2]  RETURN          R2 count=2
 
 ; prototype 1:
   ; function (params=2, vararg=false, stack=3, upvalues=0)
   ; code:
-  0000  SUB             R2 R0 R1
-  0001  RETURN          R2 count=2
+  0000  [  6]  SUB             R2 R0 R1
+  0001  [  6]  RETURN          R2 count=2
 
 ; prototype 2:
   ; function (params=2, vararg=false, stack=3, upvalues=0)
   ; code:
-  0000  MUL             R2 R0 R1
-  0001  RETURN          R2 count=2
+  0000  [ 10]  MUL             R2 R0 R1
+  0001  [ 10]  RETURN          R2 count=2
 
 ; prototype 3:
   ; function (params=2, vararg=false, stack=3, upvalues=0)
   ; code:
-  0000  DIV             R2 R0 R1
-  0001  RETURN          R2 count=2
+  0000  [ 14]  DIV             R2 R0 R1
+  0001  [ 14]  RETURN          R2 count=2
