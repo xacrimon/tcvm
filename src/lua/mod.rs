@@ -114,30 +114,7 @@ impl Lua {
     /// host — `finish` has no way to surface yielded values, and a
     /// public host-side resume API isn't implemented yet.
     pub fn finish(&mut self, ex: &StashedExecutor) -> Result<(), RuntimeError> {
-        enum Outcome {
-            Done,
-            Yielded,
-            Pending,
-        }
-        loop {
-            // The enter-closure can't return `StepResult<'gc>` across the
-            // arena boundary (it carries `'gc`-branded `Value`s). Reduce
-            // to a `'static` outcome inside the closure; the result values
-            // surface through `take_result`.
-            let outcome = self.try_enter(|ctx| -> Result<Outcome, RuntimeError> {
-                let executor = ctx.fetch(ex);
-                Ok(match executor.step(ctx)? {
-                    StepResult::Done => Outcome::Done,
-                    StepResult::Yielded(_) => Outcome::Yielded,
-                    StepResult::Pending => Outcome::Pending,
-                })
-            })?;
-            match outcome {
-                Outcome::Done => return Ok(()),
-                Outcome::Yielded => return Err(RuntimeError::MainYielded),
-                Outcome::Pending => continue,
-            }
-        }
+        self.drive(ex, |_, _| Ok(()))
     }
 
     /// `finish` then take typed results from the executor.
@@ -145,11 +122,41 @@ impl Lua {
     where
         R: for<'gc> FromMultiValue<'gc>,
     {
-        self.finish(ex)?;
-        self.try_enter(|ctx| {
-            let executor = ctx.fetch(ex);
-            executor.take_result::<R>(ctx)
-        })
+        self.drive(ex, |executor, ctx| executor.take_result::<R>(ctx))
+    }
+
+    /// Step the executor until the main thread completes, then run `on_done`
+    /// in the same `enter` as the final step so results are harvested
+    /// without an intervening arena mutation.
+    fn drive<R, F>(&mut self, ex: &StashedExecutor, on_done: F) -> Result<R, RuntimeError>
+    where
+        F: for<'gc> FnOnce(Executor<'gc>, Context<'gc>) -> Result<R, RuntimeError>,
+    {
+        enum Outcome<R> {
+            Done(R),
+            Yielded,
+            Pending,
+        }
+        // Wrapped so the `FnOnce` can be borrowed by each iteration's closure.
+        let mut on_done = Some(on_done);
+        loop {
+            // The enter-closure can't return `StepResult<'gc>` across the
+            // arena boundary (it carries `'gc`-branded `Value`s), so reduce
+            // to a `'static` outcome inside the closure.
+            let outcome = self.try_enter(|ctx| -> Result<Outcome<R>, RuntimeError> {
+                let executor = ctx.fetch(ex);
+                Ok(match executor.step(ctx)? {
+                    StepResult::Done => Outcome::Done(on_done.take().unwrap()(executor, ctx)?),
+                    StepResult::Yielded(_) => Outcome::Yielded,
+                    StepResult::Pending => Outcome::Pending,
+                })
+            })?;
+            match outcome {
+                Outcome::Done(r) => return Ok(r),
+                Outcome::Yielded => return Err(RuntimeError::MainYielded),
+                Outcome::Pending => continue,
+            }
+        }
     }
 
     /// Re-arm a yielded executor with new arguments and drive until the
