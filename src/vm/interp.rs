@@ -1,4 +1,4 @@
-use crate::dmm::{Gc, Mutation, RefLock};
+use crate::dmm::{Gc, Lock, Mutation, RefLock};
 use crate::env::function::{
     Function, FunctionKind, InlineCache, LuaClosure, NativeClosure, NativeContext, Stack, Upvalue,
     UpvalueState,
@@ -107,6 +107,39 @@ pub(crate) type Registers<'gc, 'a> = *mut Value<'gc>;
 pub(crate) struct DispatchState<'gc> {
     /// Set by `raise!` right before it tail-calls `impl_error`, which takes it.
     fault: Option<OpError<'gc>>,
+    /// The running closure's constant pool, upvalue array and inline-cache
+    /// table, so `constant!`, `upvalue!` and `read_ic` are one load off `ds`
+    /// instead of a five-deep chase through `thread.frames`. Valid because
+    /// the frame keeps the closure alive; every site that changes the top
+    /// Lua frame and keeps dispatching must `bind` the new closure alongside
+    /// `registers`.
+    constants: *const Value<'gc>,
+    upvalues: *const Upvalue<'gc>,
+    ic_table: *const Lock<InlineCache<'gc>>,
+}
+
+impl<'gc> DispatchState<'gc> {
+    fn bind(&mut self, closure: &LuaClosure<'gc>) {
+        self.constants = closure.proto.constants.as_ptr();
+        self.upvalues = closure.upvalues.as_ptr();
+        self.ic_table = closure.proto.ic_table.as_ptr();
+    }
+
+    /// Debug check that the cache matches the top frame's closure: catches a
+    /// frame change that forgot to `bind`, which the bounds checks alone
+    /// would not (a stale pool is usually long enough for the index).
+    #[inline(always)]
+    fn debug_assert_bound(&self, thread: &ThreadState<'gc>) {
+        if cfg!(debug_assertions) {
+            let closure = &thread.top_lua().unwrap().closure;
+            debug_assert!(std::ptr::eq(
+                self.constants,
+                closure.proto.constants.as_ptr()
+            ));
+            debug_assert!(std::ptr::eq(self.upvalues, closure.upvalues.as_ptr()));
+            debug_assert!(std::ptr::eq(self.ic_table, closure.proto.ic_table.as_ptr()));
+        }
+    }
 }
 
 /// Every dispatch target (handler, slow path, continuation) carries
@@ -216,8 +249,12 @@ macro_rules! helpers {
         macro_rules! constant {
             ($$idx:expr) => {{
                 unsafe {
-                    let frame = $thread.top_lua_unchecked();
-                    *frame.closure.proto.constants.get_unchecked($$idx as usize)
+                    $ds.debug_assert_bound($thread);
+                    debug_assert!(
+                        ($$idx as usize)
+                            < $thread.top_lua_unchecked().closure.proto.constants.len()
+                    );
+                    *$ds.constants.add($$idx as usize)
                 }
             }};
         }
@@ -226,8 +263,11 @@ macro_rules! helpers {
         macro_rules! upvalue {
             ($$idx:expr) => {{
                 unsafe {
-                    let frame = $thread.top_lua_unchecked();
-                    *frame.closure.upvalues.get_unchecked($$idx as usize)
+                    $ds.debug_assert_bound($thread);
+                    debug_assert!(
+                        ($$idx as usize) < $thread.top_lua_unchecked().closure.upvalues.len()
+                    );
+                    *$ds.upvalues.add($$idx as usize)
                 }
             }};
         }
@@ -257,8 +297,13 @@ macro_rules! helpers {
                 let __mm_meta: Value<'gc> = $$meta;
                 let __mm_cont: Continuation = $$cont;
                 match schedule_meta_call($ctx, $thread, __mm_meta, $$args, __mm_cont, $ip) {
-                    MetaDispatch::Lua { new_ip, new_base } => {
+                    MetaDispatch::Lua {
+                        new_ip,
+                        new_base,
+                        closure,
+                    } => {
                         $ip = new_ip;
+                        $ds.bind(&closure);
                         $registers = unsafe { $thread.stack.as_mut_ptr().add(new_base) };
                         dispatch!();
                     }
@@ -488,12 +533,21 @@ macro_rules! table_set_slow_body {
 /// `SETTABUP` instruction whose prototype was assembled with a matching
 /// `ic_table` length.
 #[inline(always)]
-fn read_ic<'gc>(thread: &ThreadState<'gc>, ic_idx: u16) -> InlineCache<'gc> {
+fn read_ic<'gc>(
+    ds: &DispatchState<'gc>,
+    thread: &ThreadState<'gc>,
+    ic_idx: u16,
+) -> InlineCache<'gc> {
     // SAFETY: ic_idx is allocated at compile-time within the prototype's
     // IC count; debug-asserted in alloc_ic_slot's saturating_add.
-    let proto = unsafe { &thread.top_lua_unchecked().closure.proto };
-    debug_assert!((ic_idx as usize) < proto.ic_table.len());
-    unsafe { proto.ic_table.get_unchecked(ic_idx as usize) }.get()
+    ds.debug_assert_bound(thread);
+    debug_assert!(
+        (ic_idx as usize)
+            < unsafe { &thread.top_lua_unchecked().closure.proto }
+                .ic_table
+                .len()
+    );
+    unsafe { (*ds.ic_table.add(ic_idx as usize)).get() }
 }
 
 /// Refill the IC entry. Called by slow paths after they've done a full
@@ -570,17 +624,23 @@ fn fill_ic_for_constant_key<'gc>(
 #[inline(never)]
 pub(crate) fn run_thread<'gc>(ctx: Context<'gc>, thread: Thread<'gc>) {
     let mut ts = thread.borrow_mut(ctx.mutation());
+    let mut ds = DispatchState {
+        fault: None,
+        constants: std::ptr::null(),
+        upvalues: std::ptr::null(),
+        ic_table: std::ptr::null(),
+    };
     let (ip, base) = {
         let frame = ts
             .top_lua()
             .expect("run_thread requires a seeded Lua frame");
+        ds.bind(&frame.closure);
         let code_ptr = frame.closure.proto.code.as_ptr();
         let ip = unsafe { code_ptr.add(frame.pc) };
         (ip, frame.base)
     };
     let registers = unsafe { ts.stack.as_mut_ptr().add(base) };
     let handlers = HANDLERS.as_ptr() as *const ();
-    let mut ds = DispatchState { fault: None };
     op_nop(
         Instruction::nop(),
         ctx,
@@ -744,7 +804,7 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
         raise!(OpError::Index(t_val));
     };
 
-    let cache = read_ic(thread, ic_idx);
+    let cache = read_ic(ds, thread, ic_idx);
     let t_state = t.inner().borrow();
     if let Some(slot) = ic_check(cache, t_state.shape()) {
         if slot != InlineCache::ABSENT_SLOT {
@@ -805,7 +865,7 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
     };
 
     let v = reg!(src);
-    let cache = read_ic(thread, ic_idx);
+    let cache = read_ic(ds, thread, ic_idx);
     let t_state = t.inner().borrow();
     if let Some(slot) = ic_check(cache, t_state.shape()) {
         if slot != InlineCache::ABSENT_SLOT {
@@ -989,7 +1049,7 @@ extern "rust-preserve-none" fn op_getfield<'gc>(
         become getfield_slow(instruction, ctx, thread, registers, ip, handlers, ds);
     };
 
-    let cache = read_ic(thread, ic_idx);
+    let cache = read_ic(ds, thread, ic_idx);
     let t_state = t.inner().borrow();
     if let Some(slot) = ic_check(cache, t_state.shape()) {
         if slot != InlineCache::ABSENT_SLOT {
@@ -1050,7 +1110,7 @@ extern "rust-preserve-none" fn op_setfield<'gc>(
     };
 
     let v = reg!(src);
-    let cache = read_ic(thread, ic_idx);
+    let cache = read_ic(ds, thread, ic_idx);
     let t_state = t.inner().borrow();
     if let Some(slot) = ic_check(cache, t_state.shape()) {
         if slot != InlineCache::ABSENT_SLOT {
@@ -1885,6 +1945,7 @@ extern "rust-preserve-none" fn op_call<'gc>(
                 continuation: None,
             });
             ip = closure.proto.code.as_ptr();
+            ds.bind(&closure);
             registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
             dispatch!();
         }
@@ -2018,6 +2079,7 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
                 thread.stack[new_base + i] = Value::nil();
             }
             ip = closure.proto.code.as_ptr();
+            ds.bind(&closure);
             registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
             dispatch!();
         }
@@ -2064,8 +2126,13 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
                         }
                         FrameReturn::TopLevel => return,
                         FrameReturn::ToNonLua => return,
-                        FrameReturn::Caller { new_base, new_ip } => {
+                        FrameReturn::Caller {
+                            new_base,
+                            new_ip,
+                            closure,
+                        } => {
                             ip = new_ip;
+                            ds.bind(&closure);
                             registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
                             dispatch!();
                         }
@@ -2130,8 +2197,13 @@ extern "rust-preserve-none" fn op_return<'gc>(
         }
         FrameReturn::TopLevel => return,
         FrameReturn::ToNonLua => return,
-        FrameReturn::Caller { new_base, new_ip } => {
+        FrameReturn::Caller {
+            new_base,
+            new_ip,
+            closure,
+        } => {
             ip = new_ip;
+            ds.bind(&closure);
             registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
             dispatch!();
         }
@@ -2865,7 +2937,7 @@ pub(crate) fn invoke_native<'gc>(
 /// What should happen after a frame returns with values at
 /// `stack[values_base .. values_base + nret]`. Produced by [`frame_return`],
 /// consumed by `op_return` and the native-tailcall path in `op_tailcall`.
-pub(crate) enum FrameReturn {
+pub(crate) enum FrameReturn<'gc> {
     /// A continuation was attached to the departing frame; caller must
     /// tail-call `cont_resume`. The continuation's `results_base` / `nret`
     /// have already been written back into the top frame.
@@ -2874,11 +2946,12 @@ pub(crate) enum FrameReturn {
     /// Caller should return from the handler.
     TopLevel,
     /// Normal return to the caller frame, which has been restored to the
-    /// top of the frame stack. Caller updates `ip` / `registers` and
-    /// dispatches.
+    /// top of the frame stack. Caller rebinds `ip` / `registers` /
+    /// `DispatchState` to it and dispatches.
     Caller {
         new_base: usize,
         new_ip: *const Instruction,
+        closure: Gc<'gc, LuaClosure<'gc>>,
     },
     /// The popped Lua frame's parent is a non-Lua frame (Sequence /
     /// WaitThread / Start / Error). The values have been left at
@@ -2895,7 +2968,7 @@ pub(crate) fn frame_return<'gc>(
     thread: &mut ThreadState<'gc>,
     values_base: usize,
     nret: usize,
-) -> FrameReturn {
+) -> FrameReturn<'gc> {
     let (cur_base, num_results, num_extras, continuation) = {
         let f = thread.top_lua().unwrap();
         (f.base, f.num_results, f.num_extras as usize, f.continuation)
@@ -2979,7 +3052,11 @@ pub(crate) fn frame_return<'gc>(
     let caller = thread.top_lua().unwrap();
     let new_base = caller.base;
     let new_ip = unsafe { caller.closure.proto.code.as_ptr().add(caller.pc) };
-    FrameReturn::Caller { new_base, new_ip }
+    FrameReturn::Caller {
+        new_base,
+        new_ip,
+        closure: caller.closure,
+    }
 }
 
 /// Close all open upvalues pointing at stack indices >= `start_idx`.
@@ -3162,12 +3239,14 @@ pub(crate) enum CallTarget<'gc> {
 
 /// Outcome of [`schedule_meta_call`], consumed by the `invoke_metamethod!`
 /// macro. Captures the three ways a continuation-driven call can proceed.
-pub(crate) enum MetaDispatch {
+pub(crate) enum MetaDispatch<'gc> {
     /// Resolved to a Lua closure; a frame carrying the continuation was
-    /// pushed. The caller rebinds `ip`/`registers` to this and dispatches.
+    /// pushed. The caller rebinds `ip`/`registers` and `DispatchState` to
+    /// the new frame and dispatches.
     Lua {
         new_ip: *const Instruction,
         new_base: usize,
+        closure: Gc<'gc, LuaClosure<'gc>>,
     },
     /// Resolved to a native callback that returned synchronously. Its results
     /// sit at `stack[results_base .. results_base + nret]`; the caller applies
@@ -3284,7 +3363,7 @@ fn schedule_meta_call<'gc>(
     args: &[Value<'gc>],
     cont: Continuation,
     caller_ip: *const Instruction,
-) -> MetaDispatch {
+) -> MetaDispatch<'gc> {
     // Save caller's pc; no decisions here depend on knowing the final target.
     // The native suspend path relies on this so the executor re-enters the
     // caller frame at the instruction following the one that scheduled us.
@@ -3357,7 +3436,11 @@ fn schedule_meta_call<'gc>(
     });
 
     let new_ip = closure.proto.code.as_ptr();
-    MetaDispatch::Lua { new_ip, new_base }
+    MetaDispatch::Lua {
+        new_ip,
+        new_base,
+        closure,
+    }
 }
 
 /// Native arm of [`schedule_meta_call`]. The callable native `nc` and its
@@ -3372,7 +3455,7 @@ fn schedule_native_meta_call<'gc>(
     caller_base: usize,
     new_base: usize,
     actual_args: usize,
-) -> MetaDispatch {
+) -> MetaDispatch<'gc> {
     use crate::vm::sequence::CallbackAction;
 
     let args_base = new_base;
@@ -3455,6 +3538,7 @@ macro_rules! finalize_return {
         let __caller_base = {
             let caller = $thread.top_lua().unwrap();
             $ip = unsafe { caller.closure.proto.code.as_ptr().add(caller.pc) };
+            $ds.bind(&caller.closure);
             caller.base
         };
         $registers = unsafe { $thread.stack.as_mut_ptr().add(__caller_base) };
