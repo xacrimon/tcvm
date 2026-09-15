@@ -1919,9 +1919,7 @@ extern "rust-preserve-none" fn op_eq<'gc>(
     let b = reg!(rhs);
     if num::raw_eq(a, b) {
         // Primitive or pointer-equal — no metamethod consultation.
-        if !inverted {
-            skip!();
-        }
+        skip_if!(!inverted);
         dispatch!();
     }
 
@@ -1945,9 +1943,7 @@ extern "rust-preserve-none" fn op_eq<'gc>(
     }
 
     // Not equal and no applicable metamethod.
-    if inverted {
-        skip!();
-    }
+    skip_if!(inverted);
     dispatch!();
 }
 
@@ -1984,9 +1980,7 @@ extern "rust-preserve-none" fn op_lt<'gc>(
     };
 
     if let Some(r) = primitive {
-        if r != inverted {
-            skip!();
-        }
+        skip_if!(r != inverted);
         dispatch!();
     }
 
@@ -2039,9 +2033,7 @@ extern "rust-preserve-none" fn op_le<'gc>(
     };
 
     if let Some(r) = primitive {
-        if r != inverted {
-            skip!();
-        }
+        skip_if!(r != inverted);
         dispatch!();
     }
 
@@ -2246,9 +2238,7 @@ extern "rust-preserve-none" fn op_test<'gc>(
     helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (src, inverted) = instruction.ab_flag();
     let truthy = !reg!(src).is_falsy();
-    if truthy != inverted {
-        skip!();
-    }
+    skip_if!(truthy != inverted);
     dispatch!();
 }
 
@@ -2270,7 +2260,7 @@ extern "rust-preserve-none" fn op_testset<'gc>(
     let val = reg!(src);
     let truthy = !val.is_falsy();
     if truthy == inverted {
-        skip!();
+        skip_if!(true);
     } else {
         *reg!(ref mut dst) = val;
     }
