@@ -383,8 +383,43 @@ pub struct Function<'gc>(Gc<'gc, FunctionKind<'gc>>);
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub enum FunctionKind<'gc> {
-    Lua(Gc<'gc, LuaClosure<'gc>>),
+    /// Inline, not behind another `Gc`: CALL reaches the closure's `code`
+    /// with one load fewer.
+    Lua(LuaClosure<'gc>),
     Native(NativeClosure<'gc>),
+}
+
+/// A `Function` known to hold a Lua closure. Derefs to the closure without
+/// re-checking the kind, so frames can keep one pointer and still reach
+/// `proto`, `upvalues` and the CALL-path copies directly.
+#[derive(Clone, Copy, Collect)]
+#[collect(internal, no_drop)]
+pub struct LuaFn<'gc>(Gc<'gc, FunctionKind<'gc>>);
+
+impl<'gc> LuaFn<'gc> {
+    /// # Safety
+    /// `f` must hold `FunctionKind::Lua`.
+    #[inline(always)]
+    pub unsafe fn from_function_unchecked(f: Function<'gc>) -> Self {
+        debug_assert!(matches!(&*f.0, FunctionKind::Lua(_)));
+        LuaFn(f.0)
+    }
+
+    pub fn function(self) -> Function<'gc> {
+        Function(self.0)
+    }
+}
+
+impl<'gc> std::ops::Deref for LuaFn<'gc> {
+    type Target = LuaClosure<'gc>;
+    #[inline(always)]
+    fn deref(&self) -> &LuaClosure<'gc> {
+        match &*self.0 {
+            FunctionKind::Lua(c) => c,
+            // SAFETY: the constructor's contract.
+            FunctionKind::Native(_) => unsafe { std::hint::unreachable_unchecked() },
+        }
+    }
 }
 
 impl<'gc> Function<'gc> {
@@ -393,19 +428,16 @@ impl<'gc> Function<'gc> {
         proto: Gc<'gc, Prototype<'gc>>,
         upvalues: Box<[Upvalue<'gc>]>,
     ) -> Self {
-        let closure = Gc::new(
-            mc,
-            LuaClosure {
-                proto,
-                upvalues,
-                code: proto.code.as_ptr(),
-                constants: proto.constants.as_ptr(),
-                ic_table: proto.ic_table.as_ptr(),
-                max_stack_size: proto.max_stack_size,
-                num_params: proto.num_params,
-                is_vararg: proto.is_vararg,
-            },
-        );
+        let closure = LuaClosure {
+            proto,
+            upvalues,
+            code: proto.code.as_ptr(),
+            constants: proto.constants.as_ptr(),
+            ic_table: proto.ic_table.as_ptr(),
+            max_stack_size: proto.max_stack_size,
+            num_params: proto.num_params,
+            is_vararg: proto.is_vararg,
+        };
         Function(Gc::new(mc, FunctionKind::Lua(closure)))
     }
 
@@ -429,9 +461,9 @@ impl<'gc> Function<'gc> {
         ))
     }
 
-    pub fn as_lua(self) -> Option<Gc<'gc, LuaClosure<'gc>>> {
+    pub fn as_lua(self) -> Option<LuaFn<'gc>> {
         match &*self.0 {
-            FunctionKind::Lua(cl) => Some(*cl),
+            FunctionKind::Lua(_) => Some(LuaFn(self.0)),
             _ => None,
         }
     }
