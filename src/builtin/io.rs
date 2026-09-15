@@ -843,7 +843,7 @@ fn default_file<'gc>(
         io_state(&nctx).raw_set(nctx.ctx, str_val(nctx.ctx, slot), Value::userdata(handle));
     }
     let cur = state_get(nctx.ctx, io_state(&nctx), slot);
-    stack.replace(&[cur]);
+    stack.ret1(cur);
     Ok(CallbackAction::Return)
 }
 
@@ -872,7 +872,7 @@ fn lua_lines<'gc>(
     // Validate formats up front (Lua reports lines-format errors eagerly).
     parse_formats(nctx.ctx, fmt_args, "lines", 2)?;
     let iter = make_lines_iter(nctx.ctx, handle, close_eof, fmt_args);
-    stack.replace(&[Value::function(iter)]);
+    stack.ret1(Value::function(iter));
     Ok(CallbackAction::Return)
 }
 
@@ -890,7 +890,7 @@ fn lua_type<'gc>(
         }
         None => Value::nil(),
     };
-    stack.replace(&[result]);
+    stack.ret1(result);
     Ok(CallbackAction::Return)
 }
 
@@ -919,7 +919,7 @@ fn lua_tmpfile<'gc>(
                 file_metatable(&nctx),
                 LuaFile::open(Stream::File(BufReader::new(file)), true, true),
             );
-            stack.replace(&[Value::userdata(u)]);
+            stack.ret1(Value::userdata(u));
         }
         Err(e) => stack.replace(&io_fail(nctx.ctx, None, &e)),
     }
@@ -976,7 +976,7 @@ fn lua_file_lines<'gc>(
     let fmt_args = &stack.as_slice()[1..];
     parse_formats(nctx.ctx, fmt_args, "lines", 2)?;
     let iter = make_lines_iter(nctx.ctx, self_val, false, fmt_args);
-    stack.replace(&[Value::function(iter)]);
+    stack.ret1(Value::function(iter));
     Ok(CallbackAction::Return)
 }
 
@@ -1092,7 +1092,7 @@ fn lua_file_setvbuf<'gc>(
             ));
         }
     }
-    stack.replace(&[Value::boolean(true)]);
+    stack.ret1(Value::boolean(true));
     Ok(CallbackAction::Return)
 }
 

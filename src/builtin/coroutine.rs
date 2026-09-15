@@ -48,7 +48,7 @@ fn lua_create<'gc>(
         ts.frames.push(Frame::Start(f));
         ts.status = ThreadStatus::Suspended;
     }
-    stack.replace(&[Value::thread(thread)]);
+    stack.ret1(Value::thread(thread));
     Ok(CallbackAction::Return)
 }
 
@@ -126,7 +126,7 @@ fn lua_status<'gc>(
         }
     };
     let v = Value::string(LuaString::new(nctx.ctx, s));
-    stack.replace(&[v]);
+    stack.ret1(v);
     Ok(CallbackAction::Return)
 }
 
@@ -160,7 +160,7 @@ fn lua_isyieldable<'gc>(
         })?;
         !target.ptr_eq(nctx.ctx.main_thread())
     };
-    stack.replace(&[Value::boolean(yieldable)]);
+    stack.ret1(Value::boolean(yieldable));
     Ok(CallbackAction::Return)
 }
 
@@ -183,7 +183,7 @@ fn lua_wrap<'gc>(
     }
     let upvalues: Box<[Value<'gc>]> = Box::new([Value::thread(thread)]);
     let wrapper = Function::new_native(nctx.ctx.mutation(), wrap_callback as NativeFn, upvalues);
-    stack.replace(&[Value::function(wrapper)]);
+    stack.ret1(Value::function(wrapper));
     Ok(CallbackAction::Return)
 }
 
