@@ -81,7 +81,7 @@ fn lua_collectgarbage<'gc>(
         // shape/units match; full GC accounting tracked in #62.)
         b"count" => {
             let kb = nctx.ctx.mutation().metrics().total_allocation() as f64 / 1024.0;
-            stack.replace(&[Value::float(kb)]);
+            stack.ret1(Value::float(kb));
         }
         b"isrunning" => stack.replace(&[Value::boolean(true)]),
         b"step" => stack.replace(&[Value::boolean(false)]),
@@ -136,7 +136,7 @@ fn lua_getmetatable<'gc>(
         }
         None => Value::nil(),
     };
-    stack.replace(&[result]);
+    stack.ret1(result);
     Ok(CallbackAction::Return)
 }
 
@@ -177,7 +177,7 @@ fn ipairs_aux<'gc>(
     let i = stack.get(1).get_integer().unwrap_or(0) + 1;
     let v = t.raw_get(Value::integer(i));
     if v.is_nil() {
-        stack.replace(&[Value::nil()]);
+        stack.ret1(Value::nil());
     } else {
         stack.replace(&[Value::integer(i), v]);
     }
@@ -247,7 +247,7 @@ fn lua_rawequal<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let eq = util::raw_eq(stack.get(0), stack.get(1));
-    stack.replace(&[Value::boolean(eq)]);
+    stack.ret1(Value::boolean(eq));
     Ok(CallbackAction::Return)
 }
 
@@ -264,7 +264,7 @@ fn lua_rawget<'gc>(
         ));
     };
     let v = t.raw_get(key);
-    stack.replace(&[v]);
+    stack.ret1(v);
     Ok(CallbackAction::Return)
 }
 
@@ -290,7 +290,7 @@ fn lua_rawlen<'gc>(
             &format!("bad argument #1 to 'rawlen' (table or string expected, got {got})"),
         ));
     };
-    stack.replace(&[Value::integer(len)]);
+    stack.ret1(Value::integer(len));
     Ok(CallbackAction::Return)
 }
 
@@ -316,7 +316,7 @@ fn lua_rawset<'gc>(
         return Err(Error::from_str(nctx.ctx, "table index is NaN").with_level(0));
     }
     t.raw_set(nctx.ctx, key, value);
-    stack.replace(&[Value::table(t)]);
+    stack.ret1(Value::table(t));
     Ok(CallbackAction::Return)
 }
 
@@ -332,7 +332,7 @@ fn lua_select<'gc>(
     if let Some(s) = sel.get_string()
         && s.as_bytes() == b"#"
     {
-        stack.replace(&[Value::integer(m as i64)]);
+        stack.ret1(Value::integer(m as i64));
         return Ok(CallbackAction::Return);
     }
     let i = util::check_integer(nctx.ctx, sel, "select", 1)?;
@@ -392,7 +392,7 @@ fn lua_setmetatable<'gc>(
         }
     }
     t.set_metatable(nctx.ctx, mt);
-    stack.replace(&[Value::table(t)]);
+    stack.ret1(Value::table(t));
     Ok(CallbackAction::Return)
 }
 
@@ -431,7 +431,7 @@ fn lua_tonumber<'gc>(
     } else {
         Value::nil()
     };
-    stack.replace(&[result]);
+    stack.ret1(result);
     Ok(CallbackAction::Return)
 }
 
@@ -448,7 +448,7 @@ fn lua_tostring<'gc>(
         ));
     }
     let s = util::basic_tostring(nctx.ctx, stack.get(0));
-    stack.replace(&[Value::string(s)]);
+    stack.ret1(Value::string(s));
     Ok(CallbackAction::Return)
 }
 

@@ -2317,7 +2317,7 @@ macro_rules! call_native {
                     // PCallSequence under coroutine.resume). Persist
                     // caller's pc first so re-entry would work if anything
                     // catches and resumes.
-                    save_pc($thread, $ip);
+                    $ds.save_pc($ip);
                     $thread.raise($ctx, err);
                     return;
                 }
@@ -2335,11 +2335,19 @@ macro_rules! call_native {
                         returns as usize - 1
                     };
                     let to_copy = retc.min(wanted);
+                    // Results sit at `args_base = func_idx + 1`, one slot above
+                    // where they land, inside the window `invoke_native` covered;
+                    // a forward copy is in bounds and never reads a slot it
+                    // already wrote. The nil padding stays inside the caller's
+                    // frame, which the CALL that entered it sized the vec for.
+                    debug_assert!(args_base + to_copy <= $thread.stack.len());
+                    debug_assert!(func_idx + wanted <= $thread.stack.len());
+                    let stack = $thread.stack.as_mut_ptr();
                     for i in 0..to_copy {
-                        $thread.stack[func_idx + i] = $thread.stack[args_base + i];
+                        unsafe { *stack.add(func_idx + i) = *stack.add(args_base + i) };
                     }
                     for i in to_copy..wanted {
-                        $thread.stack[func_idx + i] = Value::nil();
+                        unsafe { *stack.add(func_idx + i) = Value::nil() };
                     }
                     // Publish the logical top. For MULTRET this is the dynamic
                     // count the next consumer reads. The stale donor copies the
@@ -2352,7 +2360,7 @@ macro_rules! call_native {
                 }
                 action => {
                     // Suspension path: persist caller's pc, stash the
-                    // action on the $thread for the executor to translate
+                    // action on the thread for the executor to translate
                     // into frame ops, then exit the dispatch chain.
                     $ds.save_pc($ip);
                     $thread.pending_action = Some(PendingAction {
