@@ -124,6 +124,22 @@ impl<'gc> DispatchState<'gc> {
         self.upvalues = closure.upvalues.as_ptr();
         self.ic_table = closure.proto.ic_table.as_ptr();
     }
+
+    /// Debug check that the cache matches the top frame's closure: catches a
+    /// frame change that forgot to `bind`, which the bounds checks alone
+    /// would not (a stale pool is usually long enough for the index).
+    #[inline(always)]
+    fn debug_assert_bound(&self, thread: &ThreadState<'gc>) {
+        if cfg!(debug_assertions) {
+            let closure = &thread.top_lua().unwrap().closure;
+            debug_assert!(std::ptr::eq(
+                self.constants,
+                closure.proto.constants.as_ptr()
+            ));
+            debug_assert!(std::ptr::eq(self.upvalues, closure.upvalues.as_ptr()));
+            debug_assert!(std::ptr::eq(self.ic_table, closure.proto.ic_table.as_ptr()));
+        }
+    }
 }
 
 /// Every dispatch target (handler, slow path, continuation) carries
@@ -233,6 +249,7 @@ macro_rules! helpers {
         macro_rules! constant {
             ($$idx:expr) => {{
                 unsafe {
+                    $ds.debug_assert_bound($thread);
                     debug_assert!(
                         ($$idx as usize)
                             < $thread.top_lua_unchecked().closure.proto.constants.len()
@@ -246,6 +263,7 @@ macro_rules! helpers {
         macro_rules! upvalue {
             ($$idx:expr) => {{
                 unsafe {
+                    $ds.debug_assert_bound($thread);
                     debug_assert!(
                         ($$idx as usize) < $thread.top_lua_unchecked().closure.upvalues.len()
                     );
@@ -522,6 +540,7 @@ fn read_ic<'gc>(
 ) -> InlineCache<'gc> {
     // SAFETY: ic_idx is allocated at compile-time within the prototype's
     // IC count; debug-asserted in alloc_ic_slot's saturating_add.
+    ds.debug_assert_bound(thread);
     debug_assert!(
         (ic_idx as usize)
             < unsafe { &thread.top_lua_unchecked().closure.proto }
@@ -605,23 +624,23 @@ fn fill_ic_for_constant_key<'gc>(
 #[inline(never)]
 pub(crate) fn run_thread<'gc>(ctx: Context<'gc>, thread: Thread<'gc>) {
     let mut ts = thread.borrow_mut(ctx.mutation());
-    let (ip, base) = {
-        let frame = ts
-            .top_lua()
-            .expect("run_thread requires a seeded Lua frame");
-        let code_ptr = frame.closure.proto.code.as_ptr();
-        let ip = unsafe { code_ptr.add(frame.pc) };
-        (ip, frame.base)
-    };
-    let registers = unsafe { ts.stack.as_mut_ptr().add(base) };
-    let handlers = HANDLERS.as_ptr() as *const ();
     let mut ds = DispatchState {
         fault: None,
         constants: std::ptr::null(),
         upvalues: std::ptr::null(),
         ic_table: std::ptr::null(),
     };
-    ds.bind(&ts.top_lua().unwrap().closure);
+    let (ip, base) = {
+        let frame = ts
+            .top_lua()
+            .expect("run_thread requires a seeded Lua frame");
+        ds.bind(&frame.closure);
+        let code_ptr = frame.closure.proto.code.as_ptr();
+        let ip = unsafe { code_ptr.add(frame.pc) };
+        (ip, frame.base)
+    };
+    let registers = unsafe { ts.stack.as_mut_ptr().add(base) };
+    let handlers = HANDLERS.as_ptr() as *const ();
     op_nop(
         Instruction::nop(),
         ctx,
@@ -2927,8 +2946,8 @@ pub(crate) enum FrameReturn<'gc> {
     /// Caller should return from the handler.
     TopLevel,
     /// Normal return to the caller frame, which has been restored to the
-    /// top of the frame stack. Caller updates `ip` / `registers` and
-    /// dispatches.
+    /// top of the frame stack. Caller rebinds `ip` / `registers` /
+    /// `DispatchState` to it and dispatches.
     Caller {
         new_base: usize,
         new_ip: *const Instruction,
@@ -3033,11 +3052,10 @@ pub(crate) fn frame_return<'gc>(
     let caller = thread.top_lua().unwrap();
     let new_base = caller.base;
     let new_ip = unsafe { caller.closure.proto.code.as_ptr().add(caller.pc) };
-    let closure = caller.closure;
     FrameReturn::Caller {
         new_base,
         new_ip,
-        closure,
+        closure: caller.closure,
     }
 }
 
@@ -3223,7 +3241,8 @@ pub(crate) enum CallTarget<'gc> {
 /// macro. Captures the three ways a continuation-driven call can proceed.
 pub(crate) enum MetaDispatch<'gc> {
     /// Resolved to a Lua closure; a frame carrying the continuation was
-    /// pushed. The caller rebinds `ip`/`registers` to this and dispatches.
+    /// pushed. The caller rebinds `ip`/`registers` and `DispatchState` to
+    /// the new frame and dispatches.
     Lua {
         new_ip: *const Instruction,
         new_base: usize,
