@@ -144,9 +144,9 @@ pub(crate) struct DispatchState<'gc> {
 
 impl<'gc> DispatchState<'gc> {
     fn bind(&mut self, closure: &LuaClosure<'gc>) {
-        self.constants = closure.proto.constants.as_ptr();
+        self.constants = closure.constants;
         self.upvalues = closure.upvalues.as_ptr();
-        self.ic_table = closure.proto.ic_table.as_ptr();
+        self.ic_table = closure.ic_table;
     }
 
     /// Bind the constant/upvalue/IC caches to the thread's top frame, which
@@ -2454,18 +2454,18 @@ macro_rules! call_lua {
         let new_base = $func_idx + 1;
         unsafe { (*$frame).pc = $ip };
         if $grow {
-            $thread.ensure_slots(new_base + closure.proto.max_stack_size as usize);
+            $thread.ensure_slots(new_base + closure.max_stack_size as usize);
         } else {
             debug_assert!(
-                $thread.stack.len() >= new_base + closure.proto.max_stack_size as usize
+                $thread.stack.len() >= new_base + closure.max_stack_size as usize
             );
         }
-        let num_params = closure.proto.num_params as usize;
+        let num_params = closure.num_params as usize;
         // Fixed-arg call with every parameter supplied is the common shape and
         // needs no counting; the rest (MULTRET via `thread.top`, missing
         // parameters, varargs) goes through the general accounting.
         let num_extras = if std::hint::likely(
-            $nargs as usize > num_params && !closure.proto.is_vararg,
+            $nargs as usize > num_params && !closure.is_vararg,
         ) {
             0
         } else {
@@ -2478,13 +2478,13 @@ macro_rules! call_lua {
             for i in caller_provided..num_params {
                 $thread.stack[new_base + i] = Value::nil();
             }
-            if closure.proto.is_vararg {
+            if closure.is_vararg {
                 caller_provided.saturating_sub(num_params) as u32
             } else {
                 0
             }
         };
-        $ip = closure.proto.code.as_ptr();
+        $ip = closure.code;
         let frame = LuaFrame {
             closure,
             base: new_base,
@@ -2534,7 +2534,7 @@ extern "rust-preserve-none" fn op_call<'gc>(
         match f.inner().as_ref() {
             FunctionKind::Lua(closure) => {
                 let func_idx = unsafe { (*frame).base } + func as usize;
-                let needed = func_idx + 1 + closure.proto.max_stack_size as usize;
+                let needed = func_idx + 1 + closure.max_stack_size as usize;
                 if std::hint::unlikely(thread.stack.len() < needed || thread.frames_full()) {
                     become op_call_grow(
                         instruction,
@@ -2589,7 +2589,7 @@ extern "rust-preserve-none" fn op_call_grow<'gc>(
     helpers!(instruction, ctx, thread, registers, ip, handlers, ds, frame);
     let func = instruction.a();
     let max_stack = match reg!(func).get_function().map(|f| f.inner().as_ref()) {
-        Some(FunctionKind::Lua(closure)) => closure.proto.max_stack_size as usize,
+        Some(FunctionKind::Lua(closure)) => closure.max_stack_size as usize,
         _ => unreachable!("op_call_grow on a non-Lua callee"),
     };
     thread.ensure_slots(unsafe { (*frame).base } + func as usize + 1 + max_stack);
