@@ -3338,6 +3338,7 @@ pub(crate) enum FrameReturn<'gc> {
 /// Unwind the top-of-stack frame assuming it returned the values at
 /// `stack[values_base .. values_base + nret]`. Shared by the bytecode
 /// `RETURN` handler and the native-tailcall path.
+#[inline]
 pub(crate) fn frame_return<'gc>(
     mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
@@ -3361,41 +3362,40 @@ pub(crate) fn frame_return<'gc>(
     // non-vararg frames).
     close_upvalues(mc, thread, cur_base);
     close_tbc_vars(mc, thread, cur_base);
-    thread.frames.pop();
+    // The top frame is the `Frame::Lua` read above and `LuaFrame` is `Copy`,
+    // so there is nothing to drop; `Vec::pop` would copy the 96-byte frame out
+    // and run the enum's drop glue.
+    const { assert!(!std::mem::needs_drop::<LuaFrame<'_>>()) };
+    unsafe { thread.frames.set_len(thread.frames.len() - 1) };
 
     let dst_start = cur_base - 1 - num_extras;
 
-    if thread.frames.is_empty() {
-        thread
-            .stack
-            .copy_within(values_base..values_base + nret, dst_start);
-        // The thread is done, so nothing above the results is live: pair
-        // `Result { bottom }` with a `top` marking the result end, and release
-        // the rest. Consumers read `stack[bottom..top]`.
-        thread.discard_above(dst_start + nret);
-        thread.status = ThreadStatus::Result { bottom: dst_start };
-        return FrameReturn::TopLevel;
-    }
-
-    // If the parent isn't a Lua frame (Sequence/WaitThread/etc.), the executor
-    // driver picks up here: place all `nret` values at `stack[dst_start..]` for
-    // the parent's window. This MUST be handled before the `num_results`
-    // branch below — doing both copies would run two overlapping forward
-    // moves of the same source range, and the first would clobber the source
-    // of the second whenever `nret` is large enough that `dst_start + nret`
-    // reaches into `[values_base..]` (e.g. a sort comparator returning 4+
-    // values). A single copy is safe because `dst_start < values_base`, so each
-    // write lands on a slot already consumed.
-    if thread.top_lua().is_none() {
-        thread
-            .stack
-            .copy_within(values_base..values_base + nret, dst_start);
-        // Parent is a Sequence / WaitThread, so no register window sits above
-        // the results — the shrink is legal, and it publishes the parent's
-        // input window as `stack[dst_start..top]`.
-        thread.discard_above(dst_start + nret);
-        return FrameReturn::ToNonLua;
-    }
+    let (new_base, closure, pc) = match thread.frames.last() {
+        Some(Frame::Lua(caller)) => (caller.base, caller.closure, caller.pc),
+        None => {
+            thread
+                .stack
+                .copy_within(values_base..values_base + nret, dst_start);
+            // The thread is done, so nothing above the results is live: pair
+            // `Result { bottom }` with a `top` marking the result end, and release
+            // the rest. Consumers read `stack[bottom..top]`.
+            thread.discard_above(dst_start + nret);
+            thread.status = ThreadStatus::Result { bottom: dst_start };
+            return FrameReturn::TopLevel;
+        }
+        // The parent isn't a Lua frame (Sequence/WaitThread/etc.), so the
+        // executor driver picks up here: place all `nret` values at
+        // `stack[dst_start..]` for the parent's window. Since no register
+        // window sits above the results the shrink is legal, and it publishes
+        // the parent's input window as `stack[dst_start..top]`.
+        Some(_) => {
+            thread
+                .stack
+                .copy_within(values_base..values_base + nret, dst_start);
+            thread.discard_above(dst_start + nret);
+            return FrameReturn::ToNonLua;
+        }
+    };
 
     // `num_results == 0` is the CALL's MULTRET: deliver all `nret` and publish `thread.top`.
     if num_results == 0 {
@@ -3409,11 +3409,19 @@ pub(crate) fn frame_return<'gc>(
     } else {
         let wanted = num_results as usize - 1;
         let to_copy = nret.min(wanted);
+        // `dst_start < values_base` (the func slot is below the callee's
+        // registers) and both ranges lie inside the callee's window, which
+        // `op_call` sized the vec for; a forward element copy is in bounds and
+        // never reads a slot it already overwrote. Indexing here re-checks the
+        // vec length against every store, so use raw pointers.
+        debug_assert!(values_base + to_copy <= thread.stack.len());
+        debug_assert!(dst_start + wanted <= thread.stack.len());
+        let stack = thread.stack.as_mut_ptr();
         for i in 0..to_copy {
-            thread.stack[dst_start + i] = thread.stack[values_base + i];
+            unsafe { *stack.add(dst_start + i) = *stack.add(values_base + i) };
         }
         for i in to_copy..wanted {
-            thread.stack[dst_start + i] = Value::nil();
+            unsafe { *stack.add(dst_start + i) = Value::nil() };
         }
         // Publish the landing end. Without this, a `top` left high by a multires
         // producer *inside the callee* would still be the high-water long after
@@ -3424,13 +3432,11 @@ pub(crate) fn frame_return<'gc>(
         thread.set_top(dst_start + wanted);
     }
 
-    let caller = thread.top_lua().unwrap();
-    let new_base = caller.base;
-    let new_ip = unsafe { caller.closure.proto.code.as_ptr().add(caller.pc) };
+    let new_ip = unsafe { closure.proto.code.as_ptr().add(pc) };
     FrameReturn::Caller {
         new_base,
         new_ip,
-        closure: caller.closure,
+        closure,
     }
 }
 
