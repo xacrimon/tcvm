@@ -123,6 +123,27 @@ pub struct NativeClosure<'gc> {
     #[collect(require_static)]
     pub function: NativeFn,
     pub upvalues: Box<[Value<'gc>]>,
+    /// Interpreter fast path, if the builtin has one (see `op_call_fast`).
+    #[collect(require_static)]
+    pub fast: FastCall,
+}
+
+/// Builtins the interpreter can run inline for their common argument shape
+/// (LuaJIT's `ff_*` fast functions). `op_call_fast` handles exactly that
+/// shape and never errors; anything else falls back to `NativeClosure::function`,
+/// which is the complete implementation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum FastCall {
+    None = 0,
+    /// `math.sqrt(float)`
+    Sqrt,
+    /// `math.abs(number)`
+    Abs,
+    /// `math.floor(number)`
+    Floor,
+    /// `math.ceil(number)`
+    Ceil,
 }
 
 /// Signature of a native callback invoked by the VM on `CALL` / `TAILCALL`.
@@ -327,9 +348,22 @@ impl<'gc> Function<'gc> {
     }
 
     pub fn new_native(mc: &Mutation<'gc>, function: NativeFn, upvalues: Box<[Value<'gc>]>) -> Self {
+        Self::new_native_fast(mc, function, upvalues, FastCall::None)
+    }
+
+    pub fn new_native_fast(
+        mc: &Mutation<'gc>,
+        function: NativeFn,
+        upvalues: Box<[Value<'gc>]>,
+        fast: FastCall,
+    ) -> Self {
         Function(Gc::new(
             mc,
-            FunctionKind::Native(NativeClosure { function, upvalues }),
+            FunctionKind::Native(NativeClosure {
+                function,
+                upvalues,
+                fast,
+            }),
         ))
     }
 
