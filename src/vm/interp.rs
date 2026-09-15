@@ -3511,7 +3511,7 @@ pub(crate) enum FrameReturn {
 /// Unwind the top-of-stack frame assuming it returned the values at
 /// `stack[values_base .. values_base + nret]`. Shared by the bytecode
 /// `RETURN` handler and the native-tailcall path.
-#[inline]
+#[inline(always)]
 pub(crate) fn frame_return<'gc>(
     mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
