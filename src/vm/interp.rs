@@ -107,6 +107,20 @@ pub(crate) type Registers<'gc, 'a> = *mut Value<'gc>;
 pub(crate) struct DispatchState<'gc> {
     /// Set by `raise!` right before it tail-calls `impl_error`, which takes it.
     fault: Option<OpError<'gc>>,
+    /// The running closure's constant pool and upvalue array, so `constant!`
+    /// and `upvalue!` are one load off `ds` instead of a five-deep chase
+    /// through `thread.frames`. Valid because the frame keeps the closure
+    /// alive; every site that changes the top Lua frame and keeps
+    /// dispatching must `bind` the new closure alongside `registers`.
+    constants: *const Value<'gc>,
+    upvalues: *const Upvalue<'gc>,
+}
+
+impl<'gc> DispatchState<'gc> {
+    fn bind(&mut self, closure: &LuaClosure<'gc>) {
+        self.constants = closure.proto.constants.as_ptr();
+        self.upvalues = closure.upvalues.as_ptr();
+    }
 }
 
 /// Every dispatch target (handler, slow path, continuation) carries
@@ -216,8 +230,11 @@ macro_rules! helpers {
         macro_rules! constant {
             ($$idx:expr) => {{
                 unsafe {
-                    let frame = $thread.top_lua_unchecked();
-                    *frame.closure.proto.constants.get_unchecked($$idx as usize)
+                    debug_assert!(
+                        ($$idx as usize)
+                            < $thread.top_lua_unchecked().closure.proto.constants.len()
+                    );
+                    *$ds.constants.add($$idx as usize)
                 }
             }};
         }
@@ -226,8 +243,10 @@ macro_rules! helpers {
         macro_rules! upvalue {
             ($$idx:expr) => {{
                 unsafe {
-                    let frame = $thread.top_lua_unchecked();
-                    *frame.closure.upvalues.get_unchecked($$idx as usize)
+                    debug_assert!(
+                        ($$idx as usize) < $thread.top_lua_unchecked().closure.upvalues.len()
+                    );
+                    *$ds.upvalues.add($$idx as usize)
                 }
             }};
         }
@@ -257,8 +276,13 @@ macro_rules! helpers {
                 let __mm_meta: Value<'gc> = $$meta;
                 let __mm_cont: Continuation = $$cont;
                 match schedule_meta_call($ctx, $thread, __mm_meta, $$args, __mm_cont, $ip) {
-                    MetaDispatch::Lua { new_ip, new_base } => {
+                    MetaDispatch::Lua {
+                        new_ip,
+                        new_base,
+                        closure,
+                    } => {
                         $ip = new_ip;
+                        $ds.bind(&closure);
                         $registers = unsafe { $thread.stack.as_mut_ptr().add(new_base) };
                         dispatch!();
                     }
@@ -580,7 +604,12 @@ pub(crate) fn run_thread<'gc>(ctx: Context<'gc>, thread: Thread<'gc>) {
     };
     let registers = unsafe { ts.stack.as_mut_ptr().add(base) };
     let handlers = HANDLERS.as_ptr() as *const ();
-    let mut ds = DispatchState { fault: None };
+    let mut ds = DispatchState {
+        fault: None,
+        constants: std::ptr::null(),
+        upvalues: std::ptr::null(),
+    };
+    ds.bind(&ts.top_lua().unwrap().closure);
     op_nop(
         Instruction::nop(),
         ctx,
@@ -1885,6 +1914,7 @@ extern "rust-preserve-none" fn op_call<'gc>(
                 continuation: None,
             });
             ip = closure.proto.code.as_ptr();
+            ds.bind(&closure);
             registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
             dispatch!();
         }
@@ -2018,6 +2048,7 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
                 thread.stack[new_base + i] = Value::nil();
             }
             ip = closure.proto.code.as_ptr();
+            ds.bind(&closure);
             registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
             dispatch!();
         }
@@ -2064,8 +2095,13 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
                         }
                         FrameReturn::TopLevel => return,
                         FrameReturn::ToNonLua => return,
-                        FrameReturn::Caller { new_base, new_ip } => {
+                        FrameReturn::Caller {
+                            new_base,
+                            new_ip,
+                            closure,
+                        } => {
                             ip = new_ip;
+                            ds.bind(&closure);
                             registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
                             dispatch!();
                         }
@@ -2130,8 +2166,13 @@ extern "rust-preserve-none" fn op_return<'gc>(
         }
         FrameReturn::TopLevel => return,
         FrameReturn::ToNonLua => return,
-        FrameReturn::Caller { new_base, new_ip } => {
+        FrameReturn::Caller {
+            new_base,
+            new_ip,
+            closure,
+        } => {
             ip = new_ip;
+            ds.bind(&closure);
             registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
             dispatch!();
         }
@@ -2865,7 +2906,7 @@ pub(crate) fn invoke_native<'gc>(
 /// What should happen after a frame returns with values at
 /// `stack[values_base .. values_base + nret]`. Produced by [`frame_return`],
 /// consumed by `op_return` and the native-tailcall path in `op_tailcall`.
-pub(crate) enum FrameReturn {
+pub(crate) enum FrameReturn<'gc> {
     /// A continuation was attached to the departing frame; caller must
     /// tail-call `cont_resume`. The continuation's `results_base` / `nret`
     /// have already been written back into the top frame.
@@ -2879,6 +2920,7 @@ pub(crate) enum FrameReturn {
     Caller {
         new_base: usize,
         new_ip: *const Instruction,
+        closure: Gc<'gc, LuaClosure<'gc>>,
     },
     /// The popped Lua frame's parent is a non-Lua frame (Sequence /
     /// WaitThread / Start / Error). The values have been left at
@@ -2895,7 +2937,7 @@ pub(crate) fn frame_return<'gc>(
     thread: &mut ThreadState<'gc>,
     values_base: usize,
     nret: usize,
-) -> FrameReturn {
+) -> FrameReturn<'gc> {
     let (cur_base, num_results, num_extras, continuation) = {
         let f = thread.top_lua().unwrap();
         (f.base, f.num_results, f.num_extras as usize, f.continuation)
@@ -2979,7 +3021,12 @@ pub(crate) fn frame_return<'gc>(
     let caller = thread.top_lua().unwrap();
     let new_base = caller.base;
     let new_ip = unsafe { caller.closure.proto.code.as_ptr().add(caller.pc) };
-    FrameReturn::Caller { new_base, new_ip }
+    let closure = caller.closure;
+    FrameReturn::Caller {
+        new_base,
+        new_ip,
+        closure,
+    }
 }
 
 /// Close all open upvalues pointing at stack indices >= `start_idx`.
@@ -3162,12 +3209,13 @@ pub(crate) enum CallTarget<'gc> {
 
 /// Outcome of [`schedule_meta_call`], consumed by the `invoke_metamethod!`
 /// macro. Captures the three ways a continuation-driven call can proceed.
-pub(crate) enum MetaDispatch {
+pub(crate) enum MetaDispatch<'gc> {
     /// Resolved to a Lua closure; a frame carrying the continuation was
     /// pushed. The caller rebinds `ip`/`registers` to this and dispatches.
     Lua {
         new_ip: *const Instruction,
         new_base: usize,
+        closure: Gc<'gc, LuaClosure<'gc>>,
     },
     /// Resolved to a native callback that returned synchronously. Its results
     /// sit at `stack[results_base .. results_base + nret]`; the caller applies
@@ -3284,7 +3332,7 @@ fn schedule_meta_call<'gc>(
     args: &[Value<'gc>],
     cont: Continuation,
     caller_ip: *const Instruction,
-) -> MetaDispatch {
+) -> MetaDispatch<'gc> {
     // Save caller's pc; no decisions here depend on knowing the final target.
     // The native suspend path relies on this so the executor re-enters the
     // caller frame at the instruction following the one that scheduled us.
@@ -3357,7 +3405,11 @@ fn schedule_meta_call<'gc>(
     });
 
     let new_ip = closure.proto.code.as_ptr();
-    MetaDispatch::Lua { new_ip, new_base }
+    MetaDispatch::Lua {
+        new_ip,
+        new_base,
+        closure,
+    }
 }
 
 /// Native arm of [`schedule_meta_call`]. The callable native `nc` and its
@@ -3372,7 +3424,7 @@ fn schedule_native_meta_call<'gc>(
     caller_base: usize,
     new_base: usize,
     actual_args: usize,
-) -> MetaDispatch {
+) -> MetaDispatch<'gc> {
     use crate::vm::sequence::CallbackAction;
 
     let args_base = new_base;
@@ -3455,6 +3507,7 @@ macro_rules! finalize_return {
         let __caller_base = {
             let caller = $thread.top_lua().unwrap();
             $ip = unsafe { caller.closure.proto.code.as_ptr().add(caller.pc) };
+            $ds.bind(&caller.closure);
             caller.base
         };
         $registers = unsafe { $thread.stack.as_mut_ptr().add(__caller_base) };
