@@ -20,10 +20,8 @@ expression: output
   ; constants:
   ;   K0 = 8
   ;   K1 = 6.28
-  ;   K2 = 5
   ; code:
   0000  [ 10]  LOAD            R1 K0  ; 8
   0001  [ 10]  LOAD            R2 K1  ; 6.28
-  0002  [ 10]  LOAD            R3 K2  ; 5
-  0003  [ 10]  MUL             R3 R3 R0
-  0004  [ 10]  RETURN          R1 count=4
+  0002  [ 10]  MULI            R3 R0 #5 flipped
+  0003  [ 10]  RETURN          R1 count=4

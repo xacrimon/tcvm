@@ -9,7 +9,6 @@ expression: output
 ;   K2 = 0
 ;   K3 = "ipairs"
 ;   K4 = "f"
-;   K5 = 2
 ; upvalues:
 ;   U0 = local R0
 ; code:
@@ -24,55 +23,50 @@ expression: output
 0008  [  2]  CLOSE           R4
 0009  [  2]  FORLOOP         R1 -4
 0010  [  3]  LOAD            R1 K2  ; 0
-0011  [  4]  LOAD            R2 K1  ; 3
-0012  [  4]  LT              R1 R2 inv=false
-0013  [  4]  JMP             +7
-0014  [  4]  LOAD            R2 K0  ; 1
-0015  [  4]  ADD             R1 R1 R2
-0016  [  4]  MOVE            R2 R1
-0017  [  4]  CLOSURE         R3 P1
-0018  [  4]  SETTABLE        R3 R0 R1
-0019  [  4]  CLOSE           R2
-0020  [  4]  JMP             -10
-0021  [  5]  MOVE            R2 R1
-0022  [  5]  CLOSURE         R3 P2
-0023  [  5]  SETTABLE        R3 R0 R1
-0024  [  5]  LOAD            R3 K0  ; 1
-0025  [  5]  SUB             R1 R1 R3
-0026  [  5]  LOAD            R3 K0  ; 1
-0027  [  5]  LE              R2 R3 inv=false
-0028  [  5]  JMP             +1
-0029  [  5]  JMP             +2
-0030  [  5]  CLOSE           R2
-0031  [  5]  JMP             -11
-0032  [  5]  CLOSE           R2
-0033  [  6]  GETTABUP        R2 U0 K3  ; "ipairs"
-0034  [  6]  MOVE            R3 R0
-0035  [  6]  CALL            R2 args=2 ret=4
-0036  [  6]  TFORPREP        R2 +3
-0037  [  6]  CLOSURE         R7 P3
-0038  [  6]  SETTABLE        R7 R0 R6
-0039  [  6]  CLOSE           R5
-0040  [  6]  TFORCALL        R2 count=2
-0041  [  6]  TFORLOOP        R2 -5
-0042  [  7]  LOAD            R2 K0  ; 1
-0043  [  7]  CLOSURE         R3 P4
-0044  [  7]  SETFIELD        R3 R0 K4  ; "f"
-0045  [  7]  CLOSE           R2
-0046  [  8]  LOAD            R2 K0  ; 1
-0047  [  8]  LOAD            R3 K1  ; 3
-0048  [  8]  LOAD            R4 K0  ; 1
-0049  [  8]  FORPREP         R2 +9
-0050  [  8]  CLOSURE         R6 P5
-0051  [  8]  SETTABLE        R6 R0 R5
-0052  [  8]  LOAD            R6 K5  ; 2
-0053  [  8]  EQ              R5 R6 inv=false
-0054  [  8]  JMP             +2
-0055  [  8]  CLOSE           R5
-0056  [  8]  JMP             +2
-0057  [  8]  CLOSE           R5
-0058  [  8]  FORLOOP         R2 -9
-0059  [  8]  RETURN          R0 count=1
+0011  [  4]  LTI             R1 #3 inv=false
+0012  [  4]  JMP             +6
+0013  [  4]  ADDI            R1 R1 #1
+0014  [  4]  MOVE            R2 R1
+0015  [  4]  CLOSURE         R3 P1
+0016  [  4]  SETTABLE        R3 R0 R1
+0017  [  4]  CLOSE           R2
+0018  [  4]  JMP             -8
+0019  [  5]  MOVE            R2 R1
+0020  [  5]  CLOSURE         R3 P2
+0021  [  5]  SETTABLE        R3 R0 R1
+0022  [  5]  SUBI            R1 R1 #1
+0023  [  5]  LEI             R2 #1 inv=false
+0024  [  5]  JMP             +1
+0025  [  5]  JMP             +2
+0026  [  5]  CLOSE           R2
+0027  [  5]  JMP             -9
+0028  [  5]  CLOSE           R2
+0029  [  6]  GETTABUP        R2 U0 K3  ; "ipairs"
+0030  [  6]  MOVE            R3 R0
+0031  [  6]  CALL            R2 args=2 ret=4
+0032  [  6]  TFORPREP        R2 +3
+0033  [  6]  CLOSURE         R7 P3
+0034  [  6]  SETTABLE        R7 R0 R6
+0035  [  6]  CLOSE           R5
+0036  [  6]  TFORCALL        R2 count=2
+0037  [  6]  TFORLOOP        R2 -5
+0038  [  7]  LOAD            R2 K0  ; 1
+0039  [  7]  CLOSURE         R3 P4
+0040  [  7]  SETFIELD        R3 R0 K4  ; "f"
+0041  [  7]  CLOSE           R2
+0042  [  8]  LOAD            R2 K0  ; 1
+0043  [  8]  LOAD            R3 K1  ; 3
+0044  [  8]  LOAD            R4 K0  ; 1
+0045  [  8]  FORPREP         R2 +8
+0046  [  8]  CLOSURE         R6 P5
+0047  [  8]  SETTABLE        R6 R0 R5
+0048  [  8]  EQI             R5 #2 inv=false
+0049  [  8]  JMP             +2
+0050  [  8]  CLOSE           R5
+0051  [  8]  JMP             +2
+0052  [  8]  CLOSE           R5
+0053  [  8]  FORLOOP         R2 -8
+0054  [  8]  RETURN          R0 count=1
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=1, upvalues=1)

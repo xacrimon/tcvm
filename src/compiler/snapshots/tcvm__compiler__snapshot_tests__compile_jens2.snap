@@ -11,7 +11,7 @@ expression: output
 0002  [ 10]  RETURN          R0 count=1
 
 ; prototype 0:
-  ; function (params=0, vararg=false, stack=7, upvalues=1)
+  ; function (params=0, vararg=false, stack=6, upvalues=1)
   ; constants:
   ;   K0 = 0
   ;   K1 = 10000
@@ -25,11 +25,10 @@ expression: output
   0002  [  5]  LOAD            R2 K0  ; 0
   0003  [  5]  MOVE            R3 R1
   0004  [  5]  LOAD            R4 K2  ; 1
-  0005  [  5]  FORPREP         R2 +3
-  0006  [  6]  LOAD            R6 K2  ; 1
-  0007  [  6]  ADD             R0 R0 R6
-  0008  [  5]  FORLOOP         R2 -3
-  0009  [  9]  GETTABUP        R2 U0 K3  ; "print"
-  0010  [  9]  MOVE            R3 R0
-  0011  [  9]  CALL            R2 args=2 ret=1
-  0012  [ 10]  RETURN          R0 count=1
+  0005  [  5]  FORPREP         R2 +2
+  0006  [  6]  ADDI            R0 R0 #1
+  0007  [  5]  FORLOOP         R2 -2
+  0008  [  9]  GETTABUP        R2 U0 K3  ; "print"
+  0009  [  9]  MOVE            R3 R0
+  0010  [  9]  CALL            R2 args=2 ret=1
+  0011  [ 10]  RETURN          R0 count=1

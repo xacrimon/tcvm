@@ -2,56 +2,48 @@
 source: src/compiler/snapshot_tests.rs
 expression: output
 ---
-; function (params=0, vararg=true, stack=2, upvalues=1)
+; function (params=0, vararg=true, stack=1, upvalues=1)
 ; constants:
 ;   K0 = "a"
 ;   K1 = 1
-;   K2 = 0
-;   K3 = "b"
+;   K2 = "b"
+;   K3 = 0
 ;   K4 = "c"
-;   K5 = 5
-;   K6 = "d"
-;   K7 = 1.5
-;   K8 = 2
-;   K9 = "e"
-;   K10 = 0.0
-;   K11 = "f"
-;   K12 = "x"
-;   K13 = "g"
-;   K14 = "h"
-;   K15 = "abc"
+;   K5 = "d"
+;   K6 = 1.5
+;   K7 = "e"
+;   K8 = 0.0
+;   K9 = "f"
+;   K10 = "x"
+;   K11 = "g"
+;   K12 = "h"
+;   K13 = "abc"
 ; upvalues:
 ;   U0 = local R0
 ; code:
 0000  [  1]  VARARGPREP      fixed=0
 0001  [  5]  LOAD            R0 K1  ; 1
-0002  [  5]  LOAD            R1 K2  ; 0
-0003  [  5]  DIV             R0 R0 R1
-0004  [  5]  SETTABUP        R0 U0 K0  ; "a"
-0005  [  6]  LOAD            R0 K1  ; 1
-0006  [  6]  LOAD            R1 K2  ; 0
-0007  [  6]  IDIV            R0 R0 R1
-0008  [  6]  SETTABUP        R0 U0 K3  ; "b"
-0009  [  7]  LOAD            R0 K5  ; 5
-0010  [  7]  LOAD            R1 K2  ; 0
-0011  [  7]  MOD             R0 R0 R1
-0012  [  7]  SETTABUP        R0 U0 K4  ; "c"
-0013  [ 10]  LOAD            R0 K7  ; 1.5
-0014  [ 10]  LOAD            R1 K8  ; 2
-0015  [ 10]  BAND            R0 R0 R1
-0016  [ 10]  SETTABUP        R0 U0 K6  ; "d"
-0017  [ 13]  LOAD            R0 K10  ; 0.0
-0018  [ 13]  LOAD            R1 K10  ; 0.0
-0019  [ 13]  SUB             R0 R0 R1
-0020  [ 13]  SETTABUP        R0 U0 K9  ; "e"
-0021  [ 16]  GETTABUP        R0 U0 K12  ; "x"
-0022  [ 16]  LOAD            R1 K1  ; 1
-0023  [ 16]  ADD             R0 R0 R1
-0024  [ 16]  SETTABUP        R0 U0 K11  ; "f"
-0025  [ 17]  GETTABUP        R0 U0 K12  ; "x"
-0026  [ 17]  UNM             R0 R0
-0027  [ 17]  SETTABUP        R0 U0 K13  ; "g"
-0028  [ 20]  LOAD            R0 K15  ; "abc"
-0029  [ 20]  LEN             R0 R0
-0030  [ 20]  SETTABUP        R0 U0 K14  ; "h"
-0031  [ 20]  RETURN          R0 count=1
+0002  [  5]  DIVI            R0 R0 #0
+0003  [  5]  SETTABUP        R0 U0 K0  ; "a"
+0004  [  6]  LOAD            R0 K3  ; 0
+0005  [  6]  RIDIVI          R0 R0 #1
+0006  [  6]  SETTABUP        R0 U0 K2  ; "b"
+0007  [  7]  LOAD            R0 K3  ; 0
+0008  [  7]  RMODI           R0 R0 #5
+0009  [  7]  SETTABUP        R0 U0 K4  ; "c"
+0010  [ 10]  LOAD            R0 K6  ; 1.5
+0011  [ 10]  BANDI           R0 R0 #2
+0012  [ 10]  SETTABUP        R0 U0 K5  ; "d"
+0013  [ 13]  LOAD            R0 K8  ; 0.0
+0014  [ 13]  SUBI            R0 R0 #0.0
+0015  [ 13]  SETTABUP        R0 U0 K7  ; "e"
+0016  [ 16]  GETTABUP        R0 U0 K10  ; "x"
+0017  [ 16]  ADDI            R0 R0 #1
+0018  [ 16]  SETTABUP        R0 U0 K9  ; "f"
+0019  [ 17]  GETTABUP        R0 U0 K10  ; "x"
+0020  [ 17]  UNM             R0 R0
+0021  [ 17]  SETTABUP        R0 U0 K11  ; "g"
+0022  [ 20]  LOAD            R0 K13  ; "abc"
+0023  [ 20]  LEN             R0 R0
+0024  [ 20]  SETTABUP        R0 U0 K12  ; "h"
+0025  [ 20]  RETURN          R0 count=1

@@ -5,42 +5,37 @@ expression: output
 ; function (params=0, vararg=true, stack=2, upvalues=1)
 ; constants:
 ;   K0 = "x"
-;   K1 = 5
-;   K2 = "print"
-;   K3 = "x is less than 5"
-;   K4 = "z"
-;   K5 = "z is less than 5"
-;   K6 = 10
-;   K7 = "z is greater than 10"
-;   K8 = "z is greater than or equal to 5 and less than or equal to 10"
+;   K1 = "print"
+;   K2 = "x is less than 5"
+;   K3 = "z"
+;   K4 = "z is less than 5"
+;   K5 = "z is greater than 10"
+;   K6 = "z is greater than or equal to 5 and less than or equal to 10"
 ; upvalues:
 ;   U0 = local R0
 ; code:
 0000  [  1]  VARARGPREP      fixed=0
 0001  [  1]  GETTABUP        R0 U0 K0  ; "x"
-0002  [  1]  LOAD            R1 K1  ; 5
-0003  [  1]  LT              R0 R1 inv=false
-0004  [  1]  JMP             +3
-0005  [  2]  GETTABUP        R0 U0 K2  ; "print"
-0006  [  2]  LOAD            R1 K3  ; "x is less than 5"
-0007  [  2]  CALL            R0 args=2 ret=1
-0008  [  5]  GETTABUP        R0 U0 K4  ; "z"
-0009  [  5]  LOAD            R1 K1  ; 5
-0010  [  5]  LT              R0 R1 inv=false
-0011  [  5]  JMP             +4
-0012  [  6]  GETTABUP        R0 U0 K2  ; "print"
-0013  [  6]  LOAD            R1 K5  ; "z is less than 5"
-0014  [  6]  CALL            R0 args=2 ret=1
-0015  [  6]  JMP             +11
-0016  [  7]  GETTABUP        R0 U0 K4  ; "z"
-0017  [  7]  LOAD            R1 K6  ; 10
-0018  [  7]  LT              R1 R0 inv=false
-0019  [  7]  JMP             +4
-0020  [  8]  GETTABUP        R0 U0 K2  ; "print"
-0021  [  8]  LOAD            R1 K7  ; "z is greater than 10"
-0022  [  8]  CALL            R0 args=2 ret=1
-0023  [  8]  JMP             +3
-0024  [ 10]  GETTABUP        R0 U0 K2  ; "print"
-0025  [ 10]  LOAD            R1 K8  ; "z is greater than or equal to 5 and less than or equal to 10"
-0026  [ 10]  CALL            R0 args=2 ret=1
-0027  [ 11]  RETURN          R0 count=1
+0002  [  1]  LTI             R0 #5 inv=false
+0003  [  1]  JMP             +3
+0004  [  2]  GETTABUP        R0 U0 K1  ; "print"
+0005  [  2]  LOAD            R1 K2  ; "x is less than 5"
+0006  [  2]  CALL            R0 args=2 ret=1
+0007  [  5]  GETTABUP        R0 U0 K3  ; "z"
+0008  [  5]  LTI             R0 #5 inv=false
+0009  [  5]  JMP             +4
+0010  [  6]  GETTABUP        R0 U0 K1  ; "print"
+0011  [  6]  LOAD            R1 K4  ; "z is less than 5"
+0012  [  6]  CALL            R0 args=2 ret=1
+0013  [  6]  JMP             +10
+0014  [  7]  GETTABUP        R0 U0 K3  ; "z"
+0015  [  7]  GTI             R0 #10 inv=false
+0016  [  7]  JMP             +4
+0017  [  8]  GETTABUP        R0 U0 K1  ; "print"
+0018  [  8]  LOAD            R1 K5  ; "z is greater than 10"
+0019  [  8]  CALL            R0 args=2 ret=1
+0020  [  8]  JMP             +3
+0021  [ 10]  GETTABUP        R0 U0 K1  ; "print"
+0022  [ 10]  LOAD            R1 K6  ; "z is greater than or equal to 5 and less than or equal to 10"
+0023  [ 10]  CALL            R0 args=2 ret=1
+0024  [ 11]  RETURN          R0 count=1
