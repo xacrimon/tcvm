@@ -295,7 +295,40 @@ impl<'gc> ThreadState<'gc> {
             lf.base >= 1,
             "Lua frame base must leave room for the function slot"
         );
+        if self.frames.len() == self.frames.capacity() {
+            self.grow_frames();
+        }
         self.frames.push(Frame::Lua(lf));
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow_frames(&mut self) {
+        self.frames.reserve(1);
+    }
+
+    /// `push_lua` for a caller that has already made room (`reserve_frames`).
+    ///
+    /// # Safety
+    /// `frames.len() < frames.capacity()`.
+    #[inline(always)]
+    pub unsafe fn push_lua_unchecked(&mut self, lf: LuaFrame<'gc>) {
+        debug_assert!(lf.base >= 1);
+        debug_assert!(self.frames.len() < self.frames.capacity());
+        let len = self.frames.len();
+        unsafe {
+            self.frames.as_mut_ptr().add(len).write(Frame::Lua(lf));
+            self.frames.set_len(len + 1);
+        }
+    }
+
+    #[inline(always)]
+    pub fn frames_full(&self) -> bool {
+        self.frames.len() == self.frames.capacity()
+    }
+
+    pub fn reserve_frames(&mut self, n: usize) {
+        self.frames.reserve(n);
     }
 
     // --- Stack accessors -------------------------------------------------
@@ -308,8 +341,16 @@ impl<'gc> ThreadState<'gc> {
     #[inline]
     pub fn ensure_slots(&mut self, n: usize) {
         if self.stack.len() < n {
-            self.stack.resize(n, Value::nil());
+            self.grow_slots(n);
         }
+    }
+
+    /// Out of line so the growth path (a `resize` loop) never sits in a
+    /// handler's fast path or forces it to set up a stack frame.
+    #[cold]
+    #[inline(never)]
+    fn grow_slots(&mut self, n: usize) {
+        self.stack.resize(n, Value::nil());
     }
 
     /// The logical window `stack[bottom..top]`.
