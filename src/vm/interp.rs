@@ -2368,36 +2368,65 @@ macro_rules! call_native {
 /// `op_call` and the `__call` slow path; expands inside a handler body so it can
 /// use that handler's `dispatch!`.
 macro_rules! call_lua {
-    ($closure:expr, $func_idx:expr, $nargs:expr, $returns:expr,
+    // `grow`: make room for the callee's window and frame here (may call out).
+    // `nogrow`: the caller has already checked both (`op_call` tail-calls
+    // `op_call_grow` otherwise), so this arm stays call-free.
+    (grow, $($rest:tt)*) => {
+        call_lua!(@inner true, $($rest)*)
+    };
+    (nogrow, $($rest:tt)*) => {
+        call_lua!(@inner false, $($rest)*)
+    };
+    (@inner $grow:literal, $closure:expr, $func_idx:expr, $nargs:expr, $returns:expr,
      $thread:ident, $registers:ident, $ip:ident, $ds:ident) => {{
         let closure = $closure;
         let new_base = $func_idx + 1;
         $ds.save_pc($ip);
-        $thread.ensure_slots(new_base + closure.proto.max_stack_size as usize);
-        // `nargs == 0` is the MULTRET sentinel: read the count from `thread.top`.
-        let caller_provided = if $nargs == 0 {
-            $thread.top - new_base
+        if $grow {
+            $thread.ensure_slots(new_base + closure.proto.max_stack_size as usize);
         } else {
-            $nargs as usize - 1
-        };
-        let num_params = closure.proto.num_params as usize;
-        for i in caller_provided..num_params {
-            $thread.stack[new_base + i] = Value::nil();
+            debug_assert!(
+                $thread.stack.len() >= new_base + closure.proto.max_stack_size as usize
+            );
         }
-        let num_extras = if closure.proto.is_vararg {
-            caller_provided.saturating_sub(num_params) as u32
-        } else {
+        let num_params = closure.proto.num_params as usize;
+        // Fixed-arg call with every parameter supplied is the common shape and
+        // needs no counting; the rest (MULTRET via `thread.top`, missing
+        // parameters, varargs) goes through the general accounting.
+        let num_extras = if std::hint::likely(
+            $nargs as usize > num_params && !closure.proto.is_vararg,
+        ) {
             0
+        } else {
+            // `nargs == 0` is the MULTRET sentinel: read the count from `thread.top`.
+            let caller_provided = if $nargs == 0 {
+                $thread.top - new_base
+            } else {
+                $nargs as usize - 1
+            };
+            for i in caller_provided..num_params {
+                $thread.stack[new_base + i] = Value::nil();
+            }
+            if closure.proto.is_vararg {
+                caller_provided.saturating_sub(num_params) as u32
+            } else {
+                0
+            }
         };
         $ip = closure.proto.code.as_ptr();
-        $thread.push_lua(LuaFrame {
+        let frame = LuaFrame {
             closure,
             base: new_base,
             pc: $ip,
             num_results: $returns,
             num_extras,
             continuation: None,
-        });
+        };
+        if $grow {
+            $thread.push_lua(frame);
+        } else {
+            unsafe { $thread.push_lua_unchecked(frame) };
+        }
         $ds.bind_frame($thread);
         $registers = unsafe { $thread.stack.as_mut_ptr().add(new_base) };
         dispatch!();
@@ -2427,8 +2456,12 @@ extern "rust-preserve-none" fn op_call<'gc>(
         match f.inner().as_ref() {
             FunctionKind::Lua(closure) => {
                 let func_idx = ds.base() + func as usize;
+                let needed = func_idx + 1 + closure.proto.max_stack_size as usize;
+                if std::hint::unlikely(thread.stack.len() < needed || thread.frames_full()) {
+                    become op_call_grow(instruction, ctx, thread, registers, ip, handlers, ds);
+                }
                 call_lua!(
-                    *closure, func_idx, nargs, returns, thread, registers, ip, ds
+                    nogrow, *closure, func_idx, nargs, returns, thread, registers, ip, ds
                 );
             }
             FunctionKind::Native(nc) => {
@@ -2440,6 +2473,34 @@ extern "rust-preserve-none" fn op_call<'gc>(
         }
     }
     become op_call_meta(instruction, ctx, thread, registers, ip, handlers, ds);
+}
+
+/// CALL of a Lua closure that needs the value stack or the frame stack grown
+/// first. Grows both (the only thing `op_call` cannot do without a stack
+/// frame), then re-enters `op_call`, which has not modified anything yet.
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn op_call_grow<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+) {
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    let func = instruction.a();
+    let max_stack = match reg!(func).get_function().map(|f| f.inner().as_ref()) {
+        Some(FunctionKind::Lua(closure)) => closure.proto.max_stack_size as usize,
+        _ => unreachable!("op_call_grow on a non-Lua callee"),
+    };
+    thread.ensure_slots(ds.base() + func as usize + 1 + max_stack);
+    thread.reserve_frames(1);
+    // Both vecs may have moved: rebind the frame pointer and the register window.
+    ds.bind_frame(thread);
+    registers = unsafe { thread.stack.as_mut_ptr().add(ds.base()) };
+    become op_call(instruction, ctx, thread, registers, ip, handlers, ds);
 }
 
 /// CALL of a builtin with a `FastCall` kind: run the common shape inline,
@@ -2563,7 +2624,9 @@ extern "rust-preserve-none" fn op_call_meta<'gc>(
 
     match target {
         CallTarget::Lua(closure) => {
-            call_lua!(closure, func_idx, nargs, returns, thread, registers, ip, ds);
+            call_lua!(
+                grow, closure, func_idx, nargs, returns, thread, registers, ip, ds
+            );
         }
         CallTarget::Native(nc) => {
             call_native!(
@@ -2717,9 +2780,87 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
 }
 
 /// return R[values], ..., R[values+count-2]
+///
+/// Fast path: a fixed number of results, no continuation, nothing to close,
+/// and a Lua caller. It makes no calls, so it needs no stack frame; every
+/// other shape goes to `op_return_slow`.
 #[inline(never)]
 #[rustc_align(32)]
 extern "rust-preserve-none" fn op_return<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+) {
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    let (values, count) = instruction.ab();
+
+    let (cur_base, num_results, num_extras, has_cont) = {
+        let f = unsafe { &*ds.frame };
+        (
+            f.base,
+            f.num_results,
+            f.num_extras as usize,
+            f.continuation.is_some(),
+        )
+    };
+    let n = thread.frames.len();
+    let parent_is_lua = n >= 2 && matches!(thread.frames[n - 2], Frame::Lua(_));
+    if std::hint::unlikely(
+        count == 0
+            || has_cont
+            || frame_has_open_upvalues(thread, cur_base)
+            || !thread.tbc_slots.is_empty()
+            || !parent_is_lua,
+    ) {
+        become op_return_slow(instruction, ctx, thread, registers, ip, handlers, ds);
+    }
+
+    let nret = count as usize - 1;
+    let values_base = cur_base + values as usize;
+    let dst_start = cur_base - 1 - num_extras;
+    // `num_results == 0` is the CALL's MULTRET: deliver all `nret` and publish `thread.top`.
+    let wanted = if num_results == 0 {
+        nret
+    } else {
+        num_results as usize - 1
+    };
+    let to_copy = nret.min(wanted);
+    // `dst_start < values_base` and both ranges lie inside the callee's
+    // window, which the CALL that entered it sized the vec for; a forward
+    // element copy is in bounds and never reads a slot it already overwrote.
+    debug_assert!(values_base + to_copy <= thread.stack.len());
+    debug_assert!(dst_start + wanted <= thread.stack.len());
+    let stack = thread.stack.as_mut_ptr();
+    for i in 0..to_copy {
+        unsafe { *stack.add(dst_start + i) = *stack.add(values_base + i) };
+    }
+    for i in to_copy..wanted {
+        unsafe { *stack.add(dst_start + i) = Value::nil() };
+    }
+    // Without this a `top` left high by a multires producer inside the callee
+    // would keep its dead registers traced (#43); the registers themselves
+    // are released by `trim_dead` on exit.
+    thread.set_top_dirty(dst_start + wanted);
+
+    // The top frame is `Frame::Lua` (it is the one we are running) and
+    // `LuaFrame` is `Copy`, so nothing needs dropping.
+    unsafe { thread.frames.set_len(n - 1) };
+    ds.bind_frame(thread);
+    let (new_base, new_ip) = unsafe { ((*ds.frame).base, (*ds.frame).pc) };
+    ip = new_ip;
+    registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
+    dispatch!();
+}
+
+/// The general RETURN: MULTRET, continuations, open upvalues / to-be-closed
+/// variables, and returns into a non-Lua parent or out of the thread.
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn op_return_slow<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
@@ -3519,7 +3660,7 @@ pub(crate) enum FrameReturn {
 /// Unwind the top-of-stack frame assuming it returned the values at
 /// `stack[values_base .. values_base + nret]`. Shared by the bytecode
 /// `RETURN` handler and the native-tailcall path.
-#[inline(always)]
+#[inline]
 pub(crate) fn frame_return<'gc>(
     mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
@@ -3542,7 +3683,9 @@ pub(crate) fn frame_return<'gc>(
     // The func slot sits at `cur_base - 1 - num_extras`: VARARGPREP shifted
     // base past the extras at `[cur_base - num_extras .. cur_base]` (0 for
     // non-vararg frames).
-    close_upvalues(mc, thread, cur_base);
+    if frame_has_open_upvalues(thread, cur_base) {
+        close_upvalues_slow(mc, thread, cur_base);
+    }
     close_tbc_vars(mc, thread, cur_base);
     // The top frame is the `Frame::Lua` read above and `LuaFrame` is `Copy`,
     // so there is nothing to drop; `Vec::pop` would copy the 96-byte frame out
@@ -3614,6 +3757,18 @@ pub(crate) fn frame_return<'gc>(
     }
 
     FrameReturn::Caller { new_base, new_ip }
+}
+
+/// Whether the frame based at `base` still has open upvalues. Open upvalues
+/// are appended in creation order and every deeper frame closes its own before
+/// returning, so only the tail of the list can belong to the returning frame.
+/// (Not valid for a partial `CLOSE` inside a frame, whose entries are not
+/// ordered by index.)
+#[inline(always)]
+fn frame_has_open_upvalues<'gc>(thread: &ThreadState<'gc>, base: usize) -> bool {
+    thread.open_upvalues.last().is_some_and(
+        |uv| matches!(&*uv.borrow(), UpvalueState::Open { index, .. } if *index >= base),
+    )
 }
 
 /// Close all open upvalues pointing at stack indices >= `start_idx`.
