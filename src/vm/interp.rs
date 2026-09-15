@@ -7,7 +7,7 @@ use crate::env::shape::{MetamethodBits, Shape};
 use crate::env::string::LuaString;
 use crate::env::table::Table;
 use crate::env::thread::{
-    CallSite, Frame, LuaFrame, PendingAction, Thread, ThreadState, ThreadStatus,
+    CallSite, Frame, LuaFrame, PendingAction, Thread, ThreadState, ThreadStatus, frame_flags,
 };
 use crate::env::value::{Value, ValueKind};
 use crate::instruction::{Instruction, Op, UpValueDescriptor};
@@ -1896,6 +1896,7 @@ extern "rust-preserve-none" fn op_tbc<'gc>(
     let val = instruction.a();
     let base = ds.base();
     thread.tbc_slots.push(base + val as usize);
+    unsafe { (*ds.frame).flags |= frame_flags::TBC };
     dispatch!();
 }
 
@@ -2434,6 +2435,7 @@ macro_rules! call_lua {
             base: new_base,
             pc: $ip,
             num_results: $returns,
+            flags: 0,
             num_extras,
             continuation: None,
         };
@@ -2798,26 +2800,20 @@ extern "rust-preserve-none" fn op_return<'gc>(
     helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (values, count) = instruction.ab();
 
-    let (cur_base, num_results, num_extras, has_cont) = {
+    let (cur_base, num_results, num_extras, flags) = {
         let f = unsafe { &*ds.frame };
-        (
-            f.base,
-            f.num_results,
-            f.num_extras as usize,
-            f.continuation.is_some(),
-        )
+        (f.base, f.num_results, f.num_extras as usize, f.flags)
     };
-    let n = thread.frames.len();
-    let parent_is_lua = n >= 2 && matches!(thread.frames[n - 2], Frame::Lua(_));
-    if std::hint::unlikely(
-        count == 0
-            || has_cont
-            || frame_has_open_upvalues(thread, cur_base)
-            || !thread.tbc_slots.is_empty()
-            || !parent_is_lua,
-    ) {
+    // `flags` covers continuation, open upvalues, TBC slots and a non-Lua
+    // parent (see `frame_flags`); `count == 0` is MULTRET.
+    if std::hint::unlikely(count == 0 || flags != 0) {
         become op_return_slow(instruction, ctx, thread, registers, ip, handlers, ds);
     }
+    debug_assert!(!frame_has_open_upvalues(thread, cur_base));
+    debug_assert!(matches!(
+        thread.frames[thread.frames.len() - 2],
+        Frame::Lua(_)
+    ));
 
     let nret = count as usize - 1;
     let values_base = cur_base + values as usize;
@@ -2828,19 +2824,24 @@ extern "rust-preserve-none" fn op_return<'gc>(
     } else {
         num_results as usize - 1
     };
-    let to_copy = nret.min(wanted);
     // `dst_start < values_base` and both ranges lie inside the callee's
     // window, which the CALL that entered it sized the vec for; a forward
     // element copy is in bounds and never reads a slot it already overwrote.
-    debug_assert!(values_base + to_copy <= thread.stack.len());
+    debug_assert!(values_base + nret.min(wanted) <= thread.stack.len());
     debug_assert!(dst_start + wanted <= thread.stack.len());
     let stack = thread.stack.as_mut_ptr();
-    for i in 0..to_copy {
-        unsafe { *stack.add(dst_start + i) = *stack.add(values_base + i) };
+    if std::hint::likely(nret == 1 && wanted == 1) {
+        unsafe { *stack.add(dst_start) = *stack.add(values_base) };
+    } else {
+        let to_copy = nret.min(wanted);
+        for i in 0..to_copy {
+            unsafe { *stack.add(dst_start + i) = *stack.add(values_base + i) };
+        }
+        for i in to_copy..wanted {
+            unsafe { *stack.add(dst_start + i) = Value::nil() };
+        }
     }
-    for i in to_copy..wanted {
-        unsafe { *stack.add(dst_start + i) = Value::nil() };
-    }
+    let n = thread.frames.len();
     // Without this a `top` left high by a multires producer inside the callee
     // would keep its dead registers traced (#43); the registers themselves
     // are released by `trim_dead` on exit.
@@ -3248,6 +3249,7 @@ extern "rust-preserve-none" fn op_closure<'gc>(
                         }),
                     );
                     thread.open_upvalues.push(uv);
+                    unsafe { (*ds.frame).flags |= frame_flags::OPEN_UPVALUES };
                     uv
                 }
             }
@@ -4157,6 +4159,7 @@ fn schedule_meta_call<'gc>(
         // reads return values directly from the stack via `cont.results_base`.
         pc: closure.proto.code.as_ptr(),
         num_results: 0,
+        flags: frame_flags::HAS_CONT,
         num_extras,
         continuation: Some(cont),
     });
