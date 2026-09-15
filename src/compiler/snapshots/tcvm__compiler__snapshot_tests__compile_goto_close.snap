@@ -5,70 +5,61 @@ expression: output
 ; function (params=0, vararg=true, stack=15, upvalues=1)
 ; constants:
 ;   K0 = 0
-;   K1 = 1
-;   K2 = 3
-;   K3 = nil
-;   K4 = 42
-;   K5 = 7
-;   K6 = 4
-;   K7 = 2
+;   K1 = nil
+;   K2 = 42
+;   K3 = 7
+;   K4 = 1
+;   K5 = 4
 ; upvalues:
 ;   U0 = local R0
 ; code:
 0000  [  1]  VARARGPREP      fixed=0
 0001  [  2]  NEWTABLE        R0
 0002  [  2]  LOAD            R1 K0  ; 0
-0003  [  4]  LOAD            R2 K1  ; 1
-0004  [  4]  ADD             R1 R1 R2
-0005  [  6]  MOVE            R2 R1
-0006  [  7]  CLOSURE         R3 P0
-0007  [  7]  SETTABLE        R3 R0 R1
-0008  [  8]  LOAD            R3 K2  ; 3
-0009  [  8]  LT              R1 R3 inv=false
-0010  [  8]  JMP             +2
+0003  [  4]  ADDI            R1 R1 #1
+0004  [  6]  MOVE            R2 R1
+0005  [  7]  CLOSURE         R3 P0
+0006  [  7]  SETTABLE        R3 R0 R1
+0007  [  8]  LTI             R1 #3 inv=false
+0008  [  8]  JMP             +2
+0009  [  8]  CLOSE           R2
+0010  [  8]  JMP             -8
 0011  [  8]  CLOSE           R2
-0012  [  8]  JMP             -10
-0013  [  8]  CLOSE           R2
-0014  [ 12]  NEWTABLE        R2
-0015  [ 12]  LOAD            R3 K0  ; 0
-0016  [ 14]  LOAD            R4 K1  ; 1
-0017  [ 14]  ADD             R3 R3 R4
-0018  [ 15]  MOVE            R4 R3
-0019  [ 16]  CLOSURE         R5 P1
-0020  [ 16]  SETTABLE        R5 R2 R3
-0021  [ 17]  LOAD            R5 K2  ; 3
-0022  [ 17]  LT              R3 R5 inv=false
-0023  [ 17]  JMP             +2
-0024  [ 17]  CLOSE           R4
-0025  [ 17]  JMP             -10
-0026  [ 20]  LOAD            R5 K3  ; nil
-0027  [ 22]  LOAD            R6 K4  ; 42
-0028  [ 23]  CLOSURE         R5 P2
-0029  [ 24]  JMP             +1
-0030  [ 24]  CLOSE           R6
-0031  [ 26]  CLOSE           R6
-0032  [ 27]  LOAD            R6 K5  ; 7
-0033  [ 30]  NEWTABLE        R7
-0034  [ 31]  LOAD            R8 K1  ; 1
-0035  [ 31]  LOAD            R9 K6  ; 4
-0036  [ 31]  LOAD            R10 K1  ; 1
-0037  [ 31]  FORPREP         R8 +14
-0038  [ 32]  MOVE            R12 R11
-0039  [ 33]  LOAD            R13 K7  ; 2
-0040  [ 33]  MOD             R13 R11 R13
-0041  [ 33]  LOAD            R14 K0  ; 0
-0042  [ 33]  EQ              R13 R14 inv=false
-0043  [ 33]  JMP             +1
-0044  [ 33]  JMP             +5
-0045  [ 34]  LEN             R13 R7
-0046  [ 34]  LOAD            R14 K1  ; 1
-0047  [ 34]  ADD             R13 R13 R14
-0048  [ 34]  CLOSURE         R14 P3
-0049  [ 34]  SETTABLE        R14 R7 R13
-0050  [ 35]  CLOSE           R11
-0051  [ 31]  FORLOOP         R8 -14
-0052  [ 39]  JMP             +0
-0053  [ 41]  RETURN          R0 count=1
+0012  [ 12]  NEWTABLE        R2
+0013  [ 12]  LOAD            R3 K0  ; 0
+0014  [ 14]  ADDI            R3 R3 #1
+0015  [ 15]  MOVE            R4 R3
+0016  [ 16]  CLOSURE         R5 P1
+0017  [ 16]  SETTABLE        R5 R2 R3
+0018  [ 17]  LTI             R3 #3 inv=false
+0019  [ 17]  JMP             +2
+0020  [ 17]  CLOSE           R4
+0021  [ 17]  JMP             -8
+0022  [ 20]  LOAD            R5 K1  ; nil
+0023  [ 22]  LOAD            R6 K2  ; 42
+0024  [ 23]  CLOSURE         R5 P2
+0025  [ 24]  JMP             +1
+0026  [ 24]  CLOSE           R6
+0027  [ 26]  CLOSE           R6
+0028  [ 27]  LOAD            R6 K3  ; 7
+0029  [ 30]  NEWTABLE        R7
+0030  [ 31]  LOAD            R8 K4  ; 1
+0031  [ 31]  LOAD            R9 K5  ; 4
+0032  [ 31]  LOAD            R10 K4  ; 1
+0033  [ 31]  FORPREP         R8 +11
+0034  [ 32]  MOVE            R12 R11
+0035  [ 33]  MODI            R13 R11 #2
+0036  [ 33]  EQI             R13 #0 inv=false
+0037  [ 33]  JMP             +1
+0038  [ 33]  JMP             +4
+0039  [ 34]  LEN             R13 R7
+0040  [ 34]  ADDI            R13 R13 #1
+0041  [ 34]  CLOSURE         R14 P3
+0042  [ 34]  SETTABLE        R14 R7 R13
+0043  [ 35]  CLOSE           R11
+0044  [ 31]  FORLOOP         R8 -11
+0045  [ 39]  JMP             +0
+0046  [ 41]  RETURN          R0 count=1
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=1, upvalues=1)

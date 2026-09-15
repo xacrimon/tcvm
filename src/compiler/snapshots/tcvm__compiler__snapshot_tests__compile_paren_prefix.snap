@@ -28,15 +28,14 @@ expression: output
 0012  [  5]  LOAD            R2 K4  ; 3
 0013  [  6]  SETFIELD        R2 R1 K5  ; "c"
 0014  [  7]  GETFIELD        R3 R1 K0  ; "b"
-0015  [  7]  LOAD            R4 K3  ; 2
-0016  [  7]  POW             R3 R3 R4
-0017  [  7]  UNM             R3 R3
-0018  [  7]  LOAD            R4 K1  ; 1
-0019  [  7]  GETTABLE        R4 R1 R4
-0020  [  7]  LEN             R5 R1
-0021  [  7]  MUL             R4 R4 R5
-0022  [  7]  ADD             R3 R3 R4
-0023  [  7]  RETURN          R0 count=1
+0015  [  7]  POWI            R3 R3 #2
+0016  [  7]  UNM             R3 R3
+0017  [  7]  LOAD            R4 K1  ; 1
+0018  [  7]  GETTABLE        R4 R1 R4
+0019  [  7]  LEN             R5 R1
+0020  [  7]  MUL             R4 R4 R5
+0021  [  7]  ADD             R3 R3 R4
+0022  [  7]  RETURN          R0 count=1
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=1, upvalues=0)

@@ -24,6 +24,7 @@ fn truth(exprs: &[&str]) -> String {
     let bits = run(&format!(
         "local nan = 0/0\n\
          local big, bigf = 9007199254740993, 9007199254740992.0\n\
+         local t, f = 1e10, false\n\
          local r = \"\"\n{body}return tonumber(r)"
     ));
     format!("{bits}")
@@ -92,5 +93,22 @@ fn math_max_min_are_exact_at_the_i64_boundary() {
             "math.type(math.min(math.mininteger, -2^63 - 2048)) == 'float'",
         ]),
         "1111"
+    );
+}
+
+#[test]
+fn non_packing_numeral_lhs_before_short_circuit_rhs() {
+    // A numeral LHS that can't be an immediate must be loaded *before* the
+    // RHS: emitted after it, the `LOAD` sits in the `and`/`or` short-circuit
+    // span and is skipped whenever the RHS short-circuits.
+    assert_eq!(
+        truth(&[
+            "1e10 == (t or 1e10)",
+            "1e10 ~= (f or 3)",
+            "0.1 < (t and 5)",
+            "1e10 <= (t or 1e10)",
+            "1e10 >= (f or 3)",
+        ]),
+        "11111"
     );
 }

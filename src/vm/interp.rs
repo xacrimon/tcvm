@@ -69,6 +69,30 @@ static HANDLERS: [Handler; Op::COUNT] = Op::table([
     (Op::ERRNNIL, op_errnnil),
     (Op::NOP, op_nop),
     (Op::STOP, op_stop),
+    (Op::ADDI, op_addi),
+    (Op::SUBI, op_subi),
+    (Op::MULI, op_muli),
+    (Op::MODI, op_modi),
+    (Op::POWI, op_powi),
+    (Op::DIVI, op_divi),
+    (Op::IDIVI, op_idivi),
+    (Op::BANDI, op_bandi),
+    (Op::BORI, op_bori),
+    (Op::BXORI, op_bxori),
+    (Op::SHLI, op_shli),
+    (Op::SHRI, op_shri),
+    (Op::RSUBI, op_rsubi),
+    (Op::RMODI, op_rmodi),
+    (Op::RPOWI, op_rpowi),
+    (Op::RDIVI, op_rdivi),
+    (Op::RIDIVI, op_ridivi),
+    (Op::RSHLI, op_rshli),
+    (Op::RSHRI, op_rshri),
+    (Op::EQI, op_eqi),
+    (Op::LTI, op_lti),
+    (Op::LEI, op_lei),
+    (Op::GTI, op_gti),
+    (Op::GEI, op_gei),
 ]);
 
 /// Why an opcode faulted. `impl_error` renders the reference message for
@@ -276,6 +300,24 @@ macro_rules! helpers {
         macro_rules! skip {
             () => {{
                 $ip = unsafe { $ip.add(1) };
+            }};
+        }
+
+        /// `if $$cond { skip!() }`, forced to compile as a branch: LLVM otherwise
+        /// if-converts it to a `csel` on `ip`, making the next instruction load
+        /// data-dependent on the compare instead of predicted. The asm is opaque
+        /// so the select can't be re-formed.
+        #[allow(unused_macros)]
+        macro_rules! skip_if {
+            ($$cond:expr) => {{
+                if $$cond {
+                    $ip = unsafe { $ip.add(1) };
+                    // The pointer is only threaded through, never read.
+                    #[allow(clippy::pointers_in_nomem_asm_block)]
+                    unsafe {
+                        core::arch::asm!("/* {0} */", inout(reg) $ip, options(nomem, nostack, preserves_flags));
+                    }
+                }
             }};
         }
 
@@ -1412,32 +1454,45 @@ macro_rules! binop_slow_handler {
         ) {
             helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
             let (dst, lhs, rhs) = instruction.abc();
-
-            {
-                let (lhs, rhs) = (reg!(ref lhs), reg!(ref rhs));
-                let mixed = num::$num_mix_h::<$num_kind>(lhs, rhs);
-                if std::hint::unlikely(mixed.is_some()) {
-                    if let Some(v) = mixed {
-                        *reg!(ref mut dst) = v;
-                        dispatch!();
-                    }
-                }
-            }
-
             let (lhs, rhs) = (reg!(lhs), reg!(rhs));
-            let meta_fn = binop_metamethod(lhs, rhs, ctx.symbols().$mm);
-            if meta_fn.is_nil() {
-                raise!(OpError::$err(lhs, rhs));
-            }
-
-            let cont = Continuation {
-                payload: ContinuationPayload::StoreResult { dst },
-                results_base: 0,
-                nret: 0,
-            };
-            invoke_metamethod!(meta_fn, &[lhs, rhs], cont);
+            binop_slow_body!(
+                dst, lhs, rhs, $num_kind, $num_mix_h, $mm, $err, ctx, thread, registers, ip,
+                handlers, ds
+            );
         }
     };
+}
+
+/// The tail every binary-op slow path shares, given the operand *values*:
+/// the int/float mixed arm, then the metamethod, then the type error.
+/// Expects `helpers!` to have run in the enclosing handler.
+macro_rules! binop_slow_body {
+    ($dst:expr, $lhs:expr, $rhs:expr, $num_kind:ty, $num_mix_h:ident, $mm:ident, $err:ident,
+     $ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr, $ds:ident) => {{
+        let dst = $dst;
+        let (lhs, rhs): (Value<'gc>, Value<'gc>) = ($lhs, $rhs);
+        {
+            let mixed = num::$num_mix_h::<$num_kind>(&lhs, &rhs);
+            if std::hint::unlikely(mixed.is_some()) {
+                if let Some(v) = mixed {
+                    *reg!(ref mut dst) = v;
+                    dispatch!();
+                }
+            }
+        }
+
+        let meta_fn = binop_metamethod(lhs, rhs, $ctx.symbols().$mm);
+        if meta_fn.is_nil() {
+            raise!(OpError::$err(lhs, rhs));
+        }
+
+        let cont = Continuation {
+            payload: ContinuationPayload::StoreResult { dst },
+            results_base: 0,
+            nret: 0,
+        };
+        invoke_metamethod!(meta_fn, &[lhs, rhs], cont);
+    }};
 }
 
 arith_handler!(op_add, op_add_slow, ADD, num::Add, mm_add);
@@ -1452,6 +1507,161 @@ bit_handler!(op_bor, op_bor_slow, BOR, num::BOr, mm_bor);
 bit_handler!(op_bxor, op_bxor_slow, BXOR, num::BXor, mm_bxor);
 bit_handler!(op_shl, op_shl_slow, SHL, num::Shl, mm_shl);
 bit_handler!(op_shr, op_shr_slow, SHR, num::Shr, mm_shr);
+
+// ---------------------------------------------------------------------------
+// Arithmetic and bitwise (register-immediate)
+// ---------------------------------------------------------------------------
+
+/// `R[dst] = R[src] <op> imm`, or `imm <op> R[src]` when `$swap`. Unlike the
+/// register form the int/float mixes are inline: the constant side converts
+/// for free.
+macro_rules! arith_imm_handler {
+    ($fn_name:ident, $slow_name:ident, $instr:ident, $num_kind:ty, $mm:ident, $swap:expr) => {
+        #[inline(never)]
+        #[rustc_align(32)]
+        extern "rust-preserve-none" fn $fn_name<'gc>(
+            instruction: Instruction,
+            ctx: Context<'gc>,
+            thread: &mut ThreadState<'gc>,
+            registers: Registers<'gc, '_>,
+            ip: *const Instruction,
+            handlers: *const (),
+            ds: &mut DispatchState<'gc>,
+        ) {
+            helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+            let (dst, src, _) = instruction.abc_imm();
+            let v = reg!(ref src);
+
+            if std::hint::likely(instruction.imm_is_int()) {
+                let k = instruction.imm_int();
+                if std::hint::likely(v.kind() == ValueKind::Integer)
+                    && let Some(i) = v.get_integer()
+                {
+                    if $swap {
+                        // The register is the divisor, so RMODI/RIDIVI
+                        // still check it.
+                        let Some(out) = op_arith_int::<$num_kind>(k, i) else {
+                            raise!(if Op::$instr == Op::RMODI {
+                                OpError::ModByZero
+                            } else {
+                                OpError::DivByZero
+                            });
+                        };
+                        *reg!(ref mut dst) = out;
+                    } else {
+                        // The compiler never emits a zero integer divisor
+                        // in this position, so no `n % 0` check.
+                        debug_assert!(
+                            !<$num_kind as num::ArithOp>::INT_ZERO_DIVISOR_INVALID || k != 0
+                        );
+                        *reg!(ref mut dst) = <$num_kind as num::ArithOp>::int(i, k);
+                    }
+                    dispatch!();
+                } else if let Some(f) = v.get_float() {
+                    let k = k as f64;
+                    let (l, r) = if $swap { (k, f) } else { (f, k) };
+                    *reg!(ref mut dst) = op_arith_float::<$num_kind>(l, r);
+                    dispatch!();
+                }
+            } else {
+                let k = instruction.imm_float();
+                if let Some(f) = v.get_float() {
+                    let (l, r) = if $swap { (k, f) } else { (f, k) };
+                    *reg!(ref mut dst) = op_arith_float::<$num_kind>(l, r);
+                    dispatch!();
+                } else if let Some(i) = v.get_integer() {
+                    let f = i as f64;
+                    let (l, r) = if $swap { (k, f) } else { (f, k) };
+                    *reg!(ref mut dst) = op_arith_float::<$num_kind>(l, r);
+                    dispatch!();
+                }
+            }
+
+            become $slow_name(instruction, ctx, thread, registers, ip, handlers, ds);
+        }
+
+        binop_imm_slow_handler!($slow_name, $num_kind, op_arith_mixed, $mm, Arith, $swap);
+    };
+}
+
+/// `R[dst] = R[src] <op> imm` for the bitwise opcodes. The immediate is
+/// always an integer; a float register goes through the slow path's exact
+/// conversion.
+macro_rules! bit_imm_handler {
+    ($fn_name:ident, $slow_name:ident, $instr:ident, $num_kind:ty, $mm:ident, $swap:expr) => {
+        #[inline(never)]
+        #[rustc_align(32)]
+        extern "rust-preserve-none" fn $fn_name<'gc>(
+            instruction: Instruction,
+            ctx: Context<'gc>,
+            thread: &mut ThreadState<'gc>,
+            registers: Registers<'gc, '_>,
+            ip: *const Instruction,
+            handlers: *const (),
+            ds: &mut DispatchState<'gc>,
+        ) {
+            helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+            let (dst, src, _) = instruction.abc_imm();
+            debug_assert!(instruction.imm_is_int());
+            let k = instruction.imm_int();
+
+            if let Some(i) = reg!(ref src).get_integer() {
+                let (l, r) = if $swap { (k, i) } else { (i, k) };
+                *reg!(ref mut dst) = op_bit_int::<$num_kind>(l, r);
+                dispatch!();
+            }
+
+            become $slow_name(instruction, ctx, thread, registers, ip, handlers, ds);
+        }
+
+        binop_imm_slow_handler!($slow_name, $num_kind, op_bit_mixed, $mm, Bitwise, $swap);
+    };
+}
+
+macro_rules! binop_imm_slow_handler {
+    ($slow_name:ident, $num_kind:ty, $num_mix_h:ident, $mm:ident, $err:ident, $swap:expr) => {
+        #[inline(never)]
+        #[rustc_align(32)]
+        extern "rust-preserve-none" fn $slow_name<'gc>(
+            instruction: Instruction,
+            ctx: Context<'gc>,
+            thread: &mut ThreadState<'gc>,
+            mut registers: Registers<'gc, '_>,
+            mut ip: *const Instruction,
+            handlers: *const (),
+            ds: &mut DispatchState<'gc>,
+        ) {
+            helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+            let (dst, src, flipped) = instruction.abc_imm();
+            let (v, k) = (reg!(src), instruction.imm_value());
+            let (lhs, rhs) = if $swap || flipped { (k, v) } else { (v, k) };
+            binop_slow_body!(
+                dst, lhs, rhs, $num_kind, $num_mix_h, $mm, $err, ctx, thread, registers, ip,
+                handlers, ds
+            );
+        }
+    };
+}
+
+arith_imm_handler!(op_addi, op_addi_slow, ADDI, num::Add, mm_add, false);
+arith_imm_handler!(op_subi, op_subi_slow, SUBI, num::Sub, mm_sub, false);
+arith_imm_handler!(op_muli, op_muli_slow, MULI, num::Mul, mm_mul, false);
+arith_imm_handler!(op_modi, op_modi_slow, MODI, num::Mod, mm_mod, false);
+arith_imm_handler!(op_powi, op_powi_slow, POWI, num::Pow, mm_pow, false);
+arith_imm_handler!(op_divi, op_divi_slow, DIVI, num::Div, mm_div, false);
+arith_imm_handler!(op_idivi, op_idivi_slow, IDIVI, num::IDiv, mm_idiv, false);
+arith_imm_handler!(op_rsubi, op_rsubi_slow, RSUBI, num::Sub, mm_sub, true);
+arith_imm_handler!(op_rmodi, op_rmodi_slow, RMODI, num::Mod, mm_mod, true);
+arith_imm_handler!(op_rpowi, op_rpowi_slow, RPOWI, num::Pow, mm_pow, true);
+arith_imm_handler!(op_rdivi, op_rdivi_slow, RDIVI, num::Div, mm_div, true);
+arith_imm_handler!(op_ridivi, op_ridivi_slow, RIDIVI, num::IDiv, mm_idiv, true);
+bit_imm_handler!(op_bandi, op_bandi_slow, BANDI, num::BAnd, mm_band, false);
+bit_imm_handler!(op_bori, op_bori_slow, BORI, num::BOr, mm_bor, false);
+bit_imm_handler!(op_bxori, op_bxori_slow, BXORI, num::BXor, mm_bxor, false);
+bit_imm_handler!(op_shli, op_shli_slow, SHLI, num::Shl, mm_shl, false);
+bit_imm_handler!(op_shri, op_shri_slow, SHRI, num::Shr, mm_shr, false);
+bit_imm_handler!(op_rshli, op_rshli_slow, RSHLI, num::Shl, mm_shl, true);
+bit_imm_handler!(op_rshri, op_rshri_slow, RSHRI, num::Shr, mm_shr, true);
 
 // ---------------------------------------------------------------------------
 // Unary operations
@@ -1704,9 +1914,7 @@ extern "rust-preserve-none" fn op_eq<'gc>(
     let b = reg!(rhs);
     if num::raw_eq(a, b) {
         // Primitive or pointer-equal — no metamethod consultation.
-        if !inverted {
-            skip!();
-        }
+        skip_if!(!inverted);
         dispatch!();
     }
 
@@ -1730,9 +1938,7 @@ extern "rust-preserve-none" fn op_eq<'gc>(
     }
 
     // Not equal and no applicable metamethod.
-    if inverted {
-        skip!();
-    }
+    skip_if!(inverted);
     dispatch!();
 }
 
@@ -1769,9 +1975,7 @@ extern "rust-preserve-none" fn op_lt<'gc>(
     };
 
     if let Some(r) = primitive {
-        if r != inverted {
-            skip!();
-        }
+        skip_if!(r != inverted);
         dispatch!();
     }
 
@@ -1824,9 +2028,7 @@ extern "rust-preserve-none" fn op_le<'gc>(
     };
 
     if let Some(r) = primitive {
-        if r != inverted {
-            skip!();
-        }
+        skip_if!(r != inverted);
         dispatch!();
     }
 
@@ -1846,6 +2048,171 @@ extern "rust-preserve-none" fn op_le<'gc>(
     invoke_metamethod!(meta_fn, &[a, b], cont);
 }
 
+/// `if (R[src] <cmp> imm) != inverted then skip`; `$swap` puts the immediate
+/// on the left.
+macro_rules! cmp_imm_handler {
+    ($fn_name:ident, $slow_name:ident, $mm:ident, $swap:expr,
+     $ii:expr, $ff:expr, $if_:expr, $fi:expr) => {
+        #[inline(never)]
+        #[rustc_align(32)]
+        extern "rust-preserve-none" fn $fn_name<'gc>(
+            instruction: Instruction,
+            ctx: Context<'gc>,
+            thread: &mut ThreadState<'gc>,
+            registers: Registers<'gc, '_>,
+            mut ip: *const Instruction,
+            handlers: *const (),
+            ds: &mut DispatchState<'gc>,
+        ) {
+            helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+            let (src, inverted) = instruction.ab_imm_flag();
+            let v = reg!(ref src);
+
+            let primitive: Option<bool> = if std::hint::likely(instruction.imm_is_int()) {
+                let k = instruction.imm_int();
+                if std::hint::likely(v.kind() == ValueKind::Integer)
+                    && let Some(i) = v.get_integer()
+                {
+                    Some(if $swap { $ii(k, i) } else { $ii(i, k) })
+                } else if let Some(f) = v.get_float() {
+                    Some(if $swap { $if_(k, f) } else { $fi(f, k) })
+                } else {
+                    None
+                }
+            } else {
+                let k = instruction.imm_float();
+                if let Some(f) = v.get_float() {
+                    Some(if $swap { $ff(k, f) } else { $ff(f, k) })
+                } else if let Some(i) = v.get_integer() {
+                    Some(if $swap { $fi(k, i) } else { $if_(i, k) })
+                } else {
+                    None
+                }
+            };
+
+            if let Some(r) = primitive {
+                skip_if!(r != inverted);
+                dispatch!();
+            }
+
+            become $slow_name(instruction, ctx, thread, registers, ip, handlers, ds);
+        }
+
+        #[inline(never)]
+        #[rustc_align(32)]
+        extern "rust-preserve-none" fn $slow_name<'gc>(
+            instruction: Instruction,
+            ctx: Context<'gc>,
+            thread: &mut ThreadState<'gc>,
+            mut registers: Registers<'gc, '_>,
+            mut ip: *const Instruction,
+            handlers: *const (),
+            ds: &mut DispatchState<'gc>,
+        ) {
+            helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+            let (src, inverted) = instruction.ab_imm_flag();
+            let (v, k) = (reg!(src), instruction.imm_value());
+            let (a, b) = if $swap { (k, v) } else { (v, k) };
+            let meta_fn = binop_metamethod(a, b, ctx.symbols().$mm);
+            if meta_fn.is_nil() {
+                raise!(OpError::Compare(a, b));
+            }
+            let cont = Continuation {
+                payload: ContinuationPayload::CondJump {
+                    offset: 1,
+                    inverted,
+                },
+                results_base: 0,
+                nret: 0,
+            };
+            invoke_metamethod!(meta_fn, &[a, b], cont);
+        }
+    };
+}
+
+cmp_imm_handler!(
+    op_lti,
+    op_lti_slow,
+    mm_lt,
+    false,
+    |a, b| a < b,
+    |a: f64, b: f64| a < b,
+    num::lt_int_float,
+    num::lt_float_int
+);
+cmp_imm_handler!(
+    op_lei,
+    op_lei_slow,
+    mm_le,
+    false,
+    |a, b| a <= b,
+    |a: f64, b: f64| a <= b,
+    num::le_int_float,
+    num::le_float_int
+);
+cmp_imm_handler!(
+    op_gti,
+    op_gti_slow,
+    mm_lt,
+    true,
+    |a, b| a < b,
+    |a: f64, b: f64| a < b,
+    num::lt_int_float,
+    num::lt_float_int
+);
+cmp_imm_handler!(
+    op_gei,
+    op_gei_slow,
+    mm_le,
+    true,
+    |a, b| a <= b,
+    |a: f64, b: f64| a <= b,
+    num::le_int_float,
+    num::le_float_int
+);
+
+/// `if (R[src] == imm) != inverted then skip`.
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn op_eqi<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+) {
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    let (src, inverted) = instruction.ab_imm_flag();
+    let v = reg!(ref src);
+
+    let eq = if std::hint::likely(instruction.imm_is_int()) {
+        let k = instruction.imm_int();
+        if std::hint::likely(v.kind() == ValueKind::Integer)
+            && let Some(i) = v.get_integer()
+        {
+            i == k
+        } else if let Some(f) = v.get_float() {
+            num::exact_float_to_int(f) == Some(k)
+        } else {
+            false
+        }
+    } else {
+        let k = instruction.imm_float();
+        if let Some(f) = v.get_float() {
+            f == k
+        } else if let Some(i) = v.get_integer() {
+            num::exact_float_to_int(k) == Some(i)
+        } else {
+            false
+        }
+    };
+
+    skip_if!(eq != inverted);
+    dispatch!();
+}
+
 /// if (not R[src]) == inverted then skip next instruction
 #[inline(never)]
 #[rustc_align(32)]
@@ -1861,9 +2228,7 @@ extern "rust-preserve-none" fn op_test<'gc>(
     helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (src, inverted) = instruction.ab_flag();
     let truthy = !reg!(src).is_falsy();
-    if truthy != inverted {
-        skip!();
-    }
+    skip_if!(truthy != inverted);
     dispatch!();
 }
 
@@ -1885,7 +2250,7 @@ extern "rust-preserve-none" fn op_testset<'gc>(
     let val = reg!(src);
     let truthy = !val.is_falsy();
     if truthy == inverted {
-        skip!();
+        skip_if!(true);
     } else {
         *reg!(ref mut dst) = val;
     }

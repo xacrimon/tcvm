@@ -10,7 +10,7 @@ use crate::dmm::Gc;
 use crate::env::function::LocVar;
 use crate::env::{LuaString, Prototype, value::Value};
 use crate::instruction::{
-    IcIdx, Instruction, KIdx, Op, ProtoIdx, Reg, Shape, UpIdx, UpValueDescriptor,
+    IcIdx, Imm, Instruction, KIdx, Op, ProtoIdx, Reg, Shape, UpIdx, UpValueDescriptor,
 };
 use crate::lua;
 use crate::parser::LineMap;
@@ -3279,10 +3279,33 @@ fn compile_expr_binary_op(
         return Ok(ExprDesc::from_numeral(folded));
     }
 
+    // Immediate forms. The RHS is tried first so a refused fold (`1 // 0.0`)
+    // still gets the direct form.
+    let rhs_imm = match rhs_desc.kind {
+        ExprKind::Numeral(n) if !rhs_desc.has_jumps() => arith_imm(op, n, false),
+        _ => None,
+    };
+    let lhs_imm = match lhs_desc.kind {
+        ExprKind::Numeral(n) if !lhs_desc.has_jumps() => arith_imm(op, n, true),
+        _ => None,
+    };
+    if let Some((emit, imm)) = rhs_imm.or(lhs_imm) {
+        let src = if rhs_imm.is_some() {
+            ctx.discharge_to_reg_mut(&mut lhs_desc, None)?
+        } else {
+            ctx.discharge_to_reg_mut(&mut rhs_desc, None)?
+        };
+        ctx.cur_line = op_line;
+        ctx.free_reg(src);
+        let dst = ctx.dst_or_alloc(dst)?;
+        ctx.emit(emit(dst, src, imm));
+        return Ok(ExprDesc::from_reg(dst));
+    }
+
     // Postfix: materialise both operands, then emit. When the LHS is still a
     // lazy numeral and the RHS carries short-circuit jumps, discharge the RHS
-    // first so the LHS's `LOAD` lands *after* the RHS's jump span (tcvm has no
-    // immediate arithmetic operands, so the constant must occupy a register).
+    // first so the LHS's `LOAD` lands *after* the RHS's jump span (the
+    // numeral didn't pack as an immediate, so it must occupy a register).
     let (lhs, rhs) = if !materialise_lhs_early && rhs_desc.has_jumps() {
         let rhs = ctx.discharge_to_reg_mut(&mut rhs_desc, None)?;
         let lhs = ctx.discharge_to_reg_mut(&mut lhs_desc, None)?;
@@ -3348,6 +3371,63 @@ fn compile_expr_binary_op(
     Ok(ExprDesc::from_reg(reg))
 }
 
+type ArithImmCtor = fn(Reg, Reg, Imm) -> Instruction;
+type CmpImmCtor = fn(Reg, Imm) -> Instruction;
+
+/// Bitwise ops take integer immediates only — a metamethod would otherwise see
+/// `2.0` become `2`. `MODI`/`IDIVI` refuse a zero integer divisor so the handler
+/// can skip the check.
+fn arith_imm(op: BinaryOperator, n: Numeral, imm_on_left: bool) -> Option<(ArithImmCtor, Imm)> {
+    use BinaryOperator as B;
+    let imm = match n {
+        Numeral::Int(i) => Imm::from_int(i)?,
+        Numeral::Float(_)
+            if matches!(op, B::BitAnd | B::BitOr | B::BitXor | B::LShift | B::RShift) =>
+        {
+            return None;
+        }
+        Numeral::Float(f) => Imm::from_float(f)?,
+    };
+    if !imm_on_left && matches!(op, B::Mod | B::IntDiv) && n == Numeral::Int(0) {
+        return None;
+    }
+    macro_rules! form {
+        ($ctor:ident, flipped) => {
+            (|d, s, k| Instruction::$ctor(d, s, true, k), imm)
+        };
+        ($ctor:ident) => {
+            (|d, s, k| Instruction::$ctor(d, s, false, k), imm)
+        };
+    }
+    Some(match (op, imm_on_left) {
+        (B::Add, false) => form!(addi),
+        (B::Add, true) => form!(addi, flipped),
+        (B::Mul, false) => form!(muli),
+        (B::Mul, true) => form!(muli, flipped),
+        (B::BitAnd, false) => form!(bandi),
+        (B::BitAnd, true) => form!(bandi, flipped),
+        (B::BitOr, false) => form!(bori),
+        (B::BitOr, true) => form!(bori, flipped),
+        (B::BitXor, false) => form!(bxori),
+        (B::BitXor, true) => form!(bxori, flipped),
+        (B::Sub, false) => form!(subi),
+        (B::Sub, true) => form!(rsubi),
+        (B::Div, false) => form!(divi),
+        (B::Div, true) => form!(rdivi),
+        (B::IntDiv, false) => form!(idivi),
+        (B::IntDiv, true) => form!(ridivi),
+        (B::Mod, false) => form!(modi),
+        (B::Mod, true) => form!(rmodi),
+        (B::Exp, false) => form!(powi),
+        (B::Exp, true) => form!(rpowi),
+        (B::LShift, false) => form!(shli),
+        (B::LShift, true) => form!(rshli),
+        (B::RShift, false) => form!(shri),
+        (B::RShift, true) => form!(rshri),
+        _ => return None,
+    })
+}
+
 fn emit_arith(
     ctx: &mut Ctx,
     lhs: RegisterIndex,
@@ -3381,8 +3461,47 @@ fn compile_comparison_desc(
 ) -> Result<ExprDesc, CompileError> {
     let lhs_expr = item.lhs().ok_or_else(|| ice("cmp without lhs"))?;
     let rhs_expr = item.rhs().ok_or_else(|| ice("cmp without rhs"))?;
-    let lhs = compile_expr_to_reg(ctx, lhs_expr, None)?;
-    let rhs = compile_expr_to_reg(ctx, rhs_expr, None)?;
+
+    // A packable numeral on either side becomes the immediate. A non-packing one
+    // must be materialised *before* the RHS, or its `LOAD` would sit inside a
+    // jump-carrying RHS's short-circuit span and be skipped.
+    let mut lhs_desc = compile_expr(ctx, lhs_expr, None)?;
+    let lhs_numeral = match lhs_desc.kind {
+        ExprKind::Numeral(n) if !lhs_desc.has_jumps() && imm_packs(n) => Some(n),
+        _ => None,
+    };
+    if lhs_numeral.is_none() {
+        ctx.discharge_to_reg_mut(&mut lhs_desc, None)?;
+    }
+    let mut rhs_desc = compile_expr(ctx, rhs_expr, None)?;
+    let rhs_numeral = match rhs_desc.kind {
+        ExprKind::Numeral(n) if !rhs_desc.has_jumps() && imm_packs(n) => Some(n),
+        _ => None,
+    };
+    let imm_form = match (lhs_numeral, rhs_numeral) {
+        (None, Some(n)) => cmp_imm(op, n, false).map(|f| (f, false)),
+        (Some(n), None) => cmp_imm(op, n, true).map(|f| (f, true)),
+        _ => None,
+    };
+    if let Some(((emit, imm), imm_on_left)) = imm_form {
+        let src = if imm_on_left {
+            ctx.discharge_to_reg_mut(&mut rhs_desc, None)?
+        } else {
+            ctx.discharge_to_reg_mut(&mut lhs_desc, None)?
+        };
+        ctx.cur_line = op_line;
+        ctx.emit(emit(src, imm));
+        let jmp = ctx.emit_unfilled_jmp();
+        ctx.free_reg(src);
+        return Ok(ExprDesc {
+            kind: ExprKind::Jump(Some(jmp)),
+            true_list: JumpList::new(),
+            false_list: JumpList::new(),
+        });
+    }
+
+    let lhs = ctx.discharge_to_reg_mut(&mut lhs_desc, None)?;
+    let rhs = ctx.discharge_to_reg_mut(&mut rhs_desc, None)?;
     ctx.cur_line = op_line;
 
     // Lua 5.5 convention: emit the CMP so the paired JMP fires on the
@@ -3417,6 +3536,34 @@ fn compile_comparison_desc(
         true_list: JumpList::new(),
         false_list: JumpList::new(),
     })
+}
+
+fn imm_packs(n: Numeral) -> bool {
+    match n {
+        Numeral::Int(i) => Imm::from_int(i).is_some(),
+        Numeral::Float(f) => Imm::from_float(f).is_some(),
+    }
+}
+
+/// The immediate comparison for `R op n` (or `n op R` when `imm_on_left`),
+/// with the polarity `compile_comparison_desc` wants (jump fires on truthy).
+/// `n` must pack (see `imm_packs`).
+fn cmp_imm(op: BinaryOperator, n: Numeral, imm_on_left: bool) -> Option<(CmpImmCtor, Imm)> {
+    use BinaryOperator as B;
+    let imm = match n {
+        Numeral::Int(i) => Imm::from_int(i)?,
+        Numeral::Float(f) => Imm::from_float(f)?,
+    };
+    let ctor: CmpImmCtor = match (op, imm_on_left) {
+        (B::Eq, _) => |r, k| Instruction::eqi(r, true, k),
+        (B::NEq, _) => |r, k| Instruction::eqi(r, false, k),
+        (B::Lt, false) | (B::Gt, true) => |r, k| Instruction::lti(r, true, k),
+        (B::Gt, false) | (B::Lt, true) => |r, k| Instruction::gti(r, true, k),
+        (B::LEq, false) | (B::GEq, true) => |r, k| Instruction::lei(r, true, k),
+        (B::GEq, false) | (B::LEq, true) => |r, k| Instruction::gei(r, true, k),
+        _ => return None,
+    };
+    Some((ctor, imm))
 }
 
 /// Jump-list compilation of `lhs and rhs`. When `lhs` is falsy the whole

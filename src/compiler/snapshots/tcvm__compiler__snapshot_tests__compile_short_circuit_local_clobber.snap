@@ -23,17 +23,16 @@ expression: output
 0009  [  7]  JMP             +1
 0010  [  7]  MOVE            R5 R4
 0011  [  9]  LOAD            R6 K2  ; 7
-0012  [ 10]  LOAD            R7 K1  ; 5
-0013  [ 10]  EQ              R6 R7 inv=false
-0014  [ 10]  JMP             +2
-0015  [ 10]  MOVE            R7 R6
-0016  [ 10]  JMP             +2
-0017  [ 10]  LFALSESKIP      R7
-0018  [ 10]  LOAD            R7 K3  ; true
-0019  [ 12]  MOVE            R8 R1
-0020  [ 12]  MOVE            R9 R4
-0021  [ 12]  MOVE            R10 R6
-0022  [ 12]  MOVE            R11 R2
-0023  [ 12]  MOVE            R12 R5
-0024  [ 12]  MOVE            R13 R7
-0025  [ 12]  RETURN          R8 count=7
+0012  [ 10]  EQI             R6 #5 inv=false
+0013  [ 10]  JMP             +2
+0014  [ 10]  MOVE            R7 R6
+0015  [ 10]  JMP             +2
+0016  [ 10]  LFALSESKIP      R7
+0017  [ 10]  LOAD            R7 K3  ; true
+0018  [ 12]  MOVE            R8 R1
+0019  [ 12]  MOVE            R9 R4
+0020  [ 12]  MOVE            R10 R6
+0021  [ 12]  MOVE            R11 R2
+0022  [ 12]  MOVE            R12 R5
+0023  [ 12]  MOVE            R13 R7
+0024  [ 12]  RETURN          R8 count=7
