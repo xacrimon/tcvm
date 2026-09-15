@@ -70,7 +70,7 @@ fn bumpr<'gc>(
             resumed: false,
         },
     );
-    Ok(CallbackAction::Sequence(seq))
+    Ok(CallbackAction::sequence(seq))
 }
 
 #[test]

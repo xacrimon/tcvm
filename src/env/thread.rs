@@ -4,7 +4,7 @@ use crate::env::function::{Function, LuaFn, Upvalue};
 use crate::env::value::Value;
 use crate::lua::Context;
 use crate::vm::interp::Continuation;
-use crate::vm::sequence::{BoxSequence, CallbackAction};
+use crate::vm::sequence::{BoxSequence, Suspend};
 
 /// Copy wrapper stored in Value.
 #[derive(Clone, Copy, Collect)]
@@ -257,12 +257,20 @@ unsafe impl<'gc> Collect<'gc> for ThreadState<'gc> {
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub struct PendingAction<'gc> {
-    pub action: CallbackAction<'gc>,
+    pub action: Box<Suspend<'gc>>,
     #[collect(require_static)]
     pub call_site: CallSite,
 }
 
 impl<'gc> ThreadState<'gc> {
+    /// The owning `Thread`. `Thread::new` stores it before the state is
+    /// reachable, so it is only `None` inside that constructor.
+    #[inline(always)]
+    pub fn handle(&self) -> Thread<'gc> {
+        debug_assert!(self.thread_handle.is_some());
+        unsafe { self.thread_handle.unwrap_unchecked() }
+    }
+
     /// View the top frame as a Lua frame. Returns `None` if the stack is
     /// empty *or* the top is non-Lua (Sequence/Start/WaitThread/Error).
     /// Most interpreter sites can `.unwrap()` this — the dispatch loop only

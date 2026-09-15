@@ -53,7 +53,7 @@ use std::task::{self, Poll, RawWaker, RawWakerVTable, Waker};
 use crate::dmm::{Collect, DynamicRootSet, Mutation, Trace};
 use crate::env::error::Error;
 use crate::env::function::Stack;
-use crate::env::value::Value;
+use crate::env::thread::ThreadState;
 use crate::env::{Function, Thread};
 use crate::lua::Context;
 use crate::lua::stash::{Fetchable, Stashable, StashedError, StashedFunction, StashedThread};
@@ -119,11 +119,7 @@ impl AsyncSequence {
             // Reborrow both stack refs so each `enter` gets a fresh
             // disjoint borrow; mutations to the logical top persist across
             // calls (the borrow targets the live `thread.top`).
-            let stack = Stack::new(
-                &mut *shared.stack_buf,
-                &mut *shared.stack_top,
-                shared.stack_bottom,
-            );
+            let stack = Stack::new(&mut *shared.thread, shared.stack_bottom);
             f(
                 shared.ctx,
                 Locals {
@@ -152,11 +148,7 @@ impl AsyncSequence {
             // Reborrow both stack refs so each `enter` gets a fresh
             // disjoint borrow; mutations to the logical top persist across
             // calls (the borrow targets the live `thread.top`).
-            let stack = Stack::new(
-                &mut *shared.stack_buf,
-                &mut *shared.stack_top,
-                shared.stack_bottom,
-            );
+            let stack = Stack::new(&mut *shared.thread, shared.stack_bottom);
             f(
                 shared.ctx,
                 Locals {
@@ -308,7 +300,7 @@ where
         let SequenceImpl { shared, roots, fut } = this;
         let roots_local = *roots;
 
-        let (stack_buf, stack_top, stack_bottom) = stack.into_parts();
+        let (thread, stack_bottom) = stack.into_parts();
 
         let mut next_op: Option<SequenceOp<'gc>> = None;
 
@@ -317,8 +309,7 @@ where
                 roots: roots_local,
                 ctx,
                 exec,
-                stack_buf,
-                stack_top,
+                thread,
                 stack_bottom,
                 error,
                 next_op: &mut next_op,
@@ -418,14 +409,11 @@ struct Shared<'gc, 'a> {
     roots: DynamicRootSet<'gc>,
     ctx: Context<'gc>,
     exec: Execution<'gc, 'a>,
-    /// Live mutable view of the underlying value-stack vec; used to
-    /// reconstruct a `Stack<'gc, '_>` per `enter` call.
-    stack_buf: &'a mut Vec<Value<'gc>>,
-    /// Live alias of `thread.top` — the authoritative logical window top.
-    /// Reborrowed into each reconstructed `Stack` so mutations persist
-    /// across `enter` calls and are visible to the executor after poll.
-    /// Rides the same whole-struct lifetime transmute as `stack_buf`.
-    stack_top: &'a mut usize,
+    /// Live mutable view of the running thread; reborrowed into a fresh
+    /// `Stack<'gc, '_>` per `enter` call so window mutations (including the
+    /// logical top) persist across calls and are visible to the executor
+    /// after poll. Rides the whole-struct lifetime transmute.
+    thread: &'a mut ThreadState<'gc>,
     stack_bottom: usize,
     error: Option<Error<'gc>>,
     next_op: &'a mut Option<SequenceOp<'gc>>,

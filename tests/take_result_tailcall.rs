@@ -6,7 +6,7 @@ fn yielder<'gc>(
     _n: NativeContext<'gc, '_>,
     _s: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    Ok(CallbackAction::Yield { then: None })
+    Ok(CallbackAction::yield_(None))
 }
 
 /// Tail-call a native that suspends. The Lua frame is popped at TAILCALL time,

@@ -21,7 +21,7 @@ fn suspending_mm<'gc>(
     _nctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    Ok(CallbackAction::Yield { then: None })
+    Ok(CallbackAction::yield_(None))
 }
 
 /// Loads `src` with a global `t` whose metatable maps `event` to the suspending

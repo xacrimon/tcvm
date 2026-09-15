@@ -1,4 +1,6 @@
-use crate::dmm::Collect;
+use std::cell::Cell;
+
+use crate::dmm::{Collect, Gc};
 use crate::env::string::LuaString;
 use crate::env::value::Value;
 use crate::lua::Context;
@@ -7,47 +9,79 @@ use crate::lua::Context;
 /// we model the carrier as a wrapped `Value<'gc>`. The host-facing
 /// `RuntimeError` (in `lua/error.rs`) is the `'static`-ified version handed to
 /// embedders; see `StashedError` for the bridge.
+///
+/// One GC pointer: with `CallbackAction` also pointer-sized, a native's
+/// `Result<CallbackAction, Error>` is a (tag, pointer) pair and comes back in
+/// registers. An error allocates, but so does the message it usually carries.
 #[derive(Clone, Copy, Collect)]
 #[collect(internal, no_drop)]
-pub struct Error<'gc> {
+pub struct Error<'gc>(Gc<'gc, ErrorInner<'gc>>);
+
+#[derive(Collect)]
+#[collect(internal, no_drop)]
+pub struct ErrorInner<'gc> {
     value: Value<'gc>,
     /// Call level whose `source:line:` should prefix a string message, with
     /// the raising native at level 0 — Lua's `error(msg, level)` /
     /// `luaL_where` convention. Applied once by `ThreadState::raise`, which
     /// resets it to 0 so re-raising along the unwind path never prefixes
-    /// twice.
-    level: usize,
+    /// twice. Saturated from `usize`: any level past the stack bottom names
+    /// no frame.
+    #[collect(require_static)]
+    level: Cell<u32>,
 }
 
 impl<'gc> Error<'gc> {
     /// Raise `value` verbatim (`lua_error`).
-    pub fn new(value: Value<'gc>) -> Self {
-        Error { value, level: 0 }
+    pub fn new(ctx: Context<'gc>, value: Value<'gc>) -> Self {
+        Error(Gc::new(
+            ctx.mutation(),
+            ErrorInner {
+                value,
+                level: Cell::new(0),
+            },
+        ))
+    }
+
+    pub(crate) fn from_inner(inner: Gc<'gc, ErrorInner<'gc>>) -> Self {
+        Error(inner)
+    }
+
+    pub(crate) fn inner(self) -> Gc<'gc, ErrorInner<'gc>> {
+        self.0
     }
 
     /// Raise a message prefixed with the caller's position (`luaL_error`).
+    ///
+    /// Out of line: it is the error tail of nearly every builtin, and inlined
+    /// it drags string interning and allocation into their hot bodies.
+    #[cold]
+    #[inline(never)]
     pub fn from_str(ctx: Context<'gc>, msg: &str) -> Self {
         let s = LuaString::new(ctx, msg.as_bytes());
-        Error::new(Value::string(s)).with_level(1)
+        Error::new(ctx, Value::string(s)).with_level(1)
     }
 
+    /// Errors are linear (raised once, then unwound), so this updates the
+    /// shared object rather than allocating a copy.
     pub fn with_level(self, level: usize) -> Self {
-        Error { level, ..self }
+        self.0.level.set(u32::try_from(level).unwrap_or(u32::MAX));
+        self
     }
 
     pub fn value(self) -> Value<'gc> {
-        self.value
+        self.0.value
     }
 
     pub fn level(self) -> usize {
-        self.level
+        self.0.level.get() as usize
     }
 
     /// The error as a host-printable message, following `lua.c`'s
     /// `msghandler`: strings and numbers as-is, anything else by type.
     // TODO: honour `__tostring` once metamethods exist.
     pub fn message(self, ctx: Context<'gc>) -> LuaString<'gc> {
-        let v = self.value;
+        let v = self.value();
         if v.get_string().is_some() || v.get_integer().is_some() || v.get_float().is_some() {
             crate::builtin::util::basic_tostring(ctx, v)
         } else {

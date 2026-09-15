@@ -73,10 +73,7 @@ fn lua_resume<'gc>(
     let args: Vec<Value<'gc>> = stack.as_slice()[1..].to_vec();
     stack.replace(&args);
     let then = BoxSequence::new(nctx.ctx.mutation(), PCallSequence);
-    Ok(CallbackAction::Resume {
-        thread: co,
-        then: Some(then),
-    })
+    Ok(CallbackAction::resume(co, Some(then)))
 }
 
 /// `None` if `co` can be resumed, else the Lua-spec error message that
@@ -103,7 +100,7 @@ fn lua_yield<'gc>(
     _nctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    Ok(CallbackAction::Yield { then: None })
+    Ok(CallbackAction::yield_(None))
 }
 
 /// `coroutine.status(co)` — return one of `"suspended" | "normal" |
@@ -263,10 +260,7 @@ fn wrap_callback<'gc>(
         return Err(Error::from_str(nctx.ctx, msg));
     }
     let then = BoxSequence::new(nctx.ctx.mutation(), UnwrapResumeSequence);
-    Ok(CallbackAction::Resume {
-        thread: co,
-        then: Some(then),
-    })
+    Ok(CallbackAction::resume(co, Some(then)))
 }
 
 // ---------------------------------------------------------------------------
