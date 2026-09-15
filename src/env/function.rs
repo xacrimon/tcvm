@@ -3,6 +3,7 @@ use crate::dmm::{Collect, Gc, Lock, Mutation, RefLock, Trace};
 use crate::env::error::Error;
 use crate::env::shape::Shape;
 use crate::env::string::LuaString;
+use crate::env::thread::ThreadState;
 use crate::env::value::Value;
 use crate::instruction::UpValueDescriptor;
 use crate::vm::sequence::{CallbackAction, Execution};
@@ -180,11 +181,15 @@ pub type NativeFn = for<'gc, 'a> fn(
     stack: Stack<'gc, 'a>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>>;
 
+// A (tag, pointer) pair, returned in registers; a wider result goes through
+// memory and the `Return` case has to be read back from it.
+const _: () = assert!(std::mem::size_of::<Result<CallbackAction<'static>, Error<'static>>>() == 16);
+
 /// Contextual handles passed to a native callback alongside its `Stack`.
 pub struct NativeContext<'gc, 'a> {
     pub ctx: Context<'gc>,
     pub upvalues: &'a [Value<'gc>],
-    pub exec: Execution<'gc, 'a>,
+    pub exec: Execution<'gc>,
 }
 
 /// A mutable view into the running thread's value stack, spanning
@@ -200,30 +205,25 @@ pub struct NativeContext<'gc, 'a> {
 /// decoupling the window from the shared vec so a native call can never
 /// truncate it below an outer frame's register window.
 pub struct Stack<'gc, 'a> {
-    values: &'a mut Vec<Value<'gc>>,
-    /// Authoritative logical top (an alias of `thread.top`). Mutators
-    /// update it; read accessors bound by it.
-    top: &'a mut usize,
+    /// The owning thread: `thread.stack` is the storage and `thread.top` the
+    /// authoritative logical top. One reference rather than two so the view
+    /// is two words and is passed to natives in registers.
+    thread: &'a mut ThreadState<'gc>,
     bottom: usize,
 }
 
 impl<'gc, 'a> Stack<'gc, 'a> {
     #[inline]
-    pub(crate) fn new(values: &'a mut Vec<Value<'gc>>, top: &'a mut usize, bottom: usize) -> Self {
-        debug_assert!(bottom <= *top && *top <= values.len());
-        Stack {
-            values,
-            top,
-            bottom,
-        }
+    pub(crate) fn new(thread: &'a mut ThreadState<'gc>, bottom: usize) -> Self {
+        debug_assert!(bottom <= thread.top && thread.top <= thread.stack.len());
+        Stack { thread, bottom }
     }
 
-    /// Destructure the borrowed view back into its underlying parts. Used
-    /// by `async_sequence` to ferry the live stack (and logical top)
-    /// through a `SharedSlot`.
+    /// Give the thread back. Used by `async_sequence` to ferry the live
+    /// stack through a `SharedSlot`.
     #[inline]
-    pub(crate) fn into_parts(self) -> (&'a mut Vec<Value<'gc>>, &'a mut usize, usize) {
-        (self.values, self.top, self.bottom)
+    pub(crate) fn into_parts(self) -> (&'a mut ThreadState<'gc>, usize) {
+        (self.thread, self.bottom)
     }
 
     /// Stack-bottom index relative to the underlying vec.
@@ -234,12 +234,12 @@ impl<'gc, 'a> Stack<'gc, 'a> {
 
     #[inline]
     pub fn len(&self) -> usize {
-        *self.top - self.bottom
+        self.thread.top - self.bottom
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        *self.top == self.bottom
+        self.thread.top == self.bottom
     }
 
     /// Read the value at index `i` within the callback's window, or `Nil`
@@ -248,10 +248,10 @@ impl<'gc, 'a> Stack<'gc, 'a> {
     #[inline]
     pub fn get(&self, i: usize) -> Value<'gc> {
         let idx = self.bottom + i;
-        if idx < *self.top {
+        if idx < self.thread.top {
             // `top <= values.len()` is rule 1 of the stack invariant.
-            debug_assert!(idx < self.values.len());
-            unsafe { *self.values.get_unchecked(idx) }
+            debug_assert!(idx < self.thread.stack.len());
+            unsafe { *self.thread.stack.get_unchecked(idx) }
         } else {
             Value::nil()
         }
@@ -259,12 +259,12 @@ impl<'gc, 'a> Stack<'gc, 'a> {
 
     #[inline]
     pub fn as_slice(&self) -> &[Value<'gc>] {
-        &self.values[self.bottom..*self.top]
+        &self.thread.stack[self.bottom..self.thread.top]
     }
 
     #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [Value<'gc>] {
-        &mut self.values[self.bottom..*self.top]
+        &mut self.thread.stack[self.bottom..self.thread.top]
     }
 
     /// Discard everything in the window (args included). Lowers the logical top
@@ -272,18 +272,18 @@ impl<'gc, 'a> Stack<'gc, 'a> {
     /// since leaving them set would let the GC trace still reach them.
     #[inline]
     pub fn clear(&mut self) {
-        self.values[self.bottom..*self.top].fill(Value::nil());
-        *self.top = self.bottom;
+        self.thread.stack[self.bottom..self.thread.top].fill(Value::nil());
+        self.thread.top = self.bottom;
     }
 
     #[inline]
     pub fn push(&mut self, v: Value<'gc>) {
-        if *self.top == self.values.len() {
-            self.values.push(v);
+        if self.thread.top == self.thread.stack.len() {
+            self.thread.stack.push(v);
         } else {
-            self.values[*self.top] = v;
+            self.thread.stack[self.thread.top] = v;
         }
-        *self.top += 1;
+        self.thread.top += 1;
     }
 
     #[inline]
@@ -297,33 +297,41 @@ impl<'gc, 'a> Stack<'gc, 'a> {
     #[inline]
     pub fn insert(&mut self, i: usize, v: Value<'gc>) {
         let at = self.bottom + i;
-        debug_assert!(at <= *self.top);
-        if *self.top == self.values.len() {
-            self.values.push(Value::nil());
+        let top = self.thread.top;
+        debug_assert!(at <= top);
+        if top == self.thread.stack.len() {
+            self.thread.stack.push(Value::nil());
         }
-        self.values.copy_within(at..*self.top, at + 1);
-        self.values[at] = v;
-        *self.top += 1;
+        self.thread.stack.copy_within(at..top, at + 1);
+        self.thread.stack[at] = v;
+        self.thread.top += 1;
     }
 
     /// Remove the value at `i`, shifting `stack[i + 1..]` down one.
     #[inline]
     pub fn remove(&mut self, i: usize) {
         let at = self.bottom + i;
-        debug_assert!(at < *self.top);
-        self.values.copy_within(at + 1..*self.top, at);
-        *self.top -= 1;
-        self.values[*self.top] = Value::nil();
+        let top = self.thread.top;
+        debug_assert!(at < top);
+        self.thread.stack.copy_within(at + 1..top, at);
+        self.thread.top -= 1;
+        self.thread.stack[top - 1] = Value::nil();
     }
 
     /// Drop everything above the first `n` values (no-op if shorter).
     #[inline]
     pub fn truncate(&mut self, n: usize) {
         let at = self.bottom + n;
-        if at < *self.top {
-            self.values[at..*self.top].fill(Value::nil());
-            *self.top = at;
+        if at < self.thread.top {
+            self.truncate_to(at);
         }
+    }
+
+    /// The running thread's call frames, innermost last. Hidden because it
+    /// exposes the raw `Frame` layout; for tests and the debug library.
+    #[doc(hidden)]
+    pub fn frames(&self) -> &[crate::env::thread::Frame<'gc>] {
+        &self.thread.frames
     }
 
     /// Replace the whole window (args included) with `values`: the common
@@ -333,11 +341,11 @@ impl<'gc, 'a> Stack<'gc, 'a> {
     #[inline]
     pub fn replace(&mut self, values: &[Value<'gc>]) {
         let end = self.bottom + values.len();
-        if end > self.values.len() {
-            self.values.resize(end, Value::nil());
+        if end > self.thread.stack.len() {
+            self.thread.stack.resize(end, Value::nil());
         }
         for (i, v) in values.iter().enumerate() {
-            self.values[self.bottom + i] = *v;
+            self.thread.stack[self.bottom + i] = *v;
         }
         self.truncate_to(end);
     }
@@ -348,20 +356,20 @@ impl<'gc, 'a> Stack<'gc, 'a> {
     #[inline(always)]
     pub fn ret1(&mut self, v: Value<'gc>) {
         let end = self.bottom + 1;
-        if end > self.values.len() {
-            self.values.resize(end, Value::nil());
+        if end > self.thread.stack.len() {
+            self.thread.stack.resize(end, Value::nil());
         }
-        self.values[self.bottom] = v;
+        self.thread.stack[self.bottom] = v;
         self.truncate_to(end);
     }
 
     /// Lower the window end to `end`, nil-filling what it vacates (rule 3).
     #[inline(always)]
     fn truncate_to(&mut self, end: usize) {
-        if end < *self.top {
-            self.values[end..*self.top].fill(Value::nil());
+        if end < self.thread.top {
+            self.thread.stack[end..self.thread.top].fill(Value::nil());
         }
-        *self.top = end;
+        self.thread.top = end;
     }
 }
 
@@ -370,8 +378,8 @@ impl<'gc, 'a> std::ops::Index<usize> for Stack<'gc, 'a> {
     #[inline]
     fn index(&self, i: usize) -> &Value<'gc> {
         let idx = self.bottom + i;
-        debug_assert!(idx < *self.top);
-        &self.values[idx]
+        debug_assert!(idx < self.thread.top);
+        &self.thread.stack[idx]
     }
 }
 

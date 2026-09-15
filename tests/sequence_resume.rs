@@ -33,7 +33,7 @@ impl<'gc> Sequence<'gc> for ResumeAndAddOne<'gc> {
     fn poll(
         mut self: Pin<&mut Self>,
         ctx: Context<'gc>,
-        _exec: Execution<'gc, '_>,
+        _exec: Execution<'gc>,
         mut stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
         if !self.resumed {
@@ -70,7 +70,7 @@ fn bumpr<'gc>(
             resumed: false,
         },
     );
-    Ok(CallbackAction::Sequence(seq))
+    Ok(CallbackAction::sequence(seq))
 }
 
 #[test]

@@ -1,4 +1,4 @@
-//! A native callback uses `CallbackAction::Call` to call a Lua function,
+//! A native callback uses `CallbackAction::call` to call a Lua function,
 //! either consuming its results via a follow-up sequence or handing them
 //! straight to its own caller.
 
@@ -23,7 +23,7 @@ impl<'gc> Sequence<'gc> for AddOneSequence {
     fn poll(
         self: Pin<&mut Self>,
         ctx: Context<'gc>,
-        _exec: Execution<'gc, '_>,
+        _exec: Execution<'gc>,
         mut stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
         let v = stack.get(0).get_integer().unwrap_or(0);
@@ -42,7 +42,7 @@ fn bumper<'gc>(
     }
     // The callee at stack[0] with no arguments is already `Call` layout.
     let then = BoxSequence::new(nctx.ctx.mutation(), AddOneSequence);
-    Ok(CallbackAction::Call { then: Some(then) })
+    Ok(CallbackAction::call(Some(then)))
 }
 
 /// Native callback `forward(f, ...)`: `f(...)`'s results are the caller's.
@@ -50,7 +50,7 @@ fn forward<'gc>(
     _nctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    Ok(CallbackAction::Call { then: None })
+    Ok(CallbackAction::call(None))
 }
 
 #[test]

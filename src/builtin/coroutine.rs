@@ -73,10 +73,7 @@ fn lua_resume<'gc>(
     // Drop the thread-handle slot so the resume args start at index 0.
     stack.remove(0);
     let then = BoxSequence::new(nctx.ctx.mutation(), ProtectedCall { handler: None });
-    Ok(CallbackAction::Resume {
-        thread: co,
-        then: Some(then),
-    })
+    Ok(CallbackAction::resume(co, Some(then)))
 }
 
 /// `None` if `co` can be resumed, else the Lua-spec error message that
@@ -103,7 +100,7 @@ fn lua_yield<'gc>(
     _nctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    Ok(CallbackAction::Yield { then: None })
+    Ok(CallbackAction::yield_(None))
 }
 
 /// `coroutine.status(co)` — return one of `"suspended" | "normal" |
@@ -263,10 +260,7 @@ fn wrap_callback<'gc>(
         return Err(Error::from_str(nctx.ctx, msg));
     }
     let then = BoxSequence::new(nctx.ctx.mutation(), UnwrapResumeSequence);
-    Ok(CallbackAction::Resume {
-        thread: co,
-        then: Some(then),
-    })
+    Ok(CallbackAction::resume(co, Some(then)))
 }
 
 // ---------------------------------------------------------------------------
@@ -287,7 +281,7 @@ impl<'gc> Sequence<'gc> for UnwrapResumeSequence {
     fn poll(
         self: Pin<&mut Self>,
         _ctx: Context<'gc>,
-        _exec: Execution<'gc, '_>,
+        _exec: Execution<'gc>,
         _stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
         // Pass through whatever the inner left on the stack.
@@ -297,7 +291,7 @@ impl<'gc> Sequence<'gc> for UnwrapResumeSequence {
     fn error(
         self: Pin<&mut Self>,
         _ctx: Context<'gc>,
-        _exec: Execution<'gc, '_>,
+        _exec: Execution<'gc>,
         err: Error<'gc>,
         _stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {

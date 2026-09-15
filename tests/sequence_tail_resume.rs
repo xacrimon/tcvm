@@ -30,7 +30,7 @@ impl<'gc> Sequence<'gc> for TailResumeSeq<'gc> {
     fn poll(
         self: Pin<&mut Self>,
         _ctx: Context<'gc>,
-        _exec: Execution<'gc, '_>,
+        _exec: Execution<'gc>,
         mut stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
         // No args to forward.
@@ -48,7 +48,7 @@ fn forward<'gc>(
     let target = stack.get(0).get_thread().expect("arg #1 is a coroutine");
     stack.replace(&[]);
     let seq = BoxSequence::new(nctx.ctx.mutation(), TailResumeSeq { target });
-    Ok(CallbackAction::Sequence(seq))
+    Ok(CallbackAction::sequence(seq))
 }
 
 #[test]
