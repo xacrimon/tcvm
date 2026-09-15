@@ -1,7 +1,7 @@
 use crate::dmm::{Gc, Lock, Mutation, RefLock};
 use crate::env::function::{
-    Function, FunctionKind, InlineCache, LuaClosure, NativeClosure, NativeContext, Stack, Upvalue,
-    UpvalueState,
+    FastCall, Function, FunctionKind, InlineCache, LuaClosure, NativeClosure, NativeContext, Stack,
+    Upvalue, UpvalueState,
 };
 use crate::env::shape::{MetamethodBits, Shape};
 use crate::env::string::LuaString;
@@ -2282,10 +2282,251 @@ extern "rust-preserve-none" fn op_testset<'gc>(
 // Function calls
 // ---------------------------------------------------------------------------
 
+/// The native arm of CALL: run the callback inline and land its results at
+/// `func_idx`. Expands inside a handler body (needs its `dispatch!`).
+macro_rules! call_native {
+    ($nc:expr, $func_idx:expr, $nargs:expr, $returns:expr, $base:expr,
+     $ctx:ident, $thread:ident, $registers:ident, $ip:ident, $ds:ident) => {{
+        let nc = $nc;
+        let func_idx = $func_idx;
+        let nargs = $nargs;
+        let returns = $returns;
+        let base = $base;
+        {
+            let args_base = func_idx + 1;
+            let argc = if nargs == 0 {
+                $thread.top - args_base
+            } else {
+                nargs as usize - 1
+            };
+            let action = match invoke_native($ctx, $thread, nc, args_base, argc) {
+                Ok(a) => a,
+                Err(err) => {
+                    // Push Frame::Error so the executor's unwinder finds
+                    // the nearest catching `Frame::Sequence` (e.g. the
+                    // PCallSequence under coroutine.resume). Persist
+                    // caller's pc first so re-entry would work if anything
+                    // catches and resumes.
+                    save_pc($thread, $ip);
+                    $thread.raise($ctx, err);
+                    return;
+                }
+            };
+            match action {
+                crate::vm::sequence::CallbackAction::Return => {
+                    // Result count comes via the logical top, not Vec::len:
+                    // `invoke_native` never shrinks the shared stack, so the
+                    // caller's register window is still fully covered.
+                    let retc = $thread.top - args_base;
+                    // Place results at stack[func_idx..] following Lua convention.
+                    let wanted = if returns == 0 {
+                        retc
+                    } else {
+                        returns as usize - 1
+                    };
+                    let to_copy = retc.min(wanted);
+                    for i in 0..to_copy {
+                        $thread.stack[func_idx + i] = $thread.stack[args_base + i];
+                    }
+                    for i in to_copy..wanted {
+                        $thread.stack[func_idx + i] = Value::nil();
+                    }
+                    // Publish the logical top. For MULTRET this is the dynamic
+                    // count the next consumer reads. The stale donor copies the
+                    // down-shift left above the results are dead scratch (a
+                    // call's function always sits at the caller's first free
+                    // register) and are dropped by `trim_dead` on exit.
+                    $thread.set_top_dirty(func_idx + wanted);
+                    $registers = unsafe { $thread.stack.as_mut_ptr().add(base) };
+                    dispatch!();
+                }
+                action => {
+                    // Suspension path: persist caller's pc, stash the
+                    // action on the $thread for the executor to translate
+                    // into frame ops, then exit the dispatch chain.
+                    $ds.save_pc($ip);
+                    $thread.pending_action = Some(PendingAction {
+                        action,
+                        call_site: CallSite {
+                            bottom: args_base,
+                            func_idx,
+                            returns,
+                            cont: None,
+                        },
+                    });
+                    return;
+                }
+            }
+        }
+    }};
+}
+
+/// The Lua arm of CALL: push the callee's frame and continue in it. Shared by
+/// `op_call` and the `__call` slow path; expands inside a handler body so it can
+/// use that handler's `dispatch!`.
+macro_rules! call_lua {
+    ($closure:expr, $func_idx:expr, $nargs:expr, $returns:expr,
+     $thread:ident, $registers:ident, $ip:ident, $ds:ident) => {{
+        let closure = $closure;
+        let new_base = $func_idx + 1;
+        $ds.save_pc($ip);
+        $thread.ensure_slots(new_base + closure.proto.max_stack_size as usize);
+        // `nargs == 0` is the MULTRET sentinel: read the count from `thread.top`.
+        let caller_provided = if $nargs == 0 {
+            $thread.top - new_base
+        } else {
+            $nargs as usize - 1
+        };
+        let num_params = closure.proto.num_params as usize;
+        for i in caller_provided..num_params {
+            $thread.stack[new_base + i] = Value::nil();
+        }
+        let num_extras = if closure.proto.is_vararg {
+            caller_provided.saturating_sub(num_params) as u32
+        } else {
+            0
+        };
+        $ip = closure.proto.code.as_ptr();
+        $thread.push_lua(LuaFrame {
+            closure,
+            base: new_base,
+            pc: $ip,
+            num_results: $returns,
+            num_extras,
+            continuation: None,
+        });
+        $ds.bind_frame($thread);
+        $registers = unsafe { $thread.stack.as_mut_ptr().add(new_base) };
+        dispatch!();
+    }};
+}
+
 /// R[func], ..., R[func+returns-2] = R[func](R[func+1], ..., R[func+args-1])
+///
+/// Only the plain-function cases live here: a Lua closure is entered inline,
+/// a native one is handed to `op_call_fast`/`op_call_native`, and anything
+/// that needs the `__call` chain goes to `op_call_meta`. Keeping every call
+/// out of this handler keeps it frameless.
 #[inline(never)]
 #[rustc_align(32)]
 extern "rust-preserve-none" fn op_call<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+) {
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    let (func, nargs, returns) = instruction.abc();
+    if let Some(f) = reg!(func).get_function() {
+        match f.inner().as_ref() {
+            FunctionKind::Lua(closure) => {
+                let func_idx = ds.base() + func as usize;
+                call_lua!(
+                    *closure, func_idx, nargs, returns, thread, registers, ip, ds
+                );
+            }
+            FunctionKind::Native(nc) => {
+                if nc.fast != FastCall::None {
+                    become op_call_fast(instruction, ctx, thread, registers, ip, handlers, ds);
+                }
+                become op_call_native(instruction, ctx, thread, registers, ip, handlers, ds);
+            }
+        }
+    }
+    become op_call_meta(instruction, ctx, thread, registers, ip, handlers, ds);
+}
+
+/// CALL of a builtin with a `FastCall` kind: run the common shape inline,
+/// writing the result straight into the function slot. Any other shape (arg
+/// count, type) falls through to the full implementation via `op_call_native`.
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn op_call_fast<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+) {
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    let (func, nargs, returns) = instruction.abc();
+    let fast = match reg!(func).get_function().map(|f| f.inner().as_ref()) {
+        Some(FunctionKind::Native(nc)) => nc.fast,
+        _ => FastCall::None,
+    };
+    if nargs == 2 {
+        let a = reg!(func + 1);
+        let result = match fast {
+            FastCall::Sqrt => a.get_float().map(|x| Value::float(x.sqrt())),
+            FastCall::Abs => match a.kind() {
+                ValueKind::Integer => a.get_integer().map(|i| Value::integer(i.wrapping_abs())),
+                ValueKind::Float => a.get_float().map(|x| Value::float(x.abs())),
+                _ => None,
+            },
+            FastCall::Floor | FastCall::Ceil => match a.kind() {
+                ValueKind::Integer => Some(a),
+                ValueKind::Float => a.get_float().map(|x| {
+                    let r = if fast == FastCall::Floor {
+                        x.floor()
+                    } else {
+                        x.ceil()
+                    };
+                    crate::builtin::util::num_to_value(r)
+                }),
+                _ => None,
+            },
+            FastCall::None => None,
+        };
+        if let Some(result) = result {
+            *reg!(ref mut func) = result;
+            if returns == 0 {
+                thread.set_top_dirty(ds.base() + func as usize + 1);
+            } else {
+                for i in 1..returns as usize - 1 {
+                    *reg!(ref mut func as usize + i) = Value::nil();
+                }
+            }
+            dispatch!();
+        }
+    }
+    become op_call_native(instruction, ctx, thread, registers, ip, handlers, ds);
+}
+
+/// CALL of a plain native function (no `__call` chain involved).
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn op_call_native<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+) {
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    let (func, nargs, returns) = instruction.abc();
+    let base = ds.base();
+    let func_idx = base + func as usize;
+    let nc: &NativeClosure<'gc> = match reg!(func).get_function().map(|f| f.inner().as_ref()) {
+        Some(FunctionKind::Native(nc)) => nc,
+        _ => unreachable!("op_call_native on a non-native callee"),
+    };
+    call_native!(
+        nc, func_idx, nargs, returns, base, ctx, thread, registers, ip, ds
+    );
+}
+
+/// The `__call` slow path of CALL: walk the metamethod chain, then enter
+/// whatever it resolves to.
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn op_call_meta<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
@@ -2304,102 +2545,12 @@ extern "rust-preserve-none" fn op_call<'gc>(
 
     match target {
         CallTarget::Lua(closure) => {
-            let new_base = func_idx + 1;
-            ds.save_pc(ip);
-            thread.ensure_slots(new_base + closure.proto.max_stack_size as usize);
-            // `nargs == 0` is the MULTRET sentinel: read the count from `thread.top`.
-            let caller_provided = if nargs == 0 {
-                thread.top - new_base
-            } else {
-                nargs as usize - 1
-            };
-            let num_params = closure.proto.num_params as usize;
-            for i in caller_provided..num_params {
-                thread.stack[new_base + i] = Value::nil();
-            }
-            let num_extras = if closure.proto.is_vararg {
-                caller_provided.saturating_sub(num_params) as u32
-            } else {
-                0
-            };
-            ip = closure.proto.code.as_ptr();
-            thread.push_lua(LuaFrame {
-                closure,
-                base: new_base,
-                pc: ip,
-                num_results: returns,
-                num_extras,
-                continuation: None,
-            });
-            ds.bind_frame(thread);
-            registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
-            dispatch!();
+            call_lua!(closure, func_idx, nargs, returns, thread, registers, ip, ds);
         }
         CallTarget::Native(nc) => {
-            let args_base = func_idx + 1;
-            let argc = if nargs == 0 {
-                thread.top - args_base
-            } else {
-                nargs as usize - 1
-            };
-            let action = match invoke_native(ctx, thread, nc, args_base, argc) {
-                Ok(a) => a,
-                Err(err) => {
-                    // Push Frame::Error so the executor's unwinder finds
-                    // the nearest catching `Frame::Sequence` (e.g. the
-                    // PCallSequence under coroutine.resume). Persist
-                    // caller's pc first so re-entry would work if anything
-                    // catches and resumes.
-                    save_pc(thread, ip);
-                    thread.raise(ctx, err);
-                    return;
-                }
-            };
-            match action {
-                crate::vm::sequence::CallbackAction::Return => {
-                    // Result count comes via the logical top, not Vec::len:
-                    // `invoke_native` never shrinks the shared stack, so the
-                    // caller's register window is still fully covered.
-                    let retc = thread.top - args_base;
-                    // Place results at stack[func_idx..] following Lua convention.
-                    let wanted = if returns == 0 {
-                        retc
-                    } else {
-                        returns as usize - 1
-                    };
-                    let to_copy = retc.min(wanted);
-                    for i in 0..to_copy {
-                        thread.stack[func_idx + i] = thread.stack[args_base + i];
-                    }
-                    for i in to_copy..wanted {
-                        thread.stack[func_idx + i] = Value::nil();
-                    }
-                    // Publish the logical top. For MULTRET this is the dynamic
-                    // count the next consumer reads. The stale donor copies the
-                    // down-shift left above the results are dead scratch (a
-                    // call's function always sits at the caller's first free
-                    // register) and are dropped by `trim_dead` on exit.
-                    thread.set_top_dirty(func_idx + wanted);
-                    registers = unsafe { thread.stack.as_mut_ptr().add(base) };
-                    dispatch!();
-                }
-                action => {
-                    // Suspension path: persist caller's pc, stash the
-                    // action on the thread for the executor to translate
-                    // into frame ops, then exit the dispatch chain.
-                    save_pc(thread, ip);
-                    thread.pending_action = Some(PendingAction {
-                        action,
-                        call_site: CallSite {
-                            bottom: args_base,
-                            func_idx,
-                            returns,
-                            cont: None,
-                        },
-                    });
-                    return;
-                }
-            }
+            call_native!(
+                nc, func_idx, nargs, returns, base, ctx, thread, registers, ip, ds
+            );
         }
     }
 }
