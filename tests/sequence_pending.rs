@@ -24,7 +24,7 @@ impl<'gc> Sequence<'gc> for PendNTimes {
     fn poll(
         mut self: Pin<&mut Self>,
         ctx: Context<'gc>,
-        _exec: Execution<'gc, '_>,
+        _exec: Execution<'gc>,
         mut stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
         if self.remaining > 0 {
@@ -42,7 +42,7 @@ fn factory<'gc>(
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let seq = BoxSequence::new(nctx.ctx.mutation(), PendNTimes { remaining: 3 });
-    Ok(CallbackAction::Sequence(seq))
+    Ok(CallbackAction::sequence(seq))
 }
 
 #[test]

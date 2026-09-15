@@ -5,7 +5,7 @@ use std::fmt;
 
 use crate::dmm::Rootable;
 use crate::dmm::{DynamicRoot, DynamicRootSet, Mutation, RefLock};
-use crate::env::error::Error;
+use crate::env::error::{Error, ErrorInner};
 use crate::env::function::FunctionKind;
 use crate::env::string::StringData;
 use crate::env::table::TableState;
@@ -191,19 +191,20 @@ impl fmt::Debug for StashedValue {
 /// `'static`-erased handle to an in-flight Lua error. Bridges `Error<'gc>`
 /// (a `Value<'gc>` carrier) into the host-facing [`super::RuntimeError`]
 /// without losing the original payload.
-pub struct StashedError(pub(crate) StashedValue);
+#[allow(clippy::type_complexity)]
+pub struct StashedError(pub(crate) DynamicRoot<Rootable![ErrorInner<'_>]>);
 
 impl<'gc> Stashable<'gc> for Error<'gc> {
     type Stashed = StashedError;
     fn stash(self, mc: &Mutation<'gc>, roots: DynamicRootSet<'gc>) -> StashedError {
-        StashedError(self.value().stash(mc, roots))
+        StashedError(roots.stash::<Rootable![ErrorInner<'_>]>(mc, self.inner()))
     }
 }
 
 impl Fetchable for StashedError {
     type Fetched<'gc> = Error<'gc>;
-    fn fetch<'gc>(&self, mc: &Mutation<'gc>, roots: DynamicRootSet<'gc>) -> Error<'gc> {
-        Error::new(self.0.fetch(mc, roots))
+    fn fetch<'gc>(&self, _mc: &Mutation<'gc>, roots: DynamicRootSet<'gc>) -> Error<'gc> {
+        Error::from_inner(roots.fetch::<Rootable![ErrorInner<'_>]>(&self.0))
     }
 }
 

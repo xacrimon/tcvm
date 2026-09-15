@@ -11,7 +11,8 @@ use crate::vm;
 use crate::vm::interp::{CallTarget, OpError};
 use crate::vm::interp::{Continuation, ContinuationPayload};
 use crate::vm::sequence::{
-    BoxSequence, CallbackAction, Catch, Execution, Sequence, SequencePoll, seq_trace_pointers,
+    BoxSequence, CallbackAction, Catch, Execution, Sequence, SequencePoll, Suspend,
+    seq_trace_pointers,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Collect)]
@@ -386,13 +387,8 @@ fn apply_pending_action<'gc>(
 ) -> Result<(), RuntimeError> {
     let mc = ctx.mutation();
     let PendingAction { action, call_site } = p;
-    match action {
-        CallbackAction::Return => {
-            // op_call/tailcall handle Return inline. With yield_bottom
-            // factored out into its own field, no sentinel use remains.
-            unreachable!("apply_pending_action: Return is handled inline");
-        }
-        CallbackAction::Sequence(seq) => {
+    match *action {
+        Suspend::Sequence(seq) => {
             let mut ts = top.borrow_mut(mc);
             ts.frames.push(Frame::Sequence {
                 seq,
@@ -400,7 +396,7 @@ fn apply_pending_action<'gc>(
                 pending_error: None,
             });
         }
-        CallbackAction::Call { then } => {
+        Suspend::Call { then } => {
             let mut ts = top.borrow_mut(mc);
             // If `then` provided, the sequence is the call's "completion
             // handler"; it inherits the caller's expected_returns. The
@@ -430,7 +426,7 @@ fn apply_pending_action<'gc>(
             };
             schedule_call_at(&mut ts, ctx, slot, call_site.returns)?;
         }
-        CallbackAction::Yield { then } => {
+        Suspend::Yield { then } => {
             let mut ts = top.borrow_mut(mc);
             // With a follow-up sequence the resume args are its input and
             // stay at `bottom`; without one they are the call's results.
@@ -449,7 +445,7 @@ fn apply_pending_action<'gc>(
             ts.yield_bottom = Some(landing);
             ts.status = ThreadStatus::Suspended;
         }
-        CallbackAction::Resume {
+        Suspend::Resume {
             thread: target,
             then,
         } => {
@@ -547,7 +543,7 @@ fn schedule_call_at<'gc>(
         let msg = vm::debug::op_error_message(ctx, ts, OpError::Call(ts.stack[slot]));
         ts.raise(
             ctx,
-            Error::new(Value::string(LuaString::new(ctx, msg.as_bytes()))),
+            Error::new(ctx, Value::string(LuaString::new(ctx, msg.as_bytes()))),
         );
         return Ok(());
     };
@@ -607,9 +603,9 @@ fn schedule_call_at<'gc>(
                 ts.set_top(slot + retc);
                 Ok(())
             }
-            other => {
+            CallbackAction::Suspend(action) => {
                 ts.pending_action = Some(PendingAction {
-                    action: other,
+                    action,
                     call_site: CallSite {
                         bottom: args_base,
                         func_idx: slot,
@@ -660,12 +656,8 @@ fn pump_sequence<'gc>(
     // landed call, a resume). Its mutators write `top` back through the view.
     let poll_result = {
         let mut ts = top.borrow_mut(mc);
-        // Split disjoint field borrows through a single deref of the RefMut
-        // (the compiler can't split borrows across `RefMut`'s `Deref`).
-        let ts: &mut crate::env::thread::ThreadState<'gc> = &mut ts;
-        let stack_view =
-            crate::env::function::Stack::new(&mut ts.stack, &mut ts.top, call_site.bottom);
-        let exec = Execution::new(top, &ts.frames);
+        let stack_view = crate::env::function::Stack::new(&mut ts, call_site.bottom);
+        let exec = Execution::new(top);
         if let Some(err) = pending_error {
             seq.error(ctx, exec, err, stack_view)
         } else {
@@ -991,23 +983,23 @@ impl<'gc> Sequence<'gc> for HandlerSequence<'gc> {
 
     fn poll(
         self: Pin<&mut Self>,
-        _ctx: Context<'gc>,
-        _exec: Execution<'gc, '_>,
+        ctx: Context<'gc>,
+        _exec: Execution<'gc>,
         stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
-        Err(Error::new(stack.get(0)).mark_handled())
+        Err(Error::new(ctx, stack.get(0)).mark_handled())
     }
 
     fn error(
         mut self: Pin<&mut Self>,
         ctx: Context<'gc>,
-        _exec: Execution<'gc, '_>,
+        _exec: Execution<'gc>,
         err: Error<'gc>,
         mut stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
         if self.depth == MAX_HANDLER_DEPTH {
             let msg = LuaString::new(ctx, b"error in error handling");
-            return Err(Error::new(Value::string(msg)).mark_handled());
+            return Err(Error::new(ctx, Value::string(msg)).mark_handled());
         }
         self.depth += 1;
         stack.replace(&[err.value()]);
@@ -1068,7 +1060,7 @@ fn unwind_error<'gc>(
     // `luaD_seterrorobj`: only once the error is being caught (a handler
     // still sees the raw nil).
     let err = if err.value().is_nil() {
-        err.with_value(Value::string(LuaString::new(ctx, b"<no error object>")))
+        err.with_value(ctx, Value::string(LuaString::new(ctx, b"<no error object>")))
     } else {
         err
     };

@@ -84,7 +84,7 @@ pub(crate) fn locate<'gc>(ctx: Context<'gc>, ts: &ThreadState<'gc>, err: Error<'
         return err.with_level(0);
     }
     let text = [prefix.as_slice(), msg.as_bytes()].concat();
-    err.with_value(Value::string(LuaString::new(ctx, &text)))
+    err.with_value(ctx, Value::string(LuaString::new(ctx, &text)))
 }
 
 /// `luaT_objtypename`: a table or userdata whose metatable has a string

@@ -39,7 +39,7 @@ impl<'gc> Sequence<'gc> for CallBoomerSeq<'gc> {
     fn poll(
         mut self: Pin<&mut Self>,
         _ctx: Context<'gc>,
-        _exec: Execution<'gc, '_>,
+        _exec: Execution<'gc>,
         mut stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
         if !self.called {
@@ -67,7 +67,7 @@ fn factory<'gc>(
             called: false,
         },
     );
-    Ok(CallbackAction::Sequence(seq))
+    Ok(CallbackAction::sequence(seq))
 }
 
 #[test]

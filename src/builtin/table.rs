@@ -358,7 +358,7 @@ fn lua_sort<'gc>(
             Ok(SequenceReturn::Return)
         }
     });
-    Ok(CallbackAction::Sequence(seq))
+    Ok(CallbackAction::sequence(seq))
 }
 
 /// Iterative quicksort (median-of-3 pivot) over the 1-based range `[1, n]`,

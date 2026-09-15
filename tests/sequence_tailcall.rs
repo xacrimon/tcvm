@@ -25,7 +25,7 @@ impl<'gc> Sequence<'gc> for TailCallSeq {
     fn poll(
         self: Pin<&mut Self>,
         ctx: Context<'gc>,
-        _exec: Execution<'gc, '_>,
+        _exec: Execution<'gc>,
         mut stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
         let target = stack
@@ -43,7 +43,7 @@ fn forward<'gc>(
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let seq = BoxSequence::new(nctx.ctx.mutation(), TailCallSeq);
-    Ok(CallbackAction::Sequence(seq))
+    Ok(CallbackAction::sequence(seq))
 }
 
 #[test]

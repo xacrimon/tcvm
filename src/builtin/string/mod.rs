@@ -1160,7 +1160,7 @@ fn lua_gsub<'gc>(
             Ok(SequenceReturn::Return)
         }
     });
-    Ok(CallbackAction::Sequence(seq))
+    Ok(CallbackAction::sequence(seq))
 }
 
 /// The replacement template for a string/number `repl`, or `None` for other

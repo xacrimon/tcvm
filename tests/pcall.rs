@@ -202,8 +202,7 @@ fn lua_frame_count<'gc>(
     nctx: NativeContext<'gc, '_>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let n = nctx
-        .exec
+    let n = stack
         .frames()
         .iter()
         .filter(|f| matches!(f, Frame::Lua(_)))
@@ -278,14 +277,14 @@ fn lua_through<'gc>(
         fn poll(
             self: Pin<&mut Self>,
             _ctx: tcvm::Context<'gc>,
-            _exec: Execution<'gc, '_>,
+            _exec: Execution<'gc>,
             _stack: Stack<'gc, '_>,
         ) -> Result<SequencePoll<'gc>, Error<'gc>> {
             Ok(SequencePoll::Return)
         }
     }
     let then = BoxSequence::new(nctx.ctx.mutation(), PassThrough);
-    Ok(CallbackAction::Call { then: Some(then) })
+    Ok(CallbackAction::call(Some(then)))
 }
 
 fn install_through(ctx: tcvm::Context<'_>) {

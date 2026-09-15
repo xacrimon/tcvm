@@ -73,7 +73,7 @@ fn lua_assert<'gc>(
         return Ok(CallbackAction::Return);
     }
     if stack.len() >= 2 {
-        Err(Error::new(stack.get(1)).with_level(1))
+        Err(Error::new(nctx.ctx, stack.get(1)).with_level(1))
     } else {
         Err(Error::from_str(nctx.ctx, "assertion failed!"))
     }
@@ -123,7 +123,7 @@ fn lua_error<'gc>(
     } else {
         1
     };
-    Err(Error::new(stack.get(0)).with_level(level))
+    Err(Error::new(nctx.ctx, stack.get(0)).with_level(level))
 }
 
 fn lua_getmetatable<'gc>(
@@ -268,7 +268,7 @@ fn lua_pairs<'gc>(
     }
     stack.replace(&[mm, t]);
     let then = BoxSequence::new(nctx.ctx.mutation(), PairsAdjust);
-    Ok(CallbackAction::Call { then: Some(then) })
+    Ok(CallbackAction::call(Some(then)))
 }
 
 /// Completion for `pairs` via `__pairs`: adjust the metamethod's results
@@ -285,7 +285,7 @@ impl<'gc> Sequence<'gc> for PairsAdjust {
     fn poll(
         self: Pin<&mut Self>,
         _ctx: Context<'gc>,
-        _exec: Execution<'gc, '_>,
+        _exec: Execution<'gc>,
         mut stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
         stack.truncate(4);
@@ -312,7 +312,7 @@ fn lua_pcall<'gc>(
         ));
     }
     let then = BoxSequence::new(nctx.ctx.mutation(), ProtectedCall { handler: None });
-    Ok(CallbackAction::Call { then: Some(then) })
+    Ok(CallbackAction::call(Some(then)))
 }
 
 /// Completion sequence for `pcall`, `xpcall`, and `coroutine.resume`: the
@@ -332,7 +332,7 @@ impl<'gc> Sequence<'gc> for ProtectedCall<'gc> {
     fn poll(
         self: Pin<&mut Self>,
         _ctx: Context<'gc>,
-        _exec: Execution<'gc, '_>,
+        _exec: Execution<'gc>,
         mut stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
         stack.insert(0, Value::boolean(true));
@@ -342,7 +342,7 @@ impl<'gc> Sequence<'gc> for ProtectedCall<'gc> {
     fn error(
         self: Pin<&mut Self>,
         _ctx: Context<'gc>,
-        _exec: Execution<'gc, '_>,
+        _exec: Execution<'gc>,
         err: Error<'gc>,
         mut stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
@@ -664,5 +664,5 @@ fn lua_xpcall<'gc>(
             handler: Some(handler),
         },
     );
-    Ok(CallbackAction::Call { then: Some(then) })
+    Ok(CallbackAction::call(Some(then)))
 }

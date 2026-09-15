@@ -23,7 +23,7 @@ fn yielder<'gc>(
     _nctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    Ok(CallbackAction::Yield { then: None })
+    Ok(CallbackAction::yield_(None))
 }
 
 fn setup(src: &str) -> (Lua, tcvm::StashedExecutor) {
