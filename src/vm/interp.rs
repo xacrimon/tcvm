@@ -725,9 +725,6 @@ pub(crate) fn run_thread<'gc>(ctx: Context<'gc>, thread: Thread<'gc>) {
         &mut ds,
         frame,
     );
-    // The fast paths leave dead scratch above the live region (`set_top_dirty`);
-    // cut it off before anything outside the interpreter can trace this thread.
-    ts.trim_dead();
 }
 
 // ---------------------------------------------------------------------------
@@ -2406,11 +2403,8 @@ macro_rules! call_native {
                         unsafe { *stack.add(func_idx + i) = Value::nil() };
                     }
                     // Publish the logical top. For MULTRET this is the dynamic
-                    // count the next consumer reads. The stale donor copies the
-                    // down-shift left above the results are dead scratch (a
-                    // call's function always sits at the caller's first free
-                    // register) and are dropped by `trim_dead` on exit.
-                    $thread.set_top_dirty(func_idx + wanted);
+                    // count the next consumer reads.
+                    $thread.set_top_unchecked(func_idx + wanted);
                     $registers = unsafe { $thread.stack.as_mut_ptr().add(base) };
                     dispatch!();
                 }
@@ -2653,7 +2647,7 @@ extern "rust-preserve-none" fn op_call_fast<'gc>(
         if let Some(result) = result {
             *reg!(ref mut func) = result;
             if returns == 0 {
-                thread.set_top_dirty(unsafe { (*frame).base } + func as usize + 1);
+                thread.set_top_unchecked(unsafe { (*frame).base } + func as usize + 1);
             } else {
                 for i in 1..returns as usize - 1 {
                     *reg!(ref mut func as usize + i) = Value::nil();
@@ -2935,9 +2929,8 @@ extern "rust-preserve-none" fn op_return<'gc>(
     }
     let n = thread.frames.len();
     // Without this a `top` left high by a multires producer inside the callee
-    // would keep its dead registers traced (#43); the registers themselves
-    // are released by `trim_dead` on exit.
-    thread.set_top_dirty(dst_start + wanted);
+    // would keep its dead registers traced (#43).
+    thread.set_top_unchecked(dst_start + wanted);
 
     // The top frame is `Frame::Lua` (it is the one we are running) and
     // `LuaFrame` is `Copy`, so nothing needs dropping.
@@ -3821,9 +3814,7 @@ pub(crate) fn frame_return<'gc>(
         thread
             .stack
             .copy_within(values_base..values_base + nret, dst_start);
-        // The donor copies the down-shift left in the popped callee's
-        // registers are dead scratch above `top`; `trim_dead` drops them.
-        thread.set_top_dirty(dst_start + nret);
+        thread.set_top_unchecked(dst_start + nret);
     } else {
         let wanted = num_results as usize - 1;
         let to_copy = nret.min(wanted);
@@ -3845,9 +3836,7 @@ pub(crate) fn frame_return<'gc>(
         // producer *inside the callee* would still be the high-water long after
         // the callee popped, so `live_top` would keep tracing its dead registers
         // — the exact #43 leak, just via a stale `top` instead of the vec length.
-        // The callee's registers themselves are dead scratch that `trim_dead`
-        // releases on exit.
-        thread.set_top_dirty(dst_start + wanted);
+        thread.set_top_unchecked(dst_start + wanted);
     }
 
     FrameReturn::Caller { new_base, new_ip }
