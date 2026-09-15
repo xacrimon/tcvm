@@ -692,6 +692,9 @@ pub(crate) fn run_thread<'gc>(ctx: Context<'gc>, thread: Thread<'gc>) {
         handlers,
         &mut ds,
     );
+    // The fast paths leave dead scratch above the live region (`set_top_dirty`);
+    // cut it off before anything outside the interpreter can trace this thread.
+    ts.trim_dead();
 }
 
 // ---------------------------------------------------------------------------
@@ -2354,11 +2357,11 @@ extern "rust-preserve-none" fn op_call<'gc>(
                         thread.stack[func_idx + i] = Value::nil();
                     }
                     // Publish the logical top. For MULTRET this is the dynamic
-                    // count the next consumer reads; either way it nils the
-                    // function slot and the stale donor copies the down-shift
-                    // left above the results, which are dead scratch (a call's
-                    // function always sits at the caller's first free register).
-                    thread.set_top(func_idx + wanted);
+                    // count the next consumer reads. The stale donor copies the
+                    // down-shift left above the results are dead scratch (a
+                    // call's function always sits at the caller's first free
+                    // register) and are dropped by `trim_dead` on exit.
+                    thread.set_top_dirty(func_idx + wanted);
                     registers = unsafe { thread.stack.as_mut_ptr().add(base) };
                     dispatch!();
                 }
@@ -3392,10 +3395,9 @@ pub(crate) fn frame_return<'gc>(
         thread
             .stack
             .copy_within(values_base..values_base + nret, dst_start);
-        // Publishing through `set_top` also nils the donor copies the down-shift
-        // left in the popped callee's registers, which would otherwise stay
-        // traced as the caller's dead scratch.
-        thread.set_top(dst_start + nret);
+        // The donor copies the down-shift left in the popped callee's
+        // registers are dead scratch above `top`; `trim_dead` drops them.
+        thread.set_top_dirty(dst_start + nret);
     } else {
         let wanted = num_results as usize - 1;
         let to_copy = nret.min(wanted);
@@ -3417,9 +3419,9 @@ pub(crate) fn frame_return<'gc>(
         // producer *inside the callee* would still be the high-water long after
         // the callee popped, so `live_top` would keep tracing its dead registers
         // — the exact #43 leak, just via a stale `top` instead of the vec length.
-        // Also nils those registers, which are dead scratch: `dst_start` is the
-        // caller's function slot, and everything from there up is free.
-        thread.set_top(dst_start + wanted);
+        // The callee's registers themselves are dead scratch that `trim_dead`
+        // releases on exit.
+        thread.set_top_dirty(dst_start + wanted);
     }
 
     let new_ip = unsafe { closure.proto.code.as_ptr().add(pc) };
