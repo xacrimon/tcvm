@@ -48,6 +48,10 @@ pub struct LuaFrame<'gc> {
     #[collect(require_static)]
     pub pc: *const crate::instruction::Instruction,
     pub num_results: u8,
+    /// `frame_flags` bits. Zero means RETURN can take its fast path: fixed
+    /// results land in a Lua caller with nothing to close and no continuation.
+    /// Only ever set, never cleared (a stale bit just costs the slow path).
+    pub flags: u8,
     /// Caller-supplied args beyond `num_params`; the below-base region is
     /// `stack[base - num_extras .. base]`. Set by `VARARGPREP`, else 0.
     pub num_extras: u32,
@@ -82,6 +86,18 @@ pub struct CallSite {
     /// has no Lua frame to park the continuation on. `None` for ordinary
     /// calls, where `func_idx`/`returns` drive the landing.
     pub cont: Option<Continuation>,
+}
+
+/// Bits of `LuaFrame::flags`.
+pub mod frame_flags {
+    /// `continuation` is `Some`: RETURN must hand results to `cont_resume`.
+    pub const HAS_CONT: u8 = 1;
+    /// A CLOSURE in this frame captured one of its locals; RETURN must close.
+    pub const OPEN_UPVALUES: u8 = 2;
+    /// A TBC in this frame registered a to-be-closed slot.
+    pub const TBC: u8 = 4;
+    /// The frame below is not a Lua frame (executor-pushed entry frame).
+    pub const PARENT_NON_LUA: u8 = 8;
 }
 
 impl<'gc> LuaFrame<'gc> {
@@ -302,11 +318,14 @@ impl<'gc> ThreadState<'gc> {
     /// slot: `op_return` locates it as `base - 1 - num_extras` (VARARGPREP
     /// later shifts `base` up by `num_extras`), which wraps for `base == 0`.
     #[inline]
-    pub fn push_lua(&mut self, lf: LuaFrame<'gc>) {
+    pub fn push_lua(&mut self, mut lf: LuaFrame<'gc>) {
         debug_assert!(
             lf.base >= 1,
             "Lua frame base must leave room for the function slot"
         );
+        if !matches!(self.frames.last(), Some(Frame::Lua(_))) {
+            lf.flags |= frame_flags::PARENT_NON_LUA;
+        }
         if self.frames.len() == self.frames.capacity() {
             self.grow_frames();
         }
@@ -319,10 +338,11 @@ impl<'gc> ThreadState<'gc> {
         self.frames.reserve(1);
     }
 
-    /// `push_lua` for a caller that has already made room (`reserve_frames`).
+    /// `push_lua` for the interpreter: room already made (`reserve_frames`) and
+    /// the parent is the running Lua frame, so `flags` is stored as given.
     ///
     /// # Safety
-    /// `frames.len() < frames.capacity()`.
+    /// `frames.len() < frames.capacity()`, and the top frame is `Frame::Lua`.
     #[inline(always)]
     pub unsafe fn push_lua_unchecked(&mut self, lf: LuaFrame<'gc>) {
         debug_assert!(lf.base >= 1);

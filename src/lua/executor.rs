@@ -570,6 +570,7 @@ fn schedule_call_at<'gc>(
             base,
             pc: closure.proto.code.as_ptr(),
             num_results: caller_returns,
+            flags: 0,
             num_extras,
             continuation: None,
         });
