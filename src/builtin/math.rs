@@ -8,7 +8,7 @@ use crate::builtin::util::{
     check_integer, check_number, compare_error_msg, float_to_integer, num_to_value,
 };
 use crate::env::{
-    Error, Function, LuaString, NativeContext, NativeFn, Stack, Table, Userdata, Value,
+    Error, FastCall, Function, LuaString, NativeContext, NativeFn, Stack, Table, Userdata, Value,
 };
 use crate::vm::num;
 use crate::vm::sequence::CallbackAction;
@@ -51,7 +51,14 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         } else {
             Box::new([])
         };
-        let handler = Function::new_native(ctx.mutation(), handler, upvalues);
+        let fast = match name {
+            "sqrt" => FastCall::Sqrt,
+            "abs" => FastCall::Abs,
+            "floor" => FastCall::Floor,
+            "ceil" => FastCall::Ceil,
+            _ => FastCall::None,
+        };
+        let handler = Function::new_native_fast(ctx.mutation(), handler, upvalues, fast);
         let key = Value::string(LuaString::new(ctx, name.as_bytes()));
         lib.raw_set(ctx, key, Value::function(handler));
     }
