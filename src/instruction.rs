@@ -24,6 +24,8 @@
 
 use std::fmt;
 
+use crate::env::value::Value;
+
 /// A register index. Canonical home for what the compiler calls
 /// `RegisterIndex`, so emitter code can pass one straight to a constructor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -45,6 +47,52 @@ pub struct IcIdx(pub u16);
 /// An index into the prototype's child-prototype list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProtoIdx(pub u16);
+
+/// A number packed into an immediate opcode's 32-bit slot. Bit 0 set: a 31-bit
+/// integer stored as `n << 1 | 1`. Bit 0 clear: an `f32` bit pattern, so only
+/// floats whose low mantissa bit is clear qualify (`0.5`, `2.0`; not `0.1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Imm(u32);
+
+impl Imm {
+    pub const INT_MIN: i64 = -(1 << 30);
+    pub const INT_MAX: i64 = (1 << 30) - 1;
+
+    pub fn from_int(n: i64) -> Option<Imm> {
+        if (Self::INT_MIN..=Self::INT_MAX).contains(&n) {
+            Some(Imm(((n as i32) << 1 | 1) as u32))
+        } else {
+            None
+        }
+    }
+
+    /// Exactly representable as an `f32` whose low mantissa bit is clear.
+    /// Compared by bits so `-0.0` keeps its sign and NaN is rejected.
+    pub fn from_float(f: f64) -> Option<Imm> {
+        let bits = (f as f32).to_bits();
+        if bits & 1 == 0 && f.is_finite() && (f32::from_bits(bits) as f64).to_bits() == f.to_bits()
+        {
+            Some(Imm(bits))
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_int(self) -> bool {
+        self.0 & 1 != 0
+    }
+
+    #[inline(always)]
+    pub fn int(self) -> i64 {
+        ((self.0 as i32) >> 1) as i64
+    }
+
+    #[inline(always)]
+    pub fn float(self) -> f64 {
+        f32::from_bits(self.0) as f64
+    }
+}
 
 /// Something that can occupy an operand slot. Implemented for the index
 /// newtypes and for the raw types used by count/flag operands; the *declared*
@@ -73,6 +121,7 @@ impl_operand! {
     u16      => |self| self as u64,
     bool     => |self| self as u64,
     i32      => |self| self as u32 as u64,
+    Imm      => |self| self.0 as u64,
 }
 
 /// Which operand slots an opcode uses. Named after the slots themselves:
@@ -87,6 +136,8 @@ pub enum Shape {
     Abd,
     Abde,
     AImm,
+    AbImm,
+    AbcImm,
     Imm,
 }
 
@@ -122,6 +173,8 @@ pub mod shape {
     pub struct Abd;
     pub struct Abde;
     pub struct AImm;
+    pub struct AbImm;
+    pub struct AbcImm;
     pub struct Imm;
 
     impl Nil {
@@ -204,6 +257,37 @@ pub mod shape {
         }
     }
 
+    impl AbImm {
+        #[inline(always)]
+        pub fn pack(op: Op, a: impl Operand, b: impl Operand, imm: impl Operand) -> Instruction {
+            Instruction(
+                op as u64
+                    | slot8(a.bits()) << A_SHIFT
+                    | slot8(b.bits()) << B_SHIFT
+                    | (imm.bits() & 0xffff_ffff) << IMM_SHIFT,
+            )
+        }
+    }
+
+    impl AbcImm {
+        #[inline(always)]
+        pub fn pack(
+            op: Op,
+            a: impl Operand,
+            b: impl Operand,
+            c: impl Operand,
+            imm: impl Operand,
+        ) -> Instruction {
+            Instruction(
+                op as u64
+                    | slot8(a.bits()) << A_SHIFT
+                    | slot8(b.bits()) << B_SHIFT
+                    | slot8(c.bits()) << C_SHIFT
+                    | (imm.bits() & 0xffff_ffff) << IMM_SHIFT,
+            )
+        }
+    }
+
     impl Imm {
         #[inline(always)]
         pub fn pack(op: Op, imm: impl Operand) -> Instruction {
@@ -277,6 +361,40 @@ impl Instruction {
         (self.0 >> IMM_SHIFT) as u32 as i32
     }
 
+    /// The packed [`Imm`] of an immediate-operand opcode.
+    #[inline(always)]
+    pub fn imm_k(self) -> Imm {
+        Imm((self.0 >> IMM_SHIFT) as u32)
+    }
+
+    // Decoded off the whole word: one `tbnz` / one `asr`, no 32-bit extract first.
+
+    #[inline(always)]
+    pub fn imm_is_int(self) -> bool {
+        self.0 & (1 << IMM_SHIFT) != 0
+    }
+
+    #[inline(always)]
+    pub fn imm_int(self) -> i64 {
+        (self.0 as i64) >> (IMM_SHIFT + 1)
+    }
+
+    #[inline(always)]
+    pub fn imm_float(self) -> f64 {
+        f32::from_bits((self.0 >> IMM_SHIFT) as u32) as f64
+    }
+
+    /// The `Value` an immediate stands for; slow paths hand it to
+    /// metamethods and error messages.
+    #[inline]
+    pub fn imm_value<'gc>(self) -> Value<'gc> {
+        if self.imm_is_int() {
+            Value::integer(self.imm_int())
+        } else {
+            Value::float(self.imm_float())
+        }
+    }
+
     #[inline(always)]
     fn expect(self, shape: Shape) {
         debug_assert_eq!(
@@ -337,21 +455,56 @@ impl Instruction {
         (self.a(), self.imm())
     }
 
+    /// `AbcImm` slots of an immediate arithmetic op: `dst`, `src`, and the
+    /// source-order-flipped flag.
+    #[inline(always)]
+    pub fn abc_imm(self) -> (u8, u8, bool) {
+        self.expect(Shape::AbcImm);
+        (self.a(), self.b(), self.c() != 0)
+    }
+
+    /// `AbImm` whose `b` slot is a flag (`EQI`/`LTI`/...).
+    #[inline(always)]
+    pub fn ab_imm_flag(self) -> (u8, bool) {
+        self.expect(Shape::AbImm);
+        (self.a(), self.b() != 0)
+    }
+
     // --- control-flow helpers ---------------------------------------------
 
     /// True for the conditional opcodes a `JMP` can follow as its predecessor.
     #[inline]
     pub fn is_control(self) -> bool {
-        matches!(self.op(), Op::EQ | Op::LT | Op::LE | Op::TEST | Op::TESTSET)
+        matches!(
+            self.op(),
+            Op::EQ
+                | Op::LT
+                | Op::LE
+                | Op::TEST
+                | Op::TESTSET
+                | Op::EQI
+                | Op::LTI
+                | Op::LEI
+                | Op::GTI
+                | Op::GEI
+        )
     }
 
-    /// The polarity flag of a control opcode. `TEST` has no third register
-    /// operand, so its flag sits in `b`; every other control opcode carries it
-    /// in `c`.
+    /// True for the control opcodes with a single register operand, which
+    /// carry their polarity flag in `b` rather than `c`.
+    #[inline]
+    fn flag_in_b(self) -> bool {
+        matches!(
+            self.op(),
+            Op::TEST | Op::EQI | Op::LTI | Op::LEI | Op::GTI | Op::GEI
+        )
+    }
+
+    /// The polarity flag of a control opcode.
     #[inline]
     pub fn inverted(self) -> bool {
         debug_assert!(self.is_control(), "{self:?} carries no polarity flag");
-        if self.op() == Op::TEST {
+        if self.flag_in_b() {
             self.b() != 0
         } else {
             self.c() != 0
@@ -361,7 +514,7 @@ impl Instruction {
     #[inline]
     pub fn set_inverted(&mut self, v: bool) {
         debug_assert!(self.is_control(), "{self:?} carries no polarity flag");
-        if self.op() == Op::TEST {
+        if self.flag_in_b() {
             self.set_b(v as u8);
         } else {
             self.set_c(v as u8);
@@ -430,6 +583,21 @@ impl fmt::Debug for Instruction {
                 self.e()
             ),
             Shape::AImm => write!(f, "(a={}, imm={})", self.a(), self.imm()),
+            Shape::AbImm => write!(
+                f,
+                "(a={}, b={}, imm={:?})",
+                self.a(),
+                self.b(),
+                self.imm_k()
+            ),
+            Shape::AbcImm => write!(
+                f,
+                "(a={}, b={}, c={}, imm={:?})",
+                self.a(),
+                self.b(),
+                self.c(),
+                self.imm_k()
+            ),
             Shape::Imm => write!(f, "(imm={})", self.imm()),
         }
     }
@@ -574,6 +742,44 @@ instructions! {
     0x33 ERRNNIL    errnnil     Ad    { src: Reg, name_key: KIdx }
     0x34 NOP        nop         Nil   { }
     0x35 STOP       stop        Nil   { }
+
+    // --- immediate-operand forms --------------------------------------
+    //
+    // `R[dst] = R[src] <op> imm`; the `R`-prefixed forms compute `imm <op> R[src]`
+    // (cf. ARM `rsb`) so no handler selects operands on its fast path. `flipped`
+    // means the constant was on the left in the source (`1 + x`); only the slow
+    // path reads it, to pass metamethods and errors the operands in source order.
+    // Invariants the handlers rely on: `MODI`/`IDIVI` never carry a zero integer
+    // immediate; the bitwise forms only carry integer immediates.
+
+    0x36 ADDI       addi        AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x37 SUBI       subi        AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x38 MULI       muli        AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x39 MODI       modi        AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x3a POWI       powi        AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x3b DIVI       divi        AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x3c IDIVI      idivi       AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x3d BANDI      bandi       AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x3e BORI       bori        AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x3f BXORI      bxori       AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x40 SHLI       shli        AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x41 SHRI       shri        AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x42 RSUBI      rsubi       AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x43 RMODI      rmodi       AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x44 RPOWI      rpowi       AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x45 RDIVI      rdivi       AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x46 RIDIVI     ridivi      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x47 RSHLI      rshli       AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x48 RSHRI      rshri       AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+
+    /// `if (R[src] <cmp> imm) != inverted then skip`. `GTI`/`GEI` are the
+    /// swapped `LT`/`LE` so a constant on either side compiles to one of
+    /// these. `EQI` never consults `__eq`: the immediate is a number.
+    0x49 EQI        eqi         AbImm { src: Reg, inverted: bool, imm: Imm }
+    0x4a LTI        lti         AbImm { src: Reg, inverted: bool, imm: Imm }
+    0x4b LEI        lei         AbImm { src: Reg, inverted: bool, imm: Imm }
+    0x4c GTI        gti         AbImm { src: Reg, inverted: bool, imm: Imm }
+    0x4d GEI        gei         AbImm { src: Reg, inverted: bool, imm: Imm }
 }
 
 /// Describes how to capture an upvalue when creating a closure.
@@ -619,6 +825,40 @@ mod tests {
         assert_eq!(i.abd(), (1, 2, 3));
 
         assert_eq!(Instruction::nop().op(), Op::NOP);
+
+        let k = Imm::from_int(-7).unwrap();
+        let i = Instruction::addi(Reg(1), Reg(2), true, k);
+        assert_eq!(i.abc_imm(), (1, 2, true));
+        assert!(i.imm_is_int());
+        assert_eq!(i.imm_int(), -7);
+
+        let k = Imm::from_float(-0.75).unwrap();
+        let i = Instruction::lti(Reg(3), true, k);
+        assert_eq!(i.ab_imm_flag(), (3, true));
+        assert!(!i.imm_is_int());
+        assert_eq!(i.imm_float(), -0.75);
+    }
+
+    #[test]
+    fn imm_packing_limits() {
+        assert_eq!(Imm::from_int(Imm::INT_MAX).unwrap().int(), Imm::INT_MAX);
+        assert_eq!(Imm::from_int(Imm::INT_MIN).unwrap().int(), Imm::INT_MIN);
+        assert!(Imm::from_int(Imm::INT_MAX + 1).is_none());
+        assert!(Imm::from_int(Imm::INT_MIN - 1).is_none());
+        assert_eq!(Imm::from_int(0).unwrap().int(), 0);
+
+        assert_eq!(Imm::from_float(0.5).unwrap().float(), 0.5);
+        assert_eq!(
+            Imm::from_float(-0.0).unwrap().float().to_bits(),
+            (-0.0f64).to_bits()
+        );
+        assert_eq!(Imm::from_float(1e6).unwrap().float(), 1e6);
+        assert!(Imm::from_float(0.1).is_none());
+        assert!(Imm::from_float(f64::NAN).is_none());
+        assert!(Imm::from_float(f64::INFINITY).is_none());
+        // 24 significant bits: exact as f32, but the tag bit is taken.
+        assert!(Imm::from_float(16777215.0).is_none());
+        assert!(Imm::from_float(16777214.0).is_some());
     }
 
     #[test]

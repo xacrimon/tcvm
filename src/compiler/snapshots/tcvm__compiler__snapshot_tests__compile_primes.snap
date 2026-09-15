@@ -7,10 +7,8 @@ expression: output
 ;   K0 = 2
 ;   K1 = 0
 ;   K2 = ""
-;   K3 = 10000
-;   K4 = 1
-;   K5 = "\n"
-;   K6 = "print"
+;   K3 = "\n"
+;   K4 = "print"
 ; upvalues:
 ;   U0 = local R0
 ; code:
@@ -19,47 +17,41 @@ expression: output
 0002  [ 11]  LOAD            R1 K0  ; 2
 0003  [ 12]  LOAD            R2 K1  ; 0
 0004  [ 13]  LOAD            R3 K2  ; ""
-0005  [ 14]  LOAD            R4 K3  ; 10000
-0006  [ 14]  LT              R2 R4 inv=false
-0007  [ 14]  JMP             +13
-0008  [ 15]  MOVE            R4 R0
-0009  [ 15]  MOVE            R5 R1
-0010  [ 15]  CALL            R4 args=2 ret=2
-0011  [ 15]  TEST            R4 inv=false
-0012  [ 15]  JMP             +5
-0013  [ 16]  LOAD            R4 K4  ; 1
-0014  [ 16]  ADD             R2 R2 R4
-0015  [ 17]  LOAD            R4 K5  ; "\n"
-0016  [ 17]  CONCAT          R4 R1 R4
-0017  [ 17]  CONCAT          R3 R3 R4
-0018  [ 20]  LOAD            R4 K4  ; 1
-0019  [ 20]  ADD             R1 R1 R4
-0020  [ 20]  JMP             -16
-0021  [ 23]  GETTABUP        R4 U0 K6  ; "print"
-0022  [ 23]  MOVE            R5 R3
-0023  [ 23]  CALL            R4 args=2 ret=1
-0024  [ 23]  RETURN          R0 count=1
+0005  [ 14]  LTI             R2 #10000 inv=false
+0006  [ 14]  JMP             +11
+0007  [ 15]  MOVE            R4 R0
+0008  [ 15]  MOVE            R5 R1
+0009  [ 15]  CALL            R4 args=2 ret=2
+0010  [ 15]  TEST            R4 inv=false
+0011  [ 15]  JMP             +4
+0012  [ 16]  ADDI            R2 R2 #1
+0013  [ 17]  LOAD            R4 K3  ; "\n"
+0014  [ 17]  CONCAT          R4 R1 R4
+0015  [ 17]  CONCAT          R3 R3 R4
+0016  [ 20]  ADDI            R1 R1 #1
+0017  [ 20]  JMP             -13
+0018  [ 23]  GETTABUP        R4 U0 K4  ; "print"
+0019  [ 23]  MOVE            R5 R3
+0020  [ 23]  CALL            R4 args=2 ret=1
+0021  [ 23]  RETURN          R0 count=1
 
 ; prototype 0:
-  ; function (params=1, vararg=false, stack=7, upvalues=0)
+  ; function (params=1, vararg=false, stack=6, upvalues=0)
   ; constants:
   ;   K0 = 2
   ;   K1 = 1
-  ;   K2 = 0
-  ;   K3 = false
-  ;   K4 = true
+  ;   K2 = false
+  ;   K3 = true
   ; code:
   0000  [  2]  LOAD            R1 K0  ; 2
-  0001  [  2]  LOAD            R4 K1  ; 1
-  0002  [  2]  SUB             R2 R0 R4
-  0003  [  2]  LOAD            R3 K1  ; 1
-  0004  [  2]  FORPREP         R1 +7
-  0005  [  3]  MOD             R5 R0 R4
-  0006  [  3]  LOAD            R6 K2  ; 0
-  0007  [  3]  EQ              R5 R6 inv=false
-  0008  [  3]  JMP             +2
-  0009  [  4]  LOAD            R5 K3  ; false
-  0010  [  4]  RETURN          R5 count=2
-  0011  [  2]  FORLOOP         R1 -7
-  0012  [  8]  LOAD            R1 K4  ; true
-  0013  [  8]  RETURN          R1 count=2
+  0001  [  2]  SUBI            R2 R0 #1
+  0002  [  2]  LOAD            R3 K1  ; 1
+  0003  [  2]  FORPREP         R1 +6
+  0004  [  3]  MOD             R5 R0 R4
+  0005  [  3]  EQI             R5 #0 inv=false
+  0006  [  3]  JMP             +2
+  0007  [  4]  LOAD            R5 K2  ; false
+  0008  [  4]  RETURN          R5 count=2
+  0009  [  2]  FORLOOP         R1 -6
+  0010  [  8]  LOAD            R1 K3  ; true
+  0011  [  8]  RETURN          R1 count=2

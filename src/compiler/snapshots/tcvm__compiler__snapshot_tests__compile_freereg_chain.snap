@@ -2,21 +2,15 @@
 source: src/compiler/snapshot_tests.rs
 expression: output
 ---
-; function (params=0, vararg=true, stack=3, upvalues=1)
+; function (params=0, vararg=true, stack=2, upvalues=1)
 ; constants:
 ;   K0 = 1
-;   K1 = 2
-;   K2 = 3
-;   K3 = 4
 ; upvalues:
 ;   U0 = local R0
 ; code:
 0000  [  1]  VARARGPREP      fixed=0
 0001  [  1]  LOAD            R0 K0  ; 1
-0002  [  2]  LOAD            R1 K1  ; 2
-0003  [  2]  ADD             R1 R0 R1
-0004  [  2]  LOAD            R2 K2  ; 3
-0005  [  2]  ADD             R1 R1 R2
-0006  [  2]  LOAD            R2 K3  ; 4
-0007  [  2]  ADD             R1 R1 R2
-0008  [  3]  RETURN          R1 count=2
+0002  [  2]  ADDI            R1 R0 #2
+0003  [  2]  ADDI            R1 R1 #3
+0004  [  2]  ADDI            R1 R1 #4
+0005  [  3]  RETURN          R1 count=2

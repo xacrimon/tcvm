@@ -307,5 +307,48 @@ fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -> String {
         }
         Op::NOP => "NOP".to_string(),
         Op::STOP => "STOP".to_string(),
+        Op::ADDI
+        | Op::SUBI
+        | Op::MULI
+        | Op::MODI
+        | Op::POWI
+        | Op::DIVI
+        | Op::IDIVI
+        | Op::BANDI
+        | Op::BORI
+        | Op::BXORI
+        | Op::SHLI
+        | Op::SHRI
+        | Op::RSUBI
+        | Op::RMODI
+        | Op::RPOWI
+        | Op::RDIVI
+        | Op::RIDIVI
+        | Op::RSHLI
+        | Op::RSHRI => {
+            let (dst, src, flipped) = instr.abc_imm();
+            format!(
+                "{:<15} R{dst} R{src} {}{}",
+                instr.op().name(),
+                format_imm(instr),
+                if flipped { " flipped" } else { "" }
+            )
+        }
+        Op::EQI | Op::LTI | Op::LEI | Op::GTI | Op::GEI => {
+            let (src, inverted) = instr.ab_imm_flag();
+            format!(
+                "{:<15} R{src} {} inv={inverted}",
+                instr.op().name(),
+                format_imm(instr)
+            )
+        }
+    }
+}
+
+fn format_imm(instr: &Instruction) -> String {
+    if instr.imm_is_int() {
+        format!("#{}", instr.imm_int())
+    } else {
+        format!("#{:?}", instr.imm_float())
     }
 }
