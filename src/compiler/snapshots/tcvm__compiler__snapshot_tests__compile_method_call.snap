@@ -39,28 +39,28 @@ expression: output
 0024  [ 26]  MOVE            R7 R6
 0025  [ 26]  MOVE            R8 R0
 0026  [ 26]  CALL            R7 args=2 ret=1
-0027  [ 28]  RETURN          R2 count=2
+0027  [ 28]  RETURN1         R2
 
 ; prototype 0:
   ; function (params=1, vararg=false, stack=1, upvalues=0)
   ; code:
-  0000  [  7]  RETURN          R0 count=2
+  0000  [  7]  RETURN1         R0
 
 ; prototype 1:
   ; function (params=3, vararg=false, stack=4, upvalues=0)
   ; code:
   0000  [  8]  ADD             R3 R1 R2
-  0001  [  8]  RETURN          R3 count=2
+  0001  [  8]  RETURN1         R3
 
 ; prototype 2:
   ; function (params=1, vararg=false, stack=1, upvalues=0)
   ; code:
-  0000  [  9]  RETURN          R0 count=2
+  0000  [  9]  RETURN1         R0
 
 ; prototype 3:
   ; function (params=1, vararg=false, stack=1, upvalues=0)
   ; code:
-  0000  [ 18]  RETURN          R0 count=2
+  0000  [ 18]  RETURN1         R0
 
 ; prototype 4:
   ; function (params=1, vararg=false, stack=3, upvalues=0)

@@ -8,7 +8,7 @@ expression: output
 ; code:
 0000  [  1]  VARARGPREP      fixed=0
 0001  [  6]  CLOSURE         R0 P0
-0002  [  6]  RETURN          R0 count=1
+0002  [  6]  RETURN0
 
 ; prototype 0:
   ; function (params=1, vararg=false, stack=4, upvalues=1)
@@ -17,7 +17,7 @@ expression: output
   ; code:
   0000  [  2]  LTI             R0 #2 inv=false
   0001  [  2]  JMP             +1
-  0002  [  3]  RETURN          R0 count=2
+  0002  [  3]  RETURN1         R0
   0003  [  5]  GETUPVAL        R1 U0
   0004  [  5]  SUBI            R2 R0 #1
   0005  [  5]  CALL            R1 args=2 ret=2
@@ -25,4 +25,4 @@ expression: output
   0007  [  5]  SUBI            R3 R0 #2
   0008  [  5]  CALL            R2 args=2 ret=2
   0009  [  5]  ADD             R1 R1 R2
-  0010  [  5]  RETURN          R1 count=2
+  0010  [  5]  RETURN1         R1

@@ -17,10 +17,10 @@ expression: output
 0006  [  4]  TEST            R2 inv=false
 0007  [  4]  JMP             +2
 0008  [  4]  LOAD            R2 K0  ; 1
-0009  [  4]  RETURN          R2 count=2
-0010  [  4]  RETURN          R0 count=1
+0009  [  4]  RETURN1         R2
+0010  [  4]  RETURN0
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=0, upvalues=0)
   ; code:
-  0000  [  1]  RETURN          R0 count=1
+  0000  [  1]  RETURN0

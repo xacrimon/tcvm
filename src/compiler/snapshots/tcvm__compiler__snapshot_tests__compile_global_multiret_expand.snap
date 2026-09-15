@@ -16,7 +16,7 @@ expression: output
 0004  [ 40]  LOAD            R3 K0  ; 100
 0005  [ 40]  LOAD            R4 K1  ; 200
 0006  [ 40]  CALL            R2 args=3 ret=1
-0007  [ 40]  RETURN          R0 count=1
+0007  [ 40]  RETURN0
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=2, upvalues=0)
@@ -120,7 +120,7 @@ expression: output
   0067  [ 36]  CLOSURE         R1 P1
   0068  [ 37]  MOVE            R2 R1
   0069  [ 37]  CALL            R2 args=1 ret=1
-  0070  [ 38]  RETURN          R0 count=1
+  0070  [ 38]  RETURN0
 
   ; prototype 0:
     ; function (params=1, vararg=false, stack=3, upvalues=0)
@@ -158,4 +158,4 @@ expression: output
     0011  [ 35]  GETTABUP        R2 U1 K1  ; "o"
     0012  [ 35]  GETTABUP        R3 U1 K2  ; "p"
     0013  [ 35]  CALL            R0 args=4 ret=1
-    0014  [ 36]  RETURN          R0 count=1
+    0014  [ 36]  RETURN0

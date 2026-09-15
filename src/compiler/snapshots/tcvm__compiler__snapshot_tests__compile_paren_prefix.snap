@@ -35,10 +35,10 @@ expression: output
 0019  [  7]  LEN             R5 R1
 0020  [  7]  MUL             R4 R4 R5
 0021  [  7]  ADD             R3 R3 R4
-0022  [  7]  RETURN          R0 count=1
+0022  [  7]  RETURN0
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=1, upvalues=0)
   ; code:
   0000  [  1]  NEWTABLE        R0
-  0001  [  1]  RETURN          R0 count=2
+  0001  [  1]  RETURN1         R0
