@@ -109,6 +109,11 @@ pub(crate) struct DispatchState<'gc> {
     fault: Option<OpError<'gc>>,
 }
 
+/// Every dispatch target (handler, slow path, continuation) carries
+/// `#[rustc_align(32)]`: they are reached only by indirect `br`, and an
+/// unaligned entry can leave the fetch unit starved for the whole handler —
+/// measured as a 10x rise in dispatch bubbles and ~4% on primes when a code
+/// change shifted the layout.
 pub(crate) type Handler = for<'gc> extern "rust-preserve-none" fn(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -597,6 +602,7 @@ pub(crate) fn run_thread<'gc>(ctx: Context<'gc>, thread: Thread<'gc>) {
 /// be `become`d: a plain call here would put a frame on every raising
 /// handler's fast path.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn impl_error<'gc>(
     _instruction: Instruction,
     ctx: Context<'gc>,
@@ -619,6 +625,7 @@ extern "rust-preserve-none" fn impl_error<'gc>(
 // ---------------------------------------------------------------------------
 
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_move<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -636,6 +643,7 @@ extern "rust-preserve-none" fn op_move<'gc>(
 
 /// Load constant from the current prototype's constant pool.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_load<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -653,6 +661,7 @@ extern "rust-preserve-none" fn op_load<'gc>(
 
 /// Set register to false and skip the next instruction.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_lfalseskip<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -674,6 +683,7 @@ extern "rust-preserve-none" fn op_lfalseskip<'gc>(
 // ---------------------------------------------------------------------------
 
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_getupval<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -691,6 +701,7 @@ extern "rust-preserve-none" fn op_getupval<'gc>(
 }
 
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_setupval<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -714,6 +725,7 @@ extern "rust-preserve-none" fn op_setupval<'gc>(
 
 /// R[dst] = UpValue[idx][K[key]]
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_gettabup<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -749,6 +761,7 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
 }
 
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn gettabup_slow<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -772,6 +785,7 @@ extern "rust-preserve-none" fn gettabup_slow<'gc>(
 
 /// UpValue[idx][K[key]] = R[src]
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_settabup<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -811,6 +825,7 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
 }
 
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn settabup_slow<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -839,6 +854,7 @@ extern "rust-preserve-none" fn settabup_slow<'gc>(
 
 /// R[dst] = R[table][R[key]]
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_gettable<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -873,6 +889,7 @@ extern "rust-preserve-none" fn op_gettable<'gc>(
 }
 
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn gettable_slow<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -897,6 +914,7 @@ extern "rust-preserve-none" fn gettable_slow<'gc>(
 
 /// R[table][R[key]] = R[src]
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_settable<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -931,6 +949,7 @@ extern "rust-preserve-none" fn op_settable<'gc>(
 }
 
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn settable_slow<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -952,6 +971,7 @@ extern "rust-preserve-none" fn settable_slow<'gc>(
 
 /// R[dst] = R[table][K[key_idx]]
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_getfield<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -986,6 +1006,7 @@ extern "rust-preserve-none" fn op_getfield<'gc>(
 }
 
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn getfield_slow<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1011,6 +1032,7 @@ extern "rust-preserve-none" fn getfield_slow<'gc>(
 
 /// R[table][K[key_idx]] = R[src]
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_setfield<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1047,6 +1069,7 @@ extern "rust-preserve-none" fn op_setfield<'gc>(
 }
 
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn setfield_slow<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1075,6 +1098,7 @@ extern "rust-preserve-none" fn setfield_slow<'gc>(
 /// receiver into `R[dst+1]`. No inline cache for now — see the
 /// instruction definition.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_self<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1111,6 +1135,7 @@ extern "rust-preserve-none" fn op_self<'gc>(
 }
 
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_self_slow<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1160,6 +1185,7 @@ extern "rust-preserve-none" fn op_self_slow<'gc>(
 /// userdata with no metatable / nil `__index` likewise yields a nil
 /// method (the CALL raises). Any other non-table receiver raises.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_self_nontable<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1204,6 +1230,7 @@ extern "rust-preserve-none" fn op_self_nontable<'gc>(
 
 /// R[dst] = {}
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_newtable<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1227,6 +1254,7 @@ extern "rust-preserve-none" fn op_newtable<'gc>(
 macro_rules! arith_handler {
     ($fn_name:ident, $slow_name:ident, $instr:ident, $num_kind:ty, $mm:ident) => {
         #[inline(never)]
+        #[rustc_align(32)]
         extern "rust-preserve-none" fn $fn_name<'gc>(
             instruction: Instruction,
             ctx: Context<'gc>,
@@ -1281,6 +1309,7 @@ macro_rules! arith_handler {
 macro_rules! bit_handler {
     ($fn_name:ident, $slow_name:ident, $instr:ident, $num_kind:ty, $mm:ident) => {
         #[inline(never)]
+        #[rustc_align(32)]
         extern "rust-preserve-none" fn $fn_name<'gc>(
             instruction: Instruction,
             ctx: Context<'gc>,
@@ -1311,6 +1340,7 @@ macro_rules! bit_handler {
 macro_rules! binop_slow_handler {
     ($slow_name:ident, $instr:ident, $num_kind:ty, $num_mix_h:ident, $mm:ident, $err:ident) => {
         #[inline(never)]
+        #[rustc_align(32)]
         extern "rust-preserve-none" fn $slow_name<'gc>(
             instruction: Instruction,
             ctx: Context<'gc>,
@@ -1369,6 +1399,7 @@ bit_handler!(op_shr, op_shr_slow, SHR, num::Shr, mm_shr);
 
 /// R[dst] = -R[src]
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_unm<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1404,6 +1435,7 @@ extern "rust-preserve-none" fn op_unm<'gc>(
 
 /// R[dst] = ~R[src]  (bitwise NOT)
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_bnot<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1434,6 +1466,7 @@ extern "rust-preserve-none" fn op_bnot<'gc>(
 
 /// R[dst] = not R[src]  (logical NOT — always produces boolean)
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_not<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1452,6 +1485,7 @@ extern "rust-preserve-none" fn op_not<'gc>(
 
 /// R[dst] = #R[src]  (length)
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_len<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1493,6 +1527,7 @@ extern "rust-preserve-none" fn op_len<'gc>(
 
 /// R[dst] = R[lhs] .. R[rhs]  (string concatenation)
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_concat<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1530,6 +1565,7 @@ extern "rust-preserve-none" fn op_concat<'gc>(
 
 /// Close all upvalues >= R[start].
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_close<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1550,6 +1586,7 @@ extern "rust-preserve-none" fn op_close<'gc>(
 
 /// Mark R[val] as to-be-closed.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_tbc<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1572,6 +1609,7 @@ extern "rust-preserve-none" fn op_tbc<'gc>(
 
 /// pc += offset
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_jmp<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1589,6 +1627,7 @@ extern "rust-preserve-none" fn op_jmp<'gc>(
 
 /// if (R[lhs] == R[rhs]) != inverted then skip next instruction
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_eq<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1639,6 +1678,7 @@ extern "rust-preserve-none" fn op_eq<'gc>(
 
 /// if (R[lhs] < R[rhs]) != inverted then skip next instruction
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_lt<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1693,6 +1733,7 @@ extern "rust-preserve-none" fn op_lt<'gc>(
 
 /// if (R[lhs] <= R[rhs]) != inverted then skip next instruction
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_le<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1747,6 +1788,7 @@ extern "rust-preserve-none" fn op_le<'gc>(
 
 /// if (not R[src]) == inverted then skip next instruction
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_test<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1768,6 +1810,7 @@ extern "rust-preserve-none" fn op_test<'gc>(
 /// If (truthy(R[src]) == inverted) then skip next instruction;
 /// otherwise R[dst] := R[src] and fall through. Matches Lua 5.5 TESTSET.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_testset<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1795,6 +1838,7 @@ extern "rust-preserve-none" fn op_testset<'gc>(
 
 /// R[func], ..., R[func+returns-2] = R[func](R[func+1], ..., R[func+args-1])
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_call<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1915,6 +1959,7 @@ extern "rust-preserve-none" fn op_call<'gc>(
 
 /// return R[func](R[func+1], ..., R[func+args-1])  — tail call
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_tailcall<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -2057,6 +2102,7 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
 
 /// return R[values], ..., R[values+count-2]
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_return<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -2153,6 +2199,7 @@ fn for_limit(init: i64, limit: Value, step: i64) -> Option<Option<i64>> {
 /// precomputed last value instead of decrementing a count keeps the chain
 /// to one slot.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_forprep<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -2235,6 +2282,7 @@ extern "rust-preserve-none" fn op_forprep<'gc>(
 /// Numeric for loop step: advance the control variable and jump back while
 /// iterations remain. Reads the layout `op_forprep` leaves behind.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_forloop<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -2283,6 +2331,7 @@ extern "rust-preserve-none" fn op_forloop<'gc>(
 
 /// Generic for preparation: jump to the loop test.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_tforprep<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -2300,6 +2349,7 @@ extern "rust-preserve-none" fn op_tforprep<'gc>(
 
 /// Generic for call: R[base+3], ... = R[base](R[base+1], R[base+2])
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_tforcall<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -2325,6 +2375,7 @@ extern "rust-preserve-none" fn op_tforcall<'gc>(
 /// Generic for loop test: if the first result R[base+3] != nil, copy it into
 /// the control R[base+2] and jump back to the body.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_tforloop<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -2350,6 +2401,7 @@ extern "rust-preserve-none" fn op_tforloop<'gc>(
 
 /// R[table][offset+i] = R[table+i] for i in 1..=count
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_setlist<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -2400,6 +2452,7 @@ extern "rust-preserve-none" fn op_setlist<'gc>(
 
 /// R[dst] = closure(proto[idx])
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_closure<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -2462,6 +2515,7 @@ extern "rust-preserve-none" fn op_closure<'gc>(
 /// flag): optimized reads the below-base region; materialized reads `1..=t.n`
 /// from the table in `R[num_params]`, so mutations to it are visible.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_vararg<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -2544,6 +2598,7 @@ extern "rust-preserve-none" fn op_vararg<'gc>(
 /// to `GETTABLE` at compile time, so `base` is unused here (kept only as that
 /// rewrite's table operand). Lua 5.5 `OP_GETVARG`, which also ignores `B`.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_varargget<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -2594,6 +2649,7 @@ extern "rust-preserve-none" fn op_varargget<'gc>(
 /// into `R[num_params]` (Lua's `createvarargtab`); `VARARG` / `GETTABLE` then
 /// read the table, so mutations to it are observed.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_varargprep<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -2648,6 +2704,7 @@ extern "rust-preserve-none" fn op_varargprep<'gc>(
 
 /// Lua 5.5 ERRNNIL: raise if `R[src]` is **not** nil.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_errnnil<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -2670,6 +2727,7 @@ extern "rust-preserve-none" fn op_errnnil<'gc>(
 // ---------------------------------------------------------------------------
 
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_nop<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -2684,6 +2742,7 @@ extern "rust-preserve-none" fn op_nop<'gc>(
 }
 
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_stop<'gc>(
     _instruction: Instruction,
     _ctx: Context<'gc>,
@@ -3410,6 +3469,7 @@ macro_rules! finalize_return {
 /// applies the same payload via `apply_cont_payload!` without this frame
 /// teardown, since no callee frame exists there.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn cont_resume<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
