@@ -1,3 +1,6 @@
+use std::cell::UnsafeCell;
+use std::ops::{Deref, DerefMut};
+
 use crate::dmm::{Collect, Gc, Mutation, Ref, RefLock, RefMut, Trace};
 use crate::env::error::Error;
 use crate::env::function::{Function, LuaFn, Upvalue};
@@ -180,10 +183,11 @@ pub enum Frame<'gc> {
 ///     the interpreter's raw `registers` pointer). The only sanctioned shrink
 ///     is [`ThreadState::discard_above`], whose caller must guarantee nothing
 ///     above the cut is live.
-///  3. Because of (2), removing values means **lowering `top` and nil-filling
-///     what it vacates** — the nil-fill is what actually releases them, since
-///     the slots stay physically present and everything below `live_top` is
-///     traced (see the `Collect` impl).
+///  3. Removing values means **lowering `top`**, nothing more. The vacated
+///     slots keep their stale contents until the collector traces the thread,
+///     which nil-fills everything above the live region (see the `Collect`
+///     impl); the mutator never reads a slot above `top` or outside a live
+///     frame's window, so it never observes them.
 ///
 /// The *live region* is `[0 .. max(top, top_lua.base + max_stack_size))`: a
 /// Lua frame's register window is live regardless of `top` (the interpreter
@@ -191,9 +195,9 @@ pub enum Frame<'gc> {
 /// value-passing window — args and results in flight between frames — which
 /// can sit above the frames during a native call.
 pub struct ThreadState<'gc> {
-    /// Backing store. May hold dead slots above the live region; they are
-    /// kept nil so the `Collect` impl below cannot retain them.
-    pub stack: Vec<Value<'gc>>,
+    /// Backing store. May hold dead slots above the live region; the
+    /// collector clears them when it traces the thread.
+    pub stack: ValueStack<'gc>,
     pub frames: Vec<Frame<'gc>>,
     pub open_upvalues: Vec<Upvalue<'gc>>,
     pub tbc_slots: Vec<usize>,
@@ -225,20 +229,52 @@ pub struct ThreadState<'gc> {
     pub death_error: Option<Value<'gc>>,
 }
 
+/// The value stack's storage: a `Vec` the mutator uses as such, that the
+/// collector may also clear from `trace(&self)` (hence the cell).
+pub struct ValueStack<'gc>(UnsafeCell<Vec<Value<'gc>>>);
+
+impl<'gc> ValueStack<'gc> {
+    pub fn new() -> Self {
+        ValueStack(UnsafeCell::new(Vec::new()))
+    }
+}
+
+impl<'gc> Deref for ValueStack<'gc> {
+    type Target = Vec<Value<'gc>>;
+    #[inline(always)]
+    fn deref(&self) -> &Vec<Value<'gc>> {
+        unsafe { &*self.0.get() }
+    }
+}
+
+impl<'gc> DerefMut for ValueStack<'gc> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Vec<Value<'gc>> {
+        self.0.get_mut()
+    }
+}
+
 // SAFETY: traces every field that can own a `Gc` pointer. The only subtlety is
 // `stack` (issue #43): it is grown-not-shrunk, so slots above the live region
 // are dead scratch and must NOT be traced — tracing the whole vec would retain
 // whatever a since-returned callee happened to leave in its registers.
 // `live_top` is the sound live high-water (see its doc for why the innermost
-// frame's window bounds every frame's registers). Correctness also rests on
-// rule (3) of the stack invariant: anything dropped from the logical stack is
-// nil-filled, so a dead slot that happens to fall below `live_top` still
-// retains nothing.
+// frame's window bounds every frame's registers).
+// The dead region is nil-filled here, as in LuaJIT and PUC Lua, rather than by
+// the mutator as it vacates slots. This keeps every slot valid: after a
+// trace, each slot below `live_top` holds a marked object or a primitive and
+// each slot above holds nil; until the next trace the mutator writes only
+// values it could reach; and a `borrow_mut` since the last trace re-grays the
+// thread, so a slot can re-enter the live region only after the trace that
+// cleared it. Writing through `&self` is sound because collection runs
+// outside `mutate`, with no borrow of the thread outstanding.
 // `tbc_slots`/`status`/`top`/`yield_bottom` hold no `Gc` pointers.
 unsafe impl<'gc> Collect<'gc> for ThreadState<'gc> {
     fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
-        let live_top = self.live_top().min(self.stack.len());
-        cc.trace(&self.stack[..live_top]);
+        let live = self.live_top().min(self.stack.len());
+        let stack = unsafe { &mut *self.stack.0.get() };
+        stack[live..].fill(Value::nil());
+        cc.trace(&stack[..live]);
         cc.trace(&self.frames);
         cc.trace(&self.open_upvalues);
         cc.trace(&self.thread_handle);
@@ -418,33 +454,20 @@ impl<'gc> ThreadState<'gc> {
         &self.stack[bottom..self.top]
     }
 
-    /// Publish a new logical top *without* nil-filling what it vacates.
-    /// Interpreter fast paths only: the collector can never run while
-    /// `run_thread` is on the Rust stack, and `run_thread` calls
-    /// [`ThreadState::trim_dead`] on every exit, which restores rule 3 before
-    /// anything can trace the thread. `n` must already be physically covered.
+    /// `set_top` for a caller that knows `n` is already physically covered
+    /// (the interpreter, whose CALL sized the window).
     #[inline]
-    pub(crate) fn set_top_dirty(&mut self, n: usize) {
+    pub(crate) fn set_top_unchecked(&mut self, n: usize) {
         debug_assert!(n <= self.stack.len());
         self.top = n;
     }
 
-    /// Release everything above the live region. Cheap (a length store), and
-    /// exactly what makes `set_top_dirty` sound: nothing above `live_top` is
-    /// reachable, and whatever is regrown later is nil-filled by `ensure_slots`.
-    pub(crate) fn trim_dead(&mut self) {
-        let live = self.live_top();
-        self.stack.truncate(live);
-    }
-
-    /// Publish a new logical top, nil-filling any slots it vacates (rule 3).
-    /// Raising the top only exposes slots the caller has already written.
+    /// Publish a new logical top. Raising it only exposes slots the caller
+    /// has already written; lowering it leaves the vacated slots to the
+    /// collector (rule 3).
     #[inline]
     pub fn set_top(&mut self, n: usize) {
         self.ensure_slots(n);
-        if n < self.top {
-            self.stack[n..self.top].fill(Value::nil());
-        }
         self.top = n;
     }
 
@@ -497,7 +520,7 @@ impl<'gc> ThreadState<'gc> {
 impl<'gc> Thread<'gc> {
     pub fn new(mc: &Mutation<'gc>) -> Self {
         let state = ThreadState {
-            stack: Vec::new(),
+            stack: ValueStack::new(),
             frames: Vec::new(),
             open_upvalues: Vec::new(),
             tbc_slots: Vec::new(),

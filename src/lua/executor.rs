@@ -598,8 +598,6 @@ fn schedule_call_at<'gc>(
                 // stored back in [slot] before the call by the caller.)
                 let retc = ts.top - args_base;
                 ts.stack.copy_within(args_base..args_base + retc, slot);
-                // Drops the function slot and the one stale donor copy the
-                // shift-by-one leaves behind, nil-filling both.
                 ts.set_top(slot + retc);
                 Ok(())
             }
