@@ -149,7 +149,7 @@ fn lua_char<'gc>(
         }
         encode(c as u32, &mut out);
     }
-    stack.replace(&[Value::string(LuaString::new(nctx.ctx, &out))]);
+    stack.ret1(Value::string(LuaString::new(nctx.ctx, &out)));
     Ok(CallbackAction::Return)
 }
 
@@ -255,7 +255,7 @@ fn lua_len<'gc>(
             }
         }
     }
-    stack.replace(&[Value::integer(nctx.ctx.mutation(), count)]);
+    stack.ret1(Value::integer(nctx.ctx.mutation(), count));
     Ok(CallbackAction::Return)
 }
 

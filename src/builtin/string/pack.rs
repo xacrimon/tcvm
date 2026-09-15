@@ -359,7 +359,7 @@ pub(super) fn lua_pack<'gc>(
         }
     }
 
-    stack.replace(&[Value::string(LuaString::new(ctx, &out))]);
+    stack.ret1(Value::string(LuaString::new(ctx, &out)));
     Ok(CallbackAction::Return)
 }
 
@@ -390,7 +390,7 @@ pub(super) fn lua_packsize<'gc>(
         }
     }
 
-    stack.replace(&[Value::integer(nctx.ctx.mutation(), total as i64)]);
+    stack.ret1(Value::integer(nctx.ctx.mutation(), total as i64));
     Ok(CallbackAction::Return)
 }
 

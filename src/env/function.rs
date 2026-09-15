@@ -232,7 +232,9 @@ impl<'gc, 'a> Stack<'gc, 'a> {
     pub fn get(&self, i: usize) -> Value<'gc> {
         let idx = self.bottom + i;
         if idx < *self.top {
-            self.values[idx]
+            // `top <= values.len()` is rule 1 of the stack invariant.
+            debug_assert!(idx < self.values.len());
+            unsafe { *self.values.get_unchecked(idx) }
         } else {
             Value::nil()
         }
@@ -307,11 +309,42 @@ impl<'gc, 'a> Stack<'gc, 'a> {
         }
     }
 
-    /// Convenience for the common "clear args, push N results" pattern.
+    /// Replace the whole window (args included) with `values`: the common
+    /// "return these" shape. Results overwrite the args in place; only slots
+    /// the window loses are nil-filled (rule 3), so returning as many values as
+    /// there were arguments fills nothing.
     #[inline]
     pub fn replace(&mut self, values: &[Value<'gc>]) {
-        self.clear();
-        self.extend(values.iter().copied());
+        let end = self.bottom + values.len();
+        if end > self.values.len() {
+            self.values.resize(end, Value::nil());
+        }
+        for (i, v) in values.iter().enumerate() {
+            self.values[self.bottom + i] = *v;
+        }
+        self.truncate_to(end);
+    }
+
+    /// `replace(&[v])` without going through memory: a by-value `Value` stays
+    /// in a register, whereas a one-element slice is spilled to the stack and
+    /// read back through a pointer, with a copy loop around it.
+    #[inline(always)]
+    pub fn ret1(&mut self, v: Value<'gc>) {
+        let end = self.bottom + 1;
+        if end > self.values.len() {
+            self.values.resize(end, Value::nil());
+        }
+        self.values[self.bottom] = v;
+        self.truncate_to(end);
+    }
+
+    /// Lower the window end to `end`, nil-filling what it vacates (rule 3).
+    #[inline(always)]
+    fn truncate_to(&mut self, end: usize) {
+        if end < *self.top {
+            self.values[end..*self.top].fill(Value::nil());
+        }
+        *self.top = end;
     }
 }
 
