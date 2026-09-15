@@ -101,6 +101,25 @@ pub mod frame_flags {
 }
 
 impl<'gc> LuaFrame<'gc> {
+    /// The `LuaFrame` payload of the `Frame` slot after the one holding `f`.
+    ///
+    /// # Safety
+    /// `f` must point into a `Vec<Frame>` buffer with a slot after it.
+    #[inline(always)]
+    pub unsafe fn next_slot(f: *mut Self) -> *mut Self {
+        unsafe { f.byte_add(std::mem::size_of::<Frame<'gc>>()) }
+    }
+
+    /// The `LuaFrame` payload of the `Frame` slot before the one holding `f`.
+    ///
+    /// # Safety
+    /// `f` must point into a `Vec<Frame>` buffer, not at its first slot, and
+    /// the previous slot must be `Frame::Lua`.
+    #[inline(always)]
+    pub unsafe fn prev_slot(f: *mut Self) -> *mut Self {
+        unsafe { f.byte_sub(std::mem::size_of::<Frame<'gc>>()) }
+    }
+
     /// `pc` as an index into `closure.proto.code`.
     pub fn pc_index(&self) -> usize {
         unsafe {
