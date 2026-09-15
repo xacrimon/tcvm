@@ -98,6 +98,22 @@ pub(crate) enum OpError<'gc> {
 
 pub(crate) type Registers<'gc, 'a> = *mut Value<'gc>;
 
+/// Scratch state for one dispatch run. Lives on `run_thread`'s frame and is
+/// threaded through every handler by `&mut`, so handlers can hand values to a
+/// cold tail-callee without a stack object of their own (which would force a
+/// frame onto the fast path). Nothing here outlives dispatch, so it holds
+/// `Value`s without being traced: no collection can run while the `Context`
+/// is live.
+pub(crate) struct DispatchState<'gc> {
+    /// Set by `raise!` right before it tail-calls `impl_error`, which takes it.
+    fault: Option<OpError<'gc>>,
+}
+
+/// Every dispatch target (handler, slow path, continuation) carries
+/// `#[rustc_align(32)]`: they are reached only by indirect `br`, and an
+/// unaligned entry can leave the fetch unit starved for the whole handler —
+/// measured as a 10x rise in dispatch bubbles and ~4% on primes when a code
+/// change shifted the layout.
 pub(crate) type Handler = for<'gc> extern "rust-preserve-none" fn(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -105,6 +121,7 @@ pub(crate) type Handler = for<'gc> extern "rust-preserve-none" fn(
     registers: Registers<'gc, '_>,
     ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 );
 
 /// A pending fixup attached to a callee frame. When `op_return` sees this on
@@ -137,7 +154,7 @@ pub(crate) enum ContinuationPayload {
 }
 
 macro_rules! helpers {
-    ($instruction:expr, $ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr) => {
+    ($instruction:expr, $ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr, $ds:ident) => {
         #[allow(unused_macros)]
         macro_rules! dispatch {
             () => {{
@@ -156,7 +173,7 @@ macro_rules! helpers {
                     debug_assert!(pos < HANDLERS.len());
                     let handler = *$handlers.cast::<Handler>().add(pos);
                     let ip = $ip.add(1);
-                    become handler(instruction, $ctx, $thread, $registers, ip, $handlers);
+                    become handler(instruction, $ctx, $thread, $registers, ip, $handlers, $ds);
                 }
             }};
         }
@@ -181,7 +198,8 @@ macro_rules! helpers {
         macro_rules! raise {
             ($$kind:expr) => {{
                 std::hint::cold_path();
-                return impl_error($$kind, $ctx, $thread, $ip);
+                $ds.fault = Some($$kind);
+                become impl_error($instruction, $ctx, $thread, $registers, $ip, $handlers, $ds);
             }};
         }
 
@@ -226,12 +244,19 @@ macro_rules! helpers {
         /// the continuation; a native target runs inline — synchronously the
         /// continuation payload fires immediately, otherwise the call suspends
         /// through the executor (`schedule_meta_call` installs the pending
-        /// action / error frame). A non-callable target raises.
+        /// action / error frame). A non-callable target raises `$$err`, an
+        /// `OpError` variant applied to the target: `Call` by default, but
+        /// `__index`/`__newindex` chains pass `Index`, since the reference
+        /// indexes a non-function metamethod value rather than calling it.
         #[allow(unused_macros)]
         macro_rules! invoke_metamethod {
-            ($$meta:expr, $$args:expr, $$cont:expr) => {{
+            ($$meta:expr, $$args:expr, $$cont:expr) => {
+                invoke_metamethod!($$meta, $$args, $$cont, Call)
+            };
+            ($$meta:expr, $$args:expr, $$cont:expr, $$err:ident) => {{
+                let __mm_meta: Value<'gc> = $$meta;
                 let __mm_cont: Continuation = $$cont;
-                match schedule_meta_call($ctx, $thread, $$meta, $$args, __mm_cont, $ip) {
+                match schedule_meta_call($ctx, $thread, __mm_meta, $$args, __mm_cont, $ip) {
                     MetaDispatch::Lua { new_ip, new_base } => {
                         $ip = new_ip;
                         $registers = unsafe { $thread.stack.as_mut_ptr().add(new_base) };
@@ -264,13 +289,14 @@ macro_rules! helpers {
                             $thread,
                             $registers,
                             $ip,
-                            $handlers
+                            $handlers,
+                            $ds
                         );
                     }
                     // Native target suspended (or errored): the executor will
                     // resume / unwind from the installed frame state.
                     MetaDispatch::Suspended => return,
-                    MetaDispatch::Unresolvable => raise!(OpError::Call($$meta)),
+                    MetaDispatch::Unresolvable => raise!(OpError::$$err(__mm_meta)),
                 }
             }};
         }
@@ -286,7 +312,7 @@ macro_rules! helpers {
 /// the *caller's* window.
 macro_rules! apply_cont_payload {
     ($cont:expr, $results_base:expr, $nret:expr,
-     $ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr) => {{
+     $ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr, $ds:ident) => {{
         let __cont: Continuation = $cont;
         let __results_base: usize = $results_base;
         let __nret: usize = $nret as usize;
@@ -345,7 +371,7 @@ macro_rules! apply_cont_payload {
 ///   3. Nil result + `__index` → walk the chain. Resolved values
 ///      land in `$dst`; functions fire via `invoke_metamethod!`.
 macro_rules! table_get_slow_body {
-    ($ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr,
+    ($ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr, $ds:ident,
      $t:expr, $k:expr, $dst:expr) => {{
         let __t: Table<'gc> = $t;
         let __k: Value<'gc> = $k;
@@ -378,7 +404,7 @@ macro_rules! table_get_slow_body {
                     results_base: 0,
                     nret: 0,
                 };
-                invoke_metamethod!(__mm_func, &[__mm_recv, __k], __cont);
+                invoke_metamethod!(__mm_func, &[__mm_recv, __k], __cont, Index);
             }
             IndexChain::Exhausted => raise!(OpError::IndexChainLoop),
         }
@@ -391,7 +417,7 @@ macro_rules! table_get_slow_body {
 /// userdata has no raw indexing to fall back to. A key absent from the
 /// `__index` table still resolves to nil.
 macro_rules! userdata_get_slow_body {
-    ($ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr,
+    ($ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr, $ds:ident,
      $u:expr, $recv:expr, $k:expr, $dst:expr) => {{
         let __u = $u;
         let __recv: Value<'gc> = $recv;
@@ -413,7 +439,7 @@ macro_rules! userdata_get_slow_body {
                     results_base: 0,
                     nret: 0,
                 };
-                invoke_metamethod!(__mm_func, &[__mm_recv, __k], __cont);
+                invoke_metamethod!(__mm_func, &[__mm_recv, __k], __cont, Index);
             }
             Ok(IndexChain::Exhausted) => raise!(OpError::IndexChainLoop),
         }
@@ -425,7 +451,7 @@ macro_rules! userdata_get_slow_body {
 /// Walks the `__newindex` chain via `walk_newindex_chain`, which
 /// returns either the table to raw-write into, or a callable to invoke.
 macro_rules! table_set_slow_body {
-    ($ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr,
+    ($ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr, $ds:ident,
      $t:expr, $k:expr, $v:expr) => {{
         let __t: Table<'gc> = $t;
         let __k: Value<'gc> = $k;
@@ -446,7 +472,7 @@ macro_rules! table_set_slow_body {
                     results_base: 0,
                     nret: 0,
                 };
-                invoke_metamethod!(__mm_func, &[__mm_recv, __k, __new_val], __cont);
+                invoke_metamethod!(__mm_func, &[__mm_recv, __k, __new_val], __cont, Index);
             }
             NewIndexChain::Exhausted => raise!(OpError::NewIndexChainLoop),
         }
@@ -554,7 +580,16 @@ pub(crate) fn run_thread<'gc>(ctx: Context<'gc>, thread: Thread<'gc>) {
     };
     let registers = unsafe { ts.stack.as_mut_ptr().add(base) };
     let handlers = HANDLERS.as_ptr() as *const ();
-    op_nop(Instruction::nop(), ctx, &mut ts, registers, ip, handlers);
+    let mut ds = DispatchState { fault: None };
+    op_nop(
+        Instruction::nop(),
+        ctx,
+        &mut ts,
+        registers,
+        ip,
+        handlers,
+        &mut ds,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -563,14 +598,21 @@ pub(crate) fn run_thread<'gc>(ctx: Context<'gc>, thread: Thread<'gc>) {
 
 /// Cold tail of `raise!`: publish the faulting frame's pc, then raise the
 /// reference-formatted message at level 1 (the faulting Lua frame itself)
-/// so the executor's unwinder can route it to a catcher.
+/// so the executor's unwinder can route it to a catcher. A handler so it can
+/// be `become`d: a plain call here would put a frame on every raising
+/// handler's fast path.
 #[inline(never)]
-fn impl_error<'gc>(
-    kind: OpError<'gc>,
+#[rustc_align(32)]
+extern "rust-preserve-none" fn impl_error<'gc>(
+    _instruction: Instruction,
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
+    _registers: Registers<'gc, '_>,
     ip: *const Instruction,
+    _handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
+    let kind = ds.fault.take().expect("impl_error without a pending fault");
     // `ip` already points past the faulting instruction (see `dispatch!`),
     // which is the convention `LuaFrame::pc` uses.
     save_pc(thread, ip);
@@ -583,6 +625,7 @@ fn impl_error<'gc>(
 // ---------------------------------------------------------------------------
 
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_move<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -590,8 +633,9 @@ extern "rust-preserve-none" fn op_move<'gc>(
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (dst, src) = instruction.ab();
     *reg!(ref mut dst) = reg!(src);
     dispatch!();
@@ -599,6 +643,7 @@ extern "rust-preserve-none" fn op_move<'gc>(
 
 /// Load constant from the current prototype's constant pool.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_load<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -606,8 +651,9 @@ extern "rust-preserve-none" fn op_load<'gc>(
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (dst, idx) = instruction.ad();
     *reg!(ref mut dst) = constant!(idx);
     dispatch!();
@@ -615,6 +661,7 @@ extern "rust-preserve-none" fn op_load<'gc>(
 
 /// Set register to false and skip the next instruction.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_lfalseskip<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -622,8 +669,9 @@ extern "rust-preserve-none" fn op_lfalseskip<'gc>(
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let src = instruction.a();
     *reg!(ref mut src) = Value::boolean(false);
     skip!();
@@ -635,6 +683,7 @@ extern "rust-preserve-none" fn op_lfalseskip<'gc>(
 // ---------------------------------------------------------------------------
 
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_getupval<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -642,8 +691,9 @@ extern "rust-preserve-none" fn op_getupval<'gc>(
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (dst, idx) = instruction.ab();
     let uv = upvalue!(idx);
     *reg!(ref mut dst) = read_upvalue(thread, uv);
@@ -651,6 +701,7 @@ extern "rust-preserve-none" fn op_getupval<'gc>(
 }
 
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_setupval<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -658,8 +709,9 @@ extern "rust-preserve-none" fn op_setupval<'gc>(
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (src, idx) = instruction.ab();
     let val = reg!(src);
     let uv = upvalue!(idx);
@@ -673,6 +725,7 @@ extern "rust-preserve-none" fn op_setupval<'gc>(
 
 /// R[dst] = UpValue[idx][K[key]]
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_gettabup<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -680,8 +733,9 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
     mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (dst, idx, ic_idx, _key) = instruction.abde();
     let uv = upvalue!(idx);
     let t_val = read_upvalue(thread, uv);
@@ -703,10 +757,11 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
         }
     }
     drop(t_state);
-    become gettabup_slow(instruction, ctx, thread, registers, ip, handlers);
+    become gettabup_slow(instruction, ctx, thread, registers, ip, handlers, ds);
 }
 
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn gettabup_slow<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -714,8 +769,9 @@ extern "rust-preserve-none" fn gettabup_slow<'gc>(
     mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (dst, idx, ic_idx, key) = instruction.abde();
     let uv = upvalue!(idx);
     let t_val = read_upvalue(thread, uv);
@@ -724,11 +780,12 @@ extern "rust-preserve-none" fn gettabup_slow<'gc>(
     };
     let k = constant!(key);
     fill_ic_for_constant_key(ctx, thread, ic_idx, t, k);
-    table_get_slow_body!(ctx, thread, registers, ip, handlers, t, k, dst);
+    table_get_slow_body!(ctx, thread, registers, ip, handlers, ds, t, k, dst);
 }
 
 /// UpValue[idx][K[key]] = R[src]
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_settabup<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -736,8 +793,9 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
     mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (src, idx, ic_idx, key) = instruction.abde();
     let uv = upvalue!(idx);
     let t_val = read_upvalue(thread, uv);
@@ -763,10 +821,11 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
         }
     }
     drop(t_state);
-    become settabup_slow(instruction, ctx, thread, registers, ip, handlers);
+    become settabup_slow(instruction, ctx, thread, registers, ip, handlers, ds);
 }
 
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn settabup_slow<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -774,8 +833,9 @@ extern "rust-preserve-none" fn settabup_slow<'gc>(
     mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (src, idx, ic_idx, key) = instruction.abde();
     let uv = upvalue!(idx);
     let t_val = read_upvalue(thread, uv);
@@ -785,7 +845,7 @@ extern "rust-preserve-none" fn settabup_slow<'gc>(
     let k = constant!(key);
     let v = reg!(src);
     fill_ic_for_constant_key(ctx, thread, ic_idx, t, k);
-    table_set_slow_body!(ctx, thread, registers, ip, handlers, t, k, v);
+    table_set_slow_body!(ctx, thread, registers, ip, handlers, ds, t, k, v);
 }
 
 // ---------------------------------------------------------------------------
@@ -794,6 +854,7 @@ extern "rust-preserve-none" fn settabup_slow<'gc>(
 
 /// R[dst] = R[table][R[key]]
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_gettable<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -801,13 +862,14 @@ extern "rust-preserve-none" fn op_gettable<'gc>(
     mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (dst, table, key) = instruction.abc();
 
     let Some(t) = reg!(table).get_table() else {
         // Non-table (userdata `__index`, or error) — handled by the slow path.
-        become gettable_slow(instruction, ctx, thread, registers, ip, handlers);
+        become gettable_slow(instruction, ctx, thread, registers, ip, handlers, ds);
     };
 
     let k = reg!(key);
@@ -819,7 +881,7 @@ extern "rust-preserve-none" fn op_gettable<'gc>(
     };
 
     if need_index {
-        become gettable_slow(instruction, ctx, thread, registers, ip, handlers);
+        become gettable_slow(instruction, ctx, thread, registers, ip, handlers, ds);
     }
 
     *reg!(ref mut dst) = v;
@@ -827,6 +889,7 @@ extern "rust-preserve-none" fn op_gettable<'gc>(
 }
 
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn gettable_slow<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -834,22 +897,24 @@ extern "rust-preserve-none" fn gettable_slow<'gc>(
     mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (dst, table, key) = instruction.abc();
     let recv = reg!(table);
     let k = reg!(key);
     if let Some(t) = recv.get_table() {
-        table_get_slow_body!(ctx, thread, registers, ip, handlers, t, k, dst);
+        table_get_slow_body!(ctx, thread, registers, ip, handlers, ds, t, k, dst);
     }
     let Some(u) = recv.get_userdata() else {
         raise!(OpError::Index(recv));
     };
-    userdata_get_slow_body!(ctx, thread, registers, ip, handlers, u, recv, k, dst);
+    userdata_get_slow_body!(ctx, thread, registers, ip, handlers, ds, u, recv, k, dst);
 }
 
 /// R[table][R[key]] = R[src]
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_settable<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -857,8 +922,9 @@ extern "rust-preserve-none" fn op_settable<'gc>(
     mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (src, table, key) = instruction.abc();
 
     let Some(t) = reg!(table).get_table() else {
@@ -873,7 +939,7 @@ extern "rust-preserve-none" fn op_settable<'gc>(
     };
 
     if needs_newindex {
-        become settable_slow(instruction, ctx, thread, registers, ip, handlers);
+        become settable_slow(instruction, ctx, thread, registers, ip, handlers, ds);
     }
 
     check_index_key!(k);
@@ -883,6 +949,7 @@ extern "rust-preserve-none" fn op_settable<'gc>(
 }
 
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn settable_slow<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -890,19 +957,21 @@ extern "rust-preserve-none" fn settable_slow<'gc>(
     mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (src, table, key) = instruction.abc();
     let Some(t) = reg!(table).get_table() else {
         raise!(OpError::Index(reg!(table)));
     };
     let k = reg!(key);
     let v = reg!(src);
-    table_set_slow_body!(ctx, thread, registers, ip, handlers, t, k, v);
+    table_set_slow_body!(ctx, thread, registers, ip, handlers, ds, t, k, v);
 }
 
 /// R[dst] = R[table][K[key_idx]]
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_getfield<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -910,13 +979,14 @@ extern "rust-preserve-none" fn op_getfield<'gc>(
     mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (dst, table, ic_idx, _key_idx) = instruction.abde();
 
     let Some(t) = reg!(table).get_table() else {
         // Non-table (userdata `__index`, or error) — handled by the slow path.
-        become getfield_slow(instruction, ctx, thread, registers, ip, handlers);
+        become getfield_slow(instruction, ctx, thread, registers, ip, handlers, ds);
     };
 
     let cache = read_ic(thread, ic_idx);
@@ -932,10 +1002,11 @@ extern "rust-preserve-none" fn op_getfield<'gc>(
         }
     }
     drop(t_state);
-    become getfield_slow(instruction, ctx, thread, registers, ip, handlers);
+    become getfield_slow(instruction, ctx, thread, registers, ip, handlers, ds);
 }
 
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn getfield_slow<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -943,23 +1014,25 @@ extern "rust-preserve-none" fn getfield_slow<'gc>(
     mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (dst, table, ic_idx, key_idx) = instruction.abde();
     let recv = reg!(table);
     let k = constant!(key_idx);
     if let Some(t) = recv.get_table() {
         fill_ic_for_constant_key(ctx, thread, ic_idx, t, k);
-        table_get_slow_body!(ctx, thread, registers, ip, handlers, t, k, dst);
+        table_get_slow_body!(ctx, thread, registers, ip, handlers, ds, t, k, dst);
     }
     let Some(u) = recv.get_userdata() else {
         raise!(OpError::Index(recv));
     };
-    userdata_get_slow_body!(ctx, thread, registers, ip, handlers, u, recv, k, dst);
+    userdata_get_slow_body!(ctx, thread, registers, ip, handlers, ds, u, recv, k, dst);
 }
 
 /// R[table][K[key_idx]] = R[src]
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_setfield<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -967,8 +1040,9 @@ extern "rust-preserve-none" fn op_setfield<'gc>(
     mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (src, table, ic_idx, key_idx) = instruction.abde();
 
     let Some(t) = reg!(table).get_table() else {
@@ -991,10 +1065,11 @@ extern "rust-preserve-none" fn op_setfield<'gc>(
         }
     }
     drop(t_state);
-    become setfield_slow(instruction, ctx, thread, registers, ip, handlers);
+    become setfield_slow(instruction, ctx, thread, registers, ip, handlers, ds);
 }
 
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn setfield_slow<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1002,8 +1077,9 @@ extern "rust-preserve-none" fn setfield_slow<'gc>(
     mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (src, table, ic_idx, key_idx) = instruction.abde();
     let Some(t) = reg!(table).get_table() else {
         raise!(OpError::Index(reg!(table)));
@@ -1011,7 +1087,7 @@ extern "rust-preserve-none" fn setfield_slow<'gc>(
     let k = constant!(key_idx);
     let v = reg!(src);
     fill_ic_for_constant_key(ctx, thread, ic_idx, t, k);
-    table_set_slow_body!(ctx, thread, registers, ip, handlers, t, k, v);
+    table_set_slow_body!(ctx, thread, registers, ip, handlers, ds, t, k, v);
 }
 
 // ---------------------------------------------------------------------------
@@ -1022,6 +1098,7 @@ extern "rust-preserve-none" fn setfield_slow<'gc>(
 /// receiver into `R[dst+1]`. No inline cache for now — see the
 /// instruction definition.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_self<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1029,14 +1106,15 @@ extern "rust-preserve-none" fn op_self<'gc>(
     mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (dst, object, key_idx) = instruction.abd();
 
     let recv_val = reg!(object);
     let Some(recv) = recv_val.get_table() else {
         // Non-table receiver (userdata method dispatch, or an error).
-        become op_self_nontable(instruction, ctx, thread, registers, ip, handlers);
+        become op_self_nontable(instruction, ctx, thread, registers, ip, handlers, ds);
     };
 
     let key = constant!(key_idx);
@@ -1048,7 +1126,7 @@ extern "rust-preserve-none" fn op_self<'gc>(
     };
 
     if need_index {
-        become op_self_slow(instruction, ctx, thread, registers, ip, handlers);
+        become op_self_slow(instruction, ctx, thread, registers, ip, handlers, ds);
     }
 
     *reg!(ref mut dst) = method;
@@ -1057,6 +1135,7 @@ extern "rust-preserve-none" fn op_self<'gc>(
 }
 
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_self_slow<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1064,8 +1143,9 @@ extern "rust-preserve-none" fn op_self_slow<'gc>(
     mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (dst, object, key_idx) = instruction.abd();
 
     let recv_val = reg!(object);
@@ -1092,7 +1172,7 @@ extern "rust-preserve-none" fn op_self_slow<'gc>(
                 results_base: 0,
                 nret: 0,
             };
-            invoke_metamethod!(func, &[receiver, key], cont);
+            invoke_metamethod!(func, &[receiver, key], cont, Index);
         }
         IndexChain::Exhausted => raise!(OpError::IndexChainLoop),
     }
@@ -1105,6 +1185,7 @@ extern "rust-preserve-none" fn op_self_slow<'gc>(
 /// userdata with no metatable / nil `__index` likewise yields a nil
 /// method (the CALL raises). Any other non-table receiver raises.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_self_nontable<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1112,8 +1193,9 @@ extern "rust-preserve-none" fn op_self_nontable<'gc>(
     mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (dst, object, key_idx) = instruction.abd();
 
     let recv_val = reg!(object);
@@ -1140,7 +1222,7 @@ extern "rust-preserve-none" fn op_self_nontable<'gc>(
                 results_base: 0,
                 nret: 0,
             };
-            invoke_metamethod!(func, &[receiver, key], cont);
+            invoke_metamethod!(func, &[receiver, key], cont, Index);
         }
         IndexChain::Exhausted => raise!(OpError::IndexChainLoop),
     }
@@ -1148,6 +1230,7 @@ extern "rust-preserve-none" fn op_self_nontable<'gc>(
 
 /// R[dst] = {}
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_newtable<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1155,8 +1238,9 @@ extern "rust-preserve-none" fn op_newtable<'gc>(
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let dst = instruction.a();
     *reg!(ref mut dst) = Value::table(Table::new(ctx));
     dispatch!();
@@ -1170,6 +1254,7 @@ extern "rust-preserve-none" fn op_newtable<'gc>(
 macro_rules! arith_handler {
     ($fn_name:ident, $slow_name:ident, $instr:ident, $num_kind:ty, $mm:ident) => {
         #[inline(never)]
+        #[rustc_align(32)]
         extern "rust-preserve-none" fn $fn_name<'gc>(
             instruction: Instruction,
             ctx: Context<'gc>,
@@ -1177,8 +1262,9 @@ macro_rules! arith_handler {
             registers: Registers<'gc, '_>,
             ip: *const Instruction,
             handlers: *const (),
+            ds: &mut DispatchState<'gc>,
         ) {
-            helpers!(instruction, ctx, thread, registers, ip, handlers);
+            helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
             let (dst, lhs, rhs) = instruction.abc();
 
             // Testing that the tags match *before* either arm lets the
@@ -1212,7 +1298,7 @@ macro_rules! arith_handler {
                 }
             }
 
-            become $slow_name(instruction, ctx, thread, registers, ip, handlers);
+            become $slow_name(instruction, ctx, thread, registers, ip, handlers, ds);
         }
 
         binop_slow_handler!($slow_name, $instr, $num_kind, op_arith_mixed, $mm, Arith);
@@ -1223,6 +1309,7 @@ macro_rules! arith_handler {
 macro_rules! bit_handler {
     ($fn_name:ident, $slow_name:ident, $instr:ident, $num_kind:ty, $mm:ident) => {
         #[inline(never)]
+        #[rustc_align(32)]
         extern "rust-preserve-none" fn $fn_name<'gc>(
             instruction: Instruction,
             ctx: Context<'gc>,
@@ -1230,8 +1317,9 @@ macro_rules! bit_handler {
             registers: Registers<'gc, '_>,
             ip: *const Instruction,
             handlers: *const (),
+            ds: &mut DispatchState<'gc>,
         ) {
-            helpers!(instruction, ctx, thread, registers, ip, handlers);
+            helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
             let (dst, lhs, rhs) = instruction.abc();
 
             // same-type int/float
@@ -1242,7 +1330,7 @@ macro_rules! bit_handler {
                 dispatch!();
             }
 
-            become $slow_name(instruction, ctx, thread, registers, ip, handlers);
+            become $slow_name(instruction, ctx, thread, registers, ip, handlers, ds);
         }
 
         binop_slow_handler!($slow_name, $instr, $num_kind, op_bit_mixed, $mm, Bitwise);
@@ -1252,6 +1340,7 @@ macro_rules! bit_handler {
 macro_rules! binop_slow_handler {
     ($slow_name:ident, $instr:ident, $num_kind:ty, $num_mix_h:ident, $mm:ident, $err:ident) => {
         #[inline(never)]
+        #[rustc_align(32)]
         extern "rust-preserve-none" fn $slow_name<'gc>(
             instruction: Instruction,
             ctx: Context<'gc>,
@@ -1259,8 +1348,9 @@ macro_rules! binop_slow_handler {
             mut registers: Registers<'gc, '_>,
             mut ip: *const Instruction,
             handlers: *const (),
+            ds: &mut DispatchState<'gc>,
         ) {
-            helpers!(instruction, ctx, thread, registers, ip, handlers);
+            helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
             let (dst, lhs, rhs) = instruction.abc();
 
             {
@@ -1309,6 +1399,7 @@ bit_handler!(op_shr, op_shr_slow, SHR, num::Shr, mm_shr);
 
 /// R[dst] = -R[src]
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_unm<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1316,8 +1407,9 @@ extern "rust-preserve-none" fn op_unm<'gc>(
     mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (dst, src) = instruction.ab();
     let val = reg!(src);
     if let Some(i) = val.get_integer() {
@@ -1343,6 +1435,7 @@ extern "rust-preserve-none" fn op_unm<'gc>(
 
 /// R[dst] = ~R[src]  (bitwise NOT)
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_bnot<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1350,8 +1443,9 @@ extern "rust-preserve-none" fn op_bnot<'gc>(
     mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (dst, src) = instruction.ab();
     let val = reg!(src);
     if let Some(i) = val.get_integer() {
@@ -1372,6 +1466,7 @@ extern "rust-preserve-none" fn op_bnot<'gc>(
 
 /// R[dst] = not R[src]  (logical NOT — always produces boolean)
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_not<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1379,8 +1474,9 @@ extern "rust-preserve-none" fn op_not<'gc>(
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (dst, src) = instruction.ab();
     let val = reg!(src);
     *reg!(ref mut dst) = Value::boolean(val.is_falsy());
@@ -1389,6 +1485,7 @@ extern "rust-preserve-none" fn op_not<'gc>(
 
 /// R[dst] = #R[src]  (length)
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_len<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1396,8 +1493,9 @@ extern "rust-preserve-none" fn op_len<'gc>(
     mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (dst, src) = instruction.ab();
     let val = reg!(src);
 
@@ -1429,6 +1527,7 @@ extern "rust-preserve-none" fn op_len<'gc>(
 
 /// R[dst] = R[lhs] .. R[rhs]  (string concatenation)
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_concat<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1436,8 +1535,9 @@ extern "rust-preserve-none" fn op_concat<'gc>(
     mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (dst, lhs, rhs) = instruction.abc();
     let a = reg!(lhs);
     let b = reg!(rhs);
@@ -1465,6 +1565,7 @@ extern "rust-preserve-none" fn op_concat<'gc>(
 
 /// Close all upvalues >= R[start].
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_close<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1472,8 +1573,9 @@ extern "rust-preserve-none" fn op_close<'gc>(
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let start = instruction.a();
     let base = thread.top_lua().map_or(0, |f| f.base);
     let start_idx = base + start as usize;
@@ -1484,6 +1586,7 @@ extern "rust-preserve-none" fn op_close<'gc>(
 
 /// Mark R[val] as to-be-closed.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_tbc<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1491,8 +1594,9 @@ extern "rust-preserve-none" fn op_tbc<'gc>(
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let val = instruction.a();
     let base = thread.top_lua().map_or(0, |f| f.base);
     thread.tbc_slots.push(base + val as usize);
@@ -1505,6 +1609,7 @@ extern "rust-preserve-none" fn op_tbc<'gc>(
 
 /// pc += offset
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_jmp<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1512,8 +1617,9 @@ extern "rust-preserve-none" fn op_jmp<'gc>(
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let offset = instruction.imm();
     ip = unsafe { ip.offset(offset as isize) };
     dispatch!();
@@ -1521,6 +1627,7 @@ extern "rust-preserve-none" fn op_jmp<'gc>(
 
 /// if (R[lhs] == R[rhs]) != inverted then skip next instruction
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_eq<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1528,8 +1635,9 @@ extern "rust-preserve-none" fn op_eq<'gc>(
     mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (lhs, rhs, inverted) = instruction.abc_flag();
 
     let a = reg!(lhs);
@@ -1570,6 +1678,7 @@ extern "rust-preserve-none" fn op_eq<'gc>(
 
 /// if (R[lhs] < R[rhs]) != inverted then skip next instruction
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_lt<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1577,8 +1686,9 @@ extern "rust-preserve-none" fn op_lt<'gc>(
     mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (lhs, rhs, inverted) = instruction.abc_flag();
 
     let primitive = {
@@ -1623,6 +1733,7 @@ extern "rust-preserve-none" fn op_lt<'gc>(
 
 /// if (R[lhs] <= R[rhs]) != inverted then skip next instruction
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_le<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1630,8 +1741,9 @@ extern "rust-preserve-none" fn op_le<'gc>(
     mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (lhs, rhs, inverted) = instruction.abc_flag();
 
     let primitive = {
@@ -1676,6 +1788,7 @@ extern "rust-preserve-none" fn op_le<'gc>(
 
 /// if (not R[src]) == inverted then skip next instruction
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_test<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1683,8 +1796,9 @@ extern "rust-preserve-none" fn op_test<'gc>(
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (src, inverted) = instruction.ab_flag();
     let truthy = !reg!(src).is_falsy();
     if truthy != inverted {
@@ -1696,6 +1810,7 @@ extern "rust-preserve-none" fn op_test<'gc>(
 /// If (truthy(R[src]) == inverted) then skip next instruction;
 /// otherwise R[dst] := R[src] and fall through. Matches Lua 5.5 TESTSET.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_testset<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1703,8 +1818,9 @@ extern "rust-preserve-none" fn op_testset<'gc>(
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (dst, src, inverted) = instruction.abc_flag();
     let val = reg!(src);
     let truthy = !val.is_falsy();
@@ -1722,6 +1838,7 @@ extern "rust-preserve-none" fn op_testset<'gc>(
 
 /// R[func], ..., R[func+returns-2] = R[func](R[func+1], ..., R[func+args-1])
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_call<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1729,8 +1846,9 @@ extern "rust-preserve-none" fn op_call<'gc>(
     mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (func, nargs, returns) = instruction.abc();
     let base = thread.top_lua().map_or(0, |f| f.base);
     let func_idx = base + func as usize;
@@ -1841,6 +1959,7 @@ extern "rust-preserve-none" fn op_call<'gc>(
 
 /// return R[func](R[func+1], ..., R[func+args-1])  — tail call
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_tailcall<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1848,8 +1967,9 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
     mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (func, nargs) = instruction.ab();
     let base = thread.top_lua().map_or(0, |f| f.base);
     let func_idx = base + func as usize;
@@ -1932,7 +2052,15 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
                     let retc = thread.top - args_base;
                     match frame_return(ctx.mutation(), thread, args_base, retc) {
                         FrameReturn::Continuation => {
-                            become cont_resume(instruction, ctx, thread, registers, ip, handlers);
+                            become cont_resume(
+                                instruction,
+                                ctx,
+                                thread,
+                                registers,
+                                ip,
+                                handlers,
+                                ds,
+                            );
                         }
                         FrameReturn::TopLevel => return,
                         FrameReturn::ToNonLua => return,
@@ -1974,6 +2102,7 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
 
 /// return R[values], ..., R[values+count-2]
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_return<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -1981,8 +2110,9 @@ extern "rust-preserve-none" fn op_return<'gc>(
     mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (values, count) = instruction.ab();
 
     let cur_base = thread.top_lua().unwrap().base;
@@ -1996,7 +2126,7 @@ extern "rust-preserve-none" fn op_return<'gc>(
 
     match frame_return(ctx.mutation(), thread, values_base, nret) {
         FrameReturn::Continuation => {
-            become cont_resume(instruction, ctx, thread, registers, ip, handlers);
+            become cont_resume(instruction, ctx, thread, registers, ip, handlers, ds);
         }
         FrameReturn::TopLevel => return,
         FrameReturn::ToNonLua => return,
@@ -2069,6 +2199,7 @@ fn for_limit(init: i64, limit: Value, step: i64) -> Option<Option<i64>> {
 /// precomputed last value instead of decrementing a count keeps the chain
 /// to one slot.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_forprep<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -2076,8 +2207,9 @@ extern "rust-preserve-none" fn op_forprep<'gc>(
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (base, offset) = instruction.a_imm();
 
     let init = reg!(base);
@@ -2150,6 +2282,7 @@ extern "rust-preserve-none" fn op_forprep<'gc>(
 /// Numeric for loop step: advance the control variable and jump back while
 /// iterations remain. Reads the layout `op_forprep` leaves behind.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_forloop<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -2157,8 +2290,9 @@ extern "rust-preserve-none" fn op_forloop<'gc>(
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (base, offset) = instruction.a_imm();
 
     // The step's type tells the loop kind, and the hidden slots match it:
@@ -2197,6 +2331,7 @@ extern "rust-preserve-none" fn op_forloop<'gc>(
 
 /// Generic for preparation: jump to the loop test.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_tforprep<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -2204,8 +2339,9 @@ extern "rust-preserve-none" fn op_tforprep<'gc>(
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (_base, offset) = instruction.a_imm();
     ip = unsafe { ip.offset(offset as isize) };
     dispatch!();
@@ -2213,6 +2349,7 @@ extern "rust-preserve-none" fn op_tforprep<'gc>(
 
 /// Generic for call: R[base+3], ... = R[base](R[base+1], R[base+2])
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_tforcall<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -2220,8 +2357,9 @@ extern "rust-preserve-none" fn op_tforcall<'gc>(
     mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (base, count) = instruction.ab();
     let iter = reg!(base);
     let state = reg!(base + 1);
@@ -2237,6 +2375,7 @@ extern "rust-preserve-none" fn op_tforcall<'gc>(
 /// Generic for loop test: if the first result R[base+3] != nil, copy it into
 /// the control R[base+2] and jump back to the body.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_tforloop<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -2244,8 +2383,9 @@ extern "rust-preserve-none" fn op_tforloop<'gc>(
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (base, offset) = instruction.a_imm();
     let first = reg!(base + 3);
     if !first.is_nil() {
@@ -2261,6 +2401,7 @@ extern "rust-preserve-none" fn op_tforloop<'gc>(
 
 /// R[table][offset+i] = R[table+i] for i in 1..=count
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_setlist<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -2268,8 +2409,9 @@ extern "rust-preserve-none" fn op_setlist<'gc>(
     mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (table, count, offset) = instruction.abd();
     let Some(t) = reg!(table).get_table() else {
         raise!(OpError::Internal("SETLIST on a non-table"));
@@ -2310,6 +2452,7 @@ extern "rust-preserve-none" fn op_setlist<'gc>(
 
 /// R[dst] = closure(proto[idx])
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_closure<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -2317,8 +2460,9 @@ extern "rust-preserve-none" fn op_closure<'gc>(
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (dst, proto_idx) = instruction.ad();
     let frame = thread.top_lua().unwrap();
     let parent_closure = frame.closure;
@@ -2371,6 +2515,7 @@ extern "rust-preserve-none" fn op_closure<'gc>(
 /// flag): optimized reads the below-base region; materialized reads `1..=t.n`
 /// from the table in `R[num_params]`, so mutations to it are visible.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_vararg<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -2378,8 +2523,9 @@ extern "rust-preserve-none" fn op_vararg<'gc>(
     mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (dst, count) = instruction.ab();
     // Copy scalars/`Gc` out so the frame borrow ends before touching the stack.
     let (base, num_extras, proto) = {
@@ -2452,6 +2598,7 @@ extern "rust-preserve-none" fn op_vararg<'gc>(
 /// to `GETTABLE` at compile time, so `base` is unused here (kept only as that
 /// rewrite's table operand). Lua 5.5 `OP_GETVARG`, which also ignores `B`.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_varargget<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -2459,8 +2606,9 @@ extern "rust-preserve-none" fn op_varargget<'gc>(
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (dst, _base, key) = instruction.abc();
     let key_val = reg!(key);
     let frame = thread.top_lua().unwrap();
@@ -2501,6 +2649,7 @@ extern "rust-preserve-none" fn op_varargget<'gc>(
 /// into `R[num_params]` (Lua's `createvarargtab`); `VARARG` / `GETTABLE` then
 /// read the table, so mutations to it are observed.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_varargprep<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -2508,8 +2657,9 @@ extern "rust-preserve-none" fn op_varargprep<'gc>(
     mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let _num_fixed = instruction.a();
     let (num_extras, num_params, base, max_stack, needs_table) = {
         let frame = thread.top_lua().unwrap();
@@ -2554,6 +2704,7 @@ extern "rust-preserve-none" fn op_varargprep<'gc>(
 
 /// Lua 5.5 ERRNNIL: raise if `R[src]` is **not** nil.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_errnnil<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -2561,8 +2712,9 @@ extern "rust-preserve-none" fn op_errnnil<'gc>(
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (src, name_key) = instruction.ad();
     if std::hint::unlikely(!reg!(src).is_nil()) {
         raise!(OpError::GlobalRedefined(name_key));
@@ -2575,6 +2727,7 @@ extern "rust-preserve-none" fn op_errnnil<'gc>(
 // ---------------------------------------------------------------------------
 
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_nop<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -2582,12 +2735,14 @@ extern "rust-preserve-none" fn op_nop<'gc>(
     registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers);
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     dispatch!();
 }
 
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn op_stop<'gc>(
     _instruction: Instruction,
     _ctx: Context<'gc>,
@@ -2595,6 +2750,7 @@ extern "rust-preserve-none" fn op_stop<'gc>(
     _registers: Registers<'gc, '_>,
     _ip: *const Instruction,
     _handlers: *const (),
+    _ds: &mut DispatchState<'gc>,
 ) {
 }
 
@@ -3284,10 +3440,10 @@ fn schedule_native_meta_call<'gc>(
 macro_rules! finalize_return {
     (
         $instruction:expr, $ctx:expr, $thread:expr,
-        $registers:ident, $ip:ident, $handlers:expr,
+        $registers:ident, $ip:ident, $handlers:expr, $ds:ident,
         cont: $cont_out:ident
     ) => {
-        helpers!($instruction, $ctx, $thread, $registers, $ip, $handlers);
+        helpers!($instruction, $ctx, $thread, $registers, $ip, $handlers, $ds);
 
         let $cont_out: Continuation = $thread.top_lua().unwrap().continuation.unwrap();
         let __cur_base = $thread.top_lua().unwrap().base;
@@ -3313,6 +3469,7 @@ macro_rules! finalize_return {
 /// applies the same payload via `apply_cont_payload!` without this frame
 /// teardown, since no callee frame exists there.
 #[inline(never)]
+#[rustc_align(32)]
 extern "rust-preserve-none" fn cont_resume<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -3320,8 +3477,9 @@ extern "rust-preserve-none" fn cont_resume<'gc>(
     mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
+    ds: &mut DispatchState<'gc>,
 ) {
-    finalize_return!(instruction, ctx, thread, registers, ip, handlers, cont: cont);
+    finalize_return!(instruction, ctx, thread, registers, ip, handlers, ds, cont: cont);
     apply_cont_payload!(
         cont,
         cont.results_base,
@@ -3330,6 +3488,7 @@ extern "rust-preserve-none" fn cont_resume<'gc>(
         thread,
         registers,
         ip,
-        handlers
+        handlers,
+        ds
     );
 }

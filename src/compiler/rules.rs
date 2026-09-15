@@ -265,9 +265,9 @@ enum DefaultPolicy {
 /// never leak back out to the enclosing or sibling scopes.
 #[derive(Clone)]
 struct GlobalEnv {
-    /// Names introduced by an *explicit* `global Name` declaration.
-    /// Reads of these emit `ERRNNIL` after `GETTABUP` (a never-assigned
-    /// declared global is an error in 5.5 — `manual.of:1700`).
+    /// Names introduced by an *explicit* `global Name` declaration. Only an
+    /// initializing declaration emits `ERRNNIL` (the variable must still be
+    /// nil — `lua_manual.of:1668-1671`); plain reads compile to `GETTABUP`.
     decls: HashMap<String, GlobalKind, RandomState>,
     /// Policy for free names with no declaration in scope.
     default: DefaultPolicy,

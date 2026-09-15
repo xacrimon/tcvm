@@ -76,6 +76,23 @@ fn index_and_call() {
         raise_str("local t = setmetatable({}, {__call = 5}); return t()"),
         "c:1: attempt to call a number value"
     );
+    // A non-function `__index`/`__newindex` is indexed, not called.
+    assert_eq!(
+        raise_str("local t = setmetatable({}, {__index = 5}); return t.x"),
+        "c:1: attempt to index a number value"
+    );
+    assert_eq!(
+        raise_str("local t = setmetatable({}, {__index = 5}); return t:m()"),
+        "c:1: attempt to index a number value"
+    );
+    assert_eq!(
+        raise_str("local t = setmetatable({}, {__newindex = 5}); t.x = 1"),
+        "c:1: attempt to index a number value"
+    );
+    assert_eq!(
+        raise_str("local t = setmetatable({}, {__add = 5}); return t + 1"),
+        "c:1: attempt to call a number value"
+    );
 }
 
 #[test]
