@@ -1,15 +1,15 @@
 local function mandel_pixel(x, y)
     -- configurables
-    local width = 800
-    local height = 800
-    local max_iteration = 1000
-    local x_min = -2.5
-    local x_max = 1.0
-    local y_min = -1.25
-    local y_max = 1.25
+    local <const> width = 800
+    local <const> height = 800
+    local <const> max_iteration = 1000
+    local <const> x_min = -2.5
+    local <const> x_max = 1.0
+    local <const> y_min = -1.25
+    local <const> y_max = 1.25
 
-    local cx = x_min + (x * (x_max - x_min) / width)
-    local cy = y_min + (y * (y_max - y_min) / height)
+    local <const> cx = x_min + (x * (x_max - x_min) / width)
+    local <const> cy = y_min + (y * (y_max - y_min) / height)
     local zx = 0.0
     local zy = 0.0
     local iteration = 0
@@ -26,8 +26,8 @@ end
 
 local function mandel()
     -- configurables
-    local width = 800
-    local height = 800
+    local <const> width = 800
+    local <const> height = 800
 
     local total_iterations = 0
 
