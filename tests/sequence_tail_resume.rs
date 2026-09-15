@@ -48,7 +48,7 @@ fn forward<'gc>(
     let target = stack.get(0).get_thread().expect("arg #1 is a coroutine");
     stack.replace(&[]);
     let seq = BoxSequence::new(nctx.ctx.mutation(), TailResumeSeq { target });
-    Ok(CallbackAction::Sequence(seq))
+    Ok(CallbackAction::sequence(seq))
 }
 
 #[test]

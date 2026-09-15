@@ -12,7 +12,7 @@ fn yielder<'gc>(
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     // Whatever args were passed in are already on the stack — the yield
     // forwards them to the host as the yielded values.
-    Ok(CallbackAction::Yield { then: None })
+    Ok(CallbackAction::yield_(None))
 }
 
 /// Yield (1, 2, 3) to the host; on resume, return `a + b` of the

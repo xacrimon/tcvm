@@ -43,7 +43,7 @@ fn forward<'gc>(
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let seq = BoxSequence::new(nctx.ctx.mutation(), TailCallSeq);
-    Ok(CallbackAction::Sequence(seq))
+    Ok(CallbackAction::sequence(seq))
 }
 
 #[test]

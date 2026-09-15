@@ -60,7 +60,7 @@ fn lua_assert<'gc>(
         return Ok(CallbackAction::Return);
     }
     if stack.len() >= 2 {
-        Err(Error::new(stack.get(1)).with_level(1))
+        Err(Error::new(nctx.ctx, stack.get(1)).with_level(1))
     } else {
         Err(Error::from_str(nctx.ctx, "assertion failed!"))
     }
@@ -110,7 +110,7 @@ fn lua_error<'gc>(
     } else {
         1
     };
-    Err(Error::new(stack.get(0)).with_level(level))
+    Err(Error::new(nctx.ctx, stack.get(0)).with_level(level))
 }
 
 fn lua_getmetatable<'gc>(

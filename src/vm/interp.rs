@@ -2414,7 +2414,7 @@ macro_rules! call_native {
                     $registers = unsafe { $thread.stack.as_mut_ptr().add(base) };
                     dispatch!();
                 }
-                action => {
+                crate::vm::sequence::CallbackAction::Suspend(action) => {
                     // Suspension path: persist caller's pc, stash the
                     // action on the thread for the executor to translate
                     // into frame ops, then exit the dispatch chain.
@@ -2843,7 +2843,7 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
                         }
                     }
                 }
-                action => {
+                crate::vm::sequence::CallbackAction::Suspend(action) => {
                     // Tailcall + suspension: pop the tailcalling Lua frame
                     // (close upvalues / TBC vars) so any subsequent action
                     // lands on the caller's frame window. Capture the
@@ -3714,15 +3714,12 @@ pub(crate) fn invoke_native<'gc>(
     // above it — which may be an outer frame's registers — alone.
     thread.ensure_slots(end);
     thread.top = end;
-    let current_thread = thread
-        .thread_handle
-        .expect("ThreadState missing back-reference");
     let nctx = NativeContext {
         ctx,
         upvalues: &nc.upvalues,
-        exec: crate::vm::sequence::Execution::new(current_thread),
+        exec: crate::vm::sequence::Execution::new(thread.handle()),
     };
-    let stack = Stack::new(&mut thread.stack, &mut thread.top, args_base);
+    let stack = Stack::new(thread, args_base);
     // The stack is grown-not-shrunk and may leave dead scratch above the logical
     // top; that's fine because `ThreadState`'s `Collect` traces only the live
     // high-water (derived from the frames + `top`), so dead slots never retain.
@@ -4295,7 +4292,7 @@ fn schedule_native_meta_call<'gc>(
     new_base: usize,
     actual_args: usize,
 ) -> MetaDispatch {
-    use crate::vm::sequence::CallbackAction;
+    use crate::vm::sequence::{CallbackAction, Suspend};
 
     let args_base = new_base;
     let action = match invoke_native(ctx, thread, nc, args_base, actual_args) {
@@ -4323,7 +4320,7 @@ fn schedule_native_meta_call<'gc>(
         // `land_call_results` and so can't replay our continuation. It's not a
         // shape any current metamethod/iterator native produces; reject it
         // cleanly rather than silently dropping the continuation.
-        CallbackAction::Call { .. } => {
+        CallbackAction::Suspend(action) if matches!(*action, Suspend::Call { .. }) => {
             let err = crate::env::Error::from_str(
                 ctx,
                 "metamethod/iterator native cannot tail-call into Lua across the continuation",
@@ -4337,9 +4334,9 @@ fn schedule_native_meta_call<'gc>(
         // continuation against the caller frame (`apply_native_continuation`).
         // This replays every payload uniformly — including `CondJump`, whose
         // branch decision (a `pc` bump) can't be expressed as a plain landing.
-        other => {
+        CallbackAction::Suspend(action) => {
             thread.pending_action = Some(PendingAction {
-                action: other,
+                action,
                 call_site: CallSite {
                     bottom: args_base,
                     // Unused while `cont` is set (the continuation drives the
