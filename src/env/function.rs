@@ -267,12 +267,10 @@ impl<'gc, 'a> Stack<'gc, 'a> {
         &mut self.thread.stack[self.bottom..self.thread.top]
     }
 
-    /// Discard everything in the window (args included). Lowers the logical top
-    /// without shrinking the backing vec; the discarded slots are nil-filled,
-    /// since leaving them set would let the GC trace still reach them.
+    /// Discard everything in the window (args included). Lowers the logical
+    /// top without shrinking the backing vec.
     #[inline]
     pub fn clear(&mut self) {
-        self.thread.stack[self.bottom..self.thread.top].fill(Value::nil());
         self.thread.top = self.bottom;
     }
 
@@ -315,7 +313,6 @@ impl<'gc, 'a> Stack<'gc, 'a> {
         debug_assert!(at < top);
         self.thread.stack.copy_within(at + 1..top, at);
         self.thread.top -= 1;
-        self.thread.stack[top - 1] = Value::nil();
     }
 
     /// Drop everything above the first `n` values (no-op if shorter).
@@ -335,9 +332,7 @@ impl<'gc, 'a> Stack<'gc, 'a> {
     }
 
     /// Replace the whole window (args included) with `values`: the common
-    /// "return these" shape. Results overwrite the args in place; only slots
-    /// the window loses are nil-filled (rule 3), so returning as many values as
-    /// there were arguments fills nothing.
+    /// "return these" shape. Results overwrite the args in place.
     #[inline]
     pub fn replace(&mut self, values: &[Value<'gc>]) {
         let end = self.bottom + values.len();
@@ -363,12 +358,8 @@ impl<'gc, 'a> Stack<'gc, 'a> {
         self.truncate_to(end);
     }
 
-    /// Lower the window end to `end`, nil-filling what it vacates (rule 3).
     #[inline(always)]
     fn truncate_to(&mut self, end: usize) {
-        if end < self.thread.top {
-            self.thread.stack[end..self.thread.top].fill(Value::nil());
-        }
         self.thread.top = end;
     }
 }
