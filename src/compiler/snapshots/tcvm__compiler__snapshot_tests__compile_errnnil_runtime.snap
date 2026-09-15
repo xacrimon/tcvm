@@ -17,4 +17,4 @@ expression: output
 0004  [  2]  GETTABUP        R1 U0 K0  ; "X"
 0005  [  2]  ERRNNIL         R1 name=K0
 0006  [  2]  SETTABUP        R0 U0 K0  ; "X"
-0007  [  2]  RETURN          R0 count=1
+0007  [  2]  RETURN0

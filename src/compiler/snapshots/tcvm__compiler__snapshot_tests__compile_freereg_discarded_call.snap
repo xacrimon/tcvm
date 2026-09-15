@@ -21,11 +21,11 @@ expression: output
 0009  [  4]  TEST            R3 inv=false
 0010  [  4]  JMP             +2
 0011  [  4]  LOAD            R3 K0  ; 1
-0012  [  4]  RETURN          R3 count=2
+0012  [  4]  RETURN1         R3
 0013  [  5]  ADD             R3 R1 R2
-0014  [  5]  RETURN          R3 count=2
+0014  [  5]  RETURN1         R3
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=0, upvalues=0)
   ; code:
-  0000  [  1]  RETURN          R0 count=1
+  0000  [  1]  RETURN0

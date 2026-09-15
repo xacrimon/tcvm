@@ -56,6 +56,8 @@ static HANDLERS: [Handler; Op::COUNT] = Op::table([
     (Op::CALL, op_call),
     (Op::TAILCALL, op_tailcall),
     (Op::RETURN, op_return),
+    (Op::RETURN0, op_return0),
+    (Op::RETURN1, op_return1),
     (Op::FORLOOP, op_forloop),
     (Op::FORPREP, op_forprep),
     (Op::TFORPREP, op_tforprep),
@@ -2866,6 +2868,27 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
     }
 }
 
+/// The tail shared by the RETURN fast paths once the results are in place
+/// and `thread.top` is published: pop the frame and resume the Lua parent.
+macro_rules! return_to_parent {
+    ($thread:ident, $registers:ident, $ip:ident, $ds:ident, $frame:ident) => {{
+        // The top frame is `Frame::Lua` (it is the one we are running) and
+        // `LuaFrame` is `Copy`, so nothing needs dropping.
+        let n = $thread.frames.len();
+        unsafe { $thread.frames.set_len(n - 1) };
+        // The parent is the slot below (`flags` guaranteed it is a Lua frame),
+        // so it is reached from the frame register rather than through the
+        // length just stored.
+        $frame = unsafe { LuaFrame::prev_slot($frame) };
+        let (new_base, new_ip, closure) =
+            unsafe { ((*$frame).base, (*$frame).pc, &(*$frame).closure) };
+        $ds.bind(closure);
+        $ip = new_ip;
+        $registers = unsafe { $thread.stack.as_mut_ptr().add(new_base) };
+        dispatch!();
+    }};
+}
+
 /// return R[values], ..., R[values+count-2]
 ///
 /// Fast path: a fixed number of results, no continuation, nothing to close,
@@ -2927,23 +2950,90 @@ extern "rust-preserve-none" fn op_return<'gc>(
             unsafe { *stack.add(dst_start + i) = Value::nil() };
         }
     }
-    let n = thread.frames.len();
     // Without this a `top` left high by a multires producer inside the callee
     // would keep its dead registers traced (#43).
     thread.set_top_unchecked(dst_start + wanted);
+    return_to_parent!(thread, registers, ip, ds, frame);
+}
 
-    // The top frame is `Frame::Lua` (it is the one we are running) and
-    // `LuaFrame` is `Copy`, so nothing needs dropping.
-    unsafe { thread.frames.set_len(n - 1) };
-    // The parent is the slot below (`flags` guaranteed it is a Lua frame), so
-    // it is reached from the frame register rather than through the length
-    // just stored.
-    frame = unsafe { LuaFrame::prev_slot(frame) };
-    let (new_base, new_ip, closure) = unsafe { ((*frame).base, (*frame).pc, &(*frame).closure) };
-    ds.bind(closure);
-    ip = new_ip;
-    registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
-    dispatch!();
+/// return
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn op_return0<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+) {
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds, frame);
+    let (cur_base, num_results, num_extras, flags) = {
+        let f = unsafe { &*frame };
+        (f.base, f.num_results, f.num_extras as usize, f.flags)
+    };
+    if std::hint::unlikely(flags != 0) {
+        let generic = Instruction::ret(crate::instruction::Reg(0), 1);
+        become op_return_slow(generic, ctx, thread, registers, ip, handlers, ds, frame);
+    }
+    let dst_start = cur_base - 1 - num_extras;
+    // `num_results == 0` is the CALL's MULTRET: zero results, publish `top`.
+    let wanted = if num_results == 0 {
+        0
+    } else {
+        num_results as usize - 1
+    };
+    debug_assert!(dst_start + wanted <= thread.stack.len());
+    let stack = thread.stack.as_mut_ptr();
+    for i in 0..wanted {
+        unsafe { *stack.add(dst_start + i) = Value::nil() };
+    }
+    thread.set_top_unchecked(dst_start + wanted);
+    return_to_parent!(thread, registers, ip, ds, frame);
+}
+
+/// return R[value]
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn op_return1<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+) {
+    helpers!(instruction, ctx, thread, registers, ip, handlers, ds, frame);
+    let value = instruction.a();
+    let (cur_base, num_results, num_extras, flags) = {
+        let f = unsafe { &*frame };
+        (f.base, f.num_results, f.num_extras as usize, f.flags)
+    };
+    if std::hint::unlikely(flags != 0) {
+        let generic = Instruction::ret(crate::instruction::Reg(value), 2);
+        become op_return_slow(generic, ctx, thread, registers, ip, handlers, ds, frame);
+    }
+    let dst_start = cur_base - 1 - num_extras;
+    // `num_results == 0` is the CALL's MULTRET: one result, publish `top`.
+    let wanted = if num_results == 0 {
+        1
+    } else {
+        num_results as usize - 1
+    };
+    debug_assert!(dst_start + wanted.max(1) <= thread.stack.len());
+    let stack = thread.stack.as_mut_ptr();
+    // Written even when the caller wants nothing: `dst_start` is the caller's
+    // function slot, dead once the call returns.
+    unsafe { *stack.add(dst_start) = reg!(value) };
+    for i in 1..wanted {
+        unsafe { *stack.add(dst_start + i) = Value::nil() };
+    }
+    thread.set_top_unchecked(dst_start + wanted);
+    return_to_parent!(thread, registers, ip, ds, frame);
 }
 
 /// The general RETURN: MULTRET, continuations, open upvalues / to-be-closed

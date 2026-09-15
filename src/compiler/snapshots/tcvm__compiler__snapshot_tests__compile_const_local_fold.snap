@@ -39,4 +39,4 @@ expression: output
 0014  [ 15]  SETTABUP        R4 U0 K12  ; "e"
 0015  [ 16]  LOAD            R4 K14  ; 36
 0016  [ 16]  SETTABUP        R4 U0 K13  ; "f"
-0017  [ 16]  RETURN          R0 count=1
+0017  [ 16]  RETURN0

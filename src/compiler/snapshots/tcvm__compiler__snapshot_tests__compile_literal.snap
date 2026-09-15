@@ -96,4 +96,4 @@ expression: output
 0048  [ 19]  SETTABUP        R0 U0 K32  ; "tg"
 0049  [ 21]  LOAD            R0 K37  ; -18
 0050  [ 21]  SETTABUP        R0 U0 K36  ; "y"
-0051  [ 21]  RETURN          R0 count=1
+0051  [ 21]  RETURN0

@@ -33,7 +33,7 @@ expression: output
 0018  [ 23]  GETTABUP        R4 U0 K4  ; "print"
 0019  [ 23]  MOVE            R5 R3
 0020  [ 23]  CALL            R4 args=2 ret=1
-0021  [ 23]  RETURN          R0 count=1
+0021  [ 23]  RETURN0
 
 ; prototype 0:
   ; function (params=1, vararg=false, stack=6, upvalues=0)
@@ -51,7 +51,7 @@ expression: output
   0005  [  3]  EQI             R5 #0 inv=false
   0006  [  3]  JMP             +2
   0007  [  4]  LOAD            R5 K2  ; false
-  0008  [  4]  RETURN          R5 count=2
+  0008  [  4]  RETURN1         R5
   0009  [  2]  FORLOOP         R1 -6
   0010  [  8]  LOAD            R1 K3  ; true
-  0011  [  8]  RETURN          R1 count=2
+  0011  [  8]  RETURN1         R1

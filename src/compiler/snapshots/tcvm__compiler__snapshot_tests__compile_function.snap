@@ -36,28 +36,28 @@ expression: output
 0021  [ 21]  GETTABUP        R8 U0 K4  ; "print"
 0022  [ 21]  MOVE            R9 R7
 0023  [ 21]  CALL            R8 args=2 ret=1
-0024  [ 21]  RETURN          R0 count=1
+0024  [ 21]  RETURN0
 
 ; prototype 0:
   ; function (params=2, vararg=false, stack=3, upvalues=0)
   ; code:
   0000  [  2]  ADD             R2 R0 R1
-  0001  [  2]  RETURN          R2 count=2
+  0001  [  2]  RETURN1         R2
 
 ; prototype 1:
   ; function (params=2, vararg=false, stack=3, upvalues=0)
   ; code:
   0000  [  6]  SUB             R2 R0 R1
-  0001  [  6]  RETURN          R2 count=2
+  0001  [  6]  RETURN1         R2
 
 ; prototype 2:
   ; function (params=2, vararg=false, stack=3, upvalues=0)
   ; code:
   0000  [ 10]  MUL             R2 R0 R1
-  0001  [ 10]  RETURN          R2 count=2
+  0001  [ 10]  RETURN1         R2
 
 ; prototype 3:
   ; function (params=2, vararg=false, stack=3, upvalues=0)
   ; code:
   0000  [ 14]  DIV             R2 R0 R1
-  0001  [ 14]  RETURN          R2 count=2
+  0001  [ 14]  RETURN1         R2

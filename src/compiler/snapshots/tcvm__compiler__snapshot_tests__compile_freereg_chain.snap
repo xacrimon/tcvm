@@ -13,4 +13,4 @@ expression: output
 0002  [  2]  ADDI            R1 R0 #2
 0003  [  2]  ADDI            R1 R1 #3
 0004  [  2]  ADDI            R1 R1 #4
-0005  [  3]  RETURN          R1 count=2
+0005  [  3]  RETURN1         R1
