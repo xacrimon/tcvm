@@ -48,14 +48,9 @@ pub struct IcIdx(pub u16);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProtoIdx(pub u16);
 
-/// A number packed into the 32-bit extension slot of an immediate-operand
-/// opcode (`ADDI`, `LTI`, ...). Self-describing so one opcode serves both
-/// integer and float constants: bit 0 set means an integer, stored as
-/// `n << 1 | 1` (so 31 bits of range and a single `asr` to decode); bit 0
-/// clear means a float, stored as its exact `f32` bit pattern with the low
-/// mantissa bit clear — `fmov` + `fcvt` to decode, no masking. That covers
-/// every small integer and the dyadic floats (`0.5`, `2.0`, `-1.25`) that
-/// numeric code is written with; `0.1` and friends stay in the constant pool.
+/// A number packed into an immediate opcode's 32-bit slot. Bit 0 set: a 31-bit
+/// integer stored as `n << 1 | 1`. Bit 0 clear: an `f32` bit pattern, so only
+/// floats whose low mantissa bit is clear qualify (`0.5`, `2.0`; not `0.1`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Imm(u32);
 
@@ -372,8 +367,7 @@ impl Instruction {
         Imm((self.0 >> IMM_SHIFT) as u32)
     }
 
-    // Decoded straight off the 64-bit word so the tag test is one `tbnz`
-    // and the integer decode one `asr`.
+    // Decoded off the whole word: one `tbnz` / one `asr`, no 32-bit extract first.
 
     #[inline(always)]
     pub fn imm_is_int(self) -> bool {
@@ -751,15 +745,12 @@ instructions! {
 
     // --- immediate-operand forms --------------------------------------
     //
-    // `R[dst] = R[src] <op> imm` (or `imm <op> R[src]` for the `R`-prefixed
-    // reversed forms of the non-commutative ops, cf. ARM `rsb`). The
-    // reversal is baked into the opcode rather than a flag so the handler
-    // has no operand select on its fast path. `flipped` records that the
-    // constant was on the left in the source (`1 + x`); only the slow path
-    // reads it, to hand metamethods and error messages the operands in
-    // source order. The compiler never emits `MODI`/`IDIVI` with a zero
-    // integer immediate, so those skip the divisor check that the reversed
-    // forms still need. Bitwise ops only ever get integer immediates.
+    // `R[dst] = R[src] <op> imm`; the `R`-prefixed forms compute `imm <op> R[src]`
+    // (cf. ARM `rsb`) so no handler selects operands on its fast path. `flipped`
+    // means the constant was on the left in the source (`1 + x`); only the slow
+    // path reads it, to pass metamethods and errors the operands in source order.
+    // Invariants the handlers rely on: `MODI`/`IDIVI` never carry a zero integer
+    // immediate; the bitwise forms only carry integer immediates.
 
     0x36 ADDI       addi        AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
     0x37 SUBI       subi        AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }

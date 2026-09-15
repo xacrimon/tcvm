@@ -303,14 +303,10 @@ macro_rules! helpers {
             }};
         }
 
-        /// `if $$cond { skip!() }` compiled as a *branch*. Left to itself
-        /// LLVM if-converts the skip into a `csel` on `ip`, which makes the
-        /// next instruction-word load — and so the whole next handler —
-        /// data-dependent on the compared registers: ~15 cycles of exposed
-        /// latency on every execution, versus a predicted branch that
-        /// costs nothing when the outcome is stable and half a flush when
-        /// it isn't. The opaque asm can't be speculated, so the path stays
-        /// a real branch and `ip` merges through a phi, not a select.
+        /// `if $$cond { skip!() }`, forced to compile as a branch: LLVM otherwise
+        /// if-converts it to a `csel` on `ip`, making the next instruction load
+        /// data-dependent on the compare instead of predicted. The asm is opaque
+        /// so the select can't be re-formed.
         #[allow(unused_macros)]
         macro_rules! skip_if {
             ($$cond:expr) => {{
@@ -1516,11 +1512,9 @@ bit_handler!(op_shr, op_shr_slow, SHR, num::Shr, mm_shr);
 // Arithmetic and bitwise (register-immediate)
 // ---------------------------------------------------------------------------
 
-/// `R[dst] = R[src] <op> imm`, or `imm <op> R[src]` when `$swap`. The
-/// immediate's kind is tested first (one `tbnz` on the instruction word) so
-/// each arm has a single register tag check and a decode of one or two
-/// instructions; the int/float mixes are handled inline, unlike the
-/// register form, since the constant side is free to convert.
+/// `R[dst] = R[src] <op> imm`, or `imm <op> R[src]` when `$swap`. Unlike the
+/// register form the int/float mixes are inline: the constant side converts
+/// for free.
 macro_rules! arith_imm_handler {
     ($fn_name:ident, $slow_name:ident, $instr:ident, $num_kind:ty, $mm:ident, $swap:expr) => {
         #[inline(never)]
@@ -2054,10 +2048,8 @@ extern "rust-preserve-none" fn op_le<'gc>(
     invoke_metamethod!(meta_fn, &[a, b], cont);
 }
 
-/// `if (R[src] <cmp> imm) != inverted then skip`, with `$swap` putting the
-/// immediate on the left. The four number pairings each get their exact
-/// comparison (`lt_int_float` & co. for the mixed ones); anything else goes
-/// to the metamethod with the immediate materialised as a `Value`.
+/// `if (R[src] <cmp> imm) != inverted then skip`; `$swap` puts the immediate
+/// on the left.
 macro_rules! cmp_imm_handler {
     ($fn_name:ident, $slow_name:ident, $mm:ident, $swap:expr,
      $ii:expr, $ff:expr, $if_:expr, $fi:expr) => {
@@ -2106,8 +2098,6 @@ macro_rules! cmp_imm_handler {
             become $slow_name(instruction, ctx, thread, registers, ip, handlers, ds);
         }
 
-        /// Kept out of line so the fast path needs no stack frame for the
-        /// metamethod call machinery.
         #[inline(never)]
         #[rustc_align(32)]
         extern "rust-preserve-none" fn $slow_name<'gc>(
@@ -2181,8 +2171,7 @@ cmp_imm_handler!(
     num::le_float_int
 );
 
-/// `if (R[src] == imm) != inverted then skip`. Raw equality only: `__eq`
-/// requires two tables or two userdata, and the immediate is a number.
+/// `if (R[src] == imm) != inverted then skip`.
 #[inline(never)]
 #[rustc_align(32)]
 extern "rust-preserve-none" fn op_eqi<'gc>(

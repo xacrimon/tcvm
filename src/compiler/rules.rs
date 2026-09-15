@@ -3279,10 +3279,8 @@ fn compile_expr_binary_op(
         return Ok(ExprDesc::from_numeral(folded));
     }
 
-    // Immediate forms: a packable numeral on either side becomes the
-    // instruction's immediate and only the other operand takes a register.
-    // The RHS is tried first so both sides numeral with the fold refused
-    // (`1 // 0.0`) still prefers the direct form.
+    // Immediate forms. The RHS is tried first so a refused fold (`1 // 0.0`)
+    // still gets the direct form.
     let rhs_imm = match rhs_desc.kind {
         ExprKind::Numeral(n) if !rhs_desc.has_jumps() => arith_imm(op, n, false),
         _ => None,
@@ -3376,12 +3374,9 @@ fn compile_expr_binary_op(
 type ArithImmCtor = fn(Reg, Reg, Imm) -> Instruction;
 type CmpImmCtor = fn(Reg, Imm) -> Instruction;
 
-/// The immediate-operand instruction for `R op n` (or `n op R` when
-/// `imm_on_left`), if `n` packs and the op has such a form. Returns the
-/// constructor with its `flipped` flag applied. Bitwise ops take integer
-/// immediates only, since a metamethod would observe `2.0` becoming `2`;
-/// `MODI`/`IDIVI` refuse a zero integer divisor so the handler can skip the
-/// check (the register form raises the error instead).
+/// Bitwise ops take integer immediates only — a metamethod would otherwise see
+/// `2.0` become `2`. `MODI`/`IDIVI` refuse a zero integer divisor so the handler
+/// can skip the check.
 fn arith_imm(op: BinaryOperator, n: Numeral, imm_on_left: bool) -> Option<(ArithImmCtor, Imm)> {
     use BinaryOperator as B;
     let imm = match n {
@@ -3393,8 +3388,6 @@ fn arith_imm(op: BinaryOperator, n: Numeral, imm_on_left: bool) -> Option<(Arith
         }
         Numeral::Float(f) => Imm::from_float(f)?,
     };
-    // Only integer zero is unsafe; a float zero divisor packs and yields
-    // nan/inf like the register form.
     if !imm_on_left && matches!(op, B::Mod | B::IntDiv) && n == Numeral::Int(0) {
         return None;
     }
@@ -3469,11 +3462,9 @@ fn compile_comparison_desc(
     let lhs_expr = item.lhs().ok_or_else(|| ice("cmp without lhs"))?;
     let rhs_expr = item.rhs().ok_or_else(|| ice("cmp without rhs"))?;
 
-    // Immediate forms: a packable numeral on either side (`i < 10`,
-    // `0 <= x`) needs no register; the opcode absorbs the side it was on.
-    // The LHS stays lazy only if it packs: a numeral that must take a
-    // register is materialised *before* the RHS, or its `LOAD` would land
-    // inside a jump-carrying RHS's short-circuit span and be skipped.
+    // A packable numeral on either side becomes the immediate. A non-packing one
+    // must be materialised *before* the RHS, or its `LOAD` would sit inside a
+    // jump-carrying RHS's short-circuit span and be skipped.
     let mut lhs_desc = compile_expr(ctx, lhs_expr, None)?;
     let lhs_numeral = match lhs_desc.kind {
         ExprKind::Numeral(n) if !lhs_desc.has_jumps() && imm_packs(n) => Some(n),
