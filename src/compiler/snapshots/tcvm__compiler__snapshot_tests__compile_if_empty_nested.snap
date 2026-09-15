@@ -12,4 +12,4 @@ expression: output
 0001  [  4]  LOAD            R0 K0  ; nil
 0002  [  4]  LOAD            R1 K0  ; nil
 0003  [  4]  LOAD            R2 K0  ; nil
-0004  [  7]  RETURN          R0 count=1
+0004  [  7]  RETURN0

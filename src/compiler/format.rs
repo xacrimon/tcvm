@@ -261,6 +261,11 @@ fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -> String {
             let (values, count) = instr.ab();
             format!("RETURN          R{values} count={count}")
         }
+        Op::RETURN0 => "RETURN0".to_string(),
+        Op::RETURN1 => {
+            let value = instr.a();
+            format!("RETURN1         R{value}")
+        }
         Op::FORLOOP => {
             let (base, offset) = instr.a_imm();
             format!("FORLOOP         R{base} {offset:+}")

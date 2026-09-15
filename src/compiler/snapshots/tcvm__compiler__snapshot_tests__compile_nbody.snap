@@ -215,7 +215,7 @@ expression: output
 0154  [123]  CALL            R16 args=0 ret=2
 0155  [123]  LOAD            R17 K49  ; "\n"
 0156  [123]  CALL            R15 args=3 ret=1
-0157  [123]  RETURN          R0 count=1
+0157  [123]  RETURN0
 
 ; prototype 0:
   ; function (params=3, vararg=false, stack=29, upvalues=1)
@@ -311,7 +311,7 @@ expression: output
   0077  [ 80]  ADD             R8 R8 R9
   0078  [ 80]  SETFIELD        R8 R7 K3  ; "z"
   0079  [ 76]  FORLOOP         R3 -17
-  0080  [ 82]  RETURN          R0 count=1
+  0080  [ 82]  RETURN0
 
 ; prototype 1:
   ; function (params=2, vararg=false, stack=23, upvalues=1)
@@ -373,7 +373,7 @@ expression: output
   0042  [ 95]  SUB             R2 R2 R21
   0043  [ 91]  FORLOOP         R12 -22
   0044  [ 87]  FORLOOP         R3 -40
-  0045  [ 98]  RETURN          R2 count=2
+  0045  [ 98]  RETURN1         R2
 
 ; prototype 2:
   ; function (params=2, vararg=false, stack=12, upvalues=1)
@@ -424,4 +424,4 @@ expression: output
   0034  [113]  GETUPVAL        R7 U0
   0035  [113]  DIV             R6 R6 R7
   0036  [113]  SETFIELD        R6 R5 K5  ; "vz"
-  0037  [114]  RETURN          R0 count=1
+  0037  [114]  RETURN0

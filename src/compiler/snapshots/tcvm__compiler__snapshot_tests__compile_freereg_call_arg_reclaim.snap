@@ -31,9 +31,9 @@ expression: output
 0018  [  3]  LOAD            R3 K2  ; 3
 0019  [  3]  GETTABLE        R3 R1 R3
 0020  [  3]  ADD             R2 R2 R3
-0021  [  3]  RETURN          R2 count=2
+0021  [  3]  RETURN1         R2
 
 ; prototype 0:
   ; function (params=1, vararg=false, stack=1, upvalues=0)
   ; code:
-  0000  [  1]  RETURN          R0 count=2
+  0000  [  1]  RETURN1         R0

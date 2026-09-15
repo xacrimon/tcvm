@@ -28,4 +28,4 @@ expression: output
 0009  [ 13]  SETTABUP        R0 U0 K5  ; "c"
 0010  [ 14]  LOAD            R0 K8  ; 7
 0011  [ 14]  SETTABUP        R0 U0 K7  ; "d"
-0012  [ 14]  RETURN          R0 count=1
+0012  [ 14]  RETURN0

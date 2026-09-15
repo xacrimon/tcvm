@@ -11,13 +11,13 @@ expression: output
 0000  [  1]  VARARGPREP      fixed=0
 0001  [  4]  LOAD            R0 K0  ; 7
 0002  [ 11]  CLOSURE         R1 P0
-0003  [ 13]  RETURN          R1 count=2
+0003  [ 13]  RETURN1         R1
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=1, upvalues=0)
   ; code:
   0000  [  9]  CLOSURE         R0 P0
-  0001  [ 10]  RETURN          R0 count=2
+  0001  [ 10]  RETURN1         R0
 
   ; prototype 0:
     ; function (params=0, vararg=false, stack=1, upvalues=0)
@@ -25,4 +25,4 @@ expression: output
     ;   K0 = 8
     ; code:
     0000  [  8]  LOAD            R0 K0  ; 8
-    0001  [  8]  RETURN          R0 count=2
+    0001  [  8]  RETURN1         R0
