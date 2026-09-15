@@ -102,7 +102,7 @@ expression: output
   ; code:
   0000  [ 42]  GETUPVAL        R0 U0
   0001  [ 42]  CALL            R0 args=1 ret=2
-  0002  [ 42]  RETURN          R0 count=2
+  0002  [ 42]  RETURN1         R0
 
 ; prototype 5:
   ; function (params=0, vararg=false, stack=1, upvalues=1)

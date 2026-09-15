@@ -1570,12 +1570,12 @@ fn compile_function_to_chunk<'gc, 'a>(
     let last_pc = ctx.chunk.tape.len();
     let last_is_terminator = matches!(
         ctx.chunk.tape.last().map(|i| i.op()),
-        Some(Op::RETURN | Op::TAILCALL),
+        Some(Op::RETURN | Op::RETURN0 | Op::RETURN1 | Op::TAILCALL),
     );
     let needs_return = last_pc <= ctx.chunk.last_target || !last_is_terminator;
     ctx.cur_line = span.end;
     if needs_return {
-        ctx.emit(Instruction::ret(Reg(0), 1));
+        ctx.emit(Instruction::ret0());
     }
 
     if let Some(reg) = ctx.pop_scope()? {
@@ -4006,7 +4006,7 @@ fn compile_return(ctx: &mut Ctx, item: Return) -> Result<(), CompileError> {
 /// doesn't qualify for `TAILCALL`.
 fn compile_return_generic(ctx: &mut Ctx, mut exprs: Vec<Expr>) -> Result<(), CompileError> {
     if exprs.is_empty() {
-        ctx.emit(Instruction::ret(Reg(0), 1));
+        ctx.emit(Instruction::ret0());
         return Ok(());
     }
 
@@ -4029,7 +4029,7 @@ fn compile_return_generic(ctx: &mut Ctx, mut exprs: Vec<Expr>) -> Result<(), Com
         if !desc.has_jumps()
             && let ExprKind::Reg(reg) = desc.kind
         {
-            ctx.emit(Instruction::ret(reg, 2));
+            ctx.emit(Instruction::ret1(reg));
             return Ok(());
         }
         // Fall through to the generic path, discharging through a fresh
@@ -4039,7 +4039,7 @@ fn compile_return_generic(ctx: &mut Ctx, mut exprs: Vec<Expr>) -> Result<(), Com
         if reg != first_reg {
             ctx.emit(Instruction::mov(first_reg, reg));
         }
-        ctx.emit(Instruction::ret(first_reg, 2));
+        ctx.emit(Instruction::ret1(first_reg));
         return Ok(());
     }
 

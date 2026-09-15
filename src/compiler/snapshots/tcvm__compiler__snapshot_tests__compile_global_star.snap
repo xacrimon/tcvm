@@ -16,4 +16,4 @@ expression: output
 0003  [  3]  GETTABUP        R0 U0 K2  ; "print"
 0004  [  3]  GETTABUP        R1 U0 K0  ; "A"
 0005  [  3]  CALL            R0 args=2 ret=1
-0006  [  3]  RETURN          R0 count=1
+0006  [  3]  RETURN0

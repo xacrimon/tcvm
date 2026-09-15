@@ -51,7 +51,7 @@ expression: output
   ; function (params=1, vararg=true, stack=2, upvalues=0)
   ; code:
   0000  [  3]  VARARGPREP      fixed=1
-  0001  [  3]  RETURN          R1 count=2
+  0001  [  3]  RETURN1         R1
 
 ; prototype 2:
   ; function (params=0, vararg=true, stack=1, upvalues=0)
@@ -64,4 +64,4 @@ expression: output
   ; function (params=0, vararg=true, stack=1, upvalues=0)
   ; code:
   0000  [  5]  VARARGPREP      fixed=0
-  0001  [  5]  RETURN          R0 count=2
+  0001  [  5]  RETURN1         R0

@@ -18,4 +18,4 @@ expression: output
 0004  [  7]  GETTABUP        R1 U0 K3  ; "print"
 0005  [  7]  MOVE            R2 R0
 0006  [  7]  CALL            R1 args=2 ret=1
-0007  [  7]  RETURN          R0 count=1
+0007  [  7]  RETURN0

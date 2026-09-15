@@ -15,4 +15,4 @@ expression: output
 0002  [  1]  SETTABUP        R0 U0 K0  ; "num"
 0003  [  2]  LOAD            R0 K2  ; -5
 0004  [  2]  SETTABUP        R0 U0 K0  ; "num"
-0005  [  2]  RETURN          R0 count=1
+0005  [  2]  RETURN0

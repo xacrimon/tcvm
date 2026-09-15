@@ -46,4 +46,4 @@ expression: output
 0022  [ 20]  LOAD            R0 K13  ; "abc"
 0023  [ 20]  LEN             R0 R0
 0024  [ 20]  SETTABUP        R0 U0 K12  ; "h"
-0025  [ 20]  RETURN          R0 count=1
+0025  [ 20]  RETURN0

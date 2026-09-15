@@ -787,6 +787,11 @@ instructions! {
     0x4b LEI        lei         AbImm { src: Reg, inverted: bool, imm: Imm }
     0x4c GTI        gti         AbImm { src: Reg, inverted: bool, imm: Imm }
     0x4d GEI        gei         AbImm { src: Reg, inverted: bool, imm: Imm }
+
+    /// `return` / `return R[value]`: the two shapes nearly every return takes,
+    /// with the count baked in so the handler has nothing to decode or test.
+    0x4e RETURN0    ret0        Nil   { }
+    0x4f RETURN1    ret1        A     { value: Reg }
 }
 
 /// Describes how to capture an upvalue when creating a closure.

@@ -20,4 +20,4 @@ expression: output
 0005  [ 10]  SETTABUP        R0 U0 K2  ; "a"
 0006  [ 11]  SETTABUP        R1 U0 K3  ; "b"
 0007  [ 12]  SETTABUP        R2 U0 K4  ; "c"
-0008  [ 12]  RETURN          R0 count=1
+0008  [ 12]  RETURN0

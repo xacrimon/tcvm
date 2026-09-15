@@ -81,4 +81,4 @@ expression: output
 0036  [ 30]  SETTABUP        R0 U0 K33  ; "r"
 0037  [ 31]  LOAD            R0 K32  ; true
 0038  [ 31]  SETTABUP        R0 U0 K34  ; "s"
-0039  [ 31]  RETURN          R0 count=1
+0039  [ 31]  RETURN0
