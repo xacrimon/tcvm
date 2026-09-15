@@ -42,7 +42,11 @@ pub enum ThreadStatus {
 pub struct LuaFrame<'gc> {
     pub closure: Gc<'gc, LuaClosure<'gc>>,
     pub base: usize,
-    pub pc: usize,
+    /// Resume address: points *past* the instruction being executed, into
+    /// `closure.proto.code` (which the frame keeps alive). A raw pointer
+    /// rather than an index so CALL saves it with one store.
+    #[collect(require_static)]
+    pub pc: *const crate::instruction::Instruction,
     pub num_results: u8,
     /// Caller-supplied args beyond `num_params`; the below-base region is
     /// `stack[base - num_extras .. base]`. Set by `VARARGPREP`, else 0.
@@ -78,6 +82,16 @@ pub struct CallSite {
     /// has no Lua frame to park the continuation on. `None` for ordinary
     /// calls, where `func_idx`/`returns` drive the landing.
     pub cont: Option<Continuation>,
+}
+
+impl<'gc> LuaFrame<'gc> {
+    /// `pc` as an index into `closure.proto.code`.
+    pub fn pc_index(&self) -> usize {
+        unsafe {
+            self.pc
+                .offset_from_unsigned(self.closure.proto.code.as_ptr())
+        }
+    }
 }
 
 /// A frame on a thread's frame stack. The interpreter only pushes

@@ -553,7 +553,7 @@ fn schedule_call_at<'gc>(
         ts.push_lua(LuaFrame {
             closure,
             base,
-            pc: 0,
+            pc: closure.proto.code.as_ptr(),
             num_results: caller_returns,
             num_extras,
             continuation: None,
@@ -903,7 +903,7 @@ fn apply_native_continuation<'gc>(
             let truthy = !result0.is_falsy();
             if truthy != inverted {
                 let frame = ts.top_lua_mut().unwrap();
-                frame.pc = (frame.pc as i64 + offset as i64) as usize;
+                frame.pc = unsafe { frame.pc.offset(offset as isize) };
             }
         }
         ContinuationPayload::TForCall { base: reg, count } => {
