@@ -3426,11 +3426,20 @@ pub(crate) fn frame_return<'gc>(
 
 /// Close all open upvalues pointing at stack indices >= `start_idx`.
 /// Each open upvalue is converted to Closed by capturing the current stack value.
+/// Inlined so the usual no-open-upvalues return costs one load, not a call.
+#[inline(always)]
 pub(crate) fn close_upvalues<'gc>(
     mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     start_idx: usize,
 ) {
+    if !thread.open_upvalues.is_empty() {
+        close_upvalues_slow(mc, thread, start_idx);
+    }
+}
+
+#[inline(never)]
+fn close_upvalues_slow<'gc>(mc: &Mutation<'gc>, thread: &mut ThreadState<'gc>, start_idx: usize) {
     thread.open_upvalues.retain(|uv| {
         let should_close = {
             let borrowed = uv.borrow();
@@ -3632,8 +3641,27 @@ pub(crate) enum MetaDispatch<'gc> {
 /// Returns the resolved target and the (possibly adjusted) `nargs`, or
 /// `None` if the chain is unresolvable: non-callable value, `nargs`
 /// overflow, or `MAX_TAG_LOOP` exhaustion. Callers raise on `None`.
-#[inline]
+#[inline(always)]
 fn resolve_call_chain<'gc>(
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    func_idx: usize,
+    nargs: u8,
+) -> Option<(CallTarget<'gc>, u8)> {
+    // Plain functions are the overwhelmingly common case; keep the `__call`
+    // walk (and its stack frame) out of the handler.
+    if let Some(f) = thread.stack[func_idx].get_function() {
+        return match f.inner().as_ref() {
+            FunctionKind::Lua(c) => Some((CallTarget::Lua(*c), nargs)),
+            FunctionKind::Native(nc) => Some((CallTarget::Native(nc), nargs)),
+        };
+    }
+    resolve_call_chain_slow(ctx, thread, func_idx, nargs)
+}
+
+#[cold]
+#[inline(never)]
+fn resolve_call_chain_slow<'gc>(
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
     func_idx: usize,
