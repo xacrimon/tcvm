@@ -1,13 +1,13 @@
-use crate::dmm::{Gc, Lock, Mutation, RefLock};
+use crate::dmm::{Gc, Mutation, RefLock};
 use crate::env::function::{
-    Function, FunctionKind, InlineCache, LuaClosure, NativeClosure, NativeContext, Stack, Upvalue,
-    UpvalueState,
+    FastCall, Function, FunctionKind, InlineCache, LuaFn, NativeClosure, NativeContext, Stack,
+    Upvalue, UpvalueState,
 };
 use crate::env::shape::{MetamethodBits, Shape};
 use crate::env::string::LuaString;
 use crate::env::table::Table;
 use crate::env::thread::{
-    CallSite, Frame, LuaFrame, PendingAction, Thread, ThreadState, ThreadStatus,
+    CallSite, Frame, LuaFrame, PendingAction, Thread, ThreadState, ThreadStatus, frame_flags,
 };
 use crate::env::value::{Value, ValueKind};
 use crate::instruction::{Instruction, Op, UpValueDescriptor};
@@ -56,6 +56,8 @@ static HANDLERS: [Handler; Op::COUNT] = Op::table([
     (Op::CALL, op_call),
     (Op::TAILCALL, op_tailcall),
     (Op::RETURN, op_return),
+    (Op::RETURN0, op_return0),
+    (Op::RETURN1, op_return1),
     (Op::FORLOOP, op_forloop),
     (Op::FORPREP, op_forprep),
     (Op::TFORPREP, op_tforprep),
@@ -131,39 +133,17 @@ pub(crate) type Registers<'gc, 'a> = *mut Value<'gc>;
 pub(crate) struct DispatchState<'gc> {
     /// Set by `raise!` right before it tail-calls `impl_error`, which takes it.
     fault: Option<OpError<'gc>>,
-    /// The running closure's constant pool, upvalue array and inline-cache
-    /// table, so `constant!`, `upvalue!` and `read_ic` are one load off `ds`
-    /// instead of a five-deep chase through `thread.frames`. Valid because
-    /// the frame keeps the closure alive; every site that changes the top
-    /// Lua frame and keeps dispatching must `bind` the new closure alongside
-    /// `registers`.
-    constants: *const Value<'gc>,
-    upvalues: *const Upvalue<'gc>,
-    ic_table: *const Lock<InlineCache<'gc>>,
 }
 
-impl<'gc> DispatchState<'gc> {
-    fn bind(&mut self, closure: &LuaClosure<'gc>) {
-        self.constants = closure.proto.constants.as_ptr();
-        self.upvalues = closure.upvalues.as_ptr();
-        self.ic_table = closure.proto.ic_table.as_ptr();
-    }
-
-    /// Debug check that the cache matches the top frame's closure: catches a
-    /// frame change that forgot to `bind`, which the bounds checks alone
-    /// would not (a stale pool is usually long enough for the index).
-    #[inline(always)]
-    fn debug_assert_bound(&self, thread: &ThreadState<'gc>) {
-        if cfg!(debug_assertions) {
-            let closure = &thread.top_lua().unwrap().closure;
-            debug_assert!(std::ptr::eq(
-                self.constants,
-                closure.proto.constants.as_ptr()
-            ));
-            debug_assert!(std::ptr::eq(self.upvalues, closure.upvalues.as_ptr()));
-            debug_assert!(std::ptr::eq(self.ic_table, closure.proto.ic_table.as_ptr()));
-        }
-    }
+/// The thread's top frame, which must be a Lua frame, and its closure. Both
+/// travel with the handler arguments (registers), so every site that changes
+/// the top frame and keeps dispatching reassigns `frame` and `closure` from
+/// this. The pointer is into `thread.frames`' buffer, which any push may
+/// reallocate.
+#[inline(always)]
+fn top_frame<'gc>(thread: &mut ThreadState<'gc>) -> (*mut LuaFrame<'gc>, LuaFn<'gc>) {
+    let frame: *mut LuaFrame<'gc> = unsafe { thread.top_lua_unchecked_mut() };
+    (frame, unsafe { (*frame).closure })
 }
 
 /// Every dispatch target (handler, slow path, continuation) carries
@@ -179,6 +159,8 @@ pub(crate) type Handler = for<'gc> extern "rust-preserve-none" fn(
     ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 );
 
 /// A pending fixup attached to a callee frame. When `op_return` sees this on
@@ -211,7 +193,14 @@ pub(crate) enum ContinuationPayload {
 }
 
 macro_rules! helpers {
-    ($instruction:expr, $ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr, $ds:ident) => {
+    ($instruction:expr, $ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr, $ds:ident, $frame:ident, $closure:ident) => {
+        // The running frame and its closure travel in registers with the
+        // other handler arguments; rebinding them (calls, returns) reassigns
+        // these locals.
+        #[allow(unused_mut)]
+        let mut $frame: *mut LuaFrame<'gc> = $frame;
+        #[allow(unused_mut)]
+        let mut $closure: LuaFn<'gc> = $closure;
         #[allow(unused_macros)]
         macro_rules! dispatch {
             () => {{
@@ -230,7 +219,17 @@ macro_rules! helpers {
                     debug_assert!(pos < HANDLERS.len());
                     let handler = *$handlers.cast::<Handler>().add(pos);
                     let ip = $ip.add(1);
-                    become handler(instruction, $ctx, $thread, $registers, ip, $handlers, $ds);
+                    become handler(
+                        instruction,
+                        $ctx,
+                        $thread,
+                        $registers,
+                        ip,
+                        $handlers,
+                        $ds,
+                        $frame,
+                        $closure,
+                    );
                 }
             }};
         }
@@ -256,7 +255,17 @@ macro_rules! helpers {
             ($$kind:expr) => {{
                 std::hint::cold_path();
                 $ds.fault = Some($$kind);
-                become impl_error($instruction, $ctx, $thread, $registers, $ip, $handlers, $ds);
+                become impl_error(
+                    $instruction,
+                    $ctx,
+                    $thread,
+                    $registers,
+                    $ip,
+                    $handlers,
+                    $ds,
+                    $frame,
+                    $closure,
+                );
             }};
         }
 
@@ -273,12 +282,11 @@ macro_rules! helpers {
         macro_rules! constant {
             ($$idx:expr) => {{
                 unsafe {
-                    $ds.debug_assert_bound($thread);
                     debug_assert!(
                         ($$idx as usize)
                             < $thread.top_lua_unchecked().closure.proto.constants.len()
                     );
-                    *$ds.constants.add($$idx as usize)
+                    *$closure.constants.add($$idx as usize)
                 }
             }};
         }
@@ -287,11 +295,10 @@ macro_rules! helpers {
         macro_rules! upvalue {
             ($$idx:expr) => {{
                 unsafe {
-                    $ds.debug_assert_bound($thread);
                     debug_assert!(
                         ($$idx as usize) < $thread.top_lua_unchecked().closure.upvalues.len()
                     );
-                    *$ds.upvalues.add($$idx as usize)
+                    *$closure.upvalues.as_ptr().add($$idx as usize)
                 }
             }};
         }
@@ -339,13 +346,9 @@ macro_rules! helpers {
                 let __mm_meta: Value<'gc> = $$meta;
                 let __mm_cont: Continuation = $$cont;
                 match schedule_meta_call($ctx, $thread, __mm_meta, $$args, __mm_cont, $ip) {
-                    MetaDispatch::Lua {
-                        new_ip,
-                        new_base,
-                        closure,
-                    } => {
+                    MetaDispatch::Lua { new_ip, new_base } => {
                         $ip = new_ip;
-                        $ds.bind(&closure);
+                        ($frame, $closure) = top_frame($thread);
                         $registers = unsafe { $thread.stack.as_mut_ptr().add(new_base) };
                         dispatch!();
                     }
@@ -575,21 +578,11 @@ macro_rules! table_set_slow_body {
 /// `SETTABUP` instruction whose prototype was assembled with a matching
 /// `ic_table` length.
 #[inline(always)]
-fn read_ic<'gc>(
-    ds: &DispatchState<'gc>,
-    thread: &ThreadState<'gc>,
-    ic_idx: u16,
-) -> InlineCache<'gc> {
+fn read_ic<'gc>(closure: LuaFn<'gc>, ic_idx: u16) -> InlineCache<'gc> {
     // SAFETY: ic_idx is allocated at compile-time within the prototype's
     // IC count; debug-asserted in alloc_ic_slot's saturating_add.
-    ds.debug_assert_bound(thread);
-    debug_assert!(
-        (ic_idx as usize)
-            < unsafe { &thread.top_lua_unchecked().closure.proto }
-                .ic_table
-                .len()
-    );
-    unsafe { (*ds.ic_table.add(ic_idx as usize)).get() }
+    debug_assert!((ic_idx as usize) < closure.proto.ic_table.len());
+    unsafe { (*closure.ic_table.add(ic_idx as usize)).get() }
 }
 
 /// Refill the IC entry. Called by slow paths after they've done a full
@@ -666,21 +659,11 @@ fn fill_ic_for_constant_key<'gc>(
 #[inline(never)]
 pub(crate) fn run_thread<'gc>(ctx: Context<'gc>, thread: Thread<'gc>) {
     let mut ts = thread.borrow_mut(ctx.mutation());
-    let mut ds = DispatchState {
-        fault: None,
-        constants: std::ptr::null(),
-        upvalues: std::ptr::null(),
-        ic_table: std::ptr::null(),
-    };
-    let (ip, base) = {
-        let frame = ts
-            .top_lua()
-            .expect("run_thread requires a seeded Lua frame");
-        ds.bind(&frame.closure);
-        let code_ptr = frame.closure.proto.code.as_ptr();
-        let ip = unsafe { code_ptr.add(frame.pc) };
-        (ip, frame.base)
-    };
+    let mut ds = DispatchState { fault: None };
+    ts.top_lua()
+        .expect("run_thread requires a seeded Lua frame");
+    let (frame, closure) = top_frame(&mut ts);
+    let (ip, base) = unsafe { ((*frame).pc, (*frame).base) };
     let registers = unsafe { ts.stack.as_mut_ptr().add(base) };
     let handlers = HANDLERS.as_ptr() as *const ();
     op_nop(
@@ -691,6 +674,8 @@ pub(crate) fn run_thread<'gc>(ctx: Context<'gc>, thread: Thread<'gc>) {
         ip,
         handlers,
         &mut ds,
+        frame,
+        closure,
     );
 }
 
@@ -713,6 +698,8 @@ extern "rust-preserve-none" fn impl_error<'gc>(
     ip: *const Instruction,
     _handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    _frame: *mut LuaFrame<'gc>,
+    _closure: LuaFn<'gc>,
 ) {
     let kind = ds.fault.take().expect("impl_error without a pending fault");
     // `ip` already points past the faulting instruction (see `dispatch!`),
@@ -736,8 +723,20 @@ extern "rust-preserve-none" fn op_move<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (dst, src) = instruction.ab();
     *reg!(ref mut dst) = reg!(src);
     dispatch!();
@@ -754,8 +753,20 @@ extern "rust-preserve-none" fn op_load<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (dst, idx) = instruction.ad();
     *reg!(ref mut dst) = constant!(idx);
     dispatch!();
@@ -772,8 +783,20 @@ extern "rust-preserve-none" fn op_lfalseskip<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let src = instruction.a();
     *reg!(ref mut src) = Value::boolean(false);
     skip!();
@@ -794,8 +817,20 @@ extern "rust-preserve-none" fn op_getupval<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (dst, idx) = instruction.ab();
     let uv = upvalue!(idx);
     *reg!(ref mut dst) = read_upvalue(thread, uv);
@@ -812,8 +847,20 @@ extern "rust-preserve-none" fn op_setupval<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (src, idx) = instruction.ab();
     let val = reg!(src);
     let uv = upvalue!(idx);
@@ -836,8 +883,20 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (dst, idx, ic_idx, _key) = instruction.abde();
     let uv = upvalue!(idx);
     let t_val = read_upvalue(thread, uv);
@@ -846,7 +905,7 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
         raise!(OpError::Index(t_val));
     };
 
-    let cache = read_ic(ds, thread, ic_idx);
+    let cache = read_ic(closure, ic_idx);
     let t_state = t.inner().borrow();
     if let Some(slot) = ic_check(cache, t_state.shape()) {
         if slot != InlineCache::ABSENT_SLOT {
@@ -859,7 +918,17 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
         }
     }
     drop(t_state);
-    become gettabup_slow(instruction, ctx, thread, registers, ip, handlers, ds);
+    become gettabup_slow(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure,
+    );
 }
 
 #[inline(never)]
@@ -872,8 +941,20 @@ extern "rust-preserve-none" fn gettabup_slow<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (dst, idx, ic_idx, key) = instruction.abde();
     let uv = upvalue!(idx);
     let t_val = read_upvalue(thread, uv);
@@ -896,8 +977,20 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (src, idx, ic_idx, key) = instruction.abde();
     let uv = upvalue!(idx);
     let t_val = read_upvalue(thread, uv);
@@ -907,7 +1000,7 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
     };
 
     let v = reg!(src);
-    let cache = read_ic(ds, thread, ic_idx);
+    let cache = read_ic(closure, ic_idx);
     let t_state = t.inner().borrow();
     if let Some(slot) = ic_check(cache, t_state.shape()) {
         if slot != InlineCache::ABSENT_SLOT {
@@ -923,7 +1016,17 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
         }
     }
     drop(t_state);
-    become settabup_slow(instruction, ctx, thread, registers, ip, handlers, ds);
+    become settabup_slow(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure,
+    );
 }
 
 #[inline(never)]
@@ -936,8 +1039,20 @@ extern "rust-preserve-none" fn settabup_slow<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (src, idx, ic_idx, key) = instruction.abde();
     let uv = upvalue!(idx);
     let t_val = read_upvalue(thread, uv);
@@ -965,13 +1080,35 @@ extern "rust-preserve-none" fn op_gettable<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (dst, table, key) = instruction.abc();
 
     let Some(t) = reg!(table).get_table() else {
         // Non-table (userdata `__index`, or error) — handled by the slow path.
-        become gettable_slow(instruction, ctx, thread, registers, ip, handlers, ds);
+        become gettable_slow(
+            instruction,
+            ctx,
+            thread,
+            registers,
+            ip,
+            handlers,
+            ds,
+            frame,
+            closure,
+        );
     };
 
     let k = reg!(key);
@@ -983,7 +1120,17 @@ extern "rust-preserve-none" fn op_gettable<'gc>(
     };
 
     if need_index {
-        become gettable_slow(instruction, ctx, thread, registers, ip, handlers, ds);
+        become gettable_slow(
+            instruction,
+            ctx,
+            thread,
+            registers,
+            ip,
+            handlers,
+            ds,
+            frame,
+            closure,
+        );
     }
 
     *reg!(ref mut dst) = v;
@@ -1000,8 +1147,20 @@ extern "rust-preserve-none" fn gettable_slow<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (dst, table, key) = instruction.abc();
     let recv = reg!(table);
     let k = reg!(key);
@@ -1025,8 +1184,20 @@ extern "rust-preserve-none" fn op_settable<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (src, table, key) = instruction.abc();
 
     let Some(t) = reg!(table).get_table() else {
@@ -1041,7 +1212,17 @@ extern "rust-preserve-none" fn op_settable<'gc>(
     };
 
     if needs_newindex {
-        become settable_slow(instruction, ctx, thread, registers, ip, handlers, ds);
+        become settable_slow(
+            instruction,
+            ctx,
+            thread,
+            registers,
+            ip,
+            handlers,
+            ds,
+            frame,
+            closure,
+        );
     }
 
     check_index_key!(k);
@@ -1060,8 +1241,20 @@ extern "rust-preserve-none" fn settable_slow<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (src, table, key) = instruction.abc();
     let Some(t) = reg!(table).get_table() else {
         raise!(OpError::Index(reg!(table)));
@@ -1082,16 +1275,38 @@ extern "rust-preserve-none" fn op_getfield<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (dst, table, ic_idx, _key_idx) = instruction.abde();
 
     let Some(t) = reg!(table).get_table() else {
         // Non-table (userdata `__index`, or error) — handled by the slow path.
-        become getfield_slow(instruction, ctx, thread, registers, ip, handlers, ds);
+        become getfield_slow(
+            instruction,
+            ctx,
+            thread,
+            registers,
+            ip,
+            handlers,
+            ds,
+            frame,
+            closure,
+        );
     };
 
-    let cache = read_ic(ds, thread, ic_idx);
+    let cache = read_ic(closure, ic_idx);
     let t_state = t.inner().borrow();
     if let Some(slot) = ic_check(cache, t_state.shape()) {
         if slot != InlineCache::ABSENT_SLOT {
@@ -1104,7 +1319,17 @@ extern "rust-preserve-none" fn op_getfield<'gc>(
         }
     }
     drop(t_state);
-    become getfield_slow(instruction, ctx, thread, registers, ip, handlers, ds);
+    become getfield_slow(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure,
+    );
 }
 
 #[inline(never)]
@@ -1117,8 +1342,20 @@ extern "rust-preserve-none" fn getfield_slow<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (dst, table, ic_idx, key_idx) = instruction.abde();
     let recv = reg!(table);
     let k = constant!(key_idx);
@@ -1143,8 +1380,20 @@ extern "rust-preserve-none" fn op_setfield<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (src, table, ic_idx, key_idx) = instruction.abde();
 
     let Some(t) = reg!(table).get_table() else {
@@ -1152,7 +1401,7 @@ extern "rust-preserve-none" fn op_setfield<'gc>(
     };
 
     let v = reg!(src);
-    let cache = read_ic(ds, thread, ic_idx);
+    let cache = read_ic(closure, ic_idx);
     let t_state = t.inner().borrow();
     if let Some(slot) = ic_check(cache, t_state.shape()) {
         if slot != InlineCache::ABSENT_SLOT {
@@ -1167,7 +1416,17 @@ extern "rust-preserve-none" fn op_setfield<'gc>(
         }
     }
     drop(t_state);
-    become setfield_slow(instruction, ctx, thread, registers, ip, handlers, ds);
+    become setfield_slow(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure,
+    );
 }
 
 #[inline(never)]
@@ -1180,8 +1439,20 @@ extern "rust-preserve-none" fn setfield_slow<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (src, table, ic_idx, key_idx) = instruction.abde();
     let Some(t) = reg!(table).get_table() else {
         raise!(OpError::Index(reg!(table)));
@@ -1209,14 +1480,36 @@ extern "rust-preserve-none" fn op_self<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (dst, object, key_idx) = instruction.abd();
 
     let recv_val = reg!(object);
     let Some(recv) = recv_val.get_table() else {
         // Non-table receiver (userdata method dispatch, or an error).
-        become op_self_nontable(instruction, ctx, thread, registers, ip, handlers, ds);
+        become op_self_nontable(
+            instruction,
+            ctx,
+            thread,
+            registers,
+            ip,
+            handlers,
+            ds,
+            frame,
+            closure,
+        );
     };
 
     let key = constant!(key_idx);
@@ -1228,7 +1521,17 @@ extern "rust-preserve-none" fn op_self<'gc>(
     };
 
     if need_index {
-        become op_self_slow(instruction, ctx, thread, registers, ip, handlers, ds);
+        become op_self_slow(
+            instruction,
+            ctx,
+            thread,
+            registers,
+            ip,
+            handlers,
+            ds,
+            frame,
+            closure,
+        );
     }
 
     *reg!(ref mut dst) = method;
@@ -1246,8 +1549,20 @@ extern "rust-preserve-none" fn op_self_slow<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (dst, object, key_idx) = instruction.abd();
 
     let recv_val = reg!(object);
@@ -1296,8 +1611,20 @@ extern "rust-preserve-none" fn op_self_nontable<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (dst, object, key_idx) = instruction.abd();
 
     let recv_val = reg!(object);
@@ -1341,8 +1668,20 @@ extern "rust-preserve-none" fn op_newtable<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let dst = instruction.a();
     *reg!(ref mut dst) = Value::table(Table::new(ctx));
     dispatch!();
@@ -1365,8 +1704,20 @@ macro_rules! arith_handler {
             ip: *const Instruction,
             handlers: *const (),
             ds: &mut DispatchState<'gc>,
+            frame: *mut LuaFrame<'gc>,
+            closure: LuaFn<'gc>,
         ) {
-            helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+            helpers!(
+                instruction,
+                ctx,
+                thread,
+                registers,
+                ip,
+                handlers,
+                ds,
+                frame,
+                closure
+            );
             let (dst, lhs, rhs) = instruction.abc();
 
             // Testing that the tags match *before* either arm lets the
@@ -1400,7 +1751,17 @@ macro_rules! arith_handler {
                 }
             }
 
-            become $slow_name(instruction, ctx, thread, registers, ip, handlers, ds);
+            become $slow_name(
+                instruction,
+                ctx,
+                thread,
+                registers,
+                ip,
+                handlers,
+                ds,
+                frame,
+                closure,
+            );
         }
 
         binop_slow_handler!($slow_name, $instr, $num_kind, op_arith_mixed, $mm, Arith);
@@ -1420,8 +1781,20 @@ macro_rules! bit_handler {
             ip: *const Instruction,
             handlers: *const (),
             ds: &mut DispatchState<'gc>,
+            frame: *mut LuaFrame<'gc>,
+            closure: LuaFn<'gc>,
         ) {
-            helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+            helpers!(
+                instruction,
+                ctx,
+                thread,
+                registers,
+                ip,
+                handlers,
+                ds,
+                frame,
+                closure
+            );
             let (dst, lhs, rhs) = instruction.abc();
 
             // same-type int/float
@@ -1432,7 +1805,17 @@ macro_rules! bit_handler {
                 dispatch!();
             }
 
-            become $slow_name(instruction, ctx, thread, registers, ip, handlers, ds);
+            become $slow_name(
+                instruction,
+                ctx,
+                thread,
+                registers,
+                ip,
+                handlers,
+                ds,
+                frame,
+                closure,
+            );
         }
 
         binop_slow_handler!($slow_name, $instr, $num_kind, op_bit_mixed, $mm, Bitwise);
@@ -1451,8 +1834,20 @@ macro_rules! binop_slow_handler {
             mut ip: *const Instruction,
             handlers: *const (),
             ds: &mut DispatchState<'gc>,
+            frame: *mut LuaFrame<'gc>,
+            closure: LuaFn<'gc>,
         ) {
-            helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+            helpers!(
+                instruction,
+                ctx,
+                thread,
+                registers,
+                ip,
+                handlers,
+                ds,
+                frame,
+                closure
+            );
             let (dst, lhs, rhs) = instruction.abc();
             let (lhs, rhs) = (reg!(lhs), reg!(rhs));
             binop_slow_body!(
@@ -1527,8 +1922,20 @@ macro_rules! arith_imm_handler {
             ip: *const Instruction,
             handlers: *const (),
             ds: &mut DispatchState<'gc>,
+            frame: *mut LuaFrame<'gc>,
+            closure: LuaFn<'gc>,
         ) {
-            helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+            helpers!(
+                instruction,
+                ctx,
+                thread,
+                registers,
+                ip,
+                handlers,
+                ds,
+                frame,
+                closure
+            );
             let (dst, src, _) = instruction.abc_imm();
             let v = reg!(ref src);
 
@@ -1577,7 +1984,17 @@ macro_rules! arith_imm_handler {
                 }
             }
 
-            become $slow_name(instruction, ctx, thread, registers, ip, handlers, ds);
+            become $slow_name(
+                instruction,
+                ctx,
+                thread,
+                registers,
+                ip,
+                handlers,
+                ds,
+                frame,
+                closure,
+            );
         }
 
         binop_imm_slow_handler!($slow_name, $num_kind, op_arith_mixed, $mm, Arith, $swap);
@@ -1599,8 +2016,20 @@ macro_rules! bit_imm_handler {
             ip: *const Instruction,
             handlers: *const (),
             ds: &mut DispatchState<'gc>,
+            frame: *mut LuaFrame<'gc>,
+            closure: LuaFn<'gc>,
         ) {
-            helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+            helpers!(
+                instruction,
+                ctx,
+                thread,
+                registers,
+                ip,
+                handlers,
+                ds,
+                frame,
+                closure
+            );
             let (dst, src, _) = instruction.abc_imm();
             debug_assert!(instruction.imm_is_int());
             let k = instruction.imm_int();
@@ -1611,7 +2040,17 @@ macro_rules! bit_imm_handler {
                 dispatch!();
             }
 
-            become $slow_name(instruction, ctx, thread, registers, ip, handlers, ds);
+            become $slow_name(
+                instruction,
+                ctx,
+                thread,
+                registers,
+                ip,
+                handlers,
+                ds,
+                frame,
+                closure,
+            );
         }
 
         binop_imm_slow_handler!($slow_name, $num_kind, op_bit_mixed, $mm, Bitwise, $swap);
@@ -1630,8 +2069,20 @@ macro_rules! binop_imm_slow_handler {
             mut ip: *const Instruction,
             handlers: *const (),
             ds: &mut DispatchState<'gc>,
+            frame: *mut LuaFrame<'gc>,
+            closure: LuaFn<'gc>,
         ) {
-            helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+            helpers!(
+                instruction,
+                ctx,
+                thread,
+                registers,
+                ip,
+                handlers,
+                ds,
+                frame,
+                closure
+            );
             let (dst, src, flipped) = instruction.abc_imm();
             let (v, k) = (reg!(src), instruction.imm_value());
             let (lhs, rhs) = if $swap || flipped { (k, v) } else { (v, k) };
@@ -1678,8 +2129,20 @@ extern "rust-preserve-none" fn op_unm<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (dst, src) = instruction.ab();
     let val = reg!(src);
     if let Some(i) = val.get_integer() {
@@ -1714,8 +2177,20 @@ extern "rust-preserve-none" fn op_bnot<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (dst, src) = instruction.ab();
     let val = reg!(src);
     if let Some(i) = val.get_integer() {
@@ -1745,8 +2220,20 @@ extern "rust-preserve-none" fn op_not<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (dst, src) = instruction.ab();
     let val = reg!(src);
     *reg!(ref mut dst) = Value::boolean(val.is_falsy());
@@ -1764,8 +2251,20 @@ extern "rust-preserve-none" fn op_len<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (dst, src) = instruction.ab();
     let val = reg!(src);
 
@@ -1806,8 +2305,20 @@ extern "rust-preserve-none" fn op_concat<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (dst, lhs, rhs) = instruction.abc();
     let a = reg!(lhs);
     let b = reg!(rhs);
@@ -1844,10 +2355,22 @@ extern "rust-preserve-none" fn op_close<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let start = instruction.a();
-    let base = thread.top_lua().map_or(0, |f| f.base);
+    let base = unsafe { (*frame).base };
     let start_idx = base + start as usize;
     close_upvalues(ctx.mutation(), thread, start_idx);
     close_tbc_vars(ctx.mutation(), thread, start_idx);
@@ -1865,11 +2388,24 @@ extern "rust-preserve-none" fn op_tbc<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let val = instruction.a();
-    let base = thread.top_lua().map_or(0, |f| f.base);
+    let base = unsafe { (*frame).base };
     thread.tbc_slots.push(base + val as usize);
+    unsafe { (*frame).flags |= frame_flags::TBC };
     dispatch!();
 }
 
@@ -1888,8 +2424,20 @@ extern "rust-preserve-none" fn op_jmp<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let offset = instruction.imm();
     ip = unsafe { ip.offset(offset as isize) };
     dispatch!();
@@ -1906,8 +2454,20 @@ extern "rust-preserve-none" fn op_eq<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (lhs, rhs, inverted) = instruction.abc_flag();
 
     let a = reg!(lhs);
@@ -1953,8 +2513,20 @@ extern "rust-preserve-none" fn op_lt<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (lhs, rhs, inverted) = instruction.abc_flag();
 
     let primitive = {
@@ -2006,8 +2578,20 @@ extern "rust-preserve-none" fn op_le<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (lhs, rhs, inverted) = instruction.abc_flag();
 
     let primitive = {
@@ -2063,8 +2647,20 @@ macro_rules! cmp_imm_handler {
             mut ip: *const Instruction,
             handlers: *const (),
             ds: &mut DispatchState<'gc>,
+            frame: *mut LuaFrame<'gc>,
+            closure: LuaFn<'gc>,
         ) {
-            helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+            helpers!(
+                instruction,
+                ctx,
+                thread,
+                registers,
+                ip,
+                handlers,
+                ds,
+                frame,
+                closure
+            );
             let (src, inverted) = instruction.ab_imm_flag();
             let v = reg!(ref src);
 
@@ -2095,7 +2691,17 @@ macro_rules! cmp_imm_handler {
                 dispatch!();
             }
 
-            become $slow_name(instruction, ctx, thread, registers, ip, handlers, ds);
+            become $slow_name(
+                instruction,
+                ctx,
+                thread,
+                registers,
+                ip,
+                handlers,
+                ds,
+                frame,
+                closure,
+            );
         }
 
         #[inline(never)]
@@ -2108,8 +2714,20 @@ macro_rules! cmp_imm_handler {
             mut ip: *const Instruction,
             handlers: *const (),
             ds: &mut DispatchState<'gc>,
+            frame: *mut LuaFrame<'gc>,
+            closure: LuaFn<'gc>,
         ) {
-            helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+            helpers!(
+                instruction,
+                ctx,
+                thread,
+                registers,
+                ip,
+                handlers,
+                ds,
+                frame,
+                closure
+            );
             let (src, inverted) = instruction.ab_imm_flag();
             let (v, k) = (reg!(src), instruction.imm_value());
             let (a, b) = if $swap { (k, v) } else { (v, k) };
@@ -2182,8 +2800,20 @@ extern "rust-preserve-none" fn op_eqi<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (src, inverted) = instruction.ab_imm_flag();
     let v = reg!(ref src);
 
@@ -2224,8 +2854,20 @@ extern "rust-preserve-none" fn op_test<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (src, inverted) = instruction.ab_flag();
     let truthy = !reg!(src).is_falsy();
     skip_if!(truthy != inverted);
@@ -2244,8 +2886,20 @@ extern "rust-preserve-none" fn op_testset<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (dst, src, inverted) = instruction.abc_flag();
     let val = reg!(src);
     let truthy = !val.is_falsy();
@@ -2261,67 +2915,24 @@ extern "rust-preserve-none" fn op_testset<'gc>(
 // Function calls
 // ---------------------------------------------------------------------------
 
-/// R[func], ..., R[func+returns-2] = R[func](R[func+1], ..., R[func+args-1])
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn op_call<'gc>(
-    instruction: Instruction,
-    ctx: Context<'gc>,
-    thread: &mut ThreadState<'gc>,
-    mut registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
-    handlers: *const (),
-    ds: &mut DispatchState<'gc>,
-) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
-    let (func, nargs, returns) = instruction.abc();
-    let base = thread.top_lua().map_or(0, |f| f.base);
-    let func_idx = base + func as usize;
-    let Some((target, nargs)) = resolve_call_chain(ctx, thread, func_idx, nargs) else {
-        raise!(OpError::Call(thread.stack[func_idx]));
-    };
-
-    match target {
-        CallTarget::Lua(closure) => {
-            let new_base = func_idx + 1;
-            save_pc(thread, ip);
-            thread.ensure_slots(new_base + closure.proto.max_stack_size as usize);
-            // `nargs == 0` is the MULTRET sentinel: read the count from `thread.top`.
-            let caller_provided = if nargs == 0 {
-                thread.top - new_base
-            } else {
-                nargs as usize - 1
-            };
-            let num_params = closure.proto.num_params as usize;
-            for i in caller_provided..num_params {
-                thread.stack[new_base + i] = Value::nil();
-            }
-            let num_extras = if closure.proto.is_vararg {
-                caller_provided.saturating_sub(num_params) as u32
-            } else {
-                0
-            };
-            thread.push_lua(LuaFrame {
-                closure,
-                base: new_base,
-                pc: 0,
-                num_results: returns,
-                num_extras,
-                continuation: None,
-            });
-            ip = closure.proto.code.as_ptr();
-            ds.bind(&closure);
-            registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
-            dispatch!();
-        }
-        CallTarget::Native(nc) => {
+/// The native arm of CALL: run the callback inline and land its results at
+/// `func_idx`. Expands inside a handler body (needs its `dispatch!`).
+macro_rules! call_native {
+    ($nc:expr, $func_idx:expr, $nargs:expr, $returns:expr, $base:expr,
+     $ctx:ident, $thread:ident, $registers:ident, $ip:ident, $ds:ident, $frame:ident, $closure:ident) => {{
+        let nc = $nc;
+        let func_idx = $func_idx;
+        let nargs = $nargs;
+        let returns = $returns;
+        let base = $base;
+        {
             let args_base = func_idx + 1;
             let argc = if nargs == 0 {
-                thread.top - args_base
+                $thread.top - args_base
             } else {
                 nargs as usize - 1
             };
-            let action = match invoke_native(ctx, thread, nc, args_base, argc) {
+            let action = match invoke_native($ctx, $thread, nc, args_base, argc) {
                 Ok(a) => a,
                 Err(err) => {
                     // Push Frame::Error so the executor's unwinder finds
@@ -2329,8 +2940,8 @@ extern "rust-preserve-none" fn op_call<'gc>(
                     // PCallSequence under coroutine.resume). Persist
                     // caller's pc first so re-entry would work if anything
                     // catches and resumes.
-                    save_pc(thread, ip);
-                    thread.raise(ctx, err);
+                    unsafe { (*$frame).pc = $ip };
+                    $thread.raise($ctx, err);
                     return;
                 }
             };
@@ -2339,7 +2950,7 @@ extern "rust-preserve-none" fn op_call<'gc>(
                     // Result count comes via the logical top, not Vec::len:
                     // `invoke_native` never shrinks the shared stack, so the
                     // caller's register window is still fully covered.
-                    let retc = thread.top - args_base;
+                    let retc = $thread.top - args_base;
                     // Place results at stack[func_idx..] following Lua convention.
                     let wanted = if returns == 0 {
                         retc
@@ -2347,27 +2958,32 @@ extern "rust-preserve-none" fn op_call<'gc>(
                         returns as usize - 1
                     };
                     let to_copy = retc.min(wanted);
+                    // Results sit at `args_base = func_idx + 1`, one slot above
+                    // where they land, inside the window `invoke_native` covered;
+                    // a forward copy is in bounds and never reads a slot it
+                    // already wrote. The nil padding stays inside the caller's
+                    // frame, which the CALL that entered it sized the vec for.
+                    debug_assert!(args_base + to_copy <= $thread.stack.len());
+                    debug_assert!(func_idx + wanted <= $thread.stack.len());
+                    let stack = $thread.stack.as_mut_ptr();
                     for i in 0..to_copy {
-                        thread.stack[func_idx + i] = thread.stack[args_base + i];
+                        unsafe { *stack.add(func_idx + i) = *stack.add(args_base + i) };
                     }
                     for i in to_copy..wanted {
-                        thread.stack[func_idx + i] = Value::nil();
+                        unsafe { *stack.add(func_idx + i) = Value::nil() };
                     }
                     // Publish the logical top. For MULTRET this is the dynamic
-                    // count the next consumer reads; either way it nils the
-                    // function slot and the stale donor copies the down-shift
-                    // left above the results, which are dead scratch (a call's
-                    // function always sits at the caller's first free register).
-                    thread.set_top(func_idx + wanted);
-                    registers = unsafe { thread.stack.as_mut_ptr().add(base) };
+                    // count the next consumer reads.
+                    $thread.set_top_unchecked(func_idx + wanted);
+                    $registers = unsafe { $thread.stack.as_mut_ptr().add(base) };
                     dispatch!();
                 }
-                action => {
+                crate::vm::sequence::CallbackAction::Suspend(action) => {
                     // Suspension path: persist caller's pc, stash the
                     // action on the thread for the executor to translate
                     // into frame ops, then exit the dispatch chain.
-                    save_pc(thread, ip);
-                    thread.pending_action = Some(PendingAction {
+                    unsafe { (*$frame).pc = $ip };
+                    $thread.pending_action = Some(PendingAction {
                         action,
                         call_site: CallSite {
                             bottom: args_base,
@@ -2379,6 +2995,396 @@ extern "rust-preserve-none" fn op_call<'gc>(
                     return;
                 }
             }
+        }
+    }};
+}
+
+/// The Lua arm of CALL: push the callee's frame and continue in it. Shared by
+/// `op_call` and the `__call` slow path; expands inside a handler body so it can
+/// use that handler's `dispatch!`.
+macro_rules! call_lua {
+    // `grow`: make room for the callee's window and frame here (may call out).
+    // `nogrow`: the caller has already checked both (`op_call` tail-calls
+    // `op_call_grow` otherwise), so this arm stays call-free.
+    (grow, $($rest:tt)*) => {
+        call_lua!(@inner true, $($rest)*)
+    };
+    (nogrow, $($rest:tt)*) => {
+        call_lua!(@inner false, $($rest)*)
+    };
+    (@inner $grow:literal, $callee:expr, $func_idx:expr, $nargs:expr, $returns:expr,
+     $thread:ident, $registers:ident, $ip:ident, $ds:ident, $frame:ident, $closure:ident) => {{
+        let callee: LuaFn<'gc> = $callee;
+        let new_base = $func_idx + 1;
+        unsafe { (*$frame).pc = $ip };
+        if $grow {
+            $thread.ensure_slots(new_base + callee.max_stack_size as usize);
+        } else {
+            debug_assert!(
+                $thread.stack.len() >= new_base + callee.max_stack_size as usize
+            );
+        }
+        let num_params = callee.num_params as usize;
+        // Fixed-arg call with every parameter supplied is the common shape and
+        // needs no counting; the rest (MULTRET via `thread.top`, missing
+        // parameters, varargs) goes through the general accounting.
+        let num_extras = if std::hint::likely(
+            $nargs as usize > num_params && !callee.is_vararg,
+        ) {
+            0
+        } else {
+            // `nargs == 0` is the MULTRET sentinel: read the count from `thread.top`.
+            let caller_provided = if $nargs == 0 {
+                $thread.top - new_base
+            } else {
+                $nargs as usize - 1
+            };
+            // Inside the window sized above (grown here or checked by the
+            // caller), so no bounds check — its panic path is the only call
+            // this arm would otherwise make.
+            debug_assert!(new_base + num_params <= $thread.stack.len());
+            let stack = $thread.stack.as_mut_ptr();
+            for i in caller_provided..num_params {
+                unsafe { *stack.add(new_base + i) = Value::nil() };
+            }
+            if callee.is_vararg {
+                caller_provided.saturating_sub(num_params) as u32
+            } else {
+                0
+            }
+        };
+        $ip = callee.code;
+        let frame = LuaFrame {
+            closure: callee,
+            base: new_base,
+            pc: $ip,
+            num_results: $returns,
+            flags: 0,
+            num_extras,
+            continuation: None,
+        };
+        if $grow {
+            $thread.push_lua(frame);
+            ($frame, $closure) = top_frame($thread);
+        } else {
+            // The new frame sits one slot above the running one, and the
+            // closure is already in hand: no trip through `thread.frames`
+            // (whose length we just stored) to find either.
+            unsafe { $thread.push_lua_unchecked(frame) };
+            $frame = unsafe { LuaFrame::next_slot($frame) };
+            $closure = callee;
+        }
+        $registers = unsafe { $thread.stack.as_mut_ptr().add(new_base) };
+        dispatch!();
+    }};
+}
+
+/// R[func], ..., R[func+returns-2] = R[func](R[func+1], ..., R[func+args-1])
+///
+/// Only the plain-function cases live here: a Lua closure is entered inline,
+/// a native one is handed to `op_call_fast`/`op_call_native`, and anything
+/// that needs the `__call` chain goes to `op_call_meta`. Keeping every call
+/// out of this handler keeps it frameless.
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn op_call<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) {
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
+    let (func, nargs, returns) = instruction.abc();
+    if let Some(f) = reg!(func).get_function() {
+        match f.inner().as_ref() {
+            FunctionKind::Lua(target) => {
+                let func_idx = unsafe { (*frame).base } + func as usize;
+                let needed = func_idx + 1 + target.max_stack_size as usize;
+                if std::hint::unlikely(thread.stack.len() < needed || thread.frames_full()) {
+                    become op_call_grow(
+                        instruction,
+                        ctx,
+                        thread,
+                        registers,
+                        ip,
+                        handlers,
+                        ds,
+                        frame,
+                        closure,
+                    );
+                }
+                let callee = unsafe { LuaFn::from_function_unchecked(f) };
+                call_lua!(
+                    nogrow, callee, func_idx, nargs, returns, thread, registers, ip, ds, frame,
+                    closure
+                );
+            }
+            FunctionKind::Native(nc) => {
+                if nc.fast != FastCall::None {
+                    become op_call_fast(
+                        instruction,
+                        ctx,
+                        thread,
+                        registers,
+                        ip,
+                        handlers,
+                        ds,
+                        frame,
+                        closure,
+                    );
+                }
+                become op_call_native(
+                    instruction,
+                    ctx,
+                    thread,
+                    registers,
+                    ip,
+                    handlers,
+                    ds,
+                    frame,
+                    closure,
+                );
+            }
+        }
+    }
+    become op_call_meta(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure,
+    );
+}
+
+/// CALL of a Lua closure that needs the value stack or the frame stack grown
+/// first. Grows both (the only thing `op_call` cannot do without a stack
+/// frame), then re-enters `op_call`, which has not modified anything yet.
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn op_call_grow<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) {
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
+    let func = instruction.a();
+    let max_stack = match reg!(func).get_function().map(|f| f.inner().as_ref()) {
+        Some(FunctionKind::Lua(closure)) => closure.max_stack_size as usize,
+        _ => unreachable!("op_call_grow on a non-Lua callee"),
+    };
+    thread.ensure_slots(unsafe { (*frame).base } + func as usize + 1 + max_stack);
+    thread.reserve_frames(1);
+    // Both vecs may have moved: rebind the frame pointer and the register window.
+    (frame, closure) = top_frame(thread);
+    registers = unsafe { thread.stack.as_mut_ptr().add(unsafe { (*frame).base }) };
+    become op_call(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure,
+    );
+}
+
+/// CALL of a builtin with a `FastCall` kind: run the common shape inline,
+/// writing the result straight into the function slot. Any other shape (arg
+/// count, type) falls through to the full implementation via `op_call_native`.
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn op_call_fast<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) {
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
+    let (func, nargs, returns) = instruction.abc();
+    let fast = match reg!(func).get_function().map(|f| f.inner().as_ref()) {
+        Some(FunctionKind::Native(nc)) => nc.fast,
+        _ => FastCall::None,
+    };
+    if nargs == 2 {
+        let a = reg!(func + 1);
+        let result = match fast {
+            FastCall::Sqrt => a.get_float().map(|x| Value::float(x.sqrt())),
+            FastCall::Abs => match a.kind() {
+                ValueKind::Integer => a.get_integer().map(|i| Value::integer(i.wrapping_abs())),
+                ValueKind::Float => a.get_float().map(|x| Value::float(x.abs())),
+                _ => None,
+            },
+            FastCall::Floor | FastCall::Ceil => match a.kind() {
+                ValueKind::Integer => Some(a),
+                ValueKind::Float => a.get_float().map(|x| {
+                    let r = if fast == FastCall::Floor {
+                        x.floor()
+                    } else {
+                        x.ceil()
+                    };
+                    crate::builtin::util::num_to_value(r)
+                }),
+                _ => None,
+            },
+            FastCall::None => None,
+        };
+        if let Some(result) = result {
+            *reg!(ref mut func) = result;
+            if returns == 0 {
+                thread.set_top_unchecked(unsafe { (*frame).base } + func as usize + 1);
+            } else {
+                for i in 1..returns as usize - 1 {
+                    *reg!(ref mut func as usize + i) = Value::nil();
+                }
+            }
+            dispatch!();
+        }
+    }
+    become op_call_native(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure,
+    );
+}
+
+/// CALL of a plain native function (no `__call` chain involved).
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn op_call_native<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) {
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
+    let (func, nargs, returns) = instruction.abc();
+    let base = unsafe { (*frame).base };
+    let func_idx = base + func as usize;
+    let nc: &NativeClosure<'gc> = match reg!(func).get_function().map(|f| f.inner().as_ref()) {
+        Some(FunctionKind::Native(nc)) => nc,
+        _ => unreachable!("op_call_native on a non-native callee"),
+    };
+    call_native!(
+        nc, func_idx, nargs, returns, base, ctx, thread, registers, ip, ds, frame, closure
+    );
+}
+
+/// The `__call` slow path of CALL: walk the metamethod chain, then enter
+/// whatever it resolves to.
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn op_call_meta<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) {
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
+    let (func, nargs, returns) = instruction.abc();
+    let base = unsafe { (*frame).base };
+    let func_idx = base + func as usize;
+    let Some((target, nargs)) = resolve_call_chain(ctx, thread, func_idx, nargs) else {
+        raise!(OpError::Call(thread.stack[func_idx]));
+    };
+
+    match target {
+        CallTarget::Lua(callee) => {
+            call_lua!(
+                grow, callee, func_idx, nargs, returns, thread, registers, ip, ds, frame, closure
+            );
+        }
+        CallTarget::Native(nc) => {
+            call_native!(
+                nc, func_idx, nargs, returns, base, ctx, thread, registers, ip, ds, frame, closure
+            );
         }
     }
 }
@@ -2394,24 +3400,34 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (func, nargs) = instruction.ab();
-    let base = thread.top_lua().map_or(0, |f| f.base);
+    let base = unsafe { (*frame).base };
     let func_idx = base + func as usize;
     let Some((target, nargs)) = resolve_call_chain(ctx, thread, func_idx, nargs) else {
         raise!(OpError::Call(thread.stack[func_idx]));
     };
 
     match target {
-        CallTarget::Lua(closure) => {
+        CallTarget::Lua(callee) => {
             // Results must land in this frame's *original* func slot in its
             // caller. A vararg frame's VARARGPREP shifted base past the extras
             // at `[base - num_extras .. base]`, so that slot is below them.
-            let (cur_base, cur_num_extras) = {
-                let f = thread.top_lua().unwrap();
-                (f.base, f.num_extras as usize)
-            };
+            let (cur_base, cur_num_extras) =
+                unsafe { ((*frame).base, (*frame).num_extras as usize) };
             let caller_func_idx = cur_base - 1 - cur_num_extras;
             let new_base = caller_func_idx + 1;
             // Close upvalues before overwriting these slots with args, so an
@@ -2427,24 +3443,24 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
             for i in 0..nargs {
                 thread.stack[new_base + i] = thread.stack[src_start + i];
             }
-            let frame = thread.top_lua_mut().unwrap();
-            frame.closure = closure;
-            frame.pc = 0;
+            ip = callee.proto.code.as_ptr();
+            let frame = unsafe { &mut *frame };
+            frame.closure = callee;
+            frame.pc = ip;
             frame.base = new_base;
             // num_extras feeds the new frame's own VARARGPREP; num_results is
             // left as-is (still the original caller's expectation).
-            let num_params = closure.proto.num_params as usize;
-            frame.num_extras = if closure.proto.is_vararg {
+            let num_params = callee.proto.num_params as usize;
+            frame.num_extras = if callee.proto.is_vararg {
                 nargs.saturating_sub(num_params) as u32
             } else {
                 0
             };
-            thread.ensure_slots(new_base + closure.proto.max_stack_size as usize);
+            thread.ensure_slots(new_base + callee.proto.max_stack_size as usize);
             for i in nargs..num_params {
                 thread.stack[new_base + i] = Value::nil();
             }
-            ip = closure.proto.code.as_ptr();
-            ds.bind(&closure);
+            closure = callee;
             registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
             dispatch!();
         }
@@ -2477,7 +3493,7 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
                     // Result count via the logical top (the shared stack was
                     // never shrunk by the native call).
                     let retc = thread.top - args_base;
-                    match frame_return(ctx.mutation(), thread, args_base, retc) {
+                    match frame_return(ctx.mutation(), thread, frame, args_base, retc) {
                         FrameReturn::Continuation => {
                             become cont_resume(
                                 instruction,
@@ -2487,23 +3503,21 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
                                 ip,
                                 handlers,
                                 ds,
+                                frame,
+                                closure,
                             );
                         }
                         FrameReturn::TopLevel => return,
                         FrameReturn::ToNonLua => return,
-                        FrameReturn::Caller {
-                            new_base,
-                            new_ip,
-                            closure,
-                        } => {
+                        FrameReturn::Caller { new_base, new_ip } => {
                             ip = new_ip;
-                            ds.bind(&closure);
+                            (frame, closure) = top_frame(thread);
                             registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
                             dispatch!();
                         }
                     }
                 }
-                action => {
+                crate::vm::sequence::CallbackAction::Suspend(action) => {
                     // Tailcall + suspension: pop the tailcalling Lua frame
                     // (close upvalues / TBC vars) so any subsequent action
                     // lands on the caller's frame window. Capture the
@@ -2532,7 +3546,32 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
     }
 }
 
+/// The tail shared by the RETURN fast paths once the results are in place
+/// and `thread.top` is published: pop the frame and resume the Lua parent.
+macro_rules! return_to_parent {
+    ($thread:ident, $registers:ident, $ip:ident, $frame:ident, $closure:ident) => {{
+        // The top frame is `Frame::Lua` (it is the one we are running) and
+        // `LuaFrame` is `Copy`, so nothing needs dropping.
+        let n = $thread.frames.len();
+        unsafe { $thread.frames.set_len(n - 1) };
+        // The parent is the slot below (`flags` guaranteed it is a Lua frame),
+        // so it is reached from the frame register rather than through the
+        // length just stored.
+        $frame = unsafe { LuaFrame::prev_slot($frame) };
+        let (new_base, new_ip, parent) =
+            unsafe { ((*$frame).base, (*$frame).pc, (*$frame).closure) };
+        $closure = parent;
+        $ip = new_ip;
+        $registers = unsafe { $thread.stack.as_mut_ptr().add(new_base) };
+        dispatch!();
+    }};
+}
+
 /// return R[values], ..., R[values+count-2]
+///
+/// Fast path: a fixed number of results, no continuation, nothing to close,
+/// and a Lua caller. It makes no calls, so it needs no stack frame; every
+/// other shape goes to `op_return_slow`.
 #[inline(never)]
 #[rustc_align(32)]
 extern "rust-preserve-none" fn op_return<'gc>(
@@ -2543,11 +3582,214 @@ extern "rust-preserve-none" fn op_return<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (values, count) = instruction.ab();
 
-    let cur_base = thread.top_lua().unwrap().base;
+    let (cur_base, num_results, num_extras, flags) = {
+        let f = unsafe { &*frame };
+        (f.base, f.num_results, f.num_extras as usize, f.flags)
+    };
+    // `flags` covers continuation, open upvalues, TBC slots and a non-Lua
+    // parent (see `frame_flags`); `count == 0` is MULTRET.
+    if std::hint::unlikely(count == 0 || flags != 0) {
+        become op_return_slow(
+            instruction,
+            ctx,
+            thread,
+            registers,
+            ip,
+            handlers,
+            ds,
+            frame,
+            closure,
+        );
+    }
+    debug_assert!(!frame_has_open_upvalues(thread, cur_base));
+    debug_assert!(matches!(
+        thread.frames[thread.frames.len() - 2],
+        Frame::Lua(_)
+    ));
+
+    let nret = count as usize - 1;
+    let values_base = cur_base + values as usize;
+    let dst_start = cur_base - 1 - num_extras;
+    // `num_results == 0` is the CALL's MULTRET: deliver all `nret` and publish `thread.top`.
+    let wanted = if num_results == 0 {
+        nret
+    } else {
+        num_results as usize - 1
+    };
+    // `dst_start < values_base` and both ranges lie inside the callee's
+    // window, which the CALL that entered it sized the vec for; a forward
+    // element copy is in bounds and never reads a slot it already overwrote.
+    debug_assert!(values_base + nret.min(wanted) <= thread.stack.len());
+    debug_assert!(dst_start + wanted <= thread.stack.len());
+    let stack = thread.stack.as_mut_ptr();
+    if std::hint::likely(nret == 1 && wanted == 1) {
+        unsafe { *stack.add(dst_start) = *stack.add(values_base) };
+    } else {
+        let to_copy = nret.min(wanted);
+        for i in 0..to_copy {
+            unsafe { *stack.add(dst_start + i) = *stack.add(values_base + i) };
+        }
+        for i in to_copy..wanted {
+            unsafe { *stack.add(dst_start + i) = Value::nil() };
+        }
+    }
+    // Without this a `top` left high by a multires producer inside the callee
+    // would keep its dead registers traced (#43).
+    thread.set_top_unchecked(dst_start + wanted);
+    return_to_parent!(thread, registers, ip, frame, closure);
+}
+
+/// return
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn op_return0<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) {
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
+    let (cur_base, num_results, num_extras, flags) = {
+        let f = unsafe { &*frame };
+        (f.base, f.num_results, f.num_extras as usize, f.flags)
+    };
+    if std::hint::unlikely(flags != 0) {
+        let generic = Instruction::ret(crate::instruction::Reg(0), 1);
+        become op_return_slow(
+            generic, ctx, thread, registers, ip, handlers, ds, frame, closure,
+        );
+    }
+    let dst_start = cur_base - 1 - num_extras;
+    // `num_results == 0` is the CALL's MULTRET: zero results, publish `top`.
+    let wanted = if num_results == 0 {
+        0
+    } else {
+        num_results as usize - 1
+    };
+    debug_assert!(dst_start + wanted <= thread.stack.len());
+    let stack = thread.stack.as_mut_ptr();
+    for i in 0..wanted {
+        unsafe { *stack.add(dst_start + i) = Value::nil() };
+    }
+    thread.set_top_unchecked(dst_start + wanted);
+    return_to_parent!(thread, registers, ip, frame, closure);
+}
+
+/// return R[value]
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn op_return1<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) {
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
+    let value = instruction.a();
+    let (cur_base, num_results, num_extras, flags) = {
+        let f = unsafe { &*frame };
+        (f.base, f.num_results, f.num_extras as usize, f.flags)
+    };
+    if std::hint::unlikely(flags != 0) {
+        let generic = Instruction::ret(crate::instruction::Reg(value), 2);
+        become op_return_slow(
+            generic, ctx, thread, registers, ip, handlers, ds, frame, closure,
+        );
+    }
+    let dst_start = cur_base - 1 - num_extras;
+    // `num_results == 0` is the CALL's MULTRET: one result, publish `top`.
+    let wanted = if num_results == 0 {
+        1
+    } else {
+        num_results as usize - 1
+    };
+    debug_assert!(dst_start + wanted.max(1) <= thread.stack.len());
+    let stack = thread.stack.as_mut_ptr();
+    // Written even when the caller wants nothing: `dst_start` is the caller's
+    // function slot, dead once the call returns.
+    unsafe { *stack.add(dst_start) = reg!(value) };
+    for i in 1..wanted {
+        unsafe { *stack.add(dst_start + i) = Value::nil() };
+    }
+    thread.set_top_unchecked(dst_start + wanted);
+    return_to_parent!(thread, registers, ip, frame, closure);
+}
+
+/// The general RETURN: MULTRET, continuations, open upvalues / to-be-closed
+/// variables, and returns into a non-Lua parent or out of the thread.
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn op_return_slow<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) {
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
+    let (values, count) = instruction.ab();
+
+    let cur_base = unsafe { (*frame).base };
     let values_base = cur_base + values as usize;
     // `count == 0` is MULTRET: read the count from `thread.top`.
     let nret = if count == 0 {
@@ -2556,19 +3798,25 @@ extern "rust-preserve-none" fn op_return<'gc>(
         count as usize - 1
     };
 
-    match frame_return(ctx.mutation(), thread, values_base, nret) {
+    match frame_return(ctx.mutation(), thread, frame, values_base, nret) {
         FrameReturn::Continuation => {
-            become cont_resume(instruction, ctx, thread, registers, ip, handlers, ds);
+            become cont_resume(
+                instruction,
+                ctx,
+                thread,
+                registers,
+                ip,
+                handlers,
+                ds,
+                frame,
+                closure,
+            );
         }
         FrameReturn::TopLevel => return,
         FrameReturn::ToNonLua => return,
-        FrameReturn::Caller {
-            new_base,
-            new_ip,
-            closure,
-        } => {
+        FrameReturn::Caller { new_base, new_ip } => {
             ip = new_ip;
-            ds.bind(&closure);
+            (frame, closure) = top_frame(thread);
             registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
             dispatch!();
         }
@@ -2645,8 +3893,20 @@ extern "rust-preserve-none" fn op_forprep<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (base, offset) = instruction.a_imm();
 
     let init = reg!(base);
@@ -2728,8 +3988,20 @@ extern "rust-preserve-none" fn op_forloop<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (base, offset) = instruction.a_imm();
 
     // The step's type tells the loop kind, and the hidden slots match it:
@@ -2777,8 +4049,20 @@ extern "rust-preserve-none" fn op_tforprep<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (_base, offset) = instruction.a_imm();
     ip = unsafe { ip.offset(offset as isize) };
     dispatch!();
@@ -2795,8 +4079,20 @@ extern "rust-preserve-none" fn op_tforcall<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (base, count) = instruction.ab();
     let iter = reg!(base);
     let state = reg!(base + 1);
@@ -2821,8 +4117,20 @@ extern "rust-preserve-none" fn op_tforloop<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (base, offset) = instruction.a_imm();
     let first = reg!(base + 3);
     if !first.is_nil() {
@@ -2847,8 +4155,20 @@ extern "rust-preserve-none" fn op_setlist<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (table, count, offset) = instruction.abd();
     let Some(t) = reg!(table).get_table() else {
         raise!(OpError::Internal("SETLIST on a non-table"));
@@ -2898,12 +4218,22 @@ extern "rust-preserve-none" fn op_closure<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (dst, proto_idx) = instruction.ad();
-    let frame = thread.top_lua().unwrap();
-    let parent_closure = frame.closure;
-    let base = frame.base;
+    let (parent_closure, base) = unsafe { ((*frame).closure, (*frame).base) };
     let proto = parent_closure.proto.prototypes[proto_idx as usize];
 
     let thread_handle = thread.thread_handle.expect("thread must have a handle");
@@ -2927,6 +4257,7 @@ extern "rust-preserve-none" fn op_closure<'gc>(
                         }),
                     );
                     thread.open_upvalues.push(uv);
+                    unsafe { (*frame).flags |= frame_flags::OPEN_UPVALUES };
                     uv
                 }
             }
@@ -2961,8 +4292,20 @@ extern "rust-preserve-none" fn op_vararg<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (dst, count) = instruction.ab();
     // Copy scalars/`Gc` out so the frame borrow ends before touching the stack.
     let (base, num_extras, proto) = {
@@ -3044,8 +4387,20 @@ extern "rust-preserve-none" fn op_varargget<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (dst, _base, key) = instruction.abc();
     let key_val = reg!(key);
     let frame = thread.top_lua().unwrap();
@@ -3095,8 +4450,20 @@ extern "rust-preserve-none" fn op_varargprep<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let _num_fixed = instruction.a();
     let (num_extras, num_params, base, max_stack, needs_table) = {
         let frame = thread.top_lua().unwrap();
@@ -3150,8 +4517,20 @@ extern "rust-preserve-none" fn op_errnnil<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     let (src, name_key) = instruction.ad();
     if std::hint::unlikely(!reg!(src).is_nil()) {
         raise!(OpError::GlobalRedefined(name_key));
@@ -3173,8 +4552,20 @@ extern "rust-preserve-none" fn op_nop<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
     dispatch!();
 }
 
@@ -3188,6 +4579,8 @@ extern "rust-preserve-none" fn op_stop<'gc>(
     _ip: *const Instruction,
     _handlers: *const (),
     _ds: &mut DispatchState<'gc>,
+    _frame: *mut LuaFrame<'gc>,
+    _closure: LuaFn<'gc>,
 ) {
 }
 
@@ -3261,8 +4654,7 @@ fn write_upvalue<'gc>(
 #[inline]
 fn save_pc<'gc>(thread: &mut ThreadState<'gc>, ip: *const Instruction) {
     if let Some(frame) = thread.top_lua_mut() {
-        let code_start = frame.closure.proto.code.as_ptr();
-        frame.pc = unsafe { ip.offset_from_unsigned(code_start) };
+        frame.pc = ip;
     }
 }
 
@@ -3284,15 +4676,12 @@ pub(crate) fn invoke_native<'gc>(
     // above it — which may be an outer frame's registers — alone.
     thread.ensure_slots(end);
     thread.top = end;
-    let current_thread = thread
-        .thread_handle
-        .expect("ThreadState missing back-reference");
     let nctx = NativeContext {
         ctx,
         upvalues: &nc.upvalues,
-        exec: crate::vm::sequence::Execution::new(current_thread),
+        exec: crate::vm::sequence::Execution::new(thread.handle()),
     };
-    let stack = Stack::new(&mut thread.stack, &mut thread.top, args_base);
+    let stack = Stack::new(thread, args_base);
     // The stack is grown-not-shrunk and may leave dead scratch above the logical
     // top; that's fine because `ThreadState`'s `Collect` traces only the live
     // high-water (derived from the frames + `top`), so dead slots never retain.
@@ -3302,7 +4691,7 @@ pub(crate) fn invoke_native<'gc>(
 /// What should happen after a frame returns with values at
 /// `stack[values_base .. values_base + nret]`. Produced by [`frame_return`],
 /// consumed by `op_return` and the native-tailcall path in `op_tailcall`.
-pub(crate) enum FrameReturn<'gc> {
+pub(crate) enum FrameReturn {
     /// A continuation was attached to the departing frame; caller must
     /// tail-call `cont_resume`. The continuation's `results_base` / `nret`
     /// have already been written back into the top frame.
@@ -3316,7 +4705,6 @@ pub(crate) enum FrameReturn<'gc> {
     Caller {
         new_base: usize,
         new_ip: *const Instruction,
-        closure: Gc<'gc, LuaClosure<'gc>>,
     },
     /// The popped Lua frame's parent is a non-Lua frame (Sequence /
     /// WaitThread / Start / Error). The values have been left at
@@ -3328,109 +4716,129 @@ pub(crate) enum FrameReturn<'gc> {
 /// Unwind the top-of-stack frame assuming it returned the values at
 /// `stack[values_base .. values_base + nret]`. Shared by the bytecode
 /// `RETURN` handler and the native-tailcall path.
+#[inline]
 pub(crate) fn frame_return<'gc>(
     mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
+    frame: *mut LuaFrame<'gc>,
     values_base: usize,
     nret: usize,
-) -> FrameReturn<'gc> {
+) -> FrameReturn {
     let (cur_base, num_results, num_extras, continuation) = {
-        let f = thread.top_lua().unwrap();
+        let f = unsafe { &*frame };
         (f.base, f.num_results, f.num_extras as usize, f.continuation)
     };
 
     if let Some(mut cont) = continuation {
         cont.results_base = values_base;
         cont.nret = nret as u8;
-        thread.top_lua_mut().unwrap().continuation = Some(cont);
+        unsafe { (*frame).continuation = Some(cont) };
         return FrameReturn::Continuation;
     }
 
     // The func slot sits at `cur_base - 1 - num_extras`: VARARGPREP shifted
     // base past the extras at `[cur_base - num_extras .. cur_base]` (0 for
     // non-vararg frames).
-    close_upvalues(mc, thread, cur_base);
+    if frame_has_open_upvalues(thread, cur_base) {
+        close_upvalues_slow(mc, thread, cur_base);
+    }
     close_tbc_vars(mc, thread, cur_base);
-    thread.frames.pop();
+    // The top frame is the `Frame::Lua` read above and `LuaFrame` is `Copy`,
+    // so there is nothing to drop; `Vec::pop` would copy the 96-byte frame out
+    // and run the enum's drop glue.
+    const { assert!(!std::mem::needs_drop::<LuaFrame<'_>>()) };
+    unsafe { thread.frames.set_len(thread.frames.len() - 1) };
 
     let dst_start = cur_base - 1 - num_extras;
 
-    if thread.frames.is_empty() {
-        thread
-            .stack
-            .copy_within(values_base..values_base + nret, dst_start);
-        // The thread is done, so nothing above the results is live: pair
-        // `Result { bottom }` with a `top` marking the result end, and release
-        // the rest. Consumers read `stack[bottom..top]`.
-        thread.discard_above(dst_start + nret);
-        thread.status = ThreadStatus::Result { bottom: dst_start };
-        return FrameReturn::TopLevel;
-    }
-
-    // If the parent isn't a Lua frame (Sequence/WaitThread/etc.), the executor
-    // driver picks up here: place all `nret` values at `stack[dst_start..]` for
-    // the parent's window. This MUST be handled before the `num_results`
-    // branch below — doing both copies would run two overlapping forward
-    // moves of the same source range, and the first would clobber the source
-    // of the second whenever `nret` is large enough that `dst_start + nret`
-    // reaches into `[values_base..]` (e.g. a sort comparator returning 4+
-    // values). A single copy is safe because `dst_start < values_base`, so each
-    // write lands on a slot already consumed.
-    if thread.top_lua().is_none() {
-        thread
-            .stack
-            .copy_within(values_base..values_base + nret, dst_start);
-        // Parent is a Sequence / WaitThread, so no register window sits above
-        // the results — the shrink is legal, and it publishes the parent's
-        // input window as `stack[dst_start..top]`.
-        thread.discard_above(dst_start + nret);
-        return FrameReturn::ToNonLua;
-    }
+    let (new_base, new_ip) = match thread.frames.last() {
+        Some(Frame::Lua(caller)) => (caller.base, caller.pc),
+        None => {
+            thread
+                .stack
+                .copy_within(values_base..values_base + nret, dst_start);
+            // The thread is done, so nothing above the results is live: pair
+            // `Result { bottom }` with a `top` marking the result end, and release
+            // the rest. Consumers read `stack[bottom..top]`.
+            thread.discard_above(dst_start + nret);
+            thread.status = ThreadStatus::Result { bottom: dst_start };
+            return FrameReturn::TopLevel;
+        }
+        // The parent isn't a Lua frame (Sequence/WaitThread/etc.), so the
+        // executor driver picks up here: place all `nret` values at
+        // `stack[dst_start..]` for the parent's window. Since no register
+        // window sits above the results the shrink is legal, and it publishes
+        // the parent's input window as `stack[dst_start..top]`.
+        Some(_) => {
+            thread
+                .stack
+                .copy_within(values_base..values_base + nret, dst_start);
+            thread.discard_above(dst_start + nret);
+            return FrameReturn::ToNonLua;
+        }
+    };
 
     // `num_results == 0` is the CALL's MULTRET: deliver all `nret` and publish `thread.top`.
     if num_results == 0 {
         thread
             .stack
             .copy_within(values_base..values_base + nret, dst_start);
-        // Publishing through `set_top` also nils the donor copies the down-shift
-        // left in the popped callee's registers, which would otherwise stay
-        // traced as the caller's dead scratch.
-        thread.set_top(dst_start + nret);
+        thread.set_top_unchecked(dst_start + nret);
     } else {
         let wanted = num_results as usize - 1;
         let to_copy = nret.min(wanted);
+        // `dst_start < values_base` (the func slot is below the callee's
+        // registers) and both ranges lie inside the callee's window, which
+        // `op_call` sized the vec for; a forward element copy is in bounds and
+        // never reads a slot it already overwrote. Indexing here re-checks the
+        // vec length against every store, so use raw pointers.
+        debug_assert!(values_base + to_copy <= thread.stack.len());
+        debug_assert!(dst_start + wanted <= thread.stack.len());
+        let stack = thread.stack.as_mut_ptr();
         for i in 0..to_copy {
-            thread.stack[dst_start + i] = thread.stack[values_base + i];
+            unsafe { *stack.add(dst_start + i) = *stack.add(values_base + i) };
         }
         for i in to_copy..wanted {
-            thread.stack[dst_start + i] = Value::nil();
+            unsafe { *stack.add(dst_start + i) = Value::nil() };
         }
         // Publish the landing end. Without this, a `top` left high by a multires
         // producer *inside the callee* would still be the high-water long after
         // the callee popped, so `live_top` would keep tracing its dead registers
         // — the exact #43 leak, just via a stale `top` instead of the vec length.
-        // Also nils those registers, which are dead scratch: `dst_start` is the
-        // caller's function slot, and everything from there up is free.
-        thread.set_top(dst_start + wanted);
+        thread.set_top_unchecked(dst_start + wanted);
     }
 
-    let caller = thread.top_lua().unwrap();
-    let new_base = caller.base;
-    let new_ip = unsafe { caller.closure.proto.code.as_ptr().add(caller.pc) };
-    FrameReturn::Caller {
-        new_base,
-        new_ip,
-        closure: caller.closure,
-    }
+    FrameReturn::Caller { new_base, new_ip }
+}
+
+/// Whether the frame based at `base` still has open upvalues. Open upvalues
+/// are appended in creation order and every deeper frame closes its own before
+/// returning, so only the tail of the list can belong to the returning frame.
+/// (Not valid for a partial `CLOSE` inside a frame, whose entries are not
+/// ordered by index.)
+#[inline(always)]
+fn frame_has_open_upvalues<'gc>(thread: &ThreadState<'gc>, base: usize) -> bool {
+    thread.open_upvalues.last().is_some_and(
+        |uv| matches!(&*uv.borrow(), UpvalueState::Open { index, .. } if *index >= base),
+    )
 }
 
 /// Close all open upvalues pointing at stack indices >= `start_idx`.
 /// Each open upvalue is converted to Closed by capturing the current stack value.
+/// Inlined so the usual no-open-upvalues return costs one load, not a call.
+#[inline(always)]
 pub(crate) fn close_upvalues<'gc>(
     mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     start_idx: usize,
 ) {
+    if !thread.open_upvalues.is_empty() {
+        close_upvalues_slow(mc, thread, start_idx);
+    }
+}
+
+#[inline(never)]
+fn close_upvalues_slow<'gc>(mc: &Mutation<'gc>, thread: &mut ThreadState<'gc>, start_idx: usize) {
     thread.open_upvalues.retain(|uv| {
         let should_close = {
             let borrowed = uv.borrow();
@@ -3598,20 +5006,19 @@ fn walk_newindex_chain<'gc>(
 /// caller must push a frame for) or a native Rust callback (which the caller
 /// invokes inline).
 pub(crate) enum CallTarget<'gc> {
-    Lua(Gc<'gc, LuaClosure<'gc>>),
+    Lua(LuaFn<'gc>),
     Native(&'gc NativeClosure<'gc>),
 }
 
 /// Outcome of [`schedule_meta_call`], consumed by the `invoke_metamethod!`
 /// macro. Captures the three ways a continuation-driven call can proceed.
-pub(crate) enum MetaDispatch<'gc> {
+pub(crate) enum MetaDispatch {
     /// Resolved to a Lua closure; a frame carrying the continuation was
     /// pushed. The caller rebinds `ip`/`registers` and `DispatchState` to
     /// the new frame and dispatches.
     Lua {
         new_ip: *const Instruction,
         new_base: usize,
-        closure: Gc<'gc, LuaClosure<'gc>>,
     },
     /// Resolved to a native callback that returned synchronously. Its results
     /// sit at `stack[results_base .. results_base + nret]`; the caller applies
@@ -3632,8 +5039,30 @@ pub(crate) enum MetaDispatch<'gc> {
 /// Returns the resolved target and the (possibly adjusted) `nargs`, or
 /// `None` if the chain is unresolvable: non-callable value, `nargs`
 /// overflow, or `MAX_TAG_LOOP` exhaustion. Callers raise on `None`.
-#[inline]
+#[inline(always)]
 fn resolve_call_chain<'gc>(
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    func_idx: usize,
+    nargs: u8,
+) -> Option<(CallTarget<'gc>, u8)> {
+    // Plain functions are the overwhelmingly common case; keep the `__call`
+    // walk (and its stack frame) out of the handler.
+    if let Some(f) = thread.stack[func_idx].get_function() {
+        return match f.inner().as_ref() {
+            FunctionKind::Lua(_) => Some((
+                CallTarget::Lua(unsafe { LuaFn::from_function_unchecked(f) }),
+                nargs,
+            )),
+            FunctionKind::Native(nc) => Some((CallTarget::Native(nc), nargs)),
+        };
+    }
+    resolve_call_chain_slow(ctx, thread, func_idx, nargs)
+}
+
+#[cold]
+#[inline(never)]
+fn resolve_call_chain_slow<'gc>(
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
     func_idx: usize,
@@ -3643,7 +5072,10 @@ fn resolve_call_chain<'gc>(
         let func_val = thread.stack[func_idx];
         if let Some(f) = func_val.get_function() {
             return match f.inner().as_ref() {
-                FunctionKind::Lua(c) => Some((CallTarget::Lua(*c), nargs)),
+                FunctionKind::Lua(_) => Some((
+                    CallTarget::Lua(unsafe { LuaFn::from_function_unchecked(f) }),
+                    nargs,
+                )),
                 FunctionKind::Native(nc) => Some((CallTarget::Native(nc), nargs)),
             };
         }
@@ -3728,7 +5160,7 @@ fn schedule_meta_call<'gc>(
     args: &[Value<'gc>],
     cont: Continuation,
     caller_ip: *const Instruction,
-) -> MetaDispatch<'gc> {
+) -> MetaDispatch {
     // Save caller's pc; no decisions here depend on knowing the final target.
     // The native suspend path relies on this so the executor re-enters the
     // caller frame at the instruction following the one that scheduled us.
@@ -3794,18 +5226,15 @@ fn schedule_meta_call<'gc>(
         base: new_base,
         // Ignored by op_return when a continuation is set — the continuation
         // reads return values directly from the stack via `cont.results_base`.
-        pc: 0,
+        pc: closure.proto.code.as_ptr(),
         num_results: 0,
+        flags: frame_flags::HAS_CONT,
         num_extras,
         continuation: Some(cont),
     });
 
     let new_ip = closure.proto.code.as_ptr();
-    MetaDispatch::Lua {
-        new_ip,
-        new_base,
-        closure,
-    }
+    MetaDispatch::Lua { new_ip, new_base }
 }
 
 /// Native arm of [`schedule_meta_call`]. The callable native `nc` and its
@@ -3820,8 +5249,8 @@ fn schedule_native_meta_call<'gc>(
     caller_base: usize,
     new_base: usize,
     actual_args: usize,
-) -> MetaDispatch<'gc> {
-    use crate::vm::sequence::CallbackAction;
+) -> MetaDispatch {
+    use crate::vm::sequence::{CallbackAction, Suspend};
 
     let args_base = new_base;
     let action = match invoke_native(ctx, thread, nc, args_base, actual_args) {
@@ -3849,7 +5278,7 @@ fn schedule_native_meta_call<'gc>(
         // `land_call_results` and so can't replay our continuation. It's not a
         // shape any current metamethod/iterator native produces; reject it
         // cleanly rather than silently dropping the continuation.
-        CallbackAction::Call { .. } => {
+        CallbackAction::Suspend(action) if matches!(*action, Suspend::Call { .. }) => {
             let err = crate::env::Error::from_str(
                 ctx,
                 "metamethod/iterator native cannot tail-call into Lua across the continuation",
@@ -3863,9 +5292,9 @@ fn schedule_native_meta_call<'gc>(
         // continuation against the caller frame (`apply_native_continuation`).
         // This replays every payload uniformly — including `CondJump`, whose
         // branch decision (a `pc` bump) can't be expressed as a plain landing.
-        other => {
+        CallbackAction::Suspend(action) => {
             thread.pending_action = Some(PendingAction {
-                action: other,
+                action,
                 call_site: CallSite {
                     bottom: args_base,
                     // Unused while `cont` is set (the continuation drives the
@@ -3888,10 +5317,20 @@ fn schedule_native_meta_call<'gc>(
 macro_rules! finalize_return {
     (
         $instruction:expr, $ctx:expr, $thread:expr,
-        $registers:ident, $ip:ident, $handlers:expr, $ds:ident,
+        $registers:ident, $ip:ident, $handlers:expr, $ds:ident, $frame:ident, $closure:ident,
         cont: $cont_out:ident
     ) => {
-        helpers!($instruction, $ctx, $thread, $registers, $ip, $handlers, $ds);
+        helpers!(
+            $instruction,
+            $ctx,
+            $thread,
+            $registers,
+            $ip,
+            $handlers,
+            $ds,
+            $frame,
+            $closure
+        );
 
         let $cont_out: Continuation = $thread.top_lua().unwrap().continuation.unwrap();
         let __cur_base = $thread.top_lua().unwrap().base;
@@ -3900,11 +5339,10 @@ macro_rules! finalize_return {
         close_tbc_vars($ctx.mutation(), $thread, __cur_base);
         $thread.frames.pop();
 
-        let __caller_base = {
-            let caller = $thread.top_lua().unwrap();
-            $ip = unsafe { caller.closure.proto.code.as_ptr().add(caller.pc) };
-            $ds.bind(&caller.closure);
-            caller.base
+        ($frame, $closure) = top_frame($thread);
+        let __caller_base = unsafe {
+            $ip = (*$frame).pc;
+            (*$frame).base
         };
         $registers = unsafe { $thread.stack.as_mut_ptr().add(__caller_base) };
     };
@@ -3927,8 +5365,10 @@ extern "rust-preserve-none" fn cont_resume<'gc>(
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) {
-    finalize_return!(instruction, ctx, thread, registers, ip, handlers, ds, cont: cont);
+    finalize_return!(instruction, ctx, thread, registers, ip, handlers, ds, frame, closure, cont: cont);
     apply_cont_payload!(
         cont,
         cont.results_base,

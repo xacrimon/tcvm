@@ -1,4 +1,4 @@
-//! A native callback uses `CallbackAction::Call { function, then }` to call
+//! A native callback uses `CallbackAction::call(function, then)` to call
 //! a Lua function and consume its results via a follow-up sequence.
 
 use std::pin::Pin;
@@ -45,10 +45,7 @@ fn bumper<'gc>(
     // clear our window first to leave just the args (none).
     stack.replace(&[]);
     let then = BoxSequence::new(nctx.ctx.mutation(), AddOneSequence);
-    Ok(CallbackAction::Call {
-        function: f,
-        then: Some(then),
-    })
+    Ok(CallbackAction::call(f, Some(then)))
 }
 
 #[test]

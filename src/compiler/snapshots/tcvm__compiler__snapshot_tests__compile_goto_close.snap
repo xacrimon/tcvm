@@ -59,7 +59,7 @@ expression: output
 0043  [ 35]  CLOSE           R11
 0044  [ 31]  FORLOOP         R8 -11
 0045  [ 39]  JMP             +0
-0046  [ 41]  RETURN          R0 count=1
+0046  [ 41]  RETURN0
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=1, upvalues=1)
@@ -67,7 +67,7 @@ expression: output
   ;   U0 = local R2
   ; code:
   0000  [  7]  GETUPVAL        R0 U0
-  0001  [  7]  RETURN          R0 count=2
+  0001  [  7]  RETURN1         R0
 
 ; prototype 1:
   ; function (params=0, vararg=false, stack=1, upvalues=1)
@@ -75,7 +75,7 @@ expression: output
   ;   U0 = local R4
   ; code:
   0000  [ 16]  GETUPVAL        R0 U0
-  0001  [ 16]  RETURN          R0 count=2
+  0001  [ 16]  RETURN1         R0
 
 ; prototype 2:
   ; function (params=0, vararg=false, stack=1, upvalues=1)
@@ -83,7 +83,7 @@ expression: output
   ;   U0 = local R6
   ; code:
   0000  [ 23]  GETUPVAL        R0 U0
-  0001  [ 23]  RETURN          R0 count=2
+  0001  [ 23]  RETURN1         R0
 
 ; prototype 3:
   ; function (params=0, vararg=false, stack=1, upvalues=1)
@@ -91,4 +91,4 @@ expression: output
   ;   U0 = local R12
   ; code:
   0000  [ 34]  GETUPVAL        R0 U0
-  0001  [ 34]  RETURN          R0 count=2
+  0001  [ 34]  RETURN1         R0

@@ -22,13 +22,13 @@ expression: output
 0007  [  3]  LT              R2 R3 inv=false
 0008  [  3]  JMP             +2
 0009  [  4]  LOAD            R4 K0  ; 1
-0010  [  4]  RETURN          R4 count=2
+0010  [  4]  RETURN1         R4
 0011  [  7]  LT              R0 R1 inv=true
 0012  [  7]  JMP             +2
 0013  [  7]  LT              R2 R3 inv=false
 0014  [  7]  JMP             +2
 0015  [  8]  LOAD            R4 K1  ; 2
-0016  [  8]  RETURN          R4 count=2
+0016  [  8]  RETURN1         R4
 0017  [ 11]  TESTSET         R4 R0 inv=true
 0018  [ 11]  JMP             +1
 0019  [ 11]  MOVE            R4 R1

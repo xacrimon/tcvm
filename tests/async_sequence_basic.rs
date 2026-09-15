@@ -25,7 +25,7 @@ fn async_pending_then_return() {
             });
             Ok(SequenceReturn::Return)
         });
-        Ok(CallbackAction::Sequence(seq))
+        Ok(CallbackAction::sequence(seq))
     }
 
     let ex = lua

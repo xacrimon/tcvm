@@ -8,7 +8,7 @@ expression: output
 ; code:
 0000  [  1]  VARARGPREP      fixed=0
 0001  [ 10]  CLOSURE         R0 P0
-0002  [ 10]  RETURN          R0 count=1
+0002  [ 10]  RETURN0
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=6, upvalues=1)
@@ -31,4 +31,4 @@ expression: output
   0008  [  9]  GETTABUP        R2 U0 K3  ; "print"
   0009  [  9]  MOVE            R3 R0
   0010  [  9]  CALL            R2 args=2 ret=1
-  0011  [ 10]  RETURN          R0 count=1
+  0011  [ 10]  RETURN0

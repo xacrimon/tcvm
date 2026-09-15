@@ -7,7 +7,7 @@ use crate::lua::context::Context;
 use crate::lua::convert::{FromMultiValue, IntoMultiValue};
 use crate::vm;
 use crate::vm::interp::{Continuation, ContinuationPayload};
-use crate::vm::sequence::CallbackAction;
+use crate::vm::sequence::{CallbackAction, Suspend};
 
 #[derive(Clone, Copy, PartialEq, Eq, Collect)]
 #[collect(internal, require_static)]
@@ -389,13 +389,8 @@ fn apply_pending_action<'gc>(
 ) -> Result<(), RuntimeError> {
     let mc = ctx.mutation();
     let PendingAction { action, call_site } = p;
-    match action {
-        CallbackAction::Return => {
-            // op_call/tailcall handle Return inline. With yield_bottom
-            // factored out into its own field, no sentinel use remains.
-            unreachable!("apply_pending_action: Return is handled inline");
-        }
-        CallbackAction::Sequence(seq) => {
+    match *action {
+        Suspend::Sequence(seq) => {
             let mut ts = top.borrow_mut(mc);
             ts.frames.push(Frame::Sequence {
                 seq,
@@ -403,7 +398,7 @@ fn apply_pending_action<'gc>(
                 pending_error: None,
             });
         }
-        CallbackAction::Call { function, then } => {
+        Suspend::Call { function, then } => {
             let mut ts = top.borrow_mut(mc);
             // If `then` provided, the sequence is the call's "completion
             // handler"; it inherits the caller's expected_returns. The
@@ -428,7 +423,7 @@ fn apply_pending_action<'gc>(
             ts.insert_at(call_site.bottom, Value::function(function));
             schedule_call_at(&mut ts, ctx, call_site.bottom, function, call_site.returns)?;
         }
-        CallbackAction::Yield { then } => {
+        Suspend::Yield { then } => {
             let mut ts = top.borrow_mut(mc);
             if let Some(seq) = then {
                 ts.frames.push(Frame::Sequence {
@@ -443,7 +438,7 @@ fn apply_pending_action<'gc>(
             ts.yield_bottom = Some(call_site);
             ts.status = ThreadStatus::Suspended;
         }
-        CallbackAction::Resume {
+        Suspend::Resume {
             thread: target,
             then,
         } => {
@@ -553,8 +548,9 @@ fn schedule_call_at<'gc>(
         ts.push_lua(LuaFrame {
             closure,
             base,
-            pc: 0,
+            pc: closure.proto.code.as_ptr(),
             num_results: caller_returns,
+            flags: 0,
             num_extras,
             continuation: None,
         });
@@ -586,14 +582,12 @@ fn schedule_call_at<'gc>(
                 // stored back in [slot] before the call by the caller.)
                 let retc = ts.top - args_base;
                 ts.stack.copy_within(args_base..args_base + retc, slot);
-                // Drops the function slot and the one stale donor copy the
-                // shift-by-one leaves behind, nil-filling both.
                 ts.set_top(slot + retc);
                 Ok(())
             }
-            other => {
+            CallbackAction::Suspend(action) => {
                 ts.pending_action = Some(PendingAction {
-                    action: other,
+                    action,
                     call_site: CallSite {
                         bottom: args_base,
                         func_idx: slot,
@@ -644,11 +638,7 @@ fn pump_sequence<'gc>(
     // landed call, a resume). Its mutators write `top` back through the view.
     let poll_result = {
         let mut ts = top.borrow_mut(mc);
-        // Split disjoint field borrows through a single deref of the RefMut
-        // (the compiler can't split borrows across `RefMut`'s `Deref`).
-        let ts: &mut crate::env::thread::ThreadState<'gc> = &mut ts;
-        let stack_view =
-            crate::env::function::Stack::new(&mut ts.stack, &mut ts.top, call_site.bottom);
+        let stack_view = crate::env::function::Stack::new(&mut ts, call_site.bottom);
         let exec = Execution::new(top);
         if let Some(err) = pending_error {
             seq.error(ctx, exec, err, stack_view)
@@ -903,7 +893,7 @@ fn apply_native_continuation<'gc>(
             let truthy = !result0.is_falsy();
             if truthy != inverted {
                 let frame = ts.top_lua_mut().unwrap();
-                frame.pc = (frame.pc as i64 + offset as i64) as usize;
+                frame.pc = unsafe { frame.pc.offset(offset as isize) };
             }
         }
         ContinuationPayload::TForCall { base: reg, count } => {

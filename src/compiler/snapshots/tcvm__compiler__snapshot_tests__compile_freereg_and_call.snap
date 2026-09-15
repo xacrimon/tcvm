@@ -15,7 +15,7 @@ expression: output
 0004  [  3]  JMP             +2
 0005  [  3]  MOVE            R2 R0
 0006  [  3]  CALL            R2 args=1 ret=2
-0007  [  4]  RETURN          R2 count=2
+0007  [  4]  RETURN1         R2
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=1, upvalues=0)
@@ -23,4 +23,4 @@ expression: output
   ;   K0 = 42
   ; code:
   0000  [  1]  LOAD            R0 K0  ; 42
-  0001  [  1]  RETURN          R0 count=2
+  0001  [  1]  RETURN1         R0

@@ -49,11 +49,43 @@ pub enum SequencePoll<'gc> {
 }
 
 /// What a native callback requests of the executor on return.
+///
+/// `Return` is the hot path and must stay cheap to hand back: the suspension
+/// payloads are boxed so `Result<CallbackAction, Error>` is two words and
+/// crosses the native boundary in registers. A suspension already leaves the
+/// interpreter and goes through the executor, so its allocation is noise.
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub enum CallbackAction<'gc> {
     /// Plain synchronous return. Stack values above `bottom` are the results.
     Return,
+    /// Hand control to the executor; see [`Suspend`].
+    Suspend(Box<Suspend<'gc>>),
+}
+
+impl<'gc> CallbackAction<'gc> {
+    pub fn sequence(seq: BoxSequence<'gc>) -> Self {
+        CallbackAction::Suspend(Box::new(Suspend::Sequence(seq)))
+    }
+
+    pub fn call(function: Function<'gc>, then: Option<BoxSequence<'gc>>) -> Self {
+        CallbackAction::Suspend(Box::new(Suspend::Call { function, then }))
+    }
+
+    pub fn yield_(then: Option<BoxSequence<'gc>>) -> Self {
+        CallbackAction::Suspend(Box::new(Suspend::Yield { then }))
+    }
+
+    pub fn resume(thread: Thread<'gc>, then: Option<BoxSequence<'gc>>) -> Self {
+        CallbackAction::Suspend(Box::new(Suspend::Resume { thread, then }))
+    }
+}
+
+/// The suspension requests of [`CallbackAction`]; the executor driver
+/// translates them into frame-stack operations.
+#[derive(Collect)]
+#[collect(internal, no_drop)]
+pub enum Suspend<'gc> {
     /// Become a multi-step sequence. The pushed sequence will be polled
     /// repeatedly until it completes / yields / resumes.
     Sequence(BoxSequence<'gc>),

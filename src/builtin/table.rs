@@ -106,7 +106,7 @@ fn lua_concat<'gc>(
         }
         k += 1;
     }
-    stack.replace(&[Value::string(LuaString::new(nctx.ctx, &out))]);
+    stack.ret1(Value::string(LuaString::new(nctx.ctx, &out)));
     Ok(CallbackAction::Return)
 }
 
@@ -136,7 +136,7 @@ fn lua_create<'gc>(
             "bad argument #2 to 'create' (out of range)",
         ));
     }
-    stack.replace(&[Value::table(Table::new(nctx.ctx))]);
+    stack.ret1(Value::table(Table::new(nctx.ctx)));
     Ok(CallbackAction::Return)
 }
 
@@ -234,7 +234,7 @@ fn lua_move<'gc>(
             }
         }
     }
-    stack.replace(&[Value::table(a2)]);
+    stack.ret1(Value::table(a2));
     Ok(CallbackAction::Return)
 }
 
@@ -254,7 +254,7 @@ fn lua_pack<'gc>(
         Value::string(LuaString::new(nctx.ctx, b"n")),
         Value::integer(n as i64),
     );
-    stack.replace(&[Value::table(t)]);
+    stack.ret1(Value::table(t));
     Ok(CallbackAction::Return)
 }
 
@@ -287,7 +287,7 @@ fn lua_remove<'gc>(
         k += 1;
     }
     t.raw_set(nctx.ctx, Value::integer(pos.max(n)), Value::nil());
-    stack.replace(&[result]);
+    stack.ret1(result);
     Ok(CallbackAction::Return)
 }
 
@@ -342,7 +342,7 @@ fn lua_sort<'gc>(
             Ok(SequenceReturn::Return)
         }
     });
-    Ok(CallbackAction::Sequence(seq))
+    Ok(CallbackAction::sequence(seq))
 }
 
 /// Iterative quicksort (median-of-3 pivot) over the 1-based range `[1, n]`,

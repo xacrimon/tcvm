@@ -50,7 +50,7 @@ pub(crate) fn chunk_id(source: &[u8]) -> Vec<u8> {
 /// current instruction (see `LuaFrame::pc`), and 0 means not yet entered.
 pub(crate) fn frame_line(frame: &Frame<'_>) -> Option<u32> {
     let Frame::Lua(lf) = frame else { return None };
-    lf.closure.proto.line_for_pc(lf.pc.checked_sub(1)?)
+    lf.closure.proto.line_for_pc(lf.pc_index().checked_sub(1)?)
 }
 
 /// `luaL_where`: `"chunk:line: "` for call `level`, counting the raising
@@ -84,7 +84,7 @@ pub(crate) fn locate<'gc>(ctx: Context<'gc>, ts: &ThreadState<'gc>, err: Error<'
         return err.with_level(0);
     }
     let text = [prefix.as_slice(), msg.as_bytes()].concat();
-    Error::new(Value::string(LuaString::new(ctx, &text)))
+    Error::new(ctx, Value::string(LuaString::new(ctx, &text)))
 }
 
 /// `luaT_objtypename`: a table or userdata whose metatable has a string

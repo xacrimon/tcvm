@@ -17,4 +17,4 @@ expression: output
 0004  [  3]  LOAD            R1 K1  ; "new"
 0005  [  3]  LOAD            R3 K2  ; 99
 0006  [  3]  SETTABLE        R3 R0 R2
-0007  [  3]  RETURN          R0 count=1
+0007  [  3]  RETURN0

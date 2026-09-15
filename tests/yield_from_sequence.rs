@@ -57,7 +57,7 @@ fn yielding_seq<'gc>(
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let seq = BoxSequence::new(nctx.ctx.mutation(), YieldThenAddOne { yielded: false });
-    Ok(CallbackAction::Sequence(seq))
+    Ok(CallbackAction::sequence(seq))
 }
 
 #[test]

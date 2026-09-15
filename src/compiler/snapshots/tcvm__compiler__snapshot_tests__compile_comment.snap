@@ -18,4 +18,4 @@ expression: output
 0003  [  3]  SETTABUP        R1 U0 K1  ; "y"
 0004  [  7]  LOAD            R1 K4  ; 20000000.0
 0005  [  7]  SETTABUP        R1 U0 K3  ; "z"
-0006  [  7]  RETURN          R0 count=1
+0006  [  7]  RETURN0

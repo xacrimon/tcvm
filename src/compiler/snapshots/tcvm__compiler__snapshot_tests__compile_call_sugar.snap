@@ -81,24 +81,24 @@ expression: output
 0055  [  9]  LOAD            R5 K15  ; "b"
 0056  [  9]  CALL            R4 args=2 ret=0
 0057  [  9]  CALL            R3 args=0 ret=1
-0058  [  9]  RETURN          R0 count=1
+0058  [  9]  RETURN0
 
 ; prototype 0:
   ; function (params=1, vararg=false, stack=2, upvalues=0)
   ; code:
   0000  [  3]  LEN             R1 R0
-  0001  [  3]  RETURN          R1 count=2
+  0001  [  3]  RETURN1         R1
 
 ; prototype 1:
   ; function (params=2, vararg=false, stack=2, upvalues=0)
   ; code:
-  0000  [  5]  RETURN          R1 count=2
+  0000  [  5]  RETURN1         R1
 
 ; prototype 2:
   ; function (params=1, vararg=false, stack=2, upvalues=0)
   ; code:
   0000  [  8]  CLOSURE         R1 P0
-  0001  [  8]  RETURN          R1 count=2
+  0001  [  8]  RETURN1         R1
 
   ; prototype 0:
     ; function (params=1, vararg=false, stack=2, upvalues=1)
@@ -107,4 +107,4 @@ expression: output
     ; code:
     0000  [  8]  GETUPVAL        R1 U0
     0001  [  8]  CONCAT          R1 R1 R0
-    0002  [  8]  RETURN          R1 count=2
+    0002  [  8]  RETURN1         R1

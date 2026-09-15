@@ -30,7 +30,7 @@ expression: output
 0013  [  5]  CLOSURE         R1 P3
 0014  [  5]  GETFIELD        R2 R0 K2  ; "inner"
 0015  [  5]  SETFIELD        R1 R2 K6  ; "plain"
-0016  [  5]  RETURN          R0 count=1
+0016  [  5]  RETURN0
 
 ; prototype 0:
   ; function (params=1, vararg=false, stack=2, upvalues=0)
@@ -38,7 +38,7 @@ expression: output
   ;   K0 = "v"
   ; code:
   0000  [  2]  GETFIELD        R1 R0 K0  ; "v"
-  0001  [  2]  RETURN          R1 count=2
+  0001  [  2]  RETURN1         R1
 
 ; prototype 1:
   ; function (params=2, vararg=true, stack=4, upvalues=0)
@@ -61,4 +61,4 @@ expression: output
 ; prototype 3:
   ; function (params=1, vararg=false, stack=1, upvalues=0)
   ; code:
-  0000  [  5]  RETURN          R0 count=2
+  0000  [  5]  RETURN1         R0

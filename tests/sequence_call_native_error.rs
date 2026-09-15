@@ -67,7 +67,7 @@ fn factory<'gc>(
             called: false,
         },
     );
-    Ok(CallbackAction::Sequence(seq))
+    Ok(CallbackAction::sequence(seq))
 }
 
 #[test]

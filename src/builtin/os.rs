@@ -92,7 +92,7 @@ fn lua_clock<'gc>(
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     static START: OnceLock<Instant> = OnceLock::new();
     let start = START.get_or_init(Instant::now);
-    stack.replace(&[Value::float(start.elapsed().as_secs_f64())]);
+    stack.ret1(Value::float(start.elapsed().as_secs_f64()));
     Ok(CallbackAction::Return)
 }
 
@@ -123,7 +123,7 @@ fn lua_difftime<'gc>(
         ));
     }
     let t1 = util::check_number(nctx.ctx, stack.get(1), "difftime", 2)?;
-    stack.replace(&[Value::float(t2 - t1)]);
+    stack.ret1(Value::float(t2 - t1));
     Ok(CallbackAction::Return)
 }
 
@@ -169,7 +169,7 @@ fn lua_getenv<'gc>(
         Some(v) => Value::string(LuaString::new(nctx.ctx, v.as_os_str().as_bytes())),
         None => Value::nil(),
     };
-    stack.replace(&[result]);
+    stack.ret1(result);
     Ok(CallbackAction::Return)
 }
 
@@ -226,7 +226,7 @@ fn lua_time<'gc>(
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        stack.replace(&[Value::integer(now)]);
+        stack.ret1(Value::integer(now));
         Ok(CallbackAction::Return)
     } else if arg.get_table().is_some() {
         Err(Error::from_str(
@@ -254,6 +254,6 @@ fn lua_tmpname<'gc>(
     let mut path = std::env::temp_dir();
     path.push(format!("lua_{}_{n}", std::process::id()));
     let s = LuaString::new(nctx.ctx, path.to_string_lossy().as_bytes());
-    stack.replace(&[Value::string(s)]);
+    stack.ret1(Value::string(s));
     Ok(CallbackAction::Return)
 }

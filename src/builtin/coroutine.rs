@@ -47,7 +47,7 @@ fn lua_create<'gc>(
         ts.frames.push(Frame::Start(f));
         ts.status = ThreadStatus::Suspended;
     }
-    stack.replace(&[Value::thread(thread)]);
+    stack.ret1(Value::thread(thread));
     Ok(CallbackAction::Return)
 }
 
@@ -73,10 +73,7 @@ fn lua_resume<'gc>(
     let args: Vec<Value<'gc>> = stack.as_slice()[1..].to_vec();
     stack.replace(&args);
     let then = BoxSequence::new(nctx.ctx.mutation(), PCallSequence);
-    Ok(CallbackAction::Resume {
-        thread: co,
-        then: Some(then),
-    })
+    Ok(CallbackAction::resume(co, Some(then)))
 }
 
 /// `None` if `co` can be resumed, else the Lua-spec error message that
@@ -103,7 +100,7 @@ fn lua_yield<'gc>(
     _nctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    Ok(CallbackAction::Yield { then: None })
+    Ok(CallbackAction::yield_(None))
 }
 
 /// `coroutine.status(co)` — return one of `"suspended" | "normal" |
@@ -126,7 +123,7 @@ fn lua_status<'gc>(
         }
     };
     let v = Value::string(LuaString::new(nctx.ctx, s));
-    stack.replace(&[v]);
+    stack.ret1(v);
     Ok(CallbackAction::Return)
 }
 
@@ -160,7 +157,7 @@ fn lua_isyieldable<'gc>(
         })?;
         !target.ptr_eq(nctx.ctx.main_thread())
     };
-    stack.replace(&[Value::boolean(yieldable)]);
+    stack.ret1(Value::boolean(yieldable));
     Ok(CallbackAction::Return)
 }
 
@@ -183,7 +180,7 @@ fn lua_wrap<'gc>(
     }
     let upvalues: Box<[Value<'gc>]> = Box::new([Value::thread(thread)]);
     let wrapper = Function::new_native(nctx.ctx.mutation(), wrap_callback as NativeFn, upvalues);
-    stack.replace(&[Value::function(wrapper)]);
+    stack.ret1(Value::function(wrapper));
     Ok(CallbackAction::Return)
 }
 
@@ -263,10 +260,7 @@ fn wrap_callback<'gc>(
         return Err(Error::from_str(nctx.ctx, msg));
     }
     let then = BoxSequence::new(nctx.ctx.mutation(), UnwrapResumeSequence);
-    Ok(CallbackAction::Resume {
-        thread: co,
-        then: Some(then),
-    })
+    Ok(CallbackAction::resume(co, Some(then)))
 }
 
 // ---------------------------------------------------------------------------

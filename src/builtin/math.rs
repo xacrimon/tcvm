@@ -8,7 +8,7 @@ use crate::builtin::util::{
     check_integer, check_number, compare_error_msg, float_to_integer, num_to_value,
 };
 use crate::env::{
-    Error, Function, LuaString, NativeContext, NativeFn, Stack, Table, Userdata, Value,
+    Error, FastCall, Function, LuaString, NativeContext, NativeFn, Stack, Table, Userdata, Value,
 };
 use crate::vm::num;
 use crate::vm::sequence::CallbackAction;
@@ -51,7 +51,14 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         } else {
             Box::new([])
         };
-        let handler = Function::new_native(ctx.mutation(), handler, upvalues);
+        let fast = match name {
+            "sqrt" => FastCall::Sqrt,
+            "abs" => FastCall::Abs,
+            "floor" => FastCall::Floor,
+            "ceil" => FastCall::Ceil,
+            _ => FastCall::None,
+        };
+        let handler = Function::new_native_fast(ctx.mutation(), handler, upvalues, fast);
         let key = Value::string(LuaString::new(ctx, name.as_bytes()));
         lib.raw_set(ctx, key, Value::function(handler));
     }
@@ -80,7 +87,7 @@ macro_rules! float_unary {
         ) -> Result<CallbackAction<'gc>, Error<'gc>> {
             let x = check_number(nctx.ctx, stack.get(0), $fname, 1)?;
             let f: fn(f64) -> f64 = $op;
-            stack.replace(&[Value::float(f(x))]);
+            stack.ret1(Value::float(f(x)));
             Ok(CallbackAction::Return)
         }
     };
@@ -107,7 +114,7 @@ fn lua_abs<'gc>(
     } else {
         Value::float(check_number(nctx.ctx, v, "abs", 1)?.abs())
     };
-    stack.replace(&[result]);
+    stack.ret1(result);
     Ok(CallbackAction::Return)
 }
 
@@ -123,7 +130,7 @@ fn lua_atan<'gc>(
     } else {
         check_number(nctx.ctx, x_arg, "atan", 2)?
     };
-    stack.replace(&[Value::float(y.atan2(x))]);
+    stack.ret1(Value::float(y.atan2(x)));
     Ok(CallbackAction::Return)
 }
 
@@ -147,7 +154,7 @@ fn lua_log<'gc>(
             x.ln() / base.ln()
         }
     };
-    stack.replace(&[Value::float(result)]);
+    stack.ret1(Value::float(result));
     Ok(CallbackAction::Return)
 }
 
@@ -176,7 +183,7 @@ fn lua_fmod<'gc>(
         let y = check_number(nctx.ctx, b, "fmod", 2)?;
         Value::float(x % y)
     };
-    stack.replace(&[result]);
+    stack.ret1(result);
     Ok(CallbackAction::Return)
 }
 
@@ -227,7 +234,7 @@ fn round_to_int<'gc>(
     } else {
         num_to_value(round(check_number(nctx.ctx, v, fname, 1)?))
     };
-    stack.replace(&[result]);
+    stack.ret1(result);
     Ok(CallbackAction::Return)
 }
 
@@ -285,7 +292,7 @@ fn select_extreme<'gc>(
             best = v;
         }
     }
-    stack.replace(&[best]);
+    stack.ret1(best);
     Ok(CallbackAction::Return)
 }
 
@@ -313,7 +320,7 @@ fn lua_tointeger<'gc>(
     } else {
         Value::nil()
     };
-    stack.replace(&[result]);
+    stack.ret1(result);
     Ok(CallbackAction::Return)
 }
 
@@ -330,7 +337,7 @@ fn lua_type<'gc>(
     } else {
         Value::nil()
     };
-    stack.replace(&[result]);
+    stack.ret1(result);
     Ok(CallbackAction::Return)
 }
 
@@ -341,7 +348,7 @@ fn lua_ult<'gc>(
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let m = check_integer(nctx.ctx, stack.get(0), "ult", 1)?;
     let n = check_integer(nctx.ctx, stack.get(1), "ult", 2)?;
-    stack.replace(&[Value::boolean((m as u64) < (n as u64))]);
+    stack.ret1(Value::boolean((m as u64) < (n as u64)));
     Ok(CallbackAction::Return)
 }
 
@@ -488,7 +495,7 @@ fn lua_random<'gc>(
         })
         .expect("RNG userdata payload type mismatch");
 
-    stack.replace(&[result]);
+    stack.ret1(result);
     Ok(CallbackAction::Return)
 }
 

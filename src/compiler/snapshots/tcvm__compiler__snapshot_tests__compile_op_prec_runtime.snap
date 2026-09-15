@@ -25,4 +25,4 @@ expression: output
 0011  [  6]  GETTABUP        R0 U0 K1  ; "a"
 0012  [  6]  UNM             R0 R0
 0013  [  6]  SETTABUP        R0 U0 K0  ; "num"
-0014  [  6]  RETURN          R0 count=1
+0014  [  6]  RETURN0

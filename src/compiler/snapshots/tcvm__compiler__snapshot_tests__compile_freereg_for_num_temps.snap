@@ -20,7 +20,7 @@ expression: output
 0008  [  3]  FORPREP         R2 +2
 0009  [  3]  ADD             R1 R1 R5
 0010  [  3]  FORLOOP         R2 -2
-0011  [  4]  RETURN          R1 count=2
+0011  [  4]  RETURN1         R1
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=1, upvalues=0)
@@ -28,4 +28,4 @@ expression: output
   ;   K0 = 3
   ; code:
   0000  [  1]  LOAD            R0 K0  ; 3
-  0001  [  1]  RETURN          R0 count=2
+  0001  [  1]  RETURN1         R0
