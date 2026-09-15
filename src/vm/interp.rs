@@ -1543,25 +1543,26 @@ macro_rules! arith_imm_handler {
                 if std::hint::likely(v.kind() == ValueKind::Integer)
                     && let Some(i) = v.get_integer()
                 {
-                    let out = if $swap {
-                        op_arith_int::<$num_kind>(k, i)
+                    if $swap {
+                        // The register is the divisor, so RMODI/RIDIVI
+                        // still check it.
+                        let Some(out) = op_arith_int::<$num_kind>(k, i) else {
+                            raise!(if Op::$instr == Op::RMODI {
+                                OpError::ModByZero
+                            } else {
+                                OpError::DivByZero
+                            });
+                        };
+                        *reg!(ref mut dst) = out;
                     } else {
                         // The compiler never emits a zero integer divisor
                         // in this position, so no `n % 0` check.
                         debug_assert!(
                             !<$num_kind as num::ArithOp>::INT_ZERO_DIVISOR_INVALID || k != 0
                         );
-                        Some(<$num_kind as num::ArithOp>::int(i, k))
-                    };
-                    if let Some(out) = out {
-                        *reg!(ref mut dst) = out;
-                        dispatch!();
+                        *reg!(ref mut dst) = <$num_kind as num::ArithOp>::int(i, k);
                     }
-                    raise!(if Op::$instr == Op::RMODI {
-                        OpError::ModByZero
-                    } else {
-                        OpError::DivByZero
-                    });
+                    dispatch!();
                 } else if let Some(f) = v.get_float() {
                     let k = k as f64;
                     let (l, r) = if $swap { (k, f) } else { (f, k) };

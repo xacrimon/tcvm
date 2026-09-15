@@ -24,6 +24,8 @@
 
 use std::fmt;
 
+use crate::env::value::Value;
+
 /// A register index. Canonical home for what the compiler calls
 /// `RegisterIndex`, so emitter code can pass one straight to a constructor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -391,11 +393,11 @@ impl Instruction {
     /// The `Value` an immediate stands for; slow paths hand it to
     /// metamethods and error messages.
     #[inline]
-    pub fn imm_value<'gc>(self) -> crate::env::value::Value<'gc> {
+    pub fn imm_value<'gc>(self) -> Value<'gc> {
         if self.imm_is_int() {
-            crate::env::value::Value::integer(self.imm_int())
+            Value::integer(self.imm_int())
         } else {
-            crate::env::value::Value::float(self.imm_float())
+            Value::float(self.imm_float())
         }
     }
 

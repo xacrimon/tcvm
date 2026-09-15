@@ -3281,8 +3281,8 @@ fn compile_expr_binary_op(
 
     // Immediate forms: a packable numeral on either side becomes the
     // instruction's immediate and only the other operand takes a register.
-    // The RHS is tried first so `1 - x` with both sides numeral (fold refused)
-    // still prefers the direct form.
+    // The RHS is tried first so both sides numeral with the fold refused
+    // (`1 // 0.0`) still prefers the direct form.
     let rhs_imm = match rhs_desc.kind {
         ExprKind::Numeral(n) if !rhs_desc.has_jumps() => arith_imm(op, n, false),
         _ => None,
@@ -3393,6 +3393,8 @@ fn arith_imm(op: BinaryOperator, n: Numeral, imm_on_left: bool) -> Option<(Arith
         }
         Numeral::Float(f) => Imm::from_float(f)?,
     };
+    // Only integer zero is unsafe; a float zero divisor packs and yields
+    // nan/inf like the register form.
     if !imm_on_left && matches!(op, B::Mod | B::IntDiv) && n == Numeral::Int(0) {
         return None;
     }
@@ -3469,9 +3471,12 @@ fn compile_comparison_desc(
 
     // Immediate forms: a packable numeral on either side (`i < 10`,
     // `0 <= x`) needs no register; the opcode absorbs the side it was on.
+    // The LHS stays lazy only if it packs: a numeral that must take a
+    // register is materialised *before* the RHS, or its `LOAD` would land
+    // inside a jump-carrying RHS's short-circuit span and be skipped.
     let mut lhs_desc = compile_expr(ctx, lhs_expr, None)?;
     let lhs_numeral = match lhs_desc.kind {
-        ExprKind::Numeral(n) if !lhs_desc.has_jumps() => Some(n),
+        ExprKind::Numeral(n) if !lhs_desc.has_jumps() && imm_packs(n) => Some(n),
         _ => None,
     };
     if lhs_numeral.is_none() {
@@ -3479,7 +3484,7 @@ fn compile_comparison_desc(
     }
     let mut rhs_desc = compile_expr(ctx, rhs_expr, None)?;
     let rhs_numeral = match rhs_desc.kind {
-        ExprKind::Numeral(n) if !rhs_desc.has_jumps() => Some(n),
+        ExprKind::Numeral(n) if !rhs_desc.has_jumps() && imm_packs(n) => Some(n),
         _ => None,
     };
     let imm_form = match (lhs_numeral, rhs_numeral) {
@@ -3542,8 +3547,16 @@ fn compile_comparison_desc(
     })
 }
 
+fn imm_packs(n: Numeral) -> bool {
+    match n {
+        Numeral::Int(i) => Imm::from_int(i).is_some(),
+        Numeral::Float(f) => Imm::from_float(f).is_some(),
+    }
+}
+
 /// The immediate comparison for `R op n` (or `n op R` when `imm_on_left`),
 /// with the polarity `compile_comparison_desc` wants (jump fires on truthy).
+/// `n` must pack (see `imm_packs`).
 fn cmp_imm(op: BinaryOperator, n: Numeral, imm_on_left: bool) -> Option<(CmpImmCtor, Imm)> {
     use BinaryOperator as B;
     let imm = match n {
