@@ -1,5 +1,5 @@
 use crate::Context;
-use crate::dmm::{Collect, Gc, Lock, Mutation, RefLock};
+use crate::dmm::{Collect, Gc, Lock, Mutation, RefLock, Trace};
 use crate::env::error::Error;
 use crate::env::shape::Shape;
 use crate::env::string::LuaString;
@@ -109,11 +109,28 @@ pub enum UpvalueState<'gc> {
 pub type Upvalue<'gc> = Gc<'gc, RefLock<UpvalueState<'gc>>>;
 
 /// A Lua closure (bytecode + upvalues).
-#[derive(Collect)]
-#[collect(internal, no_drop)]
 pub struct LuaClosure<'gc> {
     pub proto: Gc<'gc, Prototype<'gc>>,
     pub upvalues: Box<[Upvalue<'gc>]>,
+    // Copies of the `proto` fields CALL needs, so entering a function is one
+    // dependent load shorter (closure -> code, not closure -> proto -> code).
+    // The pointers stay valid because `proto` is immutable and kept alive by
+    // this closure; they are not traced (the `Gc` above is).
+    pub code: *const crate::instruction::Instruction,
+    pub constants: *const Value<'gc>,
+    pub ic_table: *const Lock<InlineCache<'gc>>,
+    pub max_stack_size: u8,
+    pub num_params: u8,
+    pub is_vararg: bool,
+}
+
+// SAFETY: `proto` and `upvalues` are the only owned Gc pointers; the raw
+// pointers alias data owned by `proto`.
+unsafe impl<'gc> Collect<'gc> for LuaClosure<'gc> {
+    fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
+        cc.trace(&self.proto);
+        cc.trace(&self.upvalues);
+    }
 }
 
 /// A native closure (Rust function + optional upvalues).
@@ -376,7 +393,19 @@ impl<'gc> Function<'gc> {
         proto: Gc<'gc, Prototype<'gc>>,
         upvalues: Box<[Upvalue<'gc>]>,
     ) -> Self {
-        let closure = Gc::new(mc, LuaClosure { proto, upvalues });
+        let closure = Gc::new(
+            mc,
+            LuaClosure {
+                proto,
+                upvalues,
+                code: proto.code.as_ptr(),
+                constants: proto.constants.as_ptr(),
+                ic_table: proto.ic_table.as_ptr(),
+                max_stack_size: proto.max_stack_size,
+                num_params: proto.num_params,
+                is_vararg: proto.is_vararg,
+            },
+        );
         Function(Gc::new(mc, FunctionKind::Lua(closure)))
     }
 
