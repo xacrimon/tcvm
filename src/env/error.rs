@@ -17,12 +17,20 @@ pub struct Error<'gc> {
     /// resets it to 0 so re-raising along the unwind path never prefixes
     /// twice.
     level: usize,
+    /// Set once an `xpcall` message handler has run for this error, so the
+    /// unwinder doesn't run it again as the (possibly transformed) error
+    /// continues to the catcher.
+    handled: bool,
 }
 
 impl<'gc> Error<'gc> {
     /// Raise `value` verbatim (`lua_error`).
     pub fn new(value: Value<'gc>) -> Self {
-        Error { value, level: 0 }
+        Error {
+            value,
+            level: 0,
+            handled: false,
+        }
     }
 
     /// Raise a message prefixed with the caller's position (`luaL_error`).
@@ -54,5 +62,25 @@ impl<'gc> Error<'gc> {
             let text = format!("(error object is a {} value)", v.type_name());
             LuaString::new(ctx, text.as_bytes())
         }
+    }
+
+    /// Swap the payload, keeping the handled flag (level is consumed).
+    pub(crate) fn with_value(self, value: Value<'gc>) -> Self {
+        Error {
+            value,
+            level: 0,
+            ..self
+        }
+    }
+
+    pub(crate) fn mark_handled(self) -> Self {
+        Error {
+            handled: true,
+            ..self
+        }
+    }
+
+    pub(crate) fn is_handled(self) -> bool {
+        self.handled
     }
 }

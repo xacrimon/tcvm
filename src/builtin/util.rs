@@ -2,9 +2,12 @@
 //! stringification and small argument-coercion routines used across the
 //! `basic`, `string`, `table`, and `io` libraries.
 
-use crate::dmm::Gc;
-use crate::env::{Error, LuaString, Value};
+use std::pin::Pin;
+
+use crate::dmm::{Collect, Gc, Trace};
+use crate::env::{Error, Function, LuaString, Stack, Value};
 use crate::lua::Context;
+use crate::vm::sequence::{Execution, Sequence, SequencePoll, seq_trace_pointers};
 
 /// Append the canonical Lua textual form of an integer.
 pub(crate) fn push_int(out: &mut Vec<u8>, i: i64) {
@@ -334,4 +337,48 @@ fn push_addr(out: &mut Vec<u8>, kind: &str, ptr: *const ()) {
 
 fn push_ptr(out: &mut Vec<u8>, ptr: *const ()) {
     out.extend_from_slice(format!("{ptr:p}").as_bytes());
+}
+
+/// Completion sequence for `pcall`, `xpcall`, and `coroutine.resume`: the
+/// call's results come back prefixed with `true`; an error that unwinds to
+/// it becomes `(false, err)`. With a `handler` it is the `xpcall` catcher
+/// the executor consults via `message_handler`.
+#[derive(Collect)]
+#[collect(internal, no_drop)]
+pub(crate) struct ProtectedCall<'gc> {
+    pub(crate) handler: Option<Function<'gc>>,
+}
+
+impl<'gc> Sequence<'gc> for ProtectedCall<'gc> {
+    fn trace_pointers(&self, cc: &mut dyn Trace<'gc>) {
+        seq_trace_pointers!(self, cc);
+    }
+
+    fn poll(
+        self: Pin<&mut Self>,
+        _ctx: Context<'gc>,
+        _exec: Execution<'gc, '_>,
+        mut stack: Stack<'gc, '_>,
+    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
+        let mut vals = Vec::with_capacity(stack.len() + 1);
+        vals.push(Value::boolean(true));
+        vals.extend_from_slice(stack.as_slice());
+        stack.replace(&vals);
+        Ok(SequencePoll::Return)
+    }
+
+    fn error(
+        self: Pin<&mut Self>,
+        _ctx: Context<'gc>,
+        _exec: Execution<'gc, '_>,
+        err: Error<'gc>,
+        mut stack: Stack<'gc, '_>,
+    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
+        stack.replace(&[Value::boolean(false), err.value()]);
+        Ok(SequencePoll::Return)
+    }
+
+    fn message_handler(&self) -> Option<Function<'gc>> {
+        self.handler
+    }
 }

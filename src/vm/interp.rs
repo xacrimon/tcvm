@@ -2853,7 +2853,7 @@ pub(crate) fn invoke_native<'gc>(
     let nctx = NativeContext {
         ctx,
         upvalues: &nc.upvalues,
-        exec: crate::vm::sequence::Execution::new(current_thread),
+        exec: crate::vm::sequence::Execution::new(current_thread, &thread.frames),
     };
     let stack = Stack::new(&mut thread.stack, &mut thread.top, args_base);
     // The stack is grown-not-shrunk and may leave dead scratch above the logical
