@@ -195,18 +195,7 @@ pub struct ThreadState<'gc> {
 // `tbc_slots`/`status`/`top`/`yield_bottom` hold no `Gc` pointers.
 unsafe impl<'gc> Collect<'gc> for ThreadState<'gc> {
     fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
-        let live_top = self
-            .frames
-            .iter()
-            .filter_map(|f| match f {
-                Frame::Lua(lf) => Some(lf.base + lf.closure.proto.max_stack_size as usize),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(0)
-            .max(self.top)
-            .min(self.stack.len());
-        cc.trace(&self.stack[..live_top]);
+        cc.trace(&self.stack[..self.live_top()]);
         cc.trace(&self.frames);
         cc.trace(&self.open_upvalues);
         cc.trace(&self.thread_handle);
@@ -313,6 +302,40 @@ impl<'gc> ThreadState<'gc> {
     #[inline]
     pub fn window(&self, bottom: usize) -> &[Value<'gc>] {
         &self.stack[bottom..self.top]
+    }
+
+    /// End of the live region (see the type docs): the topmost Lua frame's
+    /// register window or `top`, whichever is higher, clamped to the vec.
+    pub fn live_top(&self) -> usize {
+        self.frames
+            .iter()
+            .filter_map(|f| match f {
+                Frame::Lua(lf) => Some(lf.base + lf.closure.proto.max_stack_size as usize),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+            .max(self.top)
+            .min(self.stack.len())
+    }
+
+    /// Publish a new logical top *without* nil-filling what it vacates.
+    /// Interpreter fast paths only: the collector can never run while
+    /// `run_thread` is on the Rust stack, and `run_thread` calls
+    /// [`ThreadState::trim_dead`] on every exit, which restores rule 3 before
+    /// anything can trace the thread. `n` must already be physically covered.
+    #[inline]
+    pub(crate) fn set_top_dirty(&mut self, n: usize) {
+        debug_assert!(n <= self.stack.len());
+        self.top = n;
+    }
+
+    /// Release everything above the live region. Cheap (a length store), and
+    /// exactly what makes `set_top_dirty` sound: nothing above `live_top` is
+    /// reachable, and whatever is regrown later is nil-filled by `ensure_slots`.
+    pub(crate) fn trim_dead(&mut self) {
+        let live = self.live_top();
+        self.stack.truncate(live);
     }
 
     /// Publish a new logical top, nil-filling any slots it vacates (rule 3).
