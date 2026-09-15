@@ -1,4 +1,4 @@
-use crate::dmm::{Gc, Mutation, RefLock};
+use crate::dmm::{Gc, Lock, Mutation, RefLock};
 use crate::env::function::{
     Function, FunctionKind, InlineCache, LuaClosure, NativeClosure, NativeContext, Stack, Upvalue,
     UpvalueState,
@@ -107,19 +107,22 @@ pub(crate) type Registers<'gc, 'a> = *mut Value<'gc>;
 pub(crate) struct DispatchState<'gc> {
     /// Set by `raise!` right before it tail-calls `impl_error`, which takes it.
     fault: Option<OpError<'gc>>,
-    /// The running closure's constant pool and upvalue array, so `constant!`
-    /// and `upvalue!` are one load off `ds` instead of a five-deep chase
-    /// through `thread.frames`. Valid because the frame keeps the closure
-    /// alive; every site that changes the top Lua frame and keeps
-    /// dispatching must `bind` the new closure alongside `registers`.
+    /// The running closure's constant pool, upvalue array and inline-cache
+    /// table, so `constant!`, `upvalue!` and `read_ic` are one load off `ds`
+    /// instead of a five-deep chase through `thread.frames`. Valid because
+    /// the frame keeps the closure alive; every site that changes the top
+    /// Lua frame and keeps dispatching must `bind` the new closure alongside
+    /// `registers`.
     constants: *const Value<'gc>,
     upvalues: *const Upvalue<'gc>,
+    ic_table: *const Lock<InlineCache<'gc>>,
 }
 
 impl<'gc> DispatchState<'gc> {
     fn bind(&mut self, closure: &LuaClosure<'gc>) {
         self.constants = closure.proto.constants.as_ptr();
         self.upvalues = closure.upvalues.as_ptr();
+        self.ic_table = closure.proto.ic_table.as_ptr();
     }
 }
 
@@ -512,12 +515,20 @@ macro_rules! table_set_slow_body {
 /// `SETTABUP` instruction whose prototype was assembled with a matching
 /// `ic_table` length.
 #[inline(always)]
-fn read_ic<'gc>(thread: &ThreadState<'gc>, ic_idx: u16) -> InlineCache<'gc> {
+fn read_ic<'gc>(
+    ds: &DispatchState<'gc>,
+    thread: &ThreadState<'gc>,
+    ic_idx: u16,
+) -> InlineCache<'gc> {
     // SAFETY: ic_idx is allocated at compile-time within the prototype's
     // IC count; debug-asserted in alloc_ic_slot's saturating_add.
-    let proto = unsafe { &thread.top_lua_unchecked().closure.proto };
-    debug_assert!((ic_idx as usize) < proto.ic_table.len());
-    unsafe { proto.ic_table.get_unchecked(ic_idx as usize) }.get()
+    debug_assert!(
+        (ic_idx as usize)
+            < unsafe { &thread.top_lua_unchecked().closure.proto }
+                .ic_table
+                .len()
+    );
+    unsafe { (*ds.ic_table.add(ic_idx as usize)).get() }
 }
 
 /// Refill the IC entry. Called by slow paths after they've done a full
@@ -608,6 +619,7 @@ pub(crate) fn run_thread<'gc>(ctx: Context<'gc>, thread: Thread<'gc>) {
         fault: None,
         constants: std::ptr::null(),
         upvalues: std::ptr::null(),
+        ic_table: std::ptr::null(),
     };
     ds.bind(&ts.top_lua().unwrap().closure);
     op_nop(
@@ -773,7 +785,7 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
         raise!(OpError::Index(t_val));
     };
 
-    let cache = read_ic(thread, ic_idx);
+    let cache = read_ic(ds, thread, ic_idx);
     let t_state = t.inner().borrow();
     if let Some(slot) = ic_check(cache, t_state.shape()) {
         if slot != InlineCache::ABSENT_SLOT {
@@ -834,7 +846,7 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
     };
 
     let v = reg!(src);
-    let cache = read_ic(thread, ic_idx);
+    let cache = read_ic(ds, thread, ic_idx);
     let t_state = t.inner().borrow();
     if let Some(slot) = ic_check(cache, t_state.shape()) {
         if slot != InlineCache::ABSENT_SLOT {
@@ -1018,7 +1030,7 @@ extern "rust-preserve-none" fn op_getfield<'gc>(
         become getfield_slow(instruction, ctx, thread, registers, ip, handlers, ds);
     };
 
-    let cache = read_ic(thread, ic_idx);
+    let cache = read_ic(ds, thread, ic_idx);
     let t_state = t.inner().borrow();
     if let Some(slot) = ic_check(cache, t_state.shape()) {
         if slot != InlineCache::ABSENT_SLOT {
@@ -1079,7 +1091,7 @@ extern "rust-preserve-none" fn op_setfield<'gc>(
     };
 
     let v = reg!(src);
-    let cache = read_ic(thread, ic_idx);
+    let cache = read_ic(ds, thread, ic_idx);
     let t_state = t.inner().borrow();
     if let Some(slot) = ic_check(cache, t_state.shape()) {
         if slot != InlineCache::ABSENT_SLOT {
