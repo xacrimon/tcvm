@@ -1,7 +1,7 @@
 use crate::dmm::{Gc, Lock, Mutation, RefLock};
 use crate::env::function::{
-    FastCall, Function, FunctionKind, InlineCache, LuaClosure, NativeClosure, NativeContext, Stack,
-    Upvalue, UpvalueState,
+    FastCall, Function, FunctionKind, InlineCache, LuaClosure, LuaFn, NativeClosure, NativeContext,
+    Stack, Upvalue, UpvalueState,
 };
 use crate::env::shape::{MetamethodBits, Shape};
 use crate::env::string::LuaString;
@@ -745,7 +745,7 @@ extern "rust-preserve-none" fn impl_error<'gc>(
     ip: *const Instruction,
     _handlers: *const (),
     ds: &mut DispatchState<'gc>,
-    frame: *mut LuaFrame<'gc>,
+    _frame: *mut LuaFrame<'gc>,
 ) {
     let kind = ds.fault.take().expect("impl_error without a pending fault");
     // `ip` already points past the faulting instruction (see `dispatch!`),
@@ -2465,8 +2465,13 @@ macro_rules! call_lua {
             } else {
                 $nargs as usize - 1
             };
+            // Inside the window sized above (grown here or checked by the
+            // caller), so no bounds check — its panic path is the only call
+            // this arm would otherwise make.
+            debug_assert!(new_base + num_params <= $thread.stack.len());
+            let stack = $thread.stack.as_mut_ptr();
             for i in caller_provided..num_params {
-                $thread.stack[new_base + i] = Value::nil();
+                unsafe { *stack.add(new_base + i) = Value::nil() };
             }
             if closure.is_vararg {
                 caller_provided.saturating_sub(num_params) as u32
@@ -2537,8 +2542,9 @@ extern "rust-preserve-none" fn op_call<'gc>(
                         frame,
                     );
                 }
+                let closure = unsafe { LuaFn::from_function_unchecked(f) };
                 call_lua!(
-                    nogrow, *closure, func_idx, nargs, returns, thread, registers, ip, ds, frame
+                    nogrow, closure, func_idx, nargs, returns, thread, registers, ip, ds, frame
                 );
             }
             FunctionKind::Native(nc) => {
@@ -4035,7 +4041,7 @@ fn walk_newindex_chain<'gc>(
 /// caller must push a frame for) or a native Rust callback (which the caller
 /// invokes inline).
 pub(crate) enum CallTarget<'gc> {
-    Lua(Gc<'gc, LuaClosure<'gc>>),
+    Lua(LuaFn<'gc>),
     Native(&'gc NativeClosure<'gc>),
 }
 
@@ -4079,7 +4085,10 @@ fn resolve_call_chain<'gc>(
     // walk (and its stack frame) out of the handler.
     if let Some(f) = thread.stack[func_idx].get_function() {
         return match f.inner().as_ref() {
-            FunctionKind::Lua(c) => Some((CallTarget::Lua(*c), nargs)),
+            FunctionKind::Lua(_) => Some((
+                CallTarget::Lua(unsafe { LuaFn::from_function_unchecked(f) }),
+                nargs,
+            )),
             FunctionKind::Native(nc) => Some((CallTarget::Native(nc), nargs)),
         };
     }
@@ -4098,7 +4107,10 @@ fn resolve_call_chain_slow<'gc>(
         let func_val = thread.stack[func_idx];
         if let Some(f) = func_val.get_function() {
             return match f.inner().as_ref() {
-                FunctionKind::Lua(c) => Some((CallTarget::Lua(*c), nargs)),
+                FunctionKind::Lua(_) => Some((
+                    CallTarget::Lua(unsafe { LuaFn::from_function_unchecked(f) }),
+                    nargs,
+                )),
                 FunctionKind::Native(nc) => Some((CallTarget::Native(nc), nargs)),
             };
         }

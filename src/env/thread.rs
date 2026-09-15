@@ -1,6 +1,6 @@
 use crate::dmm::{Collect, Gc, Mutation, Ref, RefLock, RefMut, Trace};
 use crate::env::error::Error;
-use crate::env::function::{Function, LuaClosure, Upvalue};
+use crate::env::function::{Function, LuaFn, Upvalue};
 use crate::env::value::Value;
 use crate::lua::Context;
 use crate::vm::interp::Continuation;
@@ -40,7 +40,7 @@ pub enum ThreadStatus {
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub struct LuaFrame<'gc> {
-    pub closure: Gc<'gc, LuaClosure<'gc>>,
+    pub closure: LuaFn<'gc>,
     pub base: usize,
     /// Resume address: points *past* the instruction being executed, into
     /// `closure.proto.code` (which the frame keeps alive). A raw pointer
