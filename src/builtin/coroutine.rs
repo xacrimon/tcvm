@@ -70,9 +70,8 @@ fn lua_resume<'gc>(
         stack.replace(&[Value::boolean(false), m]);
         return Ok(CallbackAction::Return);
     }
-    // Drop the thread-handle slot — args to pass start at index 1.
-    let args: Vec<Value<'gc>> = stack.as_slice()[1..].to_vec();
-    stack.replace(&args);
+    // Drop the thread-handle slot so the resume args start at index 0.
+    stack.remove(0);
     let then = BoxSequence::new(nctx.ctx.mutation(), ProtectedCall { handler: None });
     Ok(CallbackAction::Resume {
         thread: co,

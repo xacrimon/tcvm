@@ -575,9 +575,7 @@ fn lua_xpcall<'gc>(
         ));
     };
     // Drop the handler slot so the callee and its args sit in `Call` layout.
-    let n = stack.len();
-    stack.as_mut_slice().copy_within(2.., 1);
-    stack.truncate(n - 1);
+    stack.remove(1);
     let then = BoxSequence::new(
         nctx.ctx.mutation(),
         ProtectedCall {

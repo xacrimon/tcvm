@@ -266,14 +266,14 @@ impl<'gc, 'a> Stack<'gc, 'a> {
         *self.top += 1;
     }
 
-    /// Drop everything past the first `len` values, nil-filling like `clear`.
+    /// Remove the value at `i`, shifting `stack[i + 1..]` down one.
     #[inline]
-    pub fn truncate(&mut self, len: usize) {
-        let new_top = self.bottom + len;
-        if new_top < *self.top {
-            self.values[new_top..*self.top].fill(Value::nil());
-            *self.top = new_top;
-        }
+    pub fn remove(&mut self, i: usize) {
+        let at = self.bottom + i;
+        debug_assert!(at < *self.top);
+        self.values.copy_within(at + 1..*self.top, at);
+        *self.top -= 1;
+        self.values[*self.top] = Value::nil();
     }
 
     /// Convenience for the common "clear args, push N results" pattern.
