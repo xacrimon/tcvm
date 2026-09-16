@@ -202,18 +202,86 @@ fn lua_loadfile<'gc>(
     todo!()
 }
 
+/// `next(t [, k])` — `(k', t[k'])` for the entry after `k` in traversal
+/// order, or a lone `nil` at the end.
 fn lua_next<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    let Some(t) = stack.get(0).get_table() else {
+        let got = if stack.is_empty() {
+            "no value"
+        } else {
+            stack.get(0).type_name()
+        };
+        return Err(Error::from_str(
+            nctx.ctx,
+            &format!("bad argument #1 to 'next' (table expected, got {got})"),
+        ));
+    };
+    match t.next(stack.get(1)) {
+        Ok(Some((k, v))) => stack.replace(&[k, v]),
+        Ok(None) => stack.replace(&[Value::nil()]),
+        Err(_) => return Err(Error::from_str(nctx.ctx, "invalid key to 'next'")),
+    }
+    Ok(CallbackAction::Return)
 }
 
+/// `pairs(t)` — `(next, t, nil, nil)`, or the four values `__pairs(t)`
+/// returns when the metatable defines it. Like the reference, the
+/// argument is only checked for presence; a non-table without `__pairs`
+/// fails later in `next`.
 fn lua_pairs<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    if stack.is_empty() {
+        return Err(Error::from_str(
+            nctx.ctx,
+            "bad argument #1 to 'pairs' (value expected)",
+        ));
+    }
+    let t = stack.get(0);
+    let metatable = match t.get_table() {
+        Some(t) => t.metatable(),
+        None => t.get_userdata().and_then(|u| u.metatable()),
+    };
+    let mm = metatable.map_or(Value::nil(), |mt| {
+        mt.raw_get(Value::string(LuaString::new(nctx.ctx, b"__pairs")))
+    });
+    if mm.is_nil() {
+        let next = Function::new_native(nctx.ctx.mutation(), lua_next, Box::new([]));
+        stack.replace(&[Value::function(next), t, Value::nil(), Value::nil()]);
+        return Ok(CallbackAction::Return);
+    }
+    stack.replace(&[mm, t]);
+    let then = BoxSequence::new(nctx.ctx.mutation(), PairsAdjust);
+    Ok(CallbackAction::Call { then: Some(then) })
+}
+
+/// Completion for `pairs` via `__pairs`: adjust the metamethod's results
+/// to exactly four, as `lua_call(L, 1, 4)` does.
+struct PairsAdjust;
+
+unsafe impl<'gc> Collect<'gc> for PairsAdjust {
+    const NEEDS_TRACE: bool = false;
+}
+
+impl<'gc> Sequence<'gc> for PairsAdjust {
+    fn trace_pointers(&self, _cc: &mut dyn Trace<'gc>) {}
+
+    fn poll(
+        self: Pin<&mut Self>,
+        _ctx: Context<'gc>,
+        _exec: Execution<'gc, '_>,
+        mut stack: Stack<'gc, '_>,
+    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
+        stack.truncate(4);
+        while stack.len() < 4 {
+            stack.push(Value::nil());
+        }
+        Ok(SequencePoll::Return)
+    }
 }
 
 /// `pcall(f, ...)`: run `f` under a [`ProtectedCall`] completion that turns
