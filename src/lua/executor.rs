@@ -10,7 +10,9 @@ use crate::lua::convert::{FromMultiValue, IntoMultiValue};
 use crate::vm;
 use crate::vm::interp::{CallTarget, OpError};
 use crate::vm::interp::{Continuation, ContinuationPayload};
-use crate::vm::sequence::{BoxSequence, CallbackAction, Catch, Execution, Sequence, SequencePoll};
+use crate::vm::sequence::{
+    BoxSequence, CallbackAction, Catch, Execution, Sequence, SequencePoll, seq_trace_pointers,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, Collect)]
 #[collect(internal, require_static)]
@@ -936,7 +938,8 @@ fn apply_native_continuation<'gc>(
 /// Call an `xpcall` message handler with `err` above the failing frames
 /// (`luaG_errormsg`). A `HandlerSequence` frame collects its result and
 /// re-raises it, marked handled, so the unwind then proceeds to the catcher
-/// without consulting the handler again.
+/// without consulting the handler again; an error inside the handler is
+/// handed back to the handler.
 fn run_message_handler<'gc>(
     ts: &mut ThreadState<'gc>,
     ctx: Context<'gc>,
@@ -951,7 +954,7 @@ fn run_message_handler<'gc>(
     ts.stack[slot + 1] = err.value();
     ts.set_top(slot + 2);
     ts.frames.push(Frame::Sequence {
-        seq: BoxSequence::new(ctx.mutation(), HandlerSequence),
+        seq: BoxSequence::new(ctx.mutation(), HandlerSequence { handler, depth: 0 }),
         call_site: CallSite {
             bottom: slot,
             func_idx: slot,
@@ -964,15 +967,24 @@ fn run_message_handler<'gc>(
 }
 
 /// Completion of an `xpcall` message handler: its first result becomes the
-/// error value; an error inside the handler is "error in error handling".
-struct HandlerSequence;
-
-unsafe impl<'gc> Collect<'gc> for HandlerSequence {
-    const NEEDS_TRACE: bool = false;
+/// error value. An error inside the handler calls the handler again with
+/// it (manual §2.3), on top of the still-intact failing frames, until the
+/// loop is cut with "error in error handling" like the reference's C-stack
+/// limit does.
+#[derive(Collect)]
+#[collect(internal, no_drop)]
+struct HandlerSequence<'gc> {
+    handler: Function<'gc>,
+    depth: u32,
 }
 
-impl<'gc> Sequence<'gc> for HandlerSequence {
-    fn trace_pointers(&self, _cc: &mut dyn Trace<'gc>) {}
+/// `LUAI_MAXCCALLS`: nested handler invocations before giving up.
+const MAX_HANDLER_DEPTH: u32 = 200;
+
+impl<'gc> Sequence<'gc> for HandlerSequence<'gc> {
+    fn trace_pointers(&self, cc: &mut dyn Trace<'gc>) {
+        seq_trace_pointers!(self, cc);
+    }
 
     fn poll(
         self: Pin<&mut Self>,
@@ -984,15 +996,24 @@ impl<'gc> Sequence<'gc> for HandlerSequence {
     }
 
     fn error(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         ctx: Context<'gc>,
         _exec: Execution<'gc, '_>,
-        _err: Error<'gc>,
-        _stack: Stack<'gc, '_>,
+        err: Error<'gc>,
+        mut stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
-        let msg = LuaString::new(ctx, b"error in error handling");
-        Err(Error::new(Value::string(msg)).mark_handled())
+        if self.depth == MAX_HANDLER_DEPTH {
+            let msg = LuaString::new(ctx, b"error in error handling");
+            return Err(Error::new(Value::string(msg)).mark_handled());
+        }
+        self.depth += 1;
+        stack.replace(&[err.value()]);
+        Ok(SequencePoll::Call {
+            function: self.handler,
+            bottom: 0,
+        })
     }
+
     fn catch(&self) -> Catch<'gc> {
         Catch::Here(None)
     }

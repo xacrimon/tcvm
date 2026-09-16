@@ -133,8 +133,15 @@ fn xpcall_handler_transforms_the_error() {
 
 #[test]
 fn xpcall_handler_errors_and_nesting() {
+    // An error inside the handler calls the handler again with it (manual
+    // §2.3); the loop is cut after a fixed depth. The reference gives up
+    // when its C stack runs out (215 calls with LUAI_MAXCCALLS = 200); we
+    // stop at exactly 1 + 200.
     check(
-        "local ok, e = xpcall(function() error('orig') end, function(e) error('in handler') end) return (not ok and e == 'error in error handling') and 1 or 0",
+        "local n = 0 local ok, e = xpcall(function() error('orig') end, function(e) n = n + 1 error('in handler') end) return (not ok and e == 'error in error handling' and n == 201) and 1 or 0",
+    );
+    check(
+        "local m = 0 local ok, e = xpcall(function() error('orig') end, function(e) m = m + 1 if m == 1 then error('once') end return 'H' .. m .. ':' .. e end) return (not ok and e == 'H2:t:1: once') and 1 or 0",
     );
     // An inner pcall shadows the outer handler for errors it catches.
     check(
@@ -221,6 +228,24 @@ fn handler_runs_before_the_stack_unwinds() {
         },
     );
     assert_eq!(frames, 3);
+}
+
+#[test]
+fn retried_handler_still_sees_the_failing_frames() {
+    // The first invocation fails; the retry runs with only that invocation
+    // unwound, so it counts main, `outer`, `deep`, and itself.
+    let frames: i64 = run_with(
+        "local function deep() error('x') end\n\
+         local function outer() deep() end\n\
+         local first = true\n\
+         local ok, n = xpcall(outer, function(e)\n\
+           if first then first = false error('again') end\n\
+           return lua_frames()\n\
+         end)\n\
+         return n",
+        install_through,
+    );
+    assert_eq!(frames, 4);
 }
 
 /// `through(f, ...)`: call `f` under a sequence that keeps the default
