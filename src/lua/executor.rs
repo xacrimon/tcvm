@@ -1,13 +1,18 @@
-use crate::dmm::{Collect, Gc, RefLock};
+use std::pin::Pin;
+
+use crate::dmm::{Collect, Gc, RefLock, Trace};
 use crate::env::function::Function;
-use crate::env::thread::{CallSite, Frame, LuaFrame, PendingAction, ThreadStatus};
-use crate::env::{Thread, Value};
+use crate::env::thread::{CallSite, Frame, LuaFrame, PendingAction, ThreadState, ThreadStatus};
+use crate::env::{Error, LuaString, Stack, Thread, Value};
 use crate::lua::RuntimeError;
 use crate::lua::context::Context;
 use crate::lua::convert::{FromMultiValue, IntoMultiValue};
 use crate::vm;
+use crate::vm::interp::{CallTarget, OpError};
 use crate::vm::interp::{Continuation, ContinuationPayload};
-use crate::vm::sequence::CallbackAction;
+use crate::vm::sequence::{
+    BoxSequence, CallbackAction, Catch, Execution, Sequence, SequencePoll, seq_trace_pointers,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, Collect)]
 #[collect(internal, require_static)]
@@ -249,7 +254,7 @@ impl<'gc> Executor<'gc> {
                         _ => unreachable!(),
                     };
                     ts.insert_at(0, Value::function(f));
-                    schedule_call_at(&mut ts, ctx, 0, f, 0)?;
+                    schedule_call_at(&mut ts, ctx, 0, 0)?;
                     if ts.frames.is_empty() && ts.pending_action.is_none() {
                         // Native entry returned `Return` synchronously;
                         // results sit at stack[0..] and the thread is
@@ -309,15 +314,7 @@ impl<'gc> Executor<'gc> {
         {
             let mut ts = top.borrow_mut(mc);
             ts.set_window(cs.bottom, buf);
-            // Branch on top frame: a Sequence consumes values from
-            // stack[seq.bottom..] on its next poll, so we leave them at
-            // `bottom`. A Lua frame on top means the yield came from a
-            // native CALL inline — land the args at func_idx via the
-            // standard call-return convention so dispatch resumes
-            // correctly.
-            if !matches!(ts.frames.last(), Some(Frame::Sequence { .. })) {
-                land_call_results(&mut ts, cs);
-            }
+            land_call_results(&mut ts, cs);
             // `land_call_results` may have *terminated* the thread: a tail-called
             // native suspends with the calling Lua frame already popped, so the
             // resume that lands its results empties the frame stack and sets
@@ -403,33 +400,45 @@ fn apply_pending_action<'gc>(
                 pending_error: None,
             });
         }
-        CallbackAction::Call { function, then } => {
+        CallbackAction::Call { then } => {
             let mut ts = top.borrow_mut(mc);
             // If `then` provided, the sequence is the call's "completion
             // handler"; it inherits the caller's expected_returns. The
             // sequence sees the called function's results at stack[bottom..].
             //
             // We push `then` BEFORE scheduling the call so that if the
-            // called native errors immediately, schedule_call_at's
-            // Frame::Error (see #2 in review.md) lands above this
-            // sequence and the unwinder routes the error to it.
-            if let Some(seq) = then {
-                ts.frames.push(Frame::Sequence {
-                    seq,
-                    call_site,
-                    pending_error: None,
-                });
-            }
-            // Now schedule the call. The callback that produced `Call`
-            // left its desired args at stack[bottom..] with no function
-            // slot in front; insert the function so the layout matches
-            // schedule_call_at's convention (function at slot, args
-            // after).
-            ts.insert_at(call_site.bottom, Value::function(function));
-            schedule_call_at(&mut ts, ctx, call_site.bottom, function, call_site.returns)?;
+            // callee can't be resolved or errors immediately, the
+            // Frame::Error lands above this sequence and the unwinder
+            // routes the error to it.
+            let slot = match then {
+                Some(seq) => {
+                    ts.frames.push(Frame::Sequence {
+                        seq,
+                        call_site,
+                        pending_error: None,
+                    });
+                    call_site.bottom
+                }
+                // No completion: the callee returns straight to the CALL
+                // site, so it must sit where the CALL put its function.
+                None => {
+                    let (bottom, top) = (call_site.bottom, ts.top);
+                    ts.stack.copy_within(bottom..top, call_site.func_idx);
+                    ts.set_top(call_site.func_idx + (top - bottom));
+                    call_site.func_idx
+                }
+            };
+            schedule_call_at(&mut ts, ctx, slot, call_site.returns)?;
         }
         CallbackAction::Yield { then } => {
             let mut ts = top.borrow_mut(mc);
+            // With a follow-up sequence the resume args are its input and
+            // stay at `bottom`; without one they are the call's results.
+            let landing = if then.is_some() {
+                in_place(call_site.bottom)
+            } else {
+                call_site
+            };
             if let Some(seq) = then {
                 ts.frames.push(Frame::Sequence {
                     seq,
@@ -437,10 +446,7 @@ fn apply_pending_action<'gc>(
                     pending_error: None,
                 });
             }
-            // Yielded values live at stack[bottom..]. Mark thread
-            // suspended and stash where they are so the next pump can
-            // find them (propagation to resumer, host-side resume, etc.).
-            ts.yield_bottom = Some(call_site);
+            ts.yield_bottom = Some(landing);
             ts.status = ThreadStatus::Suspended;
         }
         CallbackAction::Resume {
@@ -449,6 +455,11 @@ fn apply_pending_action<'gc>(
         } => {
             // Optional `then` fires when target yields/returns; install on
             // the resumer first so it's seen *after* the WaitThread frame.
+            let landing = if then.is_some() {
+                in_place(call_site.bottom)
+            } else {
+                call_site
+            };
             if let Some(seq) = then {
                 top.borrow_mut(mc).frames.push(Frame::Sequence {
                     seq,
@@ -456,7 +467,7 @@ fn apply_pending_action<'gc>(
                     pending_error: None,
                 });
             }
-            schedule_thread_resume(exec, ctx, top, target, call_site.bottom, call_site)?;
+            schedule_thread_resume(exec, ctx, top, target, call_site.bottom, landing)?;
         }
     }
     Ok(())
@@ -503,19 +514,14 @@ fn schedule_thread_resume<'gc>(
             ts.set_window(0, args);
             ts.status = ThreadStatus::Normal;
         } else if matches!(ts.status, ThreadStatus::Suspended) {
-            // Mid-resume: target previously yielded. Drain yield_bottom
-            // to recover where the yielded native CALL landed, place the
-            // resume-args, then either land via call-return convention
-            // (Lua frame on top) or leave at bottom (Sequence on top —
-            // it reads stack[seq.bottom..] directly on next poll).
+            // Mid-resume: target previously yielded. Place the resume-args
+            // where it stashed its landing site and deliver them.
             let y = match ts.yield_bottom.take() {
                 Some(y) => y,
                 None => return Err(RuntimeError::BadMode),
             };
             ts.set_window(y.bottom, args);
-            if !matches!(ts.frames.last(), Some(Frame::Sequence { .. })) {
-                land_call_results(&mut ts, y);
-            }
+            land_call_results(&mut ts, y);
             ts.status = ThreadStatus::Normal;
         } else {
             return Err(RuntimeError::BadMode);
@@ -525,18 +531,27 @@ fn schedule_thread_resume<'gc>(
     Ok(())
 }
 
-/// Push a Lua/Native call frame for `function` whose function-slot is at
-/// `slot` (so args live at `slot+1..`). For Lua: a `LuaFrame` with `base =
-/// slot+1`. For Native: invoke synchronously and either land Return values
-/// at `slot..` or stash a pending action.
+/// Call the value at `stack[slot]` with the args above it (through any
+/// `__call` chain). For Lua: push a `LuaFrame` with `base = slot+1`. For
+/// Native: invoke synchronously and either land Return values at `slot..`
+/// or stash a pending action. A non-callable value raises "attempt to
+/// call" at level 0, as the raiser is a native (`luaG_callerror` adds no
+/// position for a C `ci`).
 fn schedule_call_at<'gc>(
     ts: &mut crate::env::thread::ThreadState<'gc>,
     ctx: Context<'gc>,
     slot: usize,
-    function: Function<'gc>,
     caller_returns: u8,
 ) -> Result<(), RuntimeError> {
-    if let Some(closure) = function.as_lua() {
+    let Some((target, _)) = vm::interp::resolve_call_chain(ctx, ts, slot, 0) else {
+        let msg = vm::debug::op_error_message(ctx, ts, OpError::Call(ts.stack[slot]));
+        ts.raise(
+            ctx,
+            Error::new(Value::string(LuaString::new(ctx, msg.as_bytes()))),
+        );
+        return Ok(());
+    };
+    if let CallTarget::Lua(closure) = target {
         let base = slot + 1;
         let caller_provided = ts.top.saturating_sub(base);
         let num_params = closure.proto.num_params as usize;
@@ -562,9 +577,9 @@ fn schedule_call_at<'gc>(
     } else {
         // Native target. Drive synchronously; if it returns Return we land
         // values at [slot..]; otherwise stash a new pending_action.
-        let nc = function
-            .as_native()
-            .expect("function is neither Lua nor Native");
+        let CallTarget::Native(nc) = target else {
+            unreachable!()
+        };
         let args_base = slot + 1;
         let argc = ts.top - args_base;
         let action = match vm::interp::invoke_native(ctx, ts, nc, args_base, argc) {
@@ -649,7 +664,7 @@ fn pump_sequence<'gc>(
         let ts: &mut crate::env::thread::ThreadState<'gc> = &mut ts;
         let stack_view =
             crate::env::function::Stack::new(&mut ts.stack, &mut ts.top, call_site.bottom);
-        let exec = Execution::new(top);
+        let exec = Execution::new(top, &ts.frames);
         if let Some(err) = pending_error {
             seq.error(ctx, exec, err, stack_view)
         } else {
@@ -685,7 +700,7 @@ fn pump_sequence<'gc>(
             });
             // Schedule the call: insert function at abs_bottom, args after.
             ts.insert_at(abs_bottom, Value::function(function));
-            schedule_call_at(&mut ts, ctx, abs_bottom, function, 0)?;
+            schedule_call_at(&mut ts, ctx, abs_bottom, 0)?;
         }
         Ok(SequencePoll::TailCall(function)) => {
             // Sequence is done; the call's results must land at the
@@ -705,13 +720,7 @@ fn pump_sequence<'gc>(
                 ts.set_top(new_args_base + argc);
             }
             ts.stack[call_site.func_idx] = Value::function(function);
-            schedule_call_at(
-                &mut ts,
-                ctx,
-                call_site.func_idx,
-                function,
-                call_site.returns,
-            )?;
+            schedule_call_at(&mut ts, ctx, call_site.func_idx, call_site.returns)?;
         }
         Ok(SequencePoll::Yield { bottom: rel }) => {
             let abs_bottom = call_site.bottom + rel;
@@ -722,12 +731,7 @@ fn pump_sequence<'gc>(
                 call_site,
                 pending_error: None,
             });
-            ts.yield_bottom = Some(CallSite {
-                bottom: abs_bottom,
-                func_idx: call_site.func_idx,
-                returns: call_site.returns,
-                cont: call_site.cont,
-            });
+            ts.yield_bottom = Some(in_place(abs_bottom));
             ts.status = ThreadStatus::Suspended;
         }
         Ok(SequencePoll::TailYield) => {
@@ -748,7 +752,7 @@ fn pump_sequence<'gc>(
                 call_site,
                 pending_error: None,
             });
-            schedule_thread_resume(exec, ctx, top, target, abs_bottom, call_site)?;
+            schedule_thread_resume(exec, ctx, top, target, abs_bottom, in_place(abs_bottom))?;
         }
         Ok(SequencePoll::TailResume(target)) => {
             // Sequence is consumed; target's eventual values go straight
@@ -794,23 +798,25 @@ fn propagate_inner_to_resumer<'gc>(
         Some(Frame::WaitThread { call_site }) => call_site,
         _ => unreachable!("propagate_inner_to_resumer: resumer top is not WaitThread"),
     };
-    // Land values at resumer.stack[wt.bottom..] for the next sequence /
-    // call frame to consume. If a `then` sequence sits underneath, it'll
-    // pick them up at its own `bottom == wt.bottom`. If not, do the
-    // standard CALL-landing right now.
     rs.set_window(wt.bottom, values);
-    let next_is_sequence = matches!(rs.frames.last(), Some(Frame::Sequence { .. }));
-    if !next_is_sequence {
-        // No follow-up sequence: deliver results directly to the original
-        // Lua CALL window.
-        land_call_results(&mut rs, wt);
-    }
+    land_call_results(&mut rs, wt);
     // `land_call_results` may have terminated the resumer (frames went
     // empty → status Result). Only revert to Normal if it didn't.
     if !matches!(rs.status, ThreadStatus::Result { .. }) {
         rs.status = ThreadStatus::Normal;
     }
     Ok(())
+}
+
+/// A landing site that leaves values at `bottom`: what a sequence records
+/// when it suspends on its own behalf and will read them back there.
+fn in_place(bottom: usize) -> CallSite {
+    CallSite {
+        bottom,
+        func_idx: bottom,
+        returns: 0,
+        cont: None,
+    }
 }
 
 /// Move values at `stack[bottom..]` into the original CALL's expected
@@ -929,13 +935,104 @@ fn apply_native_continuation<'gc>(
     ts.set_top(caller_top);
 }
 
-/// Walk a thread's frame stack popping Lua/Wait frames (closing upvalues
-/// at each `bottom`) until a `Sequence` frame can catch the error.
+/// Call an `xpcall` message handler with `err` above the failing frames
+/// (`luaG_errormsg`). A `HandlerSequence` frame collects its result and
+/// re-raises it, marked handled, so the unwind then proceeds to the catcher
+/// without consulting the handler again; an error inside the handler is
+/// handed back to the handler.
+fn run_message_handler<'gc>(
+    ts: &mut ThreadState<'gc>,
+    ctx: Context<'gc>,
+    handler: Function<'gc>,
+    err: Error<'gc>,
+) -> Result<(), RuntimeError> {
+    // Stage above every live register (`top` alone can sit inside the
+    // innermost window when the catcher's callee failed at once).
+    let slot = ts.live_top();
+    ts.ensure_slots(slot + 2);
+    ts.stack[slot] = Value::function(handler);
+    ts.stack[slot + 1] = err.value();
+    ts.set_top(slot + 2);
+    ts.frames.push(Frame::Sequence {
+        seq: BoxSequence::new(ctx.mutation(), HandlerSequence { handler, depth: 0 }),
+        call_site: CallSite {
+            bottom: slot,
+            func_idx: slot,
+            returns: 0,
+            cont: None,
+        },
+        pending_error: None,
+    });
+    schedule_call_at(ts, ctx, slot, 0)
+}
+
+/// Completion of an `xpcall` message handler: its first result becomes the
+/// error value. An error inside the handler calls the handler again with
+/// it (manual §2.3), on top of the still-intact failing frames, until the
+/// loop is cut with "error in error handling" like the reference's C-stack
+/// limit does. The handler may yield: the reference forbids that only
+/// because it runs the handler on the C stack, and we keep every call
+/// resumable, as LuaJIT does.
+#[derive(Collect)]
+#[collect(internal, no_drop)]
+struct HandlerSequence<'gc> {
+    handler: Function<'gc>,
+    depth: u32,
+}
+
+/// `LUAI_MAXCCALLS`: nested handler invocations before giving up.
+const MAX_HANDLER_DEPTH: u32 = 200;
+
+impl<'gc> Sequence<'gc> for HandlerSequence<'gc> {
+    fn trace_pointers(&self, cc: &mut dyn Trace<'gc>) {
+        seq_trace_pointers!(self, cc);
+    }
+
+    fn poll(
+        self: Pin<&mut Self>,
+        _ctx: Context<'gc>,
+        _exec: Execution<'gc, '_>,
+        stack: Stack<'gc, '_>,
+    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
+        Err(Error::new(stack.get(0)).mark_handled())
+    }
+
+    fn error(
+        mut self: Pin<&mut Self>,
+        ctx: Context<'gc>,
+        _exec: Execution<'gc, '_>,
+        err: Error<'gc>,
+        mut stack: Stack<'gc, '_>,
+    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
+        if self.depth == MAX_HANDLER_DEPTH {
+            let msg = LuaString::new(ctx, b"error in error handling");
+            return Err(Error::new(Value::string(msg)).mark_handled());
+        }
+        self.depth += 1;
+        stack.replace(&[err.value()]);
+        Ok(SequencePoll::Call {
+            function: self.handler,
+            bottom: 0,
+        })
+    }
+
+    fn catch(&self) -> Catch<'gc> {
+        Catch::Here(None)
+    }
+}
+
+/// Walk a thread's frame stack popping Lua/Wait/`Catch::Pass` frames
+/// (closing upvalues at each Lua `bottom`) until a `Catch::Here` sequence
+/// takes the error.
+///
+/// If the nearest catcher has a message handler (`xpcall`), the handler
+/// runs first, on top of the still-intact failing frames; see
+/// `run_message_handler`.
 ///
 /// On no-catcher: if the thread isn't the bottom of the executor's
 /// thread stack, route the error to the resumer's `Frame::WaitThread`
 /// and pop the inner thread. This lets a coroutine error propagate to
-/// the resumer's `PCallSequence::error`. If the thread *is* the bottom,
+/// the resumer's `ProtectedCall::error`. If the thread *is* the bottom,
 /// surface as `RuntimeError::Lua` to the host.
 fn unwind_error<'gc>(
     exec: Executor<'gc>,
@@ -943,45 +1040,74 @@ fn unwind_error<'gc>(
     top: Thread<'gc>,
 ) -> Result<(), RuntimeError> {
     let mc = ctx.mutation();
-    let err = {
-        let mut ts = top.borrow_mut(mc);
-        let err = match ts.frames.pop() {
-            Some(Frame::Error(e)) => e,
-            _ => unreachable!(),
-        };
-        loop {
-            match ts.frames.last() {
-                Some(Frame::Lua(lf)) => {
-                    let base = lf.base;
-                    ts.frames.pop();
-                    vm::interp::close_upvalues(mc, &mut ts, base);
-                    vm::interp::close_tbc_vars(mc, &mut ts, base);
-                    // The frame and everything above it is dead, so this is one
-                    // of the few places a shrink is legal.
-                    ts.discard_above(base);
-                }
-                Some(Frame::Sequence { .. }) => {
-                    if let Some(Frame::Sequence { pending_error, .. }) = ts.frames.last_mut() {
-                        *pending_error = Some(err);
-                    }
-                    return Ok(());
-                }
-                Some(Frame::WaitThread { .. }) => {
-                    ts.frames.pop();
-                }
-                Some(Frame::Start(_)) | Some(Frame::Error(_)) => {
-                    // Frame::Start is only on a freshly-created thread
-                    // that hasn't run yet, so it can't have errored.
-                    // Frame::Error is removed by the next driver pump
-                    // (which enters this function), so two can't coexist.
-                    unreachable!(
-                        "Frame::Start / Frame::Error mid-unwind violates the executor invariant"
-                    );
-                }
-                None => break err,
-            }
-        }
+    let mut ts = top.borrow_mut(mc);
+    let Some(Frame::Error(err)) = ts.frames.pop() else {
+        unreachable!()
     };
+    if !err.is_handled() {
+        // Only the nearest catch point's handler applies (`L->errfunc`):
+        // a plain `pcall` in between shadows an outer `xpcall`, while a
+        // `Catch::Pass` sequence is looked through.
+        let handler = ts
+            .frames
+            .iter()
+            .rev()
+            .find_map(|f| match f {
+                Frame::Sequence { seq, .. } => match seq.catch() {
+                    Catch::Pass => None,
+                    Catch::Here(handler) => Some(handler),
+                },
+                _ => None,
+            })
+            .flatten();
+        if let Some(handler) = handler {
+            return run_message_handler(&mut ts, ctx, handler, err);
+        }
+    }
+    // `luaD_seterrorobj`: only once the error is being caught (a handler
+    // still sees the raw nil).
+    let err = if err.value().is_nil() {
+        err.with_value(Value::string(LuaString::new(ctx, b"<no error object>")))
+    } else {
+        err
+    };
+    loop {
+        match ts.frames.last_mut() {
+            Some(Frame::Lua(lf)) => {
+                let base = lf.base;
+                ts.frames.pop();
+                vm::interp::close_upvalues(mc, &mut ts, base);
+                vm::interp::close_tbc_vars(mc, &mut ts, base);
+                // The frame and everything above it is dead, so this is one
+                // of the few places a shrink is legal.
+                ts.discard_above(base);
+            }
+            Some(Frame::Sequence {
+                seq, pending_error, ..
+            }) => {
+                if matches!(seq.catch(), Catch::Pass) {
+                    ts.frames.pop();
+                    continue;
+                }
+                *pending_error = Some(err);
+                return Ok(());
+            }
+            Some(Frame::WaitThread { .. }) => {
+                ts.frames.pop();
+            }
+            Some(Frame::Start(_) | Frame::Error(_)) => {
+                // Frame::Start is only on a freshly-created thread that
+                // hasn't run yet, so it can't have errored. Frame::Error is
+                // removed by the next driver pump (which enters this
+                // function), so two can't coexist.
+                unreachable!(
+                    "Frame::Start / Frame::Error mid-unwind violates the executor invariant"
+                );
+            }
+            None => break,
+        }
+    }
+    drop(ts);
 
     // No catcher on this thread. If we're an inner coroutine, propagate to
     // the resumer's WaitThread → its next Sequence can catch.

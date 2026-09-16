@@ -1,9 +1,13 @@
 use std::io::Write;
+use std::pin::Pin;
 
 use crate::Context;
 use crate::builtin::util;
+use crate::dmm::{Collect, Trace};
 use crate::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Value};
-use crate::vm::sequence::CallbackAction;
+use crate::vm::sequence::{
+    BoxSequence, CallbackAction, Catch, Execution, Sequence, SequencePoll, seq_trace_pointers,
+};
 
 // TODO(#27): _G, _VERSION
 
@@ -212,11 +216,63 @@ fn lua_pairs<'gc>(
     todo!()
 }
 
+/// `pcall(f, ...)`: run `f` under a [`ProtectedCall`] completion that turns
+/// its results into `(true, ...)` and a caught error into `(false, err)`.
+/// The callee and its arguments are already in `Call` layout; a
+/// non-callable `f` is raised by the executor inside the protected call,
+/// so it comes back as `(false, msg)` like the reference.
 fn lua_pcall<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
+    stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    if stack.is_empty() {
+        return Err(Error::from_str(
+            nctx.ctx,
+            "bad argument #1 to 'pcall' (value expected)",
+        ));
+    }
+    let then = BoxSequence::new(nctx.ctx.mutation(), ProtectedCall { handler: None });
+    Ok(CallbackAction::Call { then: Some(then) })
+}
+
+/// Completion sequence for `pcall`, `xpcall`, and `coroutine.resume`: the
+/// call's results come back prefixed with `true`; an error that unwinds to
+/// it becomes `(false, err)`, after the `xpcall` `handler` (if any) has run.
+#[derive(Collect)]
+#[collect(internal, no_drop)]
+pub(crate) struct ProtectedCall<'gc> {
+    pub(crate) handler: Option<Function<'gc>>,
+}
+
+impl<'gc> Sequence<'gc> for ProtectedCall<'gc> {
+    fn trace_pointers(&self, cc: &mut dyn Trace<'gc>) {
+        seq_trace_pointers!(self, cc);
+    }
+
+    fn poll(
+        self: Pin<&mut Self>,
+        _ctx: Context<'gc>,
+        _exec: Execution<'gc, '_>,
+        mut stack: Stack<'gc, '_>,
+    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
+        stack.insert(0, Value::boolean(true));
+        Ok(SequencePoll::Return)
+    }
+
+    fn error(
+        self: Pin<&mut Self>,
+        _ctx: Context<'gc>,
+        _exec: Execution<'gc, '_>,
+        err: Error<'gc>,
+        mut stack: Stack<'gc, '_>,
+    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
+        stack.replace(&[Value::boolean(false), err.value()]);
+        Ok(SequencePoll::Return)
+    }
+
+    fn catch(&self) -> Catch<'gc> {
+        Catch::Here(self.handler)
+    }
 }
 
 /// `print(...)` — write each argument's `tostring` form to stdout, separated
@@ -501,9 +557,30 @@ fn lua_warn<'gc>(
     Ok(CallbackAction::Return)
 }
 
+/// `xpcall(f, msgh, ...)`: like `pcall`, but the executor calls `msgh` with
+/// the error value before unwinding (see `Catch::Here`).
 fn lua_xpcall<'gc>(
-    _ctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    let Some(handler) = stack.get(1).get_function() else {
+        let got = if stack.len() < 2 {
+            "no value"
+        } else {
+            stack.get(1).type_name()
+        };
+        return Err(Error::from_str(
+            nctx.ctx,
+            &format!("bad argument #2 to 'xpcall' (function expected, got {got})"),
+        ));
+    };
+    // Drop the handler slot so the callee and its args sit in `Call` layout.
+    stack.remove(1);
+    let then = BoxSequence::new(
+        nctx.ctx.mutation(),
+        ProtectedCall {
+            handler: Some(handler),
+        },
+    );
+    Ok(CallbackAction::Call { then: Some(then) })
 }

@@ -1,12 +1,13 @@
 use std::pin::Pin;
 
 use crate::Context;
+use crate::builtin::basic::ProtectedCall;
 use crate::dmm::{Collect, Trace};
 use crate::env::thread::{Frame, ThreadStatus};
 use crate::env::{
     Error, Function, LuaString, NativeContext, NativeFn, Stack, Table, Thread, Value,
 };
-use crate::vm::sequence::{BoxSequence, CallbackAction, Execution, Sequence, SequencePoll};
+use crate::vm::sequence::{BoxSequence, CallbackAction, Catch, Execution, Sequence, SequencePoll};
 
 pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[
@@ -52,7 +53,7 @@ fn lua_create<'gc>(
 }
 
 /// `coroutine.resume(co, ...)` — switch to `co`, passing the rest as args.
-/// On `co` yielding/returning, the [`PCallSequence`] wraps the values as
+/// On `co` yielding/returning, the [`ProtectedCall`] wraps the values as
 /// `(true, ...)`; on error, it produces `(false, msg)`. If `co` isn't
 /// resumable (dead, currently running, on the resume stack as a parent, or
 /// the main thread) we return `(false, msg)` directly per the manual
@@ -69,10 +70,9 @@ fn lua_resume<'gc>(
         stack.replace(&[Value::boolean(false), m]);
         return Ok(CallbackAction::Return);
     }
-    // Drop the thread-handle slot — args to pass start at index 1.
-    let args: Vec<Value<'gc>> = stack.as_slice()[1..].to_vec();
-    stack.replace(&args);
-    let then = BoxSequence::new(nctx.ctx.mutation(), PCallSequence);
+    // Drop the thread-handle slot so the resume args start at index 0.
+    stack.remove(0);
+    let then = BoxSequence::new(nctx.ctx.mutation(), ProtectedCall { handler: None });
     Ok(CallbackAction::Resume {
         thread: co,
         then: Some(then),
@@ -273,44 +273,6 @@ fn wrap_callback<'gc>(
 // Sequences
 // ---------------------------------------------------------------------------
 
-/// Wraps a coroutine resume: prepends `true` to the inner thread's
-/// returned/yielded values; on a thrown error, returns `(false, msg)`.
-struct PCallSequence;
-
-unsafe impl<'gc> Collect<'gc> for PCallSequence {
-    const NEEDS_TRACE: bool = false;
-}
-
-impl<'gc> Sequence<'gc> for PCallSequence {
-    fn trace_pointers(&self, _cc: &mut dyn Trace<'gc>) {}
-
-    fn poll(
-        self: Pin<&mut Self>,
-        _ctx: Context<'gc>,
-        _exec: Execution<'gc, '_>,
-        mut stack: Stack<'gc, '_>,
-    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
-        // Inner thread completed/yielded; values are at stack[..]. Prepend
-        // `true` and return.
-        let mut vals: Vec<Value<'gc>> = Vec::with_capacity(stack.len() + 1);
-        vals.push(Value::boolean(true));
-        vals.extend_from_slice(stack.as_slice());
-        stack.replace(&vals);
-        Ok(SequencePoll::Return)
-    }
-
-    fn error(
-        self: Pin<&mut Self>,
-        _ctx: Context<'gc>,
-        _exec: Execution<'gc, '_>,
-        err: Error<'gc>,
-        mut stack: Stack<'gc, '_>,
-    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
-        stack.replace(&[Value::boolean(false), err.value()]);
-        Ok(SequencePoll::Return)
-    }
-}
-
 /// `coroutine.wrap`'s follow-up sequence: returns the inner thread's
 /// values verbatim on success, rethrows on error.
 struct UnwrapResumeSequence;
@@ -342,5 +304,12 @@ impl<'gc> Sequence<'gc> for UnwrapResumeSequence {
         // `auxwrap` re-raises a string error with the wrap caller's position
         // prepended on top of the coroutine's own.
         Err(err.with_level(1))
+    }
+
+    /// The rethrow is a fresh raise on the resumer (`auxwrap`'s
+    /// `lua_error`), so an enclosing `xpcall` handler must see the
+    /// re-prefixed message, not the coroutine's original.
+    fn catch(&self) -> Catch<'gc> {
+        Catch::Here(None)
     }
 }

@@ -40,3 +40,48 @@ fn async_pending_then_return() {
     let result: i64 = lua.execute(&ex).expect("run");
     assert_eq!(result, 7);
 }
+
+/// `guard(f)`: `call(f).await` and report whether it returned an error.
+fn guard<'gc>(
+    nctx: NativeContext<'gc, '_>,
+    stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, tcvm::env::Error<'gc>> {
+    let f = stack.get(0).get_function().expect("function");
+    let mc = nctx.ctx.mutation();
+    let seq = async_sequence(mc, move |locals, mut seq| {
+        let f = locals.stash(mc, f);
+        async move {
+            let caught = seq.call(&f, 0).await.is_err();
+            seq.enter(|_ctx, _locals, _exec, mut stack| {
+                stack.replace(&[Value::boolean(caught)]);
+            });
+            Ok(SequenceReturn::Return)
+        }
+    });
+    Ok(CallbackAction::Sequence(seq))
+}
+
+/// An error raised by the awaited call is delivered to the future rather
+/// than unwinding past the sequence.
+#[test]
+fn async_call_receives_callee_error() {
+    let mut lua = Lua::new();
+    lua.load_all();
+
+    let ex = lua
+        .try_enter(|ctx| -> Result<_, LoadError> {
+            let guard_fn = Function::new_native(ctx.mutation(), guard as NativeFn, Box::new([]));
+            let key = Value::string(LuaString::new(ctx, b"guard"));
+            ctx.globals().raw_set(ctx, key, Value::function(guard_fn));
+            let chunk = ctx.load(
+                "local caught = guard(function() error('x') end)\n\
+                 local fine = guard(function() return 1 end)\n\
+                 return (caught == true and fine == false) and 1 or 0",
+                Some("async_call_error"),
+            )?;
+            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+        })
+        .expect("load");
+    let result: i64 = lua.execute(&ex).expect("run");
+    assert_eq!(result, 1);
+}

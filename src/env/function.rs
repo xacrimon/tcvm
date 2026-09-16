@@ -253,6 +253,29 @@ impl<'gc, 'a> Stack<'gc, 'a> {
         }
     }
 
+    /// Shift `stack[i..]` up one and put `v` at `i`.
+    #[inline]
+    pub fn insert(&mut self, i: usize, v: Value<'gc>) {
+        let at = self.bottom + i;
+        debug_assert!(at <= *self.top);
+        if *self.top == self.values.len() {
+            self.values.push(Value::nil());
+        }
+        self.values.copy_within(at..*self.top, at + 1);
+        self.values[at] = v;
+        *self.top += 1;
+    }
+
+    /// Remove the value at `i`, shifting `stack[i + 1..]` down one.
+    #[inline]
+    pub fn remove(&mut self, i: usize) {
+        let at = self.bottom + i;
+        debug_assert!(at < *self.top);
+        self.values.copy_within(at + 1..*self.top, at);
+        *self.top -= 1;
+        self.values[*self.top] = Value::nil();
+    }
+
     /// Convenience for the common "clear args, push N results" pattern.
     #[inline]
     pub fn replace(&mut self, values: &[Value<'gc>]) {
