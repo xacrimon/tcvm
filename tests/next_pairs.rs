@@ -77,8 +77,9 @@ fn every_part_with_holes() {
 
 #[test]
 fn dict_mode_strings() {
-    let got = keys("local t = {} for i = 1, 40 do t['k' .. i] = i end return keys(t)");
-    assert!(got.starts_with("40:k10=10 k11=11"), "{got}");
+    // Past MAX_PROPERTIES_FAST (64), so the string part is a dict.
+    let got = keys("local t = {} for i = 1, 70 do t['k' .. i] = i end return keys(t)");
+    assert!(got.starts_with("70:k10=10 k11=11"), "{got}");
     assert!(got.ends_with("k8=8 k9=9"), "{got}");
 }
 
@@ -98,11 +99,35 @@ fn clear_every_entry_mid_traversal() {
 fn clear_dict_mode_mid_traversal() {
     assert_eq!(
         keys(
-            "local t = {} for i = 1, 40 do t['k' .. i] = i end
+            "local t = {} for i = 1, 70 do t['k' .. i] = i end
              for k in pairs(t) do t[k] = nil end
              return tostring(next(t)) .. ' ' .. keys(t)"
         ),
         "nil 0:"
+    );
+}
+
+/// Deleting must not rehash even when the hash part is exactly full, or the
+/// scan would jump over entries. Sweeping sizes 1..=256 crosses every
+/// hashbrown capacity boundary for both the misc and (past 64) dict parts.
+#[test]
+fn clear_full_hash_mid_traversal() {
+    assert_eq!(
+        run_str(
+            "local bad = {}
+             for n = 1, 256 do
+               local m, d = {}, {}
+               for i = 1, n do m[-i] = i d['k' .. i] = i end
+               local c = 0
+               for k in pairs(m) do m[k] = nil m[-999] = nil c = c + 1 end
+               if c ~= n or next(m) ~= nil then bad[#bad + 1] = 'm' .. n end
+               c = 0
+               for k in pairs(d) do d[k] = nil d.absent = nil c = c + 1 end
+               if c ~= n or next(d) ~= nil then bad[#bad + 1] = 'd' .. n end
+             end
+             return table.concat(bad, ' ')"
+        ),
+        ""
     );
 }
 
@@ -167,6 +192,7 @@ fn bad_argument() {
 #[test]
 fn pairs_returns_four_values() {
     check("select('#', pairs({})) == 4");
+    check("pairs({}) == next");
     // Only presence is checked; a non-table fails later in `next`.
     check("select(2, pairs(1)) == 1");
 }

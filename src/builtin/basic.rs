@@ -21,8 +21,6 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         ("ipairs", lua_ipairs),
         ("load", lua_load),
         ("loadfile", lua_loadfile),
-        ("next", lua_next),
-        ("pairs", lua_pairs),
         ("pcall", lua_pcall),
         ("print", lua_print),
         ("rawequal", lua_rawequal),
@@ -38,12 +36,23 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         ("xpcall", lua_xpcall),
     ];
 
-    for &(name, handler) in fns {
-        let handler = Function::new_native(ctx.mutation(), handler, Box::new([]));
+    let set = |name: &str, f: Function<'gc>| {
         let key = Value::string(LuaString::new(ctx, name.as_bytes()));
-
-        ctx.globals().raw_set(ctx, key, Value::function(handler));
+        ctx.globals().raw_set(ctx, key, Value::function(f));
+    };
+    for &(name, handler) in fns {
+        set(
+            name,
+            Function::new_native(ctx.mutation(), handler, Box::new([])),
+        );
     }
+    // `pairs` hands back the same `next` the global holds, so `pairs(t) == next`.
+    let next = Function::new_native(ctx.mutation(), lua_next, Box::new([]));
+    set("next", next);
+    set(
+        "pairs",
+        Function::new_native(ctx.mutation(), lua_pairs, Box::new([Value::function(next)])),
+    );
 }
 
 /// `assert(v [, message, ...])` — if `v` is truthy, return all arguments
@@ -227,10 +236,10 @@ fn lua_next<'gc>(
     Ok(CallbackAction::Return)
 }
 
-/// `pairs(t)` — `(next, t, nil, nil)`, or the four values `__pairs(t)`
-/// returns when the metatable defines it. Like the reference, the
-/// argument is only checked for presence; a non-table without `__pairs`
-/// fails later in `next`.
+/// `pairs(t)` — `(next, t, nil, nil)` with `next` from upvalue 0, or the
+/// four values `__pairs(t)` returns when the metatable defines it. Like the
+/// reference, the argument is only checked for presence; a non-table
+/// without `__pairs` fails later in `next`.
 fn lua_pairs<'gc>(
     nctx: NativeContext<'gc, '_>,
     mut stack: Stack<'gc, '_>,
@@ -250,8 +259,7 @@ fn lua_pairs<'gc>(
         mt.raw_get(Value::string(LuaString::new(nctx.ctx, b"__pairs")))
     });
     if mm.is_nil() {
-        let next = Function::new_native(nctx.ctx.mutation(), lua_next, Box::new([]));
-        stack.replace(&[Value::function(next), t, Value::nil(), Value::nil()]);
+        stack.replace(&[nctx.upvalues[0], t, Value::nil(), Value::nil()]);
         return Ok(CallbackAction::Return);
     }
     stack.replace(&[mm, t]);

@@ -304,6 +304,12 @@ impl<'gc> TableState<'gc> {
             // and `next` can resume from the deleted key.
             self.properties[slot as usize] = value;
         } else {
+            // Deleting an absent key is a no-op; a slot for it would burn a
+            // shape transition, and at the cap the dict migration would drop
+            // the nil-valued entries a `pairs` loop still resumes from.
+            if value.is_nil() {
+                return;
+            }
             // New slot. Cap shape growth to bound the transition tree;
             // beyond MAX_PROPERTIES_FAST, fall back to dict mode.
             if self.shape.slot_count() >= MAX_PROPERTIES_FAST {
@@ -324,21 +330,9 @@ impl<'gc> TableState<'gc> {
             .dict
             .as_mut()
             .expect("set_string_key_dict requires dict mode");
-        let h = lua_string_hash(key);
-        if !value.is_nil() {
-            reap_dead_if_full(&mut dict.table);
-        }
-        match dict
-            .table
-            .entry(h, |(k, _)| *k == key, |(k, _)| lua_string_hash(*k))
-        {
-            hash_table::Entry::Occupied(mut e) => e.get_mut().1 = value,
-            hash_table::Entry::Vacant(e) => {
-                if !value.is_nil() {
-                    e.insert((key, value));
-                }
-            }
-        }
+        hash_set(&mut dict.table, lua_string_hash(key), key, value, |k| {
+            lua_string_hash(*k)
+        });
         self.maybe_update_mt_bit(Value::string(key), value);
     }
 
@@ -377,20 +371,7 @@ impl<'gc> TableState<'gc> {
             key.kind() != ValueKind::String,
             "string keys go through the shape, not misc_hash"
         );
-        if !value.is_nil() {
-            reap_dead_if_full(&mut self.misc_hash);
-        }
-        match self
-            .misc_hash
-            .entry(hash, |(k, _)| *k == key, |(k, _)| value_hash(*k))
-        {
-            hash_table::Entry::Occupied(mut e) => e.get_mut().1 = value,
-            hash_table::Entry::Vacant(e) => {
-                if !value.is_nil() {
-                    e.insert((key, value));
-                }
-            }
-        }
+        hash_set(&mut self.misc_hash, hash, key, value, |k| value_hash(*k));
     }
 
     #[inline]
@@ -402,10 +383,11 @@ impl<'gc> TableState<'gc> {
     /// `key` in traversal order (array, then string keys, then the misc
     /// hash), `None` once exhausted, `nil` starts from the beginning. Hash
     /// parts are walked by bucket index, so a key deleted mid-traversal
-    /// (left in place with a nil value) still anchors the scan. Positive
-    /// integers only ever live in the array, so one past its end is taken
-    /// as an array position too: clearing the last slot trims the array,
-    /// and the traversal must still be able to resume from that key.
+    /// (left in place with a nil value) still anchors the scan. Any
+    /// positive integer is accepted as an array position, even past the
+    /// end: clearing the last slot trims trailing nils, and the traversal
+    /// must still resume from the key it just yielded. (The reference
+    /// rejects such keys as invalid; it never shrinks the array.)
     pub fn next(&self, key: Value<'gc>) -> Result<Option<(Value<'gc>, Value<'gc>)>, InvalidKey> {
         let (part, from) = if key.is_nil() {
             (Part::Array, 0)
@@ -469,12 +451,33 @@ fn next_bucket<'a, 'gc, K, A: Allocator>(
         .find(|(_, v)| !v.is_nil())
 }
 
-/// Deletion leaves an entry in place with a nil value so `next` can resume
-/// from it; drop those before an insert would grow the table. Growth
-/// rehashes anyway, and inserting a new key mid-traversal is undefined.
-fn reap_dead_if_full<K, A: Allocator>(table: &mut HashTable<(K, Value<'_>), A>) {
+/// Set `key` in a hash part. Deletion leaves the entry in place with a nil
+/// value so `next` can resume from it, and goes through `find_mut` rather
+/// than `entry`: `entry` reserves a slot before probing, and a rehash here
+/// would reorder a `pairs` loop that is clearing the table. Dead entries
+/// are reaped only when an insert would otherwise grow the table (growth
+/// rehashes anyway, and inserting mid-traversal is undefined).
+fn hash_set<'gc, K: Copy + PartialEq, A: Allocator>(
+    table: &mut HashTable<(K, Value<'gc>), A>,
+    hash: u64,
+    key: K,
+    value: Value<'gc>,
+    hasher: impl Fn(&K) -> u64,
+) {
+    if value.is_nil() {
+        if let Some((_, v)) = table.find_mut(hash, |(k, _)| *k == key) {
+            *v = value;
+        }
+        return;
+    }
     if table.len() == table.capacity() {
         table.retain(|(_, v)| !v.is_nil());
+    }
+    match table.entry(hash, |(k, _)| *k == key, |(k, _)| hasher(k)) {
+        hash_table::Entry::Occupied(mut e) => e.get_mut().1 = value,
+        hash_table::Entry::Vacant(e) => {
+            e.insert((key, value));
+        }
     }
 }
 
