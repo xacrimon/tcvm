@@ -1,6 +1,8 @@
+mod hash_part;
+
 use core::hash::BuildHasher;
 
-use hashbrown::{HashTable, hash_table};
+use hashbrown::HashTable;
 
 use crate::Context;
 use crate::dmm::{Collect, Gc, Mutation, RefLock, allocator_api::MetricsAlloc};
@@ -36,6 +38,11 @@ impl<'gc> Table<'gc> {
 
     pub fn raw_len(self) -> usize {
         self.0.borrow().raw_len()
+    }
+
+    /// See [`TableState::next`].
+    pub fn next(self, key: Value<'gc>) -> Result<Option<(Value<'gc>, Value<'gc>)>, InvalidKey> {
+        self.0.borrow().next(key)
     }
 
     pub fn metatable(self) -> Option<Table<'gc>> {
@@ -129,11 +136,11 @@ pub struct TableState<'gc> {
     array: Vec<Value<'gc>, MetricsAlloc<'gc>>,
     /// Fallback hash for non-string, non-array-integer keys (booleans,
     /// floats, table/function/thread-as-keys, negative integers).
-    misc_hash: HashTable<(Value<'gc>, Value<'gc>), MetricsAlloc<'gc>>,
+    misc_hash: hash_part::Part<'gc, Value<'gc>, MetricsAlloc<'gc>>,
     /// Set when this table has dropped to dictionary mode for its
-    /// string-keyed properties. Triggered by deletion of an existing
-    /// slot or by exceeding `MAX_PROPERTIES_FAST` slots — both cases
-    /// where shape-tree maintenance becomes hostile to ICs.
+    /// string-keyed properties, triggered by exceeding
+    /// `MAX_PROPERTIES_FAST` slots. Deletion does not migrate: it must not
+    /// reorder keys, or a `pairs` loop that clears entries would skip some.
     dict: Option<DictState<'gc>>,
     /// Live metatable handle (for `getmetatable` and metamethod
     /// invocation). Identity is mirrored in `shape.mt_cache`.
@@ -153,8 +160,12 @@ pub struct TableState<'gc> {
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub struct DictState<'gc> {
-    pub(crate) table: HashTable<(LuaString<'gc>, Value<'gc>), MetricsAlloc<'gc>>,
+    table: hash_part::Part<'gc, LuaString<'gc>, MetricsAlloc<'gc>>,
 }
+
+/// `next` was given a key that is not in the table.
+#[derive(Debug, Clone, Copy)]
+pub struct InvalidKey;
 
 #[inline]
 fn lua_string_hash(key: LuaString<'_>) -> u64 {
@@ -228,11 +239,7 @@ impl<'gc> TableState<'gc> {
     #[inline]
     fn get_string_key(&self, key: LuaString<'gc>) -> Value<'gc> {
         if let Some(d) = &self.dict {
-            let h = lua_string_hash(key);
-            return d
-                .table
-                .find(h, |(k, _)| *k == key)
-                .map_or(Value::nil(), |(_, v)| *v);
+            return hash_part::get(&d.table, lua_string_hash(key), key);
         }
         match self.shape.find_slot(key) {
             Some(slot) => self.properties[slot as usize],
@@ -247,10 +254,7 @@ impl<'gc> TableState<'gc> {
             key.kind() != ValueKind::String,
             "string keys go through the shape, not misc_hash"
         );
-        match self.misc_hash.find(hash, |(k, _)| *k == key) {
-            Some((_, v)) => *v,
-            None => Value::nil(),
-        }
+        hash_part::get(&self.misc_hash, hash, key)
     }
 
     #[inline]
@@ -290,18 +294,16 @@ impl<'gc> TableState<'gc> {
         }
 
         if let Some(slot) = self.shape.find_slot(key) {
-            // Existing slot.
-            if value.is_nil() {
-                // Deletion of an existing string-keyed slot: migrate to
-                // dict mode so the shape tree doesn't carry a dead slot
-                // forever. ICs that cached this shape will miss next
-                // access (different shape pointer post-migration).
-                self.migrate_to_dict(ctx);
-                self.set_string_key_dict(key, value);
-                return;
-            }
+            // Deletion keeps the slot (nil-valued) so the shape stays stable
+            // and `next` can resume from the deleted key.
             self.properties[slot as usize] = value;
         } else {
+            // Deleting an absent key is a no-op; a slot for it would burn a
+            // shape transition, and at the cap the dict migration would drop
+            // the nil-valued entries a `pairs` loop still resumes from.
+            if value.is_nil() {
+                return;
+            }
             // New slot. Cap shape growth to bound the transition tree;
             // beyond MAX_PROPERTIES_FAST, fall back to dict mode.
             if self.shape.slot_count() >= MAX_PROPERTIES_FAST {
@@ -322,24 +324,7 @@ impl<'gc> TableState<'gc> {
             .dict
             .as_mut()
             .expect("set_string_key_dict requires dict mode");
-        let h = lua_string_hash(key);
-        match dict
-            .table
-            .entry(h, |(k, _)| *k == key, |(k, _)| lua_string_hash(*k))
-        {
-            hash_table::Entry::Occupied(mut e) => {
-                if value.is_nil() {
-                    e.remove();
-                } else {
-                    e.get_mut().1 = value;
-                }
-            }
-            hash_table::Entry::Vacant(e) => {
-                if !value.is_nil() {
-                    e.insert((key, value));
-                }
-            }
-        }
+        hash_part::set(&mut dict.table, lua_string_hash(key), key, value);
         self.maybe_update_mt_bit(Value::string(key), value);
     }
 
@@ -361,8 +346,7 @@ impl<'gc> TableState<'gc> {
             if v.is_nil() {
                 continue;
             }
-            let h = lua_string_hash(d.key);
-            table.insert_unique(h, (d.key, v), |(k, _)| lua_string_hash(*k));
+            hash_part::insert_unique(&mut table, lua_string_hash(d.key), d.key, v);
         }
         self.properties.clear();
         self.shape = match self.shape.mt_cache() {
@@ -378,27 +362,73 @@ impl<'gc> TableState<'gc> {
             key.kind() != ValueKind::String,
             "string keys go through the shape, not misc_hash"
         );
-        match self
-            .misc_hash
-            .entry(hash, |(k, _)| *k == key, |(k, _)| value_hash(*k))
-        {
-            hash_table::Entry::Occupied(mut e) => {
-                if value.is_nil() {
-                    e.remove();
-                } else {
-                    e.get_mut().1 = value;
-                }
-            }
-            hash_table::Entry::Vacant(e) => {
-                e.insert((key, value));
-            }
-        }
+        hash_part::set(&mut self.misc_hash, hash, key, value);
     }
 
     #[inline]
     pub fn raw_len(&self) -> usize {
         self.array.len()
     }
+
+    /// Stateless successor for Lua's `next`: the first live entry after
+    /// `key` in traversal order (array, then string keys, then the misc
+    /// hash), `None` once exhausted, `nil` starts from the beginning. Hash
+    /// parts are walked by bucket index, so a key deleted mid-traversal
+    /// (left in place with a nil value) still anchors the scan. Any
+    /// positive integer is accepted as an array position, even past the
+    /// end: clearing the last slot trims trailing nils, and the traversal
+    /// must still resume from the key it just yielded. (The reference
+    /// rejects such keys as invalid; it never shrinks the array.)
+    pub fn next(&self, key: Value<'gc>) -> Result<Option<(Value<'gc>, Value<'gc>)>, InvalidKey> {
+        let (part, from) = if key.is_nil() {
+            (Part::Array, 0)
+        } else if let Some(i) = array_index(key) {
+            (Part::Array, i.min(self.array.len()))
+        } else if let Some(s) = key.get_string() {
+            let pos = match &self.dict {
+                Some(d) => hash_part::position(&d.table, lua_string_hash(s), s),
+                None => self.shape.find_slot(s).map(|slot| slot as usize),
+            };
+            (Part::Strings, pos.ok_or(InvalidKey)? + 1)
+        } else {
+            let pos = hash_part::position(&self.misc_hash, value_hash(key), key);
+            (Part::Misc, pos.ok_or(InvalidKey)? + 1)
+        };
+
+        if part == Part::Array {
+            for (i, v) in self.array.iter().enumerate().skip(from) {
+                if !v.is_nil() {
+                    return Ok(Some((Value::integer(i as i64 + 1), *v)));
+                }
+            }
+        }
+        if part <= Part::Strings {
+            let from = if part == Part::Strings { from } else { 0 };
+            let found = match &self.dict {
+                Some(d) => {
+                    hash_part::next_live(&d.table, from).map(|e| (Value::string(e.key), e.value))
+                }
+                // Slot doubles as descriptor index; see `ShapeData::descriptors`.
+                None => self.shape.descriptors()[from..]
+                    .iter()
+                    .map(|d| (Value::string(d.key), self.properties[d.slot as usize]))
+                    .find(|(_, v)| !v.is_nil()),
+            };
+            if found.is_some() {
+                return Ok(found);
+            }
+        }
+        let from = if part == Part::Misc { from } else { 0 };
+        Ok(hash_part::next_live(&self.misc_hash, from).map(|e| (e.key, e.value)))
+    }
+}
+
+/// Which storage part a `next` cursor points into, in traversal order.
+#[derive(PartialEq, PartialOrd)]
+enum Part {
+    Array,
+    Strings,
+    Misc,
 }
 
 /// Extract a valid array index from a Value (1-based positive integer).
