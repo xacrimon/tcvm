@@ -1026,76 +1026,74 @@ fn unwind_error<'gc>(
     top: Thread<'gc>,
 ) -> Result<(), RuntimeError> {
     let mc = ctx.mutation();
-    let err = {
-        let mut ts = top.borrow_mut(mc);
-        let err = match ts.frames.pop() {
-            Some(Frame::Error(e)) => e,
-            _ => unreachable!(),
-        };
-        if !err.is_handled() {
-            // Only the nearest catch point's handler applies (`L->errfunc`):
-            // a plain `pcall` in between shadows an outer `xpcall`, while a
-            // `Catch::Pass` sequence is looked through.
-            let handler = ts
-                .frames
-                .iter()
-                .rev()
-                .find_map(|f| match f {
-                    Frame::Sequence { seq, .. } => match seq.catch() {
-                        Catch::Pass => None,
-                        Catch::Here(handler) => Some(handler),
-                    },
-                    _ => None,
-                })
-                .flatten();
-            if let Some(handler) = handler {
-                return run_message_handler(&mut ts, ctx, handler, err);
-            }
-        }
-        // `luaD_seterrorobj`: only once the error is being caught (a
-        // handler still sees the raw nil).
-        let err = if err.value().is_nil() {
-            err.with_value(Value::string(LuaString::new(ctx, b"<no error object>")))
-        } else {
-            err
-        };
-        loop {
-            match ts.frames.last() {
-                Some(Frame::Lua(lf)) => {
-                    let base = lf.base;
-                    ts.frames.pop();
-                    vm::interp::close_upvalues(mc, &mut ts, base);
-                    vm::interp::close_tbc_vars(mc, &mut ts, base);
-                    // The frame and everything above it is dead, so this is one
-                    // of the few places a shrink is legal.
-                    ts.discard_above(base);
-                }
-                Some(Frame::Sequence { seq, .. }) => {
-                    if matches!(seq.catch(), Catch::Pass) {
-                        ts.frames.pop();
-                        continue;
-                    }
-                    if let Some(Frame::Sequence { pending_error, .. }) = ts.frames.last_mut() {
-                        *pending_error = Some(err);
-                    }
-                    return Ok(());
-                }
-                Some(Frame::WaitThread { .. }) => {
-                    ts.frames.pop();
-                }
-                Some(Frame::Start(_)) | Some(Frame::Error(_)) => {
-                    // Frame::Start is only on a freshly-created thread
-                    // that hasn't run yet, so it can't have errored.
-                    // Frame::Error is removed by the next driver pump
-                    // (which enters this function), so two can't coexist.
-                    unreachable!(
-                        "Frame::Start / Frame::Error mid-unwind violates the executor invariant"
-                    );
-                }
-                None => break err,
-            }
-        }
+    let mut ts = top.borrow_mut(mc);
+    let Some(Frame::Error(err)) = ts.frames.pop() else {
+        unreachable!()
     };
+    if !err.is_handled() {
+        // Only the nearest catch point's handler applies (`L->errfunc`):
+        // a plain `pcall` in between shadows an outer `xpcall`, while a
+        // `Catch::Pass` sequence is looked through.
+        let handler = ts
+            .frames
+            .iter()
+            .rev()
+            .find_map(|f| match f {
+                Frame::Sequence { seq, .. } => match seq.catch() {
+                    Catch::Pass => None,
+                    Catch::Here(handler) => Some(handler),
+                },
+                _ => None,
+            })
+            .flatten();
+        if let Some(handler) = handler {
+            return run_message_handler(&mut ts, ctx, handler, err);
+        }
+    }
+    // `luaD_seterrorobj`: only once the error is being caught (a handler
+    // still sees the raw nil).
+    let err = if err.value().is_nil() {
+        err.with_value(Value::string(LuaString::new(ctx, b"<no error object>")))
+    } else {
+        err
+    };
+    loop {
+        match ts.frames.last_mut() {
+            Some(Frame::Lua(lf)) => {
+                let base = lf.base;
+                ts.frames.pop();
+                vm::interp::close_upvalues(mc, &mut ts, base);
+                vm::interp::close_tbc_vars(mc, &mut ts, base);
+                // The frame and everything above it is dead, so this is one
+                // of the few places a shrink is legal.
+                ts.discard_above(base);
+            }
+            Some(Frame::Sequence {
+                seq, pending_error, ..
+            }) => {
+                if matches!(seq.catch(), Catch::Pass) {
+                    ts.frames.pop();
+                    continue;
+                }
+                *pending_error = Some(err);
+                return Ok(());
+            }
+            Some(Frame::WaitThread { .. }) => {
+                ts.frames.pop();
+            }
+            Some(Frame::Start(_) | Frame::Error(_)) => {
+                // Frame::Start is only on a freshly-created thread that
+                // hasn't run yet, so it can't have errored. Frame::Error is
+                // removed by the next driver pump (which enters this
+                // function), so two can't coexist.
+                unreachable!(
+                    "Frame::Start / Frame::Error mid-unwind violates the executor invariant"
+                );
+            }
+            None => break,
+        }
+    }
+    drop(ts);
 
     // No catcher on this thread. If we're an inner coroutine, propagate to
     // the resumer's WaitThread → its next Sequence can catch.
