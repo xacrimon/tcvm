@@ -233,7 +233,7 @@ impl<'gc> Hash for Value<'gc> {
 #[inline]
 pub(crate) fn value_hash(v: Value<'_>) -> u64 {
     use std::hash::BuildHasher;
-    foldhash::fast::FixedState::default().hash_one(v) & 0xff_ffff
+    foldhash::fast::FixedState::default().hash_one(v)
 }
 
 unsafe impl<'gc> Collect<'gc> for Value<'gc> {
