@@ -57,7 +57,7 @@ use crate::env::value::Value;
 use crate::env::{Function, Thread};
 use crate::lua::Context;
 use crate::lua::stash::{Fetchable, Stashable, StashedError, StashedFunction, StashedThread};
-use crate::vm::sequence::{BoxSequence, Execution, Sequence, SequencePoll};
+use crate::vm::sequence::{BoxSequence, Catch, Execution, Sequence, SequencePoll};
 
 /// Build a [`Sequence`] from a Rust `async move` block.
 ///
@@ -392,6 +392,12 @@ where
         stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
         self.poll_fut(ctx, exec, stack, Some(error))
+    }
+
+    /// The awaited `call`/`lua_yield`/`resume` returns the error to the
+    /// future, so this is a catch point.
+    fn catch(&self) -> Catch<'gc> {
+        Catch::Here(None)
     }
 }
 
