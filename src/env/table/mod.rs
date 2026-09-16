@@ -1,7 +1,8 @@
-use core::alloc::Allocator;
+mod hash_part;
+
 use core::hash::BuildHasher;
 
-use hashbrown::{HashTable, hash_table};
+use hashbrown::HashTable;
 
 use crate::Context;
 use crate::dmm::{Collect, Gc, Mutation, RefLock, allocator_api::MetricsAlloc};
@@ -135,7 +136,7 @@ pub struct TableState<'gc> {
     array: Vec<Value<'gc>, MetricsAlloc<'gc>>,
     /// Fallback hash for non-string, non-array-integer keys (booleans,
     /// floats, table/function/thread-as-keys, negative integers).
-    misc_hash: HashTable<(Value<'gc>, Value<'gc>), MetricsAlloc<'gc>>,
+    misc_hash: hash_part::Part<'gc, Value<'gc>, MetricsAlloc<'gc>>,
     /// Set when this table has dropped to dictionary mode for its
     /// string-keyed properties, triggered by exceeding
     /// `MAX_PROPERTIES_FAST` slots. Deletion does not migrate: it must not
@@ -159,7 +160,7 @@ pub struct TableState<'gc> {
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub struct DictState<'gc> {
-    pub(crate) table: HashTable<(LuaString<'gc>, Value<'gc>), MetricsAlloc<'gc>>,
+    table: hash_part::Part<'gc, LuaString<'gc>, MetricsAlloc<'gc>>,
 }
 
 /// `next` was given a key that is not in the table.
@@ -238,11 +239,7 @@ impl<'gc> TableState<'gc> {
     #[inline]
     fn get_string_key(&self, key: LuaString<'gc>) -> Value<'gc> {
         if let Some(d) = &self.dict {
-            let h = lua_string_hash(key);
-            return d
-                .table
-                .find(h, |(k, _)| *k == key)
-                .map_or(Value::nil(), |(_, v)| *v);
+            return hash_part::get(&d.table, lua_string_hash(key), key);
         }
         match self.shape.find_slot(key) {
             Some(slot) => self.properties[slot as usize],
@@ -257,10 +254,7 @@ impl<'gc> TableState<'gc> {
             key.kind() != ValueKind::String,
             "string keys go through the shape, not misc_hash"
         );
-        match self.misc_hash.find(hash, |(k, _)| *k == key) {
-            Some((_, v)) => *v,
-            None => Value::nil(),
-        }
+        hash_part::get(&self.misc_hash, hash, key)
     }
 
     #[inline]
@@ -330,9 +324,7 @@ impl<'gc> TableState<'gc> {
             .dict
             .as_mut()
             .expect("set_string_key_dict requires dict mode");
-        hash_set(&mut dict.table, lua_string_hash(key), key, value, |k| {
-            lua_string_hash(*k)
-        });
+        hash_part::set(&mut dict.table, lua_string_hash(key), key, value);
         self.maybe_update_mt_bit(Value::string(key), value);
     }
 
@@ -354,8 +346,7 @@ impl<'gc> TableState<'gc> {
             if v.is_nil() {
                 continue;
             }
-            let h = lua_string_hash(d.key);
-            table.insert_unique(h, (d.key, v), |(k, _)| lua_string_hash(*k));
+            hash_part::insert_unique(&mut table, lua_string_hash(d.key), d.key, v);
         }
         self.properties.clear();
         self.shape = match self.shape.mt_cache() {
@@ -371,7 +362,7 @@ impl<'gc> TableState<'gc> {
             key.kind() != ValueKind::String,
             "string keys go through the shape, not misc_hash"
         );
-        hash_set(&mut self.misc_hash, hash, key, value, |k| value_hash(*k));
+        hash_part::set(&mut self.misc_hash, hash, key, value);
     }
 
     #[inline]
@@ -395,16 +386,12 @@ impl<'gc> TableState<'gc> {
             (Part::Array, i.min(self.array.len()))
         } else if let Some(s) = key.get_string() {
             let pos = match &self.dict {
-                Some(d) => d
-                    .table
-                    .find_bucket_index(lua_string_hash(s), |(k, _)| *k == s),
+                Some(d) => hash_part::position(&d.table, lua_string_hash(s), s),
                 None => self.shape.find_slot(s).map(|slot| slot as usize),
             };
             (Part::Strings, pos.ok_or(InvalidKey)? + 1)
         } else {
-            let pos = self
-                .misc_hash
-                .find_bucket_index(value_hash(key), |(k, _)| *k == key);
+            let pos = hash_part::position(&self.misc_hash, value_hash(key), key);
             (Part::Misc, pos.ok_or(InvalidKey)? + 1)
         };
 
@@ -418,7 +405,9 @@ impl<'gc> TableState<'gc> {
         if part <= Part::Strings {
             let from = if part == Part::Strings { from } else { 0 };
             let found = match &self.dict {
-                Some(d) => next_bucket(&d.table, from).map(|(k, v)| (Value::string(*k), *v)),
+                Some(d) => {
+                    hash_part::next_live(&d.table, from).map(|e| (Value::string(e.key), e.value))
+                }
                 None => self.shape.descriptors()[from..]
                     .iter()
                     .map(|d| (Value::string(d.key), self.properties[d.slot as usize]))
@@ -429,7 +418,7 @@ impl<'gc> TableState<'gc> {
             }
         }
         let from = if part == Part::Misc { from } else { 0 };
-        Ok(next_bucket(&self.misc_hash, from).copied())
+        Ok(hash_part::next_live(&self.misc_hash, from).map(|e| (e.key, e.value)))
     }
 }
 
@@ -439,46 +428,6 @@ enum Part {
     Array,
     Strings,
     Misc,
-}
-
-/// First live entry at bucket index `from` or later.
-fn next_bucket<'a, 'gc, K, A: Allocator>(
-    table: &'a HashTable<(K, Value<'gc>), A>,
-    from: usize,
-) -> Option<&'a (K, Value<'gc>)> {
-    (from..table.num_buckets())
-        .filter_map(|i| table.get_bucket(i))
-        .find(|(_, v)| !v.is_nil())
-}
-
-/// Set `key` in a hash part. Deletion leaves the entry in place with a nil
-/// value so `next` can resume from it, and goes through `find_mut` rather
-/// than `entry`: `entry` reserves a slot before probing, and a rehash here
-/// would reorder a `pairs` loop that is clearing the table. Dead entries
-/// are reaped only when an insert would otherwise grow the table (growth
-/// rehashes anyway, and inserting mid-traversal is undefined).
-fn hash_set<'gc, K: Copy + PartialEq, A: Allocator>(
-    table: &mut HashTable<(K, Value<'gc>), A>,
-    hash: u64,
-    key: K,
-    value: Value<'gc>,
-    hasher: impl Fn(&K) -> u64,
-) {
-    if value.is_nil() {
-        if let Some((_, v)) = table.find_mut(hash, |(k, _)| *k == key) {
-            *v = value;
-        }
-        return;
-    }
-    if table.len() == table.capacity() {
-        table.retain(|(_, v)| !v.is_nil());
-    }
-    match table.entry(hash, |(k, _)| *k == key, |(k, _)| hasher(k)) {
-        hash_table::Entry::Occupied(mut e) => e.get_mut().1 = value,
-        hash_table::Entry::Vacant(e) => {
-            e.insert((key, value));
-        }
-    }
 }
 
 /// Extract a valid array index from a Value (1-based positive integer).

@@ -36,6 +36,21 @@ fn run_str(src: &str) -> String {
     .expect("result")
 }
 
+/// Live GC bytes after running `src` to completion and a full collection.
+fn live_bytes_after(src: &str) -> usize {
+    let mut lua = Lua::new();
+    lua.load_all();
+    let ex = lua
+        .try_enter(|ctx| -> Result<_, LoadError> {
+            let chunk = ctx.load(src, Some("=t"))?;
+            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+        })
+        .expect("load");
+    lua.finish(&ex).expect("run");
+    lua.collect_all();
+    lua.live_bytes()
+}
+
 const KEYS: &str = "local function keys(t)
   local ks, n = {}, 0
   for k, v in pairs(t) do n = n + 1; ks[#ks+1] = tostring(k) .. '=' .. tostring(v) end
@@ -216,5 +231,26 @@ fn pairs_metamethod() {
     );
     check(
         "select(4, pairs(setmetatable({}, {__pairs = function() return 1, 2, 3, 4, 5, 6 end}))) == 4",
+    );
+}
+
+/// A deleted entry stays in the bucket for `next`, but its key must not be
+/// traced: a cleared table would otherwise pin every former key.
+#[test]
+fn dead_keys_are_not_retained() {
+    const BUILD: &str = "T = {} for i = 1, 2000 do T[{i, i + 1}] = i end";
+    let baseline = live_bytes_after("T = {}");
+    let live = live_bytes_after(BUILD);
+    let cleared = live_bytes_after(&format!("{BUILD} for k in pairs(T) do T[k] = nil end"));
+
+    let payload = live.saturating_sub(baseline);
+    assert!(
+        payload > 50_000,
+        "payload too small: baseline={baseline} live={live}"
+    );
+    let leaked = cleared.saturating_sub(baseline);
+    assert!(
+        leaked < payload / 10,
+        "dead keys retained: baseline={baseline} live={live} cleared={cleared}"
     );
 }
