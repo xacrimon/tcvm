@@ -180,33 +180,15 @@ pub struct ThreadState<'gc> {
 // `stack` (issue #43): it is grown-not-shrunk, so slots above the live region
 // are dead scratch and must NOT be traced — tracing the whole vec would retain
 // whatever a since-returned callee happened to leave in its registers.
-// `live_top` is the sound live high-water:
-//   * Lua registers live in `[base, base + max_stack)`; callee bases strictly
-//     increase up the stack, so the topmost Lua frame's `base + max_stack`
-//     bounds every frame's live registers (lower frames' live regs sit below
-//     their callee's base, which is <= the top frame's base). Varargs/extras
-//     sit below a base, so `[0..live_top]` covers them too.
-//   * `top` adds the value-passing window that can sit above the Lua frames
-//     (native args/results, a paused multires window). It is `max`ed with the
-//     frame floor, so it can only raise the bound, never lower it, and thus
-//     can never cause an under-trace.
-// Correctness therefore rests on rule (3) of the stack invariant: anything
-// dropped from the logical stack is nil-filled, so a dead slot that happens to
-// fall below `live_top` still retains nothing.
+// `live_top` is the sound live high-water (see its doc for why the innermost
+// frame's window bounds every frame's registers). Correctness also rests on
+// rule (3) of the stack invariant: anything dropped from the logical stack is
+// nil-filled, so a dead slot that happens to fall below `live_top` still
+// retains nothing.
 // `tbc_slots`/`status`/`top`/`yield_bottom` hold no `Gc` pointers.
 unsafe impl<'gc> Collect<'gc> for ThreadState<'gc> {
     fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
-        let live_top = self
-            .frames
-            .iter()
-            .filter_map(|f| match f {
-                Frame::Lua(lf) => Some(lf.base + lf.closure.proto.max_stack_size as usize),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(0)
-            .max(self.top)
-            .min(self.stack.len());
+        let live_top = self.live_top().min(self.stack.len());
         cc.trace(&self.stack[..live_top]);
         cc.trace(&self.frames);
         cc.trace(&self.open_upvalues);
@@ -275,6 +257,24 @@ impl<'gc> ThreadState<'gc> {
                 unsafe { std::hint::unreachable_unchecked() }
             }
         }
+    }
+
+    /// One past the highest slot anything on this thread can still read.
+    /// Lua registers live in `[base, base + max_stack)`, and a call's
+    /// function slot is the caller's first free register, so the innermost
+    /// Lua frame's window bounds every frame's live registers (extras sit
+    /// below a base). `top` adds the value-passing window a native or a
+    /// paused multires producer may have pushed above it.
+    pub fn live_top(&self) -> usize {
+        self.frames
+            .iter()
+            .rev()
+            .find_map(|f| match f {
+                Frame::Lua(lf) => Some(lf.base + lf.closure.proto.max_stack_size as usize),
+                _ => None,
+            })
+            .unwrap_or(0)
+            .max(self.top)
     }
 
     /// Raise `err` on this thread: resolve its position prefix against the

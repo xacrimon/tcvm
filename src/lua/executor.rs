@@ -952,21 +952,9 @@ fn run_message_handler<'gc>(
     handler: Function<'gc>,
     err: Error<'gc>,
 ) -> Result<(), RuntimeError> {
-    // Stage above every live register. The innermost Lua frame's window is
-    // the highest on this thread (a sequence above it, e.g. the catcher
-    // itself when its callee failed immediately, may have left `top` inside
-    // that window), but a raising sequence can also have pushed `top` past
-    // it.
-    let slot = ts
-        .frames
-        .iter()
-        .rev()
-        .find_map(|f| match f {
-            Frame::Lua(lf) => Some(lf.base + lf.closure.proto.max_stack_size as usize),
-            _ => None,
-        })
-        .unwrap_or(0)
-        .max(ts.top);
+    // Stage above every live register (`top` alone can sit inside the
+    // innermost window when the catcher's callee failed at once).
+    let slot = ts.live_top();
     ts.ensure_slots(slot + 2);
     ts.stack[slot] = Value::function(handler);
     ts.stack[slot + 1] = err.value();
