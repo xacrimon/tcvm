@@ -605,6 +605,7 @@ dependencies = [
  "paste",
  "rand_core",
  "rand_pcg",
+ "tcvm",
  "tcvm-derive",
  "thiserror",
  "zmij",

@@ -3,13 +3,14 @@ use std::pin::Pin;
 use crate::dmm::{Collect, Gc, RefLock, Trace};
 use crate::env::function::Function;
 use crate::env::thread::{CallSite, Frame, LuaFrame, PendingAction, ThreadState, ThreadStatus};
-use crate::env::{Error, Stack, Thread, Value};
+use crate::env::{Error, LuaString, Stack, Thread, Value};
 use crate::lua::RuntimeError;
 use crate::lua::context::Context;
 use crate::lua::convert::{FromMultiValue, IntoMultiValue};
 use crate::vm;
+use crate::vm::interp::OpError;
 use crate::vm::interp::{Continuation, ContinuationPayload};
-use crate::vm::sequence::{BoxSequence, CallbackAction, Execution, Sequence, SequencePoll};
+use crate::vm::sequence::{BoxSequence, CallbackAction, Catch, Execution, Sequence, SequencePoll};
 
 #[derive(Clone, Copy, PartialEq, Eq, Collect)]
 #[collect(internal, require_static)]
@@ -405,16 +406,16 @@ fn apply_pending_action<'gc>(
                 pending_error: None,
             });
         }
-        CallbackAction::Call { function, then } => {
+        CallbackAction::Call { then } => {
             let mut ts = top.borrow_mut(mc);
             // If `then` provided, the sequence is the call's "completion
             // handler"; it inherits the caller's expected_returns. The
             // sequence sees the called function's results at stack[bottom..].
             //
             // We push `then` BEFORE scheduling the call so that if the
-            // called native errors immediately, schedule_call_at's
-            // Frame::Error (see #2 in review.md) lands above this
-            // sequence and the unwinder routes the error to it.
+            // callee can't be resolved or errors immediately, the
+            // Frame::Error lands above this sequence and the unwinder
+            // routes the error to it.
             if let Some(seq) = then {
                 ts.frames.push(Frame::Sequence {
                     seq,
@@ -422,13 +423,17 @@ fn apply_pending_action<'gc>(
                     pending_error: None,
                 });
             }
-            // Now schedule the call. The callback that produced `Call`
-            // left its desired args at stack[bottom..] with no function
-            // slot in front; insert the function so the layout matches
-            // schedule_call_at's convention (function at slot, args
-            // after).
-            ts.insert_at(call_site.bottom, Value::function(function));
-            schedule_call_at(&mut ts, ctx, call_site.bottom, function, call_site.returns)?;
+            // Callee at stack[bottom], args above it: already the layout
+            // schedule_call_at wants. Level 0 because the raiser is a
+            // native (`luaG_callerror` adds no position for a C `ci`).
+            let slot = call_site.bottom;
+            if vm::interp::resolve_call_chain(ctx, &mut ts, slot, 0).is_none() {
+                let msg = vm::debug::op_error_message(ctx, &ts, OpError::Call(ts.stack[slot]));
+                ts.raise(ctx, Error::from_str(ctx, &msg).with_level(0));
+                return Ok(());
+            }
+            let function = ts.stack[slot].get_function().unwrap();
+            schedule_call_at(&mut ts, ctx, slot, function, call_site.returns)?;
         }
         CallbackAction::Yield { then } => {
             let mut ts = top.borrow_mut(mc);
@@ -990,12 +995,7 @@ impl<'gc> Sequence<'gc> for HandlerSequence {
         _exec: Execution<'gc, '_>,
         stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
-        let value = if stack.is_empty() {
-            Value::nil()
-        } else {
-            stack.get(0)
-        };
-        Err(Error::new(value).mark_handled())
+        Err(Error::new(stack.get(0)).mark_handled())
     }
 
     fn error(
@@ -1009,10 +1009,14 @@ impl<'gc> Sequence<'gc> for HandlerSequence {
             .with_level(0)
             .mark_handled())
     }
+    fn catch(&self) -> Catch<'gc> {
+        Catch::Here(None)
+    }
 }
 
-/// Walk a thread's frame stack popping Lua/Wait frames (closing upvalues
-/// at each `bottom`) until a `Sequence` frame can catch the error.
+/// Walk a thread's frame stack popping Lua/Wait/`Catch::Pass` frames
+/// (closing upvalues at each Lua `bottom`) until a `Catch::Here` sequence
+/// takes the error.
 ///
 /// If the nearest catcher has a message handler (`xpcall`), the handler
 /// runs first, on top of the still-intact failing frames; see
@@ -1036,14 +1040,18 @@ fn unwind_error<'gc>(
             _ => unreachable!(),
         };
         if !err.is_handled() {
-            // Only the nearest catcher's handler applies (`L->errfunc`); a
-            // plain `pcall` in between shadows an outer `xpcall`.
+            // Only the nearest catch point's handler applies (`L->errfunc`):
+            // a plain `pcall` in between shadows an outer `xpcall`, while a
+            // `Catch::Pass` sequence is looked through.
             let handler = ts
                 .frames
                 .iter()
                 .rev()
                 .find_map(|f| match f {
-                    Frame::Sequence { seq, .. } => Some(seq.message_handler()),
+                    Frame::Sequence { seq, .. } => match seq.catch() {
+                        Catch::Pass => None,
+                        Catch::Here(handler) => Some(handler),
+                    },
                     _ => None,
                 })
                 .flatten();
@@ -1051,6 +1059,13 @@ fn unwind_error<'gc>(
                 return run_message_handler(&mut ts, ctx, handler, err);
             }
         }
+        // `luaD_seterrorobj`: only once the error is being caught (a
+        // handler still sees the raw nil).
+        let err = if err.value().is_nil() {
+            err.with_value(Value::string(LuaString::new(ctx, b"<no error object>")))
+        } else {
+            err
+        };
         loop {
             match ts.frames.last() {
                 Some(Frame::Lua(lf)) => {
@@ -1062,7 +1077,11 @@ fn unwind_error<'gc>(
                     // of the few places a shrink is legal.
                     ts.discard_above(base);
                 }
-                Some(Frame::Sequence { .. }) => {
+                Some(Frame::Sequence { seq, .. }) => {
+                    if matches!(seq.catch(), Catch::Pass) {
+                        ts.frames.pop();
+                        continue;
+                    }
                     if let Some(Frame::Sequence { pending_error, .. }) = ts.frames.last_mut() {
                         *pending_error = Some(err);
                     }

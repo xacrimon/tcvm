@@ -2,9 +2,11 @@
 //! same snippets (chunk name `=t`); the message handler runs *before* the
 //! stack unwinds, which the native-handler test observes directly.
 
+use std::pin::Pin;
+
 use tcvm::env::thread::Frame;
 use tcvm::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Value};
-use tcvm::vm::sequence::CallbackAction;
+use tcvm::vm::sequence::{BoxSequence, CallbackAction, Execution, Sequence, SequencePoll};
 use tcvm::{Executor, LoadError, Lua};
 
 fn run_with<T: for<'gc> tcvm::FromMultiValue<'gc>>(
@@ -65,6 +67,15 @@ fn pcall_of_non_functions() {
     check(
         "local ok, e = pcall(setmetatable({}, {__name = 'Thing'})) return (not ok and e == 'attempt to call a Thing value') and 1 or 0",
     );
+    // A non-callable target is raised inside the protected call, so the
+    // xpcall handler sees it too.
+    check(
+        "local ok, e = xpcall(5, function(e) return 'H:' .. e end) return (not ok and e == 'H:attempt to call a number value') and 1 or 0",
+    );
+    // The chain bound is on hops, not on how many arguments ride along.
+    check(
+        "local t = setmetatable({}, {__call = function(self, ...) return select('#', ...) end}) local args = {} for i = 1, 300 do args[i] = i end local ok, n = pcall(t, table.unpack(args)) return (ok and n == 300) and 1 or 0",
+    );
 }
 
 #[test]
@@ -102,6 +113,11 @@ fn xpcall_handler_transforms_the_error() {
     );
     check(
         "local ok, e = xpcall(function() error('orig') end, function(e) return nil end) return (not ok and e == '<no error object>') and 1 or 0",
+    );
+    // A nil error object reaches the handler as nil; only the catcher
+    // substitutes the placeholder message.
+    check(
+        "local ok, e = xpcall(function() error() end, function(e) return 'H:' .. tostring(e) end) return (not ok and e == 'H:nil') and 1 or 0",
     );
     // Extra arguments are passed to the function; success returns its results.
     check(
@@ -185,6 +201,70 @@ fn handler_runs_before_the_stack_unwinds() {
             let key = Value::string(LuaString::new(ctx, b"lua_frames"));
             ctx.globals().raw_set(ctx, key, Value::function(f));
         },
+    );
+    assert_eq!(frames, 3);
+}
+
+/// `through(f, ...)`: call `f` under a sequence that keeps the default
+/// `Catch::Pass`, i.e. the kind of native-with-callback (`sort`, `gsub`)
+/// that must not shadow an enclosing `xpcall` handler.
+fn lua_through<'gc>(
+    nctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
+    struct PassThrough;
+    unsafe impl<'gc> tcvm::dmm::Collect<'gc> for PassThrough {
+        const NEEDS_TRACE: bool = false;
+    }
+    impl<'gc> Sequence<'gc> for PassThrough {
+        fn trace_pointers(&self, _cc: &mut dyn tcvm::dmm::Trace<'gc>) {}
+        fn poll(
+            self: Pin<&mut Self>,
+            _ctx: tcvm::Context<'gc>,
+            _exec: Execution<'gc, '_>,
+            _stack: Stack<'gc, '_>,
+        ) -> Result<SequencePoll<'gc>, Error<'gc>> {
+            Ok(SequencePoll::Return)
+        }
+    }
+    let then = BoxSequence::new(nctx.ctx.mutation(), PassThrough);
+    Ok(CallbackAction::Call { then: Some(then) })
+}
+
+fn install_through(ctx: tcvm::Context<'_>) {
+    for (name, f) in [
+        ("lua_frames", lua_frame_count as NativeFn),
+        ("through", lua_through as NativeFn),
+    ] {
+        let f = Function::new_native(ctx.mutation(), f, Box::new([]));
+        let key = Value::string(LuaString::new(ctx, name.as_bytes()));
+        ctx.globals().raw_set(ctx, key, Value::function(f));
+    }
+}
+
+#[test]
+fn pass_through_sequence_is_transparent_to_errors() {
+    // Success path returns the callee's results; an error passes through
+    // it to the enclosing pcall.
+    let v: i64 = run_with(
+        "local ok, e = pcall(function() through(function() error('x') end) end)\n\
+         local a, b = through(function() return 1, 2 end)\n\
+         return (not ok and e == 't:1: x' and a == 1 and b == 2) and 1 or 0",
+        install_through,
+    );
+    assert_eq!(v, 1);
+}
+
+#[test]
+fn handler_looks_through_a_pass_through_sequence() {
+    // The nearest sequence is `through`'s, but it isn't a catch point, so
+    // the xpcall handler still runs with `outer` and `deep` intact.
+    let frames: i64 = run_with(
+        "local function deep() error('x') end\n\
+         local function outer() through(deep) end\n\
+         local ok, n = xpcall(outer, lua_frames)\n\
+         return n",
+        install_through,
     );
     assert_eq!(frames, 3);
 }

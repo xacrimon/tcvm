@@ -253,6 +253,16 @@ impl<'gc, 'a> Stack<'gc, 'a> {
         }
     }
 
+    /// Drop everything past the first `len` values, nil-filling like `clear`.
+    #[inline]
+    pub fn truncate(&mut self, len: usize) {
+        let new_top = self.bottom + len;
+        if new_top < *self.top {
+            self.values[new_top..*self.top].fill(Value::nil());
+            *self.top = new_top;
+        }
+    }
+
     /// Convenience for the common "clear args, push N results" pattern.
     #[inline]
     pub fn replace(&mut self, values: &[Value<'gc>]) {

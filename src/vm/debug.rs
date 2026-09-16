@@ -75,11 +75,6 @@ pub(crate) fn where_prefix(ts: &ThreadState<'_>, level: usize) -> Vec<u8> {
 /// frames: a string message gets the `where_prefix`; anything else is left
 /// alone (`luaB_error` only decorates strings). The result carries level 0.
 pub(crate) fn locate<'gc>(ctx: Context<'gc>, ts: &ThreadState<'gc>, err: Error<'gc>) -> Error<'gc> {
-    if err.value().is_nil() {
-        // `luaG_errormsg`: a nil error object becomes a proper message.
-        let s = LuaString::new(ctx, b"<no error object>");
-        return err.with_value(Value::string(s));
-    }
     let level = err.level();
     let Some(msg) = err.value().get_string().filter(|_| level > 0) else {
         return err.with_level(0);

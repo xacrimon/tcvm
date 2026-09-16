@@ -108,9 +108,10 @@ pub enum Frame<'gc> {
         #[collect(require_static)]
         call_site: CallSite,
     },
-    /// Unwinding marker. The driver pops Lua/Wait frames (closing upvalues)
-    /// until a `Sequence` frame is found and stamped with `pending_error`,
-    /// or until the thread terminates with the error.
+    /// Unwinding marker. The driver pops Lua/Wait/pass-through frames
+    /// (closing upvalues) until a catching `Sequence` frame is found and
+    /// stamped with `pending_error`, or until the thread terminates with
+    /// the error.
     Error(Error<'gc>),
 }
 

@@ -3461,7 +3461,7 @@ pub(crate) fn close_upvalues<'gc>(
 
 /// Maximum depth of `__index` / `__newindex` / `__call` chains before we
 /// give up and raise (matches Lua 5.4's `MAXTAGLOOP`).
-const MAX_TAG_LOOP: usize = 2000;
+pub(crate) const MAX_TAG_LOOP: usize = 2000;
 
 /// Result of walking an `__index` chain.
 pub(crate) enum IndexChain<'gc> {
@@ -3633,7 +3633,7 @@ pub(crate) enum MetaDispatch<'gc> {
 /// `None` if the chain is unresolvable: non-callable value, `nargs`
 /// overflow, or `MAX_TAG_LOOP` exhaustion. Callers raise on `None`.
 #[inline]
-fn resolve_call_chain<'gc>(
+pub(crate) fn resolve_call_chain<'gc>(
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
     func_idx: usize,

@@ -7,7 +7,7 @@ use std::pin::Pin;
 use crate::dmm::{Collect, Gc, Trace};
 use crate::env::{Error, Function, LuaString, Stack, Value};
 use crate::lua::Context;
-use crate::vm::sequence::{Execution, Sequence, SequencePoll, seq_trace_pointers};
+use crate::vm::sequence::{Catch, Execution, Sequence, SequencePoll, seq_trace_pointers};
 
 /// Append the canonical Lua textual form of an integer.
 pub(crate) fn push_int(out: &mut Vec<u8>, i: i64) {
@@ -341,8 +341,7 @@ fn push_ptr(out: &mut Vec<u8>, ptr: *const ()) {
 
 /// Completion sequence for `pcall`, `xpcall`, and `coroutine.resume`: the
 /// call's results come back prefixed with `true`; an error that unwinds to
-/// it becomes `(false, err)`. With a `handler` it is the `xpcall` catcher
-/// the executor consults via `message_handler`.
+/// it becomes `(false, err)`, after the `xpcall` `handler` (if any) has run.
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub(crate) struct ProtectedCall<'gc> {
@@ -378,7 +377,7 @@ impl<'gc> Sequence<'gc> for ProtectedCall<'gc> {
         Ok(SequencePoll::Return)
     }
 
-    fn message_handler(&self) -> Option<Function<'gc>> {
-        self.handler
+    fn catch(&self) -> Catch<'gc> {
+        Catch::Here(self.handler)
     }
 }

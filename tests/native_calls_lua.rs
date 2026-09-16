@@ -1,5 +1,5 @@
-//! A native callback uses `CallbackAction::Call { function, then }` to call
-//! a Lua function and consume its results via a follow-up sequence.
+//! A native callback uses `CallbackAction::Call { then }` to call a Lua
+//! function and consume its results via a follow-up sequence.
 
 use std::pin::Pin;
 
@@ -34,21 +34,14 @@ impl<'gc> Sequence<'gc> for AddOneSequence {
 /// Native callback `bumper(f)` calls `f()` then adds 1 to the result.
 fn bumper<'gc>(
     nctx: NativeContext<'gc, '_>,
-    mut stack: Stack<'gc, '_>,
+    stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let f = stack
-        .get(0)
-        .get_function()
-        .ok_or_else(|| Error::from_str(nctx.ctx, "bumper expects a function"))?;
-    // The Call action's window starts at the callback's bottom (no
-    // function slot inserted yet — apply_pending_action does that). So we
-    // clear our window first to leave just the args (none).
-    stack.replace(&[]);
+    if stack.get(0).get_function().is_none() {
+        return Err(Error::from_str(nctx.ctx, "bumper expects a function"));
+    }
+    // The callee at stack[0] with no arguments is already `Call` layout.
     let then = BoxSequence::new(nctx.ctx.mutation(), AddOneSequence);
-    Ok(CallbackAction::Call {
-        function: f,
-        then: Some(then),
-    })
+    Ok(CallbackAction::Call { then: Some(then) })
 }
 
 #[test]

@@ -58,13 +58,12 @@ pub enum CallbackAction<'gc> {
     /// Become a multi-step sequence. The pushed sequence will be polled
     /// repeatedly until it completes / yields / resumes.
     Sequence(BoxSequence<'gc>),
-    /// Call `function`; on its return, optionally hand control to a follow-up
-    /// sequence. Without `then`, the callback's caller receives the call's
-    /// results directly.
-    Call {
-        function: Function<'gc>,
-        then: Option<BoxSequence<'gc>>,
-    },
+    /// Call the value the callback left at `stack[0]` with the values above
+    /// it as arguments; on return, optionally hand control to a follow-up
+    /// sequence, else the callback's caller receives the results directly.
+    /// The executor resolves `__call` and raises "attempt to call" *inside*
+    /// the call, so `then` catches it like any error the callee raises.
+    Call { then: Option<BoxSequence<'gc>> },
     /// Yield to the resumer. Optional follow-up sequence runs on
     /// resumption with the resume-args on the stack.
     Yield { then: Option<BoxSequence<'gc>> },
@@ -83,6 +82,7 @@ pub enum CallbackAction<'gc> {
 #[derive(Clone, Copy)]
 pub struct Execution<'gc, 'a> {
     current_thread: Thread<'gc>,
+    #[cfg_attr(not(any(test, feature = "test-util")), allow(dead_code))]
     frames: &'a [Frame<'gc>],
 }
 
@@ -99,9 +99,11 @@ impl<'gc, 'a> Execution<'gc, 'a> {
         self.current_thread
     }
 
-    /// The running thread's call frames, innermost last. The thread itself
+    /// The running thread's call frames, innermost last. Test-only: it
+    /// exposes the raw `Frame` layout, which is not API. The thread itself
     /// is mutably borrowed for the duration of the call, so this is the
     /// only way a native can look at them.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn frames(self) -> &'a [Frame<'gc>] {
         self.frames
     }
@@ -137,6 +139,8 @@ pub trait Sequence<'gc>: 'gc {
         stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>>;
 
+    /// Receive an error that unwound to this sequence; only called when
+    /// [`catch`](Self::catch) says so.
     fn error(
         self: Pin<&mut Self>,
         _ctx: crate::lua::Context<'gc>,
@@ -147,13 +151,24 @@ pub trait Sequence<'gc>: 'gc {
         Err(err)
     }
 
-    /// `xpcall`-style message handler. When an error unwinds towards this
-    /// sequence as the nearest catcher, the executor calls the handler with
-    /// the error value *before* popping any frames (so tracebacks see the
-    /// failing stack) and delivers its result to `error` instead.
-    fn message_handler(&self) -> Option<Function<'gc>> {
-        None
+    /// Whether an error unwinding towards this sequence stops here. A
+    /// sequence that overrides `error` must return [`Catch::Here`].
+    fn catch(&self) -> Catch<'gc> {
+        Catch::Pass
     }
+}
+
+/// A sequence's role in error unwinding; see [`Sequence::catch`].
+#[derive(Clone, Copy)]
+pub enum Catch<'gc> {
+    /// Not a catch point: the frame is popped like a Lua frame and `error`
+    /// is never called.
+    Pass,
+    /// `error` receives the error. With an `xpcall`-style message handler,
+    /// the executor calls it with the error value first, *before* popping
+    /// any frames (so tracebacks see the failing stack), and delivers its
+    /// result to `error` instead.
+    Here(Option<Function<'gc>>),
 }
 
 /// Helper macro for `Sequence::trace_pointers`: wraps a `&mut dyn Trace<'gc>`
@@ -227,8 +242,8 @@ impl<'gc> BoxSequence<'gc> {
         self.0.as_mut().poll(ctx, exec, stack)
     }
 
-    pub fn message_handler(&self) -> Option<Function<'gc>> {
-        self.0.as_ref().get_ref().message_handler()
+    pub fn catch(&self) -> Catch<'gc> {
+        self.0.as_ref().get_ref().catch()
     }
 
     /// Hand a pending error to the sequence; it may convert it into a

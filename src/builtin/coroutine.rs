@@ -7,7 +7,7 @@ use crate::env::thread::{Frame, ThreadStatus};
 use crate::env::{
     Error, Function, LuaString, NativeContext, NativeFn, Stack, Table, Thread, Value,
 };
-use crate::vm::sequence::{BoxSequence, CallbackAction, Execution, Sequence, SequencePoll};
+use crate::vm::sequence::{BoxSequence, CallbackAction, Catch, Execution, Sequence, SequencePoll};
 
 pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[
@@ -305,5 +305,12 @@ impl<'gc> Sequence<'gc> for UnwrapResumeSequence {
         // `auxwrap` re-raises a string error with the wrap caller's position
         // prepended on top of the coroutine's own.
         Err(err.with_level(1))
+    }
+
+    /// The rethrow is a fresh raise on the resumer (`auxwrap`'s
+    /// `lua_error`), so an enclosing `xpcall` handler must see the
+    /// re-prefixed message, not the coroutine's original.
+    fn catch(&self) -> Catch<'gc> {
+        Catch::Here(None)
     }
 }

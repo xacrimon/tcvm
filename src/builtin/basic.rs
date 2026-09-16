@@ -214,6 +214,9 @@ fn lua_pairs<'gc>(
 
 /// `pcall(f, ...)`: run `f` under a [`ProtectedCall`] completion that turns
 /// its results into `(true, ...)` and a caught error into `(false, err)`.
+/// The callee and its arguments are already in `Call` layout; a
+/// non-callable `f` is raised by the executor inside the protected call,
+/// so it comes back as `(false, msg)` like the reference.
 fn lua_pcall<'gc>(
     nctx: NativeContext<'gc, '_>,
     stack: Stack<'gc, '_>,
@@ -224,53 +227,8 @@ fn lua_pcall<'gc>(
             "bad argument #1 to 'pcall' (value expected)",
         ));
     }
-    protected_call(nctx, stack, None)
-}
-
-/// Shared tail of `pcall`/`xpcall` once the handler slot (if any) has been
-/// removed: the callee is `stack[0]`, its arguments follow. Resolves a
-/// `__call` chain the way `luaD_tryfuncTM` does, prepending the callable
-/// object to the arguments at each hop; a value that never reaches a
-/// function is reported as the `(false, msg)` result rather than raised,
-/// like the reference (the error happens inside the protected call).
-fn protected_call<'gc>(
-    nctx: NativeContext<'gc, '_>,
-    mut stack: Stack<'gc, '_>,
-    handler: Option<Function<'gc>>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let mut args: Vec<Value<'gc>> = stack.as_slice()[1..].to_vec();
-    let mut callee = stack.get(0);
-    let function = loop {
-        if let Some(f) = callee.get_function() {
-            break f;
-        }
-        let mm = callee
-            .get_table()
-            .and_then(|t| t.metatable())
-            .or_else(|| callee.get_userdata().and_then(|u| u.metatable()))
-            .map_or(Value::nil(), |mt| {
-                mt.raw_get(Value::string(nctx.ctx.symbols().mm_call))
-            });
-        if mm.is_nil() || args.len() >= u8::MAX as usize {
-            let msg = format!(
-                "attempt to call a {} value",
-                crate::vm::debug::object_type_name(nctx.ctx, callee)
-            );
-            stack.replace(&[
-                Value::boolean(false),
-                Value::string(LuaString::new(nctx.ctx, msg.as_bytes())),
-            ]);
-            return Ok(CallbackAction::Return);
-        }
-        args.insert(0, callee);
-        callee = mm;
-    };
-    stack.replace(&args);
-    let then = BoxSequence::new(nctx.ctx.mutation(), ProtectedCall { handler });
-    Ok(CallbackAction::Call {
-        function,
-        then: Some(then),
-    })
+    let then = BoxSequence::new(nctx.ctx.mutation(), ProtectedCall { handler: None });
+    Ok(CallbackAction::Call { then: Some(then) })
 }
 
 /// `print(...)` — write each argument's `tostring` form to stdout, separated
@@ -556,7 +514,7 @@ fn lua_warn<'gc>(
 }
 
 /// `xpcall(f, msgh, ...)`: like `pcall`, but the executor calls `msgh` with
-/// the error value before unwinding (see `Sequence::message_handler`).
+/// the error value before unwinding (see `Catch::Here`).
 fn lua_xpcall<'gc>(
     nctx: NativeContext<'gc, '_>,
     mut stack: Stack<'gc, '_>,
@@ -572,8 +530,15 @@ fn lua_xpcall<'gc>(
             &format!("bad argument #2 to 'xpcall' (function expected, got {got})"),
         ));
     };
-    let mut vals: Vec<Value<'gc>> = stack.as_slice().to_vec();
-    vals.remove(1);
-    stack.replace(&vals);
-    protected_call(nctx, stack, Some(handler))
+    // Drop the handler slot so the callee and its args sit in `Call` layout.
+    let n = stack.len();
+    stack.as_mut_slice().copy_within(2.., 1);
+    stack.truncate(n - 1);
+    let then = BoxSequence::new(
+        nctx.ctx.mutation(),
+        ProtectedCall {
+            handler: Some(handler),
+        },
+    );
+    Ok(CallbackAction::Call { then: Some(then) })
 }
