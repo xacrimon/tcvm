@@ -34,18 +34,19 @@ const BOX: u64 = QNAN_NEG | 1 << TAG_SHIFT;
 const PAYLOAD_MASK: u64 = (1 << TAG_SHIFT) - 1;
 const CANONICAL_NAN: u64 = 0x7FF8_0000_0000_0000;
 
-// Small ints only use the low 32 payload bits, so nil/false/true share the tag with bit 47 set:
-// `is_falsy` is then a single range check and `get_integer` a single 32-bit compare on the top.
-const TAG_SMALL_INT: u64 = 1;
+// Tag 7 holds the immediates. Small ints fill the payload's top half with ones so the whole top
+// word is 0xFFFF_FFFF: boxing a zero-extended i32 is one `orr` with a logical immediate and the
+// low word can be used as a `w` register without sign extension. nil/false/true sit just below.
+const TAG_USERDATA: u64 = 1;
 const TAG_BOXED_INT: u64 = 2;
 const TAG_STRING: u64 = 3;
 const TAG_TABLE: u64 = 4;
 const TAG_FUNCTION: u64 = 5;
 const TAG_THREAD: u64 = 6;
-const TAG_USERDATA: u64 = 7;
+const TAG_IMMEDIATE: u64 = 7;
 
-const SMALL_INT: u64 = QNAN_NEG | TAG_SMALL_INT << TAG_SHIFT;
-const NIL: u64 = SMALL_INT | 1 << 47;
+const SMALL_INT: u64 = 0xFFFF_FFFF_0000_0000;
+const NIL: u64 = 0xFFFF_FFFE_0000_0000;
 const FALSE: u64 = NIL | 1;
 const TRUE: u64 = NIL | 2;
 
@@ -131,7 +132,7 @@ impl<'gc> Value<'gc> {
     #[inline(always)]
     pub fn integer(mc: &Mutation<'gc>, v: i64) -> Self {
         if let Ok(small) = i32::try_from(v) {
-            Self::from_bits(SMALL_INT | small as u32 as u64)
+            Self::small(small)
         } else {
             Self::boxed_integer(mc, v)
         }
@@ -144,10 +145,38 @@ impl<'gc> Value<'gc> {
         Self::from_ptr(TAG_BOXED_INT, Gc::new(mc, v))
     }
 
+    /// An integer that is known to fit inline; never allocates.
+    #[inline(always)]
+    pub fn small(v: i32) -> Self {
+        Self::from_bits(SMALL_INT | v as u32 as u64)
+    }
+
+    /// The inline integer, if this is one. Heap-boxed integers report `None`; this is the
+    /// fast-path check, `get_integer` is the complete one.
+    #[inline(always)]
+    pub fn get_small(&self) -> Option<i32> {
+        if hint::likely(self.bits >> 32 == SMALL_INT >> 32) {
+            Some(self.bits as i32)
+        } else {
+            None
+        }
+    }
+
+    /// Both inline integers with one compare: the top words are all ones in both operands
+    /// exactly when they are in their AND.
+    #[inline(always)]
+    pub fn both_small(a: &Self, b: &Self) -> Option<(i32, i32)> {
+        if a.bits & b.bits >= SMALL_INT {
+            Some((a.bits as i32, b.bits as i32))
+        } else {
+            None
+        }
+    }
+
     #[inline(always)]
     pub fn get_integer(&self) -> Option<i64> {
-        if hint::likely(self.bits >> 32 == SMALL_INT >> 32) {
-            Some(self.bits as u32 as i32 as i64)
+        if let Some(i) = self.get_small() {
+            Some(i as i64)
         } else if self.is_tag(TAG_BOXED_INT) {
             Some(*self.ptr::<i64>())
         } else {
@@ -155,21 +184,12 @@ impl<'gc> Value<'gc> {
         }
     }
 
+    /// Handlers that store straight to a slot use `write_float` instead, which keeps the box
+    /// check off the result path.
     #[inline(always)]
     pub fn float(v: f64) -> Self {
         let bits = v.to_bits();
-        if hint::unlikely(bits >= BOX) {
-            return Self::canonical_nan();
-        }
-        Self::from_bits(bits)
-    }
-
-    // A real function rather than a constant so the fixup stays a never-taken branch instead of
-    // becoming a select on the result path of every float op.
-    #[cold]
-    #[inline(never)]
-    fn canonical_nan() -> Self {
-        Self::from_bits(CANONICAL_NAN)
+        Self::from_bits(if bits >= BOX { CANONICAL_NAN } else { bits })
     }
 
     #[inline(always)]
@@ -292,7 +312,7 @@ impl<'gc> Value<'gc> {
         }
 
         match self.tag() {
-            TAG_SMALL_INT => match self.bits {
+            TAG_IMMEDIATE => match self.bits {
                 NIL => ValueKind::Nil,
                 FALSE | TRUE => ValueKind::Boolean,
                 _ => ValueKind::Integer,
