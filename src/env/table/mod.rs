@@ -1,7 +1,6 @@
 mod hash_part;
 
-use core::hash::BuildHasher;
-
+use hash_part::lua_string_hash;
 use hashbrown::HashTable;
 
 use crate::Context;
@@ -166,11 +165,6 @@ pub struct DictState<'gc> {
 /// `next` was given a key that is not in the table.
 #[derive(Debug, Clone, Copy)]
 pub struct InvalidKey;
-
-#[inline]
-fn lua_string_hash(key: LuaString<'_>) -> u64 {
-    foldhash::fast::FixedState::default().hash_one(key)
-}
 
 impl<'gc> TableState<'gc> {
     fn new(mc: &Mutation<'gc>, shape: Shape<'gc>) -> Self {

@@ -4,29 +4,30 @@
 //! traversal can resume from its key.
 
 use core::alloc::Allocator;
+use core::hash::BuildHasher;
 
 use hashbrown::{HashTable, hash_table};
 
 use crate::dmm::{Collect, Gc, Trace};
 use crate::env::string::LuaString;
-use crate::env::value::Value;
+use crate::env::value::{Value, value_hash};
 
 /// One hash-part entry. A dead entry (nil `value`) does not trace its
-/// key, so the key may dangle once the collector frees the object: nothing
-/// here dereferences a key. Identity is compared bitwise and `hash` is
-/// stored so rehashing never recomputes it. A dead key whose address is
-/// reused by a new object matches on identity only if the hash matches
-/// too, which is exactly when reviving the entry in place is correct.
+/// key, so the key may dangle once the collector frees the object, as in
+/// the reference: nothing dereferences a dead key. Identity is compared
+/// bitwise, and dead entries are reaped before any rehash so their hash
+/// is never recomputed. A set never revives a dead entry either (a new
+/// object at a freed address would land in the wrong bucket); only `next`
+/// resolves dead keys.
 #[derive(Clone, Copy)]
 pub(super) struct Entry<'gc, K> {
     pub key: K,
-    pub hash: u64,
     pub value: Value<'gc>,
 }
 
 unsafe impl<'gc, K: Collect<'gc>> Collect<'gc> for Entry<'gc, K> {
     fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
-        if !self.value.is_nil() {
+        if self.is_live() {
             cc.trace(&self.key);
             cc.trace(&self.value);
         }
@@ -35,28 +36,27 @@ unsafe impl<'gc, K: Collect<'gc>> Collect<'gc> for Entry<'gc, K> {
 
 impl<'gc, K> Entry<'gc, K> {
     #[inline]
-    fn matches(&self, hash: u64, key: K) -> bool
-    where
-        K: Key,
-    {
-        self.hash == hash && self.key.same(key)
-    }
-
-    #[inline]
     pub fn is_live(&self) -> bool {
         !self.value.is_nil()
     }
 }
 
-/// Identity comparison that never dereferences either side.
+/// Hash-part key: identity comparison that never dereferences either
+/// side, and the hash used to place it.
 pub(super) trait Key: Copy {
     fn same(self, other: Self) -> bool;
+    fn hash(self) -> u64;
 }
 
 impl Key for Value<'_> {
     #[inline]
     fn same(self, other: Self) -> bool {
         self == other
+    }
+
+    #[inline]
+    fn hash(self) -> u64 {
+        value_hash(self)
     }
 }
 
@@ -65,6 +65,16 @@ impl Key for LuaString<'_> {
     fn same(self, other: Self) -> bool {
         Gc::ptr_eq(self.inner(), other.inner())
     }
+
+    #[inline]
+    fn hash(self) -> u64 {
+        lua_string_hash(self)
+    }
+}
+
+#[inline]
+pub(super) fn lua_string_hash(key: LuaString<'_>) -> u64 {
+    foldhash::fast::FixedState::default().hash_one(key)
 }
 
 pub(super) type Part<'gc, K, A> = HashTable<Entry<'gc, K>, A>;
@@ -76,7 +86,7 @@ pub(super) fn get<'gc, K: Key, A: Allocator>(
     key: K,
 ) -> Value<'gc> {
     table
-        .find(hash, |e| e.matches(hash, key))
+        .find(hash, |e| e.is_live() && e.key.same(key))
         .map_or(Value::nil(), |e| e.value)
 }
 
@@ -87,7 +97,7 @@ pub(super) fn position<K: Key, A: Allocator>(
     hash: u64,
     key: K,
 ) -> Option<usize> {
-    table.find_bucket_index(hash, |e| e.matches(hash, key))
+    table.find_bucket_index(hash, |e| e.key.same(key))
 }
 
 /// First live entry at bucket index `from` or later.
@@ -102,9 +112,9 @@ pub(super) fn next_live<'a, 'gc, K, A: Allocator>(
 
 /// Deletion goes through `find_mut` rather than `entry`: `entry` reserves
 /// a slot before probing, and a rehash here would reorder a `pairs` loop
-/// that is clearing the table. Dead entries are reaped only when an insert
-/// would otherwise grow the table (growth rehashes anyway, and inserting
-/// mid-traversal is undefined).
+/// that is clearing the table. An insert reaps dead entries when it would
+/// otherwise grow the table — hashbrown rehashes exactly when
+/// `len == capacity`, so this is what keeps a dead key out of the hasher.
 pub(super) fn set<'gc, K: Key, A: Allocator>(
     table: &mut Part<'gc, K, A>,
     hash: u64,
@@ -112,7 +122,7 @@ pub(super) fn set<'gc, K: Key, A: Allocator>(
     value: Value<'gc>,
 ) {
     if value.is_nil() {
-        if let Some(e) = table.find_mut(hash, |e| e.matches(hash, key)) {
+        if let Some(e) = table.find_mut(hash, |e| e.is_live() && e.key.same(key)) {
             e.value = value;
         }
         return;
@@ -120,10 +130,10 @@ pub(super) fn set<'gc, K: Key, A: Allocator>(
     if table.len() == table.capacity() {
         table.retain(|e| e.is_live());
     }
-    match table.entry(hash, |e| e.matches(hash, key), |e| e.hash) {
+    match table.entry(hash, |e| e.is_live() && e.key.same(key), rehash) {
         hash_table::Entry::Occupied(mut e) => e.get_mut().value = value,
         hash_table::Entry::Vacant(e) => {
-            e.insert(Entry { key, hash, value });
+            e.insert(Entry { key, value });
         }
     }
 }
@@ -136,5 +146,10 @@ pub(super) fn insert_unique<'gc, K: Key, A: Allocator>(
     key: K,
     value: Value<'gc>,
 ) {
-    table.insert_unique(hash, Entry { key, hash, value }, |e| e.hash);
+    table.insert_unique(hash, Entry { key, value }, rehash);
+}
+
+fn rehash<K: Key>(e: &Entry<'_, K>) -> u64 {
+    debug_assert!(e.is_live(), "rehash reached a dead entry");
+    e.key.hash()
 }
