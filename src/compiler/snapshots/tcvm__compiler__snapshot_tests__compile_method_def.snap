@@ -46,8 +46,8 @@ expression: output
   ;   K0 = "v"
   ; code:
   0000  [  3]  VARARGPREP      fixed=2
-  0001  [  3]  GETFIELD        R3 R0 K0  ; "v"
-  0002  [  3]  ADD             R2 R3 R1
+  0001  [  3]  GETFIELD        R2 R0 K0  ; "v"
+  0002  [  3]  ADD             R2 R2 R1
   0003  [  3]  VARARG          R3 count=0
   0004  [  3]  RETURN          R2 count=0
 

@@ -4047,8 +4047,13 @@ fn compile_return_generic(ctx: &mut Ctx, mut exprs: Vec<Expr>) -> Result<(), Com
         return Ok(());
     }
 
+    // Values are built in place at `freereg` upward, like call arguments:
+    // `first_reg` must NOT be reserved ahead of time, or a call in a
+    // non-final position lands one slot high and gets MOVEd down, leaving
+    // a stale temp between it and the trailing MULTRET call that `RETURN
+    // count=0` would then sweep up as an extra return value.
     let n = exprs.len();
-    let first_reg = ctx.alloc_register()?;
+    let first_reg = RegisterIndex(ctx.chunk.freereg);
     let last_idx = n - 1;
     let mut multret = false;
 
@@ -4067,6 +4072,7 @@ fn compile_return_generic(ctx: &mut Ctx, mut exprs: Vec<Expr>) -> Result<(), Com
                     ctx.alloc_register()?;
                 }
                 ctx.emit(Instruction::mov(target, reg));
+                ctx.free_reg(reg);
             }
         }
     }
