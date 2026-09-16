@@ -408,6 +408,7 @@ impl<'gc> TableState<'gc> {
                 Some(d) => {
                     hash_part::next_live(&d.table, from).map(|e| (Value::string(e.key), e.value))
                 }
+                // Slot doubles as descriptor index; see `ShapeData::descriptors`.
                 None => self.shape.descriptors()[from..]
                     .iter()
                     .map(|d| (Value::string(d.key), self.properties[d.slot as usize]))

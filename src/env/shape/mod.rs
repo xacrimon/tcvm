@@ -170,7 +170,8 @@ pub struct ShapeData<'gc> {
 
     /// Full ordered descriptor list (parent's prefix + this shape's
     /// last_key, if any). Eager rather than lazy — keeps slow paths
-    /// branchless.
+    /// branchless. Dense and slot-ordered: `descriptors[i].slot == i`,
+    /// which `TableState::next` uses to resume a traversal from a slot.
     pub descriptors: Box<[Descriptor<'gc>]>,
 }
 
@@ -422,6 +423,7 @@ pub fn transition_add_prop<'gc>(
     // Slow path: allocate a child and install/replace the edge.
     let new_slot = parent.data().slot_count;
     let mut new_descs: Vec<Descriptor<'gc>> = parent.descriptors().to_vec();
+    debug_assert_eq!(new_descs.len(), new_slot as usize);
     new_descs.push(Descriptor {
         key,
         slot: new_slot,

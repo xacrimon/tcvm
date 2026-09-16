@@ -165,8 +165,9 @@ fn deleted_slot_is_reused() {
 }
 
 #[test]
-fn dead_hash_entries_are_reaped_on_growth() {
-    // Churn far more distinct keys through the misc hash than stay live.
+fn churned_keys_do_not_resurface() {
+    // Churn far more distinct keys through the misc hash than stay live;
+    // the dead entries must neither show up in `pairs` nor block a re-set.
     assert_eq!(
         keys("local t = {} for i = 1, 1000 do t[-i] = i t[-i] = nil end t[-5] = 5 return keys(t)"),
         "1:-5=5"
