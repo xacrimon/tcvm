@@ -2,7 +2,7 @@
 source: src/compiler/snapshot_tests.rs
 expression: output
 ---
-; function (params=0, vararg=true, stack=10, upvalues=1)
+; function (params=0, vararg=true, stack=9, upvalues=1)
 ; constants:
 ;   K0 = 1
 ;   K1 = 2
@@ -19,25 +19,22 @@ expression: output
 0002  [  3]  CLOSURE         R1 P1
 0003  [  4]  CLOSURE         R2 P2
 0004  [  5]  CLOSURE         R3 P3
-0005  [  6]  MOVE            R5 R0
-0006  [  6]  LOAD            R6 K0  ; 1
-0007  [  6]  LOAD            R7 K1  ; 2
-0008  [  6]  LOAD            R8 K2  ; 3
-0009  [  6]  CALL            R5 args=4 ret=2
-0010  [  6]  MOVE            R4 R5
-0011  [  6]  MOVE            R6 R1
-0012  [  6]  LOAD            R7 K3  ; 10
-0013  [  6]  LOAD            R8 K4  ; 20
-0014  [  6]  CALL            R6 args=3 ret=2
-0015  [  6]  MOVE            R5 R6
-0016  [  6]  MOVE            R7 R2
-0017  [  6]  LOAD            R8 K5  ; true
-0018  [  6]  LOAD            R9 K6  ; false
-0019  [  6]  CALL            R7 args=3 ret=2
-0020  [  6]  MOVE            R6 R7
-0021  [  6]  MOVE            R8 R3
-0022  [  6]  CALL            R8 args=1 ret=0
-0023  [  6]  RETURN          R4 count=0
+0005  [  6]  MOVE            R4 R0
+0006  [  6]  LOAD            R5 K0  ; 1
+0007  [  6]  LOAD            R6 K1  ; 2
+0008  [  6]  LOAD            R7 K2  ; 3
+0009  [  6]  CALL            R4 args=4 ret=2
+0010  [  6]  MOVE            R5 R1
+0011  [  6]  LOAD            R6 K3  ; 10
+0012  [  6]  LOAD            R7 K4  ; 20
+0013  [  6]  CALL            R5 args=3 ret=2
+0014  [  6]  MOVE            R6 R2
+0015  [  6]  LOAD            R7 K5  ; true
+0016  [  6]  LOAD            R8 K6  ; false
+0017  [  6]  CALL            R6 args=3 ret=2
+0018  [  6]  MOVE            R7 R3
+0019  [  6]  CALL            R7 args=1 ret=0
+0020  [  6]  RETURN          R4 count=0
 
 ; prototype 0:
   ; function (params=2, vararg=true, stack=4, upvalues=0)
