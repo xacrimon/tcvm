@@ -762,3 +762,95 @@ arm is reached after the string-tag compare and runs
 | JSC get_from_scope, new_object, get_by_val | `BytecodeList.rb:542, 597, 657`; asm `:2901` |
 | JSC arithmetic profile / math IC | `LowLevelInterpreter64.asm:1230`, `bytecode/ArithProfile.h:37`, `jit/JITMathIC.h:70–150` |
 | PUC short-string limit, `TString.hash`, `NEWTABLE` sizing | `lstring.h:29`, `lobject.h:410`, `lvm.c:1416` |
+
+---
+
+## 12. Instruction-set comparison on `particles.lua` (added after review)
+
+Static listings: `tcvm-cli -l -f particles.lua` (438 instructions),
+`luajit -bl` (436), `luac5.5 -l -l -p` (482, of which 35 are `MMBIN*` metamethod
+shadows and 10 `EXTRAARG`, so ≈437 real). tcvm's density already matches
+LuaJIT's; the instruction set is not where the big gaps are. What differs is a
+handful of specific forms, listed by how often they fire in this file's hot
+functions (`Vec2.new/add/sub/scale/len2`, `Particle.new`, the `update` closure,
+`rand`, `World:step`'s inner loops).
+
+Fusable pairs counted in tcvm's listing:
+
+| pair in tcvm output | count | what the others emit |
+|---|---|---|
+| `GETUPVAL u; GETFIELD r r K` (upvalue table, constant key) | 11 (3 hot: `Vec2.new` in add/sub/scale) | PUC: one `GETTABUP` — tcvm only emits `GETTABUP` for `_ENV` (`compiler/rules.rs:2007,2167,2829`). LuaJIT: `UGET`+`TGETS`, same as tcvm |
+| `LOAD r K; SETFIELD r t K` (constant value store) | 7 (`age = 0`, `alive = true`, `frame = 0`, …) | PUC: `SETFIELD t K vK` (RK value). LuaJIT: baked into the `TDUP` template, zero instructions |
+| `LOAD r K; ADD/MUL/MOD/DIV` (constant that doesn't fit `Imm`) | 3, all in `rand` (`1103515245`, `2147483648` ×2) | PUC `MULK/MODK/DIVK`, LuaJIT `MULVN/MODVN/DIVVN`: `rand` is 8 instructions there vs 11 here |
+| `LOAD r K; GETTABLE`/`SETTABLE` (small integer index) | 3 (cold: `ps[1]`, `arg[1]`) | PUC `GETI/SETI`, LuaJIT `TGETB/TSETB` (#33) |
+| `NOT r; TEST r; JMP` | 2 (`if not b`, `if not p.alive`, both in loops) | PUC `jumponcond` (`lcode.c:1160`) deletes the `OP_NOT` and flips `TEST`'s k; LuaJIT `ISF` |
+| `LOAD r K; EQ` for `x == nil` / `x == "str"` / `x == true` | 0 here, ubiquitous elsewhere (`type(x) == "table"`, `node ~= nil`) | LuaJIT `ISEQS/ISNES/ISEQP/ISNEP`; PUC `EQK` — one instruction, and for nil/bool/interned-string constants a single 64-bit compare with no `__eq` possible |
+| `SELF; CALL`, `GETFIELD; ADDI; SETFIELD` | 5, 4 | nobody fuses these; the win is the IC on `SELF` (§3.1), not fusion |
+
+Side by side, `rand` and `Particle.new`:
+
+```
+tcvm                              luajit                        puc 5.5
+GETUPVAL R0 U0                    UGET  0 0 ; seed              GETUPVAL 0 0
+LOAD     R1 K0 ; 1103515245       MULVN 0 0 0 ; 1103515245      MULK 0 0 0
+MUL      R0 R0 R1                 ADDVN 0 0 1 ; 12345           ADDK 0 0 1
+ADDI     R0 R0 #12345             MODVN 0 0 2 ; 2147483648      MODK 0 0 2
+LOAD     R1 K1 ; 2147483648       USETV 0 0                     SETUPVAL 0 0
+MOD      R0 R0 R1                 UGET  0 0                     GETUPVAL 0 0
+SETUPVAL R0 U0                    DIVVN 0 0 2                   DIVK 0 0 2
+GETUPVAL R0 U0                    RET1  0 2                     RETURN1 0
+LOAD     R1 K1
+DIV      R0 R0 R1
+RETURN   R0 count=2               (8)                           (8, +4 MMBINK shadows)
+(11)
+
+NEWTABLE R3                       TDUP  4 1   ; {id=,pos=,vel=,age=0,alive=true}
+GETUPVAL R4 U0                    UGET  5 0
+SETFIELD R4 R3 "id"               TSETS 5 4 "id"
+SETFIELD R0 R3 "pos"              TSETS 0 4 "pos"
+SETFIELD R1 R3 "vel"              TSETS 1 4 "vel"
+LOAD     R4 K5 ; 0                (age, alive came with the template)
+SETFIELD R4 R3 "age"
+LOAD     R4 K7 ; true
+SETFIELD R4 R3 "alive"
+(9)                               (5)
+```
+
+Note `rand` also boxes: `seed * 1103515245` is ≈2⁶¹, so on the 8-byte `Value`
+every call allocates two `i64` boxes (§7) before `% 2147483648` brings it back
+under 2³¹.
+
+### 12.1 Recommendations, in order
+
+1. **Emit `GETTABUP`/`SETTABUP` for any upvalue table with a constant key**, not
+   just `_ENV` — compiler-only, no new opcode, the IC slot already exists.
+   Removes one dispatch and a register round-trip from every `Vec2.new(...)`,
+   `Particle.new(...)`, `insert(...)`-style call inside methods.
+2. **`EQK`/`NEK` for nil/boolean/string constants** (`Abd { src, inverted, key: KIdx }`):
+   handler is `skip_if!((reg.bits == k.bits) != inverted)` — no tag dispatch,
+   no metamethod check, because nil/bool/interned strings are bit-unique in the
+   NaN-box. Numbers stay on `EQI`/generic `EQ` (1 == 1.0 needs the slow
+   compare). This is LuaJIT's `ISEQS/ISEQP` and the most common comparison
+   shape in real Lua.
+3. **K-form arithmetic** (`ADDK/SUBK/MULK/DIVK/MODK/IDIVK/POWK` + bitwise, `AbcK`
+   with `d: KIdx`) for constants the 32-bit `Imm` can't hold (any float that
+   isn't f32-exact — `0.1`, `0.995`, `PI` — and ints ≥ 2³⁰). Put the constant's
+   kind in the flag byte at compile time so the handler tests only the
+   register operand (LuaJIT's `*VN` forms assume a number constant).
+4. **Constant-value stores** — either `SETFIELD/SETI/SETTABUP` with an RK value
+   (PUC's `k` bit; the `e` slot is free once the value is a `KIdx`), or, for
+   constructor sites, the shape-carrying `NEWTABLE` of §4.2 which makes the
+   constant fields free like `TDUP`. Do §4.2 first; add the RK store for the
+   `self.count = 0` cases outside constructors.
+5. **`GETI`/`SETI`** (#33) and the **`NOT` → `TEST` peephole** (`codenot` on a
+   `Reg` operand feeding a condition; mirror `jumponcond`).
+6. **n-ary `CONCAT`** (#33, §5.2).
+
+Not worth an opcode: `SELF+CALL`, read-modify-write field ops, `RETURN0/1`
+(same dispatch count; #171 territory), `LOADI/LOADF/LOADTRUE` (the pool is one
+load off `ds` now, so they only save the constant fetch).
+
+Expected effect on this file's hot functions: `Vec2.add/sub` 9→8, `scale` 7→6,
+`Particle.new` 19→14, `rand` 11→8 dispatches — roughly 10 % fewer instructions
+in the parts that matter, which is the ceiling for ISA work here; the per-
+instruction costs in §3–§7 are worth several times that.
