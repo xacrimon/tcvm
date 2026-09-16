@@ -8,7 +8,7 @@ use crate::lua::RuntimeError;
 use crate::lua::context::Context;
 use crate::lua::convert::{FromMultiValue, IntoMultiValue};
 use crate::vm;
-use crate::vm::interp::OpError;
+use crate::vm::interp::{CallTarget, OpError};
 use crate::vm::interp::{Continuation, ContinuationPayload};
 use crate::vm::sequence::{BoxSequence, CallbackAction, Catch, Execution, Sequence, SequencePoll};
 
@@ -252,7 +252,7 @@ impl<'gc> Executor<'gc> {
                         _ => unreachable!(),
                     };
                     ts.insert_at(0, Value::function(f));
-                    schedule_call_at(&mut ts, ctx, 0, f, 0)?;
+                    schedule_call_at(&mut ts, ctx, 0, 0)?;
                     if ts.frames.is_empty() && ts.pending_action.is_none() {
                         // Native entry returned `Return` synchronously;
                         // results sit at stack[0..] and the thread is
@@ -426,19 +426,7 @@ fn apply_pending_action<'gc>(
                     call_site.func_idx
                 }
             };
-            // Callee at `slot`, args above it: the layout schedule_call_at
-            // wants. Level 0 because the raiser is a native
-            // (`luaG_callerror` adds no position for a C `ci`).
-            if vm::interp::resolve_call_chain(ctx, &mut ts, slot, 0).is_none() {
-                let msg = vm::debug::op_error_message(ctx, &ts, OpError::Call(ts.stack[slot]));
-                ts.raise(
-                    ctx,
-                    Error::new(Value::string(LuaString::new(ctx, msg.as_bytes()))),
-                );
-                return Ok(());
-            }
-            let function = ts.stack[slot].get_function().unwrap();
-            schedule_call_at(&mut ts, ctx, slot, function, call_site.returns)?;
+            schedule_call_at(&mut ts, ctx, slot, call_site.returns)?;
         }
         CallbackAction::Yield { then } => {
             let mut ts = top.borrow_mut(mc);
@@ -541,18 +529,27 @@ fn schedule_thread_resume<'gc>(
     Ok(())
 }
 
-/// Push a Lua/Native call frame for `function` whose function-slot is at
-/// `slot` (so args live at `slot+1..`). For Lua: a `LuaFrame` with `base =
-/// slot+1`. For Native: invoke synchronously and either land Return values
-/// at `slot..` or stash a pending action.
+/// Call the value at `stack[slot]` with the args above it (through any
+/// `__call` chain). For Lua: push a `LuaFrame` with `base = slot+1`. For
+/// Native: invoke synchronously and either land Return values at `slot..`
+/// or stash a pending action. A non-callable value raises "attempt to
+/// call" at level 0, as the raiser is a native (`luaG_callerror` adds no
+/// position for a C `ci`).
 fn schedule_call_at<'gc>(
     ts: &mut crate::env::thread::ThreadState<'gc>,
     ctx: Context<'gc>,
     slot: usize,
-    function: Function<'gc>,
     caller_returns: u8,
 ) -> Result<(), RuntimeError> {
-    if let Some(closure) = function.as_lua() {
+    let Some((target, _)) = vm::interp::resolve_call_chain(ctx, ts, slot, 0) else {
+        let msg = vm::debug::op_error_message(ctx, ts, OpError::Call(ts.stack[slot]));
+        ts.raise(
+            ctx,
+            Error::new(Value::string(LuaString::new(ctx, msg.as_bytes()))),
+        );
+        return Ok(());
+    };
+    if let CallTarget::Lua(closure) = target {
         let base = slot + 1;
         let caller_provided = ts.top.saturating_sub(base);
         let num_params = closure.proto.num_params as usize;
@@ -578,9 +575,9 @@ fn schedule_call_at<'gc>(
     } else {
         // Native target. Drive synchronously; if it returns Return we land
         // values at [slot..]; otherwise stash a new pending_action.
-        let nc = function
-            .as_native()
-            .expect("function is neither Lua nor Native");
+        let CallTarget::Native(nc) = target else {
+            unreachable!()
+        };
         let args_base = slot + 1;
         let argc = ts.top - args_base;
         let action = match vm::interp::invoke_native(ctx, ts, nc, args_base, argc) {
@@ -701,7 +698,7 @@ fn pump_sequence<'gc>(
             });
             // Schedule the call: insert function at abs_bottom, args after.
             ts.insert_at(abs_bottom, Value::function(function));
-            schedule_call_at(&mut ts, ctx, abs_bottom, function, 0)?;
+            schedule_call_at(&mut ts, ctx, abs_bottom, 0)?;
         }
         Ok(SequencePoll::TailCall(function)) => {
             // Sequence is done; the call's results must land at the
@@ -721,13 +718,7 @@ fn pump_sequence<'gc>(
                 ts.set_top(new_args_base + argc);
             }
             ts.stack[call_site.func_idx] = Value::function(function);
-            schedule_call_at(
-                &mut ts,
-                ctx,
-                call_site.func_idx,
-                function,
-                call_site.returns,
-            )?;
+            schedule_call_at(&mut ts, ctx, call_site.func_idx, call_site.returns)?;
         }
         Ok(SequencePoll::Yield { bottom: rel }) => {
             let abs_bottom = call_site.bottom + rel;
@@ -969,7 +960,7 @@ fn run_message_handler<'gc>(
         },
         pending_error: None,
     });
-    schedule_call_at(ts, ctx, slot, handler, 0)
+    schedule_call_at(ts, ctx, slot, 0)
 }
 
 /// Completion of an `xpcall` message handler: its first result becomes the
