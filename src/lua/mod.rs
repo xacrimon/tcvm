@@ -176,6 +176,21 @@ impl Lua {
         self.finish(ex)
     }
 
+    pub fn load(&mut self, lib: Lib) {
+        self.enter(|ctx| match lib {
+            Lib::Basic => builtin::load_basic(ctx),
+            Lib::Coroutine => builtin::load_coroutine(ctx),
+            Lib::Debug => builtin::load_debug(ctx),
+            Lib::Io => builtin::load_io(ctx),
+            Lib::Math => builtin::load_math(ctx),
+            Lib::Os => builtin::load_os(ctx),
+            Lib::Package => builtin::load_package(ctx),
+            Lib::String => builtin::load_string(ctx),
+            Lib::Table => builtin::load_table(ctx),
+            Lib::Utf8 => builtin::load_utf8(ctx),
+        });
+    }
+
     pub fn load_all(&mut self) {
         self.enter(|ctx| {
             builtin::load_basic(ctx);
@@ -190,6 +205,20 @@ impl Lua {
             builtin::load_utf8(ctx);
         });
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lib {
+    Basic,
+    Coroutine,
+    Debug,
+    Io,
+    Math,
+    Os,
+    Package,
+    String,
+    Table,
+    Utf8,
 }
 
 #[cfg(test)]
@@ -1322,5 +1351,41 @@ mod tests {
              return a + b",
         );
         assert_eq!(n, 1 + 200);
+    }
+
+    fn run_bool_in(lua: &mut Lua, src: &str) -> bool {
+        let ex = lua
+            .try_enter(|ctx| -> Result<_, LoadError> {
+                let chunk = ctx.load(src, Some("test"))?;
+                Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+            })
+            .expect("load");
+        lua.execute::<bool>(&ex).expect("run")
+    }
+
+    #[test]
+    fn load_single_lib_registers_only_that_lib() {
+        let mut lua = Lua::new();
+        lua.load(Lib::Math);
+        assert!(run_bool_in(
+            &mut lua,
+            "return math.floor(3.7) == 3 and string == nil and print == nil",
+        ));
+    }
+
+    #[test]
+    fn load_libs_incrementally() {
+        let mut lua = Lua::new();
+        lua.load(Lib::String);
+        assert!(run_bool_in(
+            &mut lua,
+            "return string.rep('a', 3) == 'aaa' and table == nil"
+        ));
+
+        lua.load(Lib::Table);
+        assert!(run_bool_in(
+            &mut lua,
+            "return table.concat({1, 2, 3}, '-') == '1-2-3' and string.rep('b', 2) == 'bb'",
+        ));
     }
 }
