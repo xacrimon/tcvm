@@ -970,7 +970,9 @@ fn run_message_handler<'gc>(
 /// error value. An error inside the handler calls the handler again with
 /// it (manual §2.3), on top of the still-intact failing frames, until the
 /// loop is cut with "error in error handling" like the reference's C-stack
-/// limit does.
+/// limit does. The handler may yield: the reference forbids that only
+/// because it runs the handler on the C stack, and we keep every call
+/// resumable, as LuaJIT does.
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 struct HandlerSequence<'gc> {

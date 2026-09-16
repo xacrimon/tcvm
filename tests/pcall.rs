@@ -231,6 +231,20 @@ fn handler_runs_before_the_stack_unwinds() {
 }
 
 #[test]
+fn handler_may_yield() {
+    // Resumable everywhere, like LuaJIT: the reference's "attempt to yield
+    // across a C-call boundary" is a limitation of its C-stack handler call.
+    check(
+        "local co = coroutine.create(function()\n\
+           return xpcall(function() error('orig') end, function(e) return 'H:' .. coroutine.yield('mid') .. e end)\n\
+         end)\n\
+         local ok1, v1 = coroutine.resume(co)\n\
+         local ok2, ok, e = coroutine.resume(co, 'R:')\n\
+         return (ok1 and v1 == 'mid' and ok2 and not ok and e == 'H:R:t:2: orig') and 1 or 0",
+    );
+}
+
+#[test]
 fn retried_handler_still_sees_the_failing_frames() {
     // The first invocation fails; the retry runs with only that invocation
     // unwound, so it counts main, `outer`, `deep`, and itself.
