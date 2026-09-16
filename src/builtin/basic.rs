@@ -1,9 +1,13 @@
 use std::io::Write;
+use std::pin::Pin;
 
 use crate::Context;
-use crate::builtin::util::{self, ProtectedCall};
+use crate::builtin::util;
+use crate::dmm::{Collect, Trace};
 use crate::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Value};
-use crate::vm::sequence::{BoxSequence, CallbackAction};
+use crate::vm::sequence::{
+    BoxSequence, CallbackAction, Catch, Execution, Sequence, SequencePoll, seq_trace_pointers,
+};
 
 // TODO(#27): _G, _VERSION
 
@@ -229,6 +233,46 @@ fn lua_pcall<'gc>(
     }
     let then = BoxSequence::new(nctx.ctx.mutation(), ProtectedCall { handler: None });
     Ok(CallbackAction::Call { then: Some(then) })
+}
+
+/// Completion sequence for `pcall`, `xpcall`, and `coroutine.resume`: the
+/// call's results come back prefixed with `true`; an error that unwinds to
+/// it becomes `(false, err)`, after the `xpcall` `handler` (if any) has run.
+#[derive(Collect)]
+#[collect(internal, no_drop)]
+pub(crate) struct ProtectedCall<'gc> {
+    pub(crate) handler: Option<Function<'gc>>,
+}
+
+impl<'gc> Sequence<'gc> for ProtectedCall<'gc> {
+    fn trace_pointers(&self, cc: &mut dyn Trace<'gc>) {
+        seq_trace_pointers!(self, cc);
+    }
+
+    fn poll(
+        self: Pin<&mut Self>,
+        _ctx: Context<'gc>,
+        _exec: Execution<'gc, '_>,
+        mut stack: Stack<'gc, '_>,
+    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
+        stack.insert(0, Value::boolean(true));
+        Ok(SequencePoll::Return)
+    }
+
+    fn error(
+        self: Pin<&mut Self>,
+        _ctx: Context<'gc>,
+        _exec: Execution<'gc, '_>,
+        err: Error<'gc>,
+        mut stack: Stack<'gc, '_>,
+    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
+        stack.replace(&[Value::boolean(false), err.value()]);
+        Ok(SequencePoll::Return)
+    }
+
+    fn catch(&self) -> Catch<'gc> {
+        Catch::Here(self.handler)
+    }
 }
 
 /// `print(...)` — write each argument's `tostring` form to stdout, separated

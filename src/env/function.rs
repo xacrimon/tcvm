@@ -253,6 +253,19 @@ impl<'gc, 'a> Stack<'gc, 'a> {
         }
     }
 
+    /// Shift `stack[i..]` up one and put `v` at `i`.
+    #[inline]
+    pub fn insert(&mut self, i: usize, v: Value<'gc>) {
+        let at = self.bottom + i;
+        debug_assert!(at <= *self.top);
+        if *self.top == self.values.len() {
+            self.values.push(Value::nil());
+        }
+        self.values.copy_within(at..*self.top, at + 1);
+        self.values[at] = v;
+        *self.top += 1;
+    }
+
     /// Drop everything past the first `len` values, nil-filling like `clear`.
     #[inline]
     pub fn truncate(&mut self, len: usize) {

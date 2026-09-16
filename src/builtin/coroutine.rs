@@ -1,7 +1,7 @@
 use std::pin::Pin;
 
 use crate::Context;
-use crate::builtin::util::ProtectedCall;
+use crate::builtin::basic::ProtectedCall;
 use crate::dmm::{Collect, Trace};
 use crate::env::thread::{Frame, ThreadStatus};
 use crate::env::{

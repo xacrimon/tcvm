@@ -64,7 +64,7 @@ impl<'gc> Error<'gc> {
         }
     }
 
-    /// Swap the payload, keeping the handled flag (level is consumed).
+    /// Swap the payload, keeping the handled flag; resets the level.
     pub(crate) fn with_value(self, value: Value<'gc>) -> Self {
         Error {
             value,
