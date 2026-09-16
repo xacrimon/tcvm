@@ -1,3 +1,4 @@
+use crate::dmm::Mutation;
 use crate::env::Value;
 
 /// Lua's `luaV_flttointns` with mode F2Ieq: the float must be integral and in
@@ -89,12 +90,16 @@ pub fn le_float_int(f: f64, i: i64) -> bool {
 }
 
 #[inline(always)]
-pub fn op_arith_int<'gc, Op: ArithOp>(lhs: i64, rhs: i64) -> Option<Value<'gc>> {
+pub fn op_arith_int<'gc, Op: ArithOp>(
+    mc: &Mutation<'gc>,
+    lhs: i64,
+    rhs: i64,
+) -> Option<Value<'gc>> {
     if Op::INT_ZERO_DIVISOR_INVALID && rhs == 0 {
         return None;
     }
 
-    Some(Op::int(lhs, rhs))
+    Some(Op::int(mc, lhs, rhs))
 }
 
 #[inline(always)]
@@ -115,7 +120,11 @@ fn to_float(v: &Value) -> Option<f64> {
 /// The mixed int/float arm. Callers must have excluded same-type operands
 /// first, so this never sees int-int and needs no zero-divisor guard.
 #[inline(always)]
-pub fn op_arith_mixed<'gc, Op: ArithOp>(lhs: &Value, rhs: &Value) -> Option<Value<'gc>> {
+pub fn op_arith_mixed<'gc, Op: ArithOp>(
+    _mc: &Mutation<'gc>,
+    lhs: &Value,
+    rhs: &Value,
+) -> Option<Value<'gc>> {
     let lhs = to_float(lhs)?;
     let rhs = to_float(rhs)?;
 
@@ -123,9 +132,13 @@ pub fn op_arith_mixed<'gc, Op: ArithOp>(lhs: &Value, rhs: &Value) -> Option<Valu
 }
 
 #[inline(always)]
-pub fn op_arith<'gc, Op: ArithOp>(lhs: Value, rhs: Value) -> Option<Value<'gc>> {
+pub fn op_arith<'gc, Op: ArithOp>(
+    mc: &Mutation<'gc>,
+    lhs: Value,
+    rhs: Value,
+) -> Option<Value<'gc>> {
     if let (Some(li), Some(ri)) = (lhs.get_integer(), rhs.get_integer()) {
-        return op_arith_int::<Op>(li, ri);
+        return op_arith_int::<Op>(mc, li, ri);
     }
 
     let lhs = if let Some(v) = lhs.get_integer() {
@@ -150,21 +163,26 @@ pub fn op_arith<'gc, Op: ArithOp>(lhs: Value, rhs: Value) -> Option<Value<'gc>> 
 pub trait ArithOp {
     const INT_ZERO_DIVISOR_INVALID: bool = false;
 
-    fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc>;
-    fn float<'gc>(lhs: f64, rhs: f64) -> Value<'gc>;
+    fn int<'gc>(mc: &Mutation<'gc>, lhs: i64, rhs: i64) -> Value<'gc>;
+    fn float_raw(lhs: f64, rhs: f64) -> f64;
+
+    #[inline(always)]
+    fn float<'gc>(lhs: f64, rhs: f64) -> Value<'gc> {
+        Value::float(Self::float_raw(lhs, rhs))
+    }
 }
 
 pub struct Add;
 
 impl ArithOp for Add {
     #[inline(always)]
-    fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc> {
-        Value::integer(lhs.wrapping_add(rhs))
+    fn int<'gc>(mc: &Mutation<'gc>, lhs: i64, rhs: i64) -> Value<'gc> {
+        Value::integer(mc, lhs.wrapping_add(rhs))
     }
 
     #[inline(always)]
-    fn float<'gc>(lhs: f64, rhs: f64) -> Value<'gc> {
-        Value::float(lhs + rhs)
+    fn float_raw(lhs: f64, rhs: f64) -> f64 {
+        lhs + rhs
     }
 }
 
@@ -172,13 +190,13 @@ pub struct Sub;
 
 impl ArithOp for Sub {
     #[inline(always)]
-    fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc> {
-        Value::integer(lhs.wrapping_sub(rhs))
+    fn int<'gc>(mc: &Mutation<'gc>, lhs: i64, rhs: i64) -> Value<'gc> {
+        Value::integer(mc, lhs.wrapping_sub(rhs))
     }
 
     #[inline(always)]
-    fn float<'gc>(lhs: f64, rhs: f64) -> Value<'gc> {
-        Value::float(lhs - rhs)
+    fn float_raw(lhs: f64, rhs: f64) -> f64 {
+        lhs - rhs
     }
 }
 
@@ -186,13 +204,13 @@ pub struct Mul;
 
 impl ArithOp for Mul {
     #[inline(always)]
-    fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc> {
-        Value::integer(lhs.wrapping_mul(rhs))
+    fn int<'gc>(mc: &Mutation<'gc>, lhs: i64, rhs: i64) -> Value<'gc> {
+        Value::integer(mc, lhs.wrapping_mul(rhs))
     }
 
     #[inline(always)]
-    fn float<'gc>(lhs: f64, rhs: f64) -> Value<'gc> {
-        Value::float(lhs * rhs)
+    fn float_raw(lhs: f64, rhs: f64) -> f64 {
+        lhs * rhs
     }
 }
 
@@ -202,7 +220,7 @@ impl ArithOp for Mod {
     const INT_ZERO_DIVISOR_INVALID: bool = true;
 
     #[inline(always)]
-    fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc> {
+    fn int<'gc>(mc: &Mutation<'gc>, lhs: i64, rhs: i64) -> Value<'gc> {
         let r = lhs.wrapping_rem(rhs);
         let adjusted = if r != 0 && (r ^ rhs) < 0 {
             r.wrapping_add(rhs)
@@ -210,19 +228,17 @@ impl ArithOp for Mod {
             r
         };
 
-        Value::integer(adjusted)
+        Value::integer(mc, adjusted)
     }
 
     #[inline(always)]
-    fn float<'gc>(lhs: f64, rhs: f64) -> Value<'gc> {
+    fn float_raw(lhs: f64, rhs: f64) -> f64 {
         let r = lhs % rhs;
-        let adjusted = if (r > 0.0 && rhs < 0.0) || (r < 0.0 && rhs > 0.0) {
+        if (r > 0.0 && rhs < 0.0) || (r < 0.0 && rhs > 0.0) {
             r + rhs
         } else {
             r
-        };
-
-        Value::float(adjusted)
+        }
     }
 }
 
@@ -230,13 +246,13 @@ pub struct Pow;
 
 impl ArithOp for Pow {
     #[inline(always)]
-    fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc> {
+    fn int<'gc>(_mc: &Mutation<'gc>, lhs: i64, rhs: i64) -> Value<'gc> {
         Value::float((lhs as f64).powf(rhs as f64))
     }
 
     #[inline(always)]
-    fn float<'gc>(lhs: f64, rhs: f64) -> Value<'gc> {
-        Value::float(lhs.powf(rhs))
+    fn float_raw(lhs: f64, rhs: f64) -> f64 {
+        lhs.powf(rhs)
     }
 }
 
@@ -244,13 +260,13 @@ pub struct Div;
 
 impl ArithOp for Div {
     #[inline(always)]
-    fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc> {
+    fn int<'gc>(_mc: &Mutation<'gc>, lhs: i64, rhs: i64) -> Value<'gc> {
         Value::float((lhs as f64) / (rhs as f64))
     }
 
     #[inline(always)]
-    fn float<'gc>(lhs: f64, rhs: f64) -> Value<'gc> {
-        Value::float(lhs / rhs)
+    fn float_raw(lhs: f64, rhs: f64) -> f64 {
+        lhs / rhs
     }
 }
 
@@ -260,7 +276,7 @@ impl ArithOp for IDiv {
     const INT_ZERO_DIVISOR_INVALID: bool = true;
 
     #[inline(always)]
-    fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc> {
+    fn int<'gc>(mc: &Mutation<'gc>, lhs: i64, rhs: i64) -> Value<'gc> {
         let q = lhs.wrapping_div(rhs);
         let r = lhs.wrapping_rem(rhs);
         let adjusted = if r != 0 && (lhs ^ rhs) < 0 {
@@ -269,29 +285,33 @@ impl ArithOp for IDiv {
             q
         };
 
-        Value::integer(adjusted)
+        Value::integer(mc, adjusted)
     }
 
     #[inline(always)]
-    fn float<'gc>(lhs: f64, rhs: f64) -> Value<'gc> {
+    fn float_raw(lhs: f64, rhs: f64) -> f64 {
         // Lua's `//` on floats is `floor(a/b)` and stays a float — keep the
         // float type (and inf/nan; `as i64` would saturate large quotients).
-        Value::float((lhs / rhs).floor())
+        (lhs / rhs).floor()
     }
 }
 
 #[inline(always)]
-pub fn op_bit_int<'gc, Op: BitOp>(lhs: i64, rhs: i64) -> Value<'gc> {
-    Op::int(lhs, rhs)
+pub fn op_bit_int<'gc, Op: BitOp>(mc: &Mutation<'gc>, lhs: i64, rhs: i64) -> Value<'gc> {
+    Op::int(mc, lhs, rhs)
 }
 
 #[inline(always)]
-pub fn op_bit_mixed<'gc, Op: BitOp>(lhs: &Value, rhs: &Value) -> Option<Value<'gc>> {
-    op_bit::<Op>(*lhs, *rhs)
+pub fn op_bit_mixed<'gc, Op: BitOp>(
+    mc: &Mutation<'gc>,
+    lhs: &Value,
+    rhs: &Value,
+) -> Option<Value<'gc>> {
+    op_bit::<Op>(mc, *lhs, *rhs)
 }
 
 #[inline(always)]
-pub fn op_bit<'gc, Op: BitOp>(lhs: Value, rhs: Value) -> Option<Value<'gc>> {
+pub fn op_bit<'gc, Op: BitOp>(mc: &Mutation<'gc>, lhs: Value, rhs: Value) -> Option<Value<'gc>> {
     let lhs = if let Some(v) = lhs.get_integer() {
         v
     } else if let Some(v) = lhs.get_float() {
@@ -308,19 +328,19 @@ pub fn op_bit<'gc, Op: BitOp>(lhs: Value, rhs: Value) -> Option<Value<'gc>> {
         return None;
     };
 
-    Some(Op::int(lhs, rhs))
+    Some(Op::int(mc, lhs, rhs))
 }
 
 pub trait BitOp {
-    fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc>;
+    fn int<'gc>(mc: &Mutation<'gc>, lhs: i64, rhs: i64) -> Value<'gc>;
 }
 
 pub struct BAnd;
 
 impl BitOp for BAnd {
     #[inline(always)]
-    fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc> {
-        Value::integer(lhs & rhs)
+    fn int<'gc>(mc: &Mutation<'gc>, lhs: i64, rhs: i64) -> Value<'gc> {
+        Value::integer(mc, lhs & rhs)
     }
 }
 
@@ -328,8 +348,8 @@ pub struct BOr;
 
 impl BitOp for BOr {
     #[inline(always)]
-    fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc> {
-        Value::integer(lhs | rhs)
+    fn int<'gc>(mc: &Mutation<'gc>, lhs: i64, rhs: i64) -> Value<'gc> {
+        Value::integer(mc, lhs | rhs)
     }
 }
 
@@ -337,8 +357,8 @@ pub struct BXor;
 
 impl BitOp for BXor {
     #[inline(always)]
-    fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc> {
-        Value::integer(lhs ^ rhs)
+    fn int<'gc>(mc: &Mutation<'gc>, lhs: i64, rhs: i64) -> Value<'gc> {
+        Value::integer(mc, lhs ^ rhs)
     }
 }
 
@@ -365,8 +385,8 @@ pub struct Shl;
 
 impl BitOp for Shl {
     #[inline(always)]
-    fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc> {
-        Value::integer(shift_left(lhs, rhs))
+    fn int<'gc>(mc: &Mutation<'gc>, lhs: i64, rhs: i64) -> Value<'gc> {
+        Value::integer(mc, shift_left(lhs, rhs))
     }
 }
 
@@ -374,10 +394,10 @@ pub struct Shr;
 
 impl BitOp for Shr {
     #[inline(always)]
-    fn int<'gc>(lhs: i64, rhs: i64) -> Value<'gc> {
+    fn int<'gc>(mc: &Mutation<'gc>, lhs: i64, rhs: i64) -> Value<'gc> {
         // `wrapping_neg` so `rhs == i64::MIN` (a right shift by 2^63) doesn't
         // overflow. `shift_left` maps the resulting huge magnitude to 0.
-        Value::integer(shift_left(lhs, rhs.wrapping_neg()))
+        Value::integer(mc, shift_left(lhs, rhs.wrapping_neg()))
     }
 }
 

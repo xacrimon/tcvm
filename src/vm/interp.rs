@@ -12,7 +12,7 @@ use crate::env::thread::{
 use crate::env::value::{Value, ValueKind};
 use crate::instruction::{Instruction, Op, UpValueDescriptor};
 use crate::lua::Context;
-use crate::vm::num::{self, op_arith_float, op_arith_int, op_bit_int};
+use crate::vm::num::{self, op_arith_int, op_bit_int};
 
 static HANDLERS: [Handler; Op::COUNT] = Op::table([
     (Op::MOVE, op_move),
@@ -1369,35 +1369,26 @@ macro_rules! arith_handler {
             helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
             let (dst, lhs, rhs) = instruction.abc();
 
-            // Testing that the tags match *before* either arm lets the
-            // second operand's check collapse into the first: inside the gate
-            // `rhs.get_integer()` is implied by `lhs.get_integer()`. Halves the
-            // integer path's tag compares (four to two).
-            let lk = reg!(ref lhs).kind();
-            if std::hint::likely(lk == reg!(ref rhs).kind()) {
-                if std::hint::likely(lk == ValueKind::Integer) {
-                    if let (Some(lhs), Some(rhs)) =
-                        (reg!(ref lhs).get_integer(), reg!(ref rhs).get_integer())
-                    {
-                        if let Some(v) = op_arith_int::<$num_kind>(lhs, rhs) {
-                            *reg!(ref mut dst) = v;
-                            dispatch!();
-                        }
-
-                        raise!(if Op::$instr == Op::MOD {
-                            OpError::ModByZero
-                        } else {
-                            OpError::DivByZero
-                        });
-                    }
-                } else if lk == ValueKind::Float {
-                    if let (Some(lhs), Some(rhs)) =
-                        (reg!(ref lhs).get_float(), reg!(ref rhs).get_float())
-                    {
-                        *reg!(ref mut dst) = op_arith_float::<$num_kind>(lhs, rhs);
-                        dispatch!();
-                    }
+            // Floats first: their test is one unsigned compare per operand,
+            // whereas a failed integer test costs two tag compares each.
+            let (l, r) = (reg!(ref lhs), reg!(ref rhs));
+            if l.is_float() && r.is_float() {
+                let (lf, rf) = unsafe { (l.read_float(), r.read_float()) };
+                reg!(ref mut dst).write_float(<$num_kind as num::ArithOp>::float_raw(lf, rf));
+                dispatch!();
+            } else if let Some(li) = l.get_integer()
+                && let Some(ri) = r.get_integer()
+            {
+                if let Some(v) = op_arith_int::<$num_kind>(ctx.mutation(), li, ri) {
+                    *reg!(ref mut dst) = v;
+                    dispatch!();
                 }
+
+                raise!(if Op::$instr == Op::MOD {
+                    OpError::ModByZero
+                } else {
+                    OpError::DivByZero
+                });
             }
 
             become $slow_name(instruction, ctx, thread, registers, ip, handlers, ds);
@@ -1428,7 +1419,7 @@ macro_rules! bit_handler {
             if let (Some(lhs), Some(rhs)) =
                 (reg!(ref lhs).get_integer(), reg!(ref rhs).get_integer())
             {
-                *reg!(ref mut dst) = op_bit_int::<$num_kind>(lhs, rhs);
+                *reg!(ref mut dst) = op_bit_int::<$num_kind>(ctx.mutation(), lhs, rhs);
                 dispatch!();
             }
 
@@ -1472,7 +1463,7 @@ macro_rules! binop_slow_body {
         let dst = $dst;
         let (lhs, rhs): (Value<'gc>, Value<'gc>) = ($lhs, $rhs);
         {
-            let mixed = num::$num_mix_h::<$num_kind>(&lhs, &rhs);
+            let mixed = num::$num_mix_h::<$num_kind>($ctx.mutation(), &lhs, &rhs);
             if std::hint::unlikely(mixed.is_some()) {
                 if let Some(v) = mixed {
                     *reg!(ref mut dst) = v;
@@ -1534,13 +1525,11 @@ macro_rules! arith_imm_handler {
 
             if std::hint::likely(instruction.imm_is_int()) {
                 let k = instruction.imm_int();
-                if std::hint::likely(v.kind() == ValueKind::Integer)
-                    && let Some(i) = v.get_integer()
-                {
+                if let Some(i) = v.get_integer() {
                     if $swap {
                         // The register is the divisor, so RMODI/RIDIVI
                         // still check it.
-                        let Some(out) = op_arith_int::<$num_kind>(k, i) else {
+                        let Some(out) = op_arith_int::<$num_kind>(ctx.mutation(), k, i) else {
                             raise!(if Op::$instr == Op::RMODI {
                                 OpError::ModByZero
                             } else {
@@ -1554,25 +1543,26 @@ macro_rules! arith_imm_handler {
                         debug_assert!(
                             !<$num_kind as num::ArithOp>::INT_ZERO_DIVISOR_INVALID || k != 0
                         );
-                        *reg!(ref mut dst) = <$num_kind as num::ArithOp>::int(i, k);
+                        *reg!(ref mut dst) = <$num_kind as num::ArithOp>::int(ctx.mutation(), i, k);
                     }
                     dispatch!();
-                } else if let Some(f) = v.get_float() {
-                    let k = k as f64;
+                } else if v.is_float() {
+                    let (f, k) = (unsafe { v.read_float() }, k as f64);
                     let (l, r) = if $swap { (k, f) } else { (f, k) };
-                    *reg!(ref mut dst) = op_arith_float::<$num_kind>(l, r);
+                    reg!(ref mut dst).write_float(<$num_kind as num::ArithOp>::float_raw(l, r));
                     dispatch!();
                 }
             } else {
                 let k = instruction.imm_float();
-                if let Some(f) = v.get_float() {
+                if v.is_float() {
+                    let f = unsafe { v.read_float() };
                     let (l, r) = if $swap { (k, f) } else { (f, k) };
-                    *reg!(ref mut dst) = op_arith_float::<$num_kind>(l, r);
+                    reg!(ref mut dst).write_float(<$num_kind as num::ArithOp>::float_raw(l, r));
                     dispatch!();
                 } else if let Some(i) = v.get_integer() {
                     let f = i as f64;
                     let (l, r) = if $swap { (k, f) } else { (f, k) };
-                    *reg!(ref mut dst) = op_arith_float::<$num_kind>(l, r);
+                    reg!(ref mut dst).write_float(<$num_kind as num::ArithOp>::float_raw(l, r));
                     dispatch!();
                 }
             }
@@ -1607,7 +1597,7 @@ macro_rules! bit_imm_handler {
 
             if let Some(i) = reg!(ref src).get_integer() {
                 let (l, r) = if $swap { (k, i) } else { (i, k) };
-                *reg!(ref mut dst) = op_bit_int::<$num_kind>(l, r);
+                *reg!(ref mut dst) = op_bit_int::<$num_kind>(ctx.mutation(), l, r);
                 dispatch!();
             }
 
@@ -1633,7 +1623,7 @@ macro_rules! binop_imm_slow_handler {
         ) {
             helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
             let (dst, src, flipped) = instruction.abc_imm();
-            let (v, k) = (reg!(src), instruction.imm_value());
+            let (v, k) = (reg!(src), instruction.imm_value(ctx.mutation()));
             let (lhs, rhs) = if $swap || flipped { (k, v) } else { (v, k) };
             binop_slow_body!(
                 dst, lhs, rhs, $num_kind, $num_mix_h, $mm, $err, ctx, thread, registers, ip,
@@ -1683,7 +1673,7 @@ extern "rust-preserve-none" fn op_unm<'gc>(
     let (dst, src) = instruction.ab();
     let val = reg!(src);
     if let Some(i) = val.get_integer() {
-        *reg!(ref mut dst) = Value::integer(i.wrapping_neg());
+        *reg!(ref mut dst) = Value::integer(ctx.mutation(), i.wrapping_neg());
         dispatch!();
     }
     if let Some(f) = val.get_float() {
@@ -1719,7 +1709,7 @@ extern "rust-preserve-none" fn op_bnot<'gc>(
     let (dst, src) = instruction.ab();
     let val = reg!(src);
     if let Some(i) = val.get_integer() {
-        *reg!(ref mut dst) = Value::integer(!i);
+        *reg!(ref mut dst) = Value::integer(ctx.mutation(), !i);
         dispatch!();
     }
     let meta_fn = unop_metamethod(val, ctx.symbols().mm_bnot);
@@ -1771,7 +1761,7 @@ extern "rust-preserve-none" fn op_len<'gc>(
 
     // Strings never consult __len; return byte length directly.
     if let Some(s) = val.get_string() {
-        *reg!(ref mut dst) = Value::integer(s.len() as i64);
+        *reg!(ref mut dst) = Value::integer(ctx.mutation(), s.len() as i64);
         dispatch!();
     }
 
@@ -1779,7 +1769,7 @@ extern "rust-preserve-none" fn op_len<'gc>(
     let meta_fn = if let Some(t) = val.get_table() {
         let mm = t.get_metamethod(ctx.symbols().mm_len);
         if mm.is_nil() {
-            *reg!(ref mut dst) = Value::integer(t.raw_len() as i64);
+            *reg!(ref mut dst) = Value::integer(ctx.mutation(), t.raw_len() as i64);
             dispatch!();
         }
         mm
@@ -1959,10 +1949,12 @@ extern "rust-preserve-none" fn op_lt<'gc>(
 
     let primitive = {
         let (a, b) = (reg!(ref lhs), reg!(ref rhs));
-        if let (Some(x), Some(y)) = (a.get_integer(), b.get_integer()) {
+        if let Some(x) = a.get_integer()
+            && let Some(y) = b.get_integer()
+        {
             Some(x < y)
-        } else if let (Some(x), Some(y)) = (a.get_float(), b.get_float()) {
-            Some(x < y)
+        } else if a.is_float() && b.is_float() {
+            Some(unsafe { a.read_float() < b.read_float() })
         } else if let (Some(x), Some(y)) = (a.get_integer(), b.get_float()) {
             Some(num::lt_int_float(x, y))
         } else if let (Some(x), Some(y)) = (a.get_float(), b.get_integer()) {
@@ -2012,10 +2004,12 @@ extern "rust-preserve-none" fn op_le<'gc>(
 
     let primitive = {
         let (a, b) = (reg!(ref lhs), reg!(ref rhs));
-        if let (Some(x), Some(y)) = (a.get_integer(), b.get_integer()) {
+        if let Some(x) = a.get_integer()
+            && let Some(y) = b.get_integer()
+        {
             Some(x <= y)
-        } else if let (Some(x), Some(y)) = (a.get_float(), b.get_float()) {
-            Some(x <= y)
+        } else if a.is_float() && b.is_float() {
+            Some(unsafe { a.read_float() <= b.read_float() })
         } else if let (Some(x), Some(y)) = (a.get_integer(), b.get_float()) {
             Some(num::le_int_float(x, y))
         } else if let (Some(x), Some(y)) = (a.get_float(), b.get_integer()) {
@@ -2070,18 +2064,18 @@ macro_rules! cmp_imm_handler {
 
             let primitive: Option<bool> = if std::hint::likely(instruction.imm_is_int()) {
                 let k = instruction.imm_int();
-                if std::hint::likely(v.kind() == ValueKind::Integer)
-                    && let Some(i) = v.get_integer()
-                {
+                if let Some(i) = v.get_integer() {
                     Some(if $swap { $ii(k, i) } else { $ii(i, k) })
-                } else if let Some(f) = v.get_float() {
+                } else if v.is_float() {
+                    let f = unsafe { v.read_float() };
                     Some(if $swap { $if_(k, f) } else { $fi(f, k) })
                 } else {
                     None
                 }
             } else {
                 let k = instruction.imm_float();
-                if let Some(f) = v.get_float() {
+                if v.is_float() {
+                    let f = unsafe { v.read_float() };
                     Some(if $swap { $ff(k, f) } else { $ff(f, k) })
                 } else if let Some(i) = v.get_integer() {
                     Some(if $swap { $fi(k, i) } else { $if_(i, k) })
@@ -2111,7 +2105,7 @@ macro_rules! cmp_imm_handler {
         ) {
             helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
             let (src, inverted) = instruction.ab_imm_flag();
-            let (v, k) = (reg!(src), instruction.imm_value());
+            let (v, k) = (reg!(src), instruction.imm_value(ctx.mutation()));
             let (a, b) = if $swap { (k, v) } else { (v, k) };
             let meta_fn = binop_metamethod(a, b, ctx.symbols().$mm);
             if meta_fn.is_nil() {
@@ -2189,9 +2183,7 @@ extern "rust-preserve-none" fn op_eqi<'gc>(
 
     let eq = if std::hint::likely(instruction.imm_is_int()) {
         let k = instruction.imm_int();
-        if std::hint::likely(v.kind() == ValueKind::Integer)
-            && let Some(i) = v.get_integer()
-        {
+        if let Some(i) = v.get_integer() {
             i == k
         } else if let Some(f) = v.get_float() {
             num::exact_float_to_int(f) == Some(k)
@@ -2587,33 +2579,37 @@ extern "rust-preserve-none" fn op_return<'gc>(
 /// is a limit that isn't a number at all.
 fn for_limit(init: i64, limit: Value, step: i64) -> Option<Option<i64>> {
     // Numeric strings become numbers first (`luaV_tointeger`'s `l_strton`).
+    use crate::builtin::util::Number;
     let num = match limit.get_string() {
         Some(s) => crate::builtin::util::str_to_number(s.as_bytes())?,
-        None => limit,
+        None => match (limit.get_integer(), limit.get_float()) {
+            (Some(i), _) => Number::Int(i),
+            (_, Some(f)) => Number::Float(f),
+            _ => return None,
+        },
     };
-    let lim = if let Some(i) = num.get_integer() {
-        i
-    } else if let Some(f) = num.get_float() {
-        let rounded = if step < 0 { f.ceil() } else { f.floor() };
-        match num::exact_float_to_int(rounded) {
-            Some(i) => i,
-            // Out of range, infinite, or NaN. NaN fails `0 < f` and so is
-            // treated as too negative, like the reference.
-            None if 0.0 < f => {
-                if step < 0 {
-                    return Some(None);
+    let lim = match num {
+        Number::Int(i) => i,
+        Number::Float(f) => {
+            let rounded = if step < 0 { f.ceil() } else { f.floor() };
+            match num::exact_float_to_int(rounded) {
+                Some(i) => i,
+                // Out of range, infinite, or NaN. NaN fails `0 < f` and so is
+                // treated as too negative, like the reference.
+                None if 0.0 < f => {
+                    if step < 0 {
+                        return Some(None);
+                    }
+                    i64::MAX
                 }
-                i64::MAX
-            }
-            None => {
-                if step > 0 {
-                    return Some(None);
+                None => {
+                    if step > 0 {
+                        return Some(None);
+                    }
+                    i64::MIN
                 }
-                i64::MIN
             }
         }
-    } else {
-        return None;
     };
     let runs = if step > 0 { init <= lim } else { init >= lim };
     Some(runs.then_some(lim))
@@ -2675,10 +2671,10 @@ extern "rust-preserve-none" fn op_forprep<'gc>(
                     (i as u64).wrapping_sub(lim as u64) / ((-(s + 1)) as u64 + 1)
                 };
                 let last = (i as u64).wrapping_add(count.wrapping_mul(s as u64)) as i64;
-                *reg!(ref mut base) = Value::integer(last);
-                *reg!(ref mut base + 1) = Value::integer(s);
-                *reg!(ref mut base + 2) = Value::integer(i);
-                *reg!(ref mut base + 3) = Value::integer(i);
+                *reg!(ref mut base) = Value::integer(ctx.mutation(), last);
+                *reg!(ref mut base + 1) = Value::integer(ctx.mutation(), s);
+                *reg!(ref mut base + 2) = Value::integer(ctx.mutation(), i);
+                *reg!(ref mut base + 3) = Value::integer(ctx.mutation(), i);
                 false
             }
         }
@@ -2742,7 +2738,7 @@ extern "rust-preserve-none" fn op_forloop<'gc>(
         // `idx` walks init, init+step, ..., last exactly, so `idx != last`
         // also guarantees `idx + step` stays in range.
         if idx != last {
-            let idx = Value::integer(idx.wrapping_add(s));
+            let idx = Value::integer(ctx.mutation(), idx.wrapping_add(s));
             *reg!(ref mut base + 2) = idx;
             *reg!(ref mut base + 3) = idx;
             ip = unsafe { ip.offset(offset as isize) };
@@ -2868,7 +2864,7 @@ extern "rust-preserve-none" fn op_setlist<'gc>(
     let off = offset as i64;
     for i in 1..=n {
         let val = thread.stack[elements_start + i - 1];
-        let key = Value::integer(off + i as i64);
+        let key = Value::integer(ctx.mutation(), off + i as i64);
         t.raw_set(ctx, key, val);
     }
     if count == 0 {
@@ -2994,7 +2990,7 @@ extern "rust-preserve-none" fn op_vararg<'gc>(
         registers = unsafe { thread.stack.as_mut_ptr().add(base) };
         let t = table.inner().borrow();
         for i in 0..wanted {
-            thread.stack[target + i] = t.raw_get(Value::integer(i as i64 + 1));
+            thread.stack[target + i] = t.raw_get(Value::integer(ctx.mutation(), i as i64 + 1));
         }
         if count == 0 {
             thread.top = new_top;
@@ -3066,7 +3062,7 @@ extern "rust-preserve-none" fn op_varargget<'gc>(
         }
     } else if let Some(s) = key_val.get_string() {
         if s.as_bytes() == b"n" {
-            Value::integer(num_extras as i64)
+            Value::integer(ctx.mutation(), num_extras as i64)
         } else {
             Value::nil()
         }
@@ -3128,12 +3124,12 @@ extern "rust-preserve-none" fn op_varargprep<'gc>(
         thread.stack[new_base + num_params] = Value::table(table);
         for i in 0..num_extras {
             let v = thread.stack[extras_start + i];
-            table.raw_set(ctx, Value::integer(i as i64 + 1), v);
+            table.raw_set(ctx, Value::integer(ctx.mutation(), i as i64 + 1), v);
         }
         table.raw_set(
             ctx,
             Value::string(LuaString::new(ctx, b"n")),
-            Value::integer(num_extras as i64),
+            Value::integer(ctx.mutation(), num_extras as i64),
         );
     }
     dispatch!();

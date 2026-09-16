@@ -20,8 +20,8 @@ fn async_pending_then_return() {
         let _ = &mut stack;
         let seq = async_sequence(nctx.ctx.mutation(), |_locals, mut seq| async move {
             seq.pending().await;
-            seq.enter(|_ctx, _locals, _exec, mut stack| {
-                stack.replace(&[Value::integer(7)]);
+            seq.enter(|ctx, _locals, _exec, mut stack| {
+                stack.replace(&[Value::integer(ctx.mutation(), 7)]);
             });
             Ok(SequenceReturn::Return)
         });

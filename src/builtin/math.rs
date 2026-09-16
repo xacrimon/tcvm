@@ -61,8 +61,8 @@ pub fn load<'gc>(ctx: Context<'gc>) {
     };
     set("pi", Value::float(std::f64::consts::PI));
     set("huge", Value::float(f64::INFINITY));
-    set("maxinteger", Value::integer(i64::MAX));
-    set("mininteger", Value::integer(i64::MIN));
+    set("maxinteger", Value::integer(ctx.mutation(), i64::MAX));
+    set("mininteger", Value::integer(ctx.mutation(), i64::MIN));
 
     let lib_name = Value::string(LuaString::new(ctx, b"math"));
     ctx.globals().raw_set(ctx, lib_name, Value::table(lib));
@@ -103,7 +103,7 @@ fn lua_abs<'gc>(
     let v = stack.get(0);
     let result = if let Some(i) = v.get_integer() {
         // Wrapping matches Lua: abs(mininteger) == mininteger.
-        Value::integer(i.wrapping_abs())
+        Value::integer(nctx.ctx.mutation(), i.wrapping_abs())
     } else {
         Value::float(check_number(nctx.ctx, v, "abs", 1)?.abs())
     };
@@ -167,9 +167,9 @@ fn lua_fmod<'gc>(
                 "bad argument #2 to 'fmod' (zero)",
             ));
         } else if y == -1 {
-            Value::integer(0)
+            Value::integer(nctx.ctx.mutation(), 0)
         } else {
-            Value::integer(x % y)
+            Value::integer(nctx.ctx.mutation(), x % y)
         }
     } else {
         let x = check_number(nctx.ctx, a, "fmod", 1)?;
@@ -192,7 +192,7 @@ fn lua_modf<'gc>(
         // part (it special-cases `n == ip`), regardless of sign.
         (Value::float(x), 0.0_f64)
     } else {
-        (num_to_value(x.trunc()), x.fract())
+        (num_to_value(nctx.ctx.mutation(), x.trunc()), x.fract())
     };
     stack.replace(&[ip, Value::float(fp)]);
     Ok(CallbackAction::Return)
@@ -223,9 +223,12 @@ fn round_to_int<'gc>(
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let v = stack.get(0);
     let result = if let Some(i) = v.get_integer() {
-        Value::integer(i)
+        Value::integer(nctx.ctx.mutation(), i)
     } else {
-        num_to_value(round(check_number(nctx.ctx, v, fname, 1)?))
+        num_to_value(
+            nctx.ctx.mutation(),
+            round(check_number(nctx.ctx, v, fname, 1)?),
+        )
     };
     stack.replace(&[result]);
     Ok(CallbackAction::Return)
@@ -292,24 +295,20 @@ fn select_extreme<'gc>(
 /// `tointeger(x)` — the integer value of `x` if it has one, else `nil`. No
 /// string coercion, matching `lua_tointegerx`.
 fn lua_tointeger<'gc>(
-    _nctx: NativeContext<'gc, '_>,
+    nctx: NativeContext<'gc, '_>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let v = stack.get(0);
+    let mc = nctx.ctx.mutation();
     let result = if let Some(i) = v.get_integer() {
-        Value::integer(i)
+        Value::integer(mc, i)
     } else if let Some(f) = v.get_float() {
-        float_to_integer(f).map_or(Value::nil(), Value::integer)
+        float_to_integer(f).map_or(Value::nil(), |i| Value::integer(mc, i))
     } else if let Some(s) = v.get_string() {
         // Lua coerces a numeric string, then applies the same int/float rule.
-        match crate::builtin::util::str_to_number(s.as_bytes()) {
-            Some(n) if n.get_integer().is_some() => n,
-            Some(n) => n
-                .get_float()
-                .and_then(float_to_integer)
-                .map_or(Value::nil(), Value::integer),
-            None => Value::nil(),
-        }
+        crate::builtin::util::str_to_number(s.as_bytes())
+            .and_then(|n| n.to_integer())
+            .map_or(Value::nil(), |i| Value::integer(mc, i))
     } else {
         Value::nil()
     };
@@ -478,11 +477,11 @@ fn lua_random<'gc>(
             let rv = st.next_u64();
             match mode {
                 Mode::Float => Value::float(unit_float(rv)),
-                Mode::Bits => Value::integer(rv as i64),
+                Mode::Bits => Value::integer(nctx.ctx.mutation(), rv as i64),
                 Mode::Range(low, up) => {
                     let span = (up as u64).wrapping_sub(low as u64);
                     let p = project(rv, span, &mut st);
-                    Value::integer(p.wrapping_add(low as u64) as i64)
+                    Value::integer(nctx.ctx.mutation(), p.wrapping_add(low as u64) as i64)
                 }
             }
         })
@@ -524,6 +523,9 @@ fn lua_randomseed<'gc>(
         })
         .expect("RNG userdata payload type mismatch");
 
-    stack.replace(&[Value::integer(s1 as i64), Value::integer(s2 as i64)]);
+    stack.replace(&[
+        Value::integer(nctx.ctx.mutation(), s1 as i64),
+        Value::integer(nctx.ctx.mutation(), s2 as i64),
+    ]);
     Ok(CallbackAction::Return)
 }

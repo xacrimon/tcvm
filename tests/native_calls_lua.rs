@@ -22,12 +22,12 @@ impl<'gc> Sequence<'gc> for AddOneSequence {
 
     fn poll(
         self: Pin<&mut Self>,
-        _ctx: Context<'gc>,
+        ctx: Context<'gc>,
         _exec: Execution<'gc, '_>,
         mut stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
         let v = stack.get(0).get_integer().unwrap_or(0);
-        stack.replace(&[Value::integer(v + 1)]);
+        stack.replace(&[Value::integer(ctx.mutation(), v + 1)]);
         Ok(SequencePoll::Return)
     }
 }

@@ -24,7 +24,7 @@ impl<'gc> Sequence<'gc> for TailCallSeq {
 
     fn poll(
         self: Pin<&mut Self>,
-        _ctx: Context<'gc>,
+        ctx: Context<'gc>,
         _exec: Execution<'gc, '_>,
         mut stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
@@ -32,7 +32,7 @@ impl<'gc> Sequence<'gc> for TailCallSeq {
             .get(0)
             .get_function()
             .expect("stack[0] should be a function");
-        stack.replace(&[Value::integer(41)]);
+        stack.replace(&[Value::integer(ctx.mutation(), 41)]);
         Ok(SequencePoll::TailCall(target))
     }
 }

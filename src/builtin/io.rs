@@ -463,8 +463,8 @@ fn read_number<R: BufRead>(r: &mut R) -> std::io::Result<ReadOne> {
         r.consume(1);
     }
     Ok(match util::str_to_number(&tok) {
-        Some(v) if v.get_integer().is_some() => ReadOne::Int(v.get_integer().unwrap()),
-        Some(v) => ReadOne::Float(v.get_float().unwrap()),
+        Some(util::Number::Int(i)) => ReadOne::Int(i),
+        Some(util::Number::Float(f)) => ReadOne::Float(f),
         None => ReadOne::Nil,
     })
 }
@@ -554,7 +554,7 @@ fn do_read<'gc>(
         .map(|r| match r {
             ReadOne::Nil => Value::nil(),
             ReadOne::Bytes(b) => Value::string(LuaString::new(ctx, &b)),
-            ReadOne::Int(i) => Value::integer(i),
+            ReadOne::Int(i) => Value::integer(ctx.mutation(), i),
             ReadOne::Float(f) => Value::float(f),
         })
         .collect())
@@ -687,7 +687,7 @@ fn io_fail<'gc>(ctx: Context<'gc>, fname: Option<&str>, e: &std::io::Error) -> [
     [
         Value::nil(),
         Value::string(LuaString::new(ctx, text.as_bytes())),
-        Value::integer(e.raw_os_error().unwrap_or(0) as i64),
+        Value::integer(ctx.mutation(), e.raw_os_error().unwrap_or(0) as i64),
     ]
 }
 
@@ -695,7 +695,7 @@ fn io_fail<'gc>(ctx: Context<'gc>, fname: Option<&str>, e: &std::io::Error) -> [
 /// Lua appends as a 4th value (`g_write`).
 fn write_fail<'gc>(ctx: Context<'gc>, e: &std::io::Error, written: u64) -> [Value<'gc>; 4] {
     let [a, b, c] = io_fail(ctx, None, e);
-    [a, b, c, Value::integer(written as i64)]
+    [a, b, c, Value::integer(ctx.mutation(), written as i64)]
 }
 
 // ---------------------------------------------------------------------------
@@ -1026,7 +1026,7 @@ fn lua_file_seek<'gc>(
         None => SeekOutcome::Io(std::io::Error::from_raw_os_error(22)), // EINVAL
     };
     match outcome {
-        SeekOutcome::Pos(n) => stack.replace(&[Value::integer(n as i64)]),
+        SeekOutcome::Pos(n) => stack.replace(&[Value::integer(nctx.ctx.mutation(), n as i64)]),
         SeekOutcome::Closed => return Err(closed_file_error(nctx.ctx)),
         SeekOutcome::Io(e) => stack.replace(&io_fail(nctx.ctx, None, &e)),
     }

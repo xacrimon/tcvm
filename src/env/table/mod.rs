@@ -40,8 +40,12 @@ impl<'gc> Table<'gc> {
     }
 
     /// See [`TableState::next`].
-    pub fn next(self, key: Value<'gc>) -> Result<Option<(Value<'gc>, Value<'gc>)>, InvalidKey> {
-        self.0.borrow().next(key)
+    pub fn next(
+        self,
+        mc: &Mutation<'gc>,
+        key: Value<'gc>,
+    ) -> Result<Option<(Value<'gc>, Value<'gc>)>, InvalidKey> {
+        self.0.borrow().next(mc, key)
     }
 
     pub fn metatable(self) -> Option<Table<'gc>> {
@@ -373,7 +377,11 @@ impl<'gc> TableState<'gc> {
     /// end: clearing the last slot trims trailing nils, and the traversal
     /// must still resume from the key it just yielded. (The reference
     /// rejects such keys as invalid; it never shrinks the array.)
-    pub fn next(&self, key: Value<'gc>) -> Result<Option<(Value<'gc>, Value<'gc>)>, InvalidKey> {
+    pub fn next(
+        &self,
+        mc: &Mutation<'gc>,
+        key: Value<'gc>,
+    ) -> Result<Option<(Value<'gc>, Value<'gc>)>, InvalidKey> {
         let (part, from) = if key.is_nil() {
             (Part::Array, 0)
         } else if let Some(i) = array_index(key) {
@@ -392,7 +400,7 @@ impl<'gc> TableState<'gc> {
         if part == Part::Array {
             for (i, v) in self.array.iter().enumerate().skip(from) {
                 if !v.is_nil() {
-                    return Ok(Some((Value::integer(i as i64 + 1), *v)));
+                    return Ok(Some((Value::integer(mc, i as i64 + 1), *v)));
                 }
             }
         }

@@ -47,7 +47,11 @@ fn churn(lua: &mut Lua) {
     lua.enter(|ctx| {
         for i in 0..2000 {
             let t = tcvm::env::Table::new(ctx);
-            t.raw_set(ctx, Value::integer(i), Value::integer(i * 7));
+            t.raw_set(
+                ctx,
+                Value::integer(ctx.mutation(), i),
+                Value::integer(ctx.mutation(), i * 7),
+            );
         }
     });
     lua.collect_all();

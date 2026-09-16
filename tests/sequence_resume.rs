@@ -32,7 +32,7 @@ impl<'gc> Sequence<'gc> for ResumeAndAddOne<'gc> {
 
     fn poll(
         mut self: Pin<&mut Self>,
-        _ctx: Context<'gc>,
+        ctx: Context<'gc>,
         _exec: Execution<'gc, '_>,
         mut stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
@@ -49,7 +49,7 @@ impl<'gc> Sequence<'gc> for ResumeAndAddOne<'gc> {
                 .get(0)
                 .get_integer()
                 .expect("target should return an integer");
-            stack.replace(&[Value::integer(v + 1)]);
+            stack.replace(&[Value::integer(ctx.mutation(), v + 1)]);
             Ok(SequencePoll::Return)
         }
     }
