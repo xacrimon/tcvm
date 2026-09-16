@@ -312,15 +312,7 @@ impl<'gc> Executor<'gc> {
         {
             let mut ts = top.borrow_mut(mc);
             ts.set_window(cs.bottom, buf);
-            // Branch on top frame: a Sequence consumes values from
-            // stack[seq.bottom..] on its next poll, so we leave them at
-            // `bottom`. A Lua frame on top means the yield came from a
-            // native CALL inline — land the args at func_idx via the
-            // standard call-return convention so dispatch resumes
-            // correctly.
-            if !matches!(ts.frames.last(), Some(Frame::Sequence { .. })) {
-                land_call_results(&mut ts, cs);
-            }
+            land_call_results(&mut ts, cs);
             // `land_call_results` may have *terminated* the thread: a tail-called
             // native suspends with the calling Lua frame already popped, so the
             // resume that lands its results empties the frame stack and sets
@@ -416,20 +408,33 @@ fn apply_pending_action<'gc>(
             // callee can't be resolved or errors immediately, the
             // Frame::Error lands above this sequence and the unwinder
             // routes the error to it.
-            if let Some(seq) = then {
-                ts.frames.push(Frame::Sequence {
-                    seq,
-                    call_site,
-                    pending_error: None,
-                });
-            }
-            // Callee at stack[bottom], args above it: already the layout
-            // schedule_call_at wants. Level 0 because the raiser is a
-            // native (`luaG_callerror` adds no position for a C `ci`).
-            let slot = call_site.bottom;
+            let slot = match then {
+                Some(seq) => {
+                    ts.frames.push(Frame::Sequence {
+                        seq,
+                        call_site,
+                        pending_error: None,
+                    });
+                    call_site.bottom
+                }
+                // No completion: the callee returns straight to the CALL
+                // site, so it must sit where the CALL put its function.
+                None => {
+                    let (bottom, top) = (call_site.bottom, ts.top);
+                    ts.stack.copy_within(bottom..top, call_site.func_idx);
+                    ts.set_top(call_site.func_idx + (top - bottom));
+                    call_site.func_idx
+                }
+            };
+            // Callee at `slot`, args above it: the layout schedule_call_at
+            // wants. Level 0 because the raiser is a native
+            // (`luaG_callerror` adds no position for a C `ci`).
             if vm::interp::resolve_call_chain(ctx, &mut ts, slot, 0).is_none() {
                 let msg = vm::debug::op_error_message(ctx, &ts, OpError::Call(ts.stack[slot]));
-                ts.raise(ctx, Error::from_str(ctx, &msg).with_level(0));
+                ts.raise(
+                    ctx,
+                    Error::new(Value::string(LuaString::new(ctx, msg.as_bytes()))),
+                );
                 return Ok(());
             }
             let function = ts.stack[slot].get_function().unwrap();
@@ -437,6 +442,13 @@ fn apply_pending_action<'gc>(
         }
         CallbackAction::Yield { then } => {
             let mut ts = top.borrow_mut(mc);
+            // With a follow-up sequence the resume args are its input and
+            // stay at `bottom`; without one they are the call's results.
+            let landing = if then.is_some() {
+                in_place(call_site.bottom)
+            } else {
+                call_site
+            };
             if let Some(seq) = then {
                 ts.frames.push(Frame::Sequence {
                     seq,
@@ -444,10 +456,7 @@ fn apply_pending_action<'gc>(
                     pending_error: None,
                 });
             }
-            // Yielded values live at stack[bottom..]. Mark thread
-            // suspended and stash where they are so the next pump can
-            // find them (propagation to resumer, host-side resume, etc.).
-            ts.yield_bottom = Some(call_site);
+            ts.yield_bottom = Some(landing);
             ts.status = ThreadStatus::Suspended;
         }
         CallbackAction::Resume {
@@ -456,6 +465,11 @@ fn apply_pending_action<'gc>(
         } => {
             // Optional `then` fires when target yields/returns; install on
             // the resumer first so it's seen *after* the WaitThread frame.
+            let landing = if then.is_some() {
+                in_place(call_site.bottom)
+            } else {
+                call_site
+            };
             if let Some(seq) = then {
                 top.borrow_mut(mc).frames.push(Frame::Sequence {
                     seq,
@@ -463,7 +477,7 @@ fn apply_pending_action<'gc>(
                     pending_error: None,
                 });
             }
-            schedule_thread_resume(exec, ctx, top, target, call_site.bottom, call_site)?;
+            schedule_thread_resume(exec, ctx, top, target, call_site.bottom, landing)?;
         }
     }
     Ok(())
@@ -510,19 +524,14 @@ fn schedule_thread_resume<'gc>(
             ts.set_window(0, args);
             ts.status = ThreadStatus::Normal;
         } else if matches!(ts.status, ThreadStatus::Suspended) {
-            // Mid-resume: target previously yielded. Drain yield_bottom
-            // to recover where the yielded native CALL landed, place the
-            // resume-args, then either land via call-return convention
-            // (Lua frame on top) or leave at bottom (Sequence on top —
-            // it reads stack[seq.bottom..] directly on next poll).
+            // Mid-resume: target previously yielded. Place the resume-args
+            // where it stashed its landing site and deliver them.
             let y = match ts.yield_bottom.take() {
                 Some(y) => y,
                 None => return Err(RuntimeError::BadMode),
             };
             ts.set_window(y.bottom, args);
-            if !matches!(ts.frames.last(), Some(Frame::Sequence { .. })) {
-                land_call_results(&mut ts, y);
-            }
+            land_call_results(&mut ts, y);
             ts.status = ThreadStatus::Normal;
         } else {
             return Err(RuntimeError::BadMode);
@@ -729,12 +738,7 @@ fn pump_sequence<'gc>(
                 call_site,
                 pending_error: None,
             });
-            ts.yield_bottom = Some(CallSite {
-                bottom: abs_bottom,
-                func_idx: call_site.func_idx,
-                returns: call_site.returns,
-                cont: call_site.cont,
-            });
+            ts.yield_bottom = Some(in_place(abs_bottom));
             ts.status = ThreadStatus::Suspended;
         }
         Ok(SequencePoll::TailYield) => {
@@ -755,7 +759,7 @@ fn pump_sequence<'gc>(
                 call_site,
                 pending_error: None,
             });
-            schedule_thread_resume(exec, ctx, top, target, abs_bottom, call_site)?;
+            schedule_thread_resume(exec, ctx, top, target, abs_bottom, in_place(abs_bottom))?;
         }
         Ok(SequencePoll::TailResume(target)) => {
             // Sequence is consumed; target's eventual values go straight
@@ -801,23 +805,25 @@ fn propagate_inner_to_resumer<'gc>(
         Some(Frame::WaitThread { call_site }) => call_site,
         _ => unreachable!("propagate_inner_to_resumer: resumer top is not WaitThread"),
     };
-    // Land values at resumer.stack[wt.bottom..] for the next sequence /
-    // call frame to consume. If a `then` sequence sits underneath, it'll
-    // pick them up at its own `bottom == wt.bottom`. If not, do the
-    // standard CALL-landing right now.
     rs.set_window(wt.bottom, values);
-    let next_is_sequence = matches!(rs.frames.last(), Some(Frame::Sequence { .. }));
-    if !next_is_sequence {
-        // No follow-up sequence: deliver results directly to the original
-        // Lua CALL window.
-        land_call_results(&mut rs, wt);
-    }
+    land_call_results(&mut rs, wt);
     // `land_call_results` may have terminated the resumer (frames went
     // empty → status Result). Only revert to Normal if it didn't.
     if !matches!(rs.status, ThreadStatus::Result { .. }) {
         rs.status = ThreadStatus::Normal;
     }
     Ok(())
+}
+
+/// A landing site that leaves values at `bottom`: what a sequence records
+/// when it suspends on its own behalf and will read them back there.
+fn in_place(bottom: usize) -> CallSite {
+    CallSite {
+        bottom,
+        func_idx: bottom,
+        returns: 0,
+        cont: None,
+    }
 }
 
 /// Move values at `stack[bottom..]` into the original CALL's expected
@@ -1005,9 +1011,8 @@ impl<'gc> Sequence<'gc> for HandlerSequence {
         _err: Error<'gc>,
         _stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
-        Err(Error::from_str(ctx, "error in error handling")
-            .with_level(0)
-            .mark_handled())
+        let msg = LuaString::new(ctx, b"error in error handling");
+        Err(Error::new(Value::string(msg)).mark_handled())
     }
     fn catch(&self) -> Catch<'gc> {
         Catch::Here(None)

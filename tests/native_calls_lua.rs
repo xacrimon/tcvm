@@ -1,5 +1,6 @@
-//! A native callback uses `CallbackAction::Call { then }` to call a Lua
-//! function and consume its results via a follow-up sequence.
+//! A native callback uses `CallbackAction::Call` to call a Lua function,
+//! either consuming its results via a follow-up sequence or handing them
+//! straight to its own caller.
 
 use std::pin::Pin;
 
@@ -44,6 +45,14 @@ fn bumper<'gc>(
     Ok(CallbackAction::Call { then: Some(then) })
 }
 
+/// Native callback `forward(f, ...)`: `f(...)`'s results are the caller's.
+fn forward<'gc>(
+    _nctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
+    Ok(CallbackAction::Call { then: None })
+}
+
 #[test]
 fn native_calls_lua_then_post_processes() {
     let mut lua = Lua::new();
@@ -63,4 +72,25 @@ fn native_calls_lua_then_post_processes() {
         .expect("load");
     let result: i64 = lua.execute(&ex).expect("run");
     assert_eq!(result, 42);
+}
+
+#[test]
+fn native_call_without_then_returns_to_caller() {
+    let mut lua = Lua::new();
+
+    let ex = lua
+        .try_enter(|ctx| -> Result<_, LoadError> {
+            let f = Function::new_native(ctx.mutation(), forward as NativeFn, Box::new([]));
+            let key = Value::string(LuaString::new(ctx, b"forward"));
+            ctx.globals().raw_set(ctx, key, Value::function(f));
+            let chunk = ctx.load(
+                "local a, b, c = forward(function(x) return x, x + 1 end, 1)\n\
+                 return (a == 1 and b == 2 and c == nil) and 1 or 0",
+                Some("native_calls_lua"),
+            )?;
+            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+        })
+        .expect("load");
+    let result: i64 = lua.execute(&ex).expect("run");
+    assert_eq!(result, 1);
 }

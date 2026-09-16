@@ -32,11 +32,6 @@ ariadne = "0.6.0"
 rand_pcg = "0.10.2"
 rand_core = "0.10.1"
 
-[features]
-# Test-only introspection (`Execution::frames`); never for downstream use.
-test-util = []
-
 [dev-dependencies]
-tcvm = { path = ".", features = ["test-util"] }
 paste = "1.0.15"
 insta = "1.47.2"

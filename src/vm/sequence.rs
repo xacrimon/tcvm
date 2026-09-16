@@ -82,7 +82,6 @@ pub enum CallbackAction<'gc> {
 #[derive(Clone, Copy)]
 pub struct Execution<'gc, 'a> {
     current_thread: Thread<'gc>,
-    #[cfg_attr(not(any(test, feature = "test-util")), allow(dead_code))]
     frames: &'a [Frame<'gc>],
 }
 
@@ -99,11 +98,10 @@ impl<'gc, 'a> Execution<'gc, 'a> {
         self.current_thread
     }
 
-    /// The running thread's call frames, innermost last. Test-only: it
-    /// exposes the raw `Frame` layout, which is not API. The thread itself
-    /// is mutably borrowed for the duration of the call, so this is the
-    /// only way a native can look at them.
-    #[cfg(any(test, feature = "test-util"))]
+    /// The running thread's call frames, innermost last. Hidden because it
+    /// exposes the raw `Frame` layout; for tests and the debug library, which
+    /// can't borrow the thread themselves while a native call holds it.
+    #[doc(hidden)]
     pub fn frames(self) -> &'a [Frame<'gc>] {
         self.frames
     }

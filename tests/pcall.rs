@@ -29,6 +29,25 @@ fn run_i64(src: &str) -> i64 {
     run_with(src, |_| {})
 }
 
+/// The message of the error `src` lets escape to the host.
+fn run_err(src: &str) -> String {
+    let mut lua = Lua::new();
+    lua.load_all();
+    let ex = lua
+        .try_enter(|ctx| -> Result<_, LoadError> {
+            let chunk = ctx.load(src, Some("=t"))?;
+            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+        })
+        .expect("load");
+    let tcvm::RuntimeError::Lua(stashed) = lua.execute::<()>(&ex).expect_err("must raise") else {
+        panic!("not a Lua error")
+    };
+    lua.enter(|ctx| {
+        let s = ctx.fetch(&stashed).value().get_string().unwrap();
+        String::from_utf8_lossy(s.as_bytes()).into_owned()
+    })
+}
+
 /// `return (cond) and 1 or 0` for a chunk that compares against expected
 /// strings inline, so failures point at the Lua expression.
 fn check(src: &str) {
@@ -80,23 +99,10 @@ fn pcall_of_non_functions() {
 
 #[test]
 fn pcall_without_arguments_is_an_error() {
-    let mut lua = Lua::new();
-    lua.load_all();
-    let ex = lua
-        .try_enter(|ctx| -> Result<_, LoadError> {
-            let chunk = ctx.load("pcall()", Some("=t"))?;
-            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
-        })
-        .expect("load");
-    let err = lua.execute::<()>(&ex).expect_err("pcall() must raise");
-    let tcvm::RuntimeError::Lua(stashed) = err else {
-        panic!("{err:?}")
-    };
-    let msg = lua.enter(|ctx| {
-        let s = ctx.fetch(&stashed).value().get_string().unwrap();
-        String::from_utf8_lossy(s.as_bytes()).into_owned()
-    });
-    assert_eq!(msg, "t:1: bad argument #1 to 'pcall' (value expected)");
+    assert_eq!(
+        run_err("pcall()"),
+        "t:1: bad argument #1 to 'pcall' (value expected)"
+    );
 }
 
 #[test]
@@ -156,6 +162,18 @@ fn xpcall_argument_checks() {
     );
     check(
         "local ok, e = pcall(xpcall, function() end, 5) return (not ok and e == \"bad argument #2 to 'xpcall' (function expected, got number)\") and 1 or 0",
+    );
+}
+
+#[test]
+fn pcall_of_a_yielding_native() {
+    // The resume args are the yield's results and land at the callee slot,
+    // so pcall sees them (and not the stale `coroutine.yield`) as f's results.
+    check(
+        "local co = coroutine.wrap(function() return pcall(coroutine.yield, 1) end)\n\
+         local first = co()\n\
+         local ok, a, b = co('a', 'b')\n\
+         return (first == 1 and ok == true and a == 'a' and b == 'b') and 1 or 0",
     );
 }
 
