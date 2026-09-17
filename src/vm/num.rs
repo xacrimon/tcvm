@@ -96,7 +96,7 @@ pub fn op_arith_int<'gc, Op: ArithOp>(
     lhs: i64,
     rhs: i64,
 ) -> Option<Value<'gc>> {
-    if Op::INT_ZERO_DIVISOR_INVALID && rhs == 0 {
+    if Op::ZERO_DIVISOR.is_some() && rhs == 0 {
         return None;
     }
 
@@ -180,8 +180,11 @@ pub fn op_arith_slow<'gc, Op: ArithOp>(
     if let (Some(li), Some(ri)) = (lhs.get_integer(), rhs.get_integer()) {
         return match op_arith_int::<Op>(mc, li, ri) {
             Some(v) => SlowNum::Value(v),
-            None if Op::IS_MOD => SlowNum::ModByZero,
-            None => SlowNum::DivByZero,
+            // `op_arith_int` only returns `None` when `ZERO_DIVISOR` gated it.
+            None => match Op::ZERO_DIVISOR.expect("None only when ZERO_DIVISOR is Some") {
+                ZeroDivisor::Mod => SlowNum::ModByZero,
+                ZeroDivisor::Div => SlowNum::DivByZero,
+            },
         };
     }
     match op_arith_mixed::<Op>(mc, &lhs, &rhs) {
@@ -202,10 +205,17 @@ pub fn op_bit_slow<'gc, Op: BitOp>(
     }
 }
 
+/// Which error a zero integer divisor raises.
+pub enum ZeroDivisor {
+    Mod,
+    Div,
+}
+
 pub trait ArithOp {
-    const INT_ZERO_DIVISOR_INVALID: bool = false;
-    /// Which error a zero integer divisor raises.
-    const IS_MOD: bool = false;
+    /// `None` when this op's `int` never divides by its second operand (Add/Sub/Mul),
+    /// or always falls through to float division regardless of the divisor (Div/Pow) —
+    /// either way, no zero check is needed before calling `int`.
+    const ZERO_DIVISOR: Option<ZeroDivisor> = None;
 
     fn int<'gc>(mc: &Mutation<'gc>, lhs: i64, rhs: i64) -> Value<'gc>;
     fn float_raw(lhs: f64, rhs: f64) -> f64;
@@ -281,7 +291,8 @@ impl ArithOp for Mul {
 pub struct Mod;
 
 impl ArithOp for Mod {
-    const IS_MOD: bool = true;
+    const ZERO_DIVISOR: Option<ZeroDivisor> = Some(ZeroDivisor::Mod);
+
     #[inline(always)]
     fn small<'gc>(lhs: i32, rhs: i32) -> Option<Value<'gc>> {
         // `checked_rem` is `None` for a zero divisor and for MIN % -1, both handled by `int`.
@@ -289,8 +300,6 @@ impl ArithOp for Mod {
         let adjusted = if r != 0 && (r ^ rhs) < 0 { r + rhs } else { r };
         Some(Value::small(adjusted))
     }
-
-    const INT_ZERO_DIVISOR_INVALID: bool = true;
 
     #[inline(always)]
     fn int<'gc>(mc: &Mutation<'gc>, lhs: i64, rhs: i64) -> Value<'gc> {
@@ -365,7 +374,7 @@ impl ArithOp for IDiv {
         Some(Value::small(adjusted))
     }
 
-    const INT_ZERO_DIVISOR_INVALID: bool = true;
+    const ZERO_DIVISOR: Option<ZeroDivisor> = Some(ZeroDivisor::Div);
 
     #[inline(always)]
     fn int<'gc>(mc: &Mutation<'gc>, lhs: i64, rhs: i64) -> Value<'gc> {
