@@ -1376,7 +1376,7 @@ macro_rules! arith_handler {
             // than width-bound int code (primes ~7%).
             let (l, r) = (reg!(ref lhs), reg!(ref rhs));
             if std::hint::likely(l.is_float() && r.is_float()) {
-                let (lf, rf) = unsafe { (l.read_float(), r.read_float()) };
+                let (lf, rf) = (l.read_float(), r.read_float());
                 reg!(ref mut dst).write_float(<$num_kind as num::ArithOp>::float_raw(lf, rf));
                 dispatch!();
             } else if let Some((li, ri)) = Value::both_small(l, r) {
@@ -1529,7 +1529,7 @@ macro_rules! arith_imm_handler {
                         dispatch!();
                     }
                 } else if v.is_float() {
-                    let (f, k) = (unsafe { v.read_float() }, k as f64);
+                    let (f, k) = (v.read_float(), k as f64);
                     let (l, r) = if $swap { (k, f) } else { (f, k) };
                     reg!(ref mut dst).write_float(<$num_kind as num::ArithOp>::float_raw(l, r));
                     dispatch!();
@@ -1537,7 +1537,7 @@ macro_rules! arith_imm_handler {
             } else {
                 let k = instruction.imm_float();
                 if v.is_float() {
-                    let f = unsafe { v.read_float() };
+                    let f = v.read_float();
                     let (l, r) = if $swap { (k, f) } else { (f, k) };
                     reg!(ref mut dst).write_float(<$num_kind as num::ArithOp>::float_raw(l, r));
                     dispatch!();
@@ -1940,7 +1940,7 @@ extern "rust-preserve-none" fn op_lt<'gc>(
     let primitive = {
         let (a, b) = (reg!(ref lhs), reg!(ref rhs));
         if std::hint::likely(a.is_float() && b.is_float()) {
-            Some(unsafe { a.read_float() < b.read_float() })
+            Some(a.read_float() < b.read_float())
         } else if let Some((x, y)) = Value::both_small(a, b) {
             Some(x < y)
         } else if let Some(x) = a.get_integer()
@@ -1997,7 +1997,7 @@ extern "rust-preserve-none" fn op_le<'gc>(
     let primitive = {
         let (a, b) = (reg!(ref lhs), reg!(ref rhs));
         if std::hint::likely(a.is_float() && b.is_float()) {
-            Some(unsafe { a.read_float() <= b.read_float() })
+            Some(a.read_float() <= b.read_float())
         } else if let Some((x, y)) = Value::both_small(a, b) {
             Some(x <= y)
         } else if let Some(x) = a.get_integer()
@@ -2064,7 +2064,7 @@ macro_rules! cmp_imm_handler {
                 } else if let Some(i) = v.get_integer() {
                     Some(if $swap { $ii(k, i) } else { $ii(i, k) })
                 } else if v.is_float() {
-                    let f = unsafe { v.read_float() };
+                    let f = v.read_float();
                     Some(if $swap { $if_(k, f) } else { $fi(f, k) })
                 } else {
                     None
@@ -2072,7 +2072,7 @@ macro_rules! cmp_imm_handler {
             } else {
                 let k = instruction.imm_float();
                 if v.is_float() {
-                    let f = unsafe { v.read_float() };
+                    let f = v.read_float();
                     Some(if $swap { $ff(k, f) } else { $ff(f, k) })
                 } else if let Some(i) = v.get_integer() {
                     Some(if $swap { $fi(k, i) } else { $if_(i, k) })

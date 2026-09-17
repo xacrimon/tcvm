@@ -50,7 +50,11 @@ const NIL: u64 = 0xFFFF_FFFE_0000_0000;
 const FALSE: u64 = NIL | 1;
 const TRUE: u64 = NIL | 2;
 
+// Guarantees `bits` sits at offset 0 and spans the whole 8 bytes: read_float/
+// write_float cast `&Value`/`&mut Value` straight to `*const f64`/`*mut f64` and
+// rely on that, not just on the size assert below.
 #[derive(Clone, Copy)]
+#[repr(transparent)]
 pub struct Value<'gc> {
     bits: u64,
     _marker: PhantomData<&'gc ()>,
@@ -210,10 +214,12 @@ impl<'gc> Value<'gc> {
     /// FP-register load instead of reusing the integer load of the tag check, which would cost a
     /// GPR->FPR move on the hot path.
     ///
-    /// # Safety
-    /// The caller must have checked `is_float`.
+    /// Garbage (some other bit pattern read as a float) if the slot isn't actually a float —
+    /// the caller's job to have checked `is_float` first — but never unsound: every 64-bit
+    /// pattern is a valid `f64`, so this can't misinterpret memory the way a wrong-`T` pointer
+    /// cast could.
     #[inline(always)]
-    pub unsafe fn read_float(&self) -> f64 {
+    pub fn read_float(&self) -> f64 {
         unsafe { core::ptr::read_volatile(self as *const Self as *const f64) }
     }
 
