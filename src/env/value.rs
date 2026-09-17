@@ -139,9 +139,18 @@ impl<'gc> Value<'gc> {
     }
 
     // Kept out of line so the allocator doesn't get inlined into every arithmetic handler.
+    //
+    // `v` must not fit `i32`: `Hash` hashes a boxed int by its dereferenced value but a
+    // small int by its raw bits, so a boxed and a small `Value` holding the same in-range
+    // `i64` would be `Eq` (which does dereference) but hash unequal, corrupting any table
+    // keyed on them. `integer` is the only caller and already guarantees this.
     #[cold]
     #[inline(never)]
     fn boxed_integer(mc: &Mutation<'gc>, v: i64) -> Self {
+        debug_assert!(
+            i32::try_from(v).is_err(),
+            "boxed_integer called with an i32-range value"
+        );
         Self::from_ptr(TAG_BOXED_INT, Gc::new(mc, v))
     }
 

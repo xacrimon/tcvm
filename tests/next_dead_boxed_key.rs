@@ -84,10 +84,7 @@ fn dead_boxed_key_is_rejected_not_dereferenced() {
     // A distinct box with the same value no longer matches a dead entry, so this
     // is "invalid key", not the pre-fix behavior of dereferencing the freed box
     // (which produced whatever value churn happened to leave there).
-    assert_eq!(
-        finish_str(&mut lua, &ex),
-        "false invalid key to 'next' nil"
-    );
+    assert_eq!(finish_str(&mut lua, &ex), "false invalid key to 'next' nil");
 }
 
 #[test]
