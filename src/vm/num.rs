@@ -421,8 +421,8 @@ pub fn op_bit<'gc, Op: BitOp>(mc: &Mutation<'gc>, lhs: Value, rhs: Value) -> Opt
 pub trait BitOp {
     fn int<'gc>(mc: &Mutation<'gc>, lhs: i64, rhs: i64) -> Value<'gc>;
 
-    /// Inline-integer fast path; `None` defers to `int`. Shifts always defer since they are
-    /// defined on the 64-bit value.
+    /// Inline-integer fast path; `None` defers to `int`, which agrees with this on
+    /// every `Some`.
     fn small<'gc>(lhs: i32, rhs: i32) -> Option<Value<'gc>>;
 }
 
@@ -491,8 +491,10 @@ pub struct Shl;
 
 impl BitOp for Shl {
     #[inline(always)]
-    fn small<'gc>(_lhs: i32, _rhs: i32) -> Option<Value<'gc>> {
-        None
+    fn small<'gc>(lhs: i32, rhs: i32) -> Option<Value<'gc>> {
+        i32::try_from(shift_left(lhs as i64, rhs as i64))
+            .ok()
+            .map(Value::small)
     }
 
     #[inline(always)]
@@ -505,8 +507,12 @@ pub struct Shr;
 
 impl BitOp for Shr {
     #[inline(always)]
-    fn small<'gc>(_lhs: i32, _rhs: i32) -> Option<Value<'gc>> {
-        None
+    fn small<'gc>(lhs: i32, rhs: i32) -> Option<Value<'gc>> {
+        // Widen to i64 before negating: unlike `int` below, `rhs` is `i32` here, so
+        // even `i32::MIN` negates without overflow once it's an `i64`.
+        i32::try_from(shift_left(lhs as i64, -(rhs as i64)))
+            .ok()
+            .map(Value::small)
     }
 
     #[inline(always)]
