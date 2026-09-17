@@ -13,12 +13,12 @@ use crate::env::string::LuaString;
 use crate::env::value::{Value, value_hash};
 
 /// One hash-part entry. A dead entry (nil `value`) does not trace its
-/// key, so the key may dangle once the collector frees the object, as in
-/// the reference: nothing dereferences a dead key. Identity is compared
-/// bitwise, and dead entries are reaped before any rehash so their hash
-/// is never recomputed. A set never revives a dead entry either (a new
-/// object at a freed address would land in the wrong bucket); only `next`
-/// resolves dead keys.
+/// key, so the key may dangle once the collector frees the object; `next`
+/// resolving a dead key (the only thing that looks one up) goes through
+/// `Key::same_dead`, which never dereferences it. Dead entries are reaped
+/// before any rehash so their hash is never recomputed. A set never revives
+/// a dead entry either (a new object at a freed address would land in the
+/// wrong bucket).
 #[derive(Clone, Copy)]
 pub(super) struct Entry<'gc, K> {
     pub key: K,
@@ -41,11 +41,20 @@ impl<'gc, K> Entry<'gc, K> {
     }
 }
 
-/// Hash-part key: identity comparison that never dereferences either
-/// side, and the hash used to place it.
+/// Hash-part key: identity comparison, and the hash used to place it.
 pub(super) trait Key: Copy {
+    /// Full equality, used against a live entry. Safe to dereference — a live
+    /// entry's key is traced.
     fn same(self, other: Self) -> bool;
     fn hash(self) -> u64;
+    /// Equality against a *dead* entry's key, which may dangle. Must never
+    /// dereference either side. Defaults to `same`, which already holds for
+    /// keys with no heap-boxed representation (e.g. `LuaString`, compared by
+    /// pointer either way).
+    #[inline]
+    fn same_dead(self, other: Self) -> bool {
+        self.same(other)
+    }
 }
 
 impl Key for Value<'_> {
@@ -57,6 +66,11 @@ impl Key for Value<'_> {
     #[inline]
     fn hash(self) -> u64 {
         value_hash(self)
+    }
+
+    #[inline]
+    fn same_dead(self, other: Self) -> bool {
+        self.same_bits(&other)
     }
 }
 
@@ -90,14 +104,22 @@ pub(super) fn get<'gc, K: Key, A: Allocator>(
         .map_or(Value::nil(), |e| e.value)
 }
 
-/// Bucket index of `key`, dead or alive.
+/// Bucket index of `key`, dead or alive. A dead entry's key only ever matches by
+/// `same_dead`: it may be a dangling heap-boxed integer, so full value equality
+/// (which would dereference it) is limited to live entries.
 #[inline]
 pub(super) fn position<K: Key, A: Allocator>(
     table: &Part<'_, K, A>,
     hash: u64,
     key: K,
 ) -> Option<usize> {
-    table.find_bucket_index(hash, |e| e.key.same(key))
+    table.find_bucket_index(hash, |e| {
+        if e.is_live() {
+            e.key.same(key)
+        } else {
+            e.key.same_dead(key)
+        }
+    })
 }
 
 /// First live entry at bucket index `from` or later.
