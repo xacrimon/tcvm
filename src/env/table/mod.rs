@@ -1,5 +1,7 @@
 mod hash_part;
 
+use core::cell::Cell;
+
 use hash_part::{int_hash, lua_string_hash};
 use hashbrown::HashTable;
 
@@ -139,6 +141,9 @@ pub struct TableState<'gc> {
     array: Vec<Value<'gc>, MetricsAlloc<'gc>>,
     /// Every other integer key, and floats with an integral value.
     int_hash: hash_part::Part<'gc, i64, MetricsAlloc<'gc>>,
+    /// Last border `raw_len` found, as Lua 5.5's `lenhint`.
+    #[collect(require_static)]
+    len_hint: Cell<usize>,
     /// Keys that are neither strings nor numbers with an integral value.
     misc_hash: hash_part::Part<'gc, Value<'gc>, MetricsAlloc<'gc>>,
     /// Set when this table has dropped to dictionary mode for its
@@ -178,6 +183,7 @@ impl<'gc> TableState<'gc> {
             properties: Vec::new_in(MetricsAlloc::new(mc)),
             array: Vec::new_in(MetricsAlloc::new(mc)),
             int_hash: HashTable::new_in(MetricsAlloc::new(mc)),
+            len_hint: Cell::new(0),
             misc_hash: HashTable::new_in(MetricsAlloc::new(mc)),
             dict: None,
             metatable: None,
@@ -235,8 +241,8 @@ impl<'gc> TableState<'gc> {
 
     #[inline]
     fn get_int(&self, key: i64) -> Value<'gc> {
-        match self.array_slot(key) {
-            Some(slot) => self.array[slot],
+        match usize::try_from(key).ok().and_then(|s| self.array.get(s)) {
+            Some(v) => *v,
             None => hash_part::get(&self.int_hash, int_hash(key), key),
         }
     }
@@ -388,6 +394,11 @@ impl<'gc> TableState<'gc> {
         }
         n += count_int(extra, &mut bins);
         let asize = best_asize(&bins, n);
+        if asize == self.array.len() {
+            // Nothing moves; let `hash_part::set` reap and grow as usual.
+            return;
+        }
+        self.len_hint.set(asize / 2);
 
         let mut rest: Vec<(i64, Value<'gc>)> = Vec::new();
         if asize < self.array.len() {
@@ -407,7 +418,9 @@ impl<'gc> TableState<'gc> {
                 _ => {}
             }
         }
-        self.int_hash = HashTable::with_capacity_in(rest.len() + 1, alloc);
+        // No slack, as in LuaJIT: a key that could extend the array must find
+        // `int_hash` full and come back here rather than settle in the hash.
+        self.int_hash = HashTable::with_capacity_in(rest.len(), alloc);
         for (k, v) in rest {
             hash_part::insert_unique(&mut self.int_hash, int_hash(k), k, v);
         }
@@ -422,26 +435,55 @@ impl<'gc> TableState<'gc> {
         hash_part::set(&mut self.misc_hash, hash, key, value);
     }
 
-    /// A border, found as LuaJIT's `lj_tab_len` does.
+    /// A border, found as Lua 5.5's `luaH_getn` does: near the last one
+    /// first, so `t[#t + 1] = v` and `t[#t] = nil` stay O(1).
     pub fn raw_len(&self) -> usize {
-        let mut hi = self.array.len().saturating_sub(1);
-        if hi > 0 && self.array[hi].is_nil() {
-            let mut lo = 0;
-            while hi - lo > 1 {
-                let mid = (lo + hi) / 2;
-                if self.array[mid].is_nil() {
-                    hi = mid;
-                } else {
-                    lo = mid;
+        let last = self.array.len().saturating_sub(1);
+        if last > 0 {
+            let empty = |k: usize| self.array[k].is_nil();
+            let found = |k: usize| {
+                self.len_hint.set(k);
+                k
+            };
+            let binsearch = |mut i: usize, mut j: usize| {
+                while j - i > 1 {
+                    let m = (i + j) / 2;
+                    if empty(m) { j = m } else { i = m }
+                }
+                found(i)
+            };
+            let mut limit = self.len_hint.get().clamp(1, last);
+            if empty(limit) {
+                for _ in 0..4 {
+                    if limit <= 1 {
+                        break;
+                    }
+                    limit -= 1;
+                    if !empty(limit) {
+                        return found(limit);
+                    }
+                }
+                return binsearch(0, limit);
+            }
+            for _ in 0..4 {
+                if limit >= last {
+                    break;
+                }
+                limit += 1;
+                if empty(limit) {
+                    return found(limit - 1);
                 }
             }
-            return lo;
+            if empty(last) {
+                return binsearch(limit, last);
+            }
+            self.len_hint.set(last);
         }
-        if self.int_hash.is_empty() {
-            return hi;
+        if self.int_hash.is_empty() || self.get_int(last as i64 + 1).is_nil() {
+            return last;
         }
         // Widen past the array into `int_hash`, then binary search.
-        let (mut lo, mut hi) = (hi as u64, hi as u64 + 1);
+        let (mut lo, mut hi) = (last as u64, last as u64 + 1);
         while !self.get_int(hi as i64).is_nil() {
             lo = hi;
             hi *= 2;
