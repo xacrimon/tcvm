@@ -376,9 +376,8 @@ impl<'gc> PartialEq for Value<'gc> {
 impl<'gc> Eq for Value<'gc> {}
 
 impl<'gc> Value<'gc> {
-    /// Bit-identity only, unlike `PartialEq`: never dereferences a boxed integer, so
-    /// this is the comparison a dead table entry's key must use — its box may already
-    /// be swept. Two differently-boxed but numerically equal integers compare unequal.
+    /// Bit identity, unlike `PartialEq`: never dereferences, so two differently-boxed
+    /// equal integers compare unequal.
     #[inline(always)]
     pub(crate) fn same_bits(&self, other: &Self) -> bool {
         self.bits == other.bits

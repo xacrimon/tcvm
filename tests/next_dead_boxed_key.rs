@@ -1,15 +1,6 @@
-//! `next`'s dead-key resume path (`hash_part::position`) must never dereference a
-//! deleted entry's key: a deleted boxed integer (`i64` outside `i32`, heap-allocated
-//! per `Value::integer`) is untraced once dead and its box can be swept, so comparing
-//! it by value would read freed memory. `Key::same_dead` compares dead entries by bit
-//! identity instead — see `src/env/table/hash_part.rs`.
-//!
-//! `dead_boxed_key_is_rejected_not_dereferenced` parks the freed box's address under
-//! GC churn and confirms `next` reports "invalid key" rather than reading through it.
-//! `live_boxed_key_still_resumes_by_value` is the control: a *live* entry must still
-//! resume by value, since a differently-boxed but numerically equal key is exactly
-//! what `for k, v in pairs(t) do t[k] = nil end` yields once other entries also use
-//! boxed integers.
+//! `next` resuming from a deleted large-integer key. The integer hash part
+//! stores keys as raw `i64`, so a dead entry never refers to a swept box and
+//! a freshly computed equal key still finds it.
 
 use tcvm::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Value};
 use tcvm::vm::sequence::CallbackAction;
@@ -60,11 +51,7 @@ fn finish_str(lua: &mut Lua, ex: &tcvm::StashedExecutor) -> String {
 }
 
 #[test]
-fn dead_boxed_key_is_rejected_not_dereferenced() {
-    // Deletes a boxed-int key (`t[-(big+1)] = nil`), forces a full GC while it's
-    // only reachable as a dead hash entry, then churns boxed-int allocations to
-    // recycle the freed box's slot before resuming past the yield and calling
-    // `next` with a freshly evaluated (differently-boxed, numerically equal) key.
+fn dead_boxed_key_resumes_by_value() {
     let (mut lua, ex) = setup(
         "local t = {}\n\
          local big = 1 << 40\n\
@@ -72,31 +59,20 @@ fn dead_boxed_key_is_rejected_not_dereferenced() {
          t[-(big+2)] = 2\n\
          t[-(big+1)] = nil\n\
          yielder()\n\
-         local ok, k, v = pcall(next, t, -(big+1))\n\
-         return tostring(ok) .. ' ' .. tostring(k) .. ' ' .. tostring(v)",
+         local ok, k = pcall(next, t, -(big+1))\n\
+         return tostring(ok) .. ' ' .. tostring(k == nil or k == -(big+2))",
     );
     let err = lua.finish(&ex).expect_err("main should yield");
     assert!(matches!(err, RuntimeError::MainYielded), "got {err:?}");
 
-    lua.collect_all(); // sweeps the dead entry's now-unreachable box
-    churn_boxed_ints(&mut lua); // recycle its freed slot with different i64s
+    lua.collect_all();
+    churn_boxed_ints(&mut lua);
 
-    // A distinct box with the same value no longer matches a dead entry, so this
-    // is "invalid key", not the pre-fix behavior of dereferencing the freed box
-    // (which produced whatever value churn happened to leave there).
-    assert_eq!(finish_str(&mut lua, &ex), "false invalid key to 'next' nil");
+    assert_eq!(finish_str(&mut lua, &ex), "true true");
 }
 
 #[test]
 fn live_boxed_key_still_resumes_by_value() {
-    // The ordinary `pairs`-delete idiom: every key is a boxed int, and resuming
-    // from one must still find its *live* entry by value even though the `next`
-    // call below constructs its key expression fresh rather than reusing a Lua
-    // reference to the entry's own box.
-    // Negative keys: `array_index` (table/mod.rs) treats any *positive* integer
-    // key as an array index with no upper bound, so a positive `1<<40`-scale key
-    // would try to grow the array part to trillions of slots — unrelated to what
-    // this test checks, so it's avoided here.
     let (mut lua, ex) = setup(
         "local t = {}\n\
          local big = 1 << 40\n\
