@@ -3499,13 +3499,27 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
                 crate::vm::sequence::CallbackAction::Suspend(action) => {
                     // Tailcall + suspension: pop the tailcalling Lua frame
                     // (close upvalues / TBC vars) so any subsequent action
-                    // lands on the caller's frame window. Capture the
-                    // popped frame's `num_results` — it carries the
+                    // lands on the caller's frame window. The popped frame's
+                    // function slot, `num_results` and continuation carry the
                     // original caller's expectation across the tail call.
-                    let (cur_base, num_results) = {
-                        let f = thread.top_lua().unwrap();
-                        (f.base, f.num_results)
+                    let (cur_base, func_idx, num_results, cont) = {
+                        let f = unsafe { &*frame };
+                        let func_idx = f.base - 1 - f.num_extras as usize;
+                        (f.base, func_idx, f.num_results, f.continuation)
                     };
+                    // Only a final landing can apply a continuation; the
+                    // callee of a plain `Call` returns without one.
+                    if cont.is_some()
+                        && matches!(*action, crate::vm::sequence::Suspend::Call { then: None })
+                    {
+                        save_pc(thread, ip);
+                        let err = crate::env::Error::from_str(
+                            ctx,
+                            "metamethod/iterator native cannot tail-call into Lua across the continuation",
+                        );
+                        thread.raise(ctx, err);
+                        return;
+                    }
                     close_upvalues(ctx.mutation(), thread, cur_base);
                     close_tbc_vars(ctx.mutation(), thread, cur_base);
                     thread.frames.pop();
@@ -3513,9 +3527,9 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
                         action,
                         call_site: CallSite {
                             bottom: args_base,
-                            func_idx: cur_base - 1,
+                            func_idx,
                             returns: num_results,
-                            cont: None,
+                            cont,
                         },
                     });
                     return;

@@ -94,3 +94,53 @@ fn native_call_without_then_returns_to_caller() {
     let result: i64 = lua.execute(&ex).expect("run");
     assert_eq!(result, 1);
 }
+
+fn run_with_natives(src: &str) -> Result<i64, String> {
+    let mut lua = Lua::new();
+    lua.load_all();
+    let ex = lua
+        .try_enter(|ctx| -> Result<_, LoadError> {
+            for (name, f) in [
+                ("bumper", bumper as NativeFn),
+                ("forward", forward as NativeFn),
+            ] {
+                let f = Function::new_native(ctx.mutation(), f, Box::new([]));
+                let key = Value::string(LuaString::new(ctx, name.as_bytes()));
+                ctx.globals().raw_set(ctx, key, Value::function(f));
+            }
+            let chunk = ctx.load(src, Some("=t"))?;
+            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+        })
+        .expect("load");
+    lua.execute(&ex).map_err(|e| match e {
+        tcvm::RuntimeError::Lua(stashed) => lua.enter(|ctx| {
+            let s = ctx.fetch(&stashed).value().get_string().unwrap();
+            String::from_utf8_lossy(s.as_bytes()).into_owned()
+        }),
+        other => panic!("{other:?}"),
+    })
+}
+
+/// Tail-called from a metamethod, the native's follow-up sequence lands the
+/// result through the metamethod's continuation.
+#[test]
+fn metamethod_tail_calls_a_native_that_calls_lua() {
+    let src = "local t = setmetatable({}, { __index = function(t, k) \
+               return bumper(function() return 41 end) end }) \
+               return t.x";
+    assert_eq!(run_with_natives(src), Ok(42));
+}
+
+/// Without a follow-up sequence nothing could apply the continuation, so
+/// this is an error rather than a wrong result.
+#[test]
+fn metamethod_tail_calls_a_native_that_forwards_to_lua() {
+    let src = "local t = setmetatable({}, { __index = function(t, k) \
+               return forward(function() return 1 end) end }) \
+               return t.x";
+    let err = run_with_natives(src).expect_err("must raise");
+    assert!(
+        err.contains("cannot tail-call into Lua across the continuation"),
+        "{err}"
+    );
+}
