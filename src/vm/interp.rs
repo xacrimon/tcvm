@@ -2910,6 +2910,27 @@ extern "rust-preserve-none" fn op_testset<'gc>(
 // Function calls
 // ---------------------------------------------------------------------------
 
+/// Write nil to `n` slots starting at `p`. The opaque pointer keeps this a
+/// loop: as a `memset_pattern16` call it would give every handler using it a
+/// stack frame, on the fast path too.
+///
+/// # Safety
+/// `p..p + n` must be in bounds.
+#[inline(always)]
+unsafe fn fill_nil<'gc>(mut p: *mut Value<'gc>, n: usize) {
+    for _ in 0..n {
+        unsafe {
+            p.write(Value::nil());
+            p = p.add(1);
+        }
+        // The pointer is only threaded through, never read.
+        #[allow(clippy::pointers_in_nomem_asm_block)]
+        unsafe {
+            core::arch::asm!("/* {0} */", inout(reg) p, options(nomem, nostack, preserves_flags));
+        }
+    }
+}
+
 /// The native arm of CALL: run the callback inline and land its results at
 /// `func_idx`. Expands inside a handler body (needs its `dispatch!`).
 macro_rules! call_native {
@@ -3039,9 +3060,12 @@ macro_rules! call_lua {
             // this arm would otherwise make.
             debug_assert!(new_base + num_params <= $thread.stack.len());
             let stack = $thread.stack.as_mut_ptr();
-            for i in caller_provided..num_params {
-                unsafe { *stack.add(new_base + i) = Value::nil() };
-            }
+            unsafe {
+                fill_nil(
+                    stack.add(new_base + caller_provided),
+                    num_params.saturating_sub(caller_provided),
+                )
+            };
             if callee.is_vararg {
                 caller_provided.saturating_sub(num_params) as u32
             } else {
@@ -3655,9 +3679,7 @@ extern "rust-preserve-none" fn op_return<'gc>(
         for i in 0..to_copy {
             unsafe { *stack.add(dst_start + i) = *stack.add(values_base + i) };
         }
-        for i in to_copy..wanted {
-            unsafe { *stack.add(dst_start + i) = Value::nil() };
-        }
+        unsafe { fill_nil(stack.add(dst_start + to_copy), wanted - to_copy) };
     }
     // Without this a `top` left high by a multires producer inside the callee
     // would keep its dead registers traced (#43).
@@ -3708,10 +3730,7 @@ extern "rust-preserve-none" fn op_return0<'gc>(
         num_results as usize - 1
     };
     debug_assert!(dst_start + wanted <= thread.stack.len());
-    let stack = thread.stack.as_mut_ptr();
-    for i in 0..wanted {
-        unsafe { *stack.add(dst_start + i) = Value::nil() };
-    }
+    unsafe { fill_nil(thread.stack.as_mut_ptr().add(dst_start), wanted) };
     thread.set_top_unchecked(dst_start + wanted);
     return_to_parent!(thread, registers, ip, frame, closure);
 }
@@ -3764,9 +3783,7 @@ extern "rust-preserve-none" fn op_return1<'gc>(
     // Written even when the caller wants nothing: `dst_start` is the caller's
     // function slot, dead once the call returns.
     unsafe { *stack.add(dst_start) = reg!(value) };
-    for i in 1..wanted {
-        unsafe { *stack.add(dst_start + i) = Value::nil() };
-    }
+    unsafe { fill_nil(stack.add(dst_start + 1), wanted.saturating_sub(1)) };
     thread.set_top_unchecked(dst_start + wanted);
     return_to_parent!(thread, registers, ip, frame, closure);
 }
