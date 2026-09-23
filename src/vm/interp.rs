@@ -7,7 +7,7 @@ use crate::env::shape::{MetamethodBits, Shape};
 use crate::env::string::LuaString;
 use crate::env::table::Table;
 use crate::env::thread::{
-    CallSite, Frame, LuaFrame, PendingAction, Thread, ThreadState, ThreadStatus, frame_flags,
+    CallSite, ExecKind, LuaFrame, PendingAction, Thread, ThreadState, ThreadStatus, frame_flags,
 };
 use crate::env::value::{Value, ValueKind};
 use crate::instruction::{Instruction, Op, UpValueDescriptor};
@@ -2883,8 +2883,8 @@ macro_rules! call_native {
             let action = match invoke_native($ctx, $thread, nc, args_base, argc) {
                 Ok(a) => a,
                 Err(err) => {
-                    // Push Frame::Error so the executor's unwinder finds
-                    // the nearest catching `Frame::Sequence` (e.g. the
+                    // Push `ExecKind::Error` so the executor's unwinder finds
+                    // the nearest catching `ExecKind::Sequence` (e.g. the
                     // PCallSequence under coroutine.resume). Persist
                     // caller's pc first so re-entry would work if anything
                     // catches and resumes.
@@ -3024,7 +3024,7 @@ macro_rules! call_lua {
             // closure is already in hand: no trip through `thread.frames`
             // (whose length we just stored) to find either.
             unsafe { $thread.push_lua_unchecked(frame) };
-            $frame = unsafe { LuaFrame::next_slot($frame) };
+            $frame = unsafe { $frame.add(1) };
             $closure = callee;
         }
         $registers = unsafe { $thread.stack.as_mut_ptr().add(new_base) };
@@ -3462,8 +3462,8 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
                     let cur_base = thread.top_lua().unwrap().base;
                     close_upvalues(ctx.mutation(), thread, cur_base);
                     close_tbc_vars(ctx.mutation(), thread, cur_base);
-                    thread.frames.pop();
-                    thread.frames.push(Frame::Error(err));
+                    thread.pop_lua();
+                    thread.push_exec(ExecKind::Error(err));
                     return;
                 }
             };
@@ -3522,7 +3522,7 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
                     }
                     close_upvalues(ctx.mutation(), thread, cur_base);
                     close_tbc_vars(ctx.mutation(), thread, cur_base);
-                    thread.frames.pop();
+                    thread.pop_lua();
                     thread.pending_action = Some(PendingAction {
                         action,
                         call_site: CallSite {
@@ -3543,14 +3543,13 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
 /// and `thread.top` is published: pop the frame and resume the Lua parent.
 macro_rules! return_to_parent {
     ($thread:ident, $registers:ident, $ip:ident, $frame:ident, $closure:ident) => {{
-        // The top frame is `Frame::Lua` (it is the one we are running) and
         // `LuaFrame` is `Copy`, so nothing needs dropping.
         let n = $thread.frames.len();
         unsafe { $thread.frames.set_len(n - 1) };
-        // The parent is the slot below (`flags` guaranteed it is a Lua frame),
-        // so it is reached from the frame register rather than through the
-        // length just stored.
-        $frame = unsafe { LuaFrame::prev_slot($frame) };
+        // The parent is the frame below (`flags` guaranteed it is a Lua
+        // frame), so it is reached from the frame register rather than
+        // through the length just stored.
+        $frame = unsafe { $frame.sub(1) };
         let (new_base, new_ip, parent) =
             unsafe { ((*$frame).base, (*$frame).pc, (*$frame).closure) };
         $closure = parent;
@@ -3611,10 +3610,7 @@ extern "rust-preserve-none" fn op_return<'gc>(
         );
     }
     debug_assert!(!frame_has_open_upvalues(thread, cur_base));
-    debug_assert!(matches!(
-        thread.frames[thread.frames.len() - 2],
-        Frame::Lua(_)
-    ));
+    debug_assert!(thread.frames.len() >= 2 && thread.exec_depth() < thread.frames.len() - 1);
 
     let nret = count as usize - 1;
     let values_base = cur_base + values as usize;
@@ -4749,15 +4745,12 @@ pub(crate) fn frame_return<'gc>(
         thread.set_top_unchecked(dst_start + nret);
         return FrameReturn::Continuation;
     }
-    // The top frame is the `Frame::Lua` read above and `LuaFrame` is `Copy`,
-    // so there is nothing to drop; `Vec::pop` would copy the 96-byte frame out
-    // and run the enum's drop glue.
     const { assert!(!std::mem::needs_drop::<LuaFrame<'_>>()) };
     unsafe { thread.frames.set_len(thread.frames.len() - 1) };
 
-    let (new_base, new_ip) = match thread.frames.last() {
-        Some(Frame::Lua(caller)) => (caller.base, caller.pc),
-        None => {
+    let (new_base, new_ip) = match thread.top_lua() {
+        Some(caller) => (caller.base, caller.pc),
+        None if thread.frames_empty() => {
             thread
                 .stack
                 .copy_within(values_base..values_base + nret, dst_start);
@@ -4773,7 +4766,7 @@ pub(crate) fn frame_return<'gc>(
         // `stack[dst_start..]` for the parent's window. Since no register
         // window sits above the results the shrink is legal, and it publishes
         // the parent's input window as `stack[dst_start..top]`.
-        Some(_) => {
+        None => {
             thread
                 .stack
                 .copy_within(values_base..values_base + nret, dst_start);
@@ -5029,7 +5022,7 @@ pub(crate) enum MetaDispatch {
     /// the continuation payload inline.
     NativeReturn { results_base: usize, nret: usize },
     /// Native callback suspended (Call/Yield/Resume/Sequence) or errored — a
-    /// `pending_action` or `Frame::Error` was installed for the executor. The
+    /// `pending_action` or `ExecKind::Error` was installed for the executor. The
     /// caller returns to exit dispatch.
     Suspended,
     /// Target is not callable (or a suspending comparison metamethod, which we
@@ -5152,7 +5145,7 @@ fn unop_metamethod<'gc>(val: Value<'gc>, name: LuaString<'gc>) -> Value<'gc> {
 /// Sequence) is mapped to a `pending_action` whose `CallSite` lands the
 /// results exactly where the continuation would, then re-enters the caller
 /// frame at the saved pc — so `op_return`-style continuation logic isn't
-/// needed for the suspend case. A native error installs a `Frame::Error`.
+/// needed for the suspend case. A native error installs an `ExecKind::Error`.
 ///
 /// The native suspend path replays all four continuation payloads uniformly via
 /// `apply_native_continuation`: `StoreResult`, `IgnoreResult`, `TForCall`, and
@@ -5266,7 +5259,7 @@ fn schedule_native_meta_call<'gc>(
     let action = match invoke_native(ctx, thread, nc, args_base, actual_args) {
         Ok(a) => a,
         Err(err) => {
-            // Mirror op_call's native-error path: a Frame::Error lets the
+            // Mirror op_call's native-error path: an `ExecKind::Error` lets the
             // executor's unwinder route to the nearest catcher (e.g. pcall).
             thread.raise(ctx, err);
             return MetaDispatch::Suspended;
@@ -5356,7 +5349,7 @@ extern "rust-preserve-none" fn cont_resume<'gc>(
         (f.continuation.unwrap(), func_slot)
     };
     // `frame_return` already closed upvalues and to-be-closed variables.
-    thread.frames.pop();
+    thread.pop_lua();
     (frame, closure) = top_frame(thread);
     let caller_base = unsafe {
         ip = (*frame).pc;

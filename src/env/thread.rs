@@ -40,7 +40,7 @@ pub enum ThreadStatus {
 /// A Lua bytecode frame on a thread's frame stack. Only Lua function
 /// execution pushes one of these; native callbacks that don't suspend run
 /// inline within the calling Lua frame.
-#[derive(Collect)]
+#[derive(Clone, Copy, Collect)]
 #[collect(internal, no_drop)]
 pub struct LuaFrame<'gc> {
     pub closure: LuaFn<'gc>,
@@ -73,7 +73,7 @@ pub struct LuaFrame<'gc> {
 ///   expects results to land.
 /// - `returns` is the CALL instruction's `returns` field (0 = "all").
 ///
-/// Stored on `Frame::Sequence`, `Frame::WaitThread`, `PendingAction`,
+/// Stored on `ExecKind::Sequence`, `ExecKind::WaitThread`, `PendingAction`,
 /// and as the yielded-state stash on `ThreadState`.
 #[derive(Clone, Copy, Debug)]
 pub struct CallSite {
@@ -99,30 +99,11 @@ pub mod frame_flags {
     pub const OPEN_UPVALUES: u8 = 2;
     /// A TBC in this frame registered a to-be-closed slot.
     pub const TBC: u8 = 4;
-    /// The frame below is not a Lua frame (executor-pushed entry frame).
+    /// The frame below is not a Lua frame, or there is none.
     pub const PARENT_NON_LUA: u8 = 8;
 }
 
 impl<'gc> LuaFrame<'gc> {
-    /// The `LuaFrame` payload of the `Frame` slot after the one holding `f`.
-    ///
-    /// # Safety
-    /// `f` must point into a `Vec<Frame>` buffer with a slot after it.
-    #[inline(always)]
-    pub unsafe fn next_slot(f: *mut Self) -> *mut Self {
-        unsafe { f.byte_add(std::mem::size_of::<Frame<'gc>>()) }
-    }
-
-    /// The `LuaFrame` payload of the `Frame` slot before the one holding `f`.
-    ///
-    /// # Safety
-    /// `f` must point into a `Vec<Frame>` buffer, not at its first slot, and
-    /// the previous slot must be `Frame::Lua`.
-    #[inline(always)]
-    pub unsafe fn prev_slot(f: *mut Self) -> *mut Self {
-        unsafe { f.byte_sub(std::mem::size_of::<Frame<'gc>>()) }
-    }
-
     /// `pc` as an index into `closure.proto.code`.
     pub fn pc_index(&self) -> usize {
         unsafe {
@@ -132,14 +113,19 @@ impl<'gc> LuaFrame<'gc> {
     }
 }
 
-/// A frame on a thread's frame stack. The interpreter only pushes
-/// `Frame::Lua`; the executor driver pushes the others when a callback
-/// suspends, an error unwinds, a coroutine waits, etc.
+/// A frame the executor pushes when a callback suspends, an error unwinds, a
+/// coroutine waits, etc. It sits above the first `depth` Lua frames and
+/// below the rest.
 #[derive(Collect)]
 #[collect(internal, no_drop)]
-pub enum Frame<'gc> {
-    /// Running Lua bytecode.
-    Lua(LuaFrame<'gc>),
+pub struct ExecFrame<'gc> {
+    pub depth: usize,
+    pub kind: ExecKind<'gc>,
+}
+
+#[derive(Collect)]
+#[collect(internal, no_drop)]
+pub enum ExecKind<'gc> {
     /// A pinned multi-step native callback awaiting (re-)poll. The
     /// `call_site` mirrors the original Lua CALL so terminal
     /// `SequencePoll::Return` lands results in the right place.
@@ -165,6 +151,13 @@ pub enum Frame<'gc> {
     /// stamped with `pending_error`, or until the thread terminates with
     /// the error.
     Error(Error<'gc>),
+}
+
+/// A frame seen while walking every frame of a thread, see
+/// [`ThreadState::frames_rev`].
+pub enum FrameRef<'a, 'gc> {
+    Lua(&'a LuaFrame<'gc>),
+    Exec(&'a ExecKind<'gc>),
 }
 
 /// Most stack slots a thread's Lua frames may use (LuaJIT's `LUAI_MAXSTACK`).
@@ -204,7 +197,11 @@ pub struct ThreadState<'gc> {
     /// Backing store. May hold dead slots above the live region; the
     /// collector clears them when it traces the thread.
     pub stack: ValueStack<'gc>,
-    pub frames: Vec<Frame<'gc>>,
+    /// Lua frames, innermost last.
+    pub frames: Vec<LuaFrame<'gc>>,
+    /// Executor frames, innermost last, each placed among `frames` by its
+    /// `depth`. Kept apart so the interpreter's frames are plain records.
+    pub exec_frames: Vec<ExecFrame<'gc>>,
     pub open_upvalues: Vec<Upvalue<'gc>>,
     pub tbc_slots: Vec<usize>,
     pub status: ThreadStatus,
@@ -285,6 +282,7 @@ unsafe impl<'gc> Collect<'gc> for ThreadState<'gc> {
         stack[live..].fill(Value::nil());
         cc.trace(&stack[..live]);
         cc.trace(&self.frames);
+        cc.trace(&self.exec_frames);
         cc.trace(&self.open_upvalues);
         cc.trace(&self.thread_handle);
         cc.trace(&self.pending_action);
@@ -310,55 +308,118 @@ impl<'gc> ThreadState<'gc> {
         unsafe { self.thread_handle.unwrap_unchecked() }
     }
 
-    /// View the top frame as a Lua frame. Returns `None` if the stack is
-    /// empty *or* the top is non-Lua (Sequence/Start/WaitThread/Error).
-    /// Most interpreter sites can `.unwrap()` this — the dispatch loop only
-    /// runs when a Lua frame is on top — but the executor driver loop must
-    /// match all variants.
+    /// Lua frames below the innermost executor frame.
+    #[inline]
+    pub(crate) fn exec_depth(&self) -> usize {
+        self.exec_frames.last().map_or(0, |e| e.depth)
+    }
+
+    /// Whether the innermost frame is a Lua frame.
+    #[inline]
+    pub fn top_is_lua(&self) -> bool {
+        self.frames.len() > self.exec_depth()
+    }
+
+    /// Whether the thread has no frames at all.
+    pub fn frames_empty(&self) -> bool {
+        self.frames.is_empty() && self.exec_frames.is_empty()
+    }
+
+    /// The innermost frame if it is a Lua frame. Most interpreter sites can
+    /// `.unwrap()` this — the dispatch loop only runs when a Lua frame is on
+    /// top — but the executor driver loop must also handle `top_exec`.
     #[inline]
     pub fn top_lua(&self) -> Option<&LuaFrame<'gc>> {
-        match self.frames.last()? {
-            Frame::Lua(lf) => Some(lf),
-            _ => None,
+        if self.top_is_lua() {
+            self.frames.last()
+        } else {
+            None
         }
     }
 
     #[inline]
     pub fn top_lua_mut(&mut self) -> Option<&mut LuaFrame<'gc>> {
-        match self.frames.last_mut()? {
-            Frame::Lua(lf) => Some(lf),
-            _ => None,
+        if self.top_is_lua() {
+            self.frames.last_mut()
+        } else {
+            None
         }
     }
 
-    /// Hot-path accessor used by interpreter handlers that have already
-    /// guaranteed (statically) that the top frame is Lua. UB in release if
-    /// it isn't; debug builds panic.
-    ///
     /// # Safety
-    /// Caller must ensure `self.frames.last()` is `Some(Frame::Lua(_))`.
+    /// The innermost frame must be a Lua frame.
     #[inline]
     pub unsafe fn top_lua_unchecked(&self) -> &LuaFrame<'gc> {
-        match unsafe { self.frames.last().unwrap_unchecked() } {
-            Frame::Lua(lf) => lf,
-            _ => {
-                debug_assert!(false, "top_lua_unchecked: non-Lua frame on top");
-                unsafe { std::hint::unreachable_unchecked() }
-            }
-        }
+        debug_assert!(self.top_is_lua(), "non-Lua frame on top");
+        unsafe { self.frames.last().unwrap_unchecked() }
     }
 
     /// # Safety
-    /// Caller must ensure `self.frames.last_mut()` is `Some(Frame::Lua(_))`.
+    /// The innermost frame must be a Lua frame.
     #[inline]
     pub unsafe fn top_lua_unchecked_mut(&mut self) -> &mut LuaFrame<'gc> {
-        match unsafe { self.frames.last_mut().unwrap_unchecked() } {
-            Frame::Lua(lf) => lf,
-            _ => {
-                debug_assert!(false, "top_lua_unchecked_mut: non-Lua frame on top");
-                unsafe { std::hint::unreachable_unchecked() }
-            }
+        debug_assert!(self.top_is_lua(), "non-Lua frame on top");
+        unsafe { self.frames.last_mut().unwrap_unchecked() }
+    }
+
+    /// The innermost frame if it is an executor frame.
+    pub fn top_exec(&self) -> Option<&ExecKind<'gc>> {
+        if self.top_is_lua() {
+            None
+        } else {
+            self.exec_frames.last().map(|e| &e.kind)
         }
+    }
+
+    pub fn top_exec_mut(&mut self) -> Option<&mut ExecKind<'gc>> {
+        if self.top_is_lua() {
+            None
+        } else {
+            self.exec_frames.last_mut().map(|e| &mut e.kind)
+        }
+    }
+
+    /// Push an executor frame above every current frame.
+    pub fn push_exec(&mut self, kind: ExecKind<'gc>) {
+        let depth = self.frames.len();
+        self.exec_frames.push(ExecFrame { depth, kind });
+    }
+
+    /// Pop the innermost frame if it is an executor frame.
+    pub fn pop_exec(&mut self) -> Option<ExecKind<'gc>> {
+        if self.top_is_lua() {
+            None
+        } else {
+            self.exec_frames.pop().map(|e| e.kind)
+        }
+    }
+
+    /// Pop the innermost frame, which must be a Lua frame.
+    #[inline]
+    pub fn pop_lua(&mut self) {
+        debug_assert!(self.top_is_lua(), "non-Lua frame on top");
+        self.frames.pop();
+    }
+
+    pub fn clear_frames(&mut self) {
+        self.frames.clear();
+        self.exec_frames.clear();
+    }
+
+    /// Every frame, innermost first.
+    pub fn frames_rev(&self) -> impl Iterator<Item = FrameRef<'_, 'gc>> {
+        let (mut lua, mut exec) = (self.frames.len(), self.exec_frames.len());
+        std::iter::from_fn(move || {
+            if exec > 0 && self.exec_frames[exec - 1].depth == lua {
+                exec -= 1;
+                Some(FrameRef::Exec(&self.exec_frames[exec].kind))
+            } else if lua > 0 {
+                lua -= 1;
+                Some(FrameRef::Lua(&self.frames[lua]))
+            } else {
+                None
+            }
+        })
     }
 
     /// One past the highest slot anything on this thread can still read.
@@ -369,13 +430,8 @@ impl<'gc> ThreadState<'gc> {
     /// paused multires producer may have pushed above it.
     pub fn live_top(&self) -> usize {
         self.frames
-            .iter()
-            .rev()
-            .find_map(|f| match f {
-                Frame::Lua(lf) => Some(lf.base + lf.closure.proto.max_stack_size as usize),
-                _ => None,
-            })
-            .unwrap_or(0)
+            .last()
+            .map_or(0, |lf| lf.base + lf.closure.proto.max_stack_size as usize)
             .max(self.top)
     }
 
@@ -383,7 +439,7 @@ impl<'gc> ThreadState<'gc> {
     /// current frames, then install the unwinding marker for the executor.
     pub(crate) fn raise(&mut self, ctx: Context<'gc>, err: Error<'gc>) {
         let err = crate::vm::debug::locate(ctx, self, err);
-        self.frames.push(Frame::Error(err));
+        self.push_exec(ExecKind::Error(err));
     }
 
     /// Push a new Lua frame. `base` must sit directly above the function
@@ -395,13 +451,13 @@ impl<'gc> ThreadState<'gc> {
             lf.base >= 1,
             "Lua frame base must leave room for the function slot"
         );
-        if !matches!(self.frames.last(), Some(Frame::Lua(_))) {
+        if !self.top_is_lua() {
             lf.flags |= frame_flags::PARENT_NON_LUA;
         }
         if self.frames.len() == self.frames.capacity() {
             self.grow_frames();
         }
-        self.frames.push(Frame::Lua(lf));
+        self.frames.push(lf);
     }
 
     #[cold]
@@ -414,14 +470,15 @@ impl<'gc> ThreadState<'gc> {
     /// the parent is the running Lua frame, so `flags` is stored as given.
     ///
     /// # Safety
-    /// `frames.len() < frames.capacity()`, and the top frame is `Frame::Lua`.
+    /// `frames.len() < frames.capacity()`, and the innermost frame is a Lua frame.
     #[inline(always)]
     pub unsafe fn push_lua_unchecked(&mut self, lf: LuaFrame<'gc>) {
         debug_assert!(lf.base >= 1);
         debug_assert!(self.frames.len() < self.frames.capacity());
+        debug_assert!(self.top_is_lua());
         let len = self.frames.len();
         unsafe {
-            self.frames.as_mut_ptr().add(len).write(Frame::Lua(lf));
+            self.frames.as_mut_ptr().add(len).write(lf);
             self.frames.set_len(len + 1);
         }
     }
@@ -556,6 +613,7 @@ impl<'gc> Thread<'gc> {
         let state = ThreadState {
             stack: ValueStack::new(),
             frames: Vec::new(),
+            exec_frames: Vec::new(),
             open_upvalues: Vec::new(),
             tbc_slots: Vec::new(),
             status: ThreadStatus::Stopped,

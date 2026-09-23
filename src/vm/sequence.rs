@@ -215,7 +215,7 @@ macro_rules! __seq_trace_pointers {
 pub use __seq_trace_pointers as seq_trace_pointers;
 
 /// Owning, pinned, GC-traced handle to a [`Sequence`]. Stored on a thread's
-/// frame stack as part of `Frame::Sequence`.
+/// frame stack as part of `ExecKind::Sequence`.
 ///
 /// The allocator is intentionally `MetricsAlloc<'static>` (not `'gc`-branded):
 /// `MetricsAlloc`'s `'gc` brand is artificial — it carries only a `Metrics`

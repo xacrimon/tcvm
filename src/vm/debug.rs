@@ -3,7 +3,7 @@
 
 use crate::env::error::Error;
 use crate::env::string::LuaString;
-use crate::env::thread::{Frame, ThreadState};
+use crate::env::thread::{FrameRef, LuaFrame, ThreadState};
 use crate::env::value::Value;
 use crate::lua::Context;
 use crate::vm::interp::OpError;
@@ -48,22 +48,24 @@ pub(crate) fn chunk_id(source: &[u8]) -> Vec<u8> {
 
 /// Source line the Lua frame is currently executing; `pc` points past the
 /// current instruction (see `LuaFrame::pc`), and 0 means not yet entered.
-pub(crate) fn frame_line(frame: &Frame<'_>) -> Option<u32> {
-    let Frame::Lua(lf) = frame else { return None };
+pub(crate) fn frame_line(lf: &LuaFrame<'_>) -> Option<u32> {
     lf.closure.proto.line_for_pc(lf.pc_index().checked_sub(1)?)
 }
 
 /// `luaL_where`: `"chunk:line: "` for call `level`, counting the raising
-/// native as 0 and `ts.frames.last()` as 1. Empty when that level isn't a
+/// native as 0 and the innermost frame as 1. Empty when that level isn't a
 /// Lua function (or doesn't exist), exactly like the reference.
 pub(crate) fn where_prefix(ts: &ThreadState<'_>, level: usize) -> Vec<u8> {
     let Some(frame) = level
         .checked_sub(1)
-        .and_then(|depth| ts.frames.iter().rev().nth(depth))
+        .and_then(|depth| ts.frames_rev().nth(depth))
     else {
         return Vec::new();
     };
-    let (Frame::Lua(lf), Some(line)) = (frame, frame_line(frame)) else {
+    let FrameRef::Lua(lf) = frame else {
+        return Vec::new();
+    };
+    let Some(line) = frame_line(lf) else {
         return Vec::new();
     };
     let mut out = chunk_id(lf.closure.proto.source.as_bytes());

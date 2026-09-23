@@ -4,7 +4,6 @@
 
 use std::pin::Pin;
 
-use tcvm::env::thread::Frame;
 use tcvm::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Value};
 use tcvm::vm::sequence::{BoxSequence, CallbackAction, Execution, Sequence, SequencePoll};
 use tcvm::{Executor, LoadError, Lua};
@@ -202,11 +201,7 @@ fn lua_frame_count<'gc>(
     nctx: NativeContext<'gc, '_>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let n = stack
-        .frames()
-        .iter()
-        .filter(|f| matches!(f, Frame::Lua(_)))
-        .count();
+    let n = stack.lua_frames().len();
     stack.replace(&[Value::integer(nctx.ctx.mutation(), n as i64)]);
     Ok(CallbackAction::Return)
 }
