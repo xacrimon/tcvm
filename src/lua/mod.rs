@@ -280,7 +280,7 @@ mod tests {
     ) -> Result<crate::vm::sequence::CallbackAction<'gc>, crate::env::Error<'gc>> {
         let (a, b) = (stack.get(0), stack.get(1));
         let sum = match (a.get_integer(), b.get_integer()) {
-            (Some(x), Some(y)) => Value::integer(x + y),
+            (Some(x), Some(y)) => Value::integer(nctx.ctx.mutation(), x + y),
             _ => return Err(crate::env::Error::from_str(nctx.ctx, "bad args")),
         };
         stack.replace(&[sum]);
@@ -1073,10 +1073,10 @@ mod tests {
             let kx = Value::string(LuaString::new(ctx, b"x"));
             let ky = Value::string(LuaString::new(ctx, b"y"));
 
-            a.raw_set(ctx, kx, Value::integer(1));
-            a.raw_set(ctx, ky, Value::integer(2));
-            b.raw_set(ctx, kx, Value::integer(10));
-            b.raw_set(ctx, ky, Value::integer(20));
+            a.raw_set(ctx, kx, Value::integer(ctx.mutation(), 1));
+            a.raw_set(ctx, ky, Value::integer(ctx.mutation(), 2));
+            b.raw_set(ctx, kx, Value::integer(ctx.mutation(), 10));
+            b.raw_set(ctx, ky, Value::integer(ctx.mutation(), 20));
 
             assert!(
                 Shape::ptr_eq(a.shape(), b.shape()),
@@ -1085,8 +1085,8 @@ mod tests {
 
             // Different ordering -> different shape pointer.
             let c = Table::new(ctx);
-            c.raw_set(ctx, ky, Value::integer(2));
-            c.raw_set(ctx, kx, Value::integer(1));
+            c.raw_set(ctx, ky, Value::integer(ctx.mutation(), 2));
+            c.raw_set(ctx, kx, Value::integer(ctx.mutation(), 1));
             assert!(
                 !Shape::ptr_eq(a.shape(), c.shape()),
                 "tables grown through different key orders should have distinct shapes"

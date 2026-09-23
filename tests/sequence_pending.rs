@@ -23,7 +23,7 @@ impl<'gc> Sequence<'gc> for PendNTimes {
     fn trace_pointers(&self, _cc: &mut dyn Trace<'gc>) {}
     fn poll(
         mut self: Pin<&mut Self>,
-        _ctx: Context<'gc>,
+        ctx: Context<'gc>,
         _exec: Execution<'gc, '_>,
         mut stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
@@ -31,7 +31,7 @@ impl<'gc> Sequence<'gc> for PendNTimes {
             self.remaining -= 1;
             Ok(SequencePoll::Pending)
         } else {
-            stack.replace(&[Value::integer(7)]);
+            stack.replace(&[Value::integer(ctx.mutation(), 7)]);
             Ok(SequencePoll::Return)
         }
     }

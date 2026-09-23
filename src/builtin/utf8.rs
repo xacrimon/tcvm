@@ -195,7 +195,7 @@ fn lua_codepoint<'gc>(
     while pos < end {
         match decode(bytes, pos, strict) {
             Some((code, next)) => {
-                out.push(Value::integer(code as i64));
+                out.push(Value::integer(nctx.ctx.mutation(), code as i64));
                 pos = next;
             }
             None => return Err(Error::from_str(nctx.ctx, "invalid UTF-8 code")),
@@ -250,12 +250,12 @@ fn lua_len<'gc>(
                 posi = next as i64 + 1;
             }
             None => {
-                stack.replace(&[Value::nil(), Value::integer(posi)]);
+                stack.replace(&[Value::nil(), Value::integer(nctx.ctx.mutation(), posi)]);
                 return Ok(CallbackAction::Return);
             }
         }
     }
-    stack.replace(&[Value::integer(count)]);
+    stack.replace(&[Value::integer(nctx.ctx.mutation(), count)]);
     Ok(CallbackAction::Return)
 }
 
@@ -330,7 +330,10 @@ fn lua_offset<'gc>(
                 }
                 e
             };
-            stack.replace(&[Value::integer(p), Value::integer(end)]);
+            stack.replace(&[
+                Value::integer(nctx.ctx.mutation(), p),
+                Value::integer(nctx.ctx.mutation(), end),
+            ]);
         }
         None => stack.replace(&[Value::nil()]),
     }
@@ -345,7 +348,11 @@ fn lua_codes<'gc>(
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let s = check_str(nctx.ctx, stack.get(0), "codes", 1)?;
     let iter = Function::new_native(nctx.ctx.mutation(), codes_aux, Box::new([]));
-    stack.replace(&[Value::function(iter), Value::string(s), Value::integer(0)]);
+    stack.replace(&[
+        Value::function(iter),
+        Value::string(s),
+        Value::integer(nctx.ctx.mutation(), 0),
+    ]);
     Ok(CallbackAction::Return)
 }
 
@@ -375,7 +382,10 @@ fn codes_aux<'gc>(
     }
     match decode(bytes, pos, true) {
         Some((code, _)) => {
-            stack.replace(&[Value::integer(pos as i64 + 1), Value::integer(code as i64)]);
+            stack.replace(&[
+                Value::integer(nctx.ctx.mutation(), pos as i64 + 1),
+                Value::integer(nctx.ctx.mutation(), code as i64),
+            ]);
             Ok(CallbackAction::Return)
         }
         None => Err(Error::from_str(nctx.ctx, "invalid UTF-8 code")),

@@ -35,7 +35,7 @@ fn file_result<'gc>(
             stack.replace(&[
                 Value::nil(),
                 Value::string(LuaString::new(nctx.ctx, text.as_bytes())),
-                Value::integer(errno as i64),
+                Value::integer(nctx.ctx.mutation(), errno as i64),
             ]);
         }
     }
@@ -226,7 +226,7 @@ fn lua_time<'gc>(
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        stack.replace(&[Value::integer(now)]);
+        stack.replace(&[Value::integer(nctx.ctx.mutation(), now)]);
         Ok(CallbackAction::Return)
     } else if arg.get_table().is_some() {
         Err(Error::from_str(

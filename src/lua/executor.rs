@@ -87,7 +87,7 @@ impl<'gc> Executor<'gc> {
         {
             let mc = ctx.mutation();
             let mut buf: Vec<Value<'gc>> = Vec::new();
-            args.push_into(&mut buf);
+            args.push_into(mc, &mut buf);
 
             let mut ts = thread.borrow_mut(mc);
             ts.discard_above(0);
@@ -310,7 +310,7 @@ impl<'gc> Executor<'gc> {
         // them at stack[bottom..], replacing the previously-yielded
         // values.
         let mut buf: Vec<Value<'gc>> = Vec::new();
-        args.push_into(&mut buf);
+        args.push_into(mc, &mut buf);
         {
             let mut ts = top.borrow_mut(mc);
             ts.set_window(cs.bottom, buf);

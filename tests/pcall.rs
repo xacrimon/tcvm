@@ -208,7 +208,7 @@ fn lua_frame_count<'gc>(
         .iter()
         .filter(|f| matches!(f, Frame::Lua(_)))
         .count();
-    stack.replace(&[Value::integer(n as i64)]);
+    stack.replace(&[Value::integer(nctx.ctx.mutation(), n as i64)]);
     Ok(CallbackAction::Return)
 }
 

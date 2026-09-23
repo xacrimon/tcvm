@@ -1,6 +1,8 @@
 mod hash_part;
 
-use hash_part::lua_string_hash;
+use core::cell::Cell;
+
+use hash_part::{int_hash, lua_string_hash};
 use hashbrown::HashTable;
 
 use crate::Context;
@@ -40,8 +42,12 @@ impl<'gc> Table<'gc> {
     }
 
     /// See [`TableState::next`].
-    pub fn next(self, key: Value<'gc>) -> Result<Option<(Value<'gc>, Value<'gc>)>, InvalidKey> {
-        self.0.borrow().next(key)
+    pub fn next(
+        self,
+        mc: &Mutation<'gc>,
+        key: Value<'gc>,
+    ) -> Result<Option<(Value<'gc>, Value<'gc>)>, InvalidKey> {
+        self.0.borrow().next(mc, key)
     }
 
     pub fn metatable(self) -> Option<Table<'gc>> {
@@ -130,11 +136,15 @@ pub struct TableState<'gc> {
     /// `properties.len() == shape.slot_count()` post-set. Empty in
     /// dict mode (storage moves to `dict`).
     pub(crate) properties: Vec<Value<'gc>, MetricsAlloc<'gc>>,
-    /// Array part for positive integer keys 1..n. Self-contained — no
-    /// shape involvement.
+    /// Integer keys `0..array.len()`, as in LuaJIT: may hold nils, and is
+    /// only resized by `rehash_ints`.
     array: Vec<Value<'gc>, MetricsAlloc<'gc>>,
-    /// Fallback hash for non-string, non-array-integer keys (booleans,
-    /// floats, table/function/thread-as-keys, negative integers).
+    /// Every other integer key, and floats with an integral value.
+    int_hash: hash_part::Part<'gc, i64, MetricsAlloc<'gc>>,
+    /// Last border `raw_len` found, as Lua 5.5's `lenhint`.
+    #[collect(require_static)]
+    len_hint: Cell<usize>,
+    /// Keys that are neither strings nor numbers with an integral value.
     misc_hash: hash_part::Part<'gc, Value<'gc>, MetricsAlloc<'gc>>,
     /// Set when this table has dropped to dictionary mode for its
     /// string-keyed properties, triggered by exceeding
@@ -172,6 +182,8 @@ impl<'gc> TableState<'gc> {
             shape,
             properties: Vec::new_in(MetricsAlloc::new(mc)),
             array: Vec::new_in(MetricsAlloc::new(mc)),
+            int_hash: HashTable::new_in(MetricsAlloc::new(mc)),
+            len_hint: Cell::new(0),
             misc_hash: HashTable::new_in(MetricsAlloc::new(mc)),
             dict: None,
             metatable: None,
@@ -221,13 +233,23 @@ impl<'gc> TableState<'gc> {
         if let Some(s) = key.get_string() {
             return self.get_string_key(s);
         }
-        if let Some(index) = array_index(key) {
-            return match self.array.get(index - 1) {
-                Some(value) => *value,
-                None => Value::nil(),
-            };
+        if let Some(i) = int_key(key) {
+            return self.get_int(i);
         }
         self.misc_hash_get(key, value_hash(key))
+    }
+
+    #[inline]
+    fn get_int(&self, key: i64) -> Value<'gc> {
+        match usize::try_from(key).ok().and_then(|s| self.array.get(s)) {
+            Some(v) => *v,
+            None => hash_part::get(&self.int_hash, int_hash(key), key),
+        }
+    }
+
+    #[inline]
+    fn array_slot(&self, key: i64) -> Option<usize> {
+        usize::try_from(key).ok().filter(|&s| s < self.array.len())
     }
 
     #[inline]
@@ -245,8 +267,8 @@ impl<'gc> TableState<'gc> {
     fn misc_hash_get(&self, key: Value<'gc>, hash: u64) -> Value<'gc> {
         debug_assert_eq!(hash, value_hash(key));
         debug_assert!(
-            key.kind() != ValueKind::String,
-            "string keys go through the shape, not misc_hash"
+            key.kind() != ValueKind::String && int_key(key).is_none(),
+            "string and integer keys have their own parts"
         );
         hash_part::get(&self.misc_hash, hash, key)
     }
@@ -257,21 +279,8 @@ impl<'gc> TableState<'gc> {
             self.set_string_key(ctx, s, value);
             return;
         }
-        if let Some(index) = array_index(key) {
-            if index > self.array.len() {
-                if value.is_nil() {
-                    return;
-                }
-                self.array.resize(index, Value::nil());
-            }
-            self.array[index - 1] = value;
-            // `raw_len` reports `array.len()`, which is only a border if the
-            // last slot is non-nil: trim trailing nils on deletion.
-            if value.is_nil() && index == self.array.len() {
-                while self.array.last().is_some_and(|v| v.is_nil()) {
-                    self.array.pop();
-                }
-            }
+        if let Some(i) = int_key(key) {
+            self.set_int_key(i, value);
             return;
         }
         assert!(
@@ -350,34 +359,173 @@ impl<'gc> TableState<'gc> {
         self.dict = Some(DictState { table });
     }
 
+    fn set_int_key(&mut self, key: i64, value: Value<'gc>) {
+        if let Some(slot) = self.array_slot(key) {
+            self.array[slot] = value;
+            return;
+        }
+        let hash = int_hash(key);
+        if !value.is_nil()
+            && self.int_hash.len() == self.int_hash.capacity()
+            && hash_part::get(&self.int_hash, hash, key).is_nil()
+        {
+            self.rehash_ints(key);
+            if let Some(slot) = self.array_slot(key) {
+                self.array[slot] = value;
+                return;
+            }
+        }
+        hash_part::set(&mut self.int_hash, hash, key, value);
+    }
+
+    /// LuaJIT's `rehashtab`, run when a new key would grow `int_hash`: size the
+    /// array to the largest `2^k + 1` that stays more than half full, counting
+    /// `extra`, and rebuild `int_hash` from the live keys that don't fit.
+    fn rehash_ints(&mut self, extra: i64) {
+        let mut bins = [0u32; MAX_ABITS];
+        let mut n = 0;
+        for (k, v) in self.array.iter().enumerate() {
+            if !v.is_nil() {
+                n += count_int(k as i64, &mut bins);
+            }
+        }
+        for e in self.int_hash.iter().filter(|e| e.is_live()) {
+            n += count_int(e.key, &mut bins);
+        }
+        n += count_int(extra, &mut bins);
+        let asize = best_asize(&bins, n);
+        if asize == self.array.len() {
+            // Nothing moves; let `hash_part::set` reap and grow as usual.
+            return;
+        }
+        self.len_hint.set(asize / 2);
+
+        let mut rest: Vec<(i64, Value<'gc>)> = Vec::new();
+        if asize < self.array.len() {
+            rest.extend(
+                (asize..)
+                    .zip(self.array.drain(asize..))
+                    .filter(|(_, v)| !v.is_nil())
+                    .map(|(k, v)| (k as i64, v)),
+            );
+        }
+        self.array.resize(asize, Value::nil());
+        let alloc = self.int_hash.allocator().clone();
+        for e in core::mem::replace(&mut self.int_hash, HashTable::new_in(alloc.clone())) {
+            match usize::try_from(e.key).ok().filter(|&s| s < asize) {
+                Some(slot) if e.is_live() => self.array[slot] = e.value,
+                _ if e.is_live() => rest.push((e.key, e.value)),
+                _ => {}
+            }
+        }
+        // No slack, as in LuaJIT: a key that could extend the array must find
+        // `int_hash` full and come back here rather than settle in the hash.
+        self.int_hash = HashTable::with_capacity_in(rest.len(), alloc);
+        for (k, v) in rest {
+            hash_part::insert_unique(&mut self.int_hash, int_hash(k), k, v);
+        }
+    }
+
     fn misc_hash_set(&mut self, key: Value<'gc>, value: Value<'gc>, hash: u64) {
         debug_assert_eq!(hash, value_hash(key));
         debug_assert!(
-            key.kind() != ValueKind::String,
-            "string keys go through the shape, not misc_hash"
+            key.kind() != ValueKind::String && int_key(key).is_none(),
+            "string and integer keys have their own parts"
         );
         hash_part::set(&mut self.misc_hash, hash, key, value);
     }
 
-    #[inline]
+    /// A border, found as Lua 5.5's `luaH_getn` does: near the last one
+    /// first, so `t[#t + 1] = v` and `t[#t] = nil` stay O(1).
     pub fn raw_len(&self) -> usize {
-        self.array.len()
+        let last = self.array.len().saturating_sub(1);
+        if last > 0 {
+            let empty = |k: usize| self.array[k].is_nil();
+            let found = |k: usize| {
+                self.len_hint.set(k);
+                k
+            };
+            let binsearch = |mut i: usize, mut j: usize| {
+                while j - i > 1 {
+                    let m = (i + j) / 2;
+                    if empty(m) { j = m } else { i = m }
+                }
+                found(i)
+            };
+            let mut limit = self.len_hint.get().clamp(1, last);
+            if empty(limit) {
+                for _ in 0..4 {
+                    if limit <= 1 {
+                        break;
+                    }
+                    limit -= 1;
+                    if !empty(limit) {
+                        return found(limit);
+                    }
+                }
+                return binsearch(0, limit);
+            }
+            for _ in 0..4 {
+                if limit >= last {
+                    break;
+                }
+                limit += 1;
+                if empty(limit) {
+                    return found(limit - 1);
+                }
+            }
+            if empty(last) {
+                return binsearch(limit, last);
+            }
+            self.len_hint.set(last);
+        }
+        if self.int_hash.is_empty() || self.get_int(last as i64 + 1).is_nil() {
+            return last;
+        }
+        // Widen past the array into `int_hash`, then binary search.
+        let (mut lo, mut hi) = (last as u64, last as u64 + 1);
+        while !self.get_int(hi as i64).is_nil() {
+            lo = hi;
+            hi *= 2;
+            if hi > i64::MAX as u64 / 2 {
+                let mut i = 1;
+                while !self.get_int(i).is_nil() {
+                    i += 1;
+                }
+                return (i - 1) as usize;
+            }
+        }
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            if self.get_int(mid as i64).is_nil() {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        lo as usize
     }
 
     /// Stateless successor for Lua's `next`: the first live entry after
-    /// `key` in traversal order (array, then string keys, then the misc
+    /// `key` in traversal order (array, integer hash, string keys, misc
     /// hash), `None` once exhausted, `nil` starts from the beginning. Hash
     /// parts are walked by bucket index, so a key deleted mid-traversal
-    /// (left in place with a nil value) still anchors the scan. Any
-    /// positive integer is accepted as an array position, even past the
-    /// end: clearing the last slot trims trailing nils, and the traversal
-    /// must still resume from the key it just yielded. (The reference
-    /// rejects such keys as invalid; it never shrinks the array.)
-    pub fn next(&self, key: Value<'gc>) -> Result<Option<(Value<'gc>, Value<'gc>)>, InvalidKey> {
+    /// (left in place with a nil value) still anchors the scan.
+    pub fn next(
+        &self,
+        mc: &Mutation<'gc>,
+        key: Value<'gc>,
+    ) -> Result<Option<(Value<'gc>, Value<'gc>)>, InvalidKey> {
         let (part, from) = if key.is_nil() {
             (Part::Array, 0)
-        } else if let Some(i) = array_index(key) {
-            (Part::Array, i.min(self.array.len()))
+        } else if let Some(i) = int_key(key) {
+            match self.array_slot(i) {
+                Some(slot) => (Part::Array, slot + 1),
+                None => {
+                    let pos = hash_part::position(&self.int_hash, int_hash(i), i);
+                    (Part::Ints, pos.ok_or(InvalidKey)? + 1)
+                }
+            }
         } else if let Some(s) = key.get_string() {
             let pos = match &self.dict {
                 Some(d) => hash_part::position(&d.table, lua_string_hash(s), s),
@@ -392,8 +540,14 @@ impl<'gc> TableState<'gc> {
         if part == Part::Array {
             for (i, v) in self.array.iter().enumerate().skip(from) {
                 if !v.is_nil() {
-                    return Ok(Some((Value::integer(i as i64 + 1), *v)));
+                    return Ok(Some((Value::integer(mc, i as i64), *v)));
                 }
+            }
+        }
+        if part <= Part::Ints {
+            let from = if part == Part::Ints { from } else { 0 };
+            if let Some(e) = hash_part::next_live(&self.int_hash, from) {
+                return Ok(Some((Value::integer(mc, e.key), e.value)));
             }
         }
         if part <= Part::Strings {
@@ -421,26 +575,42 @@ impl<'gc> TableState<'gc> {
 #[derive(PartialEq, PartialOrd)]
 enum Part {
     Array,
+    Ints,
     Strings,
     Misc,
 }
 
-/// Extract a valid array index from a Value (1-based positive integer).
-fn array_index(key: Value) -> Option<usize> {
-    if let Some(i) = key.get_integer() {
-        if i >= 1 {
-            return Some(i as usize);
-        }
-        return None;
-    }
+/// The integer a key normalizes to: integers, and floats with an exact
+/// integer value.
+fn int_key(key: Value) -> Option<i64> {
+    key.get_integer()
+        .or_else(|| key.get_float().and_then(crate::vm::num::exact_float_to_int))
+}
 
-    if let Some(f) = key.get_float() {
-        let i = f as i64;
-        if i >= 1 && (i as f64) == f {
-            return Some(i as usize);
-        }
-        return None;
-    }
+const MAX_ABITS: usize = 28;
+/// LuaJIT's `LJ_MAX_ASIZE`.
+const MAX_ASIZE: i64 = (1 << (MAX_ABITS - 1)) + 1;
 
-    None
+/// LuaJIT's `countint`: bin `b` holds keys in `(2^b, 2^(b+1)]`, with 0..=2 in bin 0.
+fn count_int(key: i64, bins: &mut [u32; MAX_ABITS]) -> u32 {
+    if !(0..MAX_ASIZE).contains(&key) {
+        return 0;
+    }
+    let k = key as u32;
+    bins[if k > 2 { (k - 1).ilog2() as usize } else { 0 }] += 1;
+    1
+}
+
+/// LuaJIT's `bestasize`: `n` is the number of keys counted into `bins`.
+fn best_asize(bins: &[u32; MAX_ABITS], n: u32) -> usize {
+    let (mut sum, mut size) = (0u32, 0);
+    let mut b = 0;
+    while b < MAX_ABITS && 2 * n > 1 << b && sum != n {
+        sum += bins[b];
+        if bins[b] > 0 && 2 * sum > 1 << b {
+            size = (2usize << b) + 1;
+        }
+        b += 1;
+    }
+    size
 }

@@ -1,12 +1,13 @@
 //! Conversion traits for passing Rust values into and out of Lua calls.
 
+use crate::dmm::Mutation;
 use crate::env::function::Function;
 use crate::env::{LuaString, Table, Thread, Value};
 use crate::lua::TypeError;
 
 /// A Rust value that lowers to a single `Value<'gc>`.
 pub trait IntoValue<'gc> {
-    fn into_value(self) -> Value<'gc>;
+    fn into_value(self, mc: &Mutation<'gc>) -> Value<'gc>;
 }
 
 /// A Rust value built from a single `Value<'gc>`.
@@ -16,7 +17,7 @@ pub trait FromValue<'gc>: Sized {
 
 /// An argument list pushed onto a Lua call's stack.
 pub trait IntoMultiValue<'gc> {
-    fn push_into(self, stack: &mut Vec<Value<'gc>>);
+    fn push_into(self, mc: &Mutation<'gc>, stack: &mut Vec<Value<'gc>>);
 }
 
 /// A Rust type constructed from the return-value sequence of a Lua call.
@@ -29,7 +30,7 @@ pub trait FromMultiValue<'gc>: Sized {
 // ---------------------------------------------------------------------------
 
 impl<'gc> IntoValue<'gc> for Value<'gc> {
-    fn into_value(self) -> Value<'gc> {
+    fn into_value(self, _mc: &Mutation<'gc>) -> Value<'gc> {
         self
     }
 }
@@ -41,7 +42,7 @@ impl<'gc> FromValue<'gc> for Value<'gc> {
 }
 
 impl<'gc> IntoValue<'gc> for bool {
-    fn into_value(self) -> Value<'gc> {
+    fn into_value(self, _mc: &Mutation<'gc>) -> Value<'gc> {
         Value::boolean(self)
     }
 }
@@ -56,8 +57,8 @@ impl<'gc> FromValue<'gc> for bool {
 }
 
 impl<'gc> IntoValue<'gc> for i64 {
-    fn into_value(self) -> Value<'gc> {
-        Value::integer(self)
+    fn into_value(self, mc: &Mutation<'gc>) -> Value<'gc> {
+        Value::integer(mc, self)
     }
 }
 
@@ -79,7 +80,7 @@ impl<'gc> FromValue<'gc> for i64 {
 }
 
 impl<'gc> IntoValue<'gc> for f64 {
-    fn into_value(self) -> Value<'gc> {
+    fn into_value(self, _mc: &Mutation<'gc>) -> Value<'gc> {
         Value::float(self)
     }
 }
@@ -100,7 +101,7 @@ impl<'gc> FromValue<'gc> for f64 {
 }
 
 impl<'gc> IntoValue<'gc> for LuaString<'gc> {
-    fn into_value(self) -> Value<'gc> {
+    fn into_value(self, _mc: &Mutation<'gc>) -> Value<'gc> {
         Value::string(self)
     }
 }
@@ -115,7 +116,7 @@ impl<'gc> FromValue<'gc> for LuaString<'gc> {
 }
 
 impl<'gc> IntoValue<'gc> for Table<'gc> {
-    fn into_value(self) -> Value<'gc> {
+    fn into_value(self, _mc: &Mutation<'gc>) -> Value<'gc> {
         Value::table(self)
     }
 }
@@ -130,7 +131,7 @@ impl<'gc> FromValue<'gc> for Table<'gc> {
 }
 
 impl<'gc> IntoValue<'gc> for Function<'gc> {
-    fn into_value(self) -> Value<'gc> {
+    fn into_value(self, _mc: &Mutation<'gc>) -> Value<'gc> {
         Value::function(self)
     }
 }
@@ -145,7 +146,7 @@ impl<'gc> FromValue<'gc> for Function<'gc> {
 }
 
 impl<'gc> IntoValue<'gc> for Thread<'gc> {
-    fn into_value(self) -> Value<'gc> {
+    fn into_value(self, _mc: &Mutation<'gc>) -> Value<'gc> {
         Value::thread(self)
     }
 }
@@ -170,10 +171,10 @@ impl<'gc, T: FromValue<'gc>> FromValue<'gc> for Option<T> {
 }
 
 impl<'gc, T: IntoValue<'gc>> IntoValue<'gc> for Option<T> {
-    fn into_value(self) -> Value<'gc> {
+    fn into_value(self, mc: &Mutation<'gc>) -> Value<'gc> {
         match self {
             None => Value::nil(),
-            Some(t) => t.into_value(),
+            Some(t) => t.into_value(mc),
         }
     }
 }
@@ -183,11 +184,11 @@ impl<'gc, T: IntoValue<'gc>> IntoValue<'gc> for Option<T> {
 // ---------------------------------------------------------------------------
 
 impl<'gc> IntoMultiValue<'gc> for () {
-    fn push_into(self, _stack: &mut Vec<Value<'gc>>) {}
+    fn push_into(self, _mc: &Mutation<'gc>, _stack: &mut Vec<Value<'gc>>) {}
 }
 
 impl<'gc> IntoMultiValue<'gc> for &[Value<'gc>] {
-    fn push_into(self, stack: &mut Vec<Value<'gc>>) {
+    fn push_into(self, _mc: &Mutation<'gc>, stack: &mut Vec<Value<'gc>>) {
         stack.extend_from_slice(self);
     }
 }
@@ -199,9 +200,9 @@ macro_rules! into_multi_tuple {
             $($t: IntoValue<'gc>,)+
         {
             #[allow(non_snake_case)]
-            fn push_into(self, stack: &mut Vec<Value<'gc>>) {
+            fn push_into(self, mc: &Mutation<'gc>, stack: &mut Vec<Value<'gc>>) {
                 let ($($t,)+) = self;
-                $(stack.push($t.into_value());)+
+                $(stack.push($t.into_value(mc));)+
             }
         }
     };

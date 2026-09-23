@@ -27,13 +27,13 @@ impl<'gc> Sequence<'gc> for YieldThenAddOne {
 
     fn poll(
         mut self: Pin<&mut Self>,
-        _ctx: Context<'gc>,
+        ctx: Context<'gc>,
         _exec: Execution<'gc, '_>,
         mut stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
         if !self.yielded {
             self.yielded = true;
-            stack.replace(&[Value::integer(42)]);
+            stack.replace(&[Value::integer(ctx.mutation(), 42)]);
             // Yield with the bottom relative to the sequence's window.
             // bottom = 0 means stack[seq.bottom..] (the 42) is what
             // gets yielded.
@@ -44,7 +44,7 @@ impl<'gc> Sequence<'gc> for YieldThenAddOne {
                 .get(0)
                 .get_integer()
                 .expect("resume-arg should be integer");
-            stack.replace(&[Value::integer(v + 1)]);
+            stack.replace(&[Value::integer(ctx.mutation(), v + 1)]);
             Ok(SequencePoll::Return)
         }
     }

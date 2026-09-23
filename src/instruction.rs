@@ -24,6 +24,7 @@
 
 use std::fmt;
 
+use crate::dmm::Mutation;
 use crate::env::value::Value;
 
 /// A register index. Canonical home for what the compiler calls
@@ -387,9 +388,9 @@ impl Instruction {
     /// The `Value` an immediate stands for; slow paths hand it to
     /// metamethods and error messages.
     #[inline]
-    pub fn imm_value<'gc>(self) -> Value<'gc> {
+    pub fn imm_value<'gc>(self, mc: &Mutation<'gc>) -> Value<'gc> {
         if self.imm_is_int() {
-            Value::integer(self.imm_int())
+            Value::integer(mc, self.imm_int())
         } else {
             Value::float(self.imm_float())
         }

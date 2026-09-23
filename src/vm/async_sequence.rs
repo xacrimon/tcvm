@@ -195,7 +195,7 @@ impl AsyncSequence {
     ) -> Result<(), StashedError> {
         self.shared.visit(|shared| {
             shared.set_next_op(SequenceOp::Call {
-                function: func.fetch(shared.roots),
+                function: func.fetch(shared.ctx.mutation(), shared.roots),
                 bottom,
             });
         });
@@ -236,7 +236,7 @@ impl AsyncSequence {
     ) -> Result<(), StashedError> {
         self.shared.visit(|shared| {
             shared.set_next_op(SequenceOp::Resume {
-                thread: thread.fetch(shared.roots),
+                thread: thread.fetch(shared.ctx.mutation(), shared.roots),
                 bottom,
             });
         });
@@ -269,8 +269,8 @@ impl<'gc, 'a> Locals<'gc, 'a> {
     }
 
     /// Recover the live `'gc` value behind a previously-stashed handle.
-    pub fn fetch<F: Fetchable>(&self, local: &F) -> F::Fetched<'gc> {
-        local.fetch(self.roots)
+    pub fn fetch<F: Fetchable>(&self, mc: &Mutation<'gc>, local: &F) -> F::Fetched<'gc> {
+        local.fetch(mc, self.roots)
     }
 }
 
@@ -341,14 +341,14 @@ where
                 );
                 match res {
                     Ok(SequenceReturn::Return) => Ok(SequencePoll::Return),
-                    Ok(SequenceReturn::Call(function)) => {
-                        Ok(SequencePoll::TailCall(function.fetch(roots_local)))
-                    }
+                    Ok(SequenceReturn::Call(function)) => Ok(SequencePoll::TailCall(
+                        function.fetch(ctx.mutation(), roots_local),
+                    )),
                     Ok(SequenceReturn::Yield) => Ok(SequencePoll::TailYield),
-                    Ok(SequenceReturn::Resume(thread)) => {
-                        Ok(SequencePoll::TailResume(thread.fetch(roots_local)))
-                    }
-                    Err(stashed) => Err(stashed.fetch(roots_local)),
+                    Ok(SequenceReturn::Resume(thread)) => Ok(SequencePoll::TailResume(
+                        thread.fetch(ctx.mutation(), roots_local),
+                    )),
+                    Err(stashed) => Err(stashed.fetch(ctx.mutation(), roots_local)),
                 }
             }
             Poll::Pending => Ok(

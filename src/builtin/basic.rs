@@ -98,7 +98,7 @@ fn lua_collectgarbage<'gc>(
         }
         b"isrunning" => stack.replace(&[Value::boolean(true)]),
         b"step" => stack.replace(&[Value::boolean(false)]),
-        _ => stack.replace(&[Value::integer(0)]),
+        _ => stack.replace(&[Value::integer(nctx.ctx.mutation(), 0)]),
     }
     Ok(CallbackAction::Return)
 }
@@ -171,7 +171,11 @@ fn lua_ipairs<'gc>(
     }
     let t = stack.get(0);
     let iter = Function::new_native(nctx.ctx.mutation(), ipairs_aux, Box::new([]));
-    stack.replace(&[Value::function(iter), t, Value::integer(0)]);
+    stack.replace(&[
+        Value::function(iter),
+        t,
+        Value::integer(nctx.ctx.mutation(), 0),
+    ]);
     Ok(CallbackAction::Return)
 }
 
@@ -188,11 +192,11 @@ fn ipairs_aux<'gc>(
         )
     })?;
     let i = stack.get(1).get_integer().unwrap_or(0) + 1;
-    let v = t.raw_get(Value::integer(i));
+    let v = t.raw_get(Value::integer(nctx.ctx.mutation(), i));
     if v.is_nil() {
         stack.replace(&[Value::nil()]);
     } else {
-        stack.replace(&[Value::integer(i), v]);
+        stack.replace(&[Value::integer(nctx.ctx.mutation(), i), v]);
     }
     Ok(CallbackAction::Return)
 }
@@ -228,7 +232,7 @@ fn lua_next<'gc>(
             &format!("bad argument #1 to 'next' (table expected, got {got})"),
         ));
     };
-    match t.next(stack.get(1)) {
+    match t.next(nctx.ctx.mutation(), stack.get(1)) {
         Ok(Some((k, v))) => stack.replace(&[k, v]),
         Ok(None) => stack.replace(&[Value::nil()]),
         Err(_) => return Err(Error::from_str(nctx.ctx, "invalid key to 'next'")),
@@ -422,7 +426,7 @@ fn lua_rawlen<'gc>(
             &format!("bad argument #1 to 'rawlen' (table or string expected, got {got})"),
         ));
     };
-    stack.replace(&[Value::integer(len)]);
+    stack.replace(&[Value::integer(nctx.ctx.mutation(), len)]);
     Ok(CallbackAction::Return)
 }
 
@@ -464,7 +468,7 @@ fn lua_select<'gc>(
     if let Some(s) = sel.get_string()
         && s.as_bytes() == b"#"
     {
-        stack.replace(&[Value::integer(m as i64)]);
+        stack.replace(&[Value::integer(nctx.ctx.mutation(), m as i64)]);
         return Ok(CallbackAction::Return);
     }
     let i = util::check_integer(nctx.ctx, sel, "select", 1)?;
@@ -555,11 +559,13 @@ fn lua_tonumber<'gc>(
                 "bad argument #2 to 'tonumber' (base out of range)",
             ));
         }
-        util::str_to_int_base(s.as_bytes(), base as u32).map_or(Value::nil(), Value::integer)
+        util::str_to_int_base(s.as_bytes(), base as u32)
+            .map_or(Value::nil(), |i| Value::integer(nctx.ctx.mutation(), i))
     } else if v.get_integer().is_some() || v.get_float().is_some() {
         v
     } else if let Some(s) = v.get_string() {
-        util::str_to_number(s.as_bytes()).unwrap_or(Value::nil())
+        util::str_to_number(s.as_bytes())
+            .map_or(Value::nil(), |n| n.into_value(nctx.ctx.mutation()))
     } else {
         Value::nil()
     };

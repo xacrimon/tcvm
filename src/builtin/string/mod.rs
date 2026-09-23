@@ -112,7 +112,10 @@ fn lua_byte<'gc>(
     let mut out = Vec::new();
     let mut k = start;
     while k <= end {
-        out.push(Value::integer(bytes[(k - 1) as usize] as i64));
+        out.push(Value::integer(
+            nctx.ctx.mutation(),
+            bytes[(k - 1) as usize] as i64,
+        ));
         k += 1;
     }
     stack.replace(&out);
@@ -159,7 +162,7 @@ fn pat_err<'gc>(ctx: Context<'gc>, e: PatError) -> Error<'gc> {
 fn cap_to_value<'gc>(ctx: Context<'gc>, src: &[u8], cv: CapValue) -> Value<'gc> {
     match cv {
         CapValue::Str { start, end } => Value::string(LuaString::new(ctx, &src[start..end])),
-        CapValue::Pos(n) => Value::integer(n),
+        CapValue::Pos(n) => Value::integer(ctx.mutation(), n),
     }
 }
 
@@ -212,8 +215,8 @@ fn lua_find<'gc>(
             Some(off) => {
                 let start = init + off;
                 stack.replace(&[
-                    Value::integer(start as i64 + 1),
-                    Value::integer((start + pat.len()) as i64),
+                    Value::integer(nctx.ctx.mutation(), start as i64 + 1),
+                    Value::integer(nctx.ctx.mutation(), (start + pat.len()) as i64),
                 ]);
             }
             None => stack.replace(&[Value::nil()]),
@@ -228,7 +231,10 @@ fn lua_find<'gc>(
     loop {
         if let Some(e) = ms.match_at(s1).map_err(|e| pat_err(ctx, e))? {
             // start, end, then the explicit captures (no whole-match fallback).
-            let mut out = vec![Value::integer(s1 as i64 + 1), Value::integer(e as i64)];
+            let mut out = vec![
+                Value::integer(nctx.ctx.mutation(), s1 as i64 + 1),
+                Value::integer(nctx.ctx.mutation(), e as i64),
+            ];
             for i in 0..ms.num_captures(false) {
                 let cv = ms.get_onecapture(i, s1, e).map_err(|e| pat_err(ctx, e))?;
                 out.push(cap_to_value(ctx, src, cv));
@@ -1118,7 +1124,7 @@ fn lua_gsub<'gc>(
     // Fast path: string/number replacement template, fully synchronous.
     if let Some(template) = repl_template(ctx, repl) {
         let (result, count) = gsub_string(ctx, s.as_bytes(), p.as_bytes(), &template, max_n)?;
-        stack.replace(&[result, Value::integer(count)]);
+        stack.replace(&[result, Value::integer(nctx.ctx.mutation(), count)]);
         return Ok(CallbackAction::Return);
     }
 
@@ -1147,9 +1153,9 @@ fn lua_gsub<'gc>(
         async move {
             let mut seq = seq;
             let (result, count) = gsub_run(&mut seq, src, pat, repl, max_n).await?;
-            seq.enter(|_ctx, locals, _exec, mut stack| {
-                let result = locals.fetch(&result);
-                stack.replace(&[result, Value::integer(count)]);
+            seq.enter(|ctx, locals, _exec, mut stack| {
+                let result = locals.fetch(ctx.mutation(), &result);
+                stack.replace(&[result, Value::integer(ctx.mutation(), count)]);
             });
             Ok(SequenceReturn::Return)
         }
@@ -1273,7 +1279,7 @@ impl OwnedCap {
     fn to_value<'gc>(&self, ctx: Context<'gc>) -> Value<'gc> {
         match self {
             OwnedCap::Bytes(b) => Value::string(LuaString::new(ctx, b)),
-            OwnedCap::Pos(n) => Value::integer(*n),
+            OwnedCap::Pos(n) => Value::integer(ctx.mutation(), *n),
         }
     }
 }
@@ -1416,7 +1422,7 @@ async fn table_index_repl(
         CallIndex(StashedFunction),
     }
     let plan = seq.try_enter(|ctx, locals, _exec, mut stack| {
-        let tbl = locals.fetch(t);
+        let tbl = locals.fetch(ctx.mutation(), t);
         let key_val = key.to_value(ctx);
         let v = tbl.raw_get(key_val);
         if !v.is_nil() {
@@ -1491,7 +1497,7 @@ fn lua_len<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let s = check_str(nctx.ctx, stack.get(0), "len", 1)?;
-    stack.replace(&[Value::integer(s.len() as i64)]);
+    stack.replace(&[Value::integer(nctx.ctx.mutation(), s.len() as i64)]);
     Ok(CallbackAction::Return)
 }
 

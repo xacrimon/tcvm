@@ -390,7 +390,7 @@ pub(super) fn lua_packsize<'gc>(
         }
     }
 
-    stack.replace(&[Value::integer(total as i64)]);
+    stack.replace(&[Value::integer(nctx.ctx.mutation(), total as i64)]);
     Ok(CallbackAction::Return)
 }
 
@@ -435,13 +435,10 @@ pub(super) fn lua_unpack<'gc>(
         pos += ntoalign;
         match opt {
             KOption::Int { signed } => {
-                out.push(Value::integer(unpack_int(
-                    ctx,
-                    &data[pos..],
-                    h.little,
-                    size,
-                    signed,
-                )?));
+                out.push(Value::integer(
+                    nctx.ctx.mutation(),
+                    unpack_int(ctx, &data[pos..], h.little, size, signed)?,
+                ));
             }
             KOption::Float => {
                 let val = if size == 4 {
@@ -490,7 +487,7 @@ pub(super) fn lua_unpack<'gc>(
         pos += size;
     }
 
-    out.push(Value::integer(pos as i64 + 1));
+    out.push(Value::integer(nctx.ctx.mutation(), pos as i64 + 1));
     stack.replace(&out);
     Ok(CallbackAction::Return)
 }

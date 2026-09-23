@@ -6,7 +6,7 @@ use foldhash::fast::RandomState;
 
 use super::defs::{Chunk, ExprDesc, ExprKind, JumpList, Numeral, RegisterIndex, VarargInfo, Want};
 use super::{CompileError, CompileErrorKind, LineNumber};
-use crate::dmm::Gc;
+use crate::dmm::{Gc, Mutation};
 use crate::env::function::LocVar;
 use crate::env::{LuaString, Prototype, value::Value};
 use crate::instruction::{
@@ -52,9 +52,9 @@ fn ice(msg: &'static str) -> CompileError {
 /// Convert a constant `ExprKind` to the runtime `Value` that should be
 /// stored in the constant table when discharging. Returns `None` for
 /// `Reg`/`Jump` kinds, which don't carry a constant value.
-fn const_kind_to_value<'gc>(kind: ExprKind) -> Option<Value<'gc>> {
+fn const_kind_to_value<'gc>(mc: &Mutation<'gc>, kind: ExprKind) -> Option<Value<'gc>> {
     match kind {
-        ExprKind::Numeral(Numeral::Int(n)) => Some(Value::integer(n)),
+        ExprKind::Numeral(Numeral::Int(n)) => Some(Value::integer(mc, n)),
         ExprKind::Numeral(Numeral::Float(f)) => Some(Value::float(f)),
         ExprKind::Bool(b) => Some(Value::boolean(b)),
         ExprKind::Nil => Some(Value::nil()),
@@ -62,9 +62,9 @@ fn const_kind_to_value<'gc>(kind: ExprKind) -> Option<Value<'gc>> {
     }
 }
 
-fn numeral_to_value<'gc>(n: Numeral) -> Value<'gc> {
+fn numeral_to_value<'gc>(mc: &Mutation<'gc>, n: Numeral) -> Value<'gc> {
     match n {
-        Numeral::Int(i) => Value::integer(i),
+        Numeral::Int(i) => Value::integer(mc, i),
         Numeral::Float(f) => Value::float(f),
     }
 }
@@ -97,7 +97,12 @@ fn numeral_is_zero(n: Numeral) -> bool {
 /// silently lose information (`-0.0` collapse, NaN-result float). Reuses
 /// the runtime helpers in `vm/num.rs` so folded results match runtime
 /// bit-for-bit.
-fn try_fold_binop(op: BinaryOperator, lhs: Numeral, rhs: Numeral) -> Option<Numeral> {
+fn try_fold_binop(
+    mc: &Mutation<'_>,
+    op: BinaryOperator,
+    lhs: Numeral,
+    rhs: Numeral,
+) -> Option<Numeral> {
     use crate::vm::num::{
         Add, BAnd, BOr, BXor, Div, IDiv, Mod, Mul, Pow, Shl, Shr, Sub, op_arith, op_bit,
     };
@@ -124,22 +129,22 @@ fn try_fold_binop(op: BinaryOperator, lhs: Numeral, rhs: Numeral) -> Option<Nume
         return None;
     }
 
-    let lv = numeral_to_value(lhs);
-    let rv = numeral_to_value(rhs);
+    let lv = numeral_to_value(mc, lhs);
+    let rv = numeral_to_value(mc, rhs);
 
     let result: Value<'_> = match op {
-        BinaryOperator::Add => op_arith::<Add>(lv, rv),
-        BinaryOperator::Sub => op_arith::<Sub>(lv, rv),
-        BinaryOperator::Mul => op_arith::<Mul>(lv, rv),
-        BinaryOperator::Div => op_arith::<Div>(lv, rv),
-        BinaryOperator::IntDiv => op_arith::<IDiv>(lv, rv),
-        BinaryOperator::Mod => op_arith::<Mod>(lv, rv),
-        BinaryOperator::Exp => op_arith::<Pow>(lv, rv),
-        BinaryOperator::BitAnd => op_bit::<BAnd>(lv, rv),
-        BinaryOperator::BitOr => op_bit::<BOr>(lv, rv),
-        BinaryOperator::BitXor => op_bit::<BXor>(lv, rv),
-        BinaryOperator::LShift => op_bit::<Shl>(lv, rv),
-        BinaryOperator::RShift => op_bit::<Shr>(lv, rv),
+        BinaryOperator::Add => op_arith::<Add>(mc, lv, rv),
+        BinaryOperator::Sub => op_arith::<Sub>(mc, lv, rv),
+        BinaryOperator::Mul => op_arith::<Mul>(mc, lv, rv),
+        BinaryOperator::Div => op_arith::<Div>(mc, lv, rv),
+        BinaryOperator::IntDiv => op_arith::<IDiv>(mc, lv, rv),
+        BinaryOperator::Mod => op_arith::<Mod>(mc, lv, rv),
+        BinaryOperator::Exp => op_arith::<Pow>(mc, lv, rv),
+        BinaryOperator::BitAnd => op_bit::<BAnd>(mc, lv, rv),
+        BinaryOperator::BitOr => op_bit::<BOr>(mc, lv, rv),
+        BinaryOperator::BitXor => op_bit::<BXor>(mc, lv, rv),
+        BinaryOperator::LShift => op_bit::<Shl>(mc, lv, rv),
+        BinaryOperator::RShift => op_bit::<Shr>(mc, lv, rv),
         _ => return None,
     }?;
 
@@ -1010,7 +1015,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         // The boolean fixup tail (LFALSESKIP / LOAD-true) is normally
         // skipped on this path because TESTSET-controlled jumps satisfy
         // `need_value` without it.
-        if let Some(value) = const_kind_to_value(expr.kind) {
+        if let Some(value) = const_kind_to_value(self.ctx.mutation(), expr.kind) {
             let idx = self.alloc_constant(value)?;
             let dst = self.dst_or_alloc(hint)?;
             self.emit(Instruction::load(dst, KIdx(idx)));
@@ -3274,7 +3279,7 @@ fn compile_expr_binary_op(
     if let (ExprKind::Numeral(l), ExprKind::Numeral(r)) = (lhs_desc.kind, rhs_desc.kind)
         && !lhs_desc.has_jumps()
         && !rhs_desc.has_jumps()
-        && let Some(folded) = try_fold_binop(op, l, r)
+        && let Some(folded) = try_fold_binop(ctx.ctx.mutation(), op, l, r)
     {
         return Ok(ExprDesc::from_numeral(folded));
     }
@@ -4289,7 +4294,7 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
             }
         } else {
             // Default step = 1
-            let one_idx = ctx.alloc_constant(Value::integer(1))?;
+            let one_idx = ctx.alloc_constant(Value::integer(ctx.ctx.mutation(), 1))?;
             ctx.emit(Instruction::load(step_reg, KIdx(one_idx)));
         }
 

@@ -2,7 +2,7 @@
 //! stringification and small argument-coercion routines used across the
 //! `basic`, `string`, `table`, and `io` libraries.
 
-use crate::dmm::Gc;
+use crate::dmm::{Gc, Mutation};
 use crate::env::{Error, LuaString, Value};
 use crate::lua::Context;
 
@@ -29,7 +29,7 @@ pub(crate) fn compare_error_msg<'gc>(a: Value<'gc>, b: Value<'gc>) -> String {
 /// anything non-numeric — notably `"inf"`/`"nan"`, which Rust's `f64::parse`
 /// would otherwise accept but Lua rejects. Shared by `tonumber` and
 /// `math.tointeger`.
-pub(crate) fn str_to_number<'gc>(b: &[u8]) -> Option<Value<'gc>> {
+pub(crate) fn str_to_number(b: &[u8]) -> Option<Number> {
     let s = std::str::from_utf8(b)
         .ok()?
         .trim_matches(|c: char| c.is_ascii_whitespace());
@@ -48,7 +48,7 @@ pub(crate) fn str_to_number<'gc>(b: &[u8]) -> Option<Value<'gc>> {
         // `.`/`p` means a hex float; otherwise a (wrapping) hex integer.
         if hex.contains(['.', 'p', 'P']) {
             let f = crate::parser::lit::parse_hex_float(body)?;
-            return Some(Value::float(if neg { -f } else { f }));
+            return Some(Number::Float(if neg { -f } else { f }));
         }
         let mut acc: u64 = 0;
         for c in hex.bytes() {
@@ -56,7 +56,7 @@ pub(crate) fn str_to_number<'gc>(b: &[u8]) -> Option<Value<'gc>> {
             acc = acc.wrapping_mul(16).wrapping_add(d);
         }
         let i = acc as i64;
-        return Some(Value::integer(if neg { i.wrapping_neg() } else { i }));
+        return Some(Number::Int(if neg { i.wrapping_neg() } else { i }));
     }
     // Decimal. Restrict to numeric characters so `f64::parse` can't sneak in
     // `inf`/`nan`/`infinity`.
@@ -68,9 +68,40 @@ pub(crate) fn str_to_number<'gc>(b: &[u8]) -> Option<Value<'gc>> {
         return None;
     }
     if let Ok(i) = s.parse::<i64>() {
-        return Some(Value::integer(i));
+        return Some(Number::Int(i));
     }
-    s.parse::<f64>().ok().map(Value::float)
+    s.parse::<f64>().ok().map(Number::Float)
+}
+
+/// A parsed numeral before it is materialized as a `Value`.
+#[derive(Clone, Copy)]
+pub(crate) enum Number {
+    Int(i64),
+    Float(f64),
+}
+
+impl Number {
+    pub(crate) fn into_value<'gc>(self, mc: &Mutation<'gc>) -> Value<'gc> {
+        match self {
+            Number::Int(i) => Value::integer(mc, i),
+            Number::Float(f) => Value::float(f),
+        }
+    }
+
+    pub(crate) fn to_float(self) -> f64 {
+        match self {
+            Number::Int(i) => i as f64,
+            Number::Float(f) => f,
+        }
+    }
+
+    /// The int/float rule of `math.tointeger`: floats only if exactly integral.
+    pub(crate) fn to_integer(self) -> Option<i64> {
+        match self {
+            Number::Int(i) => Some(i),
+            Number::Float(f) => float_to_integer(f),
+        }
+    }
 }
 
 /// Parse `b` as an integer written in `base` (2..=36), with optional
@@ -279,8 +310,7 @@ pub(crate) fn to_number<'gc>(v: Value<'gc>) -> Option<f64> {
     } else if let Some(s) = v.get_string() {
         // Via the lexer rules (`str_to_number`), not raw `f64::parse`, so
         // `"inf"`/`"nan"` are rejected as Lua's `luaL_checknumber` does.
-        let n = str_to_number(s.as_bytes())?;
-        n.get_integer().map(|i| i as f64).or_else(|| n.get_float())
+        Some(str_to_number(s.as_bytes())?.to_float())
     } else {
         None
     }
@@ -297,10 +327,7 @@ pub(crate) fn to_integer<'gc>(v: Value<'gc>) -> Option<i64> {
     }
     if let Some(s) = v.get_string() {
         // Same lexer-rule coercion as `to_number`, then the int/float rule.
-        let n = str_to_number(s.as_bytes())?;
-        return n
-            .get_integer()
-            .or_else(|| n.get_float().and_then(float_to_integer));
+        return str_to_number(s.as_bytes())?.to_integer();
     }
     None
 }
@@ -317,9 +344,9 @@ pub(crate) fn float_to_integer(f: f64) -> Option<i64> {
 
 /// Lua's `pushnumint`: an integral float collapses to an integer when it fits
 /// in `i64`, otherwise stays a float. Used by `math.floor`/`ceil`/`modf`.
-pub(crate) fn num_to_value<'gc>(f: f64) -> Value<'gc> {
+pub(crate) fn num_to_value<'gc>(mc: &Mutation<'gc>, f: f64) -> Value<'gc> {
     match float_to_integer(f) {
-        Some(i) => Value::integer(i),
+        Some(i) => Value::integer(mc, i),
         None => Value::float(f),
     }
 }

@@ -70,7 +70,7 @@ impl<'gc> Context<'gc> {
     }
 
     pub fn fetch<F: Fetchable>(self, f: &F) -> F::Fetched<'gc> {
-        f.fetch(self.state.roots)
+        f.fetch(self.mutation, self.state.roots)
     }
 
     /// Parse and compile `source` into a `Function`, with `_ENV` bound to the

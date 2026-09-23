@@ -85,7 +85,7 @@ fn lua_concat<'gc>(
     let mut out = Vec::new();
     let mut k = i;
     while k <= j {
-        let v = t.raw_get(Value::integer(k));
+        let v = t.raw_get(Value::integer(nctx.ctx.mutation(), k));
         if let Some(s) = v.get_string() {
             out.extend_from_slice(s.as_bytes());
         } else if let Some(n) = v.get_integer() {
@@ -150,7 +150,11 @@ fn lua_insert<'gc>(
     let n = t.raw_len() as i64;
     match stack.len() {
         2 => {
-            t.raw_set(nctx.ctx, Value::integer(n + 1), stack.get(1));
+            t.raw_set(
+                nctx.ctx,
+                Value::integer(nctx.ctx.mutation(), n + 1),
+                stack.get(1),
+            );
         }
         3 => {
             let pos = util::check_integer(nctx.ctx, stack.get(1), "insert", 2)?;
@@ -162,11 +166,15 @@ fn lua_insert<'gc>(
             }
             let mut k = n;
             while k >= pos {
-                let v = t.raw_get(Value::integer(k));
-                t.raw_set(nctx.ctx, Value::integer(k + 1), v);
+                let v = t.raw_get(Value::integer(nctx.ctx.mutation(), k));
+                t.raw_set(nctx.ctx, Value::integer(nctx.ctx.mutation(), k + 1), v);
                 k -= 1;
             }
-            t.raw_set(nctx.ctx, Value::integer(pos), stack.get(2));
+            t.raw_set(
+                nctx.ctx,
+                Value::integer(nctx.ctx.mutation(), pos),
+                stack.get(2),
+            );
         }
         _ => {
             return Err(Error::from_str(
@@ -219,14 +227,14 @@ fn lua_move<'gc>(
         // within the same table; the guards above keep `f + i` / `t + i` in range.
         if t > e || t <= f || !same {
             for i in 0..n {
-                let v = a1.raw_get(Value::integer(f + i));
-                a2.raw_set(nctx.ctx, Value::integer(t + i), v);
+                let v = a1.raw_get(Value::integer(nctx.ctx.mutation(), f + i));
+                a2.raw_set(nctx.ctx, Value::integer(nctx.ctx.mutation(), t + i), v);
             }
         } else {
             let mut i = n - 1;
             loop {
-                let v = a1.raw_get(Value::integer(f + i));
-                a2.raw_set(nctx.ctx, Value::integer(t + i), v);
+                let v = a1.raw_get(Value::integer(nctx.ctx.mutation(), f + i));
+                a2.raw_set(nctx.ctx, Value::integer(nctx.ctx.mutation(), t + i), v);
                 if i == 0 {
                     break;
                 }
@@ -247,12 +255,16 @@ fn lua_pack<'gc>(
     let n = stack.len();
     let t = Table::new(nctx.ctx);
     for i in 0..n {
-        t.raw_set(nctx.ctx, Value::integer(i as i64 + 1), stack.get(i));
+        t.raw_set(
+            nctx.ctx,
+            Value::integer(nctx.ctx.mutation(), i as i64 + 1),
+            stack.get(i),
+        );
     }
     t.raw_set(
         nctx.ctx,
         Value::string(LuaString::new(nctx.ctx, b"n")),
-        Value::integer(n as i64),
+        Value::integer(nctx.ctx.mutation(), n as i64),
     );
     stack.replace(&[Value::table(t)]);
     Ok(CallbackAction::Return)
@@ -279,14 +291,18 @@ fn lua_remove<'gc>(
             "bad argument #2 to 'remove' (position out of bounds)",
         ));
     }
-    let result = t.raw_get(Value::integer(pos));
+    let result = t.raw_get(Value::integer(nctx.ctx.mutation(), pos));
     let mut k = pos;
     while k < n {
-        let v = t.raw_get(Value::integer(k + 1));
-        t.raw_set(nctx.ctx, Value::integer(k), v);
+        let v = t.raw_get(Value::integer(nctx.ctx.mutation(), k + 1));
+        t.raw_set(nctx.ctx, Value::integer(nctx.ctx.mutation(), k), v);
         k += 1;
     }
-    t.raw_set(nctx.ctx, Value::integer(pos.max(n)), Value::nil());
+    t.raw_set(
+        nctx.ctx,
+        Value::integer(nctx.ctx.mutation(), pos.max(n)),
+        Value::nil(),
+    );
     stack.replace(&[result]);
     Ok(CallbackAction::Return)
 }
@@ -436,9 +452,9 @@ async fn sort_less(
         CallMeta(StashedFunction),
     }
     let plan = seq.try_enter(|ctx, locals, _exec, mut stack| {
-        let tbl = locals.fetch(t);
-        let a = tbl.raw_get(Value::integer(xi as i64));
-        let b = tbl.raw_get(Value::integer(yi as i64));
+        let tbl = locals.fetch(ctx.mutation(), t);
+        let a = tbl.raw_get(Value::integer(ctx.mutation(), xi as i64));
+        let b = tbl.raw_get(Value::integer(ctx.mutation(), yi as i64));
         if comp.is_some() {
             stack.replace(&[a, b]);
             return Ok(Plan::CallComp);
@@ -484,9 +500,9 @@ async fn sort_less(
 /// Swap `a[x]` and `a[y]` in place (raw, no metamethods).
 fn sort_swap(seq: &mut AsyncSequence, t: &StashedTable, x: usize, y: usize) {
     seq.enter(|ctx, locals, _exec, _stack| {
-        let tbl = locals.fetch(t);
-        let kx = Value::integer(x as i64);
-        let ky = Value::integer(y as i64);
+        let tbl = locals.fetch(ctx.mutation(), t);
+        let kx = Value::integer(ctx.mutation(), x as i64);
+        let ky = Value::integer(ctx.mutation(), y as i64);
         let vx = tbl.raw_get(kx);
         let vy = tbl.raw_get(ky);
         tbl.raw_set(ctx, kx, vy);
@@ -561,10 +577,10 @@ fn lua_unpack<'gc>(
     // past i64::MAX when `j == i64::MAX`.
     let mut k = i;
     while k < j {
-        out.push(t.raw_get(Value::integer(k)));
+        out.push(t.raw_get(Value::integer(nctx.ctx.mutation(), k)));
         k += 1;
     }
-    out.push(t.raw_get(Value::integer(j)));
+    out.push(t.raw_get(Value::integer(nctx.ctx.mutation(), j)));
     stack.replace(&out);
     Ok(CallbackAction::Return)
 }
