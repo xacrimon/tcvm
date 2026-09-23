@@ -1,6 +1,6 @@
 use crate::dmm::{Gc, Mutation, RefLock};
 use crate::env::function::{
-    FastCall, Function, FunctionKind, InlineCache, LuaFn, NativeClosure, NativeContext, Stack,
+    Function, FunctionKind, InlineCache, LuaFn, NativeClosure, NativeContext, Stack,
     Upvalue, UpvalueState,
 };
 use crate::env::shape::{MetamethodBits, Shape};
@@ -3101,7 +3101,7 @@ macro_rules! call_lua {
 /// R[func], ..., R[func+returns-2] = R[func](R[func+1], ..., R[func+args-1])
 ///
 /// Only the plain-function cases live here: a Lua closure is entered inline,
-/// a native one is handed to `op_call_fast`/`op_call_native`, and anything
+/// a native one jumps to its `entry`, and anything
 /// that needs the `__call` chain goes to `op_call_meta`. Keeping every call
 /// out of this handler keeps it frameless.
 #[inline(never)]
@@ -3154,20 +3154,8 @@ extern "rust-preserve-none" fn op_call<'gc>(
                 );
             }
             FunctionKind::Native(nc) => {
-                if nc.fast != FastCall::None {
-                    become op_call_fast(
-                        instruction,
-                        ctx,
-                        thread,
-                        registers,
-                        ip,
-                        handlers,
-                        ds,
-                        frame,
-                        closure,
-                    );
-                }
-                become op_call_native(
+                let entry = nc.entry;
+                become entry(
                     instruction,
                     ctx,
                     thread,
@@ -3244,105 +3232,11 @@ extern "rust-preserve-none" fn op_call_grow<'gc>(
     );
 }
 
-/// CALL of a builtin with a `FastCall` kind: run the common shape inline,
-/// writing the result straight into the function slot. Any other shape (arg
-/// count, type) falls through to the full implementation via `op_call_native`.
+/// CALL of a plain native function (no `__call` chain involved); the default
+/// `NativeClosure::entry`.
 #[inline(never)]
 #[rustc_align(32)]
-extern "rust-preserve-none" fn op_call_fast<'gc>(
-    instruction: Instruction,
-    ctx: Context<'gc>,
-    thread: &mut ThreadState<'gc>,
-    registers: Registers<'gc, '_>,
-    ip: *const Instruction,
-    handlers: *const (),
-    ds: &mut DispatchState<'gc>,
-    frame: *mut LuaFrame<'gc>,
-    closure: LuaFn<'gc>,
-) {
-    helpers!(
-        instruction,
-        ctx,
-        thread,
-        registers,
-        ip,
-        handlers,
-        ds,
-        frame,
-        closure
-    );
-    let (func, nargs, returns) = instruction.abc();
-    let fast = match reg!(func).get_function().map(|f| f.inner().as_ref()) {
-        Some(FunctionKind::Native(nc)) => nc.fast,
-        _ => FastCall::None,
-    };
-    if nargs == 2 {
-        let a = reg!(func + 1);
-        let dst = reg!(ref mut func);
-        // Boxed integers are left to the full builtin.
-        let hit = if a.is_float() {
-            let x = a.read_float();
-            match fast {
-                FastCall::Sqrt => dst.write_float(x.sqrt()),
-                FastCall::Abs => dst.write_float(x.abs()),
-                FastCall::Floor | FastCall::Ceil => {
-                    let r = if fast == FastCall::Floor {
-                        x.floor()
-                    } else {
-                        x.ceil()
-                    };
-                    // `as` saturates and maps NaN to 0, so the round trip only
-                    // holds for an integral `r` in i32 range (-0.0 becomes 0, as in Lua).
-                    let i = r as i32;
-                    *dst = if i as f64 == r {
-                        Value::small(i)
-                    } else {
-                        crate::builtin::util::num_to_value(ctx.mutation(), r)
-                    };
-                }
-                FastCall::None => {}
-            }
-            fast != FastCall::None
-        } else if let Some(i) = a.get_small() {
-            match fast {
-                FastCall::Sqrt => dst.write_float((i as f64).sqrt()),
-                // Only `abs(i32::MIN)` leaves the inline range.
-                FastCall::Abs => *dst = Value::integer(ctx.mutation(), (i as i64).abs()),
-                FastCall::Floor | FastCall::Ceil => *dst = a,
-                FastCall::None => {}
-            }
-            fast != FastCall::None
-        } else {
-            false
-        };
-        if hit {
-            if returns == 0 {
-                thread.set_top_unchecked(unsafe { (*frame).base } + func as usize + 1);
-            } else {
-                for i in 1..returns as usize - 1 {
-                    *reg!(ref mut func as usize + i) = Value::nil();
-                }
-            }
-            dispatch!();
-        }
-    }
-    become op_call_native(
-        instruction,
-        ctx,
-        thread,
-        registers,
-        ip,
-        handlers,
-        ds,
-        frame,
-        closure,
-    );
-}
-
-/// CALL of a plain native function (no `__call` chain involved).
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn op_call_native<'gc>(
+pub(crate) extern "rust-preserve-none" fn op_call_native<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
@@ -3375,6 +3269,118 @@ extern "rust-preserve-none" fn op_call_native<'gc>(
         nc, func_idx, nargs, returns, base, ctx, thread, registers, ip, ds, frame, closure
     );
 }
+
+/// What a one-argument math entry made of its argument.
+enum Math1 {
+    Float(f64),
+    Small(i32),
+    /// Not the common shape: leave the call to the full builtin.
+    Miss,
+}
+
+/// Defines the CALL entry (`NativeClosure::entry`) of a one-argument math
+/// builtin. `$float`/`$small` map a float or inline-integer argument to a
+/// `Math1`; every other shape, including extra arguments, goes to
+/// `op_call_native`. The result lands straight in the function slot.
+macro_rules! math1_entry {
+    ($name:ident, |$x:ident| $float:expr, |$i:ident| $small:expr) => {
+        #[inline(never)]
+        #[rustc_align(32)]
+        pub(crate) extern "rust-preserve-none" fn $name<'gc>(
+            instruction: Instruction,
+            ctx: Context<'gc>,
+            thread: &mut ThreadState<'gc>,
+            registers: Registers<'gc, '_>,
+            ip: *const Instruction,
+            handlers: *const (),
+            ds: &mut DispatchState<'gc>,
+            frame: *mut LuaFrame<'gc>,
+            closure: LuaFn<'gc>,
+        ) {
+            helpers!(
+                instruction,
+                ctx,
+                thread,
+                registers,
+                ip,
+                handlers,
+                ds,
+                frame,
+                closure
+            );
+            let (func, nargs, returns) = instruction.abc();
+            let result = if nargs != 2 {
+                Math1::Miss
+            } else {
+                // Read in place: `read_float` is a volatile load, and on a
+                // copy of the slot it would round-trip through the stack.
+                let arg = reg!(ref func + 1);
+                if arg.is_float() {
+                    let $x = arg.read_float();
+                    $float
+                } else if let Some($i) = arg.get_small() {
+                    $small
+                } else {
+                    Math1::Miss
+                }
+            };
+            let dst = reg!(ref mut func);
+            match result {
+                Math1::Float(f) => dst.write_float(f),
+                Math1::Small(i) => *dst = Value::small(i),
+                Math1::Miss => {
+                    become op_call_native(
+                        instruction,
+                        ctx,
+                        thread,
+                        registers,
+                        ip,
+                        handlers,
+                        ds,
+                        frame,
+                        closure,
+                    );
+                }
+            }
+            if returns == 0 {
+                thread.set_top_unchecked(unsafe { (*frame).base } + func as usize + 1);
+            } else {
+                unsafe {
+                    fill_nil(
+                        registers.add(func as usize + 1),
+                        (returns as usize).saturating_sub(2),
+                    )
+                };
+            }
+            dispatch!();
+        }
+    };
+}
+
+math1_entry!(ff_sqrt, |x| Math1::Float(x.sqrt()), |i| Math1::Float(f64::from(i).sqrt()));
+math1_entry!(ff_sin, |x| Math1::Float(x.sin()), |i| Math1::Float(f64::from(i).sin()));
+math1_entry!(ff_cos, |x| Math1::Float(x.cos()), |i| Math1::Float(f64::from(i).cos()));
+// `abs(i32::MIN)` leaves the inline range.
+math1_entry!(ff_abs, |x| Math1::Float(x.abs()), |i| i.checked_abs().map_or(Math1::Miss, Math1::Small));
+// A rounded float becomes an integer when it fits inline; the boxed range is
+// left to the builtin. `as` saturates and maps NaN to 0, so the round trip only
+// holds for an integral value in i32 range (-0.0 becomes 0, as in Lua).
+math1_entry!(
+    ff_floor,
+    |x| {
+        let r = x.floor();
+        if r as i32 as f64 == r { Math1::Small(r as i32) } else { Math1::Miss }
+    },
+    |i| Math1::Small(i)
+);
+math1_entry!(
+    ff_ceil,
+    |x| {
+        let r = x.ceil();
+        if r as i32 as f64 == r { Math1::Small(r as i32) } else { Math1::Miss }
+    },
+    |i| Math1::Small(i)
+);
 
 /// The `__call` slow path of CALL: walk the metamethod chain, then enter
 /// whatever it resolves to.
