@@ -10,8 +10,8 @@ use crate::lua::RuntimeError;
 use crate::lua::context::Context;
 use crate::lua::convert::{FromMultiValue, IntoMultiValue};
 use crate::vm;
+use crate::vm::interp::Continuation;
 use crate::vm::interp::{CallTarget, OpError};
-use crate::vm::interp::{Continuation, ContinuationPayload};
 use crate::vm::sequence::{
     BoxSequence, CallbackAction, Catch, Execution, Sequence, SequencePoll, Suspend,
     seq_trace_pointers,
@@ -897,19 +897,19 @@ fn apply_native_continuation<'gc>(
         .expect("native continuation must resume into a caller Lua frame")
         .base;
 
-    match cont.payload {
-        ContinuationPayload::StoreResult { dst } => {
+    match cont {
+        Continuation::StoreResult { dst } => {
             ts.stack[base + dst as usize] = result0;
         }
-        ContinuationPayload::IgnoreResult => {}
-        ContinuationPayload::CondJump { offset, inverted } => {
+        Continuation::IgnoreResult => {}
+        Continuation::CondJump { inverted } => {
             let truthy = !result0.is_falsy();
             if truthy != inverted {
                 let frame = ts.top_lua_mut().unwrap();
-                frame.pc = unsafe { frame.pc.offset(offset as isize) };
+                frame.pc = unsafe { frame.pc.add(1) };
             }
         }
-        ContinuationPayload::TForCall { base: reg, count } => {
+        Continuation::TForCall { base: reg, count } => {
             let dst = base + reg as usize + 3;
             let to_copy = retc.min(count as usize);
             for i in 0..to_copy {

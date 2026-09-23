@@ -165,34 +165,25 @@ pub(crate) type Handler = for<'gc> extern "rust-preserve-none" fn(
     closure: LuaFn<'gc>,
 );
 
-/// A pending fixup attached to a callee frame. When `op_return` sees this on
-/// the current frame, it fills in `results_base` and `nret`, then tail-calls
-/// `cont_resume`, which reads its own data from `thread.top_lua()`, pops the
-/// frame, restores caller state, applies the payload-specific fixup, and
-/// dispatches. `payload` fully determines the fixup, so no per-variant
-/// function pointer is stored.
+/// What the caller does with a metamethod's (or generic-for iterator's)
+/// results. Carried by the callee's frame (`HAS_CONT`), or by the `CallSite`
+/// of a native one that suspended. `cont_resume` finds the results at the
+/// callee's function slot, up to `top`.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Continuation {
-    pub payload: ContinuationPayload,
-    /// Stack index of the first returned value — written by `op_return`.
-    pub results_base: usize,
-    /// Number of values returned — written by `op_return`.
-    pub nret: u8,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum ContinuationPayload {
-    /// Place the first returned value (or Nil) into `R[dst]` of the caller.
+pub(crate) enum Continuation {
+    /// `R[dst]` = the first result, or nil.
     StoreResult { dst: u8 },
-    /// Discard results; used by `__newindex`, `__close`.
+    /// Discard the results (`__newindex`).
     IgnoreResult,
-    /// Coerce the first result to bool; if it matches (`!= inverted`), take a
-    /// jump of `offset` from the caller's resumed ip.
-    CondJump { offset: i32, inverted: bool },
-    /// Generic-for: copy up to `count` results into `R[base+4..]`, nil-filling
-    /// the shortfall.
+    /// Skip the comparison's following JMP when the first result's truthiness
+    /// differs from `inverted`.
+    CondJump { inverted: bool },
+    /// Generic for: `R[base+3 .. base+3+count]` = the results, nil-padded.
     TForCall { base: u8, count: u8 },
 }
+
+// Small enough to sit in a frame record's spare bytes.
+const _: () = assert!(std::mem::size_of::<Option<Continuation>>() == 3);
 
 macro_rules! helpers {
     ($instruction:expr, $ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr, $ds:ident, $frame:ident, $closure:ident) => {
@@ -408,9 +399,9 @@ macro_rules! apply_cont_payload {
      $ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr, $ds:ident) => {{
         let __cont: Continuation = $cont;
         let __results_base: usize = $results_base;
-        let __nret: usize = $nret as usize;
-        match __cont.payload {
-            ContinuationPayload::StoreResult { dst } => {
+        let __nret: usize = $nret;
+        match __cont {
+            Continuation::StoreResult { dst } => {
                 let __r = if __nret > 0 {
                     $thread.stack[__results_base]
                 } else {
@@ -419,21 +410,21 @@ macro_rules! apply_cont_payload {
                 *reg!(ref mut dst) = __r;
                 dispatch!();
             }
-            ContinuationPayload::IgnoreResult => {
+            Continuation::IgnoreResult => {
                 dispatch!();
             }
-            ContinuationPayload::CondJump { offset, inverted } => {
+            Continuation::CondJump { inverted } => {
                 let __r = if __nret > 0 {
                     $thread.stack[__results_base]
                 } else {
                     Value::nil()
                 };
                 if !__r.is_falsy() != inverted {
-                    $ip = unsafe { $ip.offset(offset as isize) };
+                    $ip = unsafe { $ip.add(1) };
                 }
                 dispatch!();
             }
-            ContinuationPayload::TForCall { base, count } => {
+            Continuation::TForCall { base, count } => {
                 // Destination registers are `base+3 .. base+3+count`; they must
                 // fit u8 register space, which bounds `count <= 253` (so the
                 // `count + 1` in the suspend path can't overflow `u8`).
@@ -492,11 +483,7 @@ macro_rules! table_get_slow_body {
                 func: __mm_func,
                 receiver: __mm_recv,
             } => {
-                let __cont = Continuation {
-                    payload: ContinuationPayload::StoreResult { dst: __dst_reg },
-                    results_base: 0,
-                    nret: 0,
-                };
+                let __cont = Continuation::StoreResult { dst: __dst_reg };
                 invoke_metamethod!(__mm_func, &[__mm_recv, __k], __cont, Index);
             }
             IndexChain::Exhausted => raise!(OpError::IndexChainLoop),
@@ -527,11 +514,7 @@ macro_rules! userdata_get_slow_body {
                 func: __mm_func,
                 receiver: __mm_recv,
             }) => {
-                let __cont = Continuation {
-                    payload: ContinuationPayload::StoreResult { dst: __dst_reg },
-                    results_base: 0,
-                    nret: 0,
-                };
+                let __cont = Continuation::StoreResult { dst: __dst_reg };
                 invoke_metamethod!(__mm_func, &[__mm_recv, __k], __cont, Index);
             }
             Ok(IndexChain::Exhausted) => raise!(OpError::IndexChainLoop),
@@ -560,11 +543,7 @@ macro_rules! table_set_slow_body {
                 func: __mm_func,
                 receiver: __mm_recv,
             } => {
-                let __cont = Continuation {
-                    payload: ContinuationPayload::IgnoreResult,
-                    results_base: 0,
-                    nret: 0,
-                };
+                let __cont = Continuation::IgnoreResult;
                 invoke_metamethod!(__mm_func, &[__mm_recv, __k, __new_val], __cont, Index);
             }
             NewIndexChain::Exhausted => raise!(OpError::NewIndexChainLoop),
@@ -1593,11 +1572,7 @@ extern "rust-preserve-none" fn op_self_slow<'gc>(
             // Functional __index. Pre-place self at dst+1; the
             // continuation writes the resolved method into dst.
             *reg!(ref mut (dst + 1)) = recv_val;
-            let cont = Continuation {
-                payload: ContinuationPayload::StoreResult { dst },
-                results_base: 0,
-                nret: 0,
-            };
+            let cont = Continuation::StoreResult { dst };
             invoke_metamethod!(func, &[receiver, key], cont, Index);
         }
         IndexChain::Exhausted => raise!(OpError::IndexChainLoop),
@@ -1655,11 +1630,7 @@ extern "rust-preserve-none" fn op_self_nontable<'gc>(
         }
         IndexChain::Invoke { func, receiver } => {
             *reg!(ref mut (dst + 1)) = recv_val;
-            let cont = Continuation {
-                payload: ContinuationPayload::StoreResult { dst },
-                results_base: 0,
-                nret: 0,
-            };
+            let cont = Continuation::StoreResult { dst };
             invoke_metamethod!(func, &[receiver, key], cont, Index);
         }
         IndexChain::Exhausted => raise!(OpError::IndexChainLoop),
@@ -1877,11 +1848,7 @@ macro_rules! binop_slow_body {
             raise!(OpError::$err(lhs, rhs));
         }
 
-        let cont = Continuation {
-            payload: ContinuationPayload::StoreResult { dst },
-            results_base: 0,
-            nret: 0,
-        };
+        let cont = Continuation::StoreResult { dst };
         invoke_metamethod!(meta_fn, &[lhs, rhs], cont);
     }};
 }
@@ -2146,11 +2113,7 @@ extern "rust-preserve-none" fn op_unm<'gc>(
     if meta_fn.is_nil() {
         raise!(OpError::Arith(val, val));
     }
-    let cont = Continuation {
-        payload: ContinuationPayload::StoreResult { dst },
-        results_base: 0,
-        nret: 0,
-    };
+    let cont = Continuation::StoreResult { dst };
     // Lua passes the operand twice for unary metamethods (spec quirk).
     invoke_metamethod!(meta_fn, &[val, val], cont);
 }
@@ -2194,11 +2157,7 @@ extern "rust-preserve-none" fn op_bnot<'gc>(
     if meta_fn.is_nil() {
         raise!(OpError::Bitwise(val, val));
     }
-    let cont = Continuation {
-        payload: ContinuationPayload::StoreResult { dst },
-        results_base: 0,
-        nret: 0,
-    };
+    let cont = Continuation::StoreResult { dst };
     invoke_metamethod!(meta_fn, &[val, val], cont);
 }
 
@@ -2279,11 +2238,7 @@ extern "rust-preserve-none" fn op_len<'gc>(
         raise!(OpError::Len(val))
     };
 
-    let cont = Continuation {
-        payload: ContinuationPayload::StoreResult { dst },
-        results_base: 0,
-        nret: 0,
-    };
+    let cont = Continuation::StoreResult { dst };
     invoke_metamethod!(meta_fn, &[val], cont);
 }
 
@@ -2325,11 +2280,7 @@ extern "rust-preserve-none" fn op_concat<'gc>(
     if meta_fn.is_nil() {
         raise!(OpError::Concat(a, b));
     }
-    let cont = Continuation {
-        payload: ContinuationPayload::StoreResult { dst },
-        results_base: 0,
-        nret: 0,
-    };
+    let cont = Continuation::StoreResult { dst };
     invoke_metamethod!(meta_fn, &[a, b], cont);
 }
 
@@ -2478,14 +2429,7 @@ extern "rust-preserve-none" fn op_eq<'gc>(
     if try_meta {
         let meta_fn = binop_metamethod(a, b, ctx.symbols().mm_eq);
         if !meta_fn.is_nil() {
-            let cont = Continuation {
-                payload: ContinuationPayload::CondJump {
-                    offset: 1,
-                    inverted,
-                },
-                results_base: 0,
-                nret: 0,
-            };
+            let cont = Continuation::CondJump { inverted };
             invoke_metamethod!(meta_fn, &[a, b], cont);
         }
     }
@@ -2553,14 +2497,7 @@ extern "rust-preserve-none" fn op_lt<'gc>(
     if meta_fn.is_nil() {
         raise!(OpError::Compare(a, b));
     }
-    let cont = Continuation {
-        payload: ContinuationPayload::CondJump {
-            offset: 1,
-            inverted,
-        },
-        results_base: 0,
-        nret: 0,
-    };
+    let cont = Continuation::CondJump { inverted };
     invoke_metamethod!(meta_fn, &[a, b], cont);
 }
 
@@ -2622,14 +2559,7 @@ extern "rust-preserve-none" fn op_le<'gc>(
     if meta_fn.is_nil() {
         raise!(OpError::Compare(a, b));
     }
-    let cont = Continuation {
-        payload: ContinuationPayload::CondJump {
-            offset: 1,
-            inverted,
-        },
-        results_base: 0,
-        nret: 0,
-    };
+    let cont = Continuation::CondJump { inverted };
     invoke_metamethod!(meta_fn, &[a, b], cont);
 }
 
@@ -2739,14 +2669,7 @@ macro_rules! cmp_imm_handler {
             if meta_fn.is_nil() {
                 raise!(OpError::Compare(a, b));
             }
-            let cont = Continuation {
-                payload: ContinuationPayload::CondJump {
-                    offset: 1,
-                    inverted,
-                },
-                results_base: 0,
-                nret: 0,
-            };
+            let cont = Continuation::CondJump { inverted };
             invoke_metamethod!(meta_fn, &[a, b], cont);
         }
     };
@@ -4159,11 +4082,7 @@ extern "rust-preserve-none" fn op_tforcall<'gc>(
     let iter = reg!(base);
     let state = reg!(base + 1);
     let control = reg!(base + 2);
-    let cont = Continuation {
-        payload: ContinuationPayload::TForCall { base, count },
-        results_base: 0,
-        nret: 0,
-    };
+    let cont = Continuation::TForCall { base, count };
     invoke_metamethod!(iter, &[state, control], cont);
 }
 
@@ -4756,9 +4675,9 @@ pub(crate) fn invoke_native<'gc>(
 /// `stack[values_base .. values_base + nret]`. Produced by [`frame_return`],
 /// consumed by `op_return` and the native-tailcall path in `op_tailcall`.
 pub(crate) enum FrameReturn {
-    /// A continuation was attached to the departing frame; caller must
-    /// tail-call `cont_resume`. The continuation's `results_base` / `nret`
-    /// have already been written back into the top frame.
+    /// A continuation was attached to the departing frame, which is still on
+    /// top with its results at its function slot, up to `top`; caller must
+    /// tail-call `cont_resume`.
     Continuation,
     /// The departing frame was the outermost one; thread is now `Result`.
     /// Caller should return from the handler.
@@ -4788,32 +4707,39 @@ pub(crate) fn frame_return<'gc>(
     values_base: usize,
     nret: usize,
 ) -> FrameReturn {
-    let (cur_base, num_results, num_extras, continuation) = {
+    let (cur_base, num_results, num_extras, has_cont) = {
         let f = unsafe { &*frame };
-        (f.base, f.num_results, f.num_extras as usize, f.continuation)
+        (
+            f.base,
+            f.num_results,
+            f.num_extras as usize,
+            f.continuation.is_some(),
+        )
     };
 
-    if let Some(mut cont) = continuation {
-        cont.results_base = values_base;
-        cont.nret = nret as u8;
-        unsafe { (*frame).continuation = Some(cont) };
-        return FrameReturn::Continuation;
-    }
-
-    // The func slot sits at `cur_base - 1 - num_extras`: VARARGPREP shifted
-    // base past the extras at `[cur_base - num_extras .. cur_base]` (0 for
-    // non-vararg frames).
+    // Before the results move: they may land on the frame's own registers.
     if frame_has_open_upvalues(thread, cur_base) {
         close_upvalues_slow(mc, thread, cur_base);
     }
     close_tbc_vars(mc, thread, cur_base);
+
+    // The func slot sits at `cur_base - 1 - num_extras`: VARARGPREP shifted
+    // base past the extras at `[cur_base - num_extras .. cur_base]` (0 for
+    // non-vararg frames).
+    let dst_start = cur_base - 1 - num_extras;
+
+    if has_cont {
+        thread
+            .stack
+            .copy_within(values_base..values_base + nret, dst_start);
+        thread.set_top_unchecked(dst_start + nret);
+        return FrameReturn::Continuation;
+    }
     // The top frame is the `Frame::Lua` read above and `LuaFrame` is `Copy`,
     // so there is nothing to drop; `Vec::pop` would copy the 96-byte frame out
     // and run the enum's drop glue.
     const { assert!(!std::mem::needs_drop::<LuaFrame<'_>>()) };
     unsafe { thread.frames.set_len(thread.frames.len() - 1) };
-
-    let dst_start = cur_base - 1 - num_extras;
 
     let (new_base, new_ip) = match thread.frames.last() {
         Some(Frame::Lua(caller)) => (caller.base, caller.pc),
@@ -5087,7 +5013,7 @@ pub(crate) enum MetaDispatch {
     /// Resolved to a native callback that returned synchronously. Its results
     /// sit at `stack[results_base .. results_base + nret]`; the caller applies
     /// the continuation payload inline.
-    NativeReturn { results_base: usize, nret: u8 },
+    NativeReturn { results_base: usize, nret: usize },
     /// Native callback suspended (Call/Yield/Resume/Sequence) or errored — a
     /// `pending_action` or `Frame::Error` was installed for the executor. The
     /// caller returns to exit dispatch.
@@ -5337,7 +5263,7 @@ fn schedule_native_meta_call<'gc>(
         CallbackAction::Return => {
             // Result count via the logical top; the staged scratch window sits
             // above the caller frame, so nothing shrank the caller's window.
-            let nret = (thread.top - args_base) as u8;
+            let nret = thread.top - args_base;
             MetaDispatch::NativeReturn {
                 results_base: args_base,
                 nret,
@@ -5379,52 +5305,13 @@ fn schedule_native_meta_call<'gc>(
     }
 }
 
-/// Shared skeleton used by every `cont_*` function: extract the continuation
-/// from the callee frame, cleanup, pop, restore caller state, then expose
-/// `$cont_out` to the caller's scope for payload-specific fixup. The
-/// continuation's `results_base` and `nret` remain valid post-pop because
-/// nothing is pushed to the stack during cleanup.
-macro_rules! finalize_return {
-    (
-        $instruction:expr, $ctx:expr, $thread:expr,
-        $registers:ident, $ip:ident, $handlers:expr, $ds:ident, $frame:ident, $closure:ident,
-        cont: $cont_out:ident
-    ) => {
-        helpers!(
-            $instruction,
-            $ctx,
-            $thread,
-            $registers,
-            $ip,
-            $handlers,
-            $ds,
-            $frame,
-            $closure
-        );
-
-        let $cont_out: Continuation = $thread.top_lua().unwrap().continuation.unwrap();
-        let __cur_base = $thread.top_lua().unwrap().base;
-
-        close_upvalues($ctx.mutation(), $thread, __cur_base);
-        close_tbc_vars($ctx.mutation(), $thread, __cur_base);
-        $thread.frames.pop();
-
-        ($frame, $closure) = top_frame($thread);
-        let __caller_base = unsafe {
-            $ip = (*$frame).pc;
-            (*$frame).base
-        };
-        $registers = unsafe { $thread.stack.as_mut_ptr().add(__caller_base) };
-    };
-}
-
 /// The single continuation entry point, tail-called by `op_return` /
 /// `op_tailcall` once a frame carrying a [`Continuation`] returns. Pops the
 /// callee frame, restores the caller's `ip`/`registers`, then applies the
-/// payload to the returned values (`stack[results_base .. +nret]`, written by
-/// `frame_return`). The synchronous-native path in `invoke_metamethod!`
-/// applies the same payload via `apply_cont_payload!` without this frame
-/// teardown, since no callee frame exists there.
+/// payload to the results `frame_return` left at the callee's function slot.
+/// The synchronous-native path in `invoke_metamethod!` applies the same
+/// payload via `apply_cont_payload!` without this frame teardown, since no
+/// callee frame exists there.
 #[inline(never)]
 #[rustc_align(32)]
 extern "rust-preserve-none" fn cont_resume<'gc>(
@@ -5438,11 +5325,34 @@ extern "rust-preserve-none" fn cont_resume<'gc>(
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
 ) {
-    finalize_return!(instruction, ctx, thread, registers, ip, handlers, ds, frame, closure, cont: cont);
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
+    let (cont, results_base) = {
+        let f = unsafe { &*frame };
+        let func_slot = f.base - 1 - f.num_extras as usize;
+        (f.continuation.unwrap(), func_slot)
+    };
+    // `frame_return` already closed upvalues and to-be-closed variables.
+    thread.frames.pop();
+    (frame, closure) = top_frame(thread);
+    let caller_base = unsafe {
+        ip = (*frame).pc;
+        (*frame).base
+    };
+    registers = unsafe { thread.stack.as_mut_ptr().add(caller_base) };
     apply_cont_payload!(
         cont,
-        cont.results_base,
-        cont.nret,
+        results_base,
+        thread.top - results_base,
         ctx,
         thread,
         registers,
