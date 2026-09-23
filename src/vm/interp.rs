@@ -398,28 +398,25 @@ macro_rules! apply_cont_payload {
     ($cont:expr, $results_base:expr, $nret:expr,
      $ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr, $ds:ident) => {{
         let __cont: Continuation = $cont;
-        let __results_base: usize = $results_base;
         let __nret: usize = $nret;
+        // The results sit in scratch above the caller's window, below `top`.
+        debug_assert!($results_base + __nret <= $thread.stack.len());
+        let __results = unsafe { $thread.stack.as_mut_ptr().add($results_base) };
+        let __first = if __nret > 0 {
+            unsafe { __results.read() }
+        } else {
+            Value::nil()
+        };
         match __cont {
             Continuation::StoreResult { dst } => {
-                let __r = if __nret > 0 {
-                    $thread.stack[__results_base]
-                } else {
-                    Value::nil()
-                };
-                *reg!(ref mut dst) = __r;
+                *reg!(ref mut dst) = __first;
                 dispatch!();
             }
             Continuation::IgnoreResult => {
                 dispatch!();
             }
             Continuation::CondJump { inverted } => {
-                let __r = if __nret > 0 {
-                    $thread.stack[__results_base]
-                } else {
-                    Value::nil()
-                };
-                if !__r.is_falsy() != inverted {
+                if !__first.is_falsy() != inverted {
                     $ip = unsafe { $ip.add(1) };
                 }
                 dispatch!();
@@ -433,11 +430,10 @@ macro_rules! apply_cont_payload {
                     "TFORCALL destination range exceeds u8 register space",
                 );
                 let __to_copy = __nret.min(count as usize);
-                for i in 0..__to_copy {
-                    *reg!(ref mut base + 3 + i as u8) = $thread.stack[__results_base + i];
-                }
-                for i in __to_copy..count as usize {
-                    *reg!(ref mut base + 3 + i as u8) = Value::nil();
+                unsafe {
+                    let dst = $registers.add(base as usize + 3);
+                    copy_values(dst, __results, __to_copy);
+                    fill_nil(dst.add(__to_copy), count as usize - __to_copy);
                 }
                 dispatch!();
             }
@@ -2863,6 +2859,26 @@ unsafe fn fill_nil<'gc>(mut p: *mut Value<'gc>, n: usize) {
     }
 }
 
+/// Copy `n` values from `src` to `dst`, element by element in ascending
+/// order, so `dst` may overlap `src` from below. Kept a loop like `fill_nil`.
+///
+/// # Safety
+/// Both ranges must be in bounds, and `dst <= src` if they overlap.
+#[inline(always)]
+unsafe fn copy_values<'gc>(mut dst: *mut Value<'gc>, mut src: *const Value<'gc>, n: usize) {
+    for _ in 0..n {
+        unsafe {
+            dst.write(src.read());
+            dst = dst.add(1);
+            src = src.add(1);
+        }
+        #[allow(clippy::pointers_in_nomem_asm_block)]
+        unsafe {
+            core::arch::asm!("/* {0} */", inout(reg) dst, options(nomem, nostack, preserves_flags));
+        }
+    }
+}
+
 /// The native arm of CALL: run the callback inline and land its results at
 /// `func_idx`. Expands inside a handler body (needs its `dispatch!`).
 macro_rules! call_native {
@@ -3543,6 +3559,14 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
 /// and `thread.top` is published: pop the frame and resume the Lua parent.
 macro_rules! return_to_parent {
     ($thread:ident, $registers:ident, $ip:ident, $frame:ident, $closure:ident) => {{
+        pop_to_parent!($thread, $registers, $ip, $frame, $closure);
+        dispatch!();
+    }};
+}
+
+/// Pop the running frame and rebind the handler state to its Lua parent.
+macro_rules! pop_to_parent {
+    ($thread:ident, $registers:ident, $ip:ident, $frame:ident, $closure:ident) => {{
         // `LuaFrame` is `Copy`, so nothing needs dropping.
         let n = $thread.frames.len();
         unsafe { $thread.frames.set_len(n - 1) };
@@ -3555,7 +3579,6 @@ macro_rules! return_to_parent {
         $closure = parent;
         $ip = new_ip;
         $registers = unsafe { $thread.stack.as_mut_ptr().add(new_base) };
-        dispatch!();
     }};
 }
 
@@ -3597,6 +3620,19 @@ extern "rust-preserve-none" fn op_return<'gc>(
     // `flags` covers continuation, open upvalues, TBC slots and a non-Lua
     // parent (see `frame_flags`); `count == 0` is MULTRET.
     if std::hint::unlikely(count == 0 || flags != 0) {
+        if count != 0 && flags == frame_flags::HAS_CONT {
+            become op_return_cont(
+                instruction,
+                ctx,
+                thread,
+                registers,
+                ip,
+                handlers,
+                ds,
+                frame,
+                closure,
+            );
+        }
         become op_return_slow(
             instruction,
             ctx,
@@ -3673,6 +3709,11 @@ extern "rust-preserve-none" fn op_return0<'gc>(
     };
     if std::hint::unlikely(flags != 0) {
         let generic = Instruction::ret(crate::instruction::Reg(0), 1);
+        if flags == frame_flags::HAS_CONT {
+            become op_return_cont(
+                generic, ctx, thread, registers, ip, handlers, ds, frame, closure,
+            );
+        }
         become op_return_slow(
             generic, ctx, thread, registers, ip, handlers, ds, frame, closure,
         );
@@ -3722,6 +3763,11 @@ extern "rust-preserve-none" fn op_return1<'gc>(
     };
     if std::hint::unlikely(flags != 0) {
         let generic = Instruction::ret(crate::instruction::Reg(value), 2);
+        if flags == frame_flags::HAS_CONT {
+            become op_return_cont(
+                generic, ctx, thread, registers, ip, handlers, ds, frame, closure,
+            );
+        }
         become op_return_slow(
             generic, ctx, thread, registers, ip, handlers, ds, frame, closure,
         );
@@ -3741,6 +3787,58 @@ extern "rust-preserve-none" fn op_return1<'gc>(
     unsafe { fill_nil(stack.add(dst_start + 1), wanted.saturating_sub(1)) };
     thread.set_top_unchecked(dst_start + wanted);
     return_to_parent!(thread, registers, ip, frame, closure);
+}
+
+/// RETURN of a fixed number of results from a metamethod or iterator frame
+/// with nothing to close. Such a frame's parent is always the Lua frame that
+/// invoked it, so this lands the results where `cont_resume` would read them,
+/// pops back to the parent and applies the continuation, without
+/// `frame_return`'s cleanup or a trip through `thread.frames`.
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn op_return_cont<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) {
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
+    let (values, count) = instruction.ab();
+    debug_assert!(count != 0);
+    let nret = count as usize - 1;
+    let (cont, func_slot, values_base) = {
+        let f = unsafe { &*frame };
+        debug_assert!(f.flags == frame_flags::HAS_CONT);
+        let func_slot = f.base() - 1 - f.num_extras as usize;
+        (f.continuation, func_slot, f.base() + values as usize)
+    };
+    // The function slot is below the values, inside the frame's window.
+    unsafe {
+        let stack = thread.stack.as_mut_ptr();
+        copy_values(stack.add(func_slot), stack.add(values_base), nret);
+    }
+    thread.set_top_unchecked(func_slot + nret);
+    pop_to_parent!(thread, registers, ip, frame, closure);
+    // `HAS_CONT` is set exactly when `continuation` is.
+    let cont = unsafe { cont.unwrap_unchecked() };
+    apply_cont_payload!(
+        cont, func_slot, nret, ctx, thread, registers, ip, handlers, ds
+    );
 }
 
 /// The general RETURN: MULTRET, continuations, open upvalues / to-be-closed
