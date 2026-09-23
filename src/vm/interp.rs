@@ -1698,6 +1698,10 @@ extern "rust-preserve-none" fn op_bnot<'gc>(
     helpers!(instruction, ctx, thread, registers, ip, handlers, ds);
     let (dst, src) = instruction.ab();
     let val = reg!(src);
+    if let Some(i) = val.get_small() {
+        *reg!(ref mut dst) = Value::small(!i);
+        dispatch!();
+    }
     if let Some(i) = val.get_integer() {
         *reg!(ref mut dst) = Value::integer(ctx.mutation(), !i);
         dispatch!();
@@ -2732,8 +2736,7 @@ extern "rust-preserve-none" fn op_forloop<'gc>(
     // the visible copy is `<const>` and never read here).
     let step = reg!(base + 1);
     if let Some(s) = step.get_small()
-        && let Some(last) = reg!(ref base).get_small()
-        && let Some(idx) = reg!(ref base + 2).get_small()
+        && let Some((last, idx)) = Value::both_small(reg!(ref base), reg!(ref base + 2))
     {
         // `idx` walks init, init+step, ..., last exactly, so `idx != last`
         // also guarantees `idx + step` stays in range.
