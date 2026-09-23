@@ -3,7 +3,7 @@ use std::pin::Pin;
 use crate::dmm::{Collect, Gc, RefLock, Trace};
 use crate::env::function::Function;
 use crate::env::thread::{
-    CallSite, Frame, LuaFrame, MAX_STACK, PendingAction, ThreadState, ThreadStatus,
+    CallSite, ExecKind, LuaFrame, MAX_STACK, PendingAction, ThreadState, ThreadStatus,
 };
 use crate::env::{Error, LuaString, Stack, Thread, Value};
 use crate::lua::RuntimeError;
@@ -79,7 +79,7 @@ impl<'gc> Executor<'gc> {
     /// executor. Any previous state on the main thread is cleared.
     ///
     /// Lua and native entry share the same shape: args at `stack[0..]`
-    /// and a `Frame::Start(function)` on top. The driver's `Frame::Start`
+    /// and a `ExecKind::Start(function)` on top. The driver's `ExecKind::Start`
     /// handler builds the call frame on first dispatch.
     pub fn start<A: IntoMultiValue<'gc>>(
         ctx: Context<'gc>,
@@ -94,12 +94,12 @@ impl<'gc> Executor<'gc> {
 
             let mut ts = thread.borrow_mut(mc);
             ts.discard_above(0);
-            ts.frames.clear();
+            ts.clear_frames();
             ts.open_upvalues.clear();
             ts.tbc_slots.clear();
 
             ts.set_window(0, buf);
-            ts.frames.push(Frame::Start(function));
+            ts.push_exec(ExecKind::Start(function));
             ts.status = ThreadStatus::Suspended;
         }
 
@@ -152,7 +152,7 @@ impl<'gc> Executor<'gc> {
             // (1) Inner-thread propagation. If the top thread terminated
             // (Result) or yielded (Suspended) and we're not the bottom of
             // the executor stack, hand its values off to the resumer's
-            // `Frame::WaitThread` and continue.
+            // `ExecKind::WaitThread` and continue.
             let stack_len = self.0.borrow().thread_stack.len();
             if stack_len > 1 {
                 match top.status() {
@@ -188,7 +188,7 @@ impl<'gc> Executor<'gc> {
                     // Top thread (== main) is suspended at the bottom of
                     // the executor stack. yield_bottom == Some means it
                     // yielded to the host; yield_bottom == None means
-                    // it's freshly seeded (Frame::Start on top), which
+                    // it's freshly seeded (ExecKind::Start on top), which
                     // the dispatch step below handles. Don't conflate.
                     let values: Option<Vec<Value<'gc>>> = {
                         let ts = top.borrow();
@@ -225,12 +225,12 @@ impl<'gc> Executor<'gc> {
             }
             let kind = {
                 let ts = top.borrow();
-                match ts.frames.last() {
-                    Some(Frame::Lua(_)) => FrameKind::Lua,
-                    Some(Frame::Sequence { .. }) => FrameKind::Sequence,
-                    Some(Frame::Start(_)) => FrameKind::Start,
-                    Some(Frame::WaitThread { .. }) => FrameKind::WaitThread,
-                    Some(Frame::Error(_)) => FrameKind::Error,
+                match ts.top_exec() {
+                    None if ts.top_is_lua() => FrameKind::Lua,
+                    Some(ExecKind::Sequence { .. }) => FrameKind::Sequence,
+                    Some(ExecKind::Start(_)) => FrameKind::Start,
+                    Some(ExecKind::WaitThread { .. }) => FrameKind::WaitThread,
+                    Some(ExecKind::Error(_)) => FrameKind::Error,
                     None => unreachable!(
                         "active thread with empty frames violates the executor invariant"
                     ),
@@ -247,18 +247,18 @@ impl<'gc> Executor<'gc> {
                     }
                 }
                 FrameKind::Start => {
-                    // First-resume / first-dispatch. Pop Frame::Start(f),
+                    // First-resume / first-dispatch. Pop ExecKind::Start(f),
                     // insert the function before the args, and delegate
                     // to schedule_call_at — which builds a LuaFrame for a
                     // Lua callee or invokes a native one inline.
                     let mut ts = top.borrow_mut(mc);
-                    let f = match ts.frames.pop() {
-                        Some(Frame::Start(f)) => f,
+                    let f = match ts.pop_exec() {
+                        Some(ExecKind::Start(f)) => f,
                         _ => unreachable!(),
                     };
                     ts.insert_at(0, Value::function(f));
                     schedule_call_at(&mut ts, ctx, 0, 0)?;
-                    if ts.frames.is_empty() && ts.pending_action.is_none() {
+                    if ts.frames_empty() && ts.pending_action.is_none() {
                         // Native entry returned `Return` synchronously;
                         // results sit at stack[0..] and the thread is
                         // done.
@@ -361,7 +361,7 @@ impl<'gc> Executor<'gc> {
             let mc = ctx.mutation();
             let mut ts = thread.borrow_mut(mc);
             ts.discard_above(0);
-            ts.frames.clear();
+            ts.clear_frames();
             ts.open_upvalues.clear();
             ts.tbc_slots.clear();
             ts.status = ThreadStatus::Stopped;
@@ -392,7 +392,7 @@ fn apply_pending_action<'gc>(
     match *action {
         Suspend::Sequence(seq) => {
             let mut ts = top.borrow_mut(mc);
-            ts.frames.push(Frame::Sequence {
+            ts.push_exec(ExecKind::Sequence {
                 seq,
                 call_site,
                 pending_error: None,
@@ -406,11 +406,11 @@ fn apply_pending_action<'gc>(
             //
             // We push `then` BEFORE scheduling the call so that if the
             // callee can't be resolved or errors immediately, the
-            // Frame::Error lands above this sequence and the unwinder
+            // ExecKind::Error lands above this sequence and the unwinder
             // routes the error to it.
             let slot = match then {
                 Some(seq) => {
-                    ts.frames.push(Frame::Sequence {
+                    ts.push_exec(ExecKind::Sequence {
                         seq,
                         call_site,
                         pending_error: None,
@@ -438,7 +438,7 @@ fn apply_pending_action<'gc>(
                 call_site
             };
             if let Some(seq) = then {
-                ts.frames.push(Frame::Sequence {
+                ts.push_exec(ExecKind::Sequence {
                     seq,
                     call_site,
                     pending_error: None,
@@ -459,7 +459,7 @@ fn apply_pending_action<'gc>(
                 call_site
             };
             if let Some(seq) = then {
-                top.borrow_mut(mc).frames.push(Frame::Sequence {
+                top.borrow_mut(mc).push_exec(ExecKind::Sequence {
                     seq,
                     call_site,
                     pending_error: None,
@@ -473,7 +473,7 @@ fn apply_pending_action<'gc>(
 
 /// Hand off control from `resumer` to `target`.
 ///
-/// Pushes a `Frame::WaitThread { wt }` onto the resumer (this is what
+/// Pushes a `ExecKind::WaitThread { wt }` onto the resumer (this is what
 /// `propagate_inner_to_resumer` will pop when the target eventually
 /// yields/returns), drains the resume-args from
 /// `resumer.stack[args_abs_bottom..]`, transitions the target into
@@ -494,7 +494,7 @@ fn schedule_thread_resume<'gc>(
     let mc = ctx.mutation();
     {
         let mut rs = resumer.borrow_mut(mc);
-        rs.frames.push(Frame::WaitThread { call_site: wt });
+        rs.push_exec(ExecKind::WaitThread { call_site: wt });
         rs.status = ThreadStatus::Normal;
     }
     let args: Vec<Value<'gc>> = {
@@ -504,10 +504,10 @@ fn schedule_thread_resume<'gc>(
     {
         let mut ts = target.borrow_mut(mc);
         if matches!(ts.status, ThreadStatus::Suspended)
-            && matches!(ts.frames.last(), Some(Frame::Start(_)))
+            && matches!(ts.top_exec(), Some(ExecKind::Start(_)))
         {
             // First-resume: stash args at the bottom of the stack; the
-            // `Frame::Start` handler sets up the call frame on next pump.
+            // `ExecKind::Start` handler sets up the call frame on next pump.
             ts.discard_above(0);
             ts.set_window(0, args);
             ts.status = ThreadStatus::Normal;
@@ -588,7 +588,7 @@ fn schedule_call_at<'gc>(
         let action = match vm::interp::invoke_native(ctx, ts, nc, args_base, argc) {
             Ok(a) => a,
             Err(e) => {
-                // Mirror op_call's native-error path: push Frame::Error so the
+                // Mirror op_call's native-error path: push ExecKind::Error so the
                 // executor unwinder can find the nearest Sequence catcher
                 // (e.g. a PCallSequence wrapping coroutine.resume). Returning
                 // Err here would short-circuit past any catcher pushed by
@@ -633,7 +633,7 @@ enum PumpOutcome {
     Pending,
 }
 
-/// Pump a `Frame::Sequence` on top of `top`. Pops the frame, invokes
+/// Pump a `ExecKind::Sequence` on top of `top`. Pops the frame, invokes
 /// `seq.poll()` (or `seq.error()` if `pending_error.is_some()`), and
 /// translates the [`SequencePoll`] back to frame ops.
 fn pump_sequence<'gc>(
@@ -646,13 +646,13 @@ fn pump_sequence<'gc>(
     // Pop the sequence frame and call poll/error.
     let (mut seq, call_site, pending_error) = {
         let mut ts = top.borrow_mut(mc);
-        match ts.frames.pop() {
-            Some(Frame::Sequence {
+        match ts.pop_exec() {
+            Some(ExecKind::Sequence {
                 seq,
                 call_site,
                 pending_error,
             }) => (seq, call_site, pending_error),
-            _ => unreachable!("pump_sequence: top wasn't Frame::Sequence"),
+            _ => unreachable!("pump_sequence: top wasn't ExecKind::Sequence"),
         }
     };
     // The sequence's input values are the window `stack[call_site.bottom..top]`,
@@ -670,7 +670,7 @@ fn pump_sequence<'gc>(
     };
     match poll_result {
         Ok(SequencePoll::Pending) => {
-            top.borrow_mut(mc).frames.push(Frame::Sequence {
+            top.borrow_mut(mc).push_exec(ExecKind::Sequence {
                 seq,
                 call_site,
                 pending_error: None,
@@ -690,7 +690,7 @@ fn pump_sequence<'gc>(
             let abs_bottom = call_site.bottom + rel;
             let mut ts = top.borrow_mut(mc);
             // Re-push self to be re-polled with results at stack[bottom..].
-            ts.frames.push(Frame::Sequence {
+            ts.push_exec(ExecKind::Sequence {
                 seq,
                 call_site,
                 pending_error: None,
@@ -723,7 +723,7 @@ fn pump_sequence<'gc>(
             let abs_bottom = call_site.bottom + rel;
             let mut ts = top.borrow_mut(mc);
             // Re-push self to be re-polled with resume-args at stack[bottom..].
-            ts.frames.push(Frame::Sequence {
+            ts.push_exec(ExecKind::Sequence {
                 seq,
                 call_site,
                 pending_error: None,
@@ -744,7 +744,7 @@ fn pump_sequence<'gc>(
             // sequence beneath the WaitThread and lands target's
             // eventual values at seq.bottom for the next poll.
             let abs_bottom = call_site.bottom + rel;
-            top.borrow_mut(mc).frames.push(Frame::Sequence {
+            top.borrow_mut(mc).push_exec(ExecKind::Sequence {
                 seq,
                 call_site,
                 pending_error: None,
@@ -765,9 +765,9 @@ fn pump_sequence<'gc>(
 }
 
 /// After an inner thread terminated or yielded, transfer its result-bottom
-/// values to the resumer's `Frame::WaitThread`, pop both, and let the
-/// resumer continue (the next driver pump finds either a `Frame::Sequence`
-/// or a `Frame::Lua` ready to resume).
+/// values to the resumer's `ExecKind::WaitThread`, pop both, and let the
+/// resumer continue (the next driver pump finds either a `ExecKind::Sequence`
+/// or a Lua frame ready to resume).
 fn propagate_inner_to_resumer<'gc>(
     exec: Executor<'gc>,
     ctx: Context<'gc>,
@@ -791,8 +791,8 @@ fn propagate_inner_to_resumer<'gc>(
     }
     let resumer = *exec.0.borrow().thread_stack.last().unwrap();
     let mut rs = resumer.borrow_mut(mc);
-    let wt = match rs.frames.pop() {
-        Some(Frame::WaitThread { call_site }) => call_site,
+    let wt = match rs.pop_exec() {
+        Some(ExecKind::WaitThread { call_site }) => call_site,
         _ => unreachable!("propagate_inner_to_resumer: resumer top is not WaitThread"),
     };
     rs.set_window(wt.bottom, values);
@@ -864,7 +864,7 @@ fn land_call_results<'gc>(ts: &mut crate::env::thread::ThreadState<'gc>, cs: Cal
     // the function, and everything at or above a call's function slot is free
     // scratch in the caller's register allocation.
     ts.set_top(func_idx + if returns == 0 { retc } else { wanted });
-    if ts.frames.is_empty() {
+    if ts.frames_empty() {
         ts.status = ThreadStatus::Result { bottom: func_idx };
     }
 }
@@ -957,7 +957,7 @@ fn run_message_handler<'gc>(
         depth: 0,
         saved_limit,
     };
-    ts.frames.push(Frame::Sequence {
+    ts.push_exec(ExecKind::Sequence {
         seq: BoxSequence::new(ctx.mutation(), seq),
         call_site: CallSite {
             bottom: slot,
@@ -1044,7 +1044,7 @@ impl<'gc> Sequence<'gc> for HandlerSequence<'gc> {
 /// `run_message_handler`.
 ///
 /// On no-catcher: if the thread isn't the bottom of the executor's
-/// thread stack, route the error to the resumer's `Frame::WaitThread`
+/// thread stack, route the error to the resumer's `ExecKind::WaitThread`
 /// and pop the inner thread. This lets a coroutine error propagate to
 /// the resumer's `ProtectedCall::error`. If the thread *is* the bottom,
 /// surface as `RuntimeError::Lua` to the host.
@@ -1055,7 +1055,7 @@ fn unwind_error<'gc>(
 ) -> Result<(), RuntimeError> {
     let mc = ctx.mutation();
     let mut ts = top.borrow_mut(mc);
-    let Some(Frame::Error(err)) = ts.frames.pop() else {
+    let Some(ExecKind::Error(err)) = ts.pop_exec() else {
         unreachable!()
     };
     if !err.is_handled() {
@@ -1063,11 +1063,11 @@ fn unwind_error<'gc>(
         // a plain `pcall` in between shadows an outer `xpcall`, while a
         // `Catch::Pass` sequence is looked through.
         let handler = ts
-            .frames
+            .exec_frames
             .iter()
             .rev()
-            .find_map(|f| match f {
-                Frame::Sequence { seq, .. } => match seq.catch() {
+            .find_map(|f| match &f.kind {
+                ExecKind::Sequence { seq, .. } => match seq.catch() {
                     Catch::Pass => None,
                     Catch::Here(handler) => Some(handler),
                 },
@@ -1086,37 +1086,36 @@ fn unwind_error<'gc>(
         err
     };
     loop {
-        match ts.frames.last_mut() {
-            Some(Frame::Lua(lf)) => {
-                let base = lf.base;
-                ts.frames.pop();
-                vm::interp::close_upvalues(mc, &mut ts, base);
-                vm::interp::close_tbc_vars(mc, &mut ts, base);
-                // The frame and everything above it is dead, so this is one
-                // of the few places a shrink is legal.
-                ts.discard_above(base);
-            }
-            Some(Frame::Sequence {
+        if let Some(lf) = ts.top_lua() {
+            let base = lf.base;
+            ts.pop_lua();
+            vm::interp::close_upvalues(mc, &mut ts, base);
+            vm::interp::close_tbc_vars(mc, &mut ts, base);
+            // The frame and everything above it is dead, so this is one
+            // of the few places a shrink is legal.
+            ts.discard_above(base);
+            continue;
+        }
+        match ts.top_exec_mut() {
+            Some(ExecKind::Sequence {
                 seq, pending_error, ..
             }) => {
                 if matches!(seq.catch(), Catch::Pass) {
-                    ts.frames.pop();
+                    ts.pop_exec();
                     continue;
                 }
                 *pending_error = Some(err);
                 return Ok(());
             }
-            Some(Frame::WaitThread { .. }) => {
-                ts.frames.pop();
+            Some(ExecKind::WaitThread { .. }) => {
+                ts.pop_exec();
             }
-            Some(Frame::Start(_) | Frame::Error(_)) => {
-                // Frame::Start is only on a freshly-created thread that
-                // hasn't run yet, so it can't have errored. Frame::Error is
-                // removed by the next driver pump (which enters this
-                // function), so two can't coexist.
-                unreachable!(
-                    "Frame::Start / Frame::Error mid-unwind violates the executor invariant"
-                );
+            Some(ExecKind::Start(_) | ExecKind::Error(_)) => {
+                // `Start` is only on a freshly-created thread that hasn't run
+                // yet, so it can't have errored. `Error` is removed by the next
+                // driver pump (which enters this function), so two can't
+                // coexist.
+                unreachable!("Start / Error frame mid-unwind violates the executor invariant");
             }
             None => break,
         }
@@ -1141,12 +1140,12 @@ fn unwind_error<'gc>(
         let resumer = *exec.0.borrow().thread_stack.last().unwrap();
         let mut rs = resumer.borrow_mut(mc);
         // Pop the WaitThread.
-        match rs.frames.pop() {
-            Some(Frame::WaitThread { .. }) => {}
+        match rs.pop_exec() {
+            Some(ExecKind::WaitThread { .. }) => {}
             _ => unreachable!("inner-thread error: resumer top isn't WaitThread"),
         }
         // Already located on the inner thread; don't re-raise on the resumer.
-        rs.frames.push(Frame::Error(err));
+        rs.push_exec(ExecKind::Error(err));
         rs.status = ThreadStatus::Normal;
         return Ok(());
     }

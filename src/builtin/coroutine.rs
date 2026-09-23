@@ -3,7 +3,7 @@ use std::pin::Pin;
 use crate::Context;
 use crate::builtin::basic::ProtectedCall;
 use crate::dmm::{Collect, Trace};
-use crate::env::thread::{Frame, ThreadStatus};
+use crate::env::thread::{ExecKind, ThreadStatus};
 use crate::env::{
     Error, Function, LuaString, NativeContext, NativeFn, Stack, Table, Thread, Value,
 };
@@ -33,7 +33,7 @@ pub fn load<'gc>(ctx: Context<'gc>) {
 }
 
 /// `coroutine.create(f)` — allocate a fresh `Thread`, prime it with a
-/// `Frame::Start(f)`, return it.
+/// `ExecKind::Start(f)`, return it.
 fn lua_create<'gc>(
     nctx: NativeContext<'gc, '_>,
     mut stack: Stack<'gc, '_>,
@@ -45,7 +45,7 @@ fn lua_create<'gc>(
     {
         let mc = nctx.ctx.mutation();
         let mut ts = thread.borrow_mut(mc);
-        ts.frames.push(Frame::Start(f));
+        ts.push_exec(ExecKind::Start(f));
         ts.status = ThreadStatus::Suspended;
     }
     stack.ret1(Value::thread(thread));
@@ -175,7 +175,7 @@ fn lua_wrap<'gc>(
     {
         let mc = nctx.ctx.mutation();
         let mut ts = thread.borrow_mut(mc);
-        ts.frames.push(Frame::Start(f));
+        ts.push_exec(ExecKind::Start(f));
         ts.status = ThreadStatus::Suspended;
     }
     let upvalues: Box<[Value<'gc>]> = Box::new([Value::thread(thread)]);
@@ -216,7 +216,7 @@ fn lua_close<'gc>(
             let mc = nctx.ctx.mutation();
             let mut ts = co.borrow_mut(mc);
             ts.stack.clear();
-            ts.frames.clear();
+            ts.clear_frames();
             ts.open_upvalues.clear();
             ts.tbc_slots.clear();
             ts.pending_action = None;

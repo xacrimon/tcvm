@@ -310,10 +310,10 @@ impl<'gc, 'a> Stack<'gc, 'a> {
         }
     }
 
-    /// The running thread's call frames, innermost last. Hidden because it
-    /// exposes the raw `Frame` layout; for tests and the debug library.
+    /// The running thread's Lua frames, innermost last. Hidden because it
+    /// exposes the raw `LuaFrame` layout; for tests and the debug library.
     #[doc(hidden)]
-    pub fn frames(&self) -> &[crate::env::thread::Frame<'gc>] {
+    pub fn lua_frames(&self) -> &[crate::env::thread::LuaFrame<'gc>] {
         &self.thread.frames
     }
 
