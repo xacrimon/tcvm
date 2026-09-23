@@ -118,14 +118,10 @@ fn to_float(v: &Value) -> Option<f64> {
     }
 }
 
-/// The mixed int/float arm. Callers must have excluded same-type operands
-/// first, so this never sees int-int and needs no zero-divisor guard.
+/// Float arithmetic after coercing both operands. Callers must have excluded int-int, which
+/// needs integer semantics and a zero-divisor guard.
 #[inline(always)]
-pub fn op_arith_mixed<'gc, Op: ArithOp>(
-    _mc: &Mutation<'gc>,
-    lhs: &Value,
-    rhs: &Value,
-) -> Option<Value<'gc>> {
+pub fn op_arith_mixed<'gc, Op: ArithOp>(lhs: &Value, rhs: &Value) -> Option<Value<'gc>> {
     let lhs = to_float(lhs)?;
     let rhs = to_float(rhs)?;
 
@@ -187,7 +183,7 @@ pub fn op_arith_slow<'gc, Op: ArithOp>(
             },
         };
     }
-    match op_arith_mixed::<Op>(mc, &lhs, &rhs) {
+    match op_arith_mixed::<Op>(&lhs, &rhs) {
         Some(v) => SlowNum::Value(v),
         None => SlowNum::NotNumbers,
     }
@@ -365,6 +361,8 @@ impl ArithOp for Div {
 pub struct IDiv;
 
 impl ArithOp for IDiv {
+    const ZERO_DIVISOR: Option<ZeroDivisor> = Some(ZeroDivisor::Div);
+
     #[inline(always)]
     fn small<'gc>(lhs: i32, rhs: i32) -> Option<Value<'gc>> {
         let q = lhs.checked_div(rhs)?;
@@ -373,8 +371,6 @@ impl ArithOp for IDiv {
         let adjusted = if r != 0 && (lhs ^ rhs) < 0 { q - 1 } else { q };
         Some(Value::small(adjusted))
     }
-
-    const ZERO_DIVISOR: Option<ZeroDivisor> = Some(ZeroDivisor::Div);
 
     #[inline(always)]
     fn int<'gc>(mc: &Mutation<'gc>, lhs: i64, rhs: i64) -> Value<'gc> {
