@@ -569,7 +569,7 @@ fn schedule_call_at<'gc>(
         }
         ts.push_lua(LuaFrame {
             closure,
-            base,
+            base: base as u32,
             pc: closure.proto.code.as_ptr(),
             num_results: caller_returns,
             flags: 0,
@@ -846,7 +846,7 @@ fn land_call_results<'gc>(ts: &mut crate::env::thread::ThreadState<'gc>, cs: Cal
     // raw pointer the moment we hand control back.
     let needed = match ts.top_lua() {
         Some(frame) => {
-            (func_idx + wanted).max(frame.base + frame.closure.proto.max_stack_size as usize)
+            (func_idx + wanted).max(frame.base() + frame.closure.proto.max_stack_size as usize)
         }
         None => func_idx + wanted,
     };
@@ -895,7 +895,7 @@ fn apply_native_continuation<'gc>(
     let base = ts
         .top_lua()
         .expect("native continuation must resume into a caller Lua frame")
-        .base;
+        .base();
 
     match cont {
         Continuation::StoreResult { dst } => {
@@ -927,7 +927,7 @@ fn apply_native_continuation<'gc>(
     // before the interpreter re-derives its raw register pointer off `base`.
     let caller_top = {
         let frame = ts.top_lua().unwrap();
-        frame.base + frame.closure.proto.max_stack_size as usize
+        frame.base() + frame.closure.proto.max_stack_size as usize
     };
     ts.set_top(caller_top);
 }
@@ -1087,7 +1087,7 @@ fn unwind_error<'gc>(
     };
     loop {
         if let Some(lf) = ts.top_lua() {
-            let base = lf.base;
+            let base = lf.base();
             ts.pop_lua();
             vm::interp::close_upvalues(mc, &mut ts, base);
             vm::interp::close_tbc_vars(mc, &mut ts, base);

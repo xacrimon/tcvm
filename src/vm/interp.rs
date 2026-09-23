@@ -353,7 +353,7 @@ macro_rules! helpers {
                         // payload writes through it.
                         let (__cb, __ms) = {
                             let __f = $thread.top_lua().unwrap();
-                            (__f.base, __f.closure.proto.max_stack_size as usize)
+                            (__f.base(), __f.closure.proto.max_stack_size as usize)
                         };
                         // The args/results were staged *above* the caller window
                         // (at `__cb + __ms + 1 ..`), and `invoke_native` never
@@ -645,7 +645,7 @@ pub(crate) fn run_thread<'gc>(ctx: Context<'gc>, thread: Thread<'gc>) {
     ts.top_lua()
         .expect("run_thread requires a seeded Lua frame");
     let (frame, closure) = top_frame(&mut ts);
-    let (ip, base) = unsafe { ((*frame).pc, (*frame).base) };
+    let (ip, base) = unsafe { ((*frame).pc, (*frame).base()) };
     let registers = unsafe { ts.stack.as_mut_ptr().add(base) };
     let handlers = HANDLERS.as_ptr() as *const ();
     op_nop(
@@ -2314,7 +2314,7 @@ extern "rust-preserve-none" fn op_close<'gc>(
         closure
     );
     let start = instruction.a();
-    let base = unsafe { (*frame).base };
+    let base = unsafe { (*frame).base() };
     let start_idx = base + start as usize;
     close_upvalues(ctx.mutation(), thread, start_idx);
     close_tbc_vars(ctx.mutation(), thread, start_idx);
@@ -2347,7 +2347,7 @@ extern "rust-preserve-none" fn op_tbc<'gc>(
         closure
     );
     let val = instruction.a();
-    let base = unsafe { (*frame).base };
+    let base = unsafe { (*frame).base() };
     thread.tbc_slots.push(base + val as usize);
     unsafe { (*frame).flags |= frame_flags::TBC };
     dispatch!();
@@ -3009,7 +3009,7 @@ macro_rules! call_lua {
         $ip = callee.code;
         let frame = LuaFrame {
             closure: callee,
-            base: new_base,
+            base: new_base as u32,
             pc: $ip,
             num_results: $returns,
             flags: 0,
@@ -3066,7 +3066,7 @@ extern "rust-preserve-none" fn op_call<'gc>(
     if let Some(f) = reg!(func).get_function() {
         match f.inner().as_ref() {
             FunctionKind::Lua(target) => {
-                let func_idx = unsafe { (*frame).base } + func as usize;
+                let func_idx = unsafe { (*frame).base() } + func as usize;
                 let needed = func_idx + 1 + target.max_stack_size as usize;
                 if std::hint::unlikely(thread.stack.len() < needed || thread.frames_full()) {
                     become op_call_grow(
@@ -3149,13 +3149,13 @@ extern "rust-preserve-none" fn op_call_grow<'gc>(
         Some(FunctionKind::Lua(closure)) => closure.max_stack_size as usize,
         _ => unreachable!("op_call_grow on a non-Lua callee"),
     };
-    if !thread.ensure_frame_slots(unsafe { (*frame).base } + func as usize + 1 + max_stack) {
+    if !thread.ensure_frame_slots(unsafe { (*frame).base() } + func as usize + 1 + max_stack) {
         raise!(OpError::StackOverflow);
     }
     thread.reserve_frames(1);
     // Both vecs may have moved: rebind the frame pointer and the register window.
     (frame, closure) = top_frame(thread);
-    registers = unsafe { thread.stack.as_mut_ptr().add(unsafe { (*frame).base }) };
+    registers = unsafe { thread.stack.as_mut_ptr().add(unsafe { (*frame).base() }) };
     become op_call(
         instruction,
         ctx,
@@ -3196,7 +3196,7 @@ pub(crate) extern "rust-preserve-none" fn op_call_native<'gc>(
         closure
     );
     let (func, nargs, returns) = instruction.abc();
-    let base = unsafe { (*frame).base };
+    let base = unsafe { (*frame).base() };
     let func_idx = base + func as usize;
     let nc: &NativeClosure<'gc> = match reg!(func).get_function().map(|f| f.inner().as_ref()) {
         Some(FunctionKind::Native(nc)) => nc,
@@ -3280,7 +3280,7 @@ macro_rules! math1_entry {
                 }
             }
             if returns == 0 {
-                thread.set_top_unchecked(unsafe { (*frame).base } + func as usize + 1);
+                thread.set_top_unchecked(unsafe { (*frame).base() } + func as usize + 1);
             } else {
                 unsafe {
                     fill_nil(
@@ -3346,7 +3346,7 @@ extern "rust-preserve-none" fn op_call_meta<'gc>(
         closure
     );
     let (func, nargs, returns) = instruction.abc();
-    let base = unsafe { (*frame).base };
+    let base = unsafe { (*frame).base() };
     let func_idx = base + func as usize;
     let Some((target, nargs)) = resolve_call_chain(ctx, thread, func_idx, nargs) else {
         raise!(OpError::Call(thread.stack[func_idx]));
@@ -3392,7 +3392,7 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
         closure
     );
     let (func, nargs) = instruction.ab();
-    let base = unsafe { (*frame).base };
+    let base = unsafe { (*frame).base() };
     let func_idx = base + func as usize;
     let Some((target, nargs)) = resolve_call_chain(ctx, thread, func_idx, nargs) else {
         raise!(OpError::Call(thread.stack[func_idx]));
@@ -3404,7 +3404,7 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
             // caller. A vararg frame's VARARGPREP shifted base past the extras
             // at `[base - num_extras .. base]`, so that slot is below them.
             let (cur_base, cur_num_extras) =
-                unsafe { ((*frame).base, (*frame).num_extras as usize) };
+                unsafe { ((*frame).base(), (*frame).num_extras as usize) };
             let caller_func_idx = cur_base - 1 - cur_num_extras;
             let new_base = caller_func_idx + 1;
             if !thread.ensure_frame_slots(new_base + callee.proto.max_stack_size as usize) {
@@ -3427,7 +3427,7 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
             let frame = unsafe { &mut *frame };
             frame.closure = callee;
             frame.pc = ip;
-            frame.base = new_base;
+            frame.set_base(new_base);
             // num_extras feeds the new frame's own VARARGPREP; num_results is
             // left as-is (still the original caller's expectation).
             let num_params = callee.proto.num_params as usize;
@@ -3459,7 +3459,7 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
                     // popping that frame and installing the unwind marker.
                     save_pc(thread, ip);
                     let err = crate::vm::debug::locate(ctx, thread, err);
-                    let cur_base = thread.top_lua().unwrap().base;
+                    let cur_base = thread.top_lua().unwrap().base();
                     close_upvalues(ctx.mutation(), thread, cur_base);
                     close_tbc_vars(ctx.mutation(), thread, cur_base);
                     thread.pop_lua();
@@ -3504,8 +3504,8 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
                     // original caller's expectation across the tail call.
                     let (cur_base, func_idx, num_results, cont) = {
                         let f = unsafe { &*frame };
-                        let func_idx = f.base - 1 - f.num_extras as usize;
-                        (f.base, func_idx, f.num_results, f.continuation)
+                        let func_idx = f.base() - 1 - f.num_extras as usize;
+                        (f.base(), func_idx, f.num_results, f.continuation)
                     };
                     // Only a final landing can apply a continuation; the
                     // callee of a plain `Call` returns without one.
@@ -3551,7 +3551,7 @@ macro_rules! return_to_parent {
         // through the length just stored.
         $frame = unsafe { $frame.sub(1) };
         let (new_base, new_ip, parent) =
-            unsafe { ((*$frame).base, (*$frame).pc, (*$frame).closure) };
+            unsafe { ((*$frame).base(), (*$frame).pc, (*$frame).closure) };
         $closure = parent;
         $ip = new_ip;
         $registers = unsafe { $thread.stack.as_mut_ptr().add(new_base) };
@@ -3592,7 +3592,7 @@ extern "rust-preserve-none" fn op_return<'gc>(
 
     let (cur_base, num_results, num_extras, flags) = {
         let f = unsafe { &*frame };
-        (f.base, f.num_results, f.num_extras as usize, f.flags)
+        (f.base(), f.num_results, f.num_extras as usize, f.flags)
     };
     // `flags` covers continuation, open upvalues, TBC slots and a non-Lua
     // parent (see `frame_flags`); `count == 0` is MULTRET.
@@ -3669,7 +3669,7 @@ extern "rust-preserve-none" fn op_return0<'gc>(
     );
     let (cur_base, num_results, num_extras, flags) = {
         let f = unsafe { &*frame };
-        (f.base, f.num_results, f.num_extras as usize, f.flags)
+        (f.base(), f.num_results, f.num_extras as usize, f.flags)
     };
     if std::hint::unlikely(flags != 0) {
         let generic = Instruction::ret(crate::instruction::Reg(0), 1);
@@ -3718,7 +3718,7 @@ extern "rust-preserve-none" fn op_return1<'gc>(
     let value = instruction.a();
     let (cur_base, num_results, num_extras, flags) = {
         let f = unsafe { &*frame };
-        (f.base, f.num_results, f.num_extras as usize, f.flags)
+        (f.base(), f.num_results, f.num_extras as usize, f.flags)
     };
     if std::hint::unlikely(flags != 0) {
         let generic = Instruction::ret(crate::instruction::Reg(value), 2);
@@ -3771,7 +3771,7 @@ extern "rust-preserve-none" fn op_return_slow<'gc>(
     );
     let (values, count) = instruction.ab();
 
-    let cur_base = unsafe { (*frame).base };
+    let cur_base = unsafe { (*frame).base() };
     let values_base = cur_base + values as usize;
     // `count == 0` is MULTRET: read the count from `thread.top`.
     let nret = if count == 0 {
@@ -4168,7 +4168,7 @@ extern "rust-preserve-none" fn op_setlist<'gc>(
     // exceed u8 (a `VARARG count=0` spread), so index the stack by usize.
     let (base, max_stack) = {
         let f = thread.top_lua().unwrap();
-        (f.base, f.closure.proto.max_stack_size as usize)
+        (f.base(), f.closure.proto.max_stack_size as usize)
     };
     let elements_start = base + table as usize + 1;
     let n = if count == 0 {
@@ -4224,7 +4224,7 @@ extern "rust-preserve-none" fn op_closure<'gc>(
         closure
     );
     let (dst, proto_idx) = instruction.ad();
-    let (parent_closure, base) = unsafe { ((*frame).closure, (*frame).base) };
+    let (parent_closure, base) = unsafe { ((*frame).closure, (*frame).base()) };
     let proto = parent_closure.proto.prototypes[proto_idx as usize];
 
     let thread_handle = thread.thread_handle.expect("thread must have a handle");
@@ -4301,7 +4301,7 @@ extern "rust-preserve-none" fn op_vararg<'gc>(
     // Copy scalars/`Gc` out so the frame borrow ends before touching the stack.
     let (base, num_extras, proto) = {
         let frame = thread.top_lua().unwrap();
-        (frame.base, frame.num_extras as usize, frame.closure.proto)
+        (frame.base(), frame.num_extras as usize, frame.closure.proto)
     };
     let target = base + dst as usize;
 
@@ -4396,7 +4396,7 @@ extern "rust-preserve-none" fn op_varargget<'gc>(
     let key_val = reg!(key);
     let frame = thread.top_lua().unwrap();
     let num_extras = frame.num_extras as usize;
-    let extras_start = frame.base - num_extras;
+    let extras_start = frame.base() - num_extras;
     // Normalize integral float keys (`args[1.0]` == `args[1]`) so the optimized
     // path agrees with the GETTABLE an escaped vararg would use.
     let int_key = key_val.get_integer().or_else(|| {
@@ -4461,7 +4461,7 @@ extern "rust-preserve-none" fn op_varargprep<'gc>(
         (
             frame.num_extras as usize,
             frame.closure.proto.num_params as usize,
-            frame.base,
+            frame.base(),
             frame.closure.proto.max_stack_size as usize,
             frame.closure.proto.needs_vararg_table,
         )
@@ -4474,7 +4474,7 @@ extern "rust-preserve-none" fn op_varargprep<'gc>(
         let total = num_extras + num_params;
         // [fixed..., extras...].rotate_left(num_params) => [extras..., fixed...]
         thread.stack[base..base + total].rotate_left(num_params);
-        thread.top_lua_mut().unwrap().base = new_base;
+        thread.top_lua_mut().unwrap().set_base(new_base);
         registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
         new_base
     } else {
@@ -4720,7 +4720,7 @@ pub(crate) fn frame_return<'gc>(
     let (cur_base, num_results, num_extras, has_cont) = {
         let f = unsafe { &*frame };
         (
-            f.base,
+            f.base(),
             f.num_results,
             f.num_extras as usize,
             f.continuation.is_some(),
@@ -4749,7 +4749,7 @@ pub(crate) fn frame_return<'gc>(
     unsafe { thread.frames.set_len(thread.frames.len() - 1) };
 
     let (new_base, new_ip) = match thread.top_lua() {
-        Some(caller) => (caller.base, caller.pc),
+        Some(caller) => (caller.base(), caller.pc),
         None if thread.frames_empty() => {
             thread
                 .stack
@@ -5170,7 +5170,7 @@ fn schedule_meta_call<'gc>(
     let caller_base = thread
         .top_lua()
         .expect("schedule_meta_call called without an active Lua frame")
-        .base;
+        .base();
     let scratch_func =
         caller_base + thread.top_lua().unwrap().closure.proto.max_stack_size as usize;
     let new_base = scratch_func + 1;
@@ -5226,7 +5226,7 @@ fn schedule_meta_call<'gc>(
 
     thread.push_lua(LuaFrame {
         closure,
-        base: new_base,
+        base: new_base as u32,
         // Ignored by op_return when a continuation is set — the continuation
         // reads return values directly from the stack via `cont.results_base`.
         pc: closure.proto.code.as_ptr(),
@@ -5345,7 +5345,7 @@ extern "rust-preserve-none" fn cont_resume<'gc>(
     );
     let (cont, results_base) = {
         let f = unsafe { &*frame };
-        let func_slot = f.base - 1 - f.num_extras as usize;
+        let func_slot = f.base() - 1 - f.num_extras as usize;
         (f.continuation.unwrap(), func_slot)
     };
     // `frame_return` already closed upvalues and to-be-closed variables.
@@ -5353,7 +5353,7 @@ extern "rust-preserve-none" fn cont_resume<'gc>(
     (frame, closure) = top_frame(thread);
     let caller_base = unsafe {
         ip = (*frame).pc;
-        (*frame).base
+        (*frame).base()
     };
     registers = unsafe { thread.stack.as_mut_ptr().add(caller_base) };
     apply_cont_payload!(
