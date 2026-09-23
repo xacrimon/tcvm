@@ -167,6 +167,12 @@ pub enum Frame<'gc> {
     Error(Error<'gc>),
 }
 
+/// Most stack slots a thread's Lua frames may use (LuaJIT's `LUAI_MAXSTACK`).
+/// Calls fail with "stack overflow" past [`STACK_LIMIT`]; the slots above it
+/// are headroom for a message handler to report that (PUC's `STACKERRSPACE`).
+pub(crate) const MAX_STACK: usize = 65_500;
+pub(crate) const STACK_LIMIT: usize = MAX_STACK - 200;
+
 /// The mutable state of a thread/coroutine.
 ///
 /// # The stack invariant
@@ -227,6 +233,9 @@ pub struct ThreadState<'gc> {
     /// as `(false, err)` and clears it; `None` for a coroutine that died by
     /// normal return or was never run.
     pub death_error: Option<Value<'gc>>,
+    /// End a Lua frame's register window may not cross: [`STACK_LIMIT`], or
+    /// [`MAX_STACK`] while a message handler runs.
+    pub(crate) stack_limit: usize,
 }
 
 /// The value stack's storage: a `Vec` the mutator uses as such, that the
@@ -448,6 +457,31 @@ impl<'gc> ThreadState<'gc> {
         self.stack.resize(n, Value::nil());
     }
 
+    /// `ensure_slots` for a Lua frame's register window ending at `n`; `false`
+    /// when that would cross `stack_limit`, which the caller raises as a stack
+    /// overflow. Only growth is checked, so a window inside slots a native
+    /// already pushed past the limit is allowed.
+    #[inline]
+    #[must_use]
+    pub fn ensure_frame_slots(&mut self, n: usize) -> bool {
+        self.stack.len() >= n || self.grow_frame_slots(n)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow_frame_slots(&mut self, n: usize) -> bool {
+        if n > self.stack_limit {
+            return false;
+        }
+        self.grow_slots(n);
+        true
+    }
+
+    /// A message handler is running in the headroom above [`STACK_LIMIT`].
+    pub(crate) fn in_error_headroom(&self) -> bool {
+        self.stack_limit > STACK_LIMIT
+    }
+
     /// The logical window `stack[bottom..top]`.
     #[inline]
     pub fn window(&self, bottom: usize) -> &[Value<'gc>] {
@@ -530,6 +564,7 @@ impl<'gc> Thread<'gc> {
             pending_action: None,
             yield_bottom: None,
             death_error: None,
+            stack_limit: STACK_LIMIT,
         };
         let thread = Thread(Gc::new(mc, RefLock::new(state)));
         // Store the back-reference

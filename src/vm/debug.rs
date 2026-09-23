@@ -171,8 +171,28 @@ pub(crate) fn op_error_message<'gc>(
         }
         OpError::NilIndex => "table index is nil".to_owned(),
         OpError::NanIndex => "table index is NaN".to_owned(),
+        OpError::StackOverflow => "stack overflow".to_owned(),
         OpError::Internal(what) => format!("internal VM error: {what}"),
     }
+}
+
+/// The error for a call that would cross the thread's stack limit: "stack
+/// overflow" at the caller's position, or, when a message handler already
+/// runs in the headroom, "error in error handling", which skips the handler
+/// (`luaD_errerr`).
+pub(crate) fn stack_overflow<'gc>(ctx: Context<'gc>, ts: &ThreadState<'gc>) -> Error<'gc> {
+    if ts.in_error_headroom() {
+        error_in_error_handling(ctx)
+    } else {
+        Error::from_str(ctx, &op_error_message(ctx, ts, OpError::StackOverflow))
+    }
+}
+
+/// Raised in place of an error the message handler can't deal with; marked
+/// handled so it goes straight to the catcher.
+pub(crate) fn error_in_error_handling(ctx: Context<'_>) -> Error<'_> {
+    let msg = LuaString::new(ctx, b"error in error handling");
+    Error::new(ctx, Value::string(msg)).mark_handled()
 }
 
 #[cfg(test)]

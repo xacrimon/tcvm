@@ -2,7 +2,9 @@ use std::pin::Pin;
 
 use crate::dmm::{Collect, Gc, RefLock, Trace};
 use crate::env::function::Function;
-use crate::env::thread::{CallSite, Frame, LuaFrame, PendingAction, ThreadState, ThreadStatus};
+use crate::env::thread::{
+    CallSite, Frame, LuaFrame, MAX_STACK, PendingAction, ThreadState, ThreadStatus,
+};
 use crate::env::{Error, LuaString, Stack, Thread, Value};
 use crate::lua::RuntimeError;
 use crate::lua::context::Context;
@@ -556,7 +558,11 @@ fn schedule_call_at<'gc>(
         } else {
             0
         };
-        ts.ensure_slots(base + closure.proto.max_stack_size as usize);
+        if !ts.ensure_frame_slots(base + closure.proto.max_stack_size as usize) {
+            let err = vm::debug::stack_overflow(ctx, ts);
+            ts.raise(ctx, err);
+            return Ok(());
+        }
         // Nil-fill fixed params the caller didn't supply.
         for i in caller_provided..num_params {
             ts.stack[base + i] = Value::nil();
@@ -944,8 +950,15 @@ fn run_message_handler<'gc>(
     ts.stack[slot] = Value::function(handler);
     ts.stack[slot + 1] = err.value();
     ts.set_top(slot + 2);
+    // The handler may use the headroom, so it can run even after a stack overflow.
+    let saved_limit = std::mem::replace(&mut ts.stack_limit, MAX_STACK);
+    let seq = HandlerSequence {
+        handler,
+        depth: 0,
+        saved_limit,
+    };
     ts.frames.push(Frame::Sequence {
-        seq: BoxSequence::new(ctx.mutation(), HandlerSequence { handler, depth: 0 }),
+        seq: BoxSequence::new(ctx.mutation(), seq),
         call_site: CallSite {
             bottom: slot,
             func_idx: slot,
@@ -969,6 +982,8 @@ fn run_message_handler<'gc>(
 struct HandlerSequence<'gc> {
     handler: Function<'gc>,
     depth: u32,
+    /// `stack_limit` to restore when the handler is done.
+    saved_limit: usize,
 }
 
 /// `LUAI_MAXCCALLS`: nested handler invocations before giving up.
@@ -985,7 +1000,9 @@ impl<'gc> Sequence<'gc> for HandlerSequence<'gc> {
         _exec: Execution<'gc>,
         stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
-        Err(Error::new(ctx, stack.get(0)).mark_handled())
+        let result = stack.get(0);
+        stack.into_parts().0.stack_limit = self.saved_limit;
+        Err(Error::new(ctx, result).mark_handled())
     }
 
     fn error(
@@ -995,9 +1012,15 @@ impl<'gc> Sequence<'gc> for HandlerSequence<'gc> {
         err: Error<'gc>,
         mut stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
-        if self.depth == MAX_HANDLER_DEPTH {
-            let msg = LuaString::new(ctx, b"error in error handling");
-            return Err(Error::new(ctx, Value::string(msg)).mark_handled());
+        // An already handled error is "error in error handling" from a stack
+        // overflow in the handler; it goes to the catcher as is.
+        if err.is_handled() || self.depth == MAX_HANDLER_DEPTH {
+            stack.into_parts().0.stack_limit = self.saved_limit;
+            return Err(if err.is_handled() {
+                err
+            } else {
+                vm::debug::error_in_error_handling(ctx)
+            });
         }
         self.depth += 1;
         stack.replace(&[err.value()]);

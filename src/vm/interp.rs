@@ -119,6 +119,8 @@ pub(crate) enum OpError<'gc> {
     ForNotNumber(&'static str, Value<'gc>),
     NilIndex,
     NanIndex,
+    /// A call's register window would cross `ThreadState::stack_limit`.
+    StackOverflow,
     Internal(&'static str),
 }
 
@@ -387,6 +389,7 @@ macro_rules! helpers {
                     // resume / unwind from the installed frame state.
                     MetaDispatch::Suspended => return,
                     MetaDispatch::Unresolvable => raise!(OpError::$$err(__mm_meta)),
+                    MetaDispatch::StackOverflow => raise!(OpError::StackOverflow),
                 }
             }};
         }
@@ -705,8 +708,14 @@ extern "rust-preserve-none" fn impl_error<'gc>(
     // `ip` already points past the faulting instruction (see `dispatch!`),
     // which is the convention `LuaFrame::pc` uses.
     save_pc(thread, ip);
-    let msg = crate::vm::debug::op_error_message(ctx, thread, kind);
-    thread.raise(ctx, crate::env::Error::from_str(ctx, &msg));
+    let err = match kind {
+        OpError::StackOverflow => crate::vm::debug::stack_overflow(ctx, thread),
+        kind => {
+            let msg = crate::vm::debug::op_error_message(ctx, thread, kind);
+            crate::env::Error::from_str(ctx, &msg)
+        }
+    };
+    thread.raise(ctx, err);
 }
 
 // ---------------------------------------------------------------------------
@@ -3034,7 +3043,9 @@ macro_rules! call_lua {
         let new_base = $func_idx + 1;
         unsafe { (*$frame).pc = $ip };
         if $grow {
-            $thread.ensure_slots(new_base + callee.max_stack_size as usize);
+            if !$thread.ensure_frame_slots(new_base + callee.max_stack_size as usize) {
+                raise!(OpError::StackOverflow);
+            }
         } else {
             debug_assert!(
                 $thread.stack.len() >= new_base + callee.max_stack_size as usize
@@ -3184,7 +3195,8 @@ extern "rust-preserve-none" fn op_call<'gc>(
 
 /// CALL of a Lua closure that needs the value stack or the frame stack grown
 /// first. Grows both (the only thing `op_call` cannot do without a stack
-/// frame), then re-enters `op_call`, which has not modified anything yet.
+/// frame), then re-enters `op_call`, which has not modified anything yet; or
+/// raises a stack overflow if the callee's window would cross the limit.
 #[inline(never)]
 #[rustc_align(32)]
 extern "rust-preserve-none" fn op_call_grow<'gc>(
@@ -3214,7 +3226,9 @@ extern "rust-preserve-none" fn op_call_grow<'gc>(
         Some(FunctionKind::Lua(closure)) => closure.max_stack_size as usize,
         _ => unreachable!("op_call_grow on a non-Lua callee"),
     };
-    thread.ensure_slots(unsafe { (*frame).base } + func as usize + 1 + max_stack);
+    if !thread.ensure_frame_slots(unsafe { (*frame).base } + func as usize + 1 + max_stack) {
+        raise!(OpError::StackOverflow);
+    }
     thread.reserve_frames(1);
     // Both vecs may have moved: rebind the frame pointer and the register window.
     (frame, closure) = top_frame(thread);
@@ -3470,6 +3484,9 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
                 unsafe { ((*frame).base, (*frame).num_extras as usize) };
             let caller_func_idx = cur_base - 1 - cur_num_extras;
             let new_base = caller_func_idx + 1;
+            if !thread.ensure_frame_slots(new_base + callee.proto.max_stack_size as usize) {
+                raise!(OpError::StackOverflow);
+            }
             // Close upvalues before overwriting these slots with args, so an
             // open upvalue keeps referencing the local, not the arg value.
             close_upvalues(ctx.mutation(), thread, new_base);
@@ -3496,7 +3513,6 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
             } else {
                 0
             };
-            thread.ensure_slots(new_base + callee.proto.max_stack_size as usize);
             for i in nargs..num_params {
                 thread.stack[new_base + i] = Value::nil();
             }
@@ -4522,11 +4538,13 @@ extern "rust-preserve-none" fn op_varargprep<'gc>(
         )
     };
     let new_base = if num_extras > 0 {
+        let new_base = base + num_extras;
+        if !thread.ensure_frame_slots(new_base + max_stack) {
+            raise!(OpError::StackOverflow);
+        }
         let total = num_extras + num_params;
         // [fixed..., extras...].rotate_left(num_params) => [extras..., fixed...]
         thread.stack[base..base + total].rotate_left(num_params);
-        let new_base = base + num_extras;
-        thread.ensure_slots(new_base + max_stack);
         thread.top_lua_mut().unwrap().base = new_base;
         registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
         new_base
@@ -5077,6 +5095,8 @@ pub(crate) enum MetaDispatch {
     /// Target is not callable (or a suspending comparison metamethod, which we
     /// don't support). The caller raises.
     Unresolvable,
+    /// The call would cross the stack limit. The caller raises.
+    StackOverflow,
 }
 
 /// Walk the `__call` chain at `thread.stack[func_idx]` until we hit a
@@ -5223,7 +5243,9 @@ fn schedule_meta_call<'gc>(
     let new_base = scratch_func + 1;
 
     // Stage meta_fn + args so resolve_call_chain sees them in op_call layout.
-    thread.ensure_slots(new_base + args.len());
+    if !thread.ensure_frame_slots(new_base + args.len()) {
+        return MetaDispatch::StackOverflow;
+    }
     thread.stack[scratch_func] = meta_fn;
     for (i, &a) in args.iter().enumerate() {
         thread.stack[new_base + i] = a;
@@ -5254,7 +5276,9 @@ fn schedule_meta_call<'gc>(
     };
 
     // Grow stack to fit the resolved closure's full frame.
-    thread.ensure_slots(new_base + closure.proto.max_stack_size as usize);
+    if !thread.ensure_frame_slots(new_base + closure.proto.max_stack_size as usize) {
+        return MetaDispatch::StackOverflow;
+    }
 
     // Nil-fill any parameter slots not covered by the (possibly shifted) args.
     let num_params = closure.proto.num_params as usize;
