@@ -262,12 +262,10 @@ impl<'gc, 'a> Stack<'gc, 'a> {
 
     #[inline]
     pub fn push(&mut self, v: Value<'gc>) {
-        if self.thread.top == self.thread.stack.len() {
-            self.thread.stack.push(v);
-        } else {
-            self.thread.stack[self.thread.top] = v;
-        }
-        self.thread.top += 1;
+        let top = self.thread.top;
+        self.thread.ensure_slots(top + 1);
+        self.thread.stack[top] = v;
+        self.thread.top = top + 1;
     }
 
     #[inline]
@@ -283,9 +281,7 @@ impl<'gc, 'a> Stack<'gc, 'a> {
         let at = self.bottom + i;
         let top = self.thread.top;
         debug_assert!(at <= top);
-        if top == self.thread.stack.len() {
-            self.thread.stack.push(Value::nil());
-        }
+        self.thread.ensure_slots(top + 1);
         self.thread.stack.copy_within(at..top, at + 1);
         self.thread.stack[at] = v;
         self.thread.top += 1;
@@ -322,9 +318,7 @@ impl<'gc, 'a> Stack<'gc, 'a> {
     #[inline]
     pub fn replace(&mut self, values: &[Value<'gc>]) {
         let end = self.bottom + values.len();
-        if end > self.thread.stack.len() {
-            self.thread.stack.resize(end, Value::nil());
-        }
+        self.thread.ensure_slots(end);
         for (i, v) in values.iter().enumerate() {
             self.thread.stack[self.bottom + i] = *v;
         }
@@ -337,9 +331,7 @@ impl<'gc, 'a> Stack<'gc, 'a> {
     #[inline(always)]
     pub fn ret1(&mut self, v: Value<'gc>) {
         let end = self.bottom + 1;
-        if end > self.thread.stack.len() {
-            self.thread.stack.resize(end, Value::nil());
-        }
+        self.thread.ensure_slots(end);
         self.thread.stack[self.bottom] = v;
         self.truncate_to(end);
     }

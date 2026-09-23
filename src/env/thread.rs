@@ -44,7 +44,10 @@ pub enum ThreadStatus {
 #[collect(internal, no_drop)]
 pub struct LuaFrame<'gc> {
     pub closure: LuaFn<'gc>,
-    pub base: usize,
+    /// Read through `base()`. 32 bits: a frame sits inside the stack, and
+    /// every growth of the stack goes through `grow_slots`, which keeps it
+    /// below 2^32 slots.
+    pub base: u32,
     /// Resume address: points *past* the instruction being executed, into
     /// `closure.proto.code` (which the frame keeps alive). A raw pointer
     /// rather than an index so CALL saves it with one store.
@@ -103,7 +106,21 @@ pub mod frame_flags {
     pub const PARENT_NON_LUA: u8 = 8;
 }
 
+// Two records per cache line.
+const _: () = assert!(std::mem::size_of::<LuaFrame<'static>>() == 32);
+
 impl<'gc> LuaFrame<'gc> {
+    #[inline(always)]
+    pub fn base(&self) -> usize {
+        self.base as usize
+    }
+
+    #[inline(always)]
+    pub fn set_base(&mut self, base: usize) {
+        debug_assert!(base <= u32::MAX as usize);
+        self.base = base as u32;
+    }
+
     /// `pc` as an index into `closure.proto.code`.
     pub fn pc_index(&self) -> usize {
         unsafe {
@@ -431,7 +448,7 @@ impl<'gc> ThreadState<'gc> {
     pub fn live_top(&self) -> usize {
         self.frames
             .last()
-            .map_or(0, |lf| lf.base + lf.closure.proto.max_stack_size as usize)
+            .map_or(0, |lf| lf.base() + lf.closure.proto.max_stack_size as usize)
             .max(self.top)
     }
 
@@ -448,7 +465,7 @@ impl<'gc> ThreadState<'gc> {
     #[inline]
     pub fn push_lua(&mut self, mut lf: LuaFrame<'gc>) {
         debug_assert!(
-            lf.base >= 1,
+            lf.base() >= 1,
             "Lua frame base must leave room for the function slot"
         );
         if !self.top_is_lua() {
@@ -473,7 +490,7 @@ impl<'gc> ThreadState<'gc> {
     /// `frames.len() < frames.capacity()`, and the innermost frame is a Lua frame.
     #[inline(always)]
     pub unsafe fn push_lua_unchecked(&mut self, lf: LuaFrame<'gc>) {
-        debug_assert!(lf.base >= 1);
+        debug_assert!(lf.base() >= 1);
         debug_assert!(self.frames.len() < self.frames.capacity());
         debug_assert!(self.top_is_lua());
         let len = self.frames.len();
@@ -511,6 +528,8 @@ impl<'gc> ThreadState<'gc> {
     #[cold]
     #[inline(never)]
     fn grow_slots(&mut self, n: usize) {
+        // Frame bases are stored in 32 bits (`LuaFrame::base`).
+        assert!(n <= u32::MAX as usize, "Lua stack exceeds 2^32 slots");
         self.stack.resize(n, Value::nil());
     }
 
