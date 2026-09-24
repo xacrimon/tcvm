@@ -7,8 +7,7 @@ use crate::builtin::util;
 // rejection) match `tonumber`/`math.*` and don't drift.
 use crate::builtin::util::{to_integer, to_number as to_float};
 use crate::env::{
-    Error, Function, LuaString, MetamethodBits, NativeClosure, NativeFn, Stack, Table, Userdata,
-    Value,
+    Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Userdata, Value,
 };
 use crate::lua::{StashedError, StashedFunction, StashedTable, StashedValue};
 use crate::vm::async_sequence::{AsyncSequence, SequenceReturn, async_sequence};
@@ -1476,20 +1475,11 @@ async fn table_index_repl(
         if !v.is_nil() {
             return Ok(Plan::Resolved(classify_repl_result(ctx, v)?));
         }
-        if !tbl.shape().has_mm(MetamethodBits::INDEX) {
-            return Ok(Plan::Resolved(ReplResult::Keep)); // nil -> keep original
-        }
-        // INDEX bit implies a metatable is present.
-        let mt = tbl
-            .metatable()
-            .expect("INDEX metamethod implies a metatable");
-        let mm = mt.raw_get(Value::string(ctx.symbols().mm_index));
-        match walk_index_chain(ctx, Value::table(tbl), mm, key_val) {
+        match walk_index_chain(ctx, Value::table(tbl), key_val) {
             IndexChain::Resolved(rv) => Ok(Plan::Resolved(classify_repl_result(ctx, rv)?)),
             IndexChain::Invoke { func, receiver } => {
-                let f = func.get_function().expect("Invoke carries a function");
                 stack.replace(&[receiver, key_val]);
-                Ok(Plan::CallIndex(locals.stash(ctx.mutation(), f)))
+                Ok(Plan::CallIndex(locals.stash(ctx.mutation(), func)))
             }
             IndexChain::NotIndexable(v) => Err(Error::from_str(
                 ctx,

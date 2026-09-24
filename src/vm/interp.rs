@@ -484,19 +484,14 @@ macro_rules! get_slow_body {
         let __k: Value<'gc> = $k;
         let __dst_reg: u8 = $dst;
 
-        let __mm = if let Some(__t) = __recv.get_table() {
+        if let Some(__t) = __recv.get_table() {
             let __v = __t.raw_get(__k);
-            if !__v.is_nil() || !__t.shape().has_mm(MetamethodBits::INDEX) {
+            if !__v.is_nil() {
                 *reg!(ref mut __dst_reg) = __v;
                 dispatch!();
             }
-            // INDEX bit implies metatable is Some.
-            let __mt = unsafe { __t.metatable().unwrap_unchecked() };
-            __mt.raw_get(Value::string($ctx.symbols().mm_index))
-        } else {
-            $ctx.metamethod_of(__recv, $ctx.symbols().mm_index)
-        };
-        match walk_index_chain($ctx, __recv, __mm, __k) {
+        }
+        match walk_index_chain($ctx, __recv, __k) {
             IndexChain::Resolved(__rv) => {
                 *reg!(ref mut __dst_reg) = __rv;
                 dispatch!();
@@ -506,7 +501,7 @@ macro_rules! get_slow_body {
                 receiver: __mm_recv,
             } => {
                 let __cont = Continuation::StoreResult { dst: __dst_reg };
-                invoke_metamethod!(__mm_func, &[__mm_recv, __k], __cont, Index);
+                invoke_metamethod!(Value::function(__mm_func), &[__mm_recv, __k], __cont, Index);
             }
             IndexChain::NotIndexable(__v) => raise!(OpError::Index(__v)),
             IndexChain::Exhausted => raise!(OpError::IndexChainLoop),
@@ -532,7 +527,12 @@ macro_rules! set_slow_body {
                 receiver: __mm_recv,
             } => {
                 let __cont = Continuation::IgnoreResult;
-                invoke_metamethod!(__mm_func, &[__mm_recv, __k, __new_val], __cont, Index);
+                invoke_metamethod!(
+                    Value::function(__mm_func),
+                    &[__mm_recv, __k, __new_val],
+                    __cont,
+                    Index
+                );
             }
             NewIndexChain::NotIndexable(__v) => raise!(OpError::Index(__v)),
             NewIndexChain::Exhausted => raise!(OpError::NewIndexChainLoop),
@@ -1235,16 +1235,8 @@ extern "rust-preserve-none" fn op_self_slow<'gc>(
     let recv_val = reg!(object);
     let key = constant!(key_idx);
 
-    let mm = match recv_val.get_table() {
-        // Reachable for a table only after a raw miss with the INDEX bit
-        // set, which implies a metatable.
-        Some(t) => {
-            let mt = unsafe { t.metatable().unwrap_unchecked() };
-            mt.raw_get(Value::string(ctx.symbols().mm_index))
-        }
-        None => ctx.metamethod_of(recv_val, ctx.symbols().mm_index),
-    };
-    match walk_index_chain(ctx, recv_val, mm, key) {
+    // A table receiver gets here only after `op_self`'s raw miss.
+    match walk_index_chain(ctx, recv_val, key) {
         IndexChain::Resolved(method) => {
             *reg!(ref mut dst) = method;
             *reg!(ref mut (dst + 1)) = recv_val;
@@ -1255,7 +1247,7 @@ extern "rust-preserve-none" fn op_self_slow<'gc>(
             // continuation writes the resolved method into dst.
             *reg!(ref mut (dst + 1)) = recv_val;
             let cont = Continuation::StoreResult { dst };
-            invoke_metamethod!(func, &[receiver, key], cont, Index);
+            invoke_metamethod!(Value::function(func), &[receiver, key], cont, Index);
         }
         IndexChain::NotIndexable(v) => raise!(OpError::Index(v)),
         IndexChain::Exhausted => raise!(OpError::IndexChainLoop),
@@ -4138,7 +4130,7 @@ pub(crate) enum IndexChain<'gc> {
     /// The chain ended in a function that must be invoked with
     /// `(receiver, key)`, `receiver` being the value whose metatable held it.
     Invoke {
-        func: Value<'gc>,
+        func: Function<'gc>,
         receiver: Value<'gc>,
     },
     /// A non-table in the chain has no `__index`; the caller raises
@@ -4148,38 +4140,42 @@ pub(crate) enum IndexChain<'gc> {
     Exhausted,
 }
 
-/// Resolve `key` from `mm`, the `__index` metavalue of `receiver`, whose raw
-/// lookup (if it is a table) already missed (`luaV_finishget`).
+/// Resolve `receiver[key]` through `__index` (`luaV_finishget`), given that
+/// `receiver`'s own raw lookup, if it is a table, already missed.
 pub(crate) fn walk_index_chain<'gc>(
     ctx: Context<'gc>,
     mut receiver: Value<'gc>,
-    mut mm: Value<'gc>,
     key: Value<'gc>,
 ) -> IndexChain<'gc> {
     let index = ctx.symbols().mm_index;
     for _ in 0..MAX_TAG_LOOP {
-        if mm.is_nil() {
-            return match receiver.get_table() {
-                Some(_) => IndexChain::Resolved(Value::nil()),
-                None => IndexChain::NotIndexable(receiver),
-            };
-        }
-        if mm.get_function().is_some() {
-            return IndexChain::Invoke { func: mm, receiver };
-        }
-        receiver = mm;
-        mm = match mm.get_table() {
+        let mm = match receiver.get_table() {
             Some(t) => {
-                let v = t.raw_get(key);
-                if !v.is_nil() || !t.shape().has_mm(MetamethodBits::INDEX) {
-                    return IndexChain::Resolved(v);
+                if !t.shape().has_mm(MetamethodBits::INDEX) {
+                    return IndexChain::Resolved(Value::nil());
                 }
                 // INDEX bit implies metatable is Some.
                 let mt = unsafe { t.metatable().unwrap_unchecked() };
                 mt.raw_get(Value::string(index))
             }
-            None => ctx.metamethod_of(mm, index),
+            None => {
+                let mm = ctx.metamethod_of(receiver, index);
+                if mm.is_nil() {
+                    return IndexChain::NotIndexable(receiver);
+                }
+                mm
+            }
         };
+        if let Some(func) = mm.get_function() {
+            return IndexChain::Invoke { func, receiver };
+        }
+        if let Some(t) = mm.get_table() {
+            let v = t.raw_get(key);
+            if !v.is_nil() {
+                return IndexChain::Resolved(v);
+            }
+        }
+        receiver = mm;
     }
     IndexChain::Exhausted
 }
@@ -4190,7 +4186,7 @@ enum NewIndexChain<'gc> {
     RawSet(Table<'gc>),
     /// The chain ended in a function; invoke with `(receiver, key, value)`.
     Invoke {
-        func: Value<'gc>,
+        func: Function<'gc>,
         receiver: Value<'gc>,
     },
     /// A non-table in the chain has no `__newindex`; the caller raises.
@@ -4230,11 +4226,8 @@ fn walk_newindex_chain<'gc>(
                 mm
             }
         };
-        if mm.get_function().is_some() {
-            return NewIndexChain::Invoke {
-                func: mm,
-                receiver: t,
-            };
+        if let Some(func) = mm.get_function() {
+            return NewIndexChain::Invoke { func, receiver: t };
         }
         t = mm;
     }
