@@ -1423,17 +1423,7 @@ macro_rules! arith_handler {
                 }
             }
 
-            become $slow_name(
-                instruction,
-                ctx,
-                thread,
-                registers,
-                ip,
-                handlers,
-                ds,
-                frame,
-                closure,
-            );
+            tail!($slow_name);
         }
 
         binop_slow_handler!($slow_name, $instr, $num_kind, op_arith_slow, $mm, Arith);
@@ -1468,17 +1458,7 @@ macro_rules! bit_handler {
                 dispatch!();
             }
 
-            become $slow_name(
-                instruction,
-                ctx,
-                thread,
-                registers,
-                ip,
-                handlers,
-                ds,
-                frame,
-                closure,
-            );
+            tail!($slow_name);
         }
 
         binop_slow_handler!($slow_name, $instr, $num_kind, op_bit_slow, $mm, Bitwise);
@@ -1608,17 +1588,7 @@ macro_rules! arith_imm_handler {
                 }
             }
 
-            become $slow_name(
-                instruction,
-                ctx,
-                thread,
-                registers,
-                ip,
-                handlers,
-                ds,
-                frame,
-                closure,
-            );
+            tail!($slow_name);
         }
 
         binop_imm_slow_handler!($slow_name, $num_kind, op_arith_slow, $mm, Arith, $swap);
@@ -1656,17 +1626,7 @@ macro_rules! bit_imm_handler {
                 }
             }
 
-            become $slow_name(
-                instruction,
-                ctx,
-                thread,
-                registers,
-                ip,
-                handlers,
-                ds,
-                frame,
-                closure,
-            );
+            tail!($slow_name);
         }
 
         binop_imm_slow_handler!($slow_name, $num_kind, op_bit_slow, $mm, Bitwise, $swap);
@@ -2161,17 +2121,7 @@ macro_rules! cmp_imm_handler {
                 dispatch!();
             }
 
-            become $slow_name(
-                instruction,
-                ctx,
-                thread,
-                registers,
-                ip,
-                handlers,
-                ds,
-                frame,
-                closure,
-            );
+            tail!($slow_name);
         }
 
         #[inline(never)]
@@ -4161,8 +4111,7 @@ pub(crate) fn frame_return<'gc>(
         thread.set_top_unchecked(dst_start + nret);
         return FrameReturn::Continuation;
     }
-    const { assert!(!std::mem::needs_drop::<LuaFrame<'_>>()) };
-    unsafe { thread.frames.set_len(thread.frames.len() - 1) };
+    thread.pop_lua();
 
     let (new_base, new_ip) = match thread.top_lua() {
         Some(caller) => (caller.base(), caller.pc),
@@ -4614,16 +4563,16 @@ fn schedule_meta_call<'gc>(
     };
 
     // Grow stack to fit the resolved closure's full frame.
-    if !thread.ensure_frame_slots(new_base + closure.proto.max_stack_size as usize) {
+    if !thread.ensure_frame_slots(new_base + closure.max_stack_size as usize) {
         return MetaDispatch::StackOverflow;
     }
 
     // Nil-fill any parameter slots not covered by the (possibly shifted) args.
-    let num_params = closure.proto.num_params as usize;
+    let num_params = closure.num_params as usize;
     for i in actual_args..num_params {
         thread.stack[new_base + i] = Value::nil();
     }
-    let num_extras = if closure.proto.is_vararg {
+    let num_extras = if closure.is_vararg {
         actual_args.saturating_sub(num_params) as u32
     } else {
         0
@@ -4632,7 +4581,7 @@ fn schedule_meta_call<'gc>(
     thread.push_lua(LuaFrame {
         closure,
         base: new_base as u32,
-        pc: closure.proto.code.as_ptr(),
+        pc: closure.code,
         // Unused: RETURN hands the results to the continuation instead.
         num_results: 0,
         flags: frame_flags::HAS_CONT,
@@ -4640,7 +4589,7 @@ fn schedule_meta_call<'gc>(
         continuation: Some(cont),
     });
 
-    let new_ip = closure.proto.code.as_ptr();
+    let new_ip = closure.code;
     MetaDispatch::Lua { new_ip, new_base }
 }
 

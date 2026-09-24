@@ -557,13 +557,13 @@ fn schedule_call_at<'gc>(
     if let CallTarget::Lua(closure) = target {
         let base = slot + 1;
         let caller_provided = ts.top.saturating_sub(base);
-        let num_params = closure.proto.num_params as usize;
-        let num_extras = if closure.proto.is_vararg {
+        let num_params = closure.num_params as usize;
+        let num_extras = if closure.is_vararg {
             caller_provided.saturating_sub(num_params) as u32
         } else {
             0
         };
-        if !ts.ensure_frame_slots(base + closure.proto.max_stack_size as usize) {
+        if !ts.ensure_frame_slots(base + closure.max_stack_size as usize) {
             let err = vm::debug::stack_overflow(ctx, ts);
             ts.raise(ctx, err);
             return Ok(());
@@ -575,7 +575,7 @@ fn schedule_call_at<'gc>(
         ts.push_lua(LuaFrame {
             closure,
             base: base as u32,
-            pc: closure.proto.code.as_ptr(),
+            pc: closure.code,
             num_results: caller_returns,
             flags: 0,
             num_extras,
@@ -850,7 +850,7 @@ fn land_call_results<'gc>(ts: &mut crate::env::thread::ThreadState<'gc>, cs: Cal
     // raw pointer the moment we hand control back.
     let needed = match ts.top_lua() {
         Some(frame) => {
-            (func_idx + wanted).max(frame.base() + frame.closure.proto.max_stack_size as usize)
+            (func_idx + wanted).max(frame.base() + frame.closure.max_stack_size as usize)
         }
         None => func_idx + wanted,
     };
@@ -925,7 +925,7 @@ fn apply_native_continuation<'gc>(
     // `base`.
     let caller_top = {
         let frame = ts.top_lua().unwrap();
-        frame.base() + frame.closure.proto.max_stack_size as usize
+        frame.base() + frame.closure.max_stack_size as usize
     };
     ts.set_top(caller_top);
 }
@@ -996,10 +996,10 @@ impl<'gc> Sequence<'gc> for HandlerSequence<'gc> {
         self: Pin<&mut Self>,
         ctx: Context<'gc>,
         _exec: Execution<'gc>,
-        stack: Stack<'gc, '_>,
+        mut stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
         let result = stack.get(0);
-        stack.into_parts().0.stack_limit = self.saved_limit;
+        stack.thread_mut().stack_limit = self.saved_limit;
         Err(Error::new(ctx, result).mark_handled())
     }
 
@@ -1012,20 +1012,20 @@ impl<'gc> Sequence<'gc> for HandlerSequence<'gc> {
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
         // An already handled error is "error in error handling" from a stack
         // overflow in the handler; it goes to the catcher as is.
-        if err.is_handled() || self.depth == MAX_HANDLER_DEPTH {
-            stack.into_parts().0.stack_limit = self.saved_limit;
-            return Err(if err.is_handled() {
-                err
-            } else {
-                vm::debug::error_in_error_handling(ctx)
+        let err = if err.is_handled() {
+            err
+        } else if self.depth == MAX_HANDLER_DEPTH {
+            vm::debug::error_in_error_handling(ctx)
+        } else {
+            self.depth += 1;
+            stack.replace(&[err.value()]);
+            return Ok(SequencePoll::Call {
+                function: self.handler,
+                bottom: 0,
             });
-        }
-        self.depth += 1;
-        stack.replace(&[err.value()]);
-        Ok(SequencePoll::Call {
-            function: self.handler,
-            bottom: 0,
-        })
+        };
+        stack.thread_mut().stack_limit = self.saved_limit;
+        Err(err)
     }
 
     fn catch(&self) -> Catch<'gc> {

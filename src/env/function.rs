@@ -212,6 +212,12 @@ impl<'gc, 'a> Stack<'gc, 'a> {
         (self.thread, self.bottom)
     }
 
+    /// The thread this stack belongs to, for the executor's own sequences.
+    #[inline]
+    pub(crate) fn thread_mut(&mut self) -> &mut ThreadState<'gc> {
+        self.thread
+    }
+
     /// The executor state of the thread this stack belongs to.
     #[inline]
     pub fn exec(&self) -> Execution<'gc> {

@@ -125,10 +125,7 @@ impl<'gc> LuaFrame<'gc> {
 
     /// `pc` as an index into `closure.proto.code`.
     pub fn pc_index(&self) -> usize {
-        unsafe {
-            self.pc
-                .offset_from_unsigned(self.closure.proto.code.as_ptr())
-        }
+        unsafe { self.pc.offset_from_unsigned(self.closure.code) }
     }
 }
 
@@ -463,7 +460,7 @@ impl<'gc> ThreadState<'gc> {
     pub(crate) fn live_top(&self) -> usize {
         self.frames
             .last()
-            .map_or(0, |lf| lf.base() + lf.closure.proto.max_stack_size as usize)
+            .map_or(0, |lf| lf.base() + lf.closure.max_stack_size as usize)
             .max(self.top)
     }
 
