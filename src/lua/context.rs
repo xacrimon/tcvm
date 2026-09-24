@@ -5,7 +5,6 @@ use crate::dmm::{DynamicRootSet, Gc, Mutation, RefLock};
 use crate::env::function::{Function, UpvalueState};
 use crate::env::shape::Shape;
 use crate::env::string::Interner;
-use crate::env::value::ValueKind;
 use crate::env::{LuaString, Symbols, Table, Thread, Value};
 use crate::lua::stash::{Fetchable, Stashable};
 use crate::lua::{LoadError, State};
@@ -63,7 +62,7 @@ impl<'gc> Context<'gc> {
         } else if let Some(u) = v.get_userdata() {
             u.metatable()
         } else {
-            self.state.type_metatables[type_mt_slot(v.kind())].get()
+            self.state.type_metatable(v.kind()).get()
         }
     }
 
@@ -82,7 +81,7 @@ impl<'gc> Context<'gc> {
         } else if let Some(u) = v.get_userdata() {
             u.set_metatable(self.mutation, mt);
         } else {
-            self.state.type_metatables[type_mt_slot(v.kind())].set(self.mutation, mt);
+            self.state.type_metatable(v.kind()).set(self.mutation, mt);
         }
     }
 
@@ -129,19 +128,5 @@ impl<'gc> Context<'gc> {
             RefLock::new(UpvalueState::Closed(Value::table(self.state.globals))),
         );
         Ok(Function::new_lua(self.mutation, proto, Box::from([env_uv])))
-    }
-}
-
-/// `State::type_metatables` slot for a type without per-value metatables.
-#[inline]
-fn type_mt_slot(kind: ValueKind) -> usize {
-    match kind {
-        ValueKind::Nil => 0,
-        ValueKind::Boolean => 1,
-        ValueKind::Integer | ValueKind::Float => 2,
-        ValueKind::String => 3,
-        ValueKind::Function => 4,
-        ValueKind::Thread => 5,
-        ValueKind::Table | ValueKind::Userdata => unreachable!("per-value metatable"),
     }
 }
