@@ -110,6 +110,7 @@ pub(crate) enum OpError<'gc> {
     ModByZero,
     IndexChainLoop,
     NewIndexChainLoop,
+    CallChainTooLong,
     /// ERRNNIL: constant index of the global's name.
     GlobalRedefined(u16),
     ForStepZero,
@@ -414,6 +415,7 @@ macro_rules! helpers {
                     // resume / unwind from the installed frame state.
                     MetaDispatch::Suspended => return,
                     MetaDispatch::Unresolvable => raise!(OpError::$$err(__mm_meta)),
+                    MetaDispatch::CallChainTooLong => raise!(OpError::CallChainTooLong),
                     MetaDispatch::StackOverflow => raise!(OpError::StackOverflow),
                 }
             }};
@@ -2651,8 +2653,9 @@ extern "rust-preserve-none" fn op_call_meta<'gc>(
     let (func, nargs, returns) = instruction.abc();
     let base = unsafe { (*frame).base() };
     let func_idx = base + func as usize;
-    let Some((target, nargs)) = resolve_call_chain(ctx, thread, func_idx, nargs) else {
-        raise!(OpError::Call(thread.stack[func_idx]));
+    let (target, nargs) = match resolve_call_chain(ctx, thread, func_idx, nargs) {
+        Ok(r) => r,
+        Err(e) => raise!(e),
     };
 
     match target {
@@ -2891,8 +2894,9 @@ extern "rust-preserve-none" fn op_tailcall_slow<'gc>(
     let (func, nargs) = instruction.ab();
     let base = unsafe { (*frame).base() };
     let func_idx = base + func as usize;
-    let Some((target, nargs)) = resolve_call_chain(ctx, thread, func_idx, nargs) else {
-        raise!(OpError::Call(thread.stack[func_idx]));
+    let (target, nargs) = match resolve_call_chain(ctx, thread, func_idx, nargs) {
+        Ok(r) => r,
+        Err(e) => raise!(e),
     };
 
     match target {
@@ -4256,33 +4260,38 @@ pub(crate) enum MetaDispatch {
     /// Target is not callable (or a suspending comparison metamethod, which we
     /// don't support). The caller raises.
     Unresolvable,
+    /// The target's `__call` chain is too long. The caller raises.
+    CallChainTooLong,
     /// The call would cross the stack limit. The caller raises.
     StackOverflow,
 }
 
+/// `__call` hops a call may take before "'__call' chain too long", like the
+/// reference's 4-bit `CIST_CCMT` counter.
+const MAX_CALL_CHAIN: usize = 15;
+
 /// Walk the `__call` chain at `thread.stack[func_idx]` until we hit a
 /// callable target, shifting args right by one on each hop to prepend the
 /// current callee as the first argument (Lua 5.5 `tryfuncTM` behavior).
-/// Returns the resolved target and the (possibly adjusted) `nargs`, or
-/// `None` if the chain is unresolvable: non-callable value, `nargs`
-/// overflow, or `MAX_TAG_LOOP` exhaustion. Callers raise on `None`.
+/// Returns the resolved target and the (possibly adjusted) `nargs`, or the
+/// error to raise.
 #[inline(always)]
 pub(crate) fn resolve_call_chain<'gc>(
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
     func_idx: usize,
     nargs: u8,
-) -> Option<(CallTarget<'gc>, u8)> {
+) -> Result<(CallTarget<'gc>, u8), OpError<'gc>> {
     // Plain functions are the overwhelmingly common case; keep the `__call`
     // walk (and its stack frame) out of the handler.
     if let Some(f) = thread.stack[func_idx].get_function() {
-        return match f.inner().as_ref() {
-            FunctionKind::Lua(_) => Some((
+        return Ok(match f.inner().as_ref() {
+            FunctionKind::Lua(_) => (
                 CallTarget::Lua(unsafe { LuaFn::from_function_unchecked(f) }),
                 nargs,
-            )),
-            FunctionKind::Native(nc) => Some((CallTarget::Native(nc), nargs)),
-        };
+            ),
+            FunctionKind::Native(nc) => (CallTarget::Native(nc), nargs),
+        });
     }
     resolve_call_chain_slow(ctx, thread, func_idx, nargs)
 }
@@ -4294,21 +4303,22 @@ fn resolve_call_chain_slow<'gc>(
     thread: &mut ThreadState<'gc>,
     func_idx: usize,
     mut nargs: u8,
-) -> Option<(CallTarget<'gc>, u8)> {
-    for _ in 0..MAX_TAG_LOOP {
+) -> Result<(CallTarget<'gc>, u8), OpError<'gc>> {
+    let mut hops = 0;
+    loop {
         let func_val = thread.stack[func_idx];
         if let Some(f) = func_val.get_function() {
-            return match f.inner().as_ref() {
-                FunctionKind::Lua(_) => Some((
+            return Ok(match f.inner().as_ref() {
+                FunctionKind::Lua(_) => (
                     CallTarget::Lua(unsafe { LuaFn::from_function_unchecked(f) }),
                     nargs,
-                )),
-                FunctionKind::Native(nc) => Some((CallTarget::Native(nc), nargs)),
-            };
+                ),
+                FunctionKind::Native(nc) => (CallTarget::Native(nc), nargs),
+            });
         }
         let mm = ctx.metamethod_of(func_val, ctx.symbols().mm_call);
         if mm.is_nil() {
-            return None;
+            return Err(OpError::Call(func_val));
         }
         // A MULTRET call (`nargs == 0`) carries its count in `thread.top`.
         let actual_args = if nargs == 0 {
@@ -4322,13 +4332,19 @@ fn resolve_call_chain_slow<'gc>(
         }
         thread.stack[func_idx + 1] = func_val;
         thread.stack[func_idx] = mm;
-        if nargs == 0 {
-            thread.set_top(thread.top + 1);
+        if hops == MAX_CALL_CHAIN {
+            return Err(OpError::CallChainTooLong);
+        }
+        hops += 1;
+        // A count that no longer fits in `nargs` moves to `thread.top`, as
+        // MULTRET's does.
+        if nargs == 0 || nargs == u8::MAX {
+            thread.set_top(func_idx + 2 + actual_args);
+            nargs = 0;
         } else {
-            nargs = nargs.checked_add(1)?;
+            nargs += 1;
         }
     }
-    None
 }
 
 /// Binary metamethod `name`, taken from `lhs` first, then `rhs`.
@@ -4400,8 +4416,10 @@ fn schedule_meta_call<'gc>(
     // function slot), so `args.len() + 1`.
     debug_assert!(args.len() < u8::MAX as usize);
     let nargs = (args.len() + 1) as u8;
-    let Some((target, final_nargs)) = resolve_call_chain(ctx, thread, scratch_func, nargs) else {
-        return MetaDispatch::Unresolvable;
+    let (target, final_nargs) = match resolve_call_chain(ctx, thread, scratch_func, nargs) {
+        Ok(r) => r,
+        Err(OpError::CallChainTooLong) => return MetaDispatch::CallChainTooLong,
+        Err(_) => return MetaDispatch::Unresolvable,
     };
     let actual_args = final_nargs as usize - 1;
 
