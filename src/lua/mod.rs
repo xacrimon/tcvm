@@ -19,7 +19,7 @@ pub use stash::{
 
 use crate::builtin;
 use crate::dmm::Rootable;
-use crate::dmm::{Arena, Collect, DynamicRootSet, Mutation};
+use crate::dmm::{Arena, Collect, DynamicRootSet, Gc, GcLock, Lock, Mutation};
 use crate::env::shape::Shape;
 use crate::env::string::Interner;
 use crate::env::{Symbols, Table, Thread};
@@ -44,6 +44,9 @@ pub struct State<'gc> {
     pub(crate) main_thread: Thread<'gc>,
     pub(crate) roots: DynamicRootSet<'gc>,
     pub(crate) interner: Interner<'gc>,
+    /// Metatables shared by all values of a type that has no per-value one
+    /// (PUC's `G(L)->mt`), indexed by `context::type_mt_slot`.
+    pub(crate) type_metatables: [GcLock<'gc, Option<Table<'gc>>>; 6],
 }
 
 /// A Lua runtime instance.
@@ -72,6 +75,7 @@ impl Lua {
                 main_thread: Thread::new(mc),
                 roots: DynamicRootSet::new(mc),
                 interner,
+                type_metatables: std::array::from_fn(|_| Gc::new(mc, Lock::new(None))),
             }
         });
         Lua { arena }
