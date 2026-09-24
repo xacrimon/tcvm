@@ -65,12 +65,21 @@ fn lua_getlocal<'gc>(
     todo!()
 }
 
+/// `debug.getmetatable(v)` — `v`'s metatable, ignoring `__metatable`.
 fn lua_getmetatable<'gc>(
-    _ctx: Context<'gc>,
+    ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
-    _stack: Stack<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    if stack.is_empty() {
+        return Err(Error::from_str(
+            ctx,
+            "bad argument #1 to 'getmetatable' (value expected)",
+        ));
+    }
+    let mt = ctx.metatable_of(stack.get(0));
+    stack.replace(&[mt.map_or(Value::nil(), Value::table)]);
+    Ok(CallbackAction::Return)
 }
 
 fn lua_getregistry<'gc>(
@@ -113,12 +122,33 @@ fn lua_setlocal<'gc>(
     todo!()
 }
 
+/// `debug.setmetatable(v, mt)` — set `v`'s metatable (shared by its whole
+/// type unless `v` is a table or userdata), ignoring `__metatable`; returns `v`.
 fn lua_setmetatable<'gc>(
-    _ctx: Context<'gc>,
+    ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
-    _stack: Stack<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    let v = stack.get(0);
+    let mt_arg = stack.get(1);
+    let mt = match mt_arg.get_table() {
+        Some(mt) => Some(mt),
+        None if mt_arg.is_nil() && stack.len() >= 2 => None,
+        None => {
+            let got = if stack.len() < 2 {
+                "no value"
+            } else {
+                mt_arg.type_name()
+            };
+            return Err(Error::from_str(
+                ctx,
+                &format!("bad argument #2 to 'setmetatable' (nil or table expected, got {got})"),
+            ));
+        }
+    };
+    ctx.set_metatable_of(v, mt);
+    stack.replace(&[v]);
+    Ok(CallbackAction::Return)
 }
 
 fn lua_setupvalue<'gc>(

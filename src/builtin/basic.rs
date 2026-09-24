@@ -135,15 +135,14 @@ fn lua_getmetatable<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let v = stack.get(0);
-    // A `__metatable` field shadows the real metatable (protection); tables
-    // and userdata both carry per-object metatables.
-    let metatable = if let Some(t) = v.get_table() {
-        t.metatable()
-    } else {
-        v.get_userdata().and_then(|u| u.metatable())
-    };
-    let result = match metatable {
+    if stack.is_empty() {
+        return Err(Error::from_str(
+            ctx,
+            "bad argument #1 to 'getmetatable' (value expected)",
+        ));
+    }
+    // A `__metatable` field shadows the real metatable (protection).
+    let result = match ctx.metatable_of(stack.get(0)) {
         Some(mt) => {
             let prot = mt.raw_get(Value::string(LuaString::new(ctx, b"__metatable")));
             if prot.is_nil() {
