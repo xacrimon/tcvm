@@ -4912,15 +4912,14 @@ pub(crate) fn frame_return<'gc>(
             return FrameReturn::TopLevel;
         }
         // The parent isn't a Lua frame (Sequence/WaitThread/etc.), so the
-        // executor driver picks up here: place all `nret` values at
-        // `stack[dst_start..]` for the parent's window. Since no register
-        // window sits above the results the shrink is legal, and it publishes
-        // the parent's input window as `stack[dst_start..top]`.
+        // executor driver picks up here with all `nret` values as its input
+        // window `stack[dst_start..top]`. The slots above stay allocated for
+        // the next call; the collector clears them.
         None => {
             thread
                 .stack
                 .copy_within(values_base..values_base + nret, dst_start);
-            thread.discard_above(dst_start + nret);
+            thread.set_top_unchecked(dst_start + nret);
             return FrameReturn::ToNonLua;
         }
     };
