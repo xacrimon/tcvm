@@ -159,3 +159,113 @@ fn missing_metamethod_errors() {
         "c:1: attempt to perform arithmetic on a boolean value"
     );
 }
+
+#[test]
+fn per_type_index() {
+    assert_eq!(
+        ok("debug.setmetatable(0, {__index = math})
+            return cat((2.5):floor(), (4).sqrt(16), (3).pi == math.pi, (3)['huge'])"),
+        "2 4.0 true inf"
+    );
+    assert_eq!(
+        ok("debug.setmetatable(1, {__index = setmetatable({}, {
+                __index = function(t, k) return 'deep ' .. k end,
+            })})
+            return (1).z"),
+        "deep z"
+    );
+    assert_eq!(
+        ok("debug.setmetatable(print, {__index = {name = 'fn'}})
+            return cat(print.name, (function() end).name)"),
+        "fn fn"
+    );
+}
+
+#[test]
+fn per_type_newindex() {
+    assert_eq!(
+        ok("local log = {}
+            debug.setmetatable(nil, {
+                __index = function(_, k) return k end,
+                __newindex = function(_, k, v) log[#log + 1] = k .. '=' .. v end,
+            })
+            local t
+            t.x = 1
+            t[2] = 3
+            return cat(t.hello, t[1], table.concat(log, ','))"),
+        "hello 1 x=1,2=3"
+    );
+    assert_eq!(
+        ok("local store = {}
+            debug.setmetatable(true, {__newindex = store})
+            local b = true
+            b.x = 5
+            return cat(store.x, rawget(store, 'x'))"),
+        "5 5"
+    );
+}
+
+#[test]
+fn userdata_newindex_and_function_index() {
+    assert_eq!(
+        ok("local store = {}
+            getmetatable(io.stdout).__newindex = function(u, k, v) store[k] = v end
+            io.stdout.foo = 3
+            return cat(store.foo)"),
+        "3"
+    );
+    assert_eq!(
+        ok(
+            "getmetatable(io.stdout).__index = function(u, k) return 'fn:' .. k end
+            return io.stdout.abc"
+        ),
+        "fn:abc"
+    );
+}
+
+#[test]
+fn upvalue_env_of_another_type() {
+    assert_eq!(
+        ok("local dbg, log = debug, {}
+            dbg.setmetatable(0, {
+                __index = function(_, k) return k .. '!' end,
+                __newindex = function(_, k, v) log[k] = v end,
+            })
+            local _ENV = 0
+            local r = (function() x = 'set'; return hello end)()
+            return r .. ' ' .. log.x"),
+        "hello! set"
+    );
+}
+
+#[test]
+fn index_errors_on_values_without_index() {
+    // A method lookup on a receiver without `__index` is an index error, not a
+    // nil method.
+    assert_eq!(
+        err("local function f() return io.stdout end
+             getmetatable(io.stdout).__index = nil
+             return f():write('x')"),
+        "c:3: attempt to index a FILE* value"
+    );
+    assert_eq!(
+        err("local function f() return 5 end return f().y"),
+        "c:1: attempt to index a number value"
+    );
+    assert_eq!(
+        err("local function f() return 5 end f().y = 1"),
+        "c:1: attempt to index a number value"
+    );
+    assert_eq!(
+        err("local function f() return true end return f():m()"),
+        "c:1: attempt to index a boolean value"
+    );
+    assert_eq!(
+        err("debug.setmetatable(0, {__index = 5}) return (1).x"),
+        "c:1: '__index' chain too long; possible loop"
+    );
+    assert_eq!(
+        err("debug.setmetatable(0, {__newindex = 7}) local n = 1 n.x = 2"),
+        "c:1: '__newindex' chain too long; possible loop"
+    );
+}

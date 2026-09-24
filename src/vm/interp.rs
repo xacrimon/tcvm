@@ -474,36 +474,29 @@ macro_rules! apply_cont_payload {
     }};
 }
 
-/// Inflates the slow-path body for "table get with metamethod".
+/// Inflates the slow-path body for `R[dst] = recv[k]` on any receiver.
 /// Expects `helpers!(...)` to have been invoked in the enclosing handler
 /// so `dispatch!`, `raise!`, `invoke_metamethod!`, and `reg!` resolve.
-///
-/// Steps:
-///   1. Try a direct `raw_get`. Non-nil result is the answer.
-///   2. Nil result + no `__index` → answer is nil.
-///   3. Nil result + `__index` → walk the chain. Resolved values
-///      land in `$dst`; functions fire via `invoke_metamethod!`.
-macro_rules! table_get_slow_body {
+macro_rules! get_slow_body {
     ($ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr, $ds:ident,
-     $t:expr, $k:expr, $dst:expr) => {{
-        let __t: Table<'gc> = $t;
+     $recv:expr, $k:expr, $dst:expr) => {{
+        let __recv: Value<'gc> = $recv;
         let __k: Value<'gc> = $k;
         let __dst_reg: u8 = $dst;
 
-        let __v = __t.raw_get(__k);
-        if !__v.is_nil() {
-            *reg!(ref mut __dst_reg) = __v;
-            dispatch!();
-        }
-
-        if !__t.shape().has_mm(MetamethodBits::INDEX) {
-            *reg!(ref mut __dst_reg) = Value::nil();
-            dispatch!();
-        }
-
-        // INDEX bit implies metatable is Some.
-        let __mt = unsafe { __t.metatable().unwrap_unchecked() };
-        match walk_index_chain(Value::table(__t), __mt, __k, $ctx.symbols().mm_index) {
+        let __mm = if let Some(__t) = __recv.get_table() {
+            let __v = __t.raw_get(__k);
+            if !__v.is_nil() || !__t.shape().has_mm(MetamethodBits::INDEX) {
+                *reg!(ref mut __dst_reg) = __v;
+                dispatch!();
+            }
+            // INDEX bit implies metatable is Some.
+            let __mt = unsafe { __t.metatable().unwrap_unchecked() };
+            __mt.raw_get(Value::string($ctx.symbols().mm_index))
+        } else {
+            $ctx.metamethod_of(__recv, $ctx.symbols().mm_index)
+        };
+        match walk_index_chain($ctx, __recv, __mm, __k) {
             IndexChain::Resolved(__rv) => {
                 *reg!(ref mut __dst_reg) = __rv;
                 dispatch!();
@@ -515,54 +508,20 @@ macro_rules! table_get_slow_body {
                 let __cont = Continuation::StoreResult { dst: __dst_reg };
                 invoke_metamethod!(__mm_func, &[__mm_recv, __k], __cont, Index);
             }
+            IndexChain::NotIndexable(__v) => raise!(OpError::Index(__v)),
             IndexChain::Exhausted => raise!(OpError::IndexChainLoop),
         }
     }};
 }
 
-/// Inflates the slow-path body for "userdata get via `__index`". Unlike
-/// the table case, a userdata with no metatable or a nil `__index` is an
-/// "attempt to index" error (`userdata_index_chain` returns `Err`), since
-/// userdata has no raw indexing to fall back to. A key absent from the
-/// `__index` table still resolves to nil.
-macro_rules! userdata_get_slow_body {
+/// Inflates the slow-path body for `recv[k] = v` on any receiver.
+macro_rules! set_slow_body {
     ($ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr, $ds:ident,
-     $u:expr, $recv:expr, $k:expr, $dst:expr) => {{
-        let __u = $u;
-        let __recv: Value<'gc> = $recv;
-        let __k: Value<'gc> = $k;
-        let __dst_reg: u8 = $dst;
-
-        match userdata_index_chain(__u, __recv, __k, $ctx.symbols().mm_index) {
-            Err(()) => raise!(OpError::Index(__recv)),
-            Ok(IndexChain::Resolved(__rv)) => {
-                *reg!(ref mut __dst_reg) = __rv;
-                dispatch!();
-            }
-            Ok(IndexChain::Invoke {
-                func: __mm_func,
-                receiver: __mm_recv,
-            }) => {
-                let __cont = Continuation::StoreResult { dst: __dst_reg };
-                invoke_metamethod!(__mm_func, &[__mm_recv, __k], __cont, Index);
-            }
-            Ok(IndexChain::Exhausted) => raise!(OpError::IndexChainLoop),
-        }
-    }};
-}
-
-/// Inflates the slow-path body for "table set with metamethod".
-///
-/// Walks the `__newindex` chain via `walk_newindex_chain`, which
-/// returns either the table to raw-write into, or a callable to invoke.
-macro_rules! table_set_slow_body {
-    ($ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr, $ds:ident,
-     $t:expr, $k:expr, $v:expr) => {{
-        let __t: Table<'gc> = $t;
+     $recv:expr, $k:expr, $v:expr) => {{
         let __k: Value<'gc> = $k;
         let __new_val: Value<'gc> = $v;
 
-        match walk_newindex_chain(__t, __k, $ctx.symbols().mm_newindex) {
+        match walk_newindex_chain($ctx, $recv, __k) {
             NewIndexChain::RawSet(__target) => {
                 check_index_key!(__k);
                 __target.raw_set($ctx, __k, __new_val);
@@ -575,6 +534,7 @@ macro_rules! table_set_slow_body {
                 let __cont = Continuation::IgnoreResult;
                 invoke_metamethod!(__mm_func, &[__mm_recv, __k, __new_val], __cont, Index);
             }
+            NewIndexChain::NotIndexable(__v) => raise!(OpError::Index(__v)),
             NewIndexChain::Exhausted => raise!(OpError::NewIndexChainLoop),
         }
     }};
@@ -856,7 +816,7 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
     let t_val = read_upvalue(thread, uv);
 
     let Some(t) = t_val.get_table() else {
-        raise!(OpError::Index(t_val));
+        tail!(gettabup_slow);
     };
 
     let cache = read_ic(closure, ic_idx);
@@ -892,12 +852,11 @@ extern "rust-preserve-none" fn gettabup_slow<'gc>(
     let (dst, idx, ic_idx, key) = instruction.abde();
     let uv = upvalue!(idx);
     let t_val = read_upvalue(thread, uv);
-    let Some(t) = t_val.get_table() else {
-        raise!(OpError::Index(t_val));
-    };
     let k = constant!(key);
-    fill_ic_for_constant_key(ctx, closure, ic_idx, t, k);
-    table_get_slow_body!(ctx, thread, registers, ip, handlers, ds, t, k, dst);
+    if let Some(t) = t_val.get_table() {
+        fill_ic_for_constant_key(ctx, closure, ic_idx, t, k);
+    }
+    get_slow_body!(ctx, thread, registers, ip, handlers, ds, t_val, k, dst);
 }
 
 /// UpValue[idx][K[key]] = R[src]
@@ -920,7 +879,7 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
     let t_val = read_upvalue(thread, uv);
 
     let Some(t) = t_val.get_table() else {
-        raise!(OpError::Index(t_val));
+        tail!(settabup_slow);
     };
 
     let v = reg!(src);
@@ -960,13 +919,12 @@ extern "rust-preserve-none" fn settabup_slow<'gc>(
     let (src, idx, ic_idx, key) = instruction.abde();
     let uv = upvalue!(idx);
     let t_val = read_upvalue(thread, uv);
-    let Some(t) = t_val.get_table() else {
-        raise!(OpError::Index(t_val));
-    };
     let k = constant!(key);
     let v = reg!(src);
-    fill_ic_for_constant_key(ctx, closure, ic_idx, t, k);
-    table_set_slow_body!(ctx, thread, registers, ip, handlers, ds, t, k, v);
+    if let Some(t) = t_val.get_table() {
+        fill_ic_for_constant_key(ctx, closure, ic_idx, t, k);
+    }
+    set_slow_body!(ctx, thread, registers, ip, handlers, ds, t_val, k, v);
 }
 
 // ---------------------------------------------------------------------------
@@ -1028,13 +986,7 @@ extern "rust-preserve-none" fn gettable_slow<'gc>(
     let (dst, table, key) = instruction.abc();
     let recv = reg!(table);
     let k = reg!(key);
-    if let Some(t) = recv.get_table() {
-        table_get_slow_body!(ctx, thread, registers, ip, handlers, ds, t, k, dst);
-    }
-    let Some(u) = recv.get_userdata() else {
-        raise!(OpError::Index(recv));
-    };
-    userdata_get_slow_body!(ctx, thread, registers, ip, handlers, ds, u, recv, k, dst);
+    get_slow_body!(ctx, thread, registers, ip, handlers, ds, recv, k, dst);
 }
 
 /// R[table][R[key]] = R[src]
@@ -1055,7 +1007,7 @@ extern "rust-preserve-none" fn op_settable<'gc>(
     let (src, table, key) = instruction.abc();
 
     let Some(t) = reg!(table).get_table() else {
-        raise!(OpError::Index(reg!(table)));
+        tail!(settable_slow);
     };
 
     let k = reg!(key);
@@ -1090,12 +1042,8 @@ extern "rust-preserve-none" fn settable_slow<'gc>(
 ) {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (src, table, key) = instruction.abc();
-    let Some(t) = reg!(table).get_table() else {
-        raise!(OpError::Index(reg!(table)));
-    };
-    let k = reg!(key);
-    let v = reg!(src);
-    table_set_slow_body!(ctx, thread, registers, ip, handlers, ds, t, k, v);
+    let (recv, k, v) = (reg!(table), reg!(key), reg!(src));
+    set_slow_body!(ctx, thread, registers, ip, handlers, ds, recv, k, v);
 }
 
 /// R[dst] = R[table][K[key_idx]]
@@ -1155,12 +1103,8 @@ extern "rust-preserve-none" fn getfield_slow<'gc>(
     let k = constant!(key_idx);
     if let Some(t) = recv.get_table() {
         fill_ic_for_constant_key(ctx, closure, ic_idx, t, k);
-        table_get_slow_body!(ctx, thread, registers, ip, handlers, ds, t, k, dst);
     }
-    let Some(u) = recv.get_userdata() else {
-        raise!(OpError::Index(recv));
-    };
-    userdata_get_slow_body!(ctx, thread, registers, ip, handlers, ds, u, recv, k, dst);
+    get_slow_body!(ctx, thread, registers, ip, handlers, ds, recv, k, dst);
 }
 
 /// R[table][K[key_idx]] = R[src]
@@ -1181,7 +1125,7 @@ extern "rust-preserve-none" fn op_setfield<'gc>(
     let (src, table, ic_idx, key_idx) = instruction.abde();
 
     let Some(t) = reg!(table).get_table() else {
-        raise!(OpError::Index(reg!(table)));
+        tail!(setfield_slow);
     };
 
     let v = reg!(src);
@@ -1218,13 +1162,13 @@ extern "rust-preserve-none" fn setfield_slow<'gc>(
 ) {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (src, table, ic_idx, key_idx) = instruction.abde();
-    let Some(t) = reg!(table).get_table() else {
-        raise!(OpError::Index(reg!(table)));
-    };
+    let recv = reg!(table);
     let k = constant!(key_idx);
     let v = reg!(src);
-    fill_ic_for_constant_key(ctx, closure, ic_idx, t, k);
-    table_set_slow_body!(ctx, thread, registers, ip, handlers, ds, t, k, v);
+    if let Some(t) = recv.get_table() {
+        fill_ic_for_constant_key(ctx, closure, ic_idx, t, k);
+    }
+    set_slow_body!(ctx, thread, registers, ip, handlers, ds, recv, k, v);
 }
 
 // ---------------------------------------------------------------------------
@@ -1252,8 +1196,7 @@ extern "rust-preserve-none" fn op_self<'gc>(
 
     let recv_val = reg!(object);
     let Some(recv) = recv_val.get_table() else {
-        // Non-table receiver (userdata method dispatch, or an error).
-        tail!(op_self_nontable);
+        tail!(op_self_slow);
     };
 
     let key = constant!(key_idx);
@@ -1290,15 +1233,18 @@ extern "rust-preserve-none" fn op_self_slow<'gc>(
     let (dst, object, key_idx) = instruction.abd();
 
     let recv_val = reg!(object);
-    let Some(recv) = recv_val.get_table() else {
-        raise!(OpError::Index(recv_val));
-    };
     let key = constant!(key_idx);
 
-    // Reachable only when raw_get returned nil and the INDEX bit is set,
-    // so we go straight to the chain walk.
-    let mt = unsafe { recv.metatable().unwrap_unchecked() };
-    match walk_index_chain(recv_val, mt, key, ctx.symbols().mm_index) {
+    let mm = match recv_val.get_table() {
+        // Reachable for a table only after a raw miss with the INDEX bit
+        // set, which implies a metatable.
+        Some(t) => {
+            let mt = unsafe { t.metatable().unwrap_unchecked() };
+            mt.raw_get(Value::string(ctx.symbols().mm_index))
+        }
+        None => ctx.metamethod_of(recv_val, ctx.symbols().mm_index),
+    };
+    match walk_index_chain(ctx, recv_val, mm, key) {
         IndexChain::Resolved(method) => {
             *reg!(ref mut dst) = method;
             *reg!(ref mut (dst + 1)) = recv_val;
@@ -1311,54 +1257,7 @@ extern "rust-preserve-none" fn op_self_slow<'gc>(
             let cont = Continuation::StoreResult { dst };
             invoke_metamethod!(func, &[receiver, key], cont, Index);
         }
-        IndexChain::Exhausted => raise!(OpError::IndexChainLoop),
-    }
-}
-
-/// SELF on a non-table receiver. Userdata dispatches through its
-/// metatable's `__index`; unlike GETTABLE, a missing method is *not* an
-/// error here — we write `nil` into `R[dst]` and let the subsequent CALL
-/// raise "attempt to call a nil value (method ...)", matching Lua. A
-/// userdata with no metatable / nil `__index` likewise yields a nil
-/// method (the CALL raises). Any other non-table receiver raises.
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn op_self_nontable<'gc>(
-    instruction: Instruction,
-    ctx: Context<'gc>,
-    thread: &mut ThreadState<'gc>,
-    mut registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
-    handlers: *const (),
-    ds: &mut DispatchState<'gc>,
-    frame: *mut LuaFrame<'gc>,
-    closure: LuaFn<'gc>,
-) {
-    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-    let (dst, object, key_idx) = instruction.abd();
-
-    let recv_val = reg!(object);
-    let Some(u) = recv_val.get_userdata() else {
-        raise!(OpError::Index(recv_val));
-    };
-    let key = constant!(key_idx);
-
-    let chain = match userdata_index_chain(u, recv_val, key, ctx.symbols().mm_index) {
-        // No metatable or nil `__index`: nil method, CALL raises.
-        Err(()) => IndexChain::Resolved(Value::nil()),
-        Ok(c) => c,
-    };
-    match chain {
-        IndexChain::Resolved(method) => {
-            *reg!(ref mut dst) = method;
-            *reg!(ref mut (dst + 1)) = recv_val;
-            dispatch!();
-        }
-        IndexChain::Invoke { func, receiver } => {
-            *reg!(ref mut (dst + 1)) = recv_val;
-            let cont = Continuation::StoreResult { dst };
-            invoke_metamethod!(func, &[receiver, key], cont, Index);
-        }
+        IndexChain::NotIndexable(v) => raise!(OpError::Index(v)),
         IndexChain::Exhausted => raise!(OpError::IndexChainLoop),
     }
 }
@@ -4236,129 +4135,108 @@ pub(crate) const MAX_TAG_LOOP: usize = 2000;
 pub(crate) enum IndexChain<'gc> {
     /// The chain resolved synchronously to a value (possibly `Nil`).
     Resolved(Value<'gc>),
-    /// The chain ended in a callable that must be invoked with
-    /// `(receiver, key)`. `receiver` is the table that owned the function
-    /// `__index`, matching Lua's `luaV_finishget` behavior.
+    /// The chain ended in a function that must be invoked with
+    /// `(receiver, key)`, `receiver` being the value whose metatable held it.
     Invoke {
         func: Value<'gc>,
         receiver: Value<'gc>,
     },
+    /// A non-table in the chain has no `__index`; the caller raises
+    /// "attempt to index" on it.
+    NotIndexable(Value<'gc>),
     /// Chain depth exceeded `MAX_TAG_LOOP`; caller should raise.
     Exhausted,
 }
 
-/// Walk the `__index` chain starting from `start_metatable`'s `__index`
-/// slot. `start_receiver` is the value originally indexed — a `Table`
-/// for the table paths, a `Userdata` for the userdata path — and is the
-/// `receiver` handed to a functional `__index` resolved at depth 0
-/// (deeper hops use the intermediate `__index` table as receiver, per
-/// `luaV_finishget`). `mm_index_name` is the pre-interned `__index`
-/// LuaString — the function never re-interns it.
-#[inline]
+/// Resolve `key` from `mm`, the `__index` metavalue of `receiver`, whose raw
+/// lookup (if it is a table) already missed (`luaV_finishget`).
 pub(crate) fn walk_index_chain<'gc>(
-    start_receiver: Value<'gc>,
-    start_metatable: Table<'gc>,
+    ctx: Context<'gc>,
+    mut receiver: Value<'gc>,
+    mut mm: Value<'gc>,
     key: Value<'gc>,
-    mm_index_name: LuaString<'gc>,
 ) -> IndexChain<'gc> {
-    let mut current_receiver = start_receiver;
-    let mut mm = start_metatable.raw_get(Value::string(mm_index_name));
+    let index = ctx.symbols().mm_index;
     for _ in 0..MAX_TAG_LOOP {
         if mm.is_nil() {
-            return IndexChain::Resolved(Value::nil());
+            return match receiver.get_table() {
+                Some(_) => IndexChain::Resolved(Value::nil()),
+                None => IndexChain::NotIndexable(receiver),
+            };
         }
-        let next = match mm.get_table() {
-            Some(t) => t,
-            None => {
-                return IndexChain::Invoke {
-                    func: mm,
-                    receiver: current_receiver,
-                };
+        if mm.get_function().is_some() {
+            return IndexChain::Invoke { func: mm, receiver };
+        }
+        receiver = mm;
+        mm = match mm.get_table() {
+            Some(t) => {
+                let v = t.raw_get(key);
+                if !v.is_nil() || !t.shape().has_mm(MetamethodBits::INDEX) {
+                    return IndexChain::Resolved(v);
+                }
+                // INDEX bit implies metatable is Some.
+                let mt = unsafe { t.metatable().unwrap_unchecked() };
+                mt.raw_get(Value::string(index))
             }
+            None => ctx.metamethod_of(mm, index),
         };
-        let v = next.raw_get(key);
-        if !v.is_nil() {
-            return IndexChain::Resolved(v);
-        }
-        if !next.shape().has_mm(MetamethodBits::INDEX) {
-            return IndexChain::Resolved(Value::nil());
-        }
-        // INDEX bit implies metatable is Some.
-        let next_mt = unsafe { next.metatable().unwrap_unchecked() };
-        mm = next_mt.raw_get(Value::string(mm_index_name));
-        current_receiver = Value::table(next);
     }
     IndexChain::Exhausted
-}
-
-/// Result of resolving an index on a *userdata* receiver: walk the
-/// userdata metatable's `__index` chain, or signal "raise" when the
-/// userdata has no metatable or a nil `__index` (no raw indexing exists
-/// for userdata, so this is the "attempt to index" case — see
-/// `luaV_finishget`). Callers that tolerate a missing method (SELF) must
-/// not use this; they treat the absent `__index` as a nil result so the
-/// subsequent CALL raises instead.
-#[inline]
-fn userdata_index_chain<'gc>(
-    u: crate::env::Userdata<'gc>,
-    recv_val: Value<'gc>,
-    key: Value<'gc>,
-    mm_index_name: LuaString<'gc>,
-) -> Result<IndexChain<'gc>, ()> {
-    let mt = u.metatable().ok_or(())?;
-    if mt.raw_get(Value::string(mm_index_name)).is_nil() {
-        return Err(());
-    }
-    Ok(walk_index_chain(recv_val, mt, key, mm_index_name))
 }
 
 /// Result of walking a `__newindex` chain.
 enum NewIndexChain<'gc> {
     /// Raw-assign `value` into this table.
     RawSet(Table<'gc>),
-    /// The chain ended in a callable; invoke with `(receiver, key, value)`.
+    /// The chain ended in a function; invoke with `(receiver, key, value)`.
     Invoke {
         func: Value<'gc>,
         receiver: Value<'gc>,
     },
+    /// A non-table in the chain has no `__newindex`; the caller raises.
+    NotIndexable(Value<'gc>),
     /// Chain depth exceeded `MAX_TAG_LOOP`; caller should raise.
     Exhausted,
 }
 
-/// Walk the `__newindex` chain. If the key already exists in `table`, do
-/// a raw set there. Otherwise follow `__newindex` tables; terminate at
-/// the first callable or at a table that has the key (or has no
-/// `__newindex`). `mm_newindex_name` is the pre-interned `__newindex`
-/// LuaString — the function never re-interns it.
+/// Find where `t[key] = v` lands (`luaV_finishset`): the first table that
+/// already has `key` or lacks `__newindex`, or a function `__newindex`.
 #[inline]
 fn walk_newindex_chain<'gc>(
-    table: Table<'gc>,
+    ctx: Context<'gc>,
+    mut t: Value<'gc>,
     key: Value<'gc>,
-    mm_newindex_name: LuaString<'gc>,
 ) -> NewIndexChain<'gc> {
-    let mut t = table;
+    let newindex = ctx.symbols().mm_newindex;
     for _ in 0..MAX_TAG_LOOP {
-        // If the key already has a value, skip __newindex and raw_set here.
-        if !t.raw_get(key).is_nil() {
-            return NewIndexChain::RawSet(t);
-        }
-        if !t.shape().has_mm(MetamethodBits::NEWINDEX) {
-            return NewIndexChain::RawSet(t);
-        }
-        // NEWINDEX bit implies metatable is Some.
-        let mt = unsafe { t.metatable().unwrap_unchecked() };
-        let mm = mt.raw_get(Value::string(mm_newindex_name));
-        if mm.is_nil() {
-            return NewIndexChain::RawSet(t);
-        }
-        if let Some(next) = mm.get_table() {
-            t = next;
-            continue;
-        }
-        return NewIndexChain::Invoke {
-            func: mm,
-            receiver: Value::table(t),
+        let mm = match t.get_table() {
+            Some(tbl) => {
+                if !tbl.raw_get(key).is_nil() || !tbl.shape().has_mm(MetamethodBits::NEWINDEX) {
+                    return NewIndexChain::RawSet(tbl);
+                }
+                // NEWINDEX bit implies metatable is Some.
+                let mt = unsafe { tbl.metatable().unwrap_unchecked() };
+                let mm = mt.raw_get(Value::string(newindex));
+                if mm.is_nil() {
+                    return NewIndexChain::RawSet(tbl);
+                }
+                mm
+            }
+            None => {
+                let mm = ctx.metamethod_of(t, newindex);
+                if mm.is_nil() {
+                    return NewIndexChain::NotIndexable(t);
+                }
+                mm
+            }
         };
+        if mm.get_function().is_some() {
+            return NewIndexChain::Invoke {
+                func: mm,
+                receiver: t,
+            };
+        }
+        t = mm;
     }
     NewIndexChain::Exhausted
 }

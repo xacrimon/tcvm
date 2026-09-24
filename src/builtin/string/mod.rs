@@ -1439,21 +1439,18 @@ async fn table_index_repl(
         let mt = tbl
             .metatable()
             .expect("INDEX metamethod implies a metatable");
-        match walk_index_chain(Value::table(tbl), mt, key_val, ctx.symbols().mm_index) {
+        let mm = mt.raw_get(Value::string(ctx.symbols().mm_index));
+        match walk_index_chain(ctx, Value::table(tbl), mm, key_val) {
             IndexChain::Resolved(rv) => Ok(Plan::Resolved(classify_repl_result(ctx, rv)?)),
-            IndexChain::Invoke { func, receiver } => match func.get_function() {
-                Some(f) => {
-                    stack.replace(&[receiver, key_val]);
-                    Ok(Plan::CallIndex(locals.stash(ctx.mutation(), f)))
-                }
-                // A non-function, non-table `__index` (e.g. a callable userdata
-                // with its own `__call`) is too exotic to drive here; calling a
-                // plain non-function would raise anyway.
-                None => Err(Error::from_str(
-                    ctx,
-                    &format!("attempt to call a {} value", func.type_name()),
-                )),
-            },
+            IndexChain::Invoke { func, receiver } => {
+                let f = func.get_function().expect("Invoke carries a function");
+                stack.replace(&[receiver, key_val]);
+                Ok(Plan::CallIndex(locals.stash(ctx.mutation(), f)))
+            }
+            IndexChain::NotIndexable(v) => Err(Error::from_str(
+                ctx,
+                &format!("attempt to index a {} value", v.type_name()),
+            )),
             IndexChain::Exhausted => Err(Error::from_str(
                 ctx,
                 "'__index' chain too long; possible loop",
