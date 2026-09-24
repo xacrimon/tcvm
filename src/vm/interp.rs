@@ -3003,16 +3003,10 @@ extern "rust-preserve-none" fn op_tailcall_native<'gc>(
                 let func_idx = f.base() - 1 - f.num_extras as usize;
                 (func_idx, f.num_results, f.continuation)
             };
-            // Only a final landing can apply a continuation; the
-            // callee of a plain `Call` returns without one.
             if cont.is_some()
-                && matches!(*action, crate::vm::sequence::Suspend::Call { then: None })
+                && let Some(err) = lost_continuation(ctx, &action)
             {
                 save_pc(thread, ip);
-                let err = crate::env::Error::from_str(
-                    ctx,
-                    "metamethod/iterator native cannot tail-call into Lua across the continuation",
-                );
                 thread.raise(ctx, err);
                 return;
             }
@@ -4663,7 +4657,7 @@ fn schedule_native_meta_call<'gc>(
     new_base: usize,
     actual_args: usize,
 ) -> MetaDispatch {
-    use crate::vm::sequence::{CallbackAction, Suspend};
+    use crate::vm::sequence::CallbackAction;
 
     let args_base = new_base;
     let action = match invoke_native(ctx, thread, nc, args_base, actual_args) {
@@ -4686,26 +4680,17 @@ fn schedule_native_meta_call<'gc>(
                 nret,
             }
         }
-        // A native that wants to call back into Lua (`Call`) delivers its
-        // result through the normal frame-return path, which doesn't run
-        // `land_call_results` and so can't replay our continuation. It's not a
-        // shape any current metamethod/iterator native produces; reject it
-        // cleanly rather than silently dropping the continuation.
-        CallbackAction::Suspend(action) if matches!(*action, Suspend::Call { .. }) => {
-            let err = crate::env::Error::from_str(
-                ctx,
-                "metamethod/iterator native cannot tail-call into Lua across the continuation",
-            );
-            thread.raise(ctx, err);
-            MetaDispatch::Suspended
-        }
-        // Suspending native (`Yield`/`Resume`/`Sequence`). Park the full
-        // continuation on the `CallSite`; when the suspension resolves, its
-        // results funnel through `land_call_results`, which applies the
-        // continuation against the caller frame (`apply_native_continuation`).
-        // This replays every payload uniformly — including `CondJump`, whose
-        // branch decision (a `pc` bump) can't be expressed as a plain landing.
+        // Suspending native. Park the full continuation on the `CallSite`; when
+        // the suspension resolves, its results funnel through
+        // `land_call_results`, which applies the continuation against the
+        // caller frame (`apply_native_continuation`). This replays every
+        // payload uniformly — including `CondJump`, whose branch decision (a
+        // `pc` bump) can't be expressed as a plain landing.
         CallbackAction::Suspend(action) => {
+            if let Some(err) = lost_continuation(ctx, &action) {
+                thread.raise(ctx, err);
+                return MetaDispatch::Suspended;
+            }
             thread.pending_action = Some(PendingAction {
                 action,
                 call_site: CallSite {
@@ -4720,6 +4705,22 @@ fn schedule_native_meta_call<'gc>(
             MetaDispatch::Suspended
         }
     }
+}
+
+/// The error for a native that answers a call whose results a `Continuation`
+/// must receive with a `Call` and no follow-up sequence: its callee returns
+/// straight to the caller, so nothing is left to apply the continuation. A
+/// follow-up sequence's results land through `land_call_results`, which does.
+fn lost_continuation<'gc>(
+    ctx: Context<'gc>,
+    action: &crate::vm::sequence::Suspend<'gc>,
+) -> Option<crate::env::Error<'gc>> {
+    matches!(action, crate::vm::sequence::Suspend::Call { then: None }).then(|| {
+        crate::env::Error::from_str(
+            ctx,
+            "metamethod/iterator native cannot tail-call into Lua across the continuation",
+        )
+    })
 }
 
 /// Where `op_return_slow` goes once `frame_return` has handled a frame carrying
