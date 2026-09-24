@@ -15,6 +15,7 @@ use crate::vm::async_sequence::{AsyncSequence, SequenceReturn, async_sequence};
 use crate::vm::interp::{IndexChain, walk_index_chain};
 use crate::vm::sequence::CallbackAction;
 
+mod meta;
 mod pack;
 mod pattern;
 use pattern::{CapValue, MatchState, PatError};
@@ -81,6 +82,8 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         let key = Value::string(LuaString::new(ctx, name.as_bytes()));
         lib.raw_set(ctx, key, Value::function(handler));
     }
+
+    meta::install(ctx, lib);
 
     let lib_name = Value::string(LuaString::new(ctx, b"string"));
     ctx.globals().raw_set(ctx, lib_name, Value::table(lib));
