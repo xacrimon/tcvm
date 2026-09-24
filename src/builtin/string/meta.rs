@@ -10,24 +10,10 @@ use crate::vm::num::{self, SlowNum};
 use crate::vm::sequence::{BoxSequence, CallbackAction};
 
 pub(super) fn install<'gc>(ctx: Context<'gc>, lib: Table<'gc>) {
-    let fns: &[(&[u8], NativeFn)] = &[
-        (b"__add", arith_add),
-        (b"__sub", arith_sub),
-        (b"__mul", arith_mul),
-        (b"__mod", arith_mod),
-        (b"__pow", arith_pow),
-        (b"__div", arith_div),
-        (b"__idiv", arith_idiv),
-        (b"__unm", arith_unm),
-    ];
     let mt = Table::new(ctx);
-    for &(name, f) in fns {
+    for (name, f) in arith_natives(ctx) {
         let f = Function::new_native(ctx.mutation(), f, Box::new([]));
-        mt.raw_set(
-            ctx,
-            Value::string(LuaString::new(ctx, name)),
-            Value::function(f),
-        );
+        mt.raw_set(ctx, Value::string(name), Value::function(f));
     }
     mt.raw_set(
         ctx,
@@ -40,26 +26,32 @@ pub(super) fn install<'gc>(ctx: Context<'gc>, lib: Table<'gc>) {
 type ArithFn<'gc> = fn(&Mutation<'gc>, Value<'gc>, Value<'gc>) -> SlowNum<'gc>;
 
 macro_rules! arith_natives {
-    ($($native:ident => $op:expr, $name:literal;)*) => {$(
-        fn $native<'gc>(
-            ctx: Context<'gc>,
-            _closure: &NativeClosure<'gc>,
-            stack: Stack<'gc, '_>,
-        ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-            arith(ctx, stack, $op, $name)
+    ($($native:ident => $op:expr, $mm:ident, $name:literal;)*) => {
+        $(
+            fn $native<'gc>(
+                ctx: Context<'gc>,
+                _closure: &NativeClosure<'gc>,
+                stack: Stack<'gc, '_>,
+            ) -> Result<CallbackAction<'gc>, Error<'gc>> {
+                arith(ctx, stack, $op, ctx.symbols().$mm, $name)
+            }
+        )*
+
+        fn arith_natives<'gc>(ctx: Context<'gc>) -> [(LuaString<'gc>, NativeFn); ${count($native)}] {
+            [$((ctx.symbols().$mm, $native as NativeFn),)*]
         }
-    )*};
+    };
 }
 
 arith_natives! {
-    arith_add => num::op_arith_slow::<num::Add>, "add";
-    arith_sub => num::op_arith_slow::<num::Sub>, "sub";
-    arith_mul => num::op_arith_slow::<num::Mul>, "mul";
-    arith_mod => num::op_arith_slow::<num::Mod>, "mod";
-    arith_pow => num::op_arith_slow::<num::Pow>, "pow";
-    arith_div => num::op_arith_slow::<num::Div>, "div";
-    arith_idiv => num::op_arith_slow::<num::IDiv>, "idiv";
-    arith_unm => unm, "unm";
+    arith_add => num::op_arith_slow::<num::Add>, mm_add, "add";
+    arith_sub => num::op_arith_slow::<num::Sub>, mm_sub, "sub";
+    arith_mul => num::op_arith_slow::<num::Mul>, mm_mul, "mul";
+    arith_mod => num::op_arith_slow::<num::Mod>, mm_mod, "mod";
+    arith_pow => num::op_arith_slow::<num::Pow>, mm_pow, "pow";
+    arith_div => num::op_arith_slow::<num::Div>, mm_div, "div";
+    arith_idiv => num::op_arith_slow::<num::IDiv>, mm_idiv, "idiv";
+    arith_unm => unm, mm_unm, "unm";
 }
 
 /// `lua_arith(LUA_OPUNM)` negates the topmost operand, which is `b`.
@@ -82,6 +74,7 @@ fn arith<'gc>(
     ctx: Context<'gc>,
     mut stack: Stack<'gc, '_>,
     op: ArithFn<'gc>,
+    mm: LuaString<'gc>,
     name: &'static str,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let mc = ctx.mutation();
@@ -93,7 +86,7 @@ fn arith<'gc>(
         _ => tonum(mc, stack.get(1)),
     };
     let (Some(a), Some(b)) = (a, b) else {
-        return trymt(ctx, stack, name);
+        return trymt(ctx, stack, mm, name);
     };
     // Raised from inside the native, so without a position (level 0).
     let result = match op(mc, a, b) {
@@ -115,12 +108,13 @@ fn arith<'gc>(
 fn trymt<'gc>(
     ctx: Context<'gc>,
     mut stack: Stack<'gc, '_>,
+    mm_name: LuaString<'gc>,
     name: &'static str,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let (a, b) = (stack.get(0), stack.get(1));
     let mm = match b.get_string() {
         Some(_) => Value::nil(),
-        None => ctx.metamethod_of(b, LuaString::new(ctx, format!("__{name}").as_bytes())),
+        None => ctx.metamethod_of(b, mm_name),
     };
     if mm.is_nil() {
         return Err(Error::from_str(
