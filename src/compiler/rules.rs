@@ -2309,13 +2309,13 @@ fn compile_assign(ctx: &mut Ctx, item: Assign) -> Result<(), CompileError> {
 
     // Pass 3: any source register that aliases an earlier slot's target
     // local will be clobbered by that earlier store — save it now.
-    for j in 0..num_targets {
-        let Some(r) = pending[j] else { continue };
+    for (j, slot) in pending.iter_mut().enumerate().take(num_targets) {
+        let Some(r) = *slot else { continue };
         let collides = (0..j).any(|i| local_dst(&lvalues[i]).is_some_and(|d| d.0 == r));
         if collides {
             let temp = ctx.alloc_register()?;
             ctx.emit(Instruction::mov(temp, Reg(r)));
-            pending[j] = Some(temp.0);
+            *slot = Some(temp.0);
         }
     }
 

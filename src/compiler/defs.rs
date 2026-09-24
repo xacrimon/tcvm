@@ -63,10 +63,6 @@ impl JumpList {
         JumpList { jumps: Vec::new() }
     }
 
-    pub(super) fn single(idx: usize) -> Self {
-        JumpList { jumps: vec![idx] }
-    }
-
     pub(super) fn is_empty(&self) -> bool {
         self.jumps.is_empty()
     }

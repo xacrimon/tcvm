@@ -31,6 +31,10 @@ impl<'gc> LuaString<'gc> {
         Gc::as_ref(self.0).bytes.len()
     }
 
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
     pub fn inner(&self) -> Gc<'gc, StringData> {
         self.0
     }
@@ -105,7 +109,7 @@ impl<'gc> Interner<'gc> {
 
         let target_hash = {
             let mut hasher = hasher.build_hasher();
-            hasher.write(&bytes);
+            hasher.write(bytes);
             hasher.finish()
         };
 

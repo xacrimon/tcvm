@@ -110,7 +110,7 @@ impl<'gc> Deref for Finalization<'gc> {
 
     fn deref(&self) -> &Self::Target {
         // SAFETY: Finalization and Mutation are #[repr(transparent)]
-        unsafe { mem::transmute::<&Self, &Mutation>(&self) }
+        unsafe { mem::transmute::<&Self, &Mutation>(self) }
     }
 }
 
@@ -243,12 +243,12 @@ impl Context {
 
     #[inline]
     pub(crate) unsafe fn mutation_context<'gc>(&self) -> &Mutation<'gc> {
-        unsafe { mem::transmute::<&Self, &Mutation>(&self) }
+        unsafe { mem::transmute::<&Self, &Mutation>(self) }
     }
 
     #[inline]
     pub(crate) unsafe fn finalization_context<'gc>(&self) -> &Finalization<'gc> {
-        unsafe { mem::transmute::<&Self, &Finalization>(&self) }
+        unsafe { mem::transmute::<&Self, &Finalization>(self) }
     }
 
     #[inline]
@@ -282,6 +282,8 @@ impl Context {
     // If we are currently in `Phase::Sleep` and have positive debt, this will immediately
     // transition the collector to `Phase::Mark`.
     #[deny(unsafe_op_in_unsafe_fn)]
+    // `!(debt > 0.0)` rather than `debt <= 0.0` so a NaN debt counts as paid.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
     pub(crate) unsafe fn do_collection<'gc, R: Collect<'gc> + ?Sized>(
         &mut self,
         root: &R,
@@ -406,7 +408,7 @@ impl Context {
             fn barrier(this: &Context, parent: GcBox) {
                 this.make_gray_again(parent);
             }
-            barrier(&self, parent);
+            barrier(self, parent);
         }
     }
 
@@ -422,7 +424,7 @@ impl Context {
             fn barrier(this: &Context, parent: GcBox) {
                 this.make_gray_again(parent);
             }
-            barrier(&self, parent);
+            barrier(self, parent);
         }
     }
 
@@ -442,7 +444,7 @@ impl Context {
             fn barrier(this: &Context, child: GcBox) {
                 this.trace(child);
             }
-            barrier(&self, child);
+            barrier(self, child);
         }
     }
 
@@ -462,7 +464,7 @@ impl Context {
             fn barrier(this: &Context, child: GcBox) {
                 this.trace_weak(child);
             }
-            barrier(&self, child);
+            barrier(self, child);
         }
     }
 
@@ -569,13 +571,7 @@ impl Context {
         // We look for an object first in the normal gray queue, then the "gray again" queue.
         // Processing "gray again" objects later gives them more time to be mutated again without
         // triggering another write barrier.
-        let next_gray = if let Some(gc_box) = self.gray.pop() {
-            Some(gc_box)
-        } else if let Some(gc_box) = self.gray_again.pop() {
-            Some(gc_box)
-        } else {
-            None
-        };
+        let next_gray = self.gray.pop().or_else(|| self.gray_again.pop());
 
         if let Some(gc_box) = next_gray {
             // We always mark work for objects processed from both the gray and "gray again" queue.
@@ -718,14 +714,14 @@ impl<'a> Deref for PhaseGuard<'a> {
 
     #[inline(always)]
     fn deref(&self) -> &Context {
-        &self.cx
+        self.cx
     }
 }
 
 impl<'a> DerefMut for PhaseGuard<'a> {
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut Context {
-        &mut self.cx
+        self.cx
     }
 }
 

@@ -511,7 +511,7 @@ fn lua_randomseed<'gc>(
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     // No argument at all → entropy reseed; an explicit arg (even nil) goes
     // through `check_integer`, like Lua's `luaL_checkinteger`.
-    let provided = if stack.len() == 0 {
+    let provided = if stack.is_empty() {
         None
     } else {
         let n1 = check_integer(ctx, stack.get(0), "randomseed", 1)? as u64;

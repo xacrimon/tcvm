@@ -734,7 +734,7 @@ extern "rust-preserve-none" fn op_move<'gc>(
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
+    ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
@@ -754,7 +754,7 @@ extern "rust-preserve-none" fn op_load<'gc>(
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
+    ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
@@ -798,7 +798,7 @@ extern "rust-preserve-none" fn op_getupval<'gc>(
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
+    ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
@@ -818,7 +818,7 @@ extern "rust-preserve-none" fn op_setupval<'gc>(
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
+    ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
@@ -843,8 +843,8 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
-    mut registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
+    registers: Registers<'gc, '_>,
+    ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
@@ -861,14 +861,14 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
 
     let cache = read_ic(closure, ic_idx);
     let t_state = t.inner().borrow();
-    if let Some(slot) = ic_check(cache, t_state.shape()) {
-        if slot != InlineCache::ABSENT_SLOT {
-            let v = unsafe { t_state.property_at(slot) };
-            if !(v.is_nil() && t_state.shape().has_mm(MetamethodBits::INDEX)) {
-                drop(t_state);
-                *reg!(ref mut dst) = v;
-                dispatch!();
-            }
+    if let Some(slot) = ic_check(cache, t_state.shape())
+        && slot != InlineCache::ABSENT_SLOT
+    {
+        let v = unsafe { t_state.property_at(slot) };
+        if !(v.is_nil() && t_state.shape().has_mm(MetamethodBits::INDEX)) {
+            drop(t_state);
+            *reg!(ref mut dst) = v;
+            dispatch!();
         }
     }
     drop(t_state);
@@ -907,8 +907,8 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
-    mut registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
+    registers: Registers<'gc, '_>,
+    ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
@@ -926,17 +926,17 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
     let v = reg!(src);
     let cache = read_ic(closure, ic_idx);
     let t_state = t.inner().borrow();
-    if let Some(slot) = ic_check(cache, t_state.shape()) {
-        if slot != InlineCache::ABSENT_SLOT {
-            let existing = unsafe { t_state.property_at(slot) };
-            // __newindex fires only on currently-nil keys.
-            if !(existing.is_nil() && t_state.shape().has_mm(MetamethodBits::NEWINDEX)) {
-                drop(t_state);
-                let mut state = t.inner().borrow_mut(ctx.mutation());
-                state.properties[slot as usize] = v;
-                state.maybe_update_mt_bit(constant!(key), v);
-                dispatch!()
-            }
+    if let Some(slot) = ic_check(cache, t_state.shape())
+        && slot != InlineCache::ABSENT_SLOT
+    {
+        let existing = unsafe { t_state.property_at(slot) };
+        // __newindex fires only on currently-nil keys.
+        if !(existing.is_nil() && t_state.shape().has_mm(MetamethodBits::NEWINDEX)) {
+            drop(t_state);
+            let mut state = t.inner().borrow_mut(ctx.mutation());
+            state.properties[slot as usize] = v;
+            state.maybe_update_mt_bit(constant!(key), v);
+            dispatch!()
         }
     }
     drop(t_state);
@@ -980,8 +980,8 @@ extern "rust-preserve-none" fn op_gettable<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
-    mut registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
+    registers: Registers<'gc, '_>,
+    ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
@@ -1044,8 +1044,8 @@ extern "rust-preserve-none" fn op_settable<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
-    mut registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
+    registers: Registers<'gc, '_>,
+    ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
@@ -1105,8 +1105,8 @@ extern "rust-preserve-none" fn op_getfield<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
-    mut registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
+    registers: Registers<'gc, '_>,
+    ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
@@ -1122,14 +1122,14 @@ extern "rust-preserve-none" fn op_getfield<'gc>(
 
     let cache = read_ic(closure, ic_idx);
     let t_state = t.inner().borrow();
-    if let Some(slot) = ic_check(cache, t_state.shape()) {
-        if slot != InlineCache::ABSENT_SLOT {
-            let v = unsafe { t_state.property_at(slot) };
-            if !(v.is_nil() && t_state.shape().has_mm(MetamethodBits::INDEX)) {
-                drop(t_state);
-                *reg!(ref mut dst) = v;
-                dispatch!();
-            }
+    if let Some(slot) = ic_check(cache, t_state.shape())
+        && slot != InlineCache::ABSENT_SLOT
+    {
+        let v = unsafe { t_state.property_at(slot) };
+        if !(v.is_nil() && t_state.shape().has_mm(MetamethodBits::INDEX)) {
+            drop(t_state);
+            *reg!(ref mut dst) = v;
+            dispatch!();
         }
     }
     drop(t_state);
@@ -1170,8 +1170,8 @@ extern "rust-preserve-none" fn op_setfield<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
-    mut registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
+    registers: Registers<'gc, '_>,
+    ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
@@ -1187,16 +1187,16 @@ extern "rust-preserve-none" fn op_setfield<'gc>(
     let v = reg!(src);
     let cache = read_ic(closure, ic_idx);
     let t_state = t.inner().borrow();
-    if let Some(slot) = ic_check(cache, t_state.shape()) {
-        if slot != InlineCache::ABSENT_SLOT {
-            let existing = unsafe { t_state.property_at(slot) };
-            if !(existing.is_nil() && t_state.shape().has_mm(MetamethodBits::NEWINDEX)) {
-                drop(t_state);
-                let mut state = t.inner().borrow_mut(ctx.mutation());
-                state.properties[slot as usize] = v;
-                state.maybe_update_mt_bit(constant!(key_idx), v);
-                dispatch!()
-            }
+    if let Some(slot) = ic_check(cache, t_state.shape())
+        && slot != InlineCache::ABSENT_SLOT
+    {
+        let existing = unsafe { t_state.property_at(slot) };
+        if !(existing.is_nil() && t_state.shape().has_mm(MetamethodBits::NEWINDEX)) {
+            drop(t_state);
+            let mut state = t.inner().borrow_mut(ctx.mutation());
+            state.properties[slot as usize] = v;
+            state.maybe_update_mt_bit(constant!(key_idx), v);
+            dispatch!()
         }
     }
     drop(t_state);
@@ -1240,8 +1240,8 @@ extern "rust-preserve-none" fn op_self<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
-    mut registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
+    registers: Registers<'gc, '_>,
+    ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
@@ -1371,7 +1371,7 @@ extern "rust-preserve-none" fn op_newtable<'gc>(
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
+    ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
@@ -1765,7 +1765,7 @@ extern "rust-preserve-none" fn op_not<'gc>(
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
+    ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
@@ -1862,7 +1862,7 @@ extern "rust-preserve-none" fn op_close<'gc>(
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
+    ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
@@ -1885,7 +1885,7 @@ extern "rust-preserve-none" fn op_tbc<'gc>(
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
+    ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
@@ -3277,8 +3277,7 @@ extern "rust-preserve-none" fn op_return_slow<'gc>(
         FrameReturn::Continuation => {
             tail!(cont_resume);
         }
-        FrameReturn::TopLevel => return,
-        FrameReturn::ToNonLua => return,
+        FrameReturn::TopLevel | FrameReturn::ToNonLua => {}
         FrameReturn::Caller { new_base, new_ip } => {
             ip = new_ip;
             (frame, closure) = top_frame(thread);
@@ -3469,8 +3468,9 @@ extern "rust-preserve-none" fn op_forloop<'gc>(
             ip = unsafe { ip.offset(offset as isize) };
         }
     } else if let Some(s) = step.get_float() {
-        let lim = unsafe { reg!(base).get_float().unwrap_unchecked() };
-        let idx = unsafe { reg!(base + 2).get_float().unwrap_unchecked() } + s;
+        let (lim, idx) = (reg!(base), reg!(base + 2));
+        let lim = unsafe { lim.get_float().unwrap_unchecked() };
+        let idx = unsafe { idx.get_float().unwrap_unchecked() } + s;
         if if 0.0 < s { idx <= lim } else { lim <= idx } {
             let idx = Value::float(idx);
             *reg!(ref mut base + 2) = idx;
@@ -3502,11 +3502,12 @@ extern "rust-preserve-none" fn forloop_slow<'gc>(
 ) {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (base, offset) = instruction.a_imm();
+    let (s, last, idx) = (reg!(base + 1), reg!(base), reg!(base + 2));
     let (s, last, idx) = unsafe {
         (
-            reg!(base + 1).get_integer().unwrap_unchecked(),
-            reg!(base).get_integer().unwrap_unchecked(),
-            reg!(base + 2).get_integer().unwrap_unchecked(),
+            s.get_integer().unwrap_unchecked(),
+            last.get_integer().unwrap_unchecked(),
+            idx.get_integer().unwrap_unchecked(),
         )
     };
     if idx != last {
@@ -3603,7 +3604,7 @@ extern "rust-preserve-none" fn op_setlist<'gc>(
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
     mut registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
+    ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
@@ -3653,7 +3654,7 @@ extern "rust-preserve-none" fn op_closure<'gc>(
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
+    ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
@@ -3717,7 +3718,7 @@ extern "rust-preserve-none" fn op_vararg<'gc>(
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
     mut registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
+    ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
@@ -3798,7 +3799,7 @@ extern "rust-preserve-none" fn op_varargget<'gc>(
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
+    ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
@@ -3850,7 +3851,7 @@ extern "rust-preserve-none" fn op_varargprep<'gc>(
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
     mut registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
+    ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
@@ -3902,7 +3903,7 @@ extern "rust-preserve-none" fn op_errnnil<'gc>(
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
+    ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
@@ -3927,7 +3928,7 @@ extern "rust-preserve-none" fn op_nop<'gc>(
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
+    ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,

@@ -67,10 +67,11 @@ impl<'gc> FromValue<'gc> for i64 {
         if let Some(i) = v.get_integer() {
             return Ok(i);
         }
-        if let Some(f) = v.get_float() {
-            if f.fract() == 0.0 && f.is_finite() {
-                return Ok(f as i64);
-            }
+        if let Some(f) = v.get_float()
+            && f.fract() == 0.0
+            && f.is_finite()
+        {
+            return Ok(f as i64);
         }
         Err(TypeError::Mismatch {
             expected: "integer",

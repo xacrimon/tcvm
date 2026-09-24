@@ -35,39 +35,6 @@ impl fmt::Display for LineNumber {
     }
 }
 
-#[derive(Debug, Error)]
-pub enum ParseErrorKind {
-    #[error("found {unexpected:?}, expected {expected:?}")]
-    Unexpected {
-        unexpected: String,
-        expected: String,
-    },
-    #[error(
-        "unexpected end of token stream{}",
-        .expected.as_ref().map(|e| format!(", expected {e}")).unwrap_or_default()
-    )]
-    EndOfStream { expected: Option<String> },
-    #[error("cannot assign to expression")]
-    AssignToExpression,
-    #[error("expression is not a statement")]
-    ExpressionNotStatement,
-    #[error("recursion limit reached")]
-    RecursionLimit,
-    #[error("lexer error")]
-    LexError(#[from] LexError),
-}
-
-#[derive(Debug, Error)]
-#[error("parse error at line {line_number}: {kind}")]
-pub struct ParseError {
-    pub kind: ParseErrorKind,
-    pub line_number: LineNumber,
-}
-
-#[derive(Debug, Error)]
-#[error("todo")]
-pub struct LexError {}
-
 #[derive(Debug, Clone, Error)]
 pub enum CompileErrorKind {
     #[error("internal compiler error: {0}")]
