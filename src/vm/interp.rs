@@ -359,10 +359,10 @@ macro_rules! helpers {
                         // may have reallocated the stack, so rebind `registers`
                         // (the Lua arm rebinds for the same reason) before the
                         // payload writes through it.
-                        let (__cb, __ms) = {
-                            let __f = $thread.top_lua().unwrap();
-                            (__f.base(), __f.closure.proto.max_stack_size as usize)
-                        };
+                        let (__cb, __ms) = (
+                            unsafe { (*$frame).base() },
+                            $closure.max_stack_size as usize,
+                        );
                         // The args/results were staged *above* the caller window
                         // (at `__cb + __ms + 1 ..`), and `invoke_native` never
                         // shrinks the shared stack, so the window the payload
@@ -574,14 +574,8 @@ fn read_ic<'gc>(closure: LuaFn<'gc>, ic_idx: u16) -> InlineCache<'gc> {
 /// Refill the IC entry. Called by slow paths after they've done a full
 /// shape lookup; subsequent same-shape accesses skip the slow path.
 #[inline(always)]
-fn fill_ic<'gc>(
-    ctx: Context<'gc>,
-    thread: &ThreadState<'gc>,
-    ic_idx: u16,
-    shape: Shape<'gc>,
-    slot: u32,
-) {
-    let proto_gc = unsafe { thread.top_lua_unchecked().closure.proto };
+fn fill_ic<'gc>(ctx: Context<'gc>, closure: LuaFn<'gc>, ic_idx: u16, shape: Shape<'gc>, slot: u32) {
+    let proto_gc = closure.proto;
     let value = InlineCache::Mono { shape, slot };
     if let Some(slot_lock) = proto_gc.ic_table.get(ic_idx as usize) {
         // We're adopting a fresh `Shape` Gc pointer through this slot
@@ -617,7 +611,7 @@ fn ic_check<'gc>(cache: InlineCache<'gc>, live_shape: Shape<'gc>) -> Option<u32>
 #[inline(always)]
 fn fill_ic_for_constant_key<'gc>(
     ctx: Context<'gc>,
-    thread: &ThreadState<'gc>,
+    closure: LuaFn<'gc>,
     ic_idx: u16,
     t: Table<'gc>,
     k: Value<'gc>,
@@ -634,7 +628,7 @@ fn fill_ic_for_constant_key<'gc>(
     let shape = state.shape();
     let slot = shape.find_slot(key_str).unwrap_or(InlineCache::ABSENT_SLOT);
     drop(state);
-    fill_ic(ctx, thread, ic_idx, shape, slot);
+    fill_ic(ctx, closure, ic_idx, shape, slot);
 }
 
 /// Drive the VM on `thread` until the top-level frame returns.
@@ -954,7 +948,7 @@ extern "rust-preserve-none" fn gettabup_slow<'gc>(
         raise!(OpError::Index(t_val));
     };
     let k = constant!(key);
-    fill_ic_for_constant_key(ctx, thread, ic_idx, t, k);
+    fill_ic_for_constant_key(ctx, closure, ic_idx, t, k);
     table_get_slow_body!(ctx, thread, registers, ip, handlers, ds, t, k, dst);
 }
 
@@ -1053,7 +1047,7 @@ extern "rust-preserve-none" fn settabup_slow<'gc>(
     };
     let k = constant!(key);
     let v = reg!(src);
-    fill_ic_for_constant_key(ctx, thread, ic_idx, t, k);
+    fill_ic_for_constant_key(ctx, closure, ic_idx, t, k);
     table_set_slow_body!(ctx, thread, registers, ip, handlers, ds, t, k, v);
 }
 
@@ -1352,7 +1346,7 @@ extern "rust-preserve-none" fn getfield_slow<'gc>(
     let recv = reg!(table);
     let k = constant!(key_idx);
     if let Some(t) = recv.get_table() {
-        fill_ic_for_constant_key(ctx, thread, ic_idx, t, k);
+        fill_ic_for_constant_key(ctx, closure, ic_idx, t, k);
         table_get_slow_body!(ctx, thread, registers, ip, handlers, ds, t, k, dst);
     }
     let Some(u) = recv.get_userdata() else {
@@ -1451,7 +1445,7 @@ extern "rust-preserve-none" fn setfield_slow<'gc>(
     };
     let k = constant!(key_idx);
     let v = reg!(src);
-    fill_ic_for_constant_key(ctx, thread, ic_idx, t, k);
+    fill_ic_for_constant_key(ctx, closure, ic_idx, t, k);
     table_set_slow_body!(ctx, thread, registers, ip, handlers, ds, t, k, v);
 }
 
@@ -3499,7 +3493,7 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
                     // popping that frame and installing the unwind marker.
                     save_pc(thread, ip);
                     let err = crate::vm::debug::locate(ctx, thread, err);
-                    let cur_base = thread.top_lua().unwrap().base();
+                    let cur_base = unsafe { (*frame).base() };
                     close_upvalues(ctx.mutation(), thread, cur_base);
                     close_tbc_vars(ctx.mutation(), thread, cur_base);
                     thread.pop_lua();
@@ -4290,10 +4284,7 @@ extern "rust-preserve-none" fn op_setlist<'gc>(
     };
     // `count == 0` is MULTRET: element count comes from `thread.top`. It can
     // exceed u8 (a `VARARG count=0` spread), so index the stack by usize.
-    let (base, max_stack) = {
-        let f = thread.top_lua().unwrap();
-        (f.base(), f.closure.proto.max_stack_size as usize)
-    };
+    let (base, max_stack) = (unsafe { (*frame).base() }, closure.max_stack_size as usize);
     let elements_start = base + table as usize + 1;
     let n = if count == 0 {
         thread.top - elements_start
@@ -4422,11 +4413,8 @@ extern "rust-preserve-none" fn op_vararg<'gc>(
         closure
     );
     let (dst, count) = instruction.ab();
-    // Copy scalars/`Gc` out so the frame borrow ends before touching the stack.
-    let (base, num_extras, proto) = {
-        let frame = thread.top_lua().unwrap();
-        (frame.base(), frame.num_extras as usize, frame.closure.proto)
-    };
+    let (base, num_extras) = unsafe { ((*frame).base(), (*frame).num_extras as usize) };
+    let proto = closure.proto;
     let target = base + dst as usize;
 
     if proto.needs_vararg_table {
@@ -4518,9 +4506,8 @@ extern "rust-preserve-none" fn op_varargget<'gc>(
     );
     let (dst, _base, key) = instruction.abc();
     let key_val = reg!(key);
-    let frame = thread.top_lua().unwrap();
-    let num_extras = frame.num_extras as usize;
-    let extras_start = frame.base() - num_extras;
+    let num_extras = unsafe { (*frame).num_extras as usize };
+    let extras_start = unsafe { (*frame).base() } - num_extras;
     // Normalize integral float keys (`args[1.0]` == `args[1]`) so the optimized
     // path agrees with the GETTABLE an escaped vararg would use.
     let int_key = key_val.get_integer().or_else(|| {
@@ -4580,16 +4567,9 @@ extern "rust-preserve-none" fn op_varargprep<'gc>(
         closure
     );
     let _num_fixed = instruction.a();
-    let (num_extras, num_params, base, max_stack, needs_table) = {
-        let frame = thread.top_lua().unwrap();
-        (
-            frame.num_extras as usize,
-            frame.closure.proto.num_params as usize,
-            frame.base(),
-            frame.closure.proto.max_stack_size as usize,
-            frame.closure.proto.needs_vararg_table,
-        )
-    };
+    let (num_extras, base) = unsafe { ((*frame).num_extras as usize, (*frame).base()) };
+    let num_params = closure.num_params as usize;
+    let max_stack = closure.max_stack_size as usize;
     let new_base = if num_extras > 0 {
         let new_base = base + num_extras;
         if !thread.ensure_frame_slots(new_base + max_stack) {
@@ -4598,13 +4578,13 @@ extern "rust-preserve-none" fn op_varargprep<'gc>(
         let total = num_extras + num_params;
         // [fixed..., extras...].rotate_left(num_params) => [extras..., fixed...]
         thread.stack[base..base + total].rotate_left(num_params);
-        thread.top_lua_mut().unwrap().set_base(new_base);
+        unsafe { (*frame).set_base(new_base) };
         registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
         new_base
     } else {
         base
     };
-    if needs_table {
+    if closure.proto.needs_vararg_table {
         // Store into the stack slot before filling so a mid-fill alloc can't
         // collect the table (mirrors `op_newtable`).
         let extras_start = new_base - num_extras;
@@ -5289,12 +5269,11 @@ fn schedule_meta_call<'gc>(
 
     // schedule_meta_call is only reachable from inside a handler via
     // invoke_metamethod!, so an active caller frame is always present.
-    let caller_base = thread
+    let caller = thread
         .top_lua()
-        .expect("schedule_meta_call called without an active Lua frame")
-        .base();
-    let scratch_func =
-        caller_base + thread.top_lua().unwrap().closure.proto.max_stack_size as usize;
+        .expect("schedule_meta_call called without an active Lua frame");
+    let caller_base = caller.base();
+    let scratch_func = caller_base + caller.closure.max_stack_size as usize;
     let new_base = scratch_func + 1;
 
     // Stage meta_fn + args so resolve_call_chain sees them in op_call layout.
