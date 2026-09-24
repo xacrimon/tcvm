@@ -9,7 +9,7 @@
 use super::{check_str, posrelat};
 use crate::Context;
 use crate::builtin::util;
-use crate::env::{Error, LuaString, NativeContext, Stack, Value};
+use crate::env::{Error, LuaString, NativeClosure, Stack, Value};
 use crate::vm::sequence::CallbackAction;
 
 // Native ABI (fixed, per project decision): LP64 widths, little-endian,
@@ -257,10 +257,10 @@ fn unpack_int<'gc>(
 }
 
 pub(super) fn lua_pack<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let ctx = nctx.ctx;
     let fmt = check_str(ctx, stack.get(0), "pack", 1)?;
     let fmt = fmt.as_bytes();
     let mut h = Header {
@@ -364,10 +364,10 @@ pub(super) fn lua_pack<'gc>(
 }
 
 pub(super) fn lua_packsize<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let ctx = nctx.ctx;
     let fmt = check_str(ctx, stack.get(0), "packsize", 1)?;
     let fmt = fmt.as_bytes();
     let mut h = Header {
@@ -390,15 +390,15 @@ pub(super) fn lua_packsize<'gc>(
         }
     }
 
-    stack.ret1(Value::integer(nctx.ctx.mutation(), total as i64));
+    stack.ret1(Value::integer(ctx.mutation(), total as i64));
     Ok(CallbackAction::Return)
 }
 
 pub(super) fn lua_unpack<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let ctx = nctx.ctx;
     let fmt = check_str(ctx, stack.get(0), "unpack", 1)?;
     let fmt = fmt.as_bytes();
     let data = check_str(ctx, stack.get(1), "unpack", 2)?;
@@ -436,7 +436,7 @@ pub(super) fn lua_unpack<'gc>(
         match opt {
             KOption::Int { signed } => {
                 out.push(Value::integer(
-                    nctx.ctx.mutation(),
+                    ctx.mutation(),
                     unpack_int(ctx, &data[pos..], h.little, size, signed)?,
                 ));
             }
@@ -487,7 +487,7 @@ pub(super) fn lua_unpack<'gc>(
         pos += size;
     }
 
-    out.push(Value::integer(nctx.ctx.mutation(), pos as i64 + 1));
+    out.push(Value::integer(ctx.mutation(), pos as i64 + 1));
     stack.replace(&out);
     Ok(CallbackAction::Return)
 }

@@ -1,9 +1,10 @@
-use tcvm::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Value};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
 use tcvm::vm::sequence::CallbackAction;
-use tcvm::{Executor, LoadError, Lua, RuntimeError, StepResult};
+use tcvm::{Context, Executor, LoadError, Lua, RuntimeError, StepResult};
 
 fn yielder<'gc>(
-    _n: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _s: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     Ok(CallbackAction::yield_(None))

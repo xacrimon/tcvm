@@ -2,13 +2,14 @@
 //! stores keys as raw `i64`, so a dead entry never refers to a swept box and
 //! a freshly computed equal key still finds it.
 
-use tcvm::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Value};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
 use tcvm::vm::sequence::CallbackAction;
-use tcvm::{Executor, LoadError, Lua, RuntimeError};
+use tcvm::{Context, Executor, LoadError, Lua, RuntimeError};
 
 /// Native that yields to its resumer (the host, when called on the main thread).
 fn yielder<'gc>(
-    _nctx: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     Ok(CallbackAction::yield_(None))

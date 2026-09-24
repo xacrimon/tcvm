@@ -1,5 +1,5 @@
 use crate::Context;
-use crate::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Table, Value};
+use crate::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Value};
 use crate::vm::sequence::CallbackAction;
 
 pub fn load<'gc>(ctx: Context<'gc>) {
@@ -34,112 +34,128 @@ pub fn load<'gc>(ctx: Context<'gc>) {
 }
 
 fn lua_debug<'gc>(
-    _ctx: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_gethook<'gc>(
-    _ctx: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_getinfo<'gc>(
-    _ctx: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_getlocal<'gc>(
-    _ctx: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_getmetatable<'gc>(
-    _ctx: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_getregistry<'gc>(
-    _ctx: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_getupvalue<'gc>(
-    _ctx: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_getuservalue<'gc>(
-    _ctx: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_sethook<'gc>(
-    _ctx: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_setlocal<'gc>(
-    _ctx: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_setmetatable<'gc>(
-    _ctx: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_setupvalue<'gc>(
-    _ctx: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_setuservalue<'gc>(
-    _ctx: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_traceback<'gc>(
-    _ctx: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_upvalueid<'gc>(
-    _ctx: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_upvaluejoin<'gc>(
-    _ctx: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()

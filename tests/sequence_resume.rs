@@ -5,7 +5,7 @@
 use std::pin::Pin;
 
 use tcvm::dmm::{Collect, Trace};
-use tcvm::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Thread, Value};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Thread, Value};
 use tcvm::lua::Context;
 use tcvm::vm::sequence::{BoxSequence, CallbackAction, Execution, Sequence, SequencePoll};
 use tcvm::{Executor, LoadError, Lua};
@@ -58,13 +58,14 @@ impl<'gc> Sequence<'gc> for ResumeAndAddOne<'gc> {
 /// Native `bumpr(co)` becomes a Sequence that resumes `co` and adds 1
 /// to its return.
 fn bumpr<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let target = stack.get(0).get_thread().expect("arg #1 is a coroutine");
     stack.replace(&[]);
     let seq = BoxSequence::new(
-        nctx.ctx.mutation(),
+        ctx.mutation(),
         ResumeAndAddOne {
             target,
             resumed: false,

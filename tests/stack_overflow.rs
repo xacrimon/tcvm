@@ -3,9 +3,9 @@
 //! it. Expected strings come from `lua` 5.5.1 on the same chunks named `=t`.
 //! Each chunk hands its result to the host with `error(v, 0)`.
 
-use tcvm::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Value};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
 use tcvm::vm::sequence::CallbackAction;
-use tcvm::{Executor, LoadError, Lua, RuntimeError, StepResult};
+use tcvm::{Context, Executor, LoadError, Lua, RuntimeError, StepResult};
 
 fn raised(src: &str) -> String {
     let mut lua = Lua::new();
@@ -137,7 +137,8 @@ fn coroutines_work_after_a_resume_overflow() {
 }
 
 fn yielder<'gc>(
-    _nctx: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     Ok(CallbackAction::yield_(None))

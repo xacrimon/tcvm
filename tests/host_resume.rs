@@ -2,12 +2,13 @@
 //! the host inspects them via `Executor::step`, then calls `Lua::resume`
 //! with new values and the chunk uses them to compute its return value.
 
-use tcvm::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Value};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
 use tcvm::vm::sequence::CallbackAction;
-use tcvm::{Executor, LoadError, Lua, RuntimeError, StepResult};
+use tcvm::{Context, Executor, LoadError, Lua, RuntimeError, StepResult};
 
 fn yielder<'gc>(
-    _nctx: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     // Whatever args were passed in are already on the stack — the yield

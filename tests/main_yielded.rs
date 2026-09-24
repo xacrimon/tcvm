@@ -3,14 +3,15 @@
 //! silently producing a `BadMode` from `take_result` (which is what
 //! happens if `finish` returns `Ok` on a yielded executor).
 
-use tcvm::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Value};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
 use tcvm::vm::sequence::CallbackAction;
-use tcvm::{Executor, LoadError, Lua, RuntimeError};
+use tcvm::{Context, Executor, LoadError, Lua, RuntimeError};
 
 /// A native callback that yields to its resumer (the host, when called
 /// from the main thread).
 fn yielder<'gc>(
-    _nctx: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     Ok(CallbackAction::yield_(None))

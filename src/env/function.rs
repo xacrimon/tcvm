@@ -154,31 +154,29 @@ pub struct NativeClosure<'gc> {
 
 /// Signature of a native callback invoked by the VM on `CALL` / `TAILCALL`.
 ///
+/// `closure` is the callback's own closure, which carries its upvalues; the
+/// running thread is `stack.exec()`. Three arguments rather than one context
+/// struct, because a struct wider than two words is passed through memory.
+///
 /// Arguments are read from the `Stack` view; return values are produced by
 /// leaving them on the stack above `bottom`. The returned [`CallbackAction`]
 /// tells the executor what to do next:
 ///   - `Return` keeps the hot path (sync return, results in the stack window).
-///   - `Sequence`, `Call`, `Yield`, `Resume` are the suspension paths handled
-///     by the executor's driver loop.
+///   - `Suspend` (see [`CallbackAction::call`] and its siblings) is handled by
+///     the executor's driver loop.
 ///
 /// On error, return [`Error`] (any Lua value); the executor unwinds Lua
 /// frames until a `Sequence` catcher (e.g. `pcall`) handles it, or surfaces
 /// it to the host as `RuntimeError::Lua`.
 pub type NativeFn = for<'gc, 'a> fn(
-    ctx: NativeContext<'gc, 'a>,
+    ctx: Context<'gc>,
+    closure: &'a NativeClosure<'gc>,
     stack: Stack<'gc, 'a>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>>;
 
 // A (tag, pointer) pair, returned in registers; a wider result goes through
 // memory and the `Return` case has to be read back from it.
 const _: () = assert!(std::mem::size_of::<Result<CallbackAction<'static>, Error<'static>>>() == 16);
-
-/// Contextual handles passed to a native callback alongside its `Stack`.
-pub struct NativeContext<'gc, 'a> {
-    pub ctx: Context<'gc>,
-    pub upvalues: &'a [Value<'gc>],
-    pub exec: Execution<'gc>,
-}
 
 /// A mutable view into the running thread's value stack, spanning
 /// `stack[bottom..*top]`. The callback sees `stack[0..len()]` as its
@@ -212,6 +210,12 @@ impl<'gc, 'a> Stack<'gc, 'a> {
     #[inline]
     pub(crate) fn into_parts(self) -> (&'a mut ThreadState<'gc>, usize) {
         (self.thread, self.bottom)
+    }
+
+    /// The executor state of the thread this stack belongs to.
+    #[inline]
+    pub fn exec(&self) -> Execution<'gc> {
+        Execution::new(self.thread.handle())
     }
 
     /// Stack-bottom index relative to the underlying vec.

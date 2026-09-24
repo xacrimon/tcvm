@@ -2,10 +2,10 @@
 //! `Sequence` built from an `async move` block, calls a Lua function via
 //! `.await`, and returns the result.
 
-use tcvm::env::{Function, LuaString, NativeContext, NativeFn, Stack, Value};
+use tcvm::env::{Function, LuaString, NativeClosure, NativeFn, Stack, Value};
 use tcvm::vm::async_sequence::{SequenceReturn, async_sequence};
 use tcvm::vm::sequence::CallbackAction;
-use tcvm::{Executor, LoadError, Lua};
+use tcvm::{Context, Executor, LoadError, Lua};
 
 /// `pending().await` once, then return the constant 7. Validates the
 /// minimal poll-resume cycle.
@@ -14,11 +14,12 @@ fn async_pending_then_return() {
     let mut lua = Lua::new();
 
     fn make<'gc>(
-        nctx: NativeContext<'gc, '_>,
+        ctx: Context<'gc>,
+        _closure: &NativeClosure<'gc>,
         mut stack: Stack<'gc, '_>,
     ) -> Result<CallbackAction<'gc>, tcvm::env::Error<'gc>> {
         let _ = &mut stack;
-        let seq = async_sequence(nctx.ctx.mutation(), |_locals, mut seq| async move {
+        let seq = async_sequence(ctx.mutation(), |_locals, mut seq| async move {
             seq.pending().await;
             seq.enter(|ctx, _locals, _exec, mut stack| {
                 stack.replace(&[Value::integer(ctx.mutation(), 7)]);
@@ -43,11 +44,12 @@ fn async_pending_then_return() {
 
 /// `guard(f)`: `call(f).await` and report whether it returned an error.
 fn guard<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, tcvm::env::Error<'gc>> {
     let f = stack.get(0).get_function().expect("function");
-    let mc = nctx.ctx.mutation();
+    let mc = ctx.mutation();
     let seq = async_sequence(mc, move |locals, mut seq| {
         let f = locals.stash(mc, f);
         async move {

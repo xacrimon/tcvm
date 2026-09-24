@@ -1,7 +1,6 @@
 use crate::dmm::{Gc, Mutation, RefLock};
 use crate::env::function::{
-    Function, FunctionKind, InlineCache, LuaFn, NativeClosure, NativeContext, Stack, Upvalue,
-    UpvalueState,
+    Function, FunctionKind, InlineCache, LuaFn, NativeClosure, Stack, Upvalue, UpvalueState,
 };
 use crate::env::shape::{MetamethodBits, Shape};
 use crate::env::string::LuaString;
@@ -4089,16 +4088,11 @@ pub(crate) fn invoke_native<'gc>(
     // above it — which may be an outer frame's registers — alone.
     thread.ensure_slots(end);
     thread.top = end;
-    let nctx = NativeContext {
-        ctx,
-        upvalues: &nc.upvalues,
-        exec: crate::vm::sequence::Execution::new(thread.handle()),
-    };
     let stack = Stack::new(thread, args_base);
     // The stack is grown-not-shrunk and may leave dead scratch above the logical
     // top; that's fine because `ThreadState`'s `Collect` traces only the live
     // high-water (derived from the frames + `top`), so dead slots never retain.
-    (nc.function)(nctx, stack)
+    (nc.function)(ctx, nc, stack)
 }
 
 /// What should happen after a frame returns with values at

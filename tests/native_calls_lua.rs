@@ -5,7 +5,7 @@
 use std::pin::Pin;
 
 use tcvm::dmm::{Collect, Trace};
-use tcvm::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Value};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
 use tcvm::lua::Context;
 use tcvm::vm::sequence::{BoxSequence, CallbackAction, Execution, Sequence, SequencePoll};
 use tcvm::{Executor, LoadError, Lua};
@@ -34,20 +34,22 @@ impl<'gc> Sequence<'gc> for AddOneSequence {
 
 /// Native callback `bumper(f)` calls `f()` then adds 1 to the result.
 fn bumper<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     if stack.get(0).get_function().is_none() {
-        return Err(Error::from_str(nctx.ctx, "bumper expects a function"));
+        return Err(Error::from_str(ctx, "bumper expects a function"));
     }
     // The callee at stack[0] with no arguments is already `Call` layout.
-    let then = BoxSequence::new(nctx.ctx.mutation(), AddOneSequence);
+    let then = BoxSequence::new(ctx.mutation(), AddOneSequence);
     Ok(CallbackAction::call(Some(then)))
 }
 
 /// Native callback `forward(f, ...)`: `f(...)`'s results are the caller's.
 fn forward<'gc>(
-    _nctx: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     Ok(CallbackAction::call(None))

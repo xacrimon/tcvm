@@ -4,9 +4,9 @@
 
 use std::pin::Pin;
 
-use tcvm::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Value};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
 use tcvm::vm::sequence::{BoxSequence, CallbackAction, Execution, Sequence, SequencePoll};
-use tcvm::{Executor, LoadError, Lua};
+use tcvm::{Context, Executor, LoadError, Lua};
 
 fn run_with<T: for<'gc> tcvm::FromMultiValue<'gc>>(
     src: &str,
@@ -198,11 +198,12 @@ fn xpcall_across_a_yield() {
 /// Counts the Lua frames on the running thread; as an `xpcall` handler it
 /// sees the failing frames only if the handler runs before unwinding.
 fn lua_frame_count<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let n = stack.lua_frames().len();
-    stack.replace(&[Value::integer(nctx.ctx.mutation(), n as i64)]);
+    stack.replace(&[Value::integer(ctx.mutation(), n as i64)]);
     Ok(CallbackAction::Return)
 }
 
@@ -260,7 +261,8 @@ fn retried_handler_still_sees_the_failing_frames() {
 /// `Catch::Pass`, i.e. the kind of native-with-callback (`sort`, `gsub`)
 /// that must not shadow an enclosing `xpcall` handler.
 fn lua_through<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     struct PassThrough;
@@ -278,7 +280,7 @@ fn lua_through<'gc>(
             Ok(SequencePoll::Return)
         }
     }
-    let then = BoxSequence::new(nctx.ctx.mutation(), PassThrough);
+    let then = BoxSequence::new(ctx.mutation(), PassThrough);
     Ok(CallbackAction::call(Some(then)))
 }
 

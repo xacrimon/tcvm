@@ -8,7 +8,7 @@ use crate::builtin::util::{
     check_integer, check_number, compare_error_msg, float_to_integer, num_to_value,
 };
 use crate::env::{
-    Error, Function, LuaString, NativeContext, NativeFn, Stack, Table, Userdata, Value,
+    Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Userdata, Value,
 };
 use crate::vm::interp::{self, Handler};
 use crate::vm::num;
@@ -78,10 +78,11 @@ pub fn load<'gc>(ctx: Context<'gc>) {
 macro_rules! float_unary {
     ($name:ident, $fname:literal, $op:expr) => {
         fn $name<'gc>(
-            nctx: NativeContext<'gc, '_>,
+            ctx: Context<'gc>,
+            _closure: &NativeClosure<'gc>,
             mut stack: Stack<'gc, '_>,
         ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-            let x = check_number(nctx.ctx, stack.get(0), $fname, 1)?;
+            let x = check_number(ctx, stack.get(0), $fname, 1)?;
             let f: fn(f64) -> f64 = $op;
             stack.ret1(Value::float(f(x)));
             Ok(CallbackAction::Return)
@@ -100,15 +101,16 @@ float_unary!(lua_deg, "deg", f64::to_degrees);
 float_unary!(lua_rad, "rad", f64::to_radians);
 
 fn lua_abs<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let v = stack.get(0);
     let result = if let Some(i) = v.get_integer() {
         // Wrapping matches Lua: abs(mininteger) == mininteger.
-        Value::integer(nctx.ctx.mutation(), i.wrapping_abs())
+        Value::integer(ctx.mutation(), i.wrapping_abs())
     } else {
-        Value::float(check_number(nctx.ctx, v, "abs", 1)?.abs())
+        Value::float(check_number(ctx, v, "abs", 1)?.abs())
     };
     stack.ret1(result);
     Ok(CallbackAction::Return)
@@ -116,15 +118,16 @@ fn lua_abs<'gc>(
 
 /// `atan(y [, x])` — two-argument form is `atan2`; `x` defaults to 1.
 fn lua_atan<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let y = check_number(nctx.ctx, stack.get(0), "atan", 1)?;
+    let y = check_number(ctx, stack.get(0), "atan", 1)?;
     let x_arg = stack.get(1);
     let x = if x_arg.is_nil() {
         1.0
     } else {
-        check_number(nctx.ctx, x_arg, "atan", 2)?
+        check_number(ctx, x_arg, "atan", 2)?
     };
     stack.ret1(Value::float(y.atan2(x)));
     Ok(CallbackAction::Return)
@@ -133,15 +136,16 @@ fn lua_atan<'gc>(
 /// `log(x [, base])`. Special-cases bases 2 and 10 to their dedicated libm
 /// routines, matching PUC-Lua's accuracy.
 fn lua_log<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let x = check_number(nctx.ctx, stack.get(0), "log", 1)?;
+    let x = check_number(ctx, stack.get(0), "log", 1)?;
     let base_arg = stack.get(1);
     let result = if base_arg.is_nil() {
         x.ln()
     } else {
-        let base = check_number(nctx.ctx, base_arg, "log", 2)?;
+        let base = check_number(ctx, base_arg, "log", 2)?;
         if base == 2.0 {
             x.log2()
         } else if base == 10.0 {
@@ -158,25 +162,23 @@ fn lua_log<'gc>(
 /// (sign of the dividend), with `y == 0` an error and `y == -1` short-circuited
 /// to avoid overflow on `mininteger % -1`.
 fn lua_fmod<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let a = stack.get(0);
     let b = stack.get(1);
     let result = if let (Some(x), Some(y)) = (a.get_integer(), b.get_integer()) {
         if y == 0 {
-            return Err(Error::from_str(
-                nctx.ctx,
-                "bad argument #2 to 'fmod' (zero)",
-            ));
+            return Err(Error::from_str(ctx, "bad argument #2 to 'fmod' (zero)"));
         } else if y == -1 {
-            Value::integer(nctx.ctx.mutation(), 0)
+            Value::integer(ctx.mutation(), 0)
         } else {
-            Value::integer(nctx.ctx.mutation(), x % y)
+            Value::integer(ctx.mutation(), x % y)
         }
     } else {
-        let x = check_number(nctx.ctx, a, "fmod", 1)?;
-        let y = check_number(nctx.ctx, b, "fmod", 2)?;
+        let x = check_number(ctx, a, "fmod", 1)?;
+        let y = check_number(ctx, b, "fmod", 2)?;
         Value::float(x % y)
     };
     stack.ret1(result);
@@ -185,70 +187,72 @@ fn lua_fmod<'gc>(
 
 /// `modf(x)` — `(integral_part, fractional_part)`, both floats.
 fn lua_modf<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let x = check_number(nctx.ctx, stack.get(0), "modf", 1)?;
+    let x = check_number(ctx, stack.get(0), "modf", 1)?;
     // Lua 5.5 returns the integral part as an integer when it fits (pushnumint).
     let (ip, fp) = if x.is_infinite() {
         // Lua's modf returns the integral part (±inf) and a +0.0 fractional
         // part (it special-cases `n == ip`), regardless of sign.
         (Value::float(x), 0.0_f64)
     } else {
-        (num_to_value(nctx.ctx.mutation(), x.trunc()), x.fract())
+        (num_to_value(ctx.mutation(), x.trunc()), x.fract())
     };
     stack.replace(&[ip, Value::float(fp)]);
     Ok(CallbackAction::Return)
 }
 
 fn lua_ceil<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    round_to_int(nctx, stack, "ceil", f64::ceil)
+    round_to_int(ctx, stack, "ceil", f64::ceil)
 }
 
 fn lua_floor<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    round_to_int(nctx, stack, "floor", f64::floor)
+    round_to_int(ctx, stack, "floor", f64::floor)
 }
 
 /// Shared `floor`/`ceil` body: integers pass through unchanged; floats are
 /// rounded, then returned as an integer when the result fits in `i64`, else as
 /// a float (Lua's `pushnumint` — note this does *not* error on huge values).
 fn round_to_int<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
     mut stack: Stack<'gc, '_>,
     fname: &str,
     round: fn(f64) -> f64,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let v = stack.get(0);
     let result = if let Some(i) = v.get_integer() {
-        Value::integer(nctx.ctx.mutation(), i)
+        Value::integer(ctx.mutation(), i)
     } else {
-        num_to_value(
-            nctx.ctx.mutation(),
-            round(check_number(nctx.ctx, v, fname, 1)?),
-        )
+        num_to_value(ctx.mutation(), round(check_number(ctx, v, fname, 1)?))
     };
     stack.ret1(result);
     Ok(CallbackAction::Return)
 }
 
 fn lua_max<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    select_extreme(nctx, stack, "max", false)
+    select_extreme(ctx, stack, "max", false)
 }
 
 fn lua_min<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    select_extreme(nctx, stack, "min", true)
+    select_extreme(ctx, stack, "min", true)
 }
 
 /// Shared `max`/`min` body: returns the argument that is largest (or smallest),
@@ -257,7 +261,7 @@ fn lua_min<'gc>(
 /// number coercion); a non-orderable pair raises the VM's "attempt to compare"
 /// error rather than a bad-argument error. Requires at least one argument.
 fn select_extreme<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
     mut stack: Stack<'gc, '_>,
     fname: &str,
     want_min: bool,
@@ -265,7 +269,7 @@ fn select_extreme<'gc>(
     let n = stack.len();
     if n == 0 {
         return Err(Error::from_str(
-            nctx.ctx,
+            ctx,
             &format!("bad argument #1 to '{fname}' (value expected)"),
         ));
     }
@@ -285,7 +289,7 @@ fn select_extreme<'gc>(
         } else if let (Some(x), Some(y)) = (lhs.get_string(), rhs.get_string()) {
             x < y
         } else {
-            return Err(Error::from_str(nctx.ctx, &compare_error_msg(lhs, rhs)));
+            return Err(Error::from_str(ctx, &compare_error_msg(lhs, rhs)));
         };
         if lt {
             best = v;
@@ -298,11 +302,12 @@ fn select_extreme<'gc>(
 /// `tointeger(x)` — the integer value of `x` if it has one, else `nil`. No
 /// string coercion, matching `lua_tointegerx`.
 fn lua_tointeger<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let v = stack.get(0);
-    let mc = nctx.ctx.mutation();
+    let mc = ctx.mutation();
     let result = if let Some(i) = v.get_integer() {
         Value::integer(mc, i)
     } else if let Some(f) = v.get_float() {
@@ -321,14 +326,15 @@ fn lua_tointeger<'gc>(
 
 /// `type(x)` — `"integer"`, `"float"`, or `nil` if `x` is not a number.
 fn lua_type<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let v = stack.get(0);
     let result = if v.get_integer().is_some() {
-        Value::string(LuaString::new(nctx.ctx, b"integer"))
+        Value::string(LuaString::new(ctx, b"integer"))
     } else if v.get_float().is_some() {
-        Value::string(LuaString::new(nctx.ctx, b"float"))
+        Value::string(LuaString::new(ctx, b"float"))
     } else {
         Value::nil()
     };
@@ -338,11 +344,12 @@ fn lua_type<'gc>(
 
 /// `ult(m, n)` — unsigned `m < n` over the two integers' bit patterns.
 fn lua_ult<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let m = check_integer(nctx.ctx, stack.get(0), "ult", 1)?;
-    let n = check_integer(nctx.ctx, stack.get(1), "ult", 2)?;
+    let m = check_integer(ctx, stack.get(0), "ult", 1)?;
+    let n = check_integer(ctx, stack.get(1), "ult", 2)?;
     stack.ret1(Value::boolean((m as u64) < (n as u64)));
     Ok(CallbackAction::Return)
 }
@@ -429,8 +436,8 @@ fn project(mut ran: u64, n: u64, st: &mut RngState) -> u64 {
 }
 
 #[inline]
-fn rng_state<'gc>(nctx: &NativeContext<'gc, '_>) -> Userdata<'gc> {
-    nctx.upvalues[0]
+fn rng_state<'gc>(closure: &NativeClosure<'gc>) -> Userdata<'gc> {
+    closure.upvalues[0]
         .get_userdata()
         .expect("random/randomseed upvalue 0 must be the RNG userdata")
 }
@@ -438,7 +445,8 @@ fn rng_state<'gc>(nctx: &NativeContext<'gc, '_>) -> Userdata<'gc> {
 /// `random([m [, n]])` — float in `[0,1)` (no args); a full-width random integer
 /// (`random(0)`); or an integer in `[1,m]` / `[m,n]`.
 fn lua_random<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     // Parse + validate before drawing so error paths don't perturb the stream.
@@ -451,7 +459,7 @@ fn lua_random<'gc>(
     let mode = match stack.len() {
         0 => Mode::Float,
         1 => {
-            let up = check_integer(nctx.ctx, stack.get(0), "random", 1)?;
+            let up = check_integer(ctx, stack.get(0), "random", 1)?;
             if up == 0 {
                 Mode::Bits
             } else {
@@ -459,32 +467,32 @@ fn lua_random<'gc>(
             }
         }
         2 => {
-            let low = check_integer(nctx.ctx, stack.get(0), "random", 1)?;
-            let up = check_integer(nctx.ctx, stack.get(1), "random", 2)?;
+            let low = check_integer(ctx, stack.get(0), "random", 1)?;
+            let up = check_integer(ctx, stack.get(1), "random", 2)?;
             Mode::Range(low, up)
         }
-        _ => return Err(Error::from_str(nctx.ctx, "wrong number of arguments")),
+        _ => return Err(Error::from_str(ctx, "wrong number of arguments")),
     };
     if let Mode::Range(low, up) = mode
         && low > up
     {
         return Err(Error::from_str(
-            nctx.ctx,
+            ctx,
             "bad argument #1 to 'random' (interval is empty)",
         ));
     }
 
-    let result = rng_state(&nctx)
+    let result = rng_state(closure)
         .with_data::<RefCell<RngState>, Value<'gc>>(|cell| {
             let mut st = cell.borrow_mut();
             let rv = st.next_u64();
             match mode {
                 Mode::Float => Value::float(unit_float(rv)),
-                Mode::Bits => Value::integer(nctx.ctx.mutation(), rv as i64),
+                Mode::Bits => Value::integer(ctx.mutation(), rv as i64),
                 Mode::Range(low, up) => {
                     let span = (up as u64).wrapping_sub(low as u64);
                     let p = project(rv, span, &mut st);
-                    Value::integer(nctx.ctx.mutation(), p.wrapping_add(low as u64) as i64)
+                    Value::integer(ctx.mutation(), p.wrapping_add(low as u64) as i64)
                 }
             }
         })
@@ -497,7 +505,8 @@ fn lua_random<'gc>(
 /// `randomseed([x [, y]])` — reseed (from entropy with no argument) and return
 /// the two seed integers actually used.
 fn lua_randomseed<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     // No argument at all → entropy reseed; an explicit arg (even nil) goes
@@ -505,16 +514,16 @@ fn lua_randomseed<'gc>(
     let provided = if stack.len() == 0 {
         None
     } else {
-        let n1 = check_integer(nctx.ctx, stack.get(0), "randomseed", 1)? as u64;
+        let n1 = check_integer(ctx, stack.get(0), "randomseed", 1)? as u64;
         let n2 = if stack.get(1).is_nil() {
             0
         } else {
-            check_integer(nctx.ctx, stack.get(1), "randomseed", 2)? as u64
+            check_integer(ctx, stack.get(1), "randomseed", 2)? as u64
         };
         Some((n1, n2))
     };
 
-    let (s1, s2) = rng_state(&nctx)
+    let (s1, s2) = rng_state(closure)
         .with_data::<RefCell<RngState>, (u64, u64)>(|cell| {
             let mut st = cell.borrow_mut();
             let seeds = match provided {
@@ -527,8 +536,8 @@ fn lua_randomseed<'gc>(
         .expect("RNG userdata payload type mismatch");
 
     stack.replace(&[
-        Value::integer(nctx.ctx.mutation(), s1 as i64),
-        Value::integer(nctx.ctx.mutation(), s2 as i64),
+        Value::integer(ctx.mutation(), s1 as i64),
+        Value::integer(ctx.mutation(), s2 as i64),
     ]);
     Ok(CallbackAction::Return)
 }

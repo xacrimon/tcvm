@@ -106,11 +106,11 @@ pub enum Suspend<'gc> {
     },
 }
 
-/// Read-only view of the executor that is passed to a native callback or
-/// sequence poll. Carries the currently-running thread; richer fields (full
-/// `&[Thread<'gc>]` thread stack, fuel handle) aren't implemented yet. The
-/// running thread's frames are reached through [`Stack::lua_frames`], which
-/// already borrows the thread.
+/// Read-only view of the executor, passed to a sequence poll and reached from
+/// a native callback through [`Stack::exec`]. Carries the currently-running
+/// thread; richer fields (full `&[Thread<'gc>]` thread stack, fuel handle)
+/// aren't implemented yet. The running thread's frames are reached through
+/// [`Stack::lua_frames`], which already borrows the thread.
 #[derive(Clone, Copy)]
 pub struct Execution<'gc> {
     current_thread: Thread<'gc>,
