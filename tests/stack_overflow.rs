@@ -92,6 +92,50 @@ fn recursion_through_metamethods_and_pcall() {
     assert_eq!(raised(src), "stack overflow");
 }
 
+// Each nested resume runs on a new thread with a stack limit of its own, so
+// only a cap on nesting stops these. The `n > 10000` guards keep the chunks
+// finite on a build without it.
+const WRAP_RECURSE: &str = "local n = 0 local function f() n = n + 1 \
+                            if n > 10000 then return 'unbounded' end \
+                            return coroutine.wrap(f)() end ";
+
+#[test]
+fn nested_wraps_overflow() {
+    let src = format!(
+        "{WRAP_RECURSE} local ok, e = pcall(f) \
+         error(tostring(ok) .. ' ' .. string.match(e, 'C stack overflow$'), 0)"
+    );
+    assert_eq!(raised(&src), "false C stack overflow");
+}
+
+#[test]
+fn nested_resumes_overflow() {
+    let src = "local n = 0 local function g() n = n + 1 \
+               if n > 10000 then return 'unbounded' end \
+               local ok, e = coroutine.resume(coroutine.create(g)) \
+               return ok and e or 'failed: ' .. e end \
+               error(g(), 0)";
+    assert_eq!(raised(src), "failed: C stack overflow");
+}
+
+#[test]
+fn nesting_below_the_resume_limit() {
+    let src = "local function nest(k) if k == 0 then return 'bottom' end \
+               return coroutine.wrap(nest)(k - 1) end \
+               error(nest(150), 0)";
+    assert_eq!(raised(src), "bottom");
+}
+
+#[test]
+fn coroutines_work_after_a_resume_overflow() {
+    let src = format!(
+        "{WRAP_RECURSE} pcall(f) \
+         local co = coroutine.wrap(function(a) local b = coroutine.yield(a + 1) return b * 2 end) \
+         error(co(1) .. ' ' .. co(21), 0)"
+    );
+    assert_eq!(raised(&src), "2 42");
+}
+
 fn yielder<'gc>(
     _nctx: NativeContext<'gc, '_>,
     _stack: Stack<'gc, '_>,

@@ -464,6 +464,11 @@ fn apply_pending_action<'gc>(
     Ok(())
 }
 
+/// `LUAI_MAXCCALLS`: threads resumed inside one another. Lua counts every C
+/// call toward it; here only nested resumes need a cap, since each one is a
+/// new thread with a stack limit of its own.
+const MAX_RESUME_DEPTH: usize = 200;
+
 /// Hand off control from `resumer` to `target`.
 ///
 /// Pushes a `ExecKind::WaitThread { wt }` onto the resumer (this is what
@@ -485,6 +490,13 @@ fn schedule_thread_resume<'gc>(
     wt: CallSite,
 ) -> Result<(), RuntimeError> {
     let mc = ctx.mutation();
+    // Raised on the resumer, leaving the target untouched (`lua_resume`'s
+    // `resume_error`), so the follow-up sequence sees it as the resume's error.
+    if exec.0.borrow().thread_stack.len() >= MAX_RESUME_DEPTH {
+        let msg = Value::string(LuaString::new(ctx, b"C stack overflow"));
+        resumer.borrow_mut(mc).raise(ctx, Error::new(ctx, msg));
+        return Ok(());
+    }
     {
         let mut rs = resumer.borrow_mut(mc);
         rs.push_exec(ExecKind::WaitThread { call_site: wt });
