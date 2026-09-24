@@ -2379,6 +2379,27 @@ unsafe fn copy_values<'gc>(mut dst: *mut Value<'gc>, mut src: *const Value<'gc>,
     }
 }
 
+/// Land `nret` values from `src` as `wanted` values at `dst`: the first
+/// `min(nret, wanted)` copied, the rest nil. The copy is a plain loop, which
+/// LLVM vectorizes for long result lists; the padding is `fill_nil`.
+///
+/// # Safety
+/// `dst..dst + wanted` and `src..src + min(nret, wanted)` must be in bounds,
+/// and `dst <= src` if they overlap.
+#[inline(always)]
+pub(crate) unsafe fn land_results<'gc>(
+    dst: *mut Value<'gc>,
+    src: *const Value<'gc>,
+    nret: usize,
+    wanted: usize,
+) {
+    let n = nret.min(wanted);
+    for i in 0..n {
+        unsafe { dst.add(i).write(src.add(i).read()) };
+    }
+    unsafe { fill_nil(dst.add(n), wanted - n) };
+}
+
 /// The native arm of CALL: run the callback inline and land its results at
 /// `func_idx`. Expands inside a handler body (needs its `dispatch!`).
 macro_rules! call_native {
@@ -2421,21 +2442,16 @@ macro_rules! call_native {
                     } else {
                         returns as usize - 1
                     };
-                    let to_copy = retc.min(wanted);
                     // Results sit at `args_base = func_idx + 1`, one slot above
-                    // where they land, inside the window `invoke_native` covered;
-                    // a forward copy is in bounds and never reads a slot it
-                    // already wrote. The nil padding stays inside the caller's
-                    // frame, which the CALL that entered it sized the vec for.
-                    debug_assert!(args_base + to_copy <= $thread.stack.len());
+                    // where they land, inside the window `invoke_native` covered.
+                    // The nil padding stays inside the caller's frame, which the
+                    // CALL that entered it sized the vec for.
+                    debug_assert!(args_base + retc.min(wanted) <= $thread.stack.len());
                     debug_assert!(func_idx + wanted <= $thread.stack.len());
                     let stack = $thread.stack.as_mut_ptr();
-                    for i in 0..to_copy {
-                        unsafe { *stack.add(func_idx + i) = *stack.add(args_base + i) };
-                    }
-                    for i in to_copy..wanted {
-                        unsafe { *stack.add(func_idx + i) = Value::nil() };
-                    }
+                    unsafe {
+                        land_results(stack.add(func_idx), stack.add(args_base), retc, wanted)
+                    };
                     // Publish the logical top. For MULTRET this is the dynamic
                     // count the next consumer reads.
                     $thread.set_top_unchecked(func_idx + wanted);
@@ -3142,19 +3158,14 @@ extern "rust-preserve-none" fn op_return<'gc>(
         num_results as usize - 1
     };
     // `dst_start < values_base` and both ranges lie inside the callee's
-    // window, which the CALL that entered it sized the vec for; a forward
-    // element copy is in bounds and never reads a slot it already overwrote.
+    // window, which the CALL that entered it sized the vec for.
     debug_assert!(values_base + nret.min(wanted) <= thread.stack.len());
     debug_assert!(dst_start + wanted <= thread.stack.len());
     let stack = thread.stack.as_mut_ptr();
     if std::hint::likely(nret == 1 && wanted == 1) {
         unsafe { *stack.add(dst_start) = *stack.add(values_base) };
     } else {
-        let to_copy = nret.min(wanted);
-        for i in 0..to_copy {
-            unsafe { *stack.add(dst_start + i) = *stack.add(values_base + i) };
-        }
-        unsafe { fill_nil(stack.add(dst_start + to_copy), wanted - to_copy) };
+        unsafe { land_results(stack.add(dst_start), stack.add(values_base), nret, wanted) };
     }
     // Without this a `top` left high by a multires producer inside the callee
     // would keep its dead registers traced (#43).
@@ -3803,31 +3814,30 @@ extern "rust-preserve-none" fn op_vararg<'gc>(
         dispatch!();
     }
 
-    // Optimized: read the below-base region directly.
+    // Optimized: read the below-base region directly. The extras end at `base`
+    // and the target starts at or above it, so the ranges don't overlap.
     let extras_start = base - num_extras;
-    if count == 0 {
-        // MULTRET: copy all extras and publish the new dynamic top.
-        let new_top = target + num_extras;
-        thread.ensure_slots(new_top);
-        registers = unsafe { thread.stack.as_mut_ptr().add(base) };
-        if num_extras > 0 {
-            thread
-                .stack
-                .copy_within(extras_start..extras_start + num_extras, target);
-        }
-        thread.top = new_top;
+    // `count == 0` is MULTRET: all extras, published through `top`.
+    let wanted = if count == 0 {
+        num_extras
     } else {
-        let wanted = count as usize - 1;
-        let to_copy = num_extras.min(wanted);
-        if to_copy > 0 {
-            thread
-                .stack
-                .copy_within(extras_start..extras_start + to_copy, target);
-        }
-        for i in to_copy..wanted {
-            *reg!(ref mut dst + i as u8) = Value::nil();
-        }
+        count as usize - 1
+    };
+    if count == 0 {
+        thread.ensure_slots(target + wanted);
+        registers = unsafe { thread.stack.as_mut_ptr().add(base) };
+        thread.top = target + wanted;
     }
+    debug_assert!(target + wanted <= thread.stack.len());
+    let stack = thread.stack.as_mut_ptr();
+    unsafe {
+        land_results(
+            stack.add(target),
+            stack.add(extras_start),
+            num_extras,
+            wanted,
+        )
+    };
     dispatch!();
 }
 
@@ -4194,21 +4204,13 @@ pub(crate) fn frame_return<'gc>(
         thread.set_top_unchecked(dst_start + nret);
     } else {
         let wanted = num_results as usize - 1;
-        let to_copy = nret.min(wanted);
         // `dst_start < values_base` (the func slot is below the callee's
         // registers) and both ranges lie inside the callee's window, which
-        // `op_call` sized the vec for; a forward element copy is in bounds and
-        // never reads a slot it already overwrote. Indexing here re-checks the
-        // vec length against every store, so use raw pointers.
-        debug_assert!(values_base + to_copy <= thread.stack.len());
+        // `op_call` sized the vec for.
+        debug_assert!(values_base + nret.min(wanted) <= thread.stack.len());
         debug_assert!(dst_start + wanted <= thread.stack.len());
         let stack = thread.stack.as_mut_ptr();
-        for i in 0..to_copy {
-            unsafe { *stack.add(dst_start + i) = *stack.add(values_base + i) };
-        }
-        for i in to_copy..wanted {
-            unsafe { *stack.add(dst_start + i) = Value::nil() };
-        }
+        unsafe { land_results(stack.add(dst_start), stack.add(values_base), nret, wanted) };
         // Publish the landing end. Without this, a `top` left high by a multires
         // producer *inside the callee* would still be the high-water long after
         // the callee popped, so `live_top` would keep tracing its dead registers

@@ -855,13 +855,10 @@ fn land_call_results<'gc>(ts: &mut crate::env::thread::ThreadState<'gc>, cs: Cal
         None => func_idx + wanted,
     };
     ts.ensure_slots(needed);
-    let to_copy = retc.min(wanted);
-    for i in 0..to_copy {
-        ts.stack[func_idx + i] = ts.stack[bottom + i];
-    }
-    for i in to_copy..wanted {
-        ts.stack[func_idx + i] = Value::nil();
-    }
+    // The values sit at or above their landing slot, below `top`.
+    debug_assert!(func_idx <= bottom && bottom + retc <= ts.stack.len());
+    let stack = ts.stack.as_mut_ptr();
+    unsafe { vm::interp::land_results(stack.add(func_idx), stack.add(bottom), retc, wanted) };
     // MULTRET delivers all `retc`, a fixed-results call exactly `wanted`.
     ts.set_top(func_idx + if returns == 0 { retc } else { wanted });
     if ts.frames_empty() {
@@ -910,14 +907,14 @@ fn apply_native_continuation<'gc>(
             }
         }
         Continuation::TForCall { base: reg, count } => {
+            // The loop's registers are in the caller's window, below the
+            // results staged above it.
             let dst = base + reg as usize + 3;
-            let to_copy = retc.min(count as usize);
-            for i in 0..to_copy {
-                ts.stack[dst + i] = ts.stack[bottom + i];
-            }
-            for i in to_copy..count as usize {
-                ts.stack[dst + i] = Value::nil();
-            }
+            debug_assert!(dst + count as usize <= bottom && bottom + retc <= ts.stack.len());
+            let stack = ts.stack.as_mut_ptr();
+            unsafe {
+                vm::interp::land_results(stack.add(dst), stack.add(bottom), retc, count as usize)
+            };
         }
     }
 
