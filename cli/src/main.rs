@@ -101,14 +101,16 @@ fn main() {
 fn error_message(lua: &mut Lua, err: &StashedError) -> String {
     let lossy = |s: LuaString<'_>| String::from_utf8_lossy(s.as_bytes()).into_owned();
     let call = lua.enter(|ctx| {
-        let v = ctx.fetch(err).value();
-        if v.get_string().is_some() || v.get_integer().is_some() || v.get_float().is_some() {
+        let e = ctx.fetch(err);
+        if e.as_text(ctx).is_some() {
             return None;
         }
+        let v = e.value();
         let mm = ctx.metamethod_of(v, ctx.symbols().mm_tostring);
         if mm.is_nil() {
             return None;
         }
+        // Resetting the main thread is fine: the run that raised `err` is over.
         Some(ctx.stash(Executor::start(ctx, mm, (v,))))
     });
     if let Some(ex) = call {

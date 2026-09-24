@@ -1693,7 +1693,7 @@ extern "rust-preserve-none" fn op_len<'gc>(
         dispatch!();
     }
 
-    // Tables consult __len first; fall back to raw_len only if absent.
+    // Without `__len`, only a table has a length to fall back on.
     let meta_fn = ctx.metamethod_of(val, ctx.symbols().mm_len);
     if meta_fn.is_nil() {
         let Some(t) = val.get_table() else {

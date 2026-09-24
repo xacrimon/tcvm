@@ -83,17 +83,22 @@ impl<'gc> Error<'gc> {
         self.0.level.get() as usize
     }
 
-    /// The error as a host-printable message, following `lua.c`'s
-    /// `msghandler` short of calling `__tostring`: strings and numbers as-is,
-    /// anything else by type.
-    pub fn message(self, ctx: Context<'gc>) -> LuaString<'gc> {
+    /// The error value as `lua_tostring` sees it: a string, a number as a
+    /// string, or `None` for anything else.
+    pub fn as_text(self, ctx: Context<'gc>) -> Option<LuaString<'gc>> {
         let v = self.value();
-        if v.get_string().is_some() || v.get_integer().is_some() || v.get_float().is_some() {
-            crate::builtin::util::basic_tostring(ctx, v)
-        } else {
-            let text = format!("(error object is a {} value)", v.type_name());
+        (v.get_string().is_some() || v.get_integer().is_some() || v.get_float().is_some())
+            .then(|| crate::builtin::util::basic_tostring(ctx, v))
+    }
+
+    /// The error as a host-printable message, following `lua.c`'s
+    /// `msghandler` short of calling `__tostring`: [`as_text`](Self::as_text),
+    /// else the value's type.
+    pub fn message(self, ctx: Context<'gc>) -> LuaString<'gc> {
+        self.as_text(ctx).unwrap_or_else(|| {
+            let text = format!("(error object is a {} value)", self.value().type_name());
             LuaString::new(ctx, text.as_bytes())
-        }
+        })
     }
 
     /// Swap the payload, keeping the handled flag; resets the level. The

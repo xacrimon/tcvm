@@ -275,8 +275,8 @@ fn lua_format<'gc>(
     // continuing from where `run` stopped. The arguments, format string
     // included, stay on the stack below `n` throughout.
     let n = stack.len();
-    let seq = async_sequence(ctx.mutation(), move |_locals, seq| async move {
-        let (mut seq, mut f, mut pending) = (seq, f, Some(pending));
+    let seq = async_sequence(ctx.mutation(), move |_locals, mut seq| async move {
+        let mut pending = Some(pending);
         while let Some((spec, arg)) = pending {
             let bytes = util::tolstring(&mut seq, arg, n).await?;
             // `%q` adds the result as-is.
