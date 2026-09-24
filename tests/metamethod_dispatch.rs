@@ -145,6 +145,14 @@ fn library_lookups_use_type_metatables() {
         ),
         "true true"
     );
+    assert_eq!(
+        ok("local lt = setmetatable({}, {__call = function(_, a, b) return a.v < b.v end})
+            local mt = {__lt = lt}
+            local t = {setmetatable({v = 3}, mt), setmetatable({v = 1}, mt), setmetatable({v = 2}, mt)}
+            table.sort(t)
+            return cat(t[1].v, t[2].v, t[3].v)"),
+        "1 2 3"
+    );
 }
 
 #[test]

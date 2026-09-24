@@ -97,6 +97,20 @@ fn math_max_min_are_exact_at_the_i64_boundary() {
 }
 
 #[test]
+fn table_sort_is_exact_at_the_i64_boundary() {
+    assert_eq!(
+        truth(&[
+            "(function() local t = {2^63, math.maxinteger}; table.sort(t) \
+             return math.type(t[1]) == 'integer' end)()",
+            "(function() local t = {big, bigf}; table.sort(t) return t[1] == bigf end)()",
+            "(function() local t = {math.mininteger, -2^63 - 2048}; table.sort(t) \
+             return math.type(t[1]) == 'float' end)()",
+        ]),
+        "111"
+    );
+}
+
+#[test]
 fn non_packing_numeral_lhs_before_short_circuit_rhs() {
     // A numeral LHS that can't be an immediate must be loaded *before* the
     // RHS: emitted after it, the `LOAD` sits in the `and`/`or` short-circuit

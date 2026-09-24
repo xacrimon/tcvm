@@ -1,9 +1,10 @@
 use crate::Context;
 use crate::builtin::util;
 use crate::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Value};
-use crate::lua::{StashedError, StashedFunction, StashedTable};
+use crate::lua::{StashedError, StashedFunction, StashedTable, StashedValue};
 use crate::vm::async_sequence::{AsyncSequence, SequenceReturn, async_sequence};
 use crate::vm::interp::binop_metamethod;
+use crate::vm::num;
 use crate::vm::sequence::CallbackAction;
 
 /// Fetch argument 1 as a table or raise the standard bad-argument error.
@@ -430,7 +431,7 @@ async fn sort_less(
     enum Plan {
         Ready(bool),
         CallComp,
-        CallMeta(StashedFunction),
+        CallMeta(StashedValue),
     }
     let plan = seq.try_enter(|ctx, locals, _exec, mut stack| {
         let tbl = locals.fetch(ctx.mutation(), t);
@@ -446,9 +447,9 @@ async fn sort_less(
         } else if let (Some(x), Some(y)) = (a.get_float(), b.get_float()) {
             Some(x < y)
         } else if let (Some(x), Some(y)) = (a.get_integer(), b.get_float()) {
-            Some((x as f64) < y)
+            Some(num::lt_int_float(x, y))
         } else if let (Some(x), Some(y)) = (a.get_float(), b.get_integer()) {
-            Some(x < (y as f64))
+            Some(num::lt_float_int(x, y))
         } else if let (Some(x), Some(y)) = (a.get_string(), b.get_string()) {
             Some(x < y)
         } else {
@@ -458,12 +459,11 @@ async fn sort_less(
             return Ok(Plan::Ready(r));
         }
         let m = binop_metamethod(ctx, a, b, ctx.symbols().mm_lt);
-        if let Some(f) = m.get_function() {
-            stack.replace(&[a, b]);
-            Ok(Plan::CallMeta(locals.stash(ctx.mutation(), f)))
-        } else {
-            Err(Error::from_str(ctx, &util::compare_error_msg(a, b)))
+        if m.is_nil() {
+            return Err(Error::from_str(ctx, &util::compare_error_msg(a, b)));
         }
+        stack.replace(&[a, b]);
+        Ok(Plan::CallMeta(locals.stash(ctx.mutation(), m)))
     })?;
     match plan {
         Plan::Ready(r) => Ok(r),
