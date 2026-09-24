@@ -10,6 +10,8 @@ const CHUNK: &str = r##"
 local function show(v)
   local t = math.type(v)
   if t == "float" and v ~= v then return "float:nan" end
+  -- 15 digits: platform libms differ in the last ulp (e.g. sin(2147483647)).
+  if t == "float" then return "float:" .. string.format("%.15g", v) end
   if t then return t .. ":" .. tostring(v) end
   if type(v) == "string" then return "string:\"" .. v .. "\"" end
   return type(v)
