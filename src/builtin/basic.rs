@@ -5,6 +5,8 @@ use crate::Context;
 use crate::builtin::util;
 use crate::dmm::{Collect, Trace};
 use crate::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
+use crate::lua::StashedValue;
+use crate::vm::async_sequence::{SequenceReturn, async_sequence};
 use crate::vm::sequence::{
     BoxSequence, CallbackAction, Catch, Execution, Sequence, SequencePoll, seq_trace_pointers,
 };
@@ -264,33 +266,8 @@ fn lua_pairs<'gc>(
         return Ok(CallbackAction::Return);
     }
     stack.replace(&[mm, t]);
-    let then = BoxSequence::new(ctx.mutation(), PairsAdjust);
+    let then = BoxSequence::new(ctx.mutation(), util::AdjustResults(4));
     Ok(CallbackAction::call(Some(then)))
-}
-
-/// Completion for `pairs` via `__pairs`: adjust the metamethod's results
-/// to exactly four, as `lua_call(L, 1, 4)` does.
-struct PairsAdjust;
-
-unsafe impl<'gc> Collect<'gc> for PairsAdjust {
-    const NEEDS_TRACE: bool = false;
-}
-
-impl<'gc> Sequence<'gc> for PairsAdjust {
-    fn trace_pointers(&self, _cc: &mut dyn Trace<'gc>) {}
-
-    fn poll(
-        self: Pin<&mut Self>,
-        _ctx: Context<'gc>,
-        _exec: Execution<'gc>,
-        mut stack: Stack<'gc, '_>,
-    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
-        stack.truncate(4);
-        while stack.len() < 4 {
-            stack.push(Value::nil());
-        }
-        Ok(SequencePoll::Return)
-    }
 }
 
 /// `pcall(f, ...)`: run `f` under a [`ProtectedCall`] completion that turns
@@ -354,26 +331,65 @@ impl<'gc> Sequence<'gc> for ProtectedCall<'gc> {
 }
 
 /// `print(...)` — write each argument's `tostring` form to stdout, separated
-/// by tabs and followed by a newline. Uses the default representation;
-/// TODO(#27): honor `__tostring` once metamethod calls from natives exist.
+/// by tabs and followed by a newline.
 fn lua_print<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
     let n = stack.len();
-    for i in 0..n {
-        if i > 0 {
-            let _ = out.write_all(b"\t");
+    let has_tostring = |i| {
+        !ctx.metamethod_of(stack.get(i), ctx.symbols().mm_tostring)
+            .is_nil()
+    };
+    if !(0..n).any(has_tostring) {
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        for i in 0..n {
+            if i > 0 {
+                let _ = out.write_all(b"\t");
+            }
+            let s = util::basic_tostring(ctx, stack.get(i));
+            let _ = out.write_all(s.as_bytes());
         }
-        let s = util::basic_tostring(ctx, stack.get(i));
-        let _ = out.write_all(s.as_bytes());
+        let _ = out.write_all(b"\n");
+        stack.replace(&[]);
+        return Ok(CallbackAction::Return);
     }
-    let _ = out.write_all(b"\n");
-    stack.replace(&[]);
-    Ok(CallbackAction::Return)
+    enum Piece {
+        Text(Vec<u8>),
+        ToString(StashedValue, StashedValue),
+    }
+    // Some `__tostring` must run; like Lua, write each argument as soon as it
+    // is converted.
+    let seq = async_sequence(ctx.mutation(), move |_locals, seq| async move {
+        let mut seq = seq;
+        for i in 0..n {
+            let piece = seq.enter(|ctx, locals, _exec, stack| {
+                let v = stack.get(i);
+                let mm = ctx.metamethod_of(v, ctx.symbols().mm_tostring);
+                if mm.is_nil() {
+                    Piece::Text(util::basic_tostring(ctx, v).as_bytes().to_vec())
+                } else {
+                    let mc = ctx.mutation();
+                    Piece::ToString(locals.stash(mc, mm), locals.stash(mc, v))
+                }
+            });
+            let bytes = match piece {
+                Piece::Text(bytes) => bytes,
+                Piece::ToString(mm, v) => util::call_tostring(&mut seq, &mm, &v, n).await?,
+            };
+            let mut out = std::io::stdout().lock();
+            if i > 0 {
+                let _ = out.write_all(b"\t");
+            }
+            let _ = out.write_all(&bytes);
+        }
+        let _ = std::io::stdout().write_all(b"\n");
+        seq.enter(|_ctx, _locals, _exec, mut stack| stack.replace(&[]));
+        Ok(SequenceReturn::Return)
+    });
+    Ok(CallbackAction::sequence(seq))
 }
 
 /// `rawequal(a, b)` — primitive equality, bypassing `__eq`.
@@ -575,8 +591,8 @@ fn lua_tonumber<'gc>(
     Ok(CallbackAction::Return)
 }
 
-/// `tostring(v)` — default string representation. TODO(#27): honor
-/// `__tostring`/`__name`, which require calling back into Lua.
+/// `tostring(v)` — `luaL_tolstring`: `__tostring`'s result, else the default
+/// representation (with a string `__name` in place of the type).
 fn lua_tostring<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
@@ -588,9 +604,15 @@ fn lua_tostring<'gc>(
             "bad argument #1 to 'tostring' (value expected)",
         ));
     }
-    let s = util::basic_tostring(ctx, stack.get(0));
-    stack.ret1(Value::string(s));
-    Ok(CallbackAction::Return)
+    let v = stack.get(0);
+    let mm = ctx.metamethod_of(v, ctx.symbols().mm_tostring);
+    if mm.is_nil() {
+        stack.ret1(Value::string(util::basic_tostring(ctx, v)));
+        return Ok(CallbackAction::Return);
+    }
+    stack.replace(&[mm, v]);
+    let then = BoxSequence::new(ctx.mutation(), util::ToStringResult);
+    Ok(CallbackAction::call(Some(then)))
 }
 
 /// `type(v)` — the type name of `v` as a string.

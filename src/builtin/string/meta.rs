@@ -3,13 +3,11 @@
 //! `stringmetamethods`); the VM itself never converts strings to numbers.
 
 use crate::Context;
-use crate::builtin::util::str_to_number;
+use crate::builtin::util::{AdjustResults, str_to_number};
 use crate::dmm::Mutation;
 use crate::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Value};
-use crate::vm::async_sequence::{SequenceReturn, async_sequence};
-use crate::vm::interp::MAX_TAG_LOOP;
 use crate::vm::num::{self, SlowNum};
-use crate::vm::sequence::CallbackAction;
+use crate::vm::sequence::{BoxSequence, CallbackAction};
 
 pub(super) fn install<'gc>(ctx: Context<'gc>, lib: Table<'gc>) {
     let fns: &[(&[u8], NativeFn)] = &[
@@ -134,37 +132,8 @@ fn trymt<'gc>(
             ),
         ));
     }
-    let mut args = vec![a, b];
-    let mut callee = mm;
-    for _ in 0..MAX_TAG_LOOP {
-        let Some(f) = callee.get_function() else {
-            let call = ctx.metamethod_of(callee, ctx.symbols().mm_call);
-            if call.is_nil() {
-                break;
-            }
-            args.insert(0, callee);
-            callee = call;
-            continue;
-        };
-        stack.replace(&args);
-        let mc = ctx.mutation();
-        let seq = async_sequence(mc, move |locals, seq| {
-            let f = locals.stash(mc, f);
-            async move {
-                let mut seq = seq;
-                seq.call(&f, 0).await?;
-                // `lua_call(L, 2, 1)`: exactly one result.
-                seq.enter(|_ctx, _locals, _exec, mut stack| {
-                    let r = stack.get(0);
-                    stack.replace(&[r]);
-                });
-                Ok(SequenceReturn::Return)
-            }
-        });
-        return Ok(CallbackAction::sequence(seq));
-    }
-    Err(Error::from_str(
-        ctx,
-        &format!("attempt to call a {} value", callee.type_name()),
-    ))
+    // `lua_call(L, 2, 1)`; the executor resolves a `__call` chain on `mm`.
+    stack.replace(&[mm, a, b]);
+    let then = BoxSequence::new(ctx.mutation(), AdjustResults(1));
+    Ok(CallbackAction::call(Some(then)))
 }

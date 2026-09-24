@@ -274,41 +274,99 @@ fn lua_format<'gc>(
     })?;
     let fmt = fmt_str.as_bytes();
 
-    let mut out: Vec<u8> = Vec::with_capacity(fmt.len() + 16);
-    let mut arg_idx = 1usize;
-    let mut i = 0usize;
-    while i < fmt.len() {
-        let b = fmt[i];
-        if b != b'%' {
-            out.push(b);
-            i += 1;
-            continue;
+    let mut f = Formatter {
+        i: 0,
+        arg_idx: 1,
+        out: Vec::with_capacity(fmt.len() + 16),
+    };
+    let Some(pending) = f.run(ctx, fmt, &stack)? else {
+        let s = LuaString::new(ctx, &f.out);
+        stack.ret1(Value::string(s));
+        return Ok(CallbackAction::Return);
+    };
+    // A conversion needs `__tostring`: finish in a sequence that can call it,
+    // continuing from where `run` stopped.
+    let n = stack.len();
+    let fmt = fmt.to_vec();
+    let seq = async_sequence(ctx.mutation(), move |_locals, seq| async move {
+        let (mut seq, mut f, mut pending) = (seq, f, Some(pending));
+        while let Some((spec, arg)) = pending {
+            let (mm, v) = seq.enter(|ctx, locals, _exec, stack| {
+                let v = stack.get(arg);
+                let mm = ctx.metamethod_of(v, ctx.symbols().mm_tostring);
+                (
+                    locals.stash(ctx.mutation(), mm),
+                    locals.stash(ctx.mutation(), v),
+                )
+            });
+            let bytes = util::call_tostring(&mut seq, &mm, &v, n).await?;
+            // `%q` adds the result as-is.
+            if spec.conv == b'q' {
+                f.out.extend_from_slice(&bytes);
+            } else {
+                fmt_str_bytes(&mut f.out, &spec, &bytes);
+            }
+            pending = seq.try_enter(|ctx, _locals, _exec, stack| f.run(ctx, &fmt, &stack))?;
         }
-        // parse flags/width/precision/conv starting at fmt[i+1]
-        let (spec, next) = parse_spec(ctx, fmt, i + 1)?;
-        i = next;
-        if spec.conv == b'%' {
-            out.push(b'%');
-            continue;
-        }
-        // A conversion consumes the next argument; a missing one is an error
-        // ("no value"), distinct from an explicitly-passed nil.
-        if arg_idx >= stack.len() {
-            return Err(Error::from_str(
-                ctx,
-                &format!("bad argument #{} to 'format' (no value)", arg_idx + 1),
-            ));
-        }
-        let arg = stack.get(arg_idx);
-        arg_idx += 1;
-        // After the increment, `arg_idx` is the 1-based Lua argument number of
-        // the argument just consumed (the format string is #1).
-        format_one(ctx, &mut out, &spec, arg, arg_idx)?;
-    }
+        seq.enter(|ctx, _locals, _exec, mut stack| {
+            stack.replace(&[Value::string(LuaString::new(ctx, &f.out))]);
+        });
+        Ok(SequenceReturn::Return)
+    });
+    Ok(CallbackAction::sequence(seq))
+}
 
-    let s = LuaString::new(ctx, &out);
-    stack.ret1(Value::string(s));
-    Ok(CallbackAction::Return)
+struct Formatter {
+    i: usize,
+    arg_idx: usize,
+    out: Vec<u8>,
+}
+
+impl Formatter {
+    /// Format `fmt` from where the previous call stopped, until the end or a
+    /// `luaL_tolstring` conversion whose argument has `__tostring`; that
+    /// conversion's spec and stack index are returned for the caller to finish.
+    fn run<'gc>(
+        &mut self,
+        ctx: Context<'gc>,
+        fmt: &[u8],
+        args: &Stack<'gc, '_>,
+    ) -> Result<Option<(FmtSpec, usize)>, Error<'gc>> {
+        while self.i < fmt.len() {
+            let b = fmt[self.i];
+            if b != b'%' {
+                self.out.push(b);
+                self.i += 1;
+                continue;
+            }
+            // parse flags/width/precision/conv starting at fmt[i+1]
+            let (spec, next) = parse_spec(ctx, fmt, self.i + 1)?;
+            self.i = next;
+            if spec.conv == b'%' {
+                self.out.push(b'%');
+                continue;
+            }
+            // A conversion consumes the next argument; a missing one is an error
+            // ("no value"), distinct from an explicitly-passed nil.
+            if self.arg_idx >= args.len() {
+                return Err(Error::from_str(
+                    ctx,
+                    &format!("bad argument #{} to 'format' (no value)", self.arg_idx + 1),
+                ));
+            }
+            let arg = args.get(self.arg_idx);
+            self.arg_idx += 1;
+            let tolstring = spec.conv == b's'
+                || (spec.conv == b'q' && (arg.is_nil() || arg.get_boolean().is_some()));
+            if tolstring && !ctx.metamethod_of(arg, ctx.symbols().mm_tostring).is_nil() {
+                return Ok(Some((spec, self.arg_idx - 1)));
+            }
+            // After the increment, `arg_idx` is the 1-based Lua argument number of
+            // the argument just consumed (the format string is #1).
+            format_one(ctx, &mut self.out, &spec, arg, self.arg_idx)?;
+        }
+        Ok(None)
+    }
 }
 
 #[derive(Default)]
@@ -880,14 +938,12 @@ fn fmt_hex_float(out: &mut Vec<u8>, spec: &FmtSpec, f: f64, upper: bool) {
 
 // ---------- string and q ----------
 
+/// `%s` of a value without `__tostring` (`Formatter::run` diverts the rest).
 fn fmt_string<'gc>(ctx: Context<'gc>, out: &mut Vec<u8>, spec: &FmtSpec, arg: Value<'gc>) {
-    // Lua's %s applies tostring (`luaL_tolstring`) to non-strings — booleans,
-    // numbers (in Lua form), nil, and the `type: 0xADDR` form for the rest.
-    // Honoring `__tostring` needs native->Lua calls (deferred with #27).
-    let ls = arg
-        .get_string()
-        .unwrap_or_else(|| crate::builtin::util::basic_tostring(ctx, arg));
-    let bytes = ls.as_bytes();
+    fmt_str_bytes(out, spec, util::basic_tostring(ctx, arg).as_bytes());
+}
+
+fn fmt_str_bytes(out: &mut Vec<u8>, spec: &FmtSpec, bytes: &[u8]) {
     let trimmed: &[u8] = if let Some(p) = spec.precision {
         &bytes[..bytes.len().min(p)]
     } else {

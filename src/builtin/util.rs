@@ -2,9 +2,14 @@
 //! stringification and small argument-coercion routines used across the
 //! `basic`, `string`, `table`, and `io` libraries.
 
-use crate::dmm::{Gc, Mutation};
-use crate::env::{Error, LuaString, Value};
-use crate::lua::Context;
+use std::pin::Pin;
+
+use crate::dmm::{Collect, Gc, Mutation, Trace};
+use crate::env::{Error, Function, LuaString, Stack, Value};
+use crate::lua::{Context, StashedError, StashedValue};
+use crate::vm::async_sequence::AsyncSequence;
+use crate::vm::interp::MAX_TAG_LOOP;
+use crate::vm::sequence::{Execution, Sequence, SequencePoll};
 
 /// Append the canonical Lua textual form of an integer.
 pub(crate) fn push_int(out: &mut Vec<u8>, i: i64) {
@@ -218,38 +223,149 @@ fn strip_trailing_zeros(s: &mut String) {
     }
 }
 
-/// `tostring` without metamethod dispatch: the default representation Lua
-/// uses when there is no `__tostring`/`__name`. Numbers and strings get their
-/// literal form; all reference types get `"<type>: 0x<addr>"`, with native
-/// functions tagged `"function: builtin: ..."` to match PUC-Lua.
+/// `luaL_tolstring` short of calling `__tostring`: numbers and strings in
+/// their literal form, other values as `"<__name or type>: 0x<addr>"`.
 pub(crate) fn basic_tostring<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> LuaString<'gc> {
     if let Some(s) = v.get_string() {
         return s;
     }
     let mut out: Vec<u8> = Vec::new();
-    if v.is_nil() {
+    let ptr = if v.is_nil() {
         out.extend_from_slice(b"nil");
+        None
     } else if let Some(b) = v.get_boolean() {
         out.extend_from_slice(if b { b"true" } else { b"false" });
+        None
     } else if let Some(i) = v.get_integer() {
         push_int(&mut out, i);
+        None
     } else if let Some(f) = v.get_float() {
         push_float(&mut out, f);
+        None
     } else if let Some(t) = v.get_table() {
-        push_addr(&mut out, "table", Gc::as_ptr(t.inner()) as *const ());
+        Some(Gc::as_ptr(t.inner()) as *const ())
     } else if let Some(f) = v.get_function() {
-        if f.as_native().is_some() {
-            out.extend_from_slice(b"function: builtin: ");
-            push_ptr(&mut out, Gc::as_ptr(f.inner()) as *const ());
-        } else {
-            push_addr(&mut out, "function", Gc::as_ptr(f.inner()) as *const ());
-        }
+        Some(Gc::as_ptr(f.inner()) as *const ())
     } else if let Some(t) = v.get_thread() {
-        push_addr(&mut out, "thread", Gc::as_ptr(t.inner()) as *const ());
-    } else if let Some(u) = v.get_userdata() {
-        push_addr(&mut out, "userdata", Gc::as_ptr(u.inner()) as *const ());
+        Some(Gc::as_ptr(t.inner()) as *const ())
+    } else {
+        v.get_userdata().map(|u| Gc::as_ptr(u.inner()) as *const ())
+    };
+    if let Some(ptr) = ptr {
+        let name = ctx.metamethod_of(v, LuaString::new(ctx, b"__name"));
+        match name.get_string() {
+            Some(name) => out.extend_from_slice(name.as_bytes()),
+            None => out.extend_from_slice(v.type_name().as_bytes()),
+        }
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(format!("{ptr:p}").as_bytes());
     }
     LuaString::new(ctx, &out)
+}
+
+/// The function a call to `f` reaches through its `__call` chain, with each
+/// callable object prepended to `args` (`tryfuncTM`).
+pub(crate) fn callable<'gc>(
+    ctx: Context<'gc>,
+    mut f: Value<'gc>,
+    args: &mut Vec<Value<'gc>>,
+) -> Result<Function<'gc>, Error<'gc>> {
+    for _ in 0..MAX_TAG_LOOP {
+        if let Some(func) = f.get_function() {
+            return Ok(func);
+        }
+        let call = ctx.metamethod_of(f, ctx.symbols().mm_call);
+        if call.is_nil() {
+            break;
+        }
+        args.insert(0, f);
+        f = call;
+    }
+    Err(Error::from_str(
+        ctx,
+        &format!("attempt to call a {} value", f.type_name()),
+    ))
+}
+
+/// Call `v`'s `__tostring` metamethod `mm` using the stack from `bottom` up,
+/// and return its result as `luaL_tolstring` accepts it: a string, or a
+/// number converted to one.
+pub(crate) async fn call_tostring(
+    seq: &mut AsyncSequence,
+    mm: &StashedValue,
+    v: &StashedValue,
+    bottom: usize,
+) -> Result<Vec<u8>, StashedError> {
+    let f = seq.try_enter(|ctx, locals, _exec, mut stack| {
+        let mut args = vec![locals.fetch(ctx.mutation(), v)];
+        let f = callable(ctx, locals.fetch(ctx.mutation(), mm), &mut args)?;
+        stack.truncate(bottom);
+        stack.extend(args);
+        Ok(locals.stash(ctx.mutation(), f))
+    })?;
+    seq.call(&f, bottom).await?;
+    seq.try_enter(|ctx, _locals, _exec, mut stack| {
+        let r = stack.get(bottom);
+        stack.truncate(bottom);
+        Ok(tostring_result(ctx, r)?.as_bytes().to_vec())
+    })
+}
+
+/// A `__tostring` result as `luaL_tolstring` accepts it: a string, or a number
+/// converted to one.
+fn tostring_result<'gc>(ctx: Context<'gc>, r: Value<'gc>) -> Result<LuaString<'gc>, Error<'gc>> {
+    if r.get_string().is_none() && r.get_integer().is_none() && !r.is_float() {
+        return Err(Error::from_str(ctx, "'__tostring' must return a string"));
+    }
+    Ok(basic_tostring(ctx, r))
+}
+
+/// Follow-up for a `Call` of a `__tostring` metamethod: its first result,
+/// checked and converted by [`tostring_result`].
+pub(crate) struct ToStringResult;
+
+unsafe impl<'gc> Collect<'gc> for ToStringResult {
+    const NEEDS_TRACE: bool = false;
+}
+
+impl<'gc> Sequence<'gc> for ToStringResult {
+    fn trace_pointers(&self, _cc: &mut dyn Trace<'gc>) {}
+
+    fn poll(
+        self: Pin<&mut Self>,
+        ctx: Context<'gc>,
+        _exec: Execution<'gc>,
+        mut stack: Stack<'gc, '_>,
+    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
+        let s = tostring_result(ctx, stack.get(0))?;
+        stack.ret1(Value::string(s));
+        Ok(SequencePoll::Return)
+    }
+}
+
+/// Follow-up for a `Call` that adjusts the callee's results to exactly `.0`
+/// values, as `lua_call(L, nargs, n)` does.
+pub(crate) struct AdjustResults(pub(crate) usize);
+
+unsafe impl<'gc> Collect<'gc> for AdjustResults {
+    const NEEDS_TRACE: bool = false;
+}
+
+impl<'gc> Sequence<'gc> for AdjustResults {
+    fn trace_pointers(&self, _cc: &mut dyn Trace<'gc>) {}
+
+    fn poll(
+        self: Pin<&mut Self>,
+        _ctx: Context<'gc>,
+        _exec: Execution<'gc>,
+        mut stack: Stack<'gc, '_>,
+    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
+        stack.truncate(self.0);
+        while stack.len() < self.0 {
+            stack.push(Value::nil());
+        }
+        Ok(SequencePoll::Return)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -373,13 +489,3 @@ pub(crate) fn num_to_value<'gc>(mc: &Mutation<'gc>, f: f64) -> Value<'gc> {
 }
 
 pub(crate) use crate::vm::num::raw_eq;
-
-fn push_addr(out: &mut Vec<u8>, kind: &str, ptr: *const ()) {
-    out.extend_from_slice(kind.as_bytes());
-    out.extend_from_slice(b": ");
-    push_ptr(out, ptr);
-}
-
-fn push_ptr(out: &mut Vec<u8>, ptr: *const ()) {
-    out.extend_from_slice(format!("{ptr:p}").as_bytes());
-}
