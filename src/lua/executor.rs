@@ -721,7 +721,7 @@ fn pump_sequence<'gc>(
                     .copy_within(call_site.bottom..call_site.bottom + argc, new_args_base);
                 ts.set_top(new_args_base + argc);
             }
-            ts.stack[call_site.func_idx] = Value::function(function);
+            ts.stack[call_site.func_idx] = function;
             schedule_call_at(&mut ts, ctx, call_site.func_idx, call_site.returns)?;
         }
         Ok(SequencePoll::Yield { bottom: rel }) => {

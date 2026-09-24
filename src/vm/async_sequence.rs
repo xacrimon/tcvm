@@ -56,7 +56,7 @@ use crate::env::function::Stack;
 use crate::env::thread::ThreadState;
 use crate::env::{Thread, Value};
 use crate::lua::Context;
-use crate::lua::stash::{Fetchable, Stashable, StashedError, StashedFunction, StashedThread};
+use crate::lua::stash::{Fetchable, Stashable, StashedError, StashedThread, StashedValue};
 use crate::vm::sequence::{BoxSequence, Catch, Execution, Sequence, SequencePoll};
 
 /// Build a [`Sequence`] from a Rust `async move` block.
@@ -92,8 +92,9 @@ where
 pub enum SequenceReturn {
     /// Stack values are the sequence's results — return to caller.
     Return,
-    /// Tail-call this function with stack values as args.
-    Call(StashedFunction),
+    /// Tail-call this value (through its `__call` chain) with stack values
+    /// as args.
+    Call(StashedValue),
     /// Tail-yield stack values to the resumer.
     Yield,
     /// Tail-resume `thread` with stack values as args.

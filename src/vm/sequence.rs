@@ -37,9 +37,10 @@ pub enum SequencePoll<'gc> {
     /// yielding/returning, this sequence is polled with those values at
     /// `bottom..`.
     Resume { thread: Thread<'gc>, bottom: usize },
-    /// Tail call; this sequence is consumed and the call's results go to the
-    /// sequence's caller, not back to this sequence.
-    TailCall(Function<'gc>),
+    /// Tail call (through the `__call` chain); this sequence is consumed and
+    /// the call's results go to the sequence's caller, not back to this
+    /// sequence.
+    TailCall(Value<'gc>),
     /// Tail yield; sequence consumed.
     TailYield,
     /// Tail resume; sequence consumed.
