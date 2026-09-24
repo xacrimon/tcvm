@@ -33,13 +33,7 @@ pub(super) fn check_str<'gc>(
     } else if v.get_integer().is_some() || v.get_float().is_some() {
         Ok(util::basic_tostring(ctx, v))
     } else {
-        Err(Error::from_str(
-            ctx,
-            &format!(
-                "bad argument #{n} to '{fname}' (string expected, got {})",
-                v.type_name()
-            ),
-        ))
+        Err(util::type_error(ctx, fname, n, "string", Some(v)))
     }
 }
 
@@ -264,13 +258,8 @@ fn lua_format<'gc>(
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let fmt_val = stack.get(0);
     let fmt_str = fmt_val.get_string().ok_or_else(|| {
-        Error::from_str(
-            ctx,
-            &format!(
-                "bad argument #1 to 'format' (string expected, got {})",
-                fmt_val.type_name()
-            ),
-        )
+        let got = (!stack.is_empty()).then_some(fmt_val);
+        util::type_error(ctx, "format", 1, "string", got)
     })?;
     let fmt = fmt_str.as_bytes();
 
@@ -562,14 +551,7 @@ fn arg_type_err<'gc>(
     arg: &Value<'gc>,
     arg_num: usize,
 ) -> Error<'gc> {
-    Error::from_str(
-        ctx,
-        &format!(
-            "bad argument #{arg_num} to 'format' ({} expected, got {})",
-            expected,
-            arg.type_name()
-        ),
-    )
+    util::type_error(ctx, "format", arg_num, expected, Some(*arg))
 }
 
 /// Coerce a `%d`/`%x`/`%c`/… argument to an integer, distinguishing — as Lua
@@ -583,15 +565,19 @@ fn check_fmt_int<'gc>(
     if let Some(i) = to_integer(arg) {
         return Ok(i);
     }
-    let msg = if to_float(arg).is_some() {
-        format!("bad argument #{arg_num} to 'format' (number has no integer representation)")
-    } else {
-        format!(
-            "bad argument #{arg_num} to 'format' (number expected, got {})",
-            arg.type_name()
-        )
-    };
-    Err(Error::from_str(ctx, &msg))
+    if to_float(arg).is_some() {
+        return Err(Error::from_str(
+            ctx,
+            &format!("bad argument #{arg_num} to 'format' (number has no integer representation)"),
+        ));
+    }
+    Err(util::type_error(
+        ctx,
+        "format",
+        arg_num,
+        "number",
+        Some(arg),
+    ))
 }
 
 // ---------- integer formatting ----------
@@ -1195,12 +1181,12 @@ fn lua_gsub<'gc>(
     let repl_fn = repl.get_function();
     let repl_tbl = repl.get_table();
     if repl_fn.is_none() && repl_tbl.is_none() {
-        return Err(Error::from_str(
+        return Err(util::type_error(
             ctx,
-            &format!(
-                "bad argument #3 to 'gsub' (string/function/table expected, got {})",
-                repl.type_name()
-            ),
+            "gsub",
+            3,
+            "string/function/table",
+            Some(repl),
         ));
     }
 

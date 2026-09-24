@@ -1,4 +1,5 @@
 use crate::Context;
+use crate::builtin::util;
 use crate::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Value};
 use crate::vm::sequence::CallbackAction;
 
@@ -135,14 +136,13 @@ fn lua_setmetatable<'gc>(
         Some(mt) => Some(mt),
         None if mt_arg.is_nil() && stack.len() >= 2 => None,
         None => {
-            let got = if stack.len() < 2 {
-                "no value"
-            } else {
-                mt_arg.type_name()
-            };
-            return Err(Error::from_str(
+            let got = (stack.len() >= 2).then_some(mt_arg);
+            return Err(util::type_error(
                 ctx,
-                &format!("bad argument #2 to 'setmetatable' (nil or table expected, got {got})"),
+                "setmetatable",
+                2,
+                "nil or table",
+                got,
             ));
         }
     };

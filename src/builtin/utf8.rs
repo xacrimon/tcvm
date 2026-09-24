@@ -1,4 +1,5 @@
 use crate::Context;
+use crate::builtin::util;
 use crate::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Value};
 use crate::vm::sequence::CallbackAction;
 
@@ -102,15 +103,8 @@ fn check_str<'gc>(
     fname: &str,
     n: usize,
 ) -> Result<LuaString<'gc>, Error<'gc>> {
-    v.get_string().ok_or_else(|| {
-        Error::from_str(
-            ctx,
-            &format!(
-                "bad argument #{n} to '{fname}' (string expected, got {})",
-                v.type_name()
-            ),
-        )
-    })
+    v.get_string()
+        .ok_or_else(|| util::type_error(ctx, fname, n, "string", Some(v)))
 }
 
 /// Lua's `posrelat` for byte positions.

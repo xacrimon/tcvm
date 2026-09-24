@@ -372,6 +372,32 @@ impl<'gc> Sequence<'gc> for AdjustResults {
 // Argument coercion (shared `luaL_check*` analogues)
 // ---------------------------------------------------------------------------
 
+/// `luaL_typeerror`: argument `n` of `fname` should have been `expected`.
+/// `got` is `None` for a missing argument; a value whose metatable has a
+/// string `__name` is reported by that name.
+pub(crate) fn type_error<'gc>(
+    ctx: Context<'gc>,
+    fname: &str,
+    n: usize,
+    expected: &str,
+    got: Option<Value<'gc>>,
+) -> Error<'gc> {
+    let got = match got {
+        None => "no value".into(),
+        Some(v) => match ctx
+            .metamethod_of(v, LuaString::new(ctx, b"__name"))
+            .get_string()
+        {
+            Some(name) => String::from_utf8_lossy(name.as_bytes()),
+            None => v.type_name().into(),
+        },
+    };
+    Error::from_str(
+        ctx,
+        &format!("bad argument #{n} to '{fname}' ({expected} expected, got {got})"),
+    )
+}
+
 /// Coerce `v` to a float, mirroring `luaL_checknumber` (numeric strings
 /// included). `fname`/`n` build the standard bad-argument message on failure.
 /// Floats and small integers are inlined; everything else (boxed integers,
@@ -401,15 +427,7 @@ fn check_number_slow<'gc>(
     fname: &str,
     n: usize,
 ) -> Result<f64, Error<'gc>> {
-    to_number(v).ok_or_else(|| {
-        Error::from_str(
-            ctx,
-            &format!(
-                "bad argument #{n} to '{fname}' (number expected, got {})",
-                v.type_name()
-            ),
-        )
-    })
+    to_number(v).ok_or_else(|| type_error(ctx, fname, n, "number", Some(v)))
 }
 
 /// Coerce `v` to an integer, mirroring `luaL_checkinteger`: integers pass
@@ -430,13 +448,7 @@ pub(crate) fn check_integer<'gc>(
             &format!("bad argument #{n} to '{fname}' (number has no integer representation)"),
         ));
     }
-    Err(Error::from_str(
-        ctx,
-        &format!(
-            "bad argument #{n} to '{fname}' (number expected, got {})",
-            v.type_name()
-        ),
-    ))
+    Err(type_error(ctx, fname, n, "number", Some(v)))
 }
 
 pub(crate) fn to_number<'gc>(v: Value<'gc>) -> Option<f64> {

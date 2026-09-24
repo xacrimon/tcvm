@@ -226,15 +226,8 @@ fn lua_next<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let Some(t) = stack.get(0).get_table() else {
-        let got = if stack.is_empty() {
-            "no value"
-        } else {
-            stack.get(0).type_name()
-        };
-        return Err(Error::from_str(
-            ctx,
-            &format!("bad argument #1 to 'next' (table expected, got {got})"),
-        ));
+        let got = (!stack.is_empty()).then(|| stack.get(0));
+        return Err(util::type_error(ctx, "next", 1, "table", got));
     };
     match t.next(ctx.mutation(), stack.get(1)) {
         Ok(Some((k, v))) => stack.replace(&[k, v]),
@@ -411,10 +404,8 @@ fn lua_rawget<'gc>(
     let t_arg = stack.get(0);
     let key = stack.get(1);
     let Some(t) = t_arg.get_table() else {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #1 to 'rawget' (table expected)",
-        ));
+        let got = (!stack.is_empty()).then_some(t_arg);
+        return Err(util::type_error(ctx, "rawget", 1, "table", got));
     };
     let v = t.raw_get(key);
     stack.ret1(v);
@@ -434,15 +425,8 @@ fn lua_rawlen<'gc>(
     } else if let Some(t) = v.get_table() {
         t.raw_len() as i64
     } else {
-        let got = if stack.is_empty() {
-            "no value"
-        } else {
-            v.type_name()
-        };
-        return Err(Error::from_str(
-            ctx,
-            &format!("bad argument #1 to 'rawlen' (table or string expected, got {got})"),
-        ));
+        let got = (!stack.is_empty()).then_some(v);
+        return Err(util::type_error(ctx, "rawlen", 1, "table or string", got));
     };
     stack.ret1(Value::integer(ctx.mutation(), len));
     Ok(CallbackAction::Return)
@@ -457,10 +441,8 @@ fn lua_rawset<'gc>(
     let key = stack.get(1);
     let value = stack.get(2);
     let Some(t) = t_arg.get_table() else {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #1 to 'rawset' (table expected)",
-        ));
+        let got = (!stack.is_empty()).then_some(t_arg);
+        return Err(util::type_error(ctx, "rawset", 1, "table", got));
     };
     // `luaH_set` raises from inside the C function, so unlike argument
     // errors these carry no position.
@@ -520,20 +502,22 @@ fn lua_setmetatable<'gc>(
     let t_arg = stack.get(0);
     let mt_arg = stack.get(1);
     let Some(t) = t_arg.get_table() else {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #1 to 'setmetatable' (table expected)",
-        ));
+        let got = (!stack.is_empty()).then_some(t_arg);
+        return Err(util::type_error(ctx, "setmetatable", 1, "table", got));
     };
-    let mt = if mt_arg.is_nil() {
-        None
-    } else if let Some(mt) = mt_arg.get_table() {
-        Some(mt)
-    } else {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #2 to 'setmetatable' (nil or table expected)",
-        ));
+    let mt = match mt_arg.get_table() {
+        Some(mt) => Some(mt),
+        None if mt_arg.is_nil() && stack.len() >= 2 => None,
+        None => {
+            let got = (stack.len() >= 2).then_some(mt_arg);
+            return Err(util::type_error(
+                ctx,
+                "setmetatable",
+                2,
+                "nil or table",
+                got,
+            ));
+        }
     };
     // If the existing metatable carries a `__metatable` field, the
     // metatable is locked: refuse the change. Matches Lua 5.5 reference
@@ -563,15 +547,9 @@ fn lua_tonumber<'gc>(
         // base range validated (#2) — so e.g. `tonumber(nil, 99)` complains
         // about #1, not the out-of-range base.
         let base = util::check_integer(ctx, base_arg, "tonumber", 2)?;
-        let s = v.get_string().ok_or_else(|| {
-            Error::from_str(
-                ctx,
-                &format!(
-                    "bad argument #1 to 'tonumber' (string expected, got {})",
-                    v.type_name()
-                ),
-            )
-        })?;
+        let s = v
+            .get_string()
+            .ok_or_else(|| util::type_error(ctx, "tonumber", 1, "string", Some(v)))?;
         if !(2..=36).contains(&base) {
             return Err(Error::from_str(
                 ctx,
@@ -643,24 +621,14 @@ fn lua_warn<'gc>(
     stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     if stack.is_empty() {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #1 to 'warn' (string expected, got no value)",
-        ));
+        return Err(util::type_error(ctx, "warn", 1, "string", None));
     }
     for i in 0..stack.len() {
         let v = stack.get(i);
         // `luaL_checkstring` coerces numbers to their string form, so integers
         // and floats are accepted; only truly non-coercible types error.
         if v.get_string().is_none() && v.get_integer().is_none() && v.get_float().is_none() {
-            return Err(Error::from_str(
-                ctx,
-                &format!(
-                    "bad argument #{} to 'warn' (string expected, got {})",
-                    i + 1,
-                    v.type_name()
-                ),
-            ));
+            return Err(util::type_error(ctx, "warn", i + 1, "string", Some(v)));
         }
     }
     Ok(CallbackAction::Return)
@@ -674,15 +642,8 @@ fn lua_xpcall<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let Some(handler) = stack.get(1).get_function() else {
-        let got = if stack.len() < 2 {
-            "no value"
-        } else {
-            stack.get(1).type_name()
-        };
-        return Err(Error::from_str(
-            ctx,
-            &format!("bad argument #2 to 'xpcall' (function expected, got {got})"),
-        ));
+        let got = (stack.len() >= 2).then(|| stack.get(1));
+        return Err(util::type_error(ctx, "xpcall", 2, "function", got));
     };
     // Drop the handler slot so the callee and its args sit in `Call` layout.
     stack.remove(1);

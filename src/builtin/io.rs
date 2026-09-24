@@ -225,15 +225,7 @@ fn check_file<'gc>(
     fname: &str,
     n: usize,
 ) -> Result<Userdata<'gc>, Error<'gc>> {
-    as_file(ctx, closure, v).ok_or_else(|| {
-        Error::from_str(
-            ctx,
-            &format!(
-                "bad argument #{n} to '{fname}' (FILE* expected, got {})",
-                v.type_name()
-            ),
-        )
-    })
+    as_file(ctx, closure, v).ok_or_else(|| util::type_error(ctx, fname, n, "FILE*", Some(v)))
 }
 
 fn closed_file_error<'gc>(ctx: Context<'gc>) -> Error<'gc> {
@@ -493,13 +485,12 @@ fn do_write<'gc>(
         } else if let Some(f) = v.get_float() {
             util::push_float(&mut buf, f);
         } else {
-            return Err(Error::from_str(
+            return Err(util::type_error(
                 ctx,
-                &format!(
-                    "bad argument #{} to '{fname}' (string expected, got {})",
-                    first_arg + i,
-                    v.type_name()
-                ),
+                fname,
+                first_arg + i,
+                "string",
+                Some(*v),
             ));
         }
     }
@@ -710,10 +701,11 @@ fn lua_open<'gc>(
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let name = stack
-        .get(0)
-        .get_string()
-        .ok_or_else(|| Error::from_str(ctx, "bad argument #1 to 'open' (string expected)"))?;
+    let name_val = stack.get(0);
+    let name = name_val.get_string().ok_or_else(|| {
+        let got = (!stack.is_empty()).then_some(name_val);
+        util::type_error(ctx, "open", 1, "string", got)
+    })?;
     let mode_val = stack.get(1);
     let mode = if mode_val.is_nil() {
         b"r".as_slice()
@@ -721,7 +713,7 @@ fn lua_open<'gc>(
         mode_val
             .get_string()
             .map(|s| s.as_bytes())
-            .ok_or_else(|| Error::from_str(ctx, "bad argument #2 to 'open' (string expected)"))?
+            .ok_or_else(|| util::type_error(ctx, "open", 2, "string", Some(mode_val)))?
     };
     // An invalid mode is a raised argument error, not a `(nil, msg, errno)`
     // return (Lua's `luaL_argcheck(l_checkmode(...))`).
@@ -1012,7 +1004,7 @@ fn lua_file_seek<'gc>(
         whence_val
             .get_string()
             .map(|s| s.as_bytes())
-            .ok_or_else(|| Error::from_str(ctx, "bad argument #2 to 'seek' (string expected)"))?
+            .ok_or_else(|| util::type_error(ctx, "seek", 2, "string", Some(whence_val)))?
     };
     let offset = {
         let o = stack.get(2);
@@ -1101,15 +1093,8 @@ fn lua_file_setvbuf<'gc>(
             ));
         }
         None => {
-            let got = if stack.len() < 2 {
-                "no value"
-            } else {
-                mode.type_name()
-            };
-            return Err(Error::from_str(
-                ctx,
-                &format!("bad argument #2 to 'setvbuf' (string expected, got {got})"),
-            ));
+            let got = (stack.len() >= 2).then_some(mode);
+            return Err(util::type_error(ctx, "setvbuf", 2, "string", got));
         }
     }
     stack.ret1(Value::boolean(true));

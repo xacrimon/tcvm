@@ -12,15 +12,8 @@ fn check_table<'gc>(
     v: Value<'gc>,
     fname: &str,
 ) -> Result<Table<'gc>, Error<'gc>> {
-    v.get_table().ok_or_else(|| {
-        Error::from_str(
-            ctx,
-            &format!(
-                "bad argument #1 to '{fname}' (table expected, got {})",
-                v.type_name()
-            ),
-        )
-    })
+    v.get_table()
+        .ok_or_else(|| util::type_error(ctx, fname, 1, "table", Some(v)))
 }
 
 pub fn load<'gc>(ctx: Context<'gc>) {
@@ -63,13 +56,7 @@ fn lua_concat<'gc>(
     } else if sep_arg.get_integer().is_some() || sep_arg.get_float().is_some() {
         util::basic_tostring(ctx, sep_arg).as_bytes().to_vec()
     } else {
-        return Err(Error::from_str(
-            ctx,
-            &format!(
-                "bad argument #2 to 'concat' (string expected, got {})",
-                sep_arg.type_name()
-            ),
-        ));
+        return Err(util::type_error(ctx, "concat", 2, "string", Some(sep_arg)));
     };
     let i_arg = stack.get(2);
     let i = if i_arg.is_nil() {
@@ -338,13 +325,7 @@ fn lua_sort<'gc>(
     } else if let Some(f) = comp_arg.get_function() {
         Some(f)
     } else {
-        return Err(Error::from_str(
-            ctx,
-            &format!(
-                "bad argument #2 to 'sort' (function expected, got {})",
-                comp_arg.type_name()
-            ),
-        ));
+        return Err(util::type_error(ctx, "sort", 2, "function", Some(comp_arg)));
     };
 
     let mc = ctx.mutation();

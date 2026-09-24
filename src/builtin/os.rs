@@ -47,15 +47,8 @@ fn check_str_arg<'gc>(
     fname: &str,
     n: usize,
 ) -> Result<LuaString<'gc>, Error<'gc>> {
-    v.get_string().ok_or_else(|| {
-        Error::from_str(
-            ctx,
-            &format!(
-                "bad argument #{n} to '{fname}' (string expected, got {})",
-                v.type_name()
-            ),
-        )
-    })
+    v.get_string()
+        .ok_or_else(|| util::type_error(ctx, fname, n, "string", Some(v)))
 }
 
 pub fn load<'gc>(ctx: Context<'gc>) {
@@ -113,17 +106,11 @@ fn lua_difftime<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     if stack.is_empty() {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #1 to 'difftime' (number expected, got no value)",
-        ));
+        return Err(util::type_error(ctx, "difftime", 1, "number", None));
     }
     let t2 = util::check_number(ctx, stack.get(0), "difftime", 1)?;
     if stack.len() < 2 {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #2 to 'difftime' (number expected, got no value)",
-        ));
+        return Err(util::type_error(ctx, "difftime", 2, "number", None));
     }
     let t1 = util::check_number(ctx, stack.get(1), "difftime", 2)?;
     stack.ret1(Value::float(t2 - t1));
@@ -244,13 +231,7 @@ fn lua_time<'gc>(
             "os.time with a table argument is not yet supported (needs timezone handling)",
         ))
     } else {
-        Err(Error::from_str(
-            ctx,
-            &format!(
-                "bad argument #1 to 'time' (table expected, got {})",
-                arg.type_name()
-            ),
-        ))
+        Err(util::type_error(ctx, "time", 1, "table", Some(arg)))
     }
 }
 
