@@ -157,6 +157,7 @@ pub(crate) fn op_error_message<'gc>(
         OpError::ModByZero => "attempt to perform 'n%0'".to_owned(),
         OpError::IndexChainLoop => "'__index' chain too long; possible loop".to_owned(),
         OpError::NewIndexChainLoop => "'__newindex' chain too long; possible loop".to_owned(),
+        OpError::CallChainTooLong => "'__call' chain too long".to_owned(),
         OpError::GlobalRedefined(k) => {
             let name = ts
                 .top_lua()

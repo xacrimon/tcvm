@@ -111,6 +111,7 @@ pub(crate) enum OpError<'gc> {
     ModByZero,
     IndexChainLoop,
     NewIndexChainLoop,
+    CallChainTooLong,
     /// ERRNNIL: constant index of the global's name.
     GlobalRedefined(u16),
     ForStepZero,
@@ -385,16 +386,10 @@ macro_rules! helpers {
         /// the continuation; a native target runs inline — synchronously the
         /// continuation payload fires immediately, otherwise the call suspends
         /// through the executor (`schedule_meta_call` installs the pending
-        /// action / error frame). A non-callable target raises `$$err`, an
-        /// `OpError` variant applied to the target: `Call` by default, but
-        /// `__index`/`__newindex` chains pass `Index`, since the reference
-        /// indexes a non-function metamethod value rather than calling it.
+        /// action / error frame).
         #[allow(unused_macros)]
         macro_rules! invoke_metamethod {
-            ($$meta:expr, $$args:expr, $$cont:expr) => {
-                invoke_metamethod!($$meta, $$args, $$cont, Call)
-            };
-            ($$meta:expr, $$args:expr, $$cont:expr, $$err:ident) => {{
+            ($$meta:expr, $$args:expr, $$cont:expr) => {{
                 let __mm_meta: Value<'gc> = $$meta;
                 let __mm_cont: Continuation = $$cont;
                 match schedule_meta_call($ctx, $thread, __mm_meta, $$args, __mm_cont, $ip) {
@@ -438,8 +433,7 @@ macro_rules! helpers {
                     // Native target suspended (or errored): the executor will
                     // resume / unwind from the installed frame state.
                     MetaDispatch::Suspended => return Exit::End,
-                    MetaDispatch::Unresolvable => raise!(OpError::$$err(__mm_meta)),
-                    MetaDispatch::StackOverflow => raise!(OpError::StackOverflow),
+                    MetaDispatch::Raise(e) => raise!(e),
                 }
             }};
         }
@@ -526,7 +520,7 @@ macro_rules! get_slow_body {
                 receiver: __mm_recv,
             } => {
                 let __cont = Continuation::StoreResult { dst: __dst_reg };
-                invoke_metamethod!(Value::function(__mm_func), &[__mm_recv, __k], __cont, Index);
+                invoke_metamethod!(Value::function(__mm_func), &[__mm_recv, __k], __cont);
             }
             IndexChain::NotIndexable(__v) => raise!(OpError::Index(__v)),
             IndexChain::Exhausted => raise!(OpError::IndexChainLoop),
@@ -555,8 +549,7 @@ macro_rules! set_slow_body {
                 invoke_metamethod!(
                     Value::function(__mm_func),
                     &[__mm_recv, __k, __new_val],
-                    __cont,
-                    Index
+                    __cont
                 );
             }
             NewIndexChain::NotIndexable(__v) => raise!(OpError::Index(__v)),
@@ -1273,7 +1266,7 @@ extern "rust-preserve-none" fn op_self_slow<'gc>(
             // continuation writes the resolved method into dst.
             *reg!(ref mut (dst + 1)) = recv_val;
             let cont = Continuation::StoreResult { dst };
-            invoke_metamethod!(Value::function(func), &[receiver, key], cont, Index);
+            invoke_metamethod!(Value::function(func), &[receiver, key], cont);
         }
         IndexChain::NotIndexable(v) => raise!(OpError::Index(v)),
         IndexChain::Exhausted => raise!(OpError::IndexChainLoop),
@@ -2693,8 +2686,9 @@ extern "rust-preserve-none" fn op_call_meta<'gc>(
     let (func, nargs, returns) = instruction.abc();
     let base = unsafe { (*frame).base() };
     let func_idx = base + func as usize;
-    let Some((target, nargs)) = resolve_call_chain(ctx, thread, func_idx, nargs) else {
-        raise!(OpError::Call(thread.stack[func_idx]));
+    let (target, nargs) = match resolve_call_chain(ctx, thread, func_idx, nargs) {
+        Ok(r) => r,
+        Err(e) => raise!(e),
     };
 
     match target {
@@ -2934,8 +2928,9 @@ extern "rust-preserve-none" fn op_tailcall_slow<'gc>(
     let (func, nargs) = instruction.ab();
     let base = unsafe { (*frame).base() };
     let func_idx = base + func as usize;
-    let Some((target, nargs)) = resolve_call_chain(ctx, thread, func_idx, nargs) else {
-        raise!(OpError::Call(thread.stack[func_idx]));
+    let (target, nargs) = match resolve_call_chain(ctx, thread, func_idx, nargs) {
+        Ok(r) => r,
+        Err(e) => raise!(e),
     };
 
     match target {
@@ -4200,8 +4195,8 @@ fn close_upvalues_slow<'gc>(mc: &Mutation<'gc>, thread: &mut ThreadState<'gc>, s
 // Metamethod invocation / continuations
 // ---------------------------------------------------------------------------
 
-/// Maximum depth of `__index` / `__newindex` / `__call` chains before we
-/// give up and raise (matches Lua 5.4's `MAXTAGLOOP`).
+/// Maximum depth of `__index` / `__newindex` chains before we give up and
+/// raise (Lua's `MAXTAGLOOP`).
 pub(crate) const MAX_TAG_LOOP: usize = 2000;
 
 /// Result of walking an `__index` chain.
@@ -4324,8 +4319,8 @@ pub(crate) enum CallTarget<'gc> {
 }
 
 /// Outcome of [`schedule_meta_call`], consumed by the `invoke_metamethod!`
-/// macro. Captures the three ways a continuation-driven call can proceed.
-pub(crate) enum MetaDispatch {
+/// macro.
+pub(crate) enum MetaDispatch<'gc> {
     /// Resolved to a Lua closure; a frame carrying the continuation was
     /// pushed. The caller rebinds its dispatch registers to it and dispatches.
     Lua {
@@ -4340,36 +4335,36 @@ pub(crate) enum MetaDispatch {
     /// `pending_action` or `ExecKind::Error` was installed for the executor. The
     /// caller returns to exit dispatch.
     Suspended,
-    /// Target is not callable (or a suspending comparison metamethod, which we
-    /// don't support). The caller raises.
-    Unresolvable,
-    /// The call would cross the stack limit. The caller raises.
-    StackOverflow,
+    /// The call can't be made; the caller raises.
+    Raise(OpError<'gc>),
 }
+
+/// `__call` hops a call may take before "'__call' chain too long", like the
+/// reference's 4-bit `CIST_CCMT` counter.
+const MAX_CALL_CHAIN: usize = 15;
 
 /// Walk the `__call` chain at `thread.stack[func_idx]` until we hit a
 /// callable target, shifting args right by one on each hop to prepend the
 /// current callee as the first argument (Lua 5.5 `tryfuncTM` behavior).
-/// Returns the resolved target and the (possibly adjusted) `nargs`, or
-/// `None` if the chain is unresolvable: non-callable value, `nargs`
-/// overflow, or `MAX_TAG_LOOP` exhaustion. Callers raise on `None`.
+/// Returns the resolved target and the (possibly adjusted) `nargs`, or the
+/// error to raise.
 #[inline(always)]
 pub(crate) fn resolve_call_chain<'gc>(
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
     func_idx: usize,
     nargs: u8,
-) -> Option<(CallTarget<'gc>, u8)> {
+) -> Result<(CallTarget<'gc>, u8), OpError<'gc>> {
     // Plain functions are the overwhelmingly common case; keep the `__call`
     // walk (and its stack frame) out of the handler.
     if let Some(f) = thread.stack[func_idx].get_function() {
-        return match f.inner().as_ref() {
-            FunctionKind::Lua(_) => Some((
+        return Ok(match f.inner().as_ref() {
+            FunctionKind::Lua(_) => (
                 CallTarget::Lua(unsafe { LuaFn::from_function_unchecked(f) }),
                 nargs,
-            )),
-            FunctionKind::Native(nc) => Some((CallTarget::Native(nc), nargs)),
-        };
+            ),
+            FunctionKind::Native(nc) => (CallTarget::Native(nc), nargs),
+        });
     }
     resolve_call_chain_slow(ctx, thread, func_idx, nargs)
 }
@@ -4381,21 +4376,22 @@ fn resolve_call_chain_slow<'gc>(
     thread: &mut ThreadState<'gc>,
     func_idx: usize,
     mut nargs: u8,
-) -> Option<(CallTarget<'gc>, u8)> {
-    for _ in 0..MAX_TAG_LOOP {
+) -> Result<(CallTarget<'gc>, u8), OpError<'gc>> {
+    let mut hops = 0;
+    loop {
         let func_val = thread.stack[func_idx];
         if let Some(f) = func_val.get_function() {
-            return match f.inner().as_ref() {
-                FunctionKind::Lua(_) => Some((
+            return Ok(match f.inner().as_ref() {
+                FunctionKind::Lua(_) => (
                     CallTarget::Lua(unsafe { LuaFn::from_function_unchecked(f) }),
                     nargs,
-                )),
-                FunctionKind::Native(nc) => Some((CallTarget::Native(nc), nargs)),
-            };
+                ),
+                FunctionKind::Native(nc) => (CallTarget::Native(nc), nargs),
+            });
         }
         let mm = ctx.metamethod_of(func_val, ctx.symbols().mm_call);
         if mm.is_nil() {
-            return None;
+            return Err(OpError::Call(func_val));
         }
         // A MULTRET call (`nargs == 0`) carries its count in `thread.top`.
         let actual_args = if nargs == 0 {
@@ -4409,13 +4405,35 @@ fn resolve_call_chain_slow<'gc>(
         }
         thread.stack[func_idx + 1] = func_val;
         thread.stack[func_idx] = mm;
-        if nargs == 0 {
-            thread.set_top(thread.top + 1);
+        if hops == MAX_CALL_CHAIN {
+            return Err(OpError::CallChainTooLong);
+        }
+        hops += 1;
+        // A count that no longer fits in `nargs` moves to `thread.top`, as
+        // MULTRET's does.
+        if nargs == 0 || nargs == u8::MAX {
+            thread.set_top(func_idx + 2 + actual_args);
+            nargs = 0;
         } else {
-            nargs = nargs.checked_add(1)?;
+            nargs += 1;
         }
     }
-    None
+}
+
+/// The error [`resolve_call_chain`] would raise for calling `v`, found
+/// without touching the stack.
+pub(crate) fn call_chain_error<'gc>(ctx: Context<'gc>, mut v: Value<'gc>) -> Option<OpError<'gc>> {
+    for _ in 0..=MAX_CALL_CHAIN {
+        if v.get_function().is_some() {
+            return None;
+        }
+        let mm = ctx.metamethod_of(v, ctx.symbols().mm_call);
+        if mm.is_nil() {
+            return Some(OpError::Call(v));
+        }
+        v = mm;
+    }
+    Some(OpError::CallChainTooLong)
 }
 
 /// Binary metamethod `name`, taken from `lhs` first, then `rhs`.
@@ -4459,7 +4477,7 @@ fn schedule_meta_call<'gc>(
     args: &[Value<'gc>],
     cont: Continuation,
     caller_ip: *const Instruction,
-) -> MetaDispatch {
+) -> MetaDispatch<'gc> {
     // Save caller's pc; no decisions here depend on knowing the final target.
     // The native suspend path relies on this so the executor re-enters the
     // caller frame at the instruction following the one that scheduled us.
@@ -4476,7 +4494,7 @@ fn schedule_meta_call<'gc>(
 
     // Stage meta_fn + args so resolve_call_chain sees them in op_call layout.
     if !thread.ensure_frame_slots(new_base + args.len()) {
-        return MetaDispatch::StackOverflow;
+        return MetaDispatch::Raise(OpError::StackOverflow);
     }
     thread.stack[scratch_func] = meta_fn;
     for (i, &a) in args.iter().enumerate() {
@@ -4484,11 +4502,13 @@ fn schedule_meta_call<'gc>(
     }
 
     // Walk any __call chain. nargs follows op_call's convention (includes the
-    // function slot), so `args.len() + 1`.
-    debug_assert!(args.len() < u8::MAX as usize);
+    // function slot), so `args.len() + 1`. Every hop adds one, and the count
+    // must still fit after a full chain: `final_nargs == 0` isn't handled.
+    debug_assert!(args.len() + 1 + MAX_CALL_CHAIN < u8::MAX as usize);
     let nargs = (args.len() + 1) as u8;
-    let Some((target, final_nargs)) = resolve_call_chain(ctx, thread, scratch_func, nargs) else {
-        return MetaDispatch::Unresolvable;
+    let (target, final_nargs) = match resolve_call_chain(ctx, thread, scratch_func, nargs) {
+        Ok(r) => r,
+        Err(e) => return MetaDispatch::Raise(e),
     };
     let actual_args = final_nargs as usize - 1;
 
@@ -4509,7 +4529,7 @@ fn schedule_meta_call<'gc>(
 
     // Grow stack to fit the resolved closure's full frame.
     if !thread.ensure_frame_slots(new_base + closure.max_stack_size as usize) {
-        return MetaDispatch::StackOverflow;
+        return MetaDispatch::Raise(OpError::StackOverflow);
     }
 
     // Nil-fill any parameter slots not covered by the (possibly shifted) args.
@@ -4550,7 +4570,7 @@ fn schedule_native_meta_call<'gc>(
     caller_base: usize,
     new_base: usize,
     actual_args: usize,
-) -> MetaDispatch {
+) -> MetaDispatch<'gc> {
     use crate::vm::sequence::CallbackAction;
 
     let args_base = new_base;
