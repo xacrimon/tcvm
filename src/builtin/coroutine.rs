@@ -2,6 +2,7 @@ use std::pin::Pin;
 
 use crate::Context;
 use crate::builtin::basic::ProtectedCall;
+use crate::builtin::util;
 use crate::dmm::{Collect, Trace};
 use crate::env::thread::{ExecKind, ThreadStatus};
 use crate::env::{
@@ -42,12 +43,12 @@ fn lua_create<'gc>(
     let f = stack
         .get(0)
         .get_function()
-        .ok_or_else(|| Error::from_str(ctx, "bad argument #1 to 'create' (function expected)"))?;
+        .ok_or_else(|| util::type_error(ctx, "create", 1, "function", stack.arg(0)))?;
     let thread = Thread::new(ctx.mutation());
     {
         let mc = ctx.mutation();
         let mut ts = thread.borrow_mut(mc);
-        ts.push_exec(ExecKind::Start(f));
+        ts.push_exec(ExecKind::Start(f.into()));
         ts.status = ThreadStatus::Suspended;
     }
     stack.ret1(Value::thread(thread));
@@ -68,7 +69,7 @@ fn lua_resume<'gc>(
     let co = stack
         .get(0)
         .get_thread()
-        .ok_or_else(|| Error::from_str(ctx, "bad argument #1 to 'resume' (coroutine expected)"))?;
+        .ok_or_else(|| util::type_error(ctx, "resume", 1, "thread", stack.arg(0)))?;
     if let Some(msg) = unresumable_reason(ctx, stack.exec(), co) {
         let m = Value::string(LuaString::new(ctx, msg.as_bytes()));
         stack.replace(&[Value::boolean(false), m]);
@@ -123,7 +124,7 @@ fn lua_status<'gc>(
     let co = stack
         .get(0)
         .get_thread()
-        .ok_or_else(|| Error::from_str(ctx, "bad argument #1 to 'status' (coroutine expected)"))?;
+        .ok_or_else(|| util::type_error(ctx, "status", 1, "thread", stack.arg(0)))?;
     let s: &[u8] = if co.ptr_eq(stack.exec().current_thread()) {
         b"running"
     } else {
@@ -162,9 +163,9 @@ fn lua_isyieldable<'gc>(
     let yieldable = if arg.is_nil() {
         !stack.exec().is_main(ctx)
     } else {
-        let target = arg.get_thread().ok_or_else(|| {
-            Error::from_str(ctx, "bad argument #1 to 'isyieldable' (coroutine expected)")
-        })?;
+        let target = arg
+            .get_thread()
+            .ok_or_else(|| util::type_error(ctx, "isyieldable", 1, "thread", Some(arg)))?;
         !target.ptr_eq(ctx.main_thread())
     };
     stack.ret1(Value::boolean(yieldable));
@@ -182,12 +183,12 @@ fn lua_wrap<'gc>(
     let f = stack
         .get(0)
         .get_function()
-        .ok_or_else(|| Error::from_str(ctx, "bad argument #1 to 'wrap' (function expected)"))?;
+        .ok_or_else(|| util::type_error(ctx, "wrap", 1, "function", stack.arg(0)))?;
     let thread = Thread::new(ctx.mutation());
     {
         let mc = ctx.mutation();
         let mut ts = thread.borrow_mut(mc);
-        ts.push_exec(ExecKind::Start(f));
+        ts.push_exec(ExecKind::Start(f.into()));
         ts.status = ThreadStatus::Suspended;
     }
     let upvalues: Box<[Value<'gc>]> = Box::new([Value::thread(thread)]);
@@ -214,7 +215,7 @@ fn lua_close<'gc>(
     let co = stack
         .get(0)
         .get_thread()
-        .ok_or_else(|| Error::from_str(ctx, "bad argument #1 to 'close' (coroutine expected)"))?;
+        .ok_or_else(|| util::type_error(ctx, "close", 1, "thread", stack.arg(0)))?;
     // Pointer-eq against current first to avoid re-borrowing the running
     // thread's RefLock (mut-borrowed by the interpreter).
     if co.ptr_eq(stack.exec().current_thread()) {

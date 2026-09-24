@@ -76,14 +76,15 @@ impl<'gc> Executor<'gc> {
     }
 
     /// Seed `main_thread` with `function(args...)` and return a Normal-mode
-    /// executor. Any previous state on the main thread is cleared.
+    /// executor. Any previous state on the main thread is cleared. A
+    /// non-function is called through its `__call` chain.
     ///
     /// Lua and native entry share the same shape: args at `stack[0..]`
     /// and a `ExecKind::Start(function)` on top. The driver's `ExecKind::Start`
     /// handler builds the call frame on first dispatch.
     pub fn start<A: IntoMultiValue<'gc>>(
         ctx: Context<'gc>,
-        function: Function<'gc>,
+        function: impl Into<Value<'gc>>,
         args: A,
     ) -> Self {
         let thread = ctx.main_thread();
@@ -95,7 +96,7 @@ impl<'gc> Executor<'gc> {
             let mut ts = thread.borrow_mut(mc);
             ts.reset();
             ts.set_window(0, buf);
-            ts.push_exec(ExecKind::Start(function));
+            ts.push_exec(ExecKind::Start(function.into()));
             ts.status = ThreadStatus::Suspended;
         }
 
@@ -252,7 +253,7 @@ impl<'gc> Executor<'gc> {
                         Some(ExecKind::Start(f)) => f,
                         _ => unreachable!(),
                     };
-                    ts.insert_at(0, Value::function(f));
+                    ts.insert_at(0, f);
                     schedule_call_at(&mut ts, ctx, 0, 0)?;
                     if ts.frames_empty() && ts.pending_action.is_none() {
                         // Native entry returned `Return` synchronously;
@@ -701,7 +702,7 @@ fn pump_sequence<'gc>(
                 pending_error: None,
             });
             // Schedule the call: insert function at abs_bottom, args after.
-            ts.insert_at(abs_bottom, Value::function(function));
+            ts.insert_at(abs_bottom, function);
             schedule_call_at(&mut ts, ctx, abs_bottom, 0)?;
         }
         Ok(SequencePoll::TailCall(function)) => {
@@ -720,7 +721,7 @@ fn pump_sequence<'gc>(
                     .copy_within(call_site.bottom..call_site.bottom + argc, new_args_base);
                 ts.set_top(new_args_base + argc);
             }
-            ts.stack[call_site.func_idx] = Value::function(function);
+            ts.stack[call_site.func_idx] = function;
             schedule_call_at(&mut ts, ctx, call_site.func_idx, call_site.returns)?;
         }
         Ok(SequencePoll::Yield { bottom: rel }) => {
@@ -1020,7 +1021,7 @@ impl<'gc> Sequence<'gc> for HandlerSequence<'gc> {
             self.depth += 1;
             stack.replace(&[err.value()]);
             return Ok(SequencePoll::Call {
-                function: self.handler,
+                function: Value::function(self.handler),
                 bottom: 0,
             });
         };

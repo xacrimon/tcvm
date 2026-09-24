@@ -1,8 +1,10 @@
 use crate::Context;
 use crate::builtin::util;
 use crate::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Value};
-use crate::lua::{StashedError, StashedFunction, StashedTable};
+use crate::lua::{StashedError, StashedFunction, StashedTable, StashedValue};
 use crate::vm::async_sequence::{AsyncSequence, SequenceReturn, async_sequence};
+use crate::vm::interp::binop_metamethod;
+use crate::vm::num;
 use crate::vm::sequence::CallbackAction;
 
 /// Fetch argument 1 as a table or raise the standard bad-argument error.
@@ -11,15 +13,8 @@ fn check_table<'gc>(
     v: Value<'gc>,
     fname: &str,
 ) -> Result<Table<'gc>, Error<'gc>> {
-    v.get_table().ok_or_else(|| {
-        Error::from_str(
-            ctx,
-            &format!(
-                "bad argument #1 to '{fname}' (table expected, got {})",
-                v.type_name()
-            ),
-        )
-    })
+    v.get_table()
+        .ok_or_else(|| util::type_error(ctx, fname, 1, "table", Some(v)))
 }
 
 pub fn load<'gc>(ctx: Context<'gc>) {
@@ -62,13 +57,7 @@ fn lua_concat<'gc>(
     } else if sep_arg.get_integer().is_some() || sep_arg.get_float().is_some() {
         util::basic_tostring(ctx, sep_arg).as_bytes().to_vec()
     } else {
-        return Err(Error::from_str(
-            ctx,
-            &format!(
-                "bad argument #2 to 'concat' (string expected, got {})",
-                sep_arg.type_name()
-            ),
-        ));
+        return Err(util::type_error(ctx, "concat", 2, "string", Some(sep_arg)));
     };
     let i_arg = stack.get(2);
     let i = if i_arg.is_nil() {
@@ -337,13 +326,7 @@ fn lua_sort<'gc>(
     } else if let Some(f) = comp_arg.get_function() {
         Some(f)
     } else {
-        return Err(Error::from_str(
-            ctx,
-            &format!(
-                "bad argument #2 to 'sort' (function expected, got {})",
-                comp_arg.type_name()
-            ),
-        ));
+        return Err(util::type_error(ctx, "sort", 2, "function", Some(comp_arg)));
     };
 
     let mc = ctx.mutation();
@@ -448,7 +431,7 @@ async fn sort_less(
     enum Plan {
         Ready(bool),
         CallComp,
-        CallMeta(StashedFunction),
+        CallMeta(StashedValue),
     }
     let plan = seq.try_enter(|ctx, locals, _exec, mut stack| {
         let tbl = locals.fetch(ctx.mutation(), t);
@@ -464,9 +447,9 @@ async fn sort_less(
         } else if let (Some(x), Some(y)) = (a.get_float(), b.get_float()) {
             Some(x < y)
         } else if let (Some(x), Some(y)) = (a.get_integer(), b.get_float()) {
-            Some((x as f64) < y)
+            Some(num::lt_int_float(x, y))
         } else if let (Some(x), Some(y)) = (a.get_float(), b.get_integer()) {
-            Some(x < (y as f64))
+            Some(num::lt_float_int(x, y))
         } else if let (Some(x), Some(y)) = (a.get_string(), b.get_string()) {
             Some(x < y)
         } else {
@@ -475,13 +458,12 @@ async fn sort_less(
         if let Some(r) = prim {
             return Ok(Plan::Ready(r));
         }
-        let m = lt_metamethod(ctx, a, b);
-        if let Some(f) = m.get_function() {
-            stack.replace(&[a, b]);
-            Ok(Plan::CallMeta(locals.stash(ctx.mutation(), f)))
-        } else {
-            Err(Error::from_str(ctx, &util::compare_error_msg(a, b)))
+        let m = binop_metamethod(ctx, a, b, ctx.symbols().mm_lt);
+        if m.is_nil() {
+            return Err(Error::from_str(ctx, &util::compare_error_msg(a, b)));
         }
+        stack.replace(&[a, b]);
+        Ok(Plan::CallMeta(locals.stash(ctx.mutation(), m)))
     })?;
     match plan {
         Plan::Ready(r) => Ok(r),
@@ -516,22 +498,6 @@ fn sort_truthy(seq: &mut AsyncSequence) -> bool {
         let v = stack.get(0);
         !(v.is_nil() || v.get_boolean() == Some(false))
     })
-}
-
-/// The `__lt` metamethod for an ordering of `a < b` (checked on `a` then `b`),
-/// mirroring the VM's `binop_metamethod`.
-fn lt_metamethod<'gc>(ctx: Context<'gc>, a: Value<'gc>, b: Value<'gc>) -> Value<'gc> {
-    let name = ctx.symbols().mm_lt;
-    if let Some(t) = a.get_table() {
-        let m = t.get_metamethod(name);
-        if !m.is_nil() {
-            return m;
-        }
-    }
-    if let Some(t) = b.get_table() {
-        return t.get_metamethod(name);
-    }
-    Value::nil()
 }
 
 /// Build the "invalid order function for sorting" error as a stashed error.

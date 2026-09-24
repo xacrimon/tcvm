@@ -2,9 +2,13 @@
 //! stringification and small argument-coercion routines used across the
 //! `basic`, `string`, `table`, and `io` libraries.
 
-use crate::dmm::{Gc, Mutation};
-use crate::env::{Error, LuaString, Value};
-use crate::lua::Context;
+use std::pin::Pin;
+
+use crate::dmm::{Collect, Gc, Mutation, Trace};
+use crate::env::{Error, LuaString, Stack, Value};
+use crate::lua::{Context, StashedError};
+use crate::vm::async_sequence::AsyncSequence;
+use crate::vm::sequence::{Execution, Sequence, SequencePoll};
 
 /// Append the canonical Lua textual form of an integer.
 pub(crate) fn push_int(out: &mut Vec<u8>, i: i64) {
@@ -218,10 +222,8 @@ fn strip_trailing_zeros(s: &mut String) {
     }
 }
 
-/// `tostring` without metamethod dispatch: the default representation Lua
-/// uses when there is no `__tostring`/`__name`. Numbers and strings get their
-/// literal form; all reference types get `"<type>: 0x<addr>"`, with native
-/// functions tagged `"function: builtin: ..."` to match PUC-Lua.
+/// `luaL_tolstring` short of calling `__tostring`: numbers and strings in
+/// their literal form, other values as `"<__name or type>: 0x<addr>"`.
 pub(crate) fn basic_tostring<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> LuaString<'gc> {
     if let Some(s) = v.get_string() {
         return s;
@@ -235,26 +237,138 @@ pub(crate) fn basic_tostring<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> LuaString
         push_int(&mut out, i);
     } else if let Some(f) = v.get_float() {
         push_float(&mut out, f);
-    } else if let Some(t) = v.get_table() {
-        push_addr(&mut out, "table", Gc::as_ptr(t.inner()) as *const ());
-    } else if let Some(f) = v.get_function() {
-        if f.as_native().is_some() {
-            out.extend_from_slice(b"function: builtin: ");
-            push_ptr(&mut out, Gc::as_ptr(f.inner()) as *const ());
+    } else {
+        let ptr = if let Some(t) = v.get_table() {
+            Gc::as_ptr(t.inner()) as *const ()
+        } else if let Some(f) = v.get_function() {
+            Gc::as_ptr(f.inner()) as *const ()
+        } else if let Some(t) = v.get_thread() {
+            Gc::as_ptr(t.inner()) as *const ()
         } else {
-            push_addr(&mut out, "function", Gc::as_ptr(f.inner()) as *const ());
+            let u = v.get_userdata().expect("every other type is userdata");
+            Gc::as_ptr(u.inner()) as *const ()
+        };
+        match ctx.metamethod_of(v, ctx.symbols().name).get_string() {
+            Some(name) => out.extend_from_slice(name.as_bytes()),
+            None => out.extend_from_slice(v.type_name().as_bytes()),
         }
-    } else if let Some(t) = v.get_thread() {
-        push_addr(&mut out, "thread", Gc::as_ptr(t.inner()) as *const ());
-    } else if let Some(u) = v.get_userdata() {
-        push_addr(&mut out, "userdata", Gc::as_ptr(u.inner()) as *const ());
+        out.extend_from_slice(format!(": {ptr:p}").as_bytes());
     }
     LuaString::new(ctx, &out)
+}
+
+/// `luaL_tolstring` of the value at stack index `i`, calling its `__tostring`
+/// with the stack from `bottom` (above `i`) up.
+pub(crate) async fn tolstring(
+    seq: &mut AsyncSequence,
+    i: usize,
+    bottom: usize,
+) -> Result<Vec<u8>, StashedError> {
+    let mm = seq.enter(|ctx, locals, _exec, mut stack| {
+        let v = stack.get(i);
+        let mm = ctx.metamethod_of(v, ctx.symbols().mm_tostring);
+        if mm.is_nil() {
+            return Err(basic_tostring(ctx, v).as_bytes().to_vec());
+        }
+        stack.truncate(bottom);
+        stack.push(v);
+        Ok(locals.stash(ctx.mutation(), mm))
+    });
+    let mm = match mm {
+        Ok(mm) => mm,
+        Err(bytes) => return Ok(bytes),
+    };
+    seq.call(&mm, bottom).await?;
+    seq.try_enter(|ctx, _locals, _exec, mut stack| {
+        let r = stack.get(bottom);
+        stack.truncate(bottom);
+        Ok(tostring_result(ctx, r)?.as_bytes().to_vec())
+    })
+}
+
+/// A `__tostring` result as `luaL_tolstring` accepts it: a string, or a number
+/// converted to one.
+fn tostring_result<'gc>(ctx: Context<'gc>, r: Value<'gc>) -> Result<LuaString<'gc>, Error<'gc>> {
+    if r.get_string().is_none() && r.get_integer().is_none() && !r.is_float() {
+        return Err(Error::from_str(ctx, "'__tostring' must return a string"));
+    }
+    Ok(basic_tostring(ctx, r))
+}
+
+/// Follow-up for a `Call` of a `__tostring` metamethod: its first result,
+/// checked and converted by [`tostring_result`].
+pub(crate) struct ToStringResult;
+
+unsafe impl<'gc> Collect<'gc> for ToStringResult {
+    const NEEDS_TRACE: bool = false;
+}
+
+impl<'gc> Sequence<'gc> for ToStringResult {
+    fn trace_pointers(&self, _cc: &mut dyn Trace<'gc>) {}
+
+    fn poll(
+        self: Pin<&mut Self>,
+        ctx: Context<'gc>,
+        _exec: Execution<'gc>,
+        mut stack: Stack<'gc, '_>,
+    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
+        let s = tostring_result(ctx, stack.get(0))?;
+        stack.ret1(Value::string(s));
+        Ok(SequencePoll::Return)
+    }
+}
+
+/// Follow-up for a `Call` that adjusts the callee's results to exactly `.0`
+/// values, as `lua_call(L, nargs, n)` does.
+pub(crate) struct AdjustResults(pub(crate) usize);
+
+unsafe impl<'gc> Collect<'gc> for AdjustResults {
+    const NEEDS_TRACE: bool = false;
+}
+
+impl<'gc> Sequence<'gc> for AdjustResults {
+    fn trace_pointers(&self, _cc: &mut dyn Trace<'gc>) {}
+
+    fn poll(
+        self: Pin<&mut Self>,
+        _ctx: Context<'gc>,
+        _exec: Execution<'gc>,
+        mut stack: Stack<'gc, '_>,
+    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
+        stack.truncate(self.0);
+        while stack.len() < self.0 {
+            stack.push(Value::nil());
+        }
+        Ok(SequencePoll::Return)
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Argument coercion (shared `luaL_check*` analogues)
 // ---------------------------------------------------------------------------
+
+/// `luaL_typeerror`: argument `n` of `fname` should have been `expected`.
+/// `got` is `None` for a missing argument; a value whose metatable has a
+/// string `__name` is reported by that name.
+pub(crate) fn type_error<'gc>(
+    ctx: Context<'gc>,
+    fname: &str,
+    n: usize,
+    expected: &str,
+    got: Option<Value<'gc>>,
+) -> Error<'gc> {
+    let got = match got {
+        None => "no value".into(),
+        Some(v) => match ctx.metamethod_of(v, ctx.symbols().name).get_string() {
+            Some(name) => String::from_utf8_lossy(name.as_bytes()),
+            None => v.type_name().into(),
+        },
+    };
+    Error::from_str(
+        ctx,
+        &format!("bad argument #{n} to '{fname}' ({expected} expected, got {got})"),
+    )
+}
 
 /// Coerce `v` to a float, mirroring `luaL_checknumber` (numeric strings
 /// included). `fname`/`n` build the standard bad-argument message on failure.
@@ -285,15 +399,7 @@ fn check_number_slow<'gc>(
     fname: &str,
     n: usize,
 ) -> Result<f64, Error<'gc>> {
-    to_number(v).ok_or_else(|| {
-        Error::from_str(
-            ctx,
-            &format!(
-                "bad argument #{n} to '{fname}' (number expected, got {})",
-                v.type_name()
-            ),
-        )
-    })
+    to_number(v).ok_or_else(|| type_error(ctx, fname, n, "number", Some(v)))
 }
 
 /// Coerce `v` to an integer, mirroring `luaL_checkinteger`: integers pass
@@ -314,13 +420,7 @@ pub(crate) fn check_integer<'gc>(
             &format!("bad argument #{n} to '{fname}' (number has no integer representation)"),
         ));
     }
-    Err(Error::from_str(
-        ctx,
-        &format!(
-            "bad argument #{n} to '{fname}' (number expected, got {})",
-            v.type_name()
-        ),
-    ))
+    Err(type_error(ctx, fname, n, "number", Some(v)))
 }
 
 pub(crate) fn to_number<'gc>(v: Value<'gc>) -> Option<f64> {
@@ -373,13 +473,3 @@ pub(crate) fn num_to_value<'gc>(mc: &Mutation<'gc>, f: f64) -> Value<'gc> {
 }
 
 pub(crate) use crate::vm::num::raw_eq;
-
-fn push_addr(out: &mut Vec<u8>, kind: &str, ptr: *const ()) {
-    out.extend_from_slice(kind.as_bytes());
-    out.extend_from_slice(b": ");
-    push_ptr(out, ptr);
-}
-
-fn push_ptr(out: &mut Vec<u8>, ptr: *const ()) {
-    out.extend_from_slice(format!("{ptr:p}").as_bytes());
-}

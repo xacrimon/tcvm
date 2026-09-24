@@ -7,14 +7,14 @@ use crate::builtin::util;
 // rejection) match `tonumber`/`math.*` and don't drift.
 use crate::builtin::util::{to_integer, to_number as to_float};
 use crate::env::{
-    Error, Function, LuaString, MetamethodBits, NativeClosure, NativeFn, Stack, Table, Userdata,
-    Value,
+    Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Userdata, Value,
 };
 use crate::lua::{StashedError, StashedFunction, StashedTable, StashedValue};
 use crate::vm::async_sequence::{AsyncSequence, SequenceReturn, async_sequence};
 use crate::vm::interp::{IndexChain, walk_index_chain};
 use crate::vm::sequence::CallbackAction;
 
+mod meta;
 mod pack;
 mod pattern;
 use pattern::{CapValue, MatchState, PatError};
@@ -32,13 +32,7 @@ pub(super) fn check_str<'gc>(
     } else if v.get_integer().is_some() || v.get_float().is_some() {
         Ok(util::basic_tostring(ctx, v))
     } else {
-        Err(Error::from_str(
-            ctx,
-            &format!(
-                "bad argument #{n} to '{fname}' (string expected, got {})",
-                v.type_name()
-            ),
-        ))
+        Err(util::type_error(ctx, fname, n, "string", Some(v)))
     }
 }
 
@@ -81,6 +75,8 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         let key = Value::string(LuaString::new(ctx, name.as_bytes()));
         lib.raw_set(ctx, key, Value::function(handler));
     }
+
+    meta::install(ctx, lib);
 
     let lib_name = Value::string(LuaString::new(ctx, b"string"));
     ctx.globals().raw_set(ctx, lib_name, Value::table(lib));
@@ -260,52 +256,99 @@ fn lua_format<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let fmt_val = stack.get(0);
-    let fmt_str = fmt_val.get_string().ok_or_else(|| {
-        Error::from_str(
-            ctx,
-            &format!(
-                "bad argument #1 to 'format' (string expected, got {})",
-                fmt_val.type_name()
-            ),
-        )
-    })?;
+    let fmt_str = fmt_val
+        .get_string()
+        .ok_or_else(|| util::type_error(ctx, "format", 1, "string", stack.arg(0)))?;
     let fmt = fmt_str.as_bytes();
 
-    let mut out: Vec<u8> = Vec::with_capacity(fmt.len() + 16);
-    let mut arg_idx = 1usize;
-    let mut i = 0usize;
-    while i < fmt.len() {
-        let b = fmt[i];
-        if b != b'%' {
-            out.push(b);
-            i += 1;
-            continue;
+    let mut f = Formatter {
+        i: 0,
+        arg_idx: 1,
+        out: Vec::with_capacity(fmt.len() + 16),
+    };
+    let Some(pending) = f.run(ctx, fmt, &stack)? else {
+        let s = LuaString::new(ctx, &f.out);
+        stack.ret1(Value::string(s));
+        return Ok(CallbackAction::Return);
+    };
+    // A conversion needs `__tostring`: finish in a sequence that can call it,
+    // continuing from where `run` stopped. The arguments, format string
+    // included, stay on the stack below `n` throughout.
+    let n = stack.len();
+    let seq = async_sequence(ctx.mutation(), move |_locals, mut seq| async move {
+        let mut pending = Some(pending);
+        while let Some((spec, arg)) = pending {
+            let bytes = util::tolstring(&mut seq, arg, n).await?;
+            // `%q` adds the result as-is.
+            if spec.conv == b'q' {
+                f.out.extend_from_slice(&bytes);
+            } else {
+                fmt_str_bytes(&mut f.out, &spec, &bytes);
+            }
+            pending = seq.try_enter(|ctx, _locals, _exec, stack| {
+                let fmt = stack.get(0).get_string().expect("checked on entry");
+                f.run(ctx, fmt.as_bytes(), &stack)
+            })?;
         }
-        // parse flags/width/precision/conv starting at fmt[i+1]
-        let (spec, next) = parse_spec(ctx, fmt, i + 1)?;
-        i = next;
-        if spec.conv == b'%' {
-            out.push(b'%');
-            continue;
-        }
-        // A conversion consumes the next argument; a missing one is an error
-        // ("no value"), distinct from an explicitly-passed nil.
-        if arg_idx >= stack.len() {
-            return Err(Error::from_str(
-                ctx,
-                &format!("bad argument #{} to 'format' (no value)", arg_idx + 1),
-            ));
-        }
-        let arg = stack.get(arg_idx);
-        arg_idx += 1;
-        // After the increment, `arg_idx` is the 1-based Lua argument number of
-        // the argument just consumed (the format string is #1).
-        format_one(ctx, &mut out, &spec, arg, arg_idx)?;
-    }
+        seq.enter(|ctx, _locals, _exec, mut stack| {
+            stack.replace(&[Value::string(LuaString::new(ctx, &f.out))]);
+        });
+        Ok(SequenceReturn::Return)
+    });
+    Ok(CallbackAction::sequence(seq))
+}
 
-    let s = LuaString::new(ctx, &out);
-    stack.ret1(Value::string(s));
-    Ok(CallbackAction::Return)
+struct Formatter {
+    i: usize,
+    arg_idx: usize,
+    out: Vec<u8>,
+}
+
+impl Formatter {
+    /// Format `fmt` from where the previous call stopped, until the end or a
+    /// `luaL_tolstring` conversion whose argument has `__tostring`; that
+    /// conversion's spec and stack index are returned for the caller to finish.
+    fn run<'gc>(
+        &mut self,
+        ctx: Context<'gc>,
+        fmt: &[u8],
+        args: &Stack<'gc, '_>,
+    ) -> Result<Option<(FmtSpec, usize)>, Error<'gc>> {
+        while self.i < fmt.len() {
+            let b = fmt[self.i];
+            if b != b'%' {
+                self.out.push(b);
+                self.i += 1;
+                continue;
+            }
+            // parse flags/width/precision/conv starting at fmt[i+1]
+            let (spec, next) = parse_spec(ctx, fmt, self.i + 1)?;
+            self.i = next;
+            if spec.conv == b'%' {
+                self.out.push(b'%');
+                continue;
+            }
+            // A conversion consumes the next argument; a missing one is an error
+            // ("no value"), distinct from an explicitly-passed nil.
+            if self.arg_idx >= args.len() {
+                return Err(Error::from_str(
+                    ctx,
+                    &format!("bad argument #{} to 'format' (no value)", self.arg_idx + 1),
+                ));
+            }
+            let arg = args.get(self.arg_idx);
+            self.arg_idx += 1;
+            let tolstring = spec.conv == b's'
+                || (spec.conv == b'q' && (arg.is_nil() || arg.get_boolean().is_some()));
+            if tolstring && !ctx.metamethod_of(arg, ctx.symbols().mm_tostring).is_nil() {
+                return Ok(Some((spec, self.arg_idx - 1)));
+            }
+            // After the increment, `arg_idx` is the 1-based Lua argument number of
+            // the argument just consumed (the format string is #1).
+            format_one(ctx, &mut self.out, &spec, arg, self.arg_idx)?;
+        }
+        Ok(None)
+    }
 }
 
 #[derive(Default)]
@@ -501,14 +544,7 @@ fn arg_type_err<'gc>(
     arg: &Value<'gc>,
     arg_num: usize,
 ) -> Error<'gc> {
-    Error::from_str(
-        ctx,
-        &format!(
-            "bad argument #{arg_num} to 'format' ({} expected, got {})",
-            expected,
-            arg.type_name()
-        ),
-    )
+    util::type_error(ctx, "format", arg_num, expected, Some(*arg))
 }
 
 /// Coerce a `%d`/`%x`/`%c`/… argument to an integer, distinguishing — as Lua
@@ -522,15 +558,19 @@ fn check_fmt_int<'gc>(
     if let Some(i) = to_integer(arg) {
         return Ok(i);
     }
-    let msg = if to_float(arg).is_some() {
-        format!("bad argument #{arg_num} to 'format' (number has no integer representation)")
-    } else {
-        format!(
-            "bad argument #{arg_num} to 'format' (number expected, got {})",
-            arg.type_name()
-        )
-    };
-    Err(Error::from_str(ctx, &msg))
+    if to_float(arg).is_some() {
+        return Err(Error::from_str(
+            ctx,
+            &format!("bad argument #{arg_num} to 'format' (number has no integer representation)"),
+        ));
+    }
+    Err(util::type_error(
+        ctx,
+        "format",
+        arg_num,
+        "number",
+        Some(arg),
+    ))
 }
 
 // ---------- integer formatting ----------
@@ -877,14 +917,12 @@ fn fmt_hex_float(out: &mut Vec<u8>, spec: &FmtSpec, f: f64, upper: bool) {
 
 // ---------- string and q ----------
 
+/// `%s` of a value without `__tostring` (`Formatter::run` diverts the rest).
 fn fmt_string<'gc>(ctx: Context<'gc>, out: &mut Vec<u8>, spec: &FmtSpec, arg: Value<'gc>) {
-    // Lua's %s applies tostring (`luaL_tolstring`) to non-strings — booleans,
-    // numbers (in Lua form), nil, and the `type: 0xADDR` form for the rest.
-    // Honoring `__tostring` needs native->Lua calls (deferred with #27).
-    let ls = arg
-        .get_string()
-        .unwrap_or_else(|| crate::builtin::util::basic_tostring(ctx, arg));
-    let bytes = ls.as_bytes();
+    fmt_str_bytes(out, spec, util::basic_tostring(ctx, arg).as_bytes());
+}
+
+fn fmt_str_bytes(out: &mut Vec<u8>, spec: &FmtSpec, bytes: &[u8]) {
     let trimmed: &[u8] = if let Some(p) = spec.precision {
         &bytes[..bytes.len().min(p)]
     } else {
@@ -1136,12 +1174,12 @@ fn lua_gsub<'gc>(
     let repl_fn = repl.get_function();
     let repl_tbl = repl.get_table();
     if repl_fn.is_none() && repl_tbl.is_none() {
-        return Err(Error::from_str(
+        return Err(util::type_error(
             ctx,
-            &format!(
-                "bad argument #3 to 'gsub' (string/function/table expected, got {})",
-                repl.type_name()
-            ),
+            "gsub",
+            3,
+            "string/function/table",
+            Some(repl),
         ));
     }
 
@@ -1432,28 +1470,16 @@ async fn table_index_repl(
         if !v.is_nil() {
             return Ok(Plan::Resolved(classify_repl_result(ctx, v)?));
         }
-        if !tbl.shape().has_mm(MetamethodBits::INDEX) {
-            return Ok(Plan::Resolved(ReplResult::Keep)); // nil -> keep original
-        }
-        // INDEX bit implies a metatable is present.
-        let mt = tbl
-            .metatable()
-            .expect("INDEX metamethod implies a metatable");
-        match walk_index_chain(Value::table(tbl), mt, key_val, ctx.symbols().mm_index) {
+        match walk_index_chain(ctx, Value::table(tbl), key_val) {
             IndexChain::Resolved(rv) => Ok(Plan::Resolved(classify_repl_result(ctx, rv)?)),
-            IndexChain::Invoke { func, receiver } => match func.get_function() {
-                Some(f) => {
-                    stack.replace(&[receiver, key_val]);
-                    Ok(Plan::CallIndex(locals.stash(ctx.mutation(), f)))
-                }
-                // A non-function, non-table `__index` (e.g. a callable userdata
-                // with its own `__call`) is too exotic to drive here; calling a
-                // plain non-function would raise anyway.
-                None => Err(Error::from_str(
-                    ctx,
-                    &format!("attempt to call a {} value", func.type_name()),
-                )),
-            },
+            IndexChain::Invoke { func, receiver } => {
+                stack.replace(&[receiver, key_val]);
+                Ok(Plan::CallIndex(locals.stash(ctx.mutation(), func)))
+            }
+            IndexChain::NotIndexable(v) => Err(Error::from_str(
+                ctx,
+                &format!("attempt to index a {} value", v.type_name()),
+            )),
             IndexChain::Exhausted => Err(Error::from_str(
                 ctx,
                 "'__index' chain too long; possible loop",

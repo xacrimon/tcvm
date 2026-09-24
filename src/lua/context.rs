@@ -53,6 +53,38 @@ impl<'gc> Context<'gc> {
         &self.state.symbols
     }
 
+    /// The metatable `v`'s metamethods come from: its own for tables and
+    /// userdata, otherwise the one shared by its type.
+    #[inline]
+    pub fn metatable_of(self, v: Value<'gc>) -> Option<Table<'gc>> {
+        if let Some(t) = v.get_table() {
+            t.metatable()
+        } else if let Some(u) = v.get_userdata() {
+            u.metatable()
+        } else {
+            self.state.type_metatable(v.kind()).get()
+        }
+    }
+
+    /// Metamethod `name` of `v`, nil when absent (`luaT_gettmbyobj`).
+    #[inline]
+    pub fn metamethod_of(self, v: Value<'gc>, name: LuaString<'gc>) -> Value<'gc> {
+        self.metatable_of(v)
+            .map_or(Value::nil(), |mt| mt.raw_get(Value::string(name)))
+    }
+
+    /// Set `v`'s metatable, which for types other than table and userdata
+    /// is shared by every value of that type (`lua_setmetatable`).
+    pub fn set_metatable_of(self, v: Value<'gc>, mt: Option<Table<'gc>>) {
+        if let Some(t) = v.get_table() {
+            t.set_metatable(self, mt);
+        } else if let Some(u) = v.get_userdata() {
+            u.set_metatable(self.mutation, mt);
+        } else {
+            self.state.type_metatable(v.kind()).set(self.mutation, mt);
+        }
+    }
+
     pub fn main_thread(self) -> Thread<'gc> {
         self.state.main_thread
     }

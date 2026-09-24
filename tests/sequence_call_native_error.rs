@@ -47,7 +47,7 @@ impl<'gc> Sequence<'gc> for CallBoomerSeq<'gc> {
             self.called = true;
             stack.replace(&[]);
             Ok(SequencePoll::Call {
-                function: self.boomer,
+                function: self.boomer.into(),
                 bottom: 0,
             })
         } else {

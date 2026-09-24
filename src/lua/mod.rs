@@ -19,9 +19,10 @@ pub use stash::{
 
 use crate::builtin;
 use crate::dmm::Rootable;
-use crate::dmm::{Arena, Collect, DynamicRootSet, Mutation};
+use crate::dmm::{Arena, Collect, DynamicRootSet, Gc, GcLock, Lock, Mutation};
 use crate::env::shape::Shape;
 use crate::env::string::Interner;
+use crate::env::value::ValueKind;
 use crate::env::{Symbols, Table, Thread};
 
 /// Root object of the GC arena. Holds the globals table, the main thread,
@@ -44,6 +45,27 @@ pub struct State<'gc> {
     pub(crate) main_thread: Thread<'gc>,
     pub(crate) roots: DynamicRootSet<'gc>,
     pub(crate) interner: Interner<'gc>,
+    /// Metatables shared by all values of a type that has no per-value one
+    /// (PUC's `G(L)->mt`); see `type_metatable`.
+    type_metatables: [GcLock<'gc, Option<Table<'gc>>>; 6],
+}
+
+impl<'gc> State<'gc> {
+    /// The metatable slot shared by every value of `kind`, which must not be
+    /// table or userdata.
+    #[inline]
+    pub(crate) fn type_metatable(&self, kind: ValueKind) -> GcLock<'gc, Option<Table<'gc>>> {
+        let slot = match kind {
+            ValueKind::Nil => 0,
+            ValueKind::Boolean => 1,
+            ValueKind::Integer | ValueKind::Float => 2,
+            ValueKind::String => 3,
+            ValueKind::Function => 4,
+            ValueKind::Thread => 5,
+            ValueKind::Table | ValueKind::Userdata => unreachable!("per-value metatable"),
+        };
+        self.type_metatables[slot]
+    }
 }
 
 /// A Lua runtime instance.
@@ -72,6 +94,7 @@ impl Lua {
                 main_thread: Thread::new(mc),
                 roots: DynamicRootSet::new(mc),
                 interner,
+                type_metatables: std::array::from_fn(|_| Gc::new(mc, Lock::new(None))),
             }
         });
         Lua { arena }

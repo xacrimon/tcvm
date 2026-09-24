@@ -240,6 +240,12 @@ impl<'gc, 'a> Stack<'gc, 'a> {
         self.thread.top == self.bottom
     }
 
+    /// The argument at `i`, or `None` past the logical top (`lua_isnone`).
+    #[inline]
+    pub fn arg(&self, i: usize) -> Option<Value<'gc>> {
+        (i < self.len()).then(|| self.get(i))
+    }
+
     /// Read the value at index `i` within the callback's window, or `Nil`
     /// if `i` is past the logical top. Mirrors Lua's "missing args are
     /// nil" rule.

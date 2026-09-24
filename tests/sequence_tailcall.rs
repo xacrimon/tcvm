@@ -12,7 +12,7 @@ use tcvm::vm::sequence::{BoxSequence, CallbackAction, Execution, Sequence, Seque
 use tcvm::{Executor, LoadError, Lua};
 
 /// Reads `target` from stack[0], replaces the stack window with the
-/// integer 41, then `TailCall`s `target` (a Lua function `f(x) = x+1`).
+/// integer 41, then `TailCall`s `target`.
 struct TailCallSeq;
 
 unsafe impl<'gc> Collect<'gc> for TailCallSeq {
@@ -28,10 +28,7 @@ impl<'gc> Sequence<'gc> for TailCallSeq {
         _exec: Execution<'gc>,
         mut stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
-        let target = stack
-            .get(0)
-            .get_function()
-            .expect("stack[0] should be a function");
+        let target = stack.get(0);
         stack.replace(&[Value::integer(ctx.mutation(), 41)]);
         Ok(SequencePoll::TailCall(target))
     }
@@ -47,27 +44,38 @@ fn forward<'gc>(
     Ok(CallbackAction::sequence(seq))
 }
 
-#[test]
-fn sequence_tailcall_lands_at_original_func_idx() {
+/// Runs `src` with `forward` installed as a global.
+fn run(src: &str) -> i64 {
     let mut lua = Lua::new();
-
+    lua.load_all();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
             let forward_fn =
                 Function::new_native(ctx.mutation(), forward as NativeFn, Box::new([]));
             let key = Value::string(LuaString::new(ctx, b"forward"));
             ctx.globals().raw_set(ctx, key, Value::function(forward_fn));
-            let chunk = ctx.load(
-                "local function addone(x) return x + 1 end\n\
-                 return forward(addone)",
-                Some("seq_tailcall"),
-            )?;
+            let chunk = ctx.load(src, Some("seq_tailcall"))?;
             Ok(ctx.stash(Executor::start(ctx, chunk, ())))
         })
         .expect("load");
-    let result: i64 = lua.execute(&ex).expect("run");
+    lua.execute(&ex).expect("run")
+}
+
+#[test]
+fn sequence_tailcall_lands_at_original_func_idx() {
+    let result = run("local function addone(x) return x + 1 end\n\
+                      return forward(addone)");
     assert_eq!(
         result, 42,
         "TailCall result should land where the caller expected"
     );
+}
+
+#[test]
+fn sequence_tailcall_goes_through_call_metamethod() {
+    let result = run(
+        "local addone = setmetatable({}, {__call = function(_, x) return x + 1 end})\n\
+                      return forward(addone)",
+    );
+    assert_eq!(result, 42);
 }

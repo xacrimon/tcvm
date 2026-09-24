@@ -3,7 +3,7 @@ use std::ops::{Deref, DerefMut};
 
 use crate::dmm::{Collect, Gc, Mutation, Ref, RefLock, RefMut, Trace};
 use crate::env::error::Error;
-use crate::env::function::{Function, LuaFn, Upvalue};
+use crate::env::function::{LuaFn, Upvalue};
 use crate::env::value::Value;
 use crate::lua::Context;
 use crate::vm::interp::Continuation;
@@ -153,7 +153,7 @@ pub enum ExecKind<'gc> {
     },
     /// A coroutine that hasn't been resumed yet. Replaced on first resume by
     /// a real call frame.
-    Start(Function<'gc>),
+    Start(Value<'gc>),
     /// Current thread is waiting on an inner thread it resumed; on the
     /// inner thread reaching a terminal/yielded state, the executor pops
     /// this frame and lands the inner thread's values into the original

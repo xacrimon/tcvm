@@ -26,6 +26,12 @@ macro_rules! emit_struct {
         #[collect(internal, no_drop)]
         pub struct Symbols<'gc> {
             $(pub $field: LuaString<'gc>,)*
+            /// `__name`, the metafield naming a type in messages and `tostring`.
+            pub name: LuaString<'gc>,
+            /// `__metatable`, which `getmetatable` returns in place of the metatable.
+            pub metatable: LuaString<'gc>,
+            /// `__pairs`, consulted by `pairs`.
+            pub pairs: LuaString<'gc>,
         }
     };
 }
@@ -37,6 +43,9 @@ macro_rules! emit_intern_all {
             pub(crate) fn intern_all(mc: &Mutation<'gc>, interner: &Interner<'gc>) -> Self {
                 Symbols {
                     $($field: interner.intern(mc, $bytes),)*
+                    name: interner.intern(mc, b"__name"),
+                    metatable: interner.intern(mc, b"__metatable"),
+                    pairs: interner.intern(mc, b"__pairs"),
                 }
             }
 

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use tcvm::env::{LuaString, Table, Value};
-use tcvm::{Executor, LoadError, Lua, RuntimeError, format_prototype};
+use tcvm::{Executor, LoadError, Lua, RuntimeError, StashedError, format_prototype};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -86,14 +86,49 @@ fn main() {
     if let Err(e) = lua.execute::<()>(&ex) {
         match e {
             RuntimeError::Lua(stashed) => {
-                let msg = lua.enter(|ctx| {
-                    let s = ctx.fetch(&stashed).message(ctx);
-                    String::from_utf8_lossy(s.as_bytes()).into_owned()
-                });
+                let msg = error_message(&mut lua, &stashed);
                 eprintln!("tcvm: {msg}");
             }
             other => eprintln!("tcvm: {other}"),
         }
         std::process::exit(1);
     }
+}
+
+/// `lua.c`'s `msghandler`: an error object that isn't a string or number is
+/// reported through its `__tostring` when that returns a string, and an error
+/// raised by `__tostring` replaces the original.
+fn error_message(lua: &mut Lua, err: &StashedError) -> String {
+    let lossy = |s: LuaString<'_>| String::from_utf8_lossy(s.as_bytes()).into_owned();
+    let call = lua.enter(|ctx| {
+        let e = ctx.fetch(err);
+        if e.as_text(ctx).is_some() {
+            return None;
+        }
+        let v = e.value();
+        let mm = ctx.metamethod_of(v, ctx.symbols().mm_tostring);
+        if mm.is_nil() {
+            return None;
+        }
+        // Resetting the main thread is fine: the run that raised `err` is over.
+        Some(ctx.stash(Executor::start(ctx, mm, (v,))))
+    });
+    if let Some(ex) = call {
+        match lua.finish(&ex) {
+            Ok(()) => {
+                let msg = lua.enter(|ctx| {
+                    let r = ctx.fetch(&ex).take_result::<Value>(ctx).ok()?;
+                    r.get_string().map(lossy)
+                });
+                if let Some(msg) = msg {
+                    return msg;
+                }
+            }
+            Err(RuntimeError::Lua(inner)) => {
+                return lua.enter(|ctx| lossy(ctx.fetch(&inner).message(ctx)));
+            }
+            Err(_) => {}
+        }
+    }
+    lua.enter(|ctx| lossy(ctx.fetch(err).message(ctx)))
 }

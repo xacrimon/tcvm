@@ -5,6 +5,7 @@ use crate::Context;
 use crate::builtin::util;
 use crate::dmm::{Collect, Trace};
 use crate::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
+use crate::vm::async_sequence::{SequenceReturn, async_sequence};
 use crate::vm::sequence::{
     BoxSequence, CallbackAction, Catch, Execution, Sequence, SequencePoll, seq_trace_pointers,
 };
@@ -135,17 +136,16 @@ fn lua_getmetatable<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let v = stack.get(0);
-    // A `__metatable` field shadows the real metatable (protection); tables
-    // and userdata both carry per-object metatables.
-    let metatable = if let Some(t) = v.get_table() {
-        t.metatable()
-    } else {
-        v.get_userdata().and_then(|u| u.metatable())
-    };
-    let result = match metatable {
+    if stack.is_empty() {
+        return Err(Error::from_str(
+            ctx,
+            "bad argument #1 to 'getmetatable' (value expected)",
+        ));
+    }
+    // A `__metatable` field shadows the real metatable (protection).
+    let result = match ctx.metatable_of(stack.get(0)) {
         Some(mt) => {
-            let prot = mt.raw_get(Value::string(LuaString::new(ctx, b"__metatable")));
+            let prot = mt.raw_get(Value::string(ctx.symbols().metatable));
             if prot.is_nil() {
                 Value::table(mt)
             } else {
@@ -225,15 +225,7 @@ fn lua_next<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let Some(t) = stack.get(0).get_table() else {
-        let got = if stack.is_empty() {
-            "no value"
-        } else {
-            stack.get(0).type_name()
-        };
-        return Err(Error::from_str(
-            ctx,
-            &format!("bad argument #1 to 'next' (table expected, got {got})"),
-        ));
+        return Err(util::type_error(ctx, "next", 1, "table", stack.arg(0)));
     };
     match t.next(ctx.mutation(), stack.get(1)) {
         Ok(Some((k, v))) => stack.replace(&[k, v]),
@@ -259,45 +251,14 @@ fn lua_pairs<'gc>(
         ));
     }
     let t = stack.get(0);
-    let metatable = match t.get_table() {
-        Some(t) => t.metatable(),
-        None => t.get_userdata().and_then(|u| u.metatable()),
-    };
-    let mm = metatable.map_or(Value::nil(), |mt| {
-        mt.raw_get(Value::string(LuaString::new(ctx, b"__pairs")))
-    });
+    let mm = ctx.metamethod_of(t, ctx.symbols().pairs);
     if mm.is_nil() {
         stack.replace(&[closure.upvalues[0], t, Value::nil(), Value::nil()]);
         return Ok(CallbackAction::Return);
     }
     stack.replace(&[mm, t]);
-    let then = BoxSequence::new(ctx.mutation(), PairsAdjust);
+    let then = BoxSequence::new(ctx.mutation(), util::AdjustResults(4));
     Ok(CallbackAction::call(Some(then)))
-}
-
-/// Completion for `pairs` via `__pairs`: adjust the metamethod's results
-/// to exactly four, as `lua_call(L, 1, 4)` does.
-struct PairsAdjust;
-
-unsafe impl<'gc> Collect<'gc> for PairsAdjust {
-    const NEEDS_TRACE: bool = false;
-}
-
-impl<'gc> Sequence<'gc> for PairsAdjust {
-    fn trace_pointers(&self, _cc: &mut dyn Trace<'gc>) {}
-
-    fn poll(
-        self: Pin<&mut Self>,
-        _ctx: Context<'gc>,
-        _exec: Execution<'gc>,
-        mut stack: Stack<'gc, '_>,
-    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
-        stack.truncate(4);
-        while stack.len() < 4 {
-            stack.push(Value::nil());
-        }
-        Ok(SequencePoll::Return)
-    }
 }
 
 /// `pcall(f, ...)`: run `f` under a [`ProtectedCall`] completion that turns
@@ -361,26 +322,48 @@ impl<'gc> Sequence<'gc> for ProtectedCall<'gc> {
 }
 
 /// `print(...)` — write each argument's `tostring` form to stdout, separated
-/// by tabs and followed by a newline. Uses the default representation;
-/// TODO(#27): honor `__tostring` once metamethod calls from natives exist.
+/// by tabs and followed by a newline.
 fn lua_print<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
     let n = stack.len();
-    for i in 0..n {
-        if i > 0 {
-            let _ = out.write_all(b"\t");
+    let has_tostring = |i| {
+        !ctx.metamethod_of(stack.get(i), ctx.symbols().mm_tostring)
+            .is_nil()
+    };
+    if !(0..n).any(has_tostring) {
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        for i in 0..n {
+            if i > 0 {
+                let _ = out.write_all(b"\t");
+            }
+            let s = util::basic_tostring(ctx, stack.get(i));
+            let _ = out.write_all(s.as_bytes());
         }
-        let s = util::basic_tostring(ctx, stack.get(i));
-        let _ = out.write_all(s.as_bytes());
+        let _ = out.write_all(b"\n");
+        stack.replace(&[]);
+        return Ok(CallbackAction::Return);
     }
-    let _ = out.write_all(b"\n");
-    stack.replace(&[]);
-    Ok(CallbackAction::Return)
+    // Some `__tostring` must run; like Lua, write each argument as soon as it
+    // is converted.
+    let seq = async_sequence(ctx.mutation(), move |_locals, seq| async move {
+        let mut seq = seq;
+        for i in 0..n {
+            let bytes = util::tolstring(&mut seq, i, n).await?;
+            let mut out = std::io::stdout().lock();
+            if i > 0 {
+                let _ = out.write_all(b"\t");
+            }
+            let _ = out.write_all(&bytes);
+        }
+        let _ = std::io::stdout().write_all(b"\n");
+        seq.enter(|_ctx, _locals, _exec, mut stack| stack.replace(&[]));
+        Ok(SequenceReturn::Return)
+    });
+    Ok(CallbackAction::sequence(seq))
 }
 
 /// `rawequal(a, b)` — primitive equality, bypassing `__eq`.
@@ -402,10 +385,7 @@ fn lua_rawget<'gc>(
     let t_arg = stack.get(0);
     let key = stack.get(1);
     let Some(t) = t_arg.get_table() else {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #1 to 'rawget' (table expected)",
-        ));
+        return Err(util::type_error(ctx, "rawget", 1, "table", stack.arg(0)));
     };
     let v = t.raw_get(key);
     stack.ret1(v);
@@ -425,14 +405,12 @@ fn lua_rawlen<'gc>(
     } else if let Some(t) = v.get_table() {
         t.raw_len() as i64
     } else {
-        let got = if stack.is_empty() {
-            "no value"
-        } else {
-            v.type_name()
-        };
-        return Err(Error::from_str(
+        return Err(util::type_error(
             ctx,
-            &format!("bad argument #1 to 'rawlen' (table or string expected, got {got})"),
+            "rawlen",
+            1,
+            "table or string",
+            stack.arg(0),
         ));
     };
     stack.ret1(Value::integer(ctx.mutation(), len));
@@ -448,10 +426,7 @@ fn lua_rawset<'gc>(
     let key = stack.get(1);
     let value = stack.get(2);
     let Some(t) = t_arg.get_table() else {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #1 to 'rawset' (table expected)",
-        ));
+        return Err(util::type_error(ctx, "rawset", 1, "table", stack.arg(0)));
     };
     // `luaH_set` raises from inside the C function, so unlike argument
     // errors these carry no position.
@@ -508,33 +483,37 @@ fn lua_setmetatable<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let t_arg = stack.get(0);
-    let mt_arg = stack.get(1);
-    let Some(t) = t_arg.get_table() else {
-        return Err(Error::from_str(
+    let Some(t) = stack.get(0).get_table() else {
+        return Err(util::type_error(
             ctx,
-            "bad argument #1 to 'setmetatable' (table expected)",
+            "setmetatable",
+            1,
+            "table",
+            stack.arg(0),
         ));
     };
-    let mt = if mt_arg.is_nil() {
-        None
-    } else if let Some(mt) = mt_arg.get_table() {
-        Some(mt)
-    } else {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #2 to 'setmetatable' (nil or table expected)",
-        ));
+    let mt = match stack.arg(1) {
+        Some(v) if v.is_nil() => None,
+        Some(v) if let Some(mt) = v.get_table() => Some(mt),
+        got => {
+            return Err(util::type_error(
+                ctx,
+                "setmetatable",
+                2,
+                "nil or table",
+                got,
+            ));
+        }
     };
     // If the existing metatable carries a `__metatable` field, the
     // metatable is locked: refuse the change. Matches Lua 5.5 reference
     // behavior (`luaL_error("cannot change a protected metatable")`).
-    if let Some(existing) = t.metatable() {
-        let lock_key = LuaString::new(ctx, b"__metatable");
-        let lock_val = existing.raw_get(Value::string(lock_key));
-        if !lock_val.is_nil() {
-            return Err(Error::from_str(ctx, "cannot change a protected metatable"));
-        }
+    if let Some(existing) = t.metatable()
+        && !existing
+            .raw_get(Value::string(ctx.symbols().metatable))
+            .is_nil()
+    {
+        return Err(Error::from_str(ctx, "cannot change a protected metatable"));
     }
     t.set_metatable(ctx, mt);
     stack.ret1(Value::table(t));
@@ -554,15 +533,9 @@ fn lua_tonumber<'gc>(
         // base range validated (#2) — so e.g. `tonumber(nil, 99)` complains
         // about #1, not the out-of-range base.
         let base = util::check_integer(ctx, base_arg, "tonumber", 2)?;
-        let s = v.get_string().ok_or_else(|| {
-            Error::from_str(
-                ctx,
-                &format!(
-                    "bad argument #1 to 'tonumber' (string expected, got {})",
-                    v.type_name()
-                ),
-            )
-        })?;
+        let s = v
+            .get_string()
+            .ok_or_else(|| util::type_error(ctx, "tonumber", 1, "string", Some(v)))?;
         if !(2..=36).contains(&base) {
             return Err(Error::from_str(
                 ctx,
@@ -582,8 +555,8 @@ fn lua_tonumber<'gc>(
     Ok(CallbackAction::Return)
 }
 
-/// `tostring(v)` — default string representation. TODO(#27): honor
-/// `__tostring`/`__name`, which require calling back into Lua.
+/// `tostring(v)` — `luaL_tolstring`: `__tostring`'s result, else the default
+/// representation (with a string `__name` in place of the type).
 fn lua_tostring<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
@@ -595,9 +568,15 @@ fn lua_tostring<'gc>(
             "bad argument #1 to 'tostring' (value expected)",
         ));
     }
-    let s = util::basic_tostring(ctx, stack.get(0));
-    stack.ret1(Value::string(s));
-    Ok(CallbackAction::Return)
+    let v = stack.get(0);
+    let mm = ctx.metamethod_of(v, ctx.symbols().mm_tostring);
+    if mm.is_nil() {
+        stack.ret1(Value::string(util::basic_tostring(ctx, v)));
+        return Ok(CallbackAction::Return);
+    }
+    stack.replace(&[mm, v]);
+    let then = BoxSequence::new(ctx.mutation(), util::ToStringResult);
+    Ok(CallbackAction::call(Some(then)))
 }
 
 /// `type(v)` — the type name of `v` as a string.
@@ -628,24 +607,14 @@ fn lua_warn<'gc>(
     stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     if stack.is_empty() {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #1 to 'warn' (string expected, got no value)",
-        ));
+        return Err(util::type_error(ctx, "warn", 1, "string", None));
     }
     for i in 0..stack.len() {
         let v = stack.get(i);
         // `luaL_checkstring` coerces numbers to their string form, so integers
         // and floats are accepted; only truly non-coercible types error.
         if v.get_string().is_none() && v.get_integer().is_none() && v.get_float().is_none() {
-            return Err(Error::from_str(
-                ctx,
-                &format!(
-                    "bad argument #{} to 'warn' (string expected, got {})",
-                    i + 1,
-                    v.type_name()
-                ),
-            ));
+            return Err(util::type_error(ctx, "warn", i + 1, "string", Some(v)));
         }
     }
     Ok(CallbackAction::Return)
@@ -659,15 +628,7 @@ fn lua_xpcall<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let Some(handler) = stack.get(1).get_function() else {
-        let got = if stack.len() < 2 {
-            "no value"
-        } else {
-            stack.get(1).type_name()
-        };
-        return Err(Error::from_str(
-            ctx,
-            &format!("bad argument #2 to 'xpcall' (function expected, got {got})"),
-        ));
+        return Err(util::type_error(ctx, "xpcall", 2, "function", stack.arg(1)));
     };
     // Drop the handler slot so the callee and its args sit in `Call` layout.
     stack.remove(1);
