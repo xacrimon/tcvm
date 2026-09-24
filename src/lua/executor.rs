@@ -10,8 +10,8 @@ use crate::lua::RuntimeError;
 use crate::lua::context::Context;
 use crate::lua::convert::{FromMultiValue, IntoMultiValue};
 use crate::vm;
+use crate::vm::interp::CallTarget;
 use crate::vm::interp::Continuation;
-use crate::vm::interp::{CallTarget, OpError};
 use crate::vm::sequence::{
     BoxSequence, CallbackAction, Catch, Execution, Sequence, SequencePoll, Suspend,
     seq_trace_pointers,
@@ -538,22 +538,25 @@ fn schedule_thread_resume<'gc>(
 /// Call the value at `stack[slot]` with the args above it (through any
 /// `__call` chain). For Lua: push a `LuaFrame` with `base = slot+1`. For
 /// Native: invoke synchronously and either land Return values at `slot..`
-/// or stash a pending action. A non-callable value raises "attempt to
-/// call" at level 0, as the raiser is a native (`luaG_callerror` adds no
-/// position for a C `ci`).
+/// or stash a pending action. A non-callable value (or too long a `__call`
+/// chain) raises at level 0, as the raiser is a native (`luaG_callerror` adds
+/// no position for a C `ci`).
 fn schedule_call_at<'gc>(
     ts: &mut crate::env::thread::ThreadState<'gc>,
     ctx: Context<'gc>,
     slot: usize,
     caller_returns: u8,
 ) -> Result<(), RuntimeError> {
-    let Some((target, _)) = vm::interp::resolve_call_chain(ctx, ts, slot, 0) else {
-        let msg = vm::debug::op_error_message(ctx, ts, OpError::Call(ts.stack[slot]));
-        ts.raise(
-            ctx,
-            Error::new(ctx, Value::string(LuaString::new(ctx, msg.as_bytes()))),
-        );
-        return Ok(());
+    let target = match vm::interp::resolve_call_chain(ctx, ts, slot, 0) {
+        Ok((target, _)) => target,
+        Err(e) => {
+            let msg = vm::debug::op_error_message(ctx, ts, e);
+            ts.raise(
+                ctx,
+                Error::new(ctx, Value::string(LuaString::new(ctx, msg.as_bytes()))),
+            );
+            return Ok(());
+        }
     };
     if let CallTarget::Lua(closure) = target {
         let base = slot + 1;
