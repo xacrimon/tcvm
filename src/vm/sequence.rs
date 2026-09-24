@@ -15,7 +15,7 @@ use std::pin::Pin;
 use crate::dmm::{Collect, Gc, GcWeak, MetricsAlloc, Mutation, Trace};
 use crate::env::error::Error;
 use crate::env::function::Stack;
-use crate::env::{Function, Thread};
+use crate::env::{Function, Thread, Value};
 
 /// What a [`Sequence::poll`] (or `error`) call requests of the executor next.
 #[derive(Collect)]
@@ -26,12 +26,10 @@ pub enum SequencePoll<'gc> {
     Pending,
     /// Sequence is finished. Values at `bottom..` are its return values.
     Return,
-    /// Call `function`; on completion, this sequence is polled again with the
-    /// returned values placed at `bottom..` in its window.
-    Call {
-        function: Function<'gc>,
-        bottom: usize,
-    },
+    /// Call `function` (through its `__call` chain); on completion, this
+    /// sequence is polled again with the returned values placed at `bottom..`
+    /// in its window.
+    Call { function: Value<'gc>, bottom: usize },
     /// Yield values at `bottom..` to the resumer. On resumption, this
     /// sequence is polled again with the resume-args at `bottom..`.
     Yield { bottom: usize },

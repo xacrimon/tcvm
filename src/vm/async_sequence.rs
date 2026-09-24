@@ -54,7 +54,7 @@ use crate::dmm::{Collect, DynamicRootSet, Mutation, Trace};
 use crate::env::error::Error;
 use crate::env::function::Stack;
 use crate::env::thread::ThreadState;
-use crate::env::{Function, Thread};
+use crate::env::{Thread, Value};
 use crate::lua::Context;
 use crate::lua::stash::{Fetchable, Stashable, StashedError, StashedFunction, StashedThread};
 use crate::vm::sequence::{BoxSequence, Catch, Execution, Sequence, SequencePoll};
@@ -177,17 +177,18 @@ impl AsyncSequence {
         });
     }
 
-    /// Call `func` (relative `bottom` from current stack base). When the
-    /// call returns, the sequence is re-polled and stack values at
-    /// `bottom..` are the call's results.
-    pub async fn call(
-        &mut self,
-        func: &StashedFunction,
-        bottom: usize,
-    ) -> Result<(), StashedError> {
+    /// Call `func` (relative `bottom` from current stack base), through its
+    /// `__call` chain if it isn't a function. When the call returns, the
+    /// sequence is re-polled and stack values at `bottom..` are the call's
+    /// results.
+    pub async fn call<F>(&mut self, func: &F, bottom: usize) -> Result<(), StashedError>
+    where
+        F: Fetchable,
+        for<'gc> F::Fetched<'gc>: Into<Value<'gc>>,
+    {
         self.shared.visit(|shared| {
             shared.set_next_op(SequenceOp::Call {
-                function: func.fetch(shared.ctx.mutation(), shared.roots),
+                function: func.fetch(shared.ctx.mutation(), shared.roots).into(),
                 bottom,
             });
         });
@@ -398,17 +399,9 @@ where
 
 enum SequenceOp<'gc> {
     Pending,
-    Call {
-        function: Function<'gc>,
-        bottom: usize,
-    },
-    Yield {
-        bottom: usize,
-    },
-    Resume {
-        thread: Thread<'gc>,
-        bottom: usize,
-    },
+    Call { function: Value<'gc>, bottom: usize },
+    Yield { bottom: usize },
+    Resume { thread: Thread<'gc>, bottom: usize },
 }
 
 struct Shared<'gc, 'a> {

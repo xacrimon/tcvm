@@ -105,10 +105,11 @@ fn error_message(lua: &mut Lua, err: &StashedError) -> String {
         if v.get_string().is_some() || v.get_integer().is_some() || v.get_float().is_some() {
             return None;
         }
-        let f = ctx
-            .metamethod_of(v, ctx.symbols().mm_tostring)
-            .get_function()?;
-        Some(ctx.stash(Executor::start(ctx, f, (v,))))
+        let mm = ctx.metamethod_of(v, ctx.symbols().mm_tostring);
+        if mm.is_nil() {
+            return None;
+        }
+        Some(ctx.stash(Executor::start(ctx, mm, (v,))))
     });
     if let Some(ex) = call {
         match lua.finish(&ex) {

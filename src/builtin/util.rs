@@ -5,10 +5,9 @@
 use std::pin::Pin;
 
 use crate::dmm::{Collect, Gc, Mutation, Trace};
-use crate::env::{Error, Function, LuaString, Stack, Value};
+use crate::env::{Error, LuaString, Stack, Value};
 use crate::lua::{Context, StashedError, StashedValue};
 use crate::vm::async_sequence::AsyncSequence;
-use crate::vm::interp::MAX_TAG_LOOP;
 use crate::vm::sequence::{Execution, Sequence, SequencePoll};
 
 /// Append the canonical Lua textual form of an integer.
@@ -252,7 +251,7 @@ pub(crate) fn basic_tostring<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> LuaString
         v.get_userdata().map(|u| Gc::as_ptr(u.inner()) as *const ())
     };
     if let Some(ptr) = ptr {
-        let name = ctx.metamethod_of(v, LuaString::new(ctx, b"__name"));
+        let name = ctx.metamethod_of(v, ctx.symbols().name);
         match name.get_string() {
             Some(name) => out.extend_from_slice(name.as_bytes()),
             None => out.extend_from_slice(v.type_name().as_bytes()),
@@ -261,30 +260,6 @@ pub(crate) fn basic_tostring<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> LuaString
         out.extend_from_slice(format!("{ptr:p}").as_bytes());
     }
     LuaString::new(ctx, &out)
-}
-
-/// The function a call to `f` reaches through its `__call` chain, with each
-/// callable object prepended to `args` (`tryfuncTM`).
-pub(crate) fn callable<'gc>(
-    ctx: Context<'gc>,
-    mut f: Value<'gc>,
-    args: &mut Vec<Value<'gc>>,
-) -> Result<Function<'gc>, Error<'gc>> {
-    for _ in 0..MAX_TAG_LOOP {
-        if let Some(func) = f.get_function() {
-            return Ok(func);
-        }
-        let call = ctx.metamethod_of(f, ctx.symbols().mm_call);
-        if call.is_nil() {
-            break;
-        }
-        args.insert(0, f);
-        f = call;
-    }
-    Err(Error::from_str(
-        ctx,
-        &format!("attempt to call a {} value", f.type_name()),
-    ))
 }
 
 /// Call `v`'s `__tostring` metamethod `mm` using the stack from `bottom` up,
@@ -296,14 +271,11 @@ pub(crate) async fn call_tostring(
     v: &StashedValue,
     bottom: usize,
 ) -> Result<Vec<u8>, StashedError> {
-    let f = seq.try_enter(|ctx, locals, _exec, mut stack| {
-        let mut args = vec![locals.fetch(ctx.mutation(), v)];
-        let f = callable(ctx, locals.fetch(ctx.mutation(), mm), &mut args)?;
+    seq.enter(|ctx, locals, _exec, mut stack| {
         stack.truncate(bottom);
-        stack.extend(args);
-        Ok(locals.stash(ctx.mutation(), f))
-    })?;
-    seq.call(&f, bottom).await?;
+        stack.push(locals.fetch(ctx.mutation(), v));
+    });
+    seq.call(mm, bottom).await?;
     seq.try_enter(|ctx, _locals, _exec, mut stack| {
         let r = stack.get(bottom);
         stack.truncate(bottom);
@@ -384,10 +356,7 @@ pub(crate) fn type_error<'gc>(
 ) -> Error<'gc> {
     let got = match got {
         None => "no value".into(),
-        Some(v) => match ctx
-            .metamethod_of(v, LuaString::new(ctx, b"__name"))
-            .get_string()
-        {
+        Some(v) => match ctx.metamethod_of(v, ctx.symbols().name).get_string() {
             Some(name) => String::from_utf8_lossy(name.as_bytes()),
             None => v.type_name().into(),
         },

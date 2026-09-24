@@ -156,4 +156,13 @@ fn tostring_errors() {
         ),
         "boom"
     );
+    // A non-callable `__tostring` is reported by its `__name` on every path.
+    assert_eq!(
+        ok(
+            "local t = setmetatable({}, {__tostring = setmetatable({}, {__name = 'N'})})
+             return cat(select(2, pcall(tostring, t)), select(2, pcall(print, t)),
+                 select(2, pcall(string.format, '%s', t)))"
+        ),
+        "attempt to call a N value attempt to call a N value attempt to call a N value"
+    );
 }

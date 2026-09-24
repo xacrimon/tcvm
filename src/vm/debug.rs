@@ -96,7 +96,7 @@ pub(crate) fn object_type_name<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> String 
         .get_table()
         .and_then(|t| t.metatable())
         .or_else(|| v.get_userdata().and_then(|u| u.metatable()));
-    let name = mt.map(|mt| mt.raw_get(Value::string(LuaString::new(ctx, b"__name"))));
+    let name = mt.map(|mt| mt.raw_get(Value::string(ctx.symbols().name)));
     match name.and_then(|n| n.get_string()) {
         Some(s) => String::from_utf8_lossy(s.as_bytes()).into_owned(),
         None => v.type_name().to_owned(),

@@ -32,6 +32,13 @@ fn error_object_reported_through_tostring() {
         ),
         "tcvm: bool err\n"
     );
+    assert_eq!(
+        stderr_of(
+            "callable",
+            "error(setmetatable({}, {__tostring = setmetatable({}, {__call = function() return 'callable err' end})}))\n"
+        ),
+        "tcvm: callable err\n"
+    );
 }
 
 #[test]
@@ -55,5 +62,13 @@ fn error_object_without_string_tostring() {
             "error(setmetatable({}, {__tostring = function() error('inner', 0) end}))\n"
         ),
         "tcvm: inner\n"
+    );
+    // So is the failure to call a non-callable one.
+    assert_eq!(
+        stderr_of(
+            "not_callable",
+            "error(setmetatable({}, {__tostring = 5}))\n"
+        ),
+        "tcvm: attempt to call a number value\n"
     );
 }

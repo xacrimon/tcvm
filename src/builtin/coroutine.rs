@@ -48,7 +48,7 @@ fn lua_create<'gc>(
     {
         let mc = ctx.mutation();
         let mut ts = thread.borrow_mut(mc);
-        ts.push_exec(ExecKind::Start(f));
+        ts.push_exec(ExecKind::Start(f.into()));
         ts.status = ThreadStatus::Suspended;
     }
     stack.ret1(Value::thread(thread));
@@ -188,7 +188,7 @@ fn lua_wrap<'gc>(
     {
         let mc = ctx.mutation();
         let mut ts = thread.borrow_mut(mc);
-        ts.push_exec(ExecKind::Start(f));
+        ts.push_exec(ExecKind::Start(f.into()));
         ts.status = ThreadStatus::Suspended;
     }
     let upvalues: Box<[Value<'gc>]> = Box::new([Value::thread(thread)]);

@@ -356,6 +356,13 @@ impl<'gc> Value<'gc> {
     }
 }
 
+impl<'gc> From<Function<'gc>> for Value<'gc> {
+    #[inline(always)]
+    fn from(f: Function<'gc>) -> Self {
+        Value::function(f)
+    }
+}
+
 // Boxed integers compare and hash by value so that equal integers are interchangeable regardless
 // of which side got heap-allocated.
 impl<'gc> PartialEq for Value<'gc> {
