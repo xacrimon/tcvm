@@ -15,30 +15,32 @@ use crate::vm::num;
 use crate::vm::sequence::CallbackAction;
 
 pub fn load<'gc>(ctx: Context<'gc>) {
-    let fns: &[(&str, NativeFn)] = &[
-        ("abs", lua_abs),
-        ("acos", lua_acos),
-        ("asin", lua_asin),
-        ("atan", lua_atan),
-        ("ceil", lua_ceil),
-        ("cos", lua_cos),
-        ("deg", lua_deg),
-        ("exp", lua_exp),
-        ("floor", lua_floor),
-        ("fmod", lua_fmod),
-        ("log", lua_log),
-        ("max", lua_max),
-        ("min", lua_min),
-        ("modf", lua_modf),
-        ("rad", lua_rad),
-        ("random", lua_random),
-        ("randomseed", lua_randomseed),
-        ("sin", lua_sin),
-        ("sqrt", lua_sqrt),
-        ("tan", lua_tan),
-        ("tointeger", lua_tointeger),
-        ("type", lua_type),
-        ("ult", lua_ult),
+    // Third column: the CALL entry, `call` unless the builtin has a fast path.
+    let call: Handler = interp::op_call_native;
+    let fns: &[(&str, NativeFn, Handler)] = &[
+        ("abs", lua_abs, interp::ff_abs),
+        ("acos", lua_acos, call),
+        ("asin", lua_asin, call),
+        ("atan", lua_atan, call),
+        ("ceil", lua_ceil, interp::ff_ceil),
+        ("cos", lua_cos, interp::ff_cos),
+        ("deg", lua_deg, call),
+        ("exp", lua_exp, call),
+        ("floor", lua_floor, interp::ff_floor),
+        ("fmod", lua_fmod, call),
+        ("log", lua_log, call),
+        ("max", lua_max, call),
+        ("min", lua_min, call),
+        ("modf", lua_modf, call),
+        ("rad", lua_rad, call),
+        ("random", lua_random, call),
+        ("randomseed", lua_randomseed, call),
+        ("sin", lua_sin, interp::ff_sin),
+        ("sqrt", lua_sqrt, interp::ff_sqrt),
+        ("tan", lua_tan, call),
+        ("tointeger", lua_tointeger, call),
+        ("type", lua_type, call),
+        ("ult", lua_ult, call),
     ];
 
     // Shared PRNG state for `random`/`randomseed`, mirroring Lua's per-closure
@@ -46,20 +48,11 @@ pub fn load<'gc>(ctx: Context<'gc>) {
     let rng = Userdata::new(ctx.mutation(), RefCell::new(RngState::from_entropy()), 0);
 
     let lib = Table::new(ctx);
-    for &(name, handler) in fns {
+    for &(name, handler, entry) in fns {
         let upvalues: Box<[Value<'gc>]> = if name == "random" || name == "randomseed" {
             Box::new([Value::userdata(rng)])
         } else {
             Box::new([])
-        };
-        let entry: Handler = match name {
-            "sqrt" => interp::ff_sqrt,
-            "sin" => interp::ff_sin,
-            "cos" => interp::ff_cos,
-            "abs" => interp::ff_abs,
-            "floor" => interp::ff_floor,
-            "ceil" => interp::ff_ceil,
-            _ => interp::op_call_native,
         };
         let handler = Function::new_native_with_entry(ctx.mutation(), handler, upvalues, entry);
         let key = Value::string(LuaString::new(ctx, name.as_bytes()));

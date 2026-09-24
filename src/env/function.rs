@@ -302,7 +302,7 @@ impl<'gc, 'a> Stack<'gc, 'a> {
     pub fn truncate(&mut self, n: usize) {
         let at = self.bottom + n;
         if at < self.thread.top {
-            self.truncate_to(at);
+            self.thread.top = at;
         }
     }
 
@@ -322,7 +322,7 @@ impl<'gc, 'a> Stack<'gc, 'a> {
         for (i, v) in values.iter().enumerate() {
             self.thread.stack[self.bottom + i] = *v;
         }
-        self.truncate_to(end);
+        self.thread.top = end;
     }
 
     /// `replace(&[v])` without going through memory: a by-value `Value` stays
@@ -333,11 +333,6 @@ impl<'gc, 'a> Stack<'gc, 'a> {
         let end = self.bottom + 1;
         self.thread.ensure_slots(end);
         self.thread.stack[self.bottom] = v;
-        self.truncate_to(end);
-    }
-
-    #[inline(always)]
-    fn truncate_to(&mut self, end: usize) {
         self.thread.top = end;
     }
 }
