@@ -1694,20 +1694,14 @@ extern "rust-preserve-none" fn op_len<'gc>(
     }
 
     // Tables consult __len first; fall back to raw_len only if absent.
-    let meta_fn = if let Some(t) = val.get_table() {
-        let mm = t.get_metamethod(ctx.symbols().mm_len);
-        if mm.is_nil() {
-            *reg!(ref mut dst) = Value::integer(ctx.mutation(), t.raw_len() as i64);
-            dispatch!();
-        }
-        mm
-    } else {
-        let mm = ctx.metamethod_of(val, ctx.symbols().mm_len);
-        if mm.is_nil() {
+    let meta_fn = ctx.metamethod_of(val, ctx.symbols().mm_len);
+    if meta_fn.is_nil() {
+        let Some(t) = val.get_table() else {
             raise!(OpError::Len(val));
-        }
-        mm
-    };
+        };
+        *reg!(ref mut dst) = Value::integer(ctx.mutation(), t.raw_len() as i64);
+        dispatch!();
+    }
 
     let cont = Continuation::StoreResult { dst };
     // Like the other unary metamethods, `__len` gets its operand twice.

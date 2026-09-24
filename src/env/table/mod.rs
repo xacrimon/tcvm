@@ -71,18 +71,6 @@ impl<'gc> Table<'gc> {
         state.metatable = mt;
     }
 
-    /// Look up a metamethod by pre-interned name. The runtime keeps
-    /// every metamethod-name `LuaString` interned in `Context::symbols()`,
-    /// so callers always have the identity in hand and we never
-    /// re-intern at the call site.
-    #[inline]
-    pub fn get_metamethod(self, name: LuaString<'gc>) -> Value<'gc> {
-        let Some(mt) = self.metatable() else {
-            return Value::nil();
-        };
-        mt.raw_get(Value::string(name))
-    }
-
     pub fn shape(self) -> Shape<'gc> {
         self.0.borrow().shape
     }
