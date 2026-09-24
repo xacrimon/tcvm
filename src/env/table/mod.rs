@@ -411,7 +411,7 @@ impl<'gc> TableState<'gc> {
         }
         self.array.resize(asize, Value::nil());
         let alloc = self.int_hash.allocator().clone();
-        for e in core::mem::replace(&mut self.int_hash, HashTable::new_in(alloc.clone())) {
+        for e in self.int_hash.drain() {
             match usize::try_from(e.key).ok().filter(|&s| s < asize) {
                 Some(slot) if e.is_live() => self.array[slot] = e.value,
                 _ if e.is_live() => rest.push((e.key, e.value)),
