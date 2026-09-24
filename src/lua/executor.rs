@@ -706,7 +706,6 @@ fn pump_sequence<'gc>(
             if new_args_base < call_site.bottom {
                 ts.stack
                     .copy_within(call_site.bottom..call_site.bottom + argc, new_args_base);
-                // Nils the stale copies the down-shift left above the args.
                 ts.set_top(new_args_base + argc);
             }
             ts.stack[call_site.func_idx] = Value::function(function);
@@ -851,11 +850,7 @@ fn land_call_results<'gc>(ts: &mut crate::env::thread::ThreadState<'gc>, cs: Cal
     for i in to_copy..wanted {
         ts.stack[func_idx + i] = Value::nil();
     }
-    // Publish the logical top: MULTRET delivers all `retc`, a fixed-results
-    // call exactly `wanted`. This also nils the stale copies the down-shift
-    // left above the results — safe because `func_idx` is where the CALL put
-    // the function, and everything at or above a call's function slot is free
-    // scratch in the caller's register allocation.
+    // MULTRET delivers all `retc`, a fixed-results call exactly `wanted`.
     ts.set_top(func_idx + if returns == 0 { retc } else { wanted });
     if ts.frames_empty() {
         ts.status = ThreadStatus::Result { bottom: func_idx };
@@ -1074,7 +1069,10 @@ fn unwind_error<'gc>(
     // `luaD_seterrorobj`: only once the error is being caught (a handler
     // still sees the raw nil).
     let err = if err.value().is_nil() {
-        err.with_value(ctx, Value::string(LuaString::new(ctx, b"<no error object>")))
+        err.with_value(
+            ctx,
+            Value::string(LuaString::new(ctx, b"<no error object>")),
+        )
     } else {
         err
     };

@@ -254,6 +254,7 @@ pub struct ThreadState<'gc> {
 
 /// The value stack's storage: a `Vec` the mutator uses as such, that the
 /// collector may also clear from `trace(&self)` (hence the cell).
+#[derive(Default)]
 pub struct ValueStack<'gc>(UnsafeCell<Vec<Value<'gc>>>);
 
 impl<'gc> ValueStack<'gc> {
@@ -501,7 +502,7 @@ impl<'gc> ThreadState<'gc> {
     /// # Safety
     /// `frames.len() < frames.capacity()`, and the innermost frame is a Lua frame.
     #[inline(always)]
-    pub unsafe fn push_lua_unchecked(&mut self, lf: LuaFrame<'gc>) {
+    pub(crate) unsafe fn push_lua_unchecked(&mut self, lf: LuaFrame<'gc>) {
         debug_assert!(lf.base() >= 1);
         debug_assert!(self.frames.len() < self.frames.capacity());
         debug_assert!(self.top_is_lua());
@@ -513,11 +514,11 @@ impl<'gc> ThreadState<'gc> {
     }
 
     #[inline(always)]
-    pub fn frames_full(&self) -> bool {
+    pub(crate) fn frames_full(&self) -> bool {
         self.frames.len() == self.frames.capacity()
     }
 
-    pub fn reserve_frames(&mut self, n: usize) {
+    pub(crate) fn reserve_frames(&mut self, n: usize) {
         self.frames.reserve(n);
     }
 

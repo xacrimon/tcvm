@@ -47,7 +47,7 @@ pub(crate) fn chunk_id(source: &[u8]) -> Vec<u8> {
 }
 
 /// Source line the Lua frame is currently executing; `pc` points past the
-/// current instruction (see `LuaFrame::pc`), and 0 means not yet entered.
+/// current instruction (see `LuaFrame::pc`), and index 0 means not yet entered.
 pub(crate) fn frame_line(lf: &LuaFrame<'_>) -> Option<u32> {
     lf.closure.proto.line_for_pc(lf.pc_index().checked_sub(1)?)
 }

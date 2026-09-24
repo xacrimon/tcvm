@@ -1,7 +1,7 @@
 use crate::dmm::{Gc, Mutation, RefLock};
 use crate::env::function::{
-    Function, FunctionKind, InlineCache, LuaFn, NativeClosure, NativeContext, Stack,
-    Upvalue, UpvalueState,
+    Function, FunctionKind, InlineCache, LuaFn, NativeClosure, NativeContext, Stack, Upvalue,
+    UpvalueState,
 };
 use crate::env::shape::{MetamethodBits, Shape};
 use crate::env::string::LuaString;
@@ -3171,7 +3171,7 @@ extern "rust-preserve-none" fn op_call_grow<'gc>(
     thread.reserve_frames(1);
     // Both vecs may have moved: rebind the frame pointer and the register window.
     (frame, closure) = top_frame(thread);
-    registers = unsafe { thread.stack.as_mut_ptr().add(unsafe { (*frame).base() }) };
+    registers = unsafe { thread.stack.as_mut_ptr().add((*frame).base()) };
     become op_call(
         instruction,
         ctx,
@@ -3310,11 +3310,19 @@ macro_rules! math1_entry {
     };
 }
 
-math1_entry!(ff_sqrt, |x| Math1::Float(x.sqrt()), |i| Math1::Float(f64::from(i).sqrt()));
-math1_entry!(ff_sin, |x| Math1::Float(x.sin()), |i| Math1::Float(f64::from(i).sin()));
-math1_entry!(ff_cos, |x| Math1::Float(x.cos()), |i| Math1::Float(f64::from(i).cos()));
+math1_entry!(ff_sqrt, |x| Math1::Float(x.sqrt()), |i| Math1::Float(
+    f64::from(i).sqrt()
+));
+math1_entry!(ff_sin, |x| Math1::Float(x.sin()), |i| Math1::Float(
+    f64::from(i).sin()
+));
+math1_entry!(ff_cos, |x| Math1::Float(x.cos()), |i| Math1::Float(
+    f64::from(i).cos()
+));
 // `abs(i32::MIN)` leaves the inline range.
-math1_entry!(ff_abs, |x| Math1::Float(x.abs()), |i| i.checked_abs().map_or(Math1::Miss, Math1::Small));
+math1_entry!(ff_abs, |x| Math1::Float(x.abs()), |i| i
+    .checked_abs()
+    .map_or(Math1::Miss, Math1::Small));
 // A rounded float becomes an integer when it fits inline; the boxed range is
 // left to the builtin. `as` saturates and maps NaN to 0, so the round trip only
 // holds for an integral value in i32 range (-0.0 becomes 0, as in Lua).
@@ -3322,7 +3330,11 @@ math1_entry!(
     ff_floor,
     |x| {
         let r = x.floor();
-        if r as i32 as f64 == r { Math1::Small(r as i32) } else { Math1::Miss }
+        if r as i32 as f64 == r {
+            Math1::Small(r as i32)
+        } else {
+            Math1::Miss
+        }
     },
     |i| Math1::Small(i)
 );
@@ -3330,7 +3342,11 @@ math1_entry!(
     ff_ceil,
     |x| {
         let r = x.ceil();
-        if r as i32 as f64 == r { Math1::Small(r as i32) } else { Math1::Miss }
+        if r as i32 as f64 == r {
+            Math1::Small(r as i32)
+        } else {
+            Math1::Miss
+        }
     },
     |i| Math1::Small(i)
 );
@@ -3781,9 +3797,10 @@ extern "rust-preserve-none" fn op_return1<'gc>(
     };
     debug_assert!(dst_start + wanted.max(1) <= thread.stack.len());
     let stack = thread.stack.as_mut_ptr();
+    let first = reg!(value);
     // Written even when the caller wants nothing: `dst_start` is the caller's
     // function slot, dead once the call returns.
-    unsafe { *stack.add(dst_start) = reg!(value) };
+    unsafe { *stack.add(dst_start) = first };
     unsafe { fill_nil(stack.add(dst_start + 1), wanted.saturating_sub(1)) };
     thread.set_top_unchecked(dst_start + wanted);
     return_to_parent!(thread, registers, ip, frame, closure);
@@ -3796,6 +3813,8 @@ extern "rust-preserve-none" fn op_return1<'gc>(
 /// `frame_return`'s cleanup or a trip through `thread.frames`.
 #[inline(never)]
 #[rustc_align(32)]
+// The incoming `ip` and `closure` belong to the frame this pops.
+#[allow(unused_assignments)]
 extern "rust-preserve-none" fn op_return_cont<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
@@ -3821,16 +3840,15 @@ extern "rust-preserve-none" fn op_return_cont<'gc>(
     let (values, count) = instruction.ab();
     debug_assert!(count != 0);
     let nret = count as usize - 1;
-    let (cont, func_slot, values_base) = {
+    let (cont, func_slot) = {
         let f = unsafe { &*frame };
         debug_assert!(f.flags == frame_flags::HAS_CONT);
-        let func_slot = f.base() - 1 - f.num_extras as usize;
-        (f.continuation, func_slot, f.base() + values as usize)
+        (f.continuation, f.base() - 1 - f.num_extras as usize)
     };
     // The function slot is below the values, inside the frame's window.
     unsafe {
         let stack = thread.stack.as_mut_ptr();
-        copy_values(stack.add(func_slot), stack.add(values_base), nret);
+        copy_values(stack.add(func_slot), registers.add(values as usize), nret);
     }
     thread.set_top_unchecked(func_slot + nret);
     pop_to_parent!(thread, registers, ip, frame, closure);
@@ -4790,9 +4808,8 @@ pub(crate) enum FrameReturn {
     /// The departing frame was the outermost one; thread is now `Result`.
     /// Caller should return from the handler.
     TopLevel,
-    /// Normal return to the caller frame, which has been restored to the
-    /// top of the frame stack. Caller rebinds `ip` / `registers` /
-    /// `DispatchState` to it and dispatches.
+    /// Normal return to the caller frame, which is now the top frame. Caller
+    /// rebinds its dispatch registers to it and dispatches.
     Caller {
         new_base: usize,
         new_ip: *const Instruction,
@@ -5109,8 +5126,7 @@ pub(crate) enum CallTarget<'gc> {
 /// macro. Captures the three ways a continuation-driven call can proceed.
 pub(crate) enum MetaDispatch {
     /// Resolved to a Lua closure; a frame carrying the continuation was
-    /// pushed. The caller rebinds `ip`/`registers` and `DispatchState` to
-    /// the new frame and dispatches.
+    /// pushed. The caller rebinds its dispatch registers to it and dispatches.
     Lua {
         new_ip: *const Instruction,
         new_base: usize,
@@ -5247,8 +5263,8 @@ fn unop_metamethod<'gc>(val: Value<'gc>, name: LuaString<'gc>) -> Value<'gc> {
 ///
 /// The native suspend path replays all four continuation payloads uniformly via
 /// `apply_native_continuation`: `StoreResult`, `IgnoreResult`, `TForCall`, and
-/// `CondJump` (which bumps the caller frame's saved `pc` by the payload's offset
-/// to select the branch once the suspended comparison's result arrives).
+/// `CondJump` (which skips the caller's next instruction when the suspended
+/// comparison's result selects that branch).
 #[inline(never)]
 fn schedule_meta_call<'gc>(
     ctx: Context<'gc>,
@@ -5325,9 +5341,8 @@ fn schedule_meta_call<'gc>(
     thread.push_lua(LuaFrame {
         closure,
         base: new_base as u32,
-        // Ignored by op_return when a continuation is set — the continuation
-        // reads return values directly from the stack via `cont.results_base`.
         pc: closure.proto.code.as_ptr(),
+        // Unused: RETURN hands the results to the continuation instead.
         num_results: 0,
         flags: frame_flags::HAS_CONT,
         num_extras,
@@ -5419,6 +5434,8 @@ fn schedule_native_meta_call<'gc>(
 /// callee frame exists there.
 #[inline(never)]
 #[rustc_align(32)]
+// The incoming `ip`, `registers` and `closure` belong to the popped frame.
+#[allow(unused_assignments)]
 extern "rust-preserve-none" fn cont_resume<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
