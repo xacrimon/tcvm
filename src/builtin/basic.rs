@@ -145,7 +145,7 @@ fn lua_getmetatable<'gc>(
     // A `__metatable` field shadows the real metatable (protection).
     let result = match ctx.metatable_of(stack.get(0)) {
         Some(mt) => {
-            let prot = mt.raw_get(Value::string(LuaString::new(ctx, b"__metatable")));
+            let prot = mt.raw_get(Value::string(ctx.symbols().metatable));
             if prot.is_nil() {
                 Value::table(mt)
             } else {
@@ -251,7 +251,7 @@ fn lua_pairs<'gc>(
         ));
     }
     let t = stack.get(0);
-    let mm = ctx.metamethod_of(t, LuaString::new(ctx, b"__pairs"));
+    let mm = ctx.metamethod_of(t, ctx.symbols().pairs);
     if mm.is_nil() {
         stack.replace(&[closure.upvalues[0], t, Value::nil(), Value::nil()]);
         return Ok(CallbackAction::Return);
@@ -508,12 +508,12 @@ fn lua_setmetatable<'gc>(
     // If the existing metatable carries a `__metatable` field, the
     // metatable is locked: refuse the change. Matches Lua 5.5 reference
     // behavior (`luaL_error("cannot change a protected metatable")`).
-    if let Some(existing) = t.metatable() {
-        let lock_key = LuaString::new(ctx, b"__metatable");
-        let lock_val = existing.raw_get(Value::string(lock_key));
-        if !lock_val.is_nil() {
-            return Err(Error::from_str(ctx, "cannot change a protected metatable"));
-        }
+    if let Some(existing) = t.metatable()
+        && !existing
+            .raw_get(Value::string(ctx.symbols().metatable))
+            .is_nil()
+    {
+        return Err(Error::from_str(ctx, "cannot change a protected metatable"));
     }
     t.set_metatable(ctx, mt);
     stack.ret1(Value::table(t));

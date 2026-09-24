@@ -90,7 +90,8 @@ pub(crate) fn locate<'gc>(ctx: Context<'gc>, ts: &ThreadState<'gc>, err: Error<'
 }
 
 /// `luaT_objtypename`: a table or userdata whose metatable has a string
-/// `__name` reports that instead of its basic type.
+/// `__name` reports that instead of its basic type. Unlike `luaL_tolstring`
+/// and argument errors, it ignores the per-type metatables.
 pub(crate) fn object_type_name<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> String {
     let mt = v
         .get_table()
