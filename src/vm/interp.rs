@@ -2933,12 +2933,18 @@ extern "rust-preserve-none" fn op_tailcall_native<'gc>(
             // The results sit at `func + 1` up to `top`, as a RETURN of them
             // would find them; past its 8-bit count, MULTRET reads `top`.
             let retc = thread.top - args_base;
+            registers = unsafe { thread.stack.as_mut_ptr().add(base) };
+            if retc == 1 {
+                tail!(
+                    op_return1,
+                    Instruction::ret1(crate::instruction::Reg(func + 1))
+                );
+            }
             let count = if retc < u8::MAX as usize {
                 retc as u8 + 1
             } else {
                 0
             };
-            registers = unsafe { thread.stack.as_mut_ptr().add(base) };
             tail!(
                 op_return,
                 Instruction::ret(crate::instruction::Reg(func + 1), count)
@@ -3106,11 +3112,7 @@ extern "rust-preserve-none" fn op_return<'gc>(
     debug_assert!(values_base + nret.min(wanted) <= thread.stack.len());
     debug_assert!(dst_start + wanted <= thread.stack.len());
     let stack = thread.stack.as_mut_ptr();
-    if std::hint::likely(nret == 1 && wanted == 1) {
-        unsafe { *stack.add(dst_start) = *stack.add(values_base) };
-    } else {
-        unsafe { land_results(stack.add(dst_start), stack.add(values_base), nret, wanted) };
-    }
+    unsafe { land_results(stack.add(dst_start), stack.add(values_base), nret, wanted) };
     // Without this a `top` left high by a multires producer inside the callee
     // would keep its dead registers traced (#43).
     thread.set_top_unchecked(dst_start + wanted);
