@@ -198,12 +198,20 @@ macro_rules! helpers {
         macro_rules! dispatch {
             () => {{
                 unsafe {
+                    // Catches a frame change that forgot to rebind the
+                    // dispatch registers.
                     #[cfg(debug_assertions)]
                     {
-                        let frame = $thread.top_lua_unchecked();
+                        let top = $thread.top_lua_unchecked();
+                        debug_assert!(std::ptr::eq($frame, top));
+                        debug_assert!(std::ptr::eq(&*$closure, &*top.closure));
+                        debug_assert!(std::ptr::eq(
+                            $registers,
+                            $thread.stack.as_ptr().add(top.base())
+                        ));
                         debug_assert!(
-                            $ip.offset_from_unsigned(frame.closure.proto.code.as_ptr())
-                                < frame.closure.proto.code.len()
+                            $ip.offset_from_unsigned(top.closure.proto.code.as_ptr())
+                                < top.closure.proto.code.len()
                         );
                     }
                     let _ = $instruction;
