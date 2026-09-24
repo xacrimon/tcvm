@@ -5,16 +5,17 @@
 use std::pin::Pin;
 
 use tcvm::dmm::{Collect, Trace};
-use tcvm::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Value};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
 use tcvm::lua::Context;
 use tcvm::vm::sequence::{BoxSequence, CallbackAction, Execution, Sequence, SequencePoll};
 use tcvm::{Executor, LoadError, Lua};
 
 fn boomer<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    Err(Error::from_str(nctx.ctx, "boom"))
+    Err(Error::from_str(ctx, "boom"))
 }
 
 /// Sequence: on first poll, calls `boomer` (with no `then` follow-up). The
@@ -39,7 +40,7 @@ impl<'gc> Sequence<'gc> for CallBoomerSeq<'gc> {
     fn poll(
         mut self: Pin<&mut Self>,
         _ctx: Context<'gc>,
-        _exec: Execution<'gc, '_>,
+        _exec: Execution<'gc>,
         mut stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
         if !self.called {
@@ -56,18 +57,19 @@ impl<'gc> Sequence<'gc> for CallBoomerSeq<'gc> {
 }
 
 fn factory<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let boomer_fn = Function::new_native(nctx.ctx.mutation(), boomer as NativeFn, Box::new([]));
+    let boomer_fn = Function::new_native(ctx.mutation(), boomer as NativeFn, Box::new([]));
     let seq = BoxSequence::new(
-        nctx.ctx.mutation(),
+        ctx.mutation(),
         CallBoomerSeq {
             boomer: boomer_fn,
             called: false,
         },
     );
-    Ok(CallbackAction::Sequence(seq))
+    Ok(CallbackAction::sequence(seq))
 }
 
 #[test]

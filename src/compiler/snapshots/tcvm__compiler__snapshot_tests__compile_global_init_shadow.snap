@@ -35,4 +35,4 @@ expression: output
 0016  [  5]  LOAD            R3 K8  ; "B"
 0017  [  5]  SETTABUP        R2 U0 K5  ; "a"
 0018  [  5]  SETTABUP        R3 U0 K6  ; "b"
-0019  [  5]  RETURN          R0 count=1
+0019  [  5]  RETURN0

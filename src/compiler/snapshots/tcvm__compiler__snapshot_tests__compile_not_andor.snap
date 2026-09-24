@@ -57,7 +57,7 @@ expression: output
 0041  [ 15]  TEST            R8 inv=false
 0042  [ 15]  JMP             +2
 0043  [ 16]  LOAD            R8 K5  ; 0
-0044  [ 16]  RETURN          R8 count=2
+0044  [ 16]  RETURN1         R8
 0045  [ 19]  MOVE            R8 R3
 0046  [ 19]  MOVE            R9 R4
 0047  [ 19]  MOVE            R10 R5

@@ -3,9 +3,9 @@ use std::pin::Pin;
 use crate::Context;
 use crate::builtin::basic::ProtectedCall;
 use crate::dmm::{Collect, Trace};
-use crate::env::thread::{Frame, ThreadStatus};
+use crate::env::thread::{ExecKind, ThreadStatus};
 use crate::env::{
-    Error, Function, LuaString, NativeContext, NativeFn, Stack, Table, Thread, Value,
+    Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Thread, Value,
 };
 use crate::vm::sequence::{BoxSequence, CallbackAction, Catch, Execution, Sequence, SequencePoll};
 
@@ -33,22 +33,24 @@ pub fn load<'gc>(ctx: Context<'gc>) {
 }
 
 /// `coroutine.create(f)` — allocate a fresh `Thread`, prime it with a
-/// `Frame::Start(f)`, return it.
+/// `ExecKind::Start(f)`, return it.
 fn lua_create<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let f = stack.get(0).get_function().ok_or_else(|| {
-        Error::from_str(nctx.ctx, "bad argument #1 to 'create' (function expected)")
-    })?;
-    let thread = Thread::new(nctx.ctx.mutation());
+    let f = stack
+        .get(0)
+        .get_function()
+        .ok_or_else(|| Error::from_str(ctx, "bad argument #1 to 'create' (function expected)"))?;
+    let thread = Thread::new(ctx.mutation());
     {
-        let mc = nctx.ctx.mutation();
+        let mc = ctx.mutation();
         let mut ts = thread.borrow_mut(mc);
-        ts.frames.push(Frame::Start(f));
+        ts.push_exec(ExecKind::Start(f));
         ts.status = ThreadStatus::Suspended;
     }
-    stack.replace(&[Value::thread(thread)]);
+    stack.ret1(Value::thread(thread));
     Ok(CallbackAction::Return)
 }
 
@@ -59,24 +61,23 @@ fn lua_create<'gc>(
 /// the main thread) we return `(false, msg)` directly per the manual
 /// instead of routing through the executor.
 fn lua_resume<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let co = stack.get(0).get_thread().ok_or_else(|| {
-        Error::from_str(nctx.ctx, "bad argument #1 to 'resume' (coroutine expected)")
-    })?;
-    if let Some(msg) = unresumable_reason(co, &nctx) {
-        let m = Value::string(LuaString::new(nctx.ctx, msg.as_bytes()));
+    let co = stack
+        .get(0)
+        .get_thread()
+        .ok_or_else(|| Error::from_str(ctx, "bad argument #1 to 'resume' (coroutine expected)"))?;
+    if let Some(msg) = unresumable_reason(ctx, stack.exec(), co) {
+        let m = Value::string(LuaString::new(ctx, msg.as_bytes()));
         stack.replace(&[Value::boolean(false), m]);
         return Ok(CallbackAction::Return);
     }
     // Drop the thread-handle slot so the resume args start at index 0.
     stack.remove(0);
-    let then = BoxSequence::new(nctx.ctx.mutation(), ProtectedCall { handler: None });
-    Ok(CallbackAction::Resume {
-        thread: co,
-        then: Some(then),
-    })
+    let then = BoxSequence::new(ctx.mutation(), ProtectedCall { handler: None });
+    Ok(CallbackAction::resume(co, Some(then)))
 }
 
 /// `None` if `co` can be resumed, else the Lua-spec error message that
@@ -86,8 +87,12 @@ fn lua_resume<'gc>(
 /// Pointer-eq checks against `current_thread` come first because the
 /// running thread's `RefLock` is already mutably borrowed by the
 /// interpreter — calling `co.status()` on it would re-borrow and panic.
-fn unresumable_reason<'gc>(co: Thread<'gc>, nctx: &NativeContext<'gc, '_>) -> Option<&'static str> {
-    if co.ptr_eq(nctx.ctx.main_thread()) || co.ptr_eq(nctx.exec.current_thread()) {
+fn unresumable_reason<'gc>(
+    ctx: Context<'gc>,
+    exec: Execution<'gc>,
+    co: Thread<'gc>,
+) -> Option<&'static str> {
+    if co.ptr_eq(ctx.main_thread()) || co.ptr_eq(exec.current_thread()) {
         return Some("cannot resume non-suspended coroutine");
     }
     match co.status() {
@@ -100,23 +105,26 @@ fn unresumable_reason<'gc>(co: Thread<'gc>, nctx: &NativeContext<'gc, '_>) -> Op
 /// `coroutine.yield(...)` — yield values to the resumer; on resumption,
 /// the resume-args become the return values of `yield`.
 fn lua_yield<'gc>(
-    _nctx: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    Ok(CallbackAction::Yield { then: None })
+    Ok(CallbackAction::yield_(None))
 }
 
 /// `coroutine.status(co)` — return one of `"suspended" | "normal" |
 /// "running" | "dead"`. The currently-running thread is detected by
 /// pointer-comparing `co` against `Execution::current_thread`.
 fn lua_status<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let co = stack.get(0).get_thread().ok_or_else(|| {
-        Error::from_str(nctx.ctx, "bad argument #1 to 'status' (coroutine expected)")
-    })?;
-    let s: &[u8] = if co.ptr_eq(nctx.exec.current_thread()) {
+    let co = stack
+        .get(0)
+        .get_thread()
+        .ok_or_else(|| Error::from_str(ctx, "bad argument #1 to 'status' (coroutine expected)"))?;
+    let s: &[u8] = if co.ptr_eq(stack.exec().current_thread()) {
         b"running"
     } else {
         match co.status() {
@@ -125,18 +133,19 @@ fn lua_status<'gc>(
             ThreadStatus::Normal => b"normal",
         }
     };
-    let v = Value::string(LuaString::new(nctx.ctx, s));
-    stack.replace(&[v]);
+    let v = Value::string(LuaString::new(ctx, s));
+    stack.ret1(v);
     Ok(CallbackAction::Return)
 }
 
 /// `coroutine.running()` — `(currently_running_thread, is_main_thread)`.
 fn lua_running<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let cur = nctx.exec.current_thread();
-    let is_main = nctx.exec.is_main(nctx.ctx);
+    let cur = stack.exec().current_thread();
+    let is_main = stack.exec().is_main(ctx);
     stack.replace(&[Value::thread(cur), Value::boolean(is_main)]);
     Ok(CallbackAction::Return)
 }
@@ -145,22 +154,20 @@ fn lua_running<'gc>(
 /// not the main thread. (TCVM doesn't yet model non-yieldable C frames;
 /// the main-thread test is the only blocker.)
 fn lua_isyieldable<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let arg = stack.get(0);
     let yieldable = if arg.is_nil() {
-        !nctx.exec.is_main(nctx.ctx)
+        !stack.exec().is_main(ctx)
     } else {
         let target = arg.get_thread().ok_or_else(|| {
-            Error::from_str(
-                nctx.ctx,
-                "bad argument #1 to 'isyieldable' (coroutine expected)",
-            )
+            Error::from_str(ctx, "bad argument #1 to 'isyieldable' (coroutine expected)")
         })?;
-        !target.ptr_eq(nctx.ctx.main_thread())
+        !target.ptr_eq(ctx.main_thread())
     };
-    stack.replace(&[Value::boolean(yieldable)]);
+    stack.ret1(Value::boolean(yieldable));
     Ok(CallbackAction::Return)
 }
 
@@ -168,22 +175,24 @@ fn lua_isyieldable<'gc>(
 /// on a freshly-created thread; errors propagate (rather than being
 /// caught as in `resume`).
 fn lua_wrap<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let f = stack.get(0).get_function().ok_or_else(|| {
-        Error::from_str(nctx.ctx, "bad argument #1 to 'wrap' (function expected)")
-    })?;
-    let thread = Thread::new(nctx.ctx.mutation());
+    let f = stack
+        .get(0)
+        .get_function()
+        .ok_or_else(|| Error::from_str(ctx, "bad argument #1 to 'wrap' (function expected)"))?;
+    let thread = Thread::new(ctx.mutation());
     {
-        let mc = nctx.ctx.mutation();
+        let mc = ctx.mutation();
         let mut ts = thread.borrow_mut(mc);
-        ts.frames.push(Frame::Start(f));
+        ts.push_exec(ExecKind::Start(f));
         ts.status = ThreadStatus::Suspended;
     }
     let upvalues: Box<[Value<'gc>]> = Box::new([Value::thread(thread)]);
-    let wrapper = Function::new_native(nctx.ctx.mutation(), wrap_callback as NativeFn, upvalues);
-    stack.replace(&[Value::function(wrapper)]);
+    let wrapper = Function::new_native(ctx.mutation(), wrap_callback as NativeFn, upvalues);
+    stack.ret1(Value::function(wrapper));
     Ok(CallbackAction::Return)
 }
 
@@ -198,17 +207,19 @@ fn lua_wrap<'gc>(
 /// we reject it for now via the same path. Does NOT yet invoke `__close`
 /// metamethods on TBC variables; that ships with the broader TBC work.
 fn lua_close<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let co = stack.get(0).get_thread().ok_or_else(|| {
-        Error::from_str(nctx.ctx, "bad argument #1 to 'close' (coroutine expected)")
-    })?;
+    let co = stack
+        .get(0)
+        .get_thread()
+        .ok_or_else(|| Error::from_str(ctx, "bad argument #1 to 'close' (coroutine expected)"))?;
     // Pointer-eq against current first to avoid re-borrowing the running
     // thread's RefLock (mut-borrowed by the interpreter).
-    if co.ptr_eq(nctx.exec.current_thread()) {
+    if co.ptr_eq(stack.exec().current_thread()) {
         let m = Value::string(LuaString::new(
-            nctx.ctx,
+            ctx,
             b"cannot close a non-suspended coroutine",
         ));
         stack.replace(&[Value::nil(), m]);
@@ -216,19 +227,15 @@ fn lua_close<'gc>(
     }
     match co.status() {
         ThreadStatus::Suspended | ThreadStatus::Stopped | ThreadStatus::Result { .. } => {
-            let mc = nctx.ctx.mutation();
+            let mc = ctx.mutation();
             let mut ts = co.borrow_mut(mc);
-            ts.stack.clear();
-            ts.frames.clear();
-            ts.open_upvalues.clear();
-            ts.tbc_slots.clear();
-            ts.pending_action = None;
-            ts.yield_bottom = None;
-            ts.status = ThreadStatus::Stopped;
             // A coroutine that died via error re-surfaces that error as
             // `(false, err)` (and only once — clear it so a second close is
             // `true`, matching Lua). Otherwise close succeeds with `true`.
-            match ts.death_error.take() {
+            let death_error = ts.death_error.take();
+            ts.reset();
+            ts.status = ThreadStatus::Stopped;
+            match death_error {
                 Some(err) => stack.replace(&[Value::boolean(false), err]),
                 None => stack.replace(&[Value::boolean(true)]),
             }
@@ -236,7 +243,7 @@ fn lua_close<'gc>(
         }
         ThreadStatus::Normal => {
             let m = Value::string(LuaString::new(
-                nctx.ctx,
+                ctx,
                 b"cannot close a non-suspended coroutine",
             ));
             stack.replace(&[Value::nil(), m]);
@@ -249,24 +256,22 @@ fn lua_close<'gc>(
 /// thread; we resume it and unwrap the success-prefix from the resume
 /// protocol (errors rethrow rather than getting wrapped, matching Lua).
 fn wrap_callback<'gc>(
-    nctx: NativeContext<'gc, '_>,
-    _stack: Stack<'gc, '_>,
+    ctx: Context<'gc>,
+    closure: &NativeClosure<'gc>,
+    stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let co = nctx.upvalues[0]
+    let co = closure.upvalues[0]
         .get_thread()
         .expect("wrap_callback upvalue 0 must be a thread");
     // Gate the resume like `lua_resume` does; without this, resuming a dead
     // (or otherwise non-suspended) thread reaches `schedule_thread_resume`
     // and aborts the whole executor with `BadMode`. `wrap` re-raises errors
     // rather than wrapping them, so we throw the reason directly.
-    if let Some(msg) = unresumable_reason(co, &nctx) {
-        return Err(Error::from_str(nctx.ctx, msg));
+    if let Some(msg) = unresumable_reason(ctx, stack.exec(), co) {
+        return Err(Error::from_str(ctx, msg));
     }
-    let then = BoxSequence::new(nctx.ctx.mutation(), UnwrapResumeSequence);
-    Ok(CallbackAction::Resume {
-        thread: co,
-        then: Some(then),
-    })
+    let then = BoxSequence::new(ctx.mutation(), UnwrapResumeSequence);
+    Ok(CallbackAction::resume(co, Some(then)))
 }
 
 // ---------------------------------------------------------------------------
@@ -287,7 +292,7 @@ impl<'gc> Sequence<'gc> for UnwrapResumeSequence {
     fn poll(
         self: Pin<&mut Self>,
         _ctx: Context<'gc>,
-        _exec: Execution<'gc, '_>,
+        _exec: Execution<'gc>,
         _stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
         // Pass through whatever the inner left on the stack.
@@ -297,7 +302,7 @@ impl<'gc> Sequence<'gc> for UnwrapResumeSequence {
     fn error(
         self: Pin<&mut Self>,
         _ctx: Context<'gc>,
-        _exec: Execution<'gc, '_>,
+        _exec: Execution<'gc>,
         err: Error<'gc>,
         _stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {

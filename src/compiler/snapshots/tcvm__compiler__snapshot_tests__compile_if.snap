@@ -38,4 +38,4 @@ expression: output
 0021  [ 10]  GETTABUP        R0 U0 K1  ; "print"
 0022  [ 10]  LOAD            R1 K6  ; "z is greater than or equal to 5 and less than or equal to 10"
 0023  [ 10]  CALL            R0 args=2 ret=1
-0024  [ 11]  RETURN          R0 count=1
+0024  [ 11]  RETURN0

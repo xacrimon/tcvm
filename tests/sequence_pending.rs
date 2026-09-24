@@ -6,7 +6,7 @@
 use std::pin::Pin;
 
 use tcvm::dmm::{Collect, Trace};
-use tcvm::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Value};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
 use tcvm::lua::Context;
 use tcvm::vm::sequence::{BoxSequence, CallbackAction, Execution, Sequence, SequencePoll};
 use tcvm::{Executor, LoadError, Lua, RuntimeError, StepResult};
@@ -24,7 +24,7 @@ impl<'gc> Sequence<'gc> for PendNTimes {
     fn poll(
         mut self: Pin<&mut Self>,
         ctx: Context<'gc>,
-        _exec: Execution<'gc, '_>,
+        _exec: Execution<'gc>,
         mut stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
         if self.remaining > 0 {
@@ -38,11 +38,12 @@ impl<'gc> Sequence<'gc> for PendNTimes {
 }
 
 fn factory<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let seq = BoxSequence::new(nctx.ctx.mutation(), PendNTimes { remaining: 3 });
-    Ok(CallbackAction::Sequence(seq))
+    let seq = BoxSequence::new(ctx.mutation(), PendNTimes { remaining: 3 });
+    Ok(CallbackAction::sequence(seq))
 }
 
 #[test]

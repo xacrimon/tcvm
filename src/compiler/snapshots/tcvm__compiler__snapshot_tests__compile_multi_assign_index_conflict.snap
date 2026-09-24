@@ -16,4 +16,4 @@ expression: output
 0004  [  3]  ADDI            R0 R0 #1
 0005  [  3]  LOAD            R3 K1  ; 20
 0006  [  3]  SETTABLE        R3 R1 R2
-0007  [  3]  RETURN          R0 count=1
+0007  [  3]  RETURN0

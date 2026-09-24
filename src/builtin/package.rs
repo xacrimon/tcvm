@@ -1,5 +1,5 @@
 use crate::Context;
-use crate::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Table, Value};
+use crate::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Value};
 use crate::vm::sequence::CallbackAction;
 
 // See #27: constants/tables — config, cpath, loaded, path, preload, searchers
@@ -24,21 +24,24 @@ pub fn load<'gc>(ctx: Context<'gc>) {
 }
 
 fn lua_loadlib<'gc>(
-    _ctx: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_searchpath<'gc>(
-    _ctx: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
 }
 
 fn lua_require<'gc>(
-    _ctx: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()

@@ -6,7 +6,7 @@
 use std::pin::Pin;
 
 use tcvm::dmm::{Collect, Trace};
-use tcvm::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Value};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
 use tcvm::lua::Context;
 use tcvm::vm::sequence::{BoxSequence, CallbackAction, Execution, Sequence, SequencePoll};
 use tcvm::{Executor, LoadError, Lua};
@@ -25,7 +25,7 @@ impl<'gc> Sequence<'gc> for TailCallSeq {
     fn poll(
         self: Pin<&mut Self>,
         ctx: Context<'gc>,
-        _exec: Execution<'gc, '_>,
+        _exec: Execution<'gc>,
         mut stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
         let target = stack
@@ -39,11 +39,12 @@ impl<'gc> Sequence<'gc> for TailCallSeq {
 
 /// `forward(f)` becomes a `Sequence` that tail-calls `f(41)`.
 fn forward<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let seq = BoxSequence::new(nctx.ctx.mutation(), TailCallSeq);
-    Ok(CallbackAction::Sequence(seq))
+    let seq = BoxSequence::new(ctx.mutation(), TailCallSeq);
+    Ok(CallbackAction::sequence(seq))
 }
 
 #[test]

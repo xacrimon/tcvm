@@ -11,17 +11,18 @@
 //! `StoreResult` (`__index`), `CondJump` (`__lt`, where the resumed value must
 //! steer a branch rather than land in a register), and `TForCall`.
 
-use tcvm::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Table, Value};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Value};
 use tcvm::vm::sequence::CallbackAction;
-use tcvm::{Executor, IntoMultiValue, LoadError, Lua, RuntimeError, StepResult};
+use tcvm::{Context, Executor, IntoMultiValue, LoadError, Lua, RuntimeError, StepResult};
 
 /// A metamethod that refuses to answer inline: it yields to the host, which
 /// supplies the result on resume.
 fn suspending_mm<'gc>(
-    _nctx: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    Ok(CallbackAction::Yield { then: None })
+    Ok(CallbackAction::yield_(None))
 }
 
 /// Loads `src` with a global `t` whose metatable maps `event` to the suspending

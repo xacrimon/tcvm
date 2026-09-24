@@ -7,7 +7,7 @@
 use std::pin::Pin;
 
 use tcvm::dmm::{Collect, Trace};
-use tcvm::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Value};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
 use tcvm::lua::Context;
 use tcvm::vm::sequence::{BoxSequence, CallbackAction, Execution, Sequence, SequencePoll};
 use tcvm::{Executor, LoadError, Lua};
@@ -28,7 +28,7 @@ impl<'gc> Sequence<'gc> for YieldThenAddOne {
     fn poll(
         mut self: Pin<&mut Self>,
         ctx: Context<'gc>,
-        _exec: Execution<'gc, '_>,
+        _exec: Execution<'gc>,
         mut stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
         if !self.yielded {
@@ -53,11 +53,12 @@ impl<'gc> Sequence<'gc> for YieldThenAddOne {
 /// Native callback that becomes a Sequence yielding 42 once, then
 /// returning resume-arg + 1.
 fn yielding_seq<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let seq = BoxSequence::new(nctx.ctx.mutation(), YieldThenAddOne { yielded: false });
-    Ok(CallbackAction::Sequence(seq))
+    let seq = BoxSequence::new(ctx.mutation(), YieldThenAddOne { yielded: false });
+    Ok(CallbackAction::sequence(seq))
 }
 
 #[test]

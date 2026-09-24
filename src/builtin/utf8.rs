@@ -1,5 +1,5 @@
 use crate::Context;
-use crate::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Table, Value};
+use crate::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Value};
 use crate::vm::sequence::CallbackAction;
 
 /// Original-UTF-8 (Lua flavor) max code point: 6-byte sequences up to
@@ -134,57 +134,59 @@ fn iscont(bytes: &[u8], idx1: i64) -> bool {
 
 /// `utf8.char(...)` — build a string from the given code points.
 fn lua_char<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let n = stack.len();
     let mut out = Vec::new();
     for i in 0..n {
-        let c = crate::builtin::util::check_integer(nctx.ctx, stack.get(i), "char", i + 1)?;
+        let c = crate::builtin::util::check_integer(ctx, stack.get(i), "char", i + 1)?;
         if !(0..=MAX_CODEPOINT).contains(&c) {
             return Err(Error::from_str(
-                nctx.ctx,
+                ctx,
                 &format!("bad argument #{} to 'char' (value out of range)", i + 1),
             ));
         }
         encode(c as u32, &mut out);
     }
-    stack.replace(&[Value::string(LuaString::new(nctx.ctx, &out))]);
+    stack.ret1(Value::string(LuaString::new(ctx, &out)));
     Ok(CallbackAction::Return)
 }
 
 /// `utf8.codepoint(s [, i [, j]])` — code points of the characters in byte
 /// range `i..j` (`i` defaults to 1, `j` to `i`).
 fn lua_codepoint<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let s = check_str(nctx.ctx, stack.get(0), "codepoint", 1)?;
+    let s = check_str(ctx, stack.get(0), "codepoint", 1)?;
     let bytes = s.as_bytes();
     let len = bytes.len();
     let i_arg = stack.get(1);
     let i = if i_arg.is_nil() {
         1
     } else {
-        crate::builtin::util::check_integer(nctx.ctx, i_arg, "codepoint", 2)?
+        crate::builtin::util::check_integer(ctx, i_arg, "codepoint", 2)?
     };
     let j_arg = stack.get(2);
     let j = if j_arg.is_nil() {
         i
     } else {
-        crate::builtin::util::check_integer(nctx.ctx, j_arg, "codepoint", 3)?
+        crate::builtin::util::check_integer(ctx, j_arg, "codepoint", 3)?
     };
     let posi = posrelat(i, len);
     let posj = posrelat(j, len);
     if posi < 1 {
         return Err(Error::from_str(
-            nctx.ctx,
+            ctx,
             "bad argument #2 to 'codepoint' (out of bounds)",
         ));
     }
     if posj > len as i64 {
         return Err(Error::from_str(
-            nctx.ctx,
+            ctx,
             "bad argument #3 to 'codepoint' (out of bounds)",
         ));
     }
@@ -195,10 +197,10 @@ fn lua_codepoint<'gc>(
     while pos < end {
         match decode(bytes, pos, strict) {
             Some((code, next)) => {
-                out.push(Value::integer(nctx.ctx.mutation(), code as i64));
+                out.push(Value::integer(ctx.mutation(), code as i64));
                 pos = next;
             }
-            None => return Err(Error::from_str(nctx.ctx, "invalid UTF-8 code")),
+            None => return Err(Error::from_str(ctx, "invalid UTF-8 code")),
         }
     }
     stack.replace(&out);
@@ -209,35 +211,36 @@ fn lua_codepoint<'gc>(
 /// (`i` defaults to 1, `j` to -1). On a malformed sequence, returns
 /// `(nil, position)`.
 fn lua_len<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let s = check_str(nctx.ctx, stack.get(0), "len", 1)?;
+    let s = check_str(ctx, stack.get(0), "len", 1)?;
     let bytes = s.as_bytes();
     let len = bytes.len();
     let i_arg = stack.get(1);
     let i = if i_arg.is_nil() {
         1
     } else {
-        crate::builtin::util::check_integer(nctx.ctx, i_arg, "len", 2)?
+        crate::builtin::util::check_integer(ctx, i_arg, "len", 2)?
     };
     let j_arg = stack.get(2);
     let j = if j_arg.is_nil() {
         -1
     } else {
-        crate::builtin::util::check_integer(nctx.ctx, j_arg, "len", 3)?
+        crate::builtin::util::check_integer(ctx, j_arg, "len", 3)?
     };
     let mut posi = posrelat(i, len);
     let posj = posrelat(j, len);
     if posi < 1 || posi > len as i64 + 1 {
         return Err(Error::from_str(
-            nctx.ctx,
+            ctx,
             "bad argument #2 to 'len' (initial position out of bounds)",
         ));
     }
     if posj > len as i64 {
         return Err(Error::from_str(
-            nctx.ctx,
+            ctx,
             "bad argument #3 to 'len' (final position out of bounds)",
         ));
     }
@@ -250,12 +253,12 @@ fn lua_len<'gc>(
                 posi = next as i64 + 1;
             }
             None => {
-                stack.replace(&[Value::nil(), Value::integer(nctx.ctx.mutation(), posi)]);
+                stack.replace(&[Value::nil(), Value::integer(ctx.mutation(), posi)]);
                 return Ok(CallbackAction::Return);
             }
         }
     }
-    stack.replace(&[Value::integer(nctx.ctx.mutation(), count)]);
+    stack.ret1(Value::integer(ctx.mutation(), count));
     Ok(CallbackAction::Return)
 }
 
@@ -264,24 +267,25 @@ fn lua_len<'gc>(
 /// containing byte `i`. Returns `nil` when the position falls outside the
 /// string.
 fn lua_offset<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let s = check_str(nctx.ctx, stack.get(0), "offset", 1)?;
+    let s = check_str(ctx, stack.get(0), "offset", 1)?;
     let bytes = s.as_bytes();
     let len = bytes.len();
-    let n = crate::builtin::util::check_integer(nctx.ctx, stack.get(1), "offset", 2)?;
+    let n = crate::builtin::util::check_integer(ctx, stack.get(1), "offset", 2)?;
     let default_i = if n >= 0 { 1 } else { len as i64 + 1 };
     let i_arg = stack.get(2);
     let i = if i_arg.is_nil() {
         default_i
     } else {
-        crate::builtin::util::check_integer(nctx.ctx, i_arg, "offset", 3)?
+        crate::builtin::util::check_integer(ctx, i_arg, "offset", 3)?
     };
     let mut posi = posrelat(i, len);
     if posi < 1 || posi > len as i64 + 1 {
         return Err(Error::from_str(
-            nctx.ctx,
+            ctx,
             "bad argument #3 to 'offset' (position out of bounds)",
         ));
     }
@@ -293,7 +297,7 @@ fn lua_offset<'gc>(
         Some(posi)
     } else if posi <= len as i64 && iscont(bytes, posi) {
         return Err(Error::from_str(
-            nctx.ctx,
+            ctx,
             "initial position is a continuation byte",
         ));
     } else if n > 0 {
@@ -331,8 +335,8 @@ fn lua_offset<'gc>(
                 e
             };
             stack.replace(&[
-                Value::integer(nctx.ctx.mutation(), p),
-                Value::integer(nctx.ctx.mutation(), end),
+                Value::integer(ctx.mutation(), p),
+                Value::integer(ctx.mutation(), end),
             ]);
         }
         None => stack.replace(&[Value::nil()]),
@@ -343,15 +347,16 @@ fn lua_offset<'gc>(
 /// `utf8.codes(s)` — iterator triple `(iterator, s, 0)` yielding
 /// `(byte_position, code_point)` for each character.
 fn lua_codes<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let s = check_str(nctx.ctx, stack.get(0), "codes", 1)?;
-    let iter = Function::new_native(nctx.ctx.mutation(), codes_aux, Box::new([]));
+    let s = check_str(ctx, stack.get(0), "codes", 1)?;
+    let iter = Function::new_native(ctx.mutation(), codes_aux, Box::new([]));
     stack.replace(&[
         Value::function(iter),
         Value::string(s),
-        Value::integer(nctx.ctx.mutation(), 0),
+        Value::integer(ctx.mutation(), 0),
     ]);
     Ok(CallbackAction::Return)
 }
@@ -359,10 +364,11 @@ fn lua_codes<'gc>(
 /// Stateless iterator body for `utf8.codes`. `i` is the byte position (1-based)
 /// of the previously yielded character, or 0 to start.
 fn codes_aux<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let s = check_str(nctx.ctx, stack.get(0), "codes", 1)?;
+    let s = check_str(ctx, stack.get(0), "codes", 1)?;
     let bytes = s.as_bytes();
     let len = bytes.len();
     let i = stack.get(1).get_integer().unwrap_or(0);
@@ -373,7 +379,7 @@ fn codes_aux<'gc>(
     } else {
         match decode(bytes, (i - 1) as usize, true) {
             Some((_, next)) => next,
-            None => return Err(Error::from_str(nctx.ctx, "invalid UTF-8 code")),
+            None => return Err(Error::from_str(ctx, "invalid UTF-8 code")),
         }
     };
     if pos >= len {
@@ -383,11 +389,11 @@ fn codes_aux<'gc>(
     match decode(bytes, pos, true) {
         Some((code, _)) => {
             stack.replace(&[
-                Value::integer(nctx.ctx.mutation(), pos as i64 + 1),
-                Value::integer(nctx.ctx.mutation(), code as i64),
+                Value::integer(ctx.mutation(), pos as i64 + 1),
+                Value::integer(ctx.mutation(), code as i64),
             ]);
             Ok(CallbackAction::Return)
         }
-        None => Err(Error::from_str(nctx.ctx, "invalid UTF-8 code")),
+        None => Err(Error::from_str(ctx, "invalid UTF-8 code")),
     }
 }

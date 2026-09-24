@@ -1,16 +1,17 @@
 //! Errors thrown inside a coroutine surface as `(false, msg)` from
 //! `coroutine.resume`, courtesy of `PCallSequence`'s error handler.
 
-use tcvm::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Value};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
 use tcvm::vm::sequence::CallbackAction;
-use tcvm::{Executor, LoadError, Lua};
+use tcvm::{Context, Executor, LoadError, Lua};
 
 /// A native callback that always errors.
 fn boomer<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    Err(Error::from_str(nctx.ctx, "boom"))
+    Err(Error::from_str(ctx, "boom"))
 }
 
 /// Coroutine calls `boomer()` (a native that errors); resume sees `(false, msg)`

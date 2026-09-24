@@ -1,10 +1,13 @@
+use std::cell::UnsafeCell;
+use std::ops::{Deref, DerefMut};
+
 use crate::dmm::{Collect, Gc, Mutation, Ref, RefLock, RefMut, Trace};
 use crate::env::error::Error;
-use crate::env::function::{Function, LuaClosure, Upvalue};
+use crate::env::function::{Function, LuaFn, Upvalue};
 use crate::env::value::Value;
 use crate::lua::Context;
 use crate::vm::interp::Continuation;
-use crate::vm::sequence::{BoxSequence, CallbackAction};
+use crate::vm::sequence::{BoxSequence, Suspend};
 
 /// Copy wrapper stored in Value.
 #[derive(Clone, Copy, Collect)]
@@ -37,21 +40,33 @@ pub enum ThreadStatus {
 /// A Lua bytecode frame on a thread's frame stack. Only Lua function
 /// execution pushes one of these; native callbacks that don't suspend run
 /// inline within the calling Lua frame.
-#[derive(Collect)]
+#[derive(Clone, Copy, Collect)]
 #[collect(internal, no_drop)]
 pub struct LuaFrame<'gc> {
-    pub closure: Gc<'gc, LuaClosure<'gc>>,
-    pub base: usize,
-    pub pc: usize,
-    pub num_results: u8,
+    pub(crate) closure: LuaFn<'gc>,
+    /// Read through `base()`. 32 bits: a frame sits inside the stack, and
+    /// every growth of the stack goes through `grow_slots`, which keeps it
+    /// below 2^32 slots.
+    pub(crate) base: u32,
+    /// Resume address: points *past* the instruction being executed, into
+    /// `closure.proto.code` (which the frame keeps alive). A raw pointer
+    /// rather than an index so CALL saves it with one store.
+    #[collect(require_static)]
+    pub(crate) pc: *const crate::instruction::Instruction,
+    pub(crate) num_results: u8,
+    /// `frame_flags` bits. Zero means RETURN can take its fast path: fixed
+    /// results land in a Lua caller with nothing to close and no continuation.
+    /// Mostly left set once the hazard is gone (a stale bit just costs the slow
+    /// path); a slow TAILCALL clears `OPEN_UPVALUES` after closing them.
+    pub(crate) flags: u8,
     /// Caller-supplied args beyond `num_params`; the below-base region is
     /// `stack[base - num_extras .. base]`. Set by `VARARGPREP`, else 0.
-    pub num_extras: u32,
+    pub(crate) num_extras: u32,
     /// Fixup dispatched by `op_return` when this frame unwinds. `None` for
     /// normal calls; set by metamethod/iterator helpers that need
     /// post-return processing.
     #[collect(require_static)]
-    pub continuation: Option<Continuation>,
+    pub(crate) continuation: Option<Continuation>,
 }
 
 /// Stack-window metadata threaded through every suspension point.
@@ -62,7 +77,7 @@ pub struct LuaFrame<'gc> {
 ///   expects results to land.
 /// - `returns` is the CALL instruction's `returns` field (0 = "all").
 ///
-/// Stored on `Frame::Sequence`, `Frame::WaitThread`, `PendingAction`,
+/// Stored on `ExecKind::Sequence`, `ExecKind::WaitThread`, `PendingAction`,
 /// and as the yielded-state stash on `ThreadState`.
 #[derive(Clone, Copy, Debug)]
 pub struct CallSite {
@@ -80,14 +95,53 @@ pub struct CallSite {
     pub cont: Option<Continuation>,
 }
 
-/// A frame on a thread's frame stack. The interpreter only pushes
-/// `Frame::Lua`; the executor driver pushes the others when a callback
-/// suspends, an error unwinds, a coroutine waits, etc.
+/// Bits of `LuaFrame::flags`.
+pub mod frame_flags {
+    /// `continuation` is `Some`: RETURN must apply it (`op_return_cont` or
+    /// `cont_resume`).
+    pub const HAS_CONT: u8 = 1;
+    /// A CLOSURE in this frame captured one of its locals; RETURN must close.
+    pub const OPEN_UPVALUES: u8 = 2;
+    /// A TBC in this frame registered a to-be-closed slot.
+    pub const TBC: u8 = 4;
+    /// The frame below is not a Lua frame, or there is none.
+    pub const PARENT_NON_LUA: u8 = 8;
+}
+
+// Two records per cache line.
+const _: () = assert!(std::mem::size_of::<LuaFrame<'static>>() == 32);
+
+impl<'gc> LuaFrame<'gc> {
+    #[inline(always)]
+    pub fn base(&self) -> usize {
+        self.base as usize
+    }
+
+    #[inline(always)]
+    pub fn set_base(&mut self, base: usize) {
+        debug_assert!(base <= u32::MAX as usize);
+        self.base = base as u32;
+    }
+
+    /// `pc` as an index into `closure.proto.code`.
+    pub fn pc_index(&self) -> usize {
+        unsafe { self.pc.offset_from_unsigned(self.closure.code) }
+    }
+}
+
+/// A frame the executor pushes when a callback suspends, an error unwinds, a
+/// coroutine waits, etc. It sits above the first `depth` Lua frames and
+/// below the rest.
 #[derive(Collect)]
 #[collect(internal, no_drop)]
-pub enum Frame<'gc> {
-    /// Running Lua bytecode.
-    Lua(LuaFrame<'gc>),
+pub struct ExecFrame<'gc> {
+    pub depth: usize,
+    pub kind: ExecKind<'gc>,
+}
+
+#[derive(Collect)]
+#[collect(internal, no_drop)]
+pub enum ExecKind<'gc> {
     /// A pinned multi-step native callback awaiting (re-)poll. The
     /// `call_site` mirrors the original Lua CALL so terminal
     /// `SequencePoll::Return` lands results in the right place.
@@ -115,6 +169,19 @@ pub enum Frame<'gc> {
     Error(Error<'gc>),
 }
 
+/// A frame seen while walking every frame of a thread, see
+/// [`ThreadState::frames_rev`].
+pub enum FrameRef<'a, 'gc> {
+    Lua(&'a LuaFrame<'gc>),
+    Exec(&'a ExecKind<'gc>),
+}
+
+/// Most stack slots a thread's Lua frames may use (LuaJIT's `LUAI_MAXSTACK`).
+/// Calls fail with "stack overflow" past [`STACK_LIMIT`]; the slots above it
+/// are headroom for a message handler to report that (PUC's `STACKERRSPACE`).
+pub(crate) const MAX_STACK: usize = 65_500;
+pub(crate) const STACK_LIMIT: usize = MAX_STACK - 200;
+
 /// The mutable state of a thread/coroutine.
 ///
 /// # The stack invariant
@@ -131,10 +198,11 @@ pub enum Frame<'gc> {
 ///     the interpreter's raw `registers` pointer). The only sanctioned shrink
 ///     is [`ThreadState::discard_above`], whose caller must guarantee nothing
 ///     above the cut is live.
-///  3. Because of (2), removing values means **lowering `top` and nil-filling
-///     what it vacates** — the nil-fill is what actually releases them, since
-///     the slots stay physically present and everything below `live_top` is
-///     traced (see the `Collect` impl).
+///  3. Removing values means **lowering `top`**, nothing more. The vacated
+///     slots keep their stale contents until the collector traces the thread,
+///     which nil-fills everything above the live region (see the `Collect`
+///     impl); the mutator never reads a slot above `top` or outside a live
+///     frame's window, so it never observes them.
 ///
 /// The *live region* is `[0 .. max(top, top_lua.base + max_stack_size))`: a
 /// Lua frame's register window is live regardless of `top` (the interpreter
@@ -142,38 +210,71 @@ pub enum Frame<'gc> {
 /// value-passing window — args and results in flight between frames — which
 /// can sit above the frames during a native call.
 pub struct ThreadState<'gc> {
-    /// Backing store. May hold dead slots above the live region; they are
-    /// kept nil so the `Collect` impl below cannot retain them.
-    pub stack: Vec<Value<'gc>>,
-    pub frames: Vec<Frame<'gc>>,
-    pub open_upvalues: Vec<Upvalue<'gc>>,
-    pub tbc_slots: Vec<usize>,
-    pub status: ThreadStatus,
+    /// Backing store. May hold dead slots above the live region; the
+    /// collector clears them when it traces the thread.
+    pub(crate) stack: ValueStack<'gc>,
+    /// Lua frames, innermost last.
+    pub(crate) frames: Vec<LuaFrame<'gc>>,
+    /// Executor frames, innermost last, each placed among `frames` by its
+    /// `depth`. Kept apart so the interpreter's frames are plain records.
+    pub(crate) exec_frames: Vec<ExecFrame<'gc>>,
+    pub(crate) open_upvalues: Vec<Upvalue<'gc>>,
+    pub(crate) tbc_slots: Vec<usize>,
+    pub(crate) status: ThreadStatus,
     /// Logical stack top — the end of the value-passing window. Always valid:
     /// it is the sole signal of "how many values are here" across every
     /// hand-off (native args/results, yields, sequence polls, thread resume,
     /// `Result`). Multires producers (`VARARG`/`CALL`/`TAILCALL` with the `0`
     /// sentinel, native multi-return) publish through it; their consumers read
     /// it back.
-    pub top: usize,
+    pub(crate) top: usize,
     /// Back-reference to the owning Thread handle, needed for creating open upvalues.
-    pub thread_handle: Option<Thread<'gc>>,
-    /// A native callback's non-`Return` `CallbackAction` deposited by
-    /// `op_call`/`op_tailcall` and consumed by the executor driver loop on
-    /// the next pump. `None` between pumps. The interpreter never observes
-    /// this (it bails out via `return Ok(())` immediately after setting it).
-    pub pending_action: Option<PendingAction<'gc>>,
+    pub(crate) thread_handle: Option<Thread<'gc>>,
+    /// A native callback's `Suspend` request, deposited by the interpreter's
+    /// native-call paths and consumed by the executor driver loop on the next
+    /// pump. `None` between pumps. The interpreter never observes this (it
+    /// leaves dispatch right after setting it).
+    pub(crate) pending_action: Option<PendingAction<'gc>>,
     /// Where the thread's yielded values currently live. Set when the
     /// thread suspends via a `Yield` action (or a sequence's
     /// `SequencePoll::Yield`/`TailYield`). Consumed on resume to recover
     /// where the call's results should land. `None` outside of yielded
     /// state.
-    pub yield_bottom: Option<CallSite>,
+    pub(crate) yield_bottom: Option<CallSite>,
     /// The error value that killed this coroutine, set when an uncaught error
     /// unwinds out of it (status -> `Stopped`). `coroutine.close` surfaces it
     /// as `(false, err)` and clears it; `None` for a coroutine that died by
     /// normal return or was never run.
-    pub death_error: Option<Value<'gc>>,
+    pub(crate) death_error: Option<Value<'gc>>,
+    /// End a Lua frame's register window may not cross: [`STACK_LIMIT`], or
+    /// [`MAX_STACK`] while a message handler runs.
+    pub(crate) stack_limit: usize,
+}
+
+/// The value stack's storage: a `Vec` the mutator uses as such, that the
+/// collector may also clear from `trace(&self)` (hence the cell).
+#[derive(Default)]
+pub struct ValueStack<'gc>(UnsafeCell<Vec<Value<'gc>>>);
+
+impl<'gc> ValueStack<'gc> {
+    pub fn new() -> Self {
+        ValueStack(UnsafeCell::new(Vec::new()))
+    }
+}
+
+impl<'gc> Deref for ValueStack<'gc> {
+    type Target = Vec<Value<'gc>>;
+    #[inline(always)]
+    fn deref(&self) -> &Vec<Value<'gc>> {
+        unsafe { &*self.0.get() }
+    }
+}
+
+impl<'gc> DerefMut for ValueStack<'gc> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Vec<Value<'gc>> {
+        self.0.get_mut()
+    }
 }
 
 // SAFETY: traces every field that can own a `Gc` pointer. The only subtlety is
@@ -181,16 +282,24 @@ pub struct ThreadState<'gc> {
 // are dead scratch and must NOT be traced — tracing the whole vec would retain
 // whatever a since-returned callee happened to leave in its registers.
 // `live_top` is the sound live high-water (see its doc for why the innermost
-// frame's window bounds every frame's registers). Correctness also rests on
-// rule (3) of the stack invariant: anything dropped from the logical stack is
-// nil-filled, so a dead slot that happens to fall below `live_top` still
-// retains nothing.
+// frame's window bounds every frame's registers).
+// The dead region is nil-filled here, as in LuaJIT and PUC Lua, rather than by
+// the mutator as it vacates slots. This keeps every slot valid: after a
+// trace, each slot below `live_top` holds a marked object or a primitive and
+// each slot above holds nil; until the next trace the mutator writes only
+// values it could reach; and a `borrow_mut` since the last trace re-grays the
+// thread, so a slot can re-enter the live region only after the trace that
+// cleared it. Writing through `&self` is sound because collection runs
+// outside `mutate`, with no borrow of the thread outstanding.
 // `tbc_slots`/`status`/`top`/`yield_bottom` hold no `Gc` pointers.
 unsafe impl<'gc> Collect<'gc> for ThreadState<'gc> {
     fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
-        let live_top = self.live_top().min(self.stack.len());
-        cc.trace(&self.stack[..live_top]);
+        let live = self.live_top().min(self.stack.len());
+        let stack = unsafe { &mut *self.stack.0.get() };
+        stack[live..].fill(Value::nil());
+        cc.trace(&stack[..live]);
         cc.trace(&self.frames);
+        cc.trace(&self.exec_frames);
         cc.trace(&self.open_upvalues);
         cc.trace(&self.thread_handle);
         cc.trace(&self.pending_action);
@@ -202,61 +311,144 @@ unsafe impl<'gc> Collect<'gc> for ThreadState<'gc> {
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub struct PendingAction<'gc> {
-    pub action: CallbackAction<'gc>,
+    pub action: Box<Suspend<'gc>>,
     #[collect(require_static)]
     pub call_site: CallSite,
 }
 
 impl<'gc> ThreadState<'gc> {
-    /// View the top frame as a Lua frame. Returns `None` if the stack is
-    /// empty *or* the top is non-Lua (Sequence/Start/WaitThread/Error).
-    /// Most interpreter sites can `.unwrap()` this — the dispatch loop only
-    /// runs when a Lua frame is on top — but the executor driver loop must
-    /// match all variants.
+    /// The owning `Thread`. `Thread::new` stores it before the state is
+    /// reachable, so it is only `None` inside that constructor.
+    #[inline(always)]
+    pub(crate) fn handle(&self) -> Thread<'gc> {
+        debug_assert!(self.thread_handle.is_some());
+        unsafe { self.thread_handle.unwrap_unchecked() }
+    }
+
+    /// Lua frames below the innermost executor frame.
     #[inline]
-    pub fn top_lua(&self) -> Option<&LuaFrame<'gc>> {
-        match self.frames.last()? {
-            Frame::Lua(lf) => Some(lf),
-            _ => None,
+    pub(crate) fn exec_depth(&self) -> usize {
+        self.exec_frames.last().map_or(0, |e| e.depth)
+    }
+
+    /// Whether the innermost frame is a Lua frame.
+    #[inline]
+    pub(crate) fn top_is_lua(&self) -> bool {
+        self.frames.len() > self.exec_depth()
+    }
+
+    /// Whether the thread has no frames at all.
+    pub(crate) fn frames_empty(&self) -> bool {
+        self.frames.is_empty() && self.exec_frames.is_empty()
+    }
+
+    /// The innermost frame if it is a Lua frame. Most interpreter sites can
+    /// `.unwrap()` this — the dispatch loop only runs when a Lua frame is on
+    /// top — but the executor driver loop must also handle `top_exec`.
+    #[inline]
+    pub(crate) fn top_lua(&self) -> Option<&LuaFrame<'gc>> {
+        if self.top_is_lua() {
+            self.frames.last()
+        } else {
+            None
         }
     }
 
     #[inline]
-    pub fn top_lua_mut(&mut self) -> Option<&mut LuaFrame<'gc>> {
-        match self.frames.last_mut()? {
-            Frame::Lua(lf) => Some(lf),
-            _ => None,
+    pub(crate) fn top_lua_mut(&mut self) -> Option<&mut LuaFrame<'gc>> {
+        if self.top_is_lua() {
+            self.frames.last_mut()
+        } else {
+            None
         }
     }
 
-    /// Hot-path accessor used by interpreter handlers that have already
-    /// guaranteed (statically) that the top frame is Lua. UB in release if
-    /// it isn't; debug builds panic.
+    /// # Safety
+    /// The innermost frame must be a Lua frame.
+    #[inline]
+    pub(crate) unsafe fn top_lua_unchecked(&self) -> &LuaFrame<'gc> {
+        debug_assert!(self.top_is_lua(), "non-Lua frame on top");
+        unsafe { self.frames.last().unwrap_unchecked() }
+    }
+
+    /// Raw pointer to the innermost frame. Derived from the buffer rather than
+    /// a `&mut` to the element, so it stays usable across later borrows of
+    /// `frames` and may be offset to neighbouring frames.
     ///
     /// # Safety
-    /// Caller must ensure `self.frames.last()` is `Some(Frame::Lua(_))`.
+    /// The innermost frame must be a Lua frame.
     #[inline]
-    pub unsafe fn top_lua_unchecked(&self) -> &LuaFrame<'gc> {
-        match unsafe { self.frames.last().unwrap_unchecked() } {
-            Frame::Lua(lf) => lf,
-            _ => {
-                debug_assert!(false, "top_lua_unchecked: non-Lua frame on top");
-                unsafe { std::hint::unreachable_unchecked() }
-            }
+    pub(crate) unsafe fn top_lua_ptr(&mut self) -> *mut LuaFrame<'gc> {
+        debug_assert!(self.top_is_lua(), "non-Lua frame on top");
+        unsafe { self.frames.as_mut_ptr().add(self.frames.len() - 1) }
+    }
+
+    /// The innermost frame if it is an executor frame.
+    pub(crate) fn top_exec(&self) -> Option<&ExecKind<'gc>> {
+        if self.top_is_lua() {
+            None
+        } else {
+            self.exec_frames.last().map(|e| &e.kind)
         }
     }
 
-    /// # Safety
-    /// Caller must ensure `self.frames.last_mut()` is `Some(Frame::Lua(_))`.
-    #[inline]
-    pub unsafe fn top_lua_unchecked_mut(&mut self) -> &mut LuaFrame<'gc> {
-        match unsafe { self.frames.last_mut().unwrap_unchecked() } {
-            Frame::Lua(lf) => lf,
-            _ => {
-                debug_assert!(false, "top_lua_unchecked_mut: non-Lua frame on top");
-                unsafe { std::hint::unreachable_unchecked() }
-            }
+    pub(crate) fn top_exec_mut(&mut self) -> Option<&mut ExecKind<'gc>> {
+        if self.top_is_lua() {
+            None
+        } else {
+            self.exec_frames.last_mut().map(|e| &mut e.kind)
         }
+    }
+
+    /// Push an executor frame above every current frame.
+    pub(crate) fn push_exec(&mut self, kind: ExecKind<'gc>) {
+        let depth = self.frames.len();
+        self.exec_frames.push(ExecFrame { depth, kind });
+    }
+
+    /// Pop the innermost frame if it is an executor frame.
+    pub(crate) fn pop_exec(&mut self) -> Option<ExecKind<'gc>> {
+        if self.top_is_lua() {
+            None
+        } else {
+            self.exec_frames.pop().map(|e| e.kind)
+        }
+    }
+
+    /// Pop the innermost frame, which must be a Lua frame.
+    #[inline]
+    pub(crate) fn pop_lua(&mut self) {
+        debug_assert!(self.top_is_lua(), "non-Lua frame on top");
+        self.frames.pop();
+    }
+
+    /// Drop everything a previous run left behind; `status` is the caller's.
+    pub(crate) fn reset(&mut self) {
+        self.discard_above(0);
+        self.frames.clear();
+        self.exec_frames.clear();
+        self.open_upvalues.clear();
+        self.tbc_slots.clear();
+        self.pending_action = None;
+        self.yield_bottom = None;
+        self.death_error = None;
+        self.stack_limit = STACK_LIMIT;
+    }
+
+    /// Every frame, innermost first.
+    pub(crate) fn frames_rev(&self) -> impl Iterator<Item = FrameRef<'_, 'gc>> {
+        let (mut lua, mut exec) = (self.frames.len(), self.exec_frames.len());
+        std::iter::from_fn(move || {
+            if exec > 0 && self.exec_frames[exec - 1].depth == lua {
+                exec -= 1;
+                Some(FrameRef::Exec(&self.exec_frames[exec].kind))
+            } else if lua > 0 {
+                lua -= 1;
+                Some(FrameRef::Lua(&self.frames[lua]))
+            } else {
+                None
+            }
+        })
     }
 
     /// One past the highest slot anything on this thread can still read.
@@ -265,15 +457,10 @@ impl<'gc> ThreadState<'gc> {
     /// Lua frame's window bounds every frame's live registers (extras sit
     /// below a base). `top` adds the value-passing window a native or a
     /// paused multires producer may have pushed above it.
-    pub fn live_top(&self) -> usize {
+    pub(crate) fn live_top(&self) -> usize {
         self.frames
-            .iter()
-            .rev()
-            .find_map(|f| match f {
-                Frame::Lua(lf) => Some(lf.base + lf.closure.proto.max_stack_size as usize),
-                _ => None,
-            })
-            .unwrap_or(0)
+            .last()
+            .map_or(0, |lf| lf.base() + lf.closure.max_stack_size as usize)
             .max(self.top)
     }
 
@@ -281,19 +468,57 @@ impl<'gc> ThreadState<'gc> {
     /// current frames, then install the unwinding marker for the executor.
     pub(crate) fn raise(&mut self, ctx: Context<'gc>, err: Error<'gc>) {
         let err = crate::vm::debug::locate(ctx, self, err);
-        self.frames.push(Frame::Error(err));
+        self.push_exec(ExecKind::Error(err));
     }
 
     /// Push a new Lua frame. `base` must sit directly above the function
     /// slot: `op_return` locates it as `base - 1 - num_extras` (VARARGPREP
     /// later shifts `base` up by `num_extras`), which wraps for `base == 0`.
     #[inline]
-    pub fn push_lua(&mut self, lf: LuaFrame<'gc>) {
+    pub(crate) fn push_lua(&mut self, mut lf: LuaFrame<'gc>) {
         debug_assert!(
-            lf.base >= 1,
+            lf.base() >= 1,
             "Lua frame base must leave room for the function slot"
         );
-        self.frames.push(Frame::Lua(lf));
+        if !self.top_is_lua() {
+            lf.flags |= frame_flags::PARENT_NON_LUA;
+        }
+        if self.frames.len() == self.frames.capacity() {
+            self.grow_frames();
+        }
+        self.frames.push(lf);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow_frames(&mut self) {
+        self.frames.reserve(1);
+    }
+
+    /// `push_lua` for the interpreter: room already made (`reserve_frames`) and
+    /// the parent is the running Lua frame, so `flags` is stored as given.
+    ///
+    /// # Safety
+    /// `frames.len() < frames.capacity()`, and the innermost frame is a Lua frame.
+    #[inline(always)]
+    pub(crate) unsafe fn push_lua_unchecked(&mut self, lf: LuaFrame<'gc>) {
+        debug_assert!(lf.base() >= 1);
+        debug_assert!(self.frames.len() < self.frames.capacity());
+        debug_assert!(self.top_is_lua());
+        let len = self.frames.len();
+        unsafe {
+            self.frames.as_mut_ptr().add(len).write(lf);
+            self.frames.set_len(len + 1);
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn frames_full(&self) -> bool {
+        self.frames.len() == self.frames.capacity()
+    }
+
+    pub(crate) fn reserve_frames(&mut self, n: usize) {
+        self.frames.reserve(n);
     }
 
     // --- Stack accessors -------------------------------------------------
@@ -304,31 +529,72 @@ impl<'gc> ThreadState<'gc> {
 
     /// Make `stack[..n]` physically addressable. Grow-only, per rule (2).
     #[inline]
-    pub fn ensure_slots(&mut self, n: usize) {
+    pub(crate) fn ensure_slots(&mut self, n: usize) {
         if self.stack.len() < n {
-            self.stack.resize(n, Value::nil());
+            self.grow_slots(n);
         }
+    }
+
+    /// Out of line so the growth path (a `resize` loop) never sits in a
+    /// handler's fast path or forces it to set up a stack frame.
+    #[cold]
+    #[inline(never)]
+    fn grow_slots(&mut self, n: usize) {
+        // Frame bases are stored in 32 bits (`LuaFrame::base`).
+        assert!(n <= u32::MAX as usize, "Lua stack exceeds 2^32 slots");
+        self.stack.resize(n, Value::nil());
+    }
+
+    /// `ensure_slots` for a Lua frame's register window ending at `n`; `false`
+    /// when that would cross `stack_limit`, which the caller raises as a stack
+    /// overflow. Only growth is checked, so a window inside slots a native
+    /// already pushed past the limit is allowed.
+    #[inline]
+    #[must_use]
+    pub(crate) fn ensure_frame_slots(&mut self, n: usize) -> bool {
+        self.stack.len() >= n || self.grow_frame_slots(n)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow_frame_slots(&mut self, n: usize) -> bool {
+        if n > self.stack_limit {
+            return false;
+        }
+        self.grow_slots(n);
+        true
+    }
+
+    /// A message handler is running in the headroom above [`STACK_LIMIT`].
+    pub(crate) fn in_error_headroom(&self) -> bool {
+        self.stack_limit > STACK_LIMIT
     }
 
     /// The logical window `stack[bottom..top]`.
     #[inline]
-    pub fn window(&self, bottom: usize) -> &[Value<'gc>] {
+    pub(crate) fn window(&self, bottom: usize) -> &[Value<'gc>] {
         &self.stack[bottom..self.top]
     }
 
-    /// Publish a new logical top, nil-filling any slots it vacates (rule 3).
-    /// Raising the top only exposes slots the caller has already written.
+    /// `set_top` for a caller that knows `n` is already physically covered
+    /// (the interpreter, whose CALL sized the window).
     #[inline]
-    pub fn set_top(&mut self, n: usize) {
+    pub(crate) fn set_top_unchecked(&mut self, n: usize) {
+        debug_assert!(n <= self.stack.len());
+        self.top = n;
+    }
+
+    /// Publish a new logical top. Raising it only exposes slots the caller
+    /// has already written; lowering it leaves the vacated slots to the
+    /// collector (rule 3).
+    #[inline]
+    pub(crate) fn set_top(&mut self, n: usize) {
         self.ensure_slots(n);
-        if n < self.top {
-            self.stack[n..self.top].fill(Value::nil());
-        }
         self.top = n;
     }
 
     /// Replace the window at `bottom` with `values` and publish the new top.
-    pub fn set_window<I>(&mut self, bottom: usize, values: I)
+    pub(crate) fn set_window<I>(&mut self, bottom: usize, values: I)
     where
         I: IntoIterator<Item = Value<'gc>>,
         I::IntoIter: ExactSizeIterator,
@@ -343,7 +609,7 @@ impl<'gc> ThreadState<'gc> {
     }
 
     /// Move the window at `bottom` out, leaving `top == bottom`.
-    pub fn take_window(&mut self, bottom: usize) -> Vec<Value<'gc>> {
+    pub(crate) fn take_window(&mut self, bottom: usize) -> Vec<Value<'gc>> {
         let values = self.window(bottom).to_vec();
         self.set_top(bottom);
         values
@@ -353,7 +619,7 @@ impl<'gc> ThreadState<'gc> {
     /// convention wants the function immediately below its args, but a
     /// suspended callback leaves only args behind — this splices the function
     /// back in.
-    pub fn insert_at(&mut self, at: usize, v: Value<'gc>) {
+    pub(crate) fn insert_at(&mut self, at: usize, v: Value<'gc>) {
         debug_assert!(at <= self.top);
         self.ensure_slots(self.top + 1);
         self.stack.copy_within(at..self.top, at + 1);
@@ -366,7 +632,7 @@ impl<'gc> ThreadState<'gc> {
     /// live frame window and no in-flight native call sits above `n` — i.e. a
     /// thread being seeded, unwound, or terminated, never one with a native
     /// callback on the stack.
-    pub fn discard_above(&mut self, n: usize) {
+    pub(crate) fn discard_above(&mut self, n: usize) {
         debug_assert!(n <= self.stack.len());
         self.stack.truncate(n);
         self.top = n;
@@ -376,8 +642,9 @@ impl<'gc> ThreadState<'gc> {
 impl<'gc> Thread<'gc> {
     pub fn new(mc: &Mutation<'gc>) -> Self {
         let state = ThreadState {
-            stack: Vec::new(),
+            stack: ValueStack::new(),
             frames: Vec::new(),
+            exec_frames: Vec::new(),
             open_upvalues: Vec::new(),
             tbc_slots: Vec::new(),
             status: ThreadStatus::Stopped,
@@ -386,6 +653,7 @@ impl<'gc> Thread<'gc> {
             pending_action: None,
             yield_bottom: None,
             death_error: None,
+            stack_limit: STACK_LIMIT,
         };
         let thread = Thread(Gc::new(mc, RefLock::new(state)));
         // Store the back-reference
@@ -393,11 +661,11 @@ impl<'gc> Thread<'gc> {
         thread
     }
 
-    pub fn borrow(self) -> Ref<'gc, ThreadState<'gc>> {
+    pub(crate) fn borrow(self) -> Ref<'gc, ThreadState<'gc>> {
         self.0.borrow()
     }
 
-    pub fn borrow_mut(self, mc: &Mutation<'gc>) -> RefMut<'gc, ThreadState<'gc>> {
+    pub(crate) fn borrow_mut(self, mc: &Mutation<'gc>) -> RefMut<'gc, ThreadState<'gc>> {
         self.0.borrow_mut(mc)
     }
 
@@ -410,7 +678,7 @@ impl<'gc> Thread<'gc> {
         Gc::ptr_eq(self.0, other.0)
     }
 
-    pub fn inner(self) -> Gc<'gc, RefLock<ThreadState<'gc>>> {
+    pub(crate) fn inner(self) -> Gc<'gc, RefLock<ThreadState<'gc>>> {
         self.0
     }
 

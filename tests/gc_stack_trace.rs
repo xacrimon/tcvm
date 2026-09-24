@@ -14,16 +14,17 @@
 //! memory never comes back. `dead_stack_slots_are_reclaimed` measures that
 //! directly.
 
-use tcvm::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Value};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
 use tcvm::vm::sequence::CallbackAction;
-use tcvm::{Executor, LoadError, Lua, RuntimeError};
+use tcvm::{Context, Executor, LoadError, Lua, RuntimeError};
 
 /// Native that yields to its resumer (the host, when called on the main thread).
 fn yielder<'gc>(
-    _nctx: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    Ok(CallbackAction::Yield { then: None })
+    Ok(CallbackAction::yield_(None))
 }
 
 fn setup(src: &str) -> (Lua, tcvm::StashedExecutor) {

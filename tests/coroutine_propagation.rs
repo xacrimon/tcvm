@@ -17,24 +17,26 @@
 //!   * the assertion verifying `msg == "deep boom"` end-to-end (the
 //!     real two-level test, not the indirected "two-level" sentinel).
 
-use tcvm::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Value};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
 use tcvm::vm::sequence::CallbackAction;
-use tcvm::{Executor, LoadError, Lua};
+use tcvm::{Context, Executor, LoadError, Lua};
 
 fn deep_boomer<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    Err(Error::from_str(nctx.ctx, "deep boom"))
+    Err(Error::from_str(ctx, "deep boom"))
 }
 
 /// Always errors with a fixed payload. Stand-in for Lua's `error()`,
 /// used to re-raise from B once it sees its inner resume failed.
 fn always_err<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    Err(Error::from_str(nctx.ctx, "two-level"))
+    Err(Error::from_str(ctx, "two-level"))
 }
 
 #[test]

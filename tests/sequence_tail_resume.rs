@@ -5,7 +5,7 @@
 use std::pin::Pin;
 
 use tcvm::dmm::{Collect, Trace};
-use tcvm::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Thread, Value};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Thread, Value};
 use tcvm::lua::Context;
 use tcvm::vm::sequence::{BoxSequence, CallbackAction, Execution, Sequence, SequencePoll};
 use tcvm::{Executor, LoadError, Lua};
@@ -30,7 +30,7 @@ impl<'gc> Sequence<'gc> for TailResumeSeq<'gc> {
     fn poll(
         self: Pin<&mut Self>,
         _ctx: Context<'gc>,
-        _exec: Execution<'gc, '_>,
+        _exec: Execution<'gc>,
         mut stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
         // No args to forward.
@@ -42,13 +42,14 @@ impl<'gc> Sequence<'gc> for TailResumeSeq<'gc> {
 /// `forward(co)` tail-resumes `co`; whatever co returns goes straight
 /// to forward's caller (no post-processing).
 fn forward<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let target = stack.get(0).get_thread().expect("arg #1 is a coroutine");
     stack.replace(&[]);
-    let seq = BoxSequence::new(nctx.ctx.mutation(), TailResumeSeq { target });
-    Ok(CallbackAction::Sequence(seq))
+    let seq = BoxSequence::new(ctx.mutation(), TailResumeSeq { target });
+    Ok(CallbackAction::sequence(seq))
 }
 
 #[test]

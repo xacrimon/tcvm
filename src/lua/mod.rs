@@ -275,13 +275,14 @@ mod tests {
     // Native callback used by the native_* tests below. Integer add with an
     // arity/type check so we can also exercise the error path.
     fn native_add<'gc>(
-        nctx: crate::env::NativeContext<'gc, '_>,
+        ctx: Context<'gc>,
+        _closure: &crate::env::NativeClosure<'gc>,
         mut stack: crate::env::Stack<'gc, '_>,
     ) -> Result<crate::vm::sequence::CallbackAction<'gc>, crate::env::Error<'gc>> {
         let (a, b) = (stack.get(0), stack.get(1));
         let sum = match (a.get_integer(), b.get_integer()) {
-            (Some(x), Some(y)) => Value::integer(nctx.ctx.mutation(), x + y),
-            _ => return Err(crate::env::Error::from_str(nctx.ctx, "bad args")),
+            (Some(x), Some(y)) => Value::integer(ctx.mutation(), x + y),
+            _ => return Err(crate::env::Error::from_str(ctx, "bad args")),
         };
         stack.replace(&[sum]);
         Ok(crate::vm::sequence::CallbackAction::Return)
@@ -420,14 +421,15 @@ mod tests {
     // Native identity callback used as a `print`-shaped probe: returns its
     // first integer arg unchanged so we can assert results from the VM.
     fn native_id<'gc>(
-        nctx: crate::env::NativeContext<'gc, '_>,
+        ctx: Context<'gc>,
+        _closure: &crate::env::NativeClosure<'gc>,
         mut stack: crate::env::Stack<'gc, '_>,
     ) -> Result<crate::vm::sequence::CallbackAction<'gc>, crate::env::Error<'gc>> {
         let v = stack.get(0);
         let out = if v.get_integer().is_some() {
             v
         } else {
-            return Err(crate::env::Error::from_str(nctx.ctx, "bad args"));
+            return Err(crate::env::Error::from_str(ctx, "bad args"));
         };
         stack.replace(&[out]);
         Ok(crate::vm::sequence::CallbackAction::Return)

@@ -5,7 +5,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::Context;
 use crate::builtin::util;
-use crate::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Table, Value};
+use crate::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Value};
 use crate::vm::sequence::CallbackAction;
 
 /// `luaL_fileresult`-style outcome: `true` on success, `(nil, "msg", errno?)`
@@ -14,7 +14,7 @@ use crate::vm::sequence::CallbackAction;
 /// is given — `os.remove` passes the path, `os.rename` passes `None` (C calls
 /// `luaL_fileresult` with a NULL filename there, so no prefix).
 fn file_result<'gc>(
-    nctx: &NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
     stack: &mut Stack<'gc, '_>,
     res: std::io::Result<()>,
     fname: Option<&str>,
@@ -34,8 +34,8 @@ fn file_result<'gc>(
             let errno = e.raw_os_error().unwrap_or(0);
             stack.replace(&[
                 Value::nil(),
-                Value::string(LuaString::new(nctx.ctx, text.as_bytes())),
-                Value::integer(nctx.ctx.mutation(), errno as i64),
+                Value::string(LuaString::new(ctx, text.as_bytes())),
+                Value::integer(ctx.mutation(), errno as i64),
             ]);
         }
     }
@@ -87,17 +87,19 @@ pub fn load<'gc>(ctx: Context<'gc>) {
 /// `clock()` — seconds of program runtime as a float. Approximated by
 /// wall-clock elapsed since first call.
 fn lua_clock<'gc>(
-    _nctx: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     static START: OnceLock<Instant> = OnceLock::new();
     let start = START.get_or_init(Instant::now);
-    stack.replace(&[Value::float(start.elapsed().as_secs_f64())]);
+    stack.ret1(Value::float(start.elapsed().as_secs_f64()));
     Ok(CallbackAction::Return)
 }
 
 fn lua_date<'gc>(
-    _ctx: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
@@ -106,29 +108,31 @@ fn lua_date<'gc>(
 /// `difftime(t2, t1)` — `t2 - t1` in seconds. Lua 5.5 requires both arguments
 /// (5.3/5.4 defaulted `t1` to 0; that changed).
 fn lua_difftime<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     if stack.is_empty() {
         return Err(Error::from_str(
-            nctx.ctx,
+            ctx,
             "bad argument #1 to 'difftime' (number expected, got no value)",
         ));
     }
-    let t2 = util::check_number(nctx.ctx, stack.get(0), "difftime", 1)?;
+    let t2 = util::check_number(ctx, stack.get(0), "difftime", 1)?;
     if stack.len() < 2 {
         return Err(Error::from_str(
-            nctx.ctx,
+            ctx,
             "bad argument #2 to 'difftime' (number expected, got no value)",
         ));
     }
-    let t1 = util::check_number(nctx.ctx, stack.get(1), "difftime", 2)?;
-    stack.replace(&[Value::float(t2 - t1)]);
+    let t1 = util::check_number(ctx, stack.get(1), "difftime", 2)?;
+    stack.ret1(Value::float(t2 - t1));
     Ok(CallbackAction::Return)
 }
 
 fn lua_execute<'gc>(
-    _ctx: NativeContext<'gc, '_>,
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     todo!()
@@ -138,7 +142,8 @@ fn lua_execute<'gc>(
 /// (`true`→0, `false`→1), an integer status, or nil (0). The `close` flag is
 /// ignored (we always run normal process teardown).
 fn lua_exit<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let arg = stack.get(0);
@@ -149,7 +154,7 @@ fn lua_exit<'gc>(
     } else if arg.is_nil() {
         0
     } else {
-        util::check_integer(nctx.ctx, arg, "exit", 1)? as i32
+        util::check_integer(ctx, arg, "exit", 1)? as i32
     };
     use std::io::Write;
     let _ = std::io::stdout().flush();
@@ -159,65 +164,70 @@ fn lua_exit<'gc>(
 
 /// `getenv(name)` — the value of environment variable `name`, or nil.
 fn lua_getenv<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let name = check_str_arg(nctx.ctx, stack.get(0), "getenv", 1)?;
+    let name = check_str_arg(ctx, stack.get(0), "getenv", 1)?;
     // Look up by raw bytes (env vars/values needn't be UTF-8), matching C.
     let val = std::env::var_os(std::ffi::OsStr::from_bytes(name.as_bytes()));
     let result = match val {
-        Some(v) => Value::string(LuaString::new(nctx.ctx, v.as_os_str().as_bytes())),
+        Some(v) => Value::string(LuaString::new(ctx, v.as_os_str().as_bytes())),
         None => Value::nil(),
     };
-    stack.replace(&[result]);
+    stack.ret1(result);
     Ok(CallbackAction::Return)
 }
 
 /// `remove(filename)` — delete a file (or empty directory). Returns `true`, or
 /// `(nil, msg, errno)` on failure.
 fn lua_remove<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let name = check_str_arg(nctx.ctx, stack.get(0), "remove", 1)?;
+    let name = check_str_arg(ctx, stack.get(0), "remove", 1)?;
     let path = std::path::Path::new(std::ffi::OsStr::from_bytes(name.as_bytes()));
     // C `remove` deletes files and empty directories; try the file path first.
     let res = std::fs::remove_file(path).or_else(|_| std::fs::remove_dir(path));
     // `os.remove` passes the filename to `luaL_fileresult`, so it prefixes.
     let what = String::from_utf8_lossy(name.as_bytes());
-    file_result(&nctx, &mut stack, res, Some(&what));
+    file_result(ctx, &mut stack, res, Some(&what));
     Ok(CallbackAction::Return)
 }
 
 /// `rename(from, to)` — rename/move a file. Returns `true`, or
 /// `(nil, msg, errno)` on failure.
 fn lua_rename<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let from = check_str_arg(nctx.ctx, stack.get(0), "rename", 1)?;
-    let to = check_str_arg(nctx.ctx, stack.get(1), "rename", 2)?;
+    let from = check_str_arg(ctx, stack.get(0), "rename", 1)?;
+    let to = check_str_arg(ctx, stack.get(1), "rename", 2)?;
     let from_p = std::path::Path::new(std::ffi::OsStr::from_bytes(from.as_bytes()));
     let to_p = std::path::Path::new(std::ffi::OsStr::from_bytes(to.as_bytes()));
     let res = std::fs::rename(from_p, to_p);
     // Unlike `remove`, C's `os_rename` passes NULL to `luaL_fileresult`, so the
     // error message carries no filename prefix.
-    file_result(&nctx, &mut stack, res, None);
+    file_result(ctx, &mut stack, res, None);
     Ok(CallbackAction::Return)
 }
 
 fn lua_setlocale<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    Err(Error::from_str(nctx.ctx, "os.setlocale is not implemented"))
+    Err(Error::from_str(ctx, "os.setlocale is not implemented"))
 }
 
 /// `time([table])` — with no argument, the current Unix time as an integer.
 /// The table form (build a time from broken-down fields) needs timezone/DST
 /// handling and is deferred; see TODO(#27).
 fn lua_time<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let arg = stack.get(0);
@@ -226,16 +236,16 @@ fn lua_time<'gc>(
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        stack.replace(&[Value::integer(nctx.ctx.mutation(), now)]);
+        stack.ret1(Value::integer(ctx.mutation(), now));
         Ok(CallbackAction::Return)
     } else if arg.get_table().is_some() {
         Err(Error::from_str(
-            nctx.ctx,
+            ctx,
             "os.time with a table argument is not yet supported (needs timezone handling)",
         ))
     } else {
         Err(Error::from_str(
-            nctx.ctx,
+            ctx,
             &format!(
                 "bad argument #1 to 'time' (table expected, got {})",
                 arg.type_name()
@@ -246,14 +256,15 @@ fn lua_time<'gc>(
 
 /// `tmpname()` — a path usable as a temporary file name (not created here).
 fn lua_tmpname<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut path = std::env::temp_dir();
     path.push(format!("lua_{}_{n}", std::process::id()));
-    let s = LuaString::new(nctx.ctx, path.to_string_lossy().as_bytes());
-    stack.replace(&[Value::string(s)]);
+    let s = LuaString::new(ctx, path.to_string_lossy().as_bytes());
+    stack.ret1(Value::string(s));
     Ok(CallbackAction::Return)
 }

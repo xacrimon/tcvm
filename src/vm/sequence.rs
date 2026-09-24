@@ -15,7 +15,6 @@ use std::pin::Pin;
 use crate::dmm::{Collect, Gc, GcWeak, MetricsAlloc, Mutation, Trace};
 use crate::env::error::Error;
 use crate::env::function::Stack;
-use crate::env::thread::Frame;
 use crate::env::{Function, Thread};
 
 /// What a [`Sequence::poll`] (or `error`) call requests of the executor next.
@@ -50,11 +49,43 @@ pub enum SequencePoll<'gc> {
 }
 
 /// What a native callback requests of the executor on return.
+///
+/// `Return` is the hot path and must stay cheap to hand back: the suspension
+/// payloads are boxed so `Result<CallbackAction, Error>` is two words and
+/// crosses the native boundary in registers. A suspension already leaves the
+/// interpreter and goes through the executor, so its allocation is noise.
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub enum CallbackAction<'gc> {
     /// Plain synchronous return. Stack values above `bottom` are the results.
     Return,
+    /// Hand control to the executor; see [`Suspend`].
+    Suspend(Box<Suspend<'gc>>),
+}
+
+impl<'gc> CallbackAction<'gc> {
+    pub fn sequence(seq: BoxSequence<'gc>) -> Self {
+        CallbackAction::Suspend(Box::new(Suspend::Sequence(seq)))
+    }
+
+    pub fn call(then: Option<BoxSequence<'gc>>) -> Self {
+        CallbackAction::Suspend(Box::new(Suspend::Call { then }))
+    }
+
+    pub fn yield_(then: Option<BoxSequence<'gc>>) -> Self {
+        CallbackAction::Suspend(Box::new(Suspend::Yield { then }))
+    }
+
+    pub fn resume(thread: Thread<'gc>, then: Option<BoxSequence<'gc>>) -> Self {
+        CallbackAction::Suspend(Box::new(Suspend::Resume { thread, then }))
+    }
+}
+
+/// The suspension requests of [`CallbackAction`]; the executor driver
+/// translates them into frame-stack operations.
+#[derive(Collect)]
+#[collect(internal, no_drop)]
+pub enum Suspend<'gc> {
     /// Become a multi-step sequence. The pushed sequence will be polled
     /// repeatedly until it completes / yields / resumes.
     Sequence(BoxSequence<'gc>),
@@ -75,35 +106,24 @@ pub enum CallbackAction<'gc> {
     },
 }
 
-/// Read-only view of the executor that is passed to a native callback or
-/// sequence poll. Carries the currently-running thread and its call
-/// frames; richer fields (full `&[Thread<'gc>]` thread stack, fuel handle)
-/// aren't implemented yet.
+/// Read-only view of the executor, passed to a sequence poll and reached from
+/// a native callback through [`Stack::exec`]. Carries the currently-running
+/// thread; richer fields (full `&[Thread<'gc>]` thread stack, fuel handle)
+/// aren't implemented yet. The running thread's frames are reached through
+/// [`Stack::lua_frames`], which already borrows the thread.
 #[derive(Clone, Copy)]
-pub struct Execution<'gc, 'a> {
+pub struct Execution<'gc> {
     current_thread: Thread<'gc>,
-    frames: &'a [Frame<'gc>],
 }
 
-impl<'gc, 'a> Execution<'gc, 'a> {
-    pub fn new(current_thread: Thread<'gc>, frames: &'a [Frame<'gc>]) -> Self {
-        Execution {
-            current_thread,
-            frames,
-        }
+impl<'gc> Execution<'gc> {
+    pub fn new(current_thread: Thread<'gc>) -> Self {
+        Execution { current_thread }
     }
 
     /// Thread the native callback / sequence is running on top of.
     pub fn current_thread(self) -> Thread<'gc> {
         self.current_thread
-    }
-
-    /// The running thread's call frames, innermost last. Hidden because it
-    /// exposes the raw `Frame` layout; for tests and the debug library, which
-    /// can't borrow the thread themselves while a native call holds it.
-    #[doc(hidden)]
-    pub fn frames(self) -> &'a [Frame<'gc>] {
-        self.frames
     }
 
     /// Whether the running thread is the executor's main (entry) thread.
@@ -133,7 +153,7 @@ pub trait Sequence<'gc>: 'gc {
     fn poll(
         self: Pin<&mut Self>,
         ctx: crate::lua::Context<'gc>,
-        exec: Execution<'gc, '_>,
+        exec: Execution<'gc>,
         stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>>;
 
@@ -142,7 +162,7 @@ pub trait Sequence<'gc>: 'gc {
     fn error(
         self: Pin<&mut Self>,
         _ctx: crate::lua::Context<'gc>,
-        _exec: Execution<'gc, '_>,
+        _exec: Execution<'gc>,
         err: Error<'gc>,
         _stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
@@ -195,7 +215,7 @@ macro_rules! __seq_trace_pointers {
 pub use __seq_trace_pointers as seq_trace_pointers;
 
 /// Owning, pinned, GC-traced handle to a [`Sequence`]. Stored on a thread's
-/// frame stack as part of `Frame::Sequence`.
+/// frame stack as part of `ExecKind::Sequence`.
 ///
 /// The allocator is intentionally `MetricsAlloc<'static>` (not `'gc`-branded):
 /// `MetricsAlloc`'s `'gc` brand is artificial — it carries only a `Metrics`
@@ -234,7 +254,7 @@ impl<'gc> BoxSequence<'gc> {
     pub fn poll(
         &mut self,
         ctx: crate::lua::Context<'gc>,
-        exec: Execution<'gc, '_>,
+        exec: Execution<'gc>,
         stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
         self.0.as_mut().poll(ctx, exec, stack)
@@ -249,7 +269,7 @@ impl<'gc> BoxSequence<'gc> {
     pub fn error(
         &mut self,
         ctx: crate::lua::Context<'gc>,
-        exec: Execution<'gc, '_>,
+        exec: Execution<'gc>,
         err: Error<'gc>,
         stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {

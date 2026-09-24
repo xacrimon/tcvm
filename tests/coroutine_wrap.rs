@@ -2,9 +2,9 @@
 //! coroutine on each call: yields propagate as return values, errors
 //! rethrow (in contrast to `resume`'s catch-and-wrap behavior).
 
-use tcvm::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Value};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
 use tcvm::vm::sequence::CallbackAction;
-use tcvm::{Executor, LoadError, Lua, RuntimeError};
+use tcvm::{Context, Executor, LoadError, Lua, RuntimeError};
 
 /// Wrap a generator that yields ascending values then returns. Each
 /// invocation of the wrapper drives one resume cycle; values surface
@@ -33,10 +33,11 @@ fn wrap_happy_path_yields_then_returns() {
 }
 
 fn boomer<'gc>(
-    nctx: NativeContext<'gc, '_>,
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    Err(Error::from_str(nctx.ctx, "boom"))
+    Err(Error::from_str(ctx, "boom"))
 }
 
 /// A wrapped function that errors propagates the error to the wrap-caller

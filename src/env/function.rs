@@ -1,10 +1,12 @@
 use crate::Context;
-use crate::dmm::{Collect, Gc, Lock, Mutation, RefLock};
+use crate::dmm::{Collect, Gc, Lock, Mutation, RefLock, Trace};
 use crate::env::error::Error;
 use crate::env::shape::Shape;
 use crate::env::string::LuaString;
+use crate::env::thread::ThreadState;
 use crate::env::value::Value;
 use crate::instruction::UpValueDescriptor;
+use crate::vm::interp::{Handler, op_call_native};
 use crate::vm::sequence::{CallbackAction, Execution};
 
 /// Debug record for a local register: active for `start_pc <= pc < end_pc`.
@@ -109,11 +111,28 @@ pub enum UpvalueState<'gc> {
 pub type Upvalue<'gc> = Gc<'gc, RefLock<UpvalueState<'gc>>>;
 
 /// A Lua closure (bytecode + upvalues).
-#[derive(Collect)]
-#[collect(internal, no_drop)]
 pub struct LuaClosure<'gc> {
     pub proto: Gc<'gc, Prototype<'gc>>,
     pub upvalues: Box<[Upvalue<'gc>]>,
+    // Copies of the `proto` fields CALL needs, so entering a function is one
+    // dependent load shorter (closure -> code, not closure -> proto -> code).
+    // The pointers stay valid because `proto` is immutable and kept alive by
+    // this closure; they are not traced (the `Gc` above is).
+    pub code: *const crate::instruction::Instruction,
+    pub constants: *const Value<'gc>,
+    pub ic_table: *const Lock<InlineCache<'gc>>,
+    pub max_stack_size: u8,
+    pub num_params: u8,
+    pub is_vararg: bool,
+}
+
+// SAFETY: `proto` and `upvalues` are the only owned Gc pointers; the raw
+// pointers alias data owned by `proto`.
+unsafe impl<'gc> Collect<'gc> for LuaClosure<'gc> {
+    fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
+        cc.trace(&self.proto);
+        cc.trace(&self.upvalues);
+    }
 }
 
 /// A native closure (Rust function + optional upvalues).
@@ -123,31 +142,41 @@ pub struct NativeClosure<'gc> {
     #[collect(require_static)]
     pub function: NativeFn,
     pub upvalues: Box<[Value<'gc>]>,
+    /// What CALL and TAILCALL jump to: `op_call_native`, or for a builtin with
+    /// a fast path its own entry (LuaJIT's `ff_*`), which handles the common
+    /// argument shape inline, never errors, and leaves every other shape to
+    /// `op_call_native`, so `function` stays the complete implementation. An
+    /// entry must check the opcode: after a TAILCALL it returns its results
+    /// from the frame instead of dispatching the next instruction.
+    #[collect(require_static)]
+    pub(crate) entry: Handler,
 }
 
 /// Signature of a native callback invoked by the VM on `CALL` / `TAILCALL`.
+///
+/// `closure` is the callback's own closure, which carries its upvalues; the
+/// running thread is `stack.exec()`. Three arguments rather than one context
+/// struct, because a struct wider than two words is passed through memory.
 ///
 /// Arguments are read from the `Stack` view; return values are produced by
 /// leaving them on the stack above `bottom`. The returned [`CallbackAction`]
 /// tells the executor what to do next:
 ///   - `Return` keeps the hot path (sync return, results in the stack window).
-///   - `Sequence`, `Call`, `Yield`, `Resume` are the suspension paths handled
-///     by the executor's driver loop.
+///   - `Suspend` (see [`CallbackAction::call`] and its siblings) is handled by
+///     the executor's driver loop.
 ///
 /// On error, return [`Error`] (any Lua value); the executor unwinds Lua
 /// frames until a `Sequence` catcher (e.g. `pcall`) handles it, or surfaces
 /// it to the host as `RuntimeError::Lua`.
 pub type NativeFn = for<'gc, 'a> fn(
-    ctx: NativeContext<'gc, 'a>,
+    ctx: Context<'gc>,
+    closure: &'a NativeClosure<'gc>,
     stack: Stack<'gc, 'a>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>>;
 
-/// Contextual handles passed to a native callback alongside its `Stack`.
-pub struct NativeContext<'gc, 'a> {
-    pub ctx: Context<'gc>,
-    pub upvalues: &'a [Value<'gc>],
-    pub exec: Execution<'gc, 'a>,
-}
+// A (tag, pointer) pair, returned in registers; a wider result goes through
+// memory and the `Return` case has to be read back from it.
+const _: () = assert!(std::mem::size_of::<Result<CallbackAction<'static>, Error<'static>>>() == 16);
 
 /// A mutable view into the running thread's value stack, spanning
 /// `stack[bottom..*top]`. The callback sees `stack[0..len()]` as its
@@ -162,30 +191,37 @@ pub struct NativeContext<'gc, 'a> {
 /// decoupling the window from the shared vec so a native call can never
 /// truncate it below an outer frame's register window.
 pub struct Stack<'gc, 'a> {
-    values: &'a mut Vec<Value<'gc>>,
-    /// Authoritative logical top (an alias of `thread.top`). Mutators
-    /// update it; read accessors bound by it.
-    top: &'a mut usize,
+    /// The owning thread: `thread.stack` is the storage and `thread.top` the
+    /// authoritative logical top. One reference rather than two so the view
+    /// is two words and is passed to natives in registers.
+    thread: &'a mut ThreadState<'gc>,
     bottom: usize,
 }
 
 impl<'gc, 'a> Stack<'gc, 'a> {
     #[inline]
-    pub(crate) fn new(values: &'a mut Vec<Value<'gc>>, top: &'a mut usize, bottom: usize) -> Self {
-        debug_assert!(bottom <= *top && *top <= values.len());
-        Stack {
-            values,
-            top,
-            bottom,
-        }
+    pub(crate) fn new(thread: &'a mut ThreadState<'gc>, bottom: usize) -> Self {
+        debug_assert!(bottom <= thread.top && thread.top <= thread.stack.len());
+        Stack { thread, bottom }
     }
 
-    /// Destructure the borrowed view back into its underlying parts. Used
-    /// by `async_sequence` to ferry the live stack (and logical top)
-    /// through a `SharedSlot`.
+    /// Give the thread back. Used by `async_sequence` to ferry the live
+    /// stack through a `SharedSlot`.
     #[inline]
-    pub(crate) fn into_parts(self) -> (&'a mut Vec<Value<'gc>>, &'a mut usize, usize) {
-        (self.values, self.top, self.bottom)
+    pub(crate) fn into_parts(self) -> (&'a mut ThreadState<'gc>, usize) {
+        (self.thread, self.bottom)
+    }
+
+    /// The thread this stack belongs to, for the executor's own sequences.
+    #[inline]
+    pub(crate) fn thread_mut(&mut self) -> &mut ThreadState<'gc> {
+        self.thread
+    }
+
+    /// The executor state of the thread this stack belongs to.
+    #[inline]
+    pub fn exec(&self) -> Execution<'gc> {
+        Execution::new(self.thread.handle())
     }
 
     /// Stack-bottom index relative to the underlying vec.
@@ -196,12 +232,12 @@ impl<'gc, 'a> Stack<'gc, 'a> {
 
     #[inline]
     pub fn len(&self) -> usize {
-        *self.top - self.bottom
+        self.thread.top - self.bottom
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        *self.top == self.bottom
+        self.thread.top == self.bottom
     }
 
     /// Read the value at index `i` within the callback's window, or `Nil`
@@ -210,8 +246,10 @@ impl<'gc, 'a> Stack<'gc, 'a> {
     #[inline]
     pub fn get(&self, i: usize) -> Value<'gc> {
         let idx = self.bottom + i;
-        if idx < *self.top {
-            self.values[idx]
+        if idx < self.thread.top {
+            // `top <= values.len()` is rule 1 of the stack invariant.
+            debug_assert!(idx < self.thread.stack.len());
+            unsafe { *self.thread.stack.get_unchecked(idx) }
         } else {
             Value::nil()
         }
@@ -219,31 +257,27 @@ impl<'gc, 'a> Stack<'gc, 'a> {
 
     #[inline]
     pub fn as_slice(&self) -> &[Value<'gc>] {
-        &self.values[self.bottom..*self.top]
+        &self.thread.stack[self.bottom..self.thread.top]
     }
 
     #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [Value<'gc>] {
-        &mut self.values[self.bottom..*self.top]
+        &mut self.thread.stack[self.bottom..self.thread.top]
     }
 
-    /// Discard everything in the window (args included). Lowers the logical top
-    /// without shrinking the backing vec; the discarded slots are nil-filled,
-    /// since leaving them set would let the GC trace still reach them.
+    /// Discard everything in the window (args included). Lowers the logical
+    /// top without shrinking the backing vec.
     #[inline]
     pub fn clear(&mut self) {
-        self.values[self.bottom..*self.top].fill(Value::nil());
-        *self.top = self.bottom;
+        self.thread.top = self.bottom;
     }
 
     #[inline]
     pub fn push(&mut self, v: Value<'gc>) {
-        if *self.top == self.values.len() {
-            self.values.push(v);
-        } else {
-            self.values[*self.top] = v;
-        }
-        *self.top += 1;
+        let top = self.thread.top;
+        self.thread.ensure_slots(top + 1);
+        self.thread.stack[top] = v;
+        self.thread.top = top + 1;
     }
 
     #[inline]
@@ -257,40 +291,61 @@ impl<'gc, 'a> Stack<'gc, 'a> {
     #[inline]
     pub fn insert(&mut self, i: usize, v: Value<'gc>) {
         let at = self.bottom + i;
-        debug_assert!(at <= *self.top);
-        if *self.top == self.values.len() {
-            self.values.push(Value::nil());
-        }
-        self.values.copy_within(at..*self.top, at + 1);
-        self.values[at] = v;
-        *self.top += 1;
+        let top = self.thread.top;
+        debug_assert!(at <= top);
+        self.thread.ensure_slots(top + 1);
+        self.thread.stack.copy_within(at..top, at + 1);
+        self.thread.stack[at] = v;
+        self.thread.top += 1;
     }
 
     /// Remove the value at `i`, shifting `stack[i + 1..]` down one.
     #[inline]
     pub fn remove(&mut self, i: usize) {
         let at = self.bottom + i;
-        debug_assert!(at < *self.top);
-        self.values.copy_within(at + 1..*self.top, at);
-        *self.top -= 1;
-        self.values[*self.top] = Value::nil();
+        let top = self.thread.top;
+        debug_assert!(at < top);
+        self.thread.stack.copy_within(at + 1..top, at);
+        self.thread.top -= 1;
     }
 
     /// Drop everything above the first `n` values (no-op if shorter).
     #[inline]
     pub fn truncate(&mut self, n: usize) {
         let at = self.bottom + n;
-        if at < *self.top {
-            self.values[at..*self.top].fill(Value::nil());
-            *self.top = at;
+        if at < self.thread.top {
+            self.thread.top = at;
         }
     }
 
-    /// Convenience for the common "clear args, push N results" pattern.
+    /// The running thread's Lua frames, innermost last. Hidden: a hook for
+    /// tests and the debug library.
+    #[doc(hidden)]
+    pub fn lua_frames(&self) -> &[crate::env::thread::LuaFrame<'gc>] {
+        &self.thread.frames
+    }
+
+    /// Replace the whole window (args included) with `values`: the common
+    /// "return these" shape. Results overwrite the args in place.
     #[inline]
     pub fn replace(&mut self, values: &[Value<'gc>]) {
-        self.clear();
-        self.extend(values.iter().copied());
+        let end = self.bottom + values.len();
+        self.thread.ensure_slots(end);
+        for (i, v) in values.iter().enumerate() {
+            self.thread.stack[self.bottom + i] = *v;
+        }
+        self.thread.top = end;
+    }
+
+    /// `replace(&[v])` without going through memory: a by-value `Value` stays
+    /// in a register, whereas a one-element slice is spilled to the stack and
+    /// read back through a pointer, with a copy loop around it.
+    #[inline(always)]
+    pub fn ret1(&mut self, v: Value<'gc>) {
+        let end = self.bottom + 1;
+        self.thread.ensure_slots(end);
+        self.thread.stack[self.bottom] = v;
+        self.thread.top = end;
     }
 }
 
@@ -299,8 +354,8 @@ impl<'gc, 'a> std::ops::Index<usize> for Stack<'gc, 'a> {
     #[inline]
     fn index(&self, i: usize) -> &Value<'gc> {
         let idx = self.bottom + i;
-        debug_assert!(idx < *self.top);
-        &self.values[idx]
+        debug_assert!(idx < self.thread.top);
+        &self.thread.stack[idx]
     }
 }
 
@@ -312,8 +367,43 @@ pub struct Function<'gc>(Gc<'gc, FunctionKind<'gc>>);
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub enum FunctionKind<'gc> {
-    Lua(Gc<'gc, LuaClosure<'gc>>),
+    /// Inline, not behind another `Gc`: CALL reaches the closure's `code`
+    /// with one load fewer.
+    Lua(LuaClosure<'gc>),
     Native(NativeClosure<'gc>),
+}
+
+/// A `Function` known to hold a Lua closure. Derefs to the closure without
+/// re-checking the kind, so frames can keep one pointer and still reach
+/// `proto`, `upvalues` and the CALL-path copies directly.
+#[derive(Clone, Copy, Collect)]
+#[collect(internal, no_drop)]
+pub struct LuaFn<'gc>(Gc<'gc, FunctionKind<'gc>>);
+
+impl<'gc> LuaFn<'gc> {
+    /// # Safety
+    /// `f` must hold `FunctionKind::Lua`.
+    #[inline(always)]
+    pub unsafe fn from_function_unchecked(f: Function<'gc>) -> Self {
+        debug_assert!(matches!(&*f.0, FunctionKind::Lua(_)));
+        LuaFn(f.0)
+    }
+
+    pub fn function(self) -> Function<'gc> {
+        Function(self.0)
+    }
+}
+
+impl<'gc> std::ops::Deref for LuaFn<'gc> {
+    type Target = LuaClosure<'gc>;
+    #[inline(always)]
+    fn deref(&self) -> &LuaClosure<'gc> {
+        match &*self.0 {
+            FunctionKind::Lua(c) => c,
+            // SAFETY: the constructor's contract.
+            FunctionKind::Native(_) => unsafe { std::hint::unreachable_unchecked() },
+        }
+    }
 }
 
 impl<'gc> Function<'gc> {
@@ -322,20 +412,43 @@ impl<'gc> Function<'gc> {
         proto: Gc<'gc, Prototype<'gc>>,
         upvalues: Box<[Upvalue<'gc>]>,
     ) -> Self {
-        let closure = Gc::new(mc, LuaClosure { proto, upvalues });
+        let closure = LuaClosure {
+            proto,
+            upvalues,
+            code: proto.code.as_ptr(),
+            constants: proto.constants.as_ptr(),
+            ic_table: proto.ic_table.as_ptr(),
+            max_stack_size: proto.max_stack_size,
+            num_params: proto.num_params,
+            is_vararg: proto.is_vararg,
+        };
         Function(Gc::new(mc, FunctionKind::Lua(closure)))
     }
 
     pub fn new_native(mc: &Mutation<'gc>, function: NativeFn, upvalues: Box<[Value<'gc>]>) -> Self {
+        Self::new_native_with_entry(mc, function, upvalues, op_call_native)
+    }
+
+    /// A native whose CALLs go to `entry` (see `NativeClosure::entry`).
+    pub(crate) fn new_native_with_entry(
+        mc: &Mutation<'gc>,
+        function: NativeFn,
+        upvalues: Box<[Value<'gc>]>,
+        entry: Handler,
+    ) -> Self {
         Function(Gc::new(
             mc,
-            FunctionKind::Native(NativeClosure { function, upvalues }),
+            FunctionKind::Native(NativeClosure {
+                function,
+                upvalues,
+                entry,
+            }),
         ))
     }
 
-    pub fn as_lua(self) -> Option<Gc<'gc, LuaClosure<'gc>>> {
+    pub fn as_lua(self) -> Option<LuaFn<'gc>> {
         match &*self.0 {
-            FunctionKind::Lua(cl) => Some(*cl),
+            FunctionKind::Lua(_) => Some(LuaFn(self.0)),
             _ => None,
         }
     }
