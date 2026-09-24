@@ -56,7 +56,8 @@ pub struct LuaFrame<'gc> {
     pub(crate) num_results: u8,
     /// `frame_flags` bits. Zero means RETURN can take its fast path: fixed
     /// results land in a Lua caller with nothing to close and no continuation.
-    /// Only ever set, never cleared (a stale bit just costs the slow path).
+    /// Mostly left set once the hazard is gone (a stale bit just costs the slow
+    /// path); a slow TAILCALL clears `OPEN_UPVALUES` after closing them.
     pub(crate) flags: u8,
     /// Caller-supplied args beyond `num_params`; the below-base region is
     /// `stack[base - num_extras .. base]`. Set by `VARARGPREP`, else 0.
@@ -96,7 +97,8 @@ pub struct CallSite {
 
 /// Bits of `LuaFrame::flags`.
 pub mod frame_flags {
-    /// `continuation` is `Some`: RETURN must hand results to `cont_resume`.
+    /// `continuation` is `Some`: RETURN must apply it (`op_return_cont` or
+    /// `cont_resume`).
     pub const HAS_CONT: u8 = 1;
     /// A CLOSURE in this frame captured one of its locals; RETURN must close.
     pub const OPEN_UPVALUES: u8 = 2;
@@ -231,10 +233,10 @@ pub struct ThreadState<'gc> {
     pub(crate) top: usize,
     /// Back-reference to the owning Thread handle, needed for creating open upvalues.
     pub(crate) thread_handle: Option<Thread<'gc>>,
-    /// A native callback's non-`Return` `CallbackAction` deposited by
-    /// `op_call`/`op_tailcall` and consumed by the executor driver loop on
-    /// the next pump. `None` between pumps. The interpreter never observes
-    /// this (it bails out via `return Ok(())` immediately after setting it).
+    /// A native callback's `Suspend` request, deposited by the interpreter's
+    /// native-call paths and consumed by the executor driver loop on the next
+    /// pump. `None` between pumps. The interpreter never observes this (it
+    /// leaves dispatch right after setting it).
     pub(crate) pending_action: Option<PendingAction<'gc>>,
     /// Where the thread's yielded values currently live. Set when the
     /// thread suspends via a `Yield` action (or a sequence's

@@ -922,9 +922,10 @@ fn apply_native_continuation<'gc>(
     }
 
     // The payload is applied, so the staging window (`meta_fn` + args + results,
-    // all parked at `caller_top..`) is spent: drop it, which nils it. Doubles as
-    // the guarantee that the caller's register window is physically covered
-    // before the interpreter re-derives its raw register pointer off `base`.
+    // all parked at `caller_top..`) is spent: lower `top` below it. `set_top`
+    // doubles as the guarantee that the caller's register window is physically
+    // covered before the interpreter re-derives its raw register pointer off
+    // `base`.
     let caller_top = {
         let frame = ts.top_lua().unwrap();
         frame.base() + frame.closure.proto.max_stack_size as usize

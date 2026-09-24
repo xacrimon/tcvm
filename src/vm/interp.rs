@@ -419,11 +419,11 @@ macro_rules! helpers {
 
 /// Applies a [`Continuation`]'s payload given its returned values at
 /// `stack[results_base .. results_base + nret]`, then dispatches. Shared by
-/// the Lua-return path (`cont_resume`, after popping the callee frame) and the
-/// synchronous-native path (`invoke_metamethod!`, with the caller frame still
-/// current). Expects `helpers!(...)` to have run in the enclosing handler so
-/// `reg!` / `dispatch!` resolve; `$registers` / `$ip` must already be bound to
-/// the *caller's* window.
+/// the Lua-return paths (`op_return_cont` and `cont_resume`, after popping the
+/// callee frame) and the synchronous-native path (`invoke_metamethod!`, with
+/// the caller frame still current). Expects `helpers!(...)` to have run in the
+/// enclosing handler so `reg!` / `dispatch!` resolve; `$registers` / `$ip` must
+/// already be bound to the *caller's* window.
 macro_rules! apply_cont_payload {
     ($cont:expr, $results_base:expr, $nret:expr,
      $ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr, $ds:ident) => {{
@@ -453,8 +453,7 @@ macro_rules! apply_cont_payload {
             }
             Continuation::TForCall { base, count } => {
                 // Destination registers are `base+3 .. base+3+count`; they must
-                // fit u8 register space, which bounds `count <= 253` (so the
-                // `count + 1` in the suspend path can't overflow `u8`).
+                // fit u8 register space.
                 debug_assert!(
                     base as usize + 3 + count as usize <= u8::MAX as usize + 1,
                     "TFORCALL destination range exceeds u8 register space",
@@ -3035,8 +3034,8 @@ extern "rust-preserve-none" fn op_tailcall_slow<'gc>(
             }
             // Close upvalues before overwriting these slots with args, so an
             // open upvalue keeps referencing the local, not the arg value.
-            // `TBC` stays set: luac never emits TAILCALL in a `<close>` scope,
-            // and ours doing so is a compiler bug this can't paper over.
+            // `TBC` stays set: luac never emits TAILCALL in a `<close>` scope;
+            // ours still does (#188), which this can't paper over.
             close_upvalues(ctx.mutation(), thread, new_base);
             unsafe { (*frame).flags &= !frame_flags::OPEN_UPVALUES };
             tailcall_lua!(
@@ -4048,8 +4047,8 @@ fn write_upvalue<'gc>(
 /// chain (call, suspension, error), so the executor re-enters at the
 /// instruction after the one at `ip` and `debug::frame_line` can locate it.
 ///
-/// SAFETY: `ip` points into the proto's `code` (the handler chain only ever
-/// advances it within that slice), so the offset is in bounds.
+/// `ip` points into the proto's `code` (the handler chain only ever advances
+/// it within that slice), which `LuaFrame::pc_index` relies on.
 #[inline]
 fn save_pc<'gc>(thread: &mut ThreadState<'gc>, ip: *const Instruction) {
     if let Some(frame) = thread.top_lua_mut() {
@@ -4105,9 +4104,9 @@ pub(crate) enum FrameReturn {
         new_ip: *const Instruction,
     },
     /// The popped Lua frame's parent is a non-Lua frame (Sequence /
-    /// WaitThread / Start / Error). The values have been left at
-    /// `stack[bottom..]` for the executor's driver loop to consume on the
-    /// next pump. `op_return` returns to exit dispatch.
+    /// WaitThread / Start / Error). The values have been left at the frame's
+    /// function slot, up to `top`, for the executor's driver loop to consume
+    /// on the next pump. `op_return_slow` returns to exit dispatch.
     ToNonLua,
 }
 
@@ -4712,13 +4711,13 @@ fn schedule_native_meta_call<'gc>(
     }
 }
 
-/// The single continuation entry point, tail-called by `op_return` /
-/// `op_tailcall` once a frame carrying a [`Continuation`] returns. Pops the
-/// callee frame, restores the caller's `ip`/`registers`, then applies the
-/// payload to the results `frame_return` left at the callee's function slot.
-/// The synchronous-native path in `invoke_metamethod!` applies the same
-/// payload via `apply_cont_payload!` without this frame teardown, since no
-/// callee frame exists there.
+/// Where `op_return_slow` goes once `frame_return` has handled a frame carrying
+/// a [`Continuation`] (MULTRET, or something to close); `op_return_cont`
+/// covers the rest. Pops the callee frame, restores the caller's
+/// `ip`/`registers`, then applies the payload to the results `frame_return`
+/// left at the callee's function slot. The synchronous-native path in
+/// `invoke_metamethod!` applies the same payload via `apply_cont_payload!`
+/// without this frame teardown, since no callee frame exists there.
 #[inline(never)]
 #[rustc_align(32)]
 // The incoming `ip`, `registers` and `closure` belong to the popped frame.

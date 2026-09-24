@@ -258,8 +258,9 @@ pub(crate) fn basic_tostring<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> LuaString
 
 /// Coerce `v` to a float, mirroring `luaL_checknumber` (numeric strings
 /// included). `fname`/`n` build the standard bad-argument message on failure.
-/// The float case is inlined; everything else (ints, strings, the `format!`)
-/// stays out of line so callers like `math.sqrt` stay small.
+/// Floats and small integers are inlined; everything else (boxed integers,
+/// strings, the `format!`) stays out of line so callers like `math.sqrt` stay
+/// small.
 #[inline(always)]
 pub(crate) fn check_number<'gc>(
     ctx: Context<'gc>,
