@@ -2792,10 +2792,106 @@ extern "rust-preserve-none" fn op_call_meta<'gc>(
     }
 }
 
+/// Replace the running frame with a Lua `callee` whose arguments sit at
+/// `stack[func_idx + 1..]`, and continue in it. The frame keeps its
+/// `num_results`, continuation and flags: the callee returns to this frame's
+/// caller on its behalf. Expects the callee's window to fit the stack.
+macro_rules! tailcall_lua {
+    ($callee:expr, $func_idx:expr, $nargs:expr,
+     $thread:ident, $registers:ident, $ip:ident, $frame:ident, $closure:ident) => {{
+        let callee: LuaFn<'gc> = $callee;
+        // The results go to this frame's function slot in its caller, below
+        // any varargs VARARGPREP moved `base` past.
+        let new_base = unsafe { (*$frame).base() - (*$frame).num_extras as usize };
+        debug_assert!($thread.stack.len() >= new_base + callee.max_stack_size as usize);
+        let src = $func_idx + 1;
+        // `nargs == 0` is MULTRET: read the count from `thread.top`.
+        let nargs = if $nargs == 0 {
+            $thread.top - src
+        } else {
+            $nargs as usize - 1
+        };
+        let num_params = callee.num_params as usize;
+        let stack = $thread.stack.as_mut_ptr();
+        // `new_base < src`, so a forward copy is safe for the overlap.
+        unsafe {
+            copy_values(stack.add(new_base), stack.add(src), nargs);
+            fill_nil(
+                stack.add(new_base + nargs),
+                num_params.saturating_sub(nargs),
+            );
+        }
+        $ip = callee.code;
+        let frame = unsafe { &mut *$frame };
+        frame.closure = callee;
+        frame.pc = $ip;
+        frame.set_base(new_base);
+        frame.num_extras = if callee.is_vararg {
+            nargs.saturating_sub(num_params) as u32
+        } else {
+            0
+        };
+        $closure = callee;
+        $registers = unsafe { stack.add(new_base) };
+        dispatch!();
+    }};
+}
+
 /// return R[func](R[func+1], ..., R[func+args-1])  — tail call
+///
+/// Fast path: a plain Lua callee whose window fits, from a frame with nothing
+/// to close. Every other shape goes to `op_tailcall_slow`.
 #[inline(never)]
 #[rustc_align(32)]
 extern "rust-preserve-none" fn op_tailcall<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let (func, nargs) = instruction.ab();
+    if let Some(f) = reg!(func).get_function()
+        && let FunctionKind::Lua(target) = f.inner().as_ref()
+    {
+        let (base, num_extras, flags) = unsafe {
+            (
+                (*frame).base(),
+                (*frame).num_extras as usize,
+                (*frame).flags,
+            )
+        };
+        let needed = base - num_extras + target.max_stack_size as usize;
+        if std::hint::likely(
+            flags & (frame_flags::OPEN_UPVALUES | frame_flags::TBC) == 0
+                && thread.stack.len() >= needed,
+        ) {
+            let callee = unsafe { LuaFn::from_function_unchecked(f) };
+            tailcall_lua!(
+                callee,
+                base + func as usize,
+                nargs,
+                thread,
+                registers,
+                ip,
+                frame,
+                closure
+            );
+        }
+    }
+    tail!(op_tailcall_slow);
+}
+
+/// TAILCALL through a `__call` chain, into a native, or from a frame that
+/// must close upvalues or grow the stack first.
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn op_tailcall_slow<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
@@ -2816,48 +2912,19 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
 
     match target {
         CallTarget::Lua(callee) => {
-            // Results must land in this frame's *original* func slot in its
-            // caller. A vararg frame's VARARGPREP shifted base past the extras
-            // at `[base - num_extras .. base]`, so that slot is below them.
-            let (cur_base, cur_num_extras) =
-                unsafe { ((*frame).base(), (*frame).num_extras as usize) };
-            let caller_func_idx = cur_base - 1 - cur_num_extras;
-            let new_base = caller_func_idx + 1;
-            if !thread.ensure_frame_slots(new_base + callee.proto.max_stack_size as usize) {
+            let new_base = base - unsafe { (*frame).num_extras as usize };
+            if !thread.ensure_frame_slots(new_base + callee.max_stack_size as usize) {
                 raise!(OpError::StackOverflow);
             }
             // Close upvalues before overwriting these slots with args, so an
             // open upvalue keeps referencing the local, not the arg value.
+            // `TBC` stays set: luac never emits TAILCALL in a `<close>` scope,
+            // and ours doing so is a compiler bug this can't paper over.
             close_upvalues(ctx.mutation(), thread, new_base);
-            // `nargs == 0` is MULTRET: read the count from `thread.top`.
-            let src_start = func_idx + 1;
-            let nargs = if nargs == 0 {
-                thread.top - src_start
-            } else {
-                nargs as usize - 1
-            };
-            for i in 0..nargs {
-                thread.stack[new_base + i] = thread.stack[src_start + i];
-            }
-            ip = callee.proto.code.as_ptr();
-            let frame = unsafe { &mut *frame };
-            frame.closure = callee;
-            frame.pc = ip;
-            frame.set_base(new_base);
-            // num_extras feeds the new frame's own VARARGPREP; num_results is
-            // left as-is (still the original caller's expectation).
-            let num_params = callee.proto.num_params as usize;
-            frame.num_extras = if callee.proto.is_vararg {
-                nargs.saturating_sub(num_params) as u32
-            } else {
-                0
-            };
-            for i in nargs..num_params {
-                thread.stack[new_base + i] = Value::nil();
-            }
-            closure = callee;
-            registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
-            dispatch!();
+            unsafe { (*frame).flags &= !frame_flags::OPEN_UPVALUES };
+            tailcall_lua!(
+                callee, func_idx, nargs, thread, registers, ip, frame, closure
+            );
         }
         CallTarget::Native(nc) => {
             let args_base = func_idx + 1;
