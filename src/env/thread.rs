@@ -323,7 +323,7 @@ impl<'gc> ThreadState<'gc> {
     /// The owning `Thread`. `Thread::new` stores it before the state is
     /// reachable, so it is only `None` inside that constructor.
     #[inline(always)]
-    pub fn handle(&self) -> Thread<'gc> {
+    pub(crate) fn handle(&self) -> Thread<'gc> {
         debug_assert!(self.thread_handle.is_some());
         unsafe { self.thread_handle.unwrap_unchecked() }
     }
@@ -336,12 +336,12 @@ impl<'gc> ThreadState<'gc> {
 
     /// Whether the innermost frame is a Lua frame.
     #[inline]
-    pub fn top_is_lua(&self) -> bool {
+    pub(crate) fn top_is_lua(&self) -> bool {
         self.frames.len() > self.exec_depth()
     }
 
     /// Whether the thread has no frames at all.
-    pub fn frames_empty(&self) -> bool {
+    pub(crate) fn frames_empty(&self) -> bool {
         self.frames.is_empty() && self.exec_frames.is_empty()
     }
 
@@ -349,7 +349,7 @@ impl<'gc> ThreadState<'gc> {
     /// `.unwrap()` this — the dispatch loop only runs when a Lua frame is on
     /// top — but the executor driver loop must also handle `top_exec`.
     #[inline]
-    pub fn top_lua(&self) -> Option<&LuaFrame<'gc>> {
+    pub(crate) fn top_lua(&self) -> Option<&LuaFrame<'gc>> {
         if self.top_is_lua() {
             self.frames.last()
         } else {
@@ -358,7 +358,7 @@ impl<'gc> ThreadState<'gc> {
     }
 
     #[inline]
-    pub fn top_lua_mut(&mut self) -> Option<&mut LuaFrame<'gc>> {
+    pub(crate) fn top_lua_mut(&mut self) -> Option<&mut LuaFrame<'gc>> {
         if self.top_is_lua() {
             self.frames.last_mut()
         } else {
@@ -369,7 +369,7 @@ impl<'gc> ThreadState<'gc> {
     /// # Safety
     /// The innermost frame must be a Lua frame.
     #[inline]
-    pub unsafe fn top_lua_unchecked(&self) -> &LuaFrame<'gc> {
+    pub(crate) unsafe fn top_lua_unchecked(&self) -> &LuaFrame<'gc> {
         debug_assert!(self.top_is_lua(), "non-Lua frame on top");
         unsafe { self.frames.last().unwrap_unchecked() }
     }
@@ -381,13 +381,13 @@ impl<'gc> ThreadState<'gc> {
     /// # Safety
     /// The innermost frame must be a Lua frame.
     #[inline]
-    pub unsafe fn top_lua_ptr(&mut self) -> *mut LuaFrame<'gc> {
+    pub(crate) unsafe fn top_lua_ptr(&mut self) -> *mut LuaFrame<'gc> {
         debug_assert!(self.top_is_lua(), "non-Lua frame on top");
         unsafe { self.frames.as_mut_ptr().add(self.frames.len() - 1) }
     }
 
     /// The innermost frame if it is an executor frame.
-    pub fn top_exec(&self) -> Option<&ExecKind<'gc>> {
+    pub(crate) fn top_exec(&self) -> Option<&ExecKind<'gc>> {
         if self.top_is_lua() {
             None
         } else {
@@ -395,7 +395,7 @@ impl<'gc> ThreadState<'gc> {
         }
     }
 
-    pub fn top_exec_mut(&mut self) -> Option<&mut ExecKind<'gc>> {
+    pub(crate) fn top_exec_mut(&mut self) -> Option<&mut ExecKind<'gc>> {
         if self.top_is_lua() {
             None
         } else {
@@ -404,13 +404,13 @@ impl<'gc> ThreadState<'gc> {
     }
 
     /// Push an executor frame above every current frame.
-    pub fn push_exec(&mut self, kind: ExecKind<'gc>) {
+    pub(crate) fn push_exec(&mut self, kind: ExecKind<'gc>) {
         let depth = self.frames.len();
         self.exec_frames.push(ExecFrame { depth, kind });
     }
 
     /// Pop the innermost frame if it is an executor frame.
-    pub fn pop_exec(&mut self) -> Option<ExecKind<'gc>> {
+    pub(crate) fn pop_exec(&mut self) -> Option<ExecKind<'gc>> {
         if self.top_is_lua() {
             None
         } else {
@@ -420,13 +420,13 @@ impl<'gc> ThreadState<'gc> {
 
     /// Pop the innermost frame, which must be a Lua frame.
     #[inline]
-    pub fn pop_lua(&mut self) {
+    pub(crate) fn pop_lua(&mut self) {
         debug_assert!(self.top_is_lua(), "non-Lua frame on top");
         self.frames.pop();
     }
 
     /// Drop everything a previous run left behind; `status` is the caller's.
-    pub fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.discard_above(0);
         self.frames.clear();
         self.exec_frames.clear();
@@ -439,7 +439,7 @@ impl<'gc> ThreadState<'gc> {
     }
 
     /// Every frame, innermost first.
-    pub fn frames_rev(&self) -> impl Iterator<Item = FrameRef<'_, 'gc>> {
+    pub(crate) fn frames_rev(&self) -> impl Iterator<Item = FrameRef<'_, 'gc>> {
         let (mut lua, mut exec) = (self.frames.len(), self.exec_frames.len());
         std::iter::from_fn(move || {
             if exec > 0 && self.exec_frames[exec - 1].depth == lua {
@@ -460,7 +460,7 @@ impl<'gc> ThreadState<'gc> {
     /// Lua frame's window bounds every frame's live registers (extras sit
     /// below a base). `top` adds the value-passing window a native or a
     /// paused multires producer may have pushed above it.
-    pub fn live_top(&self) -> usize {
+    pub(crate) fn live_top(&self) -> usize {
         self.frames
             .last()
             .map_or(0, |lf| lf.base() + lf.closure.proto.max_stack_size as usize)
@@ -532,7 +532,7 @@ impl<'gc> ThreadState<'gc> {
 
     /// Make `stack[..n]` physically addressable. Grow-only, per rule (2).
     #[inline]
-    pub fn ensure_slots(&mut self, n: usize) {
+    pub(crate) fn ensure_slots(&mut self, n: usize) {
         if self.stack.len() < n {
             self.grow_slots(n);
         }
@@ -554,7 +554,7 @@ impl<'gc> ThreadState<'gc> {
     /// already pushed past the limit is allowed.
     #[inline]
     #[must_use]
-    pub fn ensure_frame_slots(&mut self, n: usize) -> bool {
+    pub(crate) fn ensure_frame_slots(&mut self, n: usize) -> bool {
         self.stack.len() >= n || self.grow_frame_slots(n)
     }
 
@@ -575,7 +575,7 @@ impl<'gc> ThreadState<'gc> {
 
     /// The logical window `stack[bottom..top]`.
     #[inline]
-    pub fn window(&self, bottom: usize) -> &[Value<'gc>] {
+    pub(crate) fn window(&self, bottom: usize) -> &[Value<'gc>] {
         &self.stack[bottom..self.top]
     }
 
@@ -591,13 +591,13 @@ impl<'gc> ThreadState<'gc> {
     /// has already written; lowering it leaves the vacated slots to the
     /// collector (rule 3).
     #[inline]
-    pub fn set_top(&mut self, n: usize) {
+    pub(crate) fn set_top(&mut self, n: usize) {
         self.ensure_slots(n);
         self.top = n;
     }
 
     /// Replace the window at `bottom` with `values` and publish the new top.
-    pub fn set_window<I>(&mut self, bottom: usize, values: I)
+    pub(crate) fn set_window<I>(&mut self, bottom: usize, values: I)
     where
         I: IntoIterator<Item = Value<'gc>>,
         I::IntoIter: ExactSizeIterator,
@@ -612,7 +612,7 @@ impl<'gc> ThreadState<'gc> {
     }
 
     /// Move the window at `bottom` out, leaving `top == bottom`.
-    pub fn take_window(&mut self, bottom: usize) -> Vec<Value<'gc>> {
+    pub(crate) fn take_window(&mut self, bottom: usize) -> Vec<Value<'gc>> {
         let values = self.window(bottom).to_vec();
         self.set_top(bottom);
         values
@@ -622,7 +622,7 @@ impl<'gc> ThreadState<'gc> {
     /// convention wants the function immediately below its args, but a
     /// suspended callback leaves only args behind — this splices the function
     /// back in.
-    pub fn insert_at(&mut self, at: usize, v: Value<'gc>) {
+    pub(crate) fn insert_at(&mut self, at: usize, v: Value<'gc>) {
         debug_assert!(at <= self.top);
         self.ensure_slots(self.top + 1);
         self.stack.copy_within(at..self.top, at + 1);
@@ -664,11 +664,11 @@ impl<'gc> Thread<'gc> {
         thread
     }
 
-    pub fn borrow(self) -> Ref<'gc, ThreadState<'gc>> {
+    pub(crate) fn borrow(self) -> Ref<'gc, ThreadState<'gc>> {
         self.0.borrow()
     }
 
-    pub fn borrow_mut(self, mc: &Mutation<'gc>) -> RefMut<'gc, ThreadState<'gc>> {
+    pub(crate) fn borrow_mut(self, mc: &Mutation<'gc>) -> RefMut<'gc, ThreadState<'gc>> {
         self.0.borrow_mut(mc)
     }
 
@@ -681,7 +681,7 @@ impl<'gc> Thread<'gc> {
         Gc::ptr_eq(self.0, other.0)
     }
 
-    pub fn inner(self) -> Gc<'gc, RefLock<ThreadState<'gc>>> {
+    pub(crate) fn inner(self) -> Gc<'gc, RefLock<ThreadState<'gc>>> {
         self.0
     }
 
