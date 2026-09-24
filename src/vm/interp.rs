@@ -4123,17 +4123,7 @@ extern "rust-preserve-none" fn op_forloop<'gc>(
             *reg!(ref mut base + 3) = idx;
             ip = unsafe { ip.offset(offset as isize) };
         }
-    } else if let Some(s) = step.get_integer() {
-        let last = unsafe { reg!(base).get_integer().unwrap_unchecked() };
-        let idx = unsafe { reg!(base + 2).get_integer().unwrap_unchecked() };
-        if idx != last {
-            let idx = Value::integer(ctx.mutation(), idx.wrapping_add(s));
-            *reg!(ref mut base + 2) = idx;
-            *reg!(ref mut base + 3) = idx;
-            ip = unsafe { ip.offset(offset as isize) };
-        }
-    } else {
-        let s = unsafe { step.get_float().unwrap_unchecked() };
+    } else if let Some(s) = step.get_float() {
         let lim = unsafe { reg!(base).get_float().unwrap_unchecked() };
         let idx = unsafe { reg!(base + 2).get_float().unwrap_unchecked() } + s;
         if if 0.0 < s { idx <= lim } else { lim <= idx } {
@@ -4142,6 +4132,63 @@ extern "rust-preserve-none" fn op_forloop<'gc>(
             *reg!(ref mut base + 3) = idx;
             ip = unsafe { ip.offset(offset as isize) };
         }
+    } else {
+        // Kept out of line: boxing the new index allocates, which would give
+        // this handler a stack frame.
+        become forloop_slow(
+            instruction,
+            ctx,
+            thread,
+            registers,
+            ip,
+            handlers,
+            ds,
+            frame,
+            closure,
+        );
+    }
+
+    dispatch!();
+}
+
+/// `op_forloop` for an integer loop whose values don't all fit a small int.
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn forloop_slow<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) {
+    helpers!(
+        instruction,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure
+    );
+    let (base, offset) = instruction.a_imm();
+    let (s, last, idx) = unsafe {
+        (
+            reg!(base + 1).get_integer().unwrap_unchecked(),
+            reg!(base).get_integer().unwrap_unchecked(),
+            reg!(base + 2).get_integer().unwrap_unchecked(),
+        )
+    };
+    if idx != last {
+        let idx = Value::integer(ctx.mutation(), idx.wrapping_add(s));
+        *reg!(ref mut base + 2) = idx;
+        *reg!(ref mut base + 3) = idx;
+        ip = unsafe { ip.offset(offset as isize) };
     }
 
     dispatch!();
