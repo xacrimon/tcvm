@@ -422,9 +422,17 @@ impl<'gc> ThreadState<'gc> {
         self.frames.pop();
     }
 
-    pub fn clear_frames(&mut self) {
+    /// Drop everything a previous run left behind; `status` is the caller's.
+    pub fn reset(&mut self) {
+        self.discard_above(0);
         self.frames.clear();
         self.exec_frames.clear();
+        self.open_upvalues.clear();
+        self.tbc_slots.clear();
+        self.pending_action = None;
+        self.yield_bottom = None;
+        self.death_error = None;
+        self.stack_limit = STACK_LIMIT;
     }
 
     /// Every frame, innermost first.

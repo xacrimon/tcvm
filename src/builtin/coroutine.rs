@@ -215,17 +215,13 @@ fn lua_close<'gc>(
         ThreadStatus::Suspended | ThreadStatus::Stopped | ThreadStatus::Result { .. } => {
             let mc = nctx.ctx.mutation();
             let mut ts = co.borrow_mut(mc);
-            ts.stack.clear();
-            ts.clear_frames();
-            ts.open_upvalues.clear();
-            ts.tbc_slots.clear();
-            ts.pending_action = None;
-            ts.yield_bottom = None;
-            ts.status = ThreadStatus::Stopped;
             // A coroutine that died via error re-surfaces that error as
             // `(false, err)` (and only once — clear it so a second close is
             // `true`, matching Lua). Otherwise close succeeds with `true`.
-            match ts.death_error.take() {
+            let death_error = ts.death_error.take();
+            ts.reset();
+            ts.status = ThreadStatus::Stopped;
+            match death_error {
                 Some(err) => stack.replace(&[Value::boolean(false), err]),
                 None => stack.replace(&[Value::boolean(true)]),
             }

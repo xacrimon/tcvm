@@ -93,11 +93,7 @@ impl<'gc> Executor<'gc> {
             args.push_into(mc, &mut buf);
 
             let mut ts = thread.borrow_mut(mc);
-            ts.discard_above(0);
-            ts.clear_frames();
-            ts.open_upvalues.clear();
-            ts.tbc_slots.clear();
-
+            ts.reset();
             ts.set_window(0, buf);
             ts.push_exec(ExecKind::Start(function));
             ts.status = ThreadStatus::Suspended;
@@ -360,10 +356,7 @@ impl<'gc> Executor<'gc> {
         {
             let mc = ctx.mutation();
             let mut ts = thread.borrow_mut(mc);
-            ts.discard_above(0);
-            ts.clear_frames();
-            ts.open_upvalues.clear();
-            ts.tbc_slots.clear();
+            ts.reset();
             ts.status = ThreadStatus::Stopped;
         }
         {

@@ -3,11 +3,17 @@
 //! it. Expected strings come from `lua` 5.5.1 on the same chunks named `=t`.
 //! Each chunk hands its result to the host with `error(v, 0)`.
 
-use tcvm::{Executor, LoadError, Lua, RuntimeError};
+use tcvm::env::{Error, Function, LuaString, NativeContext, NativeFn, Stack, Value};
+use tcvm::vm::sequence::CallbackAction;
+use tcvm::{Executor, LoadError, Lua, RuntimeError, StepResult};
 
 fn raised(src: &str) -> String {
     let mut lua = Lua::new();
     lua.load_all();
+    raised_in(&mut lua, src)
+}
+
+fn raised_in(lua: &mut Lua, src: &str) -> String {
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
             let chunk = ctx.load(src, Some("=t"))?;
@@ -84,4 +90,39 @@ fn recursion_through_metamethods_and_pcall() {
     assert_eq!(raised(src), "t:1: stack overflow");
     let src = "local function f() local ok, e = pcall(f) return e end error(f(), 0)";
     assert_eq!(raised(src), "stack overflow");
+}
+
+fn yielder<'gc>(
+    _nctx: NativeContext<'gc, '_>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
+    Ok(CallbackAction::yield_(None))
+}
+
+// A handler that yields to the host leaves the thread in handler mode; a
+// fresh `Executor::start` on the same thread must restore the normal limit.
+#[test]
+fn restart_after_a_handler_yields_to_the_host() {
+    let mut lua = Lua::new();
+    lua.load_all();
+    let ex = lua
+        .try_enter(|ctx| -> Result<_, LoadError> {
+            let y = Function::new_native(ctx.mutation(), yielder as NativeFn, Box::new([]));
+            let key = Value::string(LuaString::new(ctx, b"yielder"));
+            ctx.globals().raw_set(ctx, key, Value::function(y));
+            let src = format!("{RECURSE} xpcall(f, function(m) yielder() return m end)");
+            let chunk = ctx.load(&src, Some("=t"))?;
+            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+        })
+        .expect("load");
+    let yielded = lua.try_enter(|ctx| -> Result<bool, RuntimeError> {
+        Ok(matches!(ctx.fetch(&ex).step(ctx)?, StepResult::Yielded(_)))
+    });
+    assert!(yielded.expect("step"));
+
+    let src = format!(
+        "{RECURSE} local function id(x) return x end \
+         error(select(2, xpcall(f, function(m) return 'handled: ' .. id(m) end)), 0)"
+    );
+    assert_eq!(raised_in(&mut lua, &src), "handled: t:1: stack overflow");
 }
