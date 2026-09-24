@@ -270,6 +270,9 @@ pub(crate) fn check_number<'gc>(
     if let Some(f) = v.get_float() {
         return Ok(f);
     }
+    if let Some(i) = v.get_small() {
+        return Ok(i as f64);
+    }
     check_number_slow(ctx, v, fname, n)
 }
 
