@@ -84,8 +84,8 @@ impl<'gc> Error<'gc> {
     }
 
     /// The error as a host-printable message, following `lua.c`'s
-    /// `msghandler`: strings and numbers as-is, anything else by type.
-    // TODO: honour `__tostring` once metamethods exist.
+    /// `msghandler` short of calling `__tostring`: strings and numbers as-is,
+    /// anything else by type.
     pub fn message(self, ctx: Context<'gc>) -> LuaString<'gc> {
         let v = self.value();
         if v.get_string().is_some() || v.get_integer().is_some() || v.get_float().is_some() {
