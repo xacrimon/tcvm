@@ -229,35 +229,30 @@ pub(crate) fn basic_tostring<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> LuaString
         return s;
     }
     let mut out: Vec<u8> = Vec::new();
-    let ptr = if v.is_nil() {
+    if v.is_nil() {
         out.extend_from_slice(b"nil");
-        None
     } else if let Some(b) = v.get_boolean() {
         out.extend_from_slice(if b { b"true" } else { b"false" });
-        None
     } else if let Some(i) = v.get_integer() {
         push_int(&mut out, i);
-        None
     } else if let Some(f) = v.get_float() {
         push_float(&mut out, f);
-        None
-    } else if let Some(t) = v.get_table() {
-        Some(Gc::as_ptr(t.inner()) as *const ())
-    } else if let Some(f) = v.get_function() {
-        Some(Gc::as_ptr(f.inner()) as *const ())
-    } else if let Some(t) = v.get_thread() {
-        Some(Gc::as_ptr(t.inner()) as *const ())
     } else {
-        v.get_userdata().map(|u| Gc::as_ptr(u.inner()) as *const ())
-    };
-    if let Some(ptr) = ptr {
-        let name = ctx.metamethod_of(v, ctx.symbols().name);
-        match name.get_string() {
+        let ptr = if let Some(t) = v.get_table() {
+            Gc::as_ptr(t.inner()) as *const ()
+        } else if let Some(f) = v.get_function() {
+            Gc::as_ptr(f.inner()) as *const ()
+        } else if let Some(t) = v.get_thread() {
+            Gc::as_ptr(t.inner()) as *const ()
+        } else {
+            let u = v.get_userdata().expect("every other type is userdata");
+            Gc::as_ptr(u.inner()) as *const ()
+        };
+        match ctx.metamethod_of(v, ctx.symbols().name).get_string() {
             Some(name) => out.extend_from_slice(name.as_bytes()),
             None => out.extend_from_slice(v.type_name().as_bytes()),
         }
-        out.extend_from_slice(b": ");
-        out.extend_from_slice(format!("{ptr:p}").as_bytes());
+        out.extend_from_slice(format!(": {ptr:p}").as_bytes());
     }
     LuaString::new(ctx, &out)
 }
