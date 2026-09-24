@@ -135,6 +135,11 @@ pub(crate) type Registers<'gc, 'a> = *mut Value<'gc>;
 pub(crate) struct DispatchState<'gc> {
     /// Set by `raise!` right before it tail-calls `impl_error`, which takes it.
     fault: Option<OpError<'gc>>,
+    /// The native in `R[func]`, set by CALL and TAILCALL for the entry they
+    /// jump to. Reading the slot again there races the store of a MOVE that
+    /// just filled it: the CPU sometimes runs the load first and replays it,
+    /// which made `x = max(i, 3)` cost up to twice as much.
+    native: *const NativeClosure<'gc>,
 }
 
 /// The thread's top frame, which must be a Lua frame, and its closure. Both
@@ -660,7 +665,10 @@ fn fill_ic_for_constant_key<'gc>(
 #[inline(never)]
 pub(crate) fn run_thread<'gc>(ctx: Context<'gc>, thread: Thread<'gc>) {
     let mut ts = thread.borrow_mut(ctx.mutation());
-    let mut ds = DispatchState { fault: None };
+    let mut ds = DispatchState {
+        fault: None,
+        native: std::ptr::null(),
+    };
     ts.top_lua()
         .expect("run_thread requires a seeded Lua frame");
     let (frame, closure) = top_frame(&mut ts);
@@ -2577,6 +2585,7 @@ extern "rust-preserve-none" fn op_call<'gc>(
                 );
             }
             FunctionKind::Native(nc) => {
+                ds.native = nc;
                 let entry = nc.entry;
                 tail!(entry);
             }
@@ -2618,6 +2627,14 @@ extern "rust-preserve-none" fn op_call_grow<'gc>(
     tail!(op_call);
 }
 
+/// Whether `v` is the native closure `nc`.
+fn holds_native<'gc>(v: Value<'gc>, nc: &NativeClosure<'gc>) -> bool {
+    matches!(
+        v.get_function().map(|f| f.inner().as_ref()),
+        Some(FunctionKind::Native(n)) if std::ptr::eq(n, nc)
+    )
+}
+
 /// CALL or TAILCALL of a plain native function (no `__call` chain involved);
 /// the default `NativeClosure::entry`.
 #[inline(never)]
@@ -2640,10 +2657,8 @@ pub(crate) extern "rust-preserve-none" fn op_call_native<'gc>(
     let (func, nargs, returns) = instruction.abc();
     let base = unsafe { (*frame).base() };
     let func_idx = base + func as usize;
-    let nc: &NativeClosure<'gc> = match reg!(func).get_function().map(|f| f.inner().as_ref()) {
-        Some(FunctionKind::Native(nc)) => nc,
-        _ => unreachable!("op_call_native on a non-native callee"),
-    };
+    let nc = unsafe { &*ds.native };
+    debug_assert!(holds_native(reg!(func), nc));
     call_native!(
         nc, func_idx, nargs, returns, base, ctx, thread, registers, ip, ds, frame, closure
     );
@@ -2895,6 +2910,7 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
                 }
             }
             FunctionKind::Native(nc) => {
+                ds.native = nc;
                 let entry = nc.entry;
                 tail!(entry);
             }
@@ -2903,10 +2919,10 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
     tail!(op_tailcall_slow);
 }
 
-/// TAILCALL of a plain native, reached through `op_call_native`: run it, then
-/// return its results from this frame. The frame is popped before a
-/// suspension or an error so that lands on the caller's frame, as it would
-/// after a Lua tail call.
+/// TAILCALL of a plain native, reached through `op_call_native` or, after a
+/// `__call` chain, `op_tailcall_slow`: run it, then return its results from
+/// this frame. The frame is popped before a suspension or an error so that
+/// lands on the caller's frame, as it would after a Lua tail call.
 #[inline(never)]
 #[rustc_align(32)]
 extern "rust-preserve-none" fn op_tailcall_native<'gc>(
@@ -2924,10 +2940,8 @@ extern "rust-preserve-none" fn op_tailcall_native<'gc>(
     let (func, nargs) = instruction.ab();
     let base = unsafe { (*frame).base() };
     let func_idx = base + func as usize;
-    let nc: &NativeClosure<'gc> = match reg!(func).get_function().map(|f| f.inner().as_ref()) {
-        Some(FunctionKind::Native(nc)) => nc,
-        _ => unreachable!("op_tailcall_native on a non-native callee"),
-    };
+    let nc = unsafe { &*ds.native };
+    debug_assert!(holds_native(reg!(func), nc));
     let args_base = func_idx + 1;
     let argc = if nargs == 0 {
         thread.top - args_base
@@ -3045,7 +3059,8 @@ extern "rust-preserve-none" fn op_tailcall_slow<'gc>(
         // The chain left the native in the function slot, and `nargs`
         // counts the callable objects it inserted as arguments; growing the
         // stack for them may have moved it.
-        CallTarget::Native(_) => {
+        CallTarget::Native(nc) => {
+            ds.native = nc;
             registers = unsafe { thread.stack.as_mut_ptr().add(base) };
             tail!(
                 op_tailcall_native,
