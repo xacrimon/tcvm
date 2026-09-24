@@ -24,3 +24,16 @@ false,t:34: attempt to call a nil value
 1,1,2,nil
 key!,3
 false
+2,2,3
+4
+4.5
+8
+7
+3,1099511627776,-9223372036854775808
+5,true,2
+true,1
+true,b
+table,table
+300,300
+1,nil,nil
+false,t:67: bad argument #1 to 'floor' (number expected, got table)

@@ -142,10 +142,12 @@ pub struct NativeClosure<'gc> {
     #[collect(require_static)]
     pub function: NativeFn,
     pub upvalues: Box<[Value<'gc>]>,
-    /// What CALL jumps to: `op_call_native`, or for a builtin with a fast
-    /// path its own entry (LuaJIT's `ff_*`), which handles the common argument
-    /// shape inline, never errors, and leaves every other shape to
-    /// `op_call_native`, so `function` stays the complete implementation.
+    /// What CALL and TAILCALL jump to: `op_call_native`, or for a builtin with
+    /// a fast path its own entry (LuaJIT's `ff_*`), which handles the common
+    /// argument shape inline, never errors, and leaves every other shape to
+    /// `op_call_native`, so `function` stays the complete implementation. An
+    /// entry must check the opcode: after a TAILCALL it returns its results
+    /// from the frame instead of dispatching the next instruction.
     #[collect(require_static)]
     pub(crate) entry: Handler,
 }

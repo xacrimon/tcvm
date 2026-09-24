@@ -2619,8 +2619,8 @@ extern "rust-preserve-none" fn op_call_grow<'gc>(
     tail!(op_call);
 }
 
-/// CALL of a plain native function (no `__call` chain involved); the default
-/// `NativeClosure::entry`.
+/// CALL or TAILCALL of a plain native function (no `__call` chain involved);
+/// the default `NativeClosure::entry`.
 #[inline(never)]
 #[rustc_align(32)]
 pub(crate) extern "rust-preserve-none" fn op_call_native<'gc>(
@@ -2635,6 +2635,9 @@ pub(crate) extern "rust-preserve-none" fn op_call_native<'gc>(
     closure: LuaFn<'gc>,
 ) {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    if instruction.op() == Op::TAILCALL {
+        tail!(op_tailcall_native);
+    }
     let (func, nargs, returns) = instruction.abc();
     let base = unsafe { (*frame).base() };
     let func_idx = base + func as usize;
@@ -2655,10 +2658,11 @@ enum Math1 {
     Miss,
 }
 
-/// Defines the CALL entry (`NativeClosure::entry`) of a one-argument math
-/// builtin. `$float`/`$small` map a float or inline-integer argument to a
-/// `Math1`; every other shape, including extra arguments, goes to
-/// `op_call_native`. The result lands straight in the function slot.
+/// Defines the entry (`NativeClosure::entry`) of a one-argument math builtin.
+/// `$float`/`$small` map a float or inline-integer argument to a `Math1`;
+/// every other shape, including extra arguments, goes to `op_call_native`.
+/// The result lands straight in the function slot, and a TAILCALL returns it
+/// from the frame.
 macro_rules! math1_entry {
     ($name:ident, |$x:ident| $float:expr, |$i:ident| $small:expr) => {
         #[inline(never)]
@@ -2675,7 +2679,8 @@ macro_rules! math1_entry {
             closure: LuaFn<'gc>,
         ) {
             helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-            let (func, nargs, returns) = instruction.abc();
+            // Raw reads: a TAILCALL is `Ab`-shaped, with `c` (unused then) zero.
+            let (func, nargs, returns) = (instruction.a(), instruction.b(), instruction.c());
             let result = if nargs != 2 {
                 Math1::Miss
             } else {
@@ -2698,6 +2703,9 @@ macro_rules! math1_entry {
                 Math1::Miss => {
                     tail!(op_call_native);
                 }
+            }
+            if instruction.op() == Op::TAILCALL {
+                tail!(op_return1, Instruction::ret1(crate::instruction::Reg(func)));
             }
             if returns == 0 {
                 thread.set_top_unchecked(unsafe { (*frame).base() } + func as usize + 1);
@@ -2839,8 +2847,11 @@ macro_rules! tailcall_lua {
 
 /// return R[func](R[func+1], ..., R[func+args-1])  — tail call
 ///
-/// Fast path: a plain Lua callee whose window fits, from a frame with nothing
-/// to close. Every other shape goes to `op_tailcall_slow`.
+/// Fast paths: a plain Lua callee whose window fits, from a frame with nothing
+/// to close; and a plain native, which gets this TAILCALL as its `entry`'s
+/// instruction and returns its results from this frame (as LuaJIT's fast
+/// functions return through the frame's saved PC). Every other shape goes to
+/// `op_tailcall_slow`.
 #[inline(never)]
 #[rustc_align(32)]
 extern "rust-preserve-none" fn op_tailcall<'gc>(
@@ -2856,38 +2867,144 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
 ) {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (func, nargs) = instruction.ab();
-    if let Some(f) = reg!(func).get_function()
-        && let FunctionKind::Lua(target) = f.inner().as_ref()
-    {
-        let (base, num_extras, flags) = unsafe {
-            (
-                (*frame).base(),
-                (*frame).num_extras as usize,
-                (*frame).flags,
-            )
-        };
-        let needed = base - num_extras + target.max_stack_size as usize;
-        if std::hint::likely(
-            flags & (frame_flags::OPEN_UPVALUES | frame_flags::TBC) == 0
-                && thread.stack.len() >= needed,
-        ) {
-            let callee = unsafe { LuaFn::from_function_unchecked(f) };
-            tailcall_lua!(
-                callee,
-                base + func as usize,
-                nargs,
-                thread,
-                registers,
-                ip,
-                frame,
-                closure
-            );
+    if let Some(f) = reg!(func).get_function() {
+        match f.inner().as_ref() {
+            FunctionKind::Lua(target) => {
+                let (base, num_extras, flags) = unsafe {
+                    (
+                        (*frame).base(),
+                        (*frame).num_extras as usize,
+                        (*frame).flags,
+                    )
+                };
+                let needed = base - num_extras + target.max_stack_size as usize;
+                if std::hint::likely(
+                    flags & (frame_flags::OPEN_UPVALUES | frame_flags::TBC) == 0
+                        && thread.stack.len() >= needed,
+                ) {
+                    let callee = unsafe { LuaFn::from_function_unchecked(f) };
+                    tailcall_lua!(
+                        callee,
+                        base + func as usize,
+                        nargs,
+                        thread,
+                        registers,
+                        ip,
+                        frame,
+                        closure
+                    );
+                }
+            }
+            FunctionKind::Native(nc) => {
+                let entry = nc.entry;
+                tail!(entry);
+            }
         }
     }
     tail!(op_tailcall_slow);
 }
 
-/// TAILCALL through a `__call` chain, into a native, or from a frame that
+/// TAILCALL of a plain native, reached through `op_call_native`: run it, then
+/// return its results from this frame. The frame is popped before a
+/// suspension or an error so that lands on the caller's frame, as it would
+/// after a Lua tail call.
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn op_tailcall_native<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let (func, nargs) = instruction.ab();
+    let base = unsafe { (*frame).base() };
+    let func_idx = base + func as usize;
+    let nc: &NativeClosure<'gc> = match reg!(func).get_function().map(|f| f.inner().as_ref()) {
+        Some(FunctionKind::Native(nc)) => nc,
+        _ => unreachable!("op_tailcall_native on a non-native callee"),
+    };
+    let args_base = func_idx + 1;
+    let argc = if nargs == 0 {
+        thread.top - args_base
+    } else {
+        nargs as usize - 1
+    };
+    let action = match invoke_native(ctx, thread, nc, args_base, argc) {
+        Ok(a) => a,
+        Err(err) => {
+            // The message still names the tailcalling Lua frame (a native
+            // never really tail calls in the reference either), so locate it
+            // before popping that frame and installing the unwind marker.
+            save_pc(thread, ip);
+            let err = crate::vm::debug::locate(ctx, thread, err);
+            close_upvalues(ctx.mutation(), thread, base);
+            close_tbc_vars(ctx.mutation(), thread, base);
+            thread.pop_lua();
+            thread.push_exec(ExecKind::Error(err));
+            return;
+        }
+    };
+    match action {
+        crate::vm::sequence::CallbackAction::Return => {
+            // The results sit at `func + 1` up to `top`, as a RETURN of them
+            // would find them; past its 8-bit count, MULTRET reads `top`.
+            let retc = thread.top - args_base;
+            let count = if retc < u8::MAX as usize {
+                retc as u8 + 1
+            } else {
+                0
+            };
+            registers = unsafe { thread.stack.as_mut_ptr().add(base) };
+            tail!(
+                op_return,
+                Instruction::ret(crate::instruction::Reg(func + 1), count)
+            );
+        }
+        crate::vm::sequence::CallbackAction::Suspend(action) => {
+            // The popped frame's function slot, `num_results` and
+            // continuation carry the original caller's expectation across
+            // the tail call.
+            let (func_idx, num_results, cont) = {
+                let f = unsafe { &*frame };
+                let func_idx = f.base() - 1 - f.num_extras as usize;
+                (func_idx, f.num_results, f.continuation)
+            };
+            // Only a final landing can apply a continuation; the
+            // callee of a plain `Call` returns without one.
+            if cont.is_some()
+                && matches!(*action, crate::vm::sequence::Suspend::Call { then: None })
+            {
+                save_pc(thread, ip);
+                let err = crate::env::Error::from_str(
+                    ctx,
+                    "metamethod/iterator native cannot tail-call into Lua across the continuation",
+                );
+                thread.raise(ctx, err);
+                return;
+            }
+            close_upvalues(ctx.mutation(), thread, base);
+            close_tbc_vars(ctx.mutation(), thread, base);
+            thread.pop_lua();
+            thread.pending_action = Some(PendingAction {
+                action,
+                call_site: CallSite {
+                    bottom: args_base,
+                    func_idx,
+                    returns: num_results,
+                    cont,
+                },
+            });
+        }
+    }
+}
+
+/// TAILCALL through a `__call` chain, or into a Lua callee from a frame that
 /// must close upvalues or grow the stack first.
 #[inline(never)]
 #[rustc_align(32)]
@@ -2926,88 +3043,15 @@ extern "rust-preserve-none" fn op_tailcall_slow<'gc>(
                 callee, func_idx, nargs, thread, registers, ip, frame, closure
             );
         }
-        CallTarget::Native(nc) => {
-            let args_base = func_idx + 1;
-            let argc = if nargs == 0 {
-                thread.top - args_base
-            } else {
-                nargs as usize - 1
-            };
-            let action = match invoke_native(ctx, thread, nc, args_base, argc) {
-                Ok(a) => a,
-                Err(err) => {
-                    // Tailcall + native error: the message still names the
-                    // tailcalling Lua frame (a native never really tail
-                    // calls in the reference either), so locate it before
-                    // popping that frame and installing the unwind marker.
-                    save_pc(thread, ip);
-                    let err = crate::vm::debug::locate(ctx, thread, err);
-                    let cur_base = unsafe { (*frame).base() };
-                    close_upvalues(ctx.mutation(), thread, cur_base);
-                    close_tbc_vars(ctx.mutation(), thread, cur_base);
-                    thread.pop_lua();
-                    thread.push_exec(ExecKind::Error(err));
-                    return;
-                }
-            };
-            match action {
-                crate::vm::sequence::CallbackAction::Return => {
-                    // Result count via the logical top (the shared stack was
-                    // never shrunk by the native call).
-                    let retc = thread.top - args_base;
-                    match frame_return(ctx.mutation(), thread, frame, args_base, retc) {
-                        FrameReturn::Continuation => {
-                            tail!(cont_resume);
-                        }
-                        FrameReturn::TopLevel => return,
-                        FrameReturn::ToNonLua => return,
-                        FrameReturn::Caller { new_base, new_ip } => {
-                            ip = new_ip;
-                            (frame, closure) = top_frame(thread);
-                            registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
-                            dispatch!();
-                        }
-                    }
-                }
-                crate::vm::sequence::CallbackAction::Suspend(action) => {
-                    // Tailcall + suspension: pop the tailcalling Lua frame
-                    // (close upvalues / TBC vars) so any subsequent action
-                    // lands on the caller's frame window. The popped frame's
-                    // function slot, `num_results` and continuation carry the
-                    // original caller's expectation across the tail call.
-                    let (cur_base, func_idx, num_results, cont) = {
-                        let f = unsafe { &*frame };
-                        let func_idx = f.base() - 1 - f.num_extras as usize;
-                        (f.base(), func_idx, f.num_results, f.continuation)
-                    };
-                    // Only a final landing can apply a continuation; the
-                    // callee of a plain `Call` returns without one.
-                    if cont.is_some()
-                        && matches!(*action, crate::vm::sequence::Suspend::Call { then: None })
-                    {
-                        save_pc(thread, ip);
-                        let err = crate::env::Error::from_str(
-                            ctx,
-                            "metamethod/iterator native cannot tail-call into Lua across the continuation",
-                        );
-                        thread.raise(ctx, err);
-                        return;
-                    }
-                    close_upvalues(ctx.mutation(), thread, cur_base);
-                    close_tbc_vars(ctx.mutation(), thread, cur_base);
-                    thread.pop_lua();
-                    thread.pending_action = Some(PendingAction {
-                        action,
-                        call_site: CallSite {
-                            bottom: args_base,
-                            func_idx,
-                            returns: num_results,
-                            cont,
-                        },
-                    });
-                    return;
-                }
-            }
+        // The chain left the native in the function slot, and `nargs`
+        // counts the callable objects it inserted as arguments; growing the
+        // stack for them may have moved it.
+        CallTarget::Native(_) => {
+            registers = unsafe { thread.stack.as_mut_ptr().add(base) };
+            tail!(
+                op_tailcall_native,
+                Instruction::tailcall(crate::instruction::Reg(func), nargs)
+            );
         }
     }
 }
@@ -4045,7 +4089,7 @@ pub(crate) fn invoke_native<'gc>(
 
 /// What should happen after a frame returns with values at
 /// `stack[values_base .. values_base + nret]`. Produced by [`frame_return`],
-/// consumed by `op_return` and the native-tailcall path in `op_tailcall`.
+/// consumed by `op_return_slow`.
 pub(crate) enum FrameReturn {
     /// A continuation was attached to the departing frame, which is still on
     /// top with its results at its function slot, up to `top`; caller must
@@ -4068,8 +4112,7 @@ pub(crate) enum FrameReturn {
 }
 
 /// Unwind the top-of-stack frame assuming it returned the values at
-/// `stack[values_base .. values_base + nret]`. Shared by the bytecode
-/// `RETURN` handler and the native-tailcall path.
+/// `stack[values_base .. values_base + nret]`; the general case of RETURN.
 #[inline]
 pub(crate) fn frame_return<'gc>(
     mc: &Mutation<'gc>,

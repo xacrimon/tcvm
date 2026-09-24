@@ -53,6 +53,26 @@ local even, odd
 function even(n) if n == 0 then return true end return odd(n - 1) end
 function odd(n) if n == 0 then return false end return even(n - 1) end
 p(even(100001))
+-- natives in tail position: fast entries (hit and miss) and plain natives,
+-- from vararg frames, frames with open upvalues, metamethod frames and
+-- pcall'd frames, through __call, and with more results than RETURN encodes
+p((function(...) return math.floor(...) end)(2.5), (function(...) return select(2, ...) end)(1, 2, 3))
+local function upf(x) g = function() return x end return math.floor(x) end
+p(upf(4.5)); p(g())
+local function upn(x) g = function() return x end return select(2, x, x + 1) end
+p(upn(7)); p(g())
+p((function(x) return math.floor(x) end)("3.7"), (function(x) return math.floor(x) end)(2^40 + 0.5), (function(x) return math.abs(x) end)(math.mininteger))
+local o2 = setmetatable({}, {__index = function(t, k) return math.floor(k) end, __lt = function() return math.abs(-1) end, __len = function(t) return select("#", t, t) end})
+p(o2[5.5], o2 < o2, #o2)
+p(pcall(function() return math.floor(1.5) end))
+p(pcall(function() return select(2, "a", "b") end))
+local tc = setmetatable({}, {__call = type})
+p((function() return tc(1) end)(), (function(...) return tc(...) end)(1, 2))
+local many = {} for i = 1, 300 do many[i] = i end
+p(select("#", (function() return table.unpack(many) end)()), (select(300, (function() return table.unpack(many) end)())))
+local s1, s2, s3 = (function() return math.floor(1.5) end)()
+p(s1, s2, s3)
+p(pcall(function() return math.floor({}) end))
 return table.concat(out, "\n")
 "##;
 
