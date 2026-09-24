@@ -5,7 +5,6 @@ use crate::Context;
 use crate::builtin::util;
 use crate::dmm::{Collect, Trace};
 use crate::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
-use crate::lua::StashedValue;
 use crate::vm::async_sequence::{SequenceReturn, async_sequence};
 use crate::vm::sequence::{
     BoxSequence, CallbackAction, Catch, Execution, Sequence, SequencePoll, seq_trace_pointers,
@@ -348,29 +347,12 @@ fn lua_print<'gc>(
         stack.replace(&[]);
         return Ok(CallbackAction::Return);
     }
-    enum Piece {
-        Text(Vec<u8>),
-        ToString(StashedValue, StashedValue),
-    }
     // Some `__tostring` must run; like Lua, write each argument as soon as it
     // is converted.
     let seq = async_sequence(ctx.mutation(), move |_locals, seq| async move {
         let mut seq = seq;
         for i in 0..n {
-            let piece = seq.enter(|ctx, locals, _exec, stack| {
-                let v = stack.get(i);
-                let mm = ctx.metamethod_of(v, ctx.symbols().mm_tostring);
-                if mm.is_nil() {
-                    Piece::Text(util::basic_tostring(ctx, v).as_bytes().to_vec())
-                } else {
-                    let mc = ctx.mutation();
-                    Piece::ToString(locals.stash(mc, mm), locals.stash(mc, v))
-                }
-            });
-            let bytes = match piece {
-                Piece::Text(bytes) => bytes,
-                Piece::ToString(mm, v) => util::call_tostring(&mut seq, &mm, &v, n).await?,
-            };
+            let bytes = util::tolstring(&mut seq, i, n).await?;
             let mut out = std::io::stdout().lock();
             if i > 0 {
                 let _ = out.write_all(b"\t");

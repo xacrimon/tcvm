@@ -272,28 +272,23 @@ fn lua_format<'gc>(
         return Ok(CallbackAction::Return);
     };
     // A conversion needs `__tostring`: finish in a sequence that can call it,
-    // continuing from where `run` stopped.
+    // continuing from where `run` stopped. The arguments, format string
+    // included, stay on the stack below `n` throughout.
     let n = stack.len();
-    let fmt = fmt.to_vec();
     let seq = async_sequence(ctx.mutation(), move |_locals, seq| async move {
         let (mut seq, mut f, mut pending) = (seq, f, Some(pending));
         while let Some((spec, arg)) = pending {
-            let (mm, v) = seq.enter(|ctx, locals, _exec, stack| {
-                let v = stack.get(arg);
-                let mm = ctx.metamethod_of(v, ctx.symbols().mm_tostring);
-                (
-                    locals.stash(ctx.mutation(), mm),
-                    locals.stash(ctx.mutation(), v),
-                )
-            });
-            let bytes = util::call_tostring(&mut seq, &mm, &v, n).await?;
+            let bytes = util::tolstring(&mut seq, arg, n).await?;
             // `%q` adds the result as-is.
             if spec.conv == b'q' {
                 f.out.extend_from_slice(&bytes);
             } else {
                 fmt_str_bytes(&mut f.out, &spec, &bytes);
             }
-            pending = seq.try_enter(|ctx, _locals, _exec, stack| f.run(ctx, &fmt, &stack))?;
+            pending = seq.try_enter(|ctx, _locals, _exec, stack| {
+                let fmt = stack.get(0).get_string().expect("checked on entry");
+                f.run(ctx, fmt.as_bytes(), &stack)
+            })?;
         }
         seq.enter(|ctx, _locals, _exec, mut stack| {
             stack.replace(&[Value::string(LuaString::new(ctx, &f.out))]);

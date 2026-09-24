@@ -6,7 +6,7 @@ use std::pin::Pin;
 
 use crate::dmm::{Collect, Gc, Mutation, Trace};
 use crate::env::{Error, LuaString, Stack, Value};
-use crate::lua::{Context, StashedError, StashedValue};
+use crate::lua::{Context, StashedError};
 use crate::vm::async_sequence::AsyncSequence;
 use crate::vm::sequence::{Execution, Sequence, SequencePoll};
 
@@ -262,20 +262,28 @@ pub(crate) fn basic_tostring<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> LuaString
     LuaString::new(ctx, &out)
 }
 
-/// Call `v`'s `__tostring` metamethod `mm` using the stack from `bottom` up,
-/// and return its result as `luaL_tolstring` accepts it: a string, or a
-/// number converted to one.
-pub(crate) async fn call_tostring(
+/// `luaL_tolstring` of the value at stack index `i`, calling its `__tostring`
+/// with the stack from `bottom` (above `i`) up.
+pub(crate) async fn tolstring(
     seq: &mut AsyncSequence,
-    mm: &StashedValue,
-    v: &StashedValue,
+    i: usize,
     bottom: usize,
 ) -> Result<Vec<u8>, StashedError> {
-    seq.enter(|ctx, locals, _exec, mut stack| {
+    let mm = seq.enter(|ctx, locals, _exec, mut stack| {
+        let v = stack.get(i);
+        let mm = ctx.metamethod_of(v, ctx.symbols().mm_tostring);
+        if mm.is_nil() {
+            return Err(basic_tostring(ctx, v).as_bytes().to_vec());
+        }
         stack.truncate(bottom);
-        stack.push(locals.fetch(ctx.mutation(), v));
+        stack.push(v);
+        Ok(locals.stash(ctx.mutation(), mm))
     });
-    seq.call(mm, bottom).await?;
+    let mm = match mm {
+        Ok(mm) => mm,
+        Err(bytes) => return Ok(bytes),
+    };
+    seq.call(&mm, bottom).await?;
     seq.try_enter(|ctx, _locals, _exec, mut stack| {
         let r = stack.get(bottom);
         stack.truncate(bottom);
