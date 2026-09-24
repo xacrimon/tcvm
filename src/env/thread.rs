@@ -43,29 +43,29 @@ pub enum ThreadStatus {
 #[derive(Clone, Copy, Collect)]
 #[collect(internal, no_drop)]
 pub struct LuaFrame<'gc> {
-    pub closure: LuaFn<'gc>,
+    pub(crate) closure: LuaFn<'gc>,
     /// Read through `base()`. 32 bits: a frame sits inside the stack, and
     /// every growth of the stack goes through `grow_slots`, which keeps it
     /// below 2^32 slots.
-    pub base: u32,
+    pub(crate) base: u32,
     /// Resume address: points *past* the instruction being executed, into
     /// `closure.proto.code` (which the frame keeps alive). A raw pointer
     /// rather than an index so CALL saves it with one store.
     #[collect(require_static)]
-    pub pc: *const crate::instruction::Instruction,
-    pub num_results: u8,
+    pub(crate) pc: *const crate::instruction::Instruction,
+    pub(crate) num_results: u8,
     /// `frame_flags` bits. Zero means RETURN can take its fast path: fixed
     /// results land in a Lua caller with nothing to close and no continuation.
     /// Only ever set, never cleared (a stale bit just costs the slow path).
-    pub flags: u8,
+    pub(crate) flags: u8,
     /// Caller-supplied args beyond `num_params`; the below-base region is
     /// `stack[base - num_extras .. base]`. Set by `VARARGPREP`, else 0.
-    pub num_extras: u32,
+    pub(crate) num_extras: u32,
     /// Fixup dispatched by `op_return` when this frame unwinds. `None` for
     /// normal calls; set by metamethod/iterator helpers that need
     /// post-return processing.
     #[collect(require_static)]
-    pub continuation: Option<Continuation>,
+    pub(crate) continuation: Option<Continuation>,
 }
 
 /// Stack-window metadata threaded through every suspension point.
@@ -213,40 +213,40 @@ pub(crate) const STACK_LIMIT: usize = MAX_STACK - 200;
 pub struct ThreadState<'gc> {
     /// Backing store. May hold dead slots above the live region; the
     /// collector clears them when it traces the thread.
-    pub stack: ValueStack<'gc>,
+    pub(crate) stack: ValueStack<'gc>,
     /// Lua frames, innermost last.
-    pub frames: Vec<LuaFrame<'gc>>,
+    pub(crate) frames: Vec<LuaFrame<'gc>>,
     /// Executor frames, innermost last, each placed among `frames` by its
     /// `depth`. Kept apart so the interpreter's frames are plain records.
-    pub exec_frames: Vec<ExecFrame<'gc>>,
-    pub open_upvalues: Vec<Upvalue<'gc>>,
-    pub tbc_slots: Vec<usize>,
-    pub status: ThreadStatus,
+    pub(crate) exec_frames: Vec<ExecFrame<'gc>>,
+    pub(crate) open_upvalues: Vec<Upvalue<'gc>>,
+    pub(crate) tbc_slots: Vec<usize>,
+    pub(crate) status: ThreadStatus,
     /// Logical stack top — the end of the value-passing window. Always valid:
     /// it is the sole signal of "how many values are here" across every
     /// hand-off (native args/results, yields, sequence polls, thread resume,
     /// `Result`). Multires producers (`VARARG`/`CALL`/`TAILCALL` with the `0`
     /// sentinel, native multi-return) publish through it; their consumers read
     /// it back.
-    pub top: usize,
+    pub(crate) top: usize,
     /// Back-reference to the owning Thread handle, needed for creating open upvalues.
-    pub thread_handle: Option<Thread<'gc>>,
+    pub(crate) thread_handle: Option<Thread<'gc>>,
     /// A native callback's non-`Return` `CallbackAction` deposited by
     /// `op_call`/`op_tailcall` and consumed by the executor driver loop on
     /// the next pump. `None` between pumps. The interpreter never observes
     /// this (it bails out via `return Ok(())` immediately after setting it).
-    pub pending_action: Option<PendingAction<'gc>>,
+    pub(crate) pending_action: Option<PendingAction<'gc>>,
     /// Where the thread's yielded values currently live. Set when the
     /// thread suspends via a `Yield` action (or a sequence's
     /// `SequencePoll::Yield`/`TailYield`). Consumed on resume to recover
     /// where the call's results should land. `None` outside of yielded
     /// state.
-    pub yield_bottom: Option<CallSite>,
+    pub(crate) yield_bottom: Option<CallSite>,
     /// The error value that killed this coroutine, set when an uncaught error
     /// unwinds out of it (status -> `Stopped`). `coroutine.close` surfaces it
     /// as `(false, err)` and clears it; `None` for a coroutine that died by
     /// normal return or was never run.
-    pub death_error: Option<Value<'gc>>,
+    pub(crate) death_error: Option<Value<'gc>>,
     /// End a Lua frame's register window may not cross: [`STACK_LIMIT`], or
     /// [`MAX_STACK`] while a message handler runs.
     pub(crate) stack_limit: usize,
@@ -476,7 +476,7 @@ impl<'gc> ThreadState<'gc> {
     /// slot: `op_return` locates it as `base - 1 - num_extras` (VARARGPREP
     /// later shifts `base` up by `num_extras`), which wraps for `base == 0`.
     #[inline]
-    pub fn push_lua(&mut self, mut lf: LuaFrame<'gc>) {
+    pub(crate) fn push_lua(&mut self, mut lf: LuaFrame<'gc>) {
         debug_assert!(
             lf.base() >= 1,
             "Lua frame base must leave room for the function slot"
@@ -633,7 +633,7 @@ impl<'gc> ThreadState<'gc> {
     /// live frame window and no in-flight native call sits above `n` — i.e. a
     /// thread being seeded, unwound, or terminated, never one with a native
     /// callback on the stack.
-    pub fn discard_above(&mut self, n: usize) {
+    pub(crate) fn discard_above(&mut self, n: usize) {
         debug_assert!(n <= self.stack.len());
         self.stack.truncate(n);
         self.top = n;
