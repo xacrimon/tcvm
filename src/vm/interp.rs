@@ -1509,7 +1509,7 @@ macro_rules! binop_slow_body {
             num::SlowNum::NotNumbers => {}
         }
 
-        let meta_fn = binop_metamethod(lhs, rhs, $ctx.symbols().$mm);
+        let meta_fn = binop_metamethod($ctx, lhs, rhs, $ctx.symbols().$mm);
         if meta_fn.is_nil() {
             raise!(OpError::$err(lhs, rhs));
         }
@@ -1715,7 +1715,7 @@ extern "rust-preserve-none" fn op_unm<'gc>(
         *reg!(ref mut dst) = Value::float(-f);
         dispatch!();
     }
-    let meta_fn = unop_metamethod(val, ctx.symbols().mm_unm);
+    let meta_fn = ctx.metamethod_of(val, ctx.symbols().mm_unm);
     if meta_fn.is_nil() {
         raise!(OpError::Arith(val, val));
     }
@@ -1749,7 +1749,7 @@ extern "rust-preserve-none" fn op_bnot<'gc>(
         *reg!(ref mut dst) = Value::integer(ctx.mutation(), !i);
         dispatch!();
     }
-    let meta_fn = unop_metamethod(val, ctx.symbols().mm_bnot);
+    let meta_fn = ctx.metamethod_of(val, ctx.symbols().mm_bnot);
     if meta_fn.is_nil() {
         raise!(OpError::Bitwise(val, val));
     }
@@ -1811,11 +1811,16 @@ extern "rust-preserve-none" fn op_len<'gc>(
         }
         mm
     } else {
-        raise!(OpError::Len(val))
+        let mm = ctx.metamethod_of(val, ctx.symbols().mm_len);
+        if mm.is_nil() {
+            raise!(OpError::Len(val));
+        }
+        mm
     };
 
     let cont = Continuation::StoreResult { dst };
-    invoke_metamethod!(meta_fn, &[val], cont);
+    // Like the other unary metamethods, `__len` gets its operand twice.
+    invoke_metamethod!(meta_fn, &[val, val], cont);
 }
 
 /// R[dst] = R[lhs] .. R[rhs]  (string concatenation)
@@ -1842,7 +1847,7 @@ extern "rust-preserve-none" fn op_concat<'gc>(
         *reg!(ref mut dst) = Value::string(LuaString::new(ctx, &buf));
         dispatch!();
     }
-    let meta_fn = binop_metamethod(a, b, ctx.symbols().mm_concat);
+    let meta_fn = binop_metamethod(ctx, a, b, ctx.symbols().mm_concat);
     if meta_fn.is_nil() {
         raise!(OpError::Concat(a, b));
     }
@@ -1953,7 +1958,7 @@ extern "rust-preserve-none" fn op_eq<'gc>(
     let try_meta = (a.kind() == ValueKind::Table && b.kind() == ValueKind::Table)
         || (a.kind() == ValueKind::Userdata && b.kind() == ValueKind::Userdata);
     if try_meta {
-        let meta_fn = binop_metamethod(a, b, ctx.symbols().mm_eq);
+        let meta_fn = binop_metamethod(ctx, a, b, ctx.symbols().mm_eq);
         if !meta_fn.is_nil() {
             let cont = Continuation::CondJump { inverted };
             invoke_metamethod!(meta_fn, &[a, b], cont);
@@ -2009,7 +2014,7 @@ extern "rust-preserve-none" fn op_lt<'gc>(
     }
 
     let (a, b) = (reg!(lhs), reg!(rhs));
-    let meta_fn = binop_metamethod(a, b, ctx.symbols().mm_lt);
+    let meta_fn = binop_metamethod(ctx, a, b, ctx.symbols().mm_lt);
     if meta_fn.is_nil() {
         raise!(OpError::Compare(a, b));
     }
@@ -2061,7 +2066,7 @@ extern "rust-preserve-none" fn op_le<'gc>(
     }
 
     let (a, b) = (reg!(lhs), reg!(rhs));
-    let meta_fn = binop_metamethod(a, b, ctx.symbols().mm_le);
+    let meta_fn = binop_metamethod(ctx, a, b, ctx.symbols().mm_le);
     if meta_fn.is_nil() {
         raise!(OpError::Compare(a, b));
     }
@@ -2141,7 +2146,7 @@ macro_rules! cmp_imm_handler {
             let (src, inverted) = instruction.ab_imm_flag();
             let (v, k) = (reg!(src), instruction.imm_value(ctx.mutation()));
             let (a, b) = if $swap { (k, v) } else { (v, k) };
-            let meta_fn = binop_metamethod(a, b, ctx.symbols().$mm);
+            let meta_fn = binop_metamethod(ctx, a, b, ctx.symbols().$mm);
             if meta_fn.is_nil() {
                 raise!(OpError::Compare(a, b));
             }
@@ -4436,10 +4441,7 @@ fn resolve_call_chain_slow<'gc>(
                 FunctionKind::Native(nc) => Some((CallTarget::Native(nc), nargs)),
             };
         }
-        let mm = match func_val.get_table() {
-            Some(t) => t.get_metamethod(ctx.symbols().mm_call),
-            None => return None,
-        };
+        let mm = ctx.metamethod_of(func_val, ctx.symbols().mm_call);
         if mm.is_nil() {
             return None;
         }
@@ -4464,31 +4466,19 @@ fn resolve_call_chain_slow<'gc>(
     None
 }
 
-/// Look up a binary metamethod on `lhs` first, then `rhs`. Only checks
-/// metatables on tables; userdata metatables and the string metatable
-/// are pending those subsystems (see #47). `name` is the pre-interned
-/// LuaString from `Context::symbols()`.
+/// Binary metamethod `name`, taken from `lhs` first, then `rhs`.
 #[inline]
-fn binop_metamethod<'gc>(lhs: Value<'gc>, rhs: Value<'gc>, name: LuaString<'gc>) -> Value<'gc> {
-    if let Some(t) = lhs.get_table() {
-        let m = t.get_metamethod(name);
-        if !m.is_nil() {
-            return m;
-        }
+pub(crate) fn binop_metamethod<'gc>(
+    ctx: Context<'gc>,
+    lhs: Value<'gc>,
+    rhs: Value<'gc>,
+    name: LuaString<'gc>,
+) -> Value<'gc> {
+    let m = ctx.metamethod_of(lhs, name);
+    if !m.is_nil() {
+        return m;
     }
-    if let Some(t) = rhs.get_table() {
-        return t.get_metamethod(name);
-    }
-    Value::nil()
-}
-
-/// Look up a unary metamethod on `val`. Same caveat as `binop_metamethod`.
-#[inline]
-fn unop_metamethod<'gc>(val: Value<'gc>, name: LuaString<'gc>) -> Value<'gc> {
-    if let Some(t) = val.get_table() {
-        return t.get_metamethod(name);
-    }
-    Value::nil()
+    ctx.metamethod_of(rhs, name)
 }
 
 /// Invoke a metamethod / iterator (or other helper) with a post-return

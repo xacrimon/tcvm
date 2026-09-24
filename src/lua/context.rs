@@ -67,6 +67,13 @@ impl<'gc> Context<'gc> {
         }
     }
 
+    /// Metamethod `name` of `v`, nil when absent (`luaT_gettmbyobj`).
+    #[inline]
+    pub fn metamethod_of(self, v: Value<'gc>, name: LuaString<'gc>) -> Value<'gc> {
+        self.metatable_of(v)
+            .map_or(Value::nil(), |mt| mt.raw_get(Value::string(name)))
+    }
+
     /// Set `v`'s metatable, which for types other than table and userdata
     /// is shared by every value of that type (`lua_setmetatable`).
     pub fn set_metatable_of(self, v: Value<'gc>, mt: Option<Table<'gc>>) {

@@ -3,6 +3,7 @@ use crate::builtin::util;
 use crate::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Value};
 use crate::lua::{StashedError, StashedFunction, StashedTable};
 use crate::vm::async_sequence::{AsyncSequence, SequenceReturn, async_sequence};
+use crate::vm::interp::binop_metamethod;
 use crate::vm::sequence::CallbackAction;
 
 /// Fetch argument 1 as a table or raise the standard bad-argument error.
@@ -475,7 +476,7 @@ async fn sort_less(
         if let Some(r) = prim {
             return Ok(Plan::Ready(r));
         }
-        let m = lt_metamethod(ctx, a, b);
+        let m = binop_metamethod(ctx, a, b, ctx.symbols().mm_lt);
         if let Some(f) = m.get_function() {
             stack.replace(&[a, b]);
             Ok(Plan::CallMeta(locals.stash(ctx.mutation(), f)))
@@ -516,22 +517,6 @@ fn sort_truthy(seq: &mut AsyncSequence) -> bool {
         let v = stack.get(0);
         !(v.is_nil() || v.get_boolean() == Some(false))
     })
-}
-
-/// The `__lt` metamethod for an ordering of `a < b` (checked on `a` then `b`),
-/// mirroring the VM's `binop_metamethod`.
-fn lt_metamethod<'gc>(ctx: Context<'gc>, a: Value<'gc>, b: Value<'gc>) -> Value<'gc> {
-    let name = ctx.symbols().mm_lt;
-    if let Some(t) = a.get_table() {
-        let m = t.get_metamethod(name);
-        if !m.is_nil() {
-            return m;
-        }
-    }
-    if let Some(t) = b.get_table() {
-        return t.get_metamethod(name);
-    }
-    Value::nil()
 }
 
 /// Build the "invalid order function for sorting" error as a stashed error.

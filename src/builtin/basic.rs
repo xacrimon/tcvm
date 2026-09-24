@@ -258,13 +258,7 @@ fn lua_pairs<'gc>(
         ));
     }
     let t = stack.get(0);
-    let metatable = match t.get_table() {
-        Some(t) => t.metatable(),
-        None => t.get_userdata().and_then(|u| u.metatable()),
-    };
-    let mm = metatable.map_or(Value::nil(), |mt| {
-        mt.raw_get(Value::string(LuaString::new(ctx, b"__pairs")))
-    });
+    let mm = ctx.metamethod_of(t, LuaString::new(ctx, b"__pairs"));
     if mm.is_nil() {
         stack.replace(&[closure.upvalues[0], t, Value::nil(), Value::nil()]);
         return Ok(CallbackAction::Return);
