@@ -371,12 +371,16 @@ impl<'gc> ThreadState<'gc> {
         unsafe { self.frames.last().unwrap_unchecked() }
     }
 
+    /// Raw pointer to the innermost frame. Derived from the buffer rather than
+    /// a `&mut` to the element, so it stays usable across later borrows of
+    /// `frames` and may be offset to neighbouring frames.
+    ///
     /// # Safety
     /// The innermost frame must be a Lua frame.
     #[inline]
-    pub unsafe fn top_lua_unchecked_mut(&mut self) -> &mut LuaFrame<'gc> {
+    pub unsafe fn top_lua_ptr(&mut self) -> *mut LuaFrame<'gc> {
         debug_assert!(self.top_is_lua(), "non-Lua frame on top");
-        unsafe { self.frames.last_mut().unwrap_unchecked() }
+        unsafe { self.frames.as_mut_ptr().add(self.frames.len() - 1) }
     }
 
     /// The innermost frame if it is an executor frame.

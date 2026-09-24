@@ -144,7 +144,7 @@ pub(crate) struct DispatchState<'gc> {
 /// reallocate.
 #[inline(always)]
 fn top_frame<'gc>(thread: &mut ThreadState<'gc>) -> (*mut LuaFrame<'gc>, LuaFn<'gc>) {
-    let frame: *mut LuaFrame<'gc> = unsafe { thread.top_lua_unchecked_mut() };
+    let frame = unsafe { thread.top_lua_ptr() };
     (frame, unsafe { (*frame).closure })
 }
 
