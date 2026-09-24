@@ -702,10 +702,9 @@ fn lua_open<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let name_val = stack.get(0);
-    let name = name_val.get_string().ok_or_else(|| {
-        let got = (!stack.is_empty()).then_some(name_val);
-        util::type_error(ctx, "open", 1, "string", got)
-    })?;
+    let name = name_val
+        .get_string()
+        .ok_or_else(|| util::type_error(ctx, "open", 1, "string", stack.arg(0)))?;
     let mode_val = stack.get(1);
     let mode = if mode_val.is_nil() {
         b"r".as_slice()
@@ -1093,8 +1092,7 @@ fn lua_file_setvbuf<'gc>(
             ));
         }
         None => {
-            let got = (stack.len() >= 2).then_some(mode);
-            return Err(util::type_error(ctx, "setvbuf", 2, "string", got));
+            return Err(util::type_error(ctx, "setvbuf", 2, "string", stack.arg(1)));
         }
     }
     stack.ret1(Value::boolean(true));

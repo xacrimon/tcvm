@@ -226,8 +226,7 @@ fn lua_next<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let Some(t) = stack.get(0).get_table() else {
-        let got = (!stack.is_empty()).then(|| stack.get(0));
-        return Err(util::type_error(ctx, "next", 1, "table", got));
+        return Err(util::type_error(ctx, "next", 1, "table", stack.arg(0)));
     };
     match t.next(ctx.mutation(), stack.get(1)) {
         Ok(Some((k, v))) => stack.replace(&[k, v]),
@@ -404,8 +403,7 @@ fn lua_rawget<'gc>(
     let t_arg = stack.get(0);
     let key = stack.get(1);
     let Some(t) = t_arg.get_table() else {
-        let got = (!stack.is_empty()).then_some(t_arg);
-        return Err(util::type_error(ctx, "rawget", 1, "table", got));
+        return Err(util::type_error(ctx, "rawget", 1, "table", stack.arg(0)));
     };
     let v = t.raw_get(key);
     stack.ret1(v);
@@ -425,8 +423,13 @@ fn lua_rawlen<'gc>(
     } else if let Some(t) = v.get_table() {
         t.raw_len() as i64
     } else {
-        let got = (!stack.is_empty()).then_some(v);
-        return Err(util::type_error(ctx, "rawlen", 1, "table or string", got));
+        return Err(util::type_error(
+            ctx,
+            "rawlen",
+            1,
+            "table or string",
+            stack.arg(0),
+        ));
     };
     stack.ret1(Value::integer(ctx.mutation(), len));
     Ok(CallbackAction::Return)
@@ -441,8 +444,7 @@ fn lua_rawset<'gc>(
     let key = stack.get(1);
     let value = stack.get(2);
     let Some(t) = t_arg.get_table() else {
-        let got = (!stack.is_empty()).then_some(t_arg);
-        return Err(util::type_error(ctx, "rawset", 1, "table", got));
+        return Err(util::type_error(ctx, "rawset", 1, "table", stack.arg(0)));
     };
     // `luaH_set` raises from inside the C function, so unlike argument
     // errors these carry no position.
@@ -499,17 +501,19 @@ fn lua_setmetatable<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let t_arg = stack.get(0);
-    let mt_arg = stack.get(1);
-    let Some(t) = t_arg.get_table() else {
-        let got = (!stack.is_empty()).then_some(t_arg);
-        return Err(util::type_error(ctx, "setmetatable", 1, "table", got));
+    let Some(t) = stack.get(0).get_table() else {
+        return Err(util::type_error(
+            ctx,
+            "setmetatable",
+            1,
+            "table",
+            stack.arg(0),
+        ));
     };
-    let mt = match mt_arg.get_table() {
-        Some(mt) => Some(mt),
-        None if mt_arg.is_nil() && stack.len() >= 2 => None,
-        None => {
-            let got = (stack.len() >= 2).then_some(mt_arg);
+    let mt = match stack.arg(1) {
+        Some(v) if v.is_nil() => None,
+        Some(v) if let Some(mt) = v.get_table() => Some(mt),
+        got => {
             return Err(util::type_error(
                 ctx,
                 "setmetatable",
@@ -642,8 +646,7 @@ fn lua_xpcall<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let Some(handler) = stack.get(1).get_function() else {
-        let got = (stack.len() >= 2).then(|| stack.get(1));
-        return Err(util::type_error(ctx, "xpcall", 2, "function", got));
+        return Err(util::type_error(ctx, "xpcall", 2, "function", stack.arg(1)));
     };
     // Drop the handler slot so the callee and its args sit in `Call` layout.
     stack.remove(1);

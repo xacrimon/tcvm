@@ -257,10 +257,9 @@ fn lua_format<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let fmt_val = stack.get(0);
-    let fmt_str = fmt_val.get_string().ok_or_else(|| {
-        let got = (!stack.is_empty()).then_some(fmt_val);
-        util::type_error(ctx, "format", 1, "string", got)
-    })?;
+    let fmt_str = fmt_val
+        .get_string()
+        .ok_or_else(|| util::type_error(ctx, "format", 1, "string", stack.arg(0)))?;
     let fmt = fmt_str.as_bytes();
 
     let mut f = Formatter {

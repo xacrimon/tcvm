@@ -131,12 +131,10 @@ fn lua_setmetatable<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let v = stack.get(0);
-    let mt_arg = stack.get(1);
-    let mt = match mt_arg.get_table() {
-        Some(mt) => Some(mt),
-        None if mt_arg.is_nil() && stack.len() >= 2 => None,
-        None => {
-            let got = (stack.len() >= 2).then_some(mt_arg);
+    let mt = match stack.arg(1) {
+        Some(v) if v.is_nil() => None,
+        Some(v) if let Some(mt) = v.get_table() => Some(mt),
+        got => {
             return Err(util::type_error(
                 ctx,
                 "setmetatable",

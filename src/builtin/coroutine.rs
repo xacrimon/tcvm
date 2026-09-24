@@ -40,10 +40,10 @@ fn lua_create<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let f = stack.get(0).get_function().ok_or_else(|| {
-        let got = (!stack.is_empty()).then(|| stack.get(0));
-        util::type_error(ctx, "create", 1, "function", got)
-    })?;
+    let f = stack
+        .get(0)
+        .get_function()
+        .ok_or_else(|| util::type_error(ctx, "create", 1, "function", stack.arg(0)))?;
     let thread = Thread::new(ctx.mutation());
     {
         let mc = ctx.mutation();
@@ -66,10 +66,10 @@ fn lua_resume<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let co = stack.get(0).get_thread().ok_or_else(|| {
-        let got = (!stack.is_empty()).then(|| stack.get(0));
-        util::type_error(ctx, "resume", 1, "thread", got)
-    })?;
+    let co = stack
+        .get(0)
+        .get_thread()
+        .ok_or_else(|| util::type_error(ctx, "resume", 1, "thread", stack.arg(0)))?;
     if let Some(msg) = unresumable_reason(ctx, stack.exec(), co) {
         let m = Value::string(LuaString::new(ctx, msg.as_bytes()));
         stack.replace(&[Value::boolean(false), m]);
@@ -121,10 +121,10 @@ fn lua_status<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let co = stack.get(0).get_thread().ok_or_else(|| {
-        let got = (!stack.is_empty()).then(|| stack.get(0));
-        util::type_error(ctx, "status", 1, "thread", got)
-    })?;
+    let co = stack
+        .get(0)
+        .get_thread()
+        .ok_or_else(|| util::type_error(ctx, "status", 1, "thread", stack.arg(0)))?;
     let s: &[u8] = if co.ptr_eq(stack.exec().current_thread()) {
         b"running"
     } else {
@@ -180,10 +180,10 @@ fn lua_wrap<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let f = stack.get(0).get_function().ok_or_else(|| {
-        let got = (!stack.is_empty()).then(|| stack.get(0));
-        util::type_error(ctx, "wrap", 1, "function", got)
-    })?;
+    let f = stack
+        .get(0)
+        .get_function()
+        .ok_or_else(|| util::type_error(ctx, "wrap", 1, "function", stack.arg(0)))?;
     let thread = Thread::new(ctx.mutation());
     {
         let mc = ctx.mutation();
@@ -212,10 +212,10 @@ fn lua_close<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let co = stack.get(0).get_thread().ok_or_else(|| {
-        let got = (!stack.is_empty()).then(|| stack.get(0));
-        util::type_error(ctx, "close", 1, "thread", got)
-    })?;
+    let co = stack
+        .get(0)
+        .get_thread()
+        .ok_or_else(|| util::type_error(ctx, "close", 1, "thread", stack.arg(0)))?;
     // Pointer-eq against current first to avoid re-borrowing the running
     // thread's RefLock (mut-borrowed by the interpreter).
     if co.ptr_eq(stack.exec().current_thread()) {
