@@ -60,10 +60,7 @@ impl<'gc> Table<'gc> {
     /// mutations of the metatable update its shared `MtCache` bitset
     /// in place.
     pub fn set_metatable(self, ctx: Context<'gc>, mt: Option<Table<'gc>>) {
-        let new_cache = match mt {
-            Some(t) => Some(t.ensure_mt_cache(ctx)),
-            None => None,
-        };
+        let new_cache = mt.map(|t| t.ensure_mt_cache(ctx));
         let mut state = self.0.borrow_mut(ctx.mutation());
         state.shape = shape::transition_set_metatable(
             ctx.mutation(),
@@ -221,8 +218,11 @@ impl<'gc> TableState<'gc> {
         }
     }
 
-    /// Read the slot directly. Caller is responsible for ensuring `slot`
-    /// is in range — used by the IC fast path on a verified shape match.
+    /// Read the slot directly; used by the IC fast path on a verified shape match.
+    ///
+    /// # Safety
+    ///
+    /// `slot` must be in range for this table's shape.
     #[inline]
     pub unsafe fn property_at(&self, slot: u32) -> Value<'gc> {
         unsafe { *self.properties.get_unchecked(slot as usize) }

@@ -116,7 +116,7 @@ impl<T: ?Sized> Write<T> {
         T: DerefWrite,
     {
         // SAFETY: `DerefWrite` guarantees that the `Deref` impl is `Write`-compatible.
-        unsafe { Write::assume(&*self) }
+        unsafe { Write::assume(self) }
     }
 }
 

@@ -92,7 +92,7 @@ pub struct CallSite {
     /// replays `StoreResult`/`CondJump`/`TForCall`/`IgnoreResult`, since it
     /// has no Lua frame to park the continuation on. `None` for ordinary
     /// calls, where `func_idx`/`returns` drive the landing.
-    pub cont: Option<Continuation>,
+    pub(crate) cont: Option<Continuation>,
 }
 
 /// Bits of `LuaFrame::flags`.

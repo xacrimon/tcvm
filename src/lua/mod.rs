@@ -553,7 +553,7 @@ mod tests {
         // Regression guards for forms that already lexed.
         assert_eq!(run_returning_float("return 1.5"), 1.5);
         assert_eq!(run_returning_float("return 1e5"), 100000.0);
-        assert_eq!(run_returning_float("return 3.14"), 3.14);
+        assert_eq!(run_returning_float("return 2.75"), 2.75);
     }
 
     fn run_expecting_error(src: &str) -> RuntimeError {
@@ -1038,7 +1038,7 @@ mod tests {
         }
         prog.push_str("return t.k0 + t.k60 + t.k69");
         let n = run_returning_int(&prog);
-        assert_eq!(n, 0 + 60 + 69);
+        assert_eq!(n, 60 + 69);
     }
 
     #[test]

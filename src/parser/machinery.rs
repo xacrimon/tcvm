@@ -48,7 +48,7 @@ impl<'cache, 'source> State<'cache, 'source> {
     pub fn peek(&self) -> Option<SyntaxKind> {
         self.tokens[self.cursor + 1..]
             .iter()
-            .find_map(|(t, _)| t.is_trivia().not().then(|| *t))
+            .find_map(|(t, _)| t.is_trivia().not().then_some(*t))
     }
 
     fn span(&self) -> Span {
@@ -128,7 +128,7 @@ impl<'cache, 'source> State<'cache, 'source> {
     }
 
     pub fn finish(self) -> (GreenNode, LineMap, Vec<ariadne::Report<'static, Span>>) {
-        let (tree, lines) = Sink::new(self.cache, &self.tokens, self.events, self.source).finish();
+        let (tree, lines) = Sink::new(self.cache, self.events, self.source).finish();
         (tree, lines, self.reports)
     }
 }
@@ -393,8 +393,6 @@ impl Display for Span {
 
 struct Sink<'cache, 'source> {
     builder: GreenNodeBuilder<'cache, 'static, SyntaxKind>,
-    tokens: &'source [(SyntaxKind, Span)],
-    cursor: usize,
     events: Vec<Event>,
     source: &'source str,
     lines: LineMap,
@@ -411,14 +409,11 @@ struct Sink<'cache, 'source> {
 impl<'cache, 'source> Sink<'cache, 'source> {
     fn new(
         cache: &'cache mut NodeCache<'static>,
-        tokens: &'source [(SyntaxKind, Span)],
         events: Vec<Event>,
         source: &'source str,
     ) -> Self {
         Self {
             builder: GreenNodeBuilder::with_cache(cache),
-            tokens,
-            cursor: 0,
             events,
             source,
             lines: LineMap::default(),
@@ -429,7 +424,6 @@ impl<'cache, 'source> Sink<'cache, 'source> {
     }
 
     fn token(&mut self, kind: SyntaxKind, span: Span) {
-        self.cursor += 1;
         let text = &self.source[span];
         let newlines = self.source[self.last_source_offset as usize..span.start as usize]
             .bytes()

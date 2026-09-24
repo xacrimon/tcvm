@@ -415,11 +415,7 @@ fn read_number<R: BufRead>(r: &mut R) -> std::io::Result<ReadOne> {
     let mut seen_dot = false;
     let mut seen_exp = false;
     let mut digits = 0usize;
-    loop {
-        let b = match r.fill_buf()?.first() {
-            Some(&b) => b,
-            None => break,
-        };
+    while let Some(&b) = r.fill_buf()?.first() {
         let mut is_digit = false;
         let accept = if b == b'+' || b == b'-' {
             // A sign starts the token or follows the exponent marker (`p`/`P` in

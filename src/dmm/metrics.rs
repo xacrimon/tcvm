@@ -317,8 +317,7 @@ impl Metrics {
             .0
             .total_external_bytes
             .get()
-            .checked_sub(self.0.external_bytes_start.get())
-            .unwrap_or(0);
+            .saturating_sub(self.0.external_bytes_start.get());
 
         let allocated_bytes =
             self.0.allocated_gc_bytes.get() as f64 + allocated_external_bytes as f64;

@@ -140,18 +140,14 @@ pub fn op_arith<'gc, Op: ArithOp>(
 
     let lhs = if let Some(v) = lhs.get_integer() {
         v as f64
-    } else if let Some(v) = lhs.get_float() {
-        v
     } else {
-        return None;
+        lhs.get_float()?
     };
 
     let rhs = if let Some(v) = rhs.get_integer() {
         v as f64
-    } else if let Some(v) = rhs.get_float() {
-        v
     } else {
-        return None;
+        rhs.get_float()?
     };
 
     Some(op_arith_float::<Op>(lhs, rhs))

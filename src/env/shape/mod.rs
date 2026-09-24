@@ -410,14 +410,13 @@ pub fn transition_add_prop<'gc>(
         let table = parent.data().transitions.borrow();
         let key_ptr = Gc::as_ptr(key.inner()) as usize;
         let h = key_ptr as u64;
-        if let Some(edge) = table.by_prop.find(h, |e| e.key == key) {
-            if let Some(child) = edge.child.upgrade(mc) {
-                return Shape(child);
-            }
-            // Stale weak edge: drop it on the slow path. We can't
-            // remove during the immutable borrow; instead, fall through
-            // and let the insert below replace it.
+        if let Some(edge) = table.by_prop.find(h, |e| e.key == key)
+            && let Some(child) = edge.child.upgrade(mc)
+        {
+            return Shape(child);
         }
+        // A stale weak edge falls through: it can't be removed during the
+        // immutable borrow, so the insert below replaces it.
     }
 
     // Slow path: allocate a child and install/replace the edge.
@@ -502,10 +501,10 @@ pub fn transition_set_metatable<'gc>(
     {
         let table = parent.data().transitions.borrow();
         let h = mt_edge_hash(new_mt);
-        if let Some(edge) = table.by_mt.find(h, |e| mt_edge_eq(e.mt_cache, new_mt)) {
-            if let Some(child) = edge.child.upgrade(mc) {
-                return Shape(child);
-            }
+        if let Some(edge) = table.by_mt.find(h, |e| mt_edge_eq(e.mt_cache, new_mt))
+            && let Some(child) = edge.child.upgrade(mc)
+        {
+            return Shape(child);
         }
     }
 

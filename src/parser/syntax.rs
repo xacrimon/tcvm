@@ -26,7 +26,6 @@ impl Syntax for SyntaxKind {
 
 pub type SyntaxNode = cstree::syntax::SyntaxNode<SyntaxKind>;
 pub type SyntaxToken = cstree::syntax::SyntaxToken<SyntaxKind>;
-pub type SyntaxElement = NodeOrToken<SyntaxNode, SyntaxToken>;
 
 macro_rules! ast_node {
     ($name:ident, $kind:expr) => {
@@ -41,6 +40,7 @@ macro_rules! ast_node {
                 }
             }
 
+            #[allow(dead_code)]
             pub fn syntax(&self) -> &SyntaxNode {
                 &self.0
             }

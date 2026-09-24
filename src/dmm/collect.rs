@@ -2,9 +2,12 @@ pub use tcvm_derive::Collect;
 
 use crate::dmm::{Gc, GcWeak};
 
-/// A trait for garbage collected objects that can be placed into `Gc` pointers. This trait is
-/// unsafe, because `Gc` pointers inside an Arena are assumed never to be dangling, and in order to
-/// ensure this certain rules must be followed:
+/// A trait for garbage collected objects that can be placed into `Gc` pointers.
+///
+/// # Safety
+///
+/// `Gc` pointers inside an Arena are assumed never to be dangling, and in order to ensure this
+/// certain rules must be followed:
 ///
 ///   1. `Collect::trace` *must* trace over *every* `Gc` and `GcWeak` pointer held inside this type.
 ///   2. Held `Gc` and `GcWeak` pointers must not be accessed inside `Drop::drop` since during drop
