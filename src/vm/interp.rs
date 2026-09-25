@@ -3622,7 +3622,10 @@ extern "rust-preserve-none" fn op_closure<'gc>(
     let proto = parent_closure.proto.prototypes[proto_idx as usize];
 
     let thread_handle = thread.thread_handle.expect("thread must have a handle");
-    let mut upvalues_vec = Vec::with_capacity(proto.upvalue_desc.len());
+    let mut upvalues_vec = Vec::with_capacity_in(
+        proto.upvalue_desc.len(),
+        crate::dmm::allocator_api::MetricsAlloc::new(ctx.mutation()),
+    );
     for desc in proto.upvalue_desc.iter() {
         let uv = match desc {
             UpValueDescriptor::ParentLocal(idx) => {
@@ -3650,7 +3653,7 @@ extern "rust-preserve-none" fn op_closure<'gc>(
         };
         upvalues_vec.push(uv);
     }
-    let upvalues: Box<[Upvalue<'gc>]> = upvalues_vec.into_boxed_slice();
+    let upvalues = upvalues_vec.into_boxed_slice();
 
     let func = Function::new_lua(ctx.mutation(), proto, upvalues);
     *reg!(ref mut dst) = Value::function(func);

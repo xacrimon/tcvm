@@ -15,7 +15,8 @@ pub struct LuaString<'gc>(Gc<'gc, StringData>);
 #[derive(Collect)]
 #[collect(internal, require_static)]
 pub struct StringData {
-    bytes: Box<[u8]>,
+    // `'static` because `StringData` is; the arena outlives every string.
+    bytes: Box<[u8], MetricsAlloc<'static>>,
 }
 
 impl<'gc> LuaString<'gc> {
@@ -118,8 +119,13 @@ impl<'gc> Interner<'gc> {
         match entry {
             hash_table::Entry::Occupied(entry) => *entry.get(),
             hash_table::Entry::Vacant(entry) => {
+                let mut buf = Vec::with_capacity_in(
+                    bytes.len(),
+                    MetricsAlloc::from_metrics(mc.metrics().clone()),
+                );
+                buf.extend_from_slice(bytes);
                 let data = StringData {
-                    bytes: bytes.into(),
+                    bytes: buf.into_boxed_slice(),
                 };
 
                 let string = LuaString(Gc::new(mc, data));
