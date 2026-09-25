@@ -20,6 +20,7 @@ pub use stash::{
 use crate::builtin;
 use crate::dmm::Rootable;
 use crate::dmm::arena::CollectionPhase;
+use crate::dmm::metrics::Pacing;
 use crate::dmm::{Arena, Collect, DynamicRootSet, Gc, GcLock, Lock, Mutation};
 use crate::env::shape::Shape;
 use crate::env::string::Interner;
@@ -69,6 +70,14 @@ impl<'gc> State<'gc> {
     }
 }
 
+/// Allocation debt, in bytes, between collector slices: past the knee of the
+/// exit-overhead curve, with slices of ~10 µs on `particles_bench`.
+const GC_GRANULARITY: usize = 64 * 1024;
+
+/// The least the collector sleeps between cycles. Only binds when the live
+/// set is tiny; the default 4 KiB restarts a cycle every few KiB of garbage.
+const GC_MIN_SLEEP: usize = 64 * 1024;
+
 /// A Lua runtime instance.
 pub struct Lua {
     arena: Arena<Rootable![State<'_>]>,
@@ -98,12 +107,12 @@ impl Lua {
                 type_metatables: std::array::from_fn(|_| Gc::new(mc, Lock::new(None))),
             }
         });
-        // Prototype knob for measuring exit overhead against collection latency.
-        let gc_granularity = std::env::var("TCVM_GC_GRANULARITY")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1024);
-        arena.metrics().set_gc_granularity(gc_granularity);
+        let metrics = arena.metrics();
+        metrics.set_pacing(Pacing {
+            min_sleep: GC_MIN_SLEEP,
+            ..Pacing::DEFAULT
+        });
+        metrics.set_gc_granularity(GC_GRANULARITY);
         Lua { arena }
     }
 
