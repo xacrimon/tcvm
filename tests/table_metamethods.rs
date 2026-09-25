@@ -238,6 +238,26 @@ return table.concat(out, ' | ')
     );
 }
 
+/// VM-style errors raised by the library carry no position; `luaL_error` ones name the caller.
+#[test]
+fn error_positions() {
+    let src = r#"
+local out = {}
+local function try(f) out[#out + 1] = select(2, pcall(f)) end
+try(function() local _ = table.concat(setmetatable({}, {__index = 5, __len = function() return 1 end})) end)
+try(function() local _ = table.concat(setmetatable({}, {__index = {}, __len = function() return 1.5 end})) end)
+local loop = {}; loop.__index = loop; setmetatable(loop, loop)
+try(function() local _ = table.unpack(setmetatable({}, {__index = loop, __len = function() return 1 end})) end)
+try(function() table.sort({1, {}}) end)
+try(function() table.sort({3, 2, 1, 4}, function() return true end) end)
+return table.concat(out, ' | ')
+"#;
+    assert_eq!(
+        run(src),
+        r#"attempt to index a number value | c:15: object length is not an integer | '__index' chain too long; possible loop | attempt to compare table with number | c:19: invalid order function for sorting"#
+    );
+}
+
 /// Yielding from a metamethod the table library calls is an intentional
 /// divergence: Lua raises "attempt to yield across a C-call boundary".
 #[test]

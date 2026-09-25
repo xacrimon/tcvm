@@ -795,7 +795,7 @@ fn less_step(
         }
         let m = binop_metamethod(ctx, x, y, ctx.symbols().mm_lt);
         if m.is_nil() {
-            return Err(Error::from_str(ctx, &util::compare_error_msg(x, y)));
+            return Err(util::runtime_error(ctx, &util::compare_error_msg(x, y)));
         }
         stack.extend([x, y]);
         Ok(Some(Less::Lt(locals.stash(ctx.mutation(), m), bottom)))
