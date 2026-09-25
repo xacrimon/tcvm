@@ -4,7 +4,9 @@ use std::pin::Pin;
 use crate::Context;
 use crate::builtin::util;
 use crate::dmm::{Collect, Trace};
-use crate::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
+use crate::env::{
+    Error, Function, LuaString, MetamethodBits, NativeClosure, NativeFn, Stack, Value,
+};
 use crate::vm::async_sequence::{SequenceReturn, async_sequence};
 use crate::vm::sequence::{
     BoxSequence, CallbackAction, Catch, Execution, Sequence, SequencePoll, seq_trace_pointers,
@@ -19,7 +21,6 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         ("dofile", lua_dofile),
         ("error", lua_error),
         ("getmetatable", lua_getmetatable),
-        ("ipairs", lua_ipairs),
         ("load", lua_load),
         ("loadfile", lua_loadfile),
         ("pcall", lua_pcall),
@@ -53,6 +54,15 @@ pub fn load<'gc>(ctx: Context<'gc>) {
     set(
         "pairs",
         Function::new_native(ctx.mutation(), lua_pairs, Box::new([Value::function(next)])),
+    );
+    let ipairs_iter = Function::new_native(ctx.mutation(), ipairs_aux, Box::new([]));
+    set(
+        "ipairs",
+        Function::new_native(
+            ctx.mutation(),
+            lua_ipairs,
+            Box::new([Value::function(ipairs_iter)]),
+        ),
     );
 }
 
@@ -158,15 +168,11 @@ fn lua_getmetatable<'gc>(
     Ok(CallbackAction::Return)
 }
 
-/// `ipairs(t)` — returns `(iterator, t, 0)`. The iterator yields `1,t[1]`,
-/// `2,t[2]`, … stopping at the first absent index.
-///
-/// Indexing is raw (no `__index`); Lua 5.3+ routes `ipairs` through
-/// metamethod-aware `geti`, but that requires invoking `__index`, which can
-/// re-enter Lua. TODO(#27): honor `__index` once native→Lua calls are wired.
+/// `ipairs(t)` — returns `(iterator, t, 0)`, the iterator from upvalue 0 so
+/// every call hands back the same function.
 fn lua_ipairs<'gc>(
     ctx: Context<'gc>,
-    _closure: &NativeClosure<'gc>,
+    closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     if stack.is_empty() {
@@ -176,29 +182,49 @@ fn lua_ipairs<'gc>(
         ));
     }
     let t = stack.get(0);
-    let iter = Function::new_native(ctx.mutation(), ipairs_aux, Box::new([]));
-    stack.replace(&[Value::function(iter), t, Value::integer(ctx.mutation(), 0)]);
+    stack.replace(&[closure.upvalues[0], t, Value::integer(ctx.mutation(), 0)]);
     Ok(CallbackAction::Return)
 }
 
-/// Stateless iterator body for `ipairs`: `(t, i) -> (i+1, t[i+1])`, or a lone
-/// `nil` once the array part ends.
+/// Iterator body for `ipairs`: `(t, i) -> (i + 1, t[i + 1])`, or a lone `nil`
+/// once that is nil. Indexing goes through `__index`.
 fn ipairs_aux<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let t = stack.get(0).get_table().ok_or_else(|| {
-        Error::from_str(ctx, "bad argument #1 to 'ipairs iterator' (table expected)")
-    })?;
-    let i = stack.get(1).get_integer().unwrap_or(0) + 1;
-    let v = t.raw_get(Value::integer(ctx.mutation(), i));
-    if v.is_nil() {
-        stack.ret1(Value::nil());
-    } else {
-        stack.replace(&[Value::integer(ctx.mutation(), i), v]);
+    let i = util::check_integer(ctx, stack.get(1), "for iterator", 2)?.wrapping_add(1);
+    if let Some(t) = stack.get(0).get_table() {
+        let v = t.raw_get(Value::integer(ctx.mutation(), i));
+        if !v.is_nil() {
+            stack.replace(&[Value::integer(ctx.mutation(), i), v]);
+            return Ok(CallbackAction::Return);
+        }
+        if !t.shape().has_mm(MetamethodBits::INDEX) {
+            stack.ret1(Value::nil());
+            return Ok(CallbackAction::Return);
+        }
     }
-    Ok(CallbackAction::Return)
+    Ok(ipairs_meta(ctx, i))
+}
+
+/// `ipairs_aux` for a value whose `[i]` may run `__index`.
+#[cold]
+#[inline(never)]
+fn ipairs_meta<'gc>(ctx: Context<'gc>, i: i64) -> CallbackAction<'gc> {
+    let seq = async_sequence(ctx.mutation(), move |_locals, mut seq| async move {
+        util::geti(&mut seq, 0, i).await?;
+        seq.enter(|ctx, _locals, _exec, mut stack| {
+            let v = stack.get(stack.len() - 1);
+            if v.is_nil() {
+                stack.ret1(v);
+            } else {
+                stack.replace(&[Value::integer(ctx.mutation(), i), v]);
+            }
+        });
+        Ok(SequenceReturn::Return)
+    });
+    CallbackAction::sequence(seq)
 }
 
 fn lua_load<'gc>(
