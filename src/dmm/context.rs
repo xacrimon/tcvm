@@ -174,7 +174,9 @@ pub(crate) enum Stop {
 }
 
 pub(crate) struct Context {
-    metrics: Metrics,
+    // A separate allocation, not a field: a `&mut Context` would otherwise invalidate the pointers
+    // allocators hold into it. Freed in `drop`, after every object.
+    metrics: NonNull<Metrics>,
     phase: Phase,
 
     // A linked list of all allocated `GcBox`es.
@@ -232,16 +234,17 @@ impl Drop for Context {
         }
 
         let cx = PhaseGuard::enter(self, Some(Phase::Drop));
-        DropAll(&cx.metrics, cx.all.get());
+        DropAll(cx.metrics(), cx.all.get());
+        // SAFETY: every object, and so every allocator pointing here, is gone.
+        drop(unsafe { Box::from_raw(self.metrics.as_ptr()) });
     }
 }
 
 impl Context {
     pub(crate) unsafe fn new() -> Context {
-        let metrics = Metrics::new();
         Context {
             phase: Phase::Sleep,
-            metrics: metrics.clone(),
+            metrics: NonNull::from(Box::leak(Box::new(Metrics::new()))),
             all: Cell::new(None),
             sweep: None,
             sweep_prev: Cell::new(None),
@@ -263,7 +266,8 @@ impl Context {
 
     #[inline]
     pub(crate) fn metrics(&self) -> &Metrics {
-        &self.metrics
+        // SAFETY: allocated in `new` and freed only when `self` is dropped.
+        unsafe { self.metrics.as_ref() }
     }
 
     #[inline]
@@ -302,7 +306,7 @@ impl Context {
     ) {
         let mut cx = PhaseGuard::enter(self, None);
 
-        if run_until == RunUntil::PayDebt && !(cx.metrics.allocation_debt() > 0.0) {
+        if run_until == RunUntil::PayDebt && !(cx.metrics().allocation_debt() > 0.0) {
             return;
         }
 
@@ -339,7 +343,7 @@ impl Context {
                         // We reset our debt if we have done an entire collection cycle (marking and
                         // sweeping) as a single atomic unit. This keeps inherited debt from growing
                         // without bound.
-                        cx.metrics.finish_cycle(has_slept);
+                        cx.metrics().finish_cycle(has_slept);
                         cx.root_needs_trace = true;
                         cx.switch(Phase::Sleep);
 
@@ -363,7 +367,7 @@ impl Context {
                 Phase::Drop => unreachable!(),
             }
 
-            if run_until == RunUntil::PayDebt && !(cx.metrics.allocation_debt() > 0.0) {
+            if run_until == RunUntil::PayDebt && !(cx.metrics().allocation_debt() > 0.0) {
                 break;
             }
         }
@@ -422,7 +426,7 @@ impl Context {
             self.sweep_prev.set(self.all.get());
         }
 
-        self.metrics.mark_gc_allocated(size);
+        self.metrics().mark_gc_allocated(size);
     }
 
     #[inline]
@@ -526,7 +530,7 @@ impl Context {
 
                 // Only marking the *first* time counts as a mark metric.
                 if color == GcColor::White {
-                    self.metrics.mark_gc_marked(gc_box.size());
+                    self.metrics().mark_gc_marked(gc_box.size());
                 }
             }
         }
@@ -537,7 +541,7 @@ impl Context {
         let header = gc_box.header();
         if header.color() == GcColor::White {
             header.set_color(GcColor::WhiteWeak);
-            self.metrics.mark_gc_marked(gc_box.size());
+            self.metrics().mark_gc_marked(gc_box.size());
         }
     }
 
@@ -600,7 +604,7 @@ impl Context {
             self.gray.push(gc_box);
             // Only marking the *first* time counts as a mark metric.
             if color == GcColor::White {
-                self.metrics.mark_gc_marked(gc_box.size());
+                self.metrics().mark_gc_marked(gc_box.size());
             }
         }
     }
@@ -615,7 +619,7 @@ impl Context {
             // We always mark work for objects processed from both the gray and "gray again" queue.
             // When objects are placed into the "gray again" queue due to a write barrier, the
             // original work is *undone*, so we do it again here.
-            self.metrics.mark_gc_traced(gc_box.size());
+            self.metrics().mark_gc_traced(gc_box.size());
             gc_box.header().set_color(GcColor::Black);
 
             // If we have an object in the gray queue, take one, trace it, and turn it black.
@@ -691,10 +695,10 @@ impl Context {
                         // If the alive flag is set, that means we haven't dropped the inner value
                         // of this object,
                         sweep.drop_in_place();
-                        self.metrics.mark_gc_dropped(sweep_size);
+                        self.metrics().mark_gc_dropped(sweep_size);
                     }
                     sweep.dealloc(sweep_size);
-                    self.metrics.mark_gc_freed(sweep_size);
+                    self.metrics().mark_gc_freed(sweep_size);
                 }
             }
             // Keep the `GcBox` as part of the linked list if we traced a weak pointer to it. The
@@ -710,16 +714,16 @@ impl Context {
                     // pointers to this object, only weak pointers, so we can safely drop its
                     // contents.
                     unsafe { sweep.drop_in_place() }
-                    self.metrics.mark_gc_dropped(sweep_size);
+                    self.metrics().mark_gc_dropped(sweep_size);
                 }
-                self.metrics.mark_gc_remembered(sweep_size);
+                self.metrics().mark_gc_remembered(sweep_size);
             }
             // If the next object in the sweep portion of the main list is black, we
             // need to keep it but turn it back white.
             GcColor::Black => {
                 self.sweep_prev.set(Some(sweep));
                 sweep_header.set_color(GcColor::White);
-                self.metrics.mark_gc_remembered(sweep_size);
+                self.metrics().mark_gc_remembered(sweep_size);
             }
             // No gray objects should be in this part of the main list, they should
             // be added to the beginning of the list before the sweep pointer, so it
@@ -738,7 +742,7 @@ impl Context {
         debug_assert_eq!(header.color(), GcColor::Black);
         header.set_color(GcColor::Gray);
         self.gray_again.push(gc_box);
-        self.metrics.mark_gc_untraced(gc_box.size());
+        self.metrics().mark_gc_untraced(gc_box.size());
     }
 }
 
