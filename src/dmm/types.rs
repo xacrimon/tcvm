@@ -64,16 +64,51 @@ impl GcBox {
     /// will cause the stored value to be leaked.
     ///
     /// **SAFETY**: once called, this `GcBox` should never be accessed by any GC
-    /// pointers again.
+    /// pointers again, and `size` must be `self.size()`.
     #[inline(always)]
-    pub(crate) unsafe fn dealloc(self) {
+    pub(crate) unsafe fn dealloc(self, size: usize) {
         unsafe {
-            let layout = self.header().vtable().box_layout;
+            let align = self.header().vtable().box_layout.align();
             let ptr = self.0.as_ptr() as *mut u8;
-            // SAFETY: the pointer was `Box`-allocated with this layout.
-            std::alloc::dealloc(ptr, layout);
+            // SAFETY: the pointer was allocated with this size and alignment.
+            std::alloc::dealloc(ptr, Layout::from_size_align_unchecked(size, align));
         }
     }
+
+    /// The (shallow) size occupied by this box in memory, trailing bytes included.
+    #[inline(always)]
+    pub(crate) fn size(&self) -> usize {
+        let vtable = self.header().vtable();
+        match vtable.trailing_len {
+            None => vtable.box_layout.size(),
+            // SAFETY: only `TrailingBytes` types have a `trailing_len`, and those have no drop
+            // glue, so the length is readable even after `drop_in_place`. The sum can't overflow:
+            // the box was allocated with it.
+            Some(len) => (vtable.box_layout.size() + unsafe { len(*self) })
+                .next_multiple_of(vtable.box_layout.align()),
+        }
+    }
+}
+
+/// The layout of a box whose value is followed by `len` bytes; `base` is the layout without them.
+/// [`GcBox::size`] computes the same size unchecked.
+pub(crate) fn trailing_layout(base: Layout, len: usize) -> Layout {
+    base.size()
+        .checked_add(len)
+        .and_then(|size| Layout::from_size_align(size, base.align()).ok())
+        .expect("trailing bytes too large to allocate")
+        .pad_to_align()
+}
+
+/// A type that [`Gc::new_with_bytes`](crate::dmm::Gc::new_with_bytes) allocates with a run of
+/// bytes directly after it, so a variable-length payload shares its object's allocation.
+///
+/// # Safety
+/// Values must only ever be allocated by `Gc::new_with_bytes` (keep the constructor private),
+/// `trailing_len` must return the length they were allocated with, and the type must have no drop
+/// glue: the collector reads the length to free the box after dropping the value.
+pub unsafe trait TrailingBytes {
+    fn trailing_len(&self) -> usize;
 }
 
 pub(crate) struct GcBoxHeader {
@@ -100,7 +135,25 @@ impl GcBoxHeader {
             const VTABLE: CollectVtable = CollectVtable::vtable_for::<T>();
         }
 
-        let vtable: &'static _ = &<T as HasCollectVtable>::VTABLE;
+        Self::with_vtable(&<T as HasCollectVtable>::VTABLE)
+    }
+
+    /// Like [`GcBoxHeader::new`], for a value allocated with trailing bytes.
+    #[inline(always)]
+    pub fn new_trailing<'gc, T: Collect<'gc> + TrailingBytes>() -> Self {
+        trait HasTrailingVtable {
+            const VTABLE: CollectVtable;
+        }
+
+        impl<'gc, T: Collect<'gc> + TrailingBytes> HasTrailingVtable for T {
+            const VTABLE: CollectVtable = CollectVtable::vtable_for_trailing::<T>();
+        }
+
+        Self::with_vtable(&<T as HasTrailingVtable>::VTABLE)
+    }
+
+    #[inline(always)]
+    fn with_vtable(vtable: &'static CollectVtable) -> Self {
         Self {
             next: Cell::new(None),
             tagged_vtable: Cell::new(vtable as *const _),
@@ -127,12 +180,6 @@ impl GcBoxHeader {
     #[inline(always)]
     pub(crate) fn set_next(&self, next: Option<GcBox>) {
         self.next.set(next)
-    }
-
-    /// Returns the (shallow) size occupied by this box in memory.
-    #[inline(always)]
-    pub(crate) fn size_of_box(&self) -> usize {
-        self.vtable().box_layout.size()
     }
 
     #[inline]
@@ -190,8 +237,10 @@ impl GcBoxHeader {
 /// The type is over-aligned so that `GcBoxHeader` can store flags into the LSBs of the vtable pointer.
 #[repr(align(16))]
 struct CollectVtable {
-    /// The layout of the `GcBox` the GC'd value is stored in.
+    /// The layout of the `GcBox` the GC'd value is stored in, without any trailing bytes.
     box_layout: Layout,
+    /// Reads the length of the value's trailing bytes, for `TrailingBytes` types.
+    trailing_len: Option<unsafe fn(GcBox) -> usize>,
     /// Drops the value stored in the given `GcBox` (without deallocating the box).
     drop_value: unsafe fn(GcBox),
     /// Traces the value stored in the given `GcBox`.
@@ -206,6 +255,7 @@ impl CollectVtable {
     const fn vtable_for<'gc, T: Collect<'gc>>() -> Self {
         Self {
             box_layout: Layout::new::<GcBoxInner<T>>(),
+            trailing_len: None,
             drop_value: |erased| unsafe {
                 ptr::drop_in_place(erased.unerased_value::<T>());
             },
@@ -213,6 +263,18 @@ impl CollectVtable {
                 let val = &*(erased.unerased_value::<T>());
                 val.trace(cc)
             },
+        }
+    }
+
+    #[inline(always)]
+    const fn vtable_for_trailing<'gc, T: Collect<'gc> + TrailingBytes>() -> Self {
+        assert!(
+            !mem::needs_drop::<T>(),
+            "`TrailingBytes` types must not need drop"
+        );
+        Self {
+            trailing_len: Some(|erased| unsafe { (*erased.unerased_value::<T>()).trailing_len() }),
+            ..Self::vtable_for::<T>()
         }
     }
 }
@@ -235,6 +297,12 @@ impl<'gc, T: Collect<'gc>> GcBoxInner<T> {
             value: mem::ManuallyDrop::new(t),
         }
     }
+}
+
+impl<T> GcBoxInner<T> {
+    /// Offset of a `TrailingBytes` value's bytes from the start of its box: right after the box
+    /// itself, so the allocation is exactly `trailing_layout(Layout::new::<Self>(), len)`.
+    pub(crate) const TRAILING_OFFSET: usize = mem::size_of::<Self>();
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]

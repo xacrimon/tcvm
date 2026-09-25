@@ -123,6 +123,15 @@ impl<'gc> Context<'gc> {
             self.mutation,
             RefLock::new(UpvalueState::Closed(Value::table(self.state.globals))),
         );
-        Ok(Function::new_lua(self.mutation, proto, Box::from([env_uv])))
+        let mut upvalues = Vec::with_capacity_in(
+            1,
+            crate::dmm::allocator_api::MetricsAlloc::new(self.mutation),
+        );
+        upvalues.push(env_uv);
+        Ok(Function::new_lua(
+            self.mutation,
+            proto,
+            upvalues.into_boxed_slice(),
+        ))
     }
 }
