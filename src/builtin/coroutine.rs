@@ -27,7 +27,7 @@ pub fn load<'gc>(ctx: Context<'gc>) {
 
     let lib = Table::new(ctx);
     for &(name, handler) in fns {
-        let handler = Function::new_native(ctx.mutation(), handler, Box::new([]));
+        let handler = Function::new_native(ctx.mutation(), handler, &[]);
         let key = Value::string(LuaString::new(ctx, name.as_bytes()));
         lib.raw_set(ctx, key, Value::function(handler));
     }
@@ -200,8 +200,11 @@ fn lua_wrap<'gc>(
         ts.push_exec(ExecKind::Start(f.into()));
         ts.status = ThreadStatus::Suspended;
     }
-    let upvalues: Box<[Value<'gc>]> = Box::new([Value::thread(thread)]);
-    let wrapper = Function::new_native(ctx.mutation(), wrap_callback as NativeFn, upvalues);
+    let wrapper = Function::new_native(
+        ctx.mutation(),
+        wrap_callback as NativeFn,
+        &[Value::thread(thread)],
+    );
     stack.ret1(Value::function(wrapper));
     Ok(CallbackAction::Return)
 }

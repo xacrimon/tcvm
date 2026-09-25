@@ -152,7 +152,7 @@ fn restart_after_a_handler_yields_to_the_host() {
     lua.load_all();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let y = Function::new_native(ctx.mutation(), yielder as NativeFn, Box::new([]));
+            let y = Function::new_native(ctx.mutation(), yielder as NativeFn, &[]);
             let key = Value::string(LuaString::new(ctx, b"yielder"));
             ctx.globals().raw_set(ctx, key, Value::function(y));
             let src = format!("{RECURSE} xpcall(f, function(m) yielder() return m end)");

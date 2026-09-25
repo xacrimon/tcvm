@@ -103,8 +103,8 @@ pub fn load<'gc>(ctx: Context<'gc>) {
     // by every io native; holds the file metatable and the default
     // input/output handles.
     let io_state = Table::new(ctx);
-    let upv = || Box::new([Value::table(io_state)]) as Box<[Value<'gc>]>;
-    let native = |f: NativeFn| Function::new_native(ctx.mutation(), f, upv());
+    let upv = [Value::table(io_state)];
+    let native = |f: NativeFn| Function::new_native(ctx.mutation(), f, &upv);
 
     // Methods table (the metatable's `__index`).
     let methods = Table::new(ctx);
@@ -1175,7 +1175,7 @@ fn make_lines_iter<'gc>(
     upv.push(handle);
     upv.push(Value::boolean(close_eof));
     upv.extend_from_slice(fmt_args);
-    Function::new_native(ctx.mutation(), lines_iter, upv.into_boxed_slice())
+    Function::new_native(ctx.mutation(), lines_iter, &upv)
 }
 
 /// The per-iteration body of a lines iterator. Reads one record; at EOF it

@@ -67,7 +67,7 @@ fn coroutine_yields_from_sequence_then_resumes() {
     lua.load_all();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let f = Function::new_native(ctx.mutation(), yielding_seq as NativeFn, Box::new([]));
+            let f = Function::new_native(ctx.mutation(), yielding_seq as NativeFn, &[]);
             let key = Value::string(LuaString::new(ctx, b"yseq"));
             ctx.globals().raw_set(ctx, key, Value::function(f));
             // Inside a coroutine, call yseq() which yields 42; the

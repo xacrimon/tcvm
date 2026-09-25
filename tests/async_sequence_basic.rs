@@ -31,7 +31,7 @@ fn async_pending_then_return() {
 
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let make_fn = Function::new_native(ctx.mutation(), make as NativeFn, Box::new([]));
+            let make_fn = Function::new_native(ctx.mutation(), make as NativeFn, &[]);
             let key = Value::string(LuaString::new(ctx, b"makeseq"));
             ctx.globals().raw_set(ctx, key, Value::function(make_fn));
             let chunk = ctx.load("return makeseq()", Some("async_pending"))?;
@@ -72,7 +72,7 @@ fn async_call_receives_callee_error() {
 
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let guard_fn = Function::new_native(ctx.mutation(), guard as NativeFn, Box::new([]));
+            let guard_fn = Function::new_native(ctx.mutation(), guard as NativeFn, &[]);
             let key = Value::string(LuaString::new(ctx, b"guard"));
             ctx.globals().raw_set(ctx, key, Value::function(guard_fn));
             let chunk = ctx.load(

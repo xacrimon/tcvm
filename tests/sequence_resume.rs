@@ -80,7 +80,7 @@ fn sequence_resume_then_post_processes() {
     lua.load_all();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let f = Function::new_native(ctx.mutation(), bumpr as NativeFn, Box::new([]));
+            let f = Function::new_native(ctx.mutation(), bumpr as NativeFn, &[]);
             let key = Value::string(LuaString::new(ctx, b"bumpr"));
             ctx.globals().raw_set(ctx, key, Value::function(f));
             let chunk = ctx.load(

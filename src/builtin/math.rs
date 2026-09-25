@@ -47,12 +47,13 @@ pub fn load<'gc>(ctx: Context<'gc>) {
     // `RanState` userdata held as upvalue 0 of both functions.
     let rng = Userdata::new(ctx.mutation(), RefCell::new(RngState::from_entropy()), 0);
 
+    let rng_upvalues = [Value::userdata(rng)];
     let lib = Table::new(ctx);
     for &(name, handler, entry) in fns {
-        let upvalues: Box<[Value<'gc>]> = if name == "random" || name == "randomseed" {
-            Box::new([Value::userdata(rng)])
+        let upvalues: &[Value<'gc>] = if name == "random" || name == "randomseed" {
+            &rng_upvalues
         } else {
-            Box::new([])
+            &[]
         };
         let handler = Function::new_native_with_entry(ctx.mutation(), handler, upvalues, entry);
         let key = Value::string(LuaString::new(ctx, name.as_bytes()));

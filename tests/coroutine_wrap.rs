@@ -50,7 +50,7 @@ fn wrap_rethrows_error_to_caller() {
     lua.load_all();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let boom = Function::new_native(ctx.mutation(), boomer as NativeFn, Box::new([]));
+            let boom = Function::new_native(ctx.mutation(), boomer as NativeFn, &[]);
             let key = Value::string(LuaString::new(ctx, b"boom"));
             ctx.globals().raw_set(ctx, key, Value::function(boom));
 

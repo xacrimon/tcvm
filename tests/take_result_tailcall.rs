@@ -18,7 +18,7 @@ fn take_result_after_suspended_tailcall() {
     let mut lua = Lua::new();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let y = Function::new_native(ctx.mutation(), yielder as NativeFn, Box::new([]));
+            let y = Function::new_native(ctx.mutation(), yielder as NativeFn, &[]);
             let k = Value::string(LuaString::new(ctx, b"yielder"));
             ctx.globals().raw_set(ctx, k, Value::function(y));
             let chunk = ctx.load(

@@ -1,6 +1,7 @@
 use std::cell::UnsafeCell;
 use std::ops::{Deref, DerefMut};
 
+use crate::dmm::allocator_api::MetricsAlloc;
 use crate::dmm::{Collect, Gc, Mutation, Ref, RefLock, RefMut, Trace};
 use crate::env::error::Error;
 use crate::env::function::{LuaFn, Upvalue};
@@ -244,10 +245,10 @@ pub struct ThreadState<'gc> {
     /// collector clears them when it traces the thread.
     pub(crate) stack: ValueStack<'gc>,
     /// Lua frames, innermost last.
-    pub(crate) frames: Vec<LuaFrame<'gc>>,
+    pub(crate) frames: Vec<LuaFrame<'gc>, MetricsAlloc<'gc>>,
     /// Executor frames, innermost last, each placed among `frames` by its
     /// `depth`. Kept apart so the interpreter's frames are plain records.
-    pub(crate) exec_frames: Vec<ExecFrame<'gc>>,
+    pub(crate) exec_frames: Vec<ExecFrame<'gc>, MetricsAlloc<'gc>>,
     pub(crate) open_upvalues: Vec<Upvalue<'gc>>,
     /// Open to-be-closed variables by stack position, innermost last
     /// (`L->tbclist`). Each leaves the list just before its `__close` runs.
@@ -290,26 +291,25 @@ pub struct ThreadState<'gc> {
 
 /// The value stack's storage: a `Vec` the mutator uses as such, that the
 /// collector may also clear from `trace(&self)` (hence the cell).
-#[derive(Default)]
-pub struct ValueStack<'gc>(UnsafeCell<Vec<Value<'gc>>>);
+pub struct ValueStack<'gc>(UnsafeCell<Vec<Value<'gc>, MetricsAlloc<'gc>>>);
 
 impl<'gc> ValueStack<'gc> {
-    pub fn new() -> Self {
-        ValueStack(UnsafeCell::new(Vec::new()))
+    pub fn new(mc: &Mutation<'gc>) -> Self {
+        ValueStack(UnsafeCell::new(Vec::new_in(MetricsAlloc::new(mc))))
     }
 }
 
 impl<'gc> Deref for ValueStack<'gc> {
-    type Target = Vec<Value<'gc>>;
+    type Target = Vec<Value<'gc>, MetricsAlloc<'gc>>;
     #[inline(always)]
-    fn deref(&self) -> &Vec<Value<'gc>> {
+    fn deref(&self) -> &Self::Target {
         unsafe { &*self.0.get() }
     }
 }
 
 impl<'gc> DerefMut for ValueStack<'gc> {
     #[inline(always)]
-    fn deref_mut(&mut self) -> &mut Vec<Value<'gc>> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
         self.0.get_mut()
     }
 }
@@ -681,9 +681,9 @@ impl<'gc> ThreadState<'gc> {
 impl<'gc> Thread<'gc> {
     pub fn new(mc: &Mutation<'gc>) -> Self {
         let state = ThreadState {
-            stack: ValueStack::new(),
-            frames: Vec::new(),
-            exec_frames: Vec::new(),
+            stack: ValueStack::new(mc),
+            frames: Vec::new_in(MetricsAlloc::new(mc)),
+            exec_frames: Vec::new_in(MetricsAlloc::new(mc)),
             open_upvalues: Vec::new(),
             tbc_list: Vec::new(),
             no_yield: false,
