@@ -113,11 +113,15 @@ pub enum Suspend<'gc> {
 #[derive(Clone, Copy)]
 pub struct Execution<'gc> {
     current_thread: Thread<'gc>,
+    is_main: bool,
 }
 
 impl<'gc> Execution<'gc> {
-    pub fn new(current_thread: Thread<'gc>) -> Self {
-        Execution { current_thread }
+    pub fn new(current_thread: Thread<'gc>, is_main: bool) -> Self {
+        Execution {
+            current_thread,
+            is_main,
+        }
     }
 
     /// Thread the native callback / sequence is running on top of.
@@ -126,8 +130,8 @@ impl<'gc> Execution<'gc> {
     }
 
     /// Whether the running thread is the executor's main (entry) thread.
-    pub fn is_main(self, ctx: crate::lua::Context<'gc>) -> bool {
-        self.current_thread.ptr_eq(ctx.main_thread())
+    pub fn is_main(self) -> bool {
+        self.is_main
     }
 }
 

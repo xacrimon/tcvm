@@ -5,7 +5,7 @@ use crate::dmm::{DynamicRootSet, Gc, Mutation, RefLock};
 use crate::env::function::{Function, UpvalueState};
 use crate::env::shape::Shape;
 use crate::env::string::Interner;
-use crate::env::{LuaString, Symbols, Table, Thread, Value};
+use crate::env::{LuaString, Symbols, Table, Value};
 use crate::lua::stash::{Fetchable, Stashable};
 use crate::lua::{LoadError, State};
 use crate::parser;
@@ -83,10 +83,6 @@ impl<'gc> Context<'gc> {
         } else {
             self.state.type_metatable(v.kind()).set(self.mutation, mt);
         }
-    }
-
-    pub fn main_thread(self) -> Thread<'gc> {
-        self.state.main_thread
     }
 
     pub fn roots(self) -> DynamicRootSet<'gc> {

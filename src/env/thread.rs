@@ -254,6 +254,9 @@ pub struct ThreadState<'gc> {
     pub(crate) tbc_list: Vec<TbcEntry<'gc>>,
     /// Closing variables for `coroutine.close`/`wrap`, where yields are errors.
     pub(crate) no_yield: bool,
+    /// Entry thread of an executor, PUC's main thread: never resumable,
+    /// yieldable or closable from Lua.
+    pub(crate) main: bool,
     pub(crate) status: ThreadStatus,
     /// Logical stack top — the end of the value-passing window. Always valid:
     /// it is the sole signal of "how many values are here" across every
@@ -684,6 +687,7 @@ impl<'gc> Thread<'gc> {
             open_upvalues: Vec::new(),
             tbc_list: Vec::new(),
             no_yield: false,
+            main: false,
             status: ThreadStatus::Stopped,
             top: 0,
             thread_handle: None,
@@ -708,6 +712,18 @@ impl<'gc> Thread<'gc> {
 
     pub fn status(self) -> ThreadStatus {
         self.0.borrow().status
+    }
+
+    /// Status as another thread sees it. A main thread is always `Normal`,
+    /// as PUC's is from inside a coroutine, which also keeps one executor
+    /// from resuming or closing another's entry thread.
+    pub(crate) fn peer_status(self) -> ThreadStatus {
+        let ts = self.0.borrow();
+        if ts.main {
+            ThreadStatus::Normal
+        } else {
+            ts.status
+        }
     }
 
     /// Pointer equality between two thread handles.
