@@ -51,6 +51,10 @@ impl<'cache, 'source> State<'cache, 'source> {
             .find_map(|(t, _)| t.is_trivia().not().then_some(*t))
     }
 
+    pub(super) fn cursor(&self) -> usize {
+        self.cursor
+    }
+
     pub(super) fn span(&self) -> Span {
         self.tokens[self.cursor].1
     }
