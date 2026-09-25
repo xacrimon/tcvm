@@ -120,6 +120,8 @@ pub(crate) enum OpError<'gc> {
     NanIndex,
     /// A call's register window would cross `ThreadState::stack_limit`.
     StackOverflow,
+    /// TBC: the register holds a value without `__close`.
+    NonClosable(u8),
     Internal(&'static str),
 }
 
@@ -1783,6 +1785,14 @@ extern "rust-preserve-none" fn op_tbc<'gc>(
 ) {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let val = instruction.a();
+    let v = reg!(val);
+    // `false` and `nil` need no closing.
+    if v.is_falsy() {
+        dispatch!();
+    }
+    if ctx.metamethod_of(v, ctx.symbols().close).is_nil() {
+        raise!(OpError::NonClosable(val));
+    }
     let base = unsafe { (*frame).base() };
     thread.tbc_slots.push(base + val as usize);
     unsafe { (*frame).flags |= frame_flags::TBC };
