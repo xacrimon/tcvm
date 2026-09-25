@@ -1,7 +1,6 @@
 use std::os::unix::ffi::OsStrExt;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::Context;
 use crate::builtin::util;
@@ -77,16 +76,20 @@ pub fn load<'gc>(ctx: Context<'gc>) {
     ctx.globals().raw_set(ctx, lib_name, Value::table(lib));
 }
 
-/// `clock()` — seconds of program runtime as a float. Approximated by
-/// wall-clock elapsed since first call.
+/// `clock()` — process CPU time in seconds, straight from C `clock()` like
+/// `os_clock` in `loslib.c`.
 fn lua_clock<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    static START: OnceLock<Instant> = OnceLock::new();
-    let start = START.get_or_init(Instant::now);
-    stack.ret1(Value::float(start.elapsed().as_secs_f64()));
+    // The `libc` crate binds neither `clock` nor `CLOCKS_PER_SEC` on unix
+    // targets; XSI fixes the latter at one million.
+    unsafe extern "C" {
+        safe fn clock() -> libc::clock_t;
+    }
+    const CLOCKS_PER_SEC: f64 = 1_000_000.0;
+    stack.ret1(Value::float(clock() as f64 / CLOCKS_PER_SEC));
     Ok(CallbackAction::Return)
 }
 
