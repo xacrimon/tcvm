@@ -43,26 +43,19 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         ctx.globals().raw_set(ctx, key, Value::function(f));
     };
     for &(name, handler) in fns {
-        set(
-            name,
-            Function::new_native(ctx.mutation(), handler, Box::new([])),
-        );
+        set(name, Function::new_native(ctx.mutation(), handler, &[]));
     }
     // `pairs` hands back the same `next` the global holds, so `pairs(t) == next`.
-    let next = Function::new_native(ctx.mutation(), lua_next, Box::new([]));
+    let next = Function::new_native(ctx.mutation(), lua_next, &[]);
     set("next", next);
     set(
         "pairs",
-        Function::new_native(ctx.mutation(), lua_pairs, Box::new([Value::function(next)])),
+        Function::new_native(ctx.mutation(), lua_pairs, &[Value::function(next)]),
     );
-    let ipairs_iter = Function::new_native(ctx.mutation(), ipairs_aux, Box::new([]));
+    let ipairs_iter = Function::new_native(ctx.mutation(), ipairs_aux, &[]);
     set(
         "ipairs",
-        Function::new_native(
-            ctx.mutation(),
-            lua_ipairs,
-            Box::new([Value::function(ipairs_iter)]),
-        ),
+        Function::new_native(ctx.mutation(), lua_ipairs, &[Value::function(ipairs_iter)]),
     );
 }
 

@@ -19,7 +19,7 @@ pub fn load<'gc>(ctx: Context<'gc>) {
 
     let lib = Table::new(ctx);
     for &(name, handler) in fns {
-        let handler = Function::new_native(ctx.mutation(), handler, Box::new([]));
+        let handler = Function::new_native(ctx.mutation(), handler, &[]);
         let key = Value::string(LuaString::new(ctx, name.as_bytes()));
         lib.raw_set(ctx, key, Value::function(handler));
     }
@@ -346,7 +346,7 @@ fn lua_codes<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let s = check_str(ctx, stack.get(0), "codes", 1)?;
-    let iter = Function::new_native(ctx.mutation(), codes_aux, Box::new([]));
+    let iter = Function::new_native(ctx.mutation(), codes_aux, &[]);
     stack.replace(&[
         Value::function(iter),
         Value::string(s),

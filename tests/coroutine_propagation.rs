@@ -45,13 +45,13 @@ fn two_level_error_propagation() {
     lua.load_all();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let boom = Function::new_native(ctx.mutation(), deep_boomer as NativeFn, Box::new([]));
+            let boom = Function::new_native(ctx.mutation(), deep_boomer as NativeFn, &[]);
             ctx.globals().raw_set(
                 ctx,
                 Value::string(LuaString::new(ctx, b"boom")),
                 Value::function(boom),
             );
-            let err = Function::new_native(ctx.mutation(), always_err as NativeFn, Box::new([]));
+            let err = Function::new_native(ctx.mutation(), always_err as NativeFn, &[]);
             ctx.globals().raw_set(
                 ctx,
                 Value::string(LuaString::new(ctx, b"reraise")),

@@ -58,7 +58,7 @@ fn sequence_tail_resume_propagates_return() {
     lua.load_all();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let f = Function::new_native(ctx.mutation(), forward as NativeFn, Box::new([]));
+            let f = Function::new_native(ctx.mutation(), forward as NativeFn, &[]);
             let key = Value::string(LuaString::new(ctx, b"forward"));
             ctx.globals().raw_set(ctx, key, Value::function(f));
             let chunk = ctx.load(

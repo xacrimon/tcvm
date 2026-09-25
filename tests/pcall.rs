@@ -217,7 +217,7 @@ fn handler_runs_before_the_stack_unwinds() {
          local ok, n = xpcall(outer, lua_frames)\n\
          return n",
         |ctx| {
-            let f = Function::new_native(ctx.mutation(), lua_frame_count as NativeFn, Box::new([]));
+            let f = Function::new_native(ctx.mutation(), lua_frame_count as NativeFn, &[]);
             let key = Value::string(LuaString::new(ctx, b"lua_frames"));
             ctx.globals().raw_set(ctx, key, Value::function(f));
         },
@@ -289,7 +289,7 @@ fn install_through(ctx: tcvm::Context<'_>) {
         ("lua_frames", lua_frame_count as NativeFn),
         ("through", lua_through as NativeFn),
     ] {
-        let f = Function::new_native(ctx.mutation(), f, Box::new([]));
+        let f = Function::new_native(ctx.mutation(), f, &[]);
         let key = Value::string(LuaString::new(ctx, name.as_bytes()));
         ctx.globals().raw_set(ctx, key, Value::function(f));
     }

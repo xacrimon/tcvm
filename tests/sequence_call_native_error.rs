@@ -61,7 +61,7 @@ fn factory<'gc>(
     _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let boomer_fn = Function::new_native(ctx.mutation(), boomer as NativeFn, Box::new([]));
+    let boomer_fn = Function::new_native(ctx.mutation(), boomer as NativeFn, &[]);
     let seq = BoxSequence::new(
         ctx.mutation(),
         CallBoomerSeq {
@@ -78,7 +78,7 @@ fn native_error_in_sequence_call_caught_by_pcallseq() {
     lua.load_all();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let f = Function::new_native(ctx.mutation(), factory as NativeFn, Box::new([]));
+            let f = Function::new_native(ctx.mutation(), factory as NativeFn, &[]);
             let key = Value::string(LuaString::new(ctx, b"factory"));
             ctx.globals().raw_set(ctx, key, Value::function(f));
             let chunk = ctx.load(

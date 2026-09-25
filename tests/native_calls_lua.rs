@@ -61,7 +61,7 @@ fn native_calls_lua_then_post_processes() {
 
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let bumper_fn = Function::new_native(ctx.mutation(), bumper as NativeFn, Box::new([]));
+            let bumper_fn = Function::new_native(ctx.mutation(), bumper as NativeFn, &[]);
             let key = Value::string(LuaString::new(ctx, b"bumper"));
             ctx.globals().raw_set(ctx, key, Value::function(bumper_fn));
             let chunk = ctx.load(
@@ -82,7 +82,7 @@ fn native_call_without_then_returns_to_caller() {
 
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let f = Function::new_native(ctx.mutation(), forward as NativeFn, Box::new([]));
+            let f = Function::new_native(ctx.mutation(), forward as NativeFn, &[]);
             let key = Value::string(LuaString::new(ctx, b"forward"));
             ctx.globals().raw_set(ctx, key, Value::function(f));
             let chunk = ctx.load(
@@ -106,7 +106,7 @@ fn run_with_natives(src: &str) -> Result<i64, String> {
                 ("bumper", bumper as NativeFn),
                 ("forward", forward as NativeFn),
             ] {
-                let f = Function::new_native(ctx.mutation(), f, Box::new([]));
+                let f = Function::new_native(ctx.mutation(), f, &[]);
                 let key = Value::string(LuaString::new(ctx, name.as_bytes()));
                 ctx.globals().raw_set(ctx, key, Value::function(f));
             }

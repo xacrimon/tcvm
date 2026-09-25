@@ -12,7 +12,7 @@ use crate::vm::sequence::{BoxSequence, CallbackAction};
 pub(super) fn install<'gc>(ctx: Context<'gc>, lib: Table<'gc>) {
     let mt = Table::new(ctx);
     for (name, f) in arith_natives(ctx) {
-        let f = Function::new_native(ctx.mutation(), f, Box::new([]));
+        let f = Function::new_native(ctx.mutation(), f, &[]);
         mt.raw_set(ctx, Value::string(name), Value::function(f));
     }
     mt.raw_set(

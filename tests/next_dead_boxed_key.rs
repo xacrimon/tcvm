@@ -20,7 +20,7 @@ fn setup(src: &str) -> (Lua, tcvm::StashedExecutor) {
     lua.load_all();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let y = Function::new_native(ctx.mutation(), yielder as NativeFn, Box::new([]));
+            let y = Function::new_native(ctx.mutation(), yielder as NativeFn, &[]);
             let key = Value::string(LuaString::new(ctx, b"yielder"));
             ctx.globals().raw_set(ctx, key, Value::function(y));
             let chunk = ctx.load(src, Some("t"))?;

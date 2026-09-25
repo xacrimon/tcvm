@@ -51,7 +51,7 @@ fn pending_surfaces_then_completes() {
     let mut lua = Lua::new();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let f = Function::new_native(ctx.mutation(), factory as NativeFn, Box::new([]));
+            let f = Function::new_native(ctx.mutation(), factory as NativeFn, &[]);
             let key = Value::string(LuaString::new(ctx, b"factory"));
             ctx.globals().raw_set(ctx, key, Value::function(f));
             let chunk = ctx.load("return factory()", Some("pending"))?;

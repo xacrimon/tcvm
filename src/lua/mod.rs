@@ -350,8 +350,7 @@ mod tests {
         let mut lua = Lua::new();
         let ex = lua
             .try_enter(|ctx| -> Result<_, LoadError> {
-                let add =
-                    Function::new_native(ctx.mutation(), native_add as NativeFn, Box::new([]));
+                let add = Function::new_native(ctx.mutation(), native_add as NativeFn, &[]);
                 let key = Value::string(LuaString::new(ctx, b"add"));
                 ctx.globals().raw_set(ctx, key, Value::function(add));
 
@@ -394,8 +393,7 @@ mod tests {
         let mut lua = Lua::new();
         let ex = lua
             .try_enter(|ctx| -> Result<_, LoadError> {
-                let add =
-                    Function::new_native(ctx.mutation(), native_add as NativeFn, Box::new([]));
+                let add = Function::new_native(ctx.mutation(), native_add as NativeFn, &[]);
                 let key = Value::string(LuaString::new(ctx, b"add"));
                 ctx.globals().raw_set(ctx, key, Value::function(add));
 
@@ -418,8 +416,7 @@ mod tests {
         let mut lua = Lua::new();
         let ex = lua
             .try_enter(|ctx| -> Result<_, LoadError> {
-                let add =
-                    Function::new_native(ctx.mutation(), native_add as NativeFn, Box::new([]));
+                let add = Function::new_native(ctx.mutation(), native_add as NativeFn, &[]);
                 let key = Value::string(LuaString::new(ctx, b"add"));
                 ctx.globals().raw_set(ctx, key, Value::function(add));
 
@@ -444,7 +441,7 @@ mod tests {
         // directly, step runs the callback and take_result reads results.
         let mut lua = Lua::new();
         let ex = lua.enter(|ctx| {
-            let add = Function::new_native(ctx.mutation(), native_add as NativeFn, Box::new([]));
+            let add = Function::new_native(ctx.mutation(), native_add as NativeFn, &[]);
             ctx.stash(Executor::start(ctx, add, (10i64, 32i64)))
         });
         let result: i64 = lua.execute(&ex).expect("run native entry");
@@ -457,7 +454,7 @@ mod tests {
         // with the payload stashed (native-entry path).
         let mut lua = Lua::new();
         let ex = lua.enter(|ctx| {
-            let add = Function::new_native(ctx.mutation(), native_add as NativeFn, Box::new([]));
+            let add = Function::new_native(ctx.mutation(), native_add as NativeFn, &[]);
             // Pass a float to trigger native_add's Err path (it requires Integer).
             ctx.stash(Executor::start(ctx, add, (1i64, 2.5f64)))
         });
@@ -495,8 +492,7 @@ mod tests {
         let mut lua = Lua::new();
         let ex = lua
             .try_enter(|ctx| -> Result<_, LoadError> {
-                let probe =
-                    Function::new_native(ctx.mutation(), native_id as NativeFn, Box::new([]));
+                let probe = Function::new_native(ctx.mutation(), native_id as NativeFn, &[]);
                 let key = Value::string(LuaString::new(ctx, b"probe"));
                 ctx.globals().raw_set(ctx, key, Value::function(probe));
                 let chunk = ctx.load(src, Some("test"))?;
@@ -931,8 +927,7 @@ mod tests {
         let ex = lua
             .try_enter(|ctx| -> Result<_, LoadError> {
                 builtin::load_basic(ctx);
-                let probe =
-                    Function::new_native(ctx.mutation(), native_id as NativeFn, Box::new([]));
+                let probe = Function::new_native(ctx.mutation(), native_id as NativeFn, &[]);
                 let key = Value::string(LuaString::new(ctx, b"probe"));
                 ctx.globals().raw_set(ctx, key, Value::function(probe));
                 let chunk = ctx.load(src, Some("test"))?;

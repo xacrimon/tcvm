@@ -50,8 +50,7 @@ fn run(src: &str) -> i64 {
     lua.load_all();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let forward_fn =
-                Function::new_native(ctx.mutation(), forward as NativeFn, Box::new([]));
+            let forward_fn = Function::new_native(ctx.mutation(), forward as NativeFn, &[]);
             let key = Value::string(LuaString::new(ctx, b"forward"));
             ctx.globals().raw_set(ctx, key, Value::function(forward_fn));
             let chunk = ctx.load(src, Some("seq_tailcall"))?;

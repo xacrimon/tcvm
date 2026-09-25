@@ -31,7 +31,7 @@ fn setup(event: &[u8], src: &str) -> (Lua, tcvm::StashedExecutor) {
     let mut lua = Lua::new();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let mm = Function::new_native(ctx.mutation(), suspending_mm as NativeFn, Box::new([]));
+            let mm = Function::new_native(ctx.mutation(), suspending_mm as NativeFn, &[]);
             let meta = Table::new(ctx);
             let ev = Value::string(LuaString::new(ctx, event));
             meta.raw_set(ctx, ev, Value::function(mm));
@@ -117,8 +117,7 @@ fn suspended_iterator_lands_loop_vars() {
     let mut lua = Lua::new();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let iter =
-                Function::new_native(ctx.mutation(), suspending_mm as NativeFn, Box::new([]));
+            let iter = Function::new_native(ctx.mutation(), suspending_mm as NativeFn, &[]);
             let key = Value::string(LuaString::new(ctx, b"iter"));
             ctx.globals().raw_set(ctx, key, Value::function(iter));
             let chunk = ctx.load(

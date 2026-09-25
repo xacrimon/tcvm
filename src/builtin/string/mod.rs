@@ -71,7 +71,7 @@ pub fn load<'gc>(ctx: Context<'gc>) {
 
     let lib = Table::new(ctx);
     for &(name, handler) in fns {
-        let handler = Function::new_native(ctx.mutation(), handler, Box::new([]));
+        let handler = Function::new_native(ctx.mutation(), handler, &[]);
         let key = Value::string(LuaString::new(ctx, name.as_bytes()));
         lib.raw_set(ctx, key, Value::function(handler));
     }
@@ -1078,7 +1078,7 @@ fn lua_gmatch<'gc>(
         lastmatch: None,
     };
     let ud = Userdata::new(ctx.mutation(), RefCell::new(state), 0);
-    let iter = Function::new_native(ctx.mutation(), gmatch_aux, Box::new([Value::userdata(ud)]));
+    let iter = Function::new_native(ctx.mutation(), gmatch_aux, &[Value::userdata(ud)]);
     stack.ret1(Value::function(iter));
     Ok(CallbackAction::Return)
 }
