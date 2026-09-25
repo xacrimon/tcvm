@@ -161,6 +161,9 @@ mod tests {
             "if x then + else y() end x = 1",
             "repeat ] until x x = 1",
             "local f = function() 1 end x = 1",
+            "do a[ end x = 1",
+            "do ( end x = 1",
+            "do a[ local y = 1 end x = 1",
         ] {
             let mut cache = NodeCache::new();
             let reports = parse(&mut cache, src).reports;
@@ -203,6 +206,38 @@ mod tests {
             let mut cache = NodeCache::new();
             let reports = parse(&mut cache, src).reports;
             assert!(reports.is_empty(), "unexpected parse error for {src:?}");
+        }
+    }
+
+    fn rendered_reports(src: &str) -> Vec<String> {
+        let mut cache = NodeCache::new();
+        parse(&mut cache, src)
+            .reports
+            .iter()
+            .map(|report| {
+                let mut out = Vec::new();
+                report.write(ariadne::Source::from(src), &mut out).unwrap();
+                String::from_utf8(out).unwrap()
+            })
+            .collect()
+    }
+
+    // Reports point at and quote the offending token, not wherever recovery
+    // or lookahead stopped.
+    #[test]
+    fn reports_blame_the_offending_token() {
+        for (src, at, message) in [
+            ("x = 1 ] y = 2", ":1:7 ", "got \"]\""),
+            ("do return;; end", ":1:11 ", "found ;"),
+            ("do return 1 ; x() end", ":1:15 ", "found ident"),
+        ] {
+            let reports = rendered_reports(src);
+            assert_eq!(reports.len(), 1, "expected one parse error for {src:?}");
+            assert!(
+                reports[0].contains(at) && reports[0].contains(message),
+                "{src:?} should report {message:?} at {at:?}, got:\n{}",
+                reports[0]
+            );
         }
     }
 

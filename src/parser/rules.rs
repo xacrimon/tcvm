@@ -8,7 +8,7 @@ use crate::parser::machinery::{
 };
 
 /// Tokens that can end a block. `return` must be followed by one of them
-/// (or `;` and then one of them).
+/// (or `;` and then one of them). Mirrored in `STATEMENT_RECOVERY`.
 const BLOCK_FOLLOW: &[SyntaxKind] = &[T![end], T![else], T![elseif], T![until], T![eof]];
 
 /// Statement starts plus block terminators, so a bad statement inside a
@@ -38,7 +38,8 @@ impl<'cache, 'source> Parser<'cache, 'source> {
     }
 
     /// Consumes at least one token unless at EOF, so block loops always progress.
-    fn r_stmt(&mut self) -> Option<CompletedMarker> {
+    fn r_stmt(&mut self) {
+        let start = self.cursor();
         let marker = match self.at() {
             T![do] => self.r_do(),
             T![while] => self.r_while(),
@@ -58,21 +59,22 @@ impl<'cache, 'source> Parser<'cache, 'source> {
         };
 
         if marker.is_none() && self.at() != T![eof] {
-            let got = self.source(self.span()).to_owned();
             let error = self
                 .new_error()
                 .with_message("expected a statement")
-                .with_label(
-                    self.new_label()
-                        .with_message(format!("expected a statement but got \"{got}\"")),
-                )
+                .with_label(self.new_label().with_message(format!(
+                    "expected a statement but got \"{}\"",
+                    self.source(self.span())
+                )))
                 .finish();
 
             self.report(error);
-            self.error_eat_until(STATEMENT_RECOVERY);
+            // A statement that failed partway (`a[ end`) has already made
+            // progress, so a terminator here belongs to the enclosing block.
+            if self.cursor() == start || !STATEMENT_RECOVERY.contains(&self.at()) {
+                self.error_eat_until(STATEMENT_RECOVERY);
+            }
         }
-
-        marker
     }
 
     fn r_label(&mut self) -> Option<CompletedMarker> {
@@ -311,23 +313,24 @@ impl<'cache, 'source> Parser<'cache, 'source> {
     }
 
     /// `retstat ::= return [explist] [';']`, and it must end its block. The
-    /// optional `;` is left to the enclosing block as an empty statement.
+    /// optional `;` becomes a sibling empty statement, as it would via the
+    /// block loop, but is eaten here so the error lands on the token after it.
     fn r_return(&mut self) -> Option<CompletedMarker> {
         let marker = self.start(T![return_stmt]);
         self.expect(T![return]);
         self.r_expr_list();
         let marker = marker.complete(self);
 
-        let next = match self.at() {
-            T![;] => self.peek().unwrap_or(T![eof]),
-            t => t,
-        };
-        if !BLOCK_FOLLOW.contains(&next) {
+        if self.at() == T![;] {
+            self.r_semicolon();
+        }
+        if !BLOCK_FOLLOW.contains(&self.at()) {
             let error = self
                 .new_error()
                 .with_message("unexpected token")
                 .with_label(self.new_label().with_message(format!(
-                    "'return' must be the last statement in its block, but found {next}",
+                    "'return' must be the last statement in its block, but found {}",
+                    self.at()
                 )))
                 .finish();
             self.report(error);
