@@ -1,0 +1,50 @@
+---
+source: src/compiler/snapshot_tests.rs
+expression: output
+---
+; function (params=0, vararg=true, stack=3, upvalues=1)
+; upvalues:
+;   U0 = local R0
+; code:
+0000  [  1]  VARARGPREP      fixed=0
+0001  [  5]  CLOSURE         R0 P0
+0002  [ 10]  CLOSURE         R1 P1
+0003  [ 16]  CLOSURE         R2 P2
+0004  [ 16]  RETURN0
+
+; prototype 0:
+  ; function (params=2, vararg=false, stack=5, upvalues=0)
+  ; constants:
+  ;   K0 = 1
+  ; code:
+  0000  [  3]  MOVE            R2 R0
+  0001  [  3]  TBC             R2
+  0002  [  4]  MOVE            R3 R1
+  0003  [  4]  LOAD            R4 K0  ; 1
+  0004  [  4]  CALL            R3 args=2 ret=0
+  0005  [  5]  CLOSE           R2
+  0006  [  5]  RETURN          R3 count=0
+
+; prototype 1:
+  ; function (params=2, vararg=false, stack=5, upvalues=0)
+  ; constants:
+  ;   K0 = "get"
+  ; code:
+  0000  [  8]  MOVE            R2 R0
+  0001  [  8]  TBC             R2
+  0002  [  9]  SELF            R3 R1 K0  ; "get"
+  0003  [  9]  CALL            R3 args=2 ret=0
+  0004  [ 10]  CLOSE           R2
+  0005  [ 10]  RETURN          R3 count=0
+
+; prototype 2:
+  ; function (params=2, vararg=false, stack=4, upvalues=0)
+  ; constants:
+  ;   K0 = 1
+  ; code:
+  0000  [ 14]  MOVE            R2 R0
+  0001  [ 14]  TBC             R2
+  0002  [ 14]  CLOSE           R2
+  0003  [ 15]  MOVE            R2 R1
+  0004  [ 15]  LOAD            R3 K0  ; 1
+  0005  [ 15]  TAILCALL        R2 args=2
