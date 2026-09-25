@@ -15,14 +15,14 @@
 //! via per-shape transition tables, so two tables that grow through
 //! the same key sequence converge on the same shape pointer.
 
-use core::cell::Cell;
+use core::cell::{Cell, UnsafeCell};
 
 use bitflags::bitflags;
 use hashbrown::{HashTable, hash_table};
 
 use crate::dmm::allocator_api::MetricsAlloc;
 use crate::dmm::barrier::unlock;
-use crate::dmm::{Collect, Gc, GcWeak, Lock, Mutation, RefLock};
+use crate::dmm::{Collect, Gc, GcWeak, Lock, Mutation, RefLock, Trace};
 use crate::env::for_each_metamethod;
 use crate::env::string::LuaString;
 
@@ -112,20 +112,48 @@ pub fn metamethod_bit_of_bytes(name: &[u8]) -> Option<MetamethodBits> {
 /// owning `ShapeData` to emit the backward barrier — children adopted
 /// as `GcWeak` won't retain their targets, so a transient sub-shape
 /// can be reclaimed by GC even while its parent is alive.
-#[derive(Collect)]
-#[collect(internal, no_drop)]
 pub struct TransitionTable<'gc> {
-    /// Property-add edges keyed by the added LuaString.
-    pub by_prop: HashTable<PropEdge<'gc>, MetricsAlloc<'gc>>,
+    /// Property-add edges keyed by the added LuaString. In a cell so `trace`
+    /// can drop edges whose child is gone.
+    by_prop: UnsafeCell<HashTable<PropEdge<'gc>, MetricsAlloc<'gc>>>,
     /// Set-metatable edges keyed by the new MtCache identity (None = no MT).
     pub by_mt: HashTable<MtEdge<'gc>, MetricsAlloc<'gc>>,
 }
 
-#[derive(Clone, Copy, Collect)]
-#[collect(internal, no_drop)]
+/// The key is not traced: a live child keeps it alive through `last_key`, and
+/// an edge whose child is dropped is erased at the next trace. So the key may
+/// be dead, and edges compare and hash it by pointer only.
+#[derive(Clone, Copy)]
 pub struct PropEdge<'gc> {
     pub key: LuaString<'gc>,
     pub child: GcWeak<'gc, ShapeData<'gc>>,
+}
+
+// SAFETY: traces every child weakly and `by_mt` fully; edge keys are
+// deliberately untraced (see `PropEdge`). Erasing from `trace(&self)` is sound
+// because the collector never runs while the mutator borrows the table.
+unsafe impl<'gc> Collect<'gc> for TransitionTable<'gc> {
+    fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
+        let by_prop = unsafe { &mut *self.by_prop.get() };
+        by_prop.retain(|e| !e.child.is_dropped());
+        for e in by_prop.iter() {
+            cc.trace(&e.child);
+        }
+        cc.trace(&self.by_mt);
+    }
+}
+
+impl<'gc> TransitionTable<'gc> {
+    fn new(mc: &Mutation<'gc>) -> Self {
+        TransitionTable {
+            by_prop: UnsafeCell::new(HashTable::new_in(MetricsAlloc::new(mc))),
+            by_mt: HashTable::new_in(MetricsAlloc::new(mc)),
+        }
+    }
+
+    fn by_prop(&self) -> &HashTable<PropEdge<'gc>, MetricsAlloc<'gc>> {
+        unsafe { &*self.by_prop.get() }
+    }
 }
 
 #[derive(Clone, Copy, Collect)]
@@ -293,10 +321,7 @@ impl<'gc> Shape<'gc> {
                 slot_count: 0,
                 mt_cache: None,
                 is_dict: false,
-                transitions: RefLock::new(TransitionTable {
-                    by_prop: HashTable::new_in(MetricsAlloc::new(mc)),
-                    by_mt: HashTable::new_in(MetricsAlloc::new(mc)),
-                }),
+                transitions: RefLock::new(TransitionTable::new(mc)),
                 descriptors: Box::from([]),
             },
         ))
@@ -313,10 +338,7 @@ impl<'gc> Shape<'gc> {
                 slot_count: 0,
                 mt_cache,
                 is_dict: true,
-                transitions: RefLock::new(TransitionTable {
-                    by_prop: HashTable::new_in(MetricsAlloc::new(mc)),
-                    by_mt: HashTable::new_in(MetricsAlloc::new(mc)),
-                }),
+                transitions: RefLock::new(TransitionTable::new(mc)),
                 descriptors: Box::from([]),
             },
         ))
@@ -409,7 +431,9 @@ pub fn transition_add_prop<'gc>(
         let table = parent.data().transitions.borrow();
         let key_ptr = Gc::as_ptr(key.inner()) as usize;
         let h = key_ptr as u64;
-        if let Some(edge) = table.by_prop.find(h, |e| e.key == key)
+        if let Some(edge) = table
+            .by_prop()
+            .find(h, |e| Gc::ptr_eq(e.key.inner(), key.inner()))
             && let Some(child) = edge.child.upgrade(mc)
         {
             return Shape(child);
@@ -435,10 +459,7 @@ pub fn transition_add_prop<'gc>(
             slot_count: new_slot + 1,
             mt_cache: parent.data().mt_cache,
             is_dict: false,
-            transitions: RefLock::new(TransitionTable {
-                by_prop: HashTable::new_in(MetricsAlloc::new(mc)),
-                by_mt: HashTable::new_in(MetricsAlloc::new(mc)),
-            }),
+            transitions: RefLock::new(TransitionTable::new(mc)),
             descriptors: new_descs.into_boxed_slice(),
         },
     );
@@ -449,9 +470,9 @@ pub fn transition_add_prop<'gc>(
         let mut table = unlock!(parent_write, ShapeData, transitions).borrow_mut();
         let key_ptr = Gc::as_ptr(key.inner()) as usize;
         let h = key_ptr as u64;
-        let entry = table.by_prop.entry(
+        let entry = table.by_prop.get_mut().entry(
             h,
-            |e| e.key == key,
+            |e| Gc::ptr_eq(e.key.inner(), key.inner()),
             |e| Gc::as_ptr(e.key.inner()) as usize as u64,
         );
         match entry {
@@ -527,10 +548,7 @@ pub fn transition_set_metatable<'gc>(
             slot_count: parent.slot_count(),
             mt_cache: new_mt,
             is_dict: false,
-            transitions: RefLock::new(TransitionTable {
-                by_prop: HashTable::new_in(MetricsAlloc::new(mc)),
-                by_mt: HashTable::new_in(MetricsAlloc::new(mc)),
-            }),
+            transitions: RefLock::new(TransitionTable::new(mc)),
             descriptors,
         },
     );
