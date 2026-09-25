@@ -3,7 +3,7 @@ use std::pin::Pin;
 use crate::dmm::{Collect, Gc, RefLock, Trace};
 use crate::env::function::Function;
 use crate::env::thread::{
-    CallSite, ExecKind, LuaFrame, MAX_STACK, PendingAction, ThreadState, ThreadStatus,
+    CallSite, ExecKind, LuaFrame, MAX_STACK, PendingAction, TbcEntry, ThreadState, ThreadStatus,
 };
 use crate::env::{Error, LuaString, Stack, Thread, Value};
 use crate::lua::RuntimeError;
@@ -969,6 +969,27 @@ fn run_message_handler<'gc>(
     schedule_call_at(ts, ctx, slot, 0)
 }
 
+/// Close the variables the unwinder detached at `ts.top` with `err` above the
+/// catcher, then re-raise to it.
+fn push_error_close<'gc>(
+    ts: &mut ThreadState<'gc>,
+    ctx: Context<'gc>,
+    err: Error<'gc>,
+    handler: Option<Function<'gc>>,
+) {
+    let bottom = ts.top;
+    let seq = vm::close::ErrorCloseSequence {
+        level: bottom,
+        err,
+        handler,
+    };
+    ts.push_exec(ExecKind::Sequence {
+        seq: BoxSequence::new(ctx.mutation(), seq),
+        call_site: in_place(bottom),
+        pending_error: None,
+    });
+}
+
 /// Completion of an `xpcall` message handler: its first result becomes the
 /// error value. An error inside the handler calls the handler again with
 /// it (manual §2.3), on top of the still-intact failing frames, until the
@@ -1087,12 +1108,24 @@ fn unwind_error<'gc>(
     } else {
         err
     };
+    // The popped frames' to-be-closed variables stay listed, detached at the
+    // lowest popped base, which ends up `ts.top`. They close once the catcher
+    // is reached, after the frames are gone (`luaD_pcall`).
+    let mut detached = false;
     loop {
         if let Some(lf) = ts.top_lua() {
             let base = lf.base();
             ts.pop_lua();
             vm::interp::close_upvalues(mc, &mut ts, base);
-            vm::interp::close_tbc_vars(mc, &mut ts, base);
+            let ts_ref = &mut *ts;
+            for entry in ts_ref.tbc_list.iter_mut().rev() {
+                if entry.pos() < base {
+                    break;
+                }
+                let value = entry.value(&ts_ref.stack);
+                *entry = TbcEntry::Detached { level: base, value };
+                detached = true;
+            }
             // The frame and everything above it is dead, so this is one
             // of the few places a shrink is legal.
             ts.discard_above(base);
@@ -1102,11 +1135,18 @@ fn unwind_error<'gc>(
             Some(ExecKind::Sequence {
                 seq, pending_error, ..
             }) => {
-                if matches!(seq.catch(), Catch::Pass) {
-                    ts.pop_exec();
-                    continue;
+                let handler = match seq.catch() {
+                    Catch::Pass => {
+                        ts.pop_exec();
+                        continue;
+                    }
+                    Catch::Here(handler) => handler,
+                };
+                if detached {
+                    push_error_close(&mut ts, ctx, err, handler);
+                } else {
+                    *pending_error = Some(err);
                 }
-                *pending_error = Some(err);
                 return Ok(());
             }
             Some(ExecKind::WaitThread { .. }) => {
@@ -1122,11 +1162,17 @@ fn unwind_error<'gc>(
             None => break,
         }
     }
+    let stack_len = exec.0.borrow().thread_stack.len();
+    // The host's call closes like a `pcall`; a dead coroutine keeps its
+    // variables for `coroutine.close` (`lua_resume` leaves them open).
+    if detached && stack_len == 1 {
+        push_error_close(&mut ts, ctx, err, None);
+        return Ok(());
+    }
     drop(ts);
 
     // No catcher on this thread. If we're an inner coroutine, propagate to
     // the resumer's WaitThread → its next Sequence can catch.
-    let stack_len = exec.0.borrow().thread_stack.len();
     if stack_len > 1 {
         // Error terminates this coroutine: no result values, so `Stopped`
         // (not `Result`) is its terminal/dead marker. Every coroutine the

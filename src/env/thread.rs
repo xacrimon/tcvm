@@ -139,6 +139,36 @@ pub struct ExecFrame<'gc> {
     pub kind: ExecKind<'gc>,
 }
 
+/// A to-be-closed variable, in a live frame or detached from an unwound one.
+#[derive(Collect, Clone, Copy)]
+#[collect(internal, no_drop)]
+pub(crate) enum TbcEntry<'gc> {
+    Slot(usize),
+    /// Its frame was unwound by an error; `level` is where it closes from: the
+    /// bottom of the `ErrorCloseSequence`.
+    Detached {
+        level: usize,
+        value: Value<'gc>,
+    },
+}
+
+impl<'gc> TbcEntry<'gc> {
+    #[inline]
+    pub(crate) fn pos(self) -> usize {
+        match self {
+            TbcEntry::Slot(slot) => slot,
+            TbcEntry::Detached { level, .. } => level,
+        }
+    }
+
+    pub(crate) fn value(self, stack: &[Value<'gc>]) -> Value<'gc> {
+        match self {
+            TbcEntry::Slot(slot) => stack[slot],
+            TbcEntry::Detached { value, .. } => value,
+        }
+    }
+}
+
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub enum ExecKind<'gc> {
@@ -219,7 +249,9 @@ pub struct ThreadState<'gc> {
     /// `depth`. Kept apart so the interpreter's frames are plain records.
     pub(crate) exec_frames: Vec<ExecFrame<'gc>>,
     pub(crate) open_upvalues: Vec<Upvalue<'gc>>,
-    pub(crate) tbc_slots: Vec<usize>,
+    /// Open to-be-closed variables by stack position, innermost last
+    /// (`L->tbclist`). Each leaves the list just before its `__close` runs.
+    pub(crate) tbc_list: Vec<TbcEntry<'gc>>,
     pub(crate) status: ThreadStatus,
     /// Logical stack top — the end of the value-passing window. Always valid:
     /// it is the sole signal of "how many values are here" across every
@@ -291,7 +323,7 @@ impl<'gc> DerefMut for ValueStack<'gc> {
 // thread, so a slot can re-enter the live region only after the trace that
 // cleared it. Writing through `&self` is sound because collection runs
 // outside `mutate`, with no borrow of the thread outstanding.
-// `tbc_slots`/`status`/`top`/`yield_bottom` hold no `Gc` pointers.
+// `status`/`top`/`yield_bottom` hold no `Gc` pointers.
 unsafe impl<'gc> Collect<'gc> for ThreadState<'gc> {
     fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
         let live = self.live_top().min(self.stack.len());
@@ -303,6 +335,7 @@ unsafe impl<'gc> Collect<'gc> for ThreadState<'gc> {
         cc.trace(&self.open_upvalues);
         cc.trace(&self.thread_handle);
         cc.trace(&self.pending_action);
+        cc.trace(&self.tbc_list);
     }
 }
 
@@ -428,7 +461,7 @@ impl<'gc> ThreadState<'gc> {
         self.frames.clear();
         self.exec_frames.clear();
         self.open_upvalues.clear();
-        self.tbc_slots.clear();
+        self.tbc_list.clear();
         self.pending_action = None;
         self.yield_bottom = None;
         self.death_error = None;
@@ -646,7 +679,7 @@ impl<'gc> Thread<'gc> {
             frames: Vec::new(),
             exec_frames: Vec::new(),
             open_upvalues: Vec::new(),
-            tbc_slots: Vec::new(),
+            tbc_list: Vec::new(),
             status: ThreadStatus::Stopped,
             top: 0,
             thread_handle: None,
