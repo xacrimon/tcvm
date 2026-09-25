@@ -6,7 +6,8 @@ use crate::env::shape::{MetamethodBits, Shape};
 use crate::env::string::LuaString;
 use crate::env::table::Table;
 use crate::env::thread::{
-    CallSite, ExecKind, LuaFrame, PendingAction, Thread, ThreadState, ThreadStatus, frame_flags,
+    CallSite, ExecKind, LuaFrame, PendingAction, TbcEntry, Thread, ThreadState, ThreadStatus,
+    frame_flags,
 };
 use crate::env::value::{Value, ValueKind};
 use crate::instruction::{Instruction, Op, UpValueDescriptor};
@@ -1765,7 +1766,12 @@ extern "rust-preserve-none" fn op_close<'gc>(
     let base = unsafe { (*frame).base() };
     let start_idx = base + start as usize;
     close_upvalues(ctx.mutation(), thread, start_idx);
-    close_tbc_vars(ctx.mutation(), thread, start_idx);
+    if has_tbc_from(thread, start_idx) {
+        save_pc(thread, ip);
+        let bottom = base + closure.max_stack_size as usize;
+        schedule_close(ctx, thread, start_idx, false, bottom, bottom);
+        return;
+    }
     dispatch!();
 }
 
@@ -1794,7 +1800,7 @@ extern "rust-preserve-none" fn op_tbc<'gc>(
         raise!(OpError::NonClosable(val));
     }
     let base = unsafe { (*frame).base() };
-    thread.tbc_slots.push(base + val as usize);
+    thread.tbc_list.push(TbcEntry::Slot(base + val as usize));
     unsafe { (*frame).flags |= frame_flags::TBC };
     dispatch!();
 }
@@ -3174,6 +3180,16 @@ extern "rust-preserve-none" fn op_return_slow<'gc>(
         count as usize - 1
     };
 
+    if has_tbc_from(thread, cur_base) {
+        // Past the frame and the results, which a MULTRET RETURN finds
+        // through `top` again once the closes land nothing at their end.
+        save_pc(thread, ip);
+        let values_end = values_base + nret;
+        let bottom = values_end.max(cur_base + closure.max_stack_size as usize);
+        schedule_close(ctx, thread, cur_base, true, values_end, bottom);
+        return;
+    }
+
     match frame_return(ctx.mutation(), thread, frame, values_base, nret) {
         FrameReturn::Continuation => {
             tail!(cont_resume);
@@ -3861,23 +3877,33 @@ extern "rust-preserve-none" fn op_stop<'gc>(
 /// Whether a to-be-closed variable is registered at or above `level`.
 #[inline]
 fn has_tbc_from(thread: &ThreadState<'_>, level: usize) -> bool {
-    thread.tbc_slots.last().is_some_and(|&slot| slot >= level)
+    thread.tbc_list.last().is_some_and(|e| e.pos() >= level)
 }
 
-/// Close all TBC variables at stack indices >= `start_idx`.
-/// Removes them from the tracking list; __close invocation is pending (see #45).
-pub(crate) fn close_tbc_vars<'gc>(
-    _mc: &Mutation<'gc>,
+/// Hand the running frame's variables at or above `level` to a
+/// `CloseSequence`, calling from `bottom` up and landing nothing at `landing`.
+#[cold]
+#[inline(never)]
+fn schedule_close<'gc>(
+    ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
-    start_idx: usize,
+    level: usize,
+    redo: bool,
+    landing: usize,
+    bottom: usize,
 ) {
-    thread.tbc_slots.retain(|&slot| {
-        if slot >= start_idx {
-            // See #45: invoke __close metamethod on thread.stack[slot].
-            false
-        } else {
-            true
-        }
+    thread.set_top(bottom);
+    let seq = crate::vm::close::CloseSequence { level, redo };
+    thread.pending_action = Some(PendingAction {
+        action: Box::new(crate::vm::sequence::Suspend::Sequence(
+            crate::vm::sequence::BoxSequence::new(ctx.mutation(), seq),
+        )),
+        call_site: CallSite {
+            bottom,
+            func_idx: landing,
+            returns: 0,
+            cont: None,
+        },
     });
 }
 
@@ -4007,7 +4033,7 @@ pub(crate) fn frame_return<'gc>(
     if frame_has_open_upvalues(thread, cur_base) {
         close_upvalues_slow(mc, thread, cur_base);
     }
-    close_tbc_vars(mc, thread, cur_base);
+    debug_assert!(!has_tbc_from(thread, cur_base));
 
     // The func slot sits at `cur_base - 1 - num_extras`: VARARGPREP shifted
     // base past the extras at `[cur_base - num_extras .. cur_base]` (0 for
