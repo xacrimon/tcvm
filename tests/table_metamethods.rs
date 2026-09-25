@@ -170,6 +170,74 @@ return table.concat(out, ' | ')
     );
 }
 
+/// `sort` reads, writes and compares in `auxsort`'s exact order.
+#[test]
+fn sort_access_order() {
+    let src = r#"
+local out = {}
+local store = {5, 4, 3}
+table.sort(setmetatable({}, {__index = store, __newindex = store, __len = function() return #store end}))
+out[#out + 1] = table.concat(store, ',')
+for _, arr in ipairs({{3, 1, 2}, {2, 7, 1, 8, 2, 8, 1, 8, 2, 8, 4, 5, 9, 0, 4, 5}, {'b', 'a', 'c', 'd'}}) do
+  table.sort(proxy(arr))
+  out[#out + 1] = flush() .. ' => ' .. table.concat(arr, ',')
+end
+local arr = {2, 7, 1, 8, 2, 8, 1, 8}
+table.sort(proxy(arr), function(a, b) log[#log + 1] = 'c' .. a .. b; return a > b end)
+out[#out + 1] = flush() .. ' => ' .. table.concat(arr, ',')
+return table.concat(out, ' | ')
+"#;
+    assert_eq!(
+        run(src),
+        r#"3,4,5 | # r1 r3 w1=2 w3=3 r2 r1 w2=2 w1=1 => 1,2,3 | # r1 r16 r8 r1 r16 w8=5 w16=8 r8 r15 w8=4 w15=5 r2 r14 w2=0 w14=7 r3 r4 r13 r12 w4=5 w12=8 r5 r6 r11 w6=4 w11=8 r7 r8 r9 r10 r10 r9 w15=8 w10=5 r11 r16 r13 r11 r16 w13=8 w16=9 r13 r15 w13=8 w15=8 r12 r14 w12=7 w14=8 r13 r13 w13=8 w13=8 r14 r12 w15=8 w14=8 r15 r16 r11 r13 r12 r11 w12=8 w11=7 r1 r9 r5 r1 r9 r5 r8 w5=4 w8=2 r2 r3 r4 r7 w4=1 w7=5 r5 r6 r5 r4 w8=4 w5=2 r6 r9 w6=2 w9=4 r7 r6 r9 w7=4 w9=5 r7 r8 w7=4 w8=4 r7 r7 w7=4 w7=4 r8 r6 w8=4 w8=4 r6 r7 r1 r4 w1=1 w4=2 r2 r1 w2=1 w1=0 r2 r3 w2=1 w3=1 r2 r2 w2=1 w2=1 r3 r1 w3=1 w3=1 r1 r2 => 0,1,1,2,2,2,4,4,5,5,7,8,8,8,8,9 | # r1 r4 r2 r1 w2=b w1=a r2 r3 w2=c w3=b r2 r2 r1 w3=c w2=b r3 r4 => a,b,c,d | # r1 r8 c82 w1=8 w8=2 r4 r1 c88 r8 c28 r4 r7 w4=1 w7=8 r2 c78 r6 c88 w2=8 w6=7 r3 c18 r5 c82 r4 c81 r3 c81 r2 c88 w7=1 w3=8 r1 r2 c88 r4 r8 c21 w4=2 w8=1 r6 r4 c72 w6=2 w4=7 r6 r7 w6=1 w7=2 r5 c22 r6 c21 r5 c22 w5=2 w5=2 r6 c12 r4 c27 w7=1 w6=2 r7 r8 c11 r4 r5 c27 => 8,8,8,7,2,2,1,1"#
+    );
+}
+
+/// Metamethods a comparator adds mid-sort take effect for the rest of it.
+#[test]
+fn sort_rechecks_metatable() {
+    let src = r#"
+-- A comparator that gives the array metamethods partway through: every later
+-- read and write must go through them.
+local arr = {5, 3, 8, 1, 9, 2, 7}
+local calls = 0
+table.sort(arr, function(a, b)
+  calls = calls + 1
+  if calls == 4 then
+    local store = {}
+    for i = 1, #arr do store[i] = rawget(arr, i); rawset(arr, i, nil) end
+    setmetatable(arr, {
+      __index = function(_, k) log[#log + 1] = 'r' .. k; return store[k] end,
+      __newindex = function(_, k, v) log[#log + 1] = 'w' .. k; store[k] = v end,
+    })
+    rawset(arr, "store", store)
+  end
+  return a < b
+end)
+return flush() .. ' => ' .. table.concat(rawget(arr, 'store'), ',')
+"#;
+    assert_eq!(
+        run(src),
+        r#"r5 r4 w3 w4 r4 r3 w6 w4 r5 r7 w5 w7 r6 r5 r7 r1 r3 r2 r1 r3 w2 w3 => 1,2,3,5,7,8,9"#
+    );
+}
+
+/// `sort` errors on proxies, after the reads that precede them.
+#[test]
+fn sort_errors() {
+    let src = r#"
+local out = {}
+out[#out + 1] = cat(pcall(table.sort, proxy({3, 2, 1, 4}), function() return true end), flush())
+out[#out + 1] = cat(pcall(table.sort, proxy({3, 2, 1}), 5), flush())
+out[#out + 1] = cat(pcall(table.sort, setmetatable({}, {__index = {2, {}}, __newindex = {}, __len = function() return 2 end})))
+return table.concat(out, ' | ')
+"#;
+    assert_eq!(
+        run(src),
+        r#"false # r1 r4 w1=4 w4=3 r2 r1 w2=4 w1=2 r2 r3 w2=1 w3=4 r2 r3 | false # | false attempt to compare table with number"#
+    );
+}
+
 /// Yielding from a metamethod the table library calls is an intentional
 /// divergence: Lua raises "attempt to yield across a C-call boundary".
 #[test]
