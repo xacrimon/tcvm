@@ -27,5 +27,4 @@ expression: output
 0012  [  5]  MOVE            R9 R3
 0013  [  5]  MOVE            R10 R4
 0014  [  5]  LOAD            R11 K4  ; 5
-0015  [  5]  CLOSE           R3
-0016  [  5]  RETURN          R6 count=7
+0015  [  5]  RETURN          R6 count=7

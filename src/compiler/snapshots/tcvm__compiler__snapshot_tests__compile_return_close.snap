@@ -22,8 +22,7 @@ expression: output
   0002  [  4]  MOVE            R3 R1
   0003  [  4]  LOAD            R4 K0  ; 1
   0004  [  4]  CALL            R3 args=2 ret=0
-  0005  [  5]  CLOSE           R2
-  0006  [  5]  RETURN          R3 count=0
+  0005  [  4]  RETURN          R3 count=0
 
 ; prototype 1:
   ; function (params=2, vararg=false, stack=5, upvalues=0)
@@ -34,8 +33,7 @@ expression: output
   0001  [  8]  TBC             R2
   0002  [  9]  SELF            R3 R1 K0  ; "get"
   0003  [  9]  CALL            R3 args=2 ret=0
-  0004  [ 10]  CLOSE           R2
-  0005  [ 10]  RETURN          R3 count=0
+  0004  [  9]  RETURN          R3 count=0
 
 ; prototype 2:
   ; function (params=2, vararg=false, stack=4, upvalues=0)

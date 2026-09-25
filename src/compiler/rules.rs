@@ -1583,13 +1583,9 @@ fn compile_function_to_chunk<'gc, 'a>(
         ctx.emit(Instruction::ret0());
     }
 
-    if let Some(reg) = ctx.pop_scope()? {
-        // Insert CLOSE before the final RETURN/TAILCALL
-        let return_instr = ctx.chunk.tape.pop().unwrap();
-        ctx.chunk.lineinfo.pop();
-        ctx.emit(Instruction::close(reg));
-        ctx.emit(return_instr);
-    }
+    // No CLOSE: RETURN and TAILCALL close the frame themselves, and one here
+    // could sit between a MULTRET producer and the RETURN reading `top`.
+    ctx.pop_scope()?;
 
     // Flatten the named upvalue list into the chunk's descriptor array.
     let lua_ctx = ctx.ctx;
