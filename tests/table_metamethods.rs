@@ -1,5 +1,5 @@
-//! The table library honours `__index`, `__newindex` and `__len` (#185),
-//! including on non-tables that carry them. Expected strings come from `lua`
+//! The table library and `ipairs` honour `__index`, `__newindex` and `__len`
+//! (#185), including on non-tables that carry them. Expected strings come from `lua`
 //! 5.5.1 running the same chunk.
 
 use tcvm::env::Value;
@@ -235,6 +235,49 @@ return table.concat(out, ' | ')
     assert_eq!(
         run(src),
         r#"false # r1 r4 w1=4 w4=3 r2 r1 w2=4 w1=2 r2 r3 w2=1 w3=4 r2 r3 | false # | false attempt to compare table with number"#
+    );
+}
+
+/// `ipairs` reads through `__index` and stops at the first nil.
+#[test]
+fn ipairs_through_index() {
+    let src = r#"
+local out = {}
+local function walk(t) local s = {} for i, v in ipairs(t) do s[#s + 1] = i .. '=' .. tostring(v) end return table.concat(s, ' ') end
+out[#out + 1] = walk(setmetatable({}, {__index = function(_, i) if i <= 3 then return i * 2 end end}))
+out[#out + 1] = walk(setmetatable({1, 2}, {__index = function(_, i) if i <= 4 then return 'i' .. i end end}))
+out[#out + 1] = walk(setmetatable({}, {__index = setmetatable({}, {__index = {'a', 'b'}})}))
+out[#out + 1] = cat(walk(proxy({'x', 'y'})), flush())
+out[#out + 1] = walk(setmetatable({}, {__index = 'abc'}))
+local f = ipairs({})
+out[#out + 1] = cat(f == ipairs({1}), f({10, 20}, '1'))
+out[#out + 1] = cat(f({10, 20}, 2.0), select('#', f({10}, 1)))
+out[#out + 1] = cat(f(setmetatable({}, {__index = function(_, k) return k end}), math.maxinteger))
+return table.concat(out, ' | ')
+"#;
+    assert_eq!(
+        run(src),
+        r#"1=2 2=4 3=6 | 1=1 2=2 3=i3 4=i4 | 1=a 2=b | 1=x 2=y r1 r2 r3 |  | true 2 20 | nil 1 | -9223372036854775808 -9223372036854775808"#
+    );
+}
+
+/// `ipairs` iterator errors, positioned like the reference's.
+#[test]
+fn ipairs_errors() {
+    let src = r#"
+local out = {}
+local function try(f) out[#out + 1] = select(2, pcall(f)) end
+try(function() for _ in ipairs(5) do end end)
+try(function() for _ in ipairs(setmetatable({}, {__index = function() error('boom', 0) end})) do end end)
+local f = ipairs({})
+try(function() for _ in f, {}, 'x' do end end)
+try(function() for _ in f, {}, 1.5 do end end)
+try(function() ipairs() end)
+return table.concat(out, ' | ')
+"#;
+    assert_eq!(
+        run(src),
+        r#"attempt to index a number value | boom | c:17: bad argument #2 to 'for iterator' (number expected, got string) | c:18: bad argument #2 to 'for iterator' (number has no integer representation) | c:19: bad argument #1 to 'ipairs' (value expected)"#
     );
 }
 
