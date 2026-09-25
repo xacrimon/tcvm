@@ -68,8 +68,8 @@ impl<'gc> State<'gc> {
     }
 }
 
-/// Allocation debt, in bytes, that `drive` lets build up before collecting.
-const GC_GRANULARITY: f64 = 1024.0;
+/// Allocation debt, in bytes, between collector slices.
+const GC_GRANULARITY: usize = 1024;
 
 /// A Lua runtime instance.
 pub struct Lua {
@@ -99,19 +99,18 @@ impl Lua {
                 type_metatables: std::array::from_fn(|_| Gc::new(mc, Lock::new(None))),
             }
         });
-        arena.metrics().arm_gc_check(GC_GRANULARITY);
+        arena.metrics().set_gc_granularity(GC_GRANULARITY);
         Lua { arena }
     }
 
-    /// Pay the collector's debt if the interpreter's allocation check fired,
-    /// then re-arm it.
-    fn collect_if_due(&mut self) {
-        if self.arena.metrics().gc_check_due() {
-            if self.arena.metrics().allocation_debt() > GC_GRANULARITY {
-                self.arena.collect_debt();
-            }
-            self.arena.metrics().arm_gc_check(GC_GRANULARITY);
+    /// Pay the collector's debt once it exceeds the granularity, then re-arm
+    /// the interpreter's check.
+    fn collect_debt(&mut self) {
+        let metrics = self.arena.metrics();
+        if metrics.allocation_debt() > metrics.gc_granularity() as f64 {
+            self.arena.collect_debt();
         }
+        self.arena.metrics().arm_gc_check();
     }
 
     /// Force a full garbage-collection cycle (mark + sweep) to completion.
@@ -132,12 +131,16 @@ impl Lua {
         self.arena.metrics().total_gc_allocation()
     }
 
-    /// Run `f` inside the arena's mutation context.
+    /// Run `f` inside the arena's mutation context, then collect if enough
+    /// allocation debt has built up. Collection can only happen between
+    /// `enter`s, so hosts that step an executor should step in separate ones.
     pub fn enter<F, T>(&mut self, f: F) -> T
     where
         F: for<'gc> FnOnce(Context<'gc>) -> T,
     {
-        self.arena.mutate(|mc, state| f(Context::new(mc, state)))
+        let r = self.arena.mutate(|mc, state| f(Context::new(mc, state)));
+        self.collect_debt();
+        r
     }
 
     /// `enter` variant that threads a `Result` through.
@@ -196,7 +199,7 @@ impl Lua {
             match outcome {
                 Outcome::Done(r) => return Ok(r),
                 Outcome::Yielded => return Err(RuntimeError::MainYielded),
-                Outcome::Pending => self.collect_if_due(),
+                Outcome::Pending => continue,
             }
         }
     }

@@ -198,6 +198,7 @@ impl GcCheck {
 #[derive(Debug, Default)]
 struct MetricsInner {
     gc_check: GcCheck,
+    gc_granularity: Cell<usize>,
 
     pacing: Cell<Pacing>,
 
@@ -340,12 +341,33 @@ impl Metrics {
         self.0.gc_check.due()
     }
 
-    /// Arm [`Metrics::gc_check_due`] to fire once the debt could exceed `granularity`.
-    pub fn arm_gc_check(&self, granularity: f64) {
-        let remaining = (granularity - self.raw_debt()).max(1.0) as usize;
+    /// Allocation debt, in bytes, the host lets build up before collecting.
+    pub fn gc_granularity(&self) -> usize {
+        self.0.gc_granularity.get()
+    }
+
+    pub fn set_gc_granularity(&self, bytes: usize) {
+        self.0.gc_granularity.set(bytes);
+        self.arm_gc_check();
+    }
+
+    /// Arm [`Metrics::gc_check_due`] to fire once the debt could exceed the granularity.
+    pub fn arm_gc_check(&self) {
+        let remaining = (self.gc_granularity() as f64 - self.raw_debt()).max(1.0) as usize;
+        self.set_gc_check_in(remaining);
+    }
+
+    /// Fire [`Metrics::gc_check_due`] again only after another granularity of allocation, so a
+    /// host that keeps stepping without collecting sees one exit per granularity, not one per
+    /// allocation.
+    pub fn defer_gc_check(&self) {
+        self.set_gc_check_in(self.gc_granularity().max(1));
+    }
+
+    fn set_gc_check_in(&self, bytes: usize) {
         let c = &self.0.gc_check;
         c.gc_check_at
-            .set(c.allocated_bytes_total.get().saturating_add(remaining));
+            .set(c.allocated_bytes_total.get().saturating_add(bytes));
     }
 
     // `allocation_debt` without the clamp: while the collector sleeps this is minus the bytes left
