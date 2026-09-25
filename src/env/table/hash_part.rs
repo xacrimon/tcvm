@@ -105,7 +105,7 @@ pub(super) fn int_hash(key: i64) -> u64 {
 
 #[inline]
 pub(super) fn lua_string_hash(key: LuaString<'_>) -> u64 {
-    foldhash::fast::FixedState::default().hash_one(key)
+    key.content_hash()
 }
 
 pub(super) type Part<'gc, K, A> = HashTable<Entry<'gc, K>, A>;
