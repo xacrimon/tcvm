@@ -1,4 +1,4 @@
-use core::{cell::RefCell, fmt, mem};
+use core::{cell::RefCell, fmt, mem, ptr::NonNull};
 use std::{
     rc::{Rc, Weak},
     vec::Vec,
@@ -41,7 +41,7 @@ impl<'gc> DynamicRootSet<'gc> {
         DynamicRootSet(Gc::new(
             mc,
             Inner {
-                slots: Rc::new(RefCell::new(Slots::new(mc.metrics().clone()))),
+                slots: Rc::new(RefCell::new(Slots::new(mc.metrics()))),
             },
         ))
     }
@@ -221,14 +221,16 @@ unsafe impl<'gc> Collect<'gc> for Slot<'gc> {
 }
 
 struct Slots<'gc> {
-    metrics: Metrics,
+    // The arena's; `Slots` never outlives it: the set owns the only strong `Rc` between calls, and
+    // a `DynamicRoot` whose upgrade fails never touches the metrics.
+    metrics: NonNull<Metrics>,
     slots: Vec<Slot<'gc>>,
     next_free: Index,
 }
 
 impl<'gc> Drop for Slots<'gc> {
     fn drop(&mut self) {
-        self.metrics
+        self.metrics()
             .mark_external_deallocation(self.slots.capacity() * mem::size_of::<Slot>());
     }
 }
@@ -240,12 +242,17 @@ unsafe impl<'gc> Collect<'gc> for Slots<'gc> {
 }
 
 impl<'gc> Slots<'gc> {
-    fn new(metrics: Metrics) -> Self {
+    fn new(metrics: &Metrics) -> Self {
         Self {
-            metrics,
+            metrics: NonNull::from(metrics),
             slots: Vec::new(),
             next_free: NULL_INDEX,
         }
+    }
+
+    fn metrics(&self) -> &Metrics {
+        // SAFETY: see the `metrics` field.
+        unsafe { self.metrics.as_ref() }
     }
 
     fn add(&mut self, p: Gc<'gc, ()>) -> Index {
@@ -278,7 +285,7 @@ impl<'gc> Slots<'gc> {
 
             debug_assert!(new_capacity >= old_capacity);
             if new_capacity > old_capacity {
-                self.metrics.mark_external_allocation(
+                self.metrics().mark_external_allocation(
                     (new_capacity - old_capacity) * mem::size_of::<Slot>(),
                 );
             }
