@@ -175,8 +175,30 @@ pub(crate) fn op_error_message<'gc>(
         OpError::NilIndex => "table index is nil".to_owned(),
         OpError::NanIndex => "table index is NaN".to_owned(),
         OpError::StackOverflow => "stack overflow".to_owned(),
+        OpError::NonClosable(reg) => {
+            let name = ts
+                .top_lua()
+                .and_then(|lf| local_name(lf, reg, lf.pc_index() - 1))
+                .map_or_else(
+                    || "?".to_owned(),
+                    |s| String::from_utf8_lossy(s.as_bytes()).into_owned(),
+                );
+            format!("variable '{name}' got a non-closable value")
+        }
         OpError::Internal(what) => format!("internal VM error: {what}"),
     }
+}
+
+/// Name of the local in register `reg` at instruction `pc` (`luaF_getlocalname`).
+pub(crate) fn local_name<'gc>(lf: &LuaFrame<'gc>, reg: u8, pc: usize) -> Option<LuaString<'gc>> {
+    let pc = pc as u32;
+    lf.closure
+        .proto
+        .locvars
+        .iter()
+        .filter(|v| v.start_pc <= pc && pc < v.end_pc)
+        .nth(reg as usize)
+        .map(|v| v.name)
 }
 
 /// The error for a call that would cross the thread's stack limit: "stack

@@ -1855,7 +1855,7 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
     }
 
     // Bind each target name to its slot and handle `<close>` / `<const>`.
-    let mut has_close = false;
+    let mut close_reg = None;
     for (i, target) in targets.into_iter().enumerate() {
         let name = target
             .name()
@@ -1875,12 +1875,8 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
 
         let reg = RegisterIndex(base + i as u8);
 
-        if matches!(kind, VarKind::ToClose) {
-            if mem::replace(&mut has_close, true) {
-                return Err(ctx.err(CompileErrorKind::MultipleClose));
-            }
-            ctx.emit(Instruction::tbc(reg));
-            ctx.mark_close(reg)?;
+        if matches!(kind, VarKind::ToClose) && close_reg.replace(reg).is_some() {
+            return Err(ctx.err(CompileErrorKind::MultipleClose));
         }
 
         ctx.define(
@@ -1896,6 +1892,13 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
     // are stable for the rest of the scope (upvalue-capture depends on
     // the register staying put).
     ctx.adjust_locals(num_targets as u8);
+
+    // After the locals are live, so a non-closable value's error can name
+    // the variable (luac `checktoclose`).
+    if let Some(reg) = close_reg {
+        ctx.emit(Instruction::tbc(reg));
+        ctx.mark_close(reg)?;
+    }
 
     Ok(())
 }
