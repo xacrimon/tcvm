@@ -241,7 +241,8 @@ unsafe impl<'gc> Collect<'gc> for BoxSequence<'gc> {
 impl<'gc> BoxSequence<'gc> {
     /// Construct a new boxed sequence in the GC arena's metered allocator.
     pub fn new<S: Sequence<'gc> + 'gc>(mc: &Mutation<'gc>, seq: S) -> Self {
-        let alloc: MetricsAlloc<'static> = MetricsAlloc::from_metrics(mc.metrics().clone());
+        // SAFETY: the box is stored in the arena's objects, which it cannot outlive.
+        let alloc: MetricsAlloc<'static> = unsafe { MetricsAlloc::from_metrics(mc.metrics()) };
         let b: Box<S, MetricsAlloc<'static>> = Box::new_in(seq, alloc);
         // SAFETY: rust-stable `CoerceUnsized` on `Box<T, A>` doesn't yet support
         // alternate allocators; we coerce the raw pointer manually. The

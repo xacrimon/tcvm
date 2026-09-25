@@ -1,4 +1,5 @@
 use crate::Context;
+use crate::dmm::allocator_api::MetricsAlloc;
 use crate::dmm::{Collect, Gc, Lock, Mutation, RefLock, Trace};
 use crate::env::error::Error;
 use crate::env::shape::Shape;
@@ -113,7 +114,7 @@ pub type Upvalue<'gc> = Gc<'gc, RefLock<UpvalueState<'gc>>>;
 /// A Lua closure (bytecode + upvalues).
 pub struct LuaClosure<'gc> {
     pub proto: Gc<'gc, Prototype<'gc>>,
-    pub upvalues: Box<[Upvalue<'gc>]>,
+    pub upvalues: Box<[Upvalue<'gc>], MetricsAlloc<'gc>>,
     // Copies of the `proto` fields CALL needs, so entering a function is one
     // dependent load shorter (closure -> code, not closure -> proto -> code).
     // The pointers stay valid because `proto` is immutable and kept alive by
@@ -141,7 +142,7 @@ unsafe impl<'gc> Collect<'gc> for LuaClosure<'gc> {
 pub struct NativeClosure<'gc> {
     #[collect(require_static)]
     pub function: NativeFn,
-    pub upvalues: Box<[Value<'gc>]>,
+    pub upvalues: Box<[Value<'gc>], MetricsAlloc<'gc>>,
     /// What CALL and TAILCALL jump to: `op_call_native`, or for a builtin with
     /// a fast path its own entry (LuaJIT's `ff_*`), which handles the common
     /// argument shape inline, never errors, and leaves every other shape to
@@ -426,7 +427,7 @@ impl<'gc> Function<'gc> {
     pub fn new_lua(
         mc: &Mutation<'gc>,
         proto: Gc<'gc, Prototype<'gc>>,
-        upvalues: Box<[Upvalue<'gc>]>,
+        upvalues: Box<[Upvalue<'gc>], MetricsAlloc<'gc>>,
     ) -> Self {
         let closure = LuaClosure {
             proto,
@@ -456,7 +457,11 @@ impl<'gc> Function<'gc> {
             mc,
             FunctionKind::Native(NativeClosure {
                 function,
-                upvalues,
+                upvalues: {
+                    let mut v = Vec::with_capacity_in(upvalues.len(), MetricsAlloc::new(mc));
+                    v.extend_from_slice(&upvalues);
+                    v.into_boxed_slice()
+                },
                 entry,
             }),
         ))

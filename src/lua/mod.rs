@@ -19,6 +19,8 @@ pub use stash::{
 
 use crate::builtin;
 use crate::dmm::Rootable;
+use crate::dmm::arena::CollectionPhase;
+use crate::dmm::metrics::Pacing;
 use crate::dmm::{Arena, Collect, DynamicRootSet, Gc, GcLock, Lock, Mutation};
 use crate::env::shape::Shape;
 use crate::env::string::Interner;
@@ -68,6 +70,14 @@ impl<'gc> State<'gc> {
     }
 }
 
+/// Allocation debt, in bytes, between collector slices: past the knee of the
+/// exit-overhead curve, with slices of ~10 µs on `particles_bench`.
+const GC_GRANULARITY: usize = 64 * 1024;
+
+/// The least the collector sleeps between cycles. Only binds when the live
+/// set is tiny; the default 4 KiB restarts a cycle every few KiB of garbage.
+const GC_MIN_SLEEP: usize = 64 * 1024;
+
 /// A Lua runtime instance.
 pub struct Lua {
     arena: Arena<Rootable![State<'_>]>,
@@ -97,14 +107,66 @@ impl Lua {
                 type_metatables: std::array::from_fn(|_| Gc::new(mc, Lock::new(None))),
             }
         });
+        let metrics = arena.metrics();
+        metrics.set_pacing(Pacing {
+            min_sleep: GC_MIN_SLEEP,
+            ..Pacing::DEFAULT
+        });
+        metrics.set_gc_granularity(GC_GRANULARITY);
         Lua { arena }
+    }
+
+    /// Pay the collector's debt once it exceeds the granularity, then re-arm
+    /// the interpreter's check.
+    fn collect_debt(&mut self) {
+        let metrics = self.arena.metrics();
+        if metrics.allocation_debt() > metrics.gc_granularity() as f64 {
+            if self.arena.collection_phase() != CollectionPhase::Sweeping
+                && let Some(marked) = self.arena.mark_debt()
+            {
+                marked.finalize(|fc, root| root.interner.prune(fc));
+                self.start_sweeping();
+            }
+            // Stops when the cycle ends rather than marking the next one, which
+            // must go through the prune above.
+            if self.arena.collection_phase() == CollectionPhase::Sweeping {
+                self.arena.cycle_debt();
+            }
+        }
+        self.arena.metrics().arm_gc_check();
+    }
+
+    /// Enter the sweep straight after the interner's prune: a string allocated
+    /// and dropped in between would be freed while still interned.
+    fn start_sweeping(&mut self) {
+        self.arena
+            .finish_marking()
+            .expect("arena is fully marked")
+            .start_sweeping();
+    }
+
+    /// Run the current cycle, or a new one if the collector sleeps, to its end.
+    fn finish_cycle(&mut self) {
+        if self.arena.collection_phase() != CollectionPhase::Sweeping {
+            self.arena
+                .finish_marking()
+                .expect("not sweeping")
+                .finalize(|fc, root| root.interner.prune(fc));
+            self.start_sweeping();
+        }
+        self.arena.finish_cycle();
     }
 
     /// Force a full garbage-collection cycle (mark + sweep) to completion.
     /// Exposed mainly as a GC-soundness test/debug hook; a real
     /// `collectgarbage("collect")` would route here.
     pub fn collect_all(&mut self) {
-        self.arena.finish_cycle();
+        // A cycle already under way keeps everything it has marked, so finish
+        // it first (like `luaC_fullgc`).
+        if self.arena.collection_phase() != CollectionPhase::Sleeping {
+            self.finish_cycle();
+        }
+        self.finish_cycle();
     }
 
     /// Bytes currently held by live GC allocations. Only meaningful right
@@ -113,12 +175,16 @@ impl Lua {
         self.arena.metrics().total_gc_allocation()
     }
 
-    /// Run `f` inside the arena's mutation context.
+    /// Run `f` inside the arena's mutation context, then collect if enough
+    /// allocation debt has built up. Collection can only happen between
+    /// `enter`s, so hosts that step an executor should step in separate ones.
     pub fn enter<F, T>(&mut self, f: F) -> T
     where
         F: for<'gc> FnOnce(Context<'gc>) -> T,
     {
-        self.arena.mutate(|mc, state| f(Context::new(mc, state)))
+        let r = self.arena.mutate(|mc, state| f(Context::new(mc, state)));
+        self.collect_debt();
+        r
     }
 
     /// `enter` variant that threads a `Result` through.

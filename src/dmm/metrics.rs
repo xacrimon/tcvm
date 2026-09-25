@@ -1,5 +1,4 @@
 use core::cell::Cell;
-use std::rc::Rc;
 
 /// Tuning parameters for a given garbage collected [`crate::Arena`].
 ///
@@ -109,8 +108,8 @@ pub struct Pacing {
     /// `<current heap size> + <previous remembered size> * sleep_factor` before starting
     /// collection.
     ///
-    /// External memory is ***not*** included in the "remembered size" for the purposes of
-    /// calculating a new cycle's sleep period.
+    /// The "remembered size" includes the external memory still allocated when the previous
+    /// cycle finished, which is what its surviving objects own.
     pub sleep_factor: f64,
 
     /// The minimum length of the [`crate::arena::CollectionPhase::Sleeping`] phase.
@@ -177,8 +176,29 @@ impl Default for Pacing {
     }
 }
 
+/// Allocation counter and the threshold the interpreter compares it with,
+/// adjacent so one `ldp` loads both.
+#[derive(Debug, Default)]
+#[repr(C)]
+struct GcCheck {
+    allocated_bytes_total: Cell<usize>,
+    gc_check_at: Cell<usize>,
+}
+
+impl GcCheck {
+    /// Whether allocation since the last [`Metrics::arm_gc_check`] may have pushed the debt past
+    /// its granularity. Allocation only ever raises debt, so this can fire early, never late.
+    #[inline(always)]
+    fn due(&self) -> bool {
+        self.allocated_bytes_total.get() >= self.gc_check_at.get()
+    }
+}
+
 #[derive(Debug, Default)]
 struct MetricsInner {
+    gc_check: GcCheck,
+    gc_granularity: Cell<usize>,
+
     pacing: Cell<Pacing>,
 
     total_gcs: Cell<usize>,
@@ -210,8 +230,10 @@ struct MetricsInner {
     remembered_gc_bytes: Cell<usize>,
 }
 
-#[derive(Clone)]
-pub struct Metrics(Rc<MetricsInner>);
+/// The arena's allocation and collection counters. Lives in its own allocation, owned by the
+/// arena's `Context` and freed after every object, so allocators can point at it (see
+/// [`MetricsAlloc`](crate::dmm::MetricsAlloc)); handed out only by reference.
+pub struct Metrics(MetricsInner);
 
 impl Metrics {
     pub(crate) fn new() -> Self {
@@ -267,6 +289,10 @@ impl Metrics {
         self.0
             .total_external_bytes
             .update(|b| b.saturating_add(bytes));
+        self.0
+            .gc_check
+            .allocated_bytes_total
+            .update(|b| b.wrapping_add(bytes));
     }
 
     /// Call to mark that bytes which have been marked as allocated with
@@ -308,6 +334,46 @@ impl Metrics {
             return 0.0;
         }
 
+        self.raw_debt().max(0.0)
+    }
+
+    #[inline(always)]
+    pub fn gc_check_due(&self) -> bool {
+        self.0.gc_check.due()
+    }
+
+    /// Allocation debt, in bytes, the host lets build up before collecting.
+    pub fn gc_granularity(&self) -> usize {
+        self.0.gc_granularity.get()
+    }
+
+    pub fn set_gc_granularity(&self, bytes: usize) {
+        self.0.gc_granularity.set(bytes);
+        self.arm_gc_check();
+    }
+
+    /// Arm [`Metrics::gc_check_due`] to fire once the debt could exceed the granularity.
+    pub fn arm_gc_check(&self) {
+        let remaining = (self.gc_granularity() as f64 - self.raw_debt()).max(1.0) as usize;
+        self.set_gc_check_in(remaining);
+    }
+
+    /// Fire [`Metrics::gc_check_due`] again only after another granularity of allocation, so a
+    /// host that keeps stepping without collecting sees one exit per granularity, not one per
+    /// allocation.
+    pub fn defer_gc_check(&self) {
+        self.set_gc_check_in(self.gc_granularity().max(1));
+    }
+
+    fn set_gc_check_in(&self, bytes: usize) {
+        let c = &self.0.gc_check;
+        c.gc_check_at
+            .set(c.allocated_bytes_total.get().saturating_add(bytes));
+    }
+
+    // `allocation_debt` without the clamp: while the collector sleeps this is minus the bytes left
+    // until it wakes.
+    fn raw_debt(&self) -> f64 {
         // Right now, we treat allocating an external byte as 1.0 units of debt and deallocating an
         // external byte as 1.0 units of work (we also treat freeing more external bytes than were
         // allocated in the current cycle as performing *no* work). The result is that the *total*
@@ -318,18 +384,11 @@ impl Metrics {
             .total_external_bytes
             .get()
             .saturating_sub(self.0.external_bytes_start.get());
-
         let allocated_bytes =
             self.0.allocated_gc_bytes.get() as f64 + allocated_external_bytes as f64;
-
         // Every allocation after the `wakeup_amount` in a cycle is a debit.
         let cycle_debits =
             allocated_bytes - self.0.wakeup_amount.get() + self.0.artificial_debt.get();
-
-        // If our debits are not positive, then we know the total debt is not positive.
-        if cycle_debits <= 0.0 {
-            return 0.0;
-        }
 
         let pacing = self.0.pacing.get();
 
@@ -339,12 +398,14 @@ impl Metrics {
             + self.0.dropped_gc_bytes.get() as f64 * pacing.drop_factor
             + self.0.freed_gc_bytes.get() as f64 * pacing.free_factor;
 
-        (cycle_debits - cycle_credits).max(0.0)
+        cycle_debits - cycle_credits
     }
 
     pub(crate) fn finish_cycle(&self, reset_debt: bool) {
         let pacing = self.0.pacing.get();
-        let remembered_size = self.0.remembered_gc_bytes.get();
+        // The sweep has just dropped everything unreachable, so the external bytes still
+        // outstanding are the ones live objects own.
+        let remembered_size = self.0.remembered_gc_bytes.get() + self.0.total_external_bytes.get();
         let wakeup_amount =
             (remembered_size as f64 * pacing.sleep_factor).max(pacing.min_sleep as f64);
 
@@ -378,6 +439,10 @@ impl Metrics {
         self.0
             .allocated_gc_bytes
             .update(|b| b.saturating_add(bytes));
+        self.0
+            .gc_check
+            .allocated_bytes_total
+            .update(|b| b.wrapping_add(bytes));
     }
 
     #[inline]
