@@ -19,6 +19,7 @@ pub use stash::{
 
 use crate::builtin;
 use crate::dmm::Rootable;
+use crate::dmm::arena::CollectionPhase;
 use crate::dmm::{Arena, Collect, DynamicRootSet, Gc, GcLock, Lock, Mutation};
 use crate::env::shape::Shape;
 use crate::env::string::Interner;
@@ -67,6 +68,9 @@ impl<'gc> State<'gc> {
     }
 }
 
+/// Allocation debt, in bytes, that `drive` lets build up before collecting.
+const GC_GRANULARITY: f64 = 1024.0;
+
 /// A Lua runtime instance.
 pub struct Lua {
     arena: Arena<Rootable![State<'_>]>,
@@ -95,13 +99,30 @@ impl Lua {
                 type_metatables: std::array::from_fn(|_| Gc::new(mc, Lock::new(None))),
             }
         });
+        arena.metrics().arm_gc_check(GC_GRANULARITY);
         Lua { arena }
+    }
+
+    /// Pay the collector's debt if the interpreter's allocation check fired,
+    /// then re-arm it.
+    fn collect_if_due(&mut self) {
+        if self.arena.metrics().gc_check_due() {
+            if self.arena.metrics().allocation_debt() > GC_GRANULARITY {
+                self.arena.collect_debt();
+            }
+            self.arena.metrics().arm_gc_check(GC_GRANULARITY);
+        }
     }
 
     /// Force a full garbage-collection cycle (mark + sweep) to completion.
     /// Exposed mainly as a GC-soundness test/debug hook; a real
     /// `collectgarbage("collect")` would route here.
     pub fn collect_all(&mut self) {
+        // A cycle already under way keeps everything it has marked, so finish
+        // it first (like `luaC_fullgc`).
+        if self.arena.collection_phase() != CollectionPhase::Sleeping {
+            self.arena.finish_cycle();
+        }
         self.arena.finish_cycle();
     }
 
@@ -175,7 +196,7 @@ impl Lua {
             match outcome {
                 Outcome::Done(r) => return Ok(r),
                 Outcome::Yielded => return Err(RuntimeError::MainYielded),
-                Outcome::Pending => continue,
+                Outcome::Pending => self.collect_if_due(),
             }
         }
     }
