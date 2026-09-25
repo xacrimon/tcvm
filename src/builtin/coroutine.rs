@@ -8,7 +8,10 @@ use crate::env::thread::{ExecKind, ThreadStatus};
 use crate::env::{
     Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Thread, Value,
 };
-use crate::vm::sequence::{BoxSequence, CallbackAction, Catch, Execution, Sequence, SequencePoll};
+use crate::vm::close;
+use crate::vm::sequence::{
+    BoxSequence, CallbackAction, Catch, Execution, Sequence, SequencePoll, seq_trace_pointers,
+};
 
 pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[
@@ -152,8 +155,7 @@ fn lua_running<'gc>(
 }
 
 /// `coroutine.isyieldable([co])` — true iff `co` (defaults to running) is
-/// not the main thread. (TCVM doesn't yet model non-yieldable C frames;
-/// the main-thread test is the only blocker.)
+/// not the main thread, nor closing its variables for `coroutine.close`.
 fn lua_isyieldable<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
@@ -161,12 +163,18 @@ fn lua_isyieldable<'gc>(
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let arg = stack.get(0);
     let yieldable = if arg.is_nil() {
-        !stack.exec().is_main(ctx)
+        !stack.exec().is_main(ctx) && !stack.thread_mut().no_yield
     } else {
         let target = arg
             .get_thread()
             .ok_or_else(|| util::type_error(ctx, "isyieldable", 1, "thread", Some(arg)))?;
-        !target.ptr_eq(ctx.main_thread())
+        // The running thread's lock is held by the interpreter.
+        let no_yield = if target.ptr_eq(stack.exec().current_thread()) {
+            stack.thread_mut().no_yield
+        } else {
+            target.borrow().no_yield
+        };
+        !target.ptr_eq(ctx.main_thread()) && !no_yield
     };
     stack.ret1(Value::boolean(yieldable));
     Ok(CallbackAction::Return)
@@ -197,16 +205,11 @@ fn lua_wrap<'gc>(
     Ok(CallbackAction::Return)
 }
 
-/// `coroutine.close(co)` — clear the thread's stack/frames, set status
-/// to `Stopped`, return `true`. Per the manual, valid only for dead /
-/// suspended / running coroutines; for any other status we return
-/// `(nil, "cannot close a non-suspended coroutine")` instead of
-/// corrupting executor invariants.
-///
-/// The running-self case has special "does not return" semantics in the
-/// reference, which depend on `__close` machinery we haven't built yet —
-/// we reject it for now via the same path. Does NOT yet invoke `__close`
-/// metamethods on TBC variables; that ships with the broader TBC work.
+/// `coroutine.close(co)` — close a suspended or dead coroutine's pending
+/// to-be-closed variables on `co` itself, then `true`, or `false` and the
+/// error it died with or a `__close` raised. Closing the running or a
+/// `normal` coroutine returns `(nil, msg)`; the reference's self-close,
+/// which does not return, isn't supported.
 fn lua_close<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
@@ -228,15 +231,13 @@ fn lua_close<'gc>(
     }
     match co.status() {
         ThreadStatus::Suspended | ThreadStatus::Stopped | ThreadStatus::Result { .. } => {
-            let mc = ctx.mutation();
-            let mut ts = co.borrow_mut(mc);
-            // A coroutine that died via error re-surfaces that error as
-            // `(false, err)` (and only once — clear it so a second close is
-            // `true`, matching Lua). Otherwise close succeeds with `true`.
-            let death_error = ts.death_error.take();
-            ts.reset();
-            ts.status = ThreadStatus::Stopped;
-            match death_error {
+            let mut ts = co.borrow_mut(ctx.mutation());
+            if close::seed_thread_close(ctx, &mut ts) {
+                stack.clear();
+                return Ok(CallbackAction::resume(co, None));
+            }
+            // Surfaced once, so a second close is `true`, as in Lua.
+            match ts.death_error.take() {
                 Some(err) => stack.replace(&[Value::boolean(false), err]),
                 None => stack.replace(&[Value::boolean(true)]),
             }
@@ -271,7 +272,7 @@ fn wrap_callback<'gc>(
     if let Some(msg) = unresumable_reason(ctx, stack.exec(), co) {
         return Err(Error::from_str(ctx, msg));
     }
-    let then = BoxSequence::new(ctx.mutation(), UnwrapResumeSequence);
+    let then = BoxSequence::new(ctx.mutation(), UnwrapResumeSequence { co, closing: false });
     Ok(CallbackAction::resume(co, Some(then)))
 }
 
@@ -280,33 +281,51 @@ fn wrap_callback<'gc>(
 // ---------------------------------------------------------------------------
 
 /// `coroutine.wrap`'s follow-up sequence: returns the inner thread's
-/// values verbatim on success, rethrows on error.
-struct UnwrapResumeSequence;
-
-unsafe impl<'gc> Collect<'gc> for UnwrapResumeSequence {
-    const NEEDS_TRACE: bool = false;
+/// values verbatim on success, rethrows on error once the dead thread has
+/// closed its variables (`auxwrap`'s `lua_closethread`).
+#[derive(Collect)]
+#[collect(internal, no_drop)]
+struct UnwrapResumeSequence<'gc> {
+    co: Thread<'gc>,
+    /// The thread is closing its variables; its result is `false, err`.
+    closing: bool,
 }
 
-impl<'gc> Sequence<'gc> for UnwrapResumeSequence {
-    fn trace_pointers(&self, _cc: &mut dyn Trace<'gc>) {}
+impl<'gc> Sequence<'gc> for UnwrapResumeSequence<'gc> {
+    fn trace_pointers(&self, cc: &mut dyn Trace<'gc>) {
+        seq_trace_pointers!(self, cc);
+    }
 
     fn poll(
         self: Pin<&mut Self>,
-        _ctx: Context<'gc>,
+        ctx: Context<'gc>,
         _exec: Execution<'gc>,
-        _stack: Stack<'gc, '_>,
+        stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
+        if self.closing {
+            return Err(Error::new(ctx, stack.get(1)).with_level(1));
+        }
         // Pass through whatever the inner left on the stack.
         Ok(SequencePoll::Return)
     }
 
     fn error(
-        self: Pin<&mut Self>,
-        _ctx: Context<'gc>,
+        mut self: Pin<&mut Self>,
+        ctx: Context<'gc>,
         _exec: Execution<'gc>,
         err: Error<'gc>,
-        _stack: Stack<'gc, '_>,
+        mut stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
+        let co = self.co;
+        if !self.closing && !co.borrow().tbc_list.is_empty() {
+            close::seed_thread_close(ctx, &mut co.borrow_mut(ctx.mutation()));
+            self.closing = true;
+            stack.clear();
+            return Ok(SequencePoll::Resume {
+                thread: co,
+                bottom: 0,
+            });
+        }
         // `auxwrap` re-raises a string error with the wrap caller's position
         // prepended on top of the coroutine's own.
         Err(err.with_level(1))

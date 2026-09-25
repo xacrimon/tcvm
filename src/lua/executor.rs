@@ -424,6 +424,10 @@ fn apply_pending_action<'gc>(
         }
         Suspend::Yield { then } => {
             let mut ts = top.borrow_mut(mc);
+            if ts.no_yield {
+                ts.raise(ctx, yield_across_close(ctx));
+                return Ok(());
+            }
             // With a follow-up sequence the resume args are its input and
             // stay at `bottom`; without one they are the call's results.
             let landing = if then.is_some() {
@@ -724,6 +728,9 @@ fn pump_sequence<'gc>(
             ts.stack[call_site.func_idx] = function;
             schedule_call_at(&mut ts, ctx, call_site.func_idx, call_site.returns)?;
         }
+        Ok(SequencePoll::Yield { .. } | SequencePoll::TailYield) if top.borrow().no_yield => {
+            top.borrow_mut(mc).raise(ctx, yield_across_close(ctx));
+        }
         Ok(SequencePoll::Yield { bottom: rel }) => {
             let abs_bottom = call_site.bottom + rel;
             let mut ts = top.borrow_mut(mc);
@@ -767,6 +774,13 @@ fn pump_sequence<'gc>(
         }
     }
     Ok(PumpOutcome::Continue)
+}
+
+/// A yield while `coroutine.close`/`wrap` closes the thread's variables,
+/// which the reference runs on the C stack.
+fn yield_across_close(ctx: Context<'_>) -> Error<'_> {
+    let msg = LuaString::new(ctx, b"attempt to yield across a C-call boundary");
+    Error::new(ctx, Value::string(msg))
 }
 
 /// After an inner thread terminated or yielded, transfer its result-bottom
