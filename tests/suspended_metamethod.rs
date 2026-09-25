@@ -54,14 +54,17 @@ fn yield_then_resume<A>(lua: &mut Lua, ex: &tcvm::StashedExecutor, value: A) -> 
 where
     A: for<'gc> IntoMultiValue<'gc>,
 {
-    lua.try_enter(|ctx| -> Result<(), RuntimeError> {
-        match ctx.fetch(ex).step(ctx)? {
-            StepResult::Yielded(_) => Ok(()),
-            StepResult::Done => panic!("metamethod should have suspended, not completed"),
-            StepResult::Pending => panic!("expected Yielded, got Pending"),
-        }
-    })
-    .expect("step to the metamethod's yield");
+    // Step in separate `enter`s past any `Pending` from GC exits.
+    while lua
+        .try_enter(|ctx| -> Result<bool, RuntimeError> {
+            match ctx.fetch(ex).step(ctx)? {
+                StepResult::Yielded(_) => Ok(false),
+                StepResult::Done => panic!("metamethod should have suspended, not completed"),
+                StepResult::Pending => Ok(true),
+            }
+        })
+        .expect("step to the metamethod's yield")
+    {}
 
     lua.resume(ex, value).expect("resume to completion");
     lua.try_enter(|ctx| ctx.fetch(ex).take_result::<i64>(ctx))

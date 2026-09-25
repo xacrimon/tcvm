@@ -236,7 +236,11 @@ impl<'gc> Executor<'gc> {
             };
 
             match kind {
-                FrameKind::Lua => vm::interp::run_thread(ctx, top),
+                FrameKind::Lua => {
+                    if let vm::interp::Exit::Gc = vm::interp::run_thread(ctx, top) {
+                        return Ok(StepResult::Pending);
+                    }
+                }
                 FrameKind::Sequence => {
                     if matches!(pump_sequence(self, ctx, top)?, PumpOutcome::Pending) {
                         // Sequence asked for cooperative re-poll. Mode stays
