@@ -140,3 +140,45 @@ fn yield_inside_close() {
         "closing block|block|got v1|after block|closing unwind|unwind|got v2|pcall false E|closing return|return|got v3|R1 R2"
     );
 }
+
+#[test]
+fn coroutine_close_suspended() {
+    let src = "local co = coroutine.create(function()\n  local a <close> = mk('a')\n  local b <close> = mk('b')\n  coroutine.yield()\nend)\ncoroutine.resume(co)\nout(coroutine.close(co))\nout(coroutine.status(co))\nco = coroutine.create(function()\n  local a <close> = mk('a', 'EA')\n  local b <close> = mk('b', 'EB')\n  coroutine.yield()\nend)\ncoroutine.resume(co)\nout(coroutine.close(co))\nout(coroutine.close(co))\nreturn table.concat(log, '|')";
+    assert_eq!(
+        run(src),
+        "b 1 nil|a 1 nil|true|dead|b 1 nil|a 2 EB|false EA|true"
+    );
+}
+
+#[test]
+fn coroutine_close_after_error() {
+    let src = "local co = coroutine.create(function()\n  local a <close> = mk('a')\n  local t <close> = setmetatable({tag = 'alive'}, {__close = function(o, e) out(o.tag, e) end})\n  error('DIE', 0)\nend)\nout(coroutine.resume(co))\nout(coroutine.status(co))\ncollectgarbage()\nout(coroutine.close(co))\nout(coroutine.close(co))\nreturn table.concat(log, '|')";
+    assert_eq!(run(src), "false DIE|dead|alive DIE|a 2 DIE|false DIE|true");
+}
+
+#[test]
+fn coroutine_close_runs_on_target() {
+    let src = "local co\nco = coroutine.create(function()\n  local a <close> = setmetatable({}, {__close = function()\n    out(coroutine.running() == co, coroutine.isyieldable(), coroutine.isyieldable(co), coroutine.status(co))\n    coroutine.wrap(function() out('nested', coroutine.isyieldable(), coroutine.isyieldable(co)) end)()\n    coroutine.yield()\n  end})\n  coroutine.yield()\nend)\ncoroutine.resume(co)\nout(coroutine.close(co))\nout(coroutine.status(co))\nreturn table.concat(log, '|')";
+    assert_eq!(
+        run(src),
+        "true false false running|nested true false|false attempt to yield across a C-call boundary|dead"
+    );
+}
+
+#[test]
+fn coroutine_close_inside_close() {
+    let src = "local co = coroutine.create(function()\n  local a <close> = mk('a')\n  do\n    local b <close> = setmetatable({}, {__close = function() out('b yields') coroutine.yield() out('unreached') end})\n  end\nend)\ncoroutine.resume(co)\nout(coroutine.status(co))\nout(coroutine.close(co))\nreturn table.concat(log, '|')";
+    assert_eq!(run(src), "b yields|suspended|a 1 nil|true");
+}
+
+#[test]
+fn wrap_error_closes() {
+    let src = "local f = coroutine.wrap(function()\n  local a <close> = mk('a')\n  local b <close> = mk('b', 'EB')\n  error('WRAPERR')\nend)\nout(pcall(f))\nreturn table.concat(log, '|')";
+    assert_eq!(run(src), "b 2 c:4: WRAPERR|a 2 EB|false EB");
+}
+
+#[test]
+fn coroutine_close_closes_upvalues() {
+    let src = "local f\nlocal co = coroutine.create(function() local x = 42 f = function() return x end coroutine.yield() end)\ncoroutine.resume(co)\nout(coroutine.close(co))\ncollectgarbage()\nout(f())\nreturn table.concat(log, '|')";
+    assert_eq!(run(src), "true|42");
+}

@@ -145,7 +145,7 @@ pub struct ExecFrame<'gc> {
 pub(crate) enum TbcEntry<'gc> {
     Slot(usize),
     /// Its frame was unwound by an error; `level` is where it closes from: the
-    /// bottom of the `ErrorCloseSequence`.
+    /// bottom of the `ErrorCloseSequence`, or 0 on a dead coroutine.
     Detached {
         level: usize,
         value: Value<'gc>,
@@ -252,6 +252,8 @@ pub struct ThreadState<'gc> {
     /// Open to-be-closed variables by stack position, innermost last
     /// (`L->tbclist`). Each leaves the list just before its `__close` runs.
     pub(crate) tbc_list: Vec<TbcEntry<'gc>>,
+    /// Closing variables for `coroutine.close`/`wrap`, where yields are errors.
+    pub(crate) no_yield: bool,
     pub(crate) status: ThreadStatus,
     /// Logical stack top — the end of the value-passing window. Always valid:
     /// it is the sole signal of "how many values are here" across every
@@ -462,6 +464,7 @@ impl<'gc> ThreadState<'gc> {
         self.exec_frames.clear();
         self.open_upvalues.clear();
         self.tbc_list.clear();
+        self.no_yield = false;
         self.pending_action = None;
         self.yield_bottom = None;
         self.death_error = None;
@@ -680,6 +683,7 @@ impl<'gc> Thread<'gc> {
             exec_frames: Vec::new(),
             open_upvalues: Vec::new(),
             tbc_list: Vec::new(),
+            no_yield: false,
             status: ThreadStatus::Stopped,
             top: 0,
             thread_handle: None,
