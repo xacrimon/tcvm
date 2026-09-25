@@ -34,6 +34,7 @@ pub use self::{
     gc_weak::GcWeak,
     lock::{GcLock, GcRefLock, Lock, RefLock},
     static_collect::Static,
+    types::TrailingBytes,
 };
 #[doc(hidden)]
 pub use self::{

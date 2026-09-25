@@ -91,3 +91,30 @@ fn reinterned_strings_after_death_are_equal() {
                end";
     live_bytes_after(src);
 }
+
+#[test]
+fn string_bytes_round_trip_at_every_length() {
+    // Lengths around the box's alignment, an embedded NUL, and a large one.
+    let src = "for _, n in ipairs({0, 1, 7, 8, 9, 15, 16, 17, 4096}) do \
+                 local parts = {} \
+                 for i = 1, n do parts[i] = string.char((i * 37) % 256) end \
+                 local s = table.concat(parts) \
+                 if #s ~= n then error('length ' .. n) end \
+                 for i = 1, n do \
+                   if s:byte(i) ~= (i * 37) % 256 then error('byte ' .. i .. ' of ' .. n) end \
+                 end \
+               end";
+    live_bytes_after(src);
+}
+
+#[test]
+fn string_bytes_count_as_gc_memory() {
+    // The bytes live in the string's own allocation, so the collector sees them. (The scripts'
+    // other strings differ a little, hence not exactly 1 MiB.)
+    let small = live_bytes_after("keep = 'x'");
+    let large = live_bytes_after("keep = string.rep('x', 1 << 20)");
+    assert!(
+        large - small > 1_000_000,
+        "1 MiB string not counted: small={small} large={large}"
+    );
+}
