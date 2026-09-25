@@ -109,8 +109,8 @@ pub struct Pacing {
     /// `<current heap size> + <previous remembered size> * sleep_factor` before starting
     /// collection.
     ///
-    /// External memory is ***not*** included in the "remembered size" for the purposes of
-    /// calculating a new cycle's sleep period.
+    /// The "remembered size" includes the external memory still allocated when the previous
+    /// cycle finished, which is what its surviving objects own.
     pub sleep_factor: f64,
 
     /// The minimum length of the [`crate::arena::CollectionPhase::Sleeping`] phase.
@@ -402,7 +402,9 @@ impl Metrics {
 
     pub(crate) fn finish_cycle(&self, reset_debt: bool) {
         let pacing = self.0.pacing.get();
-        let remembered_size = self.0.remembered_gc_bytes.get();
+        // The sweep has just dropped everything unreachable, so the external bytes still
+        // outstanding are the ones live objects own.
+        let remembered_size = self.0.remembered_gc_bytes.get() + self.0.total_external_bytes.get();
         let wakeup_amount =
             (remembered_size as f64 * pacing.sleep_factor).max(pacing.min_sleep as f64);
 
