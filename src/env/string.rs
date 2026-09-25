@@ -5,18 +5,29 @@ use std::hash::BuildHasher;
 use hashbrown::{HashTable, hash_table};
 
 use crate::dmm::allocator_api::MetricsAlloc;
-use crate::dmm::{Collect, Finalization, Gc, Mutation, RefLock};
+use crate::dmm::{Collect, Finalization, Gc, Mutation, RefLock, TrailingBytes};
 use crate::lua::Context;
 
 #[derive(Clone, Copy, Collect)]
 #[collect(internal, no_drop)]
 pub struct LuaString<'gc>(Gc<'gc, StringData>);
 
+/// A string's header; its bytes follow it in the same allocation.
 #[derive(Collect)]
 #[collect(internal, require_static)]
 pub struct StringData {
-    // `'static` because `StringData` is; the arena outlives every string.
-    bytes: Box<[u8], MetricsAlloc<'static>>,
+    /// The interner's hash of the bytes.
+    hash: u64,
+    len: usize,
+}
+
+// SAFETY: only `Interner::intern` makes a `StringData`, through `Gc::new_with_bytes` with `len`
+// bytes, and it has no drop glue.
+unsafe impl TrailingBytes for StringData {
+    #[inline(always)]
+    fn trailing_len(&self) -> usize {
+        self.len
+    }
 }
 
 impl<'gc> LuaString<'gc> {
@@ -25,11 +36,17 @@ impl<'gc> LuaString<'gc> {
     }
 
     pub fn as_bytes(self) -> &'gc [u8] {
-        &Gc::as_ref(self.0).bytes
+        Gc::trailing_bytes(self.0)
     }
 
     pub fn len(self) -> usize {
-        Gc::as_ref(self.0).bytes.len()
+        self.0.len
+    }
+
+    /// A hash of the bytes, computed once when the string was interned.
+    #[inline]
+    pub(crate) fn content_hash(self) -> u64 {
+        self.0.hash
     }
 
     pub fn is_empty(self) -> bool {
@@ -71,7 +88,7 @@ impl<'gc> Ord for LuaString<'gc> {
 
 impl<'gc> Hash for LuaString<'gc> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write(&self.0.bytes);
+        state.write_u64(self.content_hash());
     }
 }
 
@@ -84,14 +101,9 @@ pub struct Interner<'gc>(Gc<'gc, RefLock<InternerState<'gc>>>);
 /// marking and before every sweep (see `Lua::collect_debt`), so no entry ever
 /// points at freed memory.
 struct InternerState<'gc> {
-    table: HashTable<InternEntry<'gc>, MetricsAlloc<'gc>>,
-    hasher: foldhash::fast::RandomState,
-}
-
-#[derive(Clone, Copy)]
-struct InternEntry<'gc> {
-    hash: u64,
-    string: Gc<'gc, StringData>,
+    table: HashTable<LuaString<'gc>, MetricsAlloc<'gc>>,
+    // Fixed so string-keyed tables, which reuse this hash, iterate in the same order every run.
+    hasher: foldhash::fast::FixedState,
 }
 
 // SAFETY: the entries are not traced on purpose (see `InternerState`).
@@ -103,7 +115,7 @@ impl<'gc> Interner<'gc> {
     pub(crate) fn new(mc: &Mutation<'gc>) -> Self {
         let state = InternerState {
             table: HashTable::new_in(MetricsAlloc::new(mc)),
-            hasher: foldhash::fast::RandomState::default(),
+            hasher: foldhash::fast::FixedState::default(),
         };
 
         Self(Gc::new(mc, RefLock::new(state)))
@@ -115,7 +127,7 @@ impl<'gc> Interner<'gc> {
         self.0
             .borrow_mut(fc)
             .table
-            .retain(|e| !Gc::is_dead(fc, e.string));
+            .retain(|s| !Gc::is_dead(fc, s.0));
     }
 
     pub(crate) fn intern(&self, mc: &Mutation<'gc>, bytes: &[u8]) -> LuaString<'gc> {
@@ -128,23 +140,14 @@ impl<'gc> Interner<'gc> {
             hasher.finish()
         };
 
-        let eq = |e: &InternEntry<'gc>| e.hash == hash && *e.string.bytes == *bytes;
-        match table.entry(hash, eq, |e| e.hash) {
-            hash_table::Entry::Occupied(o) => LuaString(o.get().string),
+        let eq = |s: &LuaString<'gc>| s.content_hash() == hash && s.as_bytes() == bytes;
+        match table.entry(hash, eq, |s| s.content_hash()) {
+            hash_table::Entry::Occupied(o) => *o.get(),
             hash_table::Entry::Vacant(v) => {
-                let mut buf = Vec::with_capacity_in(
-                    bytes.len(),
-                    MetricsAlloc::from_metrics(mc.metrics().clone()),
-                );
-                buf.extend_from_slice(bytes);
-                let string = Gc::new(
-                    mc,
-                    StringData {
-                        bytes: buf.into_boxed_slice(),
-                    },
-                );
-                v.insert(InternEntry { hash, string });
-                LuaString(string)
+                let len = bytes.len();
+                let string = LuaString(Gc::new_with_bytes(mc, StringData { hash, len }, bytes));
+                v.insert(string);
+                string
             }
         }
     }
