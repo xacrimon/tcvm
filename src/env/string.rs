@@ -5,7 +5,7 @@ use std::hash::BuildHasher;
 use hashbrown::{HashTable, hash_table};
 
 use crate::dmm::allocator_api::MetricsAlloc;
-use crate::dmm::{Collect, Gc, Mutation, RefLock};
+use crate::dmm::{Collect, Finalization, Gc, Mutation, RefLock};
 use crate::lua::Context;
 
 #[derive(Clone, Copy, Collect)]
@@ -79,12 +79,24 @@ impl<'gc> Hash for LuaString<'gc> {
 #[collect(internal, no_drop)]
 pub struct Interner<'gc>(Gc<'gc, RefLock<InternerState<'gc>>>);
 
-#[derive(Collect)]
-#[collect(internal, no_drop)]
+/// Interned strings, deliberately untraced so a string dies once nothing else
+/// references it. Sound only because [`Interner::prune`] drops dead strings after
+/// marking and before every sweep (see `Lua::collect_debt`), so no entry ever
+/// points at freed memory.
 struct InternerState<'gc> {
-    table: HashTable<LuaString<'gc>, MetricsAlloc<'gc>>,
-    #[collect(require_static)]
+    table: HashTable<InternEntry<'gc>, MetricsAlloc<'gc>>,
     hasher: foldhash::fast::RandomState,
+}
+
+#[derive(Clone, Copy)]
+struct InternEntry<'gc> {
+    hash: u64,
+    string: Gc<'gc, StringData>,
+}
+
+// SAFETY: the entries are not traced on purpose (see `InternerState`).
+unsafe impl<'gc> Collect<'gc> for InternerState<'gc> {
+    const NEEDS_TRACE: bool = false;
 }
 
 impl<'gc> Interner<'gc> {
@@ -97,40 +109,42 @@ impl<'gc> Interner<'gc> {
         Self(Gc::new(mc, RefLock::new(state)))
     }
 
+    /// Forget the strings that die this cycle. Must run once marking is complete
+    /// and before sweeping starts, with no mutation in between.
+    pub(crate) fn prune(&self, fc: &Finalization<'gc>) {
+        self.0
+            .borrow_mut(fc)
+            .table
+            .retain(|e| !Gc::is_dead(fc, e.string));
+    }
+
     pub(crate) fn intern(&self, mc: &Mutation<'gc>, bytes: &[u8]) -> LuaString<'gc> {
         let mut state = self.0.borrow_mut(mc);
         let InternerState { table, hasher } = &mut *state;
 
-        let eq = |string: &LuaString| &*string.0.bytes == bytes;
-        let hash = |string: &LuaString| {
-            let mut hasher: foldhash::fast::FoldHasher<'_> = hasher.build_hasher();
-            hasher.write(&string.0.bytes);
-            hasher.finish()
-        };
-
-        let target_hash = {
+        let hash = {
             let mut hasher = hasher.build_hasher();
             hasher.write(bytes);
             hasher.finish()
         };
 
-        let entry = table.entry(target_hash, eq, hash);
-
-        match entry {
-            hash_table::Entry::Occupied(entry) => *entry.get(),
-            hash_table::Entry::Vacant(entry) => {
+        let eq = |e: &InternEntry<'gc>| e.hash == hash && *e.string.bytes == *bytes;
+        match table.entry(hash, eq, |e| e.hash) {
+            hash_table::Entry::Occupied(o) => LuaString(o.get().string),
+            hash_table::Entry::Vacant(v) => {
                 let mut buf = Vec::with_capacity_in(
                     bytes.len(),
                     MetricsAlloc::from_metrics(mc.metrics().clone()),
                 );
                 buf.extend_from_slice(bytes);
-                let data = StringData {
-                    bytes: buf.into_boxed_slice(),
-                };
-
-                let string = LuaString(Gc::new(mc, data));
-                entry.insert(string);
-                string
+                let string = Gc::new(
+                    mc,
+                    StringData {
+                        bytes: buf.into_boxed_slice(),
+                    },
+                );
+                v.insert(InternEntry { hash, string });
+                LuaString(string)
             }
         }
     }

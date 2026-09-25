@@ -121,9 +121,40 @@ impl Lua {
     fn collect_debt(&mut self) {
         let metrics = self.arena.metrics();
         if metrics.allocation_debt() > metrics.gc_granularity() as f64 {
-            self.arena.collect_debt();
+            if self.arena.collection_phase() != CollectionPhase::Sweeping
+                && let Some(marked) = self.arena.mark_debt()
+            {
+                marked.finalize(|fc, root| root.interner.prune(fc));
+                self.start_sweeping();
+            }
+            // Stops when the cycle ends rather than marking the next one, which
+            // must go through the prune above.
+            if self.arena.collection_phase() == CollectionPhase::Sweeping {
+                self.arena.cycle_debt();
+            }
         }
         self.arena.metrics().arm_gc_check();
+    }
+
+    /// Enter the sweep straight after the interner's prune: a string allocated
+    /// and dropped in between would be freed while still interned.
+    fn start_sweeping(&mut self) {
+        self.arena
+            .finish_marking()
+            .expect("arena is fully marked")
+            .start_sweeping();
+    }
+
+    /// Run the current cycle, or a new one if the collector sleeps, to its end.
+    fn finish_cycle(&mut self) {
+        if self.arena.collection_phase() != CollectionPhase::Sweeping {
+            self.arena
+                .finish_marking()
+                .expect("not sweeping")
+                .finalize(|fc, root| root.interner.prune(fc));
+            self.start_sweeping();
+        }
+        self.arena.finish_cycle();
     }
 
     /// Force a full garbage-collection cycle (mark + sweep) to completion.
@@ -133,9 +164,9 @@ impl Lua {
         // A cycle already under way keeps everything it has marked, so finish
         // it first (like `luaC_fullgc`).
         if self.arena.collection_phase() != CollectionPhase::Sleeping {
-            self.arena.finish_cycle();
+            self.finish_cycle();
         }
-        self.arena.finish_cycle();
+        self.finish_cycle();
     }
 
     /// Bytes currently held by live GC allocations. Only meaningful right
