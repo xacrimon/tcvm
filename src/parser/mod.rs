@@ -148,6 +148,64 @@ mod tests {
         }
     }
 
+    // A bad statement inside a block must stop recovery at the block's `end`
+    // (one report, parsing resumes after it) rather than eat to EOF, where
+    // the block loop used to spin forever (#205).
+    #[test]
+    fn bad_statement_in_block_recovers_at_end() {
+        for src in [
+            "do [ end x = 1",
+            "while true do ] end x = 1",
+            "function f() 1 end x = 1",
+            "if x then + end x = 1",
+            "if x then + else y() end x = 1",
+            "repeat ] until x x = 1",
+            "local f = function() 1 end x = 1",
+        ] {
+            let mut cache = NodeCache::new();
+            let reports = parse(&mut cache, src).reports;
+            assert_eq!(reports.len(), 1, "expected one parse error for {src:?}");
+        }
+
+        for src in ["do", "do x = 1", "end", "x() end y()", "repeat x() end"] {
+            let mut cache = NodeCache::new();
+            let reports = parse(&mut cache, src).reports;
+            assert!(!reports.is_empty(), "expected a parse error for {src:?}");
+        }
+    }
+
+    // `return` must end its block, optionally followed by one `;` (#205).
+    #[test]
+    fn return_must_be_last_statement() {
+        for src in [
+            "do return {1}[3] end",
+            "do return 1 1 end",
+            "do return 1 x = 2 end",
+            "do return 1 print(\"after\") end print(\"next\")",
+            "do return;; end",
+            "do return 1 ; x() end",
+            "return 1 return 2",
+        ] {
+            let mut cache = NodeCache::new();
+            let reports = parse(&mut cache, src).reports;
+            assert!(!reports.is_empty(), "expected a parse error for {src:?}");
+        }
+
+        for src in [
+            "return",
+            "return 1, 2;",
+            "do return end",
+            "do return 1; end",
+            "if x then return 1 elseif y then return 2 else return 3 end",
+            "repeat return until x",
+            "local function f() return 1 end",
+        ] {
+            let mut cache = NodeCache::new();
+            let reports = parse(&mut cache, src).reports;
+            assert!(reports.is_empty(), "unexpected parse error for {src:?}");
+        }
+    }
+
     // Tree text offsets are packed (no trivia), so the line map must be
     // consulted rather than counting newlines in the tree text.
     #[test]

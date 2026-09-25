@@ -7,6 +7,12 @@ use crate::parser::machinery::{
     infix_binding_power, prefix_binding_power, token_is_literal, token_is_unary_op,
 };
 
+/// Tokens that can end a block. `return` must be followed by one of them
+/// (or `;` and then one of them).
+const BLOCK_FOLLOW: &[SyntaxKind] = &[T![end], T![else], T![elseif], T![until], T![eof]];
+
+/// Statement starts plus block terminators, so a bad statement inside a
+/// block stops recovery at that block's `end` instead of eating through it.
 const STATEMENT_RECOVERY: &[SyntaxKind] = &[
     T![do],
     T![while],
@@ -18,17 +24,20 @@ const STATEMENT_RECOVERY: &[SyntaxKind] = &[
     T![function],
     T![local],
     T![global],
+    T![end],
+    T![else],
+    T![elseif],
+    T![until],
 ];
 
 impl<'cache, 'source> Parser<'cache, 'source> {
     pub(super) fn r_items(&mut self) {
         while self.at() != T![eof] {
-            if self.r_stmt().is_none() {
-                break;
-            }
+            self.r_stmt();
         }
     }
 
+    /// Consumes at least one token unless at EOF, so block loops always progress.
     fn r_stmt(&mut self) -> Option<CompletedMarker> {
         let marker = match self.at() {
             T![do] => self.r_do(),
@@ -48,24 +57,19 @@ impl<'cache, 'source> Parser<'cache, 'source> {
             _ => None,
         };
 
-        if marker.is_none() {
-            if self.at() == T![eof] {
-                return None;
-            }
-
-            let span = self.error_eat_until(STATEMENT_RECOVERY);
-            let source = self.source(span);
+        if marker.is_none() && self.at() != T![eof] {
+            let got = self.source(self.span()).to_owned();
             let error = self
                 .new_error()
                 .with_message("expected a statement")
                 .with_label(
                     self.new_label()
-                        .with_message(format!("expected a statement but got \"{}\"", source,)),
+                        .with_message(format!("expected a statement but got \"{got}\"")),
                 )
                 .finish();
 
             self.report(error);
-            return self.r_stmt();
+            self.error_eat_until(STATEMENT_RECOVERY);
         }
 
         marker
@@ -306,11 +310,30 @@ impl<'cache, 'source> Parser<'cache, 'source> {
         Some(marker.retype(self, T![for_gen_stmt]).complete(self))
     }
 
+    /// `retstat ::= return [explist] [';']`, and it must end its block. The
+    /// optional `;` is left to the enclosing block as an empty statement.
     fn r_return(&mut self) -> Option<CompletedMarker> {
         let marker = self.start(T![return_stmt]);
         self.expect(T![return]);
         self.r_expr_list();
-        Some(marker.complete(self))
+        let marker = marker.complete(self);
+
+        let next = match self.at() {
+            T![;] => self.peek().unwrap_or(T![eof]),
+            t => t,
+        };
+        if !BLOCK_FOLLOW.contains(&next) {
+            let error = self
+                .new_error()
+                .with_message("unexpected token")
+                .with_label(self.new_label().with_message(format!(
+                    "'return' must be the last statement in its block, but found {next}",
+                )))
+                .finish();
+            self.report(error);
+        }
+
+        Some(marker)
     }
 
     fn r_break(&mut self) -> Option<CompletedMarker> {
@@ -321,7 +344,9 @@ impl<'cache, 'source> Parser<'cache, 'source> {
 
     fn r_block(&mut self, stop: &dyn Fn(SyntaxKind) -> bool) -> Option<CompletedMarker> {
         let marker = self.start(T![stmt_list]);
-        while !stop(self.at()) {
+        // EOF ends every block; the caller's `expect` of its terminator
+        // then reports the missing `end`/`until`.
+        while !stop(self.at()) && self.at() != T![eof] {
             self.r_stmt();
         }
 
