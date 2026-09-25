@@ -123,9 +123,12 @@ pub enum CollectionPhase {
 pub struct Arena<R>
 where
     R: for<'a> Rootable<'a>,
+    for<'a> Root<'a, R>: Sized,
 {
-    context: Box<Context>,
+    // Dropped first: a root that owns a `MetricsAlloc` must free through it while the context,
+    // which owns the metrics, is still alive.
     root: Root<'static, R>,
+    context: Box<Context>,
 }
 
 impl<R> Arena<R>
@@ -211,6 +214,7 @@ where
 impl<R> Arena<R>
 where
     R: for<'a> Rootable<'a>,
+    for<'a> Root<'a, R>: Sized,
 {
     /// The primary means of interacting with a garbage collected arena. Accepts a callback which
     /// receives a `&Mutation<'gc>` and a reference to the root, and can return any non garbage
@@ -268,7 +272,7 @@ where
 impl<R> Arena<R>
 where
     R: for<'a> Rootable<'a>,
-    for<'a> Root<'a, R>: Collect<'a>,
+    for<'a> Root<'a, R>: Sized + Collect<'a>,
 {
     /// Run incremental garbage collection until the allocation debt is zero.
     ///
@@ -365,12 +369,15 @@ where
     }
 }
 
-pub struct MarkedArena<'a, R: for<'b> Rootable<'b>>(&'a mut Arena<R>);
+pub struct MarkedArena<'a, R>(&'a mut Arena<R>)
+where
+    R: for<'b> Rootable<'b>,
+    for<'b> Root<'b, R>: Sized;
 
 impl<'a, R> MarkedArena<'a, R>
 where
     R: for<'b> Rootable<'b>,
-    for<'b> Root<'b, R>: Collect<'b>,
+    for<'b> Root<'b, R>: Sized + Collect<'b>,
 {
     /// Examine the state of a fully marked arena.
     ///

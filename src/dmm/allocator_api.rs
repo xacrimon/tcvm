@@ -3,9 +3,13 @@ use std::alloc::{AllocError, Allocator, Global};
 
 use crate::dmm::{collect::Collect, context::Mutation, metrics::Metrics, types::Invariant};
 
-#[derive(Clone)]
+/// An allocator that reports its allocations to the arena's [`Metrics`] as external memory.
+///
+/// Holds a plain pointer to the metrics, so it is `Copy` (for a `Copy` allocator) and has no drop
+/// glue; the arena frees the metrics only after every object, and so every allocator stored in one.
+#[derive(Clone, Copy)]
 pub struct MetricsAlloc<'gc, A = Global> {
-    metrics: Metrics,
+    metrics: NonNull<Metrics>,
     allocator: A,
     _marker: Invariant<'gc>,
 }
@@ -16,37 +20,39 @@ impl<'gc> MetricsAlloc<'gc> {
         Self::new_in(mc, Global)
     }
 
-    /// `MetricsAlloc` is normally branded with the `'gc` branding lifetime to ensure that it is not
-    /// placed in the wrong arena or used outside of the enclosing arena.
+    /// A `MetricsAlloc` with an arbitrary branding lifetime, for storage that needs `'static`.
     ///
-    /// This is actually completely artificial and only used as a lint: `gc_arena::metrics::Metrics`
-    /// has no lifetime at all. Therefore, we can safely provide a method that returns a
-    /// `MetricsAlloc` with an arbitrary lifetime.
-    ///
-    /// NOTE: Use `MetricsAlloc::new` if at all possible, because it is harder to misuse.
+    /// # Safety
+    /// The arena that owns `metrics` must outlive the allocator and everything allocated with it,
+    /// as it does when both are stored in its objects.
     #[inline]
-    pub fn from_metrics(metrics: Metrics) -> Self {
-        Self::from_metrics_in(metrics, Global)
+    pub unsafe fn from_metrics(metrics: &Metrics) -> Self {
+        unsafe { Self::from_metrics_in(metrics, Global) }
     }
 }
 
 impl<'gc, A> MetricsAlloc<'gc, A> {
     #[inline]
     pub fn new_in(mc: &Mutation<'gc>, allocator: A) -> Self {
+        // SAFETY: the `'gc` brand keeps the allocator inside the arena that owns the metrics.
+        unsafe { Self::from_metrics_in(mc.metrics(), allocator) }
+    }
+
+    /// # Safety
+    /// As for [`MetricsAlloc::from_metrics`].
+    #[inline]
+    pub unsafe fn from_metrics_in(metrics: &Metrics, allocator: A) -> Self {
         Self {
-            metrics: mc.metrics().clone(),
+            metrics: NonNull::from(metrics),
             allocator,
             _marker: PhantomData,
         }
     }
 
-    #[inline]
-    pub fn from_metrics_in(metrics: Metrics, allocator: A) -> Self {
-        Self {
-            metrics,
-            allocator,
-            _marker: PhantomData,
-        }
+    #[inline(always)]
+    fn metrics(&self) -> &Metrics {
+        // SAFETY: see `from_metrics`.
+        unsafe { self.metrics.as_ref() }
     }
 }
 
@@ -54,14 +60,14 @@ unsafe impl<'gc, A: Allocator> Allocator for MetricsAlloc<'gc, A> {
     #[inline]
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         let ptr = self.allocator.allocate(layout)?;
-        self.metrics.mark_external_allocation(layout.size());
+        self.metrics().mark_external_allocation(layout.size());
         Ok(ptr)
     }
 
     #[inline]
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
         unsafe {
-            self.metrics.mark_external_deallocation(layout.size());
+            self.metrics().mark_external_deallocation(layout.size());
             self.allocator.deallocate(ptr, layout);
         }
     }
@@ -69,7 +75,7 @@ unsafe impl<'gc, A: Allocator> Allocator for MetricsAlloc<'gc, A> {
     #[inline]
     fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         let ptr = self.allocator.allocate_zeroed(layout)?;
-        self.metrics.mark_external_allocation(layout.size());
+        self.metrics().mark_external_allocation(layout.size());
         Ok(ptr)
     }
 
@@ -82,7 +88,7 @@ unsafe impl<'gc, A: Allocator> Allocator for MetricsAlloc<'gc, A> {
     ) -> Result<NonNull<[u8]>, AllocError> {
         unsafe {
             let ptr = self.allocator.grow(ptr, old_layout, new_layout)?;
-            self.metrics
+            self.metrics()
                 .mark_external_allocation(new_layout.size() - old_layout.size());
             Ok(ptr)
         }
@@ -97,7 +103,7 @@ unsafe impl<'gc, A: Allocator> Allocator for MetricsAlloc<'gc, A> {
     ) -> Result<NonNull<[u8]>, AllocError> {
         unsafe {
             let ptr = self.allocator.grow_zeroed(ptr, old_layout, new_layout)?;
-            self.metrics
+            self.metrics()
                 .mark_external_allocation(new_layout.size() - old_layout.size());
             Ok(ptr)
         }
@@ -112,7 +118,7 @@ unsafe impl<'gc, A: Allocator> Allocator for MetricsAlloc<'gc, A> {
     ) -> Result<NonNull<[u8]>, AllocError> {
         unsafe {
             let ptr = self.allocator.shrink(ptr, old_layout, new_layout)?;
-            self.metrics
+            self.metrics()
                 .mark_external_deallocation(old_layout.size() - new_layout.size());
             Ok(ptr)
         }

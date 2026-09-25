@@ -1,5 +1,4 @@
 use core::cell::Cell;
-use std::rc::Rc;
 
 /// Tuning parameters for a given garbage collected [`crate::Arena`].
 ///
@@ -231,8 +230,10 @@ struct MetricsInner {
     remembered_gc_bytes: Cell<usize>,
 }
 
-#[derive(Clone)]
-pub struct Metrics(Rc<MetricsInner>);
+/// The arena's allocation and collection counters. Lives in its own allocation, owned by the
+/// arena's `Context` and freed after every object, so allocators can point at it (see
+/// [`MetricsAlloc`](crate::dmm::MetricsAlloc)); handed out only by reference.
+pub struct Metrics(MetricsInner);
 
 impl Metrics {
     pub(crate) fn new() -> Self {
