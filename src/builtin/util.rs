@@ -5,9 +5,11 @@
 use std::pin::Pin;
 
 use crate::dmm::{Collect, Gc, Mutation, Trace};
-use crate::env::{Error, LuaString, Stack, Value};
+use crate::env::{Error, LuaString, MetamethodBits, Stack, Value};
 use crate::lua::{Context, StashedError};
 use crate::vm::async_sequence::AsyncSequence;
+use crate::vm::debug::object_type_name;
+use crate::vm::interp::{IndexChain, NewIndexChain, walk_index_chain, walk_newindex_chain};
 use crate::vm::sequence::{Execution, Sequence, SequencePoll};
 
 /// Append the canonical Lua textual form of an integer.
@@ -341,6 +343,135 @@ impl<'gc> Sequence<'gc> for AdjustResults {
         }
         Ok(SequencePoll::Return)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Metamethod-aware access for async natives (`lua_geti`, `lua_seti`,
+// `luaL_len`). Values move through the native's stack window, as in the C API.
+// ---------------------------------------------------------------------------
+
+/// `lua_geti`: push `stack[idx][i]`, going through `__index`.
+pub(crate) async fn geti(seq: &mut AsyncSequence, idx: usize, i: i64) -> Result<(), StashedError> {
+    let call = seq.try_enter(|ctx, locals, _exec, mut stack| {
+        let t = stack.get(idx);
+        let key = Value::integer(ctx.mutation(), i);
+        if let Some(tbl) = t.get_table() {
+            let v = tbl.raw_get(key);
+            if !v.is_nil() {
+                stack.push(v);
+                return Ok(None);
+            }
+        }
+        match walk_index_chain(ctx, t, key) {
+            IndexChain::Resolved(v) => {
+                stack.push(v);
+                Ok(None)
+            }
+            IndexChain::Invoke { func, receiver } => {
+                let bottom = stack.len();
+                stack.push(receiver);
+                stack.push(key);
+                Ok(Some((locals.stash(ctx.mutation(), func), bottom)))
+            }
+            IndexChain::NotIndexable(v) => Err(index_error(ctx, v)),
+            IndexChain::Exhausted => Err(Error::from_str(
+                ctx,
+                "'__index' chain too long; possible loop",
+            )),
+        }
+    })?;
+    if let Some((f, bottom)) = call {
+        seq.call(&f, bottom).await?;
+        seq.enter(|_ctx, _locals, _exec, mut stack| {
+            stack.truncate(bottom + 1);
+            if stack.len() == bottom {
+                stack.push(Value::nil());
+            }
+        });
+    }
+    Ok(())
+}
+
+/// `lua_seti`: pop the top value into `stack[idx][i]`, going through
+/// `__newindex`.
+pub(crate) async fn seti(seq: &mut AsyncSequence, idx: usize, i: i64) -> Result<(), StashedError> {
+    let call = seq.try_enter(|ctx, locals, _exec, mut stack| {
+        let t = stack.get(idx);
+        let v = stack.pop();
+        let top = stack.len();
+        let key = Value::integer(ctx.mutation(), i);
+        // Tables without `__newindex` skip `walk_newindex_chain`, which would
+        // look the key up first for nothing.
+        if let Some(tbl) = t.get_table()
+            && !tbl.shape().has_mm(MetamethodBits::NEWINDEX)
+        {
+            tbl.raw_set(ctx, key, v);
+            return Ok(None);
+        }
+        match walk_newindex_chain(ctx, t, key) {
+            NewIndexChain::RawSet(tbl) => {
+                tbl.raw_set(ctx, key, v);
+                Ok(None)
+            }
+            NewIndexChain::Invoke { func, receiver } => {
+                stack.extend([receiver, key, v]);
+                Ok(Some((locals.stash(ctx.mutation(), func), top)))
+            }
+            NewIndexChain::NotIndexable(v) => Err(index_error(ctx, v)),
+            NewIndexChain::Exhausted => Err(Error::from_str(
+                ctx,
+                "'__newindex' chain too long; possible loop",
+            )),
+        }
+    })?;
+    if let Some((f, bottom)) = call {
+        seq.call(&f, bottom).await?;
+        seq.enter(|_ctx, _locals, _exec, mut stack| stack.truncate(bottom));
+    }
+    Ok(())
+}
+
+/// `luaL_len`: `#stack[idx]` through `__len`, which must give an integer.
+pub(crate) async fn len(seq: &mut AsyncSequence, idx: usize) -> Result<i64, StashedError> {
+    let call = seq.try_enter(|ctx, locals, _exec, mut stack| {
+        let v = stack.get(idx);
+        if let Some(s) = v.get_string() {
+            return Ok(Err(s.len() as i64));
+        }
+        let mm = ctx.metamethod_of(v, ctx.symbols().mm_len);
+        if mm.is_nil() {
+            return match v.get_table() {
+                Some(t) => Ok(Err(t.raw_len() as i64)),
+                None => Err(Error::from_str(
+                    ctx,
+                    &format!(
+                        "attempt to get length of a {} value",
+                        object_type_name(ctx, v)
+                    ),
+                )),
+            };
+        }
+        let bottom = stack.len();
+        stack.extend([v, v]);
+        Ok(Ok((locals.stash(ctx.mutation(), mm), bottom)))
+    })?;
+    let (mm, bottom) = match call {
+        Ok(call) => call,
+        Err(n) => return Ok(n),
+    };
+    seq.call(&mm, bottom).await?;
+    seq.try_enter(|ctx, _locals, _exec, mut stack| {
+        let r = stack.get(bottom);
+        stack.truncate(bottom);
+        to_integer(r).ok_or_else(|| Error::from_str(ctx, "object length is not an integer"))
+    })
+}
+
+fn index_error<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> Error<'gc> {
+    Error::from_str(
+        ctx,
+        &format!("attempt to index a {} value", object_type_name(ctx, v)),
+    )
 }
 
 // ---------------------------------------------------------------------------
