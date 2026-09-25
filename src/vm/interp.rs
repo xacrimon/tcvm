@@ -4175,7 +4175,7 @@ pub(crate) fn walk_index_chain<'gc>(
 }
 
 /// Result of walking a `__newindex` chain.
-enum NewIndexChain<'gc> {
+pub(crate) enum NewIndexChain<'gc> {
     /// Raw-assign `value` into this table.
     RawSet(Table<'gc>),
     /// The chain ended in a function; invoke with `(receiver, key, value)`.
@@ -4192,7 +4192,7 @@ enum NewIndexChain<'gc> {
 /// Find where `t[key] = v` lands (`luaV_finishset`): the first table that
 /// already has `key` or lacks `__newindex`, or a function `__newindex`.
 #[inline]
-fn walk_newindex_chain<'gc>(
+pub(crate) fn walk_newindex_chain<'gc>(
     ctx: Context<'gc>,
     mut t: Value<'gc>,
     key: Value<'gc>,

@@ -286,6 +286,16 @@ impl<'gc, 'a> Stack<'gc, 'a> {
         self.thread.top = top + 1;
     }
 
+    /// Remove and return the top value, or `Nil` if the window is empty.
+    #[inline]
+    pub fn pop(&mut self) -> Value<'gc> {
+        if self.is_empty() {
+            return Value::nil();
+        }
+        self.thread.top -= 1;
+        self.thread.stack[self.thread.top]
+    }
+
     #[inline]
     pub fn extend<I: IntoIterator<Item = Value<'gc>>>(&mut self, iter: I) {
         for v in iter {

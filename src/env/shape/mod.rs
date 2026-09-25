@@ -381,13 +381,12 @@ impl<'gc> Shape<'gc> {
         }
     }
 
-    /// Returns `true` if the metatable has *any* metamethod set. Used
-    /// to short-circuit fast paths that don't care which one.
+    /// Like [`has_mm`](Self::has_mm), but true if *any* of `bits` is set.
     #[inline]
-    pub fn has_any_mm(self) -> bool {
+    pub fn has_any_mm(self, bits: MetamethodBits) -> bool {
         match self.mt_cache() {
             None => false,
-            Some(c) => !c.get().is_empty(),
+            Some(c) => c.get().intersects(bits),
         }
     }
 }
