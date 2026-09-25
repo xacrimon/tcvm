@@ -1,6 +1,7 @@
 use std::pin::Pin;
 
 use crate::dmm::{Collect, Gc, RefLock, Trace};
+use crate::env::error::Exit;
 use crate::env::function::Function;
 use crate::env::thread::{
     CallSite, ExecKind, LuaFrame, MAX_STACK, PendingAction, TbcEntry, ThreadState, ThreadStatus,
@@ -1092,6 +1093,7 @@ fn unwind_error<'gc>(
     let Some(ExecKind::Error(err)) = ts.pop_exec() else {
         unreachable!()
     };
+    let exit = err.exit_kind() != Exit::No;
     if !err.is_handled() {
         // Only the nearest catch point's handler applies (`L->errfunc`):
         // a plain `pcall` in between shadows an outer `xpcall`, while a
@@ -1104,6 +1106,7 @@ fn unwind_error<'gc>(
                 ExecKind::Sequence { seq, .. } => match seq.catch() {
                     Catch::Pass => None,
                     Catch::Here(handler) => Some(handler),
+                    Catch::Base => Some(None),
                 },
                 _ => None,
             })
@@ -1114,7 +1117,7 @@ fn unwind_error<'gc>(
     }
     // `luaD_seterrorobj`: only once the error is being caught (a handler
     // still sees the raw nil).
-    let err = if err.value().is_nil() {
+    let err = if err.value().is_nil() && !exit {
         err.with_value(
             ctx,
             Value::string(LuaString::new(ctx, b"<no error object>")),
@@ -1150,11 +1153,12 @@ fn unwind_error<'gc>(
                 seq, pending_error, ..
             }) => {
                 let handler = match seq.catch() {
-                    Catch::Pass => {
+                    Catch::Here(handler) if !exit => handler,
+                    Catch::Base => None,
+                    _ => {
                         ts.pop_exec();
                         continue;
                     }
-                    Catch::Here(handler) => handler,
                 };
                 if detached {
                     push_error_close(&mut ts, ctx, err, handler);
@@ -1175,6 +1179,12 @@ fn unwind_error<'gc>(
             }
             None => break,
         }
+    }
+    if err.exit_kind() == Exit::Clean {
+        // A coroutine closed itself: it returns nothing.
+        ts.discard_above(0);
+        ts.status = ThreadStatus::Result { bottom: 0 };
+        return Ok(());
     }
     let stack_len = exec.0.borrow().thread_stack.len();
     // The host's call closes like a `pcall`; a dead coroutine keeps its
@@ -1207,6 +1217,12 @@ fn unwind_error<'gc>(
             _ => unreachable!("inner-thread error: resumer top isn't WaitThread"),
         }
         // Already located on the inner thread; don't re-raise on the resumer.
+        // An exit ends only the coroutine that closed itself.
+        let err = if exit {
+            Error::new(ctx, err.value())
+        } else {
+            err
+        };
         rs.push_exec(ExecKind::Error(err));
         rs.status = ThreadStatus::Normal;
         return Ok(());

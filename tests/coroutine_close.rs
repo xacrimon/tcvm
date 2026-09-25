@@ -44,7 +44,7 @@ fn close_dead_returns_true() {
 }
 
 #[test]
-fn close_normal_resumer_returns_nil_msg() {
+fn close_normal_resumer_raises() {
     // Inner closes outer (which is on the stack as a resumer, status Normal).
     let mut lua = Lua::new();
     lua.load_all();
@@ -55,13 +55,13 @@ fn close_normal_resumer_returns_nil_msg() {
                  local saw_msg\n\
                  outer = coroutine.create(function()\n\
                    local inner = coroutine.create(function()\n\
-                     local ok, msg = coroutine.close(outer)\n\
-                     saw_msg = (ok == nil) and msg\n\
+                     local ok, msg = pcall(coroutine.close, outer)\n\
+                     saw_msg = (ok == false) and msg\n\
                    end)\n\
                    coroutine.resume(inner)\n\
                  end)\n\
                  coroutine.resume(outer)\n\
-                 if saw_msg == 'cannot close a non-suspended coroutine' then return 1 else return 0 end",
+                 if saw_msg == 'cannot close a normal coroutine' then return 1 else return 0 end",
                 Some("close_normal"),
             )?;
             Ok(ctx.stash(Executor::start(ctx, chunk, ())))
@@ -107,21 +107,22 @@ fn resume_after_close_is_dead() {
     assert_eq!(result, 1);
 }
 
+/// Closing itself ends the coroutine as if it returned nothing.
 #[test]
-fn close_running_self_returns_nil_msg() {
+fn close_running_self_ends_it() {
     let mut lua = Lua::new();
     lua.load_all();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
             let chunk = ctx.load(
                 "local co\n\
-                 local saw_msg\n\
+                 local after\n\
                  co = coroutine.create(function()\n\
-                   local ok, msg = coroutine.close(co)\n\
-                   saw_msg = (ok == nil) and msg\n\
+                   coroutine.close(co)\n\
+                   after = true\n\
                  end)\n\
-                 coroutine.resume(co)\n\
-                 if saw_msg == 'cannot close a non-suspended coroutine' then return 1 else return 0 end",
+                 local r = table.pack(coroutine.resume(co))\n\
+                 if r.n == 1 and r[1] == true and after == nil and coroutine.status(co) == 'dead' then return 1 else return 0 end",
                 Some("close_self"),
             )?;
             Ok(ctx.stash(Executor::start(ctx, chunk, ())))

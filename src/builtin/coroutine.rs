@@ -207,9 +207,8 @@ fn lua_wrap<'gc>(
 
 /// `coroutine.close(co)` — close a suspended or dead coroutine's pending
 /// to-be-closed variables on `co` itself, then `true`, or `false` and the
-/// error it died with or a `__close` raised. Closing the running or a
-/// `normal` coroutine returns `(nil, msg)`; the reference's self-close,
-/// which does not return, isn't supported.
+/// error it died with or a `__close` raised. The running coroutine closes
+/// its variables and ends, without returning.
 fn lua_close<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
@@ -222,12 +221,10 @@ fn lua_close<'gc>(
     // Pointer-eq against current first to avoid re-borrowing the running
     // thread's RefLock (mut-borrowed by the interpreter).
     if co.ptr_eq(stack.exec().current_thread()) {
-        let m = Value::string(LuaString::new(
-            ctx,
-            b"cannot close a non-suspended coroutine",
-        ));
-        stack.replace(&[Value::nil(), m]);
-        return Ok(CallbackAction::Return);
+        if stack.exec().is_main(ctx) {
+            return Err(plain_error(ctx, "cannot close main thread"));
+        }
+        return Ok(close::close_running(ctx));
     }
     match co.status() {
         ThreadStatus::Suspended | ThreadStatus::Stopped | ThreadStatus::Result { .. } => {
@@ -243,15 +240,13 @@ fn lua_close<'gc>(
             }
             Ok(CallbackAction::Return)
         }
-        ThreadStatus::Normal => {
-            let m = Value::string(LuaString::new(
-                ctx,
-                b"cannot close a non-suspended coroutine",
-            ));
-            stack.replace(&[Value::nil(), m]);
-            Ok(CallbackAction::Return)
-        }
+        ThreadStatus::Normal => Err(plain_error(ctx, "cannot close a normal coroutine")),
     }
+}
+
+/// An error without a position, as `luaL_error` raises from a C function.
+fn plain_error<'gc>(ctx: Context<'gc>, msg: &str) -> Error<'gc> {
+    Error::new(ctx, Value::string(LuaString::new(ctx, msg.as_bytes())))
 }
 
 /// Body of the closure returned by `coroutine.wrap`. Upvalue 0 carries the
