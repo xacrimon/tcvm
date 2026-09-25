@@ -160,10 +160,19 @@ fn restart_after_a_handler_yields_to_the_host() {
             Ok(ctx.stash(Executor::start(ctx, chunk, ())))
         })
         .expect("load");
-    let yielded = lua.try_enter(|ctx| -> Result<bool, RuntimeError> {
-        Ok(matches!(ctx.fetch(&ex).step(ctx)?, StepResult::Yielded(_)))
-    });
-    assert!(yielded.expect("step"));
+    // Step in separate `enter`s past any `Pending` from GC exits.
+    let yielded = loop {
+        let r = lua.try_enter(|ctx| -> Result<Option<bool>, RuntimeError> {
+            Ok(match ctx.fetch(&ex).step(ctx)? {
+                StepResult::Pending => None,
+                r => Some(matches!(r, StepResult::Yielded(_))),
+            })
+        });
+        if let Some(y) = r.expect("step") {
+            break y;
+        }
+    };
+    assert!(yielded);
 
     let src = format!(
         "{RECURSE} local function id(x) return x end \
