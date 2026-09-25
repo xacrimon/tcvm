@@ -1,4 +1,5 @@
 use core::{
+    alloc::Layout,
     cell::{Cell, UnsafeCell},
     mem,
     ops::{ControlFlow, Deref, DerefMut},
@@ -10,7 +11,7 @@ use crate::dmm::{
     Gc, GcWeak,
     collect::{Collect, Trace},
     metrics::Metrics,
-    types::{GcBox, GcBoxHeader, GcBoxInner, GcColor, Invariant},
+    types::{GcBox, GcBoxHeader, GcBoxInner, GcColor, Invariant, TrailingBytes, trailing_layout},
 };
 
 /// Handle value given by arena callbacks during construction and mutation. Allows allocating new
@@ -87,6 +88,15 @@ impl<'gc> Mutation<'gc> {
     #[inline]
     pub(crate) fn allocate<T: Collect<'gc> + 'gc>(&self, t: T) -> NonNull<GcBoxInner<T>> {
         self.context.allocate(t)
+    }
+
+    #[inline]
+    pub(crate) fn allocate_with_bytes<T: Collect<'gc> + TrailingBytes + 'gc>(
+        &self,
+        t: T,
+        bytes: &[u8],
+    ) -> NonNull<GcBoxInner<T>> {
+        self.context.allocate_with_bytes(t, bytes)
     }
 
     #[inline]
@@ -206,14 +216,14 @@ impl Drop for Context {
                     while let Some(mut gc_box) = drop_resume.1.take() {
                         let header = gc_box.header();
                         drop_resume.1 = header.next();
-                        let gc_size = header.size_of_box();
+                        let gc_size = gc_box.size();
                         // SAFETY: the context owns its GC'd objects
                         unsafe {
                             if header.is_live() {
                                 gc_box.drop_in_place();
                                 self.0.mark_gc_dropped(gc_size);
                             }
-                            gc_box.dealloc();
+                            gc_box.dealloc(gc_size);
                             self.0.mark_gc_freed(gc_size);
                         }
                     }
@@ -361,30 +371,58 @@ impl Context {
 
     fn allocate<'gc, T: Collect<'gc>>(&self, t: T) -> NonNull<GcBoxInner<T>> {
         let header = GcBoxHeader::new::<T>();
-        header.set_next(self.all.get());
-        header.set_live(true);
-        header.set_needs_trace(T::NEEDS_TRACE);
-
-        let alloc_size = header.size_of_box();
-
         // Make the generated code easier to optimize into `T` being constructed in place or at the
         // very least only memcpy'd once.
         // For more information, see: https://github.com/kyren/gc-arena/pull/14
-        let (gc_box, ptr) = unsafe {
+        let ptr = unsafe {
             let mut uninitialized = Box::new(mem::MaybeUninit::<GcBoxInner<T>>::uninit());
             core::ptr::write(uninitialized.as_mut_ptr(), GcBoxInner::new(header, t));
-            let ptr = NonNull::new_unchecked(Box::into_raw(uninitialized) as *mut GcBoxInner<T>);
-            (GcBox::erase(ptr), ptr)
+            NonNull::new_unchecked(Box::into_raw(uninitialized) as *mut GcBoxInner<T>)
         };
+        self.link(ptr, Layout::new::<GcBoxInner<T>>().size());
+        ptr
+    }
+
+    fn allocate_with_bytes<'gc, T: Collect<'gc> + TrailingBytes>(
+        &self,
+        t: T,
+        bytes: &[u8],
+    ) -> NonNull<GcBoxInner<T>> {
+        debug_assert_eq!(t.trailing_len(), bytes.len());
+        let layout = trailing_layout(Layout::new::<GcBoxInner<T>>(), bytes.len());
+        let ptr = unsafe {
+            let raw = std::alloc::alloc(layout) as *mut GcBoxInner<T>;
+            let Some(ptr) = NonNull::new(raw) else {
+                std::alloc::handle_alloc_error(layout)
+            };
+            ptr.write(GcBoxInner::new(GcBoxHeader::new_trailing::<T>(), t));
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                ptr.cast::<u8>()
+                    .add(GcBoxInner::<T>::TRAILING_OFFSET)
+                    .as_ptr(),
+                bytes.len(),
+            );
+            ptr
+        };
+        self.link(ptr, layout.size());
+        ptr
+    }
+
+    /// Link a freshly allocated box into the object list.
+    fn link<'gc, T: Collect<'gc>>(&self, ptr: NonNull<GcBoxInner<T>>, size: usize) {
+        let gc_box = unsafe { GcBox::erase(ptr) };
+        let header = gc_box.header();
+        header.set_next(self.all.get());
+        header.set_live(true);
+        header.set_needs_trace(T::NEEDS_TRACE);
 
         self.all.set(Some(gc_box));
         if self.phase == Phase::Sweep && self.sweep_prev.get().is_none() {
             self.sweep_prev.set(self.all.get());
         }
 
-        self.metrics.mark_gc_allocated(alloc_size);
-
-        ptr
+        self.metrics.mark_gc_allocated(size);
     }
 
     #[inline]
@@ -488,7 +526,7 @@ impl Context {
 
                 // Only marking the *first* time counts as a mark metric.
                 if color == GcColor::White {
-                    self.metrics.mark_gc_marked(header.size_of_box());
+                    self.metrics.mark_gc_marked(gc_box.size());
                 }
             }
         }
@@ -499,7 +537,7 @@ impl Context {
         let header = gc_box.header();
         if header.color() == GcColor::White {
             header.set_color(GcColor::WhiteWeak);
-            self.metrics.mark_gc_marked(header.size_of_box());
+            self.metrics.mark_gc_marked(gc_box.size());
         }
     }
 
@@ -562,7 +600,7 @@ impl Context {
             self.gray.push(gc_box);
             // Only marking the *first* time counts as a mark metric.
             if color == GcColor::White {
-                self.metrics.mark_gc_marked(header.size_of_box());
+                self.metrics.mark_gc_marked(gc_box.size());
             }
         }
     }
@@ -577,7 +615,7 @@ impl Context {
             // We always mark work for objects processed from both the gray and "gray again" queue.
             // When objects are placed into the "gray again" queue due to a write barrier, the
             // original work is *undone*, so we do it again here.
-            self.metrics.mark_gc_traced(gc_box.header().size_of_box());
+            self.metrics.mark_gc_traced(gc_box.size());
             gc_box.header().set_color(GcColor::Black);
 
             // If we have an object in the gray queue, take one, trace it, and turn it black.
@@ -627,7 +665,7 @@ impl Context {
         };
 
         let sweep_header = sweep.header();
-        let sweep_size = sweep_header.size_of_box();
+        let sweep_size = sweep.size();
 
         let next_box = sweep_header.next();
         self.sweep = next_box;
@@ -655,7 +693,7 @@ impl Context {
                         sweep.drop_in_place();
                         self.metrics.mark_gc_dropped(sweep_size);
                     }
-                    sweep.dealloc();
+                    sweep.dealloc(sweep_size);
                     self.metrics.mark_gc_freed(sweep_size);
                 }
             }
@@ -700,7 +738,7 @@ impl Context {
         debug_assert_eq!(header.color(), GcColor::Black);
         header.set_color(GcColor::Gray);
         self.gray_again.push(gc_box);
-        self.metrics.mark_gc_untraced(header.size_of_box());
+        self.metrics.mark_gc_untraced(gc_box.size());
     }
 }
 
