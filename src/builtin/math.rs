@@ -385,11 +385,10 @@ impl RngState {
     }
 
     fn from_entropy() -> Self {
-        let n1 = make_seed();
-        let n2 = make_seed()
-            .rotate_left(17)
-            .wrapping_add(0x9e37_79b9_7f4a_7c15);
-        Self::from_seeds(n1, n2)
+        let mut buf = [0u8; 16];
+        getrandom::fill(&mut buf).expect("OS entropy source unavailable");
+        let seed = u128::from_ne_bytes(buf);
+        Self::from_seeds((seed >> 64) as u64, seed as u64)
     }
 
     #[inline]
@@ -398,16 +397,9 @@ impl RngState {
     }
 }
 
-/// Non-cryptographic entropy for `randomseed()` with no argument, mixing the
-/// wall clock with a stack address (the spirit of `luaL_makeseed`).
-fn make_seed() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let addr = &nanos as *const u64 as u64;
-    nanos ^ addr.rotate_left(32)
+/// Seed word from the OS entropy source.
+fn os_seed() -> u64 {
+    getrandom::u64().expect("OS entropy source unavailable")
 }
 
 /// A 53-bit random value scaled into `[0, 1)` (Lua's `I2d`).
@@ -528,7 +520,7 @@ fn lua_randomseed<'gc>(
             let mut st = cell.borrow_mut();
             let seeds = match provided {
                 Some(pair) => pair,
-                None => (make_seed(), st.next_u64()),
+                None => (os_seed(), st.next_u64()),
             };
             *st = RngState::from_seeds(seeds.0, seeds.1);
             seeds
