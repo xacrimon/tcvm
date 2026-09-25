@@ -51,7 +51,7 @@ impl<'cache, 'source> State<'cache, 'source> {
             .find_map(|(t, _)| t.is_trivia().not().then_some(*t))
     }
 
-    fn span(&self) -> Span {
+    pub(super) fn span(&self) -> Span {
         self.tokens[self.cursor].1
     }
 
@@ -111,20 +111,24 @@ impl<'cache, 'source> State<'cache, 'source> {
         &self.source[span]
     }
 
-    pub fn error_eat_until(&mut self, one_of: &[SyntaxKind]) -> Span {
+    /// Wraps the current token, and everything up to the next `one_of` token
+    /// or EOF, in an `invalid` node. The current token is always eaten so a
+    /// caller looping on recovery makes progress even when it is itself in
+    /// `one_of` (a stray `end` at top level).
+    pub fn error_eat_until(&mut self, one_of: &[SyntaxKind]) {
         let marker = self.start(T![invalid]);
-        let mut last_span = self.span();
         // Stop at EOF even when it isn't a recovery token, or the loop would
         // bump past the end of the stream and `span()` would index out of
         // bounds. Reachable on any malformed tail with no recovery token
         // before EOF (e.g. `1.2.3`, `foo @ bar`).
+        if self.at() != T![eof] {
+            self.bump();
+        }
         while self.at() != T![eof] && !one_of.contains(&self.at()) {
             self.bump();
-            last_span = self.span();
         }
 
         marker.complete(self);
-        last_span
     }
 
     pub fn finish(self) -> (GreenNode, LineMap, Vec<ariadne::Report<'static, Span>>) {
