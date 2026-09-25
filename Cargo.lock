@@ -602,6 +602,7 @@ dependencies = [
  "getrandom",
  "hashbrown 0.17.1",
  "insta",
+ "libc",
  "logos",
  "paste",
  "rand_core",
