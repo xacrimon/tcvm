@@ -374,7 +374,7 @@ pub(crate) async fn geti(seq: &mut AsyncSequence, idx: usize, i: i64) -> Result<
                 Ok(Some((locals.stash(ctx.mutation(), func), bottom)))
             }
             IndexChain::NotIndexable(v) => Err(index_error(ctx, v)),
-            IndexChain::Exhausted => Err(Error::from_str(
+            IndexChain::Exhausted => Err(runtime_error(
                 ctx,
                 "'__index' chain too long; possible loop",
             )),
@@ -418,7 +418,7 @@ pub(crate) async fn seti(seq: &mut AsyncSequence, idx: usize, i: i64) -> Result<
                 Ok(Some((locals.stash(ctx.mutation(), func), top)))
             }
             NewIndexChain::NotIndexable(v) => Err(index_error(ctx, v)),
-            NewIndexChain::Exhausted => Err(Error::from_str(
+            NewIndexChain::Exhausted => Err(runtime_error(
                 ctx,
                 "'__newindex' chain too long; possible loop",
             )),
@@ -442,7 +442,7 @@ pub(crate) async fn len(seq: &mut AsyncSequence, idx: usize) -> Result<i64, Stas
         if mm.is_nil() {
             return match v.get_table() {
                 Some(t) => Ok(Err(t.raw_len() as i64)),
-                None => Err(Error::from_str(
+                None => Err(runtime_error(
                     ctx,
                     &format!(
                         "attempt to get length of a {} value",
@@ -468,10 +468,16 @@ pub(crate) async fn len(seq: &mut AsyncSequence, idx: usize) -> Result<i64, Stas
 }
 
 fn index_error<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> Error<'gc> {
-    Error::from_str(
+    runtime_error(
         ctx,
         &format!("attempt to index a {} value", object_type_name(ctx, v)),
     )
+}
+
+/// An error the VM itself would raise (`luaG_runerror`): raised from a native
+/// it carries no position, unlike `luaL_error`'s [`Error::from_str`].
+pub(crate) fn runtime_error<'gc>(ctx: Context<'gc>, msg: &str) -> Error<'gc> {
+    Error::from_str(ctx, msg).with_level(0)
 }
 
 // ---------------------------------------------------------------------------
