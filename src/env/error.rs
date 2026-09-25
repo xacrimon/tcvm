@@ -34,6 +34,19 @@ pub struct ErrorInner<'gc> {
     /// continues to the catcher.
     #[collect(require_static)]
     handled: Cell<bool>,
+    #[collect(require_static)]
+    exit: Cell<Exit>,
+}
+
+/// Whether an error is an exit, which unwinds to the thread's base level past
+/// every other catcher (`luaD_throwbaselevel`); see [`Error::exit`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Exit {
+    No,
+    /// Ends the thread without an error.
+    Clean,
+    /// Ends the thread with the error's value.
+    Failed,
 }
 
 impl<'gc> Error<'gc> {
@@ -45,6 +58,7 @@ impl<'gc> Error<'gc> {
                 value,
                 level: Cell::new(0),
                 handled: Cell::new(false),
+                exit: Cell::new(Exit::No),
             },
         ))
     }
@@ -117,5 +131,21 @@ impl<'gc> Error<'gc> {
 
     pub(crate) fn is_handled(self) -> bool {
         self.0.handled.get()
+    }
+
+    /// Unwind the running thread to its base level past every other catcher
+    /// and message handler (`luaD_throwbaselevel`), ending it with `err`, or
+    /// cleanly without one.
+    pub(crate) fn exit(ctx: Context<'gc>, err: Option<Error<'gc>>) -> Self {
+        let exit = Error::new(ctx, err.map_or(Value::nil(), Error::value)).mark_handled();
+        exit.0.exit.set(match err {
+            Some(_) => Exit::Failed,
+            None => Exit::Clean,
+        });
+        exit
+    }
+
+    pub(crate) fn exit_kind(self) -> Exit {
+        self.0.exit.get()
     }
 }

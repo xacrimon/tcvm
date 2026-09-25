@@ -3,7 +3,7 @@
 use std::pin::Pin;
 
 use crate::dmm::{Collect, Trace};
-use crate::env::error::Error;
+use crate::env::error::{Error, Exit};
 use crate::env::function::Stack;
 use crate::env::thread::{ExecKind, TbcEntry, ThreadState, ThreadStatus};
 use crate::env::{Function, NativeClosure, Value};
@@ -126,24 +126,35 @@ impl<'gc> Sequence<'gc> for ErrorCloseSequence<'gc> {
 /// Closes a coroutine's variables on its own thread for `coroutine.close` and
 /// `coroutine.wrap` (`luaE_resetthread`), which cannot yield meanwhile. An
 /// error in a `__close` replaces `err` for the rest. Returns `true`, or
-/// `false` and the last error.
+/// `false` and the last error; with `exit`, ends the thread instead.
+/// Without `exit` it is the thread's base level, where a self-close from a
+/// `__close` lands (`lua_closethread`'s outer `luaD_closeprotected`).
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub(crate) struct ThreadCloseSequence<'gc> {
     pub(crate) err: Option<Error<'gc>>,
+    /// The coroutine closes itself, above its still-live frames.
+    pub(crate) exit: bool,
 }
 
 impl<'gc> ThreadCloseSequence<'gc> {
-    fn next(&mut self, ctx: Context<'gc>, mut stack: Stack<'gc, '_>) -> SequencePoll<'gc> {
+    fn next(
+        &mut self,
+        ctx: Context<'gc>,
+        mut stack: Stack<'gc, '_>,
+    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
         stack.clear();
         let ts = stack.thread_mut();
         let Some(entry) = ts.tbc_list.pop() else {
             ts.no_yield = false;
+            if self.exit {
+                return Err(Error::exit(ctx, self.err));
+            }
             match self.err {
                 Some(err) => stack.extend([Value::boolean(false), err.value()]),
                 None => stack.push(Value::boolean(true)),
             }
-            return SequencePoll::Return;
+            return Ok(SequencePoll::Return);
         };
         ts.no_yield = true;
         let v = entry.value(&ts.stack);
@@ -151,10 +162,10 @@ impl<'gc> ThreadCloseSequence<'gc> {
         if let Some(err) = self.err {
             stack.push(err.value());
         }
-        SequencePoll::Call {
+        Ok(SequencePoll::Call {
             function: ctx.metamethod_of(v, ctx.symbols().close),
             bottom: 0,
-        }
+        })
     }
 }
 
@@ -169,7 +180,7 @@ impl<'gc> Sequence<'gc> for ThreadCloseSequence<'gc> {
         _exec: Execution<'gc>,
         stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
-        Ok(self.get_mut().next(ctx, stack))
+        self.get_mut().next(ctx, stack)
     }
 
     fn error(
@@ -180,12 +191,21 @@ impl<'gc> Sequence<'gc> for ThreadCloseSequence<'gc> {
         stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
         let this = self.get_mut();
-        this.err = Some(err);
-        Ok(this.next(ctx, stack))
+        match err.exit_kind() {
+            Exit::No | Exit::Failed => this.err = Some(err),
+            // Keeps the status, but the error object is lost with the stack
+            // the inner reset cleared, as in Lua.
+            Exit::Clean => this.err = this.err.map(|e| e.with_value(ctx, Value::nil())),
+        }
+        this.next(ctx, stack)
     }
 
     fn catch(&self) -> Catch<'gc> {
-        Catch::Here(None)
+        if self.exit {
+            Catch::Here(None)
+        } else {
+            Catch::Base
+        }
     }
 }
 
@@ -195,12 +215,9 @@ fn thread_close_entry<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let err = stack
-        .thread_mut()
-        .death_error
-        .take()
-        .map(|v| Error::new(ctx, v));
-    let seq = ThreadCloseSequence { err };
+    let ts = stack.thread_mut();
+    let err = ts.death_error.take().map(|v| Error::new(ctx, v));
+    let seq = ThreadCloseSequence { err, exit: false };
     Ok(CallbackAction::sequence(BoxSequence::new(
         ctx.mutation(),
         seq,
@@ -232,4 +249,14 @@ pub(crate) fn seed_thread_close<'gc>(ctx: Context<'gc>, ts: &mut ThreadState<'gc
     ts.push_exec(ExecKind::Start(Value::function(entry)));
     ts.status = ThreadStatus::Suspended;
     true
+}
+
+/// `coroutine.close` on the running coroutine: close all its variables, then
+/// end it (`lua_closethread` on itself).
+pub(crate) fn close_running<'gc>(ctx: Context<'gc>) -> CallbackAction<'gc> {
+    let seq = ThreadCloseSequence {
+        err: None,
+        exit: true,
+    };
+    CallbackAction::sequence(BoxSequence::new(ctx.mutation(), seq))
 }

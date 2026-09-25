@@ -186,6 +186,10 @@ pub enum Catch<'gc> {
     /// any frames (so tracebacks see the failing stack), and delivers its
     /// result to `error` instead.
     Here(Option<Function<'gc>>),
+    /// The thread's base level: like `Here(None)`, and an exit
+    /// ([`Error::exit`](crate::env::Error)) stops here rather than at the
+    /// thread's bottom.
+    Base,
 }
 
 /// Helper macro for `Sequence::trace_pointers`: wraps a `&mut dyn Trace<'gc>`
