@@ -181,7 +181,7 @@ impl Default for Pacing {
 /// adjacent so one `ldp` loads both.
 #[derive(Debug, Default)]
 #[repr(C)]
-pub struct GcCheck {
+struct GcCheck {
     allocated_bytes_total: Cell<usize>,
     gc_check_at: Cell<usize>,
 }
@@ -190,7 +190,7 @@ impl GcCheck {
     /// Whether allocation since the last [`Metrics::arm_gc_check`] may have pushed the debt past
     /// its granularity. Allocation only ever raises debt, so this can fire early, never late.
     #[inline(always)]
-    pub fn due(&self) -> bool {
+    fn due(&self) -> bool {
         self.allocated_bytes_total.get() >= self.gc_check_at.get()
     }
 }
@@ -198,6 +198,7 @@ impl GcCheck {
 #[derive(Debug, Default)]
 struct MetricsInner {
     gc_check: GcCheck,
+    gc_granularity: Cell<usize>,
 
     pacing: Cell<Pacing>,
 
@@ -336,21 +337,37 @@ impl Metrics {
     }
 
     #[inline(always)]
-    pub fn gc_check(&self) -> &GcCheck {
-        &self.0.gc_check
-    }
-
-    #[inline(always)]
     pub fn gc_check_due(&self) -> bool {
         self.0.gc_check.due()
     }
 
-    /// Arm [`Metrics::gc_check_due`] to fire once the debt could exceed `granularity`.
-    pub fn arm_gc_check(&self, granularity: f64) {
-        let remaining = (granularity - self.raw_debt()).max(1.0) as usize;
+    /// Allocation debt, in bytes, the host lets build up before collecting.
+    pub fn gc_granularity(&self) -> usize {
+        self.0.gc_granularity.get()
+    }
+
+    pub fn set_gc_granularity(&self, bytes: usize) {
+        self.0.gc_granularity.set(bytes);
+        self.arm_gc_check();
+    }
+
+    /// Arm [`Metrics::gc_check_due`] to fire once the debt could exceed the granularity.
+    pub fn arm_gc_check(&self) {
+        let remaining = (self.gc_granularity() as f64 - self.raw_debt()).max(1.0) as usize;
+        self.set_gc_check_in(remaining);
+    }
+
+    /// Fire [`Metrics::gc_check_due`] again only after another granularity of allocation, so a
+    /// host that keeps stepping without collecting sees one exit per granularity, not one per
+    /// allocation.
+    pub fn defer_gc_check(&self) {
+        self.set_gc_check_in(self.gc_granularity().max(1));
+    }
+
+    fn set_gc_check_in(&self, bytes: usize) {
         let c = &self.0.gc_check;
         c.gc_check_at
-            .set(c.allocated_bytes_total.get().saturating_add(remaining));
+            .set(c.allocated_bytes_total.get().saturating_add(bytes));
     }
 
     // `allocation_debt` without the clamp: while the collector sleeps this is minus the bytes left
