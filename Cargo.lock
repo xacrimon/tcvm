@@ -599,6 +599,7 @@ dependencies = [
  "bitflags",
  "cstree",
  "foldhash 0.2.0",
+ "getrandom",
  "hashbrown 0.17.1",
  "insta",
  "logos",
