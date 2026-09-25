@@ -47,5 +47,4 @@ expression: output
 0021  [ 10]  CALL            R9 args=1 ret=2
 0022  [ 10]  LOAD            R10 K15  ; "other4"
 0023  [ 10]  TBC             R9
-0024  [ 10]  CLOSE           R4
-0025  [ 10]  RETURN0
+0024  [ 10]  RETURN0
