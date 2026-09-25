@@ -2812,7 +2812,7 @@ extern "rust-preserve-none" fn op_tailcall_native<'gc>(
             save_pc(thread, ip);
             let err = crate::vm::debug::locate(ctx, thread, err);
             close_upvalues(ctx.mutation(), thread, base);
-            close_tbc_vars(ctx.mutation(), thread, base);
+            debug_assert!(!has_tbc_from(thread, base));
             thread.pop_lua();
             thread.push_exec(ExecKind::Error(err));
             return;
@@ -2857,7 +2857,7 @@ extern "rust-preserve-none" fn op_tailcall_native<'gc>(
                 return;
             }
             close_upvalues(ctx.mutation(), thread, base);
-            close_tbc_vars(ctx.mutation(), thread, base);
+            debug_assert!(!has_tbc_from(thread, base));
             thread.pop_lua();
             thread.pending_action = Some(PendingAction {
                 action,
@@ -2903,10 +2903,11 @@ extern "rust-preserve-none" fn op_tailcall_slow<'gc>(
             }
             // Close upvalues before overwriting these slots with args, so an
             // open upvalue keeps referencing the local, not the arg value.
-            // `TBC` stays set: luac never emits TAILCALL in a `<close>` scope;
-            // ours still does (#188), which this can't paper over.
+            // No TAILCALL is emitted inside a `<close>` scope, so `TBC` only
+            // marks scopes that already closed.
+            debug_assert!(!has_tbc_from(thread, new_base));
             close_upvalues(ctx.mutation(), thread, new_base);
-            unsafe { (*frame).flags &= !frame_flags::OPEN_UPVALUES };
+            unsafe { (*frame).flags &= !(frame_flags::OPEN_UPVALUES | frame_flags::TBC) };
             tailcall_lua!(
                 callee, func_idx, nargs, thread, registers, ip, frame, closure
             );
@@ -3846,6 +3847,12 @@ extern "rust-preserve-none" fn op_stop<'gc>(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Whether a to-be-closed variable is registered at or above `level`.
+#[inline]
+fn has_tbc_from(thread: &ThreadState<'_>, level: usize) -> bool {
+    thread.tbc_slots.last().is_some_and(|&slot| slot >= level)
+}
 
 /// Close all TBC variables at stack indices >= `start_idx`.
 /// Removes them from the tracking list; __close invocation is pending (see #45).

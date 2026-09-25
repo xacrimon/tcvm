@@ -3998,8 +3998,11 @@ fn compile_return(ctx: &mut Ctx, item: Return) -> Result<(), CompileError> {
     // because the parens force adjust-to-one. The parser preserves the
     // paren as `Expr::Paren`, which doesn't match the FuncCall/Method
     // arms here, so it falls through to `compile_return_generic` and
-    // correctly returns a single value (`manual.of:1573`).
-    if exprs.len() == 1 {
+    // correctly returns a single value (`manual.of:1573`). Nor inside a
+    // `<close>` scope, which must close after the call returns (luac
+    // `retstat`'s `insidetbc`).
+    let inside_tbc = ctx.scope_close.iter().any(|regs| !regs.is_empty());
+    if exprs.len() == 1 && !inside_tbc {
         let only = exprs.pop().unwrap();
         match only {
             Expr::FuncCall(call) => return compile_tail_func_call(ctx, call),
@@ -4024,16 +4027,10 @@ fn compile_return_generic(ctx: &mut Ctx, mut exprs: Vec<Expr>) -> Result<(), Com
     // fresh reservation and a MOVE for the common `return local_var`
     // pattern. Jump-kind expressions (comparisons, short-circuit logic)
     // fall through to the contiguous-slot path since LFALSESKIP/LOAD-true
-    // materialisation needs a concrete dst.
-    if exprs.len() == 1 {
+    // materialisation needs a concrete dst. A lone `...` or call (a call only
+    // lands here inside a `<close>` scope) returns all its values instead.
+    if exprs.len() == 1 && !matches!(exprs[0], Expr::VarArg | Expr::FuncCall(_) | Expr::Method(_)) {
         let only = exprs.pop().unwrap();
-        // `return ...` propagates every vararg to the caller via MULTRET.
-        if matches!(&only, Expr::VarArg) {
-            let dst = ctx.alloc_register()?;
-            ctx.emit(Instruction::vararg(dst, 0));
-            ctx.emit(Instruction::ret(dst, 0));
-            return Ok(());
-        }
         let mut desc = compile_expr(ctx, only, None)?;
         if !desc.has_jumps()
             && let ExprKind::Reg(reg) = desc.kind
