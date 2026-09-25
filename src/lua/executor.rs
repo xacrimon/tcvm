@@ -76,9 +76,9 @@ impl<'gc> Executor<'gc> {
         self.0.borrow().mode
     }
 
-    /// Seed `main_thread` with `function(args...)` and return a Normal-mode
-    /// executor. Any previous state on the main thread is cleared. A
-    /// non-function is called through its `__call` chain.
+    /// Seed a fresh main thread with `function(args...)` and return a
+    /// Normal-mode executor. A non-function is called through its `__call`
+    /// chain.
     ///
     /// Lua and native entry share the same shape: args at `stack[0..]`
     /// and a `ExecKind::Start(function)` on top. The driver's `ExecKind::Start`
@@ -88,14 +88,14 @@ impl<'gc> Executor<'gc> {
         function: impl Into<Value<'gc>>,
         args: A,
     ) -> Self {
-        let thread = ctx.main_thread();
+        let thread = Thread::new(ctx.mutation());
         {
             let mc = ctx.mutation();
             let mut buf: Vec<Value<'gc>> = Vec::new();
             args.push_into(mc, &mut buf);
 
             let mut ts = thread.borrow_mut(mc);
-            ts.reset();
+            ts.main = true;
             ts.set_window(0, buf);
             ts.push_exec(ExecKind::Start(function.into()));
             ts.status = ThreadStatus::Suspended;
@@ -671,8 +671,8 @@ fn pump_sequence<'gc>(
     // landed call, a resume). Its mutators write `top` back through the view.
     let poll_result = {
         let mut ts = top.borrow_mut(mc);
+        let exec = Execution::new(top, ts.main);
         let stack_view = crate::env::function::Stack::new(&mut ts, call_site.bottom);
-        let exec = Execution::new(top);
         if let Some(err) = pending_error {
             seq.error(ctx, exec, err, stack_view)
         } else {

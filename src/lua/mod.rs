@@ -23,10 +23,10 @@ use crate::dmm::{Arena, Collect, DynamicRootSet, Gc, GcLock, Lock, Mutation};
 use crate::env::shape::Shape;
 use crate::env::string::Interner;
 use crate::env::value::ValueKind;
-use crate::env::{Symbols, Table, Thread};
+use crate::env::{Symbols, Table};
 
-/// Root object of the GC arena. Holds the globals table, the main thread,
-/// and the dynamic root set used to stash values across `enter` boundaries.
+/// Root object of the GC arena. Holds the globals table and the dynamic root
+/// set used to stash values across `enter` boundaries.
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub struct State<'gc> {
@@ -42,7 +42,6 @@ pub struct State<'gc> {
     /// and friends). Accessed via `Context::symbols()`.
     pub(crate) symbols: Symbols<'gc>,
     pub(crate) globals: Table<'gc>,
-    pub(crate) main_thread: Thread<'gc>,
     pub(crate) roots: DynamicRootSet<'gc>,
     pub(crate) interner: Interner<'gc>,
     /// Metatables shared by all values of a type that has no per-value one
@@ -91,7 +90,6 @@ impl Lua {
                 empty_dict_sentinel,
                 symbols,
                 globals: Table::new_with_shape(mc, empty_shape),
-                main_thread: Thread::new(mc),
                 roots: DynamicRootSet::new(mc),
                 interner,
                 type_metatables: std::array::from_fn(|_| Gc::new(mc, Lock::new(None))),

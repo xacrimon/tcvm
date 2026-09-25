@@ -73,7 +73,7 @@ fn lua_resume<'gc>(
         .get(0)
         .get_thread()
         .ok_or_else(|| util::type_error(ctx, "resume", 1, "thread", stack.arg(0)))?;
-    if let Some(msg) = unresumable_reason(ctx, stack.exec(), co) {
+    if let Some(msg) = unresumable_reason(stack.exec(), co) {
         let m = Value::string(LuaString::new(ctx, msg.as_bytes()));
         stack.replace(&[Value::boolean(false), m]);
         return Ok(CallbackAction::Return);
@@ -90,16 +90,12 @@ fn lua_resume<'gc>(
 ///
 /// Pointer-eq checks against `current_thread` come first because the
 /// running thread's `RefLock` is already mutably borrowed by the
-/// interpreter — calling `co.status()` on it would re-borrow and panic.
-fn unresumable_reason<'gc>(
-    ctx: Context<'gc>,
-    exec: Execution<'gc>,
-    co: Thread<'gc>,
-) -> Option<&'static str> {
-    if co.ptr_eq(ctx.main_thread()) || co.ptr_eq(exec.current_thread()) {
+/// interpreter — calling `co.peer_status()` on it would re-borrow and panic.
+fn unresumable_reason<'gc>(exec: Execution<'gc>, co: Thread<'gc>) -> Option<&'static str> {
+    if co.ptr_eq(exec.current_thread()) {
         return Some("cannot resume non-suspended coroutine");
     }
-    match co.status() {
+    match co.peer_status() {
         ThreadStatus::Suspended => None,
         ThreadStatus::Result { .. } | ThreadStatus::Stopped => Some("cannot resume dead coroutine"),
         ThreadStatus::Normal => Some("cannot resume non-suspended coroutine"),
@@ -131,7 +127,7 @@ fn lua_status<'gc>(
     let s: &[u8] = if co.ptr_eq(stack.exec().current_thread()) {
         b"running"
     } else {
-        match co.status() {
+        match co.peer_status() {
             ThreadStatus::Stopped | ThreadStatus::Result { .. } => b"dead",
             ThreadStatus::Suspended => b"suspended",
             ThreadStatus::Normal => b"normal",
@@ -144,12 +140,12 @@ fn lua_status<'gc>(
 
 /// `coroutine.running()` — `(currently_running_thread, is_main_thread)`.
 fn lua_running<'gc>(
-    ctx: Context<'gc>,
+    _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let cur = stack.exec().current_thread();
-    let is_main = stack.exec().is_main(ctx);
+    let is_main = stack.exec().is_main();
     stack.replace(&[Value::thread(cur), Value::boolean(is_main)]);
     Ok(CallbackAction::Return)
 }
@@ -162,19 +158,24 @@ fn lua_isyieldable<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let arg = stack.get(0);
-    let yieldable = if arg.is_nil() {
-        !stack.exec().is_main(ctx) && !stack.thread_mut().no_yield
+    let target = if arg.is_nil() {
+        None
     } else {
-        let target = arg
+        let t = arg
             .get_thread()
             .ok_or_else(|| util::type_error(ctx, "isyieldable", 1, "thread", Some(arg)))?;
-        // The running thread's lock is held by the interpreter.
-        let no_yield = if target.ptr_eq(stack.exec().current_thread()) {
-            stack.thread_mut().no_yield
-        } else {
-            target.borrow().no_yield
-        };
-        !target.ptr_eq(ctx.main_thread()) && !no_yield
+        Some(t).filter(|t| !t.ptr_eq(stack.exec().current_thread()))
+    };
+    // The running thread's lock is held by the interpreter.
+    let yieldable = match target {
+        None => {
+            let ts = stack.thread_mut();
+            !ts.main && !ts.no_yield
+        }
+        Some(t) => {
+            let ts = t.borrow();
+            !ts.main && !ts.no_yield
+        }
     };
     stack.ret1(Value::boolean(yieldable));
     Ok(CallbackAction::Return)
@@ -221,12 +222,12 @@ fn lua_close<'gc>(
     // Pointer-eq against current first to avoid re-borrowing the running
     // thread's RefLock (mut-borrowed by the interpreter).
     if co.ptr_eq(stack.exec().current_thread()) {
-        if stack.exec().is_main(ctx) {
+        if stack.exec().is_main() {
             return Err(plain_error(ctx, "cannot close main thread"));
         }
         return Ok(close::close_running(ctx));
     }
-    match co.status() {
+    match co.peer_status() {
         ThreadStatus::Suspended | ThreadStatus::Stopped | ThreadStatus::Result { .. } => {
             let mut ts = co.borrow_mut(ctx.mutation());
             if close::seed_thread_close(ctx, &mut ts) {
@@ -264,7 +265,7 @@ fn wrap_callback<'gc>(
     // (or otherwise non-suspended) thread reaches `schedule_thread_resume`
     // and aborts the whole executor with `BadMode`. `wrap` re-raises errors
     // rather than wrapping them, so we throw the reason directly.
-    if let Some(msg) = unresumable_reason(ctx, stack.exec(), co) {
+    if let Some(msg) = unresumable_reason(stack.exec(), co) {
         return Err(Error::from_str(ctx, msg));
     }
     let then = BoxSequence::new(ctx.mutation(), UnwrapResumeSequence { co, closing: false });

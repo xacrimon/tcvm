@@ -221,7 +221,7 @@ impl<'gc, 'a> Stack<'gc, 'a> {
     /// The executor state of the thread this stack belongs to.
     #[inline]
     pub fn exec(&self) -> Execution<'gc> {
-        Execution::new(self.thread.handle())
+        Execution::new(self.thread.handle(), self.thread.main)
     }
 
     /// Stack-bottom index relative to the underlying vec.
