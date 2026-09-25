@@ -182,3 +182,21 @@ fn coroutine_close_closes_upvalues() {
     let src = "local f\nlocal co = coroutine.create(function() local x = 42 f = function() return x end coroutine.yield() end)\ncoroutine.resume(co)\nout(coroutine.close(co))\ncollectgarbage()\nout(f())\nreturn table.concat(log, '|')";
     assert_eq!(run(src), "true|42");
 }
+
+#[test]
+fn generic_for_closing_value() {
+    let src = "local function iter(t, name)\n  return function(_, i) i = i + 1 if t[i] then return i, t[i] end end, nil, 0, mk(name)\nend\nfor i, v in iter({10, 20, 30}, 'break') do out(i, v) if i == 2 then break end end\nfor i, v in iter({10}, 'end') do out(i, v) end\nout(pcall(function() for i in iter({1}, 'error') do error('boom', 0) end end))\nlocal function f(g) for i in iter({1}, 'return') do return g(i) end end\nout(f(function(i) out('in g', i) return 'r' end))\nfor i in iter({1, 2}, 'goto') do goto done end\n::done::\nfor k, v in pairs({a = 1}) do out(k, v) end\nreturn table.concat(log, '|')";
+    assert_eq!(
+        run(src),
+        "1 10|2 20|break 1 nil|1 10|end 1 nil|error 2 boom|false boom|in g 1|return 1 nil|r|goto 1 nil|a 1"
+    );
+}
+
+#[test]
+fn generic_for_non_closable() {
+    let src = "out(pcall(function() for i in function() end, nil, nil, {} do end end))\nout(pcall(function() for i in function() end, nil, nil, false do out('skipped') end end))\nreturn table.concat(log, '|')";
+    assert_eq!(
+        run(src),
+        "false c:1: variable '(for state)' got a non-closable value|true"
+    );
+}

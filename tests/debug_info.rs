@@ -116,10 +116,10 @@ fn loop_control_slots_are_recorded() {
         // the visible variable only inside the (empty) body.
         assert_eq!((proto.locvars[0].start_pc, proto.locvars[0].end_pc), (4, 6));
         assert_eq!((proto.locvars[3].start_pc, proto.locvars[3].end_pc), (5, 5));
-        // Generic loop: TFORPREP at 9, TFORLOOP at 11.
+        // Generic loop: TFORPREP at 10, TFORLOOP at 12.
         assert_eq!(
             (proto.locvars[4].start_pc, proto.locvars[4].end_pc),
-            (9, 12)
+            (10, 13)
         );
     });
 }

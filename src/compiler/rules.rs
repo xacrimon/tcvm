@@ -4357,6 +4357,7 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
 
 fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
     let for_line = ctx.cur_line;
+    let end_line = ctx.last_line_of(item.syntax());
     scope_lexical_break(ctx, |ctx| {
         let values: Vec<_> = item
             .values()
@@ -4368,13 +4369,12 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
             .collect();
         let num_targets = targets.len();
 
-        // Control registers land contiguously at [base, base+3): iterator,
-        // state, control; loop variables follow at base+3. Adjust the iterator
-        // explist to exactly 3 values like `compile_decl` does a multi-assign —
-        // a trailing call / `...` spreads to fill the remaining control slots
-        // (so `for k,v in pairs(t)` works), a shortfall is nil-padded, and
-        // values past the third are evaluated and discarded.
-        const NCTRL: u8 = 3;
+        // The explist is adjusted to 4 values at [base, base+4) like
+        // `compile_decl` does a multi-assign: iterator, state, initial
+        // control, closing value. TFORPREP swaps the last two, leaving the
+        // control in the first loop variable at base+3, where each TFORCALL
+        // stores the next one.
+        const NCTRL: u8 = 4;
         let base = RegisterIndex(ctx.chunk.freereg);
         let num_values = values.len();
 
@@ -4423,14 +4423,16 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
             let idx = ctx.alloc_constant(Value::nil())?;
             ctx.emit(Instruction::load(slot, KIdx(idx)));
         }
-        ctx.chunk.freereg = ctrl_top;
+        ctx.chunk.freereg = base.0 + 3;
 
-        // Promote the 3 anonymous control slots (iterator, state, control)
-        // so body subexpressions can't reclaim them via free_reg.
+        // Promote the 3 anonymous slots (iterator, state, closing value) so
+        // body subexpressions can't reclaim them via free_reg. The closing
+        // value closes when the loop's scope is left (luac `marktobeclosed`).
         ctx.adjust_locals(3);
         for _ in 0..3 {
             ctx.record_locvar("(for state)")?;
         }
+        ctx.mark_close(RegisterIndex(base.0 + 2))?;
 
         let loop_body = ctx.new_label();
         let loop_test = ctx.new_label();
@@ -4479,6 +4481,8 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
         // TFORLOOP: if control variable is not nil, jump back to body
         ctx.emit_jump_instr(loop_body, Instruction::tforloop(base, 0));
 
+        // The CLOSE of the closing value is on the loop's `end`, as in luac.
+        ctx.cur_line = end_line;
         Ok(())
     })
 }

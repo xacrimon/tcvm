@@ -3441,7 +3441,8 @@ extern "rust-preserve-none" fn forloop_slow<'gc>(
 // Generic for loop
 // ---------------------------------------------------------------------------
 
-/// Generic for preparation: jump to the loop test.
+/// Generic for preparation: swap the control R[base+2] and closing value
+/// R[base+3], mark the closing value to be closed, and jump to the loop test.
 #[inline(never)]
 #[rustc_align(32)]
 extern "rust-preserve-none" fn op_tforprep<'gc>(
@@ -3456,12 +3457,25 @@ extern "rust-preserve-none" fn op_tforprep<'gc>(
     closure: LuaFn<'gc>,
 ) {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-    let (_base, offset) = instruction.a_imm();
+    let (base, offset) = instruction.a_imm();
+    let closing = reg!(base + 3);
+    *reg!(ref mut base + 3) = reg!(base + 2);
+    *reg!(ref mut base + 2) = closing;
+    if !closing.is_falsy() {
+        if ctx.metamethod_of(closing, ctx.symbols().close).is_nil() {
+            raise!(OpError::NonClosable(base + 2));
+        }
+        let frame_base = unsafe { (*frame).base() };
+        thread
+            .tbc_list
+            .push(TbcEntry::Slot(frame_base + base as usize + 2));
+        unsafe { (*frame).flags |= frame_flags::TBC };
+    }
     ip = unsafe { ip.offset(offset as isize) };
     dispatch!();
 }
 
-/// Generic for call: R[base+3], ... = R[base](R[base+1], R[base+2])
+/// Generic for call: R[base+3], ... = R[base](R[base+1], R[base+3])
 #[inline(never)]
 #[rustc_align(32)]
 extern "rust-preserve-none" fn op_tforcall<'gc>(
@@ -3479,13 +3493,13 @@ extern "rust-preserve-none" fn op_tforcall<'gc>(
     let (base, count) = instruction.ab();
     let iter = reg!(base);
     let state = reg!(base + 1);
-    let control = reg!(base + 2);
+    let control = reg!(base + 3);
     let cont = Continuation::TForCall { base, count };
     invoke_metamethod!(iter, &[state, control], cont);
 }
 
-/// Generic for loop test: if the first result R[base+3] != nil, copy it into
-/// the control R[base+2] and jump back to the body.
+/// Generic for loop test: if the control R[base+3] != nil, jump back to the
+/// body.
 #[inline(never)]
 #[rustc_align(32)]
 extern "rust-preserve-none" fn op_tforloop<'gc>(
@@ -3501,9 +3515,7 @@ extern "rust-preserve-none" fn op_tforloop<'gc>(
 ) {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (base, offset) = instruction.a_imm();
-    let first = reg!(base + 3);
-    if !first.is_nil() {
-        *reg!(ref mut base + 2) = first;
+    if !reg!(base + 3).is_nil() {
         ip = unsafe { ip.offset(offset as isize) };
     }
     dispatch!();
