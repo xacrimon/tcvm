@@ -501,10 +501,12 @@ pub(crate) fn type_error<'gc>(
             None => v.type_name().into(),
         },
     };
-    Error::from_str(
-        ctx,
-        &format!("bad argument #{n} to '{fname}' ({expected} expected, got {got})"),
-    )
+    arg_error(ctx, fname, n, &format!("{expected} expected, got {got}"))
+}
+
+/// `luaL_argerror`: "bad argument #`n` to '`fname`' (`msg`)".
+pub(crate) fn arg_error<'gc>(ctx: Context<'gc>, fname: &str, n: usize, msg: &str) -> Error<'gc> {
+    Error::from_str(ctx, &format!("bad argument #{n} to '{fname}' ({msg})"))
 }
 
 /// Coerce `v` to a float, mirroring `luaL_checknumber` (numeric strings
@@ -552,9 +554,11 @@ pub(crate) fn check_integer<'gc>(
         return Ok(i);
     }
     if v.get_float().is_some() {
-        return Err(Error::from_str(
+        return Err(arg_error(
             ctx,
-            &format!("bad argument #{n} to '{fname}' (number has no integer representation)"),
+            fname,
+            n,
+            "number has no integer representation",
         ));
     }
     Err(type_error(ctx, fname, n, "number", Some(v)))

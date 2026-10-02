@@ -68,10 +68,7 @@ fn lua_assert<'gc>(
     stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     if stack.is_empty() {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #1 to 'assert' (value expected)",
-        ));
+        return Err(util::arg_error(ctx, "assert", 1, "value expected"));
     }
     if !stack.get(0).is_falsy() {
         // Leaving the window untouched returns all arguments.
@@ -140,10 +137,7 @@ fn lua_getmetatable<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     if stack.is_empty() {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #1 to 'getmetatable' (value expected)",
-        ));
+        return Err(util::arg_error(ctx, "getmetatable", 1, "value expected"));
     }
     // A `__metatable` field shadows the real metatable (protection).
     let result = match ctx.metatable_of(stack.get(0)) {
@@ -169,10 +163,7 @@ fn lua_ipairs<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     if stack.is_empty() {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #1 to 'ipairs' (value expected)",
-        ));
+        return Err(util::arg_error(ctx, "ipairs", 1, "value expected"));
     }
     let t = stack.get(0);
     stack.replace(&[closure.upvalues[0], t, Value::integer(ctx.mutation(), 0)]);
@@ -264,10 +255,7 @@ fn lua_pairs<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     if stack.is_empty() {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #1 to 'pairs' (value expected)",
-        ));
+        return Err(util::arg_error(ctx, "pairs", 1, "value expected"));
     }
     let t = stack.get(0);
     let mm = ctx.metamethod_of(t, ctx.symbols().pairs);
@@ -291,10 +279,7 @@ fn lua_pcall<'gc>(
     stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     if stack.is_empty() {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #1 to 'pcall' (value expected)",
-        ));
+        return Err(util::arg_error(ctx, "pcall", 1, "value expected"));
     }
     let then = BoxSequence::new(ctx.mutation(), ProtectedCall { handler: None });
     Ok(CallbackAction::call(Some(then)))
@@ -479,10 +464,7 @@ fn lua_select<'gc>(
     let i = util::check_integer(ctx, sel, "select", 1)?;
     let pos = if i < 0 { m as i64 + i + 1 } else { i };
     if pos < 1 {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #1 to 'select' (index out of range)",
-        ));
+        return Err(util::arg_error(ctx, "select", 1, "index out of range"));
     }
     let mut out = Vec::new();
     let mut k = pos as usize;
@@ -556,10 +538,7 @@ fn lua_tonumber<'gc>(
             .get_string()
             .ok_or_else(|| util::type_error(ctx, "tonumber", 1, "string", Some(v)))?;
         if !(2..=36).contains(&base) {
-            return Err(Error::from_str(
-                ctx,
-                "bad argument #2 to 'tonumber' (base out of range)",
-            ));
+            return Err(util::arg_error(ctx, "tonumber", 2, "base out of range"));
         }
         util::str_to_int_base(s.as_bytes(), base as u32)
             .map_or(Value::nil(), |i| Value::integer(ctx.mutation(), i))
@@ -582,10 +561,7 @@ fn lua_tostring<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     if stack.is_empty() {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #1 to 'tostring' (value expected)",
-        ));
+        return Err(util::arg_error(ctx, "tostring", 1, "value expected"));
     }
     let v = stack.get(0);
     let mm = ctx.metamethod_of(v, ctx.symbols().mm_tostring);
@@ -605,10 +581,7 @@ fn lua_type<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     if stack.is_empty() {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #1 to 'type' (value expected)",
-        ));
+        return Err(util::arg_error(ctx, "type", 1, "value expected"));
     }
     let name = stack.get(0).type_name();
     stack.replace(&[Value::string(LuaString::new(ctx, name.as_bytes()))]);

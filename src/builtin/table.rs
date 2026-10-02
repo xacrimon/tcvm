@@ -220,16 +220,10 @@ fn lua_create<'gc>(
         util::check_integer(ctx, m_arg, "create", 2)?
     };
     if n < 0 {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #1 to 'create' (out of range)",
-        ));
+        return Err(util::arg_error(ctx, "create", 1, "out of range"));
     }
     if m < 0 {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #2 to 'create' (out of range)",
-        ));
+        return Err(util::arg_error(ctx, "create", 2, "out of range"));
     }
     stack.ret1(Value::table(Table::new(ctx)));
     Ok(CallbackAction::Return)
@@ -288,10 +282,7 @@ fn insert_pos<'gc>(ctx: Context<'gc>, stack: &Stack<'gc, '_>, e: i64) -> Result<
             let pos = util::check_integer(ctx, stack.get(1), "insert", 2)?;
             // `pos` in `[1, e]`, compared unsigned as the reference does.
             if (pos as u64).wrapping_sub(1) >= e as u64 {
-                return Err(Error::from_str(
-                    ctx,
-                    "bad argument #2 to 'insert' (position out of bounds)",
-                ));
+                return Err(util::arg_error(ctx, "insert", 2, "position out of bounds"));
             }
             Ok(pos)
         }
@@ -325,17 +316,11 @@ fn lua_move<'gc>(
     // integer (else `e - f` itself overflows), and the destination range
     // `t .. t + n - 1` must not wrap past maxinteger.
     if !(f > 0 || e < i64::MAX + f) {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #3 to 'move' (too many elements to move)",
-        ));
+        return Err(util::arg_error(ctx, "move", 3, "too many elements to move"));
     }
     let n = e - f + 1;
     if t > i64::MAX - n + 1 {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #4 to 'move' (destination wrap around)",
-        ));
+        return Err(util::arg_error(ctx, "move", 4, "destination wrap around"));
     }
 
     // Copy forward unless the destination overlaps the tail of the source
@@ -499,10 +484,7 @@ fn remove_pos<'gc>(
     };
     // Any position but the default must lie in `[1, size + 1]`.
     if pos != size && (pos as u64).wrapping_sub(1) > size as u64 {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #2 to 'remove' (position out of bounds)",
-        ));
+        return Err(util::arg_error(ctx, "remove", 2, "position out of bounds"));
     }
     Ok(pos)
 }
@@ -558,10 +540,7 @@ fn sort_args<'gc>(
         return Ok(false);
     }
     if n >= i32::MAX as i64 {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #1 to 'sort' (array too big)",
-        ));
+        return Err(util::arg_error(ctx, "sort", 1, "array too big"));
     }
     let comp = stack.get(1);
     if !comp.is_nil() && comp.get_function().is_none() {
