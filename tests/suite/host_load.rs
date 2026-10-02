@@ -23,3 +23,11 @@ fn parse_error_is_the_rendered_report() {
          ───╯"
     );
 }
+
+#[test]
+fn compile_error_names_the_chunk() {
+    assert_eq!(
+        load_err("local x <const> = 1\nx = 2"),
+        "c:2: attempt to assign to const variable 'x'"
+    );
+}
