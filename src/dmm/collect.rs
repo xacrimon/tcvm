@@ -64,6 +64,12 @@ pub trait Trace<'gc> {
     /// Trace a [`GcWeak`] pointer (of any real type).
     fn trace_gc_weak(&mut self, gc: GcWeak<'gc, ()>);
 
+    /// Queue the object being traced for [`Finalization::deferred`], for pointers its trace
+    /// skipped. No default: a tracer that dropped the request would leave them dangling.
+    ///
+    /// [`Finalization::deferred`]: crate::dmm::Finalization::deferred
+    fn defer(&mut self);
+
     /// This is a convenience method that calls [`Collect::trace`] but automatically adds a
     /// [`Collect::NEEDS_TRACE`] check around it.
     ///
