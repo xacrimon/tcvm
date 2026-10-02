@@ -126,6 +126,14 @@ impl Label {
     pub fn name(&self) -> Option<Ident> {
         self.0.first_child().and_then(Ident::cast)
     }
+
+    pub(crate) fn is_last_statement_in_block(&self) -> bool {
+        self.0
+            .parent()
+            .and_then(|parent| parent.children().filter_map(Stmt::cast).last())
+            .and_then(|stmt| stmt.syntax().map(|node| node.text_range()))
+            .is_some_and(|range| range == self.0.text_range())
+    }
 }
 
 ast_node!(Goto, T![goto]);

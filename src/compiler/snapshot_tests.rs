@@ -221,3 +221,50 @@ fn test_register_limit_is_a_compile_error() {
         );
     }
 }
+
+#[test]
+fn test_goto_targets_follow_lua_block_visibility_and_scope_rules() {
+    for (source, expected) in [
+        (
+            "goto nowhere",
+            "compiler error at line 1: goto target label not found",
+        ),
+        (
+            "do goto nowhere end",
+            "compiler error at line 1: goto target label not found",
+        ),
+        (
+            "do ::inner:: end; goto inner",
+            "compiler error at line 1: goto target label not found",
+        ),
+        (
+            "while false do ::inner:: end; goto inner",
+            "compiler error at line 1: goto target label not found",
+        ),
+        (
+            "goto target; local x; ::target:: print(x)",
+            "compiler error at line 1: jump into scope of new local variable",
+        ),
+        (
+            "local x\ngoto target\nlocal y\n::target::\nprint(x, y)",
+            "compiler error at line 2: jump into scope of new local variable",
+        ),
+        (
+            "::same:: do ::same:: end",
+            "compiler error at line 1: label defined multiple times",
+        ),
+    ] {
+        assert_eq!(compile_err_and_format(source), expected, "source: {source}");
+    }
+
+    for source in [
+        "do goto outer end; ::outer::",
+        "do local x; goto target; ::target:: end",
+        "if true then local x; goto target; ::target:: end",
+        "do ::inner:: end; ::inner::",
+        "local x; goto target; ::target::",
+        "::outer:: do goto outer end",
+    ] {
+        compile_and_format(source);
+    }
+}

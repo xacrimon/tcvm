@@ -304,13 +304,16 @@ struct VariableData {
 /// Snapshot of the register allocator's state at scope entry. Restored
 /// verbatim on `pop_scope` so nested scopes cleanly release any temps and
 /// named locals they allocated.
-/// A forward `goto` whose `::label::` hasn't been compiled yet. `depth` is
-/// `scope_marks.len()` at the jump; `needs_close` is set when a scope it
-/// sits inside is popped with something to CLOSE, so the label emits one.
+/// A forward `goto` whose `::label::` hasn't been compiled yet. `depth` tracks
+/// the shallowest still-open block it can resolve from; it is promoted as
+/// inner blocks end. `needs_close` records whether leaving an inner scope
+/// requires a CLOSE at the eventual target.
 struct PendingGoto {
     name: String,
     label: u16,
     depth: usize,
+    nactvar: u8,
+    line_number: u32,
     needs_close: bool,
 }
 
@@ -389,9 +392,9 @@ struct Ctx<'gc, 'a> {
     /// `chunk.locvars` indices declared in each scope, closed on pop.
     scope_locvars: Vec<Vec<usize>>,
 
-    /// `::name::` seen so far → (label, `nactvar` at the label), so a
-    /// backward goto knows which locals it leaves.
-    labels: HashMap<String, (u16, u8), RandomState>,
+    /// Visible `::name::` labels → (label, `nactvar` at the label, scope
+    /// depth), so gotos can validate visibility and know which locals they leave.
+    labels: HashMap<String, (u16, u8, usize), RandomState>,
     /// Forward gotos awaiting their label.
     pending_gotos: Vec<PendingGoto>,
 
@@ -1136,7 +1139,8 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     /// Pop the scope, returning the register to `CLOSE` at when leaving it
     /// (if it holds to-be-closed or captured locals).
     fn pop_scope(&mut self) -> Result<Option<RegisterIndex>, CompileError> {
-        let close = self.close_reg_from(self.scope_marks.len() - 1);
+        let popped_depth = self.scope_marks.len();
+        let close = self.close_reg_from(popped_depth - 1);
         self.scope.pop().ok_or_else(|| ice("missing scope"))?;
         let mark = self
             .scope_marks
@@ -1162,11 +1166,22 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             .pop()
             .ok_or_else(|| ice("missing scope close list"))?;
         if close.is_some() {
-            let depth = self.scope_marks.len();
-            for g in self.pending_gotos.iter_mut().filter(|g| g.depth > depth) {
-                g.needs_close = true;
+            for goto in self
+                .pending_gotos
+                .iter_mut()
+                .filter(|goto| goto.depth >= popped_depth)
+            {
+                goto.needs_close = true;
             }
         }
+        let depth = self.scope_marks.len();
+        for goto in &mut self.pending_gotos {
+            if goto.depth == popped_depth {
+                goto.depth = depth;
+            }
+        }
+        self.labels
+            .retain(|_, (_, _, label_depth)| *label_depth < popped_depth);
         Ok(close)
     }
 
@@ -1587,6 +1602,13 @@ fn compile_function_to_chunk<'gc, 'a>(
     // could sit between a MULTRET producer and the RETURN reading `top`.
     ctx.pop_scope()?;
 
+    if let Some(goto) = ctx.pending_gotos.first() {
+        return Err(CompileError {
+            kind: CompileErrorKind::GotoInvalid,
+            line_number: super::LineNumber(goto.line_number),
+        });
+    }
+
     // Flatten the named upvalue list into the chunk's descriptor array.
     let lua_ctx = ctx.ctx;
     let (names, descs): (Vec<_>, Vec<_>) = ctx.upvalues.into_iter().unzip();
@@ -1643,11 +1665,32 @@ fn compile_label(ctx: &mut Ctx, item: Label) -> Result<(), CompileError> {
         .ok_or_else(|| ice("ident without name"))?
         .to_owned();
 
-    let nactvar = ctx.chunk.nactvar;
+    if ctx.labels.contains_key(&name) {
+        return Err(ctx.err(CompileErrorKind::DuplicateLabel));
+    }
+
+    let depth = ctx.scope_marks.len();
+    // Lua treats a block's final label as outside the scope of locals declared
+    // in that block, allowing a jump to the block's end without entering one.
+    let block_end = item.is_last_statement_in_block();
+    let nactvar = if block_end {
+        ctx.scope_marks
+            .last()
+            .ok_or_else(|| ice("label outside scope"))?
+            .nactvar
+    } else {
+        ctx.chunk.nactvar
+    };
     let pending: Vec<_> = ctx
         .pending_gotos
-        .extract_if(.., |g| g.name == name)
+        .extract_if(.., |g| g.name == name && g.depth >= depth)
         .collect();
+    if let Some(goto) = pending.iter().find(|g| nactvar > g.nactvar) {
+        return Err(CompileError {
+            kind: CompileErrorKind::JumpLocal,
+            line_number: super::LineNumber(goto.line_number),
+        });
+    }
     let label = match pending.first() {
         Some(g) => g.label,
         None => ctx.new_label(),
@@ -1655,10 +1698,10 @@ fn compile_label(ctx: &mut Ctx, item: Label) -> Result<(), CompileError> {
     ctx.set_label(label, ctx.next_offset());
     // Forward jumps that left a scope with open upvalues / TBC land here;
     // falling through closes nothing live (luac `createlabel`).
-    if pending.iter().any(|g| g.needs_close) {
+    if !block_end && pending.iter().any(|g| g.needs_close) {
         ctx.emit(Instruction::close(Reg(nactvar)));
     }
-    ctx.labels.insert(name, (label, nactvar));
+    ctx.labels.insert(name, (label, nactvar, depth));
 
     Ok(())
 }
@@ -1673,7 +1716,7 @@ fn compile_goto(ctx: &mut Ctx, item: Goto) -> Result<(), CompileError> {
 
     let label = match ctx.labels.get(&name) {
         // Backward jump: close whatever locals it leaves (luac `gotostat`).
-        Some(&(label, nactvar)) => {
+        Some(&(label, nactvar, _)) => {
             if ctx.chunk.nactvar > nactvar {
                 ctx.emit(Instruction::close(Reg(nactvar)));
             }
@@ -1688,6 +1731,8 @@ fn compile_goto(ctx: &mut Ctx, item: Goto) -> Result<(), CompileError> {
                 name,
                 label,
                 depth: ctx.scope_marks.len(),
+                nactvar: ctx.chunk.nactvar,
+                line_number: ctx.cur_line,
                 needs_close: false,
             });
             label
