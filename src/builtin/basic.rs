@@ -736,11 +736,8 @@ fn lua_type<'gc>(
     Ok(CallbackAction::Return)
 }
 
-/// `warn(msg, ...)` — Lua's warning system defaults to off and we do not yet
-/// track the on/off toggle, so this validates the arguments (as Lua does, via
-/// `luaL_checkstring`, which accepts strings *and* numbers) and otherwise does
-/// nothing. TODO(#27): emit to stderr and honor `@on`/`@off` control messages
-/// once warning state lives in `State`.
+/// `warn(msg, ...)` — only checks its arguments (strings or numbers, as
+/// `luaL_checkstring`); there is no warning system yet (#227).
 fn lua_warn<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
