@@ -1,3 +1,9 @@
+use std::ffi::OsStr;
+use std::fs::File;
+use std::io::Read;
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
+
 use cstree::build::NodeCache;
 
 use crate::compiler::compile_chunk;
@@ -7,7 +13,7 @@ use crate::env::shape::Shape;
 use crate::env::string::Interner;
 use crate::env::{LuaString, Symbols, Table, Value};
 use crate::lua::stash::{Fetchable, Stashable};
-use crate::lua::{LoadError, State, SyntaxError};
+use crate::lua::{LoadError, State, SyntaxError, bare_io_msg};
 use crate::parser;
 use crate::vm::debug::chunk_id;
 
@@ -108,6 +114,73 @@ impl<'gc> Context<'gc> {
         // Like Lua's `load`, an unnamed chunk is named by its own text
         // (rendered as `[string "..."]` in messages).
         let name = LuaString::new(self, name.unwrap_or(source).as_bytes());
+        self.load_text(source, name, Value::table(self.state.globals))
+    }
+
+    /// Load the file at `path` as Lua's `loadfile` does: named `@path`, with
+    /// a UTF-8 BOM and a first line starting with `#` skipped.
+    pub fn load_file(self, path: &Path) -> Result<Function<'gc>, LoadError> {
+        let path = path.as_os_str().as_bytes();
+        self.load_file_with(Some(path), Value::table(self.state.globals))
+    }
+
+    /// `luaL_loadfilex`, reading stdin without a `path`, then
+    /// [`load_bytes`](Self::load_bytes). A skipped `#` line leaves its
+    /// newline, so line numbers hold.
+    pub(crate) fn load_file_with(
+        self,
+        path: Option<&[u8]>,
+        env: Value<'gc>,
+    ) -> Result<Function<'gc>, LoadError> {
+        let mut contents = Vec::new();
+        let name = match path {
+            Some(p) => {
+                let shown = String::from_utf8_lossy(p);
+                let mut file = File::open(Path::new(OsStr::from_bytes(p))).map_err(|e| {
+                    LoadError::File(format!("cannot open {shown}: {}", bare_io_msg(&e)))
+                })?;
+                // `luaL_loadfilex` clears `errno` before reporting a read error.
+                file.read_to_end(&mut contents)
+                    .map_err(|_| LoadError::File(format!("cannot read {shown}")))?;
+                [b"@", p].concat()
+            }
+            None => {
+                std::io::stdin()
+                    .read_to_end(&mut contents)
+                    .map_err(|_| LoadError::File("cannot read stdin".into()))?;
+                b"=stdin".to_vec()
+            }
+        };
+        let body = contents.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&contents);
+        let source = match body.strip_prefix(b"#") {
+            Some(line) => line
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(&[][..], |i| &line[i..]),
+            None => body,
+        };
+        self.load_bytes(source, LuaString::new(self, &name), env)
+    }
+
+    /// `luaL_loadbuffer` for a text chunk, which must be UTF-8.
+    pub(crate) fn load_bytes(
+        self,
+        source: &[u8],
+        name: LuaString<'gc>,
+        env: Value<'gc>,
+    ) -> Result<Function<'gc>, LoadError> {
+        let source = std::str::from_utf8(source).map_err(|_| LoadError::NotUtf8 {
+            chunk: String::from_utf8_lossy(&chunk_id(name.as_bytes())).into_owned(),
+        })?;
+        self.load_text(source, name, env)
+    }
+
+    fn load_text(
+        self,
+        source: &str,
+        name: LuaString<'gc>,
+        env: Value<'gc>,
+    ) -> Result<Function<'gc>, LoadError> {
         let mut cache = NodeCache::new();
         let parse = parser::parse(&mut cache, source);
         let chunk = || String::from_utf8_lossy(&chunk_id(name.as_bytes())).into_owned();
@@ -130,11 +203,8 @@ impl<'gc> Context<'gc> {
                 }
             })?;
 
-        // Main chunk's upvalue 0 is _ENV. Pre-close it onto globals.
-        let env_uv = Gc::new(
-            self.mutation,
-            RefLock::new(UpvalueState::Closed(Value::table(self.state.globals))),
-        );
+        // Main chunk's upvalue 0 is _ENV.
+        let env_uv = Gc::new(self.mutation, RefLock::new(UpvalueState::Closed(env)));
         let mut upvalues = Vec::with_capacity_in(
             1,
             crate::dmm::allocator_api::MetricsAlloc::new(self.mutation),
