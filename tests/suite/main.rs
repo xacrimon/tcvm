@@ -38,6 +38,7 @@ mod not_andor;
 mod numeric_for;
 mod opcode_errors;
 mod os_clock;
+mod os_date;
 mod pcall;
 mod return_multires;
 mod sequence_call_native_error;
