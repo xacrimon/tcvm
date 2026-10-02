@@ -153,7 +153,6 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         ("lines", lua_lines),
         ("open", lua_open),
         ("output", lua_output),
-        ("popen", lua_popen),
         ("read", lua_read),
         ("tmpfile", lua_tmpfile),
         ("type", lua_type),
@@ -166,6 +165,7 @@ pub fn load<'gc>(ctx: Context<'gc>) {
             Value::function(native(f)),
         );
     }
+    util::set_not_implemented(ctx, lib, "io", &["popen"]);
     lib.raw_set(ctx, str_val(ctx, b"stdin"), Value::userdata(stdin));
     lib.raw_set(ctx, str_val(ctx, b"stdout"), Value::userdata(stdout));
     lib.raw_set(ctx, str_val(ctx, b"stderr"), Value::userdata(stderr));
@@ -903,15 +903,6 @@ fn lua_tmpfile<'gc>(
         Err(e) => stack.replace(&io_fail(ctx, None, &e)),
     }
     Ok(CallbackAction::Return)
-}
-
-/// `io.popen` — subprocess plumbing deferred to #27.
-fn lua_popen<'gc>(
-    ctx: Context<'gc>,
-    _closure: &NativeClosure<'gc>,
-    _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    Err(Error::from_str(ctx, "io.popen is not implemented"))
 }
 
 // ---------------------------------------------------------------------------

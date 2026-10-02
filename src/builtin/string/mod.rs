@@ -35,7 +35,6 @@ pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[
         ("byte", lua_byte),
         ("char", lua_char),
-        ("dump", lua_dump),
         ("find", lua_find),
         ("format", lua_format),
         ("gmatch", lua_gmatch),
@@ -58,6 +57,8 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         let key = Value::string(LuaString::new(ctx, name.as_bytes()));
         lib.raw_set(ctx, key, Value::function(handler));
     }
+
+    util::set_not_implemented(ctx, lib, "string", &["dump"]);
 
     meta::install(ctx, lib);
 
@@ -120,14 +121,6 @@ fn lua_char<'gc>(
     let r = LuaString::new(ctx, &out);
     stack.ret1(Value::string(r));
     Ok(CallbackAction::Return)
-}
-
-fn lua_dump<'gc>(
-    ctx: Context<'gc>,
-    _closure: &NativeClosure<'gc>,
-    _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    Err(Error::from_str(ctx, "string.dump is not implemented"))
 }
 
 // ---------- pattern matching: shared helpers ----------
