@@ -695,19 +695,12 @@ fn lua_open<'gc>(
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let name_val = stack.get(0);
-    let name = name_val
-        .get_string()
-        .ok_or_else(|| util::type_error(ctx, "open", 1, "string", stack.arg(0)))?;
-    let mode_val = stack.get(1);
-    let mode = if mode_val.is_nil() {
-        b"r".as_slice()
-    } else {
-        mode_val
-            .get_string()
-            .map(|s| s.as_bytes())
-            .ok_or_else(|| util::type_error(ctx, "open", 2, "string", Some(mode_val)))?
+    let name = match stack.arg(0) {
+        Some(v) => util::check_string(ctx, v, "open", 1)?,
+        None => return Err(util::type_error(ctx, "open", 1, "string", None)),
     };
+    let mode = util::opt_string(ctx, stack.get(1), "open", 2)?;
+    let mode = mode.map_or(&b"r"[..], |m| m.as_bytes());
     // An invalid mode is a raised argument error, not a `(nil, msg, errno)`
     // return (Lua's `luaL_argcheck(l_checkmode(...))`).
     if !check_mode(mode) {
@@ -822,7 +815,7 @@ fn default_file<'gc>(
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let arg = stack.get(0);
     if !arg.is_nil() {
-        let handle = if let Some(s) = arg.get_string() {
+        let handle = if let Some(s) = util::to_lstring(ctx, arg) {
             open_file(ctx, closure, s.as_bytes(), mode).map_err(|e| {
                 let what = String::from_utf8_lossy(s.as_bytes());
                 Error::from_str(
@@ -848,21 +841,20 @@ fn lua_lines<'gc>(
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let first = stack.get(0);
-    let (handle, close_eof, fmt_args): (Value<'gc>, bool, &[Value<'gc>]) =
-        if let Some(s) = first.get_string() {
-            let u = open_file(ctx, closure, s.as_bytes(), b"r").map_err(|e| {
-                let what = String::from_utf8_lossy(s.as_bytes());
-                Error::from_str(
-                    ctx,
-                    &format!("cannot open file '{what}' ({})", bare_io_msg(&e)),
-                )
-            })?;
-            (Value::userdata(u), true, &stack.as_slice()[1..])
-        } else {
-            let inp = state_get(ctx, io_state(closure), b"input");
-            (inp, false, stack.as_slice())
-        };
+    let fmt_args = stack.as_slice().get(1..).unwrap_or_default();
+    let (handle, close_eof) = if stack.get(0).is_nil() {
+        (state_get(ctx, io_state(closure), b"input"), false)
+    } else {
+        let s = util::check_string(ctx, stack.get(0), "lines", 1)?;
+        let u = open_file(ctx, closure, s.as_bytes(), b"r").map_err(|e| {
+            let what = String::from_utf8_lossy(s.as_bytes());
+            Error::from_str(
+                ctx,
+                &format!("cannot open file '{what}' ({})", bare_io_msg(&e)),
+            )
+        })?;
+        (Value::userdata(u), true)
+    };
     // Validate formats up front (Lua reports lines-format errors eagerly).
     parse_formats(ctx, fmt_args, "lines", 2)?;
     let iter = make_lines_iter(ctx, handle, close_eof, fmt_args);
@@ -987,15 +979,8 @@ fn lua_file_seek<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let u = check_file(ctx, closure, stack.get(0), "seek", 1)?;
-    let whence_val = stack.get(1);
-    let whence = if whence_val.is_nil() {
-        b"cur".as_slice()
-    } else {
-        whence_val
-            .get_string()
-            .map(|s| s.as_bytes())
-            .ok_or_else(|| util::type_error(ctx, "seek", 2, "string", Some(whence_val)))?
-    };
+    let whence = util::opt_string(ctx, stack.get(1), "seek", 2)?;
+    let whence = whence.map_or(&b"cur"[..], |w| w.as_bytes());
     let offset = {
         let o = stack.get(2);
         if o.is_nil() {
@@ -1011,8 +996,13 @@ fn lua_file_seek<'gc>(
         b"set" => Some(SeekFrom::Start(offset as u64)),
         b"cur" => Some(SeekFrom::Current(offset)),
         b"end" => Some(SeekFrom::End(offset)),
-        _ => {
-            return Err(util::arg_error(ctx, "seek", 2, "invalid option"));
+        other => {
+            return Err(util::arg_error(
+                ctx,
+                "seek",
+                2,
+                &format!("invalid option '{}'", String::from_utf8_lossy(other)),
+            ));
         }
     };
     let outcome = match pos {
@@ -1067,19 +1057,19 @@ fn lua_file_setvbuf<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     check_file(ctx, closure, stack.get(0), "setvbuf", 1)?;
-    let mode = stack.get(1);
-    match mode.get_string().map(|s| s.as_bytes()) {
-        Some(b"no") | Some(b"full") | Some(b"line") => {}
-        Some(other) => {
+    let mode = match stack.arg(1) {
+        Some(v) => util::check_string(ctx, v, "setvbuf", 2)?,
+        None => return Err(util::type_error(ctx, "setvbuf", 2, "string", None)),
+    };
+    match mode.as_bytes() {
+        b"no" | b"full" | b"line" => {}
+        other => {
             return Err(util::arg_error(
                 ctx,
                 "setvbuf",
                 2,
                 &format!("invalid option '{}'", String::from_utf8_lossy(other)),
             ));
-        }
-        None => {
-            return Err(util::type_error(ctx, "setvbuf", 2, "string", stack.arg(1)));
         }
     }
     stack.ret1(Value::boolean(true));

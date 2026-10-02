@@ -97,16 +97,6 @@ fn encode(cp: u32, out: &mut Vec<u8>) {
     out.extend_from_slice(&tail);
 }
 
-fn check_str<'gc>(
-    ctx: Context<'gc>,
-    v: Value<'gc>,
-    fname: &str,
-    n: usize,
-) -> Result<LuaString<'gc>, Error<'gc>> {
-    v.get_string()
-        .ok_or_else(|| util::type_error(ctx, fname, n, "string", Some(v)))
-}
-
 /// Lua's `posrelat` for byte positions.
 fn posrelat(pos: i64, len: usize) -> i64 {
     if pos >= 0 {
@@ -152,7 +142,7 @@ fn lua_codepoint<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let s = check_str(ctx, stack.get(0), "codepoint", 1)?;
+    let s = util::check_string(ctx, stack.get(0), "codepoint", 1)?;
     let bytes = s.as_bytes();
     let len = bytes.len();
     let i_arg = stack.get(1);
@@ -200,7 +190,7 @@ fn lua_len<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let s = check_str(ctx, stack.get(0), "len", 1)?;
+    let s = util::check_string(ctx, stack.get(0), "len", 1)?;
     let bytes = s.as_bytes();
     let len = bytes.len();
     let i_arg = stack.get(1);
@@ -260,7 +250,7 @@ fn lua_offset<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let s = check_str(ctx, stack.get(0), "offset", 1)?;
+    let s = util::check_string(ctx, stack.get(0), "offset", 1)?;
     let bytes = s.as_bytes();
     let len = bytes.len();
     let n = crate::builtin::util::check_integer(ctx, stack.get(1), "offset", 2)?;
@@ -337,7 +327,7 @@ fn lua_codes<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let s = check_str(ctx, stack.get(0), "codes", 1)?;
+    let s = util::check_string(ctx, stack.get(0), "codes", 1)?;
     let iter = Function::new_native(ctx.mutation(), codes_aux, &[]);
     stack.replace(&[
         Value::function(iter),
@@ -354,7 +344,7 @@ fn codes_aux<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let s = check_str(ctx, stack.get(0), "codes", 1)?;
+    let s = util::check_string(ctx, stack.get(0), "codes", 1)?;
     let bytes = s.as_bytes();
     let len = bytes.len();
     let i = stack.get(1).get_integer().unwrap_or(0);

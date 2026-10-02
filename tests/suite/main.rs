@@ -48,6 +48,7 @@ mod sequence_tail_resume;
 mod sequence_tailcall;
 mod stack_overflow;
 mod stmt_temp_reclaim;
+mod string_args;
 mod string_collection;
 mod string_metatable;
 mod suspended_metamethod;

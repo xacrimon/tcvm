@@ -40,16 +40,6 @@ fn file_result<'gc>(
     }
 }
 
-fn check_str_arg<'gc>(
-    ctx: Context<'gc>,
-    v: Value<'gc>,
-    fname: &str,
-    n: usize,
-) -> Result<LuaString<'gc>, Error<'gc>> {
-    v.get_string()
-        .ok_or_else(|| util::type_error(ctx, fname, n, "string", Some(v)))
-}
-
 pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[
         ("clock", lua_clock),
@@ -158,7 +148,7 @@ fn lua_getenv<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let name = check_str_arg(ctx, stack.get(0), "getenv", 1)?;
+    let name = util::check_string(ctx, stack.get(0), "getenv", 1)?;
     // Look up by raw bytes (env vars/values needn't be UTF-8), matching C.
     let val = std::env::var_os(std::ffi::OsStr::from_bytes(name.as_bytes()));
     let result = match val {
@@ -176,7 +166,7 @@ fn lua_remove<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let name = check_str_arg(ctx, stack.get(0), "remove", 1)?;
+    let name = util::check_string(ctx, stack.get(0), "remove", 1)?;
     let path = std::path::Path::new(std::ffi::OsStr::from_bytes(name.as_bytes()));
     // C `remove` deletes files and empty directories; try the file path first.
     let res = std::fs::remove_file(path).or_else(|_| std::fs::remove_dir(path));
@@ -193,8 +183,8 @@ fn lua_rename<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let from = check_str_arg(ctx, stack.get(0), "rename", 1)?;
-    let to = check_str_arg(ctx, stack.get(1), "rename", 2)?;
+    let from = util::check_string(ctx, stack.get(0), "rename", 1)?;
+    let to = util::check_string(ctx, stack.get(1), "rename", 2)?;
     let from_p = std::path::Path::new(std::ffi::OsStr::from_bytes(from.as_bytes()));
     let to_p = std::path::Path::new(std::ffi::OsStr::from_bytes(to.as_bytes()));
     let res = std::fs::rename(from_p, to_p);
