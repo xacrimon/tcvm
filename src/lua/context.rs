@@ -7,8 +7,9 @@ use crate::env::shape::Shape;
 use crate::env::string::Interner;
 use crate::env::{LuaString, Symbols, Table, Value};
 use crate::lua::stash::{Fetchable, Stashable};
-use crate::lua::{LoadError, State};
+use crate::lua::{LoadError, State, SyntaxError};
 use crate::parser;
+use crate::vm::debug::chunk_id;
 
 /// Cheap, copy handle into the arena mutation context.
 #[derive(Copy, Clone)]
@@ -104,18 +105,22 @@ impl<'gc> Context<'gc> {
     /// Parse and compile `source` into a `Function`, with `_ENV` bound to the
     /// runtime's globals table.
     pub fn load(self, source: &str, name: Option<&str>) -> Result<Function<'gc>, LoadError> {
-        let mut cache = NodeCache::new();
-        let parse = parser::parse(&mut cache, source);
-        // The parser only reports errors (see `State::report`), so any report
-        // means the tree is unusable.
-        if !parse.reports.is_empty() {
-            return Err(LoadError::Parse(parse.reports));
-        }
-        let root = parser::syntax::Root::new(parse.root)
-            .ok_or(LoadError::Internal("parser did not produce a Root node"))?;
         // Like Lua's `load`, an unnamed chunk is named by its own text
         // (rendered as `[string "..."]` in messages).
         let name = LuaString::new(self, name.unwrap_or(source).as_bytes());
+        let mut cache = NodeCache::new();
+        let parse = parser::parse(&mut cache, source);
+        // The parser only reports errors (see `State::error`), so any report
+        // means the tree is unusable.
+        if !parse.reports.is_empty() {
+            return Err(LoadError::Parse(SyntaxError {
+                chunk: String::from_utf8_lossy(&chunk_id(name.as_bytes())).into_owned(),
+                source: source.to_owned(),
+                reports: parse.reports,
+            }));
+        }
+        let root = parser::syntax::Root::new(parse.root)
+            .ok_or(LoadError::Internal("parser did not produce a Root node"))?;
         let proto = compile_chunk(self, &root, &parse.lines, cache.interner(), name)?;
 
         // Main chunk's upvalue 0 is _ENV. Pre-close it onto globals.

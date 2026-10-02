@@ -59,16 +59,11 @@ impl<'cache, 'source> Parser<'cache, 'source> {
         };
 
         if marker.is_none() && self.at() != T![eof] {
-            let error = self
-                .new_error()
-                .with_message("expected a statement")
-                .with_label(self.new_label().with_message(format!(
-                    "expected a statement but got \"{}\"",
-                    self.source(self.span())
-                )))
-                .finish();
-
-            self.report(error);
+            let got = format!(
+                "expected a statement but got \"{}\"",
+                self.source(self.span())
+            );
+            self.error("expected a statement", got);
             // A statement that failed partway (`a[ end`) has already made
             // progress, so a terminator here belongs to the enclosing block.
             if self.cursor() == start || !STATEMENT_RECOVERY.contains(&self.at()) {
@@ -233,19 +228,16 @@ impl<'cache, 'source> Parser<'cache, 'source> {
                 self.r_else();
             }
             t => {
-                let error = self
-                    .new_error()
-                    .with_message("unexpected token")
-                    .with_label(self.new_label().with_message(format!(
+                self.error(
+                    "unexpected token",
+                    format!(
                         "expected token one of [{}, {}, {}] but found {}",
                         T![end],
                         T![elseif],
                         T![else],
                         t,
-                    )))
-                    .finish();
-
-                self.report(error);
+                    ),
+                );
                 return None;
             }
         }
@@ -325,15 +317,11 @@ impl<'cache, 'source> Parser<'cache, 'source> {
             self.r_semicolon();
         }
         if !BLOCK_FOLLOW.contains(&self.at()) {
-            let error = self
-                .new_error()
-                .with_message("unexpected token")
-                .with_label(self.new_label().with_message(format!(
-                    "'return' must be the last statement in its block, but found {}",
-                    self.at()
-                )))
-                .finish();
-            self.report(error);
+            let found = format!(
+                "'return' must be the last statement in its block, but found {}",
+                self.at()
+            );
+            self.error("unexpected token", found);
         }
 
         Some(marker)
@@ -456,20 +444,16 @@ impl<'cache, 'source> Parser<'cache, 'source> {
                     self.r_ident();
                 }
                 t => {
-                    let error = self
-                        .new_error()
-                        .with_message("unexpected token")
-                        .with_label(self.new_label().with_message(format!(
+                    self.error(
+                        "unexpected token",
+                        format!(
                             "expected token one of [{}, {}, {}] but found {}",
                             T![')'],
                             T![...],
                             T![ident],
                             t,
-                        )))
-                        .finish();
-
-                    self.report(error);
-
+                        ),
+                    );
                     return None;
                 }
             }
@@ -524,18 +508,15 @@ impl<'cache, 'source> Parser<'cache, 'source> {
             T!['['] => self.r_table_elem_generic(),
             t if token_is_expr_start(t) => self.r_table_elem_array(),
             t => {
-                let error = self
-                    .new_error()
-                    .with_message("unexpected token")
-                    .with_label(self.new_label().with_message(format!(
+                self.error(
+                    "unexpected token",
+                    format!(
                         "expected token one of [{}, {}, expr] but found {}",
                         T![ident],
                         T!['['],
                         t,
-                    )))
-                    .finish();
-
-                self.report(error);
+                    ),
+                );
                 None
             }
         }
@@ -629,15 +610,10 @@ impl<'cache, 'source> Parser<'cache, 'source> {
             if let Some(m) = &expr_marker
                 && !matches!(m.kind(), T![func_call] | T![method_call])
             {
-                let label = self
-                    .new_label()
-                    .with_message("expression statement must be a function or method call");
-                let error = self
-                    .new_error()
-                    .with_message("syntax error")
-                    .with_label(label)
-                    .finish();
-                self.report(error);
+                self.error(
+                    "syntax error",
+                    "expression statement must be a function or method call",
+                );
             }
             expr_marker
         }
@@ -661,15 +637,7 @@ impl<'cache, 'source> Parser<'cache, 'source> {
     /// `bin_op` `r_simple_expr` builds is `.`, so the kind alone suffices.
     fn check_assign_target(&mut self, kind: SyntaxKind) {
         if !matches!(kind, T![ident] | T![index] | T![bin_op]) {
-            let label = self
-                .new_label()
-                .with_message("cannot assign to this expression");
-            let error = self
-                .new_error()
-                .with_message("syntax error")
-                .with_label(label)
-                .finish();
-            self.report(error);
+            self.error("syntax error", "cannot assign to this expression");
         }
     }
 
@@ -760,15 +728,10 @@ impl<'cache, 'source> Parser<'cache, 'source> {
         if t == T![const] {
             self.expect(t);
         } else if t == T![close] {
-            let error = self
-                .new_error()
-                .with_message("global variables cannot be to-be-closed")
-                .with_label(
-                    self.new_label()
-                        .with_message("'<close>' is not allowed on global declarations"),
-                )
-                .finish();
-            self.report(error);
+            self.error(
+                "global variables cannot be to-be-closed",
+                "'<close>' is not allowed on global declarations",
+            );
             self.expect(t);
         }
     }

@@ -9,17 +9,69 @@ use std::ops::{Deref, DerefMut};
 use cstree::build::NodeCache;
 use kind::T;
 pub use machinery::LineMap;
-use machinery::{Span, State};
+use machinery::State;
+pub use machinery::SyntaxReport;
 use syntax::SyntaxNode;
 
 pub struct Parse {
     pub root: SyntaxNode,
     pub lines: LineMap,
-    pub reports: Vec<ariadne::Report<'static, Span>>,
+    pub reports: Vec<SyntaxReport>,
 }
 
 pub fn parse(cache: &mut NodeCache<'static>, source: &str) -> Parse {
     Parser::new(cache, source).run()
+}
+
+/// Render `reports` against `source`, which is labelled `name` (a chunk id
+/// such as `[string "..."]`), with ANSI colors when `color`.
+pub(crate) fn render_reports(
+    reports: &[SyntaxReport],
+    source: &str,
+    name: &str,
+    color: bool,
+) -> String {
+    struct Chunk<'a> {
+        name: &'a str,
+        source: ariadne::Source<&'a str>,
+    }
+
+    impl<'a> ariadne::Cache<()> for Chunk<'a> {
+        type Storage = &'a str;
+
+        fn fetch(&mut self, _: &()) -> Result<&ariadne::Source<&'a str>, impl std::fmt::Debug> {
+            Ok::<_, std::convert::Infallible>(&self.source)
+        }
+
+        fn display<'b>(&self, _: &'b ()) -> Option<impl std::fmt::Display + 'b> {
+            Some(self.name.to_owned())
+        }
+    }
+
+    let mut chunk = Chunk {
+        name,
+        source: ariadne::Source::from(source),
+    };
+    // Byte indices match the lexer's spans; ariadne defaults to chars.
+    let config = ariadne::Config::default()
+        .with_color(color)
+        .with_index_type(ariadne::IndexType::Byte);
+    let mut out = Vec::new();
+    for r in reports {
+        let label = ariadne::Label::new(r.span)
+            .with_message(&r.label)
+            .with_color(ariadne::Color::Red);
+        ariadne::Report::build(ariadne::ReportKind::Error, r.span)
+            .with_config(config)
+            .with_message(&r.message)
+            .with_label(label)
+            .finish()
+            .write(&mut chunk, &mut out)
+            .expect("writing to a Vec cannot fail");
+    }
+    let mut out = String::from_utf8(out).expect("ariadne writes UTF-8");
+    out.truncate(out.trim_end().len());
+    out
 }
 
 struct Parser<'cache, 'source> {
@@ -214,11 +266,7 @@ mod tests {
         parse(&mut cache, src)
             .reports
             .iter()
-            .map(|report| {
-                let mut out = Vec::new();
-                report.write(ariadne::Source::from(src), &mut out).unwrap();
-                String::from_utf8(out).unwrap()
-            })
+            .map(|r| super::render_reports(std::slice::from_ref(r), src, "", false))
             .collect()
     }
 
