@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -25,6 +26,14 @@ fn die(e: &dyn std::fmt::Display) -> ! {
     std::process::exit(1);
 }
 
+/// [`die`] for a load error; syntax errors are drawn in color on a terminal.
+fn die_load(e: &LoadError) -> ! {
+    match e {
+        LoadError::Parse(e) => die(&e.render(std::io::stderr().is_terminal())),
+        e => die(e),
+    }
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -44,7 +53,7 @@ fn main() {
         });
         match listing {
             Ok(listing) => print!("{listing}"),
-            Err(e) => die(&e),
+            Err(e) => die_load(&e),
         }
         return;
     }
@@ -80,7 +89,7 @@ fn main() {
     });
     let ex = match ex {
         Ok(ex) => ex,
-        Err(e) => die(&e),
+        Err(e) => die_load(&e),
     };
 
     if let Err(e) = lua.execute::<()>(&ex) {

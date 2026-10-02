@@ -17,7 +17,15 @@ pub struct State<'cache, 'source> {
     cursor: usize,
     source: &'source str,
     events: Vec<Event>,
-    reports: Vec<ariadne::Report<'static, Span>>,
+    reports: Vec<SyntaxReport>,
+}
+
+/// A syntax error: `message`, with `label` pointing at `span`.
+#[derive(Clone, Debug)]
+pub struct SyntaxReport {
+    pub span: Span,
+    pub message: String,
+    pub label: String,
 }
 
 impl<'cache, 'source> State<'cache, 'source> {
@@ -73,33 +81,23 @@ impl<'cache, 'source> State<'cache, 'source> {
             self.bump();
             true
         } else {
-            self.report(
-                self.new_error()
-                    .with_message("unexpected token")
-                    .with_label(self.new_label().with_message(format!(
-                        "expected token {} but found {}",
-                        kind,
-                        self.at()
-                    )))
-                    .finish(),
+            self.error(
+                "unexpected token",
+                format!("expected token {} but found {}", kind, self.at()),
             );
             false
         }
     }
 
-    /// Every report is a hard error: `ariadne::Report` hides its kind, so
-    /// consumers treat a non-empty report list as a failed parse. Warnings
-    /// would need their own channel rather than this list.
-    pub fn report(&mut self, error: ariadne::Report<'static, Span>) {
-        self.reports.push(error);
-    }
-
-    pub fn new_error(&self) -> ariadne::ReportBuilder<'static, Span> {
-        ariadne::Report::build(ariadne::ReportKind::Error, self.span())
-    }
-
-    pub fn new_label(&self) -> ariadne::Label<Span> {
-        ariadne::Label::new(self.span())
+    /// Report a syntax error at the current token. Every report is a hard
+    /// error: consumers treat a non-empty report list as a failed parse.
+    /// Warnings would need their own channel rather than this list.
+    pub fn error(&mut self, message: impl Into<String>, label: impl Into<String>) {
+        self.reports.push(SyntaxReport {
+            span: self.span(),
+            message: message.into(),
+            label: label.into(),
+        });
     }
 
     fn bump(&mut self) {
@@ -135,7 +133,7 @@ impl<'cache, 'source> State<'cache, 'source> {
         marker.complete(self);
     }
 
-    pub fn finish(self) -> (GreenNode, LineMap, Vec<ariadne::Report<'static, Span>>) {
+    pub fn finish(self) -> (GreenNode, LineMap, Vec<SyntaxReport>) {
         let (tree, lines) = Sink::new(self.cache, self.events, self.source).finish();
         (tree, lines, self.reports)
     }

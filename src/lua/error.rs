@@ -1,18 +1,39 @@
-use ariadne::Report;
 use thiserror::Error;
 
 use crate::compiler::CompileError;
 use crate::lua::stash::StashedError;
-use crate::parser::machinery::Span;
+use crate::parser::{self, SyntaxReport};
 
 #[derive(Debug, Error)]
 pub enum LoadError {
-    #[error("parse error")]
-    Parse(Vec<Report<'static, Span>>),
+    #[error("{0}")]
+    Parse(SyntaxError),
     #[error(transparent)]
     Compile(#[from] CompileError),
     #[error("internal: {0}")]
     Internal(&'static str),
+}
+
+/// A chunk's syntax errors. Displays as the plain-text report, the form a
+/// Lua error message carries.
+#[derive(Debug)]
+pub struct SyntaxError {
+    pub(crate) chunk: String,
+    pub(crate) source: String,
+    pub(crate) reports: Vec<SyntaxReport>,
+}
+
+impl SyntaxError {
+    /// The reports drawn against the source, with ANSI colors when `color`.
+    pub fn render(&self, color: bool) -> String {
+        parser::render_reports(&self.reports, &self.source, &self.chunk, color)
+    }
+}
+
+impl std::fmt::Display for SyntaxError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.render(false))
+    }
 }
 
 #[derive(Debug, Error)]

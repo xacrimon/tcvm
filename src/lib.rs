@@ -23,5 +23,5 @@ pub use compiler::format::format_prototype;
 pub use lua::{
     Context, Executor, ExecutorMode, Fetchable, FromMultiValue, FromValue, IntoMultiValue,
     IntoValue, LoadError, Lua, RuntimeError, Stashable, StashedError, StashedExecutor,
-    StashedFunction, StashedTable, StashedThread, StashedValue, StepResult, TypeError,
+    StashedFunction, StashedTable, StashedThread, StashedValue, StepResult, SyntaxError, TypeError,
 };
