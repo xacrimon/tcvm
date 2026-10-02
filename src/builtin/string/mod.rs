@@ -19,23 +19,6 @@ mod pack;
 mod pattern;
 use pattern::{CapValue, MatchState, PatError};
 
-/// Coerce a string-or-number argument to a `LuaString`, mirroring
-/// `luaL_checkstring` (numbers are accepted and stringified).
-pub(super) fn check_str<'gc>(
-    ctx: Context<'gc>,
-    v: Value<'gc>,
-    fname: &str,
-    n: usize,
-) -> Result<LuaString<'gc>, Error<'gc>> {
-    if let Some(s) = v.get_string() {
-        Ok(s)
-    } else if v.get_integer().is_some() || v.get_float().is_some() {
-        Ok(util::basic_tostring(ctx, v))
-    } else {
-        Err(util::type_error(ctx, fname, n, "string", Some(v)))
-    }
-}
-
 /// Lua's `posrelat`: translate a possibly-negative 1-based string position into
 /// an absolute 1-based position (negatives count from the end; 0 stays 0).
 pub(super) fn posrelat(pos: i64, len: usize) -> i64 {
@@ -89,7 +72,7 @@ fn lua_byte<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let s = check_str(ctx, stack.get(0), "byte", 1)?;
+    let s = util::check_string(ctx, stack.get(0), "byte", 1)?;
     let bytes = s.as_bytes();
     let len = bytes.len();
     let i_arg = stack.get(1);
@@ -189,8 +172,8 @@ fn lua_find<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let s = check_str(ctx, stack.get(0), "find", 1)?;
-    let p = check_str(ctx, stack.get(1), "find", 2)?;
+    let s = util::check_string(ctx, stack.get(0), "find", 1)?;
+    let p = util::check_string(ctx, stack.get(1), "find", 2)?;
     let src = s.as_bytes();
     let pat = p.as_bytes();
 
@@ -1059,8 +1042,8 @@ fn lua_gmatch<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let s = check_str(ctx, stack.get(0), "gmatch", 1)?;
-    let p = check_str(ctx, stack.get(1), "gmatch", 2)?;
+    let s = util::check_string(ctx, stack.get(0), "gmatch", 1)?;
+    let p = util::check_string(ctx, stack.get(1), "gmatch", 2)?;
     let init_arg = stack.get(2);
     let init_raw = if init_arg.is_nil() {
         1
@@ -1149,8 +1132,8 @@ fn lua_gsub<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let s = check_str(ctx, stack.get(0), "gsub", 1)?;
-    let p = check_str(ctx, stack.get(1), "gsub", 2)?;
+    let s = util::check_string(ctx, stack.get(0), "gsub", 1)?;
+    let p = util::check_string(ctx, stack.get(1), "gsub", 2)?;
     let repl = stack.get(2);
     let n_arg = stack.get(3);
     // Default cap is `len+1`: at most one match per position plus the empty
@@ -1162,8 +1145,9 @@ fn lua_gsub<'gc>(
     };
 
     // Fast path: string/number replacement template, fully synchronous.
-    if let Some(template) = repl_template(ctx, repl) {
-        let (result, count) = gsub_string(ctx, s.as_bytes(), p.as_bytes(), &template, max_n)?;
+    if let Some(template) = util::to_lstring(ctx, repl) {
+        let (result, count) =
+            gsub_string(ctx, s.as_bytes(), p.as_bytes(), template.as_bytes(), max_n)?;
         stack.replace(&[result, Value::integer(ctx.mutation(), count)]);
         return Ok(CallbackAction::Return);
     }
@@ -1201,18 +1185,6 @@ fn lua_gsub<'gc>(
         }
     });
     Ok(CallbackAction::sequence(seq))
-}
-
-/// The replacement template for a string/number `repl`, or `None` for other
-/// types. Numbers are stringified (as `lua_tolstring` would).
-fn repl_template<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> Option<Vec<u8>> {
-    if let Some(s) = v.get_string() {
-        Some(s.as_bytes().to_vec())
-    } else if v.get_integer().is_some() || v.get_float().is_some() {
-        Some(util::basic_tostring(ctx, v).as_bytes().to_vec())
-    } else {
-        None
-    }
 }
 
 /// Synchronous `gsub` for a template `repl`. Returns the result string and the
@@ -1499,12 +1471,8 @@ async fn table_index_repl(
 fn classify_repl_result<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> Result<ReplResult, Error<'gc>> {
     if v.is_falsy() {
         Ok(ReplResult::Keep)
-    } else if let Some(s) = v.get_string() {
+    } else if let Some(s) = util::to_lstring(ctx, v) {
         Ok(ReplResult::Bytes(s.as_bytes().to_vec()))
-    } else if v.get_integer().is_some() || v.get_float().is_some() {
-        Ok(ReplResult::Bytes(
-            util::basic_tostring(ctx, v).as_bytes().to_vec(),
-        ))
     } else {
         Err(Error::from_str(
             ctx,
@@ -1525,7 +1493,7 @@ fn lua_len<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let s = check_str(ctx, stack.get(0), "len", 1)?;
+    let s = util::check_string(ctx, stack.get(0), "len", 1)?;
     stack.ret1(Value::integer(ctx.mutation(), s.len() as i64));
     Ok(CallbackAction::Return)
 }
@@ -1536,7 +1504,7 @@ fn lua_lower<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let s = check_str(ctx, stack.get(0), "lower", 1)?;
+    let s = util::check_string(ctx, stack.get(0), "lower", 1)?;
     let lowered: Vec<u8> = s.as_bytes().iter().map(u8::to_ascii_lowercase).collect();
     stack.ret1(Value::string(LuaString::new(ctx, &lowered)));
     Ok(CallbackAction::Return)
@@ -1550,8 +1518,8 @@ fn lua_match<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let s = check_str(ctx, stack.get(0), "match", 1)?;
-    let p = check_str(ctx, stack.get(1), "match", 2)?;
+    let s = util::check_string(ctx, stack.get(0), "match", 1)?;
+    let p = util::check_string(ctx, stack.get(1), "match", 2)?;
     let src = s.as_bytes();
     let pat = p.as_bytes();
 
@@ -1597,14 +1565,10 @@ fn lua_rep<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let s = check_str(ctx, stack.get(0), "rep", 1)?;
+    let s = util::check_string(ctx, stack.get(0), "rep", 1)?;
     let n = util::check_integer(ctx, stack.get(1), "rep", 2)?;
-    let sep_arg = stack.get(2);
-    let sep = if sep_arg.is_nil() {
-        Vec::new()
-    } else {
-        check_str(ctx, sep_arg, "rep", 3)?.as_bytes().to_vec()
-    };
+    let sep = util::opt_string(ctx, stack.get(2), "rep", 3)?
+        .map_or(Vec::new(), |s| s.as_bytes().to_vec());
     let out = if n <= 0 {
         Vec::new()
     } else {
@@ -1643,7 +1607,7 @@ fn lua_reverse<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let s = check_str(ctx, stack.get(0), "reverse", 1)?;
+    let s = util::check_string(ctx, stack.get(0), "reverse", 1)?;
     let mut bytes = s.as_bytes().to_vec();
     bytes.reverse();
     stack.ret1(Value::string(LuaString::new(ctx, &bytes)));
@@ -1657,7 +1621,7 @@ fn lua_sub<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let s = check_str(ctx, stack.get(0), "sub", 1)?;
+    let s = util::check_string(ctx, stack.get(0), "sub", 1)?;
     let bytes = s.as_bytes();
     let len = bytes.len();
     let i_arg = stack.get(1);
@@ -1689,7 +1653,7 @@ fn lua_upper<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let s = check_str(ctx, stack.get(0), "upper", 1)?;
+    let s = util::check_string(ctx, stack.get(0), "upper", 1)?;
     let uppered: Vec<u8> = s.as_bytes().iter().map(u8::to_ascii_uppercase).collect();
     stack.ret1(Value::string(LuaString::new(ctx, &uppered)));
     Ok(CallbackAction::Return)

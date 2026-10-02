@@ -6,7 +6,7 @@
 //! padding-before)`. `pack` writes values + zero padding, `unpack` reads them
 //! back (and returns the next byte position), `packsize` only sums sizes.
 
-use super::{check_str, posrelat};
+use super::posrelat;
 use crate::Context;
 use crate::builtin::util;
 use crate::env::{Error, LuaString, NativeClosure, Stack, Value};
@@ -267,7 +267,7 @@ pub(super) fn lua_pack<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let fmt = check_str(ctx, stack.get(0), "pack", 1)?;
+    let fmt = util::check_string(ctx, stack.get(0), "pack", 1)?;
     let fmt = fmt.as_bytes();
     let mut h = Header {
         little: NATIVE_LITTLE,
@@ -318,7 +318,7 @@ pub(super) fn lua_pack<'gc>(
                 }
             }
             KOption::Char => {
-                let s = check_str(ctx, stack.get(arg - 1), "pack", arg)?;
+                let s = util::check_string(ctx, stack.get(arg - 1), "pack", arg)?;
                 let b = s.as_bytes();
                 if b.len() > size {
                     return Err(util::arg_error(
@@ -339,7 +339,7 @@ pub(super) fn lua_pack<'gc>(
                 out.resize(out.len() + pad, 0);
             }
             KOption::Str => {
-                let s = check_str(ctx, stack.get(arg - 1), "pack", arg)?;
+                let s = util::check_string(ctx, stack.get(arg - 1), "pack", arg)?;
                 let b = s.as_bytes();
                 let len = b.len();
                 if size < SZINT && (len as u64) >= (1u64 << (size * 8)) {
@@ -354,7 +354,7 @@ pub(super) fn lua_pack<'gc>(
                 out.extend_from_slice(b);
             }
             KOption::Zstr => {
-                let s = check_str(ctx, stack.get(arg - 1), "pack", arg)?;
+                let s = util::check_string(ctx, stack.get(arg - 1), "pack", arg)?;
                 let b = s.as_bytes();
                 if b.contains(&0) {
                     return Err(util::arg_error(ctx, "pack", arg, "string contains zeros"));
@@ -379,7 +379,7 @@ pub(super) fn lua_packsize<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let fmt = check_str(ctx, stack.get(0), "packsize", 1)?;
+    let fmt = util::check_string(ctx, stack.get(0), "packsize", 1)?;
     let fmt = fmt.as_bytes();
     let mut h = Header {
         little: NATIVE_LITTLE,
@@ -422,9 +422,9 @@ pub(super) fn lua_unpack<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let fmt = check_str(ctx, stack.get(0), "unpack", 1)?;
+    let fmt = util::check_string(ctx, stack.get(0), "unpack", 1)?;
     let fmt = fmt.as_bytes();
-    let data = check_str(ctx, stack.get(1), "unpack", 2)?;
+    let data = util::check_string(ctx, stack.get(1), "unpack", 2)?;
     let data = data.as_bytes();
     let ld = data.len();
 
