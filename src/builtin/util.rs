@@ -346,15 +346,33 @@ impl<'gc> Sequence<'gc> for AdjustResults {
 }
 
 // ---------------------------------------------------------------------------
-// Metamethod-aware access for async natives (`lua_geti`, `lua_seti`,
-// `luaL_len`). Values move through the native's stack window, as in the C API.
+// Metamethod-aware access for async natives (`lua_geti`, `lua_getfield`,
+// `lua_seti`, `lua_setfield`, `luaL_len`). Values move through the native's
+// stack window, as in the C API.
 // ---------------------------------------------------------------------------
 
 /// `lua_geti`: push `stack[idx][i]`, going through `__index`.
 pub(crate) async fn geti(seq: &mut AsyncSequence, idx: usize, i: i64) -> Result<(), StashedError> {
+    get(seq, idx, |ctx| Value::integer(ctx.mutation(), i)).await
+}
+
+/// `lua_getfield`: push `stack[idx][k]`, going through `__index`.
+pub(crate) async fn getfield(
+    seq: &mut AsyncSequence,
+    idx: usize,
+    k: &[u8],
+) -> Result<(), StashedError> {
+    get(seq, idx, |ctx| Value::string(LuaString::new(ctx, k))).await
+}
+
+async fn get(
+    seq: &mut AsyncSequence,
+    idx: usize,
+    key: impl for<'gc> FnOnce(Context<'gc>) -> Value<'gc>,
+) -> Result<(), StashedError> {
     let call = seq.try_enter(|ctx, locals, _exec, mut stack| {
         let t = stack.get(idx);
-        let key = Value::integer(ctx.mutation(), i);
+        let key = key(ctx);
         if let Some(tbl) = t.get_table() {
             let v = tbl.raw_get(key);
             if !v.is_nil() {
@@ -395,11 +413,29 @@ pub(crate) async fn geti(seq: &mut AsyncSequence, idx: usize, i: i64) -> Result<
 /// `lua_seti`: pop the top value into `stack[idx][i]`, going through
 /// `__newindex`.
 pub(crate) async fn seti(seq: &mut AsyncSequence, idx: usize, i: i64) -> Result<(), StashedError> {
+    set(seq, idx, |ctx| Value::integer(ctx.mutation(), i)).await
+}
+
+/// `lua_setfield`: pop the top value into `stack[idx][k]`, going through
+/// `__newindex`.
+pub(crate) async fn setfield(
+    seq: &mut AsyncSequence,
+    idx: usize,
+    k: &[u8],
+) -> Result<(), StashedError> {
+    set(seq, idx, |ctx| Value::string(LuaString::new(ctx, k))).await
+}
+
+async fn set(
+    seq: &mut AsyncSequence,
+    idx: usize,
+    key: impl for<'gc> FnOnce(Context<'gc>) -> Value<'gc>,
+) -> Result<(), StashedError> {
     let call = seq.try_enter(|ctx, locals, _exec, mut stack| {
         let t = stack.get(idx);
         let v = stack.pop();
         let top = stack.len();
-        let key = Value::integer(ctx.mutation(), i);
+        let key = key(ctx);
         // Tables without `__newindex` skip `walk_newindex_chain`, which would
         // look the key up first for nothing.
         if let Some(tbl) = t.get_table()
