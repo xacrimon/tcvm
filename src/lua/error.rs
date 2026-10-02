@@ -11,6 +11,11 @@ pub enum LoadError {
     /// `chunk` is the chunk id the message is prefixed with, as in Lua.
     #[error("{chunk}:{}: {}", .error.line_number, .error.kind)]
     Compile { chunk: String, error: CompileError },
+    /// The file couldn't be opened or read.
+    #[error("{0}")]
+    File(String),
+    #[error("{chunk}: chunk is not valid UTF-8")]
+    NotUtf8 { chunk: String },
     #[error("internal: {0}")]
     Internal(&'static str),
 }
@@ -66,4 +71,14 @@ pub enum TypeError {
     },
     #[error("expected {expected} value(s), got {got}")]
     Arity { expected: usize, got: usize },
+}
+
+/// Bare `strerror(errno)` text for an error: Rust's `Display` appends
+/// " (os error N)", which Lua (using `strerror`) omits, so strip it.
+pub(crate) fn bare_io_msg(e: &std::io::Error) -> String {
+    let raw = e.to_string();
+    match raw.find(" (os error ") {
+        Some(cut) => raw[..cut].to_string(),
+        None => raw,
+    }
 }

@@ -10,6 +10,7 @@ pub(crate) mod stash;
 
 pub use context::Context;
 pub use convert::{FromMultiValue, FromValue, IntoMultiValue, IntoValue};
+pub(crate) use error::bare_io_msg;
 pub use error::{LoadError, RuntimeError, SyntaxError, TypeError};
 pub use executor::{Executor, ExecutorMode, StepResult};
 pub use stash::{

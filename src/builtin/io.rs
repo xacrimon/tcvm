@@ -27,6 +27,7 @@ use crate::dmm::Gc;
 use crate::env::{
     Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Userdata, Value,
 };
+use crate::lua::bare_io_msg;
 use crate::vm::sequence::CallbackAction;
 
 // ---------------------------------------------------------------------------
@@ -633,16 +634,6 @@ fn open_file<'gc>(
         file_metatable(ctx, closure),
         LuaFile::open(Stream::File(BufReader::new(file)), readable, writable),
     ))
-}
-
-/// Bare `strerror(errno)` text for an error: Rust's `Display` appends
-/// " (os error N)", which Lua (using `strerror`) omits, so strip it.
-fn bare_io_msg(e: &std::io::Error) -> String {
-    let raw = e.to_string();
-    match raw.find(" (os error ") {
-        Some(cut) => raw[..cut].to_string(),
-        None => raw,
-    }
 }
 
 /// The l_checkmode regex `[rwa]\+?b*` — the only mode strings Lua's `io.open`
