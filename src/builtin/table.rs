@@ -145,16 +145,8 @@ fn concat_args<'gc>(
     stack: &Stack<'gc, '_>,
     last: i64,
 ) -> Result<(Vec<u8>, i64, i64), Error<'gc>> {
-    let sep_arg = stack.get(1);
-    let sep = if sep_arg.is_nil() {
-        Vec::new()
-    } else if let Some(s) = sep_arg.get_string() {
-        s.as_bytes().to_vec()
-    } else if sep_arg.get_integer().is_some() || sep_arg.get_float().is_some() {
-        util::basic_tostring(ctx, sep_arg).as_bytes().to_vec()
-    } else {
-        return Err(util::type_error(ctx, "concat", 2, "string", Some(sep_arg)));
-    };
+    let sep = util::opt_string(ctx, stack.get(1), "concat", 2)?
+        .map_or(Vec::new(), |s| s.as_bytes().to_vec());
     let i_arg = stack.get(2);
     let i = if i_arg.is_nil() {
         1

@@ -564,6 +564,40 @@ pub(crate) fn check_integer<'gc>(
     Err(type_error(ctx, fname, n, "number", Some(v)))
 }
 
+/// `lua_tolstring` without metamethods: strings, and numbers converted.
+pub(crate) fn to_lstring<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> Option<LuaString<'gc>> {
+    if let Some(s) = v.get_string() {
+        Some(s)
+    } else if v.get_integer().is_some() || v.get_float().is_some() {
+        Some(basic_tostring(ctx, v))
+    } else {
+        None
+    }
+}
+
+/// `luaL_checkstring`: a string, or a number converted.
+pub(crate) fn check_string<'gc>(
+    ctx: Context<'gc>,
+    v: Value<'gc>,
+    fname: &str,
+    n: usize,
+) -> Result<LuaString<'gc>, Error<'gc>> {
+    to_lstring(ctx, v).ok_or_else(|| type_error(ctx, fname, n, "string", Some(v)))
+}
+
+/// `luaL_optstring`: [`check_string`], or `None` for nil.
+pub(crate) fn opt_string<'gc>(
+    ctx: Context<'gc>,
+    v: Value<'gc>,
+    fname: &str,
+    n: usize,
+) -> Result<Option<LuaString<'gc>>, Error<'gc>> {
+    if v.is_nil() {
+        return Ok(None);
+    }
+    check_string(ctx, v, fname, n).map(Some)
+}
+
 pub(crate) fn to_number<'gc>(v: Value<'gc>) -> Option<f64> {
     if let Some(i) = v.get_integer() {
         Some(i as f64)

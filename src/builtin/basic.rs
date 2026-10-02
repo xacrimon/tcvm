@@ -596,19 +596,15 @@ fn lua_type<'gc>(
 fn lua_warn<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
-    stack: Stack<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     if stack.is_empty() {
         return Err(util::type_error(ctx, "warn", 1, "string", None));
     }
     for i in 0..stack.len() {
-        let v = stack.get(i);
-        // `luaL_checkstring` coerces numbers to their string form, so integers
-        // and floats are accepted; only truly non-coercible types error.
-        if v.get_string().is_none() && v.get_integer().is_none() && v.get_float().is_none() {
-            return Err(util::type_error(ctx, "warn", i + 1, "string", Some(v)));
-        }
+        util::check_string(ctx, stack.get(i), "warn", i + 1)?;
     }
+    stack.clear();
     Ok(CallbackAction::Return)
 }
 

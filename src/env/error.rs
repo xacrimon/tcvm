@@ -100,9 +100,7 @@ impl<'gc> Error<'gc> {
     /// The error value as `lua_tostring` sees it: a string, a number as a
     /// string, or `None` for anything else.
     pub fn as_text(self, ctx: Context<'gc>) -> Option<LuaString<'gc>> {
-        let v = self.value();
-        (v.get_string().is_some() || v.get_integer().is_some() || v.get_float().is_some())
-            .then(|| crate::builtin::util::basic_tostring(ctx, v))
+        crate::builtin::util::to_lstring(ctx, self.value())
     }
 
     /// The error as a host-printable message, following `lua.c`'s
