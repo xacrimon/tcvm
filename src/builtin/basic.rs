@@ -108,12 +108,22 @@ fn lua_collectgarbage<'gc>(
     Ok(CallbackAction::Return)
 }
 
+/// `dofile([filename])` — run a file's chunk (stdin without a filename) and
+/// return its results. A load error is raised.
 fn lua_dofile<'gc>(
-    _ctx: Context<'gc>,
+    ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
-    _stack: Stack<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    let fname = util::opt_string(ctx, stack.get(0), "dofile", 1)?;
+    let path = fname.map(|f| f.as_bytes());
+    match ctx.load_file_with(path, Value::table(ctx.globals())) {
+        Ok(f) => {
+            stack.replace(&[Value::function(f)]);
+            Ok(CallbackAction::call(None))
+        }
+        Err(e) => Err(Error::new(ctx, load_error_value(ctx, &e))),
+    }
 }
 
 /// `error(message [, level])`. The position prefix for `level >= 1` is
@@ -345,12 +355,20 @@ fn check_mode<'gc>(
     Err(util::arg_error(ctx, fname, n, msg))
 }
 
+/// `loadfile([filename [, mode [, env]]])` — `load` for a file's contents
+/// (stdin without a filename).
 fn lua_loadfile<'gc>(
-    _ctx: Context<'gc>,
+    ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
-    _stack: Stack<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    let fname = util::opt_string(ctx, stack.get(0), "loadfile", 1)?;
+    check_mode(ctx, stack.get(1), "loadfile", 2)?;
+    let env = env_arg(ctx, &stack, 2);
+    let path = fname.map(|f| f.as_bytes());
+    let loaded = ctx.load_file_with(path, env);
+    push_loaded(ctx, &mut stack, loaded);
+    Ok(CallbackAction::Return)
 }
 
 /// `next(t [, k])` — `(k', t[k'])` for the entry after `k` in traversal
