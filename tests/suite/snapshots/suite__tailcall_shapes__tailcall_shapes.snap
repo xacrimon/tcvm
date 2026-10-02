@@ -1,5 +1,5 @@
 ---
-source: tests/tailcall_shapes.rs
+source: tests/suite/tailcall_shapes.rs
 expression: out
 ---
 1,nil

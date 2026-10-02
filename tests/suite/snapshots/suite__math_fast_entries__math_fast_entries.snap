@@ -1,5 +1,5 @@
 ---
-source: tests/math_fast_entries.rs
+source: tests/suite/math_fast_entries.rs
 expression: out
 ---
 sqrt(integer:0)=float:0
