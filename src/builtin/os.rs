@@ -48,12 +48,10 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         ("clock", lua_clock),
         ("date", lua_date),
         ("difftime", lua_difftime),
-        ("execute", lua_execute),
         ("exit", lua_exit),
         ("getenv", lua_getenv),
         ("remove", lua_remove),
         ("rename", lua_rename),
-        ("setlocale", lua_setlocale),
         ("time", lua_time),
         ("tmpname", lua_tmpname),
     ];
@@ -64,6 +62,7 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         let key = Value::string(LuaString::new(ctx, name.as_bytes()));
         lib.raw_set(ctx, key, Value::function(handler));
     }
+    util::set_not_implemented(ctx, lib, "os", &["execute", "setlocale"]);
 
     let lib_name = Value::string(LuaString::new(ctx, b"os"));
     ctx.globals().raw_set(ctx, lib_name, Value::table(lib));
@@ -222,14 +221,6 @@ fn lua_difftime<'gc>(
     Ok(CallbackAction::Return)
 }
 
-fn lua_execute<'gc>(
-    _ctx: Context<'gc>,
-    _closure: &NativeClosure<'gc>,
-    _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
-}
-
 /// `exit([code [, close]])` — terminate the process. `code` may be a boolean
 /// (`true`→0, `false`→1), an integer status, or nil (0). The `close` flag is
 /// ignored (we always run normal process teardown).
@@ -304,14 +295,6 @@ fn lua_rename<'gc>(
     // error message carries no filename prefix.
     file_result(ctx, &mut stack, res, None);
     Ok(CallbackAction::Return)
-}
-
-fn lua_setlocale<'gc>(
-    ctx: Context<'gc>,
-    _closure: &NativeClosure<'gc>,
-    _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    Err(Error::from_str(ctx, "os.setlocale is not implemented"))
 }
 
 /// `time([table])` — the current time, or the time the date table names

@@ -5,12 +5,12 @@
 use std::pin::Pin;
 
 use crate::dmm::{Collect, Gc, Mutation, Trace};
-use crate::env::{Error, LuaString, MetamethodBits, Stack, Value};
+use crate::env::{Error, Function, LuaString, MetamethodBits, NativeClosure, Stack, Table, Value};
 use crate::lua::{Context, StashedError};
 use crate::vm::async_sequence::AsyncSequence;
 use crate::vm::debug::object_type_name;
 use crate::vm::interp::{IndexChain, NewIndexChain, walk_index_chain, walk_newindex_chain};
-use crate::vm::sequence::{Execution, Sequence, SequencePoll};
+use crate::vm::sequence::{CallbackAction, Execution, Sequence, SequencePoll};
 
 /// Append the canonical Lua textual form of an integer.
 pub(crate) fn push_int(out: &mut Vec<u8>, i: i64) {
@@ -508,6 +508,39 @@ fn index_error<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> Error<'gc> {
         ctx,
         &format!("attempt to index a {} value", object_type_name(ctx, v)),
     )
+}
+
+/// A library function tcvm doesn't implement yet: calling it raises
+/// "`name` is not implemented".
+pub(crate) fn not_implemented<'gc>(ctx: Context<'gc>, name: &str) -> Function<'gc> {
+    let name = Value::string(LuaString::new(ctx, name.as_bytes()));
+    Function::new_native(ctx.mutation(), raise_not_implemented, &[name])
+}
+
+fn raise_not_implemented<'gc>(
+    ctx: Context<'gc>,
+    closure: &NativeClosure<'gc>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
+    let name = closure.upvalues[0]
+        .get_string()
+        .map_or(&[][..], |s| s.as_bytes());
+    let name = String::from_utf8_lossy(name);
+    Err(Error::from_str(ctx, &format!("{name} is not implemented")))
+}
+
+/// Set each of `names` in `lib` to [`not_implemented`], named `lib_name.name`.
+pub(crate) fn set_not_implemented<'gc>(
+    ctx: Context<'gc>,
+    lib: Table<'gc>,
+    lib_name: &str,
+    names: &[&str],
+) {
+    for name in names {
+        let stub = not_implemented(ctx, &format!("{lib_name}.{name}"));
+        let key = Value::string(LuaString::new(ctx, name.as_bytes()));
+        lib.raw_set(ctx, key, Value::function(stub));
+    }
 }
 
 /// An error the VM itself would raise (`luaG_runerror`): raised from a native

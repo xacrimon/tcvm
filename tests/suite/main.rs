@@ -38,6 +38,7 @@ mod native_calls_lua;
 mod next_dead_boxed_key;
 mod next_pairs;
 mod not_andor;
+mod not_implemented;
 mod numeric_for;
 mod opcode_errors;
 mod os_clock;
