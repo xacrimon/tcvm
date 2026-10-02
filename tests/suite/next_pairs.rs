@@ -3,8 +3,9 @@
 //! sorted `k=v` lists. Expected strings come from `lua` 5.5.1 on the same
 //! snippets.
 
-use tcvm::env::LuaString;
-use tcvm::{Executor, LoadError, Lua, RuntimeError};
+use tcvm::{Executor, LoadError, Lua};
+
+use crate::common::ok;
 
 fn run_i64(src: &str) -> i64 {
     let mut lua = Lua::new();
@@ -16,24 +17,6 @@ fn run_i64(src: &str) -> i64 {
         })
         .expect("load");
     lua.execute(&ex).expect("run")
-}
-
-/// The string `src` returns.
-fn run_str(src: &str) -> String {
-    let mut lua = Lua::new();
-    lua.load_all();
-    let ex = lua
-        .try_enter(|ctx| -> Result<_, LoadError> {
-            let chunk = ctx.load(src, Some("=t"))?;
-            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
-        })
-        .expect("load");
-    lua.finish(&ex).expect("run");
-    lua.try_enter(|ctx| {
-        let s = ctx.fetch(&ex).take_result::<LuaString>(ctx)?;
-        Ok::<_, RuntimeError>(String::from_utf8_lossy(s.as_bytes()).into_owned())
-    })
-    .expect("result")
 }
 
 /// Live GC bytes after running `src` to completion and a full collection.
@@ -60,7 +43,7 @@ end\n";
 
 /// Run `body` with `keys` in scope; it returns `n:k=v k=v …` for a table.
 fn keys(body: &str) -> String {
-    run_str(&format!("{KEYS}{body}"))
+    ok(&format!("{KEYS}{body}"))
 }
 
 fn check(src: &str) {
@@ -69,7 +52,7 @@ fn check(src: &str) {
 
 /// Message of the error `call` raises under `pcall`.
 fn err_msg(call: &str) -> String {
-    run_str(&format!("return select(2, pcall({call}))"))
+    ok(&format!("return select(2, pcall({call}))"))
 }
 
 #[test]
@@ -128,8 +111,7 @@ fn clear_dict_mode_mid_traversal() {
 #[test]
 fn clear_full_hash_mid_traversal() {
     assert_eq!(
-        run_str(
-            "local bad = {}
+        ok("local bad = {}
              for n = 1, 256 do
                local m, d = {}, {}
                for i = 1, n do m[-i] = i d['k' .. i] = i end
@@ -140,8 +122,7 @@ fn clear_full_hash_mid_traversal() {
                for k in pairs(d) do d[k] = nil d.absent = nil c = c + 1 end
                if c ~= n or next(d) ~= nil then bad[#bad + 1] = 'd' .. n end
              end
-             return table.concat(bad, ' ')"
-        ),
+             return table.concat(bad, ' ')"),
         ""
     );
 }

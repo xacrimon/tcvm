@@ -1,17 +1,10 @@
 //! Execution coverage for the generic `for ... in ... do` loop: the control
 //! register layout (TFORCALL/TFORLOOP) and multi-value iterator adjustment.
 
-use tcvm::{Executor, LoadError, Lua};
+use crate::common::eval;
 
 fn run(src: &str) -> i64 {
-    let mut lua = Lua::new();
-    let ex = lua
-        .try_enter(|ctx| -> Result<_, LoadError> {
-            let chunk = ctx.load(src, Some("generic_for"))?;
-            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
-        })
-        .expect("load");
-    lua.execute(&ex).expect("run")
+    eval(src)
 }
 
 #[test]

@@ -5,26 +5,14 @@
 
 use tcvm::{Executor, LoadError, Lua};
 
+use crate::common::eval;
+
 fn eval_bool(src: &str) -> bool {
-    let mut lua = Lua::new();
-    let ex = lua
-        .try_enter(|ctx| -> Result<_, LoadError> {
-            let chunk = ctx.load(src, Some("not_andor"))?;
-            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
-        })
-        .expect("load");
-    lua.execute::<bool>(&ex).expect("run")
+    eval(src)
 }
 
 fn eval_int(src: &str) -> i64 {
-    let mut lua = Lua::new();
-    let ex = lua
-        .try_enter(|ctx| -> Result<_, LoadError> {
-            let chunk = ctx.load(src, Some("not_andor"))?;
-            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
-        })
-        .expect("load");
-    lua.execute::<i64>(&ex).expect("run")
+    eval(src)
 }
 
 #[test]

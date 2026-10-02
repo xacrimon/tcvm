@@ -2,18 +2,11 @@
 //! the optimized below-base form and the materialized-table form, plus the
 //! mutation-visibility semantics the table form must honor (manual §3.4).
 
-use tcvm::{Executor, LoadError, Lua};
+use crate::common::eval;
 
 /// Compile and run `src`, returning the first integer result.
 fn run(src: &str) -> i64 {
-    let mut lua = Lua::new();
-    let ex = lua
-        .try_enter(|ctx| -> Result<_, LoadError> {
-            let chunk = ctx.load(src, Some("vararg_test"))?;
-            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
-        })
-        .expect("load");
-    lua.execute(&ex).expect("run")
+    eval(src)
 }
 
 #[test]

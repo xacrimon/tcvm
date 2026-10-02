@@ -1,41 +1,11 @@
 //! Per-type metatables (`G(L)->mt` in PUC Lua): every value of a type other
 //! than table and userdata shares one metatable slot.
 
+use tcvm::Lua;
 use tcvm::dmm::Gc;
 use tcvm::env::{LuaString, Table, Value};
-use tcvm::{Executor, LoadError, Lua, RuntimeError};
 
-/// Expected strings below come from `lua` 5.5.1 running the same chunk.
-fn run(src: &str) -> Result<String, String> {
-    let mut lua = Lua::new();
-    lua.load_all();
-    let ex = lua
-        .try_enter(|ctx| -> Result<_, LoadError> {
-            let chunk = ctx.load(src, Some("=c"))?;
-            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
-        })
-        .expect("load");
-    let as_string = |v: Value<'_>| {
-        let s = v.get_string().expect("string value");
-        String::from_utf8_lossy(s.as_bytes()).into_owned()
-    };
-    match lua.finish(&ex) {
-        Ok(()) => Ok(lua.enter(|ctx| {
-            let v = ctx.fetch(&ex).take_result::<Value>(ctx).expect("result");
-            as_string(v)
-        })),
-        Err(RuntimeError::Lua(e)) => Err(lua.enter(|ctx| as_string(ctx.fetch(&e).value()))),
-        Err(e) => panic!("unexpected failure for {src:?}: {e:?}"),
-    }
-}
-
-fn ok(src: &str) -> String {
-    run(src).unwrap_or_else(|e| panic!("{src:?} raised {e:?}"))
-}
-
-fn err(src: &str) -> String {
-    run(src).expect_err(src)
-}
+use crate::common::{err, ok};
 
 #[test]
 fn integers_and_floats_share_the_number_slot() {

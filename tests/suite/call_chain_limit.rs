@@ -2,8 +2,7 @@
 //! allows, and argument counts that outgrow the CALL instruction's 8 bits.
 //! Expected strings come from `lua` 5.5.1 running the same chunks.
 
-use tcvm::env::Value;
-use tcvm::{Executor, LoadError, Lua, RuntimeError};
+use crate::common;
 
 const PRELUDE: &str = "local function chain(n)
   local c = function(...) return select('#', ...) end
@@ -12,33 +11,12 @@ const PRELUDE: &str = "local function chain(n)
 end
 ";
 
-fn run(body: &str) -> Result<String, String> {
-    let src = format!("{PRELUDE}{body}");
-    let mut lua = Lua::new();
-    lua.load_all();
-    let ex = lua
-        .try_enter(|ctx| -> Result<_, LoadError> {
-            let chunk = ctx.load(&src, Some("=c"))?;
-            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
-        })
-        .expect("load");
-    let show = |v: Value<'_>| {
-        let s = v.get_string().expect("string value");
-        String::from_utf8_lossy(s.as_bytes()).into_owned()
-    };
-    match lua.finish(&ex) {
-        Ok(()) => Ok(lua.enter(|ctx| show(ctx.fetch(&ex).take_result::<Value>(ctx).unwrap()))),
-        Err(RuntimeError::Lua(e)) => Err(lua.enter(|ctx| show(ctx.fetch(&e).value()))),
-        Err(e) => panic!("unexpected failure for {body:?}: {e:?}"),
-    }
-}
-
 fn ok(body: &str) -> String {
-    run(body).unwrap_or_else(|e| panic!("{body:?} raised {e:?}"))
+    common::ok(&format!("{PRELUDE}{body}"))
 }
 
 fn err(body: &str) -> String {
-    run(body).expect_err(body)
+    common::err(&format!("{PRELUDE}{body}"))
 }
 
 #[test]

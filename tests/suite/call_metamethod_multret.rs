@@ -2,18 +2,10 @@
 //! count lives in `thread.top`, which the receiver shift must extend.
 //! Regression for #46.
 
-use tcvm::{Executor, LoadError, Lua};
+use crate::common::eval;
 
 fn run(src: &str) -> i64 {
-    let mut lua = Lua::new();
-    lua.load_all();
-    let ex = lua
-        .try_enter(|ctx| -> Result<_, LoadError> {
-            let chunk = ctx.load(src, Some("call_mm_multret"))?;
-            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
-        })
-        .expect("load");
-    lua.execute(&ex).expect("run")
+    eval(src)
 }
 
 const PRELUDE: &str = "local c = setmetatable({}, {__call = function(self, ...) return select('#', ...), ... end})\n\

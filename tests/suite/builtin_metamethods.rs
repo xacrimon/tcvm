@@ -3,25 +3,7 @@
 //! caller's continuation. Expected strings come from `lua` 5.5.1 on the same
 //! chunk, which hands its result to the host with `error(v, 0)`.
 
-use tcvm::{Executor, LoadError, Lua, RuntimeError};
-
-fn raised(src: &str) -> String {
-    let mut lua = Lua::new();
-    lua.load_all();
-    let ex = lua
-        .try_enter(|ctx| -> Result<_, LoadError> {
-            let chunk = ctx.load(src, Some("=t"))?;
-            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
-        })
-        .expect("load");
-    match lua.execute::<()>(&ex) {
-        Err(RuntimeError::Lua(stashed)) => lua.enter(|ctx| {
-            let s = ctx.fetch(&stashed).value().get_string().expect("string");
-            String::from_utf8_lossy(s.as_bytes()).into_owned()
-        }),
-        other => panic!("expected a Lua error, got {other:?}"),
-    }
-}
+use crate::common::err;
 
 /// One case per continuation kind: `__index` stores the first result,
 /// `__newindex` drops it, the iterator fills the loop variables and `__lt`
@@ -43,5 +25,5 @@ fn pcall_as_metamethod_and_iterator() {
         out[#out + 1] = tostring(u < u)
         error(table.concat(out, ", "), 0)
     "#;
-    assert_eq!(raised(src), "true, y=2, true 1, false");
+    assert_eq!(err(src), "true, y=2, true 1, false");
 }

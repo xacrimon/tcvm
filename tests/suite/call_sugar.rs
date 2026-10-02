@@ -1,18 +1,10 @@
 //! `f"str"`, `f[[str]]` and `f{...}` call forms (manual §3.4.10). Regression
 //! for #69.
 
-use tcvm::{Executor, LoadError, Lua};
+use crate::common::eval;
 
 fn run(src: &str) -> i64 {
-    let mut lua = Lua::new();
-    lua.load_all();
-    let ex = lua
-        .try_enter(|ctx| -> Result<_, LoadError> {
-            let chunk = ctx.load(src, Some("call_sugar"))?;
-            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
-        })
-        .expect("load");
-    lua.execute(&ex).expect("run")
+    eval(src)
 }
 
 #[test]

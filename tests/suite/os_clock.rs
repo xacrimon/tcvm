@@ -1,18 +1,10 @@
 //! `os.clock` reports process CPU time via C `clock()`. The value itself is
 //! machine-dependent, so only its shape is checked.
 
-use tcvm::{Executor, LoadError, Lua};
+use crate::common::eval;
 
 fn run_bool(src: &str) -> bool {
-    let mut lua = Lua::new();
-    lua.load_all();
-    let ex = lua
-        .try_enter(|ctx| -> Result<_, LoadError> {
-            let chunk = ctx.load(src, Some("os_clock_test"))?;
-            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
-        })
-        .expect("load");
-    lua.execute::<bool>(&ex).expect("run")
+    eval(src)
 }
 
 #[test]

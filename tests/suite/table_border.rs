@@ -1,18 +1,10 @@
 //! `#t` must return a border after array slots are cleared (manual §3.4.7).
 //! Regression for #97.
 
-use tcvm::{Executor, LoadError, Lua};
+use crate::common::eval;
 
 fn run(src: &str) -> i64 {
-    let mut lua = Lua::new();
-    lua.load_all();
-    let ex = lua
-        .try_enter(|ctx| -> Result<_, LoadError> {
-            let chunk = ctx.load(src, Some("table_border"))?;
-            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
-        })
-        .expect("load");
-    lua.execute(&ex).expect("run")
+    eval(src)
 }
 
 #[test]
