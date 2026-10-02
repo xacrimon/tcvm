@@ -7,6 +7,7 @@ pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[
         ("getmetatable", lua_getmetatable),
         ("setmetatable", lua_setmetatable),
+        ("traceback", lua_traceback),
     ];
 
     let lib = Table::new(ctx);
@@ -31,7 +32,6 @@ pub fn load<'gc>(ctx: Context<'gc>) {
             "setlocal",
             "setupvalue",
             "setuservalue",
-            "traceback",
             "upvalueid",
             "upvaluejoin",
         ],
@@ -78,5 +78,25 @@ fn lua_setmetatable<'gc>(
     };
     ctx.set_metatable_of(v, mt);
     stack.replace(&[v]);
+    Ok(CallbackAction::Return)
+}
+
+/// `debug.traceback([thread,] [msg [, level]])` — `msg` itself, as a string
+/// when it is a number: there are no tracebacks yet (#228), but
+/// handing the message back keeps `xpcall(f, debug.traceback)` working.
+fn lua_traceback<'gc>(
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
+    mut stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
+    let arg = usize::from(stack.get(0).get_thread().is_some());
+    let msg = stack.get(arg);
+    let text = util::to_lstring(ctx, msg);
+    // Like `db_traceback`, a non-string message skips the level check.
+    let level = stack.get(arg + 1);
+    if (text.is_some() || msg.is_nil()) && !level.is_nil() {
+        util::check_integer(ctx, level, "traceback", arg + 2)?;
+    }
+    stack.ret1(text.map_or(msg, Value::string));
     Ok(CallbackAction::Return)
 }
