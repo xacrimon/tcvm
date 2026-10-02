@@ -15,7 +15,7 @@ use crate::dmm::{
     context::Mutation,
     gc_weak::GcWeak,
     static_collect::Static,
-    types::{GcBox, GcBoxHeader, GcBoxInner, GcColor, Invariant},
+    types::{GcBox, GcBoxHeader, GcBoxInner, GcColor, Invariant, TrailingBytes},
 };
 
 /// A garbage collected pointer to a type T. Implements Copy, and is implemented as a plain machine
@@ -91,6 +91,30 @@ impl<'gc, T: Collect<'gc> + 'gc> Gc<'gc, T> {
         Gc {
             ptr: mc.allocate(t),
             _invariant: PhantomData,
+        }
+    }
+}
+
+impl<'gc, T: Collect<'gc> + TrailingBytes + 'gc> Gc<'gc, T> {
+    /// Allocate `t` with `bytes` copied directly after it, in the same allocation.
+    #[inline]
+    pub fn new_with_bytes(mc: &Mutation<'gc>, t: T, bytes: &[u8]) -> Gc<'gc, T> {
+        Gc {
+            ptr: mc.allocate_with_bytes(t, bytes),
+            _invariant: PhantomData,
+        }
+    }
+
+    /// The bytes `this` was allocated with by [`Gc::new_with_bytes`].
+    #[inline]
+    pub fn trailing_bytes(this: Gc<'gc, T>) -> &'gc [u8] {
+        // SAFETY: `TrailingBytes` values are only allocated by `new_with_bytes`, which puts
+        // `trailing_len` bytes at `TRAILING_OFFSET`; `ptr` carries the whole allocation's
+        // provenance. The lifetime is the same as `Gc::as_ref`'s.
+        unsafe {
+            let len = this.ptr.as_ref().value.trailing_len();
+            let start = this.ptr.cast::<u8>().add(GcBoxInner::<T>::TRAILING_OFFSET);
+            core::slice::from_raw_parts(start.as_ptr(), len)
         }
     }
 }

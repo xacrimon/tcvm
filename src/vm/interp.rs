@@ -170,7 +170,17 @@ pub(crate) type Handler = for<'gc> extern "rust-preserve-none" fn(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-);
+) -> Exit;
+
+/// Why the dispatch chain returned to `run_thread`.
+pub(crate) enum Exit {
+    /// The executor takes over from the thread state (return from the entry
+    /// frame, suspension, error).
+    End,
+    /// Allocation crossed the GC check threshold; the host should collect
+    /// before stepping again.
+    Gc,
+}
 
 /// What the caller does with a metamethod's (or generic-for iterator's)
 /// results. Carried by the callee's frame (`HAS_CONT`), or by the `CallSite`
@@ -238,6 +248,18 @@ macro_rules! helpers {
                         $frame,
                         $closure,
                     );
+                }
+            }};
+        }
+
+        /// Exit to the executor once allocation may owe the collector work;
+        /// execution resumes at the next instruction.
+        #[allow(unused_macros)]
+        macro_rules! gc_check {
+            () => {{
+                if std::hint::unlikely($ctx.mutation().metrics().gc_check_due()) {
+                    unsafe { (*$frame).pc = $ip };
+                    return Exit::Gc;
                 }
             }};
         }
@@ -415,7 +437,7 @@ macro_rules! helpers {
                     }
                     // Native target suspended (or errored): the executor will
                     // resume / unwind from the installed frame state.
-                    MetaDispatch::Suspended => return,
+                    MetaDispatch::Suspended => return Exit::End,
                     MetaDispatch::Unresolvable => raise!(OpError::$$err(__mm_meta)),
                     MetaDispatch::StackOverflow => raise!(OpError::StackOverflow),
                 }
@@ -625,7 +647,7 @@ fn fill_ic_for_constant_key<'gc>(
 /// sized `stack` to at least `base + max_stack_size`, and placed
 /// the callee + arguments at `stack[base-1..]`. See `Executor::start`.
 #[inline(never)]
-pub(crate) fn run_thread<'gc>(ctx: Context<'gc>, thread: Thread<'gc>) {
+pub(crate) fn run_thread<'gc>(ctx: Context<'gc>, thread: Thread<'gc>) -> Exit {
     let mut ts = thread.borrow_mut(ctx.mutation());
     let mut ds = DispatchState {
         fault: None,
@@ -647,7 +669,7 @@ pub(crate) fn run_thread<'gc>(ctx: Context<'gc>, thread: Thread<'gc>) {
         &mut ds,
         frame,
         closure,
-    );
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -671,7 +693,7 @@ extern "rust-preserve-none" fn impl_error<'gc>(
     ds: &mut DispatchState<'gc>,
     _frame: *mut LuaFrame<'gc>,
     _closure: LuaFn<'gc>,
-) {
+) -> Exit {
     let kind = ds.fault.take().expect("impl_error without a pending fault");
     // `ip` already points past the faulting instruction (see `dispatch!`),
     // which is the convention `LuaFrame::pc` uses.
@@ -684,6 +706,7 @@ extern "rust-preserve-none" fn impl_error<'gc>(
         }
     };
     thread.raise(ctx, err);
+    Exit::End
 }
 
 // ---------------------------------------------------------------------------
@@ -702,7 +725,7 @@ extern "rust-preserve-none" fn op_move<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (dst, src) = instruction.ab();
     *reg!(ref mut dst) = reg!(src);
@@ -722,7 +745,7 @@ extern "rust-preserve-none" fn op_load<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (dst, idx) = instruction.ad();
     *reg!(ref mut dst) = constant!(idx);
@@ -742,7 +765,7 @@ extern "rust-preserve-none" fn op_lfalseskip<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let src = instruction.a();
     *reg!(ref mut src) = Value::boolean(false);
@@ -766,7 +789,7 @@ extern "rust-preserve-none" fn op_getupval<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (dst, idx) = instruction.ab();
     let uv = upvalue!(idx);
@@ -786,7 +809,7 @@ extern "rust-preserve-none" fn op_setupval<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (src, idx) = instruction.ab();
     let val = reg!(src);
@@ -812,7 +835,7 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (dst, idx, ic_idx, _key) = instruction.abde();
     let uv = upvalue!(idx);
@@ -850,7 +873,7 @@ extern "rust-preserve-none" fn gettabup_slow<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (dst, idx, ic_idx, key) = instruction.abde();
     let uv = upvalue!(idx);
@@ -875,7 +898,7 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (src, idx, ic_idx, key) = instruction.abde();
     let uv = upvalue!(idx);
@@ -917,7 +940,7 @@ extern "rust-preserve-none" fn settabup_slow<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (src, idx, ic_idx, key) = instruction.abde();
     let uv = upvalue!(idx);
@@ -947,7 +970,7 @@ extern "rust-preserve-none" fn op_gettable<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (dst, table, key) = instruction.abc();
 
@@ -984,7 +1007,7 @@ extern "rust-preserve-none" fn gettable_slow<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (dst, table, key) = instruction.abc();
     let recv = reg!(table);
@@ -1005,7 +1028,7 @@ extern "rust-preserve-none" fn op_settable<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (src, table, key) = instruction.abc();
 
@@ -1042,7 +1065,7 @@ extern "rust-preserve-none" fn settable_slow<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (src, table, key) = instruction.abc();
     let (recv, k, v) = (reg!(table), reg!(key), reg!(src));
@@ -1062,7 +1085,7 @@ extern "rust-preserve-none" fn op_getfield<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (dst, table, ic_idx, _key_idx) = instruction.abde();
 
@@ -1099,7 +1122,7 @@ extern "rust-preserve-none" fn getfield_slow<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (dst, table, ic_idx, key_idx) = instruction.abde();
     let recv = reg!(table);
@@ -1123,7 +1146,7 @@ extern "rust-preserve-none" fn op_setfield<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (src, table, ic_idx, key_idx) = instruction.abde();
 
@@ -1162,7 +1185,7 @@ extern "rust-preserve-none" fn setfield_slow<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (src, table, ic_idx, key_idx) = instruction.abde();
     let recv = reg!(table);
@@ -1193,7 +1216,7 @@ extern "rust-preserve-none" fn op_self<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (dst, object, key_idx) = instruction.abd();
 
@@ -1231,7 +1254,7 @@ extern "rust-preserve-none" fn op_self_slow<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (dst, object, key_idx) = instruction.abd();
 
@@ -1270,10 +1293,11 @@ extern "rust-preserve-none" fn op_newtable<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let dst = instruction.a();
     *reg!(ref mut dst) = Value::table(Table::new(ctx));
+    gc_check!();
     dispatch!();
 }
 
@@ -1296,7 +1320,7 @@ macro_rules! arith_handler {
             ds: &mut DispatchState<'gc>,
             frame: *mut LuaFrame<'gc>,
             closure: LuaFn<'gc>,
-        ) {
+        ) -> Exit {
             helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
             let (dst, lhs, rhs) = instruction.abc();
 
@@ -1339,7 +1363,7 @@ macro_rules! bit_handler {
             ds: &mut DispatchState<'gc>,
             frame: *mut LuaFrame<'gc>,
             closure: LuaFn<'gc>,
-        ) {
+        ) -> Exit {
             helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
             let (dst, lhs, rhs) = instruction.abc();
 
@@ -1373,7 +1397,7 @@ macro_rules! binop_slow_handler {
             ds: &mut DispatchState<'gc>,
             frame: *mut LuaFrame<'gc>,
             closure: LuaFn<'gc>,
-        ) {
+        ) -> Exit {
             helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
             let (dst, lhs, rhs) = instruction.abc();
             let (lhs, rhs) = (reg!(lhs), reg!(rhs));
@@ -1447,7 +1471,7 @@ macro_rules! arith_imm_handler {
             ds: &mut DispatchState<'gc>,
             frame: *mut LuaFrame<'gc>,
             closure: LuaFn<'gc>,
-        ) {
+        ) -> Exit {
             helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
             let (dst, src, _) = instruction.abc_imm();
             let v = reg!(ref src);
@@ -1506,7 +1530,7 @@ macro_rules! bit_imm_handler {
             ds: &mut DispatchState<'gc>,
             frame: *mut LuaFrame<'gc>,
             closure: LuaFn<'gc>,
-        ) {
+        ) -> Exit {
             helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
             let (dst, src, _) = instruction.abc_imm();
             debug_assert!(instruction.imm_is_int());
@@ -1541,7 +1565,7 @@ macro_rules! binop_imm_slow_handler {
             ds: &mut DispatchState<'gc>,
             frame: *mut LuaFrame<'gc>,
             closure: LuaFn<'gc>,
-        ) {
+        ) -> Exit {
             helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
             let (dst, src, flipped) = instruction.abc_imm();
             let (v, k) = (reg!(src), instruction.imm_value(ctx.mutation()));
@@ -1591,7 +1615,7 @@ extern "rust-preserve-none" fn op_unm<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (dst, src) = instruction.ab();
     let val = reg!(src);
@@ -1631,7 +1655,7 @@ extern "rust-preserve-none" fn op_bnot<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (dst, src) = instruction.ab();
     let val = reg!(src);
@@ -1664,7 +1688,7 @@ extern "rust-preserve-none" fn op_not<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (dst, src) = instruction.ab();
     let val = reg!(src);
@@ -1685,7 +1709,7 @@ extern "rust-preserve-none" fn op_len<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (dst, src) = instruction.ab();
     let val = reg!(src);
@@ -1724,7 +1748,7 @@ extern "rust-preserve-none" fn op_concat<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (dst, lhs, rhs) = instruction.abc();
     let a = reg!(lhs);
@@ -1733,6 +1757,7 @@ extern "rust-preserve-none" fn op_concat<'gc>(
     let mut buf = Vec::new();
     if num::coerce_to_str(&mut buf, a) && num::coerce_to_str(&mut buf, b) {
         *reg!(ref mut dst) = Value::string(LuaString::new(ctx, &buf));
+        gc_check!();
         dispatch!();
     }
     let meta_fn = binop_metamethod(ctx, a, b, ctx.symbols().mm_concat);
@@ -1760,7 +1785,7 @@ extern "rust-preserve-none" fn op_close<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let start = instruction.a();
     let base = unsafe { (*frame).base() };
@@ -1770,7 +1795,7 @@ extern "rust-preserve-none" fn op_close<'gc>(
         save_pc(thread, ip);
         let bottom = base + closure.max_stack_size as usize;
         schedule_close(ctx, thread, start_idx, false, bottom, bottom);
-        return;
+        return Exit::End;
     }
     dispatch!();
 }
@@ -1788,7 +1813,7 @@ extern "rust-preserve-none" fn op_tbc<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let val = instruction.a();
     let v = reg!(val);
@@ -1822,7 +1847,7 @@ extern "rust-preserve-none" fn op_jmp<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let offset = instruction.imm();
     ip = unsafe { ip.offset(offset as isize) };
@@ -1842,7 +1867,7 @@ extern "rust-preserve-none" fn op_eq<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (lhs, rhs, inverted) = instruction.abc_flag();
 
@@ -1884,7 +1909,7 @@ extern "rust-preserve-none" fn op_lt<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (lhs, rhs, inverted) = instruction.abc_flag();
 
@@ -1936,7 +1961,7 @@ extern "rust-preserve-none" fn op_le<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (lhs, rhs, inverted) = instruction.abc_flag();
 
@@ -1992,7 +2017,7 @@ macro_rules! cmp_imm_handler {
             ds: &mut DispatchState<'gc>,
             frame: *mut LuaFrame<'gc>,
             closure: LuaFn<'gc>,
-        ) {
+        ) -> Exit {
             helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
             let (src, inverted) = instruction.ab_imm_flag();
             let v = reg!(ref src);
@@ -2042,7 +2067,7 @@ macro_rules! cmp_imm_handler {
             ds: &mut DispatchState<'gc>,
             frame: *mut LuaFrame<'gc>,
             closure: LuaFn<'gc>,
-        ) {
+        ) -> Exit {
             helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
             let (src, inverted) = instruction.ab_imm_flag();
             let (v, k) = (reg!(src), instruction.imm_value(ctx.mutation()));
@@ -2111,7 +2136,7 @@ extern "rust-preserve-none" fn op_eqi<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (src, inverted) = instruction.ab_imm_flag();
     let v = reg!(ref src);
@@ -2155,7 +2180,7 @@ extern "rust-preserve-none" fn op_test<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (src, inverted) = instruction.ab_flag();
     let truthy = !reg!(src).is_falsy();
@@ -2177,7 +2202,7 @@ extern "rust-preserve-none" fn op_testset<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (dst, src, inverted) = instruction.abc_flag();
     let val = reg!(src);
@@ -2283,7 +2308,7 @@ macro_rules! call_native {
                     // catches and resumes.
                     unsafe { (*$frame).pc = $ip };
                     $thread.raise($ctx, err);
-                    return;
+                    return Exit::End;
                 }
             };
             match action {
@@ -2312,6 +2337,7 @@ macro_rules! call_native {
                     // count the next consumer reads.
                     $thread.set_top_unchecked(func_idx + wanted);
                     $registers = unsafe { $thread.stack.as_mut_ptr().add(base) };
+                    gc_check!();
                     dispatch!();
                 }
                 crate::vm::sequence::CallbackAction::Suspend(action) => {
@@ -2328,7 +2354,7 @@ macro_rules! call_native {
                             cont: None,
                         },
                     });
-                    return;
+                    return Exit::End;
                 }
             }
         }
@@ -2438,7 +2464,7 @@ extern "rust-preserve-none" fn op_call<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (func, nargs, returns) = instruction.abc();
     if let Some(f) = reg!(func).get_function() {
@@ -2481,7 +2507,7 @@ extern "rust-preserve-none" fn op_call_grow<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let func = instruction.a();
     let max_stack = match reg!(func).get_function().map(|f| f.inner().as_ref()) {
@@ -2520,7 +2546,7 @@ pub(crate) extern "rust-preserve-none" fn op_call_native<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     if instruction.op() == Op::TAILCALL {
         tail!(op_tailcall_native);
@@ -2562,7 +2588,7 @@ macro_rules! math1_entry {
             ds: &mut DispatchState<'gc>,
             frame: *mut LuaFrame<'gc>,
             closure: LuaFn<'gc>,
-        ) {
+        ) -> Exit {
             helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
             // Raw reads: a TAILCALL is `Ab`-shaped, with `c` (unused then) zero.
             let (func, nargs, returns) = (instruction.a(), instruction.b(), instruction.c());
@@ -2662,7 +2688,7 @@ extern "rust-preserve-none" fn op_call_meta<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (func, nargs, returns) = instruction.abc();
     let base = unsafe { (*frame).base() };
@@ -2749,7 +2775,7 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (func, nargs) = instruction.ab();
     if let Some(f) = reg!(func).get_function() {
@@ -2806,7 +2832,7 @@ extern "rust-preserve-none" fn op_tailcall_native<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (func, nargs) = instruction.ab();
     let base = unsafe { (*frame).base() };
@@ -2831,7 +2857,7 @@ extern "rust-preserve-none" fn op_tailcall_native<'gc>(
             debug_assert!(!has_tbc_from(thread, base));
             thread.pop_lua();
             thread.push_exec(ExecKind::Error(err));
-            return;
+            return Exit::End;
         }
     };
     match action {
@@ -2870,7 +2896,7 @@ extern "rust-preserve-none" fn op_tailcall_native<'gc>(
             {
                 save_pc(thread, ip);
                 thread.raise(ctx, err);
-                return;
+                return Exit::End;
             }
             close_upvalues(ctx.mutation(), thread, base);
             debug_assert!(!has_tbc_from(thread, base));
@@ -2884,6 +2910,7 @@ extern "rust-preserve-none" fn op_tailcall_native<'gc>(
                     cont,
                 },
             });
+            Exit::End
         }
     }
 }
@@ -2902,7 +2929,7 @@ extern "rust-preserve-none" fn op_tailcall_slow<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (func, nargs) = instruction.ab();
     let base = unsafe { (*frame).base() };
@@ -2986,7 +3013,7 @@ extern "rust-preserve-none" fn op_return<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (values, count) = instruction.ab();
 
@@ -3039,7 +3066,7 @@ extern "rust-preserve-none" fn op_return0<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (cur_base, num_results, num_extras, flags) = {
         let f = unsafe { &*frame };
@@ -3078,7 +3105,7 @@ extern "rust-preserve-none" fn op_return1<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let value = instruction.a();
     let (cur_base, num_results, num_extras, flags) = {
@@ -3129,7 +3156,7 @@ extern "rust-preserve-none" fn op_return_cont<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (values, count) = instruction.ab();
     debug_assert!(count != 0);
@@ -3167,7 +3194,7 @@ extern "rust-preserve-none" fn op_return_slow<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (values, count) = instruction.ab();
 
@@ -3187,14 +3214,14 @@ extern "rust-preserve-none" fn op_return_slow<'gc>(
         let values_end = values_base + nret;
         let bottom = values_end.max(cur_base + closure.max_stack_size as usize);
         schedule_close(ctx, thread, cur_base, true, values_end, bottom);
-        return;
+        return Exit::End;
     }
 
     match frame_return(ctx.mutation(), thread, frame, values_base, nret) {
         FrameReturn::Continuation => {
             tail!(cont_resume);
         }
-        FrameReturn::TopLevel | FrameReturn::ToNonLua => {}
+        FrameReturn::TopLevel | FrameReturn::ToNonLua => Exit::End,
         FrameReturn::Caller { new_base, new_ip } => {
             ip = new_ip;
             (frame, closure) = top_frame(thread);
@@ -3280,7 +3307,7 @@ extern "rust-preserve-none" fn op_forprep<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (base, offset) = instruction.a_imm();
 
@@ -3365,7 +3392,7 @@ extern "rust-preserve-none" fn op_forloop<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (base, offset) = instruction.a_imm();
 
@@ -3416,7 +3443,7 @@ extern "rust-preserve-none" fn forloop_slow<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (base, offset) = instruction.a_imm();
     let (s, last, idx) = (reg!(base + 1), reg!(base), reg!(base + 2));
@@ -3455,7 +3482,7 @@ extern "rust-preserve-none" fn op_tforprep<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (base, offset) = instruction.a_imm();
     let closing = reg!(base + 3);
@@ -3488,7 +3515,7 @@ extern "rust-preserve-none" fn op_tforcall<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (base, count) = instruction.ab();
     let iter = reg!(base);
@@ -3512,7 +3539,7 @@ extern "rust-preserve-none" fn op_tforloop<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (base, offset) = instruction.a_imm();
     if !reg!(base + 3).is_nil() {
@@ -3538,7 +3565,7 @@ extern "rust-preserve-none" fn op_setlist<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (table, count, offset) = instruction.abd();
     let Some(t) = reg!(table).get_table() else {
@@ -3588,14 +3615,17 @@ extern "rust-preserve-none" fn op_closure<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (dst, proto_idx) = instruction.ad();
     let (parent_closure, base) = unsafe { ((*frame).closure, (*frame).base()) };
     let proto = parent_closure.proto.prototypes[proto_idx as usize];
 
     let thread_handle = thread.thread_handle.expect("thread must have a handle");
-    let mut upvalues_vec = Vec::with_capacity(proto.upvalue_desc.len());
+    let mut upvalues_vec = Vec::with_capacity_in(
+        proto.upvalue_desc.len(),
+        crate::dmm::allocator_api::MetricsAlloc::new(ctx.mutation()),
+    );
     for desc in proto.upvalue_desc.iter() {
         let uv = match desc {
             UpValueDescriptor::ParentLocal(idx) => {
@@ -3623,10 +3653,11 @@ extern "rust-preserve-none" fn op_closure<'gc>(
         };
         upvalues_vec.push(uv);
     }
-    let upvalues: Box<[Upvalue<'gc>]> = upvalues_vec.into_boxed_slice();
+    let upvalues = upvalues_vec.into_boxed_slice();
 
     let func = Function::new_lua(ctx.mutation(), proto, upvalues);
     *reg!(ref mut dst) = Value::function(func);
+    gc_check!();
     dispatch!();
 }
 
@@ -3652,7 +3683,7 @@ extern "rust-preserve-none" fn op_vararg<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (dst, count) = instruction.ab();
     let (base, num_extras) = unsafe { ((*frame).base(), (*frame).num_extras as usize) };
@@ -3733,7 +3764,7 @@ extern "rust-preserve-none" fn op_varargget<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (dst, _base, key) = instruction.abc();
     let key_val = reg!(key);
@@ -3785,7 +3816,7 @@ extern "rust-preserve-none" fn op_varargprep<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let _num_fixed = instruction.a();
     let (num_extras, base) = unsafe { ((*frame).num_extras as usize, (*frame).base()) };
@@ -3837,7 +3868,7 @@ extern "rust-preserve-none" fn op_errnnil<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (src, name_key) = instruction.ad();
     if std::hint::unlikely(!reg!(src).is_nil()) {
@@ -3862,7 +3893,7 @@ extern "rust-preserve-none" fn op_nop<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     dispatch!();
 }
@@ -3879,7 +3910,8 @@ extern "rust-preserve-none" fn op_stop<'gc>(
     _ds: &mut DispatchState<'gc>,
     _frame: *mut LuaFrame<'gc>,
     _closure: LuaFn<'gc>,
-) {
+) -> Exit {
+    Exit::End
 }
 
 // ---------------------------------------------------------------------------
@@ -4606,7 +4638,7 @@ extern "rust-preserve-none" fn cont_resume<'gc>(
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
-) {
+) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (cont, results_base) = {
         let f = unsafe { &*frame };

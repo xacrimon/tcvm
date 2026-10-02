@@ -118,9 +118,11 @@ impl<'gc> Executor<'gc> {
     /// - [`StepResult::Done`] — the main thread completed; call `take_result`.
     /// - [`StepResult::Yielded(values)`] — the main thread yielded to the
     ///   host. Feed args back via [`Executor::resume`] then `step` again.
-    /// - [`StepResult::Pending`] — a `Sequence` returned `Pending`; the
-    ///   driver yielded so the host can interleave other work. Call
-    ///   `step` again to continue. (No fuel limit is enforced yet.)
+    /// - [`StepResult::Pending`] — a `Sequence` returned `Pending`, or the
+    ///   collector is owed work. Leave the current [`Lua::enter`](crate::Lua::enter),
+    ///   which collects on its way out, and call `step` again in a new one.
+    ///   Stepping on inside the same `enter` still makes progress, but
+    ///   nothing is collected until the host leaves it.
     ///
     /// The hot path (Lua-only execution, sync natives) makes a single call
     /// into `run_thread` and exits. Coroutine resume / sequence pump cycles
@@ -236,7 +238,12 @@ impl<'gc> Executor<'gc> {
             };
 
             match kind {
-                FrameKind::Lua => vm::interp::run_thread(ctx, top),
+                FrameKind::Lua => {
+                    if let vm::interp::Exit::Gc = vm::interp::run_thread(ctx, top) {
+                        ctx.mutation().metrics().defer_gc_check();
+                        return Ok(StepResult::Pending);
+                    }
+                }
                 FrameKind::Sequence => {
                     if matches!(pump_sequence(self, ctx, top)?, PumpOutcome::Pending) {
                         // Sequence asked for cooperative re-poll. Mode stays
