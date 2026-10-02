@@ -110,18 +110,25 @@ impl<'gc> Context<'gc> {
         let name = LuaString::new(self, name.unwrap_or(source).as_bytes());
         let mut cache = NodeCache::new();
         let parse = parser::parse(&mut cache, source);
+        let chunk = || String::from_utf8_lossy(&chunk_id(name.as_bytes())).into_owned();
         // The parser only reports errors (see `State::error`), so any report
         // means the tree is unusable.
         if !parse.reports.is_empty() {
             return Err(LoadError::Parse(SyntaxError {
-                chunk: String::from_utf8_lossy(&chunk_id(name.as_bytes())).into_owned(),
+                chunk: chunk(),
                 source: source.to_owned(),
                 reports: parse.reports,
             }));
         }
         let root = parser::syntax::Root::new(parse.root)
             .ok_or(LoadError::Internal("parser did not produce a Root node"))?;
-        let proto = compile_chunk(self, &root, &parse.lines, cache.interner(), name)?;
+        let proto =
+            compile_chunk(self, &root, &parse.lines, cache.interner(), name).map_err(|error| {
+                LoadError::Compile {
+                    chunk: chunk(),
+                    error,
+                }
+            })?;
 
         // Main chunk's upvalue 0 is _ENV. Pre-close it onto globals.
         let env_uv = Gc::new(
