@@ -1,6 +1,7 @@
 mod arg_type_errors;
 mod assign_multires;
 mod async_sequence_basic;
+mod basic_globals;
 mod builtin_metamethods;
 mod call_chain_limit;
 mod call_metamethod_multret;
