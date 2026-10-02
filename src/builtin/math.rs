@@ -5,7 +5,7 @@ use rand_pcg::Pcg64;
 
 use crate::Context;
 use crate::builtin::util::{
-    check_integer, check_number, compare_error_msg, float_to_integer, num_to_value,
+    arg_error, check_integer, check_number, compare_error_msg, float_to_integer, num_to_value,
 };
 use crate::env::{
     Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Userdata, Value,
@@ -171,7 +171,7 @@ fn lua_fmod<'gc>(
     let b = stack.get(1);
     let result = if let (Some(x), Some(y)) = (a.get_integer(), b.get_integer()) {
         if y == 0 {
-            return Err(Error::from_str(ctx, "bad argument #2 to 'fmod' (zero)"));
+            return Err(arg_error(ctx, "fmod", 2, "zero"));
         } else if y == -1 {
             Value::integer(ctx.mutation(), 0)
         } else {
@@ -269,10 +269,7 @@ fn select_extreme<'gc>(
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let n = stack.len();
     if n == 0 {
-        return Err(Error::from_str(
-            ctx,
-            &format!("bad argument #1 to '{fname}' (value expected)"),
-        ));
+        return Err(arg_error(ctx, fname, 1, "value expected"));
     }
     let mut best = stack.get(0);
     for i in 1..n {
@@ -469,10 +466,7 @@ fn lua_random<'gc>(
     if let Mode::Range(low, up) = mode
         && low > up
     {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #1 to 'random' (interval is empty)",
-        ));
+        return Err(arg_error(ctx, "random", 1, "interval is empty"));
     }
 
     let result = rng_state(closure)

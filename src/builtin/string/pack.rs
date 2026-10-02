@@ -53,10 +53,6 @@ struct Header {
     maxalign: usize,
 }
 
-fn bad_arg<'gc>(ctx: Context<'gc>, fname: &str, n: usize, msg: &str) -> Error<'gc> {
-    Error::from_str(ctx, &format!("bad argument #{n} to '{fname}' ({msg})"))
-}
-
 /// Parse an optional decimal numeral at `*pos`, returning `df` when none is
 /// present. The accumulation cap mirrors reference Lua's `getnum`: once the
 /// running value would exceed `MAXSIZE`, the remaining digits are left for the
@@ -170,12 +166,22 @@ fn get_details<'gc>(
     let mut align = size;
     if opt == KOption::PaddAlign {
         if *pos >= fmt.len() {
-            return Err(bad_arg(ctx, fname, 1, "invalid next option for option 'X'"));
+            return Err(util::arg_error(
+                ctx,
+                fname,
+                1,
+                "invalid next option for option 'X'",
+            ));
         }
         let (next_opt, next_size) = get_option(ctx, h, fmt, pos)?;
         align = next_size;
         if next_opt == KOption::Char || align == 0 {
-            return Err(bad_arg(ctx, fname, 1, "invalid next option for option 'X'"));
+            return Err(util::arg_error(
+                ctx,
+                fname,
+                1,
+                "invalid next option for option 'X'",
+            ));
         }
     }
 
@@ -186,7 +192,7 @@ fn get_details<'gc>(
             align = h.maxalign;
         }
         if align & (align - 1) != 0 {
-            return Err(bad_arg(
+            return Err(util::arg_error(
                 ctx,
                 fname,
                 1,
@@ -283,13 +289,13 @@ pub(super) fn lua_pack<'gc>(
                     if size < SZINT {
                         let lim = 1i64 << (size * 8 - 1);
                         if !(-lim..lim).contains(&n) {
-                            return Err(bad_arg(ctx, "pack", arg, "integer overflow"));
+                            return Err(util::arg_error(ctx, "pack", arg, "integer overflow"));
                         }
                     }
                     pack_int_bytes(&mut out, n as u64, h.little, size, n < 0);
                 } else {
                     if size < SZINT && (n as u64) >= (1u64 << (size * 8)) {
-                        return Err(bad_arg(ctx, "pack", arg, "unsigned overflow"));
+                        return Err(util::arg_error(ctx, "pack", arg, "unsigned overflow"));
                     }
                     pack_int_bytes(&mut out, n as u64, h.little, size, false);
                 }
@@ -315,7 +321,12 @@ pub(super) fn lua_pack<'gc>(
                 let s = check_str(ctx, stack.get(arg - 1), "pack", arg)?;
                 let b = s.as_bytes();
                 if b.len() > size {
-                    return Err(bad_arg(ctx, "pack", arg, "string longer than given size"));
+                    return Err(util::arg_error(
+                        ctx,
+                        "pack",
+                        arg,
+                        "string longer than given size",
+                    ));
                 }
                 out.extend_from_slice(b);
                 // `c`'s size is unbounded (it skips the [1,16] limit), so the
@@ -332,7 +343,7 @@ pub(super) fn lua_pack<'gc>(
                 let b = s.as_bytes();
                 let len = b.len();
                 if size < SZINT && (len as u64) >= (1u64 << (size * 8)) {
-                    return Err(bad_arg(
+                    return Err(util::arg_error(
                         ctx,
                         "pack",
                         arg,
@@ -346,7 +357,7 @@ pub(super) fn lua_pack<'gc>(
                 let s = check_str(ctx, stack.get(arg - 1), "pack", arg)?;
                 let b = s.as_bytes();
                 if b.contains(&0) {
-                    return Err(bad_arg(ctx, "pack", arg, "string contains zeros"));
+                    return Err(util::arg_error(ctx, "pack", arg, "string contains zeros"));
                 }
                 out.extend_from_slice(b);
                 out.push(0);
@@ -380,13 +391,25 @@ pub(super) fn lua_packsize<'gc>(
     while fpos < fmt.len() {
         let (opt, size, ntoalign) = get_details(ctx, &mut h, total, fmt, &mut fpos, "packsize")?;
         if matches!(opt, KOption::Str | KOption::Zstr) {
-            return Err(bad_arg(ctx, "packsize", 1, "variable-length format"));
+            return Err(util::arg_error(
+                ctx,
+                "packsize",
+                1,
+                "variable-length format",
+            ));
         }
         // Cap the running size at a Lua integer, matching reference's MAXSIZE.
         let step = ntoalign.checked_add(size);
         match step.and_then(|s| total.checked_add(s)) {
             Some(t) if t <= i64::MAX as usize => total = t,
-            _ => return Err(bad_arg(ctx, "packsize", 1, "format result too large")),
+            _ => {
+                return Err(util::arg_error(
+                    ctx,
+                    "packsize",
+                    1,
+                    "format result too large",
+                ));
+            }
         }
     }
 
@@ -412,7 +435,12 @@ pub(super) fn lua_unpack<'gc>(
     // 1-based start; out-of-range high errors, low (<=0) clamps to the start.
     let p = posrelat(init, ld);
     if p > ld as i64 + 1 {
-        return Err(bad_arg(ctx, "unpack", 3, "initial position out of string"));
+        return Err(util::arg_error(
+            ctx,
+            "unpack",
+            3,
+            "initial position out of string",
+        ));
     }
     let mut pos = (p.max(1) - 1) as usize;
 
@@ -430,7 +458,7 @@ pub(super) fn lua_unpack<'gc>(
             .checked_add(size)
             .is_none_or(|need| need > ld - pos)
         {
-            return Err(bad_arg(ctx, "unpack", 2, "data string too short"));
+            return Err(util::arg_error(ctx, "unpack", 2, "data string too short"));
         }
         pos += ntoalign;
         match opt {
@@ -464,7 +492,7 @@ pub(super) fn lua_unpack<'gc>(
             KOption::Str => {
                 let len = unpack_int(ctx, &data[pos..], h.little, size, false)? as u64 as usize;
                 if len > ld - pos - size {
-                    return Err(bad_arg(ctx, "unpack", 2, "data string too short"));
+                    return Err(util::arg_error(ctx, "unpack", 2, "data string too short"));
                 }
                 let body = &data[pos + size..pos + size + len];
                 out.push(Value::string(LuaString::new(ctx, body)));
@@ -472,7 +500,7 @@ pub(super) fn lua_unpack<'gc>(
             }
             KOption::Zstr => {
                 let Some(len) = data[pos..].iter().position(|&b| b == 0) else {
-                    return Err(bad_arg(
+                    return Err(util::arg_error(
                         ctx,
                         "unpack",
                         2,

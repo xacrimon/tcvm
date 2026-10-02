@@ -137,10 +137,7 @@ fn lua_char<'gc>(
     for i in 0..n {
         let c = crate::builtin::util::check_integer(ctx, stack.get(i), "char", i + 1)?;
         if !(0..=MAX_CODEPOINT).contains(&c) {
-            return Err(Error::from_str(
-                ctx,
-                &format!("bad argument #{} to 'char' (value out of range)", i + 1),
-            ));
+            return Err(util::arg_error(ctx, "char", i + 1, "value out of range"));
         }
         encode(c as u32, &mut out);
     }
@@ -173,16 +170,10 @@ fn lua_codepoint<'gc>(
     let posi = posrelat(i, len);
     let posj = posrelat(j, len);
     if posi < 1 {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #2 to 'codepoint' (out of bounds)",
-        ));
+        return Err(util::arg_error(ctx, "codepoint", 2, "out of bounds"));
     }
     if posj > len as i64 {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #3 to 'codepoint' (out of bounds)",
-        ));
+        return Err(util::arg_error(ctx, "codepoint", 3, "out of bounds"));
     }
     let strict = stack.get(3).is_falsy(); // optional `lax` flag (arg #4): lax ⇒ not strict
     let mut out = Vec::new();
@@ -227,15 +218,19 @@ fn lua_len<'gc>(
     let mut posi = posrelat(i, len);
     let posj = posrelat(j, len);
     if posi < 1 || posi > len as i64 + 1 {
-        return Err(Error::from_str(
+        return Err(util::arg_error(
             ctx,
-            "bad argument #2 to 'len' (initial position out of bounds)",
+            "len",
+            2,
+            "initial position out of bounds",
         ));
     }
     if posj > len as i64 {
-        return Err(Error::from_str(
+        return Err(util::arg_error(
             ctx,
-            "bad argument #3 to 'len' (final position out of bounds)",
+            "len",
+            3,
+            "final position out of bounds",
         ));
     }
     let strict = stack.get(3).is_falsy(); // optional `lax` flag (arg #4)
@@ -278,10 +273,7 @@ fn lua_offset<'gc>(
     };
     let mut posi = posrelat(i, len);
     if posi < 1 || posi > len as i64 + 1 {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #3 to 'offset' (position out of bounds)",
-        ));
+        return Err(util::arg_error(ctx, "offset", 3, "position out of bounds"));
     }
 
     let found = if n == 0 {

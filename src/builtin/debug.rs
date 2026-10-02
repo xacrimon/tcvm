@@ -73,10 +73,7 @@ fn lua_getmetatable<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     if stack.is_empty() {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #1 to 'getmetatable' (value expected)",
-        ));
+        return Err(util::arg_error(ctx, "getmetatable", 1, "value expected"));
     }
     let mt = ctx.metatable_of(stack.get(0));
     stack.replace(&[mt.map_or(Value::nil(), Value::table)]);

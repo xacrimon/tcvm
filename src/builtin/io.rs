@@ -562,10 +562,7 @@ fn parse_format<'gc>(
 ) -> Result<ReadFmt, Error<'gc>> {
     if let Some(i) = util::to_integer(v) {
         if i < 0 {
-            return Err(Error::from_str(
-                ctx,
-                &format!("bad argument #{n} to '{fname}' (invalid format)"),
-            ));
+            return Err(util::arg_error(ctx, fname, n, "invalid format"));
         }
         return Ok(ReadFmt::Bytes(i as usize));
     }
@@ -580,10 +577,7 @@ fn parse_format<'gc>(
             _ => {}
         }
     }
-    Err(Error::from_str(
-        ctx,
-        &format!("bad argument #{n} to '{fname}' (invalid format)"),
-    ))
+    Err(util::arg_error(ctx, fname, n, "invalid format"))
 }
 
 /// Build the read-format list from a window of argument values, defaulting
@@ -717,10 +711,7 @@ fn lua_open<'gc>(
     // An invalid mode is a raised argument error, not a `(nil, msg, errno)`
     // return (Lua's `luaL_argcheck(l_checkmode(...))`).
     if !check_mode(mode) {
-        return Err(Error::from_str(
-            ctx,
-            "bad argument #2 to 'open' (invalid mode)",
-        ));
+        return Err(util::arg_error(ctx, "open", 2, "invalid mode"));
     }
     match open_file(ctx, closure, name.as_bytes(), mode) {
         Ok(u) => stack.replace(&[Value::userdata(u)]),
@@ -1021,10 +1012,7 @@ fn lua_file_seek<'gc>(
         b"cur" => Some(SeekFrom::Current(offset)),
         b"end" => Some(SeekFrom::End(offset)),
         _ => {
-            return Err(Error::from_str(
-                ctx,
-                "bad argument #2 to 'seek' (invalid option)",
-            ));
+            return Err(util::arg_error(ctx, "seek", 2, "invalid option"));
         }
     };
     let outcome = match pos {
@@ -1083,12 +1071,11 @@ fn lua_file_setvbuf<'gc>(
     match mode.get_string().map(|s| s.as_bytes()) {
         Some(b"no") | Some(b"full") | Some(b"line") => {}
         Some(other) => {
-            return Err(Error::from_str(
+            return Err(util::arg_error(
                 ctx,
-                &format!(
-                    "bad argument #2 to 'setvbuf' (invalid option '{}')",
-                    String::from_utf8_lossy(other)
-                ),
+                "setvbuf",
+                2,
+                &format!("invalid option '{}'", String::from_utf8_lossy(other)),
             ));
         }
         None => {

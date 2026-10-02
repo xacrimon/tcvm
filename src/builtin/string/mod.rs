@@ -130,10 +130,7 @@ fn lua_char<'gc>(
     for i in 0..n {
         let c = util::check_integer(ctx, stack.get(i), "char", i + 1)?;
         if !(0..=255).contains(&c) {
-            return Err(Error::from_str(
-                ctx,
-                &format!("bad argument #{} to 'char' (value out of range)", i + 1),
-            ));
+            return Err(util::arg_error(ctx, "char", i + 1, "value out of range"));
         }
         out.push(c as u8);
     }
@@ -331,10 +328,7 @@ impl Formatter {
             // A conversion consumes the next argument; a missing one is an error
             // ("no value"), distinct from an explicitly-passed nil.
             if self.arg_idx >= args.len() {
-                return Err(Error::from_str(
-                    ctx,
-                    &format!("bad argument #{} to 'format' (no value)", self.arg_idx + 1),
-                ));
+                return Err(util::arg_error(ctx, "format", self.arg_idx + 1, "no value"));
             }
             let arg = args.get(self.arg_idx);
             self.arg_idx += 1;
@@ -559,9 +553,11 @@ fn check_fmt_int<'gc>(
         return Ok(i);
     }
     if to_float(arg).is_some() {
-        return Err(Error::from_str(
+        return Err(util::arg_error(
             ctx,
-            &format!("bad argument #{arg_num} to 'format' (number has no integer representation)"),
+            "format",
+            arg_num,
+            "number has no integer representation",
         ));
     }
     Err(util::type_error(
@@ -992,9 +988,11 @@ fn fmt_q<'gc>(
         out.push(b'"');
     } else {
         // Tables, functions, threads, userdata have no literal form.
-        return Err(Error::from_str(
+        return Err(util::arg_error(
             ctx,
-            &format!("bad argument #{arg_num} to 'format' (value has no literal form)"),
+            "format",
+            arg_num,
+            "value has no literal form",
         ));
     }
     Ok(())
