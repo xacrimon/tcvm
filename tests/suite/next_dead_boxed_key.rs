@@ -2,31 +2,14 @@
 //! stores keys as raw `i64`, so a dead entry never refers to a swept box and
 //! a freshly computed equal key still finds it.
 
-use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
-use tcvm::vm::sequence::CallbackAction;
-use tcvm::{Context, Executor, LoadError, Lua, RuntimeError};
+use tcvm::env::{LuaString, Value};
+use tcvm::{Lua, RuntimeError, StashedExecutor};
 
-/// Native that yields to its resumer (the host, when called on the main thread).
-fn yielder<'gc>(
-    _ctx: Context<'gc>,
-    _closure: &NativeClosure<'gc>,
-    _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    Ok(CallbackAction::yield_(None))
-}
+use crate::common::{start_on, yielding_lua};
 
-fn setup(src: &str) -> (Lua, tcvm::StashedExecutor) {
-    let mut lua = Lua::new();
-    lua.load_all();
-    let ex = lua
-        .try_enter(|ctx| -> Result<_, LoadError> {
-            let y = Function::new_native(ctx.mutation(), yielder as NativeFn, &[]);
-            let key = Value::string(LuaString::new(ctx, b"yielder"));
-            ctx.globals().raw_set(ctx, key, Value::function(y));
-            let chunk = ctx.load(src, Some("t"))?;
-            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
-        })
-        .expect("load");
+fn setup(src: &str) -> (Lua, StashedExecutor) {
+    let mut lua = yielding_lua();
+    let ex = start_on(&mut lua, src);
     (lua, ex)
 }
 
@@ -42,7 +25,7 @@ fn churn_boxed_ints(lua: &mut Lua) {
     lua.collect_all();
 }
 
-fn finish_str(lua: &mut Lua, ex: &tcvm::StashedExecutor) -> String {
+fn finish_str(lua: &mut Lua, ex: &StashedExecutor) -> String {
     lua.resume(ex, ()).expect("resume to completion");
     lua.try_enter(|ctx| {
         let r = ctx.fetch(ex).take_result::<LuaString>(ctx)?;

@@ -1,8 +1,9 @@
 //! Chunk runners shared by the suite. Each loads every library and runs its
 //! source as the chunk `=c`.
 
-use tcvm::env::Value;
-use tcvm::{Executor, FromMultiValue, LoadError, Lua, RuntimeError, StashedExecutor};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
+use tcvm::vm::sequence::CallbackAction;
+use tcvm::{Context, Executor, FromMultiValue, LoadError, Lua, RuntimeError, StashedExecutor};
 
 /// Defines `cat(...)`, its arguments' `tostring`s joined by spaces. One line,
 /// so the error positions of the code after it hold.
@@ -43,15 +44,40 @@ pub fn err(src: &str) -> String {
     run(src).expect_err(src)
 }
 
+/// Native that yields to its resumer: from the main thread, to the host.
+pub fn yielder<'gc>(
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
+    _stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
+    Ok(CallbackAction::yield_(None))
+}
+
+/// A `Lua` with every library and the global `yielder` bound to [`yielder`].
+pub fn yielding_lua() -> Lua {
+    let mut lua = Lua::new();
+    lua.load_all();
+    lua.enter(|ctx| {
+        let f = Function::new_native(ctx.mutation(), yielder as NativeFn, &[]);
+        let key = Value::string(LuaString::new(ctx, b"yielder"));
+        ctx.globals().raw_set(ctx, key, Value::function(f));
+    });
+    lua
+}
+
+/// `src` started on `lua` as the chunk `=c`.
+pub fn start_on(lua: &mut Lua, src: &str) -> StashedExecutor {
+    lua.try_enter(|ctx| -> Result<_, LoadError> {
+        let chunk = ctx.load(src, Some("=c"))?;
+        Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+    })
+    .unwrap_or_else(|e| panic!("{src:?} failed to load: {e}"))
+}
+
 fn start(src: &str) -> (Lua, StashedExecutor) {
     let mut lua = Lua::new();
     lua.load_all();
-    let ex = lua
-        .try_enter(|ctx| -> Result<_, LoadError> {
-            let chunk = ctx.load(src, Some("=c"))?;
-            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
-        })
-        .unwrap_or_else(|e| panic!("{src:?} failed to load: {e}"));
+    let ex = start_on(&mut lua, src);
     (lua, ex)
 }
 
