@@ -20,7 +20,7 @@ pub use stash::{
 
 use crate::builtin;
 use crate::dmm::Rootable;
-use crate::dmm::arena::CollectionPhase;
+use crate::dmm::arena::{CollectionPhase, MarkedArena};
 use crate::dmm::metrics::Pacing;
 use crate::dmm::{Arena, Collect, DynamicRootSet, Gc, GcLock, Lock, Mutation};
 use crate::env::shape::Shape;
@@ -121,13 +121,12 @@ impl Lua {
         let metrics = self.arena.metrics();
         if metrics.allocation_debt() > metrics.gc_granularity() as f64 {
             if self.arena.collection_phase() != CollectionPhase::Sweeping
-                && let Some(marked) = self.arena.mark_debt()
+                && self.arena.mark_debt().is_some()
             {
-                marked.finalize(|fc, root| root.interner.prune(fc));
-                self.start_sweeping();
+                self.finalize_and_sweep();
             }
             // Stops when the cycle ends rather than marking the next one, which
-            // must go through the prune above.
+            // must go through `finalize_and_sweep`.
             if self.arena.collection_phase() == CollectionPhase::Sweeping {
                 self.arena.cycle_debt();
             }
@@ -135,23 +134,29 @@ impl Lua {
         self.arena.metrics().arm_gc_check();
     }
 
-    /// Enter the sweep straight after the interner's prune: a string allocated
-    /// and dropped in between would be freed while still interned.
-    fn start_sweeping(&mut self) {
-        self.arena
-            .finish_marking()
-            .expect("arena is fully marked")
-            .start_sweeping();
+    /// Mark to completion, settle weak tables and the interner, and start
+    /// sweeping, with no mutation in between: an object allocated and dropped
+    /// there would be freed while still held by them.
+    fn finalize_and_sweep(&mut self) {
+        // A resurrected value can hold further ephemeron keys, so mark and
+        // rerun until a pass resurrects nothing.
+        while self.marked().finalize(|fc, _| Table::converge_weak(fc)) {}
+        self.marked().finalize(|fc, root| {
+            Table::clear_weak(fc);
+            fc.clear_deferred();
+            root.interner.prune(fc);
+        });
+        self.marked().start_sweeping();
+    }
+
+    fn marked(&mut self) -> MarkedArena<'_, Rootable![State<'_>]> {
+        self.arena.finish_marking().expect("not sweeping")
     }
 
     /// Run the current cycle, or a new one if the collector sleeps, to its end.
     fn finish_cycle(&mut self) {
         if self.arena.collection_phase() != CollectionPhase::Sweeping {
-            self.arena
-                .finish_marking()
-                .expect("not sweeping")
-                .finalize(|fc, root| root.interner.prune(fc));
-            self.start_sweeping();
+            self.finalize_and_sweep();
         }
         self.arena.finish_cycle();
     }

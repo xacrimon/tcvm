@@ -2,7 +2,7 @@ use core::hash::{Hash, Hasher};
 use std::hint;
 use std::marker::PhantomData;
 
-use crate::dmm::{Collect, Gc, Mutation, collect::Trace};
+use crate::dmm::{Collect, Finalization, Gc, Mutation, collect::Trace};
 use crate::env::function::Function;
 use crate::env::string::LuaString;
 use crate::env::table::Table;
@@ -388,6 +388,53 @@ impl<'gc> Value<'gc> {
     #[inline(always)]
     pub(crate) fn same_bits(&self, other: &Self) -> bool {
         self.bits == other.bits
+    }
+
+    /// An object a weak table may drop. Strings and boxed integers are collectable but count
+    /// as values (§2.5.4).
+    #[inline(always)]
+    pub(crate) fn is_weak_object(&self) -> bool {
+        self.is_boxed()
+            && matches!(
+                self.tag(),
+                TAG_TABLE | TAG_FUNCTION | TAG_THREAD | TAG_USERDATA
+            )
+    }
+
+    /// This value's object, erased; `None` for non-objects.
+    #[inline]
+    fn object(self) -> Option<Gc<'gc, ()>> {
+        // The range check with an unreachable fallthrough, and `from_inner` over `get_*`, let
+        // LLVM fold the arms into one address computation.
+        if !(self.is_boxed() && matches!(self.tag(), TAG_USERDATA..=TAG_THREAD)) {
+            return None;
+        }
+        // `from_ptr` steps back over the header using each type's own layout.
+        unsafe {
+            Some(match self.tag() {
+                TAG_BOXED_INT => Gc::erase(self.ptr::<i64>()),
+                TAG_STRING => Gc::erase(LuaString::from_inner(self.ptr()).inner()),
+                TAG_TABLE => Gc::erase(Table::from_inner(self.ptr()).inner()),
+                TAG_FUNCTION => Gc::erase(Function::from_inner(self.ptr()).inner()),
+                TAG_THREAD => Gc::erase(Thread::from_inner(self.ptr()).inner()),
+                TAG_USERDATA => Gc::erase(Userdata::from_inner(self.ptr()).inner()),
+                _ => hint::unreachable_unchecked(),
+            })
+        }
+    }
+
+    /// Whether marking has not reached this value's object; false for non-objects.
+    #[inline]
+    pub(crate) fn is_dead(self, fc: &Finalization<'gc>) -> bool {
+        self.object().is_some_and(|gc| Gc::is_dead(fc, gc))
+    }
+
+    /// Keep this value's object, and everything it reaches, alive this cycle.
+    #[inline]
+    pub(crate) fn resurrect(self, fc: &Finalization<'gc>) {
+        if let Some(gc) = self.object() {
+            Gc::resurrect(fc, gc);
+        }
     }
 }
 
