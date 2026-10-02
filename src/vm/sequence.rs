@@ -213,6 +213,10 @@ macro_rules! __seq_trace_pointers {
             fn trace_gc_weak(&mut self, gc: $crate::dmm::GcWeak<'__gc, ()>) {
                 self.0.trace_gc_weak(gc)
             }
+            #[inline]
+            fn defer(&mut self) {
+                self.0.defer()
+            }
         }
         let mut __adapter = __DynTraceAdapter($cc);
         $crate::dmm::Collect::trace($self, &mut __adapter);

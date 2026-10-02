@@ -4,13 +4,13 @@ use core::marker::PhantomData;
 use core::ptr::NonNull;
 use core::{mem, ptr};
 
-use crate::dmm::{collect::Collect, context::Context};
+use crate::dmm::{Gc, collect::Collect, context::Context};
 
 /// A thin-pointer-sized box containing a type-erased GC object.
 /// Stores the metadata required by the GC algorithm inline (see `GcBoxInner`
 /// for its typed counterpart).
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct GcBox(NonNull<GcBoxInner<()>>);
 
 impl GcBox {
@@ -35,6 +35,16 @@ impl GcBox {
             // Don't create a reference, to keep the full provenance.
             // Also, this gives us interior mutability "for free".
             ptr::addr_of_mut!((*ptr).value) as *mut T
+        }
+    }
+
+    /// # Safety
+    /// `'gc` must be the branding lifetime of the arena that owns this box.
+    #[inline(always)]
+    pub(crate) unsafe fn as_gc<'gc>(self) -> Gc<'gc, ()> {
+        Gc {
+            ptr: self.0,
+            _invariant: PhantomData,
         }
     }
 

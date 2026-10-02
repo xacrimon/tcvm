@@ -129,6 +129,18 @@ impl<'gc> Finalization<'gc> {
     pub(crate) fn resurrect(&self, gc_box: GcBox) {
         self.context.resurrect(gc_box)
     }
+
+    /// The objects whose trace called [`Trace::defer`] this cycle, each once.
+    pub fn deferred(&self) -> Vec<Gc<'gc, ()>> {
+        let boxes = self.context.deferred.dedup();
+        boxes.into_iter().map(|b| unsafe { b.as_gc() }).collect()
+    }
+
+    /// Mark the [`Finalization::deferred`] objects handled; sweeping refuses to start until they
+    /// are.
+    pub fn clear_deferred(&self) {
+        self.context.deferred.clear()
+    }
 }
 
 impl<'gc> Trace<'gc> for Context {
@@ -140,6 +152,11 @@ impl<'gc> Trace<'gc> for Context {
     fn trace_gc_weak(&mut self, gc: GcWeak<'gc, ()>) {
         let gc_box = unsafe { GcBox::erase(gc.inner.ptr) };
         Context::trace_weak(self, gc_box)
+    }
+
+    fn defer(&mut self) {
+        let gc_box = self.tracing.expect("`defer` outside of an object's trace");
+        self.deferred.push(gc_box);
     }
 }
 
@@ -205,6 +222,12 @@ pub(crate) struct Context {
     // A queue of gray objects that became gray as a result
     // of a write barrier.
     gray_again: Queue<GcBox>,
+
+    // The object `mark_one` is tracing, for `Trace::defer`.
+    tracing: Option<GcBox>,
+
+    // Objects queued by `Trace::defer`, with duplicates; see `Finalization::deferred`.
+    deferred: Queue<GcBox>,
 }
 
 impl Drop for Context {
@@ -251,6 +274,8 @@ impl Context {
             root_needs_trace: true,
             gray: Queue::new(),
             gray_again: Queue::new(),
+            tracing: None,
+            deferred: Queue::new(),
         }
     }
 
@@ -324,6 +349,11 @@ impl Context {
                         if stop <= Stop::FullyMarked {
                             break;
                         } else {
+                            // A deferred object may hold pointers that sweeping is about to free.
+                            assert!(
+                                cx.deferred.is_empty(),
+                                "deferred objects must be cleared in finalization before sweeping"
+                            );
                             // If we have no gray objects left, we enter the sweep phase.
                             cx.switch(Phase::Sweep);
 
@@ -638,6 +668,7 @@ impl Context {
 
             impl<'a> Drop for DropGuard<'a> {
                 fn drop(&mut self) {
+                    self.context.tracing = None;
                     self.context.make_gray_again(self.gc_box);
                 }
             }
@@ -647,7 +678,9 @@ impl Context {
                 gc_box,
             };
             debug_assert!(gc_box.header().is_live());
+            guard.context.tracing = Some(gc_box);
             unsafe { gc_box.trace_value(guard.context) }
+            guard.context.tracing = None;
             mem::forget(guard);
 
             ControlFlow::Continue(())
@@ -781,8 +814,8 @@ impl<'a> PhaseGuard<'a> {
     }
 }
 
-// A shared, internally mutable `Vec<T>` that avoids the overhead of `RefCell`. Used for the "gray"
-// and "gray again" queues.
+// A shared, internally mutable `Vec<T>` that avoids the overhead of `RefCell`. Used for the "gray",
+// "gray again" and deferred queues.
 //
 // SAFETY: We do not return any references at all to the contents of the internal `UnsafeCell`, nor
 // do we provide any methods with callbacks. Since this type is `!Sync`, only one reference to the
@@ -811,5 +844,19 @@ impl<T> Queue<T> {
 
     fn pop(&self) -> Option<T> {
         unsafe { (*self.vec.get()).pop() }
+    }
+
+    fn clear(&self) {
+        unsafe { (*self.vec.get()).clear() }
+    }
+}
+
+impl<T: Copy + Ord> Queue<T> {
+    /// Drop duplicates in place and return a copy of the rest.
+    fn dedup(&self) -> Vec<T> {
+        let vec = unsafe { &mut *self.vec.get() };
+        vec.sort_unstable();
+        vec.dedup();
+        vec.clone()
     }
 }
