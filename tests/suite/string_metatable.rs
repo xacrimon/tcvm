@@ -2,44 +2,7 @@
 //! arithmetic metamethods that coerce numeric strings (lstrlib.c). Expected
 //! strings come from `lua` 5.5.1 running the same chunk.
 
-use tcvm::env::Value;
-use tcvm::{Executor, LoadError, Lua, RuntimeError};
-
-/// Kept on the chunk's first line so error positions are unaffected.
-const PRELUDE: &str = "local function cat(...) local t = table.pack(...) \
-    for i = 1, t.n do t[i] = tostring(t[i]) end return table.concat(t, ' ') end ";
-
-fn run(src: &str) -> Result<String, String> {
-    let mut lua = Lua::new();
-    lua.load_all();
-    let src = format!("{PRELUDE}{src}");
-    let ex = lua
-        .try_enter(|ctx| -> Result<_, LoadError> {
-            let chunk = ctx.load(&src, Some("=c"))?;
-            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
-        })
-        .expect("load");
-    let as_string = |v: Value<'_>| {
-        let s = v.get_string().expect("string value");
-        String::from_utf8_lossy(s.as_bytes()).into_owned()
-    };
-    match lua.finish(&ex) {
-        Ok(()) => Ok(lua.enter(|ctx| {
-            let v = ctx.fetch(&ex).take_result::<Value>(ctx).expect("result");
-            as_string(v)
-        })),
-        Err(RuntimeError::Lua(e)) => Err(lua.enter(|ctx| as_string(ctx.fetch(&e).value()))),
-        Err(e) => panic!("unexpected failure for {src:?}: {e:?}"),
-    }
-}
-
-fn ok(src: &str) -> String {
-    run(src).unwrap_or_else(|e| panic!("{src:?} raised {e:?}"))
-}
-
-fn err(src: &str) -> String {
-    run(src).expect_err(src)
-}
+use crate::common::{err, ok};
 
 #[test]
 fn methods_resolve_through_string_table() {

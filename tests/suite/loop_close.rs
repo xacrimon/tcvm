@@ -2,18 +2,10 @@
 //! iteration's closure gets a fresh upvalue and a later local reusing the
 //! register doesn't alias an open one. Regression for #12.
 
-use tcvm::{Executor, LoadError, Lua};
+use crate::common::eval;
 
 fn run(src: &str) -> i64 {
-    let mut lua = Lua::new();
-    lua.load_all();
-    let ex = lua
-        .try_enter(|ctx| -> Result<_, LoadError> {
-            let chunk = ctx.load(src, Some("loop_close"))?;
-            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
-        })
-        .expect("load");
-    lua.execute(&ex).expect("run")
+    eval(src)
 }
 
 #[test]

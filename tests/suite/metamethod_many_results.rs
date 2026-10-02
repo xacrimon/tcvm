@@ -2,18 +2,10 @@
 //! continuation reads its results up to `top`, so the count doesn't wrap at
 //! 256. Expected values come from `lua` 5.5.1.
 
-use tcvm::{Executor, LoadError, Lua};
+use crate::common::eval;
 
 fn run(src: &str) -> i64 {
-    let mut lua = Lua::new();
-    lua.load_all();
-    let ex = lua
-        .try_enter(|ctx| -> Result<_, LoadError> {
-            let chunk = ctx.load(src, Some("=t"))?;
-            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
-        })
-        .expect("load");
-    lua.execute(&ex).expect("run")
+    eval(src)
 }
 
 const PRELUDE: &str = "local t = {} for i = 1, 256 do t[i] = i end ";

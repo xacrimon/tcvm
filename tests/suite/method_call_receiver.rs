@@ -2,18 +2,10 @@
 //! must not leave the receiver below the call block, where a MULTRET
 //! consumer would see it as an extra leading value. Regression for #95.
 
-use tcvm::{Executor, LoadError, Lua};
+use crate::common::eval;
 
 fn run(src: &str) -> i64 {
-    let mut lua = Lua::new();
-    lua.load_all();
-    let ex = lua
-        .try_enter(|ctx| -> Result<_, LoadError> {
-            let chunk = ctx.load(src, Some("method_call_receiver"))?;
-            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
-        })
-        .expect("load");
-    lua.execute(&ex).expect("run")
+    eval(src)
 }
 
 const PRELUDE: &str = "local t = setmetatable({}, {__index = {m = function(self, ...) return ... end}})\n\

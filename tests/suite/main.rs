@@ -5,6 +5,7 @@ mod builtin_metamethods;
 mod call_chain_limit;
 mod call_metamethod_multret;
 mod call_sugar;
+mod common;
 mod compare_ops;
 mod coroutine_basic;
 mod coroutine_close;

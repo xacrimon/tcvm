@@ -2,12 +2,7 @@
 //! (#185), including on non-tables that carry them. Expected strings come from `lua`
 //! 5.5.1 running the same chunk.
 
-use tcvm::env::Value;
-use tcvm::{Executor, LoadError, Lua, RuntimeError};
-
-/// Kept on the chunk's first line so error positions are unaffected.
-const PRELUDE: &str = "local function cat(...) local t = table.pack(...) \
-    for i = 1, t.n do t[i] = tostring(t[i]) end return table.concat(t, ' ') end ";
+use crate::common::ok;
 
 /// `proxy(store)` logs each metamethod call; `flush()` returns and clears the log.
 const PROXY: &str = r#"
@@ -23,32 +18,7 @@ local function flush() local s = table.concat(log, ' '); log = {}; return s end
 "#;
 
 fn run(src: &str) -> String {
-    let mut lua = Lua::new();
-    lua.load_all();
-    let src = format!("{PRELUDE}{PROXY}{src}");
-    let ex = lua
-        .try_enter(|ctx| -> Result<_, LoadError> {
-            let chunk = ctx.load(&src, Some("=c"))?;
-            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
-        })
-        .expect("load");
-    match lua.finish(&ex) {
-        Ok(()) => lua.enter(|ctx| {
-            let v = ctx.fetch(&ex).take_result::<Value>(ctx).expect("result");
-            let s = v.get_string().expect("string result");
-            String::from_utf8_lossy(s.as_bytes()).into_owned()
-        }),
-        Err(RuntimeError::Lua(e)) => panic!(
-            "{src:?} raised {:?}",
-            lua.enter(|ctx| {
-                ctx.fetch(&e)
-                    .value()
-                    .get_string()
-                    .map(|s| String::from_utf8_lossy(s.as_bytes()).into_owned())
-            })
-        ),
-        Err(e) => panic!("unexpected failure for {src:?}: {e:?}"),
-    }
+    ok(&format!("{PROXY}{src}"))
 }
 
 /// The repro from #185: proxies read, written and measured through metamethods.

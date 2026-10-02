@@ -1,5 +1,5 @@
 //! `pcall` / `xpcall`. Expected values come from `lua` 5.5.1 running the
-//! same snippets (chunk name `=t`); the message handler runs *before* the
+//! same snippets (chunk name `=c`); the message handler runs *before* the
 //! stack unwinds, which the native-handler test observes directly.
 
 use std::pin::Pin;
@@ -7,6 +7,8 @@ use std::pin::Pin;
 use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
 use tcvm::vm::sequence::{BoxSequence, CallbackAction, Execution, Sequence, SequencePoll};
 use tcvm::{Context, Executor, LoadError, Lua};
+
+use crate::common::{err, eval};
 
 fn run_with<T: for<'gc> tcvm::FromMultiValue<'gc>>(
     src: &str,
@@ -17,40 +19,17 @@ fn run_with<T: for<'gc> tcvm::FromMultiValue<'gc>>(
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
             setup(ctx);
-            let chunk = ctx.load(src, Some("=t"))?;
+            let chunk = ctx.load(src, Some("=c"))?;
             Ok(ctx.stash(Executor::start(ctx, chunk, ())))
         })
         .expect("load");
     lua.execute(&ex).expect("run")
 }
 
-fn run_i64(src: &str) -> i64 {
-    run_with(src, |_| {})
-}
-
-/// The message of the error `src` lets escape to the host.
-fn run_err(src: &str) -> String {
-    let mut lua = Lua::new();
-    lua.load_all();
-    let ex = lua
-        .try_enter(|ctx| -> Result<_, LoadError> {
-            let chunk = ctx.load(src, Some("=t"))?;
-            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
-        })
-        .expect("load");
-    let tcvm::RuntimeError::Lua(stashed) = lua.execute::<()>(&ex).expect_err("must raise") else {
-        panic!("not a Lua error")
-    };
-    lua.enter(|ctx| {
-        let s = ctx.fetch(&stashed).value().get_string().unwrap();
-        String::from_utf8_lossy(s.as_bytes()).into_owned()
-    })
-}
-
 /// `return (cond) and 1 or 0` for a chunk that compares against expected
 /// strings inline, so failures point at the Lua expression.
 fn check(src: &str) {
-    assert_eq!(run_i64(src), 1, "{src}");
+    assert_eq!(eval::<i64>(src), 1, "{src}");
 }
 
 #[test]
@@ -61,10 +40,10 @@ fn pcall_results() {
     check("return select('#', pcall(function() return 1, 2, 3 end)) == 4 and 1 or 0");
     check("local ok, e = pcall(error, 'm') return (not ok and e == 'm') and 1 or 0");
     check(
-        "local ok, e = pcall(function() error('m') end) return (not ok and e == 't:1: m') and 1 or 0",
+        "local ok, e = pcall(function() error('m') end) return (not ok and e == 'c:1: m') and 1 or 0",
     );
     check(
-        "local ok, e = pcall(function() local x return x.y end) return (not ok and e == 't:1: attempt to index a nil value') and 1 or 0",
+        "local ok, e = pcall(function() local x return x.y end) return (not ok and e == 'c:1: attempt to index a nil value') and 1 or 0",
     );
     check("local ok, e = pcall(error, {code = 7}) return (not ok and e.code == 7) and 1 or 0");
     check("local ok, e = pcall(error) return (not ok and e == '<no error object>') and 1 or 0");
@@ -99,19 +78,19 @@ fn pcall_of_non_functions() {
 #[test]
 fn pcall_without_arguments_is_an_error() {
     assert_eq!(
-        run_err("pcall()"),
-        "t:1: bad argument #1 to 'pcall' (value expected)"
+        err("pcall()"),
+        "c:1: bad argument #1 to 'pcall' (value expected)"
     );
 }
 
 #[test]
 fn xpcall_handler_transforms_the_error() {
     check(
-        "local ok, e = xpcall(function() error('orig') end, function(e) return 'H:' .. e end) return (not ok and e == 'H:t:1: orig') and 1 or 0",
+        "local ok, e = xpcall(function() error('orig') end, function(e) return 'H:' .. e end) return (not ok and e == 'H:c:1: orig') and 1 or 0",
     );
     // Only the handler's first result is used.
     check(
-        "local ok, e, extra = xpcall(function() error('orig') end, function(e) return e, 'extra' end) return (not ok and e == 't:1: orig' and extra == nil) and 1 or 0",
+        "local ok, e, extra = xpcall(function() error('orig') end, function(e) return e, 'extra' end) return (not ok and e == 'c:1: orig' and extra == nil) and 1 or 0",
     );
     check(
         "local ok, t = xpcall(function() error({}) end, function(e) return type(e) end) return (not ok and t == 'table') and 1 or 0",
@@ -140,7 +119,7 @@ fn xpcall_handler_errors_and_nesting() {
         "local n = 0 local ok, e = xpcall(function() error('orig') end, function(e) n = n + 1 error('in handler') end) return (not ok and e == 'error in error handling' and n == 201) and 1 or 0",
     );
     check(
-        "local m = 0 local ok, e = xpcall(function() error('orig') end, function(e) m = m + 1 if m == 1 then error('once') end return 'H' .. m .. ':' .. e end) return (not ok and e == 'H2:t:1: once') and 1 or 0",
+        "local m = 0 local ok, e = xpcall(function() error('orig') end, function(e) m = m + 1 if m == 1 then error('once') end return 'H' .. m .. ':' .. e end) return (not ok and e == 'H2:c:1: once') and 1 or 0",
     );
     // An inner pcall shadows the outer handler for errors it catches.
     check(
@@ -191,7 +170,7 @@ fn xpcall_across_a_yield() {
          end)\n\
          local first = co()\n\
          local ok, e = co()\n\
-         return (first == 1 and not ok and e == 'HY:t:2: after yield') and 1 or 0",
+         return (first == 1 and not ok and e == 'HY:c:2: after yield') and 1 or 0",
     );
 }
 
@@ -235,7 +214,7 @@ fn handler_may_yield() {
          end)\n\
          local ok1, v1 = coroutine.resume(co)\n\
          local ok2, ok, e = coroutine.resume(co, 'R:')\n\
-         return (ok1 and v1 == 'mid' and ok2 and not ok and e == 'H:R:t:2: orig') and 1 or 0",
+         return (ok1 and v1 == 'mid' and ok2 and not ok and e == 'H:R:c:2: orig') and 1 or 0",
     );
 }
 
@@ -302,7 +281,7 @@ fn pass_through_sequence_is_transparent_to_errors() {
     let v: i64 = run_with(
         "local ok, e = pcall(function() through(function() error('x') end) end)\n\
          local a, b = through(function() return 1, 2 end)\n\
-         return (not ok and e == 't:1: x' and a == 1 and b == 2) and 1 or 0",
+         return (not ok and e == 'c:1: x' and a == 1 and b == 2) and 1 or 0",
         install_through,
     );
     assert_eq!(v, 1);

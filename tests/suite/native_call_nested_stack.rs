@@ -9,18 +9,10 @@
 //!
 //! Every expectation is checked against `lua` 5.5.0.
 
-use tcvm::{Executor, LoadError, Lua};
+use crate::common::eval;
 
 fn eval_bool(src: &str) -> bool {
-    let mut lua = Lua::new();
-    lua.load_all();
-    let ex = lua
-        .try_enter(|ctx| -> Result<_, LoadError> {
-            let chunk = ctx.load(src, Some("native_call_nested_stack"))?;
-            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
-        })
-        .expect("load");
-    lua.execute::<bool>(&ex).expect("run")
+    eval(src)
 }
 
 #[test]

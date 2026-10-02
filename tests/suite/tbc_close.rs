@@ -2,29 +2,14 @@
 //! handlers and yields. Expected strings come from `lua` 5.5.1 running the
 //! same chunk (`=c`) after the one-line prelude.
 
-use tcvm::env::Value;
-use tcvm::{Executor, LoadError, Lua};
+use crate::common::ok;
 
 /// `out` logs its arguments; `mk(name, fail)` makes a value whose `__close`
 /// logs its name, argument count and error, then raises `fail` if given.
 const PRELUDE: &str = "local log = {} local function out(...) local t = table.pack(...) for i = 1, t.n do t[i] = tostring(t[i]) end log[#log + 1] = table.concat(t, ' ') end local function mk(name, fail) return setmetatable({}, {__close = function(...) local _, e = ... out(name, select('#', ...), e) if fail then error(fail, 0) end end}) end ";
 
 fn run(src: &str) -> String {
-    let mut lua = Lua::new();
-    lua.load_all();
-    let src = format!("{PRELUDE}{src}");
-    let ex = lua
-        .try_enter(|ctx| -> Result<_, LoadError> {
-            let chunk = ctx.load(&src, Some("=c"))?;
-            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
-        })
-        .expect("load");
-    lua.finish(&ex)
-        .unwrap_or_else(|e| panic!("{src:?} raised {e:?}"));
-    lua.enter(|ctx| {
-        let v = ctx.fetch(&ex).take_result::<Value>(ctx).expect("result");
-        String::from_utf8_lossy(v.get_string().expect("string").as_bytes()).into_owned()
-    })
+    ok(&format!("{PRELUDE}{src}"))
 }
 
 #[test]
