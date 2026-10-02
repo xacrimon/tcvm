@@ -98,7 +98,7 @@ pub struct Interner<'gc>(Gc<'gc, RefLock<InternerState<'gc>>>);
 
 /// Interned strings, deliberately untraced so a string dies once nothing else
 /// references it. Sound only because [`Interner::prune`] drops dead strings after
-/// marking and before every sweep (see `Lua::collect_debt`), so no entry ever
+/// marking and before every sweep (see `Lua::finalize_and_sweep`), so no entry ever
 /// points at freed memory.
 struct InternerState<'gc> {
     table: HashTable<LuaString<'gc>, MetricsAlloc<'gc>>,

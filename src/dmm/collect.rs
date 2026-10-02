@@ -66,6 +66,8 @@ pub trait Trace<'gc> {
 
     /// Queue the object being traced for [`Finalization::deferred`], for pointers its trace
     /// skipped. No default: a tracer that dropped the request would leave them dangling.
+    /// The arena's owner decides what a deferred object is; in tcvm only tables defer
+    /// (`Table::converge_weak`).
     ///
     /// [`Finalization::deferred`]: crate::dmm::Finalization::deferred
     fn defer(&mut self);

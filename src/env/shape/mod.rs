@@ -25,6 +25,7 @@ use crate::dmm::barrier::unlock;
 use crate::dmm::{Collect, Gc, GcWeak, Lock, Mutation, RefLock, Trace};
 use crate::env::for_each_metamethod;
 use crate::env::string::LuaString;
+use crate::env::value::Value;
 
 /// V8-style "Map" / hidden class. Copy wrapper over a single Gc pointer
 /// for cheap pass-by-value and pointer-equality identity checks.
@@ -179,7 +180,7 @@ pub struct ShapeData<'gc> {
     /// transitions; preserved across metatable transitions.
     pub slot_count: u32,
 
-    /// Metatable identity + live metamethod bits. `None` = no
+    /// Metatable identity + live metamethod bits and weak mode. `None` = no
     /// metatable. Different metatables → different shapes; transitions
     /// go through `transition_set_metatable`.
     pub mt_cache: Option<MtCache<'gc>>,
@@ -203,11 +204,37 @@ pub struct ShapeData<'gc> {
     pub descriptors: Box<[Descriptor<'gc>]>,
 }
 
+bitflags! {
+    /// A metatable's `__mode`.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+    pub struct WeakMode: u8 {
+        const KEYS = 1 << 0;
+        const VALUES = 1 << 1;
+    }
+}
+
+impl WeakMode {
+    /// A string containing `k` and/or `v`; anything else is strong. Unlike PUC's `getmode`, bytes
+    /// after a NUL count.
+    pub fn of(mode: Value<'_>) -> Self {
+        let Some(s) = mode.get_string() else {
+            return Self::empty();
+        };
+        let mut m = Self::empty();
+        m.set(Self::KEYS, s.as_bytes().contains(&b'k'));
+        m.set(Self::VALUES, s.as_bytes().contains(&b'v'));
+        m
+    }
+}
+
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub struct MtCacheData<'gc> {
     #[collect(require_static)]
     pub bits: Cell<MetamethodBits>,
+    /// Read by the collector when it traces a table with this metatable.
+    #[collect(require_static)]
+    pub weak: Cell<WeakMode>,
     /// Lazily-allocated dict-mode sentinel for tables that drop into
     /// dict mode while carrying this metatable. Populated on the first
     /// call to `MtCache::ensure_dict_sentinel`; subsequent calls return
@@ -251,11 +278,12 @@ impl<'gc> MtCacheData<'gc> {
 }
 
 impl<'gc> MtCache<'gc> {
-    pub fn new(mc: &Mutation<'gc>, bits: MetamethodBits) -> Self {
+    pub fn new(mc: &Mutation<'gc>, bits: MetamethodBits, weak: WeakMode) -> Self {
         MtCache(Gc::new(
             mc,
             MtCacheData {
                 bits: Cell::new(bits),
+                weak: Cell::new(weak),
                 dict_sentinel: Lock::new(None),
             },
         ))
@@ -296,6 +324,21 @@ impl<'gc> MtCache<'gc> {
     #[inline]
     pub fn update(self, bit: MetamethodBits, value: crate::env::value::Value<'gc>) {
         self.0.update(bit, value);
+    }
+
+    #[inline]
+    pub fn weak(self) -> WeakMode {
+        self.0.weak.get()
+    }
+
+    /// Mirror a write of `key` to this cache's metatable into its bits and weak mode.
+    #[inline]
+    pub fn mirror(self, key: LuaString<'gc>, value: Value<'gc>) {
+        match metamethod_bit_of_bytes(key.as_bytes()) {
+            Some(bit) => self.update(bit, value),
+            None if key.as_bytes() == b"__mode" => self.0.weak.set(WeakMode::of(value)),
+            None => {}
+        }
     }
 
     #[inline]

@@ -34,6 +34,8 @@ macro_rules! emit_struct {
             pub pairs: LuaString<'gc>,
             /// `__close`, called when a to-be-closed variable goes out of scope.
             pub close: LuaString<'gc>,
+            /// `__mode`, which makes a table's keys and/or values weak.
+            pub mode: LuaString<'gc>,
         }
     };
 }
@@ -49,6 +51,7 @@ macro_rules! emit_intern_all {
                     metatable: interner.intern(mc, b"__metatable"),
                     pairs: interner.intern(mc, b"__pairs"),
                     close: interner.intern(mc, b"__close"),
+                    mode: interner.intern(mc, b"__mode"),
                 }
             }
 

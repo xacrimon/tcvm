@@ -6,8 +6,10 @@ use hash_part::{int_hash, lua_string_hash};
 use hashbrown::HashTable;
 
 use crate::Context;
-use crate::dmm::{Collect, Gc, Mutation, RefLock, allocator_api::MetricsAlloc};
-use crate::env::shape::{self, MAX_PROPERTIES_FAST, Shape};
+use crate::dmm::{
+    Collect, Finalization, Gc, Mutation, RefLock, Trace, allocator_api::MetricsAlloc,
+};
+use crate::env::shape::{self, MAX_PROPERTIES_FAST, Shape, WeakMode};
 use crate::env::string::LuaString;
 use crate::env::value::{Value, ValueKind, value_hash};
 
@@ -57,8 +59,7 @@ impl<'gc> Table<'gc> {
     /// Replace the metatable. Re-shapes the table along the
     /// `set_metatable` transition edge so subsequent metamethod queries
     /// observe the new metatable's identity. Subsequent in-place
-    /// mutations of the metatable update its shared `MtCache` bitset
-    /// in place.
+    /// mutations of the metatable update its shared `MtCache` in place.
     pub fn set_metatable(self, ctx: Context<'gc>, mt: Option<Table<'gc>>) {
         let new_cache = mt.map(|t| t.ensure_mt_cache(ctx));
         let mut state = self.0.borrow_mut(ctx.mutation());
@@ -85,8 +86,8 @@ impl<'gc> Table<'gc> {
 
     /// Lazily allocate this table's `MtCache` and return it. The
     /// cache's identity is invariant across mutations of *this table*;
-    /// metamethod-named writes mutate the cache's bitset in place.
-    /// First-adoption walks the table once to compute initial bits.
+    /// metamethod-named and `__mode` writes update the cache in place.
+    /// First adoption computes the initial bits and weak mode.
     pub(crate) fn ensure_mt_cache(self, ctx: Context<'gc>) -> shape::MtCache<'gc> {
         {
             let state = self.0.borrow();
@@ -104,14 +105,42 @@ impl<'gc> Table<'gc> {
                 }
             }
         }
-        let cache = shape::MtCache::new(ctx.mutation(), bits);
+        let weak = WeakMode::of(self.raw_get(Value::string(ctx.symbols().mode)));
+        let cache = shape::MtCache::new(ctx.mutation(), bits, weak);
         self.0.borrow_mut(ctx.mutation()).mt_cache = Some(cache);
         cache
     }
+
+    /// One ephemeron pass over the deferred weak tables (see [`TableState::converge`]); returns
+    /// whether marking must resume and the pass rerun.
+    pub(crate) fn converge_weak(fc: &Finalization<'gc>) -> bool {
+        let mut resurrected = false;
+        for t in fc.deferred() {
+            resurrected |= unsafe { Self::from_deferred(t) }.0.borrow().converge(fc);
+        }
+        resurrected
+    }
+
+    /// Clear the deferred weak tables' dead entries (see [`TableState::clear_dead`]).
+    pub(crate) fn clear_weak(fc: &Finalization<'gc>) {
+        for t in fc.deferred() {
+            // Storing nil adopts no pointer, so no barrier is needed. One would re-gray the
+            // table, and its retrace would defer it again after `clear_deferred`, tripping the
+            // sweep assert.
+            unsafe { Self::from_deferred(t).0.as_ref().as_checked_cell() }
+                .borrow_mut()
+                .clear_dead(fc);
+        }
+    }
+
+    /// # Safety
+    /// `gc` must come from [`Finalization::deferred`], and `TableState::trace` must be the only
+    /// caller of `Trace::defer`.
+    unsafe fn from_deferred(gc: Gc<'gc, ()>) -> Self {
+        Table(unsafe { Gc::cast(gc) })
+    }
 }
 
-#[derive(Collect)]
-#[collect(internal, no_drop)]
 pub struct TableState<'gc> {
     /// Hidden class describing string-keyed property layout + metatable
     /// identity. In dict mode, this is a per-table sentinel shape; ICs
@@ -127,7 +156,6 @@ pub struct TableState<'gc> {
     /// Every other integer key, and floats with an integral value.
     int_hash: hash_part::Part<'gc, i64, MetricsAlloc<'gc>>,
     /// Last border `raw_len` found, as Lua 5.5's `lenhint`.
-    #[collect(require_static)]
     len_hint: Cell<usize>,
     /// Keys that are neither strings nor numbers with an integral value.
     misc_hash: hash_part::Part<'gc, Value<'gc>, MetricsAlloc<'gc>>,
@@ -140,11 +168,57 @@ pub struct TableState<'gc> {
     /// invocation). Identity is mirrored in `shape.mt_cache`.
     metatable: Option<Table<'gc>>,
     /// Metamethod-presence cache for *this* table when it's used as a
-    /// metatable (lazily allocated on first adoption). The cache's
-    /// `bits` field is updated in place by every metamethod-named
+    /// metatable (lazily allocated on first adoption). Its bits and weak
+    /// mode are updated in place by every metamethod-named or `__mode`
     /// write to this table; downstream shapes share this same `Gc`
     /// pointer and observe the updates without a freshness check.
     mt_cache: Option<shape::MtCache<'gc>>,
+}
+
+// SAFETY: a weak table defers itself, and every edge it skips is resurrected by `converge` or
+// dropped by `clear_dead` before sweeping (see `Lua::finalize_and_sweep`).
+unsafe impl<'gc> Collect<'gc> for TableState<'gc> {
+    fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
+        cc.trace(&self.shape);
+        cc.trace(&self.metatable);
+        cc.trace(&self.mt_cache);
+        let mode = self.weak_mode();
+        if mode.is_empty() {
+            cc.trace(&self.properties);
+            cc.trace(&self.array);
+            cc.trace(&self.int_hash);
+            cc.trace(&self.misc_hash);
+            cc.trace(&self.dict);
+            return;
+        }
+        cc.defer();
+        let weak_values = mode.contains(WeakMode::VALUES);
+        let value = |cc: &mut T, v: &Value<'gc>| {
+            if !(weak_values && v.is_weak_object()) {
+                cc.trace(v);
+            }
+        };
+        for v in self.properties.iter().chain(&self.array) {
+            value(cc, v);
+        }
+        for e in self.int_hash.iter() {
+            value(cc, &e.value);
+        }
+        if let Some(d) = &self.dict {
+            for e in d.table.iter().filter(|e| e.is_live()) {
+                cc.trace(&e.key);
+                value(cc, &e.value);
+            }
+        }
+        // Only this part has object keys. An ephemeron's value waits for `converge` to find out
+        // whether its key survives.
+        for e in self.misc_hash.iter().filter(|e| e.is_live()) {
+            if !(mode.contains(WeakMode::KEYS) && e.key.is_weak_object()) {
+                cc.trace(&e.key);
+                value(cc, &e.value);
+            }
+        }
+    }
 }
 
 /// Slow / dictionary-mode storage for string-keyed properties. Replaces
@@ -191,18 +265,81 @@ impl<'gc> TableState<'gc> {
         self.mt_cache
     }
 
-    /// If `key` is a metamethod-named string and this table has been
-    /// adopted as a metatable, mirror the write into the shared
-    /// `MtCache` bitset so downstream shapes observe the change without
-    /// a freshness check. Cheap on the common path: short-circuits when
-    /// `mt_cache` is None.
+    /// If this table has been adopted as a metatable, mirror a string-keyed
+    /// write into the shared `MtCache` (see [`shape::MtCache::mirror`]) so
+    /// downstream shapes observe it without a freshness check. Cheap on the
+    /// common path: short-circuits when `mt_cache` is None.
     #[inline]
     pub fn maybe_update_mt_bit(&self, key: Value<'gc>, value: Value<'gc>) {
         if let Some(s) = key.get_string()
             && let Some(cache) = self.mt_cache
-            && let Some(bit) = shape::metamethod_bit_of_bytes(s.as_bytes())
         {
-            cache.update(bit, value);
+            cache.mirror(s, value);
+        }
+    }
+
+    /// `__mode` of this table's metatable.
+    #[inline]
+    fn weak_mode(&self) -> WeakMode {
+        if self.metatable.is_none() {
+            return WeakMode::empty();
+        }
+        self.shape
+            .mt_cache()
+            .map_or(WeakMode::empty(), |c| c.weak())
+    }
+
+    /// One ephemeron pass after marking: resurrect the values of entries whose weak key
+    /// survived. Returns whether any was, so marking must resume and the pass rerun.
+    fn converge(&self, fc: &Finalization<'gc>) -> bool {
+        let weak_values = self.weak_mode().contains(WeakMode::VALUES);
+        let mut resurrected = false;
+        for e in self.misc_hash.iter().filter(|e| e.is_live()) {
+            if e.key.is_weak_object()
+                && !e.key.is_dead(fc)
+                && e.value.is_dead(fc)
+                && !(weak_values && e.value.is_weak_object())
+            {
+                e.value.resurrect(fc);
+                resurrected = true;
+            }
+        }
+        resurrected
+    }
+
+    /// Remove the entries whose key or value marking left dead, keeping their keys for `next`
+    /// as a deletion does. Mode-independent: only an edge `trace` skipped can be dead, so a
+    /// `__mode` changed mid-cycle can only make this drop entries early, which §2.5.4 allows.
+    fn clear_dead(&mut self, fc: &Finalization<'gc>) {
+        let mt_cache = self.mt_cache;
+        let cleared = |key| {
+            if let Some(c) = mt_cache {
+                c.mirror(key, Value::nil());
+            }
+        };
+        for (v, d) in self.properties.iter_mut().zip(self.shape.descriptors()) {
+            if v.is_dead(fc) {
+                *v = Value::nil();
+                cleared(d.key);
+            }
+        }
+        for v in self.array.iter_mut().filter(|v| v.is_dead(fc)) {
+            *v = Value::nil();
+        }
+        for e in self.int_hash.iter_mut().filter(|e| e.value.is_dead(fc)) {
+            e.value = Value::nil();
+        }
+        if let Some(d) = &mut self.dict {
+            for e in d.table.iter_mut().filter(|e| e.value.is_dead(fc)) {
+                e.value = Value::nil();
+                cleared(e.key);
+            }
+        }
+        // A dead entry's key may already be freed, so test liveness first.
+        for e in self.misc_hash.iter_mut() {
+            if e.is_live() && (e.key.is_dead(fc) || e.value.is_dead(fc)) {
+                e.value = Value::nil();
+            }
         }
     }
 
