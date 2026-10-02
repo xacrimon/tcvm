@@ -14,8 +14,6 @@ use crate::vm::sequence::{
     BoxSequence, CallbackAction, Catch, Execution, Sequence, SequencePoll, seq_trace_pointers,
 };
 
-// TODO(#27): _G, _VERSION
-
 pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[
         ("assert", lua_assert),
@@ -59,6 +57,12 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         "ipairs",
         Function::new_native(ctx.mutation(), lua_ipairs, &[Value::function(ipairs_iter)]),
     );
+
+    let globals = ctx.globals();
+    let s = |bytes: &[u8]| Value::string(LuaString::new(ctx, bytes));
+    globals.raw_set(ctx, s(b"_G"), Value::table(globals));
+    // The language version, as LuaJIT reports "Lua 5.1".
+    globals.raw_set(ctx, s(b"_VERSION"), s(b"Lua 5.5"));
 }
 
 /// `assert(v [, message, ...])` — if `v` is truthy, return all arguments
