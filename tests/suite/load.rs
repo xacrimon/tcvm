@@ -140,6 +140,30 @@ fn line_breaks() {
 }
 
 #[test]
+fn string_literals() {
+    // Long strings have no escapes, drop their first line break and turn
+    // each other one into `\n`; `\z`, backslash-line-break and malformed
+    // escapes in quoted strings follow llex.c (#245).
+    assert_eq!(
+        ok(r#"local function b(src)
+                  return table.concat({string.byte(load("return " .. src)(), 1, -1)}, ",")
+              end
+              return cat(b("[[a\\nb]]"), b("[[\nx]]"), b("[==[\r\na\r\nb]==]"),
+                  b("[[\n\r\r\n\n\r]]"), b("'a\\z \r\n\t b'"), b("'a\\\nb'"),
+                  b("'a\\\r\nb'"), b("'\\x41\\u{e9}\\0653'"))"#),
+        "97,92,110,98 120 97,10,98 10,10 97,98 97,10,98 97,10,98 65,195,169,65,51"
+    );
+    assert_eq!(
+        ok(r#"local function e(src)
+                  return (select(2, load("return " .. src)):match("^[^\n]*"))
+              end
+              return cat(e("'\\q'"), e("'\\['"), e("'\\x4'"), e("'\\u{48'"), e("'\\256'"))"#),
+        "Error: invalid escape sequence Error: invalid escape sequence \
+         Error: hexadecimal digit expected Error: missing '}' Error: decimal escape too large"
+    );
+}
+
+#[test]
 fn readonly_variables() {
     // `<close>` variables and named vararg parameters are read-only like
     // `<const>` ones (#242, #247), also through upvalues, and so is a

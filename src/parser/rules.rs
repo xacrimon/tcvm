@@ -1,7 +1,8 @@
 use super::{
     Parser,
     kind::{SyntaxKind, T},
-    machinery::{CompletedMarker, Marker, token_is_expr_start},
+    lit,
+    machinery::{CompletedMarker, Marker, Span, token_is_expr_start},
 };
 use crate::parser::machinery::{
     infix_binding_power, prefix_binding_power, token_is_literal, token_is_unary_op,
@@ -184,6 +185,13 @@ impl<'cache, 'source> Parser<'cache, 'source> {
     fn r_literal(&mut self) -> Option<CompletedMarker> {
         let marker = self.start(T![literal_expr]);
         let kind = self.at();
+        if kind == T![string]
+            && let Err(e) = lit::parse_string(self.source(self.span()))
+        {
+            let start = self.span().start();
+            let span = Span::new(start + e.range.start as u32, start + e.range.end as u32);
+            self.error_at(span, e.message, "in this escape");
+        }
         self.expect(kind);
         Some(marker.complete(self))
     }

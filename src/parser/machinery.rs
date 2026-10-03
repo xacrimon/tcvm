@@ -94,8 +94,12 @@ impl<'cache, 'source> State<'cache, 'source> {
     /// error: consumers treat a non-empty report list as a failed parse.
     /// Warnings would need their own channel rather than this list.
     pub fn error(&mut self, message: impl Into<String>, label: impl Into<String>) {
+        self.error_at(self.span(), message, label);
+    }
+
+    pub fn error_at(&mut self, span: Span, message: impl Into<String>, label: impl Into<String>) {
         self.reports.push(SyntaxReport {
-            span: self.span(),
+            span,
             message: message.into(),
             label: label.into(),
         });
