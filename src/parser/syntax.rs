@@ -126,6 +126,19 @@ impl Label {
     pub fn name(&self) -> Option<Ident> {
         self.0.first_child().and_then(Ident::cast)
     }
+
+    /// Only labels and `;` follow it in its block, which `until` doesn't end
+    /// (its condition sees the block's locals).
+    pub fn ends_block(&self) -> bool {
+        let in_repeat = self
+            .0
+            .parent()
+            .and_then(|block| block.parent())
+            .is_some_and(|stmt| stmt.kind() == T![repeat_stmt]);
+        !in_repeat
+            && std::iter::successors(self.0.next_sibling(), |n| n.next_sibling())
+                .all(|n| matches!(n.kind(), T![label] | T![;]))
+    }
 }
 
 ast_node!(Goto, T![goto]);

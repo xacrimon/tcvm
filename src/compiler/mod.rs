@@ -55,12 +55,12 @@ pub enum CompileErrorKind {
     Functions,
     #[error("too many constants")]
     Constants,
-    #[error("label defined multiple times")]
-    DuplicateLabel,
-    #[error("goto target label not found")]
-    GotoInvalid,
-    #[error("jump into scope of new local variable")]
-    JumpLocal,
+    #[error("label '{0}' already defined on line {1}")]
+    DuplicateLabel(String, u32),
+    #[error("no visible label '{0}' for <goto> at line {1}")]
+    GotoInvalid(String, u32),
+    #[error("<goto {0}> at line {1} jumps into the scope of '{2}'")]
+    JumpLocal(String, u32, String),
     #[error("jump offset overflow")]
     JumpOverflow,
     #[error("multiple to-be-closed variables in local list")]

@@ -313,17 +313,28 @@ struct VariableData {
 /// sits inside is popped with something to CLOSE, so the label emits one.
 struct PendingGoto {
     name: String,
+    line: u32,
     label: u16,
     /// The scope whose labels can resolve it: its own, then each enclosing
     /// one as the blocks it is in close.
     depth: usize,
+    /// `Ctx::decls` length at the goto, lowered as it leaves blocks.
+    ndecls: usize,
     needs_close: bool,
+}
+
+#[derive(Clone, Copy)]
+struct VisibleLabel {
+    label: u16,
+    nactvar: u8,
+    line: u32,
 }
 
 #[derive(Clone, Copy)]
 struct ScopeMark {
     freereg: u8,
     nactvar: u8,
+    ndecls: usize,
     /// A local of this scope was captured as an upvalue, so leaving the
     /// scope must CLOSE it (a loop back-edge would otherwise hand every
     /// iteration's closure the same open upvalue).
@@ -414,12 +425,16 @@ struct Ctx<'gc, 'a> {
     /// `chunk.locvars` indices declared in each scope, closed on pop.
     scope_locvars: Vec<Vec<usize>>,
 
-    /// Per open scope, its `::name::`s → (label, `nactvar` at the label), so
-    /// a backward goto knows which locals it leaves. A closed block's labels
+    /// Per open scope, its `::name::`s, with `nactvar` at the label so a
+    /// backward goto knows which locals it leaves. A closed block's labels
     /// are invisible, so they go with its scope.
-    scope_labels: Vec<HashMap<String, (u16, u8), RandomState>>,
+    scope_labels: Vec<HashMap<String, VisibleLabel, RandomState>>,
     /// Forward gotos awaiting their label.
     pending_gotos: Vec<PendingGoto>,
+    /// Names of the declarations in scope, in order: locals (folded
+    /// `<const>`s included), `global` names and `global *`. A goto may not
+    /// jump forward past one (luac's `actvar`).
+    decls: Vec<String>,
 
     /// Parent function's resolver, or `None` for the main chunk. A nested
     /// function calls this to walk the lexical chain when it encounters a
@@ -1151,6 +1166,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         self.scope_marks.push(ScopeMark {
             freereg: self.chunk.freereg,
             nactvar: self.chunk.nactvar,
+            ndecls: self.decls.len(),
             captured: false,
         });
         self.scope_close.push(Vec::new());
@@ -1170,6 +1186,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             .ok_or_else(|| ice("missing scope register base"))?;
         self.chunk.freereg = mark.freereg;
         self.chunk.nactvar = mark.nactvar;
+        self.decls.truncate(mark.ndecls);
         let end_pc = self.chunk.tape.len() as u32;
         for i in self
             .scope_locvars
@@ -1195,6 +1212,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         let depth = self.scope_marks.len();
         for g in self.pending_gotos.iter_mut().filter(|g| g.depth > depth) {
             g.depth = depth;
+            g.ndecls = mark.ndecls;
             g.needs_close |= close.is_some();
         }
         Ok(close)
@@ -1227,6 +1245,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         if !matches!(data.kind, VarKind::Global) {
             self.record_locvar(&name)?;
         }
+        self.decls.push(name.clone());
         let scope = self.scope.last_mut().ok_or_else(|| ice("missing scope"))?;
         scope.insert(name, data);
         Ok(())
@@ -1574,6 +1593,7 @@ fn compile_function_to_chunk<'gc, 'a>(
         scope_locvars: Vec::new(),
         scope_labels: Vec::new(),
         pending_gotos: Vec::new(),
+        decls: Vec::new(),
         capture: parent_capture,
         upvalues: initial_upvalues,
         globals,
@@ -1666,6 +1686,10 @@ fn compile_function_to_chunk<'gc, 'a>(
     // No CLOSE: RETURN and TAILCALL close the frame themselves, and one here
     // could sit between a MULTRET producer and the RETURN reading `top`.
     ctx.pop_scope()?;
+    if let Some(g) = ctx.pending_gotos.first() {
+        ctx.cur_line = g.line;
+        return Err(ctx.err(CompileErrorKind::GotoInvalid(g.name.clone(), g.line)));
+    }
 
     // Flatten the named upvalue list into the chunk's descriptor array.
     let lua_ctx = ctx.ctx;
@@ -1724,12 +1748,27 @@ fn compile_label(ctx: &mut Ctx, item: Label) -> Result<(), CompileError> {
         .ok_or_else(|| ice("ident without name"))?
         .to_owned();
 
+    let visible = ctx.scope_labels.iter().find_map(|labels| labels.get(&name));
+    if let Some(prev) = visible {
+        let line = prev.line;
+        return Err(ctx.err(CompileErrorKind::DuplicateLabel(name, line)));
+    }
+
     let nactvar = ctx.chunk.nactvar;
     let depth = ctx.scope_marks.len();
     let pending: Vec<_> = ctx
         .pending_gotos
         .extract_if(.., |g| g.name == name && g.depth == depth)
         .collect();
+    // Jumping to a block's end skips nothing, as its locals are already dead.
+    let ndecls = match ctx.scope_marks.last() {
+        Some(mark) if item.ends_block() => mark.ndecls,
+        _ => ctx.decls.len(),
+    };
+    if let Some(g) = pending.iter().find(|g| g.ndecls < ndecls) {
+        let var = ctx.decls[g.ndecls].clone();
+        return Err(ctx.err(CompileErrorKind::JumpLocal(name, g.line, var)));
+    }
     let label = ctx.new_label();
     let offset = ctx.next_offset();
     ctx.set_label(label, offset);
@@ -1744,7 +1783,14 @@ fn compile_label(ctx: &mut Ctx, item: Label) -> Result<(), CompileError> {
     ctx.scope_labels
         .last_mut()
         .ok_or_else(|| ice("missing scope labels"))?
-        .insert(name, (label, nactvar));
+        .insert(
+            name,
+            VisibleLabel {
+                label,
+                nactvar,
+                line: ctx.cur_line,
+            },
+        );
 
     Ok(())
 }
@@ -1766,7 +1812,7 @@ fn compile_goto(ctx: &mut Ctx, item: Goto) -> Result<(), CompileError> {
         .find_map(|labels| labels.get(&name).copied());
     let label = match backward {
         // Backward jump: close whatever locals it leaves (luac `gotostat`).
-        Some((label, nactvar)) => {
+        Some(VisibleLabel { label, nactvar, .. }) => {
             if ctx.chunk.nactvar > nactvar {
                 ctx.emit(Instruction::close(Reg(nactvar)));
             }
@@ -1776,8 +1822,10 @@ fn compile_goto(ctx: &mut Ctx, item: Goto) -> Result<(), CompileError> {
             let label = ctx.new_label();
             ctx.pending_gotos.push(PendingGoto {
                 name,
+                line: ctx.cur_line,
                 label,
                 depth: ctx.scope_marks.len(),
+                ndecls: ctx.decls.len(),
                 needs_close: false,
             });
             label
@@ -2122,6 +2170,7 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         // for the rest of this block; unlike the preamble, a later
         // `global Name` won't void it.
         ctx.globals.default = DefaultPolicy::Star(default_kind);
+        ctx.decls.push("*".to_owned());
         return Ok(());
     }
 
