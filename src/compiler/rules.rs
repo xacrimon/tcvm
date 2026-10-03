@@ -2030,9 +2030,13 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         // Compile the closure into a register. `compile_func_body`
         // honours the dst hint, so `func_reg == target_reg` (asserted
         // below).
+        let line = ctx.cur_line;
         let target_reg = ctx.alloc_register()?;
         let func_reg = compile_func_body(ctx, &func, Some(target_reg))?;
         assert_eq!(func_reg, target_reg);
+        // As in `compile_func`: the guard and store are on the statement's
+        // first line, not the body's `end`.
+        ctx.cur_line = line;
 
         // Initialization guard + assignment: emit
         //   GETTABUP guard, _ENV, name
@@ -2638,8 +2642,12 @@ fn compile_func(ctx: &mut Ctx, item: Func) -> Result<(), CompileError> {
         .target()
         .ok_or_else(|| ice("func stmt without target"))?;
 
+    let line = ctx.cur_line;
     let func_reg = compile_func_body(ctx, &item, None)?;
 
+    // The store, and a const target's error, are on the `function` line,
+    // not the body's `end` (`funcstat`'s `luaK_fixline`).
+    ctx.cur_line = line;
     compile_assign_lhs(ctx, target, func_reg.0)?;
 
     Ok(())

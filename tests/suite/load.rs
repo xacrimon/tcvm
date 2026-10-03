@@ -208,3 +208,33 @@ fn global_env() {
         "function function"
     );
 }
+
+#[test]
+fn function_statement_line() {
+    // A `function` or `global function` statement's store, and its error,
+    // are on its first line, not the body's `end` (#236). Expected from lua
+    // 5.5.1.
+    assert_eq!(
+        ok(
+            r#"return select(2, load("local foo <const> = 1\nfunction foo (x)\n  return\nend\n", "=c"))"#
+        ),
+        "c:2: attempt to assign to const variable 'foo'"
+    );
+    assert_eq!(
+        ok(
+            r#"return select(2, load("global foo <const>\nfunction foo (x)\n  return\nend\n", "=c"))"#
+        ),
+        "c:2: attempt to assign to const variable 'foo'"
+    );
+    assert_eq!(
+        ok(r#"local mt = {__newindex = function() error('ni', 2) end}
+              return cat(pcall(load("local t = setmetatable({}, ...)\nfunction t.m ()\n  return\nend\n", "=c"), mt))"#),
+        "false c:2: ni"
+    );
+    assert_eq!(
+        ok(
+            r#"f = 1 return select(2, pcall(load("local x = 1\nglobal function f ()\n  return\nend\n", "=c")))"#
+        ),
+        "c:2: global 'f' already defined"
+    );
+}
