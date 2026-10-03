@@ -283,6 +283,27 @@ mod tests {
         }
     }
 
+    // A `,` in a parameter list must be followed by a name or `...`.
+    #[test]
+    fn parameter_list_rejects_trailing_comma() {
+        for src in ["function f(a,) end", "local f = function(a, b,) end"] {
+            let mut cache = NodeCache::new();
+            let reports = parse(&mut cache, src).reports;
+            assert!(!reports.is_empty(), "expected a parse error for {src:?}");
+        }
+
+        for src in [
+            "function f() end",
+            "function f(a, b) end",
+            "function f(a, ...) end",
+            "function f(...t) end",
+        ] {
+            let mut cache = NodeCache::new();
+            let reports = parse(&mut cache, src).reports;
+            assert!(reports.is_empty(), "unexpected parse error for {src:?}");
+        }
+    }
+
     // `return` must end its block, optionally followed by one `;` (#205).
     #[test]
     fn return_must_be_last_statement() {

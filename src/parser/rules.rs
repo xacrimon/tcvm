@@ -420,13 +420,14 @@ impl<'cache, 'source> Parser<'cache, 'source> {
     fn r_func_def_args(&mut self) -> Option<CompletedMarker> {
         let marker = self.start(T![func_args]);
         self.expect(T!['(']);
+        // `)` may only close an empty list; after a `,` a parameter must follow.
+        if self.at() == T![')'] {
+            self.expect(T![')']);
+            return Some(marker.complete(self));
+        }
 
         loop {
             match self.at() {
-                T![')'] => {
-                    self.expect(T![')']);
-                    break;
-                }
                 T![...] => {
                     let vararg = self.start(T![vararg_param]);
                     self.expect(T![...]);
@@ -445,8 +446,7 @@ impl<'cache, 'source> Parser<'cache, 'source> {
                     self.error(
                         "unexpected token",
                         format!(
-                            "expected token one of [{}, {}, {}] but found {}",
-                            T![')'],
+                            "expected token one of [{}, {}] but found {}",
                             T![...],
                             T![ident],
                             t,
