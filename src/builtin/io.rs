@@ -859,6 +859,7 @@ fn lua_type<'gc>(
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
+    util::check_any(ctx, &stack, "type", 1)?;
     let result = match as_file(ctx, closure, stack.get(0)) {
         Some(u) => {
             let open = u

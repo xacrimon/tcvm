@@ -584,6 +584,19 @@ pub(crate) fn arg_error<'gc>(ctx: Context<'gc>, fname: &str, n: usize, msg: &str
     Error::from_str(ctx, &format!("bad argument #{n} to '{fname}' ({msg})"))
 }
 
+/// `luaL_checkany`: argument `n` (1-based) must be present, even if nil.
+pub(crate) fn check_any<'gc>(
+    ctx: Context<'gc>,
+    stack: &Stack<'gc, '_>,
+    fname: &str,
+    n: usize,
+) -> Result<(), Error<'gc>> {
+    if stack.len() < n {
+        return Err(arg_error(ctx, fname, n, "value expected"));
+    }
+    Ok(())
+}
+
 /// Coerce `v` to a float, mirroring `luaL_checknumber` (numeric strings
 /// included). `fname`/`n` build the standard bad-argument message on failure.
 /// Floats and small integers are inlined; everything else (boxed integers,

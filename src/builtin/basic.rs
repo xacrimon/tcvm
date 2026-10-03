@@ -520,10 +520,12 @@ fn lua_print<'gc>(
 
 /// `rawequal(a, b)` — primitive equality, bypassing `__eq`.
 fn lua_rawequal<'gc>(
-    _ctx: Context<'gc>,
+    ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
+    util::check_any(ctx, &stack, "rawequal", 1)?;
+    util::check_any(ctx, &stack, "rawequal", 2)?;
     let eq = util::raw_eq(stack.get(0), stack.get(1));
     stack.ret1(Value::boolean(eq));
     Ok(CallbackAction::Return)
@@ -539,6 +541,7 @@ fn lua_rawget<'gc>(
     let Some(t) = t_arg.get_table() else {
         return Err(util::type_error(ctx, "rawget", 1, "table", stack.arg(0)));
     };
+    util::check_any(ctx, &stack, "rawget", 2)?;
     let v = t.raw_get(key);
     stack.ret1(v);
     Ok(CallbackAction::Return)
@@ -580,6 +583,8 @@ fn lua_rawset<'gc>(
     let Some(t) = t_arg.get_table() else {
         return Err(util::type_error(ctx, "rawset", 1, "table", stack.arg(0)));
     };
+    util::check_any(ctx, &stack, "rawset", 2)?;
+    util::check_any(ctx, &stack, "rawset", 3)?;
     // `luaH_set` raises from inside the C function, so unlike argument
     // errors these carry no position.
     if key.is_nil() {
@@ -695,6 +700,7 @@ fn lua_tonumber<'gc>(
     } else if let Some(s) = v.get_string() {
         util::str_to_number(s.as_bytes()).map_or(Value::nil(), |n| n.into_value(ctx.mutation()))
     } else {
+        util::check_any(ctx, &stack, "tonumber", 1)?;
         Value::nil()
     };
     stack.ret1(result);

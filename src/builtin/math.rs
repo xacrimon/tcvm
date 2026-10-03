@@ -5,7 +5,8 @@ use rand_pcg::Pcg64;
 
 use crate::Context;
 use crate::builtin::util::{
-    arg_error, check_integer, check_number, compare_error_msg, float_to_integer, num_to_value,
+    arg_error, check_any, check_integer, check_number, compare_error_msg, float_to_integer,
+    num_to_value,
 };
 use crate::env::{
     Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Userdata, Value,
@@ -400,6 +401,7 @@ fn lua_type<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
+    check_any(ctx, &stack, "type", 1)?;
     let v = stack.get(0);
     let result = if v.get_integer().is_some() {
         Value::string(LuaString::new(ctx, b"integer"))
