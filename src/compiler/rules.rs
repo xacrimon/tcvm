@@ -5,7 +5,7 @@ use cstree::interning::TokenInterner;
 use foldhash::fast::RandomState;
 
 use super::defs::{Chunk, ExprDesc, ExprKind, JumpList, Numeral, RegisterIndex, VarargInfo, Want};
-use super::{CompileError, CompileErrorKind, LineNumber};
+use super::{CompileError, CompileErrorKind, FuncLine, LineNumber};
 use crate::dmm::{Gc, Mutation};
 use crate::env::function::LocVar;
 use crate::env::{LuaString, Prototype, value::Value};
@@ -350,7 +350,12 @@ struct ScopeMark {
 /// The parent captures from its own parent on demand as the lookup
 /// cascades upward.
 trait UpvalueResolver {
-    fn resolve_for_child(&mut self, name: &str) -> Option<ChildResolution>;
+    /// `line` is the child's current line, which a limit error reports.
+    fn resolve_for_child(
+        &mut self,
+        name: &str,
+        line: u32,
+    ) -> Result<Option<ChildResolution>, CompileError>;
 }
 
 /// Result of resolving a name from a child function's perspective. A
@@ -1345,7 +1350,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                 }
                 return Ok(Env::Reg(register));
             }
-            None => self.resolve_or_capture("_ENV"),
+            None => self.resolve_or_capture("_ENV")?,
         };
         match resolved {
             Some(ResolvedName::Upvalue(idx)) => Ok(Env::Upvalue(idx)),
@@ -1379,23 +1384,49 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     /// compile-time value) or an upvalue index in THIS function's
     /// upvalue list (capturing on first reference). Returns `None` if
     /// the name isn't reachable through any enclosing scope.
-    fn resolve_or_capture(&mut self, name: &str) -> Option<ResolvedName> {
+    fn resolve_or_capture(&mut self, name: &str) -> Result<Option<ResolvedName>, CompileError> {
         if let Some(i) = self.upvalues.iter().position(|u| u.name == name) {
-            return Some(ResolvedName::Upvalue(i as u8));
+            return Ok(Some(ResolvedName::Upvalue(i as u8)));
         }
-        let parent = self.capture.as_deref_mut()?;
-        match parent.resolve_for_child(name)? {
-            ChildResolution::Const(v) => Some(ResolvedName::Const(v)),
-            ChildResolution::Upvalue { desc, readonly } => {
-                let i = self.upvalues.len() as u8;
-                self.upvalues.push(UpvalueEntry {
-                    name: name.to_owned(),
-                    desc,
-                    readonly,
-                });
+        let Some(parent) = self.capture.as_deref_mut() else {
+            return Ok(None);
+        };
+        Ok(match parent.resolve_for_child(name, self.cur_line)? {
+            None => None,
+            Some(ChildResolution::Const(v)) => Some(ResolvedName::Const(v)),
+            Some(ChildResolution::Upvalue { desc, readonly }) => {
+                let i = self.add_upvalue(name, desc, readonly, self.cur_line)?;
                 Some(ResolvedName::Upvalue(i))
             }
+        })
+    }
+
+    /// Lua's `newupvalue`: at most 255, so every index fits a `u8`.
+    fn add_upvalue(
+        &mut self,
+        name: &str,
+        desc: UpValueDescriptor,
+        readonly: bool,
+        line: u32,
+    ) -> Result<u8, CompileError> {
+        const MAX_UPVALUES: usize = 255;
+        let i = self.upvalues.len();
+        if i == MAX_UPVALUES {
+            return Err(CompileError {
+                kind: CompileErrorKind::Limit {
+                    what: "upvalues",
+                    limit: MAX_UPVALUES,
+                    func: FuncLine(self.chunk.line_defined),
+                },
+                line_number: LineNumber(line),
+            });
         }
+        self.upvalues.push(UpvalueEntry {
+            name: name.to_owned(),
+            desc,
+            readonly,
+        });
+        Ok(i as u8)
     }
 }
 
@@ -1408,7 +1439,11 @@ impl<'gc, 'a> UpvalueResolver for Ctx<'gc, 'a> {
     /// scope is referenced — matching Lua 5.5's parser, which folds the
     /// const value into the child's expdesc when it walks up to find the
     /// name.
-    fn resolve_for_child(&mut self, name: &str) -> Option<ChildResolution> {
+    fn resolve_for_child(
+        &mut self,
+        name: &str,
+        line: u32,
+    ) -> Result<Option<ChildResolution>, CompileError> {
         // 1. Own local? `<const>` with a compile-time value flows back to
         //    the child as `Const` — no upvalue is allocated here. Plain
         //    locals (and `<const>` whose initializer didn't fold) flow
@@ -1421,10 +1456,10 @@ impl<'gc, 'a> UpvalueResolver for Ctx<'gc, 'a> {
             // is not a capturable local — the child reaches its own global
             // resolution (`manual.of:251-253`).
             if matches!(kind, VarKind::Global) {
-                return None;
+                return Ok(None);
             }
             if let VarKind::Const(Some(v)) = kind {
-                return Some(ChildResolution::Const(v));
+                return Ok(Some(ChildResolution::Const(v)));
             }
             // Scope 0 is the function's outermost block; RETURN closes it.
             if depth > 0 {
@@ -1437,39 +1472,37 @@ impl<'gc, 'a> UpvalueResolver for Ctx<'gc, 'a> {
             {
                 info.captured = true;
             }
-            return Some(ChildResolution::Upvalue {
+            return Ok(Some(ChildResolution::Upvalue {
                 desc: UpValueDescriptor::ParentLocal(register.0),
                 readonly: kind.is_readonly(),
-            });
+            }));
         }
         // 2. Already captured in our upvalue list?
         if let Some(i) = self.upvalues.iter().position(|u| u.name == name) {
-            return Some(ChildResolution::Upvalue {
+            return Ok(Some(ChildResolution::Upvalue {
                 desc: UpValueDescriptor::ParentUpvalue(i as u8),
                 readonly: self.upvalues[i].readonly,
-            });
+            }));
         }
         // 3. Cascade. If a deeper ancestor resolves to a `Const`, we
         //    pass it through unchanged — no upvalue is allocated at this
         //    level either. If it's an `Upvalue`, we capture the returned
         //    descriptor into our own upvalue list and the child references
         //    that new slot.
-        let parent = self.capture.as_deref_mut()?;
-        match parent.resolve_for_child(name)? {
-            ChildResolution::Const(v) => Some(ChildResolution::Const(v)),
-            ChildResolution::Upvalue { desc, readonly } => {
-                let i = self.upvalues.len() as u8;
-                self.upvalues.push(UpvalueEntry {
-                    name: name.to_owned(),
-                    desc,
-                    readonly,
-                });
+        let Some(parent) = self.capture.as_deref_mut() else {
+            return Ok(None);
+        };
+        Ok(match parent.resolve_for_child(name, line)? {
+            None => None,
+            Some(ChildResolution::Const(v)) => Some(ChildResolution::Const(v)),
+            Some(ChildResolution::Upvalue { desc, readonly }) => {
+                let i = self.add_upvalue(name, desc, readonly, line)?;
                 Some(ChildResolution::Upvalue {
                     desc: UpValueDescriptor::ParentUpvalue(i),
                     readonly,
                 })
             }
-        }
+        })
     }
 }
 
@@ -2500,7 +2533,7 @@ fn compile_lvalue(
                     return Err(ctx.err(CompileErrorKind::ConstAssign(name.to_owned())));
                 }
                 Ok(Lvalue::Local { dst: register })
-            } else if !shadow_global && let Some(resolution) = ctx.resolve_or_capture(name) {
+            } else if !shadow_global && let Some(resolution) = ctx.resolve_or_capture(name)? {
                 match resolution {
                     ResolvedName::Upvalue(idx) if !ctx.upvalues[idx as usize].readonly => {
                         Ok(Lvalue::Upvalue { idx })
@@ -2974,7 +3007,7 @@ fn compile_expr_ident(
     // bypassing upvalue registration so the resulting prototype carries
     // no descriptor for it (matches Lua 5.5: const refs across function
     // boundaries don't appear in the inner function's upvalue list).
-    if !shadow_global && let Some(resolution) = ctx.resolve_or_capture(name) {
+    if !shadow_global && let Some(resolution) = ctx.resolve_or_capture(name)? {
         match resolution {
             ResolvedName::Const(v) => return Ok(v.to_expr_desc()),
             ResolvedName::Upvalue(idx) => {
