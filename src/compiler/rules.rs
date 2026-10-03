@@ -314,6 +314,8 @@ struct VariableData {
 struct PendingGoto {
     name: String,
     label: u16,
+    /// The scope whose labels can resolve it: its own, then each enclosing
+    /// one as the blocks it is in close.
     depth: usize,
     needs_close: bool,
 }
@@ -412,9 +414,10 @@ struct Ctx<'gc, 'a> {
     /// `chunk.locvars` indices declared in each scope, closed on pop.
     scope_locvars: Vec<Vec<usize>>,
 
-    /// `::name::` seen so far → (label, `nactvar` at the label), so a
-    /// backward goto knows which locals it leaves.
-    labels: HashMap<String, (u16, u8), RandomState>,
+    /// Per open scope, its `::name::`s → (label, `nactvar` at the label), so
+    /// a backward goto knows which locals it leaves. A closed block's labels
+    /// are invisible, so they go with its scope.
+    scope_labels: Vec<HashMap<String, (u16, u8), RandomState>>,
     /// Forward gotos awaiting their label.
     pending_gotos: Vec<PendingGoto>,
 
@@ -1153,6 +1156,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         self.scope_close.push(Vec::new());
         self.scope_locvars.push(Vec::new());
         self.scope_globals.push(self.globals.clone());
+        self.scope_labels.push(HashMap::default());
     }
 
     /// Pop the scope, returning the register to `CLOSE` at when leaving it
@@ -1183,11 +1187,15 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         self.scope_close
             .pop()
             .ok_or_else(|| ice("missing scope close list"))?;
-        if close.is_some() {
-            let depth = self.scope_marks.len();
-            for g in self.pending_gotos.iter_mut().filter(|g| g.depth > depth) {
-                g.needs_close = true;
-            }
+        self.scope_labels
+            .pop()
+            .ok_or_else(|| ice("missing scope labels"))?;
+        // Gotos this block didn't resolve now wait on the enclosing block's
+        // labels (luac `solvegotos`).
+        let depth = self.scope_marks.len();
+        for g in self.pending_gotos.iter_mut().filter(|g| g.depth > depth) {
+            g.depth = depth;
+            g.needs_close |= close.is_some();
         }
         Ok(close)
     }
@@ -1564,7 +1572,7 @@ fn compile_function_to_chunk<'gc, 'a>(
         scope_marks: Vec::new(),
         scope_close: Vec::new(),
         scope_locvars: Vec::new(),
-        labels: HashMap::default(),
+        scope_labels: Vec::new(),
         pending_gotos: Vec::new(),
         capture: parent_capture,
         upvalues: initial_upvalues,
@@ -1717,21 +1725,26 @@ fn compile_label(ctx: &mut Ctx, item: Label) -> Result<(), CompileError> {
         .to_owned();
 
     let nactvar = ctx.chunk.nactvar;
+    let depth = ctx.scope_marks.len();
     let pending: Vec<_> = ctx
         .pending_gotos
-        .extract_if(.., |g| g.name == name)
+        .extract_if(.., |g| g.name == name && g.depth == depth)
         .collect();
-    let label = match pending.first() {
-        Some(g) => g.label,
-        None => ctx.new_label(),
-    };
-    ctx.set_label(label, ctx.next_offset());
+    let label = ctx.new_label();
+    let offset = ctx.next_offset();
+    ctx.set_label(label, offset);
+    for g in &pending {
+        ctx.set_label(g.label, offset);
+    }
     // Forward jumps that left a scope with open upvalues / TBC land here;
     // falling through closes nothing live (luac `createlabel`).
     if pending.iter().any(|g| g.needs_close) {
         ctx.emit(Instruction::close(Reg(nactvar)));
     }
-    ctx.labels.insert(name, (label, nactvar));
+    ctx.scope_labels
+        .last_mut()
+        .ok_or_else(|| ice("missing scope labels"))?
+        .insert(name, (label, nactvar));
 
     Ok(())
 }
@@ -1744,19 +1757,23 @@ fn compile_goto(ctx: &mut Ctx, item: Goto) -> Result<(), CompileError> {
         .ok_or_else(|| ice("ident without name"))?
         .to_owned();
 
-    let label = match ctx.labels.get(&name) {
+    // Labels are unique among the visible ones, so a visible label is the
+    // one luac would resolve this goto to when its block closes.
+    let backward = ctx
+        .scope_labels
+        .iter()
+        .rev()
+        .find_map(|labels| labels.get(&name).copied());
+    let label = match backward {
         // Backward jump: close whatever locals it leaves (luac `gotostat`).
-        Some(&(label, nactvar)) => {
+        Some((label, nactvar)) => {
             if ctx.chunk.nactvar > nactvar {
                 ctx.emit(Instruction::close(Reg(nactvar)));
             }
             label
         }
         None => {
-            let label = match ctx.pending_gotos.iter().find(|g| g.name == name) {
-                Some(g) => g.label,
-                None => ctx.new_label(),
-            };
+            let label = ctx.new_label();
             ctx.pending_gotos.push(PendingGoto {
                 name,
                 label,
