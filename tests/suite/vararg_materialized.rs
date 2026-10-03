@@ -2,7 +2,7 @@
 //! the optimized below-base form and the materialized-table form, plus the
 //! mutation-visibility semantics the table form must honor (manual §3.4).
 
-use crate::common::eval;
+use crate::common::{err, eval, ok};
 
 /// Compile and run `src`, returning the first integer result.
 fn run(src: &str) -> i64 {
@@ -124,5 +124,45 @@ fn named_vararg_after_named_params() {
              local function f(a, b, ...rest) return a + b + unwrap(rest) end\n\
              return f(1, 2, 300)"),
         1 + 2 + 300
+    );
+}
+
+#[test]
+fn spread_checks_n() {
+    // `...` validates the table's `n`, even for a fixed count, and reads
+    // nothing past it (#241). Expected messages from lua 5.5.1.
+    for n in [
+        "-1",
+        "1.0",
+        "'2'",
+        "nil",
+        "math.maxinteger",
+        "math.mininteger",
+        "1 << 30",
+    ] {
+        assert_eq!(
+            err(&format!(
+                "local function f(...t) t.n = {n}; return ... end return f(1, 2)"
+            )),
+            "c:1: vararg table has no proper 'n'",
+            "n = {n}"
+        );
+    }
+    assert_eq!(
+        err("local function f(...t) t.n = -1; local a, b = ...; return a end return f(1)"),
+        "c:1: vararg table has no proper 'n'"
+    );
+    // In range but past the stack limit.
+    assert_eq!(
+        err("local function f(...t) t.n = (1 << 30) - 1; return ... end return f()"),
+        "c:1: stack overflow"
+    );
+    assert_eq!(
+        ok("local function f(...t) t.n = 1; local a, b = ...; return cat(a, b) end return f(5, 6)"),
+        "5 nil"
+    );
+    assert_eq!(
+        ok("local function f(...t) t.n = 4; t[4] = 'd'; return cat(...) end return f('a', 'b')"),
+        "a b nil d"
     );
 }

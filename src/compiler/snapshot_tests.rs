@@ -177,6 +177,7 @@ test!(
 );
 test!(method_call, "test-files/method_call.lua");
 test!(method_def, "test-files/method_def.lua");
+test!(func_target_upvalues, "test-files/func_target_upvalues.lua");
 test!(loop_close, "test-files/loop_close.lua");
 test!(goto_close, "test-files/goto_close.lua");
 test!(return_close, "test-files/return_close.lua");

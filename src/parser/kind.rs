@@ -270,78 +270,51 @@ impl SyntaxKind {
     }
 }
 
-fn long_string(lexer: &mut Lexer<SyntaxKind>) {
+/// `false` (an invalid token) when the string is unfinished.
+fn long_string(lexer: &mut Lexer<SyntaxKind>) -> bool {
     let delim_len = lexer.slice().len();
-    let rem = lexer.remainder();
-
-    for (i, _) in rem.char_indices() {
-        if is_long_delimiter(&rem[i..i + delim_len], ']') {
-            lexer.bump(i + delim_len);
-            return;
-        }
-    }
-
-    unreachable!()
+    skip_long_bracket(lexer, delim_len)
 }
 
-fn skip_comment(lexer: &mut Lexer<SyntaxKind>) -> logos::Skip {
+fn skip_comment(lexer: &mut Lexer<SyntaxKind>) -> logos::FilterResult<(), ()> {
     let rem = lexer.remainder();
 
-    if let Some(delim_len) = starts_with_long_delimiter(rem, '[') {
+    if let Some(delim_len) = long_bracket_open(rem) {
         lexer.bump(delim_len);
-        skip_long_comment(lexer, delim_len);
-        logos::Skip
+        if !skip_long_bracket(lexer, delim_len) {
+            return logos::FilterResult::Error(());
+        }
     } else {
-        for (i, _) in rem.char_indices() {
-            let curr = &rem[i..];
-            if curr.starts_with("\r\n") {
-                lexer.bump(i - 1);
-                return logos::Skip;
-            }
-
-            if curr.starts_with('\n') {
-                lexer.bump(i);
-                return logos::Skip;
-            }
-        }
-
-        unreachable!();
+        // Ends before the newline, which may be `\r`, or at the end of the chunk.
+        lexer.bump(rem.find(['\n', '\r']).unwrap_or(rem.len()));
     }
+    logos::FilterResult::Skip
 }
 
-fn skip_long_comment(lexer: &mut Lexer<SyntaxKind>, delim_len: usize) {
-    let rem = lexer.remainder();
-
-    for (i, _) in rem.char_indices() {
-        if is_long_delimiter(&rem[i..i + delim_len], ']') {
-            lexer.bump(i + delim_len);
-            return;
+/// Bump past the `]=*]` closing a long bracket opened with `delim_len`
+/// bytes; `false`, with the rest of the chunk consumed, if there is none.
+fn skip_long_bracket(lexer: &mut Lexer<SyntaxKind>, delim_len: usize) -> bool {
+    let level = delim_len - 2;
+    let rem = lexer.remainder().as_bytes();
+    let mut from = 0;
+    while let Some(i) = rem[from..].iter().position(|&b| b == b']') {
+        let close = from + i;
+        let eqs = rem[close + 1..].iter().take_while(|&&b| b == b'=').count();
+        if eqs == level && rem.get(close + 1 + eqs) == Some(&b']') {
+            lexer.bump(close + delim_len);
+            return true;
         }
+        from = close + 1;
     }
-
-    unreachable!()
+    lexer.bump(rem.len());
+    false
 }
 
-fn starts_with_long_delimiter(slice: &str, delim: char) -> Option<usize> {
-    if !slice.starts_with("[[") && !slice.starts_with("[=]") {
-        return None;
-    }
-
-    for (i, _) in slice.char_indices() {
-        if is_long_delimiter(&slice[..i], delim) {
-            return Some(i);
-        }
-    }
-
-    None
-}
-
-fn is_long_delimiter(slice: &str, delim: char) -> bool {
-    if slice.len() < 2 || !slice.starts_with(delim) || !slice.ends_with(delim) {
-        return false;
-    }
-
-    slice.chars().filter(|c| *c == '=').count() + 2 == slice.len()
+/// Length of the `[=*[` at the start of `slice`, if any.
+fn long_bracket_open(slice: &str) -> Option<usize> {
+    let rest = slice.strip_prefix('[')?;
+    let level = rest.len() - rest.trim_start_matches('=').len();
+    rest[level..].starts_with('[').then_some(level + 2)
 }
 
 macro_rules! __T {

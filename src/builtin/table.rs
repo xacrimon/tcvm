@@ -211,11 +211,16 @@ fn lua_create<'gc>(
     } else {
         util::check_integer(ctx, m_arg, "create", 2)?
     };
-    if n < 0 {
+    let in_range = |k: i64| (0..=i64::from(i32::MAX)).contains(&k);
+    if !in_range(n) {
         return Err(util::arg_error(ctx, "create", 1, "out of range"));
     }
-    if m < 0 {
+    if !in_range(m) {
         return Err(util::arg_error(ctx, "create", 2, "out of range"));
+    }
+    // PUC's hash part holds at most 2^30 nodes (`MAXHBITS`).
+    if m > 1 << 30 {
+        return Err(util::runtime_error(ctx, "table overflow"));
     }
     stack.ret1(Value::table(Table::new(ctx)));
     Ok(CallbackAction::Return)
@@ -407,7 +412,7 @@ fn lua_pack<'gc>(
     }
     t.raw_set(
         ctx,
-        Value::string(LuaString::new(ctx, b"n")),
+        Value::string(ctx.symbols().n),
         Value::integer(ctx.mutation(), n as i64),
     );
     stack.ret1(Value::table(t));

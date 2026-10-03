@@ -669,8 +669,9 @@ impl<'gc> ThreadState<'gc> {
     /// Cut the stack down to exactly `n` slots, releasing the storage above it.
     /// The **only** sanctioned shrink (rule 2): the caller must guarantee no
     /// live frame window and no in-flight native call sits above `n` — i.e. a
-    /// thread being seeded, unwound, or terminated, never one with a native
-    /// callback on the stack.
+    /// thread being seeded or one with no frames left, never one with a native
+    /// callback on the stack. Unwinding a single frame doesn't qualify: an
+    /// outer frame's window can extend past its base.
     pub(crate) fn discard_above(&mut self, n: usize) {
         debug_assert!(n <= self.stack.len());
         self.stack.truncate(n);

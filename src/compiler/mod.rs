@@ -41,6 +41,8 @@ pub enum CompileErrorKind {
     Internal(&'static str),
     #[error("variable '{0}' not declared")]
     UndeclaredGlobal(String),
+    #[error("_ENV is global when accessing variable '{0}'")]
+    GlobalEnv(String),
     #[error("attempt to assign to const variable '{0}'")]
     ConstAssign(String),
     #[error("insufficient available registers")]

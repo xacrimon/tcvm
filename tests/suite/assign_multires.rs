@@ -1,7 +1,7 @@
 //! Multiple assignment spreads a trailing call / method call / `...` across
 //! the remaining targets (manual §3.3.3). Regression for #121.
 
-use crate::common::eval;
+use crate::common::{eval, ok};
 
 fn run(src: &str) -> (i64, i64) {
     eval(src)
@@ -75,5 +75,25 @@ fn parenthesized_call_truncates() {
              a, b = (f())\n\
              return a, b == nil and -1 or b"),
         (10, -1)
+    );
+}
+
+#[test]
+fn extra_values_are_evaluated_and_dropped() {
+    // More values than targets indexed past the targets (#237). Expected
+    // output from lua 5.5.1.
+    assert_eq!(
+        ok("local n = 0\n\
+            local function f() n = n + 1 return 'f' end\n\
+            local t = {}\n\
+            t.x, t.y = 1, 2, f()\n\
+            local a; a = 1, 2\n\
+            local x, y = 1, 2\n\
+            x, y = y, x, x, y\n\
+            local mt = setmetatable({}, {__index = function(_, k) n = n + 10 return k end})\n\
+            local p; p = 3, mt.foo, mt.bar\n\
+            g1, g2 = 'a', 'b', 'c', 'd'\n\
+            return cat(t.x, t.y, a, x, y, p, n, g1, g2)"),
+        "1 2 1 2 1 3 21 a b"
     );
 }

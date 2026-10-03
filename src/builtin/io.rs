@@ -383,6 +383,9 @@ fn read_one<R: BufRead>(r: &mut R, fmt: ReadFmt) -> std::io::Result<ReadOne> {
     }
 }
 
+/// liolib's numeral buffer size: `read("n")` fails on a longer numeral.
+const L_MAXLENNUM: usize = 200;
+
 /// Read a numeral, preserving integer vs float subtype. Skips leading
 /// whitespace, then consumes a maximal numeric token (decimal or `0x`
 /// hex, with optional sign / fraction / exponent) via peek-and-consume,
@@ -438,6 +441,10 @@ fn read_number<R: BufRead>(r: &mut R) -> std::io::Result<ReadOne> {
         };
         if !accept {
             break;
+        }
+        // Fails with the overflowing character and the rest left unread.
+        if tok.len() >= L_MAXLENNUM {
+            return Ok(ReadOne::Nil);
         }
         if b == b'.' {
             seen_dot = true;
@@ -859,6 +866,7 @@ fn lua_type<'gc>(
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
+    util::check_any(ctx, &stack, "type", 1)?;
     let result = match as_file(ctx, closure, stack.get(0)) {
         Some(u) => {
             let open = u

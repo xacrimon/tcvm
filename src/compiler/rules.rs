@@ -193,8 +193,12 @@ enum VarKind {
 }
 
 impl VarKind {
-    fn is_const(self) -> bool {
-        matches!(self, VarKind::Const(_))
+    /// Assignment is "attempt to assign to const variable" (PUC's `readonlyvar`).
+    fn is_readonly(self) -> bool {
+        matches!(
+            self,
+            VarKind::Const(_) | VarKind::ToClose | VarKind::VarargParam
+        )
     }
 }
 
@@ -343,7 +347,19 @@ trait UpvalueResolver {
 /// the child should add to its own upvalue list.
 enum ChildResolution {
     Const(ConstVal),
-    Upvalue(UpValueDescriptor),
+    Upvalue {
+        desc: UpValueDescriptor,
+        readonly: bool,
+    },
+}
+
+/// An entry in a function's upvalue list.
+struct UpvalueEntry {
+    /// Kept so children can look entries up by name.
+    name: String,
+    desc: UpValueDescriptor,
+    /// Assignment is "attempt to assign to const variable".
+    readonly: bool,
 }
 
 /// Result of resolving a name in the current function. `Const` is the
@@ -399,10 +415,9 @@ struct Ctx<'gc, 'a> {
     /// function calls this to walk the lexical chain when it encounters a
     /// free variable.
     capture: Option<&'a mut dyn UpvalueResolver>,
-    /// This function's upvalue list, with names retained so children can
-    /// look entries up by name. Flattened to
+    /// This function's upvalue list. Flattened to
     /// `Chunk::upvalue_desc: Box<[UpValueDescriptor]>` at assembly time.
-    upvalues: Vec<(String, UpValueDescriptor)>,
+    upvalues: Vec<UpvalueEntry>,
 
     /// Lua 5.5 global-declaration state, currently in scope. Owned per
     /// function; nested functions receive a clone (see `compile_nested`).
@@ -1279,14 +1294,25 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         Ok((idx, ic))
     }
 
-    /// Convenience for `_ENV` resolution. `_ENV` is always a captured
-    /// upvalue (or root local in the main chunk) — it can never be a
-    /// `<const>` local with a compile-time value, so the `Const` arm of
-    /// `resolve_or_capture` is unreachable here.
-    fn resolve_env_upvalue(&mut self) -> Option<u8> {
-        match self.resolve_or_capture("_ENV")? {
-            ResolvedName::Upvalue(idx) => Some(idx),
-            ResolvedName::Const(_) => unreachable!("_ENV is never a const"),
+    /// The `_ENV` upvalue for an access to the global `name`; an error while
+    /// `global _ENV` is in scope, here or in an enclosing function
+    /// (`buildglobal`).
+    fn env_upvalue(&mut self, name: &str) -> Result<u8, CompileError> {
+        let declared_here = matches!(
+            self.resolve_local("_ENV").map(|d| d.kind),
+            Some(VarKind::Global)
+        );
+        let resolved = if declared_here {
+            None
+        } else {
+            self.resolve_or_capture("_ENV")
+        };
+        match resolved {
+            Some(ResolvedName::Upvalue(idx)) => Ok(idx),
+            Some(ResolvedName::Const(_)) => todo!("a constant-folded _ENV (#278)"),
+            // The main chunk pre-seeds `_ENV`, so only a `global _ENV` stops
+            // the capture.
+            None => Err(self.err(CompileErrorKind::GlobalEnv(name.to_owned()))),
         }
     }
 
@@ -1296,15 +1322,19 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     /// upvalue list (capturing on first reference). Returns `None` if
     /// the name isn't reachable through any enclosing scope.
     fn resolve_or_capture(&mut self, name: &str) -> Option<ResolvedName> {
-        if let Some(i) = self.upvalues.iter().position(|(n, _)| n == name) {
+        if let Some(i) = self.upvalues.iter().position(|u| u.name == name) {
             return Some(ResolvedName::Upvalue(i as u8));
         }
         let parent = self.capture.as_deref_mut()?;
         match parent.resolve_for_child(name)? {
             ChildResolution::Const(v) => Some(ResolvedName::Const(v)),
-            ChildResolution::Upvalue(desc) => {
+            ChildResolution::Upvalue { desc, readonly } => {
                 let i = self.upvalues.len() as u8;
-                self.upvalues.push((name.to_owned(), desc));
+                self.upvalues.push(UpvalueEntry {
+                    name: name.to_owned(),
+                    desc,
+                    readonly,
+                });
                 Some(ResolvedName::Upvalue(i))
             }
         }
@@ -1349,15 +1379,17 @@ impl<'gc, 'a> UpvalueResolver for Ctx<'gc, 'a> {
             {
                 info.captured = true;
             }
-            return Some(ChildResolution::Upvalue(UpValueDescriptor::ParentLocal(
-                register.0,
-            )));
+            return Some(ChildResolution::Upvalue {
+                desc: UpValueDescriptor::ParentLocal(register.0),
+                readonly: kind.is_readonly(),
+            });
         }
         // 2. Already captured in our upvalue list?
-        if let Some(i) = self.upvalues.iter().position(|(n, _)| n == name) {
-            return Some(ChildResolution::Upvalue(UpValueDescriptor::ParentUpvalue(
-                i as u8,
-            )));
+        if let Some(i) = self.upvalues.iter().position(|u| u.name == name) {
+            return Some(ChildResolution::Upvalue {
+                desc: UpValueDescriptor::ParentUpvalue(i as u8),
+                readonly: self.upvalues[i].readonly,
+            });
         }
         // 3. Cascade. If a deeper ancestor resolves to a `Const`, we
         //    pass it through unchanged — no upvalue is allocated at this
@@ -1367,12 +1399,17 @@ impl<'gc, 'a> UpvalueResolver for Ctx<'gc, 'a> {
         let parent = self.capture.as_deref_mut()?;
         match parent.resolve_for_child(name)? {
             ChildResolution::Const(v) => Some(ChildResolution::Const(v)),
-            ChildResolution::Upvalue(desc) => {
+            ChildResolution::Upvalue { desc, readonly } => {
                 let i = self.upvalues.len() as u8;
-                self.upvalues.push((name.to_owned(), desc));
-                Some(ChildResolution::Upvalue(UpValueDescriptor::ParentUpvalue(
-                    i,
-                )))
+                self.upvalues.push(UpvalueEntry {
+                    name: name.to_owned(),
+                    desc,
+                    readonly,
+                });
+                Some(ChildResolution::Upvalue {
+                    desc: UpValueDescriptor::ParentUpvalue(i),
+                    readonly,
+                })
             }
         }
     }
@@ -1452,7 +1489,11 @@ pub fn compile<'gc>(
         // upvalues directly, so the descriptor here is purely a
         // placeholder — nested functions reference this slot by
         // cascading ParentUpvalue(0).
-        vec![("_ENV".to_owned(), UpValueDescriptor::ParentLocal(0))],
+        vec![UpvalueEntry {
+            name: "_ENV".to_owned(),
+            desc: UpValueDescriptor::ParentLocal(0),
+            readonly: false,
+        }],
         globals,
     )?;
     Ok(chunk.assemble(ctx.mutation()))
@@ -1472,7 +1513,7 @@ fn compile_function_to_chunk<'gc, 'a>(
     arity: u8,
     source: LuaString<'gc>,
     span: FuncLines,
-    initial_upvalues: Vec<(String, UpValueDescriptor)>,
+    initial_upvalues: Vec<UpvalueEntry>,
     globals: GlobalEnv,
 ) -> Result<Chunk<'gc>, CompileError> {
     let mut chunk = Chunk::new(source);
@@ -1589,7 +1630,8 @@ fn compile_function_to_chunk<'gc, 'a>(
 
     // Flatten the named upvalue list into the chunk's descriptor array.
     let lua_ctx = ctx.ctx;
-    let (names, descs): (Vec<_>, Vec<_>) = ctx.upvalues.into_iter().unzip();
+    let (names, descs): (Vec<_>, Vec<_>) =
+        ctx.upvalues.into_iter().map(|u| (u.name, u.desc)).unzip();
     ctx.chunk.upvalue_desc = descs;
     ctx.chunk.upvalue_names = names
         .iter()
@@ -1985,12 +2027,21 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
             },
         )?;
 
+        // `_ENV` resolves before the body, as in `globalfunc`'s
+        // `buildglobal`.
+        let (key, ic_idx) = ctx.alloc_field_key(name.as_bytes())?;
+        let env_idx = ctx.env_upvalue(&name)?;
+
         // Compile the closure into a register. `compile_func_body`
         // honours the dst hint, so `func_reg == target_reg` (asserted
         // below).
+        let line = ctx.cur_line;
         let target_reg = ctx.alloc_register()?;
         let func_reg = compile_func_body(ctx, &func, Some(target_reg))?;
         assert_eq!(func_reg, target_reg);
+        // As in `compile_func`: the guard and store are on the statement's
+        // first line, not the body's `end`.
+        ctx.cur_line = line;
 
         // Initialization guard + assignment: emit
         //   GETTABUP guard, _ENV, name
@@ -1998,10 +2049,6 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         //   SETTABUP closure, _ENV, name
         // Mirrors upstream `globalfunc` (`lparser.c:1956-1968`), which
         // emits the same guard via `checkglobal` + `luaK_storevar`.
-        let (key, ic_idx) = ctx.alloc_field_key(name.as_bytes())?;
-        let env_idx = ctx
-            .resolve_env_upvalue()
-            .ok_or_else(|| ice("_ENV must resolve; main chunk pre-seeds it"))?;
         let guard_reg = ctx.alloc_register()?;
         ctx.emit(Instruction::gettabup(
             guard_reg,
@@ -2071,6 +2118,12 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
     let n_targets = decl_kinds.len();
     let n_values = values.len();
     let has_values = !values.is_empty();
+    // Resolved before the declarations take effect, so `global _ENV = …`
+    // initializes through the outer `_ENV` (`initglobal`).
+    let env_idx = match decl_kinds.first() {
+        Some((name, _)) if has_values => Some(ctx.env_upvalue(name)?),
+        _ => None,
+    };
     let value_base = ctx.chunk.freereg;
     if has_values {
         for (i, expr) in values.into_iter().enumerate() {
@@ -2147,18 +2200,15 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         )?;
     }
 
-    if !has_values {
+    let Some(env_idx) = env_idx else {
         // No initializer: per `manual.of:1665`, "global variables are
         // left unchanged". Just register the names and emit nothing.
         return Ok(());
-    }
+    };
 
     // Per name, emit `GETTABUP+ERRNNIL+SETTABUP` taking the value from the
     // corresponding slot. (Forward order — equivalent to upstream's
     // reverse-on-unwind emission, just simpler to read.)
-    let env_idx = ctx
-        .resolve_env_upvalue()
-        .ok_or_else(|| ice("_ENV must resolve; main chunk pre-seeds it"))?;
     for (i, (name, _kind)) in decl_kinds.iter().enumerate() {
         let (key, ic_idx) = ctx.alloc_field_key(name.as_bytes())?;
         let value_reg = value_base + i as u8;
@@ -2258,9 +2308,10 @@ fn compile_assign(ctx: &mut Ctx, item: Assign) -> Result<(), CompileError> {
     // Decide per-slot whether it's safe to hint the RHS directly into
     // the target local: only when the target is a local AND no later
     // RHS reads that local (an in-place hint *is* an early assignment).
+    // Values past the last target are evaluated, unhinted, then dropped.
     let mut hints: Vec<Option<RegisterIndex>> = Vec::with_capacity(num_values);
     for i in 0..num_values {
-        let h = match local_dst(&lvalues[i]) {
+        let h = match lvalues.get(i).and_then(local_dst) {
             Some(dst) if !any_reads(ctx, &values[i + 1..], dst.0)? => Some(dst),
             _ => None,
         };
@@ -2349,16 +2400,16 @@ fn compile_lvalue(
             let local = ctx.resolve_local(name).map(|d| (d.kind, d.register));
             let shadow_global = matches!(local, Some((VarKind::Global, _)));
             if let Some((kind, register)) = local.filter(|_| !shadow_global) {
-                if kind.is_const() {
+                if kind.is_readonly() {
                     return Err(ctx.err(CompileErrorKind::ConstAssign(name.to_owned())));
                 }
                 Ok(Lvalue::Local { dst: register })
             } else if !shadow_global && let Some(resolution) = ctx.resolve_or_capture(name) {
                 match resolution {
-                    ResolvedName::Const(_) => {
-                        Err(ctx.err(CompileErrorKind::ConstAssign(name.to_owned())))
+                    ResolvedName::Upvalue(idx) if !ctx.upvalues[idx as usize].readonly => {
+                        Ok(Lvalue::Upvalue { idx })
                     }
-                    ResolvedName::Upvalue(idx) => Ok(Lvalue::Upvalue { idx }),
+                    _ => Err(ctx.err(CompileErrorKind::ConstAssign(name.to_owned()))),
                 }
             } else {
                 // Lua 5.5 global resolution. If the name appears in the
@@ -2389,9 +2440,7 @@ fn compile_lvalue(
                     }
                 }
                 let (key, ic_idx) = ctx.alloc_field_key(name.as_bytes())?;
-                let env_idx = ctx
-                    .resolve_env_upvalue()
-                    .ok_or_else(|| ice("_ENV must resolve; main chunk pre-seeds it"))?;
+                let env_idx = ctx.env_upvalue(name)?;
                 Ok(Lvalue::Global {
                     env_idx,
                     key,
@@ -2449,7 +2498,7 @@ fn compile_indexed_subexpr(
     Ok(temp)
 }
 
-/// The local register a non-const local-ident target compiles into,
+/// The local register a writable local-ident target compiles into,
 /// or `None` for any other target shape.
 fn target_local_reg(ctx: &Ctx, target: &Expr) -> Option<u8> {
     let Expr::Ident(ident) = target else {
@@ -2460,7 +2509,7 @@ fn target_local_reg(ctx: &Ctx, target: &Expr) -> Option<u8> {
     if matches!(data.kind, VarKind::Global) {
         return None;
     }
-    (!data.kind.is_const()).then_some(data.register.0)
+    (!data.kind.is_readonly()).then_some(data.register.0)
 }
 
 fn local_dst(lv: &Lvalue) -> Option<RegisterIndex> {
@@ -2575,17 +2624,6 @@ fn emit_store(ctx: &mut Ctx, lv: Lvalue, src: u8) {
     }
 }
 
-/// Single-target assignment: resolve the LHS and emit the store. Used by
-/// `function name() ... end`, where there's exactly one target and no
-/// aliasing to guard against.
-fn compile_assign_lhs(ctx: &mut Ctx, target: Expr, value: u8) -> Result<(), CompileError> {
-    let freereg_before = ctx.chunk.freereg;
-    let lv = compile_lvalue(ctx, target, &[])?;
-    emit_store(ctx, lv, value);
-    ctx.chunk.freereg = freereg_before;
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Function statement
 // ---------------------------------------------------------------------------
@@ -2596,9 +2634,18 @@ fn compile_func(ctx: &mut Ctx, item: Func) -> Result<(), CompileError> {
         .target()
         .ok_or_else(|| ice("func stmt without target"))?;
 
+    let line = ctx.cur_line;
+    let freereg_before = ctx.chunk.freereg;
+    // The target resolves before the body, as in `funcstat`: a read-only one
+    // fails first, and its upvalue is captured ahead of the body's.
+    let lv = compile_lvalue(ctx, target, &[])?;
     let func_reg = compile_func_body(ctx, &item, None)?;
 
-    compile_assign_lhs(ctx, target, func_reg.0)?;
+    // The store is on the `function` line, not the body's `end`
+    // (`luaK_fixline`).
+    ctx.cur_line = line;
+    emit_store(ctx, lv, func_reg.0);
+    ctx.chunk.freereg = freereg_before;
 
     Ok(())
 }
@@ -2822,9 +2869,7 @@ fn compile_expr_ident(
 
     let (key, ic_idx) = ctx.alloc_field_key(name.as_bytes())?;
     let dst = ctx.dst_or_alloc(dst)?;
-    let env_idx = ctx
-        .resolve_env_upvalue()
-        .ok_or_else(|| ice("_ENV must resolve; main chunk pre-seeds it"))?;
+    let env_idx = ctx.env_upvalue(name)?;
     ctx.emit(Instruction::gettabup(
         dst,
         UpIdx(env_idx),
@@ -4356,7 +4401,6 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
 }
 
 fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
-    let for_line = ctx.cur_line;
     let end_line = ctx.last_line_of(item.syntax());
     scope_lexical_break(ctx, |ctx| {
         let values: Vec<_> = item
@@ -4368,6 +4412,11 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
             .ok_or_else(|| ice("for_gen without targets"))?
             .collect();
         let num_targets = targets.len();
+        // TFORCALL/TFORLOOP are on the line the explist starts (`forlist`).
+        let explist = item
+            .explist()
+            .ok_or_else(|| ice("for_gen without values"))?;
+        let call_line = ctx.line_of(explist);
 
         // The explist is adjusted to 4 values at [base, base+4) like
         // `compile_decl` does a multi-assign: iterator, state, initial
@@ -4451,13 +4500,18 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
                     .to_owned();
                 let reg = ctx.alloc_register()?;
                 assert_eq!(reg.0, base.0 + 3 + i as u8);
-                // Generic-for control variables are likewise read-only in
-                // Lua 5.5 (LOOPVARKIND).
+                // Only the first variable, the control variable, is read-only
+                // (`forlist`'s RDKCONST).
+                let kind = if i == 0 {
+                    VarKind::Const(None)
+                } else {
+                    VarKind::Reg
+                };
                 ctx.define(
                     name,
                     VariableData {
                         register: reg,
-                        kind: VarKind::Const(None),
+                        kind,
                     },
                 )?;
             }
@@ -4475,7 +4529,7 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
         ctx.set_label(loop_test, ctx.next_offset());
 
         // TFORCALL: call iterator, results go to base+3..base+2+count
-        ctx.cur_line = for_line;
+        ctx.cur_line = call_line;
         ctx.emit(Instruction::tforcall(base, num_targets as u8));
 
         // TFORLOOP: if control variable is not nil, jump back to body

@@ -2,7 +2,7 @@
 //! by its metatable's `__name` when it has one, and a missing argument is "no
 //! value". Expected strings come from `lua` 5.5.1 running the same chunk.
 
-use crate::common::err;
+use crate::common::{err, ok};
 
 #[test]
 fn name_replaces_the_type() {
@@ -128,4 +128,86 @@ fn every_type_error_says_what_it_got() {
         err("local r = warn()"),
         "c:1: bad argument #1 to 'warn' (string expected, got no value)"
     );
+}
+
+#[test]
+fn missing_arguments_are_checked() {
+    // `luaL_checkany`: a missing argument is an error, an explicit nil is not
+    // (#198). Function names are short until #186.
+    for (src, msg) in [
+        ("rawset({})", "bad argument #2 to 'rawset' (value expected)"),
+        ("rawget({})", "bad argument #2 to 'rawget' (value expected)"),
+        (
+            "rawset({}, 1)",
+            "bad argument #3 to 'rawset' (value expected)",
+        ),
+        (
+            "rawequal()",
+            "bad argument #1 to 'rawequal' (value expected)",
+        ),
+        (
+            "rawequal(1)",
+            "bad argument #2 to 'rawequal' (value expected)",
+        ),
+        ("io.type()", "bad argument #1 to 'type' (value expected)"),
+        ("math.type()", "bad argument #1 to 'type' (value expected)"),
+        (
+            "tonumber()",
+            "bad argument #1 to 'tonumber' (value expected)",
+        ),
+        (
+            "coroutine.isyieldable(nil)",
+            "bad argument #1 to 'isyieldable' (thread expected, got nil)",
+        ),
+    ] {
+        assert_eq!(err(&format!("local r = {src}")), format!("c:1: {msg}"));
+    }
+    assert_eq!(
+        ok(
+            "return cat(select('#', rawset({}, 1, nil)), rawequal(nil, nil), io.type(nil), \
+            tonumber(nil), rawget({}, nil), math.type(nil), coroutine.isyieldable(), \
+            coroutine.wrap(function() return coroutine.isyieldable() end)())"
+        ),
+        "1 true nil nil nil nil false true"
+    );
+}
+
+#[test]
+fn close_defaults_to_the_running_coroutine() {
+    assert_eq!(err("coroutine.close()"), "c:1: cannot close main thread");
+    assert_eq!(
+        ok("local log = {} \
+            local co = coroutine.create(function() \
+              local t <close> = setmetatable({}, {__close = function() log[#log + 1] = 'closed' end}) \
+              coroutine.close() \
+              log[#log + 1] = 'not reached' \
+            end) \
+            local ok = coroutine.resume(co) \
+            return cat(ok, coroutine.status(co), table.concat(log, ','))"),
+        "true dead closed"
+    );
+}
+
+#[test]
+fn value_expected() {
+    // Every `luaL_checkany`, and min/max's equivalent `luaL_argcheck`, goes
+    // through `util::check_any`. Expected messages from lua 5.5.1.
+    for (src, name) in [
+        ("assert()", "assert"),
+        ("getmetatable()", "getmetatable"),
+        ("debug.getmetatable()", "getmetatable"),
+        ("ipairs()", "ipairs"),
+        ("pairs()", "pairs"),
+        ("pcall()", "pcall"),
+        ("tostring()", "tostring"),
+        ("type()", "type"),
+        ("math.min()", "min"),
+        ("math.max()", "max"),
+    ] {
+        assert_eq!(
+            err(&format!("local r = {src}")),
+            format!("c:1: bad argument #1 to '{name}' (value expected)"),
+            "{src}"
+        );
+    }
 }

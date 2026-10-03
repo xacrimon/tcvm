@@ -122,6 +122,8 @@ pub(crate) enum OpError<'gc> {
     NanIndex,
     /// A call's register window would cross `ThreadState::stack_limit`.
     StackOverflow,
+    /// A named vararg table's `n` isn't an integer in `0..=i32::MAX / 2`.
+    VarargN,
     /// TBC: the register holds a value without `__close`.
     NonClosable(u8),
     Internal(&'static str),
@@ -3686,30 +3688,38 @@ extern "rust-preserve-none" fn op_vararg<'gc>(
     let target = base + dst as usize;
 
     if proto.needs_vararg_table {
-        // Materialized: read elements `1..=t.n` from the vararg table.
+        // Materialized: read elements `1..=t.n` from the vararg table, nil past `n`.
         let table = thread.stack[base + proto.num_params as usize]
             .get_table()
             .expect("materialized vararg slot must hold a table");
         // Read `t.n` in a tight borrow so it's released before the resize.
-        let navail = table
+        // PUC's `getnumargs` bound, checked even when `count` is fixed.
+        let Some(navail) = table
             .inner()
             .borrow()
-            .raw_get(Value::string(LuaString::new(ctx, b"n")))
+            .raw_get(Value::string(ctx.symbols().n))
             .get_integer()
-            .filter(|n| *n >= 0)
-            .unwrap_or(0) as usize;
+            .filter(|n| (0..=i64::from(i32::MAX / 2)).contains(n))
+        else {
+            raise!(OpError::VarargN);
+        };
+        let navail = navail as usize;
         let wanted = if count == 0 {
             navail
         } else {
             count as usize - 1
         };
         let new_top = target + wanted;
-        thread.ensure_slots(new_top);
+        if !thread.ensure_frame_slots(new_top) {
+            raise!(OpError::StackOverflow);
+        }
         registers = unsafe { thread.stack.as_mut_ptr().add(base) };
+        let filled = wanted.min(navail);
         let t = table.inner().borrow();
-        for i in 0..wanted {
+        for i in 0..filled {
             thread.stack[target + i] = t.raw_get(Value::integer(ctx.mutation(), i as i64 + 1));
         }
+        thread.stack[target + filled..new_top].fill(Value::nil());
         if count == 0 {
             thread.top = new_top;
         }
@@ -3843,7 +3853,7 @@ extern "rust-preserve-none" fn op_varargprep<'gc>(
         }
         table.raw_set(
             ctx,
-            Value::string(LuaString::new(ctx, b"n")),
+            Value::string(ctx.symbols().n),
             Value::integer(ctx.mutation(), num_extras as i64),
         );
     }

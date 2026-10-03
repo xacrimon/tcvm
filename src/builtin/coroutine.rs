@@ -150,6 +150,21 @@ fn lua_running<'gc>(
     Ok(CallbackAction::Return)
 }
 
+/// `getoptco`: argument 1, or the running coroutine only when it's absent (a
+/// nil is a bad argument).
+fn opt_co<'gc>(
+    ctx: Context<'gc>,
+    stack: &Stack<'gc, '_>,
+    fname: &str,
+) -> Result<Thread<'gc>, Error<'gc>> {
+    match stack.arg(0) {
+        None => Ok(stack.exec().current_thread()),
+        Some(v) => v
+            .get_thread()
+            .ok_or_else(|| util::type_error(ctx, fname, 1, "thread", Some(v))),
+    }
+}
+
 /// `coroutine.isyieldable([co])` — true iff `co` (defaults to running) is
 /// not the main thread, nor closing its variables for `coroutine.close`.
 fn lua_isyieldable<'gc>(
@@ -157,25 +172,14 @@ fn lua_isyieldable<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let arg = stack.get(0);
-    let target = if arg.is_nil() {
-        None
-    } else {
-        let t = arg
-            .get_thread()
-            .ok_or_else(|| util::type_error(ctx, "isyieldable", 1, "thread", Some(arg)))?;
-        Some(t).filter(|t| !t.ptr_eq(stack.exec().current_thread()))
-    };
+    let co = opt_co(ctx, &stack, "isyieldable")?;
     // The running thread's lock is held by the interpreter.
-    let yieldable = match target {
-        None => {
-            let ts = stack.thread_mut();
-            !ts.main && !ts.no_yield
-        }
-        Some(t) => {
-            let ts = t.borrow();
-            !ts.main && !ts.no_yield
-        }
+    let yieldable = if co.ptr_eq(stack.exec().current_thread()) {
+        let ts = stack.thread_mut();
+        !ts.main && !ts.no_yield
+    } else {
+        let ts = co.borrow();
+        !ts.main && !ts.no_yield
     };
     stack.ret1(Value::boolean(yieldable));
     Ok(CallbackAction::Return)
@@ -209,24 +213,21 @@ fn lua_wrap<'gc>(
     Ok(CallbackAction::Return)
 }
 
-/// `coroutine.close(co)` — close a suspended or dead coroutine's pending
+/// `coroutine.close([co])` — close a suspended or dead coroutine's pending
 /// to-be-closed variables on `co` itself, then `true`, or `false` and the
-/// error it died with or a `__close` raised. The running coroutine closes
-/// its variables and ends, without returning.
+/// error it died with or a `__close` raised. The running coroutine (also
+/// the default) closes its variables and ends, without returning.
 fn lua_close<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let co = stack
-        .get(0)
-        .get_thread()
-        .ok_or_else(|| util::type_error(ctx, "close", 1, "thread", stack.arg(0)))?;
+    let co = opt_co(ctx, &stack, "close")?;
     // Pointer-eq against current first to avoid re-borrowing the running
     // thread's RefLock (mut-borrowed by the interpreter).
     if co.ptr_eq(stack.exec().current_thread()) {
         if stack.exec().is_main() {
-            return Err(plain_error(ctx, "cannot close main thread"));
+            return Err(Error::from_str(ctx, "cannot close main thread"));
         }
         return Ok(close::close_running(ctx));
     }
@@ -244,13 +245,8 @@ fn lua_close<'gc>(
             }
             Ok(CallbackAction::Return)
         }
-        ThreadStatus::Normal => Err(plain_error(ctx, "cannot close a normal coroutine")),
+        ThreadStatus::Normal => Err(Error::from_str(ctx, "cannot close a normal coroutine")),
     }
-}
-
-/// An error without a position, as `luaL_error` raises from a C function.
-fn plain_error<'gc>(ctx: Context<'gc>, msg: &str) -> Error<'gc> {
-    Error::new(ctx, Value::string(LuaString::new(ctx, msg.as_bytes())))
 }
 
 /// Body of the closure returned by `coroutine.wrap`. Upvalue 0 carries the

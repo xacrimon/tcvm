@@ -1,7 +1,7 @@
 //! Execution coverage for the generic `for ... in ... do` loop: the control
 //! register layout (TFORCALL/TFORLOOP) and multi-value iterator adjustment.
 
-use crate::common::eval;
+use crate::common::{err, eval};
 
 fn run(src: &str) -> i64 {
     eval(src)
@@ -81,5 +81,24 @@ fn pairs_style_over_table() {
              return sum"),
         // i: 1+2+3+4=10, v: 10+20+30+40=100
         110
+    );
+}
+
+#[test]
+fn iterator_call_line() {
+    // Calling the iterator is on the line the explist starts, past comments
+    // and into parentheses, not the `for` line (#253). Lines from lua 5.5.1,
+    // which also appends `(for iterator 'for iterator')` (#204).
+    assert_eq!(
+        err("\n\n for k,v in \n 3 \n do \n end"),
+        "c:4: attempt to call a number value"
+    );
+    assert_eq!(
+        err("for k in\n-- c\n--[[\n]]\n 3, 4 do end"),
+        "c:5: attempt to call a number value"
+    );
+    assert_eq!(
+        err("for k in\n(\n 3) do end"),
+        "c:2: attempt to call a number value"
     );
 }

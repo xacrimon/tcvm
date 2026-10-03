@@ -1,7 +1,10 @@
 //! `coroutine.close(co)` validation: succeeds for dead/suspended threads,
 //! returns `(nil, msg)` for non-suspended (Normal / currently-running).
 
-use tcvm::{Executor, LoadError, Lua};
+use tcvm::env::LuaString;
+use tcvm::{Executor, LoadError, Lua, RuntimeError};
+
+use crate::common::{start_on, yielding_lua};
 
 #[test]
 fn close_suspended_returns_true() {
@@ -130,4 +133,39 @@ fn close_running_self_ends_it() {
         .expect("load");
     let result: i64 = lua.execute(&ex).expect("run");
     assert_eq!(result, 1);
+}
+
+#[test]
+fn close_closes_open_upvalues() {
+    // Closures that escaped keep working on their own copy of `x`, and a
+    // value stored through one survives a full collection (#189). Expected
+    // output from lua 5.5.1 with `collectgarbage()` for `yielder()`.
+    let mut lua = yielding_lua();
+    let ex = start_on(
+        &mut lua,
+        "local co = coroutine.create(function()\n\
+           local x = 42\n\
+           coroutine.yield(function() return x end, function(v) x = v end)\n\
+         end)\n\
+         local _, get, set = coroutine.resume(co)\n\
+         local closed = coroutine.close(co)\n\
+         local before = get()\n\
+         set({tag = 'kept'})\n\
+         yielder()\n\
+         return tostring(closed) .. ' ' .. before .. ' ' .. get().tag",
+    );
+    let mut step = lua.finish(&ex);
+    while let Err(RuntimeError::MainYielded) = step {
+        lua.collect_all();
+        step = lua.resume(&ex, ());
+    }
+    step.expect("run");
+    let result = lua.enter(|ctx| {
+        let s = ctx
+            .fetch(&ex)
+            .take_result::<LuaString>(ctx)
+            .expect("result");
+        String::from_utf8_lossy(s.as_bytes()).into_owned()
+    });
+    assert_eq!(result, "true 42 kept");
 }
