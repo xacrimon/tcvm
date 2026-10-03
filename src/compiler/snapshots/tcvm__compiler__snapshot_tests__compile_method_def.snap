@@ -24,12 +24,12 @@ expression: output
 0007  [  2]  SETFIELD        R1 R0 K3  ; "get"
 0008  [  3]  CLOSURE         R1 P1
 0009  [  3]  SETFIELD        R1 R0 K4  ; "add"
-0010  [  4]  CLOSURE         R1 P2
-0011  [  4]  GETFIELD        R2 R0 K2  ; "inner"
-0012  [  4]  SETFIELD        R1 R2 K5  ; "m"
-0013  [  5]  CLOSURE         R1 P3
-0014  [  5]  GETFIELD        R2 R0 K2  ; "inner"
-0015  [  5]  SETFIELD        R1 R2 K6  ; "plain"
+0010  [  4]  GETFIELD        R1 R0 K2  ; "inner"
+0011  [  4]  CLOSURE         R2 P2
+0012  [  4]  SETFIELD        R2 R1 K5  ; "m"
+0013  [  5]  GETFIELD        R1 R0 K2  ; "inner"
+0014  [  5]  CLOSURE         R2 P3
+0015  [  5]  SETFIELD        R2 R1 K6  ; "plain"
 0016  [  5]  RETURN0
 
 ; prototype 0:

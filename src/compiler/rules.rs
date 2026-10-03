@@ -2027,6 +2027,11 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
             },
         )?;
 
+        // `_ENV` resolves before the body, as in `globalfunc`'s
+        // `buildglobal`.
+        let (key, ic_idx) = ctx.alloc_field_key(name.as_bytes())?;
+        let env_idx = ctx.env_upvalue(&name)?;
+
         // Compile the closure into a register. `compile_func_body`
         // honours the dst hint, so `func_reg == target_reg` (asserted
         // below).
@@ -2044,8 +2049,6 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         //   SETTABUP closure, _ENV, name
         // Mirrors upstream `globalfunc` (`lparser.c:1956-1968`), which
         // emits the same guard via `checkglobal` + `luaK_storevar`.
-        let (key, ic_idx) = ctx.alloc_field_key(name.as_bytes())?;
-        let env_idx = ctx.env_upvalue(&name)?;
         let guard_reg = ctx.alloc_register()?;
         ctx.emit(Instruction::gettabup(
             guard_reg,
@@ -2621,17 +2624,6 @@ fn emit_store(ctx: &mut Ctx, lv: Lvalue, src: u8) {
     }
 }
 
-/// Single-target assignment: resolve the LHS and emit the store. Used by
-/// `function name() ... end`, where there's exactly one target and no
-/// aliasing to guard against.
-fn compile_assign_lhs(ctx: &mut Ctx, target: Expr, value: u8) -> Result<(), CompileError> {
-    let freereg_before = ctx.chunk.freereg;
-    let lv = compile_lvalue(ctx, target, &[])?;
-    emit_store(ctx, lv, value);
-    ctx.chunk.freereg = freereg_before;
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Function statement
 // ---------------------------------------------------------------------------
@@ -2643,12 +2635,17 @@ fn compile_func(ctx: &mut Ctx, item: Func) -> Result<(), CompileError> {
         .ok_or_else(|| ice("func stmt without target"))?;
 
     let line = ctx.cur_line;
+    let freereg_before = ctx.chunk.freereg;
+    // The target resolves before the body, as in `funcstat`: a read-only one
+    // fails first, and its upvalue is captured ahead of the body's.
+    let lv = compile_lvalue(ctx, target, &[])?;
     let func_reg = compile_func_body(ctx, &item, None)?;
 
-    // The store, and a const target's error, are on the `function` line,
-    // not the body's `end` (`funcstat`'s `luaK_fixline`).
+    // The store is on the `function` line, not the body's `end`
+    // (`luaK_fixline`).
     ctx.cur_line = line;
-    compile_assign_lhs(ctx, target, func_reg.0)?;
+    emit_store(ctx, lv, func_reg.0);
+    ctx.chunk.freereg = freereg_before;
 
     Ok(())
 }

@@ -238,3 +238,34 @@ fn function_statement_line() {
         "c:2: global 'f' already defined"
     );
 }
+
+#[test]
+fn function_statement_target_first() {
+    // A function statement's target resolves before its body, as in
+    // `funcstat` and `globalfunc`, so the target's error wins over the
+    // body's. Expected messages from lua 5.5.1.
+    for (src, msg) in [
+        (
+            "local k <const> = 1\nfunction k()\n local x <const> = 1\n x = 2\nend",
+            "c:2: attempt to assign to const variable 'k'",
+        ),
+        (
+            "local k <const> = f()\nlocal function g()\n function k()\n  local x <const> = 1\n  x = 2\n end\nend",
+            "c:3: attempt to assign to const variable 'k'",
+        ),
+        (
+            "global none\nfunction undeclared()\n local x <const> = 1\n x = 2\nend",
+            "c:2: variable 'undeclared' not declared",
+        ),
+        (
+            "global *\nglobal _ENV\nglobal function gf()\n local x <const> = 1\n x = 2\nend",
+            "c:3: _ENV is global when accessing variable 'gf'",
+        ),
+    ] {
+        assert_eq!(
+            ok(&format!("return select(2, load({src:?}, '=c'))")),
+            msg,
+            "{src}"
+        );
+    }
+}
