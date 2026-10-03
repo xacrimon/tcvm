@@ -84,6 +84,29 @@ fn write_read_roundtrip_and_number_subtype() {
 }
 
 #[test]
+fn read_number_length_limit() {
+    // liolib reads at most 200 characters of a numeral (#254); a longer one
+    // fails and leaves the rest unread. Expected values from lua 5.5.1.
+    let p = tmp_path("numlimit");
+    assert_ok(&format!(
+        "local function try(content)\n\
+           local f = io.open({p:?}, \"w\") f:write(content) f:close()\n\
+           f = io.open({p:?}, \"r\")\n\
+           local n = f:read(\"n\") local rest = f:read(\"a\")\n\
+           f:close()\n\
+           return tostring(n) .. \" \" .. #rest\n\
+         end\n\
+         return try(\"1234\" .. (\"0\"):rep(1000) .. \"\\n\") == \"nil 805\"\n\
+           and try((\"1\"):rep(200) .. \"x\") == \"1.1111111111111111e+199 1\"\n\
+           and try((\"1\"):rep(201) .. \"x\") == \"nil 2\"\n\
+           and try(\"-\" .. (\"1\"):rep(200) .. \" y\") == \"nil 3\"\n\
+           and try(\"0x\" .. (\"f\"):rep(198) .. \"z\") == \"-1 1\"\n\
+           and try(\"1.\" .. (\"5\"):rep(197) .. \"e5 z\") == \"nil 3\""
+    ));
+    let _ = std::fs::remove_file(&p);
+}
+
+#[test]
 fn read_byte_count_and_zero_probe() {
     let p = tmp_path("bytes");
     assert_ok(&format!(
