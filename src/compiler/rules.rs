@@ -1303,11 +1303,12 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
 
     /// The `_ENV` in scope for an access to the global `name`; an error while
     /// `global _ENV` is in scope, here or in an enclosing function
-    /// (`buildglobal`).
+    /// (`buildglobal`). A constant-folded `_ENV` is loaded into a temp, which
+    /// the caller frees with `free_reg` (a no-op for a local's register).
     fn env(&mut self, name: &str) -> Result<Env, CompileError> {
         let resolved = match self.resolve_local("_ENV").map(|d| (d.kind, d.register)) {
             Some((VarKind::Global, _)) => None,
-            Some((VarKind::Const(Some(_)), _)) => todo!("a constant-folded _ENV (#278)"),
+            Some((VarKind::Const(Some(v)), _)) => Some(ResolvedName::Const(v)),
             Some((kind, register)) => {
                 // Indexing a named vararg as `_ENV` reads it as a table.
                 if matches!(kind, VarKind::VarargParam)
@@ -1321,7 +1322,11 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         };
         match resolved {
             Some(ResolvedName::Upvalue(idx)) => Ok(Env::Upvalue(idx)),
-            Some(ResolvedName::Const(_)) => todo!("a constant-folded _ENV (#278)"),
+            Some(ResolvedName::Const(v)) => {
+                let reg = self.alloc_register()?;
+                self.discharge_to_reg_mut(&mut v.to_expr_desc(), Some(reg))?;
+                Ok(Env::Reg(reg))
+            }
             // The main chunk pre-seeds `_ENV`, so only a `global _ENV` stops
             // the capture.
             None => Err(self.err(CompileErrorKind::GlobalEnv(name.to_owned()))),
@@ -2082,6 +2087,9 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         ctx.emit_env_set(func_reg, env, ic_idx, key);
         ctx.free_reg(guard_reg);
         ctx.free_reg(target_reg);
+        if let Env::Reg(env) = env {
+            ctx.free_reg(env);
+        }
         return Ok(());
     }
 
@@ -2237,6 +2245,9 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
     }
     // Free the value-block.
     ctx.chunk.freereg = value_base;
+    if let Env::Reg(env) = env {
+        ctx.free_reg(env);
+    }
 
     Ok(())
 }
@@ -2920,8 +2931,12 @@ fn compile_expr_ident(
     }
 
     let (key, ic_idx) = ctx.alloc_field_key(name.as_bytes())?;
-    let dst = ctx.dst_or_alloc(dst)?;
     let env = ctx.env(name)?;
+    // Freed first so the result can reuse a temp `_ENV`: GETFIELD R, R, K.
+    if let Env::Reg(env) = env {
+        ctx.free_reg(env);
+    }
+    let dst = ctx.dst_or_alloc(dst)?;
     ctx.emit_env_get(dst, env, ic_idx, key);
     Ok(ExprDesc::from_reg(dst))
 }
