@@ -1,9 +1,14 @@
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::pin::Pin;
 
 use clap::Parser;
-use tcvm::env::{LuaString, Table, Value};
-use tcvm::{Executor, LoadError, Lua, RuntimeError, StashedError, format_prototype};
+use tcvm::dmm::{Collect, Trace};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Value};
+use tcvm::vm::sequence::{
+    BoxSequence, CallbackAction, Execution, Sequence, SequencePoll, seq_trace_pointers,
+};
+use tcvm::{Executor, LoadError, Lua, RuntimeError, format_prototype};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -76,9 +81,15 @@ fn main() {
             .raw_set(ctx, Value::string(key), Value::table(arg_tbl));
     });
 
+    // `lua.c`'s `docall`: the chunk runs under `xpcall` with `msghandler`.
+    // TODO(#228): an `Executor`-level message handler instead of the global.
     let ex = lua.enter(|ctx| {
         let chunk = ctx.load_file(&args.file)?;
-        let executor = Executor::start(ctx, chunk, ());
+        let xpcall = ctx
+            .globals()
+            .raw_get(Value::string(LuaString::new(ctx, b"xpcall")));
+        let handler = Function::new_native(ctx.mutation(), msghandler as NativeFn, &[]);
+        let executor = Executor::start(ctx, xpcall, (chunk, handler));
         Ok::<_, LoadError>(ctx.stash(executor))
     });
     let ex = match ex {
@@ -86,52 +97,69 @@ fn main() {
         Err(e) => die_load(&e),
     };
 
-    if let Err(e) = lua.execute::<()>(&ex) {
-        match e {
-            RuntimeError::Lua(stashed) => {
-                let msg = error_message(&mut lua, &stashed);
-                eprintln!("tcvm: {msg}");
-            }
-            other => eprintln!("tcvm: {other}"),
-        }
-        std::process::exit(1);
-    }
+    let outcome = lua.finish(&ex).and_then(|()| {
+        lua.try_enter(|ctx| {
+            let (ok, err): (bool, Value) = ctx.fetch(&ex).take_result(ctx)?;
+            Ok((!ok).then(|| ctx.stash(Error::new(ctx, err))))
+        })
+    });
+    let err = match outcome {
+        Ok(None) => return,
+        Ok(Some(err)) | Err(RuntimeError::Lua(err)) => lua.enter(|ctx| {
+            String::from_utf8_lossy(ctx.fetch(&err).message(ctx).as_bytes()).into_owned()
+        }),
+        Err(e) => e.to_string(),
+    };
+    eprintln!("tcvm: {err}");
+    std::process::exit(1);
 }
 
-/// `lua.c`'s `msghandler`: an error object that isn't a string or number is
-/// reported through its `__tostring` when that returns a string, and an error
-/// raised by `__tostring` replaces the original.
-fn error_message(lua: &mut Lua, err: &StashedError) -> String {
-    let lossy = |s: LuaString<'_>| String::from_utf8_lossy(s.as_bytes()).into_owned();
-    let call = lua.enter(|ctx| {
-        let e = ctx.fetch(err);
-        if e.as_text(ctx).is_some() {
-            return None;
-        }
-        let v = e.value();
+/// `lua.c`'s `msghandler`, short of the traceback (#228): the error object
+/// as text, through its `__tostring` when that returns a string. It runs
+/// before the chunk unwinds, so ahead of any pending `__close`.
+fn msghandler<'gc>(
+    ctx: tcvm::Context<'gc>,
+    _closure: &NativeClosure<'gc>,
+    mut stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
+    let v = stack.get(0);
+    let err = Error::new(ctx, v);
+    if err.as_text(ctx).is_none() {
         let mm = ctx.metamethod_of(v, ctx.symbols().mm_tostring);
-        if mm.is_nil() {
-            return None;
-        }
-        // Resetting the main thread is fine: the run that raised `err` is over.
-        Some(ctx.stash(Executor::start(ctx, mm, (v,))))
-    });
-    if let Some(ex) = call {
-        match lua.finish(&ex) {
-            Ok(()) => {
-                let msg = lua.enter(|ctx| {
-                    let r = ctx.fetch(&ex).take_result::<Value>(ctx).ok()?;
-                    r.get_string().map(lossy)
-                });
-                if let Some(msg) = msg {
-                    return msg;
-                }
-            }
-            Err(RuntimeError::Lua(inner)) => {
-                return lua.enter(|ctx| lossy(ctx.fetch(&inner).message(ctx)));
-            }
-            Err(_) => {}
+        if !mm.is_nil() {
+            stack.replace(&[mm, v]);
+            let then = BoxSequence::new(ctx.mutation(), StringOrMessage(v));
+            return Ok(CallbackAction::call(Some(then)));
         }
     }
-    lua.enter(|ctx| lossy(ctx.fetch(err).message(ctx)))
+    stack.ret1(Value::string(err.message(ctx)));
+    Ok(CallbackAction::Return)
+}
+
+/// [`msghandler`] after `__tostring`: its result if that is a string, else
+/// the error object's [`Error::message`]. An error it raises re-enters
+/// `msghandler` instead.
+#[derive(Collect)]
+#[collect(no_drop)]
+struct StringOrMessage<'gc>(Value<'gc>);
+
+impl<'gc> Sequence<'gc> for StringOrMessage<'gc> {
+    fn trace_pointers(&self, cc: &mut dyn Trace<'gc>) {
+        seq_trace_pointers!(self, cc);
+    }
+
+    fn poll(
+        self: Pin<&mut Self>,
+        ctx: tcvm::Context<'gc>,
+        _exec: Execution<'gc>,
+        mut stack: Stack<'gc, '_>,
+    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
+        let r = stack.get(0);
+        if r.get_string().is_some() {
+            stack.ret1(r);
+        } else {
+            stack.ret1(Value::string(Error::new(ctx, self.0).message(ctx)));
+        }
+        Ok(SequencePoll::Return)
+    }
 }
