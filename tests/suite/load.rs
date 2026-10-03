@@ -124,6 +124,22 @@ fn comments_and_long_brackets() {
 }
 
 #[test]
+fn line_breaks() {
+    // `\n`, `\r`, `\r\n` and `\n\r` are each one line break, in long
+    // brackets and string escapes too (#276).
+    assert_eq!(
+        ok(
+            r#"local function e(src) return (select(2, pcall(load(src, "=s")))) end
+              return cat(e("x=1\rerror('e')"), e("x=1\r\rerror('e')"),
+                  e("--[[\r]]error('e')"), e("local s = [[\ra]] error('e')"),
+                  e("x=1\r\nerror('e')"), e("x=1\n\r\nerror('e')"),
+                  e("x=1\n\n\r\rerror('e')"), e("local s = 'a\\\rb' error('e')"))"#
+        ),
+        "s:2: e s:3: e s:2: e s:2: e s:2: e s:3: e s:4: e s:2: e"
+    );
+}
+
+#[test]
 fn readonly_variables() {
     // `<close>` variables and named vararg parameters are read-only like
     // `<const>` ones (#242, #247), also through upvalues, and so is a

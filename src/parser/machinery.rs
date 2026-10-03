@@ -10,6 +10,7 @@ use cstree::green::GreenNode;
 use logos::Logos;
 
 use super::kind::{SyntaxKind, T};
+use super::lit::line_break_len;
 
 pub struct State<'cache, 'source> {
     cache: &'cache mut NodeCache<'static>,
@@ -431,11 +432,12 @@ impl<'cache, 'source> Sink<'cache, 'source> {
 
     fn token(&mut self, kind: SyntaxKind, span: Span) {
         let text = &self.source[span];
-        let newlines = self.source[self.last_source_offset as usize..span.start as usize]
-            .bytes()
-            .filter(|&b| b == b'\n')
-            .count() as u32;
-        self.last_line += newlines;
+        let mut gap =
+            &self.source.as_bytes()[self.last_source_offset as usize..span.start as usize];
+        while let Some(i) = gap.iter().position(|&b| matches!(b, b'\n' | b'\r')) {
+            gap = &gap[i + line_break_len(&gap[i..])..];
+            self.last_line += 1;
+        }
         self.last_source_offset = span.start;
         if self
             .lines
