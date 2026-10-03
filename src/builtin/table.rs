@@ -810,19 +810,16 @@ fn lua_unpack<'gc>(
     let Some(t) = check_tab(ctx, stack.get(0), "unpack", 1, TAB_R | TAB_L)? else {
         return Ok(unpack_meta(ctx));
     };
-    let Some((mut i, e)) = unpack_range(ctx, &stack, t.raw_len() as i64)? else {
+    let Some((i, n)) = unpack_range(ctx, &stack, t.raw_len() as i64)? else {
         stack.clear();
         return Ok(CallbackAction::Return);
     };
-    let mut out = Vec::with_capacity(e.wrapping_sub(i) as usize + 1);
-    // Iterate `i < e` then push `t[e]` separately, so `i += 1` never steps
-    // past i64::MAX when `e == i64::MAX`.
-    while i < e {
-        out.push(t.raw_get(Value::integer(ctx.mutation(), i)));
-        i += 1;
+    let out = stack
+        .replace_slots(n)
+        .expect("unpack_range checked the room");
+    for (k, slot) in out.iter_mut().enumerate() {
+        *slot = t.raw_get(Value::integer(ctx.mutation(), i + k as i64));
     }
-    out.push(t.raw_get(Value::integer(ctx.mutation(), e)));
-    stack.replace(&out);
     Ok(CallbackAction::Return)
 }
 
@@ -833,29 +830,28 @@ fn unpack_meta<'gc>(ctx: Context<'gc>) -> CallbackAction<'gc> {
     let seq = async_sequence(ctx.mutation(), |_locals, mut seq| async move {
         let len = util::len(&mut seq, 0).await?;
         let range = seq.try_enter(|ctx, _locals, _exec, stack| unpack_range(ctx, &stack, len))?;
-        let Some((mut i, e)) = range else {
+        let Some((i, n)) = range else {
             seq.enter(|_ctx, _locals, _exec, mut stack| stack.clear());
             return Ok(SequenceReturn::Return);
         };
         // Results go above `t`, which is dropped at the end.
         seq.enter(|_ctx, _locals, _exec, mut stack| stack.truncate(1));
-        while i < e {
-            util::geti(&mut seq, 0, i).await?;
-            i += 1;
+        for k in 0..n {
+            util::geti(&mut seq, 0, i + k as i64).await?;
         }
-        util::geti(&mut seq, 0, e).await?;
         seq.enter(|_ctx, _locals, _exec, mut stack| stack.remove(0));
         Ok(SequenceReturn::Return)
     });
     CallbackAction::sequence(seq)
 }
 
-/// `unpack`'s range, `None` when empty; `len` is `#t`, the default end.
+/// `unpack`'s first index and count, `None` when empty; `len` is `#t`, the
+/// default end. The count fits on the stack, so `i + k` for `k < n` can't overflow.
 fn unpack_range<'gc>(
     ctx: Context<'gc>,
     stack: &Stack<'gc, '_>,
     len: i64,
-) -> Result<Option<(i64, i64)>, Error<'gc>> {
+) -> Result<Option<(i64, usize)>, Error<'gc>> {
     let i_arg = stack.get(1);
     let i = if i_arg.is_nil() {
         1
@@ -872,9 +868,10 @@ fn unpack_range<'gc>(
         return Ok(None);
     }
     // `n - 1` as unsigned, so a full-i64-span range can't overflow the
-    // subtraction (PUC-Lua's `tunpack`). Cap the count at i32::MAX results.
-    if (j as u64).wrapping_sub(i as u64) >= i32::MAX as u64 {
+    // subtraction (PUC-Lua's `tunpack`).
+    let n1 = (j as u64).wrapping_sub(i as u64);
+    if n1 >= i32::MAX as u64 || !stack.check_stack(n1 as usize + 1) {
         return Err(Error::from_str(ctx, "too many results to unpack"));
     }
-    Ok(Some((i, j)))
+    Ok(Some((i, n1 as usize + 1)))
 }

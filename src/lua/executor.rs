@@ -683,10 +683,14 @@ fn pump_sequence<'gc>(
         let mut ts = top.borrow_mut(mc);
         let exec = Execution::new(top, ts.main);
         let stack_view = crate::env::function::Stack::new(&mut ts, call_site.bottom);
-        if let Some(err) = pending_error {
+        let r = if let Some(err) = pending_error {
             seq.error(ctx, exec, err, stack_view)
         } else {
             seq.poll(ctx, exec, stack_view)
+        };
+        match r {
+            Ok(_) if ts.native_overflowed() => Err(vm::interp::native_overflow(ctx)),
+            r => r,
         }
     };
     match poll_result {

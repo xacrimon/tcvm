@@ -465,6 +465,10 @@ pub(super) fn lua_unpack<'gc>(
             return Err(util::arg_error(ctx, "unpack", 2, "data string too short"));
         }
         pos += ntoalign;
+        // Room for this item and the trailing position.
+        if !stack.check_stack(out.len() + 2) {
+            return Err(Error::from_str(ctx, "too many results"));
+        }
         match opt {
             KOption::Int { signed } => {
                 out.push(Value::integer(

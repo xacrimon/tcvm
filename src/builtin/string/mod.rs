@@ -90,16 +90,17 @@ fn lua_byte<'gc>(
     };
     let start = posrelat(i, len).max(1);
     let end = posrelat(j, len).min(len as i64);
-    let mut out = Vec::new();
-    let mut k = start;
-    while k <= end {
-        out.push(Value::integer(
-            ctx.mutation(),
-            bytes[(k - 1) as usize] as i64,
-        ));
-        k += 1;
+    let slice = if start <= end {
+        &bytes[(start - 1) as usize..end as usize]
+    } else {
+        &[]
+    };
+    let Some(out) = stack.replace_slots(slice.len()) else {
+        return Err(Error::from_str(ctx, "string slice too long"));
+    };
+    for (slot, &b) in out.iter_mut().zip(slice) {
+        *slot = Value::integer(ctx.mutation(), b as i64);
     }
-    stack.replace(&out);
     Ok(CallbackAction::Return)
 }
 

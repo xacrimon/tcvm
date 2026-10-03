@@ -167,19 +167,24 @@ fn lua_codepoint<'gc>(
         return Err(util::arg_error(ctx, "codepoint", 3, "out of bounds"));
     }
     let strict = stack.get(3).is_falsy(); // optional `lax` flag (arg #4): lax ⇒ not strict
-    let mut out = Vec::new();
     let mut pos = (posi - 1) as usize;
     let end = posj as usize;
+    // Room for one result per byte, as `codepoint` checks in the reference.
+    let Some(out) = stack.replace_slots(end.saturating_sub(pos)) else {
+        return Err(Error::from_str(ctx, "string slice too long"));
+    };
+    let mut n = 0;
     while pos < end {
         match decode(bytes, pos, strict) {
             Some((code, next)) => {
-                out.push(Value::integer(ctx.mutation(), code as i64));
+                out[n] = Value::integer(ctx.mutation(), code as i64);
+                n += 1;
                 pos = next;
             }
             None => return Err(Error::from_str(ctx, "invalid UTF-8 code")),
         }
     }
-    stack.replace(&out);
+    stack.truncate(n);
     Ok(CallbackAction::Return)
 }
 
