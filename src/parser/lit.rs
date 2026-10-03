@@ -1,6 +1,5 @@
 use std::num::{ParseFloatError, ParseIntError};
-
-use logos::Logos;
+use std::ops::Range;
 
 /// Length of the line break at the start of `b`, or 0. `\n`, `\r`, `\r\n`
 /// and `\n\r` are each one break, as in `inclinenumber` (llex.c).
@@ -72,128 +71,125 @@ pub fn parse_hex_float(s: &str) -> Option<f64> {
     Some(value)
 }
 
-/// Decode a quoted string literal (including the surrounding quotes). Returns
-/// `None` on a malformed escape (a too-large decimal/`\u{}` value) so the
-/// caller can surface a parse error instead of the decoder panicking.
-pub fn parse_string(s: &str) -> Option<Vec<u8>> {
-    parse_string_fragment(&s[1..s.len() - 1])
+/// A malformed escape in a quoted string literal: Lua's `message`, for the
+/// bytes `range` of the literal (the escape up to the offending byte).
+#[derive(Debug, PartialEq, Eq)]
+pub struct EscapeError {
+    pub range: Range<usize>,
+    pub message: &'static str,
 }
 
-pub fn parse_long_string(s: &str) -> Option<Vec<u8>> {
-    let mut suffix = 1;
-    let mut s = &s[1..s.len() - 1];
-
-    while s.starts_with('=') {
-        suffix += 1;
-        s = &s[1..];
-    }
-
-    parse_string_fragment(&s[1..s.len() - suffix])
-}
-
-#[derive(Logos)]
-enum StringToken {
-    #[token("\\a")]
-    Bell,
-
-    #[token("\\b")]
-    Backspace,
-
-    #[token("\\f")]
-    FormFeed,
-
-    #[token("\\n")]
-    Newline,
-
-    #[token("\\r")]
-    CarriageReturn,
-
-    #[token("\\t")]
-    Tab,
-
-    #[token("\\v")]
-    VerticalTab,
-
-    #[token("\\\\")]
-    Backslash,
-
-    #[token("\\\"")]
-    DoubleQuote,
-
-    #[token("\\'")]
-    Quote,
-
-    #[token("\\[")]
-    LeftBracket,
-
-    #[token("\\]")]
-    RightBracket,
-
-    #[regex(r"\\x[0-9a-fA-F][0-9a-fA-F]")]
-    Hex,
-
-    // Greedy 1-3 decimal digits: `\195` takes all three, matching Lua, which
-    // then rejects values > 255 rather than falling back to fewer digits.
-    #[regex(r"\\[0-9][0-9]?[0-9]?")]
-    Decimal,
-
-    #[regex(r"\\u\{[0-9a-fA-F]+\}")]
-    Unicode,
-}
-
-fn parse_string_fragment(s: &str) -> Option<Vec<u8>> {
+/// Decode a quoted string literal (including the surrounding quotes), as
+/// llex.c's `read_string` does.
+pub fn parse_string(s: &str) -> Result<Vec<u8>, EscapeError> {
     let b = s.as_bytes();
-    let mut bytes = Vec::new();
-
-    for (token, span) in StringToken::lexer(s).spanned() {
-        match token {
-            Ok(StringToken::Bell) => bytes.push(0x07),
-            Ok(StringToken::Backspace) => bytes.push(0x08),
-            Ok(StringToken::FormFeed) => bytes.push(0x0C),
-            Ok(StringToken::Newline) => bytes.push(0x0A),
-            Ok(StringToken::CarriageReturn) => bytes.push(0x0D),
-            Ok(StringToken::Tab) => bytes.push(0x09),
-            Ok(StringToken::VerticalTab) => bytes.push(0x0B),
-            Ok(StringToken::Backslash) => bytes.push(0x5C),
-            Ok(StringToken::DoubleQuote) => bytes.push(0x22),
-            Ok(StringToken::Quote) => bytes.push(0x27),
-            Ok(StringToken::LeftBracket) => bytes.push(0x5B),
-            Ok(StringToken::RightBracket) => bytes.push(0x5D),
-            Ok(StringToken::Hex) => parse_hex_escape(&mut bytes, &s[span]),
-            Ok(StringToken::Decimal) => parse_decimal_escape(&mut bytes, &s[span])?,
-            Ok(StringToken::Unicode) => parse_unicode_escape(&mut bytes, &s[span])?,
-            Err(()) => bytes.extend_from_slice(&b[span]),
+    // The closing quote. The lexer never ends a literal on an escaped one,
+    // so every escape is complete before it.
+    let end = b.len() - 1;
+    let mut out = Vec::with_capacity(end);
+    let mut i = 1;
+    while i < end {
+        if b[i] != b'\\' {
+            out.push(b[i]);
+            i += 1;
+            continue;
         }
+        let start = i;
+        let fail = |at: usize, message| EscapeError {
+            range: start..s.ceil_char_boundary(at + 1),
+            message,
+        };
+        let hex = |at: usize| (b[at] as char).to_digit(16);
+        i += 1;
+        // Escapes that stand for one byte evaluate to it; the rest `continue`.
+        let c = match b[i] {
+            b'a' => 0x07,
+            b'b' => 0x08,
+            b'f' => 0x0C,
+            b'n' => b'\n',
+            b'r' => b'\r',
+            b't' => b'\t',
+            b'v' => 0x0B,
+            c @ (b'\\' | b'"' | b'\'') => c,
+            b'\n' | b'\r' => {
+                out.push(b'\n');
+                i += line_break_len(&b[i..]);
+                continue;
+            }
+            b'z' => {
+                i += 1;
+                while matches!(b[i], b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r') {
+                    i += 1;
+                }
+                continue;
+            }
+            b'x' => {
+                let mut c = 0;
+                for _ in 0..2 {
+                    i += 1;
+                    c = c * 16 + hex(i).ok_or_else(|| fail(i, "hexadecimal digit expected"))?;
+                }
+                c as u8
+            }
+            b'u' => {
+                i += 1;
+                if b[i] != b'{' {
+                    return Err(fail(i, "missing '{'"));
+                }
+                i += 1;
+                let mut cp = hex(i).ok_or_else(|| fail(i, "hexadecimal digit expected"))?;
+                i += 1;
+                while let Some(d) = hex(i) {
+                    if cp > 0x7FFF_FFFF >> 4 {
+                        return Err(fail(i, "UTF-8 value too large"));
+                    }
+                    cp = cp << 4 | d;
+                    i += 1;
+                }
+                if b[i] != b'}' {
+                    return Err(fail(i, "missing '}'"));
+                }
+                utf8_encode(&mut out, cp);
+                i += 1;
+                continue;
+            }
+            b'0'..=b'9' => {
+                let digits = b[i..]
+                    .iter()
+                    .take(3)
+                    .take_while(|c| c.is_ascii_digit())
+                    .count();
+                let n: u32 = s[i..i + digits].parse().expect("ASCII digits");
+                i += digits;
+                if n > 255 {
+                    return Err(fail(i, "decimal escape too large"));
+                }
+                out.push(n as u8);
+                continue;
+            }
+            _ => return Err(fail(i, "invalid escape sequence")),
+        };
+        out.push(c);
+        i += 1;
     }
-
-    Some(bytes)
+    Ok(out)
 }
 
-fn parse_hex_escape(dst: &mut Vec<u8>, s: &str) {
-    // The `\xHH` regex guarantees exactly two hex digits, so this fits a `u8`.
-    let char = u8::from_str_radix(&s[2..], 16).expect("\\x escape has two hex digits");
-    dst.push(char);
-}
-
-fn parse_decimal_escape(dst: &mut Vec<u8>, s: &str) -> Option<()> {
-    // `\ddd` is 1–3 decimal digits; Lua rejects a value > 255 (`None` here so
-    // the caller raises a parse error rather than the decoder panicking).
-    let char = s[1..].parse::<u8>().ok()?;
-    dst.push(char);
-    Some(())
-}
-
-fn parse_unicode_escape(dst: &mut Vec<u8>, s: &str) -> Option<()> {
-    // `s` is `\u{HEX}`; skip the 3-byte `\u{` prefix and the trailing `}`.
-    let hex = &s[3..s.len() - 1];
-    // Parse into `u64` so an over-long digit run yields `None` rather than
-    // overflow-panicking. Lua accepts code points up to 0x7FFFFFFF.
-    let cp = u64::from_str_radix(hex, 16).ok()?;
-    if cp > 0x7FFF_FFFF {
-        return None; // Lua: "UTF-8 value too large"
+/// Decode a long string literal (including its brackets). There are no
+/// escapes; a line break right after the opening bracket is dropped and every
+/// other one becomes `\n`, as in llex.c's `read_long_string`.
+pub fn parse_long_string(s: &str) -> Vec<u8> {
+    let level = s[1..].bytes().take_while(|&c| c == b'=').count();
+    let mut b = &s.as_bytes()[level + 2..s.len() - level - 2];
+    b = &b[line_break_len(b)..];
+    let mut out = Vec::with_capacity(b.len());
+    while let Some(i) = b.iter().position(|&c| matches!(c, b'\n' | b'\r')) {
+        out.extend_from_slice(&b[..i]);
+        out.push(b'\n');
+        b = &b[i + line_break_len(&b[i..])..];
     }
-    utf8_encode(dst, cp as u32);
-    Some(())
+    out.extend_from_slice(b);
+    out
 }
 
 /// Lua's `luaO_utf8esc`: encode a code point (0..=0x7FFFFFFF) as 1–6 bytes via
@@ -290,9 +286,11 @@ mod tests {
     }
 
     #[test]
-    fn decimal_escape_too_large_is_none() {
-        // `\256` > 255 — a parse error, not a decoder panic.
-        assert_eq!(parse_string(r#""\256""#), None);
+    fn decimal_escape_too_large_is_an_error() {
+        assert_eq!(
+            parse_string(r#""a\256""#).unwrap_err().message,
+            "decimal escape too large"
+        );
     }
 
     // Unicode escapes use Lua's extended UTF-8 (`luaO_utf8esc`): up to 6 bytes,
@@ -324,8 +322,12 @@ mod tests {
     }
 
     #[test]
-    fn unicode_escape_too_large_is_none() {
-        assert_eq!(parse_string(r#""\u{80000000}""#), None); // > 0x7FFFFFFF
-        assert_eq!(parse_string(r#""\u{FFFFFFFFF}""#), None); // overflows
+    fn unicode_escape_too_large_is_an_error() {
+        for s in [r#""\u{80000000}""#, r#""\u{FFFFFFFFF}""#] {
+            assert_eq!(
+                parse_string(s).unwrap_err().message,
+                "UTF-8 value too large"
+            );
+        }
     }
 }
