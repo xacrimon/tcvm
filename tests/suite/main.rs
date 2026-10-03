@@ -21,6 +21,7 @@ mod executor_isolation;
 mod gc_stack_trace;
 mod generic_for;
 mod goto_close;
+mod goto_labels;
 mod host_load;
 mod host_resume;
 mod io_library;
