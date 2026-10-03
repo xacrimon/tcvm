@@ -4031,7 +4031,18 @@ pub(crate) fn invoke_native<'gc>(
     // The stack is grown-not-shrunk and may leave dead scratch above the logical
     // top; that's fine because `ThreadState`'s `Collect` traces only the live
     // high-water (derived from the frames + `top`), so dead slots never retain.
-    (nc.function)(ctx, nc, stack)
+    let r = (nc.function)(ctx, nc, stack);
+    if r.is_ok() && thread.native_overflowed() {
+        return Err(native_overflow(ctx));
+    }
+    r
+}
+
+/// A native or sequence pushed without `Stack::check_stack`.
+#[cold]
+#[inline(never)]
+pub(crate) fn native_overflow(ctx: Context<'_>) -> crate::env::Error<'_> {
+    crate::env::Error::from_str(ctx, "stack overflow")
 }
 
 /// What should happen after a frame returns with values at

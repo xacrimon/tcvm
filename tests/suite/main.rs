@@ -40,6 +40,7 @@ mod method_def;
 mod metrics_lifetime;
 mod native_call_nested_stack;
 mod native_calls_lua;
+mod native_stack_limit;
 mod next_dead_boxed_key;
 mod next_pairs;
 mod not_andor;

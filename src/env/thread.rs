@@ -212,6 +212,9 @@ pub enum FrameRef<'a, 'gc> {
 /// are headroom for a message handler to report that (PUC's `STACKERRSPACE`).
 pub(crate) const MAX_STACK: usize = 65_500;
 pub(crate) const STACK_LIMIT: usize = MAX_STACK - 200;
+/// Slots a native may fill past `stack_limit` without `Stack::check_stack`,
+/// for fixed-count results (`LUA_MINSTACK`).
+pub(crate) const NATIVE_SLACK: usize = 20;
 
 /// The mutable state of a thread/coroutine.
 ///
@@ -602,6 +605,12 @@ impl<'gc> ThreadState<'gc> {
         }
         self.grow_slots(n);
         true
+    }
+
+    /// A native left more values than [`NATIVE_SLACK`] past `stack_limit`.
+    #[inline]
+    pub(crate) fn native_overflowed(&self) -> bool {
+        self.top > self.stack_limit + NATIVE_SLACK
     }
 
     /// A message handler is running in the headroom above [`STACK_LIMIT`].

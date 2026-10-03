@@ -354,6 +354,27 @@ impl<'gc, 'a> Stack<'gc, 'a> {
         self.thread.top = end;
     }
 
+    /// Whether `n` more values fit above the top within the thread's stack
+    /// limit (`lua_checkstack`). A native whose result count depends on its
+    /// arguments checks before pushing.
+    #[inline]
+    pub fn check_stack(&self, n: usize) -> bool {
+        n <= self.thread.stack_limit.saturating_sub(self.thread.top)
+    }
+
+    /// `replace` with `n` slots, or `None` unless `check_stack(n)`. The slots
+    /// hold stale values inside the window: write every one or `truncate`.
+    #[inline]
+    pub fn replace_slots(&mut self, n: usize) -> Option<&mut [Value<'gc>]> {
+        if !self.check_stack(n) {
+            return None;
+        }
+        let end = self.bottom + n;
+        self.thread.ensure_slots(end);
+        self.thread.top = end;
+        Some(&mut self.thread.stack[self.bottom..end])
+    }
+
     /// `replace(&[v])` without going through memory: a by-value `Value` stays
     /// in a register, whereas a one-element slice is spilled to the stack and
     /// read back through a pointer, with a copy loop around it.
