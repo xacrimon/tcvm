@@ -2398,20 +2398,16 @@ enum Lvalue {
     },
 }
 
-/// Lua 5.5 §3.3.3 specifies "first evaluate all its expressions and only
-/// then perform the assignments." We honour that without losing the
-/// hint-into-target optimisation by:
+/// Lua 5.5 §3.3.3: "first evaluate all its expressions and only then
+/// perform the assignments." Matches luac and LuaJIT, so a call or
+/// metamethod sees the same reads and writes of a local:
 ///
-///   1. resolving every LHS to an `Lvalue` up front (Index/Property
-///      sub-expressions land in registers, copied to temps if they
-///      reference a local that's also a target);
-///   2. compiling each RHS, hinting into the slot's target local iff no
-///      later RHS reads it — that lets value computation perform the
-///      assignment as a side effect (no MOVE in pass 4);
-///   3. saving any non-hinted source register that aliases an earlier
-///      target local, so the earlier store doesn't clobber the value a
-///      later store still needs (`b, a = a, b` cycles);
-///   4. emitting the surviving stores.
+///   1. resolve every LHS to an `Lvalue` (Index/Property sub-expressions
+///      land in registers, copied to temps if they reference a local that's
+///      also a target);
+///   2. compile every value into a fresh register, except that the last
+///      value goes straight into the last target;
+///   3. store right to left.
 fn compile_assign(ctx: &mut Ctx, item: Assign) -> Result<(), CompileError> {
     let targets: Vec<_> = item
         .targets()
@@ -2426,47 +2422,25 @@ fn compile_assign(ctx: &mut Ctx, item: Assign) -> Result<(), CompileError> {
     let num_values = values.len();
     let freereg_before = ctx.chunk.freereg;
 
-    // Set of local registers that are themselves LHS targets — drives
-    // the conflict checks in pass 1 and pass 3.
-    let target_local_regs: Vec<u8> = targets
+    let local_regs: Vec<Option<u8>> = targets.iter().map(|t| target_local_reg(ctx, t)).collect();
+    let is_env: Vec<bool> = targets
         .iter()
-        .filter_map(|t| target_local_reg(ctx, t))
+        .map(|t| matches!(t, Expr::Ident(i) if i.name(ctx.interner) == Some("_ENV")))
         .collect();
-    // Stores run in target order, so with `_ENV` among the targets a global
-    // target must index the old `_ENV`. A local one is in
-    // `target_local_regs`; this covers an upvalue.
-    let env_is_target = targets
-        .iter()
-        .any(|t| matches!(t, Expr::Ident(i) if i.name(ctx.interner) == Some("_ENV")));
 
-    // Pass 1: resolve LHS targets.
+    // Pass 1: resolve LHS targets. Stores run right to left, so only a later
+    // target can change a local, or an upvalue `_ENV`, that this one reads
+    // (luac's `check_conflict`).
     let mut lvalues: Vec<Lvalue> = Vec::with_capacity(num_targets);
-    for target in targets {
-        lvalues.push(compile_lvalue(
-            ctx,
-            target,
-            &target_local_regs,
-            env_is_target,
-        )?);
+    for (i, target) in targets.into_iter().enumerate() {
+        let later_locals: Vec<u8> = local_regs[i + 1..].iter().flatten().copied().collect();
+        let env_is_later = is_env[i + 1..].contains(&true);
+        lvalues.push(compile_lvalue(ctx, target, &later_locals, env_is_later)?);
     }
 
-    // Decide per-slot whether it's safe to hint the RHS directly into
-    // the target local: only when the target is a local AND no later
-    // RHS reads that local (an in-place hint *is* an early assignment).
-    // Values past the last target are evaluated, unhinted, then dropped.
-    let mut hints: Vec<Option<RegisterIndex>> = Vec::with_capacity(num_values);
-    for i in 0..num_values {
-        let h = match lvalues.get(i).and_then(local_dst) {
-            Some(dst) if !any_reads(ctx, &values[i + 1..], dst.0)? => Some(dst),
-            _ => None,
-        };
-        hints.push(h);
-    }
-
-    // Pass 2: compile RHS values. `pending[i] = Some(reg)` means pass 4
-    // must emit a store from `reg`; `None` means the value was hinted
-    // straight into the target local already.
-    let mut pending: Vec<Option<u8>> = Vec::with_capacity(num_targets);
+    // Pass 2: compile values. `pending[i] = Some(reg)` means pass 3 must
+    // store from `reg`; `None` means the value is already in its target.
+    let mut pending: Vec<Option<u8>> = Vec::with_capacity(num_values.max(num_targets));
     for (i, expr) in values.into_iter().enumerate() {
         let is_last = i == num_values - 1;
         if is_last
@@ -2486,38 +2460,33 @@ fn compile_assign(ctx: &mut Ctx, item: Assign) -> Result<(), CompileError> {
             pending.extend(regs.iter().map(|r| Some(r.0)));
             continue;
         }
-        let hint = hints[i];
-        let reg = compile_expr_to_reg(ctx, expr, hint)?;
-        pending.push(if hint == Some(reg) { None } else { Some(reg.0) });
-    }
-
-    // Pad with nil if fewer values than targets. A nil pad reads nothing,
-    // so hinting into a Local target is always safe.
-    while pending.len() < num_targets {
-        let i = pending.len();
-        let nil = ctx.alloc_constant(Value::nil())?;
-        let hint = local_dst(&lvalues[i]);
-        let reg = ctx.dst_or_alloc(hint)?;
-        ctx.emit(Instruction::load(reg, KIdx(nil)));
-        pending.push(if hint == Some(reg) { None } else { Some(reg.0) });
-    }
-
-    // Pass 3: any source register that aliases an earlier slot's target
-    // local will be clobbered by that earlier store — save it now.
-    for (j, slot) in pending.iter_mut().enumerate().take(num_targets) {
-        let Some(r) = *slot else { continue };
-        let collides = (0..j).any(|i| local_dst(&lvalues[i]).is_some_and(|d| d.0 == r));
-        if collides {
+        // The last target is stored first, so its value can be computed in
+        // place, and a local it reads can't have been written yet.
+        let into_last_target = is_last && num_values == num_targets;
+        let hint = into_last_target.then(|| local_dst(&lvalues[i])).flatten();
+        let mut reg = compile_expr_to_reg(ctx, expr, hint)?;
+        // Any other local is read now: a later value or store can change it.
+        if !into_last_target && i < num_targets && reg.0 < ctx.chunk.nactvar {
             let temp = ctx.alloc_register()?;
-            ctx.emit(Instruction::mov(temp, Reg(r)));
-            *slot = Some(temp.0);
+            ctx.emit(Instruction::mov(temp, reg));
+            reg = temp;
         }
+        pending.push(if hint == Some(reg) { None } else { Some(reg.0) });
     }
 
-    // Pass 4: emit stores for the non-hinted slots.
-    for (lv, src) in lvalues.into_iter().zip(&pending) {
-        let Some(val) = *src else { continue };
-        emit_store(ctx, lv, val);
+    if pending.len() < num_targets {
+        let nil = ctx.alloc_constant(Value::nil())?;
+        let reg = ctx.alloc_register()?;
+        ctx.emit(Instruction::load(reg, KIdx(nil)));
+        pending.resize(num_targets, Some(reg.0));
+    }
+
+    // Pass 3: store right to left.
+    pending.truncate(num_targets);
+    for (lv, src) in lvalues.into_iter().zip(pending).rev() {
+        if let Some(src) = src {
+            emit_store(ctx, lv, src);
+        }
     }
 
     assert!(ctx.chunk.freereg >= freereg_before);
@@ -2687,89 +2656,6 @@ fn local_dst(lv: &Lvalue) -> Option<RegisterIndex> {
         Lvalue::Local { dst } => Some(*dst),
         _ => None,
     }
-}
-
-/// True if any of `exprs`, evaluated immediately, performs a register
-/// read from `reg`. Used to gate hint-into-target — if a later RHS
-/// reads the local, hinting would corrupt that read.
-///
-/// `function ... end` literals don't count: the body's reads happen at
-/// call time via upvalues. Field-name idents under `.`/`:` don't count
-/// either: they're string keys, not variable reads.
-fn any_reads(ctx: &Ctx, exprs: &[Expr], reg: u8) -> Result<bool, CompileError> {
-    for e in exprs {
-        if expr_reads(ctx, e, reg)? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn expr_reads(ctx: &Ctx, expr: &Expr, reg: u8) -> Result<bool, CompileError> {
-    let any = |opt: Option<Expr>| -> Result<bool, CompileError> {
-        opt.as_ref().map_or(Ok(false), |e| expr_reads(ctx, e, reg))
-    };
-    Ok(match expr {
-        Expr::Literal(_) | Expr::VarArg | Expr::Func(_) => false,
-        Expr::Ident(ident) => {
-            let reads = |n| {
-                ctx.resolve_local(n)
-                    .filter(|d| !matches!(d.kind, VarKind::Global))
-                    .map(|d| d.register.0 == reg)
-            };
-            // A name that isn't a local is conservatively a global, which
-            // reads a local `_ENV`.
-            ident
-                .name(ctx.interner)
-                .and_then(|n| reads(n).or_else(|| reads("_ENV")))
-                .unwrap_or(false)
-        }
-        Expr::PrefixOp(p) => any(p.rhs())?,
-        Expr::BinaryOp(b) => {
-            let skip_rhs = matches!(
-                b.op(),
-                Some(BinaryOperator::Property | BinaryOperator::Method)
-            );
-            any(b.lhs())? || (!skip_rhs && any(b.rhs())?)
-        }
-        Expr::Index(i) => any(i.target())? || any(i.index())?,
-        Expr::FuncCall(c) => {
-            if any(c.target())? {
-                return Ok(true);
-            }
-            for arg in c.args().into_iter().flatten() {
-                if expr_reads(ctx, &arg, reg)? {
-                    return Ok(true);
-                }
-            }
-            false
-        }
-        Expr::Method(m) => {
-            if any(m.object())? {
-                return Ok(true);
-            }
-            for arg in m.args().into_iter().flatten() {
-                if expr_reads(ctx, &arg, reg)? {
-                    return Ok(true);
-                }
-            }
-            false
-        }
-        Expr::Table(t) => {
-            for entry in t.entries() {
-                let touched = match entry {
-                    TableEntry::Array(a) => any(a.value())?,
-                    TableEntry::Map(m) => any(m.value())?,
-                    TableEntry::Generic(g) => any(g.index())? || any(g.value())?,
-                };
-                if touched {
-                    return Ok(true);
-                }
-            }
-            false
-        }
-        Expr::Paren(inner) => expr_reads(ctx, inner, reg)?,
-    })
 }
 
 /// Emit the store instruction for a resolved Lvalue from a source register.
@@ -3490,7 +3376,14 @@ fn compile_expr_binary_op(
     let lhs_lazy_numeral = matches!(lhs_desc.kind, ExprKind::Numeral(_)) && !lhs_desc.has_jumps();
     let materialise_lhs_early = op == BinaryOperator::Concat || !lhs_lazy_numeral;
     if materialise_lhs_early {
-        ctx.discharge_to_reg_mut(&mut lhs_desc, None)?;
+        let lhs = ctx.discharge_to_reg_mut(&mut lhs_desc, None)?;
+        // Copy a local, as luac and LuaJIT do (their `CONCAT` needs
+        // consecutive registers), so a call in the RHS can't change it.
+        if op == BinaryOperator::Concat && lhs.0 < ctx.chunk.nactvar {
+            let temp = ctx.alloc_register()?;
+            ctx.emit(Instruction::mov(temp, lhs));
+            lhs_desc = ExprDesc::from_reg(temp);
+        }
     }
 
     let mut rhs_desc = compile_expr(ctx, rhs_expr, None)?;

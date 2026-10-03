@@ -2,7 +2,7 @@
 source: src/compiler/snapshot_tests.rs
 expression: output
 ---
-; function (params=0, vararg=true, stack=6, upvalues=1)
+; function (params=0, vararg=true, stack=7, upvalues=1)
 ; constants:
 ;   K0 = 2
 ;   K1 = 0
@@ -18,22 +18,24 @@ expression: output
 0003  [ 12]  LOAD            R2 K1  ; 0
 0004  [ 13]  LOAD            R3 K2  ; ""
 0005  [ 14]  LTI             R2 #10000 inv=false
-0006  [ 14]  JMP             +11
+0006  [ 14]  JMP             +13
 0007  [ 15]  MOVE            R4 R0
 0008  [ 15]  MOVE            R5 R1
 0009  [ 15]  CALL            R4 args=2 ret=2
 0010  [ 15]  TEST            R4 inv=false
-0011  [ 15]  JMP             +4
+0011  [ 15]  JMP             +6
 0012  [ 16]  ADDI            R2 R2 #1
-0013  [ 17]  LOAD            R4 K3  ; "\n"
-0014  [ 17]  CONCAT          R4 R1 R4
-0015  [ 17]  CONCAT          R3 R3 R4
-0016  [ 20]  ADDI            R1 R1 #1
-0017  [ 20]  JMP             -13
-0018  [ 23]  GETTABUP        R4 U0 K4  ; "print"
-0019  [ 23]  MOVE            R5 R3
-0020  [ 23]  CALL            R4 args=2 ret=1
-0021  [ 23]  RETURN0
+0013  [ 17]  MOVE            R4 R3
+0014  [ 17]  MOVE            R5 R1
+0015  [ 17]  LOAD            R6 K3  ; "\n"
+0016  [ 17]  CONCAT          R5 R5 R6
+0017  [ 17]  CONCAT          R3 R4 R5
+0018  [ 20]  ADDI            R1 R1 #1
+0019  [ 20]  JMP             -15
+0020  [ 23]  GETTABUP        R4 U0 K4  ; "print"
+0021  [ 23]  MOVE            R5 R3
+0022  [ 23]  CALL            R4 args=2 ret=1
+0023  [ 23]  RETURN0
 
 ; prototype 0:
   ; function (params=1, vararg=false, stack=6, upvalues=0)

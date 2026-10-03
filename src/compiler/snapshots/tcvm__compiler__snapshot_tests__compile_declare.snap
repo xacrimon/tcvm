@@ -35,8 +35,8 @@ expression: output
 0009  [  7]  GETTABUP        R5 U0 K8  ; "get"
 0010  [  7]  CALL            R5 args=1 ret=2
 0011  [  7]  LOAD            R6 K9  ; "other1"
-0012  [  7]  SETTABUP        R5 U0 K6  ; "i"
-0013  [  7]  SETTABUP        R6 U0 K7  ; "k"
+0012  [  7]  SETTABUP        R6 U0 K7  ; "k"
+0013  [  7]  SETTABUP        R5 U0 K6  ; "i"
 0014  [  8]  GETTABUP        R5 U0 K10  ; "getf"
 0015  [  8]  CALL            R5 args=1 ret=2
 0016  [  8]  LOAD            R6 K11  ; "other2"

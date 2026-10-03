@@ -2,7 +2,7 @@
 source: src/compiler/snapshot_tests.rs
 expression: output
 ---
-; function (params=0, vararg=true, stack=6, upvalues=1)
+; function (params=0, vararg=true, stack=7, upvalues=1)
 ; constants:
 ;   K0 = nil
 ;   K1 = 1
@@ -18,13 +18,16 @@ expression: output
 0001  [  1]  LOAD            R0 K0  ; nil
 0002  [  1]  LOAD            R1 K0  ; nil
 0003  [  1]  LOAD            R2 K0  ; nil
-0004  [  2]  LOAD            R0 K1  ; 1
-0005  [  2]  LOAD            R1 K2  ; 2
+0004  [  2]  LOAD            R3 K1  ; 1
+0005  [  2]  LOAD            R4 K2  ; 2
 0006  [  2]  LOAD            R2 K3  ; 3
-0007  [  3]  LOAD            R3 K4  ; 10
-0008  [  3]  LOAD            R4 K5  ; 20
-0009  [  4]  LOAD            R5 K6  ; 30
-0010  [  5]  MOVE            R0 R3
-0011  [  5]  MOVE            R1 R4
-0012  [  6]  ADDI            R2 R5 #1
-0013  [  6]  RETURN0
+0007  [  2]  MOVE            R1 R4
+0008  [  2]  MOVE            R0 R3
+0009  [  3]  LOAD            R3 K4  ; 10
+0010  [  3]  LOAD            R4 K5  ; 20
+0011  [  4]  LOAD            R5 K6  ; 30
+0012  [  5]  MOVE            R6 R3
+0013  [  5]  MOVE            R1 R4
+0014  [  5]  MOVE            R0 R6
+0015  [  6]  ADDI            R2 R5 #1
+0016  [  6]  RETURN0
