@@ -2258,9 +2258,10 @@ fn compile_assign(ctx: &mut Ctx, item: Assign) -> Result<(), CompileError> {
     // Decide per-slot whether it's safe to hint the RHS directly into
     // the target local: only when the target is a local AND no later
     // RHS reads that local (an in-place hint *is* an early assignment).
+    // Values past the last target are evaluated, unhinted, then dropped.
     let mut hints: Vec<Option<RegisterIndex>> = Vec::with_capacity(num_values);
     for i in 0..num_values {
-        let h = match local_dst(&lvalues[i]) {
+        let h = match lvalues.get(i).and_then(local_dst) {
             Some(dst) if !any_reads(ctx, &values[i + 1..], dst.0)? => Some(dst),
             _ => None,
         };
