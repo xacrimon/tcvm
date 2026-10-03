@@ -280,6 +280,10 @@ pub(super) fn lua_pack<'gc>(
 
     while fpos < fmt.len() {
         let (opt, size, ntoalign) = get_details(ctx, &mut h, out.len(), fmt, &mut fpos, "pack")?;
+        // Blames the previous argument (the format for the first item), as lstrlib does.
+        if size + ntoalign > MAXSIZE - out.len() {
+            return Err(util::arg_error(ctx, "pack", arg, "result too long"));
+        }
         out.resize(out.len() + ntoalign, 0);
         arg += 1;
         match opt {

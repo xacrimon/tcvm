@@ -59,6 +59,7 @@ mod string_args;
 mod string_collection;
 mod string_format_pointer;
 mod string_metatable;
+mod string_pack;
 mod suspended_metamethod;
 mod table_border;
 mod table_create;
