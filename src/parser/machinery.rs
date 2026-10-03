@@ -38,7 +38,7 @@ impl<'cache, 'source> State<'cache, 'source> {
                 .map(|(kind, range)| (kind.unwrap_or(T![invalid]), Span::from_range(range))),
         );
 
-        tokens.push((T![eof], Span::from_range(0..0)));
+        tokens.push((T![eof], Span::from_range(source.len()..source.len())));
 
         State {
             cache,
