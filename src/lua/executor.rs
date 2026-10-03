@@ -1153,9 +1153,9 @@ fn unwind_error<'gc>(
                 *entry = TbcEntry::Detached { level: base, value };
                 detached = true;
             }
-            // The frame and everything above it is dead, so this is one
-            // of the few places a shrink is legal.
-            ts.discard_above(base);
+            // Only the logical top drops: an outer frame's register window
+            // can extend past this frame's base, so the vec must not shrink.
+            ts.set_top_unchecked(base);
             continue;
         }
         match ts.top_exec_mut() {

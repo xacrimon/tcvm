@@ -8,7 +8,7 @@ use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Valu
 use tcvm::vm::sequence::{BoxSequence, CallbackAction, Execution, Sequence, SequencePoll};
 use tcvm::{Context, Executor, LoadError, Lua};
 
-use crate::common::{err, eval};
+use crate::common::{err, eval, ok};
 
 fn run_with<T: for<'gc> tcvm::FromMultiValue<'gc>>(
     src: &str,
@@ -299,4 +299,30 @@ fn handler_looks_through_a_pass_through_sequence() {
         install_through,
     );
     assert_eq!(frames, 3);
+}
+
+#[test]
+fn caught_error_keeps_the_callers_registers() {
+    // `cm`'s window extends past the failed frame's base, so unwinding must
+    // not cut the stack there (#248). Expected output from lua 5.5.1.
+    let src = "local function t(f)
+          local function doit() local c, m = pcall(f); return 'm' end
+          local function cm()
+            local m = doit()
+            local a, b, c, d, e = 2, 3, 4, 5, 6
+            return table.concat({a, b, c, d, e, m}, ' ')
+          end
+          return cm()
+        end
+        return t(function() error('x') end) .. ' | ' .. t(function() local a; return a.b end)";
+    assert_eq!(ok(src), "2 3 4 5 6 m | 2 3 4 5 6 m");
+    let src = "local function doit() pcall(function() error('x') end); return 1 end
+        local function cm()
+          local a = doit()
+          local b, c, d, e = 1, 2, 3, 4
+          local t = {name = 'alive', 1, 2, 3}
+          return t.name .. #t .. a .. b .. c .. d .. e
+        end
+        return cm()";
+    assert_eq!(ok(src), "alive311234");
 }
