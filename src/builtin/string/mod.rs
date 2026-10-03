@@ -252,13 +252,13 @@ fn lua_format<'gc>(
         let mut pending = Some(pending);
         while let Some((spec, arg)) = pending {
             let bytes = util::tolstring(&mut seq, arg, n).await?;
-            // `%q` adds the result as-is.
-            if spec.conv == b'q' {
-                f.out.extend_from_slice(&bytes);
-            } else {
-                fmt_str_bytes(&mut f.out, &spec, &bytes);
-            }
             pending = seq.try_enter(|ctx, _locals, _exec, stack| {
+                // `%q` adds the result as-is.
+                if spec.conv == b'q' {
+                    f.out.extend_from_slice(&bytes);
+                } else {
+                    fmt_str_bytes(ctx, &mut f.out, &spec, &bytes, arg + 1)?;
+                }
                 let fmt = stack.get(0).get_string().expect("checked on entry");
                 f.run(ctx, fmt.as_bytes(), &stack)
             })?;
@@ -493,7 +493,13 @@ fn format_one<'gc>(
             fmt_hex_float(out, spec, f, spec.conv == b'A');
         }
         b's' => {
-            fmt_string(ctx, out, spec, arg);
+            fmt_str_bytes(
+                ctx,
+                out,
+                spec,
+                util::basic_tostring(ctx, arg).as_bytes(),
+                arg_num,
+            )?;
         }
         b'q' => {
             fmt_q(ctx, out, arg, arg_num)?;
@@ -890,17 +896,34 @@ fn fmt_hex_float(out: &mut Vec<u8>, spec: &FmtSpec, f: f64, upper: bool) {
 // ---------- string and q ----------
 
 /// `%s` of a value without `__tostring` (`Formatter::run` diverts the rest).
-fn fmt_string<'gc>(ctx: Context<'gc>, out: &mut Vec<u8>, spec: &FmtSpec, arg: Value<'gc>) {
-    fmt_str_bytes(out, spec, util::basic_tostring(ctx, arg).as_bytes());
-}
-
-fn fmt_str_bytes(out: &mut Vec<u8>, spec: &FmtSpec, bytes: &[u8]) {
+fn fmt_str_bytes<'gc>(
+    ctx: Context<'gc>,
+    out: &mut Vec<u8>,
+    spec: &FmtSpec,
+    bytes: &[u8],
+    arg_num: usize,
+) -> Result<(), Error<'gc>> {
+    let has_mods = spec.flag_minus || spec.width != 0 || spec.precision.is_some();
+    if !has_mods {
+        out.extend_from_slice(bytes);
+        return Ok(());
+    }
+    // lstrlib formats a modified `%s` through C's `sprintf`.
+    if bytes.contains(&0) {
+        return Err(util::arg_error(
+            ctx,
+            "format",
+            arg_num,
+            "string contains zeros",
+        ));
+    }
     let trimmed: &[u8] = if let Some(p) = spec.precision {
         &bytes[..bytes.len().min(p)]
     } else {
         bytes
     };
     apply_width(out, spec, b"", b"", trimmed);
+    Ok(())
 }
 
 fn fmt_q<'gc>(

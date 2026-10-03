@@ -129,3 +129,23 @@ fn tostring_errors() {
         "attempt to call a N value attempt to call a N value attempt to call a N value"
     );
 }
+
+#[test]
+fn format_s_with_modifiers_rejects_zeros() {
+    // lstrlib formats a modified `%s` through `sprintf` (#196); plain `%s`
+    // copies the bytes, zeros included.
+    let src = r"local T = setmetatable({}, {__tostring = function() return 'x\0y' end})
+        local out = {}
+        for _, f in ipairs{'%10s', '%.1s', '%-s', '%-5s'} do
+          out[#out + 1] = select(2, pcall(string.format, f, 'a\0b'))
+          out[#out + 1] = select(2, pcall(string.format, f, T))
+        end
+        out[#out + 1] = select(2, pcall(string.format, '%s %5s', 'ok', 'a\0'))
+        out[#out + 1] = #string.format('[%s][%s]', 'a\0b', T)
+        return table.concat(out, '\n')";
+    let zeros = "bad argument #2 to 'format' (string contains zeros)";
+    let mut expected = vec![zeros; 8];
+    expected.push("bad argument #3 to 'format' (string contains zeros)");
+    expected.push("10");
+    assert_eq!(ok(src), expected.join("\n"));
+}
