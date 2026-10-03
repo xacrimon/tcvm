@@ -778,8 +778,13 @@ impl ForGen {
         Some(self.0.first_child()?.children().filter_map(Ident::cast))
     }
 
+    /// The expression list after `in`.
+    pub fn explist(&self) -> Option<&SyntaxNode> {
+        self.0.children().nth(1)
+    }
+
     pub fn values(&self) -> Option<impl Iterator<Item = Expr> + '_> {
-        Some(self.0.children().nth(1)?.children().filter_map(Expr::cast))
+        Some(self.explist()?.children().filter_map(Expr::cast))
     }
 
     pub fn block(&self) -> Option<Do> {

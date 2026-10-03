@@ -4404,7 +4404,6 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
 }
 
 fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
-    let for_line = ctx.cur_line;
     let end_line = ctx.last_line_of(item.syntax());
     scope_lexical_break(ctx, |ctx| {
         let values: Vec<_> = item
@@ -4416,6 +4415,11 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
             .ok_or_else(|| ice("for_gen without targets"))?
             .collect();
         let num_targets = targets.len();
+        // TFORCALL/TFORLOOP are on the line the explist starts (`forlist`).
+        let explist = item
+            .explist()
+            .ok_or_else(|| ice("for_gen without values"))?;
+        let call_line = ctx.line_of(explist);
 
         // The explist is adjusted to 4 values at [base, base+4) like
         // `compile_decl` does a multi-assign: iterator, state, initial
@@ -4528,7 +4532,7 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
         ctx.set_label(loop_test, ctx.next_offset());
 
         // TFORCALL: call iterator, results go to base+3..base+2+count
-        ctx.cur_line = for_line;
+        ctx.cur_line = call_line;
         ctx.emit(Instruction::tforcall(base, num_targets as u8));
 
         // TFORLOOP: if control variable is not nil, jump back to body
