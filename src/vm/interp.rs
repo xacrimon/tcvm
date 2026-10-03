@@ -3736,7 +3736,9 @@ extern "rust-preserve-none" fn op_vararg<'gc>(
         count as usize - 1
     };
     if count == 0 {
-        thread.ensure_slots(target + wanted);
+        if !thread.ensure_frame_slots(target + wanted) {
+            raise!(OpError::StackOverflow);
+        }
         registers = unsafe { thread.stack.as_mut_ptr().add(base) };
         thread.top = target + wanted;
     }

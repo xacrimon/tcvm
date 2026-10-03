@@ -43,6 +43,19 @@ fn vararg_recursion_overflows() {
     assert_eq!(raised(src), "t:1: stack overflow");
 }
 
+// The spread copies the extras above the frame, which can cross the limit
+// even when the call itself fit.
+#[test]
+fn vararg_spread_overflows() {
+    let src = "local function g(...) return ... end \
+               local function h(...) local t = {...} return #t end \
+               local n = 40000 \
+               error(select(2, pcall(g, table.unpack({}, 1, n))) .. ' ' .. \
+                     select(2, pcall(h, table.unpack({}, 1, n))) .. ' ' .. \
+                     select('#', g(table.unpack({}, 1, n // 3))), 0)";
+    assert_eq!(raised(src), "t:1: stack overflow t:1: stack overflow 13333");
+}
+
 #[test]
 fn overflow_in_a_coroutine() {
     let src = format!("{RECURSE} error(select(2, coroutine.resume(coroutine.create(f))), 0)");
