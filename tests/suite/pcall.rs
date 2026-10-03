@@ -112,11 +112,17 @@ fn xpcall_handler_transforms_the_error() {
 #[test]
 fn xpcall_handler_errors_and_nesting() {
     // An error inside the handler calls the handler again with it (manual
-    // §2.3); the loop is cut after a fixed depth. The reference gives up
-    // when its C stack runs out (215 calls with LUAI_MAXCCALLS = 200); we
-    // stop at exactly 1 + 200.
+    // §2.3). Like the reference's C-stack limit (#255), the 200th nested
+    // call gets an overflow message instead (lua's is "C stack overflow"),
+    // and the loop gives up at 220. The reference's counts are 4-5 lower:
+    // its limit also counts the C calls already on the stack.
     check(
-        "local n = 0 local ok, e = xpcall(function() error('orig') end, function(e) n = n + 1 error('in handler') end) return (not ok and e == 'error in error handling' and n == 201) and 1 or 0",
+        "local n = 0 local ok, e = xpcall(function() error('orig') end, function(e) n = n + 1 error('in handler') end) return (not ok and e == 'error in error handling' and n == 221) and 1 or 0",
+    );
+    check(
+        "local function h(n) if type(n) ~= 'number' then return n elseif n == 0 then return 'END' else error(n - 1) end end \
+         local ok1, e1 = xpcall(error, h, 170) local ok2, e2 = xpcall(error, h, 300) \
+         return (not ok1 and e1 == 'END' and not ok2 and e2 == 'stack overflow in message handler') and 1 or 0",
     );
     check(
         "local m = 0 local ok, e = xpcall(function() error('orig') end, function(e) m = m + 1 if m == 1 then error('once') end return 'H' .. m .. ':' .. e end) return (not ok and e == 'H2:c:1: once') and 1 or 0",

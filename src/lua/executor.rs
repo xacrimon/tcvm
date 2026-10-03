@@ -1018,10 +1018,9 @@ fn push_error_close<'gc>(
 /// Completion of an `xpcall` message handler: its first result becomes the
 /// error value. An error inside the handler calls the handler again with
 /// it (manual §2.3), on top of the still-intact failing frames, until the
-/// loop is cut with "error in error handling" like the reference's C-stack
-/// limit does. The handler may yield: the reference forbids that only
-/// because it runs the handler on the C stack, and we keep every call
-/// resumable, as LuaJIT does.
+/// depth limits below cut the loop. The handler may yield: the reference
+/// forbids that only because it runs the handler on the C stack, and we keep
+/// every call resumable, as LuaJIT does.
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 struct HandlerSequence<'gc> {
@@ -1031,8 +1030,12 @@ struct HandlerSequence<'gc> {
     saved_limit: usize,
 }
 
-/// `LUAI_MAXCCALLS`: nested handler invocations before giving up.
+/// The nested handler call at this depth gets "stack overflow in message
+/// handler" instead of the error (PUC: `LUAI_MAXCCALLS`, "C stack overflow").
 const MAX_HANDLER_DEPTH: u32 = 200;
+
+/// The depth at which the loop gives up (`luaE_checkcstack`).
+const HANDLER_GIVE_UP_DEPTH: u32 = MAX_HANDLER_DEPTH / 10 * 11;
 
 impl<'gc> Sequence<'gc> for HandlerSequence<'gc> {
     fn trace_pointers(&self, cc: &mut dyn Trace<'gc>) {
@@ -1061,11 +1064,16 @@ impl<'gc> Sequence<'gc> for HandlerSequence<'gc> {
         // overflow in the handler; it goes to the catcher as is.
         let err = if err.is_handled() {
             err
-        } else if self.depth == MAX_HANDLER_DEPTH {
+        } else if self.depth == HANDLER_GIVE_UP_DEPTH {
             vm::debug::error_in_error_handling(ctx)
         } else {
             self.depth += 1;
-            stack.replace(&[err.value()]);
+            let value = if self.depth == MAX_HANDLER_DEPTH {
+                Value::string(LuaString::new(ctx, b"stack overflow in message handler"))
+            } else {
+                err.value()
+            };
+            stack.replace(&[value]);
             return Ok(SequencePoll::Call {
                 function: Value::function(self.handler),
                 bottom: 0,
