@@ -170,3 +170,41 @@ fn readonly_variables() {
         );
     }
 }
+
+#[test]
+fn global_env() {
+    // A global access while `global _ENV` is in scope, including from a
+    // nested function (#235). Expected messages from lua 5.5.1.
+    for (src, name) in [
+        ("global _ENV, a; a = 10", "a"),
+        ("global _ENV; return _ENV", "_ENV"),
+        ("global *; global _ENV; return w", "w"),
+        (
+            "global *; global _ENV; local function f() return w end",
+            "w",
+        ),
+        (
+            "global *; local function f() local a = q; do global _ENV; return w end end",
+            "w",
+        ),
+        ("global *; global _ENV; global function gf() end", "gf"),
+    ] {
+        assert_eq!(
+            ok(&format!("return select(2, load({src:?}, '=c'))")),
+            format!("c:1: _ENV is global when accessing variable '{name}'"),
+            "{src}"
+        );
+    }
+    // The undeclared check comes first, and a declaration's initializers
+    // run before it takes effect.
+    assert_eq!(
+        ok("return select(2, load('global _ENV; print(1)', '=c'))"),
+        "c:1: variable 'print' not declared"
+    );
+    assert_eq!(
+        ok(
+            "return cat(type(load('global _ENV; return 1')), type(load('global *; global _ENV, b = 1, 2')))"
+        ),
+        "function function"
+    );
+}

@@ -1294,14 +1294,25 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         Ok((idx, ic))
     }
 
-    /// Convenience for `_ENV` resolution. `_ENV` is always a captured
-    /// upvalue (or root local in the main chunk) — it can never be a
-    /// `<const>` local with a compile-time value, so the `Const` arm of
-    /// `resolve_or_capture` is unreachable here.
-    fn resolve_env_upvalue(&mut self) -> Option<u8> {
-        match self.resolve_or_capture("_ENV")? {
-            ResolvedName::Upvalue(idx) => Some(idx),
-            ResolvedName::Const(_) => unreachable!("_ENV is never a const"),
+    /// The `_ENV` upvalue for an access to the global `name`; an error while
+    /// `global _ENV` is in scope, here or in an enclosing function
+    /// (`buildglobal`).
+    fn env_upvalue(&mut self, name: &str) -> Result<u8, CompileError> {
+        let declared_here = matches!(
+            self.resolve_local("_ENV").map(|d| d.kind),
+            Some(VarKind::Global)
+        );
+        let resolved = if declared_here {
+            None
+        } else {
+            self.resolve_or_capture("_ENV")
+        };
+        match resolved {
+            Some(ResolvedName::Upvalue(idx)) => Ok(idx),
+            Some(ResolvedName::Const(_)) => todo!("a constant-folded _ENV (#278)"),
+            // The main chunk pre-seeds `_ENV`, so only a `global _ENV` stops
+            // the capture.
+            None => Err(self.err(CompileErrorKind::GlobalEnv(name.to_owned()))),
         }
     }
 
@@ -2030,9 +2041,7 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         // Mirrors upstream `globalfunc` (`lparser.c:1956-1968`), which
         // emits the same guard via `checkglobal` + `luaK_storevar`.
         let (key, ic_idx) = ctx.alloc_field_key(name.as_bytes())?;
-        let env_idx = ctx
-            .resolve_env_upvalue()
-            .ok_or_else(|| ice("_ENV must resolve; main chunk pre-seeds it"))?;
+        let env_idx = ctx.env_upvalue(&name)?;
         let guard_reg = ctx.alloc_register()?;
         ctx.emit(Instruction::gettabup(
             guard_reg,
@@ -2102,6 +2111,12 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
     let n_targets = decl_kinds.len();
     let n_values = values.len();
     let has_values = !values.is_empty();
+    // Resolved before the declarations take effect, so `global _ENV = …`
+    // initializes through the outer `_ENV` (`initglobal`).
+    let env_idx = match decl_kinds.first() {
+        Some((name, _)) if has_values => Some(ctx.env_upvalue(name)?),
+        _ => None,
+    };
     let value_base = ctx.chunk.freereg;
     if has_values {
         for (i, expr) in values.into_iter().enumerate() {
@@ -2178,18 +2193,15 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         )?;
     }
 
-    if !has_values {
+    let Some(env_idx) = env_idx else {
         // No initializer: per `manual.of:1665`, "global variables are
         // left unchanged". Just register the names and emit nothing.
         return Ok(());
-    }
+    };
 
     // Per name, emit `GETTABUP+ERRNNIL+SETTABUP` taking the value from the
     // corresponding slot. (Forward order — equivalent to upstream's
     // reverse-on-unwind emission, just simpler to read.)
-    let env_idx = ctx
-        .resolve_env_upvalue()
-        .ok_or_else(|| ice("_ENV must resolve; main chunk pre-seeds it"))?;
     for (i, (name, _kind)) in decl_kinds.iter().enumerate() {
         let (key, ic_idx) = ctx.alloc_field_key(name.as_bytes())?;
         let value_reg = value_base + i as u8;
@@ -2421,9 +2433,7 @@ fn compile_lvalue(
                     }
                 }
                 let (key, ic_idx) = ctx.alloc_field_key(name.as_bytes())?;
-                let env_idx = ctx
-                    .resolve_env_upvalue()
-                    .ok_or_else(|| ice("_ENV must resolve; main chunk pre-seeds it"))?;
+                let env_idx = ctx.env_upvalue(name)?;
                 Ok(Lvalue::Global {
                     env_idx,
                     key,
@@ -2854,9 +2864,7 @@ fn compile_expr_ident(
 
     let (key, ic_idx) = ctx.alloc_field_key(name.as_bytes())?;
     let dst = ctx.dst_or_alloc(dst)?;
-    let env_idx = ctx
-        .resolve_env_upvalue()
-        .ok_or_else(|| ice("_ENV must resolve; main chunk pre-seeds it"))?;
+    let env_idx = ctx.env_upvalue(name)?;
     ctx.emit(Instruction::gettabup(
         dst,
         UpIdx(env_idx),
