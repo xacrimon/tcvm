@@ -193,8 +193,12 @@ enum VarKind {
 }
 
 impl VarKind {
-    fn is_const(self) -> bool {
-        matches!(self, VarKind::Const(_))
+    /// Assignment is "attempt to assign to const variable" (PUC's `readonlyvar`).
+    fn is_readonly(self) -> bool {
+        matches!(
+            self,
+            VarKind::Const(_) | VarKind::ToClose | VarKind::VarargParam
+        )
     }
 }
 
@@ -343,7 +347,19 @@ trait UpvalueResolver {
 /// the child should add to its own upvalue list.
 enum ChildResolution {
     Const(ConstVal),
-    Upvalue(UpValueDescriptor),
+    Upvalue {
+        desc: UpValueDescriptor,
+        readonly: bool,
+    },
+}
+
+/// An entry in a function's upvalue list.
+struct UpvalueEntry {
+    /// Kept so children can look entries up by name.
+    name: String,
+    desc: UpValueDescriptor,
+    /// Assignment is "attempt to assign to const variable".
+    readonly: bool,
 }
 
 /// Result of resolving a name in the current function. `Const` is the
@@ -399,10 +415,9 @@ struct Ctx<'gc, 'a> {
     /// function calls this to walk the lexical chain when it encounters a
     /// free variable.
     capture: Option<&'a mut dyn UpvalueResolver>,
-    /// This function's upvalue list, with names retained so children can
-    /// look entries up by name. Flattened to
+    /// This function's upvalue list. Flattened to
     /// `Chunk::upvalue_desc: Box<[UpValueDescriptor]>` at assembly time.
-    upvalues: Vec<(String, UpValueDescriptor)>,
+    upvalues: Vec<UpvalueEntry>,
 
     /// Lua 5.5 global-declaration state, currently in scope. Owned per
     /// function; nested functions receive a clone (see `compile_nested`).
@@ -1296,15 +1311,19 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     /// upvalue list (capturing on first reference). Returns `None` if
     /// the name isn't reachable through any enclosing scope.
     fn resolve_or_capture(&mut self, name: &str) -> Option<ResolvedName> {
-        if let Some(i) = self.upvalues.iter().position(|(n, _)| n == name) {
+        if let Some(i) = self.upvalues.iter().position(|u| u.name == name) {
             return Some(ResolvedName::Upvalue(i as u8));
         }
         let parent = self.capture.as_deref_mut()?;
         match parent.resolve_for_child(name)? {
             ChildResolution::Const(v) => Some(ResolvedName::Const(v)),
-            ChildResolution::Upvalue(desc) => {
+            ChildResolution::Upvalue { desc, readonly } => {
                 let i = self.upvalues.len() as u8;
-                self.upvalues.push((name.to_owned(), desc));
+                self.upvalues.push(UpvalueEntry {
+                    name: name.to_owned(),
+                    desc,
+                    readonly,
+                });
                 Some(ResolvedName::Upvalue(i))
             }
         }
@@ -1349,15 +1368,17 @@ impl<'gc, 'a> UpvalueResolver for Ctx<'gc, 'a> {
             {
                 info.captured = true;
             }
-            return Some(ChildResolution::Upvalue(UpValueDescriptor::ParentLocal(
-                register.0,
-            )));
+            return Some(ChildResolution::Upvalue {
+                desc: UpValueDescriptor::ParentLocal(register.0),
+                readonly: kind.is_readonly(),
+            });
         }
         // 2. Already captured in our upvalue list?
-        if let Some(i) = self.upvalues.iter().position(|(n, _)| n == name) {
-            return Some(ChildResolution::Upvalue(UpValueDescriptor::ParentUpvalue(
-                i as u8,
-            )));
+        if let Some(i) = self.upvalues.iter().position(|u| u.name == name) {
+            return Some(ChildResolution::Upvalue {
+                desc: UpValueDescriptor::ParentUpvalue(i as u8),
+                readonly: self.upvalues[i].readonly,
+            });
         }
         // 3. Cascade. If a deeper ancestor resolves to a `Const`, we
         //    pass it through unchanged — no upvalue is allocated at this
@@ -1367,12 +1388,17 @@ impl<'gc, 'a> UpvalueResolver for Ctx<'gc, 'a> {
         let parent = self.capture.as_deref_mut()?;
         match parent.resolve_for_child(name)? {
             ChildResolution::Const(v) => Some(ChildResolution::Const(v)),
-            ChildResolution::Upvalue(desc) => {
+            ChildResolution::Upvalue { desc, readonly } => {
                 let i = self.upvalues.len() as u8;
-                self.upvalues.push((name.to_owned(), desc));
-                Some(ChildResolution::Upvalue(UpValueDescriptor::ParentUpvalue(
-                    i,
-                )))
+                self.upvalues.push(UpvalueEntry {
+                    name: name.to_owned(),
+                    desc,
+                    readonly,
+                });
+                Some(ChildResolution::Upvalue {
+                    desc: UpValueDescriptor::ParentUpvalue(i),
+                    readonly,
+                })
             }
         }
     }
@@ -1452,7 +1478,11 @@ pub fn compile<'gc>(
         // upvalues directly, so the descriptor here is purely a
         // placeholder — nested functions reference this slot by
         // cascading ParentUpvalue(0).
-        vec![("_ENV".to_owned(), UpValueDescriptor::ParentLocal(0))],
+        vec![UpvalueEntry {
+            name: "_ENV".to_owned(),
+            desc: UpValueDescriptor::ParentLocal(0),
+            readonly: false,
+        }],
         globals,
     )?;
     Ok(chunk.assemble(ctx.mutation()))
@@ -1472,7 +1502,7 @@ fn compile_function_to_chunk<'gc, 'a>(
     arity: u8,
     source: LuaString<'gc>,
     span: FuncLines,
-    initial_upvalues: Vec<(String, UpValueDescriptor)>,
+    initial_upvalues: Vec<UpvalueEntry>,
     globals: GlobalEnv,
 ) -> Result<Chunk<'gc>, CompileError> {
     let mut chunk = Chunk::new(source);
@@ -1589,7 +1619,8 @@ fn compile_function_to_chunk<'gc, 'a>(
 
     // Flatten the named upvalue list into the chunk's descriptor array.
     let lua_ctx = ctx.ctx;
-    let (names, descs): (Vec<_>, Vec<_>) = ctx.upvalues.into_iter().unzip();
+    let (names, descs): (Vec<_>, Vec<_>) =
+        ctx.upvalues.into_iter().map(|u| (u.name, u.desc)).unzip();
     ctx.chunk.upvalue_desc = descs;
     ctx.chunk.upvalue_names = names
         .iter()
@@ -2350,16 +2381,16 @@ fn compile_lvalue(
             let local = ctx.resolve_local(name).map(|d| (d.kind, d.register));
             let shadow_global = matches!(local, Some((VarKind::Global, _)));
             if let Some((kind, register)) = local.filter(|_| !shadow_global) {
-                if kind.is_const() {
+                if kind.is_readonly() {
                     return Err(ctx.err(CompileErrorKind::ConstAssign(name.to_owned())));
                 }
                 Ok(Lvalue::Local { dst: register })
             } else if !shadow_global && let Some(resolution) = ctx.resolve_or_capture(name) {
                 match resolution {
-                    ResolvedName::Const(_) => {
-                        Err(ctx.err(CompileErrorKind::ConstAssign(name.to_owned())))
+                    ResolvedName::Upvalue(idx) if !ctx.upvalues[idx as usize].readonly => {
+                        Ok(Lvalue::Upvalue { idx })
                     }
-                    ResolvedName::Upvalue(idx) => Ok(Lvalue::Upvalue { idx }),
+                    _ => Err(ctx.err(CompileErrorKind::ConstAssign(name.to_owned()))),
                 }
             } else {
                 // Lua 5.5 global resolution. If the name appears in the
@@ -2450,7 +2481,7 @@ fn compile_indexed_subexpr(
     Ok(temp)
 }
 
-/// The local register a non-const local-ident target compiles into,
+/// The local register a writable local-ident target compiles into,
 /// or `None` for any other target shape.
 fn target_local_reg(ctx: &Ctx, target: &Expr) -> Option<u8> {
     let Expr::Ident(ident) = target else {
@@ -2461,7 +2492,7 @@ fn target_local_reg(ctx: &Ctx, target: &Expr) -> Option<u8> {
     if matches!(data.kind, VarKind::Global) {
         return None;
     }
-    (!data.kind.is_const()).then_some(data.register.0)
+    (!data.kind.is_readonly()).then_some(data.register.0)
 }
 
 fn local_dst(lv: &Lvalue) -> Option<RegisterIndex> {
@@ -4452,13 +4483,18 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
                     .to_owned();
                 let reg = ctx.alloc_register()?;
                 assert_eq!(reg.0, base.0 + 3 + i as u8);
-                // Generic-for control variables are likewise read-only in
-                // Lua 5.5 (LOOPVARKIND).
+                // Only the first variable, the control variable, is read-only
+                // (`forlist`'s RDKCONST).
+                let kind = if i == 0 {
+                    VarKind::Const(None)
+                } else {
+                    VarKind::Reg
+                };
                 ctx.define(
                     name,
                     VariableData {
                         register: reg,
-                        kind: VarKind::Const(None),
+                        kind,
                     },
                 )?;
             }

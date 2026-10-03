@@ -122,3 +122,51 @@ fn comments_and_long_brackets() {
         "nil nil"
     );
 }
+
+#[test]
+fn readonly_variables() {
+    // `<close>` variables and named vararg parameters are read-only like
+    // `<const>` ones (#242, #247), also through upvalues, and so is a
+    // `<const>` whose value isn't a compile-time constant. Of a generic
+    // for's variables, only the first is.
+    for (src, name) in [
+        ("return function (... t) t = 10 end", "t"),
+        (
+            "local function f(...e) return function () return function () e = 1 end end end",
+            "e",
+        ),
+        ("local x <close> = nil; x = 1", "x"),
+        ("local x <close> = nil; local function f() x = 1 end", "x"),
+        ("local k <const> = f(); local function g() k = 1 end", "k"),
+        (
+            "local k <const> = f(); local function g() local a = k; return function() k = 1 end end",
+            "k",
+        ),
+        (
+            "for i, v in pairs({}) do local function f() i = 1 end end",
+            "i",
+        ),
+        (
+            "local k <const> = f(); local function g() function k() end end",
+            "k",
+        ),
+    ] {
+        assert_eq!(
+            ok(&format!("return select(2, load({src:?}, '=c'))")),
+            format!("c:1: attempt to assign to const variable '{name}'"),
+            "{src}"
+        );
+    }
+    for src in [
+        "local function f(...t) t[1] = 5; t.n = 1; return function() t[2] = 1 end end",
+        "local x <close> = nil; local function f() return x end",
+        "local k <const> = f(); local function g() local k = 1; return function() k = 2 end end",
+        "for i, v in pairs({}) do v = 1; local function f() v = 2 end end",
+    ] {
+        assert_eq!(
+            ok(&format!("return type(load({src:?}))")),
+            "function",
+            "{src}"
+        );
+    }
+}
