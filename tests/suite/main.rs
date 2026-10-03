@@ -46,6 +46,7 @@ mod not_andor;
 mod not_implemented;
 mod numeric_for;
 mod opcode_errors;
+mod operand_order;
 mod os_clock;
 mod os_date;
 mod pcall;

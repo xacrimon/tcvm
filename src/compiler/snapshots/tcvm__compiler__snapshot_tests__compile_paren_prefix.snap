@@ -23,8 +23,8 @@ expression: output
 0007  [  4]  LOAD            R3 K1  ; 1
 0008  [  4]  LOAD            R4 K3  ; 2
 0009  [  4]  LOAD            R5 K4  ; 3
-0010  [  4]  SETFIELD        R4 R2 K2  ; "x"
-0011  [  4]  SETTABLE        R5 R1 R3
+0010  [  4]  SETTABLE        R5 R1 R3
+0011  [  4]  SETFIELD        R4 R2 K2  ; "x"
 0012  [  5]  LOAD            R2 K4  ; 3
 0013  [  6]  SETFIELD        R2 R1 K5  ; "c"
 0014  [  7]  GETFIELD        R3 R1 K0  ; "b"

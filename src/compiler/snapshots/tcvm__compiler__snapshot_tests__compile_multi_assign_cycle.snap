@@ -2,7 +2,7 @@
 source: src/compiler/snapshot_tests.rs
 expression: output
 ---
-; function (params=0, vararg=true, stack=4, upvalues=1)
+; function (params=0, vararg=true, stack=5, upvalues=1)
 ; constants:
 ;   K0 = 1
 ;   K1 = 2
@@ -14,8 +14,9 @@ expression: output
 0001  [  1]  LOAD            R0 K0  ; 1
 0002  [  1]  LOAD            R1 K1  ; 2
 0003  [  1]  LOAD            R2 K2  ; 3
-0004  [  2]  MOVE            R3 R0
-0005  [  2]  MOVE            R0 R1
-0006  [  2]  MOVE            R1 R2
-0007  [  2]  MOVE            R2 R3
-0008  [  2]  RETURN0
+0004  [  2]  MOVE            R3 R1
+0005  [  2]  MOVE            R4 R2
+0006  [  2]  MOVE            R2 R0
+0007  [  2]  MOVE            R1 R4
+0008  [  2]  MOVE            R0 R3
+0009  [  2]  RETURN0
