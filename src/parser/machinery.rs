@@ -64,6 +64,10 @@ impl<'cache, 'source> State<'cache, 'source> {
         self.cursor
     }
 
+    pub(super) fn report_count(&self) -> usize {
+        self.reports.len()
+    }
+
     pub(super) fn span(&self) -> Span {
         self.tokens[self.cursor].1
     }

@@ -248,6 +248,41 @@ mod tests {
         }
     }
 
+    // A missing expression is reported once, where it is missing, and every
+    // node on the way out is still closed (#207).
+    #[test]
+    fn missing_expression_reports_once() {
+        for (src, at) in [
+            ("x =", 3),
+            ("local x =", 9),
+            ("global x =", 10),
+            ("x = 1,", 6),
+            ("return 1,", 9),
+            ("do x = ( end y = 1", 9),
+            ("if a[ then x() end y = 1", 6),
+            ("print(1 +)", 9),
+            ("print(1, 2,)", 11),
+            ("f(", 2),
+            ("x = (1 +) y = 2", 8),
+            ("local x = (1 +) y = 2", 14),
+            ("return (1 +)", 11),
+            ("for i in do end", 9),
+            ("while do end", 6),
+            ("x = - -", 7),
+            ("x = 1 + * 2", 8),
+            ("x = {1, 2 +}", 11),
+        ] {
+            let mut cache = NodeCache::new();
+            let reports = parse(&mut cache, src).reports;
+            assert_eq!(reports.len(), 1, "expected one parse error for {src:?}");
+            assert_eq!(
+                (reports[0].message.as_str(), reports[0].span.start()),
+                ("expected an expression", at),
+                "{src:?}"
+            );
+        }
+    }
+
     // `return` must end its block, optionally followed by one `;` (#205).
     #[test]
     fn return_must_be_last_statement() {
