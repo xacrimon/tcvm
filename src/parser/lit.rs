@@ -2,6 +2,16 @@ use std::num::{ParseFloatError, ParseIntError};
 
 use logos::Logos;
 
+/// Length of the line break at the start of `b`, or 0. `\n`, `\r`, `\r\n`
+/// and `\n\r` are each one break, as in `inclinenumber` (llex.c).
+pub(crate) fn line_break_len(b: &[u8]) -> usize {
+    match b {
+        [b'\n', b'\r', ..] | [b'\r', b'\n', ..] => 2,
+        [b'\n' | b'\r', ..] => 1,
+        _ => 0,
+    }
+}
+
 pub fn parse_int(s: &str) -> Result<i64, ParseIntError> {
     s.parse()
 }
