@@ -73,9 +73,7 @@ fn lua_assert<'gc>(
     _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    if stack.is_empty() {
-        return Err(util::arg_error(ctx, "assert", 1, "value expected"));
-    }
+    util::check_any(ctx, &stack, "assert", 1)?;
     if !stack.get(0).is_falsy() {
         // Leaving the window untouched returns all arguments.
         return Ok(CallbackAction::Return);
@@ -152,9 +150,7 @@ fn lua_getmetatable<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    if stack.is_empty() {
-        return Err(util::arg_error(ctx, "getmetatable", 1, "value expected"));
-    }
+    util::check_any(ctx, &stack, "getmetatable", 1)?;
     // A `__metatable` field shadows the real metatable (protection).
     let result = match ctx.metatable_of(stack.get(0)) {
         Some(mt) => {
@@ -178,9 +174,7 @@ fn lua_ipairs<'gc>(
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    if stack.is_empty() {
-        return Err(util::arg_error(ctx, "ipairs", 1, "value expected"));
-    }
+    util::check_any(ctx, &stack, "ipairs", 1)?;
     let t = stack.get(0);
     stack.replace(&[closure.upvalues[0], t, Value::integer(ctx.mutation(), 0)]);
     Ok(CallbackAction::Return)
@@ -402,9 +396,7 @@ fn lua_pairs<'gc>(
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    if stack.is_empty() {
-        return Err(util::arg_error(ctx, "pairs", 1, "value expected"));
-    }
+    util::check_any(ctx, &stack, "pairs", 1)?;
     let t = stack.get(0);
     let mm = ctx.metamethod_of(t, ctx.symbols().pairs);
     if mm.is_nil() {
@@ -426,9 +418,7 @@ fn lua_pcall<'gc>(
     _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    if stack.is_empty() {
-        return Err(util::arg_error(ctx, "pcall", 1, "value expected"));
-    }
+    util::check_any(ctx, &stack, "pcall", 1)?;
     let then = BoxSequence::new(ctx.mutation(), ProtectedCall { handler: None });
     Ok(CallbackAction::call(Some(then)))
 }
@@ -714,9 +704,7 @@ fn lua_tostring<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    if stack.is_empty() {
-        return Err(util::arg_error(ctx, "tostring", 1, "value expected"));
-    }
+    util::check_any(ctx, &stack, "tostring", 1)?;
     let v = stack.get(0);
     let mm = ctx.metamethod_of(v, ctx.symbols().mm_tostring);
     if mm.is_nil() {
@@ -734,9 +722,7 @@ fn lua_type<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    if stack.is_empty() {
-        return Err(util::arg_error(ctx, "type", 1, "value expected"));
-    }
+    util::check_any(ctx, &stack, "type", 1)?;
     let name = stack.get(0).type_name();
     stack.replace(&[Value::string(LuaString::new(ctx, name.as_bytes()))]);
     Ok(CallbackAction::Return)

@@ -340,10 +340,8 @@ fn select_extreme<'gc>(
     fname: &str,
     want_min: bool,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
+    check_any(ctx, &stack, fname, 1)?;
     let n = stack.len();
-    if n == 0 {
-        return Err(arg_error(ctx, fname, 1, "value expected"));
-    }
     let mut best = stack.get(0);
     for i in 1..n {
         let v = stack.get(i);

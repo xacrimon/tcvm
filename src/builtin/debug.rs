@@ -47,9 +47,7 @@ fn lua_getmetatable<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    if stack.is_empty() {
-        return Err(util::arg_error(ctx, "getmetatable", 1, "value expected"));
-    }
+    util::check_any(ctx, &stack, "getmetatable", 1)?;
     let mt = ctx.metatable_of(stack.get(0));
     stack.replace(&[mt.map_or(Value::nil(), Value::table)]);
     Ok(CallbackAction::Return)

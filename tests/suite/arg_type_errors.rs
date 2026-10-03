@@ -187,3 +187,27 @@ fn close_defaults_to_the_running_coroutine() {
         "true dead closed"
     );
 }
+
+#[test]
+fn value_expected() {
+    // Every `luaL_checkany`, and min/max's equivalent `luaL_argcheck`, goes
+    // through `util::check_any`. Expected messages from lua 5.5.1.
+    for (src, name) in [
+        ("assert()", "assert"),
+        ("getmetatable()", "getmetatable"),
+        ("debug.getmetatable()", "getmetatable"),
+        ("ipairs()", "ipairs"),
+        ("pairs()", "pairs"),
+        ("pcall()", "pcall"),
+        ("tostring()", "tostring"),
+        ("type()", "type"),
+        ("math.min()", "min"),
+        ("math.max()", "max"),
+    ] {
+        assert_eq!(
+            err(&format!("local r = {src}")),
+            format!("c:1: bad argument #1 to '{name}' (value expected)"),
+            "{src}"
+        );
+    }
+}
