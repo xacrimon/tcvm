@@ -35,6 +35,13 @@ use crate::vm::num;
 /// at runtime would write to an out-of-bounds register.
 const NO_REG: u8 = u8::MAX;
 
+/// Per-function limits, Lua's `MAX_FSTACK`, `MAXVARS`, `MAXUPVAL` and `MAXARG_B`
+/// (which caps RETURN's `n + 1`).
+const MAX_REGISTERS: usize = 255;
+const MAX_LOCALS: usize = 200;
+const MAX_UPVALUES: usize = 255;
+const MAX_RETURNS: usize = 255;
+
 /// A control instruction whose taken edge preserves no value — a plain `TEST`,
 /// or a `TESTSET` still holding the `NO_REG` placeholder dst.
 fn is_valueless_ctrl(i: Instruction) -> bool {
@@ -471,6 +478,15 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         }
     }
 
+    /// Lua's `errorlimit`, naming this function.
+    fn limit_err(&self, what: &'static str, limit: usize) -> CompileError {
+        self.err(CompileErrorKind::Limit {
+            what,
+            limit,
+            func: FuncLine(self.chunk.line_defined),
+        })
+    }
+
     fn line_of(&self, node: &SyntaxNode) -> u32 {
         self.lines.line_at(node.text_range().start().into())
     }
@@ -491,7 +507,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         if self.chunk.freereg == 255 {
             // 255 is the last addressable slot; allocating a new one would
             // wrap freereg to 0 and silently corrupt downstream allocations.
-            return Err(self.err(CompileErrorKind::Registers));
+            return Err(self.limit_err("registers", MAX_REGISTERS));
         }
         let reg = self.chunk.freereg;
         self.chunk.freereg += 1;
@@ -510,7 +526,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         // (<= 255), so no further range check is needed.
         let end = base
             .checked_add(n)
-            .ok_or_else(|| self.err(CompileErrorKind::Registers))?;
+            .ok_or_else(|| self.limit_err("registers", MAX_REGISTERS))?;
         self.chunk.freereg = end;
         if end > self.chunk.max_stack {
             self.chunk.max_stack = end;
@@ -577,9 +593,15 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     /// values into what were temps and the targets are about to be bound
     /// by name. Must match a prior reserve; the caller's design ensures
     /// `freereg >= nactvar + n` at call time.
-    fn adjust_locals(&mut self, n: u8) {
+    fn adjust_locals(&mut self, n: u8) -> Result<(), CompileError> {
         assert!(self.chunk.nactvar as usize + n as usize <= self.chunk.freereg as usize);
+        // Lua's `MAXVARS`: below the register limit, so temporaries always
+        // have room and running out is reported at the declaration.
+        if self.chunk.nactvar as usize + n as usize > MAX_LOCALS {
+            return Err(self.limit_err("local variables", MAX_LOCALS));
+        }
         self.chunk.nactvar += n;
+        Ok(())
     }
 
     /// Use a destination hint register if provided, otherwise reserve a
@@ -592,7 +614,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                     // Same ceiling as `reserve_reg`: a hint of 255 would
                     // wrap freereg to 0.
                     if reg.0 == u8::MAX {
-                        return Err(self.err(CompileErrorKind::Registers));
+                        return Err(self.limit_err("registers", MAX_REGISTERS));
                     }
                     self.chunk.freereg = reg.0 + 1;
                     if self.chunk.freereg > self.chunk.max_stack {
@@ -1409,16 +1431,11 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         readonly: bool,
         line: u32,
     ) -> Result<u8, CompileError> {
-        const MAX_UPVALUES: usize = 255;
         let i = self.upvalues.len();
         if i == MAX_UPVALUES {
             return Err(CompileError {
-                kind: CompileErrorKind::Limit {
-                    what: "upvalues",
-                    limit: MAX_UPVALUES,
-                    func: FuncLine(self.chunk.line_defined),
-                },
                 line_number: LineNumber(line),
+                ..self.limit_err("upvalues", MAX_UPVALUES)
             });
         }
         self.upvalues.push(UpvalueEntry {
@@ -1640,8 +1657,10 @@ fn compile_function_to_chunk<'gc, 'a>(
         ctx.emit(Instruction::varargprep(arity));
     }
 
-    // Allocate registers for parameters and bind them in scope
-    let mut num_params: u8 = 0;
+    // Each parameter is promoted to an active local as it's bound, so the body sees
+    // them as locals (upvalue capture relies on `nactvar`), temp reclaims
+    // never touch their slots, and the local limit fires before the
+    // register limit, as in luac.
     for name in params {
         let reg = ctx.alloc_register()?;
         ctx.define(
@@ -1651,12 +1670,8 @@ fn compile_function_to_chunk<'gc, 'a>(
                 kind: VarKind::Reg,
             },
         )?;
-        num_params += 1;
+        ctx.adjust_locals(1)?;
     }
-    // Promote parameters to active locals so the body sees them as locals
-    // (upvalue capture by the body relies on `nactvar`) and temp reclaims
-    // never touch their slots.
-    ctx.adjust_locals(num_params);
 
     // Named-vararg setup: bind `name` to the reserved register `R[num_params]`.
     // No prologue bytecode — if it escapes, `VARARGPREP` builds the table at
@@ -1672,7 +1687,7 @@ fn compile_function_to_chunk<'gc, 'a>(
         )?;
         // Only the vararg register: `adjust_locals` *advances* `nactvar`, and the
         // parameters were already promoted above.
-        ctx.adjust_locals(1);
+        ctx.adjust_locals(1)?;
 
         ctx.chunk.vararg_info = Some(VarargInfo {
             used_as_non_base: false,
@@ -1894,7 +1909,7 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
         // child function's upvalue capture sees a stable parent register
         // and any temps allocated during body compilation don't reclaim
         // the local's slot.
-        ctx.adjust_locals(1);
+        ctx.adjust_locals(1)?;
 
         let func_reg = compile_func_body(ctx, &func, Some(reg))?;
         if func_reg != reg {
@@ -2010,8 +2025,8 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
     // Pad with nil for any targets without supplied values. A multi-return
     // call or vararg may have already filled extra slots above the last
     // non-expander value, so check freereg rather than iterating by index.
-    let target_top = base + num_targets as u8;
-    while ctx.chunk.freereg < target_top {
+    let target_top = base as usize + num_targets;
+    while (ctx.chunk.freereg as usize) < target_top {
         let slot = ctx.reserve_reg()?;
         let idx = ctx.alloc_constant(Value::nil())?;
         ctx.emit(Instruction::load(slot, KIdx(idx)));
@@ -2062,7 +2077,8 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
     // Promote the freshly bound targets to active locals so their slots
     // are stable for the rest of the scope (upvalue-capture depends on
     // the register staying put).
-    ctx.adjust_locals(num_targets as u8);
+    // `num_targets` fits: the padding reserved a register per target.
+    ctx.adjust_locals(num_targets as u8)?;
 
     // After the locals are live, so a non-closable value's error can name
     // the variable (luac `checktoclose`).
@@ -2084,7 +2100,7 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
 /// silently overflow. Returns the count as `u8` on success.
 fn expand_count(ctx: &Ctx, n: usize) -> Result<u8, CompileError> {
     if n >= u8::MAX as usize {
-        return Err(ctx.err(CompileErrorKind::Registers));
+        return Err(ctx.limit_err("registers", MAX_REGISTERS));
     }
     Ok(n as u8)
 }
@@ -2297,7 +2313,8 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
             }
         }
         // Pad with nil for any names beyond the supplied values.
-        while ctx.chunk.freereg < value_base + n_targets as u8 {
+        let value_top = value_base as usize + n_targets;
+        while (ctx.chunk.freereg as usize) < value_top {
             let slot = ctx.reserve_reg()?;
             let idx = ctx.alloc_constant(Value::nil())?;
             ctx.emit(Instruction::load(slot, KIdx(idx)));
@@ -2305,7 +2322,7 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         // Drop any extra values past `n_targets` — they were computed
         // (side-effects preserved) but are unused.
         if n_values > n_targets {
-            ctx.chunk.freereg = value_base + n_targets as u8;
+            ctx.chunk.freereg = value_top as u8;
         }
     }
 
@@ -4287,7 +4304,11 @@ fn compile_return_generic(ctx: &mut Ctx, mut exprs: Vec<Expr>) -> Result<(), Com
     let count = if multret {
         0
     } else {
-        expand_count(ctx, n)? + 1
+        // RETURN's count is `n + 1`.
+        if n + 1 > MAX_RETURNS {
+            return Err(ctx.limit_err("returns", MAX_RETURNS));
+        }
+        n as u8 + 1
     };
     ctx.emit(Instruction::ret(first_reg, count));
 
@@ -4509,7 +4530,7 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
         // subexpressions inside the body can't reclaim them via free_reg.
         // They're unnamed so upvalue capture won't find them; nactvar's
         // sole role here is as the free_reg cutoff.
-        ctx.adjust_locals(3);
+        ctx.adjust_locals(3)?;
         for _ in 0..3 {
             ctx.record_locvar("(for state)")?;
         }
@@ -4540,7 +4561,7 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
             )?;
             // Promote the loop variable to an active local so upvalue-capture
             // logic sees it and temp reclaims don't touch it.
-            ctx.adjust_locals(1);
+            ctx.adjust_locals(1)?;
 
             if let Some(block) = item.block() {
                 let stmts: Vec<_> = block.stmts().map(|s| s.collect()).unwrap_or_default();
@@ -4638,7 +4659,7 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
         // Promote the 3 anonymous slots (iterator, state, closing value) so
         // body subexpressions can't reclaim them via free_reg. The closing
         // value closes when the loop's scope is left (luac `marktobeclosed`).
-        ctx.adjust_locals(3);
+        ctx.adjust_locals(3)?;
         for _ in 0..3 {
             ctx.record_locvar("(for state)")?;
         }
@@ -4675,8 +4696,8 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
                         kind,
                     },
                 )?;
+                ctx.adjust_locals(1)?;
             }
-            ctx.adjust_locals(num_targets as u8);
 
             if let Some(block) = item.block() {
                 let stmts: Vec<_> = block.stmts().map(|s| s.collect()).unwrap_or_default();
