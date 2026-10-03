@@ -61,6 +61,7 @@ mod string_format_pointer;
 mod string_metatable;
 mod suspended_metamethod;
 mod table_border;
+mod table_create;
 mod table_metamethods;
 mod tailcall_shapes;
 mod tailcall_suspend;
