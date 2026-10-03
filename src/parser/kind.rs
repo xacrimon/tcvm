@@ -193,14 +193,14 @@ pub enum SyntaxKind {
     #[token("false")]
     False,
 
-    // A backslash always begins a two-char escape unit (`\\` followed by any
-    // byte, newline included); the unescaped branch must therefore exclude
-    // backslash. Decoding the escape happens later — the regex only needs to
-    // find the string's bounds. Letting the unescaped branch match `\` made a
-    // literal ending in `\\` ambiguous, and maximal munch swallowed the next
-    // string's opening quote (`"a\\", "x"` tokenized as one string).
-    #[regex(r#""(\\[\s\S]|[^"\\])*""#)]
-    #[regex(r#"'(\\[\s\S]|[^'\\])*'"#)]
+    // The unescaped branch excludes `\`, so an escape is always consumed whole and
+    // `"a\\", "x"` can't munch into one literal. An escaped `\r\n`/`\n\r` is one
+    // unit and `\z` takes the whitespace it skips; a raw line break or EOF leaves
+    // the literal unfinished, which is an invalid token. Escapes are decoded later.
+    #[regex(r#""(\\(\r\n|\n\r|z[ \t\n\x0B\x0C\r]*|[\s\S])|[^"\\\r\n])*""#)]
+    #[regex(r#"'(\\(\r\n|\n\r|z[ \t\n\x0B\x0C\r]*|[\s\S])|[^'\\\r\n])*'"#)]
+    #[regex(r#""(\\(\r\n|\n\r|z[ \t\n\x0B\x0C\r]*|[\s\S])|[^"\\\r\n])*\\?"#, |_| false)]
+    #[regex(r#"'(\\(\r\n|\n\r|z[ \t\n\x0B\x0C\r]*|[\s\S])|[^'\\\r\n])*\\?"#, |_| false)]
     String,
 
     #[regex(r"\[=*\[", long_string)]

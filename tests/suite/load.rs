@@ -164,6 +164,22 @@ fn string_literals() {
 }
 
 #[test]
+fn unfinished_strings() {
+    // A raw line break or the end of the chunk leaves a quoted string
+    // unfinished; an escaped line break, `\r\n` included, or one skipped by
+    // `\z` doesn't.
+    assert_eq!(
+        ok(
+            r#"return cat(load("x = 'a\nb'"), load("x = 'a\rb'"), load("x = \"a\r\nb\""),
+              load("x = 'a"), load("x = 'a\\"), load("x = 'a\\\r\rb'"),
+              #load("return 'a\\\r\nb'")(), #load("return 'a\\\n\rb'")(),
+              #load("return 'a\\z\r\n\n  b'")())"#
+        ),
+        "nil nil nil nil nil nil 3 3 2"
+    );
+}
+
+#[test]
 fn readonly_variables() {
     // `<close>` variables and named vararg parameters are read-only like
     // `<const>` ones (#242, #247), also through upvalues, and so is a
