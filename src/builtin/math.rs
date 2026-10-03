@@ -28,6 +28,8 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         ("exp", lua_exp, call),
         ("floor", lua_floor, interp::ff_floor),
         ("fmod", lua_fmod, call),
+        ("frexp", lua_frexp, call),
+        ("ldexp", lua_ldexp, call),
         ("log", lua_log, call),
         ("max", lua_max, call),
         ("min", lua_min, call),
@@ -202,6 +204,76 @@ fn lua_modf<'gc>(
         (num_to_value(ctx.mutation(), x.trunc()), x.fract())
     };
     stack.replace(&[ip, Value::float(fp)]);
+    Ok(CallbackAction::Return)
+}
+
+/// `x = m * 2^e` with `0.5 <= |m| < 1`; zeros, infinities and NaN come back
+/// as `(x, 0)`.
+fn frexp(x: f64) -> (f64, i32) {
+    let bits = x.to_bits();
+    let exp = ((bits >> 52) & 0x7ff) as i32;
+    match exp {
+        0 if x == 0.0 => (x, 0),
+        0 => {
+            // Subnormal: scale by 2^64 into the normal range first.
+            let (m, e) = frexp(x * f64::from_bits(0x43f0_0000_0000_0000));
+            (m, e - 64)
+        }
+        0x7ff => (x, 0),
+        _ => (
+            f64::from_bits(bits & !(0x7ff << 52) | (0x3fe << 52)),
+            exp - 0x3fe,
+        ),
+    }
+}
+
+/// `x * 2^n` with one rounding (musl's `scalbn`): `2^n` is out of range for
+/// large `|n|`, so scale in steps first.
+fn ldexp(mut x: f64, mut n: i32) -> f64 {
+    let p1023 = f64::from_bits(0x7fe0_0000_0000_0000);
+    // 2^-1022 * 2^53: the extra 2^53 keeps a subnormal result from rounding
+    // in both steps.
+    let pm969 = f64::from_bits(0x0360_0000_0000_0000);
+    if n > 1023 {
+        x *= p1023;
+        n -= 1023;
+        if n > 1023 {
+            x *= p1023;
+            n = (n - 1023).min(1023);
+        }
+    } else if n < -1022 {
+        x *= pm969;
+        n += 1022 - 53;
+        if n < -1022 {
+            x *= pm969;
+            n = (n + 1022 - 53).max(-1022);
+        }
+    }
+    x * f64::from_bits(((0x3ff + n) as u64) << 52)
+}
+
+/// `frexp(x)` — [`frexp`]'s `(m, e)`, `e` as an integer.
+fn lua_frexp<'gc>(
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
+    mut stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
+    let x = check_number(ctx, stack.get(0), "frexp", 1)?;
+    let (m, e) = frexp(x);
+    stack.replace(&[Value::float(m), Value::integer(ctx.mutation(), e.into())]);
+    Ok(CallbackAction::Return)
+}
+
+/// `ldexp(m, e)` — `m * 2^e`.
+fn lua_ldexp<'gc>(
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
+    mut stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
+    let m = check_number(ctx, stack.get(0), "ldexp", 1)?;
+    // Truncated to `int`, as lmathlib casts it.
+    let e = check_integer(ctx, stack.get(1), "ldexp", 2)? as i32;
+    stack.ret1(Value::float(ldexp(m, e)));
     Ok(CallbackAction::Return)
 }
 

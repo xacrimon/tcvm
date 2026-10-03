@@ -29,6 +29,7 @@ mod loadfile;
 mod loop_close;
 mod main_yielded;
 mod math_fast_entries;
+mod math_frexp_ldexp;
 mod metamethod_dispatch;
 mod metamethod_many_results;
 mod method_call_receiver;
