@@ -423,9 +423,9 @@ fn lua_pcall<'gc>(
     Ok(CallbackAction::call(Some(then)))
 }
 
-/// Completion sequence for `pcall`, `xpcall`, and `coroutine.resume`: the
-/// call's results come back prefixed with `true`; an error that unwinds to
-/// it becomes `(false, err)`, after the `xpcall` `handler` (if any) has run.
+/// Completion sequence for `pcall` and `xpcall`: the call's results come back
+/// prefixed with `true`; an error that unwinds to it becomes `(false, err)`,
+/// after the `xpcall` `handler` (if any) has run.
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub(crate) struct ProtectedCall<'gc> {

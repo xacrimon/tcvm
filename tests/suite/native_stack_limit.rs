@@ -104,3 +104,46 @@ fn unchecked_pushes_overflow() {
         other => panic!("expected a Lua error, got {other:?}"),
     }
 }
+
+/// `deep(n, f)` calls `f` under `n` non-tail frames, at least 16000 slots up.
+const DEEP: &str = "local function deep(n, f) if n == 0 then return f() end \
+                    local r = deep(n - 1, f) return r end ";
+
+// Expected values from `lua` 5.5.1 on the same chunks scaled to its limit.
+#[test]
+fn resume_args_past_the_limit() {
+    let co = "local co = coroutine.create(function() deep(8000, coroutine.yield) end) \
+              coroutine.resume(co) ";
+    assert_eq!(
+        ok(&format!(
+            "{DEEP}{co} local ok, e = coroutine.resume(co, table.unpack({{}}, 1, 60000)) \
+             return cat(ok, e, coroutine.status(co))"
+        )),
+        "false too many arguments to resume suspended"
+    );
+    let w = "local w = coroutine.wrap(function() deep(8000, coroutine.yield) end) w() ";
+    assert_eq!(
+        ok(&format!(
+            "{DEEP}{w} return cat(pcall(w, table.unpack({{}}, 1, 60000)))"
+        )),
+        "false too many arguments to resume"
+    );
+}
+
+#[test]
+fn resume_results_past_the_limit() {
+    let co = "local co = coroutine.create(function() \
+              coroutine.yield(table.unpack({}, 1, 60000)) return 1 end) ";
+    assert_eq!(
+        ok(&format!(
+            "{DEEP}{co} local r = deep(8000, function() return cat(coroutine.resume(co)) end) \
+             return cat(r, coroutine.status(co), coroutine.resume(co))"
+        )),
+        "false too many results to resume suspended true 1"
+    );
+    let w = "local w = coroutine.wrap(function() return table.unpack({}, 1, 60000) end) ";
+    assert_eq!(
+        err(&format!("{DEEP}{w} return deep(8000, w)")),
+        "c:1: too many results to resume"
+    );
+}
