@@ -89,12 +89,12 @@ fn errors() {
     );
     assert_eq!(
         ok(r#"return cat(load("x = = 1"))"#),
-        "nil Error: expected a statement\n   \
+        "nil Error: expected an expression\n   \
          ╭─[ [string \"x = = 1\"]:1:5 ]\n   \
          │\n \
          1 │ x = = 1\n   \
          │     ┬  \n   \
-         │     ╰── expected a statement but got \"=\"\n\
+         │     ╰── expected an expression but found =\n\
          ───╯"
     );
     assert_eq!(

@@ -41,6 +41,7 @@ impl<'cache, 'source> Parser<'cache, 'source> {
     /// Consumes at least one token unless at EOF, so block loops always progress.
     fn r_stmt(&mut self) {
         let start = self.cursor();
+        let reports = self.report_count();
         let marker = match self.at() {
             T![do] => self.r_do(),
             T![while] => self.r_while(),
@@ -60,11 +61,15 @@ impl<'cache, 'source> Parser<'cache, 'source> {
         };
 
         if marker.is_none() && self.at() != T![eof] {
-            let got = format!(
-                "expected a statement but got \"{}\"",
-                self.source(self.span())
-            );
-            self.error("expected a statement", got);
+            // A rule that fails partway reports, closes its node and returns
+            // `None`, leaving the cursor on the token it couldn't parse.
+            if self.report_count() == reports {
+                let got = format!(
+                    "expected a statement but got \"{}\"",
+                    self.source(self.span())
+                );
+                self.error("expected a statement", got);
+            }
             // A statement that failed partway (`a[ end`) has already made
             // progress, so a terminator here belongs to the enclosing block.
             if self.cursor() == start || !STATEMENT_RECOVERY.contains(&self.at()) {
@@ -88,19 +93,16 @@ impl<'cache, 'source> Parser<'cache, 'source> {
         Some(marker.complete(self))
     }
 
-    fn r_expr_list(&mut self) {
+    /// `explist ::= exp {',' exp}`
+    fn r_expr_list(&mut self) -> Option<CompletedMarker> {
         let marker = self.start(T![expr_list]);
-
-        while token_is_expr_start(self.at()) {
-            self.r_expr();
-            if self.at() != T![,] {
-                break;
-            }
-
+        let mut ok = self.r_expr().is_some();
+        while ok && self.at() == T![,] {
             self.expect(T![,]);
+            ok = self.r_expr().is_some();
         }
-
-        marker.complete(self);
+        let marker = marker.complete(self);
+        ok.then_some(marker)
     }
 
     fn r_expr(&mut self) -> Option<CompletedMarker> {
@@ -120,8 +122,9 @@ impl<'cache, 'source> Parser<'cache, 'source> {
 
                 let n = lhs.precede(self, T![bin_op]);
                 self.expect(t);
-                let _rhs = self.r_expr_inner(r_bp)?;
+                let rhs = self.r_expr_inner(r_bp);
                 lhs = n.complete(self);
+                rhs?;
                 continue;
             }
 
@@ -142,7 +145,13 @@ impl<'cache, 'source> Parser<'cache, 'source> {
             T![function] => self.r_func(true),
             t if token_is_unary_op(t) => self.r_expr_unary(),
             t if token_is_literal(t) => self.r_literal(),
-            _ => None,
+            t => {
+                self.error(
+                    "expected an expression",
+                    format!("expected an expression but found {t}"),
+                );
+                None
+            }
         }
     }
 
@@ -151,15 +160,17 @@ impl<'cache, 'source> Parser<'cache, 'source> {
         let op = self.at();
         self.expect(op);
         let ((), r_bp) = prefix_binding_power(op);
-        let _rhs = self.r_expr_inner(r_bp);
-        Some(n.complete(self))
+        let rhs = self.r_expr_inner(r_bp);
+        let n = n.complete(self);
+        rhs.map(|_| n)
     }
 
     fn r_method_call(&mut self, marker: Marker) -> Option<CompletedMarker> {
         self.expect(T![:]);
-        self.r_ident()?;
-        self.r_func_call_args()?;
-        Some(marker.complete(self))
+        self.r_ident();
+        let args = self.r_func_call_args();
+        let marker = marker.complete(self);
+        args.map(|_| marker)
     }
 
     fn r_ident(&mut self) -> Option<CompletedMarker> {
@@ -177,9 +188,9 @@ impl<'cache, 'source> Parser<'cache, 'source> {
     fn r_paren(&mut self) -> Option<CompletedMarker> {
         let marker = self.start(T![expr]);
         self.expect(T!['(']);
-        let _rhs = self.r_expr()?;
-        self.expect(T![')']);
-        Some(marker.complete(self))
+        let ok = self.r_expr().is_some() && self.expect(T![')']);
+        let marker = marker.complete(self);
+        ok.then_some(marker)
     }
 
     fn r_literal(&mut self) -> Option<CompletedMarker> {
@@ -303,7 +314,12 @@ impl<'cache, 'source> Parser<'cache, 'source> {
     fn r_return(&mut self) -> Option<CompletedMarker> {
         let marker = self.start(T![return_stmt]);
         self.expect(T![return]);
-        self.r_expr_list();
+        if BLOCK_FOLLOW.contains(&self.at()) || self.at() == T![;] {
+            self.start(T![expr_list]).complete(self);
+        } else if self.r_expr_list().is_none() {
+            marker.complete(self);
+            return None;
+        }
         let marker = marker.complete(self);
 
         if self.at() == T![;] {
@@ -349,31 +365,20 @@ impl<'cache, 'source> Parser<'cache, 'source> {
                 self.r_table();
                 return Some(marker.complete(self));
             }
-            _ => {
-                self.expect(T!['(']);
-            }
+            _ => {}
         }
 
-        loop {
-            match self.at() {
-                T![')'] => {
-                    self.expect(T![')']);
-                    break;
-                }
-                _ => {
-                    self.r_expr();
-                }
-            }
-
-            if self.at() == T![,] {
+        let mut ok = self.expect(T!['(']);
+        if ok && self.at() != T![')'] {
+            ok = self.r_expr().is_some();
+            while ok && self.at() == T![,] {
                 self.expect(T![,]);
-            } else {
-                self.expect(T![')']);
-                break;
+                ok = self.r_expr().is_some();
             }
         }
-
-        Some(marker.complete(self))
+        ok = ok && self.expect(T![')']);
+        let marker = marker.complete(self);
+        ok.then_some(marker)
     }
 
     fn r_func(&mut self, expr: bool) -> Option<CompletedMarker> {
@@ -554,17 +559,20 @@ impl<'cache, 'source> Parser<'cache, 'source> {
 
             if matches!(t, T!['('] | T![string] | T![long_string] | T!['{']) {
                 let n = lhs.precede(self, T![func_call]);
-                let _rhs = self.r_func_call_args()?;
+                let args = self.r_func_call_args();
                 lhs = n.complete(self);
+                args?;
                 continue;
             }
 
             if t == T!['['] {
                 let n = lhs.precede(self, T![index]);
                 self.expect(T!['[']);
-                let _rhs = self.r_expr()?;
-                self.expect(T![']']);
+                let ok = self.r_expr().is_some() && self.expect(T![']']);
                 lhs = n.complete(self);
+                if !ok {
+                    return None;
+                }
                 continue;
             }
 
@@ -621,9 +629,9 @@ impl<'cache, 'source> Parser<'cache, 'source> {
         }
 
         list_marker.complete(self);
-        self.expect(T![=]);
-        self.r_expr_list();
-        Some(assign_marker.complete(self))
+        let ok = self.expect(T![=]) && self.r_expr_list().is_some();
+        let marker = assign_marker.complete(self);
+        ok.then_some(marker)
     }
 
     /// `var ::= Name | prefixexp '[' exp ']' | prefixexp '.' Name`. The only
@@ -637,6 +645,7 @@ impl<'cache, 'source> Parser<'cache, 'source> {
     fn r_decl(&mut self) -> Option<CompletedMarker> {
         let marker = self.start(T![decl_stmt]);
         self.expect(T![local]);
+        let mut ok = true;
 
         if self.at() == T![function] {
             self.r_func(false);
@@ -654,11 +663,12 @@ impl<'cache, 'source> Parser<'cache, 'source> {
             assign_list_marker.complete(self);
             if self.at() == T![=] {
                 self.expect(T![=]);
-                self.r_expr_list();
+                ok = self.r_expr_list().is_some();
             }
         }
 
-        Some(marker.complete(self))
+        let marker = marker.complete(self);
+        ok.then_some(marker)
     }
 
     fn r_decl_target(&mut self) -> Option<CompletedMarker> {
@@ -679,6 +689,7 @@ impl<'cache, 'source> Parser<'cache, 'source> {
     fn r_global(&mut self) -> Option<CompletedMarker> {
         let marker = self.start(T![global_stmt]);
         self.expect(T![global]);
+        let mut ok = true;
 
         if self.at() == T![function] {
             self.r_func(false);
@@ -700,12 +711,13 @@ impl<'cache, 'source> Parser<'cache, 'source> {
 
                 if self.at() == T![=] {
                     self.expect(T![=]);
-                    self.r_expr_list();
+                    ok = self.r_expr_list().is_some();
                 }
             }
         }
 
-        Some(marker.complete(self))
+        let marker = marker.complete(self);
+        ok.then_some(marker)
     }
 
     fn r_global_target(&mut self) -> Option<CompletedMarker> {

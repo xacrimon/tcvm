@@ -16,12 +16,12 @@ fn load_err(src: &str) -> String {
 fn parse_error_is_the_rendered_report() {
     assert_eq!(
         load_err("x = = 1"),
-        "Error: expected a statement\n   \
+        "Error: expected an expression\n   \
          ╭─[ c:1:5 ]\n   \
          │\n \
          1 │ x = = 1\n   \
          │     ┬  \n   \
-         │     ╰── expected a statement but got \"=\"\n\
+         │     ╰── expected an expression but found =\n\
          ───╯"
     );
 }
