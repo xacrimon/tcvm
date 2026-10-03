@@ -407,7 +407,7 @@ fn lua_pack<'gc>(
     }
     t.raw_set(
         ctx,
-        Value::string(LuaString::new(ctx, b"n")),
+        Value::string(ctx.symbols().n),
         Value::integer(ctx.mutation(), n as i64),
     );
     stack.ret1(Value::table(t));

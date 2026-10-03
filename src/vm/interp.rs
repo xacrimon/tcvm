@@ -3697,14 +3697,15 @@ extern "rust-preserve-none" fn op_vararg<'gc>(
         let Some(navail) = table
             .inner()
             .borrow()
-            .raw_get(Value::string(LuaString::new(ctx, b"n")))
+            .raw_get(Value::string(ctx.symbols().n))
             .get_integer()
             .filter(|n| (0..=i64::from(i32::MAX / 2)).contains(n))
         else {
             raise!(OpError::VarargN);
         };
+        let navail = navail as usize;
         let wanted = if count == 0 {
-            navail as usize
+            navail
         } else {
             count as usize - 1
         };
@@ -3713,14 +3714,12 @@ extern "rust-preserve-none" fn op_vararg<'gc>(
             raise!(OpError::StackOverflow);
         }
         registers = unsafe { thread.stack.as_mut_ptr().add(base) };
+        let filled = wanted.min(navail);
         let t = table.inner().borrow();
-        for i in 0..wanted {
-            thread.stack[target + i] = if i < navail as usize {
-                t.raw_get(Value::integer(ctx.mutation(), i as i64 + 1))
-            } else {
-                Value::nil()
-            };
+        for i in 0..filled {
+            thread.stack[target + i] = t.raw_get(Value::integer(ctx.mutation(), i as i64 + 1));
         }
+        thread.stack[target + filled..new_top].fill(Value::nil());
         if count == 0 {
             thread.top = new_top;
         }
@@ -3854,7 +3853,7 @@ extern "rust-preserve-none" fn op_varargprep<'gc>(
         }
         table.raw_set(
             ctx,
-            Value::string(LuaString::new(ctx, b"n")),
+            Value::string(ctx.symbols().n),
             Value::integer(ctx.mutation(), num_extras as i64),
         );
     }

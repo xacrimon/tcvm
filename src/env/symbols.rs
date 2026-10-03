@@ -36,6 +36,8 @@ macro_rules! emit_struct {
             pub close: LuaString<'gc>,
             /// `__mode`, which makes a table's keys and/or values weak.
             pub mode: LuaString<'gc>,
+            /// `n`, the count field of a named vararg table.
+            pub n: LuaString<'gc>,
         }
     };
 }
@@ -52,6 +54,7 @@ macro_rules! emit_intern_all {
                     pairs: interner.intern(mc, b"__pairs"),
                     close: interner.intern(mc, b"__close"),
                     mode: interner.intern(mc, b"__mode"),
+                    n: interner.intern(mc, b"n"),
                 }
             }
 
