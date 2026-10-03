@@ -72,3 +72,39 @@ fn error_object_without_string_tostring() {
         "tcvm: attempt to call a number value\n"
     );
 }
+
+#[test]
+fn nil_error_object() {
+    // The handler sees the nil before it becomes "<no error object>" (#197).
+    let nil = "tcvm: (error object is a nil value)\n";
+    assert_eq!(stderr_of("nil", "error(nil)\n"), nil);
+    assert_eq!(stderr_of("none", "error()\n"), nil);
+    assert_eq!(
+        stderr_of(
+            "nil_close",
+            "local x <close> = setmetatable({}, {__close = function() end})\nerror(nil)\n"
+        ),
+        nil
+    );
+    // A nil caught on the way is substituted, and re-raised with a position.
+    for (name, src) in [
+        ("caught", "error(select(2, pcall(error)))\n"),
+        ("wrap", "coroutine.wrap(function() error(nil) end)()\n"),
+    ] {
+        let err = stderr_of(name, src);
+        assert!(
+            err.ends_with(".lua:1: <no error object>\n"),
+            "{name}: {err}"
+        );
+    }
+}
+
+#[test]
+fn tostring_runs_before_close() {
+    // `msghandler` runs before the chunk unwinds, so a `__close` that changes
+    // the error object comes too late to affect the message.
+    let src = "local e = setmetatable({msg = 'before'}, {__tostring = function(s) return s.msg end})\n\
+               local x <close> = setmetatable({}, {__close = function() e.msg = 'after' end})\n\
+               error(e)\n";
+    assert_eq!(stderr_of("tostring_close", src), "tcvm: before\n");
+}
