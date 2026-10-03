@@ -58,8 +58,6 @@ pub enum CompileErrorKind {
     GlobalEnv(String),
     #[error("attempt to assign to const variable '{0}'")]
     ConstAssign(String),
-    #[error("insufficient available registers")]
-    Registers,
     /// Lua's `errorlimit`.
     #[error("too many {what} (limit is {limit}) in {func}")]
     Limit {

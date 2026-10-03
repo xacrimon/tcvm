@@ -197,28 +197,42 @@ test!(
 test!(vararg_param, "test-files/vararg_param.lua");
 
 /// Register-ceiling shapes that used to wrap a `u8` and panic the VM (#11).
-/// Each must surface as a compile error instead.
+/// Each must surface as a compile error instead, with luac's message.
 #[test]
 fn test_register_limit_is_a_compile_error() {
     let list = |n: usize| (0..n).map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
-    let names = (0..255)
-        .map(|i| format!("v{i}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sources = [
+    let names = |n: usize| {
+        (0..n)
+            .map(|i| format!("v{i}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let cases = [
         // func at R1 plus 254 args: the last lands on R255.
-        format!("local function f(...) end f({})", list(254)),
+        (
+            format!("local function f(...) end f({})", list(254)),
+            "too many registers (limit is 255) in main function",
+        ),
         // 255 return values: `count = n + 1` wraps to MULTRET.
-        format!("local function f() return {} end", list(255)),
+        (
+            format!("local function f() return {} end", list(255)),
+            "too many returns (limit is 255) in function at line 1",
+        ),
         // 255 targets from one call: `returns = n + 1` wraps.
-        format!("local function g() end local {names} = g()"),
+        (
+            format!("local function g() end local {} = g()", names(255)),
+            "too many registers (limit is 255) in main function",
+        ),
         // Results reserved past R255.
-        format!("local {names} local function g() end {names} = g()"),
+        (
+            format!("local {0} local function g() end {0} = g()", names(150)),
+            "too many registers (limit is 255) in main function",
+        ),
     ];
-    for src in sources {
+    for (src, msg) in cases {
         assert_eq!(
             compile_err_and_format(&src),
-            "compiler error at line 1: insufficient available registers"
+            format!("compiler error at line 1: {msg}")
         );
     }
 }

@@ -42,3 +42,88 @@ fn upvalues() {
         "nil mid:6: too many upvalues (limit is 255) in function at line 4"
     );
 }
+
+/// `names("a", 3)` is `"a1, a2, a3"`; `locals(2)` is `"local x1 local x2"`.
+const GEN: &str = r#"
+    local function names(p, n) local t = {} for i = 1, n do t[i] = p .. i end return table.concat(t, ", ") end
+    local function locals(n) local t = {} for i = 1, n do t[i] = "local x" .. i end return table.concat(t, " ") end
+    local function err(src) return select(2, load(src, "=c")) end
+"#;
+
+fn limit(tail: &str) -> String {
+    ok(&format!("{GEN}{tail}"))
+}
+
+#[test]
+fn registers() {
+    // A local list longer than a `u8` used to wrap and panic.
+    assert_eq!(
+        limit(
+            r#"return err("local " .. names("a", 260) .. "; return #{" .. names("a", 260) .. "}")"#
+        ),
+        "c:1: too many registers (limit is 255) in main function"
+    );
+    assert_eq!(
+        limit(r#"return err("local a" .. string.rep(",a", 500) .. ";")"#),
+        "c:1: too many registers (limit is 255) in main function"
+    );
+    assert_eq!(
+        limit(r#"return err("a = f(x" .. string.rep(",x", 260) .. ")")"#),
+        "c:1: too many registers (limit is 255) in main function"
+    );
+    // lua reports "C stack overflow" here: its parser recurses per name.
+    assert_eq!(
+        limit(r#"return err("global " .. names("g", 300) .. " = 1")"#),
+        "c:1: too many registers (limit is 255) in main function"
+    );
+}
+
+#[test]
+fn local_variables() {
+    assert_eq!(
+        limit(r#"return cat(load(locals(200) .. " x200 = 200 return x200")())"#),
+        "200"
+    );
+    assert_eq!(
+        limit(r#"return err(locals(201))"#),
+        "c:1: too many local variables (limit is 200) in main function"
+    );
+    // One past the register limit used to panic.
+    assert_eq!(
+        limit(r#"return err(locals(256))"#),
+        "c:1: too many local variables (limit is 200) in main function"
+    );
+    assert_eq!(
+        limit(r#"return err(locals(200) .. " local function f() end")"#),
+        "c:1: too many local variables (limit is 200) in main function"
+    );
+    assert_eq!(
+        limit(r#"return err("local function f(" .. names("p", 201) .. ") end")"#),
+        "c:1: too many local variables (limit is 200) in function at line 1"
+    );
+    // The generic `for` holds 3 hidden locals; lua counts the same.
+    assert_eq!(
+        limit(r#"return cat(load(locals(196) .. " for k in pairs({}) do end return 1")())"#),
+        "1"
+    );
+    assert_eq!(
+        limit(r#"return err(locals(197) .. " for k in pairs({}) do end")"#),
+        "c:1: too many local variables (limit is 200) in main function"
+    );
+    assert_eq!(
+        limit(r#"return err("for " .. names("k", 300) .. " in pairs({}) do end")"#),
+        "c:1: too many local variables (limit is 200) in main function"
+    );
+}
+
+#[test]
+fn returns() {
+    assert_eq!(
+        limit(r##"return cat(select("#", load("return 10" .. string.rep(",10", 253))()))"##),
+        "254"
+    );
+    assert_eq!(
+        limit(r#"return err("return 10" .. string.rep(",10", 254))"#),
+        "c:1: too many returns (limit is 255) in main function"
+    );
+}
