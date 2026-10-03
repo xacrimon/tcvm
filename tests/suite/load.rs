@@ -102,3 +102,23 @@ fn errors() {
         "nil [string \"return '\u{FFFD}'\"]: chunk is not valid UTF-8"
     );
 }
+
+#[test]
+fn comments_and_long_brackets() {
+    // A comment at the end of the chunk, CRLF or a lone CR after a comment,
+    // leveled and non-ASCII long brackets (#233).
+    assert_eq!(
+        ok(r#"return cat(type(load("--c")), type(load("x = 1 --c")),
+              load("--ab\r\nreturn 1")(), load("--\r\nreturn 2")(), load("--\rreturn 3")(),
+              load("--x\n\rreturn 4")(), load("--[=[ a\n]] b ]=] return 5")(),
+              load("--[==[\n]=]\n]==] return 6")(), load("--[= x\nreturn 7")(),
+              load("--[\nreturn 8")(), load("--[[aé]]return 9")(), load("return #[[aé]]")(),
+              load("return [=[x]]y]=]")())"#),
+        "function function 1 2 3 4 5 6 7 8 9 3 x]]y"
+    );
+    // Unfinished long brackets are syntax errors.
+    assert_eq!(
+        ok(r#"return cat((load("return 1 --[[")), (load("return [==[x]=]")))"#),
+        "nil nil"
+    );
+}
