@@ -297,6 +297,7 @@ mod tests {
             ("x = 1 ] y = 2", ":1:7 ", "got \"]\""),
             ("do return;; end", ":1:11 ", "found ;"),
             ("do return 1 ; x() end", ":1:15 ", "found ident"),
+            ("x = 1 if x then", ":1:16 ", "found eof"),
         ] {
             let reports = rendered_reports(src);
             assert_eq!(reports.len(), 1, "expected one parse error for {src:?}");
