@@ -72,3 +72,34 @@ fn assigned_alongside_globals() {
         "1 nil 2 nil"
     );
 }
+
+#[test]
+fn constant() {
+    // #278: a folded `<const>` `_ENV` is loaded into a register and indexed,
+    // here or from a nested function.
+    for (src, value) in [
+        (
+            "local _ENV <const> = nil; local function f() return x end; return f()",
+            "nil",
+        ),
+        ("local _ENV <const> = 11; X = 'hi'", "number"),
+        (
+            "local _ENV <const> = true; local function f() global function g() end end; f()",
+            "boolean",
+        ),
+        (
+            "local _ENV <const> = 1.5; local function f() global y = 1 end; f()",
+            "number",
+        ),
+        (
+            "local _ENV <const> = false; local function f() q, r = 3, w end; f()",
+            "boolean",
+        ),
+    ] {
+        assert_eq!(
+            ok(&format!("return select(2, pcall(load({src:?}, '=c')))")),
+            format!("c:1: attempt to index a {value} value"),
+            "{src}"
+        );
+    }
+}
