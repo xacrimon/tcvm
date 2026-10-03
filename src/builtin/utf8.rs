@@ -108,8 +108,9 @@ fn posrelat(pos: i64, len: usize) -> i64 {
     }
 }
 
-fn iscont(bytes: &[u8], idx1: i64) -> bool {
-    idx1 >= 1 && ((idx1 - 1) as usize) < bytes.len() && bytes[(idx1 - 1) as usize] & 0xC0 == 0x80
+/// `iscontp` at 0-based `idx`; the end of the string is not a continuation byte.
+fn iscont(bytes: &[u8], idx: usize) -> bool {
+    bytes.get(idx).is_some_and(|b| b & 0xC0 == 0x80)
 }
 
 // ---------------------------------------------------------------------------
@@ -261,74 +262,76 @@ fn lua_offset<'gc>(
     } else {
         crate::builtin::util::check_integer(ctx, i_arg, "offset", 3)?
     };
-    let mut posi = posrelat(i, len);
+    let posi = posrelat(i, len);
     if posi < 1 || posi > len as i64 + 1 {
         return Err(util::arg_error(ctx, "offset", 3, "position out of bounds"));
     }
-
-    let found = if n == 0 {
-        while posi > 1 && iscont(bytes, posi) {
+    // 0-based from here on, as in `byteoffset`.
+    let mut posi = posi as usize - 1;
+    let cont_err = || Error::from_str(ctx, "initial position is a continuation byte");
+    let mut n = n;
+    if n == 0 {
+        while posi > 0 && iscont(bytes, posi) {
             posi -= 1;
         }
-        Some(posi)
-    } else if posi <= len as i64 && iscont(bytes, posi) {
-        return Err(Error::from_str(
-            ctx,
-            "initial position is a continuation byte",
-        ));
-    } else if n > 0 {
-        let mut n = n - 1;
-        while n > 0 && posi <= len as i64 {
-            posi += 1;
-            while posi <= len as i64 && iscont(bytes, posi) {
-                posi += 1;
-            }
-            n -= 1;
-        }
-        if n > 0 { None } else { Some(posi) }
     } else {
-        let mut n = n;
-        while n < 0 && posi > 1 {
-            posi -= 1;
-            while posi > 1 && iscont(bytes, posi) {
+        if iscont(bytes, posi) {
+            return Err(cont_err());
+        }
+        if n < 0 {
+            while n < 0 && posi > 0 {
                 posi -= 1;
-            }
-            n += 1;
-        }
-        if n < 0 { None } else { Some(posi) }
-    };
-    match found {
-        // Lua 5.5 returns the start position AND the byte index of that
-        // character's last byte (the start itself when past the end).
-        Some(p) => {
-            let end = if p > len as i64 {
-                p
-            } else {
-                let mut e = p;
-                while e < len as i64 && iscont(bytes, e + 1) {
-                    e += 1;
+                while posi > 0 && iscont(bytes, posi) {
+                    posi -= 1;
                 }
-                e
-            };
-            stack.replace(&[
-                Value::integer(ctx.mutation(), p),
-                Value::integer(ctx.mutation(), end),
-            ]);
+                n += 1;
+            }
+        } else {
+            n -= 1;
+            while n > 0 && posi < len {
+                posi += 1;
+                while iscont(bytes, posi) {
+                    posi += 1;
+                }
+                n -= 1;
+            }
         }
-        None => stack.replace(&[Value::nil()]),
     }
+    if n != 0 {
+        stack.replace(&[Value::nil()]);
+        return Ok(CallbackAction::Return);
+    }
+    let start = posi;
+    // A stray continuation byte reached by moving is caught here.
+    if bytes.get(posi).is_some_and(|b| b & 0x80 != 0) {
+        if iscont(bytes, posi) {
+            return Err(cont_err());
+        }
+        while iscont(bytes, posi + 1) {
+            posi += 1;
+        }
+    }
+    stack.replace(&[
+        Value::integer(ctx.mutation(), start as i64 + 1),
+        Value::integer(ctx.mutation(), posi as i64 + 1),
+    ]);
     Ok(CallbackAction::Return)
 }
 
-/// `utf8.codes(s)` — iterator triple `(iterator, s, 0)` yielding
+/// `utf8.codes(s [, lax])` — iterator triple `(iterator, s, 0)` yielding
 /// `(byte_position, code_point)` for each character.
 fn lua_codes<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
+    let lax = !stack.get(1).is_falsy();
     let s = util::check_string(ctx, stack.get(0), "codes", 1)?;
-    let iter = Function::new_native(ctx.mutation(), codes_aux, &[]);
+    if iscont(s.as_bytes(), 0) {
+        return Err(util::arg_error(ctx, "codes", 1, "invalid UTF-8 code"));
+    }
+    let aux: NativeFn = if lax { codes_lax } else { codes_strict };
+    let iter = Function::new_native(ctx.mutation(), aux, &[]);
     stack.replace(&[
         Value::function(iter),
         Value::string(s),
@@ -337,39 +340,48 @@ fn lua_codes<'gc>(
     Ok(CallbackAction::Return)
 }
 
-/// Stateless iterator body for `utf8.codes`. `i` is the byte position (1-based)
-/// of the previously yielded character, or 0 to start.
-fn codes_aux<'gc>(
+fn codes_strict<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
+    stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
+    codes_aux(ctx, stack, true)
+}
+
+fn codes_lax<'gc>(
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
+    stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
+    codes_aux(ctx, stack, false)
+}
+
+/// `iter_aux`: the control value is the previous character's 1-based position,
+/// i.e. the 0-based index just past its lead byte; it ends at or past the end,
+/// negative values included.
+fn codes_aux<'gc>(
+    ctx: Context<'gc>,
     mut stack: Stack<'gc, '_>,
+    strict: bool,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let s = util::check_string(ctx, stack.get(0), "codes", 1)?;
     let bytes = s.as_bytes();
-    let len = bytes.len();
-    let i = stack.get(1).get_integer().unwrap_or(0);
-    // `utf8.codes` decodes strictly by default (matching PUC-Lua).
-    // Advance past the previously decoded character (if any).
-    let pos = if i == 0 {
-        0
-    } else {
-        match decode(bytes, (i - 1) as usize, true) {
-            Some((_, next)) => next,
-            None => return Err(Error::from_str(ctx, "invalid UTF-8 code")),
-        }
-    };
-    if pos >= len {
+    let mut n = util::to_integer(stack.get(1)).unwrap_or(0) as u64 as usize;
+    while n < bytes.len() && iscont(bytes, n) {
+        n += 1;
+    }
+    if n >= bytes.len() {
         stack.replace(&[]);
         return Ok(CallbackAction::Return);
     }
-    match decode(bytes, pos, true) {
-        Some((code, _)) => {
+    match decode(bytes, n, strict) {
+        Some((code, next)) if !iscont(bytes, next) => {
             stack.replace(&[
-                Value::integer(ctx.mutation(), pos as i64 + 1),
+                Value::integer(ctx.mutation(), n as i64 + 1),
                 Value::integer(ctx.mutation(), code as i64),
             ]);
             Ok(CallbackAction::Return)
         }
-        None => Err(Error::from_str(ctx, "invalid UTF-8 code")),
+        _ => Err(Error::from_str(ctx, "invalid UTF-8 code")),
     }
 }

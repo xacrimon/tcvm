@@ -70,6 +70,7 @@ mod take_result_tailcall;
 mod tbc_close;
 mod tostring_metamethods;
 mod type_metatables;
+mod utf8_lib;
 mod vararg_materialized;
 mod weak_tables;
 mod yield_from_sequence;
