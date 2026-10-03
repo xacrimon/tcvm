@@ -229,6 +229,25 @@ mod tests {
         }
     }
 
+    // A statement that fails partway still closes its node, so the tree
+    // builder doesn't panic on the unbalanced events (#234).
+    #[test]
+    fn failed_statement_after_another_reports_without_panic() {
+        for src in [
+            "x = 1 if x then",
+            "local a\nif x then",
+            "::l::\nif x then",
+            "x = 1 if x then else",
+            "x = 1 if x then elseif y then",
+            "x = 1 function f(1) end",
+            "x = 1 local f = function(a b) end",
+        ] {
+            let mut cache = NodeCache::new();
+            let reports = parse(&mut cache, src).reports;
+            assert!(!reports.is_empty(), "expected a parse error for {src:?}");
+        }
+    }
+
     // `return` must end its block, optionally followed by one `;` (#205).
     #[test]
     fn return_must_be_last_statement() {
