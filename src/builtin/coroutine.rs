@@ -1,7 +1,6 @@
 use std::pin::Pin;
 
 use crate::Context;
-use crate::builtin::basic::ProtectedCall;
 use crate::builtin::util;
 use crate::dmm::{Collect, Trace};
 use crate::env::thread::{ExecKind, ThreadStatus};
@@ -59,7 +58,7 @@ fn lua_create<'gc>(
 }
 
 /// `coroutine.resume(co, ...)` — switch to `co`, passing the rest as args.
-/// On `co` yielding/returning, the [`ProtectedCall`] wraps the values as
+/// On `co` yielding/returning, the [`ResumeSequence`] wraps the values as
 /// `(true, ...)`; on error, it produces `(false, msg)`. If `co` isn't
 /// resumable (dead, currently running, on the resume stack as a parent, or
 /// the main thread) we return `(false, msg)` directly per the manual
@@ -73,30 +72,42 @@ fn lua_resume<'gc>(
         .get(0)
         .get_thread()
         .ok_or_else(|| util::type_error(ctx, "resume", 1, "thread", stack.arg(0)))?;
-    if let Some(msg) = unresumable_reason(stack.exec(), co) {
+    if let Some(msg) = unresumable_reason(stack.exec(), co, stack.len() - 1) {
         let m = Value::string(LuaString::new(ctx, msg.as_bytes()));
         stack.replace(&[Value::boolean(false), m]);
         return Ok(CallbackAction::Return);
     }
     // Drop the thread-handle slot so the resume args start at index 0.
     stack.remove(0);
-    let then = BoxSequence::new(ctx.mutation(), ProtectedCall { handler: None });
+    let then = BoxSequence::new(ctx.mutation(), ResumeSequence);
     Ok(CallbackAction::resume(co, Some(then)))
 }
 
-/// `None` if `co` can be resumed, else the Lua-spec error message that
-/// `(false, msg)` should carry. Covers main thread, dead, and any
-/// non-suspended status (which subsumes `running` and `normal`).
+/// `None` if `co` can be resumed with `nargs` arguments, else the Lua-spec
+/// error message that `(false, msg)` should carry. Covers main thread, dead,
+/// any non-suspended status (which subsumes `running` and `normal`), and
+/// arguments that don't fit on `co`'s stack (`auxresume`).
 ///
 /// Pointer-eq checks against `current_thread` come first because the
 /// running thread's `RefLock` is already mutably borrowed by the
 /// interpreter — calling `co.peer_status()` on it would re-borrow and panic.
-fn unresumable_reason<'gc>(exec: Execution<'gc>, co: Thread<'gc>) -> Option<&'static str> {
+fn unresumable_reason<'gc>(
+    exec: Execution<'gc>,
+    co: Thread<'gc>,
+    nargs: usize,
+) -> Option<&'static str> {
     if co.ptr_eq(exec.current_thread()) {
         return Some("cannot resume non-suspended coroutine");
     }
     match co.peer_status() {
-        ThreadStatus::Suspended => None,
+        ThreadStatus::Suspended => {
+            let ts = co.borrow();
+            // The args land where `co` yielded, or above the function in slot 0
+            // on a first resume.
+            let bottom = ts.yield_bottom.map_or(1, |y| y.bottom);
+            (nargs > ts.stack_limit.saturating_sub(bottom))
+                .then_some("too many arguments to resume")
+        }
         ThreadStatus::Result { .. } | ThreadStatus::Stopped => Some("cannot resume dead coroutine"),
         ThreadStatus::Normal => Some("cannot resume non-suspended coroutine"),
     }
@@ -264,7 +275,7 @@ fn wrap_callback<'gc>(
     // (or otherwise non-suspended) thread reaches `schedule_thread_resume`
     // and aborts the whole executor with `BadMode`. `wrap` re-raises errors
     // rather than wrapping them, so we throw the reason directly.
-    if let Some(msg) = unresumable_reason(stack.exec(), co) {
+    if let Some(msg) = unresumable_reason(stack.exec(), co, stack.len()) {
         return Err(Error::from_str(ctx, msg));
     }
     let then = BoxSequence::new(ctx.mutation(), UnwrapResumeSequence { co, closing: false });
@@ -274,6 +285,49 @@ fn wrap_callback<'gc>(
 // ---------------------------------------------------------------------------
 // Sequences
 // ---------------------------------------------------------------------------
+
+/// `coroutine.resume`'s follow-up: `pcall`'s
+/// [`ProtectedCall`](crate::builtin::basic::ProtectedCall), except that values
+/// with no room for the leading `true` become `(false, msg)` (`auxresume`).
+struct ResumeSequence;
+
+unsafe impl<'gc> Collect<'gc> for ResumeSequence {
+    const NEEDS_TRACE: bool = false;
+}
+
+impl<'gc> Sequence<'gc> for ResumeSequence {
+    fn trace_pointers(&self, _cc: &mut dyn Trace<'gc>) {}
+
+    fn poll(
+        self: Pin<&mut Self>,
+        ctx: Context<'gc>,
+        _exec: Execution<'gc>,
+        mut stack: Stack<'gc, '_>,
+    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
+        if stack.check_stack(1) {
+            stack.insert(0, Value::boolean(true));
+        } else {
+            let m = Value::string(LuaString::new(ctx, b"too many results to resume"));
+            stack.replace(&[Value::boolean(false), m]);
+        }
+        Ok(SequencePoll::Return)
+    }
+
+    fn error(
+        self: Pin<&mut Self>,
+        _ctx: Context<'gc>,
+        _exec: Execution<'gc>,
+        err: Error<'gc>,
+        mut stack: Stack<'gc, '_>,
+    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
+        stack.replace(&[Value::boolean(false), err.value()]);
+        Ok(SequencePoll::Return)
+    }
+
+    fn catch(&self) -> Catch<'gc> {
+        Catch::Here(None)
+    }
+}
 
 /// `coroutine.wrap`'s follow-up sequence: returns the inner thread's
 /// values verbatim on success, rethrows on error once the dead thread has
@@ -299,6 +353,9 @@ impl<'gc> Sequence<'gc> for UnwrapResumeSequence<'gc> {
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
         if self.closing {
             return Err(Error::new(ctx, stack.get(1)).with_level(1));
+        }
+        if !stack.check_stack(1) {
+            return Err(Error::from_str(ctx, "too many results to resume"));
         }
         // Pass through whatever the inner left on the stack.
         Ok(SequencePoll::Return)

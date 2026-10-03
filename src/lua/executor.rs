@@ -1103,7 +1103,7 @@ impl<'gc> Sequence<'gc> for HandlerSequence<'gc> {
 /// On no-catcher: if the thread isn't the bottom of the executor's
 /// thread stack, route the error to the resumer's `ExecKind::WaitThread`
 /// and pop the inner thread. This lets a coroutine error propagate to
-/// the resumer's `ProtectedCall::error`. If the thread *is* the bottom,
+/// the resumer's catching sequence. If the thread *is* the bottom,
 /// surface as `RuntimeError::Lua` to the host.
 fn unwind_error<'gc>(
     exec: Executor<'gc>,
