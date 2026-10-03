@@ -16,9 +16,8 @@ use crate::env::value::{Value, value_hash};
 /// key, so the key may dangle once the collector frees the object, as in
 /// the reference: nothing dereferences a dead key. Identity is compared
 /// bitwise, and dead entries are reaped before any rehash so their hash
-/// is never recomputed. A set revives a dead entry only when `Key::REVIVE`
-/// allows it; otherwise the key's second entry can make `next` resume from
-/// the dead one and revisit entries.
+/// is never recomputed. A set revives a matching dead entry: a second entry
+/// for the key could make `next` resume from the dead one and revisit entries.
 #[derive(Clone, Copy)]
 pub(super) struct Entry<'gc, K> {
     pub key: K,
@@ -44,10 +43,6 @@ impl<'gc, K> Entry<'gc, K> {
 /// Hash-part key: identity comparison that never dereferences either
 /// side, and the hash used to place it.
 pub(super) trait Key: Copy {
-    /// Whether the hash is a function of what `same` compares, so a dead
-    /// entry that matches is already in the right bucket.
-    const REVIVE: bool;
-
     fn same(self, other: Self) -> bool;
     fn hash(self) -> u64;
 }
@@ -55,8 +50,6 @@ pub(super) trait Key: Copy {
 // Integers never reach a `Value`-keyed part, so bit identity is value equality here and
 // never dereferences a boxed int.
 impl Key for Value<'_> {
-    const REVIVE: bool = true;
-
     #[inline]
     fn same(self, other: Self) -> bool {
         self.same_bits(&other)
@@ -68,11 +61,7 @@ impl Key for Value<'_> {
     }
 }
 
-// Content-hashed but compared by pointer: a new string at a freed key's
-// address would land in the old string's bucket.
 impl Key for LuaString<'_> {
-    const REVIVE: bool = false;
-
     #[inline]
     fn same(self, other: Self) -> bool {
         Gc::ptr_eq(self.inner(), other.inner())
@@ -85,8 +74,6 @@ impl Key for LuaString<'_> {
 }
 
 impl Key for i64 {
-    const REVIVE: bool = true;
-
     #[inline]
     fn same(self, other: Self) -> bool {
         self == other
@@ -161,8 +148,9 @@ pub(super) fn set<'gc, K: Key, A: Allocator>(
     if table.len() == table.capacity() {
         table.retain(|e| e.is_live());
     }
-    let matches = |e: &Entry<'gc, K>| (K::REVIVE || e.is_live()) && e.key.same(key);
-    match table.entry(hash, matches, rehash) {
+    // A dead key's address may now hold another object with a different hash, but `entry`
+    // only tests buckets on `hash`'s probe path with its tag, so any match is a valid home.
+    match table.entry(hash, |e| e.key.same(key), rehash) {
         hash_table::Entry::Occupied(mut e) => e.get_mut().value = value,
         hash_table::Entry::Vacant(e) => {
             e.insert(Entry { key, value });
@@ -184,4 +172,111 @@ pub(super) fn insert_unique<'gc, K: Key, A: Allocator>(
 fn rehash<K: Key>(e: &Entry<'_, K>) -> u64 {
     debug_assert!(e.is_live(), "rehash reached a dead entry");
     e.key.hash()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::alloc::Global;
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+
+    use super::*;
+
+    thread_local! {
+        static HEAP: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// A `LuaString` stand-in: compared by address, hashed by whatever
+    /// content `HEAP` holds there now.
+    #[derive(Clone, Copy)]
+    struct Addr(usize);
+
+    impl Key for Addr {
+        fn same(self, other: Self) -> bool {
+            self.0 == other.0
+        }
+
+        fn hash(self) -> u64 {
+            HEAP.with_borrow(|h| h[self.0])
+        }
+    }
+
+    /// Freed addresses are reused at once with new content while dead entries
+    /// still hold them. Only two tags and 64 low hash bits are drawn, so probe
+    /// paths and tags collide constantly.
+    #[test]
+    fn revive_at_reused_address() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rand = |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as usize % n
+        };
+        let mut t: Part<'_, Addr, Global> = HashTable::new_in(Global);
+        let (mut live, mut free) = (Vec::new(), Vec::new());
+        let v = Value::boolean(true);
+        for step in 0..10_000 {
+            match rand(16) {
+                0..=9 if live.len() < 300 => {
+                    let h = (1 + rand(2) as u64) << 57 | rand(64) as u64;
+                    let a = HEAP.with_borrow_mut(|m| match free.pop() {
+                        Some(a) => {
+                            m[a] = h;
+                            a
+                        }
+                        None => {
+                            m.push(h);
+                            m.len() - 1
+                        }
+                    });
+                    set(&mut t, h, Addr(a), v);
+                    live.push(a);
+                }
+                10 if !live.is_empty() => {
+                    let a = live.swap_remove(rand(live.len()));
+                    set(&mut t, Addr(a).hash(), Addr(a), Value::nil());
+                    free.push(a);
+                }
+                11 if !live.is_empty() => {
+                    let a = Addr(live[rand(live.len())]);
+                    set(&mut t, a.hash(), a, Value::nil());
+                    set(&mut t, a.hash(), a, v);
+                }
+                12 => {
+                    // `next` semantics, deleting some keys as they are visited. A
+                    // cursor's address can't be reused until the traversal ends.
+                    let expect: HashSet<usize> = live.iter().copied().collect();
+                    let (mut seen, mut cursor) = (HashSet::new(), None);
+                    loop {
+                        let from = cursor.map_or(0, |k: Addr| {
+                            position(&t, k.hash(), k).expect("cursor lost") + 1
+                        });
+                        let Some(&e) = next_live(&t, from) else { break };
+                        assert!(seen.insert(e.key.0), "step {step}: revisited a key");
+                        if rand(32) == 0 {
+                            set(&mut t, e.key.hash(), e.key, Value::nil());
+                        }
+                        cursor = Some(e.key);
+                    }
+                    assert_eq!(seen, expect, "step {step}: traversal missed keys");
+                    for a in live.extract_if(.., |a| get(&t, Addr(*a).hash(), Addr(*a)).is_nil()) {
+                        free.push(a);
+                    }
+                }
+                _ => {}
+            }
+            if step % 16 != 0 {
+                continue;
+            }
+            for &a in &live {
+                let k = Addr(a);
+                let p = position(&t, k.hash(), k).expect("live key lost");
+                assert!(
+                    t.get_bucket(p).unwrap().is_live(),
+                    "step {step}: position is a dead entry"
+                );
+            }
+        }
+    }
 }
