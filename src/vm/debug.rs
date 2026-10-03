@@ -176,6 +176,7 @@ pub(crate) fn op_error_message<'gc>(
         OpError::NilIndex => "table index is nil".to_owned(),
         OpError::NanIndex => "table index is NaN".to_owned(),
         OpError::StackOverflow => "stack overflow".to_owned(),
+        OpError::VarargN => "vararg table has no proper 'n'".to_owned(),
         OpError::NonClosable(reg) => {
             let name = ts
                 .top_lua()
