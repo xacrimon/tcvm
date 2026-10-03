@@ -35,6 +35,19 @@ impl fmt::Display for LineNumber {
     }
 }
 
+/// The function a limit error names, by its `line_defined` (0 for the main chunk).
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct FuncLine(pub u32);
+
+impl fmt::Display for FuncLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            0 => f.write_str("main function"),
+            n => write!(f, "function at line {n}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Error)]
 pub enum CompileErrorKind {
     #[error("internal compiler error: {0}")]
@@ -47,8 +60,13 @@ pub enum CompileErrorKind {
     ConstAssign(String),
     #[error("insufficient available registers")]
     Registers,
-    #[error("too many upvalues")]
-    UpValues,
+    /// Lua's `errorlimit`.
+    #[error("too many {what} (limit is {limit}) in {func}")]
+    Limit {
+        what: &'static str,
+        limit: usize,
+        func: FuncLine,
+    },
     #[error("too many fixed parameters")]
     FixedParameters,
     #[error("too many inner functions")]
