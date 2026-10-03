@@ -410,7 +410,7 @@ fn parse_spec<'gc>(
         b'u' => (b"-0", true),
         b'o' | b'x' | b'X' => (b"-#0", true),
         b'a' | b'A' | b'e' | b'E' | b'f' | b'F' | b'g' | b'G' => (b"-+#0 ", true),
-        b'c' => (b"-", false),
+        b'c' | b'p' => (b"-", false),
         b's' => (b"-", true),
         // Unknown letters fall through to `format_one`'s
         // "invalid conversion '%c' to 'format'".
@@ -494,6 +494,13 @@ fn format_one<'gc>(
         }
         b's' => {
             fmt_string(ctx, out, spec, arg);
+        }
+        b'p' => {
+            let s = match util::to_pointer(arg) {
+                Some(p) => format!("{p:p}"),
+                None => "(null)".to_owned(),
+            };
+            apply_width(out, spec, b"", b"", s.as_bytes());
         }
         b'q' => {
             fmt_q(ctx, out, arg, arg_num)?;

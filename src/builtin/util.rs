@@ -240,16 +240,7 @@ pub(crate) fn basic_tostring<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> LuaString
     } else if let Some(f) = v.get_float() {
         push_float(&mut out, f);
     } else {
-        let ptr = if let Some(t) = v.get_table() {
-            Gc::as_ptr(t.inner()) as *const ()
-        } else if let Some(f) = v.get_function() {
-            Gc::as_ptr(f.inner()) as *const ()
-        } else if let Some(t) = v.get_thread() {
-            Gc::as_ptr(t.inner()) as *const ()
-        } else {
-            let u = v.get_userdata().expect("every other type is userdata");
-            Gc::as_ptr(u.inner()) as *const ()
-        };
+        let ptr = to_pointer(v).expect("every other type is an object");
         match ctx.metamethod_of(v, ctx.symbols().name).get_string() {
             Some(name) => out.extend_from_slice(name.as_bytes()),
             None => out.extend_from_slice(v.type_name().as_bytes()),
@@ -257,6 +248,21 @@ pub(crate) fn basic_tostring<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> LuaString
         out.extend_from_slice(format!(": {ptr:p}").as_bytes());
     }
     LuaString::new(ctx, &out)
+}
+
+/// `lua_topointer`: an object's address, `None` for nil, booleans and numbers.
+pub(crate) fn to_pointer(v: Value<'_>) -> Option<*const ()> {
+    Some(if let Some(s) = v.get_string() {
+        Gc::as_ptr(s.inner()) as *const ()
+    } else if let Some(t) = v.get_table() {
+        Gc::as_ptr(t.inner()) as *const ()
+    } else if let Some(f) = v.get_function() {
+        Gc::as_ptr(f.inner()) as *const ()
+    } else if let Some(t) = v.get_thread() {
+        Gc::as_ptr(t.inner()) as *const ()
+    } else {
+        Gc::as_ptr(v.get_userdata()?.inner()) as *const ()
+    })
 }
 
 /// `luaL_tolstring` of the value at stack index `i`, calling its `__tostring`
