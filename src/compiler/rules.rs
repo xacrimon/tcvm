@@ -370,6 +370,13 @@ enum ResolvedName {
     Upvalue(u8),
 }
 
+/// The `_ENV` a global access indexes.
+#[derive(Clone, Copy)]
+enum Env {
+    Reg(RegisterIndex),
+    Upvalue(u8),
+}
+
 /// Where a function sits in the source. `defined`/`last_defined` become the
 /// prototype's span (both 0 for a main chunk); `end` is the line stamped on
 /// the implicit RETURN — the `end` keyword, or a main chunk's last token.
@@ -1294,26 +1301,45 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         Ok((idx, ic))
     }
 
-    /// The `_ENV` upvalue for an access to the global `name`; an error while
+    /// The `_ENV` in scope for an access to the global `name`; an error while
     /// `global _ENV` is in scope, here or in an enclosing function
     /// (`buildglobal`).
-    fn env_upvalue(&mut self, name: &str) -> Result<u8, CompileError> {
-        let declared_here = matches!(
-            self.resolve_local("_ENV").map(|d| d.kind),
-            Some(VarKind::Global)
-        );
-        let resolved = if declared_here {
-            None
-        } else {
-            self.resolve_or_capture("_ENV")
+    fn env(&mut self, name: &str) -> Result<Env, CompileError> {
+        let resolved = match self.resolve_local("_ENV").map(|d| (d.kind, d.register)) {
+            Some((VarKind::Global, _)) => None,
+            Some((VarKind::Const(Some(_)), _)) => todo!("a constant-folded _ENV (#278)"),
+            Some((kind, register)) => {
+                // Indexing a named vararg as `_ENV` reads it as a table.
+                if matches!(kind, VarKind::VarargParam)
+                    && let Some(info) = self.chunk.vararg_info.as_mut()
+                {
+                    info.used_as_non_base = true;
+                }
+                return Ok(Env::Reg(register));
+            }
+            None => self.resolve_or_capture("_ENV"),
         };
         match resolved {
-            Some(ResolvedName::Upvalue(idx)) => Ok(idx),
+            Some(ResolvedName::Upvalue(idx)) => Ok(Env::Upvalue(idx)),
             Some(ResolvedName::Const(_)) => todo!("a constant-folded _ENV (#278)"),
             // The main chunk pre-seeds `_ENV`, so only a `global _ENV` stops
             // the capture.
             None => Err(self.err(CompileErrorKind::GlobalEnv(name.to_owned()))),
         }
+    }
+
+    fn emit_env_get(&mut self, dst: RegisterIndex, env: Env, ic_idx: u16, key: u16) {
+        self.emit(match env {
+            Env::Reg(table) => Instruction::getfield(dst, table, IcIdx(ic_idx), KIdx(key)),
+            Env::Upvalue(idx) => Instruction::gettabup(dst, UpIdx(idx), IcIdx(ic_idx), KIdx(key)),
+        });
+    }
+
+    fn emit_env_set(&mut self, src: RegisterIndex, env: Env, ic_idx: u16, key: u16) {
+        self.emit(match env {
+            Env::Reg(table) => Instruction::setfield(src, table, IcIdx(ic_idx), KIdx(key)),
+            Env::Upvalue(idx) => Instruction::settabup(src, UpIdx(idx), IcIdx(ic_idx), KIdx(key)),
+        });
     }
 
     /// Resolve `name` from an enclosing scope into either an inlined
@@ -2030,7 +2056,7 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         // `_ENV` resolves before the body, as in `globalfunc`'s
         // `buildglobal`.
         let (key, ic_idx) = ctx.alloc_field_key(name.as_bytes())?;
-        let env_idx = ctx.env_upvalue(&name)?;
+        let env = ctx.env(&name)?;
 
         // Compile the closure into a register. `compile_func_body`
         // honours the dst hint, so `func_reg == target_reg` (asserted
@@ -2047,22 +2073,13 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         //   GETTABUP guard, _ENV, name
         //   ERRNNIL  guard, name
         //   SETTABUP closure, _ENV, name
-        // Mirrors upstream `globalfunc` (`lparser.c:1956-1968`), which
-        // emits the same guard via `checkglobal` + `luaK_storevar`.
+        // (GETFIELD/SETFIELD for a local `_ENV`). Mirrors upstream
+        // `globalfunc` (`lparser.c:1956-1968`), which emits the same guard
+        // via `checkglobal` + `luaK_storevar`.
         let guard_reg = ctx.alloc_register()?;
-        ctx.emit(Instruction::gettabup(
-            guard_reg,
-            UpIdx(env_idx),
-            IcIdx(ic_idx),
-            KIdx(key),
-        ));
+        ctx.emit_env_get(guard_reg, env, ic_idx, key);
         ctx.emit(Instruction::errnnil(guard_reg, KIdx(key)));
-        ctx.emit(Instruction::settabup(
-            func_reg,
-            UpIdx(env_idx),
-            IcIdx(ic_idx),
-            KIdx(key),
-        ));
+        ctx.emit_env_set(func_reg, env, ic_idx, key);
         ctx.free_reg(guard_reg);
         ctx.free_reg(target_reg);
         return Ok(());
@@ -2120,8 +2137,8 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
     let has_values = !values.is_empty();
     // Resolved before the declarations take effect, so `global _ENV = …`
     // initializes through the outer `_ENV` (`initglobal`).
-    let env_idx = match decl_kinds.first() {
-        Some((name, _)) if has_values => Some(ctx.env_upvalue(name)?),
+    let env = match decl_kinds.first() {
+        Some((name, _)) if has_values => Some(ctx.env(name)?),
         _ => None,
     };
     let value_base = ctx.chunk.freereg;
@@ -2200,7 +2217,7 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         )?;
     }
 
-    let Some(env_idx) = env_idx else {
+    let Some(env) = env else {
         // No initializer: per `manual.of:1665`, "global variables are
         // left unchanged". Just register the names and emit nothing.
         return Ok(());
@@ -2213,19 +2230,9 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         let (key, ic_idx) = ctx.alloc_field_key(name.as_bytes())?;
         let value_reg = value_base + i as u8;
         let guard_reg = ctx.alloc_register()?;
-        ctx.emit(Instruction::gettabup(
-            guard_reg,
-            UpIdx(env_idx),
-            IcIdx(ic_idx),
-            KIdx(key),
-        ));
+        ctx.emit_env_get(guard_reg, env, ic_idx, key);
         ctx.emit(Instruction::errnnil(guard_reg, KIdx(key)));
-        ctx.emit(Instruction::settabup(
-            Reg(value_reg),
-            UpIdx(env_idx),
-            IcIdx(ic_idx),
-            KIdx(key),
-        ));
+        ctx.emit_env_set(Reg(value_reg), env, ic_idx, key);
         ctx.free_reg(guard_reg);
     }
     // Free the value-block.
@@ -2298,11 +2305,22 @@ fn compile_assign(ctx: &mut Ctx, item: Assign) -> Result<(), CompileError> {
         .iter()
         .filter_map(|t| target_local_reg(ctx, t))
         .collect();
+    // Stores run in target order, so with `_ENV` among the targets a global
+    // target must index the old `_ENV`. A local one is in
+    // `target_local_regs`; this covers an upvalue.
+    let env_is_target = targets
+        .iter()
+        .any(|t| matches!(t, Expr::Ident(i) if i.name(ctx.interner) == Some("_ENV")));
 
     // Pass 1: resolve LHS targets.
     let mut lvalues: Vec<Lvalue> = Vec::with_capacity(num_targets);
     for target in targets {
-        lvalues.push(compile_lvalue(ctx, target, &target_local_regs)?);
+        lvalues.push(compile_lvalue(
+            ctx,
+            target,
+            &target_local_regs,
+            env_is_target,
+        )?);
     }
 
     // Decide per-slot whether it's safe to hint the RHS directly into
@@ -2388,6 +2406,7 @@ fn compile_lvalue(
     ctx: &mut Ctx,
     target: Expr,
     target_local_regs: &[u8],
+    env_is_target: bool,
 ) -> Result<Lvalue, CompileError> {
     match target {
         Expr::Ident(ident) => {
@@ -2440,11 +2459,26 @@ fn compile_lvalue(
                     }
                 }
                 let (key, ic_idx) = ctx.alloc_field_key(name.as_bytes())?;
-                let env_idx = ctx.env_upvalue(name)?;
-                Ok(Lvalue::Global {
-                    env_idx,
-                    key,
-                    ic_idx,
+                Ok(match ctx.env(name)? {
+                    Env::Upvalue(env_idx) if env_is_target => {
+                        let table = ctx.alloc_register()?;
+                        ctx.emit(Instruction::getupval(table, UpIdx(env_idx)));
+                        Lvalue::Field {
+                            table,
+                            key_idx: key,
+                            ic_idx,
+                        }
+                    }
+                    Env::Upvalue(env_idx) => Lvalue::Global {
+                        env_idx,
+                        key,
+                        ic_idx,
+                    },
+                    Env::Reg(env) => Lvalue::Field {
+                        table: protect_target_local(ctx, env, target_local_regs)?,
+                        key_idx: key,
+                        ic_idx,
+                    },
                 })
             }
         }
@@ -2490,6 +2524,15 @@ fn compile_indexed_subexpr(
     target_local_regs: &[u8],
 ) -> Result<RegisterIndex, CompileError> {
     let reg = compile_expr_to_reg(ctx, expr, None)?;
+    protect_target_local(ctx, reg, target_local_regs)
+}
+
+/// `reg`, or a temp copy of it if it's a local that's also a target.
+fn protect_target_local(
+    ctx: &mut Ctx,
+    reg: RegisterIndex,
+    target_local_regs: &[u8],
+) -> Result<RegisterIndex, CompileError> {
     if !target_local_regs.contains(&reg.0) {
         return Ok(reg);
     }
@@ -2541,10 +2584,19 @@ fn expr_reads(ctx: &Ctx, expr: &Expr, reg: u8) -> Result<bool, CompileError> {
     };
     Ok(match expr {
         Expr::Literal(_) | Expr::VarArg | Expr::Func(_) => false,
-        Expr::Ident(ident) => ident
-            .name(ctx.interner)
-            .and_then(|n| ctx.resolve_local(n))
-            .is_some_and(|d| !matches!(d.kind, VarKind::Global) && d.register.0 == reg),
+        Expr::Ident(ident) => {
+            let reads = |n| {
+                ctx.resolve_local(n)
+                    .filter(|d| !matches!(d.kind, VarKind::Global))
+                    .map(|d| d.register.0 == reg)
+            };
+            // A name that isn't a local is conservatively a global, which
+            // reads a local `_ENV`.
+            ident
+                .name(ctx.interner)
+                .and_then(|n| reads(n).or_else(|| reads("_ENV")))
+                .unwrap_or(false)
+        }
         Expr::PrefixOp(p) => any(p.rhs())?,
         Expr::BinaryOp(b) => {
             let skip_rhs = matches!(
@@ -2638,7 +2690,7 @@ fn compile_func(ctx: &mut Ctx, item: Func) -> Result<(), CompileError> {
     let freereg_before = ctx.chunk.freereg;
     // The target resolves before the body, as in `funcstat`: a read-only one
     // fails first, and its upvalue is captured ahead of the body's.
-    let lv = compile_lvalue(ctx, target, &[])?;
+    let lv = compile_lvalue(ctx, target, &[], false)?;
     let func_reg = compile_func_body(ctx, &item, None)?;
 
     // The store is on the `function` line, not the body's `end`
@@ -2869,13 +2921,8 @@ fn compile_expr_ident(
 
     let (key, ic_idx) = ctx.alloc_field_key(name.as_bytes())?;
     let dst = ctx.dst_or_alloc(dst)?;
-    let env_idx = ctx.env_upvalue(name)?;
-    ctx.emit(Instruction::gettabup(
-        dst,
-        UpIdx(env_idx),
-        IcIdx(ic_idx),
-        KIdx(key),
-    ));
+    let env = ctx.env(name)?;
+    ctx.emit_env_get(dst, env, ic_idx, key);
     Ok(ExprDesc::from_reg(dst))
 }
 
