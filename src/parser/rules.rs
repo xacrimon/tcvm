@@ -228,26 +228,11 @@ impl<'cache, 'source> Parser<'cache, 'source> {
         self.expect(T![then]);
         self.r_block(&|t| matches!(t, T![end] | T![elseif] | T![else]));
 
-        match self.at() {
-            T![end] => {
-                self.expect(T![end]);
-            }
-            T![elseif] | T![else] => {
-                self.r_else();
-            }
-            t => {
-                self.error(
-                    "unexpected token",
-                    format!(
-                        "expected token one of [{}, {}, {}] but found {}",
-                        T![end],
-                        T![elseif],
-                        T![else],
-                        t,
-                    ),
-                );
-                return None;
-            }
+        // The block stops only at these or EOF, where `end` is what's missing.
+        if matches!(self.at(), T![elseif] | T![else]) {
+            self.r_else();
+        } else {
+            self.expect(T![end]);
         }
 
         Some(marker.complete(self))
@@ -462,7 +447,7 @@ impl<'cache, 'source> Parser<'cache, 'source> {
                             t,
                         ),
                     );
-                    return None;
+                    break;
                 }
             }
 
