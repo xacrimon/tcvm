@@ -7,9 +7,12 @@
 //! becomes a *dead* bucket with its own control tag, so `next` can resume from its key. A set
 //! finds its key's entry live or dead and revives it; other keys may take a dead bucket like
 //! a tombstone. Probes load group-aligned windows, so a control byte has no mirror and turning
-//! a bucket dead or back is one store of its group.
+//! a bucket dead or back is one store of its group. The generic group's tag match is exact,
+//! since dead keys are compared by bits alone.
 
 mod control;
 mod raw;
 
+#[cfg(test)]
+pub(super) use control::Group;
 pub(super) use raw::RawTable;

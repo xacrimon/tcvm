@@ -86,22 +86,21 @@ impl Group {
         }
     }
 
-    /// Returns a `BitMask` indicating all tags in the group which *may*
-    /// have the given value.
+    /// Returns a `BitMask` indicating all tags in the group which have the
+    /// given value.
     ///
-    /// This function may return a false positive in certain cases where
-    /// the tag in the group differs from the searched value only in its
-    /// lowest bit. This is fine because:
-    /// - This never happens for `EMPTY` and `DELETED`, only full entries.
-    /// - The check for key equality will catch these.
-    /// - This only happens if there is at least 1 true match.
-    /// - The chance of this happening is very low (< 1% chance per tag).
+    /// Unlike upstream this is exact: a dead bucket's key is compared by bits
+    /// alone, and a reused address can give a dead bucket the bits of a live
+    /// key further along its probe sequence, so a false tag match there would
+    /// be taken for that key.
     #[inline]
     pub(crate) fn match_tag(self, tag: Tag) -> BitMask {
-        // This algorithm is derived from
-        // https://graphics.stanford.edu/~seander/bithacks.html##ValueInWord
+        // A byte of `cmp` is zero iff adding 0x7f to its low seven bits doesn't
+        // carry into the high bit and that bit is clear already; no byte carries
+        // into the next.
         let cmp = self.0 ^ repeat(tag);
-        BitMask((cmp.wrapping_sub(repeat(Tag(0x01))) & !cmp & repeat(Tag::DELETED)).to_le())
+        let low = repeat(Tag(0x7f));
+        BitMask((!(((cmp & low) + low) | cmp | low)).to_le())
     }
 
     /// Returns a `BitMask` indicating all tags in the group which are

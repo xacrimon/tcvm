@@ -14,9 +14,9 @@ mod tests {
     use super::{BitMask, Group, Tag};
 
     /// The group operations treat dead tags as the table relies on, over every
-    /// control byte a table can hold in many neighbourhoods: a dead tag matches
-    /// itself and at most other dead tags (never a bucket without an entry),
-    /// is neither empty nor full, and a rehash clears it.
+    /// control byte a table can hold in many neighbourhoods: a full or dead tag
+    /// matches exactly itself, a dead tag is neither empty nor full, and a rehash
+    /// clears it.
     #[test]
     fn dead_tags() {
         #[repr(C, align(16))]
@@ -32,25 +32,40 @@ mod tests {
         tags.sort_by_key(|t| t.0);
         tags.dedup();
         tags.extend((0..0x80).map(Tag).chain([Tag::EMPTY, Tag::DELETED]));
+        let matchable: Vec<Tag> = tags
+            .iter()
+            .copied()
+            .filter(|t| t.is_full() || t.is_dead())
+            .collect();
         let n = tags.len();
-        for start in 0..n {
+        let mut groups: Vec<Vec<Tag>> = (0..n)
+            .map(|start| {
+                (0..Group::WIDTH)
+                    .map(|i| tags[(start + i * 37) % n])
+                    .collect()
+            })
+            .collect();
+        // Upstream's generic `match_tag` falsely matched `t ^ 1` right above a true `t`.
+        groups.extend(matchable.iter().map(|&t| {
+            (0..Group::WIDTH)
+                .map(|i| if i % 2 == 0 { t } else { Tag(t.0 ^ 1) })
+                .collect()
+        }));
+        for g in &groups {
             let mut group = Aligned([Tag::EMPTY; 16]);
-            for (i, b) in group.0.iter_mut().take(Group::WIDTH).enumerate() {
-                *b = tags[(start + i * 37) % n];
-            }
+            group.0[..Group::WIDTH].copy_from_slice(g);
             let bytes = &group.0[..Group::WIDTH];
             let loaded = unsafe { Group::load_aligned(group.0.as_ptr()) };
             let bits = |m: BitMask| m.into_iter().collect::<Vec<_>>();
             let which = |f: &dyn Fn(Tag) -> bool| -> Vec<usize> {
                 (0..Group::WIDTH).filter(|&i| f(bytes[i])).collect()
             };
-            for &d in &dead {
-                let got = bits(loaded.match_tag(d));
-                assert!(
-                    which(&|t| t == d).iter().all(|i| got.contains(i)),
-                    "{bytes:?}"
+            for &t in &matchable {
+                assert_eq!(
+                    bits(loaded.match_tag(t)),
+                    which(&|b| b == t),
+                    "{t:?} in {bytes:?}"
                 );
-                assert!(got.iter().all(|&i| bytes[i].is_dead()), "{bytes:?}");
             }
             assert_eq!(bits(loaded.match_empty()), which(&|t| t == Tag::EMPTY));
             assert_eq!(bits(loaded.match_full()), which(&Tag::is_full));
