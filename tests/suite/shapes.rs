@@ -132,3 +132,28 @@ return table.concat(out, ' ')
          d18=18,d19=19,d1=1,d20=20,d21=21,d2=2,d3=3,d4=4,d5=5,d6=6,d7=7,d8=8,d9=9,e=1"
     );
 }
+
+/// Constant-key stores keep a table in shape mode past 64 keys, where lookups
+/// and `next` go through the key array's index, and move it to dict mode past
+/// `MAX_PROPERTIES_FAST`; `t[k] = v` still does past 64.
+#[test]
+fn long_tables() {
+    let mut src = String::from("t, big, keyed = {}, {}, {}\n");
+    for i in 1..=100 {
+        src += &format!("t.k{i} = {i}\n");
+    }
+    for i in 1..=520 {
+        src += &format!("big.k{i} = {i}\n");
+    }
+    src += r#"
+for i = 1, 70 do keyed['k' .. i] = i end
+local n, sum = 0, 0
+for k, v in pairs(t) do n = n + 1; sum = sum + v end
+for k, v in pairs(t) do if v % 2 == 0 then t[k] = nil end end
+local function count(t) local c = 0 for _ in pairs(t) do c = c + 1 end return c end
+return table.concat({n, sum, count(t), t['k' .. 99], tostring(t['k' .. 100]),
+  rawget(t, 'k1'), big.k1 + big.k520, big['k' .. 300], count(big),
+  keyed.k70, count(keyed)}, ' ')
+"#;
+    assert_eq!(run(&src), "100 5050 50 99 nil 1 521 300 520 70 70");
+}

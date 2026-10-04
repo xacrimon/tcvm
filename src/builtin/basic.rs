@@ -583,7 +583,7 @@ fn lua_rawset<'gc>(
     if key.get_float().is_some_and(f64::is_nan) {
         return Err(Error::from_str(ctx, "table index is NaN").with_level(0));
     }
-    t.raw_set(ctx, key, value);
+    t.raw_set_keyed(ctx, key, value);
     stack.ret1(Value::table(t));
     Ok(CallbackAction::Return)
 }

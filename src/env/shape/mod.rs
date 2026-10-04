@@ -161,10 +161,15 @@ macro_rules! emit_bitflags {
 }
 for_each_metamethod!(emit_bitflags);
 
-/// Maximum string-keyed properties a table can hold in fast mode.
-/// Beyond this, set_string_key migrates the table to dictionary mode
-/// to bound memory growth in the transition tree.
-pub const MAX_PROPERTIES_FAST: u32 = 64;
+/// Most string keys a table holds in shape mode; one more moves it to dict
+/// mode. Constant-key stores fill a table the same way each time, so its
+/// shapes are shared.
+pub const MAX_PROPERTIES_FAST: u32 = 512;
+
+/// The same, for a key added by `t[k] = v`: such a table is usually a map,
+/// whose keys and their order differ each time, so it would build a chain of
+/// shapes nothing else uses.
+pub const MAX_KEYED_PROPERTIES: u32 = 64;
 
 /// Pairing of metamethod byte-name and the bit it occupies in
 /// `MetamethodBits`. Used by:
