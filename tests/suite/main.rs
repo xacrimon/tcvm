@@ -20,6 +20,7 @@ mod coroutine_wrap;
 mod debug_info;
 mod error_position;
 mod executor_isolation;
+mod field_ic;
 mod gc_stack_trace;
 mod generic_for;
 mod goto_close;
