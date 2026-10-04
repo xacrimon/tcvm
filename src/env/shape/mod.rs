@@ -235,6 +235,10 @@ pub struct MtCacheData<'gc> {
     /// Read by the collector when it traces a table with this metatable.
     #[collect(require_static)]
     pub weak: Cell<WeakMode>,
+    /// Bumped by every write of `__index`, so a cache entry that recorded it
+    /// knows `__index` still names the same value.
+    #[collect(require_static)]
+    pub index_epoch: Cell<u32>,
     /// Lazily-allocated dict-mode sentinel for tables that drop into
     /// dict mode while carrying this metatable. Populated on the first
     /// call to `MtCache::ensure_dict_sentinel`; subsequent calls return
@@ -284,6 +288,7 @@ impl<'gc> MtCache<'gc> {
             MtCacheData {
                 bits: Cell::new(bits),
                 weak: Cell::new(weak),
+                index_epoch: Cell::new(0),
                 dict_sentinel: Lock::new(None),
             },
         ))
@@ -331,11 +336,22 @@ impl<'gc> MtCache<'gc> {
         self.0.weak.get()
     }
 
+    #[inline]
+    pub fn index_epoch(self) -> u32 {
+        self.0.index_epoch.get()
+    }
+
     /// Mirror a write of `key` to this cache's metatable into its bits and weak mode.
     #[inline]
     pub fn mirror(self, key: LuaString<'gc>, value: Value<'gc>) {
         match metamethod_bit_of_bytes(key.as_bytes()) {
-            Some(bit) => self.update(bit, value),
+            Some(bit) => {
+                if bit == MetamethodBits::INDEX {
+                    let e = &self.0.index_epoch;
+                    e.set(e.get().wrapping_add(1));
+                }
+                self.update(bit, value)
+            }
             None if key.as_bytes() == b"__mode" => self.0.weak.set(WeakMode::of(value)),
             None => {}
         }

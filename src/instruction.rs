@@ -41,7 +41,7 @@ pub struct UpIdx(pub u8);
 pub struct KIdx(pub u16);
 
 /// An index into the prototype's `ic_table`. One slot is allocated per emitted
-/// GETTABUP/SETTABUP/GETFIELD/SETFIELD; sites are not deduped.
+/// GETTABUP/SETTABUP/GETFIELD/SETFIELD/SELF; sites are not deduped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct IcIdx(pub u16);
 
@@ -690,10 +690,8 @@ instructions! {
     0x0a SETFIELD   setfield    Abde  { src: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
 
     /// Method-call setup: `R[dst] = R[object][K[key_idx]]; R[dst+1] = R[object]`.
-    /// Backs `obj:m(...)` codegen. Falls back to the slow path on `__index`
-    /// when the direct lookup is nil. No inline cache yet — the `e` slot is
-    /// free for one.
-    0x0b SELF       self_       Abd   { dst: Reg, object: Reg, key_idx: KIdx }
+    /// Backs `obj:m(...)` codegen.
+    0x0b SELF       self_       Abde  { dst: Reg, object: Reg, ic_idx: IcIdx, key_idx: KIdx }
 
     0x0c NEWTABLE   newtable    A     { dst: Reg }
     0x0d ADD        add         Abc   { dst: Reg, lhs: Reg, rhs: Reg }
@@ -827,7 +825,10 @@ mod tests {
         let i = Instruction::eq(Reg(7), Reg(8), true);
         assert_eq!(i.abc_flag(), (7, 8, true));
 
-        let i = Instruction::self_(Reg(1), Reg(2), KIdx(3));
+        let i = Instruction::self_(Reg(1), Reg(2), IcIdx(4), KIdx(3));
+        assert_eq!(i.abde(), (1, 2, 4, 3));
+
+        let i = Instruction::setlist(Reg(1), 2, 3);
         assert_eq!(i.abd(), (1, 2, 3));
 
         assert_eq!(Instruction::nop().op(), Op::NOP);

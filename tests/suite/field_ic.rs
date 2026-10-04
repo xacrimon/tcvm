@@ -139,3 +139,77 @@ return table.concat(out, ' | ')
         "1 2 a 1 | nil nil | nil a2 | i i | 64 65 66 end | 3 3 2 | 2 | 2 2"
     );
 }
+
+/// Loads and method calls through an `__index` table stay correct as the
+/// class, its `__index` and the receiver change under a cached entry.
+#[test]
+fn proto_loads() {
+    let src = r#"
+local out = {}
+local function get(o) return o.m end
+local function call(o) return o:m() end
+local C = {}
+C.__index = C
+function C.m() return 'c1' end
+local o = setmetatable({x = 1}, C)
+out[#out + 1] = cat(call(o), call(o), get(o)(), get(o)())
+C.m = function() return 'c2' end                       -- replaced in place
+out[#out + 1] = cat(call(o), get(o)())
+C.extra = 1                                             -- class shape changes
+out[#out + 1] = call(o)
+local B = {m = function() return 'base' end}
+setmetatable(C, {__index = B})
+C.m = nil                                               -- slot kept, nil: walk goes on
+out[#out + 1] = cat(call(o), get(o)())
+C.m = function() return 'c3' end
+out[#out + 1] = cat(call(o), call(o))
+C.__index = {m = function() return 'other' end}         -- __index reassigned
+out[#out + 1] = cat(call(o), call(o))
+C.__index = function(_, k) return function() return 'fn:' .. k end end
+out[#out + 1] = cat(call(o), call(o))
+local D = {m = function() return 'd' end}
+C.__index = D
+out[#out + 1] = call(o)
+C.__index = D                                           -- same value again
+out[#out + 1] = call(o)
+o.m = function() return 'own' end                       -- receiver shadows
+out[#out + 1] = cat(call(o), get(o)())
+local p = setmetatable({x = 1}, C)
+out[#out + 1] = call(p)
+setmetatable(p, {__index = {m = function() return 'new mt' end}})
+out[#out + 1] = call(p)
+-- two levels: Derived -> Base
+local Base = {}; Base.__index = Base
+function Base.m() return 'b' end
+local Derived = setmetatable({}, Base); Derived.__index = Derived
+local q = setmetatable({}, Derived)
+out[#out + 1] = cat(call(q), call(q))
+function Derived.m() return 'derived' end
+out[#out + 1] = cat(call(q), call(q))
+-- a holder in dict mode
+local Big = {}; Big.__index = Big
+for i = 1, 70 do Big['f' .. i] = i end
+Big.m = function() return 'big' end
+local r = setmetatable({}, Big)
+out[#out + 1] = cat(call(r), call(r))
+-- a string __index, and string receivers
+local s = setmetatable({}, {__index = 'abc'})
+out[#out + 1] = cat(s.len == string.len, ('xy'):upper(), ('xy'):upper())
+-- _ENV with __index
+local function env_get()
+  local _ENV = setmetatable({}, {__index = _G})
+  return type(print), type(print)
+end
+out[#out + 1] = cat(env_get())
+-- missing methods and __index loops
+local e = setmetatable({}, {__index = {}})
+out[#out + 1] = cat((pcall(call, e)), (pcall(call, e)))
+local L = {}; L.__index = L; setmetatable(L, L)
+out[#out + 1] = tostring(select(2, pcall(get, setmetatable({}, L))):find('chain too long') ~= nil)
+return table.concat(out, ' | ')
+"#;
+    assert_eq!(
+        ok(src),
+        "c1 c1 c1 c1 | c2 c2 | c2 | base base | c3 c3 | other other | fn:m fn:m | d | d | own own | d | new mt | b b | derived derived | big big | true XY XY | function function | false false | true"
+    );
+}

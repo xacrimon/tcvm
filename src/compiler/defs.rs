@@ -248,7 +248,7 @@ pub struct Chunk<'gc> {
     pub(super) last_target: usize,
     pub(super) source: LuaString<'gc>,
     /// Number of IC slots reserved so far. Incremented once per emitted
-    /// GETFIELD/SETFIELD/GETTABUP/SETTABUP. The final count seeds the
+    /// GETFIELD/SETFIELD/GETTABUP/SETTABUP/SELF. The final count seeds the
     /// prototype's `ic_table` length.
     pub(super) next_ic_idx: u16,
 }
@@ -280,7 +280,7 @@ impl<'gc> Chunk<'gc> {
     }
 
     /// Reserve a fresh inline-cache slot. Returns the index to embed in
-    /// the GETFIELD/SETFIELD/GETTABUP/SETTABUP instruction. Slots are
+    /// the GETFIELD/SETFIELD/GETTABUP/SETTABUP/SELF instruction. Slots are
     /// **not** deduped across call sites — sharing would defeat ICs at
     /// any non-monomorphic shared use.
     pub(super) fn alloc_ic_slot(&mut self) -> u16 {
