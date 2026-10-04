@@ -512,6 +512,21 @@ macro_rules! get_slow_body {
                 dispatch!();
             }
         }
+        index_chain_body!(
+            $ctx, $thread, $registers, $ip, $handlers, $ds, __recv, __k, __dst_reg
+        );
+    }};
+}
+
+/// The `__index` half of [`get_slow_body!`], for a receiver whose own raw
+/// lookup (if it is a table) already missed.
+macro_rules! index_chain_body {
+    ($ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr, $ds:ident,
+     $recv:expr, $k:expr, $dst:expr) => {{
+        let __recv: Value<'gc> = $recv;
+        let __k: Value<'gc> = $k;
+        let __dst_reg: u8 = $dst;
+
         match walk_index_chain($ctx, __recv, __k) {
             IndexChain::Resolved(__rv) => {
                 *reg!(ref mut __dst_reg) = __rv;
@@ -607,33 +622,86 @@ fn ic_check<'gc>(cache: InlineCache<'gc>, live_shape: Shape<'gc>) -> Option<u32>
     None
 }
 
-/// Fill the IC entry from the table's *current* shape + slot for the
-/// given constant key. Called at the start of constant-key slow paths
-/// so subsequent same-shape accesses can take the fast path. For SET
-/// paths that end up transitioning `t`'s shape (fresh-key write with no
-/// `__newindex`), this leaves a one-step-stale IC entry that the next
-/// access fixes up — acceptable on cold paths.
+/// GETFIELD/SETFIELD/GETTABUP/SETTABUP only carry constant string keys.
 #[inline(always)]
-fn fill_ic_for_constant_key<'gc>(
+fn constant_key<'gc>(k: Value<'gc>) -> LuaString<'gc> {
+    debug_assert!(k.get_string().is_some(), "IC site with a non-string key");
+    unsafe { k.get_string().unwrap_unchecked() }
+}
+
+/// `t[k]` without `__index` for a constant-key IC miss; the one slot lookup
+/// both answers and refills the entry.
+#[inline(always)]
+fn get_own_fill_ic<'gc>(
     ctx: Context<'gc>,
     closure: LuaFn<'gc>,
     ic_idx: u16,
     t: Table<'gc>,
     k: Value<'gc>,
-) {
-    // GETFIELD/SETFIELD/GETTABUP/SETTABUP only carry constant string keys.
-    debug_assert!(
-        k.get_string().is_some(),
-        "IC fill on non-string key — compiler invariant violation"
-    );
-    let Some(key_str) = k.get_string() else {
-        return;
-    };
+) -> Value<'gc> {
     let state = t.inner().borrow();
     let shape = state.shape();
-    let slot = shape.find_slot(key_str).unwrap_or(InlineCache::ABSENT_SLOT);
+    if shape.is_dict() {
+        return state.raw_get(k);
+    }
+    let slot = shape.find_slot(constant_key(k));
+    fill_ic(
+        ctx,
+        closure,
+        ic_idx,
+        shape,
+        slot.unwrap_or(InlineCache::ABSENT_SLOT),
+    );
+    slot.map_or(Value::nil(), |s| unsafe { state.property_at(s) })
+}
+
+/// `t[k] = v` for a constant-key IC miss, with the same single lookup as
+/// [`get_own_fill_ic`]. Returns false, having stored nothing, when
+/// `__newindex` may fire. A store that adds `k` leaves the entry on the
+/// pre-transition shape.
+#[inline(always)]
+fn set_own_fill_ic<'gc>(
+    ctx: Context<'gc>,
+    closure: LuaFn<'gc>,
+    ic_idx: u16,
+    t: Table<'gc>,
+    k: Value<'gc>,
+    v: Value<'gc>,
+) -> bool {
+    let state = t.inner().borrow();
+    let shape = state.shape();
+    let newindex = shape.has_mm(MetamethodBits::NEWINDEX);
+    if shape.is_dict() {
+        if newindex {
+            return false;
+        }
+        drop(state);
+        t.raw_set(ctx, k, v);
+        return true;
+    }
+    let key = constant_key(k);
+    let slot = shape.find_slot(key);
+    fill_ic(
+        ctx,
+        closure,
+        ic_idx,
+        shape,
+        slot.unwrap_or(InlineCache::ABSENT_SLOT),
+    );
+    let existing = slot.map_or(Value::nil(), |s| unsafe { state.property_at(s) });
+    if existing.is_nil() && newindex {
+        return false;
+    }
     drop(state);
-    fill_ic(ctx, closure, ic_idx, shape, slot);
+    let mut state = t.inner().borrow_mut(ctx.mutation());
+    match slot {
+        Some(s) => {
+            state.properties[s as usize] = v;
+            state.maybe_update_mt_bit(k, v);
+        }
+        None => state.add_string_key(ctx, key, v),
+    }
+    true
 }
 
 /// Drive the VM on `thread` until the top-level frame returns.
@@ -874,10 +942,15 @@ extern "rust-preserve-none" fn gettabup_slow<'gc>(
     let uv = upvalue!(idx);
     let t_val = read_upvalue(thread, uv);
     let k = constant!(key);
-    if let Some(t) = t_val.get_table() {
-        fill_ic_for_constant_key(ctx, closure, ic_idx, t, k);
+    let Some(t) = t_val.get_table() else {
+        get_slow_body!(ctx, thread, registers, ip, handlers, ds, t_val, k, dst);
+    };
+    let v = get_own_fill_ic(ctx, closure, ic_idx, t, k);
+    if !v.is_nil() {
+        *reg!(ref mut dst) = v;
+        dispatch!();
     }
-    get_slow_body!(ctx, thread, registers, ip, handlers, ds, t_val, k, dst);
+    index_chain_body!(ctx, thread, registers, ip, handlers, ds, t_val, k, dst);
 }
 
 /// UpValue[idx][K[key]] = R[src]
@@ -942,8 +1015,10 @@ extern "rust-preserve-none" fn settabup_slow<'gc>(
     let t_val = read_upvalue(thread, uv);
     let k = constant!(key);
     let v = reg!(src);
-    if let Some(t) = t_val.get_table() {
-        fill_ic_for_constant_key(ctx, closure, ic_idx, t, k);
+    if let Some(t) = t_val.get_table()
+        && set_own_fill_ic(ctx, closure, ic_idx, t, k, v)
+    {
+        dispatch!();
     }
     set_slow_body!(ctx, thread, registers, ip, handlers, ds, t_val, k, v);
 }
@@ -1122,10 +1197,15 @@ extern "rust-preserve-none" fn getfield_slow<'gc>(
     let (dst, table, ic_idx, key_idx) = instruction.abde();
     let recv = reg!(table);
     let k = constant!(key_idx);
-    if let Some(t) = recv.get_table() {
-        fill_ic_for_constant_key(ctx, closure, ic_idx, t, k);
+    let Some(t) = recv.get_table() else {
+        get_slow_body!(ctx, thread, registers, ip, handlers, ds, recv, k, dst);
+    };
+    let v = get_own_fill_ic(ctx, closure, ic_idx, t, k);
+    if !v.is_nil() {
+        *reg!(ref mut dst) = v;
+        dispatch!();
     }
-    get_slow_body!(ctx, thread, registers, ip, handlers, ds, recv, k, dst);
+    index_chain_body!(ctx, thread, registers, ip, handlers, ds, recv, k, dst);
 }
 
 /// R[table][K[key_idx]] = R[src]
@@ -1186,8 +1266,10 @@ extern "rust-preserve-none" fn setfield_slow<'gc>(
     let recv = reg!(table);
     let k = constant!(key_idx);
     let v = reg!(src);
-    if let Some(t) = recv.get_table() {
-        fill_ic_for_constant_key(ctx, closure, ic_idx, t, k);
+    if let Some(t) = recv.get_table()
+        && set_own_fill_ic(ctx, closure, ic_idx, t, k, v)
+    {
+        dispatch!();
     }
     set_slow_body!(ctx, thread, registers, ip, handlers, ds, recv, k, v);
 }

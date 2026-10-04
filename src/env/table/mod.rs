@@ -418,29 +418,42 @@ impl<'gc> TableState<'gc> {
             return;
         }
 
-        if let Some(slot) = self.shape.find_slot(key) {
-            // Deletion keeps the slot (nil-valued) so the shape stays stable
-            // and `next` can resume from the deleted key.
-            self.properties[slot as usize] = value;
-        } else {
-            // Deleting an absent key is a no-op; a slot for it would burn a
-            // shape transition, and at the cap the dict migration would drop
-            // the nil-valued entries a `pairs` loop still resumes from.
-            if value.is_nil() {
-                return;
+        match self.shape.find_slot(key) {
+            Some(slot) => {
+                // Deletion keeps the slot (nil-valued) so the shape stays stable
+                // and `next` can resume from the deleted key.
+                self.properties[slot as usize] = value;
+                self.maybe_update_mt_bit(Value::string(key), value);
             }
-            // New slot. Cap shape growth to bound the transition tree;
-            // beyond MAX_PROPERTIES_FAST, fall back to dict mode.
-            if self.shape.slot_count() >= MAX_PROPERTIES_FAST {
-                self.migrate_to_dict(ctx);
-                self.set_string_key_dict(key, value);
-                return;
-            }
-            let new_shape = shape::transition_add_prop(ctx.mutation(), self.shape, key);
-            debug_assert_eq!(new_shape.slot_count() as usize, self.properties.len() + 1);
-            self.shape = new_shape;
-            self.properties.push(value);
+            None => self.add_string_key(ctx, key, value),
         }
+    }
+
+    /// Store `key`, which this fast-mode table's shape lacks.
+    pub(crate) fn add_string_key(
+        &mut self,
+        ctx: Context<'gc>,
+        key: LuaString<'gc>,
+        value: Value<'gc>,
+    ) {
+        debug_assert!(self.dict.is_none() && self.shape.find_slot(key).is_none());
+        // Deleting an absent key is a no-op; a slot for it would burn a
+        // shape transition, and at the cap the dict migration would drop
+        // the nil-valued entries a `pairs` loop still resumes from.
+        if value.is_nil() {
+            return;
+        }
+        // Cap shape growth to bound the transition tree; beyond
+        // MAX_PROPERTIES_FAST, fall back to dict mode.
+        if self.shape.slot_count() >= MAX_PROPERTIES_FAST {
+            self.migrate_to_dict(ctx);
+            self.set_string_key_dict(key, value);
+            return;
+        }
+        let new_shape = shape::transition_add_prop(ctx.mutation(), self.shape, key);
+        debug_assert_eq!(new_shape.slot_count() as usize, self.properties.len() + 1);
+        self.shape = new_shape;
+        self.properties.push(value);
         self.maybe_update_mt_bit(Value::string(key), value);
     }
 
