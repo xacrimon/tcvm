@@ -581,7 +581,7 @@ macro_rules! set_slow_body {
 
 /// Read the IC entry for the current call site. The handler must have
 /// validated `ic_idx` came from a `GETFIELD`/`SETFIELD`/`GETTABUP`/
-/// `SETTABUP` instruction whose prototype was assembled with a matching
+/// `SETTABUP`/`SELF` instruction whose prototype was assembled with a matching
 /// `ic_table` length.
 #[inline(always)]
 fn read_ic<'gc>(closure: LuaFn<'gc>, ic_idx: u16) -> InlineCache<'gc> {
@@ -600,6 +600,9 @@ fn fill_ic<'gc>(ctx: Context<'gc>, closure: LuaFn<'gc>, ic_idx: u16, entry: Inli
     debug_assert!(match entry {
         InlineCache::Own { shape, .. } | InlineCache::Absent { shape } => !shape.is_dict(),
         InlineCache::Transition { from, to } => !from.is_dict() && !to.is_dict(),
+        InlineCache::ProtoLoad {
+            recv, holder_shape, ..
+        } => !recv.is_dict() && !holder_shape.is_dict(),
         InlineCache::Empty => true,
     });
     let proto_gc = closure.proto;
@@ -639,6 +642,27 @@ fn ic_get<'gc>(cache: InlineCache<'gc>, state: &TableState<'gc>) -> Option<Value
         && Shape::ptr_eq(live, shape)
     {
         Value::nil()
+    } else if let InlineCache::ProtoLoad {
+        recv,
+        holder,
+        holder_shape,
+        slot,
+        index_epoch,
+    } = cache
+        && Shape::ptr_eq(live, recv)
+    {
+        // `recv` was filled with a metatable whose `__index` was `holder`.
+        let mt = unsafe { live.mt_cache().unwrap_unchecked() };
+        if mt.index_epoch() != index_epoch {
+            return None;
+        }
+        let h = holder.inner().borrow();
+        if !Shape::ptr_eq(h.shape(), holder_shape) {
+            return None;
+        }
+        // A nil slot means the walk goes on past `holder`.
+        let v = unsafe { h.property_at(slot as u32) };
+        return (!v.is_nil()).then_some(v);
     } else {
         return None;
     };
@@ -694,35 +718,100 @@ fn ic_set<'gc>(
     false
 }
 
-/// GETFIELD/SETFIELD/GETTABUP/SETTABUP only carry constant string keys.
+/// GETFIELD/SETFIELD/GETTABUP/SETTABUP/SELF only carry constant string keys.
 #[inline(always)]
 fn constant_key<'gc>(k: Value<'gc>) -> LuaString<'gc> {
     debug_assert!(k.get_string().is_some(), "IC site with a non-string key");
     unsafe { k.get_string().unwrap_unchecked() }
 }
 
-/// `t[k]` without `__index` for a constant-key IC miss; the one slot lookup
-/// both answers and refills the entry.
+/// `t[k]` for a constant-key IC miss, resolved as far as an entry can cache
+/// it: an own slot, or a slot in the table `t`'s metatable names as
+/// `__index`. Returns the value, or the receiver to continue the `__index`
+/// walk from, its own raw lookup having missed.
 #[inline(always)]
-fn get_own_fill_ic<'gc>(
+fn get_fill_ic<'gc>(
     ctx: Context<'gc>,
     closure: LuaFn<'gc>,
     ic_idx: u16,
     t: Table<'gc>,
     k: Value<'gc>,
-) -> Value<'gc> {
+) -> Result<Value<'gc>, Value<'gc>> {
     let state = t.inner().borrow();
     let shape = state.shape();
     if shape.is_dict() {
-        return state.raw_get(k);
+        let v = state.raw_get(k);
+        return if v.is_nil() && shape.has_mm(MetamethodBits::INDEX) {
+            Err(Value::table(t))
+        } else {
+            Ok(v)
+        };
     }
     let slot = shape.find_slot(constant_key(k));
     fill_ic(ctx, closure, ic_idx, shape_entry(shape, slot));
-    slot.map_or(Value::nil(), |s| unsafe { state.property_at(s) })
+    let v = slot.map_or(Value::nil(), |s| unsafe { state.property_at(s) });
+    if !v.is_nil() || !shape.has_mm(MetamethodBits::INDEX) {
+        return Ok(v);
+    }
+    // INDEX bit implies a metatable.
+    let mt = unsafe { state.metatable().unwrap_unchecked() };
+    drop(state);
+    let recv = slot.is_none().then_some(shape);
+    get_index_fill_ic(ctx, closure, ic_idx, t, mt, recv, k)
 }
 
-/// `t[k] = v` for a constant-key IC miss, with the same single lookup as
-/// [`get_own_fill_ic`]. Returns false, having stored nothing, when
+/// The `__index` half of [`get_fill_ic`], out of line to keep the own-key
+/// miss lean: `t`'s raw lookup missed and its metatable `mt` has `__index`.
+/// `recv` is `t`'s shape when that shape lacks the key, which a hit in an
+/// `__index` table can then be cached against.
+#[inline(never)]
+fn get_index_fill_ic<'gc>(
+    ctx: Context<'gc>,
+    closure: LuaFn<'gc>,
+    ic_idx: u16,
+    t: Table<'gc>,
+    mt: Table<'gc>,
+    recv: Option<Shape<'gc>>,
+    k: Value<'gc>,
+) -> Result<Value<'gc>, Value<'gc>> {
+    let index = mt.raw_get(Value::string(ctx.symbols().mm_index));
+    let Some(holder) = index.get_table() else {
+        // A function is called with `t`; anything else is indexed in turn.
+        return Err(if index.get_function().is_some() {
+            Value::table(t)
+        } else {
+            index
+        });
+    };
+    let h = holder.inner().borrow();
+    let holder_shape = h.shape();
+    if holder_shape.is_dict() {
+        let v = h.raw_get(k);
+        return if v.is_nil() { Err(index) } else { Ok(v) };
+    }
+    let Some(holder_slot) = holder_shape.find_slot(constant_key(k)) else {
+        return Err(index);
+    };
+    let v = unsafe { h.property_at(holder_slot) };
+    if v.is_nil() {
+        return Err(index);
+    }
+    if let Some(recv) = recv {
+        let index_epoch = unsafe { recv.mt_cache().unwrap_unchecked() }.index_epoch();
+        let entry = InlineCache::ProtoLoad {
+            recv,
+            holder,
+            holder_shape,
+            slot: holder_slot as u16,
+            index_epoch,
+        };
+        fill_ic(ctx, closure, ic_idx, entry);
+    }
+    Ok(v)
+}
+
+/// `t[k] = v` for a constant-key IC miss, with one slot lookup that both
+/// stores and refills the entry. Returns false, having stored nothing, when
 /// `__newindex` may fire.
 #[inline(always)]
 fn set_own_fill_ic<'gc>(
@@ -1010,12 +1099,13 @@ extern "rust-preserve-none" fn gettabup_slow<'gc>(
     let Some(t) = t_val.get_table() else {
         get_slow_body!(ctx, thread, registers, ip, handlers, ds, t_val, k, dst);
     };
-    let v = get_own_fill_ic(ctx, closure, ic_idx, t, k);
-    if !v.is_nil() {
-        *reg!(ref mut dst) = v;
-        dispatch!();
+    match get_fill_ic(ctx, closure, ic_idx, t, k) {
+        Ok(v) => {
+            *reg!(ref mut dst) = v;
+            dispatch!();
+        }
+        Err(from) => index_chain_body!(ctx, thread, registers, ip, handlers, ds, from, k, dst),
     }
-    index_chain_body!(ctx, thread, registers, ip, handlers, ds, t_val, k, dst);
 }
 
 /// UpValue[idx][K[key]] = R[src]
@@ -1245,12 +1335,13 @@ extern "rust-preserve-none" fn getfield_slow<'gc>(
     let Some(t) = recv.get_table() else {
         get_slow_body!(ctx, thread, registers, ip, handlers, ds, recv, k, dst);
     };
-    let v = get_own_fill_ic(ctx, closure, ic_idx, t, k);
-    if !v.is_nil() {
-        *reg!(ref mut dst) = v;
-        dispatch!();
+    match get_fill_ic(ctx, closure, ic_idx, t, k) {
+        Ok(v) => {
+            *reg!(ref mut dst) = v;
+            dispatch!();
+        }
+        Err(from) => index_chain_body!(ctx, thread, registers, ip, handlers, ds, from, k, dst),
     }
-    index_chain_body!(ctx, thread, registers, ip, handlers, ds, recv, k, dst);
 }
 
 /// R[table][K[key_idx]] = R[src]
@@ -1317,8 +1408,7 @@ extern "rust-preserve-none" fn setfield_slow<'gc>(
 // ---------------------------------------------------------------------------
 
 /// Backs `obj:m(...)`. Writes the method into `R[dst]` and the
-/// receiver into `R[dst+1]`. No inline cache for now — see the
-/// instruction definition.
+/// receiver into `R[dst+1]`.
 #[inline(never)]
 #[rustc_align(32)]
 extern "rust-preserve-none" fn op_self<'gc>(
@@ -1333,28 +1423,22 @@ extern "rust-preserve-none" fn op_self<'gc>(
     closure: LuaFn<'gc>,
 ) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-    let (dst, object, key_idx) = instruction.abd();
+    let (dst, object, ic_idx, _key_idx) = instruction.abde();
 
     let recv_val = reg!(object);
     let Some(recv) = recv_val.get_table() else {
         tail!(op_self_slow);
     };
 
-    let key = constant!(key_idx);
-    let (method, need_index) = {
-        let recv_state = recv.inner().borrow();
-        let v = recv_state.raw_get(key);
-        let need = v.is_nil() && recv_state.shape().has_mm(MetamethodBits::INDEX);
-        (v, need)
-    };
-
-    if need_index {
-        tail!(op_self_slow);
+    let recv_state = recv.inner().borrow();
+    if let Some(method) = ic_get(read_ic(closure, ic_idx), &recv_state) {
+        drop(recv_state);
+        *reg!(ref mut dst) = method;
+        *reg!(ref mut (dst + 1)) = recv_val;
+        dispatch!();
     }
-
-    *reg!(ref mut dst) = method;
-    *reg!(ref mut (dst + 1)) = recv_val;
-    dispatch!();
+    drop(recv_state);
+    tail!(op_self_slow);
 }
 
 #[inline(never)]
@@ -1371,13 +1455,23 @@ extern "rust-preserve-none" fn op_self_slow<'gc>(
     closure: LuaFn<'gc>,
 ) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-    let (dst, object, key_idx) = instruction.abd();
+    let (dst, object, ic_idx, key_idx) = instruction.abde();
 
     let recv_val = reg!(object);
     let key = constant!(key_idx);
 
-    // A table receiver gets here only after `op_self`'s raw miss.
-    match walk_index_chain(ctx, recv_val, key) {
+    let from = match recv_val.get_table() {
+        Some(recv) => match get_fill_ic(ctx, closure, ic_idx, recv, key) {
+            Ok(method) => {
+                *reg!(ref mut dst) = method;
+                *reg!(ref mut (dst + 1)) = recv_val;
+                dispatch!();
+            }
+            Err(from) => from,
+        },
+        None => recv_val,
+    };
+    match walk_index_chain(ctx, from, key) {
         IndexChain::Resolved(method) => {
             *reg!(ref mut dst) = method;
             *reg!(ref mut (dst + 1)) = recv_val;

@@ -1355,9 +1355,9 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         self.alloc_constant(Value::string(lua_str))
     }
 
-    /// Allocate a string constant for use as a field/global key, and
+    /// Allocate a string constant for use as a field/global/method key, and
     /// reserve a fresh `ic_idx` for the GETFIELD/SETFIELD/GETTABUP/
-    /// SETTABUP instruction emitted right after.
+    /// SETTABUP/SELF instruction emitted right after.
     fn alloc_field_key(&mut self, s: &[u8]) -> Result<(u16, u16), CompileError> {
         let lua_str = LuaString::new(self.ctx, s);
         let idx = self.alloc_constant(Value::string(lua_str))?;
@@ -3857,7 +3857,7 @@ fn emit_method_call_setup(
     let object = compile_expr_to_reg(ctx, object_expr, None)?;
     ctx.set_line(method_ident.syntax());
 
-    let key_idx = ctx.alloc_string_constant(method_name.as_bytes())?;
+    let (key_idx, ic_idx) = ctx.alloc_field_key(method_name.as_bytes())?;
 
     // A receiver temp at the top of the stack is dead once SELF has read it,
     // so reuse its slot as `func` (luac's `luaK_self`). Leaving it below the
@@ -3867,7 +3867,12 @@ fn emit_method_call_setup(
     } else {
         ctx.alloc_register()?
     };
-    ctx.emit(Instruction::self_(func, object, KIdx(key_idx)));
+    ctx.emit(Instruction::self_(
+        func,
+        object,
+        IcIdx(ic_idx),
+        KIdx(key_idx),
+    ));
 
     // SELF writes both `func` and `func+1` (self); reserve the second
     // slot so subsequent arg compilation lands at func+2 and freereg /

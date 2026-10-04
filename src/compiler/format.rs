@@ -139,7 +139,7 @@ fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -> String {
             )
         }
         Op::SELF => {
-            let (dst, object, key_idx) = instr.abd();
+            let (dst, object, _, key_idx) = instr.abde();
             format!(
                 "SELF            R{dst} R{object} K{key_idx}{}",
                 const_comment(constants, key_idx)

@@ -4,6 +4,7 @@ use crate::dmm::{Collect, Gc, Lock, Mutation, RefLock, Trace};
 use crate::env::error::Error;
 use crate::env::shape::Shape;
 use crate::env::string::LuaString;
+use crate::env::table::Table;
 use crate::env::thread::ThreadState;
 use crate::env::value::Value;
 use crate::instruction::UpValueDescriptor;
@@ -53,13 +54,12 @@ pub struct Prototype<'gc> {
     /// Parallel to `upvalue_desc`.
     pub upvalue_names: Box<[LuaString<'gc>]>,
     /// Inline-cache table indexed by `ic_idx` embedded in
-    /// GETTABUP/SETTABUP/GETFIELD/SETFIELD instructions. One entry
+    /// GETTABUP/SETTABUP/GETFIELD/SETFIELD/SELF instructions. One entry
     /// per cache site (call site, not instruction count). The slice
     /// lives inline in the prototype (no separate `Gc` allocation,
     /// no `RefLock`); per-slot `Lock<InlineCache>` exposes
     /// counter-free reads via `get()` and barrier-aware writes via
-    /// the parent `Prototype`'s `Gc`. See `src/env/shape/mod.rs` for
-    /// the IC payload.
+    /// the parent `Prototype`'s `Gc`. Entries are [`InlineCache`].
     pub ic_table: Box<[Lock<InlineCache<'gc>>]>,
 }
 
@@ -69,15 +69,12 @@ impl<'gc> Prototype<'gc> {
     }
 }
 
-/// Per-call-site monomorphic inline cache. `Empty` initially; a slow
-/// path fills it on first miss with the observed shape and slot. Future
-/// hits skip the metatable lookup entirely.
+/// Per-call-site inline cache for one constant string key, keyed on the
+/// receiver's shape. `Empty` until a slow path fills it.
 ///
-/// Metatable-mutation tracking is handled by `Shape::has_mm`, which
-/// reads the live `MtCache` bitset on the metatable. Bits are updated
-/// in place by every metamethod-named write to the metatable, so a
-/// `Shape` pointer cached here remains a valid identity even as the
-/// metatable's metamethod set evolves.
+/// Metamethods are read live through `Shape::has_mm`, so a cached shape
+/// stays a valid identity as its metatable's metamethods change; only
+/// `ProtoLoad`, which caches what `__index` names, also needs `index_epoch`.
 // A power-of-two size keeps indexing `ic_table` to a shift.
 #[derive(Clone, Copy, Collect, Default)]
 #[collect(internal, no_drop)]
@@ -95,9 +92,26 @@ pub enum InlineCache<'gc> {
     /// Tables of `from` lack the key; adding it moves them to `to`, which
     /// holds it in the slot after `from`'s last.
     Transition { from: Shape<'gc>, to: Shape<'gc> },
+    /// Tables of `recv` lack the key and their metatable's `__index` is
+    /// `holder`, which holds it at `slot` while its shape is `holder_shape`.
+    /// `index_epoch` is the metatable's at fill time; any `__index` write
+    /// bumps it.
+    ProtoLoad {
+        recv: Shape<'gc>,
+        holder: Table<'gc>,
+        holder_shape: Shape<'gc>,
+        // u16 so the entry stays 32 bytes; `MAX_PROPERTIES_FAST` fits.
+        #[collect(require_static)]
+        slot: u16,
+        #[collect(require_static)]
+        index_epoch: u32,
+    },
     #[default]
     Empty,
 }
+
+const _: () = assert!(size_of::<InlineCache<'static>>() == 32);
+const _: () = assert!(crate::env::shape::MAX_PROPERTIES_FAST <= u16::MAX as u32);
 
 /// An upvalue — open (references a stack slot) or closed (owns the value).
 #[derive(Collect)]
