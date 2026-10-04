@@ -303,3 +303,28 @@ fn reading_closed_file_raises() {
     );
     let _ = std::fs::remove_file(&p);
 }
+
+#[test]
+fn closed_file_messages() {
+    // #252: liolib's distinct messages for a finished lines iterator and a
+    // closed default input/output.
+    let p = tmp_path("closed_msgs");
+    assert_runs(&format!(
+        "local w = io.open({p:?}, \"w\"); w:write(\"a\\n\"); w:close()\n\
+         local function err(f, ...) return select(2, pcall(f, ...)) end\n\
+         local it = io.lines({p:?}); for _ in it do end\n\
+         local done = err(it)\n\
+         io.input({p:?}); io.close(io.input())\n\
+         local inp, lines = err(io.read), err(io.lines)\n\
+         io.input(io.stdin)\n\
+         io.output({p:?}); io.close(io.output())\n\
+         local out, flush = err(io.write, \"x\"), err(io.flush)\n\
+         io.output(io.stdout)\n\
+         assert(done == \"file is already closed\", done)\n\
+         assert(inp == \"default input file is closed\", inp)\n\
+         assert(lines == \"attempt to use a closed file\", lines)\n\
+         assert(out == \"default output file is closed\", out)\n\
+         assert(flush == \"default output file is closed\", flush)"
+    ));
+    let _ = std::fs::remove_file(&p);
+}
