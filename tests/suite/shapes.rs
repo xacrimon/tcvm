@@ -42,3 +42,21 @@ keep.r = 3
         "u=7,x=1,y=2,z=3 w=4,x=1,y=2 v=5,x=1,y=2 v=6,x=1,y=2,z=3 p=1,q=2,r=3 nil"
     );
 }
+
+/// A metatable whose tables are all dead is freed: the set-metatable edge on
+/// their shape doesn't keep it, or the dead shape it led to, alive.
+#[test]
+fn dead_metatables_are_freed() {
+    const N: usize = 2000;
+    let live = |n: usize| {
+        let mut lua = Lua::new();
+        lua.load_all();
+        run_chunks(
+            &mut lua,
+            &format!("for i = 1, {n} do setmetatable({{}}, {{}}) end\n--gc\n"),
+        );
+        lua.live_bytes()
+    };
+    let (none, many) = (live(0), live(N));
+    assert!(many < none + 64 * N, "none={none} many={many}");
+}
