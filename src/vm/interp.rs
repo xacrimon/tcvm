@@ -1204,6 +1204,39 @@ extern "rust-preserve-none" fn op_gettable<'gc>(
         tail!(gettable_slow);
     };
 
+    // An integer key inside the array part, handled without calls so this
+    // handler needs no stack frame; any other key goes to `gettable_general`.
+    if let Some(i) = reg!(key).get_small() {
+        let t_state = t.inner().borrow();
+        if let Some(v) = t_state.array_get(i as usize)
+            && !(v.is_nil() && t_state.shape().has_mm(MetamethodBits::INDEX))
+        {
+            *reg!(ref mut dst) = v;
+            dispatch!();
+        }
+    }
+    tail!(gettable_general);
+}
+
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn gettable_general<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let (dst, table, key) = instruction.abc();
+    let Some(t) = reg!(table).get_table() else {
+        tail!(gettable_slow);
+    };
+
     let k = reg!(key);
     let (v, need_index) = {
         let t_state = t.inner().borrow();
@@ -1257,6 +1290,43 @@ extern "rust-preserve-none" fn op_settable<'gc>(
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (src, table, key) = instruction.abc();
 
+    let Some(t) = reg!(table).get_table() else {
+        tail!(settable_slow);
+    };
+
+    // As in `op_gettable`; barrier work also goes to `settable_general`.
+    if let Some(i) = reg!(key).get_small() {
+        let t_state = t.inner().borrow();
+        if let Some(old) = t_state.array_get(i as usize)
+            && !(old.is_nil() && t_state.shape().has_mm(MetamethodBits::NEWINDEX))
+        {
+            drop(t_state);
+            if let Some(w) = Gc::write_if_clean(ctx.mutation(), t.inner()) {
+                let v = reg!(src);
+                // In range: checked above, and nothing ran in between.
+                unsafe { w.unlock().borrow_mut().set_array_at(i as usize, v) };
+                dispatch!();
+            }
+        }
+    }
+    tail!(settable_general);
+}
+
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn settable_general<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let (src, table, key) = instruction.abc();
     let Some(t) = reg!(table).get_table() else {
         tail!(settable_slow);
     };

@@ -388,6 +388,22 @@ impl<'gc> TableState<'gc> {
         unsafe { *self.properties.get_unchecked_mut(slot as usize) = v }
     }
 
+    /// The array-part slot for key `i`, if the array part covers it.
+    #[inline(always)]
+    pub fn array_get(&self, i: usize) -> Option<Value<'gc>> {
+        self.array.get(i).copied()
+    }
+
+    /// Store to an array-part slot.
+    ///
+    /// # Safety
+    ///
+    /// `i` must be inside the array part (see [`Self::array_get`]).
+    #[inline(always)]
+    pub unsafe fn set_array_at(&mut self, i: usize, v: Value<'gc>) {
+        unsafe { *self.array.get_unchecked_mut(i) = v }
+    }
+
     #[inline]
     pub fn raw_get(&self, key: Value<'gc>) -> Value<'gc> {
         if let Some(s) = key.get_string() {
