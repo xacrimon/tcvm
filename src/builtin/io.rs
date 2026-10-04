@@ -885,7 +885,7 @@ fn lua_lines<'gc>(
     };
     // Validate formats up front (Lua reports lines-format errors eagerly).
     parse_formats(ctx, fmt_args, "lines", 2)?;
-    let iter = Value::function(make_lines_iter(ctx, handle, close_eof, fmt_args));
+    let iter = Value::function(make_lines_iter(ctx, handle, close_eof, fmt_args)?);
     if close_eof {
         stack.replace(&[iter, Value::nil(), Value::nil(), handle]);
     } else {
@@ -987,7 +987,7 @@ fn lua_file_lines<'gc>(
     check_file(ctx, closure, self_val, "lines", 1)?;
     let fmt_args = &stack.as_slice()[1..];
     parse_formats(ctx, fmt_args, "lines", 2)?;
-    let iter = make_lines_iter(ctx, self_val, false, fmt_args);
+    let iter = make_lines_iter(ctx, self_val, false, fmt_args)?;
     stack.ret1(Value::function(iter));
     Ok(CallbackAction::Return)
 }
@@ -1172,6 +1172,9 @@ fn close_handle<'gc>(
     Ok(CallbackAction::Return)
 }
 
+/// liolib's cap on the formats a lines iterator keeps.
+const MAXARGLINE: usize = 250;
+
 /// Build the iterator closure for `io.lines`/`file:lines`. Upvalues:
 /// `[handle, close_at_eof: bool, format-values...]`.
 fn make_lines_iter<'gc>(
@@ -1179,12 +1182,21 @@ fn make_lines_iter<'gc>(
     handle: Value<'gc>,
     close_eof: bool,
     fmt_args: &[Value<'gc>],
-) -> Function<'gc> {
+) -> Result<Function<'gc>, Error<'gc>> {
+    // Lua blames the argument past the cap whichever form was called.
+    if fmt_args.len() > MAXARGLINE {
+        return Err(util::arg_error(
+            ctx,
+            "lines",
+            MAXARGLINE + 2,
+            "too many arguments",
+        ));
+    }
     let mut upv: Vec<Value<'gc>> = Vec::with_capacity(2 + fmt_args.len());
     upv.push(handle);
     upv.push(Value::boolean(close_eof));
     upv.extend_from_slice(fmt_args);
-    Function::new_native(ctx.mutation(), lines_iter, &upv)
+    Ok(Function::new_native(ctx.mutation(), lines_iter, &upv))
 }
 
 /// The per-iteration body of a lines iterator. Reads one record; at EOF it
