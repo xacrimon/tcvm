@@ -2,7 +2,7 @@ use crate::dmm::{Gc, Mutation, RefLock};
 use crate::env::function::{
     Function, FunctionKind, InlineCache, LuaFn, NativeClosure, Stack, Upvalue, UpvalueState,
 };
-use crate::env::shape::{MetamethodBits, Shape};
+use crate::env::shape::{MAX_PROPERTIES_FAST, MetamethodBits, Shape};
 use crate::env::string::LuaString;
 use crate::env::table::{Table, TableState};
 use crate::env::thread::{
@@ -548,14 +548,14 @@ macro_rules! index_chain_body {
 /// Inflates the slow-path body for `recv[k] = v` on any receiver.
 macro_rules! set_slow_body {
     ($ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr, $ds:ident,
-     $recv:expr, $k:expr, $v:expr) => {{
+     $recv:expr, $k:expr, $v:expr, $raw_set:ident) => {{
         let __k: Value<'gc> = $k;
         let __new_val: Value<'gc> = $v;
 
         match walk_newindex_chain($ctx, $recv, __k) {
             NewIndexChain::RawSet(__target) => {
                 check_index_key!(__k);
-                __target.raw_set($ctx, __k, __new_val);
+                __target.$raw_set($ctx, __k, __new_val);
                 dispatch!();
             }
             NewIndexChain::Invoke {
@@ -851,7 +851,7 @@ fn set_own_fill_ic<'gc>(
             InlineCache::Own { shape, slot }
         }
         None => {
-            state.add_string_key(ctx, key, v);
+            state.add_string_key(ctx, key, v, MAX_PROPERTIES_FAST);
             let to = state.shape();
             // A nil store adds nothing; past the cap the table went dict.
             if Shape::ptr_eq(to, shape) || to.is_dict() {
@@ -1163,7 +1163,9 @@ extern "rust-preserve-none" fn settabup_slow<'gc>(
     {
         dispatch!();
     }
-    set_slow_body!(ctx, thread, registers, ip, handlers, ds, t_val, k, v);
+    set_slow_body!(
+        ctx, thread, registers, ip, handlers, ds, t_val, k, v, raw_set
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1262,7 +1264,7 @@ extern "rust-preserve-none" fn op_settable<'gc>(
 
     check_index_key!(k);
     let mut t_state = t.inner().borrow_mut(ctx.mutation());
-    t_state.raw_set(ctx, k, v);
+    t_state.raw_set_keyed(ctx, k, v);
     dispatch!()
 }
 
@@ -1282,7 +1284,18 @@ extern "rust-preserve-none" fn settable_slow<'gc>(
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (src, table, key) = instruction.abc();
     let (recv, k, v) = (reg!(table), reg!(key), reg!(src));
-    set_slow_body!(ctx, thread, registers, ip, handlers, ds, recv, k, v);
+    set_slow_body!(
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        recv,
+        k,
+        v,
+        raw_set_keyed
+    );
 }
 
 /// R[dst] = R[table][K[key_idx]]
@@ -1402,7 +1415,9 @@ extern "rust-preserve-none" fn setfield_slow<'gc>(
     {
         dispatch!();
     }
-    set_slow_body!(ctx, thread, registers, ip, handlers, ds, recv, k, v);
+    set_slow_body!(
+        ctx, thread, registers, ip, handlers, ds, recv, k, v, raw_set
+    );
 }
 
 // ---------------------------------------------------------------------------

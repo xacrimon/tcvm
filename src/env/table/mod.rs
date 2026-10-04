@@ -9,7 +9,7 @@ use crate::Context;
 use crate::dmm::{
     Collect, Finalization, Gc, Mutation, RefLock, Trace, allocator_api::MetricsAlloc,
 };
-use crate::env::shape::{self, MAX_PROPERTIES_FAST, Shape, WeakMode};
+use crate::env::shape::{self, MAX_KEYED_PROPERTIES, MAX_PROPERTIES_FAST, Shape, WeakMode};
 use crate::env::string::LuaString;
 use crate::env::value::{Value, ValueKind, value_hash};
 
@@ -37,6 +37,13 @@ impl<'gc> Table<'gc> {
 
     pub fn raw_set(self, ctx: Context<'gc>, key: Value<'gc>, value: Value<'gc>) {
         self.0.borrow_mut(ctx.mutation()).raw_set(ctx, key, value);
+    }
+
+    /// See [`TableState::raw_set_keyed`].
+    pub fn raw_set_keyed(self, ctx: Context<'gc>, key: Value<'gc>, value: Value<'gc>) {
+        self.0
+            .borrow_mut(ctx.mutation())
+            .raw_set_keyed(ctx, key, value);
     }
 
     pub fn raw_len(self) -> usize {
@@ -160,8 +167,8 @@ pub struct TableState<'gc> {
     /// Keys that are neither strings nor numbers with an integral value.
     misc_hash: hash_part::Part<'gc, Value<'gc>, MetricsAlloc<'gc>>,
     /// Set when this table has dropped to dictionary mode for its
-    /// string-keyed properties, triggered by exceeding
-    /// `MAX_PROPERTIES_FAST` slots. Deletion does not migrate: it must not
+    /// string-keyed properties, triggered by a key past `MAX_PROPERTIES_FAST`
+    /// or `MAX_KEYED_PROPERTIES`. Deletion does not migrate: it must not
     /// reorder keys, or a `pairs` loop that clears entries would skip some.
     dict: Option<DictState<'gc>>,
     /// Live metatable handle (for `getmetatable` and metamethod
@@ -397,8 +404,19 @@ impl<'gc> TableState<'gc> {
 
     #[inline]
     pub fn raw_set(&mut self, ctx: Context<'gc>, key: Value<'gc>, value: Value<'gc>) {
+        self.raw_set_capped(ctx, key, value, MAX_PROPERTIES_FAST);
+    }
+
+    /// [`raw_set`](Self::raw_set) for `t[k] = v` (see [`MAX_KEYED_PROPERTIES`]).
+    #[inline]
+    pub fn raw_set_keyed(&mut self, ctx: Context<'gc>, key: Value<'gc>, value: Value<'gc>) {
+        self.raw_set_capped(ctx, key, value, MAX_KEYED_PROPERTIES);
+    }
+
+    #[inline]
+    fn raw_set_capped(&mut self, ctx: Context<'gc>, key: Value<'gc>, value: Value<'gc>, cap: u32) {
         if let Some(s) = key.get_string() {
-            self.set_string_key(ctx, s, value);
+            self.set_string_key(ctx, s, value, cap);
             return;
         }
         if let Some(i) = int_key(key) {
@@ -412,7 +430,13 @@ impl<'gc> TableState<'gc> {
         self.misc_hash_set(key, value, value_hash(key));
     }
 
-    fn set_string_key(&mut self, ctx: Context<'gc>, key: LuaString<'gc>, value: Value<'gc>) {
+    fn set_string_key(
+        &mut self,
+        ctx: Context<'gc>,
+        key: LuaString<'gc>,
+        value: Value<'gc>,
+        cap: u32,
+    ) {
         if self.dict.is_some() {
             self.set_string_key_dict(key, value);
             return;
@@ -425,16 +449,18 @@ impl<'gc> TableState<'gc> {
                 self.properties[slot as usize] = value;
                 self.maybe_update_mt_bit(Value::string(key), value);
             }
-            None => self.add_string_key(ctx, key, value),
+            None => self.add_string_key(ctx, key, value, cap),
         }
     }
 
-    /// Store `key`, which this fast-mode table's shape lacks.
+    /// Store `key`, which this fast-mode table's shape lacks, moving to dict
+    /// mode if the shape has `cap` keys already.
     pub(crate) fn add_string_key(
         &mut self,
         ctx: Context<'gc>,
         key: LuaString<'gc>,
         value: Value<'gc>,
+        cap: u32,
     ) {
         debug_assert!(self.dict.is_none() && self.shape.find_slot(key).is_none());
         // Deleting an absent key is a no-op; a slot for it would burn a
@@ -443,9 +469,7 @@ impl<'gc> TableState<'gc> {
         if value.is_nil() {
             return;
         }
-        // Cap shape growth to bound the transition tree; beyond
-        // MAX_PROPERTIES_FAST, fall back to dict mode.
-        if self.shape.slot_count() >= MAX_PROPERTIES_FAST {
+        if self.shape.slot_count() >= cap {
             self.migrate_to_dict(ctx);
             self.set_string_key_dict(key, value);
             return;

@@ -1119,14 +1119,13 @@ mod tests {
     fn dict_mode_via_slot_cap() {
         // Adding more than MAX_PROPERTIES_FAST string keys forces
         // dict-mode migration. Subsequent reads still resolve.
-        // MAX_PROPERTIES_FAST is 64; we go past that.
         let mut prog = String::from("local t = {}\n");
-        for i in 0..70 {
+        for i in 0..crate::env::shape::MAX_PROPERTIES_FAST + 8 {
             prog.push_str(&format!("t.k{} = {}\n", i, i));
         }
-        prog.push_str("return t.k0 + t.k60 + t.k69");
+        prog.push_str("return t.k0 + t.k60 + t.k519");
         let n = run_returning_int(&prog);
-        assert_eq!(n, 60 + 69);
+        assert_eq!(n, 60 + 519);
     }
 
     #[test]
@@ -1282,11 +1281,11 @@ mod tests {
     #[test]
     fn metamethod_metatable_dict_mode() {
         // Force the *metatable* into dict mode by populating it past
-        // MAX_PROPERTIES_FAST = 64, then assign __index. The dict
-        // path's bit-update must still fire so reads through __index
-        // see the function.
+        // MAX_PROPERTIES_FAST, then assign __index. The dict path's
+        // bit-update must still fire so reads through __index see the
+        // function.
         let mut prog = String::from("local mt = {}\n");
-        for i in 0..70 {
+        for i in 0..crate::env::shape::MAX_PROPERTIES_FAST + 8 {
             prog.push_str(&format!("mt.k{} = {}\n", i, i));
         }
         prog.push_str("mt.__index = function() return 42 end\n");
