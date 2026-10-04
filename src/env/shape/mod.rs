@@ -50,12 +50,21 @@ pub struct MtCache<'gc>(Gc<'gc, MtCacheData<'gc>>);
 ///
 /// Untraced: a live shape's prefix is its `last_key` plus its parent's prefix,
 /// so the parent chain keeps it alive. A key past every live shape's prefix may
-/// be dead, so nothing reads it, and nothing appends after it either: only a
-/// shape whose prefix is the whole array may, and it keeps that key alive.
+/// be dead, so only its address is used, and nothing appends after it either:
+/// only a shape whose prefix is the whole array may, and it keeps that key alive.
 struct Keys<'gc> {
     slots: Box<[UnsafeCell<MaybeUninit<LuaString<'gc>>>], MetricsAlloc<'gc>>,
     len: Cell<u32>,
+    /// `(address, slot)` of the first `len` keys, built by the first lookup
+    /// past `LINEAR_LOOKUP` keys. A dead key's address may be reused, but not
+    /// within one array, since nothing appends once a key in it has died. So an
+    /// address matches at most one entry, and one past a shape's prefix is not
+    /// that shape's key.
+    index: UnsafeCell<Option<HashTable<(usize, u32), MetricsAlloc<'gc>>>>,
 }
+
+/// Longest prefix [`Shape::find_slot`] scans rather than hashes.
+const LINEAR_LOOKUP: u32 = 16;
 
 // SAFETY: deliberately untraced (see `Keys`); it holds no other pointer.
 unsafe impl<'gc> Collect<'gc> for Keys<'gc> {
@@ -72,8 +81,34 @@ impl<'gc> Keys<'gc> {
             Keys {
                 slots: slots.into_boxed_slice(),
                 len: Cell::new(prefix.len() as u32),
+                index: UnsafeCell::new(None),
             },
         )
+    }
+
+    /// `key`'s slot, if it is among the first `n`. Out of line: inlined into
+    /// the IC miss paths, it slowed them more than the call costs.
+    #[inline(never)]
+    fn find(&self, key: LuaString<'gc>, n: u32) -> Option<u32> {
+        // SAFETY: no reference into the index outlives a call.
+        let index = match unsafe { &*self.index.get() } {
+            Some(index) => index,
+            None => self.build_index(),
+        };
+        let a = addr(key);
+        let &(_, i) = index.find(addr_hash(a), |&(b, _)| b == a)?;
+        (i < n).then_some(i)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn build_index(&self) -> &HashTable<(usize, u32), MetricsAlloc<'gc>> {
+        let mut t = HashTable::with_capacity_in(self.slots.len(), *Box::allocator(&self.slots));
+        for (i, &k) in self.prefix(self.len.get()).iter().enumerate() {
+            t.insert_unique(addr_hash(addr(k)), (addr(k), i as u32), |e| addr_hash(e.0));
+        }
+        // SAFETY: as in `find`.
+        unsafe { (*self.index.get()).insert(t) }
     }
 
     fn prefix(&self, n: u32) -> &[LuaString<'gc>] {
@@ -92,8 +127,23 @@ impl<'gc> Keys<'gc> {
         // SAFETY: no prefix reaches slot `n` yet.
         unsafe { (*self.slots[n as usize].get()).write(key) };
         self.len.set(n + 1);
+        // SAFETY: as in `find`.
+        if let Some(index) = unsafe { &mut *self.index.get() } {
+            index.insert_unique(addr_hash(addr(key)), (addr(key), n), |e| addr_hash(e.0));
+        }
         true
     }
+}
+
+/// A key's address, all an untraced key may be used for.
+fn addr(key: LuaString<'_>) -> usize {
+    Gc::as_ptr(key.inner()) as usize
+}
+
+/// A hash of an object's address, which has no entropy in its low bits.
+fn addr_hash(addr: usize) -> u64 {
+    let h = (addr as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    h ^ (h >> 32)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Collect)]
@@ -189,7 +239,7 @@ impl<'gc> EdgeKey<'gc> {
 
     fn addr(self) -> usize {
         match self {
-            EdgeKey::Prop(k) => Gc::as_ptr(k.inner()) as usize,
+            EdgeKey::Prop(k) => addr(k),
             EdgeKey::Mt(c) => c.map_or(0, |c| Gc::as_ptr(c.inner()) as usize),
         }
     }
@@ -203,8 +253,7 @@ impl<'gc> EdgeKey<'gc> {
     }
 
     fn hash(self) -> u64 {
-        let h = (self.addr() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        h ^ (h >> 32)
+        addr_hash(self.addr())
     }
 }
 
@@ -551,10 +600,14 @@ impl<'gc> Shape<'gc> {
         Gc::as_ref(self.data().keys).prefix(self.data().slot_count)
     }
 
-    /// Look up a string key in this shape. Linear scan, bounded by
-    /// `MAX_PROPERTIES_FAST`. The IC fast path bypasses this entirely; only
-    /// slow paths reach here.
+    /// Look up a string key in this shape. The IC fast path bypasses this
+    /// entirely; only slow paths reach here.
+    #[inline]
     pub fn find_slot(self, key: LuaString<'gc>) -> Option<u32> {
+        let n = self.slot_count();
+        if n > LINEAR_LOOKUP {
+            return Gc::as_ref(self.data().keys).find(key, n);
+        }
         self.keys().iter().position(|&k| k == key).map(|i| i as u32)
     }
 
