@@ -1,43 +1,19 @@
 //! Weak tables (#52). Expected results are lua 5.5.1's, running the same
 //! chunks with `collectgarbage()` in place of the host's collections.
 
-use tcvm::env::LuaString;
-use tcvm::{Lua, RuntimeError};
+use tcvm::Lua;
 
-use crate::common::{start_on, yielding_lua};
+use crate::common::{run_chunks, yielding_lua};
 
 /// Defines the global `count(t)`, the number of entries `pairs` visits.
 const COUNT: &str =
     "function count(t) local n = 0 for _ in pairs(t) do n = n + 1 end return n end ";
 
-/// [`COUNT`], then each `--gc`-separated chunk of `src` run to completion with
-/// a full collection after it; returns the last one's string result.
-/// `yielder()` collects mid-chunk. Garbage is made in an earlier chunk than the
-/// check that it is gone, since a returned call's temporaries can outlive a
-/// `yielder()` (#229).
+/// [`COUNT`], then `src` as [`run_chunks`] runs it. Garbage is made in an
+/// earlier chunk than the check that it is gone, since a returned call's
+/// temporaries can outlive a `yielder()` (#229).
 fn run_in(lua: &mut Lua, src: &str) -> String {
-    let src = format!("{COUNT}{src}");
-    let mut result = String::new();
-    for chunk in src.split("\n--gc\n") {
-        let ex = start_on(lua, chunk);
-        let mut step = lua.finish(&ex);
-        while let Err(RuntimeError::MainYielded) = step {
-            lua.collect_all();
-            step = lua.resume(&ex, ());
-        }
-        step.expect("run");
-        result = lua
-            .try_enter(|ctx| {
-                let r = ctx.fetch(&ex).take_result::<Option<LuaString>>(ctx)?;
-                Ok::<_, RuntimeError>(r.map_or(String::new(), |s| {
-                    String::from_utf8_lossy(s.as_bytes()).into_owned()
-                }))
-            })
-            .expect("take result");
-        drop(ex);
-        lua.collect_all();
-    }
-    result
+    run_chunks(lua, &format!("{COUNT}{src}"))
 }
 
 fn run(src: &str) -> String {

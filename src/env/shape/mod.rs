@@ -16,6 +16,7 @@
 //! the same key sequence converge on the same shape pointer.
 
 use core::cell::{Cell, UnsafeCell};
+use core::mem::MaybeUninit;
 
 use bitflags::bitflags;
 use hashbrown::{HashTable, hash_table};
@@ -44,15 +45,55 @@ pub struct Shape<'gc>(Gc<'gc, ShapeData<'gc>>);
 #[collect(internal, no_drop)]
 pub struct MtCache<'gc>(Gc<'gc, MtCacheData<'gc>>);
 
-/// One descriptor entry: a string key and the slot it occupies in
-/// `TableState::properties`. Stored in `ShapeData::descriptors` in
-/// insertion order; slow-path lookups are linear, capped by
-/// `MAX_PROPERTIES_FAST = 64`.
-#[derive(Clone, Copy, Collect)]
-#[collect(internal, no_drop)]
-pub struct Descriptor<'gc> {
-    pub key: LuaString<'gc>,
-    pub slot: u32,
+/// String keys by slot, shared by the shapes along a chain of property
+/// transitions; each reads the prefix of its own `slot_count`.
+///
+/// Untraced: a live shape's prefix is its `last_key` plus its parent's prefix,
+/// so the parent chain keeps it alive. A key past every live shape's prefix may
+/// be dead, so nothing reads it, and nothing appends after it either: only a
+/// shape whose prefix is the whole array may, and it keeps that key alive.
+struct Keys<'gc> {
+    slots: Box<[UnsafeCell<MaybeUninit<LuaString<'gc>>>], MetricsAlloc<'gc>>,
+    len: Cell<u32>,
+}
+
+// SAFETY: deliberately untraced (see `Keys`); it holds no other pointer.
+unsafe impl<'gc> Collect<'gc> for Keys<'gc> {
+    const NEEDS_TRACE: bool = false;
+}
+
+impl<'gc> Keys<'gc> {
+    fn new(mc: &Mutation<'gc>, prefix: &[LuaString<'gc>], cap: usize) -> Gc<'gc, Self> {
+        let mut slots = Vec::with_capacity_in(cap, MetricsAlloc::new(mc));
+        slots.extend(prefix.iter().map(|&k| UnsafeCell::new(MaybeUninit::new(k))));
+        slots.resize_with(cap, || UnsafeCell::new(MaybeUninit::uninit()));
+        Gc::new(
+            mc,
+            Keys {
+                slots: slots.into_boxed_slice(),
+                len: Cell::new(prefix.len() as u32),
+            },
+        )
+    }
+
+    fn prefix(&self, n: u32) -> &[LuaString<'gc>] {
+        debug_assert!(n <= self.len.get());
+        // SAFETY: slots below `len` are initialized and never written again, and
+        // the cells are `repr(transparent)`.
+        unsafe { core::slice::from_raw_parts(self.slots.as_ptr().cast(), n as usize) }
+    }
+
+    /// Append `key` for a shape whose prefix is `n` long, if that is the
+    /// whole array and there is room.
+    fn try_push(&self, n: u32, key: LuaString<'gc>) -> bool {
+        if self.len.get() != n || n as usize == self.slots.len() {
+            return false;
+        }
+        // SAFETY: no prefix reaches slot `n` yet.
+        unsafe { (*self.slots[n as usize].get()).write(key) };
+        self.len.set(n + 1);
+        true
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Collect)]
@@ -188,7 +229,7 @@ pub struct ShapeData<'gc> {
     /// True if this shape represents a table that's gone slow
     /// (dictionary mode). Only one dictionary shape per `mt_cache` —
     /// see the per-`State` registry. Dictionary shapes have
-    /// `slot_count = 0` and an empty `descriptors`.
+    /// `slot_count = 0` and no keys.
     #[collect(require_static)]
     pub is_dict: bool,
 
@@ -197,11 +238,8 @@ pub struct ShapeData<'gc> {
     /// `Gc<ShapeData>` to emit the barrier.
     pub transitions: RefLock<TransitionTable<'gc>>,
 
-    /// Full ordered descriptor list (parent's prefix + this shape's
-    /// last_key, if any). Eager rather than lazy — keeps slow paths
-    /// branchless. Dense and slot-ordered: `descriptors[i].slot == i`,
-    /// which `TableState::next` uses to resume a traversal from a slot.
-    pub descriptors: Box<[Descriptor<'gc>]>,
+    /// This shape's keys are the first `slot_count`, key `i` in slot `i`.
+    keys: Gc<'gc, Keys<'gc>>,
 }
 
 bitflags! {
@@ -381,7 +419,7 @@ impl<'gc> Shape<'gc> {
                 mt_cache: None,
                 is_dict: false,
                 transitions: RefLock::new(TransitionTable::new(mc)),
-                descriptors: Box::from([]),
+                keys: Keys::new(mc, &[], 0),
             },
         ))
     }
@@ -398,7 +436,7 @@ impl<'gc> Shape<'gc> {
                 mt_cache,
                 is_dict: true,
                 transitions: RefLock::new(TransitionTable::new(mc)),
-                descriptors: Box::from([]),
+                keys: Keys::new(mc, &[], 0),
             },
         ))
     }
@@ -433,21 +471,17 @@ impl<'gc> Shape<'gc> {
         self.data().mt_cache
     }
 
+    /// String keys by slot.
     #[inline]
-    pub fn descriptors(self) -> &'gc [Descriptor<'gc>] {
-        &self.data().descriptors
+    pub fn keys(self) -> &'gc [LuaString<'gc>] {
+        Gc::as_ref(self.data().keys).prefix(self.data().slot_count)
     }
 
-    /// Look up a string key in this shape. Linear scan over descriptors,
-    /// bounded by `MAX_PROPERTIES_FAST`. The IC fast path bypasses this
-    /// entirely; only slow paths reach here.
+    /// Look up a string key in this shape. Linear scan, bounded by
+    /// `MAX_PROPERTIES_FAST`. The IC fast path bypasses this entirely; only
+    /// slow paths reach here.
     pub fn find_slot(self, key: LuaString<'gc>) -> Option<u32> {
-        for d in self.descriptors() {
-            if d.key == key {
-                return Some(d.slot);
-            }
-        }
-        None
+        self.keys().iter().position(|&k| k == key).map(|i| i as u32)
     }
 
     /// Returns `true` if the metatable behind this shape currently has
@@ -503,12 +537,15 @@ pub fn transition_add_prop<'gc>(
 
     // Slow path: allocate a child and install/replace the edge.
     let new_slot = parent.data().slot_count;
-    let mut new_descs: Vec<Descriptor<'gc>> = parent.descriptors().to_vec();
-    debug_assert_eq!(new_descs.len(), new_slot as usize);
-    new_descs.push(Descriptor {
-        key,
-        slot: new_slot,
-    });
+    let mut keys = parent.data().keys;
+    if !keys.try_push(new_slot, key) {
+        keys = Keys::new(
+            mc,
+            parent.keys(),
+            (new_slot as usize + 1).next_power_of_two().max(4),
+        );
+        keys.try_push(new_slot, key);
+    }
 
     let child_data = Gc::new(
         mc,
@@ -519,7 +556,7 @@ pub fn transition_add_prop<'gc>(
             mt_cache: parent.data().mt_cache,
             is_dict: false,
             transitions: RefLock::new(TransitionTable::new(mc)),
-            descriptors: new_descs.into_boxed_slice(),
+            keys,
         },
     );
     let child = Shape(child_data);
@@ -587,14 +624,8 @@ pub fn transition_set_metatable<'gc>(
         }
     }
 
-    // Slow path: produce a sibling shape with the same descriptors
-    // (and slot mapping) but the new `mt_cache`. We don't rebuild the
-    // parent chain via N transitions — descriptors carry slot identity
-    // directly, and `collect_keys_in_order` walking the new shape
-    // still works because we keep `parent` / `last_key` pointing into
-    // `parent`'s chain. Future prop additions on the result will mint
-    // their own edges normally.
-    let descriptors: Box<[Descriptor<'gc>]> = parent.descriptors().to_vec().into_boxed_slice();
+    // Slow path: a sibling with `parent`'s keys and the new `mt_cache`. Future
+    // prop additions on the result mint their own edges normally.
     let child_data = Gc::new(
         mc,
         ShapeData {
@@ -608,7 +639,7 @@ pub fn transition_set_metatable<'gc>(
             mt_cache: new_mt,
             is_dict: false,
             transitions: RefLock::new(TransitionTable::new(mc)),
-            descriptors,
+            keys: parent.data().keys,
         },
     );
     let child = Shape(child_data);
