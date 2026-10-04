@@ -378,6 +378,16 @@ impl<'gc> TableState<'gc> {
         unsafe { *self.properties.get_unchecked(slot as usize) }
     }
 
+    /// Write the slot directly; the store-side counterpart of [`Self::property_at`].
+    ///
+    /// # Safety
+    ///
+    /// `slot` must be in range for this table's shape.
+    #[inline]
+    pub unsafe fn set_property_at(&mut self, slot: u32, v: Value<'gc>) {
+        unsafe { *self.properties.get_unchecked_mut(slot as usize) = v }
+    }
+
     #[inline]
     pub fn raw_get(&self, key: Value<'gc>) -> Value<'gc> {
         if let Some(s) = key.get_string() {
