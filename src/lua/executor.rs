@@ -1115,6 +1115,20 @@ fn unwind_error<'gc>(
     let Some(ExecKind::Error(err)) = ts.pop_exec() else {
         unreachable!()
     };
+    if let Exit::Process(code) = err.exit_kind() {
+        // No `__close` runs, now or on a later `coroutine.close`. Upvalues are
+        // closed first so closures that outlive the reset keep their values.
+        drop(ts);
+        let mut inner = exec.0.borrow_mut(mc);
+        for t in &inner.thread_stack {
+            let mut ts = t.borrow_mut(mc);
+            vm::interp::close_upvalues(mc, &mut ts, 0);
+            ts.reset();
+            ts.status = ThreadStatus::Stopped;
+        }
+        inner.mode = ExecutorMode::Stopped;
+        return Err(RuntimeError::Exit(code));
+    }
     let exit = err.exit_kind() != Exit::No;
     if !err.is_handled() {
         // Only the nearest catch point's handler applies (`L->errfunc`):

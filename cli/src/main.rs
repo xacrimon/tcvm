@@ -8,7 +8,7 @@ use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Tabl
 use tcvm::vm::sequence::{
     BoxSequence, CallbackAction, Execution, Sequence, SequencePoll, seq_trace_pointers,
 };
-use tcvm::{Executor, LoadError, Lua, RuntimeError, format_prototype};
+use tcvm::{Executor, LoadError, Lua, RuntimeError, StashedExecutor, format_prototype};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -105,13 +105,22 @@ fn main() {
     });
     let err = match outcome {
         Ok(None) => return,
+        Err(RuntimeError::Exit(code)) => exit(lua, ex, code),
         Ok(Some(err)) | Err(RuntimeError::Lua(err)) => lua.enter(|ctx| {
             String::from_utf8_lossy(ctx.fetch(&err).message(ctx).as_bytes()).into_owned()
         }),
         Err(e) => e.to_string(),
     };
     eprintln!("tcvm: {err}");
-    std::process::exit(1);
+    exit(lua, ex, 1);
+}
+
+/// End the process once `lua` is dropped, which flushes and closes its files
+/// as C's `exit` does for every `FILE*`.
+fn exit(lua: Lua, ex: StashedExecutor, code: i32) -> ! {
+    drop(ex);
+    drop(lua);
+    std::process::exit(code);
 }
 
 /// `lua.c`'s `msghandler`, short of the traceback (#228): the error object

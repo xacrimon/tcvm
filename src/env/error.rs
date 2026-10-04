@@ -47,6 +47,9 @@ pub(crate) enum Exit {
     Clean,
     /// Ends the thread with the error's value.
     Failed,
+    /// Ends every thread and the executor (`os.exit`); see
+    /// [`Error::exit_process`].
+    Process(i32),
 }
 
 impl<'gc> Error<'gc> {
@@ -140,6 +143,15 @@ impl<'gc> Error<'gc> {
             Some(_) => Exit::Failed,
             None => Exit::Clean,
         });
+        exit
+    }
+
+    /// Stop the executor with `code` (`os.exit`), unwinding past every
+    /// catcher, message handler and `__close` to the host as
+    /// [`RuntimeError::Exit`](crate::RuntimeError::Exit).
+    pub(crate) fn exit_process(ctx: Context<'gc>, code: i32) -> Self {
+        let exit = Error::new(ctx, Value::nil());
+        exit.0.exit.set(Exit::Process(code));
         exit
     }
 
