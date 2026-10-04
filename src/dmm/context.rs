@@ -47,6 +47,13 @@ impl<'gc> Mutation<'gc> {
         )
     }
 
+    /// Whether [`Mutation::backward_barrier`] on `parent` with no child would do any work.
+    #[inline]
+    pub fn backward_barrier_pending(&self, parent: Gc<'gc, ()>) -> bool {
+        self.context
+            .backward_barrier_pending(unsafe { GcBox::erase(parent.ptr) })
+    }
+
     /// A version of [`Mutation::backward_barrier`] that allows adopting a [`GcWeak`] child.
     #[inline]
     pub fn backward_barrier_weak(&self, parent: Gc<'gc, ()>, child: GcWeak<'gc, ()>) {
@@ -482,6 +489,11 @@ impl Context {
             }
             barrier(self, parent);
         }
+    }
+
+    #[inline]
+    fn backward_barrier_pending(&self, parent: GcBox) -> bool {
+        self.phase == Phase::Mark && parent.header().color() == GcColor::Black
     }
 
     #[inline]
