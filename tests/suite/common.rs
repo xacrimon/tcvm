@@ -74,6 +74,33 @@ pub fn start_on(lua: &mut Lua, src: &str) -> StashedExecutor {
     .unwrap_or_else(|e| panic!("{src:?} failed to load: {e}"))
 }
 
+/// Each `--gc`-separated chunk of `src` run on `lua` to completion with a full
+/// collection after it; returns the last one's string result. `yielder()`
+/// collects mid-chunk.
+pub fn run_chunks(lua: &mut Lua, src: &str) -> String {
+    let mut result = String::new();
+    for chunk in src.split("\n--gc\n") {
+        let ex = start_on(lua, chunk);
+        let mut step = lua.finish(&ex);
+        while let Err(RuntimeError::MainYielded) = step {
+            lua.collect_all();
+            step = lua.resume(&ex, ());
+        }
+        step.expect("run");
+        result = lua
+            .try_enter(|ctx| {
+                let r = ctx.fetch(&ex).take_result::<Option<LuaString>>(ctx)?;
+                Ok::<_, RuntimeError>(r.map_or(String::new(), |s| {
+                    String::from_utf8_lossy(s.as_bytes()).into_owned()
+                }))
+            })
+            .expect("take result");
+        drop(ex);
+        lua.collect_all();
+    }
+    result
+}
+
 fn start(src: &str) -> (Lua, StashedExecutor) {
     let mut lua = Lua::new();
     lua.load_all();

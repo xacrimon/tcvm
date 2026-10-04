@@ -61,6 +61,7 @@ mod sequence_pending;
 mod sequence_resume;
 mod sequence_tail_resume;
 mod sequence_tailcall;
+mod shapes;
 mod stack_overflow;
 mod stmt_temp_reclaim;
 mod string_args;

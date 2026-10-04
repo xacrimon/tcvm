@@ -317,10 +317,10 @@ impl<'gc> TableState<'gc> {
                 c.mirror(key, Value::nil());
             }
         };
-        for (v, d) in self.properties.iter_mut().zip(self.shape.descriptors()) {
+        for (v, &key) in self.properties.iter_mut().zip(self.shape.keys()) {
             if v.is_dead(fc) {
                 *v = Value::nil();
-                cleared(d.key);
+                cleared(key);
             }
         }
         for v in self.array.iter_mut().filter(|v| v.is_dead(fc)) {
@@ -477,15 +477,14 @@ impl<'gc> TableState<'gc> {
             self.dict.is_none(),
             "migrate_to_dict called on already-dict table"
         );
-        let descs = self.shape.descriptors();
+        let keys = self.shape.keys();
         let mut table =
-            hash_part::Part::with_capacity_in(descs.len(), MetricsAlloc::new(ctx.mutation()));
-        for d in descs {
-            let v = self.properties[d.slot as usize];
+            hash_part::Part::with_capacity_in(keys.len(), MetricsAlloc::new(ctx.mutation()));
+        for (&k, &v) in keys.iter().zip(&self.properties) {
             if v.is_nil() {
                 continue;
             }
-            hash_part::insert_unique(&mut table, lua_string_hash(d.key), d.key, v);
+            hash_part::insert_unique(&mut table, lua_string_hash(k), k, v);
         }
         self.properties.clear();
         self.shape = match self.shape.mt_cache() {
@@ -689,10 +688,10 @@ impl<'gc> TableState<'gc> {
                 Some(d) => {
                     hash_part::next_live(&d.table, from).map(|e| (Value::string(e.key), e.value))
                 }
-                // Slot doubles as descriptor index; see `ShapeData::descriptors`.
-                None => self.shape.descriptors()[from..]
+                None => self.shape.keys()[from..]
                     .iter()
-                    .map(|d| (Value::string(d.key), self.properties[d.slot as usize]))
+                    .zip(&self.properties[from..])
+                    .map(|(&k, &v)| (Value::string(k), v))
                     .find(|(_, v)| !v.is_nil()),
             };
             if found.is_some() {
