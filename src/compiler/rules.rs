@@ -59,12 +59,13 @@ fn ice(msg: &'static str) -> CompileError {
 /// Convert a constant `ExprKind` to the runtime `Value` that should be
 /// stored in the constant table when discharging. Returns `None` for
 /// `Reg`/`Jump` kinds, which don't carry a constant value.
-fn const_kind_to_value<'gc>(mc: &Mutation<'gc>, kind: ExprKind) -> Option<Value<'gc>> {
+fn const_kind_to_value<'gc>(mc: &Mutation<'gc>, kind: ExprKind<'gc>) -> Option<Value<'gc>> {
     match kind {
         ExprKind::Numeral(Numeral::Int(n)) => Some(Value::integer(mc, n)),
         ExprKind::Numeral(Numeral::Float(f)) => Some(Value::float(f)),
         ExprKind::Bool(b) => Some(Value::boolean(b)),
         ExprKind::Nil => Some(Value::nil()),
+        ExprKind::Str(s) => Some(Value::string(s)),
         ExprKind::Reg(_) | ExprKind::Jump(_) => None,
     }
 }
@@ -220,7 +221,7 @@ enum ConstVal {
 }
 
 impl ConstVal {
-    fn from_expr_kind(k: ExprKind) -> Option<Self> {
+    fn from_expr_kind(k: ExprKind<'_>) -> Option<Self> {
         match k {
             ExprKind::Numeral(n) => Some(ConstVal::Numeral(n)),
             ExprKind::Bool(b) => Some(ConstVal::Bool(b)),
@@ -229,7 +230,7 @@ impl ConstVal {
         }
     }
 
-    fn to_expr_desc(self) -> ExprDesc {
+    fn to_expr_desc<'gc>(self) -> ExprDesc<'gc> {
         match self {
             ConstVal::Numeral(n) => ExprDesc::from_numeral(n),
             ConstVal::Bool(b) => ExprDesc::from_bool(b),
@@ -559,7 +560,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     /// Free the register backing `expr` if it's a Reg-kind expression whose
     /// register is a temp. No-op otherwise.
     #[allow(dead_code)]
-    fn free_exp(&mut self, expr: &ExprDesc) {
+    fn free_exp(&mut self, expr: &ExprDesc<'gc>) {
         if let ExprKind::Reg(reg) = expr.kind {
             self.free_reg(reg);
         }
@@ -580,7 +581,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
 
     /// Free two ExprDescs in correct order — skips non-Reg-kind inputs.
     #[allow(dead_code)]
-    fn free_exps(&mut self, e1: &ExprDesc, e2: &ExprDesc) {
+    fn free_exps(&mut self, e1: &ExprDesc<'gc>, e2: &ExprDesc<'gc>) {
         match (e1.kind, e2.kind) {
             (ExprKind::Reg(r1), ExprKind::Reg(r2)) => self.free_regs(r1, r2),
             (ExprKind::Reg(r), _) | (_, ExprKind::Reg(r)) => self.free_reg(r),
@@ -902,7 +903,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     /// (`removevalues`) before swapping. `result_kind` is the negated
     /// fall-through value: the `NOT` result, the unchanged `Jump` head (after
     /// the caller flips its polarity), or a folded boolean.
-    fn codenot(&mut self, operand: ExprDesc, result_kind: ExprKind) -> ExprDesc {
+    fn codenot(&mut self, operand: ExprDesc<'gc>, result_kind: ExprKind<'gc>) -> ExprDesc<'gc> {
         self.downgrade_testsets(&operand.true_list);
         self.downgrade_testsets(&operand.false_list);
         ExprDesc {
@@ -925,7 +926,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     /// enforce both conditions. In mixed-polarity states (lists populated
     /// from both short-circuit edges of an `and`/`or`) flipping every
     /// entry would miscompile composed expressions.
-    fn negate_cond(&mut self, expr: &mut ExprDesc) {
+    fn negate_cond(&mut self, expr: &mut ExprDesc<'gc>) {
         assert!(
             expr.pending().is_none(),
             "negate_cond requires the pending head to be absorbed first"
@@ -947,10 +948,13 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     /// "Go if true": arrange for control to fall through when `expr` is
     /// truthy and to jump otherwise. Produces a jump that fires on falsy,
     /// stored in `false_list`. Mirrors Lua 5.5's `luaK_goiftrue`.
-    fn goiftrue(&mut self, expr: &mut ExprDesc) -> Result<(), CompileError> {
+    fn goiftrue(&mut self, expr: &mut ExprDesc<'gc>) -> Result<(), CompileError> {
         // Truthy compile-time const: control always falls through, no
         // jump emitted. Mirrors Lua's `goiftrue` on `VKINT`/`VKFLT`/`VTRUE`.
-        if matches!(expr.kind, ExprKind::Numeral(_) | ExprKind::Bool(true)) {
+        if matches!(
+            expr.kind,
+            ExprKind::Numeral(_) | ExprKind::Str(_) | ExprKind::Bool(true)
+        ) {
             return Ok(());
         }
         // Falsy compile-time const: same path as a register operand —
@@ -987,7 +991,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                 let jmp = self.emit_test_jump(reg, false);
                 expr.false_list.jumps.push(jmp);
             }
-            ExprKind::Numeral(_) | ExprKind::Bool(_) | ExprKind::Nil => {
+            ExprKind::Numeral(_) | ExprKind::Str(_) | ExprKind::Bool(_) | ExprKind::Nil => {
                 unreachable!("truthy consts returned above; falsy consts discharged")
             }
         }
@@ -997,7 +1001,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     /// "Go if false": arrange for control to fall through when `expr` is
     /// falsy and to jump otherwise. Produces a jump that fires on truthy,
     /// stored in `true_list`. Mirrors Lua 5.5's `luaK_goiffalse`.
-    fn goiffalse(&mut self, expr: &mut ExprDesc) -> Result<(), CompileError> {
+    fn goiffalse(&mut self, expr: &mut ExprDesc<'gc>) -> Result<(), CompileError> {
         // Falsy compile-time const: control always falls through, no
         // jump emitted.
         if matches!(expr.kind, ExprKind::Bool(false) | ExprKind::Nil) {
@@ -1005,7 +1009,10 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         }
         // Truthy compile-time const: same path as a register operand —
         // discharge so the existing `TEST + JMP` machinery is preserved.
-        if matches!(expr.kind, ExprKind::Numeral(_) | ExprKind::Bool(true)) {
+        if matches!(
+            expr.kind,
+            ExprKind::Numeral(_) | ExprKind::Str(_) | ExprKind::Bool(true)
+        ) {
             self.discharge_to_reg_mut(expr, None)?;
         }
         match expr.kind {
@@ -1028,7 +1035,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                 let jmp = self.emit_test_jump(reg, true);
                 expr.true_list.jumps.push(jmp);
             }
-            ExprKind::Numeral(_) | ExprKind::Bool(_) | ExprKind::Nil => {
+            ExprKind::Numeral(_) | ExprKind::Str(_) | ExprKind::Bool(_) | ExprKind::Nil => {
                 unreachable!("falsy consts returned above; truthy consts discharged")
             }
         }
@@ -1058,7 +1065,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     ///   — no routing JMP needed.
     fn discharge_to_reg_mut(
         &mut self,
-        expr: &mut ExprDesc,
+        expr: &mut ExprDesc<'gc>,
         hint: Option<RegisterIndex>,
     ) -> Result<RegisterIndex, CompileError> {
         // Fast path: plain Reg with no pending jumps. `hint` is advisory —
@@ -1127,7 +1134,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                 }
             }
             ExprKind::Jump(_) => self.dst_or_alloc(hint)?,
-            ExprKind::Numeral(_) | ExprKind::Bool(_) | ExprKind::Nil => {
+            ExprKind::Numeral(_) | ExprKind::Str(_) | ExprKind::Bool(_) | ExprKind::Nil => {
                 unreachable!("const kinds materialized to Reg above")
             }
         };
@@ -2823,11 +2830,11 @@ fn compile_nested<'gc>(
 /// short-circuit `and`/`or`). Callers who need a concrete register call
 /// `compile_expr_to_reg` instead, which discharges through the standard
 /// `LFALSESKIP` / `LOAD true` fixup tail when lists are non-empty.
-fn compile_expr(
-    ctx: &mut Ctx,
+fn compile_expr<'gc>(
+    ctx: &mut Ctx<'gc, '_>,
     item: Expr,
     dst: Option<RegisterIndex>,
-) -> Result<ExprDesc, CompileError> {
+) -> Result<ExprDesc<'gc>, CompileError> {
     if let Some(node) = item.syntax() {
         ctx.set_line(node);
     }
@@ -2839,7 +2846,7 @@ fn compile_expr(
             Ok(ExprDesc::from_reg(regs[0]))
         }
         Expr::Ident(item) => compile_expr_ident(ctx, item, dst),
-        Expr::Literal(item) => compile_expr_literal(ctx, item, dst),
+        Expr::Literal(item) => compile_expr_literal(ctx, item),
         Expr::Func(item) => compile_expr_func(ctx, item, dst).map(ExprDesc::from_reg),
         Expr::Table(item) => compile_expr_table(ctx, item).map(ExprDesc::from_reg),
         Expr::FuncCall(item) => {
@@ -2872,11 +2879,11 @@ fn compile_expr_to_reg(
     ctx.discharge_to_reg_mut(&mut expr, dst)
 }
 
-fn compile_expr_ident(
-    ctx: &mut Ctx,
+fn compile_expr_ident<'gc>(
+    ctx: &mut Ctx<'gc, '_>,
     item: Ident,
     dst: Option<RegisterIndex>,
-) -> Result<ExprDesc, CompileError> {
+) -> Result<ExprDesc<'gc>, CompileError> {
     let name = item
         .name(ctx.interner)
         .ok_or_else(|| ice("ident without name"))?;
@@ -2943,31 +2950,22 @@ fn compile_expr_ident(
     Ok(ExprDesc::from_reg(dst))
 }
 
-fn compile_expr_literal(
-    ctx: &mut Ctx,
+fn compile_expr_literal<'gc>(
+    ctx: &mut Ctx<'gc, '_>,
     item: Literal,
-    dst: Option<RegisterIndex>,
-) -> Result<ExprDesc, CompileError> {
+) -> Result<ExprDesc<'gc>, CompileError> {
     let value = item
         .value(ctx.interner)
         .ok_or_else(|| ice("literal without value"))?;
 
-    // Numeric/boolean/nil literals stay in the expdesc — no constant slot
-    // or LOAD is emitted until `discharge_to_reg_mut` materializes them.
-    // String literals continue to take the eager LOAD path because there's
-    // no `Str` expdesc kind yet.
+    // Literals stay in the expdesc; no LOAD is emitted until
+    // `discharge_to_reg_mut` materializes them.
     match value {
         LiteralValue::Int(n) => Ok(ExprDesc::from_numeral(Numeral::Int(n))),
         LiteralValue::Float(n) => Ok(ExprDesc::from_numeral(Numeral::Float(n))),
         LiteralValue::Bool(b) => Ok(ExprDesc::from_bool(b)),
         LiteralValue::Nil => Ok(ExprDesc::from_nil()),
-        LiteralValue::String(bytes) => {
-            let constant = Value::string(LuaString::new(ctx.ctx, &bytes));
-            let idx = ctx.alloc_constant(constant)?;
-            let dst = ctx.dst_or_alloc(dst)?;
-            ctx.emit(Instruction::load(dst, KIdx(idx)));
-            Ok(ExprDesc::from_reg(dst))
-        }
+        LiteralValue::String(bytes) => Ok(ExprDesc::from_str(LuaString::new(ctx.ctx, &bytes))),
     }
 }
 
@@ -3173,17 +3171,17 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
     Ok(dst)
 }
 
-fn compile_expr_prefix_op(
-    ctx: &mut Ctx,
+fn compile_expr_prefix_op<'gc>(
+    ctx: &mut Ctx<'gc, '_>,
     item: PrefixOp,
     dst: Option<RegisterIndex>,
-) -> Result<ExprDesc, CompileError> {
+) -> Result<ExprDesc<'gc>, CompileError> {
     let op = item.op().ok_or_else(|| ice("prefix op without operator"))?;
     let rhs_expr = item.rhs().ok_or_else(|| ice("prefix op without operand"))?;
     let op_line = ctx.cur_line;
 
     // Compile the operand without forcing discharge — preserves const
-    // expdescs (Numeral/Bool/Nil) so we can fold them.
+    // expdescs so we can fold them.
     let mut inner = compile_expr(ctx, rhs_expr, None)?;
     ctx.cur_line = op_line;
 
@@ -3210,7 +3208,10 @@ fn compile_expr_prefix_op(
                 }
                 // else fall through — runtime will raise if non-convertible.
             }
-            (PrefixOperator::Not, ExprKind::Numeral(_) | ExprKind::Bool(true)) => {
+            (
+                PrefixOperator::Not,
+                ExprKind::Numeral(_) | ExprKind::Str(_) | ExprKind::Bool(true),
+            ) => {
                 return Ok(ExprDesc::from_bool(false));
             }
             (PrefixOperator::Not, ExprKind::Bool(false) | ExprKind::Nil) => {
@@ -3248,7 +3249,7 @@ fn compile_expr_prefix_op(
             // `not (a and 5)`: the folded `not <const>` is the fall-through
             // value, the jumps the other edge. (A jump-free const was folded
             // above.) Mirrors the const-fold arms.
-            ExprKind::Numeral(_) | ExprKind::Bool(true) => {
+            ExprKind::Numeral(_) | ExprKind::Str(_) | ExprKind::Bool(true) => {
                 return Ok(ctx.codenot(inner, ExprKind::Bool(false)));
             }
             ExprKind::Bool(false) | ExprKind::Nil => {
@@ -3288,11 +3289,11 @@ fn compile_expr_prefix_op(
     Ok(ExprDesc::from_reg(result_reg))
 }
 
-fn compile_expr_binary_op(
-    ctx: &mut Ctx,
+fn compile_expr_binary_op<'gc>(
+    ctx: &mut Ctx<'gc, '_>,
     item: BinaryOp,
     dst: Option<RegisterIndex>,
-) -> Result<ExprDesc, CompileError> {
+) -> Result<ExprDesc<'gc>, CompileError> {
     let op = item.op().ok_or_else(|| ice("binary op without operator"))?;
     // luac stamps the operator's instruction with the operator token's line
     // (`luaK_posfix(..., line)`), not the last operand's.
@@ -3573,12 +3574,12 @@ fn emit_arith(
 /// absorb the head into the right list; consumers that need a boolean in
 /// a register call `discharge_to_reg_mut`, which emits the standard
 /// `LFALSESKIP` / `LOAD K(true)` fixup tail.
-fn compile_comparison_desc(
-    ctx: &mut Ctx,
+fn compile_comparison_desc<'gc>(
+    ctx: &mut Ctx<'gc, '_>,
     item: BinaryOp,
     op: BinaryOperator,
     op_line: u32,
-) -> Result<ExprDesc, CompileError> {
+) -> Result<ExprDesc<'gc>, CompileError> {
     let lhs_expr = item.lhs().ok_or_else(|| ice("cmp without lhs"))?;
     let rhs_expr = item.rhs().ok_or_else(|| ice("cmp without rhs"))?;
 
@@ -3697,11 +3698,11 @@ fn cmp_imm(op: BinaryOperator, n: Numeral, imm_on_left: bool) -> Option<(CmpImmC
 ///     from either operand short-circuits the whole expression as falsy.
 ///   * `true_list  = rhs.true_list` — only `rhs` being truthy makes the
 ///     whole thing truthy.
-fn compile_logical_and_desc(
-    ctx: &mut Ctx,
+fn compile_logical_and_desc<'gc>(
+    ctx: &mut Ctx<'gc, '_>,
     item: BinaryOp,
     dst: Option<RegisterIndex>,
-) -> Result<ExprDesc, CompileError> {
+) -> Result<ExprDesc<'gc>, CompileError> {
     let lhs_expr = item.lhs().ok_or_else(|| ice("and without lhs"))?;
     let rhs_expr = item.rhs().ok_or_else(|| ice("and without rhs"))?;
 
@@ -3727,11 +3728,11 @@ fn compile_logical_and_desc(
 /// Jump-list compilation of `lhs or rhs`. Symmetric to `and`: truthy `lhs`
 /// short-circuits with `lhs`'s value (via `goiffalse`'s TESTSET), falsy
 /// `lhs` falls through to RHS evaluation.
-fn compile_logical_or_desc(
-    ctx: &mut Ctx,
+fn compile_logical_or_desc<'gc>(
+    ctx: &mut Ctx<'gc, '_>,
     item: BinaryOp,
     dst: Option<RegisterIndex>,
-) -> Result<ExprDesc, CompileError> {
+) -> Result<ExprDesc<'gc>, CompileError> {
     let lhs_expr = item.lhs().ok_or_else(|| ice("or without lhs"))?;
     let rhs_expr = item.rhs().ok_or_else(|| ice("or without rhs"))?;
 
