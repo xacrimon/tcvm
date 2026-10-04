@@ -229,3 +229,30 @@ return table.concat({a.x, b.x, d.x, e.x, g.c, g.s, tostring(g.t), tostring(g.no)
         "f 1 1 2 7 str true false 1.5 -3 integer 9007199254740993 6 5 1w 1w"
     );
 }
+
+/// A constructor's array part starts sized for its positional items; a
+/// trailing call or `...`, and keys stored beside the items, still land.
+#[test]
+fn constructor_items() {
+    let items: Vec<String> = (1..=300).map(|i| i.to_string()).collect();
+    let src = format!(
+        r#"
+local function three() return 'a', 'b', 'c' end
+local function pack(...) return {{...}} end
+local t1 = {{1, 2, 3}}
+local t2 = {{1, nil, 3}}
+local t3 = {{0, three()}}
+local t4 = pack(1, 2, 3, 4)
+local t5 = {{[2] = 'x', 1, 2, 3}}
+local t8 = {{x = 1, 10, 20, y = 2, 30}}
+local big = {{{}}}
+local sum = 0
+for _, v in ipairs(big) do sum = sum + v end
+t1[4] = 4
+return table.concat({{#t1, t1[4], #t2, t2[3], #t3, t3[4], #t4, t4[4], t5[2], #t8, t8[3],
+  t8.x + t8.y, #big, big[300], sum}}, ' ')
+"#,
+        items.join(", ")
+    );
+    assert_eq!(run(&src), "4 4 1 3 4 c 4 4 2 3 30 3 300 300 45150");
+}

@@ -28,7 +28,10 @@ impl<'gc> Table<'gc> {
     /// Create a new empty table in `shape`, which has no keys. Used by the
     /// `Lua::new` bootstrap before a `Context` exists.
     pub fn new_with_shape(mc: &Mutation<'gc>, shape: Shape<'gc>) -> Self {
-        Table(Gc::new(mc, RefLock::new(TableState::new(mc, shape, &[]))))
+        Table(Gc::new(
+            mc,
+            RefLock::new(TableState::new(mc, shape, &[], 0)),
+        ))
     }
 
     /// A constructor's table, as `NEWTABLE` makes it from `t`.
@@ -36,7 +39,7 @@ impl<'gc> Table<'gc> {
     pub fn from_template(mc: &Mutation<'gc>, t: &Template<'gc>) -> Self {
         Table(Gc::new(
             mc,
-            RefLock::new(TableState::new(mc, t.shape, &t.values)),
+            RefLock::new(TableState::new(mc, t.shape, &t.values, t.items as usize)),
         ))
     }
 
@@ -252,20 +255,19 @@ pub struct DictState<'gc> {
 pub struct InvalidKey;
 
 impl<'gc> TableState<'gc> {
-    /// A table in `shape` holding `values` in its slots.
-    fn new(mc: &Mutation<'gc>, shape: Shape<'gc>, values: &[Value<'gc>]) -> Self {
-        let n = values.len();
-        debug_assert_eq!(n, shape.slot_count() as usize);
-        let mut properties = Vec::with_capacity_in(n, MetricsAlloc::new(mc));
-        for (slot, &v) in properties.spare_capacity_mut().iter_mut().zip(values) {
-            slot.write(v);
-        }
-        // SAFETY: the first `n` slots were just written.
-        unsafe { properties.set_len(n) };
+    /// A table in `shape` holding `values` in its slots, with nil in keys
+    /// `1..=items` of its array part.
+    #[inline(always)]
+    fn new(mc: &Mutation<'gc>, shape: Shape<'gc>, values: &[Value<'gc>], items: usize) -> Self {
+        debug_assert_eq!(values.len(), shape.slot_count() as usize);
         Self {
             shape,
-            properties,
-            array: Vec::new_in(MetricsAlloc::new(mc)),
+            properties: filled(mc, values.len(), |i| values[i]),
+            // `nils` stays out of line: inlined, its spills cost every table.
+            array: match items {
+                0 => Vec::new_in(MetricsAlloc::new(mc)),
+                n => nils(mc, n + 1),
+            },
             int_hash: hash_part::Part::new_in(MetricsAlloc::new(mc)),
             len_hint: Cell::new(0),
             misc_hash: hash_part::Part::new_in(MetricsAlloc::new(mc)),
@@ -536,6 +538,19 @@ impl<'gc> TableState<'gc> {
         self.dict = Some(DictState { table });
     }
 
+    /// `t[offset + i] = items[i - 1]`, as `SETLIST` stores a constructor's
+    /// positional items.
+    pub fn set_list(&mut self, offset: usize, items: &[Value<'gc>]) {
+        match self.array.get_mut(offset + 1..offset + 1 + items.len()) {
+            Some(slots) => slots.copy_from_slice(items),
+            None => {
+                for (i, &v) in items.iter().enumerate() {
+                    self.set_int_key((offset + 1 + i) as i64, v);
+                }
+            }
+        }
+    }
+
     fn set_int_key(&mut self, key: i64, value: Value<'gc>) {
         if let Some(slot) = self.array_slot(key) {
             self.array[slot] = value;
@@ -752,6 +767,28 @@ enum Part {
     Ints,
     Strings,
     Misc,
+}
+
+/// A vector of `n` values, `f(i)` at `i`. Not `resize` or `extend_from_slice`,
+/// whose fill or copy is a library call even for a few values.
+#[inline(always)]
+fn filled<'gc>(
+    mc: &Mutation<'gc>,
+    n: usize,
+    f: impl Fn(usize) -> Value<'gc>,
+) -> Vec<Value<'gc>, MetricsAlloc<'gc>> {
+    let mut v = Vec::with_capacity_in(n, MetricsAlloc::new(mc));
+    for (i, slot) in v.spare_capacity_mut()[..n].iter_mut().enumerate() {
+        slot.write(f(i));
+    }
+    // SAFETY: the first `n` slots were just written.
+    unsafe { v.set_len(n) };
+    v
+}
+
+#[inline(never)]
+fn nils<'gc>(mc: &Mutation<'gc>, n: usize) -> Vec<Value<'gc>, MetricsAlloc<'gc>> {
+    filled(mc, n, |_| Value::nil())
 }
 
 /// The integer a key normalizes to: integers, and floats with an exact

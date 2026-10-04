@@ -1357,7 +1357,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
 
     /// The template for a constructor with `entries`, before their values
     /// compile: the shape of its constant field names in order, up to the
-    /// shape-mode cap, with every slot nil.
+    /// shape-mode cap, with every slot nil, and its count of positional items.
     fn template_draft(
         &mut self,
         entries: &[TableEntry],
@@ -1366,14 +1366,23 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         let mut shape = self.ctx.empty_shape();
         let mut repeated = Vec::new();
         let mut keyed = false;
-        for entry in entries {
+        let mut items = 0u32;
+        for (i, entry) in entries.iter().enumerate() {
             let map = match entry {
                 TableEntry::Map(map) => map,
                 TableEntry::Generic(_) => {
                     keyed = true;
                     continue;
                 }
-                TableEntry::Array(_) => continue,
+                TableEntry::Array(arr) => {
+                    let spreads = i + 1 == entries.len()
+                        && matches!(
+                            arr.value(),
+                            Some(Expr::FuncCall(_) | Expr::Method(_) | Expr::VarArg)
+                        );
+                    items += !spreads as u32;
+                    continue;
+                }
             };
             let key = self.field_key(map)?;
             match shape.find_slot(key) {
@@ -1389,6 +1398,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             shape,
             values: vec![Value::nil(); repeated.len()],
             bakeable: repeated.iter().map(|&r| !r && !keyed).collect(),
+            items,
         })
     }
 
@@ -1398,6 +1408,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         let templates = &mut self.chunk.templates;
         let same = |t: &Template<'gc>| {
             Shape::ptr_eq(t.shape, draft.shape)
+                && t.items == draft.items
                 && t.values.len() == draft.values.len()
                 && t.values
                     .iter()
@@ -1413,6 +1424,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                 templates.push(Template {
                     shape: draft.shape,
                     values: draft.values.into_boxed_slice(),
+                    items: draft.items,
                 });
                 templates.len() - 1
             }
@@ -3063,6 +3075,7 @@ struct TemplateDraft<'gc> {
     /// Per slot, whether a constant stored there may go in the template: its
     /// field appears once, and no `[k] = v` entry could write it.
     bakeable: Vec<bool>,
+    items: u32,
 }
 
 impl<'gc> TemplateDraft<'gc> {

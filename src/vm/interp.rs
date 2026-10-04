@@ -3810,12 +3810,10 @@ extern "rust-preserve-none" fn op_setlist<'gc>(
     } else {
         count as usize
     };
-    let off = offset as i64;
-    for i in 1..=n {
-        let val = thread.stack[elements_start + i - 1];
-        let key = Value::integer(ctx.mutation(), off + i as i64);
-        t.raw_set(ctx, key, val);
-    }
+    let items = &thread.stack[elements_start..elements_start + n];
+    t.inner()
+        .borrow_mut(ctx.mutation())
+        .set_list(offset as usize, items);
     if count == 0 {
         // A MULTRET spread leaves `thread.stack` truncated to `thread.top` by
         // the producer (e.g. a native call's variadic return). Restore the

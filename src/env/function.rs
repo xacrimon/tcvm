@@ -66,13 +66,16 @@ pub struct Prototype<'gc> {
 }
 
 /// What `NEWTABLE` starts a constructor's table with: the shape of its
-/// constant field names in order, and per slot the value of a constant field
-/// nothing else in the constructor writes, else nil.
+/// constant field names in order, per slot the value of a constant field
+/// nothing else in the constructor writes, else nil, and room in the array
+/// part for its positional items.
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub struct Template<'gc> {
     pub shape: Shape<'gc>,
     pub values: Box<[Value<'gc>]>,
+    /// Positional items, not counting a trailing call or `...`.
+    pub items: u32,
 }
 
 impl<'gc> Prototype<'gc> {
