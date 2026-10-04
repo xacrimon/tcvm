@@ -656,7 +656,9 @@ fn ic_get<'gc>(cache: InlineCache<'gc>, state: &TableState<'gc>) -> Option<Value
         if mt.index_epoch() != index_epoch {
             return None;
         }
-        let h = holder.inner().borrow();
+        // SAFETY: the epoch says `__index` is still `holder`, so the receiver
+        // keeps it alive; clearing a weak `__index` bumps the epoch too.
+        let h = unsafe { Gc::from_ptr(holder.as_ptr()) }.borrow();
         if !Shape::ptr_eq(h.shape(), holder_shape) {
             return None;
         }
@@ -800,7 +802,7 @@ fn get_index_fill_ic<'gc>(
         let index_epoch = unsafe { recv.mt_cache().unwrap_unchecked() }.index_epoch();
         let entry = InlineCache::ProtoLoad {
             recv,
-            holder,
+            holder: Gc::downgrade(holder.inner()),
             holder_shape,
             slot: holder_slot as u16,
             index_epoch,

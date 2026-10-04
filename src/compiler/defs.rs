@@ -1,5 +1,5 @@
-use crate::dmm::{Gc, Lock, Mutation};
-use crate::env::function::{InlineCache, LocVar};
+use crate::dmm::{Gc, Mutation};
+use crate::env::function::{IcTable, LocVar};
 use crate::env::{LuaString, Prototype, Value};
 /// Newtype for register indices, providing type safety over raw u8. Defined
 /// with the instruction word so the emitter can pass one straight to an
@@ -311,9 +311,6 @@ impl<'gc> Chunk<'gc> {
         let num_upvalues = self.upvalue_desc.len() as u8;
         debug_assert_eq!(self.tape.len(), self.lineinfo.len());
 
-        let ic_table =
-            vec![Lock::new(InlineCache::Empty); self.next_ic_idx as usize].into_boxed_slice();
-
         Gc::new(
             mc,
             Prototype {
@@ -332,7 +329,7 @@ impl<'gc> Chunk<'gc> {
                 lineinfo: self.lineinfo.into_boxed_slice(),
                 locvars: self.locvars.into_boxed_slice(),
                 upvalue_names: self.upvalue_names.into_boxed_slice(),
-                ic_table,
+                ic_table: IcTable::new(self.next_ic_idx as usize),
             },
         )
     }

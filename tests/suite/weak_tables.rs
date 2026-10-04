@@ -205,6 +205,49 @@ return tostring(before) .. " " .. tostring(obj.x) .. " " .. tostring(rawget(mt, 
     assert_eq!(run(src), "1 nil nil");
 }
 
+/// A load cached through `__index` doesn't keep a weak-valued metatable's
+/// `__index` alive, and the second collection empties the stale entry.
+#[test]
+fn weak_metatable_cached_index() {
+    let src = r#"
+mt = setmetatable({}, {__mode = "v"})
+obj = setmetatable({}, mt)
+mt.__index = {x = 1}
+function get() return obj.x end
+before = get()
+--gc
+gone = rawget(mt, "__index")
+--gc
+local after = get()
+mt.__index = {x = 2}
+return tostring(before) .. " " .. tostring(after) .. " " .. tostring(gone) .. " " .. tostring(get())
+"#;
+    assert_eq!(run(src), "1 nil nil 2");
+}
+
+/// Cache entries whose `__index` table was collected stop holding its memory.
+#[test]
+fn collected_index_tables_are_freed() {
+    const SITES: usize = 2000;
+    let live = |call: &str| {
+        let mut lua = yielding_lua();
+        let src = format!(
+            "fs = {{}} for i = 1, {SITES} do \
+             local mt = setmetatable({{}}, {{__mode = 'v'}}) mt.__index = {{x = i}} \
+             local obj = setmetatable({{}}, mt) \
+             local f = load('local obj = ... return function() return obj.x end')(obj) \
+             {call} fs[i] = f end\n--gc\n"
+        );
+        run_in(&mut lua, &src);
+        lua.live_bytes()
+    };
+    let (uncached, cached) = (live(""), live("f()"));
+    assert!(
+        cached < uncached + 8 * SITES,
+        "uncached={uncached} cached={cached}"
+    );
+}
+
 /// String values of surviving weak keys stay alive and interned.
 #[test]
 fn string_values() {
