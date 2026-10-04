@@ -155,6 +155,31 @@ fn churned_keys_do_not_resurface() {
     );
 }
 
+/// A dict-mode string key deleted and set again must reuse its entry: a
+/// dead twin could be where `next` resumes, revisiting keys (#181).
+#[test]
+fn dict_delete_then_set_does_not_revisit() {
+    assert_eq!(
+        ok("for trial = 1, 50 do
+              local t, ks = {}, {}
+              for i = 1, 200 do ks[i] = 'k' .. i; t[ks[i]] = i end
+              for r = 1, 5 do
+                for i = trial % 3 + 1, 200, 3 + r do t[ks[i]] = nil end
+                for i = trial % 3 + 1, 200, 3 + r do t[ks[i]] = -i end
+              end
+              local n, seen = 0, {}
+              for k in pairs(t) do
+                n = n + 1
+                if seen[k] or n > 200 then return 'repeat ' .. k .. ' trial ' .. trial end
+                seen[k] = true
+              end
+              if n ~= 200 then return 'count ' .. n end
+            end
+            return 'ok'"),
+        "ok"
+    );
+}
+
 #[test]
 fn manual_next_chain() {
     check(

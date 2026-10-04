@@ -37,12 +37,6 @@ impl Group {
         &ALIGNED_TAGS.tags
     }
 
-    /// Loads a group of tags starting at the given address.
-    #[inline]
-    pub(crate) unsafe fn load(ptr: *const Tag) -> Self {
-        unsafe { Group(neon::vld1_u8(ptr.cast())) }
-    }
-
     /// Loads a group of tags starting at the given address, which must be
     /// aligned to `align_of::<Group>()`.
     #[inline]

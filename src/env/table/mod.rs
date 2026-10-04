@@ -1,9 +1,9 @@
 mod hash_part;
+mod swiss;
 
 use core::cell::Cell;
 
 use hash_part::{int_hash, lua_string_hash};
-use hashbrown::HashTable;
 
 use crate::Context;
 use crate::dmm::{
@@ -205,14 +205,14 @@ unsafe impl<'gc> Collect<'gc> for TableState<'gc> {
             value(cc, &e.value);
         }
         if let Some(d) = &self.dict {
-            for e in d.table.iter().filter(|e| e.is_live()) {
+            for e in d.table.iter() {
                 cc.trace(&e.key);
                 value(cc, &e.value);
             }
         }
         // Only this part has object keys. An ephemeron's value waits for `converge` to find out
         // whether its key survives.
-        for e in self.misc_hash.iter().filter(|e| e.is_live()) {
+        for e in self.misc_hash.iter() {
             if !(mode.contains(WeakMode::KEYS) && e.key.is_weak_object()) {
                 cc.trace(&e.key);
                 value(cc, &e.value);
@@ -241,9 +241,9 @@ impl<'gc> TableState<'gc> {
             shape,
             properties: Vec::new_in(MetricsAlloc::new(mc)),
             array: Vec::new_in(MetricsAlloc::new(mc)),
-            int_hash: HashTable::new_in(MetricsAlloc::new(mc)),
+            int_hash: hash_part::Part::new_in(MetricsAlloc::new(mc)),
             len_hint: Cell::new(0),
-            misc_hash: HashTable::new_in(MetricsAlloc::new(mc)),
+            misc_hash: hash_part::Part::new_in(MetricsAlloc::new(mc)),
             dict: None,
             metatable: None,
             mt_cache: None,
@@ -294,7 +294,7 @@ impl<'gc> TableState<'gc> {
     fn converge(&self, fc: &Finalization<'gc>) -> bool {
         let weak_values = self.weak_mode().contains(WeakMode::VALUES);
         let mut resurrected = false;
-        for e in self.misc_hash.iter().filter(|e| e.is_live()) {
+        for e in self.misc_hash.iter() {
             if e.key.is_weak_object()
                 && !e.key.is_dead(fc)
                 && e.value.is_dead(fc)
@@ -326,21 +326,18 @@ impl<'gc> TableState<'gc> {
         for v in self.array.iter_mut().filter(|v| v.is_dead(fc)) {
             *v = Value::nil();
         }
-        for e in self.int_hash.iter_mut().filter(|e| e.value.is_dead(fc)) {
-            e.value = Value::nil();
-        }
+        self.int_hash.kill_where(|e| e.value.is_dead(fc));
         if let Some(d) = &mut self.dict {
-            for e in d.table.iter_mut().filter(|e| e.value.is_dead(fc)) {
-                e.value = Value::nil();
-                cleared(e.key);
-            }
+            d.table.kill_where(|e| {
+                let dead = e.value.is_dead(fc);
+                if dead {
+                    cleared(e.key);
+                }
+                dead
+            });
         }
-        // A dead entry's key may already be freed, so test liveness first.
-        for e in self.misc_hash.iter_mut() {
-            if e.is_live() && (e.key.is_dead(fc) || e.value.is_dead(fc)) {
-                e.value = Value::nil();
-            }
-        }
+        self.misc_hash
+            .kill_where(|e| e.key.is_dead(fc) || e.value.is_dead(fc));
     }
 
     /// Read the slot directly; used by the IC fast path on a verified shape match.
@@ -468,7 +465,8 @@ impl<'gc> TableState<'gc> {
             "migrate_to_dict called on already-dict table"
         );
         let descs = self.shape.descriptors();
-        let mut table = HashTable::with_capacity_in(descs.len(), MetricsAlloc::new(ctx.mutation()));
+        let mut table =
+            hash_part::Part::with_capacity_in(descs.len(), MetricsAlloc::new(ctx.mutation()));
         for d in descs {
             let v = self.properties[d.slot as usize];
             if v.is_nil() {
@@ -490,17 +488,15 @@ impl<'gc> TableState<'gc> {
             return;
         }
         let hash = int_hash(key);
-        if !value.is_nil()
-            && self.int_hash.len() == self.int_hash.capacity()
-            && hash_part::get(&self.int_hash, hash, key).is_nil()
-        {
+        if value.is_nil() {
+            hash_part::set(&mut self.int_hash, hash, key, value);
+        } else if hash_part::set_no_grow(&mut self.int_hash, hash, key, value).is_err() {
             self.rehash_ints(key);
-            if let Some(slot) = self.array_slot(key) {
-                self.array[slot] = value;
-                return;
+            match self.array_slot(key) {
+                Some(slot) => self.array[slot] = value,
+                None => hash_part::set(&mut self.int_hash, hash, key, value),
             }
         }
-        hash_part::set(&mut self.int_hash, hash, key, value);
     }
 
     /// LuaJIT's `rehashtab`, run when a new key would grow `int_hash`: size the
@@ -514,13 +510,13 @@ impl<'gc> TableState<'gc> {
                 n += count_int(k as i64, &mut bins);
             }
         }
-        for e in self.int_hash.iter().filter(|e| e.is_live()) {
+        for e in self.int_hash.iter() {
             n += count_int(e.key, &mut bins);
         }
         n += count_int(extra, &mut bins);
         let asize = best_asize(&bins, n);
         if asize == self.array.len() {
-            // Nothing moves; let `hash_part::set` reap and grow as usual.
+            // Nothing moves; let `hash_part::set` rehash or grow as usual.
             return;
         }
         self.len_hint.set(asize / 2);
@@ -536,16 +532,15 @@ impl<'gc> TableState<'gc> {
         }
         self.array.resize(asize, Value::nil());
         let alloc = *self.int_hash.allocator();
-        for e in self.int_hash.drain() {
+        for e in self.int_hash.iter() {
             match usize::try_from(e.key).ok().filter(|&s| s < asize) {
-                Some(slot) if e.is_live() => self.array[slot] = e.value,
-                _ if e.is_live() => rest.push((e.key, e.value)),
-                _ => {}
+                Some(slot) => self.array[slot] = e.value,
+                None => rest.push((e.key, e.value)),
             }
         }
         // No slack, as in LuaJIT: a key that could extend the array must find
         // `int_hash` full and come back here rather than settle in the hash.
-        self.int_hash = HashTable::with_capacity_in(rest.len(), alloc);
+        self.int_hash = hash_part::Part::with_capacity_in(rest.len(), alloc);
         for (k, v) in rest {
             hash_part::insert_unique(&mut self.int_hash, int_hash(k), k, v);
         }
@@ -635,7 +630,7 @@ impl<'gc> TableState<'gc> {
     /// `key` in traversal order (array, integer hash, string keys, misc
     /// hash), `None` once exhausted, `nil` starts from the beginning. Hash
     /// parts are walked by bucket index, so a key deleted mid-traversal
-    /// (left in place with a nil value) still anchors the scan.
+    /// (left in its bucket, dead) still anchors the scan.
     pub fn next(
         &self,
         mc: &Mutation<'gc>,

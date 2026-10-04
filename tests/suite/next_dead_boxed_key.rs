@@ -61,8 +61,15 @@ fn live_boxed_key_still_resumes_by_value() {
         "local t = {}\n\
          local big = 1 << 40\n\
          for i = 1, 5 do t[-(big + i)] = i end\n\
-         local k, v = next(t, -(big + 2))\n\
-         return tostring(k) .. '=' .. tostring(v)",
+         local after\n\
+         local k = next(t)\n\
+         while k ~= nil do\n\
+           local n = next(t, k)\n\
+           if k == -(big + 2) then after = n end\n\
+           k = n\n\
+         end\n\
+         local k2, v2 = next(t, -(big + 2))\n\
+         return tostring(k2 == after) .. ' ' .. tostring(v2 == t[k2])",
     );
     lua.finish(&ex).expect("run to completion");
     let s = lua
@@ -71,6 +78,6 @@ fn live_boxed_key_still_resumes_by_value() {
             Ok::<_, RuntimeError>(String::from_utf8_lossy(r.as_bytes()).into_owned())
         })
         .expect("take result");
-    // Verified against lua 5.5.1 on this exact snippet.
-    assert_eq!(s, "-1099511627777=1");
+    // `next`'s order is unspecified, so resuming is checked against the table's own traversal.
+    assert_eq!(s, "true true");
 }

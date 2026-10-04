@@ -1,9 +1,5 @@
-// TESTING NOTE:
-//
-// Because this module uses `cfg(..)` to select an implementation, it will not
-// be linted without being run on targets that actually load each of these
-// modules. Be sure to edit `ci/tools.sh` to add in the necessary cfgs if you
-// change these, so that your implementation gets properly linted.
+// `--cfg tcvm_generic_group` forces the generic implementation, which CI uses to test and
+// lint it on a SIMD target.
 
 cfg_select! {
     // Use the SSE2 implementation if possible: it allows us to scan 16 buckets
@@ -18,6 +14,7 @@ cfg_select! {
         target_feature = "sse2",
         any(target_arch = "x86", target_arch = "x86_64"),
         not(miri),
+        not(tcvm_generic_group),
     ) => {
         mod sse2;
         use sse2 as imp;
@@ -29,20 +26,11 @@ cfg_select! {
         // See https://github.com/rust-lang/stdarch/issues/1484.
         target_endian = "little",
         not(miri),
+        not(tcvm_generic_group),
     ) => {
         mod neon;
         use neon as imp;
     }
-    all(
-        feature = "nightly",
-        target_arch = "loongarch64",
-        target_feature = "lsx",
-        not(miri),
-    ) => {
-        mod lsx;
-        use lsx as imp;
-    }
-
     _ => {
         mod generic;
         use generic as imp;

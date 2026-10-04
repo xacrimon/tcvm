@@ -23,6 +23,9 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --lib --tests -- -D warnings
+        env:
+          RUSTFLAGS: --cfg tcvm_generic_group
 
   test:
     runs-on: ubuntu-26.04
@@ -31,3 +34,6 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --no-fail-fast
+      - run: cargo test --lib env::table
+        env:
+          RUSTFLAGS: --cfg tcvm_generic_group
