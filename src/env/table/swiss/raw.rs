@@ -306,7 +306,7 @@ impl<T: Copy, A: Allocator> RawTable<T, A> {
             let eq = &mut |index| eq(self.bucket(index).as_ref());
             self.table.find_inner(hash, eq).or_else(|| {
                 let (pos, bit) = self.table.find_entry_inner(hash, eq)?;
-                Some((pos + bit) & self.table.bucket_mask)
+                Some(pos + bit)
             })
         }
     }
@@ -338,7 +338,7 @@ impl<T: Copy, A: Allocator> RawTable<T, A> {
         unsafe {
             let old = self.table.replace_tag_in_group(pos, bit, Tag::full(hash));
             self.table.items += usize::from(!old.is_full());
-            self.bucket((pos + bit) & self.table.bucket_mask).as_mut()
+            self.bucket(pos + bit).as_mut()
         }
     }
 
@@ -568,47 +568,18 @@ impl RawTableInner {
         }
     }
 
-    /// Fixes up an insertion index returned by the [`RawTableInner::find_insert_index_in_group`] method.
-    ///
-    /// In tables smaller than the group width (`self.num_buckets() < Group::WIDTH`), trailing control
-    /// bytes outside the range of the table are filled with [`Tag::EMPTY`] entries. These will unfortunately
-    /// trigger a match of [`RawTableInner::find_insert_index_in_group`] function. This is because
-    /// the `Some(bit)` returned by `group.match_empty_or_deleted().lowest_set_bit()` after masking
-    /// (`(probe_seq.pos + bit) & self.bucket_mask`) may point to a full bucket that is already occupied.
-    /// We detect this situation here and perform a second scan starting at the beginning of the table.
-    /// This second scan is guaranteed to find an empty slot (due to the load factor) before hitting the
-    /// trailing control bytes (containing [`Tag::EMPTY`] bytes).
-    ///
-    /// # Safety
-    ///
-    /// The control bytes must be initialized, and `index` must come from
-    /// `find_insert_index_in_group`, with no insertion since.
-    #[inline]
-    unsafe fn fix_insert_index(&self, mut index: usize) -> usize {
-        if unlikely(unsafe { self.is_bucket_full(index) }) {
-            debug_assert!(self.bucket_mask < Group::WIDTH);
-            // SAFETY: the table is smaller than a group, so this scan finds a free bucket
-            // (due to the load factor) before the trailing EMPTY control bytes.
-            index = unsafe {
-                Group::load_aligned(self.ctrl(0))
-                    .match_empty_or_deleted()
-                    .lowest_set_bit()
-                    .unwrap_unchecked()
-            };
-        }
-        index
-    }
-
     /// Finds the position to insert something in a group.
     ///
-    /// **This may have false positives and must be fixed up with `fix_insert_index`
-    /// before it's used.**
+    /// Unlike upstream this needs no fix-up: probes are group-aligned, and a table smaller
+    /// than a group always has a free bucket before its trailing EMPTY control bytes.
     #[inline]
     fn find_insert_index_in_group(&self, group: &Group, probe_seq: &ProbeSeq) -> Option<usize> {
         let bit = group.match_empty_or_deleted().lowest_set_bit();
 
         if likely(bit.is_some()) {
-            Some((probe_seq.pos + bit.unwrap()) & self.bucket_mask)
+            let index = probe_seq.pos + bit.unwrap();
+            debug_assert!(index <= self.bucket_mask, "free bucket past the table");
+            Some(index)
         } else {
             None
         }
@@ -646,7 +617,7 @@ impl RawTableInner {
 
             // A key's entry is its first match, live or dead, so both tags are tried together.
             for bit in group.match_tag(tag_hash) | group.match_tag(tag_dead) {
-                let index = (probe_seq.pos + bit) & self.bucket_mask;
+                let index = probe_seq.pos + bit;
 
                 if likely(eq(index)) {
                     return Ok((probe_seq.pos, bit));
@@ -663,10 +634,7 @@ impl RawTableInner {
                 // Only stop the search if the group contains at least one empty element.
                 // Otherwise, the element that we are looking for might be in a following group.
                 if likely(group.match_empty().any_bit_set()) {
-                    // SAFETY: the index comes from `find_insert_index_in_group`.
-                    unsafe {
-                        return Err(self.fix_insert_index(insert_index));
-                    }
+                    return Err(insert_index);
                 }
             }
 
@@ -709,10 +677,8 @@ impl RawTableInner {
 
             let index = self.find_insert_index_in_group(&group, &probe_seq);
             if likely(index.is_some()) {
-                // SAFETY: the index comes from `find_insert_index_in_group`.
-                unsafe {
-                    return self.fix_insert_index(index.unwrap_unchecked());
-                }
+                // SAFETY: just checked.
+                return unsafe { index.unwrap_unchecked() };
             }
             probe_seq.move_next(self.bucket_mask);
         }
@@ -735,9 +701,7 @@ impl RawTableInner {
             let group = unsafe { Group::load_aligned(self.ctrl(probe_seq.pos)) };
 
             for bit in group.match_tag(tag_hash) {
-                // This is the same as `(probe_seq.pos + bit) % self.num_buckets()` because the number
-                // of buckets is a power of two, and `self.bucket_mask = self.num_buckets() - 1`.
-                let index = (probe_seq.pos + bit) & self.bucket_mask;
+                let index = probe_seq.pos + bit;
 
                 if likely(eq(index)) {
                     return Some(index);
@@ -773,7 +737,7 @@ impl RawTableInner {
             let group = unsafe { Group::load_aligned(self.ctrl(probe_seq.pos)) };
 
             for bit in group.match_tag(tag_hash) | group.match_tag(tag_dead) {
-                let index = (probe_seq.pos + bit) & self.bucket_mask;
+                let index = probe_seq.pos + bit;
 
                 if likely(eq(index)) {
                     return Some((probe_seq.pos, bit));
