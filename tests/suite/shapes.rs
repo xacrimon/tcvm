@@ -98,3 +98,37 @@ return table.concat(out, ' ')
         "b=2,p=1 p=1 p=1/2 a=2,p=1/1 c=2,p=1 a=2,p=1 d=2,p=1/2 p=1/1 q=1,s=2"
     );
 }
+
+/// Lookups past the length a shape scans go through its key array's index,
+/// which a shorter shape sharing the array, a branch off it, and a shape whose
+/// longer sibling died all read correctly.
+#[test]
+fn indexed_lookups() {
+    let setup = r#"
+function fill(t, prefix, n) for i = 1, n do t[prefix .. i] = i end return t end
+a = fill({}, 'k', 40)
+b = fill({}, 'k', 30)
+early = tostring(rawget(b, 'k35')) .. ' ' .. b.k30
+b.x = 1
+keep = fill({}, 'd', 20)
+gone = fill({}, 'd', 40)
+probe = gone.d40 + keep.d20
+gone = nil
+--gc
+"#;
+    let check = r#"
+local out = {early, probe, a.k1 + a.k40, tostring(a['k' .. 41]), tostring(b.k35), b.x}
+for i = 21, 40 do
+  if keep['d' .. i] ~= nil then out[#out + 1] = 'stale d' .. i end
+end
+keep.e = 1
+keep['d' .. 21] = 21
+out[#out + 1] = keys(keep)
+return table.concat(out, ' ')
+"#;
+    assert_eq!(
+        run(&format!("{setup}{KEYS}{check}")),
+        "nil 30 60 41 nil nil 1 d10=10,d11=11,d12=12,d13=13,d14=14,d15=15,d16=16,d17=17,\
+         d18=18,d19=19,d1=1,d20=20,d21=21,d2=2,d3=3,d4=4,d5=5,d6=6,d7=7,d8=8,d9=9,e=1"
+    );
+}
