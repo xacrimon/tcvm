@@ -213,3 +213,28 @@ return table.concat(out, ' | ')
         "c1 c1 c1 c1 | c2 c2 | c2 | base base | c3 c3 | other other | fn:m fn:m | d | d | own own | d | new mt | b b | derived derived | big big | true XY XY | function function | false false | true"
     );
 }
+
+/// A cached load through `__index` follows it as it switches back and forth,
+/// on a separate metatable and on a table that is its own, and as it names
+/// fresh tables while the old ones are collected.
+#[test]
+fn index_swaps() {
+    let src = r#"
+local out = {}
+local function get(o) return o.m end
+local A, B = {m = 'a'}, {m = 'b'}
+local mt = {__index = A}
+local o = setmetatable({}, mt)
+for i = 1, 4 do out[#out + 1] = get(o); mt.__index = i % 2 == 1 and B or A end
+local s = {__index = A}
+setmetatable(s, s)
+for i = 1, 4 do out[#out + 1] = get(s); s.__index = i % 2 == 1 and B or A end
+for i = 1, 3 do
+  mt.__index = {m = 'n' .. i}
+  collectgarbage()
+  out[#out + 1] = get(o)
+end
+return table.concat(out, ' ')
+"#;
+    assert_eq!(ok(src), "a b a b a b a b n1 n2 n3");
+}

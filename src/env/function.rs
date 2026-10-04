@@ -89,7 +89,8 @@ impl<'gc> Prototype<'gc> {
 ///
 /// Metamethods are read live through `Shape::has_mm`, so a cached shape
 /// stays a valid identity as its metatable's metamethods change; only
-/// `ProtoLoad`, which caches what `__index` names, also needs `index_epoch`.
+/// `ProtoLoad`, which caches what `__index` names, also checks
+/// `MtCache::index_table`.
 // A power-of-two size keeps indexing `ic_table` to a shift.
 #[derive(Clone, Copy, Collect, Default)]
 #[collect(internal, no_drop)]
@@ -107,26 +108,21 @@ pub enum InlineCache<'gc> {
     /// Tables of `from` lack the key; adding it moves them to `to`, which
     /// holds it in the slot after `from`'s last.
     Transition { from: Shape<'gc>, to: Shape<'gc> },
-    /// Tables of `recv` lack the key and their metatable's `__index` is
-    /// `holder`, which holds it at `slot` while its shape is `holder_shape`.
-    /// `index_epoch` is the metatable's at fill time; any `__index` write
-    /// bumps it. `holder` is weak, as a metatable's `__index` may be.
+    /// Tables of `recv` lack the key, and while their metatable's `__index`
+    /// is `holder`, it holds the key at `slot` if its shape is `holder_shape`.
+    /// `holder` is weak, as a metatable's `__index` may be.
     ProtoLoad {
         recv: Shape<'gc>,
         holder: GcWeak<'gc, RefLock<TableState<'gc>>>,
         holder_shape: Shape<'gc>,
-        // u16 so the entry stays 32 bytes; `MAX_PROPERTIES_FAST` fits.
         #[collect(require_static)]
-        slot: u16,
-        #[collect(require_static)]
-        index_epoch: u32,
+        slot: u32,
     },
     #[default]
     Empty,
 }
 
 const _: () = assert!(size_of::<InlineCache<'static>>() == 32);
-const _: () = assert!(crate::env::shape::MAX_PROPERTIES_FAST <= u16::MAX as u32);
 
 /// [`Prototype::ic_table`]. Its trace empties the `ProtoLoad` entries whose
 /// holder was dropped, so they stop reserving its allocation.

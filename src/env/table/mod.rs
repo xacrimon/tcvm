@@ -125,7 +125,8 @@ impl<'gc> Table<'gc> {
             }
         }
         let weak = WeakMode::of(self.raw_get(Value::string(ctx.symbols().mode)));
-        let cache = shape::MtCache::new(ctx.mutation(), bits, weak);
+        let index = self.raw_get(Value::string(ctx.symbols().mm_index));
+        let cache = shape::MtCache::new(ctx.mutation(), bits, weak, index);
         self.0.borrow_mut(ctx.mutation()).mt_cache = Some(cache);
         cache
     }
