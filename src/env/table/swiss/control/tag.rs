@@ -3,7 +3,7 @@ use core::{fmt, mem};
 /// Single tag in a control group.
 #[derive(Copy, Clone, PartialEq, Eq)]
 #[repr(transparent)]
-pub(crate) struct Tag(pub(super) u8);
+pub(crate) struct Tag(pub(in super::super) u8);
 impl Tag {
     /// Control tag value for an empty bucket.
     pub(crate) const EMPTY: Tag = Tag(0b1111_1111);
@@ -23,11 +23,12 @@ impl Tag {
         self.0 & 0x80 != 0
     }
 
-    /// Checks whether a special control value is EMPTY (just check 1 bit).
+    /// Checks whether a special control value is EMPTY. Unlike upstream this can't test one
+    /// bit, since dead tags use the low bit.
     #[inline]
     pub(crate) const fn special_is_empty(self) -> bool {
         debug_assert!(self.is_special());
-        self.0 & 0x01 != 0
+        self.0 == Self::EMPTY.0
     }
 
     /// Creates a control tag representing a full bucket with the given hash.
@@ -47,10 +48,26 @@ impl Tag {
         let top7 = hash >> (MIN_HASH_LEN * 8 - 7);
         Tag((top7 & 0x7f) as u8) // truncation
     }
+
+    /// The tag of a dead bucket that held this full tag: `0b10tt_tttt`, which the generic
+    /// group's `match_empty` doesn't take for EMPTY. It may equal `DELETED`, which only exists
+    /// inside a rehash, when no bucket is dead.
+    #[inline]
+    pub(crate) const fn dead(self) -> Tag {
+        debug_assert!(self.is_full());
+        Tag(0x80 | self.0 & 0x3f)
+    }
+
+    #[inline]
+    pub(crate) const fn is_dead(self) -> bool {
+        self.0 & 0xc0 == 0x80
+    }
 }
 impl fmt::Debug for Tag {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.is_special() {
+        if self.is_dead() {
+            f.debug_tuple("dead").field(&(self.0 & 0x3f)).finish()
+        } else if self.is_special() {
             if self.special_is_empty() {
                 f.pad("EMPTY")
             } else {

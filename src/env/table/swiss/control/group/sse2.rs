@@ -42,12 +42,6 @@ impl Group {
         &ALIGNED_TAGS.tags
     }
 
-    /// Loads a group of tags starting at the given address.
-    #[inline]
-    pub(crate) unsafe fn load(ptr: *const Tag) -> Self {
-        unsafe { Group(x86::_mm_loadu_si128(ptr.cast())) }
-    }
-
     /// Loads a group of tags starting at the given address, which must be
     /// aligned to `align_of::<Group>()`.
     #[inline]
