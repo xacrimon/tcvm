@@ -1,10 +1,10 @@
 use crate::Context;
 use crate::dmm::allocator_api::MetricsAlloc;
-use crate::dmm::{Collect, Gc, Lock, Mutation, RefLock, Trace};
+use crate::dmm::{Collect, Gc, GcWeak, Lock, Mutation, RefLock, Trace};
 use crate::env::error::Error;
 use crate::env::shape::Shape;
 use crate::env::string::LuaString;
-use crate::env::table::Table;
+use crate::env::table::TableState;
 use crate::env::thread::ThreadState;
 use crate::env::value::Value;
 use crate::instruction::UpValueDescriptor;
@@ -60,7 +60,7 @@ pub struct Prototype<'gc> {
     /// no `RefLock`); per-slot `Lock<InlineCache>` exposes
     /// counter-free reads via `get()` and barrier-aware writes via
     /// the parent `Prototype`'s `Gc`. Entries are [`InlineCache`].
-    pub ic_table: Box<[Lock<InlineCache<'gc>>]>,
+    pub ic_table: IcTable<'gc>,
 }
 
 impl<'gc> Prototype<'gc> {
@@ -95,10 +95,10 @@ pub enum InlineCache<'gc> {
     /// Tables of `recv` lack the key and their metatable's `__index` is
     /// `holder`, which holds it at `slot` while its shape is `holder_shape`.
     /// `index_epoch` is the metatable's at fill time; any `__index` write
-    /// bumps it.
+    /// bumps it. `holder` is weak, as a metatable's `__index` may be.
     ProtoLoad {
         recv: Shape<'gc>,
-        holder: Table<'gc>,
+        holder: GcWeak<'gc, RefLock<TableState<'gc>>>,
         holder_shape: Shape<'gc>,
         // u16 so the entry stays 32 bytes; `MAX_PROPERTIES_FAST` fits.
         #[collect(require_static)]
@@ -112,6 +112,41 @@ pub enum InlineCache<'gc> {
 
 const _: () = assert!(size_of::<InlineCache<'static>>() == 32);
 const _: () = assert!(crate::env::shape::MAX_PROPERTIES_FAST <= u16::MAX as u32);
+
+/// [`Prototype::ic_table`]. Its trace empties the `ProtoLoad` entries whose
+/// holder was dropped, so they stop reserving its allocation.
+pub struct IcTable<'gc>(Box<[Lock<InlineCache<'gc>>]>);
+
+impl<'gc> IcTable<'gc> {
+    pub fn new(len: usize) -> Self {
+        IcTable(vec![Lock::new(InlineCache::Empty); len].into_boxed_slice())
+    }
+}
+
+impl<'gc> std::ops::Deref for IcTable<'gc> {
+    type Target = [Lock<InlineCache<'gc>>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+// SAFETY: traces every entry it keeps. Emptying one from `trace(&self)` adopts
+// nothing, and the collector never runs while the mutator reads an entry.
+unsafe impl<'gc> Collect<'gc> for IcTable<'gc> {
+    fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
+        for slot in self.iter() {
+            let entry = slot.get();
+            if let InlineCache::ProtoLoad { holder, .. } = entry
+                && holder.is_dropped()
+            {
+                unsafe { slot.as_cell() }.set(InlineCache::Empty);
+            } else {
+                cc.trace(&entry);
+            }
+        }
+    }
+}
 
 /// An upvalue — open (references a stack slot) or closed (owns the value).
 #[derive(Collect)]
