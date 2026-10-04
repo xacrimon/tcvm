@@ -237,6 +237,35 @@ fn closed_file_error<'gc>(ctx: Context<'gc>) -> Error<'gc> {
     Error::from_str(ctx, "attempt to use a closed file")
 }
 
+/// Run `f` on file handle `u`'s state.
+fn with_state<R>(u: Userdata<'_>, f: impl FnOnce(&mut FileState) -> R) -> R {
+    u.with_data::<LuaFile, _>(|lf| f(&mut lf.state.borrow_mut()))
+        .expect("file handle must carry a LuaFile payload")
+}
+
+fn is_closed(u: Userdata<'_>) -> bool {
+    with_state(u, |fs| matches!(fs, FileState::Closed))
+}
+
+/// The default `"input"`/`"output"` handle (`getiofile`), which the free
+/// read/write/flush refuse to use once closed.
+fn io_file<'gc>(
+    ctx: Context<'gc>,
+    closure: &NativeClosure<'gc>,
+    slot: &str,
+) -> Result<Userdata<'gc>, Error<'gc>> {
+    let u = state_get(ctx, io_state(closure), slot.as_bytes())
+        .get_userdata()
+        .expect("io-state default file must be a file handle");
+    if is_closed(u) {
+        return Err(Error::from_str(
+            ctx,
+            &format!("default {slot} file is closed"),
+        ));
+    }
+    Ok(u)
+}
+
 // ---------------------------------------------------------------------------
 // Low-level I/O on a `FileState` (no `'gc`)
 // ---------------------------------------------------------------------------
@@ -506,10 +535,7 @@ fn do_write<'gc>(
             ));
         }
     }
-    Ok(
-        u.with_data::<LuaFile, _>(|lf| write_bytes(&mut lf.state.borrow_mut(), &buf))
-            .expect("file handle must carry a LuaFile payload"),
-    )
+    Ok(with_state(u, |fs| write_bytes(fs, &buf)))
 }
 
 /// Read `fmts` from `u`, returning the resulting Lua values (with the
@@ -725,13 +751,10 @@ fn lua_write<'gc>(
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let out_val = state_get(ctx, io_state(closure), b"output");
-    let out = out_val
-        .get_userdata()
-        .expect("io-state output must be a file handle");
+    let out = io_file(ctx, closure, "output")?;
     let vals: Vec<Value<'gc>> = stack.as_slice().to_vec();
     match do_write(ctx, out, &vals, "write", 1)? {
-        WriteOutcome::Ok => stack.replace(&[out_val]),
+        WriteOutcome::Ok => stack.replace(&[Value::userdata(out)]),
         WriteOutcome::Closed => return Err(closed_file_error(ctx)),
         WriteOutcome::Io(e, written) => stack.replace(&write_fail(ctx, &e, written)),
     }
@@ -744,9 +767,7 @@ fn lua_read<'gc>(
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let inp = state_get(ctx, io_state(closure), b"input")
-        .get_userdata()
-        .expect("io-state input must be a file handle");
+    let inp = io_file(ctx, closure, "input")?;
     let fmts = parse_formats(ctx, stack.as_slice(), "read", 1)?;
     let vals = do_read(ctx, inp, &fmts)?;
     stack.replace(&vals);
@@ -776,14 +797,11 @@ fn lua_flush<'gc>(
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let out_val = state_get(ctx, io_state(closure), b"output");
-    let out = out_val
-        .get_userdata()
-        .expect("io-state output must be a file handle");
-    match out.with_data::<LuaFile, _>(|lf| flush_stream(&mut lf.state.borrow_mut())) {
-        Some(WriteOutcome::Closed) => return Err(closed_file_error(ctx)),
-        Some(WriteOutcome::Io(e, _)) => stack.replace(&io_fail(ctx, None, &e)),
-        _ => stack.replace(&[out_val]),
+    let out = io_file(ctx, closure, "output")?;
+    match with_state(out, flush_stream) {
+        WriteOutcome::Closed => return Err(closed_file_error(ctx)),
+        WriteOutcome::Io(e, _) => stack.replace(&io_fail(ctx, None, &e)),
+        WriteOutcome::Ok => stack.replace(&[Value::userdata(out)]),
     }
     Ok(CallbackAction::Return)
 }
@@ -846,7 +864,14 @@ fn lua_lines<'gc>(
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let fmt_args = stack.as_slice().get(1..).unwrap_or_default();
     let (handle, close_eof) = if stack.get(0).is_nil() {
-        (state_get(ctx, io_state(closure), b"input"), false)
+        let inp = state_get(ctx, io_state(closure), b"input");
+        if is_closed(
+            inp.get_userdata()
+                .expect("io-state input must be a file handle"),
+        ) {
+            return Err(closed_file_error(ctx));
+        }
+        (inp, false)
     } else {
         let s = util::check_string(ctx, stack.get(0), "lines", 1)?;
         let u = open_file(ctx, closure, s.as_bytes(), b"r").map_err(|e| {
@@ -877,12 +902,8 @@ fn lua_type<'gc>(
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     util::check_any(ctx, &stack, "type", 1)?;
     let result = match as_file(ctx, closure, stack.get(0)) {
-        Some(u) => {
-            let open = u
-                .with_data::<LuaFile, _>(|lf| matches!(*lf.state.borrow(), FileState::Open { .. }))
-                .unwrap_or(false);
-            str_val(ctx, if open { b"file" } else { b"closed file" })
-        }
+        Some(u) if is_closed(u) => str_val(ctx, b"closed file"),
+        Some(_) => str_val(ctx, b"file"),
         None => Value::nil(),
     };
     stack.ret1(result);
@@ -1005,9 +1026,7 @@ fn lua_file_seek<'gc>(
         }
     };
     let outcome = match pos {
-        Some(pos) => u
-            .with_data::<LuaFile, _>(|lf| seek_stream(&mut lf.state.borrow_mut(), pos))
-            .expect("file handle must carry a LuaFile payload"),
+        Some(pos) => with_state(u, |fs| seek_stream(fs, pos)),
         None => SeekOutcome::Io(std::io::Error::from_raw_os_error(22)), // EINVAL
     };
     match outcome {
@@ -1026,10 +1045,7 @@ fn lua_file_flush<'gc>(
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let self_val = stack.get(0);
     let u = check_file(ctx, closure, self_val, "flush", 1)?;
-    match u
-        .with_data::<LuaFile, _>(|lf| flush_stream(&mut lf.state.borrow_mut()))
-        .expect("file handle must carry a LuaFile payload")
-    {
+    match with_state(u, flush_stream) {
         WriteOutcome::Ok => stack.replace(&[self_val]),
         WriteOutcome::Closed => return Err(closed_file_error(ctx)),
         WriteOutcome::Io(e, _) => stack.replace(&io_fail(ctx, None, &e)),
@@ -1100,13 +1116,10 @@ fn lua_file_tostring<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let u = check_file(ctx, closure, stack.get(0), "tostring", 1)?;
-    let open = u
-        .with_data::<LuaFile, _>(|lf| matches!(*lf.state.borrow(), FileState::Open { .. }))
-        .unwrap_or(false);
-    let s = if open {
-        format!("file ({:p})", Gc::as_ptr(u.inner()))
-    } else {
+    let s = if is_closed(u) {
         "file (closed)".to_string()
+    } else {
+        format!("file ({:p})", Gc::as_ptr(u.inner()))
     };
     stack.replace(&[str_val(ctx, s.as_bytes())]);
     Ok(CallbackAction::Return)
@@ -1187,6 +1200,9 @@ fn lines_iter<'gc>(
     let u = handle
         .get_userdata()
         .expect("lines iterator upvalue 0 must be a file handle");
+    if is_closed(u) {
+        return Err(Error::from_str(ctx, "file is already closed"));
+    }
     let fmt_vals = &closure.upvalues[2..];
     let fmts: Vec<ReadFmt> = if fmt_vals.is_empty() {
         vec![ReadFmt::Line { keep_eol: false }]
