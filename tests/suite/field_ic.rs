@@ -90,3 +90,52 @@ return table.concat(out, ' ')
         "nil nil mm nil nil proto nil nil own nil dict nil nil defined"
     );
 }
+
+/// Stores that add a key, repeated from one site so later ones take the
+/// cached transition.
+#[test]
+fn transitions() {
+    let src = r#"
+local out = {}
+local function add(t, v) t.a = v; return t end
+-- same site, same start shape: second and later stores hit the transition
+local x, y = add({}, 1), add({}, 2)
+out[#out + 1] = cat(x.a, y.a, next(x))
+-- a nil store through a cached transition adds nothing
+local z = add({}, nil)
+out[#out + 1] = cat(z.a, next(z))
+-- __newindex appearing in place on a shared metatable
+local log = {}
+local mt = {}
+add(setmetatable({}, mt), 1)
+mt.__newindex = function(_, k, v) log[#log + 1] = k .. v end
+local w = add(setmetatable({}, mt), 2)
+out[#out + 1] = cat(rawget(w, 'a'), table.concat(log))
+-- keys added through a transition to tables that are metatables
+local function idx(m) m.__index = function() return 'i' end end
+local mt1, mt2 = {}, {}
+local o1, o2 = setmetatable({}, mt1), setmetatable({}, mt2)
+idx(mt1); idx(mt2)
+out[#out + 1] = cat(o1.q, o2.q)
+-- the site that crosses the 64-key cap, run on several tables
+local function fill(t) for i = 1, 66 do t['k' .. i] = i end; t.last = 'end'; return t end
+local f1, f2 = fill({}), fill({})
+out[#out + 1] = cat(f1.k64, f1.k65, f2.k66, f2.last)
+-- a constructor-like site over two different start shapes
+local function mk(t) t.p = 1; t.q = 2; return t end
+local m1, m2, m3 = mk({}), mk({r = 0}), mk({})
+out[#out + 1] = cat(m1.p + m1.q, m2.p + m2.q + m2.r, m3.q)
+local n = 0
+for k in pairs(m3) do n = n + 1 end
+out[#out + 1] = n
+-- globals defined through SETTABUP transitions
+local function def(v) newglobal_a = v; newglobal_b = v end
+def(1); newglobal_a, newglobal_b = nil, nil; def(2)
+out[#out + 1] = cat(newglobal_a, newglobal_b)
+return table.concat(out, ' | ')
+"#;
+    assert_eq!(
+        ok(src),
+        "1 2 a 1 | nil nil | nil a2 | i i | 64 65 66 end | 3 3 2 | 2 | 2 2"
+    );
+}

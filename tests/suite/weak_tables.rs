@@ -339,3 +339,24 @@ fn weakly_held_objects_are_freed() {
         "ephemerons retained: baseline={baseline} weak={weak} strong={strong}"
     );
 }
+
+/// `__mode` stored on live metatables from one site: the later stores reuse
+/// the first one's cached shape transition and must still weaken the table.
+#[test]
+fn mode_added_by_a_cached_store() {
+    let src = r#"
+ws = {}
+local function weaken(m) m.__mode = 'k' end
+for i = 1, 3 do
+  local w = setmetatable({}, {})
+  weaken(getmetatable(w))
+  w[{}] = 1
+  ws[i] = w
+end
+--gc
+local out = {}
+for i, w in ipairs(ws) do out[i] = count(w) end
+return table.concat(out, ' ')
+"#;
+    assert_eq!(run(src), "0 0 0");
+}
