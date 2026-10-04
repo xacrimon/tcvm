@@ -51,6 +51,7 @@ mod opcode_errors;
 mod operand_order;
 mod os_clock;
 mod os_date;
+mod os_exit;
 mod pcall;
 mod return_multires;
 mod sequence_call_native_error;

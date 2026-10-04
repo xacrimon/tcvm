@@ -203,6 +203,7 @@ impl<'gc> Sequence<'gc> for ThreadCloseSequence<'gc> {
             // Keeps the status, but the error object is lost with the stack
             // the inner reset cleared, as in Lua.
             Exit::Clean => this.err = this.err.map(|e| e.with_value(ctx, Value::nil())),
+            Exit::Process(_) => unreachable!("a process exit is never caught"),
         }
         this.next(ctx, stack)
     }

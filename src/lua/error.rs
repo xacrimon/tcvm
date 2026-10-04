@@ -58,6 +58,11 @@ pub enum RuntimeError {
     /// Inspect / display via `Lua::enter` + `Fetchable::fetch`.
     #[error("lua error")]
     Lua(StashedError),
+    /// `os.exit` stopped the executor with this status, leaving its threads
+    /// dead without running their `__close`s. Drop the `Lua` to flush and
+    /// close the files it holds before ending the process.
+    #[error("exited with status {0}")]
+    Exit(i32),
     #[error(transparent)]
     Type(#[from] TypeError),
 }

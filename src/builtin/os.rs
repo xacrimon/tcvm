@@ -221,9 +221,10 @@ fn lua_difftime<'gc>(
     Ok(CallbackAction::Return)
 }
 
-/// `exit([code [, close]])` — terminate the process. `code` may be a boolean
-/// (`true`→0, `false`→1), an integer status, or nil (0). The `close` flag is
-/// ignored (we always run normal process teardown).
+/// `exit([code [, close]])` — stop the executor and hand `code` to the host
+/// (`RuntimeError::Exit`). `code` may be a boolean (`true`→0, `false`→1), an
+/// integer status, or nil (0). `close` is ignored: pending `__close`s never
+/// run, and the host drops the state either way.
 fn lua_exit<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
@@ -239,10 +240,7 @@ fn lua_exit<'gc>(
     } else {
         util::check_integer(ctx, arg, "exit", 1)? as i32
     };
-    use std::io::Write;
-    let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().flush();
-    std::process::exit(code);
+    Err(Error::exit_process(ctx, code))
 }
 
 /// `getenv(name)` — the value of environment variable `name`, or nil.
