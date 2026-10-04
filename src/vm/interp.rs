@@ -1521,8 +1521,10 @@ extern "rust-preserve-none" fn op_newtable<'gc>(
     closure: LuaFn<'gc>,
 ) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-    let dst = instruction.a();
-    *reg!(ref mut dst) = Value::table(Table::new(ctx));
+    let (dst, template) = instruction.ad();
+    // SAFETY: the compiler gives each NEWTABLE a template.
+    let shape = unsafe { *closure.proto.templates.get_unchecked(template as usize) };
+    *reg!(ref mut dst) = Value::table(Table::new_with_shape(ctx.mutation(), shape));
     gc_check!();
     dispatch!();
 }

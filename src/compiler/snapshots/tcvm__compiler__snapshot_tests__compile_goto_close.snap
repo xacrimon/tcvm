@@ -14,7 +14,7 @@ expression: output
 ;   U0 = local R0
 ; code:
 0000  [  1]  VARARGPREP      fixed=0
-0001  [  2]  NEWTABLE        R0
+0001  [  2]  NEWTABLE        R0 T0  ; {}
 0002  [  2]  LOAD            R1 K0  ; 0
 0003  [  4]  ADDI            R1 R1 #1
 0004  [  6]  MOVE            R2 R1
@@ -25,7 +25,7 @@ expression: output
 0009  [  8]  CLOSE           R2
 0010  [  8]  JMP             -8
 0011  [  8]  CLOSE           R2
-0012  [ 12]  NEWTABLE        R2
+0012  [ 12]  NEWTABLE        R2 T0  ; {}
 0013  [ 12]  LOAD            R3 K0  ; 0
 0014  [ 14]  ADDI            R3 R3 #1
 0015  [ 15]  MOVE            R4 R3
@@ -42,7 +42,7 @@ expression: output
 0026  [ 24]  CLOSE           R6
 0027  [ 26]  CLOSE           R6
 0028  [ 27]  LOAD            R6 K3  ; 7
-0029  [ 30]  NEWTABLE        R7
+0029  [ 30]  NEWTABLE        R7 T0  ; {}
 0030  [ 31]  LOAD            R8 K4  ; 1
 0031  [ 31]  LOAD            R9 K5  ; 4
 0032  [ 31]  LOAD            R10 K4  ; 1

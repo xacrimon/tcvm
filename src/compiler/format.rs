@@ -38,7 +38,7 @@ fn format_prototype_into(out: &mut String, proto: &Prototype<'_>, depth: usize) 
         let line = proto.line_for_pc(i).unwrap_or(0);
         out.push_str(&format!(
             "{indent}{i:04}  [{line:>3}]  {}\n",
-            format_instruction(instr, &proto.constants)
+            format_instruction(instr, proto)
         ));
     }
 
@@ -69,7 +69,8 @@ fn format_value(v: &Value<'_>) -> String {
     }
 }
 
-fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -> String {
+fn format_instruction(instr: &Instruction, proto: &Prototype<'_>) -> String {
+    let constants = &proto.constants;
     fn const_comment(constants: &[Value<'_>], idx: u16) -> String {
         if let Some(v) = constants.get(idx as usize) {
             format!("  ; {}", format_value(v))
@@ -146,8 +147,16 @@ fn format_instruction(instr: &Instruction, constants: &[Value<'_>]) -> String {
             )
         }
         Op::NEWTABLE => {
-            let dst = instr.a();
-            format!("NEWTABLE        R{dst}")
+            let (dst, template) = instr.ad();
+            let keys: Vec<String> = proto.templates[template as usize]
+                .keys()
+                .iter()
+                .map(|k| String::from_utf8_lossy(k.as_bytes()).into_owned())
+                .collect();
+            format!(
+                "NEWTABLE        R{dst} T{template}  ; {{{}}}",
+                keys.join(", ")
+            )
         }
         Op::ADD => {
             let (dst, lhs, rhs) = instr.abc();

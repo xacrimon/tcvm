@@ -65,7 +65,7 @@ expression: output
 0004  [  8]  MULI            R2 R1 #4 flipped
 0005  [  8]  MUL             R2 R2 R1
 0006  [  9]  LOAD            R3 K3  ; 365.24
-0007  [ 11]  NEWTABLE        R4
+0007  [ 11]  NEWTABLE        R4 T0  ; {x, y, z, vx, vy, vz, mass}
 0008  [ 12]  LOAD            R5 K5  ; 4.841431442464721
 0009  [ 12]  SETFIELD        R5 R4 K4  ; "x"
 0010  [ 13]  LOAD            R5 K7  ; -1.1603200440274284
@@ -84,7 +84,7 @@ expression: output
 0023  [ 18]  LOAD            R5 K17  ; 0.0009547919384243266
 0024  [ 18]  MUL             R5 R5 R2
 0025  [ 18]  SETFIELD        R5 R4 K16  ; "mass"
-0026  [ 21]  NEWTABLE        R5
+0026  [ 21]  NEWTABLE        R5 T0  ; {x, y, z, vx, vy, vz, mass}
 0027  [ 22]  LOAD            R6 K18  ; 8.34336671824458
 0028  [ 22]  SETFIELD        R6 R5 K4  ; "x"
 0029  [ 23]  LOAD            R6 K19  ; 4.124798564124305
@@ -103,7 +103,7 @@ expression: output
 0042  [ 28]  LOAD            R6 K24  ; 0.0002858859806661308
 0043  [ 28]  MUL             R6 R6 R2
 0044  [ 28]  SETFIELD        R6 R5 K16  ; "mass"
-0045  [ 31]  NEWTABLE        R6
+0045  [ 31]  NEWTABLE        R6 T0  ; {x, y, z, vx, vy, vz, mass}
 0046  [ 32]  LOAD            R7 K25  ; 12.894369562139131
 0047  [ 32]  SETFIELD        R7 R6 K4  ; "x"
 0048  [ 33]  LOAD            R7 K26  ; -15.111151401698631
@@ -122,7 +122,7 @@ expression: output
 0061  [ 38]  LOAD            R7 K31  ; 4.366244043351563e-5
 0062  [ 38]  MUL             R7 R7 R2
 0063  [ 38]  SETFIELD        R7 R6 K16  ; "mass"
-0064  [ 41]  NEWTABLE        R7
+0064  [ 41]  NEWTABLE        R7 T0  ; {x, y, z, vx, vy, vz, mass}
 0065  [ 42]  LOAD            R8 K32  ; 15.379697114850917
 0066  [ 42]  SETFIELD        R8 R7 K4  ; "x"
 0067  [ 43]  LOAD            R8 K33  ; -25.919314609987964
@@ -141,7 +141,7 @@ expression: output
 0080  [ 48]  LOAD            R8 K38  ; 5.1513890204661145e-5
 0081  [ 48]  MUL             R8 R8 R2
 0082  [ 48]  SETFIELD        R8 R7 K16  ; "mass"
-0083  [ 51]  NEWTABLE        R8
+0083  [ 51]  NEWTABLE        R8 T0  ; {x, y, z, vx, vy, vz, mass}
 0084  [ 51]  LOAD            R9 K39  ; 0
 0085  [ 51]  SETFIELD        R9 R8 K4  ; "x"
 0086  [ 51]  LOAD            R9 K39  ; 0
@@ -169,7 +169,7 @@ expression: output
 0108  [116]  TEST            R12 inv=true
 0109  [116]  JMP             +1
 0110  [116]  LOAD            R12 K43  ; 1000
-0111  [117]  NEWTABLE        R13
+0111  [117]  NEWTABLE        R13 T1  ; {}
 0112  [117]  MOVE            R14 R8
 0113  [117]  MOVE            R15 R4
 0114  [117]  MOVE            R16 R5

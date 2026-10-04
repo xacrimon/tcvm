@@ -157,3 +157,45 @@ return table.concat({n, sum, count(t), t['k' .. 99], tostring(t['k' .. 100]),
 "#;
     assert_eq!(run(&src), "100 5050 50 99 nil 1 521 300 520 70 70");
 }
+
+/// A constructor's table starts in the shape of its constant fields, so a
+/// field stored nil is a nil slot: invisible to `pairs` and `next`, as an
+/// absent key is. Metamethod and `__mode` fields still take effect, and a
+/// constructor past the shape-mode cap still holds all its fields.
+#[test]
+fn constructor_templates() {
+    let weak = "weak = setmetatable({}, {__mode = 'k'})\nweak[{}] = 1\n--gc\n";
+    let src = r#"
+local none
+local a = {x = 1, y = none, z = 3}
+local b = {x = 1, x = 2}
+local c = {p = none}
+c.q = 1
+local base = {get = function() return 'base' end}
+local o = setmetatable({}, {__index = base})
+local n = 0
+for _ in pairs(weak) do n = n + 1 end
+local d = {x = 1, y = 2}
+d.y = nil
+d.w = 4
+local steps = {}
+local k = next(a)
+while k do steps[#steps + 1] = k; k = next(a, k) end
+table.sort(steps)
+return table.concat({keys(a), keys(b), keys(c), o.get(), n, keys(d),
+  table.concat(steps, ','), tostring(rawget(a, 'y'))}, ' ')
+"#;
+    assert_eq!(
+        run(&format!("{weak}{KEYS}{src}")),
+        "x=1,z=3 x=2 q=1 base 0 w=4,x=1 x,z nil"
+    );
+
+    let fields: Vec<String> = (1..=600).map(|i| format!("k{i} = {i}")).collect();
+    let src = format!(
+        "local t = {{{}}} local n, sum = 0, 0 \
+         for _, v in pairs(t) do n = n + 1; sum = sum + v end \
+         return n .. ' ' .. sum .. ' ' .. t.k1 .. ' ' .. t.k600",
+        fields.join(", ")
+    );
+    assert_eq!(run(&src), "600 180300 1 600");
+}

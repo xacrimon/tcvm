@@ -15,10 +15,10 @@ expression: output
 ;   U0 = local R0
 ; code:
 0000  [  1]  VARARGPREP      fixed=0
-0001  [  1]  NEWTABLE        R0
+0001  [  1]  NEWTABLE        R0 T0  ; {v, inner}
 0002  [  1]  LOAD            R1 K1  ; 5
 0003  [  1]  SETFIELD        R1 R0 K0  ; "v"
-0004  [  1]  NEWTABLE        R1
+0004  [  1]  NEWTABLE        R1 T1  ; {}
 0005  [  1]  SETFIELD        R1 R0 K2  ; "inner"
 0006  [  2]  CLOSURE         R1 P0
 0007  [  2]  SETFIELD        R1 R0 K3  ; "get"

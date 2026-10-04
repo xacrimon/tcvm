@@ -61,6 +61,9 @@ pub struct Prototype<'gc> {
     /// counter-free reads via `get()` and barrier-aware writes via
     /// the parent `Prototype`'s `Gc`. Entries are [`InlineCache`].
     pub ic_table: IcTable<'gc>,
+    /// Per distinct constructor shape, what `NEWTABLE` starts its table in:
+    /// the constructor's constant field names, in order.
+    pub templates: Box<[Shape<'gc>]>,
 }
 
 impl<'gc> Prototype<'gc> {
