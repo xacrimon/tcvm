@@ -81,21 +81,17 @@ impl<'gc> Prototype<'gc> {
 #[derive(Clone, Copy, Collect, Default)]
 #[collect(internal, no_drop)]
 pub enum InlineCache<'gc> {
-    #[default]
-    Empty,
-    Mono {
-        /// Shape pointer the cache was filled against.
+    // First, so the hottest hit tests a zero discriminant.
+    /// Tables of `shape` hold the key at `TableState::properties[slot]`.
+    Own {
         shape: Shape<'gc>,
-        /// Slot index in `TableState::properties`. `u32::MAX` =
-        /// "key absent in shape" (so a get returns the metamethod
-        /// chain on this branch and a set must transition).
         #[collect(require_static)]
         slot: u32,
     },
-}
-
-impl<'gc> InlineCache<'gc> {
-    pub const ABSENT_SLOT: u32 = u32::MAX;
+    /// Tables of `shape` lack the key: a load is nil unless `__index` fires.
+    Absent { shape: Shape<'gc> },
+    #[default]
+    Empty,
 }
 
 /// An upvalue — open (references a stack slot) or closed (owns the value).

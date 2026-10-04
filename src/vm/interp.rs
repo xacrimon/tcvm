@@ -4,7 +4,7 @@ use crate::env::function::{
 };
 use crate::env::shape::{MetamethodBits, Shape};
 use crate::env::string::LuaString;
-use crate::env::table::Table;
+use crate::env::table::{Table, TableState};
 use crate::env::thread::{
     CallSite, ExecKind, LuaFrame, PendingAction, TbcEntry, Thread, ThreadState, ThreadStatus,
     frame_flags,
@@ -594,9 +594,14 @@ fn read_ic<'gc>(closure: LuaFn<'gc>, ic_idx: u16) -> InlineCache<'gc> {
 /// Refill the IC entry. Called by slow paths after they've done a full
 /// shape lookup; subsequent same-shape accesses skip the slow path.
 #[inline(always)]
-fn fill_ic<'gc>(ctx: Context<'gc>, closure: LuaFn<'gc>, ic_idx: u16, shape: Shape<'gc>, slot: u32) {
+fn fill_ic<'gc>(ctx: Context<'gc>, closure: LuaFn<'gc>, ic_idx: u16, entry: InlineCache<'gc>) {
+    // Every dict table with the same metatable shares one sentinel shape,
+    // so an entry on it would answer for keys it never saw.
+    debug_assert!(match entry {
+        InlineCache::Own { shape, .. } | InlineCache::Absent { shape } => !shape.is_dict(),
+        InlineCache::Empty => true,
+    });
     let proto_gc = closure.proto;
-    let value = InlineCache::Mono { shape, slot };
     if let Some(slot_lock) = proto_gc.ic_table.get(ic_idx as usize) {
         // We're adopting a fresh `Shape` Gc pointer through this slot
         // (transitively reachable from the parent `Prototype`), so emit
@@ -605,21 +610,47 @@ fn fill_ic<'gc>(ctx: Context<'gc>, closure: LuaFn<'gc>, ic_idx: u16, shape: Shap
         // because it skips the automatic barrier `Lock::set` on
         // `Gc<Lock<T>>` would emit.
         ctx.mutation().backward_barrier(Gc::erase(proto_gc), None);
-        unsafe { slot_lock.as_cell() }.set(value);
+        unsafe { slot_lock.as_cell() }.set(entry);
+    }
+}
+
+/// The entry for a lookup of a key in `shape` that found `slot`.
+#[inline(always)]
+fn shape_entry<'gc>(shape: Shape<'gc>, slot: Option<u32>) -> InlineCache<'gc> {
+    match slot {
+        Some(slot) => InlineCache::Own { shape, slot },
+        None => InlineCache::Absent { shape },
     }
 }
 
 /// Verify a cached IC entry against the live shape. Returns `Some(slot)`
-/// on a fresh hit, `None` on miss. Metatable-mutation staleness is
+/// when tables of that shape hold the key. Metatable-mutation staleness is
 /// handled downstream by `Shape::has_mm` — see `InlineCache`.
 #[inline(always)]
 fn ic_check<'gc>(cache: InlineCache<'gc>, live_shape: Shape<'gc>) -> Option<u32> {
-    if let InlineCache::Mono { shape, slot } = cache
+    if let InlineCache::Own { shape, slot } = cache
         && Shape::ptr_eq(live_shape, shape)
     {
         return Some(slot);
     }
     None
+}
+
+/// The cached result of a constant-key load from `state`, or `None` when
+/// the slow path must run.
+#[inline(always)]
+fn ic_get<'gc>(cache: InlineCache<'gc>, state: &TableState<'gc>) -> Option<Value<'gc>> {
+    let live = state.shape();
+    match cache {
+        InlineCache::Own { shape, slot } if Shape::ptr_eq(live, shape) => {
+            let v = unsafe { state.property_at(slot) };
+            (!(v.is_nil() && live.has_mm(MetamethodBits::INDEX))).then_some(v)
+        }
+        InlineCache::Absent { shape } if Shape::ptr_eq(live, shape) => {
+            (!live.has_mm(MetamethodBits::INDEX)).then_some(Value::nil())
+        }
+        _ => None,
+    }
 }
 
 /// GETFIELD/SETFIELD/GETTABUP/SETTABUP only carry constant string keys.
@@ -645,13 +676,7 @@ fn get_own_fill_ic<'gc>(
         return state.raw_get(k);
     }
     let slot = shape.find_slot(constant_key(k));
-    fill_ic(
-        ctx,
-        closure,
-        ic_idx,
-        shape,
-        slot.unwrap_or(InlineCache::ABSENT_SLOT),
-    );
+    fill_ic(ctx, closure, ic_idx, shape_entry(shape, slot));
     slot.map_or(Value::nil(), |s| unsafe { state.property_at(s) })
 }
 
@@ -681,13 +706,7 @@ fn set_own_fill_ic<'gc>(
     }
     let key = constant_key(k);
     let slot = shape.find_slot(key);
-    fill_ic(
-        ctx,
-        closure,
-        ic_idx,
-        shape,
-        slot.unwrap_or(InlineCache::ABSENT_SLOT),
-    );
+    fill_ic(ctx, closure, ic_idx, shape_entry(shape, slot));
     let existing = slot.map_or(Value::nil(), |s| unsafe { state.property_at(s) });
     if existing.is_nil() && newindex {
         return false;
@@ -908,17 +927,11 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
         tail!(gettabup_slow);
     };
 
-    let cache = read_ic(closure, ic_idx);
     let t_state = t.inner().borrow();
-    if let Some(slot) = ic_check(cache, t_state.shape())
-        && slot != InlineCache::ABSENT_SLOT
-    {
-        let v = unsafe { t_state.property_at(slot) };
-        if !(v.is_nil() && t_state.shape().has_mm(MetamethodBits::INDEX)) {
-            drop(t_state);
-            *reg!(ref mut dst) = v;
-            dispatch!();
-        }
+    if let Some(v) = ic_get(read_ic(closure, ic_idx), &t_state) {
+        drop(t_state);
+        *reg!(ref mut dst) = v;
+        dispatch!();
     }
     drop(t_state);
     tail!(gettabup_slow);
@@ -979,9 +992,7 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
     let v = reg!(src);
     let cache = read_ic(closure, ic_idx);
     let t_state = t.inner().borrow();
-    if let Some(slot) = ic_check(cache, t_state.shape())
-        && slot != InlineCache::ABSENT_SLOT
-    {
+    if let Some(slot) = ic_check(cache, t_state.shape()) {
         let existing = unsafe { t_state.property_at(slot) };
         // __newindex fires only on currently-nil keys.
         if !(existing.is_nil() && t_state.shape().has_mm(MetamethodBits::NEWINDEX)) {
@@ -1164,17 +1175,11 @@ extern "rust-preserve-none" fn op_getfield<'gc>(
         tail!(getfield_slow);
     };
 
-    let cache = read_ic(closure, ic_idx);
     let t_state = t.inner().borrow();
-    if let Some(slot) = ic_check(cache, t_state.shape())
-        && slot != InlineCache::ABSENT_SLOT
-    {
-        let v = unsafe { t_state.property_at(slot) };
-        if !(v.is_nil() && t_state.shape().has_mm(MetamethodBits::INDEX)) {
-            drop(t_state);
-            *reg!(ref mut dst) = v;
-            dispatch!();
-        }
+    if let Some(v) = ic_get(read_ic(closure, ic_idx), &t_state) {
+        drop(t_state);
+        *reg!(ref mut dst) = v;
+        dispatch!();
     }
     drop(t_state);
     tail!(getfield_slow);
@@ -1232,9 +1237,7 @@ extern "rust-preserve-none" fn op_setfield<'gc>(
     let v = reg!(src);
     let cache = read_ic(closure, ic_idx);
     let t_state = t.inner().borrow();
-    if let Some(slot) = ic_check(cache, t_state.shape())
-        && slot != InlineCache::ABSENT_SLOT
-    {
+    if let Some(slot) = ic_check(cache, t_state.shape()) {
         let existing = unsafe { t_state.property_at(slot) };
         if !(existing.is_nil() && t_state.shape().has_mm(MetamethodBits::NEWINDEX)) {
             drop(t_state);
