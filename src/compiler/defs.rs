@@ -85,9 +85,9 @@ impl JumpList {
 ///   on truthy — fall-through is falsy. This mirrors Lua's convention and
 ///   lets the `LFALSESKIP` / `LOAD true` materialisation tail handle
 ///   fall-through correctly without a routing jump.
-#[derive(Debug, Clone)]
-pub(super) struct ExprDesc {
-    pub(super) kind: ExprKind,
+#[derive(Clone)]
+pub(super) struct ExprDesc<'gc> {
+    pub(super) kind: ExprKind<'gc>,
     pub(super) true_list: JumpList,
     pub(super) false_list: JumpList,
 }
@@ -103,9 +103,9 @@ pub(super) struct ExprDesc {
 /// expdesc (no constant slot, no instruction emitted) until discharge.
 /// Operators inspect their operands' kinds and fold by mutating the
 /// expdesc, so a folded sub-expression remains foldable by the enclosing
-/// operator without any intermediate bytecode.
-#[derive(Debug, Clone, Copy)]
-pub(super) enum ExprKind {
+/// operator without any intermediate bytecode. `Str` is `VKSTR`.
+#[derive(Clone, Copy)]
+pub(super) enum ExprKind<'gc> {
     /// Value already sits in this register. `ExprDesc` may still carry
     /// pending jumps (e.g. short-circuit paths from `and`/`or` whose
     /// fall-through put the value here); the consumer must resolve them.
@@ -128,6 +128,8 @@ pub(super) enum ExprKind {
     Bool(bool),
     /// Compile-time nil.
     Nil,
+    /// Compile-time string.
+    Str(LuaString<'gc>),
 }
 
 /// Numeric literal value held in an `ExprKind::Numeral`. Matches the
@@ -139,7 +141,7 @@ pub(super) enum Numeral {
     Float(f64),
 }
 
-impl ExprDesc {
+impl<'gc> ExprDesc<'gc> {
     pub(super) fn from_reg(reg: RegisterIndex) -> Self {
         ExprDesc {
             kind: ExprKind::Reg(reg),
@@ -167,6 +169,14 @@ impl ExprDesc {
     pub(super) fn from_nil() -> Self {
         ExprDesc {
             kind: ExprKind::Nil,
+            true_list: JumpList::new(),
+            false_list: JumpList::new(),
+        }
+    }
+
+    pub(super) fn from_str(s: LuaString<'gc>) -> Self {
+        ExprDesc {
+            kind: ExprKind::Str(s),
             true_list: JumpList::new(),
             false_list: JumpList::new(),
         }
