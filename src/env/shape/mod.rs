@@ -149,68 +149,133 @@ pub fn metamethod_bit_of_bytes(name: &[u8]) -> Option<MetamethodBits> {
     None
 }
 
-/// The transition table is held inline inside `ShapeData` (mirrors
-/// `Prototype.ic_table`). Mutation goes through `Gc::write` on the
-/// owning `ShapeData` to emit the backward barrier — children adopted
-/// as `GcWeak` won't retain their targets, so a transient sub-shape
-/// can be reclaimed by GC even while its parent is alive.
-pub struct TransitionTable<'gc> {
-    /// Property-add edges keyed by the added LuaString. Both tables are in
-    /// cells so `trace` can drop edges whose child is gone.
-    by_prop: UnsafeCell<HashTable<PropEdge<'gc>, MetricsAlloc<'gc>>>,
-    /// Set-metatable edges keyed by the new MtCache identity (None = no MT).
-    by_mt: UnsafeCell<HashTable<MtEdge<'gc>, MetricsAlloc<'gc>>>,
+/// A shape's outgoing transitions, held inline in `ShapeData`. Mutation goes
+/// through `Gc::write` on the owning shape to emit the backward barrier.
+/// Children are weak, so a transient sub-shape can be reclaimed while its
+/// parent lives, and an edge whose child is dropped is erased at the next trace.
+pub struct TransitionTable<'gc>(UnsafeCell<Edges<'gc>>);
+
+/// Most shapes have at most one child, and that edge needs no key of its own:
+/// it is the child's (see [`EdgeKey::of`]).
+enum Edges<'gc> {
+    None,
+    One(GcWeak<'gc, ShapeData<'gc>>),
+    Many(Box<HashTable<Edge<'gc>, MetricsAlloc<'gc>>>),
 }
 
-/// The key is not traced: a live child keeps it alive through `last_key`, and
-/// an edge whose child is dropped is erased at the next trace. So the key may
-/// be dead, and edges compare and hash it by pointer only.
 #[derive(Clone, Copy)]
-pub struct PropEdge<'gc> {
-    pub key: LuaString<'gc>,
-    pub child: GcWeak<'gc, ShapeData<'gc>>,
+struct Edge<'gc> {
+    key: EdgeKey<'gc>,
+    child: GcWeak<'gc, ShapeData<'gc>>,
 }
 
-/// Like [`PropEdge`]'s key, the cache is not traced: a live child keeps it
-/// alive through its own `mt_cache`.
+/// What a transition adds: a string key, or a metatable (`None` removes it).
+/// Untraced in an [`Edge`], as a live child keeps it alive through `last_key`
+/// or `mt_cache`; so it may be dead, and is compared and hashed by address.
 #[derive(Clone, Copy)]
-pub struct MtEdge<'gc> {
-    pub mt_cache: Option<MtCache<'gc>>,
-    pub child: GcWeak<'gc, ShapeData<'gc>>,
+enum EdgeKey<'gc> {
+    Prop(LuaString<'gc>),
+    Mt(Option<MtCache<'gc>>),
+}
+
+impl<'gc> EdgeKey<'gc> {
+    /// The key of the edge leading to `child`.
+    fn of(child: &ShapeData<'gc>) -> Self {
+        match child.last_key {
+            Some(k) => EdgeKey::Prop(k),
+            None => EdgeKey::Mt(child.mt_cache),
+        }
+    }
+
+    fn addr(self) -> usize {
+        match self {
+            EdgeKey::Prop(k) => Gc::as_ptr(k.inner()) as usize,
+            EdgeKey::Mt(c) => c.map_or(0, |c| Gc::as_ptr(c.inner()) as usize),
+        }
+    }
+
+    fn same(self, other: Self) -> bool {
+        let kinds = matches!(
+            (self, other),
+            (EdgeKey::Prop(_), EdgeKey::Prop(_)) | (EdgeKey::Mt(_), EdgeKey::Mt(_))
+        );
+        kinds && self.addr() == other.addr()
+    }
+
+    fn hash(self) -> u64 {
+        let h = (self.addr() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        h ^ (h >> 32)
+    }
 }
 
 // SAFETY: traces every child weakly; edge keys are deliberately untraced (see
-// `PropEdge`, `MtEdge`). Erasing from `trace(&self)` is sound because the
-// collector never runs while the mutator borrows the table.
+// `EdgeKey`). Erasing from `trace(&self)` is sound because the collector never
+// runs while the mutator borrows the table.
 unsafe impl<'gc> Collect<'gc> for TransitionTable<'gc> {
     fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
-        let by_prop = unsafe { &mut *self.by_prop.get() };
-        by_prop.retain(|e| !e.child.is_dropped());
-        for e in by_prop.iter() {
-            cc.trace(&e.child);
-        }
-        let by_mt = unsafe { &mut *self.by_mt.get() };
-        by_mt.retain(|e| !e.child.is_dropped());
-        for e in by_mt.iter() {
-            cc.trace(&e.child);
+        let edges = unsafe { &mut *self.0.get() };
+        match edges {
+            Edges::None => {}
+            Edges::One(child) if child.is_dropped() => *edges = Edges::None,
+            Edges::One(child) => cc.trace(child),
+            Edges::Many(t) => {
+                t.retain(|e| !e.child.is_dropped());
+                for e in t.iter() {
+                    cc.trace(&e.child);
+                }
+            }
         }
     }
 }
 
 impl<'gc> TransitionTable<'gc> {
-    fn new(mc: &Mutation<'gc>) -> Self {
-        TransitionTable {
-            by_prop: UnsafeCell::new(HashTable::new_in(MetricsAlloc::new(mc))),
-            by_mt: UnsafeCell::new(HashTable::new_in(MetricsAlloc::new(mc))),
+    fn new() -> Self {
+        TransitionTable(UnsafeCell::new(Edges::None))
+    }
+
+    /// The live child along `key`.
+    fn get(&self, mc: &Mutation<'gc>, key: EdgeKey<'gc>) -> Option<Shape<'gc>> {
+        let child = match unsafe { &*self.0.get() } {
+            Edges::None => return None,
+            Edges::One(child) => *child,
+            Edges::Many(t) => t.find(key.hash(), |e| e.key.same(key))?.child,
+        };
+        let child = child.upgrade(mc)?;
+        EdgeKey::of(&child).same(key).then_some(Shape(child))
+    }
+
+    /// Make `child` the edge for its key, which has no live child.
+    fn insert(&mut self, mc: &Mutation<'gc>, child: Gc<'gc, ShapeData<'gc>>) {
+        let edges = self.0.get_mut();
+        let new = Edge {
+            key: EdgeKey::of(&child),
+            child: Gc::downgrade(child),
+        };
+        match edges {
+            Edges::None => *edges = Edges::One(new.child),
+            Edges::One(old) => match old.upgrade(mc) {
+                None => *edges = Edges::One(new.child),
+                Some(old_child) => {
+                    let old = Edge {
+                        key: EdgeKey::of(&old_child),
+                        child: *old,
+                    };
+                    let mut t = HashTable::new_in(MetricsAlloc::new(mc));
+                    for e in [old, new] {
+                        t.insert_unique(e.key.hash(), e, |e| e.key.hash());
+                    }
+                    *edges = Edges::Many(Box::new(t));
+                }
+            },
+            Edges::Many(t) => {
+                match t.entry(new.key.hash(), |e| e.key.same(new.key), |e| e.key.hash()) {
+                    hash_table::Entry::Occupied(mut o) => *o.get_mut() = new,
+                    hash_table::Entry::Vacant(v) => {
+                        v.insert(new);
+                    }
+                }
+            }
         }
-    }
-
-    fn by_prop(&self) -> &HashTable<PropEdge<'gc>, MetricsAlloc<'gc>> {
-        unsafe { &*self.by_prop.get() }
-    }
-
-    fn by_mt(&self) -> &HashTable<MtEdge<'gc>, MetricsAlloc<'gc>> {
-        unsafe { &*self.by_mt.get() }
     }
 }
 
@@ -427,7 +492,7 @@ impl<'gc> Shape<'gc> {
                 slot_count: 0,
                 mt_cache: None,
                 is_dict: false,
-                transitions: RefLock::new(TransitionTable::new(mc)),
+                transitions: RefLock::new(TransitionTable::new()),
                 keys: Keys::new(mc, &[], 0),
             },
         ))
@@ -444,7 +509,7 @@ impl<'gc> Shape<'gc> {
                 slot_count: 0,
                 mt_cache,
                 is_dict: true,
-                transitions: RefLock::new(TransitionTable::new(mc)),
+                transitions: RefLock::new(TransitionTable::new()),
                 keys: Keys::new(mc, &[], 0),
             },
         ))
@@ -528,20 +593,13 @@ pub fn transition_add_prop<'gc>(
         "shape transitions on dict-mode shapes are forbidden"
     );
 
-    // Fast path: existing edge.
+    if let Some(child) = parent
+        .data()
+        .transitions
+        .borrow()
+        .get(mc, EdgeKey::Prop(key))
     {
-        let table = parent.data().transitions.borrow();
-        let key_ptr = Gc::as_ptr(key.inner()) as usize;
-        let h = key_ptr as u64;
-        if let Some(edge) = table
-            .by_prop()
-            .find(h, |e| Gc::ptr_eq(e.key.inner(), key.inner()))
-            && let Some(child) = edge.child.upgrade(mc)
-        {
-            return Shape(child);
-        }
-        // A stale weak edge falls through: it can't be removed during the
-        // immutable borrow, so the insert below replaces it.
+        return child;
     }
 
     // Slow path: allocate a child and install/replace the edge.
@@ -564,40 +622,15 @@ pub fn transition_add_prop<'gc>(
             slot_count: new_slot + 1,
             mt_cache: parent.data().mt_cache,
             is_dict: false,
-            transitions: RefLock::new(TransitionTable::new(mc)),
+            transitions: RefLock::new(TransitionTable::new()),
             keys,
         },
     );
-    let child = Shape(child_data);
-
-    {
-        let parent_write = Gc::write(mc, parent.0);
-        let mut table = unlock!(parent_write, ShapeData, transitions).borrow_mut();
-        let key_ptr = Gc::as_ptr(key.inner()) as usize;
-        let h = key_ptr as u64;
-        let entry = table.by_prop.get_mut().entry(
-            h,
-            |e| Gc::ptr_eq(e.key.inner(), key.inner()),
-            |e| Gc::as_ptr(e.key.inner()) as usize as u64,
-        );
-        match entry {
-            hash_table::Entry::Occupied(mut o) => {
-                // Replace stale weak.
-                *o.get_mut() = PropEdge {
-                    key,
-                    child: Gc::downgrade(child_data),
-                };
-            }
-            hash_table::Entry::Vacant(v) => {
-                v.insert(PropEdge {
-                    key,
-                    child: Gc::downgrade(child_data),
-                });
-            }
-        }
-    }
-
-    child
+    let parent_write = Gc::write(mc, parent.0);
+    unlock!(parent_write, ShapeData, transitions)
+        .borrow_mut()
+        .insert(mc, child_data);
+    Shape(child_data)
 }
 
 /// Switch the metatable on `parent`, returning a shape with the same
@@ -622,15 +655,13 @@ pub fn transition_set_metatable<'gc>(
         };
     }
 
-    // Fast path: existing edge.
+    if let Some(child) = parent
+        .data()
+        .transitions
+        .borrow()
+        .get(mc, EdgeKey::Mt(new_mt))
     {
-        let table = parent.data().transitions.borrow();
-        let h = mt_edge_hash(new_mt);
-        if let Some(edge) = table.by_mt().find(h, |e| mt_edge_eq(e.mt_cache, new_mt))
-            && let Some(child) = edge.child.upgrade(mc)
-        {
-            return Shape(child);
-        }
+        return child;
     }
 
     // Slow path: a sibling with `parent`'s keys and the new `mt_cache`. Future
@@ -647,55 +678,13 @@ pub fn transition_set_metatable<'gc>(
             slot_count: parent.slot_count(),
             mt_cache: new_mt,
             is_dict: false,
-            transitions: RefLock::new(TransitionTable::new(mc)),
+            transitions: RefLock::new(TransitionTable::new()),
             keys: parent.data().keys,
         },
     );
-    let child = Shape(child_data);
-
-    // Install the edge on `parent` so future setmetatable calls from
-    // this same starting shape share the result.
-    {
-        let parent_write = Gc::write(mc, parent.0);
-        let mut table = unlock!(parent_write, ShapeData, transitions).borrow_mut();
-        let h = mt_edge_hash(new_mt);
-        let entry = table.by_mt.get_mut().entry(
-            h,
-            |e| mt_edge_eq(e.mt_cache, new_mt),
-            |e| mt_edge_hash(e.mt_cache),
-        );
-        match entry {
-            hash_table::Entry::Occupied(mut o) => {
-                *o.get_mut() = MtEdge {
-                    mt_cache: new_mt,
-                    child: Gc::downgrade(child_data),
-                };
-            }
-            hash_table::Entry::Vacant(v) => {
-                v.insert(MtEdge {
-                    mt_cache: new_mt,
-                    child: Gc::downgrade(child_data),
-                });
-            }
-        }
-    }
-
-    child
-}
-
-#[inline]
-fn mt_edge_hash<'gc>(cache: Option<MtCache<'gc>>) -> u64 {
-    match cache {
-        Some(c) => Gc::as_ptr(c.inner()) as usize as u64,
-        None => 0,
-    }
-}
-
-#[inline]
-fn mt_edge_eq<'gc>(a: Option<MtCache<'gc>>, b: Option<MtCache<'gc>>) -> bool {
-    match (a, b) {
-        (None, None) => true,
-        (Some(x), Some(y)) => MtCache::ptr_eq(x, y),
-        _ => false,
-    }
+    let parent_write = Gc::write(mc, parent.0);
+    unlock!(parent_write, ShapeData, transitions)
+        .borrow_mut()
+        .insert(mc, child_data);
+    Shape(child_data)
 }

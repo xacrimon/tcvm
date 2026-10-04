@@ -60,3 +60,41 @@ fn dead_metatables_are_freed() {
     let (none, many) = (live(0), live(N));
     assert!(many < none + 64 * N, "none={none} many={many}");
 }
+
+/// One shape with children along keys and metatables, some of them dropped
+/// and added again.
+#[test]
+fn many_transitions() {
+    let setup = r#"
+mt1, mt2 = {}, {}
+function make(k, mt)
+  local t = {}; t.p = 1
+  if k then t[k] = 2 end
+  if mt then setmetatable(t, mt) end
+  return t
+end
+function make2(k1, k2) local t = {}; t[k1] = 1; t[k2] = 2; return t end
+first, lone = make('a'), make2('q', 'r')
+ts = {make('b'), make(nil, mt1), make(nil, mt2), make('a', mt1), make('c')}
+setmetatable(ts[2], nil)
+--gc
+first, lone = nil, nil
+--gc
+"#;
+    let check = r#"
+ts[6] = make('a')
+ts[7] = make('d', mt2)
+ts[8] = make(nil, mt1)
+ts[9] = make2('q', 's')
+local out = {}
+for i, t in ipairs(ts) do
+  local m = getmetatable(t)
+  out[i] = keys(t) .. (m == mt1 and '/1' or m == mt2 and '/2' or '')
+end
+return table.concat(out, ' ')
+"#;
+    assert_eq!(
+        run(&format!("{setup}{KEYS}{check}")),
+        "b=2,p=1 p=1 p=1/2 a=2,p=1/1 c=2,p=1 a=2,p=1 d=2,p=1/2 p=1/1 q=1,s=2"
+    );
+}
