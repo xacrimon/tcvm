@@ -674,13 +674,7 @@ fn ic_get<'gc>(cache: InlineCache<'gc>, state: &TableState<'gc>) -> Option<Value
 /// Store `v` through the entry for a constant-key store to `t`. Returns
 /// false, having stored nothing, when the slow path must run.
 #[inline(always)]
-fn ic_set<'gc>(
-    ctx: Context<'gc>,
-    cache: InlineCache<'gc>,
-    t: Table<'gc>,
-    k: Value<'gc>,
-    v: Value<'gc>,
-) -> bool {
+fn ic_set<'gc>(ctx: Context<'gc>, cache: InlineCache<'gc>, t: Table<'gc>, v: Value<'gc>) -> bool {
     let state = t.inner().borrow();
     let live = state.shape();
     // See `ic_get` for the hint.
@@ -693,10 +687,18 @@ fn ic_set<'gc>(
         if existing.is_nil() && live.has_mm(MetamethodBits::NEWINDEX) {
             return false;
         }
+        // Stores into a metatable and barrier work go to the slow path, keeping
+        // calls (and with them a stack frame) out of this handler.
+        if state.mt_cache().is_some() {
+            return false;
+        }
         drop(state);
-        let mut state = t.inner().borrow_mut(ctx.mutation());
-        state.properties[slot as usize] = v;
-        state.maybe_update_mt_bit(k, v);
+        let Some(w) = Gc::write_if_clean(ctx.mutation(), t.inner()) else {
+            return false;
+        };
+        let mut state = w.unlock().borrow_mut();
+        // In range: the live shape is the one `slot` was cached against.
+        unsafe { state.set_property_at(slot, v) };
         return true;
     }
     if let InlineCache::Transition { from, to } = cache
@@ -709,12 +711,18 @@ fn ic_set<'gc>(
         if v.is_nil() {
             return true;
         }
+        // As above, plus a full `properties` would have to grow.
+        if state.mt_cache().is_some() || state.properties.len() == state.properties.capacity() {
+            return false;
+        }
         drop(state);
-        let mut state = t.inner().borrow_mut(ctx.mutation());
+        let Some(w) = Gc::write_if_clean(ctx.mutation(), t.inner()) else {
+            return false;
+        };
+        let mut state = w.unlock().borrow_mut();
         debug_assert_eq!(to.slot_count() as usize, state.properties.len() + 1);
         state.shape = to;
         state.properties.push(v);
-        state.maybe_update_mt_bit(k, v);
         return true;
     }
     false
@@ -1127,7 +1135,7 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
     closure: LuaFn<'gc>,
 ) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-    let (src, idx, ic_idx, key) = instruction.abde();
+    let (src, idx, ic_idx, _key) = instruction.abde();
     let uv = upvalue!(idx);
     let t_val = read_upvalue(thread, uv);
 
@@ -1135,7 +1143,7 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
         tail!(settabup_slow);
     };
 
-    if ic_set(ctx, read_ic(closure, ic_idx), t, constant!(key), reg!(src)) {
+    if ic_set(ctx, read_ic(closure, ic_idx), t, reg!(src)) {
         dispatch!();
     }
     tail!(settabup_slow);
@@ -1376,19 +1384,13 @@ extern "rust-preserve-none" fn op_setfield<'gc>(
     closure: LuaFn<'gc>,
 ) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-    let (src, table, ic_idx, key_idx) = instruction.abde();
+    let (src, table, ic_idx, _key_idx) = instruction.abde();
 
     let Some(t) = reg!(table).get_table() else {
         tail!(setfield_slow);
     };
 
-    if ic_set(
-        ctx,
-        read_ic(closure, ic_idx),
-        t,
-        constant!(key_idx),
-        reg!(src),
-    ) {
+    if ic_set(ctx, read_ic(closure, ic_idx), t, reg!(src)) {
         dispatch!();
     }
     tail!(setfield_slow);

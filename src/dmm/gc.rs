@@ -232,6 +232,17 @@ impl<'gc, T: ?Sized + 'gc> Gc<'gc, T> {
         }
     }
 
+    /// [`Gc::write`] when its barrier would do nothing, else `None`; for fast paths that would
+    /// rather bail out than call into the collector.
+    #[inline]
+    pub fn write_if_clean(mc: &Mutation<'gc>, gc: Self) -> Option<&'gc Write<T>> {
+        if mc.backward_barrier_pending(Gc::erase(gc)) {
+            return None;
+        }
+        // SAFETY: the barrier `write` would trigger is a no-op, so skipping it is the same.
+        Some(unsafe { Write::assume(gc.as_ref()) })
+    }
+
     /// Returns true if two `Gc`s point to the same allocation.
     ///
     /// Similarly to `Rc::ptr_eq` and `Arc::ptr_eq`, this function ignores the metadata of `dyn`
