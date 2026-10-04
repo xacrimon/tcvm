@@ -53,3 +53,40 @@ return table.concat(out, ' ')
 "#;
     assert_eq!(ok(src), "fx nil fx nil dict nil");
 }
+
+/// A cached absent key stops reading nil once `__index` appears in place,
+/// the metatable is replaced, the key is added, or the table goes dict.
+#[test]
+fn absent_keys() {
+    let src = r#"
+local out = {}
+local function z(t) return t.z end
+local mt = {}
+local t = setmetatable({x = 1}, mt)
+out[#out + 1] = cat(z(t), z(t))
+mt.__index = function() return 'mm' end
+out[#out + 1] = z(t)
+mt.__index = nil
+out[#out + 1] = cat(z(t), z(t))
+setmetatable(t, {__index = {z = 'proto'}})
+out[#out + 1] = z(t)
+local u = {x = 1}
+out[#out + 1] = cat(z(u), z(u))
+u.z = 'own'
+out[#out + 1] = z(u)
+local d = {x = 1}
+out[#out + 1] = tostring(z(d))
+for i = 1, 70 do d['k' .. i] = i end
+d.z = 'dict'
+out[#out + 1] = z(d)
+local function g() return undefined_global end
+out[#out + 1] = cat(g(), g())
+undefined_global = 'defined'
+out[#out + 1] = g()
+return table.concat(out, ' ')
+"#;
+    assert_eq!(
+        ok(src),
+        "nil nil mm nil nil proto nil nil own nil dict nil nil defined"
+    );
+}
