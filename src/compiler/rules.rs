@@ -172,26 +172,27 @@ fn try_fold_binop(
 // Variable tracking
 // ---------------------------------------------------------------------------
 
-/// Local variable kind, mirroring Lua 5.5's `RDK*` enum (`lparser.h`).
+/// Local variable kind, mirroring Lua 5.5's `RDK*` enum (`lparser.h`), with
+/// the register of each kind that owns one.
 /// Globals (`GDKREG` / `GDKCONST`) are tracked separately on `Ctx::globals`
 /// since they don't occupy a register slot.
 #[derive(Clone, Copy, Debug)]
 enum VarKind {
     /// Regular mutable local (RDKREG).
-    Reg,
+    Reg(RegisterIndex),
     /// Local declared with `<const>`, plus for-loop control variables
     /// (RDKCONST / LOOPVARKIND in upstream). `Some(v)` carries the
     /// compile-time value when the initializer folded to a const expdesc;
     /// `None` for `<const>` whose RHS isn't compile-time foldable
     /// (e.g. `local k <const> = f()`) — the binding still rejects
     /// assignment but doesn't inline at reference sites.
-    Const(Option<ConstVal>),
+    Const(RegisterIndex, Option<ConstVal>),
     /// Local declared with `<close>` — a to-be-closed variable (RDKTOCLOSE).
-    ToClose,
+    ToClose(RegisterIndex),
     /// The named-vararg parameter (`function f(...args)`). `args[expr]` /
     /// `args.id` lower to `VARARGGET`; any other use (`local b = args`) or
     /// upvalue capture forces materialization (see [`VarargInfo`]).
-    VarargParam,
+    VarargParam(RegisterIndex),
     /// A `global Name` declaration in scope (no register). Lives in the
     /// lexical scope stack purely so it shadows an enclosing `local`/upvalue
     /// of the same name with correct lexical recency (`manual.of:251-253`);
@@ -205,7 +206,7 @@ impl VarKind {
     fn is_readonly(self) -> bool {
         matches!(
             self,
-            VarKind::Const(_) | VarKind::ToClose | VarKind::VarargParam
+            VarKind::Const(..) | VarKind::ToClose(_) | VarKind::VarargParam(_)
         )
     }
 }
@@ -306,11 +307,6 @@ impl GlobalEnv {
             self.default = DefaultPolicy::None;
         }
     }
-}
-
-struct VariableData {
-    register: RegisterIndex,
-    kind: VarKind,
 }
 
 /// Snapshot of the register allocator's state at scope entry. Restored
@@ -429,7 +425,7 @@ struct Ctx<'gc, 'a> {
     control_end_label: Vec<(u16, usize)>,
 
     /// Lexical scope stack: each frame maps variable names to register data.
-    scope: Vec<HashMap<String, VariableData, RandomState>>,
+    scope: Vec<HashMap<String, VarKind, RandomState>>,
     /// Saved `(freereg, nactvar)` per scope entry, restored on pop so that
     /// any temps or locals allocated within the scope are reclaimed together.
     scope_marks: Vec<ScopeMark>,
@@ -1273,15 +1269,15 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         Ok(())
     }
 
-    fn define(&mut self, name: String, data: VariableData) -> Result<(), CompileError> {
+    fn define(&mut self, name: String, kind: VarKind) -> Result<(), CompileError> {
         // `global` declarations are scope entries but own no register, so
         // they get no debug record (luac lists only real locals).
-        if !matches!(data.kind, VarKind::Global) {
+        if !matches!(kind, VarKind::Global) {
             self.record_locvar(&name)?;
         }
         self.decls.push(name.clone());
         let scope = self.scope.last_mut().ok_or_else(|| ice("missing scope"))?;
-        scope.insert(name, data);
+        scope.insert(name, kind);
         Ok(())
     }
 
@@ -1302,13 +1298,11 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         Ok(())
     }
 
-    fn resolve_local(&self, name: &str) -> Option<&VariableData> {
-        for scope in self.scope.iter().rev() {
-            if let Some(data) = scope.get(name) {
-                return Some(data);
-            }
-        }
-        None
+    fn resolve_local(&self, name: &str) -> Option<VarKind> {
+        self.scope
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).copied())
     }
 
     fn alloc_constant(&mut self, value: Value<'gc>) -> Result<u16, CompileError> {
@@ -1367,16 +1361,21 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     /// (`buildglobal`). A constant-folded `_ENV` is loaded into a temp, which
     /// the caller frees with `free_reg` (a no-op for a local's register).
     fn env(&mut self, name: &str) -> Result<Env, CompileError> {
-        let resolved = match self.resolve_local("_ENV").map(|d| (d.kind, d.register)) {
-            Some((VarKind::Global, _)) => None,
-            Some((VarKind::Const(Some(v)), _)) => Some(ResolvedName::Const(v)),
-            Some((kind, register)) => {
+        let resolved = match self.resolve_local("_ENV") {
+            Some(VarKind::Global) => None,
+            Some(VarKind::Const(_, Some(v))) => Some(ResolvedName::Const(v)),
+            Some(VarKind::VarargParam(register)) => {
                 // Indexing a named vararg as `_ENV` reads it as a table.
-                if matches!(kind, VarKind::VarargParam)
-                    && let Some(info) = self.chunk.vararg_info.as_mut()
-                {
+                if let Some(info) = self.chunk.vararg_info.as_mut() {
                     info.used_as_non_base = true;
                 }
+                return Ok(Env::Reg(register));
+            }
+            Some(
+                VarKind::Reg(register)
+                | VarKind::Const(register, None)
+                | VarKind::ToClose(register),
+            ) => {
                 return Ok(Env::Reg(register));
             }
             None => self.resolve_or_capture("_ENV")?,
@@ -1473,28 +1472,28 @@ impl<'gc, 'a> UpvalueResolver for Ctx<'gc, 'a> {
         //    locals (and `<const>` whose initializer didn't fold) flow
         //    back as a `ParentLocal` descriptor.
         if let Some(depth) = self.scope.iter().rposition(|s| s.contains_key(name)) {
-            let data = &self.scope[depth][name];
-            let kind = data.kind;
-            let register = data.register;
-            // A `global` decl in scope here shadows anything more outer and
-            // is not a capturable local — the child reaches its own global
-            // resolution (`manual.of:251-253`).
-            if matches!(kind, VarKind::Global) {
-                return Ok(None);
-            }
-            if let VarKind::Const(Some(v)) = kind {
-                return Ok(Some(ChildResolution::Const(v)));
-            }
+            let kind = self.scope[depth][name];
+            let register = match kind {
+                // A `global` decl in scope here shadows anything more outer and
+                // is not a capturable local — the child reaches its own global
+                // resolution (`manual.of:251-253`).
+                VarKind::Global => return Ok(None),
+                VarKind::Const(_, Some(v)) => return Ok(Some(ChildResolution::Const(v))),
+                // Capturing the named vararg as an upvalue forces materialization:
+                // the upvalue must point at a real table, not the below-base region.
+                VarKind::VarargParam(register) => {
+                    if let Some(info) = self.chunk.vararg_info.as_mut() {
+                        info.captured = true;
+                    }
+                    register
+                }
+                VarKind::Reg(register)
+                | VarKind::Const(register, None)
+                | VarKind::ToClose(register) => register,
+            };
             // Scope 0 is the function's outermost block; RETURN closes it.
             if depth > 0 {
                 self.scope_marks[depth].captured = true;
-            }
-            // Capturing the named vararg as an upvalue forces materialization:
-            // the upvalue must point at a real table, not the below-base region.
-            if matches!(kind, VarKind::VarargParam)
-                && let Some(info) = self.chunk.vararg_info.as_mut()
-            {
-                info.captured = true;
             }
             return Ok(Some(ChildResolution::Upvalue {
                 desc: UpValueDescriptor::ParentLocal(register.0),
@@ -1670,13 +1669,7 @@ fn compile_function_to_chunk<'gc, 'a>(
     // register limit, as in luac.
     for name in params {
         let reg = ctx.alloc_register()?;
-        ctx.define(
-            name,
-            VariableData {
-                register: reg,
-                kind: VarKind::Reg,
-            },
-        )?;
+        ctx.define(name, VarKind::Reg(reg))?;
         ctx.adjust_locals(1)?;
     }
 
@@ -1685,13 +1678,7 @@ fn compile_function_to_chunk<'gc, 'a>(
     // run time and the epilogue rewrites the accesses (see below).
     if let Some(name) = vararg_name {
         let args_reg = ctx.alloc_register()?;
-        ctx.define(
-            name,
-            VariableData {
-                register: args_reg,
-                kind: VarKind::VarargParam,
-            },
-        )?;
+        ctx.define(name, VarKind::VarargParam(args_reg))?;
         // Only the vararg register: `adjust_locals` *advances* `nactvar`, and the
         // parameters were already promoted above.
         ctx.adjust_locals(1)?;
@@ -1905,13 +1892,7 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
 
         // Allocate register first so the function can reference itself
         let reg = ctx.alloc_register()?;
-        ctx.define(
-            name,
-            VariableData {
-                register: reg,
-                kind: VarKind::Reg,
-            },
-        )?;
+        ctx.define(name, VarKind::Reg(reg))?;
         // Promote to an active local BEFORE compiling the body so the
         // child function's upvalue capture sees a stable parent register
         // and any temps allocated during body compilation don't reclaim
@@ -2057,28 +2038,21 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
             .ok_or_else(|| ice("ident without name"))?
             .to_owned();
 
+        let reg = RegisterIndex(base + i as u8);
         let kind = match modifiers[i] {
             // The `Const` arm is only reachable when at least one target
             // had the `Const` modifier, which is exactly when
             // `target_const_vals` was allocated to `num_targets` entries.
-            Some(DeclModifier::Const) => VarKind::Const(target_const_vals[i]),
-            Some(DeclModifier::Close) => VarKind::ToClose,
-            None => VarKind::Reg,
+            Some(DeclModifier::Const) => VarKind::Const(reg, target_const_vals[i]),
+            Some(DeclModifier::Close) => VarKind::ToClose(reg),
+            None => VarKind::Reg(reg),
         };
 
-        let reg = RegisterIndex(base + i as u8);
-
-        if matches!(kind, VarKind::ToClose) && close_reg.replace(reg).is_some() {
+        if matches!(kind, VarKind::ToClose(_)) && close_reg.replace(reg).is_some() {
             return Err(ctx.err(CompileErrorKind::MultipleClose));
         }
 
-        ctx.define(
-            name,
-            VariableData {
-                register: reg,
-                kind,
-            },
-        )?;
+        ctx.define(name, kind)?;
     }
 
     // Promote the freshly bound targets to active locals so their slots
@@ -2171,13 +2145,7 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         // (this included) void the implicit `global *` per `manual.of:225-228`.
         ctx.globals.void_preamble();
         ctx.globals.decls.insert(name.clone(), GlobalKind::Reg);
-        ctx.define(
-            name.clone(),
-            VariableData {
-                register: RegisterIndex(0),
-                kind: VarKind::Global,
-            },
-        )?;
+        ctx.define(name.clone(), VarKind::Global)?;
 
         // `_ENV` resolves before the body, as in `globalfunc`'s
         // `buildglobal`.
@@ -2339,13 +2307,7 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
     ctx.globals.void_preamble();
     for (name, kind) in &decl_kinds {
         ctx.globals.decls.insert(name.clone(), *kind);
-        ctx.define(
-            name.clone(),
-            VariableData {
-                register: RegisterIndex(0),
-                kind: VarKind::Global,
-            },
-        )?;
+        ctx.define(name.clone(), VarKind::Global)?;
     }
 
     let Some(env) = env else {
@@ -2519,13 +2481,13 @@ fn compile_lvalue(
             // A `global` decl in scope shadows an enclosing local/upvalue of
             // the same name (manual.of:251-253), so it skips both local and
             // upvalue resolution and falls through to global resolution.
-            let local = ctx.resolve_local(name).map(|d| (d.kind, d.register));
-            let shadow_global = matches!(local, Some((VarKind::Global, _)));
-            if let Some((kind, register)) = local.filter(|_| !shadow_global) {
-                if kind.is_readonly() {
+            let local = ctx.resolve_local(name);
+            let shadow_global = matches!(local, Some(VarKind::Global));
+            if let Some(kind) = local.filter(|_| !shadow_global) {
+                let VarKind::Reg(dst) = kind else {
                     return Err(ctx.err(CompileErrorKind::ConstAssign(name.to_owned())));
-                }
-                Ok(Lvalue::Local { dst: register })
+                };
+                Ok(Lvalue::Local { dst })
             } else if !shadow_global && let Some(resolution) = ctx.resolve_or_capture(name)? {
                 match resolution {
                     ResolvedName::Upvalue(idx) if !ctx.upvalues[idx as usize].readonly => {
@@ -2651,11 +2613,10 @@ fn target_local_reg(ctx: &Ctx, target: &Expr) -> Option<u8> {
         return None;
     };
     let name = ident.name(ctx.interner)?;
-    let data = ctx.resolve_local(name)?;
-    if matches!(data.kind, VarKind::Global) {
-        return None;
+    match ctx.resolve_local(name)? {
+        VarKind::Reg(register) => Some(register.0),
+        _ => None,
     }
-    (!data.kind.is_readonly()).then_some(data.register.0)
 }
 
 fn local_dst(lv: &Lvalue) -> Option<RegisterIndex> {
@@ -2895,22 +2856,26 @@ fn compile_expr_ident<'gc>(
     // A `global` decl in scope shadows an enclosing local/upvalue of the
     // same name (manual.of:251-253); such a reference skips both local and
     // upvalue resolution and falls through to global resolution below.
-    let local = ctx.resolve_local(name).map(|d| (d.kind, d.register));
-    let shadow_global = matches!(local, Some((VarKind::Global, _)));
-    if let Some((kind, register)) = local.filter(|_| !shadow_global) {
-        if let VarKind::Const(Some(v)) = kind {
-            return Ok(v.to_expr_desc());
-        }
+    let local = ctx.resolve_local(name);
+    match local {
+        Some(VarKind::Const(_, Some(v))) => return Ok(v.to_expr_desc()),
         // A named vararg reaching this path is used as a value (the `t[exp]` /
         // `t.id` base cases are intercepted before recursing here), which
         // forces materialization.
-        if matches!(kind, VarKind::VarargParam)
-            && let Some(info) = ctx.chunk.vararg_info.as_mut()
-        {
-            info.used_as_non_base = true;
+        Some(VarKind::VarargParam(register)) => {
+            if let Some(info) = ctx.chunk.vararg_info.as_mut() {
+                info.used_as_non_base = true;
+            }
+            return Ok(ExprDesc::from_reg(register));
         }
-        return Ok(ExprDesc::from_reg(register));
+        Some(
+            VarKind::Reg(register) | VarKind::Const(register, None) | VarKind::ToClose(register),
+        ) => {
+            return Ok(ExprDesc::from_reg(register));
+        }
+        Some(VarKind::Global) | None => {}
     }
+    let shadow_global = matches!(local, Some(VarKind::Global));
 
     // Upvalue path. An outer-scope `<const>` with a known value
     // short-circuits as an inlined `ChildResolution::Const`, fully
@@ -4078,11 +4043,9 @@ fn resolve_vararg_base(ctx: &Ctx, expr: &Expr) -> Option<u8> {
         return None;
     };
     let name = ident.name(ctx.interner)?;
-    let data = ctx.resolve_local(name)?;
-    if matches!(data.kind, VarKind::VarargParam) {
-        Some(data.register.0)
-    } else {
-        None
+    match ctx.resolve_local(name)? {
+        VarKind::VarargParam(register) => Some(register.0),
+        _ => None,
     }
 }
 
@@ -4446,13 +4409,7 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
             // rejected at compile time.
             let loop_var = ctx.alloc_register()?;
             assert_eq!(loop_var.0, base.0 + 3);
-            ctx.define(
-                counter_name,
-                VariableData {
-                    register: loop_var,
-                    kind: VarKind::Const(None),
-                },
-            )?;
+            ctx.define(counter_name, VarKind::Const(loop_var, None))?;
             // Promote the loop variable to an active local so upvalue-capture
             // logic sees it and temp reclaims don't touch it.
             ctx.adjust_locals(1)?;
@@ -4579,17 +4536,11 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
                 // Only the first variable, the control variable, is read-only
                 // (`forlist`'s RDKCONST).
                 let kind = if i == 0 {
-                    VarKind::Const(None)
+                    VarKind::Const(reg, None)
                 } else {
-                    VarKind::Reg
+                    VarKind::Reg(reg)
                 };
-                ctx.define(
-                    name,
-                    VariableData {
-                        register: reg,
-                        kind,
-                    },
-                )?;
+                ctx.define(name, kind)?;
                 ctx.adjust_locals(1)?;
             }
 
