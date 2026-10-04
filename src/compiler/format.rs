@@ -158,8 +158,12 @@ fn format_instruction(instr: &Instruction, proto: &Prototype<'_>) -> String {
                     }
                 })
                 .collect();
+            let items = match t.items {
+                0 => String::new(),
+                n => format!(" items={n}"),
+            };
             format!(
-                "NEWTABLE        R{dst} T{template}  ; {{{}}}",
+                "NEWTABLE        R{dst} T{template}  ; {{{}}}{items}",
                 keys.join(", ")
             )
         }

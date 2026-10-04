@@ -12,7 +12,7 @@ expression: output
 ; code:
 0000  [  1]  VARARGPREP      fixed=0
 0001  [  1]  CLOSURE         R0 P0
-0002  [  2]  NEWTABLE        R1 T0  ; {}
+0002  [  2]  NEWTABLE        R1 T0  ; {} items=2
 0003  [  2]  MOVE            R2 R0
 0004  [  2]  LOAD            R3 K0  ; 1
 0005  [  2]  CALL            R2 args=2 ret=2

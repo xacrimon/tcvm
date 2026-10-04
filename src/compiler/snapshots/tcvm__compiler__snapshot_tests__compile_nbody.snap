@@ -117,7 +117,7 @@ expression: output
 0072  [116]  TEST            R12 inv=true
 0073  [116]  JMP             +1
 0074  [116]  LOAD            R12 K27  ; 1000
-0075  [117]  NEWTABLE        R13 T5  ; {}
+0075  [117]  NEWTABLE        R13 T5  ; {} items=5
 0076  [117]  MOVE            R14 R8
 0077  [117]  MOVE            R15 R4
 0078  [117]  MOVE            R16 R5
