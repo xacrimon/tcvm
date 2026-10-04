@@ -367,3 +367,51 @@ fn read_formats_and_io_errors() {
     ));
     let _ = std::fs::remove_file(&p);
 }
+
+#[test]
+fn setvbuf_modes() {
+    // #252, after files.lua's buffer tests.
+    let p = tmp_path("vbuf");
+    assert_runs(&format!(
+        "local f = assert(io.open({p:?}, \"w\"))\n\
+         local fr = assert(io.open({p:?}, \"r\"))\n\
+         assert(f:setvbuf(\"full\", 2000)); f:write(\"x\")\n\
+         assert(fr:read(\"a\") == \"\", \"full holds\")\n\
+         f:close(); fr:seek(\"set\")\n\
+         assert(fr:read(\"a\") == \"x\", \"close flushes\")\n\
+         f = assert(io.open({p:?}, \"a\")); assert(f:setvbuf(\"no\")); f:write(\"y\")\n\
+         fr:seek(\"set\")\n\
+         assert(fr:read(\"a\") == \"xy\", \"no writes through\")\n\
+         assert(f:setvbuf(\"line\")); f:write(\"a\\nb\")\n\
+         fr:seek(\"set\")\n\
+         assert(fr:read(\"a\") == \"xya\\n\", \"line writes through the newline\")\n\
+         assert(f:setvbuf(\"line\", 4)); f:write(\"cdefgh\\nij\")\n\
+         fr:seek(\"set\")\n\
+         assert(fr:read(\"a\") == \"xya\\nbcdefgh\\n\", \"line holds a tail past its size\")\n\
+         f:flush(); fr:seek(\"set\")\n\
+         assert(fr:read(\"a\") == \"xya\\nbcdefgh\\nij\", \"flush\")\n\
+         f:close(); fr:close()"
+    ));
+    let _ = std::fs::remove_file(&p);
+}
+
+#[test]
+fn buffered_writes_survive_os_exit() {
+    // Dropping the state after `os.exit` flushes files left open.
+    let p = tmp_path("exit_flush");
+    let mut lua = Lua::new();
+    lua.load_all();
+    let src = format!("io.open({p:?}, \"w\"):write(\"data\"); os.exit(0)");
+    let ex = lua
+        .try_enter(|ctx| -> Result<_, LoadError> {
+            let chunk = ctx.load(&src, Some("io_test"))?;
+            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+        })
+        .expect("load");
+    assert!(matches!(lua.finish(&ex), Err(RuntimeError::Exit(0))));
+    assert_eq!(std::fs::read(&p).unwrap(), b"");
+    drop(ex);
+    drop(lua);
+    assert_eq!(std::fs::read(&p).unwrap(), b"data");
+    let _ = std::fs::remove_file(&p);
+}

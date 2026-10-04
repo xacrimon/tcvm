@@ -51,10 +51,102 @@ enum FileState {
 /// process-global handles are locked per call, never owned here, so the
 /// real fds survive handle collection.
 enum Stream {
-    File(BufReader<File>),
+    File(FileStream),
     Stdin,
     Stdout,
     Stderr,
+}
+
+/// A regular file. Reads go through `reader`'s read-ahead; writes collect in
+/// `wbuf` per `mode` and reach the file before any read, seek or close, and
+/// on drop, which covers collection and the host dropping the state.
+struct FileStream {
+    reader: BufReader<File>,
+    wbuf: Vec<u8>,
+    mode: BufMode,
+}
+
+/// `setvbuf`'s modes; the sizes are the buffer's capacity.
+#[derive(Clone, Copy)]
+enum BufMode {
+    No,
+    Line(usize),
+    Full(usize),
+}
+
+/// A new file's buffer, like stdio's default full buffering.
+const DEFAULT_BUF_SIZE: usize = 8192;
+
+/// `setvbuf`'s default size (liolib's `LUAL_BUFFERSIZE`).
+const LUAL_BUFFERSIZE: usize = 16 * size_of::<usize>() * size_of::<f64>();
+
+impl FileStream {
+    fn new(file: File) -> Self {
+        FileStream {
+            reader: BufReader::new(file),
+            wbuf: Vec::new(),
+            mode: BufMode::Full(DEFAULT_BUF_SIZE),
+        }
+    }
+
+    fn flush_buf(&mut self) -> std::io::Result<()> {
+        if self.wbuf.is_empty() {
+            return Ok(());
+        }
+        let (res, _) = count_write(self.reader.get_mut(), &self.wbuf);
+        // Dropped even on failure, so one error isn't reported by every
+        // later operation.
+        self.wbuf.clear();
+        res
+    }
+
+    /// Buffer `buf`, or write it through once it no longer fits. The count is
+    /// the bytes of `buf` accepted before an error.
+    fn write(&mut self, buf: &[u8]) -> (std::io::Result<()>, u64) {
+        let (cap, line) = match self.mode {
+            BufMode::No => (0, false),
+            BufMode::Line(cap) => (cap, true),
+            BufMode::Full(cap) => (cap, false),
+        };
+        // Line mode sends everything through the last newline and holds back
+        // the rest, as macOS stdio does.
+        let head_len = match line {
+            true => buf.iter().rposition(|&b| b == b'\n').map_or(0, |nl| nl + 1),
+            false => 0,
+        };
+        let (head, tail) = buf.split_at(head_len);
+        if self.wbuf.len() + buf.len() > cap
+            && let Err(e) = self.flush_buf()
+        {
+            return (Err(e), 0);
+        }
+        if !head.is_empty() {
+            if self.wbuf.is_empty() {
+                let (res, n) = count_write(self.reader.get_mut(), head);
+                if res.is_err() {
+                    return (res, n);
+                }
+            } else {
+                // Not flushed above, so `buf` fits: one write for both.
+                self.wbuf.extend_from_slice(head);
+                if let Err(e) = self.flush_buf() {
+                    return (Err(e), 0);
+                }
+            }
+        }
+        if self.wbuf.len() + tail.len() > cap {
+            let (res, n) = count_write(self.reader.get_mut(), tail);
+            return (res, head_len as u64 + n);
+        }
+        self.wbuf.extend_from_slice(tail);
+        (Ok(()), buf.len() as u64)
+    }
+}
+
+impl Drop for FileStream {
+    fn drop(&mut self) {
+        let _ = self.flush_buf();
+    }
 }
 
 impl LuaFile {
@@ -310,7 +402,7 @@ fn write_bytes(fs: &mut FileState, buf: &[u8]) -> WriteOutcome {
         return WriteOutcome::Io(std::io::Error::from_raw_os_error(9), 0);
     }
     let (res, written) = match stream {
-        Stream::File(br) => count_write(br.get_mut(), buf),
+        Stream::File(file) => file.write(buf),
         Stream::Stdout => count_write(&mut std::io::stdout(), buf),
         Stream::Stderr => count_write(&mut std::io::stderr(), buf),
         Stream::Stdin => (Err(std::io::Error::from_raw_os_error(9)), 0),
@@ -327,7 +419,7 @@ fn flush_stream(fs: &mut FileState) -> WriteOutcome {
         FileState::Open { stream, .. } => stream,
     };
     let res = match stream {
-        Stream::File(br) => br.get_mut().flush(),
+        Stream::File(file) => file.flush_buf(),
         Stream::Stdout => std::io::stdout().flush(),
         Stream::Stderr => std::io::stderr().flush(),
         Stream::Stdin => Ok(()),
@@ -350,7 +442,7 @@ fn seek_stream(fs: &mut FileState, pos: SeekFrom) -> SeekOutcome {
         FileState::Open { stream, .. } => stream,
     };
     match stream {
-        Stream::File(br) => match br.seek(pos) {
+        Stream::File(file) => match file.flush_buf().and_then(|()| file.reader.seek(pos)) {
             Ok(n) => SeekOutcome::Pos(n),
             Err(e) => SeekOutcome::Io(e),
         },
@@ -369,7 +461,10 @@ fn read_stream(fs: &mut FileState, fmt: ReadFmt) -> std::io::Result<ReadOne> {
             readable: false, ..
         } => ebadf(),
         FileState::Open { stream, .. } => match stream {
-            Stream::File(br) => read_one(br, fmt),
+            Stream::File(file) => {
+                file.flush_buf()?;
+                read_one(&mut file.reader, fmt)
+            }
             Stream::Stdin => read_one(&mut std::io::stdin().lock(), fmt),
             Stream::Stdout | Stream::Stderr => ebadf(),
         },
@@ -639,7 +734,7 @@ fn open_file<'gc>(
     Ok(new_handle(
         ctx,
         file_metatable(ctx, closure),
-        LuaFile::open(Stream::File(BufReader::new(file)), readable, writable),
+        LuaFile::open(Stream::File(FileStream::new(file)), readable, writable),
     ))
 }
 
@@ -901,7 +996,7 @@ fn lua_tmpfile<'gc>(
             let u = new_handle(
                 ctx,
                 file_metatable(ctx, closure),
-                LuaFile::open(Stream::File(BufReader::new(file)), true, true),
+                LuaFile::open(Stream::File(FileStream::new(file)), true, true),
             );
             stack.ret1(Value::userdata(u));
         }
@@ -1028,21 +1123,33 @@ fn lua_file_close<'gc>(
     close_handle(ctx, u, &mut stack)
 }
 
-/// `file:setvbuf(mode [, size])` — buffering control is a no-op here, but the
-/// mode is still validated against `{no, full, line}` (Lua's `luaL_checkoption`)
-/// and `true` is returned, matching `luaL_fileresult` on success.
+/// `file:setvbuf(mode [, size])`, flushing what the old mode buffered. A
+/// non-positive size falls back to the default; standard streams keep their
+/// own buffering.
 fn lua_file_setvbuf<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    check_file(ctx, closure, stack.get(0), "setvbuf", 1)?;
+    let u = check_file(ctx, closure, stack.get(0), "setvbuf", 1)?;
+    if is_closed(u) {
+        return Err(closed_file_error(ctx));
+    }
     let mode = match stack.arg(1) {
         Some(v) => util::check_string(ctx, v, "setvbuf", 2)?,
         None => return Err(util::type_error(ctx, "setvbuf", 2, "string", None)),
     };
-    match mode.as_bytes() {
-        b"no" | b"full" | b"line" => {}
+    let size = match stack.get(2) {
+        v if v.is_nil() => LUAL_BUFFERSIZE,
+        v => usize::try_from(util::check_integer(ctx, v, "setvbuf", 3)?)
+            .ok()
+            .filter(|&n| n > 0)
+            .unwrap_or(LUAL_BUFFERSIZE),
+    };
+    let mode = match mode.as_bytes() {
+        b"no" => BufMode::No,
+        b"full" => BufMode::Full(size),
+        b"line" => BufMode::Line(size),
         other => {
             return Err(util::arg_error(
                 ctx,
@@ -1051,8 +1158,21 @@ fn lua_file_setvbuf<'gc>(
                 &format!("invalid option '{}'", String::from_utf8_lossy(other)),
             ));
         }
+    };
+    let res = with_state(u, |fs| match fs {
+        FileState::Open {
+            stream: Stream::File(file),
+            ..
+        } => {
+            file.mode = mode;
+            file.flush_buf()
+        }
+        _ => Ok(()),
+    });
+    match res {
+        Ok(()) => stack.ret1(Value::boolean(true)),
+        Err(e) => stack.replace(&io_fail(ctx, None, &e)),
     }
-    stack.ret1(Value::boolean(true));
     Ok(CallbackAction::Return)
 }
 
@@ -1095,40 +1215,45 @@ fn lua_file_tostring<'gc>(
 // ---------------------------------------------------------------------------
 
 enum CloseOutcome {
-    Ok,
+    /// Closed, with the result of flushing what was still buffered.
+    Closed(std::io::Result<()>),
     Standard,
     AlreadyClosed,
 }
 
-/// Move a regular file to `Closed`, dropping its `File` (closing the fd).
-/// Standard streams stay open.
+/// Flush a regular file and move it to `Closed`, dropping its `File` (closing
+/// the fd) whether or not the flush failed. Standard streams stay open.
 fn close_stream(u: Userdata<'_>) -> CloseOutcome {
-    u.with_data::<LuaFile, _>(|lf| {
-        let mut fs = lf.state.borrow_mut();
-        match &*fs {
-            FileState::Closed => CloseOutcome::AlreadyClosed,
-            FileState::Open {
-                stream: Stream::Stdin | Stream::Stdout | Stream::Stderr,
+    with_state(u, |fs| match fs {
+        FileState::Closed => CloseOutcome::AlreadyClosed,
+        FileState::Open {
+            stream: Stream::Stdin | Stream::Stdout | Stream::Stderr,
+            ..
+        } => CloseOutcome::Standard,
+        FileState::Open { .. } => {
+            let FileState::Open {
+                stream: Stream::File(mut file),
                 ..
-            } => CloseOutcome::Standard,
-            FileState::Open { .. } => {
-                *fs = FileState::Closed;
-                CloseOutcome::Ok
-            }
+            } = std::mem::replace(fs, FileState::Closed)
+            else {
+                unreachable!()
+            };
+            CloseOutcome::Closed(file.flush_buf())
         }
     })
-    .expect("file handle must carry a LuaFile payload")
 }
 
-/// `close`/`io.close`: `true`, `(nil, "cannot close standard file")`, or a
-/// raised error for an already-closed file.
+/// `close`/`io.close`: `true`, a failed final flush's `(nil, msg, errno)`,
+/// `(nil, "cannot close standard file")`, or a raised error for an
+/// already-closed file.
 fn close_handle<'gc>(
     ctx: Context<'gc>,
     u: Userdata<'gc>,
     stack: &mut Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     match close_stream(u) {
-        CloseOutcome::Ok => stack.replace(&[Value::boolean(true)]),
+        CloseOutcome::Closed(Ok(())) => stack.replace(&[Value::boolean(true)]),
+        CloseOutcome::Closed(Err(e)) => stack.replace(&io_fail(ctx, None, &e)),
         CloseOutcome::Standard => {
             stack.replace(&[Value::nil(), str_val(ctx, b"cannot close standard file")])
         }
