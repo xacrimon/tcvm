@@ -647,23 +647,23 @@ fn ic_get<'gc>(cache: InlineCache<'gc>, state: &TableState<'gc>) -> Option<Value
         holder,
         holder_shape,
         slot,
-        index_epoch,
     } = cache
         && Shape::ptr_eq(live, recv)
     {
         // `recv` was filled with a metatable whose `__index` was `holder`.
         let mt = unsafe { live.mt_cache().unwrap_unchecked() };
-        if mt.index_epoch() != index_epoch {
+        if mt.index_table() != holder.as_ptr() as usize {
             return None;
         }
-        // SAFETY: the epoch says `__index` is still `holder`, so the receiver
-        // keeps it alive; clearing a weak `__index` bumps the epoch too.
+        // SAFETY: `__index` is still `holder`, so the receiver keeps it alive.
+        // The address can't name another table: `holder` reserves it while
+        // this entry lives, even once dropped.
         let h = unsafe { Gc::from_ptr(holder.as_ptr()) }.borrow();
         if !Shape::ptr_eq(h.shape(), holder_shape) {
             return None;
         }
         // A nil slot means the walk goes on past `holder`.
-        let v = unsafe { h.property_at(slot as u32) };
+        let v = unsafe { h.property_at(slot) };
         return (!v.is_nil()).then_some(v);
     } else {
         return None;
@@ -799,13 +799,15 @@ fn get_index_fill_ic<'gc>(
         return Err(index);
     }
     if let Some(recv) = recv {
-        let index_epoch = unsafe { recv.mt_cache().unwrap_unchecked() }.index_epoch();
+        debug_assert_eq!(
+            unsafe { recv.mt_cache().unwrap_unchecked() }.index_table(),
+            Gc::as_ptr(holder.inner()) as usize
+        );
         let entry = InlineCache::ProtoLoad {
             recv,
             holder: Gc::downgrade(holder.inner()),
             holder_shape,
-            slot: holder_slot as u16,
-            index_epoch,
+            slot: holder_slot,
         };
         fill_ic(ctx, closure, ic_idx, entry);
     }

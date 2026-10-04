@@ -140,6 +140,11 @@ fn addr(key: LuaString<'_>) -> usize {
     Gc::as_ptr(key.inner()) as usize
 }
 
+/// The address of `v`'s table, or 0.
+fn table_addr(v: Value<'_>) -> usize {
+    v.get_table().map_or(0, |t| Gc::as_ptr(t.inner()) as usize)
+}
+
 /// A hash of an object's address, which has no entropy in its low bits.
 fn addr_hash(addr: usize) -> u64 {
     let h = (addr as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
@@ -401,10 +406,10 @@ pub struct MtCacheData<'gc> {
     /// Read by the collector when it traces a table with this metatable.
     #[collect(require_static)]
     pub weak: Cell<WeakMode>,
-    /// Bumped by every write of `__index`, so a cache entry that recorded it
-    /// knows `__index` still names the same value.
+    /// Address of the table `__index` names, else 0. Untraced, as it only
+    /// identifies: every `__index` write updates it, weak clears included.
     #[collect(require_static)]
-    pub index_epoch: Cell<u32>,
+    index_table: Cell<usize>,
     /// Lazily-allocated dict-mode sentinel for tables that drop into
     /// dict mode while carrying this metatable. Populated on the first
     /// call to `MtCache::ensure_dict_sentinel`; subsequent calls return
@@ -448,13 +453,19 @@ impl<'gc> MtCacheData<'gc> {
 }
 
 impl<'gc> MtCache<'gc> {
-    pub fn new(mc: &Mutation<'gc>, bits: MetamethodBits, weak: WeakMode) -> Self {
+    /// The cache of a metatable whose `__index` is `index`.
+    pub fn new(
+        mc: &Mutation<'gc>,
+        bits: MetamethodBits,
+        weak: WeakMode,
+        index: Value<'gc>,
+    ) -> Self {
         MtCache(Gc::new(
             mc,
             MtCacheData {
                 bits: Cell::new(bits),
                 weak: Cell::new(weak),
-                index_epoch: Cell::new(0),
+                index_table: Cell::new(table_addr(index)),
                 dict_sentinel: Lock::new(None),
             },
         ))
@@ -502,9 +513,10 @@ impl<'gc> MtCache<'gc> {
         self.0.weak.get()
     }
 
+    /// See [`MtCacheData::index_table`].
     #[inline]
-    pub fn index_epoch(self) -> u32 {
-        self.0.index_epoch.get()
+    pub fn index_table(self) -> usize {
+        self.0.index_table.get()
     }
 
     /// Mirror a write of `key` to this cache's metatable into its bits and weak mode.
@@ -513,8 +525,7 @@ impl<'gc> MtCache<'gc> {
         match metamethod_bit_of_bytes(key.as_bytes()) {
             Some(bit) => {
                 if bit == MetamethodBits::INDEX {
-                    let e = &self.0.index_epoch;
-                    e.set(e.get().wrapping_add(1));
+                    self.0.index_table.set(table_addr(value));
                 }
                 self.update(bit, value)
             }
