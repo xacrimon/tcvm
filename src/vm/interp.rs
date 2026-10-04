@@ -599,6 +599,7 @@ fn fill_ic<'gc>(ctx: Context<'gc>, closure: LuaFn<'gc>, ic_idx: u16, entry: Inli
     // so an entry on it would answer for keys it never saw.
     debug_assert!(match entry {
         InlineCache::Own { shape, .. } | InlineCache::Absent { shape } => !shape.is_dict(),
+        InlineCache::Transition { from, to } => !from.is_dict() && !to.is_dict(),
         InlineCache::Empty => true,
     });
     let proto_gc = closure.proto;
@@ -623,34 +624,74 @@ fn shape_entry<'gc>(shape: Shape<'gc>, slot: Option<u32>) -> InlineCache<'gc> {
     }
 }
 
-/// Verify a cached IC entry against the live shape. Returns `Some(slot)`
-/// when tables of that shape hold the key. Metatable-mutation staleness is
-/// handled downstream by `Shape::has_mm` — see `InlineCache`.
-#[inline(always)]
-fn ic_check<'gc>(cache: InlineCache<'gc>, live_shape: Shape<'gc>) -> Option<u32> {
-    if let InlineCache::Own { shape, slot } = cache
-        && Shape::ptr_eq(live_shape, shape)
-    {
-        return Some(slot);
-    }
-    None
-}
-
 /// The cached result of a constant-key load from `state`, or `None` when
 /// the slow path must run.
 #[inline(always)]
 fn ic_get<'gc>(cache: InlineCache<'gc>, state: &TableState<'gc>) -> Option<Value<'gc>> {
     let live = state.shape();
-    match cache {
-        InlineCache::Own { shape, slot } if Shape::ptr_eq(live, shape) => {
-            let v = unsafe { state.property_at(slot) };
-            (!(v.is_nil() && live.has_mm(MetamethodBits::INDEX))).then_some(v)
+    // Without the hint LLVM tests the rarer variants' tags first.
+    let v = if std::hint::likely(matches!(cache, InlineCache::Own { .. }))
+        && let InlineCache::Own { shape, slot } = cache
+        && Shape::ptr_eq(live, shape)
+    {
+        unsafe { state.property_at(slot) }
+    } else if let InlineCache::Absent { shape } = cache
+        && Shape::ptr_eq(live, shape)
+    {
+        Value::nil()
+    } else {
+        return None;
+    };
+    (!(v.is_nil() && live.has_mm(MetamethodBits::INDEX))).then_some(v)
+}
+
+/// Store `v` through the entry for a constant-key store to `t`. Returns
+/// false, having stored nothing, when the slow path must run.
+#[inline(always)]
+fn ic_set<'gc>(
+    ctx: Context<'gc>,
+    cache: InlineCache<'gc>,
+    t: Table<'gc>,
+    k: Value<'gc>,
+    v: Value<'gc>,
+) -> bool {
+    let state = t.inner().borrow();
+    let live = state.shape();
+    // See `ic_get` for the hint.
+    if std::hint::likely(matches!(cache, InlineCache::Own { .. }))
+        && let InlineCache::Own { shape, slot } = cache
+        && Shape::ptr_eq(live, shape)
+    {
+        // __newindex fires only on currently-nil keys.
+        let existing = unsafe { state.property_at(slot) };
+        if existing.is_nil() && live.has_mm(MetamethodBits::NEWINDEX) {
+            return false;
         }
-        InlineCache::Absent { shape } if Shape::ptr_eq(live, shape) => {
-            (!live.has_mm(MetamethodBits::INDEX)).then_some(Value::nil())
-        }
-        _ => None,
+        drop(state);
+        let mut state = t.inner().borrow_mut(ctx.mutation());
+        state.properties[slot as usize] = v;
+        state.maybe_update_mt_bit(k, v);
+        return true;
     }
+    if let InlineCache::Transition { from, to } = cache
+        && Shape::ptr_eq(live, from)
+    {
+        if live.has_mm(MetamethodBits::NEWINDEX) {
+            return false;
+        }
+        // Storing nil to an absent key adds nothing.
+        if v.is_nil() {
+            return true;
+        }
+        drop(state);
+        let mut state = t.inner().borrow_mut(ctx.mutation());
+        debug_assert_eq!(to.slot_count() as usize, state.properties.len() + 1);
+        state.shape = to;
+        state.properties.push(v);
+        state.maybe_update_mt_bit(k, v);
+        return true;
+    }
+    false
 }
 
 /// GETFIELD/SETFIELD/GETTABUP/SETTABUP only carry constant string keys.
@@ -682,8 +723,7 @@ fn get_own_fill_ic<'gc>(
 
 /// `t[k] = v` for a constant-key IC miss, with the same single lookup as
 /// [`get_own_fill_ic`]. Returns false, having stored nothing, when
-/// `__newindex` may fire. A store that adds `k` leaves the entry on the
-/// pre-transition shape.
+/// `__newindex` may fire.
 #[inline(always)]
 fn set_own_fill_ic<'gc>(
     ctx: Context<'gc>,
@@ -706,20 +746,32 @@ fn set_own_fill_ic<'gc>(
     }
     let key = constant_key(k);
     let slot = shape.find_slot(key);
-    fill_ic(ctx, closure, ic_idx, shape_entry(shape, slot));
     let existing = slot.map_or(Value::nil(), |s| unsafe { state.property_at(s) });
     if existing.is_nil() && newindex {
+        fill_ic(ctx, closure, ic_idx, shape_entry(shape, slot));
         return false;
     }
     drop(state);
     let mut state = t.inner().borrow_mut(ctx.mutation());
-    match slot {
-        Some(s) => {
-            state.properties[s as usize] = v;
+    let entry = match slot {
+        Some(slot) => {
+            state.properties[slot as usize] = v;
             state.maybe_update_mt_bit(k, v);
+            InlineCache::Own { shape, slot }
         }
-        None => state.add_string_key(ctx, key, v),
-    }
+        None => {
+            state.add_string_key(ctx, key, v);
+            let to = state.shape();
+            // A nil store adds nothing; past the cap the table went dict.
+            if Shape::ptr_eq(to, shape) || to.is_dict() {
+                InlineCache::Absent { shape }
+            } else {
+                InlineCache::Transition { from: shape, to }
+            }
+        }
+    };
+    drop(state);
+    fill_ic(ctx, closure, ic_idx, entry);
     true
 }
 
@@ -989,21 +1041,9 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
         tail!(settabup_slow);
     };
 
-    let v = reg!(src);
-    let cache = read_ic(closure, ic_idx);
-    let t_state = t.inner().borrow();
-    if let Some(slot) = ic_check(cache, t_state.shape()) {
-        let existing = unsafe { t_state.property_at(slot) };
-        // __newindex fires only on currently-nil keys.
-        if !(existing.is_nil() && t_state.shape().has_mm(MetamethodBits::NEWINDEX)) {
-            drop(t_state);
-            let mut state = t.inner().borrow_mut(ctx.mutation());
-            state.properties[slot as usize] = v;
-            state.maybe_update_mt_bit(constant!(key), v);
-            dispatch!()
-        }
+    if ic_set(ctx, read_ic(closure, ic_idx), t, constant!(key), reg!(src)) {
+        dispatch!();
     }
-    drop(t_state);
     tail!(settabup_slow);
 }
 
@@ -1234,20 +1274,15 @@ extern "rust-preserve-none" fn op_setfield<'gc>(
         tail!(setfield_slow);
     };
 
-    let v = reg!(src);
-    let cache = read_ic(closure, ic_idx);
-    let t_state = t.inner().borrow();
-    if let Some(slot) = ic_check(cache, t_state.shape()) {
-        let existing = unsafe { t_state.property_at(slot) };
-        if !(existing.is_nil() && t_state.shape().has_mm(MetamethodBits::NEWINDEX)) {
-            drop(t_state);
-            let mut state = t.inner().borrow_mut(ctx.mutation());
-            state.properties[slot as usize] = v;
-            state.maybe_update_mt_bit(constant!(key_idx), v);
-            dispatch!()
-        }
+    if ic_set(
+        ctx,
+        read_ic(closure, ic_idx),
+        t,
+        constant!(key_idx),
+        reg!(src),
+    ) {
+        dispatch!();
     }
-    drop(t_state);
     tail!(setfield_slow);
 }
 

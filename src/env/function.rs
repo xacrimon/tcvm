@@ -78,8 +78,10 @@ impl<'gc> Prototype<'gc> {
 /// in place by every metamethod-named write to the metatable, so a
 /// `Shape` pointer cached here remains a valid identity even as the
 /// metatable's metamethod set evolves.
+// A power-of-two size keeps indexing `ic_table` to a shift.
 #[derive(Clone, Copy, Collect, Default)]
 #[collect(internal, no_drop)]
+#[repr(align(32))]
 pub enum InlineCache<'gc> {
     // First, so the hottest hit tests a zero discriminant.
     /// Tables of `shape` hold the key at `TableState::properties[slot]`.
@@ -90,6 +92,9 @@ pub enum InlineCache<'gc> {
     },
     /// Tables of `shape` lack the key: a load is nil unless `__index` fires.
     Absent { shape: Shape<'gc> },
+    /// Tables of `from` lack the key; adding it moves them to `to`, which
+    /// holds it in the slot after `from`'s last.
+    Transition { from: Shape<'gc>, to: Shape<'gc> },
     #[default]
     Empty,
 }
