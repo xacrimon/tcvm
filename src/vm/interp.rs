@@ -1523,8 +1523,8 @@ extern "rust-preserve-none" fn op_newtable<'gc>(
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (dst, template) = instruction.ad();
     // SAFETY: the compiler gives each NEWTABLE a template.
-    let shape = unsafe { *closure.proto.templates.get_unchecked(template as usize) };
-    *reg!(ref mut dst) = Value::table(Table::new_with_shape(ctx.mutation(), shape));
+    let t = unsafe { closure.proto.templates.get_unchecked(template as usize) };
+    *reg!(ref mut dst) = Value::table(Table::from_template(ctx.mutation(), t));
     gc_check!();
     dispatch!();
 }

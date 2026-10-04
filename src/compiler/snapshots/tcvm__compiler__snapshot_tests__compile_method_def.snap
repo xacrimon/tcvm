@@ -4,33 +4,29 @@ expression: output
 ---
 ; function (params=0, vararg=true, stack=3, upvalues=1)
 ; constants:
-;   K0 = "v"
-;   K1 = 5
-;   K2 = "inner"
-;   K3 = "get"
-;   K4 = "add"
-;   K5 = "m"
-;   K6 = "plain"
+;   K0 = "inner"
+;   K1 = "get"
+;   K2 = "add"
+;   K3 = "m"
+;   K4 = "plain"
 ; upvalues:
 ;   U0 = local R0
 ; code:
 0000  [  1]  VARARGPREP      fixed=0
-0001  [  1]  NEWTABLE        R0 T0  ; {v, inner}
-0002  [  1]  LOAD            R1 K1  ; 5
-0003  [  1]  SETFIELD        R1 R0 K0  ; "v"
-0004  [  1]  NEWTABLE        R1 T1  ; {}
-0005  [  1]  SETFIELD        R1 R0 K2  ; "inner"
-0006  [  2]  CLOSURE         R1 P0
-0007  [  2]  SETFIELD        R1 R0 K3  ; "get"
-0008  [  3]  CLOSURE         R1 P1
-0009  [  3]  SETFIELD        R1 R0 K4  ; "add"
-0010  [  4]  GETFIELD        R1 R0 K2  ; "inner"
-0011  [  4]  CLOSURE         R2 P2
-0012  [  4]  SETFIELD        R2 R1 K5  ; "m"
-0013  [  5]  GETFIELD        R1 R0 K2  ; "inner"
-0014  [  5]  CLOSURE         R2 P3
-0015  [  5]  SETFIELD        R2 R1 K6  ; "plain"
-0016  [  5]  RETURN0
+0001  [  1]  NEWTABLE        R0 T1  ; {v=5, inner}
+0002  [  1]  NEWTABLE        R1 T0  ; {}
+0003  [  1]  SETFIELD        R1 R0 K0  ; "inner"
+0004  [  2]  CLOSURE         R1 P0
+0005  [  2]  SETFIELD        R1 R0 K1  ; "get"
+0006  [  3]  CLOSURE         R1 P1
+0007  [  3]  SETFIELD        R1 R0 K2  ; "add"
+0008  [  4]  GETFIELD        R1 R0 K0  ; "inner"
+0009  [  4]  CLOSURE         R2 P2
+0010  [  4]  SETFIELD        R2 R1 K3  ; "m"
+0011  [  5]  GETFIELD        R1 R0 K0  ; "inner"
+0012  [  5]  CLOSURE         R2 P3
+0013  [  5]  SETFIELD        R2 R1 K4  ; "plain"
+0014  [  5]  RETURN0
 
 ; prototype 0:
   ; function (params=1, vararg=false, stack=2, upvalues=0)

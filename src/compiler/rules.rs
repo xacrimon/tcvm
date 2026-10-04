@@ -7,7 +7,7 @@ use foldhash::fast::RandomState;
 use super::defs::{Chunk, ExprDesc, ExprKind, JumpList, Numeral, RegisterIndex, VarargInfo, Want};
 use super::{CompileError, CompileErrorKind, FuncLine, LineNumber};
 use crate::dmm::{Gc, Mutation};
-use crate::env::function::LocVar;
+use crate::env::function::{LocVar, Template};
 use crate::env::{LuaString, Prototype, value::Value};
 use crate::instruction::{
     IcIdx, Imm, Instruction, KIdx, Op, ProtoIdx, Reg, Shape, TemplateIdx, UpIdx, UpValueDescriptor,
@@ -17,7 +17,7 @@ use crate::parser::LineMap;
 use crate::parser::syntax::{
     Assign, BinaryOp, BinaryOperator, Break, Decl, DeclModifier, Do, Expr, ForGen, ForNum, Func,
     FuncCall, FuncExpr, Global, Goto, Ident, If, Index, Label, Literal, LiteralValue, MethodCall,
-    PrefixOp, PrefixOperator, Repeat, Return, Root, Stmt, SyntaxNode, Table, TableEntry,
+    PrefixOp, PrefixOperator, Repeat, Return, Root, Stmt, SyntaxNode, Table, TableEntry, TableMap,
     VarArgParam, While,
 };
 use crate::vm::num;
@@ -1355,36 +1355,78 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         self.alloc_constant(Value::string(lua_str))
     }
 
-    /// The template a constructor's `NEWTABLE` starts from: the shape of its
-    /// constant field names, in order, up to the shape-mode cap.
-    fn table_template(&mut self, entries: &[TableEntry]) -> Result<TemplateIdx, CompileError> {
-        use crate::env::shape::{MAX_PROPERTIES_FAST, Shape, transition_add_prop};
+    /// The template for a constructor with `entries`, before their values
+    /// compile: the shape of its constant field names in order, up to the
+    /// shape-mode cap, with every slot nil.
+    fn template_draft(
+        &mut self,
+        entries: &[TableEntry],
+    ) -> Result<TemplateDraft<'gc>, CompileError> {
+        use crate::env::shape::{MAX_PROPERTIES_FAST, transition_add_prop};
         let mut shape = self.ctx.empty_shape();
+        let mut repeated = Vec::new();
+        let mut keyed = false;
         for entry in entries {
-            let TableEntry::Map(map) = entry else {
-                continue;
+            let map = match entry {
+                TableEntry::Map(map) => map,
+                TableEntry::Generic(_) => {
+                    keyed = true;
+                    continue;
+                }
+                TableEntry::Array(_) => continue,
             };
-            let field = map.field().ok_or_else(|| ice("table map without field"))?;
-            let name = field
-                .name(self.interner)
-                .ok_or_else(|| ice("ident without name"))?;
-            let key = LuaString::new(self.ctx, name.as_bytes());
-            if shape.slot_count() < MAX_PROPERTIES_FAST && shape.find_slot(key).is_none() {
-                shape = transition_add_prop(self.ctx.mutation(), shape, key);
+            let key = self.field_key(map)?;
+            match shape.find_slot(key) {
+                Some(slot) => repeated[slot as usize] = true,
+                None if shape.slot_count() < MAX_PROPERTIES_FAST => {
+                    shape = transition_add_prop(self.ctx.mutation(), shape, key);
+                    repeated.push(false);
+                }
+                None => {}
             }
         }
+        Ok(TemplateDraft {
+            shape,
+            values: vec![Value::nil(); repeated.len()],
+            bakeable: repeated.iter().map(|&r| !r && !keyed).collect(),
+        })
+    }
+
+    /// `draft`'s index in the prototype's templates, shared with an identical one.
+    fn finish_template(&mut self, draft: TemplateDraft<'gc>) -> Result<TemplateIdx, CompileError> {
+        use crate::env::shape::Shape;
         let templates = &mut self.chunk.templates;
-        let idx = match templates.iter().position(|&s| Shape::ptr_eq(s, shape)) {
+        let same = |t: &Template<'gc>| {
+            Shape::ptr_eq(t.shape, draft.shape)
+                && t.values.len() == draft.values.len()
+                && t.values
+                    .iter()
+                    .zip(&draft.values)
+                    .all(|(a, b)| a.same_bits(b))
+        };
+        let idx = match templates.iter().position(same) {
             Some(idx) => idx,
             None if templates.len() > u16::MAX as usize => {
                 return Err(self.err(CompileErrorKind::Constructors));
             }
             None => {
-                templates.push(shape);
+                templates.push(Template {
+                    shape: draft.shape,
+                    values: draft.values.into_boxed_slice(),
+                });
                 templates.len() - 1
             }
         };
         Ok(TemplateIdx(idx as u16))
+    }
+
+    /// The name of a constructor's `name = value` field.
+    fn field_key(&self, map: &TableMap) -> Result<LuaString<'gc>, CompileError> {
+        let field = map.field().ok_or_else(|| ice("table map without field"))?;
+        let name = field
+            .name(self.interner)
+            .ok_or_else(|| ice("ident without name"))?;
+        Ok(LuaString::new(self.ctx, name.as_bytes()))
     }
 
     /// Allocate a string constant for use as a field/global/method key, and
@@ -3014,14 +3056,38 @@ fn property_field_name(ctx: &Ctx, field: &Expr) -> Result<Option<Vec<u8>>, Compi
     }
 }
 
+/// A constructor's [`Template`] while its entries compile.
+struct TemplateDraft<'gc> {
+    shape: crate::env::Shape<'gc>,
+    values: Vec<Value<'gc>>,
+    /// Per slot, whether a constant stored there may go in the template: its
+    /// field appears once, and no `[k] = v` entry could write it.
+    bakeable: Vec<bool>,
+}
+
+impl<'gc> TemplateDraft<'gc> {
+    /// Put `v` in `key`'s slot if it may go there.
+    fn bake(&mut self, key: LuaString<'gc>, v: Value<'gc>) -> bool {
+        match self.shape.find_slot(key) {
+            Some(slot) if self.bakeable[slot as usize] => {
+                self.values[slot as usize] = v;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, CompileError> {
     // Collected up front for the template, and so the last array entry can be
     // detected: a trailing call/`...` spreads its results rather than
     // adjusting to one.
     let entries: Vec<TableEntry> = item.entries().collect();
-    let template = ctx.table_template(&entries)?;
+    let mut draft = ctx.template_draft(&entries)?;
     let dst = ctx.alloc_register()?;
-    ctx.emit(Instruction::newtable(dst, template));
+    // The template is patched in once the entries have compiled.
+    let newtable_pc = ctx.chunk.tape.len();
+    ctx.emit(Instruction::newtable(dst, TemplateIdx(0)));
 
     let mut array_count: u16 = 0;
     let mut array_pending = 0u8;
@@ -3102,14 +3168,22 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
                     ctx.chunk.freereg = pending_base;
                 }
 
-                let field = map.field().ok_or_else(|| ice("table map without field"))?;
-                let field_expr = Expr::Ident(field);
-                let (key_idx, ic_idx) = try_property_key_constant(ctx, &field_expr)?
-                    .ok_or_else(|| ice("table map field without name"))?;
-
+                let key = ctx.field_key(&map)?;
                 let value_expr = map.value().ok_or_else(|| ice("table map without value"))?;
-                let val = compile_expr_to_reg(ctx, value_expr, None)?;
-
+                let pc = ctx.chunk.tape.len();
+                let mut value = compile_expr(ctx, value_expr, None)?;
+                // A constant that emitted nothing goes in the template if no
+                // other entry writes its field.
+                if ctx.chunk.tape.len() == pc
+                    && !value.has_jumps()
+                    && let Some(v) = const_kind_to_value(ctx.ctx.mutation(), value.kind)
+                    && draft.bake(key, v)
+                {
+                    continue;
+                }
+                let val = ctx.discharge_to_reg_mut(&mut value, None)?;
+                let key_idx = ctx.alloc_constant(Value::string(key))?;
+                let ic_idx = ctx.chunk.alloc_ic_slot();
                 ctx.emit(Instruction::setfield(
                     val,
                     dst,
@@ -3156,6 +3230,8 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
         ctx.chunk.freereg = pending_base;
     }
 
+    let template = ctx.finish_template(draft)?;
+    ctx.chunk.tape[newtable_pc] = Instruction::newtable(dst, template);
     Ok(dst)
 }
 

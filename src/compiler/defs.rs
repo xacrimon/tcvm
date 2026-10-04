@@ -1,6 +1,6 @@
 use crate::dmm::{Gc, Mutation};
-use crate::env::function::{IcTable, LocVar};
-use crate::env::{LuaString, Prototype, Shape, Value};
+use crate::env::function::{IcTable, LocVar, Template};
+use crate::env::{LuaString, Prototype, Value};
 /// Newtype for register indices, providing type safety over raw u8. Defined
 /// with the instruction word so the emitter can pass one straight to an
 /// instruction constructor.
@@ -252,7 +252,7 @@ pub struct Chunk<'gc> {
     /// prototype's `ic_table` length.
     pub(super) next_ic_idx: u16,
     /// Becomes `Prototype::templates`.
-    pub(super) templates: Vec<Shape<'gc>>,
+    pub(super) templates: Vec<Template<'gc>>,
 }
 
 impl<'gc> Chunk<'gc> {

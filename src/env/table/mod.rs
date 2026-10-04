@@ -9,6 +9,7 @@ use crate::Context;
 use crate::dmm::{
     Collect, Finalization, Gc, Mutation, RefLock, Trace, allocator_api::MetricsAlloc,
 };
+use crate::env::function::Template;
 use crate::env::shape::{self, MAX_KEYED_PROPERTIES, MAX_PROPERTIES_FAST, Shape, WeakMode};
 use crate::env::string::LuaString;
 use crate::env::value::{Value, ValueKind, value_hash};
@@ -24,11 +25,19 @@ impl<'gc> Table<'gc> {
         Self::new_with_shape(ctx.mutation(), ctx.empty_shape())
     }
 
-    /// Create a new table in `shape`, its keys all nil. Used by the
-    /// `Lua::new` bootstrap before a `Context` exists, and by `NEWTABLE`.
-    #[inline]
+    /// Create a new empty table in `shape`, which has no keys. Used by the
+    /// `Lua::new` bootstrap before a `Context` exists.
     pub fn new_with_shape(mc: &Mutation<'gc>, shape: Shape<'gc>) -> Self {
-        Table(Gc::new(mc, RefLock::new(TableState::new(mc, shape))))
+        Table(Gc::new(mc, RefLock::new(TableState::new(mc, shape, &[]))))
+    }
+
+    /// A constructor's table, as `NEWTABLE` makes it from `t`.
+    #[inline]
+    pub fn from_template(mc: &Mutation<'gc>, t: &Template<'gc>) -> Self {
+        Table(Gc::new(
+            mc,
+            RefLock::new(TableState::new(mc, t.shape, &t.values)),
+        ))
     }
 
     pub fn raw_get(self, key: Value<'gc>) -> Value<'gc> {
@@ -243,12 +252,13 @@ pub struct DictState<'gc> {
 pub struct InvalidKey;
 
 impl<'gc> TableState<'gc> {
-    fn new(mc: &Mutation<'gc>, shape: Shape<'gc>) -> Self {
-        let n = shape.slot_count() as usize;
+    /// A table in `shape` holding `values` in its slots.
+    fn new(mc: &Mutation<'gc>, shape: Shape<'gc>, values: &[Value<'gc>]) -> Self {
+        let n = values.len();
+        debug_assert_eq!(n, shape.slot_count() as usize);
         let mut properties = Vec::with_capacity_in(n, MetricsAlloc::new(mc));
-        // Not `resize`, whose fill is a library call even for a few slots.
-        for slot in &mut properties.spare_capacity_mut()[..n] {
-            slot.write(Value::nil());
+        for (slot, &v) in properties.spare_capacity_mut().iter_mut().zip(values) {
+            slot.write(v);
         }
         // SAFETY: the first `n` slots were just written.
         unsafe { properties.set_len(n) };
