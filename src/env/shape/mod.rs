@@ -155,11 +155,11 @@ pub fn metamethod_bit_of_bytes(name: &[u8]) -> Option<MetamethodBits> {
 /// as `GcWeak` won't retain their targets, so a transient sub-shape
 /// can be reclaimed by GC even while its parent is alive.
 pub struct TransitionTable<'gc> {
-    /// Property-add edges keyed by the added LuaString. In a cell so `trace`
-    /// can drop edges whose child is gone.
+    /// Property-add edges keyed by the added LuaString. Both tables are in
+    /// cells so `trace` can drop edges whose child is gone.
     by_prop: UnsafeCell<HashTable<PropEdge<'gc>, MetricsAlloc<'gc>>>,
     /// Set-metatable edges keyed by the new MtCache identity (None = no MT).
-    pub by_mt: HashTable<MtEdge<'gc>, MetricsAlloc<'gc>>,
+    by_mt: UnsafeCell<HashTable<MtEdge<'gc>, MetricsAlloc<'gc>>>,
 }
 
 /// The key is not traced: a live child keeps it alive through `last_key`, and
@@ -171,9 +171,17 @@ pub struct PropEdge<'gc> {
     pub child: GcWeak<'gc, ShapeData<'gc>>,
 }
 
-// SAFETY: traces every child weakly and `by_mt` fully; edge keys are
-// deliberately untraced (see `PropEdge`). Erasing from `trace(&self)` is sound
-// because the collector never runs while the mutator borrows the table.
+/// Like [`PropEdge`]'s key, the cache is not traced: a live child keeps it
+/// alive through its own `mt_cache`.
+#[derive(Clone, Copy)]
+pub struct MtEdge<'gc> {
+    pub mt_cache: Option<MtCache<'gc>>,
+    pub child: GcWeak<'gc, ShapeData<'gc>>,
+}
+
+// SAFETY: traces every child weakly; edge keys are deliberately untraced (see
+// `PropEdge`, `MtEdge`). Erasing from `trace(&self)` is sound because the
+// collector never runs while the mutator borrows the table.
 unsafe impl<'gc> Collect<'gc> for TransitionTable<'gc> {
     fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
         let by_prop = unsafe { &mut *self.by_prop.get() };
@@ -181,7 +189,11 @@ unsafe impl<'gc> Collect<'gc> for TransitionTable<'gc> {
         for e in by_prop.iter() {
             cc.trace(&e.child);
         }
-        cc.trace(&self.by_mt);
+        let by_mt = unsafe { &mut *self.by_mt.get() };
+        by_mt.retain(|e| !e.child.is_dropped());
+        for e in by_mt.iter() {
+            cc.trace(&e.child);
+        }
     }
 }
 
@@ -189,20 +201,17 @@ impl<'gc> TransitionTable<'gc> {
     fn new(mc: &Mutation<'gc>) -> Self {
         TransitionTable {
             by_prop: UnsafeCell::new(HashTable::new_in(MetricsAlloc::new(mc))),
-            by_mt: HashTable::new_in(MetricsAlloc::new(mc)),
+            by_mt: UnsafeCell::new(HashTable::new_in(MetricsAlloc::new(mc))),
         }
     }
 
     fn by_prop(&self) -> &HashTable<PropEdge<'gc>, MetricsAlloc<'gc>> {
         unsafe { &*self.by_prop.get() }
     }
-}
 
-#[derive(Clone, Copy, Collect)]
-#[collect(internal, no_drop)]
-pub struct MtEdge<'gc> {
-    pub mt_cache: Option<MtCache<'gc>>,
-    pub child: GcWeak<'gc, ShapeData<'gc>>,
+    fn by_mt(&self) -> &HashTable<MtEdge<'gc>, MetricsAlloc<'gc>> {
+        unsafe { &*self.by_mt.get() }
+    }
 }
 
 #[derive(Collect)]
@@ -617,7 +626,7 @@ pub fn transition_set_metatable<'gc>(
     {
         let table = parent.data().transitions.borrow();
         let h = mt_edge_hash(new_mt);
-        if let Some(edge) = table.by_mt.find(h, |e| mt_edge_eq(e.mt_cache, new_mt))
+        if let Some(edge) = table.by_mt().find(h, |e| mt_edge_eq(e.mt_cache, new_mt))
             && let Some(child) = edge.child.upgrade(mc)
         {
             return Shape(child);
@@ -650,7 +659,7 @@ pub fn transition_set_metatable<'gc>(
         let parent_write = Gc::write(mc, parent.0);
         let mut table = unlock!(parent_write, ShapeData, transitions).borrow_mut();
         let h = mt_edge_hash(new_mt);
-        let entry = table.by_mt.entry(
+        let entry = table.by_mt.get_mut().entry(
             h,
             |e| mt_edge_eq(e.mt_cache, new_mt),
             |e| mt_edge_hash(e.mt_cache),
