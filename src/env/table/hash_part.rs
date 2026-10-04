@@ -345,4 +345,51 @@ mod tests {
             }
         }
     }
+
+    /// Three keys share an address in turn: W dies in group 0, X dies in group 1, and Y
+    /// revives X's bucket past W's. A delete of Y must find Y's entry, not W's, even with a
+    /// true match for Y's dead tag right below W's, where upstream's generic group falsely
+    /// matched W's tag (Y's with the low bit flipped).
+    #[test]
+    fn reused_address_behind_a_dead_twin() {
+        let width = super::super::swiss::Group::WIDTH;
+        let h = |tag: u64, low: usize| tag << 57 | low as u64;
+        let new = |hash: u64| {
+            HEAP.with_borrow_mut(|m| {
+                m.push(hash);
+                Addr(m.len() - 1)
+            })
+        };
+        let reuse = |a: Addr, hash: u64| HEAP.with_borrow_mut(|m| m[a.0] = hash);
+        let mut t: Part<'_, Addr, Global> = RawTable::with_capacity_in(20, Global);
+        let v = Value::boolean(true);
+        // Fill group 0 so probes from it go on to group 1.
+        for tag in 1..=width as u64 - 2 {
+            let f = new(h(tag, 0));
+            set(&mut t, f.hash(), f, v);
+        }
+        let z = new(h(0x50, 0)); // dead tag 0x90, Y's
+        set(&mut t, z.hash(), z, v);
+        let a = new(h(0x11, 0)); // W, dead tag 0x91
+        set(&mut t, a.hash(), a, v);
+        set(&mut t, a.hash(), a, Value::nil());
+        reuse(a, h(0x50, width)); // X, dead tag 0x90
+        set(&mut t, a.hash(), a, v);
+        set(&mut t, a.hash(), a, Value::nil());
+        reuse(a, h(0x10, 0)); // Y, dead tag 0x90
+        set(&mut t, a.hash(), a, v);
+        assert_eq!(
+            position(&t, a.hash(), a),
+            Some(width),
+            "Y revives X's bucket"
+        );
+        set(&mut t, z.hash(), z, Value::nil());
+        set(&mut t, a.hash(), a, Value::nil());
+        assert!(
+            get(&t, a.hash(), a).is_nil(),
+            "delete of Y missed its entry"
+        );
+        assert_eq!(position(&t, a.hash(), a), Some(width));
+        assert_eq!(t.len(), width - 2);
+    }
 }

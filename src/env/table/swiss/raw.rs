@@ -9,6 +9,12 @@ use std::alloc::handle_alloc_error;
 
 use super::control::{BitMaskIter, Group, Tag, TagSliceExt};
 
+// `RawTableInner::replace_tag_in_group` stores a group as one `u64` or `u128`.
+const _: () = assert!(
+    Group::WIDTH == 8 || Group::WIDTH == 16,
+    "32-bit targets other than wasm32 are unsupported: their generic group is 4 bytes"
+);
+
 /// Primary hash function, used to select the initial bucket to probe from.
 #[inline]
 fn h1(hash: u64) -> usize {
@@ -175,8 +181,13 @@ impl TableLayout {
 
 /// A Swiss table of `Copy` entries. Deleting an entry leaves a *dead* bucket whose contents
 /// stay readable, so [`position`](Self::position) can still find it, until the next rehash
-/// drops it. Setting the key again revives it, so a key has at most one entry; other keys
-/// may take it like a tombstone.
+/// drops it. Setting the key again revives it; other keys may take it like a tombstone.
+///
+/// On a key's probe sequence, its entry comes before any other bucket with its tag and key
+/// bits, so a probe that also matches dead buckets finds the right one. Keys compared by
+/// address can share bits across entries once an address is reused. The order still holds
+/// because a new key takes the first free bucket, ahead of every dead one, and a revive only
+/// passes dead buckets whose tag differs, which tag matches, being exact, never take for it.
 pub(crate) struct RawTable<T: Copy, A: Allocator> {
     table: RawTableInner,
     alloc: A,
@@ -284,8 +295,8 @@ impl<T: Copy, A: Allocator> RawTable<T, A> {
         }
     }
 
-    /// The bucket of the entry, live or dead, that `eq` accepts. A set revives its key's dead
-    /// entry rather than inserting another, so a key has at most one.
+    /// The bucket of the entry, live or dead, that `eq` accepts: the key's own, by the order
+    /// on [`RawTable`].
     #[inline]
     pub(crate) fn position(&self, hash: u64, mut eq: impl FnMut(&T) -> bool) -> Option<usize> {
         // A traversal's cursor is nearly always live, and probing live tags alone keeps the
@@ -335,8 +346,9 @@ impl<T: Copy, A: Allocator> RawTable<T, A> {
     ///
     /// # Safety
     ///
-    /// `index` must come from [`find_or_find_insert_index`](Self::find_or_find_insert_index)
-    /// as `Err`, with no mutation since.
+    /// `index` must be a free bucket from a probe, either
+    /// [`find_or_find_insert_index`](Self::find_or_find_insert_index) as `Err` or
+    /// `RawTableInner::find_insert_index`, with no mutation since.
     #[inline]
     pub(crate) unsafe fn needs_growth(&self, index: usize) -> bool {
         self.table.growth_left == 0 && unsafe { *self.table.ctrl(index) }.special_is_empty()
@@ -346,8 +358,8 @@ impl<T: Copy, A: Allocator> RawTable<T, A> {
     ///
     /// # Safety
     ///
-    /// `index` must come from [`find_or_find_insert_index`](Self::find_or_find_insert_index)
-    /// for `hash` as `Err`, without [`needs_growth`](Self::needs_growth), with no mutation since.
+    /// `index` must be a free bucket from a probe for `hash`, as for
+    /// [`needs_growth`](Self::needs_growth), which must be false for it.
     #[inline]
     pub(crate) unsafe fn insert_at_index(&mut self, index: usize, hash: u64, value: T) {
         unsafe {
@@ -632,7 +644,7 @@ impl RawTableInner {
             // (or are `Group::static_empty()` for the unallocated table).
             let group = unsafe { Group::load_aligned(self.ctrl(probe_seq.pos)) };
 
-            // A key has at most one entry, so live and dead matches are tried together.
+            // A key's entry is its first match, live or dead, so both tags are tried together.
             for bit in group.match_tag(tag_hash) | group.match_tag(tag_dead) {
                 let index = (probe_seq.pos + bit) & self.bucket_mask;
 
