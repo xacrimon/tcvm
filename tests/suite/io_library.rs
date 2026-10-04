@@ -341,3 +341,29 @@ fn lines_format_cap() {
          assert(msg:find(\"too many arguments\", 1, true), msg)",
     );
 }
+
+#[test]
+fn read_formats_and_io_errors() {
+    // #252: formats match on their first letter and are parsed lazily, and a
+    // read error is a `(nil, msg, errno)` result that a lines loop raises.
+    let p = tmp_path("read_fmts");
+    assert_runs(&format!(
+        "local w = io.open({p:?}, \"w\"); w:write(\"abc\\n12\\n\")\n\
+         local wn, wmsg, wcode = w:read(\"l\")\n\
+         local lok, lmsg = pcall(function() for _ in w:lines() do end end)\n\
+         w:close()\n\
+         local r = io.open({p:?})\n\
+         local line, num, rest = r:read(\"line\", \"*number\", \"all\")\n\
+         local eof = r:read(\"l\", \"x\")\n\
+         local bad = not pcall(r.read, r, \"**a\") and not pcall(r.read, r, \"5\")\n\
+         r:close()\n\
+         local it = io.lines({p:?}, \"x\")\n\
+         assert(wn == nil and wmsg == \"Bad file descriptor\" and wcode == 9, \"read of a w file\")\n\
+         assert(not lok and lmsg == \"Bad file descriptor\", \"lines raises read errors\")\n\
+         assert(line == \"abc\" and num == 12 and rest == \"\\n\", \"first-letter formats\")\n\
+         assert(eof == nil, \"formats after EOF unchecked\")\n\
+         assert(bad, \"bad formats raise\")\n\
+         assert(not pcall(it), \"lines checks formats on iteration\")"
+    ));
+    let _ = std::fs::remove_file(&p);
+}

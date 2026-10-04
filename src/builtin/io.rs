@@ -359,19 +359,21 @@ fn seek_stream(fs: &mut FileState, pos: SeekFrom) -> SeekOutcome {
     }
 }
 
-/// Read each format in order. EOF / failure on a format yields `Nil` and
-/// stops (no further formats are read), matching PUC-Lua.
-fn read_formats<R: BufRead>(r: &mut R, fmts: &[ReadFmt]) -> std::io::Result<Vec<ReadOne>> {
-    let mut out = Vec::with_capacity(fmts.len());
-    for &fmt in fmts {
-        let one = read_one(r, fmt)?;
-        let stop = matches!(one, ReadOne::Nil);
-        out.push(one);
-        if stop {
-            break;
-        }
+/// One format from `fs`. A stream without read access fails with the EBADF
+/// its fd would give.
+fn read_stream(fs: &mut FileState, fmt: ReadFmt) -> std::io::Result<ReadOne> {
+    let ebadf = || Err(std::io::Error::from_raw_os_error(9));
+    match fs {
+        FileState::Closed => unreachable!("do_read rejects closed files"),
+        FileState::Open {
+            readable: false, ..
+        } => ebadf(),
+        FileState::Open { stream, .. } => match stream {
+            Stream::File(br) => read_one(br, fmt),
+            Stream::Stdin => read_one(&mut std::io::stdin().lock(), fmt),
+            Stream::Stdout | Stream::Stderr => ebadf(),
+        },
     }
-    Ok(out)
 }
 
 fn read_one<R: BufRead>(r: &mut R, fmt: ReadFmt) -> std::io::Result<ReadOne> {
@@ -538,101 +540,69 @@ fn do_write<'gc>(
     Ok(with_state(u, |fs| write_bytes(fs, &buf)))
 }
 
-/// Read `fmts` from `u`, returning the resulting Lua values (with the
-/// break-on-failure semantics of `read_formats`). A closed file is a
-/// raised error; a read I/O error surfaces as a trailing `nil` value.
+/// Read `fmt_vals` from `u` (`g_read`), no formats meaning one line. Each
+/// format is parsed only when its turn comes, so those after a failed one
+/// are never checked. A closed file is a raised error; an I/O error replaces
+/// the results with `(nil, msg, errno)`.
 fn do_read<'gc>(
     ctx: Context<'gc>,
     u: Userdata<'gc>,
-    fmts: &[ReadFmt],
+    fmt_vals: &[Value<'gc>],
+    fname: &str,
+    first_arg: usize,
 ) -> Result<Vec<Value<'gc>>, Error<'gc>> {
-    enum Dispatch {
-        Closed,
-        NotReadable,
-        Done(std::io::Result<Vec<ReadOne>>),
+    if is_closed(u) {
+        return Err(closed_file_error(ctx));
     }
-    let dispatch = u
-        .with_data::<LuaFile, _>(|lf| {
-            let mut fs = lf.state.borrow_mut();
-            match &mut *fs {
-                FileState::Closed => Dispatch::Closed,
-                FileState::Open {
-                    readable: false, ..
-                } => Dispatch::NotReadable,
-                FileState::Open { stream, .. } => match stream {
-                    Stream::File(br) => Dispatch::Done(read_formats(br, fmts)),
-                    Stream::Stdin => {
-                        let stdin = std::io::stdin();
-                        Dispatch::Done(read_formats(&mut stdin.lock(), fmts))
-                    }
-                    Stream::Stdout | Stream::Stderr => Dispatch::NotReadable,
-                },
+    let n = fmt_vals.len().max(1);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let fmt = match fmt_vals.get(i) {
+            Some(&v) => parse_format(ctx, v, fname, first_arg + i)?,
+            None => ReadFmt::Line { keep_eol: false },
+        };
+        let one = with_state(u, |fs| read_stream(fs, fmt));
+        let v = match one {
+            Err(e) => return Ok(io_fail(ctx, None, &e).to_vec()),
+            Ok(ReadOne::Nil) => {
+                out.push(Value::nil());
+                break;
             }
-        })
-        .expect("file handle must carry a LuaFile payload");
-
-    let raw = match dispatch {
-        Dispatch::Closed => return Err(closed_file_error(ctx)),
-        // A non-readable stream reads as immediate EOF.
-        Dispatch::NotReadable => return Ok(vec![Value::nil()]),
-        // A genuine read error degrades to a fail value, matching Lua's read.
-        Dispatch::Done(Err(_)) => return Ok(vec![Value::nil()]),
-        Dispatch::Done(Ok(v)) => v,
-    };
-    Ok(raw
-        .into_iter()
-        .map(|r| match r {
-            ReadOne::Nil => Value::nil(),
-            ReadOne::Bytes(b) => Value::string(LuaString::new(ctx, &b)),
-            ReadOne::Int(i) => Value::integer(ctx.mutation(), i),
-            ReadOne::Float(f) => Value::float(f),
-        })
-        .collect())
+            Ok(ReadOne::Bytes(b)) => Value::string(LuaString::new(ctx, &b)),
+            Ok(ReadOne::Int(i)) => Value::integer(ctx.mutation(), i),
+            Ok(ReadOne::Float(f)) => Value::float(f),
+        };
+        out.push(v);
+    }
+    Ok(out)
 }
 
-/// One read format from a Lua value: a string spec (`"l"`,`"L"`,`"n"`,`"a"`,
-/// with an optional leading `*` for 5.1 compatibility) or a byte count.
+/// One read format: a byte count, or a string whose first letter, after an
+/// optional `*`, picks the format.
 fn parse_format<'gc>(
     ctx: Context<'gc>,
     v: Value<'gc>,
     fname: &str,
     n: usize,
 ) -> Result<ReadFmt, Error<'gc>> {
-    if let Some(i) = util::to_integer(v) {
-        if i < 0 {
-            return Err(util::arg_error(ctx, fname, n, "invalid format"));
-        }
-        return Ok(ReadFmt::Bytes(i as usize));
+    let invalid = || Err(util::arg_error(ctx, fname, n, "invalid format"));
+    if v.get_integer().is_some() || v.get_float().is_some() {
+        // A negative count is invalid, where Lua's size_t cast fails it as
+        // "resulting string too large".
+        return match usize::try_from(util::check_integer(ctx, v, fname, n)?) {
+            Ok(count) => Ok(ReadFmt::Bytes(count)),
+            Err(_) => invalid(),
+        };
     }
-    if let Some(s) = v.get_string() {
-        let b = s.as_bytes();
-        let spec = b.strip_prefix(b"*").unwrap_or(b);
-        match spec {
-            b"l" => return Ok(ReadFmt::Line { keep_eol: false }),
-            b"L" => return Ok(ReadFmt::Line { keep_eol: true }),
-            b"a" => return Ok(ReadFmt::All),
-            b"n" => return Ok(ReadFmt::Number),
-            _ => {}
-        }
+    let s = util::check_string(ctx, v, fname, n)?;
+    let b = s.as_bytes();
+    match b.strip_prefix(b"*").unwrap_or(b).first() {
+        Some(b'l') => Ok(ReadFmt::Line { keep_eol: false }),
+        Some(b'L') => Ok(ReadFmt::Line { keep_eol: true }),
+        Some(b'a') => Ok(ReadFmt::All),
+        Some(b'n') => Ok(ReadFmt::Number),
+        _ => invalid(),
     }
-    Err(util::arg_error(ctx, fname, n, "invalid format"))
-}
-
-/// Build the read-format list from a window of argument values, defaulting
-/// to a single `"l"` when empty.
-fn parse_formats<'gc>(
-    ctx: Context<'gc>,
-    args: &[Value<'gc>],
-    fname: &str,
-    first_arg: usize,
-) -> Result<Vec<ReadFmt>, Error<'gc>> {
-    if args.is_empty() {
-        return Ok(vec![ReadFmt::Line { keep_eol: false }]);
-    }
-    args.iter()
-        .enumerate()
-        .map(|(i, v)| parse_format(ctx, *v, fname, first_arg + i))
-        .collect()
 }
 
 /// Open `path` per a Lua mode string, returning a new file handle. Errors
@@ -768,8 +738,7 @@ fn lua_read<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let inp = io_file(ctx, closure, "input")?;
-    let fmts = parse_formats(ctx, stack.as_slice(), "read", 1)?;
-    let vals = do_read(ctx, inp, &fmts)?;
+    let vals = do_read(ctx, inp, stack.as_slice(), "read", 1)?;
     stack.replace(&vals);
     Ok(CallbackAction::Return)
 }
@@ -883,8 +852,6 @@ fn lua_lines<'gc>(
         })?;
         (Value::userdata(u), true)
     };
-    // Validate formats up front (Lua reports lines-format errors eagerly).
-    parse_formats(ctx, fmt_args, "lines", 2)?;
     let iter = Value::function(make_lines_iter(ctx, handle, close_eof, fmt_args)?);
     if close_eof {
         stack.replace(&[iter, Value::nil(), Value::nil(), handle]);
@@ -971,8 +938,7 @@ fn lua_file_read<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let u = check_file(ctx, closure, stack.get(0), "read", 1)?;
-    let fmts = parse_formats(ctx, &stack.as_slice()[1..], "read", 2)?;
-    let vals = do_read(ctx, u, &fmts)?;
+    let vals = do_read(ctx, u, &stack.as_slice()[1..], "read", 2)?;
     stack.replace(&vals);
     Ok(CallbackAction::Return)
 }
@@ -986,7 +952,6 @@ fn lua_file_lines<'gc>(
     let self_val = stack.get(0);
     check_file(ctx, closure, self_val, "lines", 1)?;
     let fmt_args = &stack.as_slice()[1..];
-    parse_formats(ctx, fmt_args, "lines", 2)?;
     let iter = make_lines_iter(ctx, self_val, false, fmt_args)?;
     stack.ret1(Value::function(iter));
     Ok(CallbackAction::Return)
@@ -1215,20 +1180,14 @@ fn lines_iter<'gc>(
     if is_closed(u) {
         return Err(Error::from_str(ctx, "file is already closed"));
     }
-    let fmt_vals = &closure.upvalues[2..];
-    let fmts: Vec<ReadFmt> = if fmt_vals.is_empty() {
-        vec![ReadFmt::Line { keep_eol: false }]
-    } else {
-        fmt_vals
-            .iter()
-            .enumerate()
-            .map(|(i, v)| parse_format(ctx, *v, "lines", i + 1))
-            .collect::<Result<_, _>>()?
-    };
-
-    let vals = do_read(ctx, u, &fmts)?;
-    // EOF iff the (first) record came back nil.
-    if vals.first().map(|v| v.is_nil()).unwrap_or(true) {
+    // Lua blames the formats from argument #2, as if called with the file.
+    let vals = do_read(ctx, u, &closure.upvalues[2..], "for iterator", 2)?;
+    if vals[0].is_nil() {
+        // A fail carrying a message is an I/O error, raised rather than
+        // ending the loop.
+        if let Some(&msg) = vals.get(1) {
+            return Err(Error::new(ctx, msg));
+        }
         if close_eof {
             close_stream(u);
         }
