@@ -2,41 +2,38 @@
 source: src/compiler/snapshot_tests.rs
 expression: output
 ---
-; function (params=0, vararg=true, stack=5, upvalues=1)
+; function (params=0, vararg=true, stack=1, upvalues=1)
 ; constants:
-;   K0 = 5
-;   K1 = 7
-;   K2 = true
-;   K3 = nil
-;   K4 = "a"
-;   K5 = 8
-;   K6 = "b"
-;   K7 = 14
-;   K8 = "c"
-;   K9 = -5
-;   K10 = "d"
-;   K11 = false
-;   K12 = "e"
-;   K13 = "f"
-;   K14 = 36
+;   K0 = "a"
+;   K1 = 8
+;   K2 = "b"
+;   K3 = 14
+;   K4 = "c"
+;   K5 = -5
+;   K6 = "d"
+;   K7 = false
+;   K8 = "e"
+;   K9 = true
+;   K10 = "f"
+;   K11 = 36
+;   K12 = "g"
+;   K13 = "hello"
 ; upvalues:
 ;   U0 = local R0
 ; code:
 0000  [  1]  VARARGPREP      fixed=0
-0001  [  6]  LOAD            R0 K0  ; 5
-0002  [  7]  LOAD            R1 K1  ; 7
-0003  [  8]  LOAD            R2 K2  ; true
-0004  [  9]  LOAD            R3 K3  ; nil
-0005  [ 11]  LOAD            R4 K5  ; 8
-0006  [ 11]  SETTABUP        R4 U0 K4  ; "a"
-0007  [ 12]  LOAD            R4 K7  ; 14
-0008  [ 12]  SETTABUP        R4 U0 K6  ; "b"
-0009  [ 13]  LOAD            R4 K9  ; -5
-0010  [ 13]  SETTABUP        R4 U0 K8  ; "c"
-0011  [ 14]  LOAD            R4 K11  ; false
-0012  [ 14]  SETTABUP        R4 U0 K10  ; "d"
-0013  [ 15]  LOAD            R4 K2  ; true
-0014  [ 15]  SETTABUP        R4 U0 K12  ; "e"
-0015  [ 16]  LOAD            R4 K14  ; 36
-0016  [ 16]  SETTABUP        R4 U0 K13  ; "f"
-0017  [ 16]  RETURN0
+0001  [ 11]  LOAD            R0 K1  ; 8
+0002  [ 11]  SETTABUP        R0 U0 K0  ; "a"
+0003  [ 12]  LOAD            R0 K3  ; 14
+0004  [ 12]  SETTABUP        R0 U0 K2  ; "b"
+0005  [ 13]  LOAD            R0 K5  ; -5
+0006  [ 13]  SETTABUP        R0 U0 K4  ; "c"
+0007  [ 14]  LOAD            R0 K7  ; false
+0008  [ 14]  SETTABUP        R0 U0 K6  ; "d"
+0009  [ 15]  LOAD            R0 K9  ; true
+0010  [ 15]  SETTABUP        R0 U0 K8  ; "e"
+0011  [ 16]  LOAD            R0 K11  ; 36
+0012  [ 16]  SETTABUP        R0 U0 K10  ; "f"
+0013  [ 17]  LOAD            R0 K13  ; "hello"
+0014  [ 17]  SETTABUP        R0 U0 K12  ; "g"
+0015  [ 17]  RETURN0

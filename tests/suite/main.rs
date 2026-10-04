@@ -9,6 +9,7 @@ mod call_sugar;
 mod common;
 mod compare_ops;
 mod compile_limits;
+mod const_locals;
 mod coroutine_basic;
 mod coroutine_close;
 mod coroutine_error;

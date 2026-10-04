@@ -117,6 +117,31 @@ fn local_variables() {
 }
 
 #[test]
+fn folded_consts() {
+    // A folded `<const>` owns no register, so it counts toward neither limit.
+    assert_eq!(
+        limit(
+            r#"local t = {} for i = 1, 300 do t[i] = "local c" .. i .. " <const> = " .. i end
+               return cat(load(table.concat(t, " ") .. " return c300")())"#
+        ),
+        "300"
+    );
+    assert_eq!(
+        limit(r#"return cat(load(locals(200) .. " local k <const> = 1 return k")())"#),
+        "1"
+    );
+    // lua says "too many registers": it folds only a list's last name.
+    assert_eq!(
+        limit(
+            r#"local v = {} for i = 1, 300 do v[i] = i end
+               return cat(load("local " .. names("c", 300):gsub(",", " <const>,") .. " <const> = " ..
+                 table.concat(v, ", ") .. " return c300, c1")())"#
+        ),
+        "300 1"
+    );
+}
+
+#[test]
 fn returns() {
     assert_eq!(
         limit(r##"return cat(select("#", load("return 10" .. string.rep(",10", 253))()))"##),
