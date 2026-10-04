@@ -24,9 +24,9 @@ impl<'gc> Table<'gc> {
         Self::new_with_shape(ctx.mutation(), ctx.empty_shape())
     }
 
-    /// Create a new empty table starting at the given shape. Used by the
-    /// `Lua::new` bootstrap before a `Context` exists, and by paths that
-    /// already have the shape in hand.
+    /// Create a new table in `shape`, its keys all nil. Used by the
+    /// `Lua::new` bootstrap before a `Context` exists, and by `NEWTABLE`.
+    #[inline]
     pub fn new_with_shape(mc: &Mutation<'gc>, shape: Shape<'gc>) -> Self {
         Table(Gc::new(mc, RefLock::new(TableState::new(mc, shape))))
     }
@@ -244,9 +244,17 @@ pub struct InvalidKey;
 
 impl<'gc> TableState<'gc> {
     fn new(mc: &Mutation<'gc>, shape: Shape<'gc>) -> Self {
+        let n = shape.slot_count() as usize;
+        let mut properties = Vec::with_capacity_in(n, MetricsAlloc::new(mc));
+        // Not `resize`, whose fill is a library call even for a few slots.
+        for slot in &mut properties.spare_capacity_mut()[..n] {
+            slot.write(Value::nil());
+        }
+        // SAFETY: the first `n` slots were just written.
+        unsafe { properties.set_len(n) };
         Self {
             shape,
-            properties: Vec::new_in(MetricsAlloc::new(mc)),
+            properties,
             array: Vec::new_in(MetricsAlloc::new(mc)),
             int_hash: hash_part::Part::new_in(MetricsAlloc::new(mc)),
             len_hint: Cell::new(0),

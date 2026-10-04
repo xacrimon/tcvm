@@ -11,7 +11,7 @@ expression: output
 ;   U0 = local R0
 ; code:
 0000  [  1]  VARARGPREP      fixed=0
-0001  [  6]  NEWTABLE        R0
+0001  [  6]  NEWTABLE        R0 T0  ; {}
 0002  [  7]  LOAD            R1 K0  ; "abc"
 0003  [  7]  LEN             R1 R1
 0004  [  9]  SETTABUP        R0 U0 K1  ; "b"

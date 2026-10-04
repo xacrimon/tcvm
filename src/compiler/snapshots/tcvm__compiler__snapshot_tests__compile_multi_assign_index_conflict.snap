@@ -11,7 +11,7 @@ expression: output
 ; code:
 0000  [  1]  VARARGPREP      fixed=0
 0001  [  1]  LOAD            R0 K0  ; 3
-0002  [  2]  NEWTABLE        R1
+0002  [  2]  NEWTABLE        R1 T0  ; {}
 0003  [  3]  ADDI            R2 R0 #1
 0004  [  3]  LOAD            R3 K1  ; 20
 0005  [  3]  SETTABLE        R3 R1 R0

@@ -10,7 +10,7 @@ use crate::dmm::{Gc, Mutation};
 use crate::env::function::LocVar;
 use crate::env::{LuaString, Prototype, value::Value};
 use crate::instruction::{
-    IcIdx, Imm, Instruction, KIdx, Op, ProtoIdx, Reg, Shape, UpIdx, UpValueDescriptor,
+    IcIdx, Imm, Instruction, KIdx, Op, ProtoIdx, Reg, Shape, TemplateIdx, UpIdx, UpValueDescriptor,
 };
 use crate::lua;
 use crate::parser::LineMap;
@@ -1353,6 +1353,38 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     fn alloc_string_constant(&mut self, s: &[u8]) -> Result<u16, CompileError> {
         let lua_str = LuaString::new(self.ctx, s);
         self.alloc_constant(Value::string(lua_str))
+    }
+
+    /// The template a constructor's `NEWTABLE` starts from: the shape of its
+    /// constant field names, in order, up to the shape-mode cap.
+    fn table_template(&mut self, entries: &[TableEntry]) -> Result<TemplateIdx, CompileError> {
+        use crate::env::shape::{MAX_PROPERTIES_FAST, Shape, transition_add_prop};
+        let mut shape = self.ctx.empty_shape();
+        for entry in entries {
+            let TableEntry::Map(map) = entry else {
+                continue;
+            };
+            let field = map.field().ok_or_else(|| ice("table map without field"))?;
+            let name = field
+                .name(self.interner)
+                .ok_or_else(|| ice("ident without name"))?;
+            let key = LuaString::new(self.ctx, name.as_bytes());
+            if shape.slot_count() < MAX_PROPERTIES_FAST && shape.find_slot(key).is_none() {
+                shape = transition_add_prop(self.ctx.mutation(), shape, key);
+            }
+        }
+        let templates = &mut self.chunk.templates;
+        let idx = match templates.iter().position(|&s| Shape::ptr_eq(s, shape)) {
+            Some(idx) => idx,
+            None if templates.len() > u16::MAX as usize => {
+                return Err(self.err(CompileErrorKind::Constructors));
+            }
+            None => {
+                templates.push(shape);
+                templates.len() - 1
+            }
+        };
+        Ok(TemplateIdx(idx as u16))
     }
 
     /// Allocate a string constant for use as a field/global/method key, and
@@ -2983,8 +3015,13 @@ fn property_field_name(ctx: &Ctx, field: &Expr) -> Result<Option<Vec<u8>>, Compi
 }
 
 fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, CompileError> {
+    // Collected up front for the template, and so the last array entry can be
+    // detected: a trailing call/`...` spreads its results rather than
+    // adjusting to one.
+    let entries: Vec<TableEntry> = item.entries().collect();
+    let template = ctx.table_template(&entries)?;
     let dst = ctx.alloc_register()?;
-    ctx.emit(Instruction::newtable(dst));
+    ctx.emit(Instruction::newtable(dst, template));
 
     let mut array_count: u16 = 0;
     let mut array_pending = 0u8;
@@ -2993,9 +3030,6 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
     // and after each Map/Generic SETTABLE.
     let pending_base = ctx.chunk.freereg;
 
-    // Collected up front so the last array entry can be detected: a trailing
-    // call/`...` spreads its results rather than adjusting to one.
-    let entries: Vec<TableEntry> = item.entries().collect();
     let total = entries.len();
 
     for (i, entry) in entries.into_iter().enumerate() {

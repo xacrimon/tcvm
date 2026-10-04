@@ -13,7 +13,7 @@ expression: output
 ;   U0 = local R0
 ; code:
 0000  [  1]  VARARGPREP      fixed=0
-0001  [  1]  NEWTABLE        R0
+0001  [  1]  NEWTABLE        R0 T0  ; {}
 0002  [  2]  LOAD            R1 K0  ; 1
 0003  [  2]  LOAD            R2 K1  ; 3
 0004  [  2]  LOAD            R3 K0  ; 1

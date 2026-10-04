@@ -16,7 +16,7 @@ expression: output
 0004  [ 11]  MOVE            R3 R0
 0005  [ 11]  CALL            R3 args=1 ret=2
 0006  [ 11]  LOAD            R4 K0  ; nil
-0007  [ 14]  NEWTABLE        R5
+0007  [ 14]  NEWTABLE        R5 T0  ; {}
 0008  [ 17]  CLOSURE         R6 P1
 0009  [ 17]  SETFIELD        R6 R5 K1  ; "meth"
 0010  [ 18]  SELF            R6 R5 K1  ; "meth"

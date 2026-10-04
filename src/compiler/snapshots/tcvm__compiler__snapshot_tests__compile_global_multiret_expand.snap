@@ -83,7 +83,7 @@ expression: output
   0030  [ 17]  GETTABUP        R2 U0 K8  ; "i"
   0031  [ 17]  ERRNNIL         R2 name=K8
   0032  [ 17]  SETTABUP        R1 U0 K8  ; "i"
-  0033  [ 19]  NEWTABLE        R0
+  0033  [ 19]  NEWTABLE        R0 T0  ; {}
   0034  [ 22]  CLOSURE         R1 P0
   0035  [ 22]  SETFIELD        R1 R0 K9  ; "m"
   0036  [ 23]  SELF            R1 R0 K9  ; "m"

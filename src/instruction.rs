@@ -49,6 +49,9 @@ pub struct IcIdx(pub u16);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProtoIdx(pub u16);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TemplateIdx(pub u16);
+
 /// A number packed into an immediate opcode's 32-bit slot. Bit 0 set: a 31-bit
 /// integer stored as `n << 1 | 1`. Bit 0 clear: an `f32` bit pattern, so only
 /// floats whose low mantissa bit is clear qualify (`0.5`, `2.0`; not `0.1`).
@@ -118,6 +121,7 @@ impl_operand! {
     KIdx     => |self| self.0 as u64,
     IcIdx    => |self| self.0 as u64,
     ProtoIdx => |self| self.0 as u64,
+    TemplateIdx => |self| self.0 as u64,
     u8       => |self| self as u64,
     u16      => |self| self as u64,
     bool     => |self| self as u64,
@@ -693,7 +697,8 @@ instructions! {
     /// Backs `obj:m(...)` codegen.
     0x0b SELF       self_       Abde  { dst: Reg, object: Reg, ic_idx: IcIdx, key_idx: KIdx }
 
-    0x0c NEWTABLE   newtable    A     { dst: Reg }
+    /// `R[dst] = {}`, already in the shape `templates[template]`.
+    0x0c NEWTABLE   newtable    Ad    { dst: Reg, template: TemplateIdx }
     0x0d ADD        add         Abc   { dst: Reg, lhs: Reg, rhs: Reg }
     0x0e SUB        sub         Abc   { dst: Reg, lhs: Reg, rhs: Reg }
     0x0f MUL        mul         Abc   { dst: Reg, lhs: Reg, rhs: Reg }

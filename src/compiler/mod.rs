@@ -71,6 +71,8 @@ pub enum CompileErrorKind {
     Functions,
     #[error("too many constants")]
     Constants,
+    #[error("too many table constructors")]
+    Constructors,
     #[error("label '{0}' already defined on line {1}")]
     DuplicateLabel(String, u32),
     #[error("no visible label '{0}' for <goto> at line {1}")]
