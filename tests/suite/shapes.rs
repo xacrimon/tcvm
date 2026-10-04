@@ -199,3 +199,33 @@ return table.concat({keys(a), keys(b), keys(c), o.get(), n, keys(d),
     );
     assert_eq!(run(&src), "600 180300 1 600");
 }
+
+/// Constant fields come with the table, unless another entry may write the
+/// same field, which keeps the left-to-right result; every table gets its
+/// own copy of them.
+#[test]
+fn constructor_constants() {
+    let src = r#"
+local function f() return 'f' end
+local k = 'x'
+local c <const> = 7
+local a = {x = 1, x = f()}
+local b = {x = f(), x = 1}
+local d = {[k] = 2, x = 1}
+local e = {x = 1, [k] = 2}
+local g = {c = c, s = 'str', t = true, no = false, fl = 1.5, neg = -3,
+  big = 9007199254740993, prod = 2 * 3, alt = nil or 5}
+local out = {}
+for i = 1, 2 do
+  local t = {v = 1, w = 'w'}
+  out[i] = t.v .. t.w
+  t.v, t.w = 99, nil
+end
+return table.concat({a.x, b.x, d.x, e.x, g.c, g.s, tostring(g.t), tostring(g.no), g.fl,
+  g.neg, math.type(g.big), g.big, g.prod, g.alt, out[1], out[2]}, ' ')
+"#;
+    assert_eq!(
+        run(src),
+        "f 1 1 2 7 str true false 1.5 -3 integer 9007199254740993 6 5 1w 1w"
+    );
+}

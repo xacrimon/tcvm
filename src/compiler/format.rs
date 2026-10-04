@@ -148,10 +148,15 @@ fn format_instruction(instr: &Instruction, proto: &Prototype<'_>) -> String {
         }
         Op::NEWTABLE => {
             let (dst, template) = instr.ad();
-            let keys: Vec<String> = proto.templates[template as usize]
-                .keys()
-                .iter()
-                .map(|k| String::from_utf8_lossy(k.as_bytes()).into_owned())
+            let t = &proto.templates[template as usize];
+            let keys: Vec<String> = (t.shape.keys().iter().zip(&t.values))
+                .map(|(k, v)| {
+                    let k = String::from_utf8_lossy(k.as_bytes());
+                    match v.is_nil() {
+                        true => k.into_owned(),
+                        false => format!("{k}={}", format_value(v)),
+                    }
+                })
                 .collect();
             format!(
                 "NEWTABLE        R{dst} T{template}  ; {{{}}}",

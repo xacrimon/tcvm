@@ -11,8 +11,8 @@ expression: output
 ;   K4 = 2
 ;   K5 = 3
 ;   K6 = "setmetatable"
-;   K7 = "__index"
-;   K8 = "m"
+;   K7 = "m"
+;   K8 = "__index"
 ;   K9 = "str"
 ;   K10 = 4
 ;   K11 = 5
@@ -42,17 +42,17 @@ expression: output
 0016  [  4]  CALL            R1 args=0 ret=1
 0017  [  5]  GETTABUP        R1 U0 K6  ; "setmetatable"
 0018  [  5]  NEWTABLE        R2 T0  ; {}
-0019  [  5]  NEWTABLE        R3 T1  ; {__index}
-0020  [  5]  NEWTABLE        R4 T2  ; {m}
+0019  [  5]  NEWTABLE        R3 T2  ; {__index}
+0020  [  5]  NEWTABLE        R4 T1  ; {m}
 0021  [  5]  CLOSURE         R5 P1
-0022  [  5]  SETFIELD        R5 R4 K8  ; "m"
-0023  [  5]  SETFIELD        R4 R3 K7  ; "__index"
+0022  [  5]  SETFIELD        R5 R4 K7  ; "m"
+0023  [  5]  SETFIELD        R4 R3 K8  ; "__index"
 0024  [  5]  CALL            R1 args=3 ret=2
 0025  [  6]  GETTABUP        R2 U0 K0  ; "print"
-0026  [  6]  SELF            R3 R1 K8  ; "m"
+0026  [  6]  SELF            R3 R1 K7  ; "m"
 0027  [  6]  LOAD            R5 K9  ; "str"
 0028  [  6]  CALL            R3 args=3 ret=2
-0029  [  6]  SELF            R4 R1 K8  ; "m"
+0029  [  6]  SELF            R4 R1 K7  ; "m"
 0030  [  6]  NEWTABLE        R6 T0  ; {}
 0031  [  6]  LOAD            R7 K10  ; 4
 0032  [  6]  LOAD            R8 K11  ; 5

@@ -61,9 +61,18 @@ pub struct Prototype<'gc> {
     /// counter-free reads via `get()` and barrier-aware writes via
     /// the parent `Prototype`'s `Gc`. Entries are [`InlineCache`].
     pub ic_table: IcTable<'gc>,
-    /// Per distinct constructor shape, what `NEWTABLE` starts its table in:
-    /// the constructor's constant field names, in order.
-    pub templates: Box<[Shape<'gc>]>,
+    /// Per distinct constructor template, indexed by `NEWTABLE`.
+    pub templates: Box<[Template<'gc>]>,
+}
+
+/// What `NEWTABLE` starts a constructor's table with: the shape of its
+/// constant field names in order, and per slot the value of a constant field
+/// nothing else in the constructor writes, else nil.
+#[derive(Collect)]
+#[collect(internal, no_drop)]
+pub struct Template<'gc> {
+    pub shape: Shape<'gc>,
+    pub values: Box<[Value<'gc>]>,
 }
 
 impl<'gc> Prototype<'gc> {

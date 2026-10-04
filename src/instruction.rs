@@ -697,7 +697,7 @@ instructions! {
     /// Backs `obj:m(...)` codegen.
     0x0b SELF       self_       Abde  { dst: Reg, object: Reg, ic_idx: IcIdx, key_idx: KIdx }
 
-    /// `R[dst] = {}`, already in the shape `templates[template]`.
+    /// `R[dst]` = a new table made from `templates[template]`.
     0x0c NEWTABLE   newtable    Ad    { dst: Reg, template: TemplateIdx }
     0x0d ADD        add         Abc   { dst: Reg, lhs: Reg, rhs: Reg }
     0x0e SUB        sub         Abc   { dst: Reg, lhs: Reg, rhs: Reg }
