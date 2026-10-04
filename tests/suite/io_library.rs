@@ -328,3 +328,16 @@ fn closed_file_messages() {
     ));
     let _ = std::fs::remove_file(&p);
 }
+
+#[test]
+fn lines_format_cap() {
+    // #252: at most 250 formats; the 251st is blamed as argument #252.
+    assert_runs(
+        "local t = {} for i = 1, 251 do t[i] = \"l\" end\n\
+         assert(pcall(io.stdin.lines, io.stdin, table.unpack(t, 1, 250)), \"250 fit\")\n\
+         local ok, msg = pcall(io.stdin.lines, io.stdin, table.unpack(t))\n\
+         assert(not ok, \"251 raise\")\n\
+         assert(msg:find(\"#252\", 1, true), msg)\n\
+         assert(msg:find(\"too many arguments\", 1, true), msg)",
+    );
+}
