@@ -1,6 +1,7 @@
 //! `io` library + userdata method-dispatch tests. Each Lua chunk performs
-//! file I/O against a unique temp path and returns a boolean verdict; the
-//! closed-file case asserts a *raised* error instead.
+//! file I/O against a unique temp path and returns a boolean verdict or
+//! `assert`s each check; the closed-file case asserts a *raised* error
+//! instead.
 //!
 //! Covers issue #92 (`io.write` returns the file handle so `:write` chains)
 //! and the broader `io` subtask of #27 (file handles, read formats, seek,
@@ -36,6 +37,29 @@ fn assert_ok(src: &str) {
         run_bool(src).expect("run should not error"),
         "chunk returned false: {src}"
     );
+}
+
+/// Run `src`, panicking with the message of any error it raises, so a failed
+/// `assert(cond, "what")` in the chunk names its check.
+fn assert_runs(src: &str) {
+    let mut lua = Lua::new();
+    lua.load_all();
+    let ex = lua
+        .try_enter(|ctx| -> Result<_, LoadError> {
+            let chunk = ctx.load(src, Some("io_test"))?;
+            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+        })
+        .expect("load");
+    match lua.execute::<()>(&ex) {
+        Ok(()) => {}
+        Err(RuntimeError::Lua(err)) => {
+            let msg = lua.enter(|ctx| {
+                String::from_utf8_lossy(ctx.fetch(&err).message(ctx).as_bytes()).into_owned()
+            });
+            panic!("{msg}");
+        }
+        Err(e) => panic!("{e}"),
+    }
 }
 
 #[test]
@@ -178,6 +202,36 @@ fn io_lines_iterates_and_counts() {
            if count == 1 then first = line end\n\
          end\n\
          return count == 3 and first == \"a\""
+    ));
+    let _ = std::fs::remove_file(&p);
+}
+
+#[test]
+fn file_close_and_gc_metamethods() {
+    // #251: a file is a to-be-closed value, and `io.lines(name)` hands the
+    // file to the generic for as its closing value.
+    let p = tmp_path("tbc");
+    assert_runs(&format!(
+        "local F\n\
+         do local f <close> = assert(io.open({p:?}, \"w\")); F = f end\n\
+         assert(io.type(F) == \"closed file\", \"<close> closes\")\n\
+         local mt = getmetatable(F)\n\
+         assert(mt.__gc == mt.__close, \"shared __gc/__close\")\n\
+         assert(not pcall(mt.__gc), \"__gc checks its argument\")\n\
+         assert(select('#', mt.__close(io.stdout)) == 0, \"__close returns nothing\")\n\
+         assert(io.type(io.stdout) == \"file\", \"stdout stays open\")\n\
+         local w = io.open({p:?}, \"w\"); w:write(\"a\\nb\\n\"); w:close()\n\
+         assert(select('#', io.lines({p:?})) == 4, \"io.lines(name) returns 4\")\n\
+         local it, s, c, h = io.lines({p:?})\n\
+         assert(s == nil and c == nil, \"nil state and control\")\n\
+         for _ in it, s, c, h do break end\n\
+         assert(io.type(h) == \"closed file\", \"break closes\")\n\
+         local it2, _, _, h2 = io.lines({p:?})\n\
+         assert(not pcall(function()\n\
+           for _ in it2, nil, nil, h2 do error(\"x\") end\n\
+         end))\n\
+         assert(io.type(h2) == \"closed file\", \"error closes\")\n\
+         assert(select('#', io.lines()) == 1, \"io.lines() returns 1\")"
     ));
     let _ = std::fs::remove_file(&p);
 }

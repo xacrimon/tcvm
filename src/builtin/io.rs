@@ -4,11 +4,11 @@
 //!
 //! A file handle is a `Userdata` whose payload is a [`LuaFile`] and whose
 //! metatable is the single shared file metatable (`__index` → the methods
-//! table, plus `__name`/`__tostring`). Method dispatch (`f:write(...)`)
-//! reaches the methods through that metatable's `__index`, which the VM
-//! resolves for userdata receivers. The metatable, the methods table, and
-//! the current default input/output handles live in an internal "io-state"
-//! table captured as upvalue 0 by every `io` native.
+//! table, plus `__name`/`__tostring`/`__gc`/`__close`). Method dispatch
+//! (`f:write(...)`) reaches the methods through that metatable's `__index`,
+//! which the VM resolves for userdata receivers. The metatable, the methods
+//! table, and the current default input/output handles live in an internal
+//! "io-state" table captured as upvalue 0 by every `io` native.
 //!
 //! The OS file descriptor is owned by the `std::fs::File` inside the
 //! handle; it is released either by an explicit `close`/`io.close` (which
@@ -135,6 +135,10 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         str_val(ctx, b"__tostring"),
         Value::function(native(lua_file_tostring)),
     );
+    // One function for both, as in liolib, so `mt.__gc == mt.__close`.
+    let gc = Value::function(native(lua_file_gc));
+    mt.raw_set(ctx, str_val(ctx, b"__gc"), gc);
+    mt.raw_set(ctx, str_val(ctx, b"__close"), gc);
     io_state.raw_set(ctx, str_val(ctx, b"mt"), Value::table(mt));
 
     // Predefined handles.
@@ -832,8 +836,9 @@ fn default_file<'gc>(
 }
 
 /// `io.lines([filename] [, formats...])`. With a filename, the file is
-/// opened (raising on failure) and auto-closed at EOF; otherwise the
-/// default input is used.
+/// opened (raising on failure), auto-closed at EOF, and also returned as the
+/// generic-for closing value so `break` or an error closes it too; otherwise
+/// the default input is used.
 fn lua_lines<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
@@ -855,8 +860,12 @@ fn lua_lines<'gc>(
     };
     // Validate formats up front (Lua reports lines-format errors eagerly).
     parse_formats(ctx, fmt_args, "lines", 2)?;
-    let iter = make_lines_iter(ctx, handle, close_eof, fmt_args);
-    stack.ret1(Value::function(iter));
+    let iter = Value::function(make_lines_iter(ctx, handle, close_eof, fmt_args));
+    if close_eof {
+        stack.replace(&[iter, Value::nil(), Value::nil(), handle]);
+    } else {
+        stack.ret1(iter);
+    }
     Ok(CallbackAction::Return)
 }
 
@@ -1066,6 +1075,23 @@ fn lua_file_setvbuf<'gc>(
     Ok(CallbackAction::Return)
 }
 
+/// `__gc`/`__close` — close the file unless it is a standard stream or
+/// already closed, ignoring the outcome. The collector never calls this (no
+/// Lua finalizers yet); dropping the userdata closes the fd instead.
+fn lua_file_gc<'gc>(
+    ctx: Context<'gc>,
+    closure: &NativeClosure<'gc>,
+    mut stack: Stack<'gc, '_>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
+    let u = match stack.arg(0) {
+        Some(v) => check_file(ctx, closure, v, "__gc", 1)?,
+        None => return Err(util::type_error(ctx, "__gc", 1, "FILE*", None)),
+    };
+    close_stream(u);
+    stack.replace(&[]);
+    Ok(CallbackAction::Return)
+}
+
 /// `__tostring` — `"file (0x..)"` / `"file (closed)"`. Set on the metatable
 /// for forward-compat; `tostring`/`print` don't dispatch `__tostring` yet (#27).
 fn lua_file_tostring<'gc>(
@@ -1090,42 +1116,45 @@ fn lua_file_tostring<'gc>(
 // Shared close + lines iterator
 // ---------------------------------------------------------------------------
 
-/// Close `u`'s stream. Standard streams can't be closed (Lua returns
-/// `(nil, "cannot close standard file")`); a regular file transitions to
-/// `Closed`, dropping its `File` (closing the fd) and returns `true`;
-/// an already-closed file is a raised error.
+enum CloseOutcome {
+    Ok,
+    Standard,
+    AlreadyClosed,
+}
+
+/// Move a regular file to `Closed`, dropping its `File` (closing the fd).
+/// Standard streams stay open.
+fn close_stream(u: Userdata<'_>) -> CloseOutcome {
+    u.with_data::<LuaFile, _>(|lf| {
+        let mut fs = lf.state.borrow_mut();
+        match &*fs {
+            FileState::Closed => CloseOutcome::AlreadyClosed,
+            FileState::Open {
+                stream: Stream::Stdin | Stream::Stdout | Stream::Stderr,
+                ..
+            } => CloseOutcome::Standard,
+            FileState::Open { .. } => {
+                *fs = FileState::Closed;
+                CloseOutcome::Ok
+            }
+        }
+    })
+    .expect("file handle must carry a LuaFile payload")
+}
+
+/// `close`/`io.close`: `true`, `(nil, "cannot close standard file")`, or a
+/// raised error for an already-closed file.
 fn close_handle<'gc>(
     ctx: Context<'gc>,
     u: Userdata<'gc>,
     stack: &mut Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    enum Outcome {
-        Ok,
-        Standard,
-        AlreadyClosed,
-    }
-    let outcome = u
-        .with_data::<LuaFile, _>(|lf| {
-            let mut fs = lf.state.borrow_mut();
-            match &*fs {
-                FileState::Closed => Outcome::AlreadyClosed,
-                FileState::Open {
-                    stream: Stream::Stdin | Stream::Stdout | Stream::Stderr,
-                    ..
-                } => Outcome::Standard,
-                FileState::Open { .. } => {
-                    *fs = FileState::Closed;
-                    Outcome::Ok
-                }
-            }
-        })
-        .expect("file handle must carry a LuaFile payload");
-    match outcome {
-        Outcome::Ok => stack.replace(&[Value::boolean(true)]),
-        Outcome::Standard => {
+    match close_stream(u) {
+        CloseOutcome::Ok => stack.replace(&[Value::boolean(true)]),
+        CloseOutcome::Standard => {
             stack.replace(&[Value::nil(), str_val(ctx, b"cannot close standard file")])
         }
-        Outcome::AlreadyClosed => return Err(closed_file_error(ctx)),
+        CloseOutcome::AlreadyClosed => return Err(closed_file_error(ctx)),
     }
     Ok(CallbackAction::Return)
 }
@@ -1173,13 +1202,7 @@ fn lines_iter<'gc>(
     // EOF iff the (first) record came back nil.
     if vals.first().map(|v| v.is_nil()).unwrap_or(true) {
         if close_eof {
-            // Best-effort close of the auto-opened file; ignore the result.
-            let _ = u.with_data::<LuaFile, _>(|lf| {
-                let mut fs = lf.state.borrow_mut();
-                if matches!(*fs, FileState::Open { .. }) {
-                    *fs = FileState::Closed;
-                }
-            });
+            close_stream(u);
         }
         stack.replace(&[]);
     } else {
