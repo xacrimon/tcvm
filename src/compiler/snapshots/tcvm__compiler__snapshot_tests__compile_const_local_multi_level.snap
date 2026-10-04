@@ -2,16 +2,13 @@
 source: src/compiler/snapshot_tests.rs
 expression: output
 ---
-; function (params=0, vararg=true, stack=2, upvalues=1)
-; constants:
-;   K0 = 7
+; function (params=0, vararg=true, stack=1, upvalues=1)
 ; upvalues:
 ;   U0 = local R0
 ; code:
 0000  [  1]  VARARGPREP      fixed=0
-0001  [  4]  LOAD            R0 K0  ; 7
-0002  [ 11]  CLOSURE         R1 P0
-0003  [ 13]  RETURN1         R1
+0001  [ 11]  CLOSURE         R0 P0
+0002  [ 13]  RETURN1         R0
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=1, upvalues=0)

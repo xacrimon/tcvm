@@ -176,17 +176,16 @@ fn try_fold_binop(
 /// the register of each kind that owns one.
 /// Globals (`GDKREG` / `GDKCONST`) are tracked separately on `Ctx::globals`
 /// since they don't occupy a register slot.
-#[derive(Clone, Copy, Debug)]
-enum VarKind {
+#[derive(Clone, Copy)]
+enum VarKind<'gc> {
     /// Regular mutable local (RDKREG).
     Reg(RegisterIndex),
-    /// Local declared with `<const>`, plus for-loop control variables
-    /// (RDKCONST / LOOPVARKIND in upstream). `Some(v)` carries the
-    /// compile-time value when the initializer folded to a const expdesc;
-    /// `None` for `<const>` whose RHS isn't compile-time foldable
-    /// (e.g. `local k <const> = f()`) — the binding still rejects
-    /// assignment but doesn't inline at reference sites.
-    Const(RegisterIndex, Option<ConstVal>),
+    /// Local declared with `<const>` whose initializer didn't fold, plus
+    /// for-loop control variables (RDKCONST / LOOPVARKIND in upstream).
+    Const(RegisterIndex),
+    /// `<const>` local whose initializer folded (RDKCTC). It owns no
+    /// register; every reference inlines the value.
+    CompileTime(ConstVal<'gc>),
     /// Local declared with `<close>` — a to-be-closed variable (RDKTOCLOSE).
     ToClose(RegisterIndex),
     /// The named-vararg parameter (`function f(...args)`). `args[expr]` /
@@ -201,12 +200,15 @@ enum VarKind {
     Global,
 }
 
-impl VarKind {
+impl VarKind<'_> {
     /// Assignment is "attempt to assign to const variable" (PUC's `readonlyvar`).
     fn is_readonly(self) -> bool {
         matches!(
             self,
-            VarKind::Const(..) | VarKind::ToClose(_) | VarKind::VarargParam(_)
+            VarKind::Const(_)
+                | VarKind::CompileTime(_)
+                | VarKind::ToClose(_)
+                | VarKind::VarargParam(_)
         )
     }
 }
@@ -214,28 +216,35 @@ impl VarKind {
 /// Compile-time value bound to a `<const>` local. Mirrors the const-kind
 /// `ExprKind` variants so that ident resolution can return a fresh
 /// const-kind `ExprDesc` for inlining.
-#[derive(Clone, Copy, Debug)]
-enum ConstVal {
+#[derive(Clone, Copy)]
+enum ConstVal<'gc> {
     Numeral(Numeral),
     Bool(bool),
     Nil,
+    Str(LuaString<'gc>),
 }
 
-impl ConstVal {
-    fn from_expr_kind(k: ExprKind<'_>) -> Option<Self> {
-        match k {
+impl<'gc> ConstVal<'gc> {
+    /// The value of a jump-free const expdesc.
+    fn from_expr(e: &ExprDesc<'gc>) -> Option<Self> {
+        if e.has_jumps() {
+            return None;
+        }
+        match e.kind {
             ExprKind::Numeral(n) => Some(ConstVal::Numeral(n)),
             ExprKind::Bool(b) => Some(ConstVal::Bool(b)),
             ExprKind::Nil => Some(ConstVal::Nil),
-            _ => None,
+            ExprKind::Str(s) => Some(ConstVal::Str(s)),
+            ExprKind::Reg(_) | ExprKind::Jump(_) => None,
         }
     }
 
-    fn to_expr_desc<'gc>(self) -> ExprDesc<'gc> {
+    fn to_expr_desc(self) -> ExprDesc<'gc> {
         match self {
             ConstVal::Numeral(n) => ExprDesc::from_numeral(n),
             ConstVal::Bool(b) => ExprDesc::from_bool(b),
             ConstVal::Nil => ExprDesc::from_nil(),
+            ConstVal::Str(s) => ExprDesc::from_str(s),
         }
     }
 }
@@ -353,13 +362,13 @@ struct ScopeMark {
 /// can ask how it should reference a free variable bound in this scope.
 /// The parent captures from its own parent on demand as the lookup
 /// cascades upward.
-trait UpvalueResolver {
+trait UpvalueResolver<'gc> {
     /// `line` is the child's current line, which a limit error reports.
     fn resolve_for_child(
         &mut self,
         name: &str,
         line: u32,
-    ) -> Result<Option<ChildResolution>, CompileError>;
+    ) -> Result<Option<ChildResolution<'gc>>, CompileError>;
 }
 
 /// Result of resolving a name from a child function's perspective. A
@@ -367,8 +376,8 @@ trait UpvalueResolver {
 /// inlined at the child's reference site without registering an upvalue
 /// at any intermediate level. An `Upvalue` carries the `UpValueDescriptor`
 /// the child should add to its own upvalue list.
-enum ChildResolution {
-    Const(ConstVal),
+enum ChildResolution<'gc> {
+    Const(ConstVal<'gc>),
     Upvalue {
         desc: UpValueDescriptor,
         readonly: bool,
@@ -387,8 +396,8 @@ struct UpvalueEntry {
 /// Result of resolving a name in the current function. `Const` is the
 /// inlined-const case; `Upvalue` is an index into this function's own
 /// upvalue list (registered if necessary).
-enum ResolvedName {
-    Const(ConstVal),
+enum ResolvedName<'gc> {
+    Const(ConstVal<'gc>),
     Upvalue(u8),
 }
 
@@ -425,7 +434,7 @@ struct Ctx<'gc, 'a> {
     control_end_label: Vec<(u16, usize)>,
 
     /// Lexical scope stack: each frame maps variable names to register data.
-    scope: Vec<HashMap<String, VarKind, RandomState>>,
+    scope: Vec<HashMap<String, VarKind<'gc>, RandomState>>,
     /// Saved `(freereg, nactvar)` per scope entry, restored on pop so that
     /// any temps or locals allocated within the scope are reclaimed together.
     scope_marks: Vec<ScopeMark>,
@@ -448,7 +457,7 @@ struct Ctx<'gc, 'a> {
     /// Parent function's resolver, or `None` for the main chunk. A nested
     /// function calls this to walk the lexical chain when it encounters a
     /// free variable.
-    capture: Option<&'a mut dyn UpvalueResolver>,
+    capture: Option<&'a mut dyn UpvalueResolver<'gc>>,
     /// This function's upvalue list. Flattened to
     /// `Chunk::upvalue_desc: Box<[UpValueDescriptor]>` at assembly time.
     upvalues: Vec<UpvalueEntry>,
@@ -1269,10 +1278,10 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         Ok(())
     }
 
-    fn define(&mut self, name: String, kind: VarKind) -> Result<(), CompileError> {
-        // `global` declarations are scope entries but own no register, so
-        // they get no debug record (luac lists only real locals).
-        if !matches!(kind, VarKind::Global) {
+    fn define(&mut self, name: String, kind: VarKind<'gc>) -> Result<(), CompileError> {
+        // Names that own no register get no debug record (luac lists only
+        // real locals, and `debug.getlocal` numbers them by register).
+        if !matches!(kind, VarKind::Global | VarKind::CompileTime(_)) {
             self.record_locvar(&name)?;
         }
         self.decls.push(name.clone());
@@ -1298,7 +1307,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         Ok(())
     }
 
-    fn resolve_local(&self, name: &str) -> Option<VarKind> {
+    fn resolve_local(&self, name: &str) -> Option<VarKind<'gc>> {
         self.scope
             .iter()
             .rev()
@@ -1363,7 +1372,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     fn env(&mut self, name: &str) -> Result<Env, CompileError> {
         let resolved = match self.resolve_local("_ENV") {
             Some(VarKind::Global) => None,
-            Some(VarKind::Const(_, Some(v))) => Some(ResolvedName::Const(v)),
+            Some(VarKind::CompileTime(v)) => Some(ResolvedName::Const(v)),
             Some(VarKind::VarargParam(register)) => {
                 // Indexing a named vararg as `_ENV` reads it as a table.
                 if let Some(info) = self.chunk.vararg_info.as_mut() {
@@ -1372,9 +1381,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                 return Ok(Env::Reg(register));
             }
             Some(
-                VarKind::Reg(register)
-                | VarKind::Const(register, None)
-                | VarKind::ToClose(register),
+                VarKind::Reg(register) | VarKind::Const(register) | VarKind::ToClose(register),
             ) => {
                 return Ok(Env::Reg(register));
             }
@@ -1412,7 +1419,10 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     /// compile-time value) or an upvalue index in THIS function's
     /// upvalue list (capturing on first reference). Returns `None` if
     /// the name isn't reachable through any enclosing scope.
-    fn resolve_or_capture(&mut self, name: &str) -> Result<Option<ResolvedName>, CompileError> {
+    fn resolve_or_capture(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<ResolvedName<'gc>>, CompileError> {
         if let Some(i) = self.upvalues.iter().position(|u| u.name == name) {
             return Ok(Some(ResolvedName::Upvalue(i as u8)));
         }
@@ -1453,7 +1463,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     }
 }
 
-impl<'gc, 'a> UpvalueResolver for Ctx<'gc, 'a> {
+impl<'gc, 'a> UpvalueResolver<'gc> for Ctx<'gc, 'a> {
     /// Given a free-variable reference from a direct child of this
     /// function, return either the `UpValueDescriptor` the child should
     /// register or a `ConstVal` for the child to inline directly without
@@ -1466,7 +1476,7 @@ impl<'gc, 'a> UpvalueResolver for Ctx<'gc, 'a> {
         &mut self,
         name: &str,
         line: u32,
-    ) -> Result<Option<ChildResolution>, CompileError> {
+    ) -> Result<Option<ChildResolution<'gc>>, CompileError> {
         // 1. Own local? `<const>` with a compile-time value flows back to
         //    the child as `Const` — no upvalue is allocated here. Plain
         //    locals (and `<const>` whose initializer didn't fold) flow
@@ -1478,7 +1488,7 @@ impl<'gc, 'a> UpvalueResolver for Ctx<'gc, 'a> {
                 // is not a capturable local — the child reaches its own global
                 // resolution (`manual.of:251-253`).
                 VarKind::Global => return Ok(None),
-                VarKind::Const(_, Some(v)) => return Ok(Some(ChildResolution::Const(v))),
+                VarKind::CompileTime(v) => return Ok(Some(ChildResolution::Const(v))),
                 // Capturing the named vararg as an upvalue forces materialization:
                 // the upvalue must point at a real table, not the below-base region.
                 VarKind::VarargParam(register) => {
@@ -1487,9 +1497,9 @@ impl<'gc, 'a> UpvalueResolver for Ctx<'gc, 'a> {
                     }
                     register
                 }
-                VarKind::Reg(register)
-                | VarKind::Const(register, None)
-                | VarKind::ToClose(register) => register,
+                VarKind::Reg(register) | VarKind::Const(register) | VarKind::ToClose(register) => {
+                    register
+                }
             };
             // Scope 0 is the function's outermost block; RETURN closes it.
             if depth > 0 {
@@ -1619,7 +1629,7 @@ fn compile_function_to_chunk<'gc, 'a>(
     ctx: lua::Context<'gc>,
     lines: &'a LineMap,
     interner: &'a TokenInterner,
-    parent_capture: Option<&'a mut dyn UpvalueResolver>,
+    parent_capture: Option<&'a mut dyn UpvalueResolver<'gc>>,
     stmts: impl Iterator<Item = Stmt>,
     params: impl Iterator<Item = String>,
     is_vararg: bool,
@@ -1924,112 +1934,93 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
     let num_targets = targets.len();
     let num_values = values.len();
 
-    // Target slots will land contiguously at [base, base+num_targets).
-    // Don't pre-reserve: compile each value expression into the next free
-    // slot, letting its natural register placement (e.g. CALL's result
-    // slot, LOAD dst) line up with the target. This avoids the
-    // "pre-allocate then MOVE result down" pattern for calls, literals,
-    // and arithmetic. MOVEs are only emitted when the expression returns
-    // a register that's not at the expected slot (e.g. `local x = y`
-    // where `y` is an existing local).
+    // Register targets land contiguously from `base`. Don't pre-reserve:
+    // compile each value into the next free slot so its natural placement
+    // (CALL's result slot, LOAD dst) lines up with the target. A MOVE is
+    // only needed when the value comes back elsewhere (e.g. `local x = y`).
     let base = ctx.chunk.freereg;
 
-    // Per-target capture of the RHS's compile-time value, used to inline
-    // `<const>` references later. Only populated when at least one target
-    // is `<const>`-attributed — keeps the common (no-const) path
-    // allocation-free. `None` entries cover non-foldable RHS, multi-return
-    // expansion slots, and indices that don't bind to a target. Each
-    // entry corresponds to target index `i` (not RHS index — they align
-    // except when multi-return fills multiple targets from one RHS).
     let list_modifier = item.modifier();
     let modifiers: Vec<_> = targets
         .iter()
         .map(|t| t.modifier().max(list_modifier))
         .collect();
-    let any_const_target = modifiers.contains(&Some(DeclModifier::Const));
-    let mut target_const_vals: Vec<Option<ConstVal>> = if any_const_target {
-        vec![None; num_targets]
-    } else {
-        Vec::new()
-    };
+    // A `<const>` target whose value folds takes no register; later values
+    // move down into its slot, which is safe as a folded value has no side
+    // effects. luac only folds the last target, as it has already loaded
+    // the others by the time it sees the list end.
+    let mut folded: Vec<Option<ConstVal>> = vec![None; num_targets];
 
+    let mut next = base;
+    let mut expanded = false;
     for (i, expr) in values.into_iter().enumerate() {
         let is_last = i == num_values - 1;
-        let expected = base + i as u8;
 
         if is_last && num_targets > num_values {
             // Last RHS supplies multiple values via call or vararg.
             let want = expand_count(ctx, num_targets - i)?;
             if let Expr::FuncCall(call) = expr {
                 let regs = compile_expr_func_call(ctx, call, Want::Exact(want))?;
-                // Results occupy [regs[0], regs[0]+want); in practice this
-                // lines up with `expected` because the call's func slot
-                // is freereg at setup time, which is `expected`.
-                assert_eq!(regs[0].0, expected);
+                // The call's func slot is freereg at setup time, so its
+                // results start at `next`.
+                assert_eq!(regs[0].0, next);
+                expanded = true;
                 continue;
             }
             if let Expr::Method(call) = expr {
-                expand_method_call(ctx, call, RegisterIndex(expected), want)?;
+                expand_method_call(ctx, call, RegisterIndex(next), want)?;
+                expanded = true;
                 continue;
             }
             if let Expr::VarArg = expr {
                 let dst = ctx.reserve_regs(want)?;
-                assert_eq!(dst.0, expected);
+                assert_eq!(dst.0, next);
                 ctx.emit(Instruction::vararg(dst, want + 1));
+                expanded = true;
                 continue;
             }
         }
 
-        // Regular single-value expression. Compile without a pre-reserved
-        // slot so CALL / LOAD / arith destinations land naturally at
-        // `expected`. If the expression returns a different register
-        // (e.g. a local Ident that `compile_expr_ident` returned bare, or
-        // a short-circuit expression whose fall-through landed mid-stack),
-        // emit a MOVE. Either way, end this iteration with freereg =
-        // expected + 1 — any temps the expression leaked above are dead.
+        // Regular single-value expression. End this iteration with
+        // freereg = next + 1; any temps the expression leaked above are dead.
         let mut desc = compile_expr(ctx, expr, None)?;
-        // Capture compile-time value for `<const>`-attributed targets
-        // before discharge erases the const-kind info.
-        if any_const_target && i < num_targets && !desc.has_jumps() {
-            target_const_vals[i] = ConstVal::from_expr_kind(desc.kind);
+        if modifiers.get(i) == Some(&Some(DeclModifier::Const))
+            && let Some(v) = ConstVal::from_expr(&desc)
+        {
+            folded[i] = Some(v);
+            ctx.chunk.freereg = next;
+            continue;
         }
         let reg = ctx.discharge_to_reg_mut(&mut desc, None)?;
-        if reg.0 != expected {
-            // Reclaim any leaked temps, then reserve the target slot
-            // (reserve_reg updates max_stack).
-            ctx.chunk.freereg = expected;
+        if reg.0 != next {
+            ctx.chunk.freereg = next;
             let slot = ctx.reserve_reg()?;
-            assert_eq!(slot.0, expected);
             ctx.emit(Instruction::mov(slot, reg));
-        } else if ctx.chunk.freereg > expected + 1 {
-            // Expression landed at `expected` but leaked additional temps
-            // above (e.g. short-circuit fall-through). Drop them. The
-            // previous expression compilation already updated max_stack to
-            // reflect this peak.
-            ctx.chunk.freereg = expected + 1;
+        } else if ctx.chunk.freereg > next + 1 {
+            // Landed at `next` but leaked temps above (e.g. short-circuit
+            // fall-through); max_stack already covers them.
+            ctx.chunk.freereg = next + 1;
         }
+        next += 1;
     }
 
-    // Pad with nil for any targets without supplied values. A multi-return
-    // call or vararg may have already filled extra slots above the last
-    // non-expander value, so check freereg rather than iterating by index.
-    let target_top = base as usize + num_targets;
-    while (ctx.chunk.freereg as usize) < target_top {
-        let slot = ctx.reserve_reg()?;
-        let idx = ctx.alloc_constant(Value::nil())?;
-        ctx.emit(Instruction::load(slot, KIdx(idx)));
-        // Padding-nil slot at `slot - base` is a compile-time nil.
-        // `slot.0 >= base` because `reserve_reg` only moves freereg
-        // upward and `base` was the freereg before any RHS compiled.
-        debug_assert!(slot.0 >= base);
-        let target_idx = (slot.0 - base) as usize;
-        if any_const_target && target_idx < num_targets {
-            target_const_vals[target_idx] = Some(ConstVal::Nil);
+    // Targets without a value are nil, unless a multi-value expander
+    // already filled them.
+    if !expanded {
+        for i in num_values..num_targets {
+            if modifiers[i] == Some(DeclModifier::Const) {
+                folded[i] = Some(ConstVal::Nil);
+            } else {
+                let slot = ctx.reserve_reg()?;
+                let idx = ctx.alloc_constant(Value::nil())?;
+                ctx.emit(Instruction::load(slot, KIdx(idx)));
+            }
         }
     }
 
     // Bind each target name to its slot and handle `<close>` / `<const>`.
     let mut close_reg = None;
+    let mut reg = base;
     for (i, target) in targets.into_iter().enumerate() {
         let name = target
             .name()
@@ -2038,28 +2029,28 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
             .ok_or_else(|| ice("ident without name"))?
             .to_owned();
 
-        let reg = RegisterIndex(base + i as u8);
-        let kind = match modifiers[i] {
-            // The `Const` arm is only reachable when at least one target
-            // had the `Const` modifier, which is exactly when
-            // `target_const_vals` was allocated to `num_targets` entries.
-            Some(DeclModifier::Const) => VarKind::Const(reg, target_const_vals[i]),
-            Some(DeclModifier::Close) => VarKind::ToClose(reg),
-            None => VarKind::Reg(reg),
+        let r = RegisterIndex(reg);
+        let kind = match (modifiers[i], folded[i]) {
+            (Some(DeclModifier::Const), Some(v)) => VarKind::CompileTime(v),
+            (Some(DeclModifier::Const), None) => VarKind::Const(r),
+            (Some(DeclModifier::Close), _) => VarKind::ToClose(r),
+            (None, _) => VarKind::Reg(r),
         };
+        if !matches!(kind, VarKind::CompileTime(_)) {
+            reg += 1;
+        }
 
-        if matches!(kind, VarKind::ToClose(_)) && close_reg.replace(reg).is_some() {
+        if matches!(kind, VarKind::ToClose(_)) && close_reg.replace(r).is_some() {
             return Err(ctx.err(CompileErrorKind::MultipleClose));
         }
 
         ctx.define(name, kind)?;
     }
 
-    // Promote the freshly bound targets to active locals so their slots
-    // are stable for the rest of the scope (upvalue-capture depends on
-    // the register staying put).
-    // `num_targets` fits: the padding reserved a register per target.
-    ctx.adjust_locals(num_targets as u8)?;
+    // Promote the bound targets to active locals so their slots are stable
+    // for the rest of the scope (upvalue capture depends on the register
+    // staying put).
+    ctx.adjust_locals(reg - base)?;
 
     // After the locals are live, so a non-closable value's error can name
     // the variable (luac `checktoclose`).
@@ -2761,7 +2752,7 @@ fn compile_nested<'gc>(
     // but mutates its own copy — its `global` decls don't leak back to the
     // parent or to sibling functions (`manual.of:245-249`).
     let globals = ctx.globals.clone();
-    let parent: &mut dyn UpvalueResolver = ctx;
+    let parent: &mut dyn UpvalueResolver<'gc> = ctx;
 
     let chunk = compile_function_to_chunk(
         lua_ctx,
@@ -2858,7 +2849,7 @@ fn compile_expr_ident<'gc>(
     // upvalue resolution and falls through to global resolution below.
     let local = ctx.resolve_local(name);
     match local {
-        Some(VarKind::Const(_, Some(v))) => return Ok(v.to_expr_desc()),
+        Some(VarKind::CompileTime(v)) => return Ok(v.to_expr_desc()),
         // A named vararg reaching this path is used as a value (the `t[exp]` /
         // `t.id` base cases are intercepted before recursing here), which
         // forces materialization.
@@ -2868,9 +2859,7 @@ fn compile_expr_ident<'gc>(
             }
             return Ok(ExprDesc::from_reg(register));
         }
-        Some(
-            VarKind::Reg(register) | VarKind::Const(register, None) | VarKind::ToClose(register),
-        ) => {
+        Some(VarKind::Reg(register) | VarKind::Const(register) | VarKind::ToClose(register)) => {
             return Ok(ExprDesc::from_reg(register));
         }
         Some(VarKind::Global) | None => {}
@@ -4409,7 +4398,7 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
             // rejected at compile time.
             let loop_var = ctx.alloc_register()?;
             assert_eq!(loop_var.0, base.0 + 3);
-            ctx.define(counter_name, VarKind::Const(loop_var, None))?;
+            ctx.define(counter_name, VarKind::Const(loop_var))?;
             // Promote the loop variable to an active local so upvalue-capture
             // logic sees it and temp reclaims don't touch it.
             ctx.adjust_locals(1)?;
@@ -4536,7 +4525,7 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
                 // Only the first variable, the control variable, is read-only
                 // (`forlist`'s RDKCONST).
                 let kind = if i == 0 {
-                    VarKind::Const(reg, None)
+                    VarKind::Const(reg)
                 } else {
                     VarKind::Reg(reg)
                 };
