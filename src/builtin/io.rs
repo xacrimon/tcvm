@@ -283,7 +283,7 @@ fn new_handle<'gc>(ctx: Context<'gc>, mt: Table<'gc>, file: LuaFile) -> Userdata
 /// The io-state table (upvalue 0 of every io native).
 #[inline]
 fn io_state<'gc>(closure: &NativeClosure<'gc>) -> Table<'gc> {
-    closure.upvalues[0]
+    closure.upvalues()[0]
         .get_table()
         .expect("io native upvalue 0 must be the io-state table")
 }
@@ -1296,8 +1296,8 @@ fn lines_iter<'gc>(
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<(), Error<'gc>> {
-    let handle = closure.upvalues[0];
-    let close_eof = closure.upvalues[1].get_boolean().unwrap_or(false);
+    let handle = closure.upvalues()[0];
+    let close_eof = closure.upvalues()[1].get_boolean().unwrap_or(false);
     let u = handle
         .get_userdata()
         .expect("lines iterator upvalue 0 must be a file handle");
@@ -1305,7 +1305,7 @@ fn lines_iter<'gc>(
         return Err(Error::from_str(ctx, "file is already closed"));
     }
     // Lua blames the formats from argument #2, as if called with the file.
-    let vals = do_read(ctx, u, &closure.upvalues[2..], "for iterator", 2)?;
+    let vals = do_read(ctx, u, &closure.upvalues()[2..], "for iterator", 2)?;
     if vals[0].is_nil() {
         // A fail carrying a message is an I/O error, raised rather than
         // ending the loop.

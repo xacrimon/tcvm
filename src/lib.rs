@@ -10,6 +10,7 @@
 #![feature(rust_preserve_none_cc)]
 #![feature(variant_count)]
 #![feature(int_format_into)]
+#![feature(offset_of_enum)]
 
 mod builtin;
 pub(crate) mod compiler;

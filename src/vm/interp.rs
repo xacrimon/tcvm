@@ -392,10 +392,8 @@ macro_rules! helpers {
         macro_rules! upvalue {
             ($$idx:expr) => {{
                 unsafe {
-                    debug_assert!(
-                        ($$idx as usize) < $thread.top_lua_unchecked().closure.upvalues.len()
-                    );
-                    *$closure.upvalues.as_ptr().add($$idx as usize)
+                    debug_assert!(($$idx as usize) < $closure.upvalues().len());
+                    *$closure.upvalue_ptr().add($$idx as usize)
                 }
             }};
         }
@@ -4230,35 +4228,32 @@ extern "rust-preserve-none" fn op_closure<'gc>(
     let (parent_closure, base) = unsafe { ((*frame).closure, (*frame).base()) };
     let proto = parent_closure.proto.prototypes[proto_idx as usize];
 
-    let mut upvalues_vec = Vec::with_capacity_in(
-        proto.upvalue_desc.len(),
-        crate::dmm::allocator_api::MetricsAlloc::new(ctx.mutation()),
-    );
-    for desc in proto.upvalue_desc.iter() {
-        let uv = match desc {
-            UpValueDescriptor::ParentLocal(idx) => {
-                let slot = unsafe { thread.stack.as_mut_ptr().add(base + *idx as usize) };
-                // Sorted by slot, so this frame's are at the end.
-                let open = &thread.open_upvalues;
-                let below = open.iter().rposition(|uv| uv.slot() <= slot);
-                match below {
-                    Some(i) if open[i].slot() == slot => open[i],
-                    _ => {
-                        let uv = UpvalueCell::new_open(ctx.mutation(), thread.handle(), slot);
-                        let at = below.map_or(0, |i| i + 1);
-                        thread.open_upvalues.insert(at, uv);
-                        unsafe { (*frame).flags |= frame_flags::OPEN_UPVALUES };
-                        uv
+    let func = Function::new_lua(ctx.mutation(), proto, |dst| {
+        for (i, desc) in proto.upvalue_desc.iter().enumerate() {
+            let uv = match desc {
+                UpValueDescriptor::ParentLocal(idx) => {
+                    let slot = unsafe { thread.stack.as_mut_ptr().add(base + *idx as usize) };
+                    // Sorted by slot, so this frame's are at the end.
+                    let open = &thread.open_upvalues;
+                    let below = open.iter().rposition(|uv| uv.slot() <= slot);
+                    match below {
+                        Some(i) if open[i].slot() == slot => open[i],
+                        _ => {
+                            let uv = UpvalueCell::new_open(ctx.mutation(), thread.handle(), slot);
+                            let at = below.map_or(0, |i| i + 1);
+                            thread.open_upvalues.insert(at, uv);
+                            unsafe { (*frame).flags |= frame_flags::OPEN_UPVALUES };
+                            uv
+                        }
                     }
                 }
-            }
-            UpValueDescriptor::ParentUpvalue(idx) => parent_closure.upvalues[*idx as usize],
-        };
-        upvalues_vec.push(uv);
-    }
-    let upvalues = upvalues_vec.into_boxed_slice();
-
-    let func = Function::new_lua(ctx.mutation(), proto, upvalues);
+                UpValueDescriptor::ParentUpvalue(idx) => unsafe {
+                    *parent_closure.upvalue_ptr().add(*idx as usize)
+                },
+            };
+            unsafe { dst.add(i).write(uv) };
+        }
+    });
     *reg!(ref mut dst) = Value::function(func);
     gc_check!();
     dispatch!();
@@ -5879,7 +5874,12 @@ pub(crate) extern "rust-preserve-none" fn ff_wrap<'gc>(
     let f = reg!(instruction.a()).get_function();
     let f = unsafe { f.unwrap_unchecked() };
     let nc = unsafe { &*ds.native };
-    let co = unsafe { nc.upvalues.get_unchecked(0).get_thread().unwrap_unchecked() };
+    let co = unsafe {
+        nc.upvalues()
+            .get_unchecked(0)
+            .get_thread()
+            .unwrap_unchecked()
+    };
     resume_switch!(
         co,
         1,

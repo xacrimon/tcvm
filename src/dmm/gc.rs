@@ -134,6 +134,17 @@ impl<'gc, T: Collect<'gc> + TrailingBytes + 'gc> Gc<'gc, T> {
         unsafe { this.ptr.cast::<u8>().add(GcBoxInner::<T>::TRAILING_OFFSET) }
     }
 
+    /// [`trailing_ptr`](Self::trailing_ptr) from a reference to the value, through the
+    /// provenance the allocation exposed.
+    ///
+    /// # Safety
+    /// `value` must be the value of a `Gc<T>` that has not been collected.
+    #[inline(always)]
+    pub unsafe fn trailing_ptr_of(value: &T) -> NonNull<u8> {
+        let addr = (value as *const T).addr() + GcBoxInner::<T>::TRAILING_FROM_VALUE;
+        unsafe { NonNull::new_unchecked(core::ptr::with_exposed_provenance_mut(addr)) }
+    }
+
     /// The `Gc` whose [`trailing_ptr`](Self::trailing_ptr) is `ptr`.
     ///
     /// # Safety

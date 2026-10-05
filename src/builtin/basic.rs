@@ -209,7 +209,7 @@ fn lua_ipairs<'gc>(
 ) -> Result<(), Error<'gc>> {
     util::check_any(ctx, &stack, "ipairs", 1)?;
     let t = stack.get(0);
-    stack.replace(&[closure.upvalues[0], t, Value::integer(ctx.mutation(), 0)]);
+    stack.replace(&[closure.upvalues()[0], t, Value::integer(ctx.mutation(), 0)]);
     Ok(())
 }
 
@@ -429,7 +429,7 @@ fn lua_pairs<'gc>(
     let t = stack.get(0);
     let mm = ctx.mm_of(t, MetamethodBits::PAIRS);
     if mm.is_nil() {
-        stack.replace(&[closure.upvalues[0], t, Value::nil(), Value::nil()]);
+        stack.replace(&[closure.upvalues()[0], t, Value::nil(), Value::nil()]);
         return Ok(CallbackAction::Return);
     }
     stack.replace(&[mm, t]);

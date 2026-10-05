@@ -275,17 +275,11 @@ impl<'gc> Context<'gc> {
                 }
             })?;
 
-        // Main chunk's upvalue 0 is _ENV.
+        // Main chunk's upvalue 0 is _ENV, its only one.
+        debug_assert_eq!(proto.num_upvalues, 1);
         let env_uv = UpvalueCell::new_closed(self.mutation, env);
-        let mut upvalues = Vec::with_capacity_in(
-            1,
-            crate::dmm::allocator_api::MetricsAlloc::new(self.mutation),
-        );
-        upvalues.push(env_uv);
-        Ok(Function::new_lua(
-            self.mutation,
-            proto,
-            upvalues.into_boxed_slice(),
-        ))
+        Ok(Function::new_lua(self.mutation, proto, |dst| unsafe {
+            dst.write(env_uv)
+        }))
     }
 }
