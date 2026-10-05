@@ -170,24 +170,24 @@ pub(crate) fn basic_tostring<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> LuaString
     if let Some(s) = v.get_string() {
         return s;
     }
-    let mut out: Vec<u8> = Vec::new();
-    if v.is_nil() {
-        out.extend_from_slice(b"nil");
-    } else if let Some(b) = v.get_boolean() {
-        out.extend_from_slice(if b { b"true" } else { b"false" });
-    } else if let Some(i) = v.get_integer() {
-        push_int(&mut out, i);
-    } else if let Some(f) = v.get_float() {
-        push_float(&mut out, f);
-    } else {
-        let ptr = to_pointer(v).expect("every other type is an object");
-        match ctx.mm_of(v, MetamethodBits::NAME).get_string() {
-            Some(name) => out.extend_from_slice(name.as_bytes()),
-            None => out.extend_from_slice(v.type_name().as_bytes()),
+    ctx.build_string(|out| {
+        if v.is_nil() {
+            out.extend_from_slice(b"nil");
+        } else if let Some(b) = v.get_boolean() {
+            out.extend_from_slice(if b { b"true" } else { b"false" });
+        } else if let Some(i) = v.get_integer() {
+            push_int(out, i);
+        } else if let Some(f) = v.get_float() {
+            push_float(out, f);
+        } else {
+            let ptr = to_pointer(v).expect("every other type is an object");
+            match ctx.mm_of(v, MetamethodBits::NAME).get_string() {
+                Some(name) => out.extend_from_slice(name.as_bytes()),
+                None => out.extend_from_slice(v.type_name().as_bytes()),
+            }
+            out.extend_from_slice(format!(": {ptr:p}").as_bytes());
         }
-        out.extend_from_slice(format!(": {ptr:p}").as_bytes());
-    }
-    LuaString::new(ctx, &out)
+    })
 }
 
 /// `lua_topointer`: an object's address, `None` for nil, booleans and numbers.

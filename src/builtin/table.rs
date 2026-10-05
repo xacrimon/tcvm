@@ -95,27 +95,19 @@ fn lua_concat<'gc>(
         return Ok(concat_meta(ctx, &mut stack));
     };
     let (sep, mut i, last) = concat_args(ctx, &stack, t.raw_len() as i64)?;
-    let mut out = Vec::new();
-    // `i < last` rather than `i <= last`, so `i` never steps past `last`.
-    while i < last {
-        add_field(
-            ctx,
-            &mut out,
-            t.raw_get(Value::integer(ctx.mutation(), i)),
-            i,
-        )?;
-        out.extend_from_slice(&sep);
-        i += 1;
-    }
-    if i == last {
-        add_field(
-            ctx,
-            &mut out,
-            t.raw_get(Value::integer(ctx.mutation(), i)),
-            i,
-        )?;
-    }
-    stack.ret1(Value::string(LuaString::new(ctx, &out)));
+    let s = ctx.with_buf(|out| {
+        // `i < last` rather than `i <= last`, so `i` never steps past `last`.
+        while i < last {
+            add_field(ctx, out, t.raw_get(Value::integer(ctx.mutation(), i)), i)?;
+            out.extend_from_slice(&sep);
+            i += 1;
+        }
+        if i == last {
+            add_field(ctx, out, t.raw_get(Value::integer(ctx.mutation(), i)), i)?;
+        }
+        Ok(LuaString::new(ctx, out))
+    })?;
+    stack.ret1(Value::string(s));
     Ok(CallbackAction::Return)
 }
 

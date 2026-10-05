@@ -64,6 +64,9 @@ pub struct State<'gc> {
     /// native's future waits on the host with.
     #[collect(require_static)]
     pub(crate) waker: std::cell::Cell<*const std::task::Waker>,
+    /// Scratch for building strings (`Context::with_buf`).
+    #[collect(require_static)]
+    pub(crate) buf: std::cell::Cell<Vec<u8>>,
 }
 
 impl<'gc> State<'gc> {
@@ -123,6 +126,7 @@ impl Lua {
                 unwind: Function::new_native(mc, crate::vm::unwind::unwind_native, &[]),
                 epoch: std::cell::Cell::new(0),
                 waker: std::cell::Cell::new(std::ptr::null()),
+                buf: std::cell::Cell::new(Vec::new()),
             }
         });
         let metrics = arena.metrics();

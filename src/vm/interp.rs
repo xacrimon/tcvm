@@ -2164,9 +2164,12 @@ extern "rust-preserve-none" fn op_concat<'gc>(
     let a = reg!(lhs);
     let b = reg!(rhs);
     // Fast path: both coerce to strings/numbers.
-    let mut buf = Vec::new();
-    if num::coerce_to_str(&mut buf, a) && num::coerce_to_str(&mut buf, b) {
-        *reg!(ref mut dst) = Value::string(LuaString::new(ctx, &buf));
+    let s = ctx.with_buf(|buf| {
+        buf.reserve(num::concat_len(a) + num::concat_len(b));
+        (num::coerce_to_str(buf, a) && num::coerce_to_str(buf, b)).then(|| LuaString::new(ctx, buf))
+    });
+    if let Some(s) = s {
+        *reg!(ref mut dst) = Value::string(s);
         gc_check!(window);
         dispatch!();
     }

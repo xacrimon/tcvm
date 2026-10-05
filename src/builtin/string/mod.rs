@@ -129,15 +129,16 @@ fn lua_char<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<(), Error<'gc>> {
     let n = stack.len();
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        let c = util::check_integer(ctx, stack.get(i), "char", i + 1)?;
-        if !(0..=255).contains(&c) {
-            return Err(util::arg_error(ctx, "char", i + 1, "value out of range"));
+    let r = ctx.with_buf(|out| {
+        for i in 0..n {
+            let c = util::check_integer(ctx, stack.get(i), "char", i + 1)?;
+            if !(0..=255).contains(&c) {
+                return Err(util::arg_error(ctx, "char", i + 1, "value out of range"));
+            }
+            out.push(c as u8);
         }
-        out.push(c as u8);
-    }
-    let r = LuaString::new(ctx, &out);
+        Ok(LuaString::new(ctx, out))
+    })?;
     stack.ret1(Value::string(r));
     Ok(())
 }
@@ -994,34 +995,35 @@ fn gsub_string<'gc>(
     let anchor = pat.first() == Some(&b'^');
     let body = if anchor { &pat[1..] } else { pat };
     let mut ms = MatchState::new(src, body);
-    let mut out: Vec<u8> = Vec::new();
-    let mut pos = 0usize;
-    let mut lastmatch: Option<usize> = None;
-    let mut count: i64 = 0;
-    while count < max_n {
-        let m = ms.match_at(pos).map_err(|e| pat_err(ctx, e))?;
-        match m {
-            Some(e) if Some(e) != lastmatch => {
-                count += 1;
-                add_s(ctx, &mut out, &ms, src, pos, e, template)?;
-                pos = e;
-                lastmatch = Some(e);
-            }
-            _ => {
-                if pos < src.len() {
-                    out.push(src[pos]);
-                    pos += 1;
-                } else {
-                    break;
+    ctx.with_buf(|out| {
+        let mut pos = 0usize;
+        let mut lastmatch: Option<usize> = None;
+        let mut count: i64 = 0;
+        while count < max_n {
+            let m = ms.match_at(pos).map_err(|e| pat_err(ctx, e))?;
+            match m {
+                Some(e) if Some(e) != lastmatch => {
+                    count += 1;
+                    add_s(ctx, out, &ms, src, pos, e, template)?;
+                    pos = e;
+                    lastmatch = Some(e);
+                }
+                _ => {
+                    if pos < src.len() {
+                        out.push(src[pos]);
+                        pos += 1;
+                    } else {
+                        break;
+                    }
                 }
             }
+            if anchor {
+                break;
+            }
         }
-        if anchor {
-            break;
-        }
-    }
-    out.extend_from_slice(&src[pos..]);
-    Ok((Value::string(LuaString::new(ctx, &out)), count))
+        out.extend_from_slice(&src[pos..]);
+        Ok((Value::string(LuaString::new(ctx, out)), count))
+    })
 }
 
 /// Expand a replacement template (`add_s`) for the match `src[s..e]` into
@@ -1085,8 +1087,10 @@ fn lua_lower<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<(), Error<'gc>> {
     let s = util::check_string(ctx, stack.get(0), "lower", 1)?;
-    let lowered: Vec<u8> = s.as_bytes().iter().map(u8::to_ascii_lowercase).collect();
-    stack.ret1(Value::string(LuaString::new(ctx, &lowered)));
+    let lowered = ctx.build_string(|out| {
+        out.extend(s.as_bytes().iter().map(u8::to_ascii_lowercase));
+    });
+    stack.ret1(Value::string(lowered));
     Ok(())
 }
 
@@ -1147,37 +1151,37 @@ fn lua_rep<'gc>(
 ) -> Result<(), Error<'gc>> {
     let s = util::check_string(ctx, stack.get(0), "rep", 1)?;
     let n = util::check_integer(ctx, stack.get(1), "rep", 2)?;
-    let sep = util::opt_string(ctx, stack.get(2), "rep", 3)?
-        .map_or(Vec::new(), |s| s.as_bytes().to_vec());
-    let out = if n <= 0 {
-        Vec::new()
-    } else {
-        let n = n as usize;
-        let body = s.as_bytes();
-        // Bound the result by Lua's `MAX_SIZE` (= `LUA_MAXINTEGER` on 64-bit),
-        // not just by `usize` arithmetic: `(len+sep)*n` can fit `usize` yet still
-        // be an absurd allocation (e.g. `rep("ab", maxinteger)`), so cap at
-        // `i64::MAX` to raise a catchable error instead of aborting on a
-        // `Vec::with_capacity` overflow.
-        let total = body
-            .len()
-            .checked_add(sep.len())
-            .and_then(|per| per.checked_mul(n))
-            .and_then(|t| t.checked_sub(sep.len()))
-            .filter(|&t| t <= i64::MAX as usize);
-        let Some(total) = total else {
-            return Err(Error::from_str(ctx, "resulting string too large"));
-        };
-        let mut out = Vec::with_capacity(total);
+    let sep = util::opt_string(ctx, stack.get(2), "rep", 3)?.map_or(&[][..], |s| s.as_bytes());
+    if n <= 0 {
+        stack.ret1(Value::string(LuaString::new(ctx, b"")));
+        return Ok(());
+    }
+    let n = n as usize;
+    let body = s.as_bytes();
+    // Bound the result by Lua's `MAX_SIZE` (= `LUA_MAXINTEGER` on 64-bit),
+    // not just by `usize` arithmetic: `(len+sep)*n` can fit `usize` yet still
+    // be an absurd allocation (e.g. `rep("ab", maxinteger)`), so cap at
+    // `i64::MAX` to raise a catchable error instead of aborting on a
+    // `Vec::with_capacity` overflow.
+    let total = body
+        .len()
+        .checked_add(sep.len())
+        .and_then(|per| per.checked_mul(n))
+        .and_then(|t| t.checked_sub(sep.len()))
+        .filter(|&t| t <= i64::MAX as usize);
+    let Some(total) = total else {
+        return Err(Error::from_str(ctx, "resulting string too large"));
+    };
+    let r = ctx.build_string(|out| {
+        out.reserve(total);
         for k in 0..n {
             if k > 0 {
-                out.extend_from_slice(&sep);
+                out.extend_from_slice(sep);
             }
             out.extend_from_slice(body);
         }
-        out
-    };
-    stack.ret1(Value::string(LuaString::new(ctx, &out)));
+    });
+    stack.ret1(Value::string(r));
     Ok(())
 }
 
@@ -1188,9 +1192,8 @@ fn lua_reverse<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<(), Error<'gc>> {
     let s = util::check_string(ctx, stack.get(0), "reverse", 1)?;
-    let mut bytes = s.as_bytes().to_vec();
-    bytes.reverse();
-    stack.ret1(Value::string(LuaString::new(ctx, &bytes)));
+    let reversed = ctx.build_string(|out| out.extend(s.as_bytes().iter().rev()));
+    stack.ret1(Value::string(reversed));
     Ok(())
 }
 
@@ -1234,7 +1237,9 @@ fn lua_upper<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<(), Error<'gc>> {
     let s = util::check_string(ctx, stack.get(0), "upper", 1)?;
-    let uppered: Vec<u8> = s.as_bytes().iter().map(u8::to_ascii_uppercase).collect();
-    stack.ret1(Value::string(LuaString::new(ctx, &uppered)));
+    let uppered = ctx.build_string(|out| {
+        out.extend(s.as_bytes().iter().map(u8::to_ascii_uppercase));
+    });
+    stack.ret1(Value::string(uppered));
     Ok(())
 }
