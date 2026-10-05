@@ -20,7 +20,6 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         ("getmetatable", lua_getmetatable),
         ("load", lua_load),
         ("loadfile", lua_loadfile),
-        ("pcall", lua_pcall),
         ("print", lua_print),
         ("rawequal", lua_rawequal),
         ("rawget", lua_rawget),
@@ -32,7 +31,6 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         ("tostring", lua_tostring),
         ("type", lua_type),
         ("warn", lua_warn),
-        ("xpcall", lua_xpcall),
     ];
 
     let set = |name: &str, f: Function<'gc>| {
@@ -42,6 +40,14 @@ pub fn load<'gc>(ctx: Context<'gc>) {
     for &(name, handler) in fns {
         set(name, Function::new_native(ctx.mutation(), handler, &[]));
     }
+    set(
+        "pcall",
+        Function::new_native_with_entry(ctx.mutation(), lua_pcall, &[], interp::ff_pcall),
+    );
+    set(
+        "xpcall",
+        Function::new_native_with_entry(ctx.mutation(), lua_xpcall, &[], interp::ff_xpcall),
+    );
     // `pairs` hands back the same `next` the global holds, so `pairs(t) == next`.
     let next = ctx.next_fn();
     set("next", next);
@@ -433,7 +439,7 @@ fn lua_pcall<'gc>(
     })
 }
 
-fn pcall_cont<'gc>(
+pub(crate) fn pcall_cont<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
@@ -746,7 +752,7 @@ fn lua_xpcall<'gc>(
     })
 }
 
-fn xpcall_cont<'gc>(
+pub(crate) fn xpcall_cont<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,

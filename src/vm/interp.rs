@@ -2632,8 +2632,8 @@ macro_rules! call_lua {
     (nogrow, $($rest:tt)*) => {
         call_lua!(@inner false, $($rest)*)
     };
-    (@inner $grow:literal, $callee:expr, $func_idx:expr, $nargs:expr, $returns:expr,
-     $thread:ident, $registers:ident, $ip:ident, $handlers:ident, $frame:ident, $closure:ident) => {{
+    (@inner $grow:literal, $callee:expr, $func_idx:expr, $nargs:expr, $ret:expr,
+     $thread:ident, $registers:ident, $ip:ident, $frame:ident, $closure:ident) => {{
         let callee: LuaFn<'gc> = $callee;
         let new_base = $func_idx + 1;
         unsafe { (*$frame).pc = $ip };
@@ -2677,8 +2677,7 @@ macro_rules! call_lua {
             }
         };
         $ip = callee.code;
-        // `call_ret`, off the dispatch pointer already in a register.
-        let ret = unsafe { *$handlers.cast::<Handler>().add(Op::COUNT + $returns as usize) };
+        let ret: Handler = $ret;
         if $grow {
             $thread.push_lua(LuaFrame {
                 closure: callee,
@@ -2734,8 +2733,16 @@ extern "rust-preserve-none" fn op_call<'gc>(
                 }
                 let callee = unsafe { LuaFn::from_function_unchecked(f) };
                 call_lua!(
-                    nogrow, callee, func_idx, nargs, returns, thread, registers, ip, handlers,
-                    frame, closure
+                    nogrow,
+                    callee,
+                    func_idx,
+                    nargs,
+                    call_ret_at(handlers, returns),
+                    thread,
+                    registers,
+                    ip,
+                    frame,
+                    closure
                 );
             }
             FunctionKind::Native(nc) => {
@@ -3027,7 +3034,15 @@ extern "rust-preserve-none" fn op_call_meta<'gc>(
     match target {
         CallTarget::Lua(callee) => {
             call_lua!(
-                grow, callee, func_idx, nargs, returns, thread, registers, ip, handlers, frame,
+                grow,
+                callee,
+                func_idx,
+                nargs,
+                call_ret_at(handlers, returns),
+                thread,
+                registers,
+                ip,
+                frame,
                 closure
             );
         }
@@ -3183,7 +3198,8 @@ extern "rust-preserve-none" fn op_tailcall_native<'gc>(
             let err = crate::vm::debug::locate(ctx, thread, err);
             close_upvalues(ctx.mutation(), thread, base);
             debug_assert!(!has_tbc_from(thread, base));
-            thread.pop_lua();
+            let popped = thread.pop_lua();
+            restore_protected(thread, &popped);
             thread.push_exec(ExecKind::Error(err));
             return Exit::End;
         }
@@ -3214,7 +3230,7 @@ extern "rust-preserve-none" fn op_tailcall_native<'gc>(
             // The native takes the popped frame's place: its function slot
             // and continuation carry the original caller's expectation across
             // the tail call, so its window moves down to that slot.
-            let (orig_func, ret) = {
+            let (orig_func, mut ret) = {
                 let f = unsafe { &*frame };
                 (f.base() - 1 - f.num_extras as usize, f.ret)
             };
@@ -3222,7 +3238,10 @@ extern "rust-preserve-none" fn op_tailcall_native<'gc>(
             let f = unsafe { thread.stack[func_idx].get_function().unwrap_unchecked() };
             close_upvalues(ctx.mutation(), thread, base);
             debug_assert!(!has_tbc_from(thread, base));
-            thread.pop_lua();
+            let popped = thread.pop_lua();
+            if restore_protected(thread, &popped) {
+                ret = ret_native;
+            }
             let top = thread.top;
             thread.stack.copy_within(args_base..top, orig_func + 1);
             thread.set_top_unchecked(orig_func + 1 + (top - args_base));
@@ -5746,6 +5765,213 @@ pub(crate) extern "rust-preserve-none" fn ff_yield<'gc>(
     );
 }
 
+/// Continuation of the call a `pcall` (`$k` = 1) or `xpcall` (2) entry made
+/// without a frame of its own: `true` and the results, to the call site of
+/// the `pcall`, `$k` slots below the finished call's. As LuaJIT Remake's
+/// `OnProtectedCallSuccessReturn`, it also marks the catch point
+/// ([`LuaFrame::elided_protect`]).
+macro_rules! ret_protected {
+    ($name:ident, $k:literal) => {
+        #[inline(never)]
+        #[rustc_align(32)]
+        pub(crate) extern "rust-preserve-none" fn $name<'gc>(
+            instruction: Instruction,
+            ctx: Context<'gc>,
+            thread: &mut ThreadState<'gc>,
+            registers: Registers<'gc, '_>,
+            ip: *const Instruction,
+            handlers: *const (),
+            ds: &mut DispatchState<'gc>,
+            frame: *mut LuaFrame<'gc>,
+            closure: LuaFn<'gc>,
+        ) -> Exit {
+            let (nret, values, func_slot) = ret_args!(instruction, registers, ip);
+            // The slot below the results is the finished callee's.
+            let values = unsafe { values.sub(1) };
+            unsafe { values.write(Value::boolean(true)) };
+            // The entry runs only for a CALL in a Lua frame, now on top.
+            let call = unsafe { *(*frame).pc.sub(1) };
+            let ret = call_ret_at(handlers, call.c());
+            become ret(
+                Instruction::from_raw(nret as u64 + 1),
+                ctx,
+                thread,
+                values,
+                unsafe { func_slot.sub($k) } as *const Instruction,
+                handlers,
+                ds,
+                frame,
+                closure,
+            );
+        }
+    };
+}
+
+ret_protected!(ret_pcall, 1);
+ret_protected!(ret_xpcall, 2);
+
+/// Put back the frame of the `pcall` that called `popped` without one, if
+/// one did, for what takes the popped frame's place (a native it tail
+/// called, an error) to return to; `false` if none did.
+fn restore_protected<'gc>(thread: &mut ThreadState<'gc>, popped: &LuaFrame<'gc>) -> bool {
+    let Some(k) = popped.elided_protect() else {
+        return false;
+    };
+    let nf = protected_frame(thread, popped.func_slot() - k, k);
+    thread.push_lua(nf);
+    true
+}
+
+/// The native frame a `pcall` (`k` = 1) or `xpcall` (2) entry left out, for
+/// its call at `slot` in the Lua frame on top of `ts`: the unwinder puts it
+/// back when an error reaches the call it made.
+pub(crate) fn protected_frame<'gc>(ts: &ThreadState<'gc>, slot: usize, k: usize) -> LuaFrame<'gc> {
+    use crate::vm::sequence::{OnOk, Protect};
+    let f = ts.stack[slot]
+        .get_function()
+        .expect("pcall in its call slot");
+    let caller = ts.top_lua().expect("pcall's caller");
+    let call = unsafe { *caller.pc.sub(1) };
+    let (protect, cont): (_, crate::vm::sequence::NativeCont) = if k == 1 {
+        (Protect::Errors, crate::builtin::pcall_cont)
+    } else {
+        (Protect::Handler, crate::builtin::xpcall_cont)
+    };
+    native_frame(
+        f,
+        slot + 1,
+        k as u32 - 1,
+        protect,
+        OnOk::ReturnTrue,
+        cont,
+        call_ret(call.c()),
+    )
+}
+
+/// Call the Lua function at `R[func + 1]`, from `R[func + $k]` once `$prep`
+/// has run, its arguments above it, with `$ret` taking its results: a
+/// `pcall` (`$k` = 1) or `xpcall` (2) that pushes no frame for itself.
+/// Other callees and a window that doesn't fit go to the builtin.
+macro_rules! protected_call {
+    ($k:literal, $ret:expr, $prep:block, $ctx:ident, $thread:ident, $registers:ident,
+     $ip:ident, $handlers:ident, $ds:ident, $frame:ident, $closure:ident,
+     $instruction:ident) => {{
+        let (func, nargs) = ($instruction.a(), $instruction.b());
+        let func_idx = unsafe { (*$frame).base() } + func as usize;
+        // The callee and, for `xpcall`, the handler are there.
+        let present = if nargs == 0 {
+            $thread.top - (func_idx + 1)
+        } else {
+            nargs as usize - 1
+        };
+        if present < $k {
+            tail!(op_call_native);
+        }
+        let callee = match reg!(func + 1).get_function() {
+            Some(f) if matches!(f.inner().as_ref(), FunctionKind::Lua(_)) => unsafe {
+                LuaFn::from_function_unchecked(f)
+            },
+            _ => tail!(op_call_native),
+        };
+        let callee_idx = func_idx + $k;
+        if $thread.stack.len() < callee_idx + 1 + callee.max_stack_size as usize
+            || $thread.frames_full()
+        {
+            tail!(op_call_native);
+        }
+        $prep
+        // A fixed count, shifted down to the callee's arguments.
+        let callee_nargs = if nargs == 0 { 0 } else { nargs - $k };
+        call_lua!(
+            nogrow,
+            callee,
+            callee_idx,
+            callee_nargs,
+            $ret,
+            $thread,
+            $registers,
+            $ip,
+            $frame,
+            $closure
+        );
+    }};
+}
+
+/// The entry of `pcall`; see [`protected_call`].
+#[inline(never)]
+#[rustc_align(32)]
+pub(crate) extern "rust-preserve-none" fn ff_pcall<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    if instruction.op() == Op::TAILCALL {
+        tail!(op_call_native);
+    }
+    protected_call!(
+        1,
+        ret_pcall,
+        {},
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure,
+        instruction
+    );
+}
+
+/// The entry of `xpcall`: [`protected_call`], the handler moved to the slot
+/// below the callee, where the unwinder finds it.
+#[inline(never)]
+#[rustc_align(32)]
+pub(crate) extern "rust-preserve-none" fn ff_xpcall<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let (func, nargs) = (instruction.a(), instruction.b());
+    // A missing or non-function handler is the builtin's error.
+    if instruction.op() == Op::TAILCALL || nargs < 3 || reg!(func + 2).get_function().is_none() {
+        tail!(op_call_native);
+    }
+    protected_call!(
+        2,
+        ret_xpcall,
+        {
+            let (f, h) = (reg!(func + 1), reg!(func + 2));
+            *reg!(ref mut func + 1) = h;
+            *reg!(ref mut func + 2) = f;
+        },
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure,
+        instruction
+    );
+}
+
 /// Continuation of a call a native frame made: its results go to the
 /// frame's window, where it said, and its continuation runs.
 #[inline(never)]
@@ -6281,6 +6507,12 @@ extern "rust-preserve-none" fn cmp_slow<'gc>(
 #[inline(always)]
 fn call_ret(returns: u8) -> Handler {
     DISPATCH.rets[returns as usize]
+}
+
+/// [`call_ret`] off the dispatch pointer a handler holds in a register.
+#[inline(always)]
+fn call_ret_at(handlers: *const (), returns: u8) -> Handler {
+    unsafe { *handlers.cast::<Handler>().add(Op::COUNT + returns as usize) }
 }
 
 /// [`ret_call`] for a CALL that keeps `$n` results, nil-padded.

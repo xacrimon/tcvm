@@ -1117,6 +1117,11 @@ fn unwind_error<'gc>(
                     Catch::Base => Some(None),
                 },
                 FrameRef::Native(nf) => native_catch(&ts, nf),
+                FrameRef::Elided(lf) => Some(match lf.elided_protect() {
+                    // `xpcall`'s handler sits in the slot below the callee's.
+                    Some(2) => ts.stack[lf.func_slot() - 1].get_function(),
+                    _ => None,
+                }),
                 _ => None,
             })
             .flatten();
@@ -1156,7 +1161,7 @@ fn unwind_error<'gc>(
                 }
                 return Ok(());
             }
-            let base = lf.base();
+            let (base, func_slot, protect) = (lf.base(), lf.func_slot(), lf.elided_protect());
             ts.pop_lua();
             vm::interp::close_upvalues(mc, &mut ts, base);
             let ts_ref = &mut *ts;
@@ -1171,6 +1176,12 @@ fn unwind_error<'gc>(
             // Only the logical top drops: an outer frame's register window
             // can extend past this frame's base, so the vec must not shrink.
             ts.set_top_unchecked(base);
+            if let Some(k) = protect {
+                // The `pcall` that called it without a frame catches: put its
+                // frame back, for the native catch below.
+                let nf = vm::interp::protected_frame(&ts, func_slot - k, k);
+                ts.push_lua(nf);
+            }
             continue;
         }
         match ts.top_exec_mut() {
