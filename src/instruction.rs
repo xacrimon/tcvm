@@ -691,6 +691,10 @@ instructions! {
     0x00 MOVE       mov         Ab    { dst: Reg, src: Reg }
     0x01 LOAD       load        Ad    { dst: Reg, idx: KIdx }
     0x02 LFALSESKIP lfalseskip  A     { src: Reg }
+
+    /// Upvalue reads take a by-value upvalue (`UpValueDescriptor::by_value`);
+    /// the assembler rewrites them to the `_REF` forms for the others.
+    /// SETUPVAL's upvalue is never by value.
     0x03 GETUPVAL   getupval    Ab    { dst: Reg, idx: UpIdx }
     0x04 SETUPVAL   setupval    Ab    { src: Reg, idx: UpIdx }
     0x05 GETTABUP   gettabup    Abde  { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
@@ -824,6 +828,15 @@ instructions! {
     0x5c SETTABUP_TRANS  settabup_trans  Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
     0x5d SETFIELD_ABSENT setfield_absent Abde { src: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
     0x5e SETTABUP_ABSENT settabup_absent Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+
+    // --- shared-cell upvalue forms ------------------------------------------
+    //
+    // Never emitted: the assembler rewrites GETUPVAL, GETTABUP and SETTABUP
+    // to these for an upvalue that is not by value. Not quickened.
+
+    0x5f GETUPVAL_REF getupval_ref Ab   { dst: Reg, idx: UpIdx }
+    0x60 GETTABUP_REF gettabup_ref Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+    0x61 SETTABUP_REF settabup_ref Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
 }
 
 impl Op {
@@ -855,13 +868,24 @@ impl Instruction {
 /// slot.
 pub const TFOR_VARS: u8 = 4;
 
-/// Describes how to capture an upvalue when creating a closure.
-#[derive(Debug, Clone, Copy)]
-pub enum UpValueDescriptor {
-    /// Capture from the enclosing function's local register at the given index.
+/// Where CLOSURE takes an upvalue from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpvalSource {
+    /// The enclosing function's local in this register.
     ParentLocal(u8),
-    /// Copy from the enclosing function's upvalue at the given index.
+    /// The enclosing function's upvalue at this index.
     ParentUpvalue(u8),
+}
+
+/// How CLOSURE fills one upvalue.
+#[derive(Debug, Clone, Copy)]
+pub struct UpValueDescriptor {
+    pub source: UpvalSource,
+    /// Its variable is never assigned after its initialization, so closures
+    /// hold its value rather than share a cell (LuaJIT Remake's immutable
+    /// upvalues). `debug.setupvalue` on one would change only that closure's
+    /// copy.
+    pub by_value: bool,
 }
 
 #[cfg(test)]

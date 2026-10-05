@@ -8,7 +8,7 @@ use cstree::build::NodeCache;
 
 use crate::compiler::compile_chunk;
 use crate::dmm::{DynamicRootSet, Mutation};
-use crate::env::function::{Function, UpvalueCell};
+use crate::env::function::{Function, UpvalueCell, UpvalueSlot};
 use crate::env::shape::{MetamethodBits, Shape, inline_bucket};
 use crate::env::string::Interner;
 use crate::env::{LuaString, Symbols, Table, Value};
@@ -277,9 +277,15 @@ impl<'gc> Context<'gc> {
 
         // Main chunk's upvalue 0 is _ENV, its only one.
         debug_assert_eq!(proto.num_upvalues, 1);
-        let env_uv = UpvalueCell::new_closed(self.mutation, env);
+        let env = if proto.upvalue_desc[0].by_value {
+            UpvalueSlot { value: env }
+        } else {
+            UpvalueSlot {
+                cell: UpvalueCell::new_closed(self.mutation, env),
+            }
+        };
         Ok(Function::new_lua(self.mutation, proto, |dst| unsafe {
-            dst.write(env_uv)
+            dst.write(env)
         }))
     }
 }
