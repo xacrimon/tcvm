@@ -165,6 +165,28 @@ impl<'gc> LuaFrame<'gc> {
         self.flags & frame_flags::NATIVE != 0
     }
 
+    /// For a Lua frame a `pcall` (1) or `xpcall` (2) entry called without
+    /// pushing its own frame, how far below this frame's function slot that
+    /// call's slot is. Its `ret` marks it, as LuaJIT Remake's
+    /// `OnProtectedCallSuccessReturn` does.
+    #[inline]
+    pub(crate) fn elided_protect(&self) -> Option<usize> {
+        use crate::vm::interp::{ret_pcall, ret_xpcall};
+        if std::ptr::fn_addr_eq(self.ret, ret_pcall as Handler) {
+            Some(1)
+        } else if std::ptr::fn_addr_eq(self.ret, ret_xpcall as Handler) {
+            Some(2)
+        } else {
+            None
+        }
+    }
+
+    /// The slot of the call that pushed this Lua frame.
+    #[inline]
+    pub(crate) fn func_slot(&self) -> usize {
+        self.base() - 1 - self.num_extras as usize
+    }
+
     #[inline(always)]
     pub fn set_base(&mut self, base: usize) {
         debug_assert!(base <= u32::MAX as usize);
@@ -252,6 +274,9 @@ pub enum ExecKind<'gc> {
 pub enum FrameRef<'a, 'gc> {
     Lua(&'a LuaFrame<'gc>),
     Native(&'a LuaFrame<'gc>),
+    /// The `pcall` or `xpcall` that called Lua frame `.0` from its entry
+    /// without a frame of its own; see [`LuaFrame::elided_protect`].
+    Elided(&'a LuaFrame<'gc>),
     Exec(&'a ExecKind<'gc>),
 }
 
@@ -520,9 +545,9 @@ impl<'gc> ThreadState<'gc> {
 
     /// Pop the innermost frame, which must be a Lua frame.
     #[inline]
-    pub(crate) fn pop_lua(&mut self) {
+    pub(crate) fn pop_lua(&mut self) -> LuaFrame<'gc> {
         debug_assert!(self.top_is_lua(), "non-Lua frame on top");
-        self.frames.pop();
+        unsafe { self.frames.pop().unwrap_unchecked() }
     }
 
     /// Drop everything a previous run left behind; `status` is the caller's.
@@ -544,8 +569,11 @@ impl<'gc> ThreadState<'gc> {
     /// Every frame, innermost first.
     pub(crate) fn frames_rev(&self) -> impl Iterator<Item = FrameRef<'_, 'gc>> {
         let (mut lua, mut exec) = (self.frames.len(), self.exec_frames.len());
+        let mut elided = None;
         std::iter::from_fn(move || {
-            if exec > 0 && self.exec_frames[exec - 1].depth == lua {
+            if let Some(f) = elided.take() {
+                Some(FrameRef::Elided(f))
+            } else if exec > 0 && self.exec_frames[exec - 1].depth == lua {
                 exec -= 1;
                 Some(FrameRef::Exec(&self.exec_frames[exec].kind))
             } else if lua > 0 {
@@ -554,6 +582,9 @@ impl<'gc> ThreadState<'gc> {
                 Some(if f.is_native() {
                     FrameRef::Native(f)
                 } else {
+                    if f.elided_protect().is_some() {
+                        elided = Some(f);
+                    }
                     FrameRef::Lua(f)
                 })
             } else {
