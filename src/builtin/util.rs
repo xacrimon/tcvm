@@ -409,7 +409,7 @@ fn raise_not_implemented<'gc>(
     closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<(), Error<'gc>> {
-    let name = closure.upvalues[0]
+    let name = closure.upvalues()[0]
         .get_string()
         .map_or(&[][..], |s| s.as_bytes());
     let name = String::from_utf8_lossy(name);

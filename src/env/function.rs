@@ -1,7 +1,6 @@
 use std::cell::Cell;
 
 use crate::Context;
-use crate::dmm::allocator_api::MetricsAlloc;
 use crate::dmm::{Collect, Gc, GcWeak, Lock, Mutation, RefLock, Trace};
 use crate::env::error::Error;
 use crate::env::shape::Shape;
@@ -300,10 +299,9 @@ impl<'gc> UpvalueCell<'gc> {
     }
 }
 
-/// A Lua closure (bytecode + upvalues).
+/// A Lua closure: bytecode, with its upvalues in the cell after it.
 pub struct LuaClosure<'gc> {
     pub proto: Gc<'gc, Prototype<'gc>>,
-    pub upvalues: Box<[Upvalue<'gc>], MetricsAlloc<'gc>>,
     // Copies of the `proto` fields CALL needs, so entering a function is one
     // dependent load shorter (closure -> code, not closure -> proto -> code).
     // The pointers stay valid because `proto` is immutable and kept alive by
@@ -317,24 +315,26 @@ pub struct LuaClosure<'gc> {
     /// `num_params`, or 255 for a vararg function: a CALL passing more
     /// than this many arguments (`nargs + 1`, never 256) needs no fixups.
     pub fixed_arity: u8,
+    /// Here rather than read from `proto`, which the collector may have freed
+    /// by the time it sizes this cell.
+    num_upvalues: u8,
 }
 
-// SAFETY: `proto` and `upvalues` are the only owned Gc pointers; the raw
-// pointers alias data owned by `proto`.
-unsafe impl<'gc> Collect<'gc> for LuaClosure<'gc> {
-    fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
-        cc.trace(&self.proto);
-        cc.trace(&self.upvalues);
+impl<'gc> LuaClosure<'gc> {
+    pub fn upvalues(&self) -> &[Upvalue<'gc>] {
+        // SAFETY: a `LuaClosure` only exists as a `FunctionKind::Lua`, allocated
+        // with its upvalues after it (`Function::new_lua`).
+        unsafe {
+            let fk = (self as *const Self).byte_sub(std::mem::offset_of!(FunctionKind, Lua.0));
+            let p = Gc::<FunctionKind>::trailing_ptr_of(&*fk.cast::<FunctionKind>());
+            std::slice::from_raw_parts(p.cast().as_ptr(), self.num_upvalues as usize)
+        }
     }
 }
 
-/// A native closure (Rust function + optional upvalues).
-#[derive(Collect)]
-#[collect(internal, no_drop)]
+/// A native closure: a Rust function, with its upvalues in the cell after it.
 pub struct NativeClosure<'gc> {
-    #[collect(require_static)]
     pub(crate) function: NativeKind,
-    pub upvalues: Box<[Value<'gc>], MetricsAlloc<'gc>>,
     /// What CALL and TAILCALL jump to: `op_call_native`, `op_call_action` or
     /// `op_call_async` by `function`'s kind, or for a builtin with a fast path its own entry
     /// (LuaJIT's `ff_*`), which handles the common argument shape inline,
@@ -342,8 +342,20 @@ pub struct NativeClosure<'gc> {
     /// so `function` stays the complete implementation. An entry must check
     /// the opcode: after a TAILCALL it returns its results from the frame
     /// instead of dispatching the next instruction.
-    #[collect(require_static)]
     pub(crate) entry: Handler,
+    num_upvalues: u32,
+    _upvalues: std::marker::PhantomData<Value<'gc>>,
+}
+
+impl<'gc> NativeClosure<'gc> {
+    pub fn upvalues(&self) -> &[Value<'gc>] {
+        // SAFETY: as in `LuaClosure::upvalues`.
+        unsafe {
+            let fk = (self as *const Self).byte_sub(std::mem::offset_of!(FunctionKind, Native.0));
+            let p = Gc::<FunctionKind>::trailing_ptr_of(&*fk.cast::<FunctionKind>());
+            std::slice::from_raw_parts(p.cast().as_ptr(), self.num_upvalues as usize)
+        }
+    }
 }
 
 /// A native function: reads its arguments from `stack` and leaves its results
@@ -609,14 +621,42 @@ impl<'gc, 'a> std::ops::Index<usize> for Stack<'gc, 'a> {
 #[collect(internal, no_drop)]
 pub struct Function<'gc>(Gc<'gc, FunctionKind<'gc>>);
 
-#[derive(Collect)]
-#[collect(internal, no_drop)]
+/// Followed in its cell by the closure's upvalues: `Upvalue`s for a Lua
+/// closure, `Value`s for a native.
 pub enum FunctionKind<'gc> {
     /// Inline, not behind another `Gc`: CALL reaches the closure's `code`
     /// with one load fewer.
     Lua(LuaClosure<'gc>),
     Native(NativeClosure<'gc>),
 }
+
+// SAFETY: traces `proto` and the upvalues; a `LuaClosure`'s raw pointers alias
+// data `proto` owns.
+unsafe impl<'gc> Collect<'gc> for FunctionKind<'gc> {
+    fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
+        match self {
+            FunctionKind::Lua(c) => {
+                cc.trace(&c.proto);
+                cc.trace(c.upvalues());
+            }
+            FunctionKind::Native(c) => cc.trace(c.upvalues()),
+        }
+    }
+}
+
+// SAFETY: only `Function::new_lua` and `new_native_with_entry` allocate one,
+// with this many bytes; no drop glue.
+unsafe impl<'gc> crate::dmm::TrailingBytes for FunctionKind<'gc> {
+    #[inline(always)]
+    fn trailing_len(&self) -> usize {
+        8 * match self {
+            FunctionKind::Lua(c) => c.num_upvalues as usize,
+            FunctionKind::Native(c) => c.num_upvalues as usize,
+        }
+    }
+}
+
+const _: () = assert!(size_of::<Upvalue<'static>>() == 8 && size_of::<Value<'static>>() == 8);
 
 /// A `Function` known to hold a Lua closure. Derefs to the closure without
 /// re-checking the kind, so frames can keep one pointer and still reach
@@ -636,6 +676,12 @@ impl<'gc> LuaFn<'gc> {
 
     pub fn function(self) -> Function<'gc> {
         Function(self.0)
+    }
+
+    /// The first upvalue: a constant offset from the closure.
+    #[inline(always)]
+    pub(crate) fn upvalue_ptr(self) -> *mut Upvalue<'gc> {
+        Gc::trailing_ptr(self.0).cast().as_ptr()
     }
 
     /// A native frame's function in the closure field, which no one may
@@ -662,14 +708,16 @@ impl<'gc> std::ops::Deref for LuaFn<'gc> {
 }
 
 impl<'gc> Function<'gc> {
+    /// A Lua closure of `proto`, `init` writing its `proto.num_upvalues`
+    /// upvalues.
+    #[inline]
     pub fn new_lua(
         mc: &Mutation<'gc>,
         proto: Gc<'gc, Prototype<'gc>>,
-        upvalues: Box<[Upvalue<'gc>], MetricsAlloc<'gc>>,
+        init: impl FnOnce(*mut Upvalue<'gc>),
     ) -> Self {
         let closure = LuaClosure {
             proto,
-            upvalues,
             code: proto.code.as_ptr(),
             constants: proto.constants.as_ptr(),
             ic_table: proto.ic_table.as_ptr(),
@@ -681,8 +729,12 @@ impl<'gc> Function<'gc> {
             } else {
                 proto.num_params
             },
+            num_upvalues: proto.num_upvalues,
         };
-        Function(Gc::new(mc, FunctionKind::Lua(closure)))
+        // SAFETY: `init` writes every upvalue.
+        Function(unsafe {
+            Gc::new_with_trailing(mc, FunctionKind::Lua(closure), |p| init(p.cast().as_ptr()))
+        })
     }
 
     pub fn new_native(mc: &Mutation<'gc>, function: NativeFn, upvalues: &[Value<'gc>]) -> Self {
@@ -708,18 +760,18 @@ impl<'gc> Function<'gc> {
         upvalues: &[Value<'gc>],
         entry: Handler,
     ) -> Self {
-        Function(Gc::new(
-            mc,
-            FunctionKind::Native(NativeClosure {
-                function,
-                upvalues: {
-                    let mut v = Vec::with_capacity_in(upvalues.len(), MetricsAlloc::new(mc));
-                    v.extend_from_slice(upvalues);
-                    v.into_boxed_slice()
-                },
-                entry,
-            }),
-        ))
+        let closure = NativeClosure {
+            function,
+            entry,
+            num_upvalues: u32::try_from(upvalues.len()).expect("too many upvalues"),
+            _upvalues: std::marker::PhantomData,
+        };
+        // SAFETY: copies every upvalue.
+        Function(unsafe {
+            Gc::new_with_trailing(mc, FunctionKind::Native(closure), |p| {
+                std::ptr::copy_nonoverlapping(upvalues.as_ptr(), p.cast().as_ptr(), upvalues.len())
+            })
+        })
     }
 
     pub fn as_lua(self) -> Option<LuaFn<'gc>> {

@@ -258,7 +258,7 @@ fn lua_format<'gc>(
 
     // Taken rather than borrowed: a `__tostring` below can re-enter `format`, which then
     // finds the cell empty and allocates its own.
-    let buf = closure.upvalues[0]
+    let buf = closure.upvalues()[0]
         .get_userdata()
         .expect("format upvalue 0 must be its buffer");
     let mut out = buf
@@ -720,7 +720,7 @@ fn gmatch_aux<'gc>(
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<(), Error<'gc>> {
-    let ud = closure.upvalues[0]
+    let ud = closure.upvalues()[0]
         .get_userdata()
         .expect("gmatch iterator upvalue must be a userdata");
     let result = ud

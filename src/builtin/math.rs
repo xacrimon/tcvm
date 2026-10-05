@@ -504,7 +504,7 @@ fn project(mut ran: u64, n: u64, st: &mut RngState) -> u64 {
 
 #[inline]
 fn rng_state<'gc>(closure: &NativeClosure<'gc>) -> Userdata<'gc> {
-    closure.upvalues[0]
+    closure.upvalues()[0]
         .get_userdata()
         .expect("random/randomseed upvalue 0 must be the RNG userdata")
 }

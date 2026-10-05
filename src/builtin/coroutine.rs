@@ -312,7 +312,7 @@ fn wrap_callback<'gc>(
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction, Error<'gc>> {
-    let co = closure.upvalues[0]
+    let co = closure.upvalues()[0]
         .get_thread()
         .expect("wrap_callback upvalue 0 must be a thread");
     // Gate the resume like `lua_resume` does; without this, resuming a dead
@@ -343,7 +343,7 @@ pub(crate) fn wrap_cont<'gc>(
         Ok(()) => return Err(Error::from_str(ctx, "too many results to resume")),
         Err(err) => err,
     };
-    let co = closure.upvalues[0].get_thread().expect("wrap's thread");
+    let co = closure.upvalues()[0].get_thread().expect("wrap's thread");
     if co.borrow().tbc_list.is_empty() {
         // `auxwrap` re-raises a string error with the wrap caller's position
         // prepended on top of the coroutine's own.
