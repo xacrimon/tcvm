@@ -5,7 +5,7 @@ use crate::env::thread::{ExecKind, ThreadStatus};
 use crate::env::{
     Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Thread, Value,
 };
-use crate::vm::sequence::{CallbackAction, Execution, OnOk};
+use crate::vm::native::{CallbackAction, Execution, OnOk};
 use crate::vm::{close, interp};
 
 pub fn load<'gc>(ctx: Context<'gc>) {
@@ -64,16 +64,15 @@ fn lua_create<'gc>(
 }
 
 /// `coroutine.resume(co, ...)` — switch to `co`, passing the rest as args.
-/// On `co` yielding/returning, the [`ResumeSequence`] wraps the values as
-/// `(true, ...)`; on error, it produces `(false, msg)`. If `co` isn't
-/// resumable (dead, currently running, on the resume stack as a parent, or
-/// the main thread) we return `(false, msg)` directly per the manual
-/// instead of routing through the executor.
+/// On `co` yielding/returning, [`resume_cont`] makes the values `(true, ...)`;
+/// on error, `(false, msg)`. If `co` isn't resumable (dead, currently
+/// running, on the resume stack as a parent, or the main thread) we return
+/// `(false, msg)` directly per the manual.
 fn lua_resume<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<CallbackAction, Error<'gc>> {
     let co = stack
         .get(0)
         .get_thread()
@@ -97,7 +96,7 @@ pub(crate) fn resume_cont<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
     status: Result<(), Error<'gc>>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<CallbackAction, Error<'gc>> {
     match status {
         Ok(()) if stack.check_stack(1) => stack.insert(0, Value::boolean(true)),
         Ok(()) => {
@@ -145,7 +144,7 @@ fn lua_yield<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<CallbackAction, Error<'gc>> {
     Ok(CallbackAction::Yield)
 }
 
@@ -259,7 +258,7 @@ fn lua_close<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<CallbackAction, Error<'gc>> {
     let co = opt_co(ctx, &stack, "close")?;
     // Pointer-eq against current first to avoid re-borrowing the running
     // thread's RefLock (mut-borrowed by the interpreter).
@@ -267,14 +266,19 @@ fn lua_close<'gc>(
         if stack.exec().is_main() {
             return Err(Error::from_str(ctx, "cannot close main thread"));
         }
-        return Ok(close::close_running(ctx));
+        return close::close_running(ctx, stack);
     }
     match co.peer_status() {
         ThreadStatus::Suspended | ThreadStatus::Stopped | ThreadStatus::Result { .. } => {
             let mut ts = co.borrow_mut(ctx.mutation());
             if close::seed_thread_close(ctx, &mut ts) {
-                stack.clear();
-                return Ok(CallbackAction::resume(co, None));
+                // The coroutine's own close runner returns the results.
+                stack.replace(&[Value::thread(co)]);
+                return Ok(CallbackAction::Resume {
+                    at: 0,
+                    ok: OnOk::Return,
+                    cont: close_cont,
+                });
             }
             // Surfaced once, so a second close is `true`, as in Lua.
             match ts.death_error.take() {
@@ -287,6 +291,19 @@ fn lua_close<'gc>(
     }
 }
 
+/// A close runner that ended without returning (a process exit).
+fn close_cont<'gc>(
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
+    mut stack: Stack<'gc, '_>,
+    status: Result<(), Error<'gc>>,
+) -> Result<CallbackAction, Error<'gc>> {
+    if let Err(err) = status {
+        stack.replace(&[Value::boolean(false), err.value()]);
+    }
+    Ok(CallbackAction::Return)
+}
+
 /// Body of the closure returned by `coroutine.wrap`. Upvalue 0 carries the
 /// thread; we resume it and unwrap the success-prefix from the resume
 /// protocol (errors rethrow rather than getting wrapped, matching Lua).
@@ -294,7 +311,7 @@ fn wrap_callback<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<CallbackAction, Error<'gc>> {
     let co = closure.upvalues[0]
         .get_thread()
         .expect("wrap_callback upvalue 0 must be a thread");
@@ -320,7 +337,7 @@ pub(crate) fn wrap_cont<'gc>(
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
     status: Result<(), Error<'gc>>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<CallbackAction, Error<'gc>> {
     let err = match status {
         Ok(()) if stack.check_stack(1) => return Ok(CallbackAction::Return),
         Ok(()) => return Err(Error::from_str(ctx, "too many results to resume")),
@@ -348,7 +365,7 @@ fn wrap_close_cont<'gc>(
     _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
     status: Result<(), Error<'gc>>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<CallbackAction, Error<'gc>> {
     match status {
         Ok(()) => Err(Error::new(ctx, stack.get(1)).with_level(1)),
         Err(err) => Err(err.with_level(1)),

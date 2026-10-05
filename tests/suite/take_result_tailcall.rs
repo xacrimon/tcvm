@@ -1,13 +1,13 @@
 use tcvm::env::{Error, Function, LuaString, NativeClosure, Stack, Value};
-use tcvm::vm::sequence::CallbackAction;
+use tcvm::vm::native::CallbackAction;
 use tcvm::{Context, Executor, LoadError, Lua, RuntimeError, StepResult};
 
 fn yielder<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     _s: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    Ok(CallbackAction::yield_(None))
+) -> Result<CallbackAction, Error<'gc>> {
+    Ok(CallbackAction::Yield)
 }
 
 /// Tail-call a native that suspends. The Lua frame is popped at TAILCALL time,

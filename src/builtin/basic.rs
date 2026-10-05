@@ -7,10 +7,9 @@ use crate::env::function::NativeKind;
 use crate::env::{
     ActionFn, Error, Function, LuaString, MetamethodBits, NativeClosure, NativeFn, Stack, Value,
 };
-use crate::vm::async_sequence::{SequenceReturn, async_sequence};
 use crate::vm::debug::where_prefix;
 use crate::vm::interp;
-use crate::vm::sequence::{BoxSequence, CallbackAction, OnOk, Protect};
+use crate::vm::native::{CallbackAction, OnOk, Protect};
 
 pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[
@@ -145,13 +144,18 @@ fn lua_dofile<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<CallbackAction, Error<'gc>> {
     let fname = util::opt_string(ctx, stack.get(0), "dofile", 1)?;
     let path = fname.map(|f| f.as_bytes());
     match ctx.load_file_with(path, Value::table(ctx.globals())) {
         Ok(f) => {
             stack.replace(&[Value::function(f)]);
-            Ok(CallbackAction::call(None))
+            Ok(CallbackAction::CallThen {
+                at: 0,
+                protect: Protect::No,
+                ok: OnOk::Return,
+                cont: return_cont,
+            })
         }
         Err(e) => Err(Error::new(ctx, load_error_value(ctx, &e))),
     }
@@ -215,7 +219,7 @@ pub(crate) fn ipairs_aux<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<CallbackAction, Error<'gc>> {
     let i = util::check_integer(ctx, stack.get(1), "for iterator", 2)?.wrapping_add(1);
     if let Some(t) = stack.get(0).get_table() {
         let v = t.raw_get(Value::integer(ctx.mutation(), i));
@@ -228,16 +232,16 @@ pub(crate) fn ipairs_aux<'gc>(
             return Ok(CallbackAction::Return);
         }
     }
-    Ok(ipairs_meta(ctx, i))
+    Ok(ipairs_meta(ctx, &mut stack, i))
 }
 
 /// `ipairs_aux` for a value whose `[i]` may run `__index`.
 #[cold]
 #[inline(never)]
-fn ipairs_meta<'gc>(ctx: Context<'gc>, i: i64) -> CallbackAction<'gc> {
-    let seq = async_sequence(ctx.mutation(), move |_locals, mut seq| async move {
-        util::geti(&mut seq, 0, i).await?;
-        seq.enter(|ctx, _locals, _exec, mut stack| {
+fn ipairs_meta<'gc>(ctx: Context<'gc>, stack: &mut Stack<'gc, '_>, i: i64) -> CallbackAction {
+    stack.spawn_action(ctx, move |cx| async move {
+        util::geti(&cx, 0, i).await?;
+        cx.enter(|ctx, mut stack| {
             let v = stack.get(stack.len() - 1);
             if v.is_nil() {
                 stack.ret1(v);
@@ -245,9 +249,8 @@ fn ipairs_meta<'gc>(ctx: Context<'gc>, i: i64) -> CallbackAction<'gc> {
                 stack.replace(&[Value::integer(ctx.mutation(), i), v]);
             }
         });
-        Ok(SequenceReturn::Return)
-    });
-    CallbackAction::sequence(seq)
+        Ok(())
+    })
 }
 
 /// `load(chunk [, chunkname [, mode [, env]]])` — compile a string chunk, or
@@ -257,7 +260,7 @@ fn lua_load<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<CallbackAction, Error<'gc>> {
     let chunk = util::to_lstring(ctx, stack.get(0));
     check_mode(ctx, stack.get(2), "load", 3)?;
     if let Some(s) = chunk {
@@ -272,72 +275,69 @@ fn lua_load<'gc>(
     let Some(reader) = stack.get(0).get_function() else {
         return Err(util::type_error(ctx, "load", 1, "function", stack.arg(0)));
     };
-    Ok(load_reader(ctx, reader, name))
+    if stack.len() < 2 {
+        stack.push(Value::nil());
+    }
+    stack.as_mut_slice()[..2].copy_from_slice(&[Value::function(reader), Value::string(name)]);
+    Ok(load_reader(ctx, &mut stack))
 }
 
-/// `load` from a reader function, called until it returns nil or an empty
-/// string. An error the reader raises becomes `load`'s `(nil, message)`.
-/// Unlike Lua, which parses as it reads, the whole chunk is read first.
-fn load_reader<'gc>(
-    ctx: Context<'gc>,
-    reader: Function<'gc>,
-    name: LuaString<'gc>,
-) -> CallbackAction<'gc> {
-    let seq = async_sequence(ctx.mutation(), |locals, mut seq| {
-        let mc = ctx.mutation();
-        let reader = locals.stash(mc, reader);
-        let name = locals.stash(mc, Value::string(name));
-        async move {
-            let mut source = Vec::new();
-            loop {
-                let bottom = seq.enter(|_ctx, _locals, _exec, stack| stack.len());
-                if let Err(e) = seq.call(&reader, bottom).await {
-                    seq.enter(|ctx, locals, _exec, mut stack| {
-                        let e = locals.fetch(ctx.mutation(), &e);
-                        stack.replace(&[Value::nil(), e.value()]);
-                    });
-                    return Ok(SequenceReturn::Return);
-                }
-                // `Some(done)`, or `None` for a piece that isn't a string.
-                let piece = seq.enter(|ctx, _locals, _exec, mut stack| {
-                    let v = stack.get(bottom);
-                    stack.truncate(bottom);
-                    if v.is_nil() {
-                        return Some(true);
-                    }
-                    let s = util::to_lstring(ctx, v)?;
-                    source.extend_from_slice(s.as_bytes());
-                    Some(s.is_empty())
+/// `load` from the reader function at window slot 0, called until it
+/// returns nil or an empty string, the chunk's name at slot 1. An error the
+/// reader raises becomes `load`'s `(nil, message)`. Unlike Lua, which parses
+/// as it reads, the whole chunk is read first.
+fn load_reader<'gc>(ctx: Context<'gc>, stack: &mut Stack<'gc, '_>) -> CallbackAction {
+    stack.spawn_action(ctx, |cx| async move {
+        let mut source = Vec::new();
+        // Each call at the top of the window: the reader, then its results.
+        let at = cx.enter(|_, stack| stack.len());
+        loop {
+            cx.enter(|_, mut stack| {
+                stack.truncate(at);
+                stack.push(stack.get(0));
+            });
+            if let Err(e) = cx.pcall(at).await {
+                cx.enter(|_, mut stack| {
+                    let e = stack.get_local(e.value());
+                    stack.replace(&[Value::nil(), e]);
                 });
-                match piece {
-                    Some(false) => {}
-                    Some(true) => break,
-                    None => {
-                        seq.enter(|ctx, _locals, _exec, mut stack| {
-                            // `luaL_error`, located at `load`'s caller.
-                            let mut msg = where_prefix(stack.thread_mut(), 1);
-                            msg.extend_from_slice(b"reader function must return a string");
-                            let msg = LuaString::new(ctx, &msg);
-                            stack.replace(&[Value::nil(), Value::string(msg)]);
-                        });
-                        return Ok(SequenceReturn::Return);
-                    }
+                return Ok(());
+            }
+            // `Some(done)`, or `None` for a piece that isn't a string.
+            let piece = cx.enter(|ctx, stack| {
+                let v = stack.get(at);
+                if v.is_nil() {
+                    return Some(true);
+                }
+                let s = util::to_lstring(ctx, v)?;
+                source.extend_from_slice(s.as_bytes());
+                Some(s.is_empty())
+            });
+            match piece {
+                Some(false) => {}
+                Some(true) => break,
+                None => {
+                    cx.enter(|ctx, mut stack| {
+                        // `luaL_error`, located at `load`'s caller, below
+                        // its frame.
+                        let mut msg = where_prefix(stack.thread_mut(), 2);
+                        msg.extend_from_slice(b"reader function must return a string");
+                        let msg = LuaString::new(ctx, &msg);
+                        stack.replace(&[Value::nil(), Value::string(msg)]);
+                    });
+                    return Ok(());
                 }
             }
-            seq.enter(|ctx, locals, _exec, mut stack| {
-                let mc = ctx.mutation();
-                let name = locals
-                    .fetch(mc, &name)
-                    .get_string()
-                    .expect("stashed a string");
-                let env = env_arg(ctx, &stack, 3);
-                let loaded = ctx.load_bytes(&source, name, env);
-                push_loaded(ctx, &mut stack, loaded);
-            });
-            Ok(SequenceReturn::Return)
         }
-    });
-    CallbackAction::sequence(seq)
+        cx.enter(|ctx, mut stack| {
+            stack.truncate(at);
+            let name = stack.get(1).get_string().expect("a string name");
+            let env = env_arg(ctx, &stack, 3);
+            let loaded = ctx.load_bytes(&source, name, env);
+            push_loaded(ctx, &mut stack, loaded);
+        });
+        Ok(())
+    })
 }
 
 /// `load_aux`'s `env`: the argument at slot `i` when present, even nil.
@@ -424,7 +424,7 @@ fn lua_pairs<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<CallbackAction, Error<'gc>> {
     util::check_any(ctx, &stack, "pairs", 1)?;
     let t = stack.get(0);
     let mm = ctx.mm_of(t, MetamethodBits::PAIRS);
@@ -433,8 +433,31 @@ fn lua_pairs<'gc>(
         return Ok(CallbackAction::Return);
     }
     stack.replace(&[mm, t]);
-    let then = BoxSequence::new(ctx.mutation(), util::AdjustResults(4));
-    Ok(CallbackAction::call(Some(then)))
+    Ok(CallbackAction::call_then(0, pairs_cont))
+}
+
+/// `__pairs` returned: its first four results, as `lua_call(L, 1, 4)`.
+fn pairs_cont<'gc>(
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
+    mut stack: Stack<'gc, '_>,
+    _status: Result<(), Error<'gc>>,
+) -> Result<CallbackAction, Error<'gc>> {
+    stack.truncate(4);
+    while stack.len() < 4 {
+        stack.push(Value::nil());
+    }
+    Ok(CallbackAction::Return)
+}
+
+/// The continuation of a call whose results are the native's.
+fn return_cont<'gc>(
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
+    _stack: Stack<'gc, '_>,
+    _status: Result<(), Error<'gc>>,
+) -> Result<CallbackAction, Error<'gc>> {
+    Ok(CallbackAction::Return)
 }
 
 /// `pcall(f, ...)`: a protected call of `f`, whose results come back as
@@ -445,7 +468,7 @@ fn lua_pcall<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<CallbackAction, Error<'gc>> {
     util::check_any(ctx, &stack, "pcall", 1)?;
     Ok(CallbackAction::CallThen {
         at: 0,
@@ -460,7 +483,7 @@ pub(crate) fn pcall_cont<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
     status: Result<(), Error<'gc>>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<CallbackAction, Error<'gc>> {
     match status {
         Ok(()) => stack.insert(0, Value::boolean(true)),
         Err(err) => stack.replace(&[Value::boolean(false), err.value()]),
@@ -474,7 +497,7 @@ fn lua_print<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<CallbackAction, Error<'gc>> {
     let n = stack.len();
     let has_tostring = |i| !ctx.mm_of(stack.get(i), MetamethodBits::TOSTRING).is_nil();
     if !(0..n).any(has_tostring) {
@@ -493,10 +516,9 @@ fn lua_print<'gc>(
     }
     // Some `__tostring` must run; like Lua, write each argument as soon as it
     // is converted.
-    let seq = async_sequence(ctx.mutation(), move |_locals, seq| async move {
-        let mut seq = seq;
+    Ok(stack.spawn_action(ctx, move |cx| async move {
         for i in 0..n {
-            let bytes = util::tolstring(&mut seq, i, n).await?;
+            let bytes = util::tolstring(&cx, i, n).await?;
             let mut out = std::io::stdout().lock();
             if i > 0 {
                 let _ = out.write_all(b"\t");
@@ -504,10 +526,9 @@ fn lua_print<'gc>(
             let _ = out.write_all(&bytes);
         }
         let _ = std::io::stdout().write_all(b"\n");
-        seq.enter(|_ctx, _locals, _exec, mut stack| stack.replace(&[]));
-        Ok(SequenceReturn::Return)
-    });
-    Ok(CallbackAction::sequence(seq))
+        cx.enter(|_, mut stack| stack.replace(&[]));
+        Ok(())
+    }))
 }
 
 /// `rawequal(a, b)` — primitive equality, bypassing `__eq`.
@@ -705,7 +726,7 @@ fn lua_tostring<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<CallbackAction, Error<'gc>> {
     util::check_any(ctx, &stack, "tostring", 1)?;
     let v = stack.get(0);
     let mm = ctx.mm_of(v, MetamethodBits::TOSTRING);
@@ -714,8 +735,19 @@ fn lua_tostring<'gc>(
         return Ok(CallbackAction::Return);
     }
     stack.replace(&[mm, v]);
-    let then = BoxSequence::new(ctx.mutation(), util::ToStringResult);
-    Ok(CallbackAction::call(Some(then)))
+    Ok(CallbackAction::call_then(0, tostring_cont))
+}
+
+/// `__tostring` returned: its first result, checked and converted.
+fn tostring_cont<'gc>(
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
+    mut stack: Stack<'gc, '_>,
+    _status: Result<(), Error<'gc>>,
+) -> Result<CallbackAction, Error<'gc>> {
+    let s = util::tostring_result(ctx, stack.get(0))?;
+    stack.ret1(Value::string(s));
+    Ok(CallbackAction::Return)
 }
 
 /// `type(v)` — the type name of `v` as a string.
@@ -753,7 +785,7 @@ fn lua_xpcall<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<CallbackAction, Error<'gc>> {
     if stack.get(1).get_function().is_none() {
         return Err(util::type_error(ctx, "xpcall", 2, "function", stack.arg(1)));
     }
@@ -773,7 +805,7 @@ pub(crate) fn xpcall_cont<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
     status: Result<(), Error<'gc>>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<CallbackAction, Error<'gc>> {
     match status {
         // The results follow the handler's slot.
         Ok(()) => stack.as_mut_slice()[0] = Value::boolean(true),

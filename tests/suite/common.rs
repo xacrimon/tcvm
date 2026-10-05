@@ -2,7 +2,7 @@
 //! source as the chunk `=c`.
 
 use tcvm::env::{Error, Function, LuaString, NativeClosure, Stack, Value};
-use tcvm::vm::sequence::CallbackAction;
+use tcvm::vm::native::CallbackAction;
 use tcvm::{Context, Executor, FromMultiValue, LoadError, Lua, RuntimeError, StashedExecutor};
 
 /// Defines `cat(...)`, its arguments' `tostring`s joined by spaces. One line,
@@ -49,8 +49,8 @@ pub fn yielder<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    Ok(CallbackAction::yield_(None))
+) -> Result<CallbackAction, Error<'gc>> {
+    Ok(CallbackAction::Yield)
 }
 
 /// A `Lua` with every library and the global `yielder` bound to [`yielder`].

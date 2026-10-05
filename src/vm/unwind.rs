@@ -11,7 +11,7 @@ use crate::env::thread::{
 use crate::env::{LuaString, MetamethodBits, Value};
 use crate::lua::Context;
 use crate::vm::interp::{close_upvalues, native_frame, protected_frame, ret_exit};
-use crate::vm::sequence::{CallbackAction, Catch, NativeCont, OnOk, Protect};
+use crate::vm::native::{CallbackAction, NativeCont, OnOk, Protect};
 
 /// Where [`unwind`] left an error.
 pub(crate) enum Unwound<'gc> {
@@ -20,8 +20,8 @@ pub(crate) enum Unwound<'gc> {
     /// The native frame now on top calls the message handler or a `__close`
     /// waiting at this slot.
     Call(usize),
-    /// The executor takes over: a sequence catches the error, or nothing on
-    /// the thread does and an `ExecKind::Error` says so.
+    /// The executor takes over: nothing on the thread catches the error, as
+    /// the `ExecKind::Error` left on top says, or it is a process exit.
     Exit,
 }
 
@@ -60,7 +60,11 @@ pub(crate) fn unwind<'gc>(
         loop {
             if let Some(lf) = ts.top_lua() {
                 if lf.is_native() {
-                    let handler = if exit { None } else { native_catch(ts, lf) };
+                    let handler = if exit && lf.flags & frame_flags::BASE == 0 {
+                        None
+                    } else {
+                        native_catch(ts, lf)
+                    };
                     let at = lf.base() + lf.num_extras as usize;
                     let Some(handler) = handler else {
                         let task = lf.pc == crate::vm::async_native::async_cont as *const _;
@@ -70,7 +74,7 @@ pub(crate) fn unwind<'gc>(
                         }
                         continue;
                     };
-                    if detached {
+                    if detached && !exit {
                         return Unwound::Call(push_close(ctx, ts, err, handler));
                     }
                     // Nothing of the failed call is left above its slot.
@@ -99,24 +103,7 @@ pub(crate) fn unwind<'gc>(
                 }
                 continue;
             }
-            match ts.top_exec_mut() {
-                Some(ExecKind::Sequence {
-                    seq, pending_error, ..
-                }) => {
-                    let handler = match seq.catch() {
-                        Catch::Here(handler) if !exit => handler,
-                        Catch::Base => None,
-                        _ => {
-                            ts.pop_exec();
-                            continue;
-                        }
-                    };
-                    if detached && !exit {
-                        return Unwound::Call(push_close(ctx, ts, err, handler));
-                    }
-                    *pending_error = Some(err);
-                    return Unwound::Exit;
-                }
+            match ts.top_exec() {
                 Some(ExecKind::WaitThread { .. }) => {
                     ts.pop_exec();
                 }
@@ -158,16 +145,10 @@ pub(crate) fn unwind<'gc>(
 }
 
 /// The message handler of the nearest catch point (`L->errfunc`): a plain
-/// `pcall` in between shadows an outer `xpcall`, while a `Catch::Pass`
-/// sequence is looked through.
+/// `pcall` in between shadows an outer `xpcall`.
 fn message_handler<'gc>(ts: &ThreadState<'gc>) -> Option<Function<'gc>> {
     ts.frames_rev()
         .find_map(|f| match f {
-            FrameRef::Exec(ExecKind::Sequence { seq, .. }) => match seq.catch() {
-                Catch::Pass => None,
-                Catch::Here(handler) => Some(handler),
-                Catch::Base => Some(None),
-            },
             FrameRef::Native(nf) => native_catch(ts, nf),
             FrameRef::Elided(lf) => Some(match lf.elided_protect() {
                 // `xpcall`'s handler sits in the slot below the callee's.
@@ -259,7 +240,7 @@ fn handler_cont<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
     status: Result<(), Error<'gc>>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<CallbackAction, Error<'gc>> {
     let depth = stack.get(1).get_integer().unwrap_or(0);
     let limit = stack.get(2).get_integer().unwrap_or(0) as usize;
     let err = match status {
@@ -342,7 +323,7 @@ fn close_cont<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
     status: Result<(), Error<'gc>>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<CallbackAction, Error<'gc>> {
     let errv = match status {
         Ok(()) => stack.get(2),
         Err(e) => e.value(),

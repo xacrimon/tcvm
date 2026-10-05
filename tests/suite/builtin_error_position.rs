@@ -1,6 +1,6 @@
-//! Errors a sequence raises keep their pending position level across the
-//! stash/fetch at the sequence boundary. Expected strings come from `lua`
-//! 5.5.1 running the same chunk.
+//! An error a builtin raises after calling Lua (`table.sort`'s invalid order
+//! function) is positioned at the builtin's caller. Expected strings come
+//! from `lua` 5.5.1 running the same chunk.
 
 use crate::common::err;
 

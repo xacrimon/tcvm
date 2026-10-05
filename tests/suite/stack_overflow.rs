@@ -4,7 +4,7 @@
 //! Each chunk hands its result to the host with `error(v, 0)`.
 
 use tcvm::env::{Error, Function, LuaString, NativeClosure, Stack, Value};
-use tcvm::vm::sequence::CallbackAction;
+use tcvm::vm::native::CallbackAction;
 use tcvm::{Context, Executor, LoadError, Lua, RuntimeError, StepResult};
 
 fn raised(src: &str) -> String {
@@ -153,8 +153,8 @@ fn yielder<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    Ok(CallbackAction::yield_(None))
+) -> Result<CallbackAction, Error<'gc>> {
+    Ok(CallbackAction::Yield)
 }
 
 // A handler that yields to the host leaves the thread in handler mode; a

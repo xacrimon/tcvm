@@ -9,7 +9,7 @@ use crate::env::thread::ThreadState;
 use crate::env::value::Value;
 use crate::instruction::UpValueDescriptor;
 use crate::vm::interp::{Handler, op_call_action, op_call_async, op_call_native};
-use crate::vm::sequence::{CallbackAction, Execution};
+use crate::vm::native::{CallbackAction, Execution};
 
 /// Debug record for a local register: active for `start_pc <= pc < end_pc`.
 /// Hidden loop-control slots appear as `(for state)` like luac's, so every
@@ -270,13 +270,13 @@ pub type NativeFn = for<'gc, 'a> fn(
 ) -> Result<(), Error<'gc>>;
 
 /// A native that may ask the VM to act once it returns: call a function and
-/// continue in a [`NativeCont`](crate::vm::sequence::NativeCont), resume or
+/// continue in a [`NativeCont`](crate::vm::native::NativeCont), resume or
 /// yield a coroutine, or suspend into the executor (see [`CallbackAction`]).
 pub type ActionFn = for<'gc, 'a> fn(
     ctx: Context<'gc>,
     closure: &'a NativeClosure<'gc>,
     stack: Stack<'gc, 'a>,
-) -> Result<CallbackAction<'gc>, Error<'gc>>;
+) -> Result<CallbackAction, Error<'gc>>;
 
 // One register: a plain native's return never goes through memory.
 const _: () = assert!(std::mem::size_of::<Result<(), Error<'static>>>() == 8);
@@ -315,14 +315,13 @@ impl<'gc, 'a> Stack<'gc, 'a> {
         Stack { thread, bottom }
     }
 
-    /// Give the thread back. Used by `async_sequence` to ferry the live
-    /// stack through a `SharedSlot`.
+    /// Give the thread back.
     #[inline]
     pub(crate) fn into_parts(self) -> (&'a mut ThreadState<'gc>, usize) {
         (self.thread, self.bottom)
     }
 
-    /// The thread this stack belongs to, for the executor's own sequences.
+    /// The thread this stack belongs to.
     #[inline]
     pub(crate) fn thread_mut(&mut self) -> &mut ThreadState<'gc> {
         self.thread

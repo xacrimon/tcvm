@@ -1,13 +1,9 @@
 use std::io::IsTerminal;
 use std::path::PathBuf;
-use std::pin::Pin;
 
 use clap::Parser;
-use tcvm::dmm::{Collect, Trace};
 use tcvm::env::{Error, Function, LuaString, NativeClosure, Stack, Table, Value};
-use tcvm::vm::sequence::{
-    BoxSequence, CallbackAction, Execution, Sequence, SequencePoll, seq_trace_pointers,
-};
+use tcvm::vm::async_native::Spawned;
 use tcvm::{Executor, LoadError, Lua, RuntimeError, StashedExecutor, format_prototype};
 
 #[derive(Parser, Debug)]
@@ -88,7 +84,7 @@ fn main() {
         let xpcall = ctx
             .globals()
             .raw_get(Value::string(LuaString::new(ctx, b"xpcall")));
-        let handler = Function::new_action(ctx.mutation(), msghandler, &[]);
+        let handler = Function::new_async(ctx.mutation(), msghandler, &[]);
         let executor = Executor::start(ctx, xpcall, (chunk, handler));
         Ok::<_, LoadError>(ctx.stash(executor))
     });
@@ -125,50 +121,38 @@ fn exit(lua: Lua, ex: StashedExecutor, code: i32) -> ! {
 
 /// `lua.c`'s `msghandler`, short of the traceback (#228): the error object
 /// as text, through its `__tostring` when that returns a string. It runs
-/// before the chunk unwinds, so ahead of any pending `__close`.
+/// before the chunk unwinds, so ahead of any pending `__close`. An error in
+/// `__tostring` re-enters it instead.
 fn msghandler<'gc>(
-    ctx: tcvm::Context<'gc>,
+    _ctx: tcvm::Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let v = stack.get(0);
-    let err = Error::new(ctx, v);
-    if err.as_text(ctx).is_none() {
-        let mm = ctx.metamethod_of(v, ctx.symbols().mm_tostring);
-        if !mm.is_nil() {
-            stack.replace(&[mm, v]);
-            let then = BoxSequence::new(ctx.mutation(), StringOrMessage(v));
-            return Ok(CallbackAction::call(Some(then)));
+) -> Result<Spawned, Error<'gc>> {
+    Ok(stack.spawn(|cx| async move {
+        let call = cx.enter(|ctx, mut stack| {
+            let v = stack.get(0);
+            if Error::new(ctx, v).as_text(ctx).is_none() {
+                let mm = ctx.metamethod_of(v, ctx.symbols().mm_tostring);
+                if !mm.is_nil() {
+                    stack.truncate(1);
+                    stack.extend([mm, v]);
+                    return true;
+                }
+            }
+            stack.ret1(Value::string(Error::new(ctx, v).message(ctx)));
+            false
+        });
+        if call {
+            cx.call(1).await;
+            cx.enter(|ctx, mut stack| {
+                let r = stack.get(1);
+                let s = match r.get_string() {
+                    Some(_) => r,
+                    None => Value::string(Error::new(ctx, stack.get(0)).message(ctx)),
+                };
+                stack.ret1(s);
+            });
         }
-    }
-    stack.ret1(Value::string(err.message(ctx)));
-    Ok(CallbackAction::Return)
-}
-
-/// [`msghandler`] after `__tostring`: its result if that is a string, else
-/// the error object's [`Error::message`]. An error it raises re-enters
-/// `msghandler` instead.
-#[derive(Collect)]
-#[collect(no_drop)]
-struct StringOrMessage<'gc>(Value<'gc>);
-
-impl<'gc> Sequence<'gc> for StringOrMessage<'gc> {
-    fn trace_pointers(&self, cc: &mut dyn Trace<'gc>) {
-        seq_trace_pointers!(self, cc);
-    }
-
-    fn poll(
-        self: Pin<&mut Self>,
-        ctx: tcvm::Context<'gc>,
-        _exec: Execution<'gc>,
-        mut stack: Stack<'gc, '_>,
-    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
-        let r = stack.get(0);
-        if r.get_string().is_some() {
-            stack.ret1(r);
-        } else {
-            stack.ret1(Value::string(Error::new(ctx, self.0).message(ctx)));
-        }
-        Ok(SequencePoll::Return)
-    }
+        Ok(())
+    }))
 }
