@@ -314,6 +314,10 @@ pub struct ThreadState<'gc> {
     /// End a Lua frame's register window may not cross: [`STACK_LIMIT`], or
     /// [`MAX_STACK`] while a message handler runs.
     pub(crate) stack_limit: usize,
+    /// The thread that resumed this one, while it runs (status `Normal`).
+    pub(crate) resumer: Option<Thread<'gc>>,
+    /// Threads below this one in the resume chain.
+    pub(crate) resume_depth: u16,
 }
 
 /// The value stack's storage: a `Vec` the mutator uses as such, that the
@@ -368,6 +372,7 @@ unsafe impl<'gc> Collect<'gc> for ThreadState<'gc> {
         cc.trace(&self.thread_handle);
         cc.trace(&self.pending_action);
         cc.trace(&self.native_error);
+        cc.trace(&self.resumer);
         cc.trace(&self.tbc_list);
     }
 }
@@ -742,6 +747,8 @@ impl<'gc> Thread<'gc> {
             yield_bottom: None,
             death_error: None,
             stack_limit: STACK_LIMIT,
+            resumer: None,
+            resume_depth: 0,
         };
         let thread = Thread(Gc::new(mc, RefLock::new(state)));
         // Store the back-reference
@@ -755,6 +762,17 @@ impl<'gc> Thread<'gc> {
 
     pub(crate) fn borrow_mut(self, mc: &Mutation<'gc>) -> RefMut<'gc, ThreadState<'gc>> {
         self.0.borrow_mut(mc)
+    }
+
+    /// The state, for the interpreter to run the thread on, without a borrow
+    /// guard: dispatch switches between coroutines' states without returning
+    /// to release one. Emits the write barrier `borrow_mut` would.
+    ///
+    /// # Safety
+    /// No other reference to the state may be in use while the result is.
+    #[inline]
+    pub(crate) unsafe fn state_mut(self, mc: &Mutation<'gc>) -> &'gc mut ThreadState<'gc> {
+        unsafe { &mut *self.0.unlock(mc).as_ptr() }
     }
 
     pub fn status(self) -> ThreadStatus {

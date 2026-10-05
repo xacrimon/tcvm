@@ -1,16 +1,11 @@
-use std::pin::Pin;
-
 use crate::Context;
 use crate::builtin::util;
-use crate::dmm::{Collect, Trace};
 use crate::env::thread::{ExecKind, ThreadStatus};
 use crate::env::{
     Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Thread, Value,
 };
 use crate::vm::close;
-use crate::vm::sequence::{
-    BoxSequence, CallbackAction, Catch, Execution, Sequence, SequencePoll, seq_trace_pointers,
-};
+use crate::vm::sequence::{CallbackAction, Execution};
 
 pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[
@@ -77,10 +72,29 @@ fn lua_resume<'gc>(
         stack.replace(&[Value::boolean(false), m]);
         return Ok(CallbackAction::Return);
     }
-    // Drop the thread-handle slot so the resume args start at index 0.
-    stack.remove(0);
-    let then = BoxSequence::new(ctx.mutation(), ResumeSequence);
-    Ok(CallbackAction::resume(co, Some(then)))
+    Ok(CallbackAction::Resume {
+        at: 0,
+        cont: resume_cont,
+    })
+}
+
+/// `auxresume`'s ending: `(true, ...)`, or `(false, msg)` for an error or
+/// values with no room for the leading `true`.
+fn resume_cont<'gc>(
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
+    mut stack: Stack<'gc, '_>,
+    status: Result<(), Error<'gc>>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
+    match status {
+        Ok(()) if stack.check_stack(1) => stack.insert(0, Value::boolean(true)),
+        Ok(()) => {
+            let m = Value::string(LuaString::new(ctx, b"too many results to resume"));
+            stack.replace(&[Value::boolean(false), m]);
+        }
+        Err(err) => stack.replace(&[Value::boolean(false), err.value()]),
+    }
+    Ok(CallbackAction::Return)
 }
 
 /// `None` if `co` can be resumed with `nargs` arguments, else the Lua-spec
@@ -120,7 +134,7 @@ fn lua_yield<'gc>(
     _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    Ok(CallbackAction::yield_(None))
+    Ok(CallbackAction::Yield)
 }
 
 /// `coroutine.status(co)` — return one of `"suspended" | "normal" |
@@ -266,7 +280,7 @@ fn lua_close<'gc>(
 fn wrap_callback<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
-    stack: Stack<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let co = closure.upvalues[0]
         .get_thread()
@@ -278,115 +292,50 @@ fn wrap_callback<'gc>(
     if let Some(msg) = unresumable_reason(stack.exec(), co, stack.len()) {
         return Err(Error::from_str(ctx, msg));
     }
-    let then = BoxSequence::new(ctx.mutation(), UnwrapResumeSequence { co, closing: false });
-    Ok(CallbackAction::resume(co, Some(then)))
+    stack.insert(0, Value::thread(co));
+    Ok(CallbackAction::Resume {
+        at: 0,
+        cont: wrap_cont,
+    })
 }
 
-// ---------------------------------------------------------------------------
-// Sequences
-// ---------------------------------------------------------------------------
-
-/// `coroutine.resume`'s follow-up: like `pcall`'s continuation, except that
-/// values with no room for the leading `true` become `(false, msg)`
-/// (`auxresume`).
-struct ResumeSequence;
-
-unsafe impl<'gc> Collect<'gc> for ResumeSequence {
-    const NEEDS_TRACE: bool = false;
-}
-
-impl<'gc> Sequence<'gc> for ResumeSequence {
-    fn trace_pointers(&self, _cc: &mut dyn Trace<'gc>) {}
-
-    fn poll(
-        self: Pin<&mut Self>,
-        ctx: Context<'gc>,
-        _exec: Execution<'gc>,
-        mut stack: Stack<'gc, '_>,
-    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
-        if stack.check_stack(1) {
-            stack.insert(0, Value::boolean(true));
-        } else {
-            let m = Value::string(LuaString::new(ctx, b"too many results to resume"));
-            stack.replace(&[Value::boolean(false), m]);
-        }
-        Ok(SequencePoll::Return)
-    }
-
-    fn error(
-        self: Pin<&mut Self>,
-        _ctx: Context<'gc>,
-        _exec: Execution<'gc>,
-        err: Error<'gc>,
-        mut stack: Stack<'gc, '_>,
-    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
-        stack.replace(&[Value::boolean(false), err.value()]);
-        Ok(SequencePoll::Return)
-    }
-
-    fn catch(&self) -> Catch<'gc> {
-        Catch::Here(None)
-    }
-}
-
-/// `coroutine.wrap`'s follow-up sequence: returns the inner thread's
-/// values verbatim on success, rethrows on error once the dead thread has
-/// closed its variables (`auxwrap`'s `lua_closethread`).
-#[derive(Collect)]
-#[collect(internal, no_drop)]
-struct UnwrapResumeSequence<'gc> {
-    co: Thread<'gc>,
-    /// The thread is closing its variables; its result is `false, err`.
-    closing: bool,
-}
-
-impl<'gc> Sequence<'gc> for UnwrapResumeSequence<'gc> {
-    fn trace_pointers(&self, cc: &mut dyn Trace<'gc>) {
-        seq_trace_pointers!(self, cc);
-    }
-
-    fn poll(
-        self: Pin<&mut Self>,
-        ctx: Context<'gc>,
-        _exec: Execution<'gc>,
-        stack: Stack<'gc, '_>,
-    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
-        if self.closing {
-            return Err(Error::new(ctx, stack.get(1)).with_level(1));
-        }
-        if !stack.check_stack(1) {
-            return Err(Error::from_str(ctx, "too many results to resume"));
-        }
-        // Pass through whatever the inner left on the stack.
-        Ok(SequencePoll::Return)
-    }
-
-    fn error(
-        mut self: Pin<&mut Self>,
-        ctx: Context<'gc>,
-        _exec: Execution<'gc>,
-        err: Error<'gc>,
-        mut stack: Stack<'gc, '_>,
-    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
-        let co = self.co;
-        if !self.closing && !co.borrow().tbc_list.is_empty() {
-            close::seed_thread_close(ctx, &mut co.borrow_mut(ctx.mutation()));
-            self.closing = true;
-            stack.clear();
-            return Ok(SequencePoll::Resume {
-                thread: co,
-                bottom: 0,
-            });
-        }
+/// `auxwrap`'s ending: the coroutine's values verbatim; an error rethrown
+/// once the dead coroutine has closed its variables (`lua_closethread`).
+fn wrap_cont<'gc>(
+    ctx: Context<'gc>,
+    closure: &NativeClosure<'gc>,
+    mut stack: Stack<'gc, '_>,
+    status: Result<(), Error<'gc>>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
+    let err = match status {
+        Ok(()) if stack.check_stack(1) => return Ok(CallbackAction::Return),
+        Ok(()) => return Err(Error::from_str(ctx, "too many results to resume")),
+        Err(err) => err,
+    };
+    let co = closure.upvalues[0].get_thread().expect("wrap's thread");
+    if co.borrow().tbc_list.is_empty() {
         // `auxwrap` re-raises a string error with the wrap caller's position
         // prepended on top of the coroutine's own.
-        Err(err.with_level(1))
+        return Err(err.with_level(1));
     }
+    close::seed_thread_close(ctx, &mut co.borrow_mut(ctx.mutation()));
+    stack.replace(&[Value::thread(co)]);
+    Ok(CallbackAction::Resume {
+        at: 0,
+        cont: wrap_close_cont,
+    })
+}
 
-    /// The rethrow is a fresh raise on the resumer (`auxwrap`'s
-    /// `lua_error`), so an enclosing `xpcall` handler must see the
-    /// re-prefixed message, not the coroutine's original.
-    fn catch(&self) -> Catch<'gc> {
-        Catch::Here(None)
+/// [`wrap_cont`] once the coroutine closed its variables: rethrow its
+/// result's error, or an error a `__close` raised.
+fn wrap_close_cont<'gc>(
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
+    stack: Stack<'gc, '_>,
+    status: Result<(), Error<'gc>>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
+    match status {
+        Ok(()) => Err(Error::new(ctx, stack.get(1)).with_level(1)),
+        Err(err) => Err(err.with_level(1)),
     }
 }
