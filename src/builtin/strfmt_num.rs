@@ -1,19 +1,36 @@
 //! `%a`/`%e`/`%f`/`%g` for floats, ported from LuaJIT's `lj_strfmt_num.c`
 //! (<https://github.com/LuaJIT/LuaJIT>, commit c6ffc141a8762b41703f9287d63d93622a13dd8f, MIT,
-//! Copyright (C) 2005-2026 Mike Pall, contributed by Peter Cawley), with `lj_strfmt_wint` from
-//! `lj_strfmt.c`. Diff against that commit when porting upstream fixes.
+//! Copyright (C) 2005-2026 Mike Pall, contributed by Peter Cawley), with `lj_strfmt_wint`,
+//! `lj_strfmt_putfxint`, `strfmt_putfstrlen` and `lj_strfmt_putfchar` from `lj_strfmt.c`. Diff
+//! against that commit when porting upstream fixes.
 //!
-//! Deviations: output goes to a `Vec<u8>` grown by the same amounts `lj_buf_more` reserves, with
-//! an index for the C pointer; only the 64-bit `ND_MUL2K_MAX_SHIFT` of 29 is kept; `nd_round`
-//! learns whether a 5 is an exact tie from `n` itself, where upstream scans limbs that the
-//! division stops, the multiplication shortcut and the rescale check leave inexact (it rounds
-//! `%.0e` of 2.5e10 up and, depending on stack garbage, `%.13e` of 0x1.e3c5d95a33ebp-977 down);
-//! and `%f` of a number below 2^-500 is zero outright, where upstream's unbounded division
-//! wraps the 64-limb ring into the integer part (`%f` of 2^-1022 prints `906459071.863478`).
+//! Deviations: output goes to a `Vec<u8>` grown by the same amounts `lj_buf_more` reserves, with an
+//! index for the C pointer (the integer, string and char writers push instead); `put_fxint` takes
+//! decimal digits from core's `NumBuffer`; only the 64-bit `ND_MUL2K_MAX_SHIFT` of 29 is kept;
+//! `nd_round` learns whether a 5 is an exact tie from `n` itself, where upstream scans limbs that
+//! the division stops, the multiplication shortcut and the rescale check leave inexact (it rounds
+//! `%.0e` of 2.5e10 up and, depending on stack garbage, `%.13e` of 0x1.e3c5d95a33ebp-977 down); and
+//! `%f` of a number below 2^-500 is zero outright, where upstream's unbounded division wraps the
+//! 64-limb ring into the integer part (`%f` of 2^-1022 prints `906459071.863478`).
+
+use core::fmt::NumBuffer;
 
 /// `SFormat`: conversion, flags, width and precision packed as in `lj_strfmt.h`.
 pub(crate) type SFormat = u32;
 
+// `FormatType`, in the low nibble.
+pub(crate) const STRFMT_ERR: SFormat = 1;
+pub(crate) const STRFMT_INT: SFormat = 3;
+pub(crate) const STRFMT_UINT: SFormat = 4;
+pub(crate) const STRFMT_NUM: SFormat = 5;
+pub(crate) const STRFMT_STR: SFormat = 6;
+pub(crate) const STRFMT_CHAR: SFormat = 7;
+pub(crate) const STRFMT_PTR: SFormat = 8;
+
+// Subtypes; the bits are reused across types.
+pub(crate) const STRFMT_T_HEX: SFormat = 0x0010;
+pub(crate) const STRFMT_T_OCT: SFormat = 0x0020;
+pub(crate) const STRFMT_T_QUOTED: SFormat = 0x0010;
 pub(crate) const STRFMT_T_FP_A: SFormat = 0x0000;
 pub(crate) const STRFMT_T_FP_E: SFormat = 0x0010;
 pub(crate) const STRFMT_T_FP_F: SFormat = 0x0020;
@@ -33,6 +50,11 @@ pub(crate) const STRFMT_SH_PREC: u32 = 24;
 pub(crate) const STRFMT_G14: SFormat = STRFMT_T_FP_G | ((14 + 1) << STRFMT_SH_PREC);
 
 #[inline]
+pub(crate) fn strfmt_type(sf: SFormat) -> SFormat {
+    sf & 15
+}
+
+#[inline]
 fn strfmt_width(sf: SFormat) -> u32 {
     (sf >> STRFMT_SH_WIDTH) & 255
 }
@@ -44,7 +66,7 @@ fn strfmt_prec(sf: SFormat) -> u32 {
 }
 
 #[inline]
-fn strfmt_fp(sf: SFormat) -> u32 {
+pub(crate) fn strfmt_fp(sf: SFormat) -> u32 {
     (sf >> 4) & 3
 }
 
@@ -478,6 +500,127 @@ fn buf_more(sb: &mut Vec<u8>, sz: u32) -> usize {
     let p = sb.len();
     sb.resize(p + sz as usize, 0);
     p
+}
+
+/// Append the character `c` padded to `sf`'s width (`lj_strfmt_putfchar`).
+pub(crate) fn put_fchar(sb: &mut Vec<u8>, sf: SFormat, c: u8) {
+    let pad = strfmt_width(sf).saturating_sub(1) as usize;
+    if sf & STRFMT_F_LEFT != 0 {
+        sb.push(c);
+    }
+    sb.resize(sb.len() + pad, b' ');
+    if sf & STRFMT_F_LEFT == 0 {
+        sb.push(c);
+    }
+}
+
+/// Append `s` cut to `sf`'s precision and padded to its width (`strfmt_putfstrlen`).
+pub(crate) fn put_fstr(sb: &mut Vec<u8>, sf: SFormat, s: &[u8]) {
+    let s = &s[..s.len().min(strfmt_prec(sf) as usize)];
+    let pad = (strfmt_width(sf) as usize).saturating_sub(s.len());
+    if sf & STRFMT_F_LEFT != 0 {
+        sb.extend_from_slice(s);
+    }
+    sb.resize(sb.len() + pad, b' ');
+    if sf & STRFMT_F_LEFT == 0 {
+        sb.extend_from_slice(s);
+    }
+}
+
+/// Append `k` formatted per an `STRFMT_INT` or `STRFMT_UINT` `sf`, as `i64` for the former
+/// (`lj_strfmt_putfxint`).
+pub(crate) fn put_fxint(sb: &mut Vec<u8>, mut sf: SFormat, mut k: u64) {
+    let mut buf = [0u8; 1 + 22]; // STRFMT_MAXBUF_XINT: '0' prefix + uint64_t in octal.
+    let mut q = buf.len();
+    let mut dec = NumBuffer::new();
+    let mut prefix: u32 = 0;
+
+    // Figure out signed prefixes.
+    if strfmt_type(sf) == STRFMT_INT {
+        if (k as i64) < 0 {
+            k = (!k).wrapping_add(1);
+            prefix = 256 + b'-' as u32;
+        } else if sf & STRFMT_F_PLUS != 0 {
+            prefix = 256 + b'+' as u32;
+        } else if sf & STRFMT_F_SPACE != 0 {
+            prefix = 256 + b' ' as u32;
+        }
+    }
+
+    // Convert number and store to fixed-size buffer in reverse order.
+    let mut prec = strfmt_prec(sf);
+    if (prec as i32) >= 0 {
+        sf &= !STRFMT_F_ZERO;
+    }
+    let digits: &[u8] = if k == 0 {
+        // Special-case zero argument.
+        if prec != 0 || sf & (STRFMT_T_OCT | STRFMT_F_ALT) == (STRFMT_T_OCT | STRFMT_F_ALT) {
+            q -= 1;
+            buf[q] = b'0';
+        }
+        &buf[q..]
+    } else if sf & (STRFMT_T_HEX | STRFMT_T_OCT) == 0 {
+        k.format_into(&mut dec).as_bytes()
+    } else if sf & STRFMT_T_HEX != 0 {
+        let hexdig = if sf & STRFMT_F_UPPER != 0 {
+            b"0123456789ABCDEF"
+        } else {
+            b"0123456789abcdef"
+        };
+        loop {
+            q -= 1;
+            buf[q] = hexdig[(k & 15) as usize];
+            k >>= 4;
+            if k == 0 {
+                break;
+            }
+        }
+        if sf & STRFMT_F_ALT != 0 {
+            prefix = 512 + if sf & STRFMT_F_UPPER != 0 { b'X' } else { b'x' } as u32;
+        }
+        &buf[q..]
+    } else {
+        loop {
+            q -= 1;
+            buf[q] = b'0' + (k & 7) as u8;
+            k >>= 3;
+            if k == 0 {
+                break;
+            }
+        }
+        if sf & STRFMT_F_ALT != 0 {
+            q -= 1;
+            buf[q] = b'0';
+        }
+        &buf[q..]
+    };
+
+    // Calculate sizes.
+    let len = digits.len() as u32;
+    if (len as i32) >= (prec as i32) {
+        prec = len;
+    }
+    let pprec = prec + (prefix >> 8);
+    let pad = strfmt_width(sf).saturating_sub(pprec) as usize;
+
+    // Format number with leading/trailing whitespace and zeros.
+    if sf & (STRFMT_F_LEFT | STRFMT_F_ZERO) == 0 {
+        sb.resize(sb.len() + pad, b' ');
+    }
+    if prefix != 0 {
+        if prefix as u8 >= b'X' {
+            sb.push(b'0');
+        }
+        sb.push(prefix as u8);
+    }
+    if sf & (STRFMT_F_LEFT | STRFMT_F_ZERO) == STRFMT_F_ZERO {
+        sb.resize(sb.len() + pad, b'0');
+    }
+    sb.resize(sb.len() + (prec - len) as usize, b'0');
+    sb.extend_from_slice(digits);
+    if sf & STRFMT_F_LEFT != 0 {
+        sb.resize(sb.len() + pad, b' ');
+    }
 }
 
 /// Append `n` formatted per `sf` (`lj_strfmt_putfnum`).
