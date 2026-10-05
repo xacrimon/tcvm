@@ -529,7 +529,7 @@ pub fn coerce_to_str(buf: &mut Vec<u8>, val: Value) -> bool {
         buf.extend_from_slice(s.as_bytes());
         true
     } else if let Some(n) = val.get_integer() {
-        buf.extend_from_slice(n.to_string().as_bytes());
+        crate::builtin::util::push_int(buf, n);
         true
     } else if let Some(f) = val.get_float() {
         write_float(buf, f);

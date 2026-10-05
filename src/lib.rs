@@ -9,6 +9,7 @@
 #![feature(allocator_api)]
 #![feature(rust_preserve_none_cc)]
 #![feature(variant_count)]
+#![feature(int_format_into)]
 
 mod builtin;
 pub(crate) mod compiler;
