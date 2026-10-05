@@ -6,6 +6,7 @@ use core::cell::Cell;
 use core::ptr::NonNull;
 
 use hash_part::{int_hash, lua_string_hash};
+use slots::Owned;
 
 use crate::Context;
 use crate::dmm::{
@@ -57,10 +58,8 @@ impl<'gc> Table<'gc> {
             inline_len: (cap + asize) as u32,
             array: NonNull::dangling(),
             asize: asize as u32,
-            int_hash: hash_part::Part::new_in(GcAlloc::new(mc)),
             len_hint: Cell::new(0),
-            misc_hash: hash_part::Part::new_in(GcAlloc::new(mc)),
-            dict: None,
+            hash: None,
             metatable: None,
             mt_cache: None,
         };
@@ -272,17 +271,11 @@ pub struct TableState<'gc> {
     /// cell, or dangling when empty.
     array: NonNull<Value<'gc>>,
     asize: u32,
-    /// Every other integer key, and floats with an integral value.
-    int_hash: hash_part::Part<'gc, i64, GcAlloc<'gc>>,
     /// Last border `raw_len` found, as Lua 5.5's `lenhint`.
-    len_hint: Cell<usize>,
-    /// Keys that are neither strings nor numbers with an integral value.
-    misc_hash: hash_part::Part<'gc, Value<'gc>, GcAlloc<'gc>>,
-    /// Set when this table has dropped to dictionary mode for its
-    /// string-keyed properties, triggered by a key past `MAX_PROPERTIES_FAST`
-    /// or `MAX_KEYED_PROPERTIES`. Deletion does not migrate: it must not
-    /// reorder keys, or a `pairs` loop that clears entries would skip some.
-    dict: Option<DictState<'gc>>,
+    len_hint: Cell<u32>,
+    /// Every key the array part and the named slots don't hold, made by the
+    /// first such key.
+    hash: Option<Gc<'gc, Owned<HashParts<'gc>>>>,
     /// Live metatable handle (for `getmetatable` and metamethod
     /// invocation). Identity is mirrored in `shape.mt_cache`.
     metatable: Option<Table<'gc>>,
@@ -296,6 +289,7 @@ pub struct TableState<'gc> {
 
 // Everything a table holds is GC memory (see `slots` and `GcAlloc`), so sweeping one runs nothing.
 const _: () = assert!(!core::mem::needs_drop::<TableState<'static>>());
+const _: () = assert!(size_of::<TableState<'static>>() == 64);
 
 // SAFETY: a `TableState` is only allocated by `Table::alloc`, through `Gc::new_with_trailing` with
 // `inline_len` values, which never changes, and it has no drop glue.
@@ -353,20 +347,27 @@ unsafe impl<'gc> Collect<'gc> for TableState<'gc> {
         if self.asize > 0 && !self.array_inline() {
             unsafe { slots::mark(cc, self.array) };
         }
-        hash_part::mark(cc, &self.int_hash);
-        hash_part::mark(cc, &self.misc_hash);
-        if let Some(d) = &self.dict {
-            hash_part::mark(cc, &d.table);
+        if let Some(h) = self.hash {
+            cc.trace(&h);
         }
+        let hash = self.hash();
         let (inline, spilled) = self.named();
         if mode.is_empty() {
             cc.trace(inline);
             cc.trace(spilled);
             cc.trace(self.array());
-            cc.trace(&self.int_hash);
-            cc.trace(&self.misc_hash);
-            cc.trace(&self.dict);
+            // Each part's trace marks its memory too.
+            if let Some(h) = hash {
+                cc.trace(&h.ints);
+                cc.trace(&h.misc);
+                cc.trace(&h.strs);
+            }
             return;
+        }
+        if let Some(h) = hash {
+            hash_part::mark(cc, &h.ints);
+            hash_part::mark(cc, &h.misc);
+            hash_part::mark(cc, &h.strs);
         }
         cc.defer();
         let weak_values = mode.contains(WeakMode::VALUES);
@@ -378,18 +379,17 @@ unsafe impl<'gc> Collect<'gc> for TableState<'gc> {
         for v in inline.iter().chain(spilled).chain(self.array()) {
             value(cc, v);
         }
-        for e in self.int_hash.iter() {
+        let Some(h) = hash else { return };
+        for e in h.ints.iter() {
             value(cc, &e.value);
         }
-        if let Some(d) = &self.dict {
-            for e in d.table.iter() {
-                cc.trace(&e.key);
-                value(cc, &e.value);
-            }
+        for e in h.strs.iter() {
+            cc.trace(&e.key);
+            value(cc, &e.value);
         }
         // Only this part has object keys. An ephemeron's value waits for `converge` to find out
         // whether its key survives.
-        for e in self.misc_hash.iter() {
+        for e in h.misc.iter() {
             if !(mode.contains(WeakMode::KEYS) && e.key.is_weak_object()) {
                 cc.trace(&e.key);
                 value(cc, &e.value);
@@ -398,14 +398,18 @@ unsafe impl<'gc> Collect<'gc> for TableState<'gc> {
     }
 }
 
-/// Slow / dictionary-mode storage for string-keyed properties. Replaces
-/// the `(shape, properties)` pair in dict mode. ICs bypass naturally
-/// because the table's shape becomes a unique dict-sentinel that no IC
-/// will have cached.
-#[derive(Collect)]
-#[collect(internal, no_drop)]
-pub struct DictState<'gc> {
-    table: hash_part::Part<'gc, LuaString<'gc>, GcAlloc<'gc>>,
+/// A table's hash parts, in an [`Owned`] cell.
+struct HashParts<'gc> {
+    /// Integer keys outside the array part, and floats with an integral
+    /// value.
+    ints: hash_part::Part<'gc, i64, GcAlloc<'gc>>,
+    /// Keys that are neither strings nor numbers with an integral value.
+    misc: hash_part::Part<'gc, Value<'gc>, GcAlloc<'gc>>,
+    /// String keys, in dictionary mode only: past `MAX_PROPERTIES_FAST` or
+    /// `MAX_KEYED_PROPERTIES` keys, a table's shape becomes a dict sentinel
+    /// no IC caches. Deletion does not migrate: it must not reorder keys, or
+    /// a `pairs` loop that clears entries would skip some.
+    strs: hash_part::Part<'gc, LuaString<'gc>, GcAlloc<'gc>>,
 }
 
 /// `next` was given a key that is not in the table.
@@ -457,7 +461,10 @@ impl<'gc> TableState<'gc> {
     fn converge(&self, fc: &Finalization<'gc>) -> bool {
         let weak_values = self.weak_mode().contains(WeakMode::VALUES);
         let mut resurrected = false;
-        for e in self.misc_hash.iter() {
+        let Some(h) = self.hash() else {
+            return false;
+        };
+        for e in h.misc.iter() {
             if e.key.is_weak_object()
                 && !e.key.is_dead(fc)
                 && e.value.is_dead(fc)
@@ -491,18 +498,46 @@ impl<'gc> TableState<'gc> {
         for v in self.array_mut().iter_mut().filter(|v| v.is_dead(fc)) {
             *v = Value::nil();
         }
-        self.int_hash.kill_where(|e| e.value.is_dead(fc));
-        if let Some(d) = &mut self.dict {
-            d.table.kill_where(|e| {
-                let dead = e.value.is_dead(fc);
-                if dead {
-                    cleared(e.key);
-                }
-                dead
-            });
-        }
-        self.misc_hash
+        let Some(h) = self.hash_mut() else { return };
+        h.ints.kill_where(|e| e.value.is_dead(fc));
+        h.strs.kill_where(|e| {
+            let dead = e.value.is_dead(fc);
+            if dead {
+                cleared(e.key);
+            }
+            dead
+        });
+        h.misc
             .kill_where(|e| e.key.is_dead(fc) || e.value.is_dead(fc));
+    }
+
+    #[inline(always)]
+    fn hash(&self) -> Option<&HashParts<'gc>> {
+        // SAFETY: only this table refers to its parts, so its borrow stands in for theirs.
+        self.hash.map(|h| unsafe { Owned::get(h) })
+    }
+
+    #[inline(always)]
+    fn hash_mut(&mut self) -> Option<&mut HashParts<'gc>> {
+        // SAFETY: as in `hash`.
+        self.hash.map(|h| unsafe { Owned::get_mut(h) })
+    }
+
+    /// The hash parts, made if this table has none yet.
+    #[inline]
+    fn hash_or_new(&mut self, mc: &Mutation<'gc>) -> &mut HashParts<'gc> {
+        let h = *self.hash.get_or_insert_with(|| {
+            Owned::new(
+                mc,
+                HashParts {
+                    ints: hash_part::Part::new_in(GcAlloc::new(mc)),
+                    misc: hash_part::Part::new_in(GcAlloc::new(mc)),
+                    strs: hash_part::Part::new_in(GcAlloc::new(mc)),
+                },
+            )
+        });
+        // SAFETY: as in `hash`.
+        unsafe { Owned::get_mut(h) }
     }
 
     /// This table's own cell's values (see `inline_len`).
@@ -629,7 +664,10 @@ impl<'gc> TableState<'gc> {
     fn get_int(&self, key: i64) -> Value<'gc> {
         match usize::try_from(key).ok().and_then(|s| self.array_get(s)) {
             Some(v) => v,
-            None => hash_part::get(&self.int_hash, int_hash(key), key),
+            None => match self.hash() {
+                Some(h) => hash_part::get(&h.ints, int_hash(key), key),
+                None => Value::nil(),
+            },
         }
     }
 
@@ -642,8 +680,10 @@ impl<'gc> TableState<'gc> {
 
     #[inline]
     fn get_string_key(&self, key: LuaString<'gc>) -> Value<'gc> {
-        if let Some(d) = &self.dict {
-            return hash_part::get(&d.table, lua_string_hash(key), key);
+        if self.shape.is_dict() {
+            return self.hash().map_or(Value::nil(), |h| {
+                hash_part::get(&h.strs, lua_string_hash(key), key)
+            });
         }
         match self.shape.find_slot(key) {
             Some(slot) => self.named_get(slot),
@@ -658,7 +698,10 @@ impl<'gc> TableState<'gc> {
             key.kind() != ValueKind::String && int_key(key).is_none(),
             "string and integer keys have their own parts"
         );
-        hash_part::get(&self.misc_hash, hash, key)
+        match self.hash() {
+            Some(h) => hash_part::get(&h.misc, hash, key),
+            None => Value::nil(),
+        }
     }
 
     #[inline]
@@ -686,7 +729,7 @@ impl<'gc> TableState<'gc> {
             !key.is_nil(),
             "nil table key must be rejected before raw_set"
         );
-        self.misc_hash_set(key, value, value_hash(key));
+        self.misc_hash_set(ctx.mutation(), key, value, value_hash(key));
     }
 
     fn set_string_key(
@@ -696,8 +739,8 @@ impl<'gc> TableState<'gc> {
         value: Value<'gc>,
         cap: u32,
     ) {
-        if self.dict.is_some() {
-            self.set_string_key_dict(key, value);
+        if self.shape.is_dict() {
+            self.set_string_key_dict(ctx.mutation(), key, value);
             return;
         }
 
@@ -721,7 +764,7 @@ impl<'gc> TableState<'gc> {
         value: Value<'gc>,
         cap: u32,
     ) {
-        debug_assert!(self.dict.is_none() && self.shape.find_slot(key).is_none());
+        debug_assert!(!self.shape.is_dict() && self.shape.find_slot(key).is_none());
         // Deleting an absent key is a no-op; a slot for it would burn a
         // shape transition, and at the cap the dict migration would drop
         // the nil-valued entries a `pairs` loop still resumes from.
@@ -730,7 +773,7 @@ impl<'gc> TableState<'gc> {
         }
         if self.shape.slot_count() >= cap {
             self.migrate_to_dict(ctx);
-            self.set_string_key_dict(key, value);
+            self.set_string_key_dict(ctx.mutation(), key, value);
             return;
         }
         let new_shape = shape::transition_add_prop(ctx.mutation(), self.shape, key);
@@ -753,28 +796,20 @@ impl<'gc> TableState<'gc> {
         self.spill_cap = cap as u32;
     }
 
-    fn set_string_key_dict(&mut self, key: LuaString<'gc>, value: Value<'gc>) {
-        let dict = self
-            .dict
-            .as_mut()
-            .expect("set_string_key_dict requires dict mode");
-        hash_part::set(&mut dict.table, lua_string_hash(key), key, value);
+    fn set_string_key_dict(&mut self, mc: &Mutation<'gc>, key: LuaString<'gc>, value: Value<'gc>) {
+        debug_assert!(self.shape.is_dict());
+        let strs = &mut self.hash_or_new(mc).strs;
+        hash_part::set(strs, lua_string_hash(key), key, value);
         self.maybe_update_mt_bit(Value::string(key), value);
     }
 
-    /// Move from fast (shape-indexed `properties`) to dict mode. Copy
-    /// existing slot values into a new `DictState`, discard the
-    /// properties Vec, swap `shape` for the unique dict sentinel
-    /// anchored on the same `mt_cache` (per-`MtCache` registry, or
-    /// `State::empty_dict_sentinel` when there's no metatable).
-    /// One-way for v1.
+    /// Move the named slots to the string part and the shape to the dict
+    /// sentinel of its metatable (or `State::empty_dict_sentinel`). One way.
     fn migrate_to_dict(&mut self, ctx: Context<'gc>) {
-        debug_assert!(
-            self.dict.is_none(),
-            "migrate_to_dict called on already-dict table"
-        );
+        debug_assert!(!self.shape.is_dict());
+        let mc = ctx.mutation();
         let keys = self.shape.keys();
-        let mut table = hash_part::Part::with_capacity_in(keys.len(), GcAlloc::new(ctx.mutation()));
+        let mut table = hash_part::Part::with_capacity_in(keys.len(), GcAlloc::new(mc));
         let (inline, spilled) = self.named();
         for (&k, &v) in keys.iter().zip(inline.iter().chain(spilled)) {
             if v.is_nil() {
@@ -782,14 +817,14 @@ impl<'gc> TableState<'gc> {
             }
             hash_part::insert_unique(&mut table, lua_string_hash(k), k, v);
         }
+        self.hash_or_new(mc).strs = table;
         // The inline slots stay in the cell, unread: the dict sentinel has none.
         self.spill = NonNull::dangling();
         self.spill_cap = 0;
         self.shape = match self.shape.mt_cache() {
-            Some(c) => c.ensure_dict_sentinel(ctx.mutation()),
+            Some(c) => c.ensure_dict_sentinel(mc),
             None => ctx.empty_dict_sentinel(),
         };
-        self.dict = Some(DictState { table });
     }
 
     /// `t[offset + i] = items[i - 1]`, as `SETLIST` stores a constructor's
@@ -815,12 +850,20 @@ impl<'gc> TableState<'gc> {
         }
         let hash = int_hash(key);
         if value.is_nil() {
-            hash_part::set(&mut self.int_hash, hash, key, value);
-        } else if hash_part::set_no_grow(&mut self.int_hash, hash, key, value).is_err() {
+            if let Some(h) = self.hash_mut() {
+                hash_part::set(&mut h.ints, hash, key, value);
+            }
+            return;
+        }
+        // No parts yet is a full `ints`: the key may belong in the array.
+        let stored = self
+            .hash_mut()
+            .is_some_and(|h| hash_part::set_no_grow(&mut h.ints, hash, key, value).is_ok());
+        if !stored {
             self.rehash_ints(mc, key);
             match self.array_slot(key) {
                 Some(slot) => self.array_mut()[slot] = value,
-                None => hash_part::set(&mut self.int_hash, hash, key, value),
+                None => hash_part::set(&mut self.hash_or_new(mc).ints, hash, key, value),
             }
         }
     }
@@ -836,7 +879,8 @@ impl<'gc> TableState<'gc> {
                 n += count_int(k as i64, &mut bins);
             }
         }
-        for e in self.int_hash.iter() {
+        let ints = self.hash().map(|h| &h.ints);
+        for e in ints.into_iter().flat_map(|t| t.iter()) {
             n += count_int(e.key, &mut bins);
         }
         n += count_int(extra, &mut bins);
@@ -845,7 +889,7 @@ impl<'gc> TableState<'gc> {
             // Nothing moves; let `hash_part::set` rehash or grow as usual.
             return;
         }
-        self.len_hint.set(asize / 2);
+        self.len_hint.set(asize as u32 / 2);
 
         let old = self.array();
         let mut rest: Vec<(i64, Value<'gc>)> = Vec::new();
@@ -863,30 +907,38 @@ impl<'gc> TableState<'gc> {
             _ => slots::alloc(mc, asize, |i| old.get(i).copied().unwrap_or(Value::nil())),
         };
         self.asize = asize as u32;
-        let alloc = *self.int_hash.allocator();
         let array = self.array;
-        for e in self.int_hash.iter() {
+        let ints = self.hash().map(|h| &h.ints);
+        for e in ints.into_iter().flat_map(|t| t.iter()) {
             match usize::try_from(e.key).ok().filter(|&s| s < asize) {
                 // SAFETY: the new cell holds `asize` values.
                 Some(slot) => unsafe { *array.as_ptr().add(slot) = e.value },
                 None => rest.push((e.key, e.value)),
             }
         }
+        if self.hash.is_none() && rest.is_empty() {
+            return;
+        }
         // No slack, as in LuaJIT: a key that could extend the array must find
-        // `int_hash` full and come back here rather than settle in the hash.
-        self.int_hash = hash_part::Part::with_capacity_in(rest.len(), alloc);
+        // `ints` full and come back here rather than settle in the hash.
+        let h = self.hash_or_new(mc);
+        h.ints = hash_part::Part::with_capacity_in(rest.len(), GcAlloc::new(mc));
         for (k, v) in rest {
-            hash_part::insert_unique(&mut self.int_hash, int_hash(k), k, v);
+            hash_part::insert_unique(&mut h.ints, int_hash(k), k, v);
         }
     }
 
-    fn misc_hash_set(&mut self, key: Value<'gc>, value: Value<'gc>, hash: u64) {
+    fn misc_hash_set(&mut self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>, hash: u64) {
         debug_assert_eq!(hash, value_hash(key));
         debug_assert!(
             key.kind() != ValueKind::String && int_key(key).is_none(),
             "string and integer keys have their own parts"
         );
-        hash_part::set(&mut self.misc_hash, hash, key, value);
+        match self.hash_mut() {
+            Some(h) => hash_part::set(&mut h.misc, hash, key, value),
+            None if value.is_nil() => {}
+            None => hash_part::set(&mut self.hash_or_new(mc).misc, hash, key, value),
+        }
     }
 
     /// A border, found as Lua 5.5's `luaH_getn` does: near the last one
@@ -897,7 +949,7 @@ impl<'gc> TableState<'gc> {
         if last > 0 {
             let empty = |k: usize| array[k].is_nil();
             let found = |k: usize| {
-                self.len_hint.set(k);
+                self.len_hint.set(k as u32);
                 k
             };
             let binsearch = |mut i: usize, mut j: usize| {
@@ -907,7 +959,7 @@ impl<'gc> TableState<'gc> {
                 }
                 found(i)
             };
-            let mut limit = self.len_hint.get().clamp(1, last);
+            let mut limit = (self.len_hint.get() as usize).clamp(1, last);
             if empty(limit) {
                 for _ in 0..4 {
                     if limit <= 1 {
@@ -932,12 +984,12 @@ impl<'gc> TableState<'gc> {
             if empty(last) {
                 return binsearch(limit, last);
             }
-            self.len_hint.set(last);
+            self.len_hint.set(last as u32);
         }
-        if self.int_hash.is_empty() || self.get_int(last as i64 + 1).is_nil() {
+        if self.hash().is_none_or(|h| h.ints.is_empty()) || self.get_int(last as i64 + 1).is_nil() {
             return last;
         }
-        // Widen past the array into `int_hash`, then binary search.
+        // Widen past the array into `ints`, then binary search.
         let (mut lo, mut hi) = (last as u64, last as u64 + 1);
         while !self.get_int(hi as i64).is_nil() {
             lo = hi;
@@ -971,24 +1023,25 @@ impl<'gc> TableState<'gc> {
         mc: &Mutation<'gc>,
         key: Value<'gc>,
     ) -> Result<Option<(Value<'gc>, Value<'gc>)>, InvalidKey> {
+        let hash = self.hash();
         let (part, from) = if key.is_nil() {
             (Part::Array, 0)
         } else if let Some(i) = int_key(key) {
             match self.array_slot(i) {
                 Some(slot) => (Part::Array, slot + 1),
                 None => {
-                    let pos = hash_part::position(&self.int_hash, int_hash(i), i);
+                    let pos = hash.and_then(|h| hash_part::position(&h.ints, int_hash(i), i));
                     (Part::Ints, pos.ok_or(InvalidKey)? + 1)
                 }
             }
         } else if let Some(s) = key.get_string() {
-            let pos = match &self.dict {
-                Some(d) => hash_part::position(&d.table, lua_string_hash(s), s),
-                None => self.shape.find_slot(s).map(|slot| slot as usize),
+            let pos = match self.shape.is_dict() {
+                true => hash.and_then(|h| hash_part::position(&h.strs, lua_string_hash(s), s)),
+                false => self.shape.find_slot(s).map(|slot| slot as usize),
             };
             (Part::Strings, pos.ok_or(InvalidKey)? + 1)
         } else {
-            let pos = hash_part::position(&self.misc_hash, value_hash(key), key);
+            let pos = hash.and_then(|h| hash_part::position(&h.misc, value_hash(key), key));
             (Part::Misc, pos.ok_or(InvalidKey)? + 1)
         };
 
@@ -1001,17 +1054,17 @@ impl<'gc> TableState<'gc> {
         }
         if part <= Part::Ints {
             let from = if part == Part::Ints { from } else { 0 };
-            if let Some(e) = hash_part::next_live(&self.int_hash, from) {
+            if let Some(e) = hash.and_then(|h| hash_part::next_live(&h.ints, from)) {
                 return Ok(Some((Value::integer(mc, e.key), e.value)));
             }
         }
         if part <= Part::Strings {
             let from = if part == Part::Strings { from } else { 0 };
-            let found = match &self.dict {
-                Some(d) => {
-                    hash_part::next_live(&d.table, from).map(|e| (Value::string(e.key), e.value))
-                }
-                None => {
+            let found = match self.shape.is_dict() {
+                true => hash
+                    .and_then(|h| hash_part::next_live(&h.strs, from))
+                    .map(|e| (Value::string(e.key), e.value)),
+                false => {
                     let (inline, spilled) = self.named();
                     self.shape.keys()[from..]
                         .iter()
@@ -1025,7 +1078,9 @@ impl<'gc> TableState<'gc> {
             }
         }
         let from = if part == Part::Misc { from } else { 0 };
-        Ok(hash_part::next_live(&self.misc_hash, from).map(|e| (e.key, e.value)))
+        Ok(hash
+            .and_then(|h| hash_part::next_live(&h.misc, from))
+            .map(|e| (e.key, e.value)))
     }
 }
 

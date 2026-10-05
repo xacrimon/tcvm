@@ -236,12 +236,6 @@ impl<T: Copy, A: Allocator> RawTable<T, A> {
         }
     }
 
-    /// Returns a reference to the underlying allocator.
-    #[inline]
-    pub(crate) fn allocator(&self) -> &A {
-        &self.alloc
-    }
-
     /// The start of the table's allocation, if it has one.
     #[inline]
     pub(crate) fn allocation(&self) -> Option<NonNull<u8>> {

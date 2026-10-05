@@ -2,6 +2,7 @@
 //! traces its values, and the table's write barrier covers stores into it. The cell has no
 //! drop glue, so a table that outgrows it just leaves it for the sweep.
 
+use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 
 use crate::dmm::{Collect, Gc, Mutation, Trace, TrailingBytes};
@@ -54,4 +55,35 @@ pub(super) fn alloc<'gc>(
 pub(super) unsafe fn mark<'gc, T: Trace<'gc>>(cc: &mut T, values: NonNull<Value<'gc>>) {
     let cell: Gc<'gc, Slots> = unsafe { Gc::from_trailing_ptr(values.cast()) };
     cc.trace(&cell);
+}
+
+/// A value in a GC cell of its own that only one table refers to, owned the
+/// same way as a `Slots` cell: the table marks it and traces what it holds.
+pub(super) struct Owned<T>(UnsafeCell<T>);
+
+// SAFETY: deliberately untraced, as for `Slots`.
+unsafe impl<'gc, T: 'gc> Collect<'gc> for Owned<T> {
+    const NEEDS_TRACE: bool = false;
+}
+
+impl<'gc, T: 'gc> Owned<T> {
+    pub(super) fn new(mc: &Mutation<'gc>, value: T) -> Gc<'gc, Self> {
+        Gc::new(mc, Owned(UnsafeCell::new(value)))
+    }
+
+    /// # Safety
+    /// No `&mut` from [`Self::get_mut`] may be live; the owner's borrows
+    /// stand in for the cell's.
+    #[inline(always)]
+    pub(super) unsafe fn get(this: Gc<'gc, Self>) -> &'gc T {
+        unsafe { &*Gc::as_ref(this).0.get() }
+    }
+
+    /// # Safety
+    /// No other reference into the cell may be live.
+    #[allow(clippy::mut_from_ref)]
+    #[inline(always)]
+    pub(super) unsafe fn get_mut(this: Gc<'gc, Self>) -> &'gc mut T {
+        unsafe { &mut *Gc::as_ref(this).0.get() }
+    }
 }
