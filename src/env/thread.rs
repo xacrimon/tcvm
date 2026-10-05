@@ -200,6 +200,114 @@ impl<'gc> LuaFrame<'gc> {
     }
 }
 
+/// A thread's Lua frames, innermost last, kept as a pointer to the innermost
+/// one rather than a length, so a call or a return stores it without reading
+/// it first.
+pub struct FrameStack<'gc> {
+    /// The innermost frame, or one below the buffer when there is none.
+    top: *mut LuaFrame<'gc>,
+    /// Storage only: its length stays 0.
+    buf: Vec<LuaFrame<'gc>, MetricsAlloc<'gc>>,
+}
+
+impl<'gc> FrameStack<'gc> {
+    fn new(mc: &Mutation<'gc>) -> Self {
+        let mut buf: Vec<LuaFrame<'gc>, _> = Vec::new_in(MetricsAlloc::new(mc));
+        FrameStack {
+            top: buf.as_mut_ptr().wrapping_sub(1),
+            buf,
+        }
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        (self.top.addr().wrapping_add(size_of::<LuaFrame>()) - self.buf.as_ptr().addr())
+            / size_of::<LuaFrame>()
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline(always)]
+    pub fn capacity(&self) -> usize {
+        self.buf.capacity()
+    }
+
+    /// Make room for `additional` more frames.
+    pub fn reserve(&mut self, additional: usize) {
+        let len = self.len();
+        // SAFETY: the first `len` are initialized frames, and `Vec::reserve`
+        // moves exactly its length's worth.
+        unsafe { self.buf.set_len(len) };
+        self.buf.reserve(additional);
+        unsafe { self.buf.set_len(0) };
+        self.top = self.buf.as_mut_ptr().wrapping_add(len).wrapping_sub(1);
+    }
+
+    pub fn pop(&mut self) -> Option<LuaFrame<'gc>> {
+        (!self.is_empty()).then(|| {
+            // SAFETY: not empty.
+            let frame = unsafe { self.top.read() };
+            self.top = self.top.wrapping_sub(1);
+            frame
+        })
+    }
+
+    pub fn clear(&mut self) {
+        self.top = self.buf.as_mut_ptr().wrapping_sub(1);
+    }
+
+    /// The innermost frame, or one below the buffer when there is none.
+    /// Derived from the buffer, so it stays usable across later borrows and
+    /// may be offset to neighbouring frames.
+    #[inline(always)]
+    pub fn top_ptr(&self) -> *mut LuaFrame<'gc> {
+        self.top
+    }
+
+    /// Make the frame at `top`, which is in the buffer or one below it, the
+    /// innermost: a push writes it first, a pop just moves the pointer down.
+    ///
+    /// # Safety
+    /// `top` comes from `top_ptr`, at most one past it, and every frame up to
+    /// it is initialized.
+    #[inline(always)]
+    pub unsafe fn set_top(&mut self, top: *mut LuaFrame<'gc>) {
+        debug_assert!(top.addr().wrapping_add(size_of::<LuaFrame>()) >= self.buf.as_ptr().addr());
+        debug_assert!(
+            top.addr() < self.buf.as_ptr().addr() + self.capacity() * size_of::<LuaFrame>()
+        );
+        self.top = top;
+    }
+}
+
+impl<'gc> Deref for FrameStack<'gc> {
+    type Target = [LuaFrame<'gc>];
+    #[inline(always)]
+    fn deref(&self) -> &[LuaFrame<'gc>] {
+        // SAFETY: the first `len` are initialized.
+        unsafe { std::slice::from_raw_parts(self.buf.as_ptr(), self.len()) }
+    }
+}
+
+impl<'gc> DerefMut for FrameStack<'gc> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut [LuaFrame<'gc>] {
+        let len = self.len();
+        // SAFETY: as in `deref`.
+        unsafe { std::slice::from_raw_parts_mut(self.buf.as_mut_ptr(), len) }
+    }
+}
+
+// SAFETY: traces every frame.
+unsafe impl<'gc> Collect<'gc> for FrameStack<'gc> {
+    fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
+        cc.trace(&**self);
+    }
+}
+
 /// A frame the executor pushes when a callback suspends, an error unwinds, a
 /// coroutine waits, etc. It sits above the first `depth` Lua frames and
 /// below the rest.
@@ -312,7 +420,7 @@ pub struct ThreadState<'gc> {
     /// collector clears them when it traces the thread.
     pub(crate) stack: ValueStack<'gc>,
     /// Lua frames, innermost last.
-    pub(crate) frames: Vec<LuaFrame<'gc>, MetricsAlloc<'gc>>,
+    pub(crate) frames: FrameStack<'gc>,
     /// Executor frames, innermost last, each placed among `frames` by its
     /// `depth`. Kept apart so the interpreter's frames are plain records.
     pub(crate) exec_frames: Vec<ExecFrame<'gc>, MetricsAlloc<'gc>>,
@@ -357,6 +465,11 @@ pub struct ThreadState<'gc> {
     /// End a Lua frame's register window may not cross: [`STACK_LIMIT`], or
     /// [`MAX_STACK`] while a message handler runs.
     pub(crate) stack_limit: usize,
+    /// A call whose register window ends here or below has room for its
+    /// registers and its frame: each frame's base is above its caller's, so
+    /// no more frames than slots fit below it. `stack.len()` capped by the
+    /// frames' capacity, so CALL makes one check for both.
+    pub(crate) call_limit: usize,
     /// The thread that resumed this one, while it runs (status `Normal`).
     pub(crate) resumer: Option<Thread<'gc>>,
     /// Threads below this one in the resume chain.
@@ -512,16 +625,14 @@ impl<'gc> ThreadState<'gc> {
         unsafe { self.frames.last().unwrap_unchecked() }
     }
 
-    /// Raw pointer to the innermost frame. Derived from the buffer rather than
-    /// a `&mut` to the element, so it stays usable across later borrows of
-    /// `frames` and may be offset to neighbouring frames.
+    /// Raw pointer to the innermost frame (see `FrameStack::top_ptr`).
     ///
     /// # Safety
     /// The innermost frame must be a Lua frame.
     #[inline]
     pub(crate) unsafe fn top_lua_ptr(&mut self) -> *mut LuaFrame<'gc> {
         debug_assert!(self.top_is_lua(), "non-Lua frame on top");
-        unsafe { self.frames.as_mut_ptr().add(self.frames.len() - 1) }
+        self.frames.top_ptr()
     }
 
     /// The innermost frame if it is an executor frame.
@@ -640,20 +751,36 @@ impl<'gc> ThreadState<'gc> {
             lf.base() >= 1,
             "Lua frame base must leave room for the function slot"
         );
-        if self.frames.len() == self.frames.capacity() {
-            self.grow_frames();
+        if self.frames_full() {
+            self.grow_frames(1);
         }
-        self.frames.push(lf);
+        unsafe { self.push_unchecked(lf) };
     }
 
+    /// Make room for `n` more frames. May move them.
     #[cold]
     #[inline(never)]
-    fn grow_frames(&mut self) {
-        self.frames.reserve(1);
+    pub(crate) fn grow_frames(&mut self, n: usize) {
+        self.frames.reserve(n);
+        self.update_call_limit();
     }
 
-    /// `push_lua` for the interpreter, room already made (`reserve_frames`):
-    /// write a flagless Lua frame above `top` and return it.
+    /// Make room for a frame per value-stack slot, so `call_limit` is the
+    /// stack's length. May move the frames.
+    pub(crate) fn grow_frames_to_stack(&mut self) {
+        let n = self.stack.len().saturating_sub(self.frames.len());
+        if self.frames.capacity() < self.stack.len() {
+            self.grow_frames(n);
+        }
+    }
+
+    #[inline(always)]
+    fn update_call_limit(&mut self) {
+        self.call_limit = self.stack.len().min(self.frames.capacity());
+    }
+
+    /// `push_lua` for the interpreter, room already made: write a flagless Lua
+    /// frame above `top` and return it.
     ///
     /// # Safety
     /// `top` is the innermost frame, a Lua frame, and
@@ -672,10 +799,11 @@ impl<'gc> ThreadState<'gc> {
         debug_assert!(self.frames.len() < self.frames.capacity());
         debug_assert!(self.top_is_lua());
         debug_assert!(std::ptr::eq(top, unsafe { self.top_lua_ptr() }));
+        debug_assert!(base as usize > unsafe { (*top).base() });
         unsafe {
             let new = top.add(1);
             LuaFrame::write_lua(new, closure, pc, ret, base, num_extras);
-            self.frames.set_len(self.frames.len() + 1);
+            self.frames.set_top(new);
             new
         }
     }
@@ -687,20 +815,18 @@ impl<'gc> ThreadState<'gc> {
     #[inline(always)]
     pub(crate) unsafe fn push_unchecked(&mut self, lf: LuaFrame<'gc>) {
         debug_assert!(self.frames.len() < self.frames.capacity());
-        let len = self.frames.len();
+        // What `call_limit` counts on.
+        debug_assert!(self.frames.last().is_none_or(|f| lf.base() > f.base()));
         unsafe {
-            self.frames.as_mut_ptr().add(len).write(lf);
-            self.frames.set_len(len + 1);
+            let new = self.frames.top_ptr().add(1);
+            new.write(lf);
+            self.frames.set_top(new);
         }
     }
 
     #[inline(always)]
     pub(crate) fn frames_full(&self) -> bool {
         self.frames.len() == self.frames.capacity()
-    }
-
-    pub(crate) fn reserve_frames(&mut self, n: usize) {
-        self.frames.reserve(n);
     }
 
     // --- Stack accessors -------------------------------------------------
@@ -732,6 +858,7 @@ impl<'gc> ThreadState<'gc> {
                 uv.rebase(old, new);
             }
         }
+        self.update_call_limit();
     }
 
     /// `ensure_slots` for a Lua frame's register window ending at `n`; `false`
@@ -832,6 +959,7 @@ impl<'gc> ThreadState<'gc> {
         debug_assert!(n <= self.stack.len());
         self.stack.truncate(n);
         self.top = n;
+        self.update_call_limit();
     }
 }
 
@@ -839,7 +967,7 @@ impl<'gc> Thread<'gc> {
     pub fn new(mc: &Mutation<'gc>) -> Self {
         let state = ThreadState {
             stack: ValueStack::new(mc),
-            frames: Vec::new_in(MetricsAlloc::new(mc)),
+            frames: FrameStack::new(mc),
             exec_frames: Vec::new_in(MetricsAlloc::new(mc)),
             open_upvalues: Vec::new(),
             tbc_list: Vec::new(),
@@ -853,6 +981,7 @@ impl<'gc> Thread<'gc> {
             yield_bottom: None,
             death_error: None,
             stack_limit: STACK_LIMIT,
+            call_limit: 0,
             resumer: None,
             resume_depth: 0,
             tasks: Vec::new(),
