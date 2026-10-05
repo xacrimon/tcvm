@@ -14,25 +14,22 @@ expression: output
 0000  [  1]  VARARGPREP      fixed=0
 0001  [  1]  LOAD            R0 K0  ; false
 0002  [  2]  LOAD            R1 K1  ; 5
-0003  [  3]  TESTSET         R2 R0 inv=true
-0004  [  3]  JMP             +1
-0005  [  3]  MOVE            R2 R1
-0006  [  5]  LOAD            R3 K2  ; 7
-0007  [  6]  LOAD            R4 K1  ; 5
-0008  [  7]  TESTSET         R5 R3 inv=false
-0009  [  7]  JMP             +1
-0010  [  7]  MOVE            R5 R4
-0011  [  9]  LOAD            R6 K2  ; 7
-0012  [ 10]  EQI             R6 #5 inv=false
-0013  [ 10]  JMP             +2
-0014  [ 10]  MOVE            R7 R6
-0015  [ 10]  JMP             +2
-0016  [ 10]  LFALSESKIP      R7
-0017  [ 10]  LOAD            R7 K3  ; true
-0018  [ 12]  MOVE            R8 R1
-0019  [ 12]  MOVE            R9 R4
-0020  [ 12]  MOVE            R10 R6
-0021  [ 12]  MOVE            R11 R2
-0022  [ 12]  MOVE            R12 R5
-0023  [ 12]  MOVE            R13 R7
-0024  [ 12]  RETURN          R8 count=7
+0003  [  3]  JFSET           R2 R0 +1
+0004  [  3]  MOVE            R2 R1
+0005  [  5]  LOAD            R3 K2  ; 7
+0006  [  6]  LOAD            R4 K1  ; 5
+0007  [  7]  JTSET           R5 R3 +1
+0008  [  7]  MOVE            R5 R4
+0009  [  9]  LOAD            R6 K2  ; 7
+0010  [ 10]  JNEQI           R6 #5 +2
+0011  [ 10]  MOVE            R7 R6
+0012  [ 10]  JMP             +2
+0013  [ 10]  LFALSESKIP      R7
+0014  [ 10]  LOAD            R7 K3  ; true
+0015  [ 12]  MOVE            R8 R1
+0016  [ 12]  MOVE            R9 R4
+0017  [ 12]  MOVE            R10 R6
+0018  [ 12]  MOVE            R11 R2
+0019  [ 12]  MOVE            R12 R5
+0020  [ 12]  MOVE            R13 R7
+0021  [ 12]  RETURN          R8 count=7

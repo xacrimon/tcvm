@@ -39,21 +39,17 @@ pub enum Want {
     MultRet,
 }
 
-/// A list of unfilled `JMP` (or conditional-fall-through `JMP`) instructions
-/// in the tape whose offset fields still need to be patched to a target. The
-/// two lists attached to an `ExprDesc` represent the expression's "true" and
-/// "false" exit paths — jumps in `true_list` are taken when the expression
-/// evaluates to a truthy value, jumps in `false_list` fire when falsy.
+/// A list of conditional branches in the tape whose offsets still need to be
+/// patched to a target. The two lists attached to an `ExprDesc` represent the
+/// expression's "true" and "false" exit paths — jumps in `true_list` are
+/// taken when the expression evaluates to a truthy value, jumps in
+/// `false_list` fire when falsy.
 ///
-/// **Invariant (control-instruction predecessor):** every `jmp_idx` stored in
-/// `jumps` must satisfy either `jmp_idx == 0` (the sentinel tolerated by every
-/// consumer) or `tape[jmp_idx - 1]` is one of `EQ`, `LT`, `LE`, `TEST`,
-/// `TESTSET` — the control instruction whose taken-vs-fall-through decision
-/// the `JMP` at `tape[jmp_idx]` realises. The consumers `need_value`,
-/// `downgrade_testsets`, `patch_list_aux`, and `flip_control_polarity` all
-/// read `tape[jmp_idx - 1]` under this assumption. Only `emit_test_jump`
-/// (TESTSET + JMP) and `compile_comparison_desc` (CMP + JMP) mint jump indices
-/// that may enter a list; pushing any other JMP here would silently miscompile.
+/// **Invariant:** every index in `jumps` is a conditional branch
+/// (`Op::branch_sense` is `Some`). Only `emit_test_jump` (`JTSET`/`JFSET`)
+/// and `compile_comparison_desc` mint indices that may enter a list; the
+/// consumers rewrite those instructions in place (negate, drop the copy, set
+/// the dst), so pushing any other instruction here would miscompile.
 #[derive(Debug, Clone, Default)]
 pub(super) struct JumpList {
     pub(super) jumps: Vec<usize>,
@@ -78,14 +74,14 @@ impl JumpList {
 /// pending short-circuit jumps that will be patched by the consumer.
 ///
 /// **Invariants** (matching Lua 5.5's `expdesc` conventions):
-/// * A `JMP` in `true_list` fires when the expression is truthy.
-/// * A `JMP` in `false_list` fires when the expression is falsy.
-/// * A `Jump(Some(idx))` head is the last-emitted control jump for this
+/// * A branch in `true_list` fires when the expression is truthy.
+/// * A branch in `false_list` fires when the expression is falsy.
+/// * A `Jump(Some(idx))` head is the last-emitted branch for this
 ///   expression; it fires on truthy and its fall-through is falsy.
-/// * Comparisons emit `CMP` with `inverted=true` so the paired `JMP` fires
-///   on truthy — fall-through is falsy. This mirrors Lua's convention and
-///   lets the `LFALSESKIP` / `LOAD true` materialisation tail handle
-///   fall-through correctly without a routing jump.
+/// * Comparisons emit the branch that fires on truthy — fall-through is
+///   falsy. This mirrors Lua's convention and lets the `LFALSESKIP` /
+///   `LOAD true` materialisation tail handle fall-through correctly without
+///   a routing jump.
 #[derive(Clone)]
 pub(super) struct ExprDesc<'gc> {
     pub(super) kind: ExprKind<'gc>,
@@ -114,10 +110,9 @@ pub(super) enum ExprKind<'gc> {
     /// No register yet — the expression's truthiness is encoded entirely
     /// by the pending jumps (`true_list` / `false_list` plus the optional
     /// pending head embedded here). The inner `Option<usize>` is the
-    /// "pending" head: when `Some(idx)`, the `JMP` at `tape[idx]` has not
+    /// "pending" head: when `Some(idx)`, the branch at `tape[idx]` has not
     /// yet been absorbed into either list; `goiftrue` / `goiffalse` /
-    /// `discharge_to_reg_mut` absorb it; `not` flips its CMP polarity in
-    /// place so the invariant "pending fires on current truthy" continues
+    /// `discharge_to_reg_mut` absorb it; `not` negates it in place so the invariant "pending fires on current truthy" continues
     /// to hold across the label flip. The `None` state is reached after
     /// a `goif*` consumes the head; it represents a mixed-polarity list
     /// composition (from `and`/`or`) with no standalone tail jump.
@@ -318,7 +313,7 @@ impl<'gc> Chunk<'gc> {
                 matches!(
                     instr.op(),
                     Op::JMP | Op::FORPREP | Op::FORLOOP | Op::TFORPREP | Op::TFORLOOP
-                ),
+                ) || instr.op().branch_sense().is_some(),
                 "jump patch on non-jump instruction: {instr:?}"
             );
             instr.set_imm(offset);

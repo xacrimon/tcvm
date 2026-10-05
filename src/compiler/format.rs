@@ -271,25 +271,44 @@ fn format_instruction(instr: &Instruction, proto: &Prototype<'_>) -> String {
             let offset = instr.imm();
             format!("JMP             {offset:+}")
         }
-        Op::EQ => {
-            let (lhs, rhs, inverted) = instr.abc_flag();
-            format!("EQ              R{lhs} R{rhs} inv={inverted}")
+        Op::JEQ | Op::JNEQ | Op::JLT | Op::JNLT | Op::JLE | Op::JNLE => {
+            let (lhs, rhs, offset) = instr.ab_imm();
+            format!("{:<15} R{lhs} R{rhs} {offset:+}", instr.op().name())
         }
-        Op::LT => {
-            let (lhs, rhs, inverted) = instr.abc_flag();
-            format!("LT              R{lhs} R{rhs} inv={inverted}")
+        Op::JEQI
+        | Op::JNEQI
+        | Op::JLTI
+        | Op::JNLTI
+        | Op::JLEI
+        | Op::JNLEI
+        | Op::JGTI
+        | Op::JNGTI
+        | Op::JGEI
+        | Op::JNGEI => {
+            let (src, _, offset) = instr.ah_imm();
+            let k = instr.cmp_imm();
+            let dot = if k.is_float() { ".0" } else { "" };
+            format!(
+                "{:<15} R{src} #{}{dot} {offset:+}",
+                instr.op().name(),
+                k.int()
+            )
         }
-        Op::LE => {
-            let (lhs, rhs, inverted) = instr.abc_flag();
-            format!("LE              R{lhs} R{rhs} inv={inverted}")
+        Op::JEQS | Op::JNEQS => {
+            let (src, key, offset) = instr.ah_imm();
+            format!(
+                "{:<15} R{src} K{key} {offset:+}{}",
+                instr.op().name(),
+                const_comment(constants, key)
+            )
         }
-        Op::TEST => {
-            let (src, inverted) = instr.ab_flag();
-            format!("TEST            R{src} inv={inverted}")
+        Op::JT | Op::JF => {
+            let (src, offset) = instr.a_imm();
+            format!("{:<15} R{src} {offset:+}", instr.op().name())
         }
-        Op::TESTSET => {
-            let (dst, src, inverted) = instr.abc_flag();
-            format!("TESTSET         R{dst} R{src} inv={inverted}")
+        Op::JTSET | Op::JFSET => {
+            let (dst, src, offset) = instr.ab_imm();
+            format!("{:<15} R{dst} R{src} {offset:+}", instr.op().name())
         }
         Op::CALL => {
             let (func, args, returns) = instr.abc();
@@ -387,14 +406,6 @@ fn format_instruction(instr: &Instruction, proto: &Prototype<'_>) -> String {
                 instr.op().name(),
                 format_imm(instr),
                 if flipped { " flipped" } else { "" }
-            )
-        }
-        Op::EQI | Op::LTI | Op::LEI | Op::GTI | Op::GEI => {
-            let (src, inverted) = instr.ab_imm_flag();
-            format!(
-                "{:<15} R{src} {} inv={inverted}",
-                instr.op().name(),
-                format_imm(instr)
             )
         }
         op => unreachable!("{op:?} is a quickened form"),

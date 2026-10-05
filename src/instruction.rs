@@ -6,8 +6,10 @@
 //! ```text
 //! byte:  0    1    2    3    4    5    6    7
 //!       op    a    b    c   [------ ext ------]
-//!                           ext is either d:u16 @4 + e:u16 @6, or imm:i32 @4
+//!                 [-- h --]  ext is either d:u16 @4 + e:u16 @6, or imm:i32 @4
 //! ```
+//!
+//! `h` is `b` and `c` read as one `u16`.
 //!
 //! Every opcode's operands are a prefix of `a, b, c` plus at most one use of
 //! the extension word, so a handler reaches any field with one shift and mask
@@ -98,6 +100,44 @@ impl Imm {
     }
 }
 
+/// A number literal packed into an immediate compare's 16-bit slot as
+/// `n << 1 | is_float`, `n` a 15-bit integer. A float qualifies when it is
+/// integral and not `-0.0`; the flag only tells metamethods and errors which
+/// type the literal was (Lua's `isSCnumber`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CmpImm(u16);
+
+impl CmpImm {
+    pub const MIN: i64 = -(1 << 14);
+    pub const MAX: i64 = (1 << 14) - 1;
+
+    pub fn from_int(n: i64) -> Option<CmpImm> {
+        (Self::MIN..=Self::MAX)
+            .contains(&n)
+            .then_some(CmpImm(((n as i16) << 1) as u16))
+    }
+
+    pub fn from_float(f: f64) -> Option<CmpImm> {
+        if f.fract() != 0.0 || (f == 0.0 && f.is_sign_negative()) {
+            return None;
+        }
+        let n = f as i64;
+        (Self::MIN..=Self::MAX)
+            .contains(&n)
+            .then_some(CmpImm(((n as i16) << 1 | 1) as u16))
+    }
+
+    #[inline(always)]
+    pub fn int(self) -> i64 {
+        (self.0 as i16 >> 1) as i64
+    }
+
+    #[inline(always)]
+    pub fn is_float(self) -> bool {
+        self.0 & 1 != 0
+    }
+}
+
 /// Something that can occupy an operand slot. Implemented for the index
 /// newtypes and for the raw types used by count/flag operands; the *declared*
 /// type of each field is what a constructor takes, so two same-width operands
@@ -127,6 +167,7 @@ impl_operand! {
     bool     => |self| self as u64,
     i32      => |self| self as u32 as u64,
     Imm      => |self| self.0 as u64,
+    CmpImm   => |self| self.0 as u64,
 }
 
 /// Which operand slots an opcode uses. Named after the slots themselves:
@@ -142,12 +183,14 @@ pub enum Shape {
     Abde,
     AImm,
     AbImm,
+    AhImm,
     AbcImm,
     Imm,
 }
 
 const A_SHIFT: u32 = 8;
 const B_SHIFT: u32 = 16;
+const H_SHIFT: u32 = 16;
 const C_SHIFT: u32 = 24;
 const D_SHIFT: u32 = 32;
 const E_SHIFT: u32 = 48;
@@ -156,7 +199,9 @@ const IMM_SHIFT: u32 = 32;
 /// Packers, one per [`Shape`]. Named to match the shape so the table can
 /// select one by pasting the shape token.
 pub mod shape {
-    use super::{A_SHIFT, B_SHIFT, C_SHIFT, D_SHIFT, E_SHIFT, IMM_SHIFT, Instruction, Op, Operand};
+    use super::{
+        A_SHIFT, B_SHIFT, C_SHIFT, D_SHIFT, E_SHIFT, H_SHIFT, IMM_SHIFT, Instruction, Op, Operand,
+    };
 
     #[inline(always)]
     fn slot8(v: u64) -> u64 {
@@ -179,6 +224,7 @@ pub mod shape {
     pub struct Abde;
     pub struct AImm;
     pub struct AbImm;
+    pub struct AhImm;
     pub struct AbcImm;
     pub struct Imm;
 
@@ -269,6 +315,18 @@ pub mod shape {
                 op as u64
                     | slot8(a.bits()) << A_SHIFT
                     | slot8(b.bits()) << B_SHIFT
+                    | (imm.bits() & 0xffff_ffff) << IMM_SHIFT,
+            )
+        }
+    }
+
+    impl AhImm {
+        #[inline(always)]
+        pub fn pack(op: Op, a: impl Operand, h: impl Operand, imm: impl Operand) -> Instruction {
+            Instruction(
+                op as u64
+                    | slot8(a.bits()) << A_SHIFT
+                    | slot16(h.bits()) << H_SHIFT
                     | (imm.bits() & 0xffff_ffff) << IMM_SHIFT,
             )
         }
@@ -408,6 +466,34 @@ impl Instruction {
     }
 
     #[inline(always)]
+    pub fn h(self) -> u16 {
+        (self.0 >> H_SHIFT) as u16
+    }
+
+    /// The [`CmpImm`] of an immediate compare.
+    #[inline(always)]
+    pub fn cmp_imm(self) -> CmpImm {
+        CmpImm(self.h())
+    }
+
+    /// `cmp_imm().int()` off the whole word, one `sbfx`.
+    #[inline(always)]
+    pub fn cmp_imm_int(self) -> i64 {
+        ((self.0 << (64 - H_SHIFT - 16)) as i64) >> (64 - 15)
+    }
+
+    /// The `Value` an immediate compare's literal stands for.
+    #[inline]
+    pub fn cmp_imm_value<'gc>(self, mc: &Mutation<'gc>) -> Value<'gc> {
+        let k = self.cmp_imm();
+        if k.is_float() {
+            Value::float(k.int() as f64)
+        } else {
+            Value::integer(mc, k.int())
+        }
+    }
+
+    #[inline(always)]
     fn expect(self, shape: Shape) {
         debug_assert_eq!(
             self.op().shape(),
@@ -423,24 +509,10 @@ impl Instruction {
         (self.a(), self.b())
     }
 
-    /// `Ab` whose `b` slot is a flag (`TEST`).
-    #[inline(always)]
-    pub fn ab_flag(self) -> (u8, bool) {
-        self.expect(Shape::Ab);
-        (self.a(), self.b() != 0)
-    }
-
     #[inline(always)]
     pub fn abc(self) -> (u8, u8, u8) {
         self.expect(Shape::Abc);
         (self.a(), self.b(), self.c())
-    }
-
-    /// `Abc` whose `c` slot is a flag (`EQ`/`LT`/`LE`/`TESTSET`).
-    #[inline(always)]
-    pub fn abc_flag(self) -> (u8, u8, bool) {
-        self.expect(Shape::Abc);
-        (self.a(), self.b(), self.c() != 0)
     }
 
     #[inline(always)]
@@ -475,62 +547,16 @@ impl Instruction {
         (self.a(), self.b(), self.c() != 0)
     }
 
-    /// `AbImm` whose `b` slot is a flag (`EQI`/`LTI`/...).
     #[inline(always)]
-    pub fn ab_imm_flag(self) -> (u8, bool) {
+    pub fn ab_imm(self) -> (u8, u8, i32) {
         self.expect(Shape::AbImm);
-        (self.a(), self.b() != 0)
+        (self.a(), self.b(), self.imm())
     }
 
-    // --- control-flow helpers ---------------------------------------------
-
-    /// True for the conditional opcodes a `JMP` can follow as its predecessor.
-    #[inline]
-    pub fn is_control(self) -> bool {
-        matches!(
-            self.op(),
-            Op::EQ
-                | Op::LT
-                | Op::LE
-                | Op::TEST
-                | Op::TESTSET
-                | Op::EQI
-                | Op::LTI
-                | Op::LEI
-                | Op::GTI
-                | Op::GEI
-        )
-    }
-
-    /// True for the control opcodes with a single register operand, which
-    /// carry their polarity flag in `b` rather than `c`.
-    #[inline]
-    fn flag_in_b(self) -> bool {
-        matches!(
-            self.op(),
-            Op::TEST | Op::EQI | Op::LTI | Op::LEI | Op::GTI | Op::GEI
-        )
-    }
-
-    /// The polarity flag of a control opcode.
-    #[inline]
-    pub fn inverted(self) -> bool {
-        debug_assert!(self.is_control(), "{self:?} carries no polarity flag");
-        if self.flag_in_b() {
-            self.b() != 0
-        } else {
-            self.c() != 0
-        }
-    }
-
-    #[inline]
-    pub fn set_inverted(&mut self, v: bool) {
-        debug_assert!(self.is_control(), "{self:?} carries no polarity flag");
-        if self.flag_in_b() {
-            self.set_b(v as u8);
-        } else {
-            self.set_c(v as u8);
-        }
+    #[inline(always)]
+    pub fn ah_imm(self) -> (u8, u16, i32) {
+        self.expect(Shape::AhImm);
+        (self.a(), self.h(), self.imm())
     }
 
     // --- slot writes ------------------------------------------------------
@@ -595,13 +621,8 @@ impl fmt::Debug for Instruction {
                 self.e()
             ),
             Shape::AImm => write!(f, "(a={}, imm={})", self.a(), self.imm()),
-            Shape::AbImm => write!(
-                f,
-                "(a={}, b={}, imm={:?})",
-                self.a(),
-                self.b(),
-                self.imm_k()
-            ),
+            Shape::AbImm => write!(f, "(a={}, b={}, imm={})", self.a(), self.b(), self.imm()),
+            Shape::AhImm => write!(f, "(a={}, h={}, imm={})", self.a(), self.h(), self.imm()),
             Shape::AbcImm => write!(
                 f,
                 "(a={}, b={}, c={}, imm={:?})",
@@ -730,37 +751,74 @@ instructions! {
     0x1e CLOSE      close       A     { start: Reg }
     0x1f TBC        tbc         A     { val: Reg }
     0x20 JMP        jmp         Imm   { offset: i32 }
-    0x21 EQ         eq          Abc   { lhs: Reg, rhs: Reg, inverted: bool }
-    0x22 LT         lt          Abc   { lhs: Reg, rhs: Reg, inverted: bool }
-    0x23 LE         le          Abc   { lhs: Reg, rhs: Reg, inverted: bool }
-    0x24 TEST       test        Ab    { src: Reg, inverted: bool }
-    0x25 TESTSET    testset     Abc   { dst: Reg, src: Reg, inverted: bool }
-    0x26 CALL       call        Abc   { func: Reg, args: u8, returns: u8 }
-    0x27 TAILCALL   tailcall    Ab    { func: Reg, args: u8 }
-    0x28 RETURN     ret         Ab    { values: Reg, count: u8 }
-    0x29 FORLOOP    forloop     AImm  { base: Reg, offset: i32 }
-    0x2a FORPREP    forprep     AImm  { base: Reg, offset: i32 }
+
+    // --- conditional branches -------------------------------------------------
+    //
+    // Each jumps `offset` past itself when its test holds (`J..`, `JT`,
+    // `JTSET`) or when it doesn't (`JN..`, `JF`, `JFSET`); see
+    // `Op::branch_sense`. `JNLT a b` is not `JLE b a`: they differ on NaN and
+    // in the metamethod they call.
+
+    0x21 JEQ        jeq         AbImm { lhs: Reg, rhs: Reg, offset: i32 }
+    0x22 JNEQ       jneq        AbImm { lhs: Reg, rhs: Reg, offset: i32 }
+    0x23 JLT        jlt         AbImm { lhs: Reg, rhs: Reg, offset: i32 }
+    0x24 JNLT       jnlt        AbImm { lhs: Reg, rhs: Reg, offset: i32 }
+    0x25 JLE        jle         AbImm { lhs: Reg, rhs: Reg, offset: i32 }
+    0x26 JNLE       jnle        AbImm { lhs: Reg, rhs: Reg, offset: i32 }
+
+    // `R[src] <cmp> imm`. `GT`/`GE` are the swapped `LT`/`LE`, so a literal on
+    // either side compiles to one of these. Equality never consults `__eq`.
+
+    0x27 JEQI       jeqi        AhImm { src: Reg, imm: CmpImm, offset: i32 }
+    0x28 JNEQI      jneqi       AhImm { src: Reg, imm: CmpImm, offset: i32 }
+    0x29 JLTI       jlti        AhImm { src: Reg, imm: CmpImm, offset: i32 }
+    0x2a JNLTI      jnlti       AhImm { src: Reg, imm: CmpImm, offset: i32 }
+    0x2b JLEI       jlei        AhImm { src: Reg, imm: CmpImm, offset: i32 }
+    0x2c JNLEI      jnlei       AhImm { src: Reg, imm: CmpImm, offset: i32 }
+    0x2d JGTI       jgti        AhImm { src: Reg, imm: CmpImm, offset: i32 }
+    0x2e JNGTI      jngti       AhImm { src: Reg, imm: CmpImm, offset: i32 }
+    0x2f JGEI       jgei        AhImm { src: Reg, imm: CmpImm, offset: i32 }
+    0x30 JNGEI      jngei       AhImm { src: Reg, imm: CmpImm, offset: i32 }
+
+    // `R[src] == K[key]`, a string: identity, as strings are interned.
+
+    0x31 JEQS       jeqs        AhImm { src: Reg, key: KIdx, offset: i32 }
+    0x32 JNEQS      jneqs       AhImm { src: Reg, key: KIdx, offset: i32 }
+
+    // Truthiness of `R[src]`; the `SET` forms copy it to `R[dst]` when they
+    // jump (`a or b`).
+
+    0x33 JT         jt          AImm  { src: Reg, offset: i32 }
+    0x34 JF         jf          AImm  { src: Reg, offset: i32 }
+    0x35 JTSET      jtset       AbImm { dst: Reg, src: Reg, offset: i32 }
+    0x36 JFSET      jfset       AbImm { dst: Reg, src: Reg, offset: i32 }
+
+    0x37 CALL       call        Abc   { func: Reg, args: u8, returns: u8 }
+    0x38 TAILCALL   tailcall    Ab    { func: Reg, args: u8 }
+    0x39 RETURN     ret         Ab    { values: Reg, count: u8 }
+    0x3a FORLOOP    forloop     AImm  { base: Reg, offset: i32 }
+    0x3b FORPREP    forprep     AImm  { base: Reg, offset: i32 }
 
     /// Generic `for`, over [`TFOR_VARS`] hidden slots at `base` (iterator,
     /// state, closing value, traversal position) and then its variables.
-    0x2b TFORPREP   tforprep    AImm  { base: Reg, offset: i32 }
-    0x2c TFORCALL   tforcall    Ab    { base: Reg, count: u8 }
-    0x2d TFORLOOP   tforloop    AImm  { base: Reg, offset: i32 }
+    0x3c TFORPREP   tforprep    AImm  { base: Reg, offset: i32 }
+    0x3d TFORCALL   tforcall    Ab    { base: Reg, count: u8 }
+    0x3e TFORLOOP   tforloop    AImm  { base: Reg, offset: i32 }
 
-    0x2e SETLIST    setlist     Abd   { table: Reg, count: u8, offset: u16 }
-    0x2f CLOSURE    closure     Ad    { dst: Reg, proto: ProtoIdx }
-    0x30 VARARG     vararg      Ab    { dst: Reg, count: u8 }
+    0x3f SETLIST    setlist     Abd   { table: Reg, count: u8, offset: u16 }
+    0x40 CLOSURE    closure     Ad    { dst: Reg, proto: ProtoIdx }
+    0x41 VARARG     vararg      Ab    { dst: Reg, count: u8 }
 
     /// Optimized below-base read of an un-escaped named vararg: integer key
     /// `1..=num_extras`, `"n"` for the count, else nil. `base` is unused at
     /// run time but is the table operand when the epilogue rewrites this to
     /// `GETTABLE` for an escaped vararg. Lua 5.5 `OP_GETVARG`.
-    0x31 VARARGGET  varargget   Abc   { dst: Reg, base: Reg, key: Reg }
+    0x42 VARARGGET  varargget   Abc   { dst: Reg, base: Reg, key: Reg }
 
-    0x32 VARARGPREP varargprep  A     { num_fixed: u8 }
-    0x33 ERRNNIL    errnnil     Ad    { src: Reg, name_key: KIdx }
-    0x34 NOP        nop         Nil   { }
-    0x35 STOP       stop        Nil   { }
+    0x43 VARARGPREP varargprep  A     { num_fixed: u8 }
+    0x44 ERRNNIL    errnnil     Ad    { src: Reg, name_key: KIdx }
+    0x45 NOP        nop         Nil   { }
+    0x46 STOP       stop        Nil   { }
 
     // --- immediate-operand forms --------------------------------------
     //
@@ -771,39 +829,28 @@ instructions! {
     // Invariants the handlers rely on: `MODI`/`IDIVI` never carry a zero integer
     // immediate; the bitwise forms only carry integer immediates.
 
-    0x36 ADDI       addi        AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x37 SUBI       subi        AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x38 MULI       muli        AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x39 MODI       modi        AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x3a POWI       powi        AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x3b DIVI       divi        AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x3c IDIVI      idivi       AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x3d BANDI      bandi       AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x3e BORI       bori        AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x3f BXORI      bxori       AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x40 SHLI       shli        AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x41 SHRI       shri        AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x42 RSUBI      rsubi       AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x43 RMODI      rmodi       AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x44 RPOWI      rpowi       AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x45 RDIVI      rdivi       AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x46 RIDIVI     ridivi      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x47 RSHLI      rshli       AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x48 RSHRI      rshri       AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x47 ADDI       addi        AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x48 SUBI       subi        AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x49 MULI       muli        AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x4a MODI       modi        AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x4b POWI       powi        AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x4c DIVI       divi        AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x4d IDIVI      idivi       AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x4e BANDI      bandi       AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x4f BORI       bori        AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x50 BXORI      bxori       AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x51 SHLI       shli        AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x52 SHRI       shri        AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x53 RSUBI      rsubi       AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x54 RMODI      rmodi       AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x55 RPOWI      rpowi       AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x56 RDIVI      rdivi       AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x57 RIDIVI     ridivi      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x58 RSHLI      rshli       AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x59 RSHRI      rshri       AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
 
-    /// `if (R[src] <cmp> imm) != inverted then skip`. `GTI`/`GEI` are the
-    /// swapped `LT`/`LE` so a constant on either side compiles to one of
-    /// these. `EQI` never consults `__eq`: the immediate is a number.
-    0x49 EQI        eqi         AbImm { src: Reg, inverted: bool, imm: Imm }
-    0x4a LTI        lti         AbImm { src: Reg, inverted: bool, imm: Imm }
-    0x4b LEI        lei         AbImm { src: Reg, inverted: bool, imm: Imm }
-    0x4c GTI        gti         AbImm { src: Reg, inverted: bool, imm: Imm }
-    0x4d GEI        gei         AbImm { src: Reg, inverted: bool, imm: Imm }
-
-    /// `return` / `return R[value]`: the two shapes nearly every return takes,
-    /// with the count baked in so the handler has nothing to decode or test.
-    0x4e RETURN0    ret0        Nil   { }
-    0x4f RETURN1    ret1        A     { value: Reg }
+    0x5a RETURN0    ret0        Nil   { }
+    0x5b RETURN1    ret1        A     { value: Reg }
 
     // --- quickened forms ------------------------------------------------
     //
@@ -813,38 +860,38 @@ instructions! {
     // `__index` table, `_TRANS` an added key), and back on a miss. Same
     // operands as the generic form.
 
-    0x50 GETFIELD_OWN    getfield_own    Abde { dst: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x51 GETFIELD_ABSENT getfield_absent Abde { dst: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x52 GETFIELD_PROTO  getfield_proto  Abde { dst: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x53 GETTABUP_OWN    gettabup_own    Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
-    0x54 GETTABUP_ABSENT gettabup_absent Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
-    0x55 GETTABUP_PROTO  gettabup_proto  Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
-    0x56 SELF_OWN        self_own        Abde { dst: Reg, object: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x57 SELF_ABSENT     self_absent     Abde { dst: Reg, object: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x58 SELF_PROTO      self_proto      Abde { dst: Reg, object: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x59 SETFIELD_OWN    setfield_own    Abde { src: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x5a SETFIELD_TRANS  setfield_trans  Abde { src: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x5b SETTABUP_OWN    settabup_own    Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
-    0x5c SETTABUP_TRANS  settabup_trans  Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
-    0x5d SETFIELD_ABSENT setfield_absent Abde { src: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x5e SETTABUP_ABSENT settabup_absent Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+    0x5c GETFIELD_OWN    getfield_own    Abde { dst: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x5d GETFIELD_ABSENT getfield_absent Abde { dst: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x5e GETFIELD_PROTO  getfield_proto  Abde { dst: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x5f GETTABUP_OWN    gettabup_own    Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+    0x60 GETTABUP_ABSENT gettabup_absent Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+    0x61 GETTABUP_PROTO  gettabup_proto  Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+    0x62 SELF_OWN        self_own        Abde { dst: Reg, object: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x63 SELF_ABSENT     self_absent     Abde { dst: Reg, object: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x64 SELF_PROTO      self_proto      Abde { dst: Reg, object: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x65 SETFIELD_OWN    setfield_own    Abde { src: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x66 SETFIELD_TRANS  setfield_trans  Abde { src: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x67 SETTABUP_OWN    settabup_own    Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+    0x68 SETTABUP_TRANS  settabup_trans  Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+    0x69 SETFIELD_ABSENT setfield_absent Abde { src: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x6a SETTABUP_ABSENT settabup_absent Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
 
     // --- shared-cell upvalue forms ------------------------------------------
     //
     // Never emitted: the assembler rewrites GETUPVAL, GETTABUP and SETTABUP
     // to these for an upvalue that is not by value. Not quickened.
 
-    0x5f GETUPVAL_REF getupval_ref Ab   { dst: Reg, idx: UpIdx }
-    0x60 GETTABUP_REF gettabup_ref Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
-    0x61 SETTABUP_REF settabup_ref Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+    0x6b GETUPVAL_REF getupval_ref Ab   { dst: Reg, idx: UpIdx }
+    0x6c GETTABUP_REF gettabup_ref Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+    0x6d SETTABUP_REF settabup_ref Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
 
     // --- CALL by result count -----------------------------------------------
     //
     // A CALL wanting no result (`returns` 1) or one (`returns` 2), whose
     // continuation is a constant. `returns` stays for the generic paths.
 
-    0x62 CALL_R0    call_r0     Abc   { func: Reg, args: u8, returns: u8 }
-    0x63 CALL_R1    call_r1     Abc   { func: Reg, args: u8, returns: u8 }
+    0x6e CALL_R0    call_r0     Abc   { func: Reg, args: u8, returns: u8 }
+    0x6f CALL_R1    call_r1     Abc   { func: Reg, args: u8, returns: u8 }
 }
 
 impl Op {
@@ -860,6 +907,37 @@ impl Op {
             op => op,
         }
     }
+}
+
+/// Each conditional branch paired with the one that jumps exactly when it
+/// doesn't.
+macro_rules! branch_pairs {
+    ($($t:ident $f:ident),* $(,)?) => {
+        impl Op {
+            /// Whether a conditional branch jumps when its test holds or when
+            /// it doesn't; `None` for other opcodes.
+            #[inline]
+            pub fn branch_sense(self) -> Option<bool> {
+                match self {
+                    $(Op::$t => Some(true), Op::$f => Some(false),)*
+                    _ => None,
+                }
+            }
+
+            /// The conditional branch that jumps exactly when this one doesn't.
+            pub fn negated(self) -> Op {
+                match self {
+                    $(Op::$t => Op::$f, Op::$f => Op::$t,)*
+                    _ => panic!("{self:?} is not a conditional branch"),
+                }
+            }
+        }
+    };
+}
+
+branch_pairs! {
+    JEQ JNEQ, JLT JNLT, JLE JNLE, JEQI JNEQI, JLTI JNLTI, JLEI JNLEI, JGTI JNGTI,
+    JGEI JNGEI, JEQS JNEQS, JT JF, JTSET JFSET,
 }
 
 impl Instruction {
@@ -923,8 +1001,8 @@ mod tests {
         let i = Instruction::forloop(Reg(2), i32::MIN);
         assert_eq!(i.a_imm(), (2, i32::MIN));
 
-        let i = Instruction::eq(Reg(7), Reg(8), true);
-        assert_eq!(i.abc_flag(), (7, 8, true));
+        let i = Instruction::jeq(Reg(7), Reg(8), -3);
+        assert_eq!(i.ab_imm(), (7, 8, -3));
 
         let i = Instruction::self_(Reg(1), Reg(2), IcIdx(4), KIdx(3));
         assert_eq!(i.abde(), (1, 2, 4, 3));
@@ -940,11 +1018,33 @@ mod tests {
         assert!(i.imm_is_int());
         assert_eq!(i.imm_int(), -7);
 
-        let k = Imm::from_float(-0.75).unwrap();
-        let i = Instruction::lti(Reg(3), true, k);
-        assert_eq!(i.ab_imm_flag(), (3, true));
-        assert!(!i.imm_is_int());
-        assert_eq!(i.imm_float(), -0.75);
+        let k = CmpImm::from_int(-7).unwrap();
+        let i = Instruction::jlti(Reg(3), k, i32::MIN);
+        assert_eq!(i.ah_imm(), (3, k.0, i32::MIN));
+        assert_eq!(i.cmp_imm(), k);
+        assert_eq!(i.cmp_imm_int(), -7);
+
+        let i = Instruction::jeqs(Reg(3), KIdx(u16::MAX), 5);
+        assert_eq!(i.ah_imm(), (3, u16::MAX, 5));
+    }
+
+    #[test]
+    fn cmp_imm_packing_limits() {
+        for n in [CmpImm::MIN, -1, 0, 1, CmpImm::MAX] {
+            let k = CmpImm::from_int(n).unwrap();
+            assert_eq!((k.int(), k.is_float()), (n, false));
+            assert_eq!(Instruction::jeqi(Reg(0), k, -1).cmp_imm_int(), n);
+            let k = CmpImm::from_float(n as f64).unwrap();
+            assert_eq!((k.int(), k.is_float()), (n, true));
+            assert_eq!(Instruction::jeqi(Reg(0), k, -1).cmp_imm_int(), n);
+        }
+        assert!(CmpImm::from_int(CmpImm::MAX + 1).is_none());
+        assert!(CmpImm::from_int(CmpImm::MIN - 1).is_none());
+        assert!(CmpImm::from_float(0.5).is_none());
+        assert!(CmpImm::from_float(-0.0).is_none());
+        assert!(CmpImm::from_float(f64::NAN).is_none());
+        assert!(CmpImm::from_float(f64::INFINITY).is_none());
+        assert!(CmpImm::from_float((CmpImm::MAX + 1) as f64).is_none());
     }
 
     #[test]

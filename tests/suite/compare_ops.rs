@@ -118,3 +118,84 @@ fn non_packing_numeral_lhs_before_short_circuit_rhs() {
         "11111"
     );
 }
+
+#[test]
+fn branches_through_metamethods_both_ways() {
+    // Compares are branches; a metamethod result still has to pick the right
+    // side of each `if`.
+    assert_eq!(
+        crate::common::ok(
+            "local mt = {__lt = function(a, b) return a.v < b.v end,
+                        __le = function(a, b) return a.v <= b.v end,
+                        __eq = function(a, b) return a.v == b.v end}
+             local x, y, z = setmetatable({v = 1}, mt), setmetatable({v = 2}, mt),
+                 setmetatable({v = 1}, mt)
+             local s = ''
+             for _, p in ipairs({{x, y}, {y, x}, {x, z}}) do
+               local a, b = p[1], p[2]
+               if a < b then s = s .. 'l' else s = s .. '-' end
+               if not (a <= b) then s = s .. 'g' else s = s .. '-' end
+               if a == b then s = s .. 'e' else s = s .. '-' end
+               if a ~= b then s = s .. 'n' else s = s .. '-' end
+             end
+             return s"
+        ),
+        "l--n-g-n--e-"
+    );
+}
+
+#[test]
+fn immediate_compare_jumping_past_16_bits() {
+    // Every compare form carries a 32-bit offset.
+    let body = "x = x + 1\n".repeat(40_000);
+    let src = format!(
+        "local function f(x)\n\
+         if x < 5 then\n{body}end\n\
+         if 3 >= x then\n{body}end\n\
+         return x\n\
+         end\n\
+         return f(1) * 1000000 + f(3) * 10 + f(9)"
+    );
+    assert_eq!(run(&src), 40001 * 1000000 + 40003 * 10 + 9);
+}
+
+#[test]
+fn string_constant_equality() {
+    assert_eq!(
+        crate::common::ok(
+            "local s, n = 'foo', 1
+             local r = ''
+             for _, v in ipairs({s == 'foo', s ~= 'foo', 'foo' == s, s == 'bar',
+                                 n == 'foo', nil == 'x', not (s ~= 'bar')}) do
+               r = r .. (v and '1' or '0')
+             end
+             if s == 'foo' then r = r .. 'e' end
+             if s ~= 'bar' then r = r .. 'n' end
+             return r"
+        ),
+        "1010000en"
+    );
+}
+
+#[test]
+fn immediate_literal_limits_and_type() {
+    // Literals within 15 bits ride in the instruction, the rest in a register;
+    // either way a float literal reaches the metamethod as a float.
+    assert_eq!(
+        crate::common::ok(
+            "local n, x = 16383, 16384
+             local r = ''
+             for _, v in ipairs({n == 16383, x == 16384, n < 16384, x > 16383, n > 16383,
+                                 -n >= -16383, -x <= -16384, n == 16383.0, x < 16384.5}) do
+               r = r .. (v and '1' or '0')
+             end
+             local t = setmetatable({}, {__lt = function(a, b)
+               r = r .. ' ' .. math.type(b)
+               return true
+             end})
+             local _ = t < 1, t < 1.0, t < 16384.0, t < 0.5
+             return r"
+        ),
+        "111101111 integer float float float"
+    );
+}

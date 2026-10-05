@@ -12,7 +12,7 @@ use crate::dmm::{Gc, Mutation};
 use crate::env::function::{LocVar, Template};
 use crate::env::{LuaString, Prototype, value::Value};
 use crate::instruction::{
-    IcIdx, Imm, Instruction, KIdx, Op, ProtoIdx, Reg, Shape, TFOR_VARS, TemplateIdx, UpIdx,
+    CmpImm, IcIdx, Imm, Instruction, KIdx, Op, ProtoIdx, Reg, Shape, TFOR_VARS, TemplateIdx, UpIdx,
     UpvalSource,
 };
 use crate::lua;
@@ -25,17 +25,17 @@ use crate::parser::syntax::{
 };
 use crate::vm::num;
 
-/// Sentinel value used as the `dst` field of a `TESTSET` while the real
-/// destination register is still unknown — i.e. the jump is pending in a
-/// jump list and its ultimate consumer (a value-context discharge or a
+/// Sentinel value used as the `dst` field of a `JTSET`/`JFSET` while the
+/// real destination register is still unknown — i.e. the jump is pending in
+/// a jump list and its ultimate consumer (a value-context discharge or a
 /// branch-context patch) hasn't been reached yet.
 ///
 /// `patch_list_aux` rewrites `NO_REG` to the concrete destination register
 /// when discharging to a register; `downgrade_testsets` rewrites the whole
-/// `TESTSET` to a plain `TEST` when the list is consumed in branch context
-/// (no value preservation needed). Every `TESTSET` with this sentinel must
-/// be patched or downgraded before the chunk is assembled — executing one
-/// at runtime would write to an out-of-bounds register.
+/// branch to a plain `JT`/`JF` when the list is consumed in branch context
+/// (no value preservation needed). Every branch with this sentinel must be
+/// patched or downgraded before the chunk is assembled — executing one at
+/// runtime would write to an out-of-bounds register.
 const NO_REG: u8 = u8::MAX;
 
 /// Per-function limits, Lua's `MAX_FSTACK`, `MAXVARS`, `MAXUPVAL` and `MAXARG_B`
@@ -45,10 +45,26 @@ const MAX_LOCALS: usize = 200;
 const MAX_UPVALUES: usize = 255;
 const MAX_RETURNS: usize = 255;
 
-/// A control instruction whose taken edge preserves no value — a plain `TEST`,
-/// or a `TESTSET` still holding the `NO_REG` placeholder dst.
+/// A `JTSET`/`JFSET` still holding the `NO_REG` placeholder dst.
+fn is_open_testset(i: Instruction) -> bool {
+    matches!(i.op(), Op::JTSET | Op::JFSET) && i.a() == NO_REG
+}
+
+/// A branch whose taken edge preserves no value: `JT`/`JF` or an open
+/// `JTSET`/`JFSET`.
 fn is_valueless_ctrl(i: Instruction) -> bool {
-    i.op() == Op::TEST || (i.op() == Op::TESTSET && i.a() == NO_REG)
+    matches!(i.op(), Op::JT | Op::JF) || is_open_testset(i)
+}
+
+/// A `JTSET`/`JFSET` as the `JT`/`JF` that doesn't copy.
+fn without_copy(i: Instruction) -> Instruction {
+    let (_, src, offset) = i.ab_imm();
+    let ctor = if i.op() == Op::JTSET {
+        Instruction::jt
+    } else {
+        Instruction::jf
+    };
+    ctor(Reg(src), offset)
 }
 
 // ---------------------------------------------------------------------------
@@ -725,27 +741,17 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         idx
     }
 
-    /// Debug-only check of the `JumpList` predecessor invariant: for any
-    /// `jmp_idx` stored in a list, `tape[jmp_idx - 1]` must be a CMP/TEST/
-    /// TESTSET control instruction (or `jmp_idx == 0`, which every consumer
-    /// shortcuts). See the `JumpList` doc comment.
-    fn assert_ctrl_predecessor(&self, jmp_idx: usize) {
-        if jmp_idx == 0 {
-            return;
-        }
-        let prev = &self.chunk.tape[jmp_idx - 1];
+    /// Check of the `JumpList` invariant: `tape[idx]` is a conditional branch.
+    fn assert_cond_branch(&self, idx: usize) {
+        let instr = self.chunk.tape[idx];
         assert!(
-            prev.is_control(),
-            "JumpList invariant violated: tape[{}] = {:?} is not a \
-             CMP/TEST/TESTSET control instruction for JMP at tape[{}]",
-            jmp_idx - 1,
-            prev,
-            jmp_idx,
+            instr.op().branch_sense().is_some(),
+            "JumpList invariant violated: tape[{idx}] = {instr:?} is not a conditional branch",
         );
     }
 
-    /// Downgrade any `TESTSET` with a `NO_REG` dst preceding a jump in the
-    /// list to a plain `TEST`. Called when a list is about to be consumed
+    /// Downgrade any `JTSET`/`JFSET` in the list still holding the `NO_REG`
+    /// dst to a plain `JT`/`JF`. Called when a list is about to be consumed
     /// in a context that doesn't need value preservation — mid-expression
     /// fall-through patches and branch-context patches both qualify.
     ///
@@ -754,37 +760,24 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     /// enclosing logical operator. For example, in `a and b`, LHS's
     /// `true_list` gets patched to RHS's start — LHS's truthy value is
     /// not the result (RHS's is), so preservation would be wasted.
-    ///
-    /// Reads `tape[jmp_idx - 1]`; see the `JumpList` invariant.
     fn downgrade_testsets(&mut self, list: &JumpList) {
-        for &jmp_idx in &list.jumps {
-            if jmp_idx == 0 {
-                continue;
-            }
-
-            self.assert_ctrl_predecessor(jmp_idx);
-            let ctrl = self.chunk.tape[jmp_idx - 1];
-            if ctrl.op() == Op::TESTSET && ctrl.a() == NO_REG {
-                let (_, src, inverted) = ctrl.abc_flag();
-                // TEST skips on `truthy != inverted`; TESTSET skips on
-                // `truthy == inverted`. They're inverses, so preserving
-                // the same skip behaviour across the rewrite requires
-                // flipping the flag.
-                self.chunk.tape[jmp_idx - 1] = Instruction::test(Reg(src), !inverted);
+        for &idx in &list.jumps {
+            self.assert_cond_branch(idx);
+            let instr = self.chunk.tape[idx];
+            if is_open_testset(instr) {
+                self.chunk.tape[idx] = without_copy(instr);
             }
         }
     }
 
-    /// Patch every jump in `list` to `target`. Downgrades any `TESTSET`
-    /// controls that still hold `NO_REG` as their dst — this path is for
-    /// branch/fall-through consumers that don't materialise a value.
+    /// Patch every jump in `list` to `target`. Downgrades any open
+    /// `JTSET`/`JFSET` — this path is for branch/fall-through consumers that
+    /// don't materialise a value.
     fn patch_to(&mut self, list: JumpList, target: usize) {
         self.downgrade_testsets(&list);
         for idx in list.jumps {
             let offset = target as i32 - (idx as i32 + 1);
-            let jmp = &mut self.chunk.tape[idx];
-            assert!(jmp.op() == Op::JMP, "jump-list entry is not a JMP");
-            jmp.set_imm(offset);
+            self.chunk.tape[idx].set_imm(offset);
         }
         if target > self.chunk.last_target {
             self.chunk.last_target = target;
@@ -795,14 +788,13 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     /// instruction to be emitted).
     ///
     /// Trailing no-op jumps are elided rather than patched to offset 0: a
-    /// list jump that is the last instruction on the tape, controlled by a
-    /// side-effect-free `TEST`/`TESTSET`, would jump to its own successor —
-    /// a dead `TEST; JMP +0` pair (reference Lua leaves these in; we don't).
-    /// Pop both. Sound only at the tail, where no other live tape index
-    /// shifts, and only for the controls `patch_to` would itself drop: a
-    /// plain `TEST` or a `NO_REG` `TESTSET` (which `downgrade_testsets`
-    /// turns into a value-less `TEST`). A `CMP` predecessor may run a
-    /// metamethod, and a real-dst `TESTSET` preserves a value, so both stay.
+    /// list jump that is the last instruction on the tape and tests only
+    /// truthiness would jump to its own successor — a dead `JT +0` (reference
+    /// Lua leaves these in; we don't). Pop it. Sound only at the tail, where
+    /// no other live tape index shifts, and only for the branches `patch_to`
+    /// would itself make value-less: `JT`/`JF` or an open `JTSET`/`JFSET`. A
+    /// compare may run a metamethod, and a real-dst `JTSET` preserves a
+    /// value, so both stay.
     fn patch_to_here(&mut self, mut list: JumpList) {
         loop {
             let end = self.next_offset();
@@ -810,67 +802,55 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                 break;
             };
             let j = list.jumps[pos];
-            if j == 0 || !is_valueless_ctrl(self.chunk.tape[j - 1]) {
+            if !is_valueless_ctrl(self.chunk.tape[j]) {
                 break;
             }
             // Elision is sound only because nothing else targets the tail
-            // pair: the control + JMP were just emitted for this expression,
-            // and goto/break patches and labels resolve to statement
-            // boundaries, never mid-expression. Guard that invariant.
+            // branch: it was just emitted for this expression, and goto/break
+            // patches and labels resolve to statement boundaries, never
+            // mid-expression. Guard that invariant.
             debug_assert!(
-                !self.chunk.jump_patches.iter().any(|&(idx, _)| idx >= j - 1),
+                !self.chunk.jump_patches.iter().any(|&(idx, _)| idx >= j),
                 "no-op jump elision would orphan a pending jump_patch"
             );
             // Only a *live* label — one a jump_patch resolves at assemble time
             // — can be orphaned; dead labels (e.g. the unused end_label of an
             // empty `if ... then end` with no else) are never read. A live
-            // target at exactly `j - 1` is fine: it slides forward onto the
-            // next emitted instruction. A live target past `j - 1` would point
-            // into the elided pair, which can't happen because labels resolve
-            // to statement boundaries, never between a condition's TEST and JMP.
+            // target at exactly `j` is fine: it slides forward onto the next
+            // emitted instruction.
             debug_assert!(
                 !self
                     .chunk
                     .jump_patches
                     .iter()
-                    .any(|&(_, lbl)| self.chunk.labels[lbl as usize] > j - 1),
+                    .any(|&(_, lbl)| self.chunk.labels[lbl as usize] > j),
                 "no-op jump elision would orphan a live jump target"
             );
-            self.chunk.tape.truncate(j - 1);
-            self.chunk.lineinfo.truncate(j - 1);
+            self.chunk.tape.truncate(j);
+            self.chunk.lineinfo.truncate(j);
             list.jumps.remove(pos);
         }
         let target = self.next_offset();
         self.patch_to(list, target);
     }
 
-    /// Does this list contain any jump whose control instruction can't
-    /// self-materialise a boolean value? TESTSET-controlled jumps preserve
-    /// the operand value on the taken edge; TEST/LT/LE/EQ jumps don't. The
-    /// caller uses this to decide whether the `LFALSESKIP` / `LOAD true`
-    /// fixup tail is needed at discharge.
-    ///
-    /// Reads `tape[idx - 1]`; see the `JumpList` invariant.
+    /// Does this list contain any jump that can't self-materialise a boolean
+    /// value? An open `JTSET`/`JFSET` preserves the operand value on the
+    /// taken edge; the other branches don't. The caller uses this to decide
+    /// whether the `LFALSESKIP` / `LOAD true` fixup tail is needed at
+    /// discharge.
     fn need_value(&self, list: &JumpList) -> bool {
         list.jumps.iter().any(|&idx| {
-            if idx == 0 {
-                return true;
-            }
-
-            self.assert_ctrl_predecessor(idx);
-            let ctrl = self.chunk.tape[idx - 1];
-            !(ctrl.op() == Op::TESTSET && ctrl.a() == NO_REG)
+            self.assert_cond_branch(idx);
+            !is_open_testset(self.chunk.tape[idx])
         })
     }
 
-    /// Value-context patching of a jump list. For each jump, if its control
-    /// is a `TESTSET { dst: NO_REG, .. }`, patch the dst to `reg` and aim
-    /// the JMP at `vtarget` (the final/merge point — the TESTSET preserves
-    /// value on the taken edge so we don't need the fixup tail).
-    /// Self-assigning TESTSETs (src == reg) are downgraded to TEST and
-    /// aimed at `dtarget` along with every non-TESTSET-controlled jump.
-    ///
-    /// Reads `tape[jmp_idx - 1]`; see the `JumpList` invariant.
+    /// Value-context patching of a jump list. An open `JTSET`/`JFSET` gets
+    /// `reg` as its dst and jumps to `vtarget` (the final/merge point — it
+    /// preserves the value on the taken edge so we don't need the fixup
+    /// tail); a self-assigning one (src == reg) is downgraded to `JT`/`JF`
+    /// and also aims at `vtarget`. Every other jump aims at `dtarget`.
     fn patch_list_aux(
         &mut self,
         list: JumpList,
@@ -878,85 +858,56 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         reg: RegisterIndex,
         dtarget: usize,
     ) {
-        for jmp_idx in list.jumps {
-            let target = if jmp_idx == 0 {
-                dtarget
-            } else {
-                self.assert_ctrl_predecessor(jmp_idx);
-                let ctrl_idx = jmp_idx - 1;
-                let ctrl = self.chunk.tape[ctrl_idx];
-                if ctrl.op() == Op::TESTSET && ctrl.a() == NO_REG {
-                    let (_, src, inverted) = ctrl.abc_flag();
-                    {
-                        // Both arms preserve the operand value at `reg`:
-                        // the assignment case writes `src` → `reg`, the
-                        // self-assign case has the value already in `reg`.
-                        // Either way the jump skips the materialisation
-                        // tail and lands on `vtarget`.
-                        if src == reg.0 {
-                            self.chunk.tape[ctrl_idx] = Instruction::test(Reg(src), !inverted);
-                        } else {
-                            self.chunk.tape[ctrl_idx] =
-                                Instruction::testset(reg, Reg(src), inverted);
-                        }
-                        vtarget
-                    }
+        for idx in list.jumps {
+            self.assert_cond_branch(idx);
+            let instr = &mut self.chunk.tape[idx];
+            let target = if is_open_testset(*instr) {
+                if instr.b() == reg.0 {
+                    *instr = without_copy(*instr);
                 } else {
-                    dtarget
+                    instr.set_a(reg.0);
                 }
+                vtarget
+            } else {
+                dtarget
             };
-            let offset = target as i32 - (jmp_idx as i32 + 1);
-            let jmp = &mut self.chunk.tape[jmp_idx];
-            if jmp.op() == Op::JMP {
-                jmp.set_imm(offset);
-            }
+            instr.set_imm(target as i32 - (idx as i32 + 1));
         }
     }
 
-    /// Emit a TESTSET + unfilled JMP that fires when the value at `src`
-    /// matches `jump_if_truthy`, assigning the TESTSET's dst to the source
-    /// value on the same edge. The `dst` field is left as `NO_REG`: if this
-    /// jump is ultimately consumed by a value-context discharge,
-    /// `patch_list_aux` rewrites the dst to the final destination register;
-    /// otherwise `downgrade_testsets` rewrites the TESTSET to a plain TEST.
+    /// Emit an unfilled `JTSET`/`JFSET` that fires when the value at `src`
+    /// matches `jump_if_truthy`, copying it on the taken edge. The dst is
+    /// left as `NO_REG`: if this jump is ultimately consumed by a
+    /// value-context discharge, `patch_list_aux` rewrites it to the final
+    /// destination register; otherwise `downgrade_testsets` turns it into a
+    /// plain `JT`/`JF`.
     ///
-    /// Why TESTSET instead of TEST: for `a or b` in value context we need
-    /// the truthy short-circuit to preserve `a`'s value in the destination
-    /// register. The TESTSET does that assign on the same path as the JMP,
-    /// so no extra MOVE is needed.
+    /// Why copy: for `a or b` in value context the truthy short-circuit must
+    /// leave `a`'s value in the destination register, and copying on the
+    /// jump needs no extra MOVE.
     fn emit_test_jump(&mut self, src: RegisterIndex, jump_if_truthy: bool) -> usize {
-        // TESTSET semantics: skip iff `truthy(src) == inverted`, else
-        // `R[dst] := R[src]` and fall through. We want the fall-through
-        // path (which leads to the JMP) to be the "wanted truthiness" path.
-        //   jump_if_truthy=true  → fall-through on truthy → assign on truthy
-        //                          → `truthy != inverted` → inverted = false
-        //   jump_if_truthy=false → fall-through on falsy  → inverted = true
-        self.emit(Instruction::testset(Reg(NO_REG), src, !jump_if_truthy));
-        self.emit_unfilled_jmp()
+        let idx = self.next_offset();
+        let ctor = if jump_if_truthy {
+            Instruction::jtset
+        } else {
+            Instruction::jfset
+        };
+        self.emit(ctor(Reg(NO_REG), src, 0));
+        idx
     }
 
-    /// Flip the `inverted` flag of the CMP/TEST/TESTSET preceding `jmp_idx`.
-    /// Shared helper for `negate_cond` and the pending-flip done by `not`.
-    fn flip_control_polarity(&mut self, jmp_idx: usize) {
-        // Defensive: a JMP at tape index 0 has no predecessor to invert.
-        // Doesn't arise in practice (functions start with VARARGPREP) but
-        // cheap to guard against underflow.
-        if jmp_idx == 0 {
-            return;
-        }
-        let ctrl = &mut self.chunk.tape[jmp_idx - 1];
-        assert!(
-            ctrl.is_control(),
-            "flip_control_polarity: jump at {jmp_idx} has no \
-             CMP/TEST control instruction (found {ctrl:?})"
-        );
-        ctrl.set_inverted(!ctrl.inverted());
+    /// Make the branch at `idx` jump on the opposite outcome. Shared helper
+    /// for `negate_cond` and the pending-flip done by `not`.
+    fn flip_control_polarity(&mut self, idx: usize) {
+        self.assert_cond_branch(idx);
+        let instr = &mut self.chunk.tape[idx];
+        *instr = instr.with_op(instr.op().negated());
     }
 
     /// Lua's `codenot` list handling: negating an expression swaps its truthy
     /// and falsy exits, and the values its short-circuit jumps preserve are
-    /// useless once negated — so downgrade their TESTSETs to plain TESTs
-    /// (`removevalues`) before swapping. `result_kind` is the negated
+    /// useless once negated — so downgrade their `JTSET`/`JFSET`s to plain
+    /// `JT`/`JF`s (`removevalues`) before swapping. `result_kind` is the negated
     /// fall-through value: the `NOT` result, the unchanged `Jump` head (after
     /// the caller flips its polarity), or a folded boolean.
     fn codenot(&mut self, operand: ExprDesc<'gc>, result_kind: ExprKind<'gc>) -> ExprDesc<'gc> {
@@ -969,10 +920,9 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         }
     }
 
-    /// Flip the polarity of every pending conditional jump in `expr`: invert
-    /// the `inverted` flag of each control instruction (CMP/TEST/TESTSET)
-    /// and swap the true/false lists. After the call every pending JMP
-    /// fires on the opposite runtime condition and the lists are re-labelled
+    /// Flip the polarity of every pending conditional jump in `expr`: negate
+    /// each branch and swap the true/false lists. After the call every
+    /// pending jump fires on the opposite runtime condition and the lists are re-labelled
     /// to match — the whole `ExprDesc` stays internally consistent.
     ///
     /// **Precondition:** the Jump-kind pending head (if the expression is
@@ -1014,10 +964,9 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             return Ok(());
         }
         // Falsy compile-time const: same path as a register operand —
-        // discharge so the existing `TEST + JMP` machinery (and the
-        // `JumpList` invariant that lists only contain TEST/TESTSET/CMP-
-        // predecessor jumps) is preserved. Lua does the equivalent via
-        // `jumponcond` on `VFALSE`/`VNIL`.
+        // discharge so it goes through `emit_test_jump` (lists hold only
+        // conditional branches). Lua does the equivalent via `jumponcond` on
+        // `VFALSE`/`VNIL`.
         if matches!(expr.kind, ExprKind::Bool(false) | ExprKind::Nil) {
             self.discharge_to_reg_mut(expr, None)?;
         }
@@ -1025,8 +974,8 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             ExprKind::Jump(_) => {
                 if let Some(idx) = expr.take_pending() {
                     // Absorb the pending head into false_list. Pending
-                    // fires on truthy, so flip its CMP first to make it
-                    // fire on falsy.
+                    // fires on truthy, so negate it first to make it fire
+                    // on falsy.
                     self.flip_control_polarity(idx);
                     expr.false_list.jumps.push(idx);
                 } else if expr.false_list.is_empty() && !expr.true_list.is_empty() {
@@ -1039,9 +988,9 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             }
             ExprKind::Reg(reg) => {
                 // Mirror Lua's `freeexp` in `jumponcond`: release the operand
-                // temp before recording the TESTSET so the short-circuit value
+                // temp before recording the JFSET so the short-circuit value
                 // and the fall-through value materialise into one register (no
-                // orphan, no unifying MOVE). The TESTSET reads `reg` before any
+                // orphan, no unifying MOVE). The JFSET reads `reg` before any
                 // reuse overwrites it (emission order guarantees read-then-load).
                 self.free_reg(reg);
                 let jmp = self.emit_test_jump(reg, false);
@@ -1064,7 +1013,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             return Ok(());
         }
         // Truthy compile-time const: same path as a register operand —
-        // discharge so the existing `TEST + JMP` machinery is preserved.
+        // discharge so it goes through `emit_test_jump`.
         if matches!(
             expr.kind,
             ExprKind::Numeral(_) | ExprKind::Str(_) | ExprKind::Bool(true)
@@ -1101,21 +1050,21 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     /// Discharge an expression to a concrete register, resolving any pending
     /// jump lists. The emitted shape follows Lua 5.5's `exp2reg`:
     ///
-    /// * If every pending jump is TESTSET-controlled (all preserve their
+    /// * If every pending jump is an open `JTSET`/`JFSET` (all preserve their
     ///   operand value via the assign-on-short-circuit edge) we skip the
     ///   `LFALSESKIP` / `LOAD K(true)` fixup tail entirely — `patch_list_aux`
     ///   redirects those jumps to the final merge point, no boolean
     ///   materialisation needed.
-    /// * Otherwise we emit the two-instruction tail. TESTSET jumps still
-    ///   skip to the merge point (preserving their value); plain TEST /
-    ///   CMP jumps land on LFALSESKIP or LOADTRUE to produce a boolean in
+    /// * Otherwise we emit the two-instruction tail. `JTSET`/`JFSET` jumps
+    ///   still skip to the merge point (preserving their value); the other
+    ///   branches land on LFALSESKIP or LOADTRUE to produce a boolean in
     ///   `dst`.
     /// * For a Reg-kind expression with pending jumps, the fall-through at
     ///   the moment of discharge already holds the RHS value in `dst`; we
     ///   emit a JMP over the tail so the fall-through value survives.
     /// * For a Jump-kind expression we absorb the `pending` head into
     ///   `true_list` (mirroring Lua's `luaK_concat(&e->t, e->u.info)`).
-    ///   Physical fall-through of the last control instruction is
+    ///   Physical fall-through of the last branch is
     ///   guaranteed falsy by our invariants, so it lands naturally on
     ///   `LFALSESKIP` (the false_target) and produces the correct boolean
     ///   — no routing JMP needed.
@@ -1138,13 +1087,12 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         // LOAD here, lazily. Without pending jumps this is the whole
         // discharge — return immediately. With pending jumps (e.g. the
         // RHS of `tonumber(x) or 1000` is a literal that arrived here
-        // carrying the `or`'s TESTSET-controlled true_list), the LOAD
-        // becomes the falsy fall-through value: the TESTSET fires on
-        // truthy and patches the operand into `dst`, otherwise control
-        // falls through past the JMP and our LOAD writes the const.
-        // The boolean fixup tail (LFALSESKIP / LOAD-true) is normally
-        // skipped on this path because TESTSET-controlled jumps satisfy
-        // `need_value` without it.
+        // carrying the `or`'s JTSET true_list), the LOAD becomes the falsy
+        // fall-through value: the JTSET fires on truthy and copies the
+        // operand into `dst`, otherwise control falls through and our LOAD
+        // writes the const. The boolean fixup tail (LFALSESKIP / LOAD-true)
+        // is normally skipped on this path because open JTSET/JFSET jumps
+        // satisfy `need_value` without it.
         if let Some(value) = const_kind_to_value(self.ctx.mutation(), expr.kind) {
             let idx = self.alloc_constant(value)?;
             let dst = self.dst_or_alloc(hint)?;
@@ -1159,10 +1107,10 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         let dst = match expr.kind {
             ExprKind::Reg(reg) => {
                 // Reg with pending jumps. Honor the hint: jumps in the list
-                // preserve the short-circuit operand by having their TESTSET
-                // dst patched to our `dst`. If we used `reg` directly and
+                // preserve the short-circuit operand by having their JTSET/
+                // JFSET dst patched to our `dst`. If we used `reg` directly and
                 // `reg` happens to be a local's register (e.g. `b` in
-                // `local x = a and b`), the TESTSETs would overwrite that
+                // `local x = a and b`), those copies would overwrite that
                 // local on the falsy short-circuit — a real miscompile. So
                 // MOVE the fall-through value into the hint, then patching
                 // can target hint safely.
@@ -1174,9 +1122,9 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                     h
                 } else if hint.is_none() && reg.0 < self.chunk.nactvar {
                     // No hint and `reg` aliases an active local. Patching
-                    // TESTSETs / emitting LFALSESKIP through `reg` would
+                    // JTSET/JFSETs / emitting LFALSESKIP through `reg` would
                     // clobber the local on the falsy short-circuit edge.
-                    // Allocate a fresh temp; pre-existing TESTSET/CMP+JMPs
+                    // Allocate a fresh temp; pending JTSET/JFSETs
                     // (emitted by goiftrue/goiffalse above this call)
                     // still carry NO_REG, so patch_list_aux below rewrites
                     // their dst to `fresh` and aims them at `final_pos`
@@ -1197,9 +1145,8 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
 
         if is_jump {
             // Absorb pending head into true_list (fires on truthy by
-            // construction). Fall-through past this JMP is guaranteed
-            // falsy, so the LFALSESKIP tail handles it without a routing
-            // JMP.
+            // construction). Fall-through past it is guaranteed falsy, so
+            // the LFALSESKIP tail handles it without a routing JMP.
             if let Some(idx) = expr.take_pending() {
                 expr.true_list.jumps.push(idx);
             }
@@ -1226,7 +1173,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                 self.emit(Instruction::load(dst, KIdx(true_idx)));
                 (ft, tt)
             } else {
-                // Unused: every jump in both lists is TESTSET-controlled and
+                // Unused: every jump in both lists is an open JTSET/JFSET and
                 // will be redirected to `final_pos` by patch_list_aux.
                 (0, 0)
             };
@@ -3635,7 +3582,7 @@ fn compile_expr_binary_op<'gc>(
     // Infix (mirrors Lua's `luaK_infix`): settle the LHS *before* compiling the
     // RHS, so a jump-carrying RHS (an `and`/`or`/comparison) can't have the
     // LHS's value-load emitted into its short-circuit span — where the
-    // short-circuit `JMP` would skip it. We keep a foldable numeral LHS lazy so
+    // short-circuit jump would skip it. We keep a foldable numeral LHS lazy so
     // a numeric RHS can still constant-fold; `CONCAT` is the exception — its
     // operands must occupy consecutive ascending registers, so its LHS is
     // materialised here regardless to take the lower register.
@@ -3758,7 +3705,7 @@ fn compile_expr_binary_op<'gc>(
 }
 
 type ArithImmCtor = fn(Reg, Reg, Imm) -> Instruction;
-type CmpImmCtor = fn(Reg, Imm) -> Instruction;
+type CmpImmCtor = fn(Reg, CmpImm, i32) -> Instruction;
 
 /// Bitwise ops take integer immediates only — a metamethod would otherwise see
 /// `2.0` become `2`. `MODI`/`IDIVI` refuse a zero integer divisor so the handler
@@ -3833,8 +3780,8 @@ fn emit_arith(
 }
 
 /// Compile a comparison (`==`, `~=`, `<`, `>`, `<=`, `>=`) as a jump-list
-/// expression: emit just `CMP` + an unfilled `JMP` and return a `Jump`-kind
-/// `ExprDesc` whose `pending` head holds the JMP (fires on truthy).
+/// expression: emit just an unfilled conditional branch and return a
+/// `Jump`-kind `ExprDesc` whose `pending` head holds it (fires on truthy).
 /// Consumers that branch on the result call `goiffalse` / `goiftrue` to
 /// absorb the head into the right list; consumers that need a boolean in
 /// a register call `discharge_to_reg_mut`, which emits the standard
@@ -3848,113 +3795,119 @@ fn compile_comparison_desc<'gc>(
     let lhs_expr = item.lhs().ok_or_else(|| ice("cmp without lhs"))?;
     let rhs_expr = item.rhs().ok_or_else(|| ice("cmp without rhs"))?;
 
-    // A packable numeral on either side becomes the immediate. A non-packing one
-    // must be materialised *before* the RHS, or its `LOAD` would sit inside a
-    // jump-carrying RHS's short-circuit span and be skipped.
+    // A literal the branch can carry (see `cmp_literal`) on either side stays
+    // lazy. Anything else must be materialised *before* the RHS, or its `LOAD`
+    // would sit inside a jump-carrying RHS's short-circuit span and be skipped.
     let mut lhs_desc = compile_expr(ctx, lhs_expr, None)?;
-    let lhs_numeral = match lhs_desc.kind {
-        ExprKind::Numeral(n) if !lhs_desc.has_jumps() && imm_packs(n) => Some(n),
-        _ => None,
-    };
-    if lhs_numeral.is_none() {
+    let lhs_lit = cmp_literal(op, &lhs_desc);
+    if lhs_lit.is_none() {
         ctx.discharge_to_reg_mut(&mut lhs_desc, None)?;
     }
     let mut rhs_desc = compile_expr(ctx, rhs_expr, None)?;
-    let rhs_numeral = match rhs_desc.kind {
-        ExprKind::Numeral(n) if !rhs_desc.has_jumps() && imm_packs(n) => Some(n),
+    let rhs_lit = cmp_literal(op, &rhs_desc);
+    let lit_form = match (lhs_lit, rhs_lit) {
+        (None, Some(lit)) => Some((lit, false)),
+        (Some(lit), None) => Some((lit, true)),
         _ => None,
     };
-    let imm_form = match (lhs_numeral, rhs_numeral) {
-        (None, Some(n)) => cmp_imm(op, n, false).map(|f| (f, false)),
-        (Some(n), None) => cmp_imm(op, n, true).map(|f| (f, true)),
-        _ => None,
-    };
-    if let Some(((emit, imm), imm_on_left)) = imm_form {
-        let src = if imm_on_left {
+
+    // Each branch fires on the comparison's truthy outcome, so fall-through
+    // is falsy, which lets `discharge_to_reg_mut`'s `LFALSESKIP`-first tail
+    // produce the boolean without a routing jump.
+    let (instr, lhs, rhs) = if let Some((lit, lit_on_left)) = lit_form {
+        let src = if lit_on_left {
             ctx.discharge_to_reg_mut(&mut rhs_desc, None)?
         } else {
             ctx.discharge_to_reg_mut(&mut lhs_desc, None)?
         };
-        ctx.cur_line = op_line;
-        ctx.emit(emit(src, imm));
-        let jmp = ctx.emit_unfilled_jmp();
-        ctx.free_reg(src);
-        return Ok(ExprDesc {
-            kind: ExprKind::Jump(Some(jmp)),
-            true_list: JumpList::new(),
-            false_list: JumpList::new(),
-        });
-    }
-
-    let lhs = ctx.discharge_to_reg_mut(&mut lhs_desc, None)?;
-    let rhs = ctx.discharge_to_reg_mut(&mut rhs_desc, None)?;
-    ctx.cur_line = op_line;
-
-    // Lua 5.5 convention: emit the CMP so the paired JMP fires on the
-    // TRUTHY outcome of the comparison. The VM's `op_lt` / `op_le` /
-    // `op_eq` handlers skip the following instruction iff
-    // `(cmp_result != inverted) == true` — with `inverted=true`, the skip
-    // fires on falsy and the JMP fires on truthy, which is the polarity
-    // we want for value contexts (`discharge_to_reg_mut` emits
-    // `LFALSESKIP`-first, so fall-through naturally produces the falsy
-    // boolean). NEq / opposite-comparisons carry `inverted=false` to
-    // cancel the surface-level negation.
-    let instr = match op {
-        BinaryOperator::Eq => Instruction::eq(lhs, rhs, true),
-        BinaryOperator::NEq => Instruction::eq(lhs, rhs, false),
-        BinaryOperator::Lt => Instruction::lt(lhs, rhs, true),
-        BinaryOperator::Gt => Instruction::lt(rhs, lhs, true),
-        BinaryOperator::LEq => Instruction::le(lhs, rhs, true),
-        BinaryOperator::GEq => Instruction::le(rhs, lhs, true),
-        _ => return Err(ice("compile_comparison_desc called with non-comparison op")),
+        let instr = match lit {
+            CmpLiteral::Num(imm) => cmp_imm_branch(op, lit_on_left)(src, imm, 0),
+            CmpLiteral::Str(s) => {
+                let key = KIdx(ctx.alloc_constant(Value::string(s))?);
+                let ctor = if op == BinaryOperator::Eq {
+                    Instruction::jeqs
+                } else {
+                    Instruction::jneqs
+                };
+                ctor(src, key, 0)
+            }
+        };
+        (instr, src, src)
+    } else {
+        let lhs = ctx.discharge_to_reg_mut(&mut lhs_desc, None)?;
+        let rhs = ctx.discharge_to_reg_mut(&mut rhs_desc, None)?;
+        let instr = match op {
+            BinaryOperator::Eq => Instruction::jeq(lhs, rhs, 0),
+            BinaryOperator::NEq => Instruction::jneq(lhs, rhs, 0),
+            BinaryOperator::Lt => Instruction::jlt(lhs, rhs, 0),
+            BinaryOperator::Gt => Instruction::jlt(rhs, lhs, 0),
+            BinaryOperator::LEq => Instruction::jle(lhs, rhs, 0),
+            BinaryOperator::GEq => Instruction::jle(rhs, lhs, 0),
+            _ => return Err(ice("compile_comparison_desc called with non-comparison op")),
+        };
+        (instr, lhs, rhs)
     };
+    ctx.cur_line = op_line;
+    let idx = ctx.next_offset();
     ctx.emit(instr);
-    let jmp = ctx.emit_unfilled_jmp();
-    // CMP + JMP have captured the operands; reclaim the temps so the
+    // The branch has captured the operands; reclaim the temps so the
     // enclosing jump-list discharge can use their slots.
-    ctx.free_regs(lhs, rhs);
+    if lhs == rhs {
+        ctx.free_reg(lhs);
+    } else {
+        ctx.free_regs(lhs, rhs);
+    }
 
     Ok(ExprDesc {
         // Pending head — fires on truthy of this expression. `goiftrue` /
         // `goiffalse` / discharge absorb it into a concrete list; `not`
-        // flips its CMP polarity in place.
-        kind: ExprKind::Jump(Some(jmp)),
+        // negates it in place.
+        kind: ExprKind::Jump(Some(idx)),
         true_list: JumpList::new(),
         false_list: JumpList::new(),
     })
 }
 
-fn imm_packs(n: Numeral) -> bool {
-    match n {
-        Numeral::Int(i) => Imm::from_int(i).is_some(),
-        Numeral::Float(f) => Imm::from_float(f).is_some(),
+/// A literal operand a comparison branch carries instead of a register.
+#[derive(Clone, Copy)]
+enum CmpLiteral<'gc> {
+    Num(CmpImm),
+    /// Only for `==` / `~=`.
+    Str(LuaString<'gc>),
+}
+
+fn cmp_literal<'gc>(op: BinaryOperator, e: &ExprDesc<'gc>) -> Option<CmpLiteral<'gc>> {
+    if e.has_jumps() {
+        return None;
+    }
+    match e.kind {
+        ExprKind::Numeral(Numeral::Int(i)) => CmpImm::from_int(i).map(CmpLiteral::Num),
+        ExprKind::Numeral(Numeral::Float(f)) => CmpImm::from_float(f).map(CmpLiteral::Num),
+        ExprKind::Str(s) if matches!(op, BinaryOperator::Eq | BinaryOperator::NEq) => {
+            Some(CmpLiteral::Str(s))
+        }
+        _ => None,
     }
 }
 
-/// The immediate comparison for `R op n` (or `n op R` when `imm_on_left`),
-/// with the polarity `compile_comparison_desc` wants (jump fires on truthy).
-/// `n` must pack (see `imm_packs`).
-fn cmp_imm(op: BinaryOperator, n: Numeral, imm_on_left: bool) -> Option<(CmpImmCtor, Imm)> {
+/// The immediate branch for `R op n` (or `n op R` when `imm_on_left`), firing
+/// on truthy.
+fn cmp_imm_branch(op: BinaryOperator, imm_on_left: bool) -> CmpImmCtor {
     use BinaryOperator as B;
-    let imm = match n {
-        Numeral::Int(i) => Imm::from_int(i)?,
-        Numeral::Float(f) => Imm::from_float(f)?,
-    };
-    let ctor: CmpImmCtor = match (op, imm_on_left) {
-        (B::Eq, _) => |r, k| Instruction::eqi(r, true, k),
-        (B::NEq, _) => |r, k| Instruction::eqi(r, false, k),
-        (B::Lt, false) | (B::Gt, true) => |r, k| Instruction::lti(r, true, k),
-        (B::Gt, false) | (B::Lt, true) => |r, k| Instruction::gti(r, true, k),
-        (B::LEq, false) | (B::GEq, true) => |r, k| Instruction::lei(r, true, k),
-        (B::GEq, false) | (B::LEq, true) => |r, k| Instruction::gei(r, true, k),
-        _ => return None,
-    };
-    Some((ctor, imm))
+    match (op, imm_on_left) {
+        (B::Eq, _) => Instruction::jeqi,
+        (B::NEq, _) => Instruction::jneqi,
+        (B::Lt, false) | (B::Gt, true) => Instruction::jlti,
+        (B::Gt, false) | (B::Lt, true) => Instruction::jgti,
+        (B::LEq, false) | (B::GEq, true) => Instruction::jlei,
+        (B::GEq, false) | (B::LEq, true) => Instruction::jgei,
+        _ => unreachable!("cmp_imm_branch called with non-comparison op"),
+    }
 }
 
 /// Jump-list compilation of `lhs and rhs`. When `lhs` is falsy the whole
 /// expression's value is `lhs` — `goiftrue` arranges a jump on falsy that
-/// exits the expression (and, for Reg operands, the TESTSET it emits
+/// exits the expression (and, for Reg operands, the JFSET it emits
 /// preserves `lhs`'s value on that edge). When `lhs` is truthy, control
 /// falls through to the RHS evaluation and the result is `rhs`.
 ///
@@ -3972,15 +3925,15 @@ fn compile_logical_and_desc<'gc>(
     let rhs_expr = item.rhs().ok_or_else(|| ice("and without rhs"))?;
 
     // Thread the destination hint to both operands so the short-circuit
-    // TESTSET can end up as a `TESTSET dst dst` (self-assign, downgraded
-    // to TEST by `patch_list_aux`) — saving the intermediate register
+    // JFSET can end up as a `JFSET dst dst` (self-assign, downgraded to JF
+    // by `patch_list_aux`) — saving the intermediate register
     // and MOVE that a fresh-register allocation would otherwise need.
     let mut lhs = compile_expr(ctx, lhs_expr, dst)?;
     ctx.goiftrue(&mut lhs)?;
 
-    // LHS truthy path: evaluate RHS here. Any TESTSETs in lhs.true_list
+    // LHS truthy path: evaluate RHS here. Any JTSETs in lhs.true_list
     // represent paths whose values are discarded (RHS's value wins), so
-    // `patch_to_here` downgrades them to plain TESTs.
+    // `patch_to_here` downgrades them to plain JTs.
     let lhs_true = mem::take(&mut lhs.true_list);
     ctx.patch_to_here(lhs_true);
 
@@ -3991,7 +3944,7 @@ fn compile_logical_and_desc<'gc>(
 }
 
 /// Jump-list compilation of `lhs or rhs`. Symmetric to `and`: truthy `lhs`
-/// short-circuits with `lhs`'s value (via `goiffalse`'s TESTSET), falsy
+/// short-circuits with `lhs`'s value (via `goiffalse`'s JTSET), falsy
 /// `lhs` falls through to RHS evaluation.
 fn compile_logical_or_desc<'gc>(
     ctx: &mut Ctx<'gc, '_>,
@@ -4537,7 +4490,7 @@ fn compile_while(ctx: &mut Ctx, item: While) -> Result<(), CompileError> {
             .ok_or_else(|| ice("missing break label"))?;
         // Jumps in `break_list` are branch-context: their targets get
         // resolved by the label-based `jump_patches` system at assemble
-        // time, which only touches JMP offsets. Downgrade any TESTSETs
+        // time, which only touches offsets. Downgrade any JTSET/JFSETs
         // now (while we still have the list) so no `NO_REG` placeholder
         // makes it into the final chunk.
         ctx.downgrade_testsets(&break_list);
