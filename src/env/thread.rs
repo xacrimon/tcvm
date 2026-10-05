@@ -252,6 +252,8 @@ pub struct ThreadState<'gc> {
     /// Executor frames, innermost last, each placed among `frames` by its
     /// `depth`. Kept apart so the interpreter's frames are plain records.
     pub(crate) exec_frames: Vec<ExecFrame<'gc>, MetricsAlloc<'gc>>,
+    /// Upvalues still pointing into `stack`, sorted by slot, so a `CLOSE` or
+    /// return closes a tail of the list.
     pub(crate) open_upvalues: Vec<Upvalue<'gc>>,
     /// Open to-be-closed variables by stack position, innermost last
     /// (`L->tbclist`). Each leaves the list just before its `__close` runs.
