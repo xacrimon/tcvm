@@ -638,6 +638,20 @@ impl<'gc> ThreadState<'gc> {
         }
     }
 
+    /// `push_lua` with room already made, for a frame of any kind.
+    ///
+    /// # Safety
+    /// `frames.len() < frames.capacity()`.
+    #[inline(always)]
+    pub(crate) unsafe fn push_unchecked(&mut self, lf: LuaFrame<'gc>) {
+        debug_assert!(self.frames.len() < self.frames.capacity());
+        let len = self.frames.len();
+        unsafe {
+            self.frames.as_mut_ptr().add(len).write(lf);
+            self.frames.set_len(len + 1);
+        }
+    }
+
     #[inline(always)]
     pub(crate) fn frames_full(&self) -> bool {
         self.frames.len() == self.frames.capacity()
@@ -817,6 +831,19 @@ impl<'gc> Thread<'gc> {
     #[inline]
     pub(crate) unsafe fn state_mut(self, mc: &Mutation<'gc>) -> &'gc mut ThreadState<'gc> {
         unsafe { &mut *self.0.unlock(mc).as_ptr() }
+    }
+
+    /// [`Thread::state_mut`] when its barrier would do nothing, else `None`:
+    /// for fast paths that would rather bail out than call the collector.
+    ///
+    /// # Safety
+    /// As [`Thread::state_mut`].
+    #[inline]
+    pub(crate) unsafe fn state_mut_if_clean(
+        self,
+        mc: &Mutation<'gc>,
+    ) -> Option<&'gc mut ThreadState<'gc>> {
+        Gc::write_if_clean(mc, self.0).map(|w| unsafe { &mut *w.unlock().as_ptr() })
     }
 
     pub fn status(self) -> ThreadStatus {
