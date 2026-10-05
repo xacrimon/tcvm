@@ -11,11 +11,10 @@ expression: output
 0000  [  1]  VARARGPREP      fixed=0
 0001  [  1]  CLOSURE         R0 P0
 0002  [  2]  LOAD            R1 K0  ; true
-0003  [  3]  TESTSET         R2 R1 inv=true
-0004  [  3]  JMP             +2
-0005  [  3]  MOVE            R2 R0
-0006  [  3]  CALL_R1         R2 args=1
-0007  [  4]  RETURN          R2 count=2
+0003  [  3]  JFSET           R2 R1 +2
+0004  [  3]  MOVE            R2 R0
+0005  [  3]  CALL_R1         R2 args=1
+0006  [  4]  RETURN          R2 count=2
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=1, upvalues=0)

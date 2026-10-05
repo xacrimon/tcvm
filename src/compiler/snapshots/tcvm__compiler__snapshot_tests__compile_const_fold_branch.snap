@@ -20,12 +20,11 @@ expression: output
 0001  [  5]  LOAD            R0 K1  ; 1
 0002  [  5]  SETTABUP        R0 U0 K0  ; "a"
 0003  [  8]  LOAD            R0 K2  ; false
-0004  [  8]  TEST            R0 inv=false
-0005  [  8]  JMP             +2
-0006  [  9]  LOAD            R0 K4  ; 2
-0007  [  9]  SETTABUP        R0 U0 K3  ; "b"
-0008  [ 13]  LOAD            R0 K6  ; 5
-0009  [ 13]  SETTABUP        R0 U0 K5  ; "c"
-0010  [ 14]  LOAD            R0 K8  ; 7
-0011  [ 14]  SETTABUP        R0 U0 K7  ; "d"
-0012  [ 14]  RETURN          R0 count=1
+0004  [  8]  JF              R0 +2
+0005  [  9]  LOAD            R0 K4  ; 2
+0006  [  9]  SETTABUP        R0 U0 K3  ; "b"
+0007  [ 13]  LOAD            R0 K6  ; 5
+0008  [ 13]  SETTABUP        R0 U0 K5  ; "c"
+0009  [ 14]  LOAD            R0 K8  ; 7
+0010  [ 14]  SETTABUP        R0 U0 K7  ; "d"
+0011  [ 14]  RETURN          R0 count=1
