@@ -241,7 +241,11 @@ impl<'gc> Executor<'gc> {
 
             match kind {
                 FrameKind::Lua => {
-                    if let vm::interp::Exit::Gc = vm::interp::run_thread(ctx, top) {
+                    let (exit, current) = vm::interp::run_thread(ctx, top);
+                    if !current.ptr_eq(top) {
+                        follow_switches(self, ctx, current);
+                    }
+                    if let vm::interp::Exit::Gc = exit {
                         ctx.mutation().metrics().defer_gc_check();
                         return Ok(StepResult::Pending);
                     }
@@ -479,10 +483,18 @@ fn apply_pending_action<'gc>(
     Ok(())
 }
 
-/// `LUAI_MAXCCALLS`: threads resumed inside one another. Lua counts every C
-/// call toward it; here only nested resumes need a cap, since each one is a
-/// new thread with a stack limit of its own.
-const MAX_RESUME_DEPTH: usize = 200;
+/// Rebuild the thread stack after dispatch switched coroutines and ended on
+/// `current`: the chain of resumers below it.
+fn follow_switches<'gc>(exec: Executor<'gc>, ctx: Context<'gc>, current: Thread<'gc>) {
+    let mut chain = vec![current];
+    let mut t = current;
+    while let Some(r) = t.borrow().resumer {
+        chain.push(r);
+        t = r;
+    }
+    chain.reverse();
+    exec.0.borrow_mut(ctx.mutation()).thread_stack = chain;
+}
 
 /// Hand off control from `resumer` to `target`.
 ///
@@ -507,7 +519,7 @@ fn schedule_thread_resume<'gc>(
     let mc = ctx.mutation();
     // Raised on the resumer, leaving the target untouched (`lua_resume`'s
     // `resume_error`), so the follow-up sequence sees it as the resume's error.
-    if exec.0.borrow().thread_stack.len() >= MAX_RESUME_DEPTH {
+    if exec.0.borrow().thread_stack.len() >= vm::interp::MAX_RESUME_DEPTH as usize {
         let msg = Value::string(LuaString::new(ctx, b"C stack overflow"));
         resumer.borrow_mut(mc).raise(ctx, Error::new(ctx, msg));
         return Ok(());
@@ -521,8 +533,11 @@ fn schedule_thread_resume<'gc>(
         let mut rs = resumer.borrow_mut(mc);
         rs.take_window(args_abs_bottom)
     };
+    let depth = resumer.borrow().resume_depth + 1;
     {
         let mut ts = target.borrow_mut(mc);
+        ts.resumer = Some(resumer);
+        ts.resume_depth = depth;
         if matches!(ts.status, ThreadStatus::Suspended)
             && matches!(ts.top_exec(), Some(ExecKind::Start(_)))
         {
@@ -640,7 +655,8 @@ fn schedule_call_at<'gc>(
                     base: args_base,
                     ret,
                 };
-                match vm::interp::run_natives(ctx, ts, state) {
+                let mut tsr = &mut *ts;
+                match vm::interp::run_natives(ctx, &mut tsr, false, state) {
                     vm::interp::NativeStep::Return {
                         ret,
                         func_slot,
@@ -840,11 +856,22 @@ fn propagate_inner_to_resumer<'gc>(
     if !inner_yielded {
         inner.borrow_mut(mc).discard_above(0);
     }
+    inner.borrow_mut(mc).resumer = None;
     let resumer = *exec.0.borrow().thread_stack.last().unwrap();
     let mut rs = resumer.borrow_mut(mc);
     let wt = match rs.pop_exec() {
         Some(ExecKind::WaitThread { call_site }) => call_site,
-        _ => unreachable!("propagate_inner_to_resumer: resumer top is not WaitThread"),
+        // Resumed in dispatch: the resumer's native frame takes the values
+        // through its continuation.
+        Some(_) => unreachable!("propagate_inner_to_resumer: resumer top is not waiting"),
+        None => {
+            let bottom = rs.live_top() + 1;
+            CallSite {
+                bottom,
+                func_idx: bottom - 1,
+                ret: vm::interp::ret_native,
+            }
+        }
     };
     rs.set_window(wt.bottom, values);
     land_call_results(&mut rs, wt);
@@ -1206,14 +1233,10 @@ fn unwind_error<'gc>(
             ts.status = ThreadStatus::Stopped;
             ts.death_error = Some(err.value());
         }
+        top.borrow_mut(mc).resumer = None;
         exec.0.borrow_mut(mc).thread_stack.pop();
         let resumer = *exec.0.borrow().thread_stack.last().unwrap();
         let mut rs = resumer.borrow_mut(mc);
-        // Pop the WaitThread.
-        match rs.pop_exec() {
-            Some(ExecKind::WaitThread { .. }) => {}
-            _ => unreachable!("inner-thread error: resumer top isn't WaitThread"),
-        }
         // Already located on the inner thread; don't re-raise on the resumer.
         // An exit ends only the coroutine that closed itself.
         let err = if exit {
@@ -1221,8 +1244,21 @@ fn unwind_error<'gc>(
         } else {
             err
         };
-        rs.push_exec(ExecKind::Error(err));
         rs.status = ThreadStatus::Normal;
+        match rs.top_exec() {
+            Some(ExecKind::WaitThread { .. }) => {
+                rs.pop_exec();
+                rs.push_exec(ExecKind::Error(err));
+            }
+            Some(_) => unreachable!("inner-thread error: resumer top isn't waiting"),
+            // Resumed in dispatch: the resumer's native frame catches it.
+            None => {
+                let nf = rs.top_lua().expect("resumer without a frame");
+                let slot = nf.base() + nf.num_extras as usize;
+                rs.set_top_unchecked(slot);
+                rs.native_error = Some(err);
+            }
+        }
         return Ok(());
     }
 

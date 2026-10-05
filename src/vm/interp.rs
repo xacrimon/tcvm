@@ -147,6 +147,8 @@ pub(crate) struct DispatchState<'gc> {
     native: *const NativeClosure<'gc>,
     /// The continuation `meta_call` gives the call it makes.
     ret: Handler,
+    /// The thread dispatch switched to last, if it did.
+    current: Option<Thread<'gc>>,
 }
 
 /// The thread's top frame, which must be a Lua frame, and its closure. Both
@@ -202,10 +204,12 @@ macro_rules! ret_args {
 }
 
 macro_rules! helpers {
-    ($instruction:expr, $ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr, $ds:ident, $frame:ident, $closure:ident) => {
+    ($instruction:expr, $ctx:expr, $thread:ident, $registers:ident, $ip:ident, $handlers:expr, $ds:ident, $frame:ident, $closure:ident) => {
         // The running frame and its closure travel in registers with the
         // other handler arguments; rebinding them (calls, returns) reassigns
-        // these locals.
+        // these locals, and switching coroutines the thread.
+        #[allow(unused_mut)]
+        let mut $thread: &mut ThreadState<'gc> = $thread;
         #[allow(unused_mut)]
         let mut $frame: *mut LuaFrame<'gc> = $frame;
         #[allow(unused_mut)]
@@ -379,6 +383,19 @@ macro_rules! helpers {
                         core::arch::asm!("/* {0} */", inout(reg) $ip, options(nomem, nostack, preserves_flags));
                     }
                 }
+            }};
+        }
+
+        /// [`run_natives`] from a handler, which may switch coroutines.
+        #[allow(unused_macros)]
+        macro_rules! run_natives {
+            ($$state:expr $$(,)?) => {{
+                let __before: *const ThreadState<'gc> = &*$thread;
+                let __step = run_natives($ctx, &mut $thread, true, $$state);
+                if !std::ptr::eq(__before, &*$thread) {
+                    $ds.current = Some($thread.handle());
+                }
+                __step
             }};
         }
 
@@ -916,46 +933,67 @@ fn set_own_fill_ic<'gc>(
 /// sized `stack` to at least `base + max_stack_size`, and placed
 /// the callee + arguments at `stack[base-1..]`. See `Executor::start`.
 #[inline(never)]
-pub(crate) fn run_thread<'gc>(ctx: Context<'gc>, thread: Thread<'gc>) -> Exit {
-    let mut ts = thread.borrow_mut(ctx.mutation());
+pub(crate) fn run_thread<'gc>(ctx: Context<'gc>, thread: Thread<'gc>) -> (Exit, Thread<'gc>) {
+    // SAFETY: the executor runs one thread at a time and holds no borrow of
+    // it; dispatch may switch to coroutines it resumes the same way.
+    let ts = unsafe { thread.state_mut(ctx.mutation()) };
     let mut ds = DispatchState {
         fault: None,
         native: std::ptr::null(),
         ret: ret_exit,
+        current: None,
     };
-    ts.top_lua()
-        .expect("run_thread requires a seeded Lua frame");
-    let (frame, closure) = top_frame(&mut ts);
+    let exit = enter(ctx, ts, &mut ds);
+    (exit, ds.current.unwrap_or(thread))
+}
+
+/// Start dispatch on `ts`: run what the executor delivered, or the top
+/// frame from its `pc`.
+fn enter<'gc>(ctx: Context<'gc>, ts: &mut ThreadState<'gc>, ds: &mut DispatchState<'gc>) -> Exit {
     let handlers = HANDLERS.as_ptr() as *const ();
-    if let Some(err) = ts.native_error.take() {
-        return native_entry(ctx, &mut ts, handlers, &mut ds, closure, err);
-    }
     if let Some(p) = ts.pending_ret.take() {
+        // The call site's frame, if it has one: a coroutine's body has none.
+        let frame = ts
+            .frames
+            .as_mut_ptr()
+            .wrapping_add(ts.frames.len())
+            .wrapping_sub(1);
+        let closure = match ts.frames.last() {
+            Some(f) => f.closure,
+            // Never dereferenced: no continuation reads the closure.
+            None => unsafe { LuaFn::native_frame(ctx.next_fn()) },
+        };
         let nret = ts.top - p.values;
         let stack = ts.stack.as_mut_ptr();
         let (values, func_slot) = unsafe { (stack.add(p.values), stack.add(p.func_slot)) };
         return (p.ret)(
             Instruction::from_raw(nret as u64),
             ctx,
-            &mut ts,
+            ts,
             values,
             func_slot as *const Instruction,
             handlers,
-            &mut ds,
+            ds,
             frame,
             closure,
         );
+    }
+    ts.top_lua()
+        .expect("run_thread requires a seeded Lua frame");
+    let (frame, closure) = top_frame(ts);
+    if let Some(err) = ts.native_error.take() {
+        return native_entry(ctx, ts, handlers, ds, closure, err);
     }
     let (ip, base) = unsafe { ((*frame).pc, (*frame).base()) };
     let registers = unsafe { ts.stack.as_mut_ptr().add(base) };
     op_nop(
         Instruction::nop(),
         ctx,
-        &mut ts,
+        ts,
         registers,
         ip,
         handlers,
-        &mut ds,
+        ds,
         frame,
         closure,
     )
@@ -2447,16 +2485,13 @@ macro_rules! call_native {
                     {
                         push_native_frame($thread, f, args_base, at, protect, cont, ret_call);
                         let new_base = args_base + at as usize + 1;
-                        enter_from_native($thread, callee, new_base);
+                        enter_from_native($thread, callee, new_base, ret_native);
                         ($frame, $closure) = (unsafe { $thread.top_lua_ptr() }, callee);
                         $ip = callee.code;
                         $registers = unsafe { $thread.stack.as_mut_ptr().add(new_base) };
                         dispatch!();
                     }
-                    let step = run_natives(
-                        $ctx,
-                        $thread,
-                        NativeState::Acted {
+                    let step = run_natives!(NativeState::Acted {
                             r: Ok(action),
                             framed: false,
                             f,
@@ -3070,18 +3105,15 @@ extern "rust-preserve-none" fn op_tailcall_native<'gc>(
                 let f = unsafe { &*frame };
                 (f.base() - 1 - f.num_extras as usize, f.ret)
             };
-            let f = reg!(func).get_function();
-            let f = unsafe { f.unwrap_unchecked() };
+            // Not through `registers`: the native may have grown the stack.
+            let f = unsafe { thread.stack[func_idx].get_function().unwrap_unchecked() };
             close_upvalues(ctx.mutation(), thread, base);
             debug_assert!(!has_tbc_from(thread, base));
             thread.pop_lua();
             let top = thread.top;
             thread.stack.copy_within(args_base..top, orig_func + 1);
             thread.set_top_unchecked(orig_func + 1 + (top - args_base));
-            let step = run_natives(
-                ctx,
-                thread,
-                NativeState::Acted {
+            let step = run_natives!(NativeState::Acted {
                     r: Ok(action),
                     framed: false,
                     f,
@@ -4591,10 +4623,7 @@ extern "rust-preserve-none" fn meta_call<'gc>(
                     );
                 }
                 r => {
-                    let step = run_natives(
-                        ctx,
-                        thread,
-                        NativeState::Acted {
+                    let step = run_natives!(NativeState::Acted {
                             r,
                             framed: false,
                             f,
@@ -4897,6 +4926,9 @@ pub(crate) enum NativeState<'gc> {
     Resume(Result<(), crate::env::Error<'gc>>),
     /// Make the call the top (native) frame waits for.
     Call,
+    /// Call `stack[slot]` with the values above it, its results going to
+    /// `ret`, with no native frame waiting: a coroutine's body.
+    Start { slot: usize, ret: Handler },
 }
 
 /// What [`run_natives`] left to do.
@@ -4914,15 +4946,21 @@ pub(crate) enum NativeStep {
     Exit,
 }
 
+/// `LUAI_MAXCCALLS`: threads resumed inside one another.
+pub(crate) const MAX_RESUME_DEPTH: u16 = 200;
+
 /// Drive natives that call: push a native's frame, make its call, and run
 /// its continuation on the results, for as long as no Lua code has to run
-/// and the native doesn't return.
+/// and the native doesn't return. With `switch`, a resume or yield switches
+/// `thread` to the other coroutine here; the executor (which can't follow)
+/// gets them as suspensions otherwise.
 pub(crate) fn run_natives<'gc>(
     ctx: Context<'gc>,
-    thread: &mut ThreadState<'gc>,
+    thread: &mut &mut ThreadState<'gc>,
+    switch: bool,
     mut state: NativeState<'gc>,
 ) -> NativeStep {
-    use crate::vm::sequence::{CallbackAction, NativeCont};
+    use crate::vm::sequence::{CallbackAction, NativeCont, Protect, Suspend};
     loop {
         state = match state {
             NativeState::Resume(status) => {
@@ -4969,6 +5007,69 @@ pub(crate) fn run_natives<'gc>(
                     push_native_frame(thread, f, base, at, protect, cont, ret);
                     NativeState::Call
                 }
+                Ok(CallbackAction::Resume { at, cont }) => {
+                    // The resumer waits in a frame of its own, protected so
+                    // the error that kills the coroutine comes back to `cont`.
+                    if framed {
+                        thread.pop_lua();
+                    }
+                    push_native_frame(thread, f, base, at, Protect::Errors, cont, ret);
+                    let slot = base + at as usize;
+                    let co = thread.stack[slot].get_thread().expect("resume of a non-thread");
+                    if thread.resume_depth + 1 >= MAX_RESUME_DEPTH {
+                        // On the resumer, leaving the coroutine untouched
+                        // (`lua_resume`'s `resume_error`).
+                        let msg = LuaString::new(ctx, b"C stack overflow");
+                        thread.raise(ctx, crate::env::Error::new(ctx, Value::string(msg)));
+                        return NativeStep::Exit;
+                    }
+                    if !switch {
+                        thread.pending_action = Some(PendingAction {
+                            action: Box::new(Suspend::Resume {
+                                thread: co,
+                                then: None,
+                            }),
+                            call_site: CallSite {
+                                bottom: slot + 1,
+                                func_idx: slot,
+                                ret: ret_native,
+                            },
+                        });
+                        return NativeStep::Exit;
+                    }
+                    match resume_into(ctx, thread, co, slot + 1) {
+                        Some(site) => {
+                            return NativeStep::Return {
+                                ret: site.ret,
+                                func_slot: site.func_idx,
+                                values: site.bottom,
+                            };
+                        }
+                        None => NativeState::Start {
+                            slot: 0,
+                            ret: ret_coroutine_end,
+                        },
+                    }
+                }
+                Ok(CallbackAction::Yield) => {
+                    if framed {
+                        ret = thread.frames.pop().map(|f| f.ret).unwrap_or(ret);
+                    }
+                    let site = CallSite {
+                        bottom: base,
+                        func_idx: base - 1,
+                        ret,
+                    };
+                    if switch && yield_to_resumer(ctx, thread, site) {
+                        NativeState::Resume(Ok(()))
+                    } else {
+                        thread.pending_action = Some(PendingAction {
+                            action: Box::new(Suspend::Yield { then: None }),
+                            call_site: site,
+                        });
+                        return NativeStep::Exit;
+                    }
+                }
                 Ok(CallbackAction::Suspend(action)) => {
                     if framed {
                         ret = thread.frames.pop().map(|f| f.ret).unwrap_or(ret);
@@ -4996,6 +5097,12 @@ pub(crate) fn run_natives<'gc>(
             NativeState::Call => {
                 let frame = unsafe { thread.frames.last().unwrap_unchecked() };
                 let slot = frame.base() + frame.num_extras as usize;
+                NativeState::Start {
+                    slot,
+                    ret: ret_native,
+                }
+            }
+            NativeState::Start { slot, ret } => {
                 let new_base = slot + 1;
                 let nargs = thread.top - new_base;
                 let fv = thread.stack[slot];
@@ -5007,23 +5114,30 @@ pub(crate) fn run_natives<'gc>(
                             thread.raise(ctx, err);
                             return NativeStep::Exit;
                         }
-                        enter_from_native(thread, callee, new_base);
+                        enter_from_native(thread, callee, new_base, ret);
                         return NativeStep::EnterLua;
                     }
                     Some((f, FunctionKind::Native(nc))) => {
                         match invoke_native(ctx, thread, nc, new_base, nargs) {
-                            Ok(CallbackAction::Return) => {
+                            Ok(CallbackAction::Return) if std::ptr::fn_addr_eq(ret, ret_native as Handler) => {
                                 let nret = thread.top - new_base;
                                 thread.stack.copy_within(new_base..new_base + nret, slot);
                                 thread.set_top_unchecked(slot + nret);
                                 NativeState::Resume(Ok(()))
+                            }
+                            Ok(CallbackAction::Return) => {
+                                return NativeStep::Return {
+                                    ret,
+                                    func_slot: slot,
+                                    values: new_base,
+                                };
                             }
                             r => NativeState::Acted {
                                 r,
                                 framed: false,
                                 f,
                                 base: new_base,
-                                ret: ret_native,
+                                ret,
                             },
                         }
                     }
@@ -5038,12 +5152,131 @@ pub(crate) fn run_natives<'gc>(
                                 return NativeStep::Exit;
                             }
                         }
-                        NativeState::Call
+                        NativeState::Start { slot, ret }
                     }
                 }
             }
         }
     }
+}
+
+/// Whether the top frame of `ts` is a native's waiting for a coroutine it
+/// resumed in dispatch, as opposed to the executor's `WaitThread`.
+fn waits_in_dispatch(ts: &ThreadState<'_>) -> bool {
+    ts.top_lua().is_some_and(|f| f.is_native())
+}
+
+/// Switch `thread` to the suspended coroutine `co`, resumed with
+/// `thread.stack[args..top]`. Returns the call site its last yield left
+/// for the values, or `None` on a first resume, its body then at slot 0.
+fn resume_into<'gc>(
+    ctx: Context<'gc>,
+    thread: &mut &mut ThreadState<'gc>,
+    co: Thread<'gc>,
+    args: usize,
+) -> Option<CallSite> {
+    let n = thread.top - args;
+    // SAFETY: `co` is suspended, so nothing else uses its state.
+    let cs = unsafe { co.state_mut(ctx.mutation()) };
+    let site = if let Some(ExecKind::Start(_)) = cs.top_exec() {
+        let Some(ExecKind::Start(f)) = cs.pop_exec() else {
+            unreachable!()
+        };
+        cs.discard_above(0);
+        cs.ensure_slots(1 + n);
+        cs.stack[0] = f;
+        cs.stack[1..1 + n].copy_from_slice(&thread.stack[args..args + n]);
+        cs.top = 1 + n;
+        None
+    } else {
+        let y = cs.yield_bottom.take().expect("resumed a coroutine that didn't yield");
+        cs.ensure_slots(y.bottom + n);
+        cs.stack[y.bottom..y.bottom + n].copy_from_slice(&thread.stack[args..args + n]);
+        cs.top = y.bottom + n;
+        Some(y)
+    };
+    thread.set_top_unchecked(args - 1);
+    thread.status = ThreadStatus::Normal;
+    cs.status = ThreadStatus::Normal;
+    cs.resumer = Some(thread.handle());
+    cs.resume_depth = thread.resume_depth + 1;
+    *thread = cs;
+    site
+}
+
+/// Hand the values a coroutine yields, `thread.stack[site.bottom..top]`, to
+/// a resumer waiting in dispatch and switch `thread` to it; `false` (having
+/// done nothing) when the executor must take the yield instead.
+fn yield_to_resumer<'gc>(
+    ctx: Context<'gc>,
+    thread: &mut &mut ThreadState<'gc>,
+    site: CallSite,
+) -> bool {
+    if thread.main || thread.no_yield {
+        return false;
+    }
+    let Some(r) = thread.resumer else {
+        return false;
+    };
+    // SAFETY: the resumer waits, so nothing else uses its state.
+    let rs = unsafe { r.state_mut(ctx.mutation()) };
+    if !waits_in_dispatch(rs) {
+        return false;
+    }
+    hand_back(thread, rs, site.bottom);
+    thread.yield_bottom = Some(site);
+    thread.status = ThreadStatus::Suspended;
+    thread.set_top_unchecked(site.bottom);
+    *thread = rs;
+    true
+}
+
+/// Move `from.stack[values..top]` into the slot of the native frame waiting
+/// on top of `to`, and make `to` the running thread.
+fn hand_back<'gc>(from: &mut ThreadState<'gc>, to: &mut ThreadState<'gc>, values: usize) {
+    let n = from.top - values;
+    let nf = unsafe { to.frames.last().unwrap_unchecked() };
+    let slot = nf.base() + nf.num_extras as usize;
+    to.ensure_slots(slot + n);
+    to.stack[slot..slot + n].copy_from_slice(&from.stack[values..values + n]);
+    to.set_top_unchecked(slot + n);
+    to.status = ThreadStatus::Normal;
+    from.resumer = None;
+}
+
+/// Continuation of a coroutine's body: the coroutine is dead, and its
+/// results go to the resumer, in dispatch when it waits there.
+#[inline(never)]
+#[rustc_align(32)]
+pub(crate) extern "rust-preserve-none" fn ret_coroutine_end<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    let (nret, values, _) = ret_args!(instruction, registers, ip);
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let resumer = thread
+        .resumer
+        .map(|r| unsafe { r.state_mut(ctx.mutation()) })
+        .filter(|rs| waits_in_dispatch(rs));
+    let Some(rs) = resumer else {
+        tail!(ret_exit);
+    };
+    let values = unsafe { values.offset_from_unsigned(thread.stack.as_ptr()) };
+    thread.set_top_unchecked(values + nret);
+    hand_back(thread, rs, values);
+    thread.discard_above(0);
+    thread.status = ThreadStatus::Result { bottom: 0 };
+    thread = rs;
+    ds.current = Some(thread.handle());
+    let step = run_natives!(NativeState::Resume(Ok(())));
+    native_step!(step);
 }
 
 /// Continuation of a call a native frame made: its results go to the
@@ -5098,10 +5331,7 @@ pub(crate) extern "rust-preserve-none" fn ret_native<'gc>(
         Ok(_) if thread.native_overflowed() => Err(native_overflow(ctx)),
         r => r,
     };
-    let step = run_natives(
-        ctx,
-        thread,
-        NativeState::Acted {
+    let step = run_natives!(NativeState::Acted {
             r,
             framed: true,
             f,
@@ -5157,7 +5387,12 @@ fn push_native_frame<'gc>(
 /// Push the frame of a native's call of Lua `callee`, its arguments at
 /// `new_base` up to `top` and its window known to fit.
 #[inline(always)]
-fn enter_from_native<'gc>(thread: &mut ThreadState<'gc>, callee: LuaFn<'gc>, new_base: usize) {
+fn enter_from_native<'gc>(
+    thread: &mut ThreadState<'gc>,
+    callee: LuaFn<'gc>,
+    new_base: usize,
+    ret: Handler,
+) {
     let nargs = thread.top - new_base;
     let num_params = callee.num_params as usize;
     let stack = thread.stack.as_mut_ptr();
@@ -5175,7 +5410,7 @@ fn enter_from_native<'gc>(thread: &mut ThreadState<'gc>, callee: LuaFn<'gc>, new
     thread.push_lua(LuaFrame {
         closure: callee,
         pc: callee.code,
-        ret: ret_native,
+        ret,
         base: new_base as u32,
         num_extras,
         flags: 0,
@@ -5188,13 +5423,18 @@ fn enter_from_native<'gc>(thread: &mut ThreadState<'gc>, callee: LuaFn<'gc>, new
 #[inline(never)]
 fn native_entry<'gc>(
     ctx: Context<'gc>,
-    thread: &mut ThreadState<'gc>,
+    mut thread: &mut ThreadState<'gc>,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
     closure: LuaFn<'gc>,
     err: crate::env::Error<'gc>,
 ) -> Exit {
-    match run_natives(ctx, thread, NativeState::Resume(Err(err))) {
+    let before: *const ThreadState<'gc> = &*thread;
+    let step = run_natives(ctx, &mut thread, true, NativeState::Resume(Err(err)));
+    if !std::ptr::eq(before, &*thread) {
+        ds.current = Some(thread.handle());
+    }
+    match step {
         NativeStep::EnterLua => {
             let (frame, closure) = top_frame(thread);
             let (ip, base) = unsafe { ((*frame).pc, (*frame).base()) };

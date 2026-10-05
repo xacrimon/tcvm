@@ -70,6 +70,18 @@ pub enum CallbackAction<'gc> {
         #[collect(require_static)]
         cont: NativeCont,
     },
+    /// Resume the coroutine at `stack[at]` with the values above it, then run
+    /// `cont` with what it yields or returns in their place, or with the
+    /// error that killed it. Switches threads without leaving the
+    /// interpreter.
+    Resume {
+        at: u32,
+        #[collect(require_static)]
+        cont: NativeCont,
+    },
+    /// Yield the window to the resumer; the values it resumes with are the
+    /// native's results.
+    Yield,
     /// Hand control to the executor; see [`Suspend`].
     Suspend(Box<Suspend<'gc>>),
 }
