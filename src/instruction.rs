@@ -729,9 +729,13 @@ instructions! {
     0x28 RETURN     ret         Ab    { values: Reg, count: u8 }
     0x29 FORLOOP    forloop     AImm  { base: Reg, offset: i32 }
     0x2a FORPREP    forprep     AImm  { base: Reg, offset: i32 }
+
+    /// Generic `for`, over [`TFOR_VARS`] hidden slots at `base` (iterator,
+    /// state, closing value, traversal position) and then its variables.
     0x2b TFORPREP   tforprep    AImm  { base: Reg, offset: i32 }
     0x2c TFORCALL   tforcall    Ab    { base: Reg, count: u8 }
     0x2d TFORLOOP   tforloop    AImm  { base: Reg, offset: i32 }
+
     0x2e SETLIST    setlist     Abd   { table: Reg, count: u8, offset: u16 }
     0x2f CLOSURE    closure     Ad    { dst: Reg, proto: ProtoIdx }
     0x30 VARARG     vararg      Ab    { dst: Reg, count: u8 }
@@ -790,6 +794,12 @@ instructions! {
     0x4e RETURN0    ret0        Nil   { }
     0x4f RETURN1    ret1        A     { value: Reg }
 }
+
+/// Offset of a generic `for`'s first variable from its base. Past Lua 5.5's
+/// three hidden slots is a fourth, where `TFORCALL` keeps its place in a
+/// table it walks without calling `next`, as LuaJIT keeps it in its control
+/// slot.
+pub const TFOR_VARS: u8 = 4;
 
 /// Describes how to capture an upvalue when creating a closure.
 #[derive(Debug, Clone, Copy)]

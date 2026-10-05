@@ -46,13 +46,13 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         set(name, Function::new_native(ctx.mutation(), handler, &[]));
     }
     // `pairs` hands back the same `next` the global holds, so `pairs(t) == next`.
-    let next = Function::new_native(ctx.mutation(), lua_next, &[]);
+    let next = ctx.next_fn();
     set("next", next);
     set(
         "pairs",
         Function::new_native(ctx.mutation(), lua_pairs, &[Value::function(next)]),
     );
-    let ipairs_iter = Function::new_native(ctx.mutation(), ipairs_aux, &[]);
+    let ipairs_iter = ctx.ipairs_iter();
     set(
         "ipairs",
         Function::new_native(ctx.mutation(), lua_ipairs, &[Value::function(ipairs_iter)]),
@@ -182,7 +182,7 @@ fn lua_ipairs<'gc>(
 
 /// Iterator body for `ipairs`: `(t, i) -> (i + 1, t[i + 1])`, or a lone `nil`
 /// once that is nil. Indexing goes through `__index`.
-fn ipairs_aux<'gc>(
+pub(crate) fn ipairs_aux<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
@@ -371,7 +371,7 @@ fn lua_loadfile<'gc>(
 
 /// `next(t [, k])` — `(k', t[k'])` for the entry after `k` in traversal
 /// order, or a lone `nil` at the end.
-fn lua_next<'gc>(
+pub(crate) fn lua_next<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,

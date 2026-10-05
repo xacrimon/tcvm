@@ -10,7 +10,8 @@ use crate::dmm::{Gc, Mutation};
 use crate::env::function::{LocVar, Template};
 use crate::env::{LuaString, Prototype, value::Value};
 use crate::instruction::{
-    IcIdx, Imm, Instruction, KIdx, Op, ProtoIdx, Reg, Shape, TemplateIdx, UpIdx, UpValueDescriptor,
+    IcIdx, Imm, Instruction, KIdx, Op, ProtoIdx, Reg, Shape, TFOR_VARS, TemplateIdx, UpIdx,
+    UpValueDescriptor,
 };
 use crate::lua;
 use crate::parser::LineMap;
@@ -347,6 +348,7 @@ struct VisibleLabel {
 struct ScopeMark {
     freereg: u8,
     nactvar: u8,
+    nposition: u8,
     ndecls: usize,
     /// A local of this scope was captured as an upvalue, so leaving the
     /// scope must CLOSE it (a loop back-edge would otherwise hand every
@@ -607,7 +609,8 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         assert!(self.chunk.nactvar as usize + n as usize <= self.chunk.freereg as usize);
         // Lua's `MAXVARS`: below the register limit, so temporaries always
         // have room and running out is reported at the declaration.
-        if self.chunk.nactvar as usize + n as usize > MAX_LOCALS {
+        let locals = (self.chunk.nactvar - self.chunk.nposition) as usize;
+        if locals + n as usize > MAX_LOCALS {
             return Err(self.limit_err("local variables", MAX_LOCALS));
         }
         self.chunk.nactvar += n;
@@ -1209,6 +1212,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         self.scope_marks.push(ScopeMark {
             freereg: self.chunk.freereg,
             nactvar: self.chunk.nactvar,
+            nposition: self.chunk.nposition,
             ndecls: self.decls.len(),
             captured: false,
         });
@@ -1229,6 +1233,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             .ok_or_else(|| ice("missing scope register base"))?;
         self.chunk.freereg = mark.freereg;
         self.chunk.nactvar = mark.nactvar;
+        self.chunk.nposition = mark.nposition;
         self.decls.truncate(mark.ndecls);
         let end_pc = self.chunk.tape.len() as u32;
         for i in self
@@ -4677,9 +4682,10 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
 
         // The explist is adjusted to 4 values at [base, base+4) like
         // `compile_decl` does a multi-assign: iterator, state, initial
-        // control, closing value. TFORPREP swaps the last two, leaving the
-        // control in the first loop variable at base+3, where each TFORCALL
-        // stores the next one.
+        // control, closing value. TFORPREP moves the closing value to base+2,
+        // clears base+3 for TFORCALL's position, and moves the control to the
+        // first loop variable at base+TFOR_VARS, where each TFORCALL stores
+        // the next one.
         const NCTRL: u8 = 4;
         let base = RegisterIndex(ctx.chunk.freereg);
         let num_values = values.len();
@@ -4729,13 +4735,17 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
             let idx = ctx.alloc_constant(Value::nil())?;
             ctx.emit(Instruction::load(slot, KIdx(idx)));
         }
-        ctx.chunk.freereg = base.0 + 3;
+        ctx.chunk.freereg = base.0 + TFOR_VARS;
 
-        // Promote the 3 anonymous slots (iterator, state, closing value) so
-        // body subexpressions can't reclaim them via free_reg. The closing
-        // value closes when the loop's scope is left (luac `marktobeclosed`).
-        ctx.adjust_locals(3)?;
-        for _ in 0..3 {
+        // Promote the anonymous slots (iterator, state, closing value,
+        // position) so body subexpressions can't reclaim them via free_reg.
+        // The closing value closes when the loop's scope is left (luac
+        // `marktobeclosed`). Like lua, count only the first three toward the
+        // local-variable limit.
+        ctx.adjust_locals(TFOR_VARS - 1)?;
+        ctx.chunk.nposition += 1;
+        ctx.adjust_locals(1)?;
+        for _ in 0..TFOR_VARS {
             ctx.record_locvar("(for state)")?;
         }
         ctx.mark_close(RegisterIndex(base.0 + 2))?;
@@ -4756,7 +4766,7 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
                     .ok_or_else(|| ice("ident without name"))?
                     .to_owned();
                 let reg = ctx.alloc_register()?;
-                assert_eq!(reg.0, base.0 + 3 + i as u8);
+                assert_eq!(reg.0, base.0 + TFOR_VARS + i as u8);
                 // Only the first variable, the control variable, is read-only
                 // (`forlist`'s RDKCONST).
                 let kind = if i == 0 {
@@ -4779,7 +4789,7 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
 
         ctx.set_label(loop_test, ctx.next_offset());
 
-        // TFORCALL: call iterator, results go to base+3..base+2+count
+        // TFORCALL: call iterator, results go to the loop variables
         ctx.cur_line = call_line;
         ctx.emit(Instruction::tforcall(base, num_targets as u8));
 

@@ -14,6 +14,7 @@ mod utf8;
 pub(crate) mod util;
 
 pub use basic::load as load_basic;
+pub(crate) use basic::{ipairs_aux, lua_next};
 pub use coroutine::load as load_coroutine;
 pub use debug::load as load_debug;
 pub use io::load as load_io;

@@ -2,7 +2,7 @@
 source: src/compiler/snapshot_tests.rs
 expression: output
 ---
-; function (params=0, vararg=true, stack=8, upvalues=1)
+; function (params=0, vararg=true, stack=9, upvalues=1)
 ; constants:
 ;   K0 = 1
 ;   K1 = 3
@@ -45,9 +45,9 @@ expression: output
 0030  [  6]  MOVE            R3 R0
 0031  [  6]  CALL            R2 args=2 ret=5
 0032  [  6]  TFORPREP        R2 +3
-0033  [  6]  CLOSURE         R7 P3
-0034  [  6]  SETTABLE        R7 R0 R6
-0035  [  6]  CLOSE           R5
+0033  [  6]  CLOSURE         R8 P3
+0034  [  6]  SETTABLE        R8 R0 R7
+0035  [  6]  CLOSE           R6
 0036  [  6]  TFORCALL        R2 count=2
 0037  [  6]  TFORLOOP        R2 -5
 0038  [  6]  CLOSE           R4
@@ -96,7 +96,7 @@ expression: output
 ; prototype 3:
   ; function (params=0, vararg=false, stack=1, upvalues=1)
   ; upvalues:
-  ;   U0 = local R6
+  ;   U0 = local R7
   ; code:
   0000  [  6]  GETUPVAL        R0 U0
   0001  [  6]  RETURN1         R0
