@@ -222,7 +222,8 @@ fn lua_create<'gc>(
     if m > 1 << 30 {
         return Err(util::runtime_error(ctx, "table overflow"));
     }
-    stack.ret1(Value::table(Table::new(ctx)));
+    let t = Table::with_capacity(ctx, n as usize, m as usize);
+    stack.ret1(Value::table(t));
     Ok(CallbackAction::Return)
 }
 
