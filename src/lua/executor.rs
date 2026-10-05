@@ -112,8 +112,10 @@ impl<'gc> Executor<'gc> {
     /// - [`StepResult::Done`] — the main thread completed; call `take_result`.
     /// - [`StepResult::Yielded(values)`] — the main thread yielded to the
     ///   host. Feed args back via [`Executor::resume`] then `step` again.
-    /// - [`StepResult::Pending`] — a `Sequence` returned `Pending`, or the
-    ///   collector is owed work. Leave the current [`Lua::enter`](crate::Lua::enter),
+    /// - [`StepResult::Pending`] — a `Sequence` returned `Pending`, the
+    ///   collector is owed work, or an async native waits on the host. The
+    ///   waker of [`step_waker`](Self::step_waker) is woken once stepping can
+    ///   go on, right away for all but the last. Leave the current [`Lua::enter`](crate::Lua::enter),
     ///   which collects on its way out, and call `step` again in a new one.
     ///   Stepping on inside the same `enter` still makes progress, but
     ///   nothing is collected until the host leaves it.
@@ -123,6 +125,24 @@ impl<'gc> Executor<'gc> {
     /// loop here until something terminal happens or values cross the host
     /// boundary.
     pub fn step(self, ctx: Context<'gc>) -> Result<StepResult<'gc>, RuntimeError> {
+        self.step_waker(ctx, std::task::Waker::noop())
+    }
+
+    /// [`step`](Self::step), with the waker an async native's future that
+    /// waits on the host gets: `Pending` then means stepping again once it
+    /// is woken.
+    pub fn step_waker(
+        self,
+        ctx: Context<'gc>,
+        waker: &std::task::Waker,
+    ) -> Result<StepResult<'gc>, RuntimeError> {
+        let prev = ctx.set_waker(waker);
+        let r = self.step_inner(ctx);
+        ctx.set_waker(prev);
+        r
+    }
+
+    fn step_inner(self, ctx: Context<'gc>) -> Result<StepResult<'gc>, RuntimeError> {
         {
             let inner = self.0.borrow();
             if inner.mode != ExecutorMode::Normal {
@@ -238,15 +258,22 @@ impl<'gc> Executor<'gc> {
                     if !current.ptr_eq(top) {
                         follow_switches(self, ctx, current);
                     }
-                    if let vm::interp::Exit::Gc = exit {
-                        ctx.mutation().metrics().defer_gc_check();
-                        return Ok(StepResult::Pending);
+                    match exit {
+                        vm::interp::Exit::Gc => {
+                            ctx.mutation().metrics().defer_gc_check();
+                            // Ready again as soon as the host has collected.
+                            ctx.waker().wake_by_ref();
+                            return Ok(StepResult::Pending);
+                        }
+                        vm::interp::Exit::Pending => return Ok(StepResult::Pending),
+                        vm::interp::Exit::End => {}
                     }
                 }
                 FrameKind::Sequence => {
                     if matches!(pump_sequence(self, ctx, top)?, PumpOutcome::Pending) {
                         // Sequence asked for cooperative re-poll. Mode stays
                         // Normal so a follow-up `step` resumes the driver.
+                        ctx.waker().wake_by_ref();
                         return Ok(StepResult::Pending);
                     }
                 }
@@ -692,7 +719,9 @@ fn schedule_call_at<'gc>(
                             ret,
                         },
                     ),
-                    vm::interp::NativeStep::EnterLua | vm::interp::NativeStep::Exit => {}
+                    vm::interp::NativeStep::EnterLua
+                    | vm::interp::NativeStep::Exit
+                    | vm::interp::NativeStep::Pending => {}
                 }
                 Ok(())
             }

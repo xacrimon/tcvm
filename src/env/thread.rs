@@ -371,6 +371,19 @@ pub struct ThreadState<'gc> {
     pub(crate) resumer: Option<Thread<'gc>>,
     /// Threads below this one in the resume chain.
     pub(crate) resume_depth: u16,
+    /// The futures of the async natives with a frame here, innermost last.
+    /// Declared before `task_arena`, which holds them, so dropped first.
+    pub(crate) tasks: Vec<crate::vm::async_native::Task>,
+    pub(crate) task_arena: crate::vm::async_native::TaskArena,
+    /// Values async natives keep across awaits (`Local`), each with the
+    /// epoch of the native it belongs to.
+    pub(crate) locals: Vec<(Value<'gc>, u32)>,
+    /// The epoch of the innermost async native, 0 outside any.
+    pub(crate) local_epoch: u32,
+    /// Set while an `AsyncFn` runs and has yet to spawn its future.
+    pub(crate) spawning: Option<crate::vm::async_native::TaskHeader>,
+    /// What this thread's async natives' `Cx`s see their polls through.
+    pub(crate) async_env: Option<std::rc::Rc<crate::vm::async_native::EnvCell>>,
 }
 
 /// The value stack's storage: a `Vec` the mutator uses as such, that the
@@ -426,6 +439,9 @@ unsafe impl<'gc> Collect<'gc> for ThreadState<'gc> {
         cc.trace(&self.pending_action);
         cc.trace(&self.resumer);
         cc.trace(&self.tbc_list);
+        for (v, _) in &self.locals {
+            cc.trace(v);
+        }
     }
 }
 
@@ -558,6 +574,11 @@ impl<'gc> ThreadState<'gc> {
         self.yield_bottom = None;
         self.death_error = None;
         self.stack_limit = STACK_LIMIT;
+        while !self.tasks.is_empty() {
+            self.drop_task();
+        }
+        self.locals.clear();
+        self.local_epoch = 0;
     }
 
     /// Every frame, innermost first.
@@ -831,6 +852,12 @@ impl<'gc> Thread<'gc> {
             stack_limit: STACK_LIMIT,
             resumer: None,
             resume_depth: 0,
+            tasks: Vec::new(),
+            task_arena: crate::vm::async_native::TaskArena::new(),
+            locals: Vec::new(),
+            local_epoch: 0,
+            spawning: None,
+            async_env: None,
         };
         let thread = Thread(Gc::new(mc, RefLock::new(state)));
         // Store the back-reference

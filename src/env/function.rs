@@ -8,7 +8,7 @@ use crate::env::table::{SlotLoc, TableState};
 use crate::env::thread::ThreadState;
 use crate::env::value::Value;
 use crate::instruction::UpValueDescriptor;
-use crate::vm::interp::{Handler, op_call_action, op_call_native};
+use crate::vm::interp::{Handler, op_call_action, op_call_async, op_call_native};
 use crate::vm::sequence::{CallbackAction, Execution};
 
 /// Debug record for a local register: active for `start_pc <= pc < end_pc`.
@@ -244,8 +244,8 @@ pub struct NativeClosure<'gc> {
     #[collect(require_static)]
     pub(crate) function: NativeKind,
     pub upvalues: Box<[Value<'gc>], MetricsAlloc<'gc>>,
-    /// What CALL and TAILCALL jump to: `op_call_native` or `op_call_action`
-    /// by `function`'s kind, or for a builtin with a fast path its own entry
+    /// What CALL and TAILCALL jump to: `op_call_native`, `op_call_action` or
+    /// `op_call_async` by `function`'s kind, or for a builtin with a fast path its own entry
     /// (LuaJIT's `ff_*`), which handles the common argument shape inline,
     /// never errors, and leaves every other shape to the kind's generic entry,
     /// so `function` stays the complete implementation. An entry must check
@@ -285,6 +285,7 @@ const _: () = assert!(std::mem::size_of::<Result<(), Error<'static>>>() == 8);
 pub(crate) enum NativeKind {
     Plain(NativeFn),
     Action(ActionFn),
+    Async(crate::vm::async_native::AsyncFn),
 }
 
 /// A mutable view into the running thread's value stack, spanning
@@ -600,6 +601,14 @@ impl<'gc> Function<'gc> {
 
     pub fn new_action(mc: &Mutation<'gc>, function: ActionFn, upvalues: &[Value<'gc>]) -> Self {
         Self::new_native_with_entry(mc, NativeKind::Action(function), upvalues, op_call_action)
+    }
+
+    pub fn new_async(
+        mc: &Mutation<'gc>,
+        function: crate::vm::async_native::AsyncFn,
+        upvalues: &[Value<'gc>],
+    ) -> Self {
+        Self::new_native_with_entry(mc, NativeKind::Async(function), upvalues, op_call_async)
     }
 
     /// A native whose CALLs go to `entry` (see `NativeClosure::entry`).

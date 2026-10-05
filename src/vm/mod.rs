@@ -1,3 +1,4 @@
+pub mod async_native;
 pub mod async_sequence;
 pub(crate) mod close;
 pub(crate) mod debug;

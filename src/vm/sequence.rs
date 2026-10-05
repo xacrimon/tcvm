@@ -82,6 +82,19 @@ pub enum CallbackAction<'gc> {
     /// Yield the window to the resumer; the values it resumes with are the
     /// native's results.
     Yield,
+    /// Yield `stack[at..]` to the resumer, then run `cont` with the values it
+    /// resumes with in their place.
+    YieldThen {
+        at: u32,
+        #[collect(require_static)]
+        cont: NativeCont,
+    },
+    /// The async native's future was spawned (`Stack::spawn`): poll it from a
+    /// frame of its own.
+    Async,
+    /// Leave the native's frame for the host to come back to: its future
+    /// waits on the host.
+    Pending,
     /// Hand control to the executor; see [`Suspend`].
     Suspend(Box<Suspend<'gc>>),
 }
