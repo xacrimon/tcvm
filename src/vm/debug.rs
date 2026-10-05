@@ -188,6 +188,7 @@ pub(crate) fn op_error_message<'gc>(
             format!("variable '{name}' got a non-closable value")
         }
         OpError::Internal(what) => format!("internal VM error: {what}"),
+        OpError::Thrown(_) => unreachable!("a thrown error carries its own value"),
     }
 }
 

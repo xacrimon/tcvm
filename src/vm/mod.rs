@@ -4,3 +4,4 @@ pub(crate) mod debug;
 pub(crate) mod interp;
 pub(crate) mod num;
 pub mod sequence;
+pub(crate) mod unwind;
