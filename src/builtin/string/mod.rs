@@ -3,9 +3,11 @@ use std::cell::{Cell, RefCell};
 
 use crate::Context;
 use crate::builtin::strfmt_num::{
-    self, SFormat, STRFMT_F_ALT, STRFMT_F_LEFT, STRFMT_F_PLUS, STRFMT_F_SPACE, STRFMT_F_UPPER,
-    STRFMT_F_ZERO, STRFMT_SH_PREC, STRFMT_SH_WIDTH, STRFMT_T_FP_A, STRFMT_T_FP_E, STRFMT_T_FP_F,
-    STRFMT_T_FP_G,
+    self, SFormat, STRFMT_CHAR, STRFMT_ERR, STRFMT_F_ALT, STRFMT_F_LEFT, STRFMT_F_PLUS,
+    STRFMT_F_SPACE, STRFMT_F_UPPER, STRFMT_F_ZERO, STRFMT_INT, STRFMT_NUM, STRFMT_PTR,
+    STRFMT_SH_PREC, STRFMT_SH_WIDTH, STRFMT_STR, STRFMT_T_FP_A, STRFMT_T_FP_E, STRFMT_T_FP_F,
+    STRFMT_T_FP_G, STRFMT_T_HEX, STRFMT_T_OCT, STRFMT_T_QUOTED, STRFMT_UINT, strfmt_fp,
+    strfmt_type,
 };
 use crate::builtin::util;
 // `%d`/`%f` argument coercion reuses the shared `util` helpers so the
@@ -292,17 +294,22 @@ fn lua_format<'gc>(
     let n = stack.len();
     let seq = async_sequence(ctx.mutation(), move |_locals, mut seq| async move {
         let mut pending = Some(pending);
-        while let Some((spec, arg)) = pending {
+        while let Some((sf, at, arg)) = pending {
             let bytes = util::tolstring(&mut seq, arg, n).await?;
-            // `%q` adds the result as-is.
-            if spec.conv == b'q' {
-                f.out.extend_from_slice(&bytes);
-            } else {
-                fmt_str_bytes(&mut f.out, &spec, &bytes);
-            }
             pending = seq.try_enter(|ctx, _locals, _exec, stack| {
                 let fmt = stack.get(0).get_string().expect("checked on entry");
-                f.run(ctx, fmt.as_bytes(), &stack)
+                let fmt = fmt.as_bytes();
+                // Lua checks the spec after `luaL_tolstring`.
+                if sf & STRFMT_BAD != 0 {
+                    return Err(invalid_conv_spec(ctx, &fmt[at..f.i]));
+                }
+                // `%q` adds the result as-is.
+                if sf & STRFMT_T_QUOTED != 0 {
+                    f.out.extend_from_slice(&bytes);
+                } else {
+                    strfmt_num::put_fstr(&mut f.out, sf, &bytes);
+                }
+                f.run(ctx, fmt, &stack)
             })?;
         }
         seq.enter(|ctx, _locals, _exec, mut stack| {
@@ -322,191 +329,156 @@ struct Formatter {
 impl Formatter {
     /// Format `fmt` from where the previous call stopped, until the end or a
     /// `luaL_tolstring` conversion whose argument has `__tostring`; that
-    /// conversion's spec and stack index are returned for the caller to finish.
+    /// conversion's spec, the index of its `%` and its argument's stack index
+    /// are returned for the caller to finish.
     fn run<'gc>(
         &mut self,
         ctx: Context<'gc>,
         fmt: &[u8],
         args: &Stack<'gc, '_>,
-    ) -> Result<Option<(FmtSpec, usize)>, Error<'gc>> {
+    ) -> Result<Option<(SFormat, usize, usize)>, Error<'gc>> {
         while self.i < fmt.len() {
             let lit = fmt[self.i..].iter().position(|&b| b == b'%');
-            let end = lit.map_or(fmt.len(), |n| self.i + n);
-            if end > self.i {
-                self.out.extend_from_slice(&fmt[self.i..end]);
-                self.i = end;
+            let at = lit.map_or(fmt.len(), |n| self.i + n);
+            if at > self.i {
+                self.out.extend_from_slice(&fmt[self.i..at]);
+                self.i = at;
             }
             if lit.is_none() {
                 break;
             }
-            let (spec, next) = match fmt.get(end + 1) {
-                // A bare conversion has nothing for `parse_spec` to check.
-                Some(&conv)
-                    if matches!(
-                        conv,
-                        b'd' | b'i'
-                            | b'u'
-                            | b'o'
-                            | b'x'
-                            | b'X'
-                            | b'c'
-                            | b'p'
-                            | b's'
-                            | b'q'
-                            | b'a'
-                            | b'A'
-                            | b'e'
-                            | b'f'
-                            | b'g'
-                            | b'G'
-                            | b'E'
-                    ) =>
-                {
-                    (
-                        FmtSpec {
-                            conv,
-                            ..FmtSpec::default()
-                        },
-                        end + 2,
-                    )
-                }
-                _ => parse_spec(ctx, fmt, end + 1)?,
-            };
-            self.i = next;
-            if spec.conv == b'%' {
+            if fmt.get(at + 1) == Some(&b'%') {
                 self.out.push(b'%');
+                self.i = at + 2;
                 continue;
             }
-            // A conversion consumes the next argument; a missing one is an error
-            // ("no value"), distinct from an explicitly-passed nil.
+            // As in Lua, a missing argument ("no value", distinct from an explicit
+            // nil) is reported before anything about the spec.
             if self.arg_idx >= args.len() {
                 return Err(util::arg_error(ctx, "format", self.arg_idx + 1, "no value"));
             }
+            let (sf, next) = parse_spec(ctx, fmt, at)?;
+            self.i = next;
             let arg = args.get(self.arg_idx);
             self.arg_idx += 1;
-            let tolstring = spec.conv == b's'
-                || (spec.conv == b'q' && (arg.is_nil() || arg.get_boolean().is_some()));
-            if tolstring && !ctx.metamethod_of(arg, ctx.symbols().mm_tostring).is_nil() {
-                return Ok(Some((spec, self.arg_idx - 1)));
+            if strfmt_type(sf) == STRFMT_STR {
+                let quoted = sf & STRFMT_T_QUOTED != 0;
+                if quoted && next - at > 2 {
+                    return Err(Error::from_str(ctx, "specifier '%q' cannot have modifiers"));
+                }
+                if (!quoted || arg.is_nil() || arg.get_boolean().is_some())
+                    && !ctx.metamethod_of(arg, ctx.symbols().mm_tostring).is_nil()
+                {
+                    return Ok(Some((sf, at, self.arg_idx - 1)));
+                }
             }
             // After the increment, `arg_idx` is the 1-based Lua argument number of
             // the argument just consumed (the format string is #1).
-            format_one(ctx, &mut self.out, &spec, arg, self.arg_idx)?;
+            format_one(ctx, &mut self.out, sf, &fmt[at..next], arg, self.arg_idx)?;
         }
         Ok(None)
     }
 }
 
-#[derive(Default)]
-struct FmtSpec {
-    flag_minus: bool,
-    flag_plus: bool,
-    flag_space: bool,
-    flag_hash: bool,
-    flag_zero: bool,
-    width: usize,
-    precision: Option<usize>,
-    conv: u8,
+/// Set in a parsed `SFormat` whose modifiers its conversion doesn't take; Lua reports it at a
+/// conversion-specific point, so the parse only records it.
+const STRFMT_BAD: SFormat = 0x8000;
+/// Set in a `conv_format` result for conversions that take a precision.
+const TAKES_PREC: SFormat = 0x4000;
+const FLAGS: SFormat =
+    STRFMT_F_LEFT | STRFMT_F_PLUS | STRFMT_F_ZERO | STRFMT_F_SPACE | STRFMT_F_ALT;
+
+/// A conversion's `SFormat`, plus the flags and `TAKES_PREC` that Lua's `checkformat`
+/// accepts for it; 0 for one `format` doesn't have.
+#[inline]
+fn conv_format(c: u8) -> SFormat {
+    const F_I: SFormat = STRFMT_F_LEFT | STRFMT_F_PLUS | STRFMT_F_ZERO | STRFMT_F_SPACE;
+    const F_X: SFormat = STRFMT_F_LEFT | STRFMT_F_ALT | STRFMT_F_ZERO;
+    const F_F: SFormat = FLAGS;
+    match c {
+        b'd' | b'i' => STRFMT_INT | F_I | TAKES_PREC,
+        b'u' => STRFMT_UINT | STRFMT_F_LEFT | STRFMT_F_ZERO | TAKES_PREC,
+        b'o' => STRFMT_UINT | STRFMT_T_OCT | F_X | TAKES_PREC,
+        b'x' => STRFMT_UINT | STRFMT_T_HEX | F_X | TAKES_PREC,
+        b'X' => STRFMT_UINT | STRFMT_T_HEX | STRFMT_F_UPPER | F_X | TAKES_PREC,
+        b'a' => STRFMT_NUM | STRFMT_T_FP_A | F_F | TAKES_PREC,
+        b'A' => STRFMT_NUM | STRFMT_T_FP_A | STRFMT_F_UPPER | F_F | TAKES_PREC,
+        b'e' => STRFMT_NUM | STRFMT_T_FP_E | F_F | TAKES_PREC,
+        b'E' => STRFMT_NUM | STRFMT_T_FP_E | STRFMT_F_UPPER | F_F | TAKES_PREC,
+        b'f' => STRFMT_NUM | STRFMT_T_FP_F | F_F | TAKES_PREC,
+        b'g' => STRFMT_NUM | STRFMT_T_FP_G | F_F | TAKES_PREC,
+        b'G' => STRFMT_NUM | STRFMT_T_FP_G | STRFMT_F_UPPER | F_F | TAKES_PREC,
+        b'c' => STRFMT_CHAR | STRFMT_F_LEFT,
+        b'p' => STRFMT_PTR | STRFMT_F_LEFT,
+        b's' => STRFMT_STR | STRFMT_F_LEFT | TAKES_PREC,
+        b'q' => STRFMT_STR | STRFMT_T_QUOTED,
+        _ => 0,
+    }
 }
 
+/// The spec whose `%` is at `fmt[at]`, as Lua's `getformat` spans it, packed into an
+/// `SFormat` (`STRFMT_ERR` for an unknown conversion), and the index after it.
 fn parse_spec<'gc>(
     ctx: Context<'gc>,
     fmt: &[u8],
-    mut i: usize,
-) -> Result<(FmtSpec, usize), Error<'gc>> {
-    let start = i - 1; // the '%'
-    let mut spec = FmtSpec::default();
-    while i < fmt.len() {
-        match fmt[i] {
-            b'-' => spec.flag_minus = true,
-            b'+' => spec.flag_plus = true,
-            b' ' => spec.flag_space = true,
-            b'#' => spec.flag_hash = true,
-            b'0' => spec.flag_zero = true,
-            _ => break,
-        }
-        i += 1;
+    at: usize,
+) -> Result<(SFormat, usize), Error<'gc>> {
+    let mods = &fmt[at + 1..];
+    let mods = &mods[..mods
+        .iter()
+        .position(|&c| !matches!(c, b'-' | b'+' | b'#' | b'0' | b' ' | b'1'..=b'9' | b'.'))
+        .unwrap_or(mods.len())];
+    // Lua's `MAX_FORMAT - 10`, counting the conversion.
+    if mods.len() + 1 >= 22 {
+        return Err(Error::from_str(ctx, "invalid format (too long)"));
     }
-    // Lua's `get2digits`: only the first two digits set the value; a third digit
-    // is left in place so the conversion char ends up non-alpha and the spec is
-    // rejected as malformed below (matches `checkformat`). Max width/prec = 99.
-    let mut wdigits = 0;
-    while i < fmt.len() && fmt[i].is_ascii_digit() {
-        if wdigits < 2 {
-            spec.width = spec.width * 10 + (fmt[i] - b'0') as usize;
-        }
-        wdigits += 1;
-        i += 1;
-    }
-    let mut pdigits = 0;
-    if i < fmt.len() && fmt[i] == b'.' {
-        i += 1;
-        let mut p = 0usize;
-        while i < fmt.len() && fmt[i].is_ascii_digit() {
-            if pdigits < 2 {
-                p = p * 10 + (fmt[i] - b'0') as usize;
-            }
-            pdigits += 1;
-            i += 1;
-        }
-        spec.precision = Some(p);
-    }
-    if i >= fmt.len() {
-        return Err(invalid_conv_spec(ctx, &fmt[start..]));
-    }
-    spec.conv = fmt[i];
-    // `%%` is handled by the caller; no flags or modifiers apply to it.
-    if spec.conv == b'%' {
-        return Ok((spec, i + 1));
-    }
-    // `%q` accepts no flags, width, or precision at all (its own error).
-    if spec.conv == b'q' {
-        let has_mods = spec.flag_minus
-            || spec.flag_plus
-            || spec.flag_space
-            || spec.flag_hash
-            || spec.flag_zero
-            || spec.width != 0
-            || spec.precision.is_some();
-        if has_mods {
-            return Err(Error::from_str(ctx, "specifier '%q' cannot have modifiers"));
-        }
-        return Ok((spec, i + 1));
-    }
-    let form = &fmt[start..=i];
-    // The conversion char must be a letter and width/precision at most two
-    // digits (Lua's `get2digits` caps both at 2).
-    if !spec.conv.is_ascii_alphabetic() || wdigits > 2 || pdigits > 2 {
-        return Err(invalid_conv_spec(ctx, form));
-    }
-    // Per-specifier flag/precision validation (Lua's `checkformat`): each
-    // conversion accepts only a subset of flags, and `c` forbids a precision.
-    let (allowed_flags, precision_ok): (&[u8], bool) = match spec.conv {
-        b'd' | b'i' => (b"-+0 ", true),
-        b'u' => (b"-0", true),
-        b'o' | b'x' | b'X' => (b"-#0", true),
-        b'a' | b'A' | b'e' | b'E' | b'f' | b'g' | b'G' => (b"-+#0 ", true),
-        b'c' | b'p' => (b"-", false),
-        b's' => (b"-", true),
-        _ => {
-            return Err(Error::from_str(
-                ctx,
-                &format!(
-                    "invalid conversion '{}' to 'format'",
-                    String::from_utf8_lossy(form)
-                ),
-            ));
-        }
+    let conv_at = at + 1 + mods.len();
+    let Some(&conv) = fmt.get(conv_at) else {
+        return Ok((STRFMT_ERR, fmt.len()));
     };
-    let flag_rejected = (spec.flag_minus && !allowed_flags.contains(&b'-'))
-        || (spec.flag_plus && !allowed_flags.contains(&b'+'))
-        || (spec.flag_space && !allowed_flags.contains(&b' '))
-        || (spec.flag_hash && !allowed_flags.contains(&b'#'))
-        || (spec.flag_zero && !allowed_flags.contains(&b'0'));
-    if flag_rejected || (spec.precision.is_some() && !precision_ok) {
-        return Err(invalid_conv_spec(ctx, form));
+    let info = conv_format(conv);
+    if info == 0 {
+        return Ok((STRFMT_ERR, conv_at + 1));
     }
-    Ok((spec, i + 1))
+    let mut sf = info & !(FLAGS | TAKES_PREC);
+    if mods.is_empty() {
+        return Ok((sf, conv_at + 1));
+    }
+    // Lua's `checkformat`. Its flag scan stops at a flag the conversion doesn't take, which
+    // can't then be consumed as anything else; so taking all flags and rejecting the
+    // unaccepted ones is the same. Width and precision are at most two digits each.
+    let mut j = 0;
+    while let Some(&c) = mods.get(j) {
+        sf |= match c {
+            b'-' => STRFMT_F_LEFT,
+            b'+' => STRFMT_F_PLUS,
+            b' ' => STRFMT_F_SPACE,
+            b'#' => STRFMT_F_ALT,
+            b'0' => STRFMT_F_ZERO,
+            _ => break,
+        };
+        j += 1;
+    }
+    let two_digits = |j: &mut usize| {
+        let mut v = 0;
+        for _ in 0..2 {
+            match mods.get(*j) {
+                Some(&d @ b'0'..=b'9') => v = v * 10 + (d - b'0') as SFormat,
+                _ => break,
+            }
+            *j += 1;
+        }
+        v
+    };
+    sf |= two_digits(&mut j) << STRFMT_SH_WIDTH;
+    if info & TAKES_PREC != 0 && mods.get(j) == Some(&b'.') {
+        j += 1;
+        sf |= (two_digits(&mut j) + 1) << STRFMT_SH_PREC;
+    }
+    if j < mods.len() || sf & FLAGS & !info != 0 {
+        sf |= STRFMT_BAD;
+    }
+    Ok((sf, conv_at + 1))
 }
 
 /// Lua's "invalid conversion specification: '%...'" error, echoing the offending
@@ -521,61 +493,69 @@ fn invalid_conv_spec<'gc>(ctx: Context<'gc>, form: &[u8]) -> Error<'gc> {
     )
 }
 
+/// Format one conversion other than a `__tostring` one; `form` is its spec as written.
+/// Spec and argument errors come in the order of Lua's `str_format`.
 fn format_one<'gc>(
     ctx: Context<'gc>,
     out: &mut Vec<u8>,
-    spec: &FmtSpec,
+    sf: SFormat,
+    form: &[u8],
     arg: Value<'gc>,
     arg_num: usize,
 ) -> Result<(), Error<'gc>> {
-    match spec.conv {
-        b'd' | b'i' => {
-            let n = check_fmt_int(ctx, arg, arg_num)?;
-            fmt_int_signed(out, spec, n);
+    let check = || {
+        if sf & STRFMT_BAD != 0 {
+            return Err(invalid_conv_spec(ctx, form));
         }
-        b'u' => {
-            // `%u` formats the integer's unsigned 64-bit value, not its signed
-            // form: `-1` -> "18446744073709551615".
+        Ok(())
+    };
+    match strfmt_type(sf) {
+        STRFMT_INT | STRFMT_UINT => {
             let n = check_fmt_int(ctx, arg, arg_num)?;
-            fmt_int_unsigned(out, spec, n as u64, 10, false);
+            check()?;
+            if sf == STRFMT_INT {
+                util::push_int(out, n);
+            } else {
+                strfmt_num::put_fxint(out, sf, n as u64);
+            }
         }
-        b'o' => {
-            let n = check_fmt_int(ctx, arg, arg_num)?;
-            fmt_int_unsigned(out, spec, n as u64, 8, false);
-        }
-        b'x' => {
-            let n = check_fmt_int(ctx, arg, arg_num)?;
-            fmt_int_unsigned(out, spec, n as u64, 16, false);
-        }
-        b'X' => {
-            let n = check_fmt_int(ctx, arg, arg_num)?;
-            fmt_int_unsigned(out, spec, n as u64, 16, true);
-        }
-        b'c' => {
-            // C's `%c` casts the integer to `unsigned char`; Lua adds no range
-            // check, so out-of-range values wrap to the low byte. Width/`-`
-            // flags still apply (via apply_width).
-            let n = check_fmt_int(ctx, arg, arg_num)?;
-            apply_width(out, spec, b"", b"", 0, &[n as u8]);
-        }
-        b'a' | b'A' | b'e' | b'E' | b'f' | b'g' | b'G' => {
+        STRFMT_NUM => {
+            if strfmt_fp(sf) == strfmt_fp(STRFMT_T_FP_A) {
+                check()?;
+            }
             let f = to_float(arg).ok_or_else(|| arg_type_err(ctx, "number", &arg, arg_num))?;
-            strfmt_num::put_fnum(out, float_sformat(spec), f);
+            check()?;
+            strfmt_num::put_fnum(out, sf, f);
         }
-        b's' => {
-            fmt_string(ctx, out, spec, arg);
+        STRFMT_CHAR => {
+            check()?;
+            // C's `%c` takes the integer's low byte; Lua adds no range check.
+            let n = check_fmt_int(ctx, arg, arg_num)?;
+            strfmt_num::put_fchar(out, sf, n as u8);
         }
-        b'p' => {
-            let s = match util::to_pointer(arg) {
-                Some(p) => format!("{p:p}"),
-                None => "(null)".to_owned(),
-            };
-            apply_width(out, spec, b"", b"", 0, s.as_bytes());
+        STRFMT_PTR => {
+            check()?;
+            match util::to_pointer(arg) {
+                Some(p) => strfmt_num::put_fstr(out, sf, format!("{p:p}").as_bytes()),
+                None => strfmt_num::put_fstr(out, sf, b"(null)"),
+            }
         }
-        b'q' => {
-            fmt_q(ctx, out, arg, arg_num)?;
+        STRFMT_STR if sf & STRFMT_T_QUOTED != 0 => fmt_q(ctx, out, arg, arg_num)?,
+        STRFMT_STR => {
+            check()?;
+            strfmt_num::put_fstr(out, sf, util::basic_tostring(ctx, arg).as_bytes());
         }
-        _ => unreachable!("parse_spec rejects other conversions"),
+        _ => {
+            // Lua quotes the spec as a C string, which a NUL conversion ends.
+            let form = form.strip_suffix(b"\0").unwrap_or(form);
+            return Err(Error::from_str(
+                ctx,
+                &format!(
+                    "invalid conversion '{}' to 'format'",
+                    String::from_utf8_lossy(form)
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -615,123 +595,6 @@ fn check_fmt_int<'gc>(
         "number",
         Some(arg),
     ))
-}
-
-// ---------- integer formatting ----------
-
-fn fmt_int_signed(out: &mut Vec<u8>, spec: &FmtSpec, n: i64) {
-    let mut dec = NumBuffer::new();
-    let (zeros, digits) = int_digits(
-        spec,
-        n.unsigned_abs().format_into(&mut dec).as_bytes(),
-        n == 0,
-    );
-    let sign: &[u8] = if n < 0 {
-        b"-"
-    } else if spec.flag_plus {
-        b"+"
-    } else if spec.flag_space {
-        b" "
-    } else {
-        b""
-    };
-    apply_width(out, spec, sign, b"", zeros, digits);
-}
-
-fn fmt_int_unsigned(out: &mut Vec<u8>, spec: &FmtSpec, n: u64, radix: u32, upper: bool) {
-    let mut dec = NumBuffer::new();
-    let mut pow2 = [0; 22];
-    let raw: &[u8] = match radix {
-        10 => n.format_into(&mut dec).as_bytes(),
-        // `format_into` is decimal-only.
-        _ => {
-            let (bits, alphabet): (u32, &[u8]) = match (radix, upper) {
-                (8, _) => (3, b"01234567"),
-                (16, false) => (4, b"0123456789abcdef"),
-                (16, true) => (4, b"0123456789ABCDEF"),
-                _ => unreachable!(),
-            };
-            let mut i = pow2.len();
-            let mut m = n;
-            loop {
-                i -= 1;
-                pow2[i] = alphabet[(m & ((1 << bits) - 1)) as usize];
-                m >>= bits;
-                if m == 0 {
-                    break;
-                }
-            }
-            &pow2[i..]
-        }
-    };
-    let (zeros, digits) = int_digits(spec, raw, n == 0);
-    let prefix: &[u8] = if spec.flag_hash && n != 0 {
-        match (radix, upper) {
-            (16, false) => b"0x",
-            (16, true) => b"0X",
-            (8, _) => b"0",
-            _ => b"",
-        }
-    } else {
-        b""
-    };
-    apply_width(out, spec, b"", prefix, zeros, digits);
-}
-
-/// The zeros that extend `digits` to the spec's precision, and the digits; as in C, a zero
-/// precision prints no digits for zero.
-fn int_digits<'a>(spec: &FmtSpec, digits: &'a [u8], zero: bool) -> (usize, &'a [u8]) {
-    match spec.precision {
-        Some(0) if zero => (0, b""),
-        Some(p) => (p.saturating_sub(digits.len()), digits),
-        None => (0, digits),
-    }
-}
-
-// ---------- float formatting ----------
-
-/// The `SFormat` of a float conversion, for `strfmt_num`.
-fn float_sformat(spec: &FmtSpec) -> SFormat {
-    let mut sf = match spec.conv.to_ascii_lowercase() {
-        b'a' => STRFMT_T_FP_A,
-        b'e' => STRFMT_T_FP_E,
-        b'f' => STRFMT_T_FP_F,
-        _ => STRFMT_T_FP_G,
-    };
-    for (on, flag) in [
-        (spec.conv.is_ascii_uppercase(), STRFMT_F_UPPER),
-        (spec.flag_minus, STRFMT_F_LEFT),
-        (spec.flag_plus, STRFMT_F_PLUS),
-        (spec.flag_zero, STRFMT_F_ZERO),
-        (spec.flag_space, STRFMT_F_SPACE),
-        (spec.flag_hash, STRFMT_F_ALT),
-    ] {
-        if on {
-            sf |= flag;
-        }
-    }
-    // `parse_spec` caps both at 99, inside the 8-bit fields.
-    sf |= (spec.width as u32) << STRFMT_SH_WIDTH;
-    if let Some(p) = spec.precision {
-        sf |= (p as u32 + 1) << STRFMT_SH_PREC;
-    }
-    sf
-}
-
-// ---------- string and q ----------
-
-/// `%s` of a value without `__tostring` (`Formatter::run` diverts the rest).
-fn fmt_string<'gc>(ctx: Context<'gc>, out: &mut Vec<u8>, spec: &FmtSpec, arg: Value<'gc>) {
-    fmt_str_bytes(out, spec, util::basic_tostring(ctx, arg).as_bytes());
-}
-
-fn fmt_str_bytes(out: &mut Vec<u8>, spec: &FmtSpec, bytes: &[u8]) {
-    let trimmed: &[u8] = if let Some(p) = spec.precision {
-        &bytes[..bytes.len().min(p)]
-    } else {
-        bytes
-    };
-    apply_width(out, spec, b"", b"", 0, trimmed);
 }
 
 fn fmt_q<'gc>(
@@ -799,41 +662,6 @@ fn fmt_q<'gc>(
         ));
     }
     Ok(())
-}
-
-// ---------- shared width/padding ----------
-
-/// Append `sign`, `prefix`, `zeros` zero digits and `body`, padded to the spec's width.
-fn apply_width(
-    out: &mut Vec<u8>,
-    spec: &FmtSpec,
-    sign: &[u8],
-    prefix: &[u8],
-    zeros: usize,
-    body: &[u8],
-) {
-    let content_len = sign.len() + prefix.len() + zeros + body.len();
-    let pad = spec.width.saturating_sub(content_len);
-    if pad == 0 && zeros == 0 {
-        out.extend_from_slice(sign);
-        out.extend_from_slice(prefix);
-        out.extend_from_slice(body);
-        return;
-    }
-    // C printf: a precision suppresses the `0` flag only for the integer
-    // conversions (d/i/o/u/x/X).
-    let int_conv = matches!(spec.conv, b'd' | b'i' | b'u' | b'o' | b'x' | b'X');
-    let zero_pad = spec.flag_zero && !spec.flag_minus && !(int_conv && spec.precision.is_some());
-    if !spec.flag_minus && !zero_pad {
-        out.resize(out.len() + pad, b' ');
-    }
-    out.extend_from_slice(sign);
-    out.extend_from_slice(prefix);
-    out.resize(out.len() + zeros + if zero_pad { pad } else { 0 }, b'0');
-    out.extend_from_slice(body);
-    if spec.flag_minus {
-        out.resize(out.len() + pad, b' ');
-    }
 }
 
 /// Iterator state for `gmatch`, owned by the closure's userdata upvalue. The
