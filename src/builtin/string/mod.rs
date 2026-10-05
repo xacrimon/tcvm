@@ -244,7 +244,7 @@ fn lua_format<'gc>(
     let mut f = Formatter {
         i: 0,
         arg_idx: 1,
-        out: Vec::with_capacity(fmt.len() + 16),
+        out: Vec::with_capacity(64),
     };
     let Some(pending) = f.run(ctx, fmt, &stack)? else {
         let s = LuaString::new(ctx, &f.out);
@@ -295,14 +295,48 @@ impl Formatter {
         args: &Stack<'gc, '_>,
     ) -> Result<Option<(FmtSpec, usize)>, Error<'gc>> {
         while self.i < fmt.len() {
-            let b = fmt[self.i];
-            if b != b'%' {
-                self.out.push(b);
-                self.i += 1;
-                continue;
+            let lit = fmt[self.i..].iter().position(|&b| b == b'%');
+            let end = lit.map_or(fmt.len(), |n| self.i + n);
+            if end > self.i {
+                self.out.extend_from_slice(&fmt[self.i..end]);
+                self.i = end;
             }
-            // parse flags/width/precision/conv starting at fmt[i+1]
-            let (spec, next) = parse_spec(ctx, fmt, self.i + 1)?;
+            if lit.is_none() {
+                break;
+            }
+            let (spec, next) = match fmt.get(end + 1) {
+                // A bare conversion has nothing for `parse_spec` to check.
+                Some(&conv)
+                    if matches!(
+                        conv,
+                        b'd' | b'i'
+                            | b'u'
+                            | b'o'
+                            | b'x'
+                            | b'X'
+                            | b'c'
+                            | b'p'
+                            | b's'
+                            | b'q'
+                            | b'a'
+                            | b'A'
+                            | b'e'
+                            | b'f'
+                            | b'g'
+                            | b'G'
+                            | b'E'
+                    ) =>
+                {
+                    (
+                        FmtSpec {
+                            conv,
+                            ..FmtSpec::default()
+                        },
+                        end + 2,
+                    )
+                }
+                _ => parse_spec(ctx, fmt, end + 1)?,
+            };
             self.i = next;
             if spec.conv == b'%' {
                 self.out.push(b'%');
@@ -487,7 +521,7 @@ fn format_one<'gc>(
             // check, so out-of-range values wrap to the low byte. Width/`-`
             // flags still apply (via apply_width).
             let n = check_fmt_int(ctx, arg, arg_num)?;
-            apply_width(out, spec, b"", b"", &[n as u8]);
+            apply_width(out, spec, b"", b"", 0, &[n as u8]);
         }
         b'a' | b'A' | b'e' | b'E' | b'f' | b'g' | b'G' => {
             let f = to_float(arg).ok_or_else(|| arg_type_err(ctx, "number", &arg, arg_num))?;
@@ -501,7 +535,7 @@ fn format_one<'gc>(
                 Some(p) => format!("{p:p}"),
                 None => "(null)".to_owned(),
             };
-            apply_width(out, spec, b"", b"", s.as_bytes());
+            apply_width(out, spec, b"", b"", 0, s.as_bytes());
         }
         b'q' => {
             fmt_q(ctx, out, arg, arg_num)?;
@@ -552,12 +586,10 @@ fn check_fmt_int<'gc>(
 
 fn fmt_int_signed(out: &mut Vec<u8>, spec: &FmtSpec, n: i64) {
     let mut dec = NumBuffer::new();
-    let mut padded = [0; 99];
-    let digits = int_digits(
+    let (zeros, digits) = int_digits(
         spec,
         n.unsigned_abs().format_into(&mut dec).as_bytes(),
         n == 0,
-        &mut padded,
     );
     let sign: &[u8] = if n < 0 {
         b"-"
@@ -568,7 +600,7 @@ fn fmt_int_signed(out: &mut Vec<u8>, spec: &FmtSpec, n: i64) {
     } else {
         b""
     };
-    apply_width(out, spec, sign, b"", digits);
+    apply_width(out, spec, sign, b"", zeros, digits);
 }
 
 fn fmt_int_unsigned(out: &mut Vec<u8>, spec: &FmtSpec, n: u64, radix: u32, upper: bool) {
@@ -597,8 +629,7 @@ fn fmt_int_unsigned(out: &mut Vec<u8>, spec: &FmtSpec, n: u64, radix: u32, upper
             &pow2[i..]
         }
     };
-    let mut padded = [0; 99];
-    let digits = int_digits(spec, raw, n == 0, &mut padded);
+    let (zeros, digits) = int_digits(spec, raw, n == 0);
     let prefix: &[u8] = if spec.flag_hash && n != 0 {
         match (radix, upper) {
             (16, false) => b"0x",
@@ -609,21 +640,16 @@ fn fmt_int_unsigned(out: &mut Vec<u8>, spec: &FmtSpec, n: u64, radix: u32, upper
     } else {
         b""
     };
-    apply_width(out, spec, b"", prefix, digits);
+    apply_width(out, spec, b"", prefix, zeros, digits);
 }
 
-/// `digits` zero-extended to the spec's precision (at most 99, see `parse_spec`);
-/// as in C, a zero precision prints no digits for zero.
-fn int_digits<'a>(spec: &FmtSpec, digits: &'a [u8], zero: bool, buf: &'a mut [u8; 99]) -> &'a [u8] {
+/// The zeros that extend `digits` to the spec's precision, and the digits; as in C, a zero
+/// precision prints no digits for zero.
+fn int_digits<'a>(spec: &FmtSpec, digits: &'a [u8], zero: bool) -> (usize, &'a [u8]) {
     match spec.precision {
-        Some(0) if zero => b"",
-        Some(p) if digits.len() < p => {
-            let pad = p - digits.len();
-            buf[..pad].fill(b'0');
-            buf[pad..p].copy_from_slice(digits);
-            &buf[..p]
-        }
-        _ => digits,
+        Some(0) if zero => (0, b""),
+        Some(p) => (p.saturating_sub(digits.len()), digits),
+        None => (0, digits),
     }
 }
 
@@ -670,7 +696,7 @@ fn fmt_str_bytes(out: &mut Vec<u8>, spec: &FmtSpec, bytes: &[u8]) {
     } else {
         bytes
     };
-    apply_width(out, spec, b"", b"", trimmed);
+    apply_width(out, spec, b"", b"", 0, trimmed);
 }
 
 fn fmt_q<'gc>(
@@ -742,40 +768,36 @@ fn fmt_q<'gc>(
 
 // ---------- shared width/padding ----------
 
-fn apply_width(out: &mut Vec<u8>, spec: &FmtSpec, sign: &[u8], prefix: &[u8], body: &[u8]) {
-    let content_len = sign.len() + prefix.len() + body.len();
+/// Append `sign`, `prefix`, `zeros` zero digits and `body`, padded to the spec's width.
+fn apply_width(
+    out: &mut Vec<u8>,
+    spec: &FmtSpec,
+    sign: &[u8],
+    prefix: &[u8],
+    zeros: usize,
+    body: &[u8],
+) {
+    let content_len = sign.len() + prefix.len() + zeros + body.len();
     let pad = spec.width.saturating_sub(content_len);
-    if pad == 0 {
+    if pad == 0 && zeros == 0 {
         out.extend_from_slice(sign);
         out.extend_from_slice(prefix);
         out.extend_from_slice(body);
         return;
     }
     // C printf: a precision suppresses the `0` flag only for the integer
-    // conversions (d/i/o/u/x/X); for floats (f/e/g/a) the `0` flag still pads.
+    // conversions (d/i/o/u/x/X).
     let int_conv = matches!(spec.conv, b'd' | b'i' | b'u' | b'o' | b'x' | b'X');
-    let zero_pad = spec.flag_zero && !(int_conv && spec.precision.is_some());
+    let zero_pad = spec.flag_zero && !spec.flag_minus && !(int_conv && spec.precision.is_some());
+    if !spec.flag_minus && !zero_pad {
+        out.resize(out.len() + pad, b' ');
+    }
+    out.extend_from_slice(sign);
+    out.extend_from_slice(prefix);
+    out.resize(out.len() + zeros + if zero_pad { pad } else { 0 }, b'0');
+    out.extend_from_slice(body);
     if spec.flag_minus {
-        out.extend_from_slice(sign);
-        out.extend_from_slice(prefix);
-        out.extend_from_slice(body);
-        for _ in 0..pad {
-            out.push(b' ');
-        }
-    } else if zero_pad {
-        out.extend_from_slice(sign);
-        out.extend_from_slice(prefix);
-        for _ in 0..pad {
-            out.push(b'0');
-        }
-        out.extend_from_slice(body);
-    } else {
-        for _ in 0..pad {
-            out.push(b' ');
-        }
-        out.extend_from_slice(sign);
-        out.extend_from_slice(prefix);
-        out.extend_from_slice(body);
+        out.resize(out.len() + pad, b' ');
     }
 }
 
