@@ -1131,7 +1131,7 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
     let t_val = read_upvalue(thread, uv);
 
     let Some(t) = t_val.get_table() else {
-        tail!(gettabup_slow);
+        tail!(get_slow);
     };
 
     let t_state = t.inner().borrow();
@@ -1141,37 +1141,7 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
         dispatch!();
     }
     drop(t_state);
-    tail!(gettabup_slow);
-}
-
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn gettabup_slow<'gc>(
-    instruction: Instruction,
-    ctx: Context<'gc>,
-    thread: &mut ThreadState<'gc>,
-    registers: Registers<'gc, '_>,
-    ip: *const Instruction,
-    handlers: *const (),
-    ds: &mut DispatchState<'gc>,
-    frame: *mut LuaFrame<'gc>,
-    closure: LuaFn<'gc>,
-) -> Exit {
-    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-    let (dst, idx, ic_idx, key) = instruction.abde();
-    let uv = upvalue!(idx);
-    let t_val = read_upvalue(thread, uv);
-    let k = constant!(key);
-    let Some(t) = t_val.get_table() else {
-        get_slow_body!(ctx, thread, registers, ip, handlers, ds, t_val, k, dst);
-    };
-    match get_fill_ic(ctx, closure, ic_idx, t, k) {
-        Ok(v) => {
-            *reg!(ref mut dst) = v;
-            dispatch!();
-        }
-        Err(from) => index_chain_body!(ctx, thread, registers, ip, handlers, ds, from, k, dst),
-    }
+    tail!(get_slow);
 }
 
 /// UpValue[idx][K[key]] = R[src]
@@ -1194,42 +1164,13 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
     let t_val = read_upvalue(thread, uv);
 
     let Some(t) = t_val.get_table() else {
-        tail!(settabup_slow);
+        tail!(set_slow);
     };
 
     if ic_set(ctx, read_ic(closure, ic_idx), t, reg!(src)) {
         dispatch!();
     }
-    tail!(settabup_slow);
-}
-
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn settabup_slow<'gc>(
-    instruction: Instruction,
-    ctx: Context<'gc>,
-    thread: &mut ThreadState<'gc>,
-    registers: Registers<'gc, '_>,
-    ip: *const Instruction,
-    handlers: *const (),
-    ds: &mut DispatchState<'gc>,
-    frame: *mut LuaFrame<'gc>,
-    closure: LuaFn<'gc>,
-) -> Exit {
-    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-    let (src, idx, ic_idx, key) = instruction.abde();
-    let uv = upvalue!(idx);
-    let t_val = read_upvalue(thread, uv);
-    let k = constant!(key);
-    let v = reg!(src);
-    if let Some(t) = t_val.get_table()
-        && set_own_fill_ic(ctx, closure, ic_idx, t, k, v)
-    {
-        dispatch!();
-    }
-    set_slow_body!(
-        ctx, thread, registers, ip, handlers, ds, t_val, k, v, raw_set
-    );
+    tail!(set_slow);
 }
 
 // ---------------------------------------------------------------------------
@@ -1255,7 +1196,7 @@ extern "rust-preserve-none" fn op_gettable<'gc>(
 
     let Some(t) = reg!(table).get_table() else {
         // Non-table (userdata `__index`, or error) — handled by the slow path.
-        tail!(gettable_slow);
+        tail!(get_slow);
     };
 
     // An integer key inside the array part, handled without calls so this
@@ -1288,7 +1229,7 @@ extern "rust-preserve-none" fn gettable_general<'gc>(
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (dst, table, key) = instruction.abc();
     let Some(t) = reg!(table).get_table() else {
-        tail!(gettable_slow);
+        tail!(get_slow);
     };
 
     let k = reg!(key);
@@ -1300,31 +1241,11 @@ extern "rust-preserve-none" fn gettable_general<'gc>(
     };
 
     if need_index {
-        tail!(gettable_slow);
+        tail!(get_slow);
     }
 
     *reg!(ref mut dst) = v;
     dispatch!();
-}
-
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn gettable_slow<'gc>(
-    instruction: Instruction,
-    ctx: Context<'gc>,
-    thread: &mut ThreadState<'gc>,
-    registers: Registers<'gc, '_>,
-    ip: *const Instruction,
-    handlers: *const (),
-    ds: &mut DispatchState<'gc>,
-    frame: *mut LuaFrame<'gc>,
-    closure: LuaFn<'gc>,
-) -> Exit {
-    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-    let (dst, table, key) = instruction.abc();
-    let recv = reg!(table);
-    let k = reg!(key);
-    get_slow_body!(ctx, thread, registers, ip, handlers, ds, recv, k, dst);
 }
 
 /// R[table][R[key]] = R[src]
@@ -1345,7 +1266,7 @@ extern "rust-preserve-none" fn op_settable<'gc>(
     let (src, table, key) = instruction.abc();
 
     let Some(t) = reg!(table).get_table() else {
-        tail!(settable_slow);
+        tail!(set_slow);
     };
 
     // As in `op_gettable`; barrier work also goes to `settable_general`.
@@ -1382,7 +1303,7 @@ extern "rust-preserve-none" fn settable_general<'gc>(
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (src, table, key) = instruction.abc();
     let Some(t) = reg!(table).get_table() else {
-        tail!(settable_slow);
+        tail!(set_slow);
     };
 
     let k = reg!(key);
@@ -1393,43 +1314,13 @@ extern "rust-preserve-none" fn settable_general<'gc>(
     };
 
     if needs_newindex {
-        tail!(settable_slow);
+        tail!(set_slow);
     }
 
     check_index_key!(k);
     let mut t_state = t.inner().borrow_mut(ctx.mutation());
     t_state.raw_set_keyed(ctx, k, v);
     dispatch!()
-}
-
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn settable_slow<'gc>(
-    instruction: Instruction,
-    ctx: Context<'gc>,
-    thread: &mut ThreadState<'gc>,
-    registers: Registers<'gc, '_>,
-    ip: *const Instruction,
-    handlers: *const (),
-    ds: &mut DispatchState<'gc>,
-    frame: *mut LuaFrame<'gc>,
-    closure: LuaFn<'gc>,
-) -> Exit {
-    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-    let (src, table, key) = instruction.abc();
-    let (recv, k, v) = (reg!(table), reg!(key), reg!(src));
-    set_slow_body!(
-        ctx,
-        thread,
-        registers,
-        ip,
-        handlers,
-        ds,
-        recv,
-        k,
-        v,
-        raw_set_keyed
-    );
 }
 
 /// R[dst] = R[table][K[key_idx]]
@@ -1451,7 +1342,7 @@ extern "rust-preserve-none" fn op_getfield<'gc>(
 
     let Some(t) = reg!(table).get_table() else {
         // Non-table (userdata `__index`, or error) — handled by the slow path.
-        tail!(getfield_slow);
+        tail!(get_slow);
     };
 
     let t_state = t.inner().borrow();
@@ -1461,36 +1352,7 @@ extern "rust-preserve-none" fn op_getfield<'gc>(
         dispatch!();
     }
     drop(t_state);
-    tail!(getfield_slow);
-}
-
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn getfield_slow<'gc>(
-    instruction: Instruction,
-    ctx: Context<'gc>,
-    thread: &mut ThreadState<'gc>,
-    registers: Registers<'gc, '_>,
-    ip: *const Instruction,
-    handlers: *const (),
-    ds: &mut DispatchState<'gc>,
-    frame: *mut LuaFrame<'gc>,
-    closure: LuaFn<'gc>,
-) -> Exit {
-    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-    let (dst, table, ic_idx, key_idx) = instruction.abde();
-    let recv = reg!(table);
-    let k = constant!(key_idx);
-    let Some(t) = recv.get_table() else {
-        get_slow_body!(ctx, thread, registers, ip, handlers, ds, recv, k, dst);
-    };
-    match get_fill_ic(ctx, closure, ic_idx, t, k) {
-        Ok(v) => {
-            *reg!(ref mut dst) = v;
-            dispatch!();
-        }
-        Err(from) => index_chain_body!(ctx, thread, registers, ip, handlers, ds, from, k, dst),
-    }
+    tail!(get_slow);
 }
 
 /// R[table][K[key_idx]] = R[src]
@@ -1511,41 +1373,13 @@ extern "rust-preserve-none" fn op_setfield<'gc>(
     let (src, table, ic_idx, _key_idx) = instruction.abde();
 
     let Some(t) = reg!(table).get_table() else {
-        tail!(setfield_slow);
+        tail!(set_slow);
     };
 
     if ic_set(ctx, read_ic(closure, ic_idx), t, reg!(src)) {
         dispatch!();
     }
-    tail!(setfield_slow);
-}
-
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn setfield_slow<'gc>(
-    instruction: Instruction,
-    ctx: Context<'gc>,
-    thread: &mut ThreadState<'gc>,
-    registers: Registers<'gc, '_>,
-    ip: *const Instruction,
-    handlers: *const (),
-    ds: &mut DispatchState<'gc>,
-    frame: *mut LuaFrame<'gc>,
-    closure: LuaFn<'gc>,
-) -> Exit {
-    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-    let (src, table, ic_idx, key_idx) = instruction.abde();
-    let recv = reg!(table);
-    let k = constant!(key_idx);
-    let v = reg!(src);
-    if let Some(t) = recv.get_table()
-        && set_own_fill_ic(ctx, closure, ic_idx, t, k, v)
-    {
-        dispatch!();
-    }
-    set_slow_body!(
-        ctx, thread, registers, ip, handlers, ds, recv, k, v, raw_set
-    );
+    tail!(set_slow);
 }
 
 // ---------------------------------------------------------------------------
@@ -1572,7 +1406,7 @@ extern "rust-preserve-none" fn op_self<'gc>(
 
     let recv_val = reg!(object);
     let Some(recv) = recv_val.get_table() else {
-        tail!(op_self_slow);
+        tail!(get_slow);
     };
 
     let recv_state = recv.inner().borrow();
@@ -1583,54 +1417,7 @@ extern "rust-preserve-none" fn op_self<'gc>(
         dispatch!();
     }
     drop(recv_state);
-    tail!(op_self_slow);
-}
-
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn op_self_slow<'gc>(
-    instruction: Instruction,
-    ctx: Context<'gc>,
-    thread: &mut ThreadState<'gc>,
-    registers: Registers<'gc, '_>,
-    ip: *const Instruction,
-    handlers: *const (),
-    ds: &mut DispatchState<'gc>,
-    frame: *mut LuaFrame<'gc>,
-    closure: LuaFn<'gc>,
-) -> Exit {
-    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-    let (dst, object, ic_idx, key_idx) = instruction.abde();
-
-    let recv_val = reg!(object);
-    let key = constant!(key_idx);
-
-    let from = match recv_val.get_table() {
-        Some(recv) => match get_fill_ic(ctx, closure, ic_idx, recv, key) {
-            Ok(method) => {
-                *reg!(ref mut dst) = method;
-                *reg!(ref mut (dst + 1)) = recv_val;
-                dispatch!();
-            }
-            Err(from) => from,
-        },
-        None => recv_val,
-    };
-    match walk_index_chain(ctx, from, key) {
-        IndexChain::Resolved(method) => {
-            *reg!(ref mut dst) = method;
-            *reg!(ref mut (dst + 1)) = recv_val;
-            dispatch!();
-        }
-        IndexChain::Invoke { func, receiver } => {
-            // Functional __index. Pre-place self at dst+1; the
-            // continuation writes the resolved method into dst.
-            *reg!(ref mut (dst + 1)) = recv_val;
-            call_mm!(ret_store_a, Value::function(func), [receiver, key]);
-        }
-        IndexChain::NotIndexable(v) => raise!(OpError::Index(v)),
-        IndexChain::Exhausted => raise!(OpError::IndexChainLoop),
-    }
+    tail!(get_slow);
 }
 
 /// R[dst] = {}
@@ -1696,10 +1483,8 @@ macro_rules! arith_handler {
                 }
             }
 
-            tail!($slow_name);
+            tail!(binop_slow);
         }
-
-        binop_slow_handler!($slow_name, $instr, $num_kind, op_arith_slow, $mm, Arith);
     };
 }
 
@@ -1731,64 +1516,9 @@ macro_rules! bit_handler {
                 dispatch!();
             }
 
-            tail!($slow_name);
-        }
-
-        binop_slow_handler!($slow_name, $instr, $num_kind, op_bit_slow, $mm, Bitwise);
-    };
-}
-
-macro_rules! binop_slow_handler {
-    ($slow_name:ident, $instr:ident, $num_kind:ty, $num_mix_h:ident, $mm:ident, $err:ident) => {
-        #[inline(never)]
-        #[rustc_align(32)]
-        extern "rust-preserve-none" fn $slow_name<'gc>(
-            instruction: Instruction,
-            ctx: Context<'gc>,
-            thread: &mut ThreadState<'gc>,
-            registers: Registers<'gc, '_>,
-            ip: *const Instruction,
-            handlers: *const (),
-            ds: &mut DispatchState<'gc>,
-            frame: *mut LuaFrame<'gc>,
-            closure: LuaFn<'gc>,
-        ) -> Exit {
-            helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-            let (dst, lhs, rhs) = instruction.abc();
-            let (lhs, rhs) = (reg!(lhs), reg!(rhs));
-            binop_slow_body!(
-                dst, lhs, rhs, $num_kind, $num_mix_h, $mm, $err, ctx, thread, registers, ip,
-                handlers, ds
-            );
+            tail!(binop_slow);
         }
     };
-}
-
-/// The tail every binary-op slow path shares, given the operand *values*:
-/// the int/float mixed arm, then the metamethod, then the type error.
-/// Expects `helpers!` to have run in the enclosing handler.
-macro_rules! binop_slow_body {
-    ($dst:expr, $lhs:expr, $rhs:expr, $num_kind:ty, $num_mix_h:ident, $mm:ident, $err:ident,
-     $ctx:expr, $thread:expr, $registers:ident, $ip:ident, $handlers:expr, $ds:ident) => {{
-        let dst = $dst;
-        let (lhs, rhs): (Value<'gc>, Value<'gc>) = ($lhs, $rhs);
-        match num::$num_mix_h::<$num_kind>($ctx.mutation(), lhs, rhs) {
-            num::SlowNum::Value(v) => {
-                *reg!(ref mut dst) = v;
-                dispatch!();
-            }
-            num::SlowNum::ModByZero => raise!(OpError::ModByZero),
-            num::SlowNum::DivByZero => raise!(OpError::DivByZero),
-            num::SlowNum::NotNumbers => {}
-        }
-
-        let meta_fn = binop_metamethod($ctx, lhs, rhs, MetamethodBits::$mm);
-        if meta_fn.is_nil() {
-            raise!(OpError::$err(lhs, rhs));
-        }
-
-        call_mm!(ret_store_a, meta_fn, [lhs, rhs]);
-    }};
 }
 
 arith_handler!(op_add, op_add_slow, ADD, num::Add, ADD);
@@ -1860,10 +1590,8 @@ macro_rules! arith_imm_handler {
                 }
             }
 
-            tail!($slow_name);
+            tail!(binop_slow);
         }
-
-        binop_imm_slow_handler!($slow_name, $num_kind, op_arith_slow, $mm, Arith, $swap);
     };
 }
 
@@ -1898,36 +1626,7 @@ macro_rules! bit_imm_handler {
                 }
             }
 
-            tail!($slow_name);
-        }
-
-        binop_imm_slow_handler!($slow_name, $num_kind, op_bit_slow, $mm, Bitwise, $swap);
-    };
-}
-
-macro_rules! binop_imm_slow_handler {
-    ($slow_name:ident, $num_kind:ty, $num_mix_h:ident, $mm:ident, $err:ident, $swap:expr) => {
-        #[inline(never)]
-        #[rustc_align(32)]
-        extern "rust-preserve-none" fn $slow_name<'gc>(
-            instruction: Instruction,
-            ctx: Context<'gc>,
-            thread: &mut ThreadState<'gc>,
-            registers: Registers<'gc, '_>,
-            ip: *const Instruction,
-            handlers: *const (),
-            ds: &mut DispatchState<'gc>,
-            frame: *mut LuaFrame<'gc>,
-            closure: LuaFn<'gc>,
-        ) -> Exit {
-            helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-            let (dst, src, flipped) = instruction.abc_imm();
-            let (v, k) = (reg!(src), instruction.imm_value(ctx.mutation()));
-            let (lhs, rhs) = if $swap || flipped { (k, v) } else { (v, k) };
-            binop_slow_body!(
-                dst, lhs, rhs, $num_kind, $num_mix_h, $mm, $err, ctx, thread, registers, ip,
-                handlers, ds
-            );
+            tail!(binop_slow);
         }
     };
 }
@@ -2403,53 +2102,12 @@ macro_rules! cmp_handler {
             } else if let Some((x, y)) = Value::both_small(a, b) {
                 x $op y
             } else {
-                tail!($slow);
+                tail!(cmp_slow);
             };
             skip_if!(r != inverted);
             dispatch!();
         }
 
-        #[inline(never)]
-        #[rustc_align(32)]
-        extern "rust-preserve-none" fn $slow<'gc>(
-            instruction: Instruction,
-            ctx: Context<'gc>,
-            thread: &mut ThreadState<'gc>,
-            registers: Registers<'gc, '_>,
-            mut ip: *const Instruction,
-            handlers: *const (),
-            ds: &mut DispatchState<'gc>,
-            frame: *mut LuaFrame<'gc>,
-            closure: LuaFn<'gc>,
-        ) -> Exit {
-            helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-            let (lhs, rhs, inverted) = instruction.abc_flag();
-            let (a, b) = (reg!(lhs), reg!(rhs));
-            let primitive = if let Some(x) = a.get_integer()
-                && let Some(y) = b.get_integer()
-            {
-                Some(x $op y)
-            } else if let (Some(x), Some(y)) = (a.get_integer(), b.get_float()) {
-                Some($int_float(x, y))
-            } else if let (Some(x), Some(y)) = (a.get_float(), b.get_integer()) {
-                Some($float_int(x, y))
-            } else if let (Some(x), Some(y)) = (a.get_float(), b.get_float()) {
-                Some(x $op y)
-            } else if let (Some(x), Some(y)) = (a.get_string(), b.get_string()) {
-                Some(x $op y)
-            } else {
-                None
-            };
-            if let Some(r) = primitive {
-                skip_if!(r != inverted);
-                dispatch!();
-            }
-            let meta_fn = binop_metamethod(ctx, a, b, MetamethodBits::$mm);
-            if meta_fn.is_nil() {
-                raise!(OpError::Compare(a, b));
-            }
-            call_mm!(ret_cond_c, meta_fn, [a, b]);
-        }
     };
 }
 
@@ -2508,31 +2166,7 @@ macro_rules! cmp_imm_handler {
                 dispatch!();
             }
 
-            tail!($slow_name);
-        }
-
-        #[inline(never)]
-        #[rustc_align(32)]
-        extern "rust-preserve-none" fn $slow_name<'gc>(
-            instruction: Instruction,
-            ctx: Context<'gc>,
-            thread: &mut ThreadState<'gc>,
-            registers: Registers<'gc, '_>,
-            ip: *const Instruction,
-            handlers: *const (),
-            ds: &mut DispatchState<'gc>,
-            frame: *mut LuaFrame<'gc>,
-            closure: LuaFn<'gc>,
-        ) -> Exit {
-            helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-            let (src, _) = instruction.ab_imm_flag();
-            let (v, k) = (reg!(src), instruction.imm_value(ctx.mutation()));
-            let (a, b) = if $swap { (k, v) } else { (v, k) };
-            let meta_fn = binop_metamethod(ctx, a, b, MetamethodBits::$mm);
-            if meta_fn.is_nil() {
-                raise!(OpError::Compare(a, b));
-            }
-            call_mm!(ret_cond_b, meta_fn, [a, b]);
+            tail!(cmp_slow);
         }
     };
 }
@@ -5620,4 +5254,285 @@ fn native_entry<'gc>(
         }
         NativeStep::Exit => Exit::End,
     }
+}
+
+/// The slow path of every binary arithmetic and bitwise opcode, register and
+/// immediate forms alike: mixed and boxed numbers, division by zero, and the
+/// metamethods. The opcode says which operation it is and where its operands
+/// are.
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn binop_slow<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    use Op::*;
+    let op = instruction.op();
+    let dst = instruction.a();
+    let mc = ctx.mutation();
+    let (lhs, rhs) = match op {
+        ADD | SUB | MUL | MOD | POW | DIV | IDIV | BAND | BOR | BXOR | SHL | SHR => {
+            (reg!(instruction.b()), reg!(instruction.c()))
+        }
+        _ => {
+            let (_, src, flipped) = instruction.abc_imm();
+            let (v, k) = (reg!(src), instruction.imm_value(mc));
+            let swap = matches!(op, RSUBI | RMODI | RPOWI | RDIVI | RIDIVI | RSHLI | RSHRI);
+            if swap || flipped { (k, v) } else { (v, k) }
+        }
+    };
+    let (r, bit) = match op {
+        ADD | ADDI => (
+            num::op_arith_slow::<num::Add>(mc, lhs, rhs),
+            MetamethodBits::ADD,
+        ),
+        SUB | SUBI | RSUBI => (
+            num::op_arith_slow::<num::Sub>(mc, lhs, rhs),
+            MetamethodBits::SUB,
+        ),
+        MUL | MULI => (
+            num::op_arith_slow::<num::Mul>(mc, lhs, rhs),
+            MetamethodBits::MUL,
+        ),
+        MOD | MODI | RMODI => (
+            num::op_arith_slow::<num::Mod>(mc, lhs, rhs),
+            MetamethodBits::MOD,
+        ),
+        POW | POWI | RPOWI => (
+            num::op_arith_slow::<num::Pow>(mc, lhs, rhs),
+            MetamethodBits::POW,
+        ),
+        DIV | DIVI | RDIVI => (
+            num::op_arith_slow::<num::Div>(mc, lhs, rhs),
+            MetamethodBits::DIV,
+        ),
+        IDIV | IDIVI | RIDIVI => (
+            num::op_arith_slow::<num::IDiv>(mc, lhs, rhs),
+            MetamethodBits::IDIV,
+        ),
+        BAND | BANDI => (
+            num::op_bit_slow::<num::BAnd>(mc, lhs, rhs),
+            MetamethodBits::BAND,
+        ),
+        BOR | BORI => (
+            num::op_bit_slow::<num::BOr>(mc, lhs, rhs),
+            MetamethodBits::BOR,
+        ),
+        BXOR | BXORI => (
+            num::op_bit_slow::<num::BXor>(mc, lhs, rhs),
+            MetamethodBits::BXOR,
+        ),
+        SHL | SHLI | RSHLI => (
+            num::op_bit_slow::<num::Shl>(mc, lhs, rhs),
+            MetamethodBits::SHL,
+        ),
+        SHR | SHRI | RSHRI => (
+            num::op_bit_slow::<num::Shr>(mc, lhs, rhs),
+            MetamethodBits::SHR,
+        ),
+        _ => unreachable!("binop_slow on {op:?}"),
+    };
+    match r {
+        num::SlowNum::Value(v) => {
+            *reg!(ref mut dst) = v;
+            dispatch!();
+        }
+        num::SlowNum::ModByZero => raise!(OpError::ModByZero),
+        num::SlowNum::DivByZero => raise!(OpError::DivByZero),
+        num::SlowNum::NotNumbers => {}
+    }
+    let meta_fn = binop_metamethod(ctx, lhs, rhs, bit);
+    if meta_fn.is_nil() {
+        let bitwise = MetamethodBits::BAND | MetamethodBits::BOR | MetamethodBits::BXOR;
+        raise!(
+            if (bitwise | MetamethodBits::SHL | MetamethodBits::SHR).contains(bit) {
+                OpError::Bitwise(lhs, rhs)
+            } else {
+                OpError::Arith(lhs, rhs)
+            }
+        );
+    }
+    call_mm!(ret_store_a, meta_fn, [lhs, rhs]);
+}
+
+/// The slow path of the table reads (GETTABUP, GETTABLE, GETFIELD, SELF): a
+/// receiver that isn't a table, a cache miss, a key the table lacks, and
+/// `__index`. The opcode says where the receiver and key are.
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn get_slow<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let op = instruction.op();
+    let dst = instruction.a();
+    let recv = match op {
+        Op::GETTABUP => read_upvalue(thread, upvalue!(instruction.b())),
+        _ => reg!(instruction.b()),
+    };
+    if op == Op::SELF {
+        *reg!(ref mut (dst + 1)) = recv;
+    }
+    if op == Op::GETTABLE {
+        get_slow_body!(
+            ctx,
+            thread,
+            registers,
+            ip,
+            handlers,
+            ds,
+            recv,
+            reg!(instruction.c()),
+            dst
+        );
+    }
+    let k = constant!(instruction.e());
+    let Some(t) = recv.get_table() else {
+        index_chain_body!(ctx, thread, registers, ip, handlers, ds, recv, k, dst);
+    };
+    match get_fill_ic(ctx, closure, instruction.d(), t, k) {
+        Ok(v) => {
+            *reg!(ref mut dst) = v;
+            dispatch!();
+        }
+        Err(from) => index_chain_body!(ctx, thread, registers, ip, handlers, ds, from, k, dst),
+    }
+}
+
+/// The slow path of the table writes (SETTABUP, SETTABLE, SETFIELD), like
+/// [`get_slow`]'s.
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn set_slow<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let op = instruction.op();
+    let v = reg!(instruction.a());
+    let recv = match op {
+        Op::SETTABUP => read_upvalue(thread, upvalue!(instruction.b())),
+        _ => reg!(instruction.b()),
+    };
+    if op == Op::SETTABLE {
+        let k = reg!(instruction.c());
+        set_slow_body!(
+            ctx,
+            thread,
+            registers,
+            ip,
+            handlers,
+            ds,
+            recv,
+            k,
+            v,
+            raw_set_keyed
+        );
+    }
+    let k = constant!(instruction.e());
+    if let Some(t) = recv.get_table()
+        && set_own_fill_ic(ctx, closure, instruction.d(), t, k, v)
+    {
+        dispatch!();
+    }
+    set_slow_body!(
+        ctx, thread, registers, ip, handlers, ds, recv, k, v, raw_set
+    );
+}
+
+/// The slow path of LT, LE and their immediate forms: boxed and mixed
+/// numbers, strings, and the metamethods.
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn cmp_slow<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let op = instruction.op();
+    let imm = !matches!(op, Op::LT | Op::LE);
+    let (a, b, inverted) = if imm {
+        let (src, inverted) = instruction.ab_imm_flag();
+        let (v, k) = (reg!(src), instruction.imm_value(ctx.mutation()));
+        let (a, b) = if matches!(op, Op::GTI | Op::GEI) {
+            (k, v)
+        } else {
+            (v, k)
+        };
+        (a, b, inverted)
+    } else {
+        let (lhs, rhs, inverted) = instruction.abc_flag();
+        (reg!(lhs), reg!(rhs), inverted)
+    };
+    let le = matches!(op, Op::LE | Op::LEI | Op::GEI);
+    let primitive = if let Some(x) = a.get_integer()
+        && let Some(y) = b.get_integer()
+    {
+        Some(if le { x <= y } else { x < y })
+    } else if let (Some(x), Some(y)) = (a.get_integer(), b.get_float()) {
+        Some(if le {
+            num::le_int_float(x, y)
+        } else {
+            num::lt_int_float(x, y)
+        })
+    } else if let (Some(x), Some(y)) = (a.get_float(), b.get_integer()) {
+        Some(if le {
+            num::le_float_int(x, y)
+        } else {
+            num::lt_float_int(x, y)
+        })
+    } else if let (Some(x), Some(y)) = (a.get_float(), b.get_float()) {
+        Some(if le { x <= y } else { x < y })
+    } else if let (Some(x), Some(y)) = (a.get_string(), b.get_string()) {
+        Some(if le { x <= y } else { x < y })
+    } else {
+        None
+    };
+    if let Some(r) = primitive {
+        skip_if!(r != inverted);
+        dispatch!();
+    }
+    let bit = if le {
+        MetamethodBits::LE
+    } else {
+        MetamethodBits::LT
+    };
+    let meta_fn = binop_metamethod(ctx, a, b, bit);
+    if meta_fn.is_nil() {
+        raise!(OpError::Compare(a, b));
+    }
+    if imm {
+        call_mm!(ret_cond_b, meta_fn, [a, b]);
+    }
+    call_mm!(ret_cond_c, meta_fn, [a, b]);
 }
