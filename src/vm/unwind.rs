@@ -63,7 +63,11 @@ pub(crate) fn unwind<'gc>(
                     let handler = if exit { None } else { native_catch(ts, lf) };
                     let at = lf.base() + lf.num_extras as usize;
                     let Some(handler) = handler else {
+                        let task = lf.pc == crate::vm::async_native::async_cont as *const _;
                         ts.pop_lua();
+                        if task {
+                            ts.drop_task();
+                        }
                         continue;
                     };
                     if detached {

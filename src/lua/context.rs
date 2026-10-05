@@ -66,6 +66,29 @@ impl<'gc> Context<'gc> {
         self.state.unwind
     }
 
+    /// A fresh epoch for an async native's locals, never 0.
+    pub(crate) fn next_epoch(self) -> u32 {
+        let e = self.state.epoch.get().wrapping_add(1).max(1);
+        self.state.epoch.set(e);
+        e
+    }
+
+    /// Make `waker` the step's (see `waker`), returning the one it replaces.
+    pub(crate) fn set_waker(self, waker: *const std::task::Waker) -> *const std::task::Waker {
+        self.state.waker.replace(waker)
+    }
+
+    /// The waker of the step in progress.
+    pub(crate) fn waker(self) -> &'gc std::task::Waker {
+        let w = self.state.waker.get();
+        if w.is_null() {
+            std::task::Waker::noop()
+        } else {
+            // SAFETY: set by `Executor::step` for its duration.
+            unsafe { &*w }
+        }
+    }
+
     /// Dict-mode sentinel for tables with no metatable. Tables that
     /// migrate to dict mode while carrying a metatable use the
     /// per-`MtCache` sentinel instead.

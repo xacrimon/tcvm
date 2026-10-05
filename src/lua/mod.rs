@@ -57,6 +57,13 @@ pub struct State<'gc> {
     /// The function of the native frames the unwinder runs a message handler
     /// or `__close` calls from.
     pub(crate) unwind: Function<'gc>,
+    /// The last epoch an async native got (see `ThreadState::local_epoch`).
+    #[collect(require_static)]
+    pub(crate) epoch: std::cell::Cell<u32>,
+    /// The waker of the step in progress, null outside one: what an async
+    /// native's future waits on the host with.
+    #[collect(require_static)]
+    pub(crate) waker: std::cell::Cell<*const std::task::Waker>,
 }
 
 impl<'gc> State<'gc> {
@@ -114,6 +121,8 @@ impl Lua {
                 next: Function::new_native(mc, builtin::lua_next, &[]),
                 ipairs_iter: Function::new_action(mc, builtin::ipairs_aux, &[]),
                 unwind: Function::new_native(mc, crate::vm::unwind::unwind_native, &[]),
+                epoch: std::cell::Cell::new(0),
+                waker: std::cell::Cell::new(std::ptr::null()),
             }
         });
         let metrics = arena.metrics();
@@ -218,6 +227,27 @@ impl Lua {
     /// public host-side resume API isn't implemented yet.
     pub fn finish(&mut self, ex: &StashedExecutor) -> Result<(), RuntimeError> {
         self.drive(ex, |_, _| Ok(()))
+    }
+
+    /// [`finish`](Self::finish) for an async host: a step that waits on the
+    /// host (an async native awaiting a host future) leaves the future
+    /// pending until it is woken.
+    pub async fn finish_async(&mut self, ex: &StashedExecutor) -> Result<(), RuntimeError> {
+        std::future::poll_fn(|cx| {
+            let step = self.try_enter(|ctx| -> Result<bool, RuntimeError> {
+                Ok(match ctx.fetch(ex).step_waker(ctx, cx.waker())? {
+                    StepResult::Done => true,
+                    StepResult::Yielded(_) => return Err(RuntimeError::MainYielded),
+                    StepResult::Pending => false,
+                })
+            });
+            match step {
+                Ok(true) => std::task::Poll::Ready(Ok(())),
+                Ok(false) => std::task::Poll::Pending,
+                Err(e) => std::task::Poll::Ready(Err(e)),
+            }
+        })
+        .await
     }
 
     /// `finish` then take typed results from the executor.
