@@ -45,21 +45,25 @@ pub enum ThreadStatus {
 /// frame below on top again. A call site picks it (CALL, a metamethod or
 /// iterator, the executor), and it decodes what it needs from its own
 /// instruction, LuaJIT Remake style.
+// `repr(C)`, as `ret` before `pc` matters: a continuation reloads the
+// caller's `closure` and `pc`, and a load pair over the `pc` CALL just
+// stored stalls store forwarding.
 #[derive(Clone, Copy, Collect)]
 #[collect(internal, no_drop)]
+#[repr(C)]
 pub struct LuaFrame<'gc> {
     /// A `NATIVE` frame's holds the native function, and is never
     /// dereferenced as a Lua closure.
     pub(crate) closure: LuaFn<'gc>,
+    /// Where this frame's results go; see [`ret_args`](crate::vm::interp).
+    #[collect(require_static)]
+    pub(crate) ret: Handler,
     /// Resume address: points *past* the instruction being executed, into
     /// `closure.proto.code` (which the frame keeps alive). A raw pointer
     /// rather than an index so CALL saves it with one store. A `NATIVE`
     /// frame's is its continuation (`NativeCont`).
     #[collect(require_static)]
     pub(crate) pc: *const crate::instruction::Instruction,
-    /// Where this frame's results go; see [`ret_args`](crate::vm::interp).
-    #[collect(require_static)]
-    pub(crate) ret: Handler,
     /// Read through `base()`. 32 bits: a frame sits inside the stack, and
     /// every growth of the stack goes through `grow_slots`, which keeps it
     /// below 2^32 slots.
@@ -122,6 +126,29 @@ pub mod frame_flags {
 const _: () = assert!(std::mem::size_of::<LuaFrame<'static>>() == 32);
 
 impl<'gc> LuaFrame<'gc> {
+    /// Write a flagless Lua frame to `dst`.
+    ///
+    /// # Safety
+    /// `dst` is valid for writes.
+    #[inline(always)]
+    pub(crate) unsafe fn write_lua(
+        dst: *mut Self,
+        closure: LuaFn<'gc>,
+        pc: *const crate::instruction::Instruction,
+        ret: Handler,
+        base: u32,
+        num_extras: u16,
+    ) {
+        unsafe {
+            (&raw mut (*dst).closure).write(closure);
+            (&raw mut (*dst).pc).write(pc);
+            (&raw mut (*dst).ret).write(ret);
+            (&raw mut (*dst).base).write(base);
+            (&raw mut (*dst).num_extras).write(num_extras);
+            (&raw mut (*dst).flags).write(0);
+        }
+    }
+
     #[inline(always)]
     pub fn base(&self) -> usize {
         self.base as usize
@@ -578,19 +605,31 @@ impl<'gc> ThreadState<'gc> {
         self.frames.reserve(1);
     }
 
-    /// `push_lua` for the interpreter, room already made (`reserve_frames`).
+    /// `push_lua` for the interpreter, room already made (`reserve_frames`):
+    /// write a flagless Lua frame above `top` and return it.
     ///
     /// # Safety
-    /// `frames.len() < frames.capacity()`, and the innermost frame is a Lua frame.
+    /// `top` is the innermost frame, a Lua frame, and
+    /// `frames.len() < frames.capacity()`.
     #[inline(always)]
-    pub(crate) unsafe fn push_lua_unchecked(&mut self, lf: LuaFrame<'gc>) {
-        debug_assert!(lf.base() >= 1);
+    pub(crate) unsafe fn push_lua_above(
+        &mut self,
+        top: *mut LuaFrame<'gc>,
+        closure: LuaFn<'gc>,
+        pc: *const crate::instruction::Instruction,
+        ret: Handler,
+        base: u32,
+        num_extras: u16,
+    ) -> *mut LuaFrame<'gc> {
+        debug_assert!(base >= 1);
         debug_assert!(self.frames.len() < self.frames.capacity());
         debug_assert!(self.top_is_lua());
-        let len = self.frames.len();
+        debug_assert!(std::ptr::eq(top, unsafe { self.top_lua_ptr() }));
         unsafe {
-            self.frames.as_mut_ptr().add(len).write(lf);
-            self.frames.set_len(len + 1);
+            let new = top.add(1);
+            LuaFrame::write_lua(new, closure, pc, ret, base, num_extras);
+            self.frames.set_len(self.frames.len() + 1);
+            new
         }
     }
 

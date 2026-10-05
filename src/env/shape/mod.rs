@@ -634,7 +634,10 @@ impl<'gc> MtCache<'gc> {
                         None if value.is_nil() => None,
                         None => {
                             let mc = mc.expect("a metamethod stored without a mutation");
-                            let rest = Gc::new(mc, MmValues(std::array::from_fn(|_| Cell::new(Value::nil()))));
+                            let rest = Gc::new(
+                                mc,
+                                MmValues(std::array::from_fn(|_| Cell::new(Value::nil()))),
+                            );
                             // Adopting a fresh `Gc` through the lock: barrier
                             // first, as `ensure_dict_sentinel` does.
                             mc.backward_barrier(Gc::erase(self.0), None);

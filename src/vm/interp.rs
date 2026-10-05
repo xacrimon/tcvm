@@ -14,7 +14,26 @@ use crate::instruction::{Instruction, Op, TFOR_VARS, UpValueDescriptor};
 use crate::lua::Context;
 use crate::vm::num;
 
-static HANDLERS: [Handler; Op::COUNT] = Op::table([
+/// A handler per opcode, then CALL's continuation per C operand, so that
+/// CALL reads it off the `handlers` register (`call_ret`).
+#[repr(C)]
+struct Dispatch {
+    ops: [Handler; Op::COUNT],
+    rets: [Handler; 256],
+}
+
+static DISPATCH: Dispatch = Dispatch {
+    ops: HANDLERS,
+    rets: {
+        let mut t: [Handler; 256] = [ret_call; 256];
+        t[1] = ret_call0;
+        t[2] = ret_call1;
+        t[3] = ret_call2;
+        t
+    },
+};
+
+const HANDLERS: [Handler; Op::COUNT] = Op::table([
     (Op::MOVE, op_move),
     (Op::LOAD, op_load),
     (Op::LFALSESKIP, op_lfalseskip),
@@ -252,7 +271,7 @@ macro_rules! helpers {
                     let _ = $instruction;
                     let instruction = *$ip;
                     let pos = instruction.opcode() as usize;
-                    debug_assert!(pos < HANDLERS.len());
+                    debug_assert!(pos < Op::COUNT);
                     let handler = *$handlers.cast::<Handler>().add(pos);
                     let ip = $ip.add(1);
                     become handler(
@@ -978,8 +997,8 @@ fn set_own_fill_ic<'gc>(
     if existing.is_nil() && newindex {
         if cache {
             if site_fills(unsafe { *site }) {
-        fill_ic(ctx, closure, ic_idx, site, shape_entry(shape, slot));
-    }
+                fill_ic(ctx, closure, ic_idx, site, shape_entry(shape, slot));
+            }
         }
         return false;
     }
@@ -1039,7 +1058,7 @@ pub(crate) fn run_thread<'gc>(ctx: Context<'gc>, thread: Thread<'gc>) -> (Exit, 
 /// Start dispatch on `ts`: run what the executor delivered, or the top
 /// frame from its `pc`.
 fn enter<'gc>(ctx: Context<'gc>, ts: &mut ThreadState<'gc>, ds: &mut DispatchState<'gc>) -> Exit {
-    let handlers = HANDLERS.as_ptr() as *const ();
+    let handlers = &DISPATCH as *const Dispatch as *const ();
     if let Some(p) = ts.pending_ret.take() {
         // The call site's frame, if it has one: a coroutine's body has none.
         let frame = ts
@@ -2609,7 +2628,7 @@ macro_rules! call_lua {
         call_lua!(@inner false, $($rest)*)
     };
     (@inner $grow:literal, $callee:expr, $func_idx:expr, $nargs:expr, $returns:expr,
-     $thread:ident, $registers:ident, $ip:ident, $ds:ident, $frame:ident, $closure:ident) => {{
+     $thread:ident, $registers:ident, $ip:ident, $handlers:ident, $frame:ident, $closure:ident) => {{
         let callee: LuaFn<'gc> = $callee;
         let new_base = $func_idx + 1;
         unsafe { (*$frame).pc = $ip };
@@ -2626,9 +2645,7 @@ macro_rules! call_lua {
         // Fixed-arg call with every parameter supplied is the common shape and
         // needs no counting; the rest (MULTRET via `thread.top`, missing
         // parameters, varargs) goes through the general accounting.
-        let num_extras = if std::hint::likely(
-            $nargs as usize > num_params && !callee.is_vararg,
-        ) {
+        let num_extras = if std::hint::likely($nargs > callee.fixed_arity) {
             0
         } else {
             // `nargs == 0` is the MULTRET sentinel: read the count from `thread.top`.
@@ -2655,23 +2672,25 @@ macro_rules! call_lua {
             }
         };
         $ip = callee.code;
-        let frame = LuaFrame {
-            closure: callee,
-            pc: $ip,
-            ret: call_ret($returns),
-            base: new_base as u32,
-            num_extras,
-            flags: 0,
-        };
+        // `call_ret`, off the dispatch pointer already in a register.
+        let ret = unsafe { *$handlers.cast::<Handler>().add(Op::COUNT + $returns as usize) };
         if $grow {
-            $thread.push_lua(frame);
+            $thread.push_lua(LuaFrame {
+                closure: callee,
+                pc: $ip,
+                ret,
+                base: new_base as u32,
+                num_extras,
+                flags: 0,
+            });
             ($frame, $closure) = top_frame($thread);
         } else {
             // The new frame sits one slot above the running one, and the
-            // closure is already in hand: no trip through `thread.frames`
-            // (whose length we just stored) to find either.
-            unsafe { $thread.push_lua_unchecked(frame) };
-            $frame = unsafe { $frame.add(1) };
+            // closure is already in hand: no trip through `thread.frames` to
+            // find either.
+            $frame = unsafe {
+                $thread.push_lua_above($frame, callee, $ip, ret, new_base as u32, num_extras)
+            };
             $closure = callee;
         }
         $registers = unsafe { $thread.stack.as_mut_ptr().add(new_base) };
@@ -2710,8 +2729,8 @@ extern "rust-preserve-none" fn op_call<'gc>(
                 }
                 let callee = unsafe { LuaFn::from_function_unchecked(f) };
                 call_lua!(
-                    nogrow, callee, func_idx, nargs, returns, thread, registers, ip, ds, frame,
-                    closure
+                    nogrow, callee, func_idx, nargs, returns, thread, registers, ip, handlers,
+                    frame, closure
                 );
             }
             FunctionKind::Native(nc) => {
@@ -3003,7 +3022,8 @@ extern "rust-preserve-none" fn op_call_meta<'gc>(
     match target {
         CallTarget::Lua(callee) => {
             call_lua!(
-                grow, callee, func_idx, nargs, returns, thread, registers, ip, ds, frame, closure
+                grow, callee, func_idx, nargs, returns, thread, registers, ip, handlers, frame,
+                closure
             );
         }
         CallTarget::Native(nc) => {
@@ -5926,8 +5946,7 @@ extern "rust-preserve-none" fn cmp_slow<'gc>(
 /// call variants are.
 #[inline(always)]
 fn call_ret(returns: u8) -> Handler {
-    static RETS: [Handler; 5] = [ret_call, ret_call0, ret_call1, ret_call2, ret_call];
-    RETS[(returns as usize).min(4)]
+    DISPATCH.rets[returns as usize]
 }
 
 /// [`ret_call`] for a CALL that keeps `$n` results, nil-padded.
@@ -5950,6 +5969,8 @@ macro_rules! ret_call_n {
         ) -> Exit {
             let (nret, values, dst) = ret_args!(instruction, registers, ip);
             helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+            let base = unsafe { (*frame).base() };
+            let _ = resume_caller!(thread, registers, ip, frame, closure);
             for i in 0..$n {
                 let v = if i < nret {
                     unsafe { values.add(i).read() }
@@ -5958,9 +5979,10 @@ macro_rules! ret_call_n {
                 };
                 unsafe { dst.add(i).write(v) };
             }
-            let _ = resume_caller!(thread, registers, ip, frame, closure);
-            let dst = unsafe { dst.offset_from_unsigned(thread.stack.as_ptr()) };
-            thread.set_top_unchecked(dst + $n);
+            // Nothing above the caller's window is pending, and the window
+            // is live anyway: `base` is a valid `top` that drops whatever
+            // the callee left above it (#43), one store instead of a count.
+            thread.set_top_unchecked(base);
             dispatch!();
         }
     };
