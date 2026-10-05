@@ -90,3 +90,37 @@ return cat(#m, m.tag, m.n, m[1], m[100], k, c, t.q, t.k600)
 "#;
     assert_eq!(ok(src), "100 div 3 10 100 102 601 2 600");
 }
+
+/// Constructors sized by the fields later statements store into them: a
+/// module, a `setmetatable({}, C)` object, a shadowed local, and a rebound
+/// `setmetatable` that returns another table.
+#[test]
+fn sized_by_later_stores() {
+    let src = r#"
+local M = {}
+function M.f() return 1 end
+function M:g() return self.c end
+M.c, M.d = 3, 4
+local C = {}
+C.__index = C
+local function new(x)
+  local self = setmetatable({}, C)
+  self.x = x
+  self.y = x * 2
+  return self
+end
+local o = new(5)
+local shadow = {a = 1}
+local shadow = {}
+shadow.b = 2
+local setmetatable = function(t) return {z = 9} end
+local r = setmetatable({}, C)
+r.w = 1
+local big = {}
+for _, k in ipairs({'a','b','c','d','e','f','g','h','i','j'}) do big[k] = k end
+big.k1 = 1 big.k2 = 2 big.k3 = 3
+local n = 0 for _ in pairs(big) do n = n + 1 end
+return cat(M.f(), M:g(), M.d, o.x, o.y, getmetatable(o) == C, shadow.a, shadow.b, r.z, r.w, n)
+"#;
+    assert_eq!(ok(src), "1 3 4 5 10 true nil 2 9 1 13");
+}
