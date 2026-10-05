@@ -655,16 +655,36 @@ fn fill_ic<'gc>(
         // because it skips the automatic barrier `Lock::set` on
         // `Gc<Lock<T>>` would emit.
         ctx.mutation().backward_barrier(Gc::erase(proto_gc), None);
+        let first = matches!(slot_lock.get(), InlineCache::Empty);
         unsafe { slot_lock.as_cell() }.set(entry);
-        quicken(site, &entry);
+        quicken(site, &entry, first);
     }
 }
 
+/// Refills a table access site takes before it counts as megamorphic and
+/// stops refilling (see [`site_fills`]).
+const MEGAMORPHIC: u8 = 16;
+
+/// Whether a miss at the table access `insn` should refill its cache: not
+/// once it has been refilled [`MEGAMORPHIC`] times, which its unused `c`
+/// slot counts. Refilling a site that sees a new shape each time (a
+/// metatable per object) costs a barrier and a rewrite on every miss.
+#[inline(always)]
+fn site_fills(insn: Instruction) -> bool {
+    insn.c() < MEGAMORPHIC
+}
+
 /// Rewrite the table access at `site` to the form for `entry`, its cache's
-/// new contents (see `Op::unquickened`).
+/// new contents (see `Op::unquickened`), and count a refill. Only a `first`
+/// fill quickens: a site whose entry changes kind goes back to the generic
+/// form for good, rather than flipping its opcode (and its dispatch target)
+/// on every miss.
 #[inline]
-fn quicken(site: *const Instruction, entry: &InlineCache<'_>) {
-    let insn = unsafe { *site };
+fn quicken(site: *const Instruction, entry: &InlineCache<'_>, first: bool) {
+    let mut insn = unsafe { *site };
+    if !first {
+        insn.set_c(insn.c().saturating_add(1));
+    }
     let op = match (insn.op().unquickened(), entry) {
         (Op::GETFIELD, InlineCache::Own { .. }) => Op::GETFIELD_OWN,
         (Op::GETFIELD, InlineCache::Absent { .. }) => Op::GETFIELD_ABSENT,
@@ -683,10 +703,13 @@ fn quicken(site: *const Instruction, entry: &InlineCache<'_>) {
         (Op::SETTABUP, InlineCache::Absent { .. }) => Op::SETTABUP_ABSENT,
         (op, _) => op,
     };
-    if op != insn.op() {
-        // SAFETY: `Code` keeps instructions in cells, and `site` came from one.
-        unsafe { site.cast_mut().write(insn.with_op(op)) };
-    }
+    let op = if first || op == insn.op() {
+        op
+    } else {
+        insn.op().unquickened()
+    };
+    // SAFETY: `Code` keeps instructions in cells, and `site` came from one.
+    unsafe { site.cast_mut().write(insn.with_op(op)) };
 }
 
 /// The entry for a lookup of a key in `shape` that found `slot`.
@@ -847,7 +870,9 @@ fn get_fill_ic<'gc>(
         return get_index_fill_ic(ctx, closure, ic_idx, site, t, index, Some(shape), k);
     }
     let slot = shape.find_slot(constant_key(k));
-    fill_ic(ctx, closure, ic_idx, site, shape_entry(shape, slot));
+    if site_fills(unsafe { *site }) {
+        fill_ic(ctx, closure, ic_idx, site, shape_entry(shape, slot));
+    }
     let v = slot.map_or(Value::nil(), |s| state.named_get(s));
     if !v.is_nil() || !shape.has_mm(MetamethodBits::INDEX) {
         return Ok(v);
@@ -906,7 +931,9 @@ fn get_index_fill_ic<'gc>(
             holder_shape,
             loc: SlotLoc::new(holder_shape, holder_slot),
         };
-        fill_ic(ctx, closure, ic_idx, site, entry);
+        if site_fills(unsafe { *site }) {
+            fill_ic(ctx, closure, ic_idx, site, entry);
+        }
     }
     Ok(v)
 }
@@ -950,7 +977,9 @@ fn set_own_fill_ic<'gc>(
     let existing = slot.map_or(Value::nil(), |s| state.named_get(s));
     if existing.is_nil() && newindex {
         if cache {
-            fill_ic(ctx, closure, ic_idx, site, shape_entry(shape, slot));
+            if site_fills(unsafe { *site }) {
+                fill_ic(ctx, closure, ic_idx, site, shape_entry(shape, slot));
+            }
         }
         return false;
     }
@@ -959,7 +988,7 @@ fn set_own_fill_ic<'gc>(
     let entry = match slot {
         Some(slot) => {
             state.named_set(slot, v);
-            state.maybe_update_mt_bit(k, v);
+            state.maybe_update_mt_bit(ctx.mutation(), k, v);
             shape_entry(shape, Some(slot))
         }
         None => {
@@ -980,7 +1009,9 @@ fn set_own_fill_ic<'gc>(
     };
     drop(state);
     if cache {
-        fill_ic(ctx, closure, ic_idx, site, entry);
+        if site_fills(unsafe { *site }) {
+            fill_ic(ctx, closure, ic_idx, site, entry);
+        }
     }
     true
 }
