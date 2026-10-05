@@ -17,6 +17,7 @@
 
 use core::cell::{Cell, UnsafeCell};
 use core::mem::MaybeUninit;
+use core::ops::Not;
 use core::ptr::NonNull;
 
 use bitflags::bitflags;
@@ -439,12 +440,14 @@ pub struct MtCacheData<'gc> {
     /// Read by the collector when it traces a table with this metatable.
     #[collect(require_static)]
     pub weak: Cell<WeakMode>,
-    /// Address of the table `__index` names, else 0. Untraced, as it only
-    /// identifies: every `__index` write updates it, weak clears included.
-    #[collect(require_static)]
-    index_table: Cell<usize>,
-    /// The metamethods by bit index, kept like `bits`.
-    values: MmValues<'gc>,
+    /// `__index` and `__newindex`, kept like `bits` (weak clears included),
+    /// inline as every table access may need them.
+    index: MmValue<'gc>,
+    newindex: MmValue<'gc>,
+    /// The other metamethods by bit index, allocated once the metatable has
+    /// one: a metatable made per object (`{__index = C}`) is adopted per
+    /// object, and a cache with all of them inline was five times the size.
+    rest: Lock<Option<Gc<'gc, MmValues<'gc>>>>,
     /// Lazily-allocated dict-mode sentinel for tables that drop into
     /// dict mode while carrying this metatable. Populated on the first
     /// call to `MtCache::ensure_dict_sentinel`; subsequent calls return
@@ -453,14 +456,24 @@ pub struct MtCacheData<'gc> {
     pub dict_sentinel: Lock<Option<Shape<'gc>>>,
 }
 
-/// [`MtCacheData::values`]. Untraced: the metatable holds every one, and
+/// A metamethod in [`MtCacheData`]. Untraced: the metatable holds it, and
 /// is alive whenever a shape carrying the cache is read (see
 /// `MtCacheData::table`).
+pub struct MmValue<'gc>(Cell<Value<'gc>>);
+
+unsafe impl<'gc> Collect<'gc> for MmValue<'gc> {
+    const NEEDS_TRACE: bool = false;
+}
+
+/// [`MtCacheData::rest`], untraced like [`MmValue`].
 pub struct MmValues<'gc>([Cell<Value<'gc>>; METAMETHOD_COUNT]);
 
 unsafe impl<'gc> Collect<'gc> for MmValues<'gc> {
     const NEEDS_TRACE: bool = false;
 }
+
+const INDEX_IDX: usize = MetamethodBits::INDEX.bits().trailing_zeros() as usize;
+const NEWINDEX_IDX: usize = MetamethodBits::NEWINDEX.bits().trailing_zeros() as usize;
 
 impl<'gc> MtCacheData<'gc> {
     #[inline]
@@ -510,7 +523,10 @@ impl<'gc> MtCache<'gc> {
                 bits |= MetamethodBits::from_bits_retain(1 << i);
             }
         }
-        let index = values[MetamethodBits::INDEX.bits().trailing_zeros() as usize];
+        let rest = (bits & !(MetamethodBits::INDEX | MetamethodBits::NEWINDEX))
+            .is_empty()
+            .not()
+            .then(|| Gc::new(mc, MmValues(values.map(Cell::new))));
         MtCache(Gc::new(
             mc,
             MtCacheData {
@@ -519,8 +535,9 @@ impl<'gc> MtCache<'gc> {
                     .cast(),
                 bits: Cell::new(bits),
                 weak: Cell::new(weak),
-                index_table: Cell::new(table_addr(index)),
-                values: MmValues(values.map(Cell::new)),
+                index: MmValue(Cell::new(values[INDEX_IDX])),
+                newindex: MmValue(Cell::new(values[NEWINDEX_IDX])),
+                rest: Lock::new(rest),
                 dict_sentinel: Lock::new(None),
             },
         ))
@@ -571,13 +588,22 @@ impl<'gc> MtCache<'gc> {
     /// The metamethod `bit` names, nil when absent.
     #[inline(always)]
     pub fn mm(self, bit: MetamethodBits) -> Value<'gc> {
-        self.0.values.0[bit.bits().trailing_zeros() as usize].get()
+        if bit == MetamethodBits::INDEX {
+            self.0.index.0.get()
+        } else if bit == MetamethodBits::NEWINDEX {
+            self.0.newindex.0.get()
+        } else {
+            match self.0.rest.get() {
+                Some(rest) => rest.0[bit.bits().trailing_zeros() as usize].get(),
+                None => Value::nil(),
+            }
+        }
     }
 
-    /// See [`MtCacheData::index_table`].
+    /// Address of the table `__index` names, else 0: it only identifies.
     #[inline]
     pub fn index_table(self) -> usize {
-        self.0.index_table.get()
+        table_addr(self.0.index.0.get())
     }
 
     /// The metatable this caches.
@@ -592,15 +618,34 @@ impl<'gc> MtCache<'gc> {
     }
 
     /// Mirror a write of `key` to this cache's metatable into its bits and
-    /// weak mode; only keys [`mirrored`] names change anything.
+    /// weak mode; only keys [`mirrored`] names change anything. `mc` may be
+    /// `None` for a store of nil (a weak clear), which allocates nothing.
     #[inline]
-    pub fn mirror(self, key: LuaString<'gc>, value: Value<'gc>) {
+    pub fn mirror(self, mc: Option<&Mutation<'gc>>, key: LuaString<'gc>, value: Value<'gc>) {
         match metamethod_bit_of_bytes(key.as_bytes()) {
             Some(bit) => {
                 if bit == MetamethodBits::INDEX {
-                    self.0.index_table.set(table_addr(value));
+                    self.0.index.0.set(value);
+                } else if bit == MetamethodBits::NEWINDEX {
+                    self.0.newindex.0.set(value);
+                } else {
+                    let rest = match self.0.rest.get() {
+                        Some(rest) => Some(rest),
+                        None if value.is_nil() => None,
+                        None => {
+                            let mc = mc.expect("a metamethod stored without a mutation");
+                            let rest = Gc::new(mc, MmValues(std::array::from_fn(|_| Cell::new(Value::nil()))));
+                            // Adopting a fresh `Gc` through the lock: barrier
+                            // first, as `ensure_dict_sentinel` does.
+                            mc.backward_barrier(Gc::erase(self.0), None);
+                            unsafe { self.0.rest.as_cell() }.set(Some(rest));
+                            Some(rest)
+                        }
+                    };
+                    if let Some(rest) = rest {
+                        rest.0[bit.bits().trailing_zeros() as usize].set(value);
+                    }
                 }
-                self.0.values.0[bit.bits().trailing_zeros() as usize].set(value);
                 self.update(bit, value)
             }
             None if key.as_bytes() == b"__mode" => self.0.weak.set(WeakMode::of(value)),

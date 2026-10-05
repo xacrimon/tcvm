@@ -209,14 +209,33 @@ impl<'gc> Table<'gc> {
         if let Some(c) = self.0.borrow().mt_cache() {
             return c;
         }
-        // First adoption: walk the table once to read the metamethods.
-        let values = {
+        // First adoption: read the metamethods. A metatable made per object
+        // (`setmetatable(o, {__index = C})`) is adopted once per object, so
+        // a shape-mode one is read through its few keys, not by name.
+        let (values, weak) = {
             let state = self.0.borrow();
-            ctx.symbols()
-                .metamethods()
-                .map(|(name, _)| state.raw_get(Value::string(name)))
+            let shape = state.shape();
+            if shape.is_dict() {
+                let values = ctx
+                    .symbols()
+                    .metamethods()
+                    .map(|(name, _)| state.raw_get(Value::string(name)));
+                let weak = WeakMode::of(state.raw_get(Value::string(ctx.symbols().mode)));
+                (values, weak)
+            } else {
+                let mut values = [Value::nil(); crate::env::symbols::METAMETHOD_COUNT];
+                let mut weak = WeakMode::empty();
+                for (slot, &key) in shape.keys().iter().enumerate() {
+                    let name = key.as_bytes();
+                    if let Some(bit) = shape::metamethod_bit_of_bytes(name) {
+                        values[bit.bits().trailing_zeros() as usize] = state.named_get(slot as u32);
+                    } else if name == b"__mode" {
+                        weak = WeakMode::of(state.named_get(slot as u32));
+                    }
+                }
+                (values, weak)
+            }
         };
-        let weak = WeakMode::of(self.raw_get(Value::string(ctx.symbols().mode)));
         let mc = ctx.mutation();
         let cache = shape::MtCache::new(mc, self, values, weak);
         self.0.borrow_mut(mc).aux_or_new(mc).mt_cache = Some(cache);
@@ -437,11 +456,11 @@ impl<'gc> TableState<'gc> {
     /// write into the shared `MtCache` (see [`shape::MtCache::mirror`]) so
     /// downstream shapes observe it without a freshness check.
     #[inline]
-    pub fn maybe_update_mt_bit(&self, key: Value<'gc>, value: Value<'gc>) {
+    pub fn maybe_update_mt_bit(&self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>) {
         if let Some(s) = key.get_string()
             && let Some(cache) = self.mt_cache()
         {
-            cache.mirror(s, value);
+            cache.mirror(Some(mc), s, value);
         }
     }
 
@@ -481,7 +500,7 @@ impl<'gc> TableState<'gc> {
         let mt_cache = self.mt_cache();
         let cleared = |key| {
             if let Some(c) = mt_cache {
-                c.mirror(key, Value::nil());
+                c.mirror(None, key, Value::nil());
             }
         };
         let keys = self.shape.keys();
@@ -748,7 +767,7 @@ impl<'gc> TableState<'gc> {
                 // Deletion keeps the slot (nil-valued) so the shape stays stable
                 // and `next` can resume from the deleted key.
                 self.named_set(slot, value);
-                self.maybe_update_mt_bit(Value::string(key), value);
+                self.maybe_update_mt_bit(ctx.mutation(), Value::string(key), value);
             }
             None => self.add_string_key(ctx, key, value, cap),
         }
@@ -782,7 +801,7 @@ impl<'gc> TableState<'gc> {
         }
         self.shape = new_shape;
         self.named_set(slot, value);
-        self.maybe_update_mt_bit(Value::string(key), value);
+        self.maybe_update_mt_bit(ctx.mutation(), Value::string(key), value);
     }
 
     /// Move the spilled slots to a cell with room for more; the old one is
@@ -799,7 +818,7 @@ impl<'gc> TableState<'gc> {
         debug_assert!(self.shape.is_dict());
         let strs = &mut self.aux_or_new(mc).strs;
         hash_part::set(strs, lua_string_hash(key), key, value);
-        self.maybe_update_mt_bit(Value::string(key), value);
+        self.maybe_update_mt_bit(mc, Value::string(key), value);
     }
 
     /// Move the named slots to the string part and the shape to the dict
