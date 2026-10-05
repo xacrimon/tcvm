@@ -187,7 +187,7 @@ fn lua_frame_count<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let n = stack.lua_frames().len();
+    let n = stack.lua_frames().iter().filter(|f| !f.is_native()).count();
     stack.replace(&[Value::integer(ctx.mutation(), n as i64)]);
     Ok(CallbackAction::Return)
 }

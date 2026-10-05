@@ -48,10 +48,13 @@ pub enum ThreadStatus {
 #[derive(Clone, Copy, Collect)]
 #[collect(internal, no_drop)]
 pub struct LuaFrame<'gc> {
+    /// A `NATIVE` frame's holds the native function, and is never
+    /// dereferenced as a Lua closure.
     pub(crate) closure: LuaFn<'gc>,
     /// Resume address: points *past* the instruction being executed, into
     /// `closure.proto.code` (which the frame keeps alive). A raw pointer
-    /// rather than an index so CALL saves it with one store.
+    /// rather than an index so CALL saves it with one store. A `NATIVE`
+    /// frame's is its continuation (`NativeCont`).
     #[collect(require_static)]
     pub(crate) pc: *const crate::instruction::Instruction,
     /// Where this frame's results go; see [`ret_args`](crate::vm::interp).
@@ -63,7 +66,8 @@ pub struct LuaFrame<'gc> {
     pub(crate) base: u32,
     /// Caller-supplied args beyond `num_params`; the below-base region is
     /// `stack[base - num_extras .. base]`. Set by `VARARGPREP`, else 0. Fits:
-    /// a frame's window ends below `MAX_STACK`.
+    /// a frame's window ends below `MAX_STACK`. A `NATIVE` frame's is where
+    /// in its window the call it waits for sits, and its results land.
     pub(crate) num_extras: u16,
     /// `frame_flags` bits. Zero means RETURN can jump straight to `ret`.
     /// Mostly left set once the hazard is gone (a stale bit just costs the slow
@@ -104,6 +108,14 @@ pub mod frame_flags {
     pub const OPEN_UPVALUES: u8 = 1;
     /// A TBC in this frame registered a to-be-closed slot.
     pub const TBC: u8 = 2;
+    /// A native's frame: its window starts at `base`, its function slot is
+    /// `base - 1`.
+    pub const NATIVE: u8 = 4;
+    /// The native's call catches errors (`pcall`).
+    pub const PROTECTED: u8 = 8;
+    /// ... after running the message handler in its window's first slot
+    /// (`xpcall`).
+    pub const HANDLER: u8 = 16;
 }
 
 // Two records per cache line.
@@ -113,6 +125,12 @@ impl<'gc> LuaFrame<'gc> {
     #[inline(always)]
     pub fn base(&self) -> usize {
         self.base as usize
+    }
+
+    /// A native's frame (see `frame_flags::NATIVE`).
+    #[inline(always)]
+    pub fn is_native(&self) -> bool {
+        self.flags & frame_flags::NATIVE != 0
     }
 
     #[inline(always)]
@@ -201,6 +219,7 @@ pub enum ExecKind<'gc> {
 /// [`ThreadState::frames_rev`].
 pub enum FrameRef<'a, 'gc> {
     Lua(&'a LuaFrame<'gc>),
+    Native(&'a LuaFrame<'gc>),
     Exec(&'a ExecKind<'gc>),
 }
 
@@ -278,6 +297,9 @@ pub struct ThreadState<'gc> {
     /// Results the executor delivered to a call site; the next `run_thread`
     /// starts by running its continuation.
     pub(crate) pending_ret: Option<PendingRet>,
+    /// An error the unwinder delivers to the protected native frame on top;
+    /// the next `run_thread` starts by running its continuation with it.
+    pub(crate) native_error: Option<Error<'gc>>,
     /// Where the thread's yielded values currently live. Set when the
     /// thread suspends via a `Yield` action (or a sequence's
     /// `SequencePoll::Yield`/`TailYield`). Consumed on resume to recover
@@ -345,6 +367,7 @@ unsafe impl<'gc> Collect<'gc> for ThreadState<'gc> {
         cc.trace(&self.open_upvalues);
         cc.trace(&self.thread_handle);
         cc.trace(&self.pending_action);
+        cc.trace(&self.native_error);
         cc.trace(&self.tbc_list);
     }
 }
@@ -475,6 +498,7 @@ impl<'gc> ThreadState<'gc> {
         self.no_yield = false;
         self.pending_action = None;
         self.pending_ret = None;
+        self.native_error = None;
         self.yield_bottom = None;
         self.death_error = None;
         self.stack_limit = STACK_LIMIT;
@@ -489,7 +513,12 @@ impl<'gc> ThreadState<'gc> {
                 Some(FrameRef::Exec(&self.exec_frames[exec].kind))
             } else if lua > 0 {
                 lua -= 1;
-                Some(FrameRef::Lua(&self.frames[lua]))
+                let f = &self.frames[lua];
+                Some(if f.is_native() {
+                    FrameRef::Native(f)
+                } else {
+                    FrameRef::Lua(f)
+                })
             } else {
                 None
             }
@@ -505,7 +534,14 @@ impl<'gc> ThreadState<'gc> {
     pub(crate) fn live_top(&self) -> usize {
         self.frames
             .last()
-            .map_or(0, |lf| lf.base() + lf.closure.max_stack_size as usize)
+            .map_or(0, |lf| {
+                // A native's window is all below `top`.
+                if lf.is_native() {
+                    lf.base()
+                } else {
+                    lf.base() + lf.closure.max_stack_size as usize
+                }
+            })
             .max(self.top)
     }
 
@@ -702,6 +738,7 @@ impl<'gc> Thread<'gc> {
             thread_handle: None,
             pending_action: None,
             pending_ret: None,
+            native_error: None,
             yield_bottom: None,
             death_error: None,
             stack_limit: STACK_LIMIT,

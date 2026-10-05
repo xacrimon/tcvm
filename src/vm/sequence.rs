@@ -49,20 +49,65 @@ pub enum SequencePoll<'gc> {
 
 /// What a native callback requests of the executor on return.
 ///
-/// `Return` is the hot path and must stay cheap to hand back: the suspension
-/// payloads are boxed so `Result<CallbackAction, Error>` is two words and
-/// crosses the native boundary in registers. A suspension already leaves the
-/// interpreter and goes through the executor, so its allocation is noise.
+/// `Return` is the hot path and must stay cheap to hand back:
+/// `Result<CallbackAction, Error>` is two words and crosses the native
+/// boundary in registers. The suspension payloads are boxed for that; a
+/// suspension already leaves the interpreter and goes through the executor,
+/// so its allocation is noise.
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub enum CallbackAction<'gc> {
     /// Plain synchronous return. Stack values above `bottom` are the results.
     Return,
+    /// Call `stack[at]` with the values above it, then run `cont` with the
+    /// call's results in their place, `stack[at..]`. The native keeps its
+    /// state in `stack[..at]` meanwhile: it gets a frame of its own, and the
+    /// call and `cont` run without leaving the interpreter.
+    CallThen {
+        at: u32,
+        #[collect(require_static)]
+        protect: Protect,
+        #[collect(require_static)]
+        cont: NativeCont,
+    },
     /// Hand control to the executor; see [`Suspend`].
     Suspend(Box<Suspend<'gc>>),
 }
 
+const _: () = assert!(std::mem::size_of::<Result<CallbackAction<'static>, Error<'static>>>() == 16);
+
+/// Whether a [`CallbackAction::CallThen`]'s continuation receives the
+/// errors its call raises, instead of them unwinding past it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Protect {
+    No,
+    /// `pcall`.
+    Errors,
+    /// `xpcall`: as `Errors`, after running the message handler at
+    /// `stack[0]` on top of the failing frames.
+    Handler,
+}
+
+/// The continuation of a [`CallbackAction::CallThen`]: the native's window
+/// with the call's results at `at`, or with nothing above `at` and the error
+/// when a protected call failed.
+pub type NativeCont = for<'gc, 'a> fn(
+    ctx: crate::lua::Context<'gc>,
+    closure: &'a crate::env::NativeClosure<'gc>,
+    stack: Stack<'gc, 'a>,
+    status: Result<(), Error<'gc>>,
+) -> Result<CallbackAction<'gc>, Error<'gc>>;
+
 impl<'gc> CallbackAction<'gc> {
+    /// [`CallbackAction::CallThen`] of `stack[at]`, unprotected.
+    pub fn call_then(at: usize, cont: NativeCont) -> Self {
+        CallbackAction::CallThen {
+            at: at as u32,
+            protect: Protect::No,
+            cont,
+        }
+    }
+
     pub fn sequence(seq: BoxSequence<'gc>) -> Self {
         CallbackAction::Suspend(Box::new(Suspend::Sequence(seq)))
     }

@@ -4,8 +4,8 @@ use crate::dmm::{Collect, Gc, RefLock, Trace};
 use crate::env::error::Exit;
 use crate::env::function::Function;
 use crate::env::thread::{
-    CallSite, ExecKind, LuaFrame, MAX_STACK, PendingAction, PendingRet, TbcEntry, ThreadState,
-    ThreadStatus,
+    CallSite, ExecKind, FrameRef, LuaFrame, MAX_STACK, PendingAction, PendingRet, TbcEntry,
+    ThreadState, ThreadStatus,
 };
 use crate::env::{Error, LuaString, Stack, Thread, Value};
 use crate::lua::RuntimeError;
@@ -631,15 +631,30 @@ fn schedule_call_at<'gc>(
                 );
                 Ok(())
             }
-            CallbackAction::Suspend(action) => {
-                ts.pending_action = Some(PendingAction {
-                    action,
-                    call_site: CallSite {
-                        bottom: args_base,
-                        func_idx: slot,
+            action => {
+                let f = ts.stack[slot].get_function().expect("resolved native");
+                let state = vm::interp::NativeState::Acted {
+                    r: Ok(action),
+                    framed: false,
+                    f,
+                    base: args_base,
+                    ret,
+                };
+                match vm::interp::run_natives(ctx, ts, state) {
+                    vm::interp::NativeStep::Return {
                         ret,
-                    },
-                });
+                        func_slot,
+                        values,
+                    } => deliver(
+                        ts,
+                        CallSite {
+                            bottom: values,
+                            func_idx: func_slot,
+                            ret,
+                        },
+                    ),
+                    vm::interp::NativeStep::EnterLua | vm::interp::NativeStep::Exit => {}
+                }
                 Ok(())
             }
         }
@@ -916,6 +931,20 @@ fn run_message_handler<'gc>(
     schedule_call_at(ts, ctx, slot, ret_exit)
 }
 
+/// Whether the native frame `nf` catches errors: `Some` with its message
+/// handler, if any.
+fn native_catch<'gc>(ts: &ThreadState<'gc>, nf: &LuaFrame<'gc>) -> Option<Option<Function<'gc>>> {
+    use crate::env::thread::frame_flags::{HANDLER, PROTECTED};
+    if nf.flags & PROTECTED == 0 {
+        return None;
+    }
+    Some(if nf.flags & HANDLER != 0 {
+        ts.stack[nf.base()].get_function()
+    } else {
+        None
+    })
+}
+
 /// Close the variables the unwinder detached at `ts.top` with `err` above the
 /// catcher, then re-raise to it.
 fn push_error_close<'gc>(
@@ -1053,15 +1082,14 @@ fn unwind_error<'gc>(
         // a plain `pcall` in between shadows an outer `xpcall`, while a
         // `Catch::Pass` sequence is looked through.
         let handler = ts
-            .exec_frames
-            .iter()
-            .rev()
-            .find_map(|f| match &f.kind {
-                ExecKind::Sequence { seq, .. } => match seq.catch() {
+            .frames_rev()
+            .find_map(|f| match f {
+                FrameRef::Exec(ExecKind::Sequence { seq, .. }) => match seq.catch() {
                     Catch::Pass => None,
                     Catch::Here(handler) => Some(handler),
                     Catch::Base => Some(None),
                 },
+                FrameRef::Native(nf) => native_catch(&ts, nf),
                 _ => None,
             })
             .flatten();
@@ -1085,6 +1113,22 @@ fn unwind_error<'gc>(
     let mut detached = false;
     loop {
         if let Some(lf) = ts.top_lua() {
+            if lf.is_native() {
+                let handler = if exit { None } else { native_catch(&ts, lf) };
+                let at = lf.base() + lf.num_extras as usize;
+                let Some(handler) = handler else {
+                    ts.pop_lua();
+                    continue;
+                };
+                if detached {
+                    push_error_close(&mut ts, ctx, err, handler);
+                } else {
+                    // Nothing of the failed call is left above its slot.
+                    ts.set_top_unchecked(at);
+                    ts.native_error = Some(err);
+                }
+                return Ok(());
+            }
             let base = lf.base();
             ts.pop_lua();
             vm::interp::close_upvalues(mc, &mut ts, base);
