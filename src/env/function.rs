@@ -223,6 +223,9 @@ pub struct LuaClosure<'gc> {
     pub max_stack_size: u8,
     pub num_params: u8,
     pub is_vararg: bool,
+    /// `num_params`, or 255 for a vararg function: a CALL passing more
+    /// than this many arguments (`nargs + 1`, never 256) needs no fixups.
+    pub fixed_arity: u8,
 }
 
 // SAFETY: `proto` and `upvalues` are the only owned Gc pointers; the raw
@@ -575,6 +578,11 @@ impl<'gc> Function<'gc> {
             max_stack_size: proto.max_stack_size,
             num_params: proto.num_params,
             is_vararg: proto.is_vararg,
+            fixed_arity: if proto.is_vararg {
+                u8::MAX
+            } else {
+                proto.num_params
+            },
         };
         Function(Gc::new(mc, FunctionKind::Lua(closure)))
     }
