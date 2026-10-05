@@ -1363,7 +1363,12 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         entries: &[TableEntry],
     ) -> Result<TemplateDraft<'gc>, CompileError> {
         use crate::env::shape::{MAX_PROPERTIES_FAST, transition_add_prop};
-        let mut shape = self.ctx.empty_shape();
+        // Room inline for every field; a repeated name only overcounts.
+        let fields = entries
+            .iter()
+            .filter(|e| matches!(e, TableEntry::Map(_)))
+            .count();
+        let mut shape = self.ctx.root_shape(fields);
         let mut repeated = Vec::new();
         let mut keyed = false;
         let mut items = 0u32;

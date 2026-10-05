@@ -31,6 +31,9 @@ pub struct CheckedCell<T: ?Sized> {
 }
 
 impl<T> CheckedCell<T> {
+    /// Offset of the value from the cell.
+    pub(crate) const VALUE_OFFSET: usize = core::mem::offset_of!(Self, value);
+
     #[inline]
     pub const fn new(t: T) -> Self {
         Self {
