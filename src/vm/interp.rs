@@ -3169,7 +3169,12 @@ macro_rules! math1_entry {
                 }
             }
             if instruction.op() == Op::TAILCALL {
-                tail!(op_return1, Instruction::ret1(crate::instruction::Reg(func)));
+                // Not RETURN1's handler: the frame may have varargs or something
+                // to close.
+                tail!(
+                    op_return,
+                    Instruction::ret(crate::instruction::Reg(func), 2)
+                );
             }
             if returns == 0 {
                 thread.set_top_unchecked(unsafe { (*frame).base() } + func as usize + 1);
@@ -3521,12 +3526,6 @@ extern "rust-preserve-none" fn op_tailcall_native<'gc>(
             // would find them; past its 8-bit count, MULTRET reads `top`.
             let retc = thread.top - args_base;
             registers = unsafe { thread.stack.as_mut_ptr().add(base) };
-            if retc == 1 {
-                tail!(
-                    op_return1,
-                    Instruction::ret1(crate::instruction::Reg(func + 1))
-                );
-            }
             let count = if retc < u8::MAX as usize {
                 retc as u8 + 1
             } else {
@@ -3624,14 +3623,12 @@ extern "rust-preserve-none" fn op_tailcall_slow<'gc>(
 }
 
 /// Pop the running frame, whose results are the `$nret` values at `$values`,
-/// and hand them to its continuation.
+/// and hand them to its continuation. `fixed`: the frame has no varargs
+/// below it.
 macro_rules! return_to_ret {
-    ($nret:expr, $values:expr, $ctx:ident, $thread:ident, $registers:ident, $handlers:ident,
-     $ds:ident, $frame:ident, $closure:ident) => {{
-        let (__ret, __func_slot) = unsafe {
-            let f = &*$frame;
-            (f.ret, $registers.sub(1 + f.num_extras as usize))
-        };
+    (@pop $ret:expr, $func_slot:expr, $nret:expr, $values:expr, $ctx:ident, $thread:ident,
+     $handlers:ident, $ds:ident, $frame:ident, $closure:ident) => {{
+        let (__ret, __func_slot) = ($ret, $func_slot);
         // `LuaFrame` is `Copy`, so nothing needs dropping.
         let __n = $thread.frames.len();
         unsafe { $thread.frames.set_len(__n - 1) };
@@ -3646,6 +3643,22 @@ macro_rules! return_to_ret {
             unsafe { $frame.sub(1) },
             $closure,
         );
+    }};
+    (fixed, $nret:expr, $values:expr, $ctx:ident, $thread:ident, $registers:ident,
+     $handlers:ident, $ds:ident, $frame:ident, $closure:ident) => {{
+        debug_assert_eq!(unsafe { (*$frame).num_extras }, 0);
+        let __ret = unsafe { (*$frame).ret };
+        return_to_ret!(@pop __ret, unsafe { $registers.sub(1) }, $nret, $values, $ctx, $thread, $handlers,
+                       $ds, $frame, $closure)
+    }};
+    ($nret:expr, $values:expr, $ctx:ident, $thread:ident, $registers:ident, $handlers:ident,
+     $ds:ident, $frame:ident, $closure:ident) => {{
+        let (__ret, __func_slot) = unsafe {
+            let f = &*$frame;
+            (f.ret, $registers.sub(1 + f.num_extras as usize))
+        };
+        return_to_ret!(@pop __ret, __func_slot, $nret, $values, $ctx, $thread, $handlers, $ds,
+                       $frame, $closure)
     }};
 }
 
@@ -3683,7 +3696,8 @@ extern "rust-preserve-none" fn op_return<'gc>(
     );
 }
 
-/// return
+/// return, from a function the assembler found has nothing to close and no
+/// varargs
 #[inline(never)]
 #[rustc_align(32)]
 extern "rust-preserve-none" fn op_return0<'gc>(
@@ -3691,26 +3705,21 @@ extern "rust-preserve-none" fn op_return0<'gc>(
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
-    ip: *const Instruction,
+    _ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
 ) -> Exit {
-    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    helpers! { instruction, ctx, thread, registers, _ip, handlers, ds, frame, closure }
     let _ = instruction;
-    if std::hint::unlikely(unsafe { (*frame).flags } != 0) {
-        tail!(
-            op_return_slow,
-            Instruction::ret(crate::instruction::Reg(0), 1)
-        );
-    }
+    debug_assert_eq!(unsafe { (*frame).flags }, 0);
     return_to_ret!(
-        0, registers, ctx, thread, registers, handlers, ds, frame, closure
+        fixed, 0, registers, ctx, thread, registers, handlers, ds, frame, closure
     );
 }
 
-/// return R[value]
+/// return R[value], as RETURN0
 #[inline(never)]
 #[rustc_align(32)]
 extern "rust-preserve-none" fn op_return1<'gc>(
@@ -3718,23 +3727,17 @@ extern "rust-preserve-none" fn op_return1<'gc>(
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
     registers: Registers<'gc, '_>,
-    ip: *const Instruction,
+    _ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
 ) -> Exit {
-    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-    let value = instruction.a();
-    if std::hint::unlikely(unsafe { (*frame).flags } != 0) {
-        tail!(
-            op_return_slow,
-            Instruction::ret(crate::instruction::Reg(value), 2)
-        );
-    }
-    let values = unsafe { registers.add(value as usize) };
+    helpers! { instruction, ctx, thread, registers, _ip, handlers, ds, frame, closure }
+    debug_assert_eq!(unsafe { (*frame).flags }, 0);
+    let values = unsafe { registers.add(instruction.a() as usize) };
     return_to_ret!(
-        1, values, ctx, thread, registers, handlers, ds, frame, closure
+        fixed, 1, values, ctx, thread, registers, handlers, ds, frame, closure
     );
 }
 

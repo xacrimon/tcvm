@@ -332,6 +332,27 @@ impl<'gc> Chunk<'gc> {
                 by_value: !assigned.get(var),
             })
             .collect();
+        // RETURN0/RETURN1 skip the close check and assume no varargs below the
+        // frame (PUC's `needclose`, `luaK_finish`): a function that may need
+        // either returns through RETURN.
+        let needs_close = self
+            .tape
+            .iter()
+            .any(|i| matches!(i.op(), Op::TBC | Op::TFORPREP))
+            || self.prototypes.iter().any(|child| {
+                child.upvalue_desc.iter().any(|&(source, var)| {
+                    matches!(source, UpvalSource::ParentLocal(_)) && assigned.get(var)
+                })
+            });
+        if needs_close || self.is_vararg {
+            for instr in &mut self.tape {
+                match instr.op() {
+                    Op::RETURN0 => *instr = Instruction::ret(RegisterIndex(0), 1),
+                    Op::RETURN1 => *instr = Instruction::ret(RegisterIndex(instr.a()), 2),
+                    _ => {}
+                }
+            }
+        }
         for instr in &mut self.tape {
             let by_ref = match instr.op() {
                 Op::GETUPVAL => Op::GETUPVAL_REF,
