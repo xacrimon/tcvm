@@ -1,7 +1,6 @@
 use crate::Context;
 use crate::builtin::util;
 use crate::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Value};
-use crate::vm::sequence::CallbackAction;
 
 /// Original-UTF-8 (Lua flavor) max code point: 6-byte sequences up to
 /// `0x7FFFFFFF`. Stricter than Unicode's `0x10FFFF`, matching Lua's defaults
@@ -122,7 +121,7 @@ fn lua_char<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let n = stack.len();
     let mut out = Vec::new();
     for i in 0..n {
@@ -133,7 +132,7 @@ fn lua_char<'gc>(
         encode(c as u32, &mut out);
     }
     stack.ret1(Value::string(LuaString::new(ctx, &out)));
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `utf8.codepoint(s [, i [, j]])` — code points of the characters in byte
@@ -142,7 +141,7 @@ fn lua_codepoint<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let s = util::check_string(ctx, stack.get(0), "codepoint", 1)?;
     let bytes = s.as_bytes();
     let len = bytes.len();
@@ -185,7 +184,7 @@ fn lua_codepoint<'gc>(
         }
     }
     stack.truncate(n);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `utf8.len(s [, i [, j]])` — number of characters in byte range `i..j`
@@ -195,7 +194,7 @@ fn lua_len<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let s = util::check_string(ctx, stack.get(0), "len", 1)?;
     let bytes = s.as_bytes();
     let len = bytes.len();
@@ -239,12 +238,12 @@ fn lua_len<'gc>(
             }
             None => {
                 stack.replace(&[Value::nil(), Value::integer(ctx.mutation(), posi)]);
-                return Ok(CallbackAction::Return);
+                return Ok(());
             }
         }
     }
     stack.ret1(Value::integer(ctx.mutation(), count));
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `utf8.offset(s, n [, i])` — the byte position where the `n`-th character
@@ -255,7 +254,7 @@ fn lua_offset<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let s = util::check_string(ctx, stack.get(0), "offset", 1)?;
     let bytes = s.as_bytes();
     let len = bytes.len();
@@ -304,7 +303,7 @@ fn lua_offset<'gc>(
     }
     if n != 0 {
         stack.replace(&[Value::nil()]);
-        return Ok(CallbackAction::Return);
+        return Ok(());
     }
     let start = posi;
     // A stray continuation byte reached by moving is caught here.
@@ -320,7 +319,7 @@ fn lua_offset<'gc>(
         Value::integer(ctx.mutation(), start as i64 + 1),
         Value::integer(ctx.mutation(), posi as i64 + 1),
     ]);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `utf8.codes(s [, lax])` — iterator triple `(iterator, s, 0)` yielding
@@ -329,7 +328,7 @@ fn lua_codes<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let lax = !stack.get(1).is_falsy();
     let s = util::check_string(ctx, stack.get(0), "codes", 1)?;
     if iscont(s.as_bytes(), 0) {
@@ -342,14 +341,14 @@ fn lua_codes<'gc>(
         Value::string(s),
         Value::integer(ctx.mutation(), 0),
     ]);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 fn codes_strict<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     codes_aux(ctx, stack, true)
 }
 
@@ -357,7 +356,7 @@ fn codes_lax<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     codes_aux(ctx, stack, false)
 }
 
@@ -368,7 +367,7 @@ fn codes_aux<'gc>(
     ctx: Context<'gc>,
     mut stack: Stack<'gc, '_>,
     strict: bool,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let s = util::check_string(ctx, stack.get(0), "codes", 1)?;
     let bytes = s.as_bytes();
     let mut n = util::to_integer(stack.get(1)).unwrap_or(0) as u64 as usize;
@@ -377,7 +376,7 @@ fn codes_aux<'gc>(
     }
     if n >= bytes.len() {
         stack.replace(&[]);
-        return Ok(CallbackAction::Return);
+        return Ok(());
     }
     match decode(bytes, n, strict) {
         Some((code, next)) if !iscont(bytes, next) => {
@@ -385,7 +384,7 @@ fn codes_aux<'gc>(
                 Value::integer(ctx.mutation(), n as i64 + 1),
                 Value::integer(ctx.mutation(), code as i64),
             ]);
-            Ok(CallbackAction::Return)
+            Ok(())
         }
         _ => Err(Error::from_str(ctx, "invalid UTF-8 code")),
     }

@@ -47,13 +47,9 @@ pub enum SequencePoll<'gc> {
     TailResume(Thread<'gc>),
 }
 
-/// What a native callback requests of the executor on return.
-///
-/// `Return` is the hot path and must stay cheap to hand back:
-/// `Result<CallbackAction, Error>` is two words and crosses the native
-/// boundary in registers. The suspension payloads are boxed for that; a
-/// suspension already leaves the interpreter and goes through the executor,
-/// so its allocation is noise.
+/// What an [`ActionFn`](crate::env::ActionFn) native or a [`NativeCont`]
+/// asks of the VM on return. The suspension payloads are boxed to keep the
+/// rest small; a suspension leaves the interpreter for the executor anyway.
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub enum CallbackAction<'gc> {

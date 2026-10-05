@@ -2,7 +2,7 @@
 //! the host inspects them via `Executor::step`, then calls `Lua::resume`
 //! with new values and the chunk uses them to compute its return value.
 
-use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, Stack, Value};
 use tcvm::vm::sequence::CallbackAction;
 use tcvm::{Context, Executor, LoadError, Lua, RuntimeError, StepResult};
 
@@ -24,7 +24,7 @@ fn host_resume_round_trip() {
     let mut lua = Lua::new();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let y = Function::new_native(ctx.mutation(), yielder as NativeFn, &[]);
+            let y = Function::new_action(ctx.mutation(), yielder, &[]);
             let key = Value::string(LuaString::new(ctx, b"yielder"));
             ctx.globals().raw_set(ctx, key, Value::function(y));
             let chunk = ctx.load(
@@ -76,7 +76,7 @@ fn host_resume_two_cycles() {
     let mut lua = Lua::new();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let y = Function::new_native(ctx.mutation(), yielder as NativeFn, &[]);
+            let y = Function::new_action(ctx.mutation(), yielder, &[]);
             let key = Value::string(LuaString::new(ctx, b"yielder"));
             ctx.globals().raw_set(ctx, key, Value::function(y));
             let chunk = ctx.load(

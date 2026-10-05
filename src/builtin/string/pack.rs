@@ -10,7 +10,6 @@ use super::posrelat;
 use crate::Context;
 use crate::builtin::util;
 use crate::env::{Error, LuaString, NativeClosure, Stack, Value};
-use crate::vm::sequence::CallbackAction;
 
 // Native ABI (fixed, per project decision): LP64 widths, little-endian,
 // native alignment 8. Unlike reference Lua these don't follow the host's C
@@ -266,7 +265,7 @@ pub(super) fn lua_pack<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let fmt = util::check_string(ctx, stack.get(0), "pack", 1)?;
     let fmt = fmt.as_bytes();
     let mut h = Header {
@@ -375,14 +374,14 @@ pub(super) fn lua_pack<'gc>(
     }
 
     stack.ret1(Value::string(LuaString::new(ctx, &out)));
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 pub(super) fn lua_packsize<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let fmt = util::check_string(ctx, stack.get(0), "packsize", 1)?;
     let fmt = fmt.as_bytes();
     let mut h = Header {
@@ -418,14 +417,14 @@ pub(super) fn lua_packsize<'gc>(
     }
 
     stack.ret1(Value::integer(ctx.mutation(), total as i64));
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 pub(super) fn lua_unpack<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let fmt = util::check_string(ctx, stack.get(0), "unpack", 1)?;
     let fmt = fmt.as_bytes();
     let data = util::check_string(ctx, stack.get(1), "unpack", 2)?;
@@ -525,5 +524,5 @@ pub(super) fn lua_unpack<'gc>(
 
     out.push(Value::integer(ctx.mutation(), pos as i64 + 1));
     stack.replace(&out);
-    Ok(CallbackAction::Return)
+    Ok(())
 }

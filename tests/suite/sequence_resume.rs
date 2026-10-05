@@ -5,7 +5,7 @@
 use std::pin::Pin;
 
 use tcvm::dmm::{Collect, Trace};
-use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Thread, Value};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, Stack, Thread, Value};
 use tcvm::lua::Context;
 use tcvm::vm::sequence::{BoxSequence, CallbackAction, Execution, Sequence, SequencePoll};
 use tcvm::{Executor, LoadError, Lua};
@@ -80,7 +80,7 @@ fn sequence_resume_then_post_processes() {
     lua.load_all();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let f = Function::new_native(ctx.mutation(), bumpr as NativeFn, &[]);
+            let f = Function::new_action(ctx.mutation(), bumpr, &[]);
             let key = Value::string(LuaString::new(ctx, b"bumpr"));
             ctx.globals().raw_set(ctx, key, Value::function(f));
             let chunk = ctx.load(

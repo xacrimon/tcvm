@@ -11,7 +11,7 @@ use crate::lua::{Context, StashedError};
 use crate::vm::async_sequence::AsyncSequence;
 use crate::vm::debug::object_type_name;
 use crate::vm::interp::{IndexChain, NewIndexChain, walk_index_chain, walk_newindex_chain};
-use crate::vm::sequence::{CallbackAction, Execution, Sequence, SequencePoll};
+use crate::vm::sequence::{Execution, Sequence, SequencePoll};
 
 /// Append the canonical Lua textual form of an integer.
 pub(crate) fn push_int(out: &mut Vec<u8>, i: i64) {
@@ -470,7 +470,7 @@ fn raise_not_implemented<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let name = closure.upvalues[0]
         .get_string()
         .map_or(&[][..], |s| s.as_bytes());

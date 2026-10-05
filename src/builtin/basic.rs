@@ -3,8 +3,9 @@ use std::io::Write;
 use crate::Context;
 use crate::LoadError;
 use crate::builtin::util;
+use crate::env::function::NativeKind;
 use crate::env::{
-    Error, Function, LuaString, MetamethodBits, NativeClosure, NativeFn, Stack, Value,
+    ActionFn, Error, Function, LuaString, MetamethodBits, NativeClosure, NativeFn, Stack, Value,
 };
 use crate::vm::async_sequence::{SequenceReturn, async_sequence};
 use crate::vm::debug::where_prefix;
@@ -15,12 +16,9 @@ pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[
         ("assert", lua_assert),
         ("collectgarbage", lua_collectgarbage),
-        ("dofile", lua_dofile),
         ("error", lua_error),
         ("getmetatable", lua_getmetatable),
-        ("load", lua_load),
         ("loadfile", lua_loadfile),
-        ("print", lua_print),
         ("rawequal", lua_rawequal),
         ("rawget", lua_rawget),
         ("rawlen", lua_rawlen),
@@ -28,9 +26,14 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         ("select", lua_select),
         ("setmetatable", lua_setmetatable),
         ("tonumber", lua_tonumber),
-        ("tostring", lua_tostring),
         ("type", lua_type),
         ("warn", lua_warn),
+    ];
+    let actions: &[(&str, ActionFn)] = &[
+        ("dofile", lua_dofile),
+        ("load", lua_load),
+        ("print", lua_print),
+        ("tostring", lua_tostring),
     ];
 
     let set = |name: &str, f: Function<'gc>| {
@@ -40,13 +43,26 @@ pub fn load<'gc>(ctx: Context<'gc>) {
     for &(name, handler) in fns {
         set(name, Function::new_native(ctx.mutation(), handler, &[]));
     }
+    for &(name, handler) in actions {
+        set(name, Function::new_action(ctx.mutation(), handler, &[]));
+    }
     set(
         "pcall",
-        Function::new_native_with_entry(ctx.mutation(), lua_pcall, &[], interp::ff_pcall),
+        Function::new_native_with_entry(
+            ctx.mutation(),
+            NativeKind::Action(lua_pcall),
+            &[],
+            interp::ff_pcall,
+        ),
     );
     set(
         "xpcall",
-        Function::new_native_with_entry(ctx.mutation(), lua_xpcall, &[], interp::ff_xpcall),
+        Function::new_native_with_entry(
+            ctx.mutation(),
+            NativeKind::Action(lua_xpcall),
+            &[],
+            interp::ff_xpcall,
+        ),
     );
     // `pairs` hands back the same `next` the global holds, so `pairs(t) == next`.
     let next = ctx.next_fn();
@@ -55,7 +71,7 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         "pairs",
         Function::new_native_with_entry(
             ctx.mutation(),
-            lua_pairs,
+            NativeKind::Action(lua_pairs),
             &[Value::function(next)],
             interp::ff_pairs,
         ),
@@ -65,7 +81,7 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         "ipairs",
         Function::new_native_with_entry(
             ctx.mutation(),
-            lua_ipairs,
+            NativeKind::Plain(lua_ipairs),
             &[Value::function(ipairs_iter)],
             interp::ff_ipairs,
         ),
@@ -85,11 +101,11 @@ fn lua_assert<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     util::check_any(ctx, &stack, "assert", 1)?;
     if !stack.get(0).is_falsy() {
         // Leaving the window untouched returns all arguments.
-        return Ok(CallbackAction::Return);
+        return Ok(());
     }
     if stack.len() >= 2 {
         Err(Error::new(ctx, stack.get(1)).with_level(1))
@@ -105,7 +121,7 @@ fn lua_collectgarbage<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let opt = stack.get(0);
     let opt = opt.get_string().map_or(&b"collect"[..], |s| s.as_bytes());
     match opt {
@@ -120,7 +136,7 @@ fn lua_collectgarbage<'gc>(
         b"step" => stack.replace(&[Value::boolean(false)]),
         _ => stack.replace(&[Value::integer(ctx.mutation(), 0)]),
     }
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `dofile([filename])` — run a file's chunk (stdin without a filename) and
@@ -148,7 +164,7 @@ fn lua_error<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let level = if stack.len() >= 2 && !stack.get(1).is_nil() {
         let l = util::check_integer(ctx, stack.get(1), "error", 2)?;
         usize::try_from(l).unwrap_or(0)
@@ -162,7 +178,7 @@ fn lua_getmetatable<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     util::check_any(ctx, &stack, "getmetatable", 1)?;
     // A `__metatable` field shadows the real metatable (protection).
     let result = match ctx.metatable_of(stack.get(0)) {
@@ -177,7 +193,7 @@ fn lua_getmetatable<'gc>(
         None => Value::nil(),
     };
     stack.ret1(result);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `ipairs(t)` — returns `(iterator, t, 0)`, the iterator from upvalue 0 so
@@ -186,11 +202,11 @@ fn lua_ipairs<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     util::check_any(ctx, &stack, "ipairs", 1)?;
     let t = stack.get(0);
     stack.replace(&[closure.upvalues[0], t, Value::integer(ctx.mutation(), 0)]);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// Iterator body for `ipairs`: `(t, i) -> (i + 1, t[i + 1])`, or a lone `nil`
@@ -372,14 +388,14 @@ fn lua_loadfile<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let fname = util::opt_string(ctx, stack.get(0), "loadfile", 1)?;
     check_mode(ctx, stack.get(1), "loadfile", 2)?;
     let env = env_arg(ctx, &stack, 2);
     let path = fname.map(|f| f.as_bytes());
     let loaded = ctx.load_file_with(path, env);
     push_loaded(ctx, &mut stack, loaded);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `next(t [, k])` — `(k', t[k'])` for the entry after `k` in traversal
@@ -388,7 +404,7 @@ pub(crate) fn lua_next<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let Some(t) = stack.get(0).get_table() else {
         return Err(util::type_error(ctx, "next", 1, "table", stack.arg(0)));
     };
@@ -397,7 +413,7 @@ pub(crate) fn lua_next<'gc>(
         Ok(None) => stack.replace(&[Value::nil()]),
         Err(_) => return Err(Error::from_str(ctx, "invalid key to 'next'")),
     }
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `pairs(t)` — `(next, t, nil, nil)` with `next` from upvalue 0, or the
@@ -499,19 +515,19 @@ fn lua_rawequal<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     util::check_any(ctx, &stack, "rawequal", 1)?;
     util::check_any(ctx, &stack, "rawequal", 2)?;
     let eq = util::raw_eq(stack.get(0), stack.get(1));
     stack.ret1(Value::boolean(eq));
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 fn lua_rawget<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let t_arg = stack.get(0);
     let key = stack.get(1);
     let Some(t) = t_arg.get_table() else {
@@ -520,7 +536,7 @@ fn lua_rawget<'gc>(
     util::check_any(ctx, &stack, "rawget", 2)?;
     let v = t.raw_get(key);
     stack.ret1(v);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `rawlen(v)` — length of a table (border) or string (byte count), bypassing
@@ -529,7 +545,7 @@ fn lua_rawlen<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let v = stack.get(0);
     let len = if let Some(s) = v.get_string() {
         s.len() as i64
@@ -545,14 +561,14 @@ fn lua_rawlen<'gc>(
         ));
     };
     stack.ret1(Value::integer(ctx.mutation(), len));
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 fn lua_rawset<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let t_arg = stack.get(0);
     let key = stack.get(1);
     let value = stack.get(2);
@@ -571,7 +587,7 @@ fn lua_rawset<'gc>(
     }
     t.raw_set_keyed(ctx, key, value);
     stack.ret1(Value::table(t));
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `select('#', ...)` returns the count of extra arguments; `select(n, ...)`
@@ -581,14 +597,14 @@ fn lua_select<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let m = stack.len().saturating_sub(1); // count of arguments after the selector
     let sel = stack.get(0);
     if let Some(s) = sel.get_string()
         && s.as_bytes() == b"#"
     {
         stack.ret1(Value::integer(ctx.mutation(), m as i64));
-        return Ok(CallbackAction::Return);
+        return Ok(());
     }
     let i = util::check_integer(ctx, sel, "select", 1)?;
     let pos = if i < 0 { m as i64 + i + 1 } else { i };
@@ -602,7 +618,7 @@ fn lua_select<'gc>(
         k += 1;
     }
     stack.replace(&out);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `setmetatable(t, mt)` — attach `mt` (a table or nil) as `t`'s
@@ -612,7 +628,7 @@ fn lua_setmetatable<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let Some(t) = stack.get(0).get_table() else {
         return Err(util::type_error(
             ctx,
@@ -647,14 +663,14 @@ fn lua_setmetatable<'gc>(
     }
     t.set_metatable(ctx, mt);
     stack.ret1(Value::table(t));
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 fn lua_tonumber<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let v = stack.get(0);
     let base_arg = stack.get(1);
     let result = if !base_arg.is_nil() {
@@ -680,7 +696,7 @@ fn lua_tonumber<'gc>(
         Value::nil()
     };
     stack.ret1(result);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `tostring(v)` — `luaL_tolstring`: `__tostring`'s result, else the default
@@ -707,11 +723,11 @@ fn lua_type<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     util::check_any(ctx, &stack, "type", 1)?;
     let name = stack.get(0).type_name();
     stack.replace(&[Value::string(LuaString::new(ctx, name.as_bytes()))]);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `warn(msg, ...)` — only checks its arguments (strings or numbers, as
@@ -720,7 +736,7 @@ fn lua_warn<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     if stack.is_empty() {
         return Err(util::type_error(ctx, "warn", 1, "string", None));
     }
@@ -728,7 +744,7 @@ fn lua_warn<'gc>(
         util::check_string(ctx, stack.get(i), "warn", i + 1)?;
     }
     stack.clear();
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `xpcall(f, msgh, ...)`: like `pcall`, but the executor calls `msgh` with

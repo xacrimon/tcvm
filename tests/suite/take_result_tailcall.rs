@@ -1,4 +1,4 @@
-use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, Stack, Value};
 use tcvm::vm::sequence::CallbackAction;
 use tcvm::{Context, Executor, LoadError, Lua, RuntimeError, StepResult};
 
@@ -18,7 +18,7 @@ fn take_result_after_suspended_tailcall() {
     let mut lua = Lua::new();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let y = Function::new_native(ctx.mutation(), yielder as NativeFn, &[]);
+            let y = Function::new_action(ctx.mutation(), yielder, &[]);
             let k = Value::string(LuaString::new(ctx, b"yielder"));
             ctx.globals().raw_set(ctx, k, Value::function(y));
             let chunk = ctx.load(

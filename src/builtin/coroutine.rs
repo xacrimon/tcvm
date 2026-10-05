@@ -1,5 +1,6 @@
 use crate::Context;
 use crate::builtin::util;
+use crate::env::function::NativeKind;
 use crate::env::thread::{ExecKind, ThreadStatus};
 use crate::env::{
     Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Thread, Value,
@@ -8,31 +9,33 @@ use crate::vm::sequence::{CallbackAction, Execution, OnOk};
 use crate::vm::{close, interp};
 
 pub fn load<'gc>(ctx: Context<'gc>) {
+    let lib = Table::new(ctx);
+    let set = |name: &str, f: Function<'gc>| {
+        let key = Value::string(LuaString::new(ctx, name.as_bytes()));
+        lib.raw_set(ctx, key, Value::function(f));
+    };
     let fns: &[(&str, NativeFn)] = &[
-        ("close", lua_close),
         ("create", lua_create),
         ("isyieldable", lua_isyieldable),
-        ("resume", lua_resume),
         ("running", lua_running),
         ("status", lua_status),
         ("wrap", lua_wrap),
-        ("yield", lua_yield),
     ];
-
-    let lib = Table::new(ctx);
     for &(name, handler) in fns {
-        let entry: Option<interp::Handler> = match name {
-            "resume" => Some(interp::ff_resume),
-            "yield" => Some(interp::ff_yield),
-            _ => None,
-        };
-        let handler = match entry {
-            Some(entry) => Function::new_native_with_entry(ctx.mutation(), handler, &[], entry),
-            None => Function::new_native(ctx.mutation(), handler, &[]),
-        };
-        let key = Value::string(LuaString::new(ctx, name.as_bytes()));
-        lib.raw_set(ctx, key, Value::function(handler));
+        set(name, Function::new_native(ctx.mutation(), handler, &[]));
     }
+    let mc = ctx.mutation();
+    set("close", Function::new_action(mc, lua_close, &[]));
+    let resume = NativeKind::Action(lua_resume);
+    set(
+        "resume",
+        Function::new_native_with_entry(mc, resume, &[], interp::ff_resume),
+    );
+    let yield_ = NativeKind::Action(lua_yield);
+    set(
+        "yield",
+        Function::new_native_with_entry(mc, yield_, &[], interp::ff_yield),
+    );
 
     let lib_name = Value::string(LuaString::new(ctx, b"coroutine"));
     ctx.globals().raw_set(ctx, lib_name, Value::table(lib));
@@ -44,7 +47,7 @@ fn lua_create<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let f = stack
         .get(0)
         .get_function()
@@ -57,7 +60,7 @@ fn lua_create<'gc>(
         ts.status = ThreadStatus::Suspended;
     }
     stack.ret1(Value::thread(thread));
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `coroutine.resume(co, ...)` — switch to `co`, passing the rest as args.
@@ -153,7 +156,7 @@ fn lua_status<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let co = stack
         .get(0)
         .get_thread()
@@ -169,7 +172,7 @@ fn lua_status<'gc>(
     };
     let v = Value::string(LuaString::new(ctx, s));
     stack.ret1(v);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `coroutine.running()` — `(currently_running_thread, is_main_thread)`.
@@ -177,11 +180,11 @@ fn lua_running<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let cur = stack.exec().current_thread();
     let is_main = stack.exec().is_main();
     stack.replace(&[Value::thread(cur), Value::boolean(is_main)]);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `getoptco`: argument 1, or the running coroutine only when it's absent (a
@@ -205,7 +208,7 @@ fn lua_isyieldable<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let co = opt_co(ctx, &stack, "isyieldable")?;
     // The running thread's lock is held by the interpreter.
     let yieldable = if co.ptr_eq(stack.exec().current_thread()) {
@@ -216,7 +219,7 @@ fn lua_isyieldable<'gc>(
         !ts.main && !ts.no_yield
     };
     stack.ret1(Value::boolean(yieldable));
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `coroutine.wrap(f)` — return a callable that calls `coroutine.resume`
@@ -226,7 +229,7 @@ fn lua_wrap<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let f = stack
         .get(0)
         .get_function()
@@ -240,12 +243,12 @@ fn lua_wrap<'gc>(
     }
     let wrapper = Function::new_native_with_entry(
         ctx.mutation(),
-        wrap_callback as NativeFn,
+        NativeKind::Action(wrap_callback),
         &[Value::thread(thread)],
         interp::ff_wrap,
     );
     stack.ret1(Value::function(wrapper));
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `coroutine.close([co])` — close a suspended or dead coroutine's pending

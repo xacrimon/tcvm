@@ -1,7 +1,7 @@
 //! Each `Executor` runs on its own thread, so starting one must not disturb
 //! another that is suspended or holding results (#6).
 
-use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, Stack, Value};
 use tcvm::vm::sequence::CallbackAction;
 use tcvm::{Context, Executor, Lua, RuntimeError};
 
@@ -37,7 +37,7 @@ fn start_preserves_unread_results() {
 fn start_preserves_suspended_executor() {
     let mut lua = Lua::new();
     let a = lua.enter(|ctx| {
-        let y = Function::new_native(ctx.mutation(), yielder as NativeFn, &[]);
+        let y = Function::new_action(ctx.mutation(), yielder, &[]);
         let key = Value::string(LuaString::new(ctx, b"yielder"));
         ctx.globals().raw_set(ctx, key, Value::function(y));
         let chunk = ctx
@@ -66,7 +66,7 @@ fn other_executors_main_thread_is_normal() {
     let mut lua = Lua::new();
     lua.load_all();
     let a = lua.enter(|ctx| {
-        let y = Function::new_native(ctx.mutation(), yielder as NativeFn, &[]);
+        let y = Function::new_action(ctx.mutation(), yielder, &[]);
         let key = Value::string(LuaString::new(ctx, b"yielder"));
         ctx.globals().raw_set(ctx, key, Value::function(y));
         let chunk = ctx

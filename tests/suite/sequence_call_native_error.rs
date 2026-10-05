@@ -14,7 +14,7 @@ fn boomer<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     Err(Error::from_str(ctx, "boom"))
 }
 
@@ -78,7 +78,7 @@ fn native_error_in_sequence_call_caught_by_pcallseq() {
     lua.load_all();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let f = Function::new_native(ctx.mutation(), factory as NativeFn, &[]);
+            let f = Function::new_action(ctx.mutation(), factory, &[]);
             let key = Value::string(LuaString::new(ctx, b"factory"));
             ctx.globals().raw_set(ctx, key, Value::function(f));
             let chunk = ctx.load(
