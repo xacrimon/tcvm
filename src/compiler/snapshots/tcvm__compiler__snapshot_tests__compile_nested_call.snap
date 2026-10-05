@@ -18,7 +18,7 @@ expression: output
 0006  [  2]  CALL            R3 args=2 ret=0
 0007  [  2]  CALL            R2 args=0 ret=0
 0008  [  2]  CALL            R1 args=0 ret=1
-0009  [  2]  RETURN0
+0009  [  2]  RETURN          R0 count=1
 
 ; prototype 0:
   ; function (params=1, vararg=false, stack=2, upvalues=0)

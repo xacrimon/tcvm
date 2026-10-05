@@ -67,7 +67,7 @@ expression: output
 0052  [  8]  JMP             +2
 0053  [  8]  CLOSE           R5
 0054  [  8]  FORLOOP         R2 -8
-0055  [  8]  RETURN0
+0055  [  8]  RETURN          R0 count=1
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=1, upvalues=1)

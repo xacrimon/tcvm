@@ -8,7 +8,7 @@ expression: output
 ; code:
 0000  [  1]  VARARGPREP      fixed=0
 0001  [ 10]  CLOSURE         R0 P0
-0002  [ 10]  RETURN0
+0002  [ 10]  RETURN          R0 count=1
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=6, upvalues=1)

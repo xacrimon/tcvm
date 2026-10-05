@@ -36,4 +36,4 @@ expression: output
 0012  [ 16]  SETTABUP        R0 U0 K10  ; "f"
 0013  [ 17]  LOAD            R0 K13  ; "hello"
 0014  [ 17]  SETTABUP        R0 U0 K12  ; "g"
-0015  [ 17]  RETURN0
+0015  [ 17]  RETURN          R0 count=1

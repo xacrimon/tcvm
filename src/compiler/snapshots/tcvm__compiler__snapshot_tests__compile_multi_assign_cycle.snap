@@ -19,4 +19,4 @@ expression: output
 0006  [  2]  MOVE            R2 R0
 0007  [  2]  MOVE            R1 R4
 0008  [  2]  MOVE            R0 R3
-0009  [  2]  RETURN0
+0009  [  2]  RETURN          R0 count=1
