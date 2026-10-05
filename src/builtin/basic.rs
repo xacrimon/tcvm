@@ -9,7 +9,7 @@ use crate::env::{
 use crate::vm::async_sequence::{SequenceReturn, async_sequence};
 use crate::vm::debug::where_prefix;
 use crate::vm::interp;
-use crate::vm::sequence::{BoxSequence, CallbackAction, Protect};
+use crate::vm::sequence::{BoxSequence, CallbackAction, OnOk, Protect};
 
 pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[
@@ -428,6 +428,7 @@ fn lua_pcall<'gc>(
     Ok(CallbackAction::CallThen {
         at: 0,
         protect: Protect::Errors,
+        ok: OnOk::ReturnTrue,
         cont: pcall_cont,
     })
 }
@@ -740,6 +741,7 @@ fn lua_xpcall<'gc>(
     Ok(CallbackAction::CallThen {
         at: 1,
         protect: Protect::Handler,
+        ok: OnOk::ReturnTrue,
         cont: xpcall_cont,
     })
 }
