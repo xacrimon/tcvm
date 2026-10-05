@@ -377,8 +377,16 @@ impl<'gc, 'a> Stack<'gc, 'a> {
         let top = self.thread.top;
         debug_assert!(at <= top);
         self.thread.ensure_slots(top + 1);
-        self.thread.stack.copy_within(at..top, at + 1);
-        self.thread.stack[at] = v;
+        let stack = &mut self.thread.stack;
+        // A few values, the usual case, move faster than a `memmove` call.
+        if top - at <= 8 {
+            for j in (at..top).rev() {
+                stack[j + 1] = stack[j];
+            }
+        } else {
+            stack.copy_within(at..top, at + 1);
+        }
+        stack[at] = v;
         self.thread.top += 1;
     }
 
