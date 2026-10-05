@@ -89,6 +89,30 @@ impl<'gc> Context<'gc> {
         }
     }
 
+    /// Run `f` on a byte buffer for building a string, empty, and keep its
+    /// storage for the next one, so building a string allocates only the
+    /// string. A nested use gets a fresh buffer.
+    #[inline]
+    pub(crate) fn with_buf<R>(self, f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
+        let mut buf = self.state.buf.take();
+        buf.clear();
+        let r = f(&mut buf);
+        // Not to hold on to the memory of one huge string.
+        if buf.capacity() <= 1 << 16 {
+            self.state.buf.set(buf);
+        }
+        r
+    }
+
+    /// Intern the string `f` writes, built in the buffer of [`with_buf`](Self::with_buf).
+    #[inline]
+    pub(crate) fn build_string(self, f: impl FnOnce(&mut Vec<u8>)) -> LuaString<'gc> {
+        self.with_buf(|buf| {
+            f(buf);
+            LuaString::new(self, buf)
+        })
+    }
+
     /// Dict-mode sentinel for tables with no metatable. Tables that
     /// migrate to dict mode while carrying a metatable use the
     /// per-`MtCache` sentinel instead.
