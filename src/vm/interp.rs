@@ -2795,6 +2795,19 @@ macro_rules! call_native {
                 action => {
                     unsafe { (*$frame).pc = $ip };
                     let f = unsafe { $thread.stack[func_idx].get_function().unwrap_unchecked() };
+                    // The common shape, a native calling a Lua function, without
+                    // `run_natives`' generality.
+                    if let crate::vm::sequence::CallbackAction::CallThen { at, protect, cont } = action
+                        && let Some(callee) = native_calls_lua($thread, args_base + at as usize)
+                    {
+                        push_native_frame($thread, f, args_base, at, protect, cont, ret_call);
+                        let new_base = args_base + at as usize + 1;
+                        enter_from_native($thread, callee, new_base);
+                        ($frame, $closure) = (unsafe { $thread.top_lua_ptr() }, callee);
+                        $ip = callee.code;
+                        $registers = unsafe { $thread.stack.as_mut_ptr().add(new_base) };
+                        dispatch!();
+                    }
                     let step = run_natives(
                         $ctx,
                         $thread,
@@ -4541,6 +4554,7 @@ fn save_pc<'gc>(thread: &mut ThreadState<'gc>, ip: *const Instruction) {
 /// native call cannot truncate the shared stack below an outer frame's
 /// register window. The callback signals its result count through the logical
 /// top: after the `Return` path, the results count is `thread.top - args_base`.
+#[inline]
 pub(crate) fn invoke_native<'gc>(
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
@@ -5263,7 +5277,7 @@ pub(crate) fn run_natives<'gc>(
     thread: &mut ThreadState<'gc>,
     mut state: NativeState<'gc>,
 ) -> NativeStep {
-    use crate::vm::sequence::{CallbackAction, NativeCont, Protect};
+    use crate::vm::sequence::{CallbackAction, NativeCont};
     loop {
         state = match state {
             NativeState::Resume(status) => {
@@ -5304,28 +5318,10 @@ pub(crate) fn run_natives<'gc>(
                     };
                 }
                 Ok(CallbackAction::CallThen { at, protect, cont }) => {
-                    let flags = frame_flags::NATIVE
-                        | match protect {
-                            Protect::No => 0,
-                            Protect::Errors => frame_flags::PROTECTED,
-                            Protect::Handler => frame_flags::PROTECTED | frame_flags::HANDLER,
-                        };
-                    let pc = cont as *const Instruction;
                     if framed {
-                        let frame = unsafe { thread.frames.last_mut().unwrap_unchecked() };
-                        frame.pc = pc;
-                        frame.num_extras = at as u16;
-                        frame.flags = flags;
-                    } else {
-                        thread.push_lua(LuaFrame {
-                            closure: unsafe { LuaFn::native_frame(f) },
-                            pc,
-                            ret,
-                            base: base as u32,
-                            num_extras: at as u16,
-                            flags,
-                        });
+                        thread.pop_lua();
                     }
+                    push_native_frame(thread, f, base, at, protect, cont, ret);
                     NativeState::Call
                 }
                 Ok(CallbackAction::Suspend(action)) => {
@@ -5366,27 +5362,7 @@ pub(crate) fn run_natives<'gc>(
                             thread.raise(ctx, err);
                             return NativeStep::Exit;
                         }
-                        let num_params = callee.num_params as usize;
-                        let stack = thread.stack.as_mut_ptr();
-                        unsafe {
-                            fill_nil(
-                                stack.add(new_base + nargs),
-                                num_params.saturating_sub(nargs),
-                            )
-                        };
-                        let num_extras = if callee.is_vararg {
-                            nargs.saturating_sub(num_params) as u16
-                        } else {
-                            0
-                        };
-                        thread.push_lua(LuaFrame {
-                            closure: callee,
-                            pc: callee.code,
-                            ret: ret_native,
-                            base: new_base as u32,
-                            num_extras,
-                            flags: 0,
-                        });
+                        enter_from_native(thread, callee, new_base);
                         return NativeStep::EnterLua;
                     }
                     Some((f, FunctionKind::Native(nc))) => {
@@ -5442,12 +5418,123 @@ pub(crate) extern "rust-preserve-none" fn ret_native<'gc>(
 ) -> Exit {
     let (nret, values, _) = ret_args!(instruction, registers, ip);
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-    let slot = unsafe { (*frame).base() + (*frame).num_extras as usize };
+    let nf = unsafe { &mut *frame };
+    debug_assert!(nf.is_native());
+    let (base, slot) = (nf.base(), nf.base() + nf.num_extras as usize);
     // The results sit above the slot, in the finished call's window.
     unsafe { copy_values(thread.stack.as_mut_ptr().add(slot), values, nret) };
     thread.set_top_unchecked(slot + nret);
-    let step = run_natives(ctx, thread, NativeState::Resume(Ok(())));
+    // As `run_natives` would, with a returning continuation inline.
+    nf.flags &= !(frame_flags::PROTECTED | frame_flags::HANDLER);
+    let (f, ret) = (nf.closure.function(), nf.ret);
+    let cont: crate::vm::sequence::NativeCont = unsafe { std::mem::transmute(nf.pc) };
+    let nc = unsafe { f.as_native().unwrap_unchecked() };
+    let r = cont(ctx, nc, Stack::new(thread, base), Ok(()));
+    if let Ok(crate::vm::sequence::CallbackAction::Return) = r
+        && !thread.native_overflowed()
+    {
+        let n = thread.frames.len();
+        unsafe { thread.frames.set_len(n - 1) };
+        let stack = thread.stack.as_mut_ptr();
+        let nret = thread.top - base;
+        become ret(
+            Instruction::from_raw(nret as u64),
+            ctx,
+            thread,
+            unsafe { stack.add(base) },
+            unsafe { stack.add(base - 1) } as *const Instruction,
+            handlers,
+            ds,
+            unsafe { frame.sub(1) },
+            closure,
+        );
+    }
+    let r = match r {
+        Ok(_) if thread.native_overflowed() => Err(native_overflow(ctx)),
+        r => r,
+    };
+    let step = run_natives(
+        ctx,
+        thread,
+        NativeState::Acted {
+            r,
+            framed: true,
+            f,
+            base,
+            ret,
+        },
+    );
     native_step!(step);
+}
+
+/// The Lua function at `slot` when a native's call of it can be entered
+/// straight away: room for its window and for two more frames.
+#[inline(always)]
+fn native_calls_lua<'gc>(thread: &ThreadState<'gc>, slot: usize) -> Option<LuaFn<'gc>> {
+    let f = thread.stack[slot].get_function()?;
+    let FunctionKind::Lua(callee) = f.inner().as_ref() else {
+        return None;
+    };
+    let fits = thread.stack.len() >= slot + 1 + callee.max_stack_size as usize
+        && thread.frames.capacity() - thread.frames.len() >= 2;
+    fits.then(|| unsafe { LuaFn::from_function_unchecked(f) })
+}
+
+/// Push the frame of native `f`, whose window is at `base`, for its
+/// `CallThen`.
+#[inline(always)]
+fn push_native_frame<'gc>(
+    thread: &mut ThreadState<'gc>,
+    f: Function<'gc>,
+    base: usize,
+    at: u32,
+    protect: crate::vm::sequence::Protect,
+    cont: crate::vm::sequence::NativeCont,
+    ret: Handler,
+) {
+    use crate::vm::sequence::Protect;
+    let flags = frame_flags::NATIVE
+        | match protect {
+            Protect::No => 0,
+            Protect::Errors => frame_flags::PROTECTED,
+            Protect::Handler => frame_flags::PROTECTED | frame_flags::HANDLER,
+        };
+    thread.push_lua(LuaFrame {
+        closure: unsafe { LuaFn::native_frame(f) },
+        pc: cont as *const Instruction,
+        ret,
+        base: base as u32,
+        num_extras: at as u16,
+        flags,
+    });
+}
+
+/// Push the frame of a native's call of Lua `callee`, its arguments at
+/// `new_base` up to `top` and its window known to fit.
+#[inline(always)]
+fn enter_from_native<'gc>(thread: &mut ThreadState<'gc>, callee: LuaFn<'gc>, new_base: usize) {
+    let nargs = thread.top - new_base;
+    let num_params = callee.num_params as usize;
+    let stack = thread.stack.as_mut_ptr();
+    unsafe {
+        fill_nil(
+            stack.add(new_base + nargs),
+            num_params.saturating_sub(nargs),
+        )
+    };
+    let num_extras = if callee.is_vararg {
+        nargs.saturating_sub(num_params) as u16
+    } else {
+        0
+    };
+    thread.push_lua(LuaFrame {
+        closure: callee,
+        pc: callee.code,
+        ret: ret_native,
+        base: new_base as u32,
+        num_extras,
+        flags: 0,
+    });
 }
 
 /// `run_thread`'s start when the unwinder hands an error to the protected
