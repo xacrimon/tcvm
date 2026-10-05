@@ -14,6 +14,7 @@ use crate::env::value::{Value, ValueKind};
 use crate::instruction::{Instruction, Op, TFOR_VARS, UpValueDescriptor};
 use crate::lua::Context;
 use crate::vm::num;
+use crate::vm::unwind::Unwound;
 
 /// A handler per opcode, then CALL's continuation per C operand, so that
 /// CALL reads it off the `handlers` register (`call_ret`).
@@ -162,6 +163,9 @@ pub(crate) enum OpError<'gc> {
     /// TBC: the register holds a value without `__close`.
     NonClosable(u8),
     Internal(&'static str),
+    /// Raised by a native or a metamethod, the running frame's pc already
+    /// saved (see `throw!`).
+    Thrown(crate::env::Error<'gc>),
 }
 
 pub(crate) type Registers<'gc, 'a> = *mut Value<'gc>;
@@ -315,6 +319,29 @@ macro_rules! helpers {
                 if std::hint::unlikely(__k.get_float().is_some_and(f64::is_nan)) {
                     raise!(OpError::NanIndex);
                 }
+            }};
+        }
+
+        /// Raise `err` from the frames as they are, the running one's `pc`
+        /// saved: unwind to the frame that catches it and continue there.
+        /// Through `impl_error`, so the unwinder's call stays off the
+        /// raising handler's fast path.
+        #[allow(unused_macros)]
+        macro_rules! throw {
+            ($$err:expr) => {{
+                std::hint::cold_path();
+                $ds.fault = Some(OpError::Thrown($$err));
+                become impl_error(
+                    $instruction,
+                    $ctx,
+                    $thread,
+                    $registers,
+                    $ip,
+                    $handlers,
+                    $ds,
+                    $frame,
+                    $closure,
+                );
             }};
         }
 
@@ -1090,9 +1117,6 @@ fn enter<'gc>(ctx: Context<'gc>, ts: &mut ThreadState<'gc>, ds: &mut DispatchSta
     ts.top_lua()
         .expect("run_thread requires a seeded Lua frame");
     let (frame, closure) = top_frame(ts);
-    if let Some(err) = ts.native_error.take() {
-        return native_entry(ctx, ts, handlers, ds, closure, err);
-    }
     let (ip, base) = unsafe { ((*frame).pc, (*frame).base()) };
     let registers = unsafe { ts.stack.as_mut_ptr().add(base) };
     op_nop(
@@ -1114,35 +1138,42 @@ fn enter<'gc>(ctx: Context<'gc>, ts: &mut ThreadState<'gc>, ds: &mut DispatchSta
 
 /// Cold tail of `raise!`: publish the faulting frame's pc, then raise the
 /// reference-formatted message at level 1 (the faulting Lua frame itself)
-/// so the executor's unwinder can route it to a catcher. A handler so it can
+/// and unwind it to the frame that catches it. A handler so it can
 /// be `become`d: a plain call here would put a frame on every raising
 /// handler's fast path.
 #[inline(never)]
 #[rustc_align(32)]
+// The incoming frame state is only rebound, to wherever the error is caught.
+#[allow(unused_assignments)]
 extern "rust-preserve-none" fn impl_error<'gc>(
-    _instruction: Instruction,
+    instruction: Instruction,
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
-    _registers: Registers<'gc, '_>,
-    ip: *const Instruction,
-    _handlers: *const (),
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
     ds: &mut DispatchState<'gc>,
-    _frame: *mut LuaFrame<'gc>,
-    _closure: LuaFn<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
 ) -> Exit {
-    let kind = ds.fault.take().expect("impl_error without a pending fault");
-    // `ip` already points past the faulting instruction (see `dispatch!`),
-    // which is the convention `LuaFrame::pc` uses.
-    save_pc(thread, ip);
-    let err = match kind {
-        OpError::StackOverflow => crate::vm::debug::stack_overflow(ctx, thread),
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let err = match ds.fault.take().expect("impl_error without a pending fault") {
+        OpError::Thrown(err) => err,
         kind => {
-            let msg = crate::vm::debug::op_error_message(ctx, thread, kind);
-            crate::env::Error::from_str(ctx, &msg)
+            // `ip` already points past the faulting instruction (see
+            // `dispatch!`), which is the convention `LuaFrame::pc` uses.
+            save_pc(thread, ip);
+            match kind {
+                OpError::StackOverflow => crate::vm::debug::stack_overflow(ctx, thread),
+                kind => {
+                    let msg = crate::vm::debug::op_error_message(ctx, thread, kind);
+                    crate::env::Error::from_str(ctx, &msg)
+                }
+            }
         }
     };
-    thread.raise(ctx, err);
-    Exit::End
+    let step = run_natives!(NativeState::Raise(err));
+    native_step!(step);
 }
 
 // ---------------------------------------------------------------------------
@@ -2076,8 +2107,7 @@ extern "rust-preserve-none" fn close_tbc<'gc>(
         Ok(c) => c,
         Err(err) => {
             save_pc(thread, ip);
-            thread.raise(ctx, err);
-            return Exit::End;
+            throw!(err);
         }
     };
     call_mm!(ret_close, tm, [v]);
@@ -2569,8 +2599,7 @@ macro_rules! call_plain {
         if let Err(err) = invoke_plain($ctx, $thread, $f, $nc, args_base, argc) {
             // Saved so the unwinder locates the error at this CALL.
             unsafe { (*$frame).pc = $ip };
-            $thread.raise($ctx, err);
-            return Exit::End;
+            throw!(err);
         }
         land_native!(args_base, func_idx, $returns, $base, $thread, $registers);
     }};
@@ -2587,8 +2616,7 @@ macro_rules! call_action {
             Ok(a) => a,
             Err(err) => {
                 unsafe { (*$frame).pc = $ip };
-                $thread.raise($ctx, err);
-                return Exit::End;
+                throw!(err);
             }
         };
         if let crate::vm::sequence::CallbackAction::Return = action {
@@ -3260,8 +3288,7 @@ extern "rust-preserve-none" fn op_tailcall_native<'gc>(
             debug_assert!(!has_tbc_from(thread, base));
             let popped = thread.pop_lua();
             restore_protected(thread, &popped);
-            thread.push_exec(ExecKind::Error(err));
-            return Exit::End;
+            throw!(err);
         }
     };
     match action {
@@ -3518,8 +3545,7 @@ extern "rust-preserve-none" fn op_return_slow<'gc>(
             Ok(c) => c,
             Err(err) => {
                 save_pc(thread, ip);
-                thread.raise(ctx, err);
-                return Exit::End;
+                throw!(err);
             }
         };
         // Past the frame and the results, below the call: where they end,
@@ -5177,6 +5203,8 @@ pub(crate) enum NativeState<'gc> {
     },
     /// Run the top (native) frame's continuation.
     Resume(Result<(), crate::env::Error<'gc>>),
+    /// Raise the error, from the frames as they are.
+    Raise(crate::env::Error<'gc>),
 }
 
 /// What [`run_natives`] left to do.
@@ -5243,6 +5271,18 @@ pub(crate) fn run_natives<'gc>(
             0,
             ret_native,
         ),
+        NativeState::Raise(err) => drive_natives(
+            ctx,
+            thread,
+            switch,
+            Phase::Raise,
+            Ok(crate::vm::sequence::CallbackAction::Return),
+            Err(err),
+            true,
+            ctx.next_fn(),
+            0,
+            ret_native,
+        ),
     }
 }
 
@@ -5251,6 +5291,8 @@ enum Phase {
     Act,
     Resume,
     Start,
+    /// Unwind `status`'s error to the frame that catches it.
+    Raise,
 }
 
 /// [`run_natives`], starting in `phase` with its state in scalars.
@@ -5342,8 +5384,9 @@ fn drive_natives<'gc>(
                         // On the resumer, leaving the coroutine untouched
                         // (`lua_resume`'s `resume_error`).
                         let msg = LuaString::new(ctx, b"C stack overflow");
-                        thread.raise(ctx, crate::env::Error::new(ctx, Value::string(msg)));
-                        return NativeStep::Exit;
+                        status = Err(crate::env::Error::new(ctx, Value::string(msg)));
+                        phase = Phase::Raise;
+                        continue;
                     }
                     if !switch {
                         thread.pending_action = Some(PendingAction {
@@ -5411,10 +5454,25 @@ fn drive_natives<'gc>(
                     if framed {
                         thread.pop_lua();
                     }
-                    thread.raise(ctx, err);
-                    return NativeStep::Exit;
+                    status = Err(err);
+                    phase = Phase::Raise;
                 }
             },
+            Phase::Raise => {
+                let err = unsafe { std::mem::replace(&mut status, Ok(())).unwrap_err_unchecked() };
+                let err = crate::vm::debug::locate(ctx, thread, err);
+                match crate::vm::unwind::unwind(ctx, thread, err, switch) {
+                    Unwound::Catch(err) => {
+                        status = Err(err);
+                        phase = Phase::Resume;
+                    }
+                    Unwound::Call(at) => {
+                        (slot, ret) = (at, ret_native);
+                        phase = Phase::Start;
+                    }
+                    Unwound::Exit => return NativeStep::Exit,
+                }
+            }
             Phase::Start => {
                 let new_base = slot + 1;
                 let nargs = thread.top - new_base;
@@ -5423,9 +5481,9 @@ fn drive_natives<'gc>(
                     Some((callee, FunctionKind::Lua(_))) => {
                         let callee = unsafe { LuaFn::from_function_unchecked(callee) };
                         if !thread.ensure_frame_slots(new_base + callee.max_stack_size as usize) {
-                            let err = crate::vm::debug::stack_overflow(ctx, thread);
-                            thread.raise(ctx, err);
-                            return NativeStep::Exit;
+                            status = Err(crate::vm::debug::stack_overflow(ctx, thread));
+                            phase = Phase::Raise;
+                            continue;
                         }
                         enter_from_native(thread, callee, new_base, ret);
                         return NativeStep::EnterLua;
@@ -5454,8 +5512,8 @@ fn drive_natives<'gc>(
                         // keeps it.
                         if let Err(e) = resolve_call_chain(ctx, thread, slot, 0) {
                             let msg = crate::vm::debug::op_error_message(ctx, thread, e);
-                            thread.raise(ctx, crate::env::Error::from_str(ctx, &msg));
-                            return NativeStep::Exit;
+                            status = Err(crate::env::Error::from_str(ctx, &msg));
+                            phase = Phase::Raise;
                         }
                     }
                 }
@@ -6221,7 +6279,7 @@ fn set_native_frame<'gc>(thread: &mut ThreadState<'gc>, framed: bool, nf: LuaFra
 
 /// The frame [`push_native_frame`] pushes.
 #[inline(always)]
-fn native_frame<'gc>(
+pub(crate) fn native_frame<'gc>(
     f: Function<'gc>,
     base: usize,
     at: u32,
@@ -6283,68 +6341,6 @@ fn enter_from_native<'gc>(
         num_extras,
         flags: 0,
     });
-}
-
-/// `run_thread`'s start when the unwinder hands an error to the protected
-/// native frame on top: run its continuation with it. Not a handler: the
-/// handlers it enters are called, from `run_thread`'s frame.
-#[inline(never)]
-fn native_entry<'gc>(
-    ctx: Context<'gc>,
-    mut thread: &mut ThreadState<'gc>,
-    handlers: *const (),
-    ds: &mut DispatchState<'gc>,
-    closure: LuaFn<'gc>,
-    err: crate::env::Error<'gc>,
-) -> Exit {
-    let before: *const ThreadState<'gc> = &*thread;
-    let step = run_natives(ctx, &mut thread, true, NativeState::Resume(Err(err)));
-    if !std::ptr::eq(before, &*thread) {
-        ds.current = Some(thread.handle());
-    }
-    match step {
-        NativeStep::EnterLua => {
-            let (frame, closure) = top_frame(thread);
-            let (ip, base) = unsafe { ((*frame).pc, (*frame).base()) };
-            let registers = unsafe { thread.stack.as_mut_ptr().add(base) };
-            op_nop(
-                Instruction::nop(),
-                ctx,
-                thread,
-                registers,
-                ip,
-                handlers,
-                ds,
-                frame,
-                closure,
-            )
-        }
-        NativeStep::Return {
-            ret,
-            func_slot,
-            values,
-        } => {
-            let nret = thread.top - values;
-            let stack = thread.stack.as_mut_ptr();
-            let frame = thread
-                .frames
-                .as_mut_ptr()
-                .wrapping_add(thread.frames.len())
-                .wrapping_sub(1);
-            ret(
-                Instruction::from_raw(nret as u64),
-                ctx,
-                thread,
-                unsafe { stack.add(values) },
-                unsafe { stack.add(func_slot) } as *const Instruction,
-                handlers,
-                ds,
-                frame,
-                closure,
-            )
-        }
-        NativeStep::Exit => Exit::End,
-    }
 }
 
 /// The slow path of every binary arithmetic and bitwise opcode, register and

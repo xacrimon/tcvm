@@ -1,23 +1,16 @@
-use std::pin::Pin;
-
-use crate::dmm::{Collect, Gc, RefLock, Trace};
+use crate::dmm::{Collect, Gc, RefLock};
 use crate::env::error::Exit;
-use crate::env::function::Function;
 use crate::env::thread::{
-    CallSite, ExecKind, FrameRef, LuaFrame, MAX_STACK, PendingAction, PendingRet, TbcEntry,
-    ThreadState, ThreadStatus,
+    CallSite, ExecKind, LuaFrame, PendingAction, PendingRet, ThreadState, ThreadStatus,
 };
-use crate::env::{Error, LuaString, Stack, Thread, Value};
+use crate::env::{Error, LuaString, Thread, Value};
 use crate::lua::RuntimeError;
 use crate::lua::context::Context;
 use crate::lua::convert::{FromMultiValue, IntoMultiValue};
 use crate::vm;
 use crate::vm::interp::CallTarget;
 use crate::vm::interp::ret_exit;
-use crate::vm::sequence::{
-    BoxSequence, CallbackAction, Catch, Execution, Sequence, SequencePoll, Suspend,
-    seq_trace_pointers,
-};
+use crate::vm::sequence::{CallbackAction, Suspend};
 
 #[derive(Clone, Copy, PartialEq, Eq, Collect)]
 #[collect(internal, require_static)]
@@ -496,6 +489,36 @@ fn follow_switches<'gc>(exec: Executor<'gc>, ctx: Context<'gc>, current: Thread<
     exec.0.borrow_mut(ctx.mutation()).thread_stack = chain;
 }
 
+/// Run natives on `thread` from the executor, as dispatch would, leaving
+/// what is left to run for the next `run_thread`.
+fn run_natives<'gc>(
+    exec: Executor<'gc>,
+    ctx: Context<'gc>,
+    thread: Thread<'gc>,
+    state: vm::interp::NativeState<'gc>,
+) {
+    // SAFETY: the executor runs one thread at a time and holds no borrow of
+    // it, as for `run_thread`.
+    let mut ts = unsafe { thread.state_mut(ctx.mutation()) };
+    let step = vm::interp::run_natives(ctx, &mut ts, true, state);
+    if let vm::interp::NativeStep::Return {
+        ret,
+        func_slot,
+        values,
+    } = step
+    {
+        ts.pending_ret = Some(PendingRet {
+            ret,
+            func_slot,
+            values,
+        });
+    }
+    let current = ts.handle();
+    if !current.ptr_eq(thread) {
+        follow_switches(exec, ctx, current);
+    }
+}
+
 /// Hand off control from `resumer` to `target`.
 ///
 /// Pushes a `ExecKind::WaitThread { wt }` onto the resumer (this is what
@@ -925,174 +948,21 @@ fn deliver<'gc>(ts: &mut ThreadState<'gc>, cs: CallSite) {
     }
 }
 
-/// Call an `xpcall` message handler with `err` above the failing frames
-/// (`luaG_errormsg`). A `HandlerSequence` frame collects its result and
-/// re-raises it, marked handled, so the unwind then proceeds to the catcher
-/// without consulting the handler again; an error inside the handler is
-/// handed back to the handler.
-fn run_message_handler<'gc>(
-    ts: &mut ThreadState<'gc>,
-    ctx: Context<'gc>,
-    handler: Function<'gc>,
-    err: Error<'gc>,
-) -> Result<(), RuntimeError> {
-    // Stage above every live register (`top` alone can sit inside the
-    // innermost window when the catcher's callee failed at once).
-    let slot = ts.live_top();
-    ts.ensure_slots(slot + 2);
-    ts.stack[slot] = Value::function(handler);
-    ts.stack[slot + 1] = err.value();
-    ts.set_top(slot + 2);
-    // The handler may use the headroom, so it can run even after a stack overflow.
-    let saved_limit = std::mem::replace(&mut ts.stack_limit, MAX_STACK);
-    let seq = HandlerSequence {
-        handler,
-        depth: 0,
-        saved_limit,
-    };
-    ts.push_exec(ExecKind::Sequence {
-        seq: BoxSequence::new(ctx.mutation(), seq),
-        call_site: in_place(slot),
-        pending_error: None,
-    });
-    schedule_call_at(ts, ctx, slot, ret_exit)
-}
-
-/// Whether the native frame `nf` catches errors: `Some` with its message
-/// handler, if any.
-fn native_catch<'gc>(ts: &ThreadState<'gc>, nf: &LuaFrame<'gc>) -> Option<Option<Function<'gc>>> {
-    use crate::env::thread::frame_flags::{HANDLER, PROTECTED};
-    if nf.flags & PROTECTED == 0 {
-        return None;
-    }
-    Some(if nf.flags & HANDLER != 0 {
-        ts.stack[nf.base()].get_function()
-    } else {
-        None
-    })
-}
-
-/// Close the variables the unwinder detached at `ts.top` with `err` above the
-/// catcher, then re-raise to it.
-fn push_error_close<'gc>(
-    ts: &mut ThreadState<'gc>,
-    ctx: Context<'gc>,
-    err: Error<'gc>,
-    handler: Option<Function<'gc>>,
-) {
-    let bottom = ts.top;
-    let seq = vm::close::ErrorCloseSequence {
-        level: bottom,
-        err,
-        handler,
-    };
-    ts.push_exec(ExecKind::Sequence {
-        seq: BoxSequence::new(ctx.mutation(), seq),
-        call_site: in_place(bottom),
-        pending_error: None,
-    });
-}
-
-/// Completion of an `xpcall` message handler: its first result becomes the
-/// error value. An error inside the handler calls the handler again with
-/// it (manual §2.3), on top of the still-intact failing frames, until the
-/// depth limits below cut the loop. The handler may yield: the reference
-/// forbids that only because it runs the handler on the C stack, and we keep
-/// every call resumable, as LuaJIT does.
-#[derive(Collect)]
-#[collect(internal, no_drop)]
-struct HandlerSequence<'gc> {
-    handler: Function<'gc>,
-    depth: u32,
-    /// `stack_limit` to restore when the handler is done.
-    saved_limit: usize,
-}
-
-/// The nested handler call at this depth gets "stack overflow in message
-/// handler" instead of the error (PUC: `LUAI_MAXCCALLS`, "C stack overflow").
-const MAX_HANDLER_DEPTH: u32 = 200;
-
-/// The depth at which the loop gives up (`luaE_checkcstack`).
-const HANDLER_GIVE_UP_DEPTH: u32 = MAX_HANDLER_DEPTH / 10 * 11;
-
-impl<'gc> Sequence<'gc> for HandlerSequence<'gc> {
-    fn trace_pointers(&self, cc: &mut dyn Trace<'gc>) {
-        seq_trace_pointers!(self, cc);
-    }
-
-    fn poll(
-        self: Pin<&mut Self>,
-        ctx: Context<'gc>,
-        _exec: Execution<'gc>,
-        mut stack: Stack<'gc, '_>,
-    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
-        let result = stack.get(0);
-        stack.thread_mut().stack_limit = self.saved_limit;
-        Err(Error::new(ctx, result).mark_handled())
-    }
-
-    fn error(
-        mut self: Pin<&mut Self>,
-        ctx: Context<'gc>,
-        _exec: Execution<'gc>,
-        err: Error<'gc>,
-        mut stack: Stack<'gc, '_>,
-    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
-        // An already handled error is "error in error handling" from a stack
-        // overflow in the handler; it goes to the catcher as is.
-        let err = if err.is_handled() {
-            err
-        } else if self.depth == HANDLER_GIVE_UP_DEPTH {
-            vm::debug::error_in_error_handling(ctx)
-        } else {
-            self.depth += 1;
-            let value = if self.depth == MAX_HANDLER_DEPTH {
-                Value::string(LuaString::new(ctx, b"stack overflow in message handler"))
-            } else {
-                err.value()
-            };
-            stack.replace(&[value]);
-            return Ok(SequencePoll::Call {
-                function: Value::function(self.handler),
-                bottom: 0,
-            });
-        };
-        stack.thread_mut().stack_limit = self.saved_limit;
-        Err(err)
-    }
-
-    fn catch(&self) -> Catch<'gc> {
-        Catch::Here(None)
-    }
-}
-
-/// Walk a thread's frame stack popping Lua/Wait/`Catch::Pass` frames
-/// (closing upvalues at each Lua `bottom`) until a `Catch::Here` sequence
-/// takes the error.
-///
-/// If the nearest catcher has a message handler (`xpcall`), the handler
-/// runs first, on top of the still-intact failing frames; see
-/// `run_message_handler`.
-///
-/// On no-catcher: if the thread isn't the bottom of the executor's
-/// thread stack, route the error to the resumer's `ExecKind::WaitThread`
-/// and pop the inner thread. This lets a coroutine error propagate to
-/// the resumer's catching sequence. If the thread *is* the bottom,
-/// surface as `RuntimeError::Lua` to the host.
+/// Unwind the error on top of `top` (see `vm::unwind`). Once nothing on the
+/// thread catches it, it ends the executor (`os.exit`), kills an inner
+/// coroutine and goes on in its resumer, or surfaces to the host.
 fn unwind_error<'gc>(
     exec: Executor<'gc>,
     ctx: Context<'gc>,
     top: Thread<'gc>,
 ) -> Result<(), RuntimeError> {
     let mc = ctx.mutation();
-    let mut ts = top.borrow_mut(mc);
-    let Some(ExecKind::Error(err)) = ts.pop_exec() else {
+    let Some(ExecKind::Error(err)) = top.borrow_mut(mc).pop_exec() else {
         unreachable!()
     };
     if let Exit::Process(code) = err.exit_kind() {
         // No `__close` runs, now or on a later `coroutine.close`. Upvalues are
         // closed first so closures that outlive the reset keep their values.
-        drop(ts);
         let mut inner = exec.0.borrow_mut(mc);
         for t in &inner.thread_stack {
             let mut ts = t.borrow_mut(mc);
@@ -1103,136 +973,19 @@ fn unwind_error<'gc>(
         inner.mode = ExecutorMode::Stopped;
         return Err(RuntimeError::Exit(code));
     }
-    let exit = err.exit_kind() != Exit::No;
-    if !err.is_handled() {
-        // Only the nearest catch point's handler applies (`L->errfunc`):
-        // a plain `pcall` in between shadows an outer `xpcall`, while a
-        // `Catch::Pass` sequence is looked through.
-        let handler = ts
-            .frames_rev()
-            .find_map(|f| match f {
-                FrameRef::Exec(ExecKind::Sequence { seq, .. }) => match seq.catch() {
-                    Catch::Pass => None,
-                    Catch::Here(handler) => Some(handler),
-                    Catch::Base => Some(None),
-                },
-                FrameRef::Native(nf) => native_catch(&ts, nf),
-                FrameRef::Elided(lf) => Some(match lf.elided_protect() {
-                    // `xpcall`'s handler sits in the slot below the callee's.
-                    Some(2) => ts.stack[lf.func_slot() - 1].get_function(),
-                    _ => None,
-                }),
-                _ => None,
-            })
-            .flatten();
-        if let Some(handler) = handler {
-            return run_message_handler(&mut ts, ctx, handler, err);
-        }
-    }
-    // `luaD_seterrorobj`: only once the error is being caught (a handler
-    // still sees the raw nil).
-    let err = if err.value().is_nil() && !exit {
-        err.with_value(
-            ctx,
-            Value::string(LuaString::new(ctx, b"<no error object>")),
-        )
-    } else {
-        err
-    };
-    // The popped frames' to-be-closed variables stay listed, detached at the
-    // lowest popped base, which ends up `ts.top`. They close once the catcher
-    // is reached, after the frames are gone (`luaD_pcall`).
-    let mut detached = false;
-    loop {
-        if let Some(lf) = ts.top_lua() {
-            if lf.is_native() {
-                let handler = if exit { None } else { native_catch(&ts, lf) };
-                let at = lf.base() + lf.num_extras as usize;
-                let Some(handler) = handler else {
-                    ts.pop_lua();
-                    continue;
-                };
-                if detached {
-                    push_error_close(&mut ts, ctx, err, handler);
-                } else {
-                    // Nothing of the failed call is left above its slot.
-                    ts.set_top_unchecked(at);
-                    ts.native_error = Some(err);
-                }
-                return Ok(());
-            }
-            let (base, func_slot, protect) = (lf.base(), lf.func_slot(), lf.elided_protect());
-            ts.pop_lua();
-            vm::interp::close_upvalues(mc, &mut ts, base);
-            let ts_ref = &mut *ts;
-            for entry in ts_ref.tbc_list.iter_mut().rev() {
-                if entry.pos() < base {
-                    break;
-                }
-                let value = entry.value(&ts_ref.stack);
-                *entry = TbcEntry::Detached { level: base, value };
-                detached = true;
-            }
-            // Only the logical top drops: an outer frame's register window
-            // can extend past this frame's base, so the vec must not shrink.
-            ts.set_top_unchecked(base);
-            if let Some(k) = protect {
-                // The `pcall` that called it without a frame catches: put its
-                // frame back, for the native catch below.
-                let nf = vm::interp::protected_frame(&ts, func_slot - k, k);
-                ts.push_lua(nf);
-            }
-            continue;
-        }
-        match ts.top_exec_mut() {
-            Some(ExecKind::Sequence {
-                seq, pending_error, ..
-            }) => {
-                let handler = match seq.catch() {
-                    Catch::Here(handler) if !exit => handler,
-                    Catch::Base => None,
-                    _ => {
-                        ts.pop_exec();
-                        continue;
-                    }
-                };
-                if detached {
-                    push_error_close(&mut ts, ctx, err, handler);
-                } else {
-                    *pending_error = Some(err);
-                }
-                return Ok(());
-            }
-            Some(ExecKind::WaitThread { .. }) => {
-                ts.pop_exec();
-            }
-            Some(ExecKind::Start(_) | ExecKind::Error(_)) => {
-                // `Start` is only on a freshly-created thread that hasn't run
-                // yet, so it can't have errored. `Error` is removed by the next
-                // driver pump (which enters this function), so two can't
-                // coexist.
-                unreachable!("Start / Error frame mid-unwind violates the executor invariant");
-            }
-            None => break,
-        }
+    if !top.borrow().frames_empty() {
+        run_natives(exec, ctx, top, vm::interp::NativeState::Raise(err));
+        return Ok(());
     }
     if err.exit_kind() == Exit::Clean {
         // A coroutine closed itself: it returns nothing.
+        let mut ts = top.borrow_mut(mc);
         ts.discard_above(0);
         ts.status = ThreadStatus::Result { bottom: 0 };
         return Ok(());
     }
+    let exit = err.exit_kind() != Exit::No;
     let stack_len = exec.0.borrow().thread_stack.len();
-    // The host's call closes like a `pcall`; a dead coroutine keeps its
-    // variables for `coroutine.close` (`lua_resume` leaves them open).
-    if detached && stack_len == 1 {
-        push_error_close(&mut ts, ctx, err, None);
-        return Ok(());
-    }
-    drop(ts);
-
-    // No catcher on this thread. If we're an inner coroutine, propagate to
-    // the resumer's WaitThread → its next Sequence can catch.
     if stack_len > 1 {
         // Error terminates this coroutine: no result values, so `Stopped`
         // (not `Result`) is its terminal/dead marker. Every coroutine the
@@ -1243,11 +996,10 @@ fn unwind_error<'gc>(
             let mut ts = top.borrow_mut(mc);
             ts.status = ThreadStatus::Stopped;
             ts.death_error = Some(err.value());
+            ts.resumer = None;
         }
-        top.borrow_mut(mc).resumer = None;
         exec.0.borrow_mut(mc).thread_stack.pop();
         let resumer = *exec.0.borrow().thread_stack.last().unwrap();
-        let mut rs = resumer.borrow_mut(mc);
         // Already located on the inner thread; don't re-raise on the resumer.
         // An exit ends only the coroutine that closed itself.
         let err = if exit {
@@ -1255,6 +1007,7 @@ fn unwind_error<'gc>(
         } else {
             err
         };
+        let mut rs = resumer.borrow_mut(mc);
         rs.status = ThreadStatus::Normal;
         match rs.top_exec() {
             Some(ExecKind::WaitThread { .. }) => {
@@ -1267,7 +1020,13 @@ fn unwind_error<'gc>(
                 let nf = rs.top_lua().expect("resumer without a frame");
                 let slot = nf.base() + nf.num_extras as usize;
                 rs.set_top_unchecked(slot);
-                rs.native_error = Some(err);
+                drop(rs);
+                run_natives(
+                    exec,
+                    ctx,
+                    resumer,
+                    vm::interp::NativeState::Resume(Err(err)),
+                );
             }
         }
         return Ok(());
