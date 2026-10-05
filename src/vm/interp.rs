@@ -4938,11 +4938,6 @@ pub(crate) enum NativeState<'gc> {
     },
     /// Run the top (native) frame's continuation.
     Resume(Result<(), crate::env::Error<'gc>>),
-    /// Make the call the top (native) frame waits for.
-    Call,
-    /// Call `stack[slot]` with the values above it, its results going to
-    /// `ret`, with no native frame waiting: a coroutine's body.
-    Start { slot: usize, ret: Handler },
 }
 
 /// What [`run_natives`] left to do.
@@ -4968,42 +4963,93 @@ pub(crate) const MAX_RESUME_DEPTH: u16 = 200;
 /// and the native doesn't return. With `switch`, a resume or yield switches
 /// `thread` to the other coroutine here; the executor (which can't follow)
 /// gets them as suspensions otherwise.
+#[inline(always)]
 pub(crate) fn run_natives<'gc>(
     ctx: Context<'gc>,
     thread: &mut &mut ThreadState<'gc>,
     switch: bool,
-    mut state: NativeState<'gc>,
+    state: NativeState<'gc>,
+) -> NativeStep {
+    // Unpacked here, at the call site: passed whole, the state went through
+    // memory, stored piecewise and read back wider, stalling on store
+    // forwarding.
+    match state {
+        NativeState::Acted {
+            r,
+            framed,
+            f,
+            base,
+            ret,
+        } => drive_natives(
+            ctx,
+            thread,
+            switch,
+            Phase::Act,
+            r,
+            Ok(()),
+            framed,
+            f,
+            base,
+            ret,
+        ),
+        NativeState::Resume(status) => drive_natives(
+            ctx,
+            thread,
+            switch,
+            Phase::Resume,
+            Ok(crate::vm::sequence::CallbackAction::Return),
+            status,
+            true,
+            ctx.next_fn(),
+            0,
+            ret_native,
+        ),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Act,
+    Resume,
+    Start,
+}
+
+/// [`run_natives`], starting in `phase` with its state in scalars.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn drive_natives<'gc>(
+    ctx: Context<'gc>,
+    thread: &mut &mut ThreadState<'gc>,
+    switch: bool,
+    mut phase: Phase,
+    mut r: Result<crate::vm::sequence::CallbackAction<'gc>, crate::env::Error<'gc>>,
+    mut status: Result<(), crate::env::Error<'gc>>,
+    mut framed: bool,
+    mut f: Function<'gc>,
+    mut base: usize,
+    mut ret: Handler,
 ) -> NativeStep {
     use crate::vm::sequence::{CallbackAction, NativeCont, Protect, Suspend};
+    let mut slot = 0;
     loop {
-        state = match state {
-            NativeState::Resume(status) => {
+        match phase {
+            Phase::Resume => {
                 let frame = unsafe { thread.frames.last_mut().unwrap_unchecked() };
                 debug_assert!(frame.is_native());
                 // Errors the continuation itself raises unwind past it.
                 frame.flags &= !(frame_flags::PROTECTED | frame_flags::HANDLER);
-                let (f, base, ret) = (frame.closure.function(), frame.base(), frame.ret);
+                (f, base, ret) = (frame.closure.function(), frame.base(), frame.ret);
                 let cont: NativeCont = unsafe { std::mem::transmute(frame.pc) };
                 let nc = unsafe { f.as_native().unwrap_unchecked() };
-                let mut r = cont(ctx, nc, Stack::new(thread, base), status);
+                let st = std::mem::replace(&mut status, Ok(()));
+                r = cont(ctx, nc, Stack::new(thread, base), st);
                 if r.is_ok() && thread.native_overflowed() {
                     r = Err(native_overflow(ctx));
                 }
-                NativeState::Acted {
-                    r,
-                    framed: true,
-                    f,
-                    base,
-                    ret,
-                }
+                framed = true;
+                phase = Phase::Act;
             }
-            NativeState::Acted {
-                r,
-                framed,
-                f,
-                base,
-                mut ret,
-            } => match r {
+            Phase::Act => match std::mem::replace(&mut r, Ok(CallbackAction::Return)) {
                 Ok(CallbackAction::Return) => {
                     if framed {
                         thread.pop_lua();
@@ -5019,7 +5065,8 @@ pub(crate) fn run_natives<'gc>(
                         thread.pop_lua();
                     }
                     push_native_frame(thread, f, base, at, protect, cont, ret);
-                    NativeState::Call
+                    (slot, ret) = (base + at as usize, ret_native);
+                    phase = Phase::Start;
                 }
                 Ok(CallbackAction::Resume { at, cont }) => {
                     // The resumer waits in a frame of its own, protected so
@@ -5028,8 +5075,8 @@ pub(crate) fn run_natives<'gc>(
                         thread.pop_lua();
                     }
                     push_native_frame(thread, f, base, at, Protect::Errors, cont, ret);
-                    let slot = base + at as usize;
-                    let co = thread.stack[slot]
+                    let at = base + at as usize;
+                    let co = thread.stack[at]
                         .get_thread()
                         .expect("resume of a non-thread");
                     if thread.resume_depth + 1 >= MAX_RESUME_DEPTH {
@@ -5046,14 +5093,14 @@ pub(crate) fn run_natives<'gc>(
                                 then: None,
                             }),
                             call_site: CallSite {
-                                bottom: slot + 1,
-                                func_idx: slot,
+                                bottom: at + 1,
+                                func_idx: at,
                                 ret: ret_native,
                             },
                         });
                         return NativeStep::Exit;
                     }
-                    match resume_into(ctx, thread, co, slot + 1) {
+                    match resume_into(ctx, thread, co, at + 1) {
                         Some(site) => {
                             return NativeStep::Return {
                                 ret: site.ret,
@@ -5061,10 +5108,10 @@ pub(crate) fn run_natives<'gc>(
                                 values: site.bottom,
                             };
                         }
-                        None => NativeState::Start {
-                            slot: 0,
-                            ret: ret_coroutine_end,
-                        },
+                        None => {
+                            (slot, ret) = (0, ret_coroutine_end);
+                            phase = Phase::Start;
+                        }
                     }
                 }
                 Ok(CallbackAction::Yield) => {
@@ -5076,15 +5123,14 @@ pub(crate) fn run_natives<'gc>(
                         func_idx: base - 1,
                         ret,
                     };
-                    if switch && yield_to_resumer(ctx, thread, site) {
-                        NativeState::Resume(Ok(()))
-                    } else {
+                    if !(switch && yield_to_resumer(ctx, thread, site)) {
                         thread.pending_action = Some(PendingAction {
                             action: Box::new(Suspend::Yield { then: None }),
                             call_site: site,
                         });
                         return NativeStep::Exit;
                     }
+                    phase = Phase::Resume;
                 }
                 Ok(CallbackAction::Suspend(action)) => {
                     if framed {
@@ -5110,21 +5156,13 @@ pub(crate) fn run_natives<'gc>(
                     return NativeStep::Exit;
                 }
             },
-            NativeState::Call => {
-                let frame = unsafe { thread.frames.last().unwrap_unchecked() };
-                let slot = frame.base() + frame.num_extras as usize;
-                NativeState::Start {
-                    slot,
-                    ret: ret_native,
-                }
-            }
-            NativeState::Start { slot, ret } => {
+            Phase::Start => {
                 let new_base = slot + 1;
                 let nargs = thread.top - new_base;
                 let fv = thread.stack[slot];
                 match fv.get_function().map(|f| (f, f.inner().as_ref())) {
-                    Some((f, FunctionKind::Lua(_))) => {
-                        let callee = unsafe { LuaFn::from_function_unchecked(f) };
+                    Some((callee, FunctionKind::Lua(_))) => {
+                        let callee = unsafe { LuaFn::from_function_unchecked(callee) };
                         if !thread.ensure_frame_slots(new_base + callee.max_stack_size as usize) {
                             let err = crate::vm::debug::stack_overflow(ctx, thread);
                             thread.raise(ctx, err);
@@ -5133,44 +5171,33 @@ pub(crate) fn run_natives<'gc>(
                         enter_from_native(thread, callee, new_base, ret);
                         return NativeStep::EnterLua;
                     }
-                    Some((f, FunctionKind::Native(nc))) => {
-                        match invoke_native(ctx, thread, nc, new_base, nargs) {
-                            Ok(CallbackAction::Return)
-                                if std::ptr::fn_addr_eq(ret, ret_native as Handler) =>
-                            {
-                                let nret = thread.top - new_base;
-                                thread.stack.copy_within(new_base..new_base + nret, slot);
-                                thread.set_top_unchecked(slot + nret);
-                                NativeState::Resume(Ok(()))
-                            }
-                            Ok(CallbackAction::Return) => {
-                                return NativeStep::Return {
-                                    ret,
-                                    func_slot: slot,
-                                    values: new_base,
-                                };
-                            }
-                            r => NativeState::Acted {
-                                r,
-                                framed: false,
-                                f,
-                                base: new_base,
+                    Some((callee, FunctionKind::Native(nc))) => {
+                        r = invoke_native(ctx, thread, nc, new_base, nargs);
+                        if !matches!(r, Ok(CallbackAction::Return)) {
+                            (framed, f, base) = (false, callee, new_base);
+                            phase = Phase::Act;
+                        } else if std::ptr::fn_addr_eq(ret, ret_native as Handler) {
+                            let nret = thread.top - new_base;
+                            let stack = thread.stack.as_mut_ptr();
+                            unsafe { copy_values(stack.add(slot), stack.add(new_base), nret) };
+                            thread.set_top_unchecked(slot + nret);
+                            phase = Phase::Resume;
+                        } else {
+                            return NativeStep::Return {
                                 ret,
-                            },
+                                func_slot: slot,
+                                values: new_base,
+                            };
                         }
                     }
                     None => {
                         // MULTRET: the count is at `top`, where the chain
                         // keeps it.
-                        match resolve_call_chain(ctx, thread, slot, 0) {
-                            Ok(_) => {}
-                            Err(e) => {
-                                let msg = crate::vm::debug::op_error_message(ctx, thread, e);
-                                thread.raise(ctx, crate::env::Error::from_str(ctx, &msg));
-                                return NativeStep::Exit;
-                            }
+                        if let Err(e) = resolve_call_chain(ctx, thread, slot, 0) {
+                            let msg = crate::vm::debug::op_error_message(ctx, thread, e);
+                            thread.raise(ctx, crate::env::Error::from_str(ctx, &msg));
+                            return NativeStep::Exit;
                         }
-                        NativeState::Start { slot, ret }
                     }
                 }
             }
@@ -5203,7 +5230,13 @@ fn resume_into<'gc>(
         cs.discard_above(0);
         cs.ensure_slots(1 + n);
         cs.stack[0] = f;
-        cs.stack[1..1 + n].copy_from_slice(&thread.stack[args..args + n]);
+        unsafe {
+            copy_values(
+                cs.stack.as_mut_ptr().add(1),
+                thread.stack.as_ptr().add(args),
+                n,
+            )
+        };
         cs.top = 1 + n;
         None
     } else {
@@ -5212,7 +5245,13 @@ fn resume_into<'gc>(
             .take()
             .expect("resumed a coroutine that didn't yield");
         cs.ensure_slots(y.bottom + n);
-        cs.stack[y.bottom..y.bottom + n].copy_from_slice(&thread.stack[args..args + n]);
+        unsafe {
+            copy_values(
+                cs.stack.as_mut_ptr().add(y.bottom),
+                thread.stack.as_ptr().add(args),
+                n,
+            )
+        };
         cs.top = y.bottom + n;
         Some(y)
     };
@@ -5259,7 +5298,13 @@ fn hand_back<'gc>(from: &mut ThreadState<'gc>, to: &mut ThreadState<'gc>, values
     let nf = unsafe { to.frames.last().unwrap_unchecked() };
     let slot = nf.base() + nf.num_extras as usize;
     to.ensure_slots(slot + n);
-    to.stack[slot..slot + n].copy_from_slice(&from.stack[values..values + n]);
+    unsafe {
+        copy_values(
+            to.stack.as_mut_ptr().add(slot),
+            from.stack.as_ptr().add(values),
+            n,
+        )
+    };
     to.set_top_unchecked(slot + n);
     to.status = ThreadStatus::Normal;
     from.resumer = None;
