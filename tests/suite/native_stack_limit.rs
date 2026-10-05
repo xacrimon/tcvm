@@ -4,7 +4,6 @@
 //! 5.5.1, whose larger stack also lets the 70000-result cases through).
 
 use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
-use tcvm::vm::sequence::CallbackAction;
 use tcvm::{Context, Lua, RuntimeError};
 
 use crate::common::{err, ok, start_on};
@@ -78,11 +77,11 @@ fn flood<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     for _ in 0..100_000 {
         stack.push(Value::boolean(true));
     }
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 #[test]

@@ -6,7 +6,7 @@
 use std::pin::Pin;
 
 use tcvm::dmm::{Collect, Trace};
-use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, Stack, Value};
 use tcvm::lua::Context;
 use tcvm::vm::sequence::{BoxSequence, CallbackAction, Execution, Sequence, SequencePoll};
 use tcvm::{Executor, LoadError, Lua, RuntimeError, StepResult};
@@ -51,7 +51,7 @@ fn pending_surfaces_then_completes() {
     let mut lua = Lua::new();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let f = Function::new_native(ctx.mutation(), factory as NativeFn, &[]);
+            let f = Function::new_action(ctx.mutation(), factory, &[]);
             let key = Value::string(LuaString::new(ctx, b"factory"));
             ctx.globals().raw_set(ctx, key, Value::function(f));
             let chunk = ctx.load("return factory()", Some("pending"))?;

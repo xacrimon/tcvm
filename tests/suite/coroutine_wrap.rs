@@ -3,7 +3,6 @@
 //! rethrow (in contrast to `resume`'s catch-and-wrap behavior).
 
 use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
-use tcvm::vm::sequence::CallbackAction;
 use tcvm::{Context, Executor, LoadError, Lua, RuntimeError};
 
 /// Wrap a generator that yields ascending values then returns. Each
@@ -36,7 +35,7 @@ fn boomer<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     Err(Error::from_str(ctx, "boom"))
 }
 

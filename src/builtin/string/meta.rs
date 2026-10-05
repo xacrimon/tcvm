@@ -5,14 +5,14 @@
 use crate::Context;
 use crate::builtin::util::{AdjustResults, str_to_number};
 use crate::dmm::Mutation;
-use crate::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Value};
+use crate::env::{ActionFn, Error, Function, LuaString, NativeClosure, Stack, Table, Value};
 use crate::vm::num::{self, SlowNum};
 use crate::vm::sequence::{BoxSequence, CallbackAction};
 
 pub(super) fn install<'gc>(ctx: Context<'gc>, lib: Table<'gc>) {
     let mt = Table::new(ctx);
     for (name, f) in arith_natives(ctx) {
-        let f = Function::new_native(ctx.mutation(), f, &[]);
+        let f = Function::new_action(ctx.mutation(), f, &[]);
         mt.raw_set(ctx, Value::string(name), Value::function(f));
     }
     mt.raw_set(
@@ -37,8 +37,8 @@ macro_rules! arith_natives {
             }
         )*
 
-        fn arith_natives<'gc>(ctx: Context<'gc>) -> [(LuaString<'gc>, NativeFn); ${count($native)}] {
-            [$((ctx.symbols().$mm, $native as NativeFn),)*]
+        fn arith_natives<'gc>(ctx: Context<'gc>) -> [(LuaString<'gc>, ActionFn); ${count($native)}] {
+            [$((ctx.symbols().$mm, $native as ActionFn),)*]
         }
     };
 }

@@ -3,7 +3,7 @@
 //! it. Expected strings come from `lua` 5.5.1 on the same chunks named `=t`.
 //! Each chunk hands its result to the host with `error(v, 0)`.
 
-use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, Stack, Value};
 use tcvm::vm::sequence::CallbackAction;
 use tcvm::{Context, Executor, LoadError, Lua, RuntimeError, StepResult};
 
@@ -165,7 +165,7 @@ fn restart_after_a_handler_yields_to_the_host() {
     lua.load_all();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let y = Function::new_native(ctx.mutation(), yielder as NativeFn, &[]);
+            let y = Function::new_action(ctx.mutation(), yielder, &[]);
             let key = Value::string(LuaString::new(ctx, b"yielder"));
             ctx.globals().raw_set(ctx, key, Value::function(y));
             let src = format!("{RECURSE} xpcall(f, function(m) yielder() return m end)");

@@ -5,7 +5,7 @@
 use std::pin::Pin;
 
 use tcvm::dmm::{Collect, Trace};
-use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
+use tcvm::env::{ActionFn, Error, Function, LuaString, NativeClosure, Stack, Value};
 use tcvm::lua::Context;
 use tcvm::vm::sequence::{BoxSequence, CallbackAction, Execution, Sequence, SequencePoll};
 use tcvm::{Executor, LoadError, Lua};
@@ -61,7 +61,7 @@ fn native_calls_lua_then_post_processes() {
 
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let bumper_fn = Function::new_native(ctx.mutation(), bumper as NativeFn, &[]);
+            let bumper_fn = Function::new_action(ctx.mutation(), bumper, &[]);
             let key = Value::string(LuaString::new(ctx, b"bumper"));
             ctx.globals().raw_set(ctx, key, Value::function(bumper_fn));
             let chunk = ctx.load(
@@ -82,7 +82,7 @@ fn native_call_without_then_returns_to_caller() {
 
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let f = Function::new_native(ctx.mutation(), forward as NativeFn, &[]);
+            let f = Function::new_action(ctx.mutation(), forward, &[]);
             let key = Value::string(LuaString::new(ctx, b"forward"));
             ctx.globals().raw_set(ctx, key, Value::function(f));
             let chunk = ctx.load(
@@ -103,10 +103,10 @@ fn run_with_natives(src: &str) -> Result<i64, String> {
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
             for (name, f) in [
-                ("bumper", bumper as NativeFn),
-                ("forward", forward as NativeFn),
+                ("bumper", bumper as ActionFn),
+                ("forward", forward as ActionFn),
             ] {
-                let f = Function::new_native(ctx.mutation(), f, &[]);
+                let f = Function::new_action(ctx.mutation(), f, &[]);
                 let key = Value::string(LuaString::new(ctx, name.as_bytes()));
                 ctx.globals().raw_set(ctx, key, Value::function(f));
             }

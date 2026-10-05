@@ -6,7 +6,7 @@
 use std::pin::Pin;
 
 use tcvm::dmm::{Collect, Trace};
-use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, Stack, Value};
 use tcvm::lua::Context;
 use tcvm::vm::sequence::{BoxSequence, CallbackAction, Execution, Sequence, SequencePoll};
 use tcvm::{Executor, LoadError, Lua};
@@ -50,7 +50,7 @@ fn run(src: &str) -> i64 {
     lua.load_all();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let forward_fn = Function::new_native(ctx.mutation(), forward as NativeFn, &[]);
+            let forward_fn = Function::new_action(ctx.mutation(), forward, &[]);
             let key = Value::string(LuaString::new(ctx, b"forward"));
             ctx.globals().raw_set(ctx, key, Value::function(forward_fn));
             let chunk = ctx.load(src, Some("seq_tailcall"))?;

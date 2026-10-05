@@ -52,7 +52,6 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         ("getenv", lua_getenv),
         ("remove", lua_remove),
         ("rename", lua_rename),
-        ("time", lua_time),
         ("tmpname", lua_tmpname),
     ];
 
@@ -62,6 +61,12 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         let key = Value::string(LuaString::new(ctx, name.as_bytes()));
         lib.raw_set(ctx, key, Value::function(handler));
     }
+    let time = Function::new_action(ctx.mutation(), lua_time, &[]);
+    lib.raw_set(
+        ctx,
+        Value::string(LuaString::new(ctx, b"time")),
+        Value::function(time),
+    );
     util::set_not_implemented(ctx, lib, "os", &["execute", "setlocale"]);
 
     let lib_name = Value::string(LuaString::new(ctx, b"os"));
@@ -74,7 +79,7 @@ fn lua_clock<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     // The `libc` crate binds neither `clock` nor `CLOCKS_PER_SEC` on unix
     // targets; XSI fixes the latter at one million.
     unsafe extern "C" {
@@ -82,7 +87,7 @@ fn lua_clock<'gc>(
     }
     const CLOCKS_PER_SEC: f64 = 1_000_000.0;
     stack.ret1(Value::float(clock() as f64 / CLOCKS_PER_SEC));
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `date([format [, time]])` — `time` (default: now) broken down in local
@@ -92,7 +97,7 @@ fn lua_date<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     // `SIZETIMEFMT`: longer expansions of a single conversion come out empty.
     const MAX_ITEM: usize = 250;
 
@@ -136,7 +141,7 @@ fn lua_date<'gc>(
             fields.raw_set(ctx, key, Value::boolean(b));
         }
         stack.ret1(Value::table(fields));
-        return Ok(CallbackAction::Return);
+        return Ok(());
     }
 
     let mut out = Vec::with_capacity(s.len());
@@ -168,7 +173,7 @@ fn lua_date<'gc>(
         out.extend_from_slice(&buf[..len]);
     }
     stack.ret1(Value::string(LuaString::new(ctx, &out)));
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 fn until_nul(s: &[u8]) -> &[u8] {
@@ -208,7 +213,7 @@ fn lua_difftime<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     if stack.is_empty() {
         return Err(util::type_error(ctx, "difftime", 1, "number", None));
     }
@@ -218,7 +223,7 @@ fn lua_difftime<'gc>(
     }
     let t1 = util::check_number(ctx, stack.get(1), "difftime", 2)?;
     stack.ret1(Value::float(t2 - t1));
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `exit([code [, close]])` — stop the executor and hand `code` to the host
@@ -229,7 +234,7 @@ fn lua_exit<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let arg = stack.get(0);
     // Boolean: true→0, false→1. Otherwise (and for nil/none) an integer status,
     // via `luaL_optinteger` — so non-integers raise rather than silently exit 0.
@@ -248,7 +253,7 @@ fn lua_getenv<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let name = util::check_string(ctx, stack.get(0), "getenv", 1)?;
     // Look up by raw bytes (env vars/values needn't be UTF-8), matching C.
     let val = std::env::var_os(std::ffi::OsStr::from_bytes(name.as_bytes()));
@@ -257,7 +262,7 @@ fn lua_getenv<'gc>(
         None => Value::nil(),
     };
     stack.ret1(result);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `remove(filename)` — delete a file (or empty directory). Returns `true`, or
@@ -266,7 +271,7 @@ fn lua_remove<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let name = util::check_string(ctx, stack.get(0), "remove", 1)?;
     let path = std::path::Path::new(std::ffi::OsStr::from_bytes(name.as_bytes()));
     // C `remove` deletes files and empty directories; try the file path first.
@@ -274,7 +279,7 @@ fn lua_remove<'gc>(
     // `os.remove` passes the filename to `luaL_fileresult`, so it prefixes.
     let what = String::from_utf8_lossy(name.as_bytes());
     file_result(ctx, &mut stack, res, Some(&what));
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `rename(from, to)` — rename/move a file. Returns `true`, or
@@ -283,7 +288,7 @@ fn lua_rename<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let from = util::check_string(ctx, stack.get(0), "rename", 1)?;
     let to = util::check_string(ctx, stack.get(1), "rename", 2)?;
     let from_p = std::path::Path::new(std::ffi::OsStr::from_bytes(from.as_bytes()));
@@ -292,7 +297,7 @@ fn lua_rename<'gc>(
     // Unlike `remove`, C's `os_rename` passes NULL to `luaL_fileresult`, so the
     // error message carries no filename prefix.
     file_result(ctx, &mut stack, res, None);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `time([table])` — the current time, or the time the date table names
@@ -418,12 +423,12 @@ fn lua_tmpname<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut path = std::env::temp_dir();
     path.push(format!("lua_{}_{n}", std::process::id()));
     let s = LuaString::new(ctx, path.to_string_lossy().as_bytes());
     stack.ret1(Value::string(s));
-    Ok(CallbackAction::Return)
+    Ok(())
 }

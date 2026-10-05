@@ -109,7 +109,7 @@ impl Lua {
                 interner,
                 type_metatables: std::array::from_fn(|_| Gc::new(mc, Lock::new(None))),
                 next: Function::new_native(mc, builtin::lua_next, &[]),
-                ipairs_iter: Function::new_native(mc, builtin::ipairs_aux, &[]),
+                ipairs_iter: Function::new_action(mc, builtin::ipairs_aux, &[]),
             }
         });
         let metrics = arena.metrics();
@@ -377,14 +377,14 @@ mod tests {
         ctx: Context<'gc>,
         _closure: &crate::env::NativeClosure<'gc>,
         mut stack: crate::env::Stack<'gc, '_>,
-    ) -> Result<crate::vm::sequence::CallbackAction<'gc>, crate::env::Error<'gc>> {
+    ) -> Result<(), crate::env::Error<'gc>> {
         let (a, b) = (stack.get(0), stack.get(1));
         let sum = match (a.get_integer(), b.get_integer()) {
             (Some(x), Some(y)) => Value::integer(ctx.mutation(), x + y),
             _ => return Err(crate::env::Error::from_str(ctx, "bad args")),
         };
         stack.replace(&[sum]);
-        Ok(crate::vm::sequence::CallbackAction::Return)
+        Ok(())
     }
 
     #[test]
@@ -520,7 +520,7 @@ mod tests {
         ctx: Context<'gc>,
         _closure: &crate::env::NativeClosure<'gc>,
         mut stack: crate::env::Stack<'gc, '_>,
-    ) -> Result<crate::vm::sequence::CallbackAction<'gc>, crate::env::Error<'gc>> {
+    ) -> Result<(), crate::env::Error<'gc>> {
         let v = stack.get(0);
         let out = if v.get_integer().is_some() {
             v
@@ -528,7 +528,7 @@ mod tests {
             return Err(crate::env::Error::from_str(ctx, "bad args"));
         };
         stack.replace(&[out]);
-        Ok(crate::vm::sequence::CallbackAction::Return)
+        Ok(())
     }
 
     fn run_returning_int(src: &str) -> i64 {

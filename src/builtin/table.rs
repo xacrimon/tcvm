@@ -1,7 +1,8 @@
 use crate::Context;
 use crate::builtin::util;
 use crate::env::{
-    Error, Function, LuaString, MetamethodBits, NativeClosure, NativeFn, Stack, Table, Value,
+    ActionFn, Error, Function, LuaString, MetamethodBits, NativeClosure, NativeFn, Stack, Table,
+    Value,
 };
 use crate::lua::stash::Fetchable;
 use crate::lua::{StashedError, StashedValue};
@@ -57,22 +58,26 @@ fn check_tab_meta<'gc>(
 }
 
 pub fn load<'gc>(ctx: Context<'gc>) {
-    let fns: &[(&str, NativeFn)] = &[
+    let fns: &[(&str, NativeFn)] = &[("create", lua_create), ("pack", lua_pack)];
+    let actions: &[(&str, ActionFn)] = &[
         ("concat", lua_concat),
-        ("create", lua_create),
         ("insert", lua_insert),
         ("move", lua_move),
-        ("pack", lua_pack),
         ("remove", lua_remove),
         ("sort", lua_sort),
         ("unpack", lua_unpack),
     ];
 
     let lib = Table::new(ctx);
-    for &(name, handler) in fns {
-        let handler = Function::new_native(ctx.mutation(), handler, &[]);
+    let set = |name: &str, f: Function<'gc>| {
         let key = Value::string(LuaString::new(ctx, name.as_bytes()));
-        lib.raw_set(ctx, key, Value::function(handler));
+        lib.raw_set(ctx, key, Value::function(f));
+    };
+    for &(name, handler) in fns {
+        set(name, Function::new_native(ctx.mutation(), handler, &[]));
+    }
+    for &(name, handler) in actions {
+        set(name, Function::new_action(ctx.mutation(), handler, &[]));
     }
 
     let lib_name = Value::string(LuaString::new(ctx, b"table"));
@@ -203,7 +208,7 @@ fn lua_create<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let n = util::check_integer(ctx, stack.get(0), "create", 1)?;
     let m_arg = stack.get(1);
     let m = if m_arg.is_nil() {
@@ -224,7 +229,7 @@ fn lua_create<'gc>(
     }
     let t = Table::with_capacity(ctx, n as usize, m as usize);
     stack.ret1(Value::table(t));
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `insert(t, [pos,] value)` — append `value`, or insert it at `pos`, shifting
@@ -401,7 +406,7 @@ fn lua_pack<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let n = stack.len();
     let t = Table::new(ctx);
     for i in 0..n {
@@ -417,7 +422,7 @@ fn lua_pack<'gc>(
         Value::integer(ctx.mutation(), n as i64),
     );
     stack.ret1(Value::table(t));
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `remove(t [, pos])` — remove and return `t[pos]` (default `#t`), shifting

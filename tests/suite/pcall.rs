@@ -186,10 +186,10 @@ fn lua_frame_count<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let n = stack.lua_frames().iter().filter(|f| !f.is_native()).count();
     stack.replace(&[Value::integer(ctx.mutation(), n as i64)]);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 #[test]
@@ -269,15 +269,19 @@ fn lua_through<'gc>(
     Ok(CallbackAction::call(Some(then)))
 }
 
-fn install_through(ctx: tcvm::Context<'_>) {
-    for (name, f) in [
-        ("lua_frames", lua_frame_count as NativeFn),
-        ("through", lua_through as NativeFn),
-    ] {
-        let f = Function::new_native(ctx.mutation(), f, &[]);
+fn install_through<'gc>(ctx: tcvm::Context<'gc>) {
+    let set = |name: &str, f: Function<'gc>| {
         let key = Value::string(LuaString::new(ctx, name.as_bytes()));
         ctx.globals().raw_set(ctx, key, Value::function(f));
-    }
+    };
+    set(
+        "lua_frames",
+        Function::new_native(ctx.mutation(), lua_frame_count, &[]),
+    );
+    set(
+        "through",
+        Function::new_action(ctx.mutation(), lua_through, &[]),
+    );
 }
 
 #[test]

@@ -2,7 +2,6 @@
 //! `coroutine.resume`, courtesy of `PCallSequence`'s error handler.
 
 use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
-use tcvm::vm::sequence::CallbackAction;
 use tcvm::{Context, Executor, LoadError, Lua};
 
 /// A native callback that always errors.
@@ -10,7 +9,7 @@ fn boomer<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     Err(Error::from_str(ctx, "boom"))
 }
 

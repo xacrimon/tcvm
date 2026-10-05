@@ -2,7 +2,7 @@
 //! `Sequence` built from an `async move` block, calls a Lua function via
 //! `.await`, and returns the result.
 
-use tcvm::env::{Function, LuaString, NativeClosure, NativeFn, Stack, Value};
+use tcvm::env::{Function, LuaString, NativeClosure, Stack, Value};
 use tcvm::vm::async_sequence::{SequenceReturn, async_sequence};
 use tcvm::vm::sequence::CallbackAction;
 use tcvm::{Context, Executor, LoadError, Lua};
@@ -31,7 +31,7 @@ fn async_pending_then_return() {
 
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let make_fn = Function::new_native(ctx.mutation(), make as NativeFn, &[]);
+            let make_fn = Function::new_action(ctx.mutation(), make, &[]);
             let key = Value::string(LuaString::new(ctx, b"makeseq"));
             ctx.globals().raw_set(ctx, key, Value::function(make_fn));
             let chunk = ctx.load("return makeseq()", Some("async_pending"))?;
@@ -72,7 +72,7 @@ fn async_call_receives_callee_error() {
 
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let guard_fn = Function::new_native(ctx.mutation(), guard as NativeFn, &[]);
+            let guard_fn = Function::new_action(ctx.mutation(), guard, &[]);
             let key = Value::string(LuaString::new(ctx, b"guard"));
             ctx.globals().raw_set(ctx, key, Value::function(guard_fn));
             let chunk = ctx.load(
