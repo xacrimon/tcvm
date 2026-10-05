@@ -28,7 +28,7 @@ pub struct LocVar<'gc> {
 #[collect(internal, no_drop)]
 pub struct Prototype<'gc> {
     #[collect(require_static)]
-    pub code: Box<[crate::instruction::Instruction]>,
+    pub code: Code,
     pub constants: Box<[Value<'gc>]>,
     pub prototypes: Box<[Gc<'gc, Prototype<'gc>>]>,
     #[collect(require_static)]
@@ -63,6 +63,38 @@ pub struct Prototype<'gc> {
     pub ic_table: IcTable<'gc>,
     /// Per distinct constructor template, indexed by `NEWTABLE`.
     pub templates: Box<[Template<'gc>]>,
+}
+
+/// A prototype's bytecode, in cells: the interpreter rewrites an
+/// instruction in place to the variant specialized for what its inline cache
+/// holds (quickening).
+pub struct Code(Box<[std::cell::Cell<crate::instruction::Instruction>]>);
+
+impl Code {
+    pub fn new(code: Box<[crate::instruction::Instruction]>) -> Self {
+        Code(code.into_iter().map(std::cell::Cell::new).collect())
+    }
+
+    /// The first instruction, for the interpreter's raw reads (and writes,
+    /// which the cells permit).
+    #[inline(always)]
+    pub fn as_ptr(&self) -> *const crate::instruction::Instruction {
+        self.0.as_ptr().cast()
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = crate::instruction::Instruction> + '_ {
+        self.0.iter().map(std::cell::Cell::get)
+    }
 }
 
 /// What `NEWTABLE` starts a constructor's table with: the shape of its

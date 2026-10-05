@@ -38,7 +38,7 @@ fn format_prototype_into(out: &mut String, proto: &Prototype<'_>, depth: usize) 
         let line = proto.line_for_pc(i).unwrap_or(0);
         out.push_str(&format!(
             "{indent}{i:04}  [{line:>3}]  {}\n",
-            format_instruction(instr, proto)
+            format_instruction(&instr, proto)
         ));
     }
 
@@ -79,7 +79,8 @@ fn format_instruction(instr: &Instruction, proto: &Prototype<'_>) -> String {
         }
     }
 
-    match instr.op() {
+    // A quickened form prints as the instruction the compiler emitted.
+    match instr.op().unquickened() {
         Op::MOVE => {
             let (dst, src) = instr.ab();
             format!("MOVE            R{dst} R{src}")
@@ -365,6 +366,7 @@ fn format_instruction(instr: &Instruction, proto: &Prototype<'_>) -> String {
                 format_imm(instr)
             )
         }
+        op => unreachable!("{op:?} is a quickened form"),
     }
 }
 

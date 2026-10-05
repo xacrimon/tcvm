@@ -95,6 +95,21 @@ static HANDLERS: [Handler; Op::COUNT] = Op::table([
     (Op::LEI, op_lei),
     (Op::GTI, op_gti),
     (Op::GEI, op_gei),
+    (Op::GETFIELD_OWN, getfield_own),
+    (Op::GETFIELD_ABSENT, getfield_absent),
+    (Op::GETFIELD_PROTO, getfield_proto),
+    (Op::GETTABUP_OWN, gettabup_own),
+    (Op::GETTABUP_ABSENT, gettabup_absent),
+    (Op::GETTABUP_PROTO, gettabup_proto),
+    (Op::SELF_OWN, self_own),
+    (Op::SELF_ABSENT, self_absent),
+    (Op::SELF_PROTO, self_proto),
+    (Op::SETFIELD_OWN, setfield_own),
+    (Op::SETFIELD_TRANS, setfield_trans),
+    (Op::SETTABUP_OWN, settabup_own),
+    (Op::SETTABUP_TRANS, settabup_trans),
+    (Op::SETFIELD_ABSENT, setfield_absent),
+    (Op::SETTABUP_ABSENT, settabup_absent),
 ]);
 
 /// Why an opcode faulted. `impl_error` renders the reference message for
@@ -614,7 +629,13 @@ fn read_ic<'gc>(closure: LuaFn<'gc>, ic_idx: u16) -> InlineCache<'gc> {
 /// Refill the IC entry. Called by slow paths after they've done a full
 /// shape lookup; subsequent same-shape accesses skip the slow path.
 #[inline(always)]
-fn fill_ic<'gc>(ctx: Context<'gc>, closure: LuaFn<'gc>, ic_idx: u16, entry: InlineCache<'gc>) {
+fn fill_ic<'gc>(
+    ctx: Context<'gc>,
+    closure: LuaFn<'gc>,
+    ic_idx: u16,
+    site: *const Instruction,
+    entry: InlineCache<'gc>,
+) {
     // Every dict table with the same metatable shares one sentinel shape,
     // so an entry on it would answer for keys it never saw.
     debug_assert!(match entry {
@@ -635,6 +656,36 @@ fn fill_ic<'gc>(ctx: Context<'gc>, closure: LuaFn<'gc>, ic_idx: u16, entry: Inli
         // `Gc<Lock<T>>` would emit.
         ctx.mutation().backward_barrier(Gc::erase(proto_gc), None);
         unsafe { slot_lock.as_cell() }.set(entry);
+        quicken(site, &entry);
+    }
+}
+
+/// Rewrite the table access at `site` to the form for `entry`, its cache's
+/// new contents (see `Op::unquickened`).
+#[inline]
+fn quicken(site: *const Instruction, entry: &InlineCache<'_>) {
+    let insn = unsafe { *site };
+    let op = match (insn.op().unquickened(), entry) {
+        (Op::GETFIELD, InlineCache::Own { .. }) => Op::GETFIELD_OWN,
+        (Op::GETFIELD, InlineCache::Absent { .. }) => Op::GETFIELD_ABSENT,
+        (Op::GETFIELD, InlineCache::ProtoLoad { .. }) => Op::GETFIELD_PROTO,
+        (Op::GETTABUP, InlineCache::Own { .. }) => Op::GETTABUP_OWN,
+        (Op::GETTABUP, InlineCache::Absent { .. }) => Op::GETTABUP_ABSENT,
+        (Op::GETTABUP, InlineCache::ProtoLoad { .. }) => Op::GETTABUP_PROTO,
+        (Op::SELF, InlineCache::Own { .. }) => Op::SELF_OWN,
+        (Op::SELF, InlineCache::Absent { .. }) => Op::SELF_ABSENT,
+        (Op::SELF, InlineCache::ProtoLoad { .. }) => Op::SELF_PROTO,
+        (Op::SETFIELD, InlineCache::Own { .. }) => Op::SETFIELD_OWN,
+        (Op::SETFIELD, InlineCache::Transition { .. }) => Op::SETFIELD_TRANS,
+        (Op::SETTABUP, InlineCache::Own { .. }) => Op::SETTABUP_OWN,
+        (Op::SETTABUP, InlineCache::Transition { .. }) => Op::SETTABUP_TRANS,
+        (Op::SETFIELD, InlineCache::Absent { .. }) => Op::SETFIELD_ABSENT,
+        (Op::SETTABUP, InlineCache::Absent { .. }) => Op::SETTABUP_ABSENT,
+        (op, _) => op,
+    };
+    if op != insn.op() {
+        // SAFETY: `Code` keeps instructions in cells, and `site` came from one.
+        unsafe { site.cast_mut().write(insn.with_op(op)) };
     }
 }
 
@@ -768,6 +819,7 @@ fn get_fill_ic<'gc>(
     ctx: Context<'gc>,
     closure: LuaFn<'gc>,
     ic_idx: u16,
+    site: *const Instruction,
     t: Table<'gc>,
     k: Value<'gc>,
 ) -> Result<Value<'gc>, Value<'gc>> {
@@ -781,17 +833,21 @@ fn get_fill_ic<'gc>(
             Ok(v)
         };
     }
-    // The entry already says `t` lacks the key, and an `__index` function
-    // leaves nothing to cache: refilling would cost a barrier on every miss.
+    // The entry already says `t` lacks the key: refilling it would cost a
+    // barrier on every miss. Only `__index` is left.
     if let InlineCache::Absent { shape: cached } = read_ic(closure, ic_idx)
         && Shape::ptr_eq(cached, shape)
         && let Some(mt) = shape.mt_cache()
-        && mt.mm(MetamethodBits::INDEX).get_function().is_some()
     {
-        return Err(Value::table(t));
+        let index = mt.mm(MetamethodBits::INDEX);
+        drop(state);
+        if index.get_function().is_some() {
+            return Err(Value::table(t));
+        }
+        return get_index_fill_ic(ctx, closure, ic_idx, site, t, index, Some(shape), k);
     }
     let slot = shape.find_slot(constant_key(k));
-    fill_ic(ctx, closure, ic_idx, shape_entry(shape, slot));
+    fill_ic(ctx, closure, ic_idx, site, shape_entry(shape, slot));
     let v = slot.map_or(Value::nil(), |s| state.named_get(s));
     if !v.is_nil() || !shape.has_mm(MetamethodBits::INDEX) {
         return Ok(v);
@@ -800,7 +856,7 @@ fn get_fill_ic<'gc>(
     let index = unsafe { shape.mt_cache().unwrap_unchecked() }.mm(MetamethodBits::INDEX);
     drop(state);
     let recv = slot.is_none().then_some(shape);
-    get_index_fill_ic(ctx, closure, ic_idx, t, index, recv, k)
+    get_index_fill_ic(ctx, closure, ic_idx, site, t, index, recv, k)
 }
 
 /// The `__index` half of [`get_fill_ic`], out of line to keep the own-key
@@ -812,6 +868,7 @@ fn get_index_fill_ic<'gc>(
     ctx: Context<'gc>,
     closure: LuaFn<'gc>,
     ic_idx: u16,
+    site: *const Instruction,
     t: Table<'gc>,
     index: Value<'gc>,
     recv: Option<Shape<'gc>>,
@@ -849,7 +906,7 @@ fn get_index_fill_ic<'gc>(
             holder_shape,
             loc: SlotLoc::new(holder_shape, holder_slot),
         };
-        fill_ic(ctx, closure, ic_idx, entry);
+        fill_ic(ctx, closure, ic_idx, site, entry);
     }
     Ok(v)
 }
@@ -862,6 +919,7 @@ fn set_own_fill_ic<'gc>(
     ctx: Context<'gc>,
     closure: LuaFn<'gc>,
     ic_idx: u16,
+    site: *const Instruction,
     t: Table<'gc>,
     k: Value<'gc>,
     v: Value<'gc>,
@@ -892,7 +950,7 @@ fn set_own_fill_ic<'gc>(
     let existing = slot.map_or(Value::nil(), |s| state.named_get(s));
     if existing.is_nil() && newindex {
         if cache {
-            fill_ic(ctx, closure, ic_idx, shape_entry(shape, slot));
+            fill_ic(ctx, closure, ic_idx, site, shape_entry(shape, slot));
         }
         return false;
     }
@@ -922,7 +980,7 @@ fn set_own_fill_ic<'gc>(
     };
     drop(state);
     if cache {
-        fill_ic(ctx, closure, ic_idx, entry);
+        fill_ic(ctx, closure, ic_idx, site, entry);
     }
     true
 }
@@ -5675,7 +5733,7 @@ extern "rust-preserve-none" fn get_slow<'gc>(
     closure: LuaFn<'gc>,
 ) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-    let op = instruction.op();
+    let op = instruction.op().unquickened();
     let dst = instruction.a();
     let recv = match op {
         Op::GETTABUP => read_upvalue(thread, upvalue!(instruction.b())),
@@ -5701,7 +5759,7 @@ extern "rust-preserve-none" fn get_slow<'gc>(
     let Some(t) = recv.get_table() else {
         index_chain_body!(ctx, thread, registers, ip, handlers, ds, recv, k, dst);
     };
-    match get_fill_ic(ctx, closure, instruction.d(), t, k) {
+    match get_fill_ic(ctx, closure, instruction.d(), unsafe { ip.sub(1) }, t, k) {
         Ok(v) => {
             *reg!(ref mut dst) = v;
             dispatch!();
@@ -5726,7 +5784,7 @@ extern "rust-preserve-none" fn set_slow<'gc>(
     closure: LuaFn<'gc>,
 ) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-    let op = instruction.op();
+    let op = instruction.op().unquickened();
     let v = reg!(instruction.a());
     let recv = match op {
         Op::SETTABUP => read_upvalue(thread, upvalue!(instruction.b())),
@@ -5749,7 +5807,7 @@ extern "rust-preserve-none" fn set_slow<'gc>(
     }
     let k = constant!(instruction.e());
     if let Some(t) = recv.get_table()
-        && set_own_fill_ic(ctx, closure, instruction.d(), t, k, v)
+        && set_own_fill_ic(ctx, closure, instruction.d(), unsafe { ip.sub(1) }, t, k, v)
     {
         dispatch!();
     }
@@ -5882,3 +5940,170 @@ macro_rules! ret_call_n {
 ret_call_n!(ret_call0, 0);
 ret_call_n!(ret_call1, 1);
 ret_call_n!(ret_call2, 2);
+
+// ---------------------------------------------------------------------------
+// Quickened table accesses
+// ---------------------------------------------------------------------------
+
+/// A quickened read: the receiver `$recv` names (`reg` or `upval` operand
+/// `b`), its cache entry known to be of kind `$kind`, and with `$self_` the
+/// receiver also stored above the result (SELF). Any miss goes to
+/// `get_slow`, which refills the entry and requickens.
+macro_rules! get_quick {
+    ($name:ident, $recv:ident, $kind:ident, $self_:literal) => {
+        #[inline(never)]
+        #[rustc_align(32)]
+        extern "rust-preserve-none" fn $name<'gc>(
+            instruction: Instruction,
+            ctx: Context<'gc>,
+            thread: &mut ThreadState<'gc>,
+            registers: Registers<'gc, '_>,
+            ip: *const Instruction,
+            handlers: *const (),
+            ds: &mut DispatchState<'gc>,
+            frame: *mut LuaFrame<'gc>,
+            closure: LuaFn<'gc>,
+        ) -> Exit {
+            helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+            let (dst, b, ic_idx, _) = instruction.abde();
+            let recv = get_quick!(@recv $recv, b, thread);
+            let Some(t) = recv.get_table() else {
+                tail!(get_slow);
+            };
+            let state = t.inner().borrow();
+            let Some(v) = get_quick!(@load $kind, read_ic(closure, ic_idx), t, &state) else {
+                drop(state);
+                // An absent key on a shape with an `__index` function: call
+                // it from here, as `get_slow` would.
+                if get_quick!(@absent $kind)
+                    && let InlineCache::Absent { shape } = read_ic(closure, ic_idx)
+                    && Shape::ptr_eq(t.shape(), shape)
+                    && let Some(mt) = shape.mt_cache()
+                    && let index = mt.mm(MetamethodBits::INDEX)
+                    && index.get_function().is_some()
+                {
+                    if $self_ {
+                        *reg!(ref mut (dst + 1)) = recv;
+                    }
+                    call_mm!(ret_store_a, index, [recv, constant!(instruction.e())]);
+                }
+                tail!(get_slow);
+            };
+            drop(state);
+            if $self_ {
+                *reg!(ref mut (dst + 1)) = recv;
+            }
+            *reg!(ref mut dst) = v;
+            dispatch!();
+        }
+    };
+    (@absent Absent) => {
+        true
+    };
+    (@absent $kind:ident) => {
+        false
+    };
+    (@recv reg, $b:ident, $thread:ident) => {
+        reg!($b)
+    };
+    (@recv upval, $b:ident, $thread:ident) => {
+        read_upvalue($thread, upvalue!($b))
+    };
+    // Own and Absent entries only change through `fill_ic`, which
+    // requickens; the collector may empty a ProtoLoad one, so that kind is
+    // checked.
+    (@load Own, $cache:expr, $t:ident, $state:expr) => {{
+        let InlineCache::Own { shape, loc } = $cache else {
+            unsafe { std::hint::unreachable_unchecked() }
+        };
+        let state: &TableState<'gc> = $state;
+        if Shape::ptr_eq(state.shape(), shape) {
+            let v = unsafe { $t.load(state, loc) };
+            (!(v.is_nil() && shape.has_mm(MetamethodBits::INDEX))).then_some(v)
+        } else {
+            None
+        }
+    }};
+    (@load Absent, $cache:expr, $t:ident, $state:expr) => {{
+        let InlineCache::Absent { shape } = $cache else {
+            unsafe { std::hint::unreachable_unchecked() }
+        };
+        let state: &TableState<'gc> = $state;
+        (Shape::ptr_eq(state.shape(), shape) && !shape.has_mm(MetamethodBits::INDEX))
+            .then_some(Value::nil())
+    }};
+    (@load Proto, $cache:expr, $t:ident, $state:expr) => {{
+        let cache = $cache;
+        if matches!(cache, InlineCache::ProtoLoad { .. }) {
+            ic_get(cache, $t, $state)
+        } else {
+            None
+        }
+    }};
+}
+
+get_quick!(getfield_own, reg, Own, false);
+get_quick!(getfield_absent, reg, Absent, false);
+get_quick!(getfield_proto, reg, Proto, false);
+get_quick!(gettabup_own, upval, Own, false);
+get_quick!(gettabup_absent, upval, Absent, false);
+get_quick!(gettabup_proto, upval, Proto, false);
+get_quick!(self_own, reg, Own, true);
+get_quick!(self_absent, reg, Absent, true);
+get_quick!(self_proto, reg, Proto, true);
+
+/// A quickened write, as [`get_quick!`]: `$kind` is `Own` or `Transition`.
+macro_rules! set_quick {
+    ($name:ident, $recv:ident, $kind:ident) => {
+        #[inline(never)]
+        #[rustc_align(32)]
+        extern "rust-preserve-none" fn $name<'gc>(
+            instruction: Instruction,
+            ctx: Context<'gc>,
+            thread: &mut ThreadState<'gc>,
+            registers: Registers<'gc, '_>,
+            ip: *const Instruction,
+            handlers: *const (),
+            ds: &mut DispatchState<'gc>,
+            frame: *mut LuaFrame<'gc>,
+            closure: LuaFn<'gc>,
+        ) -> Exit {
+            helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+            let (src, b, ic_idx, _) = instruction.abde();
+            let recv = get_quick!(@recv $recv, b, thread);
+            let Some(t) = recv.get_table() else {
+                tail!(set_slow);
+            };
+            let cache = read_ic(closure, ic_idx);
+            if !matches!(cache, InlineCache::$kind { .. }) {
+                unsafe { std::hint::unreachable_unchecked() }
+            }
+            set_quick!(@store $kind, ctx, instruction, cache, t, recv, src);
+            tail!(set_slow);
+        }
+    };
+    (@store Absent, $ctx:ident, $instruction:ident, $cache:ident, $t:ident, $recv:ident, $src:ident) => {
+        // Filled for a shape with `__newindex`, which a function may answer
+        // from here.
+        if let InlineCache::Absent { shape } = $cache
+            && Shape::ptr_eq($t.shape(), shape)
+            && let Some(mt) = shape.mt_cache()
+            && let newindex = mt.mm(MetamethodBits::NEWINDEX)
+            && newindex.get_function().is_some()
+        {
+            call_mm!(ret_discard, newindex, [$recv, constant!($instruction.e()), reg!($src)]);
+        }
+    };
+    (@store $kind:ident, $ctx:ident, $instruction:ident, $cache:ident, $t:ident, $recv:ident, $src:ident) => {
+        if ic_set($ctx, $cache, $t, reg!($src)) {
+            dispatch!();
+        }
+    };
+}
+
+set_quick!(setfield_own, reg, Own);
+set_quick!(setfield_trans, reg, Transition);
+set_quick!(settabup_own, upval, Own);
+set_quick!(settabup_trans, upval, Transition);
+set_quick!(setfield_absent, reg, Absent);
+set_quick!(settabup_absent, upval, Absent);

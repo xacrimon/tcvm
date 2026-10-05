@@ -321,7 +321,7 @@ impl<'gc> Chunk<'gc> {
         Gc::new(
             mc,
             Prototype {
-                code: self.tape.into_boxed_slice(),
+                code: crate::env::function::Code::new(self.tape.into_boxed_slice()),
                 constants: self.constants.into_boxed_slice(),
                 prototypes: self.prototypes.into_boxed_slice(),
                 upvalue_desc: self.upvalue_desc.into_boxed_slice(),

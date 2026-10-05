@@ -631,7 +631,7 @@ macro_rules! instructions {
         /// handler array with `op as usize`.
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         #[repr(u8)]
-        #[allow(clippy::upper_case_acronyms)]
+        #[allow(clippy::upper_case_acronyms, non_camel_case_types)]
         pub enum Op {
             $($(#[$meta])* $op = $num,)*
         }
@@ -800,6 +800,53 @@ instructions! {
     /// with the count baked in so the handler has nothing to decode or test.
     0x4e RETURN0    ret0        Nil   { }
     0x4f RETURN1    ret1        A     { value: Reg }
+
+    // --- quickened forms ------------------------------------------------
+    //
+    // Never emitted: the interpreter rewrites a table access to the form for
+    // the kind of entry its inline cache holds once it fills it (`_OWN` an own
+    // slot, `_ABSENT` a key the shape lacks, `_PROTO` a slot in the
+    // `__index` table, `_TRANS` an added key), and back on a miss. Same
+    // operands as the generic form.
+
+    0x50 GETFIELD_OWN    getfield_own    Abde { dst: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x51 GETFIELD_ABSENT getfield_absent Abde { dst: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x52 GETFIELD_PROTO  getfield_proto  Abde { dst: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x53 GETTABUP_OWN    gettabup_own    Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+    0x54 GETTABUP_ABSENT gettabup_absent Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+    0x55 GETTABUP_PROTO  gettabup_proto  Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+    0x56 SELF_OWN        self_own        Abde { dst: Reg, object: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x57 SELF_ABSENT     self_absent     Abde { dst: Reg, object: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x58 SELF_PROTO      self_proto      Abde { dst: Reg, object: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x59 SETFIELD_OWN    setfield_own    Abde { src: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x5a SETFIELD_TRANS  setfield_trans  Abde { src: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x5b SETTABUP_OWN    settabup_own    Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+    0x5c SETTABUP_TRANS  settabup_trans  Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+    0x5d SETFIELD_ABSENT setfield_absent Abde { src: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x5e SETTABUP_ABSENT settabup_absent Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+}
+
+impl Op {
+    /// The generic opcode a quickened one stands in for, else itself.
+    #[inline]
+    pub fn unquickened(self) -> Op {
+        match self {
+            Op::GETFIELD_OWN | Op::GETFIELD_ABSENT | Op::GETFIELD_PROTO => Op::GETFIELD,
+            Op::GETTABUP_OWN | Op::GETTABUP_ABSENT | Op::GETTABUP_PROTO => Op::GETTABUP,
+            Op::SELF_OWN | Op::SELF_ABSENT | Op::SELF_PROTO => Op::SELF,
+            Op::SETFIELD_OWN | Op::SETFIELD_TRANS | Op::SETFIELD_ABSENT => Op::SETFIELD,
+            Op::SETTABUP_OWN | Op::SETTABUP_TRANS | Op::SETTABUP_ABSENT => Op::SETTABUP,
+            op => op,
+        }
+    }
+}
+
+impl Instruction {
+    /// This instruction with its opcode replaced, operands kept.
+    #[inline]
+    pub(crate) fn with_op(self, op: Op) -> Self {
+        Instruction((self.0 & !0xff) | op as u64)
+    }
 }
 
 /// Offset of a generic `for`'s first variable from its base. Past Lua 5.5's
