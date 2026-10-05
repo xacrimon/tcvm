@@ -30,8 +30,6 @@ macro_rules! emit_struct {
             pub name: LuaString<'gc>,
             /// `__metatable`, which `getmetatable` returns in place of the metatable.
             pub metatable: LuaString<'gc>,
-            /// `__pairs`, consulted by `pairs`.
-            pub pairs: LuaString<'gc>,
             /// `__close`, called when a to-be-closed variable goes out of scope.
             pub close: LuaString<'gc>,
             /// `__mode`, which makes a table's keys and/or values weak.
@@ -51,7 +49,6 @@ macro_rules! emit_intern_all {
                     $($field: interner.intern(mc, $bytes),)*
                     name: interner.intern(mc, b"__name"),
                     metatable: interner.intern(mc, b"__metatable"),
-                    pairs: interner.intern(mc, b"__pairs"),
                     close: interner.intern(mc, b"__close"),
                     mode: interner.intern(mc, b"__mode"),
                     n: interner.intern(mc, b"n"),

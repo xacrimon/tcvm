@@ -256,3 +256,45 @@ return tostring(n > 0)
 "#;
     assert_eq!(ok(src), "true");
 }
+
+/// `pairs` and `ipairs` called the way a loop does go through their fast
+/// entries; every other call shape, and a `__pairs` added to or removed from a
+/// metatable in use, must give the builtins' results.
+#[test]
+fn pairs_and_ipairs_entries() {
+    let src = r#"
+local out = {}
+local t = {1, 2}
+local a, b, c, d, e = pairs(t)
+out[#out + 1] = cat(a == next, b == t, c, d, e)
+local f = pairs(t)
+out[#out + 1] = cat(f == next, select('#', pairs(t)))
+local function tail(x) return pairs(x) end
+local g, h = tail(t)
+out[#out + 1] = cat(g == next, h == t, select('#', tail(t)))
+local mt = {}
+local o = setmetatable({x = 1}, mt)
+local s = {}
+for k, v in pairs(o) do s[#s + 1] = k .. v end
+mt.__pairs = function(self) return function(_, k) if not k then return 'p', 1 end end, self, nil end
+for k, v in pairs(o) do s[#s + 1] = k .. v end
+mt.__pairs = nil
+for k, v in pairs(o) do s[#s + 1] = k .. v end
+out[#out + 1] = table.concat(s, ',')
+local i1, i2, i3, i4 = ipairs(t)
+local it = ipairs(t)
+out[#out + 1] = cat(i1 == it, i2 == t, i3, i4, select('#', ipairs(t)))
+local n1, n2, n3 = ipairs(nil)
+out[#out + 1] = cat(n2, n3)
+out[#out + 1] = select(2, pcall(function() local x = pairs() end))
+out[#out + 1] = select(2, pcall(function() local x = ipairs() end))
+out[#out + 1] = cat(select('#', pairs(t, 1)), (pairs('abc')) == next)
+return table.concat(out, ' | ')
+"#;
+    assert_eq!(
+        ok(src),
+        "true true nil nil nil | true 4 | true true 4 | x1,p1,x1 | true true 0 nil 3 | nil 0 | \
+         c:25: bad argument #1 to 'pairs' (value expected) | \
+         c:26: bad argument #1 to 'ipairs' (value expected) | 4 true"
+    );
+}
