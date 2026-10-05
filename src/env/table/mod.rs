@@ -52,7 +52,7 @@ impl<'gc> Table<'gc> {
             shape,
             spill: match spilled.len() {
                 0 => NonNull::dangling(),
-                n => slots::alloc(mc, n, |i| spilled[i]),
+                n => slots::alloc(mc, n, spilled),
             },
             spill_cap: spilled.len() as u32,
             inline_len: (cap + asize) as u32,
@@ -792,7 +792,7 @@ impl<'gc> TableState<'gc> {
     fn grow_spill(&mut self, mc: &Mutation<'gc>) {
         let old = self.named().1;
         let cap = (old.len() * 2).max(4);
-        self.spill = slots::alloc(mc, cap, |i| old.get(i).copied().unwrap_or(Value::nil()));
+        self.spill = slots::alloc(mc, cap, old);
         self.spill_cap = cap as u32;
     }
 
@@ -873,12 +873,7 @@ impl<'gc> TableState<'gc> {
     /// `extra`, and rebuild `int_hash` from the live keys that don't fit.
     fn rehash_ints(&mut self, mc: &Mutation<'gc>, extra: i64) {
         let mut bins = [0u32; MAX_ABITS];
-        let mut n = 0;
-        for (k, v) in self.array().iter().enumerate() {
-            if !v.is_nil() {
-                n += count_int(k as i64, &mut bins);
-            }
-        }
+        let mut n = count_array(self.array(), &mut bins);
         let ints = self.hash().map(|h| &h.ints);
         for e in ints.into_iter().flat_map(|t| t.iter()) {
             n += count_int(e.key, &mut bins);
@@ -904,7 +899,7 @@ impl<'gc> TableState<'gc> {
         // The old cell is left for the sweep.
         self.array = match asize {
             0 => NonNull::dangling(),
-            _ => slots::alloc(mc, asize, |i| old.get(i).copied().unwrap_or(Value::nil())),
+            _ => slots::alloc(mc, asize, old),
         };
         self.asize = asize as u32;
         let array = self.array;
@@ -1114,6 +1109,24 @@ fn count_int(key: i64, bins: &mut [u32; MAX_ABITS]) -> u32 {
     1
 }
 
+/// LuaJIT's `countarray`: `count_int` for the key of every non-nil value in
+/// `array`, a bin at a time, so the loop needs no per-key bin.
+fn count_array(array: &[Value], bins: &mut [u32; MAX_ABITS]) -> u32 {
+    let array = &array[..array.len().min(MAX_ASIZE as usize)];
+    let (mut n, mut lo) = (0, 0);
+    for (b, bin) in bins.iter_mut().enumerate() {
+        let hi = ((2usize << b) + 1).min(array.len());
+        if lo >= hi {
+            break;
+        }
+        let c = array[lo..hi].iter().filter(|v| !v.is_nil()).count() as u32;
+        *bin += c;
+        n += c;
+        lo = hi;
+    }
+    n
+}
+
 /// LuaJIT's `bestasize`: `n` is the number of keys counted into `bins`.
 fn best_asize(bins: &[u32; MAX_ABITS], n: u32) -> usize {
     let (mut sum, mut size) = (0u32, 0);
@@ -1126,4 +1139,34 @@ fn best_asize(bins: &[u32; MAX_ABITS], n: u32) -> usize {
         b += 1;
     }
     size
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn count_array_bins_like_count_int() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        for len in (0..40).chain([63, 64, 65, 129, 1000, 4097]) {
+            for density in [0, 1, 2, 4] {
+                let array: Vec<Value> = (0..len)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        match (seed >> 33) % 4 < density {
+                            true => Value::boolean(true),
+                            false => Value::nil(),
+                        }
+                    })
+                    .collect();
+                let (mut by_key, mut by_bin) = ([0; MAX_ABITS], [0; MAX_ABITS]);
+                let n: u32 = (0..len)
+                    .filter(|&k| !array[k].is_nil())
+                    .map(|k| count_int(k as i64, &mut by_key))
+                    .sum();
+                assert_eq!(count_array(&array, &mut by_bin), n, "len {len}");
+                assert_eq!(by_bin, by_key, "len {len}");
+            }
+        }
+    }
 }
