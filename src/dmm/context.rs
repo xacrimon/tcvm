@@ -98,12 +98,12 @@ impl<'gc> Mutation<'gc> {
     }
 
     #[inline]
-    pub(crate) fn allocate_with_bytes<T: Collect<'gc> + TrailingBytes + 'gc>(
+    pub(crate) fn allocate_trailing<T: Collect<'gc> + TrailingBytes + 'gc>(
         &self,
         t: T,
-        bytes: &[u8],
+        init: impl FnOnce(NonNull<u8>),
     ) -> NonNull<GcBoxInner<T>> {
-        self.context.allocate_with_bytes(t, bytes)
+        self.context.allocate_trailing(t, init)
     }
 
     #[inline]
@@ -424,26 +424,20 @@ impl Context {
         ptr
     }
 
-    fn allocate_with_bytes<'gc, T: Collect<'gc> + TrailingBytes>(
+    /// `init` must initialize all `t.trailing_len()` bytes it is handed.
+    fn allocate_trailing<'gc, T: Collect<'gc> + TrailingBytes>(
         &self,
         t: T,
-        bytes: &[u8],
+        init: impl FnOnce(NonNull<u8>),
     ) -> NonNull<GcBoxInner<T>> {
-        debug_assert_eq!(t.trailing_len(), bytes.len());
-        let layout = trailing_layout(Layout::new::<GcBoxInner<T>>(), bytes.len());
+        let layout = trailing_layout(Layout::new::<GcBoxInner<T>>(), t.trailing_len());
         let ptr = unsafe {
             let raw = std::alloc::alloc(layout) as *mut GcBoxInner<T>;
             let Some(ptr) = NonNull::new(raw) else {
                 std::alloc::handle_alloc_error(layout)
             };
             ptr.write(GcBoxInner::new(GcBoxHeader::new_trailing::<T>(), t));
-            core::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                ptr.cast::<u8>()
-                    .add(GcBoxInner::<T>::TRAILING_OFFSET)
-                    .as_ptr(),
-                bytes.len(),
-            );
+            init(ptr.cast::<u8>().add(GcBoxInner::<T>::TRAILING_OFFSET));
             ptr
         };
         self.link(ptr, layout.size());

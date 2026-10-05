@@ -99,8 +99,48 @@ impl<'gc, T: Collect<'gc> + TrailingBytes + 'gc> Gc<'gc, T> {
     /// Allocate `t` with `bytes` copied directly after it, in the same allocation.
     #[inline]
     pub fn new_with_bytes(mc: &Mutation<'gc>, t: T, bytes: &[u8]) -> Gc<'gc, T> {
+        debug_assert_eq!(t.trailing_len(), bytes.len());
+        // SAFETY: copies all `trailing_len` bytes.
+        unsafe {
+            Self::new_with_trailing(mc, t, |dst| {
+                core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst.as_ptr(), bytes.len())
+            })
+        }
+    }
+
+    /// Allocate `t` with `t.trailing_len()` bytes directly after it, which `init` is handed to
+    /// fill.
+    ///
+    /// # Safety
+    /// `init` must initialize every trailing byte.
+    #[inline]
+    pub unsafe fn new_with_trailing(
+        mc: &Mutation<'gc>,
+        t: T,
+        init: impl FnOnce(NonNull<u8>),
+    ) -> Gc<'gc, T> {
         Gc {
-            ptr: mc.allocate_with_bytes(t, bytes),
+            ptr: mc.allocate_trailing(t, init),
+            _invariant: PhantomData,
+        }
+    }
+
+    /// The start of `this`'s trailing bytes, with the whole allocation's provenance. Writes
+    /// through it need the same barrier as any other write to `this`.
+    #[inline]
+    pub fn trailing_ptr(this: Gc<'gc, T>) -> NonNull<u8> {
+        // SAFETY: in bounds, see `trailing_bytes`.
+        unsafe { this.ptr.cast::<u8>().add(GcBoxInner::<T>::TRAILING_OFFSET) }
+    }
+
+    /// The `Gc` whose [`trailing_ptr`](Self::trailing_ptr) is `ptr`.
+    ///
+    /// # Safety
+    /// `ptr` must come from `trailing_ptr` of a `Gc<T>` that has not been collected.
+    #[inline]
+    pub unsafe fn from_trailing_ptr(ptr: NonNull<u8>) -> Gc<'gc, T> {
+        Gc {
+            ptr: unsafe { ptr.sub(GcBoxInner::<T>::TRAILING_OFFSET).cast() },
             _invariant: PhantomData,
         }
     }
@@ -113,8 +153,7 @@ impl<'gc, T: Collect<'gc> + TrailingBytes + 'gc> Gc<'gc, T> {
         // provenance. The lifetime is the same as `Gc::as_ref`'s.
         unsafe {
             let len = this.ptr.as_ref().value.trailing_len();
-            let start = this.ptr.cast::<u8>().add(GcBoxInner::<T>::TRAILING_OFFSET);
-            core::slice::from_raw_parts(start.as_ptr(), len)
+            core::slice::from_raw_parts(Self::trailing_ptr(this).as_ptr(), len)
         }
     }
 }
