@@ -7,6 +7,7 @@ use core::alloc::Allocator;
 use core::hash::BuildHasher;
 
 use super::swiss::RawTable;
+use crate::dmm::allocator_api::GcAlloc;
 use crate::dmm::{Collect, Gc, Trace};
 use crate::env::string::LuaString;
 use crate::env::value::{Value, value_hash};
@@ -79,15 +80,22 @@ pub(super) fn lua_string_hash(key: LuaString<'_>) -> u64 {
 
 pub(super) type Part<'gc, K, A> = RawTable<Entry<'gc, K>, A>;
 
-unsafe impl<'gc, K: Copy + Collect<'gc>, A: Allocator + Collect<'gc>> Collect<'gc>
-    for Part<'gc, K, A>
-{
+unsafe impl<'gc, K: Copy + Collect<'gc>> Collect<'gc> for Part<'gc, K, GcAlloc<'gc>> {
     fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
+        mark(cc, self);
         for e in self.iter() {
             cc.trace(&e.key);
             cc.trace(&e.value);
         }
-        cc.trace(self.allocator());
+    }
+}
+
+/// Mark `table`'s memory, which its holder must do whenever it is traced.
+#[inline]
+pub(super) fn mark<'gc, K: Copy, T: Trace<'gc>>(cc: &mut T, table: &Part<'gc, K, GcAlloc<'gc>>) {
+    if let Some(ptr) = table.allocation() {
+        // SAFETY: the table's allocation, live while the table is.
+        unsafe { GcAlloc::mark(cc, ptr) };
     }
 }
 

@@ -1,7 +1,13 @@
 use core::{alloc::Layout, marker::PhantomData, ptr::NonNull};
 use std::alloc::{AllocError, Allocator, Global};
 
-use crate::dmm::{collect::Collect, context::Mutation, metrics::Metrics, types::Invariant};
+use crate::dmm::{
+    Gc,
+    collect::{Collect, Trace},
+    context::Mutation,
+    metrics::Metrics,
+    types::{Invariant, TrailingBytes},
+};
 
 /// An allocator that reports its allocations to the arena's [`Metrics`] as external memory.
 ///
@@ -130,5 +136,79 @@ unsafe impl<'gc, A: 'static> Collect<'gc> for MetricsAlloc<'gc, A> {
 }
 
 unsafe impl<'gc> Collect<'gc> for Global {
+    const NEEDS_TRACE: bool = false;
+}
+
+/// An allocator whose memory is GC cells nothing traces: the holder of an allocation must mark
+/// its cell with [`GcAlloc::mark`] whenever it is traced, and trace what it stores there itself,
+/// as for a table's own fields. Deallocation does nothing; the sweep frees an unmarked cell. So a
+/// structure using it needs no drop glue, and its memory is only valid while its holder is traced.
+#[derive(Clone, Copy)]
+pub struct GcAlloc<'gc> {
+    mc: NonNull<Mutation<'gc>>,
+}
+
+/// A [`GcAlloc`] cell's header; its `len` bytes follow it, aligned to [`GcAlloc::MAX_ALIGN`].
+#[repr(align(16))]
+struct RawCell {
+    len: usize,
+}
+
+// SAFETY: only `GcAlloc::allocate` makes a `RawCell`, through `Gc::new_with_trailing` with `len`
+// bytes, and it has no drop glue.
+unsafe impl TrailingBytes for RawCell {
+    #[inline(always)]
+    fn trailing_len(&self) -> usize {
+        self.len
+    }
+}
+
+// SAFETY: holds no pointers it could trace; see `GcAlloc`.
+unsafe impl<'gc> Collect<'gc> for RawCell {
+    const NEEDS_TRACE: bool = false;
+}
+
+impl<'gc> GcAlloc<'gc> {
+    /// The largest alignment an allocation may ask for.
+    pub const MAX_ALIGN: usize = align_of::<RawCell>();
+
+    #[inline]
+    pub fn new(mc: &Mutation<'gc>) -> Self {
+        Self {
+            mc: NonNull::from(mc),
+        }
+    }
+
+    /// Mark the cell of an allocation this allocator returned.
+    ///
+    /// # Safety
+    /// `ptr` must be the start of a `GcAlloc` allocation that has not been collected.
+    #[inline]
+    pub unsafe fn mark<T: Trace<'gc>>(cc: &mut T, ptr: NonNull<u8>) {
+        let cell: Gc<'gc, RawCell> = unsafe { Gc::from_trailing_ptr(ptr) };
+        cc.trace(&cell);
+    }
+}
+
+unsafe impl<'gc> Allocator for GcAlloc<'gc> {
+    #[inline]
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        assert!(layout.align() <= Self::MAX_ALIGN);
+        // SAFETY: the `'gc` brand keeps the allocator inside the arena whose context `mc` points
+        // to, which the arena boxes and frees only after every object, as for `MetricsAlloc`.
+        let mc = unsafe { self.mc.as_ref() };
+        // SAFETY: the trailing bytes are the allocation, which the caller initializes.
+        let cell = unsafe { Gc::new_with_trailing(mc, RawCell { len: layout.size() }, |_| {}) };
+        Ok(NonNull::slice_from_raw_parts(
+            Gc::trailing_ptr(cell),
+            layout.size(),
+        ))
+    }
+
+    #[inline]
+    unsafe fn deallocate(&self, _ptr: NonNull<u8>, _layout: Layout) {}
+}
+
+unsafe impl<'gc> Collect<'gc> for GcAlloc<'gc> {
     const NEEDS_TRACE: bool = false;
 }

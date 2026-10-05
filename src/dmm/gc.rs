@@ -100,7 +100,7 @@ impl<'gc, T: Collect<'gc> + TrailingBytes + 'gc> Gc<'gc, T> {
     #[inline]
     pub fn new_with_bytes(mc: &Mutation<'gc>, t: T, bytes: &[u8]) -> Gc<'gc, T> {
         debug_assert_eq!(t.trailing_len(), bytes.len());
-        // SAFETY: copies all `trailing_len` bytes.
+        // SAFETY: initializes all `trailing_len` bytes.
         unsafe {
             Self::new_with_trailing(mc, t, |dst| {
                 core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst.as_ptr(), bytes.len())
@@ -112,7 +112,8 @@ impl<'gc, T: Collect<'gc> + TrailingBytes + 'gc> Gc<'gc, T> {
     /// fill.
     ///
     /// # Safety
-    /// `init` must initialize every trailing byte.
+    /// [`trailing_bytes`](Self::trailing_bytes) must not be called on the result unless `init`
+    /// initialized every trailing byte.
     #[inline]
     pub unsafe fn new_with_trailing(
         mc: &Mutation<'gc>,

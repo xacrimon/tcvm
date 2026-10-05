@@ -242,6 +242,14 @@ impl<T: Copy, A: Allocator> RawTable<T, A> {
         &self.alloc
     }
 
+    /// The start of the table's allocation, if it has one.
+    #[inline]
+    pub(crate) fn allocation(&self) -> Option<NonNull<u8>> {
+        // SAFETY: the table is allocated, with its own layout.
+        (!self.table.is_empty_singleton())
+            .then(|| unsafe { self.table.allocation_info(Self::TABLE_LAYOUT).0 })
+    }
+
     /// Number of live entries.
     #[inline]
     pub(crate) fn len(&self) -> usize {
@@ -431,15 +439,6 @@ impl<T: Copy, A: Allocator> RawTable<T, A> {
                     Self::TABLE_LAYOUT,
                 );
             }
-        }
-    }
-}
-
-impl<T: Copy, A: Allocator> Drop for RawTable<T, A> {
-    fn drop(&mut self) {
-        if !self.table.is_empty_singleton() {
-            // SAFETY: the layout and allocator are the ones this table was allocated with.
-            unsafe { self.table.free_buckets(&self.alloc, Self::TABLE_LAYOUT) };
         }
     }
 }
