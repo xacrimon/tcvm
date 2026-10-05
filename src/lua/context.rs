@@ -7,8 +7,8 @@ use std::path::Path;
 use cstree::build::NodeCache;
 
 use crate::compiler::compile_chunk;
-use crate::dmm::{DynamicRootSet, Gc, Mutation, RefLock};
-use crate::env::function::{Function, UpvalueState};
+use crate::dmm::{DynamicRootSet, Mutation};
+use crate::env::function::{Function, UpvalueCell};
 use crate::env::shape::{MetamethodBits, Shape, inline_bucket};
 use crate::env::string::Interner;
 use crate::env::{LuaString, Symbols, Table, Value};
@@ -276,7 +276,7 @@ impl<'gc> Context<'gc> {
             })?;
 
         // Main chunk's upvalue 0 is _ENV.
-        let env_uv = Gc::new(self.mutation, RefLock::new(UpvalueState::Closed(env)));
+        let env_uv = UpvalueCell::new_closed(self.mutation, env);
         let mut upvalues = Vec::with_capacity_in(
             1,
             crate::dmm::allocator_api::MetricsAlloc::new(self.mutation),

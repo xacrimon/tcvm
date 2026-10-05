@@ -1,7 +1,7 @@
-use crate::dmm::{Gc, Mutation, RefLock};
+use crate::dmm::{Gc, Mutation};
 use crate::env::function::{
     Function, FunctionKind, InlineCache, LuaFn, NativeClosure, NativeKind, Stack, Upvalue,
-    UpvalueState,
+    UpvalueCell,
 };
 use crate::env::shape::{MAX_PROPERTIES_FAST, MetamethodBits, Shape, mirrored};
 use crate::env::string::LuaString;
@@ -1272,7 +1272,7 @@ extern "rust-preserve-none" fn op_getupval<'gc>(
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (dst, idx) = instruction.ab();
     let uv = upvalue!(idx);
-    *reg!(ref mut dst) = read_upvalue(thread, uv);
+    *reg!(ref mut dst) = read_upvalue(uv);
     dispatch!();
 }
 
@@ -1318,7 +1318,7 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (dst, idx, ic_idx, _key) = instruction.abde();
     let uv = upvalue!(idx);
-    let t_val = read_upvalue(thread, uv);
+    let t_val = read_upvalue(uv);
 
     let Some(t) = t_val.get_table() else {
         tail!(get_slow);
@@ -1351,7 +1351,7 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (src, idx, ic_idx, _key) = instruction.abde();
     let uv = upvalue!(idx);
-    let t_val = read_upvalue(thread, uv);
+    let t_val = read_upvalue(uv);
 
     let Some(t) = t_val.get_table() else {
         tail!(set_slow);
@@ -4230,7 +4230,6 @@ extern "rust-preserve-none" fn op_closure<'gc>(
     let (parent_closure, base) = unsafe { ((*frame).closure, (*frame).base()) };
     let proto = parent_closure.proto.prototypes[proto_idx as usize];
 
-    let thread_handle = thread.thread_handle.expect("thread must have a handle");
     let mut upvalues_vec = Vec::with_capacity_in(
         proto.upvalue_desc.len(),
         crate::dmm::allocator_api::MetricsAlloc::new(ctx.mutation()),
@@ -4238,20 +4237,14 @@ extern "rust-preserve-none" fn op_closure<'gc>(
     for desc in proto.upvalue_desc.iter() {
         let uv = match desc {
             UpValueDescriptor::ParentLocal(idx) => {
-                let stack_idx = base + *idx as usize;
+                let slot = unsafe { thread.stack.as_mut_ptr().add(base + *idx as usize) };
                 // Sorted by slot, so this frame's are at the end.
                 let open = &thread.open_upvalues;
-                let below = open.iter().rposition(|&uv| open_index(uv) <= stack_idx);
+                let below = open.iter().rposition(|uv| uv.slot() <= slot);
                 match below {
-                    Some(i) if open_index(open[i]) == stack_idx => open[i],
+                    Some(i) if open[i].slot() == slot => open[i],
                     _ => {
-                        let uv: Upvalue<'gc> = Gc::new(
-                            ctx.mutation(),
-                            RefLock::new(UpvalueState::Open {
-                                thread: thread_handle,
-                                index: stack_idx,
-                            }),
-                        );
+                        let uv = UpvalueCell::new_open(ctx.mutation(), thread.handle(), slot);
                         let at = below.map_or(0, |i| i + 1);
                         thread.open_upvalues.insert(at, uv);
                         unsafe { (*frame).flags |= frame_flags::OPEN_UPVALUES };
@@ -4545,43 +4538,18 @@ fn has_tbc_from(thread: &ThreadState<'_>, level: usize) -> bool {
 }
 
 #[inline(always)]
-fn read_upvalue<'gc>(thread: &ThreadState<'gc>, uv: Upvalue<'gc>) -> Value<'gc> {
-    match &*uv.borrow() {
-        UpvalueState::Closed(v) => *v,
-        UpvalueState::Open { thread: t, index } => unsafe {
-            let running = thread.thread_handle.unwrap_unchecked().inner();
-
-            if Gc::ptr_eq(t.inner(), running) {
-                *thread.stack.get_unchecked(*index)
-            } else {
-                *t.borrow().stack.get_unchecked(*index)
-            }
-        },
-    }
+fn read_upvalue<'gc>(uv: Upvalue<'gc>) -> Value<'gc> {
+    uv.get()
 }
 
 #[inline(always)]
 fn write_upvalue<'gc>(
     mc: &Mutation<'gc>,
-    thread: &mut ThreadState<'gc>,
+    thread: &ThreadState<'gc>,
     uv: Upvalue<'gc>,
     val: Value<'gc>,
 ) {
-    unsafe {
-        let running = thread.thread_handle.unwrap_unchecked().inner();
-
-        let mut uv_ref = uv.borrow_mut(mc);
-        match &mut *uv_ref {
-            UpvalueState::Closed(v) => *v = val,
-            UpvalueState::Open { thread: t, index } => {
-                if Gc::ptr_eq(t.inner(), running) {
-                    *thread.stack.get_unchecked_mut(*index) = val;
-                } else {
-                    *t.borrow_mut(mc).stack.get_unchecked_mut(*index) = val;
-                }
-            }
-        }
-    }
+    UpvalueCell::set(uv, mc, thread.handle(), val);
 }
 
 /// Persist the top Lua frame's resume point before leaving the dispatch
@@ -4676,27 +4644,16 @@ pub(crate) fn native_overflow(ctx: Context<'_>) -> crate::env::Error<'_> {
     crate::env::Error::from_str(ctx, "stack overflow")
 }
 
-/// The stack slot of an upvalue in `ThreadState::open_upvalues`, which are
-/// all open, sorted by slot (as Lua's `openupval` list is).
-#[inline(always)]
-fn open_index(uv: Upvalue<'_>) -> usize {
-    match &*uv.borrow() {
-        UpvalueState::Open { index, .. } => *index,
-        UpvalueState::Closed(_) => unreachable!("closed upvalue in the open list"),
-    }
-}
-
 /// Whether any open upvalue points at stack index `base` or above.
 #[inline(always)]
 fn frame_has_open_upvalues<'gc>(thread: &ThreadState<'gc>, base: usize) -> bool {
     thread
         .open_upvalues
         .last()
-        .is_some_and(|&uv| open_index(uv) >= base)
+        .is_some_and(|uv| uv.slot().addr() >= thread.stack.as_ptr().wrapping_add(base).addr())
 }
 
 /// Close all open upvalues pointing at stack indices >= `start_idx`.
-/// Each open upvalue is converted to Closed by capturing the current stack value.
 /// Inlined so the usual nothing-to-close case costs a load or two, not a call.
 #[inline(always)]
 pub(crate) fn close_upvalues<'gc>(
@@ -4711,13 +4668,13 @@ pub(crate) fn close_upvalues<'gc>(
 
 #[inline(never)]
 fn close_upvalues_slow<'gc>(mc: &Mutation<'gc>, thread: &mut ThreadState<'gc>, start_idx: usize) {
+    let level = thread.stack.as_ptr().wrapping_add(start_idx).addr();
     // Sorted by slot, so the ones to close are the tail.
     while let Some(&uv) = thread.open_upvalues.last() {
-        let index = open_index(uv);
-        if index < start_idx {
+        if uv.slot().addr() < level {
             break;
         }
-        *uv.borrow_mut(mc) = UpvalueState::Closed(thread.stack[index]);
+        UpvalueCell::close(uv, mc);
         thread.open_upvalues.pop();
     }
 }
@@ -6693,7 +6650,7 @@ extern "rust-preserve-none" fn get_slow<'gc>(
     let op = instruction.op().unquickened();
     let dst = instruction.a();
     let recv = match op {
-        Op::GETTABUP => read_upvalue(thread, upvalue!(instruction.b())),
+        Op::GETTABUP => read_upvalue(upvalue!(instruction.b())),
         _ => reg!(instruction.b()),
     };
     if op == Op::SELF {
@@ -6744,7 +6701,7 @@ extern "rust-preserve-none" fn set_slow<'gc>(
     let op = instruction.op().unquickened();
     let v = reg!(instruction.a());
     let recv = match op {
-        Op::SETTABUP => read_upvalue(thread, upvalue!(instruction.b())),
+        Op::SETTABUP => read_upvalue(upvalue!(instruction.b())),
         _ => reg!(instruction.b()),
     };
     if op == Op::SETTABLE {
@@ -6972,7 +6929,7 @@ macro_rules! get_quick {
         reg!($b)
     };
     (@recv upval, $b:ident, $thread:ident) => {
-        read_upvalue($thread, upvalue!($b))
+        read_upvalue(upvalue!($b))
     };
     // Own and Absent entries only change through `fill_ic`, which
     // requickens; the collector may empty a ProtoLoad one, so that kind is
