@@ -1098,9 +1098,6 @@ impl<'gc> TableState<'gc> {
                     Some((i, Value::small(i as i32), v))
                 }),
                 1 if aux.is_some_and(|h| !h.ints.is_empty()) => return Step::Slow,
-                2 if self.shape.is_dict() => aux
-                    .and_then(|h| hash_part::next_live(&h.strs, from))
-                    .map(|(i, e)| (i, Value::string(e.key), e.value)),
                 2 => {
                     let keys = self.shape.keys();
                     let (inline, spilled) = self.named();
@@ -1113,8 +1110,11 @@ impl<'gc> TableState<'gc> {
                         (!v.is_nil()).then(|| (i, Value::string(k), v))
                     })
                 }
-                3 if aux.is_some_and(|h| !h.misc.is_empty()) => return Step::Slow,
-                1 | 3 => None,
+                3 => aux
+                    .and_then(|h| hash_part::next_live(&h.strs, from))
+                    .map(|(i, e)| (i, Value::string(e.key), e.value)),
+                4 if aux.is_some_and(|h| !h.misc.is_empty()) => return Step::Slow,
+                1 | 4 => None,
                 _ => return Step::End,
             };
             if let Some((i, k, v)) = found {
@@ -1129,7 +1129,7 @@ impl<'gc> TableState<'gc> {
 
     /// [`Self::next`] for a traversal that keeps its own place: the first
     /// live entry at or after `pos`, and the position after it, which is
-    /// `None` when it doesn't fit (past 2^29 buckets in a part; resume with
+    /// `None` when it doesn't fit (past 2^28 buckets in a part; resume with
     /// `next` from the key instead). Start from 0. A table that grows
     /// mid-traversal (which Lua leaves undefined) can yield an entry twice or
     /// skip one, but is never read out of bounds.
@@ -1150,9 +1150,6 @@ impl<'gc> TableState<'gc> {
                 1 => aux
                     .and_then(|h| hash_part::next_live(&h.ints, from))
                     .map(|(i, e)| (i, Value::integer(mc, e.key), e.value)),
-                2 if self.shape.is_dict() => aux
-                    .and_then(|h| hash_part::next_live(&h.strs, from))
-                    .map(|(i, e)| (i, Value::string(e.key), e.value)),
                 2 => {
                     let keys = self.shape.keys();
                     let (inline, spilled) = self.named();
@@ -1165,6 +1162,9 @@ impl<'gc> TableState<'gc> {
                     })
                 }
                 3 => aux
+                    .and_then(|h| hash_part::next_live(&h.strs, from))
+                    .map(|(i, e)| (i, Value::string(e.key), e.value)),
+                4 => aux
                     .and_then(|h| hash_part::next_live(&h.misc, from))
                     .map(|(i, e)| (i, e.key, e.value)),
                 _ => return None,
@@ -1189,11 +1189,12 @@ pub enum Step<'gc> {
     Slow,
 }
 
-/// A [`TableState::next_at`] position: the part (array, integer keys, string
-/// keys, other keys) above this bit, the index within it below, so a
-/// position in the array part is the index itself and every position is a
-/// small integer.
-pub const POS_PART_SHIFT: u32 = 29;
+/// A [`TableState::next_at`] position: the part above this bit, the index
+/// within it below, so a position in the array part is the index itself and
+/// every position is a small integer. The parts, in `next`'s order: array,
+/// integer keys, named slots, dict-mode string keys, other keys. Only one of
+/// the string parts is ever non-empty, so a step needn't ask the shape which.
+pub const POS_PART_SHIFT: u32 = 28;
 const POS_INDEX: u32 = (1 << POS_PART_SHIFT) - 1;
 
 /// Which storage part a `next` cursor points into, in traversal order.
