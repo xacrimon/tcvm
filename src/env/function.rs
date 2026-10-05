@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use crate::Context;
 use crate::dmm::allocator_api::MetricsAlloc;
 use crate::dmm::{Collect, Gc, GcWeak, Lock, Mutation, RefLock, Trace};
@@ -5,7 +7,7 @@ use crate::env::error::Error;
 use crate::env::shape::Shape;
 use crate::env::string::LuaString;
 use crate::env::table::{SlotLoc, TableState};
-use crate::env::thread::ThreadState;
+use crate::env::thread::{Thread, ThreadState};
 use crate::env::value::Value;
 use crate::instruction::UpValueDescriptor;
 use crate::vm::interp::{Handler, op_call_action, op_call_async, op_call_native};
@@ -196,18 +198,107 @@ unsafe impl<'gc> Collect<'gc> for IcTable<'gc> {
     }
 }
 
-/// An upvalue — open (references a stack slot) or closed (owns the value).
-#[derive(Collect)]
-#[collect(internal, no_drop)]
-pub enum UpvalueState<'gc> {
-    Open {
-        thread: crate::env::thread::Thread<'gc>,
-        index: usize,
-    },
-    Closed(Value<'gc>),
+/// A captured local: open while its frame lives, `v` pointing at its slot in
+/// `thread`'s stack (rebased when the stack moves), then closed, `v` pointing
+/// at `closed`. Reads are one load through `v`, whichever state.
+pub struct UpvalueCell<'gc> {
+    v: Cell<*mut Value<'gc>>,
+    closed: Cell<Value<'gc>>,
+    /// The thread whose stack `v` points into, while open.
+    thread: Cell<Option<Thread<'gc>>>,
 }
 
-pub type Upvalue<'gc> = Gc<'gc, RefLock<UpvalueState<'gc>>>;
+pub type Upvalue<'gc> = Gc<'gc, UpvalueCell<'gc>>;
+
+// SAFETY: `closed` and `thread` are the only Gc pointers, and every write that
+// may make either hold a new one goes through a barrier on the cell.
+unsafe impl<'gc> Collect<'gc> for UpvalueCell<'gc> {
+    fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
+        cc.trace(&self.closed.get());
+        cc.trace(&self.thread.get());
+    }
+}
+
+impl<'gc> UpvalueCell<'gc> {
+    /// An open upvalue for `slot` of `thread`'s stack.
+    pub(crate) fn new_open(
+        mc: &Mutation<'gc>,
+        thread: Thread<'gc>,
+        slot: *mut Value<'gc>,
+    ) -> Upvalue<'gc> {
+        Gc::new(
+            mc,
+            UpvalueCell {
+                v: Cell::new(slot),
+                closed: Cell::new(Value::nil()),
+                thread: Cell::new(Some(thread)),
+            },
+        )
+    }
+
+    pub(crate) fn new_closed(mc: &Mutation<'gc>, value: Value<'gc>) -> Upvalue<'gc> {
+        let uv = Gc::new(
+            mc,
+            UpvalueCell {
+                v: Cell::new(std::ptr::null_mut()),
+                closed: Cell::new(value),
+                thread: Cell::new(None),
+            },
+        );
+        uv.v.set(uv.closed.as_ptr());
+        uv
+    }
+
+    #[inline(always)]
+    pub(crate) fn get(&self) -> Value<'gc> {
+        // SAFETY: `v` is a live slot of `thread`'s stack while open (closed
+        // before the frame goes, rebased when the stack moves), else `closed`.
+        unsafe { *self.v.get() }
+    }
+
+    /// Store `value`, `running` being the thread the interpreter runs on.
+    #[inline(always)]
+    pub(crate) fn set(
+        this: Upvalue<'gc>,
+        mc: &Mutation<'gc>,
+        running: Thread<'gc>,
+        value: Value<'gc>,
+    ) {
+        match this.thread.get() {
+            None => mc.backward_barrier(Gc::erase(this), None),
+            // The running thread's state is borrowed for dispatch, which
+            // emitted its barrier.
+            Some(t) if !t.ptr_eq(running) => mc.backward_barrier(Gc::erase(t.inner()), None),
+            Some(_) => {}
+        }
+        // SAFETY: as in `get`.
+        unsafe { *this.v.get() = value };
+    }
+
+    /// The stack slot of an open upvalue.
+    #[inline(always)]
+    pub(crate) fn slot(&self) -> *mut Value<'gc> {
+        debug_assert!(self.thread.get().is_some());
+        self.v.get()
+    }
+
+    /// Point an open upvalue into its stack's new buffer, which moved from
+    /// address `old`.
+    #[inline]
+    pub(crate) fn rebase(&self, old: usize, new: *mut Value<'gc>) {
+        let index = (self.v.get().addr() - old) / size_of::<Value>();
+        // SAFETY: the slot moved with the rest of the stack.
+        self.v.set(unsafe { new.add(index) });
+    }
+
+    #[inline]
+    pub(crate) fn close(this: Upvalue<'gc>, mc: &Mutation<'gc>) {
+        mc.backward_barrier(Gc::erase(this), None);
+        this.closed.set(this.get());
+        this.v.set(this.closed.as_ptr());
+        this.thread.set(None);
+    }
+}
 
 /// A Lua closure (bytecode + upvalues).
 pub struct LuaClosure<'gc> {
