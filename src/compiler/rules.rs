@@ -465,6 +465,10 @@ struct Ctx<'gc, 'a> {
     /// Lua 5.5 global-declaration state, currently in scope. Owned per
     /// function; nested functions receive a clone (see `compile_nested`).
     globals: GlobalEnv,
+    /// Field names a declaration's later statements store into the table
+    /// constructor it initializes, which sizes the table's inline slots;
+    /// taken by that constructor (see [`stored_fields`]).
+    table_hint: Option<(SyntaxNode, Vec<Vec<u8>>)>,
     /// `globals` snapshot saved on each `push_scope`, restored on the
     /// matching `pop_scope` so a block-local `global` decl is scoped to
     /// its block.
@@ -1358,17 +1362,23 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     /// The template for a constructor with `entries`, before their values
     /// compile: the shape of its constant field names in order, up to the
     /// shape-mode cap, with every slot nil, and its count of positional items.
+    /// Its inline slots have room for those names and the `stored` ones.
     fn template_draft(
         &mut self,
         entries: &[TableEntry],
+        stored: &[Vec<u8>],
     ) -> Result<TemplateDraft<'gc>, CompileError> {
         use crate::env::shape::{MAX_PROPERTIES_FAST, transition_add_prop};
-        // Room inline for every field; a repeated name only overcounts.
-        let fields = entries
-            .iter()
-            .filter(|e| matches!(e, TableEntry::Map(_)))
-            .count();
-        let mut shape = self.ctx.root_shape(fields);
+        let mut names = Vec::new();
+        for entry in entries {
+            if let TableEntry::Map(map) = entry {
+                names.push(self.field_key(map)?);
+            }
+        }
+        names.extend(stored.iter().map(|k| LuaString::new(self.ctx, k)));
+        names.sort_unstable_by_key(|k| Gc::as_ptr(k.inner()));
+        names.dedup_by_key(|k| Gc::as_ptr(k.inner()));
+        let mut shape = self.ctx.root_shape(names.len());
         let mut repeated = Vec::new();
         let mut keyed = false;
         let mut items = 0u32;
@@ -1754,6 +1764,7 @@ fn compile_function_to_chunk<'gc, 'a>(
         capture: parent_capture,
         upvalues: initial_upvalues,
         globals,
+        table_hint: None,
         scope_globals: Vec::new(),
     };
 
@@ -2024,6 +2035,13 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
 
     let num_targets = targets.len();
     let num_values = values.len();
+    if let ([target], [value]) = (&targets[..], &values[..])
+        && let Some(table) = initializer_table(ctx, value)
+        && let Some(name) = target.name().and_then(|n| n.name(ctx.interner))
+    {
+        let fields = stored_fields(ctx, name, item.following());
+        ctx.table_hint = Some((table, fields));
+    }
 
     // Register targets land contiguously from `base`. Don't pre-reserve:
     // compile each value into the next free slot so its natural placement
@@ -2447,6 +2465,85 @@ enum Lvalue {
         key_idx: u16,
         ic_idx: u16,
     },
+}
+
+/// The constructor `value` makes a table from, for `{...}` and
+/// `setmetatable({...}, mt)`, which returns its first argument unless the
+/// name is rebound; a size hint survives that.
+fn initializer_table(ctx: &Ctx, value: &Expr) -> Option<SyntaxNode> {
+    match value {
+        Expr::Table(t) => Some(t.syntax().clone()),
+        Expr::FuncCall(call) => {
+            let Some(Expr::Ident(f)) = call.target() else {
+                return None;
+            };
+            if f.name(ctx.interner) != Some("setmetatable") {
+                return None;
+            }
+            match call.args()?.next()? {
+                Expr::Table(t) => Some(t.syntax().clone()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The distinct constant field names `stmts` store into the local `name`,
+/// through `name.k = v` and `function name.k` / `name:k`, up to a statement
+/// that declares another `name`: how many slots the table it starts as
+/// will hold, as JSC's StaticPropertyAnalyzer counts them.
+fn stored_fields(ctx: &Ctx, name: &str, stmts: impl Iterator<Item = Stmt>) -> Vec<Vec<u8>> {
+    let field = |e: Expr| -> Option<Vec<u8>> {
+        let Expr::BinaryOp(b) = e else { return None };
+        if !matches!(
+            b.op(),
+            Some(BinaryOperator::Property | BinaryOperator::Method)
+        ) {
+            return None;
+        }
+        let Some(Expr::Ident(t)) = b.lhs() else {
+            return None;
+        };
+        if t.name(ctx.interner) != Some(name) {
+            return None;
+        }
+        property_field_name(ctx, &b.rhs()?).ok().flatten()
+    };
+    let mut fields: Vec<Vec<u8>> = Vec::new();
+    // Bounded, as a long block would otherwise be rescanned per declaration.
+    for stmt in stmts.take(1024) {
+        let stored: Vec<_> = match stmt {
+            Stmt::Assign(a) => a
+                .targets()
+                .into_iter()
+                .flatten()
+                .filter_map(field)
+                .collect(),
+            Stmt::Func(f) => f.target().and_then(field).into_iter().collect(),
+            Stmt::Decl(d) => {
+                let declares = match d.function() {
+                    Some(f) => f.name(ctx.interner).is_some_and(|n| n == name),
+                    None => d
+                        .targets()
+                        .into_iter()
+                        .flatten()
+                        .any(|t| t.name().and_then(|n| n.name(ctx.interner)) == Some(name)),
+                };
+                if declares {
+                    break;
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        for k in stored {
+            if !fields.contains(&k) && fields.len() < 64 {
+                fields.push(k);
+            }
+        }
+    }
+    fields
 }
 
 /// Lua 5.5 §3.3.3: "first evaluate all its expressions and only then
@@ -3101,7 +3198,12 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
     // detected: a trailing call/`...` spreads its results rather than
     // adjusting to one.
     let entries: Vec<TableEntry> = item.entries().collect();
-    let mut draft = ctx.template_draft(&entries)?;
+    let stored = ctx
+        .table_hint
+        .take_if(|(node, _)| node == item.syntax())
+        .map(|(_, fields)| fields)
+        .unwrap_or_default();
+    let mut draft = ctx.template_draft(&entries, &stored)?;
     let dst = ctx.alloc_register()?;
     // The template is patched in once the entries have compiled.
     let newtable_pc = ctx.chunk.tape.len();
