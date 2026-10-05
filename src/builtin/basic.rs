@@ -10,6 +10,7 @@ use crate::env::{
 };
 use crate::vm::async_sequence::{SequenceReturn, async_sequence};
 use crate::vm::debug::where_prefix;
+use crate::vm::interp;
 use crate::vm::sequence::{
     BoxSequence, CallbackAction, Catch, Execution, Sequence, SequencePoll, seq_trace_pointers,
 };
@@ -50,12 +51,22 @@ pub fn load<'gc>(ctx: Context<'gc>) {
     set("next", next);
     set(
         "pairs",
-        Function::new_native(ctx.mutation(), lua_pairs, &[Value::function(next)]),
+        Function::new_native_with_entry(
+            ctx.mutation(),
+            lua_pairs,
+            &[Value::function(next)],
+            interp::ff_pairs,
+        ),
     );
     let ipairs_iter = ctx.ipairs_iter();
     set(
         "ipairs",
-        Function::new_native(ctx.mutation(), lua_ipairs, &[Value::function(ipairs_iter)]),
+        Function::new_native_with_entry(
+            ctx.mutation(),
+            lua_ipairs,
+            &[Value::function(ipairs_iter)],
+            interp::ff_ipairs,
+        ),
     );
 
     let globals = ctx.globals();
@@ -398,7 +409,7 @@ fn lua_pairs<'gc>(
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     util::check_any(ctx, &stack, "pairs", 1)?;
     let t = stack.get(0);
-    let mm = ctx.metamethod_of(t, ctx.symbols().pairs);
+    let mm = ctx.metamethod_of(t, ctx.symbols().mm_pairs);
     if mm.is_nil() {
         stack.replace(&[closure.upvalues[0], t, Value::nil(), Value::nil()]);
         return Ok(CallbackAction::Return);

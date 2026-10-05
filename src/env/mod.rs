@@ -47,6 +47,7 @@ macro_rules! for_each_metamethod {
             (LEN,      20, b"__len",      mm_len);
             (CALL,     21, b"__call",     mm_call);
             (TOSTRING, 22, b"__tostring", mm_tostring);
+            (PAIRS,    23, b"__pairs",    mm_pairs);
         }
     };
 }
