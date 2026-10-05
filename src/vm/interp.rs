@@ -712,7 +712,7 @@ fn ic_set<'gc>(ctx: Context<'gc>, cache: InlineCache<'gc>, t: Table<'gc>, v: Val
             return true;
         }
         // As above, plus a full `properties` would have to grow.
-        if state.mt_cache().is_some() || state.properties.len() == state.properties.capacity() {
+        if state.mt_cache().is_some() || state.properties_full() {
             return false;
         }
         drop(state);
@@ -720,9 +720,8 @@ fn ic_set<'gc>(ctx: Context<'gc>, cache: InlineCache<'gc>, t: Table<'gc>, v: Val
             return false;
         };
         let mut state = w.unlock().borrow_mut();
-        debug_assert_eq!(to.slot_count() as usize, state.properties.len() + 1);
-        state.shape = to;
-        state.properties.push(v);
+        // SAFETY: the live shape is `from`, and there is room.
+        unsafe { state.push_property(to, v) };
         return true;
     }
     false
@@ -856,7 +855,8 @@ fn set_own_fill_ic<'gc>(
     let mut state = t.inner().borrow_mut(ctx.mutation());
     let entry = match slot {
         Some(slot) => {
-            state.properties[slot as usize] = v;
+            // SAFETY: `slot` was found in the live shape.
+            unsafe { state.set_property_at(slot, v) };
             state.maybe_update_mt_bit(k, v);
             InlineCache::Own { shape, slot }
         }
