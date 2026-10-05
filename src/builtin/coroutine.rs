@@ -1,4 +1,3 @@
-
 use crate::Context;
 use crate::builtin::util;
 use crate::env::thread::{ExecKind, ThreadStatus};
@@ -6,9 +5,7 @@ use crate::env::{
     Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Thread, Value,
 };
 use crate::vm::close;
-use crate::vm::sequence::{
-    CallbackAction, Execution,
-};
+use crate::vm::sequence::{CallbackAction, Execution};
 
 pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[

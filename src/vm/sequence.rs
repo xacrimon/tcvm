@@ -86,8 +86,7 @@ pub enum CallbackAction<'gc> {
     Suspend(Box<Suspend<'gc>>),
 }
 
-const _: () =
-    assert!(std::mem::size_of::<Result<CallbackAction<'static>, Error<'static>>>() == 16);
+const _: () = assert!(std::mem::size_of::<Result<CallbackAction<'static>, Error<'static>>>() == 16);
 
 /// Whether a [`CallbackAction::CallThen`]'s continuation receives the
 /// errors its call raises, instead of them unwinding past it.

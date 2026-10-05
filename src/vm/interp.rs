@@ -95,6 +95,21 @@ static HANDLERS: [Handler; Op::COUNT] = Op::table([
     (Op::LEI, op_lei),
     (Op::GTI, op_gti),
     (Op::GEI, op_gei),
+    (Op::GETFIELD_OWN, getfield_own),
+    (Op::GETFIELD_ABSENT, getfield_absent),
+    (Op::GETFIELD_PROTO, getfield_proto),
+    (Op::GETTABUP_OWN, gettabup_own),
+    (Op::GETTABUP_ABSENT, gettabup_absent),
+    (Op::GETTABUP_PROTO, gettabup_proto),
+    (Op::SELF_OWN, self_own),
+    (Op::SELF_ABSENT, self_absent),
+    (Op::SELF_PROTO, self_proto),
+    (Op::SETFIELD_OWN, setfield_own),
+    (Op::SETFIELD_TRANS, setfield_trans),
+    (Op::SETTABUP_OWN, settabup_own),
+    (Op::SETTABUP_TRANS, settabup_trans),
+    (Op::SETFIELD_ABSENT, setfield_absent),
+    (Op::SETTABUP_ABSENT, settabup_absent),
 ]);
 
 /// Why an opcode faulted. `impl_error` renders the reference message for
@@ -614,7 +629,13 @@ fn read_ic<'gc>(closure: LuaFn<'gc>, ic_idx: u16) -> InlineCache<'gc> {
 /// Refill the IC entry. Called by slow paths after they've done a full
 /// shape lookup; subsequent same-shape accesses skip the slow path.
 #[inline(always)]
-fn fill_ic<'gc>(ctx: Context<'gc>, closure: LuaFn<'gc>, ic_idx: u16, entry: InlineCache<'gc>) {
+fn fill_ic<'gc>(
+    ctx: Context<'gc>,
+    closure: LuaFn<'gc>,
+    ic_idx: u16,
+    site: *const Instruction,
+    entry: InlineCache<'gc>,
+) {
     // Every dict table with the same metatable shares one sentinel shape,
     // so an entry on it would answer for keys it never saw.
     debug_assert!(match entry {
@@ -635,6 +656,36 @@ fn fill_ic<'gc>(ctx: Context<'gc>, closure: LuaFn<'gc>, ic_idx: u16, entry: Inli
         // `Gc<Lock<T>>` would emit.
         ctx.mutation().backward_barrier(Gc::erase(proto_gc), None);
         unsafe { slot_lock.as_cell() }.set(entry);
+        quicken(site, &entry);
+    }
+}
+
+/// Rewrite the table access at `site` to the form for `entry`, its cache's
+/// new contents (see `Op::unquickened`).
+#[inline]
+fn quicken(site: *const Instruction, entry: &InlineCache<'_>) {
+    let insn = unsafe { *site };
+    let op = match (insn.op().unquickened(), entry) {
+        (Op::GETFIELD, InlineCache::Own { .. }) => Op::GETFIELD_OWN,
+        (Op::GETFIELD, InlineCache::Absent { .. }) => Op::GETFIELD_ABSENT,
+        (Op::GETFIELD, InlineCache::ProtoLoad { .. }) => Op::GETFIELD_PROTO,
+        (Op::GETTABUP, InlineCache::Own { .. }) => Op::GETTABUP_OWN,
+        (Op::GETTABUP, InlineCache::Absent { .. }) => Op::GETTABUP_ABSENT,
+        (Op::GETTABUP, InlineCache::ProtoLoad { .. }) => Op::GETTABUP_PROTO,
+        (Op::SELF, InlineCache::Own { .. }) => Op::SELF_OWN,
+        (Op::SELF, InlineCache::Absent { .. }) => Op::SELF_ABSENT,
+        (Op::SELF, InlineCache::ProtoLoad { .. }) => Op::SELF_PROTO,
+        (Op::SETFIELD, InlineCache::Own { .. }) => Op::SETFIELD_OWN,
+        (Op::SETFIELD, InlineCache::Transition { .. }) => Op::SETFIELD_TRANS,
+        (Op::SETTABUP, InlineCache::Own { .. }) => Op::SETTABUP_OWN,
+        (Op::SETTABUP, InlineCache::Transition { .. }) => Op::SETTABUP_TRANS,
+        (Op::SETFIELD, InlineCache::Absent { .. }) => Op::SETFIELD_ABSENT,
+        (Op::SETTABUP, InlineCache::Absent { .. }) => Op::SETTABUP_ABSENT,
+        (op, _) => op,
+    };
+    if op != insn.op() {
+        // SAFETY: `Code` keeps instructions in cells, and `site` came from one.
+        unsafe { site.cast_mut().write(insn.with_op(op)) };
     }
 }
 
@@ -768,6 +819,7 @@ fn get_fill_ic<'gc>(
     ctx: Context<'gc>,
     closure: LuaFn<'gc>,
     ic_idx: u16,
+    site: *const Instruction,
     t: Table<'gc>,
     k: Value<'gc>,
 ) -> Result<Value<'gc>, Value<'gc>> {
@@ -781,17 +833,21 @@ fn get_fill_ic<'gc>(
             Ok(v)
         };
     }
-    // The entry already says `t` lacks the key, and an `__index` function
-    // leaves nothing to cache: refilling would cost a barrier on every miss.
+    // The entry already says `t` lacks the key: refilling it would cost a
+    // barrier on every miss. Only `__index` is left.
     if let InlineCache::Absent { shape: cached } = read_ic(closure, ic_idx)
         && Shape::ptr_eq(cached, shape)
         && let Some(mt) = shape.mt_cache()
-        && mt.mm(MetamethodBits::INDEX).get_function().is_some()
     {
-        return Err(Value::table(t));
+        let index = mt.mm(MetamethodBits::INDEX);
+        drop(state);
+        if index.get_function().is_some() {
+            return Err(Value::table(t));
+        }
+        return get_index_fill_ic(ctx, closure, ic_idx, site, t, index, Some(shape), k);
     }
     let slot = shape.find_slot(constant_key(k));
-    fill_ic(ctx, closure, ic_idx, shape_entry(shape, slot));
+    fill_ic(ctx, closure, ic_idx, site, shape_entry(shape, slot));
     let v = slot.map_or(Value::nil(), |s| state.named_get(s));
     if !v.is_nil() || !shape.has_mm(MetamethodBits::INDEX) {
         return Ok(v);
@@ -800,7 +856,7 @@ fn get_fill_ic<'gc>(
     let index = unsafe { shape.mt_cache().unwrap_unchecked() }.mm(MetamethodBits::INDEX);
     drop(state);
     let recv = slot.is_none().then_some(shape);
-    get_index_fill_ic(ctx, closure, ic_idx, t, index, recv, k)
+    get_index_fill_ic(ctx, closure, ic_idx, site, t, index, recv, k)
 }
 
 /// The `__index` half of [`get_fill_ic`], out of line to keep the own-key
@@ -812,6 +868,7 @@ fn get_index_fill_ic<'gc>(
     ctx: Context<'gc>,
     closure: LuaFn<'gc>,
     ic_idx: u16,
+    site: *const Instruction,
     t: Table<'gc>,
     index: Value<'gc>,
     recv: Option<Shape<'gc>>,
@@ -849,7 +906,7 @@ fn get_index_fill_ic<'gc>(
             holder_shape,
             loc: SlotLoc::new(holder_shape, holder_slot),
         };
-        fill_ic(ctx, closure, ic_idx, entry);
+        fill_ic(ctx, closure, ic_idx, site, entry);
     }
     Ok(v)
 }
@@ -862,6 +919,7 @@ fn set_own_fill_ic<'gc>(
     ctx: Context<'gc>,
     closure: LuaFn<'gc>,
     ic_idx: u16,
+    site: *const Instruction,
     t: Table<'gc>,
     k: Value<'gc>,
     v: Value<'gc>,
@@ -892,7 +950,7 @@ fn set_own_fill_ic<'gc>(
     let existing = slot.map_or(Value::nil(), |s| state.named_get(s));
     if existing.is_nil() && newindex {
         if cache {
-            fill_ic(ctx, closure, ic_idx, shape_entry(shape, slot));
+            fill_ic(ctx, closure, ic_idx, site, shape_entry(shape, slot));
         }
         return false;
     }
@@ -922,7 +980,7 @@ fn set_own_fill_ic<'gc>(
     };
     drop(state);
     if cache {
-        fill_ic(ctx, closure, ic_idx, entry);
+        fill_ic(ctx, closure, ic_idx, site, entry);
     }
     true
 }
@@ -1182,7 +1240,6 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
     tail!(get_slow);
 }
 
-
 /// UpValue[idx][K[key]] = R[src]
 #[inline(never)]
 #[rustc_align(32)]
@@ -1211,7 +1268,6 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
     }
     tail!(set_slow);
 }
-
 
 // ---------------------------------------------------------------------------
 // Table access via register
@@ -1288,7 +1344,6 @@ extern "rust-preserve-none" fn gettable_general<'gc>(
     dispatch!();
 }
 
-
 /// R[table][R[key]] = R[src]
 #[inline(never)]
 #[rustc_align(32)]
@@ -1364,7 +1419,6 @@ extern "rust-preserve-none" fn settable_general<'gc>(
     dispatch!()
 }
 
-
 /// R[dst] = R[table][K[key_idx]]
 #[inline(never)]
 #[rustc_align(32)]
@@ -1397,7 +1451,6 @@ extern "rust-preserve-none" fn op_getfield<'gc>(
     tail!(get_slow);
 }
 
-
 /// R[table][K[key_idx]] = R[src]
 #[inline(never)]
 #[rustc_align(32)]
@@ -1424,7 +1477,6 @@ extern "rust-preserve-none" fn op_setfield<'gc>(
     }
     tail!(set_slow);
 }
-
 
 // ---------------------------------------------------------------------------
 // SELF — method-call setup
@@ -1463,7 +1515,6 @@ extern "rust-preserve-none" fn op_self<'gc>(
     drop(recv_state);
     tail!(get_slow);
 }
-
 
 /// R[dst] = {}
 #[inline(never)]
@@ -1565,8 +1616,6 @@ macro_rules! bit_handler {
         }
     };
 }
-
-
 
 arith_handler!(op_add, op_add_slow, ADD, num::Add, ADD);
 arith_handler!(op_sub, op_sub_slow, SUB, num::Sub, SUB);
@@ -1677,7 +1726,6 @@ macro_rules! bit_imm_handler {
         }
     };
 }
-
 
 arith_imm_handler!(op_addi, op_addi_slow, ADDI, num::Add, ADD, false);
 arith_imm_handler!(op_subi, op_subi_slow, SUBI, num::Sub, SUB, false);
@@ -1991,7 +2039,10 @@ fn pop_tbc<'gc>(
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
 ) -> Result<(Value<'gc>, Value<'gc>), crate::env::Error<'gc>> {
-    let entry = thread.tbc_list.pop().expect("no to-be-closed variable to close");
+    let entry = thread
+        .tbc_list
+        .pop()
+        .expect("no to-be-closed variable to close");
     let v = entry.value(&thread.stack);
     let tm = ctx.mm_of(v, MetamethodBits::CLOSE);
     if let Some(e) = call_chain_error(ctx, tm) {
@@ -2213,7 +2264,6 @@ macro_rules! cmp_imm_handler {
 
             tail!(cmp_slow);
         }
-
     };
 }
 
@@ -2480,10 +2530,19 @@ macro_rules! call_native {
                     let f = unsafe { $thread.stack[func_idx].get_function().unwrap_unchecked() };
                     // The common shape, a native calling a Lua function, without
                     // `run_natives`' generality.
-                    if let crate::vm::sequence::CallbackAction::CallThen { at, protect, cont } = action
+                    if let crate::vm::sequence::CallbackAction::CallThen { at, protect, cont } =
+                        action
                         && let Some(callee) = native_calls_lua($thread, args_base + at as usize)
                     {
-                        push_native_frame($thread, f, args_base, at, protect, cont, call_ret(returns));
+                        push_native_frame(
+                            $thread,
+                            f,
+                            args_base,
+                            at,
+                            protect,
+                            cont,
+                            call_ret(returns),
+                        );
                         let new_base = args_base + at as usize + 1;
                         enter_from_native($thread, callee, new_base, ret_native);
                         ($frame, $closure) = (unsafe { $thread.top_lua_ptr() }, callee);
@@ -2492,13 +2551,12 @@ macro_rules! call_native {
                         dispatch!();
                     }
                     let step = run_natives!(NativeState::Acted {
-                            r: Ok(action),
-                            framed: false,
-                            f,
-                            base: args_base,
-                            ret: call_ret(returns),
-                        },
-                    );
+                        r: Ok(action),
+                        framed: false,
+                        f,
+                        base: args_base,
+                        ret: call_ret(returns),
+                    },);
                     native_step!(step);
                 }
             }
@@ -3113,13 +3171,12 @@ extern "rust-preserve-none" fn op_tailcall_native<'gc>(
             thread.stack.copy_within(args_base..top, orig_func + 1);
             thread.set_top_unchecked(orig_func + 1 + (top - args_base));
             let step = run_natives!(NativeState::Acted {
-                    r: Ok(action),
-                    framed: false,
-                    f,
-                    base: orig_func + 1,
-                    ret,
-                },
-            );
+                r: Ok(action),
+                framed: false,
+                f,
+                base: orig_func + 1,
+                ret,
+            },);
             native_step!(step);
         }
     }
@@ -3235,7 +3292,9 @@ extern "rust-preserve-none" fn op_return<'gc>(
     } else {
         count as usize - 1
     };
-    return_to_ret!(nret, values, ctx, thread, registers, handlers, ds, frame, closure);
+    return_to_ret!(
+        nret, values, ctx, thread, registers, handlers, ds, frame, closure
+    );
 }
 
 /// return
@@ -3255,9 +3314,14 @@ extern "rust-preserve-none" fn op_return0<'gc>(
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let _ = instruction;
     if std::hint::unlikely(unsafe { (*frame).flags } != 0) {
-        tail!(op_return_slow, Instruction::ret(crate::instruction::Reg(0), 1));
+        tail!(
+            op_return_slow,
+            Instruction::ret(crate::instruction::Reg(0), 1)
+        );
     }
-    return_to_ret!(0, registers, ctx, thread, registers, handlers, ds, frame, closure);
+    return_to_ret!(
+        0, registers, ctx, thread, registers, handlers, ds, frame, closure
+    );
 }
 
 /// return R[value]
@@ -3277,10 +3341,15 @@ extern "rust-preserve-none" fn op_return1<'gc>(
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let value = instruction.a();
     if std::hint::unlikely(unsafe { (*frame).flags } != 0) {
-        tail!(op_return_slow, Instruction::ret(crate::instruction::Reg(value), 2));
+        tail!(
+            op_return_slow,
+            Instruction::ret(crate::instruction::Reg(value), 2)
+        );
     }
     let values = unsafe { registers.add(value as usize) };
-    return_to_ret!(1, values, ctx, thread, registers, handlers, ds, frame, closure);
+    return_to_ret!(
+        1, values, ctx, thread, registers, handlers, ds, frame, closure
+    );
 }
 
 /// RETURN from a frame with upvalues or to-be-closed variables to close.
@@ -3329,7 +3398,9 @@ extern "rust-preserve-none" fn op_return_slow<'gc>(
     // Before the results move: they may land on the frame's own registers.
     close_upvalues(ctx.mutation(), thread, cur_base);
     let values = unsafe { registers.add(values as usize) };
-    return_to_ret!(nret, values, ctx, thread, registers, handlers, ds, frame, closure);
+    return_to_ret!(
+        nret, values, ctx, thread, registers, handlers, ds, frame, closure
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -4342,7 +4413,10 @@ pub(crate) fn walk_index_chain<'gc>(
     for _ in 0..MAX_TAG_LOOP {
         let mm = match receiver.get_table() {
             Some(t) => {
-                let mm = t.shape().mt_cache().map_or(Value::nil(), |c| c.mm(MetamethodBits::INDEX));
+                let mm = t
+                    .shape()
+                    .mt_cache()
+                    .map_or(Value::nil(), |c| c.mm(MetamethodBits::INDEX));
                 if mm.is_nil() {
                     return IndexChain::Resolved(Value::nil());
                 }
@@ -4623,13 +4697,12 @@ extern "rust-preserve-none" fn meta_call<'gc>(
                 }
                 r => {
                     let step = run_natives!(NativeState::Acted {
-                            r,
-                            framed: false,
-                            f,
-                            base: new_base,
-                            ret,
-                        },
-                    );
+                        r,
+                        framed: false,
+                        f,
+                        base: new_base,
+                        ret,
+                    },);
                     native_step!(step);
                 }
             }
@@ -4847,7 +4920,14 @@ extern "rust-preserve-none" fn ret_tfor<'gc>(
     let op = resume_caller!(thread, registers, ip, frame, closure);
     let (base, count) = op.ab();
     // The variables are in the caller's window, below the results.
-    unsafe { land_results(registers.add((base + TFOR_VARS) as usize), values, nret, count as usize) };
+    unsafe {
+        land_results(
+            registers.add((base + TFOR_VARS) as usize),
+            values,
+            nret,
+            count as usize,
+        )
+    };
     let func_slot = unsafe { func_slot.offset_from_unsigned(thread.stack.as_ptr()) };
     thread.set_top_unchecked(func_slot);
     dispatch!();
@@ -4965,7 +5045,18 @@ pub(crate) fn run_natives<'gc>(
             f,
             base,
             ret,
-        } => drive_natives(ctx, thread, switch, Phase::Act, r, Ok(()), framed, f, base, ret),
+        } => drive_natives(
+            ctx,
+            thread,
+            switch,
+            Phase::Act,
+            r,
+            Ok(()),
+            framed,
+            f,
+            base,
+            ret,
+        ),
         NativeState::Resume(status) => drive_natives(
             ctx,
             thread,
@@ -5050,7 +5141,9 @@ fn drive_natives<'gc>(
                     }
                     push_native_frame(thread, f, base, at, Protect::Errors, cont, ret);
                     let at = base + at as usize;
-                    let co = thread.stack[at].get_thread().expect("resume of a non-thread");
+                    let co = thread.stack[at]
+                        .get_thread()
+                        .expect("resume of a non-thread");
                     if thread.resume_depth + 1 >= MAX_RESUME_DEPTH {
                         // On the resumer, leaving the coroutine untouched
                         // (`lua_resume`'s `resume_error`).
@@ -5202,14 +5295,27 @@ fn resume_into<'gc>(
         cs.discard_above(0);
         cs.ensure_slots(1 + n);
         cs.stack[0] = f;
-        unsafe { copy_values(cs.stack.as_mut_ptr().add(1), thread.stack.as_ptr().add(args), n) };
+        unsafe {
+            copy_values(
+                cs.stack.as_mut_ptr().add(1),
+                thread.stack.as_ptr().add(args),
+                n,
+            )
+        };
         cs.top = 1 + n;
         None
     } else {
-        let y = cs.yield_bottom.take().expect("resumed a coroutine that didn't yield");
+        let y = cs
+            .yield_bottom
+            .take()
+            .expect("resumed a coroutine that didn't yield");
         cs.ensure_slots(y.bottom + n);
         unsafe {
-            copy_values(cs.stack.as_mut_ptr().add(y.bottom), thread.stack.as_ptr().add(args), n)
+            copy_values(
+                cs.stack.as_mut_ptr().add(y.bottom),
+                thread.stack.as_ptr().add(args),
+                n,
+            )
         };
         cs.top = y.bottom + n;
         Some(y)
@@ -5257,7 +5363,13 @@ fn hand_back<'gc>(from: &mut ThreadState<'gc>, to: &mut ThreadState<'gc>, values
     let nf = unsafe { to.frames.last().unwrap_unchecked() };
     let slot = nf.base() + nf.num_extras as usize;
     to.ensure_slots(slot + n);
-    unsafe { copy_values(to.stack.as_mut_ptr().add(slot), from.stack.as_ptr().add(values), n) };
+    unsafe {
+        copy_values(
+            to.stack.as_mut_ptr().add(slot),
+            from.stack.as_ptr().add(values),
+            n,
+        )
+    };
     to.set_top_unchecked(slot + n);
     to.status = ThreadStatus::Normal;
     from.resumer = None;
@@ -5351,13 +5463,12 @@ pub(crate) extern "rust-preserve-none" fn ret_native<'gc>(
         r => r,
     };
     let step = run_natives!(NativeState::Acted {
-            r,
-            framed: true,
-            f,
-            base,
-            ret,
-        },
-    );
+        r,
+        framed: true,
+        f,
+        base,
+        ret,
+    },);
     native_step!(step);
 }
 
@@ -5532,20 +5643,54 @@ extern "rust-preserve-none" fn binop_slow<'gc>(
         }
     };
     let (r, bit) = match op {
-        ADD | ADDI => (num::op_arith_slow::<num::Add>(mc, lhs, rhs), MetamethodBits::ADD),
-        SUB | SUBI | RSUBI => (num::op_arith_slow::<num::Sub>(mc, lhs, rhs), MetamethodBits::SUB),
-        MUL | MULI => (num::op_arith_slow::<num::Mul>(mc, lhs, rhs), MetamethodBits::MUL),
-        MOD | MODI | RMODI => (num::op_arith_slow::<num::Mod>(mc, lhs, rhs), MetamethodBits::MOD),
-        POW | POWI | RPOWI => (num::op_arith_slow::<num::Pow>(mc, lhs, rhs), MetamethodBits::POW),
-        DIV | DIVI | RDIVI => (num::op_arith_slow::<num::Div>(mc, lhs, rhs), MetamethodBits::DIV),
-        IDIV | IDIVI | RIDIVI => {
-            (num::op_arith_slow::<num::IDiv>(mc, lhs, rhs), MetamethodBits::IDIV)
-        }
-        BAND | BANDI => (num::op_bit_slow::<num::BAnd>(mc, lhs, rhs), MetamethodBits::BAND),
-        BOR | BORI => (num::op_bit_slow::<num::BOr>(mc, lhs, rhs), MetamethodBits::BOR),
-        BXOR | BXORI => (num::op_bit_slow::<num::BXor>(mc, lhs, rhs), MetamethodBits::BXOR),
-        SHL | SHLI | RSHLI => (num::op_bit_slow::<num::Shl>(mc, lhs, rhs), MetamethodBits::SHL),
-        SHR | SHRI | RSHRI => (num::op_bit_slow::<num::Shr>(mc, lhs, rhs), MetamethodBits::SHR),
+        ADD | ADDI => (
+            num::op_arith_slow::<num::Add>(mc, lhs, rhs),
+            MetamethodBits::ADD,
+        ),
+        SUB | SUBI | RSUBI => (
+            num::op_arith_slow::<num::Sub>(mc, lhs, rhs),
+            MetamethodBits::SUB,
+        ),
+        MUL | MULI => (
+            num::op_arith_slow::<num::Mul>(mc, lhs, rhs),
+            MetamethodBits::MUL,
+        ),
+        MOD | MODI | RMODI => (
+            num::op_arith_slow::<num::Mod>(mc, lhs, rhs),
+            MetamethodBits::MOD,
+        ),
+        POW | POWI | RPOWI => (
+            num::op_arith_slow::<num::Pow>(mc, lhs, rhs),
+            MetamethodBits::POW,
+        ),
+        DIV | DIVI | RDIVI => (
+            num::op_arith_slow::<num::Div>(mc, lhs, rhs),
+            MetamethodBits::DIV,
+        ),
+        IDIV | IDIVI | RIDIVI => (
+            num::op_arith_slow::<num::IDiv>(mc, lhs, rhs),
+            MetamethodBits::IDIV,
+        ),
+        BAND | BANDI => (
+            num::op_bit_slow::<num::BAnd>(mc, lhs, rhs),
+            MetamethodBits::BAND,
+        ),
+        BOR | BORI => (
+            num::op_bit_slow::<num::BOr>(mc, lhs, rhs),
+            MetamethodBits::BOR,
+        ),
+        BXOR | BXORI => (
+            num::op_bit_slow::<num::BXor>(mc, lhs, rhs),
+            MetamethodBits::BXOR,
+        ),
+        SHL | SHLI | RSHLI => (
+            num::op_bit_slow::<num::Shl>(mc, lhs, rhs),
+            MetamethodBits::SHL,
+        ),
+        SHR | SHRI | RSHRI => (
+            num::op_bit_slow::<num::Shr>(mc, lhs, rhs),
+            MetamethodBits::SHR,
+        ),
         _ => unreachable!("binop_slow on {op:?}"),
     };
     match r {
@@ -5560,11 +5705,13 @@ extern "rust-preserve-none" fn binop_slow<'gc>(
     let meta_fn = binop_metamethod(ctx, lhs, rhs, bit);
     if meta_fn.is_nil() {
         let bitwise = MetamethodBits::BAND | MetamethodBits::BOR | MetamethodBits::BXOR;
-        raise!(if (bitwise | MetamethodBits::SHL | MetamethodBits::SHR).contains(bit) {
-            OpError::Bitwise(lhs, rhs)
-        } else {
-            OpError::Arith(lhs, rhs)
-        });
+        raise!(
+            if (bitwise | MetamethodBits::SHL | MetamethodBits::SHR).contains(bit) {
+                OpError::Bitwise(lhs, rhs)
+            } else {
+                OpError::Arith(lhs, rhs)
+            }
+        );
     }
     call_mm!(ret_store_a, meta_fn, [lhs, rhs]);
 }
@@ -5586,7 +5733,7 @@ extern "rust-preserve-none" fn get_slow<'gc>(
     closure: LuaFn<'gc>,
 ) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-    let op = instruction.op();
+    let op = instruction.op().unquickened();
     let dst = instruction.a();
     let recv = match op {
         Op::GETTABUP => read_upvalue(thread, upvalue!(instruction.b())),
@@ -5596,13 +5743,23 @@ extern "rust-preserve-none" fn get_slow<'gc>(
         *reg!(ref mut (dst + 1)) = recv;
     }
     if op == Op::GETTABLE {
-        get_slow_body!(ctx, thread, registers, ip, handlers, ds, recv, reg!(instruction.c()), dst);
+        get_slow_body!(
+            ctx,
+            thread,
+            registers,
+            ip,
+            handlers,
+            ds,
+            recv,
+            reg!(instruction.c()),
+            dst
+        );
     }
     let k = constant!(instruction.e());
     let Some(t) = recv.get_table() else {
         index_chain_body!(ctx, thread, registers, ip, handlers, ds, recv, k, dst);
     };
-    match get_fill_ic(ctx, closure, instruction.d(), t, k) {
+    match get_fill_ic(ctx, closure, instruction.d(), unsafe { ip.sub(1) }, t, k) {
         Ok(v) => {
             *reg!(ref mut dst) = v;
             dispatch!();
@@ -5627,7 +5784,7 @@ extern "rust-preserve-none" fn set_slow<'gc>(
     closure: LuaFn<'gc>,
 ) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-    let op = instruction.op();
+    let op = instruction.op().unquickened();
     let v = reg!(instruction.a());
     let recv = match op {
         Op::SETTABUP => read_upvalue(thread, upvalue!(instruction.b())),
@@ -5635,15 +5792,28 @@ extern "rust-preserve-none" fn set_slow<'gc>(
     };
     if op == Op::SETTABLE {
         let k = reg!(instruction.c());
-        set_slow_body!(ctx, thread, registers, ip, handlers, ds, recv, k, v, raw_set_keyed);
+        set_slow_body!(
+            ctx,
+            thread,
+            registers,
+            ip,
+            handlers,
+            ds,
+            recv,
+            k,
+            v,
+            raw_set_keyed
+        );
     }
     let k = constant!(instruction.e());
     if let Some(t) = recv.get_table()
-        && set_own_fill_ic(ctx, closure, instruction.d(), t, k, v)
+        && set_own_fill_ic(ctx, closure, instruction.d(), unsafe { ip.sub(1) }, t, k, v)
     {
         dispatch!();
     }
-    set_slow_body!(ctx, thread, registers, ip, handlers, ds, recv, k, v, raw_set);
+    set_slow_body!(
+        ctx, thread, registers, ip, handlers, ds, recv, k, v, raw_set
+    );
 }
 
 /// The slow path of LT, LE and their immediate forms: boxed and mixed
@@ -5667,7 +5837,11 @@ extern "rust-preserve-none" fn cmp_slow<'gc>(
     let (a, b, inverted) = if imm {
         let (src, inverted) = instruction.ab_imm_flag();
         let (v, k) = (reg!(src), instruction.imm_value(ctx.mutation()));
-        let (a, b) = if matches!(op, Op::GTI | Op::GEI) { (k, v) } else { (v, k) };
+        let (a, b) = if matches!(op, Op::GTI | Op::GEI) {
+            (k, v)
+        } else {
+            (v, k)
+        };
         (a, b, inverted)
     } else {
         let (lhs, rhs, inverted) = instruction.abc_flag();
@@ -5679,9 +5853,17 @@ extern "rust-preserve-none" fn cmp_slow<'gc>(
     {
         Some(if le { x <= y } else { x < y })
     } else if let (Some(x), Some(y)) = (a.get_integer(), b.get_float()) {
-        Some(if le { num::le_int_float(x, y) } else { num::lt_int_float(x, y) })
+        Some(if le {
+            num::le_int_float(x, y)
+        } else {
+            num::lt_int_float(x, y)
+        })
     } else if let (Some(x), Some(y)) = (a.get_float(), b.get_integer()) {
-        Some(if le { num::le_float_int(x, y) } else { num::lt_float_int(x, y) })
+        Some(if le {
+            num::le_float_int(x, y)
+        } else {
+            num::lt_float_int(x, y)
+        })
     } else if let (Some(x), Some(y)) = (a.get_float(), b.get_float()) {
         Some(if le { x <= y } else { x < y })
     } else if let (Some(x), Some(y)) = (a.get_string(), b.get_string()) {
@@ -5693,7 +5875,11 @@ extern "rust-preserve-none" fn cmp_slow<'gc>(
         skip_if!(r != inverted);
         dispatch!();
     }
-    let bit = if le { MetamethodBits::LE } else { MetamethodBits::LT };
+    let bit = if le {
+        MetamethodBits::LE
+    } else {
+        MetamethodBits::LT
+    };
     let meta_fn = binop_metamethod(ctx, a, b, bit);
     if meta_fn.is_nil() {
         raise!(OpError::Compare(a, b));
@@ -5753,3 +5939,169 @@ ret_call_n!(ret_call0, 0);
 ret_call_n!(ret_call1, 1);
 ret_call_n!(ret_call2, 2);
 
+// ---------------------------------------------------------------------------
+// Quickened table accesses
+// ---------------------------------------------------------------------------
+
+/// A quickened read: the receiver `$recv` names (`reg` or `upval` operand
+/// `b`), its cache entry known to be of kind `$kind`, and with `$self_` the
+/// receiver also stored above the result (SELF). Any miss goes to
+/// `get_slow`, which refills the entry and requickens.
+macro_rules! get_quick {
+    ($name:ident, $recv:ident, $kind:ident, $self_:literal) => {
+        #[inline(never)]
+        #[rustc_align(32)]
+        extern "rust-preserve-none" fn $name<'gc>(
+            instruction: Instruction,
+            ctx: Context<'gc>,
+            thread: &mut ThreadState<'gc>,
+            registers: Registers<'gc, '_>,
+            ip: *const Instruction,
+            handlers: *const (),
+            ds: &mut DispatchState<'gc>,
+            frame: *mut LuaFrame<'gc>,
+            closure: LuaFn<'gc>,
+        ) -> Exit {
+            helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+            let (dst, b, ic_idx, _) = instruction.abde();
+            let recv = get_quick!(@recv $recv, b, thread);
+            let Some(t) = recv.get_table() else {
+                tail!(get_slow);
+            };
+            let state = t.inner().borrow();
+            let Some(v) = get_quick!(@load $kind, read_ic(closure, ic_idx), t, &state) else {
+                drop(state);
+                // An absent key on a shape with an `__index` function: call
+                // it from here, as `get_slow` would.
+                if get_quick!(@absent $kind)
+                    && let InlineCache::Absent { shape } = read_ic(closure, ic_idx)
+                    && Shape::ptr_eq(t.shape(), shape)
+                    && let Some(mt) = shape.mt_cache()
+                    && let index = mt.mm(MetamethodBits::INDEX)
+                    && index.get_function().is_some()
+                {
+                    if $self_ {
+                        *reg!(ref mut (dst + 1)) = recv;
+                    }
+                    call_mm!(ret_store_a, index, [recv, constant!(instruction.e())]);
+                }
+                tail!(get_slow);
+            };
+            drop(state);
+            if $self_ {
+                *reg!(ref mut (dst + 1)) = recv;
+            }
+            *reg!(ref mut dst) = v;
+            dispatch!();
+        }
+    };
+    (@absent Absent) => {
+        true
+    };
+    (@absent $kind:ident) => {
+        false
+    };
+    (@recv reg, $b:ident, $thread:ident) => {
+        reg!($b)
+    };
+    (@recv upval, $b:ident, $thread:ident) => {
+        read_upvalue($thread, upvalue!($b))
+    };
+    // Own and Absent entries only change through `fill_ic`, which
+    // requickens; the collector may empty a ProtoLoad one, so that kind is
+    // checked.
+    (@load Own, $cache:expr, $t:ident, $state:expr) => {{
+        let InlineCache::Own { shape, loc } = $cache else {
+            unsafe { std::hint::unreachable_unchecked() }
+        };
+        let state: &TableState<'gc> = $state;
+        if Shape::ptr_eq(state.shape(), shape) {
+            let v = unsafe { $t.load(state, loc) };
+            (!(v.is_nil() && shape.has_mm(MetamethodBits::INDEX))).then_some(v)
+        } else {
+            None
+        }
+    }};
+    (@load Absent, $cache:expr, $t:ident, $state:expr) => {{
+        let InlineCache::Absent { shape } = $cache else {
+            unsafe { std::hint::unreachable_unchecked() }
+        };
+        let state: &TableState<'gc> = $state;
+        (Shape::ptr_eq(state.shape(), shape) && !shape.has_mm(MetamethodBits::INDEX))
+            .then_some(Value::nil())
+    }};
+    (@load Proto, $cache:expr, $t:ident, $state:expr) => {{
+        let cache = $cache;
+        if matches!(cache, InlineCache::ProtoLoad { .. }) {
+            ic_get(cache, $t, $state)
+        } else {
+            None
+        }
+    }};
+}
+
+get_quick!(getfield_own, reg, Own, false);
+get_quick!(getfield_absent, reg, Absent, false);
+get_quick!(getfield_proto, reg, Proto, false);
+get_quick!(gettabup_own, upval, Own, false);
+get_quick!(gettabup_absent, upval, Absent, false);
+get_quick!(gettabup_proto, upval, Proto, false);
+get_quick!(self_own, reg, Own, true);
+get_quick!(self_absent, reg, Absent, true);
+get_quick!(self_proto, reg, Proto, true);
+
+/// A quickened write, as [`get_quick!`]: `$kind` is `Own` or `Transition`.
+macro_rules! set_quick {
+    ($name:ident, $recv:ident, $kind:ident) => {
+        #[inline(never)]
+        #[rustc_align(32)]
+        extern "rust-preserve-none" fn $name<'gc>(
+            instruction: Instruction,
+            ctx: Context<'gc>,
+            thread: &mut ThreadState<'gc>,
+            registers: Registers<'gc, '_>,
+            ip: *const Instruction,
+            handlers: *const (),
+            ds: &mut DispatchState<'gc>,
+            frame: *mut LuaFrame<'gc>,
+            closure: LuaFn<'gc>,
+        ) -> Exit {
+            helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+            let (src, b, ic_idx, _) = instruction.abde();
+            let recv = get_quick!(@recv $recv, b, thread);
+            let Some(t) = recv.get_table() else {
+                tail!(set_slow);
+            };
+            let cache = read_ic(closure, ic_idx);
+            if !matches!(cache, InlineCache::$kind { .. }) {
+                unsafe { std::hint::unreachable_unchecked() }
+            }
+            set_quick!(@store $kind, ctx, instruction, cache, t, recv, src);
+            tail!(set_slow);
+        }
+    };
+    (@store Absent, $ctx:ident, $instruction:ident, $cache:ident, $t:ident, $recv:ident, $src:ident) => {
+        // Filled for a shape with `__newindex`, which a function may answer
+        // from here.
+        if let InlineCache::Absent { shape } = $cache
+            && Shape::ptr_eq($t.shape(), shape)
+            && let Some(mt) = shape.mt_cache()
+            && let newindex = mt.mm(MetamethodBits::NEWINDEX)
+            && newindex.get_function().is_some()
+        {
+            call_mm!(ret_discard, newindex, [$recv, constant!($instruction.e()), reg!($src)]);
+        }
+    };
+    (@store $kind:ident, $ctx:ident, $instruction:ident, $cache:ident, $t:ident, $recv:ident, $src:ident) => {
+        if ic_set($ctx, $cache, $t, reg!($src)) {
+            dispatch!();
+        }
+    };
+}
+
+set_quick!(setfield_own, reg, Own);
+set_quick!(setfield_trans, reg, Transition);
+set_quick!(settabup_own, upval, Own);
+set_quick!(settabup_trans, upval, Transition);
+set_quick!(setfield_absent, reg, Absent);
+set_quick!(settabup_absent, upval, Absent);

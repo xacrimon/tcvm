@@ -9,9 +9,7 @@ use crate::env::{
 use crate::vm::async_sequence::{SequenceReturn, async_sequence};
 use crate::vm::debug::where_prefix;
 use crate::vm::interp;
-use crate::vm::sequence::{
-    BoxSequence, CallbackAction, Protect,
-};
+use crate::vm::sequence::{BoxSequence, CallbackAction, Protect};
 
 pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[
@@ -455,10 +453,7 @@ fn lua_print<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let n = stack.len();
-    let has_tostring = |i| {
-        !ctx.mm_of(stack.get(i), MetamethodBits::TOSTRING)
-            .is_nil()
-    };
+    let has_tostring = |i| !ctx.mm_of(stack.get(i), MetamethodBits::TOSTRING).is_nil();
     if !(0..n).any(has_tostring) {
         let stdout = std::io::stdout();
         let mut out = stdout.lock();

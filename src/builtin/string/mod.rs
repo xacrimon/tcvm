@@ -367,7 +367,9 @@ impl Formatter {
                     return Err(Error::from_str(ctx, "specifier '%q' cannot have modifiers"));
                 }
                 if (!quoted || arg.is_nil() || arg.get_boolean().is_some())
-                    && !ctx.mm_of(arg, crate::env::MetamethodBits::TOSTRING).is_nil()
+                    && !ctx
+                        .mm_of(arg, crate::env::MetamethodBits::TOSTRING)
+                        .is_nil()
                 {
                     return Ok(Some((sf, at, self.arg_idx - 1)));
                 }
