@@ -1,3 +1,4 @@
+use super::rules::{Assigned, VarId};
 use crate::dmm::{Gc, Mutation};
 use crate::env::function::{IcTable, LocVar, Template};
 use crate::env::{LuaString, Prototype, Value};
@@ -5,7 +6,7 @@ use crate::env::{LuaString, Prototype, Value};
 /// with the instruction word so the emitter can pass one straight to an
 /// instruction constructor.
 pub use crate::instruction::Reg as RegisterIndex;
-use crate::instruction::{Instruction, Op, UpValueDescriptor};
+use crate::instruction::{Instruction, Op, UpValueDescriptor, UpvalSource};
 
 /// Escape-analysis state for a named vararg parameter (`function f(...name)`).
 /// `Some` on the `Chunk` iff one is declared. If either flag is set by the end
@@ -219,8 +220,10 @@ pub struct Chunk<'gc> {
     pub(super) line_defined: u32,
     pub(super) last_line_defined: u32,
     pub(super) constants: Vec<Value<'gc>>,
-    pub(super) prototypes: Vec<Gc<'gc, Prototype<'gc>>>,
-    pub(super) upvalue_desc: Vec<UpValueDescriptor>,
+    /// Assembled with this one, once every assignment in the chunk is known.
+    pub(super) prototypes: Vec<Chunk<'gc>>,
+    /// Each upvalue's source and the variable it captures.
+    pub(super) upvalue_desc: Vec<(UpvalSource, VarId)>,
     /// Next free register slot; cursor for temp allocation. Locals occupy
     /// `[0, nactvar)`, temps occupy `[nactvar, freereg)`. Matches Lua 5.5's
     /// `fs->freereg` semantics.
@@ -298,8 +301,14 @@ impl<'gc> Chunk<'gc> {
         i
     }
 
-    /// Resolve jump patches and convert into an immutable Prototype.
-    pub fn assemble(mut self, mc: &Mutation<'gc>) -> Gc<'gc, Prototype<'gc>> {
+    /// Resolve jump patches and convert into an immutable Prototype, with
+    /// its nested functions. `assigned` must be final: it decides which
+    /// upvalues are by value.
+    pub(super) fn assemble(
+        mut self,
+        mc: &Mutation<'gc>,
+        assigned: &Assigned,
+    ) -> Gc<'gc, Prototype<'gc>> {
         // Resolve all jump patches
         for &(instr_idx, label_idx) in &self.jump_patches {
             let target = self.labels[label_idx as usize];
@@ -315,16 +324,45 @@ impl<'gc> Chunk<'gc> {
             instr.set_imm(offset);
         }
 
-        let num_upvalues = self.upvalue_desc.len() as u8;
+        let upvalue_desc: Box<[UpValueDescriptor]> = self
+            .upvalue_desc
+            .iter()
+            .map(|&(source, var)| UpValueDescriptor {
+                source,
+                by_value: !assigned.get(var),
+            })
+            .collect();
+        for instr in &mut self.tape {
+            let by_ref = match instr.op() {
+                Op::GETUPVAL => Op::GETUPVAL_REF,
+                Op::GETTABUP => Op::GETTABUP_REF,
+                Op::SETTABUP => Op::SETTABUP_REF,
+                Op::SETUPVAL => {
+                    debug_assert!(!upvalue_desc[instr.b() as usize].by_value);
+                    continue;
+                }
+                _ => continue,
+            };
+            if !upvalue_desc[instr.b() as usize].by_value {
+                *instr = instr.with_op(by_ref);
+            }
+        }
+
+        let num_upvalues = upvalue_desc.len() as u8;
         debug_assert_eq!(self.tape.len(), self.lineinfo.len());
+        let prototypes = self
+            .prototypes
+            .into_iter()
+            .map(|child| child.assemble(mc, assigned))
+            .collect();
 
         Gc::new(
             mc,
             Prototype {
                 code: crate::env::function::Code::new(self.tape.into_boxed_slice()),
                 constants: self.constants.into_boxed_slice(),
-                prototypes: self.prototypes.into_boxed_slice(),
-                upvalue_desc: self.upvalue_desc.into_boxed_slice(),
+                prototypes,
+                upvalue_desc,
                 num_params: self.arity,
                 is_vararg: self.is_vararg,
                 needs_vararg_table: self.vararg_info.is_some_and(|i| i.needs_table()),

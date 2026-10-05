@@ -1,4 +1,5 @@
-//! Upvalues: open ones follow their slot when the stack moves. Expected
+//! Upvalues: open ones follow their slot when the stack moves, and captures
+//! of variables nothing reassigns are copied into the closure. Expected
 //! values from Lua 5.5.1.
 
 use crate::common::ok;
@@ -57,4 +58,56 @@ fn coroutine_open_upvalue_survives_its_stack_growing() {
          return cat(seen, co())"
     );
     assert_eq!(ok(&src), "11 12");
+}
+
+#[test]
+fn assignment_after_capture_is_seen() {
+    assert_eq!(
+        ok("local x = 1 local f = function() return x end x = 2
+            local y = 1 local g = function() return y end
+            local function h() return function() y = 7 end end h()()
+            return cat(f(), g())"),
+        "2 7"
+    );
+}
+
+#[test]
+fn local_function_captures_itself() {
+    assert_eq!(
+        ok(
+            "local function fact(n) if n <= 1 then return 1 end return n * fact(n - 1) end
+            local function f() return function() return f end end
+            local function r() return r end local first = r r = 42
+            return cat(fact(10), f()() == f, first())"
+        ),
+        "3628800 true 42"
+    );
+}
+
+#[test]
+fn loop_captures_take_each_iteration_value() {
+    assert_eq!(
+        ok("local a, b, c = {}, {}, {}
+            for k, v in ipairs({10, 20, 30}) do a[k] = function() return v end end
+            for k, v in ipairs({10, 20, 30}) do b[k] = function() return v end v = v + 1 end
+            for i = 1, 3 do local x = i c[i] = function() return x end x = x * 10 end
+            return cat(a[2](), b[2](), c[2]())"),
+        "20 21 20"
+    );
+}
+
+#[test]
+fn assigned_env_is_shared() {
+    assert_eq!(
+        ok("local f = load([[
+              local f = function() return y end
+              local g = function() _ENV = {y = 9} end
+              _ENV = {y = 3}
+              local a = f()
+              g()
+              return a, f()
+            ]], 'c', 't', {})
+            return cat(f())"),
+        "3 9"
+    );
 }

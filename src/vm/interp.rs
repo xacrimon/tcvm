@@ -1,7 +1,7 @@
 use crate::dmm::{Gc, Mutation};
 use crate::env::function::{
-    Function, FunctionKind, InlineCache, LuaFn, NativeClosure, NativeKind, Stack, Upvalue,
-    UpvalueCell,
+    Function, FunctionKind, InlineCache, LuaFn, NativeClosure, NativeKind, Stack, UpvalueCell,
+    UpvalueSlot,
 };
 use crate::env::shape::{MAX_PROPERTIES_FAST, MetamethodBits, Shape, mirrored};
 use crate::env::string::LuaString;
@@ -11,7 +11,7 @@ use crate::env::thread::{
     ThreadStatus, frame_flags,
 };
 use crate::env::value::{Value, ValueKind};
-use crate::instruction::{Instruction, Op, TFOR_VARS, UpValueDescriptor};
+use crate::instruction::{Instruction, Op, TFOR_VARS, UpvalSource};
 use crate::lua::Context;
 use crate::vm::num;
 use crate::vm::unwind::Unwound;
@@ -131,6 +131,9 @@ const HANDLERS: [Handler; Op::COUNT] = Op::table([
     (Op::SETTABUP_TRANS, settabup_trans),
     (Op::SETFIELD_ABSENT, setfield_absent),
     (Op::SETTABUP_ABSENT, settabup_absent),
+    (Op::GETUPVAL_REF, op_getupval_ref),
+    (Op::GETTABUP_REF, op_gettabup_ref),
+    (Op::SETTABUP_REF, op_settabup_ref),
 ]);
 
 /// Why an opcode faulted. `impl_error` renders the reference message for
@@ -388,6 +391,8 @@ macro_rules! helpers {
             }};
         }
 
+        /// The closure's upvalue slot `idx`, or the field its descriptor
+        /// says it holds.
         #[allow(unused_macros)]
         macro_rules! upvalue {
             ($$idx:expr) => {{
@@ -395,6 +400,16 @@ macro_rules! helpers {
                     debug_assert!(($$idx as usize) < $closure.upvalues().len());
                     *$closure.upvalue_ptr().add($$idx as usize)
                 }
+            }};
+            (value $$idx:expr) => {{
+                let slot = upvalue!($$idx);
+                debug_assert!($closure.proto.upvalue_desc[$$idx as usize].by_value);
+                unsafe { slot.value }
+            }};
+            (cell $$idx:expr) => {{
+                let slot = upvalue!($$idx);
+                debug_assert!(!$closure.proto.upvalue_desc[$$idx as usize].by_value);
+                unsafe { slot.cell }
             }};
         }
 
@@ -1254,6 +1269,7 @@ extern "rust-preserve-none" fn op_lfalseskip<'gc>(
 // Upvalue access
 // ---------------------------------------------------------------------------
 
+/// R[dst] = UpValue[idx], a by-value upvalue
 #[inline(never)]
 #[rustc_align(32)]
 extern "rust-preserve-none" fn op_getupval<'gc>(
@@ -1269,8 +1285,27 @@ extern "rust-preserve-none" fn op_getupval<'gc>(
 ) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (dst, idx) = instruction.ab();
-    let uv = upvalue!(idx);
-    *reg!(ref mut dst) = read_upvalue(uv);
+    *reg!(ref mut dst) = upvalue!(value idx);
+    dispatch!();
+}
+
+/// R[dst] = UpValue[idx], a shared cell
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn op_getupval_ref<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let (dst, idx) = instruction.ab();
+    *reg!(ref mut dst) = upvalue!(cell idx).get();
     dispatch!();
 }
 
@@ -1290,8 +1325,8 @@ extern "rust-preserve-none" fn op_setupval<'gc>(
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (src, idx) = instruction.ab();
     let val = reg!(src);
-    let uv = upvalue!(idx);
-    write_upvalue(ctx.mutation(), thread, uv, val);
+    let cell = upvalue!(cell idx);
+    UpvalueCell::set(cell, ctx.mutation(), thread.handle(), val);
     dispatch!();
 }
 
@@ -1315,13 +1350,40 @@ extern "rust-preserve-none" fn op_gettabup<'gc>(
 ) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (dst, idx, ic_idx, _key) = instruction.abde();
-    let uv = upvalue!(idx);
-    let t_val = read_upvalue(uv);
-
+    let t_val = upvalue!(value idx);
     let Some(t) = t_val.get_table() else {
         tail!(get_slow);
     };
+    let t_state = t.inner().borrow();
+    if let Some(v) = ic_get(read_ic(closure, ic_idx), t, &t_state) {
+        drop(t_state);
+        *reg!(ref mut dst) = v;
+        dispatch!();
+    }
+    drop(t_state);
+    tail!(get_slow);
+}
 
+/// `op_gettabup` on a shared cell
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn op_gettabup_ref<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let (dst, idx, ic_idx, _key) = instruction.abde();
+    let t_val = upvalue!(cell idx).get();
+    let Some(t) = t_val.get_table() else {
+        tail!(get_slow);
+    };
     let t_state = t.inner().borrow();
     if let Some(v) = ic_get(read_ic(closure, ic_idx), t, &t_state) {
         drop(t_state);
@@ -1348,13 +1410,36 @@ extern "rust-preserve-none" fn op_settabup<'gc>(
 ) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (src, idx, ic_idx, _key) = instruction.abde();
-    let uv = upvalue!(idx);
-    let t_val = read_upvalue(uv);
-
+    let t_val = upvalue!(value idx);
     let Some(t) = t_val.get_table() else {
         tail!(set_slow);
     };
+    if ic_set(ctx, read_ic(closure, ic_idx), t, reg!(src)) {
+        dispatch!();
+    }
+    tail!(set_slow);
+}
 
+/// `op_settabup` on a shared cell
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn op_settabup_ref<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let (src, idx, ic_idx, _key) = instruction.abde();
+    let t_val = upvalue!(cell idx).get();
+    let Some(t) = t_val.get_table() else {
+        tail!(set_slow);
+    };
     if ic_set(ctx, read_ic(closure, ic_idx), t, reg!(src)) {
         dispatch!();
     }
@@ -4228,15 +4313,25 @@ extern "rust-preserve-none" fn op_closure<'gc>(
     let (parent_closure, base) = unsafe { ((*frame).closure, (*frame).base()) };
     let proto = parent_closure.proto.prototypes[proto_idx as usize];
 
-    let func = Function::new_lua(ctx.mutation(), proto, |dst| {
+    let mut self_slot = None;
+    let func = Function::new_lua(ctx.mutation(), proto, |slots| {
         for (i, desc) in proto.upvalue_desc.iter().enumerate() {
-            let uv = match desc {
-                UpValueDescriptor::ParentLocal(idx) => {
-                    let slot = unsafe { thread.stack.as_mut_ptr().add(base + *idx as usize) };
+            let slot = match desc.source {
+                // A local function's capture of itself: its register is
+                // only written below.
+                UpvalSource::ParentLocal(idx) if desc.by_value && idx == dst => {
+                    self_slot = Some(i);
+                    UpvalueSlot {
+                        value: Value::nil(),
+                    }
+                }
+                UpvalSource::ParentLocal(idx) if desc.by_value => UpvalueSlot { value: reg!(idx) },
+                UpvalSource::ParentLocal(idx) => {
+                    let slot = unsafe { thread.stack.as_mut_ptr().add(base + idx as usize) };
                     // Sorted by slot, so this frame's are at the end.
                     let open = &thread.open_upvalues;
                     let below = open.iter().rposition(|uv| uv.slot() <= slot);
-                    match below {
+                    let cell = match below {
                         Some(i) if open[i].slot() == slot => open[i],
                         _ => {
                             let uv = UpvalueCell::new_open(ctx.mutation(), thread.handle(), slot);
@@ -4245,15 +4340,21 @@ extern "rust-preserve-none" fn op_closure<'gc>(
                             unsafe { (*frame).flags |= frame_flags::OPEN_UPVALUES };
                             uv
                         }
-                    }
+                    };
+                    UpvalueSlot { cell }
                 }
-                UpValueDescriptor::ParentUpvalue(idx) => unsafe {
-                    *parent_closure.upvalue_ptr().add(*idx as usize)
-                },
+                UpvalSource::ParentUpvalue(idx) => upvalue!(idx),
             };
-            unsafe { dst.add(i).write(uv) };
+            unsafe { slots.add(i).write(slot) };
         }
     });
+    if let Some(i) = self_slot {
+        // The fresh closure pointing at itself needs no barrier.
+        unsafe {
+            let f = LuaFn::from_function_unchecked(func);
+            (*f.upvalue_ptr().add(i)).value = Value::function(func);
+        }
+    }
     *reg!(ref mut dst) = Value::function(func);
     gc_check!();
     dispatch!();
@@ -4530,21 +4631,6 @@ extern "rust-preserve-none" fn op_stop<'gc>(
 #[inline]
 fn has_tbc_from(thread: &ThreadState<'_>, level: usize) -> bool {
     thread.tbc_list.last().is_some_and(|e| e.pos() >= level)
-}
-
-#[inline(always)]
-fn read_upvalue<'gc>(uv: Upvalue<'gc>) -> Value<'gc> {
-    uv.get()
-}
-
-#[inline(always)]
-fn write_upvalue<'gc>(
-    mc: &Mutation<'gc>,
-    thread: &ThreadState<'gc>,
-    uv: Upvalue<'gc>,
-    val: Value<'gc>,
-) {
-    UpvalueCell::set(uv, mc, thread.handle(), val);
 }
 
 /// Persist the top Lua frame's resume point before leaving the dispatch
@@ -6650,7 +6736,8 @@ extern "rust-preserve-none" fn get_slow<'gc>(
     let op = instruction.op().unquickened();
     let dst = instruction.a();
     let recv = match op {
-        Op::GETTABUP => read_upvalue(upvalue!(instruction.b())),
+        Op::GETTABUP => upvalue!(value instruction.b()),
+        Op::GETTABUP_REF => upvalue!(cell instruction.b()).get(),
         _ => reg!(instruction.b()),
     };
     if op == Op::SELF {
@@ -6701,7 +6788,8 @@ extern "rust-preserve-none" fn set_slow<'gc>(
     let op = instruction.op().unquickened();
     let v = reg!(instruction.a());
     let recv = match op {
-        Op::SETTABUP => read_upvalue(upvalue!(instruction.b())),
+        Op::SETTABUP => upvalue!(value instruction.b()),
+        Op::SETTABUP_REF => upvalue!(cell instruction.b()).get(),
         _ => reg!(instruction.b()),
     };
     if op == Op::SETTABLE {
@@ -6927,7 +7015,7 @@ macro_rules! get_quick {
         reg!($b)
     };
     (@recv upval, $b:ident, $thread:ident) => {
-        read_upvalue(upvalue!($b))
+        upvalue!(value $b)
     };
     // Own and Absent entries only change through `fill_ic`, which
     // requickens; the collector may empty a ProtoLoad one, so that kind is

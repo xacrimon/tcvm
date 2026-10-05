@@ -19,7 +19,7 @@ expression: output
 ; prototype 0:
   ; function (params=0, vararg=false, stack=1, upvalues=2)
   ; upvalues:
-  ;   U0 = local R0
+  ;   U0 = local R0, cell
   ;   U1 = local R1
   ; code:
   0000  [  4]  CLOSURE         R0 P0
