@@ -3027,6 +3027,75 @@ math1_entry!(
     |i| Math1::Small(i)
 );
 
+/// The entry of `pairs` (see `NativeClosure::entry`): for a table without
+/// `__pairs`, `(next, t, nil, nil)` straight into the call's result slots.
+/// Other arguments, a TAILCALL and a call keeping all results go to the
+/// builtin.
+#[inline(never)]
+#[rustc_align(32)]
+pub(crate) extern "rust-preserve-none" fn ff_pairs<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let (func, nargs, returns) = (instruction.a(), instruction.b(), instruction.c());
+    if instruction.op() == Op::TAILCALL || nargs != 2 || returns == 0 {
+        tail!(op_call_native);
+    }
+    let Some(t) = reg!(func + 1).get_table() else {
+        tail!(op_call_native);
+    };
+    if t.shape().has_mm(MetamethodBits::PAIRS) {
+        tail!(op_call_native);
+    }
+    *reg!(ref mut func) = Value::function(ctx.next_fn());
+    // `t` is already in R[func+1].
+    unsafe {
+        fill_nil(
+            registers.add(func as usize + 2),
+            (returns as usize - 1).saturating_sub(2),
+        )
+    };
+    dispatch!();
+}
+
+/// The entry of `ipairs`: `(iterator, v, 0)` straight into the call's
+/// result slots, for one argument, like [`ff_pairs`].
+#[inline(never)]
+#[rustc_align(32)]
+pub(crate) extern "rust-preserve-none" fn ff_ipairs<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let (func, nargs, returns) = (instruction.a(), instruction.b(), instruction.c());
+    if instruction.op() == Op::TAILCALL || nargs != 2 || returns == 0 {
+        tail!(op_call_native);
+    }
+    *reg!(ref mut func) = Value::function(ctx.ipairs_iter());
+    // The argument is already in R[func+1].
+    let wanted = returns as usize - 1;
+    if wanted > 2 {
+        *reg!(ref mut func + 2) = Value::small(0);
+        unsafe { fill_nil(registers.add(func as usize + 3), wanted - 3) };
+    }
+    dispatch!();
+}
+
 /// The `__call` slow path of CALL: walk the metamethod chain, then enter
 /// whatever it resolves to.
 #[inline(never)]
