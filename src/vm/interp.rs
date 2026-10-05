@@ -4,13 +4,13 @@ use crate::env::function::{
 };
 use crate::env::shape::{MAX_PROPERTIES_FAST, MetamethodBits, Shape, mirrored};
 use crate::env::string::LuaString;
-use crate::env::table::{SlotLoc, Table, TableState};
+use crate::env::table::{SlotLoc, Step, Table, TableState};
 use crate::env::thread::{
     CallSite, ExecKind, LuaFrame, PendingAction, TbcEntry, Thread, ThreadState, ThreadStatus,
     frame_flags,
 };
 use crate::env::value::{Value, ValueKind};
-use crate::instruction::{Instruction, Op, UpValueDescriptor};
+use crate::instruction::{Instruction, Op, TFOR_VARS, UpValueDescriptor};
 use crate::lua::Context;
 use crate::vm::num;
 
@@ -198,7 +198,7 @@ pub(crate) enum Continuation {
     /// Skip the comparison's following JMP when the first result's truthiness
     /// differs from `inverted`.
     CondJump { inverted: bool },
-    /// Generic for: `R[base+3 .. base+3+count]` = the results, nil-padded.
+    /// Generic for: its `count` variables = the results, nil-padded.
     TForCall { base: u8, count: u8 },
 }
 
@@ -477,15 +477,15 @@ macro_rules! apply_cont_payload {
                 dispatch!();
             }
             Continuation::TForCall { base, count } => {
-                // Destination registers are `base+3 .. base+3+count`; they must
-                // fit u8 register space.
+                // The loop variables must fit u8 register space.
+                let __vars = base as usize + TFOR_VARS as usize;
                 debug_assert!(
-                    base as usize + 3 + count as usize <= u8::MAX as usize + 1,
+                    __vars + count as usize <= u8::MAX as usize + 1,
                     "TFORCALL destination range exceeds u8 register space",
                 );
                 let __to_copy = __nret.min(count as usize);
                 unsafe {
-                    let dst = $registers.add(base as usize + 3);
+                    let dst = $registers.add(__vars);
                     copy_values(dst, __results, __to_copy);
                     fill_nil(dst.add(__to_copy), count as usize - __to_copy);
                 }
@@ -542,6 +542,38 @@ macro_rules! index_chain_body {
             IndexChain::NotIndexable(__v) => raise!(OpError::Index(__v)),
             IndexChain::Exhausted => raise!(OpError::IndexChainLoop),
         }
+    }};
+}
+
+/// Finish a TFORCALL step taken without calling the iterator: store `(k, v)`
+/// in the loop's variables and take the following TFORLOOP's jump, or once
+/// the walk is done, nil them and step past it. Expects `helpers!(...)` to
+/// have been invoked in the enclosing handler.
+macro_rules! tfor_finish {
+    ($step:expr, $vars:expr, $count:expr, $ip:ident) => {{
+        let __vars: u8 = $vars;
+        let __count: u8 = $count;
+        match $step {
+            Some((__k, __v)) => {
+                *reg!(ref mut __vars) = __k;
+                if __count > 1 {
+                    *reg!(ref mut __vars + 1) = __v;
+                }
+                for __i in 2..__count {
+                    *reg!(ref mut __vars + __i) = Value::nil();
+                }
+                debug_assert_eq!(unsafe { (*$ip).op() }, Op::TFORLOOP);
+                let (_, __offset) = unsafe { *$ip }.a_imm();
+                $ip = unsafe { $ip.add(1).offset(__offset as isize) };
+            }
+            None => {
+                for __i in 0..__count {
+                    *reg!(ref mut __vars + __i) = Value::nil();
+                }
+                $ip = unsafe { $ip.add(1) };
+            }
+        }
+        dispatch!();
     }};
 }
 
@@ -3788,8 +3820,10 @@ extern "rust-preserve-none" fn forloop_slow<'gc>(
 // Generic for loop
 // ---------------------------------------------------------------------------
 
-/// Generic for preparation: swap the control R[base+2] and closing value
-/// R[base+3], mark the closing value to be closed, and jump to the loop test.
+/// Generic for preparation: move the closing value from R[base+3] to
+/// R[base+2], mark it to be closed, clear the position slot R[base+3] (see
+/// `op_tforcall`), move the initial control from R[base+2] to the first loop
+/// variable, and jump to the loop test.
 #[inline(never)]
 #[rustc_align(32)]
 extern "rust-preserve-none" fn op_tforprep<'gc>(
@@ -3805,8 +3839,10 @@ extern "rust-preserve-none" fn op_tforprep<'gc>(
 ) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (base, offset) = instruction.a_imm();
+    let control = reg!(base + 2);
     let closing = reg!(base + 3);
-    *reg!(ref mut base + 3) = reg!(base + 2);
+    *reg!(ref mut base + TFOR_VARS) = control;
+    *reg!(ref mut base + 3) = Value::nil();
     *reg!(ref mut base + 2) = closing;
     if !closing.is_falsy() {
         if ctx.metamethod_of(closing, ctx.symbols().close).is_nil() {
@@ -3822,10 +3858,146 @@ extern "rust-preserve-none" fn op_tforprep<'gc>(
     dispatch!();
 }
 
-/// Generic for call: R[base+3], ... = R[base](R[base+1], R[base+3])
+/// Generic for call: the loop variables = R[base](R[base+1], first variable).
+///
+/// When the iterator is the `next` `pairs` returns, or `ipairs`'s, and the
+/// state is a table, the step is taken without a call, and so is the
+/// following TFORLOOP's jump. This handler takes the steps within the array
+/// part, without a stack frame; `tfor_next` and `tfor_ipairs` the rest.
+/// `next`'s walk keeps its position in R[base+3], so a step doesn't look up
+/// the previous key; like LuaJIT's `ITERN`, it then doesn't follow a key
+/// `debug.setlocal` changes.
 #[inline(never)]
 #[rustc_align(32)]
 extern "rust-preserve-none" fn op_tforcall<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let (base, count) = instruction.ab();
+    let vars = base + TFOR_VARS;
+    let Some(t) = reg!(base + 1).get_table() else {
+        tail!(tforcall_generic);
+    };
+    let iter = reg!(base);
+    let step = if iter.same_bits(&Value::function(ctx.next_fn())) {
+        let Some(pos) = reg!(base + 3).get_small().filter(|&p| p >= 0) else {
+            tail!(tfor_next);
+        };
+        match t.inner().borrow().next_at_inline(pos as u32) {
+            Step::Entry(next, k, v) => {
+                *reg!(ref mut base + 3) = Value::small(next as i32);
+                Some((k, v))
+            }
+            Step::End => None,
+            Step::Slow => tail!(tfor_next),
+        }
+    } else if iter.same_bits(&Value::function(ctx.ipairs_iter()))
+        && let Some(i) = reg!(vars).get_small()
+    {
+        let state = t.inner().borrow();
+        match i.checked_add(1) {
+            Some(k)
+                if let Some(v) = state.array_get(k as usize)
+                    && !v.is_nil() =>
+            {
+                Some((Value::small(k), v))
+            }
+            _ => {
+                drop(state);
+                tail!(tfor_ipairs);
+            }
+        }
+    } else {
+        tail!(tforcall_generic);
+    };
+    tfor_finish!(step, vars, count, ip);
+}
+
+/// [`op_tforcall`]'s `next` step through a part of integer or other keys,
+/// from the start, or past a position that doesn't fit.
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn tfor_next<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let (base, count) = instruction.ab();
+    let vars = base + TFOR_VARS;
+    // `op_tforcall` checked it.
+    let t = reg!(base + 1).get_table();
+    let t = unsafe { t.unwrap_unchecked() };
+    let cursor = reg!(base + 3);
+    let pos = match cursor.get_small() {
+        Some(p) if p >= 0 => p as u32,
+        // Before the first step, unless the loop starts from a key; nil
+        // after a position that doesn't fit, so `next` resumes from the key.
+        None if cursor.is_nil() && reg!(vars).is_nil() => 0,
+        _ => tail!(tforcall_generic),
+    };
+    let step = t.inner().borrow().next_at(ctx.mutation(), pos);
+    let step = step.map(|(next, k, v)| {
+        *reg!(ref mut base + 3) = next.map_or(Value::nil(), |p| Value::small(p as i32));
+        (k, v)
+    });
+    tfor_finish!(step, vars, count, ip);
+}
+
+/// [`op_tforcall`]'s `ipairs` step past the array part: through the integer
+/// keys' hash part, to the end, or to `__index`.
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn tfor_ipairs<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let (base, count) = instruction.ab();
+    let vars = base + TFOR_VARS;
+    // `op_tforcall` checked it.
+    let t = reg!(base + 1).get_table();
+    let t = unsafe { t.unwrap_unchecked() };
+    let i = reg!(vars).get_small();
+    let i = unsafe { i.unwrap_unchecked() } as i64 + 1;
+    let state = t.inner().borrow();
+    let v = state.get_int(i);
+    let step = if !v.is_nil() {
+        Some((Value::integer(ctx.mutation(), i), v))
+    } else if state.shape().has_mm(MetamethodBits::INDEX) {
+        drop(state);
+        tail!(tforcall_generic);
+    } else {
+        None
+    };
+    tfor_finish!(step, vars, count, ip);
+}
+
+/// [`op_tforcall`] by calling the iterator.
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn tforcall_generic<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
@@ -3840,13 +4012,13 @@ extern "rust-preserve-none" fn op_tforcall<'gc>(
     let (base, count) = instruction.ab();
     let iter = reg!(base);
     let state = reg!(base + 1);
-    let control = reg!(base + 3);
+    let control = reg!(base + TFOR_VARS);
     let cont = Continuation::TForCall { base, count };
     invoke_metamethod!(iter, &[state, control], cont);
 }
 
-/// Generic for loop test: if the control R[base+3] != nil, jump back to the
-/// body.
+/// Generic for loop test: if the first loop variable != nil, jump back to
+/// the body.
 #[inline(never)]
 #[rustc_align(32)]
 extern "rust-preserve-none" fn op_tforloop<'gc>(
@@ -3862,7 +4034,7 @@ extern "rust-preserve-none" fn op_tforloop<'gc>(
 ) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (base, offset) = instruction.a_imm();
-    if !reg!(base + 3).is_nil() {
+    if !reg!(base + TFOR_VARS).is_nil() {
         ip = unsafe { ip.offset(offset as isize) };
     }
     dispatch!();

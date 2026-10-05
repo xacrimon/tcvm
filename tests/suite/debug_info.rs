@@ -111,7 +111,8 @@ fn loop_control_slots_are_recorded() {
         let proto = chunk.as_lua().unwrap().proto;
         let names: Vec<&[u8]> = proto.locvars.iter().map(|v| v.name.as_bytes()).collect();
         let fs = &b"(for state)"[..];
-        assert_eq!(names, [fs, fs, fs, b"i", fs, fs, fs, b"k", b"v"]);
+        // A generic loop has a fourth, for its traversal position (`TFOR_VARS`).
+        assert_eq!(names, [fs, fs, fs, b"i", fs, fs, fs, fs, b"k", b"v"]);
         // Control slots live from FORPREP (pc 4) through FORLOOP (pc 5);
         // the visible variable only inside the (empty) body.
         assert_eq!((proto.locvars[0].start_pc, proto.locvars[0].end_pc), (4, 6));

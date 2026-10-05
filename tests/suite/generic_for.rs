@@ -1,7 +1,7 @@
 //! Execution coverage for the generic `for ... in ... do` loop: the control
 //! register layout (TFORCALL/TFORLOOP) and multi-value iterator adjustment.
 
-use crate::common::{err, eval};
+use crate::common::{err, eval, ok};
 
 fn run(src: &str) -> i64 {
     eval(src)
@@ -101,4 +101,158 @@ fn iterator_call_line() {
         err("for k in\n(\n 3) do end"),
         "c:2: attempt to call a number value"
     );
+}
+
+/// `pairs` walks without calling `next` (see `op_tforcall`), in exactly
+/// `next`'s order, through every part: array (with key 0 and holes), integer
+/// and other hash keys, named slots inline and spilled, dict-mode strings.
+#[test]
+fn pairs_walks_every_part_in_next_order() {
+    let src = r#"
+local function same_order(t)
+  local a, b = {}, {}
+  for k, v in pairs(t) do a[#a + 1] = tostring(k) .. '=' .. tostring(v) end
+  local k, v = next(t)
+  while k ~= nil do b[#b + 1] = tostring(k) .. '=' .. tostring(v) k, v = next(t, k) end
+  return table.concat(a, ',') == table.concat(b, ',') and #a
+end
+local named = load('local t = {} ' .. (function()
+  local s = {} for i = 1, 40 do s[i] = 't.f' .. i .. ' = ' .. i end return table.concat(s, ' ')
+end)() .. ' return t')()
+local dict = {} for i = 1, 100 do dict['k' .. i] = i end
+local mixed = {1, 2, nil, 4, a = 1, b = 2, [10] = 10, [-3] = 3, [1.5] = 1, [true] = 2}
+mixed[{}] = 3 mixed[0] = 0
+for i = 1, 80 do mixed['m' .. i] = i end
+local out = {}
+for _, t in ipairs({{}, {1, nil, 3, [0] = 0}, {[10] = 1, [1000] = 2, [-5] = 3},
+                    {[1.5] = 1, [true] = 2, [false] = 3}, {a = 1, b = 2, c = 3}, named, dict, mixed}) do
+  out[#out + 1] = tostring(same_order(t))
+end
+return table.concat(out, ' ')
+"#;
+    assert_eq!(ok(src), "0 3 3 3 3 40 100 91");
+}
+
+/// Clearing or updating existing fields mid-traversal, which Lua allows,
+/// visits every key once.
+#[test]
+fn pairs_survives_clears_and_updates() {
+    let src = r#"
+local function tables()
+  local named = {} for i = 1, 40 do named['f' .. i] = i end
+  local dict = {} for i = 1, 100 do dict['k' .. i] = i end
+  return {{1, 2, 3, 4}, {[10] = 1, [1000] = 2, [-5] = 3}, {a = 1, b = 2, c = 3}, named, dict,
+          {1, 2, a = 1, [2.5] = 1, [true] = 1, [100] = 1}}
+end
+local out = {}
+for _, t in ipairs(tables()) do
+  local n = 0
+  for k in pairs(t) do t[k] = nil n = n + 1 end
+  out[#out + 1] = n .. '/' .. tostring(next(t))
+end
+for _, t in ipairs(tables()) do
+  local n, sum = 0, 0
+  for k, v in pairs(t) do t[k] = v * 2 n = n + 1 end
+  for _, v in pairs(t) do sum = sum + v end
+  out[#out + 1] = n .. ':' .. sum
+end
+return table.concat(out, ' ')
+"#;
+    assert_eq!(
+        ok(src),
+        "4/nil 3/nil 3/nil 40/nil 100/nil 6/nil 4:20 3:12 3:12 40:1640 100:10100 6:14"
+    );
+}
+
+/// The forms around the walk: a loop started from a key, `next` under
+/// another name, `__pairs`, a closing value, extra and single variables,
+/// nested walks of one table, and a walk that yields.
+#[test]
+fn next_loop_forms() {
+    let src = r#"
+local out = {}
+local t = {10, 20, 30}
+local s = {}
+for k, v in next, t, 1 do s[#s + 1] = k .. '=' .. v end
+out[#out + 1] = table.concat(s, ',')
+local n = next
+s = {}
+for k, v in n, {5, 6} do s[#s + 1] = k .. '=' .. v end
+out[#out + 1] = table.concat(s, ',')
+local p = setmetatable({}, {__pairs = function(t) return next, {7, 8}, nil end})
+s = {}
+for k, v in pairs(p) do s[#s + 1] = k .. '=' .. v end
+out[#out + 1] = table.concat(s, ',')
+local closed = 0
+local c = setmetatable({}, {__close = function() closed = closed + 1 end})
+for k in next, {1, 2, 3}, nil, c do end
+for k in next, {1, 2, 3}, nil, c do break end
+out[#out + 1] = closed
+for k, v, x in pairs({1}) do out[#out + 1] = cat(k, v, x) end
+for k in pairs({a = 1}) do out[#out + 1] = k end
+s = {}
+local u = {a = 1, b = 2, c = 3}
+for k1 in pairs(u) do for k2 in pairs(u) do s[#s + 1] = k1 .. k2 end end
+table.sort(s)
+out[#out + 1] = table.concat(s, ',')
+local co = coroutine.wrap(function()
+  for k, v in pairs({a = 1, b = 2, c = 3, 4, 5}) do coroutine.yield(tostring(k) .. v) end
+end)
+s = {}
+for _ = 1, 5 do s[#s + 1] = co() end
+table.sort(s)
+out[#out + 1] = table.concat(s, ',')
+return table.concat(out, ' | ')
+"#;
+    assert_eq!(
+        ok(src),
+        "2=20,3=30 | 1=5,2=6 | 1=7,2=8 | 2 | 1 1 nil | a | aa,ab,ac,ba,bb,bc,ca,cb,cc | 14,25,a1,b2,c3"
+    );
+}
+
+/// `ipairs` without a call: through the array part, the integer hash keys,
+/// `__index`, and a hole made mid-loop.
+#[test]
+fn ipairs_walks() {
+    let src = r#"
+local out = {}
+local function walk(t)
+  local s = {}
+  for i, v in ipairs(t) do s[#s + 1] = i .. '=' .. tostring(v) end
+  return table.concat(s, ',')
+end
+out[#out + 1] = walk({1, 2, nil, 4})
+out[#out + 1] = walk({[1] = 'a', [2] = 'b', [3] = 'c'})
+local h = {} h[3] = 3 h[2] = 2 h[1] = 1
+out[#out + 1] = walk(h)
+out[#out + 1] = walk(setmetatable({1, 2}, {__index = function(_, i) if i <= 4 then return i * 10 end end}))
+out[#out + 1] = walk(setmetatable({}, {__index = {'x', 'y'}}))
+local t = {1, 2, 3, 4, 5}
+local s = {}
+for i, v in ipairs(t) do s[#s + 1] = v if i == 2 then t[4] = nil end end
+out[#out + 1] = table.concat(s, ',')
+s = {}
+for i, v, x in ipairs({9}) do s[#s + 1] = cat(i, v, x) end
+out[#out + 1] = table.concat(s, ',')
+return table.concat(out, ' | ')
+"#;
+    assert_eq!(
+        ok(src),
+        "1=1,2=2 | 1=a,2=b,3=c | 1=1,2=2,3=3 | 1=1,2=2,3=30,4=40 | 1=x,2=y | 1,2,3 | 1 9 nil"
+    );
+}
+
+/// Adding keys mid-traversal is undefined in Lua; the walk must still end
+/// without reading out of bounds.
+#[test]
+fn pairs_over_a_growing_table_stays_in_bounds() {
+    let src = r#"
+local t = {} for i = 1, 10 do t['k' .. i] = i end
+local n = 0
+pcall(function()
+  for k in pairs(t) do n = n + 1 if n < 200 then t['x' .. n] = n t[n] = n end end
+end)
+return tostring(n > 0)
+"#;
+    assert_eq!(ok(src), "true");
 }
