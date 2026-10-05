@@ -409,7 +409,7 @@ fn lua_pairs<'gc>(
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     util::check_any(ctx, &stack, "pairs", 1)?;
     let t = stack.get(0);
-    let mm = ctx.metamethod_of(t, ctx.symbols().mm_pairs);
+    let mm = ctx.mm_of(t, MetamethodBits::PAIRS);
     if mm.is_nil() {
         stack.replace(&[closure.upvalues[0], t, Value::nil(), Value::nil()]);
         return Ok(CallbackAction::Return);
@@ -483,7 +483,7 @@ fn lua_print<'gc>(
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let n = stack.len();
     let has_tostring = |i| {
-        !ctx.metamethod_of(stack.get(i), ctx.symbols().mm_tostring)
+        !ctx.mm_of(stack.get(i), MetamethodBits::TOSTRING)
             .is_nil()
     };
     if !(0..n).any(has_tostring) {
@@ -717,7 +717,7 @@ fn lua_tostring<'gc>(
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     util::check_any(ctx, &stack, "tostring", 1)?;
     let v = stack.get(0);
-    let mm = ctx.metamethod_of(v, ctx.symbols().mm_tostring);
+    let mm = ctx.mm_of(v, MetamethodBits::TOSTRING);
     if mm.is_nil() {
         stack.ret1(Value::string(util::basic_tostring(ctx, v)));
         return Ok(CallbackAction::Return);
