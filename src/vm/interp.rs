@@ -3408,7 +3408,16 @@ extern "rust-preserve-none" fn op_tailcall_native<'gc>(
     } else {
         nargs as usize - 1
     };
-    let action = match invoke_native(ctx, thread, nc, args_base, argc) {
+    let r = match nc.function {
+        // A plain native's result comes back in a register: keep its path
+        // free of `CallbackAction`.
+        NativeKind::Plain(f) => match invoke_plain(ctx, thread, f, nc, args_base, argc) {
+            Ok(()) => Ok(crate::vm::native::CallbackAction::Return),
+            Err(e) => Err(e),
+        },
+        _ => invoke_native(ctx, thread, nc, args_base, argc),
+    };
+    let action = match r {
         Ok(a) => a,
         Err(err) => {
             // The message still names the tailcalling Lua frame (a native
