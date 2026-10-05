@@ -1,5 +1,7 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::mem;
+use std::rc::Rc;
 
 use cstree::interning::TokenInterner;
 use foldhash::fast::RandomState;
@@ -11,7 +13,7 @@ use crate::env::function::{LocVar, Template};
 use crate::env::{LuaString, Prototype, value::Value};
 use crate::instruction::{
     IcIdx, Imm, Instruction, KIdx, Op, ProtoIdx, Reg, Shape, TFOR_VARS, TemplateIdx, UpIdx,
-    UpValueDescriptor,
+    UpvalSource,
 };
 use crate::lua;
 use crate::parser::LineMap;
@@ -376,13 +378,14 @@ trait UpvalueResolver<'gc> {
 /// Result of resolving a name from a child function's perspective. A
 /// `Const` short-circuits the upvalue chain entirely — the value is
 /// inlined at the child's reference site without registering an upvalue
-/// at any intermediate level. An `Upvalue` carries the `UpValueDescriptor`
+/// at any intermediate level. An `Upvalue` carries the `UpvalSource`
 /// the child should add to its own upvalue list.
 enum ChildResolution<'gc> {
     Const(ConstVal<'gc>),
     Upvalue {
-        desc: UpValueDescriptor,
+        desc: UpvalSource,
         readonly: bool,
+        var: VarId,
     },
 }
 
@@ -390,9 +393,37 @@ enum ChildResolution<'gc> {
 struct UpvalueEntry {
     /// Kept so children can look entries up by name.
     name: String,
-    desc: UpValueDescriptor,
+    desc: UpvalSource,
     /// Assignment is "attempt to assign to const variable".
     readonly: bool,
+    /// The local it captures, at whatever level it lives.
+    var: VarId,
+}
+
+/// A local variable of the chunk, by declaration: an index into
+/// [`Assigned`].
+pub(super) type VarId = u32;
+
+/// Per local of the chunk, whether anything assigns it after its
+/// declaration. Final once the chunk is compiled, when it decides which
+/// upvalues are by value (see `Chunk::assemble`).
+#[derive(Clone, Default)]
+pub(super) struct Assigned(Rc<RefCell<Vec<bool>>>);
+
+impl Assigned {
+    fn new_var(&self) -> VarId {
+        let mut v = self.0.borrow_mut();
+        v.push(false);
+        (v.len() - 1) as VarId
+    }
+
+    fn mark(&self, var: VarId) {
+        self.0.borrow_mut()[var as usize] = true;
+    }
+
+    pub(super) fn get(&self, var: VarId) -> bool {
+        self.0.borrow()[var as usize]
+    }
 }
 
 /// Result of resolving a name in the current function. `Const` is the
@@ -461,8 +492,11 @@ struct Ctx<'gc, 'a> {
     /// free variable.
     capture: Option<&'a mut dyn UpvalueResolver<'gc>>,
     /// This function's upvalue list. Flattened to
-    /// `Chunk::upvalue_desc: Box<[UpValueDescriptor]>` at assembly time.
+    /// `Chunk::upvalue_desc` at the end of the function.
     upvalues: Vec<UpvalueEntry>,
+    assigned: Assigned,
+    /// The variable each register holds while a local is active in it.
+    reg_var: Box<[VarId; 256]>,
 
     /// Lua 5.5 global-declaration state, currently in scope. Owned per
     /// function; nested functions receive a clone (see `compile_nested`).
@@ -1293,6 +1327,11 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         if !matches!(kind, VarKind::Global | VarKind::CompileTime(_)) {
             self.record_locvar(&name)?;
         }
+        if let VarKind::Reg(r) | VarKind::Const(r) | VarKind::ToClose(r) | VarKind::VarargParam(r) =
+            kind
+        {
+            self.reg_var[r.0 as usize] = self.assigned.new_var();
+        }
         self.decls.push(name.clone());
         let scope = self.scope.last_mut().ok_or_else(|| ice("missing scope"))?;
         scope.insert(name, kind);
@@ -1538,8 +1577,12 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         Ok(match parent.resolve_for_child(name, self.cur_line)? {
             None => None,
             Some(ChildResolution::Const(v)) => Some(ResolvedName::Const(v)),
-            Some(ChildResolution::Upvalue { desc, readonly }) => {
-                let i = self.add_upvalue(name, desc, readonly, self.cur_line)?;
+            Some(ChildResolution::Upvalue {
+                desc,
+                readonly,
+                var,
+            }) => {
+                let i = self.add_upvalue(name, desc, readonly, var, self.cur_line)?;
                 Some(ResolvedName::Upvalue(i))
             }
         })
@@ -1549,8 +1592,9 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     fn add_upvalue(
         &mut self,
         name: &str,
-        desc: UpValueDescriptor,
+        desc: UpvalSource,
         readonly: bool,
+        var: VarId,
         line: u32,
     ) -> Result<u8, CompileError> {
         let i = self.upvalues.len();
@@ -1564,6 +1608,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             name: name.to_owned(),
             desc,
             readonly,
+            var,
         });
         Ok(i as u8)
     }
@@ -1612,15 +1657,17 @@ impl<'gc, 'a> UpvalueResolver<'gc> for Ctx<'gc, 'a> {
                 self.scope_marks[depth].captured = true;
             }
             return Ok(Some(ChildResolution::Upvalue {
-                desc: UpValueDescriptor::ParentLocal(register.0),
+                desc: UpvalSource::ParentLocal(register.0),
                 readonly: kind.is_readonly(),
+                var: self.reg_var[register.0 as usize],
             }));
         }
         // 2. Already captured in our upvalue list?
         if let Some(i) = self.upvalues.iter().position(|u| u.name == name) {
             return Ok(Some(ChildResolution::Upvalue {
-                desc: UpValueDescriptor::ParentUpvalue(i as u8),
+                desc: UpvalSource::ParentUpvalue(i as u8),
                 readonly: self.upvalues[i].readonly,
+                var: self.upvalues[i].var,
             }));
         }
         // 3. Cascade. If a deeper ancestor resolves to a `Const`, we
@@ -1634,11 +1681,16 @@ impl<'gc, 'a> UpvalueResolver<'gc> for Ctx<'gc, 'a> {
         Ok(match parent.resolve_for_child(name, line)? {
             None => None,
             Some(ChildResolution::Const(v)) => Some(ChildResolution::Const(v)),
-            Some(ChildResolution::Upvalue { desc, readonly }) => {
-                let i = self.add_upvalue(name, desc, readonly, line)?;
+            Some(ChildResolution::Upvalue {
+                desc,
+                readonly,
+                var,
+            }) => {
+                let i = self.add_upvalue(name, desc, readonly, var, line)?;
                 Some(ChildResolution::Upvalue {
-                    desc: UpValueDescriptor::ParentUpvalue(i),
+                    desc: UpvalSource::ParentUpvalue(i),
                     readonly,
+                    var,
                 })
             }
         })
@@ -1697,6 +1749,8 @@ pub fn compile<'gc>(
     // nested functions inherit a clone of whatever is in scope at their
     // definition site (see `compile_nested`).
     let globals = GlobalEnv::new();
+    let assigned = Assigned::default();
+    let env_var = assigned.new_var();
     let chunk = compile_function_to_chunk(
         ctx,
         lines,
@@ -1721,12 +1775,14 @@ pub fn compile<'gc>(
         // cascading ParentUpvalue(0).
         vec![UpvalueEntry {
             name: "_ENV".to_owned(),
-            desc: UpValueDescriptor::ParentLocal(0),
+            desc: UpvalSource::ParentLocal(0),
             readonly: false,
+            var: env_var,
         }],
         globals,
+        assigned.clone(),
     )?;
-    Ok(chunk.assemble(ctx.mutation()))
+    Ok(chunk.assemble(ctx.mutation(), &assigned))
 }
 
 /// Compile a function body into a Chunk (not yet assembled).
@@ -1745,6 +1801,7 @@ fn compile_function_to_chunk<'gc, 'a>(
     span: FuncLines,
     initial_upvalues: Vec<UpvalueEntry>,
     globals: GlobalEnv,
+    assigned: Assigned,
 ) -> Result<Chunk<'gc>, CompileError> {
     let mut chunk = Chunk::new(source);
     chunk.is_vararg = is_vararg;
@@ -1768,6 +1825,8 @@ fn compile_function_to_chunk<'gc, 'a>(
         decls: Vec::new(),
         capture: parent_capture,
         upvalues: initial_upvalues,
+        assigned,
+        reg_var: Box::new([VarId::MAX; 256]),
         globals,
         table_hint: None,
         scope_globals: Vec::new(),
@@ -1852,9 +1911,11 @@ fn compile_function_to_chunk<'gc, 'a>(
 
     // Flatten the named upvalue list into the chunk's descriptor array.
     let lua_ctx = ctx.ctx;
-    let (names, descs): (Vec<_>, Vec<_>) =
-        ctx.upvalues.into_iter().map(|u| (u.name, u.desc)).unzip();
-    ctx.chunk.upvalue_desc = descs;
+    let mut names = Vec::with_capacity(ctx.upvalues.len());
+    for u in ctx.upvalues {
+        names.push(u.name);
+        ctx.chunk.upvalue_desc.push((u.desc, u.var));
+    }
     ctx.chunk.upvalue_names = names
         .iter()
         .map(|n| LuaString::new(lua_ctx, n.as_bytes()))
@@ -2018,6 +2079,9 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
 
         let func_reg = compile_func_body(ctx, &func, Some(reg))?;
         if func_reg != reg {
+            // The closure saw the register before this store, so a capture
+            // of it can't be by value (CLOSURE's self-capture needs `reg`).
+            ctx.assigned.mark(ctx.reg_var[reg.0 as usize]);
             ctx.emit(Instruction::mov(reg, func_reg));
         }
         // The local is bound early so the body can recurse, but debug info
@@ -2671,10 +2735,12 @@ fn compile_lvalue(
                 let VarKind::Reg(dst) = kind else {
                     return Err(ctx.err(CompileErrorKind::ConstAssign(name.to_owned())));
                 };
+                ctx.assigned.mark(ctx.reg_var[dst.0 as usize]);
                 Ok(Lvalue::Local { dst })
             } else if !shadow_global && let Some(resolution) = ctx.resolve_or_capture(name)? {
                 match resolution {
                     ResolvedName::Upvalue(idx) if !ctx.upvalues[idx as usize].readonly => {
+                        ctx.assigned.mark(ctx.upvalues[idx as usize].var);
                         Ok(Lvalue::Upvalue { idx })
                     }
                     _ => Err(ctx.err(CompileErrorKind::ConstAssign(name.to_owned()))),
@@ -2935,7 +3001,7 @@ fn compile_nested<'gc>(
     is_vararg: bool,
     vararg_name: Option<String>,
     span: FuncLines,
-) -> Result<Gc<'gc, Prototype<'gc>>, CompileError> {
+) -> Result<Chunk<'gc>, CompileError> {
     let arity = params.len() as u8;
     let lua_ctx = ctx.ctx;
     let interner = ctx.interner;
@@ -2945,9 +3011,10 @@ fn compile_nested<'gc>(
     // but mutates its own copy — its `global` decls don't leak back to the
     // parent or to sibling functions (`manual.of:245-249`).
     let globals = ctx.globals.clone();
+    let assigned = ctx.assigned.clone();
     let parent: &mut dyn UpvalueResolver<'gc> = ctx;
 
-    let chunk = compile_function_to_chunk(
+    compile_function_to_chunk(
         lua_ctx,
         lines,
         interner,
@@ -2961,9 +3028,8 @@ fn compile_nested<'gc>(
         span,
         Vec::new(),
         globals,
-    )?;
-
-    Ok(chunk.assemble(lua_ctx.mutation()))
+        assigned,
+    )
 }
 
 // ---------------------------------------------------------------------------

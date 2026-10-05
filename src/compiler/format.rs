@@ -1,5 +1,5 @@
 use crate::env::{Prototype, Value};
-use crate::instruction::{Instruction, Op, UpValueDescriptor};
+use crate::instruction::{Instruction, Op, UpvalSource};
 
 pub fn format_prototype(proto: &Prototype<'_>) -> String {
     let mut out = String::new();
@@ -25,9 +25,14 @@ fn format_prototype_into(out: &mut String, proto: &Prototype<'_>, depth: usize) 
     if !proto.upvalue_desc.is_empty() {
         out.push_str(&format!("{indent}; upvalues:\n"));
         for (i, desc) in proto.upvalue_desc.iter().enumerate() {
-            let desc_str = match desc {
-                UpValueDescriptor::ParentLocal(r) => format!("local R{r}"),
-                UpValueDescriptor::ParentUpvalue(u) => format!("upvalue U{u}"),
+            let source = match desc.source {
+                UpvalSource::ParentLocal(r) => format!("local R{r}"),
+                UpvalSource::ParentUpvalue(u) => format!("upvalue U{u}"),
+            };
+            let desc_str = if desc.by_value {
+                source
+            } else {
+                format!("{source}, cell")
             };
             out.push_str(&format!("{indent};   U{i} = {desc_str}\n"));
         }
@@ -99,6 +104,24 @@ fn format_instruction(instr: &Instruction, proto: &Prototype<'_>) -> String {
         Op::GETUPVAL => {
             let (dst, idx) = instr.ab();
             format!("GETUPVAL        R{dst} U{idx}")
+        }
+        Op::GETUPVAL_REF => {
+            let (dst, idx) = instr.ab();
+            format!("GETUPVAL_REF    R{dst} U{idx}")
+        }
+        Op::GETTABUP_REF => {
+            let (dst, idx, _, key) = instr.abde();
+            format!(
+                "GETTABUP_REF    R{dst} U{idx} K{key}{}",
+                const_comment(constants, key)
+            )
+        }
+        Op::SETTABUP_REF => {
+            let (src, idx, _, key) = instr.abde();
+            format!(
+                "SETTABUP_REF    R{src} U{idx} K{key}{}",
+                const_comment(constants, key)
+            )
         }
         Op::SETUPVAL => {
             let (src, idx) = instr.ab();

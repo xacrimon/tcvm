@@ -209,6 +209,14 @@ pub struct UpvalueCell<'gc> {
 
 pub type Upvalue<'gc> = Gc<'gc, UpvalueCell<'gc>>;
 
+/// A Lua closure's upvalue: the value itself if its descriptor is
+/// `by_value`, else the cell it shares.
+#[derive(Clone, Copy)]
+pub union UpvalueSlot<'gc> {
+    pub(crate) value: Value<'gc>,
+    pub(crate) cell: Upvalue<'gc>,
+}
+
 // SAFETY: `closed` and `thread` are the only Gc pointers, and every write that
 // may make either hold a new one goes through a barrier on the cell.
 unsafe impl<'gc> Collect<'gc> for UpvalueCell<'gc> {
@@ -321,7 +329,7 @@ pub struct LuaClosure<'gc> {
 }
 
 impl<'gc> LuaClosure<'gc> {
-    pub fn upvalues(&self) -> &[Upvalue<'gc>] {
+    pub fn upvalues(&self) -> &[UpvalueSlot<'gc>] {
         // SAFETY: a `LuaClosure` only exists as a `FunctionKind::Lua`, allocated
         // with its upvalues after it (`Function::new_lua`).
         unsafe {
@@ -621,7 +629,7 @@ impl<'gc, 'a> std::ops::Index<usize> for Stack<'gc, 'a> {
 #[collect(internal, no_drop)]
 pub struct Function<'gc>(Gc<'gc, FunctionKind<'gc>>);
 
-/// Followed in its cell by the closure's upvalues: `Upvalue`s for a Lua
+/// Followed in its cell by the closure's upvalues: `UpvalueSlot`s for a Lua
 /// closure, `Value`s for a native.
 pub enum FunctionKind<'gc> {
     /// Inline, not behind another `Gc`: CALL reaches the closure's `code`
@@ -637,7 +645,16 @@ unsafe impl<'gc> Collect<'gc> for FunctionKind<'gc> {
         match self {
             FunctionKind::Lua(c) => {
                 cc.trace(&c.proto);
-                cc.trace(c.upvalues());
+                for (slot, desc) in c.upvalues().iter().zip(&c.proto.upvalue_desc) {
+                    // SAFETY: `by_value` says which field CLOSURE wrote.
+                    unsafe {
+                        if desc.by_value {
+                            cc.trace(&slot.value);
+                        } else {
+                            cc.trace(&slot.cell);
+                        }
+                    }
+                }
             }
             FunctionKind::Native(c) => cc.trace(c.upvalues()),
         }
@@ -656,7 +673,7 @@ unsafe impl<'gc> crate::dmm::TrailingBytes for FunctionKind<'gc> {
     }
 }
 
-const _: () = assert!(size_of::<Upvalue<'static>>() == 8 && size_of::<Value<'static>>() == 8);
+const _: () = assert!(size_of::<UpvalueSlot<'static>>() == 8 && size_of::<Value<'static>>() == 8);
 
 /// A `Function` known to hold a Lua closure. Derefs to the closure without
 /// re-checking the kind, so frames can keep one pointer and still reach
@@ -680,7 +697,7 @@ impl<'gc> LuaFn<'gc> {
 
     /// The first upvalue: a constant offset from the closure.
     #[inline(always)]
-    pub(crate) fn upvalue_ptr(self) -> *mut Upvalue<'gc> {
+    pub(crate) fn upvalue_ptr(self) -> *mut UpvalueSlot<'gc> {
         Gc::trailing_ptr(self.0).cast().as_ptr()
     }
 
@@ -709,12 +726,12 @@ impl<'gc> std::ops::Deref for LuaFn<'gc> {
 
 impl<'gc> Function<'gc> {
     /// A Lua closure of `proto`, `init` writing its `proto.num_upvalues`
-    /// upvalues.
+    /// upvalues, each the field `proto.upvalue_desc` says.
     #[inline]
     pub fn new_lua(
         mc: &Mutation<'gc>,
         proto: Gc<'gc, Prototype<'gc>>,
-        init: impl FnOnce(*mut Upvalue<'gc>),
+        init: impl FnOnce(*mut UpvalueSlot<'gc>),
     ) -> Self {
         let closure = LuaClosure {
             proto,
