@@ -26,7 +26,7 @@ expression: output
 0011  [  5]  GETFIELD        R1 R0 K0  ; "inner"
 0012  [  5]  CLOSURE         R2 P3
 0013  [  5]  SETFIELD        R2 R1 K4  ; "plain"
-0014  [  5]  RETURN0
+0014  [  5]  RETURN          R0 count=1
 
 ; prototype 0:
   ; function (params=1, vararg=false, stack=2, upvalues=0)

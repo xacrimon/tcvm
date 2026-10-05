@@ -30,4 +30,4 @@ expression: output
 0013  [  5]  MOVE            R1 R4
 0014  [  5]  MOVE            R0 R6
 0015  [  6]  ADDI            R2 R5 #1
-0016  [  6]  RETURN0
+0016  [  6]  RETURN          R0 count=1

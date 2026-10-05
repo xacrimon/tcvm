@@ -16,4 +16,4 @@ expression: output
 0003  [  7]  LEN             R1 R1
 0004  [  9]  SETTABUP        R0 U0 K1  ; "b"
 0005  [ 10]  SETTABUP        R1 U0 K2  ; "c"
-0006  [ 10]  RETURN0
+0006  [ 10]  RETURN          R0 count=1

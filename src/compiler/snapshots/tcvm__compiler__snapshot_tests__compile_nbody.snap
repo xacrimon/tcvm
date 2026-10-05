@@ -163,7 +163,7 @@ expression: output
 0118  [123]  CALL            R16 args=0 ret=2
 0119  [123]  LOAD            R17 K33  ; "\n"
 0120  [123]  CALL            R15 args=3 ret=1
-0121  [123]  RETURN0
+0121  [123]  RETURN          R0 count=1
 
 ; prototype 0:
   ; function (params=3, vararg=false, stack=29, upvalues=1)

@@ -39,7 +39,7 @@ expression: output
 0024  [ 26]  MOVE            R7 R6
 0025  [ 26]  MOVE            R8 R0
 0026  [ 26]  CALL            R7 args=2 ret=1
-0027  [ 28]  RETURN1         R2
+0027  [ 28]  RETURN          R2 count=2
 
 ; prototype 0:
   ; function (params=1, vararg=false, stack=1, upvalues=0)

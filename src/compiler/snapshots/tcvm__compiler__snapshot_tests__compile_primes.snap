@@ -35,7 +35,7 @@ expression: output
 0020  [ 23]  GETTABUP        R4 U0 K4  ; "print"
 0021  [ 23]  MOVE            R5 R3
 0022  [ 23]  CALL            R4 args=2 ret=1
-0023  [ 23]  RETURN0
+0023  [ 23]  RETURN          R0 count=1
 
 ; prototype 0:
   ; function (params=1, vararg=false, stack=6, upvalues=0)
