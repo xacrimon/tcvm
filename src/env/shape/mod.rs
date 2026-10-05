@@ -17,6 +17,7 @@
 
 use core::cell::{Cell, UnsafeCell};
 use core::mem::MaybeUninit;
+use core::ptr::NonNull;
 
 use bitflags::bitflags;
 use hashbrown::{HashTable, hash_table};
@@ -26,6 +27,7 @@ use crate::dmm::barrier::unlock;
 use crate::dmm::{Collect, Gc, GcWeak, Lock, Mutation, RefLock, Trace};
 use crate::env::for_each_metamethod;
 use crate::env::string::LuaString;
+use crate::env::table::Table;
 use crate::env::value::Value;
 
 /// V8-style "Map" / hidden class. Copy wrapper over a single Gc pointer
@@ -206,6 +208,12 @@ macro_rules! emit_byte_table {
     };
 }
 for_each_metamethod!(emit_byte_table);
+
+/// Whether a store of `key` to a metatable changes its [`MtCache`].
+pub fn mirrored(key: LuaString<'_>) -> bool {
+    let name = key.as_bytes();
+    name == b"__mode" || metamethod_bit_of_bytes(name).is_some()
+}
 
 /// Map a key's bytes to its metamethod bit, if any. Cheap match-on-bytes
 /// lookup — no `Context`/`State` access needed, callable from any
@@ -420,6 +428,11 @@ impl WeakMode {
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub struct MtCacheData<'gc> {
+    /// The metatable this caches, untraced so that a shape held by an IC
+    /// doesn't keep it alive: only tables whose shape carries this cache
+    /// read it, and each of them marks it.
+    #[collect(require_static)]
+    table: NonNull<()>,
     #[collect(require_static)]
     pub bits: Cell<MetamethodBits>,
     /// Read by the collector when it traces a table with this metatable.
@@ -472,9 +485,10 @@ impl<'gc> MtCacheData<'gc> {
 }
 
 impl<'gc> MtCache<'gc> {
-    /// The cache of a metatable whose `__index` is `index`.
+    /// The cache of `table`, whose `__index` is `index`.
     pub fn new(
         mc: &Mutation<'gc>,
+        table: Table<'gc>,
         bits: MetamethodBits,
         weak: WeakMode,
         index: Value<'gc>,
@@ -482,6 +496,9 @@ impl<'gc> MtCache<'gc> {
         MtCache(Gc::new(
             mc,
             MtCacheData {
+                // SAFETY: a `Gc`'s pointer is never null.
+                table: unsafe { NonNull::new_unchecked(Gc::as_ptr(table.inner()).cast_mut()) }
+                    .cast(),
                 bits: Cell::new(bits),
                 weak: Cell::new(weak),
                 index_table: Cell::new(table_addr(index)),
@@ -538,7 +555,19 @@ impl<'gc> MtCache<'gc> {
         self.0.index_table.get()
     }
 
-    /// Mirror a write of `key` to this cache's metatable into its bits and weak mode.
+    /// The metatable this caches.
+    ///
+    /// # Safety
+    ///
+    /// Only for a cache read from the shape of a table that is still
+    /// reachable, as that table keeps it alive (see `MtCacheData::table`).
+    #[inline]
+    pub unsafe fn table(self) -> Table<'gc> {
+        Table::from_inner(unsafe { Gc::from_ptr(self.0.table.cast().as_ptr()) })
+    }
+
+    /// Mirror a write of `key` to this cache's metatable into its bits and
+    /// weak mode; only keys [`mirrored`] names change anything.
     #[inline]
     pub fn mirror(self, key: LuaString<'gc>, value: Value<'gc>) {
         match metamethod_bit_of_bytes(key.as_bytes()) {

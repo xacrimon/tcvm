@@ -359,6 +359,24 @@ fn weakly_held_objects_are_freed() {
     );
 }
 
+/// A table keeps its metatable alive, and an inline cache holding the
+/// table's shape does not.
+#[test]
+fn metatable_lives_as_long_as_its_tables() {
+    let src = r#"
+w = setmetatable({}, {__mode = "v"})
+function get(o) return o.x end
+keep = setmetatable({x = 1}, {tag = "kept"})
+w[1] = getmetatable(keep)
+local gone = setmetatable({x = 1}, {tag = "gone"})
+w[2] = getmetatable(gone)
+for _ = 1, 3 do get(gone) end
+--gc
+return tostring(w[1] and w[1].tag) .. " " .. tostring(w[2])
+"#;
+    assert_eq!(run(src), "kept nil");
+}
+
 /// `__mode` stored on live metatables from one site: the later stores reuse
 /// the first one's cached shape transition and must still weaken the table.
 #[test]
