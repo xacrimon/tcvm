@@ -8,62 +8,9 @@ use crate::env::function::Stack;
 use crate::env::thread::{ExecKind, TbcEntry, ThreadState, ThreadStatus};
 use crate::env::{Function, MetamethodBits, NativeClosure, Value};
 use crate::lua::Context;
-use crate::vm::debug::op_error_message;
-use crate::vm::interp::{OpError, call_chain_error};
 use crate::vm::sequence::{
     BoxSequence, CallbackAction, Catch, Execution, Sequence, SequencePoll, seq_trace_pointers,
 };
-
-/// Closes the running frame's variables at or above `level` in turn, taking
-/// each off `tbc_list` before its call, so a failing `__close` leaves the rest
-/// registered for the unwinder to close with the error. `redo` steps the frame
-/// back onto its RETURN, which then finds nothing left to close.
-pub(crate) struct CloseSequence {
-    pub(crate) level: usize,
-    pub(crate) redo: bool,
-}
-
-unsafe impl<'gc> Collect<'gc> for CloseSequence {
-    const NEEDS_TRACE: bool = false;
-}
-
-impl<'gc> Sequence<'gc> for CloseSequence {
-    fn trace_pointers(&self, _cc: &mut dyn Trace<'gc>) {}
-
-    fn poll(
-        self: Pin<&mut Self>,
-        ctx: Context<'gc>,
-        _exec: Execution<'gc>,
-        mut stack: Stack<'gc, '_>,
-    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
-        stack.clear();
-        let ts = stack.thread_mut();
-        let Some(entry) = ts.tbc_list.pop_if(|e| e.pos() >= self.level) else {
-            if self.redo {
-                let frame = ts.top_lua_mut().expect("close sequence without its frame");
-                frame.pc = unsafe { frame.pc.sub(1) };
-            }
-            return Ok(SequencePoll::Return);
-        };
-        let v = entry.value(&ts.stack);
-        let tm = ctx.mm_of(v, MetamethodBits::CLOSE);
-        // Raised here rather than by the call, which would blame this
-        // sequence instead of the closing frame.
-        if let Some(e) = call_chain_error(ctx, tm) {
-            let suffix = match e {
-                OpError::Call(_) => " (metamethod 'close')",
-                _ => "",
-            };
-            let msg = op_error_message(ctx, ts, e) + suffix;
-            return Err(Error::from_str(ctx, &msg));
-        }
-        stack.push(v);
-        Ok(SequencePoll::Call {
-            function: tm,
-            bottom: 0,
-        })
-    }
-}
 
 /// Closes the variables an error unwound past, detached at `level`, once the
 /// unwinder has reached the catcher (`luaD_closeprotected`). An error in a

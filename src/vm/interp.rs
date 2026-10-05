@@ -340,12 +340,15 @@ macro_rules! helpers {
                 tail!($$f, $instruction)
             };
             ($$f:ident, $$instruction:expr) => {
+                tail!($$f, $$instruction, $ip)
+            };
+            ($$f:ident, $$instruction:expr, $$ip:expr) => {
                 become $$f(
                     $$instruction,
                     $ctx,
                     $thread,
                     $registers,
-                    $ip,
+                    $$ip,
                     $handlers,
                     $ds,
                     $frame,
@@ -385,10 +388,15 @@ macro_rules! helpers {
         #[allow(unused_macros)]
         macro_rules! call_mm {
             ($$ret:ident, $$f:expr, [$$($$arg:expr),* $$(,)?]) => {{
-                let __f: Value<'gc> = $$f;
-                let __args: [Value<'gc>; _] = [$$($$arg),*];
                 let __scratch =
                     unsafe { (*$frame).base() } + $closure.max_stack_size as usize;
+                call_mm!(@at __scratch, $$ret, $$f, [$$($$arg),*]);
+            }};
+            // Staged at `$$scratch`, at or above the frame's registers.
+            (@at $$scratch:expr, $$ret:ident, $$f:expr, [$$($$arg:expr),* $$(,)?]) => {{
+                let __f: Value<'gc> = $$f;
+                let __args: [Value<'gc>; _] = [$$($$arg),*];
+                let __scratch: usize = $$scratch;
                 let __end = __scratch + 1 + __args.len();
                 $thread.ensure_slots(__end);
                 let __stack = $thread.stack.as_mut_ptr();
@@ -406,7 +414,7 @@ macro_rules! helpers {
                     $ctx,
                     $thread,
                     $registers,
-                    $ip,
+                    unsafe { __stack.add(__scratch) } as *const Instruction,
                     $handlers,
                     $ds,
                     $frame,
@@ -2149,12 +2157,58 @@ extern "rust-preserve-none" fn op_close<'gc>(
     let start_idx = base + start as usize;
     close_upvalues(ctx.mutation(), thread, start_idx);
     if has_tbc_from(thread, start_idx) {
-        save_pc(thread, ip);
-        let bottom = base + closure.max_stack_size as usize;
-        schedule_close(ctx, thread, start_idx, false, bottom, bottom);
-        return Exit::End;
+        tail!(close_tbc);
     }
     dispatch!();
+}
+
+/// CLOSE of a to-be-closed variable: call its `__close`, taking it off the
+/// list first so a failing one leaves the rest to the unwinder, then run the
+/// CLOSE again for the next.
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn close_tbc<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let (v, tm) = match pop_tbc(ctx, thread) {
+        Ok(c) => c,
+        Err(err) => {
+            save_pc(thread, ip);
+            thread.raise(ctx, err);
+            return Exit::End;
+        }
+    };
+    call_mm!(ret_close, tm, [v]);
+}
+
+/// Take the innermost to-be-closed variable off the list: its value and
+/// `__close`, or the error for a `__close` that can't be called, raised as
+/// the closing frame's rather than as the call's.
+fn pop_tbc<'gc>(
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+) -> Result<(Value<'gc>, Value<'gc>), crate::env::Error<'gc>> {
+    let entry = thread.tbc_list.pop().expect("no to-be-closed variable to close");
+    let v = entry.value(&thread.stack);
+    let tm = ctx.mm_of(v, MetamethodBits::CLOSE);
+    if let Some(e) = call_chain_error(ctx, tm) {
+        let suffix = match e {
+            OpError::Call(_) => " (metamethod 'close')",
+            _ => "",
+        };
+        let msg = crate::vm::debug::op_error_message(ctx, thread, e) + suffix;
+        return Err(crate::env::Error::from_str(ctx, &msg));
+    }
+    Ok((v, tm))
 }
 
 /// Mark R[val] as to-be-closed.
@@ -3510,13 +3564,21 @@ extern "rust-preserve-none" fn op_return_slow<'gc>(
     };
 
     if has_tbc_from(thread, cur_base) {
-        // Past the frame and the results, which a MULTRET RETURN finds
-        // through `top` again once the closes land nothing at their end.
-        save_pc(thread, ip);
+        let (v, tm) = match pop_tbc(ctx, thread) {
+            Ok(c) => c,
+            Err(err) => {
+                save_pc(thread, ip);
+                thread.raise(ctx, err);
+                return Exit::End;
+            }
+        };
+        // Past the frame and the results, below the call: where they end,
+        // which a MULTRET RETURN finds through `top` again (`ret_return`).
         let values_end = values_base + nret;
-        let bottom = values_end.max(cur_base + closure.max_stack_size as usize);
-        schedule_close(ctx, thread, cur_base, true, values_end, bottom);
-        return Exit::End;
+        let mark = values_end.max(cur_base + closure.max_stack_size as usize);
+        thread.ensure_slots(mark + 1);
+        thread.stack[mark] = Value::small(values_end as i32);
+        call_mm!(@at mark + 1, ret_return, tm, [v]);
     }
     // Before the results move: they may land on the frame's own registers.
     close_upvalues(ctx.mutation(), thread, cur_base);
@@ -4363,32 +4425,6 @@ fn has_tbc_from(thread: &ThreadState<'_>, level: usize) -> bool {
     thread.tbc_list.last().is_some_and(|e| e.pos() >= level)
 }
 
-/// Hand the running frame's variables at or above `level` to a
-/// `CloseSequence`, calling from `bottom` up and landing nothing at `landing`.
-#[cold]
-#[inline(never)]
-fn schedule_close<'gc>(
-    ctx: Context<'gc>,
-    thread: &mut ThreadState<'gc>,
-    level: usize,
-    redo: bool,
-    landing: usize,
-    bottom: usize,
-) {
-    thread.set_top(bottom);
-    let seq = crate::vm::close::CloseSequence { level, redo };
-    thread.pending_action = Some(PendingAction {
-        action: Box::new(crate::vm::sequence::Suspend::Sequence(
-            crate::vm::sequence::BoxSequence::new(ctx.mutation(), seq),
-        )),
-        call_site: CallSite {
-            bottom,
-            func_idx: landing,
-            ret: ret_exit,
-        },
-    });
-}
-
 #[inline(always)]
 fn read_upvalue<'gc>(thread: &ThreadState<'gc>, uv: Upvalue<'gc>) -> Value<'gc> {
     match &*uv.borrow() {
@@ -4763,9 +4799,10 @@ pub(crate) fn binop_metamethod<'gc>(
 // ---------------------------------------------------------------------------
 
 /// Make the call `call_mm!` staged above the running frame's registers: the
-/// function at `base + max_stack_size`, its arguments above it up to `top`,
-/// finished by `ds.ret`. A Lua function gets a frame returning to it, a native
-/// one runs here and hands its results straight to it.
+/// function at the slot `ip` points to (the frame's `pc` is already saved),
+/// its arguments above it up to `top`, finished by `ds.ret`. A Lua function
+/// gets a frame returning to it, a native one runs here and hands its results
+/// straight to it.
 #[inline(never)]
 #[rustc_align(32)]
 extern "rust-preserve-none" fn meta_call<'gc>(
@@ -4779,9 +4816,10 @@ extern "rust-preserve-none" fn meta_call<'gc>(
     frame: *mut LuaFrame<'gc>,
     closure: LuaFn<'gc>,
 ) -> Exit {
+    let scratch = unsafe { (ip as *const Value<'gc>).offset_from_unsigned(thread.stack.as_ptr()) };
+    ip = unsafe { (*frame).pc };
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let ret = ds.ret;
-    let scratch = unsafe { (*frame).base() } + closure.max_stack_size as usize;
     let new_base = scratch + 1;
     let nargs = thread.top - new_base;
     let f = thread.stack[scratch];
@@ -4862,7 +4900,8 @@ extern "rust-preserve-none" fn meta_call<'gc>(
                 Ok(_) => {}
                 Err(e) => raise!(e),
             }
-            tail!(meta_call);
+            let func_slot = unsafe { thread.stack.as_ptr().add(scratch) };
+            tail!(meta_call, instruction, func_slot as *const Instruction);
         }
     }
 }
@@ -5068,6 +5107,58 @@ extern "rust-preserve-none" fn ret_tfor<'gc>(
     unsafe { land_results(registers.add((base + TFOR_VARS) as usize), values, nret, count as usize) };
     let func_slot = unsafe { func_slot.offset_from_unsigned(thread.stack.as_ptr()) };
     thread.set_top_unchecked(func_slot);
+    dispatch!();
+}
+
+/// Continuation of a CLOSE's `__close`: run the CLOSE again, for the next
+/// variable or to move on.
+#[inline(never)]
+#[rustc_align(32)]
+// The incoming `closure` belongs to the finished call.
+#[allow(unused_assignments)]
+extern "rust-preserve-none" fn ret_close<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    let (_, _, func_slot) = ret_args!(instruction, registers, ip);
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let _ = resume_caller!(thread, registers, ip, frame, closure);
+    ip = unsafe { ip.sub(1) };
+    let func_slot = unsafe { func_slot.offset_from_unsigned(thread.stack.as_ptr()) };
+    thread.set_top_unchecked(func_slot);
+    dispatch!();
+}
+
+/// Continuation of a RETURN's `__close`: run the RETURN again, with `top`
+/// back at the end of its results, which the slot below the call recorded.
+#[inline(never)]
+#[rustc_align(32)]
+// The incoming `closure` belongs to the finished call.
+#[allow(unused_assignments)]
+extern "rust-preserve-none" fn ret_return<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    let (_, _, func_slot) = ret_args!(instruction, registers, ip);
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let _ = resume_caller!(thread, registers, ip, frame, closure);
+    ip = unsafe { ip.sub(1) };
+    let values_end = unsafe { func_slot.sub(1).read() }.get_small();
+    thread.set_top_unchecked(unsafe { values_end.unwrap_unchecked() } as usize);
     dispatch!();
 }
 
