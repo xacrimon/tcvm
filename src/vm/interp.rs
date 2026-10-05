@@ -5504,12 +5504,15 @@ macro_rules! resume_switch {
         if co.ptr_eq($thread.handle())
             || co.peer_status() != ThreadStatus::Suspended
             || $thread.resume_depth + 1 >= MAX_RESUME_DEPTH
+            || $thread.frames_full()
         {
             tail!(op_call_native);
         }
         let (func, nargs, returns) = $instruction.abc();
         // SAFETY: `co` is suspended, so nothing else uses its state.
-        let cs = unsafe { co.state_mut($ctx.mutation()) };
+        let Some(cs) = (unsafe { co.state_mut_if_clean($ctx.mutation()) }) else {
+            tail!(op_call_native);
+        };
         // A yield the executor took (from a sequence) resumes through it.
         let Some(y) = cs.yield_bottom.filter(|_| cs.top_is_lua()) else {
             tail!(op_call_native);
@@ -5525,16 +5528,20 @@ macro_rules! resume_switch {
             tail!(op_call_native);
         }
         unsafe { (*$frame).pc = $ip };
-        push_native_frame(
-            $thread,
+        let nf = native_frame(
             $f,
             base + func as usize + 1,
             0,
             crate::vm::sequence::Protect::Errors,
             $ok,
             $cont,
-            call_ret(returns),
+            unsafe {
+                *$handlers
+                    .cast::<Handler>()
+                    .add(Op::COUNT + returns as usize)
+            },
         );
+        unsafe { $thread.push_unchecked(nf) };
         $thread.set_top_unchecked(base + func as usize + 1);
         $thread.status = ThreadStatus::Normal;
         cs.yield_bottom = None;
@@ -5583,7 +5590,8 @@ pub(crate) extern "rust-preserve-none" fn ff_wrap<'gc>(
     }
     let f = reg!(instruction.a()).get_function();
     let f = unsafe { f.unwrap_unchecked() };
-    let co = unsafe { (*ds.native).upvalues[0].get_thread().unwrap_unchecked() };
+    let nc = unsafe { &*ds.native };
+    let co = unsafe { nc.upvalues.get_unchecked(0).get_thread().unwrap_unchecked() };
     resume_switch!(
         co,
         1,
@@ -5676,7 +5684,9 @@ pub(crate) extern "rust-preserve-none" fn ff_yield<'gc>(
     }
     let (func, nargs, returns) = instruction.abc();
     // SAFETY: the resumer waits, so nothing else uses its state.
-    let rs = unsafe { r.state_mut(ctx.mutation()) };
+    let Some(rs) = (unsafe { r.state_mut_if_clean(ctx.mutation()) }) else {
+        tail!(op_call_native);
+    };
     let nf = match rs.top_lua() {
         Some(nf) if nf.flags & (frame_flags::PASS | frame_flags::PASS_TRUE) != 0 => *nf,
         _ => tail!(op_call_native),
@@ -5713,7 +5723,8 @@ pub(crate) extern "rust-preserve-none" fn ff_yield<'gc>(
     let nret = n + pass_true as usize;
     rs.set_top_unchecked(slot + n);
     rs.status = ThreadStatus::Normal;
-    rs.pop_lua();
+    let n = rs.frames.len();
+    unsafe { rs.frames.set_len(n - 1) };
     thread = rs;
     ds.current = Some(r);
     let frame = thread
@@ -5841,6 +5852,7 @@ fn native_calls_lua<'gc>(thread: &ThreadState<'gc>, slot: usize) -> Option<LuaFn
 /// Push the frame of native `f`, whose window is at `base`, for its
 /// `CallThen`.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn push_native_frame<'gc>(
     thread: &mut ThreadState<'gc>,
     f: Function<'gc>,
@@ -5851,6 +5863,20 @@ fn push_native_frame<'gc>(
     cont: crate::vm::sequence::NativeCont,
     ret: Handler,
 ) {
+    thread.push_lua(native_frame(f, base, at, protect, ok, cont, ret));
+}
+
+/// The frame [`push_native_frame`] pushes.
+#[inline(always)]
+fn native_frame<'gc>(
+    f: Function<'gc>,
+    base: usize,
+    at: u32,
+    protect: crate::vm::sequence::Protect,
+    ok: crate::vm::sequence::OnOk,
+    cont: crate::vm::sequence::NativeCont,
+    ret: Handler,
+) -> LuaFrame<'gc> {
     use crate::vm::sequence::{OnOk, Protect};
     let flags = frame_flags::NATIVE
         | match protect {
@@ -5863,14 +5889,14 @@ fn push_native_frame<'gc>(
             OnOk::Return => frame_flags::PASS,
             OnOk::ReturnTrue => frame_flags::PASS_TRUE,
         };
-    thread.push_lua(LuaFrame {
+    LuaFrame {
         closure: unsafe { LuaFn::native_frame(f) },
         pc: cont as *const Instruction,
         ret,
         base: base as u32,
         num_extras: at as u16,
         flags,
-    });
+    }
 }
 
 /// Push the frame of a native's call of Lua `callee`, its arguments at
