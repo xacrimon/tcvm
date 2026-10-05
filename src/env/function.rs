@@ -496,6 +496,16 @@ impl<'gc> LuaFn<'gc> {
     pub fn function(self) -> Function<'gc> {
         Function(self.0)
     }
+
+    /// A native frame's function in the closure field, which no one may
+    /// dereference as a Lua closure (see `LuaFrame::closure`).
+    ///
+    /// # Safety
+    /// Only for a frame flagged `NATIVE`.
+    #[inline(always)]
+    pub(crate) unsafe fn native_frame(f: Function<'gc>) -> Self {
+        LuaFn(f.0)
+    }
 }
 
 impl<'gc> std::ops::Deref for LuaFn<'gc> {

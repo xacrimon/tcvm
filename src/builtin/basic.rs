@@ -1,19 +1,15 @@
 use std::io::Write;
-use std::pin::Pin;
 
 use crate::Context;
 use crate::LoadError;
 use crate::builtin::util;
-use crate::dmm::{Collect, Trace};
 use crate::env::{
     Error, Function, LuaString, MetamethodBits, NativeClosure, NativeFn, Stack, Value,
 };
 use crate::vm::async_sequence::{SequenceReturn, async_sequence};
 use crate::vm::debug::where_prefix;
 use crate::vm::interp;
-use crate::vm::sequence::{
-    BoxSequence, CallbackAction, Catch, Execution, Sequence, SequencePoll, seq_trace_pointers,
-};
+use crate::vm::sequence::{BoxSequence, CallbackAction, Protect};
 
 pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[
@@ -419,59 +415,34 @@ fn lua_pairs<'gc>(
     Ok(CallbackAction::call(Some(then)))
 }
 
-/// `pcall(f, ...)`: run `f` under a [`ProtectedCall`] completion that turns
-/// its results into `(true, ...)` and a caught error into `(false, err)`.
-/// The callee and its arguments are already in `Call` layout; a
-/// non-callable `f` is raised by the executor inside the protected call,
-/// so it comes back as `(false, msg)` like the reference.
+/// `pcall(f, ...)`: a protected call of `f`, whose results come back as
+/// `(true, ...)` and a caught error as `(false, err)`. The callee and its
+/// arguments are already in call layout; a non-callable `f` raises inside
+/// the protected call, so it comes back as `(false, msg)` like the reference.
 fn lua_pcall<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     util::check_any(ctx, &stack, "pcall", 1)?;
-    let then = BoxSequence::new(ctx.mutation(), ProtectedCall { handler: None });
-    Ok(CallbackAction::call(Some(then)))
+    Ok(CallbackAction::CallThen {
+        at: 0,
+        protect: Protect::Errors,
+        cont: pcall_cont,
+    })
 }
 
-/// Completion sequence for `pcall` and `xpcall`: the call's results come back
-/// prefixed with `true`; an error that unwinds to it becomes `(false, err)`,
-/// after the `xpcall` `handler` (if any) has run.
-#[derive(Collect)]
-#[collect(internal, no_drop)]
-pub(crate) struct ProtectedCall<'gc> {
-    pub(crate) handler: Option<Function<'gc>>,
-}
-
-impl<'gc> Sequence<'gc> for ProtectedCall<'gc> {
-    fn trace_pointers(&self, cc: &mut dyn Trace<'gc>) {
-        seq_trace_pointers!(self, cc);
+fn pcall_cont<'gc>(
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
+    mut stack: Stack<'gc, '_>,
+    status: Result<(), Error<'gc>>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
+    match status {
+        Ok(()) => stack.insert(0, Value::boolean(true)),
+        Err(err) => stack.replace(&[Value::boolean(false), err.value()]),
     }
-
-    fn poll(
-        self: Pin<&mut Self>,
-        _ctx: Context<'gc>,
-        _exec: Execution<'gc>,
-        mut stack: Stack<'gc, '_>,
-    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
-        stack.insert(0, Value::boolean(true));
-        Ok(SequencePoll::Return)
-    }
-
-    fn error(
-        self: Pin<&mut Self>,
-        _ctx: Context<'gc>,
-        _exec: Execution<'gc>,
-        err: Error<'gc>,
-        mut stack: Stack<'gc, '_>,
-    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
-        stack.replace(&[Value::boolean(false), err.value()]);
-        Ok(SequencePoll::Return)
-    }
-
-    fn catch(&self) -> Catch<'gc> {
-        Catch::Here(self.handler)
-    }
+    Ok(CallbackAction::Return)
 }
 
 /// `print(...)` — write each argument's `tostring` form to stdout, separated
@@ -760,16 +731,29 @@ fn lua_xpcall<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    let Some(handler) = stack.get(1).get_function() else {
+    if stack.get(1).get_function().is_none() {
         return Err(util::type_error(ctx, "xpcall", 2, "function", stack.arg(1)));
-    };
-    // Drop the handler slot so the callee and its args sit in `Call` layout.
-    stack.remove(1);
-    let then = BoxSequence::new(
-        ctx.mutation(),
-        ProtectedCall {
-            handler: Some(handler),
-        },
-    );
-    Ok(CallbackAction::call(Some(then)))
+    }
+    // The handler goes first, where the unwinder finds it; the callee and
+    // its arguments follow in call layout.
+    stack.as_mut_slice().swap(0, 1);
+    Ok(CallbackAction::CallThen {
+        at: 1,
+        protect: Protect::Handler,
+        cont: xpcall_cont,
+    })
+}
+
+fn xpcall_cont<'gc>(
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
+    mut stack: Stack<'gc, '_>,
+    status: Result<(), Error<'gc>>,
+) -> Result<CallbackAction<'gc>, Error<'gc>> {
+    match status {
+        // The results follow the handler's slot.
+        Ok(()) => stack.as_mut_slice()[0] = Value::boolean(true),
+        Err(err) => stack.replace(&[Value::boolean(false), err.value()]),
+    }
+    Ok(CallbackAction::Return)
 }

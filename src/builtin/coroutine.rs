@@ -286,9 +286,9 @@ fn wrap_callback<'gc>(
 // Sequences
 // ---------------------------------------------------------------------------
 
-/// `coroutine.resume`'s follow-up: `pcall`'s
-/// [`ProtectedCall`](crate::builtin::basic::ProtectedCall), except that values
-/// with no room for the leading `true` become `(false, msg)` (`auxresume`).
+/// `coroutine.resume`'s follow-up: like `pcall`'s continuation, except that
+/// values with no room for the leading `true` become `(false, msg)`
+/// (`auxresume`).
 struct ResumeSequence;
 
 unsafe impl<'gc> Collect<'gc> for ResumeSequence {
