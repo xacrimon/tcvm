@@ -837,6 +837,14 @@ instructions! {
     0x5f GETUPVAL_REF getupval_ref Ab   { dst: Reg, idx: UpIdx }
     0x60 GETTABUP_REF gettabup_ref Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
     0x61 SETTABUP_REF settabup_ref Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+
+    // --- CALL by result count -----------------------------------------------
+    //
+    // A CALL wanting no result (`returns` 1) or one (`returns` 2), whose
+    // continuation is a constant. `returns` stays for the generic paths.
+
+    0x62 CALL_R0    call_r0     Abc   { func: Reg, args: u8, returns: u8 }
+    0x63 CALL_R1    call_r1     Abc   { func: Reg, args: u8, returns: u8 }
 }
 
 impl Op {

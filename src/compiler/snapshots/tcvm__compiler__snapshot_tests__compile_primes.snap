@@ -21,7 +21,7 @@ expression: output
 0006  [ 14]  JMP             +13
 0007  [ 15]  MOVE            R4 R0
 0008  [ 15]  MOVE            R5 R1
-0009  [ 15]  CALL            R4 args=2 ret=2
+0009  [ 15]  CALL_R1         R4 args=2
 0010  [ 15]  TEST            R4 inv=false
 0011  [ 15]  JMP             +6
 0012  [ 16]  ADDI            R2 R2 #1
@@ -34,7 +34,7 @@ expression: output
 0019  [ 20]  JMP             -15
 0020  [ 23]  GETTABUP        R4 U0 K4  ; "print"
 0021  [ 23]  MOVE            R5 R3
-0022  [ 23]  CALL            R4 args=2 ret=1
+0022  [ 23]  CALL_R0         R4 args=2
 0023  [ 23]  RETURN          R0 count=1
 
 ; prototype 0:

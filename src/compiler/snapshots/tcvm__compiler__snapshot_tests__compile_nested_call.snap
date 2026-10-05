@@ -17,7 +17,7 @@ expression: output
 0005  [  2]  LOAD            R4 K1  ; 2
 0006  [  2]  CALL            R3 args=2 ret=0
 0007  [  2]  CALL            R2 args=0 ret=0
-0008  [  2]  CALL            R1 args=0 ret=1
+0008  [  2]  CALL_R0         R1 args=0
 0009  [  2]  RETURN          R0 count=1
 
 ; prototype 0:

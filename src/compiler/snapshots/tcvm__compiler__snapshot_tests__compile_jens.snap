@@ -20,9 +20,9 @@ expression: output
   0002  [  3]  RETURN1         R0
   0003  [  5]  GETUPVAL        R1 U0
   0004  [  5]  SUBI            R2 R0 #1
-  0005  [  5]  CALL            R1 args=2 ret=2
+  0005  [  5]  CALL_R1         R1 args=2
   0006  [  5]  GETUPVAL        R2 U0
   0007  [  5]  SUBI            R3 R0 #2
-  0008  [  5]  CALL            R2 args=2 ret=2
+  0008  [  5]  CALL_R1         R2 args=2
   0009  [  5]  ADD             R1 R1 R2
   0010  [  5]  RETURN1         R1

@@ -19,7 +19,7 @@ expression: output
 0003  [  3]  LOAD            R2 K1  ; 1
 0004  [  3]  SETFIELD        R2 R1 K0  ; "b"
 0005  [  4]  MOVE            R2 R0
-0006  [  4]  CALL            R2 args=1 ret=2
+0006  [  4]  CALL_R1         R2 args=1
 0007  [  4]  LOAD            R3 K1  ; 1
 0008  [  4]  LOAD            R4 K3  ; 2
 0009  [  4]  LOAD            R5 K4  ; 3

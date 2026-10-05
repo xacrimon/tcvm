@@ -14,7 +14,7 @@ expression: output
 0003  [  3]  TESTSET         R2 R1 inv=true
 0004  [  3]  JMP             +2
 0005  [  3]  MOVE            R2 R0
-0006  [  3]  CALL            R2 args=1 ret=2
+0006  [  3]  CALL_R1         R2 args=1
 0007  [  4]  RETURN          R2 count=2
 
 ; prototype 0:

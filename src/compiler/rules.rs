@@ -697,6 +697,16 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         self.emit(Instruction::jmp(0));
     }
 
+    /// A call, in the form for its result count (`returns` is Lua's `C`).
+    fn emit_call(&mut self, func: RegisterIndex, args: u8, returns: u8) {
+        let call = match returns {
+            1 => Instruction::call_r0,
+            2 => Instruction::call_r1,
+            _ => Instruction::call,
+        };
+        self.emit(call(func, args, returns));
+    }
+
     fn emit_jump_instr(&mut self, label: u16, instr: Instruction) {
         let idx = self.next_offset();
         self.chunk.jump_patches.push((idx, label));
@@ -4067,7 +4077,7 @@ fn compile_expr_func_call(
         Want::Exact(n) => n + 1,
         Want::MultRet => 0,
     };
-    ctx.emit(Instruction::call(func, args_wire, returns));
+    ctx.emit_call(func, args_wire, returns);
 
     match want {
         Want::Exact(n) => {
@@ -4118,13 +4128,13 @@ fn compile_stmt_expr(ctx: &mut Ctx, item: Expr) -> Result<(), CompileError> {
     match item {
         Expr::FuncCall(call) => {
             let (func, args_wire) = emit_func_call_setup(ctx, &call)?;
-            ctx.emit(Instruction::call(func, args_wire, 1));
+            ctx.emit_call(func, args_wire, 1);
             ctx.chunk.freereg = func.0;
             Ok(())
         }
         Expr::Method(call) => {
             let (func, args_wire) = emit_method_call_setup(ctx, &call)?;
-            ctx.emit(Instruction::call(func, args_wire, 1));
+            ctx.emit_call(func, args_wire, 1);
             ctx.chunk.freereg = func.0;
             Ok(())
         }
@@ -4289,7 +4299,7 @@ fn compile_expr_method_call(
         Want::Exact(n) => n + 1,
         Want::MultRet => 0,
     };
-    ctx.emit(Instruction::call(func, args_wire, returns));
+    ctx.emit_call(func, args_wire, returns);
 
     match want {
         Want::Exact(n) => {
