@@ -515,11 +515,7 @@ impl BitOp for Shr {
     }
 }
 
-/// Append a float in Lua's canonical textual form (the `..` concat path). This
-/// must match `tostring`/`print` exactly — Lua uses the same `tostringbuff` for
-/// both — so it delegates to `push_float` (`%.15g`→`%.17g`, integer-looking
-/// floats tagged `.0`, lowercase `inf`/`nan`) rather than a shortest-round-trip
-/// formatter, which would print e.g. `0.3333333333333333` for `1/3`.
+/// Append a float as `tostring` does (the `..` concat path), via `push_float`.
 pub fn write_float(dst: &mut Vec<u8>, f: f64) {
     crate::builtin::util::push_float(dst, f);
 }

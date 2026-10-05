@@ -71,7 +71,7 @@ fn arithmetic_coerces_numeric_strings() {
             "return cat(math.type('10' + 1), math.type('10' + 1.0), math.type('10.0' + 1),
                 '9223372036854775807' + 1, '9223372036854775808' + 0)"
         ),
-        "integer float float -9223372036854775808 9.2233720368547758e+18"
+        "integer float float -9223372036854775808 9.2233720368548e+18"
     );
     assert_eq!(
         ok("return cat(-'2', -'2.0', -'0', -'-0.0', math.type(-'0'), '7' % 0.0)"),
@@ -81,7 +81,7 @@ fn arithmetic_coerces_numeric_strings() {
         ok(
             "return cat('2' ^ '0.5', '7' / '2', '-7' // '2', '-7' % '2', '7.5' % '-2', 'a' .. 1 + '2')"
         ),
-        "1.4142135623730951 3.5 -4 1 -0.5 a3"
+        "1.4142135623731 3.5 -4 1 -0.5 a3"
     );
 }
 
