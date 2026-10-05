@@ -14,7 +14,7 @@ use crate::vm::sequence::{CallbackAction, Execution, Sequence, SequencePoll};
 
 /// Append the canonical Lua textual form of an integer.
 pub(crate) fn push_int(out: &mut Vec<u8>, i: i64) {
-    out.extend_from_slice(i.to_string().as_bytes());
+    out.extend_from_slice(i.format_into(&mut core::fmt::NumBuffer::new()).as_bytes());
 }
 
 /// The VM's "attempt to compare …" runtime-error message for an ordering of two
