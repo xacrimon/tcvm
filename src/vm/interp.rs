@@ -3887,7 +3887,7 @@ extern "rust-preserve-none" fn op_setlist<'gc>(
     let items = &thread.stack[elements_start..elements_start + n];
     t.inner()
         .borrow_mut(ctx.mutation())
-        .set_list(offset as usize, items);
+        .set_list(ctx.mutation(), offset as usize, items);
     if count == 0 {
         // A MULTRET spread leaves `thread.stack` truncated to `thread.top` by
         // the producer (e.g. a native call's variadic return). Restore the

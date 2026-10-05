@@ -1,7 +1,9 @@
 mod hash_part;
+mod slots;
 mod swiss;
 
 use core::cell::Cell;
+use core::ptr::NonNull;
 
 use hash_part::{int_hash, lua_string_hash};
 
@@ -170,9 +172,10 @@ pub struct TableState<'gc> {
     /// `properties.len() == shape.slot_count()` post-set. Empty in
     /// dict mode (storage moves to `dict`).
     pub(crate) properties: Vec<Value<'gc>, MetricsAlloc<'gc>>,
-    /// Integer keys `0..array.len()`, as in LuaJIT: may hold nils, and is
-    /// only resized by `rehash_ints`.
-    array: Vec<Value<'gc>, MetricsAlloc<'gc>>,
+    /// Integer keys `0..asize`, as in LuaJIT: may hold nils, and is only
+    /// resized by `rehash_ints`. A [`slots`] cell, or dangling when empty.
+    array: NonNull<Value<'gc>>,
+    asize: u32,
     /// Every other integer key, and floats with an integral value.
     int_hash: hash_part::Part<'gc, i64, MetricsAlloc<'gc>>,
     /// Last border `raw_len` found, as Lua 5.5's `lenhint`.
@@ -203,9 +206,13 @@ unsafe impl<'gc> Collect<'gc> for TableState<'gc> {
         cc.trace(&self.metatable);
         cc.trace(&self.mt_cache);
         let mode = self.weak_mode();
+        if self.asize > 0 {
+            // SAFETY: a non-empty array part is a live `slots` cell.
+            unsafe { slots::mark(cc, self.array) };
+        }
         if mode.is_empty() {
             cc.trace(&self.properties);
-            cc.trace(&self.array);
+            cc.trace(self.array());
             cc.trace(&self.int_hash);
             cc.trace(&self.misc_hash);
             cc.trace(&self.dict);
@@ -218,7 +225,7 @@ unsafe impl<'gc> Collect<'gc> for TableState<'gc> {
                 cc.trace(v);
             }
         };
-        for v in self.properties.iter().chain(&self.array) {
+        for v in self.properties.iter().chain(self.array()) {
             value(cc, v);
         }
         for e in self.int_hash.iter() {
@@ -266,8 +273,12 @@ impl<'gc> TableState<'gc> {
             properties: filled(mc, values.len(), |i| values[i]),
             // `nils` stays out of line: inlined, its spills cost every table.
             array: match items {
-                0 => Vec::new_in(MetricsAlloc::new(mc)),
+                0 => NonNull::dangling(),
                 n => nils(mc, n + 1),
+            },
+            asize: match items {
+                0 => 0,
+                n => n as u32 + 1,
             },
             int_hash: hash_part::Part::new_in(MetricsAlloc::new(mc)),
             len_hint: Cell::new(0),
@@ -351,7 +362,7 @@ impl<'gc> TableState<'gc> {
                 cleared(key);
             }
         }
-        for v in self.array.iter_mut().filter(|v| v.is_dead(fc)) {
+        for v in self.array_mut().iter_mut().filter(|v| v.is_dead(fc)) {
             *v = Value::nil();
         }
         self.int_hash.kill_where(|e| e.value.is_dead(fc));
@@ -388,10 +399,23 @@ impl<'gc> TableState<'gc> {
         unsafe { *self.properties.get_unchecked_mut(slot as usize) = v }
     }
 
+    #[inline(always)]
+    fn array(&self) -> &[Value<'gc>] {
+        // SAFETY: `array` holds `asize` values, in a cell nothing else refers to.
+        unsafe { core::slice::from_raw_parts(self.array.as_ptr(), self.asize as usize) }
+    }
+
+    #[inline(always)]
+    fn array_mut(&mut self) -> &mut [Value<'gc>] {
+        // SAFETY: as in `array`.
+        unsafe { core::slice::from_raw_parts_mut(self.array.as_ptr(), self.asize as usize) }
+    }
+
     /// The array-part slot for key `i`, if the array part covers it.
     #[inline(always)]
     pub fn array_get(&self, i: usize) -> Option<Value<'gc>> {
-        self.array.get(i).copied()
+        // SAFETY: in bounds.
+        (i < self.asize as usize).then(|| unsafe { *self.array.as_ptr().add(i) })
     }
 
     /// Store to an array-part slot.
@@ -401,7 +425,8 @@ impl<'gc> TableState<'gc> {
     /// `i` must be inside the array part (see [`Self::array_get`]).
     #[inline(always)]
     pub unsafe fn set_array_at(&mut self, i: usize, v: Value<'gc>) {
-        unsafe { *self.array.get_unchecked_mut(i) = v }
+        debug_assert!(i < self.asize as usize);
+        unsafe { *self.array.as_ptr().add(i) = v }
     }
 
     #[inline]
@@ -417,15 +442,17 @@ impl<'gc> TableState<'gc> {
 
     #[inline]
     fn get_int(&self, key: i64) -> Value<'gc> {
-        match usize::try_from(key).ok().and_then(|s| self.array.get(s)) {
-            Some(v) => *v,
+        match usize::try_from(key).ok().and_then(|s| self.array_get(s)) {
+            Some(v) => v,
             None => hash_part::get(&self.int_hash, int_hash(key), key),
         }
     }
 
     #[inline]
     fn array_slot(&self, key: i64) -> Option<usize> {
-        usize::try_from(key).ok().filter(|&s| s < self.array.len())
+        usize::try_from(key)
+            .ok()
+            .filter(|&s| s < self.asize as usize)
     }
 
     #[inline]
@@ -467,7 +494,7 @@ impl<'gc> TableState<'gc> {
             return;
         }
         if let Some(i) = int_key(key) {
-            self.set_int_key(i, value);
+            self.set_int_key(ctx.mutation(), i, value);
             return;
         }
         assert!(
@@ -567,29 +594,32 @@ impl<'gc> TableState<'gc> {
 
     /// `t[offset + i] = items[i - 1]`, as `SETLIST` stores a constructor's
     /// positional items.
-    pub fn set_list(&mut self, offset: usize, items: &[Value<'gc>]) {
-        match self.array.get_mut(offset + 1..offset + 1 + items.len()) {
+    pub fn set_list(&mut self, mc: &Mutation<'gc>, offset: usize, items: &[Value<'gc>]) {
+        match self
+            .array_mut()
+            .get_mut(offset + 1..offset + 1 + items.len())
+        {
             Some(slots) => slots.copy_from_slice(items),
             None => {
                 for (i, &v) in items.iter().enumerate() {
-                    self.set_int_key((offset + 1 + i) as i64, v);
+                    self.set_int_key(mc, (offset + 1 + i) as i64, v);
                 }
             }
         }
     }
 
-    fn set_int_key(&mut self, key: i64, value: Value<'gc>) {
+    fn set_int_key(&mut self, mc: &Mutation<'gc>, key: i64, value: Value<'gc>) {
         if let Some(slot) = self.array_slot(key) {
-            self.array[slot] = value;
+            self.array_mut()[slot] = value;
             return;
         }
         let hash = int_hash(key);
         if value.is_nil() {
             hash_part::set(&mut self.int_hash, hash, key, value);
         } else if hash_part::set_no_grow(&mut self.int_hash, hash, key, value).is_err() {
-            self.rehash_ints(key);
+            self.rehash_ints(mc, key);
             match self.array_slot(key) {
-                Some(slot) => self.array[slot] = value,
+                Some(slot) => self.array_mut()[slot] = value,
                 None => hash_part::set(&mut self.int_hash, hash, key, value),
             }
         }
@@ -598,10 +628,10 @@ impl<'gc> TableState<'gc> {
     /// LuaJIT's `rehashtab`, run when a new key would grow `int_hash`: size the
     /// array to the largest `2^k + 1` that stays more than half full, counting
     /// `extra`, and rebuild `int_hash` from the live keys that don't fit.
-    fn rehash_ints(&mut self, extra: i64) {
+    fn rehash_ints(&mut self, mc: &Mutation<'gc>, extra: i64) {
         let mut bins = [0u32; MAX_ABITS];
         let mut n = 0;
-        for (k, v) in self.array.iter().enumerate() {
+        for (k, v) in self.array().iter().enumerate() {
             if !v.is_nil() {
                 n += count_int(k as i64, &mut bins);
             }
@@ -611,26 +641,34 @@ impl<'gc> TableState<'gc> {
         }
         n += count_int(extra, &mut bins);
         let asize = best_asize(&bins, n);
-        if asize == self.array.len() {
+        if asize == self.asize as usize {
             // Nothing moves; let `hash_part::set` rehash or grow as usual.
             return;
         }
         self.len_hint.set(asize / 2);
 
+        let old = self.array();
         let mut rest: Vec<(i64, Value<'gc>)> = Vec::new();
-        if asize < self.array.len() {
+        if asize < old.len() {
             rest.extend(
                 (asize..)
-                    .zip(self.array.drain(asize..))
+                    .zip(&old[asize..])
                     .filter(|(_, v)| !v.is_nil())
-                    .map(|(k, v)| (k as i64, v)),
+                    .map(|(k, &v)| (k as i64, v)),
             );
         }
-        self.array.resize(asize, Value::nil());
+        // The old cell is left for the sweep.
+        self.array = match asize {
+            0 => NonNull::dangling(),
+            _ => slots::alloc(mc, asize, |i| old.get(i).copied().unwrap_or(Value::nil())),
+        };
+        self.asize = asize as u32;
         let alloc = *self.int_hash.allocator();
+        let array = self.array;
         for e in self.int_hash.iter() {
             match usize::try_from(e.key).ok().filter(|&s| s < asize) {
-                Some(slot) => self.array[slot] = e.value,
+                // SAFETY: the new cell holds `asize` values.
+                Some(slot) => unsafe { *array.as_ptr().add(slot) = e.value },
                 None => rest.push((e.key, e.value)),
             }
         }
@@ -654,9 +692,10 @@ impl<'gc> TableState<'gc> {
     /// A border, found as Lua 5.5's `luaH_getn` does: near the last one
     /// first, so `t[#t + 1] = v` and `t[#t] = nil` stay O(1).
     pub fn raw_len(&self) -> usize {
-        let last = self.array.len().saturating_sub(1);
+        let array = self.array();
+        let last = array.len().saturating_sub(1);
         if last > 0 {
-            let empty = |k: usize| self.array[k].is_nil();
+            let empty = |k: usize| array[k].is_nil();
             let found = |k: usize| {
                 self.len_hint.set(k);
                 k
@@ -754,7 +793,7 @@ impl<'gc> TableState<'gc> {
         };
 
         if part == Part::Array {
-            for (i, v) in self.array.iter().enumerate().skip(from) {
+            for (i, v) in self.array().iter().enumerate().skip(from) {
                 if !v.is_nil() {
                     return Ok(Some((Value::integer(mc, i as i64), *v)));
                 }
@@ -814,8 +853,8 @@ fn filled<'gc>(
 }
 
 #[inline(never)]
-fn nils<'gc>(mc: &Mutation<'gc>, n: usize) -> Vec<Value<'gc>, MetricsAlloc<'gc>> {
-    filled(mc, n, |_| Value::nil())
+fn nils<'gc>(mc: &Mutation<'gc>, n: usize) -> NonNull<Value<'gc>> {
+    slots::alloc(mc, n, |_| Value::nil())
 }
 
 /// The integer a key normalizes to: integers, and floats with an exact
