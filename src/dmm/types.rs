@@ -313,6 +313,10 @@ impl<T> GcBoxInner<T> {
     /// Offset of a `TrailingBytes` value's bytes from the start of its box: right after the box
     /// itself, so the allocation is exactly `trailing_layout(Layout::new::<Self>(), len)`.
     pub(crate) const TRAILING_OFFSET: usize = mem::size_of::<Self>();
+
+    /// Offset of a `TrailingBytes` value's bytes from the value.
+    pub(crate) const TRAILING_FROM_VALUE: usize =
+        Self::TRAILING_OFFSET - mem::offset_of!(Self, value);
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]

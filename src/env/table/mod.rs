@@ -8,7 +8,9 @@ use core::ptr::NonNull;
 use hash_part::{int_hash, lua_string_hash};
 
 use crate::Context;
-use crate::dmm::{Collect, Finalization, Gc, Mutation, RefLock, Trace, allocator_api::GcAlloc};
+use crate::dmm::{
+    Collect, Finalization, Gc, Mutation, RefLock, Trace, TrailingBytes, allocator_api::GcAlloc,
+};
 use crate::env::function::Template;
 use crate::env::shape::{self, MAX_KEYED_PROPERTIES, MAX_PROPERTIES_FAST, Shape, WeakMode};
 use crate::env::string::LuaString;
@@ -28,19 +30,109 @@ impl<'gc> Table<'gc> {
     /// Create a new empty table in `shape`, which has no keys. Used by the
     /// `Lua::new` bootstrap before a `Context` exists.
     pub fn new_with_shape(mc: &Mutation<'gc>, shape: Shape<'gc>) -> Self {
-        Table(Gc::new(
-            mc,
-            RefLock::new(TableState::new(mc, shape, &[], 0)),
-        ))
+        Self::alloc(mc, shape, &[], 0)
     }
 
     /// A constructor's table, as `NEWTABLE` makes it from `t`.
     #[inline]
     pub fn from_template(mc: &Mutation<'gc>, t: &Template<'gc>) -> Self {
-        Table(Gc::new(
-            mc,
-            RefLock::new(TableState::new(mc, t.shape, &t.values, t.items as usize)),
-        ))
+        Self::alloc(mc, t.shape, &t.values, t.items as usize)
+    }
+
+    /// A table in `shape` holding `values` in its slots, with nil in keys
+    /// `1..=items` of an array part kept in the table's own cell.
+    #[inline(always)]
+    fn alloc(mc: &Mutation<'gc>, shape: Shape<'gc>, values: &[Value<'gc>], items: usize) -> Self {
+        debug_assert_eq!(values.len(), shape.slot_count() as usize);
+        let cap = shape.inline_cap() as usize;
+        let (inline, spilled) = values.split_at(values.len().min(cap));
+        let asize = if items == 0 { 0 } else { items + 1 };
+        let state = TableState {
+            shape,
+            spill: match spilled.len() {
+                0 => NonNull::dangling(),
+                n => slots::alloc(mc, n, |i| spilled[i]),
+            },
+            spill_cap: spilled.len() as u32,
+            inline_len: (cap + asize) as u32,
+            array: NonNull::dangling(),
+            asize: asize as u32,
+            int_hash: hash_part::Part::new_in(GcAlloc::new(mc)),
+            len_hint: Cell::new(0),
+            misc_hash: hash_part::Part::new_in(GcAlloc::new(mc)),
+            dict: None,
+            metatable: None,
+            mt_cache: None,
+        };
+        // SAFETY: initializes all `cap + asize` values.
+        let gc = unsafe {
+            Gc::new_with_trailing(mc, RefLock::new(state), |dst| {
+                let dst = dst.cast::<Value<'gc>>();
+                for (i, &v) in inline.iter().enumerate() {
+                    dst.add(i).write(v);
+                }
+                for i in inline.len()..cap + asize {
+                    dst.add(i).write(Value::nil());
+                }
+            })
+        };
+        if asize > 0 {
+            // SAFETY: nothing else refers to the new table yet, and a pointer into its own
+            // cell adopts no `Gc`.
+            unsafe { (*gc.as_ptr()).array = Gc::trailing_ptr(gc).cast().add(cap) };
+        }
+        Table(gc)
+    }
+
+    /// The named slot at `loc` (see [`SlotLoc`]) of this table, whose state
+    /// is `state`.
+    ///
+    /// # Safety
+    ///
+    /// `loc` must be resolved against `state`'s shape, for one of its slots.
+    #[inline(always)]
+    pub unsafe fn load(self, state: &TableState<'gc>, loc: SlotLoc) -> Value<'gc> {
+        unsafe { *self.slot_ptr(state, loc) }
+    }
+
+    /// Store to the named slot at `loc`; the caller handles the barrier.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::load`].
+    #[inline(always)]
+    pub unsafe fn store(self, state: &TableState<'gc>, loc: SlotLoc, v: Value<'gc>) {
+        unsafe { *self.slot_ptr(state, loc) = v }
+    }
+
+    /// Store the property `to` adds to `state`'s shape at `loc`, its new
+    /// slot, and move to `to`; the caller handles the barrier.
+    ///
+    /// # Safety
+    ///
+    /// `to` must be a property transition from `state`'s shape, `loc`
+    /// resolved against `to` for its last slot, and [`TableState::has_room`]
+    /// true for it.
+    #[inline(always)]
+    pub unsafe fn push(
+        self,
+        state: &mut TableState<'gc>,
+        to: Shape<'gc>,
+        loc: SlotLoc,
+        v: Value<'gc>,
+    ) {
+        debug_assert!(state.has_room(loc) && to.slot_count() == state.shape.slot_count() + 1);
+        unsafe { *self.slot_ptr(state, loc) = v };
+        state.shape = to;
+    }
+
+    #[inline(always)]
+    unsafe fn slot_ptr(self, state: &TableState<'gc>, loc: SlotLoc) -> *mut Value<'gc> {
+        let base = match loc.spilled() {
+            false => Gc::as_ptr(self.0).cast::<u8>().cast_mut(),
+            true => state.spill.as_ptr().cast::<u8>(),
+        };
+        unsafe { base.add(loc.offset()).cast() }
     }
 
     pub fn raw_get(self, key: Value<'gc>) -> Value<'gc> {
@@ -167,12 +259,17 @@ pub struct TableState<'gc> {
     /// naturally bypass.
     pub(crate) shape: Shape<'gc>,
     /// String-keyed property values by slot, `shape.slot_count()` of them:
-    /// a [`slots`] cell of `named_cap` values, or dangling. Empty in dict
-    /// mode (storage moves to `dict`).
-    named: NonNull<Value<'gc>>,
-    named_cap: u32,
+    /// the first `shape.inline_cap()` in this table's own cell (see
+    /// `inline`), the rest in `spill`, a [`slots`] cell of `spill_cap`
+    /// values or dangling. None in dict mode (storage moves to `dict`).
+    spill: NonNull<Value<'gc>>,
+    spill_cap: u32,
+    /// Values in this table's own cell, right after it: the inline slots of
+    /// the shape it was made in, then the array part a constructor sized.
+    inline_len: u32,
     /// Integer keys `0..asize`, as in LuaJIT: may hold nils, and is only
-    /// resized by `rehash_ints`. A [`slots`] cell, or dangling when empty.
+    /// resized by `rehash_ints`. In this table's own cell, a [`slots`]
+    /// cell, or dangling when empty.
     array: NonNull<Value<'gc>>,
     asize: u32,
     /// Every other integer key, and floats with an integral value.
@@ -200,6 +297,47 @@ pub struct TableState<'gc> {
 // Everything a table holds is GC memory (see `slots` and `GcAlloc`), so sweeping one runs nothing.
 const _: () = assert!(!core::mem::needs_drop::<TableState<'static>>());
 
+// SAFETY: a `TableState` is only allocated by `Table::alloc`, through `Gc::new_with_trailing` with
+// `inline_len` values, which never changes, and it has no drop glue.
+unsafe impl TrailingBytes for TableState<'_> {
+    #[inline(always)]
+    fn trailing_len(&self) -> usize {
+        self.inline_len as usize * size_of::<Value>()
+    }
+}
+
+/// Where tables of one shape keep a named slot, resolved once so that a
+/// cached access reads neither the shape nor its capacity: a byte offset
+/// from the table's lock (`Gc::as_ptr`) for an inline slot, else
+/// `SPILLED` plus a byte offset into its spill cell.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SlotLoc(u32);
+
+impl SlotLoc {
+    const SPILLED: u32 = 1 << 31;
+
+    /// Where tables of `shape` keep `slot`.
+    #[inline]
+    pub fn new(shape: Shape<'_>, slot: u32) -> Self {
+        let cap = shape.inline_cap();
+        let size = size_of::<Value>() as u32;
+        match slot.checked_sub(cap) {
+            None => SlotLoc(RefLock::<TableState>::TRAILING_FROM_LOCK as u32 + slot * size),
+            Some(i) => SlotLoc(Self::SPILLED | (i * size)),
+        }
+    }
+
+    #[inline(always)]
+    fn spilled(self) -> bool {
+        self.0 & Self::SPILLED != 0
+    }
+
+    #[inline(always)]
+    fn offset(self) -> usize {
+        (self.0 & !Self::SPILLED) as usize
+    }
+}
+
 // SAFETY: a weak table defers itself, and every edge it skips is resurrected by `converge` or
 // dropped by `clear_dead` before sweeping (see `Lua::finalize_and_sweep`).
 unsafe impl<'gc> Collect<'gc> for TableState<'gc> {
@@ -208,11 +346,11 @@ unsafe impl<'gc> Collect<'gc> for TableState<'gc> {
         cc.trace(&self.metatable);
         cc.trace(&self.mt_cache);
         let mode = self.weak_mode();
-        // SAFETY: non-empty parts are live `slots` cells.
-        if self.named_cap > 0 {
-            unsafe { slots::mark(cc, self.named) };
+        // SAFETY: non-empty parts outside the table's cell are live `slots` cells.
+        if self.spill_cap > 0 {
+            unsafe { slots::mark(cc, self.spill) };
         }
-        if self.asize > 0 {
+        if self.asize > 0 && !self.array_inline() {
             unsafe { slots::mark(cc, self.array) };
         }
         hash_part::mark(cc, &self.int_hash);
@@ -220,8 +358,10 @@ unsafe impl<'gc> Collect<'gc> for TableState<'gc> {
         if let Some(d) = &self.dict {
             hash_part::mark(cc, &d.table);
         }
+        let (inline, spilled) = self.named();
         if mode.is_empty() {
-            cc.trace(self.properties());
+            cc.trace(inline);
+            cc.trace(spilled);
             cc.trace(self.array());
             cc.trace(&self.int_hash);
             cc.trace(&self.misc_hash);
@@ -235,7 +375,7 @@ unsafe impl<'gc> Collect<'gc> for TableState<'gc> {
                 cc.trace(v);
             }
         };
-        for v in self.properties().iter().chain(self.array()) {
+        for v in inline.iter().chain(spilled).chain(self.array()) {
             value(cc, v);
         }
         for e in self.int_hash.iter() {
@@ -273,36 +413,6 @@ pub struct DictState<'gc> {
 pub struct InvalidKey;
 
 impl<'gc> TableState<'gc> {
-    /// A table in `shape` holding `values` in its slots, with nil in keys
-    /// `1..=items` of its array part.
-    #[inline(always)]
-    fn new(mc: &Mutation<'gc>, shape: Shape<'gc>, values: &[Value<'gc>], items: usize) -> Self {
-        debug_assert_eq!(values.len(), shape.slot_count() as usize);
-        Self {
-            shape,
-            named: match values.len() {
-                0 => NonNull::dangling(),
-                n => slots::alloc(mc, n, |i| values[i]),
-            },
-            named_cap: values.len() as u32,
-            // `nils` stays out of line: inlined, its spills cost every table.
-            array: match items {
-                0 => NonNull::dangling(),
-                n => nils(mc, n + 1),
-            },
-            asize: match items {
-                0 => 0,
-                n => n as u32 + 1,
-            },
-            int_hash: hash_part::Part::new_in(GcAlloc::new(mc)),
-            len_hint: Cell::new(0),
-            misc_hash: hash_part::Part::new_in(GcAlloc::new(mc)),
-            dict: None,
-            metatable: None,
-            mt_cache: None,
-        }
-    }
-
     #[inline]
     pub fn shape(&self) -> Shape<'gc> {
         self.shape
@@ -371,7 +481,8 @@ impl<'gc> TableState<'gc> {
             }
         };
         let keys = self.shape.keys();
-        for (v, &key) in self.properties_mut().iter_mut().zip(keys) {
+        let (inline, spilled) = self.named_mut();
+        for (v, &key) in inline.iter_mut().chain(spilled).zip(keys) {
             if v.is_dead(fc) {
                 *v = Value::nil();
                 cleared(key);
@@ -394,62 +505,83 @@ impl<'gc> TableState<'gc> {
             .kill_where(|e| e.key.is_dead(fc) || e.value.is_dead(fc));
     }
 
-    /// Read the slot directly; used by the IC fast path on a verified shape match.
-    ///
-    /// # Safety
-    ///
-    /// `slot` must be in range for this table's shape.
-    #[inline]
-    pub unsafe fn property_at(&self, slot: u32) -> Value<'gc> {
-        debug_assert!(slot < self.shape.slot_count());
-        unsafe { *self.named.as_ptr().add(slot as usize) }
-    }
-
-    /// Write the slot directly; the store-side counterpart of [`Self::property_at`].
-    ///
-    /// # Safety
-    ///
-    /// `slot` must be in range for this table's shape.
-    #[inline]
-    pub unsafe fn set_property_at(&mut self, slot: u32, v: Value<'gc>) {
-        debug_assert!(slot < self.shape.slot_count());
-        unsafe { *self.named.as_ptr().add(slot as usize) = v }
-    }
-
-    /// Whether adding a property needs a bigger cell.
-    #[inline]
-    pub fn properties_full(&self) -> bool {
-        self.shape.slot_count() == self.named_cap
-    }
-
-    /// Store the property `to` adds to this table's shape, and move to `to`.
-    ///
-    /// # Safety
-    ///
-    /// `to` must be a property transition from this table's shape, and
-    /// [`Self::properties_full`] false.
-    #[inline]
-    pub unsafe fn push_property(&mut self, to: Shape<'gc>, v: Value<'gc>) {
-        let slot = self.shape.slot_count();
-        debug_assert!(slot < self.named_cap && to.slot_count() == slot + 1);
-        unsafe { *self.named.as_ptr().add(slot as usize) = v };
-        self.shape = to;
-    }
-
+    /// This table's own cell's values (see `inline_len`).
     #[inline(always)]
-    fn properties(&self) -> &[Value<'gc>] {
-        // SAFETY: `named` holds the shape's slots, in a cell nothing else refers to.
+    fn inline(&self) -> NonNull<Value<'gc>> {
+        // SAFETY: every `TableState` lives in a `Table`'s cell.
+        unsafe { RefLock::trailing_ptr_of(self).cast() }
+    }
+
+    /// Whether the array part is in this table's own cell.
+    #[inline]
+    fn array_inline(&self) -> bool {
+        let start = self.inline().as_ptr().addr();
+        let at = self.array.as_ptr().addr();
+        at.wrapping_sub(start) < self.inline_len as usize * size_of::<Value>()
+    }
+
+    /// The named slots: the inline ones, then the spilled ones.
+    #[inline(always)]
+    fn named(&self) -> (&[Value<'gc>], &[Value<'gc>]) {
+        let (n, cap) = (
+            self.shape.slot_count() as usize,
+            self.shape.inline_cap() as usize,
+        );
+        // SAFETY: the cell holds the shape's `cap` inline slots, and `spill` the rest.
         unsafe {
-            core::slice::from_raw_parts(self.named.as_ptr(), self.shape.slot_count() as usize)
+            (
+                core::slice::from_raw_parts(self.inline().as_ptr(), n.min(cap)),
+                core::slice::from_raw_parts(self.spill.as_ptr(), n.saturating_sub(cap)),
+            )
         }
     }
 
     #[inline(always)]
-    fn properties_mut(&mut self) -> &mut [Value<'gc>] {
-        // SAFETY: as in `properties`.
+    fn named_mut(&mut self) -> (&mut [Value<'gc>], &mut [Value<'gc>]) {
+        let (n, cap) = (
+            self.shape.slot_count() as usize,
+            self.shape.inline_cap() as usize,
+        );
+        // SAFETY: as in `named`; the two never overlap.
         unsafe {
-            core::slice::from_raw_parts_mut(self.named.as_ptr(), self.shape.slot_count() as usize)
+            (
+                core::slice::from_raw_parts_mut(self.inline().as_ptr(), n.min(cap)),
+                core::slice::from_raw_parts_mut(self.spill.as_ptr(), n.saturating_sub(cap)),
+            )
         }
+    }
+
+    #[inline]
+    fn named_ptr(&self, slot: u32) -> *mut Value<'gc> {
+        debug_assert!(slot < self.shape.slot_count());
+        let cap = self.shape.inline_cap();
+        // SAFETY: in bounds, as in `named`.
+        unsafe {
+            match slot.checked_sub(cap) {
+                None => self.inline().as_ptr().add(slot as usize),
+                Some(i) => self.spill.as_ptr().add(i as usize),
+            }
+        }
+    }
+
+    /// The value in `slot` of this table's shape.
+    #[inline]
+    pub fn named_get(&self, slot: u32) -> Value<'gc> {
+        unsafe { *self.named_ptr(slot) }
+    }
+
+    /// Store to `slot` of this table's shape.
+    #[inline]
+    pub fn named_set(&mut self, slot: u32, v: Value<'gc>) {
+        unsafe { *self.named_ptr(slot) = v }
+    }
+
+    /// Whether the slot at `loc`, the next one this table's shape would
+    /// add, has storage: inline slots always do, spilled ones while the
+    /// spill cell has room.
+    #[inline(always)]
+    pub fn has_room(&self, loc: SlotLoc) -> bool {
+        !loc.spilled() || loc.offset() < self.spill_cap as usize * size_of::<Value>()
     }
 
     #[inline(always)]
@@ -514,7 +646,7 @@ impl<'gc> TableState<'gc> {
             return hash_part::get(&d.table, lua_string_hash(key), key);
         }
         match self.shape.find_slot(key) {
-            Some(slot) => self.properties()[slot as usize],
+            Some(slot) => self.named_get(slot),
             None => Value::nil(),
         }
     }
@@ -573,7 +705,7 @@ impl<'gc> TableState<'gc> {
             Some(slot) => {
                 // Deletion keeps the slot (nil-valued) so the shape stays stable
                 // and `next` can resume from the deleted key.
-                self.properties_mut()[slot as usize] = value;
+                self.named_set(slot, value);
                 self.maybe_update_mt_bit(Value::string(key), value);
             }
             None => self.add_string_key(ctx, key, value, cap),
@@ -602,22 +734,23 @@ impl<'gc> TableState<'gc> {
             return;
         }
         let new_shape = shape::transition_add_prop(ctx.mutation(), self.shape, key);
-        if self.properties_full() {
-            self.grow_properties(ctx.mutation());
+        let slot = self.shape.slot_count();
+        if !self.has_room(SlotLoc::new(new_shape, slot)) {
+            self.grow_spill(ctx.mutation());
         }
-        // SAFETY: room was just made.
-        unsafe { self.push_property(new_shape, value) };
+        self.shape = new_shape;
+        self.named_set(slot, value);
         self.maybe_update_mt_bit(Value::string(key), value);
     }
 
-    /// Move the properties to a cell with room for more; the old one is left
-    /// for the sweep.
+    /// Move the spilled slots to a cell with room for more; the old one is
+    /// left for the sweep.
     #[cold]
-    fn grow_properties(&mut self, mc: &Mutation<'gc>) {
-        let old = self.properties();
+    fn grow_spill(&mut self, mc: &Mutation<'gc>) {
+        let old = self.named().1;
         let cap = (old.len() * 2).max(4);
-        self.named = slots::alloc(mc, cap, |i| old.get(i).copied().unwrap_or(Value::nil()));
-        self.named_cap = cap as u32;
+        self.spill = slots::alloc(mc, cap, |i| old.get(i).copied().unwrap_or(Value::nil()));
+        self.spill_cap = cap as u32;
     }
 
     fn set_string_key_dict(&mut self, key: LuaString<'gc>, value: Value<'gc>) {
@@ -642,14 +775,16 @@ impl<'gc> TableState<'gc> {
         );
         let keys = self.shape.keys();
         let mut table = hash_part::Part::with_capacity_in(keys.len(), GcAlloc::new(ctx.mutation()));
-        for (&k, &v) in keys.iter().zip(self.properties()) {
+        let (inline, spilled) = self.named();
+        for (&k, &v) in keys.iter().zip(inline.iter().chain(spilled)) {
             if v.is_nil() {
                 continue;
             }
             hash_part::insert_unique(&mut table, lua_string_hash(k), k, v);
         }
-        self.named = NonNull::dangling();
-        self.named_cap = 0;
+        // The inline slots stay in the cell, unread: the dict sentinel has none.
+        self.spill = NonNull::dangling();
+        self.spill_cap = 0;
         self.shape = match self.shape.mt_cache() {
             Some(c) => c.ensure_dict_sentinel(ctx.mutation()),
             None => ctx.empty_dict_sentinel(),
@@ -876,11 +1011,14 @@ impl<'gc> TableState<'gc> {
                 Some(d) => {
                     hash_part::next_live(&d.table, from).map(|e| (Value::string(e.key), e.value))
                 }
-                None => self.shape.keys()[from..]
-                    .iter()
-                    .zip(&self.properties()[from..])
-                    .map(|(&k, &v)| (Value::string(k), v))
-                    .find(|(_, v)| !v.is_nil()),
+                None => {
+                    let (inline, spilled) = self.named();
+                    self.shape.keys()[from..]
+                        .iter()
+                        .zip(inline.iter().chain(spilled).skip(from))
+                        .map(|(&k, &v)| (Value::string(k), v))
+                        .find(|(_, v)| !v.is_nil())
+                }
             };
             if found.is_some() {
                 return Ok(found);
@@ -898,11 +1036,6 @@ enum Part {
     Ints,
     Strings,
     Misc,
-}
-
-#[inline(never)]
-fn nils<'gc>(mc: &Mutation<'gc>, n: usize) -> NonNull<Value<'gc>> {
-    slots::alloc(mc, n, |_| Value::nil())
 }
 
 /// The integer a key normalizes to: integers, and floats with an exact

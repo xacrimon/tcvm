@@ -9,7 +9,7 @@ use cstree::build::NodeCache;
 use crate::compiler::compile_chunk;
 use crate::dmm::{DynamicRootSet, Gc, Mutation, RefLock};
 use crate::env::function::{Function, UpvalueState};
-use crate::env::shape::Shape;
+use crate::env::shape::{Shape, inline_bucket};
 use crate::env::string::Interner;
 use crate::env::{LuaString, Symbols, Table, Value};
 use crate::lua::stash::{Fetchable, Stashable};
@@ -37,10 +37,16 @@ impl<'gc> Context<'gc> {
         self.state.globals
     }
 
-    /// Shared empty / root shape — every newly-allocated table starts
-    /// here. Stable for the lifetime of the runtime.
+    /// The root shape of tables with no inline slots, where `{}` starts.
+    /// Stable for the lifetime of the runtime.
     pub fn empty_shape(self) -> Shape<'gc> {
-        self.state.empty_shape
+        self.state.root_shapes[0]
+    }
+
+    /// The root shape of tables with room for `n` inline slots, or for as
+    /// many as tables hold inline.
+    pub fn root_shape(self, n: usize) -> Shape<'gc> {
+        self.state.root_shapes[inline_bucket(n)]
     }
 
     /// Dict-mode sentinel for tables with no metatable. Tables that

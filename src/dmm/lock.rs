@@ -4,6 +4,7 @@ use core::{
     cell::{Cell, OnceCell},
     cmp::Ordering,
     fmt,
+    ptr::NonNull,
 };
 
 use crate::dmm::{
@@ -11,6 +12,7 @@ use crate::dmm::{
     barrier::Unlock,
     checked_cell::{BorrowError, BorrowMutError, CheckedCell, Ref, RefMut},
     collect::{Collect, Trace},
+    types::{GcBoxInner, TrailingBytes},
 };
 
 // Helper macro to factor out the common parts of locks types.
@@ -374,5 +376,34 @@ impl<'gc, T: 'gc> Gc<'gc, OnceLock<T>> {
             mc.backward_barrier(Gc::erase(self), None);
             f()
         })
+    }
+}
+
+// SAFETY: the lock adds no bytes of its own after the value's, and the value's length is read
+// through the cell only when nothing borrows it mutably: at allocation and by the collector.
+unsafe impl<T: TrailingBytes> TrailingBytes for RefLock<T> {
+    #[inline(always)]
+    fn trailing_len(&self) -> usize {
+        unsafe { (*self.as_ptr()).trailing_len() }
+    }
+}
+
+impl<T: TrailingBytes> RefLock<T> {
+    /// Offset of the trailing bytes from the lock, as `Gc::as_ptr` gives it.
+    pub const TRAILING_FROM_LOCK: usize = GcBoxInner::<Self>::TRAILING_FROM_VALUE;
+
+    /// Offset of the trailing bytes from the locked value.
+    pub const TRAILING_FROM_INNER: usize =
+        GcBoxInner::<Self>::TRAILING_FROM_VALUE - CheckedCell::<T>::VALUE_OFFSET;
+
+    /// The trailing bytes of the `Gc<RefLock<T>>` that holds `value`, with the allocation's
+    /// provenance (exposed when it was allocated), so a reference to the value is enough.
+    ///
+    /// # Safety
+    /// `value` must be the value of a `Gc<RefLock<T>>` that has not been collected.
+    #[inline(always)]
+    pub unsafe fn trailing_ptr_of(value: &T) -> NonNull<u8> {
+        let addr = (value as *const T).addr() + Self::TRAILING_FROM_INNER;
+        unsafe { NonNull::new_unchecked(core::ptr::with_exposed_provenance_mut(addr)) }
     }
 }

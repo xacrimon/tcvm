@@ -437,6 +437,8 @@ impl Context {
                 std::alloc::handle_alloc_error(layout)
             };
             ptr.write(GcBoxInner::new(GcBoxHeader::new_trailing::<T>(), t));
+            // For `RefLock::trailing_ptr_of`, which only has a reference to the value.
+            ptr.expose_provenance();
             init(ptr.cast::<u8>().add(GcBoxInner::<T>::TRAILING_OFFSET));
             ptr
         };
