@@ -311,6 +311,18 @@ macro_rules! helpers {
                     return Exit::Gc;
                 }
             }};
+            // Where nothing is pending above the frame's registers: `top`
+            // may be stale there (fixed-count returns leave it), so bound
+            // the collector's trace by the window, as LuaJIT's `fixtop`.
+            (window) => {{
+                if std::hint::unlikely($ctx.mutation().metrics().gc_check_due()) {
+                    unsafe {
+                        $thread.top = (*$frame).base() + $closure.max_stack_size as usize;
+                        (*$frame).pc = $ip;
+                    }
+                    return Exit::Gc;
+                }
+            }};
         }
 
         /// Keys a raw table write must refuse (`luaH_set`); an absent key
@@ -1706,7 +1718,7 @@ extern "rust-preserve-none" fn op_newtable<'gc>(
     // SAFETY: the compiler gives each NEWTABLE a template.
     let t = unsafe { closure.proto.templates.get_unchecked(template as usize) };
     *reg!(ref mut dst) = Value::table(Table::from_template(ctx.mutation(), t));
-    gc_check!();
+    gc_check!(window);
     dispatch!();
 }
 
@@ -2136,7 +2148,7 @@ extern "rust-preserve-none" fn op_concat<'gc>(
     let mut buf = Vec::new();
     if num::coerce_to_str(&mut buf, a) && num::coerce_to_str(&mut buf, b) {
         *reg!(ref mut dst) = Value::string(LuaString::new(ctx, &buf));
-        gc_check!();
+        gc_check!(window);
         dispatch!();
     }
     let meta_fn = binop_metamethod(ctx, a, b, MetamethodBits::CONCAT);
@@ -4353,7 +4365,7 @@ extern "rust-preserve-none" fn op_closure<'gc>(
         }
     }
     *reg!(ref mut dst) = Value::function(func);
-    gc_check!();
+    gc_check!(window);
     dispatch!();
 }
 
@@ -5144,10 +5156,10 @@ extern "rust-preserve-none" fn ret_call<'gc>(
     // The function slot is below the values, and the landing inside the
     // callee's window, which the CALL sized the vec for.
     unsafe { land_results(dst, values, nret, wanted) };
-    // Without this a `top` left high by a multires producer inside the callee
-    // would keep its dead registers traced (#43).
-    let dst = unsafe { dst.offset_from_unsigned(thread.stack.as_ptr()) };
-    thread.set_top_unchecked(dst + wanted);
+    if returns == 0 {
+        let dst = unsafe { dst.offset_from_unsigned(thread.stack.as_ptr()) };
+        thread.set_top_unchecked(dst + wanted);
+    }
     dispatch!();
 }
 
@@ -6910,7 +6922,6 @@ macro_rules! ret_call_n {
         ) -> Exit {
             let (nret, values, dst) = ret_args!(instruction, registers, ip);
             helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-            let base = unsafe { (*frame).base() };
             let _ = resume_caller!(thread, registers, ip, frame, closure);
             for i in 0..$n {
                 let v = if i < nret {
@@ -6920,10 +6931,9 @@ macro_rules! ret_call_n {
                 };
                 unsafe { dst.add(i).write(v) };
             }
-            // Nothing above the caller's window is pending, and the window
-            // is live anyway: `base` is a valid `top` that drops whatever
-            // the callee left above it (#43), one store instead of a count.
-            thread.set_top_unchecked(base);
+            // `top` keeps whatever the callee left: nothing reads it before a
+            // MULTRET producer sets it, and a GC check bounds the trace by the
+            // window (`gc_check!(window)`).
             dispatch!();
         }
     };
