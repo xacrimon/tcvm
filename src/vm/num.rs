@@ -520,6 +520,13 @@ pub fn write_float(dst: &mut Vec<u8>, f: f64) {
     crate::builtin::util::push_float(dst, f);
 }
 
+/// Room `coerce_to_str` may take for `val`: its length for a string, enough
+/// for any number.
+#[inline]
+pub fn concat_len(val: Value) -> usize {
+    val.get_string().map_or(24, |s| s.len())
+}
+
 pub fn coerce_to_str(buf: &mut Vec<u8>, val: Value) -> bool {
     if let Some(s) = val.get_string() {
         buf.extend_from_slice(s.as_bytes());
