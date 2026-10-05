@@ -7,7 +7,7 @@
 use std::pin::Pin;
 
 use tcvm::dmm::{Collect, Trace};
-use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, Stack, Value};
 use tcvm::lua::Context;
 use tcvm::vm::sequence::{BoxSequence, CallbackAction, Execution, Sequence, SequencePoll};
 use tcvm::{Executor, LoadError, Lua};
@@ -67,7 +67,7 @@ fn coroutine_yields_from_sequence_then_resumes() {
     lua.load_all();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let f = Function::new_native(ctx.mutation(), yielding_seq as NativeFn, &[]);
+            let f = Function::new_action(ctx.mutation(), yielding_seq, &[]);
             let key = Value::string(LuaString::new(ctx, b"yseq"));
             ctx.globals().raw_set(ctx, key, Value::function(f));
             // Inside a coroutine, call yseq() which yields 42; the

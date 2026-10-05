@@ -11,7 +11,7 @@
 //! `StoreResult` (`__index`), `CondJump` (`__lt`, where the resumed value must
 //! steer a branch rather than land in a register), and `TForCall`.
 
-use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Value};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, Stack, Table, Value};
 use tcvm::vm::sequence::CallbackAction;
 use tcvm::{Context, Executor, IntoMultiValue, LoadError, Lua, RuntimeError, StepResult};
 
@@ -31,7 +31,7 @@ fn setup(event: &[u8], src: &str) -> (Lua, tcvm::StashedExecutor) {
     let mut lua = Lua::new();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let mm = Function::new_native(ctx.mutation(), suspending_mm as NativeFn, &[]);
+            let mm = Function::new_action(ctx.mutation(), suspending_mm, &[]);
             let meta = Table::new(ctx);
             let ev = Value::string(LuaString::new(ctx, event));
             meta.raw_set(ctx, ev, Value::function(mm));
@@ -117,7 +117,7 @@ fn suspended_iterator_lands_loop_vars() {
     let mut lua = Lua::new();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let iter = Function::new_native(ctx.mutation(), suspending_mm as NativeFn, &[]);
+            let iter = Function::new_action(ctx.mutation(), suspending_mm, &[]);
             let key = Value::string(LuaString::new(ctx, b"iter"));
             ctx.globals().raw_set(ctx, key, Value::function(iter));
             let chunk = ctx.load(

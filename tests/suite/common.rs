@@ -1,7 +1,7 @@
 //! Chunk runners shared by the suite. Each loads every library and runs its
 //! source as the chunk `=c`.
 
-use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, Stack, Value};
 use tcvm::vm::sequence::CallbackAction;
 use tcvm::{Context, Executor, FromMultiValue, LoadError, Lua, RuntimeError, StashedExecutor};
 
@@ -58,7 +58,7 @@ pub fn yielding_lua() -> Lua {
     let mut lua = Lua::new();
     lua.load_all();
     lua.enter(|ctx| {
-        let f = Function::new_native(ctx.mutation(), yielder as NativeFn, &[]);
+        let f = Function::new_action(ctx.mutation(), yielder, &[]);
         let key = Value::string(LuaString::new(ctx, b"yielder"));
         ctx.globals().raw_set(ctx, key, Value::function(f));
     });

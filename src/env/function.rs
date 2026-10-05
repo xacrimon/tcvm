@@ -8,7 +8,7 @@ use crate::env::table::{SlotLoc, TableState};
 use crate::env::thread::ThreadState;
 use crate::env::value::Value;
 use crate::instruction::UpValueDescriptor;
-use crate::vm::interp::{Handler, op_call_native};
+use crate::vm::interp::{Handler, op_call_action, op_call_native};
 use crate::vm::sequence::{CallbackAction, Execution};
 
 /// Debug record for a local register: active for `start_pc <= pc < end_pc`.
@@ -242,43 +242,50 @@ unsafe impl<'gc> Collect<'gc> for LuaClosure<'gc> {
 #[collect(internal, no_drop)]
 pub struct NativeClosure<'gc> {
     #[collect(require_static)]
-    pub function: NativeFn,
+    pub(crate) function: NativeKind,
     pub upvalues: Box<[Value<'gc>], MetricsAlloc<'gc>>,
-    /// What CALL and TAILCALL jump to: `op_call_native`, or for a builtin with
-    /// a fast path its own entry (LuaJIT's `ff_*`), which handles the common
-    /// argument shape inline, never errors, and leaves every other shape to
-    /// `op_call_native`, so `function` stays the complete implementation. An
-    /// entry must check the opcode: after a TAILCALL it returns its results
-    /// from the frame instead of dispatching the next instruction.
+    /// What CALL and TAILCALL jump to: `op_call_native` or `op_call_action`
+    /// by `function`'s kind, or for a builtin with a fast path its own entry
+    /// (LuaJIT's `ff_*`), which handles the common argument shape inline,
+    /// never errors, and leaves every other shape to the kind's generic entry,
+    /// so `function` stays the complete implementation. An entry must check
+    /// the opcode: after a TAILCALL it returns its results from the frame
+    /// instead of dispatching the next instruction.
     #[collect(require_static)]
     pub(crate) entry: Handler,
 }
 
-/// Signature of a native callback invoked by the VM on `CALL` / `TAILCALL`.
+/// A native function: reads its arguments from `stack` and leaves its results
+/// there in their place. `closure` is its own closure, which carries its
+/// upvalues; the running thread is `stack.exec()`. Three arguments rather than
+/// one context struct, because a struct wider than two words is passed through
+/// memory.
 ///
-/// `closure` is the callback's own closure, which carries its upvalues; the
-/// running thread is `stack.exec()`. Three arguments rather than one context
-/// struct, because a struct wider than two words is passed through memory.
-///
-/// Arguments are read from the `Stack` view; return values are produced by
-/// leaving them on the stack above `bottom`. The returned [`CallbackAction`]
-/// tells the executor what to do next:
-///   - `Return` keeps the hot path (sync return, results in the stack window).
-///   - `Suspend` (see [`CallbackAction::call`] and its siblings) is handled by
-///     the executor's driver loop.
-///
-/// On error, return [`Error`] (any Lua value); the executor unwinds Lua
-/// frames until a `Sequence` catcher (e.g. `pcall`) handles it, or surfaces
-/// it to the host as `RuntimeError::Lua`.
+/// An error (any Lua value) unwinds to the nearest `pcall` or to the host as
+/// `RuntimeError::Lua`.
 pub type NativeFn = for<'gc, 'a> fn(
+    ctx: Context<'gc>,
+    closure: &'a NativeClosure<'gc>,
+    stack: Stack<'gc, 'a>,
+) -> Result<(), Error<'gc>>;
+
+/// A native that may ask the VM to act once it returns: call a function and
+/// continue in a [`NativeCont`](crate::vm::sequence::NativeCont), resume or
+/// yield a coroutine, or suspend into the executor (see [`CallbackAction`]).
+pub type ActionFn = for<'gc, 'a> fn(
     ctx: Context<'gc>,
     closure: &'a NativeClosure<'gc>,
     stack: Stack<'gc, 'a>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>>;
 
-// A (tag, pointer) pair, returned in registers; a wider result goes through
-// memory and the `Return` case has to be read back from it.
-const _: () = assert!(std::mem::size_of::<Result<CallbackAction<'static>, Error<'static>>>() == 16);
+// One register: a plain native's return never goes through memory.
+const _: () = assert!(std::mem::size_of::<Result<(), Error<'static>>>() == 8);
+
+#[derive(Clone, Copy)]
+pub(crate) enum NativeKind {
+    Plain(NativeFn),
+    Action(ActionFn),
+}
 
 /// A mutable view into the running thread's value stack, spanning
 /// `stack[bottom..*top]`. The callback sees `stack[0..len()]` as its
@@ -588,13 +595,17 @@ impl<'gc> Function<'gc> {
     }
 
     pub fn new_native(mc: &Mutation<'gc>, function: NativeFn, upvalues: &[Value<'gc>]) -> Self {
-        Self::new_native_with_entry(mc, function, upvalues, op_call_native)
+        Self::new_native_with_entry(mc, NativeKind::Plain(function), upvalues, op_call_native)
+    }
+
+    pub fn new_action(mc: &Mutation<'gc>, function: ActionFn, upvalues: &[Value<'gc>]) -> Self {
+        Self::new_native_with_entry(mc, NativeKind::Action(function), upvalues, op_call_action)
     }
 
     /// A native whose CALLs go to `entry` (see `NativeClosure::entry`).
     pub(crate) fn new_native_with_entry(
         mc: &Mutation<'gc>,
-        function: NativeFn,
+        function: NativeKind,
         upvalues: &[Value<'gc>],
         entry: Handler,
     ) -> Self {

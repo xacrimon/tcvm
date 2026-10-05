@@ -200,7 +200,7 @@ pub(crate) fn seed_thread_close<'gc>(ctx: Context<'gc>, ts: &mut ThreadState<'gc
         return false;
     }
     ts.tbc_list = tbc_list;
-    let entry = Function::new_native(ctx.mutation(), thread_close_entry, &[]);
+    let entry = Function::new_action(ctx.mutation(), thread_close_entry, &[]);
     ts.push_exec(ExecKind::Start(Value::function(entry)));
     ts.status = ThreadStatus::Suspended;
     true

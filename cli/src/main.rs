@@ -4,7 +4,7 @@ use std::pin::Pin;
 
 use clap::Parser;
 use tcvm::dmm::{Collect, Trace};
-use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Value};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, Stack, Table, Value};
 use tcvm::vm::sequence::{
     BoxSequence, CallbackAction, Execution, Sequence, SequencePoll, seq_trace_pointers,
 };
@@ -88,7 +88,7 @@ fn main() {
         let xpcall = ctx
             .globals()
             .raw_get(Value::string(LuaString::new(ctx, b"xpcall")));
-        let handler = Function::new_native(ctx.mutation(), msghandler as NativeFn, &[]);
+        let handler = Function::new_action(ctx.mutation(), msghandler, &[]);
         let executor = Executor::start(ctx, xpcall, (chunk, handler));
         Ok::<_, LoadError>(ctx.stash(executor))
     });

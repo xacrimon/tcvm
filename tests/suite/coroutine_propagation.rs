@@ -18,14 +18,13 @@
 //!     real two-level test, not the indirected "two-level" sentinel).
 
 use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
-use tcvm::vm::sequence::CallbackAction;
 use tcvm::{Context, Executor, LoadError, Lua};
 
 fn deep_boomer<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     Err(Error::from_str(ctx, "deep boom"))
 }
 
@@ -35,7 +34,7 @@ fn always_err<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     Err(Error::from_str(ctx, "two-level"))
 }
 

@@ -28,7 +28,6 @@ use crate::env::{
     Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Userdata, Value,
 };
 use crate::lua::bare_io_msg;
-use crate::vm::sequence::CallbackAction;
 
 // ---------------------------------------------------------------------------
 // File handle payload (plain std types, lives behind `Box<dyn Any>`)
@@ -787,7 +786,7 @@ fn lua_open<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let name = match stack.arg(0) {
         Some(v) => util::check_string(ctx, v, "open", 1)?,
         None => return Err(util::type_error(ctx, "open", 1, "string", None)),
@@ -806,7 +805,7 @@ fn lua_open<'gc>(
             stack.replace(&io_fail(ctx, Some(&what), &e));
         }
     }
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `io.write(...)` — write to the default output; return that handle so
@@ -815,7 +814,7 @@ fn lua_write<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let out = io_file(ctx, closure, "output")?;
     let vals: Vec<Value<'gc>> = stack.as_slice().to_vec();
     match do_write(ctx, out, &vals, "write", 1)? {
@@ -823,7 +822,7 @@ fn lua_write<'gc>(
         WriteOutcome::Closed => return Err(closed_file_error(ctx)),
         WriteOutcome::Io(e, written) => stack.replace(&write_fail(ctx, &e, written)),
     }
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `io.read(...)` — read from the default input.
@@ -831,11 +830,11 @@ fn lua_read<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let inp = io_file(ctx, closure, "input")?;
     let vals = do_read(ctx, inp, stack.as_slice(), "read", 1)?;
     stack.replace(&vals);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `io.close([file])` — close `file` or the default output.
@@ -843,7 +842,7 @@ fn lua_close<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let arg = stack.get(0);
     let file = if arg.is_nil() {
         state_get(ctx, io_state(closure), b"output")
@@ -860,14 +859,14 @@ fn lua_flush<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let out = io_file(ctx, closure, "output")?;
     match with_state(out, flush_stream) {
         WriteOutcome::Closed => return Err(closed_file_error(ctx)),
         WriteOutcome::Io(e, _) => stack.replace(&io_fail(ctx, None, &e)),
         WriteOutcome::Ok => stack.replace(&[Value::userdata(out)]),
     }
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `io.input([file])` — get/set the default input. A string opens that
@@ -876,7 +875,7 @@ fn lua_input<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     default_file(ctx, closure, stack, b"input", b"r", "input")
 }
 
@@ -885,7 +884,7 @@ fn lua_output<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     default_file(ctx, closure, stack, b"output", b"w", "output")
 }
 
@@ -896,7 +895,7 @@ fn default_file<'gc>(
     slot: &[u8],
     mode: &[u8],
     fname: &str,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let arg = stack.get(0);
     if !arg.is_nil() {
         let handle = if let Some(s) = util::to_lstring(ctx, arg) {
@@ -914,7 +913,7 @@ fn default_file<'gc>(
     }
     let cur = state_get(ctx, io_state(closure), slot);
     stack.ret1(cur);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `io.lines([filename] [, formats...])`. With a filename, the file is
@@ -925,7 +924,7 @@ fn lua_lines<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let fmt_args = stack.as_slice().get(1..).unwrap_or_default();
     let (handle, close_eof) = if stack.get(0).is_nil() {
         let inp = state_get(ctx, io_state(closure), b"input");
@@ -953,7 +952,7 @@ fn lua_lines<'gc>(
     } else {
         stack.ret1(iter);
     }
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `io.type(v)` — `"file"` / `"closed file"` / `nil`.
@@ -961,7 +960,7 @@ fn lua_type<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     util::check_any(ctx, &stack, "type", 1)?;
     let result = match as_file(ctx, closure, stack.get(0)) {
         Some(u) if is_closed(u) => str_val(ctx, b"closed file"),
@@ -969,7 +968,7 @@ fn lua_type<'gc>(
         None => Value::nil(),
     };
     stack.ret1(result);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `io.tmpfile()` — a fresh temporary file open for update, removed from
@@ -978,7 +977,7 @@ fn lua_tmpfile<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -1002,7 +1001,7 @@ fn lua_tmpfile<'gc>(
         }
         Err(e) => stack.replace(&io_fail(ctx, None, &e)),
     }
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1014,7 +1013,7 @@ fn lua_file_write<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let self_val = stack.get(0);
     let u = check_file(ctx, closure, self_val, "write", 1)?;
     let vals: Vec<Value<'gc>> = stack.as_slice()[1..].to_vec();
@@ -1023,7 +1022,7 @@ fn lua_file_write<'gc>(
         WriteOutcome::Closed => return Err(closed_file_error(ctx)),
         WriteOutcome::Io(e, written) => stack.replace(&write_fail(ctx, &e, written)),
     }
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `file:read(...)`.
@@ -1031,11 +1030,11 @@ fn lua_file_read<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let u = check_file(ctx, closure, stack.get(0), "read", 1)?;
     let vals = do_read(ctx, u, &stack.as_slice()[1..], "read", 2)?;
     stack.replace(&vals);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `file:lines(...)` — like `io.lines` but never auto-closes at EOF.
@@ -1043,13 +1042,13 @@ fn lua_file_lines<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let self_val = stack.get(0);
     check_file(ctx, closure, self_val, "lines", 1)?;
     let fmt_args = &stack.as_slice()[1..];
     let iter = make_lines_iter(ctx, self_val, false, fmt_args)?;
     stack.ret1(Value::function(iter));
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `file:seek([whence [, offset]])` — `set`/`cur`/`end`, default `("cur",0)`.
@@ -1057,7 +1056,7 @@ fn lua_file_seek<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let u = check_file(ctx, closure, stack.get(0), "seek", 1)?;
     let whence = util::opt_string(ctx, stack.get(1), "seek", 2)?;
     let whence = whence.map_or(&b"cur"[..], |w| w.as_bytes());
@@ -1094,7 +1093,7 @@ fn lua_file_seek<'gc>(
         SeekOutcome::Closed => return Err(closed_file_error(ctx)),
         SeekOutcome::Io(e) => stack.replace(&io_fail(ctx, None, &e)),
     }
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `file:flush()` — flush, return `self`.
@@ -1102,7 +1101,7 @@ fn lua_file_flush<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let self_val = stack.get(0);
     let u = check_file(ctx, closure, self_val, "flush", 1)?;
     match with_state(u, flush_stream) {
@@ -1110,7 +1109,7 @@ fn lua_file_flush<'gc>(
         WriteOutcome::Closed => return Err(closed_file_error(ctx)),
         WriteOutcome::Io(e, _) => stack.replace(&io_fail(ctx, None, &e)),
     }
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `file:close()`.
@@ -1118,7 +1117,7 @@ fn lua_file_close<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let u = check_file(ctx, closure, stack.get(0), "close", 1)?;
     close_handle(ctx, u, &mut stack)
 }
@@ -1130,7 +1129,7 @@ fn lua_file_setvbuf<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let u = check_file(ctx, closure, stack.get(0), "setvbuf", 1)?;
     if is_closed(u) {
         return Err(closed_file_error(ctx));
@@ -1173,7 +1172,7 @@ fn lua_file_setvbuf<'gc>(
         Ok(()) => stack.ret1(Value::boolean(true)),
         Err(e) => stack.replace(&io_fail(ctx, None, &e)),
     }
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `__gc`/`__close` — close the file unless it is a standard stream or
@@ -1183,14 +1182,14 @@ fn lua_file_gc<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let u = match stack.arg(0) {
         Some(v) => check_file(ctx, closure, v, "__gc", 1)?,
         None => return Err(util::type_error(ctx, "__gc", 1, "FILE*", None)),
     };
     close_stream(u);
     stack.replace(&[]);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `__tostring` — `"file (0x..)"` / `"file (closed)"`. Set on the metatable
@@ -1199,7 +1198,7 @@ fn lua_file_tostring<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let u = check_file(ctx, closure, stack.get(0), "tostring", 1)?;
     let s = if is_closed(u) {
         "file (closed)".to_string()
@@ -1207,7 +1206,7 @@ fn lua_file_tostring<'gc>(
         format!("file ({:p})", Gc::as_ptr(u.inner()))
     };
     stack.replace(&[str_val(ctx, s.as_bytes())]);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1250,7 +1249,7 @@ fn close_handle<'gc>(
     ctx: Context<'gc>,
     u: Userdata<'gc>,
     stack: &mut Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     match close_stream(u) {
         CloseOutcome::Closed(Ok(())) => stack.replace(&[Value::boolean(true)]),
         CloseOutcome::Closed(Err(e)) => stack.replace(&io_fail(ctx, None, &e)),
@@ -1259,7 +1258,7 @@ fn close_handle<'gc>(
         }
         CloseOutcome::AlreadyClosed => return Err(closed_file_error(ctx)),
     }
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// liolib's cap on the formats a lines iterator keeps.
@@ -1296,7 +1295,7 @@ fn lines_iter<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let handle = closure.upvalues[0];
     let close_eof = closure.upvalues[1].get_boolean().unwrap_or(false);
     let u = handle
@@ -1320,5 +1319,5 @@ fn lines_iter<'gc>(
     } else {
         stack.replace(&vals);
     }
-    Ok(CallbackAction::Return)
+    Ok(())
 }

@@ -8,12 +8,12 @@ use crate::builtin::util::{
     arg_error, check_any, check_integer, check_number, compare_error_msg, float_to_integer,
     num_to_value,
 };
+use crate::env::function::NativeKind;
 use crate::env::{
     Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Userdata, Value,
 };
 use crate::vm::interp::{self, Handler};
 use crate::vm::num;
-use crate::vm::sequence::CallbackAction;
 
 pub fn load<'gc>(ctx: Context<'gc>) {
     // Third column: the CALL entry, `call` unless the builtin has a fast path.
@@ -58,7 +58,12 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         } else {
             &[]
         };
-        let handler = Function::new_native_with_entry(ctx.mutation(), handler, upvalues, entry);
+        let handler = Function::new_native_with_entry(
+            ctx.mutation(),
+            NativeKind::Plain(handler),
+            upvalues,
+            entry,
+        );
         let key = Value::string(LuaString::new(ctx, name.as_bytes()));
         lib.raw_set(ctx, key, Value::function(handler));
     }
@@ -85,11 +90,11 @@ macro_rules! float_unary {
             ctx: Context<'gc>,
             _closure: &NativeClosure<'gc>,
             mut stack: Stack<'gc, '_>,
-        ) -> Result<CallbackAction<'gc>, Error<'gc>> {
+        ) -> Result<(), Error<'gc>> {
             let x = check_number(ctx, stack.get(0), $fname, 1)?;
             let f: fn(f64) -> f64 = $op;
             stack.ret1(Value::float(f(x)));
-            Ok(CallbackAction::Return)
+            Ok(())
         }
     };
 }
@@ -108,7 +113,7 @@ fn lua_abs<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let v = stack.get(0);
     let result = if let Some(i) = v.get_integer() {
         // Wrapping matches Lua: abs(mininteger) == mininteger.
@@ -117,7 +122,7 @@ fn lua_abs<'gc>(
         Value::float(check_number(ctx, v, "abs", 1)?.abs())
     };
     stack.ret1(result);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `atan(y [, x])` — two-argument form is `atan2`; `x` defaults to 1.
@@ -125,7 +130,7 @@ fn lua_atan<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let y = check_number(ctx, stack.get(0), "atan", 1)?;
     let x_arg = stack.get(1);
     let x = if x_arg.is_nil() {
@@ -134,7 +139,7 @@ fn lua_atan<'gc>(
         check_number(ctx, x_arg, "atan", 2)?
     };
     stack.ret1(Value::float(y.atan2(x)));
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `log(x [, base])`. Special-cases bases 2 and 10 to their dedicated libm
@@ -143,7 +148,7 @@ fn lua_log<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let x = check_number(ctx, stack.get(0), "log", 1)?;
     let base_arg = stack.get(1);
     let result = if base_arg.is_nil() {
@@ -159,7 +164,7 @@ fn lua_log<'gc>(
         }
     };
     stack.ret1(Value::float(result));
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `fmod(x, y)` — C `fmod` for floats; for two integers, the C `%` remainder
@@ -169,7 +174,7 @@ fn lua_fmod<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let a = stack.get(0);
     let b = stack.get(1);
     let result = if let (Some(x), Some(y)) = (a.get_integer(), b.get_integer()) {
@@ -186,7 +191,7 @@ fn lua_fmod<'gc>(
         Value::float(x % y)
     };
     stack.ret1(result);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `modf(x)` — `(integral_part, fractional_part)`, both floats.
@@ -194,7 +199,7 @@ fn lua_modf<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let x = check_number(ctx, stack.get(0), "modf", 1)?;
     // Lua 5.5 returns the integral part as an integer when it fits (pushnumint).
     let (ip, fp) = if x.is_infinite() {
@@ -205,7 +210,7 @@ fn lua_modf<'gc>(
         (num_to_value(ctx.mutation(), x.trunc()), x.fract())
     };
     stack.replace(&[ip, Value::float(fp)]);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `x = m * 2^e` with `0.5 <= |m| < 1`; zeros, infinities and NaN come back
@@ -258,11 +263,11 @@ fn lua_frexp<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let x = check_number(ctx, stack.get(0), "frexp", 1)?;
     let (m, e) = frexp(x);
     stack.replace(&[Value::float(m), Value::integer(ctx.mutation(), e.into())]);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `ldexp(m, e)` — `m * 2^e`.
@@ -270,19 +275,19 @@ fn lua_ldexp<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let m = check_number(ctx, stack.get(0), "ldexp", 1)?;
     // Truncated to `int`, as lmathlib casts it.
     let e = check_integer(ctx, stack.get(1), "ldexp", 2)? as i32;
     stack.ret1(Value::float(ldexp(m, e)));
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 fn lua_ceil<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     round_to_int(ctx, stack, "ceil", f64::ceil)
 }
 
@@ -290,7 +295,7 @@ fn lua_floor<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     round_to_int(ctx, stack, "floor", f64::floor)
 }
 
@@ -302,7 +307,7 @@ fn round_to_int<'gc>(
     mut stack: Stack<'gc, '_>,
     fname: &str,
     round: fn(f64) -> f64,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let v = stack.get(0);
     let result = if let Some(i) = v.get_integer() {
         Value::integer(ctx.mutation(), i)
@@ -310,14 +315,14 @@ fn round_to_int<'gc>(
         num_to_value(ctx.mutation(), round(check_number(ctx, v, fname, 1)?))
     };
     stack.ret1(result);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 fn lua_max<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     select_extreme(ctx, stack, "max", false)
 }
 
@@ -325,7 +330,7 @@ fn lua_min<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     select_extreme(ctx, stack, "min", true)
 }
 
@@ -339,7 +344,7 @@ fn select_extreme<'gc>(
     mut stack: Stack<'gc, '_>,
     fname: &str,
     want_min: bool,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     check_any(ctx, &stack, fname, 1)?;
     let n = stack.len();
     let mut best = stack.get(0);
@@ -365,7 +370,7 @@ fn select_extreme<'gc>(
         }
     }
     stack.ret1(best);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `tointeger(x)` — the integer value of `x` if it has one, else `nil`. No
@@ -374,7 +379,7 @@ fn lua_tointeger<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let v = stack.get(0);
     let mc = ctx.mutation();
     let result = if let Some(i) = v.get_integer() {
@@ -390,7 +395,7 @@ fn lua_tointeger<'gc>(
         Value::nil()
     };
     stack.ret1(result);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `type(x)` — `"integer"`, `"float"`, or `nil` if `x` is not a number.
@@ -398,7 +403,7 @@ fn lua_type<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     check_any(ctx, &stack, "type", 1)?;
     let v = stack.get(0);
     let result = if v.get_integer().is_some() {
@@ -409,7 +414,7 @@ fn lua_type<'gc>(
         Value::nil()
     };
     stack.ret1(result);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `ult(m, n)` — unsigned `m < n` over the two integers' bit patterns.
@@ -417,11 +422,11 @@ fn lua_ult<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let m = check_integer(ctx, stack.get(0), "ult", 1)?;
     let n = check_integer(ctx, stack.get(1), "ult", 2)?;
     stack.ret1(Value::boolean((m as u64) < (n as u64)));
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -510,7 +515,7 @@ fn lua_random<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     // Parse + validate before drawing so error paths don't perturb the stream.
     #[derive(Clone, Copy)]
     enum Mode {
@@ -558,7 +563,7 @@ fn lua_random<'gc>(
         .expect("RNG userdata payload type mismatch");
 
     stack.ret1(result);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `randomseed([x [, y]])` — reseed (from entropy with no argument) and return
@@ -567,7 +572,7 @@ fn lua_randomseed<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     // No argument at all → entropy reseed; an explicit arg (even nil) goes
     // through `check_integer`, like Lua's `luaL_checkinteger`.
     let provided = if stack.is_empty() {
@@ -598,5 +603,5 @@ fn lua_randomseed<'gc>(
         Value::integer(ctx.mutation(), s1 as i64),
         Value::integer(ctx.mutation(), s2 as i64),
     ]);
-    Ok(CallbackAction::Return)
+    Ok(())
 }

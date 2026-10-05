@@ -1,7 +1,6 @@
 use crate::Context;
 use crate::builtin::util;
 use crate::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Value};
-use crate::vm::sequence::CallbackAction;
 
 pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[
@@ -46,11 +45,11 @@ fn lua_getmetatable<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     util::check_any(ctx, &stack, "getmetatable", 1)?;
     let mt = ctx.metatable_of(stack.get(0));
     stack.replace(&[mt.map_or(Value::nil(), Value::table)]);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `debug.setmetatable(v, mt)` — set `v`'s metatable (shared by its whole
@@ -59,7 +58,7 @@ fn lua_setmetatable<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let v = stack.get(0);
     let mt = match stack.arg(1) {
         Some(v) if v.is_nil() => None,
@@ -76,7 +75,7 @@ fn lua_setmetatable<'gc>(
     };
     ctx.set_metatable_of(v, mt);
     stack.replace(&[v]);
-    Ok(CallbackAction::Return)
+    Ok(())
 }
 
 /// `debug.traceback([thread,] [msg [, level]])` — `msg` itself, as a string
@@ -86,7 +85,7 @@ fn lua_traceback<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<(), Error<'gc>> {
     let arg = usize::from(stack.get(0).get_thread().is_some());
     let msg = stack.get(arg);
     let text = util::to_lstring(ctx, msg);
@@ -96,5 +95,5 @@ fn lua_traceback<'gc>(
         util::check_integer(ctx, level, "traceback", arg + 2)?;
     }
     stack.ret1(text.map_or(msg, Value::string));
-    Ok(CallbackAction::Return)
+    Ok(())
 }

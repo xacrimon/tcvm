@@ -1,6 +1,7 @@
 use crate::dmm::{Gc, Mutation, RefLock};
 use crate::env::function::{
-    Function, FunctionKind, InlineCache, LuaFn, NativeClosure, Stack, Upvalue, UpvalueState,
+    Function, FunctionKind, InlineCache, LuaFn, NativeClosure, NativeKind, Stack, Upvalue,
+    UpvalueState,
 };
 use crate::env::shape::{MAX_PROPERTIES_FAST, MetamethodBits, Shape, mirrored};
 use crate::env::string::LuaString;
@@ -2516,106 +2517,120 @@ pub(crate) unsafe fn land_results<'gc>(
     unsafe { fill_nil(dst.add(n), wanted - n) };
 }
 
-/// The native arm of CALL: run the callback inline and land its results at
+/// Land the results a native left at `args_base..top` at `func_idx`, as
+/// many as `returns` asks for, and continue after the CALL.
+macro_rules! land_native {
+    ($args_base:expr, $func_idx:expr, $returns:expr, $base:expr,
+     $thread:ident, $registers:ident) => {{
+        let (args_base, func_idx, returns) = ($args_base, $func_idx, $returns);
+        // The count comes via the logical top: a native never shrinks the
+        // shared stack, so the caller's register window is still covered.
+        let retc = $thread.top - args_base;
+        let wanted = if returns == 0 {
+            retc
+        } else {
+            returns as usize - 1
+        };
+        // The nil padding stays inside the caller's frame, which the CALL
+        // that entered it sized the vec for.
+        debug_assert!(args_base + retc.min(wanted) <= $thread.stack.len());
+        debug_assert!(func_idx + wanted <= $thread.stack.len());
+        let stack = $thread.stack.as_mut_ptr();
+        unsafe { land_results(stack.add(func_idx), stack.add(args_base), retc, wanted) };
+        // For MULTRET this is the dynamic count the next consumer reads.
+        $thread.set_top_unchecked(func_idx + wanted);
+        $registers = unsafe { $thread.stack.as_mut_ptr().add($base) };
+        gc_check!();
+        dispatch!();
+    }};
+}
+
+/// The arguments of the CALL of a native at `func_idx`: their first slot and
+/// their count.
+macro_rules! native_args {
+    ($func_idx:expr, $nargs:expr, $thread:ident) => {{
+        let args_base = $func_idx + 1;
+        let argc = if $nargs == 0 {
+            $thread.top - args_base
+        } else {
+            $nargs as usize - 1
+        };
+        (args_base, argc)
+    }};
+}
+
+/// The plain-native arm of CALL: run `$f` inline and land its results at
 /// `func_idx`. Expands inside a handler body (needs its `dispatch!`).
-macro_rules! call_native {
-    ($nc:expr, $func_idx:expr, $nargs:expr, $returns:expr, $base:expr,
-     $ctx:ident, $thread:ident, $registers:ident, $ip:ident, $ds:ident, $frame:ident, $closure:ident) => {{
-        let nc = $nc;
+macro_rules! call_plain {
+    ($f:expr, $nc:expr, $func_idx:expr, $nargs:expr, $returns:expr, $base:expr,
+     $ctx:ident, $thread:ident, $registers:ident, $ip:ident, $frame:ident) => {{
         let func_idx = $func_idx;
-        let nargs = $nargs;
-        let returns = $returns;
-        let base = $base;
-        {
-            let args_base = func_idx + 1;
-            let argc = if nargs == 0 {
-                $thread.top - args_base
-            } else {
-                nargs as usize - 1
-            };
-            let action = match invoke_native($ctx, $thread, nc, args_base, argc) {
-                Ok(a) => a,
-                Err(err) => {
-                    // Push `ExecKind::Error` so the executor's unwinder finds
-                    // the nearest catching `ExecKind::Sequence` (e.g. the
-                    // PCallSequence under coroutine.resume). Persist
-                    // caller's pc first so re-entry would work if anything
-                    // catches and resumes.
-                    unsafe { (*$frame).pc = $ip };
-                    $thread.raise($ctx, err);
-                    return Exit::End;
-                }
-            };
-            match action {
-                crate::vm::sequence::CallbackAction::Return => {
-                    // Result count comes via the logical top, not Vec::len:
-                    // `invoke_native` never shrinks the shared stack, so the
-                    // caller's register window is still fully covered.
-                    let retc = $thread.top - args_base;
-                    // Place results at stack[func_idx..] following Lua convention.
-                    let wanted = if returns == 0 {
-                        retc
-                    } else {
-                        returns as usize - 1
-                    };
-                    // Results sit at `args_base = func_idx + 1`, one slot above
-                    // where they land, inside the window `invoke_native` covered.
-                    // The nil padding stays inside the caller's frame, which the
-                    // CALL that entered it sized the vec for.
-                    debug_assert!(args_base + retc.min(wanted) <= $thread.stack.len());
-                    debug_assert!(func_idx + wanted <= $thread.stack.len());
-                    let stack = $thread.stack.as_mut_ptr();
-                    unsafe {
-                        land_results(stack.add(func_idx), stack.add(args_base), retc, wanted)
-                    };
-                    // Publish the logical top. For MULTRET this is the dynamic
-                    // count the next consumer reads.
-                    $thread.set_top_unchecked(func_idx + wanted);
-                    $registers = unsafe { $thread.stack.as_mut_ptr().add(base) };
-                    gc_check!();
-                    dispatch!();
-                }
-                action => {
-                    unsafe { (*$frame).pc = $ip };
-                    let f = unsafe { $thread.stack[func_idx].get_function().unwrap_unchecked() };
-                    // The common shape, a native calling a Lua function, without
-                    // `run_natives`' generality.
-                    if let crate::vm::sequence::CallbackAction::CallThen {
-                        at,
-                        protect,
-                        ok,
-                        cont,
-                    } = action
-                        && let Some(callee) = native_calls_lua($thread, args_base + at as usize)
-                    {
-                        push_native_frame(
-                            $thread,
-                            f,
-                            args_base,
-                            at,
-                            protect,
-                            ok,
-                            cont,
-                            call_ret(returns),
-                        );
-                        let new_base = args_base + at as usize + 1;
-                        enter_from_native($thread, callee, new_base, ret_native);
-                        ($frame, $closure) = (unsafe { $thread.top_lua_ptr() }, callee);
-                        $ip = callee.code;
-                        $registers = unsafe { $thread.stack.as_mut_ptr().add(new_base) };
-                        dispatch!();
-                    }
-                    let step = run_natives!(NativeState::Acted {
-                        r: Ok(action),
-                        framed: false,
-                        f,
-                        base: args_base,
-                        ret: call_ret(returns),
-                    },);
-                    native_step!(step);
-                }
-            }
+        let (args_base, argc) = native_args!(func_idx, $nargs, $thread);
+        if let Err(err) = invoke_plain($ctx, $thread, $f, $nc, args_base, argc) {
+            // Saved so the unwinder locates the error at this CALL.
+            unsafe { (*$frame).pc = $ip };
+            $thread.raise($ctx, err);
+            return Exit::End;
         }
+        land_native!(args_base, func_idx, $returns, $base, $thread, $registers);
+    }};
+}
+
+/// The action-native arm of CALL: run `$f` inline and do what it asks.
+macro_rules! call_action {
+    ($f:expr, $nc:expr, $func_idx:expr, $nargs:expr, $returns:expr, $base:expr,
+     $ctx:ident, $thread:ident, $registers:ident, $ip:ident, $ds:ident, $frame:ident, $closure:ident) => {{
+        let func_idx = $func_idx;
+        let returns = $returns;
+        let (args_base, argc) = native_args!(func_idx, $nargs, $thread);
+        let action = match invoke_action($ctx, $thread, $f, $nc, args_base, argc) {
+            Ok(a) => a,
+            Err(err) => {
+                unsafe { (*$frame).pc = $ip };
+                $thread.raise($ctx, err);
+                return Exit::End;
+            }
+        };
+        if let crate::vm::sequence::CallbackAction::Return = action {
+            land_native!(args_base, func_idx, returns, $base, $thread, $registers);
+        }
+        unsafe { (*$frame).pc = $ip };
+        let f = unsafe { $thread.stack[func_idx].get_function().unwrap_unchecked() };
+        // The common shape, a native calling a Lua function, without
+        // `run_natives`' generality.
+        if let crate::vm::sequence::CallbackAction::CallThen {
+            at,
+            protect,
+            ok,
+            cont,
+        } = action
+            && let Some(callee) = native_calls_lua($thread, args_base + at as usize, 2)
+        {
+            push_native_frame(
+                $thread,
+                f,
+                args_base,
+                at,
+                protect,
+                ok,
+                cont,
+                call_ret(returns),
+            );
+            let new_base = args_base + at as usize + 1;
+            enter_from_native($thread, callee, new_base, ret_native);
+            ($frame, $closure) = (unsafe { $thread.top_lua_ptr() }, callee);
+            $ip = callee.code;
+            $registers = unsafe { $thread.stack.as_mut_ptr().add(new_base) };
+            dispatch!();
+        }
+        let step = run_natives!(NativeState::Acted {
+            r: Ok(action),
+            framed: false,
+            f,
+            base: args_base,
+            ret: call_ret(returns),
+        },);
+        native_step!(step);
     }};
 }
 
@@ -2805,6 +2820,39 @@ pub(crate) extern "rust-preserve-none" fn op_call_native<'gc>(
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
     mut registers: Registers<'gc, '_>,
+    ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    if instruction.op() == Op::TAILCALL {
+        tail!(op_tailcall_native);
+    }
+    let (func, nargs, returns) = instruction.abc();
+    let base = unsafe { (*frame).base() };
+    let func_idx = base + func as usize;
+    let nc = unsafe { &*ds.native };
+    debug_assert!(holds_native(reg!(func), nc));
+    let NativeKind::Plain(f) = nc.function else {
+        debug_assert!(false, "op_call_native entry of an action native");
+        unsafe { std::hint::unreachable_unchecked() }
+    };
+    call_plain!(
+        f, nc, func_idx, nargs, returns, base, ctx, thread, registers, ip, frame
+    );
+}
+
+/// CALL or TAILCALL of an action native: the default `NativeClosure::entry`
+/// of one.
+#[inline(never)]
+#[rustc_align(32)]
+pub(crate) extern "rust-preserve-none" fn op_call_action<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
     mut ip: *const Instruction,
     handlers: *const (),
     ds: &mut DispatchState<'gc>,
@@ -2820,8 +2868,12 @@ pub(crate) extern "rust-preserve-none" fn op_call_native<'gc>(
     let func_idx = base + func as usize;
     let nc = unsafe { &*ds.native };
     debug_assert!(holds_native(reg!(func), nc));
-    call_native!(
-        nc, func_idx, nargs, returns, base, ctx, thread, registers, ip, ds, frame, closure
+    let NativeKind::Action(f) = nc.function else {
+        debug_assert!(false, "op_call_action entry of a plain native");
+        unsafe { std::hint::unreachable_unchecked() }
+    };
+    call_action!(
+        f, nc, func_idx, nargs, returns, base, ctx, thread, registers, ip, ds, frame, closure
     );
 }
 
@@ -2958,13 +3010,13 @@ pub(crate) extern "rust-preserve-none" fn ff_pairs<'gc>(
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (func, nargs, returns) = (instruction.a(), instruction.b(), instruction.c());
     if instruction.op() == Op::TAILCALL || nargs != 2 || returns == 0 {
-        tail!(op_call_native);
+        tail!(op_call_action);
     }
     let Some(t) = reg!(func + 1).get_table() else {
-        tail!(op_call_native);
+        tail!(op_call_action);
     };
     if t.shape().has_mm(MetamethodBits::PAIRS) {
-        tail!(op_call_native);
+        tail!(op_call_action);
     }
     *reg!(ref mut func) = Value::function(ctx.next_fn());
     // `t` is already in R[func+1].
@@ -3046,11 +3098,19 @@ extern "rust-preserve-none" fn op_call_meta<'gc>(
                 closure
             );
         }
-        CallTarget::Native(nc) => {
-            call_native!(
-                nc, func_idx, nargs, returns, base, ctx, thread, registers, ip, ds, frame, closure
-            );
-        }
+        CallTarget::Native(nc) => match nc.function {
+            NativeKind::Plain(f) => {
+                call_plain!(
+                    f, nc, func_idx, nargs, returns, base, ctx, thread, registers, ip, frame
+                );
+            }
+            NativeKind::Action(f) => {
+                call_action!(
+                    f, nc, func_idx, nargs, returns, base, ctx, thread, registers, ip, ds, frame,
+                    closure
+                );
+            }
+        },
     }
 }
 
@@ -3159,7 +3219,7 @@ extern "rust-preserve-none" fn op_tailcall<'gc>(
     tail!(op_tailcall_slow);
 }
 
-/// TAILCALL of a plain native, reached through `op_call_native` or, after a
+/// TAILCALL of a native, reached through its kind's generic entry or, after a
 /// `__call` chain, `op_tailcall_slow`: run it, then return its results from
 /// this frame. The frame is popped before a suspension or an error so that
 /// lands on the caller's frame, as it would after a Lua tail call.
@@ -4370,12 +4430,60 @@ fn save_pc<'gc>(thread: &mut ThreadState<'gc>, ip: *const Instruction) {
     }
 }
 
-/// Invoke a native callback. Presents the callback a window whose logical
-/// length is `argc` (`thread.top` seeded to `args_base + argc`); the backing
-/// vec is grown to physically cover the window but is NEVER shrunk, so a
-/// native call cannot truncate the shared stack below an outer frame's
-/// register window. The callback signals its result count through the logical
-/// top: after the `Return` path, the results count is `thread.top - args_base`.
+/// Present a native the window `args_base..args_base + argc` as its
+/// arguments. The backing vec is grown to cover it but never shrunk, so a
+/// native cannot truncate the shared stack below an outer frame's registers;
+/// it signals its result count through the logical top instead. Dead scratch
+/// it leaves above that top is harmless: `ThreadState`'s trace covers only
+/// the live high-water.
+#[inline(always)]
+fn native_window<'gc, 'a>(
+    thread: &'a mut ThreadState<'gc>,
+    args_base: usize,
+    argc: usize,
+) -> Stack<'gc, 'a> {
+    let end = args_base + argc;
+    thread.ensure_slots(end);
+    thread.top = end;
+    Stack::new(thread, args_base)
+}
+
+/// Run plain native `f` of `nc` on its arguments; its results are then at
+/// `args_base..top`.
+#[inline(always)]
+pub(crate) fn invoke_plain<'gc>(
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    f: crate::env::NativeFn,
+    nc: &NativeClosure<'gc>,
+    args_base: usize,
+    argc: usize,
+) -> Result<(), crate::env::Error<'gc>> {
+    let r = f(ctx, nc, native_window(thread, args_base, argc));
+    if r.is_ok() && thread.native_overflowed() {
+        return Err(native_overflow(ctx));
+    }
+    r
+}
+
+/// Run action native `f` of `nc` on its arguments.
+#[inline(always)]
+pub(crate) fn invoke_action<'gc>(
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    f: crate::env::ActionFn,
+    nc: &NativeClosure<'gc>,
+    args_base: usize,
+    argc: usize,
+) -> Result<crate::vm::sequence::CallbackAction<'gc>, crate::env::Error<'gc>> {
+    let r = f(ctx, nc, native_window(thread, args_base, argc));
+    if r.is_ok() && thread.native_overflowed() {
+        return Err(native_overflow(ctx));
+    }
+    r
+}
+
+/// Run native `nc` of either kind on its arguments.
 #[inline]
 pub(crate) fn invoke_native<'gc>(
     ctx: Context<'gc>,
@@ -4384,20 +4492,11 @@ pub(crate) fn invoke_native<'gc>(
     args_base: usize,
     argc: usize,
 ) -> Result<crate::vm::sequence::CallbackAction<'gc>, crate::env::Error<'gc>> {
-    let end = args_base + argc;
-    // Grow-not-shrink: cover the arg window physically, but leave the slots
-    // above it — which may be an outer frame's registers — alone.
-    thread.ensure_slots(end);
-    thread.top = end;
-    let stack = Stack::new(thread, args_base);
-    // The stack is grown-not-shrunk and may leave dead scratch above the logical
-    // top; that's fine because `ThreadState`'s `Collect` traces only the live
-    // high-water (derived from the frames + `top`), so dead slots never retain.
-    let r = (nc.function)(ctx, nc, stack);
-    if r.is_ok() && thread.native_overflowed() {
-        return Err(native_overflow(ctx));
+    match nc.function {
+        NativeKind::Plain(f) => invoke_plain(ctx, thread, f, nc, args_base, argc)
+            .map(|()| crate::vm::sequence::CallbackAction::Return),
+        NativeKind::Action(f) => invoke_action(ctx, thread, f, nc, args_base, argc),
     }
-    r
 }
 
 /// A native or sequence pushed without `Stack::check_stack`.
@@ -5225,20 +5324,16 @@ fn drive_natives<'gc>(
                     ok,
                     cont,
                 }) => {
-                    if framed {
-                        thread.pop_lua();
-                    }
-                    push_native_frame(thread, f, base, at, protect, ok, cont, ret);
+                    let nf = native_frame(f, base, at, protect, ok, cont, ret);
+                    set_native_frame(thread, framed, nf);
                     (slot, ret) = (base + at as usize, ret_native);
                     phase = Phase::Start;
                 }
                 Ok(CallbackAction::Resume { at, ok, cont }) => {
                     // The resumer waits in a frame of its own, protected so
                     // the error that kills the coroutine comes back to `cont`.
-                    if framed {
-                        thread.pop_lua();
-                    }
-                    push_native_frame(thread, f, base, at, Protect::Errors, ok, cont, ret);
+                    let nf = native_frame(f, base, at, Protect::Errors, ok, cont, ret);
+                    set_native_frame(thread, framed, nf);
                     let at = base + at as usize;
                     let co = thread.stack[at]
                         .get_thread()
@@ -5525,16 +5620,16 @@ macro_rules! resume_switch {
             || $thread.resume_depth + 1 >= MAX_RESUME_DEPTH
             || $thread.frames_full()
         {
-            tail!(op_call_native);
+            tail!(op_call_action);
         }
         let (func, nargs, returns) = $instruction.abc();
         // SAFETY: `co` is suspended, so nothing else uses its state.
         let Some(cs) = (unsafe { co.state_mut_if_clean($ctx.mutation()) }) else {
-            tail!(op_call_native);
+            tail!(op_call_action);
         };
         // A yield the executor took (from a sequence) resumes through it.
         let Some(y) = cs.yield_bottom.filter(|_| cs.top_is_lua()) else {
-            tail!(op_call_native);
+            tail!(op_call_action);
         };
         let base = unsafe { (*$frame).base() };
         let args = base + func as usize + $skip;
@@ -5544,7 +5639,7 @@ macro_rules! resume_switch {
             nargs as usize - $skip
         };
         if y.bottom + n > cs.stack.len() || y.bottom + n > cs.stack_limit {
-            tail!(op_call_native);
+            tail!(op_call_action);
         }
         unsafe { (*$frame).pc = $ip };
         let nf = native_frame(
@@ -5605,7 +5700,7 @@ pub(crate) extern "rust-preserve-none" fn ff_wrap<'gc>(
 ) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     if instruction.op() == Op::TAILCALL {
-        tail!(op_call_native);
+        tail!(op_call_action);
     }
     let f = reg!(instruction.a()).get_function();
     let f = unsafe { f.unwrap_unchecked() };
@@ -5645,7 +5740,7 @@ pub(crate) extern "rust-preserve-none" fn ff_resume<'gc>(
 ) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     if instruction.op() == Op::TAILCALL {
-        tail!(op_call_native);
+        tail!(op_call_action);
     }
     let (func, nargs) = (instruction.a(), instruction.b());
     let f = reg!(func).get_function();
@@ -5657,7 +5752,7 @@ pub(crate) extern "rust-preserve-none" fn ff_resume<'gc>(
         None
     };
     let Some(co) = co else {
-        tail!(op_call_native);
+        tail!(op_call_action);
     };
     resume_switch!(
         co,
@@ -5696,19 +5791,19 @@ pub(crate) extern "rust-preserve-none" fn ff_yield<'gc>(
 ) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let Some(r) = thread.resumer else {
-        tail!(op_call_native);
+        tail!(op_call_action);
     };
     if instruction.op() == Op::TAILCALL || thread.no_yield {
-        tail!(op_call_native);
+        tail!(op_call_action);
     }
     let (func, nargs, returns) = instruction.abc();
     // SAFETY: the resumer waits, so nothing else uses its state.
     let Some(rs) = (unsafe { r.state_mut_if_clean(ctx.mutation()) }) else {
-        tail!(op_call_native);
+        tail!(op_call_action);
     };
     let nf = match rs.top_lua() {
         Some(nf) if nf.flags & (frame_flags::PASS | frame_flags::PASS_TRUE) != 0 => *nf,
-        _ => tail!(op_call_native),
+        _ => tail!(op_call_action),
     };
     let func_idx = unsafe { (*frame).base() } + func as usize;
     let n = if nargs == 0 {
@@ -5720,7 +5815,7 @@ pub(crate) extern "rust-preserve-none" fn ff_yield<'gc>(
     // Where `hand_back` puts them; `resume` checks its stack.
     let slot = nf.base() + nf.num_extras as usize;
     if slot + n > rs.stack.len() || slot + n >= rs.stack_limit {
-        tail!(op_call_native);
+        tail!(op_call_action);
     }
     unsafe { (*frame).pc = ip };
     thread.yield_bottom = Some(CallSite {
@@ -5865,19 +5960,19 @@ macro_rules! protected_call {
             nargs as usize - 1
         };
         if present < $k {
-            tail!(op_call_native);
+            tail!(op_call_action);
         }
         let callee = match reg!(func + 1).get_function() {
             Some(f) if matches!(f.inner().as_ref(), FunctionKind::Lua(_)) => unsafe {
                 LuaFn::from_function_unchecked(f)
             },
-            _ => tail!(op_call_native),
+            _ => tail!(op_call_action),
         };
         let callee_idx = func_idx + $k;
         if $thread.stack.len() < callee_idx + 1 + callee.max_stack_size as usize
             || $thread.frames_full()
         {
-            tail!(op_call_native);
+            tail!(op_call_action);
         }
         $prep
         // A fixed count, shifted down to the callee's arguments.
@@ -5913,7 +6008,7 @@ pub(crate) extern "rust-preserve-none" fn ff_pcall<'gc>(
 ) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     if instruction.op() == Op::TAILCALL {
-        tail!(op_call_native);
+        tail!(op_call_action);
     }
     protected_call!(
         1,
@@ -5950,7 +6045,7 @@ pub(crate) extern "rust-preserve-none" fn ff_xpcall<'gc>(
     let (func, nargs) = (instruction.a(), instruction.b());
     // A missing or non-function handler is the builtin's error.
     if instruction.op() == Op::TAILCALL || nargs < 3 || reg!(func + 2).get_function().is_none() {
-        tail!(op_call_native);
+        tail!(op_call_action);
     }
     protected_call!(
         2,
@@ -6029,24 +6124,42 @@ pub(crate) extern "rust-preserve-none" fn ret_native<'gc>(
     let cont: crate::vm::sequence::NativeCont = unsafe { std::mem::transmute(nf.pc) };
     let nc = unsafe { f.as_native().unwrap_unchecked() };
     let r = cont(ctx, nc, Stack::new(thread, base), Ok(()));
-    if let Ok(crate::vm::sequence::CallbackAction::Return) = r
-        && !thread.native_overflowed()
-    {
-        let n = thread.frames.len();
-        unsafe { thread.frames.set_len(n - 1) };
-        let stack = thread.stack.as_mut_ptr();
-        let nret = thread.top - base;
-        become ret(
-            Instruction::from_raw(nret as u64),
-            ctx,
-            thread,
-            unsafe { stack.add(base) },
-            unsafe { stack.add(base - 1) } as *const Instruction,
-            handlers,
-            ds,
-            unsafe { frame.sub(1) },
-            closure,
-        );
+    match r {
+        Ok(crate::vm::sequence::CallbackAction::Return) if !thread.native_overflowed() => {
+            let n = thread.frames.len();
+            unsafe { thread.frames.set_len(n - 1) };
+            let stack = thread.stack.as_mut_ptr();
+            let nret = thread.top - base;
+            become ret(
+                Instruction::from_raw(nret as u64),
+                ctx,
+                thread,
+                unsafe { stack.add(base) },
+                unsafe { stack.add(base - 1) } as *const Instruction,
+                handlers,
+                ds,
+                unsafe { frame.sub(1) },
+                closure,
+            );
+        }
+        // The next call of a Lua function, from this same frame.
+        Ok(crate::vm::sequence::CallbackAction::CallThen {
+            at,
+            protect,
+            ok,
+            cont,
+        }) if !thread.native_overflowed()
+            && let Some(callee) = native_calls_lua(thread, base + at as usize, 1) =>
+        {
+            unsafe { *frame = native_frame(f, base, at, protect, ok, cont, ret) };
+            let new_base = base + at as usize + 1;
+            enter_from_native(thread, callee, new_base, ret_native);
+            (frame, closure) = (unsafe { thread.top_lua_ptr() }, callee);
+            ip = callee.code;
+            registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
+            dispatch!();
+        }
+        _ => {}
     }
     let r = match r {
         Ok(_) if thread.native_overflowed() => Err(native_overflow(ctx)),
@@ -6063,15 +6176,19 @@ pub(crate) extern "rust-preserve-none" fn ret_native<'gc>(
 }
 
 /// The Lua function at `slot` when a native's call of it can be entered
-/// straight away: room for its window and for two more frames.
+/// straight away: room for its window and for `frames` more frames.
 #[inline(always)]
-fn native_calls_lua<'gc>(thread: &ThreadState<'gc>, slot: usize) -> Option<LuaFn<'gc>> {
+fn native_calls_lua<'gc>(
+    thread: &ThreadState<'gc>,
+    slot: usize,
+    frames: usize,
+) -> Option<LuaFn<'gc>> {
     let f = thread.stack[slot].get_function()?;
     let FunctionKind::Lua(callee) = f.inner().as_ref() else {
         return None;
     };
     let fits = thread.stack.len() >= slot + 1 + callee.max_stack_size as usize
-        && thread.frames.capacity() - thread.frames.len() >= 2;
+        && thread.frames.capacity() - thread.frames.len() >= frames;
     fits.then(|| unsafe { LuaFn::from_function_unchecked(f) })
 }
 
@@ -6090,6 +6207,16 @@ fn push_native_frame<'gc>(
     ret: Handler,
 ) {
     thread.push_lua(native_frame(f, base, at, protect, ok, cont, ret));
+}
+
+/// Make `nf` the native's frame: in place of the one it has when `framed`.
+#[inline(always)]
+fn set_native_frame<'gc>(thread: &mut ThreadState<'gc>, framed: bool, nf: LuaFrame<'gc>) {
+    if framed {
+        unsafe { *thread.frames.last_mut().unwrap_unchecked() = nf };
+    } else {
+        thread.push_lua(nf);
+    }
 }
 
 /// The frame [`push_native_frame`] pushes.
