@@ -27,20 +27,30 @@ unsafe impl<'gc> Collect<'gc> for Slots {
     const NEEDS_TRACE: bool = false;
 }
 
-/// A new cell of `len` values, `f(i)` at `i`; returns its first value.
+/// A new cell of `len` values, `prefix` then nils; returns its first value.
 #[inline]
 pub(super) fn alloc<'gc>(
     mc: &Mutation<'gc>,
     len: usize,
-    f: impl Fn(usize) -> Value<'gc>,
+    prefix: &[Value<'gc>],
 ) -> NonNull<Value<'gc>> {
     let len32 = u32::try_from(len).expect("table part too large");
     // SAFETY: the bytes are only read as the values written here.
     let cell = unsafe {
         Gc::new_with_trailing(mc, Slots { len: len32 }, |dst| {
             let dst = dst.cast::<Value<'gc>>();
-            for i in 0..len {
-                dst.add(i).write(f(i));
+            // Calls to `memcpy` and `memset` cost more than they save on a small cell.
+            if len < 32 {
+                for i in 0..len {
+                    dst.add(i)
+                        .write(prefix.get(i).copied().unwrap_or(Value::nil()));
+                }
+                return;
+            }
+            let copied = prefix.len().min(len);
+            dst.copy_from_nonoverlapping(NonNull::from(prefix).cast(), copied);
+            for i in copied..len {
+                dst.add(i).write(Value::nil());
             }
         })
     };
