@@ -34,7 +34,7 @@ pub(super) fn alloc<'gc>(
     f: impl Fn(usize) -> Value<'gc>,
 ) -> NonNull<Value<'gc>> {
     let len32 = u32::try_from(len).expect("table part too large");
-    // SAFETY: writes all `len` values.
+    // SAFETY: the bytes are only read as the values written here.
     let cell = unsafe {
         Gc::new_with_trailing(mc, Slots { len: len32 }, |dst| {
             let dst = dst.cast::<Value<'gc>>();

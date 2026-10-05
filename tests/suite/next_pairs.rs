@@ -246,7 +246,8 @@ fn pairs_metamethod() {
 #[test]
 fn dead_keys_are_not_retained() {
     const BUILD: &str = "T = {} for i = 1, 2000 do T[{i, i + 1}] = i end";
-    let baseline = live_bytes_after("T = {}");
+    // A table as big, whose keys own nothing: the hash part's memory is GC memory too.
+    let baseline = live_bytes_after("T = {} for i = 1, 2000 do T[i + 0.5] = i end");
     let live = live_bytes_after(BUILD);
     let cleared = live_bytes_after(&format!("{BUILD} for k in pairs(T) do T[k] = nil end"));
 

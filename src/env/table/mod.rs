@@ -8,9 +8,7 @@ use core::ptr::NonNull;
 use hash_part::{int_hash, lua_string_hash};
 
 use crate::Context;
-use crate::dmm::{
-    Collect, Finalization, Gc, Mutation, RefLock, Trace, allocator_api::MetricsAlloc,
-};
+use crate::dmm::{Collect, Finalization, Gc, Mutation, RefLock, Trace, allocator_api::GcAlloc};
 use crate::env::function::Template;
 use crate::env::shape::{self, MAX_KEYED_PROPERTIES, MAX_PROPERTIES_FAST, Shape, WeakMode};
 use crate::env::string::LuaString;
@@ -178,11 +176,11 @@ pub struct TableState<'gc> {
     array: NonNull<Value<'gc>>,
     asize: u32,
     /// Every other integer key, and floats with an integral value.
-    int_hash: hash_part::Part<'gc, i64, MetricsAlloc<'gc>>,
+    int_hash: hash_part::Part<'gc, i64, GcAlloc<'gc>>,
     /// Last border `raw_len` found, as Lua 5.5's `lenhint`.
     len_hint: Cell<usize>,
     /// Keys that are neither strings nor numbers with an integral value.
-    misc_hash: hash_part::Part<'gc, Value<'gc>, MetricsAlloc<'gc>>,
+    misc_hash: hash_part::Part<'gc, Value<'gc>, GcAlloc<'gc>>,
     /// Set when this table has dropped to dictionary mode for its
     /// string-keyed properties, triggered by a key past `MAX_PROPERTIES_FAST`
     /// or `MAX_KEYED_PROPERTIES`. Deletion does not migrate: it must not
@@ -199,6 +197,9 @@ pub struct TableState<'gc> {
     mt_cache: Option<shape::MtCache<'gc>>,
 }
 
+// Everything a table holds is GC memory (see `slots` and `GcAlloc`), so sweeping one runs nothing.
+const _: () = assert!(!core::mem::needs_drop::<TableState<'static>>());
+
 // SAFETY: a weak table defers itself, and every edge it skips is resurrected by `converge` or
 // dropped by `clear_dead` before sweeping (see `Lua::finalize_and_sweep`).
 unsafe impl<'gc> Collect<'gc> for TableState<'gc> {
@@ -213,6 +214,11 @@ unsafe impl<'gc> Collect<'gc> for TableState<'gc> {
         }
         if self.asize > 0 {
             unsafe { slots::mark(cc, self.array) };
+        }
+        hash_part::mark(cc, &self.int_hash);
+        hash_part::mark(cc, &self.misc_hash);
+        if let Some(d) = &self.dict {
+            hash_part::mark(cc, &d.table);
         }
         if mode.is_empty() {
             cc.trace(self.properties());
@@ -259,7 +265,7 @@ unsafe impl<'gc> Collect<'gc> for TableState<'gc> {
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub struct DictState<'gc> {
-    table: hash_part::Part<'gc, LuaString<'gc>, MetricsAlloc<'gc>>,
+    table: hash_part::Part<'gc, LuaString<'gc>, GcAlloc<'gc>>,
 }
 
 /// `next` was given a key that is not in the table.
@@ -288,9 +294,9 @@ impl<'gc> TableState<'gc> {
                 0 => 0,
                 n => n as u32 + 1,
             },
-            int_hash: hash_part::Part::new_in(MetricsAlloc::new(mc)),
+            int_hash: hash_part::Part::new_in(GcAlloc::new(mc)),
             len_hint: Cell::new(0),
-            misc_hash: hash_part::Part::new_in(MetricsAlloc::new(mc)),
+            misc_hash: hash_part::Part::new_in(GcAlloc::new(mc)),
             dict: None,
             metatable: None,
             mt_cache: None,
@@ -635,8 +641,7 @@ impl<'gc> TableState<'gc> {
             "migrate_to_dict called on already-dict table"
         );
         let keys = self.shape.keys();
-        let mut table =
-            hash_part::Part::with_capacity_in(keys.len(), MetricsAlloc::new(ctx.mutation()));
+        let mut table = hash_part::Part::with_capacity_in(keys.len(), GcAlloc::new(ctx.mutation()));
         for (&k, &v) in keys.iter().zip(self.properties()) {
             if v.is_nil() {
                 continue;
