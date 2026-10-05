@@ -5,6 +5,7 @@ mod io;
 mod math;
 mod os;
 mod package;
+pub(crate) mod strfmt_num;
 mod string;
 mod table;
 mod utf8;

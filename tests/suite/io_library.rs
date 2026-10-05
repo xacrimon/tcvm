@@ -121,7 +121,7 @@ fn read_number_length_limit() {
            return tostring(n) .. \" \" .. #rest\n\
          end\n\
          return try(\"1234\" .. (\"0\"):rep(1000) .. \"\\n\") == \"nil 805\"\n\
-           and try((\"1\"):rep(200) .. \"x\") == \"1.1111111111111111e+199 1\"\n\
+           and try((\"1\"):rep(200) .. \"x\") == \"1.1111111111111e+199 1\"\n\
            and try((\"1\"):rep(201) .. \"x\") == \"nil 2\"\n\
            and try(\"-\" .. (\"1\"):rep(200) .. \" y\") == \"nil 3\"\n\
            and try(\"0x\" .. (\"f\"):rep(198) .. \"z\") == \"-1 1\"\n\
