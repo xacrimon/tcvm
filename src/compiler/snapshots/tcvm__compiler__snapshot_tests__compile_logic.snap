@@ -17,29 +17,22 @@ expression: output
 0002  [  1]  LOAD            R1 K1  ; 2
 0003  [  1]  LOAD            R2 K2  ; 3
 0004  [  1]  LOAD            R3 K3  ; 4
-0005  [  3]  LT              R0 R1 inv=false
-0006  [  3]  JMP             +4
-0007  [  3]  LT              R2 R3 inv=false
-0008  [  3]  JMP             +2
-0009  [  4]  LOAD            R4 K0  ; 1
-0010  [  4]  RETURN          R4 count=2
-0011  [  7]  LT              R0 R1 inv=true
-0012  [  7]  JMP             +2
-0013  [  7]  LT              R2 R3 inv=false
-0014  [  7]  JMP             +2
-0015  [  8]  LOAD            R4 K1  ; 2
-0016  [  8]  RETURN          R4 count=2
-0017  [ 11]  TESTSET         R4 R0 inv=true
-0018  [ 11]  JMP             +1
-0019  [ 11]  MOVE            R4 R1
-0020  [ 12]  TESTSET         R5 R0 inv=false
-0021  [ 12]  JMP             +1
-0022  [ 12]  MOVE            R5 R1
-0023  [ 13]  LT              R0 R1 inv=false
-0024  [ 13]  JMP             +1
-0025  [ 13]  LFALSESKIP      R6
-0026  [ 13]  LOAD            R6 K4  ; true
-0027  [ 14]  MOVE            R7 R4
-0028  [ 14]  MOVE            R8 R5
-0029  [ 14]  MOVE            R9 R6
-0030  [ 14]  RETURN          R7 count=4
+0005  [  3]  JNLT            R0 R1 +3
+0006  [  3]  JNLT            R2 R3 +2
+0007  [  4]  LOAD            R4 K0  ; 1
+0008  [  4]  RETURN          R4 count=2
+0009  [  7]  JLT             R0 R1 +1
+0010  [  7]  JNLT            R2 R3 +2
+0011  [  8]  LOAD            R4 K1  ; 2
+0012  [  8]  RETURN          R4 count=2
+0013  [ 11]  JFSET           R4 R0 +1
+0014  [ 11]  MOVE            R4 R1
+0015  [ 12]  JTSET           R5 R0 +1
+0016  [ 12]  MOVE            R5 R1
+0017  [ 13]  JNLT            R0 R1 +1
+0018  [ 13]  LFALSESKIP      R6
+0019  [ 13]  LOAD            R6 K4  ; true
+0020  [ 14]  MOVE            R7 R4
+0021  [ 14]  MOVE            R8 R5
+0022  [ 14]  MOVE            R9 R6
+0023  [ 14]  RETURN          R7 count=4

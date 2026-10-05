@@ -20,46 +20,43 @@ expression: output
 0004  [  6]  MOVE            R2 R1
 0005  [  7]  CLOSURE         R3 P0
 0006  [  7]  SETTABLE        R3 R0 R1
-0007  [  8]  LTI             R1 #3 inv=false
-0008  [  8]  JMP             +2
-0009  [  8]  CLOSE           R2
-0010  [  8]  JMP             -8
-0011  [  8]  CLOSE           R2
-0012  [ 12]  NEWTABLE        R2 T0  ; {}
-0013  [ 12]  LOAD            R3 K0  ; 0
-0014  [ 14]  ADDI            R3 R3 #1
-0015  [ 15]  MOVE            R4 R3
-0016  [ 16]  CLOSURE         R5 P1
-0017  [ 16]  SETTABLE        R5 R2 R3
-0018  [ 17]  LTI             R3 #3 inv=false
-0019  [ 17]  JMP             +2
-0020  [ 17]  CLOSE           R4
-0021  [ 17]  JMP             -8
-0022  [ 20]  LOAD            R5 K1  ; nil
-0023  [ 22]  LOAD            R6 K2  ; 42
-0024  [ 23]  CLOSURE         R5 P2
-0025  [ 24]  JMP             +1
-0026  [ 24]  CLOSE           R6
-0027  [ 26]  CLOSE           R6
-0028  [ 27]  LOAD            R6 K3  ; 7
-0029  [ 30]  NEWTABLE        R7 T0  ; {}
-0030  [ 31]  LOAD            R8 K4  ; 1
-0031  [ 31]  LOAD            R9 K5  ; 4
-0032  [ 31]  LOAD            R10 K4  ; 1
-0033  [ 31]  FORPREP         R8 +11
-0034  [ 32]  MOVE            R12 R11
-0035  [ 33]  MODI            R13 R11 #2
-0036  [ 33]  EQI             R13 #0 inv=false
-0037  [ 33]  JMP             +1
-0038  [ 33]  JMP             +4
-0039  [ 34]  LEN             R13 R7
-0040  [ 34]  ADDI            R13 R13 #1
-0041  [ 34]  CLOSURE         R14 P3
-0042  [ 34]  SETTABLE        R14 R7 R13
-0043  [ 35]  CLOSE           R11
-0044  [ 31]  FORLOOP         R8 -11
-0045  [ 39]  JMP             +0
-0046  [ 41]  RETURN          R0 count=1
+0007  [  8]  JNLTI           R1 #3 +2
+0008  [  8]  CLOSE           R2
+0009  [  8]  JMP             -7
+0010  [  8]  CLOSE           R2
+0011  [ 12]  NEWTABLE        R2 T0  ; {}
+0012  [ 12]  LOAD            R3 K0  ; 0
+0013  [ 14]  ADDI            R3 R3 #1
+0014  [ 15]  MOVE            R4 R3
+0015  [ 16]  CLOSURE         R5 P1
+0016  [ 16]  SETTABLE        R5 R2 R3
+0017  [ 17]  JNLTI           R3 #3 +2
+0018  [ 17]  CLOSE           R4
+0019  [ 17]  JMP             -7
+0020  [ 20]  LOAD            R5 K1  ; nil
+0021  [ 22]  LOAD            R6 K2  ; 42
+0022  [ 23]  CLOSURE         R5 P2
+0023  [ 24]  JMP             +1
+0024  [ 24]  CLOSE           R6
+0025  [ 26]  CLOSE           R6
+0026  [ 27]  LOAD            R6 K3  ; 7
+0027  [ 30]  NEWTABLE        R7 T0  ; {}
+0028  [ 31]  LOAD            R8 K4  ; 1
+0029  [ 31]  LOAD            R9 K5  ; 4
+0030  [ 31]  LOAD            R10 K4  ; 1
+0031  [ 31]  FORPREP         R8 +10
+0032  [ 32]  MOVE            R12 R11
+0033  [ 33]  MODI            R13 R11 #2
+0034  [ 33]  JNEQI           R13 #0 +1
+0035  [ 33]  JMP             +4
+0036  [ 34]  LEN             R13 R7
+0037  [ 34]  ADDI            R13 R13 #1
+0038  [ 34]  CLOSURE         R14 P3
+0039  [ 34]  SETTABLE        R14 R7 R13
+0040  [ 35]  CLOSE           R11
+0041  [ 31]  FORLOOP         R8 -10
+0042  [ 39]  JMP             +0
+0043  [ 41]  RETURN          R0 count=1
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=1, upvalues=1)

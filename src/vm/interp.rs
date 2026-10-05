@@ -69,11 +69,28 @@ const HANDLERS: [Handler; Op::COUNT] = Op::table([
     (Op::CLOSE, op_close),
     (Op::TBC, op_tbc),
     (Op::JMP, op_jmp),
-    (Op::EQ, op_eq),
-    (Op::LT, op_lt),
-    (Op::LE, op_le),
-    (Op::TEST, op_test),
-    (Op::TESTSET, op_testset),
+    (Op::JEQ, op_jeq),
+    (Op::JNEQ, op_jneq),
+    (Op::JLT, op_jlt),
+    (Op::JNLT, op_jnlt),
+    (Op::JLE, op_jle),
+    (Op::JNLE, op_jnle),
+    (Op::JEQI, op_jeqi),
+    (Op::JNEQI, op_jneqi),
+    (Op::JLTI, op_jlti),
+    (Op::JNLTI, op_jnlti),
+    (Op::JLEI, op_jlei),
+    (Op::JNLEI, op_jnlei),
+    (Op::JGTI, op_jgti),
+    (Op::JNGTI, op_jngti),
+    (Op::JGEI, op_jgei),
+    (Op::JNGEI, op_jngei),
+    (Op::JEQS, op_jeqs),
+    (Op::JNEQS, op_jneqs),
+    (Op::JT, op_jt),
+    (Op::JF, op_jf),
+    (Op::JTSET, op_jtset),
+    (Op::JFSET, op_jfset),
     (Op::CALL, op_call),
     (Op::TAILCALL, op_tailcall),
     (Op::RETURN, op_return),
@@ -111,11 +128,6 @@ const HANDLERS: [Handler; Op::COUNT] = Op::table([
     (Op::RIDIVI, op_ridivi),
     (Op::RSHLI, op_rshli),
     (Op::RSHRI, op_rshri),
-    (Op::EQI, op_eqi),
-    (Op::LTI, op_lti),
-    (Op::LEI, op_lei),
-    (Op::GTI, op_gti),
-    (Op::GEI, op_gei),
     (Op::GETFIELD_OWN, getfield_own),
     (Op::GETFIELD_ABSENT, getfield_absent),
     (Op::GETFIELD_PROTO, getfield_proto),
@@ -459,16 +471,23 @@ macro_rules! helpers {
             }};
         }
 
-        /// `if $$cond { skip!() }`, forced to compile as a branch: LLVM otherwise
-        /// if-converts it to a `csel` on `ip`, making the next instruction load
-        /// data-dependent on the compare instead of predicted. The asm is opaque
-        /// so the select can't be re-formed.
+        /// A conditional branch's exit: jump `offset` past it if `cond`,
+        /// forced to compile as a branch: LLVM otherwise if-converts it to a
+        /// `csel` on `ip`, making the next instruction load data-dependent on
+        /// the compare instead of predicted. The asm is opaque so the select
+        /// can't be re-formed. The one in the else arm keeps a dispatch per
+        /// outcome, so each `br` predicts its own successor (5-6% on collatz).
         #[allow(unused_macros)]
-        macro_rules! skip_if {
-            ($$cond:expr) => {{
+        macro_rules! branch_if {
+            ($$cond:expr, $$offset:expr) => {{
                 if $$cond {
-                    $ip = unsafe { $ip.add(1) };
+                    $ip = unsafe { $ip.offset($$offset as isize) };
                     // The pointer is only threaded through, never read.
+                    #[allow(clippy::pointers_in_nomem_asm_block)]
+                    unsafe {
+                        core::arch::asm!("/* {0} */", inout(reg) $ip, options(nomem, nostack, preserves_flags));
+                    }
+                } else {
                     #[allow(clippy::pointers_in_nomem_asm_block)]
                     unsafe {
                         core::arch::asm!("/* {0} */", inout(reg) $ip, options(nomem, nostack, preserves_flags));
@@ -2292,35 +2311,44 @@ extern "rust-preserve-none" fn op_jmp<'gc>(
     dispatch!();
 }
 
-/// if (R[lhs] == R[rhs]) != inverted then skip next instruction
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn op_eq<'gc>(
-    instruction: Instruction,
-    ctx: Context<'gc>,
-    thread: &mut ThreadState<'gc>,
-    registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
-    handlers: *const (),
-    ds: &mut DispatchState<'gc>,
-    frame: *mut LuaFrame<'gc>,
-    closure: LuaFn<'gc>,
-) -> Exit {
-    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-    let (lhs, rhs, inverted) = instruction.abc_flag();
-    let (a, b) = (reg!(ref lhs), reg!(ref rhs));
-    // Floats first: a NaN has the same bits as itself.
-    let eq = if a.is_float() && b.is_float() {
-        a.read_float() == b.read_float()
-    } else if a.same_bits(b) {
-        true
-    } else {
-        tail!(op_eq_slow);
+/// JEQ/JNEQ: jump when `(R[lhs] == R[rhs]) == $k`.
+macro_rules! eq_handler {
+    ($name:ident, $k:literal) => {
+        #[inline(never)]
+        #[rustc_align(32)]
+        extern "rust-preserve-none" fn $name<'gc>(
+            instruction: Instruction,
+            ctx: Context<'gc>,
+            thread: &mut ThreadState<'gc>,
+            registers: Registers<'gc, '_>,
+            mut ip: *const Instruction,
+            handlers: *const (),
+            ds: &mut DispatchState<'gc>,
+            frame: *mut LuaFrame<'gc>,
+            closure: LuaFn<'gc>,
+        ) -> Exit {
+            helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+            let (a, b) = (reg!(ref instruction.a()), reg!(ref instruction.b()));
+            // Floats first: a NaN has the same bits as itself.
+            let eq = if a.is_float() && b.is_float() {
+                a.read_float() == b.read_float()
+            } else if a.same_bits(b) {
+                true
+            } else if let Some((x, y)) = Value::both_small(a, b) {
+                x == y
+            } else {
+                tail!(op_eq_slow);
+            };
+            branch_if!(eq == $k, instruction.imm());
+            dispatch!();
+        }
     };
-    skip_if!(eq != inverted);
-    dispatch!();
 }
 
+eq_handler!(op_jeq, true);
+eq_handler!(op_jneq, false);
+
+/// JEQ/JNEQ past the fast path.
 #[inline(never)]
 #[rustc_align(32)]
 extern "rust-preserve-none" fn op_eq_slow<'gc>(
@@ -2335,10 +2363,10 @@ extern "rust-preserve-none" fn op_eq_slow<'gc>(
     closure: LuaFn<'gc>,
 ) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-    let (lhs, rhs, inverted) = instruction.abc_flag();
-    let (a, b) = (reg!(lhs), reg!(rhs));
+    let (a, b) = (reg!(instruction.a()), reg!(instruction.b()));
+    let k = instruction.op() == Op::JEQ;
     if num::raw_eq(a, b) {
-        skip_if!(!inverted);
+        branch_if!(k, instruction.imm());
         dispatch!();
     }
     // Lua 5.5: __eq fires only when both operands are the same non-primitive
@@ -2348,18 +2376,18 @@ extern "rust-preserve-none" fn op_eq_slow<'gc>(
     if try_meta {
         let meta_fn = binop_metamethod(ctx, a, b, MetamethodBits::EQ);
         if !meta_fn.is_nil() {
-            call_mm!(ret_cond_c, meta_fn, [a, b]);
+            call_mm!(ret_cond, meta_fn, [a, b]);
         }
     }
-    skip_if!(inverted);
+    branch_if!(!k, instruction.imm());
     dispatch!();
 }
 
-/// `if (R[lhs] <op> R[rhs]) != inverted then skip next instruction` for LT and
-/// LE: two floats or two inline integers here, everything else in `$slow`.
+/// JLT/JNLT/JLE/JNLE: jump when `(R[lhs] <op> R[rhs]) == $k`. Two floats or
+/// two inline integers here, everything else in `cmp_slow`.
 macro_rules! cmp_handler {
-    ($name:ident, $slow:ident, $op:tt, $mm:ident, $int_float:path, $float_int:path) => {
-#[inline(never)]
+    ($name:ident, $op:tt, $k:literal) => {
+        #[inline(never)]
         #[rustc_align(32)]
         extern "rust-preserve-none" fn $name<'gc>(
             instruction: Instruction,
@@ -2373,8 +2401,7 @@ macro_rules! cmp_handler {
             closure: LuaFn<'gc>,
         ) -> Exit {
             helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-            let (lhs, rhs, inverted) = instruction.abc_flag();
-            let (a, b) = (reg!(ref lhs), reg!(ref rhs));
+            let (a, b) = (reg!(ref instruction.a()), reg!(ref instruction.b()));
             let r = if std::hint::likely(a.is_float() && b.is_float()) {
                 a.read_float() $op b.read_float()
             } else if let Some((x, y)) = Value::both_small(a, b) {
@@ -2382,24 +2409,24 @@ macro_rules! cmp_handler {
             } else {
                 tail!(cmp_slow);
             };
-            skip_if!(r != inverted);
+            branch_if!(r == $k, instruction.imm());
             dispatch!();
         }
-
     };
 }
 
-cmp_handler!(op_lt, op_lt_slow, <, LT, num::lt_int_float, num::lt_float_int);
-cmp_handler!(op_le, op_le_slow, <=, LE, num::le_int_float, num::le_float_int);
+cmp_handler!(op_jlt, <, true);
+cmp_handler!(op_jnlt, <, false);
+cmp_handler!(op_jle, <=, true);
+cmp_handler!(op_jnle, <=, false);
 
-/// `if (R[src] <cmp> imm) != inverted then skip`; `$swap` puts the immediate
-/// on the left.
-macro_rules! cmp_imm_handler {
-    ($fn_name:ident, $slow_name:ident, $mm:ident, $swap:expr,
-     $ii:expr, $ff:expr, $if_:expr, $fi:expr) => {
+/// The immediate ordered compares: jump when `(R[src] <cmp> imm) == $k`,
+/// `<` if `$lt` else `<=`, with the immediate on the left if `$swap`.
+macro_rules! cmp_imm_handlers {
+    ($($name:ident, $k:literal, $lt:literal, $swap:literal;)*) => {$(
         #[inline(never)]
         #[rustc_align(32)]
-        extern "rust-preserve-none" fn $fn_name<'gc>(
+        extern "rust-preserve-none" fn $name<'gc>(
             instruction: Instruction,
             ctx: Context<'gc>,
             thread: &mut ThreadState<'gc>,
@@ -2411,176 +2438,163 @@ macro_rules! cmp_imm_handler {
             closure: LuaFn<'gc>,
         ) -> Exit {
             helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-            let (src, inverted) = instruction.ab_imm_flag();
-            let v = reg!(ref src);
-
-            let primitive: Option<bool> = if std::hint::likely(instruction.imm_is_int()) {
-                let k = instruction.imm_int();
-                if let Some(i) = v.get_small() {
-                    let i = i as i64;
-                    Some(if $swap { $ii(k, i) } else { $ii(i, k) })
-                } else if let Some(i) = v.get_integer() {
-                    Some(if $swap { $ii(k, i) } else { $ii(i, k) })
-                } else if v.is_float() {
-                    let f = v.read_float();
-                    Some(if $swap { $if_(k, f) } else { $fi(f, k) })
-                } else {
-                    None
-                }
+            let v = reg!(ref instruction.a());
+            // A 15-bit integer, so exact as a float too.
+            let k = instruction.cmp_imm_int();
+            let ints = |x: i64, y: i64| if $lt { x < y } else { x <= y };
+            let floats = |x: f64, y: f64| if $lt { x < y } else { x <= y };
+            let r = if let Some(i) = v.get_small() {
+                let i = i as i64;
+                if $swap { ints(k, i) } else { ints(i, k) }
+            } else if v.is_float() {
+                let f = v.read_float();
+                if $swap { floats(k as f64, f) } else { floats(f, k as f64) }
+            } else if let Some(i) = v.get_integer() {
+                if $swap { ints(k, i) } else { ints(i, k) }
             } else {
-                let k = instruction.imm_float();
-                if v.is_float() {
-                    let f = v.read_float();
-                    Some(if $swap { $ff(k, f) } else { $ff(f, k) })
-                } else if let Some(i) = v.get_integer() {
-                    Some(if $swap { $fi(k, i) } else { $if_(i, k) })
-                } else {
-                    None
-                }
+                tail!(cmp_slow);
             };
+            branch_if!(r == $k, instruction.imm());
+            dispatch!();
+        }
+    )*};
+}
 
-            if let Some(r) = primitive {
-                skip_if!(r != inverted);
-                dispatch!();
+cmp_imm_handlers! {
+    op_jlti, true, true, false;
+    op_jnlti, false, true, false;
+    op_jlei, true, false, false;
+    op_jnlei, false, false, false;
+    op_jgti, true, true, true;
+    op_jngti, false, true, true;
+    op_jgei, true, false, true;
+    op_jngei, false, false, true;
+}
+
+/// JEQI/JNEQI: jump when `(R[src] == imm) == $k`. Never `__eq`: the
+/// immediate is a number.
+macro_rules! eqi_handler {
+    ($name:ident, $k:literal) => {
+        #[inline(never)]
+        #[rustc_align(32)]
+        extern "rust-preserve-none" fn $name<'gc>(
+            instruction: Instruction,
+            ctx: Context<'gc>,
+            thread: &mut ThreadState<'gc>,
+            registers: Registers<'gc, '_>,
+            mut ip: *const Instruction,
+            handlers: *const (),
+            ds: &mut DispatchState<'gc>,
+            frame: *mut LuaFrame<'gc>,
+            closure: LuaFn<'gc>,
+        ) -> Exit {
+            helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+            let v = reg!(ref instruction.a());
+            let k = instruction.cmp_imm_int();
+            let eq = if let Some(i) = v.get_small() {
+                i as i64 == k
+            } else if v.is_float() {
+                v.read_float() == k as f64
+            } else if let Some(i) = v.get_integer() {
+                i == k
+            } else {
+                false
+            };
+            branch_if!(eq == $k, instruction.imm());
+            dispatch!();
+        }
+    };
+}
+
+eqi_handler!(op_jeqi, true);
+eqi_handler!(op_jneqi, false);
+
+/// JEQS/JNEQS: jump when `(R[src] == K[key]) == $k`, `K[key]` a string.
+/// Strings are interned, so equality is identity.
+macro_rules! eqs_handler {
+    ($name:ident, $k:literal) => {
+        #[inline(never)]
+        #[rustc_align(32)]
+        extern "rust-preserve-none" fn $name<'gc>(
+            instruction: Instruction,
+            ctx: Context<'gc>,
+            thread: &mut ThreadState<'gc>,
+            registers: Registers<'gc, '_>,
+            mut ip: *const Instruction,
+            handlers: *const (),
+            ds: &mut DispatchState<'gc>,
+            frame: *mut LuaFrame<'gc>,
+            closure: LuaFn<'gc>,
+        ) -> Exit {
+            helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+            let eq = reg!(ref instruction.a()).same_bits(&constant!(instruction.h()));
+            branch_if!(eq == $k, instruction.imm());
+            dispatch!();
+        }
+    };
+}
+
+eqs_handler!(op_jeqs, true);
+eqs_handler!(op_jneqs, false);
+
+/// JT/JF: jump when `truthy(R[src]) == $k`.
+macro_rules! test_handler {
+    ($name:ident, $k:literal) => {
+        #[inline(never)]
+        #[rustc_align(32)]
+        extern "rust-preserve-none" fn $name<'gc>(
+            instruction: Instruction,
+            ctx: Context<'gc>,
+            thread: &mut ThreadState<'gc>,
+            registers: Registers<'gc, '_>,
+            mut ip: *const Instruction,
+            handlers: *const (),
+            ds: &mut DispatchState<'gc>,
+            frame: *mut LuaFrame<'gc>,
+            closure: LuaFn<'gc>,
+        ) -> Exit {
+            helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+            let truthy = !reg!(instruction.a()).is_falsy();
+            branch_if!(truthy == $k, instruction.imm());
+            dispatch!();
+        }
+    };
+}
+
+test_handler!(op_jt, true);
+test_handler!(op_jf, false);
+
+/// JTSET/JFSET: jump when `truthy(R[src]) == $k`, copying `R[src]` to
+/// `R[dst]` first.
+macro_rules! testset_handler {
+    ($name:ident, $k:literal) => {
+        #[inline(never)]
+        #[rustc_align(32)]
+        extern "rust-preserve-none" fn $name<'gc>(
+            instruction: Instruction,
+            ctx: Context<'gc>,
+            thread: &mut ThreadState<'gc>,
+            registers: Registers<'gc, '_>,
+            mut ip: *const Instruction,
+            handlers: *const (),
+            ds: &mut DispatchState<'gc>,
+            frame: *mut LuaFrame<'gc>,
+            closure: LuaFn<'gc>,
+        ) -> Exit {
+            helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+            let val = reg!(instruction.b());
+            let jump = !val.is_falsy() == $k;
+            if jump {
+                *reg!(ref mut instruction.a()) = val;
             }
-
-            tail!(cmp_slow);
+            branch_if!(jump, instruction.imm());
+            dispatch!();
         }
     };
 }
 
-cmp_imm_handler!(
-    op_lti,
-    op_lti_slow,
-    LT,
-    false,
-    |a, b| a < b,
-    |a: f64, b: f64| a < b,
-    num::lt_int_float,
-    num::lt_float_int
-);
-cmp_imm_handler!(
-    op_lei,
-    op_lei_slow,
-    LE,
-    false,
-    |a, b| a <= b,
-    |a: f64, b: f64| a <= b,
-    num::le_int_float,
-    num::le_float_int
-);
-cmp_imm_handler!(
-    op_gti,
-    op_gti_slow,
-    LT,
-    true,
-    |a, b| a < b,
-    |a: f64, b: f64| a < b,
-    num::lt_int_float,
-    num::lt_float_int
-);
-cmp_imm_handler!(
-    op_gei,
-    op_gei_slow,
-    LE,
-    true,
-    |a, b| a <= b,
-    |a: f64, b: f64| a <= b,
-    num::le_int_float,
-    num::le_float_int
-);
-
-/// `if (R[src] == imm) != inverted then skip`.
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn op_eqi<'gc>(
-    instruction: Instruction,
-    ctx: Context<'gc>,
-    thread: &mut ThreadState<'gc>,
-    registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
-    handlers: *const (),
-    ds: &mut DispatchState<'gc>,
-    frame: *mut LuaFrame<'gc>,
-    closure: LuaFn<'gc>,
-) -> Exit {
-    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-    let (src, inverted) = instruction.ab_imm_flag();
-    let v = reg!(ref src);
-
-    let eq = if std::hint::likely(instruction.imm_is_int()) {
-        let k = instruction.imm_int();
-        if let Some(i) = v.get_small() {
-            i == k as i32
-        } else if let Some(i) = v.get_integer() {
-            i == k
-        } else if let Some(f) = v.get_float() {
-            num::exact_float_to_int(f) == Some(k)
-        } else {
-            false
-        }
-    } else {
-        let k = instruction.imm_float();
-        if let Some(f) = v.get_float() {
-            f == k
-        } else if let Some(i) = v.get_integer() {
-            num::exact_float_to_int(k) == Some(i)
-        } else {
-            false
-        }
-    };
-
-    skip_if!(eq != inverted);
-    dispatch!();
-}
-
-/// if (not R[src]) == inverted then skip next instruction
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn op_test<'gc>(
-    instruction: Instruction,
-    ctx: Context<'gc>,
-    thread: &mut ThreadState<'gc>,
-    registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
-    handlers: *const (),
-    ds: &mut DispatchState<'gc>,
-    frame: *mut LuaFrame<'gc>,
-    closure: LuaFn<'gc>,
-) -> Exit {
-    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-    let (src, inverted) = instruction.ab_flag();
-    let truthy = !reg!(src).is_falsy();
-    skip_if!(truthy != inverted);
-    dispatch!();
-}
-
-/// If (truthy(R[src]) == inverted) then skip next instruction;
-/// otherwise R[dst] := R[src] and fall through. Matches Lua 5.5 TESTSET.
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn op_testset<'gc>(
-    instruction: Instruction,
-    ctx: Context<'gc>,
-    thread: &mut ThreadState<'gc>,
-    registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
-    handlers: *const (),
-    ds: &mut DispatchState<'gc>,
-    frame: *mut LuaFrame<'gc>,
-    closure: LuaFn<'gc>,
-) -> Exit {
-    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-    let (dst, src, inverted) = instruction.abc_flag();
-    let val = reg!(src);
-    let truthy = !val.is_falsy();
-    if truthy == inverted {
-        skip_if!(true);
-    } else {
-        *reg!(ref mut dst) = val;
-    }
-    dispatch!();
-}
+testset_handler!(op_jtset, true);
+testset_handler!(op_jfset, false);
 
 // ---------------------------------------------------------------------------
 // Function calls
@@ -5254,40 +5268,35 @@ extern "rust-preserve-none" fn ret_discard<'gc>(
     dispatch!();
 }
 
-/// Continuation of a comparison metamethod: skip the following JMP unless
-/// the result's truthiness matches the flag, in `c` (`EQ`/`LT`/`LE`) or in
-/// `b` (`EQI`/`LTI`/...).
-macro_rules! ret_cond {
-    ($name:ident, $flag:ident) => {
-        #[inline(never)]
-        #[rustc_align(32)]
-        // The incoming `closure` belongs to the finished call.
-        #[allow(unused_assignments)]
-        extern "rust-preserve-none" fn $name<'gc>(
-            instruction: Instruction,
-            ctx: Context<'gc>,
-            thread: &mut ThreadState<'gc>,
-            mut registers: Registers<'gc, '_>,
-            mut ip: *const Instruction,
-            handlers: *const (),
-            ds: &mut DispatchState<'gc>,
-            frame: *mut LuaFrame<'gc>,
-            closure: LuaFn<'gc>,
-        ) -> Exit {
-            let (nret, values, func_slot) = ret_args!(instruction, registers, ip);
-            helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-            let truthy = !first_result(nret, values).is_falsy();
-            let op = resume_caller!(thread, registers, ip, frame, closure);
-            let func_slot = unsafe { func_slot.offset_from_unsigned(thread.stack.as_ptr()) };
-            thread.set_top_unchecked(func_slot);
-            skip_if!(truthy != (op.$flag() != 0));
-            dispatch!();
-        }
-    };
+/// Continuation of a comparison metamethod: the caller's branch jumps when
+/// the result's truthiness is its sense.
+#[inline(never)]
+#[rustc_align(32)]
+// The incoming `closure` belongs to the finished call.
+#[allow(unused_assignments)]
+extern "rust-preserve-none" fn ret_cond<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    let (nret, values, func_slot) = ret_args!(instruction, registers, ip);
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let truthy = !first_result(nret, values).is_falsy();
+    let caller = resume_caller!(thread, registers, ip, frame, closure);
+    let func_slot = unsafe { func_slot.offset_from_unsigned(thread.stack.as_ptr()) };
+    thread.set_top_unchecked(func_slot);
+    branch_if!(
+        truthy == (caller.op().branch_sense() == Some(true)),
+        caller.imm()
+    );
+    dispatch!();
 }
-
-ret_cond!(ret_cond_c, c);
-ret_cond!(ret_cond_b, b);
 
 /// Continuation of a generic for's iterator: its results are the loop's
 /// variables, nil-padded.
@@ -6814,8 +6823,8 @@ extern "rust-preserve-none" fn set_slow<'gc>(
     );
 }
 
-/// The slow path of LT, LE and their immediate forms: boxed and mixed
-/// numbers, strings, and the metamethods.
+/// The slow path of the ordered compares: boxed and mixed numbers, strings,
+/// and the metamethods.
 #[inline(never)]
 #[rustc_align(32)]
 extern "rust-preserve-none" fn cmp_slow<'gc>(
@@ -6831,21 +6840,21 @@ extern "rust-preserve-none" fn cmp_slow<'gc>(
 ) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let op = instruction.op();
-    let imm = !matches!(op, Op::LT | Op::LE);
-    let (a, b, inverted) = if imm {
-        let (src, inverted) = instruction.ab_imm_flag();
-        let (v, k) = (reg!(src), instruction.imm_value(ctx.mutation()));
-        let (a, b) = if matches!(op, Op::GTI | Op::GEI) {
-            (k, v)
-        } else {
-            (v, k)
-        };
-        (a, b, inverted)
+    let k = op.branch_sense() == Some(true);
+    let (a, b) = if matches!(op, Op::JLT | Op::JNLT | Op::JLE | Op::JNLE) {
+        (reg!(instruction.a()), reg!(instruction.b()))
     } else {
-        let (lhs, rhs, inverted) = instruction.abc_flag();
-        (reg!(lhs), reg!(rhs), inverted)
+        let (v, lit) = (reg!(instruction.a()), instruction.cmp_imm_value(ctx.mutation()));
+        if matches!(op, Op::JGTI | Op::JNGTI | Op::JGEI | Op::JNGEI) {
+            (lit, v)
+        } else {
+            (v, lit)
+        }
     };
-    let le = matches!(op, Op::LE | Op::LEI | Op::GEI);
+    let le = matches!(
+        op,
+        Op::JLE | Op::JNLE | Op::JLEI | Op::JNLEI | Op::JGEI | Op::JNGEI
+    );
     let primitive = if let Some(x) = a.get_integer()
         && let Some(y) = b.get_integer()
     {
@@ -6870,7 +6879,7 @@ extern "rust-preserve-none" fn cmp_slow<'gc>(
         None
     };
     if let Some(r) = primitive {
-        skip_if!(r != inverted);
+        branch_if!(r == k, instruction.imm());
         dispatch!();
     }
     let bit = if le {
@@ -6882,10 +6891,7 @@ extern "rust-preserve-none" fn cmp_slow<'gc>(
     if meta_fn.is_nil() {
         raise!(OpError::Compare(a, b));
     }
-    if imm {
-        call_mm!(ret_cond_b, meta_fn, [a, b]);
-    }
-    call_mm!(ret_cond_c, meta_fn, [a, b]);
+    call_mm!(ret_cond, meta_fn, [a, b]);
 }
 
 /// The continuation for a CALL that keeps `returns - 1` results, MULTRET

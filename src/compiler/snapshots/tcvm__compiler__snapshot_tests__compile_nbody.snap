@@ -108,62 +108,60 @@ expression: output
 0063  [114]  CLOSURE         R11 P2
 0064  [116]  GETTABUP        R12 U0 K24  ; "tonumber"
 0065  [116]  GETTABUP        R13 U0 K25  ; "arg"
-0066  [116]  TEST            R13 inv=false
-0067  [116]  JMP             +3
-0068  [116]  GETTABUP        R13 U0 K25  ; "arg"
-0069  [116]  LOAD            R14 K26  ; 1
-0070  [116]  GETTABLE        R13 R13 R14
-0071  [116]  CALL_R1         R12 args=2
-0072  [116]  TEST            R12 inv=true
-0073  [116]  JMP             +1
-0074  [116]  LOAD            R12 K27  ; 1000
-0075  [117]  NEWTABLE        R13 T5  ; {} items=5
-0076  [117]  MOVE            R14 R8
-0077  [117]  MOVE            R15 R4
-0078  [117]  MOVE            R16 R5
-0079  [117]  MOVE            R17 R6
-0080  [117]  MOVE            R18 R7
-0081  [117]  SETLIST         R13 count=5 offset=0
-0082  [118]  LEN             R14 R13
-0083  [120]  MOVE            R15 R11
-0084  [120]  MOVE            R16 R13
-0085  [120]  MOVE            R17 R14
-0086  [120]  CALL_R0         R15 args=3
-0087  [121]  GETTABUP        R15 U0 K28  ; "io"
-0088  [121]  GETFIELD        R15 R15 K29  ; "write"
-0089  [121]  GETTABUP        R16 U0 K30  ; "string"
-0090  [121]  GETFIELD        R16 R16 K31  ; "format"
-0091  [121]  LOAD            R17 K32  ; "%0.9f"
-0092  [121]  MOVE            R18 R10
-0093  [121]  MOVE            R19 R13
-0094  [121]  MOVE            R20 R14
-0095  [121]  CALL            R18 args=3 ret=0
-0096  [121]  CALL_R1         R16 args=0
-0097  [121]  LOAD            R17 K33  ; "\n"
-0098  [121]  CALL_R0         R15 args=3
-0099  [122]  LOAD            R15 K26  ; 1
-0100  [122]  MOVE            R16 R12
-0101  [122]  LOAD            R17 K26  ; 1
-0102  [122]  FORPREP         R15 +6
-0103  [122]  MOVE            R19 R9
-0104  [122]  MOVE            R20 R13
-0105  [122]  MOVE            R21 R14
-0106  [122]  LOAD            R22 K34  ; 0.01
-0107  [122]  CALL_R0         R19 args=4
-0108  [122]  FORLOOP         R15 -6
-0109  [123]  GETTABUP        R15 U0 K28  ; "io"
-0110  [123]  GETFIELD        R15 R15 K29  ; "write"
-0111  [123]  GETTABUP        R16 U0 K30  ; "string"
-0112  [123]  GETFIELD        R16 R16 K31  ; "format"
-0113  [123]  LOAD            R17 K32  ; "%0.9f"
-0114  [123]  MOVE            R18 R10
-0115  [123]  MOVE            R19 R13
-0116  [123]  MOVE            R20 R14
-0117  [123]  CALL            R18 args=3 ret=0
-0118  [123]  CALL_R1         R16 args=0
-0119  [123]  LOAD            R17 K33  ; "\n"
-0120  [123]  CALL_R0         R15 args=3
-0121  [123]  RETURN          R0 count=1
+0066  [116]  JF              R13 +3
+0067  [116]  GETTABUP        R13 U0 K25  ; "arg"
+0068  [116]  LOAD            R14 K26  ; 1
+0069  [116]  GETTABLE        R13 R13 R14
+0070  [116]  CALL_R1         R12 args=2
+0071  [116]  JT              R12 +1
+0072  [116]  LOAD            R12 K27  ; 1000
+0073  [117]  NEWTABLE        R13 T5  ; {} items=5
+0074  [117]  MOVE            R14 R8
+0075  [117]  MOVE            R15 R4
+0076  [117]  MOVE            R16 R5
+0077  [117]  MOVE            R17 R6
+0078  [117]  MOVE            R18 R7
+0079  [117]  SETLIST         R13 count=5 offset=0
+0080  [118]  LEN             R14 R13
+0081  [120]  MOVE            R15 R11
+0082  [120]  MOVE            R16 R13
+0083  [120]  MOVE            R17 R14
+0084  [120]  CALL_R0         R15 args=3
+0085  [121]  GETTABUP        R15 U0 K28  ; "io"
+0086  [121]  GETFIELD        R15 R15 K29  ; "write"
+0087  [121]  GETTABUP        R16 U0 K30  ; "string"
+0088  [121]  GETFIELD        R16 R16 K31  ; "format"
+0089  [121]  LOAD            R17 K32  ; "%0.9f"
+0090  [121]  MOVE            R18 R10
+0091  [121]  MOVE            R19 R13
+0092  [121]  MOVE            R20 R14
+0093  [121]  CALL            R18 args=3 ret=0
+0094  [121]  CALL_R1         R16 args=0
+0095  [121]  LOAD            R17 K33  ; "\n"
+0096  [121]  CALL_R0         R15 args=3
+0097  [122]  LOAD            R15 K26  ; 1
+0098  [122]  MOVE            R16 R12
+0099  [122]  LOAD            R17 K26  ; 1
+0100  [122]  FORPREP         R15 +6
+0101  [122]  MOVE            R19 R9
+0102  [122]  MOVE            R20 R13
+0103  [122]  MOVE            R21 R14
+0104  [122]  LOAD            R22 K34  ; 0.01
+0105  [122]  CALL_R0         R19 args=4
+0106  [122]  FORLOOP         R15 -6
+0107  [123]  GETTABUP        R15 U0 K28  ; "io"
+0108  [123]  GETFIELD        R15 R15 K29  ; "write"
+0109  [123]  GETTABUP        R16 U0 K30  ; "string"
+0110  [123]  GETFIELD        R16 R16 K31  ; "format"
+0111  [123]  LOAD            R17 K32  ; "%0.9f"
+0112  [123]  MOVE            R18 R10
+0113  [123]  MOVE            R19 R13
+0114  [123]  MOVE            R20 R14
+0115  [123]  CALL            R18 args=3 ret=0
+0116  [123]  CALL_R1         R16 args=0
+0117  [123]  LOAD            R17 K33  ; "\n"
+0118  [123]  CALL_R0         R15 args=3
+0119  [123]  RETURN          R0 count=1
 
 ; prototype 0:
   ; function (params=3, vararg=false, stack=29, upvalues=1)
