@@ -3,11 +3,11 @@
 //! `stringmetamethods`); the VM itself never converts strings to numbers.
 
 use crate::Context;
-use crate::builtin::util::{AdjustResults, str_to_number};
+use crate::builtin::util::str_to_number;
 use crate::dmm::Mutation;
 use crate::env::{ActionFn, Error, Function, LuaString, NativeClosure, Stack, Table, Value};
+use crate::vm::native::CallbackAction;
 use crate::vm::num::{self, SlowNum};
-use crate::vm::sequence::{BoxSequence, CallbackAction};
 
 pub(super) fn install<'gc>(ctx: Context<'gc>, lib: Table<'gc>) {
     let mt = Table::new(ctx);
@@ -32,7 +32,7 @@ macro_rules! arith_natives {
                 ctx: Context<'gc>,
                 _closure: &NativeClosure<'gc>,
                 stack: Stack<'gc, '_>,
-            ) -> Result<CallbackAction<'gc>, Error<'gc>> {
+            ) -> Result<CallbackAction, Error<'gc>> {
                 arith(ctx, stack, $op, ctx.symbols().$mm, $name)
             }
         )*
@@ -76,7 +76,7 @@ fn arith<'gc>(
     op: ArithFn<'gc>,
     mm: LuaString<'gc>,
     name: &'static str,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<CallbackAction, Error<'gc>> {
     let mc = ctx.mutation();
     let a = tonum(mc, stack.get(0));
     // lstrlib's `tonum` pushes the converted first operand, which then stands
@@ -110,7 +110,7 @@ fn trymt<'gc>(
     mut stack: Stack<'gc, '_>,
     mm_name: LuaString<'gc>,
     name: &'static str,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<CallbackAction, Error<'gc>> {
     let (a, b) = (stack.get(0), stack.get(1));
     let mm = match b.get_string() {
         Some(_) => Value::nil(),
@@ -126,8 +126,18 @@ fn trymt<'gc>(
             ),
         ));
     }
-    // `lua_call(L, 2, 1)`; the executor resolves a `__call` chain on `mm`.
+    // `lua_call(L, 2, 1)`, through a `__call` chain on `mm`.
     stack.replace(&[mm, a, b]);
-    let then = BoxSequence::new(ctx.mutation(), AdjustResults(1));
-    Ok(CallbackAction::call(Some(then)))
+    Ok(CallbackAction::call_then(0, one_result))
+}
+
+fn one_result<'gc>(
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
+    mut stack: Stack<'gc, '_>,
+    _status: Result<(), Error<'gc>>,
+) -> Result<CallbackAction, Error<'gc>> {
+    let v = stack.get(0);
+    stack.ret1(v);
+    Ok(CallbackAction::Return)
 }

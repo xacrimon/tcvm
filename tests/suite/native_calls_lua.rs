@@ -1,49 +1,35 @@
-//! A native callback uses `CallbackAction::call` to call a Lua function,
-//! either consuming its results via a follow-up sequence or handing them
-//! straight to its own caller.
+//! A native calls a Lua function with `CallbackAction::CallThen`, either
+//! consuming its results in a continuation or handing them straight to its
+//! own caller.
 
-use std::pin::Pin;
-
-use tcvm::dmm::{Collect, Trace};
 use tcvm::env::{ActionFn, Error, Function, LuaString, NativeClosure, Stack, Value};
 use tcvm::lua::Context;
-use tcvm::vm::sequence::{BoxSequence, CallbackAction, Execution, Sequence, SequencePoll};
+use tcvm::vm::native::{CallbackAction, OnOk, Protect};
 use tcvm::{Executor, LoadError, Lua};
-
-/// A trivial sequence that, on poll, takes the result at slot 0 and adds 1.
-struct AddOneSequence;
-
-unsafe impl<'gc> Collect<'gc> for AddOneSequence {
-    const NEEDS_TRACE: bool = false;
-}
-
-impl<'gc> Sequence<'gc> for AddOneSequence {
-    fn trace_pointers(&self, _cc: &mut dyn Trace<'gc>) {}
-
-    fn poll(
-        self: Pin<&mut Self>,
-        ctx: Context<'gc>,
-        _exec: Execution<'gc>,
-        mut stack: Stack<'gc, '_>,
-    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
-        let v = stack.get(0).get_integer().unwrap_or(0);
-        stack.replace(&[Value::integer(ctx.mutation(), v + 1)]);
-        Ok(SequencePoll::Return)
-    }
-}
 
 /// Native callback `bumper(f)` calls `f()` then adds 1 to the result.
 fn bumper<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<CallbackAction, Error<'gc>> {
     if stack.get(0).get_function().is_none() {
         return Err(Error::from_str(ctx, "bumper expects a function"));
     }
-    // The callee at stack[0] with no arguments is already `Call` layout.
-    let then = BoxSequence::new(ctx.mutation(), AddOneSequence);
-    Ok(CallbackAction::call(Some(then)))
+    // The callee at stack[0] with no arguments is already call layout.
+    Ok(CallbackAction::call_then(0, add_one))
+}
+
+/// Takes the result at slot 0 and adds 1.
+fn add_one<'gc>(
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
+    mut stack: Stack<'gc, '_>,
+    _status: Result<(), Error<'gc>>,
+) -> Result<CallbackAction, Error<'gc>> {
+    let v = stack.get(0).get_integer().unwrap_or(0);
+    stack.replace(&[Value::integer(ctx.mutation(), v + 1)]);
+    Ok(CallbackAction::Return)
 }
 
 /// Native callback `forward(f, ...)`: `f(...)`'s results are the caller's.
@@ -51,8 +37,22 @@ fn forward<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    Ok(CallbackAction::call(None))
+) -> Result<CallbackAction, Error<'gc>> {
+    Ok(CallbackAction::CallThen {
+        at: 0,
+        protect: Protect::No,
+        ok: OnOk::Return,
+        cont: returned,
+    })
+}
+
+fn returned<'gc>(
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
+    _stack: Stack<'gc, '_>,
+    _status: Result<(), Error<'gc>>,
+) -> Result<CallbackAction, Error<'gc>> {
+    Ok(CallbackAction::Return)
 }
 
 #[test]

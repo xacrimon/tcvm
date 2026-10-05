@@ -12,7 +12,7 @@
 //! steer a branch rather than land in a register), and `TForCall`.
 
 use tcvm::env::{Error, Function, LuaString, NativeClosure, Stack, Table, Value};
-use tcvm::vm::sequence::CallbackAction;
+use tcvm::vm::native::CallbackAction;
 use tcvm::{Context, Executor, IntoMultiValue, LoadError, Lua, RuntimeError, StepResult};
 
 /// A metamethod that refuses to answer inline: it yields to the host, which
@@ -21,8 +21,8 @@ fn suspending_mm<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    Ok(CallbackAction::yield_(None))
+) -> Result<CallbackAction, Error<'gc>> {
+    Ok(CallbackAction::Yield)
 }
 
 /// Loads `src` with a global `t` whose metatable maps `event` to the suspending

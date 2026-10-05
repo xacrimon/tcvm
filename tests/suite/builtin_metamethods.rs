@@ -1,6 +1,6 @@
-//! A builtin that calls Lua through a follow-up sequence (`pcall`) works as a
-//! metamethod or generic-for iterator: the sequence's results reach the
-//! caller's continuation. Expected strings come from `lua` 5.5.1 on the same
+//! A builtin that calls Lua and continues after it (`pcall`) works as a
+//! metamethod or generic-for iterator: its results reach the caller's
+//! continuation. Expected strings come from `lua` 5.5.1 on the same
 //! chunk, which hands its result to the host with `error(v, 0)`.
 
 use crate::common::err;
