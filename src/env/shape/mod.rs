@@ -171,6 +171,20 @@ for_each_metamethod!(emit_bitflags);
 /// shapes are shared.
 pub const MAX_PROPERTIES_FAST: u32 = 512;
 
+/// The inline capacities a table can be allocated with, one root shape each:
+/// a table's first `inline_cap` slots live in its own cell, the rest in a
+/// spill cell. Few sizes, so tables built with nearby hints share shapes.
+pub const INLINE_CAPS: [u8; 6] = [0, 2, 4, 8, 16, 32];
+
+/// Index into [`INLINE_CAPS`] of the smallest capacity holding `n` slots, or
+/// of the largest.
+pub fn inline_bucket(n: usize) -> usize {
+    INLINE_CAPS
+        .iter()
+        .position(|&c| c as usize >= n)
+        .unwrap_or(INLINE_CAPS.len() - 1)
+}
+
 /// The same, for a key added by `t[k] = v`: such a table is usually a map,
 /// whose keys and their order differ each time, so it would build a chain of
 /// shapes nothing else uses.
@@ -366,6 +380,11 @@ pub struct ShapeData<'gc> {
     #[collect(require_static)]
     pub is_dict: bool,
 
+    /// How many of the slots live in the table's own cell (see
+    /// [`INLINE_CAPS`]); fixed for a whole tree, from its root.
+    #[collect(require_static)]
+    pub inline_cap: u8,
+
     /// Outgoing transition edges, held inline (no separate `Gc`
     /// allocation). Mutation goes through `Gc::write` on the parent
     /// `Gc<ShapeData>` to emit the barrier.
@@ -546,9 +565,9 @@ impl<'gc> MtCache<'gc> {
 }
 
 impl<'gc> Shape<'gc> {
-    /// Allocate the global empty / root shape. There is exactly one
-    /// per `State` — see `State::empty_shape`.
-    pub fn root_empty(mc: &Mutation<'gc>) -> Self {
+    /// Allocate an empty root shape for tables with `inline_cap` inline
+    /// slots. There is one per capacity per `State`, see `State::root_shapes`.
+    pub fn root_empty(mc: &Mutation<'gc>, inline_cap: u8) -> Self {
         Shape(Gc::new(
             mc,
             ShapeData {
@@ -557,6 +576,7 @@ impl<'gc> Shape<'gc> {
                 slot_count: 0,
                 mt_cache: None,
                 is_dict: false,
+                inline_cap,
                 transitions: RefLock::new(TransitionTable::new()),
                 keys: Keys::new(mc, &[], 0),
             },
@@ -574,6 +594,7 @@ impl<'gc> Shape<'gc> {
                 slot_count: 0,
                 mt_cache,
                 is_dict: true,
+                inline_cap: 0,
                 transitions: RefLock::new(TransitionTable::new()),
                 keys: Keys::new(mc, &[], 0),
             },
@@ -603,6 +624,11 @@ impl<'gc> Shape<'gc> {
     #[inline]
     pub fn is_dict(self) -> bool {
         self.data().is_dict
+    }
+
+    #[inline]
+    pub fn inline_cap(self) -> u32 {
+        self.data().inline_cap as u32
     }
 
     #[inline]
@@ -691,6 +717,7 @@ pub fn transition_add_prop<'gc>(
             slot_count: new_slot + 1,
             mt_cache: parent.data().mt_cache,
             is_dict: false,
+            inline_cap: parent.data().inline_cap,
             transitions: RefLock::new(TransitionTable::new()),
             keys,
         },
@@ -747,6 +774,7 @@ pub fn transition_set_metatable<'gc>(
             slot_count: parent.slot_count(),
             mt_cache: new_mt,
             is_dict: false,
+            inline_cap: parent.data().inline_cap,
             transitions: RefLock::new(TransitionTable::new()),
             keys: parent.data().keys,
         },

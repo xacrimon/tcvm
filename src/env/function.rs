@@ -4,7 +4,7 @@ use crate::dmm::{Collect, Gc, GcWeak, Lock, Mutation, RefLock, Trace};
 use crate::env::error::Error;
 use crate::env::shape::Shape;
 use crate::env::string::LuaString;
-use crate::env::table::TableState;
+use crate::env::table::{SlotLoc, TableState};
 use crate::env::thread::ThreadState;
 use crate::env::value::Value;
 use crate::instruction::UpValueDescriptor;
@@ -97,26 +97,31 @@ impl<'gc> Prototype<'gc> {
 #[repr(align(32))]
 pub enum InlineCache<'gc> {
     // First, so the hottest hit tests a zero discriminant.
-    /// Tables of `shape` hold the key at `TableState::properties[slot]`.
+    /// Tables of `shape` hold the key at `loc`.
     Own {
         shape: Shape<'gc>,
         #[collect(require_static)]
-        slot: u32,
+        loc: SlotLoc,
     },
     /// Tables of `shape` lack the key: a load is nil unless `__index` fires.
     Absent { shape: Shape<'gc> },
     /// Tables of `from` lack the key; adding it moves them to `to`, which
-    /// holds it in the slot after `from`'s last.
-    Transition { from: Shape<'gc>, to: Shape<'gc> },
+    /// holds it at `loc`, the slot after `from`'s last.
+    Transition {
+        from: Shape<'gc>,
+        to: Shape<'gc>,
+        #[collect(require_static)]
+        loc: SlotLoc,
+    },
     /// Tables of `recv` lack the key, and while their metatable's `__index`
-    /// is `holder`, it holds the key at `slot` if its shape is `holder_shape`.
+    /// is `holder`, it holds the key at `loc` if its shape is `holder_shape`.
     /// `holder` is weak, as a metatable's `__index` may be.
     ProtoLoad {
         recv: Shape<'gc>,
         holder: GcWeak<'gc, RefLock<TableState<'gc>>>,
         holder_shape: Shape<'gc>,
         #[collect(require_static)]
-        slot: u32,
+        loc: SlotLoc,
     },
     #[default]
     Empty,

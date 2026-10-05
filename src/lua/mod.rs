@@ -23,7 +23,7 @@ use crate::dmm::Rootable;
 use crate::dmm::arena::{CollectionPhase, MarkedArena};
 use crate::dmm::metrics::Pacing;
 use crate::dmm::{Arena, Collect, DynamicRootSet, Gc, GcLock, Lock, Mutation};
-use crate::env::shape::Shape;
+use crate::env::shape::{INLINE_CAPS, Shape};
 use crate::env::string::Interner;
 use crate::env::value::ValueKind;
 use crate::env::{Symbols, Table};
@@ -33,10 +33,10 @@ use crate::env::{Symbols, Table};
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub struct State<'gc> {
-    /// Shared root shape for all freshly created tables. Anchors the
-    /// transition tree so two tables that grow through the same key
-    /// sequence converge on the same shape pointer.
-    pub(crate) empty_shape: Shape<'gc>,
+    /// Root shapes by inline capacity (`INLINE_CAPS`). Each anchors a
+    /// transition tree, so two tables of one capacity that grow through the
+    /// same key sequence converge on the same shape pointer.
+    pub(crate) root_shapes: [Shape<'gc>; INLINE_CAPS.len()],
     /// Shared dict-mode sentinel for tables migrating to dict mode
     /// while carrying no metatable. Tables with a metatable use the
     /// per-`MtCache` sentinel via `MtCache::ensure_dict_sentinel`.
@@ -92,15 +92,15 @@ impl Default for Lua {
 impl Lua {
     pub fn new() -> Self {
         let arena = Arena::<Rootable![State<'_>]>::new(|mc: &Mutation<'_>| {
-            let empty_shape = Shape::root_empty(mc);
+            let root_shapes = INLINE_CAPS.map(|cap| Shape::root_empty(mc, cap));
             let empty_dict_sentinel = Shape::dict_sentinel(mc, None);
             let interner = Interner::new(mc);
             let symbols = Symbols::intern_all(mc, &interner);
             State {
-                empty_shape,
+                root_shapes,
                 empty_dict_sentinel,
                 symbols,
-                globals: Table::new_with_shape(mc, empty_shape),
+                globals: Table::new_with_shape(mc, root_shapes[0]),
                 roots: DynamicRootSet::new(mc),
                 interner,
                 type_metatables: std::array::from_fn(|_| Gc::new(mc, Lock::new(None))),
