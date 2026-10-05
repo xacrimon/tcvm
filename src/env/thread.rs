@@ -317,7 +317,7 @@ pub struct ThreadState<'gc> {
     /// `depth`. Kept apart so the interpreter's frames are plain records.
     pub(crate) exec_frames: Vec<ExecFrame<'gc>, MetricsAlloc<'gc>>,
     /// Upvalues still pointing into `stack`, sorted by slot, so a `CLOSE` or
-    /// return closes a tail of the list.
+    /// return closes a tail of the list. `grow_slots` rebases them.
     pub(crate) open_upvalues: Vec<Upvalue<'gc>>,
     /// Open to-be-closed variables by stack position, innermost last
     /// (`L->tbclist`). Each leaves the list just before its `__close` runs.
@@ -557,6 +557,8 @@ impl<'gc> ThreadState<'gc> {
 
     /// Drop everything a previous run left behind; `status` is the caller's.
     pub(crate) fn reset(&mut self) {
+        // An open upvalue left behind would keep pointing into `stack`.
+        debug_assert!(self.open_upvalues.is_empty());
         self.discard_above(0);
         self.frames.clear();
         self.exec_frames.clear();
@@ -722,7 +724,14 @@ impl<'gc> ThreadState<'gc> {
     fn grow_slots(&mut self, n: usize) {
         // Frame bases are stored in 32 bits (`LuaFrame::base`).
         assert!(n <= u32::MAX as usize, "Lua stack exceeds 2^32 slots");
+        let old = self.stack.as_ptr().addr();
         self.stack.resize(n, Value::nil());
+        let new = self.stack.as_mut_ptr();
+        if new.addr() != old {
+            for uv in &self.open_upvalues {
+                uv.rebase(old, new);
+            }
+        }
     }
 
     /// `ensure_slots` for a Lua frame's register window ending at `n`; `false`
