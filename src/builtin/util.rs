@@ -4,6 +4,7 @@
 
 use std::pin::Pin;
 
+use crate::builtin::strfmt_num;
 use crate::dmm::{Collect, Gc, Mutation, Trace};
 use crate::env::{Error, Function, LuaString, MetamethodBits, NativeClosure, Stack, Table, Value};
 use crate::lua::{Context, StashedError};
@@ -154,73 +155,15 @@ pub(crate) fn str_to_int_base(b: &[u8], base: u32) -> Option<i64> {
     Some(if neg { acc.wrapping_neg() } else { acc })
 }
 
-/// Append the canonical Lua 5.5 textual form of a float. Lua formats with
-/// `LUA_NUMBER_FMT` (`"%.15g"`) and, only if that fails to read back exactly,
-/// falls straight to `LUA_NUMBER_FMT_N` (`"%.17g"`) — there is no scan through
-/// the intermediate precisions, so e.g. `1/3` prints `0.33333333333333331`, not
-/// the shorter `%.16g` form. Any integer-looking result gets a trailing `".0"`.
+/// Append the textual form of a float: `%.14g` as in LuaJIT, where Lua 5.5 uses `%.15g`
+/// and falls back to `%.17g` when that doesn't read back exactly, plus `.0` on an
+/// integer-looking result.
 pub(crate) fn push_float(out: &mut Vec<u8>, f: f64) {
-    if f.is_nan() {
-        out.extend_from_slice(b"nan");
-        return;
-    }
-    if f.is_infinite() {
-        out.extend_from_slice(if f < 0.0 { b"-inf" } else { b"inf" });
-        return;
-    }
-    // `%.15g`, else `%.17g` (which always round-trips an f64).
-    let s15 = format_g(f, 15);
-    let mut s = if s15.parse::<f64>() == Ok(f) {
-        s15
-    } else {
-        format_g(f, 17)
-    };
+    let start = out.len();
+    strfmt_num::put_fnum(out, strfmt_num::STRFMT_G14, f);
     // Tag an otherwise integer-looking float so round-trips stay floats.
-    if !s
-        .bytes()
-        .any(|b| matches!(b, b'.' | b'e' | b'E' | b'n' | b'N' | b'i' | b'I'))
-    {
-        s.push_str(".0");
-    }
-    out.extend_from_slice(s.as_bytes());
-}
-
-/// C `printf` `%.*g` for finite `f` with `prec` significant digits. The `%e`
-/// vs `%f` choice and trailing-zero trimming follow the C standard; the
-/// exponent is rendered C-style (signed, at least two digits).
-fn format_g(f: f64, prec: usize) -> String {
-    let p = prec.max(1);
-    // Format in scientific first to read off the decimal exponent.
-    let sci = format!("{:.*e}", p - 1, f);
-    let e = sci.find('e').expect("scientific format always has 'e'");
-    let exp: i32 = sci[e + 1..].parse().expect("valid exponent");
-    if exp < -4 || exp >= p as i32 {
-        let mut mantissa = sci[..e].to_string();
-        strip_trailing_zeros(&mut mantissa);
-        let sign = if exp < 0 { '-' } else { '+' };
-        let mag = exp.unsigned_abs();
-        if mag < 10 {
-            format!("{mantissa}e{sign}0{mag}")
-        } else {
-            format!("{mantissa}e{sign}{mag}")
-        }
-    } else {
-        let dec = (p as i32 - 1 - exp).max(0) as usize;
-        let mut s = format!("{f:.dec$}");
-        strip_trailing_zeros(&mut s);
-        s
-    }
-}
-
-fn strip_trailing_zeros(s: &mut String) {
-    if !s.contains('.') {
-        return;
-    }
-    while s.ends_with('0') {
-        s.pop();
-    }
-    if s.ends_with('.') {
-        s.pop();
+    if out[start..].iter().all(|b| matches!(b, b'-' | b'0'..=b'9')) {
+        out.extend_from_slice(b".0");
     }
 }
 

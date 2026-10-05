@@ -2,6 +2,11 @@ use core::fmt::NumBuffer;
 use std::cell::RefCell;
 
 use crate::Context;
+use crate::builtin::strfmt_num::{
+    self, SFormat, STRFMT_F_ALT, STRFMT_F_LEFT, STRFMT_F_PLUS, STRFMT_F_SPACE, STRFMT_F_UPPER,
+    STRFMT_F_ZERO, STRFMT_SH_PREC, STRFMT_SH_WIDTH, STRFMT_T_FP_A, STRFMT_T_FP_E, STRFMT_T_FP_F,
+    STRFMT_T_FP_G,
+};
 use crate::builtin::util;
 // `%d`/`%f` argument coercion reuses the shared `util` helpers so the
 // integer-representation and numeric-string rules (including `inf`/`nan`
@@ -411,12 +416,18 @@ fn parse_spec<'gc>(
         b'd' | b'i' => (b"-+0 ", true),
         b'u' => (b"-0", true),
         b'o' | b'x' | b'X' => (b"-#0", true),
-        b'a' | b'A' | b'e' | b'E' | b'f' | b'F' | b'g' | b'G' => (b"-+#0 ", true),
+        b'a' | b'A' | b'e' | b'E' | b'f' | b'g' | b'G' => (b"-+#0 ", true),
         b'c' | b'p' => (b"-", false),
         b's' => (b"-", true),
-        // Unknown letters fall through to `format_one`'s
-        // "invalid conversion '%c' to 'format'".
-        _ => return Ok((spec, i + 1)),
+        _ => {
+            return Err(Error::from_str(
+                ctx,
+                &format!(
+                    "invalid conversion '{}' to 'format'",
+                    String::from_utf8_lossy(form)
+                ),
+            ));
+        }
     };
     let flag_rejected = (spec.flag_minus && !allowed_flags.contains(&b'-'))
         || (spec.flag_plus && !allowed_flags.contains(&b'+'))
@@ -478,21 +489,9 @@ fn format_one<'gc>(
             let n = check_fmt_int(ctx, arg, arg_num)?;
             apply_width(out, spec, b"", b"", &[n as u8]);
         }
-        b'f' | b'F' => {
+        b'a' | b'A' | b'e' | b'E' | b'f' | b'g' | b'G' => {
             let f = to_float(arg).ok_or_else(|| arg_type_err(ctx, "number", &arg, arg_num))?;
-            fmt_float_fixed(out, spec, f);
-        }
-        b'e' | b'E' => {
-            let f = to_float(arg).ok_or_else(|| arg_type_err(ctx, "number", &arg, arg_num))?;
-            fmt_float_exp(out, spec, f, spec.conv == b'E');
-        }
-        b'g' | b'G' => {
-            let f = to_float(arg).ok_or_else(|| arg_type_err(ctx, "number", &arg, arg_num))?;
-            fmt_float_g(out, spec, f, spec.conv == b'G');
-        }
-        b'a' | b'A' => {
-            let f = to_float(arg).ok_or_else(|| arg_type_err(ctx, "number", &arg, arg_num))?;
-            fmt_hex_float(out, spec, f, spec.conv == b'A');
+            strfmt_num::put_fnum(out, float_sformat(spec), f);
         }
         b's' => {
             fmt_string(ctx, out, spec, arg);
@@ -507,12 +506,7 @@ fn format_one<'gc>(
         b'q' => {
             fmt_q(ctx, out, arg, arg_num)?;
         }
-        c => {
-            return Err(Error::from_str(
-                ctx,
-                &format!("invalid conversion '%{}' to 'format'", c as char),
-            ));
-        }
+        _ => unreachable!("parse_spec rejects other conversions"),
     }
     Ok(())
 }
@@ -635,283 +629,32 @@ fn int_digits<'a>(spec: &FmtSpec, digits: &'a [u8], zero: bool, buf: &'a mut [u8
 
 // ---------- float formatting ----------
 
-fn fmt_float_fixed(out: &mut Vec<u8>, spec: &FmtSpec, f: f64) {
-    let prec = spec.precision.unwrap_or(6);
-    if let Some(s) = special_float(f, spec) {
-        apply_width(out, spec, b"", b"", s.as_bytes());
-        return;
-    }
-    let (sign, abs) = sign_split(f, spec);
-    let mut body = format!("{abs:.prec$}");
-    if spec.flag_hash && prec == 0 {
-        body.push('.');
-    }
-    apply_width(out, spec, sign.as_bytes(), "".as_bytes(), body.as_bytes());
-}
-
-fn fmt_float_exp(out: &mut Vec<u8>, spec: &FmtSpec, f: f64, upper: bool) {
-    let prec = spec.precision.unwrap_or(6);
-    if let Some(s) = special_float(f, spec) {
-        apply_width(out, spec, b"", b"", s.as_bytes());
-        return;
-    }
-    let (sign, abs) = sign_split(f, spec);
-    let body = format_exp_abs(abs, prec, upper, spec.flag_hash);
-    apply_width(out, spec, sign.as_bytes(), b"", body.as_bytes());
-}
-
-fn fmt_float_g(out: &mut Vec<u8>, spec: &FmtSpec, f: f64, upper: bool) {
-    let raw_prec = spec.precision.unwrap_or(6);
-    let prec = if raw_prec == 0 { 1 } else { raw_prec };
-    if let Some(s) = special_float(f, spec) {
-        apply_width(out, spec, b"", b"", s.as_bytes());
-        return;
-    }
-    let (sign, abs) = sign_split(f, spec);
-    // X = decimal exponent of `abs` when formatted as %e
-    let x: i32 = if abs == 0.0 {
-        0
-    } else {
-        abs.abs().log10().floor() as i32
+/// The `SFormat` of a float conversion, for `strfmt_num`.
+fn float_sformat(spec: &FmtSpec) -> SFormat {
+    let mut sf = match spec.conv.to_ascii_lowercase() {
+        b'a' => STRFMT_T_FP_A,
+        b'e' => STRFMT_T_FP_E,
+        b'f' => STRFMT_T_FP_F,
+        _ => STRFMT_T_FP_G,
     };
-    let mut body = if (x < -4) || (x >= prec as i32) {
-        // %e with precision = prec - 1
-        format_exp_abs(abs, prec - 1, upper, false)
-    } else {
-        // %f with precision = prec - 1 - X
-        let p = (prec as i32 - 1 - x).max(0) as usize;
-        format!("{abs:.p$}")
-    };
-    if !spec.flag_hash {
-        strip_g_trailing_zeros(&mut body);
-    }
-    apply_width(out, spec, sign.as_bytes(), b"", body.as_bytes());
-}
-
-fn special_float(f: f64, spec: &FmtSpec) -> Option<&'static str> {
-    if f.is_nan() {
-        Some(if spec.conv.is_ascii_uppercase() {
-            "NAN"
-        } else {
-            "nan"
-        })
-    } else if f.is_infinite() {
-        Some(if f.is_sign_negative() {
-            if spec.conv.is_ascii_uppercase() {
-                "-INF"
-            } else {
-                "-inf"
-            }
-        } else if spec.conv.is_ascii_uppercase() {
-            "INF"
-        } else {
-            "inf"
-        })
-    } else {
-        None
-    }
-}
-
-fn sign_split(f: f64, spec: &FmtSpec) -> (&'static str, f64) {
-    if f.is_sign_negative() && f != 0.0 {
-        ("-", -f)
-    } else if spec.flag_plus {
-        ("+", f)
-    } else if spec.flag_space {
-        (" ", f)
-    } else {
-        ("", f)
-    }
-}
-
-fn format_exp_abs(abs: f64, prec: usize, upper: bool, hash: bool) -> String {
-    // Produce mantissa and exponent matching C printf semantics:
-    //   d.ddd e ±NN  (exponent always signed, at least 2 digits)
-    let (mantissa, exp) = decompose_exp(abs, prec);
-    let e_char = if upper { 'E' } else { 'e' };
-    let mut s = mantissa;
-    if hash && prec == 0 && !s.contains('.') {
-        s.push('.');
-    }
-    let sign = if exp < 0 { '-' } else { '+' };
-    let mag = exp.unsigned_abs();
-    if mag < 10 {
-        format!("{s}{e_char}{sign}0{mag}")
-    } else {
-        format!("{s}{e_char}{sign}{mag}")
-    }
-}
-
-fn decompose_exp(abs: f64, prec: usize) -> (String, i32) {
-    // Rust's `{:e}` formatting rounds, renormalizes (e.g. 9.9 at prec 0 -> "1e1"),
-    // and handles subnormals correctly. Scaling the mantissa by `10^-exp` by hand
-    // instead overflowed to `inf` for denormal exponents (~1e-309 and below),
-    // producing garbage like "infe-309". Split the mantissa from the exponent.
-    // `.abs()` strips a `-0.0` sign bit, which the caller already accounts for and
-    // which `{:e}` would otherwise re-emit as a duplicate '-'.
-    let s = format!("{:.prec$e}", abs.abs());
-    let epos = s.find('e').expect("exponential format always contains 'e'");
-    let exp = s[epos + 1..]
-        .parse::<i32>()
-        .expect("exponent is a valid integer");
-    (s[..epos].to_string(), exp)
-}
-
-fn strip_trailing_zeros(s: &mut String) {
-    if !s.contains('.') {
-        return;
-    }
-    while s.ends_with('0') {
-        s.pop();
-    }
-    if s.ends_with('.') {
-        s.pop();
-    }
-}
-
-/// `%g` trailing-zero trimming: strip only the *mantissa*, never the exponent
-/// digits. `strip_trailing_zeros` on a whole `"1.20000e+20"` would chew the
-/// `0` off the exponent (`...e+2`); split at `e`/`E` and trim just the front.
-fn strip_g_trailing_zeros(s: &mut String) {
-    match s.find(['e', 'E']) {
-        Some(epos) => {
-            let mut mant = s[..epos].to_string();
-            strip_trailing_zeros(&mut mant);
-            mant.push_str(&s[epos..]);
-            *s = mant;
-        }
-        None => strip_trailing_zeros(s),
-    }
-}
-
-/// Format `abs` (finite, non-negative) as a C `%a`/`%A` hex float — `0x1.fep+7`
-/// style. Without `prec`, emits the minimal fraction digits (trailing zeros
-/// trimmed); with `prec`, emits exactly that many fraction nibbles.
-fn format_hex_float(abs: f64, upper: bool, prec: Option<usize>) -> String {
-    let bits = abs.to_bits();
-    let exp_bits = ((bits >> 52) & 0x7ff) as i64;
-    let raw_frac = bits & 0x000f_ffff_ffff_ffff;
-    // (leading hex digit, unbiased exponent, 52-bit fraction below the lead).
-    let (mut lead, exp, frac) = if exp_bits == 0 {
-        if raw_frac == 0 {
-            (0u8, 0i64, 0u64) // ±0
-        } else {
-            // Subnormal: normalize to a leading `1` digit (matches C/Lua).
-            let hb = 63 - raw_frac.leading_zeros() as i64; // highest set bit, 0..=51
-            let frac = (raw_frac << (52 - hb as u32)) & 0x000f_ffff_ffff_ffff;
-            (1u8, hb - 1074, frac)
-        }
-    } else {
-        (1u8, exp_bits - 1023, raw_frac)
-    };
-    // 13 hex digits of the fraction, most-significant nibble first.
-    let mut digits: Vec<u8> = (0..13)
-        .map(|i| ((frac >> (48 - i * 4)) & 0xf) as u8)
-        .collect();
-    match prec {
-        Some(p) => {
-            // Round to `p` fraction nibbles using round-half-to-even (the IEEE
-            // 754 default). This is chosen for cross-platform determinism: C's
-            // `%a` tie-breaking is host-`printf`-defined (glibc rounds to even,
-            // macOS toward zero), which we deliberately do not inherit. The
-            // discarded part is exactly `digits[p..]` — the 52-bit fraction is
-            // 13 nibbles, so nothing lies beyond. A carry can ripple into `lead`.
-            if p < digits.len() {
-                let first = digits[p];
-                let rest_nonzero = digits[p + 1..].iter().any(|&d| d != 0);
-                let round_up = if first > 8 {
-                    true
-                } else if first < 8 {
-                    false
-                } else if rest_nonzero {
-                    true // past the halfway point
-                } else {
-                    // Exactly halfway: round so the last kept nibble is even.
-                    let last_kept = if p == 0 { lead } else { digits[p - 1] };
-                    last_kept & 1 == 1
-                };
-                digits.truncate(p);
-                if round_up {
-                    let mut carry = true;
-                    let mut i = digits.len();
-                    while carry && i > 0 {
-                        i -= 1;
-                        if digits[i] == 0xf {
-                            digits[i] = 0;
-                        } else {
-                            digits[i] += 1;
-                            carry = false;
-                        }
-                    }
-                    if carry {
-                        lead += 1;
-                    }
-                }
-            } else {
-                digits.truncate(p);
-            }
-        }
-        None => {
-            while digits.last() == Some(&0) {
-                digits.pop();
-            }
+    for (on, flag) in [
+        (spec.conv.is_ascii_uppercase(), STRFMT_F_UPPER),
+        (spec.flag_minus, STRFMT_F_LEFT),
+        (spec.flag_plus, STRFMT_F_PLUS),
+        (spec.flag_zero, STRFMT_F_ZERO),
+        (spec.flag_space, STRFMT_F_SPACE),
+        (spec.flag_hash, STRFMT_F_ALT),
+    ] {
+        if on {
+            sf |= flag;
         }
     }
-    let hexdig = |d: u8| -> char {
-        let c = if d < 10 {
-            b'0' + d
-        } else if upper {
-            b'A' + (d - 10)
-        } else {
-            b'a' + (d - 10)
-        };
-        c as char
-    };
-    let mut s = String::from(if upper { "0X" } else { "0x" });
-    s.push((b'0' + lead) as char);
-    if !digits.is_empty() || matches!(prec, Some(p) if p > 0) {
-        s.push('.');
-        for &d in &digits {
-            s.push(hexdig(d));
-        }
-        if let Some(p) = prec {
-            for _ in digits.len()..p {
-                s.push('0');
-            }
-        }
+    // `parse_spec` caps both at 99, inside the 8-bit fields.
+    sf |= (spec.width as u32) << STRFMT_SH_WIDTH;
+    if let Some(p) = spec.precision {
+        sf |= (p as u32 + 1) << STRFMT_SH_PREC;
     }
-    s.push(if upper { 'P' } else { 'p' });
-    s.push(if exp < 0 { '-' } else { '+' });
-    s.push_str(&exp.unsigned_abs().to_string());
-    s
-}
-
-fn fmt_hex_float(out: &mut Vec<u8>, spec: &FmtSpec, f: f64, upper: bool) {
-    if let Some(s) = special_float(f, spec) {
-        apply_width(out, spec, b"", b"", s.as_bytes());
-        return;
-    }
-    // Unlike the decimal float specs, `%a` keeps the sign of `-0.0`.
-    let sign: &str = if f.is_sign_negative() {
-        "-"
-    } else if spec.flag_plus {
-        "+"
-    } else if spec.flag_space {
-        " "
-    } else {
-        ""
-    };
-    let body = format_hex_float(f.abs(), upper, spec.precision);
-    // Split the `0x`/`0X` prefix so the `0` flag zero-pads *after* it
-    // (`%010a` -> `0x00001p+0`, not `00000x1p+0`).
-    let (prefix, rest) = body.split_at(2);
-    apply_width(
-        out,
-        spec,
-        sign.as_bytes(),
-        prefix.as_bytes(),
-        rest.as_bytes(),
-    );
+    sf
 }
 
 // ---------- string and q ----------
@@ -957,10 +700,7 @@ fn fmt_q<'gc>(
         } else if f.is_infinite() {
             out.extend_from_slice(if f < 0.0 { b"-1e9999" } else { b"1e9999" });
         } else {
-            if f.is_sign_negative() {
-                out.push(b'-');
-            }
-            out.extend_from_slice(format_hex_float(f.abs(), false, None).as_bytes());
+            strfmt_num::put_fnum(out, STRFMT_T_FP_A, f);
         }
     } else if let Some(s) = arg.get_string() {
         // Mirror Lua's `addquoted`: `"` / `\` / `\n` -> backslash + the char;
