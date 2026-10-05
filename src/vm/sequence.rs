@@ -68,6 +68,8 @@ pub enum CallbackAction<'gc> {
         #[collect(require_static)]
         protect: Protect,
         #[collect(require_static)]
+        ok: OnOk,
+        #[collect(require_static)]
         cont: NativeCont,
     },
     /// Resume the coroutine at `stack[at]` with the values above it, then run
@@ -76,6 +78,8 @@ pub enum CallbackAction<'gc> {
     /// interpreter.
     Resume {
         at: u32,
+        #[collect(require_static)]
+        ok: OnOk,
         #[collect(require_static)]
         cont: NativeCont,
     },
@@ -100,6 +104,18 @@ pub enum Protect {
     Handler,
 }
 
+/// What `cont` does with the results of a [`CallbackAction::CallThen`] or
+/// [`CallbackAction::Resume`] that succeeded, when that is simple enough for
+/// the VM to do it instead of calling `cont`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OnOk {
+    Cont,
+    /// They are the native's results.
+    Return,
+    /// `true` and then them (`pcall`).
+    ReturnTrue,
+}
+
 /// The continuation of a [`CallbackAction::CallThen`]: the native's window
 /// with the call's results at `at`, or with nothing above `at` and the error
 /// when a protected call failed.
@@ -116,6 +132,7 @@ impl<'gc> CallbackAction<'gc> {
         CallbackAction::CallThen {
             at: at as u32,
             protect: Protect::No,
+            ok: OnOk::Cont,
             cont,
         }
     }

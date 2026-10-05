@@ -2580,8 +2580,12 @@ macro_rules! call_native {
                     let f = unsafe { $thread.stack[func_idx].get_function().unwrap_unchecked() };
                     // The common shape, a native calling a Lua function, without
                     // `run_natives`' generality.
-                    if let crate::vm::sequence::CallbackAction::CallThen { at, protect, cont } =
-                        action
+                    if let crate::vm::sequence::CallbackAction::CallThen {
+                        at,
+                        protect,
+                        ok,
+                        cont,
+                    } = action
                         && let Some(callee) = native_calls_lua($thread, args_base + at as usize)
                     {
                         push_native_frame(
@@ -2590,6 +2594,7 @@ macro_rules! call_native {
                             args_base,
                             at,
                             protect,
+                            ok,
                             cont,
                             call_ret(returns),
                         );
@@ -5152,6 +5157,25 @@ fn drive_natives<'gc>(
             Phase::Resume => {
                 let frame = unsafe { thread.frames.last_mut().unwrap_unchecked() };
                 debug_assert!(frame.is_native());
+                if status.is_ok()
+                    && frame.flags & (frame_flags::PASS | frame_flags::PASS_TRUE) != 0
+                    && thread.top < thread.stack_limit
+                {
+                    // What `cont` would do: the results at the call's slot,
+                    // after a `true` in the slot below with `PASS_TRUE`.
+                    let (base, ret) = (frame.base(), frame.ret);
+                    let mut values = base + frame.num_extras as usize;
+                    if frame.flags & frame_flags::PASS_TRUE != 0 {
+                        values -= 1;
+                        thread.stack[values] = Value::boolean(true);
+                    }
+                    thread.pop_lua();
+                    return NativeStep::Return {
+                        ret,
+                        func_slot: base - 1,
+                        values,
+                    };
+                }
                 // Errors the continuation itself raises unwind past it.
                 frame.flags &= !(frame_flags::PROTECTED | frame_flags::HANDLER);
                 (f, base, ret) = (frame.closure.function(), frame.base(), frame.ret);
@@ -5176,21 +5200,26 @@ fn drive_natives<'gc>(
                         values: base,
                     };
                 }
-                Ok(CallbackAction::CallThen { at, protect, cont }) => {
+                Ok(CallbackAction::CallThen {
+                    at,
+                    protect,
+                    ok,
+                    cont,
+                }) => {
                     if framed {
                         thread.pop_lua();
                     }
-                    push_native_frame(thread, f, base, at, protect, cont, ret);
+                    push_native_frame(thread, f, base, at, protect, ok, cont, ret);
                     (slot, ret) = (base + at as usize, ret_native);
                     phase = Phase::Start;
                 }
-                Ok(CallbackAction::Resume { at, cont }) => {
+                Ok(CallbackAction::Resume { at, ok, cont }) => {
                     // The resumer waits in a frame of its own, protected so
                     // the error that kills the coroutine comes back to `cont`.
                     if framed {
                         thread.pop_lua();
                     }
-                    push_native_frame(thread, f, base, at, Protect::Errors, cont, ret);
+                    push_native_frame(thread, f, base, at, Protect::Errors, ok, cont, ret);
                     let at = base + at as usize;
                     let co = thread.stack[at]
                         .get_thread()
@@ -5461,6 +5490,251 @@ pub(crate) extern "rust-preserve-none" fn ret_coroutine_end<'gc>(
     native_step!(step);
 }
 
+/// Resume `$co` from the CALL running this entry, its arguments from
+/// `R[func + $skip]` on, the caller waiting in a frame for native `$f` that
+/// takes the results by `$ok` and gets errors in `$cont`: move them to where
+/// `$co` last yielded and continue its call site there, LuaJIT Remake's
+/// `CoroSwitch`. Any case the switch doesn't cover (a first resume, a
+/// non-suspended coroutine, no room) goes to the builtin.
+macro_rules! resume_switch {
+    ($co:expr, $skip:literal, $f:expr, $ok:expr, $cont:expr,
+     $ctx:ident, $thread:ident, $registers:ident, $ip:ident, $handlers:ident, $ds:ident,
+     $frame:ident, $closure:ident, $instruction:ident) => {{
+        let co: Thread<'gc> = $co;
+        if co.ptr_eq($thread.handle())
+            || co.peer_status() != ThreadStatus::Suspended
+            || $thread.resume_depth + 1 >= MAX_RESUME_DEPTH
+        {
+            tail!(op_call_native);
+        }
+        let (func, nargs, returns) = $instruction.abc();
+        // SAFETY: `co` is suspended, so nothing else uses its state.
+        let cs = unsafe { co.state_mut($ctx.mutation()) };
+        // A yield the executor took (from a sequence) resumes through it.
+        let Some(y) = cs.yield_bottom.filter(|_| cs.top_is_lua()) else {
+            tail!(op_call_native);
+        };
+        let base = unsafe { (*$frame).base() };
+        let args = base + func as usize + $skip;
+        let n = if nargs == 0 {
+            $thread.top - args
+        } else {
+            nargs as usize - $skip
+        };
+        if y.bottom + n > cs.stack.len() || y.bottom + n > cs.stack_limit {
+            tail!(op_call_native);
+        }
+        unsafe { (*$frame).pc = $ip };
+        push_native_frame(
+            $thread,
+            $f,
+            base + func as usize + 1,
+            0,
+            crate::vm::sequence::Protect::Errors,
+            $ok,
+            $cont,
+            call_ret(returns),
+        );
+        $thread.set_top_unchecked(base + func as usize + 1);
+        $thread.status = ThreadStatus::Normal;
+        cs.yield_bottom = None;
+        cs.status = ThreadStatus::Normal;
+        cs.resumer = Some($thread.handle());
+        cs.resume_depth = $thread.resume_depth + 1;
+        // Copied rather than passed by pointer: continuations take values
+        // in their own thread's stack.
+        let values = unsafe { cs.stack.as_mut_ptr().add(y.bottom) };
+        unsafe { copy_values(values, $thread.stack.as_ptr().add(args), n) };
+        $thread = cs;
+        $ds.current = Some(co);
+        let (frame, closure) = top_frame($thread);
+        let func_slot = unsafe { $thread.stack.as_mut_ptr().add(y.func_idx) };
+        become (y.ret)(
+            Instruction::from_raw(n as u64),
+            $ctx,
+            $thread,
+            values,
+            func_slot as *const Instruction,
+            $handlers,
+            $ds,
+            frame,
+            closure,
+        );
+    }};
+}
+
+/// The entry of a `coroutine.wrap` function; see [`resume_switch`].
+#[inline(never)]
+#[rustc_align(32)]
+pub(crate) extern "rust-preserve-none" fn ff_wrap<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    if instruction.op() == Op::TAILCALL {
+        tail!(op_call_native);
+    }
+    let f = reg!(instruction.a()).get_function();
+    let f = unsafe { f.unwrap_unchecked() };
+    let co = unsafe { (*ds.native).upvalues[0].get_thread().unwrap_unchecked() };
+    resume_switch!(
+        co,
+        1,
+        f,
+        crate::vm::sequence::OnOk::Return,
+        crate::builtin::wrap_cont,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure,
+        instruction
+    );
+}
+
+/// The entry of `coroutine.resume`; see [`resume_switch`].
+#[inline(never)]
+#[rustc_align(32)]
+pub(crate) extern "rust-preserve-none" fn ff_resume<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    if instruction.op() == Op::TAILCALL {
+        tail!(op_call_native);
+    }
+    let (func, nargs) = (instruction.a(), instruction.b());
+    let f = reg!(func).get_function();
+    let f = unsafe { f.unwrap_unchecked() };
+    // Without the thread argument the builtin raises.
+    let co = if nargs != 1 {
+        reg!(func + 1).get_thread()
+    } else {
+        None
+    };
+    let Some(co) = co else {
+        tail!(op_call_native);
+    };
+    resume_switch!(
+        co,
+        2,
+        f,
+        crate::vm::sequence::OnOk::ReturnTrue,
+        crate::builtin::resume_cont,
+        ctx,
+        thread,
+        registers,
+        ip,
+        handlers,
+        ds,
+        frame,
+        closure,
+        instruction
+    );
+}
+
+/// The entry of `coroutine.yield`: with the resumer waiting in dispatch on
+/// a frame that takes the values as they are (`PASS`, `PASS_TRUE`), move
+/// them into that frame's window and continue its call site, as
+/// [`resume_switch`] does the other way. Anything else goes to the builtin.
+#[inline(never)]
+#[rustc_align(32)]
+pub(crate) extern "rust-preserve-none" fn ff_yield<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let Some(r) = thread.resumer else {
+        tail!(op_call_native);
+    };
+    if instruction.op() == Op::TAILCALL || thread.no_yield {
+        tail!(op_call_native);
+    }
+    let (func, nargs, returns) = instruction.abc();
+    // SAFETY: the resumer waits, so nothing else uses its state.
+    let rs = unsafe { r.state_mut(ctx.mutation()) };
+    let nf = match rs.top_lua() {
+        Some(nf) if nf.flags & (frame_flags::PASS | frame_flags::PASS_TRUE) != 0 => *nf,
+        _ => tail!(op_call_native),
+    };
+    let func_idx = unsafe { (*frame).base() } + func as usize;
+    let n = if nargs == 0 {
+        thread.top - (func_idx + 1)
+    } else {
+        nargs as usize - 1
+    };
+    let pass_true = nf.flags & frame_flags::PASS_TRUE != 0;
+    // Where `hand_back` puts them; `resume` checks its stack.
+    let slot = nf.base() + nf.num_extras as usize;
+    if slot + n > rs.stack.len() || slot + n >= rs.stack_limit {
+        tail!(op_call_native);
+    }
+    unsafe { (*frame).pc = ip };
+    thread.yield_bottom = Some(CallSite {
+        bottom: func_idx + 1,
+        func_idx,
+        ret: call_ret(returns),
+    });
+    thread.status = ThreadStatus::Suspended;
+    thread.resumer = None;
+    thread.set_top_unchecked(func_idx + 1);
+    let stack = rs.stack.as_mut_ptr();
+    unsafe { copy_values(stack.add(slot), thread.stack.as_ptr().add(func_idx + 1), n) };
+    // With `PASS_TRUE`, the `true` goes in the slot below, the native's own
+    // or its function slot.
+    let values = unsafe { stack.add(slot - pass_true as usize) };
+    if pass_true {
+        unsafe { values.write(Value::boolean(true)) };
+    }
+    let nret = n + pass_true as usize;
+    rs.set_top_unchecked(slot + n);
+    rs.status = ThreadStatus::Normal;
+    rs.pop_lua();
+    thread = rs;
+    ds.current = Some(r);
+    let frame = thread
+        .frames
+        .as_mut_ptr()
+        .wrapping_add(thread.frames.len())
+        .wrapping_sub(1);
+    let func_slot = unsafe { thread.stack.as_mut_ptr().add(nf.base() - 1) };
+    become (nf.ret)(
+        Instruction::from_raw(nret as u64),
+        ctx,
+        thread,
+        values,
+        func_slot as *const Instruction,
+        handlers,
+        ds,
+        frame,
+        closure,
+    );
+}
+
 /// Continuation of a call a native frame made: its results go to the
 /// frame's window, where it said, and its continuation runs.
 #[inline(never)]
@@ -5480,6 +5754,34 @@ pub(crate) extern "rust-preserve-none" fn ret_native<'gc>(
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let nf = unsafe { &mut *frame };
     debug_assert!(nf.is_native());
+    if nf.flags & (frame_flags::PASS | frame_flags::PASS_TRUE) != 0 {
+        // What the continuation would do, without copying the results into
+        // the native's window first: the slot below them is the finished
+        // callee's, free for the `true`.
+        let (ret, func_slot) = (nf.ret, unsafe {
+            thread.stack.as_mut_ptr().add(nf.base() - 1)
+        });
+        let (values, nret) = if nf.flags & frame_flags::PASS_TRUE != 0 {
+            let v = unsafe { values.sub(1) };
+            unsafe { v.write(Value::boolean(true)) };
+            (v, nret + 1)
+        } else {
+            (values, nret)
+        };
+        let n = thread.frames.len();
+        unsafe { thread.frames.set_len(n - 1) };
+        become ret(
+            Instruction::from_raw(nret as u64),
+            ctx,
+            thread,
+            values,
+            func_slot as *const Instruction,
+            handlers,
+            ds,
+            unsafe { frame.sub(1) },
+            closure,
+        );
+    }
     let (base, slot) = (nf.base(), nf.base() + nf.num_extras as usize);
     // The results sit above the slot, in the finished call's window.
     unsafe { copy_values(thread.stack.as_mut_ptr().add(slot), values, nret) };
@@ -5545,15 +5847,21 @@ fn push_native_frame<'gc>(
     base: usize,
     at: u32,
     protect: crate::vm::sequence::Protect,
+    ok: crate::vm::sequence::OnOk,
     cont: crate::vm::sequence::NativeCont,
     ret: Handler,
 ) {
-    use crate::vm::sequence::Protect;
+    use crate::vm::sequence::{OnOk, Protect};
     let flags = frame_flags::NATIVE
         | match protect {
             Protect::No => 0,
             Protect::Errors => frame_flags::PROTECTED,
             Protect::Handler => frame_flags::PROTECTED | frame_flags::HANDLER,
+        }
+        | match ok {
+            OnOk::Cont => 0,
+            OnOk::Return => frame_flags::PASS,
+            OnOk::ReturnTrue => frame_flags::PASS_TRUE,
         };
     thread.push_lua(LuaFrame {
         closure: unsafe { LuaFn::native_frame(f) },

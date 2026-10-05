@@ -4,8 +4,8 @@ use crate::env::thread::{ExecKind, ThreadStatus};
 use crate::env::{
     Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Thread, Value,
 };
-use crate::vm::close;
-use crate::vm::sequence::{CallbackAction, Execution};
+use crate::vm::sequence::{CallbackAction, Execution, OnOk};
+use crate::vm::{close, interp};
 
 pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[
@@ -21,7 +21,15 @@ pub fn load<'gc>(ctx: Context<'gc>) {
 
     let lib = Table::new(ctx);
     for &(name, handler) in fns {
-        let handler = Function::new_native(ctx.mutation(), handler, &[]);
+        let entry: Option<interp::Handler> = match name {
+            "resume" => Some(interp::ff_resume),
+            "yield" => Some(interp::ff_yield),
+            _ => None,
+        };
+        let handler = match entry {
+            Some(entry) => Function::new_native_with_entry(ctx.mutation(), handler, &[], entry),
+            None => Function::new_native(ctx.mutation(), handler, &[]),
+        };
         let key = Value::string(LuaString::new(ctx, name.as_bytes()));
         lib.raw_set(ctx, key, Value::function(handler));
     }
@@ -74,13 +82,14 @@ fn lua_resume<'gc>(
     }
     Ok(CallbackAction::Resume {
         at: 0,
+        ok: OnOk::ReturnTrue,
         cont: resume_cont,
     })
 }
 
 /// `auxresume`'s ending: `(true, ...)`, or `(false, msg)` for an error or
 /// values with no room for the leading `true`.
-fn resume_cont<'gc>(
+pub(crate) fn resume_cont<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
@@ -229,10 +238,11 @@ fn lua_wrap<'gc>(
         ts.push_exec(ExecKind::Start(f.into()));
         ts.status = ThreadStatus::Suspended;
     }
-    let wrapper = Function::new_native(
+    let wrapper = Function::new_native_with_entry(
         ctx.mutation(),
         wrap_callback as NativeFn,
         &[Value::thread(thread)],
+        interp::ff_wrap,
     );
     stack.ret1(Value::function(wrapper));
     Ok(CallbackAction::Return)
@@ -295,13 +305,14 @@ fn wrap_callback<'gc>(
     stack.insert(0, Value::thread(co));
     Ok(CallbackAction::Resume {
         at: 0,
+        ok: OnOk::Return,
         cont: wrap_cont,
     })
 }
 
 /// `auxwrap`'s ending: the coroutine's values verbatim; an error rethrown
 /// once the dead coroutine has closed its variables (`lua_closethread`).
-fn wrap_cont<'gc>(
+pub(crate) fn wrap_cont<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
@@ -322,6 +333,7 @@ fn wrap_cont<'gc>(
     stack.replace(&[Value::thread(co)]);
     Ok(CallbackAction::Resume {
         at: 0,
+        ok: OnOk::Cont,
         cont: wrap_close_cont,
     })
 }

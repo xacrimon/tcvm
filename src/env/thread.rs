@@ -120,6 +120,11 @@ pub mod frame_flags {
     /// ... after running the message handler in its window's first slot
     /// (`xpcall`).
     pub const HANDLER: u8 = 16;
+    /// The continuation returns a successful call's results as the
+    /// native's (`OnOk::Return`), so the VM may do that instead of running it.
+    pub const PASS: u8 = 32;
+    /// ... after `true` (`OnOk::ReturnTrue`).
+    pub const PASS_TRUE: u8 = 64;
 }
 
 // Two records per cache line.
