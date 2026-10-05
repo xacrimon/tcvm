@@ -498,11 +498,7 @@ macro_rules! helpers {
                         let __stack = $thread.stack.as_mut_ptr();
                         // The frame below, or one before the first when there
                         // is none (the continuation is then `ret_exit`).
-                        let __top = $thread
-                            .frames
-                            .as_mut_ptr()
-                            .wrapping_add($thread.frames.len())
-                            .wrapping_sub(1);
+                        let __top = $thread.frames.top_ptr();
                         become __ret(
                             Instruction::from_raw(__nret as u64),
                             $ctx,
@@ -1105,11 +1101,7 @@ fn enter<'gc>(ctx: Context<'gc>, ts: &mut ThreadState<'gc>, ds: &mut DispatchSta
     let handlers = &DISPATCH as *const Dispatch as *const ();
     if let Some(p) = ts.pending_ret.take() {
         // The call site's frame, if it has one: a coroutine's body has none.
-        let frame = ts
-            .frames
-            .as_mut_ptr()
-            .wrapping_add(ts.frames.len())
-            .wrapping_sub(1);
+        let frame = ts.frames.top_ptr();
         let closure = match ts.frames.last() {
             Some(f) => f.closure,
             // Never dereferenced: no continuation reads the closure.
@@ -2929,7 +2921,7 @@ extern "rust-preserve-none" fn op_call<'gc>(
             FunctionKind::Lua(target) => {
                 let func_idx = unsafe { (*frame).base() } + func as usize;
                 let needed = func_idx + 1 + target.max_stack_size as usize;
-                if std::hint::unlikely(thread.stack.len() < needed || thread.frames_full()) {
+                if std::hint::unlikely(thread.call_limit < needed) {
                     tail!(op_call_grow);
                 }
                 let callee = unsafe { LuaFn::from_function_unchecked(f) };
@@ -2982,8 +2974,8 @@ extern "rust-preserve-none" fn op_call_grow<'gc>(
     if !thread.ensure_frame_slots(unsafe { (*frame).base() } + func as usize + 1 + max_stack) {
         raise!(OpError::StackOverflow);
     }
-    thread.reserve_frames(1);
-    // Both vecs may have moved: rebind the frame pointer and the register window.
+    thread.grow_frames_to_stack();
+    // Both stacks may have moved: rebind the frame pointer and the register window.
     (frame, closure) = top_frame(thread);
     registers = unsafe { thread.stack.as_mut_ptr().add((*frame).base()) };
     tail!(op_call);
@@ -3629,9 +3621,7 @@ macro_rules! return_to_ret {
     (@pop $ret:expr, $func_slot:expr, $nret:expr, $values:expr, $ctx:ident, $thread:ident,
      $handlers:ident, $ds:ident, $frame:ident, $closure:ident) => {{
         let (__ret, __func_slot) = ($ret, $func_slot);
-        // `LuaFrame` is `Copy`, so nothing needs dropping.
-        let __n = $thread.frames.len();
-        unsafe { $thread.frames.set_len(__n - 1) };
+        unsafe { $thread.frames.set_top($frame.sub(1)) };
         become __ret(
             Instruction::from_raw($nret as u64),
             $ctx,
@@ -6100,15 +6090,10 @@ pub(crate) extern "rust-preserve-none" fn ff_yield<'gc>(
     let nret = n + pass_true as usize;
     rs.set_top_unchecked(slot + n);
     rs.status = ThreadStatus::Normal;
-    let n = rs.frames.len();
-    unsafe { rs.frames.set_len(n - 1) };
+    unsafe { rs.frames.set_top(rs.frames.top_ptr().sub(1)) };
     thread = rs;
     ds.current = Some(r);
-    let frame = thread
-        .frames
-        .as_mut_ptr()
-        .wrapping_add(thread.frames.len())
-        .wrapping_sub(1);
+    let frame = thread.frames.top_ptr();
     let func_slot = unsafe { thread.stack.as_mut_ptr().add(nf.base() - 1) };
     become (nf.ret)(
         Instruction::from_raw(nret as u64),
@@ -6232,9 +6217,7 @@ macro_rules! protected_call {
             _ => tail!(op_call_action),
         };
         let callee_idx = func_idx + $k;
-        if $thread.stack.len() < callee_idx + 1 + callee.max_stack_size as usize
-            || $thread.frames_full()
-        {
+        if $thread.call_limit < callee_idx + 1 + callee.max_stack_size as usize {
             tail!(op_call_action);
         }
         $prep
@@ -6363,8 +6346,7 @@ pub(crate) extern "rust-preserve-none" fn ret_native<'gc>(
         } else {
             (values, nret)
         };
-        let n = thread.frames.len();
-        unsafe { thread.frames.set_len(n - 1) };
+        unsafe { thread.frames.set_top(thread.frames.top_ptr().sub(1)) };
         become ret(
             Instruction::from_raw(nret as u64),
             ctx,
@@ -6389,8 +6371,7 @@ pub(crate) extern "rust-preserve-none" fn ret_native<'gc>(
     let r = cont(ctx, nc, Stack::new(thread, base), Ok(()));
     match r {
         Ok(crate::vm::native::CallbackAction::Return) if !thread.native_overflowed() => {
-            let n = thread.frames.len();
-            unsafe { thread.frames.set_len(n - 1) };
+            unsafe { thread.frames.set_top(thread.frames.top_ptr().sub(1)) };
             let stack = thread.stack.as_mut_ptr();
             let nret = thread.top - base;
             become ret(
@@ -6564,11 +6545,7 @@ fn native_entry<'gc>(
     if !std::ptr::eq(before, &*thread) {
         ds.current = Some(thread.handle());
     }
-    let frame = thread
-        .frames
-        .as_mut_ptr()
-        .wrapping_add(thread.frames.len())
-        .wrapping_sub(1);
+    let frame = thread.frames.top_ptr();
     match step {
         NativeStep::EnterLua => {
             let (frame, closure) = top_frame(thread);
