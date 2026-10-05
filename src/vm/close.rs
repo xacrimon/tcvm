@@ -6,7 +6,7 @@ use crate::dmm::{Collect, Trace};
 use crate::env::error::{Error, Exit};
 use crate::env::function::Stack;
 use crate::env::thread::{ExecKind, TbcEntry, ThreadState, ThreadStatus};
-use crate::env::{Function, NativeClosure, Value};
+use crate::env::{Function, MetamethodBits, NativeClosure, Value};
 use crate::lua::Context;
 use crate::vm::debug::op_error_message;
 use crate::vm::interp::{OpError, call_chain_error};
@@ -46,7 +46,7 @@ impl<'gc> Sequence<'gc> for CloseSequence {
             return Ok(SequencePoll::Return);
         };
         let v = entry.value(&ts.stack);
-        let tm = ctx.metamethod_of(v, ctx.symbols().close);
+        let tm = ctx.mm_of(v, MetamethodBits::CLOSE);
         // Raised here rather than by the call, which would blame this
         // sequence instead of the closing frame.
         if let Some(e) = call_chain_error(ctx, tm) {
@@ -93,7 +93,7 @@ impl<'gc> ErrorCloseSequence<'gc> {
         let v = entry.value(&ts.stack);
         stack.extend([v, self.err.value()]);
         Ok(SequencePoll::Call {
-            function: ctx.metamethod_of(v, ctx.symbols().close),
+            function: ctx.mm_of(v, MetamethodBits::CLOSE),
             bottom: 0,
         })
     }
@@ -170,7 +170,7 @@ impl<'gc> ThreadCloseSequence<'gc> {
             stack.push(err.value());
         }
         Ok(SequencePoll::Call {
-            function: ctx.metamethod_of(v, ctx.symbols().close),
+            function: ctx.mm_of(v, MetamethodBits::CLOSE),
             bottom: 0,
         })
     }

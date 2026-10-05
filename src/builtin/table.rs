@@ -333,7 +333,7 @@ fn lua_move<'gc>(
         let same_kind = (a1.get_table().is_some() && a2.get_table().is_some())
             || (a1.get_userdata().is_some() && a2.get_userdata().is_some());
         if same_kind {
-            eq_mm = binop_metamethod(ctx, a1, a2, ctx.symbols().mm_eq);
+            eq_mm = binop_metamethod(ctx, a1, a2, MetamethodBits::EQ);
         }
         eq_mm.is_nil().then_some(true)
     };
@@ -770,7 +770,7 @@ fn less_step(
         if let Some(r) = prim {
             return Ok(Some(Less::Ready(r)));
         }
-        let m = binop_metamethod(ctx, x, y, ctx.symbols().mm_lt);
+        let m = binop_metamethod(ctx, x, y, MetamethodBits::LT);
         if m.is_nil() {
             return Err(util::runtime_error(ctx, &util::compare_error_msg(x, y)));
         }

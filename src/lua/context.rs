@@ -9,7 +9,7 @@ use cstree::build::NodeCache;
 use crate::compiler::compile_chunk;
 use crate::dmm::{DynamicRootSet, Gc, Mutation, RefLock};
 use crate::env::function::{Function, UpvalueState};
-use crate::env::shape::{Shape, inline_bucket};
+use crate::env::shape::{MetamethodBits, Shape, inline_bucket};
 use crate::env::string::Interner;
 use crate::env::{LuaString, Symbols, Table, Value};
 use crate::lua::stash::{Fetchable, Stashable};
@@ -96,6 +96,32 @@ impl<'gc> Context<'gc> {
     pub fn metamethod_of(self, v: Value<'gc>, name: LuaString<'gc>) -> Value<'gc> {
         self.metatable_of(v)
             .map_or(Value::nil(), |mt| mt.raw_get(Value::string(name)))
+    }
+
+    /// Metamethod `bit` of `v`, nil when absent, read from the metatable's
+    /// cache rather than looked up by name.
+    #[inline]
+    pub fn mm_of(self, v: Value<'gc>, bit: MetamethodBits) -> Value<'gc> {
+        let cache = if let Some(t) = v.get_table() {
+            t.shape().mt_cache()
+        } else {
+            let Some(mt) = self.metatable_of(v) else {
+                return Value::nil();
+            };
+            Some(mt.ensure_mt_cache(self))
+        };
+        let mm = cache.map_or(Value::nil(), |c| c.mm(bit));
+        #[cfg(debug_assertions)]
+        if let Some(mt) = self.metatable_of(v) {
+            let name = self.symbols().metamethods()[bit.bits().trailing_zeros() as usize].0;
+            let raw = mt.raw_get(Value::string(name));
+            debug_assert!(
+                mm.same_bits(&raw),
+                "stale metamethod cache for {}",
+                String::from_utf8_lossy(name.as_bytes())
+            );
+        }
+        mm
     }
 
     /// Set `v`'s metatable, which for types other than table and userdata

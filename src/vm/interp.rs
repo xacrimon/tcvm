@@ -712,6 +712,15 @@ fn get_fill_ic<'gc>(
             Ok(v)
         };
     }
+    // The entry already says `t` lacks the key, and an `__index` function
+    // leaves nothing to cache: refilling would cost a barrier on every miss.
+    if let InlineCache::Absent { shape: cached } = read_ic(closure, ic_idx)
+        && Shape::ptr_eq(cached, shape)
+        && let Some(mt) = shape.mt_cache()
+        && mt.mm(MetamethodBits::INDEX).get_function().is_some()
+    {
+        return Err(Value::table(t));
+    }
     let slot = shape.find_slot(constant_key(k));
     fill_ic(ctx, closure, ic_idx, shape_entry(shape, slot));
     let v = slot.map_or(Value::nil(), |s| state.named_get(s));
@@ -719,14 +728,14 @@ fn get_fill_ic<'gc>(
         return Ok(v);
     }
     // INDEX bit implies a metatable.
-    let mt = unsafe { state.metatable().unwrap_unchecked() };
+    let index = unsafe { shape.mt_cache().unwrap_unchecked() }.mm(MetamethodBits::INDEX);
     drop(state);
     let recv = slot.is_none().then_some(shape);
-    get_index_fill_ic(ctx, closure, ic_idx, t, mt, recv, k)
+    get_index_fill_ic(ctx, closure, ic_idx, t, index, recv, k)
 }
 
 /// The `__index` half of [`get_fill_ic`], out of line to keep the own-key
-/// miss lean: `t`'s raw lookup missed and its metatable `mt` has `__index`.
+/// miss lean: `t`'s raw lookup missed and its metatable's `__index` is `index`.
 /// `recv` is `t`'s shape when that shape lacks the key, which a hit in an
 /// `__index` table can then be cached against.
 #[inline(never)]
@@ -735,11 +744,10 @@ fn get_index_fill_ic<'gc>(
     closure: LuaFn<'gc>,
     ic_idx: u16,
     t: Table<'gc>,
-    mt: Table<'gc>,
+    index: Value<'gc>,
     recv: Option<Shape<'gc>>,
     k: Value<'gc>,
 ) -> Result<Value<'gc>, Value<'gc>> {
-    let index = mt.raw_get(Value::string(ctx.symbols().mm_index));
     let Some(holder) = index.get_table() else {
         // A function is called with `t`; anything else is indexed in turn.
         return Err(if index.get_function().is_some() {
@@ -799,6 +807,13 @@ fn set_own_fill_ic<'gc>(
         drop(state);
         t.raw_set(ctx, k, v);
         return true;
+    }
+    // As in `get_fill_ic`: the entry already says only `__newindex` is left.
+    if newindex
+        && let InlineCache::Absent { shape: cached } = read_ic(closure, ic_idx)
+        && Shape::ptr_eq(cached, shape)
+    {
+        return false;
     }
     let key = constant_key(k);
     // A hit stores without telling a metatable's cache, so the keys it
@@ -1712,7 +1727,7 @@ macro_rules! binop_slow_body {
             num::SlowNum::NotNumbers => {}
         }
 
-        let meta_fn = binop_metamethod($ctx, lhs, rhs, $ctx.symbols().$mm);
+        let meta_fn = binop_metamethod($ctx, lhs, rhs, MetamethodBits::$mm);
         if meta_fn.is_nil() {
             raise!(OpError::$err(lhs, rhs));
         }
@@ -1721,18 +1736,18 @@ macro_rules! binop_slow_body {
     }};
 }
 
-arith_handler!(op_add, op_add_slow, ADD, num::Add, mm_add);
-arith_handler!(op_sub, op_sub_slow, SUB, num::Sub, mm_sub);
-arith_handler!(op_mul, op_mul_slow, MUL, num::Mul, mm_mul);
-arith_handler!(op_mod, op_mod_slow, MOD, num::Mod, mm_mod);
-arith_handler!(op_pow, op_pow_slow, POW, num::Pow, mm_pow);
-arith_handler!(op_div, op_div_slow, DIV, num::Div, mm_div);
-arith_handler!(op_idiv, op_idiv_slow, IDIV, num::IDiv, mm_idiv);
-bit_handler!(op_band, op_band_slow, BAND, num::BAnd, mm_band);
-bit_handler!(op_bor, op_bor_slow, BOR, num::BOr, mm_bor);
-bit_handler!(op_bxor, op_bxor_slow, BXOR, num::BXor, mm_bxor);
-bit_handler!(op_shl, op_shl_slow, SHL, num::Shl, mm_shl);
-bit_handler!(op_shr, op_shr_slow, SHR, num::Shr, mm_shr);
+arith_handler!(op_add, op_add_slow, ADD, num::Add, ADD);
+arith_handler!(op_sub, op_sub_slow, SUB, num::Sub, SUB);
+arith_handler!(op_mul, op_mul_slow, MUL, num::Mul, MUL);
+arith_handler!(op_mod, op_mod_slow, MOD, num::Mod, MOD);
+arith_handler!(op_pow, op_pow_slow, POW, num::Pow, POW);
+arith_handler!(op_div, op_div_slow, DIV, num::Div, DIV);
+arith_handler!(op_idiv, op_idiv_slow, IDIV, num::IDiv, IDIV);
+bit_handler!(op_band, op_band_slow, BAND, num::BAnd, BAND);
+bit_handler!(op_bor, op_bor_slow, BOR, num::BOr, BOR);
+bit_handler!(op_bxor, op_bxor_slow, BXOR, num::BXor, BXOR);
+bit_handler!(op_shl, op_shl_slow, SHL, num::Shl, SHL);
+bit_handler!(op_shr, op_shr_slow, SHR, num::Shr, SHR);
 
 // ---------------------------------------------------------------------------
 // Arithmetic and bitwise (register-immediate)
@@ -1862,25 +1877,25 @@ macro_rules! binop_imm_slow_handler {
     };
 }
 
-arith_imm_handler!(op_addi, op_addi_slow, ADDI, num::Add, mm_add, false);
-arith_imm_handler!(op_subi, op_subi_slow, SUBI, num::Sub, mm_sub, false);
-arith_imm_handler!(op_muli, op_muli_slow, MULI, num::Mul, mm_mul, false);
-arith_imm_handler!(op_modi, op_modi_slow, MODI, num::Mod, mm_mod, false);
-arith_imm_handler!(op_powi, op_powi_slow, POWI, num::Pow, mm_pow, false);
-arith_imm_handler!(op_divi, op_divi_slow, DIVI, num::Div, mm_div, false);
-arith_imm_handler!(op_idivi, op_idivi_slow, IDIVI, num::IDiv, mm_idiv, false);
-arith_imm_handler!(op_rsubi, op_rsubi_slow, RSUBI, num::Sub, mm_sub, true);
-arith_imm_handler!(op_rmodi, op_rmodi_slow, RMODI, num::Mod, mm_mod, true);
-arith_imm_handler!(op_rpowi, op_rpowi_slow, RPOWI, num::Pow, mm_pow, true);
-arith_imm_handler!(op_rdivi, op_rdivi_slow, RDIVI, num::Div, mm_div, true);
-arith_imm_handler!(op_ridivi, op_ridivi_slow, RIDIVI, num::IDiv, mm_idiv, true);
-bit_imm_handler!(op_bandi, op_bandi_slow, BANDI, num::BAnd, mm_band, false);
-bit_imm_handler!(op_bori, op_bori_slow, BORI, num::BOr, mm_bor, false);
-bit_imm_handler!(op_bxori, op_bxori_slow, BXORI, num::BXor, mm_bxor, false);
-bit_imm_handler!(op_shli, op_shli_slow, SHLI, num::Shl, mm_shl, false);
-bit_imm_handler!(op_shri, op_shri_slow, SHRI, num::Shr, mm_shr, false);
-bit_imm_handler!(op_rshli, op_rshli_slow, RSHLI, num::Shl, mm_shl, true);
-bit_imm_handler!(op_rshri, op_rshri_slow, RSHRI, num::Shr, mm_shr, true);
+arith_imm_handler!(op_addi, op_addi_slow, ADDI, num::Add, ADD, false);
+arith_imm_handler!(op_subi, op_subi_slow, SUBI, num::Sub, SUB, false);
+arith_imm_handler!(op_muli, op_muli_slow, MULI, num::Mul, MUL, false);
+arith_imm_handler!(op_modi, op_modi_slow, MODI, num::Mod, MOD, false);
+arith_imm_handler!(op_powi, op_powi_slow, POWI, num::Pow, POW, false);
+arith_imm_handler!(op_divi, op_divi_slow, DIVI, num::Div, DIV, false);
+arith_imm_handler!(op_idivi, op_idivi_slow, IDIVI, num::IDiv, IDIV, false);
+arith_imm_handler!(op_rsubi, op_rsubi_slow, RSUBI, num::Sub, SUB, true);
+arith_imm_handler!(op_rmodi, op_rmodi_slow, RMODI, num::Mod, MOD, true);
+arith_imm_handler!(op_rpowi, op_rpowi_slow, RPOWI, num::Pow, POW, true);
+arith_imm_handler!(op_rdivi, op_rdivi_slow, RDIVI, num::Div, DIV, true);
+arith_imm_handler!(op_ridivi, op_ridivi_slow, RIDIVI, num::IDiv, IDIV, true);
+bit_imm_handler!(op_bandi, op_bandi_slow, BANDI, num::BAnd, BAND, false);
+bit_imm_handler!(op_bori, op_bori_slow, BORI, num::BOr, BOR, false);
+bit_imm_handler!(op_bxori, op_bxori_slow, BXORI, num::BXor, BXOR, false);
+bit_imm_handler!(op_shli, op_shli_slow, SHLI, num::Shl, SHL, false);
+bit_imm_handler!(op_shri, op_shri_slow, SHRI, num::Shr, SHR, false);
+bit_imm_handler!(op_rshli, op_rshli_slow, RSHLI, num::Shl, SHL, true);
+bit_imm_handler!(op_rshri, op_rshri_slow, RSHRI, num::Shr, SHR, true);
 
 // ---------------------------------------------------------------------------
 // Unary operations
@@ -1902,22 +1917,42 @@ extern "rust-preserve-none" fn op_unm<'gc>(
 ) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (dst, src) = instruction.ab();
-    let val = reg!(src);
+    let val = reg!(ref src);
+    if val.is_float() {
+        let f = val.read_float();
+        reg!(ref mut dst).write_float(-f);
+        dispatch!();
+    }
     if let Some(i) = val.get_small()
         && let Some(n) = i.checked_neg()
     {
         *reg!(ref mut dst) = Value::small(n);
         dispatch!();
     }
+    tail!(op_unm_slow);
+}
+
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn op_unm_slow<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let (dst, src) = instruction.ab();
+    let val = reg!(src);
     if let Some(i) = val.get_integer() {
         *reg!(ref mut dst) = Value::integer(ctx.mutation(), i.wrapping_neg());
         dispatch!();
     }
-    if let Some(f) = val.get_float() {
-        *reg!(ref mut dst) = Value::float(-f);
-        dispatch!();
-    }
-    let meta_fn = ctx.metamethod_of(val, ctx.symbols().mm_unm);
+    let meta_fn = ctx.mm_of(val, MetamethodBits::UNM);
     if meta_fn.is_nil() {
         raise!(OpError::Arith(val, val));
     }
@@ -1941,16 +1976,34 @@ extern "rust-preserve-none" fn op_bnot<'gc>(
 ) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (dst, src) = instruction.ab();
-    let val = reg!(src);
-    if let Some(i) = val.get_small() {
+    if let Some(i) = reg!(ref src).get_small() {
         *reg!(ref mut dst) = Value::small(!i);
         dispatch!();
     }
+    tail!(op_bnot_slow);
+}
+
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn op_bnot_slow<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let (dst, src) = instruction.ab();
+    let val = reg!(src);
     if let Some(i) = val.get_integer() {
         *reg!(ref mut dst) = Value::integer(ctx.mutation(), !i);
         dispatch!();
     }
-    let meta_fn = ctx.metamethod_of(val, ctx.symbols().mm_bnot);
+    let meta_fn = ctx.mm_of(val, MetamethodBits::BNOT);
     if meta_fn.is_nil() {
         raise!(OpError::Bitwise(val, val));
     }
@@ -1995,6 +2048,31 @@ extern "rust-preserve-none" fn op_len<'gc>(
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (dst, src) = instruction.ab();
     let val = reg!(src);
+    if let Some(t) = val.get_table()
+        && !t.shape().has_mm(MetamethodBits::LEN)
+    {
+        *reg!(ref mut dst) = Value::integer(ctx.mutation(), t.raw_len() as i64);
+        dispatch!();
+    }
+    tail!(op_len_slow);
+}
+
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn op_len_slow<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let (dst, src) = instruction.ab();
+    let val = reg!(src);
 
     // Strings never consult __len; return byte length directly.
     if let Some(s) = val.get_string() {
@@ -2003,7 +2081,7 @@ extern "rust-preserve-none" fn op_len<'gc>(
     }
 
     // Without `__len`, only a table has a length to fall back on.
-    let meta_fn = ctx.metamethod_of(val, ctx.symbols().mm_len);
+    let meta_fn = ctx.mm_of(val, MetamethodBits::LEN);
     if meta_fn.is_nil() {
         let Some(t) = val.get_table() else {
             raise!(OpError::Len(val));
@@ -2011,7 +2089,6 @@ extern "rust-preserve-none" fn op_len<'gc>(
         *reg!(ref mut dst) = Value::integer(ctx.mutation(), t.raw_len() as i64);
         dispatch!();
     }
-
     // Like the other unary metamethods, `__len` gets its operand twice.
     call_mm!(ret_store_a, meta_fn, [val, val]);
 }
@@ -2041,7 +2118,7 @@ extern "rust-preserve-none" fn op_concat<'gc>(
         gc_check!();
         dispatch!();
     }
-    let meta_fn = binop_metamethod(ctx, a, b, ctx.symbols().mm_concat);
+    let meta_fn = binop_metamethod(ctx, a, b, MetamethodBits::CONCAT);
     if meta_fn.is_nil() {
         raise!(OpError::Concat(a, b));
     }
@@ -2101,7 +2178,7 @@ extern "rust-preserve-none" fn op_tbc<'gc>(
     if v.is_falsy() {
         dispatch!();
     }
-    if ctx.metamethod_of(v, ctx.symbols().close).is_nil() {
+    if ctx.mm_of(v, MetamethodBits::CLOSE).is_nil() {
         raise!(OpError::NonClosable(val));
     }
     let base = unsafe { (*frame).base() };
@@ -2150,132 +2227,130 @@ extern "rust-preserve-none" fn op_eq<'gc>(
 ) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     let (lhs, rhs, inverted) = instruction.abc_flag();
+    let (a, b) = (reg!(ref lhs), reg!(ref rhs));
+    // Floats first: a NaN has the same bits as itself.
+    let eq = if a.is_float() && b.is_float() {
+        a.read_float() == b.read_float()
+    } else if a.same_bits(b) {
+        true
+    } else {
+        tail!(op_eq_slow);
+    };
+    skip_if!(eq != inverted);
+    dispatch!();
+}
 
-    let a = reg!(lhs);
-    let b = reg!(rhs);
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn op_eq_slow<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let (lhs, rhs, inverted) = instruction.abc_flag();
+    let (a, b) = (reg!(lhs), reg!(rhs));
     if num::raw_eq(a, b) {
-        // Primitive or pointer-equal — no metamethod consultation.
         skip_if!(!inverted);
         dispatch!();
     }
-
     // Lua 5.5: __eq fires only when both operands are the same non-primitive
     // type (tables or userdata) and raw equality fails.
     let try_meta = (a.kind() == ValueKind::Table && b.kind() == ValueKind::Table)
         || (a.kind() == ValueKind::Userdata && b.kind() == ValueKind::Userdata);
     if try_meta {
-        let meta_fn = binop_metamethod(ctx, a, b, ctx.symbols().mm_eq);
+        let meta_fn = binop_metamethod(ctx, a, b, MetamethodBits::EQ);
         if !meta_fn.is_nil() {
             call_mm!(ret_cond_c, meta_fn, [a, b]);
         }
     }
-
-    // Not equal and no applicable metamethod.
     skip_if!(inverted);
     dispatch!();
 }
 
-/// if (R[lhs] < R[rhs]) != inverted then skip next instruction
+/// `if (R[lhs] <op> R[rhs]) != inverted then skip next instruction` for LT and
+/// LE: two floats or two inline integers here, everything else in `$slow`.
+macro_rules! cmp_handler {
+    ($name:ident, $slow:ident, $op:tt, $mm:ident, $int_float:path, $float_int:path) => {
 #[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn op_lt<'gc>(
-    instruction: Instruction,
-    ctx: Context<'gc>,
-    thread: &mut ThreadState<'gc>,
-    registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
-    handlers: *const (),
-    ds: &mut DispatchState<'gc>,
-    frame: *mut LuaFrame<'gc>,
-    closure: LuaFn<'gc>,
-) -> Exit {
-    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-    let (lhs, rhs, inverted) = instruction.abc_flag();
+        #[rustc_align(32)]
+        extern "rust-preserve-none" fn $name<'gc>(
+            instruction: Instruction,
+            ctx: Context<'gc>,
+            thread: &mut ThreadState<'gc>,
+            registers: Registers<'gc, '_>,
+            mut ip: *const Instruction,
+            handlers: *const (),
+            ds: &mut DispatchState<'gc>,
+            frame: *mut LuaFrame<'gc>,
+            closure: LuaFn<'gc>,
+        ) -> Exit {
+            helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+            let (lhs, rhs, inverted) = instruction.abc_flag();
+            let (a, b) = (reg!(ref lhs), reg!(ref rhs));
+            let r = if std::hint::likely(a.is_float() && b.is_float()) {
+                a.read_float() $op b.read_float()
+            } else if let Some((x, y)) = Value::both_small(a, b) {
+                x $op y
+            } else {
+                tail!($slow);
+            };
+            skip_if!(r != inverted);
+            dispatch!();
+        }
 
-    let primitive = {
-        let (a, b) = (reg!(ref lhs), reg!(ref rhs));
-        if std::hint::likely(a.is_float() && b.is_float()) {
-            Some(a.read_float() < b.read_float())
-        } else if let Some((x, y)) = Value::both_small(a, b) {
-            Some(x < y)
-        } else if let Some(x) = a.get_integer()
-            && let Some(y) = b.get_integer()
-        {
-            Some(x < y)
-        } else if let (Some(x), Some(y)) = (a.get_integer(), b.get_float()) {
-            Some(num::lt_int_float(x, y))
-        } else if let (Some(x), Some(y)) = (a.get_float(), b.get_integer()) {
-            Some(num::lt_float_int(x, y))
-        } else if let (Some(x), Some(y)) = (a.get_string(), b.get_string()) {
-            Some(x < y)
-        } else {
-            None
+        #[inline(never)]
+        #[rustc_align(32)]
+        extern "rust-preserve-none" fn $slow<'gc>(
+            instruction: Instruction,
+            ctx: Context<'gc>,
+            thread: &mut ThreadState<'gc>,
+            registers: Registers<'gc, '_>,
+            mut ip: *const Instruction,
+            handlers: *const (),
+            ds: &mut DispatchState<'gc>,
+            frame: *mut LuaFrame<'gc>,
+            closure: LuaFn<'gc>,
+        ) -> Exit {
+            helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+            let (lhs, rhs, inverted) = instruction.abc_flag();
+            let (a, b) = (reg!(lhs), reg!(rhs));
+            let primitive = if let Some(x) = a.get_integer()
+                && let Some(y) = b.get_integer()
+            {
+                Some(x $op y)
+            } else if let (Some(x), Some(y)) = (a.get_integer(), b.get_float()) {
+                Some($int_float(x, y))
+            } else if let (Some(x), Some(y)) = (a.get_float(), b.get_integer()) {
+                Some($float_int(x, y))
+            } else if let (Some(x), Some(y)) = (a.get_float(), b.get_float()) {
+                Some(x $op y)
+            } else if let (Some(x), Some(y)) = (a.get_string(), b.get_string()) {
+                Some(x $op y)
+            } else {
+                None
+            };
+            if let Some(r) = primitive {
+                skip_if!(r != inverted);
+                dispatch!();
+            }
+            let meta_fn = binop_metamethod(ctx, a, b, MetamethodBits::$mm);
+            if meta_fn.is_nil() {
+                raise!(OpError::Compare(a, b));
+            }
+            call_mm!(ret_cond_c, meta_fn, [a, b]);
         }
     };
-
-    if let Some(r) = primitive {
-        skip_if!(r != inverted);
-        dispatch!();
-    }
-
-    let (a, b) = (reg!(lhs), reg!(rhs));
-    let meta_fn = binop_metamethod(ctx, a, b, ctx.symbols().mm_lt);
-    if meta_fn.is_nil() {
-        raise!(OpError::Compare(a, b));
-    }
-    call_mm!(ret_cond_c, meta_fn, [a, b]);
 }
 
-/// if (R[lhs] <= R[rhs]) != inverted then skip next instruction
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn op_le<'gc>(
-    instruction: Instruction,
-    ctx: Context<'gc>,
-    thread: &mut ThreadState<'gc>,
-    registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
-    handlers: *const (),
-    ds: &mut DispatchState<'gc>,
-    frame: *mut LuaFrame<'gc>,
-    closure: LuaFn<'gc>,
-) -> Exit {
-    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-    let (lhs, rhs, inverted) = instruction.abc_flag();
-
-    let primitive = {
-        let (a, b) = (reg!(ref lhs), reg!(ref rhs));
-        if std::hint::likely(a.is_float() && b.is_float()) {
-            Some(a.read_float() <= b.read_float())
-        } else if let Some((x, y)) = Value::both_small(a, b) {
-            Some(x <= y)
-        } else if let Some(x) = a.get_integer()
-            && let Some(y) = b.get_integer()
-        {
-            Some(x <= y)
-        } else if let (Some(x), Some(y)) = (a.get_integer(), b.get_float()) {
-            Some(num::le_int_float(x, y))
-        } else if let (Some(x), Some(y)) = (a.get_float(), b.get_integer()) {
-            Some(num::le_float_int(x, y))
-        } else if let (Some(x), Some(y)) = (a.get_string(), b.get_string()) {
-            Some(x <= y)
-        } else {
-            None
-        }
-    };
-
-    if let Some(r) = primitive {
-        skip_if!(r != inverted);
-        dispatch!();
-    }
-
-    let (a, b) = (reg!(lhs), reg!(rhs));
-    let meta_fn = binop_metamethod(ctx, a, b, ctx.symbols().mm_le);
-    if meta_fn.is_nil() {
-        raise!(OpError::Compare(a, b));
-    }
-    call_mm!(ret_cond_c, meta_fn, [a, b]);
-}
+cmp_handler!(op_lt, op_lt_slow, <, LT, num::lt_int_float, num::lt_float_int);
+cmp_handler!(op_le, op_le_slow, <=, LE, num::le_int_float, num::le_float_int);
 
 /// `if (R[src] <cmp> imm) != inverted then skip`; `$swap` puts the immediate
 /// on the left.
@@ -2349,7 +2424,7 @@ macro_rules! cmp_imm_handler {
             let (src, _) = instruction.ab_imm_flag();
             let (v, k) = (reg!(src), instruction.imm_value(ctx.mutation()));
             let (a, b) = if $swap { (k, v) } else { (v, k) };
-            let meta_fn = binop_metamethod(ctx, a, b, ctx.symbols().$mm);
+            let meta_fn = binop_metamethod(ctx, a, b, MetamethodBits::$mm);
             if meta_fn.is_nil() {
                 raise!(OpError::Compare(a, b));
             }
@@ -2361,7 +2436,7 @@ macro_rules! cmp_imm_handler {
 cmp_imm_handler!(
     op_lti,
     op_lti_slow,
-    mm_lt,
+    LT,
     false,
     |a, b| a < b,
     |a: f64, b: f64| a < b,
@@ -2371,7 +2446,7 @@ cmp_imm_handler!(
 cmp_imm_handler!(
     op_lei,
     op_lei_slow,
-    mm_le,
+    LE,
     false,
     |a, b| a <= b,
     |a: f64, b: f64| a <= b,
@@ -2381,7 +2456,7 @@ cmp_imm_handler!(
 cmp_imm_handler!(
     op_gti,
     op_gti_slow,
-    mm_lt,
+    LT,
     true,
     |a, b| a < b,
     |a: f64, b: f64| a < b,
@@ -2391,7 +2466,7 @@ cmp_imm_handler!(
 cmp_imm_handler!(
     op_gei,
     op_gei_slow,
-    mm_le,
+    LE,
     true,
     |a, b| a <= b,
     |a: f64, b: f64| a <= b,
@@ -3736,7 +3811,7 @@ extern "rust-preserve-none" fn op_tforprep<'gc>(
         Value::nil()
     };
     if !closing.is_falsy() {
-        if ctx.metamethod_of(closing, ctx.symbols().close).is_nil() {
+        if ctx.mm_of(closing, MetamethodBits::CLOSE).is_nil() {
             raise!(OpError::NonClosable(base + 2));
         }
         let frame_base = unsafe { (*frame).base() };
@@ -4495,19 +4570,20 @@ pub(crate) fn walk_index_chain<'gc>(
     mut receiver: Value<'gc>,
     key: Value<'gc>,
 ) -> IndexChain<'gc> {
-    let index = ctx.symbols().mm_index;
     for _ in 0..MAX_TAG_LOOP {
         let mm = match receiver.get_table() {
             Some(t) => {
-                if !t.shape().has_mm(MetamethodBits::INDEX) {
+                let mm = t
+                    .shape()
+                    .mt_cache()
+                    .map_or(Value::nil(), |c| c.mm(MetamethodBits::INDEX));
+                if mm.is_nil() {
                     return IndexChain::Resolved(Value::nil());
                 }
-                // INDEX bit implies metatable is Some.
-                let mt = unsafe { t.metatable().unwrap_unchecked() };
-                mt.raw_get(Value::string(index))
+                mm
             }
             None => {
-                let mm = ctx.metamethod_of(receiver, index);
+                let mm = ctx.mm_of(receiver, MetamethodBits::INDEX);
                 if mm.is_nil() {
                     return IndexChain::NotIndexable(receiver);
                 }
@@ -4551,23 +4627,20 @@ pub(crate) fn walk_newindex_chain<'gc>(
     mut t: Value<'gc>,
     key: Value<'gc>,
 ) -> NewIndexChain<'gc> {
-    let newindex = ctx.symbols().mm_newindex;
     for _ in 0..MAX_TAG_LOOP {
         let mm = match t.get_table() {
             Some(tbl) => {
-                if !tbl.raw_get(key).is_nil() || !tbl.shape().has_mm(MetamethodBits::NEWINDEX) {
-                    return NewIndexChain::RawSet(tbl);
-                }
-                // NEWINDEX bit implies metatable is Some.
-                let mt = unsafe { tbl.metatable().unwrap_unchecked() };
-                let mm = mt.raw_get(Value::string(newindex));
-                if mm.is_nil() {
+                let mm = tbl
+                    .shape()
+                    .mt_cache()
+                    .map_or(Value::nil(), |c| c.mm(MetamethodBits::NEWINDEX));
+                if mm.is_nil() || !tbl.raw_get(key).is_nil() {
                     return NewIndexChain::RawSet(tbl);
                 }
                 mm
             }
             None => {
-                let mm = ctx.metamethod_of(t, newindex);
+                let mm = ctx.mm_of(t, MetamethodBits::NEWINDEX);
                 if mm.is_nil() {
                     return NewIndexChain::NotIndexable(t);
                 }
@@ -4640,7 +4713,7 @@ fn resolve_call_chain_slow<'gc>(
                 FunctionKind::Native(nc) => (CallTarget::Native(nc), nargs),
             });
         }
-        let mm = ctx.metamethod_of(func_val, ctx.symbols().mm_call);
+        let mm = ctx.mm_of(func_val, MetamethodBits::CALL);
         if mm.is_nil() {
             return Err(OpError::Call(func_val));
         }
@@ -4678,7 +4751,7 @@ pub(crate) fn call_chain_error<'gc>(ctx: Context<'gc>, mut v: Value<'gc>) -> Opt
         if v.get_function().is_some() {
             return None;
         }
-        let mm = ctx.metamethod_of(v, ctx.symbols().mm_call);
+        let mm = ctx.mm_of(v, MetamethodBits::CALL);
         if mm.is_nil() {
             return Some(OpError::Call(v));
         }
@@ -4693,13 +4766,13 @@ pub(crate) fn binop_metamethod<'gc>(
     ctx: Context<'gc>,
     lhs: Value<'gc>,
     rhs: Value<'gc>,
-    name: LuaString<'gc>,
+    bit: MetamethodBits,
 ) -> Value<'gc> {
-    let m = ctx.metamethod_of(lhs, name);
+    let m = ctx.mm_of(lhs, bit);
     if !m.is_nil() {
         return m;
     }
-    ctx.metamethod_of(rhs, name)
+    ctx.mm_of(rhs, bit)
 }
 
 // ---------------------------------------------------------------------------

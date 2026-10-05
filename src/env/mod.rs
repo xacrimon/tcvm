@@ -48,6 +48,8 @@ macro_rules! for_each_metamethod {
             (CALL,     21, b"__call",     mm_call);
             (TOSTRING, 22, b"__tostring", mm_tostring);
             (PAIRS,    23, b"__pairs",    mm_pairs);
+            (CLOSE,    24, b"__close",    close);
+            (NAME,     25, b"__name",     name);
         }
     };
 }

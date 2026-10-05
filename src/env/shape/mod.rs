@@ -27,6 +27,7 @@ use crate::dmm::barrier::unlock;
 use crate::dmm::{Collect, Gc, GcWeak, Lock, Mutation, RefLock, Trace};
 use crate::env::for_each_metamethod;
 use crate::env::string::LuaString;
+use crate::env::symbols::METAMETHOD_COUNT;
 use crate::env::table::Table;
 use crate::env::value::Value;
 
@@ -442,12 +443,23 @@ pub struct MtCacheData<'gc> {
     /// identifies: every `__index` write updates it, weak clears included.
     #[collect(require_static)]
     index_table: Cell<usize>,
+    /// The metamethods by bit index, kept like `bits`.
+    values: MmValues<'gc>,
     /// Lazily-allocated dict-mode sentinel for tables that drop into
     /// dict mode while carrying this metatable. Populated on the first
     /// call to `MtCache::ensure_dict_sentinel`; subsequent calls return
     /// the same `Shape` pointer so dict-mode tables sharing a metatable
     /// also share a shape.
     pub dict_sentinel: Lock<Option<Shape<'gc>>>,
+}
+
+/// [`MtCacheData::values`]. Untraced: the metatable holds every one, and
+/// is alive whenever a shape carrying the cache is read (see
+/// `MtCacheData::table`).
+pub struct MmValues<'gc>([Cell<Value<'gc>>; METAMETHOD_COUNT]);
+
+unsafe impl<'gc> Collect<'gc> for MmValues<'gc> {
+    const NEEDS_TRACE: bool = false;
 }
 
 impl<'gc> MtCacheData<'gc> {
@@ -485,14 +497,20 @@ impl<'gc> MtCacheData<'gc> {
 }
 
 impl<'gc> MtCache<'gc> {
-    /// The cache of `table`, whose `__index` is `index`.
+    /// The cache of `table`, whose metamethods by bit index are `values`.
     pub fn new(
         mc: &Mutation<'gc>,
         table: Table<'gc>,
-        bits: MetamethodBits,
+        values: [Value<'gc>; METAMETHOD_COUNT],
         weak: WeakMode,
-        index: Value<'gc>,
     ) -> Self {
+        let mut bits = MetamethodBits::empty();
+        for (i, v) in values.iter().enumerate() {
+            if !v.is_nil() {
+                bits |= MetamethodBits::from_bits_retain(1 << i);
+            }
+        }
+        let index = values[MetamethodBits::INDEX.bits().trailing_zeros() as usize];
         MtCache(Gc::new(
             mc,
             MtCacheData {
@@ -502,6 +520,7 @@ impl<'gc> MtCache<'gc> {
                 bits: Cell::new(bits),
                 weak: Cell::new(weak),
                 index_table: Cell::new(table_addr(index)),
+                values: MmValues(values.map(Cell::new)),
                 dict_sentinel: Lock::new(None),
             },
         ))
@@ -549,6 +568,12 @@ impl<'gc> MtCache<'gc> {
         self.0.weak.get()
     }
 
+    /// The metamethod `bit` names, nil when absent.
+    #[inline(always)]
+    pub fn mm(self, bit: MetamethodBits) -> Value<'gc> {
+        self.0.values.0[bit.bits().trailing_zeros() as usize].get()
+    }
+
     /// See [`MtCacheData::index_table`].
     #[inline]
     pub fn index_table(self) -> usize {
@@ -575,6 +600,7 @@ impl<'gc> MtCache<'gc> {
                 if bit == MetamethodBits::INDEX {
                     self.0.index_table.set(table_addr(value));
                 }
+                self.0.values.0[bit.bits().trailing_zeros() as usize].set(value);
                 self.update(bit, value)
             }
             None if key.as_bytes() == b"__mode" => self.0.weak.set(WeakMode::of(value)),
