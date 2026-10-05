@@ -254,6 +254,11 @@ impl Decl {
     pub fn values(&self) -> Option<impl Iterator<Item = Expr> + '_> {
         Some(self.0.last_child()?.children().filter_map(Expr::cast))
     }
+
+    /// The statements after this one in its block.
+    pub fn following(&self) -> impl Iterator<Item = Stmt> + '_ {
+        core::iter::successors(self.0.next_sibling(), |n| n.next_sibling()).filter_map(Stmt::cast)
+    }
 }
 
 ast_node!(DeclTarget, T![decl_target]);
