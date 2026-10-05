@@ -24,7 +24,7 @@ use crate::env::function::{NativeClosure, Stack};
 use crate::env::thread::ThreadState;
 use crate::env::{Error, Value};
 use crate::lua::Context;
-use crate::vm::sequence::{CallbackAction, OnOk, Protect};
+use crate::vm::native::{CallbackAction, OnOk, Protect};
 
 /// An async native: reads its arguments from `stack` and returns
 /// [`Stack::spawn`]'s token, or fails right away.
@@ -99,16 +99,10 @@ enum Request {
 }
 
 impl Cx {
-    #[inline]
-    fn env(&self) -> &mut Env<'static> {
-        let env = self.env.0.get();
-        assert!(!env.is_null(), "Cx used outside its native's poll");
-        unsafe { &mut *env }
-    }
-
     /// Run `f` on the native's window and context.
     pub fn enter<R>(&self, f: impl for<'gc> FnOnce(Context<'gc>, Stack<'gc, '_>) -> R) -> R {
-        let env = self.env();
+        let env = self.env.0.get();
+        assert!(!env.is_null(), "Cx used outside its native's poll");
         // Null meanwhile, so a nested `enter` can't alias the thread.
         struct Restore<'a>(&'a EnvCell, *mut Env<'static>);
         impl Drop for Restore<'_> {
@@ -118,6 +112,7 @@ impl Cx {
         }
         let _restore = Restore(&self.env, env);
         self.env.0.set(std::ptr::null_mut());
+        let env = unsafe { &mut *env };
         f(env.ctx, Stack::new(unsafe { &mut *env.thread }, env.base))
     }
 
@@ -286,6 +281,29 @@ impl<'gc> Stack<'gc, '_> {
     }
 }
 
+impl<'gc> Stack<'gc, '_> {
+    /// [`spawn`](Stack::spawn) from an action native that turns async: it
+    /// returns what to return. Its locals must be made in the future.
+    pub(crate) fn spawn_action<Fut>(
+        &mut self,
+        ctx: Context<'gc>,
+        f: impl FnOnce(Cx) -> Fut,
+    ) -> CallbackAction
+    where
+        Fut: Future<Output = TaskResult> + 'static,
+    {
+        let ts = self.thread_mut();
+        debug_assert!(ts.spawning.is_none());
+        ts.spawning = Some(TaskHeader {
+            local_base: ts.locals.len() as u32,
+            prev_epoch: ts.local_epoch,
+        });
+        ts.local_epoch = ctx.next_epoch();
+        let Spawned(()) = self.spawn(f);
+        CallbackAction::Async
+    }
+}
+
 /// An async native's future, with where its locals start and the epoch to
 /// restore once it is done.
 pub(crate) struct Task {
@@ -318,7 +336,7 @@ pub(crate) fn invoke_async<'gc>(
     nc: &NativeClosure<'gc>,
     args_base: usize,
     argc: usize,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<CallbackAction, Error<'gc>> {
     let header = TaskHeader {
         local_base: thread.locals.len() as u32,
         prev_epoch: thread.local_epoch,
@@ -354,7 +372,7 @@ pub(crate) fn async_cont<'gc>(
     _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
     status: Result<(), Error<'gc>>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<CallbackAction, Error<'gc>> {
     let (thread, base) = stack.into_parts();
     let mut env = Env {
         ctx,
@@ -363,16 +381,20 @@ pub(crate) fn async_cont<'gc>(
         status: Some(status),
         request: Request::None,
     };
+    // Through a pointer to the arena, not a borrow of the thread, which the
+    // future's `enter`s take whole.
     let task = unsafe { thread.tasks.last_mut().unwrap_unchecked() };
-    let fut = task.fut.as_mut();
+    let fut: *mut dyn Future<Output = TaskResult> =
+        unsafe { task.fut.as_mut().get_unchecked_mut() };
     let envp = (&raw mut env).cast::<Env<'static>>();
     // The thread keeps it, so it outlives the poll.
-    let cell: *const EnvCell = &**unsafe { (*thread).async_env.as_ref().unwrap_unchecked() };
+    let cell: *const EnvCell = &**unsafe { thread.async_env.as_ref().unwrap_unchecked() };
     let cell = unsafe { &*cell };
     let poll = {
         // Restored after, for a poll nested in another (a native running a
         // second executor from `enter`).
         let prev = cell.0.replace(envp);
+        let fut = unsafe { Pin::new_unchecked(&mut *fut) };
         let r = fut.poll(&mut TaskCx::from_waker(ctx.waker()));
         cell.0.set(prev);
         r

@@ -3,17 +3,17 @@
 //! with new values and the chunk uses them to compute its return value.
 
 use tcvm::env::{Error, Function, LuaString, NativeClosure, Stack, Value};
-use tcvm::vm::sequence::CallbackAction;
+use tcvm::vm::native::CallbackAction;
 use tcvm::{Context, Executor, LoadError, Lua, RuntimeError, StepResult};
 
 fn yielder<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<CallbackAction, Error<'gc>> {
     // Whatever args were passed in are already on the stack — the yield
     // forwards them to the host as the yielded values.
-    Ok(CallbackAction::yield_(None))
+    Ok(CallbackAction::Yield)
 }
 
 /// Yield (1, 2, 3) to the host; on resume, return `a + b` of the

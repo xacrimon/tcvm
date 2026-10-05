@@ -4,7 +4,7 @@
 //! happens if `finish` returns `Ok` on a yielded executor).
 
 use tcvm::env::{Error, Function, LuaString, NativeClosure, Stack, Value};
-use tcvm::vm::sequence::CallbackAction;
+use tcvm::vm::native::CallbackAction;
 use tcvm::{Context, Executor, LoadError, Lua, RuntimeError};
 
 /// A native callback that yields to its resumer (the host, when called
@@ -13,8 +13,8 @@ fn yielder<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    Ok(CallbackAction::yield_(None))
+) -> Result<CallbackAction, Error<'gc>> {
+    Ok(CallbackAction::Yield)
 }
 
 #[test]

@@ -8,7 +8,6 @@ use crate::env::function::{LuaFn, Upvalue};
 use crate::env::value::Value;
 use crate::lua::Context;
 use crate::vm::interp::Handler;
-use crate::vm::sequence::{BoxSequence, Suspend};
 
 /// Copy wrapper stored in Value.
 #[derive(Clone, Copy, Collect)]
@@ -82,12 +81,12 @@ pub struct LuaFrame<'gc> {
 /// Stack-window metadata threaded through every suspension point.
 ///
 /// - `bottom` is the callback's `args_base` — `stack[bottom..]` is the
-///   active window (yielded values, sequence args, etc.).
+///   active window (yielded values, a native's arguments, etc.).
 /// - `func_idx` is the call's function slot, below `bottom`.
 /// - `ret` takes the results once they are in: the continuation of the call
 ///   site, as a returning frame's `ret` would.
 ///
-/// Stored on `ExecKind::Sequence`, `ExecKind::WaitThread`, `PendingAction`,
+/// Stored on `ExecKind::WaitThread`, `PendingAction`,
 /// and as the yielded-state stash on `ThreadState`.
 #[derive(Clone, Copy)]
 pub struct CallSite {
@@ -125,6 +124,8 @@ pub mod frame_flags {
     pub const PASS: u8 = 32;
     /// ... after `true` (`OnOk::ReturnTrue`).
     pub const PASS_TRUE: u8 = 64;
+    /// With `PROTECTED`: catches an exit too (`Protect::Base`).
+    pub const BASE: u8 = 128;
 }
 
 // Two records per cache line.
@@ -243,15 +244,6 @@ impl<'gc> TbcEntry<'gc> {
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub enum ExecKind<'gc> {
-    /// A pinned multi-step native callback awaiting (re-)poll. The
-    /// `call_site` mirrors the original Lua CALL so terminal
-    /// `SequencePoll::Return` lands results in the right place.
-    Sequence {
-        seq: BoxSequence<'gc>,
-        #[collect(require_static)]
-        call_site: CallSite,
-        pending_error: Option<Error<'gc>>,
-    },
     /// A coroutine that hasn't been resumed yet. Replaced on first resume by
     /// a real call frame.
     Start(Value<'gc>),
@@ -338,24 +330,22 @@ pub struct ThreadState<'gc> {
     pub(crate) status: ThreadStatus,
     /// Logical stack top — the end of the value-passing window. Always valid:
     /// it is the sole signal of "how many values are here" across every
-    /// hand-off (native args/results, yields, sequence polls, thread resume,
+    /// hand-off (native args/results, yields, thread resume,
     /// `Result`). Multires producers (`VARARG`/`CALL`/`TAILCALL` with the `0`
     /// sentinel, native multi-return) publish through it; their consumers read
     /// it back.
     pub(crate) top: usize,
     /// Back-reference to the owning Thread handle, needed for creating open upvalues.
     pub(crate) thread_handle: Option<Thread<'gc>>,
-    /// A native callback's `Suspend` request, deposited by the interpreter's
-    /// native-call paths and consumed by the executor driver loop on the next
-    /// pump. `None` between pumps. The interpreter never observes this (it
-    /// leaves dispatch right after setting it).
+    /// A yield or resume left to the executor, consumed on its next pump.
+    /// The interpreter never observes this (it leaves dispatch right after
+    /// setting it).
     pub(crate) pending_action: Option<PendingAction<'gc>>,
     /// Results the executor delivered to a call site; the next `run_thread`
     /// starts by running its continuation.
     pub(crate) pending_ret: Option<PendingRet>,
     /// Where the thread's yielded values currently live. Set when the
-    /// thread suspends via a `Yield` action (or a sequence's
-    /// `SequencePoll::Yield`/`TailYield`). Consumed on resume to recover
+    /// thread suspends by a yield. Consumed on resume to recover
     /// where the call's results should land. `None` outside of yielded
     /// state.
     pub(crate) yield_bottom: Option<CallSite>,
@@ -445,14 +435,26 @@ unsafe impl<'gc> Collect<'gc> for ThreadState<'gc> {
     }
 }
 
-/// A native callback wants to suspend / call / yield / resume; the executor
-/// driver translates this into frame-stack operations on the next pump.
+/// A yield or resume a native asked for that dispatch couldn't make (no
+/// resumer waiting in dispatch, or natives run by the executor), for the
+/// executor to make on its next pump, the values at `call_site.bottom..top`.
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub struct PendingAction<'gc> {
-    pub action: Box<Suspend<'gc>>,
+    pub(crate) kind: PendingKind<'gc>,
     #[collect(require_static)]
-    pub call_site: CallSite,
+    pub(crate) call_site: CallSite,
+}
+
+#[derive(Collect)]
+#[collect(internal, no_drop)]
+pub(crate) enum PendingKind<'gc> {
+    /// To the resumer, or the host; the values it resumes with are the
+    /// call's results.
+    Yield,
+    /// The coroutine's values when it yields or returns are the call's
+    /// results.
+    Resume(Thread<'gc>),
 }
 
 impl<'gc> ThreadState<'gc> {
@@ -528,14 +530,6 @@ impl<'gc> ThreadState<'gc> {
             None
         } else {
             self.exec_frames.last().map(|e| &e.kind)
-        }
-    }
-
-    pub(crate) fn top_exec_mut(&mut self) -> Option<&mut ExecKind<'gc>> {
-        if self.top_is_lua() {
-            None
-        } else {
-            self.exec_frames.last_mut().map(|e| &mut e.kind)
         }
     }
 

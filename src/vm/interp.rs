@@ -7,8 +7,8 @@ use crate::env::shape::{MAX_PROPERTIES_FAST, MetamethodBits, Shape, mirrored};
 use crate::env::string::LuaString;
 use crate::env::table::{SlotLoc, Step, Table, TableState};
 use crate::env::thread::{
-    CallSite, ExecKind, LuaFrame, PendingAction, TbcEntry, Thread, ThreadState, ThreadStatus,
-    frame_flags,
+    CallSite, ExecKind, LuaFrame, PendingAction, PendingKind, TbcEntry, Thread, ThreadState,
+    ThreadStatus, frame_flags,
 };
 use crate::env::value::{Value, ValueKind};
 use crate::instruction::{Instruction, Op, TFOR_VARS, UpValueDescriptor};
@@ -1122,9 +1122,9 @@ fn enter<'gc>(ctx: Context<'gc>, ts: &mut ThreadState<'gc>, ds: &mut DispatchSta
         .expect("run_thread requires a seeded Lua frame");
     if top.is_native() {
         // An async native that waited on the host: poll it again.
-        debug_assert!(std::ptr::fn_addr_eq(
-            unsafe { std::mem::transmute::<_, crate::vm::sequence::NativeCont>(top.pc) },
-            crate::vm::async_native::async_cont as crate::vm::sequence::NativeCont
+        debug_assert!(std::ptr::eq(
+            top.pc,
+            crate::vm::async_native::async_cont as *const Instruction
         ));
         return native_entry(ctx, ts, handlers, ds, NativeState::Resume(Ok(())));
     }
@@ -2645,24 +2645,24 @@ macro_rules! call_action {
                 throw!(err);
             }
         };
-        if let crate::vm::sequence::CallbackAction::Return = action {
+        if let crate::vm::native::CallbackAction::Return = action {
             land_native!(args_base, func_idx, returns, $base, $thread, $registers);
         }
         unsafe { (*$frame).pc = $ip };
         let f = unsafe { $thread.stack[func_idx].get_function().unwrap_unchecked() };
-        if $async && let crate::vm::sequence::CallbackAction::Async = action {
+        if $async && let crate::vm::native::CallbackAction::Async = action {
             // The future's first poll, from the frame it gets, and the call
             // of a Lua function it asks for, without `run_natives` either.
             let cont = crate::vm::async_native::async_cont;
             let ret = call_ret(returns);
             let (no, cont_ok) = (
-                crate::vm::sequence::Protect::No,
-                crate::vm::sequence::OnOk::Cont,
+                crate::vm::native::Protect::No,
+                crate::vm::native::OnOk::Cont,
             );
             push_native_frame($thread, f, args_base, 0, no, cont_ok, cont, ret);
             let r = cont($ctx, $nc, Stack::new($thread, args_base), Ok(()));
             match r {
-                Ok(crate::vm::sequence::CallbackAction::CallThen {
+                Ok(crate::vm::native::CallbackAction::CallThen {
                     at,
                     protect,
                     ok,
@@ -2679,7 +2679,7 @@ macro_rules! call_action {
                     $registers = unsafe { $thread.stack.as_mut_ptr().add(new_base) };
                     dispatch!();
                 }
-                Ok(crate::vm::sequence::CallbackAction::Return) if !$thread.native_overflowed() => {
+                Ok(crate::vm::native::CallbackAction::Return) if !$thread.native_overflowed() => {
                     $thread.pop_lua();
                     land_native!(args_base, func_idx, returns, $base, $thread, $registers);
                 }
@@ -2701,7 +2701,7 @@ macro_rules! call_action {
         }
         // The common shape, a native calling a Lua function, without
         // `run_natives`' generality.
-        if let crate::vm::sequence::CallbackAction::CallThen {
+        if let crate::vm::native::CallbackAction::CallThen {
             at,
             protect,
             ok,
@@ -3424,7 +3424,7 @@ extern "rust-preserve-none" fn op_tailcall_native<'gc>(
         }
     };
     match action {
-        crate::vm::sequence::CallbackAction::Return => {
+        crate::vm::native::CallbackAction::Return => {
             // The results sit at `func + 1` up to `top`, as a RETURN of them
             // would find them; past its 8-bit count, MULTRET reads `top`.
             let retc = thread.top - args_base;
@@ -4633,7 +4633,7 @@ pub(crate) fn invoke_action<'gc>(
     nc: &NativeClosure<'gc>,
     args_base: usize,
     argc: usize,
-) -> Result<crate::vm::sequence::CallbackAction<'gc>, crate::env::Error<'gc>> {
+) -> Result<crate::vm::native::CallbackAction, crate::env::Error<'gc>> {
     let r = f(ctx, nc, native_window(thread, args_base, argc));
     if r.is_ok() && thread.native_overflowed() {
         return Err(native_overflow(ctx));
@@ -4649,10 +4649,10 @@ pub(crate) fn invoke_native<'gc>(
     nc: &NativeClosure<'gc>,
     args_base: usize,
     argc: usize,
-) -> Result<crate::vm::sequence::CallbackAction<'gc>, crate::env::Error<'gc>> {
+) -> Result<crate::vm::native::CallbackAction, crate::env::Error<'gc>> {
     match nc.function {
         NativeKind::Plain(f) => invoke_plain(ctx, thread, f, nc, args_base, argc)
-            .map(|()| crate::vm::sequence::CallbackAction::Return),
+            .map(|()| crate::vm::native::CallbackAction::Return),
         NativeKind::Action(f) => invoke_action(ctx, thread, f, nc, args_base, argc),
         NativeKind::Async(f) => {
             crate::vm::async_native::invoke_async(ctx, thread, f, nc, args_base, argc)
@@ -4660,7 +4660,7 @@ pub(crate) fn invoke_native<'gc>(
     }
 }
 
-/// A native or sequence pushed without `Stack::check_stack`.
+/// A native pushed without `Stack::check_stack`.
 #[cold]
 #[inline(never)]
 pub(crate) fn native_overflow(ctx: Context<'_>) -> crate::env::Error<'_> {
@@ -5012,7 +5012,7 @@ extern "rust-preserve-none" fn meta_call<'gc>(
             dispatch!();
         }
         Some((f, FunctionKind::Native(nc))) => {
-            use crate::vm::sequence::CallbackAction;
+            use crate::vm::native::CallbackAction;
             match invoke_native(ctx, thread, nc, new_base, nargs) {
                 Ok(CallbackAction::Return) => {
                     let nret = thread.top - new_base;
@@ -5330,7 +5330,7 @@ pub(crate) enum NativeState<'gc> {
     /// (it ran inline, its results going to `ret`), or as the top frame's
     /// continuation.
     Acted {
-        r: Result<crate::vm::sequence::CallbackAction<'gc>, crate::env::Error<'gc>>,
+        r: Result<crate::vm::native::CallbackAction, crate::env::Error<'gc>>,
         framed: bool,
         f: Function<'gc>,
         base: usize,
@@ -5401,7 +5401,7 @@ pub(crate) fn run_natives<'gc>(
             thread,
             switch,
             Phase::Resume,
-            Ok(crate::vm::sequence::CallbackAction::Return),
+            Ok(crate::vm::native::CallbackAction::Return),
             status,
             true,
             ctx.next_fn(),
@@ -5413,7 +5413,7 @@ pub(crate) fn run_natives<'gc>(
             thread,
             switch,
             Phase::Raise,
-            Ok(crate::vm::sequence::CallbackAction::Return),
+            Ok(crate::vm::native::CallbackAction::Return),
             Err(err),
             true,
             ctx.next_fn(),
@@ -5440,14 +5440,14 @@ fn drive_natives<'gc>(
     thread: &mut &mut ThreadState<'gc>,
     switch: bool,
     mut phase: Phase,
-    mut r: Result<crate::vm::sequence::CallbackAction<'gc>, crate::env::Error<'gc>>,
+    mut r: Result<crate::vm::native::CallbackAction, crate::env::Error<'gc>>,
     mut status: Result<(), crate::env::Error<'gc>>,
     mut framed: bool,
     mut f: Function<'gc>,
     mut base: usize,
     mut ret: Handler,
 ) -> NativeStep {
-    use crate::vm::sequence::{CallbackAction, NativeCont, OnOk, Protect, Suspend};
+    use crate::vm::native::{CallbackAction, NativeCont, OnOk, Protect};
     let mut slot = 0;
     loop {
         match phase {
@@ -5527,10 +5527,7 @@ fn drive_natives<'gc>(
                     }
                     if !switch {
                         thread.pending_action = Some(PendingAction {
-                            action: Box::new(Suspend::Resume {
-                                thread: co,
-                                then: None,
-                            }),
+                            kind: PendingKind::Resume(co),
                             call_site: CallSite {
                                 bottom: at + 1,
                                 func_idx: at,
@@ -5564,7 +5561,7 @@ fn drive_natives<'gc>(
                     };
                     if !(switch && yield_to_resumer(ctx, thread, site)) {
                         thread.pending_action = Some(PendingAction {
-                            action: Box::new(Suspend::Yield { then: None }),
+                            kind: PendingKind::Yield,
                             call_site: site,
                         });
                         return NativeStep::Exit;
@@ -5584,7 +5581,7 @@ fn drive_natives<'gc>(
                     };
                     if !(switch && yield_to_resumer(ctx, thread, site)) {
                         thread.pending_action = Some(PendingAction {
-                            action: Box::new(Suspend::Yield { then: None }),
+                            kind: PendingKind::Yield,
                             call_site: site,
                         });
                         return NativeStep::Exit;
@@ -5600,20 +5597,6 @@ fn drive_natives<'gc>(
                 Ok(CallbackAction::Pending) => {
                     debug_assert!(framed);
                     return NativeStep::Pending;
-                }
-                Ok(CallbackAction::Suspend(action)) => {
-                    if framed {
-                        ret = thread.frames.pop().map(|f| f.ret).unwrap_or(ret);
-                    }
-                    thread.pending_action = Some(PendingAction {
-                        action,
-                        call_site: CallSite {
-                            bottom: base,
-                            func_idx: base - 1,
-                            ret,
-                        },
-                    });
-                    return NativeStep::Exit;
                 }
                 Err(err) => {
                     // Raised at the native's caller, as from a native that
@@ -5852,7 +5835,7 @@ macro_rules! resume_switch {
         let Some(cs) = (unsafe { co.state_mut_if_clean($ctx.mutation()) }) else {
             tail!(op_call_action);
         };
-        // A yield the executor took (from a sequence) resumes through it.
+        // A yield the executor took resumes through it.
         let Some(y) = cs.yield_bottom.filter(|_| cs.top_is_lua()) else {
             tail!(op_call_action);
         };
@@ -5871,7 +5854,7 @@ macro_rules! resume_switch {
             $f,
             base + func as usize + 1,
             0,
-            crate::vm::sequence::Protect::Errors,
+            crate::vm::native::Protect::Errors,
             $ok,
             $cont,
             unsafe {
@@ -5935,7 +5918,7 @@ pub(crate) extern "rust-preserve-none" fn ff_wrap<'gc>(
         co,
         1,
         f,
-        crate::vm::sequence::OnOk::Return,
+        crate::vm::native::OnOk::Return,
         crate::builtin::wrap_cont,
         ctx,
         thread,
@@ -5983,7 +5966,7 @@ pub(crate) extern "rust-preserve-none" fn ff_resume<'gc>(
         co,
         2,
         f,
-        crate::vm::sequence::OnOk::ReturnTrue,
+        crate::vm::native::OnOk::ReturnTrue,
         crate::builtin::resume_cont,
         ctx,
         thread,
@@ -6146,13 +6129,13 @@ fn restore_protected<'gc>(thread: &mut ThreadState<'gc>, popped: &LuaFrame<'gc>)
 /// its call at `slot` in the Lua frame on top of `ts`: the unwinder puts it
 /// back when an error reaches the call it made.
 pub(crate) fn protected_frame<'gc>(ts: &ThreadState<'gc>, slot: usize, k: usize) -> LuaFrame<'gc> {
-    use crate::vm::sequence::{OnOk, Protect};
+    use crate::vm::native::{OnOk, Protect};
     let f = ts.stack[slot]
         .get_function()
         .expect("pcall in its call slot");
     let caller = ts.top_lua().expect("pcall's caller");
     let call = unsafe { *caller.pc.sub(1) };
-    let (protect, cont): (_, crate::vm::sequence::NativeCont) = if k == 1 {
+    let (protect, cont): (_, crate::vm::native::NativeCont) = if k == 1 {
         (Protect::Errors, crate::builtin::pcall_cont)
     } else {
         (Protect::Handler, crate::builtin::xpcall_cont)
@@ -6346,11 +6329,11 @@ pub(crate) extern "rust-preserve-none" fn ret_native<'gc>(
     // As `run_natives` would, with a returning continuation inline.
     nf.flags &= !(frame_flags::PROTECTED | frame_flags::HANDLER);
     let (f, ret) = (nf.closure.function(), nf.ret);
-    let cont: crate::vm::sequence::NativeCont = unsafe { std::mem::transmute(nf.pc) };
+    let cont: crate::vm::native::NativeCont = unsafe { std::mem::transmute(nf.pc) };
     let nc = unsafe { f.as_native().unwrap_unchecked() };
     let r = cont(ctx, nc, Stack::new(thread, base), Ok(()));
     match r {
-        Ok(crate::vm::sequence::CallbackAction::Return) if !thread.native_overflowed() => {
+        Ok(crate::vm::native::CallbackAction::Return) if !thread.native_overflowed() => {
             let n = thread.frames.len();
             unsafe { thread.frames.set_len(n - 1) };
             let stack = thread.stack.as_mut_ptr();
@@ -6368,7 +6351,7 @@ pub(crate) extern "rust-preserve-none" fn ret_native<'gc>(
             );
         }
         // The next call of a Lua function, from this same frame.
-        Ok(crate::vm::sequence::CallbackAction::CallThen {
+        Ok(crate::vm::native::CallbackAction::CallThen {
             at,
             protect,
             ok,
@@ -6426,9 +6409,9 @@ fn push_native_frame<'gc>(
     f: Function<'gc>,
     base: usize,
     at: u32,
-    protect: crate::vm::sequence::Protect,
-    ok: crate::vm::sequence::OnOk,
-    cont: crate::vm::sequence::NativeCont,
+    protect: crate::vm::native::Protect,
+    ok: crate::vm::native::OnOk,
+    cont: crate::vm::native::NativeCont,
     ret: Handler,
 ) {
     thread.push_lua(native_frame(f, base, at, protect, ok, cont, ret));
@@ -6450,17 +6433,18 @@ pub(crate) fn native_frame<'gc>(
     f: Function<'gc>,
     base: usize,
     at: u32,
-    protect: crate::vm::sequence::Protect,
-    ok: crate::vm::sequence::OnOk,
-    cont: crate::vm::sequence::NativeCont,
+    protect: crate::vm::native::Protect,
+    ok: crate::vm::native::OnOk,
+    cont: crate::vm::native::NativeCont,
     ret: Handler,
 ) -> LuaFrame<'gc> {
-    use crate::vm::sequence::{OnOk, Protect};
+    use crate::vm::native::{OnOk, Protect};
     let flags = frame_flags::NATIVE
         | match protect {
             Protect::No => 0,
             Protect::Errors => frame_flags::PROTECTED,
             Protect::Handler => frame_flags::PROTECTED | frame_flags::HANDLER,
+            Protect::Base => frame_flags::PROTECTED | frame_flags::BASE,
         }
         | match ok {
             OnOk::Cont => 0,

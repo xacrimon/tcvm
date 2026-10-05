@@ -7,8 +7,7 @@ use libc::c_int;
 use crate::Context;
 use crate::builtin::util;
 use crate::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Value};
-use crate::vm::async_sequence::{SequenceReturn, async_sequence};
-use crate::vm::sequence::CallbackAction;
+use crate::vm::native::CallbackAction;
 
 /// `luaL_fileresult`-style outcome: `true` on success, `(nil, "msg", errno?)`
 /// on failure. The message is bare `strerror(errno)` (Rust's `Display` appends
@@ -307,7 +306,7 @@ fn lua_time<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<CallbackAction, Error<'gc>> {
     let arg = stack.get(0);
     if arg.is_nil() {
         stack.ret1(Value::integer(ctx.mutation(), now()));
@@ -316,35 +315,31 @@ fn lua_time<'gc>(
     if arg.get_table().is_none() {
         return Err(util::type_error(ctx, "time", 1, "table", Some(arg)));
     }
-    let seq = async_sequence(ctx.mutation(), |_locals, mut seq| async move {
+    let seq = stack.spawn_action(ctx, |cx| async move {
         let mut ints = [0; 6];
         for (slot, &(k, d, delta)) in ints.iter_mut().zip(&DATE_FIELDS) {
-            util::getfield(&mut seq, 0, k.as_bytes()).await?;
-            *slot = seq.try_enter(|ctx, _locals, _exec, mut stack| {
-                date_field(ctx, stack.pop(), k, d, delta)
-            })?;
+            util::getfield(&cx, 0, k.as_bytes()).await?;
+            *slot = cx.try_enter(|ctx, stack| date_field(ctx, stack.pop(), k, d, delta))?;
         }
-        util::getfield(&mut seq, 0, b"isdst").await?;
-        let isdst = seq.enter(|_ctx, _locals, _exec, mut stack| bool_field(stack.pop()));
+        util::getfield(&cx, 0, b"isdst").await?;
+        let isdst = cx.enter(|_ctx, mut stack| bool_field(stack.pop()));
         let (time, tm) = make_time(ints, isdst);
         let (ints, isdst) = tm_fields(&tm);
         for (k, v) in ints {
-            seq.enter(|ctx, _locals, _exec, mut stack| {
-                stack.push(Value::integer(ctx.mutation(), v))
-            });
-            util::setfield(&mut seq, 0, k.as_bytes()).await?;
+            cx.enter(|ctx, mut stack| stack.push(Value::integer(ctx.mutation(), v)));
+            util::setfield(&cx, 0, k.as_bytes()).await?;
         }
         if let Some(b) = isdst {
-            seq.enter(|_ctx, _locals, _exec, mut stack| stack.push(Value::boolean(b)));
-            util::setfield(&mut seq, 0, b"isdst").await?;
+            cx.enter(|_ctx, mut stack| stack.push(Value::boolean(b)));
+            util::setfield(&cx, 0, b"isdst").await?;
         }
-        seq.try_enter(|ctx, _locals, _exec, mut stack| {
+        cx.try_enter(|ctx, stack| {
             stack.ret1(time_result(ctx, time)?);
             Ok(())
         })?;
-        Ok(SequenceReturn::Return)
+        Ok(())
     });
-    Ok(CallbackAction::sequence(seq))
+    Ok(seq)
 }
 
 /// `os_time`'s `getfield` calls, in order: key, default (`None`: required),

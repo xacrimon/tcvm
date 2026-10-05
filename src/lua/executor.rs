@@ -1,7 +1,7 @@
 use crate::dmm::{Collect, Gc, RefLock};
 use crate::env::error::Exit;
 use crate::env::thread::{
-    CallSite, ExecKind, LuaFrame, PendingAction, PendingRet, ThreadState, ThreadStatus,
+    CallSite, ExecKind, LuaFrame, PendingAction, PendingKind, PendingRet, ThreadState, ThreadStatus,
 };
 use crate::env::{Error, LuaString, Thread, Value};
 use crate::lua::RuntimeError;
@@ -10,7 +10,7 @@ use crate::lua::convert::{FromMultiValue, IntoMultiValue};
 use crate::vm;
 use crate::vm::interp::CallTarget;
 use crate::vm::interp::ret_exit;
-use crate::vm::sequence::{CallbackAction, Suspend};
+use crate::vm::native::CallbackAction;
 
 #[derive(Clone, Copy, PartialEq, Eq, Collect)]
 #[collect(internal, require_static)]
@@ -34,9 +34,9 @@ pub enum StepResult<'gc> {
     /// Top thread yielded these values to the host. Feed resume args via
     /// [`Executor::resume`] (mode → `Normal`) and call `step` again.
     Yielded(Vec<Value<'gc>>),
-    /// A `Sequence` returned `SequencePoll::Pending`, asking the host to
-    /// interleave other work / consult fuel. Mode stays `Normal`; call
-    /// `step` again to keep going.
+    /// The host gets to run before stepping on: the collector is owed work,
+    /// or an async native waits on the host. Mode stays `Normal`; call `step`
+    /// again to keep going, once woken (see [`Executor::step_waker`]).
     Pending,
 }
 
@@ -112,16 +112,16 @@ impl<'gc> Executor<'gc> {
     /// - [`StepResult::Done`] — the main thread completed; call `take_result`.
     /// - [`StepResult::Yielded(values)`] — the main thread yielded to the
     ///   host. Feed args back via [`Executor::resume`] then `step` again.
-    /// - [`StepResult::Pending`] — a `Sequence` returned `Pending`, the
-    ///   collector is owed work, or an async native waits on the host. The
-    ///   waker of [`step_waker`](Self::step_waker) is woken once stepping can
-    ///   go on, right away for all but the last. Leave the current [`Lua::enter`](crate::Lua::enter),
+    /// - [`StepResult::Pending`] — the collector is owed work, or an async
+    ///   native waits on the host. The waker of [`step_waker`](Self::step_waker)
+    ///   is woken once stepping can go on, right away for the collector.
+    ///   Leave the current [`Lua::enter`](crate::Lua::enter),
     ///   which collects on its way out, and call `step` again in a new one.
     ///   Stepping on inside the same `enter` still makes progress, but
     ///   nothing is collected until the host leaves it.
     ///
     /// The hot path (Lua-only execution, sync natives) makes a single call
-    /// into `run_thread` and exits. Coroutine resume / sequence pump cycles
+    /// into `run_thread` and exits. Coroutines the executor resumes itself
     /// loop here until something terminal happens or values cross the host
     /// boundary.
     pub fn step(self, ctx: Context<'gc>) -> Result<StepResult<'gc>, RuntimeError> {
@@ -232,7 +232,6 @@ impl<'gc> Executor<'gc> {
             #[derive(Clone, Copy)]
             enum FrameKind {
                 Lua,
-                Sequence,
                 Start,
                 WaitThread,
                 Error,
@@ -242,7 +241,6 @@ impl<'gc> Executor<'gc> {
                 match ts.top_exec() {
                     _ if ts.pending_ret.is_some() => FrameKind::Lua,
                     None if ts.top_is_lua() => FrameKind::Lua,
-                    Some(ExecKind::Sequence { .. }) => FrameKind::Sequence,
                     Some(ExecKind::Start(_)) => FrameKind::Start,
                     Some(ExecKind::WaitThread { .. }) => FrameKind::WaitThread,
                     Some(ExecKind::Error(_)) => FrameKind::Error,
@@ -267,14 +265,6 @@ impl<'gc> Executor<'gc> {
                         }
                         vm::interp::Exit::Pending => return Ok(StepResult::Pending),
                         vm::interp::Exit::End => {}
-                    }
-                }
-                FrameKind::Sequence => {
-                    if matches!(pump_sequence(self, ctx, top)?, PumpOutcome::Pending) {
-                        // Sequence asked for cooperative re-poll. Mode stays
-                        // Normal so a follow-up `step` resumes the driver.
-                        ctx.waker().wake_by_ref();
-                        return Ok(StepResult::Pending);
                     }
                 }
                 FrameKind::Start => {
@@ -407,97 +397,27 @@ impl<'gc> Executor<'gc> {
 // Driver helpers
 // ---------------------------------------------------------------------------
 
-/// Translate a [`PendingAction`] (deposited by `op_call`/`op_tailcall` after
-/// a non-`Return` `CallbackAction`) into frame-stack operations.
+/// Make the yield or resume a native asked for that dispatch left to the
+/// executor (see [`PendingAction`]).
 fn apply_pending_action<'gc>(
     exec: Executor<'gc>,
     ctx: Context<'gc>,
     top: Thread<'gc>,
     p: PendingAction<'gc>,
 ) -> Result<(), RuntimeError> {
-    let mc = ctx.mutation();
-    let PendingAction { action, call_site } = p;
-    match *action {
-        Suspend::Sequence(seq) => {
-            let mut ts = top.borrow_mut(mc);
-            ts.push_exec(ExecKind::Sequence {
-                seq,
-                call_site,
-                pending_error: None,
-            });
-        }
-        Suspend::Call { then } => {
-            let mut ts = top.borrow_mut(mc);
-            // If `then` provided, the sequence is the call's "completion
-            // handler"; it inherits the caller's expected_returns. The
-            // sequence sees the called function's results at stack[bottom..].
-            //
-            // We push `then` BEFORE scheduling the call so that if the
-            // callee can't be resolved or errors immediately, the
-            // ExecKind::Error lands above this sequence and the unwinder
-            // routes the error to it.
-            let (slot, ret) = match then {
-                Some(seq) => {
-                    ts.push_exec(ExecKind::Sequence {
-                        seq,
-                        call_site,
-                        pending_error: None,
-                    });
-                    (call_site.bottom, ret_exit as vm::interp::Handler)
-                }
-                // No completion: the callee returns straight to the call
-                // site, so it must sit where the call put its function.
-                None => {
-                    let (bottom, top) = (call_site.bottom, ts.top);
-                    ts.stack.copy_within(bottom..top, call_site.func_idx);
-                    ts.set_top(call_site.func_idx + (top - bottom));
-                    (call_site.func_idx, call_site.ret)
-                }
-            };
-            schedule_call_at(&mut ts, ctx, slot, ret)?;
-        }
-        Suspend::Yield { then } => {
-            let mut ts = top.borrow_mut(mc);
+    let PendingAction { kind, call_site } = p;
+    match kind {
+        PendingKind::Yield => {
+            let mut ts = top.borrow_mut(ctx.mutation());
             if ts.no_yield {
                 ts.raise(ctx, yield_across_close(ctx));
                 return Ok(());
             }
-            // With a follow-up sequence the resume args are its input and
-            // stay at `bottom`; without one they are the call's results.
-            let landing = if then.is_some() {
-                in_place(call_site.bottom)
-            } else {
-                call_site
-            };
-            if let Some(seq) = then {
-                ts.push_exec(ExecKind::Sequence {
-                    seq,
-                    call_site,
-                    pending_error: None,
-                });
-            }
-            ts.yield_bottom = Some(landing);
+            ts.yield_bottom = Some(call_site);
             ts.status = ThreadStatus::Suspended;
         }
-        Suspend::Resume {
-            thread: target,
-            then,
-        } => {
-            // Optional `then` fires when target yields/returns; install on
-            // the resumer first so it's seen *after* the WaitThread frame.
-            let landing = if then.is_some() {
-                in_place(call_site.bottom)
-            } else {
-                call_site
-            };
-            if let Some(seq) = then {
-                top.borrow_mut(mc).push_exec(ExecKind::Sequence {
-                    seq,
-                    call_site,
-                    pending_error: None,
-                });
-            }
-            schedule_thread_resume(exec, ctx, top, target, call_site.bottom, landing)?;
+        PendingKind::Resume(target) => {
+            schedule_thread_resume(exec, ctx, top, target, call_site.bottom, call_site)?;
         }
     }
     Ok(())
@@ -554,10 +474,6 @@ fn run_natives<'gc>(
 /// `resumer.stack[args_abs_bottom..]`, transitions the target into
 /// `Normal` (handling first-resume and mid-resume cases), and pushes the
 /// target onto the executor's thread stack.
-///
-/// Callers that want a follow-up `Sequence` on the resumer for the
-/// returned values must push it BEFORE calling this helper (so it sits
-/// beneath the WaitThread frame in stack order).
 fn schedule_thread_resume<'gc>(
     exec: Executor<'gc>,
     ctx: Context<'gc>,
@@ -568,7 +484,7 @@ fn schedule_thread_resume<'gc>(
 ) -> Result<(), RuntimeError> {
     let mc = ctx.mutation();
     // Raised on the resumer, leaving the target untouched (`lua_resume`'s
-    // `resume_error`), so the follow-up sequence sees it as the resume's error.
+    // `resume_error`).
     if exec.0.borrow().thread_stack.len() >= vm::interp::MAX_RESUME_DEPTH as usize {
         let msg = Value::string(LuaString::new(ctx, b"C stack overflow"));
         resumer.borrow_mut(mc).raise(ctx, Error::new(ctx, msg));
@@ -675,11 +591,7 @@ fn schedule_call_at<'gc>(
         let action = match vm::interp::invoke_native(ctx, ts, nc, args_base, argc) {
             Ok(a) => a,
             Err(e) => {
-                // Mirror op_call's native-error path: push ExecKind::Error so the
-                // executor unwinder can find the nearest Sequence catcher
-                // (e.g. a PCallSequence wrapping coroutine.resume). Returning
-                // Err here would short-circuit past any catcher pushed by
-                // apply_pending_action / pump_sequence before this call.
+                // Unwound from the frames as they are, like any error.
                 ts.raise(ctx, e);
                 return Ok(());
             }
@@ -729,153 +641,6 @@ fn schedule_call_at<'gc>(
     }
 }
 
-/// What to do after pumping the top frame.
-#[derive(Clone, Copy)]
-enum PumpOutcome {
-    /// Default — continue the driver loop.
-    Continue,
-    /// Sequence returned `Pending`; surface to the host so it can
-    /// interleave other work / consult fuel.
-    Pending,
-}
-
-/// Pump a `ExecKind::Sequence` on top of `top`. Pops the frame, invokes
-/// `seq.poll()` (or `seq.error()` if `pending_error.is_some()`), and
-/// translates the [`SequencePoll`] back to frame ops.
-fn pump_sequence<'gc>(
-    exec: Executor<'gc>,
-    ctx: Context<'gc>,
-    top: Thread<'gc>,
-) -> Result<PumpOutcome, RuntimeError> {
-    use crate::vm::sequence::{Execution, SequencePoll};
-    let mc = ctx.mutation();
-    // Pop the sequence frame and call poll/error.
-    let (mut seq, call_site, pending_error) = {
-        let mut ts = top.borrow_mut(mc);
-        match ts.pop_exec() {
-            Some(ExecKind::Sequence {
-                seq,
-                call_site,
-                pending_error,
-            }) => (seq, call_site, pending_error),
-            _ => unreachable!("pump_sequence: top wasn't ExecKind::Sequence"),
-        }
-    };
-    // The sequence's input values are the window `stack[call_site.bottom..top]`,
-    // already published by whoever produced them (the suspending native, a
-    // landed call, a resume). Its mutators write `top` back through the view.
-    let poll_result = {
-        let mut ts = top.borrow_mut(mc);
-        let exec = Execution::new(top, ts.main);
-        let stack_view = crate::env::function::Stack::new(&mut ts, call_site.bottom);
-        let r = if let Some(err) = pending_error {
-            seq.error(ctx, exec, err, stack_view)
-        } else {
-            seq.poll(ctx, exec, stack_view)
-        };
-        match r {
-            Ok(_) if ts.native_overflowed() => Err(vm::interp::native_overflow(ctx)),
-            r => r,
-        }
-    };
-    match poll_result {
-        Ok(SequencePoll::Pending) => {
-            top.borrow_mut(mc).push_exec(ExecKind::Sequence {
-                seq,
-                call_site,
-                pending_error: None,
-            });
-            return Ok(PumpOutcome::Pending);
-        }
-        Ok(SequencePoll::Return) => {
-            // Sequence finished. Land values at the original CALL's expected
-            // window.
-            let mut ts = top.borrow_mut(mc);
-            land_call_results(&mut ts, call_site);
-        }
-        Ok(SequencePoll::Call {
-            function,
-            bottom: rel,
-        }) => {
-            let abs_bottom = call_site.bottom + rel;
-            let mut ts = top.borrow_mut(mc);
-            // Re-push self to be re-polled with results at stack[bottom..].
-            ts.push_exec(ExecKind::Sequence {
-                seq,
-                call_site,
-                pending_error: None,
-            });
-            // Schedule the call: insert function at abs_bottom, args after.
-            ts.insert_at(abs_bottom, function);
-            schedule_call_at(&mut ts, ctx, abs_bottom, ret_exit)?;
-        }
-        Ok(SequencePoll::TailCall(function)) => {
-            // Sequence is done; the call's results must land at the
-            // original CALL site `call_site.func_idx`. Args sit at
-            // stack[bottom..], adjacent to func_idx after a normal CALL
-            // but not after a TAILCALL→native→sequence chain (where
-            // bottom lives inside the popped tail-callee's window).
-            // Compact down to func_idx+1, then place the function.
-            let mut ts = top.borrow_mut(mc);
-            // The sequence left its tail-call args at `stack[bottom..top]`.
-            let argc = ts.top - call_site.bottom;
-            let new_args_base = call_site.func_idx + 1;
-            if new_args_base < call_site.bottom {
-                ts.stack
-                    .copy_within(call_site.bottom..call_site.bottom + argc, new_args_base);
-                ts.set_top(new_args_base + argc);
-            }
-            ts.stack[call_site.func_idx] = function;
-            schedule_call_at(&mut ts, ctx, call_site.func_idx, call_site.ret)?;
-        }
-        Ok(SequencePoll::Yield { .. } | SequencePoll::TailYield) if top.borrow().no_yield => {
-            top.borrow_mut(mc).raise(ctx, yield_across_close(ctx));
-        }
-        Ok(SequencePoll::Yield { bottom: rel }) => {
-            let abs_bottom = call_site.bottom + rel;
-            let mut ts = top.borrow_mut(mc);
-            // Re-push self to be re-polled with resume-args at stack[bottom..].
-            ts.push_exec(ExecKind::Sequence {
-                seq,
-                call_site,
-                pending_error: None,
-            });
-            ts.yield_bottom = Some(in_place(abs_bottom));
-            ts.status = ThreadStatus::Suspended;
-        }
-        Ok(SequencePoll::TailYield) => {
-            let mut ts = top.borrow_mut(mc);
-            ts.yield_bottom = Some(call_site);
-            ts.status = ThreadStatus::Suspended;
-        }
-        Ok(SequencePoll::Resume {
-            thread: target,
-            bottom: rel,
-        }) => {
-            // Re-push self so propagate_inner_to_resumer finds the
-            // sequence beneath the WaitThread and lands target's
-            // eventual values at seq.bottom for the next poll.
-            let abs_bottom = call_site.bottom + rel;
-            top.borrow_mut(mc).push_exec(ExecKind::Sequence {
-                seq,
-                call_site,
-                pending_error: None,
-            });
-            schedule_thread_resume(exec, ctx, top, target, abs_bottom, in_place(abs_bottom))?;
-        }
-        Ok(SequencePoll::TailResume(target)) => {
-            // Sequence is consumed; target's eventual values go straight
-            // to the original CALL site via the WaitThread call_site
-            // when no Sequence is beneath.
-            schedule_thread_resume(exec, ctx, top, target, call_site.bottom, call_site)?;
-        }
-        Err(err) => {
-            top.borrow_mut(mc).raise(ctx, err);
-        }
-    }
-    Ok(PumpOutcome::Continue)
-}
-
 /// A yield while `coroutine.close`/`wrap` closes the thread's variables,
 /// which the reference runs on the C stack.
 fn yield_across_close(ctx: Context<'_>) -> Error<'_> {
@@ -885,8 +650,7 @@ fn yield_across_close(ctx: Context<'_>) -> Error<'_> {
 
 /// After an inner thread terminated or yielded, transfer its result-bottom
 /// values to the resumer's `ExecKind::WaitThread`, pop both, and let the
-/// resumer continue (the next driver pump finds either a `ExecKind::Sequence`
-/// or a Lua frame ready to resume).
+/// resumer continue.
 fn propagate_inner_to_resumer<'gc>(
     exec: Executor<'gc>,
     ctx: Context<'gc>,
@@ -933,16 +697,6 @@ fn propagate_inner_to_resumer<'gc>(
         rs.status = ThreadStatus::Normal;
     }
     Ok(())
-}
-
-/// A landing site that leaves values at `bottom`: what a sequence records
-/// when it suspends on its own behalf and will read them back there.
-fn in_place(bottom: usize) -> CallSite {
-    CallSite {
-        bottom,
-        func_idx: bottom,
-        ret: ret_exit,
-    }
 }
 
 /// Hand the values at `stack[cs.bottom..top]` to the call site: an executor

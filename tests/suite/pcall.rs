@@ -2,10 +2,8 @@
 //! same snippets (chunk name `=c`); the message handler runs *before* the
 //! stack unwinds, which the native-handler test observes directly.
 
-use std::pin::Pin;
-
 use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
-use tcvm::vm::sequence::{BoxSequence, CallbackAction, Execution, Sequence, SequencePoll};
+use tcvm::vm::native::{CallbackAction, OnOk, Protect};
 use tcvm::{Context, Executor, LoadError, Lua};
 
 use crate::common::{err, eval, ok};
@@ -242,31 +240,29 @@ fn retried_handler_still_sees_the_failing_frames() {
     assert_eq!(frames, 4);
 }
 
-/// `through(f, ...)`: call `f` under a sequence that keeps the default
-/// `Catch::Pass`, i.e. the kind of native-with-callback (`sort`, `gsub`)
-/// that must not shadow an enclosing `xpcall` handler.
+/// `through(f, ...)`: call `f` from an unprotected native frame, the kind a
+/// native with a callback (`sort`, `gsub`) has, which must not shadow an
+/// enclosing `xpcall` handler.
 fn lua_through<'gc>(
-    ctx: Context<'gc>,
+    _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    struct PassThrough;
-    unsafe impl<'gc> tcvm::dmm::Collect<'gc> for PassThrough {
-        const NEEDS_TRACE: bool = false;
-    }
-    impl<'gc> Sequence<'gc> for PassThrough {
-        fn trace_pointers(&self, _cc: &mut dyn tcvm::dmm::Trace<'gc>) {}
-        fn poll(
-            self: Pin<&mut Self>,
-            _ctx: tcvm::Context<'gc>,
-            _exec: Execution<'gc>,
-            _stack: Stack<'gc, '_>,
-        ) -> Result<SequencePoll<'gc>, Error<'gc>> {
-            Ok(SequencePoll::Return)
-        }
-    }
-    let then = BoxSequence::new(ctx.mutation(), PassThrough);
-    Ok(CallbackAction::call(Some(then)))
+) -> Result<CallbackAction, Error<'gc>> {
+    Ok(CallbackAction::CallThen {
+        at: 0,
+        protect: Protect::No,
+        ok: OnOk::Cont,
+        cont: through_cont,
+    })
+}
+
+fn through_cont<'gc>(
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
+    _stack: Stack<'gc, '_>,
+    _status: Result<(), Error<'gc>>,
+) -> Result<CallbackAction, Error<'gc>> {
+    Ok(CallbackAction::Return)
 }
 
 fn install_through<'gc>(ctx: tcvm::Context<'gc>) {

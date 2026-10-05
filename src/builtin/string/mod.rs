@@ -17,10 +17,8 @@ use crate::builtin::util::{to_integer, to_number as to_float};
 use crate::env::{
     Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Userdata, Value,
 };
-use crate::lua::{StashedError, StashedFunction, StashedTable, StashedValue};
-use crate::vm::async_sequence::{AsyncSequence, SequenceReturn, async_sequence};
 use crate::vm::interp::{IndexChain, walk_index_chain};
-use crate::vm::sequence::CallbackAction;
+use crate::vm::native::CallbackAction;
 
 mod meta;
 mod pack;
@@ -251,7 +249,7 @@ fn lua_format<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<CallbackAction, Error<'gc>> {
     let fmt_val = stack.get(0);
     let fmt_str = fmt_val
         .get_string()
@@ -292,16 +290,16 @@ fn lua_format<'gc>(
             return Err(e);
         }
     };
-    // A conversion needs `__tostring`: finish in a sequence that can call it,
+    // A conversion needs `__tostring`: finish in a future that can call it,
     // continuing from where `run` stopped. The buffer goes with it and is not
     // returned. The arguments, format string included, stay on the stack below
     // `n` throughout.
     let n = stack.len();
-    let seq = async_sequence(ctx.mutation(), move |_locals, mut seq| async move {
+    let seq = stack.spawn_action(ctx, move |cx| async move {
         let mut pending = Some(pending);
         while let Some((sf, at, arg)) = pending {
-            let bytes = util::tolstring(&mut seq, arg, n).await?;
-            pending = seq.try_enter(|ctx, _locals, _exec, stack| {
+            let bytes = util::tolstring(&cx, arg, n).await?;
+            pending = cx.try_enter(|ctx, stack| {
                 let fmt = stack.get(0).get_string().expect("checked on entry");
                 let fmt = fmt.as_bytes();
                 // Lua checks the spec after `luaL_tolstring`.
@@ -314,15 +312,15 @@ fn lua_format<'gc>(
                 } else {
                     strfmt_num::put_fstr(&mut f.out, sf, &bytes);
                 }
-                f.run(ctx, fmt, &stack)
+                f.run(ctx, fmt, stack)
             })?;
         }
-        seq.enter(|ctx, _locals, _exec, mut stack| {
+        cx.enter(|ctx, mut stack| {
             stack.replace(&[Value::string(LuaString::new(ctx, &f.out))]);
         });
-        Ok(SequenceReturn::Return)
+        Ok(())
     });
-    Ok(CallbackAction::sequence(seq))
+    Ok(seq)
 }
 
 struct Formatter {
@@ -775,14 +773,13 @@ fn gmatch_aux<'gc>(
 /// result string and the substitution count.
 ///
 /// A string/number `repl` resolves entirely in Rust (a synchronous return). A
-/// table/function `repl` re-enters the interpreter per match, so the work runs
-/// as an async `Sequence` (the same mechanism `table.sort` uses for its
-/// comparator).
+/// table/function `repl` calls into Lua per match, so the loop runs as a
+/// continuation ([`gsub_drive`]), as `table.sort` does with its comparator.
 fn lua_gsub<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction<'gc>, Error<'gc>> {
+) -> Result<CallbackAction, Error<'gc>> {
     let s = util::check_string(ctx, stack.get(0), "gsub", 1)?;
     let p = util::check_string(ctx, stack.get(1), "gsub", 2)?;
     let repl = stack.get(2);
@@ -803,10 +800,7 @@ fn lua_gsub<'gc>(
         return Ok(CallbackAction::Return);
     }
 
-    // Table/function replacement: re-enters the VM, so drive a sequence.
-    let repl_fn = repl.get_function();
-    let repl_tbl = repl.get_table();
-    if repl_fn.is_none() && repl_tbl.is_none() {
+    if repl.get_function().is_none() && repl.get_table().is_none() {
         return Err(util::type_error(
             ctx,
             "gsub",
@@ -816,26 +810,174 @@ fn lua_gsub<'gc>(
         ));
     }
 
+    // The matching runs here, calling `repl` as a continuation, with the
+    // result so far in a buffer of its own: the window holds the state.
     let mc = ctx.mutation();
-    let src = s.as_bytes().to_vec();
-    let pat = p.as_bytes().to_vec();
-    let seq = async_sequence(mc, move |locals, seq| {
-        let repl = match (repl_fn, repl_tbl) {
-            (Some(f), _) => Repl::Func(locals.stash(mc, f)),
-            (_, Some(t)) => Repl::Table(locals.stash(mc, t)),
-            _ => unreachable!("repl kind validated above"),
-        };
-        async move {
-            let mut seq = seq;
-            let (result, count) = gsub_run(&mut seq, src, pat, repl, max_n).await?;
-            seq.enter(|ctx, locals, _exec, mut stack| {
-                let result = locals.fetch(ctx.mutation(), &result);
-                stack.replace(&[result, Value::integer(ctx.mutation(), count)]);
-            });
-            Ok(SequenceReturn::Return)
+    let buf = Userdata::new(mc, RefCell::new(Vec::<u8>::new()), 0);
+    stack.replace(&[
+        Value::string(s),
+        Value::string(p),
+        repl,
+        Value::integer(mc, max_n),
+        Value::userdata(buf),
+        Value::small(0),
+        Value::small(-1),
+        Value::small(0),
+        Value::small(0),
+    ]);
+    gsub_drive(ctx, stack, None)
+}
+
+// `gsub_drive`'s window above `[s, p, repl]`: the match limit, the result
+// buffer, the subject position, the end of the last match (-1 for none),
+// the count, the end of the match being replaced, then the call.
+const G_N: usize = 3;
+const G_BUF: usize = 4;
+const G_POS: usize = 5;
+const G_LAST: usize = 6;
+const G_COUNT: usize = 7;
+const G_E: usize = 8;
+const G_AT: usize = 9;
+
+/// `gsub`'s loop for a function or table `repl`, resumed with what the
+/// replacement call returned for the match ending at `G_E`.
+fn gsub_drive<'gc>(
+    ctx: Context<'gc>,
+    mut stack: Stack<'gc, '_>,
+    resumed: Option<Value<'gc>>,
+) -> Result<CallbackAction, Error<'gc>> {
+    let mc = ctx.mutation();
+    let int = |stack: &Stack<'gc, '_>, i: usize| stack.get(i).get_integer().unwrap_or(0);
+    let src = stack.get(0).get_string().expect("gsub's subject");
+    let pat = stack.get(1).get_string().expect("gsub's pattern");
+    let (src, pat) = (src.as_bytes(), pat.as_bytes());
+    let repl = stack.get(2);
+    let max_n = int(&stack, G_N);
+    let buf = stack.get(G_BUF).get_userdata().expect("gsub's buffer");
+    let mut pos = int(&stack, G_POS) as usize;
+    let mut last = usize::try_from(int(&stack, G_LAST)).ok();
+    let mut count = int(&stack, G_COUNT);
+    let anchor = pat.first() == Some(&b'^');
+    let body = if anchor { &pat[1..] } else { pat };
+    let mut out = buf
+        .with_data::<RefCell<Vec<u8>>, _>(|b| b.take())
+        .expect("gsub's buffer");
+    let mut done = false;
+    if let Some(v) = resumed {
+        let e = int(&stack, G_E) as usize;
+        match repl_bytes(ctx, v)? {
+            Some(r) => out.extend_from_slice(r.as_bytes()),
+            None => out.extend_from_slice(&src[pos..e]),
         }
-    });
-    Ok(CallbackAction::sequence(seq))
+        pos = e;
+        last = Some(e);
+        done = anchor;
+    }
+    let mut ms = MatchState::new(src, body);
+    while !done && count < max_n {
+        match ms.match_at(pos).map_err(|e| pat_err(ctx, e))? {
+            Some(e) if Some(e) != last => {
+                count += 1;
+                let call = if let Some(f) = repl.get_function() {
+                    // Every capture is an argument.
+                    let n = ms.num_captures(true);
+                    let mut call = Vec::with_capacity(n + 1);
+                    call.push(Value::function(f));
+                    for i in 0..n {
+                        let cv = ms.get_onecapture(i, pos, e).map_err(|e| pat_err(ctx, e))?;
+                        call.push(cap_to_value(ctx, src, cv));
+                    }
+                    Some(call)
+                } else {
+                    // A table is indexed by the first capture, through
+                    // `__index`.
+                    let cv = ms.get_onecapture(0, pos, e).map_err(|e| pat_err(ctx, e))?;
+                    let key = cap_to_value(ctx, src, cv);
+                    let raw = repl.get_table().map_or(Value::nil(), |t| t.raw_get(key));
+                    let chain = if raw.is_nil() {
+                        walk_index_chain(ctx, repl, key)
+                    } else {
+                        IndexChain::Resolved(raw)
+                    };
+                    match chain {
+                        IndexChain::Resolved(v) => {
+                            match repl_bytes(ctx, v)? {
+                                Some(r) => out.extend_from_slice(r.as_bytes()),
+                                None => out.extend_from_slice(&src[pos..e]),
+                            }
+                            None
+                        }
+                        IndexChain::Invoke { func, receiver } => {
+                            Some(vec![Value::function(func), receiver, key])
+                        }
+                        IndexChain::NotIndexable(v) => {
+                            let msg = format!("attempt to index a {} value", v.type_name());
+                            return Err(Error::from_str(ctx, &msg));
+                        }
+                        IndexChain::Exhausted => {
+                            let msg = "'__index' chain too long; possible loop";
+                            return Err(Error::from_str(ctx, msg));
+                        }
+                    }
+                };
+                if let Some(call) = call {
+                    let _ = buf.with_data::<RefCell<Vec<u8>>, _>(|b| b.replace(out));
+                    let slots = stack.as_mut_slice();
+                    slots[G_POS] = Value::integer(mc, pos as i64);
+                    slots[G_LAST] = Value::integer(mc, last.map_or(-1, |l| l as i64));
+                    slots[G_COUNT] = Value::integer(mc, count);
+                    slots[G_E] = Value::integer(mc, e as i64);
+                    stack.truncate(G_AT);
+                    stack.extend(call);
+                    return Ok(CallbackAction::call_then(G_AT, gsub_cont));
+                }
+                pos = e;
+                last = Some(e);
+            }
+            _ => {
+                if pos < src.len() {
+                    out.push(src[pos]);
+                    pos += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        if anchor {
+            break;
+        }
+    }
+    out.extend_from_slice(&src[pos..]);
+    let result = Value::string(LuaString::new(ctx, &out));
+    stack.replace(&[result, Value::integer(mc, count)]);
+    Ok(CallbackAction::Return)
+}
+
+/// The replacement call returned: on with its first result.
+fn gsub_cont<'gc>(
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
+    mut stack: Stack<'gc, '_>,
+    _status: Result<(), Error<'gc>>,
+) -> Result<CallbackAction, Error<'gc>> {
+    let v = stack.get(G_AT);
+    stack.truncate(G_AT);
+    gsub_drive(ctx, stack, Some(v))
+}
+
+/// A function or table replacement's value: `None` (nil or false) keeps the
+/// match; a string or number replaces it; anything else is an error, as
+/// PUC's `lua_isstring` test.
+fn repl_bytes<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> Result<Option<LuaString<'gc>>, Error<'gc>> {
+    if v.is_falsy() {
+        return Ok(None);
+    }
+    util::to_lstring(ctx, v).map(Some).ok_or_else(|| {
+        Error::from_str(
+            ctx,
+            &format!("invalid replacement value (a {})", v.type_name()),
+        )
+    })
 }
 
 /// Synchronous `gsub` for a template `repl`. Returns the result string and the
@@ -923,219 +1065,6 @@ fn add_s<'gc>(
         }
     }
     Ok(())
-}
-
-/// Stashed table/function replacement target for the sequence path.
-enum Repl {
-    Func(StashedFunction),
-    Table(StashedTable),
-}
-
-/// A capture extracted into owned bytes (or a position) so it can outlive the
-/// transient `MatchState` borrow across an `.await`.
-enum OwnedCap {
-    Bytes(Vec<u8>),
-    Pos(i64),
-}
-
-impl OwnedCap {
-    fn to_value<'gc>(&self, ctx: Context<'gc>) -> Value<'gc> {
-        match self {
-            OwnedCap::Bytes(b) => Value::string(LuaString::new(ctx, b)),
-            OwnedCap::Pos(n) => Value::integer(ctx.mutation(), *n),
-        }
-    }
-}
-
-/// What a single match's replacement resolves to.
-enum ReplResult {
-    /// Keep the original matched text (function/table returned nil/false).
-    Keep,
-    /// Substitute these bytes.
-    Bytes(Vec<u8>),
-}
-
-/// One iteration's matching decision, extracted synchronously so the borrow of
-/// the subject/pattern by `MatchState` never spans an `.await`.
-enum GsubStep {
-    /// A match ending at `e`; `whole` is the matched text and `caps` the
-    /// replacement arguments (all captures for a function, just the first for
-    /// a table).
-    Replace {
-        whole: Vec<u8>,
-        caps: Vec<OwnedCap>,
-        e: usize,
-    },
-    /// No match here: copy one subject byte and advance.
-    SkipChar,
-    /// End of subject: stop.
-    End,
-}
-
-/// Async `gsub` for a table/function `repl`. Mirrors `gsub_string`'s loop but
-/// resolves each replacement by re-entering the VM (`seq.call` for a function,
-/// a `__index`-honoring index for a table).
-async fn gsub_run(
-    seq: &mut AsyncSequence,
-    src: Vec<u8>,
-    pat: Vec<u8>,
-    repl: Repl,
-    max_n: i64,
-) -> Result<(StashedValue, i64), StashedError> {
-    let anchor = pat.first() == Some(&b'^');
-    let pat_off = if anchor { 1 } else { 0 };
-    let is_func = matches!(repl, Repl::Func(_));
-
-    let mut out: Vec<u8> = Vec::new();
-    let mut pos = 0usize;
-    let mut lastmatch: Option<usize> = None;
-    let mut count: i64 = 0;
-
-    while count < max_n {
-        // Synchronous matching block — `MatchState` lives and dies here, so its
-        // borrow of `src`/`pat` never crosses the awaits below.
-        let step: Result<GsubStep, PatError> = (|| {
-            let mut ms = MatchState::new(&src, &pat[pat_off..]);
-            match ms.match_at(pos)? {
-                Some(e) if Some(e) != lastmatch => {
-                    // Function: all captures as call args. Table: just the
-                    // first capture (whole match if there are no captures).
-                    let n = if is_func { ms.num_captures(true) } else { 1 };
-                    let mut caps = Vec::with_capacity(n);
-                    for i in 0..n {
-                        caps.push(match ms.get_onecapture(i, pos, e)? {
-                            CapValue::Str { start, end } => {
-                                OwnedCap::Bytes(src[start..end].to_vec())
-                            }
-                            CapValue::Pos(p) => OwnedCap::Pos(p),
-                        });
-                    }
-                    Ok(GsubStep::Replace {
-                        whole: src[pos..e].to_vec(),
-                        caps,
-                        e,
-                    })
-                }
-                _ => Ok(if pos < src.len() {
-                    GsubStep::SkipChar
-                } else {
-                    GsubStep::End
-                }),
-            }
-        })();
-
-        match step.map_err(|e| stash_pat_err(seq, e))? {
-            GsubStep::Replace { whole, caps, e } => {
-                count += 1;
-                let res = match &repl {
-                    Repl::Func(f) => call_func_repl(seq, f, &caps).await?,
-                    Repl::Table(t) => table_index_repl(seq, t, &caps[0]).await?,
-                };
-                match res {
-                    ReplResult::Keep => out.extend_from_slice(&whole),
-                    ReplResult::Bytes(b) => out.extend_from_slice(&b),
-                }
-                pos = e;
-                lastmatch = Some(e);
-            }
-            GsubStep::SkipChar => {
-                out.push(src[pos]);
-                pos += 1;
-            }
-            GsubStep::End => break,
-        }
-        if anchor {
-            break;
-        }
-    }
-    out.extend_from_slice(&src[pos..]);
-
-    let result = seq.enter(|ctx, locals, _exec, _stack| {
-        locals.stash(ctx.mutation(), Value::string(LuaString::new(ctx, &out)))
-    });
-    Ok((result, count))
-}
-
-/// Call a function `repl` with the captures as arguments and classify its
-/// first result.
-async fn call_func_repl(
-    seq: &mut AsyncSequence,
-    f: &StashedFunction,
-    caps: &[OwnedCap],
-) -> Result<ReplResult, StashedError> {
-    seq.enter(|ctx, _locals, _exec, mut stack| {
-        stack.clear();
-        for c in caps {
-            stack.push(c.to_value(ctx));
-        }
-    });
-    seq.call(f, 0).await?;
-    seq.try_enter(|ctx, _locals, _exec, stack| classify_repl_result(ctx, stack.get(0)))
-}
-
-/// Index a table `repl` by `key` (honoring `__index`, which may itself be a
-/// function requiring a call) and classify the result.
-async fn table_index_repl(
-    seq: &mut AsyncSequence,
-    t: &StashedTable,
-    key: &OwnedCap,
-) -> Result<ReplResult, StashedError> {
-    enum Plan {
-        Resolved(ReplResult),
-        CallIndex(StashedFunction),
-    }
-    let plan = seq.try_enter(|ctx, locals, _exec, mut stack| {
-        let tbl = locals.fetch(ctx.mutation(), t);
-        let key_val = key.to_value(ctx);
-        let v = tbl.raw_get(key_val);
-        if !v.is_nil() {
-            return Ok(Plan::Resolved(classify_repl_result(ctx, v)?));
-        }
-        match walk_index_chain(ctx, Value::table(tbl), key_val) {
-            IndexChain::Resolved(rv) => Ok(Plan::Resolved(classify_repl_result(ctx, rv)?)),
-            IndexChain::Invoke { func, receiver } => {
-                stack.replace(&[receiver, key_val]);
-                Ok(Plan::CallIndex(locals.stash(ctx.mutation(), func)))
-            }
-            IndexChain::NotIndexable(v) => Err(Error::from_str(
-                ctx,
-                &format!("attempt to index a {} value", v.type_name()),
-            )),
-            IndexChain::Exhausted => Err(Error::from_str(
-                ctx,
-                "'__index' chain too long; possible loop",
-            )),
-        }
-    })?;
-    match plan {
-        Plan::Resolved(r) => Ok(r),
-        Plan::CallIndex(f) => {
-            seq.call(&f, 0).await?;
-            seq.try_enter(|ctx, _locals, _exec, stack| classify_repl_result(ctx, stack.get(0)))
-        }
-    }
-}
-
-/// Classify a function/table replacement result: nil/false keeps the original;
-/// a string or number substitutes; anything else is an error (matching PUC's
-/// `lua_isstring` test, which accepts numbers).
-fn classify_repl_result<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> Result<ReplResult, Error<'gc>> {
-    if v.is_falsy() {
-        Ok(ReplResult::Keep)
-    } else if let Some(s) = util::to_lstring(ctx, v) {
-        Ok(ReplResult::Bytes(s.as_bytes().to_vec()))
-    } else {
-        Err(Error::from_str(
-            ctx,
-            &format!("invalid replacement value (a {})", v.type_name()),
-        ))
-    }
-}
-
-/// Convert a matcher `PatError` into a `StashedError` from inside a sequence.
-fn stash_pat_err(seq: &mut AsyncSequence, e: PatError) -> StashedError {
-    seq.try_enter(|ctx, _locals, _exec, _stack| Result::<(), _>::Err(pat_err(ctx, e)))
-        .unwrap_err()
 }
 
 /// `len(s)` — number of bytes in `s`.

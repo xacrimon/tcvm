@@ -2,16 +2,13 @@
 //! stringification and small argument-coercion routines used across the
 //! `basic`, `string`, `table`, and `io` libraries.
 
-use std::pin::Pin;
-
 use crate::builtin::strfmt_num;
-use crate::dmm::{Collect, Gc, Mutation, Trace};
+use crate::dmm::{Gc, Mutation};
 use crate::env::{Error, Function, LuaString, MetamethodBits, NativeClosure, Stack, Table, Value};
-use crate::lua::{Context, StashedError};
-use crate::vm::async_sequence::AsyncSequence;
+use crate::lua::Context;
+use crate::vm::async_native::{AsyncError, Cx};
 use crate::vm::debug::object_type_name;
 use crate::vm::interp::{IndexChain, NewIndexChain, walk_index_chain, walk_newindex_chain};
-use crate::vm::sequence::{Execution, Sequence, SequencePoll};
 
 /// Append the canonical Lua textual form of an integer.
 pub(crate) fn push_int(out: &mut Vec<u8>, i: i64) {
@@ -208,29 +205,24 @@ pub(crate) fn to_pointer(v: Value<'_>) -> Option<*const ()> {
     })
 }
 
-/// `luaL_tolstring` of the value at stack index `i`, calling its `__tostring`
-/// with the stack from `bottom` (above `i`) up.
-pub(crate) async fn tolstring(
-    seq: &mut AsyncSequence,
-    i: usize,
-    bottom: usize,
-) -> Result<Vec<u8>, StashedError> {
-    let mm = seq.enter(|ctx, locals, _exec, mut stack| {
+/// `luaL_tolstring` of the value at window index `i`, calling its
+/// `__tostring` with the window from `bottom` (above `i`) up.
+pub(crate) async fn tolstring(cx: &Cx, i: usize, bottom: usize) -> Result<Vec<u8>, AsyncError> {
+    let call = cx.enter(|ctx, mut stack| {
         let v = stack.get(i);
         let mm = ctx.mm_of(v, MetamethodBits::TOSTRING);
         if mm.is_nil() {
             return Err(basic_tostring(ctx, v).as_bytes().to_vec());
         }
         stack.truncate(bottom);
-        stack.push(v);
-        Ok(locals.stash(ctx.mutation(), mm))
+        stack.extend([mm, v]);
+        Ok(())
     });
-    let mm = match mm {
-        Ok(mm) => mm,
-        Err(bytes) => return Ok(bytes),
-    };
-    seq.call(&mm, bottom).await?;
-    seq.try_enter(|ctx, _locals, _exec, mut stack| {
+    if let Err(bytes) = call {
+        return Ok(bytes);
+    }
+    cx.call(bottom).await;
+    cx.try_enter(|ctx, stack| {
         let r = stack.get(bottom);
         stack.truncate(bottom);
         Ok(tostring_result(ctx, r)?.as_bytes().to_vec())
@@ -239,87 +231,38 @@ pub(crate) async fn tolstring(
 
 /// A `__tostring` result as `luaL_tolstring` accepts it: a string, or a number
 /// converted to one.
-fn tostring_result<'gc>(ctx: Context<'gc>, r: Value<'gc>) -> Result<LuaString<'gc>, Error<'gc>> {
+pub(crate) fn tostring_result<'gc>(
+    ctx: Context<'gc>,
+    r: Value<'gc>,
+) -> Result<LuaString<'gc>, Error<'gc>> {
     if r.get_string().is_none() && r.get_integer().is_none() && !r.is_float() {
         return Err(Error::from_str(ctx, "'__tostring' must return a string"));
     }
     Ok(basic_tostring(ctx, r))
 }
 
-/// Follow-up for a `Call` of a `__tostring` metamethod: its first result,
-/// checked and converted by [`tostring_result`].
-pub(crate) struct ToStringResult;
-
-unsafe impl<'gc> Collect<'gc> for ToStringResult {
-    const NEEDS_TRACE: bool = false;
-}
-
-impl<'gc> Sequence<'gc> for ToStringResult {
-    fn trace_pointers(&self, _cc: &mut dyn Trace<'gc>) {}
-
-    fn poll(
-        self: Pin<&mut Self>,
-        ctx: Context<'gc>,
-        _exec: Execution<'gc>,
-        mut stack: Stack<'gc, '_>,
-    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
-        let s = tostring_result(ctx, stack.get(0))?;
-        stack.ret1(Value::string(s));
-        Ok(SequencePoll::Return)
-    }
-}
-
-/// Follow-up for a `Call` that adjusts the callee's results to exactly `.0`
-/// values, as `lua_call(L, nargs, n)` does.
-pub(crate) struct AdjustResults(pub(crate) usize);
-
-unsafe impl<'gc> Collect<'gc> for AdjustResults {
-    const NEEDS_TRACE: bool = false;
-}
-
-impl<'gc> Sequence<'gc> for AdjustResults {
-    fn trace_pointers(&self, _cc: &mut dyn Trace<'gc>) {}
-
-    fn poll(
-        self: Pin<&mut Self>,
-        _ctx: Context<'gc>,
-        _exec: Execution<'gc>,
-        mut stack: Stack<'gc, '_>,
-    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
-        stack.truncate(self.0);
-        while stack.len() < self.0 {
-            stack.push(Value::nil());
-        }
-        Ok(SequencePoll::Return)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Metamethod-aware access for async natives (`lua_geti`, `lua_getfield`,
 // `lua_seti`, `lua_setfield`, `luaL_len`). Values move through the native's
-// stack window, as in the C API.
+// window, as in the C API.
 // ---------------------------------------------------------------------------
 
-/// `lua_geti`: push `stack[idx][i]`, going through `__index`.
-pub(crate) async fn geti(seq: &mut AsyncSequence, idx: usize, i: i64) -> Result<(), StashedError> {
-    get(seq, idx, |ctx| Value::integer(ctx.mutation(), i)).await
+/// `lua_geti`: push `window[idx][i]`, going through `__index`.
+pub(crate) async fn geti(cx: &Cx, idx: usize, i: i64) -> Result<(), AsyncError> {
+    get(cx, idx, |ctx| Value::integer(ctx.mutation(), i)).await
 }
 
-/// `lua_getfield`: push `stack[idx][k]`, going through `__index`.
-pub(crate) async fn getfield(
-    seq: &mut AsyncSequence,
-    idx: usize,
-    k: &[u8],
-) -> Result<(), StashedError> {
-    get(seq, idx, |ctx| Value::string(LuaString::new(ctx, k))).await
+/// `lua_getfield`: push `window[idx][k]`, going through `__index`.
+pub(crate) async fn getfield(cx: &Cx, idx: usize, k: &[u8]) -> Result<(), AsyncError> {
+    get(cx, idx, |ctx| Value::string(LuaString::new(ctx, k))).await
 }
 
 async fn get(
-    seq: &mut AsyncSequence,
+    cx: &Cx,
     idx: usize,
     key: impl for<'gc> FnOnce(Context<'gc>) -> Value<'gc>,
-) -> Result<(), StashedError> {
-    let call = seq.try_enter(|ctx, locals, _exec, mut stack| {
+) -> Result<(), AsyncError> {
+    let call = cx.try_enter(|ctx, stack| {
         let t = stack.get(idx);
         let key = key(ctx);
         if let Some(tbl) = t.get_table() {
@@ -335,10 +278,9 @@ async fn get(
                 Ok(None)
             }
             IndexChain::Invoke { func, receiver } => {
-                let bottom = stack.len();
-                stack.push(receiver);
-                stack.push(key);
-                Ok(Some((locals.stash(ctx.mutation(), func), bottom)))
+                let at = stack.len();
+                stack.extend([Value::function(func), receiver, key]);
+                Ok(Some(at))
             }
             IndexChain::NotIndexable(v) => Err(index_error(ctx, v)),
             IndexChain::Exhausted => Err(runtime_error(
@@ -347,11 +289,11 @@ async fn get(
             )),
         }
     })?;
-    if let Some((f, bottom)) = call {
-        seq.call(&f, bottom).await?;
-        seq.enter(|_ctx, _locals, _exec, mut stack| {
-            stack.truncate(bottom + 1);
-            if stack.len() == bottom {
+    if let Some(at) = call {
+        cx.call(at).await;
+        cx.enter(|_, mut stack| {
+            stack.truncate(at + 1);
+            if stack.len() == at {
                 stack.push(Value::nil());
             }
         });
@@ -359,31 +301,27 @@ async fn get(
     Ok(())
 }
 
-/// `lua_seti`: pop the top value into `stack[idx][i]`, going through
+/// `lua_seti`: pop the top value into `window[idx][i]`, going through
 /// `__newindex`.
-pub(crate) async fn seti(seq: &mut AsyncSequence, idx: usize, i: i64) -> Result<(), StashedError> {
-    set(seq, idx, |ctx| Value::integer(ctx.mutation(), i)).await
+pub(crate) async fn seti(cx: &Cx, idx: usize, i: i64) -> Result<(), AsyncError> {
+    set(cx, idx, |ctx| Value::integer(ctx.mutation(), i)).await
 }
 
-/// `lua_setfield`: pop the top value into `stack[idx][k]`, going through
+/// `lua_setfield`: pop the top value into `window[idx][k]`, going through
 /// `__newindex`.
-pub(crate) async fn setfield(
-    seq: &mut AsyncSequence,
-    idx: usize,
-    k: &[u8],
-) -> Result<(), StashedError> {
-    set(seq, idx, |ctx| Value::string(LuaString::new(ctx, k))).await
+pub(crate) async fn setfield(cx: &Cx, idx: usize, k: &[u8]) -> Result<(), AsyncError> {
+    set(cx, idx, |ctx| Value::string(LuaString::new(ctx, k))).await
 }
 
 async fn set(
-    seq: &mut AsyncSequence,
+    cx: &Cx,
     idx: usize,
     key: impl for<'gc> FnOnce(Context<'gc>) -> Value<'gc>,
-) -> Result<(), StashedError> {
-    let call = seq.try_enter(|ctx, locals, _exec, mut stack| {
+) -> Result<(), AsyncError> {
+    let call = cx.try_enter(|ctx, stack| {
         let t = stack.get(idx);
         let v = stack.pop();
-        let top = stack.len();
+        let at = stack.len();
         let key = key(ctx);
         // Tables without `__newindex` skip `walk_newindex_chain`, which would
         // look the key up first for nothing.
@@ -399,8 +337,8 @@ async fn set(
                 Ok(None)
             }
             NewIndexChain::Invoke { func, receiver } => {
-                stack.extend([receiver, key, v]);
-                Ok(Some((locals.stash(ctx.mutation(), func), top)))
+                stack.extend([Value::function(func), receiver, key, v]);
+                Ok(Some(at))
             }
             NewIndexChain::NotIndexable(v) => Err(index_error(ctx, v)),
             NewIndexChain::Exhausted => Err(runtime_error(
@@ -409,16 +347,16 @@ async fn set(
             )),
         }
     })?;
-    if let Some((f, bottom)) = call {
-        seq.call(&f, bottom).await?;
-        seq.enter(|_ctx, _locals, _exec, mut stack| stack.truncate(bottom));
+    if let Some(at) = call {
+        cx.call(at).await;
+        cx.enter(|_, mut stack| stack.truncate(at));
     }
     Ok(())
 }
 
-/// `luaL_len`: `#stack[idx]` through `__len`, which must give an integer.
-pub(crate) async fn len(seq: &mut AsyncSequence, idx: usize) -> Result<i64, StashedError> {
-    let call = seq.try_enter(|ctx, locals, _exec, mut stack| {
+/// `luaL_len`: `#window[idx]` through `__len`, which must give an integer.
+pub(crate) async fn len(cx: &Cx, idx: usize) -> Result<i64, AsyncError> {
+    let call = cx.try_enter(|ctx, stack| {
         let v = stack.get(idx);
         if let Some(s) = v.get_string() {
             return Ok(Err(s.len() as i64));
@@ -436,18 +374,18 @@ pub(crate) async fn len(seq: &mut AsyncSequence, idx: usize) -> Result<i64, Stas
                 )),
             };
         }
-        let bottom = stack.len();
-        stack.extend([v, v]);
-        Ok(Ok((locals.stash(ctx.mutation(), mm), bottom)))
+        let at = stack.len();
+        stack.extend([mm, v, v]);
+        Ok(Ok(at))
     })?;
-    let (mm, bottom) = match call {
-        Ok(call) => call,
+    let at = match call {
+        Ok(at) => at,
         Err(n) => return Ok(n),
     };
-    seq.call(&mm, bottom).await?;
-    seq.try_enter(|ctx, _locals, _exec, mut stack| {
-        let r = stack.get(bottom);
-        stack.truncate(bottom);
+    cx.call(at).await;
+    cx.try_enter(|ctx, stack| {
+        let r = stack.get(at);
+        stack.truncate(at);
         to_integer(r).ok_or_else(|| Error::from_str(ctx, "object length is not an integer"))
     })
 }
