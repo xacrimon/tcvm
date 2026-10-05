@@ -54,6 +54,33 @@ return table.concat(out, ' ')
     assert_eq!(ok(src), "fx nil fx nil dict nil");
 }
 
+/// Metamethods stored through one site, first into a plain table and then
+/// into a metatable of the same shape: each store must reach the metatable's
+/// cache, so the site never caches them.
+#[test]
+fn metamethod_stores_from_a_shared_site() {
+    let src = r#"
+local out = {}
+local function set_index(t, v) t.__index = v end
+local function set_newindex(t, f) t.__newindex = f end
+local a, b = {}, {}
+set_index(a, {y = 1})
+set_index(b, {y = 2})
+set_newindex(a, print)
+local o = setmetatable({}, b)
+out[#out + 1] = o.y
+set_index(b, {y = 3})
+out[#out + 1] = o.y
+set_index(b, nil)
+out[#out + 1] = tostring(o.y)
+set_newindex(b, function(t, k, v) rawset(t, k, v * 10) end)
+o.z = 1
+out[#out + 1] = o.z
+return table.concat(out, ' ')
+"#;
+    assert_eq!(ok(src), "2 3 nil 10");
+}
+
 /// A cached absent key stops reading nil once `__index` appears in place,
 /// the metatable is replaced, the key is added, or the table goes dict.
 #[test]
