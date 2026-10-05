@@ -134,6 +134,8 @@ const HANDLERS: [Handler; Op::COUNT] = Op::table([
     (Op::GETUPVAL_REF, op_getupval_ref),
     (Op::GETTABUP_REF, op_gettabup_ref),
     (Op::SETTABUP_REF, op_settabup_ref),
+    (Op::CALL_R0, op_call_r0),
+    (Op::CALL_R1, op_call_r1),
 ]);
 
 /// Why an opcode faulted. `impl_error` renders the reference message for
@@ -2900,53 +2902,55 @@ macro_rules! call_lua {
 /// Only the plain-function cases live here: a Lua closure is entered inline,
 /// a native one jumps to its `entry`, and anything
 /// that needs the `__call` chain goes to `op_call_meta`. Keeping every call
-/// out of this handler keeps it frameless.
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn op_call<'gc>(
-    instruction: Instruction,
-    ctx: Context<'gc>,
-    thread: &mut ThreadState<'gc>,
-    mut registers: Registers<'gc, '_>,
-    mut ip: *const Instruction,
-    handlers: *const (),
-    ds: &mut DispatchState<'gc>,
-    frame: *mut LuaFrame<'gc>,
-    closure: LuaFn<'gc>,
-) -> Exit {
-    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
-    let (func, nargs, returns) = instruction.abc();
-    if let Some(f) = reg!(func).get_function() {
-        match f.inner().as_ref() {
-            FunctionKind::Lua(target) => {
-                let func_idx = unsafe { (*frame).base() } + func as usize;
-                let needed = func_idx + 1 + target.max_stack_size as usize;
-                if std::hint::unlikely(thread.call_limit < needed) {
-                    tail!(op_call_grow);
+/// out of this handler keeps it frameless. `$ret` is the callee's
+/// continuation.
+macro_rules! call_handler {
+    ($name:ident, $ret:expr) => {
+        #[inline(never)]
+        #[rustc_align(32)]
+        extern "rust-preserve-none" fn $name<'gc>(
+            instruction: Instruction,
+            ctx: Context<'gc>,
+            thread: &mut ThreadState<'gc>,
+            mut registers: Registers<'gc, '_>,
+            mut ip: *const Instruction,
+            handlers: *const (),
+            ds: &mut DispatchState<'gc>,
+            frame: *mut LuaFrame<'gc>,
+            closure: LuaFn<'gc>,
+        ) -> Exit {
+            helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+            let (func, nargs, returns) = instruction.abc();
+            if let Some(f) = reg!(func).get_function() {
+                match f.inner().as_ref() {
+                    FunctionKind::Lua(target) => {
+                        let func_idx = unsafe { (*frame).base() } + func as usize;
+                        let needed = func_idx + 1 + target.max_stack_size as usize;
+                        if std::hint::unlikely(thread.call_limit < needed) {
+                            tail!(op_call_grow);
+                        }
+                        let callee = unsafe { LuaFn::from_function_unchecked(f) };
+                        let ret: Handler = $ret(handlers, returns);
+                        call_lua!(
+                            nogrow, callee, func_idx, nargs, ret, thread, registers, ip, frame,
+                            closure
+                        );
+                    }
+                    FunctionKind::Native(nc) => {
+                        ds.native = nc;
+                        let entry = nc.entry;
+                        tail!(entry);
+                    }
                 }
-                let callee = unsafe { LuaFn::from_function_unchecked(f) };
-                call_lua!(
-                    nogrow,
-                    callee,
-                    func_idx,
-                    nargs,
-                    call_ret_at(handlers, returns),
-                    thread,
-                    registers,
-                    ip,
-                    frame,
-                    closure
-                );
             }
-            FunctionKind::Native(nc) => {
-                ds.native = nc;
-                let entry = nc.entry;
-                tail!(entry);
-            }
+            tail!(op_call_meta);
         }
-    }
-    tail!(op_call_meta);
+    };
 }
+
+call_handler!(op_call, call_ret_at);
+call_handler!(op_call_r0, |_, _| ret_call0 as Handler);
+call_handler!(op_call_r1, |_, _| ret_call1 as Handler);
 
 /// CALL of a Lua closure that needs the value stack or the frame stack grown
 /// first. Grows both (the only thing `op_call` cannot do without a stack

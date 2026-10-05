@@ -15,10 +15,10 @@ expression: output
 0002  [  2]  NEWTABLE        R1 T0  ; {} items=2
 0003  [  2]  MOVE            R2 R0
 0004  [  2]  LOAD            R3 K0  ; 1
-0005  [  2]  CALL            R2 args=2 ret=2
+0005  [  2]  CALL_R1         R2 args=2
 0006  [  2]  MOVE            R3 R0
 0007  [  2]  LOAD            R4 K1  ; 2
-0008  [  2]  CALL            R3 args=2 ret=2
+0008  [  2]  CALL_R1         R3 args=2
 0009  [  2]  MOVE            R4 R0
 0010  [  2]  LOAD            R5 K2  ; 3
 0011  [  2]  CALL            R4 args=2 ret=0

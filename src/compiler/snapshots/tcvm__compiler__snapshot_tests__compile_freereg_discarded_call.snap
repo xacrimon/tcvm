@@ -12,9 +12,9 @@ expression: output
 0000  [  1]  VARARGPREP      fixed=0
 0001  [  1]  CLOSURE         R0 P0
 0002  [  2]  MOVE            R1 R0
-0003  [  2]  CALL            R1 args=1 ret=1
+0003  [  2]  CALL_R0         R1 args=1
 0004  [  2]  MOVE            R1 R0
-0005  [  2]  CALL            R1 args=1 ret=1
+0005  [  2]  CALL_R0         R1 args=1
 0006  [  3]  LOAD            R1 K0  ; 1
 0007  [  3]  LOAD            R2 K1  ; 2
 0008  [  4]  NOT             R3 R1

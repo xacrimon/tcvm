@@ -12,5 +12,5 @@ expression: output
 0000  [  1]  VARARGPREP      fixed=0
 0001  [  2]  GETTABUP        R0 U0 K0  ; "print"
 0002  [  2]  LOAD            R1 K1  ; "hello"
-0003  [  2]  CALL            R0 args=2 ret=1
+0003  [  2]  CALL_R0         R0 args=2
 0004  [  2]  RETURN          R0 count=1

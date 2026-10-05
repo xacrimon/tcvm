@@ -113,7 +113,7 @@ expression: output
 0068  [116]  GETTABUP        R13 U0 K25  ; "arg"
 0069  [116]  LOAD            R14 K26  ; 1
 0070  [116]  GETTABLE        R13 R13 R14
-0071  [116]  CALL            R12 args=2 ret=2
+0071  [116]  CALL_R1         R12 args=2
 0072  [116]  TEST            R12 inv=true
 0073  [116]  JMP             +1
 0074  [116]  LOAD            R12 K27  ; 1000
@@ -128,7 +128,7 @@ expression: output
 0083  [120]  MOVE            R15 R11
 0084  [120]  MOVE            R16 R13
 0085  [120]  MOVE            R17 R14
-0086  [120]  CALL            R15 args=3 ret=1
+0086  [120]  CALL_R0         R15 args=3
 0087  [121]  GETTABUP        R15 U0 K28  ; "io"
 0088  [121]  GETFIELD        R15 R15 K29  ; "write"
 0089  [121]  GETTABUP        R16 U0 K30  ; "string"
@@ -138,9 +138,9 @@ expression: output
 0093  [121]  MOVE            R19 R13
 0094  [121]  MOVE            R20 R14
 0095  [121]  CALL            R18 args=3 ret=0
-0096  [121]  CALL            R16 args=0 ret=2
+0096  [121]  CALL_R1         R16 args=0
 0097  [121]  LOAD            R17 K33  ; "\n"
-0098  [121]  CALL            R15 args=3 ret=1
+0098  [121]  CALL_R0         R15 args=3
 0099  [122]  LOAD            R15 K26  ; 1
 0100  [122]  MOVE            R16 R12
 0101  [122]  LOAD            R17 K26  ; 1
@@ -149,7 +149,7 @@ expression: output
 0104  [122]  MOVE            R20 R13
 0105  [122]  MOVE            R21 R14
 0106  [122]  LOAD            R22 K34  ; 0.01
-0107  [122]  CALL            R19 args=4 ret=1
+0107  [122]  CALL_R0         R19 args=4
 0108  [122]  FORLOOP         R15 -6
 0109  [123]  GETTABUP        R15 U0 K28  ; "io"
 0110  [123]  GETFIELD        R15 R15 K29  ; "write"
@@ -160,9 +160,9 @@ expression: output
 0115  [123]  MOVE            R19 R13
 0116  [123]  MOVE            R20 R14
 0117  [123]  CALL            R18 args=3 ret=0
-0118  [123]  CALL            R16 args=0 ret=2
+0118  [123]  CALL_R1         R16 args=0
 0119  [123]  LOAD            R17 K33  ; "\n"
-0120  [123]  CALL            R15 args=3 ret=1
+0120  [123]  CALL_R0         R15 args=3
 0121  [123]  RETURN          R0 count=1
 
 ; prototype 0:
@@ -208,7 +208,7 @@ expression: output
   0026  [ 62]  ADD             R24 R24 R25
   0027  [ 62]  MUL             R25 R22 R22
   0028  [ 62]  ADD             R24 R24 R25
-  0029  [ 62]  CALL            R23 args=2 ret=2
+  0029  [ 62]  CALL_R1         R23 args=2
   0030  [ 63]  MUL             R24 R23 R23
   0031  [ 63]  MUL             R24 R24 R23
   0032  [ 63]  DIV             R24 R2 R24
@@ -314,7 +314,7 @@ expression: output
   0035  [ 94]  ADD             R21 R21 R22
   0036  [ 94]  MUL             R22 R19 R19
   0037  [ 94]  ADD             R21 R21 R22
-  0038  [ 94]  CALL            R20 args=2 ret=2
+  0038  [ 94]  CALL_R1         R20 args=2
   0039  [ 95]  GETFIELD        R21 R16 K5  ; "mass"
   0040  [ 95]  MUL             R21 R11 R21
   0041  [ 95]  DIV             R21 R21 R20

@@ -30,7 +30,7 @@ expression: output
 0011  [  4]  GETTABUP        R2 U0 K4  ; "print"
 0012  [  4]  GETTABUP        R3 U0 K2  ; "p"
 0013  [  4]  GETTABUP        R4 U0 K3  ; "q"
-0014  [  4]  CALL            R2 args=3 ret=1
+0014  [  4]  CALL_R0         R2 args=3
 0015  [  5]  LOAD            R2 K7  ; "A"
 0016  [  5]  LOAD            R3 K8  ; "B"
 0017  [  5]  SETTABUP        R3 U0 K6  ; "b"
