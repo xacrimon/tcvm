@@ -330,6 +330,13 @@ impl Instruction {
         self.0
     }
 
+    /// A word that is no instruction: the interpreter passes a return's
+    /// value count to a continuation in the instruction register.
+    #[inline(always)]
+    pub(crate) const fn from_raw(raw: u64) -> Self {
+        Instruction(raw)
+    }
+
     // --- slot reads -------------------------------------------------------
     //
     // Deliberately unchecked against the opcode: a handler reached through

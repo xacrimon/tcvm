@@ -7,7 +7,7 @@ use crate::env::error::Error;
 use crate::env::function::{LuaFn, Upvalue};
 use crate::env::value::Value;
 use crate::lua::Context;
-use crate::vm::interp::Continuation;
+use crate::vm::interp::Handler;
 use crate::vm::sequence::{BoxSequence, Suspend};
 
 /// Copy wrapper stored in Value.
@@ -38,75 +38,72 @@ pub enum ThreadStatus {
     Result { bottom: usize },
 }
 
-/// A Lua bytecode frame on a thread's frame stack. Only Lua function
-/// execution pushes one of these; native callbacks that don't suspend run
-/// inline within the calling Lua frame.
+/// A frame on a thread's frame stack: a Lua function's, or a native's that
+/// called back into Lua and waits for the results (`NATIVE`).
+///
+/// Every frame says where its results go: `ret`, run when it returns, with the
+/// frame below on top again. A call site picks it (CALL, a metamethod or
+/// iterator, the executor), and it decodes what it needs from its own
+/// instruction, LuaJIT Remake style.
 #[derive(Clone, Copy, Collect)]
 #[collect(internal, no_drop)]
 pub struct LuaFrame<'gc> {
     pub(crate) closure: LuaFn<'gc>,
-    /// Read through `base()`. 32 bits: a frame sits inside the stack, and
-    /// every growth of the stack goes through `grow_slots`, which keeps it
-    /// below 2^32 slots.
-    pub(crate) base: u32,
     /// Resume address: points *past* the instruction being executed, into
     /// `closure.proto.code` (which the frame keeps alive). A raw pointer
     /// rather than an index so CALL saves it with one store.
     #[collect(require_static)]
     pub(crate) pc: *const crate::instruction::Instruction,
-    pub(crate) num_results: u8,
-    /// `frame_flags` bits. Zero means RETURN can take its fast path: fixed
-    /// results land in a Lua caller with nothing to close and no continuation.
+    /// Where this frame's results go; see [`ret_args`](crate::vm::interp).
+    #[collect(require_static)]
+    pub(crate) ret: Handler,
+    /// Read through `base()`. 32 bits: a frame sits inside the stack, and
+    /// every growth of the stack goes through `grow_slots`, which keeps it
+    /// below 2^32 slots.
+    pub(crate) base: u32,
+    /// Caller-supplied args beyond `num_params`; the below-base region is
+    /// `stack[base - num_extras .. base]`. Set by `VARARGPREP`, else 0. Fits:
+    /// a frame's window ends below `MAX_STACK`.
+    pub(crate) num_extras: u16,
+    /// `frame_flags` bits. Zero means RETURN can jump straight to `ret`.
     /// Mostly left set once the hazard is gone (a stale bit just costs the slow
     /// path); a slow TAILCALL clears `OPEN_UPVALUES` after closing them.
     pub(crate) flags: u8,
-    /// Caller-supplied args beyond `num_params`; the below-base region is
-    /// `stack[base - num_extras .. base]`. Set by `VARARGPREP`, else 0.
-    pub(crate) num_extras: u32,
-    /// Fixup dispatched by `op_return` when this frame unwinds. `None` for
-    /// normal calls; set by metamethod/iterator helpers that need
-    /// post-return processing.
-    #[collect(require_static)]
-    pub(crate) continuation: Option<Continuation>,
 }
 
 /// Stack-window metadata threaded through every suspension point.
 ///
 /// - `bottom` is the callback's `args_base` — `stack[bottom..]` is the
 ///   active window (yielded values, sequence args, etc.).
-/// - `func_idx == bottom - 1` (typically) is where the original Lua CALL
-///   expects results to land.
-/// - `returns` is the CALL instruction's `returns` field (0 = "all").
+/// - `func_idx` is the call's function slot, below `bottom`.
+/// - `ret` takes the results once they are in: the continuation of the call
+///   site, as a returning frame's `ret` would.
 ///
 /// Stored on `ExecKind::Sequence`, `ExecKind::WaitThread`, `PendingAction`,
 /// and as the yielded-state stash on `ThreadState`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct CallSite {
     pub bottom: usize,
     pub func_idx: usize,
-    pub returns: u8,
-    /// Set only when this call site backs a continuation-driven native
-    /// metamethod/iterator (`schedule_meta_call`) that suspended. On result
-    /// delivery the executor applies this `Continuation`'s payload against the
-    /// caller frame (`apply_native_continuation`) instead of the plain
-    /// `func_idx`/`returns` landing — this is how a suspended native target
-    /// replays `StoreResult`/`CondJump`/`TForCall`/`IgnoreResult`, since it
-    /// has no Lua frame to park the continuation on. `None` for ordinary
-    /// calls, where `func_idx`/`returns` drive the landing.
-    pub(crate) cont: Option<Continuation>,
+    pub(crate) ret: Handler,
+}
+
+/// A call site's results, waiting for the next `run_thread` to hand them to
+/// `ret` (see `CallSite`): `stack[values..top]`, the call's function at
+/// `func_slot`.
+#[derive(Clone, Copy)]
+pub(crate) struct PendingRet {
+    pub(crate) ret: Handler,
+    pub(crate) func_slot: usize,
+    pub(crate) values: usize,
 }
 
 /// Bits of `LuaFrame::flags`.
 pub mod frame_flags {
-    /// `continuation` is `Some`: RETURN must apply it (`op_return_cont` or
-    /// `cont_resume`).
-    pub const HAS_CONT: u8 = 1;
     /// A CLOSURE in this frame captured one of its locals; RETURN must close.
-    pub const OPEN_UPVALUES: u8 = 2;
+    pub const OPEN_UPVALUES: u8 = 1;
     /// A TBC in this frame registered a to-be-closed slot.
-    pub const TBC: u8 = 4;
-    /// The frame below is not a Lua frame, or there is none.
-    pub const PARENT_NON_LUA: u8 = 8;
+    pub const TBC: u8 = 2;
 }
 
 // Two records per cache line.
@@ -278,6 +275,9 @@ pub struct ThreadState<'gc> {
     /// pump. `None` between pumps. The interpreter never observes this (it
     /// leaves dispatch right after setting it).
     pub(crate) pending_action: Option<PendingAction<'gc>>,
+    /// Results the executor delivered to a call site; the next `run_thread`
+    /// starts by running its continuation.
+    pub(crate) pending_ret: Option<PendingRet>,
     /// Where the thread's yielded values currently live. Set when the
     /// thread suspends via a `Yield` action (or a sequence's
     /// `SequencePoll::Yield`/`TailYield`). Consumed on resume to recover
@@ -474,6 +474,7 @@ impl<'gc> ThreadState<'gc> {
         self.tbc_list.clear();
         self.no_yield = false;
         self.pending_action = None;
+        self.pending_ret = None;
         self.yield_bottom = None;
         self.death_error = None;
         self.stack_limit = STACK_LIMIT;
@@ -519,14 +520,11 @@ impl<'gc> ThreadState<'gc> {
     /// slot: `op_return` locates it as `base - 1 - num_extras` (VARARGPREP
     /// later shifts `base` up by `num_extras`), which wraps for `base == 0`.
     #[inline]
-    pub(crate) fn push_lua(&mut self, mut lf: LuaFrame<'gc>) {
+    pub(crate) fn push_lua(&mut self, lf: LuaFrame<'gc>) {
         debug_assert!(
             lf.base() >= 1,
             "Lua frame base must leave room for the function slot"
         );
-        if !self.top_is_lua() {
-            lf.flags |= frame_flags::PARENT_NON_LUA;
-        }
         if self.frames.len() == self.frames.capacity() {
             self.grow_frames();
         }
@@ -539,8 +537,7 @@ impl<'gc> ThreadState<'gc> {
         self.frames.reserve(1);
     }
 
-    /// `push_lua` for the interpreter: room already made (`reserve_frames`) and
-    /// the parent is the running Lua frame, so `flags` is stored as given.
+    /// `push_lua` for the interpreter, room already made (`reserve_frames`).
     ///
     /// # Safety
     /// `frames.len() < frames.capacity()`, and the innermost frame is a Lua frame.
@@ -704,6 +701,7 @@ impl<'gc> Thread<'gc> {
             top: 0,
             thread_handle: None,
             pending_action: None,
+            pending_ret: None,
             yield_bottom: None,
             death_error: None,
             stack_limit: STACK_LIMIT,
