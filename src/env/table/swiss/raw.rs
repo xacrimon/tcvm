@@ -385,12 +385,12 @@ impl<T: Copy, A: Allocator> RawTable<T, A> {
         }
     }
 
-    /// The first live entry at bucket `from` or later.
+    /// The first live entry at bucket `from` or later, and its bucket.
     #[inline]
-    pub(crate) fn next_full(&self, from: usize) -> Option<&T> {
+    pub(crate) fn next_full(&self, from: usize) -> Option<(usize, &T)> {
         let index = self.table.next_full_scalar(from)?;
         // SAFETY: `next_full_scalar` returns full buckets.
-        Some(unsafe { self.bucket(index).as_ref() })
+        Some((index, unsafe { self.bucket(index).as_ref() }))
     }
 
     /// Every live entry.

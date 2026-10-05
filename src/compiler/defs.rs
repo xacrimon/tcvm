@@ -230,6 +230,9 @@ pub struct Chunk<'gc> {
     /// upvalue descriptors (see `UpValueDescriptor::ParentLocal`) embed
     /// these register numbers and rely on their stability.
     pub(super) nactvar: u8,
+    /// How many of the `nactvar` locals are generic-`for` position slots,
+    /// which Lua's local-variable limit doesn't count (see `TFOR_VARS`).
+    pub(super) nposition: u8,
     /// Peak register count seen during compilation; becomes the prototype's
     /// `max_stack_size`.
     pub(super) max_stack: u8,
@@ -269,6 +272,7 @@ impl<'gc> Chunk<'gc> {
             upvalue_desc: Vec::new(),
             freereg: 0,
             nactvar: 0,
+            nposition: 0,
             max_stack: 0,
             arity: 0,
             is_vararg: false,

@@ -26,7 +26,7 @@ use crate::dmm::{Arena, Collect, DynamicRootSet, Gc, GcLock, Lock, Mutation};
 use crate::env::shape::{INLINE_CAPS, Shape};
 use crate::env::string::Interner;
 use crate::env::value::ValueKind;
-use crate::env::{Symbols, Table};
+use crate::env::{Function, Symbols, Table};
 
 /// Root object of the GC arena. Holds the globals table and the dynamic root
 /// set used to stash values across `enter` boundaries.
@@ -50,6 +50,10 @@ pub struct State<'gc> {
     /// Metatables shared by all values of a type that has no per-value one
     /// (PUC's `G(L)->mt`); see `type_metatable`.
     type_metatables: [GcLock<'gc, Option<Table<'gc>>>; 6],
+    /// The `next` that `pairs` returns, and the iterator `ipairs` does:
+    /// `TFORCALL` walks a table itself when its loop's iterator is one.
+    pub(crate) next: Function<'gc>,
+    pub(crate) ipairs_iter: Function<'gc>,
 }
 
 impl<'gc> State<'gc> {
@@ -104,6 +108,8 @@ impl Lua {
                 roots: DynamicRootSet::new(mc),
                 interner,
                 type_metatables: std::array::from_fn(|_| Gc::new(mc, Lock::new(None))),
+                next: Function::new_native(mc, builtin::lua_next, &[]),
+                ipairs_iter: Function::new_native(mc, builtin::ipairs_aux, &[]),
             }
         });
         let metrics = arena.metrics();

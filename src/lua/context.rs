@@ -49,6 +49,18 @@ impl<'gc> Context<'gc> {
         self.state.root_shapes[inline_bucket(n)]
     }
 
+    /// The `next` that `pairs` returns (see `State::next`).
+    #[inline]
+    pub(crate) fn next_fn(self) -> Function<'gc> {
+        self.state.next
+    }
+
+    /// The iterator `ipairs` returns (see `State::next`).
+    #[inline]
+    pub(crate) fn ipairs_iter(self) -> Function<'gc> {
+        self.state.ipairs_iter
+    }
+
     /// Dict-mode sentinel for tables with no metatable. Tables that
     /// migrate to dict mode while carrying a metatable use the
     /// per-`MtCache` sentinel instead.

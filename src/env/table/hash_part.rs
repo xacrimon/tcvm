@@ -120,12 +120,12 @@ pub(super) fn position<K: Key, A: Allocator>(
     table.position(hash, |e| e.key.same(key))
 }
 
-/// First live entry at bucket index `from` or later.
+/// First live entry at bucket index `from` or later, and its bucket.
 #[inline]
 pub(super) fn next_live<'a, 'gc, K: Key, A: Allocator>(
     table: &'a Part<'gc, K, A>,
     from: usize,
-) -> Option<&'a Entry<'gc, K>> {
+) -> Option<(usize, &'a Entry<'gc, K>)> {
     table.next_full(from)
 }
 
@@ -213,7 +213,7 @@ mod tests {
     fn is_live<K: Key>(t: &Part<'_, K, Global>, key: K) -> bool {
         position(t, key.hash(), key)
             .and_then(|p| next_live(t, p))
-            .is_some_and(|e| e.key.same(key))
+            .is_some_and(|(_, e)| e.key.same(key))
     }
 
     /// Freed addresses are reused at once with new content while dead entries
@@ -271,7 +271,9 @@ mod tests {
                         let from = cursor.map_or(0, |k: Addr| {
                             position(&t, k.hash(), k).expect("cursor lost") + 1
                         });
-                        let Some(&e) = next_live(&t, from) else { break };
+                        let Some((_, &e)) = next_live(&t, from) else {
+                            break;
+                        };
                         assert!(seen.insert(e.key.0), "step {step}: revisited a key");
                         if rand(32) == 0 {
                             set(&mut t, e.key.hash(), e.key, Value::nil());
@@ -323,7 +325,9 @@ mod tests {
             let (mut seen, mut cursor) = (HashSet::new(), None);
             loop {
                 let from = cursor.map_or(0, |k: i64| position(&t, k.hash(), k).unwrap() + 1);
-                let Some(&e) = next_live(&t, from) else { break };
+                let Some((_, &e)) = next_live(&t, from) else {
+                    break;
+                };
                 assert!(seen.insert(e.key), "{n}: revisited {}", e.key);
                 let at = position(&t, e.key.hash(), e.key);
                 match e.key % 3 {

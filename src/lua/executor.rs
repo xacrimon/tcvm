@@ -939,7 +939,7 @@ fn apply_native_continuation<'gc>(
         Continuation::TForCall { base: reg, count } => {
             // The loop's registers are in the caller's window, below the
             // results staged above it.
-            let dst = base + reg as usize + 3;
+            let dst = base + reg as usize + crate::instruction::TFOR_VARS as usize;
             debug_assert!(dst + count as usize <= bottom && bottom + retc <= ts.stack.len());
             let stack = ts.stack.as_mut_ptr();
             unsafe {

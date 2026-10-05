@@ -662,8 +662,9 @@ impl<'gc> TableState<'gc> {
         self.misc_hash_get(key, value_hash(key))
     }
 
+    /// The raw value at integer key `key`.
     #[inline]
-    fn get_int(&self, key: i64) -> Value<'gc> {
+    pub fn get_int(&self, key: i64) -> Value<'gc> {
         match usize::try_from(key).ok().and_then(|s| self.array_get(s)) {
             Some(v) => v,
             None => match self.aux() {
@@ -1051,7 +1052,7 @@ impl<'gc> TableState<'gc> {
         }
         if part <= Part::Ints {
             let from = if part == Part::Ints { from } else { 0 };
-            if let Some(e) = hash.and_then(|h| hash_part::next_live(&h.ints, from)) {
+            if let Some((_, e)) = hash.and_then(|h| hash_part::next_live(&h.ints, from)) {
                 return Ok(Some((Value::integer(mc, e.key), e.value)));
             }
         }
@@ -1060,7 +1061,7 @@ impl<'gc> TableState<'gc> {
             let found = match self.shape.is_dict() {
                 true => hash
                     .and_then(|h| hash_part::next_live(&h.strs, from))
-                    .map(|e| (Value::string(e.key), e.value)),
+                    .map(|(_, e)| (Value::string(e.key), e.value)),
                 false => {
                     let (inline, spilled) = self.named();
                     self.shape.keys()[from..]
@@ -1077,9 +1078,123 @@ impl<'gc> TableState<'gc> {
         let from = if part == Part::Misc { from } else { 0 };
         Ok(hash
             .and_then(|h| hash_part::next_live(&h.misc, from))
-            .map(|e| (e.key, e.value)))
+            .map(|(_, e)| (e.key, e.value)))
+    }
+
+    /// [`Self::next_at`] without calls, so the interpreter can take it without a
+    /// stack frame: the array part and the string keys, and `Step::Slow` for a
+    /// live entry in another part.
+    #[inline(always)]
+    pub fn next_at_inline(&self, pos: u32) -> Step<'gc> {
+        let aux = self.aux();
+        let (mut part, mut from) = (pos >> POS_PART_SHIFT, (pos & POS_INDEX) as usize);
+        loop {
+            let found = match part {
+                0 => self.array().get(from..).and_then(|rest| {
+                    let i = rest.iter().position(|v| !v.is_nil())?;
+                    let v = rest[i];
+                    let i = from + i;
+                    // Array keys are below `POS_INDEX`, so they are small too.
+                    Some((i, Value::small(i as i32), v))
+                }),
+                1 if aux.is_some_and(|h| !h.ints.is_empty()) => return Step::Slow,
+                2 if self.shape.is_dict() => aux
+                    .and_then(|h| hash_part::next_live(&h.strs, from))
+                    .map(|(i, e)| (i, Value::string(e.key), e.value)),
+                2 => {
+                    let keys = self.shape.keys();
+                    let (inline, spilled) = self.named();
+                    (from..keys.len()).find_map(|i| {
+                        let v = match i.checked_sub(inline.len()) {
+                            None => inline.get(i),
+                            Some(j) => spilled.get(j),
+                        };
+                        let (v, k) = (*v?, *keys.get(i)?);
+                        (!v.is_nil()).then(|| (i, Value::string(k), v))
+                    })
+                }
+                3 if aux.is_some_and(|h| !h.misc.is_empty()) => return Step::Slow,
+                1 | 3 => None,
+                _ => return Step::End,
+            };
+            if let Some((i, k, v)) = found {
+                if i >= POS_INDEX as usize {
+                    return Step::Slow;
+                }
+                return Step::Entry(part << POS_PART_SHIFT | (i as u32 + 1), k, v);
+            }
+            (part, from) = (part + 1, 0);
+        }
+    }
+
+    /// [`Self::next`] for a traversal that keeps its own place: the first
+    /// live entry at or after `pos`, and the position after it, which is
+    /// `None` when it doesn't fit (past 2^29 buckets in a part; resume with
+    /// `next` from the key instead). Start from 0. A table that grows
+    /// mid-traversal (which Lua leaves undefined) can yield an entry twice or
+    /// skip one, but is never read out of bounds.
+    #[inline]
+    pub fn next_at(
+        &self,
+        mc: &Mutation<'gc>,
+        pos: u32,
+    ) -> Option<(Option<u32>, Value<'gc>, Value<'gc>)> {
+        let aux = self.aux();
+        let (mut part, mut from) = (pos >> POS_PART_SHIFT, (pos & POS_INDEX) as usize);
+        loop {
+            let found = match part {
+                0 => self.array().get(from..).and_then(|rest| {
+                    let i = rest.iter().position(|v| !v.is_nil())?;
+                    Some((from + i, Value::integer(mc, (from + i) as i64), rest[i]))
+                }),
+                1 => aux
+                    .and_then(|h| hash_part::next_live(&h.ints, from))
+                    .map(|(i, e)| (i, Value::integer(mc, e.key), e.value)),
+                2 if self.shape.is_dict() => aux
+                    .and_then(|h| hash_part::next_live(&h.strs, from))
+                    .map(|(i, e)| (i, Value::string(e.key), e.value)),
+                2 => {
+                    let keys = self.shape.keys();
+                    let (inline, spilled) = self.named();
+                    (from..keys.len()).find_map(|i| {
+                        let v = match i.checked_sub(inline.len()) {
+                            None => inline[i],
+                            Some(j) => spilled[j],
+                        };
+                        (!v.is_nil()).then(|| (i, Value::string(keys[i]), v))
+                    })
+                }
+                3 => aux
+                    .and_then(|h| hash_part::next_live(&h.misc, from))
+                    .map(|(i, e)| (i, e.key, e.value)),
+                _ => return None,
+            };
+            if let Some((i, k, v)) = found {
+                let next =
+                    (i < POS_INDEX as usize).then(|| part << POS_PART_SHIFT | (i as u32 + 1));
+                return Some((next, k, v));
+            }
+            (part, from) = (part + 1, 0);
+        }
     }
 }
+
+/// A step of [`TableState::next_at_inline`].
+pub enum Step<'gc> {
+    /// The entry, and the position after it.
+    Entry(u32, Value<'gc>, Value<'gc>),
+    /// The traversal is over.
+    End,
+    /// `next_at` must take this step.
+    Slow,
+}
+
+/// A [`TableState::next_at`] position: the part (array, integer keys, string
+/// keys, other keys) above this bit, the index within it below, so a
+/// position in the array part is the index itself and every position is a
+/// small integer.
+pub const POS_PART_SHIFT: u32 = 29;
+const POS_INDEX: u32 = (1 << POS_PART_SHIFT) - 1;
 
 /// Which storage part a `next` cursor points into, in traversal order.
 #[derive(PartialEq, PartialOrd)]
