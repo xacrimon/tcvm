@@ -2,7 +2,7 @@ use crate::dmm::{Gc, Mutation, RefLock};
 use crate::env::function::{
     Function, FunctionKind, InlineCache, LuaFn, NativeClosure, Stack, Upvalue, UpvalueState,
 };
-use crate::env::shape::{MAX_PROPERTIES_FAST, MetamethodBits, Shape};
+use crate::env::shape::{MAX_PROPERTIES_FAST, MetamethodBits, Shape, mirrored};
 use crate::env::string::LuaString;
 use crate::env::table::{SlotLoc, Table, TableState};
 use crate::env::thread::{
@@ -695,11 +695,8 @@ fn ic_set<'gc>(ctx: Context<'gc>, cache: InlineCache<'gc>, t: Table<'gc>, v: Val
         if existing.is_nil() && live.has_mm(MetamethodBits::NEWINDEX) {
             return false;
         }
-        // Stores into a metatable and barrier work go to the slow path, keeping
-        // calls (and with them a stack frame) out of this handler.
-        if state.mt_cache().is_some() {
-            return false;
-        }
+        // Barrier work goes to the slow path, keeping calls (and with them a
+        // stack frame) out of this handler.
         drop(state);
         let Some(w) = Gc::write_if_clean(ctx.mutation(), t.inner()) else {
             return false;
@@ -719,8 +716,8 @@ fn ic_set<'gc>(ctx: Context<'gc>, cache: InlineCache<'gc>, t: Table<'gc>, v: Val
         if v.is_nil() {
             return true;
         }
-        // As above, plus a full spill cell would have to grow.
-        if state.mt_cache().is_some() || !state.has_room(loc) {
+        // As above, and so does growing a full spill cell.
+        if !state.has_room(loc) {
             return false;
         }
         drop(state);
@@ -853,10 +850,15 @@ fn set_own_fill_ic<'gc>(
         return true;
     }
     let key = constant_key(k);
+    // A hit stores without telling a metatable's cache, so the keys it
+    // mirrors are left uncached.
+    let cache = !mirrored(key);
     let slot = shape.find_slot(key);
     let existing = slot.map_or(Value::nil(), |s| state.named_get(s));
     if existing.is_nil() && newindex {
-        fill_ic(ctx, closure, ic_idx, shape_entry(shape, slot));
+        if cache {
+            fill_ic(ctx, closure, ic_idx, shape_entry(shape, slot));
+        }
         return false;
     }
     drop(state);
@@ -884,7 +886,9 @@ fn set_own_fill_ic<'gc>(
         }
     };
     drop(state);
-    fill_ic(ctx, closure, ic_idx, entry);
+    if cache {
+        fill_ic(ctx, closure, ic_idx, entry);
+    }
     true
 }
 
