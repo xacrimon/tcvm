@@ -54,6 +54,9 @@ pub struct State<'gc> {
     /// `TFORCALL` walks a table itself when its loop's iterator is one.
     pub(crate) next: Function<'gc>,
     pub(crate) ipairs_iter: Function<'gc>,
+    /// The function of the native frames the unwinder runs a message handler
+    /// or `__close` calls from.
+    pub(crate) unwind: Function<'gc>,
 }
 
 impl<'gc> State<'gc> {
@@ -110,6 +113,7 @@ impl Lua {
                 type_metatables: std::array::from_fn(|_| Gc::new(mc, Lock::new(None))),
                 next: Function::new_native(mc, builtin::lua_next, &[]),
                 ipairs_iter: Function::new_action(mc, builtin::ipairs_aux, &[]),
+                unwind: Function::new_native(mc, crate::vm::unwind::unwind_native, &[]),
             }
         });
         let metrics = arena.metrics();

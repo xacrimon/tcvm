@@ -215,7 +215,8 @@ pub struct ExecFrame<'gc> {
 pub(crate) enum TbcEntry<'gc> {
     Slot(usize),
     /// Its frame was unwound by an error; `level` is where it closes from: the
-    /// bottom of the `ErrorCloseSequence`, or 0 on a dead coroutine.
+    /// bottom of the frame that closes them (`vm::unwind`), or 0 on a dead
+    /// coroutine.
     Detached {
         level: usize,
         value: Value<'gc>,
@@ -262,10 +263,8 @@ pub enum ExecKind<'gc> {
         #[collect(require_static)]
         call_site: CallSite,
     },
-    /// Unwinding marker. The driver pops Lua/Wait/pass-through frames
-    /// (closing upvalues) until a catching `Sequence` frame is found and
-    /// stamped with `pending_error`, or until the thread terminates with
-    /// the error.
+    /// An error for the executor: raised by the executor itself, or one
+    /// nothing on the thread catches anymore (see `vm::unwind`).
     Error(Error<'gc>),
 }
 
@@ -354,9 +353,6 @@ pub struct ThreadState<'gc> {
     /// Results the executor delivered to a call site; the next `run_thread`
     /// starts by running its continuation.
     pub(crate) pending_ret: Option<PendingRet>,
-    /// An error the unwinder delivers to the protected native frame on top;
-    /// the next `run_thread` starts by running its continuation with it.
-    pub(crate) native_error: Option<Error<'gc>>,
     /// Where the thread's yielded values currently live. Set when the
     /// thread suspends via a `Yield` action (or a sequence's
     /// `SequencePoll::Yield`/`TailYield`). Consumed on resume to recover
@@ -428,7 +424,6 @@ unsafe impl<'gc> Collect<'gc> for ThreadState<'gc> {
         cc.trace(&self.open_upvalues);
         cc.trace(&self.thread_handle);
         cc.trace(&self.pending_action);
-        cc.trace(&self.native_error);
         cc.trace(&self.resumer);
         cc.trace(&self.tbc_list);
     }
@@ -560,7 +555,6 @@ impl<'gc> ThreadState<'gc> {
         self.no_yield = false;
         self.pending_action = None;
         self.pending_ret = None;
-        self.native_error = None;
         self.yield_bottom = None;
         self.death_error = None;
         self.stack_limit = STACK_LIMIT;
@@ -832,7 +826,6 @@ impl<'gc> Thread<'gc> {
             thread_handle: None,
             pending_action: None,
             pending_ret: None,
-            native_error: None,
             yield_bottom: None,
             death_error: None,
             stack_limit: STACK_LIMIT,

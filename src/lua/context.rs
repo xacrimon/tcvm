@@ -61,6 +61,11 @@ impl<'gc> Context<'gc> {
         self.state.ipairs_iter
     }
 
+    /// See `State::unwind`.
+    pub(crate) fn unwind_fn(self) -> Function<'gc> {
+        self.state.unwind
+    }
+
     /// Dict-mode sentinel for tables with no metatable. Tables that
     /// migrate to dict mode while carrying a metatable use the
     /// per-`MtCache` sentinel instead.
