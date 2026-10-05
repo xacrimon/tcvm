@@ -133,16 +133,12 @@ fn metamethod_tail_calls_a_native_that_calls_lua() {
     assert_eq!(run_with_natives(src), Ok(42));
 }
 
-/// Without a follow-up sequence nothing could apply the continuation, so
-/// this is an error rather than a wrong result.
+/// Without a follow-up sequence the callee returns through the metamethod's
+/// continuation itself.
 #[test]
 fn metamethod_tail_calls_a_native_that_forwards_to_lua() {
     let src = "local t = setmetatable({}, { __index = function(t, k) \
                return forward(function() return 1 end) end }) \
                return t.x";
-    let err = run_with_natives(src).expect_err("must raise");
-    assert!(
-        err.contains("cannot tail-call into Lua across the continuation"),
-        "{err}"
-    );
+    assert_eq!(run_with_natives(src), Ok(1));
 }
