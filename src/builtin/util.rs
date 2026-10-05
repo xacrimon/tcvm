@@ -184,7 +184,7 @@ pub(crate) fn basic_tostring<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> LuaString
         push_float(&mut out, f);
     } else {
         let ptr = to_pointer(v).expect("every other type is an object");
-        match ctx.metamethod_of(v, ctx.symbols().name).get_string() {
+        match ctx.mm_of(v, MetamethodBits::NAME).get_string() {
             Some(name) => out.extend_from_slice(name.as_bytes()),
             None => out.extend_from_slice(v.type_name().as_bytes()),
         }
@@ -217,7 +217,7 @@ pub(crate) async fn tolstring(
 ) -> Result<Vec<u8>, StashedError> {
     let mm = seq.enter(|ctx, locals, _exec, mut stack| {
         let v = stack.get(i);
-        let mm = ctx.metamethod_of(v, ctx.symbols().mm_tostring);
+        let mm = ctx.mm_of(v, MetamethodBits::TOSTRING);
         if mm.is_nil() {
             return Err(basic_tostring(ctx, v).as_bytes().to_vec());
         }
@@ -423,7 +423,7 @@ pub(crate) async fn len(seq: &mut AsyncSequence, idx: usize) -> Result<i64, Stas
         if let Some(s) = v.get_string() {
             return Ok(Err(s.len() as i64));
         }
-        let mm = ctx.metamethod_of(v, ctx.symbols().mm_len);
+        let mm = ctx.mm_of(v, MetamethodBits::LEN);
         if mm.is_nil() {
             return match v.get_table() {
                 Some(t) => Ok(Err(t.raw_len() as i64)),
@@ -514,7 +514,7 @@ pub(crate) fn type_error<'gc>(
 ) -> Error<'gc> {
     let got = match got {
         None => "no value".into(),
-        Some(v) => match ctx.metamethod_of(v, ctx.symbols().name).get_string() {
+        Some(v) => match ctx.mm_of(v, MetamethodBits::NAME).get_string() {
             Some(name) => String::from_utf8_lossy(name.as_bytes()),
             None => v.type_name().into(),
         },

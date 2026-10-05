@@ -209,20 +209,16 @@ impl<'gc> Table<'gc> {
         if let Some(c) = self.0.borrow().mt_cache() {
             return c;
         }
-        // First adoption: walk the table once to compute initial bits.
-        let mut bits = shape::MetamethodBits::empty();
-        {
+        // First adoption: walk the table once to read the metamethods.
+        let values = {
             let state = self.0.borrow();
-            for (name, bit) in ctx.symbols().metamethods() {
-                if !state.raw_get(Value::string(name)).is_nil() {
-                    bits |= bit;
-                }
-            }
-        }
+            ctx.symbols()
+                .metamethods()
+                .map(|(name, _)| state.raw_get(Value::string(name)))
+        };
         let weak = WeakMode::of(self.raw_get(Value::string(ctx.symbols().mode)));
-        let index = self.raw_get(Value::string(ctx.symbols().mm_index));
         let mc = ctx.mutation();
-        let cache = shape::MtCache::new(mc, self, bits, weak, index);
+        let cache = shape::MtCache::new(mc, self, values, weak);
         self.0.borrow_mut(mc).aux_or_new(mc).mt_cache = Some(cache);
         cache
     }
