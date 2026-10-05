@@ -168,10 +168,11 @@ pub struct TableState<'gc> {
     /// identity. In dict mode, this is a per-table sentinel shape; ICs
     /// naturally bypass.
     pub(crate) shape: Shape<'gc>,
-    /// String-keyed property values, indexed by `shape.find_slot(key)`.
-    /// `properties.len() == shape.slot_count()` post-set. Empty in
-    /// dict mode (storage moves to `dict`).
-    pub(crate) properties: Vec<Value<'gc>, MetricsAlloc<'gc>>,
+    /// String-keyed property values by slot, `shape.slot_count()` of them:
+    /// a [`slots`] cell of `named_cap` values, or dangling. Empty in dict
+    /// mode (storage moves to `dict`).
+    named: NonNull<Value<'gc>>,
+    named_cap: u32,
     /// Integer keys `0..asize`, as in LuaJIT: may hold nils, and is only
     /// resized by `rehash_ints`. A [`slots`] cell, or dangling when empty.
     array: NonNull<Value<'gc>>,
@@ -206,12 +207,15 @@ unsafe impl<'gc> Collect<'gc> for TableState<'gc> {
         cc.trace(&self.metatable);
         cc.trace(&self.mt_cache);
         let mode = self.weak_mode();
+        // SAFETY: non-empty parts are live `slots` cells.
+        if self.named_cap > 0 {
+            unsafe { slots::mark(cc, self.named) };
+        }
         if self.asize > 0 {
-            // SAFETY: a non-empty array part is a live `slots` cell.
             unsafe { slots::mark(cc, self.array) };
         }
         if mode.is_empty() {
-            cc.trace(&self.properties);
+            cc.trace(self.properties());
             cc.trace(self.array());
             cc.trace(&self.int_hash);
             cc.trace(&self.misc_hash);
@@ -225,7 +229,7 @@ unsafe impl<'gc> Collect<'gc> for TableState<'gc> {
                 cc.trace(v);
             }
         };
-        for v in self.properties.iter().chain(self.array()) {
+        for v in self.properties().iter().chain(self.array()) {
             value(cc, v);
         }
         for e in self.int_hash.iter() {
@@ -270,7 +274,11 @@ impl<'gc> TableState<'gc> {
         debug_assert_eq!(values.len(), shape.slot_count() as usize);
         Self {
             shape,
-            properties: filled(mc, values.len(), |i| values[i]),
+            named: match values.len() {
+                0 => NonNull::dangling(),
+                n => slots::alloc(mc, n, |i| values[i]),
+            },
+            named_cap: values.len() as u32,
             // `nils` stays out of line: inlined, its spills cost every table.
             array: match items {
                 0 => NonNull::dangling(),
@@ -356,7 +364,8 @@ impl<'gc> TableState<'gc> {
                 c.mirror(key, Value::nil());
             }
         };
-        for (v, &key) in self.properties.iter_mut().zip(self.shape.keys()) {
+        let keys = self.shape.keys();
+        for (v, &key) in self.properties_mut().iter_mut().zip(keys) {
             if v.is_dead(fc) {
                 *v = Value::nil();
                 cleared(key);
@@ -386,7 +395,8 @@ impl<'gc> TableState<'gc> {
     /// `slot` must be in range for this table's shape.
     #[inline]
     pub unsafe fn property_at(&self, slot: u32) -> Value<'gc> {
-        unsafe { *self.properties.get_unchecked(slot as usize) }
+        debug_assert!(slot < self.shape.slot_count());
+        unsafe { *self.named.as_ptr().add(slot as usize) }
     }
 
     /// Write the slot directly; the store-side counterpart of [`Self::property_at`].
@@ -396,7 +406,44 @@ impl<'gc> TableState<'gc> {
     /// `slot` must be in range for this table's shape.
     #[inline]
     pub unsafe fn set_property_at(&mut self, slot: u32, v: Value<'gc>) {
-        unsafe { *self.properties.get_unchecked_mut(slot as usize) = v }
+        debug_assert!(slot < self.shape.slot_count());
+        unsafe { *self.named.as_ptr().add(slot as usize) = v }
+    }
+
+    /// Whether adding a property needs a bigger cell.
+    #[inline]
+    pub fn properties_full(&self) -> bool {
+        self.shape.slot_count() == self.named_cap
+    }
+
+    /// Store the property `to` adds to this table's shape, and move to `to`.
+    ///
+    /// # Safety
+    ///
+    /// `to` must be a property transition from this table's shape, and
+    /// [`Self::properties_full`] false.
+    #[inline]
+    pub unsafe fn push_property(&mut self, to: Shape<'gc>, v: Value<'gc>) {
+        let slot = self.shape.slot_count();
+        debug_assert!(slot < self.named_cap && to.slot_count() == slot + 1);
+        unsafe { *self.named.as_ptr().add(slot as usize) = v };
+        self.shape = to;
+    }
+
+    #[inline(always)]
+    fn properties(&self) -> &[Value<'gc>] {
+        // SAFETY: `named` holds the shape's slots, in a cell nothing else refers to.
+        unsafe {
+            core::slice::from_raw_parts(self.named.as_ptr(), self.shape.slot_count() as usize)
+        }
+    }
+
+    #[inline(always)]
+    fn properties_mut(&mut self) -> &mut [Value<'gc>] {
+        // SAFETY: as in `properties`.
+        unsafe {
+            core::slice::from_raw_parts_mut(self.named.as_ptr(), self.shape.slot_count() as usize)
+        }
     }
 
     #[inline(always)]
@@ -461,7 +508,7 @@ impl<'gc> TableState<'gc> {
             return hash_part::get(&d.table, lua_string_hash(key), key);
         }
         match self.shape.find_slot(key) {
-            Some(slot) => self.properties[slot as usize],
+            Some(slot) => self.properties()[slot as usize],
             None => Value::nil(),
         }
     }
@@ -520,7 +567,7 @@ impl<'gc> TableState<'gc> {
             Some(slot) => {
                 // Deletion keeps the slot (nil-valued) so the shape stays stable
                 // and `next` can resume from the deleted key.
-                self.properties[slot as usize] = value;
+                self.properties_mut()[slot as usize] = value;
                 self.maybe_update_mt_bit(Value::string(key), value);
             }
             None => self.add_string_key(ctx, key, value, cap),
@@ -549,10 +596,22 @@ impl<'gc> TableState<'gc> {
             return;
         }
         let new_shape = shape::transition_add_prop(ctx.mutation(), self.shape, key);
-        debug_assert_eq!(new_shape.slot_count() as usize, self.properties.len() + 1);
-        self.shape = new_shape;
-        self.properties.push(value);
+        if self.properties_full() {
+            self.grow_properties(ctx.mutation());
+        }
+        // SAFETY: room was just made.
+        unsafe { self.push_property(new_shape, value) };
         self.maybe_update_mt_bit(Value::string(key), value);
+    }
+
+    /// Move the properties to a cell with room for more; the old one is left
+    /// for the sweep.
+    #[cold]
+    fn grow_properties(&mut self, mc: &Mutation<'gc>) {
+        let old = self.properties();
+        let cap = (old.len() * 2).max(4);
+        self.named = slots::alloc(mc, cap, |i| old.get(i).copied().unwrap_or(Value::nil()));
+        self.named_cap = cap as u32;
     }
 
     fn set_string_key_dict(&mut self, key: LuaString<'gc>, value: Value<'gc>) {
@@ -578,13 +637,14 @@ impl<'gc> TableState<'gc> {
         let keys = self.shape.keys();
         let mut table =
             hash_part::Part::with_capacity_in(keys.len(), MetricsAlloc::new(ctx.mutation()));
-        for (&k, &v) in keys.iter().zip(&self.properties) {
+        for (&k, &v) in keys.iter().zip(self.properties()) {
             if v.is_nil() {
                 continue;
             }
             hash_part::insert_unique(&mut table, lua_string_hash(k), k, v);
         }
-        self.properties.clear();
+        self.named = NonNull::dangling();
+        self.named_cap = 0;
         self.shape = match self.shape.mt_cache() {
             Some(c) => c.ensure_dict_sentinel(ctx.mutation()),
             None => ctx.empty_dict_sentinel(),
@@ -813,7 +873,7 @@ impl<'gc> TableState<'gc> {
                 }
                 None => self.shape.keys()[from..]
                     .iter()
-                    .zip(&self.properties[from..])
+                    .zip(&self.properties()[from..])
                     .map(|(&k, &v)| (Value::string(k), v))
                     .find(|(_, v)| !v.is_nil()),
             };
@@ -833,23 +893,6 @@ enum Part {
     Ints,
     Strings,
     Misc,
-}
-
-/// A vector of `n` values, `f(i)` at `i`. Not `resize` or `extend_from_slice`,
-/// whose fill or copy is a library call even for a few values.
-#[inline(always)]
-fn filled<'gc>(
-    mc: &Mutation<'gc>,
-    n: usize,
-    f: impl Fn(usize) -> Value<'gc>,
-) -> Vec<Value<'gc>, MetricsAlloc<'gc>> {
-    let mut v = Vec::with_capacity_in(n, MetricsAlloc::new(mc));
-    for (i, slot) in v.spare_capacity_mut()[..n].iter_mut().enumerate() {
-        slot.write(f(i));
-    }
-    // SAFETY: the first `n` slots were just written.
-    unsafe { v.set_len(n) };
-    v
 }
 
 #[inline(never)]
