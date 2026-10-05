@@ -1,3 +1,4 @@
+use core::fmt::NumBuffer;
 use std::cell::RefCell;
 
 use crate::Context;
@@ -556,51 +557,54 @@ fn check_fmt_int<'gc>(
 // ---------- integer formatting ----------
 
 fn fmt_int_signed(out: &mut Vec<u8>, spec: &FmtSpec, n: i64) {
-    let negative = n < 0;
-    let abs = n.unsigned_abs();
-    let mut digits = format!("{abs}");
-    if let Some(p) = spec.precision {
-        if digits.len() < p {
-            let pad = p - digits.len();
-            let mut zeros = "0".repeat(pad);
-            zeros.push_str(&digits);
-            digits = zeros;
-        }
-        if p == 0 && abs == 0 {
-            digits.clear();
-        }
-    }
-    let sign = if negative {
-        "-"
+    let mut dec = NumBuffer::new();
+    let mut padded = [0; 99];
+    let digits = int_digits(
+        spec,
+        n.unsigned_abs().format_into(&mut dec).as_bytes(),
+        n == 0,
+        &mut padded,
+    );
+    let sign: &[u8] = if n < 0 {
+        b"-"
     } else if spec.flag_plus {
-        "+"
+        b"+"
     } else if spec.flag_space {
-        " "
+        b" "
     } else {
-        ""
+        b""
     };
-    apply_width(out, spec, sign.as_bytes(), b"", digits.as_bytes());
+    apply_width(out, spec, sign, b"", digits);
 }
 
 fn fmt_int_unsigned(out: &mut Vec<u8>, spec: &FmtSpec, n: u64, radix: u32, upper: bool) {
-    let mut digits = match radix {
-        8 => format!("{n:o}"),
-        10 => format!("{n}"),
-        16 if upper => format!("{n:X}"),
-        16 => format!("{n:x}"),
-        _ => unreachable!(),
+    let mut dec = NumBuffer::new();
+    let mut pow2 = [0; 22];
+    let raw: &[u8] = match radix {
+        10 => n.format_into(&mut dec).as_bytes(),
+        // `format_into` is decimal-only.
+        _ => {
+            let (bits, alphabet): (u32, &[u8]) = match (radix, upper) {
+                (8, _) => (3, b"01234567"),
+                (16, false) => (4, b"0123456789abcdef"),
+                (16, true) => (4, b"0123456789ABCDEF"),
+                _ => unreachable!(),
+            };
+            let mut i = pow2.len();
+            let mut m = n;
+            loop {
+                i -= 1;
+                pow2[i] = alphabet[(m & ((1 << bits) - 1)) as usize];
+                m >>= bits;
+                if m == 0 {
+                    break;
+                }
+            }
+            &pow2[i..]
+        }
     };
-    if let Some(p) = spec.precision {
-        if digits.len() < p {
-            let pad = p - digits.len();
-            let mut zeros = "0".repeat(pad);
-            zeros.push_str(&digits);
-            digits = zeros;
-        }
-        if p == 0 && n == 0 {
-            digits.clear();
-        }
-    }
+    let mut padded = [0; 99];
+    let digits = int_digits(spec, raw, n == 0, &mut padded);
     let prefix: &[u8] = if spec.flag_hash && n != 0 {
         match (radix, upper) {
             (16, false) => b"0x",
@@ -611,7 +615,22 @@ fn fmt_int_unsigned(out: &mut Vec<u8>, spec: &FmtSpec, n: u64, radix: u32, upper
     } else {
         b""
     };
-    apply_width(out, spec, b"", prefix, digits.as_bytes());
+    apply_width(out, spec, b"", prefix, digits);
+}
+
+/// `digits` zero-extended to the spec's precision (at most 99, see `parse_spec`);
+/// as in C, a zero precision prints no digits for zero.
+fn int_digits<'a>(spec: &FmtSpec, digits: &'a [u8], zero: bool, buf: &'a mut [u8; 99]) -> &'a [u8] {
+    match spec.precision {
+        Some(0) if zero => b"",
+        Some(p) if digits.len() < p => {
+            let pad = p - digits.len();
+            buf[..pad].fill(b'0');
+            buf[pad..p].copy_from_slice(digits);
+            &buf[..p]
+        }
+        _ => digits,
+    }
 }
 
 // ---------- float formatting ----------
@@ -928,8 +947,7 @@ fn fmt_q<'gc>(
         if i == i64::MIN {
             out.extend_from_slice(b"0x8000000000000000");
         } else {
-            let s = format!("{i}");
-            out.extend_from_slice(s.as_bytes());
+            out.extend_from_slice(i.format_into(&mut NumBuffer::new()).as_bytes());
         }
     } else if let Some(f) = arg.get_float() {
         // %q must read back to the exact value: hex-float for finite numbers,
