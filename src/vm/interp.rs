@@ -4120,23 +4120,24 @@ extern "rust-preserve-none" fn op_closure<'gc>(
         let uv = match desc {
             UpValueDescriptor::ParentLocal(idx) => {
                 let stack_idx = base + *idx as usize;
-                // Check if there's already an open upvalue for this stack slot
-                let existing = thread.open_upvalues.iter().find(|uv| {
-                    matches!(&*uv.borrow(), UpvalueState::Open { index, .. } if *index == stack_idx)
-                });
-                if let Some(uv) = existing {
-                    *uv
-                } else {
-                    let uv: Upvalue<'gc> = Gc::new(
-                        ctx.mutation(),
-                        RefLock::new(UpvalueState::Open {
-                            thread: thread_handle,
-                            index: stack_idx,
-                        }),
-                    );
-                    thread.open_upvalues.push(uv);
-                    unsafe { (*frame).flags |= frame_flags::OPEN_UPVALUES };
-                    uv
+                // Sorted by slot, so this frame's are at the end.
+                let open = &thread.open_upvalues;
+                let below = open.iter().rposition(|&uv| open_index(uv) <= stack_idx);
+                match below {
+                    Some(i) if open_index(open[i]) == stack_idx => open[i],
+                    _ => {
+                        let uv: Upvalue<'gc> = Gc::new(
+                            ctx.mutation(),
+                            RefLock::new(UpvalueState::Open {
+                                thread: thread_handle,
+                                index: stack_idx,
+                            }),
+                        );
+                        let at = below.map_or(0, |i| i + 1);
+                        thread.open_upvalues.insert(at, uv);
+                        unsafe { (*frame).flags |= frame_flags::OPEN_UPVALUES };
+                        uv
+                    }
                 }
             }
             UpValueDescriptor::ParentUpvalue(idx) => parent_closure.upvalues[*idx as usize],
@@ -4655,56 +4656,50 @@ pub(crate) fn frame_return<'gc>(
     FrameReturn::Caller { new_base, new_ip }
 }
 
-/// Whether the frame based at `base` still has open upvalues. Open upvalues
-/// are appended in creation order and every deeper frame closes its own before
-/// returning, so only the tail of the list can belong to the returning frame.
-/// (Not valid for a partial `CLOSE` inside a frame, whose entries are not
-/// ordered by index.)
+/// The stack slot of an upvalue in `ThreadState::open_upvalues`, which are
+/// all open, sorted by slot (as Lua's `openupval` list is).
+#[inline(always)]
+fn open_index(uv: Upvalue<'_>) -> usize {
+    match &*uv.borrow() {
+        UpvalueState::Open { index, .. } => *index,
+        UpvalueState::Closed(_) => unreachable!("closed upvalue in the open list"),
+    }
+}
+
+/// Whether any open upvalue points at stack index `base` or above.
 #[inline(always)]
 fn frame_has_open_upvalues<'gc>(thread: &ThreadState<'gc>, base: usize) -> bool {
-    thread.open_upvalues.last().is_some_and(
-        |uv| matches!(&*uv.borrow(), UpvalueState::Open { index, .. } if *index >= base),
-    )
+    thread
+        .open_upvalues
+        .last()
+        .is_some_and(|&uv| open_index(uv) >= base)
 }
 
 /// Close all open upvalues pointing at stack indices >= `start_idx`.
 /// Each open upvalue is converted to Closed by capturing the current stack value.
-/// Inlined so the usual no-open-upvalues return costs one load, not a call.
+/// Inlined so the usual nothing-to-close case costs a load or two, not a call.
 #[inline(always)]
 pub(crate) fn close_upvalues<'gc>(
     mc: &Mutation<'gc>,
     thread: &mut ThreadState<'gc>,
     start_idx: usize,
 ) {
-    if !thread.open_upvalues.is_empty() {
+    if frame_has_open_upvalues(thread, start_idx) {
         close_upvalues_slow(mc, thread, start_idx);
     }
 }
 
 #[inline(never)]
 fn close_upvalues_slow<'gc>(mc: &Mutation<'gc>, thread: &mut ThreadState<'gc>, start_idx: usize) {
-    thread.open_upvalues.retain(|uv| {
-        let should_close = {
-            let borrowed = uv.borrow();
-            match &*borrowed {
-                UpvalueState::Open { index, .. } => *index >= start_idx,
-                UpvalueState::Closed(_) => false,
-            }
-        };
-        if should_close {
-            let val = thread.stack[{
-                let b = uv.borrow();
-                match &*b {
-                    UpvalueState::Open { index, .. } => *index,
-                    _ => unreachable!(),
-                }
-            }];
-            *uv.borrow_mut(mc) = UpvalueState::Closed(val);
-            false // remove from open list
-        } else {
-            true // keep
+    // Sorted by slot, so the ones to close are the tail.
+    while let Some(&uv) = thread.open_upvalues.last() {
+        let index = open_index(uv);
+        if index < start_idx {
+            break;
         }
-    });
+        *uv.borrow_mut(mc) = UpvalueState::Closed(thread.stack[index]);
+        thread.open_upvalues.pop();
+    }
 }
 
 // ---------------------------------------------------------------------------

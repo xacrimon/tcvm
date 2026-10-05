@@ -2,7 +2,7 @@
 //! iteration's closure gets a fresh upvalue and a later local reusing the
 //! register doesn't alias an open one. Regression for #12.
 
-use crate::common::eval;
+use crate::common::{eval, ok};
 
 fn run(src: &str) -> i64 {
     eval(src)
@@ -77,4 +77,35 @@ fn do_block_closes() {
              return f() * 10 + y"),
         12
     );
+}
+
+/// Upvalues captured out of slot order, then closed partway: a `CLOSE` must
+/// close exactly the ones at or above its level, and a later capture must
+/// find the one still open (`ThreadState::open_upvalues` is sorted by slot).
+#[test]
+fn upvalues_captured_out_of_order() {
+    let src = r#"
+local fs = {}
+do
+  local a = 1
+  do
+    local b = 2
+    fs[1] = function() return b end
+    fs[2] = function() return a end
+    b = 20
+  end
+  local c = 99
+  a = 10
+  fs[3] = function() a = a + 1 return a end
+  a = 100
+end
+local co = coroutine.wrap(function(x)
+  local gs = {}
+  for i = 3, 1, -1 do local v = x * i gs[i] = function() return v end end
+  coroutine.yield(gs[1]() + gs[2]() + gs[3]())
+  return gs[3]()
+end)
+return fs[1]() .. ' ' .. fs[2]() .. ' ' .. fs[3]() .. ' ' .. fs[2]() .. ' ' .. co(5) .. ' ' .. co()
+"#;
+    assert_eq!(ok(src), "20 100 101 101 30 15");
 }
