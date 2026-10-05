@@ -34,6 +34,14 @@ impl<'gc> Table<'gc> {
         Self::alloc(mc, shape, &[], 0)
     }
 
+    /// A table sized as `table.create(nseq, nrec)` asks: keys `1..=nseq` in
+    /// an array part in its own cell, and `nrec` inline named slots, as
+    /// far as either can grow.
+    pub fn with_capacity(ctx: Context<'gc>, nseq: usize, nrec: usize) -> Self {
+        let items = nseq.min(MAX_ASIZE as usize - 1);
+        Self::alloc(ctx.mutation(), ctx.root_shape(nrec), &[], items)
+    }
+
     /// A constructor's table, as `NEWTABLE` makes it from `t`.
     #[inline]
     pub fn from_template(mc: &Mutation<'gc>, t: &Template<'gc>) -> Self {
