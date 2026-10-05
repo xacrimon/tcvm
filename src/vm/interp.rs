@@ -2483,7 +2483,7 @@ macro_rules! call_native {
                     if let crate::vm::sequence::CallbackAction::CallThen { at, protect, cont } = action
                         && let Some(callee) = native_calls_lua($thread, args_base + at as usize)
                     {
-                        push_native_frame($thread, f, args_base, at, protect, cont, ret_call);
+                        push_native_frame($thread, f, args_base, at, protect, cont, call_ret(returns));
                         let new_base = args_base + at as usize + 1;
                         enter_from_native($thread, callee, new_base, ret_native);
                         ($frame, $closure) = (unsafe { $thread.top_lua_ptr() }, callee);
@@ -2496,7 +2496,7 @@ macro_rules! call_native {
                             framed: false,
                             f,
                             base: args_base,
-                            ret: ret_call,
+                            ret: call_ret(returns),
                         },
                     );
                     native_step!(step);
@@ -2566,11 +2566,10 @@ macro_rules! call_lua {
             }
         };
         $ip = callee.code;
-        let _ = $returns;
         let frame = LuaFrame {
             closure: callee,
             pc: $ip,
-            ret: ret_call,
+            ret: call_ret($returns),
             base: new_base as u32,
             num_extras,
             flags: 0,
@@ -5704,4 +5703,53 @@ extern "rust-preserve-none" fn cmp_slow<'gc>(
     }
     call_mm!(ret_cond_c, meta_fn, [a, b]);
 }
+
+/// The continuation for a CALL that keeps `returns - 1` results, MULTRET
+/// for 0: specialized for the common fixed counts, as LuaJIT Remake's
+/// call variants are.
+#[inline(always)]
+fn call_ret(returns: u8) -> Handler {
+    static RETS: [Handler; 5] = [ret_call, ret_call0, ret_call1, ret_call2, ret_call];
+    RETS[(returns as usize).min(4)]
+}
+
+/// [`ret_call`] for a CALL that keeps `$n` results, nil-padded.
+macro_rules! ret_call_n {
+    ($name:ident, $n:literal) => {
+        #[inline(never)]
+        #[rustc_align(32)]
+        // The incoming `closure` belongs to the finished call.
+        #[allow(unused_assignments)]
+        extern "rust-preserve-none" fn $name<'gc>(
+            instruction: Instruction,
+            ctx: Context<'gc>,
+            thread: &mut ThreadState<'gc>,
+            mut registers: Registers<'gc, '_>,
+            mut ip: *const Instruction,
+            handlers: *const (),
+            ds: &mut DispatchState<'gc>,
+            frame: *mut LuaFrame<'gc>,
+            closure: LuaFn<'gc>,
+        ) -> Exit {
+            let (nret, values, dst) = ret_args!(instruction, registers, ip);
+            helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+            for i in 0..$n {
+                let v = if i < nret {
+                    unsafe { values.add(i).read() }
+                } else {
+                    Value::nil()
+                };
+                unsafe { dst.add(i).write(v) };
+            }
+            let _ = resume_caller!(thread, registers, ip, frame, closure);
+            let dst = unsafe { dst.offset_from_unsigned(thread.stack.as_ptr()) };
+            thread.set_top_unchecked(dst + $n);
+            dispatch!();
+        }
+    };
+}
+
+ret_call_n!(ret_call0, 0);
+ret_call_n!(ret_call1, 1);
+ret_call_n!(ret_call2, 2);
 
