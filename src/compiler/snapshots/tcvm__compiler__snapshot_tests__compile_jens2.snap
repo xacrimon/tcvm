@@ -30,5 +30,5 @@ expression: output
   0007  [  5]  FORLOOP         R2 -2
   0008  [  9]  GETTABUP        R2 U0 K3  ; "print"
   0009  [  9]  MOVE            R3 R0
-  0010  [  9]  CALL            R2 args=2 ret=1
+  0010  [  9]  CALL_R0         R2 args=2
   0011  [ 10]  RETURN0

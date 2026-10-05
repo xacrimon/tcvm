@@ -14,7 +14,7 @@ expression: output
 0002  [  2]  LOAD            R1 K0  ; 0
 0003  [  3]  LOAD            R2 K1  ; 1
 0004  [  3]  MOVE            R5 R0
-0005  [  3]  CALL            R5 args=1 ret=2
+0005  [  3]  CALL_R1         R5 args=1
 0006  [  3]  MOVE            R3 R5
 0007  [  3]  LOAD            R4 K1  ; 1
 0008  [  3]  FORPREP         R2 +2

@@ -30,17 +30,17 @@ expression: output
 0006  [  5]  LOAD            R3 K4  ; "abs"
 0007  [  5]  TBC             R3
 0008  [  7]  GETTABUP        R4 U0 K7  ; "get"
-0009  [  7]  CALL            R4 args=1 ret=2
+0009  [  7]  CALL_R1         R4 args=1
 0010  [  7]  LOAD            R5 K8  ; "other1"
 0011  [  7]  SETTABUP        R5 U0 K6  ; "k"
 0012  [  7]  SETTABUP        R4 U0 K5  ; "i"
 0013  [  8]  GETTABUP        R4 U0 K9  ; "getf"
-0014  [  8]  CALL            R4 args=1 ret=2
+0014  [  8]  CALL_R1         R4 args=1
 0015  [  8]  LOAD            R5 K10  ; "other2"
 0016  [  9]  GETTABUP        R6 U0 K11  ; "getw"
-0017  [  9]  CALL            R6 args=1 ret=2
+0017  [  9]  CALL_R1         R6 args=1
 0018  [ 10]  GETTABUP        R7 U0 K12  ; "getq"
-0019  [ 10]  CALL            R7 args=1 ret=2
+0019  [ 10]  CALL_R1         R7 args=1
 0020  [ 10]  LOAD            R8 K13  ; "other4"
 0021  [ 10]  TBC             R7
 0022  [ 10]  RETURN          R0 count=1
