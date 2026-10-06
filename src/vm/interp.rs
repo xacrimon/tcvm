@@ -6918,6 +6918,8 @@ macro_rules! ret_call_n {
         #[rustc_align(32)]
         // The incoming `closure` belongs to the finished call.
         #[allow(unused_assignments)]
+        // `ret_call0` copies nothing.
+        #[allow(clippy::reversed_empty_ranges)]
         extern "rust-preserve-none" fn $name<'gc>(
             instruction: Instruction,
             ctx: Context<'gc>,
