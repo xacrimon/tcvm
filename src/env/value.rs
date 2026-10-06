@@ -390,6 +390,20 @@ impl<'gc> Value<'gc> {
         self.bits == other.bits
     }
 
+    /// The raw encoding, to pass a value through a register that holds a
+    /// `u64` (see `meta_call`).
+    #[inline(always)]
+    pub(crate) fn to_raw(self) -> u64 {
+        self.bits
+    }
+
+    /// # Safety
+    /// `bits` came from [`Self::to_raw`] on a value that is still live.
+    #[inline(always)]
+    pub(crate) unsafe fn from_raw(bits: u64) -> Self {
+        Self::from_bits(bits)
+    }
+
     /// An object a weak table may drop. Strings and boxed integers are collectable but count
     /// as values (§2.5.4).
     #[inline(always)]
