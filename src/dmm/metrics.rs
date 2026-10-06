@@ -1,25 +1,24 @@
 use core::cell::Cell;
 
-use crate::dmm::heap::page_size;
-
 /// When an [`crate::Arena`] collects, after mmtk-core's StickyImmix trigger: once the memory in
-/// use passes a heap limit, which each full collection sets by MemBalancer's fallback rule (mmtk's
-/// `MemBalancerTrigger::compute_new_heap_limit` without allocation and collection rates). A
-/// collection is full if less than `min_nursery` was left under the limit when the last one
-/// ended, and minor otherwise. Memory in use is the heap's blocks and huge objects (mmtk's
-/// reserved pages) plus external allocations.
+/// use passes a heap limit, which each full collection sets to twice what survived it (LuaJIT's
+/// pause of 200, in place of mmtk's MemBalancer). A collection is full if less than `min_nursery`
+/// was left under the limit when the last one ended, and minor otherwise. Memory in use is the
+/// lines and huge objects allocated and not freed, plus external allocations: not mmtk's reserved
+/// pages, which count a block whole while any line of it lives, so that survivors spread thin
+/// over many blocks don't inflate the limit.
 #[derive(Debug, Copy, Clone)]
 pub struct Pacing {
     /// The least heap limit, and the limit until the first full collection.
     pub min_heap: usize,
-    /// mmtk's minimum nursery: room a full collection leaves under the limit, and the least room
-    /// left at the end of a collection that keeps the next one minor.
+    /// mmtk's minimum nursery: the least room left under the limit at the end of a collection
+    /// that keeps the next one minor.
     pub min_nursery: usize,
 }
 
 impl Pacing {
     pub const DEFAULT: Pacing = Pacing {
-        min_heap: 4 << 20,
+        min_heap: 1 << 20,
         min_nursery: 2 << 20,
     };
 }
@@ -60,8 +59,6 @@ struct MetricsInner {
     /// Bytes of lines and huge objects handed to allocation and not yet freed.
     total_gc_bytes: Cell<usize>,
     total_external_bytes: Cell<usize>,
-    /// Bytes of the heap's blocks in use and of its huge objects' pages.
-    reserved_bytes: Cell<usize>,
 
     /// Set by the last full collection; 0 before the first.
     heap_limit: Cell<usize>,
@@ -195,10 +192,7 @@ impl Metrics {
     }
 
     fn in_use(&self) -> usize {
-        self.0
-            .reserved_bytes
-            .get()
-            .saturating_add(self.0.total_external_bytes.get())
+        self.total_allocation()
     }
 
     fn heap_limit(&self) -> usize {
@@ -224,12 +218,7 @@ impl Metrics {
             .next_full
             .set(self.heap_limit().saturating_sub(in_use) < pacing.min_nursery);
         if full {
-            // mmtk's fallback: live + sqrt(live * 4096) + the minimum nursery, in pages.
-            let page = page_size();
-            let live = in_use.div_ceil(page);
-            let extra = (live as f64 * 4096.0).sqrt() as usize;
-            let limit = (live + extra) * page + pacing.min_nursery;
-            self.0.heap_limit.set(limit.max(pacing.min_heap));
+            self.0.heap_limit.set((2 * in_use).max(pacing.min_heap));
             self.0.full_collections.update(|n| n + 1);
         } else {
             self.0.minor_collections.update(|n| n + 1);
@@ -249,16 +238,5 @@ impl Metrics {
     #[inline]
     pub(crate) fn mark_gc_freed(&self, bytes: usize) {
         self.0.total_gc_bytes.update(|b| b - bytes);
-    }
-
-    /// Blocks or huge object pages taken into use.
-    #[inline]
-    pub(crate) fn mark_reserved(&self, bytes: usize) {
-        self.0.reserved_bytes.update(|b| b + bytes);
-    }
-
-    #[inline]
-    pub(crate) fn mark_released(&self, bytes: usize) {
-        self.0.reserved_bytes.update(|b| b - bytes);
     }
 }
