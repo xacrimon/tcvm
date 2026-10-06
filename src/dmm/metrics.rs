@@ -30,6 +30,10 @@ impl Default for Pacing {
     }
 }
 
+/// Allocation between [`Metrics::gc_check_due`] firings for a host that doesn't collect when it
+/// does.
+const DEFERRED_GC_CHECK: usize = 64 << 10;
+
 /// Allocation counter and the threshold the interpreter compares it with,
 /// adjacent so one `ldp` loads both.
 #[derive(Debug, Default)]
@@ -40,9 +44,9 @@ struct GcCheck {
 }
 
 impl GcCheck {
-    /// Whether allocation since the last [`Metrics::arm_gc_check`] may have pushed the debt past
-    /// its granularity. Memory in use grows by at most what is allocated, so this can fire early,
-    /// never late.
+    /// Whether allocation since the last [`Metrics::arm_gc_check`] may have pushed memory in use
+    /// past the heap limit. Memory in use grows by at most what is allocated, so this can fire
+    /// early, never late.
     #[inline(always)]
     fn due(&self) -> bool {
         self.allocated_bytes_total.get() >= self.gc_check_at.get()
@@ -52,7 +56,6 @@ impl GcCheck {
 #[derive(Debug, Default)]
 struct MetricsInner {
     gc_check: GcCheck,
-    gc_granularity: Cell<usize>,
 
     pacing: Cell<Pacing>,
 
@@ -162,27 +165,16 @@ impl Metrics {
         self.0.gc_check.due()
     }
 
-    /// Allocation debt, in bytes, the host lets build up before collecting.
-    pub fn gc_granularity(&self) -> usize {
-        self.0.gc_granularity.get()
-    }
-
-    pub fn set_gc_granularity(&self, bytes: usize) {
-        self.0.gc_granularity.set(bytes);
-        self.arm_gc_check();
-    }
-
-    /// Arm [`Metrics::gc_check_due`] to fire once the debt could exceed the granularity.
+    /// Arm [`Metrics::gc_check_due`] to fire once memory in use could pass the heap limit.
     pub fn arm_gc_check(&self) {
-        let remaining = (self.gc_granularity() as f64 - self.raw_debt()).max(1.0) as usize;
+        let remaining = (-self.raw_debt()).max(1.0) as usize;
         self.set_gc_check_in(remaining);
     }
 
-    /// Fire [`Metrics::gc_check_due`] again only after another granularity of allocation, so a
-    /// host that keeps stepping without collecting sees one exit per granularity, not one per
-    /// allocation.
+    /// Fire [`Metrics::gc_check_due`] again only after `DEFERRED_GC_CHECK` more bytes, so a host
+    /// that keeps stepping without collecting isn't sent back at every check.
     pub fn defer_gc_check(&self) {
-        self.set_gc_check_in(self.gc_granularity().max(1));
+        self.set_gc_check_in(DEFERRED_GC_CHECK);
     }
 
     fn set_gc_check_in(&self, bytes: usize) {
