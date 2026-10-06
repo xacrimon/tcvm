@@ -200,7 +200,7 @@ unsafe fn unmap(p: *mut u8, size: usize) {
     unsafe { libc::munmap(p.cast(), size.next_multiple_of(page_size())) };
 }
 
-pub(crate) fn page_size() -> usize {
+fn page_size() -> usize {
     // SAFETY: no preconditions.
     unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
 }
@@ -575,7 +575,6 @@ impl Heap {
             w.set(0);
         }
         metrics.mark_gc_allocated(BLOCK);
-        metrics.mark_reserved(BLOCK);
         block_start(chunk, b)
     }
 
@@ -617,7 +616,6 @@ impl Heap {
         unsafe { &mut *self.young_huge.get() }.push(ptr);
         let pages = size.next_multiple_of(page_size());
         metrics.mark_gc_allocated(pages);
-        metrics.mark_reserved(pages);
         ptr
     }
 
@@ -657,7 +655,6 @@ impl Heap {
             // SAFETY: an unmarked huge object is unreachable.
             unsafe { free_huge(huge) };
             metrics.mark_gc_freed(size);
-            metrics.mark_released(size);
         };
         let table = unsafe { self.huge_table() };
         let young = unsafe { &mut *self.young_huge.get() };
@@ -801,7 +798,6 @@ impl Heap {
         metrics.mark_gc_freed((held - live) * LINE);
         info.held.set(live as u16);
         if live == 0 {
-            metrics.mark_released(BLOCK);
             chunk.free.update(|f| f | 1 << b);
             self.free_blocks.update(|n| n + 1);
             self.free_from.update(|f| f.min(i));
