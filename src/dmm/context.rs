@@ -29,8 +29,9 @@ impl<'gc> Mutation<'gc> {
         self.context.metrics()
     }
 
-    /// IF we are in the marking phase AND the `parent` pointer is colored black AND the `child` (if
-    /// given) is colored white, then change the `parent` color to gray and enqueue it for tracing.
+    /// IF the `parent` pointer is colored black and we are in the marking phase, then change it to
+    /// gray and enqueue it for tracing again. A white parent just becomes light gray (see
+    /// `GcBoxHeader`), so it needs no barrier until it is next traced; `child` is not looked at.
     ///
     /// This operation is known as a "backwards write barrier". Calling this method is one of the
     /// safe ways for the value in the `parent` pointer to use internal mutability to adopt the
@@ -48,7 +49,8 @@ impl<'gc> Mutation<'gc> {
         )
     }
 
-    /// Whether [`Mutation::backward_barrier`] on `parent` with no child would do any work.
+    /// Whether [`Mutation::backward_barrier`] on `parent` would enqueue it. When not, the rest of
+    /// what it does is done, so `parent` may be written without it.
     #[inline]
     pub fn backward_barrier_pending(&self, parent: Gc<'gc, ()>) -> bool {
         self.context
@@ -418,49 +420,45 @@ impl Context {
         ptr
     }
 
+    // LuaJIT 3.0's quad-color barrier: a gray parent (light gray: new or written since it was
+    // traced, or dark gray: queued) needs nothing. The child is not looked at, as in LuaJIT 2's
+    // table barrier: it is almost always white anyway.
     #[inline]
-    fn backward_barrier(&self, parent: GcBox, child: Option<GcBox>) {
-        // During the marking phase, if we are mutating a black object, we may add a white object to
-        // it and invalidate the invariant that black objects may not point to white objects. Turn
-        // the black parent object gray to prevent this.
-        //
-        // NOTE: This also adds the pointer to the gray_again queue even if `header.needs_trace()`
-        // is false, but this is not harmful (just wasteful). There's no reason to call a barrier on
-        // a pointer that can't adopt other pointers, so we skip the check.
-        if self.phase == Phase::Mark
-            && is_black(parent)
-            && child.map(|c| unsafe { !heap::is_marked(c) }).unwrap_or(true)
-        {
-            // Outline the actual barrier code (which is somewhat expensive and won't be executed
-            // often) to promote the inlining of the write barrier.
+    fn backward_barrier(&self, parent: GcBox, _child: Option<GcBox>) {
+        if !parent.header().is_gray() {
             #[cold]
+            #[inline(never)]
             fn barrier(this: &Context, parent: GcBox) {
-                this.make_gray_again(parent);
+                if !this.lighten(parent) {
+                    this.make_gray_again(parent);
+                }
             }
             barrier(self, parent);
         }
     }
 
+    /// Whether the barrier on `parent` would enqueue it; when not, whatever else it does is done.
     #[inline]
     fn backward_barrier_pending(&self, parent: GcBox) -> bool {
-        self.phase == Phase::Mark && is_black(parent)
+        !parent.header().is_gray() && !self.lighten(parent)
+    }
+
+    /// Turn a white `parent` light gray. False for a black one while marking, which has to be
+    /// traced again.
+    #[cold]
+    #[inline(never)]
+    fn lighten(&self, parent: GcBox) -> bool {
+        // SAFETY: a barrier is only called on a live object.
+        if self.phase == Phase::Mark && unsafe { heap::is_marked(parent) } {
+            return false;
+        }
+        parent.header().set_gray(true);
+        true
     }
 
     #[inline]
-    fn backward_barrier_weak(&self, parent: GcBox, child: GcBox) {
-        if self.phase == Phase::Mark
-            && is_black(parent)
-            && !child.header().is_weak()
-            && unsafe { !heap::is_marked(child) }
-        {
-            // Outline the actual barrier code (which is somewhat expensive and won't be executed
-            // often) to promote the inlining of the write barrier.
-            #[cold]
-            fn barrier(this: &Context, parent: GcBox) {
-                this.make_gray_again(parent);
-            }
-            barrier(self, parent);
-        }
+    fn backward_barrier_weak(&self, parent: GcBox, _child: GcBox) {
+        self.backward_barrier(parent, None);
     }
 
     #[inline]

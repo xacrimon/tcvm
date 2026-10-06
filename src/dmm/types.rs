@@ -122,7 +122,9 @@ pub(crate) struct GcBoxHeader {
     /// A custom virtual function table for handling type-specific operations.
     ///
     /// The lower bits of the pointer are used to store GC flags:
-    /// - bit 0 (`GRAY`): queued for tracing; a marked object without it is black;
+    /// - bit 0 (`GRAY`): writes need no barrier. Set at birth (light gray), by the first write
+    ///   since the object was last traced (light gray again), and while it waits to be traced
+    ///   (dark gray, marked); cleared when traced, leaving it black;
     /// - bit 1 (`WEAK`): reached only through a `GcWeak` so far this cycle;
     /// - bit 2 for the `needs_trace` flag;
     /// - bit 3 for the `is_live` flag.
@@ -161,7 +163,7 @@ impl GcBoxHeader {
 
     #[inline(always)]
     fn with_vtable(vtable: &'static CollectVtable, needs_trace: bool) -> Self {
-        let flags = LIVE | if needs_trace { NEEDS_TRACE } else { 0 };
+        let flags = GRAY | LIVE | if needs_trace { NEEDS_TRACE } else { 0 };
         Self {
             tagged_vtable: Cell::new((vtable as *const CollectVtable).map_addr(|a| a | flags)),
         }
