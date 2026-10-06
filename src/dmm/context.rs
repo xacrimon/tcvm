@@ -10,7 +10,7 @@ use std::{boxed::Box, vec::Vec};
 use crate::dmm::{
     Gc, GcWeak,
     collect::{Collect, Trace},
-    heap::{CELL, GrayQueue, Heap},
+    heap::{self, CELL, Heap},
     metrics::Metrics,
     types::{GcBox, GcBoxHeader, GcBoxInner, Invariant, TrailingBytes, trailing_layout},
 };
@@ -222,7 +222,7 @@ pub(crate) struct Context {
 
     /// A queue of gray objects, used during `Phase::Mark`.
     /// This holds traceable objects that have yet to be traced.
-    gray: GrayQueue,
+    gray: Queue<GcBox>,
 
     // A queue of gray objects that became gray as a result
     // of a write barrier.
@@ -255,7 +255,7 @@ impl Context {
             metrics: NonNull::from(Box::leak(Box::new(Metrics::new()))),
             heap: ManuallyDrop::new(Heap::new()),
             root_needs_trace: true,
-            gray: GrayQueue::new(),
+            gray: Queue::new(),
             gray_again: Queue::new(),
             tracing: None,
             deferred: Queue::new(),
@@ -326,6 +326,7 @@ impl Context {
                 Phase::Sleep => {
                     has_slept = true;
                     // Immediately enter the mark phase
+                    cx.heap.start_marking();
                     cx.switch(Phase::Mark);
                 }
                 Phase::Mark => {
@@ -341,7 +342,7 @@ impl Context {
                             // If we have no gray objects left, we enter the sweep phase.
                             cx.switch(Phase::Sweep);
                             cx.settle_weak();
-                            // Allocation from here on only uses chunks already swept, so nothing
+                            // Allocation from here on only uses blocks already swept, so nothing
                             // allocated during the sweep is freed by it.
                             cx.heap.start_sweep(cx.metrics());
                         }
@@ -396,7 +397,6 @@ impl Context {
             .cast::<GcBoxInner<T>>();
         // SAFETY: a fresh block of `size` bytes.
         unsafe { ptr.write(GcBoxInner::new(GcBoxHeader::new::<T>(), t)) };
-        self.metrics().mark_gc_allocated(size);
         ptr
     }
 
@@ -423,7 +423,6 @@ impl Context {
             ptr.expose_provenance();
             init(ptr.cast::<u8>().add(GcBoxInner::<T>::TRAILING_OFFSET));
         }
-        self.metrics().mark_gc_allocated(size);
         ptr
     }
 
@@ -502,6 +501,18 @@ impl Context {
 
     #[inline]
     fn trace(&self, gc_box: GcBox) {
+        // Out of line as a tail call, so the common case needs no stack frame.
+        if heap::is_huge_box(gc_box) {
+            #[cold]
+            #[inline(never)]
+            fn trace_huge(this: &Context, gc_box: GcBox) {
+                // SAFETY: as below.
+                if unsafe { !this.heap.is_marked(gc_box) && this.heap.mark(gc_box) } {
+                    this.gray.push(gc_box);
+                }
+            }
+            return trace_huge(self, gc_box);
+        }
         // SAFETY: a traced pointer is a live object's.
         if unsafe { self.heap.is_marked(gc_box) } {
             return;
@@ -511,8 +522,7 @@ impl Context {
         // so a write to it takes the barrier and queues it again: traversing twice is cheaper
         // than reading every object as it is found.
         if unsafe { self.heap.mark(gc_box) } {
-            // SAFETY: it was just marked, so it isn't queued.
-            unsafe { self.gray.push(gc_box) };
+            self.gray.push(gc_box);
         }
     }
 
@@ -541,7 +551,7 @@ impl Context {
                         gc_box.drop_in_place();
                         self.metrics().mark_gc_dropped(size);
                     }
-                    self.heap.mark(gc_box);
+                    self.heap.mark_untraced(gc_box, size);
                     self.metrics().mark_gc_marked(size);
                 }
             }
@@ -579,6 +589,8 @@ impl Context {
             let size = gc_box.size();
             self.metrics().mark_gc_marked(size);
             self.metrics().mark_gc_traced(size);
+            // SAFETY: a queued object is marked and live.
+            unsafe { self.heap.mark_lines(gc_box, size) };
             // Black before the traversal, so writes during it are caught.
             gc_box.header().set_gray(false);
             // Drop and huge chunks also hold types with nothing to trace.
@@ -710,9 +722,23 @@ impl<T> Queue<T> {
         unsafe { (*self.vec.get().cast_const()).is_empty() }
     }
 
+    #[inline]
     fn push(&self, val: T) {
+        let vec = unsafe { &mut *self.vec.get() };
+        let len = vec.len();
+        if len == vec.capacity() {
+            // Out of line as a tail call, so the common case needs no stack frame.
+            #[cold]
+            #[inline(never)]
+            fn grow_push<T>(vec: &mut Vec<T>, val: T) {
+                vec.push(val)
+            }
+            return grow_push(vec, val);
+        }
+        // SAFETY: within capacity.
         unsafe {
-            (*self.vec.get()).push(val);
+            vec.as_mut_ptr().add(len).write(val);
+            vec.set_len(len + 1);
         }
     }
 

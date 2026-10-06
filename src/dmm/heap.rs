@@ -1,25 +1,22 @@
-//! The memory the collector manages, after LuaJIT 3.0's GC design (arenas there; chunks here,
-//! as [`Arena`](crate::dmm::Arena) is the collector). A chunk is `CHUNK_SIZE` bytes aligned to
-//! its size, so masking any object pointer finds its metadata: a header and two bitmaps with one
-//! bit per 16-byte cell. A block is an object's run of cells, typed by its first cell:
+//! The memory the collector manages: a single-threaded, non-moving Immix (Blackburn & McKinley,
+//! 2008) after mmtk-core's `ImmixSpace` and `ImmixAllocator`. Chunks of `CHUNK` bytes, aligned to
+//! their size, are cut into blocks of lines of cells; a chunk's first blocks hold the metadata of
+//! all of them, found by masking an object's address:
 //!
-//! | block | mark | cell                  |
-//! |-------|------|-----------------------|
-//! | 0     | 0    | inside a block        |
-//! | 0     | 1    | starts a free block   |
-//! | 1     | 0    | starts a white block  |
-//! | 1     | 1    | starts a black block  |
+//! - a byte per line: 0 if free, else the `epoch` of the marking that last found it live, so lines
+//!   never need clearing before marking (mmtk's line mark states);
+//! - two bits per cell: the mark bit, and an `AUX` bit that starts an object in drop blocks and
+//!   flags one larger than a line in leaf blocks.
 //!
-//! Allocation bumps a pointer through a free run and sets the block bit; sweeping is two word
-//! operations per 64 cells and never reads a dead object unless it needs dropping. A huge object
-//! is allocated on its own, aligned like a chunk, with its metadata in a table keyed by its
-//! address: offset 0 of a chunk holds metadata, so an aligned object pointer is a huge one. Both
-//! are mapped straight from the OS.
+//! Objects are bump-allocated through holes, runs of free lines. Marking marks the lines of the
+//! objects it reaches, and the sweep frees every line no marking reached without visiting the
+//! objects in it, except to drop them. Objects larger than `HUGE` are mapped on their own, aligned
+//! like a chunk, with their metadata in a table keyed by address: offset 0 of a chunk holds
+//! metadata, so an aligned object pointer is a huge one.
 
 use core::cell::{Cell, UnsafeCell};
 use core::ptr::{self, NonNull};
 use std::alloc::{self, Layout};
-use std::collections::BinaryHeap;
 use std::vec::Vec;
 
 use hashbrown::HashTable;
@@ -27,18 +24,29 @@ use hashbrown::HashTable;
 use crate::dmm::{metrics::Metrics, types::GcBox};
 
 pub(crate) const CELL: usize = 16;
-const CHUNK_SIZE: usize = 1 << 18;
-const CELLS: usize = CHUNK_SIZE / CELL;
-const WORDS: usize = CELLS / 64;
-/// Bitmap words covering the metadata's own cells, which hold the header instead.
-const META_WORDS: usize = WORDS / 64;
-const FIRST_CELL: usize = META_WORDS * 64;
-/// Objects bigger than this are huge.
-const HUGE: usize = CHUNK_SIZE / 8;
+const LINE: usize = 256;
+const BLOCK: usize = 1 << 15;
+const CHUNK: usize = 1 << 22;
+const LINES: usize = BLOCK / LINE;
+const BLOCKS: usize = CHUNK / BLOCK;
+/// Bitmap words per block, at two bits per cell.
+const WORDS: usize = BLOCK / CELL * 2 / 64;
+/// Blocks at the start of a chunk taken by its metadata.
+const META_BLOCKS: usize = size_of::<Chunk>().div_ceil(BLOCK);
+const DATA_BLOCKS: u128 = !0 << META_BLOCKS;
+/// Objects bigger than this are huge: half a block, as in mmtk.
+const HUGE: usize = BLOCK / 2;
 
-#[derive(Copy, Clone, Eq, PartialEq)]
+const MARK: u64 = 0x5555_5555_5555_5555;
+const AUX: u64 = MARK << 1;
+
+const _: () = assert!(BLOCKS == 128 && META_BLOCKS < BLOCKS);
+const _: () = assert!(LINES <= u16::MAX as usize);
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+#[repr(u8)]
 enum Kind {
-    /// Traced objects without drop glue.
+    /// Traced objects without drop glue; zeroed metadata reads as this.
     Plain,
     /// Untraced objects without drop glue, which marking never reads.
     Leaf,
@@ -47,68 +55,87 @@ enum Kind {
 }
 
 #[repr(C)]
-struct Header {
-    /// Bytes of the blocks allocated here, as of the last run retired from this chunk.
-    allocated: Cell<usize>,
-    kind: Kind,
+struct BlockInfo {
+    /// The next block in its space's `recyclable` list.
+    next: Cell<*mut u8>,
+    /// Lines charged to allocation since the block was last swept, plus the ones it kept then.
+    held: Cell<u16>,
+    kind: Cell<Kind>,
+    /// Swept this cycle, when equal to `Heap::swept`.
+    swept: Cell<bool>,
 }
 
-/// A chunk's gray stack: the cells of its objects waiting to be traced.
+#[repr(C, align(128))]
+struct Lines([Cell<u8>; BLOCKS * LINES]);
+
+#[repr(C, align(128))]
+struct Bits([Cell<u64>; BLOCKS * WORDS]);
+
+/// A chunk's metadata, at its start. Entries for the metadata's own blocks go unused.
 #[repr(C)]
-struct GrayStack {
-    cells: Cell<*mut u16>,
-    len: Cell<u32>,
-    cap: Cell<u32>,
-    /// In the gray queue, or being drained.
-    queued: Cell<bool>,
+struct Chunk {
+    /// Free blocks, one bit each.
+    free: Cell<u128>,
+    blocks: [BlockInfo; BLOCKS],
+    lines: Lines,
+    bits: Bits,
 }
-
-#[repr(C)]
-struct Meta {
-    /// In place of the block bits of the metadata's own cells.
-    header: Header,
-    _header_pad: [u8; META_WORDS * 8 - size_of::<Header>()],
-    block: [Cell<u64>; WORDS - META_WORDS],
-    /// In place of the mark bits of the metadata's own cells.
-    gray: GrayStack,
-    _gray_pad: [u8; META_WORDS * 8 - size_of::<GrayStack>()],
-    mark: [Cell<u64>; WORDS - META_WORDS],
-}
-
-const _: () = assert!(size_of::<Header>() <= META_WORDS * 8);
-const _: () = assert!(size_of::<GrayStack>() <= META_WORDS * 8);
-const _: () = assert!(CELLS <= 1 << 16);
-const _: () = assert!(size_of::<Meta>() == FIRST_CELL * CELL);
 
 #[inline(always)]
-fn meta<'a>(p: *const u8) -> &'a Meta {
+fn chunk_of<'a>(p: *const u8) -> &'a Chunk {
     // SAFETY (for callers): `p` points into a live chunk, whose metadata starts at its base.
-    unsafe { &*p.map_addr(|a| a & !(CHUNK_SIZE - 1)).cast::<Meta>() }
+    unsafe { &*p.map_addr(|a| a & !(CHUNK - 1)).cast::<Chunk>() }
 }
 
 #[inline(always)]
-fn cell_of(p: *const u8) -> usize {
-    (p.addr() & (CHUNK_SIZE - 1)) / CELL
+fn block_index(p: *const u8) -> usize {
+    (p.addr() / BLOCK) % BLOCKS
 }
 
-/// The word index and bit of `cell` in a bitmap.
+/// The index of `p`'s line in its chunk.
 #[inline(always)]
-fn bit(cell: usize) -> (usize, u64) {
-    (cell / 64 - META_WORDS, 1 << (cell % 64))
+fn line_index(p: *const u8) -> usize {
+    (p.addr() % CHUNK) / LINE
+}
+
+/// The index of the bitmap word holding `p`'s cell in its chunk, and its mark bit.
+#[inline(always)]
+fn mark_bit(p: *const u8) -> (usize, u64) {
+    let cell = (p.addr() % CHUNK) / CELL;
+    (cell / 32, 1 << (cell % 32 * 2))
 }
 
 #[inline(always)]
-fn base(meta: &Meta) -> *mut u8 {
-    ptr::from_ref(meta).cast::<u8>().cast_mut()
+fn block_start(chunk: &Chunk, b: usize) -> *mut u8 {
+    ptr::from_ref(chunk)
+        .cast::<u8>()
+        .cast_mut()
+        .wrapping_add(b * BLOCK)
+}
+
+#[inline(always)]
+fn block_lines(chunk: &Chunk, b: usize) -> &[Cell<u8>; LINES] {
+    chunk.lines.0[b * LINES..][..LINES].try_into().unwrap()
+}
+
+#[inline(always)]
+fn block_bits(chunk: &Chunk, b: usize) -> &[Cell<u64>; WORDS] {
+    chunk.bits.0[b * WORDS..][..WORDS].try_into().unwrap()
 }
 
 /// Whether the object at `p` is huge rather than in a chunk.
 #[inline(always)]
 fn is_huge(p: *const u8) -> bool {
-    p.addr() & (CHUNK_SIZE - 1) == 0
+    p.addr().is_multiple_of(CHUNK)
 }
 
-/// A huge object's metadata (LuaJIT 3.0's huge block table). Its gray bit is the one in its own
+/// Whether `p` is a huge object rather than one in a chunk.
+#[inline(always)]
+pub(crate) fn is_huge_box(p: GcBox) -> bool {
+    is_huge(p.as_ptr())
+}
+
+/// A huge object's metadata (mmtk's large object space). Its gray bit is the one in its own
 /// header, as for any object.
 struct Huge {
     ptr: NonNull<u8>,
@@ -121,7 +148,7 @@ struct Huge {
 #[inline(always)]
 fn huge_hash(p: *const u8) -> u64 {
     // Huge objects' addresses differ only above the chunk bits.
-    ((p.addr() >> CHUNK_SIZE.trailing_zeros()) as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    ((p.addr() / CHUNK) as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
 /// # Safety
@@ -135,12 +162,12 @@ unsafe fn free_huge(huge: &Huge, metrics: Option<&Metrics>) {
     }
 }
 
-/// Map `size` bytes, zeroed and aligned to `CHUNK_SIZE`, from the OS. Only `size` rounded up to
-/// whole pages stays mapped; the slack taken to align it is unmapped again.
+/// Map `size` bytes, zeroed and aligned to `CHUNK`, from the OS. Only `size` rounded up to whole
+/// pages stays mapped; the slack taken to align it is unmapped again.
 fn map(size: usize) -> NonNull<u8> {
     let page = page_size();
     let len = size.next_multiple_of(page);
-    let span = len.checked_add(CHUNK_SIZE - page).expect("allocation too large");
+    let span = len.checked_add(CHUNK - page).expect("allocation too large");
     // SAFETY: a new anonymous mapping, trimmed to an aligned `len` bytes.
     unsafe {
         let p = libc::mmap(
@@ -152,10 +179,10 @@ fn map(size: usize) -> NonNull<u8> {
             0,
         );
         if p == libc::MAP_FAILED {
-            alloc::handle_alloc_error(Layout::from_size_align_unchecked(size, CHUNK_SIZE));
+            alloc::handle_alloc_error(Layout::from_size_align_unchecked(size, CHUNK));
         }
         let p = p.cast::<u8>();
-        let start = p.map_addr(|a| a.next_multiple_of(CHUNK_SIZE));
+        let start = p.map_addr(|a| a.next_multiple_of(CHUNK));
         let head = start.addr() - p.addr();
         if head != 0 {
             libc::munmap(p.cast(), head);
@@ -178,106 +205,85 @@ fn page_size() -> usize {
     unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
 }
 
-#[derive(Copy, Clone)]
-struct Sweep {
-    /// The next chunk to sweep.
-    next: usize,
-    /// Chunks from here on were made while sweeping; their objects are all new.
-    end: usize,
-}
-
-/// Where objects of one kind are bump-allocated.
+/// Where objects of one kind are bump-allocated (mmtk's `ImmixAllocator`).
 struct Space {
     kind: Kind,
-    /// The run being bump-allocated: `top..limit` is free, `run_start..top` allocated since the
-    /// run began. All null when there is none.
-    top: Cell<*mut u8>,
+    /// The hole being bump-allocated through: `cursor..limit`. Both null when there is none.
+    cursor: Cell<*mut u8>,
     limit: Cell<*mut u8>,
-    run_start: Cell<*mut u8>,
-    /// Where the search for the next run resumes.
-    scan_chunk: Cell<usize>,
-    scan_cell: Cell<usize>,
+    /// The block the next hole is looked for in, from line `hole_line` on; null when none.
+    hole_block: Cell<*mut u8>,
+    hole_line: Cell<usize>,
+    /// Where objects larger than a line that missed the current hole go, in free blocks only, so
+    /// they don't make it give up the rest of a hole.
+    big_cursor: Cell<*mut u8>,
+    big_limit: Cell<*mut u8>,
+    /// Swept blocks of this kind with free lines, linked through `BlockInfo::next`.
+    recyclable: Cell<*mut u8>,
 }
 
 impl Space {
-    fn new(kind: Kind) -> Self {
+    const fn new(kind: Kind) -> Self {
         Self {
             kind,
-            top: Cell::new(ptr::null_mut()),
+            cursor: Cell::new(ptr::null_mut()),
             limit: Cell::new(ptr::null_mut()),
-            run_start: Cell::new(ptr::null_mut()),
-            scan_chunk: Cell::new(0),
-            scan_cell: Cell::new(FIRST_CELL),
+            hole_block: Cell::new(ptr::null_mut()),
+            hole_line: Cell::new(0),
+            big_cursor: Cell::new(ptr::null_mut()),
+            big_limit: Cell::new(ptr::null_mut()),
+            recyclable: Cell::new(ptr::null_mut()),
         }
     }
 
-    #[inline(always)]
-    fn bump(&self, size: usize) -> Option<NonNull<u8>> {
-        let top = self.top.get();
-        if size > self.limit.get().addr() - top.addr() {
-            return None;
-        }
-        self.top.set(top.wrapping_add(size));
-        let (w, b) = bit(cell_of(top));
-        meta(top).block[w].update(|m| m | b);
-        // SAFETY: `top` is in a chunk.
-        Some(unsafe { NonNull::new_unchecked(top) })
-    }
-
-    /// Bump-allocate from `start..end` of `meta`, a free run.
-    fn start_run(&self, meta: &Meta, start: usize, end: usize) {
-        // Clear the free-block starts so the run reads as one block's inside until allocated.
-        clear_range(&meta.mark, start, end);
-        let base = base(meta);
-        // SAFETY: both are within the chunk.
-        let (start, end) = unsafe { (base.add(start * CELL), base.add(end * CELL)) };
-        self.run_start.set(start);
-        self.top.set(start);
-        self.limit.set(end);
-    }
-
-    /// End the current run, leaving its unused tail a free block.
-    fn retire_run(&self) {
-        let top = self.top.get();
-        if top.is_null() {
-            return;
-        }
-        let meta = meta(self.run_start.get());
-        if top != self.limit.get() {
-            let (w, b) = bit(cell_of(top));
-            meta.mark[w].update(|m| m | b);
-        }
-        let used = top.addr() - self.run_start.get().addr();
-        meta.header.allocated.update(|n| n + used);
-        self.top.set(ptr::null_mut());
+    /// Give up every block this space allocates in or from, for the sweep to reclaim.
+    fn retire(&self) {
+        self.cursor.set(ptr::null_mut());
         self.limit.set(ptr::null_mut());
-        self.run_start.set(ptr::null_mut());
-    }
-
-    fn rescan(&self) {
-        self.scan_chunk.set(0);
-        self.scan_cell.set(FIRST_CELL);
+        self.hole_block.set(ptr::null_mut());
+        self.big_cursor.set(ptr::null_mut());
+        self.big_limit.set(ptr::null_mut());
+        self.recyclable.set(ptr::null_mut());
     }
 }
 
+/// The next block to sweep.
+#[derive(Copy, Clone)]
+struct Sweep {
+    chunk: usize,
+    block: usize,
+}
+
 pub(crate) struct Heap {
-    chunks: UnsafeCell<Vec<NonNull<Meta>>>,
-    huge: UnsafeCell<HashTable<Huge>>,
-    plain: Space,
-    leaf: Space,
-    drop: Space,
+    chunks: UnsafeCell<Vec<NonNull<Chunk>>>,
+    /// No chunk before this one has a free block.
+    free_from: Cell<usize>,
+    free_blocks: Cell<usize>,
+    /// Indexed by `Kind`.
+    spaces: [Space; 3],
+    /// The line mark of the current or last marking; never 0.
+    epoch: Cell<u8>,
+    /// Flipped as each sweep starts; see `BlockInfo::swept`.
+    swept: Cell<bool>,
     sweep: Cell<Option<Sweep>>,
+    huge: UnsafeCell<HashTable<Huge>>,
 }
 
 impl Heap {
     pub(crate) fn new() -> Self {
         Self {
             chunks: UnsafeCell::new(Vec::new()),
-            huge: UnsafeCell::new(HashTable::new()),
-            plain: Space::new(Kind::Plain),
-            leaf: Space::new(Kind::Leaf),
-            drop: Space::new(Kind::Drop),
+            free_from: Cell::new(0),
+            free_blocks: Cell::new(0),
+            spaces: [
+                Space::new(Kind::Plain),
+                Space::new(Kind::Leaf),
+                Space::new(Kind::Drop),
+            ],
+            epoch: Cell::new(1),
+            swept: Cell::new(false),
             sweep: Cell::new(None),
+            huge: UnsafeCell::new(HashTable::new()),
         }
     }
 
@@ -286,7 +292,7 @@ impl Heap {
     /// result within its own body is enough.
     #[allow(clippy::mut_from_ref)]
     #[inline(always)]
-    unsafe fn chunks(&self) -> &mut Vec<NonNull<Meta>> {
+    unsafe fn chunks(&self) -> &mut Vec<NonNull<Chunk>> {
         unsafe { &mut *self.chunks.get() }
     }
 
@@ -321,12 +327,14 @@ impl Heap {
             }
             return huge_marked(self, p);
         }
-        let (w, b) = bit(cell_of(p));
-        meta(p).mark[w].get() & b != 0
+        let (w, m) = mark_bit(p);
+        chunk_of(p).bits.0[w].get() & m != 0
     }
 
-    /// Mark `p` and return whether it needs tracing, reading only metadata (LuaJIT 3.0's
-    /// marking). Only leaf chunks hold objects that need no tracing.
+    /// Mark `p` and return whether it needs tracing, which marks its lines (`mark_lines`). A leaf
+    /// is never read: its first line is marked, and the next one is kept from allocation as it may
+    /// hold the rest (the Immix paper's conservative line marking); a leaf larger than a line has
+    /// its `AUX` bit set and all its lines marked.
     ///
     /// # Safety
     /// `p` must be an unmarked live object's start.
@@ -343,14 +351,79 @@ impl Heap {
             }
             return mark_huge(self, p);
         }
-        let meta = meta(p);
-        let (w, b) = bit(cell_of(p));
-        meta.mark[w].update(|m| m | b);
-        meta.header.kind != Kind::Leaf
+        let chunk = chunk_of(p);
+        let (w, m) = mark_bit(p);
+        let word = &chunk.bits.0[w];
+        let old = word.get();
+        word.set(old | m);
+        if chunk.blocks[block_index(p)].kind.get() != Kind::Leaf {
+            return true;
+        }
+        debug_assert_eq!(
+            old & m << 1 != 0,
+            unsafe { GcBox::from_ptr(p) }.size() > LINE
+        );
+        if old & m << 1 != 0 {
+            #[cold]
+            #[inline(never)]
+            fn mark_big_leaf(heap: &Heap, p: *mut u8) {
+                // SAFETY: a marked object's start.
+                unsafe { heap.mark_span(p, GcBox::from_ptr(p).size()) }
+            }
+            mark_big_leaf(self, p);
+        } else {
+            chunk.lines.0[line_index(p)].set(self.epoch.get());
+        }
+        false
     }
 
-    /// Allocate `size` bytes, a multiple of `CELL`, as a white block for an object of a type
-    /// that `needs_drop` and `needs_trace`.
+    /// Mark the lines of the object at `p`, of `size` bytes (mmtk marks lines as it scans).
+    ///
+    /// # Safety
+    /// `p` must be a marked live object's start, and `size` its size.
+    #[inline(always)]
+    pub(crate) unsafe fn mark_lines(&self, p: GcBox, size: usize) {
+        let p = p.as_ptr();
+        if !is_huge(p) {
+            unsafe { self.mark_span(p, size) };
+        }
+    }
+
+    /// Mark an object that won't be traced, as `mark` and `mark_lines` would together.
+    ///
+    /// # Safety
+    /// `p` must be an unmarked live object's start, and `size` its size.
+    pub(crate) unsafe fn mark_untraced(&self, p: GcBox, size: usize) {
+        unsafe {
+            self.mark(p);
+            self.mark_lines(p, size);
+        }
+    }
+
+    /// # Safety
+    /// `p` must start an object of `size` bytes in a chunk.
+    #[inline(always)]
+    unsafe fn mark_span(&self, p: *mut u8, size: usize) {
+        let lines = &chunk_of(p).lines.0;
+        let epoch = self.epoch.get();
+        let (first, last) = (line_index(p), line_index(p.wrapping_add(size - 1)));
+        // Two stores cover anything up to a line long; a loop here becomes a call to memset.
+        lines[first].set(epoch);
+        lines[last].set(epoch);
+        if last > first + 1 {
+            #[cold]
+            #[inline(never)]
+            fn fill(lines: &[Cell<u8>], epoch: u8) {
+                for line in lines {
+                    line.set(epoch);
+                }
+            }
+            fill(&lines[first + 1..last], epoch);
+        }
+    }
+
+    /// Allocate `size` bytes, a multiple of `CELL`, for an object of a type that `needs_drop` and
+    /// `needs_trace`. Allocation is charged to `metrics` a hole at a time.
     #[inline(always)]
     pub(crate) fn alloc(
         &self,
@@ -361,39 +434,170 @@ impl Heap {
     ) -> NonNull<u8> {
         debug_assert!(size.is_multiple_of(CELL) && size > 0);
         if size > HUGE {
-            return self.alloc_huge(size, needs_drop, needs_trace);
+            return self.alloc_huge(size, needs_drop, needs_trace, metrics);
         }
-        let space = match (needs_drop, needs_trace) {
-            (true, _) => &self.drop,
-            (false, true) => &self.plain,
-            (false, false) => &self.leaf,
+        let kind = match (needs_drop, needs_trace) {
+            (true, _) => Kind::Drop,
+            (false, true) => Kind::Plain,
+            (false, false) => Kind::Leaf,
         };
-        match space.bump(size) {
-            Some(p) => p,
-            None => self.alloc_slow(space, size, metrics),
+        let space = &self.spaces[kind as usize];
+        let top = space.cursor.get();
+        let p = if size <= space.limit.get().addr() - top.addr() {
+            space.cursor.set(top.wrapping_add(size));
+            top
+        } else {
+            self.alloc_slow(space, size, metrics)
+        };
+        // Debug builds also mark where plain objects start, to check their lines in the sweep.
+        if kind == Kind::Drop
+            || (kind == Kind::Leaf && size > LINE)
+            || (cfg!(debug_assertions) && kind == Kind::Plain)
+        {
+            let (w, m) = mark_bit(p);
+            chunk_of(p).bits.0[w].update(|x| x | m << 1);
         }
+        // SAFETY: in a chunk.
+        unsafe { NonNull::new_unchecked(p) }
     }
 
     #[cold]
     #[inline(never)]
-    fn alloc_slow(&self, space: &Space, size: usize, metrics: &Metrics) -> NonNull<u8> {
-        space.retire_run();
-        match self.next_run(space, size / CELL, metrics) {
-            Some((meta, start, end)) => space.start_run(meta, start, end),
-            None => {
-                let meta = self.new_chunk(space.kind);
-                space.scan_chunk.set(unsafe { self.chunks() }.len() - 1);
-                space.scan_cell.set(CELLS);
-                space.start_run(meta, FIRST_CELL, CELLS);
+    fn alloc_slow(&self, space: &Space, size: usize, metrics: &Metrics) -> *mut u8 {
+        if size > LINE {
+            let top = space.big_cursor.get();
+            if size <= space.big_limit.get().addr() - top.addr() {
+                space.big_cursor.set(top.wrapping_add(size));
+                return top;
+            }
+            let start = self.take_free_block(space.kind, metrics);
+            space.big_cursor.set(start.wrapping_add(size));
+            space.big_limit.set(start.wrapping_add(BLOCK));
+            return start;
+        }
+        let (start, end) = self.next_hole(space, metrics);
+        space.cursor.set(start.wrapping_add(size));
+        space.limit.set(end);
+        start
+    }
+
+    /// The next hole for `space`: in its block, then in its recyclable blocks, then a free block.
+    fn next_hole(&self, space: &Space, metrics: &Metrics) -> (*mut u8, *mut u8) {
+        loop {
+            let block = space.hole_block.get();
+            if !block.is_null() {
+                let chunk = chunk_of(block);
+                let b = block_index(block);
+                let conservative = space.kind == Kind::Leaf;
+                if let Some((s, e)) = find_hole(chunk, b, space.hole_line.get(), conservative) {
+                    space.hole_line.set(e);
+                    chunk.blocks[b].held.update(|h| h + (e - s) as u16);
+                    metrics.mark_gc_allocated((e - s) * LINE);
+                    let bits = block_bits(chunk, b);
+                    for l in s..e {
+                        // The two lines of a word, one half each.
+                        let half = AUX & (0xffff_ffff << (l % 2 * 32));
+                        if conservative {
+                            // Leaves larger than a line that died here.
+                            bits[l / 2].update(|x| x & !half);
+                        } else {
+                            debug_assert_eq!(
+                                bits[l / 2].get() & half,
+                                0,
+                                "a free line starts an object"
+                            );
+                        }
+                    }
+                    return (block.wrapping_add(s * LINE), block.wrapping_add(e * LINE));
+                }
+                space.hole_block.set(ptr::null_mut());
+            }
+            if let Some(block) = self.pop_recyclable(space, metrics) {
+                space.hole_block.set(block);
+                space.hole_line.set(0);
+                continue;
+            }
+            let block = self.take_free_block(space.kind, metrics);
+            return (block, block.wrapping_add(BLOCK));
+        }
+    }
+
+    /// A swept block of `space`'s kind with free lines, sweeping further for one while a sweep is
+    /// under way and there is no free block to take instead.
+    fn pop_recyclable(&self, space: &Space, metrics: &Metrics) -> Option<*mut u8> {
+        loop {
+            let head = space.recyclable.get();
+            if !head.is_null() {
+                space
+                    .recyclable
+                    .set(chunk_of(head).blocks[block_index(head)].next.get());
+                return Some(head);
+            }
+            if self.free_blocks.get() != 0 || !self.sweep_next(metrics) {
+                return None;
             }
         }
-        space.bump(size).unwrap()
+    }
+
+    /// Take a free block for `kind`, sweeping for one or else mapping a new chunk if there is none,
+    /// and charge all of it.
+    fn take_free_block(&self, kind: Kind, metrics: &Metrics) -> *mut u8 {
+        while self.free_blocks.get() == 0 && self.sweep_next(metrics) {}
+        let mut i = self.free_from.get();
+        let (chunk, b) = loop {
+            let Some(&chunk) = unsafe { self.chunks() }.get(i) else {
+                break (self.new_chunk(), META_BLOCKS);
+            };
+            // SAFETY: chunks in the list are live.
+            let chunk = unsafe { chunk.as_ref() };
+            let free = chunk.free.get();
+            if free != 0 {
+                break (chunk, free.trailing_zeros() as usize);
+            }
+            i += 1;
+        };
+        self.free_from.set(i);
+        self.free_blocks.update(|n| n - 1);
+        chunk.free.update(|f| f & !(1 << b));
+        let info = &chunk.blocks[b];
+        info.next.set(ptr::null_mut());
+        info.held.set(LINES as u16);
+        info.kind.set(kind);
+        // Nothing allocated here before the sweep began, so there's nothing for it to free.
+        info.swept.set(self.swept.get());
+        debug_assert!(block_lines(chunk, b).iter().all(|l| l.get() == 0));
+        // No marks in a free block, but `AUX` bits of dead objects.
+        for w in block_bits(chunk, b) {
+            w.set(0);
+        }
+        metrics.mark_gc_allocated(BLOCK);
+        block_start(chunk, b)
+    }
+
+    fn new_chunk(&self) -> &Chunk {
+        // SAFETY: the mapping is zeroed, which the rest of the metadata starts as.
+        let chunk = unsafe {
+            let chunk = map(CHUNK).cast::<Chunk>();
+            ptr::addr_of_mut!((*chunk.as_ptr()).free).write(Cell::new(DATA_BLOCKS));
+            chunk
+        };
+        unsafe { self.chunks() }.push(chunk);
+        self.free_blocks
+            .update(|n| n + DATA_BLOCKS.count_ones() as usize);
+        // SAFETY: just made; freed only by `finish_sweep` or `Drop`, once free.
+        unsafe { chunk.as_ref() }
     }
 
     #[cold]
     #[inline(never)]
-    fn alloc_huge(&self, size: usize, needs_drop: bool, needs_trace: bool) -> NonNull<u8> {
-        // Not rounded up to whole chunks as in LuaJIT 3.0: only its pages are mapped.
+    fn alloc_huge(
+        &self,
+        size: usize,
+        needs_drop: bool,
+        needs_trace: bool,
+        metrics: &Metrics,
+    ) -> NonNull<u8> {
+        // Not rounded up to whole chunks: only its pages are mapped, and charged.
         let ptr = map(size);
         let huge = Huge {
             ptr,
@@ -405,118 +609,230 @@ impl Heap {
         unsafe { self.huge_table() }.insert_unique(huge_hash(ptr.as_ptr()), huge, |huge| {
             huge_hash(huge.ptr.as_ptr())
         });
+        metrics.mark_gc_allocated(size.next_multiple_of(page_size()));
         ptr
     }
 
-    fn new_chunk(&self, kind: Kind) -> &Meta {
-        // SAFETY: the mapping is zeroed, which the rest of the metadata starts as.
-        let meta = unsafe {
-            let meta = map(CHUNK_SIZE).cast::<Meta>().as_ptr();
-            ptr::addr_of_mut!((*meta).header).write(Header {
-                allocated: Cell::new(0),
-                kind,
-            });
-            NonNull::new_unchecked(meta)
-        };
-        unsafe { self.chunks() }.push(meta);
-        // SAFETY: just made; freed only by `Drop`.
-        unsafe { meta.as_ref() }
-    }
-
-    /// The next free run of at least `cells` cells in one of `space`'s chunks that may be
-    /// allocated into, sweeping chunks on the way if a sweep is under way.
-    fn next_run(
-        &self,
-        space: &Space,
-        cells: usize,
-        metrics: &Metrics,
-    ) -> Option<(&Meta, usize, usize)> {
-        loop {
-            let i = space.scan_chunk.get();
-            let chunk = *unsafe { self.chunks() }.get(i)?;
-            if let Some(sweep) = self.sweep.get()
-                && i >= sweep.next
-                && i < sweep.end
-            {
-                // Sweep up to `i`; the other space may have swept past it already.
-                while self.sweep.get().is_some_and(|s| s.next <= i) {
-                    self.sweep_next(metrics);
-                }
-                continue;
-            }
+    /// Start a marking: a new line mark, and every mark cleared.
+    pub(crate) fn start_marking(&self) {
+        self.epoch.set(if self.epoch.get() == u8::MAX {
+            1
+        } else {
+            self.epoch.get() + 1
+        });
+        for &chunk in unsafe { self.chunks() }.iter() {
             // SAFETY: chunks in the list are live.
-            let meta = unsafe { chunk.as_ref() };
-            if meta.header.kind == space.kind
-                && let Some((start, end)) = find_run(meta, space.scan_cell.get(), cells)
-            {
-                space.scan_cell.set(end);
-                return Some((meta, start, end));
+            let chunk = unsafe { chunk.as_ref() };
+            let free = chunk.free.get();
+            for b in META_BLOCKS..BLOCKS {
+                if free & 1 << b == 0 {
+                    for w in block_bits(chunk, b) {
+                        w.update(|x| x & AUX);
+                    }
+                }
             }
-            space.scan_chunk.set(i + 1);
-            space.scan_cell.set(FIRST_CELL);
+        }
+        for huge in unsafe { self.huge_table() }.iter() {
+            huge.marked.set(false);
         }
     }
 
-    /// Sweep the huge objects, and begin sweeping every chunk that exists now. Allocation from
-    /// here on only uses chunks already swept, or made after this.
+    /// Sweep the huge objects, and begin sweeping every block in use now. Allocation from here on
+    /// only uses blocks already swept, or free.
     pub(crate) fn start_sweep(&self, metrics: &Metrics) {
-        // All at once, unlike chunks, so that huge objects allocated during the sweep are left
+        // All at once, unlike blocks, so that huge objects allocated during the sweep are left
         // alone.
         unsafe { self.huge_table() }.retain(|huge| {
-            if huge.marked.replace(false) {
-                metrics.mark_gc_remembered(huge.size);
+            let size = huge.size.next_multiple_of(page_size());
+            if huge.marked.get() {
+                metrics.mark_gc_remembered(size);
                 return true;
             }
             // SAFETY: an unmarked huge object is unreachable.
             unsafe { free_huge(huge, Some(metrics)) };
-            metrics.mark_gc_freed(huge.size);
+            metrics.mark_gc_freed(size);
             false
         });
-        for space in [&self.plain, &self.leaf, &self.drop] {
-            space.retire_run();
-            space.rescan();
+        for space in &self.spaces {
+            space.retire();
         }
+        self.swept.update(|s| !s);
         self.sweep.set(Some(Sweep {
-            next: 0,
-            end: unsafe { self.chunks() }.len(),
+            chunk: 0,
+            block: META_BLOCKS,
         }));
     }
 
-    /// Sweep the next chunk; false once every chunk is swept.
+    /// Sweep the next block; false once every block is swept.
     pub(crate) fn sweep_next(&self, metrics: &Metrics) -> bool {
         let Some(mut sweep) = self.sweep.get() else {
             return false;
         };
-        if sweep.next == sweep.end {
-            return false;
+        loop {
+            let Some(&chunk) = unsafe { self.chunks() }.get(sweep.chunk) else {
+                self.sweep.set(Some(sweep));
+                return false;
+            };
+            // SAFETY: chunks in the list are live.
+            let chunk = unsafe { chunk.as_ref() };
+            if sweep.block >= BLOCKS {
+                sweep.chunk += 1;
+                sweep.block = META_BLOCKS;
+                continue;
+            }
+            let b = sweep.block;
+            sweep.block += 1;
+            if chunk.free.get() & 1 << b != 0 || chunk.blocks[b].swept.get() == self.swept.get() {
+                continue;
+            }
+            self.sweep.set(Some(sweep));
+            self.sweep_block(chunk, sweep.chunk, b, metrics);
+            return true;
         }
-        // SAFETY: chunks in the list are live.
-        let meta = unsafe { self.chunks()[sweep.next].as_ref() };
-        sweep_chunk(meta, metrics);
-        sweep.next += 1;
-        self.sweep.set(Some(sweep));
-        true
     }
 
-    /// End the sweep once `sweep_next` is done.
+    /// End the sweep once `sweep_next` is done, returning wholly free chunks to the OS but one.
     pub(crate) fn finish_sweep(&self) {
-        debug_assert!(self.sweep.get().is_some_and(|s| s.next == s.end));
+        debug_assert!(
+            self.sweep
+                .get()
+                .is_some_and(|s| s.chunk == unsafe { self.chunks() }.len())
+        );
         self.sweep.set(None);
-        for space in [&self.plain, &self.leaf, &self.drop] {
-            space.rescan();
+        // One is kept so a heap hovering at a chunk boundary doesn't map and unmap every cycle.
+        let mut spare = false;
+        unsafe { self.chunks() }.retain(|&chunk| {
+            // SAFETY: chunks in the list are live.
+            if unsafe { chunk.as_ref() }.free.get() != DATA_BLOCKS || !spare {
+                spare |= unsafe { chunk.as_ref() }.free.get() == DATA_BLOCKS;
+                return true;
+            }
+            // SAFETY: no block of it is in use, so nothing points into it.
+            unsafe { unmap(chunk.as_ptr().cast(), CHUNK) };
+            self.free_blocks
+                .update(|n| n - DATA_BLOCKS.count_ones() as usize);
+            false
+        });
+        self.free_from.set(0);
+    }
+
+    /// Drop the dead objects of block `b` of `chunk`, the `i`th chunk, and free its lines that no
+    /// marking reached since it was last swept (mmtk's `Block::sweep`).
+    fn sweep_block(&self, chunk: &Chunk, i: usize, b: usize, metrics: &Metrics) {
+        let info = &chunk.blocks[b];
+        info.swept.set(self.swept.get());
+        let kind = info.kind.get();
+        let epoch = self.epoch.get();
+        let lines = block_lines(chunk, b);
+        let bits = block_bits(chunk, b);
+        let start = block_start(chunk, b);
+        if kind == Kind::Drop || (cfg!(debug_assertions) && kind == Kind::Plain) {
+            for (w, word) in bits.iter().enumerate() {
+                let x = word.get();
+                #[cfg(debug_assertions)]
+                {
+                    let mut live = x & AUX & (x & MARK) << 1;
+                    while live != 0 {
+                        let cell = w * 32 + live.trailing_zeros() as usize / 2;
+                        let p = start.wrapping_add(cell * CELL);
+                        let size = unsafe { GcBox::from_ptr(p) }.size();
+                        let (first, last) = (line_index(p), line_index(p.wrapping_add(size - 1)));
+                        debug_assert!(
+                            (first..=last).all(|l| chunk.lines.0[l].get() == epoch),
+                            "a marked object's line is unmarked"
+                        );
+                        live &= live - 1;
+                    }
+                }
+                let dead = x & AUX & !((x & MARK) << 1);
+                if dead == 0 {
+                    continue;
+                }
+                if kind == Kind::Drop {
+                    let mut d = dead;
+                    while d != 0 {
+                        let cell = w * 32 + d.trailing_zeros() as usize / 2;
+                        // SAFETY: an unmarked object after marking is unreachable.
+                        unsafe { drop_object(start.wrapping_add(cell * CELL), Some(metrics)) };
+                        d &= d - 1;
+                    }
+                }
+                word.set(x & !dead);
+            }
+        }
+        // A byte counter keeps the loop in byte lanes.
+        let mut live = 0u8;
+        for line in lines {
+            let kept = line.get() == epoch;
+            live += kept as u8;
+            line.set(if kept { epoch } else { 0 });
+        }
+        let live = live as usize;
+        let held = info.held.get() as usize;
+        debug_assert!(live <= held, "marked lines never handed out");
+        metrics.mark_gc_freed((held - live) * LINE);
+        metrics.mark_gc_remembered(live * LINE);
+        info.held.set(live as u16);
+        if live == 0 {
+            chunk.free.update(|f| f | 1 << b);
+            self.free_blocks.update(|n| n + 1);
+            self.free_from.update(|f| f.min(i));
+        } else if find_hole(chunk, b, 0, kind == Kind::Leaf).is_some() {
+            let space = &self.spaces[kind as usize];
+            info.next.set(space.recyclable.get());
+            space.recyclable.set(start);
         }
     }
+}
+
+/// The first hole at or after line `from` of block `b`: a run of free lines, less the first free
+/// line after a live one when `conservative`, as it may hold the end of a small object.
+fn find_hole(chunk: &Chunk, b: usize, from: usize, conservative: bool) -> Option<(usize, usize)> {
+    let lines = block_lines(chunk, b);
+    let mut l = from;
+    loop {
+        while l < LINES && lines[l].get() != 0 {
+            l += 1;
+        }
+        if l == LINES {
+            return None;
+        }
+        if conservative && l > 0 && lines[l - 1].get() != 0 {
+            l += 1;
+            continue;
+        }
+        break;
+    }
+    let start = l;
+    while l < LINES && lines[l].get() == 0 {
+        l += 1;
+    }
+    Some((start, l))
 }
 
 impl Drop for Heap {
     fn drop(&mut self) {
         for &chunk in self.chunks.get_mut().iter() {
-            // SAFETY: the heap owns its chunks; every block holds an initialized object.
+            // SAFETY: the heap owns its chunks; every `AUX` bit in a drop block starts an
+            // initialized object.
             unsafe {
-                if chunk.as_ref().header.kind == Kind::Drop {
-                    for_each_bit(chunk.as_ref(), |b, _| b, |p| drop_object(p, None));
+                let c = chunk.as_ref();
+                let free = c.free.get();
+                for b in META_BLOCKS..BLOCKS {
+                    if free & 1 << b != 0 || c.blocks[b].kind.get() != Kind::Drop {
+                        continue;
+                    }
+                    let start = block_start(c, b);
+                    for (w, word) in block_bits(c, b).iter().enumerate() {
+                        let mut starts = word.get() & AUX;
+                        while starts != 0 {
+                            let cell = w * 32 + starts.trailing_zeros() as usize / 2;
+                            drop_object(start.wrapping_add(cell * CELL), None);
+                            starts &= starts - 1;
+                        }
+                    }
                 }
-                free_chunk(chunk);
+                unmap(chunk.as_ptr().cast(), CHUNK);
             }
         }
         for huge in self.huge.get_mut().drain() {
@@ -526,22 +842,10 @@ impl Drop for Heap {
     }
 }
 
-/// # Safety
-/// `chunk` must be live and unreferenced.
-unsafe fn free_chunk(chunk: NonNull<Meta>) {
-    unsafe {
-        let gray = &chunk.as_ref().gray;
-        if gray.cap.get() != 0 {
-            alloc::dealloc(gray.cells.get().cast(), gray_layout(gray.cap.get()));
-        }
-        unmap(chunk.as_ptr().cast(), CHUNK_SIZE);
-    }
-}
-
 /// Drop the object at `p` unless it was dropped already.
 ///
 /// # Safety
-/// `p` must start a block holding an initialized object nothing will use again.
+/// `p` must start an initialized object nothing will use again.
 unsafe fn drop_object(p: *mut u8, metrics: Option<&Metrics>) {
     // SAFETY: as the caller promises.
     unsafe {
@@ -554,255 +858,4 @@ unsafe fn drop_object(p: *mut u8, metrics: Option<&Metrics>) {
             }
         }
     }
-}
-
-/// Free the white blocks of `meta`, merging neighbouring free blocks, and turn its black ones
-/// white.
-fn sweep_chunk(meta: &Meta, metrics: &Metrics) {
-    let header = &meta.header;
-    let base = base(meta);
-    #[cfg(debug_assertions)]
-    let mut expected = 0;
-    #[cfg(debug_assertions)]
-    for_each_bit(meta, |b, m| b & m, |p| {
-        expected += unsafe { GcBox::from_ptr(p) }.size();
-    });
-    let mut marked = 0;
-    let mut in_black = false;
-    // As if a live block came before the first cell, so a free block there is kept.
-    let mut in_live = true;
-    for w in 0..WORDS - META_WORDS {
-        let (b, m) = (meta.block[w].get(), meta.mark[w].get());
-        // Count the cells of the black blocks: an add carries from each black start through the
-        // extent bits after it, stopped by the next white or free start, and on into the next
-        // word.
-        let black = b & m;
-        let x = !(b | m) | black;
-        let (sum, c1) = x.overflowing_add(black);
-        let (sum, c2) = sum.overflowing_add(in_black as u64);
-        in_black = c1 | c2;
-        marked += (((x ^ sum) | black) & x).count_ones() as usize;
-        if header.kind == Kind::Drop {
-            let mut dead = b & !m;
-            while dead != 0 {
-                let cell = (w + META_WORDS) * 64 + dead.trailing_zeros() as usize;
-                // SAFETY: a white block after marking holds an unreachable object.
-                unsafe { drop_object(base.add(cell * CELL), Some(metrics)) };
-                dead &= dead - 1;
-            }
-        }
-        let (live, free) = (b & m, b ^ m);
-        // Keep only the free starts that follow a live block, by the same carry from each live
-        // start, now stopped by (and so flipping) the first free start after it.
-        let x = !(live | free) | live;
-        let (sum, c1) = x.overflowing_add(live);
-        let (sum, c2) = sum.overflowing_add(in_live as u64);
-        in_live = c1 | c2;
-        meta.block[w].set(live);
-        meta.mark[w].set(free & (x ^ sum));
-    }
-    let (allocated, marked) = (header.allocated.get(), marked * CELL);
-    #[cfg(debug_assertions)]
-    {
-        debug_assert_eq!(marked, expected);
-        let mut prev_free = false;
-        for_each_bit(meta, |b, m| b | m, |p| {
-            let (w, b) = bit(cell_of(p));
-            let free = meta.block[w].get() & b == 0;
-            debug_assert!(!(free && prev_free), "neighbouring free blocks");
-            prev_free = free;
-        });
-    }
-    metrics.mark_gc_freed(allocated - marked);
-    metrics.mark_gc_remembered(marked);
-    header.allocated.set(marked);
-}
-
-/// Call `f` on the start of every cell of `meta` where `select(block, mark)` has a bit set.
-fn for_each_bit(meta: &Meta, select: impl Fn(u64, u64) -> u64, mut f: impl FnMut(*mut u8)) {
-    let base = base(meta);
-    for w in 0..WORDS - META_WORDS {
-        let mut bits = select(meta.block[w].get(), meta.mark[w].get());
-        while bits != 0 {
-            let cell = (w + META_WORDS) * 64 + bits.trailing_zeros() as usize;
-            // SAFETY: within the chunk.
-            f(unsafe { base.add(cell * CELL) });
-            bits &= bits - 1;
-        }
-    }
-}
-
-/// The first cell at or after `from` where `select(block, mark)` has a bit set.
-fn next_bit(meta: &Meta, from: usize, select: impl Fn(u64, u64) -> u64) -> Option<usize> {
-    if from >= CELLS {
-        return None;
-    }
-    let (mut w, _) = bit(from);
-    let mut bits = select(meta.block[w].get(), meta.mark[w].get()) & (!0 << (from % 64));
-    loop {
-        if bits != 0 {
-            return Some((w + META_WORDS) * 64 + bits.trailing_zeros() as usize);
-        }
-        w += 1;
-        if w == WORDS - META_WORDS {
-            return None;
-        }
-        bits = select(meta.block[w].get(), meta.mark[w].get());
-    }
-}
-
-/// The first free block of at least `cells` cells at or after `from`, which runs from a free start
-/// to the next block start.
-fn find_run(meta: &Meta, from: usize, cells: usize) -> Option<(usize, usize)> {
-    let mut from = from;
-    loop {
-        let start = next_bit(meta, from, |b, m| m & !b)?;
-        let end = next_bit(meta, start + 1, |b, _| b).unwrap_or(CELLS);
-        if end - start >= cells {
-            return Some((start, end));
-        }
-        from = end;
-    }
-}
-
-/// Clear the bits of `start..end` in `map`.
-fn clear_range(map: &[Cell<u64>], start: usize, end: usize) {
-    let mut cell = start;
-    while cell < end {
-        let (w, _) = bit(cell);
-        let hi = (cell / 64 + 1) * 64;
-        let lo_bit = cell % 64;
-        let n = end.min(hi) - cell;
-        let mask = if n == 64 {
-            !0
-        } else {
-            ((1u64 << n) - 1) << lo_bit
-        };
-        map[w].update(|m| m & !mask);
-        cell += n;
-    }
-}
-
-fn gray_layout(cap: u32) -> Layout {
-    Layout::array::<u16>(cap as usize).unwrap()
-}
-
-/// The objects waiting to be traced, kept per chunk so tracing works through one chunk at a time
-/// (LuaJIT 3.0's gray stacks and gray queue). Chunks are queued by how much they hold, largest
-/// first, so the bulk of the work has the best locality. Huge objects have no chunk and wait in a
-/// list of their own, traced before the next chunk is taken (the design doesn't say).
-pub(crate) struct GrayQueue {
-    /// Chunks with a nonempty stack, by its length when queued; a waiting chunk is queued again
-    /// each time its length reaches a power of two, and entries for drained chunks are skipped.
-    queue: UnsafeCell<BinaryHeap<(u32, u64, NonNull<Meta>)>>,
-    /// Breaks ties in `queue` toward the chunk queued last.
-    seq: Cell<u64>,
-    /// The chunk being drained.
-    current: Cell<Option<NonNull<Meta>>>,
-    huge: UnsafeCell<Vec<GcBox>>,
-}
-
-impl GrayQueue {
-    pub(crate) fn new() -> Self {
-        Self {
-            queue: UnsafeCell::new(BinaryHeap::new()),
-            seq: Cell::new(0),
-            current: Cell::new(None),
-            huge: UnsafeCell::new(Vec::new()),
-        }
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        // SAFETY: `GrayQueue` is `!Sync` and no reference to its contents escapes a method.
-        unsafe {
-            self.current.get().is_none()
-                && (*self.queue.get()).is_empty()
-                && (*self.huge.get()).is_empty()
-        }
-    }
-
-    /// # Safety
-    /// `p` must be a live object's start that is not in the queue.
-    pub(crate) unsafe fn push(&self, p: GcBox) {
-        if is_huge(p.as_ptr()) {
-            // SAFETY: as in `is_empty`.
-            unsafe { (*self.huge.get()).push(p) };
-            return;
-        }
-        let p = p.as_ptr();
-        let meta = meta(p);
-        let gray = &meta.gray;
-        let len = gray.len.get();
-        if len == gray.cap.get() {
-            grow(gray);
-        }
-        // SAFETY: within capacity.
-        unsafe { gray.cells.get().add(len as usize).write(cell_of(p) as u16) };
-        gray.len.set(len + 1);
-        // A waiting chunk's stack only grows, so this queues it once per doubling; the chunk
-        // being drained goes up and down and is never queued again.
-        let draining = self.current.get() == Some(NonNull::from(meta));
-        if !gray.queued.get() || (!draining && (len + 1).is_power_of_two()) {
-            gray.queued.set(true);
-            let seq = self.seq.get() + 1;
-            self.seq.set(seq);
-            // SAFETY: as in `is_empty`.
-            unsafe { (*self.queue.get()).push((len + 1, seq, NonNull::from(meta))) };
-        }
-    }
-
-    pub(crate) fn pop(&self) -> Option<GcBox> {
-        loop {
-            if let Some(chunk) = self.current.get() {
-                // SAFETY: a queued chunk is live; chunks are only freed after marking.
-                let meta = unsafe { chunk.as_ref() };
-                let gray = &meta.gray;
-                let len = gray.len.get();
-                if len != 0 {
-                    gray.len.set(len - 1);
-                    // SAFETY: below `len`; a stack cell is a gray object's start.
-                    return Some(unsafe {
-                        let cell = *gray.cells.get().add(len as usize - 1);
-                        GcBox::from_ptr(base(meta).add(cell as usize * CELL))
-                    });
-                }
-                gray.queued.set(false);
-                self.current.set(None);
-            }
-            // SAFETY: as in `is_empty`.
-            if let Some(p) = unsafe { (*self.huge.get()).pop() } {
-                return Some(p);
-            }
-            // SAFETY: as in `is_empty`.
-            let (_, _, chunk) = unsafe { (*self.queue.get()).pop()? };
-            // SAFETY: as above.
-            let gray = unsafe { &chunk.as_ref().gray };
-            if gray.queued.get() && gray.len.get() != 0 {
-                self.current.set(Some(chunk));
-            }
-        }
-    }
-}
-
-#[cold]
-fn grow(gray: &GrayStack) {
-    let cap = gray.cap.get();
-    let new_cap = (cap * 2).max(64);
-    // SAFETY: the layouts are nonzero and match the stack's allocation.
-    let cells = unsafe {
-        if cap == 0 {
-            alloc::alloc(gray_layout(new_cap))
-        } else {
-            alloc::realloc(
-                gray.cells.get().cast(),
-                gray_layout(cap),
-                gray_layout(new_cap).size(),
-            )
-        }
-    };
-    if cells.is_null() {
-        alloc::handle_alloc_error(gray_layout(new_cap));
-    }
-    gray.cells.set(cells.cast());
-    gray.cap.set(new_cap);
 }
