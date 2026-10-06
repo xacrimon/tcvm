@@ -381,7 +381,10 @@ impl Context {
     fn allocate<'gc, T: Collect<'gc>>(&self, t: T) -> NonNull<GcBoxInner<T>> {
         const { assert!(align_of::<GcBoxInner<T>>() <= CELL) };
         let size = size_of::<GcBoxInner<T>>().next_multiple_of(CELL);
-        let ptr = self.heap.alloc(size, self.metrics()).cast::<GcBoxInner<T>>();
+        let ptr = self
+            .heap
+            .alloc(size, mem::needs_drop::<T>(), self.metrics())
+            .cast::<GcBoxInner<T>>();
         // SAFETY: a fresh block of `size` bytes.
         unsafe { ptr.write(GcBoxInner::new(GcBoxHeader::new::<T>(), t)) };
         self.metrics().mark_gc_allocated(size);
@@ -398,7 +401,11 @@ impl Context {
         const { assert!(align_of::<GcBoxInner<T>>() <= CELL) };
         let layout = trailing_layout(Layout::new::<GcBoxInner<T>>(), t.trailing_len());
         let size = layout.size().next_multiple_of(CELL);
-        let ptr = self.heap.alloc(size, self.metrics()).cast::<GcBoxInner<T>>();
+        // `TrailingBytes` types have no drop glue.
+        let ptr = self
+            .heap
+            .alloc(size, false, self.metrics())
+            .cast::<GcBoxInner<T>>();
         // SAFETY: a fresh block of `size` bytes. The header and value are written before `init`
         // runs, so a panic in it leaves a whole object for the sweep.
         unsafe {

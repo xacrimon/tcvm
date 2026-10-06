@@ -34,7 +34,10 @@ const HUGE: usize = CHUNK_SIZE / 8;
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 enum Kind {
-    Normal,
+    /// Objects without drop glue.
+    Plain,
+    /// Objects with drop glue.
+    Drop,
     Huge,
     /// A huge chunk whose object died, freed when the sweep ends.
     Dead,
@@ -116,8 +119,9 @@ struct Sweep {
     end: usize,
 }
 
-pub(crate) struct Heap {
-    chunks: UnsafeCell<Vec<NonNull<Meta>>>,
+/// Where objects of one kind are bump-allocated.
+struct Space {
+    kind: Kind,
     /// The run being bump-allocated: `top..limit` is free, `run_start..top` allocated since the
     /// run began. All null when there is none.
     top: Cell<*mut u8>,
@@ -126,6 +130,75 @@ pub(crate) struct Heap {
     /// Where the search for the next run resumes.
     scan_chunk: Cell<usize>,
     scan_cell: Cell<usize>,
+}
+
+impl Space {
+    fn new(kind: Kind) -> Self {
+        Self {
+            kind,
+            top: Cell::new(ptr::null_mut()),
+            limit: Cell::new(ptr::null_mut()),
+            run_start: Cell::new(ptr::null_mut()),
+            scan_chunk: Cell::new(0),
+            scan_cell: Cell::new(FIRST_CELL),
+        }
+    }
+
+    #[inline(always)]
+    fn bump(&self, size: usize) -> Option<NonNull<u8>> {
+        let top = self.top.get();
+        if size > self.limit.get().addr() - top.addr() {
+            return None;
+        }
+        self.top.set(top.wrapping_add(size));
+        let (w, b) = bit(cell_of(top));
+        meta(top).block[w].update(|m| m | b);
+        // SAFETY: `top` is in a chunk.
+        Some(unsafe { NonNull::new_unchecked(top) })
+    }
+
+    /// Bump-allocate from `start..end` of `meta`, a free run.
+    fn start_run(&self, meta: &Meta, start: usize, end: usize) {
+        // Clear the free-block starts so the run reads as one block's inside until allocated.
+        clear_range(&meta.mark, start, end);
+        let base = base(meta);
+        // SAFETY: both are within the chunk.
+        let (start, end) = unsafe { (base.add(start * CELL), base.add(end * CELL)) };
+        self.run_start.set(start);
+        self.top.set(start);
+        self.limit.set(end);
+    }
+
+    /// End the current run, leaving its unused tail a free block.
+    fn retire_run(&self) {
+        let top = self.top.get();
+        if top.is_null() {
+            return;
+        }
+        let meta = meta(self.run_start.get());
+        if top != self.limit.get() {
+            let (w, b) = bit(cell_of(top));
+            meta.mark[w].update(|m| m | b);
+        }
+        let used = top.addr() - self.run_start.get().addr();
+        meta.header.allocated.update(|n| n + used);
+        self.top.set(ptr::null_mut());
+        self.limit.set(ptr::null_mut());
+        self.run_start.set(ptr::null_mut());
+    }
+
+    fn rescan(&self) {
+        self.scan_chunk.set(0);
+        self.scan_cell.set(FIRST_CELL);
+    }
+}
+
+pub(crate) struct Heap {
+    chunks: UnsafeCell<Vec<NonNull<Meta>>>,
+    /// Types without drop glue, whose dead objects the sweep never reads.
+    plain: Space,
+    /// Types with drop glue, whose dead objects the sweep drops.
+    drop: Space,
     sweep: Cell<Option<Sweep>>,
 }
 
@@ -133,11 +206,8 @@ impl Heap {
     pub(crate) fn new() -> Self {
         Self {
             chunks: UnsafeCell::new(Vec::new()),
-            top: Cell::new(ptr::null_mut()),
-            limit: Cell::new(ptr::null_mut()),
-            run_start: Cell::new(ptr::null_mut()),
-            scan_chunk: Cell::new(0),
-            scan_cell: Cell::new(FIRST_CELL),
+            plain: Space::new(Kind::Plain),
+            drop: Space::new(Kind::Drop),
             sweep: Cell::new(None),
         }
     }
@@ -151,38 +221,35 @@ impl Heap {
         unsafe { &mut *self.chunks.get() }
     }
 
-    /// Allocate `size` bytes, a multiple of `CELL`, as a white block.
+    /// Allocate `size` bytes, a multiple of `CELL`, as a white block, among the objects that
+    /// need dropping if `needs_drop`.
     #[inline(always)]
-    pub(crate) fn alloc(&self, size: usize, metrics: &Metrics) -> NonNull<u8> {
+    pub(crate) fn alloc(&self, size: usize, needs_drop: bool, metrics: &Metrics) -> NonNull<u8> {
         debug_assert!(size.is_multiple_of(CELL) && size > 0);
         if size > HUGE {
             return self.alloc_huge(size);
         }
-        let top = self.top.get();
-        if size <= self.limit.get().addr() - top.addr() {
-            self.top.set(top.wrapping_add(size));
-            let (w, b) = bit(cell_of(top));
-            meta(top).block[w].update(|m| m | b);
-            // SAFETY: `top` is in a chunk.
-            return unsafe { NonNull::new_unchecked(top) };
+        let space = if needs_drop { &self.drop } else { &self.plain };
+        match space.bump(size) {
+            Some(p) => p,
+            None => self.alloc_slow(space, size, metrics),
         }
-        self.alloc_slow(size, metrics)
     }
 
     #[cold]
     #[inline(never)]
-    fn alloc_slow(&self, size: usize, metrics: &Metrics) -> NonNull<u8> {
-        self.retire_run();
-        match self.next_run(size / CELL, metrics) {
-            Some((meta, start, end)) => self.start_run(meta, start, end),
+    fn alloc_slow(&self, space: &Space, size: usize, metrics: &Metrics) -> NonNull<u8> {
+        space.retire_run();
+        match self.next_run(space, size / CELL, metrics) {
+            Some((meta, start, end)) => space.start_run(meta, start, end),
             None => {
-                let meta = self.new_chunk(CHUNK_SIZE, Kind::Normal);
-                self.scan_chunk.set(unsafe { self.chunks() }.len() - 1);
-                self.scan_cell.set(CELLS);
-                self.start_run(meta, FIRST_CELL, CELLS);
+                let meta = self.new_chunk(CHUNK_SIZE, space.kind);
+                space.scan_chunk.set(unsafe { self.chunks() }.len() - 1);
+                space.scan_cell.set(CELLS);
+                space.start_run(meta, FIRST_CELL, CELLS);
             }
         }
-        self.alloc(size, metrics)
+        space.bump(size).unwrap()
     }
 
     #[cold]
@@ -220,73 +287,51 @@ impl Heap {
         unsafe { meta.as_ref() }
     }
 
-    /// Bump-allocate from `start..end` of `meta`, a free run.
-    fn start_run(&self, meta: &Meta, start: usize, end: usize) {
-        // Clear the free-block starts so the run reads as one block's inside until allocated.
-        clear_range(&meta.mark, start, end);
-        let base = base(meta);
-        // SAFETY: both are within the chunk.
-        let (start, end) = unsafe { (base.add(start * CELL), base.add(end * CELL)) };
-        self.run_start.set(start);
-        self.top.set(start);
-        self.limit.set(end);
-    }
-
-    /// End the current run, leaving its unused tail a free block.
-    fn retire_run(&self) {
-        let top = self.top.get();
-        if top.is_null() {
-            return;
-        }
-        let meta = meta(self.run_start.get());
-        if top != self.limit.get() {
-            let (w, b) = bit(cell_of(top));
-            meta.mark[w].update(|m| m | b);
-        }
-        let used = top.addr() - self.run_start.get().addr();
-        meta.header.allocated.update(|n| n + used);
-        self.top.set(ptr::null_mut());
-        self.limit.set(ptr::null_mut());
-        self.run_start.set(ptr::null_mut());
-    }
-
-    /// The next free run of at least `cells` cells in a chunk that may be allocated into,
-    /// sweeping chunks on the way if a sweep is under way.
-    fn next_run(&self, cells: usize, metrics: &Metrics) -> Option<(&Meta, usize, usize)> {
+    /// The next free run of at least `cells` cells in one of `space`'s chunks that may be
+    /// allocated into, sweeping chunks on the way if a sweep is under way.
+    fn next_run(
+        &self,
+        space: &Space,
+        cells: usize,
+        metrics: &Metrics,
+    ) -> Option<(&Meta, usize, usize)> {
         loop {
-            let i = self.scan_chunk.get();
+            let i = space.scan_chunk.get();
             let chunk = *unsafe { self.chunks() }.get(i)?;
             if let Some(sweep) = self.sweep.get()
                 && i >= sweep.next
                 && i < sweep.end
             {
-                debug_assert_eq!(i, sweep.next);
-                self.sweep_next(metrics);
+                // Sweep up to `i`; the other space may have swept past it already.
+                while self.sweep.get().is_some_and(|s| s.next <= i) {
+                    self.sweep_next(metrics);
+                }
                 continue;
             }
             // SAFETY: chunks in the list are live.
             let meta = unsafe { chunk.as_ref() };
-            if meta.header.kind.get() == Kind::Normal
-                && let Some((start, end)) = find_run(meta, self.scan_cell.get(), cells)
+            if meta.header.kind.get() == space.kind
+                && let Some((start, end)) = find_run(meta, space.scan_cell.get(), cells)
             {
-                self.scan_cell.set(end);
+                space.scan_cell.set(end);
                 return Some((meta, start, end));
             }
-            self.scan_chunk.set(i + 1);
-            self.scan_cell.set(FIRST_CELL);
+            space.scan_chunk.set(i + 1);
+            space.scan_cell.set(FIRST_CELL);
         }
     }
 
     /// Begin sweeping every chunk that exists now. Allocation from here on only uses chunks
     /// already swept, or made after this.
     pub(crate) fn start_sweep(&self) {
-        self.retire_run();
+        for space in [&self.plain, &self.drop] {
+            space.retire_run();
+            space.rescan();
+        }
         self.sweep.set(Some(Sweep {
             next: 0,
             end: unsafe { self.chunks() }.len(),
         }));
-        self.scan_chunk.set(0);
-        self.scan_cell.set(FIRST_CELL);
     }
 
     /// Sweep the next chunk; false once every chunk is swept.
@@ -318,8 +363,8 @@ impl Heap {
             unsafe { free_chunk(*chunk) };
             false
         });
-        self.scan_chunk.set(0);
-        self.scan_cell.set(FIRST_CELL);
+        self.plain.rescan();
+        self.drop.rescan();
     }
 }
 
@@ -328,7 +373,9 @@ impl Drop for Heap {
         for &chunk in self.chunks.get_mut().iter() {
             // SAFETY: the heap owns its chunks; every block holds an initialized object.
             unsafe {
-                for_each_bit(chunk.as_ref(), |b, _| b, |p| drop_object(p, None));
+                if chunk.as_ref().header.kind.get() != Kind::Plain {
+                    for_each_bit(chunk.as_ref(), |b, _| b, |p| drop_object(p, None));
+                }
                 free_chunk(chunk);
             }
         }
@@ -369,16 +416,18 @@ unsafe fn drop_object(p: *mut u8, metrics: Option<&Metrics>) {
 fn sweep_chunk(meta: &Meta, metrics: &Metrics) {
     let header = &meta.header;
     match header.kind.get() {
-        Kind::Normal => {
+        kind @ (Kind::Plain | Kind::Drop) => {
             let base = base(meta);
             for w in 0..WORDS - META_WORDS {
                 let (b, m) = (meta.block[w].get(), meta.mark[w].get());
-                let mut dead = b & !m;
-                while dead != 0 {
-                    let cell = (w + META_WORDS) * 64 + dead.trailing_zeros() as usize;
-                    // SAFETY: a white block after marking holds an unreachable object.
-                    unsafe { drop_object(base.add(cell * CELL), Some(metrics)) };
-                    dead &= dead - 1;
+                if kind == Kind::Drop {
+                    let mut dead = b & !m;
+                    while dead != 0 {
+                        let cell = (w + META_WORDS) * 64 + dead.trailing_zeros() as usize;
+                        // SAFETY: a white block after marking holds an unreachable object.
+                        unsafe { drop_object(base.add(cell * CELL), Some(metrics)) };
+                        dead &= dead - 1;
+                    }
                 }
                 meta.block[w].set(b & m);
                 meta.mark[w].set(b ^ m);
