@@ -61,8 +61,6 @@ struct BlockInfo {
     /// Lines charged to allocation since the block was last swept, plus the ones it kept then.
     held: Cell<u16>,
     kind: Cell<Kind>,
-    /// Swept this cycle, when equal to `Heap::swept`.
-    swept: Cell<bool>,
 }
 
 #[repr(C, align(128))]
@@ -247,13 +245,6 @@ impl Space {
     }
 }
 
-/// The next block to sweep.
-#[derive(Copy, Clone)]
-struct Sweep {
-    chunk: usize,
-    block: usize,
-}
-
 pub(crate) struct Heap {
     chunks: UnsafeCell<Vec<NonNull<Chunk>>>,
     /// No chunk before this one has a free block.
@@ -263,9 +254,6 @@ pub(crate) struct Heap {
     spaces: [Space; 3],
     /// The line mark of the current or last marking; never 0.
     epoch: Cell<u8>,
-    /// Flipped as each sweep starts; see `BlockInfo::swept`.
-    swept: Cell<bool>,
-    sweep: Cell<Option<Sweep>>,
     huge: UnsafeCell<HashTable<Huge>>,
     /// Huge objects allocated since the last collection, the only ones a minor one can free
     /// (mmtk's large object nursery).
@@ -284,8 +272,6 @@ impl Heap {
                 Space::new(Kind::Drop),
             ],
             epoch: Cell::new(1),
-            swept: Cell::new(false),
-            sweep: Cell::new(None),
             huge: UnsafeCell::new(HashTable::new()),
             young_huge: UnsafeCell::new(Vec::new()),
         }
@@ -516,7 +502,7 @@ impl Heap {
                 }
                 space.hole_block.set(ptr::null_mut());
             }
-            if let Some(block) = self.pop_recyclable(space, metrics) {
+            if let Some(block) = self.pop_recyclable(space) {
                 space.hole_block.set(block);
                 space.hole_line.set(0);
                 continue;
@@ -526,27 +512,20 @@ impl Heap {
         }
     }
 
-    /// A swept block of `space`'s kind with free lines, sweeping further for one while a sweep is
-    /// under way and there is no free block to take instead.
-    fn pop_recyclable(&self, space: &Space, metrics: &Metrics) -> Option<*mut u8> {
-        loop {
-            let head = space.recyclable.get();
-            if !head.is_null() {
-                space
-                    .recyclable
-                    .set(chunk_of(head).blocks[block_index(head)].next.get());
-                return Some(head);
-            }
-            if self.free_blocks.get() != 0 || !self.sweep_next(metrics) {
-                return None;
-            }
+    /// A block of `space`'s kind with free lines.
+    fn pop_recyclable(&self, space: &Space) -> Option<*mut u8> {
+        let head = space.recyclable.get();
+        if head.is_null() {
+            return None;
         }
+        space
+            .recyclable
+            .set(chunk_of(head).blocks[block_index(head)].next.get());
+        Some(head)
     }
 
-    /// Take a free block for `kind`, sweeping for one or else mapping a new chunk if there is none,
-    /// and charge all of it.
+    /// Take a free block for `kind`, mapping a new chunk if there is none, and charge all of it.
     fn take_free_block(&self, kind: Kind, metrics: &Metrics) -> *mut u8 {
-        while self.free_blocks.get() == 0 && self.sweep_next(metrics) {}
         let mut i = self.free_from.get();
         let (chunk, b) = loop {
             let Some(&chunk) = unsafe { self.chunks() }.get(i) else {
@@ -567,8 +546,6 @@ impl Heap {
         info.next.set(ptr::null_mut());
         info.held.set(LINES as u16);
         info.kind.set(kind);
-        // Nothing allocated here before the sweep began, so there's nothing for it to free.
-        info.swept.set(self.swept.get());
         debug_assert!(block_lines(chunk, b).iter().all(|l| l.get() == 0));
         // No marks in a free block, but `AUX` bits of dead objects.
         for w in block_bits(chunk, b) {
@@ -588,7 +565,7 @@ impl Heap {
         unsafe { self.chunks() }.push(chunk);
         self.free_blocks
             .update(|n| n + DATA_BLOCKS.count_ones() as usize);
-        // SAFETY: just made; freed only by `finish_sweep` or `Drop`, once free.
+        // SAFETY: just made; freed only by `sweep` or `Drop`, once free.
         unsafe { chunk.as_ref() }
     }
 
@@ -645,11 +622,10 @@ impl Heap {
         }
     }
 
-    /// Sweep the huge objects, and begin sweeping every block in use now. Allocation from here on
-    /// only uses blocks already swept, or free.
-    pub(crate) fn start_sweep(&self, metrics: &Metrics, full: bool) {
-        // All at once, unlike blocks, so that huge objects allocated during the sweep are left
-        // alone.
+    /// Free the huge objects and lines that marking didn't reach, dropping what dies, and give
+    /// wholly free chunks back to the OS but one. Runs to the end before anything is allocated, as
+    /// mmtk's sweep does within the pause.
+    pub(crate) fn sweep(&self, metrics: &Metrics, full: bool) {
         let free = |huge: &Huge| {
             let size = huge.size.next_multiple_of(page_size());
             // SAFETY: an unmarked huge object is unreachable.
@@ -681,49 +657,16 @@ impl Heap {
         for space in &self.spaces {
             space.retire();
         }
-        self.swept.update(|s| !s);
-        self.sweep.set(Some(Sweep {
-            chunk: 0,
-            block: META_BLOCKS,
-        }));
-    }
-
-    /// Sweep the next block; false once every block is swept.
-    pub(crate) fn sweep_next(&self, metrics: &Metrics) -> bool {
-        let Some(mut sweep) = self.sweep.get() else {
-            return false;
-        };
-        loop {
-            let Some(&chunk) = unsafe { self.chunks() }.get(sweep.chunk) else {
-                self.sweep.set(Some(sweep));
-                return false;
-            };
+        for &chunk in unsafe { self.chunks() }.iter() {
             // SAFETY: chunks in the list are live.
             let chunk = unsafe { chunk.as_ref() };
-            if sweep.block >= BLOCKS {
-                sweep.chunk += 1;
-                sweep.block = META_BLOCKS;
-                continue;
+            let mut used = !chunk.free.get() & DATA_BLOCKS;
+            while used != 0 {
+                let b = used.trailing_zeros() as usize;
+                used &= used - 1;
+                self.sweep_block(chunk, b, metrics);
             }
-            let b = sweep.block;
-            sweep.block += 1;
-            if chunk.free.get() & 1 << b != 0 || chunk.blocks[b].swept.get() == self.swept.get() {
-                continue;
-            }
-            self.sweep.set(Some(sweep));
-            self.sweep_block(chunk, sweep.chunk, b, metrics);
-            return true;
         }
-    }
-
-    /// End the sweep once `sweep_next` is done, returning wholly free chunks to the OS but one.
-    pub(crate) fn finish_sweep(&self) {
-        debug_assert!(
-            self.sweep
-                .get()
-                .is_some_and(|s| s.chunk == unsafe { self.chunks() }.len())
-        );
-        self.sweep.set(None);
         // One is kept so a heap hovering at a chunk boundary doesn't map and unmap every cycle.
         let mut spare = false;
         unsafe { self.chunks() }.retain(|&chunk| {
@@ -741,11 +684,10 @@ impl Heap {
         self.free_from.set(0);
     }
 
-    /// Drop the dead objects of block `b` of `chunk`, the `i`th chunk, and free its lines that no
-    /// marking reached since it was last swept (mmtk's `Block::sweep`).
-    fn sweep_block(&self, chunk: &Chunk, i: usize, b: usize, metrics: &Metrics) {
+    /// Drop the dead objects of block `b` of `chunk`, and free its lines that no marking reached
+    /// since it was last swept (mmtk's `Block::sweep`).
+    fn sweep_block(&self, chunk: &Chunk, b: usize, metrics: &Metrics) {
         let info = &chunk.blocks[b];
-        info.swept.set(self.swept.get());
         let kind = info.kind.get();
         let epoch = self.epoch.get();
         let lines = block_lines(chunk, b);
@@ -800,7 +742,6 @@ impl Heap {
         if live == 0 {
             chunk.free.update(|f| f | 1 << b);
             self.free_blocks.update(|n| n + 1);
-            self.free_from.update(|f| f.min(i));
         } else if find_hole(chunk, b, 0, kind == Kind::Leaf).is_some() {
             let space = &self.spaces[kind as usize];
             info.next.set(space.recyclable.get());

@@ -3,7 +3,7 @@ use std::boxed::Box;
 
 use crate::dmm::{
     Collect,
-    context::{Context, Finalization, Mutation, Phase, RunUntil, Stop},
+    context::{Context, Finalization, Mutation, Phase, Stop},
     metrics::Metrics,
 };
 
@@ -96,18 +96,14 @@ pub enum CollectionPhase {
     /// The arena has finished tracing, all reachable objects are marked. This may transition
     /// back to `Marking` if write barriers occur.
     Marked,
-    /// The arena has determined a set of unreachable objects and has started freeing them. At this
-    /// point, marking is no longer taking place so the root may have reachable, unmarked pointers.
-    Sweeping,
 }
 
 /// A generic, garbage collected arena.
 ///
 /// Garbage collected arenas allow for isolated sets of garbage collected objects with zero-overhead
-/// garbage collected pointers. It provides incremental mark and sweep garbage collection which
-/// must be manually triggered outside the `mutate` method, and works best when units of work inside
-/// `mutate` can be kept relatively small. It is designed primarily to be a garbage collector for
-/// scripting language runtimes.
+/// garbage collected pointers. It provides stop-the-world, generational mark and sweep garbage
+/// collection which must be manually triggered outside the `mutate` method. It is designed
+/// primarily to be a garbage collector for scripting language runtimes.
 ///
 /// The arena API is able to provide extremely cheap Gc pointers because it is based around
 /// "generativity". During construction and access, the root type is branded by a unique, invariant
@@ -116,10 +112,9 @@ pub enum CollectionPhase {
 /// the arena can be sure that during mutation, all `Gc` pointers come from the arena we expect
 /// them to come from, and that they're all either reachable from root or have been allocated during
 /// the current `mutate` call. When not inside the `mutate` callback, the arena knows that all `Gc`
-/// pointers must be either reachable from root or they are unreachable and safe to collect. In
-/// this way, incremental garbage collection can be achieved (assuming "sufficiently small" calls
-/// to `mutate`) that is both extremely safe and zero overhead vs what you would write in C with raw
-/// pointers and manually ensuring that invariants are held.
+/// pointers must be either reachable from root or they are unreachable and safe to collect, with no
+/// stack to scan. In this way, garbage collection is both extremely safe and zero overhead vs what
+/// you would write in C with raw pointers and manually ensuring that invariants are held.
 pub struct Arena<R>
 where
     R: for<'a> Rootable<'a>,
@@ -262,7 +257,6 @@ where
                     CollectionPhase::Marked
                 }
             }
-            Phase::Sweep => CollectionPhase::Sweeping,
             Phase::Sleep => CollectionPhase::Sleeping,
             Phase::Drop => unreachable!(),
         }
@@ -274,86 +268,32 @@ where
     R: for<'a> Rootable<'a>,
     for<'a> Root<'a, R>: Sized + Collect<'a>,
 {
-    /// Run incremental garbage collection until the allocation debt is zero.
+    /// Collect if there is allocation debt, or finish the collection under way if there is one.
     ///
-    /// This will run through ALL phases of the collection cycle until the debt is zero, including
-    /// implicitly finishing the current cycle and starting a new one (transitioning from
-    /// [`CollectionPhase::Sweeping`] to [`CollectionPhase::Sleeping`]). Since this method runs
-    /// until debt is zero with no guaranteed return at any specific transition, you may need to use
-    /// other methods like [`Arena::mark_debt`] and [`Arena::cycle_debt`] if you need to keep close
-    /// track of the current collection phase.
-    ///
-    /// There is no minimum unit of work enforced here, so it may be faster to only call this method
-    /// when the allocation debt is above some minimum threshold.
+    /// Any positive debt starts a collection, so it may be faster to only call this method when
+    /// the debt is above some minimum threshold.
     #[inline]
+    // `!(debt > 0.0)` rather than `debt <= 0.0` so a NaN debt counts as paid.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
     pub fn collect_debt(&mut self) {
+        if self.context.phase() == Phase::Sleep && !(self.metrics().allocation_debt() > 0.0) {
+            return;
+        }
         unsafe {
-            self.context
-                .do_collection(&self.root, RunUntil::PayDebt, Stop::Full);
+            self.context.do_collection(&self.root, Stop::FinishCycle);
         }
     }
 
-    /// Run only the *marking* part of incremental garbage collection until allocation debt is zero.
-    ///
-    /// This does *not* transition collection past the [`CollectionPhase::Marked`]
-    /// phase. Does nothing if the collection phase is [`CollectionPhase::Marked`] or
-    /// [`CollectionPhase::Sweeping`], otherwise acts like [`Arena::collect_debt`].
-    ///
-    /// If this method stops because the arena is now fully marked (the collection phase is
-    /// [`CollectionPhase::Marked`]), then a [`MarkedArena`] object will be returned to allow
-    /// you to examine the state of the fully marked arena.
+    /// Run the marking part of the current collection, starting one if the collector is
+    /// sleeping, and return the fully marked arena to examine and then sweep. Marks nothing more
+    /// if the arena is already [`CollectionPhase::Marked`].
     #[inline]
-    pub fn mark_debt(&mut self) -> Option<MarkedArena<'_, R>> {
+    pub fn finish_marking(&mut self) -> MarkedArena<'_, R> {
         unsafe {
-            self.context
-                .do_collection(&self.root, RunUntil::PayDebt, Stop::FullyMarked);
+            self.context.do_collection(&self.root, Stop::FullyMarked);
         }
-
-        if self.context.phase() == Phase::Mark && !self.context.gray_remaining() {
-            Some(MarkedArena(self))
-        } else {
-            None
-        }
-    }
-
-    /// Runs ALL of the remaining *marking* part of the current garbage collection cycle.
-    ///
-    /// Similarly to [`Arena::mark_debt`], this does not transition collection past the
-    /// [`CollectionPhase::Marked`] phase, and does nothing if the collector is currently in the
-    /// [`CollectionPhase::Marked`] phase or the [`CollectionPhase::Sweeping`] phase.
-    ///
-    /// This method will always fully mark the arena and return a [`MarkedArena`] object as long as
-    /// the current phase is not [`CollectionPhase::Sweeping`].
-    #[inline]
-    pub fn finish_marking(&mut self) -> Option<MarkedArena<'_, R>> {
-        unsafe {
-            self.context
-                .do_collection(&self.root, RunUntil::Stop, Stop::FullyMarked);
-        }
-
-        if self.context.phase() == Phase::Mark && !self.context.gray_remaining() {
-            Some(MarkedArena(self))
-        } else {
-            None
-        }
-    }
-
-    /// Run the *current* collection cycle until the allocation debt is zero.
-    ///
-    /// This is nearly identical to the [`Arena::collect_debt`] method, except it
-    /// *always* returns immediately when a cycle is finished (when phase transitions
-    /// to [`CollectionPhase::Sleeping`]), and will never transition directly from
-    /// [`CollectionPhase::Sweeping`] to [`CollectionPhase::Marking`] within a single call, even if
-    /// there is enough outstanding debt to do so.
-    ///
-    /// This mostly only important when the user of an `Arena` needs to closely track collection
-    /// phases, otherwise [`Arena::collect_debt`] simpler to use.
-    #[inline]
-    pub fn cycle_debt(&mut self) {
-        unsafe {
-            self.context
-                .do_collection(&self.root, RunUntil::PayDebt, Stop::FinishCycle);
-        }
+        debug_assert!(self.context.phase() == Phase::Mark && !self.context.gray_remaining());
+        MarkedArena(self)
     }
 
     /// Make the next collection to start a full one.
@@ -376,8 +316,7 @@ where
     #[inline]
     pub fn finish_cycle(&mut self) {
         unsafe {
-            self.context
-                .do_collection(&self.root, RunUntil::Stop, Stop::FinishCycle);
+            self.context.do_collection(&self.root, Stop::FinishCycle);
         }
     }
 }
@@ -413,16 +352,15 @@ where
         }
     }
 
-    /// Immediately transition the arena out of [`CollectionPhase::Marked`] to
-    /// [`CollectionPhase::Sweeping`].
+    /// Free everything unmarked, ending the collection in [`CollectionPhase::Sleeping`].
     #[inline]
-    pub fn start_sweeping(self) {
+    pub fn sweep(self) {
         unsafe {
             self.0
                 .context
-                .do_collection(&self.0.root, RunUntil::Stop, Stop::AtSweep);
+                .do_collection(&self.0.root, Stop::FinishCycle);
         }
-        assert_eq!(self.0.context.phase(), Phase::Sweep);
+        assert_eq!(self.0.context.phase(), Phase::Sleep);
     }
 }
 

@@ -243,9 +243,9 @@ return count(e) .. " " .. count(kv) .. " " .. tostring(probe[e[keys[3]]])
     assert_eq!(run(src), "10 10 1");
 }
 
-/// Weak entries hold up while the collector runs incrementally alongside the script.
+/// Weak entries hold up across the many collections that run during the script.
 #[test]
-fn incremental_collection() {
+fn repeated_collections() {
     let src = r#"
 cache = setmetatable({}, {__mode = "k"})
 eph = setmetatable({}, {__mode = "k"})
@@ -266,12 +266,11 @@ return count(cache) .. " " .. count(vals) .. " " .. count(eph)
     assert_eq!(run(src), "200 200 0");
 }
 
-/// `__mode` flips between a table's trace and the end of marking. Strongly held entries
-/// survive, and under Guard Malloc an edge left uncleared crashes.
+/// `__mode` flips between collections. Strongly held entries survive, and under Guard Malloc an
+/// edge left uncleared crashes.
 #[test]
-fn mode_change_mid_cycle() {
+fn mode_change_between_collections() {
     let src = r#"
--- Enough strong heap that marking spans several steps, so the flips land mid-mark.
 local heap = {}
 for i = 1, 10000 do heap[i] = {i} end
 local R = 8000
