@@ -341,7 +341,12 @@ fn weakly_held_objects_are_freed() {
         run_in(&mut lua, src);
         lua.live_bytes()
     };
-    let baseline = live("t = setmetatable({}, {__mode = 'k'})");
+    // Emptied the same way the collector empties the weak table, so it keeps as much storage
+    // whether or not collections ran while it filled.
+    let baseline = live(
+        "t = {} for i = 1, 20000 do local k = {} t[k] = {k} end \
+         for k in next, t do t[k] = nil end",
+    );
     let strong = live("t = {} for i = 1, 20000 do local k = {} t[k] = {k} end");
     let weak = live(
         "t = setmetatable({}, {__mode = 'k'}) \

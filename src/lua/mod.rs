@@ -21,7 +21,6 @@ pub use stash::{
 use crate::builtin;
 use crate::dmm::Rootable;
 use crate::dmm::arena::{CollectionPhase, MarkedArena};
-use crate::dmm::metrics::Pacing;
 use crate::dmm::{Arena, Collect, DynamicRootSet, Gc, GcLock, Lock, Mutation};
 use crate::env::shape::{INLINE_CAPS, Shape};
 use crate::env::string::Interner;
@@ -91,14 +90,6 @@ impl<'gc> State<'gc> {
 /// exit-overhead curve, with slices of ~10 µs on `particles_bench`.
 const GC_GRANULARITY: usize = 64 * 1024;
 
-/// The least the collector sleeps between cycles. Only binds when the live
-/// set is tiny; the default 4 KiB restarts a cycle every few KiB of garbage.
-const GC_MIN_SLEEP: usize = 64 * 1024;
-
-/// Garbage allowed per cycle, as a fraction of what survived the last one;
-/// LuaJIT's default pause of 200 is the same.
-const GC_SLEEP_FACTOR: f64 = 1.0;
-
 /// A Lua runtime instance.
 pub struct Lua {
     arena: Arena<Rootable![State<'_>]>,
@@ -133,13 +124,7 @@ impl Lua {
                 buf: std::cell::Cell::new(Vec::new()),
             }
         });
-        let metrics = arena.metrics();
-        metrics.set_pacing(Pacing {
-            min_sleep: GC_MIN_SLEEP,
-            sleep_factor: GC_SLEEP_FACTOR,
-            ..Pacing::DEFAULT
-        });
-        metrics.set_gc_granularity(GC_GRANULARITY);
+        arena.metrics().set_gc_granularity(GC_GRANULARITY);
         Lua { arena }
     }
 
@@ -198,6 +183,18 @@ impl Lua {
         if self.arena.collection_phase() != CollectionPhase::Sleeping {
             self.finish_cycle();
         }
+        self.arena.force_full_collection();
+        self.finish_cycle();
+    }
+
+    /// Force a minor collection, which frees only what was allocated since
+    /// the last collection. A GC-soundness test hook, like
+    /// [`Lua::collect_all`].
+    pub fn collect_young(&mut self) {
+        if self.arena.collection_phase() != CollectionPhase::Sleeping {
+            self.finish_cycle();
+        }
+        self.arena.force_minor_collection();
         self.finish_cycle();
     }
 

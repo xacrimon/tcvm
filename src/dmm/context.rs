@@ -147,6 +147,12 @@ impl<'gc> Finalization<'gc> {
         unsafe { self.context.heap.is_marked(gc_box) }
     }
 
+    /// Whether this collection is a full one; a minor one only traces and frees what was
+    /// allocated since the last collection.
+    pub fn is_full(&self) -> bool {
+        self.context.full
+    }
+
     /// The objects whose trace called [`Trace::defer`] this cycle, each once.
     pub fn deferred(&self) -> Vec<Gc<'gc, ()>> {
         let boxes = self.context.deferred.dedup();
@@ -228,6 +234,16 @@ pub(crate) struct Context {
     // of a write barrier.
     gray_again: Queue<GcBox>,
 
+    // Black objects written since the last collection, the roots of the next minor one besides
+    // the root (mmtk's modbuf).
+    remembered: Queue<GcBox>,
+
+    // Whether the current or last collection is a full one.
+    full: bool,
+
+    // The kind the next collection must be, if forced: full when true.
+    forced: Option<bool>,
+
     // The object `mark_one` is tracing, for `Trace::defer`.
     tracing: Option<GcBox>,
 
@@ -257,6 +273,9 @@ impl Context {
             root_needs_trace: true,
             gray: Queue::new(),
             gray_again: Queue::new(),
+            remembered: Queue::new(),
+            full: false,
+            forced: None,
             tracing: None,
             deferred: Queue::new(),
             weak: Queue::new(),
@@ -296,14 +315,18 @@ impl Context {
         !self.gray.is_empty() || !self.gray_again.is_empty() || self.root_needs_trace
     }
 
-    // Do some collection work until either we have achieved our `target` (paying off debt or
-    // finishing a full collection) or we have reached the `stop` condition.
+    /// Force the kind of the next collection to start: full when `full`, else minor.
+    pub(crate) fn force_collection(&mut self, full: bool) {
+        self.forced = Some(full);
+    }
+
+    // Run a collection, starting one first if the collector sleeps (and, for
+    // `RunUntil::PayDebt`, the heap is past its limit), until it reaches the `stop` condition.
+    // Collections are stop-the-world, as in mmtk's StickyImmix: once started, a collection runs to
+    // `stop` whatever the debt.
     //
     // In order for this to be safe, at the time of call no `Gc` pointers can be live that are not
     // reachable from the given root object.
-    //
-    // If we are currently in `Phase::Sleep` and have positive debt, this will immediately
-    // transition the collector to `Phase::Mark`.
     #[deny(unsafe_op_in_unsafe_fn)]
     // `!(debt > 0.0)` rather than `debt <= 0.0` so a NaN debt counts as paid.
     #[allow(clippy::neg_cmp_op_on_partial_ord)]
@@ -314,8 +337,11 @@ impl Context {
         stop: Stop,
     ) {
         let mut cx = PhaseGuard::enter(self, None);
+        let paid = |cx: &Context| {
+            run_until == RunUntil::PayDebt && !(cx.metrics().allocation_debt() > 0.0)
+        };
 
-        if run_until == RunUntil::PayDebt && !(cx.metrics().allocation_debt() > 0.0) {
+        if cx.phase == Phase::Sleep && paid(&cx) {
             return;
         }
 
@@ -325,8 +351,7 @@ impl Context {
             match cx.phase {
                 Phase::Sleep => {
                     has_slept = true;
-                    // Immediately enter the mark phase
-                    cx.heap.start_marking();
+                    cx.start_collection();
                     cx.switch(Phase::Mark);
                 }
                 Phase::Mark => {
@@ -344,7 +369,7 @@ impl Context {
                             cx.settle_weak();
                             // Allocation from here on only uses blocks already swept, so nothing
                             // allocated during the sweep is freed by it.
-                            cx.heap.start_sweep(cx.metrics());
+                            cx.heap.start_sweep(cx.metrics(), cx.full);
                         }
                     }
                 }
@@ -352,38 +377,36 @@ impl Context {
                     if stop <= Stop::AtSweep {
                         break;
                     } else if cx.sweep_one().is_break() {
-                        // Begin a new cycle.
-                        //
-                        // We reset our debt if we have done an entire collection cycle (marking and
-                        // sweeping) as a single atomic unit. This keeps inherited debt from growing
-                        // without bound.
-                        cx.metrics().finish_cycle(has_slept);
+                        cx.metrics().finish_cycle(cx.full);
                         cx.root_needs_trace = true;
                         cx.switch(Phase::Sleep);
-
-                        // We treat a stop condition of `Stop::Finish` as special for the purposes
-                        // of logging, and log that we finished a cycle.
-                        if stop == Stop::FinishCycle {
-                            return;
-                        }
-
-                        // Otherwise we always break if we have performed a full cycle as a single
-                        // atomic unit, because there cannot be any more work to do in this case.
-                        if has_slept {
-                            // We shouldn't be stopping here if the stop condition is something like
-                            // `Stop::AtSweep`, but this should be impossible since the only way to
-                            // get here is to have gone through the entire cycle.
-                            assert!(stop == Stop::Full);
+                        // A whole collection done in this call is as much as one call does.
+                        if stop == Stop::FinishCycle || has_slept || paid(&cx) {
                             break;
                         }
                     }
                 }
                 Phase::Drop => unreachable!(),
             }
+        }
+    }
 
-            if run_until == RunUntil::PayDebt && !(cx.metrics().allocation_debt() > 0.0) {
-                break;
-            }
+    /// Begin a collection, full or minor as forced or as the metrics decide.
+    fn start_collection(&mut self) {
+        self.full = self
+            .forced
+            .take()
+            .unwrap_or_else(|| self.metrics().next_full());
+        debug_assert!(self.gray.is_empty() && self.gray_again.is_empty());
+        if self.full {
+            self.heap.start_marking();
+            // Each is traced again if still reachable; its gray bit now just spares it the
+            // barrier.
+            self.remembered.clear();
+        } else {
+            // Marked objects are old and not traced again, but for those written since the last
+            // collection (mmtk's `ProcessModBuf`).
+            mem::swap(&mut self.gray, &mut self.remembered);
         }
     }
 
@@ -449,13 +472,14 @@ impl Context {
         !parent.header().is_gray() && !self.lighten(parent)
     }
 
-    /// Turn a white `parent` light gray. False for a black one while marking, which has to be
-    /// traced again.
+    /// Turn a white `parent` light gray. False for a black one, which has to be traced again:
+    /// in this collection while marking, else in the next minor one, as the marks of everything
+    /// that survived stay set until a full one.
     #[cold]
     #[inline(never)]
     fn lighten(&self, parent: GcBox) -> bool {
         // SAFETY: a barrier is only called on a live object.
-        if self.phase == Phase::Mark && unsafe { self.heap.is_marked(parent) } {
+        if unsafe { self.heap.is_marked(parent) } {
             return false;
         }
         parent.header().set_gray(true);
@@ -545,14 +569,11 @@ impl Context {
             // SAFETY: the box was live when reached and the sweep has not begun.
             unsafe {
                 if !self.heap.is_marked(gc_box) {
-                    let size = gc_box.size();
                     if header.is_live() {
                         header.set_live(false);
                         gc_box.drop_in_place();
-                        self.metrics().mark_gc_dropped(size);
                     }
-                    self.heap.mark_untraced(gc_box, size);
-                    self.metrics().mark_gc_marked(size);
+                    self.heap.mark_untraced(gc_box, gc_box.size());
                 }
             }
         }
@@ -583,17 +604,11 @@ impl Context {
         let next_gray = self.gray.pop().or_else(|| self.gray_again.pop());
 
         if let Some(gc_box) = next_gray {
-            // Every traversal counts as work, including the second one of an object a barrier
-            // queued again. Marking reads no object, so its work is counted here too, where the
-            // size is at hand; objects never traversed count none, as in LuaJIT.
-            let size = gc_box.size();
-            self.metrics().mark_gc_marked(size);
-            self.metrics().mark_gc_traced(size);
             // SAFETY: a queued object is marked and live.
-            unsafe { self.heap.mark_lines(gc_box, size) };
+            unsafe { self.heap.mark_lines(gc_box, gc_box.size()) };
             // Black before the traversal, so writes during it are caught.
             gc_box.header().set_gray(false);
-            // Drop and huge chunks also hold types with nothing to trace.
+            // Drop blocks and huge objects also hold types with nothing to trace.
             if !gc_box.header().needs_trace() {
                 return ControlFlow::Continue(());
             }
@@ -650,11 +665,16 @@ impl Context {
         }
     }
 
-    // Take a black pointer and turn it gray and put it in the `gray_again` queue.
+    // Take a black pointer and turn it gray, and queue it to be traced again in this collection
+    // while marking, else remember it for the next one.
     fn make_gray_again(&self, gc_box: GcBox) {
         debug_assert!(self.is_black(gc_box));
         gc_box.header().set_gray(true);
-        self.gray_again.push(gc_box);
+        if self.phase == Phase::Mark {
+            self.gray_again.push(gc_box);
+        } else {
+            self.remembered.push(gc_box);
+        }
     }
 
     /// Marked and traced, or not in need of tracing.

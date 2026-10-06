@@ -23,6 +23,7 @@ mod error_position;
 mod executor_isolation;
 mod field_ic;
 mod gc_stack_trace;
+mod generational;
 mod generic_for;
 mod goto_close;
 mod goto_labels;

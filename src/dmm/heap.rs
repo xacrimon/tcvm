@@ -153,10 +153,10 @@ fn huge_hash(p: *const u8) -> u64 {
 
 /// # Safety
 /// `huge` must be unreachable.
-unsafe fn free_huge(huge: &Huge, metrics: Option<&Metrics>) {
+unsafe fn free_huge(huge: &Huge) {
     unsafe {
         if huge.needs_drop {
-            drop_object(huge.ptr.as_ptr(), metrics);
+            drop_object(huge.ptr.as_ptr());
         }
         unmap(huge.ptr.as_ptr(), huge.size);
     }
@@ -200,7 +200,7 @@ unsafe fn unmap(p: *mut u8, size: usize) {
     unsafe { libc::munmap(p.cast(), size.next_multiple_of(page_size())) };
 }
 
-fn page_size() -> usize {
+pub(crate) fn page_size() -> usize {
     // SAFETY: no preconditions.
     unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
 }
@@ -267,6 +267,9 @@ pub(crate) struct Heap {
     swept: Cell<bool>,
     sweep: Cell<Option<Sweep>>,
     huge: UnsafeCell<HashTable<Huge>>,
+    /// Huge objects allocated since the last collection, the only ones a minor one can free
+    /// (mmtk's large object nursery).
+    young_huge: UnsafeCell<Vec<NonNull<u8>>>,
 }
 
 impl Heap {
@@ -284,6 +287,7 @@ impl Heap {
             swept: Cell::new(false),
             sweep: Cell::new(None),
             huge: UnsafeCell::new(HashTable::new()),
+            young_huge: UnsafeCell::new(Vec::new()),
         }
     }
 
@@ -571,6 +575,7 @@ impl Heap {
             w.set(0);
         }
         metrics.mark_gc_allocated(BLOCK);
+        metrics.mark_reserved(BLOCK);
         block_start(chunk, b)
     }
 
@@ -609,11 +614,16 @@ impl Heap {
         unsafe { self.huge_table() }.insert_unique(huge_hash(ptr.as_ptr()), huge, |huge| {
             huge_hash(huge.ptr.as_ptr())
         });
-        metrics.mark_gc_allocated(size.next_multiple_of(page_size()));
+        unsafe { &mut *self.young_huge.get() }.push(ptr);
+        let pages = size.next_multiple_of(page_size());
+        metrics.mark_gc_allocated(pages);
+        metrics.mark_reserved(pages);
         ptr
     }
 
-    /// Start a marking: a new line mark, and every mark cleared.
+    /// Start a full collection's marking: a new line mark, and every mark cleared. A minor one
+    /// keeps the marks, so everything marked before is old and not traced again (mmtk's sticky
+    /// mark bits).
     pub(crate) fn start_marking(&self) {
         self.epoch.set(if self.epoch.get() == u8::MAX {
             1
@@ -639,20 +649,38 @@ impl Heap {
 
     /// Sweep the huge objects, and begin sweeping every block in use now. Allocation from here on
     /// only uses blocks already swept, or free.
-    pub(crate) fn start_sweep(&self, metrics: &Metrics) {
+    pub(crate) fn start_sweep(&self, metrics: &Metrics, full: bool) {
         // All at once, unlike blocks, so that huge objects allocated during the sweep are left
         // alone.
-        unsafe { self.huge_table() }.retain(|huge| {
+        let free = |huge: &Huge| {
             let size = huge.size.next_multiple_of(page_size());
-            if huge.marked.get() {
-                metrics.mark_gc_remembered(size);
-                return true;
-            }
             // SAFETY: an unmarked huge object is unreachable.
-            unsafe { free_huge(huge, Some(metrics)) };
+            unsafe { free_huge(huge) };
             metrics.mark_gc_freed(size);
-            false
-        });
+            metrics.mark_released(size);
+        };
+        let table = unsafe { self.huge_table() };
+        let young = unsafe { &mut *self.young_huge.get() };
+        if full {
+            table.retain(|huge| {
+                if !huge.marked.get() {
+                    free(huge);
+                }
+                huge.marked.get()
+            });
+        } else {
+            for p in young.iter() {
+                let Ok(entry) = table.find_entry(huge_hash(p.as_ptr()), |huge| huge.ptr == *p)
+                else {
+                    unreachable!("a young huge object outside the table")
+                };
+                if !entry.get().marked.get() {
+                    free(entry.get());
+                    entry.remove();
+                }
+            }
+        }
+        young.clear();
         for space in &self.spaces {
             space.retire();
         }
@@ -753,7 +781,7 @@ impl Heap {
                     while d != 0 {
                         let cell = w * 32 + d.trailing_zeros() as usize / 2;
                         // SAFETY: an unmarked object after marking is unreachable.
-                        unsafe { drop_object(start.wrapping_add(cell * CELL), Some(metrics)) };
+                        unsafe { drop_object(start.wrapping_add(cell * CELL)) };
                         d &= d - 1;
                     }
                 }
@@ -771,9 +799,9 @@ impl Heap {
         let held = info.held.get() as usize;
         debug_assert!(live <= held, "marked lines never handed out");
         metrics.mark_gc_freed((held - live) * LINE);
-        metrics.mark_gc_remembered(live * LINE);
         info.held.set(live as u16);
         if live == 0 {
+            metrics.mark_released(BLOCK);
             chunk.free.update(|f| f | 1 << b);
             self.free_blocks.update(|n| n + 1);
             self.free_from.update(|f| f.min(i));
@@ -827,7 +855,7 @@ impl Drop for Heap {
                         let mut starts = word.get() & AUX;
                         while starts != 0 {
                             let cell = w * 32 + starts.trailing_zeros() as usize / 2;
-                            drop_object(start.wrapping_add(cell * CELL), None);
+                            drop_object(start.wrapping_add(cell * CELL));
                             starts &= starts - 1;
                         }
                     }
@@ -837,7 +865,7 @@ impl Drop for Heap {
         }
         for huge in self.huge.get_mut().drain() {
             // SAFETY: as above.
-            unsafe { free_huge(&huge, None) };
+            unsafe { free_huge(&huge) };
         }
     }
 }
@@ -846,16 +874,12 @@ impl Drop for Heap {
 ///
 /// # Safety
 /// `p` must start an initialized object nothing will use again.
-unsafe fn drop_object(p: *mut u8, metrics: Option<&Metrics>) {
+unsafe fn drop_object(p: *mut u8) {
     // SAFETY: as the caller promises.
     unsafe {
         let mut gc_box = GcBox::from_ptr(p);
         if gc_box.header().is_live() {
-            let size = gc_box.size();
             gc_box.drop_in_place();
-            if let Some(metrics) = metrics {
-                metrics.mark_gc_dropped(size);
-            }
         }
     }
 }
