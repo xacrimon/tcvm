@@ -34,8 +34,10 @@ const HUGE: usize = CHUNK_SIZE / 8;
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 enum Kind {
-    /// Objects without drop glue.
+    /// Traced objects without drop glue.
     Plain,
+    /// Untraced objects without drop glue, which marking never reads.
+    Leaf,
     /// Objects with drop glue.
     Drop,
     Huge,
@@ -195,9 +197,8 @@ impl Space {
 
 pub(crate) struct Heap {
     chunks: UnsafeCell<Vec<NonNull<Meta>>>,
-    /// Types without drop glue, whose dead objects the sweep never reads.
     plain: Space,
-    /// Types with drop glue, whose dead objects the sweep drops.
+    leaf: Space,
     drop: Space,
     sweep: Cell<Option<Sweep>>,
 }
@@ -207,6 +208,7 @@ impl Heap {
         Self {
             chunks: UnsafeCell::new(Vec::new()),
             plain: Space::new(Kind::Plain),
+            leaf: Space::new(Kind::Leaf),
             drop: Space::new(Kind::Drop),
             sweep: Cell::new(None),
         }
@@ -221,15 +223,25 @@ impl Heap {
         unsafe { &mut *self.chunks.get() }
     }
 
-    /// Allocate `size` bytes, a multiple of `CELL`, as a white block, among the objects that
-    /// need dropping if `needs_drop`.
+    /// Allocate `size` bytes, a multiple of `CELL`, as a white block for an object of a type
+    /// that `needs_drop` and `needs_trace`.
     #[inline(always)]
-    pub(crate) fn alloc(&self, size: usize, needs_drop: bool, metrics: &Metrics) -> NonNull<u8> {
+    pub(crate) fn alloc(
+        &self,
+        size: usize,
+        needs_drop: bool,
+        needs_trace: bool,
+        metrics: &Metrics,
+    ) -> NonNull<u8> {
         debug_assert!(size.is_multiple_of(CELL) && size > 0);
         if size > HUGE {
             return self.alloc_huge(size);
         }
-        let space = if needs_drop { &self.drop } else { &self.plain };
+        let space = match (needs_drop, needs_trace) {
+            (true, _) => &self.drop,
+            (false, true) => &self.plain,
+            (false, false) => &self.leaf,
+        };
         match space.bump(size) {
             Some(p) => p,
             None => self.alloc_slow(space, size, metrics),
@@ -321,10 +333,37 @@ impl Heap {
         }
     }
 
+    /// Mark `p` if it is a leaf, and return its size: the cells up to the next block or free
+    /// start, or the leaf run's top.
+    ///
+    /// # Safety
+    /// `p` must be an unmarked live object's start.
+    #[inline]
+    pub(crate) unsafe fn mark_leaf(&self, p: GcBox) -> Option<usize> {
+        let p = p.as_ptr();
+        let meta = meta(p);
+        if meta.header.kind.get() != Kind::Leaf {
+            return None;
+        }
+        let cell = cell_of(p);
+        let mut end = next_bit(meta, cell + 1, |b, m| b | m).unwrap_or(CELLS);
+        // The leaf run's unallocated tail has no bits set.
+        let top = self.leaf.top.get();
+        if top.addr() & !(CHUNK_SIZE - 1) == base(meta).addr() && cell < cell_of(top) {
+            end = end.min(cell_of(top));
+        }
+        let size = (end - cell) * CELL;
+        debug_assert_eq!(size, unsafe { GcBox::from_ptr(p) }.size());
+        let (w, b) = bit(cell);
+        meta.mark[w].update(|m| m | b);
+        meta.header.marked.update(|n| n + size);
+        Some(size)
+    }
+
     /// Begin sweeping every chunk that exists now. Allocation from here on only uses chunks
     /// already swept, or made after this.
     pub(crate) fn start_sweep(&self) {
-        for space in [&self.plain, &self.drop] {
+        for space in [&self.plain, &self.leaf, &self.drop] {
             space.retire_run();
             space.rescan();
         }
@@ -363,8 +402,9 @@ impl Heap {
             unsafe { free_chunk(*chunk) };
             false
         });
-        self.plain.rescan();
-        self.drop.rescan();
+        for space in [&self.plain, &self.leaf, &self.drop] {
+            space.rescan();
+        }
     }
 }
 
@@ -373,7 +413,7 @@ impl Drop for Heap {
         for &chunk in self.chunks.get_mut().iter() {
             // SAFETY: the heap owns its chunks; every block holds an initialized object.
             unsafe {
-                if chunk.as_ref().header.kind.get() != Kind::Plain {
+                if matches!(chunk.as_ref().header.kind.get(), Kind::Drop | Kind::Huge) {
                     for_each_bit(chunk.as_ref(), |b, _| b, |p| drop_object(p, None));
                 }
                 free_chunk(chunk);
@@ -416,7 +456,7 @@ unsafe fn drop_object(p: *mut u8, metrics: Option<&Metrics>) {
 fn sweep_chunk(meta: &Meta, metrics: &Metrics) {
     let header = &meta.header;
     match header.kind.get() {
-        kind @ (Kind::Plain | Kind::Drop) => {
+        kind @ (Kind::Plain | Kind::Leaf | Kind::Drop) => {
             let base = base(meta);
             for w in 0..WORDS - META_WORDS {
                 let (b, m) = (meta.block[w].get(), meta.mark[w].get());

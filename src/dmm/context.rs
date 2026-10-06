@@ -383,7 +383,7 @@ impl Context {
         let size = size_of::<GcBoxInner<T>>().next_multiple_of(CELL);
         let ptr = self
             .heap
-            .alloc(size, mem::needs_drop::<T>(), self.metrics())
+            .alloc(size, mem::needs_drop::<T>(), T::NEEDS_TRACE, self.metrics())
             .cast::<GcBoxInner<T>>();
         // SAFETY: a fresh block of `size` bytes.
         unsafe { ptr.write(GcBoxInner::new(GcBoxHeader::new::<T>(), t)) };
@@ -404,7 +404,7 @@ impl Context {
         // `TrailingBytes` types have no drop glue.
         let ptr = self
             .heap
-            .alloc(size, false, self.metrics())
+            .alloc(size, false, T::NEEDS_TRACE, self.metrics())
             .cast::<GcBoxInner<T>>();
         // SAFETY: a fresh block of `size` bytes. The header and value are written before `init`
         // runs, so a panic in it leaves a whole object for the sweep.
@@ -499,6 +499,10 @@ impl Context {
     fn trace(&self, gc_box: GcBox) {
         // SAFETY: a traced pointer is a live object's.
         if unsafe { heap::is_marked(gc_box) } {
+            return;
+        }
+        if let Some(size) = unsafe { self.heap.mark_leaf(gc_box) } {
+            self.metrics().mark_gc_marked(size);
             return;
         }
         let header = gc_box.header();
