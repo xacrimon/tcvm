@@ -458,12 +458,6 @@ impl Metrics {
     }
 
     #[inline]
-    pub(crate) fn mark_gc_untraced(&self, bytes: usize) {
-        self.0.traced_gcs.update(|c| c - 1);
-        self.0.traced_gc_bytes.update(|b| b - bytes);
-    }
-
-    #[inline]
     pub(crate) fn mark_gc_remembered(&self, bytes: usize) {
         self.0.remembered_gc_bytes.update(|b| b + bytes);
     }

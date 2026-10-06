@@ -499,21 +499,13 @@ impl Context {
         if unsafe { heap::is_marked(gc_box) } {
             return;
         }
-        if let Some(size) = unsafe { self.heap.mark_leaf(gc_box) } {
-            self.metrics().mark_gc_marked(size);
-            return;
-        }
-        let header = gc_box.header();
-        debug_assert!(header.is_live());
-        let size = gc_box.size();
-        unsafe { heap::set_marked(gc_box, size) };
-        // A weakly reached object was counted when it was first reached.
-        if !header.is_weak() {
-            self.metrics().mark_gc_marked(size);
-        }
-        // An object that doesn't need tracing is black as soon as it's marked.
-        if header.needs_trace() {
-            header.set_gray(true);
+        debug_assert!(gc_box.header().is_live());
+        // The object itself is first read when traversed. Until then its gray bit may be clear,
+        // so a write to it takes the barrier and queues it again: traversing twice is cheaper
+        // than reading every object as it is found.
+        let (size, push) = unsafe { self.heap.mark(gc_box) };
+        self.metrics().mark_gc_marked(size);
+        if push {
             self.gray.push(gc_box);
         }
     }
@@ -524,7 +516,6 @@ impl Context {
         if !header.is_weak() && unsafe { !heap::is_marked(gc_box) } {
             header.set_weak(true);
             self.weak.push(gc_box);
-            self.metrics().mark_gc_marked(gc_box.size());
         }
     }
 
@@ -545,6 +536,7 @@ impl Context {
                         self.metrics().mark_gc_dropped(size);
                     }
                     heap::set_marked(gc_box, size);
+                    self.metrics().mark_gc_marked(size);
                 }
             }
         }
@@ -575,11 +567,15 @@ impl Context {
         let next_gray = self.gray.pop().or_else(|| self.gray_again.pop());
 
         if let Some(gc_box) = next_gray {
-            // We always mark work for objects processed from both the gray and "gray again" queue.
-            // When objects are placed into the "gray again" queue due to a write barrier, the
-            // original work is *undone*, so we do it again here.
+            // Every traversal counts as work, including the second one of an object a barrier
+            // queued again.
             self.metrics().mark_gc_traced(gc_box.size());
+            // Black before the traversal, so writes during it are caught.
             gc_box.header().set_gray(false);
+            // Drop and huge chunks also hold types with nothing to trace.
+            if !gc_box.header().needs_trace() {
+                return ControlFlow::Continue(());
+            }
 
             // If we have an object in the gray queue, take one, trace it, and turn it black.
 
@@ -638,7 +634,6 @@ impl Context {
         debug_assert!(is_black(gc_box));
         gc_box.header().set_gray(true);
         self.gray_again.push(gc_box);
-        self.metrics().mark_gc_untraced(gc_box.size());
     }
 }
 

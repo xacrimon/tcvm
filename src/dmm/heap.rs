@@ -333,31 +333,43 @@ impl Heap {
         }
     }
 
-    /// Mark `p` if it is a leaf, and return its size: the cells up to the next block or free
-    /// start, or the leaf run's top.
+    /// Mark `p` and return its size and whether it needs tracing, reading only metadata (LuaJIT
+    /// 3.0's marking): the size is the cells up to the next block or free start, or up to its
+    /// space's run top when it is the last object in the run (whose tail has no bits set); a huge
+    /// object's is in its chunk header. Only leaf chunks hold objects that need no tracing.
     ///
     /// # Safety
     /// `p` must be an unmarked live object's start.
     #[inline]
-    pub(crate) unsafe fn mark_leaf(&self, p: GcBox) -> Option<usize> {
+    pub(crate) unsafe fn mark(&self, p: GcBox) -> (usize, bool) {
         let p = p.as_ptr();
         let meta = meta(p);
-        if meta.header.kind.get() != Kind::Leaf {
-            return None;
-        }
+        let kind = meta.header.kind.get();
         let cell = cell_of(p);
-        let mut end = next_bit(meta, cell + 1, |b, m| b | m).unwrap_or(CELLS);
-        // The leaf run's unallocated tail has no bits set.
-        let top = self.leaf.top.get();
-        if top.addr() & !(CHUNK_SIZE - 1) == base(meta).addr() && cell < cell_of(top) {
-            end = end.min(cell_of(top));
-        }
-        let size = (end - cell) * CELL;
+        let size = if kind == Kind::Huge {
+            meta.header.allocated.get()
+        } else {
+            let mut end = next_bit(meta, cell + 1, |b, m| b | m).unwrap_or(CELLS);
+            let top = self.space(kind).top.get();
+            if top.addr() & !(CHUNK_SIZE - 1) == base(meta).addr() && cell < cell_of(top) {
+                end = end.min(cell_of(top));
+            }
+            (end - cell) * CELL
+        };
         debug_assert_eq!(size, unsafe { GcBox::from_ptr(p) }.size());
         let (w, b) = bit(cell);
         meta.mark[w].update(|m| m | b);
         meta.header.marked.update(|n| n + size);
-        Some(size)
+        (size, kind != Kind::Leaf)
+    }
+
+    fn space(&self, kind: Kind) -> &Space {
+        match kind {
+            Kind::Plain => &self.plain,
+            Kind::Leaf => &self.leaf,
+            Kind::Drop => &self.drop,
+            Kind::Huge | Kind::Dead => unreachable!(),
+        }
     }
 
     /// Begin sweeping every chunk that exists now. Allocation from here on only uses chunks
