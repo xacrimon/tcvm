@@ -465,6 +465,17 @@ unsafe impl<'gc> Collect<'gc> for MmValue<'gc> {
     const NEEDS_TRACE: bool = false;
 }
 
+/// A metamethod's bit index, below `METAMETHOD_COUNT`.
+#[derive(Clone, Copy)]
+pub struct MmIndex(u8);
+
+impl MmIndex {
+    pub const fn of(bit: MetamethodBits) -> Self {
+        assert!(bit.bits().count_ones() == 1);
+        MmIndex(bit.bits().trailing_zeros() as u8)
+    }
+}
+
 /// [`MtCacheData::rest`], untraced like [`MmValue`].
 pub struct MmValues<'gc>([Cell<Value<'gc>>; METAMETHOD_COUNT]);
 
@@ -597,6 +608,18 @@ impl<'gc> MtCache<'gc> {
                 Some(rest) => rest.0[bit.bits().trailing_zeros() as usize].get(),
                 None => Value::nil(),
             }
+        }
+    }
+
+    /// [`Self::mm`] by the metamethod's bit index, for one other than
+    /// `__index` and `__newindex`.
+    #[inline(always)]
+    pub fn mm_at(self, idx: MmIndex) -> Value<'gc> {
+        debug_assert!(idx.0 as usize != INDEX_IDX && idx.0 as usize != NEWINDEX_IDX);
+        match self.0.rest.get() {
+            // SAFETY: an `MmIndex` is in bounds.
+            Some(rest) => unsafe { rest.0.get_unchecked(idx.0 as usize) }.get(),
+            None => Value::nil(),
         }
     }
 

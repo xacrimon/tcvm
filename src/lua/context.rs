@@ -143,6 +143,14 @@ impl<'gc> Context<'gc> {
         }
     }
 
+    /// The metatable numbers share, usually none.
+    #[inline]
+    pub(crate) fn number_metatable(self) -> Option<Table<'gc>> {
+        self.state
+            .type_metatable(crate::lua::ValueKind::Float)
+            .get()
+    }
+
     /// Metamethod `name` of `v`, nil when absent (`luaT_gettmbyobj`).
     #[inline]
     pub fn metamethod_of(self, v: Value<'gc>, name: LuaString<'gc>) -> Value<'gc> {
