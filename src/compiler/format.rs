@@ -85,7 +85,8 @@ fn format_instruction(instr: &Instruction, proto: &Prototype<'_>) -> String {
     }
 
     // A quickened form prints as the instruction the compiler emitted.
-    match instr.op().unquickened() {
+    let instr = instr.unquickened();
+    match instr.op() {
         Op::MOVE => {
             let (dst, src) = instr.ab();
             format!("MOVE            R{dst} R{src}")
@@ -404,7 +405,7 @@ fn format_instruction(instr: &Instruction, proto: &Prototype<'_>) -> String {
             format!(
                 "{:<15} R{dst} R{src} {}{}",
                 instr.op().name(),
-                format_imm(instr),
+                format_imm(&instr),
                 if flipped { " flipped" } else { "" }
             )
         }

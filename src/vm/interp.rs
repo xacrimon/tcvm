@@ -3,7 +3,7 @@ use crate::env::function::{
     Function, FunctionKind, InlineCache, LuaFn, NativeClosure, NativeKind, Stack, UpvalueCell,
     UpvalueSlot,
 };
-use crate::env::shape::{MAX_PROPERTIES_FAST, MetamethodBits, Shape, mirrored};
+use crate::env::shape::{MAX_PROPERTIES_FAST, MetamethodBits, MmIndex, Shape, mirrored};
 use crate::env::string::LuaString;
 use crate::env::table::{SlotLoc, Step, Table, TableState};
 use crate::env::thread::{
@@ -148,6 +148,16 @@ const HANDLERS: [Handler; Op::COUNT] = Op::table([
     (Op::SETTABUP_REF, op_settabup_ref),
     (Op::CALL_R0, op_call_r0),
     (Op::CALL_R1, op_call_r1),
+    (Op::ADD_NUM, op_add_num),
+    (Op::SUB_NUM, op_sub_num),
+    (Op::MUL_NUM, op_mul_num),
+    (Op::MOD_NUM, op_mod_num),
+    (Op::POW_NUM, op_pow_num),
+    (Op::DIV_NUM, op_div_num),
+    (Op::IDIV_NUM, op_idiv_num),
+    (Op::ARITH_MM, op_arith_mm),
+    (Op::ARITH_MM_R, op_arith_mm_r),
+    (Op::ARITH_MMI, op_arith_mmi),
 ]);
 
 /// Why an opcode faulted. `impl_error` renders the reference message for
@@ -1831,6 +1841,231 @@ bit_handler!(op_bor, op_bor_slow, BOR, num::BOr, BOR);
 bit_handler!(op_bxor, op_bxor_slow, BXOR, num::BXor, BXOR);
 bit_handler!(op_shl, op_shl_slow, SHL, num::Shl, SHL);
 bit_handler!(op_shr, op_shr_slow, SHR, num::Shr, SHR);
+
+/// A register-form arithmetic site quickened to its `_NUM` form: the generic
+/// handler's cases plus a float and an inline int in either order.
+macro_rules! arith_num_handler {
+    ($fn_name:ident, $num_kind:ty) => {
+        #[inline(never)]
+        #[rustc_align(32)]
+        extern "rust-preserve-none" fn $fn_name<'gc>(
+            instruction: Instruction,
+            ctx: Context<'gc>,
+            thread: &mut ThreadState<'gc>,
+            registers: Registers<'gc, '_>,
+            ip: *const Instruction,
+            handlers: *const (),
+            ds: &mut DispatchState<'gc>,
+            frame: *mut LuaFrame<'gc>,
+            closure: LuaFn<'gc>,
+        ) -> Exit {
+            helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+            let (dst, lhs, rhs) = instruction.abc();
+            let (l, r) = (reg!(ref lhs), reg!(ref rhs));
+            if let Some((li, ri)) = Value::both_small(l, r) {
+                if let Some(v) = <$num_kind as num::ArithOp>::small(li, ri) {
+                    *reg!(ref mut dst) = v;
+                    dispatch!();
+                }
+            } else if let Some(lf) = small_or_float(l)
+                && let Some(rf) = small_or_float(r)
+            {
+                reg!(ref mut dst).write_float(<$num_kind as num::ArithOp>::float_raw(lf, rf));
+                dispatch!();
+            }
+            tail!(binop_slow);
+        }
+    };
+}
+
+#[inline(always)]
+fn small_or_float(v: &Value<'_>) -> Option<f64> {
+    if v.is_float() {
+        Some(v.read_float())
+    } else {
+        v.get_small().map(f64::from)
+    }
+}
+
+arith_num_handler!(op_add_num, num::Add);
+arith_num_handler!(op_sub_num, num::Sub);
+arith_num_handler!(op_mul_num, num::Mul);
+arith_num_handler!(op_mod_num, num::Mod);
+arith_num_handler!(op_pow_num, num::Pow);
+arith_num_handler!(op_div_num, num::Div);
+arith_num_handler!(op_idiv_num, num::IDiv);
+
+/// The metamethod a binary arithmetic or bitwise opcode calls.
+const fn binop_mm_bit(op: Op) -> Option<MetamethodBits> {
+    use Op::*;
+    Some(match op {
+        ADD | ADDI => MetamethodBits::ADD,
+        SUB | SUBI | RSUBI => MetamethodBits::SUB,
+        MUL | MULI => MetamethodBits::MUL,
+        MOD | MODI | RMODI => MetamethodBits::MOD,
+        POW | POWI | RPOWI => MetamethodBits::POW,
+        DIV | DIVI | RDIVI => MetamethodBits::DIV,
+        IDIV | IDIVI | RIDIVI => MetamethodBits::IDIV,
+        BAND | BANDI => MetamethodBits::BAND,
+        BOR | BORI => MetamethodBits::BOR,
+        BXOR | BXORI => MetamethodBits::BXOR,
+        SHL | SHLI | RSHLI => MetamethodBits::SHL,
+        SHR | SHRI | RSHRI => MetamethodBits::SHR,
+        _ => return None,
+    })
+}
+
+/// [`binop_mm_bit`] by opcode byte, so the metamethod forms read their
+/// metamethod with one load instead of a `match` (a jump table, and a stack
+/// frame for its panic arm).
+static BINOP_MM: [MmIndex; 256] = {
+    let mut t = [MmIndex::of(MetamethodBits::ADD); 256];
+    let mut i = 0;
+    while i < Op::COUNT {
+        if let Some(bit) = binop_mm_bit(Op::ALL[i]) {
+            t[i] = MmIndex::of(bit);
+        }
+        i += 1;
+    }
+    t
+};
+
+/// The metamethod `t`'s metatable has for the binary opcode `orig`, which a
+/// metamethod form stands in for; nil when none.
+#[inline(always)]
+fn table_binop_mm<'gc>(t: Table<'gc>, orig: u8) -> Value<'gc> {
+    match t.shape().mt_cache() {
+        Some(cache) => cache.mm_at(BINOP_MM[orig as usize]),
+        None => Value::nil(),
+    }
+}
+
+/// Stage the call `mm(a, b)` above the frame's registers for `meta_call`, as
+/// `call_mm!` does but without growing the stack (`None` when that's needed),
+/// so the metamethod forms need no stack frame.
+#[inline(always)]
+fn stage_binop_mm<'gc>(
+    thread: &mut ThreadState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+    ip: *const Instruction,
+    [mm, a, b]: [Value<'gc>; 3],
+) -> Option<*const Instruction> {
+    let scratch = unsafe { (*frame).base() } + closure.max_stack_size as usize;
+    if std::hint::unlikely(scratch + 3 > thread.stack.len()) {
+        return None;
+    }
+    unsafe {
+        let slot = thread.stack.as_mut_ptr().add(scratch);
+        slot.write(mm);
+        slot.add(1).write(a);
+        slot.add(2).write(b);
+        (*frame).pc = ip;
+        thread.set_top_unchecked(scratch + 3);
+        Some(slot as *const Instruction)
+    }
+}
+
+/// `ARITH_MM`: `R[dst] = mm(R[lhs], R[rhs])`, `mm` from `R[lhs]`, a table.
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn op_arith_mm<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let (_, lhs, rhs) = instruction.abc();
+    let (l, r) = (reg!(lhs), reg!(rhs));
+    if let Some(t) = l.get_table() {
+        let mm = table_binop_mm(t, instruction.d() as u8);
+        if !mm.is_nil()
+            && let Some(slot) = stage_binop_mm(thread, frame, closure, ip, [mm, l, r])
+        {
+            ds.ret = ret_store_a;
+            tail!(meta_call, Instruction::from_raw(mm.to_raw()), slot);
+        }
+    }
+    tail!(binop_slow);
+}
+
+/// `ARITH_MM_R`: as `ARITH_MM`, `mm` from `R[rhs]`, a table, `R[lhs]` a
+/// number.
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn op_arith_mm_r<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let (_, lhs, rhs) = instruction.abc();
+    let (l, r) = (reg!(lhs), reg!(rhs));
+    if let Some(t) = r.get_table()
+        && l.is_number()
+        && ctx.number_metatable().is_none()
+    {
+        let mm = table_binop_mm(t, instruction.d() as u8);
+        if !mm.is_nil()
+            && let Some(slot) = stage_binop_mm(thread, frame, closure, ip, [mm, l, r])
+        {
+            ds.ret = ret_store_a;
+            tail!(meta_call, Instruction::from_raw(mm.to_raw()), slot);
+        }
+    }
+    tail!(binop_slow);
+}
+
+/// `ARITH_MMI`: an immediate form whose register operand is a table with the
+/// metamethod. With the immediate on the left, numbers must have none.
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn op_arith_mmi<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    registers: Registers<'gc, '_>,
+    ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let (_, src, flipped) = instruction.abc_imm();
+    let v = reg!(src);
+    if let Some(t) = v.get_table() {
+        let orig = instruction.c() >> 1;
+        let mm = table_binop_mm(t, orig);
+        let imm_left = flipped || (Op::RSUBI as u8..=Op::RSHRI as u8).contains(&orig);
+        if !mm.is_nil() && (!imm_left || ctx.number_metatable().is_none()) {
+            // Immediates are 31-bit, so an integer one is inline.
+            let k = if instruction.imm_is_int() {
+                Value::small(instruction.imm_int() as i32)
+            } else {
+                Value::float(instruction.imm_float())
+            };
+            let (a, b) = if imm_left { (k, v) } else { (v, k) };
+            if let Some(slot) = stage_binop_mm(thread, frame, closure, ip, [mm, a, b]) {
+                ds.ret = ret_store_a;
+                tail!(meta_call, Instruction::from_raw(mm.to_raw()), slot);
+            }
+        }
+    }
+    tail!(binop_slow);
+}
 
 // ---------------------------------------------------------------------------
 // Arithmetic and bitwise (register-immediate)
@@ -6679,7 +6914,7 @@ fn native_entry<'gc>(
 /// The slow path of every binary arithmetic and bitwise opcode, register and
 /// immediate forms alike: mixed and boxed numbers, division by zero, and the
 /// metamethods. The opcode says which operation it is and where its operands
-/// are.
+/// are. Quickens the site (see `Op::ADD_NUM`) by what reaches it here.
 #[inline(never)]
 #[rustc_align(32)]
 extern "rust-preserve-none" fn binop_slow<'gc>(
@@ -6695,18 +6930,28 @@ extern "rust-preserve-none" fn binop_slow<'gc>(
 ) -> Exit {
     helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
     use Op::*;
-    let op = instruction.op();
-    let dst = instruction.a();
+    // SAFETY: `Code` keeps instructions in cells, and `ip` is past this one.
+    let site = unsafe { ip.sub(1).cast_mut() };
+    let insn = instruction.unquickened();
+    let op = insn.op();
+    let quicken = instruction.op() == op && insn.quickenable();
+    // A metamethod form also lands here when the stack needs growing, which
+    // must not undo it; other misses undo it for good.
+    let mm_form = matches!(instruction.op(), ARITH_MM | ARITH_MM_R | ARITH_MMI);
+    let dst = insn.a();
     let mc = ctx.mutation();
     let (lhs, rhs) = match op {
         ADD | SUB | MUL | MOD | POW | DIV | IDIV | BAND | BOR | BXOR | SHL | SHR => {
-            (reg!(instruction.b()), reg!(instruction.c()))
+            (reg!(insn.b()), reg!(insn.c()))
         }
         _ => {
-            let (_, src, flipped) = instruction.abc_imm();
-            let (v, k) = (reg!(src), instruction.imm_value(mc));
-            let swap = matches!(op, RSUBI | RMODI | RPOWI | RDIVI | RIDIVI | RSHLI | RSHRI);
-            if swap || flipped { (k, v) } else { (v, k) }
+            let (_, src, flipped) = insn.abc_imm();
+            let (v, k) = (reg!(src), insn.imm_value(mc));
+            if flipped || op.is_reversed() {
+                (k, v)
+            } else {
+                (v, k)
+            }
         }
     };
     let (r, bit) = match op {
@@ -6760,8 +7005,17 @@ extern "rust-preserve-none" fn binop_slow<'gc>(
         ),
         _ => unreachable!("binop_slow on {op:?}"),
     };
+    if mm_form && !matches!(r, num::SlowNum::NotNumbers) {
+        unsafe { site.write(insn.with_no_quicken()) };
+    }
     match r {
         num::SlowNum::Value(v) => {
+            if quicken
+                && lhs.is_float() != rhs.is_float()
+                && let Some(num) = op.num_form()
+            {
+                unsafe { site.write(insn.with_op(num)) };
+            }
             *reg!(ref mut dst) = v;
             dispatch!();
         }
@@ -6769,7 +7023,37 @@ extern "rust-preserve-none" fn binop_slow<'gc>(
         num::SlowNum::DivByZero => raise!(OpError::DivByZero),
         num::SlowNum::NotNumbers => {}
     }
-    let meta_fn = binop_metamethod(ctx, lhs, rhs, bit);
+    let lhs_mm = ctx.mm_of(lhs, bit);
+    let meta_fn = if lhs_mm.is_nil() {
+        ctx.mm_of(rhs, bit)
+    } else {
+        lhs_mm
+    };
+    if quicken || mm_form {
+        // The forms read the metamethod from a table's shape; taking it from
+        // the right needs the left to be a number without one.
+        let form = if meta_fn.is_nil() {
+            None
+        } else if !lhs_mm.is_nil() {
+            lhs.get_table().map(|_| ARITH_MM)
+        } else if rhs.get_table().is_some() && lhs.is_number() && ctx.number_metatable().is_none() {
+            Some(ARITH_MM_R)
+        } else {
+            None
+        };
+        let form = form.map(|f| {
+            if op.shape() == crate::instruction::Shape::AbcImm {
+                ARITH_MMI
+            } else {
+                f
+            }
+        });
+        if quicken && let Some(form) = form {
+            unsafe { site.write(insn.with_mm_form(form)) };
+        } else if mm_form && form != Some(instruction.op()) {
+            unsafe { site.write(insn.with_no_quicken()) };
+        }
+    }
     if meta_fn.is_nil() {
         let bitwise = MetamethodBits::BAND | MetamethodBits::BOR | MetamethodBits::BXOR;
         raise!(
