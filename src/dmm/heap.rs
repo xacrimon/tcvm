@@ -18,6 +18,7 @@
 use core::cell::{Cell, UnsafeCell};
 use core::ptr::{self, NonNull};
 use std::alloc::{self, Layout};
+use std::collections::BinaryHeap;
 use std::vec::Vec;
 
 use crate::dmm::{metrics::Metrics, types::GcBox};
@@ -56,15 +57,29 @@ struct Header {
     kind: Cell<Kind>,
 }
 
+/// A chunk's gray stack: the cells of its objects waiting to be traced.
+#[repr(C)]
+struct GrayStack {
+    cells: Cell<*mut u16>,
+    len: Cell<u32>,
+    cap: Cell<u32>,
+    /// In the gray queue, or being drained.
+    queued: Cell<bool>,
+}
+
 #[repr(C)]
 struct Meta {
     header: Header,
     block: [Cell<u64>; WORDS - META_WORDS],
-    _mark_header: [u64; META_WORDS],
+    /// In place of the mark bits of the metadata's own cells.
+    gray: GrayStack,
+    _pad: [u8; META_WORDS * 8 - size_of::<GrayStack>()],
     mark: [Cell<u64>; WORDS - META_WORDS],
 }
 
 const _: () = assert!(size_of::<Header>() == META_WORDS * 8);
+const _: () = assert!(size_of::<GrayStack>() <= META_WORDS * 8);
+const _: () = assert!(CELLS <= 1 << 16);
 const _: () = assert!(size_of::<Meta>() == FIRST_CELL * CELL);
 
 #[inline(always)]
@@ -438,6 +453,10 @@ impl Drop for Heap {
 /// `chunk` must be live and unreferenced.
 unsafe fn free_chunk(chunk: NonNull<Meta>) {
     unsafe {
+        let gray = &chunk.as_ref().gray;
+        if gray.cap.get() != 0 {
+            alloc::dealloc(gray.cells.get().cast(), gray_layout(gray.cap.get()));
+        }
         let size = chunk.as_ref().header.size;
         alloc::dealloc(
             chunk.as_ptr().cast(),
@@ -567,4 +586,112 @@ fn clear_range(map: &[Cell<u64>], start: usize, end: usize) {
         map[w].update(|m| m & !mask);
         cell += n;
     }
+}
+
+fn gray_layout(cap: u32) -> Layout {
+    Layout::array::<u16>(cap as usize).unwrap()
+}
+
+/// The objects waiting to be traced, kept per chunk so tracing works through one chunk at a time
+/// (LuaJIT 3.0's gray stacks and gray queue). Chunks are queued by how much they hold, largest
+/// first, so the bulk of the work has the best locality.
+pub(crate) struct GrayQueue {
+    /// Chunks with a nonempty stack, by its length when queued; a waiting chunk is queued again
+    /// each time its length reaches a power of two, and entries for drained chunks are skipped.
+    queue: UnsafeCell<BinaryHeap<(u32, u64, NonNull<Meta>)>>,
+    /// Breaks ties in `queue` toward the chunk queued last.
+    seq: Cell<u64>,
+    /// The chunk being drained.
+    current: Cell<Option<NonNull<Meta>>>,
+}
+
+impl GrayQueue {
+    pub(crate) fn new() -> Self {
+        Self {
+            queue: UnsafeCell::new(BinaryHeap::new()),
+            seq: Cell::new(0),
+            current: Cell::new(None),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        // SAFETY: `GrayQueue` is `!Sync` and no reference to the heap escapes a method.
+        self.current.get().is_none() && unsafe { (*self.queue.get()).is_empty() }
+    }
+
+    /// # Safety
+    /// `p` must be a live object's start that is not in the queue.
+    pub(crate) unsafe fn push(&self, p: GcBox) {
+        let p = p.as_ptr();
+        let meta = meta(p);
+        let gray = &meta.gray;
+        let len = gray.len.get();
+        if len == gray.cap.get() {
+            grow(gray);
+        }
+        // SAFETY: within capacity.
+        unsafe { gray.cells.get().add(len as usize).write(cell_of(p) as u16) };
+        gray.len.set(len + 1);
+        // A waiting chunk's stack only grows, so this queues it once per doubling; the chunk
+        // being drained goes up and down and is never queued again.
+        let draining = self.current.get() == Some(NonNull::from(meta));
+        if !gray.queued.get() || (!draining && (len + 1).is_power_of_two()) {
+            gray.queued.set(true);
+            let seq = self.seq.get() + 1;
+            self.seq.set(seq);
+            // SAFETY: as in `is_empty`.
+            unsafe { (*self.queue.get()).push((len + 1, seq, NonNull::from(meta))) };
+        }
+    }
+
+    pub(crate) fn pop(&self) -> Option<GcBox> {
+        loop {
+            if let Some(chunk) = self.current.get() {
+                // SAFETY: a queued chunk is live; chunks are only freed after marking.
+                let meta = unsafe { chunk.as_ref() };
+                let gray = &meta.gray;
+                let len = gray.len.get();
+                if len != 0 {
+                    gray.len.set(len - 1);
+                    // SAFETY: below `len`; a stack cell is a gray object's start.
+                    return Some(unsafe {
+                        let cell = *gray.cells.get().add(len as usize - 1);
+                        GcBox::from_ptr(base(meta).add(cell as usize * CELL))
+                    });
+                }
+                gray.queued.set(false);
+                self.current.set(None);
+            }
+            // SAFETY: as in `is_empty`.
+            let (_, _, chunk) = unsafe { (*self.queue.get()).pop()? };
+            // SAFETY: as above.
+            let gray = unsafe { &chunk.as_ref().gray };
+            if gray.queued.get() && gray.len.get() != 0 {
+                self.current.set(Some(chunk));
+            }
+        }
+    }
+}
+
+#[cold]
+fn grow(gray: &GrayStack) {
+    let cap = gray.cap.get();
+    let new_cap = (cap * 2).max(64);
+    // SAFETY: the layouts are nonzero and match the stack's allocation.
+    let cells = unsafe {
+        if cap == 0 {
+            alloc::alloc(gray_layout(new_cap))
+        } else {
+            alloc::realloc(
+                gray.cells.get().cast(),
+                gray_layout(cap),
+                gray_layout(new_cap).size(),
+            )
+        }
+    };
+    if cells.is_null() {
+        alloc::handle_alloc_error(gray_layout(new_cap));
+    }
+    gray.cells.set(cells.cast());
+    gray.cap.set(new_cap);
 }

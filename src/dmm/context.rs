@@ -10,7 +10,7 @@ use std::{boxed::Box, vec::Vec};
 use crate::dmm::{
     Gc, GcWeak,
     collect::{Collect, Trace},
-    heap::{self, CELL, Heap},
+    heap::{self, CELL, GrayQueue, Heap},
     metrics::Metrics,
     types::{GcBox, GcBoxHeader, GcBoxInner, Invariant, TrailingBytes, trailing_layout},
 };
@@ -215,7 +215,7 @@ pub(crate) struct Context {
 
     /// A queue of gray objects, used during `Phase::Mark`.
     /// This holds traceable objects that have yet to be traced.
-    gray: Queue<GcBox>,
+    gray: GrayQueue,
 
     // A queue of gray objects that became gray as a result
     // of a write barrier.
@@ -248,7 +248,7 @@ impl Context {
             metrics: NonNull::from(Box::leak(Box::new(Metrics::new()))),
             heap: ManuallyDrop::new(Heap::new()),
             root_needs_trace: true,
-            gray: Queue::new(),
+            gray: GrayQueue::new(),
             gray_again: Queue::new(),
             tracing: None,
             deferred: Queue::new(),
@@ -506,7 +506,8 @@ impl Context {
         let (size, push) = unsafe { self.heap.mark(gc_box) };
         self.metrics().mark_gc_marked(size);
         if push {
-            self.gray.push(gc_box);
+            // SAFETY: it was just marked, so it isn't queued.
+            unsafe { self.gray.push(gc_box) };
         }
     }
 
