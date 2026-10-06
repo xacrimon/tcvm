@@ -95,6 +95,10 @@ const GC_GRANULARITY: usize = 64 * 1024;
 /// set is tiny; the default 4 KiB restarts a cycle every few KiB of garbage.
 const GC_MIN_SLEEP: usize = 64 * 1024;
 
+/// Garbage allowed per cycle, as a fraction of what survived the last one;
+/// LuaJIT's default pause of 200 is the same.
+const GC_SLEEP_FACTOR: f64 = 1.0;
+
 /// A Lua runtime instance.
 pub struct Lua {
     arena: Arena<Rootable![State<'_>]>,
@@ -132,6 +136,7 @@ impl Lua {
         let metrics = arena.metrics();
         metrics.set_pacing(Pacing {
             min_sleep: GC_MIN_SLEEP,
+            sleep_factor: GC_SLEEP_FACTOR,
             ..Pacing::DEFAULT
         });
         metrics.set_gc_granularity(GC_GRANULARITY);
