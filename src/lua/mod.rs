@@ -86,10 +86,6 @@ impl<'gc> State<'gc> {
     }
 }
 
-/// Allocation, in bytes, past the heap limit before a collection starts.
-/// Tuned when collections were incremental; not measured again since.
-const GC_GRANULARITY: usize = 64 * 1024;
-
 /// A Lua runtime instance.
 pub struct Lua {
     arena: Arena<Rootable![State<'_>]>,
@@ -124,15 +120,13 @@ impl Lua {
                 buf: std::cell::Cell::new(Vec::new()),
             }
         });
-        arena.metrics().set_gc_granularity(GC_GRANULARITY);
         Lua { arena }
     }
 
-    /// Collect once the debt exceeds the granularity, then re-arm the
+    /// Collect once memory in use is past the heap limit, then re-arm the
     /// interpreter's check.
     fn collect_debt(&mut self) {
-        let metrics = self.arena.metrics();
-        if metrics.allocation_debt() > metrics.gc_granularity() as f64 {
+        if self.arena.metrics().allocation_debt() > 0.0 {
             self.finalize_and_sweep();
         }
         self.arena.metrics().arm_gc_check();
