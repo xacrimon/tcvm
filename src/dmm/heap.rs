@@ -530,7 +530,8 @@ unsafe fn drop_object(p: *mut u8, metrics: Option<&Metrics>) {
     }
 }
 
-/// Free the white blocks of `meta` and turn its black ones white.
+/// Free the white blocks of `meta`, merging neighbouring free blocks, and turn its black ones
+/// white.
 fn sweep_chunk(meta: &Meta, metrics: &Metrics) {
     let header = &meta.header;
     let base = base(meta);
@@ -542,6 +543,8 @@ fn sweep_chunk(meta: &Meta, metrics: &Metrics) {
     });
     let mut marked = 0;
     let mut in_black = false;
+    // As if a live block came before the first cell, so a free block there is kept.
+    let mut in_live = true;
     for w in 0..WORDS - META_WORDS {
         let (b, m) = (meta.block[w].get(), meta.mark[w].get());
         // Count the cells of the black blocks: an add carries from each black start through the
@@ -562,12 +565,28 @@ fn sweep_chunk(meta: &Meta, metrics: &Metrics) {
                 dead &= dead - 1;
             }
         }
-        meta.block[w].set(b & m);
-        meta.mark[w].set(b ^ m);
+        let (live, free) = (b & m, b ^ m);
+        // Keep only the free starts that follow a live block, by the same carry from each live
+        // start, now stopped by (and so flipping) the first free start after it.
+        let x = !(live | free) | live;
+        let (sum, c1) = x.overflowing_add(live);
+        let (sum, c2) = sum.overflowing_add(in_live as u64);
+        in_live = c1 | c2;
+        meta.block[w].set(live);
+        meta.mark[w].set(free & (x ^ sum));
     }
     let (allocated, marked) = (header.allocated.get(), marked * CELL);
     #[cfg(debug_assertions)]
-    debug_assert_eq!(marked, expected);
+    {
+        debug_assert_eq!(marked, expected);
+        let mut prev_free = false;
+        for_each_bit(meta, |b, m| b | m, |p| {
+            let (w, b) = bit(cell_of(p));
+            let free = meta.block[w].get() & b == 0;
+            debug_assert!(!(free && prev_free), "neighbouring free blocks");
+            prev_free = free;
+        });
+    }
     metrics.mark_gc_freed(allocated - marked);
     metrics.mark_gc_remembered(marked);
     header.allocated.set(marked);
@@ -606,8 +625,8 @@ fn next_bit(meta: &Meta, from: usize, select: impl Fn(u64, u64) -> u64) -> Optio
     }
 }
 
-/// The first free run of at least `cells` cells at or after `from`: from a free-block start to
-/// the next block start, merging the free blocks between.
+/// The first free block of at least `cells` cells at or after `from`, which runs from a free start
+/// to the next block start.
 fn find_run(meta: &Meta, from: usize, cells: usize) -> Option<(usize, usize)> {
     let mut from = from;
     loop {
