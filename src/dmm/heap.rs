@@ -13,7 +13,8 @@
 //! Allocation bumps a pointer through a free run and sets the block bit; sweeping is two word
 //! operations per 64 cells and never reads a dead object unless it needs dropping. A huge object
 //! is allocated on its own, aligned like a chunk, with its metadata in a table keyed by its
-//! address: offset 0 of a chunk holds metadata, so an aligned object pointer is a huge one.
+//! address: offset 0 of a chunk holds metadata, so an aligned object pointer is a huge one. Both
+//! are mapped straight from the OS.
 
 use core::cell::{Cell, UnsafeCell};
 use core::ptr::{self, NonNull};
@@ -130,11 +131,51 @@ unsafe fn free_huge(huge: &Huge, metrics: Option<&Metrics>) {
         if huge.needs_drop {
             drop_object(huge.ptr.as_ptr(), metrics);
         }
-        alloc::dealloc(
-            huge.ptr.as_ptr(),
-            Layout::from_size_align_unchecked(huge.size, CHUNK_SIZE),
-        );
+        unmap(huge.ptr.as_ptr(), huge.size);
     }
+}
+
+/// Map `size` bytes, zeroed and aligned to `CHUNK_SIZE`, from the OS. Only `size` rounded up to
+/// whole pages stays mapped; the slack taken to align it is unmapped again.
+fn map(size: usize) -> NonNull<u8> {
+    let page = page_size();
+    let len = size.next_multiple_of(page);
+    let span = len.checked_add(CHUNK_SIZE - page).expect("allocation too large");
+    // SAFETY: a new anonymous mapping, trimmed to an aligned `len` bytes.
+    unsafe {
+        let p = libc::mmap(
+            ptr::null_mut(),
+            span,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        );
+        if p == libc::MAP_FAILED {
+            alloc::handle_alloc_error(Layout::from_size_align_unchecked(size, CHUNK_SIZE));
+        }
+        let p = p.cast::<u8>();
+        let start = p.map_addr(|a| a.next_multiple_of(CHUNK_SIZE));
+        let head = start.addr() - p.addr();
+        if head != 0 {
+            libc::munmap(p.cast(), head);
+        }
+        if span - head != len {
+            libc::munmap(start.add(len).cast(), span - head - len);
+        }
+        NonNull::new_unchecked(start)
+    }
+}
+
+/// # Safety
+/// `p` and `size` must be those of a `map`, and nothing in it used again.
+unsafe fn unmap(p: *mut u8, size: usize) {
+    unsafe { libc::munmap(p.cast(), size.next_multiple_of(page_size())) };
+}
+
+fn page_size() -> usize {
+    // SAFETY: no preconditions.
+    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
 }
 
 #[derive(Copy, Clone)]
@@ -352,13 +393,8 @@ impl Heap {
     #[cold]
     #[inline(never)]
     fn alloc_huge(&self, size: usize, needs_drop: bool, needs_trace: bool) -> NonNull<u8> {
-        // Not rounded up to whole chunks as in LuaJIT 3.0, whose memory manager hands out only
-        // chunk-sized memory: the system allocator can still use what follows the object.
-        let layout = Layout::from_size_align(size, CHUNK_SIZE).expect("allocation too large");
-        // SAFETY: `layout` is not zero-sized.
-        let Some(ptr) = NonNull::new(unsafe { alloc::alloc(layout) }) else {
-            alloc::handle_alloc_error(layout)
-        };
+        // Not rounded up to whole chunks as in LuaJIT 3.0: only its pages are mapped.
+        let ptr = map(size);
         let huge = Huge {
             ptr,
             size,
@@ -373,16 +409,9 @@ impl Heap {
     }
 
     fn new_chunk(&self, kind: Kind) -> &Meta {
-        let layout = Layout::from_size_align(CHUNK_SIZE, CHUNK_SIZE).unwrap();
-        // SAFETY: `layout` is not zero-sized; only the metadata needs zeroing, as allocation
-        // writes every object before it is read.
+        // SAFETY: the mapping is zeroed, which the rest of the metadata starts as.
         let meta = unsafe {
-            let p = alloc::alloc(layout);
-            if p.is_null() {
-                alloc::handle_alloc_error(layout);
-            }
-            p.write_bytes(0, size_of::<Meta>());
-            let meta = p.cast::<Meta>();
+            let meta = map(CHUNK_SIZE).cast::<Meta>().as_ptr();
             ptr::addr_of_mut!((*meta).header).write(Header {
                 allocated: Cell::new(0),
                 kind,
@@ -505,10 +534,7 @@ unsafe fn free_chunk(chunk: NonNull<Meta>) {
         if gray.cap.get() != 0 {
             alloc::dealloc(gray.cells.get().cast(), gray_layout(gray.cap.get()));
         }
-        alloc::dealloc(
-            chunk.as_ptr().cast(),
-            Layout::from_size_align_unchecked(CHUNK_SIZE, CHUNK_SIZE),
-        );
+        unmap(chunk.as_ptr().cast(), CHUNK_SIZE);
     }
 }
 
