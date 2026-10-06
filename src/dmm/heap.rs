@@ -11,15 +11,17 @@
 //! | 1     | 1    | starts a black block  |
 //!
 //! Allocation bumps a pointer through a free run and sets the block bit; sweeping is two word
-//! operations per 64 cells and never reads a dead object unless it needs dropping. An object too
-//! big for a chunk gets a huge chunk of its own, with the same metadata and the object in its
-//! first data cell.
+//! operations per 64 cells and never reads a dead object unless it needs dropping. A huge object
+//! is allocated on its own, aligned like a chunk, with its metadata in a table keyed by its
+//! address: offset 0 of a chunk holds metadata, so an aligned object pointer is a huge one.
 
 use core::cell::{Cell, UnsafeCell};
 use core::ptr::{self, NonNull};
 use std::alloc::{self, Layout};
 use std::collections::BinaryHeap;
 use std::vec::Vec;
+
+use hashbrown::HashTable;
 
 use crate::dmm::{metrics::Metrics, types::GcBox};
 
@@ -30,7 +32,7 @@ const WORDS: usize = CELLS / 64;
 /// Bitmap words covering the metadata's own cells, which hold the header instead.
 const META_WORDS: usize = WORDS / 64;
 const FIRST_CELL: usize = META_WORDS * 64;
-/// Objects bigger than this get a huge chunk.
+/// Objects bigger than this are huge.
 const HUGE: usize = CHUNK_SIZE / 8;
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -41,9 +43,6 @@ enum Kind {
     Leaf,
     /// Objects with drop glue.
     Drop,
-    Huge,
-    /// A huge chunk whose object died, freed when the sweep ends.
-    Dead,
 }
 
 #[repr(C)]
@@ -52,9 +51,7 @@ struct Header {
     allocated: Cell<usize>,
     /// Bytes of the blocks marked this cycle.
     marked: Cell<usize>,
-    /// The whole allocation: `CHUNK_SIZE`, or more for a huge chunk.
-    size: usize,
-    kind: Cell<Kind>,
+    kind: Kind,
 }
 
 /// A chunk's gray stack: the cells of its objects waiting to be traced.
@@ -69,15 +66,17 @@ struct GrayStack {
 
 #[repr(C)]
 struct Meta {
+    /// In place of the block bits of the metadata's own cells.
     header: Header,
+    _header_pad: [u8; META_WORDS * 8 - size_of::<Header>()],
     block: [Cell<u64>; WORDS - META_WORDS],
     /// In place of the mark bits of the metadata's own cells.
     gray: GrayStack,
-    _pad: [u8; META_WORDS * 8 - size_of::<GrayStack>()],
+    _gray_pad: [u8; META_WORDS * 8 - size_of::<GrayStack>()],
     mark: [Cell<u64>; WORDS - META_WORDS],
 }
 
-const _: () = assert!(size_of::<Header>() == META_WORDS * 8);
+const _: () = assert!(size_of::<Header>() <= META_WORDS * 8);
 const _: () = assert!(size_of::<GrayStack>() <= META_WORDS * 8);
 const _: () = assert!(CELLS <= 1 << 16);
 const _: () = assert!(size_of::<Meta>() == FIRST_CELL * CELL);
@@ -104,28 +103,40 @@ fn base(meta: &Meta) -> *mut u8 {
     ptr::from_ref(meta).cast::<u8>().cast_mut()
 }
 
-/// Whether the object at `p` is marked.
-///
-/// # Safety
-/// `p` must be a live object's start.
+/// Whether the object at `p` is huge rather than in a chunk.
 #[inline(always)]
-pub(crate) unsafe fn is_marked(p: GcBox) -> bool {
-    let p = p.as_ptr();
-    let (w, b) = bit(cell_of(p));
-    meta(p).mark[w].get() & b != 0
+fn is_huge(p: *const u8) -> bool {
+    p.addr() & (CHUNK_SIZE - 1) == 0
 }
 
-/// Mark the object at `p`, which is `bytes` big.
-///
-/// # Safety
-/// `p` must be an unmarked live object's start.
+/// A huge object's metadata (LuaJIT 3.0's huge block table). Its gray bit is the one in its own
+/// header, as for any object.
+struct Huge {
+    ptr: NonNull<u8>,
+    size: usize,
+    marked: Cell<bool>,
+    needs_drop: bool,
+    needs_trace: bool,
+}
+
 #[inline(always)]
-pub(crate) unsafe fn set_marked(p: GcBox, bytes: usize) {
-    let p = p.as_ptr();
-    let meta = meta(p);
-    let (w, b) = bit(cell_of(p));
-    meta.mark[w].update(|m| m | b);
-    meta.header.marked.update(|n| n + bytes);
+fn huge_hash(p: *const u8) -> u64 {
+    // Huge objects' addresses differ only above the chunk bits.
+    ((p.addr() >> CHUNK_SIZE.trailing_zeros()) as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+
+/// # Safety
+/// `huge` must be unreachable.
+unsafe fn free_huge(huge: &Huge, metrics: Option<&Metrics>) {
+    unsafe {
+        if huge.needs_drop {
+            drop_object(huge.ptr.as_ptr(), metrics);
+        }
+        alloc::dealloc(
+            huge.ptr.as_ptr(),
+            Layout::from_size_align_unchecked(huge.size, CHUNK_SIZE),
+        );
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -212,6 +223,7 @@ impl Space {
 
 pub(crate) struct Heap {
     chunks: UnsafeCell<Vec<NonNull<Meta>>>,
+    huge: UnsafeCell<HashTable<Huge>>,
     plain: Space,
     leaf: Space,
     drop: Space,
@@ -222,6 +234,7 @@ impl Heap {
     pub(crate) fn new() -> Self {
         Self {
             chunks: UnsafeCell::new(Vec::new()),
+            huge: UnsafeCell::new(HashTable::new()),
             plain: Space::new(Kind::Plain),
             leaf: Space::new(Kind::Leaf),
             drop: Space::new(Kind::Drop),
@@ -238,6 +251,57 @@ impl Heap {
         unsafe { &mut *self.chunks.get() }
     }
 
+    /// # Safety
+    /// As for `chunks`.
+    #[allow(clippy::mut_from_ref)]
+    #[inline(always)]
+    unsafe fn huge_table(&self) -> &mut HashTable<Huge> {
+        unsafe { &mut *self.huge.get() }
+    }
+
+    /// # Safety
+    /// `p` must be a live huge object's start, and the result dropped before the table changes.
+    unsafe fn huge(&self, p: *const u8) -> &Huge {
+        unsafe { self.huge_table() }
+            .find(huge_hash(p), |huge| ptr::eq(huge.ptr.as_ptr(), p))
+            .expect("not a huge object")
+    }
+
+    /// Whether the object at `p` is marked.
+    ///
+    /// # Safety
+    /// `p` must be a live object's start.
+    #[inline(always)]
+    pub(crate) unsafe fn is_marked(&self, p: GcBox) -> bool {
+        let p = p.as_ptr();
+        if is_huge(p) {
+            #[cold]
+            #[inline(never)]
+            fn huge_marked(heap: &Heap, p: *const u8) -> bool {
+                unsafe { heap.huge(p) }.marked.get()
+            }
+            return huge_marked(self, p);
+        }
+        let (w, b) = bit(cell_of(p));
+        meta(p).mark[w].get() & b != 0
+    }
+
+    /// Mark the object at `p`, which is `bytes` big.
+    ///
+    /// # Safety
+    /// `p` must be an unmarked live object's start.
+    pub(crate) unsafe fn set_marked(&self, p: GcBox, bytes: usize) {
+        let p = p.as_ptr();
+        if is_huge(p) {
+            unsafe { self.huge(p) }.marked.set(true);
+            return;
+        }
+        let meta = meta(p);
+        let (w, b) = bit(cell_of(p));
+        meta.mark[w].update(|m| m | b);
+        meta.header.marked.update(|n| n + bytes);
+    }
+
     /// Allocate `size` bytes, a multiple of `CELL`, as a white block for an object of a type
     /// that `needs_drop` and `needs_trace`.
     #[inline(always)]
@@ -250,7 +314,7 @@ impl Heap {
     ) -> NonNull<u8> {
         debug_assert!(size.is_multiple_of(CELL) && size > 0);
         if size > HUGE {
-            return self.alloc_huge(size);
+            return self.alloc_huge(size, needs_drop, needs_trace);
         }
         let space = match (needs_drop, needs_trace) {
             (true, _) => &self.drop,
@@ -270,7 +334,7 @@ impl Heap {
         match self.next_run(space, size / CELL, metrics) {
             Some((meta, start, end)) => space.start_run(meta, start, end),
             None => {
-                let meta = self.new_chunk(CHUNK_SIZE, space.kind);
+                let meta = self.new_chunk(space.kind);
                 space.scan_chunk.set(unsafe { self.chunks() }.len() - 1);
                 space.scan_cell.set(CELLS);
                 space.start_run(meta, FIRST_CELL, CELLS);
@@ -281,17 +345,29 @@ impl Heap {
 
     #[cold]
     #[inline(never)]
-    fn alloc_huge(&self, size: usize) -> NonNull<u8> {
-        let meta = self.new_chunk(FIRST_CELL * CELL + size, Kind::Huge);
-        let (w, b) = bit(FIRST_CELL);
-        meta.block[w].set(b);
-        meta.header.allocated.set(size);
-        // SAFETY: the object is the chunk's data.
-        unsafe { NonNull::new_unchecked(base(meta).add(FIRST_CELL * CELL)) }
+    fn alloc_huge(&self, size: usize, needs_drop: bool, needs_trace: bool) -> NonNull<u8> {
+        // Not rounded up to whole chunks as in LuaJIT 3.0, whose memory manager hands out only
+        // chunk-sized memory: the system allocator can still use what follows the object.
+        let layout = Layout::from_size_align(size, CHUNK_SIZE).expect("allocation too large");
+        // SAFETY: `layout` is not zero-sized.
+        let Some(ptr) = NonNull::new(unsafe { alloc::alloc(layout) }) else {
+            alloc::handle_alloc_error(layout)
+        };
+        let huge = Huge {
+            ptr,
+            size,
+            marked: Cell::new(false),
+            needs_drop,
+            needs_trace,
+        };
+        unsafe { self.huge_table() }.insert_unique(huge_hash(ptr.as_ptr()), huge, |huge| {
+            huge_hash(huge.ptr.as_ptr())
+        });
+        ptr
     }
 
-    fn new_chunk(&self, size: usize, kind: Kind) -> &Meta {
-        let layout = Layout::from_size_align(size, CHUNK_SIZE).expect("allocation too large");
+    fn new_chunk(&self, kind: Kind) -> &Meta {
+        let layout = Layout::from_size_align(CHUNK_SIZE, CHUNK_SIZE).unwrap();
         // SAFETY: `layout` is not zero-sized; only the metadata needs zeroing, as allocation
         // writes every object before it is read.
         let meta = unsafe {
@@ -304,13 +380,12 @@ impl Heap {
             ptr::addr_of_mut!((*meta).header).write(Header {
                 allocated: Cell::new(0),
                 marked: Cell::new(0),
-                size,
-                kind: Cell::new(kind),
+                kind,
             });
             NonNull::new_unchecked(meta)
         };
         unsafe { self.chunks() }.push(meta);
-        // SAFETY: just made; freed only by `finish_sweep` or `Drop`.
+        // SAFETY: just made; freed only by `Drop`.
         unsafe { meta.as_ref() }
     }
 
@@ -337,7 +412,7 @@ impl Heap {
             }
             // SAFETY: chunks in the list are live.
             let meta = unsafe { chunk.as_ref() };
-            if meta.header.kind.get() == space.kind
+            if meta.header.kind == space.kind
                 && let Some((start, end)) = find_run(meta, space.scan_cell.get(), cells)
             {
                 space.scan_cell.set(end);
@@ -351,26 +426,33 @@ impl Heap {
     /// Mark `p` and return its size and whether it needs tracing, reading only metadata (LuaJIT
     /// 3.0's marking): the size is the cells up to the next block or free start, or up to its
     /// space's run top when it is the last object in the run (whose tail has no bits set); a huge
-    /// object's is in its chunk header. Only leaf chunks hold objects that need no tracing.
+    /// object's is in its table entry. Only leaf chunks hold objects that need no tracing.
     ///
     /// # Safety
     /// `p` must be an unmarked live object's start.
     #[inline]
     pub(crate) unsafe fn mark(&self, p: GcBox) -> (usize, bool) {
         let p = p.as_ptr();
-        let meta = meta(p);
-        let kind = meta.header.kind.get();
-        let cell = cell_of(p);
-        let size = if kind == Kind::Huge {
-            meta.header.allocated.get()
-        } else {
-            let mut end = next_bit(meta, cell + 1, |b, m| b | m).unwrap_or(CELLS);
-            let top = self.space(kind).top.get();
-            if top.addr() & !(CHUNK_SIZE - 1) == base(meta).addr() && cell < cell_of(top) {
-                end = end.min(cell_of(top));
+        if is_huge(p) {
+            #[cold]
+            #[inline(never)]
+            fn mark_huge(heap: &Heap, p: *const u8) -> (usize, bool) {
+                let huge = unsafe { heap.huge(p) };
+                debug_assert_eq!(huge.size, unsafe { GcBox::from_ptr(p.cast_mut()) }.size());
+                huge.marked.set(true);
+                (huge.size, huge.needs_trace)
             }
-            (end - cell) * CELL
-        };
+            return mark_huge(self, p);
+        }
+        let meta = meta(p);
+        let kind = meta.header.kind;
+        let cell = cell_of(p);
+        let mut end = next_bit(meta, cell + 1, |b, m| b | m).unwrap_or(CELLS);
+        let top = self.space(kind).top.get();
+        if top.addr() & !(CHUNK_SIZE - 1) == base(meta).addr() && cell < cell_of(top) {
+            end = end.min(cell_of(top));
+        }
+        let size = (end - cell) * CELL;
         debug_assert_eq!(size, unsafe { GcBox::from_ptr(p) }.size());
         let (w, b) = bit(cell);
         meta.mark[w].update(|m| m | b);
@@ -383,13 +465,24 @@ impl Heap {
             Kind::Plain => &self.plain,
             Kind::Leaf => &self.leaf,
             Kind::Drop => &self.drop,
-            Kind::Huge | Kind::Dead => unreachable!(),
         }
     }
 
-    /// Begin sweeping every chunk that exists now. Allocation from here on only uses chunks
-    /// already swept, or made after this.
-    pub(crate) fn start_sweep(&self) {
+    /// Sweep the huge objects, and begin sweeping every chunk that exists now. Allocation from
+    /// here on only uses chunks already swept, or made after this.
+    pub(crate) fn start_sweep(&self, metrics: &Metrics) {
+        // All at once, unlike chunks, so that huge objects allocated during the sweep are left
+        // alone.
+        unsafe { self.huge_table() }.retain(|huge| {
+            if huge.marked.replace(false) {
+                metrics.mark_gc_remembered(huge.size);
+                return true;
+            }
+            // SAFETY: an unmarked huge object is unreachable.
+            unsafe { free_huge(huge, Some(metrics)) };
+            metrics.mark_gc_freed(huge.size);
+            false
+        });
         for space in [&self.plain, &self.leaf, &self.drop] {
             space.retire_run();
             space.rescan();
@@ -416,19 +509,10 @@ impl Heap {
         true
     }
 
-    /// End the sweep once `sweep_next` is done: free the dead huge chunks.
+    /// End the sweep once `sweep_next` is done.
     pub(crate) fn finish_sweep(&self) {
         debug_assert!(self.sweep.get().is_some_and(|s| s.next == s.end));
         self.sweep.set(None);
-        unsafe { self.chunks() }.retain(|chunk| {
-            // SAFETY: chunks in the list are live until freed here.
-            let meta = unsafe { chunk.as_ref() };
-            if meta.header.kind.get() != Kind::Dead {
-                return true;
-            }
-            unsafe { free_chunk(*chunk) };
-            false
-        });
         for space in [&self.plain, &self.leaf, &self.drop] {
             space.rescan();
         }
@@ -440,11 +524,15 @@ impl Drop for Heap {
         for &chunk in self.chunks.get_mut().iter() {
             // SAFETY: the heap owns its chunks; every block holds an initialized object.
             unsafe {
-                if matches!(chunk.as_ref().header.kind.get(), Kind::Drop | Kind::Huge) {
+                if chunk.as_ref().header.kind == Kind::Drop {
                     for_each_bit(chunk.as_ref(), |b, _| b, |p| drop_object(p, None));
                 }
                 free_chunk(chunk);
             }
+        }
+        for huge in self.huge.get_mut().drain() {
+            // SAFETY: as above.
+            unsafe { free_huge(&huge, None) };
         }
     }
 }
@@ -457,10 +545,9 @@ unsafe fn free_chunk(chunk: NonNull<Meta>) {
         if gray.cap.get() != 0 {
             alloc::dealloc(gray.cells.get().cast(), gray_layout(gray.cap.get()));
         }
-        let size = chunk.as_ref().header.size;
         alloc::dealloc(
             chunk.as_ptr().cast(),
-            Layout::from_size_align_unchecked(size, CHUNK_SIZE),
+            Layout::from_size_align_unchecked(CHUNK_SIZE, CHUNK_SIZE),
         );
     }
 }
@@ -486,44 +573,25 @@ unsafe fn drop_object(p: *mut u8, metrics: Option<&Metrics>) {
 /// Free the white blocks of `meta` and turn its black ones white.
 fn sweep_chunk(meta: &Meta, metrics: &Metrics) {
     let header = &meta.header;
-    match header.kind.get() {
-        kind @ (Kind::Plain | Kind::Leaf | Kind::Drop) => {
-            let base = base(meta);
-            for w in 0..WORDS - META_WORDS {
-                let (b, m) = (meta.block[w].get(), meta.mark[w].get());
-                if kind == Kind::Drop {
-                    let mut dead = b & !m;
-                    while dead != 0 {
-                        let cell = (w + META_WORDS) * 64 + dead.trailing_zeros() as usize;
-                        // SAFETY: a white block after marking holds an unreachable object.
-                        unsafe { drop_object(base.add(cell * CELL), Some(metrics)) };
-                        dead &= dead - 1;
-                    }
-                }
-                meta.block[w].set(b & m);
-                meta.mark[w].set(b ^ m);
-            }
-            let (allocated, marked) = (header.allocated.get(), header.marked.get());
-            metrics.mark_gc_freed(allocated - marked);
-            metrics.mark_gc_remembered(marked);
-            header.allocated.set(marked);
-        }
-        Kind::Huge => {
-            let (w, b) = bit(FIRST_CELL);
-            let size = header.allocated.get();
-            if meta.mark[w].get() & b != 0 {
-                meta.mark[w].set(0);
-                metrics.mark_gc_remembered(size);
-            } else {
-                // SAFETY: an unmarked huge object is unreachable.
-                unsafe { drop_object(base(meta).add(FIRST_CELL * CELL), Some(metrics)) };
-                meta.block[w].set(0);
-                metrics.mark_gc_freed(size);
-                header.kind.set(Kind::Dead);
+    let base = base(meta);
+    for w in 0..WORDS - META_WORDS {
+        let (b, m) = (meta.block[w].get(), meta.mark[w].get());
+        if header.kind == Kind::Drop {
+            let mut dead = b & !m;
+            while dead != 0 {
+                let cell = (w + META_WORDS) * 64 + dead.trailing_zeros() as usize;
+                // SAFETY: a white block after marking holds an unreachable object.
+                unsafe { drop_object(base.add(cell * CELL), Some(metrics)) };
+                dead &= dead - 1;
             }
         }
-        Kind::Dead => unreachable!(),
+        meta.block[w].set(b & m);
+        meta.mark[w].set(b ^ m);
     }
+    let (allocated, marked) = (header.allocated.get(), header.marked.get());
+    metrics.mark_gc_freed(allocated - marked);
+    metrics.mark_gc_remembered(marked);
+    header.allocated.set(marked);
     header.marked.set(0);
 }
 
@@ -582,7 +650,11 @@ fn clear_range(map: &[Cell<u64>], start: usize, end: usize) {
         let hi = (cell / 64 + 1) * 64;
         let lo_bit = cell % 64;
         let n = end.min(hi) - cell;
-        let mask = if n == 64 { !0 } else { ((1u64 << n) - 1) << lo_bit };
+        let mask = if n == 64 {
+            !0
+        } else {
+            ((1u64 << n) - 1) << lo_bit
+        };
         map[w].update(|m| m & !mask);
         cell += n;
     }
@@ -594,7 +666,8 @@ fn gray_layout(cap: u32) -> Layout {
 
 /// The objects waiting to be traced, kept per chunk so tracing works through one chunk at a time
 /// (LuaJIT 3.0's gray stacks and gray queue). Chunks are queued by how much they hold, largest
-/// first, so the bulk of the work has the best locality.
+/// first, so the bulk of the work has the best locality. Huge objects have no chunk and wait in a
+/// list of their own, traced before the next chunk is taken (the design doesn't say).
 pub(crate) struct GrayQueue {
     /// Chunks with a nonempty stack, by its length when queued; a waiting chunk is queued again
     /// each time its length reaches a power of two, and entries for drained chunks are skipped.
@@ -603,6 +676,7 @@ pub(crate) struct GrayQueue {
     seq: Cell<u64>,
     /// The chunk being drained.
     current: Cell<Option<NonNull<Meta>>>,
+    huge: UnsafeCell<Vec<GcBox>>,
 }
 
 impl GrayQueue {
@@ -611,17 +685,27 @@ impl GrayQueue {
             queue: UnsafeCell::new(BinaryHeap::new()),
             seq: Cell::new(0),
             current: Cell::new(None),
+            huge: UnsafeCell::new(Vec::new()),
         }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        // SAFETY: `GrayQueue` is `!Sync` and no reference to the heap escapes a method.
-        self.current.get().is_none() && unsafe { (*self.queue.get()).is_empty() }
+        // SAFETY: `GrayQueue` is `!Sync` and no reference to its contents escapes a method.
+        unsafe {
+            self.current.get().is_none()
+                && (*self.queue.get()).is_empty()
+                && (*self.huge.get()).is_empty()
+        }
     }
 
     /// # Safety
     /// `p` must be a live object's start that is not in the queue.
     pub(crate) unsafe fn push(&self, p: GcBox) {
+        if is_huge(p.as_ptr()) {
+            // SAFETY: as in `is_empty`.
+            unsafe { (*self.huge.get()).push(p) };
+            return;
+        }
         let p = p.as_ptr();
         let meta = meta(p);
         let gray = &meta.gray;
@@ -661,6 +745,10 @@ impl GrayQueue {
                 }
                 gray.queued.set(false);
                 self.current.set(None);
+            }
+            // SAFETY: as in `is_empty`.
+            if let Some(p) = unsafe { (*self.huge.get()).pop() } {
+                return Some(p);
             }
             // SAFETY: as in `is_empty`.
             let (_, _, chunk) = unsafe { (*self.queue.get()).pop()? };

@@ -10,7 +10,7 @@ use std::{boxed::Box, vec::Vec};
 use crate::dmm::{
     Gc, GcWeak,
     collect::{Collect, Trace},
-    heap::{self, CELL, GrayQueue, Heap},
+    heap::{CELL, GrayQueue, Heap},
     metrics::Metrics,
     types::{GcBox, GcBoxHeader, GcBoxInner, Invariant, TrailingBytes, trailing_layout},
 };
@@ -138,6 +138,13 @@ impl<'gc> Finalization<'gc> {
     #[inline]
     pub(crate) fn resurrect(&self, gc_box: GcBox) {
         self.context.resurrect(gc_box)
+    }
+
+    /// # Safety
+    /// `gc_box` must be a live object.
+    #[inline]
+    pub(crate) unsafe fn is_marked(&self, gc_box: GcBox) -> bool {
+        unsafe { self.context.heap.is_marked(gc_box) }
     }
 
     /// The objects whose trace called [`Trace::defer`] this cycle, each once.
@@ -336,7 +343,7 @@ impl Context {
                             cx.settle_weak();
                             // Allocation from here on only uses chunks already swept, so nothing
                             // allocated during the sweep is freed by it.
-                            cx.heap.start_sweep();
+                            cx.heap.start_sweep(cx.metrics());
                         }
                     }
                 }
@@ -449,7 +456,7 @@ impl Context {
     #[inline(never)]
     fn lighten(&self, parent: GcBox) -> bool {
         // SAFETY: a barrier is only called on a live object.
-        if self.phase == Phase::Mark && unsafe { heap::is_marked(parent) } {
+        if self.phase == Phase::Mark && unsafe { self.heap.is_marked(parent) } {
             return false;
         }
         parent.header().set_gray(true);
@@ -466,7 +473,7 @@ impl Context {
         // During the marking phase, if we are mutating a black object, we may add a white object
         // to it and invalidate the invariant that black objects may not point to white objects.
         // Immediately trace the child white object to turn it gray (or black) to prevent this.
-        if self.phase == Phase::Mark && parent.map(is_black).unwrap_or(true) {
+        if self.phase == Phase::Mark && parent.is_none_or(|p| self.is_black(p)) {
             // Outline the actual barrier code (which is somewhat expensive and won't be executed
             // often) to promote the inlining of the write barrier.
             #[cold]
@@ -482,7 +489,7 @@ impl Context {
         // During the marking phase, if we are mutating a black object, we may add a white object
         // to it and invalidate the invariant that black objects may not point to white objects.
         // Immediately trace the child white object to turn it gray (or black) to prevent this.
-        if self.phase == Phase::Mark && parent.map(is_black).unwrap_or(true) {
+        if self.phase == Phase::Mark && parent.is_none_or(|p| self.is_black(p)) {
             // Outline the actual barrier code (which is somewhat expensive and won't be executed
             // often) to promote the inlining of the write barrier.
             #[cold]
@@ -496,7 +503,7 @@ impl Context {
     #[inline]
     fn trace(&self, gc_box: GcBox) {
         // SAFETY: a traced pointer is a live object's.
-        if unsafe { heap::is_marked(gc_box) } {
+        if unsafe { self.heap.is_marked(gc_box) } {
             return;
         }
         debug_assert!(gc_box.header().is_live());
@@ -514,7 +521,7 @@ impl Context {
     #[inline]
     fn trace_weak(&self, gc_box: GcBox) {
         let header = gc_box.header();
-        if !header.is_weak() && unsafe { !heap::is_marked(gc_box) } {
+        if !header.is_weak() && unsafe { !self.heap.is_marked(gc_box) } {
             header.set_weak(true);
             self.weak.push(gc_box);
         }
@@ -529,14 +536,14 @@ impl Context {
             header.set_weak(false);
             // SAFETY: the box was live when reached and the sweep has not begun.
             unsafe {
-                if !heap::is_marked(gc_box) {
+                if !self.heap.is_marked(gc_box) {
                     let size = gc_box.size();
                     if header.is_live() {
                         header.set_live(false);
                         gc_box.drop_in_place();
                         self.metrics().mark_gc_dropped(size);
                     }
-                    heap::set_marked(gc_box, size);
+                    self.heap.set_marked(gc_box, size);
                     self.metrics().mark_gc_marked(size);
                 }
             }
@@ -632,17 +639,17 @@ impl Context {
 
     // Take a black pointer and turn it gray and put it in the `gray_again` queue.
     fn make_gray_again(&self, gc_box: GcBox) {
-        debug_assert!(is_black(gc_box));
+        debug_assert!(self.is_black(gc_box));
         gc_box.header().set_gray(true);
         self.gray_again.push(gc_box);
     }
-}
 
-/// Marked and traced, or not in need of tracing.
-#[inline(always)]
-fn is_black(gc_box: GcBox) -> bool {
-    // SAFETY: only called on live objects' pointers.
-    !gc_box.header().is_gray() && unsafe { heap::is_marked(gc_box) }
+    /// Marked and traced, or not in need of tracing.
+    #[inline(always)]
+    fn is_black(&self, gc_box: GcBox) -> bool {
+        // SAFETY: only called on live objects' pointers.
+        !gc_box.header().is_gray() && unsafe { self.heap.is_marked(gc_box) }
+    }
 }
 
 /// Helper type for managing phase transitions.
