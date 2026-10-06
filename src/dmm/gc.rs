@@ -15,7 +15,7 @@ use crate::dmm::{
     context::Mutation,
     gc_weak::GcWeak,
     static_collect::Static,
-    types::{GcBox, GcBoxHeader, GcBoxInner, GcColor, Invariant, TrailingBytes},
+    types::{GcBox, GcBoxHeader, GcBoxInner, Invariant, TrailingBytes},
 };
 
 /// A garbage collected pointer to a type T. Implements Copy, and is implemented as a plain machine
@@ -317,9 +317,9 @@ impl<'gc, T: ?Sized + 'gc> Gc<'gc, T> {
     /// Any strong pointer reachable from the root will never be dead, BUT there can be strong
     /// pointers reachable only through other weak pointers that can be dead.
     #[inline]
-    pub fn is_dead(_: &Finalization<'gc>, gc: Gc<'gc, T>) -> bool {
-        let inner = unsafe { gc.ptr.as_ref() };
-        matches!(inner.header.color(), GcColor::White | GcColor::WhiteWeak)
+    pub fn is_dead(fc: &Finalization<'gc>, gc: Gc<'gc, T>) -> bool {
+        // SAFETY: a `Gc` the mutator holds points to an object that has not been freed.
+        unsafe { !fc.is_marked(GcBox::erase(gc.ptr)) }
     }
 
     /// Manually marks a dead `Gc` pointer as reachable and keeps it alive.

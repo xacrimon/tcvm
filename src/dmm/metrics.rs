@@ -45,7 +45,8 @@ use core::cell::Cell;
 /// Every remembered value will always have exactly three things done to it in a given cycle:
 ///
 /// 1) It will at some point be found and marked as reachable (and potentially queued for tracing).
-///    When this happens, `mark_factor * alloc_size` work is recorded.
+///    Marking reads only metadata, so `mark_factor * alloc_size` work is recorded when the value
+///    is traced, and none for a value that is never traced.
 /// 2) Entries in the queue for tracing will eventually be traced by having their
 ///    [`crate::Collect::trace`] method called. At this time, `trace_factor * alloc_size` work is
 ///    recorded. Calling `Collect::trace` will usually mark other pointers as reachable and queue
@@ -97,7 +98,7 @@ use core::cell::Cell;
 /// formulas represent every possible the worst case: for example, if a weakly reachable value has
 /// already been dropped then only `mark_factor + keep_factor` work will be recorded, and if we
 /// can prove that a reachable value has [`crate::Collect::NEEDS_TRACE`] set to false, then only
-/// `mark_factor + keep_factor` work will be recorded. This is not important to remember though, it
+/// `keep_factor` work will be recorded. This is not important to remember though, it
 /// is true that when the collector elides work it may not actually record that work as performed,
 /// but this will only *speed up* collection, it can never cause the collector to stall.
 #[derive(Debug, Copy, Clone)]
@@ -201,7 +202,6 @@ struct MetricsInner {
 
     pacing: Cell<Pacing>,
 
-    total_gcs: Cell<usize>,
     total_gc_bytes: Cell<usize>,
     total_external_bytes: Cell<usize>,
 
@@ -225,8 +225,7 @@ struct MetricsInner {
     traced_gcs: Cell<usize>,
     traced_gc_bytes: Cell<usize>,
 
-    // Statistics for reachable `Gc` pointers as they are iterated through during the sweep phase.
-    remembered_gcs: Cell<usize>,
+    // Bytes of reachable `Gc` pointers the sweep has kept.
     remembered_gc_bytes: Cell<usize>,
 }
 
@@ -247,12 +246,6 @@ impl Metrics {
     #[inline]
     pub fn set_pacing(&self, pacing: Pacing) {
         self.0.pacing.set(pacing);
-    }
-
-    /// Returns the current number of `Gc`s allocated that have not yet been freed.
-    #[inline]
-    pub fn total_gc_count(&self) -> usize {
-        self.0.total_gcs.get()
     }
 
     /// Returns the total bytes allocated by all live `Gc` pointers.
@@ -327,8 +320,7 @@ impl Metrics {
     /// faster than that of allocation so that collection will always complete.
     #[inline]
     pub fn allocation_debt(&self) -> f64 {
-        let total_gcs = self.0.total_gcs.get();
-        if total_gcs == 0 {
+        if self.0.total_gc_bytes.get() == 0 {
             // If we have no live `Gc`s, then there is no possible collection to do so always
             // return zero debt.
             return 0.0;
@@ -428,13 +420,11 @@ impl Metrics {
         self.0.marked_gc_bytes.set(0);
         self.0.traced_gcs.set(0);
         self.0.traced_gc_bytes.set(0);
-        self.0.remembered_gcs.set(0);
         self.0.remembered_gc_bytes.set(0);
     }
 
     #[inline]
     pub(crate) fn mark_gc_allocated(&self, bytes: usize) {
-        self.0.total_gcs.update(|c| c + 1);
         self.0.total_gc_bytes.update(|b| b + bytes);
         self.0
             .allocated_gc_bytes
@@ -452,7 +442,6 @@ impl Metrics {
 
     #[inline]
     pub(crate) fn mark_gc_freed(&self, bytes: usize) {
-        self.0.total_gcs.update(|c| c - 1);
         self.0.total_gc_bytes.update(|b| b - bytes);
         self.0.freed_gc_bytes.update(|b| b.saturating_add(bytes));
     }
@@ -470,14 +459,7 @@ impl Metrics {
     }
 
     #[inline]
-    pub(crate) fn mark_gc_untraced(&self, bytes: usize) {
-        self.0.traced_gcs.update(|c| c - 1);
-        self.0.traced_gc_bytes.update(|b| b - bytes);
-    }
-
-    #[inline]
     pub(crate) fn mark_gc_remembered(&self, bytes: usize) {
-        self.0.remembered_gcs.update(|c| c + 1);
         self.0.remembered_gc_bytes.update(|b| b + bytes);
     }
 }
