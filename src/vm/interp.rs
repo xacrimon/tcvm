@@ -578,7 +578,7 @@ macro_rules! helpers {
                 $thread.set_top_unchecked(__end);
                 $ds.ret = $$ret;
                 become meta_call(
-                    $instruction,
+                    Instruction::from_raw(__f.to_raw()),
                     $ctx,
                     $thread,
                     $registers,
@@ -5028,13 +5028,68 @@ pub(crate) fn binop_metamethod<'gc>(
 // ---------------------------------------------------------------------------
 
 /// Make the call `call_mm!` staged above the running frame's registers: the
-/// function at the slot `ip` points to (the frame's `pc` is already saved),
-/// its arguments above it up to `top`, finished by `ds.ret`. A Lua function
-/// gets a frame returning to it, a native one runs here and hands its results
-/// straight to it.
+/// function at the slot `ip` points to, also passed in `instruction` (see
+/// [`Value::to_raw`]) so it isn't read back from the slot just written; its
+/// arguments above it up to `top`; finished by `ds.ret`. The frame's `pc` is
+/// already saved. Only a Lua function whose window fits is called here, which
+/// keeps this frameless; the rest goes to `meta_call_slow`.
 #[inline(never)]
 #[rustc_align(32)]
 extern "rust-preserve-none" fn meta_call<'gc>(
+    instruction: Instruction,
+    ctx: Context<'gc>,
+    thread: &mut ThreadState<'gc>,
+    mut registers: Registers<'gc, '_>,
+    mut ip: *const Instruction,
+    handlers: *const (),
+    ds: &mut DispatchState<'gc>,
+    frame: *mut LuaFrame<'gc>,
+    closure: LuaFn<'gc>,
+) -> Exit {
+    helpers! { instruction, ctx, thread, registers, ip, handlers, ds, frame, closure }
+    let f = unsafe { Value::from_raw(instruction.raw()) };
+    if let Some(f) = f.get_function()
+        && let FunctionKind::Lua(target) = f.inner().as_ref()
+    {
+        let scratch =
+            unsafe { (ip as *const Value<'gc>).offset_from_unsigned(thread.stack.as_ptr()) };
+        let new_base = scratch + 1;
+        if std::hint::likely(new_base + target.max_stack_size as usize <= thread.call_limit) {
+            let callee = unsafe { LuaFn::from_function_unchecked(f) };
+            let nargs = thread.top - new_base;
+            let num_extras = if std::hint::likely(nargs >= callee.fixed_arity as usize) {
+                0
+            } else {
+                let num_params = callee.num_params as usize;
+                unsafe {
+                    fill_nil(
+                        thread.stack.as_mut_ptr().add(new_base + nargs),
+                        num_params.saturating_sub(nargs),
+                    )
+                };
+                if callee.is_vararg {
+                    nargs.saturating_sub(num_params) as u16
+                } else {
+                    0
+                }
+            };
+            ip = callee.code;
+            frame = unsafe {
+                thread.push_lua_above(frame, callee, ip, ds.ret, new_base as u32, num_extras)
+            };
+            closure = callee;
+            registers = unsafe { thread.stack.as_mut_ptr().add(new_base) };
+            dispatch!();
+        }
+    }
+    tail!(meta_call_slow);
+}
+
+/// [`meta_call`] for a native, a callable non-function, or a Lua function
+/// that needs the stack grown first.
+#[inline(never)]
+#[rustc_align(32)]
+extern "rust-preserve-none" fn meta_call_slow<'gc>(
     instruction: Instruction,
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
@@ -5058,6 +5113,9 @@ extern "rust-preserve-none" fn meta_call<'gc>(
             if !thread.ensure_frame_slots(new_base + callee.max_stack_size as usize) {
                 raise!(OpError::StackOverflow);
             }
+            // As `op_call_grow`, so the next call fits `call_limit` and stays
+            // in `meta_call`.
+            thread.grow_frames_to_stack();
             let num_params = callee.num_params as usize;
             let stack = thread.stack.as_mut_ptr();
             unsafe {
@@ -5125,7 +5183,8 @@ extern "rust-preserve-none" fn meta_call<'gc>(
                 Err(e) => raise!(e),
             }
             let func_slot = unsafe { thread.stack.as_ptr().add(scratch) };
-            tail!(meta_call, instruction, func_slot as *const Instruction);
+            let f = Instruction::from_raw(thread.stack[scratch].to_raw());
+            tail!(meta_call, f, func_slot as *const Instruction);
         }
     }
 }
