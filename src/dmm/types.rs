@@ -4,7 +4,7 @@ use core::marker::PhantomData;
 use core::ptr::NonNull;
 use core::{mem, ptr};
 
-use crate::dmm::{Gc, collect::Collect, context::Context};
+use crate::dmm::{Gc, collect::Collect, context::Context, heap::CELL};
 
 /// A thin-pointer-sized box containing a type-erased GC object.
 /// Stores the metadata required by the GC algorithm inline (see `GcBoxInner`
@@ -16,13 +16,25 @@ pub(crate) struct GcBox(NonNull<GcBoxInner<()>>);
 impl GcBox {
     /// Erases a pointer to a typed GC object.
     ///
-    /// **SAFETY:** The pointer must point to a valid `GcBoxInner` allocated
-    /// in a `Box`.
+    /// **SAFETY:** The pointer must point to a valid `GcBoxInner` allocated by the heap.
     #[inline(always)]
     pub(crate) unsafe fn erase<T: ?Sized>(ptr: NonNull<GcBoxInner<T>>) -> Self {
         // This cast is sound because `GcBoxInner` is `repr(C)`.
         let erased = ptr.as_ptr() as *mut GcBoxInner<()>;
         unsafe { Self(NonNull::new_unchecked(erased)) }
+    }
+
+    /// The box starting at `p`.
+    ///
+    /// **SAFETY:** `p` must start a block holding an initialized `GcBoxInner`.
+    #[inline(always)]
+    pub(crate) unsafe fn from_ptr(p: *mut u8) -> Self {
+        unsafe { Self(NonNull::new_unchecked(p.cast())) }
+    }
+
+    #[inline(always)]
+    pub(crate) fn as_ptr(self) -> *mut u8 {
+        self.0.as_ptr().cast()
     }
 
     /// Gets a pointer to the value stored inside this box.
@@ -70,33 +82,18 @@ impl GcBox {
         unsafe { (self.header().vtable().drop_value)(*self) }
     }
 
-    /// Deallocates the box. Failing to call `Self::drop_in_place` beforehand
-    /// will cause the stored value to be leaked.
-    ///
-    /// **SAFETY**: once called, this `GcBox` should never be accessed by any GC
-    /// pointers again, and `size` must be `self.size()`.
-    #[inline(always)]
-    pub(crate) unsafe fn dealloc(self, size: usize) {
-        unsafe {
-            let align = self.header().vtable().box_layout.align();
-            let ptr = self.0.as_ptr() as *mut u8;
-            // SAFETY: the pointer was allocated with this size and alignment.
-            std::alloc::dealloc(ptr, Layout::from_size_align_unchecked(size, align));
-        }
-    }
-
-    /// The (shallow) size occupied by this box in memory, trailing bytes included.
+    /// The (shallow) size occupied by this box in memory, trailing bytes included, in whole cells.
     #[inline(always)]
     pub(crate) fn size(&self) -> usize {
         let vtable = self.header().vtable();
-        match vtable.trailing_len {
+        let size = match vtable.trailing_len {
             None => vtable.box_layout.size(),
             // SAFETY: only `TrailingBytes` types have a `trailing_len`, and those have no drop
             // glue, so the length is readable even after `drop_in_place`. The sum can't overflow:
             // the box was allocated with it.
-            Some(len) => (vtable.box_layout.size() + unsafe { len(*self) })
-                .next_multiple_of(vtable.box_layout.align()),
-        }
+            Some(len) => vtable.box_layout.size() + unsafe { len(*self) },
+        };
+        size.next_multiple_of(CELL)
     }
 }
 
@@ -122,18 +119,18 @@ pub unsafe trait TrailingBytes {
 }
 
 pub(crate) struct GcBoxHeader {
-    /// The next element in the global linked list of allocated objects.
-    next: Cell<Option<GcBox>>,
     /// A custom virtual function table for handling type-specific operations.
     ///
     /// The lower bits of the pointer are used to store GC flags:
-    /// - bits 0 & 1 for the current `GcColor`;
+    /// - bit 0 (`GRAY`): queued for tracing; a marked object without it is black;
+    /// - bit 1 (`WEAK`): reached only through a `GcWeak` so far this cycle;
     /// - bit 2 for the `needs_trace` flag;
     /// - bit 3 for the `is_live` flag.
     tagged_vtable: Cell<*const CollectVtable>,
 }
 
 impl GcBoxHeader {
+    /// A header for a freshly allocated, live `T`.
     #[inline(always)]
     pub fn new<'gc, T: Collect<'gc>>() -> Self {
         // Helper trait to materialize vtables in static memory.
@@ -145,7 +142,7 @@ impl GcBoxHeader {
             const VTABLE: CollectVtable = CollectVtable::vtable_for::<T>();
         }
 
-        Self::with_vtable(&<T as HasCollectVtable>::VTABLE)
+        Self::with_vtable(&<T as HasCollectVtable>::VTABLE, T::NEEDS_TRACE)
     }
 
     /// Like [`GcBoxHeader::new`], for a value allocated with trailing bytes.
@@ -159,14 +156,14 @@ impl GcBoxHeader {
             const VTABLE: CollectVtable = CollectVtable::vtable_for_trailing::<T>();
         }
 
-        Self::with_vtable(&<T as HasTrailingVtable>::VTABLE)
+        Self::with_vtable(&<T as HasTrailingVtable>::VTABLE, T::NEEDS_TRACE)
     }
 
     #[inline(always)]
-    fn with_vtable(vtable: &'static CollectVtable) -> Self {
+    fn with_vtable(vtable: &'static CollectVtable, needs_trace: bool) -> Self {
+        let flags = LIVE | if needs_trace { NEEDS_TRACE } else { 0 };
         Self {
-            next: Cell::new(None),
-            tagged_vtable: Cell::new(vtable as *const _),
+            tagged_vtable: Cell::new((vtable as *const CollectVtable).map_addr(|a| a | flags)),
         }
     }
 
@@ -180,43 +177,29 @@ impl GcBoxHeader {
         unsafe { &*ptr }
     }
 
-    /// Gets the next element in the global linked list of allocated objects.
     #[inline(always)]
-    pub(crate) fn next(&self) -> Option<GcBox> {
-        self.next.get()
+    pub(crate) fn is_gray(&self) -> bool {
+        tagged_ptr::get::<GRAY, _>(self.tagged_vtable.get()) != 0
     }
 
-    /// Sets the next element in the global linked list of allocated objects.
     #[inline(always)]
-    pub(crate) fn set_next(&self, next: Option<GcBox>) {
-        self.next.set(next)
+    pub(crate) fn set_gray(&self, gray: bool) {
+        tagged_ptr::set_bool::<GRAY, _>(&self.tagged_vtable, gray);
     }
 
-    #[inline]
-    pub(crate) fn color(&self) -> GcColor {
-        match tagged_ptr::get::<0x3, _>(self.tagged_vtable.get()) {
-            0x0 => GcColor::White,
-            0x1 => GcColor::WhiteWeak,
-            0x2 => GcColor::Gray,
-            _ => GcColor::Black,
-        }
+    #[inline(always)]
+    pub(crate) fn is_weak(&self) -> bool {
+        tagged_ptr::get::<WEAK, _>(self.tagged_vtable.get()) != 0
     }
 
-    #[inline]
-    pub(crate) fn set_color(&self, color: GcColor) {
-        tagged_ptr::set::<0x3, _>(
-            &self.tagged_vtable,
-            match color {
-                GcColor::White => 0x0,
-                GcColor::WhiteWeak => 0x1,
-                GcColor::Gray => 0x2,
-                GcColor::Black => 0x3,
-            },
-        );
+    #[inline(always)]
+    pub(crate) fn set_weak(&self, weak: bool) {
+        tagged_ptr::set_bool::<WEAK, _>(&self.tagged_vtable, weak);
     }
+
     #[inline]
     pub(crate) fn needs_trace(&self) -> bool {
-        tagged_ptr::get::<0x4, _>(self.tagged_vtable.get()) != 0x0
+        tagged_ptr::get::<NEEDS_TRACE, _>(self.tagged_vtable.get()) != 0
     }
 
     /// Determines whether or not we've dropped the `dyn Collect` value
@@ -227,19 +210,19 @@ impl GcBoxHeader {
     /// (since we've already done it).
     #[inline]
     pub(crate) fn is_live(&self) -> bool {
-        tagged_ptr::get::<0x8, _>(self.tagged_vtable.get()) != 0x0
-    }
-
-    #[inline]
-    pub(crate) fn set_needs_trace(&self, needs_trace: bool) {
-        tagged_ptr::set_bool::<0x4, _>(&self.tagged_vtable, needs_trace);
+        tagged_ptr::get::<LIVE, _>(self.tagged_vtable.get()) != 0
     }
 
     #[inline]
     pub(crate) fn set_live(&self, alive: bool) {
-        tagged_ptr::set_bool::<0x8, _>(&self.tagged_vtable, alive);
+        tagged_ptr::set_bool::<LIVE, _>(&self.tagged_vtable, alive);
     }
 }
+
+const GRAY: usize = 0x1;
+const WEAK: usize = 0x2;
+const NEEDS_TRACE: usize = 0x4;
+const LIVE: usize = 0x8;
 
 /// Type-specific operations for GC'd values.
 ///
@@ -319,29 +302,6 @@ impl<T> GcBoxInner<T> {
         Self::TRAILING_OFFSET - mem::offset_of!(Self, value);
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub(crate) enum GcColor {
-    /// An object that has not yet been reached by tracing (if we're in a tracing phase).
-    ///
-    /// During `Phase::Sweep`, we will free all white objects that existed *before* the start of the
-    /// current `Phase::Sweep`. Objects allocated during `Phase::Sweep` will be white, but will not
-    /// be freed.
-    White,
-    /// Like White, but for objects weakly reachable from a Black object.
-    ///
-    /// These objects may drop their contents during `Phase::Sweep`, but must stay allocated so that
-    /// weak references can check the alive status.
-    WhiteWeak,
-    /// An object reachable from a Black object, but that has not yet been traced using
-    /// `Collect::trace`. We also mark black objects as gray during `Phase::Mark` in response to
-    /// a write barrier, so that we re-trace and find any objects newly reachable from the mutated
-    /// object.
-    Gray,
-    /// An object that was reached during tracing. It will not be freed during `Phase::Sweep`. At
-    /// the end of `Phase::Sweep`, all black objects will be reset to white.
-    Black,
-}
-
 // Phantom type that holds a lifetime and ensures that it is invariant.
 pub(crate) type Invariant<'a> = PhantomData<Cell<&'a ()>>;
 
@@ -375,14 +335,6 @@ mod tagged_ptr {
     pub(super) fn get<const MASK: usize, T>(tagged_ptr: *const T) -> usize {
         check_mask!(T, MASK);
         tagged_ptr.addr() & MASK
-    }
-
-    #[inline(always)]
-    pub(super) fn set<const MASK: usize, T>(pcell: &Cell<*const T>, tag: usize) {
-        check_mask!(T, MASK);
-        let ptr = pcell.get();
-        let ptr = ptr.map_addr(|addr| (addr & !MASK) | (tag & MASK));
-        pcell.set(ptr)
     }
 
     #[inline(always)]

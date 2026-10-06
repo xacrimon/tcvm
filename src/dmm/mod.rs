@@ -9,6 +9,7 @@ mod context;
 pub mod dynamic_roots;
 mod gc;
 mod gc_weak;
+mod heap;
 pub mod lock;
 pub mod metrics;
 mod no_drop;
