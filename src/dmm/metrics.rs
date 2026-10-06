@@ -45,7 +45,8 @@ use core::cell::Cell;
 /// Every remembered value will always have exactly three things done to it in a given cycle:
 ///
 /// 1) It will at some point be found and marked as reachable (and potentially queued for tracing).
-///    When this happens, `mark_factor * alloc_size` work is recorded.
+///    Marking reads only metadata, so `mark_factor * alloc_size` work is recorded when the value
+///    is traced, and none for a value that is never traced.
 /// 2) Entries in the queue for tracing will eventually be traced by having their
 ///    [`crate::Collect::trace`] method called. At this time, `trace_factor * alloc_size` work is
 ///    recorded. Calling `Collect::trace` will usually mark other pointers as reachable and queue
@@ -97,7 +98,7 @@ use core::cell::Cell;
 /// formulas represent every possible the worst case: for example, if a weakly reachable value has
 /// already been dropped then only `mark_factor + keep_factor` work will be recorded, and if we
 /// can prove that a reachable value has [`crate::Collect::NEEDS_TRACE`] set to false, then only
-/// `mark_factor + keep_factor` work will be recorded. This is not important to remember though, it
+/// `keep_factor` work will be recorded. This is not important to remember though, it
 /// is true that when the collector elides work it may not actually record that work as performed,
 /// but this will only *speed up* collection, it can never cause the collector to stall.
 #[derive(Debug, Copy, Clone)]

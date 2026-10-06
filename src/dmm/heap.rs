@@ -49,8 +49,6 @@ enum Kind {
 struct Header {
     /// Bytes of the blocks allocated here, as of the last run retired from this chunk.
     allocated: Cell<usize>,
-    /// Bytes of the blocks marked this cycle.
-    marked: Cell<usize>,
     kind: Kind,
 }
 
@@ -286,20 +284,28 @@ impl Heap {
         meta(p).mark[w].get() & b != 0
     }
 
-    /// Mark the object at `p`, which is `bytes` big.
+    /// Mark `p` and return whether it needs tracing, reading only metadata (LuaJIT 3.0's
+    /// marking). Only leaf chunks hold objects that need no tracing.
     ///
     /// # Safety
     /// `p` must be an unmarked live object's start.
-    pub(crate) unsafe fn set_marked(&self, p: GcBox, bytes: usize) {
+    #[inline(always)]
+    pub(crate) unsafe fn mark(&self, p: GcBox) -> bool {
         let p = p.as_ptr();
         if is_huge(p) {
-            unsafe { self.huge(p) }.marked.set(true);
-            return;
+            #[cold]
+            #[inline(never)]
+            fn mark_huge(heap: &Heap, p: *const u8) -> bool {
+                let huge = unsafe { heap.huge(p) };
+                huge.marked.set(true);
+                huge.needs_trace
+            }
+            return mark_huge(self, p);
         }
         let meta = meta(p);
         let (w, b) = bit(cell_of(p));
         meta.mark[w].update(|m| m | b);
-        meta.header.marked.update(|n| n + bytes);
+        meta.header.kind != Kind::Leaf
     }
 
     /// Allocate `size` bytes, a multiple of `CELL`, as a white block for an object of a type
@@ -379,7 +385,6 @@ impl Heap {
             let meta = p.cast::<Meta>();
             ptr::addr_of_mut!((*meta).header).write(Header {
                 allocated: Cell::new(0),
-                marked: Cell::new(0),
                 kind,
             });
             NonNull::new_unchecked(meta)
@@ -420,51 +425,6 @@ impl Heap {
             }
             space.scan_chunk.set(i + 1);
             space.scan_cell.set(FIRST_CELL);
-        }
-    }
-
-    /// Mark `p` and return its size and whether it needs tracing, reading only metadata (LuaJIT
-    /// 3.0's marking): the size is the cells up to the next block or free start, or up to its
-    /// space's run top when it is the last object in the run (whose tail has no bits set); a huge
-    /// object's is in its table entry. Only leaf chunks hold objects that need no tracing.
-    ///
-    /// # Safety
-    /// `p` must be an unmarked live object's start.
-    #[inline]
-    pub(crate) unsafe fn mark(&self, p: GcBox) -> (usize, bool) {
-        let p = p.as_ptr();
-        if is_huge(p) {
-            #[cold]
-            #[inline(never)]
-            fn mark_huge(heap: &Heap, p: *const u8) -> (usize, bool) {
-                let huge = unsafe { heap.huge(p) };
-                debug_assert_eq!(huge.size, unsafe { GcBox::from_ptr(p.cast_mut()) }.size());
-                huge.marked.set(true);
-                (huge.size, huge.needs_trace)
-            }
-            return mark_huge(self, p);
-        }
-        let meta = meta(p);
-        let kind = meta.header.kind;
-        let cell = cell_of(p);
-        let mut end = next_bit(meta, cell + 1, |b, m| b | m).unwrap_or(CELLS);
-        let top = self.space(kind).top.get();
-        if top.addr() & !(CHUNK_SIZE - 1) == base(meta).addr() && cell < cell_of(top) {
-            end = end.min(cell_of(top));
-        }
-        let size = (end - cell) * CELL;
-        debug_assert_eq!(size, unsafe { GcBox::from_ptr(p) }.size());
-        let (w, b) = bit(cell);
-        meta.mark[w].update(|m| m | b);
-        meta.header.marked.update(|n| n + size);
-        (size, kind != Kind::Leaf)
-    }
-
-    fn space(&self, kind: Kind) -> &Space {
-        match kind {
-            Kind::Plain => &self.plain,
-            Kind::Leaf => &self.leaf,
-            Kind::Drop => &self.drop,
         }
     }
 
@@ -574,8 +534,25 @@ unsafe fn drop_object(p: *mut u8, metrics: Option<&Metrics>) {
 fn sweep_chunk(meta: &Meta, metrics: &Metrics) {
     let header = &meta.header;
     let base = base(meta);
+    #[cfg(debug_assertions)]
+    let mut expected = 0;
+    #[cfg(debug_assertions)]
+    for_each_bit(meta, |b, m| b & m, |p| {
+        expected += unsafe { GcBox::from_ptr(p) }.size();
+    });
+    let mut marked = 0;
+    let mut in_black = false;
     for w in 0..WORDS - META_WORDS {
         let (b, m) = (meta.block[w].get(), meta.mark[w].get());
+        // Count the cells of the black blocks: an add carries from each black start through the
+        // extent bits after it, stopped by the next white or free start, and on into the next
+        // word.
+        let black = b & m;
+        let x = !(b | m) | black;
+        let (sum, c1) = x.overflowing_add(black);
+        let (sum, c2) = sum.overflowing_add(in_black as u64);
+        in_black = c1 | c2;
+        marked += (((x ^ sum) | black) & x).count_ones() as usize;
         if header.kind == Kind::Drop {
             let mut dead = b & !m;
             while dead != 0 {
@@ -588,11 +565,12 @@ fn sweep_chunk(meta: &Meta, metrics: &Metrics) {
         meta.block[w].set(b & m);
         meta.mark[w].set(b ^ m);
     }
-    let (allocated, marked) = (header.allocated.get(), header.marked.get());
+    let (allocated, marked) = (header.allocated.get(), marked * CELL);
+    #[cfg(debug_assertions)]
+    debug_assert_eq!(marked, expected);
     metrics.mark_gc_freed(allocated - marked);
     metrics.mark_gc_remembered(marked);
     header.allocated.set(marked);
-    header.marked.set(0);
 }
 
 /// Call `f` on the start of every cell of `meta` where `select(block, mark)` has a bit set.

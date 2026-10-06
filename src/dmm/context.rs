@@ -510,9 +510,7 @@ impl Context {
         // The object itself is first read when traversed. Until then its gray bit may be clear,
         // so a write to it takes the barrier and queues it again: traversing twice is cheaper
         // than reading every object as it is found.
-        let (size, push) = unsafe { self.heap.mark(gc_box) };
-        self.metrics().mark_gc_marked(size);
-        if push {
+        if unsafe { self.heap.mark(gc_box) } {
             // SAFETY: it was just marked, so it isn't queued.
             unsafe { self.gray.push(gc_box) };
         }
@@ -543,7 +541,7 @@ impl Context {
                         gc_box.drop_in_place();
                         self.metrics().mark_gc_dropped(size);
                     }
-                    self.heap.set_marked(gc_box, size);
+                    self.heap.mark(gc_box);
                     self.metrics().mark_gc_marked(size);
                 }
             }
@@ -576,8 +574,11 @@ impl Context {
 
         if let Some(gc_box) = next_gray {
             // Every traversal counts as work, including the second one of an object a barrier
-            // queued again.
-            self.metrics().mark_gc_traced(gc_box.size());
+            // queued again. Marking reads no object, so its work is counted here too, where the
+            // size is at hand; objects never traversed count none, as in LuaJIT.
+            let size = gc_box.size();
+            self.metrics().mark_gc_marked(size);
+            self.metrics().mark_gc_traced(size);
             // Black before the traversal, so writes during it are caught.
             gc_box.header().set_gray(false);
             // Drop and huge chunks also hold types with nothing to trace.
