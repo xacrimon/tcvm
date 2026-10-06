@@ -36,8 +36,7 @@ unsafe impl<'gc, T: ?Sized + 'gc> Collect<'gc> for GcWeak<'gc, T> {
 impl<'gc, T: ?Sized + 'gc> GcWeak<'gc, T> {
     /// If the `GcWeak` pointer can be safely upgraded to a strong pointer, upgrade it.
     ///
-    /// This will fail if the value the `GcWeak` points to is dropped, or if we are in the
-    /// [`crate::arena::CollectionPhase::Sweeping`] phase and we know the pointer *will* be dropped.
+    /// This will fail if the value the `GcWeak` points to is dropped.
     #[inline]
     pub fn upgrade(self, mc: &Mutation<'gc>) -> Option<Gc<'gc, T>> {
         let ptr = unsafe { GcBox::erase(self.inner.ptr) };
@@ -46,13 +45,7 @@ impl<'gc, T: ?Sized + 'gc> GcWeak<'gc, T> {
 
     /// Returns whether the value referenced by this `GcWeak` has already been dropped.
     ///
-    /// # Note
-    ///
-    /// This is not the same as using [`GcWeak::upgrade`] and checking if the result is `None`! A
-    /// `GcWeak` pointer can fail to upgrade *without* having been dropped if the current collection
-    /// phase is [`crate::arena::CollectionPhase::Sweeping`] and the pointer *will* be dropped.
-    ///
-    /// It is not safe to use this to use this and casting as a substitute for [`GcWeak::upgrade`].
+    /// It is not safe to use this and casting as a substitute for [`GcWeak::upgrade`].
     #[inline]
     pub fn is_dropped(self) -> bool {
         !unsafe { self.inner.ptr.as_ref() }.header.is_live()

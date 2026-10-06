@@ -86,8 +86,8 @@ impl<'gc> State<'gc> {
     }
 }
 
-/// Allocation debt, in bytes, between collector slices: past the knee of the
-/// exit-overhead curve, with slices of ~10 µs on `particles_bench`.
+/// Allocation, in bytes, past the heap limit before a collection starts.
+/// Tuned when collections were incremental; not measured again since.
 const GC_GRANULARITY: usize = 64 * 1024;
 
 /// A Lua runtime instance.
@@ -128,28 +128,20 @@ impl Lua {
         Lua { arena }
     }
 
-    /// Pay the collector's debt once it exceeds the granularity, then re-arm
-    /// the interpreter's check.
+    /// Collect once the debt exceeds the granularity, then re-arm the
+    /// interpreter's check.
     fn collect_debt(&mut self) {
         let metrics = self.arena.metrics();
         if metrics.allocation_debt() > metrics.gc_granularity() as f64 {
-            if self.arena.collection_phase() != CollectionPhase::Sweeping
-                && self.arena.mark_debt().is_some()
-            {
-                self.finalize_and_sweep();
-            }
-            // Stops when the cycle ends rather than marking the next one, which
-            // must go through `finalize_and_sweep`.
-            if self.arena.collection_phase() == CollectionPhase::Sweeping {
-                self.arena.cycle_debt();
-            }
+            self.finalize_and_sweep();
         }
         self.arena.metrics().arm_gc_check();
     }
 
-    /// Mark to completion, settle weak tables and the interner, and start
-    /// sweeping, with no mutation in between: an object allocated and dropped
-    /// there would be freed while still held by them.
+    /// Run the current cycle, or a new one if the collector sleeps: mark to
+    /// completion, settle weak tables and the interner, and sweep, with no
+    /// mutation in between: an object allocated and dropped there would be
+    /// freed while still held by them.
     fn finalize_and_sweep(&mut self) {
         // A resurrected value can hold further ephemeron keys, so mark and
         // rerun until a pass resurrects nothing.
@@ -159,19 +151,11 @@ impl Lua {
             fc.clear_deferred();
             root.interner.prune(fc);
         });
-        self.marked().start_sweeping();
+        self.marked().sweep();
     }
 
     fn marked(&mut self) -> MarkedArena<'_, Rootable![State<'_>]> {
-        self.arena.finish_marking().expect("not sweeping")
-    }
-
-    /// Run the current cycle, or a new one if the collector sleeps, to its end.
-    fn finish_cycle(&mut self) {
-        if self.arena.collection_phase() != CollectionPhase::Sweeping {
-            self.finalize_and_sweep();
-        }
-        self.arena.finish_cycle();
+        self.arena.finish_marking()
     }
 
     /// Force a full garbage-collection cycle (mark + sweep) to completion.
@@ -181,10 +165,10 @@ impl Lua {
         // A cycle already under way keeps everything it has marked, so finish
         // it first (like `luaC_fullgc`).
         if self.arena.collection_phase() != CollectionPhase::Sleeping {
-            self.finish_cycle();
+            self.finalize_and_sweep();
         }
         self.arena.force_full_collection();
-        self.finish_cycle();
+        self.finalize_and_sweep();
     }
 
     /// Force a minor collection, which frees only what was allocated since
@@ -192,14 +176,15 @@ impl Lua {
     /// [`Lua::collect_all`].
     pub fn collect_young(&mut self) {
         if self.arena.collection_phase() != CollectionPhase::Sleeping {
-            self.finish_cycle();
+            self.finalize_and_sweep();
         }
         self.arena.force_minor_collection();
-        self.finish_cycle();
+        self.finalize_and_sweep();
     }
 
     /// Bytes currently held by live GC allocations. Only meaningful right
-    /// after [`Lua::collect_all`]; mid-cycle it still counts unswept garbage.
+    /// after [`Lua::collect_all`]; otherwise it also counts garbage allocated
+    /// since the last collection.
     pub fn live_bytes(&self) -> usize {
         self.arena.metrics().total_gc_allocation()
     }
