@@ -102,6 +102,8 @@ pub struct Interner<'gc>(Gc<'gc, RefLock<InternerState<'gc>>>);
 /// points at freed memory.
 struct InternerState<'gc> {
     table: HashTable<LuaString<'gc>, MetricsAlloc<'gc>>,
+    /// Strings interned since the last collection, the only ones a minor one can free.
+    young: Vec<LuaString<'gc>, MetricsAlloc<'gc>>,
     // Randomly seeded, like PUC's `luai_makeseed`; dictionary tables reuse this hash, so their
     // `pairs` order differs between runs.
     hasher: foldhash::fast::RandomState,
@@ -116,6 +118,7 @@ impl<'gc> Interner<'gc> {
     pub(crate) fn new(mc: &Mutation<'gc>) -> Self {
         let state = InternerState {
             table: HashTable::new_in(MetricsAlloc::new(mc)),
+            young: Vec::new_in(MetricsAlloc::new(mc)),
             hasher: foldhash::fast::RandomState::default(),
         };
 
@@ -125,15 +128,28 @@ impl<'gc> Interner<'gc> {
     /// Forget the strings that die this cycle. Must run once marking is complete
     /// and before sweeping starts, with no mutation in between.
     pub(crate) fn prune(&self, fc: &Finalization<'gc>) {
-        self.0
-            .borrow_mut(fc)
-            .table
-            .retain(|s| !Gc::is_dead(fc, s.0));
+        let mut state = self.0.borrow_mut(fc);
+        let InternerState { table, young, .. } = &mut *state;
+        if fc.is_full() {
+            table.retain(|s| !Gc::is_dead(fc, s.0));
+        } else {
+            for s in young.iter().filter(|s| Gc::is_dead(fc, s.0)) {
+                match table.find_entry(s.content_hash(), |t| Gc::ptr_eq(t.0, s.0)) {
+                    Ok(entry) => drop(entry.remove()),
+                    Err(_) => unreachable!("a young string outside the table"),
+                }
+            }
+        }
+        young.clear();
     }
 
     pub(crate) fn intern(&self, mc: &Mutation<'gc>, bytes: &[u8]) -> LuaString<'gc> {
         let mut state = self.0.borrow_mut(mc);
-        let InternerState { table, hasher } = &mut *state;
+        let InternerState {
+            table,
+            young,
+            hasher,
+        } = &mut *state;
 
         let hash = {
             let mut hasher = hasher.build_hasher();
@@ -148,6 +164,7 @@ impl<'gc> Interner<'gc> {
                 let len = bytes.len();
                 let string = LuaString(Gc::new_with_bytes(mc, StringData { hash, len }, bytes));
                 v.insert(string);
+                young.push(string);
                 string
             }
         }

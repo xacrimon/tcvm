@@ -356,10 +356,23 @@ where
         }
     }
 
+    /// Make the next collection to start a full one.
+    #[inline]
+    pub fn force_full_collection(&mut self) {
+        self.context.force_collection(true);
+    }
+
+    /// Make the next collection to start a minor one, which only frees what was allocated since
+    /// the last collection. For tests.
+    #[inline]
+    pub fn force_minor_collection(&mut self) {
+        self.context.force_collection(false);
+    }
+
     /// Run the current garbage collection cycle to completion, stopping once garbage collection
     /// has entered the [`CollectionPhase::Sleeping`] phase. If the collector is currently sleeping,
-    /// then this restarts the collector and performs a full collection before transitioning back to
-    /// the sleep phase.
+    /// then this restarts the collector and performs a collection, full or minor, before
+    /// transitioning back to the sleep phase.
     #[inline]
     pub fn finish_cycle(&mut self) {
         unsafe {
