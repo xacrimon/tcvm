@@ -186,31 +186,16 @@ impl<'gc> Trace<'gc> for Context {
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub(crate) enum Phase {
     Mark,
-    Sweep,
     Sleep,
     Drop,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub(crate) enum RunUntil {
-    // Run collection until we reach the stop condition *or* debt is zero.
-    PayDebt,
-    // Run collection until we reach our stop condition.
-    Stop,
-}
-
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) enum Stop {
-    // Don't proceed past the end of marking, *just* before the sweep phase
+    // At the end of marking, just before the sweep.
     FullyMarked,
-    // Don't proceed past the very beginning of the sweep phase
-    AtSweep,
-    // Stop once we reach the end of the current cycle and are in `Phase::Sleep`.
+    // At the end of the collection, back in `Phase::Sleep`.
     FinishCycle,
-    // Stop once we have done an entire cycle as a single atomic unit. This is the maximum amount
-    // of work that a call to `Context::do_collection` will do, since a full collection as a single
-    // atomic unit means that all unreachable values *must* already be freed.
-    Full,
 }
 
 pub(crate) struct Context {
@@ -320,75 +305,39 @@ impl Context {
         self.forced = Some(full);
     }
 
-    // Run a collection, starting one first if the collector sleeps (and, for
-    // `RunUntil::PayDebt`, the heap is past its limit), until it reaches the `stop` condition.
-    // Collections are stop-the-world, as in mmtk's StickyImmix: once started, a collection runs to
-    // `stop` whatever the debt.
+    // Run the current collection, starting one if the collector sleeps, to `stop`. Collections
+    // are stop-the-world, sweep included, as in mmtk's StickyImmix.
     //
     // In order for this to be safe, at the time of call no `Gc` pointers can be live that are not
     // reachable from the given root object.
     #[deny(unsafe_op_in_unsafe_fn)]
-    // `!(debt > 0.0)` rather than `debt <= 0.0` so a NaN debt counts as paid.
-    #[allow(clippy::neg_cmp_op_on_partial_ord)]
     pub(crate) unsafe fn do_collection<'gc, R: Collect<'gc> + ?Sized>(
         &mut self,
         root: &R,
-        run_until: RunUntil,
         stop: Stop,
     ) {
         let mut cx = PhaseGuard::enter(self, None);
-        let paid = |cx: &Context| {
-            run_until == RunUntil::PayDebt && !(cx.metrics().allocation_debt() > 0.0)
-        };
-
-        if cx.phase == Phase::Sleep && paid(&cx) {
+        if cx.phase == Phase::Sleep {
+            cx.start_collection();
+            cx.switch(Phase::Mark);
+        }
+        while cx.mark_one(root).is_continue() {}
+        if stop == Stop::FullyMarked {
             return;
         }
-
-        let mut has_slept = false;
-
-        loop {
-            match cx.phase {
-                Phase::Sleep => {
-                    has_slept = true;
-                    cx.start_collection();
-                    cx.switch(Phase::Mark);
-                }
-                Phase::Mark => {
-                    if cx.mark_one(root).is_break() {
-                        if stop <= Stop::FullyMarked {
-                            break;
-                        } else {
-                            // A deferred object may hold pointers that sweeping is about to free.
-                            assert!(
-                                cx.deferred.is_empty(),
-                                "deferred objects must be cleared in finalization before sweeping"
-                            );
-                            // If we have no gray objects left, we enter the sweep phase.
-                            cx.switch(Phase::Sweep);
-                            cx.settle_weak();
-                            // Allocation from here on only uses blocks already swept, so nothing
-                            // allocated during the sweep is freed by it.
-                            cx.heap.start_sweep(cx.metrics(), cx.full);
-                        }
-                    }
-                }
-                Phase::Sweep => {
-                    if stop <= Stop::AtSweep {
-                        break;
-                    } else if cx.sweep_one().is_break() {
-                        cx.metrics().finish_cycle(cx.full);
-                        cx.root_needs_trace = true;
-                        cx.switch(Phase::Sleep);
-                        // A whole collection done in this call is as much as one call does.
-                        if stop == Stop::FinishCycle || has_slept || paid(&cx) {
-                            break;
-                        }
-                    }
-                }
-                Phase::Drop => unreachable!(),
-            }
-        }
+        // A deferred object may hold pointers that sweeping is about to free.
+        assert!(
+            cx.deferred.is_empty(),
+            "deferred objects must be cleared in finalization before sweeping"
+        );
+        // Out of `Mark` before any drop runs: if one panics, the mutator must not go on with
+        // barriers feeding a marking that would not trace the root again, and so would free what
+        // it allocates.
+        cx.switch(Phase::Sleep);
+        cx.root_needs_trace = true;
+        cx.settle_weak();
+        cx.heap.sweep(cx.metrics(), cx.full);
+        cx.metrics().finish_cycle(cx.full);
     }
 
     /// Begin a collection, full or minor as forced or as the metrics decide.
@@ -583,10 +532,9 @@ impl Context {
     /// This is used by weak pointers to determine if it can safely upgrade to a strong pointer.
     #[inline]
     fn upgrade(&self, gc_box: GcBox) -> bool {
-        // A weakly reached object that died was dropped before the sweep began (`settle_weak`).
-        // Any other object a `GcWeak` points to during the sweep was reachable when marking
-        // ended, or allocated since, so it survives the sweep. In the other phases, an upgraded
-        // pointer that outlives the callback must have been stored, which a barrier catches.
+        // A weakly reached object that died was dropped before the sweep (`settle_weak`), and no
+        // mutation happens during one. An upgraded pointer that outlives the callback must have
+        // been stored, which a barrier catches.
         gc_box.header().is_live()
     }
 
@@ -652,15 +600,6 @@ impl Context {
             self.root_needs_trace = false;
             ControlFlow::Continue(())
         } else {
-            ControlFlow::Break(())
-        }
-    }
-
-    fn sweep_one(&mut self) -> ControlFlow<()> {
-        if self.heap.sweep_next(self.metrics()) {
-            ControlFlow::Continue(())
-        } else {
-            self.heap.finish_sweep();
             ControlFlow::Break(())
         }
     }
