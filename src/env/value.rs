@@ -210,6 +210,12 @@ impl<'gc> Value<'gc> {
         !self.is_boxed()
     }
 
+    /// A float or an integer, inline or boxed.
+    #[inline(always)]
+    pub fn is_number(&self) -> bool {
+        self.is_float() || self.get_small().is_some() || self.is_tag(TAG_BOXED_INT)
+    }
+
     /// The float in this slot, read straight from memory. Volatile so LLVM keeps it a separate
     /// FP-register load instead of reusing the integer load of the tag check, which would cost a
     /// GPR->FPR move on the hot path.

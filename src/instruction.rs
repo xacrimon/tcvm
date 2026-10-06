@@ -544,7 +544,7 @@ impl Instruction {
     #[inline(always)]
     pub fn abc_imm(self) -> (u8, u8, bool) {
         self.expect(Shape::AbcImm);
-        (self.a(), self.b(), self.c() != 0)
+        (self.a(), self.b(), self.c() & 1 != 0)
     }
 
     #[inline(always)]
@@ -892,6 +892,32 @@ instructions! {
 
     0x6e CALL_R0    call_r0     Abc   { func: Reg, args: u8, returns: u8 }
     0x6f CALL_R1    call_r1     Abc   { func: Reg, args: u8, returns: u8 }
+
+    // --- quickened arithmetic -------------------------------------------------
+    //
+    // Never emitted: the arithmetic slow path rewrites a site the first time
+    // it gets there, to the `_NUM` form when one operand is a float and the
+    // other an integer, or to a metamethod form when a table operand supplies
+    // the metamethod. A metamethod form that misses goes back to the generic
+    // opcode for good (`Instruction::NO_QUICKEN`); a `_NUM` form stays.
+    // See `Instruction::unquickened`.
+
+    0x70 ADD_NUM    add_num     Abc   { dst: Reg, lhs: Reg, rhs: Reg }
+    0x71 SUB_NUM    sub_num     Abc   { dst: Reg, lhs: Reg, rhs: Reg }
+    0x72 MUL_NUM    mul_num     Abc   { dst: Reg, lhs: Reg, rhs: Reg }
+    0x73 MOD_NUM    mod_num     Abc   { dst: Reg, lhs: Reg, rhs: Reg }
+    0x74 POW_NUM    pow_num     Abc   { dst: Reg, lhs: Reg, rhs: Reg }
+    0x75 DIV_NUM    div_num     Abc   { dst: Reg, lhs: Reg, rhs: Reg }
+    0x76 IDIV_NUM   idiv_num    Abc   { dst: Reg, lhs: Reg, rhs: Reg }
+
+    /// A register-form binary op whose `lhs` is a table with the metamethod;
+    /// the original opcode is in `d`.
+    0x77 ARITH_MM   arith_mm    Abc   { dst: Reg, lhs: Reg, rhs: Reg }
+    /// As `ARITH_MM`, the metamethod from `rhs`, a table, and `lhs` a number.
+    0x78 ARITH_MM_R arith_mm_r  Abc   { dst: Reg, lhs: Reg, rhs: Reg }
+    /// An immediate-form op whose register operand is a table with the
+    /// metamethod: `c` is `flipped | original opcode << 1`.
+    0x79 ARITH_MMI  arith_mmi   AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
 }
 
 impl Op {
@@ -904,8 +930,36 @@ impl Op {
             Op::SELF_OWN | Op::SELF_ABSENT | Op::SELF_PROTO => Op::SELF,
             Op::SETFIELD_OWN | Op::SETFIELD_TRANS | Op::SETFIELD_ABSENT => Op::SETFIELD,
             Op::SETTABUP_OWN | Op::SETTABUP_TRANS | Op::SETTABUP_ABSENT => Op::SETTABUP,
+            Op::ADD_NUM => Op::ADD,
+            Op::SUB_NUM => Op::SUB,
+            Op::MUL_NUM => Op::MUL,
+            Op::MOD_NUM => Op::MOD,
+            Op::POW_NUM => Op::POW,
+            Op::DIV_NUM => Op::DIV,
+            Op::IDIV_NUM => Op::IDIV,
             op => op,
         }
+    }
+
+    /// The `_NUM` form of a register-form arithmetic opcode.
+    #[inline]
+    pub fn num_form(self) -> Option<Op> {
+        Some(match self {
+            Op::ADD => Op::ADD_NUM,
+            Op::SUB => Op::SUB_NUM,
+            Op::MUL => Op::MUL_NUM,
+            Op::MOD => Op::MOD_NUM,
+            Op::POW => Op::POW_NUM,
+            Op::DIV => Op::DIV_NUM,
+            Op::IDIV => Op::IDIV_NUM,
+            _ => return None,
+        })
+    }
+
+    /// An immediate-form opcode that computes `imm <op> R[src]` (the `R` forms).
+    #[inline]
+    pub fn is_reversed(self) -> bool {
+        (Op::RSUBI as u8..=Op::RSHRI as u8).contains(&(self as u8))
     }
 }
 
@@ -945,6 +999,69 @@ impl Instruction {
     #[inline]
     pub(crate) fn with_op(self, op: Op) -> Self {
         Instruction((self.0 & !0xff) | op as u64)
+    }
+
+    /// Whether the arithmetic slow path may still quicken this generic binary
+    /// op: cleared by [`Self::with_no_quicken`], in bits the form leaves unused
+    /// (the top bit for register forms, bit 1 of `c` beside `flipped` for
+    /// immediate ones).
+    #[inline]
+    pub(crate) fn quickenable(self) -> bool {
+        if self.op().shape() == Shape::AbcImm {
+            self.c() & 2 == 0
+        } else {
+            self.0 >> 63 == 0
+        }
+    }
+
+    #[inline]
+    pub(crate) fn with_no_quicken(self) -> Self {
+        if self.op().shape() == Shape::AbcImm {
+            Instruction(self.0 | 2 << C_SHIFT)
+        } else {
+            Instruction(self.0 | 1 << 63)
+        }
+    }
+
+    /// The metamethod form `op` (`ARITH_MM`, `ARITH_MM_R` or `ARITH_MMI`) of
+    /// this generic binary op, which keeps its opcode for [`Self::unquickened`].
+    #[inline]
+    pub(crate) fn with_mm_form(self, op: Op) -> Self {
+        let orig = self.opcode() as u64;
+        if op == Op::ARITH_MMI {
+            let mut i = self.with_op(op);
+            i.set_c((self.c() & 1) | (orig as u8) << 1);
+            i
+        } else {
+            Instruction((self.0 & !0xff & !(0xff << D_SHIFT)) | op as u64 | orig << D_SHIFT)
+        }
+    }
+
+    /// The opcode a metamethod form stands in for.
+    #[inline(always)]
+    pub(crate) fn mm_form_op(self) -> Op {
+        let orig = if self.op() == Op::ARITH_MMI {
+            self.c() >> 1
+        } else {
+            self.d() as u8
+        };
+        Instruction(orig as u64).op()
+    }
+
+    /// This instruction as the compiler emitted it, but for a
+    /// [`Self::with_no_quicken`] mark.
+    pub fn unquickened(self) -> Self {
+        match self.op() {
+            Op::ARITH_MM | Op::ARITH_MM_R => {
+                Instruction(self.0 & !0xff & !(0xff << D_SHIFT) | self.mm_form_op() as u64)
+            }
+            Op::ARITH_MMI => {
+                let mut i = self.with_op(self.mm_form_op());
+                i.set_c(self.c() & 1);
+                i
+            }
+            op => self.with_op(op.unquickened()),
+        }
     }
 }
 
