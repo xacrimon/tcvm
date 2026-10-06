@@ -56,7 +56,8 @@ enum Kind {
 
 #[repr(C)]
 struct BlockInfo {
-    /// The next block in its space's `recyclable` list.
+    /// The next block in its space's `recyclable` list, or in `Heap::young` once allocation takes
+    /// it.
     next: Cell<*mut u8>,
     /// Lines charged to allocation since the block was last swept, plus the ones it kept then.
     held: Cell<u16>,
@@ -234,14 +235,13 @@ impl Space {
         }
     }
 
-    /// Give up every block this space allocates in or from, for the sweep to reclaim.
+    /// Give up the blocks this space allocates in, for the sweep to reclaim.
     fn retire(&self) {
         self.cursor.set(ptr::null_mut());
         self.limit.set(ptr::null_mut());
         self.hole_block.set(ptr::null_mut());
         self.big_cursor.set(ptr::null_mut());
         self.big_limit.set(ptr::null_mut());
-        self.recyclable.set(ptr::null_mut());
     }
 }
 
@@ -254,6 +254,9 @@ pub(crate) struct Heap {
     spaces: [Space; 3],
     /// The line mark of the current or last marking; never 0.
     epoch: Cell<u8>,
+    /// Blocks taken for allocation since the last collection, linked through `BlockInfo::next`:
+    /// the only ones a minor one can free anything in.
+    young: Cell<*mut u8>,
     huge: UnsafeCell<HashTable<Huge>>,
     /// Huge objects allocated since the last collection, the only ones a minor one can free
     /// (mmtk's large object nursery).
@@ -272,6 +275,7 @@ impl Heap {
                 Space::new(Kind::Drop),
             ],
             epoch: Cell::new(1),
+            young: Cell::new(ptr::null_mut()),
             huge: UnsafeCell::new(HashTable::new()),
             young_huge: UnsafeCell::new(Vec::new()),
         }
@@ -518,9 +522,9 @@ impl Heap {
         if head.is_null() {
             return None;
         }
-        space
-            .recyclable
-            .set(chunk_of(head).blocks[block_index(head)].next.get());
+        let info = &chunk_of(head).blocks[block_index(head)];
+        space.recyclable.set(info.next.get());
+        info.next.set(self.young.replace(head));
         Some(head)
     }
 
@@ -542,8 +546,9 @@ impl Heap {
         self.free_from.set(i);
         self.free_blocks.update(|n| n - 1);
         chunk.free.update(|f| f & !(1 << b));
+        let start = block_start(chunk, b);
         let info = &chunk.blocks[b];
-        info.next.set(ptr::null_mut());
+        info.next.set(self.young.replace(start));
         info.held.set(LINES as u16);
         info.kind.set(kind);
         debug_assert!(block_lines(chunk, b).iter().all(|l| l.get() == 0));
@@ -552,7 +557,7 @@ impl Heap {
             w.set(0);
         }
         metrics.mark_gc_allocated(BLOCK);
-        block_start(chunk, b)
+        start
     }
 
     fn new_chunk(&self) -> &Chunk {
@@ -625,6 +630,10 @@ impl Heap {
     /// Free the huge objects and lines that marking didn't reach, dropping what dies, and give
     /// wholly free chunks back to the OS but one. Runs to the end before anything is allocated, as
     /// mmtk's sweep does within the pause.
+    ///
+    /// A minor collection sweeps only the young blocks: in any other, nothing was allocated since
+    /// the last sweep and the marks and line epoch stayed, so nothing in it can die. mmtk sweeps
+    /// every block after a nursery collection.
     pub(crate) fn sweep(&self, metrics: &Metrics, full: bool) {
         let free = |huge: &Huge| {
             let size = huge.size.next_multiple_of(page_size());
@@ -657,13 +666,28 @@ impl Heap {
         for space in &self.spaces {
             space.retire();
         }
-        for &chunk in unsafe { self.chunks() }.iter() {
-            // SAFETY: chunks in the list are live.
-            let chunk = unsafe { chunk.as_ref() };
-            let mut used = !chunk.free.get() & DATA_BLOCKS;
-            while used != 0 {
-                let b = used.trailing_zeros() as usize;
-                used &= used - 1;
+        let mut young = self.young.replace(ptr::null_mut());
+        if full {
+            // Rebuilt by the sweep: an old block on one may now be free, or have more free lines.
+            for space in &self.spaces {
+                space.recyclable.set(ptr::null_mut());
+            }
+            for &chunk in unsafe { self.chunks() }.iter() {
+                // SAFETY: chunks in the list are live.
+                let chunk = unsafe { chunk.as_ref() };
+                let mut used = !chunk.free.get() & DATA_BLOCKS;
+                while used != 0 {
+                    let b = used.trailing_zeros() as usize;
+                    used &= used - 1;
+                    self.sweep_block(chunk, b, metrics);
+                }
+            }
+        } else {
+            // The lists keep the old blocks on them, and get young ones back with free lines.
+            while !young.is_null() {
+                let chunk = chunk_of(young);
+                let b = block_index(young);
+                young = chunk.blocks[b].next.get();
                 self.sweep_block(chunk, b, metrics);
             }
         }
