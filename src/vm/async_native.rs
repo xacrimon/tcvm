@@ -328,14 +328,13 @@ impl<'gc> ThreadState<'gc> {
     }
 }
 
-/// Run async native `f` of `nc` on its arguments.
+/// Run async native `f` of `nc` on the window `win .. top`.
 pub(crate) fn invoke_async<'gc>(
     ctx: Context<'gc>,
     thread: &mut ThreadState<'gc>,
     f: AsyncFn,
     nc: &NativeClosure<'gc>,
-    args_base: usize,
-    argc: usize,
+    win: usize,
 ) -> Result<CallbackAction, Error<'gc>> {
     let header = TaskHeader {
         local_base: thread.locals.len() as u32,
@@ -343,10 +342,7 @@ pub(crate) fn invoke_async<'gc>(
     };
     thread.local_epoch = ctx.next_epoch();
     thread.spawning = Some(header);
-    let end = args_base + argc;
-    thread.ensure_slots(end);
-    thread.top = end;
-    let r = f(ctx, nc, Stack::new(thread, args_base));
+    let r = f(ctx, nc, Stack::new(thread, win));
     let spawned = thread.spawning.take().is_none();
     match r {
         Ok(Spawned(())) => {

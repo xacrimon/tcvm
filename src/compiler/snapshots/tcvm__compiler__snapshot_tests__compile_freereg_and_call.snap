@@ -2,7 +2,7 @@
 source: src/compiler/snapshot_tests.rs
 expression: output
 ---
-; function (params=0, vararg=true, stack=3, upvalues=1)
+; function (params=0, vararg=true, stack=6, upvalues=1)
 ; constants:
 ;   K0 = true
 ; upvalues:

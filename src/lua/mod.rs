@@ -26,12 +26,23 @@ use crate::env::shape::{INLINE_CAPS, Shape};
 use crate::env::string::Interner;
 use crate::env::value::ValueKind;
 use crate::env::{Function, Symbols, Table};
+use crate::vm::abi::Handler;
+use crate::vm::dispatch::Runtime;
 
-/// Root object of the GC arena. Holds the globals table and the dynamic root
-/// set used to stash values across `enter` boundaries.
+/// Root object of the GC arena and the interpreter's runtime. `repr(C)` with
+/// the dispatch tables first, so a `Context` (a reference to it) is also the
+/// table base the dispatch tail indexes.
 #[derive(Collect)]
 #[collect(internal, no_drop)]
+#[repr(C)]
 pub struct State<'gc> {
+    /// Indexed by opcode byte.
+    #[collect(require_static)]
+    pub(crate) dispatch: [Handler; 256],
+    /// CALL continuations by the `returns` operand (0 = MULTRET).
+    #[collect(require_static)]
+    pub(crate) rets: [Handler; 256],
+    pub(crate) rt: Runtime<'gc>,
     /// Root shapes by inline capacity (`INLINE_CAPS`). Each anchors a
     /// transition tree, so two tables of one capacity that grow through the
     /// same key sequence converge on the same shape pointer.
@@ -105,6 +116,9 @@ impl Lua {
             let interner = Interner::new(mc);
             let symbols = Symbols::intern_all(mc, &interner);
             State {
+                dispatch: crate::vm::dispatch::TABLE,
+                rets: crate::vm::dispatch::RETS,
+                rt: Runtime::new(mc.metrics()),
                 root_shapes,
                 empty_dict_sentinel,
                 symbols,

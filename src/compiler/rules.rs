@@ -25,6 +25,10 @@ use crate::parser::syntax::{
 };
 use crate::vm::num;
 
+/// Hidden registers after a call's function register: the callee's frame
+/// header (`vm::frame::HDR` minus the function slot itself).
+const HIDDEN: u8 = 3;
+
 /// Sentinel value used as the `dst` field of a `JTSET`/`JFSET` while the
 /// real destination register is still unknown — i.e. the jump is pending in
 /// a jump list and its ultimate consumer (a value-context discharge or a
@@ -714,6 +718,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     }
 
     /// A call, in the form for its result count (`returns` is Lua's `C`).
+    #[allow(clippy::wrong_self_convention)]
     fn emit_call(&mut self, func: RegisterIndex, args: u8, returns: u8) {
         let call = match returns {
             1 => Instruction::call_r0,
@@ -4004,9 +4009,14 @@ fn emit_func_call_setup(
         func
     };
 
+    // The three hidden slots after the function hold the callee's frame
+    // header: arguments start at `func + 4`.
+    while ctx.chunk.freereg < func.0 + HIDDEN + 1 {
+        ctx.alloc_register()?;
+    }
     let args: Vec<_> = item.args().map(|a| a.collect()).unwrap_or_default();
     let nargs = args.len();
-    let args_wire = compile_call_args(ctx, args, func, 1)?;
+    let args_wire = compile_call_args(ctx, args, func, HIDDEN + 1, 0)?;
     debug_assert!(args_wire == 0 || args_wire as usize == nargs + 1);
 
     // luac stamps CALL with the line of the argument list's opening token.
@@ -4138,16 +4148,16 @@ fn emit_method_call_setup(
         KIdx(key_idx),
     ));
 
-    // SELF writes both `func` and `func+1` (self); reserve the second
-    // slot so subsequent arg compilation lands at func+2 and freereg /
-    // max_stack track the SELF output.
-    let self_reg = RegisterIndex(func.0 + 1);
+    // SELF writes `func` and the receiver past the hidden slots, `func+4`;
+    // reserve through it so the arguments land at `func+5` and
+    // freereg / max_stack track the SELF output.
+    let self_reg = RegisterIndex(func.0 + HIDDEN + 1);
     while ctx.chunk.freereg <= self_reg.0 {
         ctx.alloc_register()?;
     }
 
     let args: Vec<_> = item.args().map(|a| a.collect()).unwrap_or_default();
-    let args_wire = compile_call_args(ctx, args, func, 2)?;
+    let args_wire = compile_call_args(ctx, args, func, HIDDEN + 2, 1)?;
     if let Some(args_node) = item.args_node() {
         ctx.set_line(args_node);
     }
@@ -4207,14 +4217,20 @@ fn compile_trailing_multires(
 /// `1` for a plain call, `2` for a method call to leave room for `self`). A
 /// trailing call/`...` is lowered as `Want::MultRet`. Returns the `args`
 /// operand: `0` for MULTRET, else `nargs + 1` (counting `self`).
+/// Compile `args` into the registers from `func + first`; `implicit` is the
+/// number of arguments already in place before them (the receiver of a
+/// method call). Returns the wire argument count, `nargs + 1`, or 0 for
+/// MULTRET.
 fn compile_call_args(
     ctx: &mut Ctx,
     args: Vec<Expr>,
     func: RegisterIndex,
-    offset: u8,
+    first: u8,
+    implicit: u8,
 ) -> Result<u8, CompileError> {
     let n = args.len();
-    let total = n as u8 + (offset - 1); // for method calls: +1 for self
+    let offset = first;
+    let total = n as u8 + implicit;
 
     for (i, arg_expr) in args.into_iter().enumerate() {
         let is_last = i + 1 == n;

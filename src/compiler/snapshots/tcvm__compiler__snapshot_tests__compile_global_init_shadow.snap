@@ -2,7 +2,7 @@
 source: src/compiler/snapshot_tests.rs
 expression: output
 ---
-; function (params=0, vararg=true, stack=5, upvalues=1)
+; function (params=0, vararg=true, stack=8, upvalues=1)
 ; constants:
 ;   K0 = "P"
 ;   K1 = "Q"
@@ -28,8 +28,8 @@ expression: output
 0009  [  3]  ERRNNIL         R4 name=K3
 0010  [  3]  SETTABUP        R3 U0 K3  ; "q"
 0011  [  4]  GETTABUP        R2 U0 K4  ; "print"
-0012  [  4]  GETTABUP        R3 U0 K2  ; "p"
-0013  [  4]  GETTABUP        R4 U0 K3  ; "q"
+0012  [  4]  GETTABUP        R6 U0 K2  ; "p"
+0013  [  4]  GETTABUP        R7 U0 K3  ; "q"
 0014  [  4]  CALL_R0         R2 args=3
 0015  [  5]  LOAD            R2 K7  ; "A"
 0016  [  5]  LOAD            R3 K8  ; "B"

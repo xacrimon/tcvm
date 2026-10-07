@@ -8,7 +8,6 @@ use crate::env::{
     ActionFn, Error, Function, LuaString, MetamethodBits, NativeClosure, NativeFn, Stack, Value,
 };
 use crate::vm::debug::where_prefix;
-use crate::vm::interp;
 use crate::vm::native::{CallbackAction, OnOk, Protect};
 
 pub fn load<'gc>(ctx: Context<'gc>) {
@@ -51,7 +50,7 @@ pub fn load<'gc>(ctx: Context<'gc>) {
             ctx.mutation(),
             NativeKind::Action(lua_pcall),
             &[],
-            interp::ff_pcall,
+            crate::vm::native::ff_pcall,
         ),
     );
     set(
@@ -60,7 +59,7 @@ pub fn load<'gc>(ctx: Context<'gc>) {
             ctx.mutation(),
             NativeKind::Action(lua_xpcall),
             &[],
-            interp::ff_xpcall,
+            crate::vm::native::ff_xpcall,
         ),
     );
     // `pairs` hands back the same `next` the global holds, so `pairs(t) == next`.
@@ -72,7 +71,7 @@ pub fn load<'gc>(ctx: Context<'gc>) {
             ctx.mutation(),
             NativeKind::Action(lua_pairs),
             &[Value::function(next)],
-            interp::ff_pairs,
+            crate::vm::native::ff_pairs,
         ),
     );
     let ipairs_iter = ctx.ipairs_iter();
@@ -82,7 +81,7 @@ pub fn load<'gc>(ctx: Context<'gc>) {
             ctx.mutation(),
             NativeKind::Plain(lua_ipairs),
             &[Value::function(ipairs_iter)],
-            interp::ff_ipairs,
+            crate::vm::native::ff_ipairs,
         ),
     );
 
@@ -320,7 +319,7 @@ fn load_reader<'gc>(ctx: Context<'gc>, stack: &mut Stack<'gc, '_>) -> CallbackAc
                     cx.enter(|ctx, mut stack| {
                         // `luaL_error`, located at `load`'s caller, below
                         // its frame.
-                        let mut msg = where_prefix(stack.thread_mut(), 2);
+                        let mut msg = where_prefix(stack.thread_mut(), 1);
                         msg.extend_from_slice(b"reader function must return a string");
                         let msg = LuaString::new(ctx, &msg);
                         stack.replace(&[Value::nil(), Value::string(msg)]);

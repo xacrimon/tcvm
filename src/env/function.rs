@@ -9,7 +9,8 @@ use crate::env::table::{SlotLoc, TableState};
 use crate::env::thread::{Thread, ThreadState};
 use crate::env::value::Value;
 use crate::instruction::UpValueDescriptor;
-use crate::vm::interp::{Handler, op_call_action, op_call_async, op_call_native};
+use crate::vm::abi::Handler;
+use crate::vm::native::native_call;
 use crate::vm::native::{CallbackAction, Execution};
 
 /// Debug record for a local register: active for `start_pc <= pc < end_pc`.
@@ -343,13 +344,13 @@ impl<'gc> LuaClosure<'gc> {
 /// A native closure: a Rust function, with its upvalues in the cell after it.
 pub struct NativeClosure<'gc> {
     pub(crate) function: NativeKind,
-    /// What CALL and TAILCALL jump to: `op_call_native`, `op_call_action` or
-    /// `op_call_async` by `function`'s kind, or for a builtin with a fast path its own entry
+    /// What CALL and TAILCALL jump to with this closure in the `closure` slot:
+    /// `native_call`, or for a builtin with a fast path its own entry
     /// (LuaJIT's `ff_*`), which handles the common argument shape inline,
-    /// never errors, and leaves every other shape to the kind's generic entry,
-    /// so `function` stays the complete implementation. An entry must check
-    /// the opcode: after a TAILCALL it returns its results from the frame
-    /// instead of dispatching the next instruction.
+    /// never errors, and leaves every other shape to `native_call`, so
+    /// `function` stays the complete implementation. An entry must check the
+    /// opcode: after a TAILCALL it returns its results from the frame instead
+    /// of dispatching the next instruction.
     pub(crate) entry: Handler,
     num_upvalues: u32,
     _upvalues: std::marker::PhantomData<Value<'gc>>,
@@ -562,11 +563,12 @@ impl<'gc, 'a> Stack<'gc, 'a> {
         }
     }
 
-    /// The running thread's Lua frames, innermost last. Hidden: a hook for
-    /// tests and the debug library.
+    /// How many Lua frames the running thread has. Hidden: a hook for tests.
     #[doc(hidden)]
-    pub fn lua_frames(&self) -> &[crate::env::thread::LuaFrame<'gc>] {
-        &self.thread.frames
+    pub fn lua_frame_count(&self) -> usize {
+        crate::vm::frame::frames(self.thread)
+            .filter(|f| !f.is_native())
+            .count()
     }
 
     /// Replace the whole window (args included) with `values`: the common
@@ -701,14 +703,17 @@ impl<'gc> LuaFn<'gc> {
         Gc::trailing_ptr(self.0).cast().as_ptr()
     }
 
-    /// A native frame's function in the closure field, which no one may
-    /// dereference as a Lua closure (see `LuaFrame::closure`).
-    ///
-    /// # Safety
-    /// Only for a frame flagged `NATIVE`.
+    /// The closure's cell, for a frame header word (`vm::frame`).
     #[inline(always)]
-    pub(crate) unsafe fn native_frame(f: Function<'gc>) -> Self {
-        LuaFn(f.0)
+    pub(crate) fn as_ptr(self) -> *const FunctionKind<'gc> {
+        Gc::as_ptr(self.0)
+    }
+
+    /// # Safety
+    /// `p` came from [`as_ptr`](Self::as_ptr) on a live closure.
+    #[inline(always)]
+    pub(crate) unsafe fn from_ptr(p: *const FunctionKind<'gc>) -> Self {
+        LuaFn(unsafe { Gc::from_ptr(p) })
     }
 }
 
@@ -755,11 +760,11 @@ impl<'gc> Function<'gc> {
     }
 
     pub fn new_native(mc: &Mutation<'gc>, function: NativeFn, upvalues: &[Value<'gc>]) -> Self {
-        Self::new_native_with_entry(mc, NativeKind::Plain(function), upvalues, op_call_native)
+        Self::new_native_with_entry(mc, NativeKind::Plain(function), upvalues, native_call)
     }
 
     pub fn new_action(mc: &Mutation<'gc>, function: ActionFn, upvalues: &[Value<'gc>]) -> Self {
-        Self::new_native_with_entry(mc, NativeKind::Action(function), upvalues, op_call_action)
+        Self::new_native_with_entry(mc, NativeKind::Action(function), upvalues, native_call)
     }
 
     pub fn new_async(
@@ -767,7 +772,7 @@ impl<'gc> Function<'gc> {
         function: crate::vm::async_native::AsyncFn,
         upvalues: &[Value<'gc>],
     ) -> Self {
-        Self::new_native_with_entry(mc, NativeKind::Async(function), upvalues, op_call_async)
+        Self::new_native_with_entry(mc, NativeKind::Async(function), upvalues, native_call)
     }
 
     /// A native whose CALLs go to `entry` (see `NativeClosure::entry`).

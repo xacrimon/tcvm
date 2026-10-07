@@ -11,7 +11,7 @@ expression: output
 0002  [ 10]  RETURN          R0 count=1
 
 ; prototype 0:
-  ; function (params=0, vararg=false, stack=6, upvalues=1)
+  ; function (params=0, vararg=false, stack=7, upvalues=1)
   ; constants:
   ;   K0 = 0
   ;   K1 = 10000
@@ -29,6 +29,6 @@ expression: output
   0006  [  6]  ADDI            R0 R0 #1
   0007  [  5]  FORLOOP         R2 -2
   0008  [  9]  GETTABUP        R2 U0 K3  ; "print"
-  0009  [  9]  MOVE            R3 R0
+  0009  [  9]  MOVE            R6 R0
   0010  [  9]  CALL_R0         R2 args=2
   0011  [ 10]  RETURN0

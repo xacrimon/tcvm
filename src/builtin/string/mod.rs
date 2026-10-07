@@ -17,8 +17,8 @@ use crate::builtin::util::{to_integer, to_number as to_float};
 use crate::env::{
     Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Userdata, Value,
 };
-use crate::vm::interp::{IndexChain, walk_index_chain};
 use crate::vm::native::CallbackAction;
+use crate::vm::{IndexChain, walk_index_chain};
 
 mod meta;
 mod pack;
