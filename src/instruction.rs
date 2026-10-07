@@ -893,77 +893,920 @@ instructions! {
     0x6e CALL_R0    call_r0     Abc   { func: Reg, args: u8, returns: u8 }
     0x6f CALL_R1    call_r1     Abc   { func: Reg, args: u8, returns: u8 }
 
-    // --- quickened arithmetic -------------------------------------------------
+    // --- adaptive arithmetic -------------------------------------------------
     //
-    // Never emitted: the arithmetic slow path rewrites a site the first time
-    // it gets there, to the `_NUM` form when one operand is a float and the
-    // other an integer, or to a metamethod form when a table operand supplies
-    // the metamethod. A metamethod form that misses goes back to the generic
-    // opcode for good (`Instruction::NO_QUICKEN`); a `_NUM` form stays.
-    // See `Instruction::unquickened`.
-
-    0x70 ADD_NUM    add_num     Abc   { dst: Reg, lhs: Reg, rhs: Reg }
-    0x71 SUB_NUM    sub_num     Abc   { dst: Reg, lhs: Reg, rhs: Reg }
-    0x72 MUL_NUM    mul_num     Abc   { dst: Reg, lhs: Reg, rhs: Reg }
-    0x73 MOD_NUM    mod_num     Abc   { dst: Reg, lhs: Reg, rhs: Reg }
-    0x74 POW_NUM    pow_num     Abc   { dst: Reg, lhs: Reg, rhs: Reg }
-    0x75 DIV_NUM    div_num     Abc   { dst: Reg, lhs: Reg, rhs: Reg }
-    0x76 IDIV_NUM   idiv_num    Abc   { dst: Reg, lhs: Reg, rhs: Reg }
+    // Never emitted: the generic handler of a binary arithmetic or bitwise
+    // site rewrites it to the form for the operand kinds it saw, and back to
+    // the generic opcode after three misses (locked). The forms keep the
+    // generic operand layout; the adaptive bits (`misses`, `locked`) sit in
+    // bits 32..34 of a register form and in `c` bits 1..3 of an immediate
+    // form. See `OP_INFO`.
 
     /// A register-form binary op whose `lhs` is a table with the metamethod;
-    /// the original opcode is in `d`.
-    0x77 ARITH_MM   arith_mm    Abc   { dst: Reg, lhs: Reg, rhs: Reg }
+    /// the original opcode is in `e`'s low byte.
+    0x70 ARITH_MM     arith_mm    Abc    { dst: Reg, lhs: Reg, rhs: Reg }
     /// As `ARITH_MM`, the metamethod from `rhs`, a table, and `lhs` a number.
-    0x78 ARITH_MM_R arith_mm_r  Abc   { dst: Reg, lhs: Reg, rhs: Reg }
+    0x71 ARITH_MM_R   arith_mm_r  Abc    { dst: Reg, lhs: Reg, rhs: Reg }
     /// An immediate-form op whose register operand is a table with the
-    /// metamethod: `c` is `flipped | original opcode << 1`.
-    0x79 ARITH_MMI  arith_mmi   AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    /// metamethod: `c` bits 4..7 index `IMM_ARITH_OPS` for the original opcode.
+    0x72 ARITH_MMI    arith_mmi   AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
 
     /// `R[dst] = imm`, a small integer, and `R[dst .. dst+count) = nil`.
-    0x7a LOADI      loadi       AImm  { dst: Reg, imm: i32 }
-    0x7b LOADNIL    loadnil     Ab    { dst: Reg, count: u8 }
+    0x73 LOADI        loadi       AImm   { dst: Reg, imm: i32 }
+    0x74 LOADNIL      loadnil     Ab     { dst: Reg, count: u8 }
+
+    // Register arithmetic: both small, both float, small/float, float/small.
+    0x75 ADD_II       add_ii      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x76 SUB_II       sub_ii      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x77 MUL_II       mul_ii      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x78 MOD_II       mod_ii      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x79 IDIV_II      idiv_ii     Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x7a DIV_II       div_ii      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x7b ADD_FF       add_ff      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x7c SUB_FF       sub_ff      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x7d MUL_FF       mul_ff      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x7e MOD_FF       mod_ff      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x7f POW_FF       pow_ff      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x80 DIV_FF       div_ff      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x81 IDIV_FF      idiv_ff     Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x82 ADD_IF       add_if      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x83 SUB_IF       sub_if      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x84 MUL_IF       mul_if      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x85 DIV_IF       div_if      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x86 ADD_FI       add_fi      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x87 SUB_FI       sub_fi      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x88 MUL_FI       mul_fi      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x89 DIV_FI       div_fi      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+
+    // Register bitwise: both small.
+    0x8a BAND_II      band_ii     Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x8b BOR_II       bor_ii      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x8c BXOR_II      bxor_ii     Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x8d SHL_II       shl_ii      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x8e SHR_II       shr_ii      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+
+    // Immediate arithmetic: small register with an integer immediate (`_I`),
+    // float register (`_F`), small register with a float result (`_IF`).
+    0x8f ADDI_I       addi_i      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x90 SUBI_I       subi_i      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x91 MULI_I       muli_i      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x92 MODI_I       modi_i      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x93 IDIVI_I      idivi_i     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x94 RSUBI_I      rsubi_i     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x95 ADDI_F       addi_f      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x96 SUBI_F       subi_f      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x97 MULI_F       muli_f      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x98 MODI_F       modi_f      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x99 IDIVI_F      idivi_f     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x9a RSUBI_F      rsubi_f     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x9b POWI_F       powi_f      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x9c DIVI_F       divi_f      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x9d RDIVI_F      rdivi_f     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x9e ADDI_IF      addi_if     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x9f SUBI_IF      subi_if     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0xa0 MULI_IF      muli_if     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0xa1 DIVI_IF      divi_if     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0xa2 RDIVI_IF     rdivi_if    AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+
+    // Immediate bitwise: small register.
+    0xa3 BANDI_I      bandi_i     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0xa4 BORI_I       bori_i      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0xa5 BXORI_I      bxori_i     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0xa6 SHLI_I       shli_i      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0xa7 SHRI_I       shri_i      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+
+    // Power with small integers has a float result: forms beyond section 12.3.
+    0xa8 POW_II       pow_ii      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0xa9 POWI_IF      powi_if     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0xaa RPOWI_IF     rpowi_if    AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+
+    // Any inline numbers, int-int with an integer result: what a register
+    // site whose operand kinds keep changing takes instead of locking.
+    0xab ADD_NN       add_nn      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0xac SUB_NN       sub_nn      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0xad MUL_NN       mul_nn      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0xae MOD_NN       mod_nn      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0xaf POW_NN       pow_nn      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0xb0 DIV_NN       div_nn      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0xb1 IDIV_NN      idiv_nn     Abc    { dst: Reg, lhs: Reg, rhs: Reg }
 }
 
+/// The polymorphic family an opcode belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Family {
+    None,
+    RegArith,
+    RegBit,
+    ImmArith,
+    ImmBit,
+    /// Constant-key table access, specialized by the inline-cache fill.
+    Field,
+}
+
+/// The operation of an arithmetic or bitwise opcode, generic or specialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithKind {
+    None,
+    Add,
+    Sub,
+    Mul,
+    Mod,
+    Pow,
+    Div,
+    IDiv,
+    BAnd,
+    BOr,
+    BXor,
+    Shl,
+    Shr,
+}
+
+/// What the generic handlers and the listing know about an opcode.
+#[derive(Debug, Clone, Copy)]
+pub struct OpInfo {
+    /// The opcode the compiler emitted for this site.
+    pub generic: Op,
+    pub family: Family,
+    pub kind: ArithKind,
+    /// The immediate is the left operand (the `R` forms).
+    pub reversed: bool,
+    /// Bit position of the adaptive bits (`misses: u2`, `locked: u1`); 0 for
+    /// an opcode without them.
+    pub adaptive_shift: u8,
+    /// The specialized forms by operand kinds: `[II, FF, IF, FI, NN]` for a
+    /// register family (`NN`: any inline numbers, the form a site whose
+    /// kinds keep changing takes instead of locking), `[I, F, IF, -, -]` for
+    /// an immediate one.
+    pub forms: [Option<Op>; 5],
+}
+
+/// Adaptive bits of an `Abc` site: bits 32..34 (the low bits of `d`).
+pub const ADAPTIVE_ABC: u8 = 32;
+/// Adaptive bits of an `AbcImm` site: `c` bits 1..3, beside `flipped`.
+pub const ADAPTIVE_ABC_IMM: u8 = 25;
+
+/// Misses at which a site locks to its generic opcode.
+pub const MISSES_TO_LOCK: u8 = 3;
+
+/// The immediate arithmetic opcodes `ARITH_MMI` can stand for, indexed by
+/// `c` bits 4..7 (padded to 16 so the index needs no bounds check).
+pub const IMM_ARITH_OPS: [Op; 16] = [
+    Op::ADDI,
+    Op::SUBI,
+    Op::MULI,
+    Op::MODI,
+    Op::POWI,
+    Op::DIVI,
+    Op::IDIVI,
+    Op::RSUBI,
+    Op::RMODI,
+    Op::RPOWI,
+    Op::RDIVI,
+    Op::RIDIVI,
+    Op::ADDI,
+    Op::ADDI,
+    Op::ADDI,
+    Op::ADDI,
+];
+/// How many of [`IMM_ARITH_OPS`] are real.
+pub const IMM_ARITH_COUNT: usize = 12;
+
+const fn op_info(op: Op) -> OpInfo {
+    match op {
+        Op::ADD => OpInfo {
+            generic: Op::ADD,
+            family: Family::RegArith,
+            kind: ArithKind::Add,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_ABC,
+            forms: [
+                Some(Op::ADD_II),
+                Some(Op::ADD_FF),
+                Some(Op::ADD_IF),
+                Some(Op::ADD_FI),
+                Some(Op::ADD_NN),
+            ],
+        },
+        Op::SUB => OpInfo {
+            generic: Op::SUB,
+            family: Family::RegArith,
+            kind: ArithKind::Sub,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_ABC,
+            forms: [
+                Some(Op::SUB_II),
+                Some(Op::SUB_FF),
+                Some(Op::SUB_IF),
+                Some(Op::SUB_FI),
+                Some(Op::SUB_NN),
+            ],
+        },
+        Op::MUL => OpInfo {
+            generic: Op::MUL,
+            family: Family::RegArith,
+            kind: ArithKind::Mul,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_ABC,
+            forms: [
+                Some(Op::MUL_II),
+                Some(Op::MUL_FF),
+                Some(Op::MUL_IF),
+                Some(Op::MUL_FI),
+                Some(Op::MUL_NN),
+            ],
+        },
+        Op::MOD => OpInfo {
+            generic: Op::MOD,
+            family: Family::RegArith,
+            kind: ArithKind::Mod,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_ABC,
+            forms: [
+                Some(Op::MOD_II),
+                Some(Op::MOD_FF),
+                None,
+                None,
+                Some(Op::MOD_NN),
+            ],
+        },
+        Op::POW => OpInfo {
+            generic: Op::POW,
+            family: Family::RegArith,
+            kind: ArithKind::Pow,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_ABC,
+            forms: [
+                Some(Op::POW_II),
+                Some(Op::POW_FF),
+                None,
+                None,
+                Some(Op::POW_NN),
+            ],
+        },
+        Op::DIV => OpInfo {
+            generic: Op::DIV,
+            family: Family::RegArith,
+            kind: ArithKind::Div,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_ABC,
+            forms: [
+                Some(Op::DIV_II),
+                Some(Op::DIV_FF),
+                Some(Op::DIV_IF),
+                Some(Op::DIV_FI),
+                Some(Op::DIV_NN),
+            ],
+        },
+        Op::IDIV => OpInfo {
+            generic: Op::IDIV,
+            family: Family::RegArith,
+            kind: ArithKind::IDiv,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_ABC,
+            forms: [
+                Some(Op::IDIV_II),
+                Some(Op::IDIV_FF),
+                None,
+                None,
+                Some(Op::IDIV_NN),
+            ],
+        },
+        Op::BAND => OpInfo {
+            generic: Op::BAND,
+            family: Family::RegBit,
+            kind: ArithKind::BAnd,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_ABC,
+            forms: [Some(Op::BAND_II), None, None, None, None],
+        },
+        Op::BOR => OpInfo {
+            generic: Op::BOR,
+            family: Family::RegBit,
+            kind: ArithKind::BOr,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_ABC,
+            forms: [Some(Op::BOR_II), None, None, None, None],
+        },
+        Op::BXOR => OpInfo {
+            generic: Op::BXOR,
+            family: Family::RegBit,
+            kind: ArithKind::BXor,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_ABC,
+            forms: [Some(Op::BXOR_II), None, None, None, None],
+        },
+        Op::SHL => OpInfo {
+            generic: Op::SHL,
+            family: Family::RegBit,
+            kind: ArithKind::Shl,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_ABC,
+            forms: [Some(Op::SHL_II), None, None, None, None],
+        },
+        Op::SHR => OpInfo {
+            generic: Op::SHR,
+            family: Family::RegBit,
+            kind: ArithKind::Shr,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_ABC,
+            forms: [Some(Op::SHR_II), None, None, None, None],
+        },
+        Op::ADDI => OpInfo {
+            generic: Op::ADDI,
+            family: Family::ImmArith,
+            kind: ArithKind::Add,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_ABC_IMM,
+            forms: [
+                Some(Op::ADDI_I),
+                Some(Op::ADDI_F),
+                Some(Op::ADDI_IF),
+                None,
+                None,
+            ],
+        },
+        Op::SUBI => OpInfo {
+            generic: Op::SUBI,
+            family: Family::ImmArith,
+            kind: ArithKind::Sub,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_ABC_IMM,
+            forms: [
+                Some(Op::SUBI_I),
+                Some(Op::SUBI_F),
+                Some(Op::SUBI_IF),
+                None,
+                None,
+            ],
+        },
+        Op::MULI => OpInfo {
+            generic: Op::MULI,
+            family: Family::ImmArith,
+            kind: ArithKind::Mul,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_ABC_IMM,
+            forms: [
+                Some(Op::MULI_I),
+                Some(Op::MULI_F),
+                Some(Op::MULI_IF),
+                None,
+                None,
+            ],
+        },
+        Op::MODI => OpInfo {
+            generic: Op::MODI,
+            family: Family::ImmArith,
+            kind: ArithKind::Mod,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_ABC_IMM,
+            forms: [Some(Op::MODI_I), Some(Op::MODI_F), None, None, None],
+        },
+        Op::POWI => OpInfo {
+            generic: Op::POWI,
+            family: Family::ImmArith,
+            kind: ArithKind::Pow,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_ABC_IMM,
+            forms: [None, Some(Op::POWI_F), Some(Op::POWI_IF), None, None],
+        },
+        Op::DIVI => OpInfo {
+            generic: Op::DIVI,
+            family: Family::ImmArith,
+            kind: ArithKind::Div,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_ABC_IMM,
+            forms: [None, Some(Op::DIVI_F), Some(Op::DIVI_IF), None, None],
+        },
+        Op::IDIVI => OpInfo {
+            generic: Op::IDIVI,
+            family: Family::ImmArith,
+            kind: ArithKind::IDiv,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_ABC_IMM,
+            forms: [Some(Op::IDIVI_I), Some(Op::IDIVI_F), None, None, None],
+        },
+        Op::RSUBI => OpInfo {
+            generic: Op::RSUBI,
+            family: Family::ImmArith,
+            kind: ArithKind::Sub,
+            reversed: true,
+            adaptive_shift: ADAPTIVE_ABC_IMM,
+            forms: [Some(Op::RSUBI_I), Some(Op::RSUBI_F), None, None, None],
+        },
+        Op::RMODI => OpInfo {
+            generic: Op::RMODI,
+            family: Family::ImmArith,
+            kind: ArithKind::Mod,
+            reversed: true,
+            adaptive_shift: ADAPTIVE_ABC_IMM,
+            forms: [None, None, None, None, None],
+        },
+        Op::RPOWI => OpInfo {
+            generic: Op::RPOWI,
+            family: Family::ImmArith,
+            kind: ArithKind::Pow,
+            reversed: true,
+            adaptive_shift: ADAPTIVE_ABC_IMM,
+            forms: [None, None, Some(Op::RPOWI_IF), None, None],
+        },
+        Op::RDIVI => OpInfo {
+            generic: Op::RDIVI,
+            family: Family::ImmArith,
+            kind: ArithKind::Div,
+            reversed: true,
+            adaptive_shift: ADAPTIVE_ABC_IMM,
+            forms: [None, Some(Op::RDIVI_F), Some(Op::RDIVI_IF), None, None],
+        },
+        Op::RIDIVI => OpInfo {
+            generic: Op::RIDIVI,
+            family: Family::ImmArith,
+            kind: ArithKind::IDiv,
+            reversed: true,
+            adaptive_shift: ADAPTIVE_ABC_IMM,
+            forms: [None, None, None, None, None],
+        },
+        Op::BANDI => OpInfo {
+            generic: Op::BANDI,
+            family: Family::ImmBit,
+            kind: ArithKind::BAnd,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_ABC_IMM,
+            forms: [Some(Op::BANDI_I), None, None, None, None],
+        },
+        Op::BORI => OpInfo {
+            generic: Op::BORI,
+            family: Family::ImmBit,
+            kind: ArithKind::BOr,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_ABC_IMM,
+            forms: [Some(Op::BORI_I), None, None, None, None],
+        },
+        Op::BXORI => OpInfo {
+            generic: Op::BXORI,
+            family: Family::ImmBit,
+            kind: ArithKind::BXor,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_ABC_IMM,
+            forms: [Some(Op::BXORI_I), None, None, None, None],
+        },
+        Op::SHLI => OpInfo {
+            generic: Op::SHLI,
+            family: Family::ImmBit,
+            kind: ArithKind::Shl,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_ABC_IMM,
+            forms: [Some(Op::SHLI_I), None, None, None, None],
+        },
+        Op::SHRI => OpInfo {
+            generic: Op::SHRI,
+            family: Family::ImmBit,
+            kind: ArithKind::Shr,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_ABC_IMM,
+            forms: [Some(Op::SHRI_I), None, None, None, None],
+        },
+        Op::RSHLI => OpInfo {
+            generic: Op::RSHLI,
+            family: Family::ImmBit,
+            kind: ArithKind::Shl,
+            reversed: true,
+            adaptive_shift: ADAPTIVE_ABC_IMM,
+            forms: [None, None, None, None, None],
+        },
+        Op::RSHRI => OpInfo {
+            generic: Op::RSHRI,
+            family: Family::ImmBit,
+            kind: ArithKind::Shr,
+            reversed: true,
+            adaptive_shift: ADAPTIVE_ABC_IMM,
+            forms: [None, None, None, None, None],
+        },
+        Op::ADD_II => OpInfo {
+            generic: Op::ADD,
+            ..op_info(Op::ADD)
+        },
+        Op::SUB_II => OpInfo {
+            generic: Op::SUB,
+            ..op_info(Op::SUB)
+        },
+        Op::MUL_II => OpInfo {
+            generic: Op::MUL,
+            ..op_info(Op::MUL)
+        },
+        Op::MOD_II => OpInfo {
+            generic: Op::MOD,
+            ..op_info(Op::MOD)
+        },
+        Op::IDIV_II => OpInfo {
+            generic: Op::IDIV,
+            ..op_info(Op::IDIV)
+        },
+        Op::DIV_II => OpInfo {
+            generic: Op::DIV,
+            ..op_info(Op::DIV)
+        },
+        Op::ADD_FF => OpInfo {
+            generic: Op::ADD,
+            ..op_info(Op::ADD)
+        },
+        Op::SUB_FF => OpInfo {
+            generic: Op::SUB,
+            ..op_info(Op::SUB)
+        },
+        Op::MUL_FF => OpInfo {
+            generic: Op::MUL,
+            ..op_info(Op::MUL)
+        },
+        Op::MOD_FF => OpInfo {
+            generic: Op::MOD,
+            ..op_info(Op::MOD)
+        },
+        Op::POW_FF => OpInfo {
+            generic: Op::POW,
+            ..op_info(Op::POW)
+        },
+        Op::DIV_FF => OpInfo {
+            generic: Op::DIV,
+            ..op_info(Op::DIV)
+        },
+        Op::IDIV_FF => OpInfo {
+            generic: Op::IDIV,
+            ..op_info(Op::IDIV)
+        },
+        Op::ADD_IF => OpInfo {
+            generic: Op::ADD,
+            ..op_info(Op::ADD)
+        },
+        Op::SUB_IF => OpInfo {
+            generic: Op::SUB,
+            ..op_info(Op::SUB)
+        },
+        Op::MUL_IF => OpInfo {
+            generic: Op::MUL,
+            ..op_info(Op::MUL)
+        },
+        Op::DIV_IF => OpInfo {
+            generic: Op::DIV,
+            ..op_info(Op::DIV)
+        },
+        Op::ADD_FI => OpInfo {
+            generic: Op::ADD,
+            ..op_info(Op::ADD)
+        },
+        Op::SUB_FI => OpInfo {
+            generic: Op::SUB,
+            ..op_info(Op::SUB)
+        },
+        Op::MUL_FI => OpInfo {
+            generic: Op::MUL,
+            ..op_info(Op::MUL)
+        },
+        Op::DIV_FI => OpInfo {
+            generic: Op::DIV,
+            ..op_info(Op::DIV)
+        },
+        Op::BAND_II => OpInfo {
+            generic: Op::BAND,
+            ..op_info(Op::BAND)
+        },
+        Op::BOR_II => OpInfo {
+            generic: Op::BOR,
+            ..op_info(Op::BOR)
+        },
+        Op::BXOR_II => OpInfo {
+            generic: Op::BXOR,
+            ..op_info(Op::BXOR)
+        },
+        Op::SHL_II => OpInfo {
+            generic: Op::SHL,
+            ..op_info(Op::SHL)
+        },
+        Op::SHR_II => OpInfo {
+            generic: Op::SHR,
+            ..op_info(Op::SHR)
+        },
+        Op::ADDI_I => OpInfo {
+            generic: Op::ADDI,
+            ..op_info(Op::ADDI)
+        },
+        Op::SUBI_I => OpInfo {
+            generic: Op::SUBI,
+            ..op_info(Op::SUBI)
+        },
+        Op::MULI_I => OpInfo {
+            generic: Op::MULI,
+            ..op_info(Op::MULI)
+        },
+        Op::MODI_I => OpInfo {
+            generic: Op::MODI,
+            ..op_info(Op::MODI)
+        },
+        Op::IDIVI_I => OpInfo {
+            generic: Op::IDIVI,
+            ..op_info(Op::IDIVI)
+        },
+        Op::RSUBI_I => OpInfo {
+            generic: Op::RSUBI,
+            ..op_info(Op::RSUBI)
+        },
+        Op::ADDI_F => OpInfo {
+            generic: Op::ADDI,
+            ..op_info(Op::ADDI)
+        },
+        Op::SUBI_F => OpInfo {
+            generic: Op::SUBI,
+            ..op_info(Op::SUBI)
+        },
+        Op::MULI_F => OpInfo {
+            generic: Op::MULI,
+            ..op_info(Op::MULI)
+        },
+        Op::MODI_F => OpInfo {
+            generic: Op::MODI,
+            ..op_info(Op::MODI)
+        },
+        Op::IDIVI_F => OpInfo {
+            generic: Op::IDIVI,
+            ..op_info(Op::IDIVI)
+        },
+        Op::RSUBI_F => OpInfo {
+            generic: Op::RSUBI,
+            ..op_info(Op::RSUBI)
+        },
+        Op::POWI_F => OpInfo {
+            generic: Op::POWI,
+            ..op_info(Op::POWI)
+        },
+        Op::DIVI_F => OpInfo {
+            generic: Op::DIVI,
+            ..op_info(Op::DIVI)
+        },
+        Op::RDIVI_F => OpInfo {
+            generic: Op::RDIVI,
+            ..op_info(Op::RDIVI)
+        },
+        Op::ADDI_IF => OpInfo {
+            generic: Op::ADDI,
+            ..op_info(Op::ADDI)
+        },
+        Op::SUBI_IF => OpInfo {
+            generic: Op::SUBI,
+            ..op_info(Op::SUBI)
+        },
+        Op::MULI_IF => OpInfo {
+            generic: Op::MULI,
+            ..op_info(Op::MULI)
+        },
+        Op::DIVI_IF => OpInfo {
+            generic: Op::DIVI,
+            ..op_info(Op::DIVI)
+        },
+        Op::RDIVI_IF => OpInfo {
+            generic: Op::RDIVI,
+            ..op_info(Op::RDIVI)
+        },
+        Op::BANDI_I => OpInfo {
+            generic: Op::BANDI,
+            ..op_info(Op::BANDI)
+        },
+        Op::BORI_I => OpInfo {
+            generic: Op::BORI,
+            ..op_info(Op::BORI)
+        },
+        Op::BXORI_I => OpInfo {
+            generic: Op::BXORI,
+            ..op_info(Op::BXORI)
+        },
+        Op::SHLI_I => OpInfo {
+            generic: Op::SHLI,
+            ..op_info(Op::SHLI)
+        },
+        Op::SHRI_I => OpInfo {
+            generic: Op::SHRI,
+            ..op_info(Op::SHRI)
+        },
+        Op::POW_II => OpInfo {
+            generic: Op::POW,
+            ..op_info(Op::POW)
+        },
+        Op::POWI_IF => OpInfo {
+            generic: Op::POWI,
+            ..op_info(Op::POWI)
+        },
+        Op::RPOWI_IF => OpInfo {
+            generic: Op::RPOWI,
+            ..op_info(Op::RPOWI)
+        },
+        Op::ADD_NN => OpInfo {
+            generic: Op::ADD,
+            ..op_info(Op::ADD)
+        },
+        Op::SUB_NN => OpInfo {
+            generic: Op::SUB,
+            ..op_info(Op::SUB)
+        },
+        Op::MUL_NN => OpInfo {
+            generic: Op::MUL,
+            ..op_info(Op::MUL)
+        },
+        Op::MOD_NN => OpInfo {
+            generic: Op::MOD,
+            ..op_info(Op::MOD)
+        },
+        Op::POW_NN => OpInfo {
+            generic: Op::POW,
+            ..op_info(Op::POW)
+        },
+        Op::DIV_NN => OpInfo {
+            generic: Op::DIV,
+            ..op_info(Op::DIV)
+        },
+        Op::IDIV_NN => OpInfo {
+            generic: Op::IDIV,
+            ..op_info(Op::IDIV)
+        },
+        Op::ARITH_MM | Op::ARITH_MM_R => OpInfo {
+            generic: Op::ARITH_MM,
+            family: Family::RegArith,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_ABC,
+            forms: [None; 5],
+        },
+        Op::ARITH_MMI => OpInfo {
+            generic: Op::ARITH_MMI,
+            family: Family::ImmArith,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_ABC_IMM,
+            forms: [None; 5],
+        },
+        Op::GETFIELD_OWN => OpInfo {
+            generic: Op::GETFIELD,
+            family: Family::Field,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: 0,
+            forms: [None; 5],
+        },
+        Op::GETFIELD_ABSENT => OpInfo {
+            generic: Op::GETFIELD,
+            family: Family::Field,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: 0,
+            forms: [None; 5],
+        },
+        Op::GETFIELD_PROTO => OpInfo {
+            generic: Op::GETFIELD,
+            family: Family::Field,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: 0,
+            forms: [None; 5],
+        },
+        Op::GETTABUP_OWN => OpInfo {
+            generic: Op::GETTABUP,
+            family: Family::Field,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: 0,
+            forms: [None; 5],
+        },
+        Op::GETTABUP_ABSENT => OpInfo {
+            generic: Op::GETTABUP,
+            family: Family::Field,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: 0,
+            forms: [None; 5],
+        },
+        Op::GETTABUP_PROTO => OpInfo {
+            generic: Op::GETTABUP,
+            family: Family::Field,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: 0,
+            forms: [None; 5],
+        },
+        Op::SELF_OWN => OpInfo {
+            generic: Op::SELF,
+            family: Family::Field,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: 0,
+            forms: [None; 5],
+        },
+        Op::SELF_ABSENT => OpInfo {
+            generic: Op::SELF,
+            family: Family::Field,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: 0,
+            forms: [None; 5],
+        },
+        Op::SELF_PROTO => OpInfo {
+            generic: Op::SELF,
+            family: Family::Field,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: 0,
+            forms: [None; 5],
+        },
+        Op::SETFIELD_OWN => OpInfo {
+            generic: Op::SETFIELD,
+            family: Family::Field,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: 0,
+            forms: [None; 5],
+        },
+        Op::SETFIELD_TRANS => OpInfo {
+            generic: Op::SETFIELD,
+            family: Family::Field,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: 0,
+            forms: [None; 5],
+        },
+        Op::SETFIELD_ABSENT => OpInfo {
+            generic: Op::SETFIELD,
+            family: Family::Field,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: 0,
+            forms: [None; 5],
+        },
+        Op::SETTABUP_OWN => OpInfo {
+            generic: Op::SETTABUP,
+            family: Family::Field,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: 0,
+            forms: [None; 5],
+        },
+        Op::SETTABUP_TRANS => OpInfo {
+            generic: Op::SETTABUP,
+            family: Family::Field,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: 0,
+            forms: [None; 5],
+        },
+        Op::SETTABUP_ABSENT => OpInfo {
+            generic: Op::SETTABUP,
+            family: Family::Field,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: 0,
+            forms: [None; 5],
+        },
+        op => OpInfo {
+            generic: op,
+            family: Family::None,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: 0,
+            forms: [None; 5],
+        },
+    }
+}
+
+pub static OP_INFO: [OpInfo; 256] = {
+    let none = OpInfo {
+        generic: Op::MOVE,
+        family: Family::None,
+        kind: ArithKind::None,
+        reversed: false,
+        adaptive_shift: 0,
+        forms: [None; 5],
+    };
+    let mut t = [none; 256];
+    let mut i = 0;
+    while i < Op::COUNT {
+        t[i] = op_info(Op::ALL[i]);
+        i += 1;
+    }
+    t
+};
+
 impl Op {
-    /// The generic opcode a quickened one stands in for, else itself.
+    /// The generic opcode a specialized form stands in for, else itself. A
+    /// metamethod form's original opcode is in its word (`Instruction::mm_orig`).
     #[inline]
     pub fn unquickened(self) -> Op {
-        match self {
-            Op::GETFIELD_OWN | Op::GETFIELD_ABSENT | Op::GETFIELD_PROTO => Op::GETFIELD,
-            Op::GETTABUP_OWN | Op::GETTABUP_ABSENT | Op::GETTABUP_PROTO => Op::GETTABUP,
-            Op::SELF_OWN | Op::SELF_ABSENT | Op::SELF_PROTO => Op::SELF,
-            Op::SETFIELD_OWN | Op::SETFIELD_TRANS | Op::SETFIELD_ABSENT => Op::SETFIELD,
-            Op::SETTABUP_OWN | Op::SETTABUP_TRANS | Op::SETTABUP_ABSENT => Op::SETTABUP,
-            Op::ADD_NUM => Op::ADD,
-            Op::SUB_NUM => Op::SUB,
-            Op::MUL_NUM => Op::MUL,
-            Op::MOD_NUM => Op::MOD,
-            Op::POW_NUM => Op::POW,
-            Op::DIV_NUM => Op::DIV,
-            Op::IDIV_NUM => Op::IDIV,
-            op => op,
-        }
+        OP_INFO[self as usize].generic
     }
 
-    /// The `_NUM` form of a register-form arithmetic opcode.
-    #[inline]
-    pub fn num_form(self) -> Option<Op> {
-        Some(match self {
-            Op::ADD => Op::ADD_NUM,
-            Op::SUB => Op::SUB_NUM,
-            Op::MUL => Op::MUL_NUM,
-            Op::MOD => Op::MOD_NUM,
-            Op::POW => Op::POW_NUM,
-            Op::DIV => Op::DIV_NUM,
-            Op::IDIV => Op::IDIV_NUM,
-            _ => return None,
-        })
+    #[inline(always)]
+    pub fn info(self) -> &'static OpInfo {
+        &OP_INFO[self as usize]
     }
 
     /// An immediate-form opcode that computes `imm <op> R[src]` (the `R` forms).
     #[inline]
     pub fn is_reversed(self) -> bool {
-        (Op::RSUBI as u8..=Op::RSHRI as u8).contains(&(self as u8))
+        OP_INFO[self as usize].reversed
     }
 }
 
@@ -1005,67 +1848,94 @@ impl Instruction {
         Instruction((self.0 & !0xff) | op as u64)
     }
 
-    /// Whether the arithmetic slow path may still quicken this generic binary
-    /// op: cleared by [`Self::with_no_quicken`], in bits the form leaves unused
-    /// (the top bit for register forms, bit 1 of `c` beside `flipped` for
-    /// immediate ones).
-    #[inline]
-    pub(crate) fn quickenable(self) -> bool {
-        if self.op().shape() == Shape::AbcImm {
-            self.c() & 2 == 0
-        } else {
-            self.0 >> 63 == 0
-        }
+    /// The adaptive bits of a specializable site: `(misses, locked)`.
+    #[inline(always)]
+    pub(crate) fn adaptive(self) -> (u8, bool) {
+        let bits = (self.0 >> OP_INFO[self.opcode() as usize].adaptive_shift) as u8;
+        (bits & 3, bits & 4 != 0)
     }
 
-    #[inline]
-    pub(crate) fn with_no_quicken(self) -> Self {
-        if self.op().shape() == Shape::AbcImm {
-            Instruction(self.0 | 2 << C_SHIFT)
-        } else {
-            Instruction(self.0 | 1 << 63)
-        }
+    /// This instruction with its adaptive bits set.
+    #[inline(always)]
+    pub(crate) fn with_adaptive(self, misses: u8, locked: bool) -> Self {
+        let shift = OP_INFO[self.opcode() as usize].adaptive_shift;
+        debug_assert!(shift != 0 && misses < 4);
+        let v = (misses as u64) | (locked as u64) << 2;
+        Instruction((self.0 & !(7 << shift)) | v << shift)
     }
 
-    /// The metamethod form `op` (`ARITH_MM`, `ARITH_MM_R` or `ARITH_MMI`) of
-    /// this generic binary op, which keeps its opcode for [`Self::unquickened`].
+    /// The metamethod form `form` (`ARITH_MM`, `ARITH_MM_R` or `ARITH_MMI`) of
+    /// this binary op, whose generic opcode `orig` the form records.
     #[inline]
-    pub(crate) fn with_mm_form(self, op: Op) -> Self {
-        let orig = self.opcode() as u64;
-        if op == Op::ARITH_MMI {
-            let mut i = self.with_op(op);
-            i.set_c((self.c() & 1) | (orig as u8) << 1);
+    pub(crate) fn with_mm_form(self, form: Op, orig: Op) -> Self {
+        if form == Op::ARITH_MMI {
+            let mut idx = 0;
+            while idx < IMM_ARITH_COUNT && IMM_ARITH_OPS[idx] as u8 != orig as u8 {
+                idx += 1;
+            }
+            debug_assert!(idx < IMM_ARITH_COUNT, "no ARITH_MMI form for {orig:?}");
+            let mut i = self.with_op(form);
+            i.set_c((self.c() & 0x0f) | (idx as u8) << 4);
             i
         } else {
-            Instruction((self.0 & !0xff & !(0xff << D_SHIFT)) | op as u64 | orig << D_SHIFT)
+            let mut i = self.with_op(form);
+            i.set_e(orig as u8 as u16);
+            i
         }
+    }
+
+    /// The opcode an `ARITH_MMI` stands in for.
+    #[inline(always)]
+    pub(crate) fn mm_orig_imm(self) -> Op {
+        IMM_ARITH_OPS[(self.c() >> 4) as usize & 15]
+    }
+
+    /// The opcode an `ARITH_MM` or `ARITH_MM_R` stands in for.
+    #[inline(always)]
+    pub(crate) fn mm_orig_reg(self) -> Op {
+        Instruction((self.e() & 0xff) as u64).op()
     }
 
     /// The opcode a metamethod form stands in for.
     #[inline(always)]
-    pub(crate) fn mm_form_op(self) -> Op {
-        let orig = if self.op() == Op::ARITH_MMI {
-            self.c() >> 1
+    pub(crate) fn mm_orig(self) -> Op {
+        if self.op() == Op::ARITH_MMI {
+            self.mm_orig_imm()
         } else {
-            self.d() as u8
-        };
-        Instruction(orig as u64).op()
+            self.mm_orig_reg()
+        }
     }
 
-    /// This instruction as the compiler emitted it, but for a
-    /// [`Self::with_no_quicken`] mark.
-    pub fn unquickened(self) -> Self {
+    /// The generic opcode of this site, whatever form it is in.
+    #[inline(always)]
+    pub(crate) fn generic_op(self) -> Op {
         match self.op() {
+            Op::ARITH_MM | Op::ARITH_MM_R | Op::ARITH_MMI => self.mm_orig(),
+            op => op.unquickened(),
+        }
+    }
+
+    /// This instruction as the compiler emitted it: the generic opcode, no
+    /// adaptive bits, no recorded original.
+    pub fn unquickened(self) -> Self {
+        let generic = self.generic_op();
+        let mut i = match self.op() {
             Op::ARITH_MM | Op::ARITH_MM_R => {
-                Instruction(self.0 & !0xff & !(0xff << D_SHIFT) | self.mm_form_op() as u64)
-            }
-            Op::ARITH_MMI => {
-                let mut i = self.with_op(self.mm_form_op());
-                i.set_c(self.c() & 1);
+                let mut i = self.with_op(generic);
+                i.set_e(0);
                 i
             }
-            op => self.with_op(op.unquickened()),
+            Op::ARITH_MMI => {
+                let mut i = self.with_op(generic);
+                i.set_c(self.c() & 0x0f);
+                i
+            }
+            _ => self.with_op(generic),
+        };
+        if OP_INFO[generic as usize].adaptive_shift != 0 {
+            i = i.with_adaptive(0, false);
         }
+        i
     }
 }
 

@@ -1,238 +1,372 @@
-//! Arithmetic and bitwise operators, register and immediate forms, the
-//! quickened `_NUM` and metamethod forms, and their shared slow path.
+//! Arithmetic and bitwise operators: the guarded forms, the metamethod
+//! forms, and one generic handler that executes every case and specializes
+//! the site by the operand kinds it saw.
 
 use crate::env::shape::{MetamethodBits, MmIndex};
 use crate::env::table::Table;
 use crate::env::value::Value;
-use crate::instruction::{Instruction, Op};
+use crate::instruction::{ArithKind, Family, Instruction, MISSES_TO_LOCK, Op};
 use crate::vm::abi::{Slot, handler, handler_bits};
 use crate::vm::frame::{self, HDR};
-use crate::vm::num;
+use crate::vm::num::{self, ArithOp, BitOp};
 use crate::vm::ops::meta::{ret_store_a, stage_mm};
 use crate::vm::unwind::OpError;
 
-/// `R[a] = R[b] <op> R[c]` for the arithmetic opcodes.
-///
-/// Inline ints and floats only; boxed ints, overflow, zero divisors and mixes
-/// all go to the slow handler so no call (and no stack frame) lands here.
-/// Floats are the fall-through arm.
-macro_rules! arith_handler {
-    ($name:ident, $num_kind:ty) => {
-        handler! {
-            bind(insn, pc, base, rt, closure, thread, nret, values);
-            op fn $name {
-                let (dst, lhs, rhs) = insn.abc();
-                let (l, r) = (&reg![lhs], &reg![rhs]);
-                if std::hint::likely(l.is_float() && r.is_float()) {
-                    let (lf, rf) = (l.read_float(), r.read_float());
-                    reg![dst].write_float(<$num_kind as num::ArithOp>::float_raw(lf, rf));
-                    next!()
-                } else if let Some((li, ri)) = Value::both_small(l, r) {
-                    if let Some(v) = <$num_kind as num::ArithOp>::small(li, ri) {
-                        reg![dst] = v;
-                        next!()
-                    }
-                }
-                tail!(binop_slow)
-            }
-        }
-    };
+/// What a form stores, or that the operation left its fast case.
+enum Out<'gc> {
+    Value(Value<'gc>),
+    /// A hardware result of canonical operands: stored unchecked.
+    Float(f64),
+    /// A libm result: checked for a NaN in box space.
+    FloatChecked(f64),
+    Miss,
 }
-
-/// `R[a] = R[b] <op> R[c]` for the bitwise opcodes.
-macro_rules! bit_handler {
-    ($name:ident, $num_kind:ty) => {
-        handler! {
-            bind(insn, pc, base, rt, closure, thread, nret, values);
-            op fn $name {
-                let (dst, lhs, rhs) = insn.abc();
-                let (l, r) = (&reg![lhs], &reg![rhs]);
-                if let Some(li) = l.get_small()
-                    && let Some(ri) = r.get_small()
-                    && let Some(v) = <$num_kind as num::BitOp>::small(li, ri)
-                {
-                    reg![dst] = v;
-                    next!()
-                }
-                tail!(binop_slow)
-            }
-        }
-    };
-}
-
-arith_handler!(op_add, num::Add);
-arith_handler!(op_sub, num::Sub);
-arith_handler!(op_mul, num::Mul);
-arith_handler!(op_mod, num::Mod);
-arith_handler!(op_pow, num::Pow);
-arith_handler!(op_div, num::Div);
-arith_handler!(op_idiv, num::IDiv);
-bit_handler!(op_band, num::BAnd);
-bit_handler!(op_bor, num::BOr);
-bit_handler!(op_bxor, num::BXor);
-bit_handler!(op_shl, num::Shl);
-bit_handler!(op_shr, num::Shr);
 
 #[inline(always)]
-fn small_or_float(v: &Value<'_>) -> Option<f64> {
-    if v.is_float() {
-        Some(v.read_float())
-    } else {
-        v.get_small().map(f64::from)
+fn val(v: Option<Value<'_>>) -> Out<'_> {
+    match v {
+        Some(v) => Out::Value(v),
+        None => Out::Miss,
     }
 }
 
-/// A register-form arithmetic site quickened to its `_NUM` form: the generic
-/// handler's cases plus a float and an inline int in either order.
-macro_rules! arith_num_handler {
-    ($name:ident, $num_kind:ty) => {
-        handler! {
-            bind(insn, pc, base, rt, closure, thread, nret, values);
-            op fn $name {
-                let (dst, lhs, rhs) = insn.abc();
-                let (l, r) = (&reg![lhs], &reg![rhs]);
-                if let Some((li, ri)) = Value::both_small(l, r) {
-                    if let Some(v) = <$num_kind as num::ArithOp>::small(li, ri) {
-                        reg![dst] = v;
-                        next!()
-                    }
-                } else if let Some(lf) = small_or_float(l)
-                    && let Some(rf) = small_or_float(r)
-                {
-                    reg![dst].write_float(<$num_kind as num::ArithOp>::float_raw(lf, rf));
-                    next!()
-                }
-                tail!(binop_slow)
-            }
-        }
-    };
+#[inline(always)]
+fn float_small(l: &Value<'_>, r: &Value<'_>) -> Option<(f64, i32)> {
+    Value::small_float(r, l).map(|(i, f)| (f, i))
 }
 
-arith_num_handler!(op_add_num, num::Add);
-arith_num_handler!(op_sub_num, num::Sub);
-arith_num_handler!(op_mul_num, num::Mul);
-arith_num_handler!(op_mod_num, num::Mod);
-arith_num_handler!(op_pow_num, num::Pow);
-arith_num_handler!(op_div_num, num::Div);
-arith_num_handler!(op_idiv_num, num::IDiv);
-
-/// `R[a] = R[b] <op> imm`, or `imm <op> R[b]` when `$swap`. Unlike the
-/// register form the int/float mixes are inline: the constant side converts
-/// for free.
-macro_rules! arith_imm_handler {
-    ($name:ident, $num_kind:ty, $swap:expr) => {
+/// A register form: `$guard` binds `R[b]` and `R[c]` as the kinds the form
+/// is for in one branch; `$body` computes the [`Out`]. The guard's failure
+/// and a `Miss` go to the generic handler.
+macro_rules! reg_form {
+    ($name:ident, $guard:expr, |$l:ident, $r:ident| $body:expr) => {
         handler! {
             bind(insn, pc, base, rt, closure, thread, nret, values);
             op fn $name {
-                let (dst, src, _) = insn.abc_imm();
-                let v = &reg![src];
-                if std::hint::likely(insn.imm_is_int()) {
-                    let k = insn.imm_int();
-                    if let Some(i) = v.get_small() {
-                        // Immediates are 31-bit, so both operands are i32.
-                        let (l, r) = if $swap { (k as i32, i) } else { (i, k as i32) };
-                        if let Some(out) = <$num_kind as num::ArithOp>::small(l, r) {
-                            reg![dst] = out;
+                let (dst, lhs, rhs) = (insn.a(), insn.b(), insn.c());
+                if let Some(($l, $r)) = $guard(&reg![lhs], &reg![rhs]) {
+                    match $body {
+                        Out::Value(v) => {
+                            reg![dst] = v;
                             next!()
                         }
-                    } else if v.is_float() {
-                        let (f, k) = (v.read_float(), k as f64);
-                        let (l, r) = if $swap { (k, f) } else { (f, k) };
-                        reg![dst].write_float(<$num_kind as num::ArithOp>::float_raw(l, r));
-                        next!()
-                    }
-                } else {
-                    let k = insn.imm_float();
-                    if v.is_float() {
-                        let f = v.read_float();
-                        let (l, r) = if $swap { (k, f) } else { (f, k) };
-                        reg![dst].write_float(<$num_kind as num::ArithOp>::float_raw(l, r));
-                        next!()
-                    } else if let Some(i) = v.get_small() {
-                        let f = i as f64;
-                        let (l, r) = if $swap { (k, f) } else { (f, k) };
-                        reg![dst].write_float(<$num_kind as num::ArithOp>::float_raw(l, r));
-                        next!()
+                        Out::Float(f) => {
+                            reg![dst].write_float_unchecked(f);
+                            next!()
+                        }
+                        Out::FloatChecked(f) => {
+                            reg![dst].write_float(f);
+                            next!()
+                        }
+                        Out::Miss => {}
                     }
                 }
-                tail!(binop_slow)
+                tail!(arith_generic)
             }
         }
     };
 }
 
-/// `R[a] = R[b] <op> imm` for the bitwise opcodes. The immediate is always an
-/// integer; a float register goes through the slow path's exact conversion.
-macro_rules! bit_imm_handler {
-    ($name:ident, $num_kind:ty, $swap:expr) => {
+/// An immediate form: `$guard` binds `R[b]` and the immediate, in source
+/// order (`$reversed` puts the immediate first).
+macro_rules! imm_form {
+    ($name:ident, $guard:ident, $reversed:expr, |$l:ident, $r:ident| $body:expr) => {
         handler! {
             bind(insn, pc, base, rt, closure, thread, nret, values);
             op fn $name {
-                let (dst, src, _) = insn.abc_imm();
-                debug_assert!(insn.imm_is_int());
-                let k = insn.imm_int();
-                if let Some(i) = reg![src].get_small() {
-                    let (l, r) = if $swap { (k as i32, i) } else { (i, k as i32) };
-                    if let Some(out) = <$num_kind as num::BitOp>::small(l, r) {
-                        reg![dst] = out;
-                        next!()
+                let (dst, src) = (insn.a(), insn.b());
+                if let Some(($l, $r)) = $guard(&reg![src], insn, $reversed) {
+                    match $body {
+                        Out::Value(v) => {
+                            reg![dst] = v;
+                            next!()
+                        }
+                        Out::Float(f) => {
+                            reg![dst].write_float_unchecked(f);
+                            next!()
+                        }
+                        Out::FloatChecked(f) => {
+                            reg![dst].write_float(f);
+                            next!()
+                        }
+                        Out::Miss => {}
                     }
                 }
-                tail!(binop_slow)
+                tail!(arith_generic)
             }
         }
     };
 }
 
-arith_imm_handler!(op_addi, num::Add, false);
-arith_imm_handler!(op_subi, num::Sub, false);
-arith_imm_handler!(op_muli, num::Mul, false);
-arith_imm_handler!(op_modi, num::Mod, false);
-arith_imm_handler!(op_powi, num::Pow, false);
-arith_imm_handler!(op_divi, num::Div, false);
-arith_imm_handler!(op_idivi, num::IDiv, false);
-arith_imm_handler!(op_rsubi, num::Sub, true);
-arith_imm_handler!(op_rmodi, num::Mod, true);
-arith_imm_handler!(op_rpowi, num::Pow, true);
-arith_imm_handler!(op_rdivi, num::Div, true);
-arith_imm_handler!(op_ridivi, num::IDiv, true);
-bit_imm_handler!(op_bandi, num::BAnd, false);
-bit_imm_handler!(op_bori, num::BOr, false);
-bit_imm_handler!(op_bxori, num::BXor, false);
-bit_imm_handler!(op_shli, num::Shl, false);
-bit_imm_handler!(op_shri, num::Shr, false);
-bit_imm_handler!(op_rshli, num::Shl, true);
-bit_imm_handler!(op_rshri, num::Shr, true);
-
-/// The metamethod a binary arithmetic or bitwise opcode calls.
-const fn binop_mm_bit(op: Op) -> Option<MetamethodBits> {
-    use Op::*;
-    Some(match op {
-        ADD | ADDI => MetamethodBits::ADD,
-        SUB | SUBI | RSUBI => MetamethodBits::SUB,
-        MUL | MULI => MetamethodBits::MUL,
-        MOD | MODI | RMODI => MetamethodBits::MOD,
-        POW | POWI | RPOWI => MetamethodBits::POW,
-        DIV | DIVI | RDIVI => MetamethodBits::DIV,
-        IDIV | IDIVI | RIDIVI => MetamethodBits::IDIV,
-        BAND | BANDI => MetamethodBits::BAND,
-        BOR | BORI => MetamethodBits::BOR,
-        BXOR | BXORI => MetamethodBits::BXOR,
-        SHL | SHLI | RSHLI => MetamethodBits::SHL,
-        SHR | SHRI | RSHRI => MetamethodBits::SHR,
-        _ => return None,
-    })
+/// The immediate as a float, whichever kind it is.
+#[inline(always)]
+fn imm_as_float(insn: Instruction) -> f64 {
+    if insn.imm_is_int() {
+        insn.imm_int() as f64
+    } else {
+        insn.imm_float()
+    }
 }
 
-/// [`binop_mm_bit`] by opcode byte, so the metamethod forms read their
-/// metamethod with one load instead of a `match`.
+/// Small register, integer immediate (31-bit, so an i32). The `_I` form is
+/// only written for an integer immediate, and a site's immediate never
+/// changes.
+#[inline(always)]
+fn imm_i(v: &Value<'_>, insn: Instruction, reversed: bool) -> Option<(i32, i32)> {
+    debug_assert!(insn.imm_is_int());
+    let i = v.get_small()?;
+    let k = insn.imm_int() as i32;
+    Some(if reversed { (k, i) } else { (i, k) })
+}
+
+/// Float register, immediate of either kind.
+#[inline(always)]
+fn imm_f(v: &Value<'_>, insn: Instruction, reversed: bool) -> Option<(f64, f64)> {
+    if !v.is_float() {
+        return None;
+    }
+    let (f, k) = (v.read_float(), imm_as_float(insn));
+    Some(if reversed { (k, f) } else { (f, k) })
+}
+
+/// Small register, immediate of either kind, float result (the ops whose
+/// `_I` form takes an integer immediate only see a float one here).
+#[inline(always)]
+fn imm_if(v: &Value<'_>, insn: Instruction, reversed: bool) -> Option<(f64, f64)> {
+    let i = v.get_small()? as f64;
+    let k = imm_as_float(insn);
+    Some(if reversed { (k, i) } else { (i, k) })
+}
+
+/// Small register, float immediate.
+#[inline(always)]
+fn imm_if_float(v: &Value<'_>, insn: Instruction, reversed: bool) -> Option<(f64, f64)> {
+    debug_assert!(!insn.imm_is_int());
+    let i = v.get_small()? as f64;
+    let k = insn.imm_float();
+    Some(if reversed { (k, i) } else { (i, k) })
+}
+
+/// Small register; a bitwise immediate is always an integer.
+#[inline(always)]
+fn immbit_i(v: &Value<'_>, insn: Instruction, reversed: bool) -> Option<(i32, i32)> {
+    debug_assert!(insn.imm_is_int());
+    let i = v.get_small()?;
+    let k = insn.imm_int() as i32;
+    Some(if reversed { (k, i) } else { (i, k) })
+}
+
+reg_form!(op_add_ii, Value::both_small, |l, r| val(num::Add::small(
+    l, r
+)));
+reg_form!(op_sub_ii, Value::both_small, |l, r| val(num::Sub::small(
+    l, r
+)));
+reg_form!(op_mul_ii, Value::both_small, |l, r| val(num::Mul::small(
+    l, r
+)));
+reg_form!(op_mod_ii, Value::both_small, |l, r| val(num::Mod::small(
+    l, r
+)));
+reg_form!(op_idiv_ii, Value::both_small, |l, r| val(num::IDiv::small(
+    l, r
+)));
+reg_form!(op_div_ii, Value::both_small, |l, r| Out::Float(
+    num::Div::float_raw(l as f64, r as f64)
+));
+reg_form!(op_pow_ii, Value::both_small, |l, r| Out::FloatChecked(
+    num::Pow::float_raw(l as f64, r as f64)
+));
+reg_form!(op_add_ff, Value::both_float, |l, r| Out::Float(
+    num::Add::float_raw(l, r)
+));
+reg_form!(op_sub_ff, Value::both_float, |l, r| Out::Float(
+    num::Sub::float_raw(l, r)
+));
+reg_form!(op_mul_ff, Value::both_float, |l, r| Out::Float(
+    num::Mul::float_raw(l, r)
+));
+reg_form!(op_mod_ff, Value::both_float, |l, r| Out::FloatChecked(
+    num::Mod::float_raw(l, r)
+));
+reg_form!(op_pow_ff, Value::both_float, |l, r| Out::FloatChecked(
+    num::Pow::float_raw(l, r)
+));
+reg_form!(op_div_ff, Value::both_float, |l, r| Out::Float(
+    num::Div::float_raw(l, r)
+));
+reg_form!(op_idiv_ff, Value::both_float, |l, r| Out::Float(
+    num::IDiv::float_raw(l, r)
+));
+reg_form!(op_add_if, Value::small_float, |l, r| Out::Float(
+    num::Add::float_raw(l as f64, r)
+));
+reg_form!(op_sub_if, Value::small_float, |l, r| Out::Float(
+    num::Sub::float_raw(l as f64, r)
+));
+reg_form!(op_mul_if, Value::small_float, |l, r| Out::Float(
+    num::Mul::float_raw(l as f64, r)
+));
+reg_form!(op_div_if, Value::small_float, |l, r| Out::Float(
+    num::Div::float_raw(l as f64, r)
+));
+reg_form!(op_add_fi, float_small, |l, r| Out::Float(
+    num::Add::float_raw(l, r as f64)
+));
+reg_form!(op_sub_fi, float_small, |l, r| Out::Float(
+    num::Sub::float_raw(l, r as f64)
+));
+reg_form!(op_mul_fi, float_small, |l, r| Out::Float(
+    num::Mul::float_raw(l, r as f64)
+));
+reg_form!(op_div_fi, float_small, |l, r| Out::Float(
+    num::Div::float_raw(l, r as f64)
+));
+/// Any inline numbers (`_NN`): the form of a site whose kinds keep changing.
+macro_rules! nn_form {
+    ($name:ident, $k:ty, $store:ident) => {
+        reg_form!($name, nn_guard, |l, r| {
+            if let Some((li, ri)) = Value::both_small(l, r) {
+                val(<$k as ArithOp>::small(li, ri))
+            } else if let Some(lf) = small_or_float(l)
+                && let Some(rf) = small_or_float(r)
+            {
+                Out::$store(<$k as ArithOp>::float_raw(lf, rf))
+            } else {
+                Out::Miss
+            }
+        });
+    };
+}
+
+#[inline(always)]
+fn nn_guard<'a, 'gc>(
+    l: &'a Value<'gc>,
+    r: &'a Value<'gc>,
+) -> Option<(&'a Value<'gc>, &'a Value<'gc>)> {
+    Some((l, r))
+}
+
+nn_form!(op_add_nn, num::Add, Float);
+nn_form!(op_sub_nn, num::Sub, Float);
+nn_form!(op_mul_nn, num::Mul, Float);
+nn_form!(op_mod_nn, num::Mod, FloatChecked);
+nn_form!(op_pow_nn, num::Pow, FloatChecked);
+nn_form!(op_div_nn, num::Div, Float);
+nn_form!(op_idiv_nn, num::IDiv, Float);
+
+reg_form!(op_band_ii, Value::both_small, |l, r| val(num::BAnd::small(
+    l, r
+)));
+reg_form!(op_bor_ii, Value::both_small, |l, r| val(num::BOr::small(
+    l, r
+)));
+reg_form!(op_bxor_ii, Value::both_small, |l, r| val(num::BXor::small(
+    l, r
+)));
+reg_form!(op_shl_ii, Value::both_small, |l, r| val(num::Shl::small(
+    l, r
+)));
+reg_form!(op_shr_ii, Value::both_small, |l, r| val(num::Shr::small(
+    l, r
+)));
+
+imm_form!(op_addi_i, imm_i, false, |l, r| val(num::Add::small(l, r)));
+imm_form!(op_subi_i, imm_i, false, |l, r| val(num::Sub::small(l, r)));
+imm_form!(op_muli_i, imm_i, false, |l, r| val(num::Mul::small(l, r)));
+imm_form!(op_modi_i, imm_i, false, |l, r| val(num::Mod::small(l, r)));
+imm_form!(op_idivi_i, imm_i, false, |l, r| val(num::IDiv::small(l, r)));
+imm_form!(op_rsubi_i, imm_i, true, |l, r| val(num::Sub::small(l, r)));
+imm_form!(op_addi_f, imm_f, false, |l, r| Out::Float(
+    num::Add::float_raw(l, r)
+));
+imm_form!(op_subi_f, imm_f, false, |l, r| Out::Float(
+    num::Sub::float_raw(l, r)
+));
+imm_form!(op_muli_f, imm_f, false, |l, r| Out::Float(
+    num::Mul::float_raw(l, r)
+));
+imm_form!(op_modi_f, imm_f, false, |l, r| Out::FloatChecked(
+    num::Mod::float_raw(l, r)
+));
+imm_form!(op_idivi_f, imm_f, false, |l, r| Out::Float(
+    num::IDiv::float_raw(l, r)
+));
+imm_form!(op_rsubi_f, imm_f, true, |l, r| Out::Float(
+    num::Sub::float_raw(l, r)
+));
+imm_form!(op_powi_f, imm_f, false, |l, r| Out::FloatChecked(
+    num::Pow::float_raw(l, r)
+));
+imm_form!(op_divi_f, imm_f, false, |l, r| Out::Float(
+    num::Div::float_raw(l, r)
+));
+imm_form!(op_rdivi_f, imm_f, true, |l, r| Out::Float(
+    num::Div::float_raw(l, r)
+));
+imm_form!(op_addi_if, imm_if_float, false, |l, r| Out::Float(
+    num::Add::float_raw(l, r)
+));
+imm_form!(op_subi_if, imm_if_float, false, |l, r| Out::Float(
+    num::Sub::float_raw(l, r)
+));
+imm_form!(op_muli_if, imm_if_float, false, |l, r| Out::Float(
+    num::Mul::float_raw(l, r)
+));
+imm_form!(op_divi_if, imm_if, false, |l, r| Out::Float(
+    num::Div::float_raw(l, r)
+));
+imm_form!(op_rdivi_if, imm_if, true, |l, r| Out::Float(
+    num::Div::float_raw(l, r)
+));
+imm_form!(op_powi_if, imm_if, false, |l, r| Out::FloatChecked(
+    num::Pow::float_raw(l, r)
+));
+imm_form!(op_rpowi_if, imm_if, true, |l, r| Out::FloatChecked(
+    num::Pow::float_raw(l, r)
+));
+imm_form!(op_bandi_i, immbit_i, false, |l, r| val(num::BAnd::small(
+    l, r
+)));
+imm_form!(op_bori_i, immbit_i, false, |l, r| val(num::BOr::small(
+    l, r
+)));
+imm_form!(op_bxori_i, immbit_i, false, |l, r| val(num::BXor::small(
+    l, r
+)));
+imm_form!(op_shli_i, immbit_i, false, |l, r| val(num::Shl::small(
+    l, r
+)));
+imm_form!(op_shri_i, immbit_i, false, |l, r| val(num::Shr::small(
+    l, r
+)));
+
+/// The metamethod of an arithmetic kind.
+const fn kind_mm(kind: ArithKind) -> MetamethodBits {
+    match kind {
+        ArithKind::Add => MetamethodBits::ADD,
+        ArithKind::Sub => MetamethodBits::SUB,
+        ArithKind::Mul => MetamethodBits::MUL,
+        ArithKind::Mod => MetamethodBits::MOD,
+        ArithKind::Pow => MetamethodBits::POW,
+        ArithKind::Div => MetamethodBits::DIV,
+        ArithKind::IDiv => MetamethodBits::IDIV,
+        ArithKind::BAnd => MetamethodBits::BAND,
+        ArithKind::BOr => MetamethodBits::BOR,
+        ArithKind::BXor => MetamethodBits::BXOR,
+        ArithKind::Shl => MetamethodBits::SHL,
+        ArithKind::Shr => MetamethodBits::SHR,
+        ArithKind::None => MetamethodBits::ADD,
+    }
+}
+
+/// The metamethod index by generic opcode byte, so the metamethod forms read
+/// theirs with one load instead of a `match`.
 static BINOP_MM: [MmIndex; 256] = {
     let mut t = [MmIndex::of(MetamethodBits::ADD); 256];
     let mut i = 0;
     while i < Op::COUNT {
-        if let Some(bit) = binop_mm_bit(Op::ALL[i]) {
-            t[i] = MmIndex::of(bit);
-        }
+        t[i] = MmIndex::of(kind_mm(crate::instruction::OP_INFO[i].kind));
         i += 1;
     }
     t
@@ -241,7 +375,7 @@ static BINOP_MM: [MmIndex; 256] = {
 /// The metamethod `t`'s metatable has for the binary opcode `orig`; nil when
 /// none.
 #[inline(always)]
-fn table_binop_mm<'gc>(t: Table<'gc>, orig: u8) -> Value<'gc> {
+fn table_binop_mm<'gc>(t: Table<'gc>, orig: Op) -> Value<'gc> {
     match t.shape().mt_cache() {
         Some(cache) => cache.mm_at(BINOP_MM[orig as usize]),
         None => Value::nil(),
@@ -268,48 +402,184 @@ macro_rules! stage_binop_mm {
     }};
 }
 
+/// The operand kind a site is specialized on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Small,
+    Float,
+    Other,
+}
+
+#[inline(always)]
+fn kind_of(v: &Value<'_>) -> Kind {
+    if v.is_float() {
+        Kind::Float
+    } else if v.get_small().is_some() {
+        Kind::Small
+    } else {
+        Kind::Other
+    }
+}
+
+/// The form of `generic` for the numeric operand kinds seen, if one
+/// exists. `rhs` is the immediate for an immediate family.
+fn numeric_form(generic: Op, lhs: &Value<'_>, rhs: &Value<'_>, imm_int: bool) -> Option<Op> {
+    let info = generic.info();
+    let forms = &info.forms;
+    match info.family {
+        Family::RegArith | Family::RegBit => match (kind_of(lhs), kind_of(rhs)) {
+            (Kind::Small, Kind::Small) => forms[0],
+            (Kind::Float, Kind::Float) => forms[1],
+            (Kind::Small, Kind::Float) => forms[2],
+            (Kind::Float, Kind::Small) => forms[3],
+            _ => None,
+        },
+        Family::ImmArith | Family::ImmBit => {
+            // The register operand: the immediate is on the left for the
+            // reversed forms (and the slow path passed it as `lhs`).
+            let reg = if info.reversed { rhs } else { lhs };
+            match (kind_of(reg), imm_int) {
+                (Kind::Small, true) => forms[0].or(forms[2]),
+                (Kind::Small, false) => forms[2],
+                (Kind::Float, _) => forms[1],
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Rewrite the site for `form`, the form of the operand
+/// kinds just seen. Only a change of specializable kinds counts as a miss
+/// (three lock the site to its generic opcode): a form whose operation
+/// failed on its own kinds (overflow, a zero divisor) and a boxed integer
+/// operand leave the site as it is, so a site that mostly sees small
+/// integers keeps its form. `lock` is the metamethod path's "no form".
+#[inline(always)]
+unsafe fn specialize(site: *mut Instruction, insn: Instruction, form: Option<Op>, lock: bool) {
+    let current = insn.op();
+    let generic = insn.unquickened();
+    let (misses, _) = insn.adaptive();
+    let is_form = current != generic.op();
+    let word = match form {
+        Some(f) if f == current => return,
+        None if !lock => return,
+        _ => {
+            let misses = misses + is_form as u8;
+            if misses >= MISSES_TO_LOCK {
+                // A numeric site that keeps changing kinds takes the
+                // any-numbers form, locked, where there is one.
+                match generic.op().info().forms[4] {
+                    Some(nn) if !lock => generic.with_op(nn).with_adaptive(misses.min(3), true),
+                    _ => generic.with_adaptive(misses.min(3), true),
+                }
+            } else {
+                match form {
+                    Some(f @ (Op::ARITH_MM | Op::ARITH_MM_R | Op::ARITH_MMI)) => generic
+                        .with_mm_form(f, generic.op())
+                        .with_adaptive(misses, false),
+                    Some(f) => generic.with_op(f).with_adaptive(misses, false),
+                    None => generic.with_adaptive(misses, true),
+                }
+            }
+        }
+    };
+    unsafe { site.write(word) }
+}
+
+#[inline(always)]
+fn small_or_float(v: &Value<'_>) -> Option<f64> {
+    if v.is_float() {
+        Some(v.read_float())
+    } else {
+        v.get_small().map(f64::from)
+    }
+}
+
+/// The inline-number cases of an arithmetic kind, what a locked site runs
+/// on every execution: small integers, floats and their mixes.
+#[inline(always)]
+fn inline_arith<'gc>(kind: ArithKind, lhs: &Value<'gc>, rhs: &Value<'gc>) -> Option<Value<'gc>> {
+    use ArithKind::*;
+    macro_rules! arith {
+        ($k:ty) => {{
+            if let Some((li, ri)) = Value::both_small(lhs, rhs) {
+                <$k as ArithOp>::small(li, ri)
+            } else if let Some(lf) = small_or_float(lhs)
+                && let Some(rf) = small_or_float(rhs)
+            {
+                Some(Value::float(<$k as ArithOp>::float_raw(lf, rf)))
+            } else {
+                Option::None
+            }
+        }};
+    }
+    macro_rules! bit {
+        ($k:ty) => {{
+            let (li, ri) = Value::both_small(lhs, rhs)?;
+            <$k as BitOp>::small(li, ri)
+        }};
+    }
+    match kind {
+        Add => arith!(num::Add),
+        Sub => arith!(num::Sub),
+        Mul => arith!(num::Mul),
+        Mod => arith!(num::Mod),
+        Pow => arith!(num::Pow),
+        Div => arith!(num::Div),
+        IDiv => arith!(num::IDiv),
+        BAnd => bit!(num::BAnd),
+        BOr => bit!(num::BOr),
+        BXor => bit!(num::BXor),
+        Shl => bit!(num::Shl),
+        Shr => bit!(num::Shr),
+        None => Option::None,
+    }
+}
+
 handler! {
     bind(insn, pc, base, rt, closure, thread, nret, values);
 
     /// `ARITH_MM`: `R[a] = mm(R[b], R[c])`, `mm` from `R[b]`, a table.
     op fn op_arith_mm {
-        let (_, lhs, rhs) = insn.abc();
+        let (lhs, rhs) = (insn.b(), insn.c());
         let (l, r) = (reg![lhs], reg![rhs]);
         if let Some(t) = l.get_table() {
-            let mm = table_binop_mm(t, insn.d() as u8);
+            let mm = table_binop_mm(t, insn.mm_orig_reg());
             if !mm.is_nil() {
                 stage_binop_mm!(pc, base, closure, mm, l, r);
             }
         }
-        tail!(binop_slow)
+        tail!(arith_generic)
     }
 
     /// `ARITH_MM_R`: as `ARITH_MM`, `mm` from `R[c]`, a table, `R[b]` a
     /// number.
     op fn op_arith_mm_r {
-        let (_, lhs, rhs) = insn.abc();
+        let (lhs, rhs) = (insn.b(), insn.c());
         let (l, r) = (reg![lhs], reg![rhs]);
         if let Some(t) = r.get_table()
             && l.is_number()
             && rt.number_metatable().is_none()
         {
-            let mm = table_binop_mm(t, insn.d() as u8);
+            let mm = table_binop_mm(t, insn.mm_orig_reg());
             if !mm.is_nil() {
                 stage_binop_mm!(pc, base, closure, mm, l, r);
             }
         }
-        tail!(binop_slow)
+        tail!(arith_generic)
     }
 
     /// `ARITH_MMI`: an immediate form whose register operand is a table with
     /// the metamethod. With the immediate on the left, numbers must have none.
     op fn op_arith_mmi {
-        let (_, src, flipped) = insn.abc_imm();
+        let src = insn.b();
+        let flipped = insn.c() & 1 != 0;
         let v = reg![src];
         if let Some(t) = v.get_table() {
-            let orig = insn.c() >> 1;
+            let orig = insn.mm_orig_imm();
             let mm = table_binop_mm(t, orig);
-            let imm_left = flipped || (Op::RSUBI as u8..=Op::RSHRI as u8).contains(&orig);
+            let imm_left = flipped || orig.is_reversed();
             if !mm.is_nil() && (!imm_left || rt.number_metatable().is_none()) {
                 // Immediates are 31-bit, so an integer one is inline.
                 let k = if insn.imm_is_int() {
@@ -321,7 +591,7 @@ handler! {
                 stage_binop_mm!(pc, base, closure, mm, a, b);
             }
         }
-        tail!(binop_slow)
+        tail!(arith_generic)
     }
 
     /// `R[a] = -R[b]`
@@ -330,7 +600,7 @@ handler! {
         let v = &reg![src];
         if v.is_float() {
             let f = v.read_float();
-            reg![dst].write_float(-f);
+            reg![dst].write_float_unchecked(-f);
             next!()
         }
         if let Some(i) = v.get_small()
@@ -391,58 +661,83 @@ handler! {
         next!()
     }
 
-    /// The slow path of every binary arithmetic and bitwise opcode, register
-    /// and immediate forms alike: mixed and boxed numbers, division by zero,
-    /// and the metamethods. Quickens the site by what reaches it here.
-    slow fn binop_slow {
-        use Op::*;
-        let instruction = insn_at!();
+    /// The generic handler of every binary arithmetic and bitwise site:
+    /// dispatched for a generic opcode (a first execution or a locked
+    /// site) and tailed to by a form's guard failure. It does the inline
+    /// numbers here, specializing the site, and leaves the rest (boxed
+    /// integers, metamethods, errors) to `arith_slow`, so a locked site
+    /// still runs without a stack frame.
+    op fn arith_generic {
         // SAFETY: `Code` keeps instructions in cells, and `pc` is past this one.
         let site = unsafe { pc.sub(1).cast_mut() };
-        let insn = instruction.unquickened();
-        let op = insn.op();
-        let quicken = instruction.op() == op && insn.quickenable();
-        // A metamethod form also lands here when the stack needs growing,
-        // which must not undo it; other misses undo it for good.
-        let mm_form = matches!(instruction.op(), ARITH_MM | ARITH_MM_R | ARITH_MMI);
+        let generic = insn.generic_op();
+        let info = generic.info();
+        let (_, locked) = insn.adaptive();
+        let dst = insn.a();
+        let imm = matches!(info.family, Family::ImmArith | Family::ImmBit);
+        let (lhs, rhs) = if imm {
+            // Immediates are 31-bit, so an integer one is inline.
+            let k = if insn.imm_is_int() {
+                Value::small(insn.imm_int() as i32)
+            } else {
+                Value::float(insn.imm_float())
+            };
+            let v = reg![insn.b()];
+            let flipped = insn.c() & 1 != 0;
+            if flipped || info.reversed { (k, v) } else { (v, k) }
+        } else {
+            (reg![insn.b()], reg![insn.c()])
+        };
+        if let Some(v) = inline_arith(info.kind, &lhs, &rhs) {
+            if !locked {
+                let form = numeric_form(generic, &lhs, &rhs, insn.imm_is_int());
+                unsafe { specialize(site, insn, form, false) };
+            }
+            reg![dst] = v;
+            next!()
+        }
+        tail!(arith_slow)
+    }
+
+    /// The rest of `arith_generic`: boxed integers, string coercion,
+    /// metamethods and the errors, with the metamethod forms' specialization.
+    slow fn arith_slow {
+        use ArithKind::*;
+        let insn = insn_at!();
+        let site = unsafe { pc.sub(1).cast_mut() };
+        let generic = insn.generic_op();
+        let info = generic.info();
+        let (_, locked) = insn.adaptive();
         let dst = insn.a();
         let mc = rt.mutation();
-        let (lhs, rhs) = match op {
-            ADD | SUB | MUL | MOD | POW | DIV | IDIV | BAND | BOR | BXOR | SHL | SHR => {
-                (reg![insn.b()], reg![insn.c()])
-            }
-            _ => {
-                let (_, src, flipped) = insn.abc_imm();
-                let (v, k) = (reg![src], insn.imm_value(mc));
-                if flipped || op.is_reversed() { (k, v) } else { (v, k) }
-            }
+        let imm = matches!(info.family, Family::ImmArith | Family::ImmBit);
+        let (lhs, rhs) = if imm {
+            let (v, k) = (reg![insn.b()], insn.imm_value(mc));
+            let flipped = insn.c() & 1 != 0;
+            if flipped || info.reversed { (k, v) } else { (v, k) }
+        } else {
+            (reg![insn.b()], reg![insn.c()])
         };
-        let (r, bit) = match op {
-            ADD | ADDI => (num::op_arith_slow::<num::Add>(mc, lhs, rhs), MetamethodBits::ADD),
-            SUB | SUBI | RSUBI => (num::op_arith_slow::<num::Sub>(mc, lhs, rhs), MetamethodBits::SUB),
-            MUL | MULI => (num::op_arith_slow::<num::Mul>(mc, lhs, rhs), MetamethodBits::MUL),
-            MOD | MODI | RMODI => (num::op_arith_slow::<num::Mod>(mc, lhs, rhs), MetamethodBits::MOD),
-            POW | POWI | RPOWI => (num::op_arith_slow::<num::Pow>(mc, lhs, rhs), MetamethodBits::POW),
-            DIV | DIVI | RDIVI => (num::op_arith_slow::<num::Div>(mc, lhs, rhs), MetamethodBits::DIV),
-            IDIV | IDIVI | RIDIVI => (num::op_arith_slow::<num::IDiv>(mc, lhs, rhs), MetamethodBits::IDIV),
-            BAND | BANDI => (num::op_bit_slow::<num::BAnd>(mc, lhs, rhs), MetamethodBits::BAND),
-            BOR | BORI => (num::op_bit_slow::<num::BOr>(mc, lhs, rhs), MetamethodBits::BOR),
-            BXOR | BXORI => (num::op_bit_slow::<num::BXor>(mc, lhs, rhs), MetamethodBits::BXOR),
-            SHL | SHLI | RSHLI => (num::op_bit_slow::<num::Shl>(mc, lhs, rhs), MetamethodBits::SHL),
-            SHR | SHRI | RSHRI => (num::op_bit_slow::<num::Shr>(mc, lhs, rhs), MetamethodBits::SHR),
-            _ => unreachable!("binop_slow on {op:?}"),
+        let r = match info.kind {
+            Add => num::op_arith_slow::<num::Add>(mc, lhs, rhs),
+            Sub => num::op_arith_slow::<num::Sub>(mc, lhs, rhs),
+            Mul => num::op_arith_slow::<num::Mul>(mc, lhs, rhs),
+            Mod => num::op_arith_slow::<num::Mod>(mc, lhs, rhs),
+            Pow => num::op_arith_slow::<num::Pow>(mc, lhs, rhs),
+            Div => num::op_arith_slow::<num::Div>(mc, lhs, rhs),
+            IDiv => num::op_arith_slow::<num::IDiv>(mc, lhs, rhs),
+            BAnd => num::op_bit_slow::<num::BAnd>(mc, lhs, rhs),
+            BOr => num::op_bit_slow::<num::BOr>(mc, lhs, rhs),
+            BXor => num::op_bit_slow::<num::BXor>(mc, lhs, rhs),
+            Shl => num::op_bit_slow::<num::Shl>(mc, lhs, rhs),
+            Shr => num::op_bit_slow::<num::Shr>(mc, lhs, rhs),
+            None => unreachable!("arith_slow on {generic:?}"),
         };
-        if mm_form && !matches!(r, num::SlowNum::NotNumbers) {
-            unsafe { site.write(insn.with_no_quicken()) };
-        }
+        let bit = kind_mm(info.kind);
         match r {
             num::SlowNum::Value(v) => {
-                if quicken
-                    && lhs.is_float() != rhs.is_float()
-                    && let Some(n) = op.num_form()
-                {
-                    unsafe { site.write(insn.with_op(n)) };
-                }
+                // Boxed integers, or an overflow of the inline case: no form
+                // change, and the site stays as it is.
                 reg![dst] = v;
                 next!()
             }
@@ -452,34 +747,33 @@ handler! {
         }
         let lhs_mm = rt.mm_of(lhs, bit);
         let mm = if lhs_mm.is_nil() { rt.mm_of(rhs, bit) } else { lhs_mm };
-        if quicken || mm_form {
-            // The forms read the metamethod from a table's shape; taking it
-            // from the right needs the left to be a number without one.
-            let form = if mm.is_nil() {
-                None
-            } else if !lhs_mm.is_nil() {
-                lhs.get_table().map(|_| ARITH_MM)
-            } else if rhs.get_table().is_some() && lhs.is_number() && rt.number_metatable().is_none() {
-                Some(ARITH_MM_R)
-            } else {
-                None
-            };
-            let form = form.map(|f| {
-                if op.shape() == crate::instruction::Shape::AbcImm { ARITH_MMI } else { f }
-            });
-            if quicken && let Some(form) = form {
-                unsafe { site.write(insn.with_mm_form(form)) };
-            } else if mm_form && form != Some(instruction.op()) {
-                unsafe { site.write(insn.with_no_quicken()) };
-            }
-        }
         if mm.is_nil() {
+            if !locked {
+                unsafe { specialize(site, insn, Option::None, true) };
+            }
             let bitwise = MetamethodBits::BAND | MetamethodBits::BOR | MetamethodBits::BXOR;
             raise!(if (bitwise | MetamethodBits::SHL | MetamethodBits::SHR).contains(bit) {
                 OpError::Bitwise(lhs, rhs)
             } else {
                 OpError::Arith(lhs, rhs)
             })
+        }
+        if !locked {
+            // The forms read the metamethod from a table's shape; taking it
+            // from the right needs the left to be a number without one.
+            let form = if !lhs_mm.is_nil() {
+                lhs.get_table().map(|_| Op::ARITH_MM)
+            } else if rhs.get_table().is_some() && lhs.is_number() && rt.number_metatable().is_none() {
+                Some(Op::ARITH_MM_R)
+            } else {
+                Option::None
+            };
+            let form = match info.family {
+                Family::ImmArith => form.map(|_| Op::ARITH_MMI),
+                Family::ImmBit => Option::None,
+                _ => form,
+            };
+            unsafe { specialize(site, insn, form, true) };
         }
         stage_mm!(pc, base, rt, ret_store_a, mm, [lhs, rhs])
     }

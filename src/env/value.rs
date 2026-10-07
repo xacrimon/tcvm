@@ -197,12 +197,39 @@ impl<'gc> Value<'gc> {
         }
     }
 
-    /// Handlers that store straight to a slot use `write_float` instead, which keeps the box
-    /// check off the result path.
+    /// Every NaN becomes the canonical quiet NaN, so a payload NaN (from bits, or a
+    /// signalling one quieting) can never reach box space. Hardware add, sub, mul, div, neg
+    /// and abs of canonical floats stay out of box space on their own, so handlers store
+    /// those results with `write_float_unchecked`.
     #[inline(always)]
     pub fn float(v: f64) -> Self {
-        let bits = v.to_bits();
-        Self::from_bits(if bits >= BOX { CANONICAL_NAN } else { bits })
+        Self::from_bits(if v.is_nan() {
+            CANONICAL_NAN
+        } else {
+            v.to_bits()
+        })
+    }
+
+    /// Both floats, one compare: the larger of two bit patterns is below box space exactly
+    /// when both are. The floats come from `read_float`, separate FP loads: built from the
+    /// integer loads they would cost a GPR-to-FPR move on the result path.
+    #[inline(always)]
+    pub fn both_float(a: &Self, b: &Self) -> Option<(f64, f64)> {
+        if a.bits.max(b.bits) < BOX {
+            Some((a.read_float(), b.read_float()))
+        } else {
+            None
+        }
+    }
+
+    /// An inline integer and a float.
+    #[inline(always)]
+    pub fn small_float(a: &Self, b: &Self) -> Option<(i32, f64)> {
+        if a.bits >> 32 == SMALL_INT >> 32 && b.bits < BOX {
+            Some((a.bits as i32, b.read_float()))
+        } else {
+            None
+        }
     }
 
     #[inline(always)]
@@ -240,6 +267,14 @@ impl<'gc> Value<'gc> {
                 core::ptr::write_volatile(self as *mut Self as *mut u64, CANONICAL_NAN);
             }
         }
+    }
+
+    /// A plain store of a float that is known to be outside box space: the result of a
+    /// hardware add, sub, mul, div, neg or abs of canonical operands.
+    #[inline(always)]
+    pub fn write_float_unchecked(&mut self, f: f64) {
+        debug_assert!(f.to_bits() < BOX, "a float in box space");
+        unsafe { core::ptr::write_volatile(self as *mut Self as *mut f64, f) }
     }
 
     #[inline(always)]
