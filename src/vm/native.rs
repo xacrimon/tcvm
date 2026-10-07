@@ -7,7 +7,7 @@ use crate::env::error::Error;
 use crate::env::function::{NativeClosure, NativeKind, Stack};
 use crate::env::thread::ThreadState;
 use crate::env::value::Value;
-use crate::instruction::{Instruction, Op, Reg};
+use crate::instruction::{Instruction, Op};
 use crate::lua::Context;
 use crate::vm::abi::{Exit, Jump, Slot, handler, handler_bits};
 use crate::vm::frame::{self, HDR, NativeHdr, copy_values, fill_nil, flag};
@@ -647,101 +647,6 @@ handler! {
         next!()
     }
 }
-
-/// What a one-argument math entry made of its argument.
-enum Math1 {
-    Float(f64),
-    Small(i32),
-    /// Not the common shape: leave the call to the full builtin.
-    Miss,
-}
-
-/// The entry of a one-argument math builtin. `$float`/`$small` map a float or
-/// inline-integer argument to a `Math1`; every other shape goes to
-/// `native_call`. The result lands in the function slot; a TAILCALL returns it
-/// from the frame.
-macro_rules! math1_entry {
-    ($name:ident, |$x:ident| $float:expr, |$i:ident| $small:expr) => {
-        handler! {
-            bind(insn, pc, base, rt, closure, thread, nret, values);
-            entry fn $name {
-                let call = insn.as_insn();
-                let (a, b, c) = (call.a(), call.b(), call.c());
-                let result = if b != 2 {
-                    Math1::Miss
-                } else {
-                    let arg = &reg![a + 4];
-                    if arg.is_float() {
-                        let $x = arg.read_float();
-                        $float
-                    } else if let Some($i) = arg.get_small() {
-                        $small
-                    } else {
-                        Math1::Miss
-                    }
-                };
-                match result {
-                    Math1::Float(f) => reg![a].write_float(f),
-                    Math1::Small(i) => reg![a] = Value::small(i),
-                    Math1::Miss => tail!(native_call),
-                }
-                set_closure!(unsafe { frame::closure(base) });
-                if call.op() == Op::TAILCALL {
-                    // Not RETURN1's handler: the frame may have something to close.
-                    tail!(crate::vm::ops::call::op_return, insn = Slot::insn(Instruction::ret(Reg(a), 2)))
-                }
-                if c == 0 {
-                    let ts = thread!();
-                    ts.top = ts.slot_index(base) + a as usize + 1;
-                } else {
-                    unsafe { fill_nil(base.add(a as usize + 1), (c as usize).saturating_sub(2)) };
-                }
-                next!()
-            }
-        }
-    };
-}
-
-math1_entry!(ff_sqrt, |x| Math1::Float(x.sqrt()), |i| Math1::Float(
-    f64::from(i).sqrt()
-));
-math1_entry!(ff_sin, |x| Math1::Float(x.sin()), |i| Math1::Float(
-    f64::from(i).sin()
-));
-math1_entry!(ff_cos, |x| Math1::Float(x.cos()), |i| Math1::Float(
-    f64::from(i).cos()
-));
-// `abs(i32::MIN)` leaves the inline range.
-math1_entry!(ff_abs, |x| Math1::Float(x.abs()), |i| i
-    .checked_abs()
-    .map_or(Math1::Miss, Math1::Small));
-// A rounded float becomes an integer when it fits inline; the boxed range is
-// left to the builtin. `as` saturates and maps NaN to 0, so the round trip
-// only holds for an integral value in i32 range (-0.0 becomes 0, as in Lua).
-math1_entry!(
-    ff_floor,
-    |x| {
-        let r = x.floor();
-        if r as i32 as f64 == r {
-            Math1::Small(r as i32)
-        } else {
-            Math1::Miss
-        }
-    },
-    |i| Math1::Small(i)
-);
-math1_entry!(
-    ff_ceil,
-    |x| {
-        let r = x.ceil();
-        if r as i32 as f64 == r {
-            Math1::Small(r as i32)
-        } else {
-            Math1::Miss
-        }
-    },
-    |i| Math1::Small(i)
-);
 
 /// Make the native frame at header `hdr` (window `hdr + 4`) wait for the
 /// call at window slot `at`, whose arguments follow it: the frame's word 0

@@ -14,6 +14,7 @@ use crate::builtin::util;
 // integer-representation and numeric-string rules (including `inf`/`nan`
 // rejection) match `tonumber`/`math.*` and don't drift.
 use crate::builtin::util::{to_integer, to_number as to_float};
+use crate::env::function::NativeKind;
 use crate::env::{
     Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Userdata, Value,
 };
@@ -28,7 +29,7 @@ use pattern::{CapValue, MatchState, PatError};
 
 /// Lua's `posrelat`: translate a possibly-negative 1-based string position into
 /// an absolute 1-based position (negatives count from the end; 0 stays 0).
-pub(super) fn posrelat(pos: i64, len: usize) -> i64 {
+pub(crate) fn posrelat(pos: i64, len: usize) -> i64 {
     if pos >= 0 {
         pos
     } else if pos.unsigned_abs() > len as u64 {
@@ -51,7 +52,6 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         ("packsize", pack::lua_packsize),
         ("rep", lua_rep),
         ("reverse", lua_reverse),
-        ("sub", lua_sub),
         ("unpack", pack::lua_unpack),
         ("upper", lua_upper),
     ];
@@ -64,6 +64,17 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         let key = Value::string(LuaString::new(ctx, name.as_bytes()));
         lib.raw_set(ctx, key, Value::function(handler));
     }
+    let sub = Function::new_native_with_entry(
+        ctx.mutation(),
+        NativeKind::Plain(lua_sub),
+        &[],
+        crate::vm::ff::ff_sub,
+    );
+    lib.raw_set(
+        ctx,
+        Value::string(LuaString::new(ctx, b"sub")),
+        Value::function(sub),
+    );
     let format = Function::new_cont(ctx.mutation(), lua_format, &[Value::userdata(fmt_buf)]);
     lib.raw_set(
         ctx,

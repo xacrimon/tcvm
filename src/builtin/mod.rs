@@ -27,7 +27,7 @@ pub use math::load as load_math;
 pub use os::load as load_os;
 pub use package::load as load_package;
 pub use string::load as load_string;
-pub(crate) use string::{gsub_cont, one_result};
+pub(crate) use string::{gsub_cont, one_result, posrelat};
 pub use table::load as load_table;
 pub(crate) use table::{sort_cont, sort_len_cont};
 pub use utf8::load as load_utf8;
