@@ -11,6 +11,7 @@ mod call_chain_limit;
 mod call_metamethod_multret;
 mod call_sugar;
 mod common;
+mod compare_loop_forms;
 mod compare_ops;
 mod compile_limits;
 mod const_locals;

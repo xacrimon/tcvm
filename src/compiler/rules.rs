@@ -799,7 +799,9 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         self.downgrade_testsets(&list);
         for idx in list.jumps {
             let offset = target as i32 - (idx as i32 + 1);
-            self.chunk.tape[idx].set_imm(offset);
+            if !self.chunk.tape[idx].set_branch_offset(offset) {
+                self.chunk.too_long = true;
+            }
         }
         if target > self.chunk.last_target {
             self.chunk.last_target = target;
@@ -893,7 +895,9 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             } else {
                 dtarget
             };
-            instr.set_imm(target as i32 - (idx as i32 + 1));
+            if !instr.set_branch_offset(target as i32 - (idx as i32 + 1)) {
+                self.chunk.too_long = true;
+            }
         }
     }
 
@@ -1770,7 +1774,12 @@ pub fn compile<'gc>(
         globals,
         assigned.clone(),
     )?;
-    Ok(chunk.assemble(ctx.mutation(), &assigned))
+    chunk
+        .assemble(ctx.mutation(), &assigned)
+        .map_err(|kind| CompileError {
+            kind,
+            line_number: LineNumber(0),
+        })
 }
 
 /// Compile a function body into a Chunk (not yet assembled).

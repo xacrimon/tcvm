@@ -1,4 +1,5 @@
 use super::rules::{Assigned, VarId};
+use crate::compiler::CompileErrorKind;
 use crate::dmm::{Gc, Mutation};
 use crate::env::function::{IcTable, LocVar, Template};
 use crate::env::{LuaString, Prototype, Value};
@@ -247,6 +248,9 @@ pub struct Chunk<'gc> {
     /// whether fall-through to the implicit RETURN is reachable from a
     /// forward jump (LuaJIT-style `lasttarget`).
     pub(super) last_target: usize,
+    /// A conditional branch's offset did not fit its 24 bits: the function
+    /// fails with "control structure too long" when it is assembled.
+    pub(super) too_long: bool,
     pub(super) source: LuaString<'gc>,
     /// Number of IC slots reserved so far. Incremented once per emitted
     /// GETFIELD/SETFIELD/GETTABUP/SETTABUP/SELF. The final count seeds the
@@ -278,6 +282,7 @@ impl<'gc> Chunk<'gc> {
             labels: Vec::new(),
             jump_patches: Vec::new(),
             last_target: 0,
+            too_long: false,
             source,
             next_ic_idx: 0,
             templates: Vec::new(),
@@ -303,7 +308,7 @@ impl<'gc> Chunk<'gc> {
         mut self,
         mc: &Mutation<'gc>,
         assigned: &Assigned,
-    ) -> Gc<'gc, Prototype<'gc>> {
+    ) -> Result<Gc<'gc, Prototype<'gc>>, CompileErrorKind> {
         // Resolve all jump patches
         for &(instr_idx, label_idx) in &self.jump_patches {
             let target = self.labels[label_idx as usize];
@@ -316,7 +321,12 @@ impl<'gc> Chunk<'gc> {
                 ) || instr.op().branch_sense().is_some(),
                 "jump patch on non-jump instruction: {instr:?}"
             );
-            instr.set_imm(offset);
+            if !instr.set_branch_offset(offset) {
+                self.too_long = true;
+            }
+        }
+        if self.too_long {
+            return Err(CompileErrorKind::ControlTooLong);
         }
 
         let upvalue_desc: Box<[UpValueDescriptor]> = self
@@ -370,9 +380,10 @@ impl<'gc> Chunk<'gc> {
             .prototypes
             .into_iter()
             .map(|child| child.assemble(mc, assigned))
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?
+            .into_boxed_slice();
 
-        Gc::new(
+        Ok(Gc::new(
             mc,
             Prototype {
                 code: crate::env::function::Code::new(self.tape.into_boxed_slice()),
@@ -393,6 +404,6 @@ impl<'gc> Chunk<'gc> {
                 ic_table: IcTable::new(self.next_ic_idx as usize),
                 templates: self.templates.into_boxed_slice(),
             },
-        )
+        ))
     }
 }

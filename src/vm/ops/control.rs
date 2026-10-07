@@ -150,6 +150,24 @@ macro_rules! tfor_finish {
     }};
 }
 
+/// Rewrite the FORLOOP a FORPREP at `pc - 1` guards (the instruction before
+/// its jump target) to `form` when it is not that already. Only on a
+/// change: a store to a word dispatch loads a few instructions later stalls
+/// every loop start (queen 1.06).
+#[inline(always)]
+fn write_forloop_form(pc: *const Instruction, offset: i32, form: Op) {
+    // SAFETY: `Code` keeps instructions in cells; the FORPREP's target is
+    // the instruction after its FORLOOP.
+    unsafe {
+        let site = pc.offset(offset as isize - 1).cast_mut();
+        let word = *site;
+        debug_assert_eq!(word.generic_op(), Op::FORLOOP);
+        if word.op() != form {
+            site.write(word.with_op(form));
+        }
+    }
+}
+
 handler! {
     bind(insn, pc, base, rt, closure, thread, nret, values);
 
@@ -198,6 +216,12 @@ handler! {
                     reg![a + 1] = Value::integer(mc, s);
                     reg![a + 2] = Value::integer(mc, i);
                     reg![a + 3] = Value::integer(mc, i);
+                    // The loop's FORLOOP takes the integer form when every
+                    // value it compares is small.
+                    let all_small = i32::try_from(last).is_ok()
+                        && i32::try_from(s).is_ok()
+                        && i32::try_from(i).is_ok();
+                    write_forloop_form(pc, offset, if all_small { Op::FORLOOP_I } else { Op::FORLOOP });
                     false
                 }
             }
@@ -222,14 +246,56 @@ handler! {
                 reg![a + 1] = Value::float(s);
                 reg![a + 2] = Value::float(i);
                 reg![a + 3] = Value::float(i);
+                write_forloop_form(pc, offset, Op::FORLOOP_F);
             }
             skip
         };
         branch!(skip, offset)
     }
 
+    /// `FORLOOP_I`: the integer loop whose last value, step and control
+    /// variable are all small; anything else (`debug.setlocal` on the
+    /// hidden slots) goes to the generic FORLOOP.
+    op fn op_forloop_i {
+        let (a, offset) = insn.a_imm();
+        let step = &reg![a + 1];
+        let Some(s) = step.get_small() else {
+            tail!(op_forloop)
+        };
+        let Some((last, idx)) = Value::both_small(&reg![a], &reg![a + 2]) else {
+            tail!(op_forloop)
+        };
+        let go = idx != last;
+        if go {
+            let idx = Value::small(idx.wrapping_add(s));
+            reg![a + 2] = idx;
+            reg![a + 3] = idx;
+        }
+        branch!(go, offset)
+    }
+
+    /// `FORLOOP_F`: the float loop.
+    op fn op_forloop_f {
+        let (a, offset) = insn.a_imm();
+        let step = &reg![a + 1];
+        if !step.is_float() {
+            tail!(op_forloop)
+        }
+        let s = step.read_float();
+        let lim = reg![a].read_float();
+        let idx = reg![a + 2].read_float() + s;
+        let go = if 0.0 < s { idx <= lim } else { lim <= idx };
+        if go {
+            let idx = Value::float(idx);
+            reg![a + 2] = idx;
+            reg![a + 3] = idx;
+        }
+        branch!(go, offset)
+    }
+
     /// Numeric for step: advance the control variable and jump back while
-    /// iterations remain, reading the layout FORPREP leaves behind.
+    /// iterations remain, reading the layout FORPREP leaves behind. The
+    /// generic form, for a loop with boxed values and for the forms' misses.
     op fn op_forloop {
         let (a, offset) = insn.a_imm();
         // The step's type tells the loop kind, and the hidden slots match it:
@@ -300,15 +366,27 @@ handler! {
         // Decided once per loop, as LuaJIT's `ISNEXT` does: the iterator and
         // state are hidden, so only `debug.setlocal` can change them.
         let (iter, state) = (reg![a], reg![a + 1]);
-        reg![a + 3] = if state.get_table().is_none() {
-            Value::nil()
+        let (pos, form) = if state.get_table().is_none() {
+            (Value::nil(), Op::TFORCALL)
         } else if iter.same_bits(&Value::function(rt.next_fn())) && control.is_nil() {
-            Value::small(0)
+            (Value::small(0), Op::TFORCALL_NEXT)
         } else if iter.same_bits(&Value::function(rt.ipairs_iter())) {
-            Value::small(TFOR_IPAIRS)
+            (Value::small(TFOR_IPAIRS), Op::TFORCALL_IPAIRS)
         } else {
-            Value::nil()
+            (Value::nil(), Op::TFORCALL)
         };
+        reg![a + 3] = pos;
+        // The TFORCALL this jumps to takes the matching form, written
+        // only on a change: a store to a word dispatch is about to load
+        // stalls every loop start.
+        unsafe {
+            let site = pc.offset(offset as isize).cast_mut();
+            let word = *site;
+            debug_assert_eq!(word.generic_op(), Op::TFORCALL);
+            if word.op() != form {
+                site.write(word.with_op(form));
+            }
+        }
         if !closing.is_falsy() {
             if rt.mm_of(closing, MetamethodBits::CLOSE).is_nil() {
                 raise!(OpError::NonClosable(a + 2))
@@ -320,6 +398,58 @@ handler! {
         }
         jump_by!(offset);
         next!()
+    }
+
+    /// `TFORCALL_NEXT`: the `next` step over a table, kept at the position
+    /// `R[a+3]`; anything else goes to the generic TFORCALL.
+    op fn op_tforcall_next {
+        let (a, count) = insn.ab();
+        let vars = a + TFOR_VARS;
+        let Some(t) = reg![a + 1].get_table() else {
+            tail!(op_tforcall)
+        };
+        let Some(pos) = reg![a + 3].get_small().filter(|&p| p >= 0) else {
+            tail!(op_tforcall)
+        };
+        let step = match t.inner().borrow().next_at_inline(pos as u32) {
+            Step::Entry(next, k, v) => {
+                reg![a + 3] = Value::small(next as i32);
+                Some((k, v))
+            }
+            Step::End => None,
+            Step::Slow => tail!(tfor_next),
+        };
+        tfor_finish!(pc, base, step, vars, count)
+    }
+
+    /// `TFORCALL_IPAIRS`: the `ipairs` step through the array part.
+    op fn op_tforcall_ipairs {
+        let (a, count) = insn.ab();
+        let vars = a + TFOR_VARS;
+        let Some(t) = reg![a + 1].get_table() else {
+            tail!(op_tforcall)
+        };
+        if reg![a + 3].get_small() != Some(TFOR_IPAIRS) {
+            tail!(op_tforcall)
+        }
+        let Some(i) = reg![vars].get_small() else {
+            tail!(op_tforcall)
+        };
+        let state = t.inner().borrow();
+        let step = match i.checked_add(1) {
+            Some(k)
+                if let Some(v) = state.array_get(k as usize)
+                    && !v.is_nil() =>
+            {
+                Some((Value::small(k), v))
+            }
+            _ => {
+                drop(state);
+                tail!(tfor_ipairs)
+            }
+        };
+        drop(state);
+        tfor_finish!(pc, base, step, vars, count)
     }
 
     /// Generic for call: the loop variables = `R[a](R[a+1], first variable)`.

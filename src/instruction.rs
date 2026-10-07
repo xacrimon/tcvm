@@ -195,12 +195,15 @@ const C_SHIFT: u32 = 24;
 const D_SHIFT: u32 = 32;
 const E_SHIFT: u32 = 48;
 const IMM_SHIFT: u32 = 32;
+/// The 24-bit branch offset of an `AhImm` word.
+const IMM24_SHIFT: u32 = 40;
 
 /// Packers, one per [`Shape`]. Named to match the shape so the table can
 /// select one by pasting the shape token.
 pub mod shape {
     use super::{
-        A_SHIFT, B_SHIFT, C_SHIFT, D_SHIFT, E_SHIFT, H_SHIFT, IMM_SHIFT, Instruction, Op, Operand,
+        A_SHIFT, B_SHIFT, C_SHIFT, D_SHIFT, E_SHIFT, H_SHIFT, IMM_SHIFT, IMM24_SHIFT, Instruction,
+        Op, Operand,
     };
 
     #[inline(always)]
@@ -321,13 +324,16 @@ pub mod shape {
     }
 
     impl AhImm {
+        /// The branch offset is 24 bits here (`IMM24_SHIFT`): bits 32..34
+        /// hold the site's adaptive bits.
         #[inline(always)]
         pub fn pack(op: Op, a: impl Operand, h: impl Operand, imm: impl Operand) -> Instruction {
+            debug_assert!(Instruction::fits_imm24(imm.bits() as u32 as i32));
             Instruction(
                 op as u64
                     | slot8(a.bits()) << A_SHIFT
                     | slot16(h.bits()) << H_SHIFT
-                    | (imm.bits() & 0xffff_ffff) << IMM_SHIFT,
+                    | (imm.bits() & 0xff_ffff) << IMM24_SHIFT,
             )
         }
     }
@@ -429,6 +435,27 @@ impl Instruction {
     #[inline(always)]
     pub fn imm(self) -> i32 {
         (self.0 >> IMM_SHIFT) as u32 as i32
+    }
+
+    /// The branch offset of an `AhImm` word: 24 bits, sign-extended.
+    #[inline(always)]
+    pub fn imm24(self) -> i32 {
+        ((self.0 as i64) >> IMM24_SHIFT) as i32
+    }
+
+    /// Whether `v` fits an `AhImm` branch offset.
+    pub const fn fits_imm24(v: i32) -> bool {
+        v >= -(1 << 23) && v < (1 << 23)
+    }
+
+    /// The branch offset of this word, whichever shape it has.
+    #[inline(always)]
+    pub fn branch_offset(self) -> i32 {
+        if self.op().shape() == Shape::AhImm {
+            self.imm24()
+        } else {
+            self.imm()
+        }
     }
 
     /// The packed [`Imm`] of an immediate-operand opcode.
@@ -556,7 +583,7 @@ impl Instruction {
     #[inline(always)]
     pub fn ah_imm(self) -> (u8, u16, i32) {
         self.expect(Shape::AhImm);
-        (self.a(), self.h(), self.imm())
+        (self.a(), self.h(), self.imm24())
     }
 
     // --- slot writes ------------------------------------------------------
@@ -599,6 +626,28 @@ impl Instruction {
     pub fn set_imm(&mut self, v: i32) {
         self.set_slot(IMM_SHIFT, 0xffff_ffff, v as u32 as u64);
     }
+
+    /// Set the 24-bit branch offset of an `AhImm` word.
+    #[inline(always)]
+    pub fn set_imm24(&mut self, v: i32) {
+        debug_assert!(Self::fits_imm24(v));
+        self.set_slot(IMM24_SHIFT, 0xff_ffff, v as u32 as u64);
+    }
+
+    /// Set this branch's offset by its shape; `false` when it does not fit
+    /// (an `AhImm` offset is 24 bits).
+    #[must_use]
+    pub fn set_branch_offset(&mut self, v: i32) -> bool {
+        if self.op().shape() == Shape::AhImm {
+            if !Self::fits_imm24(v) {
+                return false;
+            }
+            self.set_imm24(v);
+        } else {
+            self.set_imm(v);
+        }
+        true
+    }
 }
 
 impl fmt::Debug for Instruction {
@@ -622,7 +671,7 @@ impl fmt::Debug for Instruction {
             ),
             Shape::AImm => write!(f, "(a={}, imm={})", self.a(), self.imm()),
             Shape::AbImm => write!(f, "(a={}, b={}, imm={})", self.a(), self.b(), self.imm()),
-            Shape::AhImm => write!(f, "(a={}, h={}, imm={})", self.a(), self.h(), self.imm()),
+            Shape::AhImm => write!(f, "(a={}, h={}, imm={})", self.a(), self.h(), self.imm24()),
             Shape::AbcImm => write!(
                 f,
                 "(a={}, b={}, c={}, imm={:?})",
@@ -994,6 +1043,29 @@ instructions! {
     0xb4 POW_NN       pow_nn      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
     0xb5 DIV_NN       div_nn      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
     0xb6 IDIV_NN      idiv_nn     Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+
+    // Compares: both small for the register forms, a float register
+    // for the immediate ones.
+    0xb7 JLT_II       jlt_ii      AbImm  { lhs: Reg, rhs: Reg, offset: i32 }
+    0xb8 JNLT_II      jnlt_ii     AbImm  { lhs: Reg, rhs: Reg, offset: i32 }
+    0xb9 JLE_II       jle_ii      AbImm  { lhs: Reg, rhs: Reg, offset: i32 }
+    0xba JNLE_II      jnle_ii     AbImm  { lhs: Reg, rhs: Reg, offset: i32 }
+    0xbb JEQ_II       jeq_ii      AbImm  { lhs: Reg, rhs: Reg, offset: i32 }
+    0xbc JNEQ_II      jneq_ii     AbImm  { lhs: Reg, rhs: Reg, offset: i32 }
+    0xbd JLTI_F       jlti_f      AhImm  { src: Reg, imm: CmpImm, offset: i32 }
+    0xbe JNLTI_F      jnlti_f     AhImm  { src: Reg, imm: CmpImm, offset: i32 }
+    0xbf JLEI_F       jlei_f      AhImm  { src: Reg, imm: CmpImm, offset: i32 }
+    0xc0 JNLEI_F      jnlei_f     AhImm  { src: Reg, imm: CmpImm, offset: i32 }
+    0xc1 JGTI_F       jgti_f      AhImm  { src: Reg, imm: CmpImm, offset: i32 }
+    0xc2 JNGTI_F      jngti_f     AhImm  { src: Reg, imm: CmpImm, offset: i32 }
+    0xc3 JGEI_F       jgei_f      AhImm  { src: Reg, imm: CmpImm, offset: i32 }
+    0xc4 JNGEI_F      jngei_f     AhImm  { src: Reg, imm: CmpImm, offset: i32 }
+
+    // Loops: written by the prep instruction, guarded, no counter.
+    0xc5 FORLOOP_I    forloop_i   AImm   { base: Reg, offset: i32 }
+    0xc6 FORLOOP_F    forloop_f   AImm   { base: Reg, offset: i32 }
+    0xc7 TFORCALL_NEXT   tforcall_next   Ab { base: Reg, count: u8 }
+    0xc8 TFORCALL_IPAIRS tforcall_ipairs Ab { base: Reg, count: u8 }
 }
 
 /// The polymorphic family an opcode belongs to.
@@ -1006,6 +1078,12 @@ pub enum Family {
     ImmBit,
     /// Constant-key table access, specialized by the inline-cache fill.
     Field,
+    /// Register compares and equality (`JLT`...), forms `[II, -, -, -, -]`.
+    CmpReg,
+    /// Immediate compares (`JLTI`...), forms `[-, F, -, -, -]`.
+    CmpImm,
+    /// Loop steps, specialized by their prep instruction.
+    Loop,
 }
 
 /// The operation of an arithmetic or bitwise opcode, generic or specialized.
@@ -1049,6 +1127,11 @@ pub struct OpInfo {
 pub const ADAPTIVE_ABC: u8 = 32;
 /// Adaptive bits of an `AbcImm` site: `c` bits 1..3, beside `flipped`.
 pub const ADAPTIVE_ABC_IMM: u8 = 25;
+/// Adaptive bits of an `AbImm` compare site: the `c` byte.
+pub const ADAPTIVE_AB_IMM: u8 = 24;
+/// Adaptive bits of an `AhImm` compare site: bits 32..34, below the 24-bit
+/// offset.
+pub const ADAPTIVE_AH_IMM: u8 = 32;
 
 /// Misses at which a site locks to its generic opcode.
 pub const MISSES_TO_LOCK: u8 = 3;
@@ -1630,6 +1713,206 @@ const fn op_info(op: Op) -> OpInfo {
             generic: Op::IDIV,
             ..op_info(Op::IDIV)
         },
+        Op::JLT => OpInfo {
+            generic: Op::JLT,
+            family: Family::CmpReg,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_AB_IMM,
+            forms: [Some(Op::JLT_II), None, None, None, None],
+        },
+        Op::JLT_II => OpInfo {
+            generic: Op::JLT,
+            ..op_info(Op::JLT)
+        },
+        Op::JNLT => OpInfo {
+            generic: Op::JNLT,
+            family: Family::CmpReg,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_AB_IMM,
+            forms: [Some(Op::JNLT_II), None, None, None, None],
+        },
+        Op::JNLT_II => OpInfo {
+            generic: Op::JNLT,
+            ..op_info(Op::JNLT)
+        },
+        Op::JLE => OpInfo {
+            generic: Op::JLE,
+            family: Family::CmpReg,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_AB_IMM,
+            forms: [Some(Op::JLE_II), None, None, None, None],
+        },
+        Op::JLE_II => OpInfo {
+            generic: Op::JLE,
+            ..op_info(Op::JLE)
+        },
+        Op::JNLE => OpInfo {
+            generic: Op::JNLE,
+            family: Family::CmpReg,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_AB_IMM,
+            forms: [Some(Op::JNLE_II), None, None, None, None],
+        },
+        Op::JNLE_II => OpInfo {
+            generic: Op::JNLE,
+            ..op_info(Op::JNLE)
+        },
+        Op::JEQ => OpInfo {
+            generic: Op::JEQ,
+            family: Family::CmpReg,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_AB_IMM,
+            forms: [Some(Op::JEQ_II), None, None, None, None],
+        },
+        Op::JEQ_II => OpInfo {
+            generic: Op::JEQ,
+            ..op_info(Op::JEQ)
+        },
+        Op::JNEQ => OpInfo {
+            generic: Op::JNEQ,
+            family: Family::CmpReg,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_AB_IMM,
+            forms: [Some(Op::JNEQ_II), None, None, None, None],
+        },
+        Op::JNEQ_II => OpInfo {
+            generic: Op::JNEQ,
+            ..op_info(Op::JNEQ)
+        },
+        Op::JLTI => OpInfo {
+            generic: Op::JLTI,
+            family: Family::CmpImm,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_AH_IMM,
+            forms: [None, Some(Op::JLTI_F), None, None, None],
+        },
+        Op::JLTI_F => OpInfo {
+            generic: Op::JLTI,
+            ..op_info(Op::JLTI)
+        },
+        Op::JNLTI => OpInfo {
+            generic: Op::JNLTI,
+            family: Family::CmpImm,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_AH_IMM,
+            forms: [None, Some(Op::JNLTI_F), None, None, None],
+        },
+        Op::JNLTI_F => OpInfo {
+            generic: Op::JNLTI,
+            ..op_info(Op::JNLTI)
+        },
+        Op::JLEI => OpInfo {
+            generic: Op::JLEI,
+            family: Family::CmpImm,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_AH_IMM,
+            forms: [None, Some(Op::JLEI_F), None, None, None],
+        },
+        Op::JLEI_F => OpInfo {
+            generic: Op::JLEI,
+            ..op_info(Op::JLEI)
+        },
+        Op::JNLEI => OpInfo {
+            generic: Op::JNLEI,
+            family: Family::CmpImm,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_AH_IMM,
+            forms: [None, Some(Op::JNLEI_F), None, None, None],
+        },
+        Op::JNLEI_F => OpInfo {
+            generic: Op::JNLEI,
+            ..op_info(Op::JNLEI)
+        },
+        Op::JGTI => OpInfo {
+            generic: Op::JGTI,
+            family: Family::CmpImm,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_AH_IMM,
+            forms: [None, Some(Op::JGTI_F), None, None, None],
+        },
+        Op::JGTI_F => OpInfo {
+            generic: Op::JGTI,
+            ..op_info(Op::JGTI)
+        },
+        Op::JNGTI => OpInfo {
+            generic: Op::JNGTI,
+            family: Family::CmpImm,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_AH_IMM,
+            forms: [None, Some(Op::JNGTI_F), None, None, None],
+        },
+        Op::JNGTI_F => OpInfo {
+            generic: Op::JNGTI,
+            ..op_info(Op::JNGTI)
+        },
+        Op::JGEI => OpInfo {
+            generic: Op::JGEI,
+            family: Family::CmpImm,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_AH_IMM,
+            forms: [None, Some(Op::JGEI_F), None, None, None],
+        },
+        Op::JGEI_F => OpInfo {
+            generic: Op::JGEI,
+            ..op_info(Op::JGEI)
+        },
+        Op::JNGEI => OpInfo {
+            generic: Op::JNGEI,
+            family: Family::CmpImm,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: ADAPTIVE_AH_IMM,
+            forms: [None, Some(Op::JNGEI_F), None, None, None],
+        },
+        Op::JNGEI_F => OpInfo {
+            generic: Op::JNGEI,
+            ..op_info(Op::JNGEI)
+        },
+        Op::FORLOOP_I => OpInfo {
+            generic: Op::FORLOOP,
+            family: Family::Loop,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: 0,
+            forms: [None; 5],
+        },
+        Op::FORLOOP_F => OpInfo {
+            generic: Op::FORLOOP,
+            family: Family::Loop,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: 0,
+            forms: [None; 5],
+        },
+        Op::TFORCALL_NEXT => OpInfo {
+            generic: Op::TFORCALL,
+            family: Family::Loop,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: 0,
+            forms: [None; 5],
+        },
+        Op::TFORCALL_IPAIRS => OpInfo {
+            generic: Op::TFORCALL,
+            family: Family::Loop,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: 0,
+            forms: [None; 5],
+        },
         Op::ARITH_MM | Op::ARITH_MM_R => OpInfo {
             generic: Op::ARITH_MM,
             family: Family::RegArith,
@@ -1962,6 +2245,7 @@ impl Instruction {
 
     /// This instruction as the compiler emitted it: the generic opcode, no
     /// adaptive bits, no recorded original.
+    #[inline(always)]
     pub fn unquickened(self) -> Self {
         let generic = self.generic_op();
         let mut i = match self.op() {
@@ -2055,8 +2339,15 @@ mod tests {
         assert_eq!(i.imm_int(), -7);
 
         let k = CmpImm::from_int(-7).unwrap();
-        let i = Instruction::jlti(Reg(3), k, i32::MIN);
-        assert_eq!(i.ah_imm(), (3, k.0, i32::MIN));
+        // An `AhImm` offset is 24 bits.
+        let i = Instruction::jlti(Reg(3), k, -(1 << 23));
+        assert_eq!(i.ah_imm(), (3, k.0, -(1 << 23)));
+        let mut i = Instruction::jlti(Reg(3), k, 5);
+        assert!(i.set_branch_offset((1 << 23) - 1));
+        assert_eq!(i.ah_imm(), (3, k.0, (1 << 23) - 1));
+        assert!(!i.set_branch_offset(1 << 23));
+        assert_eq!(i.with_adaptive(2, true).adaptive(), (2, true));
+        assert_eq!(i.with_adaptive(2, true).ah_imm(), (3, k.0, (1 << 23) - 1));
         assert_eq!(i.cmp_imm(), k);
         assert_eq!(i.cmp_imm_int(), -7);
 
