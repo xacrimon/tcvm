@@ -62,7 +62,10 @@ handler! {
         let (src, idx) = insn.ab();
         let v = reg![src];
         let cell = upval!(cell idx);
-        UpvalueCell::set(cell, rt.mutation(), thread!().handle(), v);
+        if let Some(target) = UpvalueCell::barrier_target(cell, thread!().handle()) {
+            barrier!(target);
+        }
+        unsafe { UpvalueCell::set_barriered(cell, v) };
         next!()
     }
 }

@@ -852,46 +852,51 @@ instructions! {
     0x5a RETURN0    ret0        Nil   { }
     0x5b RETURN1    ret1        A     { value: Reg }
 
-    // --- quickened forms ------------------------------------------------
+    // --- constant-key table forms --------------------------------------------
     //
-    // Never emitted: the interpreter rewrites a table access to the form for
-    // the kind of entry its inline cache holds once it fills it (`_OWN` an own
-    // slot, `_ABSENT` a key the shape lacks, `_PROTO` a slot in the
-    // `__index` table, `_TRANS` an added key), and back on a miss. Same
-    // operands as the generic form.
+    // Never emitted: the generic handler fills the site's inline cache and
+    // rewrites the site to the form for what the entry holds: an own slot in
+    // the table's cell (`_INL`) or its spill cell (`_AUX`), a key the shape
+    // lacks (`_ABSENT`), a slot in the `__index` table (`_PROTO`), an added
+    // key (`_TRANS`). Same operands as the generic form; `c` counts refills.
 
-    0x5c GETFIELD_OWN    getfield_own    Abde { dst: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x5d GETFIELD_ABSENT getfield_absent Abde { dst: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x5e GETFIELD_PROTO  getfield_proto  Abde { dst: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x5f GETTABUP_OWN    gettabup_own    Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
-    0x60 GETTABUP_ABSENT gettabup_absent Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
-    0x61 GETTABUP_PROTO  gettabup_proto  Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
-    0x62 SELF_OWN        self_own        Abde { dst: Reg, object: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x63 SELF_ABSENT     self_absent     Abde { dst: Reg, object: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x64 SELF_PROTO      self_proto      Abde { dst: Reg, object: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x65 SETFIELD_OWN    setfield_own    Abde { src: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x66 SETFIELD_TRANS  setfield_trans  Abde { src: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x67 SETTABUP_OWN    settabup_own    Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
-    0x68 SETTABUP_TRANS  settabup_trans  Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
-    0x69 SETFIELD_ABSENT setfield_absent Abde { src: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x6a SETTABUP_ABSENT settabup_absent Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+    0x5c GETFIELD_INL     getfield_inl    Abde { dst: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x5d GETFIELD_AUX     getfield_aux    Abde { dst: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x5e GETFIELD_ABSENT  getfield_absent Abde { dst: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x5f GETFIELD_PROTO   getfield_proto  Abde { dst: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x60 GETTABUP_INL     gettabup_inl    Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+    0x61 GETTABUP_AUX     gettabup_aux    Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+    0x62 GETTABUP_ABSENT  gettabup_absent Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+    0x63 GETTABUP_PROTO   gettabup_proto  Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+    0x64 SELF_INL         self_inl        Abde { dst: Reg, object: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x65 SELF_AUX         self_aux        Abde { dst: Reg, object: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x66 SELF_ABSENT      self_absent     Abde { dst: Reg, object: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x67 SELF_PROTO       self_proto      Abde { dst: Reg, object: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x68 SETFIELD_INL     setfield_inl    Abde { src: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x69 SETFIELD_AUX     setfield_aux    Abde { src: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x6a SETFIELD_TRANS   setfield_trans  Abde { src: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x6b SETFIELD_ABSENT  setfield_absent Abde { src: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x6c SETTABUP_INL     settabup_inl    Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+    0x6d SETTABUP_AUX     settabup_aux    Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+    0x6e SETTABUP_TRANS   settabup_trans  Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+    0x6f SETTABUP_ABSENT  settabup_absent Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
 
     // --- shared-cell upvalue forms ------------------------------------------
     //
     // Never emitted: the assembler rewrites GETUPVAL, GETTABUP and SETTABUP
     // to these for an upvalue that is not by value. Not quickened.
 
-    0x6b GETUPVAL_REF getupval_ref Ab   { dst: Reg, idx: UpIdx }
-    0x6c GETTABUP_REF gettabup_ref Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
-    0x6d SETTABUP_REF settabup_ref Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+    0x70 GETUPVAL_REF getupval_ref Ab   { dst: Reg, idx: UpIdx }
+    0x71 GETTABUP_REF gettabup_ref Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+    0x72 SETTABUP_REF settabup_ref Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
 
     // --- CALL by result count -----------------------------------------------
     //
     // A CALL wanting no result (`returns` 1) or one (`returns` 2), whose
     // continuation is a constant. `returns` stays for the generic paths.
 
-    0x6e CALL_R0    call_r0     Abc   { func: Reg, args: u8, returns: u8 }
-    0x6f CALL_R1    call_r1     Abc   { func: Reg, args: u8, returns: u8 }
+    0x73 CALL_R0    call_r0     Abc   { func: Reg, args: u8, returns: u8 }
+    0x74 CALL_R1    call_r1     Abc   { func: Reg, args: u8, returns: u8 }
 
     // --- adaptive arithmetic -------------------------------------------------
     //
@@ -904,91 +909,91 @@ instructions! {
 
     /// A register-form binary op whose `lhs` is a table with the metamethod;
     /// the original opcode is in `e`'s low byte.
-    0x70 ARITH_MM     arith_mm    Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x75 ARITH_MM     arith_mm    Abc    { dst: Reg, lhs: Reg, rhs: Reg }
     /// As `ARITH_MM`, the metamethod from `rhs`, a table, and `lhs` a number.
-    0x71 ARITH_MM_R   arith_mm_r  Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x76 ARITH_MM_R   arith_mm_r  Abc    { dst: Reg, lhs: Reg, rhs: Reg }
     /// An immediate-form op whose register operand is a table with the
     /// metamethod: `c` bits 4..7 index `IMM_ARITH_OPS` for the original opcode.
-    0x72 ARITH_MMI    arith_mmi   AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x77 ARITH_MMI    arith_mmi   AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
 
     /// `R[dst] = imm`, a small integer, and `R[dst .. dst+count) = nil`.
-    0x73 LOADI        loadi       AImm   { dst: Reg, imm: i32 }
-    0x74 LOADNIL      loadnil     Ab     { dst: Reg, count: u8 }
+    0x78 LOADI        loadi       AImm   { dst: Reg, imm: i32 }
+    0x79 LOADNIL      loadnil     Ab     { dst: Reg, count: u8 }
 
     // Register arithmetic: both small, both float, small/float, float/small.
-    0x75 ADD_II       add_ii      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0x76 SUB_II       sub_ii      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0x77 MUL_II       mul_ii      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0x78 MOD_II       mod_ii      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0x79 IDIV_II      idiv_ii     Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0x7a DIV_II       div_ii      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0x7b ADD_FF       add_ff      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0x7c SUB_FF       sub_ff      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0x7d MUL_FF       mul_ff      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0x7e MOD_FF       mod_ff      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0x7f POW_FF       pow_ff      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0x80 DIV_FF       div_ff      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0x81 IDIV_FF      idiv_ff     Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0x82 ADD_IF       add_if      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0x83 SUB_IF       sub_if      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0x84 MUL_IF       mul_if      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0x85 DIV_IF       div_if      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0x86 ADD_FI       add_fi      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0x87 SUB_FI       sub_fi      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0x88 MUL_FI       mul_fi      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0x89 DIV_FI       div_fi      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x7a ADD_II       add_ii      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x7b SUB_II       sub_ii      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x7c MUL_II       mul_ii      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x7d MOD_II       mod_ii      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x7e IDIV_II      idiv_ii     Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x7f DIV_II       div_ii      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x80 ADD_FF       add_ff      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x81 SUB_FF       sub_ff      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x82 MUL_FF       mul_ff      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x83 MOD_FF       mod_ff      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x84 POW_FF       pow_ff      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x85 DIV_FF       div_ff      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x86 IDIV_FF      idiv_ff     Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x87 ADD_IF       add_if      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x88 SUB_IF       sub_if      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x89 MUL_IF       mul_if      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x8a DIV_IF       div_if      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x8b ADD_FI       add_fi      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x8c SUB_FI       sub_fi      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x8d MUL_FI       mul_fi      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x8e DIV_FI       div_fi      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
 
     // Register bitwise: both small.
-    0x8a BAND_II      band_ii     Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0x8b BOR_II       bor_ii      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0x8c BXOR_II      bxor_ii     Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0x8d SHL_II       shl_ii      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0x8e SHR_II       shr_ii      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x8f BAND_II      band_ii     Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x90 BOR_II       bor_ii      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x91 BXOR_II      bxor_ii     Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x92 SHL_II       shl_ii      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0x93 SHR_II       shr_ii      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
 
     // Immediate arithmetic: small register with an integer immediate (`_I`),
     // float register (`_F`), small register with a float result (`_IF`).
-    0x8f ADDI_I       addi_i      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x90 SUBI_I       subi_i      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x91 MULI_I       muli_i      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x92 MODI_I       modi_i      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x93 IDIVI_I      idivi_i     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x94 RSUBI_I      rsubi_i     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x95 ADDI_F       addi_f      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x96 SUBI_F       subi_f      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x97 MULI_F       muli_f      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x98 MODI_F       modi_f      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x99 IDIVI_F      idivi_f     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x9a RSUBI_F      rsubi_f     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x9b POWI_F       powi_f      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x9c DIVI_F       divi_f      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x9d RDIVI_F      rdivi_f     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x9e ADDI_IF      addi_if     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0x9f SUBI_IF      subi_if     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0xa0 MULI_IF      muli_if     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0xa1 DIVI_IF      divi_if     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0xa2 RDIVI_IF     rdivi_if    AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x94 ADDI_I       addi_i      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x95 SUBI_I       subi_i      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x96 MULI_I       muli_i      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x97 MODI_I       modi_i      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x98 IDIVI_I      idivi_i     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x99 RSUBI_I      rsubi_i     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x9a ADDI_F       addi_f      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x9b SUBI_F       subi_f      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x9c MULI_F       muli_f      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x9d MODI_F       modi_f      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x9e IDIVI_F      idivi_f     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0x9f RSUBI_F      rsubi_f     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0xa0 POWI_F       powi_f      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0xa1 DIVI_F       divi_f      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0xa2 RDIVI_F      rdivi_f     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0xa3 ADDI_IF      addi_if     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0xa4 SUBI_IF      subi_if     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0xa5 MULI_IF      muli_if     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0xa6 DIVI_IF      divi_if     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0xa7 RDIVI_IF     rdivi_if    AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
 
     // Immediate bitwise: small register.
-    0xa3 BANDI_I      bandi_i     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0xa4 BORI_I       bori_i      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0xa5 BXORI_I      bxori_i     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0xa6 SHLI_I       shli_i      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0xa7 SHRI_I       shri_i      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0xa8 BANDI_I      bandi_i     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0xa9 BORI_I       bori_i      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0xaa BXORI_I      bxori_i     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0xab SHLI_I       shli_i      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0xac SHRI_I       shri_i      AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
 
     // Power with small integers has a float result: forms beyond section 12.3.
-    0xa8 POW_II       pow_ii      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0xa9 POWI_IF      powi_if     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
-    0xaa RPOWI_IF     rpowi_if    AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0xad POW_II       pow_ii      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0xae POWI_IF      powi_if     AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+    0xaf RPOWI_IF     rpowi_if    AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
 
     // Any inline numbers, int-int with an integer result: what a register
     // site whose operand kinds keep changing takes instead of locking.
-    0xab ADD_NN       add_nn      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0xac SUB_NN       sub_nn      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0xad MUL_NN       mul_nn      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0xae MOD_NN       mod_nn      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0xaf POW_NN       pow_nn      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0xb0 DIV_NN       div_nn      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
-    0xb1 IDIV_NN      idiv_nn     Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0xb0 ADD_NN       add_nn      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0xb1 SUB_NN       sub_nn      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0xb2 MUL_NN       mul_nn      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0xb3 MOD_NN       mod_nn      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0xb4 POW_NN       pow_nn      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0xb5 DIV_NN       div_nn      Abc    { dst: Reg, lhs: Reg, rhs: Reg }
+    0xb6 IDIV_NN      idiv_nn     Abc    { dst: Reg, lhs: Reg, rhs: Reg }
 }
 
 /// The polymorphic family an opcode belongs to.
@@ -1641,7 +1646,15 @@ const fn op_info(op: Op) -> OpInfo {
             adaptive_shift: ADAPTIVE_ABC_IMM,
             forms: [None; 5],
         },
-        Op::GETFIELD_OWN => OpInfo {
+        Op::GETFIELD_INL => OpInfo {
+            generic: Op::GETFIELD,
+            family: Family::Field,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: 0,
+            forms: [None; 5],
+        },
+        Op::GETFIELD_AUX => OpInfo {
             generic: Op::GETFIELD,
             family: Family::Field,
             kind: ArithKind::None,
@@ -1665,7 +1678,15 @@ const fn op_info(op: Op) -> OpInfo {
             adaptive_shift: 0,
             forms: [None; 5],
         },
-        Op::GETTABUP_OWN => OpInfo {
+        Op::GETTABUP_INL => OpInfo {
+            generic: Op::GETTABUP,
+            family: Family::Field,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: 0,
+            forms: [None; 5],
+        },
+        Op::GETTABUP_AUX => OpInfo {
             generic: Op::GETTABUP,
             family: Family::Field,
             kind: ArithKind::None,
@@ -1689,7 +1710,15 @@ const fn op_info(op: Op) -> OpInfo {
             adaptive_shift: 0,
             forms: [None; 5],
         },
-        Op::SELF_OWN => OpInfo {
+        Op::SELF_INL => OpInfo {
+            generic: Op::SELF,
+            family: Family::Field,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: 0,
+            forms: [None; 5],
+        },
+        Op::SELF_AUX => OpInfo {
             generic: Op::SELF,
             family: Family::Field,
             kind: ArithKind::None,
@@ -1713,7 +1742,15 @@ const fn op_info(op: Op) -> OpInfo {
             adaptive_shift: 0,
             forms: [None; 5],
         },
-        Op::SETFIELD_OWN => OpInfo {
+        Op::SETFIELD_INL => OpInfo {
+            generic: Op::SETFIELD,
+            family: Family::Field,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: 0,
+            forms: [None; 5],
+        },
+        Op::SETFIELD_AUX => OpInfo {
             generic: Op::SETFIELD,
             family: Family::Field,
             kind: ArithKind::None,
@@ -1737,7 +1774,15 @@ const fn op_info(op: Op) -> OpInfo {
             adaptive_shift: 0,
             forms: [None; 5],
         },
-        Op::SETTABUP_OWN => OpInfo {
+        Op::SETTABUP_INL => OpInfo {
+            generic: Op::SETTABUP,
+            family: Family::Field,
+            kind: ArithKind::None,
+            reversed: false,
+            adaptive_shift: 0,
+            forms: [None; 5],
+        },
+        Op::SETTABUP_AUX => OpInfo {
             generic: Op::SETTABUP,
             family: Family::Field,
             kind: ArithKind::None,

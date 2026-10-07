@@ -49,6 +49,16 @@ impl<'gc> Mutation<'gc> {
         )
     }
 
+    /// [`Mutation::backward_barrier`] on the box [`Gc::erased_ptr`] gave.
+    ///
+    /// # Safety
+    /// `parent` came from `Gc::erased_ptr` of a live object.
+    pub(crate) unsafe fn backward_barrier_erased(&self, parent: *const ()) {
+        let ptr = unsafe { NonNull::new_unchecked(parent as *mut GcBoxInner<()>) };
+        self.context
+            .backward_barrier(unsafe { GcBox::erase(ptr) }, None)
+    }
+
     /// Whether [`Mutation::backward_barrier`] on `parent` would enqueue it. When not, the rest of
     /// what it does is done, so `parent` may be written without it.
     #[inline]

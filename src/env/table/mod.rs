@@ -10,7 +10,8 @@ use slots::Owned;
 
 use crate::Context;
 use crate::dmm::{
-    Collect, Finalization, Gc, Mutation, RefLock, Trace, TrailingBytes, allocator_api::GcAlloc,
+    Collect, Finalization, Gc, Mutation, RefLock, RefMut, Trace, TrailingBytes,
+    allocator_api::GcAlloc,
 };
 use crate::env::function::Template;
 use crate::env::shape::{self, MAX_KEYED_PROPERTIES, MAX_PROPERTIES_FAST, Shape, WeakMode};
@@ -131,6 +132,83 @@ impl<'gc> Table<'gc> {
         debug_assert!(state.has_room(loc) && to.slot_count() == state.shape.slot_count() + 1);
         unsafe { *self.slot_ptr(state, loc) = v };
         state.shape = to;
+    }
+
+    /// [`Self::load`] for a `loc` known to be inline (the form says so).
+    ///
+    /// # Safety
+    /// As for [`Self::load`], and `loc` is not spilled.
+    #[inline(always)]
+    pub unsafe fn load_inline(self, loc: SlotLoc) -> Value<'gc> {
+        debug_assert!(!loc.spilled());
+        unsafe {
+            *Gc::as_ptr(self.0)
+                .cast::<u8>()
+                .add(loc.offset())
+                .cast::<Value<'gc>>()
+        }
+    }
+
+    /// [`Self::load`] for a `loc` known to be spilled.
+    ///
+    /// # Safety
+    /// As for [`Self::load`], and `loc` is spilled.
+    #[inline(always)]
+    pub unsafe fn load_aux(self, state: &TableState<'gc>, loc: SlotLoc) -> Value<'gc> {
+        debug_assert!(loc.spilled());
+        unsafe {
+            *state
+                .spill
+                .as_ptr()
+                .cast::<u8>()
+                .add(loc.offset())
+                .cast::<Value<'gc>>()
+        }
+    }
+
+    /// [`Self::store`] for an inline `loc`; the caller handles the barrier.
+    ///
+    /// # Safety
+    /// As for [`Self::load_inline`].
+    #[inline(always)]
+    pub unsafe fn store_inline(self, loc: SlotLoc, v: Value<'gc>) {
+        debug_assert!(!loc.spilled());
+        unsafe {
+            *Gc::as_ptr(self.0)
+                .cast::<u8>()
+                .cast_mut()
+                .add(loc.offset())
+                .cast::<Value<'gc>>() = v
+        }
+    }
+
+    /// [`Self::store`] for a spilled `loc`; the caller handles the barrier.
+    ///
+    /// # Safety
+    /// As for [`Self::load_aux`].
+    #[inline(always)]
+    pub unsafe fn store_aux(self, state: &TableState<'gc>, loc: SlotLoc, v: Value<'gc>) {
+        debug_assert!(loc.spilled());
+        unsafe {
+            *state
+                .spill
+                .as_ptr()
+                .cast::<u8>()
+                .add(loc.offset())
+                .cast::<Value<'gc>>() = v
+        }
+    }
+
+    /// A mutable borrow without the write barrier, for a handler that has
+    /// passed `barrier!` on this table.
+    ///
+    /// # Safety
+    /// The table is gray, or the barrier was run.
+    #[inline(always)]
+    pub(crate) unsafe fn borrow_mut_barriered(self) -> RefMut<'gc, TableState<'gc>> {
+        unsafe { crate::dmm::barrier::Write::assume(self.0.as_ref()) }
+            .unlock()
+            .borrow_mut()
     }
 
     #[inline(always)]
@@ -333,7 +411,7 @@ impl SlotLoc {
     }
 
     #[inline(always)]
-    fn spilled(self) -> bool {
+    pub fn spilled(self) -> bool {
         self.0 & Self::SPILLED != 0
     }
 
@@ -626,6 +704,23 @@ impl<'gc> TableState<'gc> {
     #[inline]
     pub fn named_set(&mut self, slot: u32, v: Value<'gc>) {
         unsafe { *self.named_ptr(slot) = v }
+    }
+
+    /// The spilled slot at `loc` as a pointer, for a handler that stores to it
+    /// after dropping its borrow (the barrier retry needs no live guard).
+    ///
+    /// # Safety
+    /// `loc` is a spilled slot of this table's shape.
+    #[inline(always)]
+    pub unsafe fn aux_slot(&self, loc: SlotLoc) -> *mut Value<'gc> {
+        debug_assert!(loc.spilled());
+        unsafe {
+            self.spill
+                .as_ptr()
+                .cast::<u8>()
+                .add(loc.offset())
+                .cast::<Value<'gc>>()
+        }
     }
 
     /// Whether the slot at `loc`, the next one this table's shape would
