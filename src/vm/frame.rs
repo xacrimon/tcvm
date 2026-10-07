@@ -196,7 +196,9 @@ impl NativeHdr {
     }
 }
 
-/// Write a complete header at `hdr`: two pair stores.
+/// Write a complete header at `hdr`. Volatile only to keep the words four
+/// single stores: the M4 does not forward a pair store to the one-word
+/// loads of RETURN and the continuations.
 ///
 /// # Safety
 /// `hdr .. hdr + 4` is inside the stack.
@@ -210,10 +212,10 @@ pub(crate) unsafe fn write_hdr<'gc>(
 ) {
     unsafe {
         let p = hdr.cast::<u64>();
-        p.write(func);
-        p.add(1).write(ret);
-        p.add(2).write(caller as usize as u64);
-        p.add(3).write(pc as usize as u64);
+        p.write_volatile(func);
+        p.add(1).write_volatile(ret);
+        p.add(2).write_volatile(caller as usize as u64);
+        p.add(3).write_volatile(pc as usize as u64);
     }
 }
 
