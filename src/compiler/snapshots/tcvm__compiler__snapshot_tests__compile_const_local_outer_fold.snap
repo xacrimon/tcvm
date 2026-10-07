@@ -13,10 +13,9 @@ expression: output
 ; prototype 0:
   ; function (params=1, vararg=false, stack=4, upvalues=0)
   ; constants:
-  ;   K0 = 8
-  ;   K1 = 6.28
+  ;   K0 = 6.28
   ; code:
-  0000  [ 10]  LOAD            R1 K0  ; 8
-  0001  [ 10]  LOAD            R2 K1  ; 6.28
+  0000  [ 10]  LOADI           R1 8
+  0001  [ 10]  LOAD            R2 K0  ; 6.28
   0002  [ 10]  MULI            R3 R0 #5 flipped
   0003  [ 10]  RETURN          R1 count=4

@@ -7,8 +7,6 @@ expression: output
 ;   K0 = "id"
 ;   K1 = "add"
 ;   K2 = "chain"
-;   K3 = 1
-;   K4 = 2
 ; upvalues:
 ;   U0 = local R0
 ; code:
@@ -23,8 +21,8 @@ expression: output
 0008  [ 12]  SELF            R1 R0 K0  ; "id"
 0009  [ 12]  CALL_R1         R1 args=2
 0010  [ 15]  SELF            R2 R0 K1  ; "add"
-0011  [ 15]  LOAD            R7 K3  ; 1
-0012  [ 15]  LOAD            R8 K4  ; 2
+0011  [ 15]  LOADI           R7 1
+0012  [ 15]  LOADI           R8 2
 0013  [ 15]  CALL_R1         R2 args=4
 0014  [ 18]  CLOSURE         R3 P3
 0015  [ 19]  MOVE            R4 R3

@@ -5,35 +5,31 @@ expression: output
 ; function (params=0, vararg=true, stack=1, upvalues=1)
 ; constants:
 ;   K0 = "a"
-;   K1 = 8
-;   K2 = "b"
-;   K3 = 14
-;   K4 = "c"
-;   K5 = -5
-;   K6 = "d"
-;   K7 = false
-;   K8 = "e"
-;   K9 = true
-;   K10 = "f"
-;   K11 = 36
-;   K12 = "g"
-;   K13 = "hello"
+;   K1 = "b"
+;   K2 = "c"
+;   K3 = "d"
+;   K4 = false
+;   K5 = "e"
+;   K6 = true
+;   K7 = "f"
+;   K8 = "g"
+;   K9 = "hello"
 ; upvalues:
 ;   U0 = local R0
 ; code:
 0000  [  1]  VARARGPREP      fixed=0
-0001  [ 11]  LOAD            R0 K1  ; 8
+0001  [ 11]  LOADI           R0 8
 0002  [ 11]  SETTABUP        R0 U0 K0  ; "a"
-0003  [ 12]  LOAD            R0 K3  ; 14
-0004  [ 12]  SETTABUP        R0 U0 K2  ; "b"
-0005  [ 13]  LOAD            R0 K5  ; -5
-0006  [ 13]  SETTABUP        R0 U0 K4  ; "c"
-0007  [ 14]  LOAD            R0 K7  ; false
-0008  [ 14]  SETTABUP        R0 U0 K6  ; "d"
-0009  [ 15]  LOAD            R0 K9  ; true
-0010  [ 15]  SETTABUP        R0 U0 K8  ; "e"
-0011  [ 16]  LOAD            R0 K11  ; 36
-0012  [ 16]  SETTABUP        R0 U0 K10  ; "f"
-0013  [ 17]  LOAD            R0 K13  ; "hello"
-0014  [ 17]  SETTABUP        R0 U0 K12  ; "g"
+0003  [ 12]  LOADI           R0 14
+0004  [ 12]  SETTABUP        R0 U0 K1  ; "b"
+0005  [ 13]  LOADI           R0 -5
+0006  [ 13]  SETTABUP        R0 U0 K2  ; "c"
+0007  [ 14]  LOAD            R0 K4  ; false
+0008  [ 14]  SETTABUP        R0 U0 K3  ; "d"
+0009  [ 15]  LOAD            R0 K6  ; true
+0010  [ 15]  SETTABUP        R0 U0 K5  ; "e"
+0011  [ 16]  LOADI           R0 36
+0012  [ 16]  SETTABUP        R0 U0 K7  ; "f"
+0013  [ 17]  LOAD            R0 K9  ; "hello"
+0014  [ 17]  SETTABUP        R0 U0 K8  ; "g"
 0015  [ 17]  RETURN          R0 count=1

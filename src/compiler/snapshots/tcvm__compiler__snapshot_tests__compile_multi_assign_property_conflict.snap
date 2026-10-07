@@ -6,7 +6,6 @@ expression: output
 ; constants:
 ;   K0 = "field"
 ;   K1 = "new"
-;   K2 = 99
 ; upvalues:
 ;   U0 = local R0
 ; code:
@@ -14,7 +13,7 @@ expression: output
 0001  [  1]  NEWTABLE        R0 T0  ; {}
 0002  [  2]  LOAD            R1 K0  ; "field"
 0003  [  3]  LOAD            R2 K1  ; "new"
-0004  [  3]  LOAD            R3 K2  ; 99
+0004  [  3]  LOADI           R3 99
 0005  [  3]  SETTABLE        R3 R0 R1
 0006  [  3]  MOVE            R1 R2
 0007  [  3]  RETURN          R0 count=1

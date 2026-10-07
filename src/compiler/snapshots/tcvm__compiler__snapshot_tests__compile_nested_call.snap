@@ -5,7 +5,6 @@ expression: output
 ; function (params=0, vararg=true, stack=14, upvalues=1)
 ; constants:
 ;   K0 = "print"
-;   K1 = 2
 ; upvalues:
 ;   U0 = local R0
 ; code:
@@ -14,7 +13,7 @@ expression: output
 0002  [  2]  GETTABUP        R1 U0 K0  ; "print"
 0003  [  2]  MOVE            R5 R0
 0004  [  2]  MOVE            R9 R0
-0005  [  2]  LOAD            R13 K1  ; 2
+0005  [  2]  LOADI           R13 2
 0006  [  2]  CALL            R9 args=2 ret=0
 0007  [  2]  CALL            R5 args=0 ret=0
 0008  [  2]  CALL_R0         R1 args=0

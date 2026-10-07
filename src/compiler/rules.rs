@@ -537,6 +537,23 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         self.chunk.lineinfo.push(self.cur_line);
     }
 
+    /// `R[slot] = nil`, extending the LOADNIL just emitted when it ends at
+    /// `slot` (`local a, b, c` is one instruction).
+    fn emit_nil(&mut self, slot: RegisterIndex) {
+        // Not across a jump target (`luaK_nil`): the previous LOADNIL may be
+        // skipped by a goto to a label between them.
+        if self.chunk.tape.len() > self.chunk.last_target
+            && let Some(last) = self.chunk.tape.last_mut()
+            && last.op() == Op::LOADNIL
+            && last.a() as usize + last.b() as usize == slot.0 as usize
+            && last.b() < u8::MAX
+        {
+            last.set_b(last.b() + 1);
+            return;
+        }
+        self.emit(Instruction::loadnil(slot, 1));
+    }
+
     fn err(&self, kind: CompileErrorKind) -> CompileError {
         CompileError {
             kind,
@@ -1099,9 +1116,18 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         // is normally skipped on this path because open JTSET/JFSET jumps
         // satisfy `need_value` without it.
         if let Some(value) = const_kind_to_value(self.ctx.mutation(), expr.kind) {
-            let idx = self.alloc_constant(value)?;
             let dst = self.dst_or_alloc(hint)?;
-            self.emit(Instruction::load(dst, KIdx(idx)));
+            match expr.kind {
+                // Small integers and nil need no constant slot.
+                ExprKind::Numeral(Numeral::Int(n)) if i32::try_from(n).is_ok() => {
+                    self.emit(Instruction::loadi(dst, n as i32));
+                }
+                ExprKind::Nil => self.emit_nil(dst),
+                _ => {
+                    let idx = self.alloc_constant(value)?;
+                    self.emit(Instruction::load(dst, KIdx(idx)));
+                }
+            }
             expr.kind = ExprKind::Reg(dst);
             if !expr.has_jumps() {
                 return Ok(dst);
@@ -2152,8 +2178,7 @@ fn compile_decl(ctx: &mut Ctx, item: Decl) -> Result<(), CompileError> {
                 folded[i] = Some(ConstVal::Nil);
             } else {
                 let slot = ctx.reserve_reg()?;
-                let idx = ctx.alloc_constant(Value::nil())?;
-                ctx.emit(Instruction::load(slot, KIdx(idx)));
+                ctx.emit_nil(slot);
             }
         }
     }
@@ -2422,8 +2447,7 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         let value_top = value_base as usize + n_targets;
         while (ctx.chunk.freereg as usize) < value_top {
             let slot = ctx.reserve_reg()?;
-            let idx = ctx.alloc_constant(Value::nil())?;
-            ctx.emit(Instruction::load(slot, KIdx(idx)));
+            ctx.emit_nil(slot);
         }
         // Drop any extra values past `n_targets` — they were computed
         // (side-effects preserved) but are unused.
@@ -2654,9 +2678,8 @@ fn compile_assign(ctx: &mut Ctx, item: Assign) -> Result<(), CompileError> {
     }
 
     if pending.len() < num_targets {
-        let nil = ctx.alloc_constant(Value::nil())?;
         let reg = ctx.alloc_register()?;
-        ctx.emit(Instruction::load(reg, KIdx(nil)));
+        ctx.emit_nil(reg);
         pending.resize(num_targets, Some(reg.0));
     }
 
