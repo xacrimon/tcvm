@@ -2,7 +2,7 @@
 //! source as the chunk `=c`.
 
 use tcvm::env::{Error, Function, LuaString, NativeClosure, Stack, Value};
-use tcvm::vm::native::CallbackAction;
+use tcvm::vm::async_native::Spawned;
 use tcvm::{Context, Executor, FromMultiValue, LoadError, Lua, RuntimeError, StashedExecutor};
 
 /// Defines `cat(...)`, its arguments' `tostring`s joined by spaces. One line,
@@ -48,9 +48,12 @@ pub fn err(src: &str) -> String {
 pub fn yielder<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
-    _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
-    Ok(CallbackAction::Yield)
+    mut stack: Stack<'gc, '_>,
+) -> Result<Spawned, Error<'gc>> {
+    Ok(stack.spawn(|cx| async move {
+        cx.yield_(0).await;
+        Ok(())
+    }))
 }
 
 /// A `Lua` with every library and the global `yielder` bound to [`yielder`].
@@ -58,7 +61,7 @@ pub fn yielding_lua() -> Lua {
     let mut lua = Lua::new();
     lua.load_all();
     lua.enter(|ctx| {
-        let f = Function::new_action(ctx.mutation(), yielder, &[]);
+        let f = Function::new_async(ctx.mutation(), yielder, &[]);
         let key = Value::string(LuaString::new(ctx, b"yielder"));
         ctx.globals().raw_set(ctx, key, Value::function(f));
     });

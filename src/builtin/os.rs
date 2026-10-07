@@ -7,7 +7,7 @@ use libc::c_int;
 use crate::Context;
 use crate::builtin::util;
 use crate::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Value};
-use crate::vm::native::CallbackAction;
+use crate::vm::native::NativeOut;
 
 /// `luaL_fileresult`-style outcome: `true` on success, `(nil, "msg", errno?)`
 /// on failure. The message is bare `strerror(errno)` (Rust's `Display` appends
@@ -60,7 +60,7 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         let key = Value::string(LuaString::new(ctx, name.as_bytes()));
         lib.raw_set(ctx, key, Value::function(handler));
     }
-    let time = Function::new_action(ctx.mutation(), lua_time, &[]);
+    let time = Function::new_cont(ctx.mutation(), lua_time, &[]);
     lib.raw_set(
         ctx,
         Value::string(LuaString::new(ctx, b"time")),
@@ -306,16 +306,16 @@ fn lua_time<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let arg = stack.get(0);
     if arg.is_nil() {
         stack.ret1(Value::integer(ctx.mutation(), now()));
-        return Ok(CallbackAction::Return);
+        return NativeOut::RETURN;
     }
     if arg.get_table().is_none() {
-        return Err(util::type_error(ctx, "time", 1, "table", Some(arg)));
+        return NativeOut::error(util::type_error(ctx, "time", 1, "table", Some(arg)));
     }
-    let seq = stack.spawn_action(ctx, |cx| async move {
+    stack.spawn_action(ctx, |cx| async move {
         let mut ints = [0; 6];
         for (slot, &(k, d, delta)) in ints.iter_mut().zip(&DATE_FIELDS) {
             util::getfield(&cx, 0, k.as_bytes()).await?;
@@ -338,8 +338,7 @@ fn lua_time<'gc>(
             Ok(())
         })?;
         Ok(())
-    });
-    Ok(seq)
+    })
 }
 
 /// `os_time`'s `getfield` calls, in order: key, default (`None`: required),

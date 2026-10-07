@@ -10,7 +10,7 @@ use crate::instruction::Op;
 use crate::lua::Context;
 use crate::vm::abi::{Exit, Jump, handler, handler_bits};
 use crate::vm::frame::{self, HDR, NativeHdr, copy_values, flag};
-use crate::vm::native::{native_call, native_continue, ok};
+use crate::vm::native::{cont, native_call, native_continue, ok};
 use crate::vm::ops::call::seed_header;
 
 /// `LUAI_MAXCCALLS`: threads resumed inside one another.
@@ -243,7 +243,7 @@ handler! {
         }
         let nc = unsafe { closure.as_native() };
         let co = unsafe { nc.upvalues().get_unchecked(0).get_thread().unwrap_unchecked() };
-        resume_switch!(pc, base, rt, closure, thread, call, co, 0, ok::RETURN, crate::vm::dispatch::WRAP_CONT)
+        resume_switch!(pc, base, rt, closure, thread, call, co, 0, ok::RETURN, cont::WRAP.0)
     }
 
     /// The entry of `coroutine.resume`; see [`resume_switch`].
@@ -258,7 +258,7 @@ handler! {
         let Some(co) = co else {
             tail!(native_call)
         };
-        resume_switch!(pc, base, rt, closure, thread, call, co, 1, ok::RETURN_TRUE, crate::vm::dispatch::RESUME_CONT)
+        resume_switch!(pc, base, rt, closure, thread, call, co, 1, ok::RETURN_TRUE, cont::RESUME.0)
     }
 
     /// The entry of `coroutine.yield`: with the resumer waiting in

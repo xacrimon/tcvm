@@ -12,7 +12,7 @@
 //! steer a branch rather than land in a register), and `TForCall`.
 
 use tcvm::env::{Error, Function, LuaString, NativeClosure, Stack, Table, Value};
-use tcvm::vm::native::CallbackAction;
+use tcvm::vm::async_native::Spawned;
 use tcvm::{Context, Executor, IntoMultiValue, LoadError, Lua, RuntimeError, StepResult};
 
 /// A metamethod that refuses to answer inline: it yields to the host, which
@@ -20,9 +20,12 @@ use tcvm::{Context, Executor, IntoMultiValue, LoadError, Lua, RuntimeError, Step
 fn suspending_mm<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
-    _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
-    Ok(CallbackAction::Yield)
+    mut stack: Stack<'gc, '_>,
+) -> Result<Spawned, Error<'gc>> {
+    Ok(stack.spawn(|cx| async move {
+        cx.yield_(0).await;
+        Ok(())
+    }))
 }
 
 /// Loads `src` with a global `t` whose metatable maps `event` to the suspending
@@ -31,7 +34,7 @@ fn setup(event: &[u8], src: &str) -> (Lua, tcvm::StashedExecutor) {
     let mut lua = Lua::new();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let mm = Function::new_action(ctx.mutation(), suspending_mm, &[]);
+            let mm = Function::new_async(ctx.mutation(), suspending_mm, &[]);
             let meta = Table::new(ctx);
             let ev = Value::string(LuaString::new(ctx, event));
             meta.raw_set(ctx, ev, Value::function(mm));
@@ -117,7 +120,7 @@ fn suspended_iterator_lands_loop_vars() {
     let mut lua = Lua::new();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let iter = Function::new_action(ctx.mutation(), suspending_mm, &[]);
+            let iter = Function::new_async(ctx.mutation(), suspending_mm, &[]);
             let key = Value::string(LuaString::new(ctx, b"iter"));
             ctx.globals().raw_set(ctx, key, Value::function(iter));
             let chunk = ctx.load(

@@ -4,7 +4,7 @@
 //! happens if `finish` returns `Ok` on a yielded executor).
 
 use tcvm::env::{Error, Function, LuaString, NativeClosure, Stack, Value};
-use tcvm::vm::native::CallbackAction;
+use tcvm::vm::async_native::Spawned;
 use tcvm::{Context, Executor, LoadError, Lua, RuntimeError};
 
 /// A native callback that yields to its resumer (the host, when called
@@ -12,9 +12,12 @@ use tcvm::{Context, Executor, LoadError, Lua, RuntimeError};
 fn yielder<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
-    _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
-    Ok(CallbackAction::Yield)
+    mut stack: Stack<'gc, '_>,
+) -> Result<Spawned, Error<'gc>> {
+    Ok(stack.spawn(|cx| async move {
+        cx.yield_(0).await;
+        Ok(())
+    }))
 }
 
 #[test]
@@ -22,7 +25,7 @@ fn main_thread_yield_surfaces_as_main_yielded() {
     let mut lua = Lua::new();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let y = Function::new_action(ctx.mutation(), yielder, &[]);
+            let y = Function::new_async(ctx.mutation(), yielder, &[]);
             let key = Value::string(LuaString::new(ctx, b"yielder"));
             ctx.globals().raw_set(ctx, key, Value::function(y));
             let chunk = ctx.load("return yielder()", Some("main_yield"))?;

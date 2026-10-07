@@ -14,3 +14,6 @@ pub(crate) use abi::Exit;
 pub(crate) use ops::meta::{
     IndexChain, NewIndexChain, binop_metamethod, walk_index_chain, walk_newindex_chain,
 };
+
+#[cfg(test)]
+mod tests;

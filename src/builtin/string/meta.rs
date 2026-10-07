@@ -5,14 +5,14 @@
 use crate::Context;
 use crate::builtin::util::str_to_number;
 use crate::dmm::Mutation;
-use crate::env::{ActionFn, Error, Function, LuaString, NativeClosure, Stack, Table, Value};
-use crate::vm::native::CallbackAction;
+use crate::env::{Error, Function, LuaString, NativeClosure, Stack, Table, Value};
+use crate::vm::native::{ContFn, NativeOut, OnOk, Protect, cont};
 use crate::vm::num::{self, SlowNum};
 
 pub(super) fn install<'gc>(ctx: Context<'gc>, lib: Table<'gc>) {
     let mt = Table::new(ctx);
     for (name, f) in arith_natives(ctx) {
-        let f = Function::new_action(ctx.mutation(), f, &[]);
+        let f = Function::new_cont(ctx.mutation(), f, &[]);
         mt.raw_set(ctx, Value::string(name), Value::function(f));
     }
     mt.raw_set(
@@ -32,13 +32,13 @@ macro_rules! arith_natives {
                 ctx: Context<'gc>,
                 _closure: &NativeClosure<'gc>,
                 stack: Stack<'gc, '_>,
-            ) -> Result<CallbackAction, Error<'gc>> {
+            ) -> NativeOut {
                 arith(ctx, stack, $op, ctx.symbols().$mm, $name)
             }
         )*
 
-        fn arith_natives<'gc>(ctx: Context<'gc>) -> [(LuaString<'gc>, ActionFn); ${count($native)}] {
-            [$((ctx.symbols().$mm, $native as ActionFn),)*]
+        fn arith_natives<'gc>(ctx: Context<'gc>) -> [(LuaString<'gc>, ContFn); ${count($native)}] {
+            [$((ctx.symbols().$mm, $native as ContFn),)*]
         }
     };
 }
@@ -76,7 +76,7 @@ fn arith<'gc>(
     op: ArithFn<'gc>,
     mm: LuaString<'gc>,
     name: &'static str,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let mc = ctx.mutation();
     let a = tonum(mc, stack.get(0));
     // lstrlib's `tonum` pushes the converted first operand, which then stands
@@ -92,15 +92,19 @@ fn arith<'gc>(
     let result = match op(mc, a, b) {
         SlowNum::Value(v) => v,
         SlowNum::ModByZero => {
-            return Err(Error::from_str(ctx, "attempt to perform 'n%0'").with_level(0));
+            return NativeOut::error(
+                Error::from_str(ctx, "attempt to perform 'n%0'").with_level(0),
+            );
         }
         SlowNum::DivByZero => {
-            return Err(Error::from_str(ctx, "attempt to divide by zero").with_level(0));
+            return NativeOut::error(
+                Error::from_str(ctx, "attempt to divide by zero").with_level(0),
+            );
         }
         SlowNum::NotNumbers => unreachable!("both operands converted"),
     };
     stack.ret1(result);
-    Ok(CallbackAction::Return)
+    NativeOut::RETURN
 }
 
 /// The string operand's metamethod ran first, so only the second operand's
@@ -110,14 +114,14 @@ fn trymt<'gc>(
     mut stack: Stack<'gc, '_>,
     mm_name: LuaString<'gc>,
     name: &'static str,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let (a, b) = (stack.get(0), stack.get(1));
     let mm = match b.get_string() {
         Some(_) => Value::nil(),
         None => ctx.metamethod_of(b, mm_name),
     };
     if mm.is_nil() {
-        return Err(Error::from_str(
+        return NativeOut::error(Error::from_str(
             ctx,
             &format!(
                 "attempt to {name} a '{}' with a '{}'",
@@ -128,16 +132,16 @@ fn trymt<'gc>(
     }
     // `lua_call(L, 2, 1)`, through a `__call` chain on `mm`.
     stack.replace(&[mm, a, b]);
-    Ok(CallbackAction::call_then(0, one_result))
+    NativeOut::call_then(0, cont::ONE_RESULT, Protect::No, OnOk::Cont)
 }
 
-fn one_result<'gc>(
+pub(crate) fn one_result<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
     _status: Result<(), Error<'gc>>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let v = stack.get(0);
     stack.ret1(v);
-    Ok(CallbackAction::Return)
+    NativeOut::RETURN
 }

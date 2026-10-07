@@ -17,10 +17,11 @@ use crate::builtin::util::{to_integer, to_number as to_float};
 use crate::env::{
     Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Userdata, Value,
 };
-use crate::vm::native::CallbackAction;
+use crate::vm::native::{NativeOut, OnOk, Protect, cont};
 use crate::vm::{IndexChain, walk_index_chain};
 
 mod meta;
+pub(crate) use meta::one_result;
 mod pack;
 mod pattern;
 use pattern::{CapValue, MatchState, PatError};
@@ -63,13 +64,13 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         let key = Value::string(LuaString::new(ctx, name.as_bytes()));
         lib.raw_set(ctx, key, Value::function(handler));
     }
-    let format = Function::new_action(ctx.mutation(), lua_format, &[Value::userdata(fmt_buf)]);
+    let format = Function::new_cont(ctx.mutation(), lua_format, &[Value::userdata(fmt_buf)]);
     lib.raw_set(
         ctx,
         Value::string(LuaString::new(ctx, b"format")),
         Value::function(format),
     );
-    let gsub = Function::new_action(ctx.mutation(), lua_gsub, &[]);
+    let gsub = Function::new_cont(ctx.mutation(), lua_gsub, &[]);
     lib.raw_set(
         ctx,
         Value::string(LuaString::new(ctx, b"gsub")),
@@ -250,7 +251,7 @@ fn lua_format<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let fmt_val = stack.get(0);
     let fmt_str = fmt_val
         .get_string()
@@ -284,11 +285,11 @@ fn lua_format<'gc>(
             let s = LuaString::new(ctx, &f.out);
             give_back(f.out);
             stack.ret1(Value::string(s));
-            return Ok(CallbackAction::Return);
+            return NativeOut::RETURN;
         }
         Err(e) => {
             give_back(f.out);
-            return Err(e);
+            return NativeOut::error(e);
         }
     };
     // A conversion needs `__tostring`: finish in a future that can call it,
@@ -296,7 +297,7 @@ fn lua_format<'gc>(
     // returned. The arguments, format string included, stay on the stack below
     // `n` throughout.
     let n = stack.len();
-    let seq = stack.spawn_action(ctx, move |cx| async move {
+    stack.spawn_action(ctx, move |cx| async move {
         let mut pending = Some(pending);
         while let Some((sf, at, arg)) = pending {
             let bytes = util::tolstring(&cx, arg, n).await?;
@@ -320,8 +321,7 @@ fn lua_format<'gc>(
             stack.replace(&[Value::string(LuaString::new(ctx, &f.out))]);
         });
         Ok(())
-    });
-    Ok(seq)
+    })
 }
 
 struct Formatter {
@@ -780,7 +780,7 @@ fn lua_gsub<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let s = util::check_string(ctx, stack.get(0), "gsub", 1)?;
     let p = util::check_string(ctx, stack.get(1), "gsub", 2)?;
     let repl = stack.get(2);
@@ -798,11 +798,11 @@ fn lua_gsub<'gc>(
         let (result, count) =
             gsub_string(ctx, s.as_bytes(), p.as_bytes(), template.as_bytes(), max_n)?;
         stack.replace(&[result, Value::integer(ctx.mutation(), count)]);
-        return Ok(CallbackAction::Return);
+        return NativeOut::RETURN;
     }
 
     if repl.get_function().is_none() && repl.get_table().is_none() {
-        return Err(util::type_error(
+        return NativeOut::error(util::type_error(
             ctx,
             "gsub",
             3,
@@ -846,7 +846,7 @@ fn gsub_drive<'gc>(
     ctx: Context<'gc>,
     mut stack: Stack<'gc, '_>,
     resumed: Option<Value<'gc>>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let mc = ctx.mutation();
     let int = |stack: &Stack<'gc, '_>, i: usize| stack.get(i).get_integer().unwrap_or(0);
     let src = stack.get(0).get_string().expect("gsub's subject");
@@ -913,11 +913,11 @@ fn gsub_drive<'gc>(
                         }
                         IndexChain::NotIndexable(v) => {
                             let msg = format!("attempt to index a {} value", v.type_name());
-                            return Err(Error::from_str(ctx, &msg));
+                            return NativeOut::error(Error::from_str(ctx, &msg));
                         }
                         IndexChain::Exhausted => {
                             let msg = "'__index' chain too long; possible loop";
-                            return Err(Error::from_str(ctx, msg));
+                            return NativeOut::error(Error::from_str(ctx, msg));
                         }
                     }
                 };
@@ -930,7 +930,7 @@ fn gsub_drive<'gc>(
                     slots[G_E] = Value::integer(mc, e as i64);
                     stack.truncate(G_AT);
                     stack.extend(call);
-                    return Ok(CallbackAction::call_then(G_AT, gsub_cont));
+                    return NativeOut::call_then(G_AT, cont::GSUB, Protect::No, OnOk::Cont);
                 }
                 pos = e;
                 last = Some(e);
@@ -951,16 +951,16 @@ fn gsub_drive<'gc>(
     out.extend_from_slice(&src[pos..]);
     let result = Value::string(LuaString::new(ctx, &out));
     stack.replace(&[result, Value::integer(mc, count)]);
-    Ok(CallbackAction::Return)
+    NativeOut::RETURN
 }
 
 /// The replacement call returned: on with its first result.
-fn gsub_cont<'gc>(
+pub(crate) fn gsub_cont<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
     _status: Result<(), Error<'gc>>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let v = stack.get(G_AT);
     stack.truncate(G_AT);
     gsub_drive(ctx, stack, Some(v))

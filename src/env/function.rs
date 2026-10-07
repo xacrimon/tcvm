@@ -10,8 +10,8 @@ use crate::env::thread::{Thread, ThreadState};
 use crate::env::value::Value;
 use crate::instruction::UpValueDescriptor;
 use crate::vm::abi::Handler;
+use crate::vm::native::Execution;
 use crate::vm::native::native_call;
-use crate::vm::native::{CallbackAction, Execution};
 
 /// Debug record for a local register: active for `start_pc <= pc < end_pc`.
 /// Hidden loop-control slots appear as `(for state)` like luac's, so every
@@ -381,22 +381,13 @@ pub type NativeFn = for<'gc, 'a> fn(
     stack: Stack<'gc, 'a>,
 ) -> Result<(), Error<'gc>>;
 
-/// A native that may ask the VM to act once it returns: call a function and
-/// continue in a [`NativeCont`](crate::vm::native::NativeCont), resume or
-/// yield a coroutine, or suspend into the executor (see [`CallbackAction`]).
-pub type ActionFn = for<'gc, 'a> fn(
-    ctx: Context<'gc>,
-    closure: &'a NativeClosure<'gc>,
-    stack: Stack<'gc, 'a>,
-) -> Result<CallbackAction, Error<'gc>>;
-
 // One register: a plain native's return never goes through memory.
 const _: () = assert!(std::mem::size_of::<Result<(), Error<'static>>>() == 8);
 
 #[derive(Clone, Copy)]
 pub(crate) enum NativeKind {
     Plain(NativeFn),
-    Action(ActionFn),
+    Cont(crate::vm::native::ContFn),
     Async(crate::vm::async_native::AsyncFn),
 }
 
@@ -763,8 +754,14 @@ impl<'gc> Function<'gc> {
         Self::new_native_with_entry(mc, NativeKind::Plain(function), upvalues, native_call)
     }
 
-    pub fn new_action(mc: &Mutation<'gc>, function: ActionFn, upvalues: &[Value<'gc>]) -> Self {
-        Self::new_native_with_entry(mc, NativeKind::Action(function), upvalues, native_call)
+    /// A continuation native: crate-internal, since it names its
+    /// continuations by [`CONT_TABLE`](crate::vm::native::CONT_TABLE) index.
+    pub(crate) fn new_cont(
+        mc: &Mutation<'gc>,
+        function: crate::vm::native::ContFn,
+        upvalues: &[Value<'gc>],
+    ) -> Self {
+        Self::new_native_with_entry(mc, NativeKind::Cont(function), upvalues, native_call)
     }
 
     pub fn new_async(

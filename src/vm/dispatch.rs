@@ -1,7 +1,7 @@
 //! The dispatch tables, the runtime cells behind a `Context`, and the
 //! trampoline from the executor into dispatch.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 
 use crate::dmm::metrics::Metrics;
 use crate::dmm::{Collect, Mutation, Trace};
@@ -10,7 +10,6 @@ use crate::env::thread::{ThreadState, ThreadStatus};
 use crate::instruction::{Instruction, Op};
 use crate::lua::Context;
 use crate::vm::abi::{Exit, Handler, Jump, Slot};
-use crate::vm::native::NativeCont;
 use crate::vm::ops::{arith, call, compare, control, data, field, table};
 use crate::vm::unwind::OpError;
 use crate::vm::{coro, frame, native};
@@ -171,33 +170,6 @@ pub(crate) struct Runtime<'gc> {
     pub(crate) metrics: *const Metrics,
     /// The fault `raise!` leaves for `impl_error`.
     pub(crate) fault: Cell<Option<OpError<'gc>>>,
-    /// Continuation natives by index: `NO_CONT` and `ASYNC_CONT`
-    /// first, the rest registered on first use rather than listed statically
-    /// while natives outside the crate may still name continuations of their
-    /// own (stage 1 transitional).
-    pub(crate) conts: RefCell<Vec<NativeCont>>,
-}
-
-/// The continuation index of a native frame that awaits nothing.
-pub(crate) const NO_CONT: u8 = 0;
-/// The continuation index of an async native's frame (`async_cont`).
-pub(crate) const ASYNC_CONT: u8 = 1;
-/// `coroutine.resume`'s continuation, registered up front for `ff_resume`.
-pub(crate) const RESUME_CONT: u8 = 2;
-/// `coroutine.wrap`'s continuation, registered up front for `ff_wrap`.
-pub(crate) const WRAP_CONT: u8 = 3;
-
-/// [`NO_CONT`]'s entry: never called.
-fn no_cont<'gc>(
-    ctx: Context<'gc>,
-    _closure: &crate::env::function::NativeClosure<'gc>,
-    _stack: crate::env::function::Stack<'gc, '_>,
-    _status: Result<(), crate::env::error::Error<'gc>>,
-) -> Result<crate::vm::native::CallbackAction, crate::env::error::Error<'gc>> {
-    Err(crate::env::error::Error::from_str(
-        ctx,
-        "internal: continuation of a frame that awaits nothing",
-    ))
 }
 
 // SAFETY: holds no `Gc` pointer that outlives a `Lua::enter`: the fault is
@@ -220,12 +192,6 @@ impl<'gc> Runtime<'gc> {
             mutation: Cell::new(std::ptr::null()),
             metrics,
             fault: Cell::new(None),
-            conts: RefCell::new(vec![
-                no_cont as NativeCont,
-                crate::vm::async_native::async_cont as NativeCont,
-                crate::builtin::resume_cont as NativeCont,
-                crate::builtin::wrap_cont as NativeCont,
-            ]),
         }
     }
 }

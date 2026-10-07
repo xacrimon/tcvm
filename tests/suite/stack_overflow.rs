@@ -4,7 +4,7 @@
 //! Each chunk hands its result to the host with `error(v, 0)`.
 
 use tcvm::env::{Error, Function, LuaString, NativeClosure, Stack, Value};
-use tcvm::vm::native::CallbackAction;
+use tcvm::vm::async_native::Spawned;
 use tcvm::{Context, Executor, LoadError, Lua, RuntimeError, StepResult};
 
 fn raised(src: &str) -> String {
@@ -152,9 +152,12 @@ fn coroutines_work_after_a_resume_overflow() {
 fn yielder<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
-    _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
-    Ok(CallbackAction::Yield)
+    mut stack: Stack<'gc, '_>,
+) -> Result<Spawned, Error<'gc>> {
+    Ok(stack.spawn(|cx| async move {
+        cx.yield_(0).await;
+        Ok(())
+    }))
 }
 
 // A handler that yields to the host leaves the thread in handler mode; a
@@ -165,7 +168,7 @@ fn restart_after_a_handler_yields_to_the_host() {
     lua.load_all();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let y = Function::new_action(ctx.mutation(), yielder, &[]);
+            let y = Function::new_async(ctx.mutation(), yielder, &[]);
             let key = Value::string(LuaString::new(ctx, b"yielder"));
             ctx.globals().raw_set(ctx, key, Value::function(y));
             let src = format!("{RECURSE} xpcall(f, function(m) yielder() return m end)");

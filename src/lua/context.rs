@@ -18,7 +18,6 @@ use crate::lua::{LoadError, State, SyntaxError, bare_io_msg};
 use crate::parser;
 use crate::vm::abi::Handler;
 use crate::vm::debug::chunk_id;
-use crate::vm::native::NativeCont;
 use crate::vm::unwind::OpError;
 
 /// Cheap, copy handle into the runtime: one word, the `State`, whose first
@@ -91,21 +90,6 @@ impl<'gc> Context<'gc> {
             .fault
             .take()
             .expect("impl_error without a pending fault")
-    }
-
-    /// The index of continuation `f`, registered on first use.
-    pub(crate) fn cont_index(self, f: NativeCont) -> u8 {
-        let mut conts = self.state.rt.conts.borrow_mut();
-        if let Some(i) = conts.iter().position(|&g| std::ptr::fn_addr_eq(g, f)) {
-            return i as u8;
-        }
-        assert!(conts.len() < 64, "more than 64 continuation natives");
-        conts.push(f);
-        (conts.len() - 1) as u8
-    }
-
-    pub(crate) fn cont(self, idx: u8) -> NativeCont {
-        self.state.rt.conts.borrow()[idx as usize]
     }
 
     pub fn globals(self) -> Table<'gc> {

@@ -4,6 +4,7 @@
 #![cfg_attr(not(any(debug_assertions, test)), allow(clippy::drop_non_drop))]
 #![feature(fn_align)]
 #![feature(explicit_tail_calls)]
+#![feature(try_trait_v2)]
 #![feature(macro_metavar_expr)]
 #![feature(likely_unlikely)]
 #![feature(allocator_api)]
