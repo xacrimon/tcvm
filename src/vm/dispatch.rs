@@ -182,6 +182,10 @@ pub(crate) struct Runtime<'gc> {
 pub(crate) const NO_CONT: u8 = 0;
 /// The continuation index of an async native's frame (`async_cont`).
 pub(crate) const ASYNC_CONT: u8 = 1;
+/// `coroutine.resume`'s continuation, registered up front for `ff_resume`.
+pub(crate) const RESUME_CONT: u8 = 2;
+/// `coroutine.wrap`'s continuation, registered up front for `ff_wrap`.
+pub(crate) const WRAP_CONT: u8 = 3;
 
 /// [`NO_CONT`]'s entry: never called.
 fn no_cont<'gc>(
@@ -219,6 +223,8 @@ impl<'gc> Runtime<'gc> {
             conts: RefCell::new(vec![
                 no_cont as NativeCont,
                 crate::vm::async_native::async_cont as NativeCont,
+                crate::builtin::resume_cont as NativeCont,
+                crate::builtin::wrap_cont as NativeCont,
             ]),
         }
     }
