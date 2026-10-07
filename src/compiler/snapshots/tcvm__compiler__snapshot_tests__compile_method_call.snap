@@ -2,7 +2,7 @@
 source: src/compiler/snapshot_tests.rs
 expression: output
 ---
-; function (params=0, vararg=true, stack=9, upvalues=1)
+; function (params=0, vararg=true, stack=13, upvalues=1)
 ; constants:
 ;   K0 = "id"
 ;   K1 = "add"
@@ -23,13 +23,13 @@ expression: output
 0008  [ 12]  SELF            R1 R0 K0  ; "id"
 0009  [ 12]  CALL_R1         R1 args=2
 0010  [ 15]  SELF            R2 R0 K1  ; "add"
-0011  [ 15]  LOAD            R4 K3  ; 1
-0012  [ 15]  LOAD            R5 K4  ; 2
+0011  [ 15]  LOAD            R7 K3  ; 1
+0012  [ 15]  LOAD            R8 K4  ; 2
 0013  [ 15]  CALL_R1         R2 args=4
 0014  [ 18]  CLOSURE         R3 P3
 0015  [ 19]  MOVE            R4 R3
-0016  [ 19]  SELF            R5 R0 K0  ; "id"
-0017  [ 19]  CALL            R5 args=2 ret=0
+0016  [ 19]  SELF            R8 R0 K0  ; "id"
+0017  [ 19]  CALL            R8 args=2 ret=0
 0018  [ 19]  CALL_R1         R4 args=0
 0019  [ 22]  SELF            R5 R0 K2  ; "chain"
 0020  [ 22]  CALL_R1         R5 args=2
@@ -37,7 +37,7 @@ expression: output
 0022  [ 22]  CALL_R1         R5 args=2
 0023  [ 25]  CLOSURE         R6 P4
 0024  [ 26]  MOVE            R7 R6
-0025  [ 26]  MOVE            R8 R0
+0025  [ 26]  MOVE            R11 R0
 0026  [ 26]  CALL_R0         R7 args=2
 0027  [ 28]  RETURN          R2 count=2
 
@@ -63,7 +63,7 @@ expression: output
   0000  [ 18]  RETURN1         R0
 
 ; prototype 4:
-  ; function (params=1, vararg=false, stack=3, upvalues=0)
+  ; function (params=1, vararg=false, stack=6, upvalues=0)
   ; constants:
   ;   K0 = "id"
   ; code:

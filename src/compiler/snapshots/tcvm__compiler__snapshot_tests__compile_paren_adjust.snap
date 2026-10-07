@@ -63,7 +63,7 @@ expression: output
   0002  [ 16]  RETURN          R1 count=3
 
 ; prototype 2:
-  ; function (params=0, vararg=false, stack=4, upvalues=1)
+  ; function (params=0, vararg=false, stack=5, upvalues=1)
   ; constants:
   ;   K0 = "meth"
   ; upvalues:
@@ -96,7 +96,7 @@ expression: output
   0012  [ 37]  RETURN          R6 count=7
 
 ; prototype 4:
-  ; function (params=0, vararg=false, stack=1, upvalues=1)
+  ; function (params=0, vararg=false, stack=4, upvalues=1)
   ; upvalues:
   ;   U0 = local R0
   ; code:
@@ -105,7 +105,7 @@ expression: output
   0002  [ 42]  RETURN1         R0
 
 ; prototype 5:
-  ; function (params=0, vararg=false, stack=1, upvalues=1)
+  ; function (params=0, vararg=false, stack=4, upvalues=1)
   ; upvalues:
   ;   U0 = local R0
   ; code:

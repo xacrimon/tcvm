@@ -40,7 +40,7 @@ expression: output
 0025  [  5]  JMP             -8
 0026  [  5]  CLOSE           R2
 0027  [  6]  GETTABUP        R2 U0 K3  ; "ipairs"
-0028  [  6]  MOVE            R3 R0
+0028  [  6]  MOVE            R6 R0
 0029  [  6]  CALL            R2 args=2 ret=5
 0030  [  6]  TFORPREP        R2 +3
 0031  [  6]  CLOSURE         R8 P3

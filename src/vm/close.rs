@@ -2,7 +2,7 @@
 
 use crate::env::error::{Error, Exit};
 use crate::env::function::Stack;
-use crate::env::thread::{ExecKind, TbcEntry, ThreadState, ThreadStatus};
+use crate::env::thread::{TbcEntry, ThreadState, ThreadStatus};
 use crate::env::{Function, MetamethodBits, NativeClosure, Value};
 use crate::lua::Context;
 use crate::vm::native::{CallbackAction, OnOk, Protect};
@@ -75,7 +75,7 @@ fn close_step<'gc>(
     })
 }
 
-fn close_entry_cont<'gc>(
+pub(crate) fn close_entry_cont<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
@@ -120,7 +120,7 @@ fn close_resumed<'gc>(
 /// when next resumed; `false` if it had none, leaving it merely reset. Its
 /// death error, if any, goes to the first `__close` and is kept on reset.
 pub(crate) fn seed_thread_close<'gc>(ctx: Context<'gc>, ts: &mut ThreadState<'gc>) -> bool {
-    crate::vm::interp::close_upvalues(ctx.mutation(), ts, 0);
+    crate::vm::ops::control::close_upvalues(ctx.mutation(), ts, 0);
     let tbc_list: Vec<_> = ts
         .tbc_list
         .iter()
@@ -138,7 +138,6 @@ pub(crate) fn seed_thread_close<'gc>(ctx: Context<'gc>, ts: &mut ThreadState<'gc
     }
     ts.tbc_list = tbc_list;
     let entry = Function::new_action(ctx.mutation(), thread_close_entry, &[]);
-    ts.push_exec(ExecKind::Start(Value::function(entry)));
-    ts.status = ThreadStatus::Suspended;
+    ts.seed(Value::function(entry));
     true
 }

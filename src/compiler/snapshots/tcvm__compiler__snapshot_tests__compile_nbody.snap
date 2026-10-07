@@ -2,7 +2,7 @@
 source: src/compiler/snapshot_tests.rs
 expression: output
 ---
-; function (params=0, vararg=true, stack=23, upvalues=1)
+; function (params=0, vararg=true, stack=30, upvalues=1)
 ; constants:
 ;   K0 = "math"
 ;   K1 = "sqrt"
@@ -107,11 +107,11 @@ expression: output
 0062  [ 99]  CLOSURE         R10 P1
 0063  [114]  CLOSURE         R11 P2
 0064  [116]  GETTABUP        R12 U0 K24  ; "tonumber"
-0065  [116]  GETTABUP        R13 U0 K25  ; "arg"
-0066  [116]  JF              R13 +3
-0067  [116]  GETTABUP        R13 U0 K25  ; "arg"
-0068  [116]  LOAD            R14 K26  ; 1
-0069  [116]  GETTABLE        R13 R13 R14
+0065  [116]  GETTABUP        R16 U0 K25  ; "arg"
+0066  [116]  JF              R16 +3
+0067  [116]  GETTABUP        R16 U0 K25  ; "arg"
+0068  [116]  LOAD            R17 K26  ; 1
+0069  [116]  GETTABLE        R16 R16 R17
 0070  [116]  CALL_R1         R12 args=2
 0071  [116]  JT              R12 +1
 0072  [116]  LOAD            R12 K27  ; 1000
@@ -124,42 +124,42 @@ expression: output
 0079  [117]  SETLIST         R13 count=5 offset=0
 0080  [118]  LEN             R14 R13
 0081  [120]  MOVE            R15 R11
-0082  [120]  MOVE            R16 R13
-0083  [120]  MOVE            R17 R14
+0082  [120]  MOVE            R19 R13
+0083  [120]  MOVE            R20 R14
 0084  [120]  CALL_R0         R15 args=3
 0085  [121]  GETTABUP        R15 U0 K28  ; "io"
 0086  [121]  GETFIELD        R15 R15 K29  ; "write"
-0087  [121]  GETTABUP        R16 U0 K30  ; "string"
-0088  [121]  GETFIELD        R16 R16 K31  ; "format"
-0089  [121]  LOAD            R17 K32  ; "%0.9f"
-0090  [121]  MOVE            R18 R10
-0091  [121]  MOVE            R19 R13
-0092  [121]  MOVE            R20 R14
-0093  [121]  CALL            R18 args=3 ret=0
-0094  [121]  CALL_R1         R16 args=0
-0095  [121]  LOAD            R17 K33  ; "\n"
+0087  [121]  GETTABUP        R19 U0 K30  ; "string"
+0088  [121]  GETFIELD        R19 R19 K31  ; "format"
+0089  [121]  LOAD            R23 K32  ; "%0.9f"
+0090  [121]  MOVE            R24 R10
+0091  [121]  MOVE            R28 R13
+0092  [121]  MOVE            R29 R14
+0093  [121]  CALL            R24 args=3 ret=0
+0094  [121]  CALL_R1         R19 args=0
+0095  [121]  LOAD            R20 K33  ; "\n"
 0096  [121]  CALL_R0         R15 args=3
 0097  [122]  LOAD            R15 K26  ; 1
 0098  [122]  MOVE            R16 R12
 0099  [122]  LOAD            R17 K26  ; 1
 0100  [122]  FORPREP         R15 +6
 0101  [122]  MOVE            R19 R9
-0102  [122]  MOVE            R20 R13
-0103  [122]  MOVE            R21 R14
-0104  [122]  LOAD            R22 K34  ; 0.01
+0102  [122]  MOVE            R23 R13
+0103  [122]  MOVE            R24 R14
+0104  [122]  LOAD            R25 K34  ; 0.01
 0105  [122]  CALL_R0         R19 args=4
 0106  [122]  FORLOOP         R15 -6
 0107  [123]  GETTABUP        R15 U0 K28  ; "io"
 0108  [123]  GETFIELD        R15 R15 K29  ; "write"
-0109  [123]  GETTABUP        R16 U0 K30  ; "string"
-0110  [123]  GETFIELD        R16 R16 K31  ; "format"
-0111  [123]  LOAD            R17 K32  ; "%0.9f"
-0112  [123]  MOVE            R18 R10
-0113  [123]  MOVE            R19 R13
-0114  [123]  MOVE            R20 R14
-0115  [123]  CALL            R18 args=3 ret=0
-0116  [123]  CALL_R1         R16 args=0
-0117  [123]  LOAD            R17 K33  ; "\n"
+0109  [123]  GETTABUP        R19 U0 K30  ; "string"
+0110  [123]  GETFIELD        R19 R19 K31  ; "format"
+0111  [123]  LOAD            R23 K32  ; "%0.9f"
+0112  [123]  MOVE            R24 R10
+0113  [123]  MOVE            R28 R13
+0114  [123]  MOVE            R29 R14
+0115  [123]  CALL            R24 args=3 ret=0
+0116  [123]  CALL_R1         R19 args=0
+0117  [123]  LOAD            R20 K33  ; "\n"
 0118  [123]  CALL_R0         R15 args=3
 0119  [123]  RETURN          R0 count=1
 
@@ -201,11 +201,11 @@ expression: output
   0021  [ 61]  GETFIELD        R22 R19 K3  ; "z"
   0022  [ 61]  SUB             R22 R10 R22
   0023  [ 62]  GETUPVAL        R23 U0
-  0024  [ 62]  MUL             R24 R20 R20
-  0025  [ 62]  MUL             R25 R21 R21
-  0026  [ 62]  ADD             R24 R24 R25
-  0027  [ 62]  MUL             R25 R22 R22
-  0028  [ 62]  ADD             R24 R24 R25
+  0024  [ 62]  MUL             R27 R20 R20
+  0025  [ 62]  MUL             R28 R21 R21
+  0026  [ 62]  ADD             R27 R27 R28
+  0027  [ 62]  MUL             R28 R22 R22
+  0028  [ 62]  ADD             R27 R27 R28
   0029  [ 62]  CALL_R1         R23 args=2
   0030  [ 63]  MUL             R24 R23 R23
   0031  [ 63]  MUL             R24 R24 R23
@@ -260,7 +260,7 @@ expression: output
   0080  [ 82]  RETURN0
 
 ; prototype 1:
-  ; function (params=2, vararg=false, stack=23, upvalues=1)
+  ; function (params=2, vararg=false, stack=26, upvalues=1)
   ; constants:
   ;   K0 = 0
   ;   K1 = 1
@@ -307,11 +307,11 @@ expression: output
   0030  [ 93]  GETFIELD        R20 R16 K8  ; "z"
   0031  [ 93]  SUB             R19 R19 R20
   0032  [ 94]  GETUPVAL        R20 U0
-  0033  [ 94]  MUL             R21 R17 R17
-  0034  [ 94]  MUL             R22 R18 R18
-  0035  [ 94]  ADD             R21 R21 R22
-  0036  [ 94]  MUL             R22 R19 R19
-  0037  [ 94]  ADD             R21 R21 R22
+  0033  [ 94]  MUL             R24 R17 R17
+  0034  [ 94]  MUL             R25 R18 R18
+  0035  [ 94]  ADD             R24 R24 R25
+  0036  [ 94]  MUL             R25 R19 R19
+  0037  [ 94]  ADD             R24 R24 R25
   0038  [ 94]  CALL_R1         R20 args=2
   0039  [ 95]  GETFIELD        R21 R16 K5  ; "mass"
   0040  [ 95]  MUL             R21 R11 R21

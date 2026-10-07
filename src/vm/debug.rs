@@ -2,11 +2,13 @@
 //! the `source:line:` of a call level (ldebug.c / lauxlib.c counterparts).
 
 use crate::env::error::Error;
+use crate::env::function::LuaFn;
 use crate::env::string::LuaString;
-use crate::env::thread::{FrameRef, LuaFrame, ThreadState};
+use crate::env::thread::ThreadState;
 use crate::env::value::Value;
 use crate::lua::Context;
-use crate::vm::interp::OpError;
+use crate::vm::frame::{self, Frame};
+use crate::vm::unwind::OpError;
 
 /// `luaO_chunkid`: how a chunk name prints in messages, capped at
 /// `LUA_IDSIZE` (60) bytes. `=name` is literal, `@path` keeps the tail of
@@ -46,36 +48,32 @@ pub(crate) fn chunk_id(source: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Source line the Lua frame is currently executing; `pc` points past the
-/// current instruction (see `LuaFrame::pc`), and index 0 means not yet entered.
-pub(crate) fn frame_line(lf: &LuaFrame<'_>) -> Option<u32> {
-    lf.closure.proto.line_for_pc(lf.pc_index().checked_sub(1)?)
+/// The top frame, when it is a Lua frame.
+fn top_lua<'gc>(ts: &ThreadState<'gc>) -> Option<Frame<'gc>> {
+    frame::frames(ts).next().filter(|f| !f.is_native())
 }
 
-/// `luaL_where`: `"chunk:line: "` for call `level`, counting the raising
-/// native as 0 and the innermost frame as 1. Empty when that level isn't a
-/// Lua function (or doesn't exist), exactly like the reference.
+/// `luaL_where`: `"chunk:line: "` for the frame `level` below the top (the
+/// top frame is level 0, so a raising native's caller is level 1). Empty
+/// when that frame isn't a Lua function or doesn't exist, like the reference.
 pub(crate) fn where_prefix(ts: &ThreadState<'_>, level: usize) -> Vec<u8> {
-    let Some(frame) = level
-        .checked_sub(1)
-        .and_then(|depth| ts.frames_rev().nth(depth))
-    else {
+    let Some(f) = frame::frames(ts).nth(level) else {
         return Vec::new();
     };
-    let FrameRef::Lua(lf) = frame else {
+    if f.is_native() {
+        return Vec::new();
+    }
+    let Some(line) = f.line() else {
         return Vec::new();
     };
-    let Some(line) = frame_line(lf) else {
-        return Vec::new();
-    };
-    let mut out = chunk_id(lf.closure.proto.source.as_bytes());
+    let mut out = chunk_id(f.closure().proto.source.as_bytes());
     out.extend_from_slice(format!(":{line}: ").as_bytes());
     out
 }
 
-/// Apply an error's pending position level against the raising thread's
-/// frames: a string message gets the `where_prefix`; anything else is left
-/// alone (`luaB_error` only decorates strings). The result carries level 0.
+/// Apply an error's pending position level against the thread's frames: a
+/// string message gets the `where_prefix`; anything else is left alone
+/// (`luaB_error` only decorates strings). The result carries level 0.
 pub(crate) fn locate<'gc>(ctx: Context<'gc>, ts: &ThreadState<'gc>, err: Error<'gc>) -> Error<'gc> {
     let level = err.level();
     let Some(msg) = err.value().get_string().filter(|_| level > 0) else {
@@ -87,6 +85,38 @@ pub(crate) fn locate<'gc>(ctx: Context<'gc>, ts: &ThreadState<'gc>, err: Error<'
     }
     let text = [prefix.as_slice(), msg.as_bytes()].concat();
     err.with_value(ctx, Value::string(LuaString::new(ctx, &text)))
+}
+
+/// [`locate`] for an error raised by a native with no frame of its own (a
+/// tail-called one): its level 1 is the top frame.
+pub(crate) fn locate_unframed<'gc>(
+    ctx: Context<'gc>,
+    ts: &ThreadState<'gc>,
+    err: Error<'gc>,
+) -> Error<'gc> {
+    let level = err.level();
+    let Some(msg) = err.value().get_string().filter(|_| level > 0) else {
+        return err.with_level(0);
+    };
+    let prefix = where_prefix(ts, level - 1);
+    if prefix.is_empty() {
+        return err.with_level(0);
+    }
+    let text = [prefix.as_slice(), msg.as_bytes()].concat();
+    err.with_value(ctx, Value::string(LuaString::new(ctx, &text)))
+}
+
+/// An error with `msg` prefixed by the position of frame `level` below the
+/// top; level 0 is the running Lua frame, for opcode faults.
+pub(crate) fn error_at<'gc>(
+    ctx: Context<'gc>,
+    ts: &ThreadState<'gc>,
+    msg: &str,
+    level: usize,
+) -> Error<'gc> {
+    let mut text = where_prefix(ts, level);
+    text.extend_from_slice(msg.as_bytes());
+    Error::new(ctx, Value::string(LuaString::new(ctx, &text)))
 }
 
 /// `luaT_objtypename`: a table or userdata whose metatable has a string
@@ -159,9 +189,8 @@ pub(crate) fn op_error_message<'gc>(
         OpError::NewIndexChainLoop => "'__newindex' chain too long; possible loop".to_owned(),
         OpError::CallChainTooLong => "'__call' chain too long".to_owned(),
         OpError::GlobalRedefined(k) => {
-            let name = ts
-                .top_lua()
-                .and_then(|lf| lf.closure.proto.constants.get(k as usize).copied())
+            let name = top_lua(ts)
+                .and_then(|f| f.closure().proto.constants.get(k as usize).copied())
                 .and_then(|v| v.get_string())
                 .map_or_else(
                     || "?".to_owned(),
@@ -178,9 +207,8 @@ pub(crate) fn op_error_message<'gc>(
         OpError::StackOverflow => "stack overflow".to_owned(),
         OpError::VarargN => "vararg table has no proper 'n'".to_owned(),
         OpError::NonClosable(reg) => {
-            let name = ts
-                .top_lua()
-                .and_then(|lf| local_name(lf, reg, lf.pc_index() - 1))
+            let name = top_lua(ts)
+                .and_then(|f| local_name(f.closure(), reg, f.pc_index().saturating_sub(1)))
                 .map_or_else(
                     || "?".to_owned(),
                     |s| String::from_utf8_lossy(s.as_bytes()).into_owned(),
@@ -193,9 +221,9 @@ pub(crate) fn op_error_message<'gc>(
 }
 
 /// Name of the local in register `reg` at instruction `pc` (`luaF_getlocalname`).
-pub(crate) fn local_name<'gc>(lf: &LuaFrame<'gc>, reg: u8, pc: usize) -> Option<LuaString<'gc>> {
+pub(crate) fn local_name<'gc>(closure: LuaFn<'gc>, reg: u8, pc: usize) -> Option<LuaString<'gc>> {
     let pc = pc as u32;
-    lf.closure
+    closure
         .proto
         .locvars
         .iter()
@@ -205,14 +233,24 @@ pub(crate) fn local_name<'gc>(lf: &LuaFrame<'gc>, reg: u8, pc: usize) -> Option<
 }
 
 /// The error for a call that would cross the thread's stack limit: "stack
-/// overflow" at the caller's position, or, when a message handler already
-/// runs in the headroom, "error in error handling", which skips the handler
-/// (`luaD_errerr`).
-pub(crate) fn stack_overflow<'gc>(ctx: Context<'gc>, ts: &ThreadState<'gc>) -> Error<'gc> {
+/// overflow" at the running frame's position, or, when a message handler
+/// already runs in the headroom, "error in error handling", which skips the
+/// handler (`luaD_errerr`).
+pub(crate) fn stack_overflow<'gc>(
+    ctx: Context<'gc>,
+    ts: &ThreadState<'gc>,
+    positioned: bool,
+) -> Error<'gc> {
     if ts.in_error_headroom() {
         error_in_error_handling(ctx)
     } else {
-        Error::from_str(ctx, &op_error_message(ctx, ts, OpError::StackOverflow))
+        let msg = op_error_message(ctx, ts, OpError::StackOverflow);
+        // `luaG_runerror`: positioned only when the running function is Lua.
+        if positioned && !ts.top_is_native() {
+            error_at(ctx, ts, &msg, 0)
+        } else {
+            Error::new(ctx, Value::string(LuaString::new(ctx, msg.as_bytes())))
+        }
     }
 }
 

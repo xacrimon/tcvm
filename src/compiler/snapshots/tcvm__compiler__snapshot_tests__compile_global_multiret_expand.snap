@@ -2,7 +2,7 @@
 source: src/compiler/snapshot_tests.rs
 expression: output
 ---
-; function (params=0, vararg=true, stack=5, upvalues=1)
+; function (params=0, vararg=true, stack=8, upvalues=1)
 ; constants:
 ;   K0 = 100
 ;   K1 = 200
@@ -13,8 +13,8 @@ expression: output
 0001  [  7]  CLOSURE         R0 P0
 0002  [ 38]  CLOSURE         R1 P1
 0003  [ 40]  MOVE            R2 R1
-0004  [ 40]  LOAD            R3 K0  ; 100
-0005  [ 40]  LOAD            R4 K1  ; 200
+0004  [ 40]  LOAD            R6 K0  ; 100
+0005  [ 40]  LOAD            R7 K1  ; 200
 0006  [ 40]  CALL_R0         R2 args=3
 0007  [ 40]  RETURN          R0 count=1
 
@@ -29,7 +29,7 @@ expression: output
   0002  [  6]  RETURN          R0 count=3
 
 ; prototype 1:
-  ; function (params=0, vararg=true, stack=14, upvalues=2)
+  ; function (params=0, vararg=true, stack=17, upvalues=2)
   ; constants:
   ;   K0 = "a"
   ;   K1 = "b"
@@ -104,18 +104,18 @@ expression: output
   0051  [ 25]  ERRNNIL         R3 name=K13
   0052  [ 25]  SETTABUP        R2 U0 K13  ; "n"
   0053  [ 26]  GETTABUP        R1 U0 K14  ; "print"
-  0054  [ 26]  GETTABUP        R2 U0 K0  ; "a"
-  0055  [ 26]  GETTABUP        R3 U0 K1  ; "b"
-  0056  [ 26]  GETTABUP        R4 U0 K3  ; "c"
-  0057  [ 26]  GETTABUP        R5 U0 K4  ; "d"
-  0058  [ 26]  GETTABUP        R6 U0 K5  ; "e"
-  0059  [ 26]  GETTABUP        R7 U0 K6  ; "g"
-  0060  [ 26]  GETTABUP        R8 U0 K7  ; "h"
-  0061  [ 26]  GETTABUP        R9 U0 K8  ; "i"
-  0062  [ 26]  GETTABUP        R10 U0 K10  ; "j"
-  0063  [ 26]  GETTABUP        R11 U0 K11  ; "k"
-  0064  [ 26]  GETTABUP        R12 U0 K12  ; "l"
-  0065  [ 26]  GETTABUP        R13 U0 K13  ; "n"
+  0054  [ 26]  GETTABUP        R5 U0 K0  ; "a"
+  0055  [ 26]  GETTABUP        R6 U0 K1  ; "b"
+  0056  [ 26]  GETTABUP        R7 U0 K3  ; "c"
+  0057  [ 26]  GETTABUP        R8 U0 K4  ; "d"
+  0058  [ 26]  GETTABUP        R9 U0 K5  ; "e"
+  0059  [ 26]  GETTABUP        R10 U0 K6  ; "g"
+  0060  [ 26]  GETTABUP        R11 U0 K7  ; "h"
+  0061  [ 26]  GETTABUP        R12 U0 K8  ; "i"
+  0062  [ 26]  GETTABUP        R13 U0 K10  ; "j"
+  0063  [ 26]  GETTABUP        R14 U0 K11  ; "k"
+  0064  [ 26]  GETTABUP        R15 U0 K12  ; "l"
+  0065  [ 26]  GETTABUP        R16 U0 K13  ; "n"
   0066  [ 26]  CALL_R0         R1 args=13
   0067  [ 36]  CLOSURE         R1 P1
   0068  [ 37]  MOVE            R2 R1
@@ -133,7 +133,7 @@ expression: output
     0002  [ 21]  RETURN          R1 count=3
 
   ; prototype 1:
-    ; function (params=0, vararg=false, stack=4, upvalues=2)
+    ; function (params=0, vararg=false, stack=7, upvalues=2)
     ; constants:
     ;   K0 = "m"
     ;   K1 = "o"
@@ -154,8 +154,8 @@ expression: output
     0007  [ 34]  ERRNNIL         R2 name=K2
     0008  [ 34]  SETTABUP        R1 U0 K2  ; "p"
     0009  [ 35]  GETTABUP        R0 U0 K3  ; "print"
-    0010  [ 35]  LOAD            R1 K4  ; "up_recv"
-    0011  [ 35]  GETTABUP        R2 U0 K1  ; "o"
-    0012  [ 35]  GETTABUP        R3 U0 K2  ; "p"
+    0010  [ 35]  LOAD            R4 K4  ; "up_recv"
+    0011  [ 35]  GETTABUP        R5 U0 K1  ; "o"
+    0012  [ 35]  GETTABUP        R6 U0 K2  ; "p"
     0013  [ 35]  CALL_R0         R0 args=4
     0014  [ 36]  RETURN0

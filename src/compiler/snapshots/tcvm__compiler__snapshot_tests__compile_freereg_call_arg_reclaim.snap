@@ -2,7 +2,7 @@
 source: src/compiler/snapshot_tests.rs
 expression: output
 ---
-; function (params=0, vararg=true, stack=6, upvalues=1)
+; function (params=0, vararg=true, stack=9, upvalues=1)
 ; constants:
 ;   K0 = 1
 ;   K1 = 2
@@ -14,13 +14,13 @@ expression: output
 0001  [  1]  CLOSURE         R0 P0
 0002  [  2]  NEWTABLE        R1 T0  ; {} items=2
 0003  [  2]  MOVE            R2 R0
-0004  [  2]  LOAD            R3 K0  ; 1
+0004  [  2]  LOAD            R6 K0  ; 1
 0005  [  2]  CALL_R1         R2 args=2
 0006  [  2]  MOVE            R3 R0
-0007  [  2]  LOAD            R4 K1  ; 2
+0007  [  2]  LOAD            R7 K1  ; 2
 0008  [  2]  CALL_R1         R3 args=2
 0009  [  2]  MOVE            R4 R0
-0010  [  2]  LOAD            R5 K2  ; 3
+0010  [  2]  LOAD            R8 K2  ; 3
 0011  [  2]  CALL            R4 args=2 ret=0
 0012  [  2]  SETLIST         R1 count=0 offset=0
 0013  [  3]  LOAD            R2 K0  ; 1

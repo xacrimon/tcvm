@@ -80,14 +80,17 @@ fn close_errors_are_positioned_at_the_closing_frame() {
 
 #[test]
 fn argument_count_past_255() {
-    let args = (1..=252)
+    // 250 arguments fill the registers a call can use (the function, three
+    // hidden slots and a local take the rest); six hops push the count past
+    // the CALL's 8-bit operand.
+    let args = (1..=250)
         .map(|i| i.to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    let tail = format!("local function g(c) return c({args}) end return tostring(g(chain(4)))");
+    let tail = format!("local function g(c) return c({args}) end return tostring(g(chain(6)))");
     assert_eq!(ok(&tail), "256");
     let call = format!(
-        "local function g(c) local r = c({args}) return r end return tostring(g(chain(4)))"
+        "local function g(c) local r = c({args}) return r end return tostring(g(chain(6)))"
     );
     assert_eq!(ok(&call), "256");
 }

@@ -8,7 +8,7 @@ use crate::env::{Error, Function, LuaString, MetamethodBits, NativeClosure, Stac
 use crate::lua::Context;
 use crate::vm::async_native::{AsyncError, Cx};
 use crate::vm::debug::object_type_name;
-use crate::vm::interp::{IndexChain, NewIndexChain, walk_index_chain, walk_newindex_chain};
+use crate::vm::{IndexChain, NewIndexChain, walk_index_chain, walk_newindex_chain};
 
 /// Append the canonical Lua textual form of an integer.
 pub(crate) fn push_int(out: &mut Vec<u8>, i: i64) {

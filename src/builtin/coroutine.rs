@@ -1,12 +1,12 @@
 use crate::Context;
 use crate::builtin::util;
 use crate::env::function::NativeKind;
-use crate::env::thread::{ExecKind, ThreadStatus};
+use crate::env::thread::ThreadStatus;
 use crate::env::{
     Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Thread, Value,
 };
 use crate::vm::native::{CallbackAction, Execution, OnOk};
-use crate::vm::{close, interp};
+use crate::vm::{close, coro};
 
 pub fn load<'gc>(ctx: Context<'gc>) {
     let lib = Table::new(ctx);
@@ -29,12 +29,12 @@ pub fn load<'gc>(ctx: Context<'gc>) {
     let resume = NativeKind::Action(lua_resume);
     set(
         "resume",
-        Function::new_native_with_entry(mc, resume, &[], interp::ff_resume),
+        Function::new_native_with_entry(mc, resume, &[], coro::ff_resume),
     );
     let yield_ = NativeKind::Action(lua_yield);
     set(
         "yield",
-        Function::new_native_with_entry(mc, yield_, &[], interp::ff_yield),
+        Function::new_native_with_entry(mc, yield_, &[], coro::ff_yield),
     );
 
     let lib_name = Value::string(LuaString::new(ctx, b"coroutine"));
@@ -53,12 +53,7 @@ fn lua_create<'gc>(
         .get_function()
         .ok_or_else(|| util::type_error(ctx, "create", 1, "function", stack.arg(0)))?;
     let thread = Thread::new(ctx.mutation());
-    {
-        let mc = ctx.mutation();
-        let mut ts = thread.borrow_mut(mc);
-        ts.push_exec(ExecKind::Start(f.into()));
-        ts.status = ThreadStatus::Suspended;
-    }
+    thread.borrow_mut(ctx.mutation()).seed(Value::function(f));
     stack.ret1(Value::thread(thread));
     Ok(())
 }
@@ -127,9 +122,9 @@ fn unresumable_reason<'gc>(
     match co.peer_status() {
         ThreadStatus::Suspended => {
             let ts = co.borrow();
-            // The args land where `co` yielded, or above the function in slot 0
-            // on a first resume.
-            let bottom = ts.yield_bottom.map_or(1, |y| y.bottom);
+            // The args land where `co` yielded, or above the header of the
+            // function in slot 0 on a first resume.
+            let bottom = ts.yield_bottom.unwrap_or(4);
             (nargs > ts.stack_limit.saturating_sub(bottom))
                 .then_some("too many arguments to resume")
         }
@@ -234,17 +229,12 @@ fn lua_wrap<'gc>(
         .get_function()
         .ok_or_else(|| util::type_error(ctx, "wrap", 1, "function", stack.arg(0)))?;
     let thread = Thread::new(ctx.mutation());
-    {
-        let mc = ctx.mutation();
-        let mut ts = thread.borrow_mut(mc);
-        ts.push_exec(ExecKind::Start(f.into()));
-        ts.status = ThreadStatus::Suspended;
-    }
+    thread.borrow_mut(ctx.mutation()).seed(Value::function(f));
     let wrapper = Function::new_native_with_entry(
         ctx.mutation(),
         NativeKind::Action(wrap_callback),
         &[Value::thread(thread)],
-        interp::ff_wrap,
+        coro::ff_wrap,
     );
     stack.ret1(Value::function(wrapper));
     Ok(())

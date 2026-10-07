@@ -2,7 +2,7 @@
 source: src/compiler/snapshot_tests.rs
 expression: output
 ---
-; function (params=0, vararg=true, stack=7, upvalues=1)
+; function (params=0, vararg=true, stack=9, upvalues=1)
 ; constants:
 ;   K0 = 2
 ;   K1 = 0
@@ -19,7 +19,7 @@ expression: output
 0004  [ 13]  LOAD            R3 K2  ; ""
 0005  [ 14]  JNLTI           R2 #10000 +12
 0006  [ 15]  MOVE            R4 R0
-0007  [ 15]  MOVE            R5 R1
+0007  [ 15]  MOVE            R8 R1
 0008  [ 15]  CALL_R1         R4 args=2
 0009  [ 15]  JF              R4 +6
 0010  [ 16]  ADDI            R2 R2 #1
@@ -31,7 +31,7 @@ expression: output
 0016  [ 20]  ADDI            R1 R1 #1
 0017  [ 20]  JMP             -13
 0018  [ 23]  GETTABUP        R4 U0 K4  ; "print"
-0019  [ 23]  MOVE            R5 R3
+0019  [ 23]  MOVE            R8 R3
 0020  [ 23]  CALL_R0         R4 args=2
 0021  [ 23]  RETURN          R0 count=1
 

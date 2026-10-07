@@ -13,19 +13,19 @@ expression: output
 0004  [ 16]  RETURN          R0 count=1
 
 ; prototype 0:
-  ; function (params=2, vararg=false, stack=5, upvalues=0)
+  ; function (params=2, vararg=false, stack=8, upvalues=0)
   ; constants:
   ;   K0 = 1
   ; code:
   0000  [  3]  MOVE            R2 R0
   0001  [  3]  TBC             R2
   0002  [  4]  MOVE            R3 R1
-  0003  [  4]  LOAD            R4 K0  ; 1
+  0003  [  4]  LOAD            R7 K0  ; 1
   0004  [  4]  CALL            R3 args=2 ret=0
   0005  [  4]  RETURN          R3 count=0
 
 ; prototype 1:
-  ; function (params=2, vararg=false, stack=5, upvalues=0)
+  ; function (params=2, vararg=false, stack=8, upvalues=0)
   ; constants:
   ;   K0 = "get"
   ; code:
@@ -36,7 +36,7 @@ expression: output
   0004  [  9]  RETURN          R3 count=0
 
 ; prototype 2:
-  ; function (params=2, vararg=false, stack=4, upvalues=0)
+  ; function (params=2, vararg=false, stack=7, upvalues=0)
   ; constants:
   ;   K0 = 1
   ; code:
@@ -44,5 +44,5 @@ expression: output
   0001  [ 14]  TBC             R2
   0002  [ 14]  CLOSE           R2
   0003  [ 15]  MOVE            R2 R1
-  0004  [ 15]  LOAD            R3 K0  ; 1
+  0004  [ 15]  LOAD            R6 K0  ; 1
   0005  [ 15]  TAILCALL        R2 args=2

@@ -11,26 +11,101 @@ use crate::dmm::{DynamicRootSet, Mutation};
 use crate::env::function::{Function, UpvalueCell, UpvalueSlot};
 use crate::env::shape::{MetamethodBits, Shape, inline_bucket};
 use crate::env::string::Interner;
+use crate::env::thread::ThreadState;
 use crate::env::{LuaString, Symbols, Table, Value};
 use crate::lua::stash::{Fetchable, Stashable};
 use crate::lua::{LoadError, State, SyntaxError, bare_io_msg};
 use crate::parser;
+use crate::vm::abi::Handler;
 use crate::vm::debug::chunk_id;
+use crate::vm::native::NativeCont;
+use crate::vm::unwind::OpError;
 
-/// Cheap, copy handle into the arena mutation context.
+/// Cheap, copy handle into the runtime: one word, the `State`, whose first
+/// bytes are the dispatch tables (so the interpreter's `rt` slot is also the
+/// table base) and which caches the arena's mutation context.
 #[derive(Copy, Clone)]
 pub struct Context<'gc> {
-    mutation: &'gc Mutation<'gc>,
     state: &'gc State<'gc>,
 }
 
 impl<'gc> Context<'gc> {
     pub(crate) fn new(mutation: &'gc Mutation<'gc>, state: &'gc State<'gc>) -> Self {
-        Context { mutation, state }
+        state.rt.mutation.set(mutation);
+        Context { state }
     }
 
+    #[inline(always)]
     pub fn mutation(self) -> &'gc Mutation<'gc> {
-        self.mutation
+        // SAFETY: set by `Context::new` inside `Lua::enter`, whose closure
+        // every `Context` lives in.
+        unsafe { &*self.state.rt.mutation.get() }
+    }
+
+    /// The handler of opcode byte `op`.
+    #[inline(always)]
+    pub(crate) fn handler(self, op: u8) -> Handler {
+        // SAFETY: `State` is `repr(C)` with the 256-entry table first.
+        unsafe {
+            *(self.state as *const State<'gc>)
+                .cast::<Handler>()
+                .add(op as usize)
+        }
+    }
+
+    /// The CALL continuation for `c` results wanted (0 = MULTRET).
+    #[inline(always)]
+    pub(crate) fn ret(self, c: u8) -> Handler {
+        // SAFETY: the `rets` table follows `dispatch`.
+        unsafe {
+            *(self.state as *const State<'gc>)
+                .cast::<Handler>()
+                .add(256 + c as usize)
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn thread_ptr(self) -> *mut ThreadState<'gc> {
+        self.state.rt.thread.get()
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_thread(self, ts: *mut ThreadState<'gc>) {
+        self.state.rt.thread.set(ts);
+    }
+
+    /// Whether allocation since the last check may owe the collector work.
+    #[inline(always)]
+    pub(crate) fn gc_due(self) -> bool {
+        // SAFETY: the metrics live as long as the arena.
+        unsafe { (*self.state.rt.metrics).gc_check_due() }
+    }
+
+    pub(crate) fn set_fault(self, fault: OpError<'gc>) {
+        self.state.rt.fault.set(Some(fault));
+    }
+
+    pub(crate) fn take_fault(self) -> OpError<'gc> {
+        self.state
+            .rt
+            .fault
+            .take()
+            .expect("impl_error without a pending fault")
+    }
+
+    /// The index of continuation `f`, registered on first use.
+    pub(crate) fn cont_index(self, f: NativeCont) -> u8 {
+        let mut conts = self.state.rt.conts.borrow_mut();
+        if let Some(i) = conts.iter().position(|&g| std::ptr::fn_addr_eq(g, f)) {
+            return i as u8;
+        }
+        assert!(conts.len() < 64, "more than 64 continuation natives");
+        conts.push(f);
+        (conts.len() - 1) as u8
+    }
+
+    pub(crate) fn cont(self, idx: u8) -> NativeCont {
+        self.state.rt.conts.borrow()[idx as usize]
     }
 
     pub fn globals(self) -> Table<'gc> {
@@ -190,9 +265,9 @@ impl<'gc> Context<'gc> {
         if let Some(t) = v.get_table() {
             t.set_metatable(self, mt);
         } else if let Some(u) = v.get_userdata() {
-            u.set_metatable(self.mutation, mt);
+            u.set_metatable(self.mutation(), mt);
         } else {
-            self.state.type_metatable(v.kind()).set(self.mutation, mt);
+            self.state.type_metatable(v.kind()).set(self.mutation(), mt);
         }
     }
 
@@ -205,11 +280,11 @@ impl<'gc> Context<'gc> {
     }
 
     pub fn stash<S: Stashable<'gc>>(self, s: S) -> S::Stashed {
-        s.stash(self.mutation, self.state.roots)
+        s.stash(self.mutation(), self.state.roots)
     }
 
     pub fn fetch<F: Fetchable>(self, f: &F) -> F::Fetched<'gc> {
-        f.fetch(self.mutation, self.state.roots)
+        f.fetch(self.mutation(), self.state.roots)
     }
 
     /// Parse and compile `source` into a `Function`, with `_ENV` bound to the
@@ -313,10 +388,10 @@ impl<'gc> Context<'gc> {
             UpvalueSlot { value: env }
         } else {
             UpvalueSlot {
-                cell: UpvalueCell::new_closed(self.mutation, env),
+                cell: UpvalueCell::new_closed(self.mutation(), env),
             }
         };
-        Ok(Function::new_lua(self.mutation, proto, |dst| unsafe {
+        Ok(Function::new_lua(self.mutation(), proto, |dst| unsafe {
             dst.write(env)
         }))
     }

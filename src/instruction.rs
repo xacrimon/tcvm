@@ -918,6 +918,10 @@ instructions! {
     /// An immediate-form op whose register operand is a table with the
     /// metamethod: `c` is `flipped | original opcode << 1`.
     0x79 ARITH_MMI  arith_mmi   AbcImm { dst: Reg, src: Reg, flipped: bool, imm: Imm }
+
+    /// `R[dst] = imm`, a small integer, and `R[dst .. dst+count) = nil`.
+    0x7a LOADI      loadi       AImm  { dst: Reg, imm: i32 }
+    0x7b LOADNIL    loadnil     Ab    { dst: Reg, count: u8 }
 }
 
 impl Op {

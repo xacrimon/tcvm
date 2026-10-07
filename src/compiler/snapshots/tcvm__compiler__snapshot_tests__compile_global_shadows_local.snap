@@ -2,7 +2,7 @@
 source: src/compiler/snapshot_tests.rs
 expression: output
 ---
-; function (params=0, vararg=true, stack=3, upvalues=1)
+; function (params=0, vararg=true, stack=6, upvalues=1)
 ; constants:
 ;   K0 = 1
 ;   K1 = "v"
@@ -16,6 +16,6 @@ expression: output
 0002  [  5]  LOAD            R1 K2  ; 2
 0003  [  5]  SETTABUP        R1 U0 K1  ; "v"
 0004  [  7]  GETTABUP        R1 U0 K3  ; "print"
-0005  [  7]  MOVE            R2 R0
+0005  [  7]  MOVE            R5 R0
 0006  [  7]  CALL_R0         R1 args=2
 0007  [  7]  RETURN          R0 count=1

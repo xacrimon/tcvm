@@ -5,11 +5,11 @@ use crate::env::{
     Value,
 };
 use crate::vm::async_native::{AsyncError, Cx};
-use crate::vm::interp::{
-    IndexChain, NewIndexChain, binop_metamethod, walk_index_chain, walk_newindex_chain,
-};
 use crate::vm::native::CallbackAction;
 use crate::vm::num;
+use crate::vm::{
+    IndexChain, NewIndexChain, binop_metamethod, walk_index_chain, walk_newindex_chain,
+};
 
 // What an argument must support (`ltablib.c`'s `TAB_R`/`TAB_W`/`TAB_L`).
 const TAB_R: MetamethodBits = MetamethodBits::INDEX;

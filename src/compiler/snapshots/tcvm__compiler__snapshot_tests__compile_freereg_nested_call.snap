@@ -2,7 +2,7 @@
 source: src/compiler/snapshot_tests.rs
 expression: output
 ---
-; function (params=0, vararg=true, stack=5, upvalues=1)
+; function (params=0, vararg=true, stack=14, upvalues=1)
 ; constants:
 ;   K0 = 2
 ; upvalues:
@@ -11,11 +11,11 @@ expression: output
 0000  [  1]  VARARGPREP      fixed=0
 0001  [  1]  CLOSURE         R0 P0
 0002  [  2]  MOVE            R1 R0
-0003  [  2]  MOVE            R2 R0
-0004  [  2]  MOVE            R3 R0
-0005  [  2]  LOAD            R4 K0  ; 2
-0006  [  2]  CALL            R3 args=2 ret=0
-0007  [  2]  CALL            R2 args=0 ret=0
+0003  [  2]  MOVE            R5 R0
+0004  [  2]  MOVE            R9 R0
+0005  [  2]  LOAD            R13 K0  ; 2
+0006  [  2]  CALL            R9 args=2 ret=0
+0007  [  2]  CALL            R5 args=0 ret=0
 0008  [  2]  TAILCALL        R1 args=0
 
 ; prototype 0:
