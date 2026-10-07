@@ -9,11 +9,10 @@ expression: output
 0000  [  1]  VARARGPREP      fixed=0
 0001  [  7]  CLOSURE         R0 P0
 0002  [ 38]  CLOSURE         R1 P1
-0003  [ 40]  MOVE            R2 R1
-0004  [ 40]  LOADI           R6 100
-0005  [ 40]  LOADI           R7 200
-0006  [ 40]  CALL_R0         R2 args=3
-0007  [ 40]  RETURN          R0 count=1
+0003  [ 40]  LOADI           R6 100
+0004  [ 40]  LOADI           R7 200
+0005  [ 40]  CALLS_R0        R2 args=3 f=R1
+0006  [ 40]  RETURN          R0 count=1
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=2, upvalues=0)
@@ -111,9 +110,8 @@ expression: output
   0065  [ 26]  GETTABUP        R16 U0 K12  ; "n"
   0066  [ 26]  CALL_R0         R1 args=13
   0067  [ 36]  CLOSURE         R1 P1
-  0068  [ 37]  MOVE            R2 R1
-  0069  [ 37]  CALL_R0         R2 args=1
-  0070  [ 38]  RETURN          R0 count=1
+  0068  [ 37]  CALLS_R0        R2 args=1 f=R1
+  0069  [ 38]  RETURN          R0 count=1
 
   ; prototype 0:
     ; function (params=1, vararg=false, stack=3, upvalues=0)

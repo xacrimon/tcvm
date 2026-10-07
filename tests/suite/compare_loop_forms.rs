@@ -27,6 +27,19 @@ out[#out + 1] = 'nlt ' .. run(function(a, b) if a < b then return 'y' else retur
 out[#out + 1] = 'nle ' .. run(function(a, b) if a <= b then return 'y' else return 'n' end end)
 out[#out + 1] = 'eq ' .. run(function(a, b) return a == b end)
 out[#out + 1] = 'neq ' .. run(function(a, b) if a ~= b then return 'y' else return 'n' end end)
+-- float-first register sites: every guard failure of the _FF forms
+local pairs_f = {{1.5, 2.5}, {2.5, 1.5}, {1.5, 1.5}, {nan, 1.5}, {1.5, nan}, {1, 2}, {1.5, 2}, {big, 1.5}, {'a', 'b'}, {v, w}, {v, 1.5}, {1.5, 2.5}}
+local function runf(f)
+  local r = {}
+  for _, p in ipairs(pairs_f) do local ok, x = pcall(f, p[1], p[2]) r[#r + 1] = ok and tostring(x) or x:match('attempt to [^(]*[^ (]') end
+  return table.concat(r, ',')
+end
+out[#out + 1] = 'ltf ' .. runf(function(a, b) return a < b end)
+out[#out + 1] = 'lef ' .. runf(function(a, b) return a <= b end)
+out[#out + 1] = 'nltf ' .. runf(function(a, b) if a < b then return 'y' else return 'n' end end)
+out[#out + 1] = 'nlef ' .. runf(function(a, b) if a <= b then return 'y' else return 'n' end end)
+out[#out + 1] = 'eqf ' .. runf(function(a, b) return a == b end)
+out[#out + 1] = 'neqf ' .. runf(function(a, b) if a ~= b then return 'y' else return 'n' end end)
 -- immediate compares: float-first sites then ints, boxed, strings, tables
 local one = {{1.5}, {2.5}, {1}, {2}, {big}, {-big}, {nan}, {'x'}, {v}, {3}, {3.0}}
 local function one_(f) local r = {} for _, p in ipairs(one) do local ok, x = pcall(f, p[1]) r[#r + 1] = ok and tostring(x) or x:match('attempt to [^(]*[^ (]') end return table.concat(r, ',') end
@@ -74,6 +87,12 @@ nlt y,n,n,y,n,y,n,n,n,y,n,y,n,y,y,y,n
 nle y,n,y,y,n,y,n,n,n,y,y,y,n,n,n,y,n
 eq false,false,true,false,false,false,false,false,false,false,true,false,false,true,false,false,false
 neq y,y,n,y,y,y,y,y,y,y,n,y,y,n,y,y,y
+ltf true,false,false,false,false,true,true,false,true,true,true,true
+lef true,false,true,false,false,true,true,false,true,false,false,true
+nltf y,n,n,n,n,y,y,n,y,y,y,y
+nlef y,n,y,n,n,y,y,n,y,n,n,y
+eqf false,false,true,false,false,false,false,false,false,true,false,false
+neqf y,y,n,y,y,y,y,y,y,n,y,y
 lti true,false,true,false,false,true,false,attempt to compare string with number,true,false,false
 lei true,false,true,true,false,true,false,attempt to compare string with number,false,false,false
 gti false,true,false,false,true,false,false,attempt to compare number with string,true,true,true

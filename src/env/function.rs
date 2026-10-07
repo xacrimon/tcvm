@@ -324,9 +324,11 @@ pub struct LuaClosure<'gc> {
     pub max_stack_size: u8,
     pub num_params: u8,
     pub is_vararg: bool,
-    /// `num_params`, or 255 for a vararg function: a CALL passing more
-    /// than this many arguments (`nargs + 1`, never 256) needs no fixups.
-    pub fixed_arity: u8,
+    /// `num_params`, or `u16::MAX` for a vararg function: a call passing
+    /// fewer arguments than this needs the fixups (`nargs < fixed_arity`;
+    /// a CALL compares `nargs + 1 <= fixed_arity`). One compare for both
+    /// tests, and no argument count reaches the vararg value.
+    pub fixed_arity: u16,
     /// Here rather than read from `proto`, which the collector may have freed
     /// by the time it sizes this cell.
     num_upvalues: u8,
@@ -741,9 +743,9 @@ impl<'gc> Function<'gc> {
             num_params: proto.num_params,
             is_vararg: proto.is_vararg,
             fixed_arity: if proto.is_vararg {
-                u8::MAX
+                u16::MAX
             } else {
-                proto.num_params
+                proto.num_params as u16
             },
             num_upvalues: proto.num_upvalues,
         };
