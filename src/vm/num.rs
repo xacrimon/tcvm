@@ -362,7 +362,9 @@ impl ArithOp for IDiv {
     #[inline(always)]
     fn small<'gc>(lhs: i32, rhs: i32) -> Option<Value<'gc>> {
         let q = lhs.checked_div(rhs)?;
-        let r = lhs.wrapping_rem(rhs);
+        // Not `wrapping_rem`: its zero-divisor panic path would give the
+        // handler a stack frame, though `checked_div` excluded zero.
+        let r = lhs.wrapping_sub(q.wrapping_mul(rhs));
         // `q - 1` only when the signs differ, so q <= 0 and it cannot overflow.
         let adjusted = if r != 0 && (lhs ^ rhs) < 0 { q - 1 } else { q };
         Some(Value::small(adjusted))

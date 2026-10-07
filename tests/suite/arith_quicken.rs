@@ -1,5 +1,5 @@
-//! Binary arithmetic sites the slow path quickens (`ADD_NUM`, `ARITH_MM`,
-//! `ARITH_MM_R`, `ARITH_MMI`), and back. Expected strings come from `lua`
+//! Binary arithmetic sites the generic handler specializes (the numeric
+//! forms, `ARITH_MM`, `ARITH_MM_R`, `ARITH_MMI`), and back. Expected strings come from `lua`
 //! 5.5.1 running the same chunk.
 
 use crate::common::ok;
@@ -126,7 +126,7 @@ return table.concat(out, ' ')
     );
 }
 
-/// Mixed int/float sites quicken to their `_NUM` forms, which must still handle
+/// Mixed int/float sites take their `_IF`/`_FI` forms, which must still handle
 /// every other operand pair: overflow, boxed ints, strings, zero divisors.
 #[test]
 fn mixed_numbers() {

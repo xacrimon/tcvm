@@ -1,4 +1,5 @@
 mod arg_type_errors;
+mod arith_forms;
 mod arith_quicken;
 mod assign_multires;
 mod async_native;
