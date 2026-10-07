@@ -228,6 +228,28 @@ impl<'gc> Table<'gc> {
         self.0.borrow_mut(ctx.mutation()).raw_set(ctx, key, value);
     }
 
+    /// [`raw_get`](Self::raw_get) of the integer key `k`, the array part inline.
+    #[inline]
+    pub fn raw_get_index(self, k: usize) -> Value<'gc> {
+        let t = self.0.borrow();
+        match t.array_get(k) {
+            Some(v) => v,
+            None => t.get_int(k as i64),
+        }
+    }
+
+    /// [`raw_set`](Self::raw_set) of the integer key `k`, the array part inline.
+    #[inline]
+    pub fn raw_set_index(self, ctx: Context<'gc>, k: usize, value: Value<'gc>) {
+        let mut t = self.0.borrow_mut(ctx.mutation());
+        if t.array_get(k).is_some() {
+            // SAFETY: `array_get` found the slot inside the array part.
+            unsafe { t.set_array_at(k, value) }
+        } else {
+            t.raw_set(ctx, Value::integer(ctx.mutation(), k as i64), value);
+        }
+    }
+
     /// See [`TableState::raw_set_keyed`].
     pub fn raw_set_keyed(self, ctx: Context<'gc>, key: Value<'gc>, value: Value<'gc>) {
         self.0

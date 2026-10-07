@@ -520,6 +520,21 @@ impl<'gc, 'a> Stack<'gc, 'a> {
         }
     }
 
+    /// [`extend`](Self::extend) with one growth check and one top store
+    /// (`push` per value chains them through `top`). A loop, not
+    /// `copy_from_slice`: a `memcpy` call for a few values cost the
+    /// comparator sort a fifth of its time.
+    #[inline]
+    pub fn extend_from_slice(&mut self, values: &[Value<'gc>]) {
+        let top = self.thread.top;
+        let end = top + values.len();
+        self.thread.ensure_slots(end);
+        for (i, v) in values.iter().enumerate() {
+            self.thread.stack[top + i] = *v;
+        }
+        self.thread.top = end;
+    }
+
     /// Shift `stack[i..]` up one and put `v` at `i`.
     #[inline]
     pub fn insert(&mut self, i: usize, v: Value<'gc>) {

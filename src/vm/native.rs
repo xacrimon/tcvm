@@ -290,6 +290,21 @@ impl NativeOut {
         Self::packed(tag::CALL_THEN, at, cont, ok, protect)
     }
 
+    /// [`call_then`](Self::call_then) for a native that laid the call out
+    /// as a frame already, `[f, _, _, _, args..]` at `at`, so the
+    /// arguments need no move.
+    pub(crate) fn call_then_staged(at: usize, cont: ContIdx, protect: Protect, ok: OnOk) -> Self {
+        NativeOut(Self::call_then(at, cont, protect, ok).0 | Self::STAGED)
+    }
+
+    /// Set on a `CALL_THEN` whose arguments are in frame layout already.
+    const STAGED: u64 = 1 << 5;
+
+    #[inline]
+    pub(crate) fn staged(self) -> bool {
+        self.0 & Self::STAGED != 0
+    }
+
     /// Resume the coroutine at `stack[at]` with the values above it, then run
     /// `cont` with what it yields or returns in their place, or with the
     /// error that killed it.
@@ -651,7 +666,8 @@ handler! {
 /// Make the native frame at header `hdr` (window `hdr + 4`) wait for the
 /// call at window slot `at`, whose arguments follow it: the frame's word 0
 /// records `at`, `cont` and `ok`, the arguments move up past the hidden slots
-/// and the callee's header gets `ret_native`.
+/// (unless `staged` laid them out there) and the callee's header gets
+/// `ret_native`.
 fn stage_call<'gc>(
     ts: &mut ThreadState<'gc>,
     hdr: usize,
@@ -660,13 +676,19 @@ fn stage_call<'gc>(
     cont: u8,
     okk: u8,
     protect: Protect,
+    staged: bool,
 ) -> Jump<'gc> {
     let win = hdr + HDR;
     let callee = win + at;
-    let nargs = ts.top - (callee + 1);
-    ts.ensure_slots(ts.top + 3);
-    ts.stack.copy_within(callee + 1..ts.top, callee + HDR);
-    ts.top += 3;
+    let nargs = if staged {
+        ts.top - (callee + HDR)
+    } else {
+        let nargs = ts.top - (callee + 1);
+        ts.ensure_slots(ts.top + 3);
+        ts.stack.copy_within(callee + 1..ts.top, callee + HDR);
+        ts.top += 3;
+        nargs
+    };
     let win_ptr = ts.slot_ptr(win);
     unsafe {
         let h = ts.slot_ptr(hdr).cast::<u64>();
@@ -731,7 +753,16 @@ pub(crate) fn drive<'gc>(
                 return crate::vm::unwind::unwind(ctx, ts, out.into_error());
             }
             tag::CALL_THEN => {
-                return stage_call(t, hdr, nc, out.at(), out.cont(), out.ok(), out.protect());
+                return stage_call(
+                    t,
+                    hdr,
+                    nc,
+                    out.at(),
+                    out.cont(),
+                    out.ok(),
+                    out.protect(),
+                    out.staged(),
+                );
             }
             tag::RESUME => {
                 let at = out.at();
