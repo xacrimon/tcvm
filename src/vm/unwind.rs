@@ -10,7 +10,7 @@ use crate::env::{LuaString, MetamethodBits, Value};
 use crate::lua::Context;
 use crate::vm::abi::{Exit, Jump, handler, handler_bits};
 use crate::vm::frame::{self, HDR, NativeHdr, flag};
-use crate::vm::native::{CallbackAction, NativeCont, OnOk, Protect, native_catch, ok};
+use crate::vm::native::{ContIdx, NativeOut, OnOk, Protect, cont, native_catch, ok};
 use crate::vm::ops::call::ret_exit;
 use crate::vm::ops::control::close_upvalues;
 
@@ -92,11 +92,8 @@ pub(crate) fn render<'gc>(
 
 /// Whether the continuation at `cont` catches exits too (`Protect::Base`):
 /// the base-level runner of `coroutine.close`.
-fn catches_exit(ctx: Context<'_>, cont: u8) -> bool {
-    std::ptr::fn_addr_eq(
-        ctx.cont(cont),
-        crate::vm::close::close_entry_cont as NativeCont,
-    )
+fn catches_exit(cont: u8) -> bool {
+    cont == cont::CLOSE_ENTRY.0
 }
 
 /// Unwind `ts` from the raise of `err` to the frame that catches it. An error
@@ -144,7 +141,7 @@ pub(crate) fn unwind<'gc>(
         // decides what the error becomes.
         if native && rw & flag::PROTECTED != 0 {
             let nh = NativeHdr::unpack(unsafe { frame::func_word(base) });
-            if !exit || catches_exit(ctx, nh.cont) {
+            if !exit || catches_exit(nh.cont) {
                 if detached && !exit {
                     let handler = (rw & flag::HANDLER != 0)
                         .then(|| t.stack[bi].get_function())
@@ -250,7 +247,7 @@ fn pop_frame<'gc>(
 ) {
     if native {
         let nh = NativeHdr::unpack(unsafe { frame::func_word(base) });
-        if nh.cont == crate::vm::dispatch::ASYNC_CONT {
+        if nh.cont == cont::ASYNC.0 {
             t.drop_task();
         }
     } else {
@@ -317,7 +314,7 @@ fn push_runner<'gc>(
     window: &[Value<'gc>],
     at: usize,
     protect: Protect,
-    cont: NativeCont,
+    cont: ContIdx,
 ) -> Jump<'gc> {
     let f = ctx.unwind_fn();
     let nc = f.as_native().expect("the unwind native");
@@ -336,7 +333,7 @@ fn push_runner<'gc>(
             ts.slot_ptr(hdr),
             NativeHdr {
                 at,
-                cont: ctx.cont_index(cont),
+                cont: cont.0,
                 ok: ok::CONT,
             }
             .pack(nc),
@@ -390,7 +387,7 @@ fn push_handler<'gc>(
         h,
         err.value(),
     ];
-    push_runner(ctx, ts, &window, 3, Protect::Errors, handler_cont)
+    push_runner(ctx, ts, &window, 3, Protect::Errors, cont::HANDLER)
 }
 
 /// The message handler returned: its first result, marked handled, goes on
@@ -404,7 +401,7 @@ pub(crate) fn handler_cont<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
     status: Result<(), Error<'gc>>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let depth = stack.get(1).get_integer().unwrap_or(0);
     let limit = stack.get(2).get_integer().unwrap_or(0) as usize;
     let err = match status {
@@ -424,16 +421,11 @@ pub(crate) fn handler_cont<'gc>(
             stack.truncate(2);
             stack.extend([Value::small(limit as i32), handler, value]);
             stack.as_mut_slice()[1] = Value::small(depth as i32);
-            return Ok(CallbackAction::CallThen {
-                at: 3,
-                protect: Protect::Errors,
-                ok: OnOk::Cont,
-                cont: handler_cont,
-            });
+            return NativeOut::call_then(3, cont::HANDLER, Protect::Errors, OnOk::Cont);
         }
     };
     stack.thread_mut().stack_limit = limit;
-    Err(err)
+    NativeOut::error(err)
 }
 
 /// Close the variables the walk detached at `ts.top`, with `err` above the
@@ -457,7 +449,7 @@ fn push_close<'gc>(
     let mm = ctx.mm_of(v, MetamethodBits::CLOSE);
     let errv = err.value();
     let window = [handler, Value::small(level as i32), errv, mm, v, errv];
-    push_runner(ctx, ts, &window, 3, protect, close_cont)
+    push_runner(ctx, ts, &window, 3, protect, cont::CLOSE)
 }
 
 fn close_protect(handler: bool) -> Protect {
@@ -491,20 +483,20 @@ pub(crate) fn close_cont<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
     status: Result<(), Error<'gc>>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let errv = match status {
         Ok(()) => stack.get(2),
         Err(e) => e.value(),
     };
     if !close_next(ctx, &mut stack, errv) {
-        return Err(Error::new(ctx, errv).mark_handled());
+        return NativeOut::error(Error::new(ctx, errv).mark_handled());
     }
-    Ok(CallbackAction::CallThen {
-        at: 3,
-        protect: close_protect(!stack.get(0).is_nil()),
-        ok: OnOk::Cont,
-        cont: close_cont,
-    })
+    NativeOut::call_then(
+        3,
+        cont::CLOSE,
+        close_protect(!stack.get(0).is_nil()),
+        OnOk::Cont,
+    )
 }
 
 /// The function of the runner frames: never called.

@@ -1,11 +1,10 @@
 use crate::Context;
 use crate::builtin::util;
 use crate::env::{
-    ActionFn, Error, Function, LuaString, MetamethodBits, NativeClosure, NativeFn, Stack, Table,
-    Value,
+    Error, Function, LuaString, MetamethodBits, NativeClosure, NativeFn, Stack, Table, Value,
 };
 use crate::vm::async_native::{AsyncError, Cx};
-use crate::vm::native::CallbackAction;
+use crate::vm::native::{ContFn, NativeOut, OnOk, Protect, cont};
 use crate::vm::num;
 use crate::vm::{
     IndexChain, NewIndexChain, binop_metamethod, walk_index_chain, walk_newindex_chain,
@@ -59,7 +58,7 @@ fn check_tab_meta<'gc>(
 
 pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[("create", lua_create), ("pack", lua_pack)];
-    let actions: &[(&str, ActionFn)] = &[
+    let actions: &[(&str, ContFn)] = &[
         ("concat", lua_concat),
         ("insert", lua_insert),
         ("move", lua_move),
@@ -77,7 +76,7 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         set(name, Function::new_native(ctx.mutation(), handler, &[]));
     }
     for &(name, handler) in actions {
-        set(name, Function::new_action(ctx.mutation(), handler, &[]));
+        set(name, Function::new_cont(ctx.mutation(), handler, &[]));
     }
 
     let lib_name = Value::string(LuaString::new(ctx, b"table"));
@@ -90,9 +89,9 @@ fn lua_concat<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let Some(t) = check_tab(ctx, stack.get(0), "concat", 1, TAB_R | TAB_L)? else {
-        return Ok(concat_meta(ctx, &mut stack));
+        return concat_meta(ctx, &mut stack);
     };
     let (sep, mut i, last) = concat_args(ctx, &stack, t.raw_len() as i64)?;
     let s = ctx.with_buf(|out| {
@@ -108,13 +107,13 @@ fn lua_concat<'gc>(
         Ok(LuaString::new(ctx, out))
     })?;
     stack.ret1(Value::string(s));
-    Ok(CallbackAction::Return)
+    NativeOut::RETURN
 }
 
 /// `concat` on a value whose accesses may run metamethods.
 #[cold]
 #[inline(never)]
-fn concat_meta<'gc>(ctx: Context<'gc>, stack: &mut Stack<'gc, '_>) -> CallbackAction {
+fn concat_meta<'gc>(ctx: Context<'gc>, stack: &mut Stack<'gc, '_>) -> NativeOut {
     stack.spawn_action(ctx, |cx| async move {
         let last = util::len(&cx, 0).await?;
         let (sep, mut i, last) = cx.try_enter(|ctx, stack| concat_args(ctx, stack, last))?;
@@ -222,9 +221,9 @@ fn lua_insert<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let Some(t) = check_tab(ctx, stack.get(0), "insert", 1, TAB_R | TAB_W | TAB_L)? else {
-        return Ok(insert_meta(ctx, &mut stack));
+        return insert_meta(ctx, &mut stack);
     };
     let e = (t.raw_len() as i64).wrapping_add(1);
     let pos = insert_pos(ctx, &stack, e)?;
@@ -237,13 +236,13 @@ fn lua_insert<'gc>(
     let v = stack.pop();
     t.raw_set(ctx, Value::integer(ctx.mutation(), pos), v);
     stack.clear();
-    Ok(CallbackAction::Return)
+    NativeOut::RETURN
 }
 
 /// `insert` on a value whose accesses may run metamethods.
 #[cold]
 #[inline(never)]
-fn insert_meta<'gc>(ctx: Context<'gc>, stack: &mut Stack<'gc, '_>) -> CallbackAction {
+fn insert_meta<'gc>(ctx: Context<'gc>, stack: &mut Stack<'gc, '_>) -> NativeOut {
     stack.spawn_action(ctx, |cx| async move {
         let e = util::len(&cx, 0).await?.wrapping_add(1);
         let pos = cx.try_enter(|ctx, stack| insert_pos(ctx, stack, e))?;
@@ -286,7 +285,7 @@ fn lua_move<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let f = util::check_integer(ctx, stack.get(1), "move", 2)?;
     let e = util::check_integer(ctx, stack.get(2), "move", 3)?;
     let t = util::check_integer(ctx, stack.get(3), "move", 4)?;
@@ -296,17 +295,17 @@ fn lua_move<'gc>(
     let (a1, a2) = (stack.get(0), stack.get(tt));
     if e < f {
         stack.ret1(a2);
-        return Ok(CallbackAction::Return);
+        return NativeOut::RETURN;
     }
     // PUC-Lua's two bounds: the element count `e - f + 1` must fit a Lua
     // integer (else `e - f` itself overflows), and the destination range
     // `t .. t + n - 1` must not wrap past maxinteger.
     if !(f > 0 || e < i64::MAX + f) {
-        return Err(util::arg_error(ctx, "move", 3, "too many elements to move"));
+        return NativeOut::error(util::arg_error(ctx, "move", 3, "too many elements to move"));
     }
     let n = e - f + 1;
     if t > i64::MAX - n + 1 {
-        return Err(util::arg_error(ctx, "move", 4, "destination wrap around"));
+        return NativeOut::error(util::arg_error(ctx, "move", 4, "destination wrap around"));
     }
 
     // Copy forward unless the destination overlaps the tail of the source
@@ -333,9 +332,9 @@ fn lua_move<'gc>(
             dst.raw_set(ctx, Value::integer(ctx.mutation(), t + i), v);
         }
         stack.ret1(a2);
-        return Ok(CallbackAction::Return);
+        return NativeOut::RETURN;
     }
-    Ok(move_meta(ctx, &mut stack, f, n, t, tt, forward, eq_mm))
+    move_meta(ctx, &mut stack, f, n, t, tt, forward, eq_mm)
 }
 
 /// `move` of `n` elements when an access may run metamethods or the copy
@@ -352,7 +351,7 @@ fn move_meta<'gc>(
     tt: usize,
     forward: Option<bool>,
     eq_mm: Value<'gc>,
-) -> CallbackAction {
+) -> NativeOut {
     // `__eq` goes above the arguments, for the future to call.
     if forward.is_none() {
         stack.push(eq_mm);
@@ -415,9 +414,9 @@ fn lua_remove<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let Some(t) = check_tab(ctx, stack.get(0), "remove", 1, TAB_R | TAB_W | TAB_L)? else {
-        return Ok(remove_meta(ctx, &mut stack));
+        return remove_meta(ctx, &mut stack);
     };
     let size = t.raw_len() as i64;
     let mut pos = remove_pos(ctx, &stack, size)?;
@@ -429,13 +428,13 @@ fn lua_remove<'gc>(
     }
     t.raw_set(ctx, Value::integer(ctx.mutation(), pos), Value::nil());
     stack.ret1(result);
-    Ok(CallbackAction::Return)
+    NativeOut::RETURN
 }
 
 /// `remove` on a value whose accesses may run metamethods.
 #[cold]
 #[inline(never)]
-fn remove_meta<'gc>(ctx: Context<'gc>, stack: &mut Stack<'gc, '_>) -> CallbackAction {
+fn remove_meta<'gc>(ctx: Context<'gc>, stack: &mut Stack<'gc, '_>) -> NativeOut {
     stack.spawn_action(ctx, |cx| async move {
         let size = util::len(&cx, 0).await?;
         let mut pos = cx.try_enter(|ctx, stack| remove_pos(ctx, stack, size))?;
@@ -483,7 +482,7 @@ fn lua_sort<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let n = match check_tab(ctx, stack.get(0), "sort", 1, TAB_R | TAB_W | TAB_L)? {
         Some(t) => t.raw_len() as i64,
         None => {
@@ -502,7 +501,7 @@ fn lua_sort<'gc>(
                         stack.push(Value::nil());
                     }
                     stack.extend([mm, v, v]);
-                    return Ok(CallbackAction::call_then(2, sort_len_cont));
+                    return NativeOut::call_then(2, cont::SORT_LEN, Protect::No, OnOk::Cont);
                 }
             }
         }
@@ -511,12 +510,12 @@ fn lua_sort<'gc>(
 }
 
 /// `__len` returned `sort`'s `#t`.
-fn sort_len_cont<'gc>(
+pub(crate) fn sort_len_cont<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
     _status: Result<(), Error<'gc>>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let n = util::to_integer(stack.get(2))
         .ok_or_else(|| Error::from_str(ctx, "object length is not an integer"))?;
     stack.truncate(2);
@@ -524,14 +523,10 @@ fn sort_len_cont<'gc>(
 }
 
 /// Sort `t[1..n]`, `n` being `#t`.
-fn sort_start<'gc>(
-    ctx: Context<'gc>,
-    mut stack: Stack<'gc, '_>,
-    n: i64,
-) -> Result<CallbackAction, Error<'gc>> {
+fn sort_start<'gc>(ctx: Context<'gc>, mut stack: Stack<'gc, '_>, n: i64) -> NativeOut {
     if !sort_args(ctx, &mut stack, n)? {
         stack.clear();
-        return Ok(CallbackAction::Return);
+        return NativeOut::RETURN;
     }
     if stack.get(1).is_nil()
         && let Some(t) = stack.get(0).get_table()
@@ -539,7 +534,7 @@ fn sort_start<'gc>(
         && sort_primitive(ctx, t, n as usize)
     {
         stack.clear();
-        return Ok(CallbackAction::Return);
+        return NativeOut::RETURN;
     }
     stack.extend([Value::nil(); LO - S0]);
     stack.extend([Value::small(0); STATE - LO]);
@@ -673,7 +668,7 @@ fn sort_drive<'gc>(
     ctx: Context<'gc>,
     mut stack: Stack<'gc, '_>,
     resume: SortResume<'gc>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let mc = ctx.mutation();
     let tv = stack.get(0);
     let comp = stack.get(1);
@@ -707,7 +702,7 @@ fn sort_drive<'gc>(
             let at = stack.len();
             stack.as_mut_slice()[AT] = Value::small(at as i32);
             stack.extend([$f, $($arg),*]);
-            return Ok(CallbackAction::call_then(at, sort_cont));
+            return NativeOut::call_then(at, cont::SORT, Protect::No, OnOk::Cont);
         }};
     }
     // Queue a read of `t[$k]` into slot `$s`, or a write the other way.
@@ -737,7 +732,7 @@ fn sort_drive<'gc>(
                             let m = binop_metamethod(ctx, x, y, MetamethodBits::LT);
                             if m.is_nil() {
                                 let msg = util::compare_error_msg(x, y);
-                                return Err(util::runtime_error(ctx, &msg));
+                                return NativeOut::error(util::runtime_error(ctx, &msg));
                             }
                             call!(m, [x, y]);
                         }
@@ -773,11 +768,11 @@ fn sort_drive<'gc>(
                         }
                         IndexChain::NotIndexable(v) => {
                             let msg = format!("attempt to index a {} value", v.type_name());
-                            return Err(util::runtime_error(ctx, &msg));
+                            return NativeOut::error(util::runtime_error(ctx, &msg));
                         }
                         IndexChain::Exhausted => {
                             let msg = "'__index' chain too long; possible loop";
-                            return Err(util::runtime_error(ctx, msg));
+                            return NativeOut::error(util::runtime_error(ctx, msg));
                         }
                     },
                 };
@@ -793,11 +788,11 @@ fn sort_drive<'gc>(
                         }
                         NewIndexChain::NotIndexable(v) => {
                             let msg = format!("attempt to index a {} value", v.type_name());
-                            return Err(util::runtime_error(ctx, &msg));
+                            return NativeOut::error(util::runtime_error(ctx, &msg));
                         }
                         NewIndexChain::Exhausted => {
                             let msg = "'__newindex' chain too long; possible loop";
-                            return Err(util::runtime_error(ctx, msg));
+                            return NativeOut::error(util::runtime_error(ctx, msg));
                         }
                     },
                 }
@@ -815,7 +810,7 @@ fn sort_drive<'gc>(
                 // The next pending range, or done.
                 if stack.len() == STATE {
                     stack.clear();
-                    return Ok(CallbackAction::Return);
+                    return NativeOut::RETURN;
                 }
                 let n = stack.len();
                 (lo, up) = (int(&stack, n - 2) as usize, int(&stack, n - 1) as usize);
@@ -878,7 +873,10 @@ fn sort_drive<'gc>(
             PH_D => {
                 if less!(S1, S0) {
                     if i == up - 1 {
-                        return Err(Error::from_str(ctx, "invalid order function for sorting"));
+                        return NativeOut::error(Error::from_str(
+                            ctx,
+                            "invalid order function for sorting",
+                        ));
                     }
                     phase = PH_D_NEXT;
                 } else {
@@ -894,7 +892,10 @@ fn sort_drive<'gc>(
             PH_E => {
                 if less!(S0, S2) {
                     if j < i {
-                        return Err(Error::from_str(ctx, "invalid order function for sorting"));
+                        return NativeOut::error(Error::from_str(
+                            ctx,
+                            "invalid order function for sorting",
+                        ));
                     }
                     phase = PH_E_NEXT;
                 } else {
@@ -934,12 +935,12 @@ fn pop_op<'gc>(stack: &mut Stack<'gc, '_>, nq: &mut usize) {
     *nq -= 1;
 }
 
-fn sort_cont<'gc>(
+pub(crate) fn sort_cont<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
     _status: Result<(), Error<'gc>>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let at = stack.get(AT).get_small().unwrap_or(0) as usize;
     let first = stack.get(at);
     stack.truncate(at);
@@ -975,13 +976,13 @@ fn lua_unpack<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let Some(t) = check_tab(ctx, stack.get(0), "unpack", 1, TAB_R | TAB_L)? else {
-        return Ok(unpack_meta(ctx, &mut stack));
+        return unpack_meta(ctx, &mut stack);
     };
     let Some((i, n)) = unpack_range(ctx, &stack, t.raw_len() as i64)? else {
         stack.clear();
-        return Ok(CallbackAction::Return);
+        return NativeOut::RETURN;
     };
     let out = stack
         .replace_slots(n)
@@ -989,13 +990,13 @@ fn lua_unpack<'gc>(
     for (k, slot) in out.iter_mut().enumerate() {
         *slot = t.raw_get(Value::integer(ctx.mutation(), i + k as i64));
     }
-    Ok(CallbackAction::Return)
+    NativeOut::RETURN
 }
 
 /// `unpack` on a value whose accesses may run metamethods.
 #[cold]
 #[inline(never)]
-fn unpack_meta<'gc>(ctx: Context<'gc>, stack: &mut Stack<'gc, '_>) -> CallbackAction {
+fn unpack_meta<'gc>(ctx: Context<'gc>, stack: &mut Stack<'gc, '_>) -> NativeOut {
     stack.spawn_action(ctx, |cx| async move {
         let len = util::len(&cx, 0).await?;
         let range = cx.try_enter(|ctx, stack| unpack_range(ctx, stack, len))?;

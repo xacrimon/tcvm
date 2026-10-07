@@ -127,7 +127,7 @@ impl Lua {
                 interner,
                 type_metatables: std::array::from_fn(|_| Gc::new(mc, Lock::new(None))),
                 next: Function::new_native(mc, builtin::lua_next, &[]),
-                ipairs_iter: Function::new_action(mc, builtin::ipairs_aux, &[]),
+                ipairs_iter: Function::new_cont(mc, builtin::ipairs_aux, &[]),
                 unwind: Function::new_native(mc, crate::vm::unwind::unwind_native, &[]),
                 epoch: std::cell::Cell::new(0),
                 waker: std::cell::Cell::new(std::ptr::null()),

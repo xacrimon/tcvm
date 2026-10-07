@@ -3,17 +3,20 @@
 //! with new values and the chunk uses them to compute its return value.
 
 use tcvm::env::{Error, Function, LuaString, NativeClosure, Stack, Value};
-use tcvm::vm::native::CallbackAction;
+use tcvm::vm::async_native::Spawned;
 use tcvm::{Context, Executor, LoadError, Lua, RuntimeError, StepResult};
 
 fn yielder<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
-    _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
+    mut stack: Stack<'gc, '_>,
+) -> Result<Spawned, Error<'gc>> {
     // Whatever args were passed in are already on the stack — the yield
     // forwards them to the host as the yielded values.
-    Ok(CallbackAction::Yield)
+    Ok(stack.spawn(|cx| async move {
+        cx.yield_(0).await;
+        Ok(())
+    }))
 }
 
 /// Yield (1, 2, 3) to the host; on resume, return `a + b` of the
@@ -24,7 +27,7 @@ fn host_resume_round_trip() {
     let mut lua = Lua::new();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let y = Function::new_action(ctx.mutation(), yielder, &[]);
+            let y = Function::new_async(ctx.mutation(), yielder, &[]);
             let key = Value::string(LuaString::new(ctx, b"yielder"));
             ctx.globals().raw_set(ctx, key, Value::function(y));
             let chunk = ctx.load(
@@ -76,7 +79,7 @@ fn host_resume_two_cycles() {
     let mut lua = Lua::new();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let y = Function::new_action(ctx.mutation(), yielder, &[]);
+            let y = Function::new_async(ctx.mutation(), yielder, &[]);
             let key = Value::string(LuaString::new(ctx, b"yielder"));
             ctx.globals().raw_set(ctx, key, Value::function(y));
             let chunk = ctx.load(

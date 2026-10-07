@@ -24,7 +24,7 @@ use crate::env::function::{NativeClosure, Stack};
 use crate::env::thread::ThreadState;
 use crate::env::{Error, Value};
 use crate::lua::Context;
-use crate::vm::native::{CallbackAction, OnOk, Protect};
+use crate::vm::native::{NativeOut, OnOk, Protect, cont};
 
 /// An async native: reads its arguments from `stack` and returns
 /// [`Stack::spawn`]'s token, or fails right away.
@@ -288,7 +288,7 @@ impl<'gc> Stack<'gc, '_> {
         &mut self,
         ctx: Context<'gc>,
         f: impl FnOnce(Cx) -> Fut,
-    ) -> CallbackAction
+    ) -> NativeOut
     where
         Fut: Future<Output = TaskResult> + 'static,
     {
@@ -300,7 +300,7 @@ impl<'gc> Stack<'gc, '_> {
         });
         ts.local_epoch = ctx.next_epoch();
         let Spawned(()) = self.spawn(f);
-        CallbackAction::Async
+        NativeOut::ASYNC
     }
 }
 
@@ -335,7 +335,7 @@ pub(crate) fn invoke_async<'gc>(
     f: AsyncFn,
     nc: &NativeClosure<'gc>,
     win: usize,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let header = TaskHeader {
         local_base: thread.locals.len() as u32,
         prev_epoch: thread.local_epoch,
@@ -347,7 +347,7 @@ pub(crate) fn invoke_async<'gc>(
     match r {
         Ok(Spawned(())) => {
             assert!(spawned, "an AsyncFn returned another native's Spawned");
-            Ok(CallbackAction::Async)
+            NativeOut::ASYNC
         }
         Err(e) => {
             if spawned {
@@ -356,7 +356,7 @@ pub(crate) fn invoke_async<'gc>(
                 thread.locals.truncate(header.local_base as usize);
                 thread.local_epoch = header.prev_epoch;
             }
-            Err(e)
+            NativeOut::error(e)
         }
     }
 }
@@ -368,7 +368,7 @@ pub(crate) fn async_cont<'gc>(
     _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
     status: Result<(), Error<'gc>>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let (thread, base) = stack.into_parts();
     let mut env = Env {
         ctx,
@@ -405,25 +405,22 @@ pub(crate) fn async_cont<'gc>(
                 Error::new(ctx, value).with_level(e.level as usize)
             });
             thread.drop_task();
-            r.map(|()| CallbackAction::Return)
+            match r {
+                Ok(()) => NativeOut::RETURN,
+                Err(e) => NativeOut::error(e),
+            }
         }
-        Poll::Pending => Ok(match env.request {
-            Request::Call { at, protect } => CallbackAction::CallThen {
-                at: at as u32,
-                protect,
-                ok: OnOk::Cont,
-                cont: async_cont,
-            },
-            Request::Yield { at } => CallbackAction::YieldThen {
-                at: at as u32,
-                cont: async_cont,
-            },
+        Poll::Pending => match env.request {
+            Request::Call { at, protect } => {
+                NativeOut::call_then(at, cont::ASYNC, protect, OnOk::Cont)
+            }
+            Request::Yield { at } => NativeOut::yield_then(at, cont::ASYNC),
             Request::Pending => {
                 ctx.waker().wake_by_ref();
-                CallbackAction::Pending
+                NativeOut::PENDING
             }
-            Request::None => CallbackAction::Pending,
-        }),
+            Request::None => NativeOut::PENDING,
+        },
     }
 }
 

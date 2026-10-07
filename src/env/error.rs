@@ -10,8 +10,8 @@ use crate::lua::Context;
 /// `RuntimeError` (in `lua/error.rs`) is the `'static`-ified version handed to
 /// embedders; see `StashedError` for the bridge.
 ///
-/// One GC pointer: with `CallbackAction` also pointer-sized, a native's
-/// `Result<CallbackAction, Error>` is a (tag, pointer) pair and comes back in
+/// One GC pointer: a native's `Result<(), Error>` is a (tag, pointer) pair
+/// and comes back in
 /// registers. An error allocates, but so does the message it usually carries.
 #[derive(Clone, Copy, Collect)]
 #[collect(internal, no_drop)]

@@ -3,7 +3,6 @@
 //! stack unwinds, which the native-handler test observes directly.
 
 use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
-use tcvm::vm::native::{CallbackAction, OnOk, Protect};
 use tcvm::{Context, Executor, LoadError, Lua};
 
 use crate::common::{err, eval, ok};
@@ -235,76 +234,15 @@ fn retried_handler_still_sees_the_failing_frames() {
            return lua_frames()\n\
          end)\n\
          return n",
-        install_through,
+        install_frames,
     );
     assert_eq!(frames, 4);
 }
 
-/// `through(f, ...)`: call `f` from an unprotected native frame, the kind a
-/// native with a callback (`sort`, `gsub`) has, which must not shadow an
-/// enclosing `xpcall` handler.
-fn lua_through<'gc>(
-    _ctx: Context<'gc>,
-    _closure: &NativeClosure<'gc>,
-    _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
-    Ok(CallbackAction::CallThen {
-        at: 0,
-        protect: Protect::No,
-        ok: OnOk::Cont,
-        cont: through_cont,
-    })
-}
-
-fn through_cont<'gc>(
-    _ctx: Context<'gc>,
-    _closure: &NativeClosure<'gc>,
-    _stack: Stack<'gc, '_>,
-    _status: Result<(), Error<'gc>>,
-) -> Result<CallbackAction, Error<'gc>> {
-    Ok(CallbackAction::Return)
-}
-
-fn install_through<'gc>(ctx: tcvm::Context<'gc>) {
-    let set = |name: &str, f: Function<'gc>| {
-        let key = Value::string(LuaString::new(ctx, name.as_bytes()));
-        ctx.globals().raw_set(ctx, key, Value::function(f));
-    };
-    set(
-        "lua_frames",
-        Function::new_native(ctx.mutation(), lua_frame_count, &[]),
-    );
-    set(
-        "through",
-        Function::new_action(ctx.mutation(), lua_through, &[]),
-    );
-}
-
-#[test]
-fn pass_through_sequence_is_transparent_to_errors() {
-    // Success path returns the callee's results; an error passes through
-    // it to the enclosing pcall.
-    let v: i64 = run_with(
-        "local ok, e = pcall(function() through(function() error('x') end) end)\n\
-         local a, b = through(function() return 1, 2 end)\n\
-         return (not ok and e == 'c:1: x' and a == 1 and b == 2) and 1 or 0",
-        install_through,
-    );
-    assert_eq!(v, 1);
-}
-
-#[test]
-fn handler_looks_through_a_pass_through_sequence() {
-    // The nearest sequence is `through`'s, but it isn't a catch point, so
-    // the xpcall handler still runs with `outer` and `deep` intact.
-    let frames: i64 = run_with(
-        "local function deep() error('x') end\n\
-         local function outer() through(deep) end\n\
-         local ok, n = xpcall(outer, lua_frames)\n\
-         return n",
-        install_through,
-    );
-    assert_eq!(frames, 3);
+fn install_frames<'gc>(ctx: tcvm::Context<'gc>) {
+    let f = Function::new_native(ctx.mutation(), lua_frame_count as NativeFn, &[]);
+    let key = Value::string(LuaString::new(ctx, b"lua_frames"));
+    ctx.globals().raw_set(ctx, key, Value::function(f));
 }
 
 #[test]

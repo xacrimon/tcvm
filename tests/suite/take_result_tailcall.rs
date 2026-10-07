@@ -1,13 +1,16 @@
 use tcvm::env::{Error, Function, LuaString, NativeClosure, Stack, Value};
-use tcvm::vm::native::CallbackAction;
+use tcvm::vm::async_native::Spawned;
 use tcvm::{Context, Executor, LoadError, Lua, RuntimeError, StepResult};
 
 fn yielder<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
-    _s: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
-    Ok(CallbackAction::Yield)
+    mut stack: Stack<'gc, '_>,
+) -> Result<Spawned, Error<'gc>> {
+    Ok(stack.spawn(|cx| async move {
+        cx.yield_(0).await;
+        Ok(())
+    }))
 }
 
 /// Tail-call a native that suspends. The Lua frame is popped at TAILCALL time,
@@ -18,7 +21,7 @@ fn take_result_after_suspended_tailcall() {
     let mut lua = Lua::new();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
-            let y = Function::new_action(ctx.mutation(), yielder, &[]);
+            let y = Function::new_async(ctx.mutation(), yielder, &[]);
             let k = Value::string(LuaString::new(ctx, b"yielder"));
             ctx.globals().raw_set(ctx, k, Value::function(y));
             let chunk = ctx.load(

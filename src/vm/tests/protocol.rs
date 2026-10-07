@@ -1,22 +1,22 @@
-//! Natives that act once they return (`CallThen`, `Resume`) and async natives
+//! Continuation natives (`call_then`, `resume`) and async natives
 //! that call, yield and wait: where their results land and how errors reach
 //! them.
 
-use tcvm::env::{ActionFn, Error, Function, LuaString, NativeClosure, Stack, Value};
-use tcvm::vm::async_native::{AsyncFn, Spawned};
-use tcvm::vm::native::{CallbackAction, OnOk, Protect};
-use tcvm::{Context, Executor, LoadError, Lua, RuntimeError, StashedExecutor, StepResult};
+use crate::env::{Error, Function, LuaString, NativeClosure, Stack, Value};
+use crate::vm::async_native::{AsyncFn, Spawned};
+use crate::vm::native::{ContFn, NativeOut, OnOk, Protect, cont};
+use crate::{Context, Executor, LoadError, Lua, RuntimeError, StashedExecutor, StepResult};
 
 fn start(
     lua: &mut Lua,
     src: &str,
-    natives: &[(&str, ActionFn)],
+    natives: &[(&str, ContFn)],
     asyncs: &[(&str, AsyncFn)],
 ) -> StashedExecutor {
     lua.try_enter(|ctx| -> Result<_, LoadError> {
         let fns = natives
             .iter()
-            .map(|&(name, f)| (name, Function::new_action(ctx.mutation(), f, &[])))
+            .map(|&(name, f)| (name, Function::new_cont(ctx.mutation(), f, &[])))
             .chain(
                 asyncs
                     .iter()
@@ -32,20 +32,20 @@ fn start(
     .expect("load")
 }
 
-fn run(src: &str, natives: &[(&str, ActionFn)], asyncs: &[(&str, AsyncFn)]) -> i64 {
+fn run(src: &str, natives: &[(&str, ContFn)], asyncs: &[(&str, AsyncFn)]) -> i64 {
     let mut lua = Lua::new();
     lua.load_all();
     let ex = start(&mut lua, src, natives, asyncs);
     lua.execute(&ex).expect("run")
 }
 
-fn returned<'gc>(
+pub(crate) fn returned<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
     _status: Result<(), Error<'gc>>,
-) -> Result<CallbackAction, Error<'gc>> {
-    Ok(CallbackAction::Return)
+) -> NativeOut {
+    NativeOut::RETURN
 }
 
 /// `tail_resume(co)`: whatever `co` returns goes straight to the caller.
@@ -53,12 +53,8 @@ fn tail_resume<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
-    Ok(CallbackAction::Resume {
-        at: 0,
-        ok: OnOk::Return,
-        cont: returned,
-    })
+) -> NativeOut {
+    NativeOut::resume(0, cont::TEST_RETURNED, OnOk::Return)
 }
 
 #[test]
@@ -73,20 +69,15 @@ fn forward<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let f = stack.get(0);
     stack.replace(&[f, Value::integer(ctx.mutation(), 41)]);
-    Ok(CallbackAction::CallThen {
-        at: 0,
-        protect: Protect::No,
-        ok: OnOk::Return,
-        cont: returned,
-    })
+    NativeOut::call_then(0, cont::TEST_RETURNED, Protect::No, OnOk::Return)
 }
 
 #[test]
 fn call_results_land_at_the_original_call() {
-    let natives: &[(&str, ActionFn)] = &[("forward", forward)];
+    let natives: &[(&str, ContFn)] = &[("forward", forward)];
     let src = "local function addone(x) return x + 1 end\n\
                return forward(addone)";
     assert_eq!(run(src, natives, &[]), 42);
@@ -101,24 +92,20 @@ fn bumpr<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
-    Ok(CallbackAction::Resume {
-        at: 0,
-        ok: OnOk::Cont,
-        cont: add_one,
-    })
+) -> NativeOut {
+    NativeOut::resume(0, cont::TEST_ADD_ONE, OnOk::Cont)
 }
 
-fn add_one<'gc>(
+pub(crate) fn add_one<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
     status: Result<(), Error<'gc>>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     status?;
     let v = stack.get(0).get_integer().expect("an integer");
     stack.replace(&[Value::integer(ctx.mutation(), v + 1)]);
-    Ok(CallbackAction::Return)
+    NativeOut::RETURN
 }
 
 #[test]

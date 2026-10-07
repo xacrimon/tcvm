@@ -5,10 +5,10 @@ use crate::LoadError;
 use crate::builtin::util;
 use crate::env::function::NativeKind;
 use crate::env::{
-    ActionFn, Error, Function, LuaString, MetamethodBits, NativeClosure, NativeFn, Stack, Value,
+    Error, Function, LuaString, MetamethodBits, NativeClosure, NativeFn, Stack, Value,
 };
 use crate::vm::debug::where_prefix;
-use crate::vm::native::{CallbackAction, OnOk, Protect};
+use crate::vm::native::{ContFn, NativeOut, OnOk, Protect, cont};
 
 pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[
@@ -27,7 +27,7 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         ("type", lua_type),
         ("warn", lua_warn),
     ];
-    let actions: &[(&str, ActionFn)] = &[
+    let actions: &[(&str, ContFn)] = &[
         ("dofile", lua_dofile),
         ("load", lua_load),
         ("print", lua_print),
@@ -42,13 +42,13 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         set(name, Function::new_native(ctx.mutation(), handler, &[]));
     }
     for &(name, handler) in actions {
-        set(name, Function::new_action(ctx.mutation(), handler, &[]));
+        set(name, Function::new_cont(ctx.mutation(), handler, &[]));
     }
     set(
         "pcall",
         Function::new_native_with_entry(
             ctx.mutation(),
-            NativeKind::Action(lua_pcall),
+            NativeKind::Cont(lua_pcall),
             &[],
             crate::vm::native::ff_pcall,
         ),
@@ -57,7 +57,7 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         "xpcall",
         Function::new_native_with_entry(
             ctx.mutation(),
-            NativeKind::Action(lua_xpcall),
+            NativeKind::Cont(lua_xpcall),
             &[],
             crate::vm::native::ff_xpcall,
         ),
@@ -69,7 +69,7 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         "pairs",
         Function::new_native_with_entry(
             ctx.mutation(),
-            NativeKind::Action(lua_pairs),
+            NativeKind::Cont(lua_pairs),
             &[Value::function(next)],
             crate::vm::native::ff_pairs,
         ),
@@ -143,20 +143,15 @@ fn lua_dofile<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let fname = util::opt_string(ctx, stack.get(0), "dofile", 1)?;
     let path = fname.map(|f| f.as_bytes());
     match ctx.load_file_with(path, Value::table(ctx.globals())) {
         Ok(f) => {
             stack.replace(&[Value::function(f)]);
-            Ok(CallbackAction::CallThen {
-                at: 0,
-                protect: Protect::No,
-                ok: OnOk::Return,
-                cont: return_cont,
-            })
+            NativeOut::call_then(0, cont::DOFILE, Protect::No, OnOk::Return)
         }
-        Err(e) => Err(Error::new(ctx, load_error_value(ctx, &e))),
+        Err(e) => NativeOut::error(Error::new(ctx, load_error_value(ctx, &e))),
     }
 }
 
@@ -218,26 +213,26 @@ pub(crate) fn ipairs_aux<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let i = util::check_integer(ctx, stack.get(1), "for iterator", 2)?.wrapping_add(1);
     if let Some(t) = stack.get(0).get_table() {
         let v = t.raw_get(Value::integer(ctx.mutation(), i));
         if !v.is_nil() {
             stack.replace(&[Value::integer(ctx.mutation(), i), v]);
-            return Ok(CallbackAction::Return);
+            return NativeOut::RETURN;
         }
         if !t.shape().has_mm(MetamethodBits::INDEX) {
             stack.ret1(Value::nil());
-            return Ok(CallbackAction::Return);
+            return NativeOut::RETURN;
         }
     }
-    Ok(ipairs_meta(ctx, &mut stack, i))
+    ipairs_meta(ctx, &mut stack, i)
 }
 
 /// `ipairs_aux` for a value whose `[i]` may run `__index`.
 #[cold]
 #[inline(never)]
-fn ipairs_meta<'gc>(ctx: Context<'gc>, stack: &mut Stack<'gc, '_>, i: i64) -> CallbackAction {
+fn ipairs_meta<'gc>(ctx: Context<'gc>, stack: &mut Stack<'gc, '_>, i: i64) -> NativeOut {
     stack.spawn_action(ctx, move |cx| async move {
         util::geti(&cx, 0, i).await?;
         cx.enter(|ctx, mut stack| {
@@ -259,7 +254,7 @@ fn lua_load<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let chunk = util::to_lstring(ctx, stack.get(0));
     check_mode(ctx, stack.get(2), "load", 3)?;
     if let Some(s) = chunk {
@@ -267,25 +262,25 @@ fn lua_load<'gc>(
         let env = env_arg(ctx, &stack, 3);
         let loaded = ctx.load_bytes(s.as_bytes(), name, env);
         push_loaded(ctx, &mut stack, loaded);
-        return Ok(CallbackAction::Return);
+        return NativeOut::RETURN;
     }
     let name = util::opt_string(ctx, stack.get(1), "load", 2)?
         .unwrap_or_else(|| LuaString::new(ctx, b"=(load)"));
     let Some(reader) = stack.get(0).get_function() else {
-        return Err(util::type_error(ctx, "load", 1, "function", stack.arg(0)));
+        return NativeOut::error(util::type_error(ctx, "load", 1, "function", stack.arg(0)));
     };
     if stack.len() < 2 {
         stack.push(Value::nil());
     }
     stack.as_mut_slice()[..2].copy_from_slice(&[Value::function(reader), Value::string(name)]);
-    Ok(load_reader(ctx, &mut stack))
+    load_reader(ctx, &mut stack)
 }
 
 /// `load` from the reader function at window slot 0, called until it
 /// returns nil or an empty string, the chunk's name at slot 1. An error the
 /// reader raises becomes `load`'s `(nil, message)`. Unlike Lua, which parses
 /// as it reads, the whole chunk is read first.
-fn load_reader<'gc>(ctx: Context<'gc>, stack: &mut Stack<'gc, '_>) -> CallbackAction {
+fn load_reader<'gc>(ctx: Context<'gc>, stack: &mut Stack<'gc, '_>) -> NativeOut {
     stack.spawn_action(ctx, |cx| async move {
         let mut source = Vec::new();
         // Each call at the top of the window: the reader, then its results.
@@ -423,40 +418,40 @@ fn lua_pairs<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     util::check_any(ctx, &stack, "pairs", 1)?;
     let t = stack.get(0);
     let mm = ctx.mm_of(t, MetamethodBits::PAIRS);
     if mm.is_nil() {
         stack.replace(&[closure.upvalues()[0], t, Value::nil(), Value::nil()]);
-        return Ok(CallbackAction::Return);
+        return NativeOut::RETURN;
     }
     stack.replace(&[mm, t]);
-    Ok(CallbackAction::call_then(0, pairs_cont))
+    NativeOut::call_then(0, cont::PAIRS, Protect::No, OnOk::Cont)
 }
 
 /// `__pairs` returned: its first four results, as `lua_call(L, 1, 4)`.
-fn pairs_cont<'gc>(
+pub(crate) fn pairs_cont<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
     _status: Result<(), Error<'gc>>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     stack.truncate(4);
     while stack.len() < 4 {
         stack.push(Value::nil());
     }
-    Ok(CallbackAction::Return)
+    NativeOut::RETURN
 }
 
 /// The continuation of a call whose results are the native's.
-fn return_cont<'gc>(
+pub(crate) fn return_cont<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
     _status: Result<(), Error<'gc>>,
-) -> Result<CallbackAction, Error<'gc>> {
-    Ok(CallbackAction::Return)
+) -> NativeOut {
+    NativeOut::RETURN
 }
 
 /// `pcall(f, ...)`: a protected call of `f`, whose results come back as
@@ -467,14 +462,9 @@ fn lua_pcall<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     util::check_any(ctx, &stack, "pcall", 1)?;
-    Ok(CallbackAction::CallThen {
-        at: 0,
-        protect: Protect::Errors,
-        ok: OnOk::ReturnTrue,
-        cont: pcall_cont,
-    })
+    NativeOut::call_then(0, cont::PCALL, Protect::Errors, OnOk::ReturnTrue)
 }
 
 pub(crate) fn pcall_cont<'gc>(
@@ -482,12 +472,12 @@ pub(crate) fn pcall_cont<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
     status: Result<(), Error<'gc>>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     match status {
         Ok(()) => stack.insert(0, Value::boolean(true)),
         Err(err) => stack.replace(&[Value::boolean(false), err.value()]),
     }
-    Ok(CallbackAction::Return)
+    NativeOut::RETURN
 }
 
 /// `print(...)` — write each argument's `tostring` form to stdout, separated
@@ -496,7 +486,7 @@ fn lua_print<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let n = stack.len();
     let has_tostring = |i| !ctx.mm_of(stack.get(i), MetamethodBits::TOSTRING).is_nil();
     if !(0..n).any(has_tostring) {
@@ -511,11 +501,11 @@ fn lua_print<'gc>(
         }
         let _ = out.write_all(b"\n");
         stack.replace(&[]);
-        return Ok(CallbackAction::Return);
+        return NativeOut::RETURN;
     }
     // Some `__tostring` must run; like Lua, write each argument as soon as it
     // is converted.
-    Ok(stack.spawn_action(ctx, move |cx| async move {
+    stack.spawn_action(ctx, move |cx| async move {
         for i in 0..n {
             let bytes = util::tolstring(&cx, i, n).await?;
             let mut out = std::io::stdout().lock();
@@ -527,7 +517,7 @@ fn lua_print<'gc>(
         let _ = std::io::stdout().write_all(b"\n");
         cx.enter(|_, mut stack| stack.replace(&[]));
         Ok(())
-    }))
+    })
 }
 
 /// `rawequal(a, b)` — primitive equality, bypassing `__eq`.
@@ -725,28 +715,28 @@ fn lua_tostring<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     util::check_any(ctx, &stack, "tostring", 1)?;
     let v = stack.get(0);
     let mm = ctx.mm_of(v, MetamethodBits::TOSTRING);
     if mm.is_nil() {
         stack.ret1(Value::string(util::basic_tostring(ctx, v)));
-        return Ok(CallbackAction::Return);
+        return NativeOut::RETURN;
     }
     stack.replace(&[mm, v]);
-    Ok(CallbackAction::call_then(0, tostring_cont))
+    NativeOut::call_then(0, cont::TOSTRING, Protect::No, OnOk::Cont)
 }
 
 /// `__tostring` returned: its first result, checked and converted.
-fn tostring_cont<'gc>(
+pub(crate) fn tostring_cont<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
     _status: Result<(), Error<'gc>>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let s = util::tostring_result(ctx, stack.get(0))?;
     stack.ret1(Value::string(s));
-    Ok(CallbackAction::Return)
+    NativeOut::RETURN
 }
 
 /// `type(v)` — the type name of `v` as a string.
@@ -784,19 +774,14 @@ fn lua_xpcall<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     if stack.get(1).get_function().is_none() {
-        return Err(util::type_error(ctx, "xpcall", 2, "function", stack.arg(1)));
+        return NativeOut::error(util::type_error(ctx, "xpcall", 2, "function", stack.arg(1)));
     }
     // The handler goes first, where the unwinder finds it; the callee and
     // its arguments follow in call layout.
     stack.as_mut_slice().swap(0, 1);
-    Ok(CallbackAction::CallThen {
-        at: 1,
-        protect: Protect::Handler,
-        ok: OnOk::ReturnTrue,
-        cont: xpcall_cont,
-    })
+    NativeOut::call_then(1, cont::XPCALL, Protect::Handler, OnOk::ReturnTrue)
 }
 
 pub(crate) fn xpcall_cont<'gc>(
@@ -804,11 +789,11 @@ pub(crate) fn xpcall_cont<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
     status: Result<(), Error<'gc>>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     match status {
         // The results follow the handler's slot.
         Ok(()) => stack.as_mut_slice()[0] = Value::boolean(true),
         Err(err) => stack.replace(&[Value::boolean(false), err.value()]),
     }
-    Ok(CallbackAction::Return)
+    NativeOut::RETURN
 }

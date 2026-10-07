@@ -5,7 +5,7 @@ use crate::env::thread::ThreadStatus;
 use crate::env::{
     Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Thread, Value,
 };
-use crate::vm::native::{CallbackAction, Execution, OnOk};
+use crate::vm::native::{Execution, NativeOut, OnOk, cont};
 use crate::vm::{close, coro};
 
 pub fn load<'gc>(ctx: Context<'gc>) {
@@ -25,13 +25,13 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         set(name, Function::new_native(ctx.mutation(), handler, &[]));
     }
     let mc = ctx.mutation();
-    set("close", Function::new_action(mc, lua_close, &[]));
-    let resume = NativeKind::Action(lua_resume);
+    set("close", Function::new_cont(mc, lua_close, &[]));
+    let resume = NativeKind::Cont(lua_resume);
     set(
         "resume",
         Function::new_native_with_entry(mc, resume, &[], coro::ff_resume),
     );
-    let yield_ = NativeKind::Action(lua_yield);
+    let yield_ = NativeKind::Cont(lua_yield);
     set(
         "yield",
         Function::new_native_with_entry(mc, yield_, &[], coro::ff_yield),
@@ -67,7 +67,7 @@ fn lua_resume<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let co = stack
         .get(0)
         .get_thread()
@@ -75,13 +75,9 @@ fn lua_resume<'gc>(
     if let Some(msg) = unresumable_reason(stack.exec(), co, stack.len() - 1) {
         let m = Value::string(LuaString::new(ctx, msg.as_bytes()));
         stack.replace(&[Value::boolean(false), m]);
-        return Ok(CallbackAction::Return);
+        return NativeOut::RETURN;
     }
-    Ok(CallbackAction::Resume {
-        at: 0,
-        ok: OnOk::ReturnTrue,
-        cont: resume_cont,
-    })
+    NativeOut::resume(0, cont::RESUME, OnOk::ReturnTrue)
 }
 
 /// `auxresume`'s ending: `(true, ...)`, or `(false, msg)` for an error or
@@ -91,7 +87,7 @@ pub(crate) fn resume_cont<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
     status: Result<(), Error<'gc>>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     match status {
         Ok(()) if stack.check_stack(1) => stack.insert(0, Value::boolean(true)),
         Ok(()) => {
@@ -100,7 +96,7 @@ pub(crate) fn resume_cont<'gc>(
         }
         Err(err) => stack.replace(&[Value::boolean(false), err.value()]),
     }
-    Ok(CallbackAction::Return)
+    NativeOut::RETURN
 }
 
 /// `None` if `co` can be resumed with `nargs` arguments, else the Lua-spec
@@ -139,8 +135,8 @@ fn lua_yield<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     _stack: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
-    Ok(CallbackAction::Yield)
+) -> NativeOut {
+    NativeOut::YIELD
 }
 
 /// `coroutine.status(co)` — return one of `"suspended" | "normal" |
@@ -232,7 +228,7 @@ fn lua_wrap<'gc>(
     thread.borrow_mut(ctx.mutation()).seed(Value::function(f));
     let wrapper = Function::new_native_with_entry(
         ctx.mutation(),
-        NativeKind::Action(wrap_callback),
+        NativeKind::Cont(wrap_callback),
         &[Value::thread(thread)],
         coro::ff_wrap,
     );
@@ -248,13 +244,13 @@ fn lua_close<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let co = opt_co(ctx, &stack, "close")?;
     // Pointer-eq against current first to avoid re-borrowing the running
     // thread's RefLock (mut-borrowed by the interpreter).
     if co.ptr_eq(stack.exec().current_thread()) {
         if stack.exec().is_main() {
-            return Err(Error::from_str(ctx, "cannot close main thread"));
+            return NativeOut::error(Error::from_str(ctx, "cannot close main thread"));
         }
         return close::close_running(ctx, stack);
     }
@@ -264,34 +260,32 @@ fn lua_close<'gc>(
             if close::seed_thread_close(ctx, &mut ts) {
                 // The coroutine's own close runner returns the results.
                 stack.replace(&[Value::thread(co)]);
-                return Ok(CallbackAction::Resume {
-                    at: 0,
-                    ok: OnOk::Return,
-                    cont: close_cont,
-                });
+                return NativeOut::resume(0, cont::CORO_CLOSE, OnOk::Return);
             }
             // Surfaced once, so a second close is `true`, as in Lua.
             match ts.death_error.take() {
                 Some(err) => stack.replace(&[Value::boolean(false), err]),
                 None => stack.replace(&[Value::boolean(true)]),
             }
-            Ok(CallbackAction::Return)
+            NativeOut::RETURN
         }
-        ThreadStatus::Normal => Err(Error::from_str(ctx, "cannot close a normal coroutine")),
+        ThreadStatus::Normal => {
+            NativeOut::error(Error::from_str(ctx, "cannot close a normal coroutine"))
+        }
     }
 }
 
 /// A close runner that ended without returning (a process exit).
-fn close_cont<'gc>(
+pub(crate) fn close_cont<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
     status: Result<(), Error<'gc>>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     if let Err(err) = status {
         stack.replace(&[Value::boolean(false), err.value()]);
     }
-    Ok(CallbackAction::Return)
+    NativeOut::RETURN
 }
 
 /// Body of the closure returned by `coroutine.wrap`. Upvalue 0 carries the
@@ -301,7 +295,7 @@ fn wrap_callback<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let co = closure.upvalues()[0]
         .get_thread()
         .expect("wrap_callback upvalue 0 must be a thread");
@@ -310,14 +304,10 @@ fn wrap_callback<'gc>(
     // and aborts the whole executor with `BadMode`. `wrap` re-raises errors
     // rather than wrapping them, so we throw the reason directly.
     if let Some(msg) = unresumable_reason(stack.exec(), co, stack.len()) {
-        return Err(Error::from_str(ctx, msg));
+        return NativeOut::error(Error::from_str(ctx, msg));
     }
     stack.insert(0, Value::thread(co));
-    Ok(CallbackAction::Resume {
-        at: 0,
-        ok: OnOk::Return,
-        cont: wrap_cont,
-    })
+    NativeOut::resume(0, cont::WRAP, OnOk::Return)
 }
 
 /// `auxwrap`'s ending: the coroutine's values verbatim; an error rethrown
@@ -327,37 +317,33 @@ pub(crate) fn wrap_cont<'gc>(
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
     status: Result<(), Error<'gc>>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     let err = match status {
-        Ok(()) if stack.check_stack(1) => return Ok(CallbackAction::Return),
-        Ok(()) => return Err(Error::from_str(ctx, "too many results to resume")),
+        Ok(()) if stack.check_stack(1) => return NativeOut::RETURN,
+        Ok(()) => return NativeOut::error(Error::from_str(ctx, "too many results to resume")),
         Err(err) => err,
     };
     let co = closure.upvalues()[0].get_thread().expect("wrap's thread");
     if co.borrow().tbc_list.is_empty() {
         // `auxwrap` re-raises a string error with the wrap caller's position
         // prepended on top of the coroutine's own.
-        return Err(err.with_level(1));
+        return NativeOut::error(err.with_level(1));
     }
     close::seed_thread_close(ctx, &mut co.borrow_mut(ctx.mutation()));
     stack.replace(&[Value::thread(co)]);
-    Ok(CallbackAction::Resume {
-        at: 0,
-        ok: OnOk::Cont,
-        cont: wrap_close_cont,
-    })
+    NativeOut::resume(0, cont::WRAP_CLOSE, OnOk::Cont)
 }
 
 /// [`wrap_cont`] once the coroutine closed its variables: rethrow its
 /// result's error, or an error a `__close` raised.
-fn wrap_close_cont<'gc>(
+pub(crate) fn wrap_close_cont<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
     status: Result<(), Error<'gc>>,
-) -> Result<CallbackAction, Error<'gc>> {
+) -> NativeOut {
     match status {
-        Ok(()) => Err(Error::new(ctx, stack.get(1)).with_level(1)),
-        Err(err) => Err(err.with_level(1)),
+        Ok(()) => NativeOut::error(Error::new(ctx, stack.get(1)).with_level(1)),
+        Err(err) => NativeOut::error(err.with_level(1)),
     }
 }

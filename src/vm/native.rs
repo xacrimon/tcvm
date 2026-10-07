@@ -13,42 +13,10 @@ use crate::vm::abi::{Exit, Jump, Slot, handler, handler_bits};
 use crate::vm::frame::{self, HDR, NativeHdr, copy_values, fill_nil, flag};
 use crate::vm::ops::control::close_upvalues;
 
-/// What an [`ActionFn`](crate::env::ActionFn) native or a [`NativeCont`]
-/// asks of the VM on return.
-pub enum CallbackAction {
-    /// Plain synchronous return. Stack values above `bottom` are the results.
-    Return,
-    /// Call `stack[at]` with the values above it, then run `cont` with the
-    /// call's results in their place, `stack[at..]`. The native keeps its
-    /// state in `stack[..at]` meanwhile.
-    CallThen {
-        at: u32,
-        protect: Protect,
-        ok: OnOk,
-        cont: NativeCont,
-    },
-    /// Resume the coroutine at `stack[at]` with the values above it, then run
-    /// `cont` with what it yields or returns in their place, or with the
-    /// error that killed it.
-    Resume { at: u32, ok: OnOk, cont: NativeCont },
-    /// Yield the window to the resumer; the values it resumes with are the
-    /// native's results.
-    Yield,
-    /// Yield `stack[at..]` to the resumer, then run `cont` with the values it
-    /// resumes with in their place.
-    YieldThen { at: u32, cont: NativeCont },
-    /// The async native's future was spawned (`Stack::spawn`): poll it from a
-    /// frame of its own.
-    Async,
-    /// Leave the native's frame for the host to come back to: its future
-    /// waits on the host.
-    Pending,
-}
-
-/// Whether a [`CallbackAction::CallThen`]'s continuation receives the
-/// errors its call raises, instead of them unwinding past it.
+/// Whether a continuation receives the errors its call raises, instead of
+/// them unwinding past it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Protect {
+pub(crate) enum Protect {
     No,
     /// `pcall`.
     Errors,
@@ -60,11 +28,11 @@ pub enum Protect {
     Base,
 }
 
-/// What `cont` does with the results of a [`CallbackAction::CallThen`] or
-/// [`CallbackAction::Resume`] that succeeded, when that is simple enough for
-/// the VM to do it instead of calling `cont`.
+/// What a continuation does with the results of the call or resume that
+/// succeeded, when that is simple enough for the VM to do instead of calling
+/// it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum OnOk {
+pub(crate) enum OnOk {
     Cont,
     /// They are the native's results.
     Return,
@@ -72,26 +40,99 @@ pub enum OnOk {
     ReturnTrue,
 }
 
-/// The continuation of a [`CallbackAction::CallThen`]: the native's window
-/// with the call's results at `at`, or with nothing above `at` and the error
-/// when a protected call failed.
-pub type NativeCont = for<'gc, 'a> fn(
+/// A native that may ask the VM to act once it returns: call a
+/// function and continue in a [`NativeCont`], resume or yield a coroutine,
+/// or suspend into the executor. `?` on a `Result<_, Error>` works in one:
+/// the error becomes [`NativeOut::error`].
+pub(crate) type ContFn = for<'gc, 'a> fn(
+    ctx: Context<'gc>,
+    closure: &'a NativeClosure<'gc>,
+    stack: Stack<'gc, 'a>,
+) -> NativeOut;
+
+/// The continuation of a [`NativeOut::call_then`]: the native's window with
+/// the call's results at `at`, or with nothing above `at` and the error when
+/// a protected call failed.
+pub(crate) type NativeCont = for<'gc, 'a> fn(
     ctx: Context<'gc>,
     closure: &'a NativeClosure<'gc>,
     stack: Stack<'gc, 'a>,
     status: Result<(), Error<'gc>>,
-) -> Result<CallbackAction, Error<'gc>>;
+) -> NativeOut;
 
-impl CallbackAction {
-    /// [`CallbackAction::CallThen`] of `stack[at]`, unprotected.
-    pub fn call_then(at: usize, cont: NativeCont) -> Self {
-        CallbackAction::CallThen {
-            at: at as u32,
-            protect: Protect::No,
-            ok: OnOk::Cont,
-            cont,
+/// A continuation's index in [`CONT_TABLE`]; six bits in a native frame's
+/// word 0 and in a [`NativeOut`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ContIdx(pub(crate) u8);
+
+/// The continuation table and its indices by name. The test
+/// continuations follow the others, so every index holds in every build.
+macro_rules! cont_table {
+    ($($name:ident => $f:path),* $(,)? ; test: $($tname:ident => $tf:path),* $(,)?) => {
+        pub(crate) mod cont {
+            use super::ContIdx;
+            $(pub(crate) const $name: ContIdx = ContIdx(${index()});)*
+            #[cfg(test)]
+            const TEST_BASE: usize = ${count($name)};
+            $(
+                #[cfg(test)]
+                pub(crate) const $tname: ContIdx = ContIdx((TEST_BASE + ${index()}) as u8);
+            )*
         }
-    }
+        #[cfg(not(test))]
+        pub(crate) static CONT_TABLE: &[NativeCont] = &[$($f as NativeCont,)*];
+        #[cfg(test)]
+        pub(crate) static CONT_TABLE: &[NativeCont] = &[$($f as NativeCont,)* $($tf as NativeCont,)*];
+    };
+}
+
+cont_table! {
+    NONE => no_cont,
+    ASYNC => crate::vm::async_native::async_cont,
+    RESUME => crate::builtin::resume_cont,
+    WRAP => crate::builtin::wrap_cont,
+    WRAP_CLOSE => crate::builtin::wrap_close_cont,
+    CORO_CLOSE => crate::builtin::coroutine_close_cont,
+    PCALL => crate::builtin::pcall_cont,
+    XPCALL => crate::builtin::xpcall_cont,
+    PAIRS => crate::builtin::pairs_cont,
+    TOSTRING => crate::builtin::tostring_cont,
+    DOFILE => crate::builtin::return_cont,
+    SORT_LEN => crate::builtin::sort_len_cont,
+    SORT => crate::builtin::sort_cont,
+    GSUB => crate::builtin::gsub_cont,
+    ONE_RESULT => crate::builtin::one_result,
+    HANDLER => crate::vm::unwind::handler_cont,
+    CLOSE => crate::vm::unwind::close_cont,
+    CLOSE_ENTRY => crate::vm::close::close_entry_cont,
+    CLOSE_RUNNING => crate::vm::close::close_running_cont;
+    test:
+    TEST_RETURNED => crate::vm::tests::protocol::returned,
+    TEST_ADD_ONE => crate::vm::tests::protocol::add_one,
+    TEST_CL_ADD_ONE => crate::vm::tests::calls_lua::add_one,
+    TEST_CL_RETURNED => crate::vm::tests::calls_lua::returned,
+    TEST_THROUGH => crate::vm::tests::pcall_through::through_cont,
+}
+
+const _: () = assert!(CONT_TABLE.len() <= 64, "more than 64 continuation natives");
+
+/// The continuation at `idx`.
+#[inline(always)]
+pub(crate) fn cont_fn(idx: u8) -> NativeCont {
+    CONT_TABLE[idx as usize]
+}
+
+/// [`cont::NONE`]'s entry: never called.
+fn no_cont<'gc>(
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
+    _stack: Stack<'gc, '_>,
+    _status: Result<(), Error<'gc>>,
+) -> NativeOut {
+    NativeOut::error(Error::from_str(
+        ctx,
+        "internal: continuation of a frame that awaits nothing",
+    ))
 }
 
 /// Read-only view of the executor, reached from a native through
@@ -155,7 +196,8 @@ impl Protect {
 #[repr(transparent)]
 pub(crate) struct NativeOut(u64);
 
-impl NativeOut {
+/// [`NativeOut`] tags.
+pub(crate) mod tag {
     pub(crate) const RETURN: u64 = 0;
     pub(crate) const ERROR: u64 = 1;
     pub(crate) const CALL_THEN: u64 = 2;
@@ -164,6 +206,20 @@ impl NativeOut {
     pub(crate) const YIELD_THEN: u64 = 5;
     pub(crate) const ASYNC: u64 = 6;
     pub(crate) const PENDING: u64 = 7;
+}
+
+impl NativeOut {
+    /// A plain return: the results are the window.
+    pub(crate) const RETURN: NativeOut = NativeOut(tag::RETURN);
+    /// Yield the window to the resumer; the values it resumes with are the
+    /// native's results.
+    pub(crate) const YIELD: NativeOut = NativeOut(tag::YIELD);
+    /// The async native's future was spawned (`Stack::spawn`): poll it from
+    /// a frame of its own.
+    pub(crate) const ASYNC: NativeOut = NativeOut(tag::ASYNC);
+    /// Leave the native's frame for the host to come back to: its future
+    /// waits on the host.
+    pub(crate) const PENDING: NativeOut = NativeOut(tag::PENDING);
 
     const PROTECT_SHIFT: u32 = 3;
     const AT_SHIFT: u32 = 48;
@@ -187,31 +243,32 @@ impl NativeOut {
 
     #[inline(always)]
     pub(crate) fn is_return(self) -> bool {
-        self.0 == Self::RETURN
+        self.0 == tag::RETURN
     }
 
     /// A plain native's result.
     #[inline(always)]
     pub(crate) fn plain(r: Result<(), Error<'_>>) -> Self {
         match r {
-            Ok(()) => NativeOut(Self::RETURN),
+            Ok(()) => NativeOut(tag::RETURN),
             Err(e) => Self::error(e),
         }
     }
 
     #[inline(always)]
     pub(crate) fn error(e: Error<'_>) -> Self {
-        NativeOut(Self::ERROR | crate::dmm::Gc::as_ptr(e.inner()) as usize as u64)
+        NativeOut(tag::ERROR | crate::dmm::Gc::as_ptr(e.inner()) as usize as u64)
     }
 
     /// The error of an `ERROR` result.
     #[inline(always)]
     pub(crate) fn into_error<'gc>(self) -> Error<'gc> {
-        debug_assert_eq!(self.tag(), Self::ERROR);
+        debug_assert_eq!(self.tag(), tag::ERROR);
         unsafe { Error::from_inner(crate::dmm::Gc::from_ptr((self.0 & !7) as usize as *const _)) }
     }
 
-    fn packed(tag: u64, at: u32, cont: u8, okk: OnOk, protect: Protect) -> Self {
+    fn packed(tag: u64, at: usize, cont: ContIdx, okk: OnOk, protect: Protect) -> Self {
+        debug_assert!(at < 256);
         let protect = match protect {
             Protect::No => 0,
             Protect::Errors => 1,
@@ -221,36 +278,29 @@ impl NativeOut {
         NativeOut(
             tag | protect << Self::PROTECT_SHIFT
                 | (at as u64) << Self::AT_SHIFT
-                | (cont as u64) << Self::CONT_SHIFT
+                | (cont.0 as u64) << Self::CONT_SHIFT
                 | (okk.bits() as u64) << Self::OK_SHIFT,
         )
     }
 
-    /// An action native's result, its continuation indexed.
-    pub(crate) fn action<'gc>(ctx: Context<'gc>, r: Result<CallbackAction, Error<'gc>>) -> Self {
-        match r {
-            Ok(CallbackAction::Return) => NativeOut(Self::RETURN),
-            Ok(CallbackAction::CallThen {
-                at,
-                protect,
-                ok,
-                cont,
-            }) => Self::packed(Self::CALL_THEN, at, ctx.cont_index(cont), ok, protect),
-            Ok(CallbackAction::Resume { at, ok, cont }) => {
-                Self::packed(Self::RESUME, at, ctx.cont_index(cont), ok, Protect::Errors)
-            }
-            Ok(CallbackAction::Yield) => NativeOut(Self::YIELD),
-            Ok(CallbackAction::YieldThen { at, cont }) => Self::packed(
-                Self::YIELD_THEN,
-                at,
-                ctx.cont_index(cont),
-                OnOk::Cont,
-                Protect::No,
-            ),
-            Ok(CallbackAction::Async) => NativeOut(Self::ASYNC),
-            Ok(CallbackAction::Pending) => NativeOut(Self::PENDING),
-            Err(e) => Self::error(e),
-        }
+    /// Call `stack[at]` with the values above it, then run `cont` with the
+    /// call's results in their place, `stack[at..]`. The native keeps its
+    /// state in `stack[..at]` meanwhile.
+    pub(crate) fn call_then(at: usize, cont: ContIdx, protect: Protect, ok: OnOk) -> Self {
+        Self::packed(tag::CALL_THEN, at, cont, ok, protect)
+    }
+
+    /// Resume the coroutine at `stack[at]` with the values above it, then run
+    /// `cont` with what it yields or returns in their place, or with the
+    /// error that killed it.
+    pub(crate) fn resume(at: usize, cont: ContIdx, ok: OnOk) -> Self {
+        Self::packed(tag::RESUME, at, cont, ok, Protect::Errors)
+    }
+
+    /// Yield `stack[at..]` to the resumer, then run `cont` with the values it
+    /// resumes with in their place.
+    pub(crate) fn yield_then(at: usize, cont: ContIdx) -> Self {
+        Self::packed(tag::YIELD_THEN, at, cont, OnOk::Cont, Protect::No)
     }
 
     #[inline]
@@ -275,6 +325,16 @@ impl NativeOut {
             1 => Protect::Errors,
             2 => Protect::Handler,
             _ => Protect::Base,
+        }
+    }
+}
+
+impl<'gc> std::ops::FromResidual<Result<std::convert::Infallible, Error<'gc>>> for NativeOut {
+    #[inline(always)]
+    fn from_residual(r: Result<std::convert::Infallible, Error<'gc>>) -> Self {
+        match r {
+            Ok(never) => match never {},
+            Err(e) => NativeOut::error(e),
         }
     }
 }
@@ -319,13 +379,10 @@ pub(crate) fn invoke<'gc>(
 ) -> NativeOut {
     let out = match nc.function {
         NativeKind::Plain(f) => NativeOut::plain(f(ctx, nc, Stack::new(ts, win))),
-        NativeKind::Action(f) => NativeOut::action(ctx, f(ctx, nc, Stack::new(ts, win))),
-        NativeKind::Async(f) => NativeOut::action(
-            ctx,
-            crate::vm::async_native::invoke_async(ctx, ts, f, nc, win),
-        ),
+        NativeKind::Cont(f) => f(ctx, nc, Stack::new(ts, win)),
+        NativeKind::Async(f) => crate::vm::async_native::invoke_async(ctx, ts, f, nc, win),
     };
-    if out.tag() != NativeOut::ERROR && ts.native_overflowed() {
+    if out.tag() != tag::ERROR && ts.native_overflowed() {
         return NativeOut::error(native_overflow(ctx));
     }
     out
@@ -432,7 +489,7 @@ handler! {
             let ret = unsafe { frame::ret(base) };
             tail!(ret, pc = unsafe { sp.add(win) } as *const Instruction, insn = Slot::nret(nret))
         }
-        if out.tag() == NativeOut::ERROR {
+        if out.tag() == tag::ERROR {
             // The native has no frame here, so its level 1 is this frame.
             let err = crate::vm::debug::locate_unframed(rt, ts, out.into_error());
             throw!(err)
@@ -738,7 +795,7 @@ pub(crate) fn drive<'gc>(
         let win_ptr = t.slot_ptr(win);
         let nc = unsafe { frame::native_closure(win_ptr) };
         match out.tag() {
-            NativeOut::RETURN => {
+            tag::RETURN => {
                 let nret = t.top - win;
                 return Jump::Ret {
                     ret: unsafe { frame::ret(win_ptr) },
@@ -747,19 +804,19 @@ pub(crate) fn drive<'gc>(
                     base: win_ptr,
                 };
             }
-            NativeOut::ERROR => {
+            tag::ERROR => {
                 // Raised with the native's frame on top (its level 0); the
                 // unwinder pops it, or catches at it when a frameless `pcall`
                 // called it. An async native's future dropped itself before
                 // returning the error, so the frame no longer owns a task.
                 t.top_base = win_ptr;
                 let nh = NativeHdr::unpack(unsafe { frame::func_word(win_ptr) });
-                if nh.cont == crate::vm::dispatch::ASYNC_CONT {
+                if nh.cont == cont::ASYNC.0 {
                     unsafe {
                         frame::set_func_word(
                             win_ptr,
                             NativeHdr {
-                                cont: crate::vm::dispatch::NO_CONT,
+                                cont: cont::NONE.0,
                                 ..nh
                             }
                             .pack(nc),
@@ -768,10 +825,10 @@ pub(crate) fn drive<'gc>(
                 }
                 return crate::vm::unwind::unwind(ctx, ts, out.into_error());
             }
-            NativeOut::CALL_THEN => {
+            tag::CALL_THEN => {
                 return stage_call(t, hdr, nc, out.at(), out.cont(), out.ok(), out.protect());
             }
-            NativeOut::RESUME => {
+            tag::RESUME => {
                 let at = out.at();
                 unsafe {
                     let h = t.slot_ptr(hdr).cast::<u64>();
@@ -799,7 +856,7 @@ pub(crate) fn drive<'gc>(
                 }
                 return crate::vm::coro::resume_into(ctx, ts, co, win + at + 1);
             }
-            NativeOut::YIELD => {
+            tag::YIELD => {
                 // The values it resumes with are the native's results.
                 unsafe {
                     let h = t.slot_ptr(hdr).cast::<u64>();
@@ -818,7 +875,7 @@ pub(crate) fn drive<'gc>(
                 t.top_base = win_ptr;
                 return crate::vm::coro::yield_from(ctx, ts, win);
             }
-            NativeOut::YIELD_THEN => {
+            tag::YIELD_THEN => {
                 let at = out.at();
                 unsafe {
                     let h = t.slot_ptr(hdr).cast::<u64>();
@@ -837,13 +894,13 @@ pub(crate) fn drive<'gc>(
                 t.top_base = win_ptr;
                 return crate::vm::coro::yield_from(ctx, ts, win + at);
             }
-            NativeOut::ASYNC => {
+            tag::ASYNC => {
                 unsafe {
                     let h = t.slot_ptr(hdr).cast::<u64>();
                     h.write(
                         NativeHdr {
                             at: 0,
-                            cont: crate::vm::dispatch::ASYNC_CONT,
+                            cont: cont::ASYNC.0,
                             ok: ok::CONT,
                         }
                         .pack(nc),
@@ -853,14 +910,13 @@ pub(crate) fn drive<'gc>(
                     );
                 }
                 t.top_base = win_ptr;
-                let r = crate::vm::async_native::async_cont(ctx, nc, Stack::new(t, win), Ok(()));
-                out = NativeOut::action(ctx, r);
-                if out.tag() != NativeOut::ERROR && t.native_overflowed() {
+                out = crate::vm::async_native::async_cont(ctx, nc, Stack::new(t, win), Ok(()));
+                if out.tag() != tag::ERROR && t.native_overflowed() {
                     out = NativeOut::error(native_overflow(ctx));
                 }
             }
             _ => {
-                debug_assert_eq!(out.tag(), NativeOut::PENDING);
+                debug_assert_eq!(out.tag(), tag::PENDING);
                 t.top_base = win_ptr;
                 return Jump::Exit(Exit::Pending);
             }
@@ -910,10 +966,8 @@ pub(crate) fn native_continue<'gc>(
     // Errors the continuation itself raises unwind past it.
     unsafe { frame::clear_flags(win_ptr, flag::PROTECTED | flag::HANDLER) };
     let nc = unsafe { frame::native_closure(win_ptr) };
-    let cont = ctx.cont(nh.cont);
-    let r = cont(ctx, nc, Stack::new(t, win), Ok(()));
-    let mut out = NativeOut::action(ctx, r);
-    if out.tag() != NativeOut::ERROR && t.native_overflowed() {
+    let mut out = cont_fn(nh.cont)(ctx, nc, Stack::new(t, win), Ok(()));
+    if out.tag() != tag::ERROR && t.native_overflowed() {
         out = NativeOut::error(native_overflow(ctx));
     }
     drive(ctx, ts, win - HDR, out)
@@ -935,10 +989,8 @@ pub(crate) fn native_catch<'gc>(
     t.top_base = win_ptr;
     unsafe { frame::clear_flags(win_ptr, flag::PROTECTED | flag::HANDLER) };
     let nc = unsafe { frame::native_closure(win_ptr) };
-    let cont = ctx.cont(nh.cont);
-    let r = cont(ctx, nc, Stack::new(t, win), Err(err));
-    let mut out = NativeOut::action(ctx, r);
-    if out.tag() != NativeOut::ERROR && t.native_overflowed() {
+    let mut out = cont_fn(nh.cont)(ctx, nc, Stack::new(t, win), Err(err));
+    if out.tag() != tag::ERROR && t.native_overflowed() {
         out = NativeOut::error(native_overflow(ctx));
     }
     drive(ctx, ts, win - HDR, out)
@@ -953,9 +1005,8 @@ pub(crate) fn repoll<'gc>(
     let t = &mut **ts;
     let win_ptr = t.slot_ptr(win);
     let nc = unsafe { frame::native_closure(win_ptr) };
-    let r = crate::vm::async_native::async_cont(ctx, nc, Stack::new(t, win), Ok(()));
-    let mut out = NativeOut::action(ctx, r);
-    if out.tag() != NativeOut::ERROR && t.native_overflowed() {
+    let mut out = crate::vm::async_native::async_cont(ctx, nc, Stack::new(t, win), Ok(()));
+    if out.tag() != tag::ERROR && t.native_overflowed() {
         out = NativeOut::error(native_overflow(ctx));
     }
     drive(ctx, ts, win - HDR, out)
