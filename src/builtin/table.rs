@@ -657,6 +657,162 @@ enum SortResume<'gc> {
     Set,
 }
 
+/// The state and working-value slots as registers: loaded once per step and
+/// stored once before a call. Every access through the window is a bounds
+/// check against the thread's top, which a call may move, and a value read
+/// into a slot and compared from it a few instructions later stalled on the
+/// store (a fifth of the comparator sort's time).
+#[derive(Clone, Copy)]
+struct SortState<'gc> {
+    /// `S0`, `S1`, `S2`.
+    s: [Value<'gc>; 3],
+    lo: usize,
+    up: usize,
+    i: usize,
+    j: usize,
+    p: usize,
+    phase: i32,
+    nq: usize,
+}
+
+impl<'gc> SortState<'gc> {
+    #[inline(always)]
+    fn load(stack: &Stack<'gc, '_>) -> Self {
+        let s = &stack.as_slice()[..STATE];
+        let g = |i: usize| s[i].get_small().unwrap_or(0);
+        SortState {
+            s: [s[S0], s[S1], s[S2]],
+            lo: g(LO) as usize,
+            up: g(UP) as usize,
+            i: g(I) as usize,
+            j: g(J) as usize,
+            p: g(P) as usize,
+            phase: g(PHASE),
+            nq: g(NQ) as usize,
+        }
+    }
+
+    /// Reload the working values after the queue path wrote the slots.
+    #[inline(always)]
+    fn reload_values(&mut self, stack: &Stack<'gc, '_>) {
+        let s = &stack.as_slice()[..STATE];
+        self.s = [s[S0], s[S1], s[S2]];
+    }
+
+    #[inline(always)]
+    fn store(self, stack: &mut Stack<'gc, '_>) {
+        let s = &mut stack.as_mut_slice()[..STATE];
+        s[S0] = self.s[0];
+        s[S1] = self.s[1];
+        s[S2] = self.s[2];
+        s[LO] = Value::small(self.lo as i32);
+        s[UP] = Value::small(self.up as i32);
+        s[I] = Value::small(self.i as i32);
+        s[J] = Value::small(self.j as i32);
+        s[P] = Value::small(self.p as i32);
+        s[PHASE] = Value::small(self.phase);
+        s[NQ] = Value::small(self.nq as i32);
+    }
+}
+
+/// Save the state and make the call `[f, args..]`, which `sort_cont` resumes.
+#[inline(never)]
+fn sort_call<'gc>(
+    stack: &mut Stack<'gc, '_>,
+    st: SortState<'gc>,
+    f: Value<'gc>,
+    args: &[Value<'gc>],
+) -> NativeOut {
+    st.store(stack);
+    let at = stack.len();
+    stack.as_mut_slice()[AT] = Value::small(at as i32);
+    // In frame layout, so the driver moves nothing.
+    stack.extend_from_slice(&[f, Value::nil(), Value::nil(), Value::nil()]);
+    stack.extend_from_slice(args);
+    NativeOut::call_then_staged(at, cont::SORT, Protect::No, OnOk::Cont)
+}
+
+/// The queued reads and writes, in order, each through the metamethod it
+/// needs: `sort_drive`'s path for a table with `__index` or `__newindex`,
+/// checked per operation since a comparator may add them. `Some` when one
+/// of them calls (the state saved, the operation still queued) or fails.
+#[inline(never)]
+fn sort_queued<'gc>(
+    ctx: Context<'gc>,
+    stack: &mut Stack<'gc, '_>,
+    st: &mut SortState<'gc>,
+    tv: Value<'gc>,
+) -> Option<NativeOut> {
+    let mc = ctx.mutation();
+    let int = |stack: &Stack<'gc, '_>, i: usize| stack.get(i).get_small().unwrap_or(0);
+    while st.nq > 0 {
+        let (kind, k, s) = (
+            int(stack, QUEUE),
+            int(stack, QUEUE + 1),
+            int(stack, QUEUE + 2) as usize,
+        );
+        let key = Value::integer(mc, k as i64);
+        let raw = tv.get_table().filter(|t| {
+            let what = if kind == OP_GET { TAB_R } else { TAB_W };
+            !t.shape().has_mm(what)
+        });
+        if kind == OP_GET {
+            // `walk_index_chain` starts from a raw miss.
+            let v = tv.get_table().map_or(Value::nil(), |t| t.raw_get(key));
+            let v = match raw {
+                Some(_) => v,
+                None if !v.is_nil() => v,
+                None => match walk_index_chain(ctx, tv, key) {
+                    IndexChain::Resolved(v) => v,
+                    IndexChain::Invoke { func, receiver } => {
+                        return Some(sort_call(
+                            stack,
+                            *st,
+                            Value::function(func),
+                            &[receiver, key],
+                        ));
+                    }
+                    IndexChain::NotIndexable(v) => {
+                        let msg = format!("attempt to index a {} value", v.type_name());
+                        return Some(NativeOut::error(util::runtime_error(ctx, &msg)));
+                    }
+                    IndexChain::Exhausted => {
+                        let msg = "'__index' chain too long; possible loop";
+                        return Some(NativeOut::error(util::runtime_error(ctx, msg)));
+                    }
+                },
+            };
+            stack.as_mut_slice()[s] = v;
+        } else {
+            let v = stack.get(s);
+            match raw {
+                Some(t) => t.raw_set(ctx, key, v),
+                None => match walk_newindex_chain(ctx, tv, key) {
+                    NewIndexChain::RawSet(target) => target.raw_set(ctx, key, v),
+                    NewIndexChain::Invoke { func, receiver } => {
+                        return Some(sort_call(
+                            stack,
+                            *st,
+                            Value::function(func),
+                            &[receiver, key, v],
+                        ));
+                    }
+                    NewIndexChain::NotIndexable(v) => {
+                        let msg = format!("attempt to index a {} value", v.type_name());
+                        return Some(NativeOut::error(util::runtime_error(ctx, &msg)));
+                    }
+                    NewIndexChain::Exhausted => {
+                        let msg = "'__newindex' chain too long; possible loop";
+                        return Some(NativeOut::error(util::runtime_error(ctx, msg)));
+                    }
+                },
+            }
+        }
+        pop_op(stack, &mut st.nq);
+    }
+    None
+}
+
 /// PUC-Lua's `auxsort` over `[1, n]`, down to the order of every read, write
 /// and comparison, as a state machine in the window: comparisons and the
 /// reads and writes that need no call run in the loop; the rest return a
@@ -669,62 +825,62 @@ fn sort_drive<'gc>(
     mut stack: Stack<'gc, '_>,
     resume: SortResume<'gc>,
 ) -> NativeOut {
-    let mc = ctx.mutation();
     let tv = stack.get(0);
     let comp = stack.get(1);
-    let int = |stack: &Stack<'gc, '_>, i: usize| stack.get(i).get_small().unwrap_or(0);
-    let (mut lo, mut up) = (int(&stack, LO) as usize, int(&stack, UP) as usize);
-    let (mut i, mut j, mut p) = (
-        int(&stack, I) as usize,
-        int(&stack, J) as usize,
-        int(&stack, P) as usize,
-    );
-    let mut phase = int(&stack, PHASE);
-    let mut nq = int(&stack, NQ) as usize;
+    // Reads and writes go straight to the table while it has no `__index`
+    // or `__newindex` and nothing is queued ahead of them; a comparator can
+    // add the metamethods, so this is decided again on every resume.
+    let direct = tv
+        .get_table()
+        .filter(|t| !t.shape().has_any_mm(TAB_R | TAB_W));
     let mut r = None;
+    let mut nq = stack.get(NQ).get_small().unwrap_or(0) as usize;
     match resume {
         SortResume::Start => {}
         SortResume::Less(b) => r = Some(b),
         SortResume::Got(v) => {
-            let s = int(&stack, QUEUE + 2) as usize;
+            let s = stack.get(QUEUE + 2).get_small().unwrap_or(0) as usize;
             stack.as_mut_slice()[s] = v;
             pop_op(&mut stack, &mut nq);
         }
         SortResume::Set => pop_op(&mut stack, &mut nq),
     }
-    // Save the state and make the call `[$f, $args..]`.
-    macro_rules! call {
-        ($f:expr, [$($arg:expr),*]) => {{
-            for (s, v) in [(LO, lo), (UP, up), (I, i), (J, j), (P, p), (NQ, nq)] {
-                stack.as_mut_slice()[s] = Value::small(v as i32);
-            }
-            stack.as_mut_slice()[PHASE] = Value::small(phase);
-            let at = stack.len();
-            stack.as_mut_slice()[AT] = Value::small(at as i32);
-            stack.extend([$f, $($arg),*]);
-            return NativeOut::call_then(at, cont::SORT, Protect::No, OnOk::Cont);
-        }};
-    }
-    // Queue a read of `t[$k]` into slot `$s`, or a write the other way.
+    let mut st = SortState::load(&stack);
+    st.nq = nq;
+    // Read `t[$k]` into working value `$s` (0, 1, 2), or write the other
+    // way: now, or queued for `sort_queued` at the top of the loop. Queued
+    // operations go through the slots, which hold the same values until the
+    // queue is drained (nothing else writes a working value meanwhile).
     macro_rules! op {
         ($kind:expr, $k:expr, $s:expr) => {{
-            let q = QUEUE + 3 * nq;
-            let slots = stack.as_mut_slice();
-            slots[q] = Value::small($kind);
-            slots[q + 1] = Value::small($k as i32);
-            slots[q + 2] = Value::small($s as i32);
-            nq += 1;
+            match direct {
+                Some(t) if st.nq == 0 => {
+                    if $kind == OP_GET {
+                        st.s[$s] = t.raw_get_index($k);
+                    } else {
+                        t.raw_set_index(ctx, $k, st.s[$s]);
+                    }
+                }
+                _ => {
+                    let q = QUEUE + 3 * st.nq;
+                    let slots = stack.as_mut_slice();
+                    slots[q] = Value::small($kind);
+                    slots[q + 1] = Value::small($k as i32);
+                    slots[q + 2] = Value::small((S0 + $s) as i32);
+                    st.nq += 1;
+                }
+            }
         }};
     }
-    // Whether the value in slot `$x` sorts before the one in `$y`.
+    // Whether working value `$x` sorts before `$y`.
     macro_rules! less {
         ($x:expr, $y:expr) => {{
             match r.take() {
                 Some(b) => b,
                 None => {
-                    let (x, y) = (stack.get($x), stack.get($y));
+                    let (x, y) = (st.s[$x], st.s[$y]);
                     if !comp.is_nil() {
-                        call!(comp, [x, y]);
+                        return sort_call(&mut stack, st, comp, &[x, y]);
                     }
                     match prim_lt(x, y) {
                         Some(b) => b,
@@ -734,7 +890,7 @@ fn sort_drive<'gc>(
                                 let msg = util::compare_error_msg(x, y);
                                 return NativeOut::error(util::runtime_error(ctx, &msg));
                             }
-                            call!(m, [x, y]);
+                            return sort_call(&mut stack, st, m, &[x, y]);
                         }
                     }
                 }
@@ -742,69 +898,18 @@ fn sort_drive<'gc>(
         }};
     }
     loop {
-        // The queued reads and writes come first, in order. A comparator may
-        // have given the table metamethods, so check each time.
-        while nq > 0 {
-            let (kind, k, s) = (
-                int(&stack, QUEUE),
-                int(&stack, QUEUE + 1),
-                int(&stack, QUEUE + 2) as usize,
-            );
-            let key = Value::integer(mc, k as i64);
-            let raw = tv.get_table().filter(|t| {
-                let what = if kind == OP_GET { TAB_R } else { TAB_W };
-                !t.shape().has_mm(what)
-            });
-            if kind == OP_GET {
-                // `walk_index_chain` starts from a raw miss.
-                let v = tv.get_table().map_or(Value::nil(), |t| t.raw_get(key));
-                let v = match raw {
-                    Some(_) => v,
-                    None if !v.is_nil() => v,
-                    None => match walk_index_chain(ctx, tv, key) {
-                        IndexChain::Resolved(v) => v,
-                        IndexChain::Invoke { func, receiver } => {
-                            call!(Value::function(func), [receiver, key]);
-                        }
-                        IndexChain::NotIndexable(v) => {
-                            let msg = format!("attempt to index a {} value", v.type_name());
-                            return NativeOut::error(util::runtime_error(ctx, &msg));
-                        }
-                        IndexChain::Exhausted => {
-                            let msg = "'__index' chain too long; possible loop";
-                            return NativeOut::error(util::runtime_error(ctx, msg));
-                        }
-                    },
-                };
-                stack.as_mut_slice()[s] = v;
-            } else {
-                let v = stack.get(s);
-                match raw {
-                    Some(t) => t.raw_set(ctx, key, v),
-                    None => match walk_newindex_chain(ctx, tv, key) {
-                        NewIndexChain::RawSet(target) => target.raw_set(ctx, key, v),
-                        NewIndexChain::Invoke { func, receiver } => {
-                            call!(Value::function(func), [receiver, key, v]);
-                        }
-                        NewIndexChain::NotIndexable(v) => {
-                            let msg = format!("attempt to index a {} value", v.type_name());
-                            return NativeOut::error(util::runtime_error(ctx, &msg));
-                        }
-                        NewIndexChain::Exhausted => {
-                            let msg = "'__newindex' chain too long; possible loop";
-                            return NativeOut::error(util::runtime_error(ctx, msg));
-                        }
-                    },
-                }
+        if st.nq > 0 {
+            if let Some(out) = sort_queued(ctx, &mut stack, &mut st, tv) {
+                return out;
             }
-            pop_op(&mut stack, &mut nq);
+            st.reload_values(&stack);
         }
-        match phase {
+        match st.phase {
             PH_RANGE => {
-                if lo < up {
-                    op!(OP_GET, lo, S0);
-                    op!(OP_GET, up, S1);
-                    phase = PH_A;
+                if st.lo < st.up {
+                    op!(OP_GET, st.lo, 0);
+                    op!(OP_GET, st.up, 1);
+                    st.phase = PH_A;
                     continue;
                 }
                 // The next pending range, or done.
@@ -813,117 +918,118 @@ fn sort_drive<'gc>(
                     return NativeOut::RETURN;
                 }
                 let n = stack.len();
-                (lo, up) = (int(&stack, n - 2) as usize, int(&stack, n - 1) as usize);
+                st.lo = stack.get(n - 2).get_small().unwrap_or(0) as usize;
+                st.up = stack.get(n - 1).get_small().unwrap_or(0) as usize;
                 stack.truncate(n - 2);
             }
             PH_A => {
                 // sort elements `lo`, `p`, and `up`
-                if less!(S1, S0) {
-                    op!(OP_SET, lo, S1);
-                    op!(OP_SET, up, S0);
+                if less!(1, 0) {
+                    op!(OP_SET, st.lo, 1);
+                    op!(OP_SET, st.up, 0);
                 }
-                if up - lo == 1 {
-                    (lo, up) = (1, 0);
-                    phase = PH_RANGE;
+                if st.up - st.lo == 1 {
+                    (st.lo, st.up) = (1, 0);
+                    st.phase = PH_RANGE;
                     continue;
                 }
-                p = (lo + up) / 2;
-                op!(OP_GET, p, S0);
-                op!(OP_GET, lo, S1);
-                phase = PH_B;
+                st.p = (st.lo + st.up) / 2;
+                op!(OP_GET, st.p, 0);
+                op!(OP_GET, st.lo, 1);
+                st.phase = PH_B;
             }
             PH_B => {
-                if less!(S0, S1) {
-                    op!(OP_SET, p, S1);
-                    op!(OP_SET, lo, S0);
-                    phase = PH_PIVOT;
+                if less!(0, 1) {
+                    op!(OP_SET, st.p, 1);
+                    op!(OP_SET, st.lo, 0);
+                    st.phase = PH_PIVOT;
                 } else {
-                    op!(OP_GET, up, S1);
-                    phase = PH_C;
+                    op!(OP_GET, st.up, 1);
+                    st.phase = PH_C;
                 }
             }
             PH_C => {
-                if less!(S1, S0) {
-                    op!(OP_SET, p, S1);
-                    op!(OP_SET, up, S0);
+                if less!(1, 0) {
+                    op!(OP_SET, st.p, 1);
+                    op!(OP_SET, st.up, 0);
                 }
-                phase = PH_PIVOT;
+                st.phase = PH_PIVOT;
             }
             PH_PIVOT => {
-                if up - lo == 2 {
-                    (lo, up) = (1, 0);
-                    phase = PH_RANGE;
+                if st.up - st.lo == 2 {
+                    (st.lo, st.up) = (1, 0);
+                    st.phase = PH_RANGE;
                     continue;
                 }
                 // Pivot P stays in `S0` for the partition; `a[p]` and
                 // `a[up - 1]` swap places.
-                op!(OP_GET, p, S0);
-                op!(OP_GET, up - 1, S1);
-                op!(OP_SET, p, S1);
-                op!(OP_SET, up - 1, S0);
-                (i, j) = (lo, up - 1);
-                phase = PH_D_NEXT;
+                op!(OP_GET, st.p, 0);
+                op!(OP_GET, st.up - 1, 1);
+                op!(OP_SET, st.p, 1);
+                op!(OP_SET, st.up - 1, 0);
+                (st.i, st.j) = (st.lo, st.up - 1);
+                st.phase = PH_D_NEXT;
             }
             PH_D_NEXT => {
                 // repeat ++i while a[i] < P
-                i += 1;
-                op!(OP_GET, i, S1);
-                phase = PH_D;
+                st.i += 1;
+                op!(OP_GET, st.i, 1);
+                st.phase = PH_D;
             }
             PH_D => {
-                if less!(S1, S0) {
-                    if i == up - 1 {
+                if less!(1, 0) {
+                    if st.i == st.up - 1 {
                         return NativeOut::error(Error::from_str(
                             ctx,
                             "invalid order function for sorting",
                         ));
                     }
-                    phase = PH_D_NEXT;
+                    st.phase = PH_D_NEXT;
                 } else {
-                    phase = PH_E_NEXT;
+                    st.phase = PH_E_NEXT;
                 }
             }
             PH_E_NEXT => {
                 // repeat --j while P < a[j]
-                j -= 1;
-                op!(OP_GET, j, S2);
-                phase = PH_E;
+                st.j -= 1;
+                op!(OP_GET, st.j, 2);
+                st.phase = PH_E;
             }
             PH_E => {
-                if less!(S0, S2) {
-                    if j < i {
+                if less!(0, 2) {
+                    if st.j < st.i {
                         return NativeOut::error(Error::from_str(
                             ctx,
                             "invalid order function for sorting",
                         ));
                     }
-                    phase = PH_E_NEXT;
+                    st.phase = PH_E_NEXT;
                 } else {
-                    phase = PH_SWAP;
+                    st.phase = PH_SWAP;
                 }
             }
             PH_SWAP => {
-                if j < i {
+                if st.j < st.i {
                     // no elements out of place: swap P into a[i], and sort
                     // the smaller side first, the larger one pending
-                    op!(OP_SET, up - 1, S1);
-                    op!(OP_SET, i, S0);
-                    let p = i;
-                    let (next, pend) = if p - lo < up - p {
-                        ((lo, p - 1), (p + 1, up))
+                    op!(OP_SET, st.up - 1, 1);
+                    op!(OP_SET, st.i, 0);
+                    let p = st.i;
+                    let (next, pend) = if p - st.lo < st.up - p {
+                        ((st.lo, p - 1), (p + 1, st.up))
                     } else {
-                        ((p + 1, up), (lo, p - 1))
+                        ((p + 1, st.up), (st.lo, p - 1))
                     };
                     stack.extend([Value::small(pend.0 as i32), Value::small(pend.1 as i32)]);
-                    (lo, up) = next;
-                    phase = PH_RANGE;
+                    (st.lo, st.up) = next;
+                    st.phase = PH_RANGE;
                 } else {
-                    op!(OP_SET, i, S2);
-                    op!(OP_SET, j, S1);
-                    phase = PH_D_NEXT;
+                    op!(OP_SET, st.i, 2);
+                    op!(OP_SET, st.j, 1);
+                    st.phase = PH_D_NEXT;
                 }
             }
-            _ => unreachable!("sort phase {phase}"),
+            _ => unreachable!("sort phase {}", st.phase),
         }
     }
 }
