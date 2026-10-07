@@ -71,6 +71,8 @@ pub enum CompileErrorKind {
     Functions,
     #[error("too many constants")]
     Constants,
+    #[error("control structure too long")]
+    ControlTooLong,
     #[error("too many table constructors")]
     Constructors,
     #[error("label '{0}' already defined on line {1}")]

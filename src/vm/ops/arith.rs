@@ -454,9 +454,16 @@ fn numeric_form(generic: Op, lhs: &Value<'_>, rhs: &Value<'_>, imm_int: bool) ->
 /// (three lock the site to its generic opcode): a form whose operation
 /// failed on its own kinds (overflow, a zero divisor) and a boxed integer
 /// operand leave the site as it is, so a site that mostly sees small
-/// integers keeps its form. `lock` is the metamethod path's "no form".
+/// integers keeps its form. With `lock`, a `None` form counts too (the
+/// kinds are ones the generic handles inline but no form covers, or a
+/// metamethod site without a form).
 #[inline(always)]
-unsafe fn specialize(site: *mut Instruction, insn: Instruction, form: Option<Op>, lock: bool) {
+pub(crate) unsafe fn specialize(
+    site: *mut Instruction,
+    insn: Instruction,
+    form: Option<Op>,
+    lock: bool,
+) {
     let current = insn.op();
     let generic = insn.unquickened();
     let (misses, _) = insn.adaptive();
@@ -479,7 +486,9 @@ unsafe fn specialize(site: *mut Instruction, insn: Instruction, form: Option<Op>
                         .with_mm_form(f, generic.op())
                         .with_adaptive(misses, false),
                     Some(f) => generic.with_op(f).with_adaptive(misses, false),
-                    None => generic.with_adaptive(misses, true),
+                    // Counted; the generic opcode specializes again on the
+                    // next kinds that have a form, until the misses lock it.
+                    None => generic.with_adaptive(misses, false),
                 }
             }
         }

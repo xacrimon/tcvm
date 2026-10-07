@@ -94,7 +94,7 @@ handler! {
         base = caller;
         pc = cpc;
         set_closure!(unsafe { frame::closure(base) });
-        branch!(truthy == (op.op().branch_sense() == Some(true)), op.imm())
+        branch!(truthy == (op.generic_op().branch_sense() == Some(true)), op.branch_offset())
     }
 
     /// Continuation of a generic for's iterator: its results are the loop's
