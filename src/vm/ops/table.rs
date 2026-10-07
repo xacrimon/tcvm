@@ -1,6 +1,5 @@
 //! Register-key table access, table construction, length and concatenation.
 
-use crate::dmm::Gc;
 use crate::env::MetamethodBits;
 use crate::env::string::LuaString;
 use crate::env::table::Table;
@@ -82,12 +81,11 @@ handler! {
                 && !(old.is_nil() && state.shape().has_mm(MetamethodBits::NEWINDEX))
             {
                 drop(state);
-                if let Some(w) = Gc::write_if_clean(rt.mutation(), t.inner()) {
-                    let v = reg![src];
-                    // In range: checked above, and nothing ran in between.
-                    unsafe { w.unlock().borrow_mut().set_array_at(i as usize, v) };
-                    next!()
-                }
+                barrier!(t.inner());
+                let v = reg![src];
+                // In range: checked above, and nothing ran in between.
+                unsafe { t.borrow_mut_barriered().set_array_at(i as usize, v) };
+                next!()
             }
         }
         tail!(settable_general)
@@ -136,8 +134,9 @@ handler! {
         let bi = ts.slot_index(base);
         let start = bi + table as usize + 1;
         let n = if count == 0 { ts.top - start } else { count as usize };
+        barrier!(t.inner());
         let items = &ts.stack[start..start + n];
-        t.inner().borrow_mut(rt.mutation()).set_list(rt.mutation(), offset as usize, items);
+        unsafe { t.borrow_mut_barriered() }.set_list(rt.mutation(), offset as usize, items);
         next!()
     }
 

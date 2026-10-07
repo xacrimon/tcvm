@@ -3,6 +3,7 @@ mod arith_forms;
 mod arith_quicken;
 mod assign_multires;
 mod async_native;
+mod barrier_retry;
 mod basic_globals;
 mod builtin_error_position;
 mod builtin_metamethods;

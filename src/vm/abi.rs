@@ -404,6 +404,21 @@ macro_rules! handler_impl {
             }};
         }
 
+        /// Before a store into `$$gc`: a gray object needs no
+        /// barrier; any other goes to `barrier_retry`, which runs the barrier
+        /// out of line and re-dispatches this instruction.
+        macro_rules! barrier {
+            ($$gc:expr) => {{
+                let __g = $$gc;
+                if ::std::hint::unlikely(!$crate::dmm::Gc::is_gray(__g)) {
+                    tail!(
+                        $crate::vm::ops::field::barrier_retry,
+                        closure = $crate::vm::abi::Slot::from_raw($crate::dmm::Gc::erased_ptr(__g) as u64)
+                    )
+                }
+            }};
+        }
+
         /// After an allocation: leave for the collector if it is owed work.
         macro_rules! gc_check {
             () => {{

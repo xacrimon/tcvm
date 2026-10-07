@@ -264,21 +264,24 @@ impl<'gc> UpvalueCell<'gc> {
         unsafe { *self.v.get() }
     }
 
-    /// Store `value`, `running` being the thread the interpreter runs on.
+    /// The object a store into this cell must barrier: the cell when closed,
+    /// the owning thread when open on another thread's stack, none when open
+    /// on `running`, whose state is borrowed for dispatch.
     #[inline(always)]
-    pub(crate) fn set(
-        this: Upvalue<'gc>,
-        mc: &Mutation<'gc>,
-        running: Thread<'gc>,
-        value: Value<'gc>,
-    ) {
+    pub(crate) fn barrier_target(this: Upvalue<'gc>, running: Thread<'gc>) -> Option<Gc<'gc, ()>> {
         match this.thread.get() {
-            None => mc.backward_barrier(Gc::erase(this), None),
-            // The running thread's state is borrowed for dispatch, which
-            // emitted its barrier.
-            Some(t) if !t.ptr_eq(running) => mc.backward_barrier(Gc::erase(t.inner()), None),
-            Some(_) => {}
+            None => Some(Gc::erase(this)),
+            Some(t) if !t.ptr_eq(running) => Some(Gc::erase(t.inner())),
+            Some(_) => None,
         }
+    }
+
+    /// Store `value` after the caller ran the barrier of [`Self::barrier_target`].
+    ///
+    /// # Safety
+    /// The barrier was handled.
+    #[inline(always)]
+    pub(crate) unsafe fn set_barriered(this: Upvalue<'gc>, value: Value<'gc>) {
         // SAFETY: as in `get`.
         unsafe { *this.v.get() = value };
     }

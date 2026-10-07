@@ -283,6 +283,20 @@ impl<'gc, T: ?Sized + 'gc> Gc<'gc, T> {
         }
     }
 
+    /// The backward barrier's fast test: a gray object may be written without one. A handler
+    /// whose object fails it retries the store after [`Mutation::backward_barrier_erased`] on
+    /// [`Gc::erased_ptr`].
+    #[inline(always)]
+    pub fn is_gray(this: Self) -> bool {
+        unsafe { GcBox::erase(this.ptr) }.header().is_gray()
+    }
+
+    /// The object's box as an opaque pointer, to pass through a handler slot.
+    #[inline(always)]
+    pub(crate) fn erased_ptr(this: Self) -> *const () {
+        this.ptr.as_ptr() as *const ()
+    }
+
     /// [`Gc::write`] when its barrier would do nothing, else `None`; for fast paths that would
     /// rather bail out than call into the collector.
     #[inline]
