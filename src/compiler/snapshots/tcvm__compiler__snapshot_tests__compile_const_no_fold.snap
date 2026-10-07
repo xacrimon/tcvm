@@ -5,45 +5,43 @@ expression: output
 ; function (params=0, vararg=true, stack=1, upvalues=1)
 ; constants:
 ;   K0 = "a"
-;   K1 = 1
-;   K2 = "b"
-;   K3 = 0
-;   K4 = "c"
-;   K5 = "d"
-;   K6 = 1.5
-;   K7 = "e"
-;   K8 = 0.0
-;   K9 = "f"
-;   K10 = "x"
-;   K11 = "g"
-;   K12 = "h"
-;   K13 = "abc"
+;   K1 = "b"
+;   K2 = "c"
+;   K3 = "d"
+;   K4 = 1.5
+;   K5 = "e"
+;   K6 = 0.0
+;   K7 = "f"
+;   K8 = "x"
+;   K9 = "g"
+;   K10 = "h"
+;   K11 = "abc"
 ; upvalues:
 ;   U0 = local R0
 ; code:
 0000  [  1]  VARARGPREP      fixed=0
-0001  [  5]  LOAD            R0 K1  ; 1
+0001  [  5]  LOADI           R0 1
 0002  [  5]  DIVI            R0 R0 #0
 0003  [  5]  SETTABUP        R0 U0 K0  ; "a"
-0004  [  6]  LOAD            R0 K3  ; 0
+0004  [  6]  LOADI           R0 0
 0005  [  6]  RIDIVI          R0 R0 #1
-0006  [  6]  SETTABUP        R0 U0 K2  ; "b"
-0007  [  7]  LOAD            R0 K3  ; 0
+0006  [  6]  SETTABUP        R0 U0 K1  ; "b"
+0007  [  7]  LOADI           R0 0
 0008  [  7]  RMODI           R0 R0 #5
-0009  [  7]  SETTABUP        R0 U0 K4  ; "c"
-0010  [ 10]  LOAD            R0 K6  ; 1.5
+0009  [  7]  SETTABUP        R0 U0 K2  ; "c"
+0010  [ 10]  LOAD            R0 K4  ; 1.5
 0011  [ 10]  BANDI           R0 R0 #2
-0012  [ 10]  SETTABUP        R0 U0 K5  ; "d"
-0013  [ 13]  LOAD            R0 K8  ; 0.0
+0012  [ 10]  SETTABUP        R0 U0 K3  ; "d"
+0013  [ 13]  LOAD            R0 K6  ; 0.0
 0014  [ 13]  SUBI            R0 R0 #0.0
-0015  [ 13]  SETTABUP        R0 U0 K7  ; "e"
-0016  [ 16]  GETTABUP        R0 U0 K10  ; "x"
+0015  [ 13]  SETTABUP        R0 U0 K5  ; "e"
+0016  [ 16]  GETTABUP        R0 U0 K8  ; "x"
 0017  [ 16]  ADDI            R0 R0 #1
-0018  [ 16]  SETTABUP        R0 U0 K9  ; "f"
-0019  [ 17]  GETTABUP        R0 U0 K10  ; "x"
+0018  [ 16]  SETTABUP        R0 U0 K7  ; "f"
+0019  [ 17]  GETTABUP        R0 U0 K8  ; "x"
 0020  [ 17]  UNM             R0 R0
-0021  [ 17]  SETTABUP        R0 U0 K11  ; "g"
-0022  [ 20]  LOAD            R0 K13  ; "abc"
+0021  [ 17]  SETTABUP        R0 U0 K9  ; "g"
+0022  [ 20]  LOAD            R0 K11  ; "abc"
 0023  [ 20]  LEN             R0 R0
-0024  [ 20]  SETTABUP        R0 U0 K12  ; "h"
+0024  [ 20]  SETTABUP        R0 U0 K10  ; "h"
 0025  [ 20]  RETURN          R0 count=1

@@ -18,8 +18,6 @@ expression: output
 
   ; prototype 0:
     ; function (params=0, vararg=false, stack=1, upvalues=0)
-    ; constants:
-    ;   K0 = 8
     ; code:
-    0000  [  8]  LOAD            R0 K0  ; 8
+    0000  [  8]  LOADI           R0 8
     0001  [  8]  RETURN1         R0

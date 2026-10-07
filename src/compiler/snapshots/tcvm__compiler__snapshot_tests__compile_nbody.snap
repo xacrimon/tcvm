@@ -30,15 +30,14 @@ expression: output
 ;   K23 = 5.1513890204661145e-5
 ;   K24 = "tonumber"
 ;   K25 = "arg"
-;   K26 = 1
-;   K27 = 1000
-;   K28 = "io"
-;   K29 = "write"
-;   K30 = "string"
-;   K31 = "format"
-;   K32 = "%0.9f"
-;   K33 = "\n"
-;   K34 = 0.01
+;   K26 = "io"
+;   K27 = "write"
+;   K28 = "string"
+;   K29 = "format"
+;   K30 = "%0.9f"
+;   K31 = "\n"
+;   K32 = 1
+;   K33 = 0.01
 ; upvalues:
 ;   U0 = local R0
 ; code:
@@ -110,11 +109,11 @@ expression: output
 0065  [116]  GETTABUP        R16 U0 K25  ; "arg"
 0066  [116]  JF              R16 +3
 0067  [116]  GETTABUP        R16 U0 K25  ; "arg"
-0068  [116]  LOAD            R17 K26  ; 1
+0068  [116]  LOADI           R17 1
 0069  [116]  GETTABLE        R16 R16 R17
 0070  [116]  CALL_R1         R12 args=2
 0071  [116]  JT              R12 +1
-0072  [116]  LOAD            R12 K27  ; 1000
+0072  [116]  LOADI           R12 1000
 0073  [117]  NEWTABLE        R13 T5  ; {} items=5
 0074  [117]  MOVE            R14 R8
 0075  [117]  MOVE            R15 R4
@@ -127,39 +126,39 @@ expression: output
 0082  [120]  MOVE            R19 R13
 0083  [120]  MOVE            R20 R14
 0084  [120]  CALL_R0         R15 args=3
-0085  [121]  GETTABUP        R15 U0 K28  ; "io"
-0086  [121]  GETFIELD        R15 R15 K29  ; "write"
-0087  [121]  GETTABUP        R19 U0 K30  ; "string"
-0088  [121]  GETFIELD        R19 R19 K31  ; "format"
-0089  [121]  LOAD            R23 K32  ; "%0.9f"
+0085  [121]  GETTABUP        R15 U0 K26  ; "io"
+0086  [121]  GETFIELD        R15 R15 K27  ; "write"
+0087  [121]  GETTABUP        R19 U0 K28  ; "string"
+0088  [121]  GETFIELD        R19 R19 K29  ; "format"
+0089  [121]  LOAD            R23 K30  ; "%0.9f"
 0090  [121]  MOVE            R24 R10
 0091  [121]  MOVE            R28 R13
 0092  [121]  MOVE            R29 R14
 0093  [121]  CALL            R24 args=3 ret=0
 0094  [121]  CALL_R1         R19 args=0
-0095  [121]  LOAD            R20 K33  ; "\n"
+0095  [121]  LOAD            R20 K31  ; "\n"
 0096  [121]  CALL_R0         R15 args=3
-0097  [122]  LOAD            R15 K26  ; 1
+0097  [122]  LOADI           R15 1
 0098  [122]  MOVE            R16 R12
-0099  [122]  LOAD            R17 K26  ; 1
+0099  [122]  LOAD            R17 K32  ; 1
 0100  [122]  FORPREP         R15 +6
 0101  [122]  MOVE            R19 R9
 0102  [122]  MOVE            R23 R13
 0103  [122]  MOVE            R24 R14
-0104  [122]  LOAD            R25 K34  ; 0.01
+0104  [122]  LOAD            R25 K33  ; 0.01
 0105  [122]  CALL_R0         R19 args=4
 0106  [122]  FORLOOP         R15 -6
-0107  [123]  GETTABUP        R15 U0 K28  ; "io"
-0108  [123]  GETFIELD        R15 R15 K29  ; "write"
-0109  [123]  GETTABUP        R19 U0 K30  ; "string"
-0110  [123]  GETFIELD        R19 R19 K31  ; "format"
-0111  [123]  LOAD            R23 K32  ; "%0.9f"
+0107  [123]  GETTABUP        R15 U0 K26  ; "io"
+0108  [123]  GETFIELD        R15 R15 K27  ; "write"
+0109  [123]  GETTABUP        R19 U0 K28  ; "string"
+0110  [123]  GETFIELD        R19 R19 K29  ; "format"
+0111  [123]  LOAD            R23 K30  ; "%0.9f"
 0112  [123]  MOVE            R24 R10
 0113  [123]  MOVE            R28 R13
 0114  [123]  MOVE            R29 R14
 0115  [123]  CALL            R24 args=3 ret=0
 0116  [123]  CALL_R1         R19 args=0
-0117  [123]  LOAD            R20 K33  ; "\n"
+0117  [123]  LOAD            R20 K31  ; "\n"
 0118  [123]  CALL_R0         R15 args=3
 0119  [123]  RETURN          R0 count=1
 
@@ -177,7 +176,7 @@ expression: output
   ; upvalues:
   ;   U0 = local R0
   ; code:
-  0000  [ 55]  LOAD            R3 K0  ; 1
+  0000  [ 55]  LOADI           R3 1
   0001  [ 55]  MOVE            R4 R1
   0002  [ 55]  LOAD            R5 K0  ; 1
   0003  [ 55]  FORPREP         R3 +55
@@ -236,7 +235,7 @@ expression: output
   0056  [ 73]  SETFIELD        R13 R7 K6  ; "vy"
   0057  [ 74]  SETFIELD        R14 R7 K7  ; "vz"
   0058  [ 55]  FORLOOP         R3 -55
-  0059  [ 76]  LOAD            R3 K0  ; 1
+  0059  [ 76]  LOADI           R3 1
   0060  [ 76]  MOVE            R4 R1
   0061  [ 76]  LOAD            R5 K0  ; 1
   0062  [ 76]  FORPREP         R3 +17
@@ -262,28 +261,27 @@ expression: output
 ; prototype 1:
   ; function (params=2, vararg=false, stack=26, upvalues=1)
   ; constants:
-  ;   K0 = 0
-  ;   K1 = 1
-  ;   K2 = "vx"
-  ;   K3 = "vy"
-  ;   K4 = "vz"
-  ;   K5 = "mass"
-  ;   K6 = "x"
-  ;   K7 = "y"
-  ;   K8 = "z"
+  ;   K0 = 1
+  ;   K1 = "vx"
+  ;   K2 = "vy"
+  ;   K3 = "vz"
+  ;   K4 = "mass"
+  ;   K5 = "x"
+  ;   K6 = "y"
+  ;   K7 = "z"
   ; upvalues:
   ;   U0 = local R0
   ; code:
-  0000  [ 86]  LOAD            R2 K0  ; 0
-  0001  [ 87]  LOAD            R3 K1  ; 1
+  0000  [ 86]  LOADI           R2 0
+  0001  [ 87]  LOADI           R3 1
   0002  [ 87]  MOVE            R4 R1
-  0003  [ 87]  LOAD            R5 K1  ; 1
+  0003  [ 87]  LOAD            R5 K0  ; 1
   0004  [ 87]  FORPREP         R3 +40
   0005  [ 88]  GETTABLE        R7 R0 R6
-  0006  [ 89]  GETFIELD        R8 R7 K2  ; "vx"
-  0007  [ 89]  GETFIELD        R9 R7 K3  ; "vy"
-  0008  [ 89]  GETFIELD        R10 R7 K4  ; "vz"
-  0009  [ 89]  GETFIELD        R11 R7 K5  ; "mass"
+  0006  [ 89]  GETFIELD        R8 R7 K1  ; "vx"
+  0007  [ 89]  GETFIELD        R9 R7 K2  ; "vy"
+  0008  [ 89]  GETFIELD        R10 R7 K3  ; "vz"
+  0009  [ 89]  GETFIELD        R11 R7 K4  ; "mass"
   0010  [ 90]  MULI            R12 R11 #0.5 flipped
   0011  [ 90]  MUL             R13 R8 R8
   0012  [ 90]  MUL             R14 R9 R9
@@ -294,17 +292,17 @@ expression: output
   0017  [ 90]  ADD             R2 R2 R12
   0018  [ 91]  ADDI            R12 R6 #1
   0019  [ 91]  MOVE            R13 R1
-  0020  [ 91]  LOAD            R14 K1  ; 1
+  0020  [ 91]  LOAD            R14 K0  ; 1
   0021  [ 91]  FORPREP         R12 +22
   0022  [ 92]  GETTABLE        R16 R0 R15
-  0023  [ 93]  GETFIELD        R17 R7 K6  ; "x"
-  0024  [ 93]  GETFIELD        R18 R16 K6  ; "x"
+  0023  [ 93]  GETFIELD        R17 R7 K5  ; "x"
+  0024  [ 93]  GETFIELD        R18 R16 K5  ; "x"
   0025  [ 93]  SUB             R17 R17 R18
-  0026  [ 93]  GETFIELD        R18 R7 K7  ; "y"
-  0027  [ 93]  GETFIELD        R19 R16 K7  ; "y"
+  0026  [ 93]  GETFIELD        R18 R7 K6  ; "y"
+  0027  [ 93]  GETFIELD        R19 R16 K6  ; "y"
   0028  [ 93]  SUB             R18 R18 R19
-  0029  [ 93]  GETFIELD        R19 R7 K8  ; "z"
-  0030  [ 93]  GETFIELD        R20 R16 K8  ; "z"
+  0029  [ 93]  GETFIELD        R19 R7 K7  ; "z"
+  0030  [ 93]  GETFIELD        R20 R16 K7  ; "z"
   0031  [ 93]  SUB             R19 R19 R20
   0032  [ 94]  GETUPVAL        R20 U0
   0033  [ 94]  MUL             R24 R17 R17
@@ -313,7 +311,7 @@ expression: output
   0036  [ 94]  MUL             R25 R19 R19
   0037  [ 94]  ADD             R24 R24 R25
   0038  [ 94]  CALL_R1         R20 args=2
-  0039  [ 95]  GETFIELD        R21 R16 K5  ; "mass"
+  0039  [ 95]  GETFIELD        R21 R16 K4  ; "mass"
   0040  [ 95]  MUL             R21 R11 R21
   0041  [ 95]  DIV             R21 R21 R20
   0042  [ 95]  SUB             R2 R2 R21
@@ -324,50 +322,49 @@ expression: output
 ; prototype 2:
   ; function (params=2, vararg=false, stack=12, upvalues=1)
   ; constants:
-  ;   K0 = 0
-  ;   K1 = 1
-  ;   K2 = "mass"
-  ;   K3 = "vx"
-  ;   K4 = "vy"
-  ;   K5 = "vz"
+  ;   K0 = 1
+  ;   K1 = "mass"
+  ;   K2 = "vx"
+  ;   K3 = "vy"
+  ;   K4 = "vz"
   ; upvalues:
   ;   U0 = local R2
   ; code:
-  0000  [103]  LOAD            R2 K0  ; 0
-  0001  [103]  LOAD            R3 K0  ; 0
-  0002  [103]  LOAD            R4 K0  ; 0
-  0003  [104]  LOAD            R5 K1  ; 1
+  0000  [103]  LOADI           R2 0
+  0001  [103]  LOADI           R3 0
+  0002  [103]  LOADI           R4 0
+  0003  [104]  LOADI           R5 1
   0004  [104]  MOVE            R6 R1
-  0005  [104]  LOAD            R7 K1  ; 1
+  0005  [104]  LOAD            R7 K0  ; 1
   0006  [104]  FORPREP         R5 +12
   0007  [105]  GETTABLE        R9 R0 R8
-  0008  [106]  GETFIELD        R10 R9 K2  ; "mass"
-  0009  [107]  GETFIELD        R11 R9 K3  ; "vx"
+  0008  [106]  GETFIELD        R10 R9 K1  ; "mass"
+  0009  [107]  GETFIELD        R11 R9 K2  ; "vx"
   0010  [107]  MUL             R11 R11 R10
   0011  [107]  ADD             R2 R2 R11
-  0012  [108]  GETFIELD        R11 R9 K4  ; "vy"
+  0012  [108]  GETFIELD        R11 R9 K3  ; "vy"
   0013  [108]  MUL             R11 R11 R10
   0014  [108]  ADD             R3 R3 R11
-  0015  [109]  GETFIELD        R11 R9 K5  ; "vz"
+  0015  [109]  GETFIELD        R11 R9 K4  ; "vz"
   0016  [109]  MUL             R11 R11 R10
   0017  [109]  ADD             R4 R4 R11
   0018  [104]  FORLOOP         R5 -12
-  0019  [111]  LOAD            R5 K1  ; 1
+  0019  [111]  LOADI           R5 1
   0020  [111]  GETTABLE        R5 R0 R5
   0021  [111]  UNM             R6 R2
   0022  [111]  GETUPVAL        R7 U0
   0023  [111]  DIV             R6 R6 R7
-  0024  [111]  SETFIELD        R6 R5 K3  ; "vx"
-  0025  [112]  LOAD            R5 K1  ; 1
+  0024  [111]  SETFIELD        R6 R5 K2  ; "vx"
+  0025  [112]  LOADI           R5 1
   0026  [112]  GETTABLE        R5 R0 R5
   0027  [112]  UNM             R6 R3
   0028  [112]  GETUPVAL        R7 U0
   0029  [112]  DIV             R6 R6 R7
-  0030  [112]  SETFIELD        R6 R5 K4  ; "vy"
-  0031  [113]  LOAD            R5 K1  ; 1
+  0030  [112]  SETFIELD        R6 R5 K3  ; "vy"
+  0031  [113]  LOADI           R5 1
   0032  [113]  GETTABLE        R5 R0 R5
   0033  [113]  UNM             R6 R4
   0034  [113]  GETUPVAL        R7 U0
   0035  [113]  DIV             R6 R6 R7
-  0036  [113]  SETFIELD        R6 R5 K5  ; "vz"
+  0036  [113]  SETFIELD        R6 R5 K4  ; "vz"
   0037  [114]  RETURN0

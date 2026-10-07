@@ -307,6 +307,14 @@ fn format_instruction(instr: &Instruction, proto: &Prototype<'_>) -> String {
             let (src, offset) = instr.a_imm();
             format!("{:<15} R{src} {offset:+}", instr.op().name())
         }
+        Op::LOADI => {
+            let (dst, imm) = instr.a_imm();
+            format!("LOADI           R{dst} {imm}")
+        }
+        Op::LOADNIL => {
+            let (dst, count) = instr.ab();
+            format!("LOADNIL         R{dst} count={count}")
+        }
         Op::JTSET | Op::JFSET => {
             let (dst, src, offset) = instr.ab_imm();
             format!("{:<15} R{dst} R{src} {offset:+}", instr.op().name())

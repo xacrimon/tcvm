@@ -3,8 +3,6 @@ source: src/compiler/snapshot_tests.rs
 expression: output
 ---
 ; function (params=0, vararg=true, stack=5, upvalues=1)
-; constants:
-;   K0 = 1
 ; upvalues:
 ;   U0 = local R0
 ; code:
@@ -12,10 +10,10 @@ expression: output
 0001  [  1]  CLOSURE         R0 P0
 0002  [  2]  MOVE            R1 R0
 0003  [  2]  CALL_R0         R1 args=1
-0004  [  3]  LOAD            R1 K0  ; 1
+0004  [  3]  LOADI           R1 1
 0005  [  4]  NOT             R2 R1
 0006  [  4]  JF              R2 +2
-0007  [  4]  LOAD            R2 K0  ; 1
+0007  [  4]  LOADI           R2 1
 0008  [  4]  RETURN          R2 count=2
 0009  [  4]  RETURN          R0 count=1
 

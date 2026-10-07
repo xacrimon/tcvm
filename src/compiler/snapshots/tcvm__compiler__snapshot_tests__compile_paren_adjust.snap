@@ -4,8 +4,7 @@ expression: output
 ---
 ; function (params=0, vararg=true, stack=26, upvalues=1)
 ; constants:
-;   K0 = nil
-;   K1 = "meth"
+;   K0 = "meth"
 ; upvalues:
 ;   U0 = local R0
 ; code:
@@ -15,15 +14,15 @@ expression: output
 0003  [  8]  CALL            R1 args=1 ret=3
 0004  [ 11]  MOVE            R3 R0
 0005  [ 11]  CALL_R1         R3 args=1
-0006  [ 11]  LOAD            R4 K0  ; nil
+0006  [ 11]  LOADNIL         R4 count=1
 0007  [ 14]  NEWTABLE        R5 T0  ; {}
 0008  [ 17]  CLOSURE         R6 P1
-0009  [ 17]  SETFIELD        R6 R5 K1  ; "meth"
-0010  [ 18]  SELF            R6 R5 K1  ; "meth"
+0009  [ 17]  SETFIELD        R6 R5 K0  ; "meth"
+0010  [ 18]  SELF            R6 R5 K0  ; "meth"
 0011  [ 18]  CALL            R6 args=2 ret=3
-0012  [ 20]  SELF            R8 R5 K1  ; "meth"
+0012  [ 20]  SELF            R8 R5 K0  ; "meth"
 0013  [ 20]  CALL_R1         R8 args=2
-0014  [ 20]  LOAD            R9 K0  ; nil
+0014  [ 20]  LOADNIL         R9 count=1
 0015  [ 28]  CLOSURE         R10 P2
 0016  [ 38]  CLOSURE         R11 P3
 0017  [ 43]  CLOSURE         R12 P4
@@ -44,22 +43,16 @@ expression: output
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=2, upvalues=0)
-  ; constants:
-  ;   K0 = 10
-  ;   K1 = 20
   ; code:
-  0000  [  4]  LOAD            R0 K0  ; 10
-  0001  [  4]  LOAD            R1 K1  ; 20
+  0000  [  4]  LOADI           R0 10
+  0001  [  4]  LOADI           R1 20
   0002  [  4]  RETURN          R0 count=3
 
 ; prototype 1:
   ; function (params=1, vararg=false, stack=3, upvalues=0)
-  ; constants:
-  ;   K0 = 10
-  ;   K1 = 20
   ; code:
-  0000  [ 16]  LOAD            R1 K0  ; 10
-  0001  [ 16]  LOAD            R2 K1  ; 20
+  0000  [ 16]  LOADI           R1 10
+  0001  [ 16]  LOADI           R2 20
   0002  [ 16]  RETURN          R1 count=3
 
 ; prototype 2:
@@ -78,15 +71,13 @@ expression: output
 
 ; prototype 3:
   ; function (params=0, vararg=true, stack=12, upvalues=0)
-  ; constants:
-  ;   K0 = nil
   ; code:
   0000  [ 30]  VARARGPREP      fixed=0
   0001  [ 32]  VARARG          R0 count=3
   0002  [ 34]  VARARG          R2 count=2
-  0003  [ 34]  LOAD            R3 K0  ; nil
+  0003  [ 34]  LOADNIL         R3 count=1
   0004  [ 36]  VARARG          R4 count=2
-  0005  [ 36]  LOAD            R5 K0  ; nil
+  0005  [ 36]  LOADNIL         R5 count=1
   0006  [ 37]  MOVE            R6 R0
   0007  [ 37]  MOVE            R7 R1
   0008  [ 37]  MOVE            R8 R2

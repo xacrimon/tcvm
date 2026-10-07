@@ -4,26 +4,22 @@ expression: output
 ---
 ; function (params=0, vararg=true, stack=10, upvalues=1)
 ; constants:
-;   K0 = 1
-;   K1 = 2
-;   K2 = 3
-;   K3 = 4
-;   K4 = true
+;   K0 = true
 ; upvalues:
 ;   U0 = local R0
 ; code:
 0000  [  1]  VARARGPREP      fixed=0
-0001  [  1]  LOAD            R0 K0  ; 1
-0002  [  1]  LOAD            R1 K1  ; 2
-0003  [  1]  LOAD            R2 K2  ; 3
-0004  [  1]  LOAD            R3 K3  ; 4
+0001  [  1]  LOADI           R0 1
+0002  [  1]  LOADI           R1 2
+0003  [  1]  LOADI           R2 3
+0004  [  1]  LOADI           R3 4
 0005  [  3]  JNLT            R0 R1 +3
 0006  [  3]  JNLT            R2 R3 +2
-0007  [  4]  LOAD            R4 K0  ; 1
+0007  [  4]  LOADI           R4 1
 0008  [  4]  RETURN          R4 count=2
 0009  [  7]  JLT             R0 R1 +1
 0010  [  7]  JNLT            R2 R3 +2
-0011  [  8]  LOAD            R4 K1  ; 2
+0011  [  8]  LOADI           R4 2
 0012  [  8]  RETURN          R4 count=2
 0013  [ 11]  JFSET           R4 R0 +1
 0014  [ 11]  MOVE            R4 R1
@@ -31,7 +27,7 @@ expression: output
 0016  [ 12]  MOVE            R5 R1
 0017  [ 13]  JNLT            R0 R1 +1
 0018  [ 13]  LFALSESKIP      R6
-0019  [ 13]  LOAD            R6 K4  ; true
+0019  [ 13]  LOAD            R6 K0  ; true
 0020  [ 14]  MOVE            R7 R4
 0021  [ 14]  MOVE            R8 R5
 0022  [ 14]  MOVE            R9 R6

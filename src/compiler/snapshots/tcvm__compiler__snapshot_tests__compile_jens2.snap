@@ -13,22 +13,19 @@ expression: output
 ; prototype 0:
   ; function (params=0, vararg=false, stack=7, upvalues=1)
   ; constants:
-  ;   K0 = 0
-  ;   K1 = 10000
-  ;   K2 = 1
-  ;   K3 = "print"
+  ;   K0 = "print"
   ; upvalues:
   ;   U0 = upvalue U0
   ; code:
-  0000  [  2]  LOAD            R0 K0  ; 0
-  0001  [  3]  LOAD            R1 K1  ; 10000
-  0002  [  5]  LOAD            R2 K0  ; 0
+  0000  [  2]  LOADI           R0 0
+  0001  [  3]  LOADI           R1 10000
+  0002  [  5]  LOADI           R2 0
   0003  [  5]  MOVE            R3 R1
-  0004  [  5]  LOAD            R4 K2  ; 1
+  0004  [  5]  LOADI           R4 1
   0005  [  5]  FORPREP         R2 +2
   0006  [  6]  ADDI            R0 R0 #1
   0007  [  5]  FORLOOP         R2 -2
-  0008  [  9]  GETTABUP        R2 U0 K3  ; "print"
+  0008  [  9]  GETTABUP        R2 U0 K0  ; "print"
   0009  [  9]  MOVE            R6 R0
   0010  [  9]  CALL_R0         R2 args=2
   0011  [ 10]  RETURN0

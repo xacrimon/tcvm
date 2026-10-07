@@ -7,19 +7,14 @@ expression: output
 ;   K0 = "print"
 ;   K1 = "hello"
 ;   K2 = "long"
-;   K3 = 1
-;   K4 = 2
-;   K5 = 3
-;   K6 = "setmetatable"
-;   K7 = "m"
-;   K8 = "__index"
-;   K9 = "str"
-;   K10 = 4
-;   K11 = 5
-;   K12 = "type"
-;   K13 = "x"
-;   K14 = "a"
-;   K15 = "b"
+;   K3 = "setmetatable"
+;   K4 = "m"
+;   K5 = "__index"
+;   K6 = "str"
+;   K7 = "type"
+;   K8 = "x"
+;   K9 = "a"
+;   K10 = "b"
 ; upvalues:
 ;   U0 = local R0
 ; code:
@@ -34,28 +29,28 @@ expression: output
 0008  [  4]  GETTABUP        R1 U0 K0  ; "print"
 0009  [  4]  MOVE            R5 R0
 0010  [  4]  NEWTABLE        R9 T0  ; {} items=3
-0011  [  4]  LOAD            R10 K3  ; 1
-0012  [  4]  LOAD            R11 K4  ; 2
-0013  [  4]  LOAD            R12 K5  ; 3
+0011  [  4]  LOADI           R10 1
+0012  [  4]  LOADI           R11 2
+0013  [  4]  LOADI           R12 3
 0014  [  4]  SETLIST         R9 count=3 offset=0
 0015  [  4]  CALL            R5 args=2 ret=0
 0016  [  4]  CALL_R0         R1 args=0
-0017  [  5]  GETTABUP        R1 U0 K6  ; "setmetatable"
+0017  [  5]  GETTABUP        R1 U0 K3  ; "setmetatable"
 0018  [  5]  NEWTABLE        R5 T1  ; {}
 0019  [  5]  NEWTABLE        R6 T3  ; {__index}
 0020  [  5]  NEWTABLE        R7 T2  ; {m}
 0021  [  5]  CLOSURE         R8 P1
-0022  [  5]  SETFIELD        R8 R7 K7  ; "m"
-0023  [  5]  SETFIELD        R7 R6 K8  ; "__index"
+0022  [  5]  SETFIELD        R8 R7 K4  ; "m"
+0023  [  5]  SETFIELD        R7 R6 K5  ; "__index"
 0024  [  5]  CALL_R1         R1 args=3
 0025  [  6]  GETTABUP        R2 U0 K0  ; "print"
-0026  [  6]  SELF            R6 R1 K7  ; "m"
-0027  [  6]  LOAD            R11 K9  ; "str"
+0026  [  6]  SELF            R6 R1 K4  ; "m"
+0027  [  6]  LOAD            R11 K6  ; "str"
 0028  [  6]  CALL_R1         R6 args=3
-0029  [  6]  SELF            R7 R1 K7  ; "m"
+0029  [  6]  SELF            R7 R1 K4  ; "m"
 0030  [  6]  NEWTABLE        R12 T4  ; {} items=2
-0031  [  6]  LOAD            R13 K10  ; 4
-0032  [  6]  LOAD            R14 K11  ; 5
+0031  [  6]  LOADI           R13 4
+0032  [  6]  LOADI           R14 5
 0033  [  6]  SETLIST         R12 count=2 offset=0
 0034  [  6]  CALL_R1         R7 args=3
 0035  [  6]  MOVE            R8 R0
@@ -64,21 +59,21 @@ expression: output
 0038  [  6]  ADDI            R8 R8 #1
 0039  [  6]  CALL_R0         R2 args=4
 0040  [  7]  GETTABUP        R2 U0 K0  ; "print"
-0041  [  7]  GETTABUP        R6 U0 K12  ; "type"
-0042  [  7]  LOAD            R10 K13  ; "x"
+0041  [  7]  GETTABUP        R6 U0 K7  ; "type"
+0042  [  7]  LOAD            R10 K8  ; "x"
 0043  [  7]  CALL_R1         R6 args=2
 0044  [  7]  MOVE            R7 R0
 0045  [  7]  NEWTABLE        R11 T5  ; {} items=1
-0046  [  7]  LOAD            R12 K3  ; 1
+0046  [  7]  LOADI           R12 1
 0047  [  7]  SETLIST         R11 count=1 offset=0
 0048  [  7]  CALL            R7 args=2 ret=0
 0049  [  7]  CALL_R0         R2 args=0
 0050  [  8]  CLOSURE         R2 P2
 0051  [  9]  GETTABUP        R3 U0 K0  ; "print"
 0052  [  9]  MOVE            R7 R2
-0053  [  9]  LOAD            R11 K14  ; "a"
+0053  [  9]  LOAD            R11 K9  ; "a"
 0054  [  9]  CALL_R1         R7 args=2
-0055  [  9]  LOAD            R11 K15  ; "b"
+0055  [  9]  LOAD            R11 K10  ; "b"
 0056  [  9]  CALL            R7 args=2 ret=0
 0057  [  9]  CALL_R0         R3 args=0
 0058  [  9]  RETURN          R0 count=1

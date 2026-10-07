@@ -3,18 +3,14 @@ source: src/compiler/snapshot_tests.rs
 expression: output
 ---
 ; function (params=0, vararg=true, stack=5, upvalues=1)
-; constants:
-;   K0 = nil
 ; upvalues:
 ;   U0 = local R0
 ; code:
 0000  [  1]  VARARGPREP      fixed=0
-0001  [  3]  LOAD            R0 K0  ; nil
-0002  [  3]  LOAD            R1 K0  ; nil
-0003  [  3]  LOAD            R2 K0  ; nil
-0004  [  4]  CLOSURE         R3 P0
-0005  [  5]  CLOSURE         R4 P1
-0006  [  5]  RETURN          R0 count=1
+0001  [  3]  LOADNIL         R0 count=3
+0002  [  4]  CLOSURE         R3 P0
+0003  [  5]  CLOSURE         R4 P1
+0004  [  5]  RETURN          R0 count=1
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=1, upvalues=2)

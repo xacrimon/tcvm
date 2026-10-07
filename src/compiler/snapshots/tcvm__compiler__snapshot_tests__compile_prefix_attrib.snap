@@ -3,24 +3,18 @@ source: src/compiler/snapshot_tests.rs
 expression: output
 ---
 ; function (params=0, vararg=true, stack=8, upvalues=1)
-; constants:
-;   K0 = nil
-;   K1 = 1
-;   K2 = 2
-;   K3 = 3
-;   K4 = 5
 ; upvalues:
 ;   U0 = local R0
 ; code:
 0000  [  1]  VARARGPREP      fixed=0
-0001  [  3]  LOAD            R0 K0  ; nil
+0001  [  3]  LOADNIL         R0 count=1
 0002  [  3]  TBC             R0
-0003  [  4]  LOAD            R1 K0  ; nil
+0003  [  4]  LOADNIL         R1 count=1
 0004  [  4]  TBC             R1
-0005  [  5]  LOAD            R2 K1  ; 1
-0006  [  5]  LOAD            R3 K2  ; 2
-0007  [  5]  LOAD            R4 K3  ; 3
+0005  [  5]  LOADI           R2 1
+0006  [  5]  LOADI           R3 2
+0007  [  5]  LOADI           R4 3
 0008  [  5]  MOVE            R5 R0
 0009  [  5]  MOVE            R6 R1
-0010  [  5]  LOAD            R7 K4  ; 5
+0010  [  5]  LOADI           R7 5
 0011  [  5]  RETURN          R2 count=7

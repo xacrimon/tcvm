@@ -3,12 +3,10 @@ source: src/compiler/snapshot_tests.rs
 expression: output
 ---
 ; function (params=0, vararg=true, stack=1, upvalues=1)
-; constants:
-;   K0 = nil
 ; upvalues:
 ;   U0 = local R0
 ; code:
 0000  [  1]  VARARGPREP      fixed=0
-0001  [  3]  LOAD            R0 K0  ; nil
+0001  [  3]  LOADNIL         R0 count=1
 0002  [  4]  JMP             +0
 0003  [  6]  RETURN          R0 count=1
