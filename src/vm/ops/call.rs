@@ -116,12 +116,13 @@ fn call_nargs(ts: &ThreadState<'_>, b: u8, nb: usize) -> usize {
     if b == 0 { ts.top - nb } else { b as usize - 1 }
 }
 
-/// The Lua arm of CALL, shared by the three CALL forms; `$ret` is the
-/// callee's continuation.
+/// The Lua arm of CALL, shared by the CALL forms; `$fv` is the callee
+/// (`R[a]`, or the source register of a CALLS, which has just stored it
+/// there) and `$ret` the callee's continuation.
 macro_rules! call_body {
-    ($insn:ident, $pc:ident, $base:ident, $rt:ident, $closure:ident, $ret:expr) => {{
-        let (a, b, _) = $insn.abc();
-        let fv = reg![a];
+    ($insn:ident, $pc:ident, $base:ident, $rt:ident, $closure:ident, $fv:expr, $ret:expr) => {{
+        let (a, b) = ($insn.a(), $insn.b());
+        let fv: Value<'gc> = $fv;
         let Some(f) = fv.get_function() else {
             tail!(call_meta)
         };
@@ -138,7 +139,7 @@ macro_rules! call_body {
                 ) {
                     tail!(call_grow)
                 }
-                if std::hint::unlikely(b <= p.fixed_arity) {
+                if std::hint::unlikely(b as u16 <= p.fixed_arity) {
                     tail!(call_fixup)
                 }
                 let callee = unsafe { LuaFn::from_function_unchecked(f) };
@@ -166,17 +167,40 @@ handler! {
     /// `R[a], ...` = `R[a](R[a+4], ...)`; `b` is nargs + 1 (0: up to `top`),
     /// `c` wanted + 1 (0: publish `top`).
     op fn op_call {
-        call_body!(insn, pc, base, rt, closure, rt.ret(insn.c()))
+        call_body!(insn, pc, base, rt, closure, reg![insn.a()], rt.ret(insn.c()))
     }
 
     /// CALL wanting no result.
     op fn op_call_r0 {
-        call_body!(insn, pc, base, rt, closure, ret_call0)
+        call_body!(insn, pc, base, rt, closure, reg![insn.a()], ret_call0)
     }
 
     /// CALL wanting one result.
     op fn op_call_r1 {
-        call_body!(insn, pc, base, rt, closure, ret_call1)
+        call_body!(insn, pc, base, rt, closure, reg![insn.a()], ret_call1)
+    }
+
+    /// `R[a], ...` = `R[src](R[a+4], ...)`: CALL with the callee in `src`
+    /// (the fused MOVE). `R[a]` gets the callee so the slow paths, which
+    /// re-read the function slot, see a plain CALL.
+    op fn op_calls {
+        let fv = reg![insn.imm() as u8];
+        reg![insn.a()] = fv;
+        call_body!(insn, pc, base, rt, closure, fv, rt.ret(insn.c()))
+    }
+
+    /// CALLS wanting no result.
+    op fn op_calls_r0 {
+        let fv = reg![insn.imm() as u8];
+        reg![insn.a()] = fv;
+        call_body!(insn, pc, base, rt, closure, fv, ret_call0)
+    }
+
+    /// CALLS wanting one result.
+    op fn op_calls_r1 {
+        let fv = reg![insn.imm() as u8];
+        reg![insn.a()] = fv;
+        call_body!(insn, pc, base, rt, closure, fv, ret_call1)
     }
 
     /// CALL of a Lua closure whose window does not fit: grow, then retry
@@ -203,7 +227,7 @@ handler! {
     /// argument count: the general accounting, then the entry.
     slow fn call_fixup {
         let call = insn_at!();
-        let (a, b, c) = call.abc();
+        let (a, b, c) = (call.a(), call.b(), call.c());
         sync!();
         let ts = thread!();
         let bi = ts.slot_index(base);
@@ -226,7 +250,7 @@ handler! {
     /// (each hop inserts the callable as the first argument), then retry.
     slow fn call_meta {
         let call = insn_at!();
-        let (a, b, _) = call.abc();
+        let (a, b) = (call.a(), call.b());
         sync!();
         let ts = thread!();
         let bi = ts.slot_index(base);
@@ -274,7 +298,7 @@ handler! {
                 ) {
                     tail!(enter_grow)
                 }
-                if std::hint::unlikely(nargs < p.num_params as usize || p.is_vararg) {
+                if std::hint::unlikely(nargs < p.fixed_arity as usize) {
                     tail!(enter_fixup)
                 }
                 unsafe { hdr.cast::<u64>().write(lua_func_word(callee, 0)) };

@@ -15,24 +15,23 @@ expression: output
 0002  [  2]  NEWTABLE        R1 T0  ; {}
 0003  [  3]  LOADI           R2 1
 0004  [  3]  SETFIELD        R2 R1 K0  ; "b"
-0005  [  4]  MOVE            R2 R0
-0006  [  4]  CALL_R1         R2 args=1
-0007  [  4]  LOADI           R3 1
-0008  [  4]  LOADI           R4 2
-0009  [  4]  LOADI           R5 3
-0010  [  4]  SETTABLE        R5 R1 R3
-0011  [  4]  SETFIELD        R4 R2 K1  ; "x"
-0012  [  5]  LOADI           R2 3
-0013  [  6]  SETFIELD        R2 R1 K2  ; "c"
-0014  [  7]  GETFIELD        R3 R1 K0  ; "b"
-0015  [  7]  POWI            R3 R3 #2
-0016  [  7]  UNM             R3 R3
-0017  [  7]  LOADI           R4 1
-0018  [  7]  GETTABLE        R4 R1 R4
-0019  [  7]  LEN             R5 R1
-0020  [  7]  MUL             R4 R4 R5
-0021  [  7]  ADD             R3 R3 R4
-0022  [  7]  RETURN          R0 count=1
+0005  [  4]  CALLS_R1        R2 args=1 f=R0
+0006  [  4]  LOADI           R3 1
+0007  [  4]  LOADI           R4 2
+0008  [  4]  LOADI           R5 3
+0009  [  4]  SETTABLE        R5 R1 R3
+0010  [  4]  SETFIELD        R4 R2 K1  ; "x"
+0011  [  5]  LOADI           R2 3
+0012  [  6]  SETFIELD        R2 R1 K2  ; "c"
+0013  [  7]  GETFIELD        R3 R1 K0  ; "b"
+0014  [  7]  POWI            R3 R3 #2
+0015  [  7]  UNM             R3 R3
+0016  [  7]  LOADI           R4 1
+0017  [  7]  GETTABLE        R4 R1 R4
+0018  [  7]  LEN             R5 R1
+0019  [  7]  MUL             R4 R4 R5
+0020  [  7]  ADD             R3 R3 R4
+0021  [  7]  RETURN          R0 count=1
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=1, upvalues=0)

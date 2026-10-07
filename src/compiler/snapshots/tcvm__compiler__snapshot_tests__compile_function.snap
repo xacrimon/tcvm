@@ -13,26 +13,22 @@ expression: output
 0002  [  7]  CLOSURE         R1 P1
 0003  [ 11]  CLOSURE         R2 P2
 0004  [ 15]  CLOSURE         R3 P3
-0005  [ 17]  MOVE            R4 R2
-0006  [ 17]  LOADI           R8 3
-0007  [ 17]  LOADI           R9 4
-0008  [ 17]  CALL_R1         R4 args=3
-0009  [ 18]  MOVE            R5 R1
-0010  [ 18]  LOADI           R9 3
-0011  [ 18]  LOADI           R10 1
-0012  [ 18]  CALL_R1         R5 args=3
-0013  [ 19]  MOVE            R6 R3
-0014  [ 19]  LOADI           R10 6
-0015  [ 19]  MOVE            R11 R5
-0016  [ 19]  CALL_R1         R6 args=3
-0017  [ 20]  MOVE            R7 R0
-0018  [ 20]  MOVE            R11 R4
-0019  [ 20]  MOVE            R12 R6
-0020  [ 20]  CALL_R1         R7 args=3
-0021  [ 21]  GETTABUP        R8 U0 K0  ; "print"
-0022  [ 21]  MOVE            R12 R7
-0023  [ 21]  CALL_R0         R8 args=2
-0024  [ 21]  RETURN          R0 count=1
+0005  [ 17]  LOADI           R8 3
+0006  [ 17]  LOADI           R9 4
+0007  [ 17]  CALLS_R1        R4 args=3 f=R2
+0008  [ 18]  LOADI           R9 3
+0009  [ 18]  LOADI           R10 1
+0010  [ 18]  CALLS_R1        R5 args=3 f=R1
+0011  [ 19]  LOADI           R10 6
+0012  [ 19]  MOVE            R11 R5
+0013  [ 19]  CALLS_R1        R6 args=3 f=R3
+0014  [ 20]  MOVE            R11 R4
+0015  [ 20]  MOVE            R12 R6
+0016  [ 20]  CALLS_R1        R7 args=3 f=R0
+0017  [ 21]  GETTABUP        R8 U0 K0  ; "print"
+0018  [ 21]  MOVE            R12 R7
+0019  [ 21]  CALL_R0         R8 args=2
+0020  [ 21]  RETURN          R0 count=1
 
 ; prototype 0:
   ; function (params=2, vararg=false, stack=3, upvalues=0)

@@ -9,12 +9,10 @@ expression: output
 0000  [  1]  VARARGPREP      fixed=0
 0001  [  1]  CLOSURE         R0 P0
 0002  [  2]  MOVE            R1 R0
-0003  [  2]  MOVE            R5 R0
-0004  [  2]  MOVE            R9 R0
-0005  [  2]  LOADI           R13 2
-0006  [  2]  CALL            R9 args=2 ret=0
-0007  [  2]  CALL            R5 args=0 ret=0
-0008  [  2]  TAILCALL        R1 args=0
+0003  [  2]  LOADI           R13 2
+0004  [  2]  CALLS           R9 args=2 ret=0 f=R0
+0005  [  2]  CALLS           R5 args=0 ret=0 f=R0
+0006  [  2]  TAILCALL        R1 args=0
 
 ; prototype 0:
   ; function (params=1, vararg=false, stack=2, upvalues=0)

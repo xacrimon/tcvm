@@ -17,10 +17,9 @@ expression: output
   ; code:
   0000  [  3]  MOVE            R2 R0
   0001  [  3]  TBC             R2
-  0002  [  4]  MOVE            R3 R1
-  0003  [  4]  LOADI           R7 1
-  0004  [  4]  CALL            R3 args=2 ret=0
-  0005  [  4]  RETURN          R3 count=0
+  0002  [  4]  LOADI           R7 1
+  0003  [  4]  CALLS           R3 args=2 ret=0 f=R1
+  0004  [  4]  RETURN          R3 count=0
 
 ; prototype 1:
   ; function (params=2, vararg=false, stack=8, upvalues=0)

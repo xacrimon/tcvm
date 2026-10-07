@@ -736,13 +736,24 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
 
     /// A call, in the form for its result count (`returns` is Lua's `C`).
     #[allow(clippy::wrong_self_convention)]
-    fn emit_call(&mut self, func: RegisterIndex, args: u8, returns: u8) {
-        let call = match returns {
-            1 => Instruction::call_r0,
-            2 => Instruction::call_r1,
-            _ => Instruction::call,
+    /// Emit the CALL at `func`; with `src`, the CALLS form that reads the
+    /// callee from that register instead of a MOVE having copied it.
+    fn emit_call(
+        &mut self,
+        func: RegisterIndex,
+        args: u8,
+        returns: u8,
+        src: Option<RegisterIndex>,
+    ) {
+        let insn = match (returns, src) {
+            (1, None) => Instruction::call_r0(func, args, returns),
+            (2, None) => Instruction::call_r1(func, args, returns),
+            (_, None) => Instruction::call(func, args, returns),
+            (1, Some(s)) => Instruction::calls_r0(func, args, returns, Reg(s.0)),
+            (2, Some(s)) => Instruction::calls_r1(func, args, returns, Reg(s.0)),
+            (_, Some(s)) => Instruction::calls(func, args, returns, Reg(s.0)),
         };
-        self.emit(call(func, args, returns));
+        self.emit(insn);
     }
 
     fn emit_jump_instr(&mut self, label: u16, instr: Instruction) {
@@ -4007,13 +4018,17 @@ fn compile_logical_or_desc<'gc>(
 /// call into consecutive registers `func`, `func+1`, `func+2`, ... ready
 /// for a `CALL` or `TAILCALL` instruction.
 ///
-/// Returns `(func, args_wire)`, where `args_wire` is the `args` operand:
-/// `n + 1` for `n` fixed arguments, or `0` (MULTRET) when the last argument
-/// was itself a multires expression that propagated `returns=0`.
+/// Returns `(func, args_wire, src)`, where `args_wire` is the `args`
+/// operand: `n + 1` for `n` fixed arguments, or `0` (MULTRET) when the last
+/// argument was itself a multires expression that propagated `returns=0`.
+/// With `fuse`, a callee that would have been copied to `func` by a MOVE is
+/// left where it is and returned as `src` for a CALLS; TAILCALL has
+/// no such form.
 fn emit_func_call_setup(
     ctx: &mut Ctx,
     item: &FuncCall,
-) -> Result<(RegisterIndex, u8), CompileError> {
+    fuse: bool,
+) -> Result<(RegisterIndex, u8, Option<RegisterIndex>), CompileError> {
     let target = item
         .target()
         .ok_or_else(|| ice("func call without target"))?;
@@ -4033,9 +4048,14 @@ fn emit_func_call_setup(
     // Fresh temps (GETUPVAL/GETTABUP/GETTABLE results, etc.) at the top of
     // stack are safe to overwrite since nothing else references them.
     let needs_copy = (func.0 + 1 != ctx.chunk.freereg) || func.0 < ctx.chunk.nactvar;
+    let mut src = None;
     let func = if needs_copy {
         let top = ctx.alloc_register()?;
-        ctx.emit(Instruction::mov(top, func));
+        if fuse {
+            src = Some(func);
+        } else {
+            ctx.emit(Instruction::mov(top, func));
+        }
         top
     } else {
         func
@@ -4055,7 +4075,7 @@ fn emit_func_call_setup(
     if let Some(args_node) = item.args_node() {
         ctx.set_line(args_node);
     }
-    Ok((func, args_wire))
+    Ok((func, args_wire, src))
 }
 
 /// Emit a `CALL`. `Want::Exact(n)` returns the `n` result registers
@@ -4066,13 +4086,13 @@ fn compile_expr_func_call(
     item: FuncCall,
     want: Want,
 ) -> Result<Vec<RegisterIndex>, CompileError> {
-    let (func, args_wire) = emit_func_call_setup(ctx, &item)?;
+    let (func, args_wire, src) = emit_func_call_setup(ctx, &item, true)?;
 
     let returns = match want {
         Want::Exact(n) => n + 1,
         Want::MultRet => 0,
     };
-    ctx.emit_call(func, args_wire, returns);
+    ctx.emit_call(func, args_wire, returns, src);
 
     match want {
         Want::Exact(n) => {
@@ -4092,7 +4112,7 @@ fn compile_expr_func_call(
 /// path replaces the current frame, the native path goes through
 /// `frame_return`).
 fn compile_tail_func_call(ctx: &mut Ctx, item: FuncCall) -> Result<(), CompileError> {
-    let (func, args_wire) = emit_func_call_setup(ctx, &item)?;
+    let (func, args_wire, _) = emit_func_call_setup(ctx, &item, false)?;
     ctx.emit(Instruction::tailcall(func, args_wire));
     // Frame is about to be torn down; conservatively snap freereg to func
     // so any post-TAILCALL code in the compiler (there shouldn't be any
@@ -4122,14 +4142,14 @@ fn compile_tail_method_call(ctx: &mut Ctx, item: MethodCall) -> Result<(), Compi
 fn compile_stmt_expr(ctx: &mut Ctx, item: Expr) -> Result<(), CompileError> {
     match item {
         Expr::FuncCall(call) => {
-            let (func, args_wire) = emit_func_call_setup(ctx, &call)?;
-            ctx.emit_call(func, args_wire, 1);
+            let (func, args_wire, src) = emit_func_call_setup(ctx, &call, true)?;
+            ctx.emit_call(func, args_wire, 1, src);
             ctx.chunk.freereg = func.0;
             Ok(())
         }
         Expr::Method(call) => {
             let (func, args_wire) = emit_method_call_setup(ctx, &call)?;
-            ctx.emit_call(func, args_wire, 1);
+            ctx.emit_call(func, args_wire, 1, None);
             ctx.chunk.freereg = func.0;
             Ok(())
         }
@@ -4300,7 +4320,7 @@ fn compile_expr_method_call(
         Want::Exact(n) => n + 1,
         Want::MultRet => 0,
     };
-    ctx.emit_call(func, args_wire, returns);
+    ctx.emit_call(func, args_wire, returns, None);
 
     match want {
         Want::Exact(n) => {

@@ -331,6 +331,21 @@ fn format_instruction(instr: &Instruction, proto: &Prototype<'_>) -> String {
             let (func, args, _) = instr.abc();
             format!("CALL_R1         R{func} args={args}")
         }
+        Op::CALLS => {
+            let (func, args, returns) = (instr.a(), instr.b(), instr.c());
+            format!(
+                "CALLS           R{func} args={args} ret={returns} f=R{}",
+                instr.imm()
+            )
+        }
+        Op::CALLS_R0 => {
+            let (func, args) = (instr.a(), instr.b());
+            format!("CALLS_R0        R{func} args={args} f=R{}", instr.imm())
+        }
+        Op::CALLS_R1 => {
+            let (func, args) = (instr.a(), instr.b());
+            format!("CALLS_R1        R{func} args={args} f=R{}", instr.imm())
+        }
         Op::TAILCALL => {
             let (func, args) = instr.ab();
             format!("TAILCALL        R{func} args={args}")

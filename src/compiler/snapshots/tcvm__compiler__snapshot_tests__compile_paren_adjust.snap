@@ -10,36 +10,34 @@ expression: output
 ; code:
 0000  [  1]  VARARGPREP      fixed=0
 0001  [  5]  CLOSURE         R0 P0
-0002  [  8]  MOVE            R1 R0
-0003  [  8]  CALL            R1 args=1 ret=3
-0004  [ 11]  MOVE            R3 R0
-0005  [ 11]  CALL_R1         R3 args=1
-0006  [ 11]  LOADNIL         R4 count=1
-0007  [ 14]  NEWTABLE        R5 T0  ; {}
-0008  [ 17]  CLOSURE         R6 P1
-0009  [ 17]  SETFIELD        R6 R5 K0  ; "meth"
-0010  [ 18]  SELF            R6 R5 K0  ; "meth"
-0011  [ 18]  CALL            R6 args=2 ret=3
-0012  [ 20]  SELF            R8 R5 K0  ; "meth"
-0013  [ 20]  CALL_R1         R8 args=2
-0014  [ 20]  LOADNIL         R9 count=1
-0015  [ 28]  CLOSURE         R10 P2
-0016  [ 38]  CLOSURE         R11 P3
-0017  [ 43]  CLOSURE         R12 P4
-0018  [ 48]  CLOSURE         R13 P5
-0019  [ 50]  MOVE            R14 R1
-0020  [ 50]  MOVE            R15 R2
-0021  [ 50]  MOVE            R16 R3
-0022  [ 50]  MOVE            R17 R4
-0023  [ 50]  MOVE            R18 R6
-0024  [ 50]  MOVE            R19 R7
-0025  [ 50]  MOVE            R20 R8
-0026  [ 50]  MOVE            R21 R9
-0027  [ 50]  MOVE            R22 R11
-0028  [ 50]  MOVE            R23 R12
-0029  [ 50]  MOVE            R24 R13
-0030  [ 50]  MOVE            R25 R10
-0031  [ 50]  RETURN          R14 count=13
+0002  [  8]  CALLS           R1 args=1 ret=3 f=R0
+0003  [ 11]  CALLS_R1        R3 args=1 f=R0
+0004  [ 11]  LOADNIL         R4 count=1
+0005  [ 14]  NEWTABLE        R5 T0  ; {}
+0006  [ 17]  CLOSURE         R6 P1
+0007  [ 17]  SETFIELD        R6 R5 K0  ; "meth"
+0008  [ 18]  SELF            R6 R5 K0  ; "meth"
+0009  [ 18]  CALL            R6 args=2 ret=3
+0010  [ 20]  SELF            R8 R5 K0  ; "meth"
+0011  [ 20]  CALL_R1         R8 args=2
+0012  [ 20]  LOADNIL         R9 count=1
+0013  [ 28]  CLOSURE         R10 P2
+0014  [ 38]  CLOSURE         R11 P3
+0015  [ 43]  CLOSURE         R12 P4
+0016  [ 48]  CLOSURE         R13 P5
+0017  [ 50]  MOVE            R14 R1
+0018  [ 50]  MOVE            R15 R2
+0019  [ 50]  MOVE            R16 R3
+0020  [ 50]  MOVE            R17 R4
+0021  [ 50]  MOVE            R18 R6
+0022  [ 50]  MOVE            R19 R7
+0023  [ 50]  MOVE            R20 R8
+0024  [ 50]  MOVE            R21 R9
+0025  [ 50]  MOVE            R22 R11
+0026  [ 50]  MOVE            R23 R12
+0027  [ 50]  MOVE            R24 R13
+0028  [ 50]  MOVE            R25 R10
+0029  [ 50]  RETURN          R14 count=13
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=2, upvalues=0)

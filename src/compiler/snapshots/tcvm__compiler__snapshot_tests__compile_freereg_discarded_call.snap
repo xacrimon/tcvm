@@ -8,18 +8,16 @@ expression: output
 ; code:
 0000  [  1]  VARARGPREP      fixed=0
 0001  [  1]  CLOSURE         R0 P0
-0002  [  2]  MOVE            R1 R0
-0003  [  2]  CALL_R0         R1 args=1
-0004  [  2]  MOVE            R1 R0
-0005  [  2]  CALL_R0         R1 args=1
-0006  [  3]  LOADI           R1 1
-0007  [  3]  LOADI           R2 2
-0008  [  4]  NOT             R3 R1
-0009  [  4]  JF              R3 +2
-0010  [  4]  LOADI           R3 1
-0011  [  4]  RETURN          R3 count=2
-0012  [  5]  ADD             R3 R1 R2
-0013  [  5]  RETURN          R3 count=2
+0002  [  2]  CALLS_R0        R1 args=1 f=R0
+0003  [  2]  CALLS_R0        R1 args=1 f=R0
+0004  [  3]  LOADI           R1 1
+0005  [  3]  LOADI           R2 2
+0006  [  4]  NOT             R3 R1
+0007  [  4]  JF              R3 +2
+0008  [  4]  LOADI           R3 1
+0009  [  4]  RETURN          R3 count=2
+0010  [  5]  ADD             R3 R1 R2
+0011  [  5]  RETURN          R3 count=2
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=0, upvalues=0)

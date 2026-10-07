@@ -536,9 +536,15 @@ impl Instruction {
         (self.a(), self.b())
     }
 
+    /// `a`, `b`, `c`; also of an `AbcImm` word, whose first three slots
+    /// are the same (a CALLS read as a CALL).
     #[inline(always)]
     pub fn abc(self) -> (u8, u8, u8) {
-        self.expect(Shape::Abc);
+        debug_assert!(
+            matches!(self.op().shape(), Shape::Abc | Shape::AbcImm),
+            "{:?} is not Abc-shaped",
+            self.op()
+        );
         (self.a(), self.b(), self.c())
     }
 
@@ -1066,6 +1072,15 @@ instructions! {
     0xc6 FORLOOP_F    forloop_f   AImm   { base: Reg, offset: i32 }
     0xc7 TFORCALL_NEXT   tforcall_next   Ab { base: Reg, count: u8 }
     0xc8 TFORCALL_IPAIRS tforcall_ipairs Ab { base: Reg, count: u8 }
+
+    // CALL with the callee in `src` rather than `func`: the
+    // compiler's fusion of the MOVE that fills the function slot of a call
+    // of a local. The callee is read when the call runs, after the
+    // arguments (the manual fixes no order between the two). `R[func]`
+    // gets the callee first, so the slow paths see a plain CALL.
+    0xc9 CALLS        calls       AbcImm { func: Reg, args: u8, returns: u8, src: Reg }
+    0xca CALLS_R0     calls_r0    AbcImm { func: Reg, args: u8, returns: u8, src: Reg }
+    0xcb CALLS_R1     calls_r1    AbcImm { func: Reg, args: u8, returns: u8, src: Reg }
 }
 
 /// The polymorphic family an opcode belongs to.
