@@ -208,7 +208,7 @@ impl<'gc> Runtime<'gc> {
         // The unwinder tells `pcall` and `xpcall` catch points apart by their
         // continuations' addresses, which identical bodies would fold.
         assert!(
-            crate::vm::native::ret_pcall as usize != crate::vm::native::ret_xpcall as usize,
+            crate::vm::native::ret_pcall as *const () != crate::vm::native::ret_xpcall as *const (),
             "ret_pcall and ret_xpcall were merged"
         );
         Runtime {
