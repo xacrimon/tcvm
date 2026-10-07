@@ -13,22 +13,22 @@ use crate::env::{
     Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Userdata, Value,
 };
 use crate::vm::abi::Handler;
-use crate::vm::native;
 use crate::vm::num;
+use crate::vm::{ff, native};
 
 pub fn load<'gc>(ctx: Context<'gc>) {
     // Third column: the CALL entry, `call` unless the builtin has a fast path.
     let call: Handler = native::native_call;
     let fns: &[(&str, NativeFn, Handler)] = &[
-        ("abs", lua_abs, native::ff_abs),
+        ("abs", lua_abs, ff::ff_abs),
         ("acos", lua_acos, call),
         ("asin", lua_asin, call),
         ("atan", lua_atan, call),
-        ("ceil", lua_ceil, native::ff_ceil),
-        ("cos", lua_cos, native::ff_cos),
+        ("ceil", lua_ceil, ff::ff_ceil),
+        ("cos", lua_cos, ff::ff_cos),
         ("deg", lua_deg, call),
         ("exp", lua_exp, call),
-        ("floor", lua_floor, native::ff_floor),
+        ("floor", lua_floor, ff::ff_floor),
         ("fmod", lua_fmod, call),
         ("frexp", lua_frexp, call),
         ("ldexp", lua_ldexp, call),
@@ -39,8 +39,8 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         ("rad", lua_rad, call),
         ("random", lua_random, call),
         ("randomseed", lua_randomseed, call),
-        ("sin", lua_sin, native::ff_sin),
-        ("sqrt", lua_sqrt, native::ff_sqrt),
+        ("sin", lua_sin, ff::ff_sin),
+        ("sqrt", lua_sqrt, ff::ff_sqrt),
         ("tan", lua_tan, call),
         ("tointeger", lua_tointeger, call),
         ("type", lua_type, call),

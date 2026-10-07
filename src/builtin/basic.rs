@@ -12,7 +12,6 @@ use crate::vm::native::{ContFn, NativeOut, OnOk, Protect, cont};
 
 pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[
-        ("assert", lua_assert),
         ("collectgarbage", lua_collectgarbage),
         ("error", lua_error),
         ("getmetatable", lua_getmetatable),
@@ -22,7 +21,6 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         ("rawlen", lua_rawlen),
         ("rawset", lua_rawset),
         ("select", lua_select),
-        ("setmetatable", lua_setmetatable),
         ("tonumber", lua_tonumber),
         ("type", lua_type),
         ("warn", lua_warn),
@@ -44,6 +42,24 @@ pub fn load<'gc>(ctx: Context<'gc>) {
     for &(name, handler) in actions {
         set(name, Function::new_cont(ctx.mutation(), handler, &[]));
     }
+    set(
+        "assert",
+        Function::new_native_with_entry(
+            ctx.mutation(),
+            NativeKind::Plain(lua_assert),
+            &[],
+            crate::vm::ff::ff_assert,
+        ),
+    );
+    set(
+        "setmetatable",
+        Function::new_native_with_entry(
+            ctx.mutation(),
+            NativeKind::Plain(lua_setmetatable),
+            &[],
+            crate::vm::ff::ff_setmetatable,
+        ),
+    );
     set(
         "pcall",
         Function::new_native_with_entry(
