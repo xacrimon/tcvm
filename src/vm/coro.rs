@@ -176,6 +176,13 @@ macro_rules! resume_switch {
         let Some(yb) = cs.yield_bottom.filter(|_| cs.started && cs.top_is_native()) else {
             tail!(native_call)
         };
+        // The yield frame takes the values as they are; anything
+        // else is a frame the driver has to run.
+        let yh = NativeHdr::unpack(unsafe { frame::func_word(cs.top_base) });
+        if yh.ok != ok::RETURN || yh.at != 0 {
+            tail!(native_call)
+        }
+        debug_assert_eq!(cs.top_base_index(), yb);
         let bi = ts.slot_index($base);
         let win = bi + a as usize + HDR;
         let args = win + $skip;
@@ -184,7 +191,7 @@ macro_rules! resume_switch {
         } else {
             b as usize - 1 - $skip
         };
-        if yb + n > cs.stack.len() || yb + n > cs.stack_limit {
+        if yb + n > cs.stack.len() || yb + n >= cs.stack_limit {
             tail!(native_call)
         }
         let nc = unsafe { $closure.as_native() };
@@ -193,7 +200,7 @@ macro_rules! resume_switch {
                 $base.add(a as usize),
                 NativeHdr {
                     at: 0,
-                    cont: $rt.cont_index($cont),
+                    cont: $cont,
                     ok: $ok,
                 }
                 .pack(nc),
@@ -213,10 +220,15 @@ macro_rules! resume_switch {
         // in their own thread's stack.
         unsafe { copy_values(cs.slot_ptr(yb), ts.stack.as_ptr().add(args), n) };
         cs.set_top_unchecked(yb + n);
+        let ybp = cs.slot_ptr(yb);
+        let r = unsafe { frame::ret(ybp) };
         switch!(cs);
-        let mut tsr: &mut ThreadState<'gc> = thread!();
-        let j = deliver($rt, &mut tsr, yb);
-        jump!(j)
+        jump!(Jump::Ret {
+            ret: r,
+            nret: n,
+            values: ybp,
+            base: ybp
+        })
     }};
 }
 
@@ -231,7 +243,7 @@ handler! {
         }
         let nc = unsafe { closure.as_native() };
         let co = unsafe { nc.upvalues().get_unchecked(0).get_thread().unwrap_unchecked() };
-        resume_switch!(pc, base, rt, closure, thread, call, co, 0, ok::RETURN, crate::builtin::wrap_cont)
+        resume_switch!(pc, base, rt, closure, thread, call, co, 0, ok::RETURN, crate::vm::dispatch::WRAP_CONT)
     }
 
     /// The entry of `coroutine.resume`; see [`resume_switch`].
@@ -246,7 +258,7 @@ handler! {
         let Some(co) = co else {
             tail!(native_call)
         };
-        resume_switch!(pc, base, rt, closure, thread, call, co, 1, ok::RETURN_TRUE, crate::builtin::resume_cont)
+        resume_switch!(pc, base, rt, closure, thread, call, co, 1, ok::RETURN_TRUE, crate::vm::dispatch::RESUME_CONT)
     }
 
     /// The entry of `coroutine.yield`: with the resumer waiting in
@@ -277,8 +289,11 @@ handler! {
         let bi = ts.slot_index(base);
         let yb = bi + a as usize + HDR;
         let n = if b == 0 { ts.top - yb } else { b as usize - 1 };
-        let slot = rs.top_base_index() + rh.at;
-        if slot + n > rs.stack.len() || slot + n >= rs.stack_limit {
+        let rwin = rs.top_base_index();
+        let slot = rwin + rh.at;
+        // One more slot when `true` goes before values at the window.
+        let room = slot + n + usize::from(rh.ok == ok::RETURN_TRUE && rh.at == 0);
+        if room > rs.stack.len() || slot + n >= rs.stack_limit {
             tail!(native_call)
         }
         let nc = unsafe { closure.as_native() };
@@ -295,15 +310,26 @@ handler! {
         ts.yield_bottom = Some(yb);
         ts.status = ThreadStatus::Suspended;
         ts.resumer = None;
-        unsafe { copy_values(rs.slot_ptr(slot), ts.stack.as_ptr().add(yb), n) };
+        // What `native_continue` would do for the pass-through modes, with
+        // `true` placed as `prepend_true` places it.
+        let (vi, nret) = if rh.ok == ok::RETURN_TRUE {
+            let (vi, dst) = if rh.at > 0 { (slot - 1, slot) } else { (slot, slot + 1) };
+            unsafe { copy_values(rs.slot_ptr(dst), ts.stack.as_ptr().add(yb), n) };
+            rs.stack[vi] = Value::boolean(true);
+            rs.set_top_unchecked(dst + n);
+            (vi, n + 1)
+        } else {
+            unsafe { copy_values(rs.slot_ptr(slot), ts.stack.as_ptr().add(yb), n) };
+            rs.set_top_unchecked(slot + n);
+            (rwin, rh.at + n)
+        };
         ts.set_top_unchecked(yb);
-        rs.set_top_unchecked(slot + n);
         rs.status = ThreadStatus::Normal;
-        let rwin = rs.top_base_index();
+        let r = unsafe { frame::ret(rs.top_base) };
+        let values = rs.slot_ptr(vi);
+        let basep = rs.slot_ptr(rwin);
         switch!(rs);
-        let mut tsr: &mut ThreadState<'gc> = thread!();
-        let j = native_continue(rt, &mut tsr, rwin);
-        jump!(j)
+        jump!(Jump::Ret { ret: r, nret, values, base: basep })
     }
 
     /// Continuation of a coroutine's body: the coroutine is dead, and its
