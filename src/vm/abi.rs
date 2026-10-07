@@ -14,6 +14,7 @@
 //! | `closure` | running closure   | unspecified                | payload, often the native   |
 
 use crate::env::function::{FunctionKind, LuaFn, NativeClosure};
+#[cfg(target_arch = "aarch64")]
 use crate::env::thread::ThreadState;
 use crate::env::value::Value;
 use crate::instruction::Instruction;
