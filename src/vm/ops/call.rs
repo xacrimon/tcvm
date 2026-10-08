@@ -390,7 +390,9 @@ handler! {
                     let np = callee.num_params as usize;
                     unsafe {
                         copy_values(base, src, nargs);
-                        fill_nil(base.add(nargs), np.saturating_sub(nargs));
+                        if nargs < np {
+                            fill_nil(base.add(nargs), np - nargs);
+                        }
                         // The frame keeps its vararg count: its results
                         // still land where its caller expects.
                         let w = frame::func_word(base) & !frame::PTR_MASK;
