@@ -131,7 +131,7 @@ fn trymt<'gc>(
         ));
     }
     // `lua_call(L, 2, 1)`, through a `__call` chain on `mm`.
-    stack.replace(&[mm, a, b]);
+    stack.stage(0, mm, &[a, b]);
     NativeOut::call_then(0, cont::ONE_RESULT, Protect::No, OnOk::Cont)
 }
 

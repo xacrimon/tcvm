@@ -164,7 +164,7 @@ fn lua_dofile<'gc>(
     let path = fname.map(|f| f.as_bytes());
     match ctx.load_file_with(path, Value::table(ctx.globals())) {
         Ok(f) => {
-            stack.replace(&[Value::function(f)]);
+            stack.stage(0, Value::function(f), &[]);
             NativeOut::call_then(0, cont::DOFILE, Protect::No, OnOk::Return)
         }
         Err(e) => NativeOut::error(Error::new(ctx, load_error_value(ctx, &e))),
@@ -442,7 +442,7 @@ fn lua_pairs<'gc>(
         stack.replace(&[closure.upvalues()[0], t, Value::nil(), Value::nil()]);
         return NativeOut::RETURN;
     }
-    stack.replace(&[mm, t]);
+    stack.stage(0, mm, &[t]);
     NativeOut::call_then(0, cont::PAIRS, Protect::No, OnOk::Cont)
 }
 
@@ -472,14 +472,16 @@ pub(crate) fn return_cont<'gc>(
 
 /// `pcall(f, ...)`: a protected call of `f`, whose results come back as
 /// `(true, ...)` and a caught error as `(false, err)`. The callee and its
-/// arguments are already in call layout; a non-callable `f` raises inside
-/// the protected call, so it comes back as `(false, msg)` like the reference.
+/// arguments only need the header's slots opened; a non-callable `f` raises
+/// inside the protected call, so it comes back as `(false, msg)` like the
+/// reference.
 fn lua_pcall<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
-    stack: Stack<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> NativeOut {
     util::check_any(ctx, &stack, "pcall", 1)?;
+    stack.open_hidden(0);
     NativeOut::call_then(0, cont::PCALL, Protect::Errors, OnOk::ReturnTrue)
 }
 
@@ -739,7 +741,7 @@ fn lua_tostring<'gc>(
         stack.ret1(Value::string(util::basic_tostring(ctx, v)));
         return NativeOut::RETURN;
     }
-    stack.replace(&[mm, v]);
+    stack.stage(0, mm, &[v]);
     NativeOut::call_then(0, cont::TOSTRING, Protect::No, OnOk::Cont)
 }
 
@@ -795,8 +797,9 @@ fn lua_xpcall<'gc>(
         return NativeOut::error(util::type_error(ctx, "xpcall", 2, "function", stack.arg(1)));
     }
     // The handler goes first, where the unwinder finds it; the callee and
-    // its arguments follow in call layout.
+    // its arguments follow in frame layout.
     stack.as_mut_slice().swap(0, 1);
+    stack.open_hidden(1);
     NativeOut::call_then(1, cont::XPCALL, Protect::Handler, OnOk::ReturnTrue)
 }
 

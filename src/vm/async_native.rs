@@ -412,6 +412,9 @@ pub(crate) fn async_cont<'gc>(
         }
         Poll::Pending => match env.request {
             Request::Call { at, protect } => {
+                // The future laid the call out contiguously (its public
+                // contract); open the header's slots for it.
+                Stack::new(thread, base).open_hidden(at);
                 NativeOut::call_then(at, cont::ASYNC, protect, OnOk::Cont)
             }
             Request::Yield { at } => NativeOut::yield_then(at, cont::ASYNC),

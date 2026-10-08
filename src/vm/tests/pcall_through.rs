@@ -37,8 +37,9 @@ fn lua_frame_count<'gc>(
 fn lua_through<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
-    _stack: Stack<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> NativeOut {
+    stack.open_hidden(0);
     NativeOut::call_then(0, cont::TEST_THROUGH, Protect::No, OnOk::Cont)
 }
 

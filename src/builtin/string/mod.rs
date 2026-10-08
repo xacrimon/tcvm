@@ -893,8 +893,9 @@ fn gsub_drive<'gc>(
                 let call = if let Some(f) = repl.get_function() {
                     // Every capture is an argument.
                     let n = ms.num_captures(true);
-                    let mut call = Vec::with_capacity(n + 1);
-                    call.push(Value::function(f));
+                    // In frame layout: the callee's header slots after it.
+                    let mut call = Vec::with_capacity(n + 4);
+                    call.extend([Value::function(f), Value::nil(), Value::nil(), Value::nil()]);
                     for i in 0..n {
                         let cv = ms.get_onecapture(i, pos, e).map_err(|e| pat_err(ctx, e))?;
                         call.push(cap_to_value(ctx, src, cv));
@@ -919,9 +920,14 @@ fn gsub_drive<'gc>(
                             }
                             None
                         }
-                        IndexChain::Invoke { func, receiver } => {
-                            Some(vec![Value::function(func), receiver, key])
-                        }
+                        IndexChain::Invoke { func, receiver } => Some(vec![
+                            Value::function(func),
+                            Value::nil(),
+                            Value::nil(),
+                            Value::nil(),
+                            receiver,
+                            key,
+                        ]),
                         IndexChain::NotIndexable(v) => {
                             let msg = format!("attempt to index a {} value", v.type_name());
                             return NativeOut::error(Error::from_str(ctx, &msg));

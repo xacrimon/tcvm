@@ -11,12 +11,12 @@ use crate::{Executor, LoadError, Lua};
 fn bumper<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
-    stack: Stack<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> NativeOut {
     if stack.get(0).get_function().is_none() {
         return NativeOut::error(Error::from_str(ctx, "bumper expects a function"));
     }
-    // The callee at stack[0] with no arguments is already call layout.
+    stack.open_hidden(0);
     NativeOut::call_then(0, cont::TEST_CL_ADD_ONE, Protect::No, OnOk::Cont)
 }
 
@@ -36,8 +36,9 @@ pub(crate) fn add_one<'gc>(
 fn forward<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
-    _stack: Stack<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> NativeOut {
+    stack.open_hidden(0);
     NativeOut::call_then(0, cont::TEST_CL_RETURNED, Protect::No, OnOk::Return)
 }
 

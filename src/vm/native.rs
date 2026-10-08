@@ -10,7 +10,7 @@ use crate::env::value::Value;
 use crate::instruction::{Instruction, Op};
 use crate::lua::Context;
 use crate::vm::abi::{Exit, Jump, Slot, handler, handler_bits};
-use crate::vm::frame::{self, HDR, NativeHdr, copy_values, copy_values_up, fill_nil, flag};
+use crate::vm::frame::{self, HDR, NativeHdr, copy_values, fill_nil, flag};
 use crate::vm::ops::control::close_upvalues;
 
 /// Whether a continuation receives the errors its call raises, instead of
@@ -279,26 +279,12 @@ impl NativeOut {
         )
     }
 
-    /// Call `stack[at]` with the values above it, then run `cont` with the
-    /// call's results in their place, `stack[at..]`. The native keeps its
+    /// Call the function the native laid out as a frame at `stack[at]`
+    /// (`[f, _, _, _, args..]`, `Stack::stage`), then run `cont` with
+    /// the call's results in its place, `stack[at..]`. The native keeps its
     /// state in `stack[..at]` meanwhile.
     pub(crate) fn call_then(at: usize, cont: ContIdx, protect: Protect, ok: OnOk) -> Self {
         Self::packed(tag::CALL_THEN, at, cont, ok, protect)
-    }
-
-    /// [`call_then`](Self::call_then) for a native that laid the call out
-    /// as a frame already, `[f, _, _, _, args..]` at `at`, so the
-    /// arguments need no move.
-    pub(crate) fn call_then_staged(at: usize, cont: ContIdx, protect: Protect, ok: OnOk) -> Self {
-        NativeOut(Self::call_then(at, cont, protect, ok).0 | Self::STAGED)
-    }
-
-    /// Set on a `CALL_THEN` whose arguments are in frame layout already.
-    const STAGED: u64 = 1 << 5;
-
-    #[inline]
-    pub(crate) fn staged(self) -> bool {
-        self.0 & Self::STAGED != 0
     }
 
     /// Resume the coroutine at `stack[at]` with the values above it, then run
@@ -743,11 +729,9 @@ handler! {
 }
 
 /// Make the native frame at header `hdr` (window `hdr + 4`) wait for the
-/// call `out` asks for, at window slot `at` with its arguments after it: the
-/// frame's word 0 records `at`, `cont` and `ok`, the arguments move up past
-/// the hidden slots (unless the native laid them out there) and the callee's
-/// header gets `ret_native`. Returns the callee's header and argument count
-/// for `enter`.
+/// call `out` asks for, laid out as a frame at window slot `at`: the frame's
+/// word 0 records `at`, `cont` and `ok`, and the callee's header gets
+/// `ret_native`. Returns the callee's header and argument count for `enter`.
 #[inline(always)]
 fn stage_call<'gc>(
     ts: &mut ThreadState<'gc>,
@@ -758,17 +742,7 @@ fn stage_call<'gc>(
     let (at, cont, okk) = (out.at(), out.cont(), out.ok());
     let win = hdr + HDR;
     let callee = win + at;
-    let nargs = if out.staged() {
-        ts.top - (callee + HDR)
-    } else {
-        // The arguments move up past the hidden slots, highest first.
-        let nargs = ts.top - (callee + 1);
-        ts.ensure_slots(ts.top + 3);
-        let sp = ts.stack.as_mut_ptr();
-        unsafe { copy_values_up(sp.add(callee + HDR), sp.add(callee + 1), nargs) };
-        ts.top += 3;
-        nargs
-    };
+    let nargs = ts.top - (callee + HDR);
     let sp = ts.stack.as_mut_ptr();
     let win_ptr = unsafe { sp.add(win) };
     // Single stores throughout: `ret_native` and the callee's RETURN read

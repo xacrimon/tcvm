@@ -52,7 +52,7 @@ fn close_step<'gc>(ctx: Context<'gc>, mut stack: Stack<'gc, '_>, exit: bool) -> 
     let v = entry.value(&ts.stack);
     let errv = stack.get(1);
     stack.truncate(2);
-    stack.extend([ctx.mm_of(v, MetamethodBits::CLOSE), v]);
+    stack.stage(2, ctx.mm_of(v, MetamethodBits::CLOSE), &[v]);
     if has_err {
         stack.push(errv);
     }
