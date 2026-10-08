@@ -739,6 +739,30 @@ macro_rules! instructions {
                 match self { $(Op::$op => Shape::$shape,)* }
             }
 
+            /// A table from groups of rows (the families' and the singles'),
+            /// every opcode listed exactly once; `fill` is overwritten.
+            pub const fn table_of<T: Copy>(fill: T, groups: &[&[(Op, T)]]) -> [T; Op::COUNT] {
+                let mut t = [fill; Op::COUNT];
+                let mut seen = [false; Op::COUNT];
+                let mut n = 0;
+                let mut g = 0;
+                while g < groups.len() {
+                    let rows = groups[g];
+                    let mut i = 0;
+                    while i < rows.len() {
+                        let (op, v) = rows[i];
+                        assert!(!seen[op as usize], "opcode listed twice");
+                        seen[op as usize] = true;
+                        t[op as usize] = v;
+                        n += 1;
+                        i += 1;
+                    }
+                    g += 1;
+                }
+                assert!(n == Op::COUNT, "an opcode has no handler");
+                t
+            }
+
             pub const fn table<T: Copy>(rows: [(Op, T); Op::COUNT]) -> [T; Op::COUNT] {
                 let mut t = [rows[0].1; Op::COUNT];
                 let mut seen = [false; Op::COUNT];
