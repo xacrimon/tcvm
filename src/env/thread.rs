@@ -107,6 +107,13 @@ pub struct ThreadState<'gc> {
     pub(crate) top_pc: *const Instruction,
     /// Whether the seeded call at slot 0 has been entered (header 0 written).
     pub(crate) started: bool,
+    /// Debug: a handler published this frame (`sync!`) since the last
+    /// dispatch, which then checks the published state.
+    #[cfg(debug_assertions)]
+    pub(crate) synced: bool,
+    /// Debug: the source location of that `sync!`.
+    #[cfg(debug_assertions)]
+    pub(crate) sync_site: (&'static str, u32),
     /// An error nothing on the thread caught; the executor reports it.
     pub(crate) uncaught: Option<Error<'gc>>,
     /// Upvalues still pointing into `stack`, sorted by slot, so a `CLOSE` or
@@ -424,6 +431,10 @@ impl<'gc> Thread<'gc> {
             top_base: std::ptr::null_mut(),
             top_pc: std::ptr::null(),
             started: false,
+            #[cfg(debug_assertions)]
+            synced: false,
+            #[cfg(debug_assertions)]
+            sync_site: ("", 0),
             uncaught: None,
             open_upvalues: Vec::new(),
             tbc_list: Vec::new(),

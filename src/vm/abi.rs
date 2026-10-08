@@ -14,7 +14,7 @@
 //! | `closure` | running closure   | unspecified                | payload, often the native   |
 
 use crate::env::function::{FunctionKind, LuaFn, NativeClosure};
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", debug_assertions))]
 use crate::env::thread::ThreadState;
 use crate::env::value::Value;
 use crate::instruction::Instruction;
@@ -325,6 +325,8 @@ macro_rules! handler_impl {
         /// Dispatch the instruction at `pc`.
         macro_rules! next {
             () => {{
+                #[cfg(debug_assertions)]
+                $crate::vm::abi::check_published(thread!());
                 let __w: $crate::instruction::Instruction = unsafe { *$pc };
                 $pc = unsafe { $pc.add(1) };
                 let __h = $rt.handler(__w.opcode());
@@ -360,7 +362,11 @@ macro_rules! handler_impl {
         /// Register `$$i` of the running frame, as a place.
         macro_rules! reg {
             ($$i:expr) => {
-                (*unsafe { &mut *$base.add(($$i) as usize) })
+                (*unsafe {
+                    #[cfg(debug_assertions)]
+                    $crate::vm::abi::check_reg($base, ($$i) as usize);
+                    &mut *$base.add(($$i) as usize)
+                })
             };
         }
 
@@ -394,6 +400,12 @@ macro_rules! handler_impl {
                 let __t = thread!();
                 __t.top_base = $base;
                 __t.top_pc = $pc;
+                #[cfg(debug_assertions)]
+                {
+                    __t.synced = true;
+                    __t.sync_site = (file!(), line!());
+                    $crate::vm::abi::check_sync(__t);
+                }
             }};
         }
 
@@ -578,3 +590,56 @@ macro_rules! handler_impl {
 }
 
 pub(crate) use {handler, handler_impl};
+
+/// Debug: the window check behind `reg!` outside opcode handlers, where the
+/// running closure is the frame's.
+#[cfg(debug_assertions)]
+pub(crate) fn check_reg<'gc>(base: *mut Value<'gc>, i: usize) {
+    let max = unsafe { crate::vm::frame::closure(base) }.max_stack_size as usize;
+    assert!(i < max, "register {i} past the window of {max}");
+}
+
+/// Debug: `sync!` published a consistent pair: for a Lua frame, `top_pc`
+/// lies in its closure's code (a repurposed `pc` slot would not).
+#[cfg(debug_assertions)]
+pub(crate) fn check_sync<'gc>(ts: &ThreadState<'gc>) {
+    let tb = ts.top_base;
+    if tb.is_null() || unsafe { crate::vm::frame::is_native(tb) } {
+        return;
+    }
+    let c = unsafe { crate::vm::frame::closure(tb) };
+    let code = c.code;
+    let n = c.proto.code.len();
+    let site = ts.sync_site;
+    assert!(
+        ts.top_pc >= code && ts.top_pc <= unsafe { code.add(n) },
+        "published pc outside the frame's code (sync at {}:{})",
+        site.0,
+        site.1
+    );
+}
+
+/// Debug: at the first dispatch after a `sync!`, the published base still
+/// points into the stack (growth in between must have rebased it). The
+/// pair itself may be stale by now: a tail call replaces the frame in place,
+/// and D10 reads the published state only at exits, which publish again.
+#[cfg(debug_assertions)]
+pub(crate) fn check_published<'gc>(ts: &mut ThreadState<'gc>) {
+    if !ts.synced {
+        return;
+    }
+    ts.synced = false;
+    let tb = ts.top_base;
+    if tb.is_null() {
+        return;
+    }
+    let start = ts.stack.as_ptr();
+    let end = unsafe { start.add(ts.stack.len()) };
+    let site = ts.sync_site;
+    assert!(
+        tb.cast_const() >= start && tb.cast_const() <= end,
+        "published base outside the stack (sync at {}:{})",
+        site.0,
+        site.1
+    );
+}
