@@ -136,7 +136,7 @@ macro_rules! tfor_finish {
                     reg![vars + i] = Value::nil();
                 }
                 debug_assert_eq!(unsafe { (*$pc).op() }, Op::TFORLOOP);
-                let (_, offset) = unsafe { *$pc }.a_imm();
+                let (_, offset) = unsafe { *$pc }.a_offset();
                 $pc = unsafe { $pc.add(1).offset(offset as isize) };
             }
             None => {
@@ -173,7 +173,7 @@ handler! {
 
     /// `pc += imm`
     op fn op_jmp {
-        jump_by!(insn.imm());
+        jump_by!(insn.branch_offset());
         next!()
     }
 
@@ -187,7 +187,7 @@ handler! {
     /// loop-carried chain; comparing against a precomputed last value
     /// keeps the chain to one slot.
     op fn op_forprep {
-        let (a, offset) = insn.a_imm();
+        let (a, offset) = insn.a_offset();
         let init = reg![a];
         let limit = reg![a + 1];
         let step = reg![a + 2];
@@ -257,7 +257,7 @@ handler! {
     /// variable are all small; anything else (`debug.setlocal` on the
     /// hidden slots) goes to the generic FORLOOP.
     op fn op_forloop_i {
-        let (a, offset) = insn.a_imm();
+        let (a, offset) = insn.a_offset();
         let step = &reg![a + 1];
         let Some(s) = step.get_small() else {
             tail!(op_forloop)
@@ -276,7 +276,7 @@ handler! {
 
     /// `FORLOOP_F`: the float loop.
     op fn op_forloop_f {
-        let (a, offset) = insn.a_imm();
+        let (a, offset) = insn.a_offset();
         let step = &reg![a + 1];
         if !step.is_float() {
             tail!(op_forloop)
@@ -297,7 +297,7 @@ handler! {
     /// iterations remain, reading the layout FORPREP leaves behind. The
     /// generic form, for a loop with boxed values and for the forms' misses.
     op fn op_forloop {
-        let (a, offset) = insn.a_imm();
+        let (a, offset) = insn.a_offset();
         // The step's type tells the loop kind, and the hidden slots match it:
         // FORPREP wrote them and nothing else can (the visible copy is never
         // read here).
@@ -335,7 +335,7 @@ handler! {
     /// FORLOOP for an integer loop whose values don't all fit a small int.
     slow fn forloop_slow {
         let insn = insn_at!();
-        let (a, offset) = insn.a_imm();
+        let (a, offset) = insn.a_offset();
         let (s, last, idx) = (reg![a + 1], reg![a], reg![a + 2]);
         let (s, last, idx) = unsafe {
             (
@@ -358,7 +358,7 @@ handler! {
     /// to the first loop variable, set the position slot `R[a+3]` (see
     /// `op_tforcall`), and jump to the loop test.
     op fn op_tforprep {
-        let (a, offset) = insn.a_imm();
+        let (a, offset) = insn.a_offset();
         let control = reg![a + 2];
         let closing = reg![a + 3];
         reg![a + TFOR_VARS] = control;
@@ -556,7 +556,7 @@ handler! {
 
     /// Generic for loop test: jump back while the first variable is not nil.
     op fn op_tforloop {
-        let (a, offset) = insn.a_imm();
+        let (a, offset) = insn.a_offset();
         branch!(!reg![a + TFOR_VARS].is_nil(), offset)
     }
 

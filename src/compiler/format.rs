@@ -269,11 +269,11 @@ fn format_instruction(instr: &Instruction, proto: &Prototype<'_>) -> String {
             format!("TBC             R{val}")
         }
         Op::JMP => {
-            let offset = instr.imm();
+            let offset = instr.branch_offset();
             format!("JMP             {offset:+}")
         }
         Op::JEQ | Op::JNEQ | Op::JLT | Op::JNLT | Op::JLE | Op::JNLE => {
-            let (lhs, rhs, offset) = instr.ab_imm();
+            let (lhs, rhs, offset) = instr.ab_offset();
             format!("{:<15} R{lhs} R{rhs} {offset:+}", instr.op().name())
         }
         Op::JEQI
@@ -304,7 +304,7 @@ fn format_instruction(instr: &Instruction, proto: &Prototype<'_>) -> String {
             )
         }
         Op::JT | Op::JF => {
-            let (src, offset) = instr.a_imm();
+            let (src, offset) = instr.a_offset();
             format!("{:<15} R{src} {offset:+}", instr.op().name())
         }
         Op::LOADI => {
@@ -316,7 +316,7 @@ fn format_instruction(instr: &Instruction, proto: &Prototype<'_>) -> String {
             format!("LOADNIL         R{dst} count={count}")
         }
         Op::JTSET | Op::JFSET => {
-            let (dst, src, offset) = instr.ab_imm();
+            let (dst, src, offset) = instr.ab_offset();
             format!("{:<15} R{dst} R{src} {offset:+}", instr.op().name())
         }
         Op::CALL => {
@@ -360,15 +360,15 @@ fn format_instruction(instr: &Instruction, proto: &Prototype<'_>) -> String {
             format!("RETURN1         R{value}")
         }
         Op::FORLOOP => {
-            let (base, offset) = instr.a_imm();
+            let (base, offset) = instr.a_offset();
             format!("FORLOOP         R{base} {offset:+}")
         }
         Op::FORPREP => {
-            let (base, offset) = instr.a_imm();
+            let (base, offset) = instr.a_offset();
             format!("FORPREP         R{base} {offset:+}")
         }
         Op::TFORPREP => {
-            let (base, offset) = instr.a_imm();
+            let (base, offset) = instr.a_offset();
             format!("TFORPREP        R{base} {offset:+}")
         }
         Op::TFORCALL => {
@@ -376,7 +376,7 @@ fn format_instruction(instr: &Instruction, proto: &Prototype<'_>) -> String {
             format!("TFORCALL        R{base} count={count}")
         }
         Op::TFORLOOP => {
-            let (base, offset) = instr.a_imm();
+            let (base, offset) = instr.a_offset();
             format!("TFORLOOP        R{base} {offset:+}")
         }
         Op::SETLIST => {

@@ -107,6 +107,13 @@ impl Imm {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CmpImm(u16);
 
+/// A branch offset: 24 bits, sign-extended, held in bits 40..63 of every
+/// branch opcode whatever its shape, so a reader never asks the
+/// shape. Constructed in range; the compiler patches offsets through
+/// `set_branch_offset`, which reports one that does not fit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Offset(pub i32);
+
 impl CmpImm {
     pub const MIN: i64 = -(1 << 14);
     pub const MAX: i64 = (1 << 14) - 1;
@@ -168,6 +175,11 @@ impl_operand! {
     i32      => |self| self as u32 as u64,
     Imm      => |self| self.0 as u64,
     CmpImm   => |self| self.0 as u64,
+    // Placed in the top 24 bits of the 32-bit immediate slot.
+    Offset   => |self| {
+        debug_assert!(Instruction::fits_imm24(self.0));
+        ((self.0 as u32 as u64) & 0xff_ffff) << 8
+    },
 }
 
 /// Which operand slots an opcode uses. Named after the slots themselves:
@@ -202,8 +214,7 @@ const IMM24_SHIFT: u32 = 40;
 /// select one by pasting the shape token.
 pub mod shape {
     use super::{
-        A_SHIFT, B_SHIFT, C_SHIFT, D_SHIFT, E_SHIFT, H_SHIFT, IMM_SHIFT, IMM24_SHIFT, Instruction,
-        Op, Operand,
+        A_SHIFT, B_SHIFT, C_SHIFT, D_SHIFT, E_SHIFT, H_SHIFT, IMM_SHIFT, Instruction, Op, Operand,
     };
 
     #[inline(always)]
@@ -324,16 +335,15 @@ pub mod shape {
     }
 
     impl AhImm {
-        /// The branch offset is 24 bits here (`IMM24_SHIFT`): bits 32..34
-        /// hold the site's adaptive bits.
+        /// The immediate slot holds an `Offset` (bits 40..63); bits 32..34
+        /// are the site's adaptive bits.
         #[inline(always)]
         pub fn pack(op: Op, a: impl Operand, h: impl Operand, imm: impl Operand) -> Instruction {
-            debug_assert!(Instruction::fits_imm24(imm.bits() as u32 as i32));
             Instruction(
                 op as u64
                     | slot8(a.bits()) << A_SHIFT
                     | slot16(h.bits()) << H_SHIFT
-                    | (imm.bits() & 0xff_ffff) << IMM24_SHIFT,
+                    | (imm.bits() & 0xffff_ffff) << IMM_SHIFT,
             )
         }
     }
@@ -437,25 +447,21 @@ impl Instruction {
         (self.0 >> IMM_SHIFT) as u32 as i32
     }
 
-    /// The branch offset of an `AhImm` word: 24 bits, sign-extended.
+    /// The 24-bit field at bits 40..63, sign-extended: every branch offset.
     #[inline(always)]
     pub fn imm24(self) -> i32 {
         ((self.0 as i64) >> IMM24_SHIFT) as i32
     }
 
-    /// Whether `v` fits an `AhImm` branch offset.
+    /// Whether `v` fits a branch offset.
     pub const fn fits_imm24(v: i32) -> bool {
         v >= -(1 << 23) && v < (1 << 23)
     }
 
-    /// The branch offset of this word, whichever shape it has.
+    /// The branch offset of this word: the same field in every shape.
     #[inline(always)]
     pub fn branch_offset(self) -> i32 {
-        if self.op().shape() == Shape::AhImm {
-            self.imm24()
-        } else {
-            self.imm()
-        }
+        self.imm24()
     }
 
     /// The packed [`Imm`] of an immediate-operand opcode.
@@ -586,6 +592,20 @@ impl Instruction {
         (self.a(), self.b(), self.imm())
     }
 
+    /// `a` and the branch offset of an `AImm` branch.
+    #[inline(always)]
+    pub fn a_offset(self) -> (u8, i32) {
+        self.expect(Shape::AImm);
+        (self.a(), self.imm24())
+    }
+
+    /// `a`, `b` and the branch offset of an `AbImm` branch.
+    #[inline(always)]
+    pub fn ab_offset(self) -> (u8, u8, i32) {
+        self.expect(Shape::AbImm);
+        (self.a(), self.b(), self.imm24())
+    }
+
     #[inline(always)]
     pub fn ah_imm(self) -> (u8, u16, i32) {
         self.expect(Shape::AhImm);
@@ -633,25 +653,19 @@ impl Instruction {
         self.set_slot(IMM_SHIFT, 0xffff_ffff, v as u32 as u64);
     }
 
-    /// Set the 24-bit branch offset of an `AhImm` word.
+    /// Set the 24-bit branch offset.
     #[inline(always)]
     pub fn set_imm24(&mut self, v: i32) {
         debug_assert!(Self::fits_imm24(v));
         self.set_slot(IMM24_SHIFT, 0xff_ffff, v as u32 as u64);
     }
 
-    /// Set this branch's offset by its shape; `false` when it does not fit
-    /// (an `AhImm` offset is 24 bits).
-    #[must_use]
+    /// Set this branch's offset; `false` when it does not fit 24 bits.
     pub fn set_branch_offset(&mut self, v: i32) -> bool {
-        if self.op().shape() == Shape::AhImm {
-            if !Self::fits_imm24(v) {
-                return false;
-            }
-            self.set_imm24(v);
-        } else {
-            self.set_imm(v);
+        if !Self::fits_imm24(v) {
+            return false;
         }
+        self.set_imm24(v);
         true
     }
 }
@@ -805,7 +819,7 @@ instructions! {
     0x1d CONCAT     concat      Abc   { dst: Reg, lhs: Reg, rhs: Reg }
     0x1e CLOSE      close       A     { start: Reg }
     0x1f TBC        tbc         A     { val: Reg }
-    0x20 JMP        jmp         Imm   { offset: i32 }
+    0x20 JMP        jmp         Imm   { offset: Offset }
 
     // --- conditional branches -------------------------------------------------
     //
@@ -814,51 +828,51 @@ instructions! {
     // `Op::branch_sense`. `JNLT a b` is not `JLE b a`: they differ on NaN and
     // in the metamethod they call.
 
-    0x21 JEQ        jeq         AbImm { lhs: Reg, rhs: Reg, offset: i32 }
-    0x22 JNEQ       jneq        AbImm { lhs: Reg, rhs: Reg, offset: i32 }
-    0x23 JLT        jlt         AbImm { lhs: Reg, rhs: Reg, offset: i32 }
-    0x24 JNLT       jnlt        AbImm { lhs: Reg, rhs: Reg, offset: i32 }
-    0x25 JLE        jle         AbImm { lhs: Reg, rhs: Reg, offset: i32 }
-    0x26 JNLE       jnle        AbImm { lhs: Reg, rhs: Reg, offset: i32 }
+    0x21 JEQ        jeq         AbImm { lhs: Reg, rhs: Reg, offset: Offset }
+    0x22 JNEQ       jneq        AbImm { lhs: Reg, rhs: Reg, offset: Offset }
+    0x23 JLT        jlt         AbImm { lhs: Reg, rhs: Reg, offset: Offset }
+    0x24 JNLT       jnlt        AbImm { lhs: Reg, rhs: Reg, offset: Offset }
+    0x25 JLE        jle         AbImm { lhs: Reg, rhs: Reg, offset: Offset }
+    0x26 JNLE       jnle        AbImm { lhs: Reg, rhs: Reg, offset: Offset }
 
     // `R[src] <cmp> imm`. `GT`/`GE` are the swapped `LT`/`LE`, so a literal on
     // either side compiles to one of these. Equality never consults `__eq`.
 
-    0x27 JEQI       jeqi        AhImm { src: Reg, imm: CmpImm, offset: i32 }
-    0x28 JNEQI      jneqi       AhImm { src: Reg, imm: CmpImm, offset: i32 }
-    0x29 JLTI       jlti        AhImm { src: Reg, imm: CmpImm, offset: i32 }
-    0x2a JNLTI      jnlti       AhImm { src: Reg, imm: CmpImm, offset: i32 }
-    0x2b JLEI       jlei        AhImm { src: Reg, imm: CmpImm, offset: i32 }
-    0x2c JNLEI      jnlei       AhImm { src: Reg, imm: CmpImm, offset: i32 }
-    0x2d JGTI       jgti        AhImm { src: Reg, imm: CmpImm, offset: i32 }
-    0x2e JNGTI      jngti       AhImm { src: Reg, imm: CmpImm, offset: i32 }
-    0x2f JGEI       jgei        AhImm { src: Reg, imm: CmpImm, offset: i32 }
-    0x30 JNGEI      jngei       AhImm { src: Reg, imm: CmpImm, offset: i32 }
+    0x27 JEQI       jeqi        AhImm { src: Reg, imm: CmpImm, offset: Offset }
+    0x28 JNEQI      jneqi       AhImm { src: Reg, imm: CmpImm, offset: Offset }
+    0x29 JLTI       jlti        AhImm { src: Reg, imm: CmpImm, offset: Offset }
+    0x2a JNLTI      jnlti       AhImm { src: Reg, imm: CmpImm, offset: Offset }
+    0x2b JLEI       jlei        AhImm { src: Reg, imm: CmpImm, offset: Offset }
+    0x2c JNLEI      jnlei       AhImm { src: Reg, imm: CmpImm, offset: Offset }
+    0x2d JGTI       jgti        AhImm { src: Reg, imm: CmpImm, offset: Offset }
+    0x2e JNGTI      jngti       AhImm { src: Reg, imm: CmpImm, offset: Offset }
+    0x2f JGEI       jgei        AhImm { src: Reg, imm: CmpImm, offset: Offset }
+    0x30 JNGEI      jngei       AhImm { src: Reg, imm: CmpImm, offset: Offset }
 
     // `R[src] == K[key]`, a string: identity, as strings are interned.
 
-    0x31 JEQS       jeqs        AhImm { src: Reg, key: KIdx, offset: i32 }
-    0x32 JNEQS      jneqs       AhImm { src: Reg, key: KIdx, offset: i32 }
+    0x31 JEQS       jeqs        AhImm { src: Reg, key: KIdx, offset: Offset }
+    0x32 JNEQS      jneqs       AhImm { src: Reg, key: KIdx, offset: Offset }
 
     // Truthiness of `R[src]`; the `SET` forms copy it to `R[dst]` when they
     // jump (`a or b`).
 
-    0x33 JT         jt          AImm  { src: Reg, offset: i32 }
-    0x34 JF         jf          AImm  { src: Reg, offset: i32 }
-    0x35 JTSET      jtset       AbImm { dst: Reg, src: Reg, offset: i32 }
-    0x36 JFSET      jfset       AbImm { dst: Reg, src: Reg, offset: i32 }
+    0x33 JT         jt          AImm  { src: Reg, offset: Offset }
+    0x34 JF         jf          AImm  { src: Reg, offset: Offset }
+    0x35 JTSET      jtset       AbImm { dst: Reg, src: Reg, offset: Offset }
+    0x36 JFSET      jfset       AbImm { dst: Reg, src: Reg, offset: Offset }
 
     0x37 CALL       call        Abc   { func: Reg, args: u8, returns: u8 }
     0x38 TAILCALL   tailcall    Ab    { func: Reg, args: u8 }
     0x39 RETURN     ret         Ab    { values: Reg, count: u8 }
-    0x3a FORLOOP    forloop     AImm  { base: Reg, offset: i32 }
-    0x3b FORPREP    forprep     AImm  { base: Reg, offset: i32 }
+    0x3a FORLOOP    forloop     AImm  { base: Reg, offset: Offset }
+    0x3b FORPREP    forprep     AImm  { base: Reg, offset: Offset }
 
     /// Generic `for`, over [`TFOR_VARS`] hidden slots at `base` (iterator,
     /// state, closing value, traversal position) and then its variables.
-    0x3c TFORPREP   tforprep    AImm  { base: Reg, offset: i32 }
+    0x3c TFORPREP   tforprep    AImm  { base: Reg, offset: Offset }
     0x3d TFORCALL   tforcall    Ab    { base: Reg, count: u8 }
-    0x3e TFORLOOP   tforloop    AImm  { base: Reg, offset: i32 }
+    0x3e TFORLOOP   tforloop    AImm  { base: Reg, offset: Offset }
 
     0x3f SETLIST    setlist     Abd   { table: Reg, count: u8, offset: u16 }
     0x40 CLOSURE    closure     Ad    { dst: Reg, proto: ProtoIdx }
@@ -1052,24 +1066,24 @@ instructions! {
 
     // Compares: both small for the register forms, a float register
     // for the immediate ones.
-    0xb7 JLT_II       jlt_ii      AbImm  { lhs: Reg, rhs: Reg, offset: i32 }
-    0xb8 JNLT_II      jnlt_ii     AbImm  { lhs: Reg, rhs: Reg, offset: i32 }
-    0xb9 JLE_II       jle_ii      AbImm  { lhs: Reg, rhs: Reg, offset: i32 }
-    0xba JNLE_II      jnle_ii     AbImm  { lhs: Reg, rhs: Reg, offset: i32 }
-    0xbb JEQ_II       jeq_ii      AbImm  { lhs: Reg, rhs: Reg, offset: i32 }
-    0xbc JNEQ_II      jneq_ii     AbImm  { lhs: Reg, rhs: Reg, offset: i32 }
-    0xbd JLTI_F       jlti_f      AhImm  { src: Reg, imm: CmpImm, offset: i32 }
-    0xbe JNLTI_F      jnlti_f     AhImm  { src: Reg, imm: CmpImm, offset: i32 }
-    0xbf JLEI_F       jlei_f      AhImm  { src: Reg, imm: CmpImm, offset: i32 }
-    0xc0 JNLEI_F      jnlei_f     AhImm  { src: Reg, imm: CmpImm, offset: i32 }
-    0xc1 JGTI_F       jgti_f      AhImm  { src: Reg, imm: CmpImm, offset: i32 }
-    0xc2 JNGTI_F      jngti_f     AhImm  { src: Reg, imm: CmpImm, offset: i32 }
-    0xc3 JGEI_F       jgei_f      AhImm  { src: Reg, imm: CmpImm, offset: i32 }
-    0xc4 JNGEI_F      jngei_f     AhImm  { src: Reg, imm: CmpImm, offset: i32 }
+    0xb7 JLT_II       jlt_ii      AbImm  { lhs: Reg, rhs: Reg, offset: Offset }
+    0xb8 JNLT_II      jnlt_ii     AbImm  { lhs: Reg, rhs: Reg, offset: Offset }
+    0xb9 JLE_II       jle_ii      AbImm  { lhs: Reg, rhs: Reg, offset: Offset }
+    0xba JNLE_II      jnle_ii     AbImm  { lhs: Reg, rhs: Reg, offset: Offset }
+    0xbb JEQ_II       jeq_ii      AbImm  { lhs: Reg, rhs: Reg, offset: Offset }
+    0xbc JNEQ_II      jneq_ii     AbImm  { lhs: Reg, rhs: Reg, offset: Offset }
+    0xbd JLTI_F       jlti_f      AhImm  { src: Reg, imm: CmpImm, offset: Offset }
+    0xbe JNLTI_F      jnlti_f     AhImm  { src: Reg, imm: CmpImm, offset: Offset }
+    0xbf JLEI_F       jlei_f      AhImm  { src: Reg, imm: CmpImm, offset: Offset }
+    0xc0 JNLEI_F      jnlei_f     AhImm  { src: Reg, imm: CmpImm, offset: Offset }
+    0xc1 JGTI_F       jgti_f      AhImm  { src: Reg, imm: CmpImm, offset: Offset }
+    0xc2 JNGTI_F      jngti_f     AhImm  { src: Reg, imm: CmpImm, offset: Offset }
+    0xc3 JGEI_F       jgei_f      AhImm  { src: Reg, imm: CmpImm, offset: Offset }
+    0xc4 JNGEI_F      jngei_f     AhImm  { src: Reg, imm: CmpImm, offset: Offset }
 
     // Loops: written by the prep instruction, guarded, no counter.
-    0xc5 FORLOOP_I    forloop_i   AImm   { base: Reg, offset: i32 }
-    0xc6 FORLOOP_F    forloop_f   AImm   { base: Reg, offset: i32 }
+    0xc5 FORLOOP_I    forloop_i   AImm   { base: Reg, offset: Offset }
+    0xc6 FORLOOP_F    forloop_f   AImm   { base: Reg, offset: Offset }
     0xc7 TFORCALL_NEXT   tforcall_next   Ab { base: Reg, count: u8 }
     0xc8 TFORCALL_IPAIRS tforcall_ipairs Ab { base: Reg, count: u8 }
 
@@ -2329,15 +2343,20 @@ mod tests {
         assert_eq!(i.op(), Op::GETFIELD);
         assert_eq!(i.abde(), (4, 5, 600, 700));
 
-        let i = Instruction::jmp(-9);
+        let i = Instruction::jmp(Offset(-9));
         assert_eq!(i.op(), Op::JMP);
-        assert_eq!(i.imm(), -9);
+        assert_eq!(i.branch_offset(), -9);
 
-        let i = Instruction::forloop(Reg(2), i32::MIN);
-        assert_eq!(i.a_imm(), (2, i32::MIN));
+        let i = Instruction::forloop(Reg(2), Offset(-(1 << 23)));
+        assert_eq!(i.a_offset(), (2, -(1 << 23)));
 
-        let i = Instruction::jeq(Reg(7), Reg(8), -3);
-        assert_eq!(i.ab_imm(), (7, 8, -3));
+        let i = Instruction::jeq(Reg(7), Reg(8), Offset(-3));
+        assert_eq!(i.ab_offset(), (7, 8, -3));
+        let mut i = Instruction::jeq(Reg(7), Reg(8), Offset(0));
+        assert!(i.set_branch_offset((1 << 23) - 1));
+        assert_eq!(i.ab_offset(), (7, 8, (1 << 23) - 1));
+        assert!(!i.set_branch_offset(-(1 << 23) - 1));
+        assert_eq!(i.with_adaptive(1, false).ab_offset(), (7, 8, (1 << 23) - 1));
 
         let i = Instruction::self_(Reg(1), Reg(2), IcIdx(4), KIdx(3));
         assert_eq!(i.abde(), (1, 2, 4, 3));
@@ -2355,9 +2374,9 @@ mod tests {
 
         let k = CmpImm::from_int(-7).unwrap();
         // An `AhImm` offset is 24 bits.
-        let i = Instruction::jlti(Reg(3), k, -(1 << 23));
+        let i = Instruction::jlti(Reg(3), k, Offset(-(1 << 23)));
         assert_eq!(i.ah_imm(), (3, k.0, -(1 << 23)));
-        let mut i = Instruction::jlti(Reg(3), k, 5);
+        let mut i = Instruction::jlti(Reg(3), k, Offset(5));
         assert!(i.set_branch_offset((1 << 23) - 1));
         assert_eq!(i.ah_imm(), (3, k.0, (1 << 23) - 1));
         assert!(!i.set_branch_offset(1 << 23));
@@ -2366,7 +2385,7 @@ mod tests {
         assert_eq!(i.cmp_imm(), k);
         assert_eq!(i.cmp_imm_int(), -7);
 
-        let i = Instruction::jeqs(Reg(3), KIdx(u16::MAX), 5);
+        let i = Instruction::jeqs(Reg(3), KIdx(u16::MAX), Offset(5));
         assert_eq!(i.ah_imm(), (3, u16::MAX, 5));
     }
 
@@ -2375,10 +2394,10 @@ mod tests {
         for n in [CmpImm::MIN, -1, 0, 1, CmpImm::MAX] {
             let k = CmpImm::from_int(n).unwrap();
             assert_eq!((k.int(), k.is_float()), (n, false));
-            assert_eq!(Instruction::jeqi(Reg(0), k, -1).cmp_imm_int(), n);
+            assert_eq!(Instruction::jeqi(Reg(0), k, Offset(-1)).cmp_imm_int(), n);
             let k = CmpImm::from_float(n as f64).unwrap();
             assert_eq!((k.int(), k.is_float()), (n, true));
-            assert_eq!(Instruction::jeqi(Reg(0), k, -1).cmp_imm_int(), n);
+            assert_eq!(Instruction::jeqi(Reg(0), k, Offset(-1)).cmp_imm_int(), n);
         }
         assert!(CmpImm::from_int(CmpImm::MAX + 1).is_none());
         assert!(CmpImm::from_int(CmpImm::MIN - 1).is_none());
@@ -2418,9 +2437,9 @@ mod tests {
         assert_eq!(i.abc(), (9, 2, 3));
         assert_eq!(i.op(), Op::ADD);
 
-        let mut i = Instruction::jmp(5);
-        i.set_imm(-1);
-        assert_eq!(i.imm(), -1);
+        let mut i = Instruction::jmp(Offset(5));
+        assert!(i.set_branch_offset(-1));
+        assert_eq!(i.branch_offset(), -1);
         assert_eq!(i.op(), Op::JMP);
 
         let mut i = Instruction::getfield(Reg(1), Reg(2), IcIdx(3), KIdx(4));
