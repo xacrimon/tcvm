@@ -12,6 +12,7 @@ use crate::env::value::Value;
 use crate::instruction::{Instruction, Op};
 use crate::lua::Context;
 use crate::vm::abi::{Slot, handler};
+use crate::vm::ops::family;
 use crate::vm::ops::meta::{
     IndexChain, NewIndexChain, ret_discard, ret_store_a, stage_mm, walk_index_chain,
     walk_newindex_chain,
@@ -25,7 +26,7 @@ use crate::vm::unwind::OpError;
 
 /// The IC entry of the current site.
 #[inline(always)]
-fn read_ic<'gc>(closure: LuaFn<'gc>, ic_idx: u16) -> InlineCache<'gc> {
+pub(crate) fn read_ic<'gc>(closure: LuaFn<'gc>, ic_idx: u16) -> InlineCache<'gc> {
     debug_assert!((ic_idx as usize) < closure.proto.ic_table.len());
     unsafe { (*closure.ic_table.add(ic_idx as usize)).get() }
 }
@@ -464,6 +465,34 @@ macro_rules! receiver {
     };
 }
 
+family! {
+    get GET_ROWS, slow = get_slow;
+    GETFIELD_INL = getfield_inl (reg, Inl, false),
+    GETFIELD_AUX = getfield_aux (reg, Aux, false),
+    GETFIELD_ABSENT = getfield_absent (reg, Absent, false),
+    GETFIELD_PROTO = getfield_proto (reg, Proto, false),
+    GETTABUP_INL = gettabup_inl (upval, Inl, false),
+    GETTABUP_AUX = gettabup_aux (upval, Aux, false),
+    GETTABUP_ABSENT = gettabup_absent (upval, Absent, false),
+    GETTABUP_PROTO = gettabup_proto (upval, Proto, false),
+    SELF_INL = self_inl (reg, Inl, true),
+    SELF_AUX = self_aux (reg, Aux, true),
+    SELF_ABSENT = self_absent (reg, Absent, true),
+    SELF_PROTO = self_proto (reg, Proto, true),
+}
+
+family! {
+    set SET_ROWS, slow = set_slow;
+    SETFIELD_INL = setfield_inl (reg, Inl),
+    SETFIELD_AUX = setfield_aux (reg, Aux),
+    SETFIELD_TRANS = setfield_trans (reg, Trans),
+    SETFIELD_ABSENT = setfield_absent (reg, Absent),
+    SETTABUP_INL = settabup_inl (upval, Inl),
+    SETTABUP_AUX = settabup_aux (upval, Aux),
+    SETTABUP_TRANS = settabup_trans (upval, Trans),
+    SETTABUP_ABSENT = settabup_absent (upval, Absent),
+}
+
 /// The shared-cell upvalue read (`GETTABUP_REF`, never specialized):
 /// `R[a] = recv[K[e]]` through the IC, whatever its entry.
 macro_rules! get_generic {
@@ -514,237 +543,6 @@ macro_rules! set_generic {
 }
 
 set_generic!(op_settabup_ref, cell);
-
-/// A constant-key read form: the receiver `$recv` names, its cache
-/// entry of the kind the form was written for, and with `$self_` the
-/// receiver also stored for SELF. Any miss goes to `get_slow`, the generic
-/// handler, which refills the entry and rewrites the site.
-macro_rules! get_form {
-    ($name:ident, $recv:ident, $kind:ident, $self_:literal) => {
-        handler! {
-            bind(insn, pc, base, rt, closure, thread, nret, values);
-            op fn $name {
-                let (dst, b, ic_idx, _) = insn.abde();
-                let recv_val = receiver!($recv, b);
-                let Some(t) = recv_val.get_table() else {
-                    tail!(get_slow)
-                };
-                let cache = read_ic(closure, ic_idx);
-                let v = get_form!(@load $kind, cache, t, recv_val, insn, dst, $self_);
-                if $self_ {
-                    reg![dst + 4] = recv_val;
-                }
-                reg![dst] = v;
-                next!()
-            }
-        }
-    };
-    // Own and Absent entries only change through `fill_ic`, which rewrites
-    // the site, so the form implies the entry's kind; the collector may
-    // empty a ProtoLoad one, so that kind is checked.
-    (@load Inl, $cache:expr, $t:ident, $recv:ident, $insn:ident, $dst:ident, $self_:literal) => {{
-        let InlineCache::Own { shape, loc } = $cache else {
-            unsafe { std::hint::unreachable_unchecked() }
-        };
-        if !Shape::ptr_eq($t.shape(), shape) {
-            tail!(get_slow)
-        }
-        let v = unsafe { $t.load_inline(loc) };
-        // A nil own slot answers unless the metatable gained `__index`.
-        if v.is_nil() && shape.has_mm(MetamethodBits::INDEX) {
-            tail!(get_slow)
-        }
-        v
-    }};
-    (@load Aux, $cache:expr, $t:ident, $recv:ident, $insn:ident, $dst:ident, $self_:literal) => {{
-        let InlineCache::Own { shape, loc } = $cache else {
-            unsafe { std::hint::unreachable_unchecked() }
-        };
-        let state = $t.inner().borrow();
-        if !Shape::ptr_eq(state.shape(), shape) {
-            drop(state);
-            tail!(get_slow)
-        }
-        let v = unsafe { $t.load_aux(&state, loc) };
-        drop(state);
-        if v.is_nil() && shape.has_mm(MetamethodBits::INDEX) {
-            tail!(get_slow)
-        }
-        v
-    }};
-    (@load Absent, $cache:expr, $t:ident, $recv:ident, $insn:ident, $dst:ident, $self_:literal) => {{
-        let InlineCache::Absent { shape } = $cache else {
-            unsafe { std::hint::unreachable_unchecked() }
-        };
-        if !Shape::ptr_eq($t.shape(), shape) {
-            tail!(get_slow)
-        }
-        if shape.has_mm(MetamethodBits::INDEX) {
-            // An `__index` function is called from here, as `get_slow` would.
-            if let Some(mt) = shape.mt_cache()
-                && let index = mt.mm(MetamethodBits::INDEX)
-                && index.get_function().is_some()
-            {
-                if $self_ {
-                    reg![$dst + 4] = $recv;
-                }
-                call_mm!(ret_store_a, index, [$recv, k![$insn.e()]])
-            }
-            tail!(get_slow)
-        }
-        Value::nil()
-    }};
-    (@load Proto, $cache:expr, $t:ident, $recv:ident, $insn:ident, $dst:ident, $self_:literal) => {{
-        let InlineCache::ProtoLoad {
-            recv,
-            holder,
-            holder_shape,
-            loc,
-        } = $cache
-        else {
-            tail!(get_slow)
-        };
-        let live = $t.shape();
-        if !Shape::ptr_eq(live, recv) {
-            tail!(get_slow)
-        }
-        // `recv` was filled with a metatable whose `__index` was `holder`.
-        let mt = unsafe { live.mt_cache().unwrap_unchecked() };
-        if mt.index_table() != holder.as_ptr() as usize {
-            tail!(get_slow)
-        }
-        // SAFETY: `__index` is still `holder`, so the receiver keeps it alive.
-        let holder = Table::from_inner(unsafe { Gc::from_ptr(holder.as_ptr()) });
-        let h = holder.inner().borrow();
-        if !Shape::ptr_eq(h.shape(), holder_shape) {
-            drop(h);
-            tail!(get_slow)
-        }
-        let v = unsafe { holder.load(&h, loc) };
-        drop(h);
-        // A nil slot means the walk goes on past `holder`.
-        if v.is_nil() {
-            tail!(get_slow)
-        }
-        v
-    }};
-}
-
-get_form!(getfield_inl, reg, Inl, false);
-get_form!(getfield_aux, reg, Aux, false);
-get_form!(getfield_absent, reg, Absent, false);
-get_form!(getfield_proto, reg, Proto, false);
-get_form!(gettabup_inl, upval, Inl, false);
-get_form!(gettabup_aux, upval, Aux, false);
-get_form!(gettabup_absent, upval, Absent, false);
-get_form!(gettabup_proto, upval, Proto, false);
-get_form!(self_inl, reg, Inl, true);
-get_form!(self_aux, reg, Aux, true);
-get_form!(self_absent, reg, Absent, true);
-get_form!(self_proto, reg, Proto, true);
-
-/// A constant-key write form, as [`get_form!`]: `$kind` is `Inl`, `Aux`,
-/// `Trans` or `Absent`. The barrier is the retry form, so the
-/// handlers need no stack frame.
-macro_rules! set_form {
-    ($name:ident, $recv:ident, $kind:ident) => {
-        handler! {
-            bind(insn, pc, base, rt, closure, thread, nret, values);
-            op fn $name {
-                let (src, b, ic_idx, _) = insn.abde();
-                let recv_val = receiver!($recv, b);
-                let Some(t) = recv_val.get_table() else {
-                    tail!(set_slow)
-                };
-                let cache = read_ic(closure, ic_idx);
-                set_form!(@store $kind, insn, cache, t, recv_val, src);
-                next!()
-            }
-        }
-    };
-    (@store Inl, $insn:ident, $cache:ident, $t:ident, $recv:ident, $src:ident) => {
-        let InlineCache::Own { shape, loc } = $cache else {
-            unsafe { std::hint::unreachable_unchecked() }
-        };
-        if !Shape::ptr_eq($t.shape(), shape) {
-            tail!(set_slow)
-        }
-        // `__newindex` fires only on currently-nil keys.
-        let existing = unsafe { $t.load_inline(loc) };
-        if existing.is_nil() && shape.has_mm(MetamethodBits::NEWINDEX) {
-            tail!(set_slow)
-        }
-        barrier!($t.inner());
-        unsafe { $t.store_inline(loc, reg![$src]) };
-    };
-    (@store Aux, $insn:ident, $cache:ident, $t:ident, $recv:ident, $src:ident) => {
-        let InlineCache::Own { shape, loc } = $cache else {
-            unsafe { std::hint::unreachable_unchecked() }
-        };
-        let state = $t.inner().borrow();
-        if !Shape::ptr_eq(state.shape(), shape) {
-            drop(state);
-            tail!(set_slow)
-        }
-        let slot = unsafe { state.aux_slot(loc) };
-        drop(state);
-        let existing = unsafe { *slot };
-        if existing.is_nil() && shape.has_mm(MetamethodBits::NEWINDEX) {
-            tail!(set_slow)
-        }
-        barrier!($t.inner());
-        // SAFETY: the shape still matched, so the spill cell holds `loc`.
-        unsafe { *slot = reg![$src] };
-    };
-    (@store Trans, $insn:ident, $cache:ident, $t:ident, $recv:ident, $src:ident) => {
-        let InlineCache::Transition { from, to, loc } = $cache else {
-            unsafe { std::hint::unreachable_unchecked() }
-        };
-        let state = $t.inner().borrow();
-        if !Shape::ptr_eq(state.shape(), from) || from.has_mm(MetamethodBits::NEWINDEX) {
-            drop(state);
-            tail!(set_slow)
-        }
-        let v = reg![$src];
-        // Storing nil to an absent key adds nothing.
-        if v.is_nil() {
-            drop(state);
-            next!()
-        }
-        if !state.has_room(loc) {
-            drop(state);
-            tail!(set_slow)
-        }
-        drop(state);
-        barrier!($t.inner());
-        let mut state = unsafe { $t.borrow_mut_barriered() };
-        // SAFETY: the live shape is `from`, and there is room.
-        unsafe { $t.push(&mut state, to, loc, v) };
-        drop(state);
-    };
-    (@store Absent, $insn:ident, $cache:ident, $t:ident, $recv:ident, $src:ident) => {
-        // Filled for a shape with `__newindex`, which a function may answer
-        // from here.
-        if let InlineCache::Absent { shape } = $cache
-            && Shape::ptr_eq($t.shape(), shape)
-            && let Some(mt) = shape.mt_cache()
-            && let newindex = mt.mm(MetamethodBits::NEWINDEX)
-            && newindex.get_function().is_some()
-        {
-            call_mm!(ret_discard, newindex, [$recv, k![$insn.e()], reg![$src]])
-        }
-        tail!(set_slow)
-    };
-}
-
-set_form!(setfield_inl, reg, Inl);
-set_form!(setfield_aux, reg, Aux);
-set_form!(setfield_trans, reg, Trans);
-set_form!(setfield_absent, reg, Absent);
-set_form!(settabup_inl, upval, Inl);
-set_form!(settabup_aux, upval, Aux);
-set_form!(settabup_trans, upval, Trans);
-set_form!(settabup_absent, upval, Absent);
 
 handler! {
     bind(insn, pc, base, rt, closure, thread, nret, values);

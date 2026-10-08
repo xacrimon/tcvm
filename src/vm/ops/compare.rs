@@ -10,6 +10,7 @@ use crate::instruction::{ADAPTIVE_AB_IMM, ADAPTIVE_AH_IMM, Instruction, Op};
 use crate::vm::abi::{Slot, handler};
 use crate::vm::num;
 use crate::vm::ops::arith::specialize;
+use crate::vm::ops::family;
 
 /// Whether a compare site's word is locked (its adaptive bits at `$shift`).
 macro_rules! locked {
@@ -32,6 +33,28 @@ macro_rules! adapt {
 }
 use crate::vm::ops::meta::{binop_metamethod, ret_cond_f, ret_cond_t, stage_mm};
 use crate::vm::unwind::OpError;
+
+family! {
+    branch II_ROWS;
+    JLT_II = op_jlt_ii (Value::both_small, op_jlt, true) |x, y| x < y,
+    JNLT_II = op_jnlt_ii (Value::both_small, op_jnlt, false) |x, y| x < y,
+    JLE_II = op_jle_ii (Value::both_small, op_jle, true) |x, y| x <= y,
+    JNLE_II = op_jnle_ii (Value::both_small, op_jnle, false) |x, y| x <= y,
+    JEQ_II = op_jeq_ii (Value::both_small, op_jeq, true) |x, y| x == y,
+    JNEQ_II = op_jneq_ii (Value::both_small, op_jneq, false) |x, y| x == y,
+}
+
+family! {
+    branch_imm F_ROWS;
+    JLTI_F = op_jlti_f (false, op_jlti, true) |x, y| x < y,
+    JNLTI_F = op_jnlti_f (false, op_jnlti, false) |x, y| x < y,
+    JLEI_F = op_jlei_f (false, op_jlei, true) |x, y| x <= y,
+    JNLEI_F = op_jnlei_f (false, op_jnlei, false) |x, y| x <= y,
+    JGTI_F = op_jgti_f (true, op_jgti, true) |x, y| x < y,
+    JNGTI_F = op_jngti_f (true, op_jngti, false) |x, y| x < y,
+    JGEI_F = op_jgei_f (true, op_jgei, true) |x, y| x <= y,
+    JNGEI_F = op_jngei_f (true, op_jngei, false) |x, y| x <= y,
+}
 
 /// JEQ/JNEQ: jump when `(R[a] == R[b]) == $k`. Two small integers
 /// specialize the site to `$ii`.
@@ -62,24 +85,6 @@ macro_rules! eq_handler {
 
 eq_handler!(op_jeq, JEQ, true, JEQ_II);
 eq_handler!(op_jneq, JNEQ, false, JNEQ_II);
-
-/// `JEQ_II`/`JNEQ_II`: both small, else the generic.
-macro_rules! eq_ii_handler {
-    ($name:ident, $k:literal, $generic:ident) => {
-        handler! {
-            bind(insn, pc, base, rt, closure, thread, nret, values);
-            op fn $name {
-                let Some((x, y)) = Value::both_small(&reg![insn.a()], &reg![insn.b()]) else {
-                    tail!($generic)
-                };
-                branch!((x == y) == $k, insn.branch_offset())
-            }
-        }
-    };
-}
-
-eq_ii_handler!(op_jeq_ii, true, op_jeq);
-eq_ii_handler!(op_jneq_ii, false, op_jneq);
 
 /// JLT/JNLT/JLE/JNLE: jump when `(R[a] <op> R[b]) == $k`. Two floats here;
 /// two small integers specialize the site to `$ii`; a float and a small
@@ -124,26 +129,6 @@ cmp_handler!(op_jlt, JLT, <, true, JLT_II);
 cmp_handler!(op_jnlt, JNLT, <, false, JNLT_II);
 cmp_handler!(op_jle, JLE, <=, true, JLE_II);
 cmp_handler!(op_jnle, JNLE, <=, false, JNLE_II);
-
-/// `JLT_II` and friends: both small, else the generic.
-macro_rules! cmp_ii_handler {
-    ($name:ident, $op:tt, $k:literal, $generic:ident) => {
-        handler! {
-            bind(insn, pc, base, rt, closure, thread, nret, values);
-            op fn $name {
-                let Some((x, y)) = Value::both_small(&reg![insn.a()], &reg![insn.b()]) else {
-                    tail!($generic)
-                };
-                branch!((x $op y) == $k, insn.branch_offset())
-            }
-        }
-    };
-}
-
-cmp_ii_handler!(op_jlt_ii, <, true, op_jlt);
-cmp_ii_handler!(op_jnlt_ii, <, false, op_jnlt);
-cmp_ii_handler!(op_jle_ii, <=, true, op_jle);
-cmp_ii_handler!(op_jnle_ii, <=, false, op_jnle);
 
 /// The immediate ordered compares: jump when `(R[a] <cmp> imm) == $k`, `<`
 /// if `$lt` else `<=`, with the immediate on the left if `$swap`. A float
@@ -190,36 +175,6 @@ cmp_imm_handler!(op_jgti, JGTI, true, true, true, JGTI_F);
 cmp_imm_handler!(op_jngti, JNGTI, false, true, true, JNGTI_F);
 cmp_imm_handler!(op_jgei, JGEI, true, false, true, JGEI_F);
 cmp_imm_handler!(op_jngei, JNGEI, false, false, true, JNGEI_F);
-
-/// `JLTI_F` and friends: a float register against the immediate converted
-/// with one `scvtf`, else the generic.
-macro_rules! cmp_imm_f_handler {
-    ($name:ident, $k:literal, $lt:literal, $swap:literal, $generic:ident) => {
-        handler! {
-            bind(insn, pc, base, rt, closure, thread, nret, values);
-            op fn $name {
-                let v = &reg![insn.a()];
-                if !v.is_float() {
-                    tail!($generic)
-                }
-                let f = v.read_float();
-                let k = insn.cmp_imm_int() as f64;
-                let (x, y) = if $swap { (k, f) } else { (f, k) };
-                let r = if $lt { x < y } else { x <= y };
-                branch!(r == $k, insn.branch_offset())
-            }
-        }
-    };
-}
-
-cmp_imm_f_handler!(op_jlti_f, true, true, false, op_jlti);
-cmp_imm_f_handler!(op_jnlti_f, false, true, false, op_jnlti);
-cmp_imm_f_handler!(op_jlei_f, true, false, false, op_jlei);
-cmp_imm_f_handler!(op_jnlei_f, false, false, false, op_jnlei);
-cmp_imm_f_handler!(op_jgti_f, true, true, true, op_jgti);
-cmp_imm_f_handler!(op_jngti_f, false, true, true, op_jngti);
-cmp_imm_f_handler!(op_jgei_f, true, false, true, op_jgei);
-cmp_imm_f_handler!(op_jngei_f, false, false, true, op_jngei);
 
 /// JEQI/JNEQI: jump when `(R[a] == imm) == $k`. Never `__eq`: the immediate
 /// is a number.
