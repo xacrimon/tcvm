@@ -578,18 +578,22 @@ impl<'gc, 'a> Stack<'gc, 'a> {
     /// `NativeOut::call_then`: the callee, the three slots its header takes
     /// (nil until `enter` writes them, so the tracer sees values), the
     /// arguments; `top` ends after them.
+    #[inline]
     pub(crate) fn stage(&mut self, at: usize, f: Value<'gc>, args: &[Value<'gc>]) {
         const HIDDEN: usize = crate::vm::frame::HDR - 1;
         let callee = self.bottom + at;
         let end = callee + 1 + HIDDEN + args.len();
         self.thread.ensure_slots(end);
-        let s = &mut self.thread.stack;
-        s[callee] = f;
-        for i in 1..=HIDDEN {
-            s[callee + i] = Value::nil();
-        }
-        for (i, v) in args.iter().enumerate() {
-            s[callee + 1 + HIDDEN + i] = *v;
+        // One growth check, then plain stores: indexed ones re-check the
+        // bounds and reload the base for every slot.
+        // SAFETY: `callee .. end` is inside the stack after the growth.
+        unsafe {
+            let p = self.thread.stack.as_mut_ptr().add(callee);
+            p.write(f);
+            for i in 1..=HIDDEN {
+                p.add(i).write(Value::nil());
+            }
+            crate::vm::frame::copy_values(p.add(1 + HIDDEN), args.as_ptr(), args.len());
         }
         self.thread.top = end;
     }

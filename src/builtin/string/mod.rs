@@ -893,14 +893,12 @@ fn gsub_drive<'gc>(
                 let call = if let Some(f) = repl.get_function() {
                     // Every capture is an argument.
                     let n = ms.num_captures(true);
-                    // In frame layout: the callee's header slots after it.
-                    let mut call = Vec::with_capacity(n + 4);
-                    call.extend([Value::function(f), Value::nil(), Value::nil(), Value::nil()]);
+                    let mut args = Vec::with_capacity(n);
                     for i in 0..n {
                         let cv = ms.get_onecapture(i, pos, e).map_err(|e| pat_err(ctx, e))?;
-                        call.push(cap_to_value(ctx, src, cv));
+                        args.push(cap_to_value(ctx, src, cv));
                     }
-                    Some(call)
+                    Some((Value::function(f), args))
                 } else {
                     // A table is indexed by the first capture, through
                     // `__index`.
@@ -920,14 +918,9 @@ fn gsub_drive<'gc>(
                             }
                             None
                         }
-                        IndexChain::Invoke { func, receiver } => Some(vec![
-                            Value::function(func),
-                            Value::nil(),
-                            Value::nil(),
-                            Value::nil(),
-                            receiver,
-                            key,
-                        ]),
+                        IndexChain::Invoke { func, receiver } => {
+                            Some((Value::function(func), vec![receiver, key]))
+                        }
                         IndexChain::NotIndexable(v) => {
                             let msg = format!("attempt to index a {} value", v.type_name());
                             return NativeOut::error(Error::from_str(ctx, &msg));
@@ -938,15 +931,14 @@ fn gsub_drive<'gc>(
                         }
                     }
                 };
-                if let Some(call) = call {
+                if let Some((f, args)) = call {
                     let _ = buf.with_data::<RefCell<Vec<u8>>, _>(|b| b.replace(out));
                     let slots = stack.as_mut_slice();
                     slots[G_POS] = Value::integer(mc, pos as i64);
                     slots[G_LAST] = Value::integer(mc, last.map_or(-1, |l| l as i64));
                     slots[G_COUNT] = Value::integer(mc, count);
                     slots[G_E] = Value::integer(mc, e as i64);
-                    stack.truncate(G_AT);
-                    stack.extend(call);
+                    stack.stage(G_AT, f, &args);
                     return NativeOut::call_then(G_AT, cont::GSUB, Protect::No, OnOk::Cont);
                 }
                 pos = e;
