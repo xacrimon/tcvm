@@ -9,11 +9,12 @@ use crate::instruction::{ArithKind, Family, Instruction, MISSES_TO_LOCK, Op};
 use crate::vm::abi::{Slot, handler, handler_bits};
 use crate::vm::frame::{self, HDR};
 use crate::vm::num::{self, ArithOp, BitOp};
+use crate::vm::ops::family;
 use crate::vm::ops::meta::{ret_store_a, stage_mm};
 use crate::vm::unwind::OpError;
 
 /// What a form stores, or that the operation left its fast case.
-enum Out<'gc> {
+pub(crate) enum Out<'gc> {
     Value(Value<'gc>),
     /// A hardware result of canonical operands: stored unchecked.
     Float(f64),
@@ -23,7 +24,7 @@ enum Out<'gc> {
 }
 
 #[inline(always)]
-fn val(v: Option<Value<'_>>) -> Out<'_> {
+pub(crate) fn val(v: Option<Value<'_>>) -> Out<'_> {
     match v {
         Some(v) => Out::Value(v),
         None => Out::Miss,
@@ -33,69 +34,6 @@ fn val(v: Option<Value<'_>>) -> Out<'_> {
 #[inline(always)]
 fn float_small(l: &Value<'_>, r: &Value<'_>) -> Option<(f64, i32)> {
     Value::small_float(r, l).map(|(i, f)| (f, i))
-}
-
-/// A register form: `$guard` binds `R[b]` and `R[c]` as the kinds the form
-/// is for in one branch; `$body` computes the [`Out`]. The guard's failure
-/// and a `Miss` go to the generic handler.
-macro_rules! reg_form {
-    ($name:ident, $guard:expr, |$l:ident, $r:ident| $body:expr) => {
-        handler! {
-            bind(insn, pc, base, rt, closure, thread, nret, values);
-            op fn $name {
-                let (dst, lhs, rhs) = (insn.a(), insn.b(), insn.c());
-                if let Some(($l, $r)) = $guard(&reg![lhs], &reg![rhs]) {
-                    match $body {
-                        Out::Value(v) => {
-                            reg![dst] = v;
-                            next!()
-                        }
-                        Out::Float(f) => {
-                            reg![dst].write_float_unchecked(f);
-                            next!()
-                        }
-                        Out::FloatChecked(f) => {
-                            reg![dst].write_float(f);
-                            next!()
-                        }
-                        Out::Miss => {}
-                    }
-                }
-                tail!(arith_generic)
-            }
-        }
-    };
-}
-
-/// An immediate form: `$guard` binds `R[b]` and the immediate, in source
-/// order (`$reversed` puts the immediate first).
-macro_rules! imm_form {
-    ($name:ident, $guard:ident, $reversed:expr, |$l:ident, $r:ident| $body:expr) => {
-        handler! {
-            bind(insn, pc, base, rt, closure, thread, nret, values);
-            op fn $name {
-                let (dst, src) = (insn.a(), insn.b());
-                if let Some(($l, $r)) = $guard(&reg![src], insn, $reversed) {
-                    match $body {
-                        Out::Value(v) => {
-                            reg![dst] = v;
-                            next!()
-                        }
-                        Out::Float(f) => {
-                            reg![dst].write_float_unchecked(f);
-                            next!()
-                        }
-                        Out::FloatChecked(f) => {
-                            reg![dst].write_float(f);
-                            next!()
-                        }
-                        Out::Miss => {}
-                    }
-                }
-                tail!(arith_generic)
-            }
-        }
-    };
 }
 
 /// The immediate as a float, whichever kind it is.
@@ -156,89 +94,6 @@ fn immbit_i(v: &Value<'_>, insn: Instruction, reversed: bool) -> Option<(i32, i3
     Some(if reversed { (k, i) } else { (i, k) })
 }
 
-reg_form!(op_add_ii, Value::both_small, |l, r| val(num::Add::small(
-    l, r
-)));
-reg_form!(op_sub_ii, Value::both_small, |l, r| val(num::Sub::small(
-    l, r
-)));
-reg_form!(op_mul_ii, Value::both_small, |l, r| val(num::Mul::small(
-    l, r
-)));
-reg_form!(op_mod_ii, Value::both_small, |l, r| val(num::Mod::small(
-    l, r
-)));
-reg_form!(op_idiv_ii, Value::both_small, |l, r| val(num::IDiv::small(
-    l, r
-)));
-reg_form!(op_div_ii, Value::both_small, |l, r| Out::Float(
-    num::Div::float_raw(l as f64, r as f64)
-));
-reg_form!(op_pow_ii, Value::both_small, |l, r| Out::FloatChecked(
-    num::Pow::float_raw(l as f64, r as f64)
-));
-reg_form!(op_add_ff, Value::both_float, |l, r| Out::Float(
-    num::Add::float_raw(l, r)
-));
-reg_form!(op_sub_ff, Value::both_float, |l, r| Out::Float(
-    num::Sub::float_raw(l, r)
-));
-reg_form!(op_mul_ff, Value::both_float, |l, r| Out::Float(
-    num::Mul::float_raw(l, r)
-));
-reg_form!(op_mod_ff, Value::both_float, |l, r| Out::FloatChecked(
-    num::Mod::float_raw(l, r)
-));
-reg_form!(op_pow_ff, Value::both_float, |l, r| Out::FloatChecked(
-    num::Pow::float_raw(l, r)
-));
-reg_form!(op_div_ff, Value::both_float, |l, r| Out::Float(
-    num::Div::float_raw(l, r)
-));
-reg_form!(op_idiv_ff, Value::both_float, |l, r| Out::Float(
-    num::IDiv::float_raw(l, r)
-));
-reg_form!(op_add_if, Value::small_float, |l, r| Out::Float(
-    num::Add::float_raw(l as f64, r)
-));
-reg_form!(op_sub_if, Value::small_float, |l, r| Out::Float(
-    num::Sub::float_raw(l as f64, r)
-));
-reg_form!(op_mul_if, Value::small_float, |l, r| Out::Float(
-    num::Mul::float_raw(l as f64, r)
-));
-reg_form!(op_div_if, Value::small_float, |l, r| Out::Float(
-    num::Div::float_raw(l as f64, r)
-));
-reg_form!(op_add_fi, float_small, |l, r| Out::Float(
-    num::Add::float_raw(l, r as f64)
-));
-reg_form!(op_sub_fi, float_small, |l, r| Out::Float(
-    num::Sub::float_raw(l, r as f64)
-));
-reg_form!(op_mul_fi, float_small, |l, r| Out::Float(
-    num::Mul::float_raw(l, r as f64)
-));
-reg_form!(op_div_fi, float_small, |l, r| Out::Float(
-    num::Div::float_raw(l, r as f64)
-));
-/// Any inline numbers (`_NN`): the form of a site whose kinds keep changing.
-macro_rules! nn_form {
-    ($name:ident, $k:ty, $store:ident) => {
-        reg_form!($name, nn_guard, |l, r| {
-            if let Some((li, ri)) = Value::both_small(l, r) {
-                val(<$k as ArithOp>::small(li, ri))
-            } else if let Some(lf) = small_or_float(l)
-                && let Some(rf) = small_or_float(r)
-            {
-                Out::$store(<$k as ArithOp>::float_raw(lf, rf))
-            } else {
-                Out::Miss
-            }
-        });
-    };
-}
-
 #[inline(always)]
 fn nn_guard<'a, 'gc>(
     l: &'a Value<'gc>,
@@ -247,99 +102,91 @@ fn nn_guard<'a, 'gc>(
     Some((l, r))
 }
 
-nn_form!(op_add_nn, num::Add, Float);
-nn_form!(op_sub_nn, num::Sub, Float);
-nn_form!(op_mul_nn, num::Mul, Float);
-nn_form!(op_mod_nn, num::Mod, FloatChecked);
-nn_form!(op_pow_nn, num::Pow, FloatChecked);
-nn_form!(op_div_nn, num::Div, Float);
-nn_form!(op_idiv_nn, num::IDiv, Float);
+/// Any inline numbers (`_NN`): the operation of a site whose kinds keep
+/// changing, as an expression over the guard's `$l`, `$r` (an inline
+/// function here changes LLVM's block layout: the overflow branch flips).
+macro_rules! nn {
+    ($l:ident, $r:ident, $k:ty, $store:ident) => {
+        if let Some((li, ri)) = Value::both_small($l, $r) {
+            val(<$k as ArithOp>::small(li, ri))
+        } else if let Some(lf) = small_or_float($l)
+            && let Some(rf) = small_or_float($r)
+        {
+            Out::$store(<$k as ArithOp>::float_raw(lf, rf))
+        } else {
+            Out::Miss
+        }
+    };
+}
 
-reg_form!(op_band_ii, Value::both_small, |l, r| val(num::BAnd::small(
-    l, r
-)));
-reg_form!(op_bor_ii, Value::both_small, |l, r| val(num::BOr::small(
-    l, r
-)));
-reg_form!(op_bxor_ii, Value::both_small, |l, r| val(num::BXor::small(
-    l, r
-)));
-reg_form!(op_shl_ii, Value::both_small, |l, r| val(num::Shl::small(
-    l, r
-)));
-reg_form!(op_shr_ii, Value::both_small, |l, r| val(num::Shr::small(
-    l, r
-)));
+family! {
+    arith REG_ROWS, generic = arith_generic;
+    ADD_II = op_add_ii (Value::both_small) |l, r| val(num::Add::small( l, r )),
+    SUB_II = op_sub_ii (Value::both_small) |l, r| val(num::Sub::small( l, r )),
+    MUL_II = op_mul_ii (Value::both_small) |l, r| val(num::Mul::small( l, r )),
+    MOD_II = op_mod_ii (Value::both_small) |l, r| val(num::Mod::small( l, r )),
+    IDIV_II = op_idiv_ii (Value::both_small) |l, r| val(num::IDiv::small( l, r )),
+    DIV_II = op_div_ii (Value::both_small) |l, r| Out::Float( num::Div::float_raw(l as f64, r as f64) ),
+    POW_II = op_pow_ii (Value::both_small) |l, r| Out::FloatChecked( num::Pow::float_raw(l as f64, r as f64) ),
+    ADD_FF = op_add_ff (Value::both_float) |l, r| Out::Float( num::Add::float_raw(l, r) ),
+    SUB_FF = op_sub_ff (Value::both_float) |l, r| Out::Float( num::Sub::float_raw(l, r) ),
+    MUL_FF = op_mul_ff (Value::both_float) |l, r| Out::Float( num::Mul::float_raw(l, r) ),
+    MOD_FF = op_mod_ff (Value::both_float) |l, r| Out::FloatChecked( num::Mod::float_raw(l, r) ),
+    POW_FF = op_pow_ff (Value::both_float) |l, r| Out::FloatChecked( num::Pow::float_raw(l, r) ),
+    DIV_FF = op_div_ff (Value::both_float) |l, r| Out::Float( num::Div::float_raw(l, r) ),
+    IDIV_FF = op_idiv_ff (Value::both_float) |l, r| Out::Float( num::IDiv::float_raw(l, r) ),
+    ADD_IF = op_add_if (Value::small_float) |l, r| Out::Float( num::Add::float_raw(l as f64, r) ),
+    SUB_IF = op_sub_if (Value::small_float) |l, r| Out::Float( num::Sub::float_raw(l as f64, r) ),
+    MUL_IF = op_mul_if (Value::small_float) |l, r| Out::Float( num::Mul::float_raw(l as f64, r) ),
+    DIV_IF = op_div_if (Value::small_float) |l, r| Out::Float( num::Div::float_raw(l as f64, r) ),
+    ADD_FI = op_add_fi (float_small) |l, r| Out::Float( num::Add::float_raw(l, r as f64) ),
+    SUB_FI = op_sub_fi (float_small) |l, r| Out::Float( num::Sub::float_raw(l, r as f64) ),
+    MUL_FI = op_mul_fi (float_small) |l, r| Out::Float( num::Mul::float_raw(l, r as f64) ),
+    DIV_FI = op_div_fi (float_small) |l, r| Out::Float( num::Div::float_raw(l, r as f64) ),
+    BAND_II = op_band_ii (Value::both_small) |l, r| val(num::BAnd::small( l, r )),
+    BOR_II = op_bor_ii (Value::both_small) |l, r| val(num::BOr::small( l, r )),
+    BXOR_II = op_bxor_ii (Value::both_small) |l, r| val(num::BXor::small( l, r )),
+    SHL_II = op_shl_ii (Value::both_small) |l, r| val(num::Shl::small( l, r )),
+    SHR_II = op_shr_ii (Value::both_small) |l, r| val(num::Shr::small( l, r )),
+    ADD_NN = op_add_nn (nn_guard) |l, r| nn!(l, r, num::Add, Float),
+    SUB_NN = op_sub_nn (nn_guard) |l, r| nn!(l, r, num::Sub, Float),
+    MUL_NN = op_mul_nn (nn_guard) |l, r| nn!(l, r, num::Mul, Float),
+    MOD_NN = op_mod_nn (nn_guard) |l, r| nn!(l, r, num::Mod, FloatChecked),
+    POW_NN = op_pow_nn (nn_guard) |l, r| nn!(l, r, num::Pow, FloatChecked),
+    DIV_NN = op_div_nn (nn_guard) |l, r| nn!(l, r, num::Div, Float),
+    IDIV_NN = op_idiv_nn (nn_guard) |l, r| nn!(l, r, num::IDiv, Float),
+}
 
-imm_form!(op_addi_i, imm_i, false, |l, r| val(num::Add::small(l, r)));
-imm_form!(op_subi_i, imm_i, false, |l, r| val(num::Sub::small(l, r)));
-imm_form!(op_muli_i, imm_i, false, |l, r| val(num::Mul::small(l, r)));
-imm_form!(op_modi_i, imm_i, false, |l, r| val(num::Mod::small(l, r)));
-imm_form!(op_idivi_i, imm_i, false, |l, r| val(num::IDiv::small(l, r)));
-imm_form!(op_rsubi_i, imm_i, true, |l, r| val(num::Sub::small(l, r)));
-imm_form!(op_addi_f, imm_f, false, |l, r| Out::Float(
-    num::Add::float_raw(l, r)
-));
-imm_form!(op_subi_f, imm_f, false, |l, r| Out::Float(
-    num::Sub::float_raw(l, r)
-));
-imm_form!(op_muli_f, imm_f, false, |l, r| Out::Float(
-    num::Mul::float_raw(l, r)
-));
-imm_form!(op_modi_f, imm_f, false, |l, r| Out::FloatChecked(
-    num::Mod::float_raw(l, r)
-));
-imm_form!(op_idivi_f, imm_f, false, |l, r| Out::Float(
-    num::IDiv::float_raw(l, r)
-));
-imm_form!(op_rsubi_f, imm_f, true, |l, r| Out::Float(
-    num::Sub::float_raw(l, r)
-));
-imm_form!(op_powi_f, imm_f, false, |l, r| Out::FloatChecked(
-    num::Pow::float_raw(l, r)
-));
-imm_form!(op_divi_f, imm_f, false, |l, r| Out::Float(
-    num::Div::float_raw(l, r)
-));
-imm_form!(op_rdivi_f, imm_f, true, |l, r| Out::Float(
-    num::Div::float_raw(l, r)
-));
-imm_form!(op_addi_if, imm_if_float, false, |l, r| Out::Float(
-    num::Add::float_raw(l, r)
-));
-imm_form!(op_subi_if, imm_if_float, false, |l, r| Out::Float(
-    num::Sub::float_raw(l, r)
-));
-imm_form!(op_muli_if, imm_if_float, false, |l, r| Out::Float(
-    num::Mul::float_raw(l, r)
-));
-imm_form!(op_divi_if, imm_if, false, |l, r| Out::Float(
-    num::Div::float_raw(l, r)
-));
-imm_form!(op_rdivi_if, imm_if, true, |l, r| Out::Float(
-    num::Div::float_raw(l, r)
-));
-imm_form!(op_powi_if, imm_if, false, |l, r| Out::FloatChecked(
-    num::Pow::float_raw(l, r)
-));
-imm_form!(op_rpowi_if, imm_if, true, |l, r| Out::FloatChecked(
-    num::Pow::float_raw(l, r)
-));
-imm_form!(op_bandi_i, immbit_i, false, |l, r| val(num::BAnd::small(
-    l, r
-)));
-imm_form!(op_bori_i, immbit_i, false, |l, r| val(num::BOr::small(
-    l, r
-)));
-imm_form!(op_bxori_i, immbit_i, false, |l, r| val(num::BXor::small(
-    l, r
-)));
-imm_form!(op_shli_i, immbit_i, false, |l, r| val(num::Shl::small(
-    l, r
-)));
-imm_form!(op_shri_i, immbit_i, false, |l, r| val(num::Shr::small(
-    l, r
-)));
+family! {
+    imm IMM_ROWS, generic = arith_generic;
+    ADDI_I = op_addi_i (imm_i, false) |l, r| val(num::Add::small(l, r)),
+    SUBI_I = op_subi_i (imm_i, false) |l, r| val(num::Sub::small(l, r)),
+    MULI_I = op_muli_i (imm_i, false) |l, r| val(num::Mul::small(l, r)),
+    MODI_I = op_modi_i (imm_i, false) |l, r| val(num::Mod::small(l, r)),
+    IDIVI_I = op_idivi_i (imm_i, false) |l, r| val(num::IDiv::small(l, r)),
+    RSUBI_I = op_rsubi_i (imm_i, true) |l, r| val(num::Sub::small(l, r)),
+    ADDI_F = op_addi_f (imm_f, false) |l, r| Out::Float( num::Add::float_raw(l, r) ),
+    SUBI_F = op_subi_f (imm_f, false) |l, r| Out::Float( num::Sub::float_raw(l, r) ),
+    MULI_F = op_muli_f (imm_f, false) |l, r| Out::Float( num::Mul::float_raw(l, r) ),
+    MODI_F = op_modi_f (imm_f, false) |l, r| Out::FloatChecked( num::Mod::float_raw(l, r) ),
+    IDIVI_F = op_idivi_f (imm_f, false) |l, r| Out::Float( num::IDiv::float_raw(l, r) ),
+    RSUBI_F = op_rsubi_f (imm_f, true) |l, r| Out::Float( num::Sub::float_raw(l, r) ),
+    POWI_F = op_powi_f (imm_f, false) |l, r| Out::FloatChecked( num::Pow::float_raw(l, r) ),
+    DIVI_F = op_divi_f (imm_f, false) |l, r| Out::Float( num::Div::float_raw(l, r) ),
+    RDIVI_F = op_rdivi_f (imm_f, true) |l, r| Out::Float( num::Div::float_raw(l, r) ),
+    ADDI_IF = op_addi_if (imm_if_float, false) |l, r| Out::Float( num::Add::float_raw(l, r) ),
+    SUBI_IF = op_subi_if (imm_if_float, false) |l, r| Out::Float( num::Sub::float_raw(l, r) ),
+    MULI_IF = op_muli_if (imm_if_float, false) |l, r| Out::Float( num::Mul::float_raw(l, r) ),
+    DIVI_IF = op_divi_if (imm_if, false) |l, r| Out::Float( num::Div::float_raw(l, r) ),
+    RDIVI_IF = op_rdivi_if (imm_if, true) |l, r| Out::Float( num::Div::float_raw(l, r) ),
+    POWI_IF = op_powi_if (imm_if, false) |l, r| Out::FloatChecked( num::Pow::float_raw(l, r) ),
+    RPOWI_IF = op_rpowi_if (imm_if, true) |l, r| Out::FloatChecked( num::Pow::float_raw(l, r) ),
+    BANDI_I = op_bandi_i (immbit_i, false) |l, r| val(num::BAnd::small( l, r )),
+    BORI_I = op_bori_i (immbit_i, false) |l, r| val(num::BOr::small( l, r )),
+    BXORI_I = op_bxori_i (immbit_i, false) |l, r| val(num::BXor::small( l, r )),
+    SHLI_I = op_shli_i (immbit_i, false) |l, r| val(num::Shl::small( l, r )),
+    SHRI_I = op_shri_i (immbit_i, false) |l, r| val(num::Shr::small( l, r )),
+}
 
 /// The metamethod of an arithmetic kind.
 const fn kind_mm(kind: ArithKind) -> MetamethodBits {
