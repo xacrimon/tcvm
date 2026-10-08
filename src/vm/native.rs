@@ -10,7 +10,7 @@ use crate::env::value::Value;
 use crate::instruction::{Instruction, Op};
 use crate::lua::Context;
 use crate::vm::abi::{Exit, Jump, Slot, handler, handler_bits};
-use crate::vm::frame::{self, HDR, NativeHdr, copy_values, fill_nil, flag};
+use crate::vm::frame::{self, HDR, NativeHdr, copy_values, copy_values_up, fill_nil, flag};
 use crate::vm::ops::control::close_upvalues;
 
 /// Whether a continuation receives the errors its call raises, instead of
@@ -221,7 +221,6 @@ impl NativeOut {
     /// waits on the host.
     pub(crate) const PENDING: NativeOut = NativeOut(tag::PENDING);
 
-    const PROTECT_SHIFT: u32 = 3;
     const AT_SHIFT: u32 = 48;
     const CONT_SHIFT: u32 = 56;
     const OK_SHIFT: u32 = 62;
@@ -269,14 +268,11 @@ impl NativeOut {
 
     fn packed(tag: u64, at: usize, cont: ContIdx, okk: OnOk, protect: Protect) -> Self {
         debug_assert!(at < 256);
-        let protect = match protect {
-            Protect::No => 0,
-            Protect::Errors => 1,
-            Protect::Handler => 2,
-            Protect::Base => 3,
-        };
+        // Bits 3 and 4 hold the frame flags themselves, so staging needs no
+        // decode; `Base` is `Errors` plus its continuation's identity.
+        const _: () = assert!(flag::PROTECTED | flag::HANDLER == 0x18);
         NativeOut(
-            tag | protect << Self::PROTECT_SHIFT
+            tag | protect.flags()
                 | (at as u64) << Self::AT_SHIFT
                 | (cont.0 as u64) << Self::CONT_SHIFT
                 | (okk.bits() as u64) << Self::OK_SHIFT,
@@ -333,14 +329,10 @@ impl NativeOut {
         (self.0 >> Self::OK_SHIFT) as u8
     }
 
-    #[inline]
-    pub(crate) fn protect(self) -> Protect {
-        match (self.0 >> Self::PROTECT_SHIFT) & 3 {
-            0 => Protect::No,
-            1 => Protect::Errors,
-            2 => Protect::Handler,
-            _ => Protect::Base,
-        }
+    /// The `PROTECTED`/`HANDLER` flags the staged call's frame gets.
+    #[inline(always)]
+    pub(crate) fn protect_flags(self) -> u64 {
+        self.0 & (flag::PROTECTED | flag::HANDLER)
     }
 }
 
@@ -565,28 +557,73 @@ handler! {
     }
 
     /// A native asked for something other than a plain return: `pc` is its
-    /// frame's header, `insn` the `NativeOut`.
+    /// frame's header, `insn` the `NativeOut`. A call is staged here and
+    /// entered directly; the other requests go to `drive`.
     slow fn native_act {
-        let hdr = pc as *mut Value<'gc>;
         let out = NativeOut::from_raw(insn.raw());
         let mut ts: &mut ThreadState<'gc> = thread!();
-        let hdr = ts.slot_index(hdr);
+        let hdr = ts.slot_index(pc as *const Value<'gc>);
+        if std::hint::likely(out.tag() == tag::CALL_THEN) {
+            let nc = unsafe { frame::native_closure(ts.slot_ptr(hdr + HDR)) };
+            let (callee, nargs) = stage_call(ts, hdr, nc, out);
+            tail!(
+                crate::vm::ops::call::enter,
+                pc = callee as *const Instruction,
+                insn = Slot::nret(nargs),
+                base = std::ptr::null_mut()
+            )
+        }
         let j = drive(rt, &mut ts, hdr, out);
         jump!(j)
     }
 
     /// Continuation of a call a native frame made: the results go to
-    /// the frame's window at `at`, then its continuation runs.
+    /// the frame's window at `at`, its continuation runs, and its answer is
+    /// acted on here: a return lands through the frame's own continuation, a
+    /// call is staged and entered, the rest goes to `drive`. The pass-through
+    /// modes are `native_continue`'s.
     cont fn ret_native {
         let win = unsafe { frame::caller_base(base) };
         let mut ts: &mut ThreadState<'gc> = thread!();
         let wi = ts.slot_index(win);
-        let nh = NativeHdr::unpack(unsafe { frame::func_word(win) });
+        let w0 = unsafe { frame::func_word(win) };
+        let nh = NativeHdr::unpack(w0);
         let dst = unsafe { win.add(nh.at) };
         unsafe { copy_values(dst, values, nret) };
-        ts.top = wi + nh.at + nret;
+        // A single store: the continuation reads `top` alone.
+        unsafe { std::ptr::write_volatile(&mut ts.top, wi + nh.at + nret) };
         ts.top_base = win;
-        let j = native_continue(rt, &mut ts, wi);
+        if std::hint::unlikely(nh.ok != ok::CONT) {
+            let j = native_continue(rt, &mut ts, wi);
+            jump!(j)
+        }
+        let nc = unsafe { frame::native_closure_of(w0) };
+        // Errors the continuation itself raises unwind past it.
+        unsafe { frame::clear_flags(win, flag::PROTECTED | flag::HANDLER) };
+        let mut out = cont_fn(nh.cont)(rt, nc, Stack::new(ts, wi), Ok(()));
+        if out.tag() != tag::ERROR && ts.native_overflowed() {
+            out = NativeOut::error(native_overflow(rt));
+        }
+        // The continuation may have grown the stack.
+        let win = ts.slot_ptr(wi);
+        if std::hint::likely(out.is_return()) {
+            if std::hint::unlikely(rt.gc_due()) {
+                return gc_exit(ts, win, nc);
+            }
+            let nret = ts.top - wi;
+            let ret = unsafe { frame::ret(win) };
+            tail!(ret, pc = win as *const Instruction, insn = Slot::nret(nret), base = win)
+        }
+        if std::hint::likely(out.tag() == tag::CALL_THEN) {
+            let (callee, nargs) = stage_call(ts, wi - HDR, nc, out);
+            tail!(
+                crate::vm::ops::call::enter,
+                pc = callee as *const Instruction,
+                insn = Slot::nret(nargs),
+                base = std::ptr::null_mut()
+            )
+        }
+        let j = drive(rt, &mut ts, wi - HDR, out);
         jump!(j)
     }
 
@@ -706,48 +743,50 @@ handler! {
 }
 
 /// Make the native frame at header `hdr` (window `hdr + 4`) wait for the
-/// call at window slot `at`, whose arguments follow it: the frame's word 0
-/// records `at`, `cont` and `ok`, the arguments move up past the hidden slots
-/// (unless `staged` laid them out there) and the callee's header gets
-/// `ret_native`.
+/// call `out` asks for, at window slot `at` with its arguments after it: the
+/// frame's word 0 records `at`, `cont` and `ok`, the arguments move up past
+/// the hidden slots (unless the native laid them out there) and the callee's
+/// header gets `ret_native`. Returns the callee's header and argument count
+/// for `enter`.
+#[inline(always)]
 fn stage_call<'gc>(
     ts: &mut ThreadState<'gc>,
     hdr: usize,
     nc: &NativeClosure<'gc>,
-    at: usize,
-    cont: u8,
-    okk: u8,
-    protect: Protect,
-    staged: bool,
-) -> Jump<'gc> {
+    out: NativeOut,
+) -> (*mut Value<'gc>, usize) {
+    let (at, cont, okk) = (out.at(), out.cont(), out.ok());
     let win = hdr + HDR;
     let callee = win + at;
-    let nargs = if staged {
+    let nargs = if out.staged() {
         ts.top - (callee + HDR)
     } else {
+        // The arguments move up past the hidden slots, highest first.
         let nargs = ts.top - (callee + 1);
         ts.ensure_slots(ts.top + 3);
-        ts.stack.copy_within(callee + 1..ts.top, callee + HDR);
+        let sp = ts.stack.as_mut_ptr();
+        unsafe { copy_values_up(sp.add(callee + HDR), sp.add(callee + 1), nargs) };
         ts.top += 3;
         nargs
     };
-    let win_ptr = ts.slot_ptr(win);
+    let sp = ts.stack.as_mut_ptr();
+    let win_ptr = unsafe { sp.add(win) };
+    // Single stores throughout: `ret_native` and the callee's RETURN read
+    // these words one at a time.
     unsafe {
-        let h = ts.slot_ptr(hdr).cast::<u64>();
-        h.write(NativeHdr { at, cont, ok: okk }.pack(nc));
+        let h = sp.add(hdr).cast::<u64>();
+        h.write_volatile(NativeHdr { at, cont, ok: okk }.pack(nc));
         let rw = h.add(1).read() & !(flag::PROTECTED | flag::HANDLER);
-        h.add(1).write(rw | flag::NATIVE | protect.flags());
-        let c = ts.slot_ptr(callee).cast::<u64>();
-        c.add(1).write(handler_bits(ret_native));
-        c.add(2).write(win_ptr as usize as u64);
-        c.add(3).write(0);
+        h.add(1)
+            .write_volatile(rw | flag::NATIVE | out.protect_flags());
+        let c = sp.add(callee).cast::<u64>();
+        c.add(1).write_volatile(handler_bits(ret_native));
+        c.add(2).write_volatile(win_ptr as usize as u64);
+        c.add(3).write_volatile(0);
     }
-    ts.top_base = win_ptr;
-    Jump::Enter {
-        hdr: ts.slot_ptr(callee),
-        nargs,
-        base: std::ptr::null_mut(),
-    }
+    // Every path here has published the native frame (growth rebases it).
+    debug_assert!(std::ptr::eq(ts.top_base, win_ptr));
+    (unsafe { sp.add(callee) }, nargs)
 }
 
 /// Do what the native of the frame at header `hdr` asked for with `out`.
@@ -792,16 +831,12 @@ pub(crate) fn drive<'gc>(
                 return crate::vm::unwind::unwind(ctx, ts, out.into_error());
             }
             tag::CALL_THEN => {
-                return stage_call(
-                    t,
+                let (hdr, nargs) = stage_call(t, hdr, nc, out);
+                return Jump::Enter {
                     hdr,
-                    nc,
-                    out.at(),
-                    out.cont(),
-                    out.ok(),
-                    out.protect(),
-                    out.staged(),
-                );
+                    nargs,
+                    base: std::ptr::null_mut(),
+                };
             }
             tag::RESUME => {
                 let at = out.at();
