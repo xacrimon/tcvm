@@ -493,56 +493,39 @@ family! {
     SETTABUP_ABSENT = settabup_absent (upval, Absent),
 }
 
-/// The shared-cell upvalue read (`GETTABUP_REF`, never specialized):
-/// `R[a] = recv[K[e]]` through the IC, whatever its entry.
-macro_rules! get_generic {
-    ($name:ident, $recv:ident, $self_:literal) => {
-        handler! {
-            bind(insn, pc, base, rt, closure, thread, nret, values);
-            op fn $name {
-                let (dst, b, ic_idx, _) = insn.abde();
-                let recv_val = receiver!($recv, b);
-                let Some(t) = recv_val.get_table() else {
-                    tail!(get_slow)
-                };
-                let state = t.inner().borrow();
-                if let Some(v) = ic_get(read_ic(closure, ic_idx), t, &state) {
-                    drop(state);
-                    if $self_ {
-                        reg![dst + 4] = recv_val;
-                    }
-                    reg![dst] = v;
-                    next!()
-                }
-                drop(state);
-                tail!(get_slow)
-            }
+handler! {
+    bind(insn, pc, base, rt, closure, thread, nret, values);
+
+    /// The shared-cell upvalue read (`GETTABUP_REF`, never specialized):
+    /// `R[a] = recv[K[e]]` through the IC, whatever its entry.
+    op fn op_gettabup_ref {
+        let (dst, b, ic_idx, _) = insn.abde();
+        let recv_val = receiver!(cell, b);
+        let Some(t) = recv_val.get_table() else {
+            tail!(get_slow)
+        };
+        let state = t.inner().borrow();
+        if let Some(v) = ic_get(read_ic(closure, ic_idx), t, &state) {
+            drop(state);
+            reg![dst] = v;
+            next!()
         }
-    };
-}
+        drop(state);
+        tail!(get_slow)
+    }
 
-get_generic!(op_gettabup_ref, cell, false);
-
-/// The shared-cell upvalue write (`SETTABUP_REF`, never specialized).
-macro_rules! set_generic {
-    ($name:ident, $recv:ident) => {
-        handler! {
-            bind(insn, pc, base, rt, closure, thread, nret, values);
-            op fn $name {
-                let (src, b, ic_idx, _) = insn.abde();
-                let Some(t) = receiver!($recv, b).get_table() else {
-                    tail!(set_slow)
-                };
-                if ic_set(rt, read_ic(closure, ic_idx), t, reg![src]) {
-                    next!()
-                }
-                tail!(set_slow)
-            }
+    /// The shared-cell upvalue write (`SETTABUP_REF`, never specialized).
+    op fn op_settabup_ref {
+        let (src, b, ic_idx, _) = insn.abde();
+        let Some(t) = receiver!(cell, b).get_table() else {
+            tail!(set_slow)
+        };
+        if ic_set(rt, read_ic(closure, ic_idx), t, reg![src]) {
+            next!()
         }
-    };
+        tail!(set_slow)
+    }
 }
-
-set_generic!(op_settabup_ref, cell);
 
 handler! {
     bind(insn, pc, base, rt, closure, thread, nret, values);
