@@ -500,7 +500,7 @@ fn lua_sort<'gc>(
                     while stack.len() < 2 {
                         stack.push(Value::nil());
                     }
-                    stack.extend([mm, v, v]);
+                    stack.stage(2, mm, &[v, v]);
                     return NativeOut::call_then(2, cont::SORT_LEN, Protect::No, OnOk::Cont);
                 }
             }
@@ -729,7 +729,7 @@ fn sort_call<'gc>(
     // In frame layout, so the driver moves nothing.
     stack.extend_from_slice(&[f, Value::nil(), Value::nil(), Value::nil()]);
     stack.extend_from_slice(args);
-    NativeOut::call_then_staged(at, cont::SORT, Protect::No, OnOk::Cont)
+    NativeOut::call_then(at, cont::SORT, Protect::No, OnOk::Cont)
 }
 
 /// The queued reads and writes, in order, each through the metamethod it

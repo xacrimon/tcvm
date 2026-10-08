@@ -71,7 +71,7 @@ fn forward<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> NativeOut {
     let f = stack.get(0);
-    stack.replace(&[f, Value::integer(ctx.mutation(), 41)]);
+    stack.stage(0, f, &[Value::integer(ctx.mutation(), 41)]);
     NativeOut::call_then(0, cont::TEST_RETURNED, Protect::No, OnOk::Return)
 }
 

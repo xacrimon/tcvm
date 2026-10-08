@@ -574,6 +574,43 @@ impl<'gc, 'a> Stack<'gc, 'a> {
         }
     }
 
+    /// Lay the call `f(args..)` out as a frame at window slot `at` for
+    /// `NativeOut::call_then`: the callee, the three slots its header takes
+    /// (nil until `enter` writes them, so the tracer sees values), the
+    /// arguments; `top` ends after them.
+    pub(crate) fn stage(&mut self, at: usize, f: Value<'gc>, args: &[Value<'gc>]) {
+        const HIDDEN: usize = crate::vm::frame::HDR - 1;
+        let callee = self.bottom + at;
+        let end = callee + 1 + HIDDEN + args.len();
+        self.thread.ensure_slots(end);
+        let s = &mut self.thread.stack;
+        s[callee] = f;
+        for i in 1..=HIDDEN {
+            s[callee + i] = Value::nil();
+        }
+        for (i, v) in args.iter().enumerate() {
+            s[callee + 1 + HIDDEN + i] = *v;
+        }
+        self.thread.top = end;
+    }
+
+    /// Open the three header slots after the callee at window slot `at`,
+    /// moving the arguments above it up: the frame layout `stage` writes, for
+    /// a call whose layout the caller handed in (`pcall`'s native fallback,
+    /// an async native's `call`).
+    pub(crate) fn open_hidden(&mut self, at: usize) {
+        const HIDDEN: usize = crate::vm::frame::HDR - 1;
+        let first = self.bottom + at + 1;
+        let top = self.thread.top;
+        self.thread.ensure_slots(top + HIDDEN);
+        let sp = self.thread.stack.as_mut_ptr();
+        // SAFETY: `first .. top + HIDDEN` is inside the stack after the growth.
+        unsafe {
+            crate::vm::frame::copy_values_up(sp.add(first + HIDDEN), sp.add(first), top - first)
+        };
+        self.thread.top = top + HIDDEN;
+    }
+
     /// How many Lua frames the running thread has. Hidden: a hook for tests.
     #[doc(hidden)]
     pub fn lua_frame_count(&self) -> usize {

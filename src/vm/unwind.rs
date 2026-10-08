@@ -419,7 +419,8 @@ pub(crate) fn handler_cont<'gc>(
             };
             let handler = stack.get(0);
             stack.truncate(2);
-            stack.extend([Value::small(limit as i32), handler, value]);
+            stack.push(Value::small(limit as i32));
+            stack.stage(3, handler, &[value]);
             stack.as_mut_slice()[1] = Value::small(depth as i32);
             return NativeOut::call_then(3, cont::HANDLER, Protect::Errors, OnOk::Cont);
         }
@@ -471,7 +472,8 @@ fn close_next<'gc>(ctx: Context<'gc>, stack: &mut Stack<'gc, '_>, errv: Value<'g
     let v = entry.value(&ts.stack);
     let mm = ctx.mm_of(v, MetamethodBits::CLOSE);
     stack.truncate(2);
-    stack.extend([errv, mm, v, errv]);
+    stack.push(errv);
+    stack.stage(3, mm, &[v, errv]);
     true
 }
 
