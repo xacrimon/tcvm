@@ -141,8 +141,16 @@ pub(crate) unsafe fn function<'gc>(base: *mut Value<'gc>) -> Gc<'gc, FunctionKin
 /// The native frame's closure.
 #[inline(always)]
 pub(crate) unsafe fn native_closure<'gc>(base: *mut Value<'gc>) -> &'gc NativeClosure<'gc> {
+    unsafe { native_closure_of(func_word(base)) }
+}
+
+/// The native closure a native frame's word 0 `func` holds.
+#[inline(always)]
+pub(crate) unsafe fn native_closure_of<'gc>(func: u64) -> &'gc NativeClosure<'gc> {
+    let f: Gc<'gc, FunctionKind<'gc>> =
+        unsafe { Gc::from_ptr((func & PTR_MASK) as usize as *const _) };
     unsafe {
-        match function(base).as_ref() {
+        match f.as_ref() {
             FunctionKind::Native(nc) => &*(nc as *const NativeClosure<'gc>),
             FunctionKind::Lua(_) => std::hint::unreachable_unchecked(),
         }
@@ -258,6 +266,24 @@ pub(crate) unsafe fn copy_values<'gc>(
         #[allow(clippy::pointers_in_nomem_asm_block)]
         unsafe {
             core::arch::asm!("/* {0} */", inout(reg) dst, options(nomem, nostack, preserves_flags));
+        }
+    }
+}
+
+/// Copy `n` values from `src` to `dst` in descending order, so `dst` may
+/// overlap `src` from above. A loop like [`copy_values`].
+///
+/// # Safety
+/// Both ranges are in bounds, and `dst >= src` if they overlap.
+#[inline(always)]
+pub(crate) unsafe fn copy_values_up<'gc>(dst: *mut Value<'gc>, src: *const Value<'gc>, n: usize) {
+    let mut i = n;
+    while i > 0 {
+        i -= 1;
+        unsafe { dst.add(i).write(src.add(i).read()) };
+        #[allow(clippy::pointers_in_nomem_asm_block)]
+        unsafe {
+            core::arch::asm!("/* {0} */", inout(reg) i, options(nomem, nostack, preserves_flags));
         }
     }
 }
