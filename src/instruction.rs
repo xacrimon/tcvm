@@ -951,7 +951,7 @@ instructions! {
     // rewrites the site to the form for what the entry holds: an own slot in
     // the table's cell (`_INL`) or its spill cell (`_AUX`), a key the shape
     // lacks (`_ABSENT`), a slot in the `__index` table (`_PROTO`), an added
-    // key (`_TRANS`). Same operands as the generic form; `c` counts refills.
+    // key (`_TRANS`). Same operands as the generic form; every miss refills.
 
     0x5c GETFIELD_INL     getfield_inl    Abde { dst: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
     0x5d GETFIELD_AUX     getfield_aux    Abde { dst: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }

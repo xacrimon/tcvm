@@ -55,33 +55,18 @@ fn fill_ic<'gc>(
         // A fresh `Shape` pointer is adopted through this slot, so the
         // prototype gets its barrier before the write through `as_cell`.
         ctx.mutation().backward_barrier(Gc::erase(proto_gc), None);
-        let first = matches!(slot_lock.get(), InlineCache::Empty);
         unsafe { slot_lock.as_cell() }.set(entry);
-        quicken(site, &entry, first);
+        quicken(site, &entry);
     }
 }
 
-/// Refills a site takes before it counts as megamorphic and stops refilling.
-const MEGAMORPHIC: u8 = 16;
-
-/// Whether a miss at `insn` should refill its cache: not once it has been
-/// refilled [`MEGAMORPHIC`] times, which its unused `c` slot counts.
-#[inline(always)]
-fn site_fills(insn: Instruction) -> bool {
-    insn.c() < MEGAMORPHIC
-}
-
-/// Rewrite the site to the form for its cache's new contents, and count a
-/// refill. Every fill rewrites: the form must match the entry's kind, and the
-/// generic handler is the full lookup, so a site that refills (an `Absent`
-/// entry becoming a `ProtoLoad` on the `__index` walk, a shape change) takes
-/// its new form until the refill count stops the fills.
+/// Rewrite the site to the form for its cache's new contents; the form must
+/// match the entry's kind, since the generic handler is the full lookup.
+/// There is no megamorphic state: a site whose receivers change shape over
+/// time (a fresh metatable per object) is cached again after each change.
 #[inline]
-fn quicken(site: *const Instruction, entry: &InlineCache<'_>, first: bool) {
-    let mut insn = unsafe { *site };
-    if !first {
-        insn.set_c(insn.c().saturating_add(1));
-    }
+fn quicken(site: *const Instruction, entry: &InlineCache<'_>) {
+    let insn = unsafe { *site };
     use InlineCache::*;
     let own = |inl: Op, aux: Op, loc: &SlotLoc| if loc.spilled() { aux } else { inl };
     let op = match (insn.op().unquickened(), entry) {
@@ -255,9 +240,7 @@ fn get_fill_ic<'gc>(
         return get_index_fill_ic(ctx, closure, ic_idx, site, t, index, Some(shape), k);
     }
     let slot = shape.find_slot(constant_key(k));
-    if site_fills(unsafe { *site }) {
-        fill_ic(ctx, closure, ic_idx, site, shape_entry(shape, slot));
-    }
+    fill_ic(ctx, closure, ic_idx, site, shape_entry(shape, slot));
     let v = slot.map_or(Value::nil(), |s| state.named_get(s));
     if !v.is_nil() || !shape.has_mm(MetamethodBits::INDEX) {
         return Ok(v);
@@ -315,9 +298,7 @@ fn get_index_fill_ic<'gc>(
             holder_shape,
             loc: SlotLoc::new(holder_shape, holder_slot),
         };
-        if site_fills(unsafe { *site }) {
-            fill_ic(ctx, closure, ic_idx, site, entry);
-        }
+        fill_ic(ctx, closure, ic_idx, site, entry);
     }
     Ok(v)
 }
@@ -360,7 +341,7 @@ fn set_own_fill_ic<'gc>(
     let slot = shape.find_slot(key);
     let existing = slot.map_or(Value::nil(), |s| state.named_get(s));
     if existing.is_nil() && newindex {
-        if cache && site_fills(unsafe { *site }) {
+        if cache {
             fill_ic(ctx, closure, ic_idx, site, shape_entry(shape, slot));
         }
         return false;
@@ -390,7 +371,7 @@ fn set_own_fill_ic<'gc>(
         }
     };
     drop(state);
-    if cache && site_fills(unsafe { *site }) {
+    if cache {
         fill_ic(ctx, closure, ic_idx, site, entry);
     }
     true
