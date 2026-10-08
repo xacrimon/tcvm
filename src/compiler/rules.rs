@@ -12,8 +12,8 @@ use crate::dmm::{Gc, Mutation};
 use crate::env::function::{LocVar, Template};
 use crate::env::{LuaString, Prototype, value::Value};
 use crate::instruction::{
-    CmpImm, IcIdx, Imm, Instruction, KIdx, Op, ProtoIdx, Reg, Shape, TFOR_VARS, TemplateIdx, UpIdx,
-    UpvalSource,
+    CmpImm, IcIdx, Imm, Instruction, KIdx, Offset, Op, ProtoIdx, Reg, Shape, TFOR_VARS,
+    TemplateIdx, UpIdx, UpvalSource,
 };
 use crate::lua;
 use crate::parser::LineMap;
@@ -68,7 +68,7 @@ fn without_copy(i: Instruction) -> Instruction {
     } else {
         Instruction::jf
     };
-    ctor(Reg(src), offset)
+    ctor(Reg(src), Offset(offset))
 }
 
 // ---------------------------------------------------------------------------
@@ -731,7 +731,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     fn emit_jump(&mut self, label: u16) {
         let idx = self.next_offset();
         self.chunk.jump_patches.push((idx, label));
-        self.emit(Instruction::jmp(0));
+        self.emit(Instruction::jmp(Offset(0)));
     }
 
     /// A call, in the form for its result count (`returns` is Lua's `C`).
@@ -770,7 +770,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     /// the caller can thread it through a `JumpList`.
     fn emit_unfilled_jmp(&mut self) -> usize {
         let idx = self.next_offset();
-        self.emit(Instruction::jmp(0));
+        self.emit(Instruction::jmp(Offset(0)));
         idx
     }
 
@@ -929,7 +929,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         } else {
             Instruction::jfset
         };
-        self.emit(ctor(Reg(NO_REG), src, 0));
+        self.emit(ctor(Reg(NO_REG), src, Offset(0)));
         idx
     }
 
@@ -1234,8 +1234,8 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                 let end = self.next_offset();
                 let offset = end as i32 - (idx as i32 + 1);
                 let jmp = &mut self.chunk.tape[idx];
-                if jmp.op() == Op::JMP {
-                    jmp.set_imm(offset);
+                if jmp.op() == Op::JMP && !jmp.set_branch_offset(offset) {
+                    self.chunk.too_long = true;
                 }
             }
         }
@@ -3753,7 +3753,7 @@ fn compile_expr_binary_op<'gc>(
 }
 
 type ArithImmCtor = fn(Reg, Reg, Imm) -> Instruction;
-type CmpImmCtor = fn(Reg, CmpImm, i32) -> Instruction;
+type CmpImmCtor = fn(Reg, CmpImm, Offset) -> Instruction;
 
 /// Bitwise ops take integer immediates only — a metamethod would otherwise see
 /// `2.0` become `2`. `MODI`/`IDIVI` refuse a zero integer divisor so the handler
@@ -3869,7 +3869,7 @@ fn compile_comparison_desc<'gc>(
             ctx.discharge_to_reg_mut(&mut lhs_desc, None)?
         };
         let instr = match lit {
-            CmpLiteral::Num(imm) => cmp_imm_branch(op, lit_on_left)(src, imm, 0),
+            CmpLiteral::Num(imm) => cmp_imm_branch(op, lit_on_left)(src, imm, Offset(0)),
             CmpLiteral::Str(s) => {
                 let key = KIdx(ctx.alloc_constant(Value::string(s))?);
                 let ctor = if op == BinaryOperator::Eq {
@@ -3877,7 +3877,7 @@ fn compile_comparison_desc<'gc>(
                 } else {
                     Instruction::jneqs
                 };
-                ctor(src, key, 0)
+                ctor(src, key, Offset(0))
             }
         };
         (instr, src, src)
@@ -3885,12 +3885,12 @@ fn compile_comparison_desc<'gc>(
         let lhs = ctx.discharge_to_reg_mut(&mut lhs_desc, None)?;
         let rhs = ctx.discharge_to_reg_mut(&mut rhs_desc, None)?;
         let instr = match op {
-            BinaryOperator::Eq => Instruction::jeq(lhs, rhs, 0),
-            BinaryOperator::NEq => Instruction::jneq(lhs, rhs, 0),
-            BinaryOperator::Lt => Instruction::jlt(lhs, rhs, 0),
-            BinaryOperator::Gt => Instruction::jlt(rhs, lhs, 0),
-            BinaryOperator::LEq => Instruction::jle(lhs, rhs, 0),
-            BinaryOperator::GEq => Instruction::jle(rhs, lhs, 0),
+            BinaryOperator::Eq => Instruction::jeq(lhs, rhs, Offset(0)),
+            BinaryOperator::NEq => Instruction::jneq(lhs, rhs, Offset(0)),
+            BinaryOperator::Lt => Instruction::jlt(lhs, rhs, Offset(0)),
+            BinaryOperator::Gt => Instruction::jlt(rhs, lhs, Offset(0)),
+            BinaryOperator::LEq => Instruction::jle(lhs, rhs, Offset(0)),
+            BinaryOperator::GEq => Instruction::jle(rhs, lhs, Offset(0)),
             _ => return Err(ice("compile_comparison_desc called with non-comparison op")),
         };
         (instr, lhs, rhs)
@@ -4722,7 +4722,7 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
         let loop_end = ctx.new_label();
 
         // FORPREP: initialize and jump past body if loop shouldn't execute
-        ctx.emit_jump_instr(loop_end, Instruction::forprep(base, 0));
+        ctx.emit_jump_instr(loop_end, Instruction::forprep(base, Offset(0)));
 
         ctx.set_label(loop_body, ctx.next_offset());
 
@@ -4752,7 +4752,7 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
         // FORLOOP: increment and jump back if still in range. luac stamps
         // the loop-back instructions with the `for` line.
         ctx.cur_line = for_line;
-        ctx.emit_jump_instr(loop_body, Instruction::forloop(base, 0));
+        ctx.emit_jump_instr(loop_body, Instruction::forloop(base, Offset(0)));
 
         ctx.set_label(loop_end, ctx.next_offset());
         Ok(())
@@ -4851,7 +4851,7 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
         let loop_test = ctx.new_label();
 
         // TFORPREP: jump to the test
-        ctx.emit_jump_instr(loop_test, Instruction::tforprep(base, 0));
+        ctx.emit_jump_instr(loop_test, Instruction::tforprep(base, Offset(0)));
 
         ctx.set_label(loop_body, ctx.next_offset());
 
@@ -4891,7 +4891,7 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
         ctx.emit(Instruction::tforcall(base, num_targets as u8));
 
         // TFORLOOP: if control variable is not nil, jump back to body
-        ctx.emit_jump_instr(loop_body, Instruction::tforloop(base, 0));
+        ctx.emit_jump_instr(loop_body, Instruction::tforloop(base, Offset(0)));
 
         // The CLOSE of the closing value is on the loop's `end`, as in luac.
         ctx.cur_line = end_line;

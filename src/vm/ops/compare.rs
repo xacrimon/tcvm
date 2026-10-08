@@ -30,7 +30,7 @@ macro_rules! adapt {
         )
     }};
 }
-use crate::vm::ops::meta::{binop_metamethod, ret_cond, stage_mm};
+use crate::vm::ops::meta::{binop_metamethod, ret_cond_f, ret_cond_t, stage_mm};
 use crate::vm::unwind::OpError;
 
 /// JEQ/JNEQ: jump when `(R[a] == R[b]) == $k`. Two small integers
@@ -54,7 +54,7 @@ macro_rules! eq_handler {
                 } else {
                     tail!(eq_slow)
                 };
-                branch!(eq == $k, insn.imm())
+                branch!(eq == $k, insn.branch_offset())
             }
         }
     };
@@ -72,7 +72,7 @@ macro_rules! eq_ii_handler {
                 let Some((x, y)) = Value::both_small(&reg![insn.a()], &reg![insn.b()]) else {
                     tail!($generic)
                 };
-                branch!((x == y) == $k, insn.imm())
+                branch!((x == y) == $k, insn.branch_offset())
             }
         }
     };
@@ -114,7 +114,7 @@ macro_rules! cmp_handler {
                 } else {
                     tail!(cmp_slow)
                 };
-                branch!(r == $k, insn.imm())
+                branch!(r == $k, insn.branch_offset())
             }
         }
     };
@@ -134,7 +134,7 @@ macro_rules! cmp_ii_handler {
                 let Some((x, y)) = Value::both_small(&reg![insn.a()], &reg![insn.b()]) else {
                     tail!($generic)
                 };
-                branch!((x $op y) == $k, insn.imm())
+                branch!((x $op y) == $k, insn.branch_offset())
             }
         }
     };
@@ -176,7 +176,7 @@ macro_rules! cmp_imm_handler {
                 } else {
                     tail!(cmp_slow)
                 };
-                branch!(r == $k, insn.imm24())
+                branch!(r == $k, insn.branch_offset())
             }
         }
     };
@@ -206,7 +206,7 @@ macro_rules! cmp_imm_f_handler {
                 let k = insn.cmp_imm_int() as f64;
                 let (x, y) = if $swap { (k, f) } else { (f, k) };
                 let r = if $lt { x < y } else { x <= y };
-                branch!(r == $k, insn.imm24())
+                branch!(r == $k, insn.branch_offset())
             }
         }
     };
@@ -239,7 +239,7 @@ macro_rules! eqi_handler {
                 } else {
                     false
                 };
-                branch!(eq == $k, insn.imm24())
+                branch!(eq == $k, insn.branch_offset())
             }
         }
     };
@@ -256,7 +256,7 @@ macro_rules! eqs_handler {
             bind(insn, pc, base, rt, closure, thread, nret, values);
             op fn $name {
                 let eq = reg![insn.a()].same_bits(&k![insn.h()]);
-                branch!(eq == $k, insn.imm24())
+                branch!(eq == $k, insn.branch_offset())
             }
         }
     };
@@ -272,7 +272,7 @@ macro_rules! test_handler {
             bind(insn, pc, base, rt, closure, thread, nret, values);
             op fn $name {
                 let truthy = !reg![insn.a()].is_falsy();
-                branch!(truthy == $k, insn.imm())
+                branch!(truthy == $k, insn.branch_offset())
             }
         }
     };
@@ -293,7 +293,7 @@ macro_rules! testset_handler {
                 if jump {
                     reg![insn.a()] = v;
                 }
-                branch!(jump, insn.imm())
+                branch!(jump, insn.branch_offset())
             }
         }
     };
@@ -326,7 +326,7 @@ handler! {
         let (a, b) = (reg![insn.a()], reg![insn.b()]);
         let k = insn.generic_op() == Op::JEQ;
         if num::raw_eq(a, b) {
-            branch!(k, insn.imm())
+            branch!(k, insn.branch_offset())
         }
         // Lua 5.5: `__eq` fires only when both operands are the same
         // non-primitive type (tables or userdata) and raw equality fails.
@@ -335,10 +335,10 @@ handler! {
         if try_meta {
             let mm = binop_metamethod(rt, a, b, MetamethodBits::EQ);
             if !mm.is_nil() {
-                stage_mm!(pc, base, rt, ret_cond, mm, [a, b])
+                stage_mm!(pc, base, rt, if k { ret_cond_t } else { ret_cond_f }, mm, [a, b])
             }
         }
-        branch!(!k, insn.imm())
+        branch!(!k, insn.branch_offset())
     }
 
     /// The slow path of the ordered compares: boxed and mixed numbers,
@@ -378,6 +378,6 @@ handler! {
         if mm.is_nil() {
             raise!(OpError::Compare(a, b))
         }
-        stage_mm!(pc, base, rt, ret_cond, mm, [a, b])
+        stage_mm!(pc, base, rt, if k { ret_cond_t } else { ret_cond_f }, mm, [a, b])
     }
 }

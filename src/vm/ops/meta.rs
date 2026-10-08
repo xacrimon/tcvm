@@ -85,16 +85,28 @@ handler! {
         resume!(caller, cpc)
     }
 
-    /// Continuation of a comparison metamethod: the caller's branch jumps when
-    /// the result's truthiness is its sense.
-    cont fn ret_cond {
+    /// Continuation of a comparison metamethod staged by a branch-if-true
+    /// compare: the caller's branch jumps when the result is truthy. The
+    /// sense is the continuation's identity, so nothing decodes the opcode.
+    cont fn ret_cond_t {
         let truthy = !first_result(nret, values).is_falsy();
         let (caller, cpc) = caller!();
         let op: Instruction = unsafe { *cpc.sub(1) };
         base = caller;
         pc = cpc;
         set_closure!(unsafe { frame::closure(base) });
-        branch!(truthy == (op.generic_op().branch_sense() == Some(true)), op.branch_offset())
+        branch!(truthy, op.branch_offset())
+    }
+
+    /// As [`ret_cond_t`] for a branch-if-false compare.
+    cont fn ret_cond_f {
+        let truthy = !first_result(nret, values).is_falsy();
+        let (caller, cpc) = caller!();
+        let op: Instruction = unsafe { *cpc.sub(1) };
+        base = caller;
+        pc = cpc;
+        set_closure!(unsafe { frame::closure(base) });
+        branch!(!truthy, op.branch_offset())
     }
 
     /// Continuation of a generic for's iterator: its results are the loop's
