@@ -410,6 +410,38 @@ fn call_nargs(ts: &ThreadState<'_>, b: u8, win: usize) -> usize {
     if b == 0 { ts.top - win } else { b as usize - 1 }
 }
 
+/// Leave for the collector with the native frame at window `win` holding
+/// its results; `ok = RETURN` tells the trampoline to land them.
+#[cold]
+#[inline(never)]
+fn gc_exit<'gc>(ts: &mut ThreadState<'gc>, win: *mut Value<'gc>, nc: &NativeClosure<'gc>) -> Exit {
+    let nh = NativeHdr::unpack(unsafe { frame::func_word(win) });
+    unsafe {
+        frame::set_func_word(
+            win,
+            NativeHdr {
+                ok: ok::RETURN,
+                ..nh
+            }
+            .pack(nc),
+        )
+    };
+    ts.top_base = win;
+    Exit::Gc
+}
+
+/// Return the native frame at window `win`'s results, `win .. top`, through
+/// its continuation.
+pub(crate) fn land_pending<'gc>(ts: &mut ThreadState<'gc>, win: usize) -> Jump<'gc> {
+    let win_ptr = ts.slot_ptr(win);
+    Jump::Ret {
+        ret: unsafe { frame::ret(win_ptr) },
+        nret: ts.top - win,
+        values: win_ptr,
+        base: win_ptr,
+    }
+}
+
 handler! {
     bind(insn, pc, base, rt, closure, thread, nret, values);
 
@@ -446,6 +478,9 @@ handler! {
         if std::hint::likely(out.is_return()) {
             let nret = ts.top - win;
             let w = unsafe { sp.add(win) };
+            if std::hint::unlikely(rt.gc_due()) {
+                return gc_exit(ts, w, nc);
+            }
             tail!(ret, pc = w as *const Instruction, insn = Slot::nret(nret), base = w)
         }
         tail!(native_act, pc = unsafe { sp.add(hdr) } as *const Instruction, insn = Slot::from_raw(out.raw()), base = unsafe { sp.add(bi) })
@@ -471,6 +506,9 @@ handler! {
         let w = unsafe { sp.add(win) };
         if std::hint::likely(out.is_return()) {
             let nret = ts.top - win;
+            if std::hint::unlikely(rt.gc_due()) {
+                return gc_exit(ts, w, nc);
+            }
             let ret = unsafe { frame::ret(w) };
             tail!(ret, pc = w as *const Instruction, insn = Slot::nret(nret), base = w)
         }
@@ -499,7 +537,8 @@ handler! {
         let out = invoke(rt, ts, nc, win);
         let sp = ts.stack.as_mut_ptr();
         base = unsafe { sp.add(bi) };
-        if std::hint::likely(out.is_return()) {
+        let returned = out.is_return();
+        if std::hint::likely(returned) && std::hint::likely(!rt.gc_due()) {
             let nret = ts.top - win;
             let ret = unsafe { frame::ret(base) };
             tail!(ret, pc = unsafe { sp.add(win) } as *const Instruction, insn = Slot::nret(nret))
@@ -518,6 +557,9 @@ handler! {
             frame::set_func_word(base, NativeHdr { at: 0, cont: 0, ok: ok::CONT }.pack(nc));
             let rw = frame::ret_word(base) & !(flag::HAS_OPEN | flag::HAS_TBC);
             frame::set_ret_word(base, rw | flag::NATIVE);
+        }
+        if returned {
+            return gc_exit(ts, base, nc);
         }
         tail!(native_act, pc = unsafe { base.sub(HDR) } as *const Instruction, insn = Slot::from_raw(out.raw()))
     }
@@ -723,13 +765,10 @@ pub(crate) fn drive<'gc>(
         let nc = unsafe { frame::native_closure(win_ptr) };
         match out.tag() {
             tag::RETURN => {
-                let nret = t.top - win;
-                return Jump::Ret {
-                    ret: unsafe { frame::ret(win_ptr) },
-                    nret,
-                    values: win_ptr,
-                    base: win_ptr,
-                };
+                if std::hint::unlikely(ctx.gc_due()) {
+                    return Jump::Exit(gc_exit(t, win_ptr, nc));
+                }
+                return land_pending(t, win);
             }
             tag::ERROR => {
                 // Raised with the native's frame on top (its level 0); the

@@ -748,6 +748,7 @@ handler! {
                 // Boxed integers, or an overflow of the inline case: no form
                 // change, and the site stays as it is.
                 reg![dst] = v;
+                gc_check!();
                 next!()
             }
             num::SlowNum::ModByZero => raise!(OpError::ModByZero),

@@ -375,7 +375,14 @@ pub(crate) fn enter<'gc>(ctx: Context<'gc>, thread: Thread<'gc>) -> Exit {
     );
     if ts.top_is_native() {
         let win = ts.top_base_index();
-        let j = native::repoll(ctx, &mut ts, win);
+        // Results a collector exit left in the frame land now; otherwise an
+        // async native waits on the host.
+        let nh = frame::NativeHdr::unpack(unsafe { frame::func_word(ts.top_base) });
+        let j = if nh.ok == native::ok::RETURN {
+            native::land_pending(ts, win)
+        } else {
+            native::repoll(ctx, &mut ts, win)
+        };
         return run(ctx, j);
     }
     let (pc, base) = (ts.top_pc, ts.top_base);
