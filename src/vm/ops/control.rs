@@ -674,14 +674,56 @@ handler! {
     /// in `R[num_params]`, so mutations to it are visible.
     op fn op_vararg {
         let (dst, count) = insn.ab();
+        if std::hint::unlikely(closure.proto.needs_vararg_table) {
+            tail!(vararg_slow)
+        }
         let nv = unsafe { frame::nv(base) };
-        let proto = closure.proto;
+        let wanted = if count == 0 { nv } else { count as usize - 1 };
+        let target = unsafe { base.add(dst as usize) };
+        if count == 0 {
+            let end = unsafe { target.add(wanted) };
+            if std::hint::unlikely(end.cast_const() > thread!().stack_end) {
+                tail!(vararg_grow)
+            }
+            let ts = thread!();
+            ts.top = ts.slot_index(end);
+        }
+        // The extras end at the header and the target starts at or above
+        // the base, so the ranges don't overlap.
+        let extras = unsafe { base.sub(HDR + nv) };
+        unsafe { land_results(target, extras, nv, wanted) };
+        next!()
+    }
+
+    /// VARARG of all the extras into a window that does not fit the stack:
+    /// grow (or overflow) and run it again.
+    slow fn vararg_grow {
+        let insn = insn_at!();
+        let (dst, _) = insn.ab();
+        sync!();
+        let ts = thread!();
+        let bi = ts.slot_index(base);
+        let nv = unsafe { frame::nv(base) };
+        if !ts.ensure_frame_slots(bi + dst as usize + nv) {
+            raise!(OpError::StackOverflow)
+        }
+        base = ts.slot_ptr(bi);
+        jump_by!(-1);
+        next!()
+    }
+
+    /// VARARG of a function whose varargs were materialized into a table
+    /// (`VARARGPREP`).
+    slow fn vararg_slow {
+        let insn = insn_at!();
+        let (dst, count) = insn.ab();
+        let closure = unsafe { frame::closure(base) };
         // The copy may grow the stack.
         sync!();
         let ts = thread!();
         let bi = ts.slot_index(base);
         let target = bi + dst as usize;
-        if proto.needs_vararg_table {
+        {
             let table = reg![closure.num_params].get_table().expect("materialized vararg slot must hold a table");
             // PUC's `getnumargs` bound, checked even when `count` is fixed.
             let Some(navail) = table
@@ -711,21 +753,6 @@ handler! {
             }
             next!()
         }
-        // Optimized: the extras end at the header and the target starts at or
-        // above the base, so the ranges don't overlap.
-        let extras = bi - HDR - nv;
-        let wanted = if count == 0 { nv } else { count as usize - 1 };
-        if count == 0 {
-            if !ts.ensure_frame_slots(target + wanted) {
-                raise!(OpError::StackOverflow)
-            }
-            base = ts.slot_ptr(bi);
-            ts.top = target + wanted;
-        }
-        debug_assert!(target + wanted <= ts.stack.len());
-        let sp = ts.stack.as_mut_ptr();
-        unsafe { land_results(sp.add(target), sp.add(extras), nv, wanted) };
-        next!()
     }
 
     /// Optimized below-base read of an un-escaped named vararg: integer key
