@@ -146,8 +146,10 @@ handler! {
         let v = reg![src];
         if let Some(t) = v.get_table()
             && !t.shape().has_mm(MetamethodBits::LEN)
+            && let Some(n) = t.raw_len_hint()
+            && let Ok(n) = i32::try_from(n)
         {
-            reg![dst] = Value::integer(rt.mutation(), t.raw_len() as i64);
+            reg![dst] = Value::small(n);
             next!()
         }
         tail!(len_slow)

@@ -261,6 +261,12 @@ impl<'gc> Table<'gc> {
         self.0.borrow().raw_len()
     }
 
+    /// The border when the length hint is exact (see [`TableState::raw_len_hint`]).
+    #[inline(always)]
+    pub(crate) fn raw_len_hint(self) -> Option<usize> {
+        self.0.borrow().raw_len_hint()
+    }
+
     /// See [`TableState::next`].
     pub fn next(
         self,
@@ -1069,6 +1075,30 @@ impl<'gc> TableState<'gc> {
             None if value.is_nil() => {}
             None => hash_part::set(&mut self.aux_or_new(mc).misc, hash, key, value),
         }
+    }
+
+    /// The border when the length hint names it: the hinted slot is filled
+    /// and the next one empty, or the hint is the array's end and nothing
+    /// continues past it. The handler's inline case; `raw_len` does the rest.
+    #[inline(always)]
+    pub(crate) fn raw_len_hint(&self) -> Option<usize> {
+        let array = self.array();
+        let last = array.len().saturating_sub(1);
+        if last == 0 {
+            return None;
+        }
+        let hint = (self.len_hint.get() as usize).clamp(1, last);
+        // SAFETY: `1 <= hint <= last < len`, and `hint + 1 <= last` when read;
+        // indexed reads would keep a bounds-check call in the handler.
+        unsafe {
+            if array.get_unchecked(hint).is_nil() {
+                return None;
+            }
+            if hint < last {
+                return array.get_unchecked(hint + 1).is_nil().then_some(hint);
+            }
+        }
+        self.aux().is_none_or(|h| h.ints.is_empty()).then_some(last)
     }
 
     /// A border, found as Lua 5.5's `luaH_getn` does: near the last one
