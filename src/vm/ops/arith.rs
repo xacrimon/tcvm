@@ -552,7 +552,10 @@ handler! {
                     // Kinds no form covers leave no other record.
                     feedback::record(closure, site, feedback::kind(lhs) | feedback::kind(rhs));
                 }
-                unsafe { specialize(site, insn, form, false) };
+                // A form drops on kinds no form covers, so no form
+                // outlives the kinds its site sees.
+                let drop = form.is_none() && insn.op() != generic;
+                unsafe { specialize(site, insn, form, drop) };
             }
             reg![dst] = v;
             next!()
@@ -601,8 +604,18 @@ handler! {
         feedback::record(closure, site, kinds | overflow);
         match r {
             num::SlowNum::Value(v) => {
-                // Boxed integers, or an overflow of the inline case: no form
-                // change, and the site stays as it is.
+                // An overflow of the inline case, or boxed integers at an
+                // integer form, leave the site as it is; other kinds (big
+                // integers at a float form, strings) drop its form.
+                let int_form =
+                    info.forms[0] == Some(insn.op()) && !matches!(info.kind, Div | Pow);
+                let foreign = feedback::STR
+                    | feedback::TAB
+                    | feedback::OTHER
+                    | if int_form { 0 } else { feedback::BIGINT };
+                if !locked && insn.op() != generic && kinds & foreign != 0 {
+                    unsafe { specialize(site, insn, Option::None, true) };
+                }
                 reg![dst] = v;
                 gc_check!();
                 next!()

@@ -502,10 +502,14 @@ fn on_entry_fail<'gc>(
     region.entry_fails.set(n);
     let name = || crate::jit::compile::chunk_name(closure);
     if n == 1 {
-        log(ctx, || format!("first entry fail {} pc{}", name(), region.entry_pc));
+        log(ctx, || {
+            format!("first entry fail {} pc{}", name(), region.entry_pc)
+        });
     }
     if n == EXIT_HOT && !region.retired.get() {
-        log(ctx, || format!("hot entry fail {} pc{}", name(), region.entry_pc));
+        log(ctx, || {
+            format!("hot entry fail {} pc{}", name(), region.entry_pc)
+        });
         request_recompile(ctx, closure, region, false);
     }
 }

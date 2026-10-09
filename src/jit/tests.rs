@@ -99,3 +99,57 @@ fn builds_loop_entry_in_nest() {
     let ir = ir_of(src, "mandel", pc);
     println!("{ir}");
 }
+
+/// The opcodes of global function `name` after running `src`.
+fn ops_of(src: &str, name: &str) -> Vec<crate::instruction::Op> {
+    let mut lua = Lua::new();
+    lua.set_jit(false);
+    lua.load_all();
+    let ex = lua
+        .try_enter(|ctx| -> Result<_, LoadError> {
+            let chunk = ctx.load(src, Some("=t"))?;
+            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+        })
+        .expect("load");
+    lua.finish(&ex).expect("run");
+    lua.enter(|ctx| {
+        let f = ctx
+            .globals()
+            .raw_get(Value::string(LuaString::new(ctx, name.as_bytes())));
+        let lf = f.get_function().and_then(|f| f.as_lua()).unwrap();
+        lf.proto.code.iter().map(|i| i.op()).collect()
+    })
+}
+
+/// A form drops when its site sees kinds no form covers, so the JIT can
+/// compile a form as what it says (6.5).
+#[test]
+fn forms_drop_on_foreign_kinds() {
+    use crate::instruction::Op;
+    let ops = ops_of(
+        "function f(a, b) return a + b end
+        for i = 1, 10 do f(i, i) end",
+        "f",
+    );
+    assert!(ops.contains(&Op::ADD_II));
+    let ops = ops_of(
+        "function f(a, b) return a + b end
+        for i = 1, 10 do f(i, i) end
+        f('1', 2)",
+        "f",
+    );
+    assert!(ops.contains(&Op::ADD) && !ops.contains(&Op::ADD_II));
+    let ops = ops_of(
+        "function f(a, b) return a < b end
+        for i = 1, 10 do f(i, i) end",
+        "f",
+    );
+    assert!(ops.contains(&Op::JLT_II));
+    let ops = ops_of(
+        "function f(a, b) return a < b end
+        for i = 1, 10 do f(i, i) end
+        f('a', 'b')",
+        "f",
+    );
+    assert!(ops.contains(&Op::JLT) && !ops.contains(&Op::JLT_II));
+}

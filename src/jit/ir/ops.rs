@@ -91,10 +91,7 @@ pub(crate) enum ExitTag {
 
 impl ExitTag {
     pub(crate) fn widenable(self) -> bool {
-        matches!(
-            self,
-            ExitTag::Type | ExitTag::Overflow | ExitTag::NeverRan
-        )
+        matches!(self, ExitTag::Type | ExitTag::Overflow | ExitTag::NeverRan)
     }
 }
 
