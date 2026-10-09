@@ -37,10 +37,14 @@ This is a Cargo workspace with two crates: `tcvm` (main) and `tcvm-derive` (proc
 Requires **nightly Rust** (nightly-2026-04-05, pinned in `rust-toolchain.toml`). Uses these nightly features:
 - `explicit_tail_calls` (`become` keyword) — core to the interpreter dispatch loop
 - `rust_preserve_none_cc` — calling convention for VM opcode handlers
-- `super_let` — used for handler array lifetime extension
+- `fn_align` — `#[rustc_align(32)]` on dispatch targets
+- `try_trait_v2` — `?` in natives that return `NativeOut`
 - `macro_metavar_expr`
 - `likely_unlikely`
 - `allocator_api`
+- `variant_count`
+- `int_format_into`
+- `offset_of_enum`
 
 Edition 2024.
 
@@ -59,6 +63,7 @@ A custom tracing GC ("Dioxygen Memory Management") using invariant lifetimes (`'
 - **`Mutation<'gc>`** / **`Finalization<'gc>`** (`context.rs`): Context handles for mutating or finalizing GC objects.
 - **`Collect` trait** (`collect.rs`): Types must implement this to be GC-managed. Derive it with `#[derive(Collect)]` from `tcvm-derive`.
 - **Write barriers** (`barrier.rs`): Forward and backward barriers maintain GC invariants when mutating object graphs.
+- **Heap** (`heap.rs`): A non-moving Immix (blocks of lines in mmap'd chunks) with sticky-mark minor collections; every collection is stop-the-world.
 
 The derive macro (`derive/src/lib.rs`) supports attributes: `#[collect(no_drop)]`, `#[collect(require_static)]`, `#[collect(unsafe_drop)]`.
 
@@ -74,12 +79,15 @@ Lua runtime value types, all GC-aware:
 
 ### VM Interpreter (`src/vm/`)
 
-- **`interp.rs`** (~1500 lines): Direct-threaded interpreter with 49 opcode handlers. Each handler is a function using `extern "rust-preserve-none"` calling convention. Dispatch works via an array of function pointers and explicit tail calls (`become handler(...)`). Debug builds use bounds-checked register access; release uses raw pointer arithmetic.
+- **Handlers** (`abi.rs`, `ops/`): Direct-threaded interpreter. Each handler is an `extern "rust-preserve-none"` function declared with `handler!` and dispatched through the runtime's tables (`dispatch.rs`) with explicit tail calls (`become`); `ops/` holds the opcode handlers by family. Debug builds assert register indices; release uses raw pointer arithmetic.
+- **Frames** (`frame.rs`): Four header words below each base in the value stack; every callee returns through its header's continuation.
+- **Natives** (`native.rs`, `async_native.rs`, `ff.rs`): Plain natives, continuation natives that return a `NativeOut` naming a `CONT_TABLE` continuation, async natives, and fast entries for hot builtins.
+- **`coro.rs`** / **`unwind.rs`**: Coroutine switches and error unwinding, both inside dispatch.
 - **`num.rs`**: Arithmetic and bitwise operation helpers.
 
 ### Instruction Set (`src/instruction.rs`)
 
-49 Lua 5.5 bytecodes covering moves, loads, table ops, arithmetic, bitwise, comparisons, control flow, calls, returns, closures, varargs, metamethods, and the 5.5 `ERRNNIL` global-declaration check.
+Lua 5.5's operations as 64-bit instructions, plus forms the compiler emits (compare-and-branch, CALL by result count, fused MOVE + CALL) and forms adaptive sites rewrite themselves to (arithmetic, compares, loops, constant-key table access). `OP_INFO` describes each opcode's family and forms.
 
 ### Lua reference
 
