@@ -1,6 +1,7 @@
 //! The optimizer (`jit-design.md` 9): passes over a `Func`, each verified in
 //! checking builds.
 
+pub(crate) mod calls;
 pub(crate) mod gvn;
 pub(crate) mod infer;
 pub(crate) mod peel;

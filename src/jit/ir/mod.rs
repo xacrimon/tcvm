@@ -224,6 +224,8 @@ pub(crate) struct Func<'gc> {
     /// The `After` snapshot of a value's definition, where a definition
     /// guard (9.1) may exit: call results, loads after a call, upvalues.
     pub(crate) def_snaps: Vec<(Val, Snap)>,
+    /// The call-boundary pass ran: nothing is live across a call (R6).
+    pub(crate) boundaries: bool,
     cfg: RefCell<Option<Rc<CfgInfo>>>,
 }
 
@@ -259,6 +261,7 @@ impl<'gc> Func<'gc> {
             entry: Block(0),
             meta,
             def_snaps: Vec::new(),
+            boundaries: false,
             cfg: RefCell::new(None),
         }
     }
