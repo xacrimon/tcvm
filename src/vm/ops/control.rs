@@ -239,6 +239,11 @@ handler! {
                         && i32::try_from(s).is_ok()
                         && i32::try_from(i).is_ok();
                     write_forloop_form(pc, offset, if all_small { Op::FORLOOP_I } else { Op::FORLOOP });
+                    if !all_small {
+                        // A generic FORLOOP whose byte is empty never ran.
+                        let site = unsafe { pc.offset(offset as isize - 1) };
+                        crate::jit::feedback::record(closure, site, crate::jit::feedback::BIGINT);
+                    }
                     false
                 }
             }
@@ -272,9 +277,9 @@ handler! {
 
     /// `FORLOOP_I`: the integer loop whose last value, step and control
     /// variable are all small; anything else (`debug.setlocal` on the
-    /// hidden slots) goes to the generic FORLOOP.
+    /// hidden slots) goes to the generic FORLOOP. The FORLOOP forms count
+    /// a taken back edge, before writing anything.
     op fn op_forloop_i {
-        count_hot!(rt, insn);
         let (a, offset) = insn.a_offset();
         let step = &reg![a + 1];
         let Some(s) = step.get_small() else {
@@ -285,6 +290,7 @@ handler! {
         };
         let go = idx != last;
         if go {
+            count_hot!(rt, insn);
             let idx = Value::small(idx.wrapping_add(s));
             reg![a + 2] = idx;
             reg![a + 3] = idx;
@@ -294,7 +300,6 @@ handler! {
 
     /// `FORLOOP_F`: the float loop.
     op fn op_forloop_f {
-        count_hot!(rt, insn);
         let (a, offset) = insn.a_offset();
         let step = &reg![a + 1];
         if !step.is_float() {
@@ -305,6 +310,7 @@ handler! {
         let idx = reg![a + 2].read_float() + s;
         let go = if 0.0 < s { idx <= lim } else { lim <= idx };
         if go {
+            count_hot!(rt, insn);
             let idx = Value::float(idx);
             reg![a + 2] = idx;
             reg![a + 3] = idx;
@@ -314,11 +320,9 @@ handler! {
 
     /// Numeric for step: advance the control variable and jump back while
     /// iterations remain, reading the layout FORPREP leaves behind. The
-    /// generic form, for a loop with boxed values and for the forms' misses.
+    /// generic form, for a loop with boxed values and for the forms' misses,
+    /// which have not counted yet.
     op fn op_forloop {
-        if insn.op() == Op::FORLOOP {
-            count_hot!(rt, insn);
-        }
         let (a, offset) = insn.a_offset();
         // The step's type tells the loop kind, and the hidden slots match it:
         // FORPREP wrote them and nothing else can (the visible copy is never
@@ -332,6 +336,7 @@ handler! {
             // also guarantees `idx + step` stays in range.
             let go = idx != last;
             if go {
+                count_hot!(rt, insn);
                 let idx = Value::small(idx.wrapping_add(s));
                 reg![a + 2] = idx;
                 reg![a + 3] = idx;
@@ -343,6 +348,7 @@ handler! {
             let idx = reg![a + 2].read_float() + s;
             let go = if 0.0 < s { idx <= lim } else { lim <= idx };
             if go {
+                count_hot!(rt, insn);
                 let idx = Value::float(idx);
                 reg![a + 2] = idx;
                 reg![a + 3] = idx;
@@ -371,6 +377,7 @@ handler! {
         };
         let go = idx != last;
         if go {
+            count_hot!(rt, insn);
             let idx = Value::integer(rt.mutation(), idx.wrapping_add(s));
             reg![a + 2] = idx;
             reg![a + 3] = idx;

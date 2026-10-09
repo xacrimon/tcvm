@@ -65,10 +65,17 @@ macro_rules! eq_handler {
             bind(insn, pc, base, rt, closure, thread, nret, values);
             op fn $name {
                 let (a, b) = (&reg![insn.a()], &reg![insn.b()]);
-                // Floats first: a NaN has the same bits as itself.
+                // Floats first: a NaN has the same bits as itself. A form
+                // here saw other kinds than two small integers.
                 let eq = if a.is_float() && b.is_float() {
+                    if insn.op() != Op::$g {
+                        adapt!(Option::None)
+                    }
                     a.read_float() == b.read_float()
                 } else if a.same_bits(b) {
+                    if insn.op() != Op::$g {
+                        adapt!(Option::None)
+                    }
                     true
                 } else if let Some((x, y)) = Value::both_small(a, b) {
                     if insn.op() == Op::$g && !locked!(insn, ADAPTIVE_AB_IMM) {
@@ -158,6 +165,9 @@ macro_rules! cmp_imm_handler {
                     let f = v.read_float();
                     if $swap { floats(k as f64, f) } else { floats(f, k as f64) }
                 } else if let Some(i) = v.get_integer() {
+                    if insn.op() != Op::$g {
+                        adapt!(Option::None)
+                    }
                     if $swap { ints(k, i) } else { ints(i, k) }
                 } else {
                     tail!(cmp_slow)
@@ -282,6 +292,10 @@ handler! {
         let (a, b) = (reg![insn.a()], reg![insn.b()]);
         let closure = unsafe { crate::vm::frame::closure(base) };
         feedback::record(closure, unsafe { pc.sub(1) }, feedback::kind(a) | feedback::kind(b));
+        // A form here saw other kinds than its own.
+        if insn.op() != insn.generic_op() {
+            unsafe { specialize(pc.sub(1).cast_mut(), insn, Option::None, true) };
+        }
         let k = insn.generic_op() == Op::JEQ;
         if num::raw_eq(a, b) {
             branch!(k, insn.branch_offset())
@@ -314,7 +328,14 @@ handler! {
             if matches!(op, Op::JGTI | Op::JNGTI | Op::JGEI | Op::JNGEI) { (lit, v) } else { (v, lit) }
         };
         let closure = unsafe { crate::vm::frame::closure(base) };
-        feedback::record(closure, unsafe { pc.sub(1) }, feedback::kind(a) | feedback::kind(b));
+        let kinds = feedback::kind(a) | feedback::kind(b);
+        feedback::record(closure, unsafe { pc.sub(1) }, kinds);
+        // Strings and the metamethod kinds drop a form; big integers are
+        // an integer form's too.
+        let foreign = feedback::STR | feedback::TAB | feedback::OTHER;
+        if insn.op() != op && kinds & foreign != 0 {
+            unsafe { specialize(pc.sub(1).cast_mut(), insn, Option::None, true) };
+        }
         let le = matches!(op, Op::JLE | Op::JNLE | Op::JLEI | Op::JNLEI | Op::JGEI | Op::JNGEI);
         let primitive = if let Some(x) = a.get_integer()
             && let Some(y) = b.get_integer()

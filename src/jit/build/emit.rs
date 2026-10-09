@@ -39,14 +39,7 @@ fn arith_mode(b: &Builder<'_, '_>, pc: u32) -> Mode {
         let forms = &info.forms;
         let imm = matches!(info.family, Family::ImmArith | Family::ImmBit);
         let idx = forms.iter().position(|f| *f == Some(op));
-        // Kinds the interpreter keeps a form through (`specialize`) and the
-        // form's guards would exit on each time: generic code, milestone 2.
-        let int_form = idx == Some(0) && !float_result;
-        let foreign =
-            fb::STR | fb::TAB | fb::OTHER | fb::MM | if int_form { 0 } else { fb::BIGINT };
-        if byte & foreign != 0 {
-            return Mode::Deopt;
-        }
+        // A site keeps a form only while it sees the form's kinds (6.5).
         return match (imm, idx) {
             (false, Some(0)) | (true, Some(0)) if float_result => Mode::F64 {
                 l_small: true,
@@ -587,10 +580,6 @@ fn emit_cmp_imm(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Bl
     // `k <cc> v` is `v <swapped cc> k`.
     let cc = if swap { cc.swap() } else { cc };
     let how = if op != generic {
-        if b.feedback(pc) & !(fb::SMALL | fb::FLOAT | fb::OVERFLOW) != 0 {
-            b.deopt(ExitTag::Unsupported);
-            return;
-        }
         CmpAs::F64
     } else {
         // The generic immediate compares' fast path is a small integer.
