@@ -6,7 +6,7 @@ use crate::env::value::Value;
 use crate::instruction::{ArithKind, Family, Instruction, Op as BcOp};
 use crate::jit::build::Builder;
 use crate::jit::feedback as fb;
-use crate::jit::ir::ops::{Cc, ExitTag, HelperId, Op};
+use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL, HelperId, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
 use crate::jit::ir::{Block, Val};
 
@@ -492,6 +492,16 @@ fn byte_kind(b: &Builder<'_, '_>, pc: u32) -> Option<CmpAs> {
     }
 }
 
+/// Whether the site's feedback saw only kinds `how` compares.
+fn byte_within(b: &Builder<'_, '_>, pc: u32, how: CmpAs) -> bool {
+    let kinds = match how {
+        CmpAs::I32 => fb::SMALL,
+        CmpAs::I64 => fb::INT,
+        CmpAs::F64 => fb::FLOAT,
+    };
+    b.feedback(pc) & fb::KINDS & !kinds == 0
+}
+
 fn cmp_vals(b: &mut Builder<'_, '_>, cc: Cc, x: Val, y: Val, how: CmpAs) -> Val {
     match how {
         CmpAs::I32 => {
@@ -535,29 +545,135 @@ fn emit_cmp_reg(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Bl
                 // Mixed small and float compare exactly as floats; an i64 does not.
                 let wide = num_kind(b, x) == Some(CmpAs::I64) || num_kind(b, y) == Some(CmpAs::I64);
                 if wide {
-                    b.deopt(ExitTag::Type);
+                    let (x, y) = (b.boxed(x), b.boxed(y));
+                    match generic {
+                        BcOp::JEQ | BcOp::JNEQ => generic_eq(b, x, y, sense, succs),
+                        _ => generic_cmp(b, cc, x, y, sense, succs),
+                    }
                     return;
                 }
                 CmpAs::F64
             }
             (Some(CmpAs::I32), None) | (None, Some(CmpAs::I32)) if wide => CmpAs::I64,
-            (Some(k), None) | (None, Some(k)) if generic != BcOp::JEQ && generic != BcOp::JNEQ => k,
+            // The other operand speculated to the typed one's kind, unless
+            // exits saw it differ.
+            (Some(k), None) | (None, Some(k))
+                if generic != BcOp::JEQ && generic != BcOp::JNEQ && byte_within(b, pc, k) =>
+            {
+                k
+            }
             (None, None) if wide => CmpAs::I64,
             _ if generic == BcOp::JEQ || generic == BcOp::JNEQ => {
+                let (x, y) = (b.boxed(x), b.boxed(y));
                 if eq_by_bits(b, x) || eq_by_bits(b, y) {
                     let c = b.ins(Op::SameBits, &[x, y]);
                     branch(b, c, sense, succs);
-                    return;
+                } else {
+                    generic_eq(b, x, y, sense, succs);
                 }
-                b.deopt(ExitTag::Type);
                 return;
             }
-            // The generic ordered compares' fast path is two floats.
-            _ => seen.unwrap_or(CmpAs::F64),
+            _ => match seen {
+                Some(how) => how,
+                None => {
+                    let (x, y) = (b.boxed(x), b.boxed(y));
+                    generic_cmp(b, cc, x, y, sense, succs);
+                    return;
+                }
+            },
         }
     };
     let c = cmp_vals(b, cc, x, y, how);
     branch(b, c, sense, succs);
+}
+
+/// Both of two `Val`s of kind `set`.
+fn both(b: &mut Builder<'_, '_>, set: TypeSet, x: Val, y: Val) -> Val {
+    let (cx, cy) = (b.ins(Op::IsType(set), &[x]), b.ins(Op::IsType(set), &[y]));
+    let f = b.ins(Op::KB1(false), &[]);
+    b.ins(Op::Select, &[cx, cy, f])
+}
+
+/// Branch on `x cc y` for `Val`s nothing typed, as the handler orders it:
+/// two floats, two small integers, then `jit_lt`/`jit_le` (mixed numbers,
+/// big integers, strings), whose failure (a metamethod, an error) deopts.
+fn generic_cmp(b: &mut Builder<'_, '_>, cc: Cc, x: Val, y: Val, sense: bool, succs: &[Block]) {
+    let ff = both(b, TypeSet::FLOAT, x, y);
+    let (floats, rest) = (b.new_sealed_succ(), b.new_sealed_succ());
+    b.br(ff, floats, rest);
+    b.switch_to(floats);
+    let (fx, fy) = (
+        b.ins(Op::Unbox(Rep::F64), &[x]),
+        b.ins(Op::Unbox(Rep::F64), &[y]),
+    );
+    let c = b.ins(Op::FCmp(cc), &[fx, fy]);
+    branch(b, c, sense, succs);
+    b.switch_to(rest);
+    let ss = both(b, TypeSet::SMALL, x, y);
+    let (smalls, slow) = (b.new_sealed_succ(), b.new_sealed_succ());
+    b.br(ss, smalls, slow);
+    b.switch_to(smalls);
+    let (ix, iy) = (
+        b.ins(Op::Unbox(Rep::I32), &[x]),
+        b.ins(Op::Unbox(Rep::I32), &[y]),
+    );
+    let c = b.ins(Op::ICmp(cc), &[ix, iy]);
+    branch(b, c, sense, succs);
+    b.switch_to(slow);
+    // `a > b` is `b < a`.
+    let (h, x, y) = match cc {
+        Cc::Lt => (HelperId::Lt, x, y),
+        Cc::Le => (HelperId::Le, x, y),
+        Cc::Gt => (HelperId::Lt, y, x),
+        Cc::Ge => (HelperId::Le, y, x),
+        Cc::Eq | Cc::Ne => unreachable!("an ordered compare"),
+    };
+    let c = helper_test(b, h, x, y);
+    branch(b, c, sense, succs);
+}
+
+/// Branch on `x == y` for `Val`s nothing typed, as the handler orders it:
+/// two floats by value (a NaN has its own bits), equal bits, two small
+/// integers (unequal), then `jit_eq`, whose failure (`__eq`) deopts.
+fn generic_eq(b: &mut Builder<'_, '_>, x: Val, y: Val, sense: bool, succs: &[Block]) {
+    let (fall, target) = (succs[0], succs[1]);
+    let (yes, no) = if sense {
+        (target, fall)
+    } else {
+        (fall, target)
+    };
+    let ff = both(b, TypeSet::FLOAT, x, y);
+    let (floats, rest) = (b.new_sealed_succ(), b.new_sealed_succ());
+    b.br(ff, floats, rest);
+    b.switch_to(floats);
+    let (fx, fy) = (
+        b.ins(Op::Unbox(Rep::F64), &[x]),
+        b.ins(Op::Unbox(Rep::F64), &[y]),
+    );
+    let c = b.ins(Op::FCmp(Cc::Eq), &[fx, fy]);
+    branch(b, c, sense, succs);
+    b.switch_to(rest);
+    let same = b.ins(Op::SameBits, &[x, y]);
+    let differ = b.new_sealed_succ();
+    b.br(same, yes, differ);
+    b.switch_to(differ);
+    let ss = both(b, TypeSet::SMALL, x, y);
+    let slow = b.new_sealed_succ();
+    b.br(ss, no, slow);
+    b.switch_to(slow);
+    let c = helper_test(b, HelperId::Eq, x, y);
+    branch(b, c, sense, succs);
+}
+
+/// A compare helper's result as a `B1`, deopting `Before` when it failed.
+fn helper_test(b: &mut Builder<'_, '_>, h: HelperId, x: Val, y: Val) -> Val {
+    let r = b.ins(Op::Helper(h), &[x, y]);
+    let fail = b.ki32(HELPER_FAIL);
+    let failed = b.ins(Op::ICmp(Cc::Eq), &[r, fail]);
+    let snap = b.snap_before();
+    b.ins_snap(Op::GuardFalse, &[failed], snap, ExitTag::Slow);
+    let zero = b.ki32(0);
+    b.ins(Op::ICmp(Cc::Ne), &[r, zero])
 }
 
 /// Whether equality with `v` is identity: it is no number and no table or
@@ -590,8 +706,14 @@ fn emit_cmp_imm(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Bl
     let how = if op != generic {
         CmpAs::F64
     } else {
-        // The generic immediate compares' fast path is a small integer.
-        num_kind(b, v).or(byte_kind(b, pc)).unwrap_or(CmpAs::I32)
+        match num_kind(b, v).or(byte_kind(b, pc)) {
+            Some(how) => how,
+            None => {
+                let (v, kk) = (b.boxed(v), b.konst(Value::small(k as i32)));
+                generic_cmp(b, cc, v, kk, sense, succs);
+                return;
+            }
+        }
     };
     let c = match how {
         CmpAs::I32 => {
@@ -628,10 +750,26 @@ fn emit_eqi(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Block]
             let kk = b.ins(Op::KI64(k), &[]);
             b.ins(Op::LCmp(Cc::Eq), &[x, kk])
         }
-        _ => {
+        Some(CmpAs::I32) => {
             let x = b.as_i32(v);
             let kk = b.ki32(k as i32);
             b.ins(Op::ICmp(Cc::Eq), &[x, kk])
+        }
+        // A float compares by value; anything else equals the small
+        // constant only as its bits (a big integer is never small).
+        None => {
+            let v = b.boxed(v);
+            let float = b.ins(Op::IsType(TypeSet::FLOAT), &[v]);
+            let (ff, other) = (b.new_sealed_succ(), b.new_sealed_succ());
+            b.br(float, ff, other);
+            b.switch_to(ff);
+            let x = b.ins(Op::Unbox(Rep::F64), &[v]);
+            let kk = b.kf64(k as f64);
+            let c = b.ins(Op::FCmp(Cc::Eq), &[x, kk]);
+            branch(b, c, sense, succs);
+            b.switch_to(other);
+            let kk = b.konst(Value::small(k as i32));
+            b.ins(Op::SameBits, &[v, kk])
         }
     };
     branch(b, c, sense, succs);

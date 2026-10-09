@@ -273,7 +273,7 @@ fn check_reps(f: &Func<'_>, i: Inst) -> Result<(), String> {
     let args = f.args(i);
     let want: &[Rep] = match op {
         Store(_) | Unbox(_) | IsType(_) | IsFalsy | Guard(_) | ToF64 => &[Val],
-        SameBits | GuardSame => &[Val, Val],
+        SameBits | GuardSame | Helper(HelperId::Lt | HelperId::Le | HelperId::Eq) => &[Val, Val],
         GuardTrue | GuardFalse | Br => &[B1],
         IAdd | ISub | IMul | IAddNo | ISubNo | IMulNo | IAnd | IOr | IXor | IShl | IShr
         | IDivFloor | IModFloor | ICmp(_) => &[I32, I32],

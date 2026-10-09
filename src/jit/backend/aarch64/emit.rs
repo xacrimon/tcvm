@@ -65,6 +65,9 @@ pub(crate) struct Helpers {
     pub(crate) pow: usize,
     pub(crate) box_i64: usize,
     pub(crate) land: usize,
+    pub(crate) lt: usize,
+    pub(crate) le: usize,
+    pub(crate) eq: usize,
 }
 
 fn gpr(p: PReg) -> Gpr {
@@ -661,7 +664,13 @@ impl Em<'_> {
                 let target = match h {
                     HelperId::FMod => self.helpers.fmod,
                     HelperId::FPow => self.helpers.pow,
+                    HelperId::Lt => self.helpers.lt,
+                    HelperId::Le => self.helpers.le,
+                    HelperId::Eq => self.helpers.eq,
                 };
+                if matches!(h, HelperId::Lt | HelperId::Le | HelperId::Eq) {
+                    self.a.mov(Gpr(0), RT);
+                }
                 self.a.bl_far(target);
             }
             Jump => {

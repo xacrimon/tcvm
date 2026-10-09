@@ -57,13 +57,24 @@ pub(crate) enum HelperId {
     FMod,
     /// `(f64, f64) -> f64`: `pow`.
     FPow,
+    /// `(Val, Val) -> i32`: a generic `<`, `<=` or `==`: 1, 0, or
+    /// `HELPER_FAIL` when only the interpreter can (a metamethod, an error).
+    Lt,
+    Le,
+    Eq,
 }
+
+/// What a compare helper returns when the interpreter must run the compare.
+pub(crate) const HELPER_FAIL: i32 = 2;
 
 impl HelperId {
     pub(crate) fn name(self) -> &'static str {
         match self {
             HelperId::FMod => "fmod",
             HelperId::FPow => "pow",
+            HelperId::Lt => "lt",
+            HelperId::Le => "le",
+            HelperId::Eq => "eq",
         }
     }
 }
@@ -383,6 +394,7 @@ impl Op {
             IToL | FToL | LAdd | LSub | LMul | LUDiv | LNeg | LAnd | LOr | LXor | LNot | LShl
             | LShr | LDivFloor | LModFloor => Ty::I64,
             Helper(HelperId::FMod | HelperId::FPow) => Ty::F64,
+            Helper(HelperId::Lt | HelperId::Le | HelperId::Eq) => Ty::I32,
             _ => Ty::ANY,
         }
     }
