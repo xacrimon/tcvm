@@ -264,6 +264,11 @@ impl Effects {
     pub(crate) fn has(self, e: Effects) -> bool {
         self.0 & e.0 == e.0
     }
+
+    /// Whether anything is written: a slot or a memory class.
+    pub(crate) fn writes(self) -> bool {
+        self.0 & (Effects::W_SLOT.0 | Effects::W_ALL.0) != 0
+    }
 }
 
 impl std::ops::BitOr for Effects {

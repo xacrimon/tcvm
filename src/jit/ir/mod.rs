@@ -656,6 +656,28 @@ impl<'gc> Func<'gc> {
 
     // --- uses -------------------------------------------------------------------
 
+    /// Make `inst` use `r` where it uses `v`; a snapshot it may share is
+    /// copied first.
+    pub(crate) fn replace_uses(&mut self, inst: Inst, v: Val, r: Val) {
+        for a in self.args_mut(inst) {
+            if *a == v {
+                *a = r;
+            }
+        }
+        for e in 0..self.edges(inst).len() {
+            for a in self.edge_args_mut(inst, e) {
+                if *a == v {
+                    *a = r;
+                }
+            }
+        }
+        if self.snap_entries(inst).iter().any(|e| e.1 == v) {
+            let s = self.insts[inst.idx()].snap;
+            let ns = self.map_snap(Snap(s), |x| if x == v { r } else { x });
+            self.insts[inst.idx()].snap = ns.0;
+        }
+    }
+
     /// Every value `inst` uses: operands, edge arguments, snapshot entries.
     pub(crate) fn for_each_use(&self, inst: Inst, mut f: impl FnMut(Val)) {
         for &a in self.args(inst) {
