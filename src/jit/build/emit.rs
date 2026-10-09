@@ -7,7 +7,7 @@ use crate::instruction::{ArithKind, Family, Instruction, Op as BcOp};
 use crate::jit::build::Builder;
 use crate::jit::feedback as fb;
 use crate::jit::ir::ops::{Cc, ExitTag, HelperId, Op};
-use crate::jit::ir::types::{Rep, Ty, TypeSet};
+use crate::jit::ir::types::{Rep, TypeSet};
 use crate::jit::ir::{Block, Val};
 
 /// How an arithmetic site compiles.
