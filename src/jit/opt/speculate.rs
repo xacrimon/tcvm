@@ -35,26 +35,31 @@ pub(crate) fn speculate(f: &mut Func<'_>, kinds: &EntryKinds) -> bool {
             continue;
         };
         let (e, t) = (exp[k], vd.ty);
-        if t.rep != Rep::Val || e == TypeSet::ANY || !t.set.intersects(e) || t.within(e) {
-            continue;
-        }
         let v = Val(k as u32);
         let block = f.insts[i.idx()].block;
-        if block.0 == u32::MAX || f.blocks[block.idx()].dead {
+        if t.rep != Rep::Val || block.0 == u32::MAX || f.blocks[block.idx()].dead {
             continue;
         }
         if block == f.entry
             && let Op::Load(r) = f.op(i)
         {
-            if entry_agrees(f, kinds, r, e) {
+            if let Some(set) = entry_set(f, kinds, r, e)
+                && t.set.intersects(set)
+                && !t.within(set)
+            {
                 cands.push(Cand {
                     v,
-                    set: e,
+                    set,
                     entry: Some(r),
                     snap: None,
                 });
             }
-        } else if let Some(&(_, s)) = f.def_snaps.iter().find(|(x, _)| *x == v) {
+            continue;
+        }
+        if e == TypeSet::ANY || !t.set.intersects(e) || t.within(e) {
+            continue;
+        }
+        if let Some(&(_, s)) = f.def_snaps.iter().find(|(x, _)| *x == v) {
             cands.push(Cand {
                 v,
                 set: e,
@@ -163,21 +168,29 @@ fn informative(f: &Func<'_>, i: Inst) -> Option<(Val, TypeSet)> {
     }
 }
 
-/// Whether the register's entry value may be speculated at `e`: the kinds
-/// failed entry guards saw and, at a loop entry, the frame's value agree.
-fn entry_agrees(f: &Func<'_>, kinds: &EntryKinds, r: u8, e: TypeSet) -> bool {
-    if kinds.seen.iter().any(|&(x, s)| x == r && !e.contains(s)) {
-        return false;
-    }
-    if f.meta.loop_entry && !kinds.frame.is_empty() {
-        let k = kinds
+/// The set the register's entry value is guarded to, if any. An
+/// expectation of its uses holds when the kinds failed entry guards saw and,
+/// at a loop entry, the frame's value fit it; a register without one is
+/// typed at a loop entry by the frame's kind and the seen ones (J7).
+fn entry_set(f: &Func<'_>, kinds: &EntryKinds, r: u8, e: TypeSet) -> Option<TypeSet> {
+    let seen = kinds
+        .seen
+        .iter()
+        .filter(|&&(x, _)| x == r)
+        .fold(TypeSet::empty(), |a, &(_, s)| a | s);
+    let frame = (f.meta.loop_entry && !kinds.frame.is_empty()).then(|| {
+        kinds
             .frame
             .get(r as usize)
             .copied()
-            .unwrap_or(TypeSet::empty());
-        return !k.is_empty() && e.contains(k);
+            .unwrap_or(TypeSet::empty())
+    });
+    if e == TypeSet::ANY {
+        let set = frame.filter(|k| !k.is_empty())? | seen;
+        return (set != TypeSet::ANY).then_some(set);
     }
-    true
+    let fits = e.contains(seen) && frame.is_none_or(|k| !k.is_empty() && e.contains(k));
+    fits.then_some(e)
 }
 
 /// For each candidate, whether every path from just after its definition
