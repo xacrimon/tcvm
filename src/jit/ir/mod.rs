@@ -118,6 +118,9 @@ pub(crate) struct Func<'gc> {
     pub(crate) pool: Vec<Value<'gc>>,
     pub(crate) entry: Block,
     pub(crate) meta: RegionMeta,
+    /// The `After` snapshot of a value's definition, where a definition
+    /// guard (9.1) may exit: call results, loads after a call, upvalues.
+    pub(crate) def_snaps: Vec<(Val, Snap)>,
 }
 
 /// The type set of a constant `Value` word.
@@ -148,6 +151,7 @@ impl<'gc> Func<'gc> {
             pool: Vec::new(),
             entry: Block(0),
             meta,
+            def_snaps: Vec::new(),
         }
     }
 

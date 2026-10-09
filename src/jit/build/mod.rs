@@ -62,6 +62,8 @@ struct BlockState {
     root_at: usize,
     /// Types of the slots of a root (what was stored before the call).
     root_ty: Vec<TypeSet>,
+    /// The frame at a resume block's start, for guards of its loads.
+    after: Option<Snap>,
     terminated: bool,
 }
 
@@ -130,6 +132,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             root: false,
             root_at: 0,
             root_ty: Vec::new(),
+            after: None,
             terminated: false,
         });
         b
@@ -265,6 +268,9 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         self.f.vals[v.idx()].ty = Ty::val(if set.is_empty() { TypeSet::ANY } else { set });
         self.bs[b.idx()].defs[r as usize] = Some(v);
         self.bs[b.idx()].slots[r as usize] = SlotState::Holds(v);
+        if let Some(s) = self.bs[b.idx()].after {
+            self.f.def_snaps.push((v, s));
+        }
         v
     }
 
@@ -456,7 +462,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         let regs = self.exit_regs(live);
         let mut entries = Vec::new();
         for r in regs.iter() {
-            if r >= self.nregs {
+            if r >= self.nregs || self.untouched(r) {
                 continue;
             }
             let v = self.reg(r as u8);
@@ -478,15 +484,34 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         s
     }
 
-    /// A snapshot resuming at `pc` with `live` (after the instruction's
-    /// writes were flushed).
-    pub(crate) fn snap_at(&mut self, pc: u32, kind: ExitKind) -> Snap {
-        let live = if (pc as usize) < self.cfg.live_in.len() {
-            self.cfg.live_in[pc as usize]
-        } else {
-            RegSet::EMPTY
+    /// The snapshot that continues after the instruction at `pc`, once its
+    /// writes are flushed.
+    pub(crate) fn snap_after(&mut self, pc: u32) -> Snap {
+        let live = match self.cfg.live_in.get(pc as usize + 1) {
+            Some(&l) => l,
+            None => RegSet::EMPTY,
         };
-        self.snapshot(pc, kind, live)
+        self.snapshot(pc, ExitKind::After, live)
+    }
+
+    /// Whether `r`'s home slot still holds what it held at the root: the
+    /// register is the root's (perhaps not yet created) load.
+    fn untouched(&self, r: usize) -> bool {
+        matches!(self.bs[self.cur.idx()].slots[r], SlotState::Lazy(_))
+    }
+
+    /// Note the `After` snapshot of `v`'s definition, the instruction at the
+    /// current pc, and of the loads of the block it starts when that is a
+    /// resume block (9.1).
+    pub(crate) fn note_def(&mut self, vals: &[Val], resume: Option<Block>) {
+        self.flush();
+        let s = self.snap_after(self.pc);
+        for &v in vals {
+            self.f.def_snaps.push((v, s));
+        }
+        if let Some(b) = resume {
+            self.bs[b.idx()].after = Some(s);
+        }
     }
 
     /// Store the registers in `live` (and the captured ones) whose home
@@ -497,6 +522,11 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         let mut tys = vec![TypeSet::ANY; self.nregs];
         for r in regs.iter() {
             if r >= self.nregs {
+                continue;
+            }
+            if let SlotState::Lazy(root) = self.bs[self.cur.idx()].slots[r] {
+                let t = self.bs[root.idx()].root_ty.get(r).copied();
+                tys[r] = t.filter(|t| !t.is_empty()).unwrap_or(TypeSet::ANY);
                 continue;
             }
             let v = self.reg(r as u8);

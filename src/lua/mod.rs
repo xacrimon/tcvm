@@ -172,6 +172,13 @@ impl Lua {
         self.arena.finish_marking()
     }
 
+    /// Turn the JIT on or off for what runs from now on; installed regions
+    /// stay.
+    pub fn set_jit(&mut self, on: bool) {
+        self.arena
+            .mutate_root(|_, root| root.jit.config.enabled = on && cfg!(target_arch = "aarch64"));
+    }
+
     /// Force a full garbage-collection cycle (mark + sweep) to completion.
     /// Exposed mainly as a GC-soundness test/debug hook; a real
     /// `collectgarbage("collect")` would route here.

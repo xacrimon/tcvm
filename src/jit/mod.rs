@@ -63,7 +63,7 @@ handler! {
         // Not when the word in `Code` is an entry an exit dispatched around.
         if unsafe { *site } == word {
             let at = unsafe { site.offset_from_unsigned(closure.code) } as u32;
-            if let Some(entry) = try_compile(rt, closure, at, word) {
+            if let Some(entry) = try_compile(rt, closure, at, word, base) {
                 let jw = unsafe { *site };
                 let h = unsafe { as_handler(entry) };
                 tail!(h, insn = Slot::insn(jw), closure = Slot::closure(closure))
@@ -102,7 +102,8 @@ handler! {
         }
         let closure: LuaFn<'gc> = unsafe { frame::closure(base) };
         on_exit(rt, closure, base, region, e);
-        let resume = unsafe { closure.code.add(e.pc as usize) };
+        let at = if e.kind == ExitKind::Before { e.pc } else { e.pc + 1 };
+        let resume = unsafe { closure.code.add(at as usize) };
         if e.kind == ExitKind::Gc {
             pc = resume;
             exit!(crate::vm::abi::Exit::Gc)
@@ -123,7 +124,7 @@ handler! {
         let closure: LuaFn<'gc> = unsafe { frame::closure(base) };
         let site = unsafe { pc.sub(1) };
         let at = unsafe { site.offset_from_unsigned(closure.code) } as u32;
-        match recompile(rt, closure, at, word.d()) {
+        match recompile(rt, closure, at, word.d(), base) {
             Ok(entry) => {
                 let h = unsafe { as_handler(entry) };
                 tail!(h, insn = Slot::insn(word), closure = Slot::closure(closure))
@@ -172,6 +173,7 @@ fn try_compile<'gc>(
     closure: LuaFn<'gc>,
     at: u32,
     word: Instruction,
+    frame: *const Value<'gc>,
 ) -> Option<*const u8> {
     let config = &ctx.jit().config;
     if let Some(only) = &config.only
@@ -187,7 +189,7 @@ fn try_compile<'gc>(
             return None;
         }
     }
-    match compile_caught(ctx, closure, at) {
+    match compile_caught(ctx, closure, at, frame, &[]) {
         Ok(region) => {
             let entry = install(ctx, closure, state, at, word, region)?;
             log(ctx, || {
@@ -209,7 +211,9 @@ fn try_compile<'gc>(
                 )
             });
             let mut st = state.borrow_mut(mc);
-            st.strikes += 1;
+            if !matches!(e, crate::jit::compile::CompileError::Useless) {
+                st.strikes += 1;
+            }
             st.refused.push(at);
             None
         }
@@ -220,11 +224,13 @@ fn compile_caught<'gc>(
     ctx: Context<'gc>,
     closure: LuaFn<'gc>,
     at: u32,
+    frame: *const Value<'gc>,
+    seen: &[(u8, crate::jit::ir::types::TypeSet)],
 ) -> Result<Gc<'gc, Region<'gc>>, crate::jit::compile::CompileError> {
     #[cfg(target_arch = "aarch64")]
     {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::jit::compile::compile(ctx, closure, at)
+            crate::jit::compile::compile(ctx, closure, at, frame, seen)
         }));
         match r {
             Ok(r) => r,
@@ -242,7 +248,7 @@ fn compile_caught<'gc>(
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
-        let _ = (ctx, closure, at);
+        let _ = (ctx, closure, at, frame, seen);
         Err(crate::jit::compile::CompileError::Backend(
             "no backend".into(),
         ))
@@ -280,6 +286,7 @@ fn install<'gc>(
         state: EntryState::Compiled,
         depth: (word.op() != Op::FUNC) as u16,
         age,
+        seen: Vec::new(),
     });
     st.regions.push(region);
     st.compiles += 1;
@@ -325,11 +332,24 @@ fn on_exit<'gc>(
     e: &ExitInfo,
 ) {
     use crate::jit::ir::ops::ExitTag;
-    if e.kind == ExitKind::Before && e.tag.widenable() {
+    if let ExitTag::Entry(r) = e.tag {
+        record_entry(ctx, closure, base, region, r);
+    } else if e.kind == ExitKind::Before && e.tag.widenable() {
         record_site(closure, base, e.pc, e.tag == ExitTag::Overflow);
     }
     let n = e.count.get() + 1;
     e.count.set(n);
+    if n == 1 {
+        log(ctx, || {
+            format!(
+                "first exit {} pc{} ({:?}) of the region at pc{}",
+                crate::jit::compile::chunk_name(closure),
+                e.pc,
+                e.tag,
+                region.entry_pc
+            )
+        });
+    }
     if region.retired.get() {
         return;
     }
@@ -382,6 +402,33 @@ fn record_site<'gc>(closure: LuaFn<'gc>, base: *mut Value<'gc>, pc: u32, overflo
     }
 }
 
+/// Record the kind of `R[r]` a failed entry guard saw on its entry.
+fn record_entry<'gc>(
+    ctx: Context<'gc>,
+    closure: LuaFn<'gc>,
+    base: *mut Value<'gc>,
+    region: &Region<'gc>,
+    r: u8,
+) {
+    let Some(state) = closure.proto.jit.get() else {
+        return;
+    };
+    // SAFETY: an entry guard tests a live register of the frame.
+    let kind = crate::jit::build::value_set(unsafe { *base.add(r as usize) });
+    let mut st = state.borrow_mut(ctx.mutation());
+    let me = region as *const Region<'gc>;
+    if let Some(e) = st
+        .entries
+        .iter_mut()
+        .find(|e| e.region.is_some_and(|x| Gc::as_ptr(x) == me))
+    {
+        match e.seen.iter_mut().find(|(x, _)| *x == r) {
+            Some((_, s)) => *s |= kind,
+            None => e.seen.push((r, kind)),
+        }
+    }
+}
+
 fn request_recompile<'gc>(
     ctx: Context<'gc>,
     closure: LuaFn<'gc>,
@@ -413,6 +460,7 @@ fn recompile<'gc>(
     closure: LuaFn<'gc>,
     at: u32,
     slot: u16,
+    frame: *const Value<'gc>,
 ) -> Result<*const u8, Instruction> {
     let mc = ctx.mutation();
     let state = closure
@@ -420,7 +468,7 @@ fn recompile<'gc>(
         .jit
         .get()
         .expect("a recompile without a JIT state");
-    let (original, budget_left) = {
+    let (original, budget_left, seen) = {
         let st = state.borrow();
         let e = st
             .entries
@@ -430,10 +478,11 @@ fn recompile<'gc>(
         (
             e.original,
             e.free_recompile || e.recompiles < MAX_RECOMPILES,
+            e.seen.clone(),
         )
     };
     let result = if budget_left && state.borrow().compiles < MAX_COMPILES {
-        compile_caught(ctx, closure, at).map_err(|e| {
+        compile_caught(ctx, closure, at, frame, &seen).map_err(|e| {
             log(ctx, || {
                 format!(
                     "recompile of {} pc{at} failed: {e:?}",

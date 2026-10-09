@@ -2,7 +2,7 @@
 //! allocator's moves, every instruction's sequence, the exit stubs and the
 //! region's exit trampoline in the cold section.
 
-use regalloc2::{Allocation, Edit, Function, Output, PReg, RegClass};
+use regalloc2::{Allocation, Edit, Output, PReg, RegClass};
 
 use crate::env::value::Value;
 use crate::jit::backend::aarch64::abi::{

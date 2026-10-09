@@ -2,11 +2,14 @@
 //! allocation and emission.
 
 use crate::env::function::LuaFn;
+use crate::env::value::Value;
 use crate::jit::build::cfg::{Cfg, CfgError};
-use crate::jit::build::{BuildError, Builder, remove_trivial_params};
+use crate::jit::build::{BuildError, Builder, remove_trivial_params, value_set};
 use crate::jit::ir::Func;
+use crate::jit::ir::types::TypeSet;
 use crate::jit::ir::verify::verify;
 use crate::jit::opt;
+use crate::jit::opt::speculate::EntryKinds;
 use crate::lua::Context;
 
 /// Why a compile failed: always an internal limit, never a semantic decline
@@ -17,6 +20,8 @@ pub(crate) enum CompileError {
     TooLarge,
     Verify(String),
     Backend(String),
+    /// No path does work before a deopt nothing widens (`opt::completes`).
+    Useless,
 }
 
 impl From<CfgError> for CompileError {
@@ -41,12 +46,15 @@ pub(crate) struct Options {
     pub(crate) deopt_all: bool,
 }
 
-/// The optimized IR of the region of `closure` entered at `pc`.
+/// The optimized IR of the region of `closure` entered at `pc`. `frame` is
+/// the frame standing at the entry, or null.
 pub(crate) fn build_ir<'gc>(
     ctx: Context<'gc>,
     closure: LuaFn<'gc>,
     pc: u32,
     opts: &Options,
+    frame: *const Value<'gc>,
+    seen: &[(u8, TypeSet)],
 ) -> Result<(Func<'gc>, Cfg), CompileError> {
     let code: Vec<_> = closure
         .proto
@@ -67,8 +75,28 @@ pub(crate) fn build_ir<'gc>(
         Ok(())
     };
     check(&f, "build")?;
+    let mut kinds = EntryKinds {
+        frame: Vec::new(),
+        seen: seen.to_vec(),
+    };
+    if loop_entry && !frame.is_null() {
+        kinds.frame = vec![TypeSet::empty(); cfg.nregs];
+        for r in cfg.live_in[pc as usize].iter() {
+            if r < cfg.nregs {
+                // SAFETY: a live register of the frame holds a value.
+                kinds.frame[r] = value_set(unsafe { *frame.add(r) });
+            }
+        }
+    }
+    opt::infer::infer(&mut f);
+    if opt::speculate::speculate(&mut f, &kinds) {
+        check(&f, "speculate")?;
+    }
     optimize(&mut f);
     check(&f, "optimize")?;
+    if !opt::completes(&f) {
+        return Err(CompileError::Useless);
+    }
     // `cfg` is borrowed by nothing past here.
     Ok((f, cfg))
 }
@@ -133,6 +161,8 @@ pub(crate) fn compile<'gc>(
     ctx: Context<'gc>,
     closure: LuaFn<'gc>,
     pc: u32,
+    frame: *const Value<'gc>,
+    seen: &[(u8, TypeSet)],
 ) -> Result<crate::dmm::Gc<'gc, crate::jit::region::Region<'gc>>, CompileError> {
     use crate::jit::backend::aarch64::{abi, emit, lower};
     use crate::jit::region::{ExitInfo, Region, SnapEntry};
@@ -142,7 +172,7 @@ pub(crate) fn compile<'gc>(
         deopt_all: config.deopt_all,
     };
     note_upvalues_offset(closure);
-    let (mut f, _cfg) = build_ir(ctx, closure, pc, &opts)?;
+    let (mut f, _cfg) = build_ir(ctx, closure, pc, &opts, frame, seen)?;
     opt::split_critical_edges(&mut f);
     if opts.check {
         verify(&f)
