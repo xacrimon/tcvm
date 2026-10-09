@@ -34,6 +34,17 @@ impl<'gc> Context<'gc> {
         Context { state }
     }
 
+    /// The context of the `rt` register compiled code holds.
+    ///
+    /// # Safety
+    /// `state` is the running `State`, inside its `Lua::enter`.
+    #[inline(always)]
+    pub(crate) unsafe fn from_state(state: *const State<'static>) -> Self {
+        Context {
+            state: unsafe { &*(state as *const State<'gc>) },
+        }
+    }
+
     #[inline(always)]
     pub fn mutation(self) -> &'gc Mutation<'gc> {
         // SAFETY: set by `Context::new` inside `Lua::enter`, whose closure

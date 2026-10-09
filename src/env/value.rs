@@ -438,6 +438,15 @@ impl<'gc> Value<'gc> {
         self.bits
     }
 
+    /// The value of a raw encoding.
+    ///
+    /// # Safety
+    /// `bits` came from `to_raw` of a value that is live.
+    #[inline(always)]
+    pub(crate) unsafe fn from_raw(bits: u64) -> Self {
+        Self::from_bits(bits)
+    }
+
     /// An object a weak table may drop. Strings and boxed integers are collectable but count
     /// as values (§2.5.4).
     #[inline(always)]

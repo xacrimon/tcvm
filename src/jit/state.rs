@@ -105,6 +105,9 @@ pub(crate) struct JitRuntime {
     /// Bumped when a number metatable is set (section 11.5).
     pub(crate) epoch: Cell<u32>,
     pub(crate) config: JitConfig,
+    code: RefCell<Option<std::rc::Rc<crate::jit::backend::alloc::CodeAllocator>>>,
+    /// Compile failures from running out of code memory turn the JIT off.
+    pub(crate) exhausted: Cell<bool>,
 }
 
 #[derive(Default)]
@@ -128,6 +131,8 @@ impl JitRuntime {
             exit_regs_buf,
             epoch: Cell::new(0),
             config,
+            code: RefCell::new(None),
+            exhausted: Cell::new(false),
         };
         rt.grow_table(16);
         rt
@@ -171,6 +176,19 @@ impl JitRuntime {
         let mut t = self.table.borrow_mut();
         t.slots[d as usize].set(std::ptr::null());
         t.free.push(d);
+    }
+
+    /// The code allocator, created with the first compile.
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn code_alloc(&self) -> std::rc::Rc<crate::jit::backend::alloc::CodeAllocator> {
+        self.code
+            .borrow_mut()
+            .get_or_insert_with(|| {
+                std::rc::Rc::new(crate::jit::backend::alloc::CodeAllocator::new(
+                    crate::jit::backend::aarch64::abi::exit_common,
+                ))
+            })
+            .clone()
     }
 
     /// The register image of the last exit.
