@@ -35,6 +35,7 @@ mod goto_labels;
 mod host_load;
 mod host_resume;
 mod io_library;
+mod jit_regions;
 mod load;
 mod loadfile;
 mod local_env;

@@ -157,8 +157,9 @@ pub(crate) fn verify(f: &Func<'_>) -> Result<(), String> {
     Ok(())
 }
 
-/// No value other than a constant is live into a resume block: everything
-/// else lives in home slots across the call (R6).
+/// No value other than a constant is live into a resume block, and none
+/// once the call-boundary pass re-emitted them: everything else lives in
+/// home slots across the call (R6).
 fn check_r6(f: &Func<'_>, rpo: &[Block], _pos: &[(Block, usize)]) -> Result<(), String> {
     let live = live_in(f, rpo);
     for &b in rpo {
@@ -166,7 +167,7 @@ fn check_r6(f: &Func<'_>, rpo: &[Block], _pos: &[(Block, usize)]) -> Result<(), 
             continue;
         }
         for v in live[b.idx()].iter() {
-            if !f.def_op(Val(v as u32)).is_some_and(|op| op.is_const()) {
+            if f.boundaries || !f.def_op(Val(v as u32)).is_some_and(|op| op.is_const()) {
                 return Err(format!("v{v} is live across the call resuming at b{}", b.0));
             }
         }
