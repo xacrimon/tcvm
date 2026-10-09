@@ -104,7 +104,7 @@ handler! {
         on_exit(rt, closure, base, region, e);
         let at = if e.kind == ExitKind::Before { e.pc } else { e.pc + 1 };
         let resume = unsafe { closure.code.add(at as usize) };
-        if e.kind == ExitKind::Gc {
+        if e.kind == ExitKind::Gc || e.tag == crate::jit::ir::ops::ExitTag::Gc {
             pc = resume;
             exit!(crate::vm::abi::Exit::Gc)
         }

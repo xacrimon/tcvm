@@ -926,6 +926,13 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             self.deopt(ExitTag::NeverRan);
             return;
         }
+        if self.cfg.loops.iter().any(|l| l.header == bc) {
+            // The collector's chance once per iteration; `prune_gc_checks`
+            // keeps it only in loops that allocate or call.
+            self.pc = start;
+            let s = self.snap_before();
+            self.ins_snap(Op::GcCheck, &[], s, ExitTag::Gc);
+        }
         for pc in start..end {
             self.pc = pc;
             self.cur_snap = None;
