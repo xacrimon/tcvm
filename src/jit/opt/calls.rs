@@ -5,7 +5,7 @@
 
 use crate::jit::FastMap;
 use crate::jit::ir::verify::live_in;
-use crate::jit::ir::{Block, CfgInfo, Func, Inst, Snap, Val};
+use crate::jit::ir::{Block, CfgInfo, Func, Inst, Val};
 
 pub(crate) fn call_boundaries(f: &mut Func<'_>) -> Result<(), String> {
     f.boundaries = true;
@@ -78,7 +78,7 @@ pub(crate) fn call_boundaries(f: &mut Func<'_>) -> Result<(), String> {
                     }
                 };
                 if r != v {
-                    rewrite(f, i, v, r);
+                    f.replace_uses(i, v, r);
                 }
             }
         }
@@ -90,27 +90,6 @@ fn uses(f: &Func<'_>, i: Inst, v: Val) -> bool {
     let mut u = false;
     f.for_each_use(i, |x| u |= x == v);
     u
-}
-
-fn rewrite(f: &mut Func<'_>, i: Inst, v: Val, r: Val) {
-    for a in f.args_mut(i) {
-        if *a == v {
-            *a = r;
-        }
-    }
-    for e in 0..f.edges(i).len() {
-        for a in f.edge_args_mut(i, e) {
-            if *a == v {
-                *a = r;
-            }
-        }
-    }
-    let s = f.insts[i.idx()].snap;
-    // Snapshots may be shared: rewrite a copy.
-    if f.snap_entries(i).iter().any(|e| e.1 == v) {
-        let ns = f.map_snap(Snap(s), |x| if x == v { r } else { x });
-        f.insts[i.idx()].snap = ns.0;
-    }
 }
 
 /// The definition of `v` reaching each block (Braun et al.'s lookup, every

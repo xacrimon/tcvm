@@ -2,9 +2,10 @@
 //! set, and the value is guarded once where it is defined instead, so
 //! inference carries the type to every use.
 
+use crate::jit::FastMap;
 use crate::jit::ir::ops::{ExitTag, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
-use crate::jit::ir::{ExitKind, Func, Inst, Snap, Val, ValDef};
+use crate::jit::ir::{Block, CfgInfo, ExitKind, Func, Inst, Snap, Val, ValDef};
 
 /// What is known of the values a region is entered with.
 #[derive(Default)]
@@ -68,36 +69,42 @@ pub(crate) fn speculate(f: &mut Func<'_>, kinds: &EntryKinds) -> bool {
             });
         }
     }
-    let safe = down_safe(f, &cands);
-    let cands: Vec<Cand> = cands
-        .into_iter()
-        .zip(safe)
-        .filter(|(c, s)| c.entry.is_some() || *s)
-        .map(|(c, _)| c)
-        .collect();
     if cands.is_empty() {
         return false;
     }
-    let mut guards = Vec::with_capacity(cands.len());
-    for c in &cands {
-        let tag = if c.entry.is_some() {
-            ExitTag::Entry
-        } else {
-            ExitTag::Type
-        };
-        let g = f.make_inst(Op::Guard(c.set), &[c.v], None, tag);
-        if c.entry.is_some() {
-            f.insert_before_term(f.entry, g);
-        } else {
-            let d = f.def_inst(c.v).unwrap();
-            let b = f.insts[d.idx()].block;
-            let at = f.insts_of(b).iter().position(|&x| x == d).unwrap();
-            f.insert(b, at + 1, g);
+    let ant = anticipated(f, &cands);
+    let cfg = f.cfg();
+    // Where each guard goes: in the prologue for an entry value; after the
+    // definition when every path from there reaches a use expecting the set;
+    // else at the earliest blocks the definition dominates from which every
+    // path does, so no guard deopts an execution a use's guard would not
+    // have (9.1). Values without any keep their uses' guards.
+    let mut places: Vec<(usize, Option<Block>)> = Vec::new();
+    for (ci, c) in cands.iter().enumerate() {
+        if c.entry.is_some() || ant.after_def[ci] {
+            places.push((ci, None));
+            continue;
         }
-        guards.push(g);
+        let d = f.def_inst(c.v).unwrap();
+        let db = f.insts[d.idx()].block;
+        for &b in &cfg.rpo {
+            if b == db || !ant.at(b, ci) || !cfg.dominates(db, b) {
+                continue;
+            }
+            let mut x = cfg.idom[b.idx()].unwrap();
+            while x != db && !ant.at(x, ci) {
+                x = cfg.idom[x.idx()].unwrap();
+            }
+            if x == db && !barrier(f, &cfg, d, b) {
+                places.push((ci, Some(b)));
+            }
+        }
+    }
+    if places.is_empty() {
+        return false;
     }
     // Each guard tests the value itself and exits with the frame of the
-    // value's definition, which the replacement must not touch.
+    // value's definition, which the replacements below must not touch.
     let frames: Vec<(u32, ExitKind, Vec<(u8, Val)>)> = cands
         .iter()
         .map(|c| match c.snap {
@@ -109,16 +116,59 @@ pub(crate) fn speculate(f: &mut Func<'_>, kinds: &EntryKinds) -> bool {
             None => (f.meta.entry_pc, ExitKind::Before, Vec::new()),
         })
         .collect();
+    let mut guards = Vec::with_capacity(places.len());
+    for &(ci, at) in &places {
+        let c = &cands[ci];
+        let tag = if c.entry.is_some() {
+            ExitTag::Entry
+        } else {
+            ExitTag::Type
+        };
+        let g = f.make_inst(Op::Guard(c.set), &[c.v], None, tag);
+        match at {
+            None if c.entry.is_some() => f.insert_before_term(f.entry, g),
+            None => {
+                let d = f.def_inst(c.v).unwrap();
+                let b = f.insts[d.idx()].block;
+                let k = f.insts_of(b).iter().position(|&x| x == d).unwrap();
+                f.insert(b, k + 1, g);
+            }
+            Some(b) => f.insert(b, 0, g),
+        }
+        guards.push(g);
+    }
+    // A guard after the definition dominates every use; one in a block,
+    // the uses that block dominates.
     let mut map: Vec<Val> = (0..f.vals.len() as u32).map(Val).collect();
-    for (c, &g) in cands.iter().zip(&guards) {
-        map[c.v.idx()] = f.result(g);
+    for (&(ci, at), &g) in places.iter().zip(&guards) {
+        if at.is_none() {
+            map[cands[ci].v.idx()] = f.result(g);
+        }
     }
     f.apply_replacements(&mut map);
-    for ((c, &g), (pc, kind, entries)) in cands.into_iter().zip(&guards).zip(frames) {
-        f.args_mut(g)[0] = c.v;
+    for (&(ci, at), &g) in places.iter().zip(&guards) {
+        let Some(b) = at else {
+            continue;
+        };
+        let (v, r) = (cands[ci].v, f.result(g));
+        for &x in &cfg.rpo {
+            if !cfg.dominates(b, x) {
+                continue;
+            }
+            for k in 0..f.blocks[x.idx()].insts.len() {
+                let i = f.insts_of(x)[k];
+                if i != g {
+                    f.replace_uses(i, v, r);
+                }
+            }
+        }
+    }
+    for (&(ci, _), &g) in places.iter().zip(&guards) {
+        f.args_mut(g)[0] = cands[ci].v;
+        let (pc, kind, entries) = &frames[ci];
         let from = f.snap_pool.len();
-        f.snap_pool.extend_from_slice(&entries);
-        let s = f.finish_snap(pc, kind, from);
+        f.snap_pool.extend_from_slice(entries);
+        let s = f.finish_snap(*pc, *kind, from);
         f.insts[g.idx()].snap = s.0;
     }
     true
@@ -193,69 +243,129 @@ fn entry_set(f: &Func<'_>, kinds: &EntryKinds, r: u8, e: TypeSet) -> Option<Type
     fits.then_some(e)
 }
 
-/// For each candidate, whether every path from just after its definition
-/// reaches a use expecting a subset of its set before leaving the region
-/// other than by an exit: a guard there deopts no execution that would not
-/// have deopted anyway (the anticipability of partial redundancy
-/// elimination). A value's names are itself and the parameters it flows
-/// into.
-fn down_safe(f: &Func<'_>, cands: &[Cand]) -> Vec<bool> {
+/// Per block and candidate, whether every path from the block's start
+/// reaches a use expecting a subset of the candidate's set before leaving
+/// the region other than by an exit (the anticipability, or down-safety, of
+/// partial redundancy elimination), and the same just after each
+/// candidate's definition: one bit-vector dataflow for all candidates. A
+/// value's names are itself and the parameters it flows into.
+struct Ant {
+    words: usize,
+    at_start: Vec<u64>,
+    after_def: Vec<bool>,
+}
+
+impl Ant {
+    fn at(&self, b: Block, c: usize) -> bool {
+        self.at_start[b.idx() * self.words + c / 64] >> (c % 64) & 1 != 0
+    }
+}
+
+fn anticipated(f: &Func<'_>, cands: &[Cand]) -> Ant {
     let cfg = f.cfg();
     let rpo = &cfg.rpo;
-    let mut out = vec![false; cands.len()];
+    let w = cands.len().div_ceil(64);
+    // The candidates each value names, and those each instruction defines.
+    let mut names: FastMap<Val, Vec<usize>> = FastMap::default();
+    let mut defs: FastMap<Inst, Vec<usize>> = FastMap::default();
     for (ci, c) in cands.iter().enumerate() {
         if c.entry.is_some() {
             continue;
         }
-        let mut names = vec![false; f.vals.len()];
-        names[c.v.idx()] = true;
+        defs.entry(f.def_inst(c.v).unwrap()).or_default().push(ci);
+        let mut mine = vec![c.v];
         let mut grew = true;
         while grew {
             grew = false;
             for &b in rpo {
                 for (k, &p) in f.params(b).iter().enumerate() {
-                    if !names[p.idx()]
+                    if !mine.contains(&p)
                         && cfg
                             .incoming(b)
                             .iter()
-                            .any(|&(t, j)| names[f.edge_args(t, j as usize)[k].idx()])
+                            .any(|&(t, j)| mine.contains(&f.edge_args(t, j as usize)[k]))
                     {
-                        names[p.idx()] = true;
+                        mine.push(p);
                         grew = true;
                     }
                 }
             }
         }
-        let def = f.def_inst(c.v).unwrap();
-        let mut ds_in = vec![true; f.blocks.len()];
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for &b in rpo.iter().rev() {
-                let insts = f.insts_of(b);
-                let term = *insts.last().unwrap();
-                let mut cur = match f.op(term) {
-                    Op::Deopt => true,
-                    Op::Jump | Op::Br => f.succs(b).all(|s| ds_in[s.idx()]),
-                    _ => false,
-                };
-                for &i in insts.iter().rev() {
-                    if i == def {
-                        out[ci] = cur;
-                    }
-                    if let Some((a, set)) = informative(f, i)
-                        && names[a.idx()]
-                        && c.set.contains(set)
-                    {
-                        cur = true;
+        for v in mine {
+            names.entry(v).or_default().push(ci);
+        }
+    }
+    let mut at_start = vec![!0u64; f.blocks.len() * w];
+    let mut after_def = vec![false; cands.len()];
+    let mut cur = vec![0u64; w];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &b in rpo.iter().rev() {
+            let insts = f.insts_of(b);
+            let term = *insts.last().unwrap();
+            match f.op(term) {
+                Op::Deopt => cur.fill(!0),
+                Op::Jump | Op::Br => {
+                    cur.fill(!0);
+                    for s in f.succs(b) {
+                        for (x, y) in cur.iter_mut().zip(&at_start[s.idx() * w..]) {
+                            *x &= y;
+                        }
                     }
                 }
-                if cur != ds_in[b.idx()] {
-                    ds_in[b.idx()] = cur;
-                    changed = true;
+                _ => cur.fill(0),
+            }
+            for &i in insts.iter().rev() {
+                if let Some(cs) = defs.get(&i) {
+                    for &c in cs {
+                        after_def[c] = cur[c / 64] >> (c % 64) & 1 != 0;
+                    }
                 }
+                if let Some((a, set)) = informative(f, i)
+                    && let Some(cs) = names.get(&a)
+                {
+                    for &c in cs {
+                        if cands[c].set.contains(set) {
+                            cur[c / 64] |= 1 << (c % 64);
+                        }
+                    }
+                }
+            }
+            let row = &mut at_start[b.idx() * w..(b.idx() + 1) * w];
+            if row != cur.as_slice() {
+                row.copy_from_slice(&cur);
+                changed = true;
             }
         }
     }
-    out
+    Ant {
+        words: w,
+        at_start,
+        after_def,
+    }
+}
+
+/// Whether a path from `d` to the start of `b` writes or calls: a guard at
+/// `b` exits with `d`'s frame, and the interpreter runs what lies between
+/// again.
+fn barrier(f: &Func<'_>, cfg: &CfgInfo, d: Inst, b: Block) -> bool {
+    let writes = |i: &Inst| f.op(*i).effects().writes();
+    let db = f.insts[d.idx()].block;
+    let k = f.insts_of(db).iter().position(|&x| x == d).unwrap();
+    if f.insts_of(db)[k + 1..].iter().any(writes) {
+        return true;
+    }
+    let mut seen = vec![false; f.blocks.len()];
+    let mut work = cfg.preds(b).to_vec();
+    while let Some(x) = work.pop() {
+        if x == db || std::mem::replace(&mut seen[x.idx()], true) {
+            continue;
+        }
+        if f.blocks[x.idx()].resume || f.insts_of(x).iter().any(writes) {
+            return true;
+        }
+        work.extend_from_slice(cfg.preds(x));
+    }
+    false
 }
