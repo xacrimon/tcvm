@@ -27,18 +27,6 @@ impl Cc {
         }
     }
 
-    /// The integer comparison true exactly when this one is false.
-    pub(crate) fn negate(self) -> Cc {
-        match self {
-            Cc::Eq => Cc::Ne,
-            Cc::Ne => Cc::Eq,
-            Cc::Lt => Cc::Ge,
-            Cc::Le => Cc::Gt,
-            Cc::Gt => Cc::Le,
-            Cc::Ge => Cc::Lt,
-        }
-    }
-
     pub(crate) fn eval_i(self, a: i64, b: i64) -> bool {
         match self {
             Cc::Eq => a == b,
@@ -69,12 +57,6 @@ pub(crate) enum HelperId {
     FMod,
     /// `(f64, f64) -> f64`: `pow`.
     FPow,
-    /// `(rt, i64) -> Value`: box an integer outside i32 (allocates).
-    BoxI64,
-    /// `(rt, thread, base, a, values, nret, wanted)`: land a call's results
-    /// into `R[a..a+wanted]`, or all of them up to `top` when `wanted` is
-    /// MULTRET.
-    Land,
 }
 
 impl HelperId {
@@ -82,8 +64,6 @@ impl HelperId {
         match self {
             HelperId::FMod => "fmod",
             HelperId::FPow => "pow",
-            HelperId::BoxI64 => "box_i64",
-            HelperId::Land => "land",
         }
     }
 }
@@ -118,6 +98,8 @@ impl ExitTag {
     }
 }
 
+// Some operations are lowered already but produced only from milestone 2.
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Op {
     // --- constants: pure, no operands --------------------------------------
@@ -278,17 +260,12 @@ impl Effects {
     pub(crate) const TERMINATOR: Effects = Effects(8);
     pub(crate) const R_SLOT: Effects = Effects(16);
     pub(crate) const W_SLOT: Effects = Effects(32);
-    pub(crate) const W_GC: Effects = Effects(64);
     pub(crate) const R_GC: Effects = Effects(128);
     /// Writes every class (a call: anything may run).
     pub(crate) const W_ALL: Effects = Effects(0xffff_0000);
 
     pub(crate) fn has(self, e: Effects) -> bool {
         self.0 & e.0 == e.0
-    }
-
-    pub(crate) fn any(self, e: Effects) -> bool {
-        self.0 & e.0 != 0
     }
 }
 
@@ -309,8 +286,6 @@ impl Op {
             | INeg | IShl | IShr | IDivFloor | IModFloor | LDivFloor | LModFloor | LToI
             | FToIExact | ToF64 => Effects::MAY_DEOPT,
             GcCheck => Effects::MAY_DEOPT | Effects::R_GC,
-            Helper(HelperId::BoxI64) => Effects::MAY_ALLOC | Effects::W_GC,
-            Helper(HelperId::Land) => Effects::W_SLOT | Effects::R_SLOT,
             Helper(_) => Effects::NONE,
             Resume { .. } => Effects::R_SLOT,
             Jump | Br => Effects::TERMINATOR,
@@ -363,7 +338,6 @@ impl Op {
             | Return { .. }
             | Call { .. }
             | Deopt => 0,
-            Helper(HelperId::Land) => 0,
             Resume { c } => match c {
                 2 => 1,
                 3 => 2,
@@ -407,7 +381,6 @@ impl Op {
             IToL | FToL | LAdd | LSub | LMul | LUDiv | LNeg | LAnd | LOr | LXor | LNot | LShl
             | LShr | LDivFloor | LModFloor => Ty::I64,
             Helper(HelperId::FMod | HelperId::FPow) => Ty::F64,
-            Helper(HelperId::BoxI64) => Ty::val(TypeSet::INT),
             _ => Ty::ANY,
         }
     }

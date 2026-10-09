@@ -393,29 +393,6 @@ impl<'gc> Func<'gc> {
         uses
     }
 
-    /// Replace every use of `from` with `to`.
-    pub(crate) fn replace_uses(&mut self, from: Val, to: Val) {
-        for a in &mut self.args {
-            if *a == from {
-                *a = to;
-            }
-        }
-        for e in &mut self.edges {
-            for a in &mut e.args {
-                if *a == from {
-                    *a = to;
-                }
-            }
-        }
-        for s in &mut self.snaps {
-            for (_, v) in &mut s.entries {
-                if *v == from {
-                    *v = to;
-                }
-            }
-        }
-    }
-
     /// Replace uses through a map from each value to its replacement (or
     /// itself), resolving chains.
     pub(crate) fn apply_replacements(&mut self, map: &mut [Val]) {

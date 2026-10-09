@@ -21,11 +21,6 @@ impl RegSet {
         self.0[r / 64] &= !(1 << (r % 64));
     }
 
-    #[inline]
-    pub(crate) fn contains(&self, r: usize) -> bool {
-        self.0[r / 64] >> (r % 64) & 1 != 0
-    }
-
     pub(crate) fn union(&mut self, o: &RegSet) {
         for i in 0..4 {
             self.0[i] |= o.0[i];
@@ -36,15 +31,6 @@ impl RegSet {
         for i in 0..4 {
             self.0[i] &= !o.0[i];
         }
-    }
-
-    /// All registers from `lo` below `hi`.
-    pub(crate) fn range(lo: usize, hi: usize) -> RegSet {
-        let mut s = RegSet::EMPTY;
-        for r in lo..hi.min(256) {
-            s.insert(r);
-        }
-        s
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = usize> + '_ {
@@ -352,13 +338,9 @@ pub(crate) struct Cfg {
     /// Registers live into each instruction.
     pub(crate) live_in: Vec<RegSet>,
     pub(crate) captured: RegSet,
-    pub(crate) idom: Vec<u32>,
-    pub(crate) rpo: Vec<u32>,
     pub(crate) loops: Vec<Loop>,
     /// The innermost loop of each block.
     pub(crate) loop_of: Vec<Option<usize>>,
-    /// Blocks a site has recorded in, or that dominate one (6.3).
-    pub(crate) ran: Vec<bool>,
     /// Blocks whose recording sites all lack a record.
     pub(crate) never_ran: Vec<bool>,
 }
@@ -653,39 +635,10 @@ impl Cfg {
             block_of,
             live_in,
             captured,
-            idom,
-            rpo,
             loops,
             loop_of,
-            ran,
             never_ran,
         })
-    }
-
-    /// Registers live after the instruction at `pc` on its fallthrough or
-    /// any edge: the union of its successors' live-in.
-    pub(crate) fn live_out(&self, pc: u32) -> RegSet {
-        let b = self.block_of[pc as usize] as usize;
-        if pc + 1 < self.blocks[b].end {
-            return self.live_in[pc as usize + 1];
-        }
-        let mut s = RegSet::EMPTY;
-        for &succ in &self.blocks[b].succs {
-            s.union(&self.live_in[self.blocks[succ as usize].start as usize]);
-        }
-        s
-    }
-
-    /// Whether loop `outer` contains loop `inner` (or is it).
-    pub(crate) fn loop_contains(&self, outer: usize, inner: usize) -> bool {
-        let mut x = Some(inner);
-        while let Some(i) = x {
-            if i == outer {
-                return true;
-            }
-            x = self.loops[i].parent;
-        }
-        false
     }
 }
 

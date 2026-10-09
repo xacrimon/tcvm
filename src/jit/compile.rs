@@ -24,6 +24,18 @@ pub(crate) enum CompileError {
     Useless,
 }
 
+impl std::fmt::Display for CompileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CompileError::Irreducible => write!(f, "irreducible control flow"),
+            CompileError::TooLarge => write!(f, "too large"),
+            CompileError::Verify(s) => write!(f, "verifier: {s}"),
+            CompileError::Backend(s) => write!(f, "backend: {s}"),
+            CompileError::Useless => write!(f, "no path does work before a deopt"),
+        }
+    }
+}
+
 impl From<CfgError> for CompileError {
     fn from(e: CfgError) -> Self {
         match e {
@@ -35,7 +47,6 @@ impl From<CfgError> for CompileError {
 impl From<BuildError> for CompileError {
     fn from(e: BuildError) -> Self {
         match e {
-            BuildError::Irreducible => CompileError::Irreducible,
             BuildError::TooLarge => CompileError::TooLarge,
         }
     }
@@ -49,7 +60,6 @@ pub(crate) struct Options {
 /// The optimized IR of the region of `closure` entered at `pc`. `frame` is
 /// the frame standing at the entry, or null.
 pub(crate) fn build_ir<'gc>(
-    ctx: Context<'gc>,
     closure: LuaFn<'gc>,
     pc: u32,
     opts: &Options,
@@ -64,7 +74,7 @@ pub(crate) fn build_ir<'gc>(
         .collect();
     let loop_entry = code[pc as usize].op() != crate::instruction::Op::FUNC;
     let cfg = Cfg::build(&closure.proto, code, pc)?;
-    let mut b = Builder::new(ctx, closure, &cfg, pc, loop_entry);
+    let mut b = Builder::new(closure, &cfg, pc, loop_entry);
     b.deopt_all = opts.deopt_all;
     let mut f = b.build()?;
     let check = |f: &Func<'gc>, stage: &str| -> Result<(), CompileError> {
@@ -178,7 +188,7 @@ pub(crate) fn compile<'gc>(
         deopt_all: config.deopt_all,
     };
     note_upvalues_offset(closure);
-    let (mut f, _cfg) = build_ir(ctx, closure, pc, &opts, frame, seen)?;
+    let (mut f, _cfg) = build_ir(closure, pc, &opts, frame, seen)?;
     opt::split_critical_edges(&mut f);
     if opts.check {
         verify(&f)
@@ -263,7 +273,7 @@ pub(crate) fn compile<'gc>(
         ctx.mutation(),
         Region {
             code: block,
-            alloc,
+            _alloc: alloc,
             entry,
             pool: f.pool.clone().into_boxed_slice(),
             exits: exits.into_boxed_slice(),
@@ -274,7 +284,6 @@ pub(crate) fn compile<'gc>(
             frame_size: em.frame_size,
             num_spills: em.num_spills,
             retired: std::cell::Cell::new(false),
-            entry_fails: std::cell::Cell::new(0),
         },
     );
     region

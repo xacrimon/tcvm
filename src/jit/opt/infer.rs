@@ -5,7 +5,7 @@
 use crate::jit::build::incoming;
 use crate::jit::ir::ops::{ExitTag, Op};
 use crate::jit::ir::types::{Rep, Ty, TypeSet};
-use crate::jit::ir::{Block, Func, Val, ValDef};
+use crate::jit::ir::{Block, Func, Val};
 
 /// Whether the builder fixed the result type of `op` from knowledge the
 /// operands do not carry.
@@ -234,11 +234,6 @@ pub(crate) fn convert(f: &mut Func<'_>, a: Val, rep: Rep, at: Block) -> Val {
         f.vals[r.idx()].ty.set = ty.set & Ty::of_rep(rep).set;
     }
     r
-}
-
-/// Whether `v` is a block parameter.
-pub(crate) fn is_param(f: &Func<'_>, v: Val) -> bool {
-    matches!(f.vals[v.idx()].def, ValDef::Param(..))
 }
 
 /// Make every edge argument the representation of its parameter, boxing or

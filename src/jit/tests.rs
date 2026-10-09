@@ -26,7 +26,7 @@ pub(crate) fn ir_of(src: &str, name: &str, pc: u32) -> String {
             check: true,
             deopt_all: false,
         };
-        match crate::jit::compile::build_ir(ctx, lf, pc, &opts, std::ptr::null(), &[]) {
+        match crate::jit::compile::build_ir(lf, pc, &opts, std::ptr::null(), &[]) {
             Ok((func, _)) => func.print(),
             Err(e) => panic!("{e:?}"),
         }

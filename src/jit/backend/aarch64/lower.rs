@@ -40,8 +40,6 @@ pub(crate) struct Lowered {
     pub(crate) exits: Vec<LExit>,
     /// The first operand index of each instruction's snapshot uses.
     pub(crate) snap_ops: Vec<u32>,
-    /// IR block of each VCode block.
-    pub(crate) order: Vec<Block>,
 }
 
 struct Lower<'a, 'gc> {
@@ -160,7 +158,6 @@ pub(crate) fn lower<'gc>(f: &Func<'gc>, code_base: usize) -> Result<Lowered, Str
         vcode: lw.v,
         exits: lw.exits,
         snap_ops: lw.snap_ops,
-        order,
     })
 }
 
@@ -763,7 +760,6 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 clob.remove(preg_float(0));
                 self.push(MInst::Helper(h), &ops, clob);
             }
-            Op::Helper(h) => return Err(format!("helper {h:?} as an instruction")),
             Op::Resume { c } => {
                 let a = match self.f.blocks[self.f.insts[i.idx()].block.idx()].resume {
                     true => self.resume_a(i),
