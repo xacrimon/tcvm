@@ -192,6 +192,9 @@ pub(crate) struct Region<'gc> {
     pub(crate) entry_fails: Cell<u32>,
     pub(crate) proto: Gc<'gc, Prototype<'gc>>,
     pub(crate) entry_pc: u32,
+    /// The entry's loop nest, innermost first (`Entry::nest`).
+    #[collect(require_static)]
+    pub(crate) nest: Box<[u32]>,
     /// The native frame's size, which `exit_common` pops.
     #[collect(require_static)]
     pub(crate) frame_size: u32,

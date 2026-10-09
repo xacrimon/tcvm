@@ -332,7 +332,7 @@ fn install<'gc>(
         recompiles: 0,
         free_recompile: false,
         state: EntryState::Compiled,
-        depth: (word.op() != Op::FUNC) as u16,
+        nest: region.nest.clone(),
         age,
         seen: Vec::new(),
     });
@@ -340,13 +340,27 @@ fn install<'gc>(
     st.compiles += 1;
     write_code(closure, at, jw);
     if st.entries.len() > MAX_ENTRIES {
-        // The oldest loop entry other than this one.
+        // A loop entry inside another live entry's loop, whose region
+        // covers it but for the rest of one outer iteration after a deopt
+        // (5.2): the deepest such, else the oldest loop entry, never this one.
+        let inside = |e: &Entry<'_>| {
+            st.entries
+                .iter()
+                .any(|o| o.pc != e.pc && !o.nest.is_empty() && e.nest[1..].contains(&o.nest[0]))
+        };
         let victim = st
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.pc != at && e.depth > 0)
-            .min_by_key(|(_, e)| e.age)
+            .filter(|(_, e)| e.pc != at && !e.nest.is_empty())
+            .max_by_key(|(_, e)| {
+                let n = inside(e);
+                (
+                    n,
+                    if n { e.nest.len() } else { 0 },
+                    std::cmp::Reverse(e.age),
+                )
+            })
             .map(|(i, _)| i);
         if let Some(v) = victim {
             let e = st.entries.remove(v);

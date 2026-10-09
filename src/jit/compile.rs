@@ -206,7 +206,15 @@ pub(crate) fn compile<'gc>(
     };
     note_upvalues_offset(closure);
     let mut times = Times::default();
-    let (mut f, _cfg) = build_ir(closure, pc, &opts, frame, seen, &mut times)?;
+    let (mut f, cfg) = build_ir(closure, pc, &opts, frame, seen, &mut times)?;
+    let mut nest = Vec::new();
+    if f.meta.loop_entry {
+        let mut l = cfg.loop_of[cfg.block_of[pc as usize] as usize];
+        while let Some(i) = l {
+            nest.push(cfg.blocks[cfg.loops[i].header as usize].start);
+            l = cfg.loops[i].parent;
+        }
+    }
     opt::split_critical_edges(&mut f);
     if opts.check {
         verify(&f)
@@ -339,6 +347,7 @@ pub(crate) fn compile<'gc>(
             entry_fails: std::cell::Cell::new(0),
             proto: closure.proto,
             entry_pc: pc,
+            nest: nest.into_boxed_slice(),
             frame_size: em.frame_size,
             num_spills: em.num_spills,
             retired: std::cell::Cell::new(false),
