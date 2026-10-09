@@ -236,9 +236,10 @@ pub(crate) struct Entry<'gc> {
     pub(crate) free_recompile: bool,
     #[collect(require_static)]
     pub(crate) state: EntryState,
-    /// Depth of the loop header in the loop forest (0 for a function entry),
-    /// for eviction.
-    pub(crate) depth: u16,
+    /// The headers (first pcs) of a loop entry's loop and the loops around
+    /// it, innermost first; empty for a function entry.
+    #[collect(require_static)]
+    pub(crate) nest: Box<[u32]>,
     pub(crate) age: u32,
     /// Kinds of the entry values failed entry guards saw, by register.
     #[collect(require_static)]
