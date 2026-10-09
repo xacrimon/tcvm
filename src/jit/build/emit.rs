@@ -102,12 +102,12 @@ pub(super) fn always_deopts(b: &Builder<'_, '_>, pc: u32) -> bool {
     use BcOp::*;
     match insn.op() {
         MOVE | LOAD | LOADI | LOADNIL | LFALSESKIP | GETUPVAL | NOP | FUNC | LOOP | JMP | NOT
-        | ERRNNIL | JT | JF | JTSET | JFSET | RETURN0 | RETURN1 | FORLOOP_I | FORLOOP_F | JEQS
-        | JNEQS => false,
+        | ERRNNIL | JT | JF | JTSET | JFSET | RETURN0 | RETURN1 | FORLOOP_I | FORLOOP_F
+        | FORLOOP | JEQS | JNEQS => false,
         VARARGPREP => b.proto.needs_vararg_table,
         RETURN => insn.b() == 0,
         CALL | CALL_R0 | CALL_R1 | CALLS | CALLS_R0 | CALLS_R1 => insn.b() == 0,
-        FORPREP => !matches!(forloop_kind(b, pc), BcOp::FORLOOP_I | BcOp::FORLOOP_F),
+        FORPREP => false,
         UNM | BNOT => false,
         op => match op.info().family {
             Family::RegArith | Family::RegBit | Family::ImmArith | Family::ImmBit => {
@@ -119,11 +119,33 @@ pub(super) fn always_deopts(b: &Builder<'_, '_>, pc: u32) -> bool {
     }
 }
 
-/// The form of the FORLOOP a FORPREP at `pc` guards.
-fn forloop_kind(b: &Builder<'_, '_>, pc: u32) -> BcOp {
+/// How the numeric loop whose FORLOOP is at `pc` compiles: as its form,
+/// unless the feedback of the FORLOOP or its FORPREP saw floats or big
+/// integers (`FORPREP` does not rewrite a FORLOOP that is a JIT word).
+/// `None` when it saw both integer and float loops: generic code,
+/// milestone 2.
+fn loop_kind(b: &Builder<'_, '_>, pc: u32) -> Option<BcOp> {
     let insn = b.code(pc);
-    let at = (pc as i64 + insn.branch_offset() as i64) as u32;
-    b.code(at).op()
+    let prep = (pc as i64 + insn.branch_offset() as i64) as u32;
+    let seen = (b.feedback(pc) | b.feedback(prep)) & fb::KINDS;
+    match (seen & fb::INT != 0, seen & fb::FLOAT != 0) {
+        (true, true) => None,
+        (false, true) => Some(BcOp::FORLOOP_F),
+        _ if seen & fb::BIGINT != 0 => Some(BcOp::FORLOOP),
+        _ => Some(insn.op()),
+    }
+}
+
+/// The f64 of a number operand of a float loop, which may be an integer.
+fn any_f64(b: &mut Builder<'_, '_>, v: Val) -> Val {
+    let t = b.ty(v);
+    if matches!(t.rep, Rep::I32 | Rep::I64 | Rep::F64)
+        || (!t.set.is_empty() && (t.within(TypeSet::SMALL) || t.within(TypeSet::FLOAT)))
+    {
+        return b.num_f64(v);
+    }
+    let i = b.ins_exit(Op::ToF64, &[v], ExitTag::Type);
+    b.f.result(i)
 }
 
 /// Emit the instruction at `pc`. `succs` are the IR blocks of its bytecode
@@ -228,8 +250,12 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
         }
         CALL | CALL_R0 | CALL_R1 | CALLS | CALLS_R0 | CALLS_R1 => emit_call(b, pc, insn),
         FORPREP => emit_forprep(b, pc, insn, succs),
-        FORLOOP_I => emit_forloop_i(b, a, succs),
-        FORLOOP_F => emit_forloop_f(b, a, succs),
+        FORLOOP_I | FORLOOP_F | FORLOOP => match loop_kind(b, pc) {
+            Some(FORLOOP_I) => emit_forloop_i(b, a, succs),
+            Some(FORLOOP_F) => emit_forloop_f(b, a, succs),
+            Some(_) => emit_forloop_l(b, a, succs),
+            None => b.deopt(ExitTag::Unsupported),
+        },
         JEQI | JNEQI => emit_eqi(b, pc, insn, succs),
         op => match op.info().family {
             Family::RegArith | Family::RegBit | Family::ImmArith | Family::ImmBit => {
@@ -663,9 +689,34 @@ fn emit_forprep(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Bl
     let a = insn.a();
     let (fall, skip_to) = (succs[0], succs[1]);
     let (init, limit, step) = (b.reg(a), b.reg(a + 1), b.reg(a + 2));
-    match forloop_kind(b, pc) {
-        BcOp::FORLOOP_I => {
-            let (i, l, s) = (b.as_i32(init), b.as_i32(limit), b.as_i32(step));
+    let at = (pc as i64 + insn.branch_offset() as i64) as u32;
+    // An integer loop's limit is a float when known to be or seen so.
+    let lt = b.ty(limit);
+    let int_typed =
+        matches!(lt.rep, Rep::I32 | Rep::I64) || (!lt.set.is_empty() && lt.within(TypeSet::INT));
+    let float_limit = is_float(b, limit) || (!int_typed && b.feedback(pc) & fb::FLOAT_LIMIT != 0);
+    match loop_kind(b, at) {
+        Some(BcOp::FORLOOP_I) => {
+            let (i, s) = (b.as_i32(init), b.as_i32(step));
+            let l = if float_limit {
+                // The interpreter's `for_limit`: floored up, ceiled down.
+                let x = any_f64(b, limit);
+                let r = match b.f.def_op(s) {
+                    Some(Op::KI32(n)) if n > 0 => b.ins(Op::FFloor, &[x]),
+                    Some(Op::KI32(_)) => b.ins(Op::FCeil, &[x]),
+                    _ => {
+                        let zero = b.ki32(0);
+                        let pos = b.ins(Op::ICmp(Cc::Gt), &[s, zero]);
+                        let fl = b.ins(Op::FFloor, &[x]);
+                        let ce = b.ins(Op::FCeil, &[x]);
+                        b.ins(Op::Select, &[pos, fl, ce])
+                    }
+                };
+                let li = b.ins_exit(Op::FToIExact, &[r], ExitTag::Type);
+                b.f.result(li)
+            } else {
+                b.as_i32(limit)
+            };
             let zero = b.ki32(0);
             // A zero step raises in the interpreter.
             let nz = b.ins(Op::ICmp(Cc::Ne), &[s, zero]);
@@ -707,8 +758,8 @@ fn emit_forprep(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Bl
             b.flush();
             b.br(skip, skip_to, fall);
         }
-        BcOp::FORLOOP_F => {
-            let (i, l, s) = (b.num_f64(init), b.num_f64(limit), b.num_f64(step));
+        Some(BcOp::FORLOOP_F) => {
+            let (i, l, s) = (any_f64(b, init), any_f64(b, limit), any_f64(b, step));
             let zero = b.kf64(0.0);
             let nz = b.ins(Op::FCmp(Cc::Ne), &[s, zero]);
             let snap = b.snap_before();
@@ -731,7 +782,79 @@ fn emit_forprep(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Bl
             b.flush();
             b.br(skip, skip_to, fall);
         }
+        // A loop whose values did not all fit, or that never ran: integers,
+        // with the reference's unsigned iteration count.
+        Some(BcOp::FORLOOP) => {
+            let (i, s) = (b.as_i64(init), b.as_i64(step));
+            let zero = b.ins(Op::KI64(0), &[]);
+            let nz = b.ins(Op::LCmp(Cc::Ne), &[s, zero]);
+            let snap = b.snap_before();
+            b.ins_snap(Op::GuardTrue, &[nz], snap, ExitTag::Slow);
+            let pos = b.ins(Op::LCmp(Cc::Gt), &[s, zero]);
+            let (l, outside) = if float_limit {
+                // `for_limit`: floored up, ceiled down, clamped to i64 with
+                // the loop skipped when the limit lies outside it on the
+                // side the loop moves away from; NaN counts as too small.
+                let x = any_f64(b, limit);
+                let nan = b.ins(Op::FCmp(Cc::Ne), &[x, x]);
+                let fl = b.ins(Op::FFloor, &[x]);
+                let ce = b.ins(Op::FCeil, &[x]);
+                let r = b.ins(Op::Select, &[pos, fl, ce]);
+                let l = b.ins(Op::FToL, &[r]);
+                let lmin = b.ins(Op::KI64(i64::MIN), &[]);
+                let l = b.ins(Op::Select, &[nan, lmin, l]);
+                let (min, max) = (b.kf64(-(2f64.powi(63))), b.kf64(2f64.powi(63)));
+                let t = b.ins(Op::KB1(true), &[]);
+                let below = b.ins(Op::FCmp(Cc::Lt), &[r, min]);
+                let below = b.ins(Op::Select, &[nan, t, below]);
+                let above = b.ins(Op::FCmp(Cc::Ge), &[r, max]);
+                (l, Some((below, above)))
+            } else {
+                (b.as_i64(limit), None)
+            };
+            let mut up = b.ins(Op::LCmp(Cc::Gt), &[i, l]);
+            let mut down = b.ins(Op::LCmp(Cc::Lt), &[i, l]);
+            if let Some((below, above)) = outside {
+                let t = b.ins(Op::KB1(true), &[]);
+                up = b.ins(Op::Select, &[below, t, up]);
+                down = b.ins(Op::Select, &[above, t, down]);
+            }
+            let skip = b.ins(Op::Select, &[pos, up, down]);
+            let last = match const_i64(b, s) {
+                Some(1 | -1) => l,
+                _ => {
+                    let (fwd, back) = (b.ins(Op::LSub, &[l, i]), b.ins(Op::LSub, &[i, l]));
+                    let span = b.ins(Op::Select, &[pos, fwd, back]);
+                    let neg = b.ins(Op::LNeg, &[s]);
+                    let div = b.ins(Op::Select, &[pos, s, neg]);
+                    let count = b.ins(Op::LUDiv, &[span, div]);
+                    let off = b.ins(Op::LMul, &[count, s]);
+                    b.ins(Op::LAdd, &[i, off])
+                }
+            };
+            b.set(a, last);
+            b.set(a + 1, s);
+            b.set(a + 2, i);
+            b.set(a + 3, i);
+            b.flush();
+            b.br(skip, skip_to, fall);
+        }
         _ => b.deopt(ExitTag::Unsupported),
+    }
+}
+
+/// Whether `v` is known to be a float.
+fn is_float(b: &Builder<'_, '_>, v: Val) -> bool {
+    let t = b.ty(v);
+    t.rep == Rep::F64 || (t.within(TypeSet::FLOAT) && !t.set.is_empty())
+}
+
+fn const_i64(b: &Builder<'_, '_>, v: Val) -> Option<i64> {
+    match b.f.def_op(v) {
+        Some(Op::KI64(n)) => Some(n),
+        Some(Op::KI32(n)) => Some(n as i64),
+        Some(Op::IToL) => const_i64(b, b.f.args(b.f.def_inst(v).unwrap())[0]),
+        _ => None,
     }
 }
 
@@ -762,6 +885,22 @@ fn emit_forloop_i(b: &mut Builder<'_, '_>, a: u8, succs: &[Block]) {
     b.jump(back);
 }
 
+fn emit_forloop_l(b: &mut Builder<'_, '_>, a: u8, succs: &[Block]) {
+    let (exit, back) = (succs[0], succs[1]);
+    let (last, step, idx) = (b.reg(a), b.reg(a + 1), b.reg(a + 2));
+    let (last, step, idx) = (b.as_i64(last), b.as_i64(step), b.as_i64(idx));
+    let go = b.ins(Op::LCmp(Cc::Ne), &[idx, last]);
+    let edge = b.new_sealed_succ();
+    b.br(go, edge, exit);
+    b.switch_to(edge);
+    // As for `FORLOOP_I`: `idx` walks to `last` exactly.
+    let next = b.ins(Op::LAdd, &[idx, step]);
+    b.set(a + 2, next);
+    b.set(a + 3, next);
+    b.flush();
+    b.jump(back);
+}
+
 fn emit_forloop_f(b: &mut Builder<'_, '_>, a: u8, succs: &[Block]) {
     let (exit, back) = (succs[0], succs[1]);
     let (lim, step, idx) = (b.reg(a), b.reg(a + 1), b.reg(a + 2));
@@ -785,9 +924,4 @@ fn emit_forloop_f(b: &mut Builder<'_, '_>, a: u8, succs: &[Block]) {
     b.set(a + 3, next);
     b.flush();
     b.jump(back);
-}
-
-#[allow(unused)]
-fn ty_of(b: &Builder<'_, '_>, v: Val) -> Ty {
-    b.ty(v)
 }

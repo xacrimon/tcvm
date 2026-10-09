@@ -334,7 +334,8 @@ fn on_exit<'gc>(
     use crate::jit::ir::ops::ExitTag;
     if let ExitTag::Entry(r) = e.tag {
         record_entry(ctx, closure, base, region, r);
-    } else if e.kind == ExitKind::Before && e.tag.widenable() {
+    }
+    if e.kind == ExitKind::Before && e.tag.widenable() {
         record_site(closure, base, e.pc, e.tag == ExitTag::Overflow);
     }
     let n = e.count.get() + 1;
@@ -375,14 +376,32 @@ fn record_site<'gc>(closure: LuaFn<'gc>, base: *mut Value<'gc>, pc: u32, overflo
     use crate::instruction::Family;
     use crate::jit::feedback as fb;
     let site = unsafe { closure.code.add(pc as usize) };
-    let i = unsafe { *site };
+    let mut i = unsafe { *site };
     if i.is_jit_word() {
-        return;
+        i = original_of(closure, i);
     }
     // SAFETY: the operands are registers of the frame's window.
-    let kind = |r: u8| fb::kind(unsafe { *base.add(r as usize) });
+    let reg = |r: u8| unsafe { *base.add(r as usize) };
+    let kind = |r: u8| fb::kind(reg(r));
     let imm = |i: Instruction| if i.imm_is_int() { fb::SMALL } else { fb::FLOAT };
-    let mut bits = match i.op().info().family {
+    let num = |v: Value<'_>| v.is_float() || v.get_integer().is_some();
+    let mut bits = match i.op() {
+        // The loop's kind: integer (and whether it is big) or float.
+        Op::FORPREP => {
+            let (init, limit, step) = (reg(i.a()), reg(i.a() + 1), reg(i.a() + 2));
+            if init.get_integer().is_some() && step.get_integer().is_some() {
+                let float_limit = if limit.is_float() { fb::FLOAT_LIMIT } else { 0 };
+                fb::kind(init) | fb::kind(step) | (fb::kind(limit) & fb::BIGINT) | float_limit
+            } else if num(init) && num(step) {
+                fb::FLOAT
+            } else {
+                0
+            }
+        }
+        Op::FORLOOP | Op::FORLOOP_I | Op::FORLOOP_F => kind(i.a() + 1) | kind(i.a() + 2),
+        _ => 0,
+    };
+    bits |= match i.op().info().family {
         Family::RegArith | Family::RegBit | Family::CmpReg
             if i.op().info().family != Family::CmpReg =>
         {
