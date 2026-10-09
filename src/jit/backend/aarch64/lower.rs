@@ -8,7 +8,7 @@ use regalloc2::{Block as RBlock, Operand, PRegSet, RegClass, VReg};
 use crate::env::value::Value;
 use crate::jit::backend::aarch64::abi::{caller_saved, preg_float, preg_int};
 use crate::jit::backend::aarch64::asm::{Asm, Cond, Sz};
-use crate::jit::backend::aarch64::inst::{AluOp, FOp, FUnOp, MInst, Test};
+use crate::jit::backend::aarch64::inst::{AluOp, ENTRY_FAIL, FOp, FUnOp, MInst, Test};
 use crate::jit::backend::vcode::VCode;
 use crate::jit::ir::ops::{Cc, ExitTag, HelperId, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
@@ -40,6 +40,8 @@ pub(crate) struct Lowered {
     pub(crate) exits: Vec<LExit>,
     /// The first operand index of each instruction's snapshot uses.
     pub(crate) snap_ops: Vec<u32>,
+    /// The registers the entry guards test.
+    pub(crate) entry_regs: Vec<u8>,
 }
 
 struct Lower<'a, 'gc> {
@@ -51,6 +53,7 @@ struct Lower<'a, 'gc> {
     uses: Vec<u32>,
     exits: Vec<LExit>,
     snap_ops: Vec<u32>,
+    entry_regs: Vec<u8>,
     block_of: Vec<u32>,
     pc_base: usize,
 }
@@ -113,6 +116,7 @@ pub(crate) fn lower<'gc>(f: &Func<'gc>, code_base: usize) -> Result<Lowered, Str
         uses,
         exits: Vec::new(),
         snap_ops: Vec::new(),
+        entry_regs: Vec::new(),
         block_of,
         pc_base: code_base,
     };
@@ -169,6 +173,7 @@ pub(crate) fn lower<'gc>(f: &Func<'gc>, code_base: usize) -> Result<Lowered, Str
         vcode: lw.v,
         exits: lw.exits,
         snap_ops: lw.snap_ops,
+        entry_regs: lw.entry_regs,
     })
 }
 
@@ -511,6 +516,22 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     self.use_(args[2]),
                 ];
                 self.push(MInst::Select { float }, &ops, none);
+            }
+            Op::Guard(set) if f.insts[i.idx()].tag == ExitTag::Entry => {
+                let Some(Op::Load(r)) = f.def_op(args[0]) else {
+                    return Err("an entry guard of no entry load".into());
+                };
+                self.entry_regs.push(r);
+                let u = self.use_(args[0]);
+                self.push(
+                    MInst::Guard {
+                        test: Test::Type(set),
+                        cond: Cond::Eq,
+                        exit: ENTRY_FAIL,
+                    },
+                    &[u],
+                    none,
+                );
             }
             Op::Guard(set) => {
                 let u = self.use_(args[0]);

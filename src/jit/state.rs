@@ -187,9 +187,7 @@ impl JitRuntime {
         self.code
             .borrow_mut()
             .get_or_insert_with(|| {
-                std::rc::Rc::new(crate::jit::backend::alloc::CodeAllocator::new(
-                    crate::jit::backend::aarch64::abi::exit_common,
-                ))
+                std::rc::Rc::new(crate::jit::backend::alloc::CodeAllocator::new())
             })
             .clone()
     }

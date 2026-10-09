@@ -8,6 +8,9 @@ use crate::jit::backend::vcode::TargetInst;
 use crate::jit::ir::ops::HelperId;
 use crate::jit::ir::types::TypeSet;
 
+/// The exit of an entry guard: the region's entry-fail stub (6.4).
+pub(crate) const ENTRY_FAIL: u32 = u32::MAX - 1;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum AluOp {
     Add,

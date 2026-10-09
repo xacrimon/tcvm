@@ -84,16 +84,16 @@ pub(crate) enum ExitTag {
     Slow,
     /// The collector's check after an allocation.
     Gc,
-    /// A prologue guard on the register's entry value (5.2): records the
-    /// kind it saw on the entry.
-    Entry(u8),
+    /// A prologue guard on an entry value (5.2): fails to the entry-fail
+    /// stub, which records the entry's kinds.
+    Entry,
 }
 
 impl ExitTag {
     pub(crate) fn widenable(self) -> bool {
         matches!(
             self,
-            ExitTag::Type | ExitTag::Overflow | ExitTag::NeverRan | ExitTag::Entry(_)
+            ExitTag::Type | ExitTag::Overflow | ExitTag::NeverRan
         )
     }
 }

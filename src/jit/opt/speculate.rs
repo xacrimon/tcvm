@@ -75,7 +75,11 @@ pub(crate) fn speculate(f: &mut Func<'_>, kinds: &EntryKinds) -> bool {
     }
     let mut guards = Vec::with_capacity(cands.len());
     for c in &cands {
-        let tag = c.entry.map_or(ExitTag::Type, ExitTag::Entry);
+        let tag = if c.entry.is_some() {
+            ExitTag::Entry
+        } else {
+            ExitTag::Type
+        };
         let g = f.make_inst(Op::Guard(c.set), &[c.v], None, tag);
         if c.entry.is_some() {
             f.insert_before_term(f.entry, g);

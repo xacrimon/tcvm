@@ -1,9 +1,9 @@
 //! Registers of a region (Appendix A), the allocator's machine environment,
-//! the register image order, and the per-segment `exit_common`.
+//! the register image order, and `exit_common`.
 
 use regalloc2::{MachineEnv, PReg, PRegSet, RegClass};
 
-use crate::jit::backend::aarch64::asm::{Asm, FP, Fpr, Gpr, LR, SP, Sz};
+use crate::jit::backend::aarch64::asm::{Fpr, Gpr};
 use crate::jit::state::EXIT_REGS;
 
 /// Pinned for a region's whole body.
@@ -95,55 +95,82 @@ pub(crate) fn image_index(p: PReg) -> u8 {
 pub(crate) const IMAGE_SPILLS: usize = 64;
 const _: () = assert!(IMAGE_SPILLS + 64 <= EXIT_REGS);
 
-/// `exit_common` at `rx`: entered from a region's exit trampoline with x16 =
-/// region | exit << 48 and the region's frame still open; stores the image,
-/// copies the spill slots, pops the frame and tails `jit_exit`.
-pub(crate) fn exit_common(rx: usize) -> Vec<u32> {
-    let mut a = Asm::new();
-    let img = X17;
-    a.ldr(img, RT, crate::jit::layout::EXIT_REGS as i32);
-    for r in (0..16).step_by(2) {
-        a.stp(Gpr(r), Gpr(r + 1), img, r as i32 * 8);
+/// Entered from a region's exit trampoline with x16 = region | exit << 48
+/// and the region's frame still open: stores the register image in
+/// `image_index` order, copies the frame's spill slots after it, pops the
+/// frame (its size is the region's) and tails `jit_exit`.
+#[unsafe(naked)]
+pub(crate) unsafe extern "C" fn exit_common() {
+    core::arch::naked_asm!(
+        "ldr x17, [x23, #{regs}]",
+        "stp x0, x1, [x17, #0]",
+        "stp x2, x3, [x17, #16]",
+        "stp x4, x5, [x17, #32]",
+        "stp x6, x7, [x17, #48]",
+        "stp x8, x9, [x17, #64]",
+        "stp x10, x11, [x17, #80]",
+        "stp x12, x13, [x17, #96]",
+        "stp x14, x15, [x17, #112]",
+        "stp x19, x20, [x17, #128]",
+        "str x21, [x17, #144]",
+        "stp x26, x27, [x17, #152]",
+        "str x28, [x17, #168]",
+        "stp d0, d1, [x17, #176]",
+        "stp d2, d3, [x17, #192]",
+        "stp d4, d5, [x17, #208]",
+        "stp d6, d7, [x17, #224]",
+        "stp d8, d9, [x17, #240]",
+        "stp d10, d11, [x17, #256]",
+        "stp d12, d13, [x17, #272]",
+        "stp d14, d15, [x17, #288]",
+        "stp d16, d17, [x17, #304]",
+        "stp d18, d19, [x17, #320]",
+        "stp d20, d21, [x17, #336]",
+        "stp d22, d23, [x17, #352]",
+        "stp d24, d25, [x17, #368]",
+        "stp d26, d27, [x17, #384]",
+        "stp d28, d29, [x17, #400]",
+        "stp d30, d31, [x17, #416]",
+        // The spill slots, [x29 + 16 + 8i], to the image's spill words.
+        "and x9, x16, #0xffffffffffff",
+        "ldr w10, [x9, #{num_spills}]",
+        "add x11, x29, #16",
+        "add x12, x17, #{spills}",
+        "cbz w10, 2f",
+        "1:",
+        "ldr x13, [x11], #8",
+        "str x13, [x12], #8",
+        "subs w10, w10, #1",
+        "b.ne 1b",
+        "2:",
+        "ldr w10, [x9, #{frame_size}]",
+        "ldp x13, x30, [x29]",
+        "add x11, x29, x10",
+        "mov sp, x11",
+        "mov x29, x13",
+        "mov x20, x16",
+        "b {jit_exit}",
+        regs = const crate::jit::layout::EXIT_REGS,
+        num_spills = const crate::jit::region::layout::NUM_SPILLS,
+        spills = const IMAGE_SPILLS * 8,
+        frame_size = const crate::jit::region::layout::FRAME_SIZE,
+        jit_exit = sym crate::jit::jit_exit,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_order() {
+        // `exit_common`'s stores, by image word.
+        assert_eq!(image_index(preg_int(15)), 15);
+        assert_eq!(image_index(preg_int(19)), 16);
+        assert_eq!(image_index(preg_int(21)), 18);
+        assert_eq!(image_index(preg_int(26)), 19);
+        assert_eq!(image_index(preg_int(28)), 21);
+        assert_eq!(image_index(preg_float(0)), 22);
+        assert_eq!(image_index(preg_float(31)), 53);
     }
-    a.stp(Gpr(19), Gpr(20), img, 16 * 8);
-    a.str(Gpr(21), img, 18 * 8);
-    a.stp(Gpr(26), Gpr(27), img, 19 * 8);
-    a.str(Gpr(28), img, 21 * 8);
-    for r in (0..32).step_by(2) {
-        a.stp_d(Fpr(r), Fpr(r + 1), img, (22 + r as i32) * 8);
-    }
-    // The spill slots, [x29 + 16 + 8i], to image words 64..
-    let region = Gpr(9);
-    a.and_imm(Sz::X, region, X16, (1 << 48) - 1);
-    a.ldr_w(
-        Gpr(10),
-        region,
-        crate::jit::region::layout::NUM_SPILLS as i32,
-    );
-    a.add_imm(Sz::X, Gpr(11), FP, 16);
-    a.add_imm(Sz::X, Gpr(12), img, (IMAGE_SPILLS * 8) as u64);
-    let done = a.new_label();
-    let lp = a.new_label();
-    a.cbz(Sz::W, Gpr(10), done);
-    a.bind(lp);
-    a.ldr(Gpr(13), Gpr(11), 0);
-    a.add_imm(Sz::X, Gpr(11), Gpr(11), 8);
-    a.str(Gpr(13), Gpr(12), 0);
-    a.add_imm(Sz::X, Gpr(12), Gpr(12), 8);
-    a.subs_imm(Sz::W, Gpr(10), Gpr(10), 1);
-    a.b_cond(crate::jit::backend::aarch64::asm::Cond::Ne, lp);
-    a.bind(done);
-    // Pop the frame, whatever its size.
-    a.ldr_w(
-        Gpr(10),
-        region,
-        crate::jit::region::layout::FRAME_SIZE as i32,
-    );
-    a.ldp(Gpr(13), LR, FP, 0);
-    a.add(Sz::X, Gpr(11), FP, Gpr(10));
-    a.mov_sp(SP, Gpr(11));
-    a.mov(FP, Gpr(13));
-    a.mov(INSN, X16);
-    a.b_far(crate::jit::jit_exit as *const () as usize);
-    a.finish(rx).expect("exit_common reaches jit_exit")
 }
