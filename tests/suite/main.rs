@@ -78,6 +78,7 @@ mod table_border;
 mod table_create;
 mod table_inline;
 mod table_metamethods;
+mod tailcall_native_frame;
 mod tailcall_shapes;
 mod tailcall_suspend;
 mod take_result_tailcall;

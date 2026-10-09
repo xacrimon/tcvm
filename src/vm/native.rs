@@ -527,14 +527,16 @@ handler! {
             throw!(err)
         }
         // The native takes this frame's place: its window moves down to
-        // `base`, so its results land where this frame's would.
+        // `base`, so its results land where this frame's would. Volatile as
+        // in `frame::write_hdr`.
         let n = ts.top - win;
         ts.stack.copy_within(win..win + n, bi);
         ts.top = bi + n;
         unsafe {
-            frame::set_func_word(base, NativeHdr { at: 0, cont: 0, ok: ok::CONT }.pack(nc));
-            let rw = frame::ret_word(base) & !(flag::HAS_OPEN | flag::HAS_TBC);
-            frame::set_ret_word(base, rw | flag::NATIVE);
+            let h = frame::hdr(base);
+            h.write_volatile(NativeHdr { at: 0, cont: 0, ok: ok::CONT }.pack(nc));
+            let rw = h.add(1).read() & !(flag::HAS_OPEN | flag::HAS_TBC);
+            h.add(1).write_volatile(rw | flag::NATIVE);
         }
         if returned {
             return gc_exit(ts, base, nc);
@@ -627,17 +629,16 @@ handler! {
     }
 
     /// As [`ret_pcall`], for `xpcall`, whose frames the unwinder tells apart
-    /// by this continuation's address: the handler below the header is
-    /// cleared here so the two bodies never fold into one function.
+    /// by this continuation's address: the handler is cleared here so the
+    /// two bodies never fold into one function.
     cont fn ret_xpcall {
         let ts = thread!();
         let b = ts.slot_index(base);
-        let nv = unsafe { frame::extras(base) };
-        ts.stack[b - HDR - nv - 1] = Value::nil();
         let vi = prepend_true(ts, b, ts.slot_index(values), nret);
         base = ts.slot_ptr(b);
-        let (_, cpc) = caller!();
+        let (caller, cpc) = caller!();
         let call: Instruction = unsafe { *cpc.sub(1) };
+        unsafe { caller.add(call.a() as usize + 1).write(Value::nil()) };
         let r = rt.ret(call.c());
         tail!(r, pc = ts.slot_ptr(vi) as *const Instruction, insn = Slot::nret(nret + 1))
     }
@@ -661,8 +662,8 @@ handler! {
         tail!(crate::vm::ops::call::enter, pc = hdr as *const Instruction, insn = Slot::nret(present - 1))
     }
 
-    /// The entry of `xpcall`: the handler moves to the first hidden slot,
-    /// where the unwinder finds it below the callee's header.
+    /// The entry of `xpcall`: the handler moves to the CALL's first hidden
+    /// slot, where the unwinder finds it through the callee's caller words.
     entry fn ff_xpcall {
         let call = insn.as_insn();
         let (a, b) = (call.a(), call.b());

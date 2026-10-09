@@ -127,13 +127,10 @@ handler! {
     }
 
     /// Continuation of a RETURN's `__close`: run the RETURN again, with `top`
-    /// back at the end of its results, which the slot below the call recorded.
+    /// back at the end of its results.
     cont fn ret_return {
-        // The callee may be a native (`__close = coroutine.yield`).
-        let nv = unsafe { frame::extras(base) };
-        let values_end = unsafe { base.sub(frame::HDR + nv + 1).read() }.get_small();
-        thread!().set_top_unchecked(unsafe { values_end.unwrap_unchecked() } as usize);
         let (caller, cpc) = caller!();
+        thread!().set_top_unchecked(unsafe { frame::results_end(caller) });
         resume!(caller, unsafe { cpc.sub(1) })
     }
 }
