@@ -93,7 +93,7 @@ pub(crate) enum ExitTag {
     Unsupported,
     /// An operand the interpreter raises on, or its slow path.
     Slow,
-    /// The collector's check after an allocation.
+    /// A collector check (5.7): leaves through `Exit::Gc`, then resumes.
     Gc,
     /// A prologue guard on an entry value (5.2): fails to the entry-fail
     /// stub, which records the entry's kinds.

@@ -154,8 +154,6 @@ pub(crate) enum ExitKind {
     Before,
     /// The instruction at `pc` is done: continue at `pc + 1`.
     After,
-    /// As `After`, through the collector.
-    Gc,
 }
 
 /// The frame an exit rebuilds: home slots to write and where to resume.

@@ -55,7 +55,7 @@ pub(crate) struct SnapFrame {
     pub(crate) caller_pc: u32,
 }
 
-/// Append a snapshot to `out`: `kind:2 frames:2 entries:12`, the pc, three
+/// Append a snapshot to `out`: `kind:1 frames:2 entries:12`, the pc, three
 /// words per frame, a word per entry (`reg:8 rep:3 loc:3 index:18`).
 pub(crate) fn encode_snap(
     out: &mut Vec<u32>,
@@ -65,12 +65,8 @@ pub(crate) fn encode_snap(
     entries: &[SnapEntry],
 ) {
     assert!(frames.len() < 4 && entries.len() < 1 << 12);
-    let kind = match kind {
-        ExitKind::Before => 0,
-        ExitKind::After => 1,
-        ExitKind::Gc => 2,
-    };
-    out.push(kind | (frames.len() as u32) << 2 | (entries.len() as u32) << 4);
+    let kind = (kind == ExitKind::After) as u32;
+    out.push(kind | (frames.len() as u32) << 1 | (entries.len() as u32) << 3);
     out.push(pc);
     for f in frames {
         out.push(f.func);
@@ -102,13 +98,13 @@ pub(crate) struct SnapView<'a> {
 impl<'a> SnapView<'a> {
     pub(crate) fn decode(words: &'a [u32]) -> Self {
         let h = words[0];
-        let kind = match h & 3 {
-            0 => ExitKind::Before,
-            1 => ExitKind::After,
-            _ => ExitKind::Gc,
+        let kind = if h & 1 != 0 {
+            ExitKind::After
+        } else {
+            ExitKind::Before
         };
-        let nf = (h >> 2 & 3) as usize;
-        let ne = (h >> 4 & 0xfff) as usize;
+        let nf = (h >> 1 & 3) as usize;
+        let ne = (h >> 3 & 0xfff) as usize;
         let frames = &words[2..2 + 3 * nf];
         SnapView {
             kind,
@@ -262,9 +258,9 @@ mod tests {
             },
         ];
         let mut out = vec![0xdead];
-        encode_snap(&mut out, ExitKind::Gc, 1234, &frames, &entries);
+        encode_snap(&mut out, ExitKind::After, 1234, &frames, &entries);
         let v = SnapView::decode(&out[1..]);
-        assert_eq!(v.kind, ExitKind::Gc);
+        assert_eq!(v.kind, ExitKind::After);
         assert_eq!(v.pc, 1234);
         assert_eq!(v.frames().collect::<Vec<_>>(), frames);
         assert_eq!(v.entries().collect::<Vec<_>>(), entries);

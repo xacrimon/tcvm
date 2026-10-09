@@ -135,7 +135,7 @@ handler! {
         on_exit(rt, closure, base, region, e, snap.kind, snap.pc);
         let at = if snap.kind == ExitKind::Before { snap.pc } else { snap.pc + 1 };
         let resume = unsafe { closure.code.add(at as usize) };
-        if snap.kind == ExitKind::Gc || e.tag == crate::jit::ir::ops::ExitTag::Gc {
+        if e.tag == crate::jit::ir::ops::ExitTag::Gc {
             pc = resume;
             exit!(crate::vm::abi::Exit::Gc)
         }
