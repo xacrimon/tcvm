@@ -93,12 +93,15 @@ elaborates them.
   `FUNC` at pc 0, a compiler-emitted `LOOP` at `while`/`repeat`/generic-`for`/
   `goto` loop headers, and the numeric `FORLOOP` forms. Entries are installed only
   over those words, as LuaJIT patches `FUNCF`/`LOOP`/`FORL`. (Sections 5.2, 6.)
-- **J6. Integers are i32 in compiled code**, boxed with the interpreter's small-int
-  encoding, with overflow guards that deoptimize; 64-bit integers go through the
-  generic helpers. Sites that never executed compile to a deoptimization; for
-  that, milestone 1 makes the interpreter's adaptive state record execution
-  completely (4.8), as V8's `kNone` feedback does. A range analysis later removes
-  overflow checks the bounds make unnecessary. (Sections 6.3, 7.2.)
+- **J6. Integers are `I32` or `I64` in compiled code.** A site whose feedback is
+  small ints only gets `I32` with overflow guards that deoptimize; a site that saw
+  boxed integers or an i32 overflow gets `I64`, which needs no overflow checks
+  since Lua's integers wrap, and is boxed only when it escapes (an allocation when
+  it leaves i32). The feedback comes from a per-prototype byte per instruction that
+  the interpreter's slow paths and the JIT's exits write (4.8). Blocks that never
+  executed compile to a deoptimization, as V8 does for `kNone` feedback. A range analysis
+  later removes overflow checks and narrows `I64` to `I32` where bounds allow.
+  (Sections 4.8, 6.3, 7.2.)
 - **J7. Compilation is synchronous**, on the trigger, so a loop entry seeds the
   types of the live registers from the actual frame. Regions belong to the
   prototype, not the closure; upvalue and global constants are guarded per use.
@@ -381,39 +384,35 @@ fast path and never adapts on ints (`compare.rs:96-150`). An `Empty` IC is not
 "never executed" either: dict shapes and mirrored keys on adopted shapes are never
 cached (`field.rs:223-230,351-353`).
 
-Milestone 1 makes the adaptive state complete, so that it can serve as V8's
-`kNone` (`v8/src/objects/type-hints.h:18-43`) without V8's cost. V8 and JSC
-record feedback with a write on every execution: an OR into a feedback-vector
-slot (`v8/src/codegen/code-stub-assembler.cc:13848-13863`), an OR into an arith
-profile or a value-profile bucket store
+Milestone 1 adds a feedback store beside the opcode, so that the JIT can tell
+"never ran" (V8's `kNone`, `v8/src/objects/type-hints.h:18-43`) and "ran with
+boxed integers" from the rest. V8 and JSC write their feedback on every execution:
+an OR into a feedback-vector slot (`v8/src/codegen/code-stub-assembler.cc:13848-13863`),
+an OR into an arith profile or a value-profile bucket store
 (`JavaScriptCore/llint/LowLevelInterpreter.asm:2968-2973`,
-`LowLevelInterpreter64.asm:77-81`). Here the opcode stays the feedback, and only
-the places where quickening is silent change:
+`LowLevelInterpreter64.asm:77-81`). Here the opcode stays the feedback on every
+fast path, and only paths that are already slow write the store.
 
-1. **Forms for the generic fast paths.** `JLT_FF`, `JNLT_FF`, `JLE_FF`,
-   `JNLE_FF` for two floats, and `JLTI_I` … `JNGEI_I` (eight) for a small-int
-   register: the generic handler's float and int paths quicken on the first
-   execution like every other case, and the forms check that case first. Twelve
-   opcodes; with `FUNC`, `LOOP`, `JIT_ENTRY`, `JIT_LOOP` the ISA goes from 204 to
-   220. The JIT gets a type where it had "generic".
-2. **A `SEEN` bit** beside `misses`/`locked` in the adaptive field: bit 35 for
-   `Abc` and `AhImm` sites, `c` bit 3 for `AbImm` compares, `c` bit 4 for `AbcImm`
-   arithmetic (`instruction.rs:1179-1187`; `c` bits 4..7 hold `ARITH_MMI`'s op
-   index, written only when a site becomes that form, `instruction.rs:2259`, and
-   a site that was ever in a form has executed anyway). It is
-   set once, by `specialize(None)` on a generic site and by `arith_slow`,
-   `cmp_slow` and `eq_slow`, all slow paths; and by a `tbz` on `insn` (one
-   instruction, taken only the first time) on the inline generic paths that
-   neither quicken nor go slow: `JLT`'s small/float mixes and `JEQ`/`JNEQ` on two
-   floats or identical bits.
-3. **`InlineCache::Uncached`**, written once by a field slow path that declines to
-   fill (a dict shape, a mirrored key on an adopted shape, a `ProtoLoad` whose
-   holder lacks the key), so that `Empty` means the site never ran.
+The store is `Prototype.feedback: Box<[Cell<u8>]>`, one byte per instruction,
+allocated zeroed with the prototype. Its bits are the kinds of the operands seen
+(`SMALL`, `BIGINT`, `FLOAT`, `STR`, `TAB`, `OTHER`), `OVERFLOW` (small operands
+gave a result outside i32) and `MM` (a metamethod ran). It is an OR, so it only
+grows. Writers: `arith_slow`, `specialize(None)` on a generic site, `cmp_slow`,
+`eq_slow`, `forloop_slow`, the field slow paths, and `jit_exit` (5.6). A writer
+reaches the byte through `closure.proto` and indexes it by `pc - closure.code`:
+two loads and an OR on a path that already boxes, allocates or calls. One byte per
+eight-byte instruction is 12.5% of code size; allocating it lazily at hotness, as
+V8 does, would leave the executions before it unrecorded.
 
-A site never executed exactly when it is still its emitted opcode with
-`misses = 0`, not `locked`, not `SEEN`, or a field site whose IC is `Empty`.
-Section 6.3 depends on this. The interpreter cost (one-time writes, the `tbz`) is
-measured with the `FUNC`/`LOOP` cost in milestone 1.
+Arithmetic and field sites always leave a record when they run: a quickened
+form, a miss or a lock, a filled IC, or a byte written by the slow path they take
+when nothing fits. Compares do not: the generic `JLT` family is itself the
+two-float fast path, generic `JLTI` the small-int one, and `JEQ`/`JNEQ` settle
+floats and identical bits inline, all without a write. Section 6.3 therefore
+decides "never executed" per block, from the sites that do record, and the types
+of compare operands come from inference and use-driven speculation (9.1), not
+from the compare. The interpreter cost of the byte is measured with the
+`FUNC`/`LOOP` cost in milestone 1.
 
 ### 4.9 Closures, upvalues, prototypes (`src/env/function.rs`)
 
@@ -527,10 +526,11 @@ The prologue, in order:
    with `F` the spill area plus 16, 16-byte aligned. Frame size is per region.
 2. Entry guards: for each live register at the entry pc whose entry type is
    narrower than `Any`, load the home slot and test the type; a failure jumps to
-   the single entry-fail stub, which pops the frame and tails `jit_entry_fail`. For a `JIT_ENTRY` the live registers are the parameters, typed from the
-   prototype's feedback (section 7.1); for a `JIT_LOOP` they are the registers live
-   at the header, typed from the actual frame at compile time (J7) and widened by
-   the loop's own speculation.
+   the single entry-fail stub, which pops the frame and tails `jit_entry_fail`.
+   For a `JIT_ENTRY` the live registers are the parameters, typed by use-driven
+   speculation (9.1): the type their uses' feedback agrees on. For a `JIT_LOOP`
+   they are the registers live at the entry, typed the same way and intersected
+   with the kinds of the live frame's values at compile time (J7).
 3. Unbox the guarded values into the representations the body wants.
 
 A `JIT_ENTRY` region compiles the whole function from pc 0; a `JIT_LOOP` region
@@ -586,7 +586,7 @@ both sides of a call is either a Lua register, reloaded from its home slot (R1),
 or rematerializable (a constant, a pool load, an unbox of a reloaded slot), and is
 rematerialized after the resume point. Passes that move or share values (GVN,
 LICM, the prologue's hoisted constants) create such uses, so the call-boundary
-pass of 9.7 re-materializes them, and the verifier (8.8) rejects anything left.
+pass of 9.8 re-materializes them, and the verifier (8.8) rejects anything left.
 
 ### 5.4 Calls
 
@@ -746,8 +746,12 @@ A deopt never raises an error: an operation that would error in the interpreter
 (a nil index, a non-callable, a bad `for` value) deopts `Before` and the
 interpreter raises it with its own message and position.
 
-Only widenable exits count toward recompilation: type, shape, overflow,
-never-executed and entry-guard exits, which a recompile can cover. `Gc` exits,
+Only widenable exits count toward recompilation: type, shape, overflow and
+entry-guard exits, which a recompile can cover. A never-executed exit (6.3) is
+widenable too, and stronger: it can only fire because its block did run, so its
+first firing records the kinds and marks the entry for recompilation at once,
+outside the `MAX_RECOMPILES` budget. Each block flips from never-executed to
+executed at most once, so this terminates. `Gc` exits,
 `GuardFits`, a helper's `FAIL` for an error or a metamethod the site already
 handles generically, and `HAS_TBC` returns are uncountable: no recompile changes
 them, and counting them would blacklist an allocating loop after about
@@ -887,25 +891,40 @@ instruction. It:
 
 A function-entry region covers every instruction reachable from pc 0; a loop-entry
 region everything reachable from the header. Unreachable code is not compiled.
-Instructions that have never executed compile to a `Deopt(Before)` (J6): the
-interpreter runs them, quickens them, and the hot-exit path recompiles with real
-feedback. The builder reads "never executed" from the complete adaptive state of
-4.8: an arithmetic or compare site still in its emitted opcode with `misses = 0`
-and neither `locked` nor `SEEN`, or a field site whose IC is `Empty`. A site that
-executed without a form (`SEEN`, `locked`, `Uncached`) compiles to generic code:
-the generic handler's inline cases plus a helper, never a deopt. Sites without
-adaptive state (moves, loops, calls, `GETTABLE`, `JEQI`/`JEQS`) are assumed
-executed; a never-run arm containing only those is compiled, and the first
-adaptive site in it deopts. A generic `FORLOOP` or `TFORCALL` is not a signal:
-`FORPREP` keeps a generic `FORLOOP` when the values do not fit, and `TFORPREP`
-keeps a generic `TFORCALL` for any iterator other than `next` and `ipairs`.
+Code that has never executed compiles to a `Deopt(Before)` (J6): the interpreter
+runs it, quickens it, and the hot-exit path recompiles with real feedback. The
+decision is per basic block of the bytecode CFG, made before emission:
+
+- A block is **known executed** if any site in it left a record (a quickened form,
+  `misses > 0` or `locked`, a filled IC, a nonzero feedback byte), if it dominates
+  a known-executed block (a block cannot run without its dominators), or if it is
+  the region's entry block.
+- A block is **known never executed** if it is not known executed, has at least
+  one recording site (register or immediate arithmetic, a constant-key field
+  site), and none of them recorded anything. Compares never decide it (4.8).
+- Every other block is assumed executed.
+
+A never-executed block compiles to one `Deopt(Before)` at its first instruction,
+and blocks reachable only through it are not emitted. In an executed block a site
+without feedback compiles from what it has: a byte with integer kinds only gives
+`I64` code (7.2), any other byte or no byte generic code (the generic handler's
+inline cases plus a helper), and a compare whose operands inference or 9.1 typed
+compiles to the typed compare. Assuming a block executed when it was not costs
+little: its compares are generic inline code, and its arms still prune themselves
+at their own recording sites. A misjudgment the other way, a block whose sites ran
+but recorded nothing, cannot happen for recording sites; the never-executed exit
+of 5.6 remains as a safety net.
+
+A generic `FORLOOP` or `TFORCALL` is not a signal: `FORPREP` keeps a generic
+`FORLOOP` when the values do not fit, and `TFORPREP` keeps a generic `TFORCALL` for
+any iterator other than `next` and `ipairs`.
 
 ### 6.4 Exits, recompilation, blacklisting
 
 Each exit has a 32-bit counter in the region's exit table. Every exit records
-what it saw into the prototype's site feedback (section 7.1): the kinds of the
-guarded values for a type guard, the receiver shape for a shape guard (up to four
-per site), the overflow for an arithmetic guard. On the `EXIT_HOT = 10`th taking
+what it saw (section 7.1): the kinds of the guarded values and an overflow into
+the site's feedback byte, the receiver shape for a shape guard (up to four per
+site) into `JitState.shapes_seen`. On the `EXIT_HOT = 10`th taking
 of one widenable exit (5.6) `jit_exit` marks the entry for recompilation by
 pointing its entry-table slot (11.1) at `jit_recompile`, a `slow` handler. The
 next arrival at the `JIT_ENTRY`/`JIT_LOOP` word lands there with the frame
@@ -948,19 +967,26 @@ full per-opcode table is Appendix D.
 2. The inline cache entry of a field site.
 3. The constant pool, upvalue descriptors and templates of the prototype.
 4. For a loop entry, the actual values of the live registers in the frame.
-5. Site feedback from hot exits: `JitState.feedback: Box<[SiteFeedback]>`, one per
-   pc, 8 bytes each: `kinds: u8` (bits NIL, BOOL, SMALL, BIGINT, FLOAT, STR, TAB,
-   OTHER), `shapes: u8` count with the shapes themselves in a side vector keyed by
-   pc, `flags: u8` (OVERFLOW_SEEN, MM_SEEN, GENERIC), `exits: u32`.
+5. The site's feedback byte (4.8), written by the interpreter's slow paths and by
+   exits: operand kinds, `OVERFLOW`, `MM`. A value's uses combine into the type
+   it is speculated at where it is defined (9.1). Receiver shapes seen at hot shape
+   exits are in `JitState.shapes_seen`, keyed by pc; exit counts are in the
+   region's exit table.
 6. Global facts: whether a number metatable is set (`State.type_metatables[2]`),
    read at compile time and guarded by a region-level watch (11.5).
 
 ### 7.2 Numbers
 
 Representations in compiled code: `I32` (sign-extended in an x register, or a w
-register), `F64` (a d register), `Val` (the boxed word). Integers outside i32 never
-exist unboxed; a `Val` with the `BIGINT` type bit set only flows into generic
-helpers.
+register), `I64` (an x register), `F64` (a d register), `Val` (the boxed word).
+Which integer representation a site gets comes from its form and its feedback
+byte:
+
+| Site | Representation |
+|---|---|
+| `_II` form, byte without `BIGINT`/`OVERFLOW` | `I32`, overflow guarded |
+| `_II` form with `OVERFLOW` or `BIGINT` in the byte, or a generic site whose byte has only `SMALL`/`BIGINT` | `I64` |
+| byte with `FLOAT` and integer kinds, no form | generic code |
 
 | Site form | Speculation and code |
 |---|---|
@@ -970,8 +996,9 @@ helpers.
 | `_FF` | both float (`Guard FLOAT`: unsigned compare against `BOX`); hardware op; `MOD_FF` and `POW_FF` by helper with a canonical-NaN fixup; result `F64` |
 | `_IF`, `_FI` | one small, one float; `scvtf` the small one; result `F64` |
 | `_NN` and locked generic | no speculation: `Val` operands, helper `jit_arith(rt, kind, a, b) -> Value or FAIL`; `FAIL` (a metamethod or an error) deopts `Before`; the helper boxes big integers and is followed by a GC check |
-| generic, never executed (4.8) | `Deopt(Before)` |
-| generic, executed without a form (`SEEN`) | generic code: the handler's inline small/float cases, then `jit_arith` |
+| generic, in a never-executed block (6.3) | `Deopt(Before)` |
+| generic, byte with integer kinds only | `I64` code (below) |
+| generic, any other nonzero byte | generic code: the handler's inline small/float cases, then `jit_arith` |
 | immediate forms `_I`, `_F`, `_IF` | one register operand guarded as the form says; the immediate is a constant (`Imm`: 31-bit int or f32-exact float); `ADDI_I` becomes `adds w, w, #imm` when the immediate fits 12 bits |
 | `ARITH_MM`, `_MM_R`, `_MMI` | left (or right) operand `Guard TAB`, its shape guarded, the class's metamethod at `mm_at(idx)` loaded from the class and compared against the compile-time constant (a function); a call through 5.4 with `ret_store_a` semantics (one result into `R[a]`). A mismatch deopts |
 | `UNM` | small with overflow check, or float `fneg`; else helper |
@@ -980,16 +1007,34 @@ helpers.
 | `FORPREP` | integer prep inline when init and step are small (the limit may be any number: helper `jit_for_limit` computes `last` or skips); `last` outside i32 deopts, as the interpreter then writes generic `FORLOOP` (it writes `FORLOOP_I` only when `last`, step and init all fit, `control.rs:221-224`); float prep inline for floats; other combinations deopt; writes the four hidden slots (`R[a]` last, `R[a+1]` step, `R[a+2]` index, `R[a+3]` the visible copy; a float loop keeps the limit in `R[a]`) as typed SSA values |
 | `FORLOOP_I` | `cmp idx, last; b.eq exit_loop; add idx, idx, step` with the step a constant when `FORPREP` saw a constant; no overflow check needed (`FORPREP` chose `last` in range) |
 | `FORLOOP_F` | `fadd; fcmp; b.cond`, direction chosen at compile time when the step is a constant |
-| `FORLOOP` generic | the hidden slots hold boxed integers: deopt at the loop (the interpreter runs such loops) |
+| `FORLOOP` generic with integer kinds (`forloop_slow` writes `BIGINT`) | an `I64` loop: `last`, step and index unboxed once at `FORPREP` or the entry, `cmp; b.eq; add` on x registers, the visible copy boxed only when it escapes |
 
-Overflow policy (J6): the exit of an overflowing `_II` site records
-`OVERFLOW_SEEN`; the recompile emits the generic helper for that site only. The
-range analysis of section 9.6 removes the check where bounds prove it dead.
+**`I64` code.** Lua integers wrap (`math.maxinteger + 1 == math.mininteger`,
+`(1 << 62) * 4 == 0` in lua 5.5.1), so `add`, `sub`, `mul`, the bitwise ops and
+`lslv`/`lsrv` on x registers are the exact semantics, with no overflow check.
+`//` and `%` deopt on a zero divisor (the interpreter raises) and handle
+`mininteger // -1` (`mininteger`) and `% -1` (0) with a `csel`, since `sdiv`
+returns the dividend there without trapping. Values enter `I64` by
+`Unbox{I64}` (a small int's `sxtw`, or a boxed int's load from its box, after a
+two-way kind test) and leave by `Box{I64}`, which keeps the interpreter's
+invariant that a value in i32 is always a small int (`value.rs:144-149`): a range
+test, then the small-int `orr`, or the helper `jit_box_i64` and a GC check when
+the value is outside i32. A boxing that allocates happens only where the value
+escapes: a store to a table or upvalue, an argument or result, a register live at
+a tail-out or a snapshot. A loop that keeps a big integer in a register allocates
+nothing.
+
+Overflow policy: an `I32` site's overflow exit records `OVERFLOW`, and the
+recompile gives that site, and the values that flow from it, `I64`. The range
+analysis of section 9.7 removes checks and narrows `I64` back to `I32` where
+bounds prove it.
 
 `collatz_bench` meets this policy in milestone 1: 948 of its 1.5M starting values
-leave i32, in 7,408 of 203,419,330 steps (measured with lua 5.5.1), enough to set
-`OVERFLOW_SEEN` on `3*n+1`. After that recompile `n` is a guarded `Val` in the
-loop, and the helper boxes large values as the interpreter does.
+leave i32, in 7,408 of 203,419,330 steps (measured with lua 5.5.1). The first
+compile is `I32` (the interpreter has seen no overflow by then); the first
+overflow exit records `OVERFLOW` on `3*n+1`, and the recompile keeps `n` in an x
+register for the whole loop. The interpreter heap-boxes those 7,408 values; the
+compiled loop boxes none, since `n` never escapes the loop.
 
 ### 7.3 Compares and branches
 
@@ -997,8 +1042,8 @@ loop, and the helper boxes large values as the interpreter does.
 |---|---|
 | `JLT_II` … `JNEQ_II` | both small; `cmp w, w; b.cond` fused |
 | `JLTI_F` … `JNGEI_F` | float register; `fcmp d, #imm-constant` (`fmov` of the 15-bit immediate hoisted); unordered falls to the not-taken side as the handler's `<`/`<=` do |
-| `JLT_FF` … `JNLE_FF`, `JLTI_I` … `JNGEI_I` (new, 4.8) | both float: `fcmp; b.cond`; small int against the immediate: `cmp w, #imm; b.cond` |
-| generic register compare | never executed (4.8): deopt; `SEEN`: both floats inline, small/float mixes inline, strings and metamethods by helper `jit_cmp` that returns a bool or `FAIL` |
+| generic register compare (`JLT`, `JNLT`, `JLE`, `JNLE`) | operands typed by inference or use-driven speculation (9.1): `fcmp`, `cmp w` or `I64` `cmp` with `b.cond`; byte with integer kinds only: `I64` `cmp`; otherwise generic inline in the handler's order: both floats, both small, small/float mixes, then helper `jit_cmp` that returns a bool or `FAIL` for strings and metamethods |
+| generic `JLTI` … `JNGEI` | a register typed `I32`: `cmp w, #imm; b.cond`; typed `F64`: as `_F`; otherwise small test, float test, helper |
 | `JEQ`/`JNEQ` generic | in the handler's order (`compare.rs:67-71`): two floats by `fcmp` first, since a NaN has its own bits and must not equal itself; then bit identity; then both small; then helper for boxed ints and `__eq` |
 | `JEQI`, `JNEQI`, `JEQS`, `JNEQS` | inline: small compare, float compare, or bit identity against the interned constant; no metamethod |
 | `JT`, `JF`, `JTSET`, `JFSET` | `sub x, v, x_nil; cmp x, #2; b.lo/hs` with `NIL` hoisted; the `SET` forms assign on one edge (an edge block param, as the old `edge_defs` did) |
@@ -1017,8 +1062,8 @@ compare of a loop counter against its `last` is the common case.
 | `SETFIELD_INL/_AUX`, `SETTABUP_*` with `Own` | shape guard; load the existing value, and when it is nil read the class bits live and deopt on `NEWINDEX`; barrier (5.7) unless the stored value is proven non-heap; store. The SET fill never caches a mirrored key on an adopted shape (4.7), so this store never changes class bits |
 | `_TRANS` with `Transition{from, to, loc}` | shape guard on `from`; class bits read live, `NEWINDEX` deopts (the shape pins the class, not its bits); value nil deopts (stores nothing in the interpreter, which the deopt reproduces); `has_room(loc)` inline for a spilled `loc` (`ldr cap, [t + SPILL_CAP]; cmp`), true for an inline one; barrier; store the value; store `to` into `t + SHAPE` (the shape pointer is a GC object the table now references: the barrier above covers it, since the table is the parent) |
 | `_ABSENT` store | class bits read live; an `__newindex` function on the class: a metamethod call; else deopt |
-| `GETFIELD`/`SETFIELD` generic with `Empty` | never executed (4.8): deopt |
-| any field site with `Uncached` | the generic helper (`jit_index`/`jit_newindex`) |
+| `GETFIELD`/`SETFIELD` generic with `Empty` and a zero byte | a recording site that never ran: its block is never executed (6.3), deopt |
+| a field site with an `Empty` IC and a nonzero byte (it ran, never cacheable: a dict shape, a mirrored key) | the generic helper (`jit_index`/`jit_newindex`) |
 | generic with a filled IC that no longer matches the form | the IC was refilled after the form was written; the builder uses the IC entry, which is authoritative, and the form only as a hint |
 | `GETTABUP_REF`, `SETTABUP_REF` | receiver loaded through the cell (`ldr cell, [closure + UPVAL i]; ldr p, [cell + V]; ldr t, [p]`), then as the `_INL` cases using the IC entry |
 
@@ -1026,7 +1071,7 @@ A shape compare covers later uses of the same receiver until something may chang
 a shape (`W_SHAPE`: a transition, a generic store helper, `setmetatable`, a call;
 8.4). GVN removes the repeats in between, and LICM hoists it out of a loop whose
 receiver is loop-invariant and whose body writes no shape, which a loop of stores
-into existing fields does not (section 9.4). The class-bit reads are `R_META` and
+into existing fields does not (section 9.5). The class-bit reads are `R_META` and
 hoist the same way.
 
 ### 7.5 Globals, upvalues, constants
@@ -1116,7 +1161,7 @@ splicing (a rewrite over flat arenas is a linear copy, which is what the old
 ```rust
 pub struct Ty { rep: Rep, set: TypeSet, refine: Refine }
 
-pub enum Rep { Val, I32, F64, B1, Ptr }
+pub enum Rep { Val, I32, I64, F64, B1, Ptr }
 
 bitflags TypeSet: u16 {
     NIL, FALSE, TRUE, SMALL, BIGINT, FLOAT, STR, TAB, FUN, THR, UDATA
@@ -1135,12 +1180,12 @@ exists: a type tag, an identity, a closure's prototype. A table's shape is not o
 of those. A transition, a generic store helper, `setmetatable` or a call changes
 the shape of every alias of the table, so shape knowledge is never part of `Ty`:
 it lives in `GuardShape` instructions, which read the `R_SHAPE` effect class and
-are removed only by GVN (8.4, 9.3).
+are removed only by GVN (8.4, 9.4).
 
-`Rep::I32` implies `SMALL`, `F64` implies `FLOAT`, `B1` implies `BOOL`, `Ptr` a
+`Rep::I32` implies `SMALL`, `I64` implies `INT`, `F64` implies `FLOAT`, `B1` implies `BOOL`, `Ptr` a
 single heap type. `Val` carries any set. The lattice join is the union of sets
 with the refinement kept only when both sides agree. Every value has a `Ty`; the
-builder assigns the speculated type, inference (9.1) narrows it, and guards
+builder assigns the speculated type, inference (9.2) narrows it, and guards
 produce refined copies: `Guard(v, set) -> v'` where `v'` has `set ∩ ty(v)` and the
 same `Rep`; `Unbox` changes `Rep`.
 
@@ -1165,10 +1210,16 @@ identity), `GuardIndexTable[pool](shape)` (class `__index` identity),
 staged header), `Deopt` (unconditional, `Before`), `GcCheck` (exit `Gc`, `After`).
 
 Integer (`I32` in, `I32` out): `IAdd`, `ISub`, `IMul` (overflow deopts; carry a
-snapshot), `IAddNo`, `ISubNo`, `IMulNo` (proven not to overflow, 9.6), `INeg`,
+snapshot), `IAddNo`, `ISubNo`, `IMulNo` (proven not to overflow, 9.7), `INeg`,
 `IDivFloor`, `IModFloor` (zero divisor deopts; expanded before lowering, 10.3),
 `IAnd`, `IOr`, `IXor`, `INot`, `IShl`, `IShr` (Lua count semantics, expanded),
 `ICmp[cc] -> B1`, `IToF -> F64`.
+
+Integer (`I64` in, `I64` out, wrapping, no snapshot): `LAdd`, `LSub`, `LMul`,
+`LNeg`, `LAnd`, `LOr`, `LXor`, `LNot`, `LShl`, `LShr` (Lua count semantics),
+`LDivFloor`, `LModFloor` (zero divisor deopts; `mininteger`/`-1` by `csel`),
+`LCmp[cc] -> B1`, `IToL` (`sxtw`), `LToI` (deopts outside i32; used by range
+narrowing and array keys), `LToF -> F64`.
 
 Float: `FAdd`, `FSub`, `FMul`, `FDiv`, `FNeg`, `FAbs`, `FSqrt`, `FFloor`, `FCeil`,
 `FFloorDiv` (`fdiv` then `frintm`), `FMod` and `FPow` (helpers, canonical-NaN
@@ -1306,8 +1357,9 @@ One pass over the bytecode from the entry pc:
    "in slot" for every register, captured ones included, since the callee may
    have written them through an open cell), since the resume brings nothing in
    registers but the results.
-6. **Never-executed sites** (4.8, 6.3) emit `Deopt` and end the block (the rest
-   of the block is unreachable code and is not emitted).
+6. **Never-executed blocks** (6.3, decided after step 1 from the CFG and its
+   dominator tree) emit one `Deopt(Before)` at their first instruction; blocks
+   reachable only through them are not emitted.
 7. **Sealing**: blocks are sealed when all predecessors are emitted; loop headers
    seal at the back-edge, which is when Braun's algorithm completes their
    parameters; trivial parameters are removed by the existing `simplify`.
@@ -1329,7 +1381,69 @@ instruction with types and snapshots, which the snapshot tests (`insta`) record.
 Passes in order; each is a function `Func -> Func` or an in-place rewrite, with a
 verifier run after each in debug builds.
 
-### 9.1 Type inference
+### 9.1 Use-driven speculation
+
+Values enter a region without a type: parameters, the live registers at a loop
+entry, field and table loads, upvalues and globals, call results, `VARARG`. JSC
+types such values where they are defined, from value profiles the LLInt writes on
+every execution (argument profiles, `JavaScriptCore/bytecode/CodeBlock.h:420-424`;
+load and call results). tcvm has feedback only at uses (the consumers' forms and
+feedback bytes), so this pass reconstructs a definition's type from its uses and
+guards the value once, where it is defined, instead of once per use.
+
+1. **Expectation per use**, from the consumer's feedback:
+
+   | Use | Expectation |
+   |---|---|
+   | operand of an `_II`/`_I` form | `SMALL` |
+   | operand of an `_FF`/`_F` form | `FLOAT` |
+   | operand of `_IF`/`_FI` | `SMALL` on one side, `FLOAT` on the other |
+   | operand of a generic site whose byte has only integer kinds | `INT` (an `I64` candidate) |
+   | receiver of a field form | `TAB` |
+   | callee of a call | `FUN` |
+   | generic compare, store, return, call argument | none (uninformative) |
+
+   Uses in blocks the never-executed rule cuts (6.3) do not count.
+2. **Backward propagation** to a fixpoint over the SSA uses: a value's expectation
+   is the intersection of its informative uses' sets, and a block parameter passes
+   its expectation back to its incoming arguments, so loop-carried values take
+   part. This is the direction of V8's truncation propagation
+   (`v8/src/compiler/simplified-lowering.cc:64-72,714-722`) and JSC's backwards
+   propagation of use flags (`JavaScriptCore/dfg/DFGNodeFlags.h:62-69`), which
+   carry how a value is used rather than a type to guard.
+3. **Conflict**: an empty intersection (one use quickened to `_II`, another to
+   `_FF`) means the value is polymorphic; it gets no definition guard and keeps
+   per-use guards.
+4. **Placement**: the guard goes at the earliest point after the definition from
+   which every path reaches an informative use expecting that set before the
+   value's last use, the anticipability ("down-safety") condition of partial
+   redundancy elimination. A guard placed there deopts only executions that a
+   per-use guard would deopt later, so it never adds a deopt, only moves one
+   earlier. Its snapshot is `After` the defining instruction.
+5. **Entries are the exception.** Parameters and the live registers at a loop
+   entry are guarded in the prologue even where that point is not down-safe: a
+   failed entry guard costs one interpreted run of the original instruction
+   (`jit_entry_fail`, 6.4), and the prologue needs the types. A loop entry
+   intersects the expectation with the kind of the live frame's value (J7); if
+   they disagree, the register is not speculated.
+6. **After the guard** the value is refined and unboxed once; inference (9.2)
+   carries the type to every use, which deletes their own guards.
+
+A wrong speculation corrects itself through the interpreter: after a definition
+guard deopts, the interpreter runs the uses with the other type, their forms miss
+and re-quicken or go generic, and the next compile sees conflicting or widened
+expectations and leaves the value to per-use guards. The cost is one backward
+fixpoint over the uses and one bit-vector anticipability dataflow with a bit per
+candidate value.
+
+Example, `primes2`'s `is_prime(n)`: `n` is used by `n < 2` and `n == 2`
+(uninformative), `n % 2` (a small-int form), `i * i <= n` (`JLE_II`) and `n % i`
+(`MOD_II`). They agree on `SMALL`, the prologue guards `n` once, and all three
+compares are `cmp w`. Counter-example, `local v = t.x; if v > 0 then s = s + v end`
+with the add `_FF`: the path where `v > 0` fails never uses `v` as a float, so the
+guard stays at the add and the compare stays generic.
+
+### 9.2 Type inference
 
 Optimistic forward dataflow to a fixpoint over the SSA graph: every value starts
 at the bottom type, instructions apply their result rules, block parameters join
@@ -1343,7 +1457,7 @@ type guard's set already holds, the guard is deleted. Shape guards are not types
 `NUM`, and its consumers keep their guards; that is the case block duplication
 would address later (J4).
 
-### 9.2 Loop peeling
+### 9.3 Loop peeling
 
 Each innermost loop of the region whose body is at most `PEEL_LIMIT = 48`
 instructions is peeled once: the body is copied before the header, the copy's exit
@@ -1351,12 +1465,12 @@ edges join the original loop's exits, and the original header's parameters are
 fed only by the back-edge and the copy's end. Inference then runs again on the
 loop, where the steady-state types are no longer joined with the entry types, and
 guards that held in the peeled iteration and whose values are loop-invariant are
-proven by GVN in the loop (9.3). Peeling is what makes the `_II` counter loop and
+proven by GVN in the loop (9.4). Peeling is what makes the `_II` counter loop and
 the `_FF` accumulator loop guard-free in their steady state. Outer loops are not
 peeled here; the peeling of enclosing iterations at a loop entry (8.7) is a
 different transformation and runs in the builder.
 
-### 9.3 Global value numbering with guard elimination
+### 9.4 Global value numbering with guard elimination
 
 Dominator-order hashing of pure instructions by op and arguments. Guards hash by
 op, argument and payload, and a guard is redundant when an equal guard dominates
@@ -1365,7 +1479,7 @@ it with no intervening write to the class it reads (8.4). Loads (`TabLoad`,
 write to their class as an extra key, which gives load forwarding for free within
 a block and across blocks along the dominator tree.
 
-### 9.4 Loop-invariant code motion
+### 9.5 Loop-invariant code motion
 
 For each loop, instructions whose arguments are defined outside the loop and
 whose effects read only classes the loop does not write are moved to the
@@ -1377,7 +1491,7 @@ correct because the loop's first iteration would have deopted there too (peeling
 guarantees the first iteration's guards are present before the loop). Allocating
 instructions and calls are never hoisted.
 
-### 9.5 Dead code elimination and narrowing
+### 9.6 Dead code elimination and narrowing
 
 Unused pure instructions are deleted; `Box` of an `Unbox` and `Unbox` of a `Box`
 fold; a `Val` that is only ever unboxed to `I32` is kept unboxed from its
@@ -1385,16 +1499,18 @@ definition when the definition is a boxed `I32` producer (narrowing of block
 parameters: a parameter whose every incoming argument is `Box(I32)` becomes an
 `I32` parameter with the boxes moved to the uses that need `Val`).
 
-### 9.6 Range analysis (after milestone 3)
+### 9.7 Range analysis (after milestone 3)
 
 Interval analysis over `I32` values: constants, `FORPREP` bounds (`last` and the
 step give the counter's range), compares on dominating edges, `asize` bounds for
 array indices. An `IAdd`/`ISub`/`IMul` whose operand ranges keep the result in
-i32 becomes the `No` form without the overflow branch; an array index proven in
-`[0, asize)` by a dominating compare loses its bounds check. This is V8's
+i32 becomes the `No` form without the overflow branch; an `I64` value whose range
+fits i32 is narrowed to `I32`, which boxes with one `orr` instead of a range test;
+an array index proven in `[0, asize)` by a dominating compare loses its bounds
+check. This is V8's
 `maglev-range-analysis` idea scoped to what Lua loops need.
 
-### 9.7 Call boundaries, snapshot pruning and critical edges
+### 9.8 Call boundaries, snapshot pruning and critical edges
 
 The call-boundary pass enforces R6. For each tail-out that resumes (`Call`,
 `CallMm`) it computes the values live across it; each must be a constant, a pool
@@ -1410,7 +1526,7 @@ allocator may place anywhere and which is rematerialized when it is a constant o
 an unbox of an unchanged slot). Critical edges are split by inserting empty blocks
 so that `regalloc2`'s requirement holds and edge-block parameters have a home.
 
-### 9.8 Block layout
+### 9.9 Block layout
 
 `order.rs` lays out blocks loop-contiguously with the exit stubs at the end; it
 rejects irreducible graphs, which Lua's `goto` can produce; such a region fails
@@ -1482,7 +1598,7 @@ fold:
 | `Br(ICmp[cc](a, b))`, single use | `cmp; b.cond` |
 | `Br(ICmp[cc](a, I32[k]))`, k in imm12 | `cmp w, #k; b.cond` (negative k becomes `cmn`) |
 | `Br(FCmp[cc](a, b))` | `fcmp; b.cond` with the unordered sense folded into `cond` |
-| `Br(IsFalsy(v))` | `sub x9, v, x_nil; cmp x9, #2; b.lo` with `NIL` (`0xFFFF_FFFE_0000_0000`) materialized once per call-free span (`movz/movk`, or a load from the island; 9.7 re-materializes it after each resume point) |
+| `Br(IsFalsy(v))` | `sub x9, v, x_nil; cmp x9, #2; b.lo` with `NIL` (`0xFFFF_FFFE_0000_0000`) materialized once per call-free span (`movz/movk`, or a load from the island; 9.8 re-materializes it after each resume point) |
 | `Br(IsType[FLOAT](v))` | `cmp v, x_BOX; b.lo` with `BOX` in a register shared within a call-free span when used more than once, else `movz/movk` |
 | `Br(IsType[SMALL](v))` | `lsr x9, v, #32; cmn w9, #1; b.eq` |
 | `Br(IsType[tag](v))` | `lsr x9, v, #48; cmp w9, w_k; b.eq` with `k = 0xFFF8 \| tag` (too wide for imm12: a `movz` shared within a call-free span) |
@@ -1497,6 +1613,9 @@ fold:
 | `FToIExact` | `fcvtzs w, d; scvtf d2, w; fcmp d, d2; b.ne stub` |
 | `Box{I32}(v)` | `orr x, x_v_zext, #0xFFFF_FFFF_0000_0000` after `mov w, w` (zero extend; folded when the producer was a w-register op) |
 | `Unbox{I32}(Load[r])` | `ldrsw w, [base, #r*8]` |
+| `Unbox{I64}(v)` | `lsr x9, v, #32; cmn w9, #1; b.ne big; sxtw x, w_v`; `big:` tag-2 test (`lsr x9, v, #48`, compare with `0xFFFA`, else the stub), `and p, v, #0xFFFF_FFFF_FFFF; ldr x, [p]` (the box's payload is at offset 0, `value.rs:190-198`) |
+| `Box{I64}(x)` | `cmp x, w_x, sxtw; b.ne big`, then the small-int `orr`; `big:` `bl jit_box_i64` and a `GcCheck` exit (`After`), out of line in the cold section |
+| `LAdd`, `LSub`, `LMul`, `LAnd`… | the 64-bit `add`/`sub`/`mul`/`and`… on x registers, immediates folded as for `I32` |
 | `Unbox{F64}(Load[r])` | `ldr d, [base, #r*8]` |
 | `Box{F64}(v)` → `Store[r]` | `str d, [base, #r*8]` (no GPR trip) |
 | `Box{Ptr[tag]}(p)` | `orr x, p, #k` with `k = QNAN_NEG \| tag << 48` as a logical immediate when `k`'s ones are contiguous (tags 4 and 7), else `orr x, p, x_k` with `k` hoisted |
@@ -1514,7 +1633,7 @@ fold:
 | `Load[r]` | `ldr x, [base, #r*8]` |
 | `UpvalValue[i]` | `ldr x, [closure, #UPVALS + i*8]` |
 
-Expansions before lowering (shared, in the IR, section 9.5 runs after them):
+Expansions before lowering (shared, in the IR, section 9.6 runs after them):
 `IDivFloor`, `IModFloor`, `IShl`, `IShr`, `FFloorDiv`, `IsFalsy` into primitive
 compares and selects, so the second target lowers only primitives. The patterns
 that fuse compare and branch, immediates and addressing modes are the per-target
@@ -1663,8 +1782,9 @@ the entry (11.3). The Rosetta flake noted in #128 is an x86-64 concern for later
 
 ### 11.1 Per prototype
 
-`Prototype` gains one field, `jit: Lock<Option<Gc<'gc, JitState<'gc>>>>`, null
-until the first `jit_hot` for the prototype. `LuaClosure` copies nothing new.
+`Prototype` gains two fields: `feedback: Box<[Cell<u8>]>`, the feedback byte per
+instruction (4.8), and `jit: Lock<Option<Gc<'gc, JitState<'gc>>>>`, null until the
+first `jit_hot` for the prototype. `LuaClosure` copies nothing new.
 
 `State` gains the entry table, `jit.entries: Box<[Cell<*const u8>]>` behind a
 pointer at a fixed `layout` offset, as LuaJIT's `J->trace[]`: slot `d` holds the
@@ -1678,7 +1798,6 @@ closure → proto → `jit` → entry chain.
 ```rust
 pub struct JitState<'gc> {
     entries: [Entry; MAX_ENTRIES],          // MAX_ENTRIES = 4
-    feedback: Box<[SiteFeedback]>,           // one per pc (7.1)
     shapes_seen: Vec<(u32 /*pc*/, Shape<'gc>)>,
     regions: Vec<Gc<'gc, Region<'gc>>>,      // live and retired, until the prototype dies
     strikes: u8,
@@ -1769,7 +1888,7 @@ them hoist out of loops that write no metatable and no shape.
 
 | Structure | Size |
 |---|---|
-| `SiteFeedback` | 8 bytes per instruction of the prototype |
+| feedback byte | 1 byte per instruction of every prototype |
 | `ExitInfo` | 16 bytes per exit |
 | snapshot entry | 4 bytes; a typical guard snapshot has 2 to 6 entries |
 | exit stub | 8 bytes of code per guard |
@@ -1871,18 +1990,21 @@ Tests:
 Each milestone has exit criteria; a milestone is done when all tests of section 14
 pass for its coverage and its measurements are recorded.
 
-1. **Protocol and numerics.** Interpreter first: the complete adaptive state of
-   4.8 (the `_FF` and `_I` compare forms, the `SEEN` bit, `Uncached` ICs), ISA
-   opcodes `FUNC`/`LOOP` (emitted by the compiler) and `JIT_ENTRY`/`JIT_LOOP`,
-   each measured with the JIT off. Then the entry table, counters, `jit_hot`,
+1. **Protocol and numerics.** Interpreter first: the feedback byte and its
+   slow-path writers (4.8), ISA opcodes `FUNC`/`LOOP` (emitted by the compiler)
+   and `JIT_ENTRY`/`JIT_LOOP` (the ISA goes from 204 to 208 opcodes), each
+   measured with the JIT off. Then the entry table, counters, `jit_hot`,
    `jit_recompile`, `jit_entry_fail`, `JitState`/`Region`, the builder with
-   constants, moves, `_II`/`_FF`/`_IF`/`_FI` arithmetic, immediates, compares,
+   constants, moves, `_II`/`_FF`/`_IF`/`_FI` arithmetic, `I64` arithmetic and
+   loops with `jit_box_i64` and its GC-check exit, immediates, compares,
    `JT/JF`, `FORPREP`/`FORLOOP_I/F`, `JMP`, `RETURN0/1`, type inference,
    peeling, GVN, the aarch64 backend with `regalloc2`, exits with snapshots,
-   `jit_exit`, and the `Call` instruction with resume points for unknown callees
-   (so a region can call out). Everything else is `Deopt`. Exit: `primes2`, `collatz_bench`,
-   `mandel_bench`, `iterative_fib_bench` run compiled with no exits in steady state
-   (for `collatz_bench`, after its overflow recompile, 7.2); compile time per stage
+   `jit_exit`, the never-executed block rule (6.3), use-driven speculation (9.1),
+   and the `Call` instruction with resume points for unknown callees
+   (so a region can call out). Everything else is `Deopt`. Exit: `primes2`,
+   `collatz_bench`, `mandel_bench`, `iterative_fib_bench` run compiled with no
+   exits in steady state (for `collatz_bench`, after its overflow recompile, with
+   `n` in an x register, 7.2); compile time per stage
    measured on them; the interpreter changes measured with the JIT off against
    main (6.1, 4.8).
 2. **Helpers and allocation.** Generic arithmetic and compare helpers, `_NN` and
@@ -1897,7 +2019,7 @@ pass for its coverage and its measurements are recorded.
    suite compiled; results versus the interpreter and LuaJIT recorded in the
    perf notes.
 4. **Calls.** Direct calls to compiled entries with patching, inlining (13),
-   `pcall` through `enter`, range analysis (9.6). Exit: the LJR call-heavy
+   `pcall` through `enter`, range analysis (9.7). Exit: the LJR call-heavy
    benchmarks (`fib`, `richards`, `deltablue`, `havlak`) measured against the
    interpreter and LuaJIT.
 5. **x86-64.** The second target per Appendix E, run under Rosetta for
@@ -1928,9 +2050,14 @@ first milestone 1 measurement replaces it.
   the chain see correct frames (5.8). `debug.setlocal` is a call, so the JIT frame
   is at a tail-out with its live registers in their slots (R1) and reloads every
   register after the resume (8.7): the write takes effect. Hooks are a non-goal.
-- **Irreducible control flow** from `goto`: refused (9.8), a strike.
+- **Irreducible control flow** from `goto`: refused (9.9), a strike.
 - **Very large functions**: the builder caps a region at `MAX_INSTS = 4000` IR
   instructions; beyond that only loop entries are compiled.
+- **`I64` boxing at calls**: a big integer live across a call is boxed at every
+  call (R1 needs a `Value` in its slot), an allocation per call that the
+  interpreter also pays when it produces the value. Loops that keep big integers
+  in registers and call nothing allocate nothing; a loop that calls with a big
+  integer live costs one box per iteration until inlining (13) removes the call.
 - **Snapshot-only values across calls**: a value live only in snapshots after a
   call is rematerialized from its home slot (it was stored by R1), so it is never
   an allocator use after a call.
@@ -2011,9 +2138,9 @@ named milestone, `H` a helper, `I` inline code.
 | `GETTABUP*`, `GETFIELD*`, `SELF*`, `SETTABUP*`, `SETFIELD*` (27 opcodes: 5 generic, 20 forms, 2 `_REF`) | D | D | I | 7.4; `_REF` receivers via the cell |
 | `GETTABLE`, `SETTABLE` | D | D | I/H | array fast path inline, else helper |
 | `NEWTABLE`, `SETLIST` | D | H | | GC check after `NEWTABLE` |
-| `ADD`..`SHR` generic (12), `_NN` (7) | D | H | | never executed (4.8) stays D |
+| `ADD`..`SHR` generic (12), `_NN` (7) | D / I | H | | never-executed blocks (6.3) stay D; an integer-kinds byte gives `I64` code from M1 |
 | `_II`, `_FF`, `_IF`, `_FI`, bitwise `_II`, `POW_II` (27) | I | | | 7.2 |
-| `ADDI`..`RSHRI` generic (19) | D | H | | |
+| `ADDI`..`RSHRI` generic (19) | D / I | H | | as the register forms |
 | `_I`, `_F`, `_IF` immediate forms (27) | I | | | |
 | `ARITH_MM`, `_MM_R`, `_MMI` | D | D | I + call | |
 | `UNM`, `BNOT`, `NOT` | I | | | slow cases H in M2 |
@@ -2021,12 +2148,12 @@ named milestone, `H` a helper, `I` inline code.
 | `CLOSE`, `TBC` | D | H / D | | TBC stays D |
 | `JMP` | I | | | |
 | `JEQ`..`JNLE` generic, `JEQI`..`JNGEI`, `JEQS`, `JNEQS` | I/D | H | | inline numeric cases; strings and `__eq`/`__lt` via H |
-| `_II` compares (6), `_F` compares (8), `_FF` (4) and `_I` (8) compares (new, 4.8) | I | | | |
+| `_II` compares (6), `_F` compares (8) | I | | | |
 | `JT`, `JF`, `JTSET`, `JFSET` | I | | | |
 | `CALL`, `CALL_R0`, `CALL_R1`, `CALLS*` | I (5.4) | | direct calls M4 | `b == 0` D until M3 |
 | `TAILCALL` | D | | I fast arm | |
 | `RETURN`, `RETURN0`, `RETURN1` | I | | | `b == 0` and flags set: D until M3 |
-| `FORPREP`, `FORLOOP_I`, `FORLOOP_F` | I | | | generic `FORLOOP`: D |
+| `FORPREP`, `FORLOOP_I`, `FORLOOP_F`, generic `FORLOOP` | I | | | generic `FORLOOP` as an `I64` loop |
 | `TFORPREP`, `TFORCALL`, `TFORCALL_NEXT`, `TFORCALL_IPAIRS`, `TFORLOOP` | D | | I | generic `TFORCALL` is a call |
 | `CLOSURE` | D | H | | |
 | `VARARG`, `VARARGGET`, `VARARGPREP` | D | I/H | | |
