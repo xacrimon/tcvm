@@ -816,6 +816,12 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             }
         }
         post.reverse();
+        for (j, &li) in nest.iter().enumerate() {
+            if let Some(&ii) = self.inst_of.get(&(cfg.loops[li].header, j as u32)) {
+                let b = self.instances[ii].ir;
+                self.f.blocks[b.idx()].peeled = true;
+            }
+        }
         post
     }
 
