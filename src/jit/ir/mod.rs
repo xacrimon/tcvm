@@ -78,6 +78,9 @@ pub(crate) struct BlockData {
     pub(crate) resume: bool,
     /// Deleted by a pass; skipped by everything.
     pub(crate) dead: bool,
+    /// A loop header entered only after a copy of the loop's current
+    /// iteration (8.7), so peeling it again buys nothing.
+    pub(crate) peeled: bool,
 }
 
 /// How an exit resumes the interpreter.

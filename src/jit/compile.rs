@@ -92,6 +92,10 @@ pub(crate) fn build_ir<'gc>(
     if opt::speculate::speculate(&mut f, &kinds) {
         check(&f, "speculate")?;
     }
+    if opt::peel::peel(&mut f) {
+        remove_trivial_params(&mut f);
+        check(&f, "peel")?;
+    }
     optimize(&mut f);
     opt::prune_gc_checks(&mut f);
     opt::dce(&mut f);

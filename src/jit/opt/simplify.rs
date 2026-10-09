@@ -123,6 +123,7 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                         changed = true;
                     }
                 }
+                op if fold_arith(f, i, op, &args) => changed = true,
                 Op::ICmp(cc) | Op::LCmp(cc) => {
                     if let (Some(x), Some(y)) = (konst_int(f, args[0]), konst_int(f, args[1])) {
                         set_b1(f, i, cc.eval_i(x, y));
@@ -211,6 +212,69 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
         mark_unreachable(f);
     }
     changed
+}
+
+/// Fold integer and float arithmetic on constants into a constant, where
+/// the operation would not exit.
+fn fold_arith(f: &mut Func<'_>, i: Inst, op: Op, args: &[Val]) -> bool {
+    use Op::*;
+    let int = |k: usize| args.get(k).and_then(|&a| konst_int(f, a));
+    let flt = |k: usize| args.get(k).and_then(|&a| konst_f64(f, a));
+    let small = |n: i64| i32::try_from(n).ok().map(KI32);
+    let folded = match op {
+        IAdd | IAddNo => int(0).zip(int(1)).and_then(|(x, y)| small(x + y)),
+        ISub | ISubNo => int(0).zip(int(1)).and_then(|(x, y)| small(x - y)),
+        IMul | IMulNo => int(0).zip(int(1)).and_then(|(x, y)| small(x * y)),
+        IAnd => int(0).zip(int(1)).and_then(|(x, y)| small(x & y)),
+        IOr => int(0).zip(int(1)).and_then(|(x, y)| small(x | y)),
+        IXor => int(0).zip(int(1)).and_then(|(x, y)| small(x ^ y)),
+        INeg => int(0).and_then(|x| small(-x)),
+        IDivFloor => int(0)
+            .zip(int(1))
+            .filter(|&(_, y)| y != 0)
+            .and_then(|(x, y)| {
+                let q = x / y;
+                small(if x % y != 0 && (x < 0) != (y < 0) {
+                    q - 1
+                } else {
+                    q
+                })
+            }),
+        IModFloor => int(0)
+            .zip(int(1))
+            .filter(|&(_, y)| y != 0)
+            .and_then(|(x, y)| {
+                let r = x % y;
+                small(if r != 0 && (r < 0) != (y < 0) {
+                    r + y
+                } else {
+                    r
+                })
+            }),
+        LAdd => int(0).zip(int(1)).map(|(x, y)| KI64(x.wrapping_add(y))),
+        LSub => int(0).zip(int(1)).map(|(x, y)| KI64(x.wrapping_sub(y))),
+        LMul => int(0).zip(int(1)).map(|(x, y)| KI64(x.wrapping_mul(y))),
+        LAnd => int(0).zip(int(1)).map(|(x, y)| KI64(x & y)),
+        LOr => int(0).zip(int(1)).map(|(x, y)| KI64(x | y)),
+        LXor => int(0).zip(int(1)).map(|(x, y)| KI64(x ^ y)),
+        IToL => int(0).map(KI64),
+        LToI => int(0).and_then(small),
+        IToF | LToF => int(0).map(|x| KF64((x as f64).to_bits())),
+        FAdd => flt(0).zip(flt(1)).map(|(x, y)| KF64((x + y).to_bits())),
+        FSub => flt(0).zip(flt(1)).map(|(x, y)| KF64((x - y).to_bits())),
+        FMul => flt(0).zip(flt(1)).map(|(x, y)| KF64((x * y).to_bits())),
+        _ => None,
+    };
+    let Some(k) = folded else {
+        return false;
+    };
+    let d = &mut f.insts[i.idx()];
+    d.op = k;
+    d.an = 0;
+    d.snap = crate::jit::ir::NO_SNAP;
+    let r = f.result(i);
+    f.vals[r.idx()].ty = k.result_ty(&[]);
+    true
 }
 
 fn set_b1(f: &mut Func<'_>, i: Inst, v: bool) {
