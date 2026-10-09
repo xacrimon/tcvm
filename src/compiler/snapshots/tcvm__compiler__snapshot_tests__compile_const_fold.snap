@@ -32,43 +32,44 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  [  1]  VARARGPREP      fixed=0
-0001  [  5]  LOADI           R0 21
-0002  [  5]  SETTABUP        R0 U0 K0  ; "a"
-0003  [  6]  LOAD            R0 K2  ; 21.0
-0004  [  6]  SETTABUP        R0 U0 K1  ; "b"
-0005  [  7]  LOAD            R0 K4  ; 1024.0
-0006  [  7]  SETTABUP        R0 U0 K3  ; "c"
-0007  [  8]  LOADI           R0 2
-0008  [  8]  SETTABUP        R0 U0 K5  ; "d"
-0009  [  9]  LOADI           R0 3
-0010  [  9]  SETTABUP        R0 U0 K6  ; "e"
-0011  [ 12]  LOAD            R0 K8  ; 5.5
-0012  [ 12]  SETTABUP        R0 U0 K7  ; "f"
-0013  [ 13]  LOAD            R0 K10  ; 2.5
-0014  [ 13]  SETTABUP        R0 U0 K9  ; "g"
-0015  [ 16]  LOADI           R0 255
-0016  [ 16]  SETTABUP        R0 U0 K11  ; "h"
-0017  [ 17]  LOADI           R0 15
-0018  [ 17]  SETTABUP        R0 U0 K12  ; "i"
-0019  [ 18]  LOADI           R0 240
-0020  [ 18]  SETTABUP        R0 U0 K13  ; "j"
-0021  [ 19]  LOADI           R0 256
-0022  [ 19]  SETTABUP        R0 U0 K14  ; "k"
-0023  [ 20]  LOADI           R0 16
-0024  [ 20]  SETTABUP        R0 U0 K15  ; "l"
-0025  [ 23]  LOADI           R0 -5
-0026  [ 23]  SETTABUP        R0 U0 K16  ; "m"
-0027  [ 24]  LOADI           R0 5
-0028  [ 24]  SETTABUP        R0 U0 K17  ; "n"
-0029  [ 25]  LOADI           R0 255
-0030  [ 25]  SETTABUP        R0 U0 K18  ; "o"
-0031  [ 28]  LOAD            R0 K20  ; false
-0032  [ 28]  SETTABUP        R0 U0 K19  ; "p"
-0033  [ 29]  LOAD            R0 K22  ; true
-0034  [ 29]  SETTABUP        R0 U0 K21  ; "q"
-0035  [ 30]  LOAD            R0 K20  ; false
-0036  [ 30]  SETTABUP        R0 U0 K23  ; "r"
-0037  [ 31]  LOAD            R0 K22  ; true
-0038  [ 31]  SETTABUP        R0 U0 K24  ; "s"
-0039  [ 31]  RETURN          R0 count=1
+0000  [  1]  FUNC
+0001  [  1]  VARARGPREP      fixed=0
+0002  [  5]  LOADI           R0 21
+0003  [  5]  SETTABUP        R0 U0 K0  ; "a"
+0004  [  6]  LOAD            R0 K2  ; 21.0
+0005  [  6]  SETTABUP        R0 U0 K1  ; "b"
+0006  [  7]  LOAD            R0 K4  ; 1024.0
+0007  [  7]  SETTABUP        R0 U0 K3  ; "c"
+0008  [  8]  LOADI           R0 2
+0009  [  8]  SETTABUP        R0 U0 K5  ; "d"
+0010  [  9]  LOADI           R0 3
+0011  [  9]  SETTABUP        R0 U0 K6  ; "e"
+0012  [ 12]  LOAD            R0 K8  ; 5.5
+0013  [ 12]  SETTABUP        R0 U0 K7  ; "f"
+0014  [ 13]  LOAD            R0 K10  ; 2.5
+0015  [ 13]  SETTABUP        R0 U0 K9  ; "g"
+0016  [ 16]  LOADI           R0 255
+0017  [ 16]  SETTABUP        R0 U0 K11  ; "h"
+0018  [ 17]  LOADI           R0 15
+0019  [ 17]  SETTABUP        R0 U0 K12  ; "i"
+0020  [ 18]  LOADI           R0 240
+0021  [ 18]  SETTABUP        R0 U0 K13  ; "j"
+0022  [ 19]  LOADI           R0 256
+0023  [ 19]  SETTABUP        R0 U0 K14  ; "k"
+0024  [ 20]  LOADI           R0 16
+0025  [ 20]  SETTABUP        R0 U0 K15  ; "l"
+0026  [ 23]  LOADI           R0 -5
+0027  [ 23]  SETTABUP        R0 U0 K16  ; "m"
+0028  [ 24]  LOADI           R0 5
+0029  [ 24]  SETTABUP        R0 U0 K17  ; "n"
+0030  [ 25]  LOADI           R0 255
+0031  [ 25]  SETTABUP        R0 U0 K18  ; "o"
+0032  [ 28]  LOAD            R0 K20  ; false
+0033  [ 28]  SETTABUP        R0 U0 K19  ; "p"
+0034  [ 29]  LOAD            R0 K22  ; true
+0035  [ 29]  SETTABUP        R0 U0 K21  ; "q"
+0036  [ 30]  LOAD            R0 K20  ; false
+0037  [ 30]  SETTABUP        R0 U0 K23  ; "r"
+0038  [ 31]  LOAD            R0 K22  ; true
+0039  [ 31]  SETTABUP        R0 U0 K24  ; "s"
+0040  [ 31]  RETURN          R0 count=1

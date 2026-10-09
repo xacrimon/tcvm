@@ -6,6 +6,7 @@ use crate::env::shape::{MetamethodBits, MmIndex};
 use crate::env::table::Table;
 use crate::env::value::Value;
 use crate::instruction::{ArithKind, Family, Instruction, MISSES_TO_LOCK, Op};
+use crate::jit::feedback;
 use crate::vm::abi::{Slot, handler, handler_bits};
 use crate::vm::frame::{self, HDR};
 use crate::vm::num::{self, ArithOp, BitOp};
@@ -547,6 +548,10 @@ handler! {
         if let Some(v) = inline_arith(info.kind, &lhs, &rhs) {
             if !locked {
                 let form = numeric_form(generic, &lhs, &rhs, insn.imm_is_int());
+                if form.is_none() {
+                    // Kinds no form covers leave no other record.
+                    feedback::record(closure, site, feedback::kind(lhs) | feedback::kind(rhs));
+                }
                 unsafe { specialize(site, insn, form, false) };
             }
             reg![dst] = v;
@@ -590,6 +595,10 @@ handler! {
             None => unreachable!("arith_slow on {generic:?}"),
         };
         let bit = kind_mm(info.kind);
+        let closure = unsafe { frame::closure(base) };
+        let kinds = feedback::kind(lhs) | feedback::kind(rhs);
+        let overflow = if kinds == feedback::SMALL { feedback::OVERFLOW } else { 0 };
+        feedback::record(closure, site, kinds | overflow);
         match r {
             num::SlowNum::Value(v) => {
                 // Boxed integers, or an overflow of the inline case: no form
@@ -615,6 +624,7 @@ handler! {
                 OpError::Arith(lhs, rhs)
             })
         }
+        feedback::record(closure, site, feedback::MM);
         if !locked {
             // The forms read the metamethod from a table's shape; taking it
             // from the right needs the left to be a number without one.

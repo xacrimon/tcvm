@@ -10,11 +10,12 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  [  1]  VARARGPREP      fixed=0
-0001  [  1]  LOAD            R0 K0  ; "Hello"
-0002  [  1]  LOAD            R1 K1  ; ", World"
-0003  [  1]  CONCAT          R0 R0 R1
-0004  [  2]  GETTABUP        R1 U0 K2  ; "print"
-0005  [  2]  MOVE            R5 R0
-0006  [  2]  CALL_R0         R1 args=2
-0007  [  2]  RETURN          R0 count=1
+0000  [  1]  FUNC
+0001  [  1]  VARARGPREP      fixed=0
+0002  [  1]  LOAD            R0 K0  ; "Hello"
+0003  [  1]  LOAD            R1 K1  ; ", World"
+0004  [  1]  CONCAT          R0 R0 R1
+0005  [  2]  GETTABUP        R1 U0 K2  ; "print"
+0006  [  2]  MOVE            R5 R0
+0007  [  2]  CALL_R0         R1 args=2
+0008  [  2]  RETURN          R0 count=1

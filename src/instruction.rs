@@ -1119,6 +1119,20 @@ instructions! {
     0xc9 CALLS        calls       AbcImm { func: Reg, args: u8, returns: u8, src: Reg }
     0xca CALLS_R0     calls_r0    AbcImm { func: Reg, args: u8, returns: u8, src: Reg }
     0xcb CALLS_R1     calls_r1    AbcImm { func: Reg, args: u8, returns: u8, src: Reg }
+
+    // --- JIT entries -----------------------------------------------------------
+    //
+    // `FUNC` is pc 0 of every prototype and `LOOP` the header of every
+    // `while`, `repeat` and generic `for` loop (and the latch of a backward
+    // `goto`, as LuaJIT's `BC_LOOP`); each counts on hot counter `hot`. A
+    // compiled entry overwrites the word with `JIT_ENTRY`/`JIT_LOOP`, whose
+    // `entry` indexes the runtime's entry table; numeric loops count in their
+    // `FORLOOP` (`b`) and are overwritten there.
+
+    0xcc FUNC         func        A      { hot: u8 }
+    0xcd LOOP         loop_       A      { hot: u8 }
+    0xce JIT_ENTRY    jit_entry   Ad     { hot: u8, entry: u16 }
+    0xcf JIT_LOOP     jit_loop    Ad     { hot: u8, entry: u16 }
 }
 
 /// The polymorphic family an opcode belongs to.
@@ -2318,6 +2332,28 @@ impl Instruction {
             i = i.with_adaptive(0, false);
         }
         i
+    }
+}
+
+/// Hot counters in the runtime's table (`Instruction::hot_counter`).
+pub const HOT_COUNTERS: usize = 64;
+
+impl Instruction {
+    /// The hot counter a counting instruction decrements: `a` of `FUNC`,
+    /// `LOOP` and the JIT words, `b` of a `FORLOOP` form.
+    #[inline(always)]
+    pub(crate) fn hot_counter(self) -> usize {
+        let i = match self.op() {
+            Op::FORLOOP | Op::FORLOOP_I | Op::FORLOOP_F => self.b(),
+            _ => self.a(),
+        };
+        i as usize % HOT_COUNTERS
+    }
+
+    /// Whether this is a word a compiled entry wrote.
+    #[inline(always)]
+    pub(crate) fn is_jit_word(self) -> bool {
+        matches!(self.op(), Op::JIT_ENTRY | Op::JIT_LOOP)
     }
 }
 

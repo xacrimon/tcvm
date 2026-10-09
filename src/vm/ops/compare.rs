@@ -7,6 +7,7 @@
 use crate::env::MetamethodBits;
 use crate::env::value::{Value, ValueKind};
 use crate::instruction::{ADAPTIVE_AB_IMM, ADAPTIVE_AH_IMM, Instruction, Op};
+use crate::jit::feedback;
 use crate::vm::abi::{Slot, handler};
 use crate::vm::num;
 use crate::vm::ops::arith::specialize;
@@ -279,6 +280,8 @@ handler! {
     slow fn eq_slow {
         let insn: Instruction = insn_at!();
         let (a, b) = (reg![insn.a()], reg![insn.b()]);
+        let closure = unsafe { crate::vm::frame::closure(base) };
+        feedback::record(closure, unsafe { pc.sub(1) }, feedback::kind(a) | feedback::kind(b));
         let k = insn.generic_op() == Op::JEQ;
         if num::raw_eq(a, b) {
             branch!(k, insn.branch_offset())
@@ -290,6 +293,7 @@ handler! {
         if try_meta {
             let mm = binop_metamethod(rt, a, b, MetamethodBits::EQ);
             if !mm.is_nil() {
+                feedback::record(closure, unsafe { pc.sub(1) }, feedback::MM);
                 stage_mm!(pc, base, rt, if k { ret_cond_t } else { ret_cond_f }, mm, [a, b])
             }
         }
@@ -309,6 +313,8 @@ handler! {
             let (v, lit) = (reg![insn.a()], insn.cmp_imm_value(rt.mutation()));
             if matches!(op, Op::JGTI | Op::JNGTI | Op::JGEI | Op::JNGEI) { (lit, v) } else { (v, lit) }
         };
+        let closure = unsafe { crate::vm::frame::closure(base) };
+        feedback::record(closure, unsafe { pc.sub(1) }, feedback::kind(a) | feedback::kind(b));
         let le = matches!(op, Op::JLE | Op::JNLE | Op::JLEI | Op::JNLEI | Op::JGEI | Op::JNGEI);
         let primitive = if let Some(x) = a.get_integer()
             && let Some(y) = b.get_integer()
@@ -333,6 +339,7 @@ handler! {
         if mm.is_nil() {
             raise!(OpError::Compare(a, b))
         }
+        feedback::record(closure, unsafe { pc.sub(1) }, feedback::MM);
         stage_mm!(pc, base, rt, if k { ret_cond_t } else { ret_cond_f }, mm, [a, b])
     }
 }

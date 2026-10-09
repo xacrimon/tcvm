@@ -1786,7 +1786,7 @@ pub fn compile<'gc>(
         assigned.clone(),
     )?;
     chunk
-        .assemble(ctx.mutation(), &assigned)
+        .assemble(ctx.mutation(), &assigned, &mut 0)
         .map_err(|kind| CompileError {
             kind,
             line_number: LineNumber(0),
@@ -1841,6 +1841,9 @@ fn compile_function_to_chunk<'gc, 'a>(
     };
 
     ctx.push_scope();
+
+    // The function entry's hot counter and JIT entry point.
+    ctx.emit(Instruction::func(0));
 
     // Emit VARARGPREP for vararg functions
     if is_vararg {
@@ -2044,6 +2047,8 @@ fn compile_goto(ctx: &mut Ctx, item: Goto) -> Result<(), CompileError> {
             if ctx.chunk.nactvar > nactvar {
                 ctx.emit(Instruction::close(Reg(nactvar)));
             }
+            // A backward goto's loop counts at its latch, as LuaJIT's.
+            ctx.emit(Instruction::loop_(0));
             label
         }
         None => {
@@ -4533,6 +4538,7 @@ fn compile_while(ctx: &mut Ctx, item: While) -> Result<(), CompileError> {
     scope_lexical_break(ctx, |ctx| {
         let loop_start = ctx.new_label();
         ctx.set_label(loop_start, ctx.next_offset());
+        ctx.emit(Instruction::loop_(0));
 
         let cond_expr = item.cond().ok_or_else(|| ice("while without condition"))?;
         let break_list = compile_branch_cond_false(ctx, cond_expr)?;
@@ -4577,6 +4583,7 @@ fn compile_repeat(ctx: &mut Ctx, item: Repeat) -> Result<(), CompileError> {
         // in the same lexical scope.
         scope_lexical(ctx, |ctx| {
             let loop_start_off = ctx.next_offset();
+            ctx.emit(Instruction::loop_(0));
 
             // Compile body
             let stmts: Vec<_> = item.block().map(|b| b.collect()).unwrap_or_default();
@@ -4854,6 +4861,7 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
         ctx.emit_jump_instr(loop_test, Instruction::tforprep(base, Offset(0)));
 
         ctx.set_label(loop_body, ctx.next_offset());
+        ctx.emit(Instruction::loop_(0));
 
         // Loop variables live in the body scope (see `compile_for_num`).
         scope_lexical(ctx, |ctx| {

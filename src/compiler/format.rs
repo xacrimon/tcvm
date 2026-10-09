@@ -405,6 +405,9 @@ fn format_instruction(instr: &Instruction, proto: &Prototype<'_>) -> String {
         }
         Op::NOP => "NOP".to_string(),
         Op::STOP => "STOP".to_string(),
+        Op::FUNC => "FUNC".to_string(),
+        Op::LOOP => "LOOP".to_string(),
+        Op::JIT_ENTRY | Op::JIT_LOOP => format!("{:<15} entry={}", instr.op().name(), instr.d()),
         Op::ADDI
         | Op::SUBI
         | Op::MULI

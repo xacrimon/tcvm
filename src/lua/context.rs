@@ -64,6 +64,25 @@ impl<'gc> Context<'gc> {
     }
 
     #[inline(always)]
+    pub(crate) fn jit(self) -> &'gc crate::jit::state::JitRuntime {
+        &self.state.jit
+    }
+
+    /// Hot counter `i` (< `HOT_COUNTERS`).
+    #[inline(always)]
+    pub(crate) fn hot_counter(self, i: usize) -> &'gc std::cell::Cell<u16> {
+        // SAFETY: callers pass `Instruction::hot_counter`, which is in range.
+        unsafe { self.state.jit.hot.get_unchecked(i) }
+    }
+
+    /// What entry-table slot `d` tails into.
+    #[inline(always)]
+    pub(crate) fn jit_entry(self, d: u16) -> Handler {
+        // SAFETY: a JIT word's slot is allocated while the word is in `Code`.
+        unsafe { crate::jit::as_handler((*self.state.jit.entries.get().add(d as usize)).get()) }
+    }
+
+    #[inline(always)]
     pub(crate) fn thread_ptr(self) -> *mut ThreadState<'gc> {
         self.state.rt.thread.get()
     }

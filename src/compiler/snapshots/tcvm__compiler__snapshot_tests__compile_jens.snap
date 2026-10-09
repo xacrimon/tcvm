@@ -6,22 +6,24 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  [  1]  VARARGPREP      fixed=0
-0001  [  6]  CLOSURE         R0 P0
-0002  [  6]  RETURN          R0 count=1
+0000  [  1]  FUNC
+0001  [  1]  VARARGPREP      fixed=0
+0002  [  6]  CLOSURE         R0 P0
+0003  [  6]  RETURN          R0 count=1
 
 ; prototype 0:
   ; function (params=1, vararg=false, stack=7, upvalues=1)
   ; upvalues:
   ;   U0 = local R0
   ; code:
-  0000  [  2]  JNLTI           R0 #2 +1
-  0001  [  3]  RETURN1         R0
-  0002  [  5]  GETUPVAL        R1 U0
-  0003  [  5]  SUBI            R5 R0 #1
-  0004  [  5]  CALL_R1         R1 args=2
-  0005  [  5]  GETUPVAL        R2 U0
-  0006  [  5]  SUBI            R6 R0 #2
-  0007  [  5]  CALL_R1         R2 args=2
-  0008  [  5]  ADD             R1 R1 R2
-  0009  [  5]  RETURN1         R1
+  0000  [  1]  FUNC
+  0001  [  2]  JNLTI           R0 #2 +1
+  0002  [  3]  RETURN1         R0
+  0003  [  5]  GETUPVAL        R1 U0
+  0004  [  5]  SUBI            R5 R0 #1
+  0005  [  5]  CALL_R1         R1 args=2
+  0006  [  5]  GETUPVAL        R2 U0
+  0007  [  5]  SUBI            R6 R0 #2
+  0008  [  5]  CALL_R1         R2 args=2
+  0009  [  5]  ADD             R1 R1 R2
+  0010  [  5]  RETURN1         R1

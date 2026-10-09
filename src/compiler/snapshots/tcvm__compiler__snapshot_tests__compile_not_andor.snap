@@ -9,45 +9,46 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  [  1]  VARARGPREP      fixed=0
-0001  [  5]  LOADI           R0 1
-0002  [  5]  LOADI           R1 2
-0003  [  5]  LOADI           R2 3
-0004  [  8]  JF              R0 +3
-0005  [  8]  NOT             R3 R1
-0006  [  8]  JMP             +2
-0007  [  8]  LFALSESKIP      R3
-0008  [  8]  LOAD            R3 K0  ; true
-0009  [  9]  JT              R0 +2
-0010  [  9]  NOT             R4 R1
-0011  [  9]  JMP             +2
-0012  [  9]  LFALSESKIP      R4
-0013  [  9]  LOAD            R4 K0  ; true
-0014  [ 10]  JF              R0 +4
-0015  [ 10]  JF              R1 +3
-0016  [ 10]  NOT             R5 R2
-0017  [ 10]  JMP             +2
-0018  [ 10]  LFALSESKIP      R5
-0019  [ 10]  LOAD            R5 K0  ; true
-0020  [ 11]  JT              R0 +3
-0021  [ 11]  JT              R1 +2
-0022  [ 11]  NOT             R6 R2
-0023  [ 11]  JMP             +2
-0024  [ 11]  LFALSESKIP      R6
-0025  [ 11]  LOAD            R6 K0  ; true
-0026  [ 12]  JF              R0 +3
-0027  [ 12]  LOAD            R7 K1  ; false
-0028  [ 12]  JMP             +2
-0029  [ 12]  LFALSESKIP      R7
-0030  [ 12]  LOAD            R7 K0  ; true
-0031  [ 15]  JF              R0 +2
-0032  [ 15]  NOT             R8 R1
-0033  [ 15]  JF              R8 +2
-0034  [ 16]  LOADI           R8 0
-0035  [ 16]  RETURN          R8 count=2
-0036  [ 19]  MOVE            R8 R3
-0037  [ 19]  MOVE            R9 R4
-0038  [ 19]  MOVE            R10 R5
-0039  [ 19]  MOVE            R11 R6
-0040  [ 19]  MOVE            R12 R7
-0041  [ 19]  RETURN          R8 count=6
+0000  [  1]  FUNC
+0001  [  1]  VARARGPREP      fixed=0
+0002  [  5]  LOADI           R0 1
+0003  [  5]  LOADI           R1 2
+0004  [  5]  LOADI           R2 3
+0005  [  8]  JF              R0 +3
+0006  [  8]  NOT             R3 R1
+0007  [  8]  JMP             +2
+0008  [  8]  LFALSESKIP      R3
+0009  [  8]  LOAD            R3 K0  ; true
+0010  [  9]  JT              R0 +2
+0011  [  9]  NOT             R4 R1
+0012  [  9]  JMP             +2
+0013  [  9]  LFALSESKIP      R4
+0014  [  9]  LOAD            R4 K0  ; true
+0015  [ 10]  JF              R0 +4
+0016  [ 10]  JF              R1 +3
+0017  [ 10]  NOT             R5 R2
+0018  [ 10]  JMP             +2
+0019  [ 10]  LFALSESKIP      R5
+0020  [ 10]  LOAD            R5 K0  ; true
+0021  [ 11]  JT              R0 +3
+0022  [ 11]  JT              R1 +2
+0023  [ 11]  NOT             R6 R2
+0024  [ 11]  JMP             +2
+0025  [ 11]  LFALSESKIP      R6
+0026  [ 11]  LOAD            R6 K0  ; true
+0027  [ 12]  JF              R0 +3
+0028  [ 12]  LOAD            R7 K1  ; false
+0029  [ 12]  JMP             +2
+0030  [ 12]  LFALSESKIP      R7
+0031  [ 12]  LOAD            R7 K0  ; true
+0032  [ 15]  JF              R0 +2
+0033  [ 15]  NOT             R8 R1
+0034  [ 15]  JF              R8 +2
+0035  [ 16]  LOADI           R8 0
+0036  [ 16]  RETURN          R8 count=2
+0037  [ 19]  MOVE            R8 R3
+0038  [ 19]  MOVE            R9 R4
+0039  [ 19]  MOVE            R10 R5
+0040  [ 19]  MOVE            R11 R6
+0041  [ 19]  MOVE            R12 R7
+0042  [ 19]  RETURN          R8 count=6

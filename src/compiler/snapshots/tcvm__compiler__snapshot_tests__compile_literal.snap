@@ -35,51 +35,52 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  [  1]  VARARGPREP      fixed=0
-0001  [  1]  LOADI           R0 581
-0002  [  1]  SETTABUP        R0 U0 K0  ; "a"
-0003  [  2]  LOADI           R0 255
-0004  [  2]  SETTABUP        R0 U0 K1  ; "b"
-0005  [  3]  LOADNIL         R0 count=1
-0006  [  3]  SETTABUP        R0 U0 K2  ; "c"
-0007  [  4]  LOAD            R0 K4  ; true
-0008  [  4]  SETTABUP        R0 U0 K3  ; "d"
-0009  [  5]  LOAD            R0 K6  ; false
-0010  [  5]  SETTABUP        R0 U0 K5  ; "e"
-0011  [  6]  LOAD            R0 K8  ; "hello"
-0012  [  6]  SETTABUP        R0 U0 K7  ; "f"
-0013  [  7]  LOAD            R0 K10  ; "world"
-0014  [  7]  SETTABUP        R0 U0 K9  ; "g"
-0015  [  8]  LOAD            R0 K12  ; "woosh"
-0016  [  8]  SETTABUP        R0 U0 K11  ; "h"
-0017  [  9]  LOAD            R0 K12  ; "woosh"
-0018  [  9]  SETTABUP        R0 U0 K13  ; "i"
-0019  [ 10]  LOAD            R0 K15  ; 50000.0
-0020  [ 10]  SETTABUP        R0 U0 K14  ; "l"
-0021  [ 11]  LOAD            R0 K17  ; 206.0625
-0022  [ 11]  SETTABUP        R0 U0 K16  ; "j"
-0023  [ 12]  LOAD            R0 K19  ; 0.1953125
-0024  [ 12]  SETTABUP        R0 U0 K18  ; "k"
-0025  [ 13]  NEWTABLE        R0 T0  ; {}
-0026  [ 13]  SETTABUP        R0 U0 K20  ; "t"
-0027  [ 14]  NEWTABLE        R0 T1  ; {} items=2
-0028  [ 14]  LOADI           R1 59
-0029  [ 14]  LOADI           R2 63
-0030  [ 14]  SETLIST         R0 count=2 offset=0
-0031  [ 14]  SETTABUP        R0 U0 K21  ; "tl"
-0032  [ 15]  NEWTABLE        R0 T2  ; {anna=15, james=20}
-0033  [ 15]  SETTABUP        R0 U0 K22  ; "tr"
-0034  [ 16]  NEWTABLE        R0 T0  ; {}
-0035  [ 17]  LOADI           R1 0
-0036  [ 17]  LOADI           R2 10
-0037  [ 17]  SETTABLE        R2 R0 R1
-0038  [ 18]  LOAD            R1 K24  ; "anna"
-0039  [ 18]  LOADI           R2 15
-0040  [ 18]  SETTABLE        R2 R0 R1
-0041  [ 19]  LOAD            R1 K25  ; "james"
-0042  [ 19]  LOAD            R2 K26  ; "20"
-0043  [ 19]  SETTABLE        R2 R0 R1
-0044  [ 19]  SETTABUP        R0 U0 K23  ; "tg"
-0045  [ 21]  LOADI           R0 -18
-0046  [ 21]  SETTABUP        R0 U0 K27  ; "y"
-0047  [ 21]  RETURN          R0 count=1
+0000  [  1]  FUNC
+0001  [  1]  VARARGPREP      fixed=0
+0002  [  1]  LOADI           R0 581
+0003  [  1]  SETTABUP        R0 U0 K0  ; "a"
+0004  [  2]  LOADI           R0 255
+0005  [  2]  SETTABUP        R0 U0 K1  ; "b"
+0006  [  3]  LOADNIL         R0 count=1
+0007  [  3]  SETTABUP        R0 U0 K2  ; "c"
+0008  [  4]  LOAD            R0 K4  ; true
+0009  [  4]  SETTABUP        R0 U0 K3  ; "d"
+0010  [  5]  LOAD            R0 K6  ; false
+0011  [  5]  SETTABUP        R0 U0 K5  ; "e"
+0012  [  6]  LOAD            R0 K8  ; "hello"
+0013  [  6]  SETTABUP        R0 U0 K7  ; "f"
+0014  [  7]  LOAD            R0 K10  ; "world"
+0015  [  7]  SETTABUP        R0 U0 K9  ; "g"
+0016  [  8]  LOAD            R0 K12  ; "woosh"
+0017  [  8]  SETTABUP        R0 U0 K11  ; "h"
+0018  [  9]  LOAD            R0 K12  ; "woosh"
+0019  [  9]  SETTABUP        R0 U0 K13  ; "i"
+0020  [ 10]  LOAD            R0 K15  ; 50000.0
+0021  [ 10]  SETTABUP        R0 U0 K14  ; "l"
+0022  [ 11]  LOAD            R0 K17  ; 206.0625
+0023  [ 11]  SETTABUP        R0 U0 K16  ; "j"
+0024  [ 12]  LOAD            R0 K19  ; 0.1953125
+0025  [ 12]  SETTABUP        R0 U0 K18  ; "k"
+0026  [ 13]  NEWTABLE        R0 T0  ; {}
+0027  [ 13]  SETTABUP        R0 U0 K20  ; "t"
+0028  [ 14]  NEWTABLE        R0 T1  ; {} items=2
+0029  [ 14]  LOADI           R1 59
+0030  [ 14]  LOADI           R2 63
+0031  [ 14]  SETLIST         R0 count=2 offset=0
+0032  [ 14]  SETTABUP        R0 U0 K21  ; "tl"
+0033  [ 15]  NEWTABLE        R0 T2  ; {anna=15, james=20}
+0034  [ 15]  SETTABUP        R0 U0 K22  ; "tr"
+0035  [ 16]  NEWTABLE        R0 T0  ; {}
+0036  [ 17]  LOADI           R1 0
+0037  [ 17]  LOADI           R2 10
+0038  [ 17]  SETTABLE        R2 R0 R1
+0039  [ 18]  LOAD            R1 K24  ; "anna"
+0040  [ 18]  LOADI           R2 15
+0041  [ 18]  SETTABLE        R2 R0 R1
+0042  [ 19]  LOAD            R1 K25  ; "james"
+0043  [ 19]  LOAD            R2 K26  ; "20"
+0044  [ 19]  SETTABLE        R2 R0 R1
+0045  [ 19]  SETTABUP        R0 U0 K23  ; "tg"
+0046  [ 21]  LOADI           R0 -18
+0047  [ 21]  SETTABUP        R0 U0 K27  ; "y"
+0048  [ 21]  RETURN          R0 count=1

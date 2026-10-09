@@ -17,19 +17,20 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  [  1]  VARARGPREP      fixed=0
-0001  [ 11]  LOADI           R0 8
-0002  [ 11]  SETTABUP        R0 U0 K0  ; "a"
-0003  [ 12]  LOADI           R0 14
-0004  [ 12]  SETTABUP        R0 U0 K1  ; "b"
-0005  [ 13]  LOADI           R0 -5
-0006  [ 13]  SETTABUP        R0 U0 K2  ; "c"
-0007  [ 14]  LOAD            R0 K4  ; false
-0008  [ 14]  SETTABUP        R0 U0 K3  ; "d"
-0009  [ 15]  LOAD            R0 K6  ; true
-0010  [ 15]  SETTABUP        R0 U0 K5  ; "e"
-0011  [ 16]  LOADI           R0 36
-0012  [ 16]  SETTABUP        R0 U0 K7  ; "f"
-0013  [ 17]  LOAD            R0 K9  ; "hello"
-0014  [ 17]  SETTABUP        R0 U0 K8  ; "g"
-0015  [ 17]  RETURN          R0 count=1
+0000  [  1]  FUNC
+0001  [  1]  VARARGPREP      fixed=0
+0002  [ 11]  LOADI           R0 8
+0003  [ 11]  SETTABUP        R0 U0 K0  ; "a"
+0004  [ 12]  LOADI           R0 14
+0005  [ 12]  SETTABUP        R0 U0 K1  ; "b"
+0006  [ 13]  LOADI           R0 -5
+0007  [ 13]  SETTABUP        R0 U0 K2  ; "c"
+0008  [ 14]  LOAD            R0 K4  ; false
+0009  [ 14]  SETTABUP        R0 U0 K3  ; "d"
+0010  [ 15]  LOAD            R0 K6  ; true
+0011  [ 15]  SETTABUP        R0 U0 K5  ; "e"
+0012  [ 16]  LOADI           R0 36
+0013  [ 16]  SETTABUP        R0 U0 K7  ; "f"
+0014  [ 17]  LOAD            R0 K9  ; "hello"
+0015  [ 17]  SETTABUP        R0 U0 K8  ; "g"
+0016  [ 17]  RETURN          R0 count=1

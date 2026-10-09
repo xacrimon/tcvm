@@ -43,6 +43,8 @@ pub struct State<'gc> {
     #[collect(require_static)]
     pub(crate) rets: [Handler; 256],
     pub(crate) rt: Runtime<'gc>,
+    #[collect(require_static)]
+    pub(crate) jit: crate::jit::state::JitRuntime,
     /// Root shapes by inline capacity (`INLINE_CAPS`). Each anchors a
     /// transition tree, so two tables of one capacity that grow through the
     /// same key sequence converge on the same shape pointer.
@@ -121,6 +123,7 @@ impl Lua {
                 dispatch: crate::vm::dispatch::TABLE,
                 rets: crate::vm::dispatch::RETS,
                 rt: Runtime::new(mc.metrics()),
+                jit: crate::jit::state::JitRuntime::new(),
                 root_shapes,
                 empty_dict_sentinel,
                 mt_classes: MtClasses::new(mc),
