@@ -15,11 +15,13 @@ pub(crate) trait TargetInst: Clone {
 pub(crate) struct VBlock {
     pub(crate) start: u32,
     pub(crate) end: u32,
-    pub(crate) succs: Vec<RBlock>,
-    pub(crate) preds: Vec<RBlock>,
-    pub(crate) params: Vec<VReg>,
-    /// Arguments per successor, for the branch ending the block.
-    pub(crate) branch_args: Vec<Vec<VReg>>,
+    /// Runs of `VCode::bpool`.
+    succs: (u32, u32),
+    preds: (u32, u32),
+    /// A run of `VCode::rpool`.
+    params: (u32, u32),
+    /// `args[k]` is the run of `rpool` successor `k` is passed.
+    args: u32,
     /// A call's resume point: aligned and entered by a return.
     pub(crate) resume: bool,
 }
@@ -31,8 +33,17 @@ pub(crate) struct VCode<I> {
     pub(crate) ops: Vec<(u32, u32)>,
     pub(crate) clobbers: Vec<PRegSet>,
     pub(crate) blocks: Vec<VBlock>,
+    bpool: Vec<RBlock>,
+    rpool: Vec<VReg>,
+    args: Vec<(u32, u32)>,
     pub(crate) vreg_classes: Vec<RegClass>,
     pub(crate) entry: RBlock,
+}
+
+fn run<T: Copy>(pool: &mut Vec<T>, xs: impl IntoIterator<Item = T>) -> (u32, u32) {
+    let s = pool.len() as u32;
+    pool.extend(xs);
+    (s, pool.len() as u32)
 }
 
 impl<I: TargetInst> VCode<I> {
@@ -43,6 +54,9 @@ impl<I: TargetInst> VCode<I> {
             ops: Vec::new(),
             clobbers: Vec::new(),
             blocks: Vec::new(),
+            bpool: Vec::new(),
+            rpool: Vec::new(),
+            args: Vec::new(),
             vreg_classes: Vec::new(),
             entry: RBlock::new(0),
         }
@@ -62,6 +76,46 @@ impl<I: TargetInst> VCode<I> {
         self.insts.push(inst);
         self.clobbers.push(clobbers);
         i
+    }
+
+    /// Add a block over instructions `start..end`; `args` holds each
+    /// successor's arguments in turn, `nargs[k]` of them for successor `k`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn push_block(
+        &mut self,
+        start: u32,
+        end: u32,
+        succs: &[RBlock],
+        preds: impl IntoIterator<Item = RBlock>,
+        params: impl IntoIterator<Item = VReg>,
+        args: &[VReg],
+        nargs: &[u32],
+        resume: bool,
+    ) {
+        let succs = run(&mut self.bpool, succs.iter().copied());
+        let preds = run(&mut self.bpool, preds);
+        let params = run(&mut self.rpool, params);
+        let at = self.args.len() as u32;
+        let mut k = 0;
+        for &n in nargs {
+            let r = run(&mut self.rpool, args[k..k + n as usize].iter().copied());
+            self.args.push(r);
+            k += n as usize;
+        }
+        self.blocks.push(VBlock {
+            start,
+            end,
+            succs,
+            preds,
+            params,
+            args: at,
+            resume,
+        });
+    }
+
+    pub(crate) fn succs(&self, b: usize) -> &[RBlock] {
+        let (s, e) = self.blocks[b].succs;
+        &self.bpool[s as usize..e as usize]
     }
 
     pub(crate) fn inst_operands_of(&self, i: usize) -> &[Operand] {
@@ -89,15 +143,17 @@ impl<I: TargetInst> Function for VCode<I> {
     }
 
     fn block_succs(&self, block: RBlock) -> &[RBlock] {
-        &self.blocks[block.index()].succs
+        self.succs(block.index())
     }
 
     fn block_preds(&self, block: RBlock) -> &[RBlock] {
-        &self.blocks[block.index()].preds
+        let (s, e) = self.blocks[block.index()].preds;
+        &self.bpool[s as usize..e as usize]
     }
 
     fn block_params(&self, block: RBlock) -> &[VReg] {
-        &self.blocks[block.index()].params
+        let (s, e) = self.blocks[block.index()].params;
+        &self.rpool[s as usize..e as usize]
     }
 
     fn is_ret(&self, insn: RInst) -> bool {
@@ -109,7 +165,8 @@ impl<I: TargetInst> Function for VCode<I> {
     }
 
     fn branch_blockparams(&self, block: RBlock, _insn: RInst, succ_idx: usize) -> &[VReg] {
-        &self.blocks[block.index()].branch_args[succ_idx]
+        let (s, e) = self.args[self.blocks[block.index()].args as usize + succ_idx];
+        &self.rpool[s as usize..e as usize]
     }
 
     fn inst_operands(&self, insn: RInst) -> &[Operand] {

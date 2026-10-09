@@ -109,6 +109,8 @@ pub(crate) struct JitRuntime {
     code: RefCell<Option<std::rc::Rc<crate::jit::backend::alloc::CodeAllocator>>>,
     /// Compile failures from running out of code memory turn the JIT off.
     pub(crate) exhausted: Cell<bool>,
+    /// The register allocator's buffers, kept between compiles.
+    pub(crate) ra: RefCell<regalloc2::Ctx>,
 }
 
 #[derive(Default)]
@@ -133,6 +135,7 @@ impl JitRuntime {
             config,
             code: RefCell::new(None),
             exhausted: Cell::new(false),
+            ra: RefCell::new(regalloc2::Ctx::default()),
         };
         rt.grow_table(16);
         rt

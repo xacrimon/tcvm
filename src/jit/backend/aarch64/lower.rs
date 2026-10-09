@@ -9,7 +9,7 @@ use crate::env::value::Value;
 use crate::jit::backend::aarch64::abi::{caller_saved, preg_float, preg_int};
 use crate::jit::backend::aarch64::asm::{Asm, Cond, Sz};
 use crate::jit::backend::aarch64::inst::{AluOp, FOp, FUnOp, MInst, Test};
-use crate::jit::backend::vcode::{VBlock, VCode};
+use crate::jit::backend::vcode::VCode;
 use crate::jit::ir::ops::{Cc, ExitTag, HelperId, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
 use crate::jit::ir::{Block, ExitKind, Func, Inst, NO_SNAP, Val};
@@ -98,7 +98,8 @@ fn float_cond(cc: Cc) -> Cond {
 
 /// The address of `Code[pc]` of the prototype being compiled.
 pub(crate) fn lower<'gc>(f: &Func<'gc>, code_base: usize) -> Result<Lowered, String> {
-    let order = f.rpo();
+    let cfg = f.cfg();
+    let order = &cfg.rpo;
     let mut block_of = vec![u32::MAX; f.blocks.len()];
     for (k, b) in order.iter().enumerate() {
         block_of[b.idx()] = k as u32;
@@ -115,43 +116,53 @@ pub(crate) fn lower<'gc>(f: &Func<'gc>, code_base: usize) -> Result<Lowered, Str
         block_of,
         pc_base: code_base,
     };
-    lw.find_fusions(&order);
-    let preds = f.preds();
-    for &b in &order {
+    lw.find_fusions(order);
+    let mut params: Vec<VReg> = Vec::new();
+    let mut succs: Vec<RBlock> = Vec::new();
+    let mut args: Vec<VReg> = Vec::new();
+    let mut nargs: Vec<u32> = Vec::new();
+    for &b in order {
         let start = lw.v.insts.len() as u32;
-        let params: Vec<VReg> = f.blocks[b.idx()].params.iter().map(|&p| lw.vr(p)).collect();
+        params.clear();
+        for &p in f.params(b) {
+            params.push(lw.vr(p));
+        }
         if b == f.entry {
             lw.push(MInst::Prologue, &[], PRegSet::empty());
         }
-        let mut succs = Vec::new();
-        let mut branch_args = Vec::new();
-        for &i in &f.blocks[b.idx()].insts {
+        succs.clear();
+        args.clear();
+        nargs.clear();
+        for &i in f.insts_of(b) {
             lw.lower_inst(i)?;
             if f.op(i).is_terminator() {
+                // A call's resume block takes its values from the return.
+                let call = matches!(f.op(i), Op::Call { .. });
                 for e in f.edges(i) {
                     succs.push(RBlock::new(lw.block_of[e.target.idx()] as usize));
-                    branch_args.push(e.args.iter().map(|&a| lw.vr(a)).collect());
-                }
-                if matches!(f.op(i), Op::Call { .. }) {
-                    branch_args = vec![Vec::new()];
+                    let a = if call { &[][..] } else { f.vl(e.args) };
+                    for &x in a {
+                        args.push(lw.vr(x));
+                    }
+                    nargs.push(a.len() as u32);
                 }
             }
         }
         let end = lw.v.insts.len() as u32;
-        let bpreds = preds[b.idx()]
+        let preds = cfg
+            .preds(b)
             .iter()
-            .filter(|p| lw.block_of[p.idx()] != u32::MAX)
-            .map(|p| RBlock::new(lw.block_of[p.idx()] as usize))
-            .collect();
-        lw.v.blocks.push(VBlock {
+            .map(|p| RBlock::new(lw.block_of[p.idx()] as usize));
+        lw.v.push_block(
             start,
             end,
-            succs,
-            preds: bpreds,
-            params,
-            branch_args,
-            resume: f.blocks[b.idx()].resume,
-        });
+            &succs,
+            preds,
+            params.iter().copied(),
+            &args,
+            &nargs,
+            f.blocks[b.idx()].resume,
+        );
     }
     lw.v.entry = RBlock::new(0);
     Ok(Lowered {
@@ -197,7 +208,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
     /// block, to be computed there.
     fn find_fusions(&mut self, order: &[Block]) {
         for &b in order {
-            for &i in &self.f.blocks[b.idx()].insts {
+            for &i in self.f.insts_of(b) {
                 let op = self.f.op(i);
                 let cand = match op {
                     Op::Br | Op::GuardTrue | Op::GuardFalse => Some(self.f.args(i)[0]),
@@ -287,11 +298,11 @@ impl<'a, 'gc> Lower<'a, 'gc> {
     fn exit_of(&mut self, i: Inst) -> (u32, Vec<Operand>) {
         let d = &self.f.insts[i.idx()];
         debug_assert!(d.snap != NO_SNAP, "{:?} exits without a snapshot", d.op);
-        let s = &self.f.snaps[d.snap as usize];
+        let s = self.f.snaps[d.snap as usize];
         let mut ops: Vec<Operand> = Vec::new();
         let mut seen: Vec<(VReg, u16)> = Vec::new();
         let mut entries = Vec::new();
-        for &(r, v) in &s.entries {
+        for &(r, v) in self.f.entries(d.snap) {
             // Boxes in snapshots are the exit's work.
             let v = match self.f.def_op(v) {
                 Some(Op::Box) => self.f.args(self.f.def_inst(v).unwrap())[0],
@@ -816,13 +827,9 @@ impl<'a, 'gc> Lower<'a, 'gc> {
     /// terminator.
     fn resume_a(&self, i: Inst) -> u8 {
         let b = self.f.insts[i.idx()].block;
-        for bd in &self.f.blocks {
-            if bd.dead {
-                continue;
-            }
-            if let Some(&t) = bd.insts.last()
+        for &p in self.f.cfg().preds(b) {
+            if let Some(t) = self.f.terminator(p)
                 && let Op::Call { a, .. } = self.f.op(t)
-                && self.f.edges(t).iter().any(|e| e.target == b)
             {
                 return a;
             }

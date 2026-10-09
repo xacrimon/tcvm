@@ -10,8 +10,8 @@ impl Func<'_> {
         let order = self.rpo();
         for b in order {
             let bd = &self.blocks[b.idx()];
-            let params: Vec<String> = bd
-                .params
+            let params: Vec<String> = self
+                .params(b)
                 .iter()
                 .map(|&p| format!("v{}: {}", p.0, self.ty(p)))
                 .collect();
@@ -23,7 +23,7 @@ impl Func<'_> {
                 if bd.resume { " resume" } else { "" },
                 if b == self.entry { " entry" } else { "" }
             );
-            for &i in &bd.insts {
+            for &i in self.insts_of(b) {
                 let d = &self.insts[i.idx()];
                 let _ = write!(out, "  ");
                 let res: Vec<String> = self
@@ -39,7 +39,11 @@ impl Func<'_> {
                     let _ = write!(out, " {}", args.join(", "));
                 }
                 for e in self.edges(i) {
-                    let a: Vec<String> = e.args.iter().map(|a| format!("v{}", a.0)).collect();
+                    let a: Vec<String> = self
+                        .vl(e.args)
+                        .iter()
+                        .map(|a| format!("v{}", a.0))
+                        .collect();
                     let _ = write!(out, " -> b{}({})", e.target.0, a.join(", "));
                 }
                 if d.snap != NO_SNAP {
@@ -49,8 +53,8 @@ impl Func<'_> {
                         ExitKind::After => "after",
                         ExitKind::Gc => "gc",
                     };
-                    let ents: Vec<String> = s
-                        .entries
+                    let ents: Vec<String> = self
+                        .entries(d.snap)
                         .iter()
                         .map(|&(r, v)| format!("r{r}=v{}", v.0))
                         .collect();

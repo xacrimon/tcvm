@@ -235,18 +235,18 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             branch(b, eq, insn.op() == JEQS, succs);
         }
         RETURN0 => {
-            b.terminate(Op::Return { a: 0, n: 0 }, &[], vec![], None);
+            b.terminate(Op::Return { a: 0, n: 0 }, &[], &[], None);
         }
         RETURN1 => {
             store_results(b, a, 1);
-            b.terminate(Op::Return { a, n: 1 }, &[], vec![], None);
+            b.terminate(Op::Return { a, n: 1 }, &[], &[], None);
         }
         RETURN => {
             let s = b.snap_before();
             b.ins_snap(Op::GuardNoClose, &[], s, ExitTag::Unsupported);
             let n = rb - 1;
             store_results(b, a, n);
-            b.terminate(Op::Return { a, n }, &[], vec![], None);
+            b.terminate(Op::Return { a, n }, &[], &[], None);
         }
         CALL | CALL_R0 | CALL_R1 | CALLS | CALLS_R0 | CALLS_R1 => emit_call(b, pc, insn),
         FORPREP => emit_forprep(b, pc, insn, succs),
@@ -675,7 +675,7 @@ fn emit_call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
         tys,
         c,
     );
-    let first = b.f.blocks[resume.idx()].insts[0];
+    let first = b.f.insts_of(resume)[0];
     let rs: Vec<Val> = b.f.results(first).collect();
     for (k, &v) in rs.iter().enumerate() {
         b.set(a + k as u8, v);

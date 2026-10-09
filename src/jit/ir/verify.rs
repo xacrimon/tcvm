@@ -2,10 +2,11 @@
 //! arguments, snapshot entries), terminators, edge arity, snapshots on every
 //! exiting instruction, and R6 (nothing but constants lives across a call).
 
-use crate::jit::ir::{Block, Func, Inst, NO_SNAP, Val, ValDef};
+use crate::jit::ir::{Block, CfgInfo, Func, Inst, NO_SNAP, Val, ValDef};
 
 /// Dominators by the Cooper-Harvey-Kennedy iteration over an RPO.
-pub(crate) fn dominators(f: &Func<'_>, rpo: &[Block], preds: &[Vec<Block>]) -> Vec<Option<Block>> {
+pub(crate) fn dominators(f: &Func<'_>, cfg: &CfgInfo) -> Vec<Option<Block>> {
+    let rpo = &cfg.rpo;
     let n = f.blocks.len();
     let mut order = vec![usize::MAX; n];
     for (i, b) in rpo.iter().enumerate() {
@@ -18,7 +19,7 @@ pub(crate) fn dominators(f: &Func<'_>, rpo: &[Block], preds: &[Vec<Block>]) -> V
         changed = false;
         for &b in rpo.iter().skip(1) {
             let mut new: Option<Block> = None;
-            for &p in &preds[b.idx()] {
+            for &p in cfg.preds(b) {
                 if idom[p.idx()].is_none() {
                     continue;
                 }
@@ -60,12 +61,12 @@ pub(crate) fn dominates(idom: &[Option<Block>], a: Block, mut b: Block) -> bool 
 }
 
 pub(crate) fn verify(f: &Func<'_>) -> Result<(), String> {
-    let rpo = f.rpo();
-    let preds = f.preds();
-    let idom = dominators(f, &rpo, &preds);
+    let cfg = f.cfg();
+    let rpo = &cfg.rpo;
+    let idom = &cfg.idom;
     let mut pos = vec![(Block(u32::MAX), usize::MAX); f.insts.len()];
-    for &b in &rpo {
-        for (k, &i) in f.blocks[b.idx()].insts.iter().enumerate() {
+    for &b in rpo {
+        for (k, &i) in f.insts_of(b).iter().enumerate() {
             pos[i.idx()] = (b, k);
         }
     }
@@ -89,7 +90,7 @@ pub(crate) fn verify(f: &Func<'_>) -> Result<(), String> {
         let ok = if db == b {
             is_param(v) || dk < k
         } else {
-            dominates(&idom, db, b)
+            dominates(idom, db, b)
         };
         if !ok {
             return Err(format!(
@@ -99,17 +100,17 @@ pub(crate) fn verify(f: &Func<'_>) -> Result<(), String> {
         }
         Ok(())
     };
-    for &b in &rpo {
-        let bd = &f.blocks[b.idx()];
-        let Some(&last) = bd.insts.last() else {
+    for &b in rpo {
+        let insts = f.insts_of(b);
+        let Some(&last) = insts.last() else {
             return Err(format!("b{} is empty", b.0));
         };
         if !f.op(last).is_terminator() {
             return Err(format!("b{} does not end in a terminator", b.0));
         }
-        for (k, &i) in bd.insts.iter().enumerate() {
+        for (k, &i) in insts.iter().enumerate() {
             let d = &f.insts[i.idx()];
-            if d.op.is_terminator() && k + 1 != bd.insts.len() {
+            if d.op.is_terminator() && k + 1 != insts.len() {
                 return Err(format!("terminator i{} in the middle of b{}", i.0, b.0));
             }
             if d.block != b {
@@ -129,10 +130,8 @@ pub(crate) fn verify(f: &Func<'_>) -> Result<(), String> {
                     d.op.name()
                 ));
             }
-            if d.snap != NO_SNAP {
-                for &(_, v) in &f.snaps[d.snap as usize].entries {
-                    check_use(v, b, k, "snapshot", i)?;
-                }
+            for &(_, v) in f.snap_entries(i) {
+                check_use(v, b, k, "snapshot", i)?;
             }
             for e in f.edges(i) {
                 let tb = &f.blocks[e.target.idx()];
@@ -148,13 +147,13 @@ pub(crate) fn verify(f: &Func<'_>) -> Result<(), String> {
                         tb.params.len()
                     ));
                 }
-                for &a in &e.args {
+                for &a in f.vl(e.args) {
                     check_use(a, b, k + 1, "edge argument", i)?;
                 }
             }
         }
     }
-    check_r6(f, &rpo, &pos)?;
+    check_r6(f, rpo, &pos)?;
     Ok(())
 }
 
@@ -234,12 +233,12 @@ pub(crate) fn live_in(f: &Func<'_>, rpo: &[Block]) -> Vec<ValSet> {
             for s in f.succs(b) {
                 cur.union(&live[s.idx()]);
             }
-            for &i in f.blocks[b.idx()].insts.iter().rev() {
+            for &i in f.insts_of(b).iter().rev() {
                 for e in f.edges(i) {
-                    for &p in &f.blocks[e.target.idx()].params {
+                    for &p in f.params(e.target) {
                         cur.remove(p.idx());
                     }
-                    for &a in &e.args {
+                    for &a in f.vl(e.args) {
                         cur.insert(a.idx());
                     }
                 }
@@ -249,14 +248,11 @@ pub(crate) fn live_in(f: &Func<'_>, rpo: &[Block]) -> Vec<ValSet> {
                 for &a in f.args(i) {
                     cur.insert(a.idx());
                 }
-                let s = f.insts[i.idx()].snap;
-                if s != NO_SNAP {
-                    for &(_, v) in &f.snaps[s as usize].entries {
-                        cur.insert(v.idx());
-                    }
+                for &(_, v) in f.snap_entries(i) {
+                    cur.insert(v.idx());
                 }
             }
-            for &p in &f.blocks[b.idx()].params {
+            for &p in f.params(b) {
                 cur.remove(p.idx());
             }
             if cur != live[b.idx()] {

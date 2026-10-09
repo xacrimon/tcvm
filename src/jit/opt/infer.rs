@@ -2,7 +2,6 @@
 //! forward dataflow over the SSA graph, then parameters whose incoming values
 //! are all one numeric kind take that kind's unboxed representation.
 
-use crate::jit::build::incoming;
 use crate::jit::ir::ops::{ExitTag, Op};
 use crate::jit::ir::types::{Rep, Ty, TypeSet};
 use crate::jit::ir::{Block, Func, Val};
@@ -17,11 +16,11 @@ fn keeps_type(op: Op) -> bool {
 }
 
 pub(crate) fn infer(f: &mut Func<'_>) {
-    let rpo = f.rpo();
-    let inc = incoming(f);
+    let cfg = f.cfg();
     // Parameters start at the bottom and only grow.
-    for &b in &rpo {
-        for &p in &f.blocks[b.idx()].params {
+    for &b in &cfg.rpo {
+        for k in 0..f.blocks[b.idx()].params.len() {
+            let p = f.params(b)[k];
             let t = &mut f.vals[p.idx()].ty;
             *t = Ty {
                 set: TypeSet::empty(),
@@ -34,9 +33,9 @@ pub(crate) fn infer(f: &mut Func<'_>) {
     while changed && rounds < 50 {
         changed = false;
         rounds += 1;
-        for &b in &rpo {
-            let params = f.blocks[b.idx()].params.clone();
-            for (k, &p) in params.iter().enumerate() {
+        for &b in &cfg.rpo {
+            for k in 0..f.blocks[b.idx()].params.len() {
+                let p = f.params(b)[k];
                 let rep = f.vals[p.idx()].ty.rep;
                 let mut t = Ty {
                     rep,
@@ -44,11 +43,8 @@ pub(crate) fn infer(f: &mut Func<'_>) {
                     refine: crate::jit::ir::types::Refine::None,
                 };
                 let mut first = true;
-                for &(term, e) in &inc[b.idx()] {
-                    if f.blocks[f.insts[term.idx()].block.idx()].dead {
-                        continue;
-                    }
-                    let a = f.edges(term)[e].args[k];
+                for &(term, e) in cfg.incoming(b) {
+                    let a = f.edge_args(term, e as usize)[k];
                     let at = f.vals[a.idx()].ty;
                     if first {
                         t = Ty { rep, ..at };
@@ -70,14 +66,13 @@ pub(crate) fn infer(f: &mut Func<'_>) {
                     changed = true;
                 }
             }
-            let insts = f.blocks[b.idx()].insts.clone();
-            for i in insts {
+            for k in 0..f.blocks[b.idx()].insts.len() {
+                let i = f.insts_of(b)[k];
                 let op = f.op(i);
                 if keeps_type(op) || f.insts[i.idx()].rn != 1 {
                     continue;
                 }
-                let tys: Vec<Ty> = f.args(i).iter().map(|&a| f.vals[a.idx()].ty).collect();
-                let t = op.result_ty(&tys);
+                let t = f.result_ty(op, f.args(i));
                 let r = f.result(i);
                 if t != f.vals[r.idx()].ty {
                     f.vals[r.idx()].ty = t;
@@ -88,8 +83,9 @@ pub(crate) fn infer(f: &mut Func<'_>) {
     }
 }
 
-/// The unboxed representation a parameter of type `t` can take.
-fn narrow_rep(t: Ty, args: &[Ty]) -> Option<Rep> {
+/// The unboxed representation a parameter of type `t` can take, `i64`
+/// when one of its arguments is one.
+fn narrow_rep(t: Ty, i64_arg: bool) -> Option<Rep> {
     if t.rep != Rep::Val || t.set.is_empty() {
         return None;
     }
@@ -97,7 +93,7 @@ fn narrow_rep(t: Ty, args: &[Ty]) -> Option<Rep> {
         Some(Rep::I32)
     } else if t.within(TypeSet::FLOAT) {
         Some(Rep::F64)
-    } else if t.within(TypeSet::INT) && args.iter().any(|a| a.rep == Rep::I64) {
+    } else if t.within(TypeSet::INT) && i64_arg {
         Some(Rep::I64)
     } else {
         None
@@ -106,27 +102,21 @@ fn narrow_rep(t: Ty, args: &[Ty]) -> Option<Rep> {
 
 /// Narrow parameters; returns whether any changed.
 pub(crate) fn narrow(f: &mut Func<'_>) -> bool {
-    let inc = incoming(f);
+    let cfg = f.cfg();
     let mut changed = false;
-    for b in 0..f.blocks.len() {
-        if f.blocks[b].dead || f.blocks[b].params.is_empty() {
-            continue;
-        }
-        let block = Block(b as u32);
-        let params = f.blocks[b].params.clone();
-        for (k, &p) in params.iter().enumerate() {
+    for &block in &cfg.rpo {
+        for k in 0..f.blocks[block.idx()].params.len() {
+            let p = f.params(block)[k];
             // An argument boxed for the edge counts as what it boxes.
-            let arg_tys: Vec<Ty> = inc[b]
-                .iter()
-                .map(|&(t, e)| {
-                    let a = f.edges(t)[e].args[k];
-                    match f.def_op(a) {
-                        Some(Op::Box) => f.vals[f.args(f.def_inst(a).unwrap())[0].idx()].ty,
-                        _ => f.vals[a.idx()].ty,
-                    }
-                })
-                .collect();
-            let Some(rep) = narrow_rep(f.vals[p.idx()].ty, &arg_tys) else {
+            let i64_arg = cfg.incoming(block).iter().any(|&(t, e)| {
+                let a = f.edge_args(t, e as usize)[k];
+                let a = match f.def_op(a) {
+                    Some(Op::Box) => f.args(f.def_inst(a).unwrap())[0],
+                    _ => a,
+                };
+                f.vals[a.idx()].ty.rep == Rep::I64
+            });
+            let Some(rep) = narrow_rep(f.vals[p.idx()].ty, i64_arg) else {
                 continue;
             };
             changed = true;
@@ -138,11 +128,10 @@ pub(crate) fn narrow(f: &mut Func<'_>) -> bool {
                 refine: crate::jit::ir::types::Refine::None,
             };
             box_uses(f, p);
-            let _ = block;
-            for &(term, e) in &inc[b] {
-                let a = f.edges(term)[e].args[k];
+            for &(term, e) in cfg.incoming(block) {
+                let a = f.edge_args(term, e as usize)[k];
                 let na = convert(f, a, rep, f.insts[term.idx()].block);
-                f.edges_mut(term)[e].args[k] = na;
+                f.edge_args_mut(term, e as usize)[k] = na;
             }
         }
     }
@@ -157,18 +146,18 @@ fn box_uses(f: &mut Func<'_>, p: Val) {
         if f.blocks[b].dead {
             continue;
         }
+        let b = Block(b as u32);
         let mut k = 0;
-        while k < f.blocks[b].insts.len() {
-            let i = f.blocks[b].insts[k];
+        while k < f.blocks[b.idx()].insts.len() {
+            let i = f.insts_of(b)[k];
             let in_args = f.args(i).contains(&p);
-            let in_edges = f.edges(i).iter().any(|e| e.args.contains(&p));
+            let in_edges = f.edges(i).iter().any(|e| f.vl(e.args).contains(&p));
             if !in_args && !in_edges {
                 k += 1;
                 continue;
             }
             let bx = f.make_inst(Op::Box, &[p], None, ExitTag::Type);
-            f.insts[bx.idx()].block = Block(b as u32);
-            f.blocks[b].insts.insert(k, bx);
+            f.insert(b, k, bx);
             let bv = f.result(bx);
             f.vals[bv.idx()].ty = Ty::val(set);
             for a in f.args_mut(i) {
@@ -176,8 +165,8 @@ fn box_uses(f: &mut Func<'_>, p: Val) {
                     *a = bv;
                 }
             }
-            for e in f.edges_mut(i) {
-                for a in &mut e.args {
+            for e in 0..f.edges(i).len() {
+                for a in f.edge_args_mut(i, e) {
                     if *a == p {
                         *a = bv;
                     }
@@ -239,19 +228,15 @@ pub(crate) fn convert(f: &mut Func<'_>, a: Val, rep: Rep, at: Block) -> Val {
 /// Make every edge argument the representation of its parameter, boxing or
 /// unboxing in the predecessor.
 pub(crate) fn legalize(f: &mut Func<'_>) {
-    let inc = incoming(f);
-    for b in 0..f.blocks.len() {
-        if f.blocks[b].dead {
-            continue;
-        }
-        let params = f.blocks[b].params.clone();
-        for (k, &p) in params.iter().enumerate() {
-            let rep = f.vals[p.idx()].ty.rep;
-            for &(term, e) in &inc[b] {
-                let a = f.edges(term)[e].args[k];
+    let cfg = f.cfg();
+    for &b in &cfg.rpo {
+        for k in 0..f.blocks[b.idx()].params.len() {
+            let rep = f.vals[f.params(b)[k].idx()].ty.rep;
+            for &(term, e) in cfg.incoming(b) {
+                let a = f.edge_args(term, e as usize)[k];
                 if f.vals[a.idx()].ty.rep != rep {
                     let na = convert(f, a, rep, f.insts[term.idx()].block);
-                    f.edges_mut(term)[e].args[k] = na;
+                    f.edge_args_mut(term, e as usize)[k] = na;
                 }
             }
         }

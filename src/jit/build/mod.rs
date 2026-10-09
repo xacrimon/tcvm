@@ -6,8 +6,6 @@
 pub(crate) mod cfg;
 mod emit;
 
-use std::collections::HashMap;
-
 use crate::dmm::Gc;
 use crate::env::function::{LuaFn, Prototype};
 use crate::env::value::Value;
@@ -15,9 +13,7 @@ use crate::instruction::Instruction;
 use crate::jit::build::cfg::{Cfg, RegSet};
 use crate::jit::ir::ops::{ExitTag, Op};
 use crate::jit::ir::types::{Refine, Rep, Ty, TypeSet};
-use crate::jit::ir::{
-    Block, BlockCall, ExitKind, Func, Inst, RegionMeta, Snap, SnapData, Val, ValDef,
-};
+use crate::jit::ir::{Block, BlockCall, ExitKind, Func, Inst, List, RegionMeta, Snap, Val, ValDef};
 
 #[derive(Debug)]
 pub(crate) enum BuildError {
@@ -29,11 +25,12 @@ struct Instance {
     bc: u32,
     version: u32,
     ir: Block,
-    succs: Vec<usize>,
+    /// A run of `Builder::inst_succs`.
+    succs: List,
     npreds: u32,
     done_preds: u32,
     started: bool,
-    processed: bool,
+    discovered: bool,
 }
 
 /// What a home slot holds, as far as the region knows.
@@ -46,10 +43,9 @@ enum SlotState {
     Lazy(Block),
 }
 
-/// Per IR block SSA state.
+/// Per IR block SSA state; its registers' definitions and slot states are
+/// rows of `Builder::defs` and `Builder::slots`.
 struct BlockState {
-    defs: Vec<Option<Val>>,
-    slots: Vec<SlotState>,
     sealed: bool,
     incomplete: Vec<(u8, Val)>,
     preds: Vec<Block>,
@@ -72,9 +68,14 @@ pub(crate) struct Builder<'a, 'gc> {
     pub(crate) cfg: &'a Cfg,
     nregs: usize,
     bs: Vec<BlockState>,
+    defs: Vec<Option<Val>>,
+    slots: Vec<SlotState>,
     cur: Block,
     instances: Vec<Instance>,
-    inst_of: HashMap<(u32, u32), usize>,
+    inst_succs: Vec<usize>,
+    /// The instance of each (bytecode block, version), by block then version.
+    inst_of: Vec<Vec<u32>>,
+    scratch: Vec<Val>,
     /// Writes of the instruction being emitted, applied at its end so its
     /// exits see the frame before it.
     pending: Vec<(u8, Val)>,
@@ -99,9 +100,13 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             cfg,
             nregs: cfg.nregs,
             bs: Vec::new(),
+            defs: Vec::new(),
+            slots: Vec::new(),
             cur: Block(0),
             instances: Vec::new(),
-            inst_of: HashMap::new(),
+            inst_succs: Vec::new(),
+            inst_of: vec![Vec::new(); cfg.blocks.len()],
+            scratch: Vec::new(),
             pending: Vec::new(),
             cur_snap: None,
             pc: entry_pc,
@@ -113,9 +118,10 @@ impl<'a, 'gc> Builder<'a, 'gc> {
 
     pub(crate) fn new_block(&mut self) -> Block {
         let b = self.f.new_block();
+        self.defs.extend(std::iter::repeat_n(None, self.nregs));
+        self.slots
+            .extend(std::iter::repeat_n(SlotState::Unknown, self.nregs));
         self.bs.push(BlockState {
-            defs: vec![None; self.nregs],
-            slots: vec![SlotState::Unknown; self.nregs],
             sealed: false,
             incomplete: Vec::new(),
             preds: Vec::new(),
@@ -136,8 +142,32 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         s.root = true;
         s.sealed = true;
         s.root_ty = tys;
-        s.slots = vec![SlotState::Lazy(b); self.nregs];
+        self.slots_of(b).fill(SlotState::Lazy(b));
         b
+    }
+
+    #[inline]
+    fn def(&self, b: Block, r: u8) -> Option<Val> {
+        self.defs[b.idx() * self.nregs + r as usize]
+    }
+
+    #[inline]
+    fn set_def(&mut self, b: Block, r: u8, v: Val) {
+        self.defs[b.idx() * self.nregs + r as usize] = Some(v);
+    }
+
+    #[inline]
+    fn slot(&self, b: Block, r: usize) -> SlotState {
+        self.slots[b.idx() * self.nregs + r]
+    }
+
+    #[inline]
+    fn set_slot(&mut self, b: Block, r: usize, s: SlotState) {
+        self.slots[b.idx() * self.nregs + r] = s;
+    }
+
+    fn slots_of(&mut self, b: Block) -> &mut [SlotState] {
+        &mut self.slots[b.idx() * self.nregs..(b.idx() + 1) * self.nregs]
     }
 
     pub(crate) fn switch_to(&mut self, b: Block) {
@@ -170,57 +200,50 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     /// Append, on every edge into `b`, the argument for its new parameter
     /// `p` of register `r`.
     fn add_param_args(&mut self, b: Block, r: u8, _p: Val) {
-        let preds = self.bs[b.idx()].preds.clone();
         // One argument per edge, in the order the edges were added.
-        let mut seen: HashMap<Block, usize> = HashMap::new();
-        for pred in preds {
+        for j in 0..self.bs[b.idx()].preds.len() {
+            let pred = self.bs[b.idx()].preds[j];
+            let nth = self.bs[b.idx()].preds[..j]
+                .iter()
+                .filter(|&&x| x == pred)
+                .count();
             let v = self.read_var_at(r, pred);
-            let k = seen.entry(pred).or_insert(0);
-            let nth = *k;
-            *k += 1;
             let term = self
                 .f
                 .terminator(pred)
                 .expect("a predecessor is terminated");
-            let mut found = 0;
-            for e in self.f.edges_mut(term) {
-                if e.target == b {
-                    if found == nth {
-                        e.args.push(v);
-                        break;
-                    }
-                    found += 1;
-                }
-            }
+            let k = (0..self.f.edges(term).len())
+                .filter(|&k| self.f.edges(term)[k].target == b)
+                .nth(nth)
+                .expect("an edge per predecessor");
+            self.f.push_edge_arg(term, k, v);
         }
     }
 
     // --- SSA over registers ---------------------------------------------------
 
     pub(crate) fn read_var_at(&mut self, r: u8, b: Block) -> Val {
-        if let Some(v) = self.bs[b.idx()].defs[r as usize] {
+        if let Some(v) = self.def(b, r) {
             return v;
         }
         // Walk up single-predecessor chains iteratively.
-        let mut chain = vec![b];
         let mut x = b;
         let v = loop {
-            let s = &self.bs[x.idx()];
-            if let Some(v) = s.defs[r as usize] {
+            if let Some(v) = self.def(x, r) {
                 break v;
             }
+            let s = &self.bs[x.idx()];
             if s.root {
                 break self.root_load(x, r);
             }
             if !s.sealed {
                 let p = self.f.add_param(x, Ty::ANY);
                 self.bs[x.idx()].incomplete.push((r, p));
-                self.bs[x.idx()].defs[r as usize] = Some(p);
+                self.set_def(x, r, p);
                 break p;
             }
             if s.preds.len() == 1 {
                 x = s.preds[0];
-                chain.push(x);
                 continue;
             }
             if s.preds.is_empty() {
@@ -229,12 +252,20 @@ impl<'a, 'gc> Builder<'a, 'gc> {
                 break v;
             }
             let p = self.f.add_param(x, Ty::ANY);
-            self.bs[x.idx()].defs[r as usize] = Some(p);
+            self.set_def(x, r, p);
             self.add_param_args(x, r, p);
             break p;
         };
-        for c in chain {
-            self.bs[c.idx()].defs[r as usize].get_or_insert(v);
+        // The chain walked, again.
+        let mut c = b;
+        loop {
+            if self.def(c, r).is_none() {
+                self.set_def(c, r, v);
+            }
+            if c == x {
+                break;
+            }
+            c = self.bs[c.idx()].preds[0];
         }
         v
     }
@@ -246,14 +277,13 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             .copied()
             .unwrap_or(TypeSet::ANY);
         let inst = self.f.make_inst(Op::Load(r), &[], None, ExitTag::Type);
-        self.f.insts[inst.idx()].block = b;
         let at = self.bs[b.idx()].root_at;
-        self.f.blocks[b.idx()].insts.insert(at, inst);
+        self.f.insert(b, at, inst);
         self.bs[b.idx()].root_at += 1;
         let v = self.f.result(inst);
         self.f.vals[v.idx()].ty = Ty::val(if set.is_empty() { TypeSet::ANY } else { set });
-        self.bs[b.idx()].defs[r as usize] = Some(v);
-        self.bs[b.idx()].slots[r as usize] = SlotState::Holds(v);
+        self.set_def(b, r, v);
+        self.set_slot(b, r as usize, SlotState::Holds(v));
         if let Some(s) = self.bs[b.idx()].after {
             self.f.def_snaps.push((v, s));
         }
@@ -264,8 +294,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         let inst = self
             .f
             .make_inst(Op::KVal(v.to_raw()), &[], None, ExitTag::Type);
-        self.f.insts[inst.idx()].block = b;
-        self.f.blocks[b.idx()].insts.insert(0, inst);
+        self.f.insert(b, 0, inst);
         if self.bs[b.idx()].root {
             self.bs[b.idx()].root_at += 1;
         }
@@ -286,18 +315,19 @@ impl<'a, 'gc> Builder<'a, 'gc> {
 
     /// Apply the instruction's writes now.
     pub(crate) fn flush(&mut self) {
-        for (r, v) in std::mem::take(&mut self.pending) {
-            let s = &mut self.bs[self.cur.idx()];
-            s.defs[r as usize] = Some(v);
+        for k in 0..self.pending.len() {
+            let (r, v) = self.pending[k];
+            self.set_def(self.cur, r, v);
             // A slot whose root value is unchanged still holds it.
-            let keep = match s.slots[r as usize] {
+            let keep = match self.slot(self.cur, r as usize) {
                 SlotState::Holds(h) => h == self.root_of(v),
                 _ => false,
             };
             if !keep {
-                self.bs[self.cur.idx()].slots[r as usize] = SlotState::Unknown;
+                self.set_slot(self.cur, r as usize, SlotState::Unknown);
             }
         }
+        self.pending.clear();
         self.cur_snap = None;
     }
 
@@ -316,7 +346,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
 
     /// Whether `r`'s home slot holds `v` now.
     fn slot_holds(&mut self, r: u8, v: Val) -> bool {
-        match self.bs[self.cur.idx()].slots[r as usize] {
+        match self.slot(self.cur, r as usize) {
             SlotState::Holds(h) => h == self.root_of(v),
             SlotState::Lazy(root) => {
                 // Untouched since the root: `v` is the root's load of `r`.
@@ -370,7 +400,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         &mut self,
         op: Op,
         args: &[Val],
-        edges: Vec<Block>,
+        edges: &[Block],
         snap: Option<(Snap, ExitTag)>,
     ) -> Inst {
         debug_assert!(!self.terminated());
@@ -380,28 +410,30 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         };
         let i = self.f.make_inst(op, args, s, tag);
         self.f.append(self.cur, i);
-        let calls = edges
-            .iter()
-            .map(|&t| BlockCall {
-                target: t,
-                args: Vec::new(),
-            })
-            .collect();
-        self.f.set_edges(i, calls);
-        for &t in &edges {
+        let none = BlockCall {
+            target: Block(0),
+            args: List::default(),
+        };
+        let mut calls = [none; 2];
+        for (c, &t) in calls.iter_mut().zip(edges) {
+            c.target = t;
+        }
+        self.f.set_edges(i, &calls[..edges.len()]);
+        for &t in edges {
             self.bs[t.idx()].preds.push(self.cur);
         }
         self.bs[self.cur.idx()].terminated = true;
         // Edges into blocks already sealed get their arguments now.
         for (k, &t) in edges.iter().enumerate() {
             if self.bs[t.idx()].sealed && !self.f.blocks[t.idx()].params.is_empty() {
-                let params = self.f.blocks[t.idx()].params.clone();
-                let regs: Vec<u8> = params.iter().map(|&p| self.param_reg(t, p)).collect();
-                let mut args = Vec::new();
-                for r in regs {
+                let mut args = std::mem::take(&mut self.scratch);
+                args.clear();
+                for j in 0..self.f.blocks[t.idx()].params.len() {
+                    let r = self.param_reg(t, self.f.params(t)[j]);
                     args.push(self.read_var_at(r, self.cur));
                 }
-                self.f.edges_mut(i)[k].args = args;
+                self.f.set_edge_args(i, k, &args);
+                self.scratch = args;
             }
         }
         i
@@ -409,7 +441,6 @@ impl<'a, 'gc> Builder<'a, 'gc> {
 
     /// The register a block parameter stands for.
     fn param_reg(&self, b: Block, p: Val) -> u8 {
-        let defs = &self.bs[b.idx()].defs;
         if let Some(r) = self.bs[b.idx()]
             .incomplete
             .iter()
@@ -418,20 +449,17 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         {
             return r;
         }
-        for (r, d) in defs.iter().enumerate() {
-            if *d == Some(p) {
-                return r as u8;
-            }
-        }
-        panic!("block parameter without a register");
+        (0..self.nregs as u8)
+            .find(|&r| self.def(b, r) == Some(p))
+            .expect("block parameter without a register")
     }
 
     pub(crate) fn jump(&mut self, target: Block) {
-        self.terminate(Op::Jump, &[], vec![target], None);
+        self.terminate(Op::Jump, &[], &[target], None);
     }
 
     pub(crate) fn br(&mut self, cond: Val, t: Block, f: Block) {
-        self.terminate(Op::Br, &[cond], vec![t, f], None);
+        self.terminate(Op::Br, &[cond], &[t, f], None);
     }
 
     // --- snapshots and tail-outs ----------------------------------------------
@@ -446,17 +474,19 @@ impl<'a, 'gc> Builder<'a, 'gc> {
 
     fn snapshot(&mut self, pc: u32, kind: ExitKind, live: RegSet) -> Snap {
         let regs = self.exit_regs(live);
-        let mut entries = Vec::new();
+        // Reading a register creates no snapshot, so the entries are the
+        // pool's tail.
+        let from = self.f.snap_pool.len();
         for r in regs.iter() {
             if r >= self.nregs || self.untouched(r) {
                 continue;
             }
             let v = self.reg(r as u8);
             if !self.slot_holds(r as u8, v) {
-                entries.push((r as u8, v));
+                self.f.snap_pool.push((r as u8, v));
             }
         }
-        self.f.add_snap(SnapData { pc, kind, entries })
+        self.f.finish_snap(pc, kind, from)
     }
 
     /// The snapshot that re-runs the instruction being emitted.
@@ -483,7 +513,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     /// Whether `r`'s home slot still holds what it held at the root: the
     /// register is the root's (perhaps not yet created) load.
     fn untouched(&self, r: usize) -> bool {
-        matches!(self.bs[self.cur.idx()].slots[r], SlotState::Lazy(_))
+        matches!(self.slot(self.cur, r), SlotState::Lazy(_))
     }
 
     /// Note the `After` snapshot of `v`'s definition, the instruction at the
@@ -510,7 +540,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             if r >= self.nregs {
                 continue;
             }
-            if let SlotState::Lazy(root) = self.bs[self.cur.idx()].slots[r] {
+            if let SlotState::Lazy(root) = self.slot(self.cur, r) {
                 let t = self.bs[root.idx()].root_ty.get(r).copied();
                 tys[r] = t.filter(|t| !t.is_empty()).unwrap_or(TypeSet::ANY);
                 continue;
@@ -519,7 +549,8 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             if !self.slot_holds(r as u8, v) {
                 let b = self.boxed(v);
                 self.push(Op::Store(r as u8), &[b]);
-                self.bs[self.cur.idx()].slots[r] = SlotState::Holds(self.root_of(v));
+                let root = self.root_of(v);
+                self.set_slot(self.cur, r, SlotState::Holds(root));
             }
             tys[r] = self.ty(v).set;
         }
@@ -534,7 +565,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     /// Leave for the interpreter at the instruction being emitted.
     pub(crate) fn deopt(&mut self, tag: ExitTag) {
         let s = self.snap_before();
-        self.terminate(Op::Deopt, &[], vec![], Some((s, tag)));
+        self.terminate(Op::Deopt, &[], &[], Some((s, tag)));
     }
 
     /// End the block with a call: `Call` to a fresh resume block, which
@@ -542,7 +573,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     pub(crate) fn call(&mut self, op: Op, slot_tys: Vec<TypeSet>, c: u8) -> Block {
         let resume = self.new_root(slot_tys);
         self.f.blocks[resume.idx()].resume = true;
-        self.terminate(op, &[], vec![resume], None);
+        self.terminate(op, &[], &[resume], None);
         self.bs[resume.idx()].preds.clear();
         self.switch_to(resume);
         let r = self.push(Op::Resume { c }, &[]);
@@ -705,7 +736,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     // --- the instance graph ---------------------------------------------------
 
     fn instance(&mut self, bc: u32, version: u32) -> usize {
-        if let Some(&i) = self.inst_of.get(&(bc, version)) {
+        if let Some(i) = self.instance_of(bc, version) {
             return i;
         }
         let ir = self.new_block();
@@ -713,15 +744,28 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             bc,
             version,
             ir,
-            succs: Vec::new(),
+            succs: List::default(),
             npreds: 0,
             done_preds: 0,
             started: false,
-            processed: false,
+            discovered: false,
         });
         let i = self.instances.len() - 1;
-        self.inst_of.insert((bc, version), i);
+        let row = &mut self.inst_of[bc as usize];
+        if row.len() <= version as usize {
+            row.resize(version as usize + 1, u32::MAX);
+        }
+        row[version as usize] = i as u32;
         i
+    }
+
+    fn instance_of(&self, bc: u32, version: u32) -> Option<usize> {
+        let &i = self.inst_of[bc as usize].get(version as usize)?;
+        (i != u32::MAX).then_some(i as usize)
+    }
+
+    fn succ_at(&self, ii: usize, k: usize) -> usize {
+        self.inst_succs[self.instances[ii].succs.start as usize + k]
     }
 
     /// Discover the instances reachable from the entry, versioned for
@@ -762,26 +806,31 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         };
         let start = self.instance(entry_bc, n.min(level(entry_bc)));
         let mut work = vec![start];
-        let mut seen = vec![start];
+        self.instances[start].discovered = true;
         while let Some(i) = work.pop() {
             let (bc, k) = (self.instances[i].bc, self.instances[i].version);
-            let succs = if self.block_deopts(bc) {
-                Vec::new()
+            let succs: &[u32] = if self.block_deopts(bc) {
+                &[]
             } else {
-                cfg.blocks[bc as usize].succs.clone()
+                &cfg.blocks[bc as usize].succs
             };
-            let mut out = Vec::new();
-            for s in succs {
+            let mut out = [0usize; 4];
+            for (o, &s) in out.iter_mut().zip(succs) {
                 let v = succ_version(bc, k, s);
                 let si = self.instance(s, v);
-                out.push(si);
+                *o = si;
                 self.instances[si].npreds += 1;
-                if !seen.contains(&si) {
-                    seen.push(si);
+                if !self.instances[si].discovered {
+                    self.instances[si].discovered = true;
                     work.push(si);
                 }
             }
-            self.instances[i].succs = out;
+            let start = self.inst_succs.len();
+            self.inst_succs.extend_from_slice(&out[..succs.len()]);
+            self.instances[i].succs = List {
+                start: start as u32,
+                len: succs.len() as u32,
+            };
         }
         // RPO over instances.
         let mut visited = vec![false; self.instances.len()];
@@ -790,7 +839,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         visited[start] = true;
         while let Some(&mut (i, ref mut k)) = stack.last_mut() {
             if *k < self.instances[i].succs.len() {
-                let s = self.instances[i].succs[*k];
+                let s = self.succ_at(i, *k);
                 *k += 1;
                 if !visited[s] {
                     visited[s] = true;
@@ -803,7 +852,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         }
         post.reverse();
         for (j, &li) in nest.iter().enumerate() {
-            if let Some(&ii) = self.inst_of.get(&(cfg.loops[li].header, j as u32)) {
+            if let Some(ii) = self.instance_of(cfg.loops[li].header, j as u32) {
                 let b = self.instances[ii].ir;
                 self.f.blocks[b.idx()].peeled = true;
             }
@@ -849,9 +898,8 @@ impl<'a, 'gc> Builder<'a, 'gc> {
                 self.f.blocks[ir.idx()].dead = true;
                 self.bs[ir.idx()].terminated = true;
             }
-            self.instances[ii].processed = true;
-            let succs = self.instances[ii].succs.clone();
-            for s in succs {
+            for k in 0..self.instances[ii].succs.len() {
+                let s = self.succ_at(ii, k);
                 self.instances[s].done_preds += 1;
                 if self.instances[s].started
                     && self.instances[s].done_preds == self.instances[s].npreds
@@ -871,9 +919,8 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             }
         }
         // Blocks no edge reaches.
-        let reach = self.f.rpo();
         let mut live = vec![false; self.f.blocks.len()];
-        for b in reach {
+        for &b in &self.f.cfg().rpo {
             live[b.idx()] = true;
         }
         for (b, l) in live.iter().enumerate() {
@@ -888,25 +935,24 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     /// The slot state at the start of a block: the meet over its emitted
     /// predecessors, unknown at a loop header.
     fn init_slots(&mut self, b: Block) {
-        let preds = self.bs[b.idx()].preds.clone();
-        if !self.bs[b.idx()].sealed || preds.is_empty() {
+        let n = self.nregs;
+        if !self.bs[b.idx()].sealed || self.bs[b.idx()].preds.is_empty() {
             if !self.bs[b.idx()].root {
-                self.bs[b.idx()].slots = vec![SlotState::Unknown; self.nregs];
+                self.slots_of(b).fill(SlotState::Unknown);
             }
             return;
         }
-        let mut st = self.bs[preds[0].idx()].slots.clone();
-        for p in &preds[1..] {
-            for (r, s) in st.iter_mut().enumerate() {
-                if *s != self.bs[p.idx()].slots[r] {
-                    *s = SlotState::Unknown;
+        let p0 = self.bs[b.idx()].preds[0];
+        self.slots
+            .copy_within(p0.idx() * n..(p0.idx() + 1) * n, b.idx() * n);
+        for j in 1..self.bs[b.idx()].preds.len() {
+            let p = self.bs[b.idx()].preds[j];
+            for r in 0..n {
+                if self.slot(b, r) != self.slot(p, r) {
+                    self.set_slot(b, r, SlotState::Unknown);
                 }
             }
         }
-        // A value that differs between predecessors became a parameter, and
-        // `Holds` names the old one: only keep states whose value is still
-        // the register's here.
-        self.bs[b.idx()].slots = st;
     }
 
     fn emit_instance(&mut self, ii: usize, bc: u32) {
@@ -925,27 +971,24 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             let s = self.snap_before();
             self.ins_snap(Op::GcCheck, &[], s, ExitTag::Gc);
         }
+        let mut sb = [Block(0); 4];
+        let ns = self.instances[ii].succs.len();
+        for (k, s) in sb.iter_mut().enumerate().take(ns) {
+            *s = self.instances[self.succ_at(ii, k)].ir;
+        }
         for pc in start..end {
             self.pc = pc;
             self.cur_snap = None;
             let last = pc + 1 == end;
-            let succs: Vec<Block> = if last {
-                self.instances[ii]
-                    .succs
-                    .iter()
-                    .map(|&s| self.instances[s].ir)
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            emit::emit(self, pc, &succs);
+            let succs = if last { &sb[..ns] } else { &[][..] };
+            emit::emit(self, pc, succs);
             self.flush();
             if self.terminated() {
                 return;
             }
             if last {
                 // Fallthrough into the single successor.
-                match succs.as_slice() {
+                match succs {
                     [s] => self.jump(*s),
                     [] => self.deopt(ExitTag::Unsupported),
                     _ => unreachable!("a branch instruction did not terminate its block"),
@@ -991,21 +1034,20 @@ pub(crate) fn value_set(v: Value<'_>) -> TypeSet {
 /// Remove parameters whose incoming arguments are all one other value (or
 /// the parameter itself), to a fixpoint.
 pub(crate) fn remove_trivial_params(f: &mut Func<'_>) {
+    let cfg = f.cfg();
+    let mut map: Vec<Val> = Vec::new();
+    let mut kept: Vec<Val> = Vec::new();
     loop {
-        let preds_edges = incoming(f);
-        let mut map: Vec<Val> = (0..f.vals.len() as u32).map(Val).collect();
+        map.clear();
+        map.extend((0..f.vals.len() as u32).map(Val));
         let mut changed = false;
-        for b in 0..f.blocks.len() {
-            if f.blocks[b].dead {
-                continue;
-            }
-            let params = f.blocks[b].params.clone();
-            for (k, &p) in params.iter().enumerate() {
+        for &b in &cfg.rpo {
+            for k in 0..f.blocks[b.idx()].params.len() {
+                let p = f.params(b)[k];
                 let mut same: Option<Val> = None;
                 let mut trivial = true;
-                for &(term, e) in &preds_edges[b] {
-                    let a = f.edges(term)[e].args[k];
-                    let a = resolve(&map, a);
+                for &(term, e) in cfg.incoming(b) {
+                    let a = resolve(&map, f.edge_args(term, e as usize)[k]);
                     if a == p {
                         continue;
                     }
@@ -1029,10 +1071,10 @@ pub(crate) fn remove_trivial_params(f: &mut Func<'_>) {
         }
         // A replacement of another representation enters through a
         // conversion at the parameter's block.
-        for b in 0..f.blocks.len() {
-            let params = f.blocks[b].params.clone();
+        for &b in &cfg.rpo {
             let mut at = 0;
-            for &p in &params {
+            for k in 0..f.blocks[b.idx()].params.len() {
+                let p = f.params(b)[k];
                 let s = resolve(&map, p);
                 if s == p || f.vals[s.idx()].ty.rep == f.vals[p.idx()].ty.rep {
                     continue;
@@ -1040,8 +1082,7 @@ pub(crate) fn remove_trivial_params(f: &mut Func<'_>) {
                 let rep = f.vals[p.idx()].ty.rep;
                 let op = conversion(f.vals[s.idx()].ty.rep, rep);
                 let i = f.make_inst(op, &[s], None, ExitTag::Type);
-                f.insts[i.idx()].block = Block(b as u32);
-                f.blocks[b].insts.insert(at, i);
+                f.insert(b, at, i);
                 at += 1;
                 let r = f.result(i);
                 f.vals[r.idx()].ty = Ty {
@@ -1056,30 +1097,23 @@ pub(crate) fn remove_trivial_params(f: &mut Func<'_>) {
         }
         f.apply_replacements(&mut map);
         // Drop the replaced parameters and their arguments.
-        for b in 0..f.blocks.len() {
-            let params = f.blocks[b].params.clone();
-            let keep: Vec<bool> = params.iter().map(|&p| map[p.idx()] == p).collect();
-            if keep.iter().all(|&k| k) {
+        for &b in &cfg.rpo {
+            let n = f.blocks[b.idx()].params.len();
+            if f.params(b).iter().all(|&p| map[p.idx()] == p) {
                 continue;
             }
-            f.blocks[b].params = params
-                .iter()
-                .zip(&keep)
-                .filter(|(_, k)| **k)
-                .map(|(p, _)| *p)
-                .collect();
-            for (k, &p) in f.blocks[b].params.clone().iter().enumerate() {
-                f.vals[p.idx()].def = ValDef::Param(Block(b as u32), k as u16);
+            for &(term, e) in cfg.incoming(b) {
+                kept.clear();
+                for k in 0..n {
+                    if map[f.params(b)[k].idx()] == f.params(b)[k] {
+                        kept.push(f.edge_args(term, e as usize)[k]);
+                    }
+                }
+                f.set_edge_args(term, e as usize, &kept);
             }
-            for &(term, e) in &preds_edges[b] {
-                let args = std::mem::take(&mut f.edges_mut(term)[e].args);
-                f.edges_mut(term)[e].args = args
-                    .into_iter()
-                    .zip(&keep)
-                    .filter(|(_, k)| **k)
-                    .map(|(a, _)| a)
-                    .collect();
-            }
+            kept.clear();
+            kept.extend(f.params(b).iter().copied().filter(|&p| map[p.idx()] == p));
+            f.set_params(b, &kept);
         }
     }
 }
@@ -1100,24 +1134,6 @@ fn resolve(map: &[Val], mut v: Val) -> Val {
         v = map[v.idx()];
     }
     v
-}
-
-/// For each block, the (terminator, edge index) pairs entering it.
-pub(crate) fn incoming(f: &Func<'_>) -> Vec<Vec<(Inst, usize)>> {
-    let mut inc = vec![Vec::new(); f.blocks.len()];
-    for bd in &f.blocks {
-        if bd.dead {
-            continue;
-        }
-        if let Some(&t) = bd.insts.last()
-            && f.op(t).is_terminator()
-        {
-            for (k, e) in f.edges(t).iter().enumerate() {
-                inc[e.target.idx()].push((t, k));
-            }
-        }
-    }
-    inc
 }
 
 impl Func<'_> {

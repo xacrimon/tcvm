@@ -227,7 +227,8 @@ pub(crate) fn compile<'gc>(
             regalloc2::Algorithm::Ion
         },
     };
-    let out = regalloc2::run(&lowered.vcode, &env, &ra)
+    let mut rctx = ctx.jit().ra.borrow_mut();
+    let out = regalloc2::run_with_ctx(&lowered.vcode, &env, &ra, &mut rctx)
         .map_err(|e| CompileError::Backend(format!("regalloc: {e:?}")))?;
     if opts.check {
         let mut checker = regalloc2::checker::Checker::new(&lowered.vcode, &env);

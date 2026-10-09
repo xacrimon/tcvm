@@ -2,10 +2,9 @@
 //! set, and the value is guarded once where it is defined instead, so
 //! inference carries the type to every use.
 
-use crate::jit::build::incoming;
 use crate::jit::ir::ops::{ExitTag, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
-use crate::jit::ir::{ExitKind, Func, Inst, SnapData, Val, ValDef};
+use crate::jit::ir::{ExitKind, Func, Inst, Snap, Val, ValDef};
 
 /// What is known of the values a region is entered with.
 #[derive(Default)]
@@ -23,7 +22,7 @@ struct Cand {
     set: TypeSet,
     /// The register of an entry value; guarded in the prologue.
     entry: Option<u8>,
-    snap: Option<SnapData>,
+    snap: Option<Snap>,
 }
 
 /// Guard values at their definitions; whether any was. Types must be
@@ -60,7 +59,7 @@ pub(crate) fn speculate(f: &mut Func<'_>, kinds: &EntryKinds) -> bool {
                 v,
                 set: e,
                 entry: None,
-                snap: Some(f.snaps[s.idx()].clone()),
+                snap: Some(s),
             });
         }
     }
@@ -83,32 +82,35 @@ pub(crate) fn speculate(f: &mut Func<'_>, kinds: &EntryKinds) -> bool {
         } else {
             let d = f.def_inst(c.v).unwrap();
             let b = f.insts[d.idx()].block;
-            let at = f.blocks[b.idx()]
-                .insts
-                .iter()
-                .position(|&x| x == d)
-                .unwrap();
-            f.insts[g.idx()].block = b;
-            f.blocks[b.idx()].insts.insert(at + 1, g);
+            let at = f.insts_of(b).iter().position(|&x| x == d).unwrap();
+            f.insert(b, at + 1, g);
         }
         guards.push(g);
     }
+    // Each guard tests the value itself and exits with the frame of the
+    // value's definition, which the replacement must not touch.
+    let frames: Vec<(u32, ExitKind, Vec<(u8, Val)>)> = cands
+        .iter()
+        .map(|c| match c.snap {
+            Some(s) => (
+                f.snaps[s.idx()].pc,
+                f.snaps[s.idx()].kind,
+                f.entries(s.0).to_vec(),
+            ),
+            None => (f.meta.entry_pc, ExitKind::Before, Vec::new()),
+        })
+        .collect();
     let mut map: Vec<Val> = (0..f.vals.len() as u32).map(Val).collect();
     for (c, &g) in cands.iter().zip(&guards) {
         map[c.v.idx()] = f.result(g);
     }
     f.apply_replacements(&mut map);
-    // Each guard tests the value itself and exits with the frame of the
-    // value's definition, which the replacement must not have touched.
-    for (c, &g) in cands.into_iter().zip(&guards) {
+    for ((c, &g), (pc, kind, entries)) in cands.into_iter().zip(&guards).zip(frames) {
         f.args_mut(g)[0] = c.v;
-        let s = c.snap.unwrap_or(SnapData {
-            pc: f.meta.entry_pc,
-            kind: ExitKind::Before,
-            entries: Vec::new(),
-        });
-        f.snaps.push(s);
-        f.insts[g.idx()].snap = f.snaps.len() as u32 - 1;
+        let from = f.snap_pool.len();
+        f.snap_pool.extend_from_slice(&entries);
+        let s = f.finish_snap(pc, kind, from);
+        f.insts[g.idx()].snap = s.0;
     }
     true
 }
@@ -118,26 +120,25 @@ pub(crate) fn speculate(f: &mut Func<'_>, kinds: &EntryKinds) -> bool {
 /// expect. `ANY` is no expectation, the empty set a conflict.
 fn expectations(f: &Func<'_>) -> Vec<TypeSet> {
     let mut exp = vec![TypeSet::ANY; f.vals.len()];
-    let rpo = f.rpo();
-    for &b in &rpo {
-        for &i in &f.blocks[b.idx()].insts {
+    let cfg = f.cfg();
+    for &b in &cfg.rpo {
+        for &i in f.insts_of(b) {
             if let Some((a, set)) = informative(f, i) {
                 exp[a.idx()] &= set;
             }
         }
     }
-    let inc = incoming(f);
     let mut changed = true;
     while changed {
         changed = false;
-        for &b in &rpo {
-            for (k, &p) in f.blocks[b.idx()].params.iter().enumerate() {
+        for &b in &cfg.rpo {
+            for (k, &p) in f.params(b).iter().enumerate() {
                 let e = exp[p.idx()];
                 if e == TypeSet::ANY {
                     continue;
                 }
-                for &(term, j) in &inc[b.idx()] {
-                    let a = f.edges(term)[j].args[k];
+                for &(term, j) in cfg.incoming(b) {
+                    let a = f.edge_args(term, j as usize)[k];
                     let n = exp[a.idx()] & e;
                     if n != exp[a.idx()] {
                         exp[a.idx()] = n;
@@ -182,8 +183,8 @@ fn entry_agrees(f: &Func<'_>, kinds: &EntryKinds, r: u8, e: TypeSet) -> bool {
 /// elimination). A value's names are itself and the parameters it flows
 /// into.
 fn down_safe(f: &Func<'_>, cands: &[Cand]) -> Vec<bool> {
-    let rpo = f.rpo();
-    let inc = incoming(f);
+    let cfg = f.cfg();
+    let rpo = &cfg.rpo;
     let mut out = vec![false; cands.len()];
     for (ci, c) in cands.iter().enumerate() {
         if c.entry.is_some() {
@@ -194,12 +195,13 @@ fn down_safe(f: &Func<'_>, cands: &[Cand]) -> Vec<bool> {
         let mut grew = true;
         while grew {
             grew = false;
-            for &b in &rpo {
-                for (k, &p) in f.blocks[b.idx()].params.iter().enumerate() {
+            for &b in rpo {
+                for (k, &p) in f.params(b).iter().enumerate() {
                     if !names[p.idx()]
-                        && inc[b.idx()]
+                        && cfg
+                            .incoming(b)
                             .iter()
-                            .any(|&(t, j)| names[f.edges(t)[j].args[k].idx()])
+                            .any(|&(t, j)| names[f.edge_args(t, j as usize)[k].idx()])
                     {
                         names[p.idx()] = true;
                         grew = true;
@@ -213,7 +215,7 @@ fn down_safe(f: &Func<'_>, cands: &[Cand]) -> Vec<bool> {
         while changed {
             changed = false;
             for &b in rpo.iter().rev() {
-                let insts = &f.blocks[b.idx()].insts;
+                let insts = f.insts_of(b);
                 let term = *insts.last().unwrap();
                 let mut cur = match f.op(term) {
                     Op::Deopt => true,
