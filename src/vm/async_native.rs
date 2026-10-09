@@ -428,12 +428,13 @@ pub(crate) fn async_cont<'gc>(
 }
 
 /// A thread's LIFO bump arena for its tasks' futures, which nest like the
-/// frames that own them. Chunks never move; a free that isn't the last
-/// allocation (a future dropped out of order) is only reclaimed once the
-/// arena empties.
+/// frames that own them. Chunks never move and are kept for the next burst;
+/// a free that isn't the last allocation (a future dropped out of order) is
+/// only reclaimed once the arena empties.
 pub(crate) struct TaskArena {
     chunks: Vec<(NonNull<u8>, usize)>,
-    /// Current chunk and the free space in it.
+    /// The chunk being bump-allocated, and its free space, `top..end`.
+    cur: usize,
     top: usize,
     end: usize,
     live: usize,
@@ -445,6 +446,7 @@ impl TaskArena {
     pub(crate) const fn new() -> Self {
         TaskArena {
             chunks: Vec::new(),
+            cur: 0,
             top: 0,
             end: 0,
             live: 0,
@@ -459,17 +461,36 @@ impl TaskArena {
             self.live += 1;
             return unsafe { NonNull::new_unchecked(p as *mut u8) };
         }
-        self.alloc_chunk(l)
+        self.alloc_slow(l)
     }
 
+    /// Move on to the next chunk with room for `l`, mapping one when none of
+    /// the later ones has.
     #[cold]
     #[inline(never)]
-    fn alloc_chunk(&mut self, l: Layout) -> NonNull<u8> {
-        let size = (l.size() + l.align()).max(CHUNK);
-        let layout = Layout::from_size_align(size, 16).unwrap();
-        let base = NonNull::new(unsafe { std::alloc::alloc(layout) })
-            .unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
-        self.chunks.push((base, size));
+    fn alloc_slow(&mut self, l: Layout) -> NonNull<u8> {
+        let fits = |&(base, size): &(NonNull<u8>, usize)| {
+            let p = (base.as_ptr() as usize + l.align() - 1) & !(l.align() - 1);
+            p + l.size() <= base.as_ptr() as usize + size
+        };
+        let next = if self.chunks.is_empty() {
+            0
+        } else {
+            self.cur + 1
+        };
+        let i = match self.chunks[next..].iter().position(fits) {
+            Some(i) => next + i,
+            None => {
+                let size = (l.size() + l.align()).max(CHUNK);
+                let layout = Layout::from_size_align(size, 16).unwrap();
+                let base = NonNull::new(unsafe { std::alloc::alloc(layout) })
+                    .unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
+                self.chunks.push((base, size));
+                self.chunks.len() - 1
+            }
+        };
+        let (base, size) = self.chunks[i];
+        self.cur = i;
         self.end = base.as_ptr() as usize + size;
         let p = (base.as_ptr() as usize + l.align() - 1) & !(l.align() - 1);
         self.top = p + l.size();
@@ -486,6 +507,7 @@ impl TaskArena {
         if self.live == 0 {
             // Back to the first chunk; later ones stay for the next burst.
             if let Some(&(base, size)) = self.chunks.first() {
+                self.cur = 0;
                 self.top = base.as_ptr() as usize;
                 self.end = self.top + size;
             }
@@ -519,5 +541,31 @@ unsafe impl Allocator for TaskAlloc {
     #[inline(always)]
     unsafe fn deallocate(&self, p: NonNull<u8>, l: Layout) {
         unsafe { (*self.0).free(p, l) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A burst that overflows the first chunk takes the chunks an earlier
+    /// one mapped, rather than mapping more.
+    #[test]
+    fn arena_reuses_later_chunks() {
+        let mut arena = TaskArena::new();
+        let alloc = TaskAlloc(&raw mut arena);
+        // Two don't fit one chunk.
+        let l = Layout::from_size_align(CHUNK / 2 + 1, 16).unwrap();
+        for _ in 0..100 {
+            let a = alloc.allocate(l).unwrap().cast::<u8>();
+            let b = alloc.allocate(l).unwrap().cast::<u8>();
+            let c = alloc.allocate(l).unwrap().cast::<u8>();
+            unsafe {
+                alloc.deallocate(c, l);
+                alloc.deallocate(b, l);
+                alloc.deallocate(a, l);
+            }
+        }
+        assert_eq!(arena.chunks.len(), 3);
     }
 }
