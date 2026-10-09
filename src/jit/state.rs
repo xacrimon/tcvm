@@ -240,6 +240,9 @@ pub(crate) struct Entry<'gc> {
     /// for eviction.
     pub(crate) depth: u16,
     pub(crate) age: u32,
+    /// Kinds of the entry values failed entry guards saw, by register.
+    #[collect(require_static)]
+    pub(crate) seen: Vec<(u8, crate::jit::ir::types::TypeSet)>,
 }
 
 /// The per-prototype JIT record (`Prototype::jit`).

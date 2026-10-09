@@ -39,6 +39,14 @@ fn arith_mode(b: &Builder<'_, '_>, pc: u32) -> Mode {
         let forms = &info.forms;
         let imm = matches!(info.family, Family::ImmArith | Family::ImmBit);
         let idx = forms.iter().position(|f| *f == Some(op));
+        // Kinds the interpreter keeps a form through (`specialize`) and the
+        // form's guards would exit on each time: generic code, milestone 2.
+        let int_form = idx == Some(0) && !float_result;
+        let foreign =
+            fb::STR | fb::TAB | fb::OTHER | fb::MM | if int_form { 0 } else { fb::BIGINT };
+        if byte & foreign != 0 {
+            return Mode::Deopt;
+        }
         return match (imm, idx) {
             (false, Some(0)) | (true, Some(0)) if float_result => Mode::F64 {
                 l_small: true,
@@ -161,6 +169,7 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
         GETUPVAL => {
             let v = b.ins(Op::UpvalValue(rb), &[]);
             b.set(a, v);
+            b.note_def(&[v], None);
         }
         NOT => {
             let v = b.reg(rb);
@@ -221,13 +230,13 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
         FORPREP => emit_forprep(b, pc, insn, succs),
         FORLOOP_I => emit_forloop_i(b, a, succs),
         FORLOOP_F => emit_forloop_f(b, a, succs),
-        JEQI | JNEQI => emit_eqi(b, insn, succs),
+        JEQI | JNEQI => emit_eqi(b, pc, insn, succs),
         op => match op.info().family {
             Family::RegArith | Family::RegBit | Family::ImmArith | Family::ImmBit => {
                 emit_arith(b, pc, insn)
             }
-            Family::CmpReg => emit_cmp_reg(b, insn, succs),
-            Family::CmpImm => emit_cmp_imm(b, insn, succs),
+            Family::CmpReg => emit_cmp_reg(b, pc, insn, succs),
+            Family::CmpImm => emit_cmp_imm(b, pc, insn, succs),
             _ => b.deopt(ExitTag::Unsupported),
         },
     }
@@ -443,6 +452,19 @@ fn num_kind(b: &Builder<'_, '_>, v: Val) -> Option<CmpAs> {
     }
 }
 
+/// What the site's feedback byte says its operands compare as: `I64` when
+/// it saw only integers, a big one among them; `F64` when only floats.
+fn byte_kind(b: &Builder<'_, '_>, pc: u32) -> Option<CmpAs> {
+    let kinds = b.feedback(pc) & fb::KINDS;
+    if kinds & fb::BIGINT != 0 && kinds & !fb::INT == 0 {
+        Some(CmpAs::I64)
+    } else if kinds == fb::FLOAT {
+        Some(CmpAs::F64)
+    } else {
+        None
+    }
+}
+
 fn cmp_vals(b: &mut Builder<'_, '_>, cc: Cc, x: Val, y: Val, how: CmpAs) -> Val {
     match how {
         CmpAs::I32 => {
@@ -460,8 +482,10 @@ fn cmp_vals(b: &mut Builder<'_, '_>, cc: Cc, x: Val, y: Val, how: CmpAs) -> Val 
     }
 }
 
-fn emit_cmp_reg(b: &mut Builder<'_, '_>, insn: Instruction, succs: &[Block]) {
+fn emit_cmp_reg(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Block]) {
     let op = insn.op();
+    let seen = byte_kind(b, pc);
+    let wide = seen == Some(CmpAs::I64);
     let generic = insn.generic_op();
     let (x, y) = (b.reg(insn.a()), b.reg(insn.b()));
     let (cc, sense) = match generic {
@@ -474,8 +498,8 @@ fn emit_cmp_reg(b: &mut Builder<'_, '_>, insn: Instruction, succs: &[Block]) {
         _ => unreachable!(),
     };
     let how = if op != generic {
-        // An `_II` form.
-        CmpAs::I32
+        // An `_II` form, which exits saw leave i32.
+        if wide { CmpAs::I64 } else { CmpAs::I32 }
     } else {
         match (num_kind(b, x), num_kind(b, y)) {
             (Some(CmpAs::I32), Some(CmpAs::I32)) => CmpAs::I32,
@@ -489,7 +513,9 @@ fn emit_cmp_reg(b: &mut Builder<'_, '_>, insn: Instruction, succs: &[Block]) {
                 }
                 CmpAs::F64
             }
+            (Some(CmpAs::I32), None) | (None, Some(CmpAs::I32)) if wide => CmpAs::I64,
             (Some(k), None) | (None, Some(k)) if generic != BcOp::JEQ && generic != BcOp::JNEQ => k,
+            (None, None) if wide => CmpAs::I64,
             _ if generic == BcOp::JEQ || generic == BcOp::JNEQ => {
                 if eq_by_bits(b, x) || eq_by_bits(b, y) {
                     let c = b.ins(Op::SameBits, &[x, y]);
@@ -500,7 +526,7 @@ fn emit_cmp_reg(b: &mut Builder<'_, '_>, insn: Instruction, succs: &[Block]) {
                 return;
             }
             // The generic ordered compares' fast path is two floats.
-            _ => CmpAs::F64,
+            _ => seen.unwrap_or(CmpAs::F64),
         }
     };
     let c = cmp_vals(b, cc, x, y, how);
@@ -516,7 +542,7 @@ fn eq_by_bits(b: &Builder<'_, '_>, v: Val) -> bool {
         && ty.within(TypeSet::NIL | TypeSet::BOOL | TypeSet::STR | TypeSet::FUN | TypeSet::THR)
 }
 
-fn emit_cmp_imm(b: &mut Builder<'_, '_>, insn: Instruction, succs: &[Block]) {
+fn emit_cmp_imm(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Block]) {
     let op = insn.op();
     let generic = insn.generic_op();
     let v = b.reg(insn.a());
@@ -535,13 +561,14 @@ fn emit_cmp_imm(b: &mut Builder<'_, '_>, insn: Instruction, succs: &[Block]) {
     // `k <cc> v` is `v <swapped cc> k`.
     let cc = if swap { cc.swap() } else { cc };
     let how = if op != generic {
+        if b.feedback(pc) & !(fb::SMALL | fb::FLOAT | fb::OVERFLOW) != 0 {
+            b.deopt(ExitTag::Unsupported);
+            return;
+        }
         CmpAs::F64
     } else {
-        match num_kind(b, v) {
-            Some(k) => k,
-            // The generic immediate compares' fast path is a small integer.
-            None => CmpAs::I32,
-        }
+        // The generic immediate compares' fast path is a small integer.
+        num_kind(b, v).or(byte_kind(b, pc)).unwrap_or(CmpAs::I32)
     };
     let c = match how {
         CmpAs::I32 => {
@@ -563,11 +590,11 @@ fn emit_cmp_imm(b: &mut Builder<'_, '_>, insn: Instruction, succs: &[Block]) {
     branch(b, c, sense, succs);
 }
 
-fn emit_eqi(b: &mut Builder<'_, '_>, insn: Instruction, succs: &[Block]) {
+fn emit_eqi(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Block]) {
     let v = b.reg(insn.a());
     let k = insn.cmp_imm_int();
     let sense = insn.op() == BcOp::JEQI;
-    let c = match num_kind(b, v) {
+    let c = match num_kind(b, v).or(byte_kind(b, pc)) {
         Some(CmpAs::F64) => {
             let x = b.num_f64(v);
             let kk = b.kf64(k as f64);
@@ -623,18 +650,11 @@ fn emit_call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
         c,
     );
     let first = b.f.blocks[resume.idx()].insts[0];
-    match c {
-        2 => {
-            let r0 = b.f.result(first);
-            b.set(a, r0);
-        }
-        3 => {
-            let rs: Vec<Val> = b.f.results(first).collect();
-            b.set(a, rs[0]);
-            b.set(a + 1, rs[1]);
-        }
-        _ => {}
+    let rs: Vec<Val> = b.f.results(first).collect();
+    for (k, &v) in rs.iter().enumerate() {
+        b.set(a + k as u8, v);
     }
+    b.note_def(&rs, Some(resume));
 }
 
 // --- loops --------------------------------------------------------------------

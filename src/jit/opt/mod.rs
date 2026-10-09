@@ -4,9 +4,54 @@
 pub(crate) mod gvn;
 pub(crate) mod infer;
 pub(crate) mod simplify;
+pub(crate) mod speculate;
 
 use crate::jit::ir::ops::Op;
+use crate::jit::ir::verify::{dominates, dominators};
 use crate::jit::ir::{Block, BlockCall, Func, NO_SNAP};
+
+/// Whether some path from the entry does work in compiled code before it
+/// leaves: a loop's back edge, a return from a function entry, or an exit a
+/// recompile may widen (inside a loop, for a loop entry, whose exit and
+/// return happen once per run of the loop); a call continues in its resume
+/// block. A region whose every path ends otherwise only adds an exit to the
+/// interpreter's work.
+pub(crate) fn completes(f: &Func<'_>) -> bool {
+    let rpo = f.rpo();
+    let preds = f.preds();
+    let idom = dominators(f, &rpo, &preds);
+    let loop_entry = f.meta.loop_entry;
+    let mut in_loop = vec![false; f.blocks.len()];
+    for &t in &rpo {
+        for h in f.succs(t) {
+            if !dominates(&idom, h, t) {
+                continue;
+            }
+            in_loop[h.idx()] = true;
+            let mut work = vec![t];
+            while let Some(b) = work.pop() {
+                if !in_loop[b.idx()] {
+                    in_loop[b.idx()] = true;
+                    work.extend(preds[b.idx()].iter().copied());
+                }
+            }
+        }
+    }
+    let mut done = vec![false; f.blocks.len()];
+    // Successors before predecessors, but for back edges, which complete.
+    for &b in rpo.iter().rev() {
+        let Some(t) = f.terminator(b) else {
+            continue;
+        };
+        let d = &f.insts[t.idx()];
+        done[b.idx()] = match d.op {
+            Op::Return { .. } => !loop_entry,
+            Op::Deopt => d.tag.widenable() && (in_loop[b.idx()] || !loop_entry),
+            _ => f.succs(b).any(|s| done[s.idx()] || dominates(&idom, s, b)),
+        };
+    }
+    done[f.entry.idx()]
+}
 
 /// Delete pure instructions whose results are unused, to a fixpoint.
 pub(crate) fn dce(f: &mut Func<'_>) {

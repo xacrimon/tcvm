@@ -5,7 +5,7 @@
 use crate::jit::build::incoming;
 use crate::jit::ir::ops::{ExitTag, Op};
 use crate::jit::ir::types::{Rep, Ty, TypeSet};
-use crate::jit::ir::{Block, Func, Inst, Val, ValDef};
+use crate::jit::ir::{Block, Func, Val, ValDef};
 
 /// Whether the builder fixed the result type of `op` from knowledge the
 /// operands do not carry.
@@ -115,9 +115,16 @@ pub(crate) fn narrow(f: &mut Func<'_>) -> bool {
         let block = Block(b as u32);
         let params = f.blocks[b].params.clone();
         for (k, &p) in params.iter().enumerate() {
+            // An argument boxed for the edge counts as what it boxes.
             let arg_tys: Vec<Ty> = inc[b]
                 .iter()
-                .map(|&(t, e)| f.vals[f.edges(t)[e].args[k].idx()].ty)
+                .map(|&(t, e)| {
+                    let a = f.edges(t)[e].args[k];
+                    match f.def_op(a) {
+                        Some(Op::Box) => f.vals[f.args(f.def_inst(a).unwrap())[0].idx()].ty,
+                        _ => f.vals[a.idx()].ty,
+                    }
+                })
                 .collect();
             let Some(rep) = narrow_rep(f.vals[p.idx()].ty, &arg_tys) else {
                 continue;
@@ -130,12 +137,8 @@ pub(crate) fn narrow(f: &mut Func<'_>) -> bool {
                 set,
                 refine: crate::jit::ir::types::Refine::None,
             };
-            let boxed = f.make_inst(Op::Box, &[p], None, ExitTag::Type);
-            f.insts[boxed.idx()].block = block;
-            f.blocks[b].insts.insert(0, boxed);
-            let bv = f.result(boxed);
-            f.vals[bv.idx()].ty = Ty::val(set);
-            replace_uses_except(f, p, bv, boxed);
+            box_uses(f, p);
+            let _ = block;
             for &(term, e) in &inc[b] {
                 let a = f.edges(term)[e].args[k];
                 let na = convert(f, a, rep, f.insts[term.idx()].block);
@@ -146,26 +149,41 @@ pub(crate) fn narrow(f: &mut Func<'_>) -> bool {
     changed
 }
 
-fn replace_uses_except(f: &mut Func<'_>, from: Val, to: Val, except: Inst) {
-    let d = f.insts[except.idx()];
-    let skip = d.a0 as usize..d.a0 as usize + d.an as usize;
-    for (i, a) in f.args.iter_mut().enumerate() {
-        if *a == from && !skip.contains(&i) {
-            *a = to;
+/// Give each operand and edge use of the now unboxed `p` a box of its own
+/// just before it; GVN merges the dominated ones. Snapshots take `p` as is.
+fn box_uses(f: &mut Func<'_>, p: Val) {
+    let set = f.vals[p.idx()].ty.set;
+    for b in 0..f.blocks.len() {
+        if f.blocks[b].dead {
+            continue;
         }
-    }
-    for e in &mut f.edges {
-        for a in &mut e.args {
-            if *a == from {
-                *a = to;
+        let mut k = 0;
+        while k < f.blocks[b].insts.len() {
+            let i = f.blocks[b].insts[k];
+            let in_args = f.args(i).contains(&p);
+            let in_edges = f.edges(i).iter().any(|e| e.args.contains(&p));
+            if !in_args && !in_edges {
+                k += 1;
+                continue;
             }
-        }
-    }
-    for s in &mut f.snaps {
-        for (_, v) in &mut s.entries {
-            if *v == from {
-                *v = to;
+            let bx = f.make_inst(Op::Box, &[p], None, ExitTag::Type);
+            f.insts[bx.idx()].block = Block(b as u32);
+            f.blocks[b].insts.insert(k, bx);
+            let bv = f.result(bx);
+            f.vals[bv.idx()].ty = Ty::val(set);
+            for a in f.args_mut(i) {
+                if *a == p {
+                    *a = bv;
+                }
             }
+            for e in f.edges_mut(i) {
+                for a in &mut e.args {
+                    if *a == p {
+                        *a = bv;
+                    }
+                }
+            }
+            k += 2;
         }
     }
 }
