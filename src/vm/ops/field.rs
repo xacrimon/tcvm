@@ -217,6 +217,7 @@ fn get_fill_ic<'gc>(
     t: Table<'gc>,
     k: Value<'gc>,
 ) -> Result<Value<'gc>, Value<'gc>> {
+    leave_stale_class(ctx, t);
     let state = t.inner().borrow();
     let shape = state.shape();
     if shape.is_dict() {
@@ -249,6 +250,17 @@ fn get_fill_ic<'gc>(
     drop(state);
     let recv = slot.is_none().then_some(shape);
     get_index_fill_ic(ctx, closure, ic_idx, site, t, index, recv, k)
+}
+
+/// Move `t` off a stale metatable class before a fill reads the class or
+/// caches its shape (see [`Table::meta`]).
+#[inline(always)]
+fn leave_stale_class<'gc>(ctx: Context<'gc>, t: Table<'gc>) {
+    if let Some(c) = t.shape().mt_cache()
+        && c.is_stale()
+    {
+        t.refresh_meta(ctx);
+    }
 }
 
 /// The `__index` half of [`get_fill_ic`]: `t`'s raw lookup missed and its
@@ -316,6 +328,7 @@ fn set_own_fill_ic<'gc>(
     k: Value<'gc>,
     v: Value<'gc>,
 ) -> bool {
+    leave_stale_class(ctx, t);
     let state = t.inner().borrow();
     let shape = state.shape();
     let newindex = shape.has_mm(MetamethodBits::NEWINDEX);
@@ -335,9 +348,9 @@ fn set_own_fill_ic<'gc>(
         return false;
     }
     let key = constant_key(k);
-    // A hit stores without telling a metatable's cache, so the keys it
-    // mirrors are left uncached.
-    let cache = !mirrored(key);
+    // A hit stores without telling a metatable's class, so an adopted
+    // table's mirrored keys are left uncached; adoption changes the shape.
+    let cache = shape.as_mt().is_none() || !mirrored(key);
     let slot = shape.find_slot(key);
     let existing = slot.map_or(Value::nil(), |s| state.named_get(s));
     if existing.is_nil() && newindex {

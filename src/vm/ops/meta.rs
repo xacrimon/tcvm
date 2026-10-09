@@ -169,8 +169,7 @@ pub(crate) fn walk_index_chain<'gc>(
         let mm = match receiver.get_table() {
             Some(t) => {
                 let mm = t
-                    .shape()
-                    .mt_cache()
+                    .meta(ctx)
                     .map_or(Value::nil(), |c| c.mm(MetamethodBits::INDEX));
                 if mm.is_nil() {
                     return IndexChain::Resolved(Value::nil());
@@ -226,8 +225,7 @@ pub(crate) fn walk_newindex_chain<'gc>(
         let mm = match t.get_table() {
             Some(tbl) => {
                 let mm = tbl
-                    .shape()
-                    .mt_cache()
+                    .meta(ctx)
                     .map_or(Value::nil(), |c| c.mm(MetamethodBits::NEWINDEX));
                 if mm.is_nil() || !tbl.raw_get(key).is_nil() {
                     return NewIndexChain::RawSet(tbl);

@@ -21,8 +21,8 @@ pub struct StringData {
     len: usize,
 }
 
-// SAFETY: only `Interner::intern` makes a `StringData`, through `Gc::new_with_bytes` with `len`
-// bytes, and it has no drop glue.
+// SAFETY: only `Interner::intern` and `Interner::detached` make a `StringData`, through
+// `Gc::new_with_bytes` with `len` bytes, and it has no drop glue.
 unsafe impl TrailingBytes for StringData {
     #[inline(always)]
     fn trailing_len(&self) -> usize {
@@ -141,6 +141,18 @@ impl<'gc> Interner<'gc> {
             }
         }
         young.clear();
+    }
+
+    /// A string of `bytes` that is not interned, so it is unequal to every
+    /// key a program can name; for internal table keys only.
+    pub(crate) fn detached(&self, mc: &Mutation<'gc>, bytes: &[u8]) -> LuaString<'gc> {
+        let hash = {
+            let mut hasher = self.0.borrow().hasher.build_hasher();
+            hasher.write(bytes);
+            hasher.finish()
+        };
+        let len = bytes.len();
+        LuaString(Gc::new_with_bytes(mc, StringData { hash, len }, bytes))
     }
 
     pub(crate) fn intern(&self, mc: &Mutation<'gc>, bytes: &[u8]) -> LuaString<'gc> {

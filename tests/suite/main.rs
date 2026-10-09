@@ -44,6 +44,7 @@ mod math_fast_entries;
 mod math_frexp_ldexp;
 mod metamethod_dispatch;
 mod metamethod_many_results;
+mod metatable_classes;
 mod method_call_receiver;
 mod method_def;
 mod metrics_lifetime;
