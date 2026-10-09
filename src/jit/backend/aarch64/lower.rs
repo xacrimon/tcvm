@@ -102,7 +102,7 @@ fn float_cond(cc: Cc) -> Cond {
 /// The address of `Code[pc]` of the prototype being compiled.
 pub(crate) fn lower<'gc>(f: &Func<'gc>, code_base: usize) -> Result<Lowered, String> {
     let cfg = f.cfg();
-    let order = &cfg.rpo;
+    let order = &crate::jit::backend::order::layout(f);
     let mut block_of = vec![u32::MAX; f.blocks.len()];
     for (k, b) in order.iter().enumerate() {
         block_of[b.idx()] = k as u32;
