@@ -16,6 +16,7 @@ pub(crate) enum AluOp {
     Orr,
     Eor,
     Mul,
+    Udiv,
     Lslv,
     Lsrv,
     Asrv,
@@ -134,6 +135,8 @@ pub(crate) enum MInst {
     Sxtw,
     /// `[def d (float), use n (int)]`.
     Scvtf(Sz),
+    /// `[def d, use n (float)]`: `fcvtzs`, saturating.
+    Fcvtzs(Sz),
     /// `[def d (int), use n (float)]`: the bits.
     FmovToGpr,
     /// `[def d (float), use n (int)]`: the bits.
@@ -144,6 +147,11 @@ pub(crate) enum MInst {
     },
     /// `[def d, use n (float), snap..]`: the i32 an f64 holds exactly.
     FToIExact {
+        exit: u32,
+    },
+    /// `[def d (float), use v, snap..]`: the f64 of a small integer or
+    /// float `Value`.
+    ToF64 {
         exit: u32,
     },
     /// `[def d, use n]`: box an i32.
@@ -240,6 +248,7 @@ impl MInst {
             | ShiftI32 { exit, .. }
             | LToI { exit }
             | FToIExact { exit }
+            | ToF64 { exit }
             | BoxI64 { exit }
             | Guard { exit, .. }
             | GuardNoClose { exit }

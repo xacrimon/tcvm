@@ -58,6 +58,34 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                         changed = true;
                     }
                 }
+                Op::ToF64 => {
+                    let x = args[0];
+                    if let Some(Op::Box) = f.def_op(x) {
+                        let y = f.args(f.def_inst(x).unwrap())[0];
+                        match f.ty(y).rep {
+                            Rep::F64 => {
+                                map[res(f).idx()] = y;
+                                remove.push(i);
+                                changed = true;
+                                continue;
+                            }
+                            Rep::I32 => {
+                                f.insts[i.idx()].op = Op::IToF;
+                                f.insts[i.idx()].snap = crate::jit::ir::NO_SNAP;
+                                f.args_mut(i)[0] = y;
+                                changed = true;
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+                    let t = f.ty(x);
+                    if t.within(TypeSet::FLOAT) && !t.set.is_empty() {
+                        f.insts[i.idx()].op = Op::Unbox(Rep::F64);
+                        f.insts[i.idx()].snap = crate::jit::ir::NO_SNAP;
+                        changed = true;
+                    }
+                }
                 Op::Unbox(rep) => {
                     let x = args[0];
                     if f.ty(x).rep == rep {

@@ -201,6 +201,8 @@ pub(crate) enum Op {
     LNot,
     LShl,
     LShr,
+    /// Unsigned division by a divisor known nonzero.
+    LUDiv,
     /// Exit on a zero divisor.
     LDivFloor,
     LModFloor,
@@ -224,6 +226,10 @@ pub(crate) enum Op {
     FCmp(Cc),
     /// The i32 an f64 holds exactly; exits otherwise.
     FToIExact,
+    /// The f64 of a `Val` small integer or float; exits otherwise.
+    ToF64,
+    /// The i64 of an f64 rounded toward zero, saturating; NaN gives 0.
+    FToL,
 
     // --- closure --------------------------------------------------------------
     /// A by-value upvalue of the running closure.
@@ -301,7 +307,7 @@ impl Op {
             Store(_) => Effects::W_SLOT,
             Guard(_) | GuardTrue | GuardFalse | GuardSame | GuardNoClose | IAdd | ISub | IMul
             | INeg | IShl | IShr | IDivFloor | IModFloor | LDivFloor | LModFloor | LToI
-            | FToIExact => Effects::MAY_DEOPT,
+            | FToIExact | ToF64 => Effects::MAY_DEOPT,
             GcCheck => Effects::MAY_DEOPT | Effects::R_GC,
             Helper(HelperId::BoxI64) => Effects::MAY_ALLOC | Effects::W_GC,
             Helper(HelperId::Land) => Effects::W_SLOT | Effects::R_SLOT,
@@ -397,9 +403,9 @@ impl Op {
             IAdd | ISub | IMul | IAddNo | ISubNo | IMulNo | INeg | IAnd | IOr | IXor | INot
             | IShl | IShr | IDivFloor | IModFloor | LToI | FToIExact => Ty::I32,
             IToF | LToF | FAdd | FSub | FMul | FDiv | FNeg | FAbs | FSqrt | FFloor | FCeil
-            | FIDiv => Ty::F64,
-            IToL | LAdd | LSub | LMul | LNeg | LAnd | LOr | LXor | LNot | LShl | LShr
-            | LDivFloor | LModFloor => Ty::I64,
+            | FIDiv | ToF64 => Ty::F64,
+            IToL | FToL | LAdd | LSub | LMul | LUDiv | LNeg | LAnd | LOr | LXor | LNot | LShl
+            | LShr | LDivFloor | LModFloor => Ty::I64,
             Helper(HelperId::FMod | HelperId::FPow) => Ty::F64,
             Helper(HelperId::BoxI64) => Ty::val(TypeSet::INT),
             _ => Ty::ANY,

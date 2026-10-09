@@ -415,6 +415,7 @@ impl Em<'_> {
                     AluOp::Orr => self.a.orr(sz, d, n, m),
                     AluOp::Eor => self.a.eor(sz, d, n, m),
                     AluOp::Mul => self.a.mul(sz, d, n, m),
+                    AluOp::Udiv => self.a.udiv(sz, d, n, m),
                     AluOp::Lslv => self.a.lslv(sz, d, n, m),
                     AluOp::Lsrv => self.a.lsrv(sz, d, n, m),
                     AluOp::Asrv => self.a.asrv(sz, d, n, m),
@@ -498,6 +499,10 @@ impl Em<'_> {
                 let (d, n) = (self.r(i, 0), self.r(i, 1));
                 self.a.sxtw(d, n);
             }
+            Fcvtzs(sz) => {
+                let (d, n) = (self.r(i, 0), self.fr(i, 1));
+                self.a.fcvtzs(sz, d, n);
+            }
             Scvtf(sz) => {
                 let (d, n) = (self.fr(i, 0), self.r(i, 1));
                 self.a.scvtf(sz, d, n);
@@ -524,10 +529,31 @@ impl Em<'_> {
                 let l = self.exit(exit);
                 self.a.b_cond(Cond::Ne, l);
                 // -0.0 converts to 0 but is a float zero only by sign: keep it a float.
+                let ok = self.a.new_label();
+                self.a.cmp_imm(Sz::W, X16, 0);
+                self.a.b_cond(Cond::Ne, ok);
                 self.a.fmov_to_gpr(X17, n);
                 self.a.cmp_imm(Sz::X, X17, 0);
                 self.a.b_cond(Cond::Lt, l);
+                self.a.bind(ok);
                 self.a.mov_w(d, X16);
+            }
+            ToF64 { exit } => {
+                let (d, v) = (self.fr(i, 0), self.r(i, 1));
+                let done = self.a.new_label();
+                let not_small = self.a.new_label();
+                self.a.lsr_imm(Sz::X, X16, v, 32);
+                self.a.cmn_imm(Sz::W, X16, 1);
+                self.a.b_cond(Cond::Ne, not_small);
+                self.a.scvtf(Sz::W, d, v);
+                self.a.b(done);
+                self.a.bind(not_small);
+                self.a.movz(Sz::X, X16, 0xfff9, 3);
+                self.a.cmp(Sz::X, v, X16);
+                let l = self.exit(exit);
+                self.a.b_cond(Cond::Hs, l);
+                self.a.fmov_from_gpr(d, v);
+                self.a.bind(done);
             }
             BoxI32 => {
                 let (d, n) = (self.r(i, 0), self.r(i, 1));

@@ -279,20 +279,19 @@ fn check_reps(f: &Func<'_>, i: Inst) -> Result<(), String> {
     let op = f.op(i);
     let args = f.args(i);
     let want: &[Rep] = match op {
-        Store(_) | Unbox(_) | IsType(_) | IsFalsy | Guard(_) => &[Val],
+        Store(_) | Unbox(_) | IsType(_) | IsFalsy | Guard(_) | ToF64 => &[Val],
         SameBits | GuardSame => &[Val, Val],
         GuardTrue | GuardFalse | Br => &[B1],
         IAdd | ISub | IMul | IAddNo | ISubNo | IMulNo | IAnd | IOr | IXor | IShl | IShr
         | IDivFloor | IModFloor | ICmp(_) => &[I32, I32],
         INeg | INot | IToF | IToL => &[I32],
-        LAdd | LSub | LMul | LAnd | LOr | LXor | LShl | LShr | LDivFloor | LModFloor | LCmp(_) => {
-            &[I64, I64]
-        }
+        LAdd | LSub | LMul | LUDiv | LAnd | LOr | LXor | LShl | LShr | LDivFloor | LModFloor
+        | LCmp(_) => &[I64, I64],
         LNeg | LNot | LToF | LToI => &[I64],
         FAdd | FSub | FMul | FDiv | FIDiv | FCmp(_) | Helper(HelperId::FMod | HelperId::FPow) => {
             &[F64, F64]
         }
-        FNeg | FAbs | FSqrt | FFloor | FCeil | FToIExact => &[F64],
+        FNeg | FAbs | FSqrt | FFloor | FCeil | FToIExact | FToL => &[F64],
         Box => {
             if f.ty(args[0]).rep == Val {
                 return Err(format!("i{} boxes a val", i.0));

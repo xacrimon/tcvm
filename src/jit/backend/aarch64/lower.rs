@@ -642,6 +642,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             | Op::LAdd
             | Op::LSub
             | Op::LMul
+            | Op::LUDiv
             | Op::LAnd
             | Op::LOr
             | Op::LXor => {
@@ -655,6 +656,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     Op::LAdd => (AluOp::Add, Sz::X),
                     Op::LSub => (AluOp::Sub, Sz::X),
                     Op::LMul => (AluOp::Mul, Sz::X),
+                    Op::LUDiv => (AluOp::Udiv, Sz::X),
                     Op::LAnd => (AluOp::And, Sz::X),
                     Op::LOr => (AluOp::Orr, Sz::X),
                     _ => (AluOp::Eor, Sz::X),
@@ -697,6 +699,10 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 let ops = [self.def(res.unwrap()), self.use_(args[0])];
                 self.push(MInst::Scvtf(sz), &ops, none);
             }
+            Op::FToL => {
+                let ops = [self.def(res.unwrap()), self.use_(args[0])];
+                self.push(MInst::Fcvtzs(Sz::X), &ops, none);
+            }
             Op::IToL => {
                 let ops = [self.def(res.unwrap()), self.use_(args[0])];
                 self.push(MInst::Sxtw, &ops, none);
@@ -708,6 +714,10 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             Op::FToIExact => {
                 let ops = vec![self.def(res.unwrap()), self.use_(args[0])];
                 self.push_exit(i, |exit| MInst::FToIExact { exit }, ops, none);
+            }
+            Op::ToF64 => {
+                let ops = vec![self.def(res.unwrap()), self.use_(args[0])];
+                self.push_exit(i, |exit| MInst::ToF64 { exit }, ops, none);
             }
             Op::FAdd | Op::FSub | Op::FMul | Op::FDiv => {
                 let fop = match op {

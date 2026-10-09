@@ -16,6 +16,8 @@ pub(crate) const OTHER: u8 = 32;
 pub(crate) const OVERFLOW: u8 = 64;
 /// A metamethod ran.
 pub(crate) const MM: u8 = 128;
+/// At a `FORPREP`: an integer loop's limit was a float.
+pub(crate) const FLOAT_LIMIT: u8 = OTHER;
 
 pub(crate) const INT: u8 = SMALL | BIGINT;
 pub(crate) const KINDS: u8 = SMALL | BIGINT | FLOAT | STR | TAB | OTHER;
