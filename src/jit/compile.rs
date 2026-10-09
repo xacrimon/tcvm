@@ -57,6 +57,16 @@ pub(crate) struct Options {
     pub(crate) deopt_all: bool,
 }
 
+/// Microseconds spent per stage of one compile.
+#[derive(Default, Debug)]
+pub(crate) struct Times {
+    pub(crate) build: u128,
+    pub(crate) passes: u128,
+    pub(crate) lower: u128,
+    pub(crate) regalloc: u128,
+    pub(crate) emit: u128,
+}
+
 /// The optimized IR of the region of `closure` entered at `pc`. `frame` is
 /// the frame standing at the entry, or null.
 pub(crate) fn build_ir<'gc>(
@@ -65,7 +75,9 @@ pub(crate) fn build_ir<'gc>(
     opts: &Options,
     frame: *const Value<'gc>,
     seen: &[(u8, TypeSet)],
+    times: &mut Times,
 ) -> Result<(Func<'gc>, Cfg), CompileError> {
+    let start = std::time::Instant::now();
     let code: Vec<_> = closure
         .proto
         .code
@@ -85,6 +97,8 @@ pub(crate) fn build_ir<'gc>(
         Ok(())
     };
     check(&f, "build")?;
+    let built = std::time::Instant::now();
+    times.build = (built - start).as_micros();
     let mut kinds = EntryKinds {
         frame: Vec::new(),
         seen: seen.to_vec(),
@@ -110,6 +124,7 @@ pub(crate) fn build_ir<'gc>(
     opt::prune_gc_checks(&mut f);
     opt::dce(&mut f);
     check(&f, "optimize")?;
+    times.passes = built.elapsed().as_micros();
     if !opt::completes(&f) {
         return Err(CompileError::Useless);
     }
@@ -188,7 +203,8 @@ pub(crate) fn compile<'gc>(
         deopt_all: config.deopt_all,
     };
     note_upvalues_offset(closure);
-    let (mut f, _cfg) = build_ir(closure, pc, &opts, frame, seen)?;
+    let mut times = Times::default();
+    let (mut f, _cfg) = build_ir(closure, pc, &opts, frame, seen, &mut times)?;
     opt::split_critical_edges(&mut f);
     if opts.check {
         verify(&f)
@@ -197,7 +213,10 @@ pub(crate) fn compile<'gc>(
     if config.dump.ir || config.dump.opt {
         eprintln!("-- jit ir {} pc{pc}\n{}", chunk_name(closure), f.print());
     }
+    let t = std::time::Instant::now();
     let lowered = lower::lower(&f, closure.code as usize).map_err(CompileError::Backend)?;
+    times.lower = t.elapsed().as_micros();
+    let t = std::time::Instant::now();
     let env = abi::machine_env();
     let ra = regalloc2::RegallocOptions {
         verbose_log: false,
@@ -217,6 +236,8 @@ pub(crate) fn compile<'gc>(
             .run()
             .map_err(|e| CompileError::Backend(format!("regalloc checker: {e:?}")))?;
     }
+    times.regalloc = t.elapsed().as_micros();
+    let t = std::time::Instant::now();
     let helpers = emit::Helpers {
         enter: crate::vm::ops::call::enter as *const () as usize,
         fmod: crate::jit::helpers::jit_fmod as *const () as usize,
@@ -246,6 +267,23 @@ pub(crate) fn compile<'gc>(
             words.len() * 4
         );
         dump_words(entry as usize, &words);
+    }
+    times.emit = t.elapsed().as_micros();
+    if config.time {
+        eprintln!(
+            "jit time {} pc{pc}: {} IR insts, build {}us, passes {}us, lower {}us, regalloc {}us, emit {}us",
+            chunk_name(closure),
+            f.blocks
+                .iter()
+                .filter(|b| !b.dead)
+                .map(|b| b.insts.len())
+                .sum::<usize>(),
+            times.build,
+            times.passes,
+            times.lower,
+            times.regalloc,
+            times.emit
+        );
     }
     let mut exits = Vec::with_capacity(em.exits.len());
     let mut snaps: Vec<SnapEntry> = Vec::new();

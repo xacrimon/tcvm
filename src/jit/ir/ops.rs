@@ -100,7 +100,7 @@ impl ExitTag {
 
 // Some operations are lowered already but produced only from milestone 2.
 #[allow(dead_code)]
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Op {
     // --- constants: pure, no operands --------------------------------------
     /// A `Value` word with no heap object (nil, booleans, small ints, floats).

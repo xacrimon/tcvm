@@ -11,13 +11,9 @@ use crate::jit::ir::{Block, Func, Inst, Val};
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Key {
-    op: OpKey,
+    op: Op,
     args: Vec<Val>,
 }
-
-/// `Op` with its floating payloads as bits, hashable.
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct OpKey(String);
 
 fn key_of(f: &Func<'_>, i: Inst) -> Option<Key> {
     let op = f.op(i);
@@ -26,7 +22,7 @@ fn key_of(f: &Func<'_>, i: Inst) -> Option<Key> {
         return None;
     }
     Some(Key {
-        op: OpKey(format!("{op:?}")),
+        op,
         args: f.args(i).to_vec(),
     })
 }

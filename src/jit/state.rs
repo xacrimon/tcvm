@@ -31,6 +31,8 @@ pub(crate) struct JitConfig {
     pub(crate) log: bool,
     pub(crate) dump: DumpFlags,
     pub(crate) check: bool,
+    /// Log each compile's time per stage.
+    pub(crate) time: bool,
     pub(crate) fastalloc: bool,
     pub(crate) only: Option<String>,
     pub(crate) deopt_all: bool,
@@ -82,6 +84,7 @@ impl JitConfig {
             log: flag("TCVM_JIT_LOG"),
             dump,
             check: flag("TCVM_JIT_CHECK") || cfg!(debug_assertions),
+            time: flag("TCVM_JIT_TIME"),
             fastalloc: flag("TCVM_JIT_FASTALLOC"),
             only: var("TCVM_JIT_ONLY"),
             deopt_all: flag("TCVM_JIT_DEOPT_ALL"),
