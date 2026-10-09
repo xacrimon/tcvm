@@ -51,7 +51,6 @@ impl Func<'_> {
                     let kind = match s.kind {
                         ExitKind::Before => "before",
                         ExitKind::After => "after",
-                        ExitKind::Gc => "gc",
                     };
                     let ents: Vec<String> = self
                         .entries(d.snap)

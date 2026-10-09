@@ -90,8 +90,8 @@ elaborates them.
   kept in reserve. (Sections 7 and 9.)
 - **J5. Hotness is counted at function entry and at loop back-edges** through one
   table of 16-bit counters in `State`, in dedicated instructions: a compiler-emitted
-  `FUNC` at pc 0, a compiler-emitted `LOOP` at `while`/`repeat`/generic-`for`/
-  `goto` loop headers, and the numeric `FORLOOP` forms. Entries are installed only
+  `FUNC` at pc 0, a compiler-emitted `LOOP` at `while`/`repeat`/generic-`for` loop
+  headers and at each backward `goto`, and the numeric `FORLOOP` forms. Entries are installed only
   over those words, as LuaJIT patches `FUNCF`/`LOOP`/`FORL`. (Sections 5.2, 6.)
 - **J6. Integers are `I32` or `I64` in compiled code.** A site whose feedback is
   small ints only gets `I32` with overflow guards that deoptimize; a site that saw
@@ -479,10 +479,12 @@ from `Code` (4.8). Four opcodes are added to the ISA:
   `VARARGPREP`): counts a function entry (6.1), then falls through. Every way into
   a Lua function (`CALL`, `enter`, `TAILCALL`, a coroutine's first resume) passes
   it.
-- `LOOP`, emitted at the header of every `while`, `repeat`, generic `for` and
-  backward-`goto` loop (LuaJIT emits `BC_LOOP` in `parse_while`, `parse_repeat`
-  and for a backward `goto`, `lj_parse.c:2724,2784,2804`): counts an iteration,
-  then falls through. A generic `for` gets one, where LuaJIT patches `ITERL`,
+- `LOOP`, emitted at the header of every `while`, `repeat` and generic `for`
+  loop, and at a backward `goto` itself (LuaJIT emits `BC_LOOP` in `parse_while`,
+  `parse_repeat` and at the `goto`, `lj_parse.c:2724,2784,2804`: a one-pass
+  compiler learns that a label heads a loop only when the backward `goto`
+  arrives): counts an iteration, then falls through. A `goto` loop's entry is
+  therefore at its latch, as a numeric loop's is. A generic `for` gets one, where LuaJIT patches `ITERL`,
   because here its back-jump is taken inside `TFORCALL_*` (`tfor_finish!` reads
   the `TFORLOOP` word, `control.rs:138-140`), so `TFORLOOP` cannot be patched.
 - `JIT_ENTRY`, shape `Ad { entry: u16 }`, never emitted: written over a `FUNC`
@@ -497,10 +499,11 @@ decodes them, so nothing but dispatch reads them. A `FORLOOP` has two readers,
 both taught to recognize a JIT word: `write_forloop_form` (`control.rs:157-169`)
 leaves it alone (the `FORLOOP_I` region's entry guards and `FORLOOP_I`'s own
 fallback to the generic `FORLOOP`, `control.rs:259-267`, cover a changed loop
-kind), and `forloop_slow` decodes the original through the entry. Every other
-path that would dispatch the word at a pc (a `jit_exit` resume, 5.6; the entry-fail
-stub) dispatches the original instead, which also keeps an exit `Before` a loop
-header from re-entering the region it just left.
+kind), and `forloop_slow` decodes the word `op_forloop` passed it, never the one
+in `Code`. That word is always the original: every path that would dispatch the
+word at a pc (a `jit_exit` resume, 5.6; `jit_entry_fail`) dispatches the original
+instead, which also keeps an exit `Before` a loop header from re-entering the
+region it just left.
 
 The overwritten word is kept in the prototype's `JitState.entries[i].original`
 (section 11). The entry's code address is in a
@@ -514,7 +517,9 @@ op fn op_jit_entry / op_jit_loop {
 ```
 
 A failed entry guard runs the original: the entry-fail stub pops the frame and
-tails `jit_entry_fail` (6.4), which counts and then does
+tails `jit_entry_fail` (6.4) with the region in `insn`, which records the kinds
+of every register the entry guards test (the region keeps their list), counts and
+then does
 `tail!(rt.handler(original.opcode()), insn = original)` with `pc` already pointing
 past the word, the exact state the original handler expects. A blacklisted or retired entry
 restores the original word in `Code` and frees its table slot, so `op_jit_*` is
@@ -529,19 +534,22 @@ The prologue, in order:
    the single entry-fail stub, which pops the frame and tails `jit_entry_fail`.
    For a `JIT_ENTRY` the live registers are the parameters, typed by use-driven
    speculation (9.1): the type their uses' feedback agrees on. For a `JIT_LOOP`
-   they are the registers live at the entry, typed the same way and intersected
-   with the kinds of the live frame's values at compile time (J7).
+   they are the registers live at the entry: one whose uses expect a set keeps it
+   when the kind of the live frame's value at compile time (J7) and the kinds
+   failed entries saw fit it, and is left untyped otherwise; one whose uses expect
+   nothing is typed by the frame's kind and the seen ones.
 3. Unbox the guarded values into the representations the body wants.
 
 A `JIT_ENTRY` region compiles the whole function from pc 0; a `JIT_LOOP` region
 compiles from its `LOOP` or `FORLOOP` and covers everything reachable from it,
 including the code after the loop and the returns, with the enclosing loops
 rebuilt as real loops by peeling the rest of their current iterations (8.7). A prototype may hold up to `MAX_ENTRIES = 4`
-live regions (one function entry, three loop entries); a fifth request evicts the
-innermost loop entry (the one whose header is deepest in the loop forest, ties by
-age), since a region entered at an outer header already contains the inner loops
-and an inner entry only saves the interpreted remainder of one outer iteration
-after a deopt inside the inner body. Both kinds coexist: an interpreted frame reaching a `JIT_LOOP`
+live regions (one function entry, three loop entries); a fifth evicts the deepest
+loop entry whose loop lies inside another live loop entry's loop, since the outer
+region already contains the inner loop and the inner entry only saves the
+interpreted remainder of one outer iteration after a deopt inside the inner body;
+when no entry is nested in another, the oldest loop entry goes. Each entry keeps
+the headers of its loop nest for this. Both kinds coexist: an interpreted frame reaching a `JIT_LOOP`
 word enters the loop region; a call reaching `JIT_ENTRY` enters the function
 region; compiled code never reads bytecode, so neither word is seen by a region.
 
@@ -577,8 +585,7 @@ recomputed from it.
 
 Rule R5: **no Rust helper called from a region may grow the value stack, switch
 threads, run Lua code, or raise.** Anything that needs one of those is a tail-out
-(a call) or a deopt. Helpers may allocate; an allocating helper is followed by the
-GC check of 5.6.
+(a call) or a deopt. Helpers may allocate; the collector checks of 5.7 cover them.
 
 Rule R6: **no virtual register is live across a tail-out.** R3 pops the frame
 that would hold a spill, and the callee clobbers every register. A value used on
@@ -709,24 +716,28 @@ exit_K:  mov  w16, #K
          b    exit_region        ; the region's three-instruction trampoline into exit_common (10.6)
 ```
 
-`exit_common` is one routine per code segment (section 10.6). It stores x0–x15,
+`exit_common` is one naked function in the binary (section 10.6). It stores x0–x15,
 x19–x21, x26–x28, d0–d31 and the region's spill slots to `State.jit.exit_regs` (a
 fixed buffer reached through `rt`), pops the native frame, and tails `jit_exit`, a
 `slow` handler, with `insn` packing the region pointer and `K`. `jit_exit`:
 
-1. Finds `exit K` in the region's exit table: its snapshot, its resume pc and
-   kind, its counter.
+1. Finds `exit K` in the region's exit table: its snapshot (whose header holds
+   the resume pc and kind), its tag, its counter.
 2. Interprets the snapshot (Appendix C): for each entry, materializes the `Value`
    from the recorded location (a register image, a spill slot of the frame just
    popped, read before the pop into the same buffer, a constant from the region's
-   pool, or an unboxed i32/f64 to box) and stores it to the home slot. Entries for
+   pool, an inline nil or boolean, or an unboxed i32/i64/f64 to box) and stores it
+   to the home slot. Entries for
    unchanged slots are not in the snapshot; dead registers are not in it.
 3. For a snapshot with inlined frames (Appendix C), writes the inlined callees'
    headers from the outermost in, so the interpreter sees ordinary frames.
-4. Records what the failing guard saw into the site's feedback on every exit,
-   reading the site's operands from the frame it just restored (a `Before` exit's
-   operands are all in home slots by then), and counts the exit when it is
-   widenable (6.4); requests a recompile or a blacklist when a threshold trips.
+4. On every `Before` exit, records the kinds of the site's operands into its
+   feedback byte, reading them from the frame it just restored (they are all in
+   home slots by then); an `After` exit follows a completed instruction and
+   records nothing. It counts the exit when it is widenable (6.4), and requests a
+   recompile or a blacklist when a threshold trips. A collector check's exit
+   (tag `Gc`, 5.7) then leaves through `Exit::Gc` and resumes at its pc after the
+   collection.
 5. `sync!`s the frame and `become`s the handler of the instruction at the resume
    pc with `insn` loaded from `Code` (which may by now be a quickened form, which is
    fine), or for an "after" snapshot the instruction following it. A
@@ -738,16 +749,15 @@ Exit kinds:
 
 | Kind | Resume | Used by |
 |---|---|---|
-| `Before(pc)` | re-execute the instruction at `pc` in the interpreter | type and shape guards, overflow, generic fallbacks, unsupported ops |
-| `After(pc)` | continue at `pc + 1`; the instruction's effects are complete | GC checks after an allocation, a helper that completed but reported "slow path needed afterwards" |
-| `Gc(pc)` | as `After`, but the handler exits with `Exit::Gc` first | the collector check |
+| `Before(pc)` | re-execute the instruction at `pc` in the interpreter | type and shape guards, overflow, generic fallbacks, unsupported ops, the collector checks |
+| `After(pc)` | continue at `pc + 1`; the instruction's effects are complete | definition guards (9.1), a helper that completed but reported "slow path needed afterwards" |
 
 A deopt never raises an error: an operation that would error in the interpreter
 (a nil index, a non-callable, a bad `for` value) deopts `Before` and the
 interpreter raises it with its own message and position.
 
-Only widenable exits count toward recompilation: type, shape, overflow and
-entry-guard exits, which a recompile can cover. A never-executed exit (6.3) is
+Only widenable exits count toward recompilation: type, shape and overflow exits,
+which a recompile can cover, and failed entry guards (6.4). A never-executed exit (6.3) is
 widenable too, and stronger: it can only fire because its block did run, so its
 first firing records the kinds and marks the entry for recompilation at once,
 outside the `MAX_RECOMPILES` budget. Each block flips from never-executed to
@@ -764,12 +774,16 @@ A region of 300 guards costs 2.4 KiB of stubs and one shared routine.
 
 Because the collector runs only between `Lua::enter`s, nothing in a region's
 registers needs rooting: no collection can happen while the region's registers
-hold anything. The region must only make sure the collector gets its chance:
-after every allocating operation (`NEWTABLE`, `CONCAT`, `CLOSURE`, a helper that
-boxed an integer or built a string, a native that returned) it emits the
-interpreter's check, `ldp x9, x10, [metrics]; cmp x9, x10; b.hs gc_exit_K`, where
-`gc_exit_K` is a `Gc(pc)` exit with an `After` snapshot. Natives returning through
-a resume point have already had their check in `native_enter`.
+hold anything. The region must only make sure the collector gets its chance, which
+it does once per section, as LuaJIT does (`asm_gc_check` at a trace's head and its
+`LOOP`, `lj_asm.c:1691,2587`): at the header of every loop that allocates (an
+allocating helper, a boxed integer outside i32, a call) and at the region's entry
+when code outside every loop allocates, the interpreter's check
+`ldp x9, x10, [metrics]; cmp x9, x10; b.hs gc_exit_K`, a `Before` exit at the
+header's or the entry's pc that leaves through `Exit::Gc`. Garbage then waits at
+most one iteration or one entry, and no allocating instruction needs a snapshot
+of its own (boxes are inserted after the builder, where none exists). Natives
+returning through a resume point have already had their check in `native_enter`.
 
 The collector may free objects the region holds only pointers to: between
 tail-outs nothing is freed, since no collection runs; across a tail-out every live
@@ -834,8 +848,7 @@ the entry's (a `JIT_LOOP` entry after a deopt and re-entry), both rebased by
   that no closure has captured yet costs one extra store per tail-out.
 - Varargs: `VARARG` with a fixed count and `VARARGGET` read `nv` from header word 0
   and copy from `base - 4 - nv`; `VARARG` with `count = 0` sets `top` through a
-  helper. `VARARGPREP` with `needs_vararg_table` is a helper that allocates, then a
-  GC check.
+  helper. `VARARGPREP` with `needs_vararg_table` is a helper that allocates (5.7).
 - `TBC` deopts (it registers a to-be-closed slot, rare in hot code); `CLOSE` with no
   TBC entries is a helper call to `close_upvalues`, with TBC entries a deopt.
 - `FORPREP` and `TFORPREP` hidden slots are ordinary registers with known types
@@ -856,7 +869,7 @@ Collisions between sites only make a site hot earlier.
 | Site | Handler | Cost |
 |---|---|---|
 | function entry | `FUNC`: `ldrh; sub; strh; cbz` on `rt + HOT + idx * 2`, then dispatch | one extra dispatch per call plus 4; `call_body!` and `enter` are unchanged |
-| numeric loop | `FORLOOP_I`, `FORLOOP_F`, `FORLOOP` on the taken branch | 4 |
+| numeric loop | `FORLOOP_I`, `FORLOOP_F`, `FORLOOP` on the taken branch, before the index is written (so `jit_hot` sees the frame at the instruction) | 4 |
 | other loops | `LOOP` at the header | one extra dispatch per iteration plus 4 |
 
 No compare handler, `JMP` or `TFORLOOP` counts, so the sign tests on backward
@@ -886,6 +899,17 @@ instruction. It:
    is exactly at the entry.
 5. On a compiler failure (an internal limit, never a semantic decline) counts a
    strike, dispatches the original instruction; three strikes blacklist the entry.
+6. Refuses, without a strike, a region in which no path does work in compiled
+   code before it leaves: reaches a back edge, a return (from a function entry),
+   or an exit a recompile could widen (inside a loop, for a loop entry, whose exit
+   and return happen once per run of the loop); a call continues in its resume
+   block. Such a region only adds an entry and an exit to the interpreter's work,
+   and since unwidenable exits never recompile (5.6), nothing would fix it: a loop
+   whose every iteration hits an op the milestone does not compile would pay both
+   on each iteration. A region that has a useful path but whose hot path still
+   always deopts unwidenably is not caught; telling it apart needs a rate
+   (unwidenable exits per entry), which waits until milestone 2 shows which
+   unwidenable exits remain.
 
 ### 6.3 What a region covers
 
@@ -915,14 +939,17 @@ at their own recording sites. A misjudgment the other way, a block whose sites r
 but recorded nothing, cannot happen for recording sites; the never-executed exit
 of 5.6 remains as a safety net.
 
-A generic `FORLOOP` or `TFORCALL` is not a signal: `FORPREP` keeps a generic
-`FORLOOP` when the values do not fit, and `TFORPREP` keeps a generic `TFORCALL` for
-any iterator other than `next` and `ipairs`.
+A generic `TFORCALL` is not a signal: `TFORPREP` keeps a generic `TFORCALL` for any
+iterator other than `next` and `ipairs`. A generic `FORLOOP` is one only with its
+byte: `FORPREP` records `BIGINT` at a `FORLOOP` it makes generic and
+`forloop_slow` on each of its iterations, so a generic `FORLOOP` that it and its
+`FORPREP` recorded nothing at never iterated and compiles to the never-executed
+deopt.
 
 ### 6.4 Exits, recompilation, blacklisting
 
-Each exit has a 32-bit counter in the region's exit table. Every exit records
-what it saw (section 7.1): the kinds of the guarded values and an overflow into
+Each exit has a 32-bit counter in the region's exit table. Every `Before` exit
+records what it saw (5.6, 7.1): the kinds of the guarded values and an overflow into
 the site's feedback byte, the receiver shape for a shape guard (up to four per
 site) into `JitState.shapes_seen`. On the `EXIT_HOT = 10`th taking
 of one widenable exit (5.6) `jit_exit` marks the entry for recompilation by
@@ -943,8 +970,11 @@ ints and floats compiles its float path; one that saw three shapes compiles a
 three-way chain; one that saw more than four goes generic (a helper call). A
 `JIT_LOOP` region whose entry guards fail repeatedly (the loop is entered with
 other types later in the run) is widened the same way: the entry-fail stub tails
-`jit_entry_fail`, a `slow` handler that counts on the region, records the frame's
-types at the entry as feedback, and dispatches the original instruction.
+`jit_entry_fail`, a `slow` handler that records the kinds of every register the
+region's entry guards test into the entry's `seen` (the next compile of the entry
+reads them, 9.1) and the entry instruction's operand kinds into its byte, counts
+on the region toward the same `EXIT_HOT`, and dispatches the original
+instruction.
 
 ### 6.5 Interaction with the adaptive interpreter
 
@@ -954,6 +984,15 @@ re-specialized by the interpreter's own rules, and the builder reads the newer
 form. Retired entries restore the original word: a `FUNC` or `LOOP`, or a
 `FORLOOP` form, which `FORPREP` rewrites again on the loop's next start as it
 would have.
+
+A form lasts only while its site sees the form's kinds. A slow path that sees
+kinds no form covers (strings, tables, metamethod kinds, big integers at a float
+form; floats or other non-small operands at an equality form) drops the form and
+counts a miss, as a change between forms does, so no form outlives the kinds its
+site sees: the builder compiles a form as what it says (7.2, 7.3), and its
+guards exit only on kinds that are new since the last compile. A small overflow
+and a big integer at an integer form keep it: those are the integer form's `I64`
+code (7.2).
 
 ## 7. Feedback and speculation, by opcode
 
@@ -995,7 +1034,7 @@ byte:
 | `DIV_II`, `POW_II` | both small; convert, `fdiv`/`pow` helper; result `F64` |
 | `_FF` | both float (`Guard FLOAT`: unsigned compare against `BOX`); hardware op; `MOD_FF` and `POW_FF` by helper with a canonical-NaN fixup; result `F64` |
 | `_IF`, `_FI` | one small, one float; `scvtf` the small one; result `F64` |
-| `_NN` and locked generic | no speculation: `Val` operands, helper `jit_arith(rt, kind, a, b) -> Value or FAIL`; `FAIL` (a metamethod or an error) deopts `Before`; the helper boxes big integers and is followed by a GC check |
+| `_NN` and locked generic | no speculation: `Val` operands, helper `jit_arith(rt, kind, a, b) -> Value or FAIL`; `FAIL` (a metamethod or an error) deopts `Before`; the helper boxes big integers, which the section's collector check covers (5.7) |
 | generic, in a never-executed block (6.3) | `Deopt(Before)` |
 | generic, byte with integer kinds only | `I64` code (below) |
 | generic, any other nonzero byte | generic code: the handler's inline small/float cases, then `jit_arith` |
@@ -1003,11 +1042,11 @@ byte:
 | `ARITH_MM`, `_MM_R`, `_MMI` | left (or right) operand `Guard TAB`, its shape guarded, the class's metamethod at `mm_at(idx)` loaded from the class and compared against the compile-time constant (a function); a call through 5.4 with `ret_store_a` semantics (one result into `R[a]`). A mismatch deopts |
 | `UNM` | small with overflow check, or float `fneg`; else helper |
 | `BNOT`, `NOT`, `LEN` | small `mvn`; falsy test; table length via `raw_len_hint` helper after a live `__len` test on the class bits (nil result deopts) |
-| `CONCAT` | helper that builds the string from two values (numbers coerced), `FAIL` deopts; GC check after |
-| `FORPREP` | integer prep inline when init and step are small (the limit may be any number: helper `jit_for_limit` computes `last` or skips); `last` outside i32 deopts, as the interpreter then writes generic `FORLOOP` (it writes `FORLOOP_I` only when `last`, step and init all fit, `control.rs:221-224`); float prep inline for floats; other combinations deopt; writes the four hidden slots (`R[a]` last, `R[a+1]` step, `R[a+2]` index, `R[a+3]` the visible copy; a float loop keeps the limit in `R[a]`) as typed SSA values |
+| `CONCAT` | helper that builds the string from two values (numbers coerced), `FAIL` deopts; an allocation for 5.7 |
+| `FORPREP` | the loop's kind is its `FORLOOP`'s form, unless the bytes of the `FORLOOP` and the `FORPREP`, written at their exits, saw floats (a float loop) or big integers (an `I64` loop); one that saw both integer and float loops deopts, since a loop's kind is visible (the index's `math.type`) and no one representation runs both. Integer prep inline when init and step are small; a float limit, known from its type or from the `FORPREP` byte's `FLOAT_LIMIT` (the `OTHER` bit, which no `FORPREP` operand sets otherwise), is floored or ceiled inline as `for_limit` does, clamped with an out-of-range skip and NaN taken as too small; `last` outside i32 deopts, as the interpreter then writes generic `FORLOOP` (it writes `FORLOOP_I` only when `last`, step and init all fit, `control.rs:221-224`); float prep inline for floats; writes the four hidden slots (`R[a]` last, `R[a+1]` step, `R[a+2]` index, `R[a+3]` the visible copy; a float loop keeps the limit in `R[a]`) as typed SSA values |
 | `FORLOOP_I` | `cmp idx, last; b.eq exit_loop; add idx, idx, step` with the step a constant when `FORPREP` saw a constant; no overflow check needed (`FORPREP` chose `last` in range) |
 | `FORLOOP_F` | `fadd; fcmp; b.cond`, direction chosen at compile time when the step is a constant |
-| `FORLOOP` generic with integer kinds (`forloop_slow` writes `BIGINT`) | an `I64` loop: `last`, step and index unboxed once at `FORPREP` or the entry, `cmp; b.eq; add` on x registers, the visible copy boxed only when it escapes |
+| `FORLOOP` generic with integer kinds (`FORPREP` and `forloop_slow` write `BIGINT`; with nothing recorded the loop never iterated, 6.3) | an `I64` loop with the reference's unsigned trip count: `last`, step and index unboxed once at `FORPREP` or the entry, `cmp; b.eq; add` on x registers, the visible copy boxed only when it escapes |
 
 **`I64` code.** Lua integers wrap (`math.maxinteger + 1 == math.mininteger`,
 `(1 << 62) * 4 == 0` in lua 5.5.1), so `add`, `sub`, `mul`, the bitwise ops and
@@ -1018,8 +1057,8 @@ returns the dividend there without trapping. Values enter `I64` by
 `Unbox{I64}` (a small int's `sxtw`, or a boxed int's load from its box, after a
 two-way kind test) and leave by `Box{I64}`, which keeps the interpreter's
 invariant that a value in i32 is always a small int (`value.rs:144-149`): a range
-test, then the small-int `orr`, or the helper `jit_box_i64` and a GC check when
-the value is outside i32. A boxing that allocates happens only where the value
+test, then the small-int `orr`, or the helper `jit_box_i64` when the value is
+outside i32, an allocation for 5.7. A boxing that allocates happens only where the value
 escapes: a store to a table or upvalue, an argument or result, a register live at
 a tail-out or a snapshot. A loop that keeps a big integer in a register allocates
 nothing.
@@ -1042,9 +1081,9 @@ compiled loop boxes none, since `n` never escapes the loop.
 |---|---|
 | `JLT_II` … `JNEQ_II` | both small; `cmp w, w; b.cond` fused |
 | `JLTI_F` … `JNGEI_F` | float register; `fcmp d, #imm-constant` (`fmov` of the 15-bit immediate hoisted); unordered falls to the not-taken side as the handler's `<`/`<=` do |
-| generic register compare (`JLT`, `JNLT`, `JLE`, `JNLE`) | operands typed by inference or use-driven speculation (9.1): `fcmp`, `cmp w` or `I64` `cmp` with `b.cond`; byte with integer kinds only: `I64` `cmp`; otherwise generic inline in the handler's order: both floats, both small, small/float mixes, then helper `jit_cmp` that returns a bool or `FAIL` for strings and metamethods |
-| generic `JLTI` … `JNGEI` | a register typed `I32`: `cmp w, #imm; b.cond`; typed `F64`: as `_F`; otherwise small test, float test, helper |
-| `JEQ`/`JNEQ` generic | in the handler's order (`compare.rs:67-71`): two floats by `fcmp` first, since a NaN has its own bits and must not equal itself; then bit identity; then both small; then helper for boxed ints and `__eq` |
+| generic register compare (`JLT`, `JNLT`, `JLE`, `JNLE`) | operands typed by inference or use-driven speculation (9.1): `fcmp`, `cmp w` or `I64` `cmp` with `b.cond`; one typed operand speculates the other to its kind unless the byte saw it differ; byte with integer kinds only: `I64` `cmp`; otherwise generic inline in the handler's order: both floats, both small, then the helper `jit_lt`/`jit_le` (mixed numbers, big integers, strings), which returns 1, 0 or `FAIL` for a metamethod or an error, and `FAIL` deopts `Before`. An `I64` against an `F64` goes to the helper boxed, since converting the integer is not exact |
+| generic `JLTI` … `JNGEI` | a register typed `I32`: `cmp w, #imm; b.cond`; typed `F64`: as `_F`; otherwise as the register compare, with the immediate a constant |
+| `JEQ`/`JNEQ` generic | in the handler's order (`compare.rs:67-71`): two floats by `fcmp` first, since a NaN has its own bits and must not equal itself; then bit identity; then both small (unequal); then `jit_eq` (boxed integers, mixed numbers), whose `FAIL` lets the interpreter run an `__eq` |
 | `JEQI`, `JNEQI`, `JEQS`, `JNEQS` | inline: small compare, float compare, or bit identity against the interned constant; no metamethod |
 | `JT`, `JF`, `JTSET`, `JFSET` | `sub x, v, x_nil; cmp x, #2; b.lo/hs` with `NIL` hoisted; the `SET` forms assign on one edge (an edge block param, as the old `edge_defs` did) |
 
@@ -1096,14 +1135,14 @@ and emit nothing by themselves.
 |---|---|
 | `GETTABLE` with a key proven `I32` | receiver `Guard TAB`; `ldr n, [t + ASIZE]; cmp idx, n; b.hs slow; ldr arr, [t + ARRAY]; ldr v, [arr, idx, lsl #3]` (key `k` is at index `k`, 4.7); a nil result reads the class bits live and goes to the slow helper `jit_index(rt, t, k) -> Value or FAIL` when `INDEX` is set; other keys: the helper |
 | `SETTABLE` with an `I32` key | bounds check, load old value, nil old value with live `NEWINDEX` bit deopts, barrier, store; else helper `jit_newindex` which returns `FAIL` for a metamethod (deopt) |
-| `NEWTABLE` | helper `Table::from_template`; GC check |
+| `NEWTABLE` | helper `Table::from_template`; an allocation for 5.7 |
 | `SETLIST` | helper; a constant count has the values in home slots (R1 stores them first) |
 | `LEN` | `raw_len_hint` helper when the live class bits lack `LEN`; deopt otherwise |
 | `TFORPREP` | the form it wrote is the feedback: `_NEXT` means `next` over a table from position 0; `_IPAIRS` the array walk |
 | `TFORCALL_NEXT` | the interpreter's walk (`table/mod.rs:1467-1579`): parts in the order array, integer hash, named shape slots, dict strings, misc hash, the position a small int `part << 28 \| index + 1` in `R[a+3]` (`next` walks the same order, so a deopt mid-loop continues correctly); array and named slots inline, the other parts by helper; the position stays in the hidden slot's encoding at every tail-out and snapshot; `TFORCALL_NEXT` itself does the following `TFORLOOP`'s back-jump (`tfor_finish!`, `control.rs:138-140`), so the loop variables are SSA values and the nil test on the first ends the loop |
 | `TFORCALL_IPAIRS` | `i + 1`, bounds check against `asize`, load, nil ends the loop |
 | `TFORCALL` generic | a call (5.4) through `ret_tfor` semantics landing `count` results |
-| `CLOSURE` | helper `jit_closure(rt, thread, base, proto_idx)` that does what `op_closure` does, including open upvalue creation and the `HAS_OPEN` flag; GC check; captured registers are stored before it (5.11) |
+| `CLOSURE` | helper `jit_closure(rt, thread, base, proto_idx)` that does what `op_closure` does, including open upvalue creation and the `HAS_OPEN` flag; an allocation for 5.7; captured registers are stored before it (5.11) |
 
 ### 7.7 Calls
 
@@ -1129,32 +1168,40 @@ whose failure deopts so the interpreter raises), `NOP`, `STOP` (deopt), `JMP`
 A region is one `Func`: a control-flow graph of basic blocks with block parameters
 (no phi instructions), instructions in SSA form, a constant pool outside the IR,
 and snapshots in a side table. Every structure is a flat arena indexed by a
-`u32` newtype; nothing inside an instruction is a `Vec`.
+`u32` newtype, and every list is a run of a pool; nothing inside an instruction
+or a block is a `Vec`.
 
 ```rust
 pub struct Func<'gc> {
-    pub blocks: Vec<BlockData>,        // params: Range<ValIdx>, insts: Range<InstIdx>, preds/succs: Range<EdgeIdx>
-    pub insts:  Vec<InstData>,         // op, args: Range<ValIdx>, results: Range<ValIdx>, snap: Option<SnapIdx>, effects
-    pub vals:   Vec<ValData>,          // ty: Ty, def: ValDef (Inst(i, k) | Param(b, k)), uses: u32
-    pub args:   Vec<Val>,              // the operand pool the ranges index
-    pub edges:  Vec<BlockCall>,        // target: Block, args: Range<ValIdx>
-    pub snaps:  SnapTable,             // section 8.6
-    pub pool:   ConstPool<'gc>,        // values, shapes, prototypes, strings, helpers; the only `'gc` holder
+    pub blocks: Vec<BlockData>,        // params: run of ppool, insts: run of layout, resume/dead/peeled
+    pub insts:  Vec<InstData>,         // op, args: run of vpool, results: Val range, edges: run of edges, snap, tag, block
+    pub vals:   Vec<ValData>,          // ty: Ty, def: ValDef (Inst(i, k) | Param(b, k))
+    pub vpool:  Vec<Val>,              // operands and edge arguments
+    pub ppool:  Vec<Val>,              // block parameters
+    pub layout: Vec<Inst>,             // blocks' instruction lists
+    pub edges:  Vec<BlockCall>,        // target: Block, args: run of vpool
+    pub snaps:  Vec<SnapData>,         // pc, kind, entries: run of snap_pool (8.6)
+    pub snap_pool: Vec<(u8, Val)>,
+    pub pool:   Vec<Value<'gc>>,       // the heap values the code embeds; the only `'gc` holder
     pub entry:  Block,
-    pub meta:   RegionMeta,            // entry kind and pc, max_stack_size, memory-register set, vararg-ness
+    pub meta:   RegionMeta,            // entry pc and kind, max_stack_size
+    cfg:        RefCell<Option<Rc<CfgInfo>>>, // RPO, predecessors, incoming edges, dominators
 }
 ```
 
-`InstData` is 32 bytes: `op: Op` (u16 tag plus a u32 payload for an immediate,
-a register index, a slot location or a pool index), `args: (u32, u16)`,
-`results: (u32, u8)`, `snap: u32` (`NONE` for most), `effects: Effects` (u16),
-`block: Block`. Arguments and results are ranges into `args`, so an instruction
-with any arity costs no allocation. Block parameters are the values in
-`blocks[b].params`; a branch's `BlockCall` carries the argument range for each
-target. Instruction order inside a block is the order of `insts` within its range;
-passes that insert build a new `Func` by a single ordered rewrite rather than
-splicing (a rewrite over flat arenas is a linear copy, which is what the old
-`simplify` already did).
+An instruction's arguments are a run of `vpool` and its results a range of
+values, so an instruction with any arity costs no allocation; a block's
+parameters and instructions and an edge's arguments are runs too. A run that
+grows (a pass inserting an instruction, the builder adding a parameter or an
+edge argument at a join) and does not end its pool moves to the pool's end; a
+copy of the old handle keeps reading the old elements, so a pass may walk a
+block's old list while it inserts. Instruction ids are stable, so nothing is
+renumbered. The control-flow facts every pass wants (RPO, predecessors, the
+incoming edges of each block, dominators) are computed once per CFG and shared,
+and any change to an edge's target or to the set of blocks drops them. The
+first measurement of the pipeline (section 15) found 40% of the passes' time in
+malloc; this storage and the shared facts took the passes on `mandel`'s inner
+loop from 137 µs to 65 µs.
 
 ### 8.2 Types
 
@@ -1200,14 +1247,17 @@ Register file: `Load[r]` (home slot, `Val`), `Store[r](v)`, `EntryLoad[r]` (as
 `Load`, only in the prologue), `Sync[pc]` (publish `top_base`/`top_pc`),
 `SetTop(v)`, `GetTop`.
 
-Boxing and tests: `Unbox{I32|F64|Ptr}(v)`, `Box{I32|F64|B1|Ptr[tag]}(v)`,
-`IsType[set](v) -> B1`, `IsFalsy(v) -> B1`, `Select(c, a, b)`.
+Boxing and tests: `Unbox{I32|I64|F64|Ptr}(v)`, `Box{I32|I64|F64|B1|Ptr[tag]}(v)`,
+`ToF64(v) -> F64` (a small integer or float `Val`; anything else exits),
+`IsType[set](v) -> B1`, `IsFalsy(v) -> B1`, `SameBits(a, b) -> B1` (bit
+identity), `Select(c, a, b)`.
 
 Guards (all carry a snapshot, all deopt `Before` unless noted): `Guard[set](v) ->
 v'`, `GuardShape[pool](t) -> t'`, `GuardConst[pool](v) -> v'` (pointer or bit
 identity), `GuardIndexTable[pool](shape)` (class `__index` identity),
 `GuardCond(b1)`, `GuardNotNil(v) -> v'`, `GuardFits(v)` (`stack_end` room for a
-staged header), `Deopt` (unconditional, `Before`), `GcCheck` (exit `Gc`, `After`).
+staged header), `Deopt` (unconditional, `Before`), `GcCheck` (tag `Gc`, `Before`,
+leaving through `Exit::Gc`, 5.7).
 
 Integer (`I32` in, `I32` out): `IAdd`, `ISub`, `IMul` (overflow deopts; carry a
 snapshot), `IAddNo`, `ISubNo`, `IMulNo` (proven not to overflow, 9.7), `INeg`,
@@ -1218,13 +1268,16 @@ snapshot), `IAddNo`, `ISubNo`, `IMulNo` (proven not to overflow, 9.7), `INeg`,
 Integer (`I64` in, `I64` out, wrapping, no snapshot): `LAdd`, `LSub`, `LMul`,
 `LNeg`, `LAnd`, `LOr`, `LXor`, `LNot`, `LShl`, `LShr` (Lua count semantics),
 `LDivFloor`, `LModFloor` (zero divisor deopts; `mininteger`/`-1` by `csel`),
-`LCmp[cc] -> B1`, `IToL` (`sxtw`), `LToI` (deopts outside i32; used by range
-narrowing and array keys), `LToF -> F64`.
+`LCmp[cc] -> B1`, `LUDiv` (unsigned, for a loop's trip count), `IToL` (`sxtw`),
+`LToI` (deopts outside i32; used by range narrowing and array keys),
+`LToF -> F64`.
 
 Float: `FAdd`, `FSub`, `FMul`, `FDiv`, `FNeg`, `FAbs`, `FSqrt`, `FFloor`, `FCeil`,
 `FFloorDiv` (`fdiv` then `frintm`), `FMod` and `FPow` (helpers, canonical-NaN
 fixup on the result), `FCmp[cc] -> B1` (unordered is false), `FToIExact -> I32`
-(deopts when not an exact i32; used by `floor`/`ceil` intrinsics and array keys).
+(deopts when not an exact i32; used by `floor`/`ceil` intrinsics, array keys and
+float loop limits), `FToL -> I64` (`fcvtzs`, saturating; a float limit of an
+`I64` loop).
 
 Tables (`Ptr` receivers, offsets from the layout module): `TabShape(t) -> Ptr`,
 `TabLoad[loc](t) -> Val`, `TabStore[loc](t, v)`, `TabSpill(t) -> Ptr`,
@@ -1246,9 +1299,11 @@ deopts `Before`).
 Control: `Jump(target, args)`, `Br(c, then, else)` with block-call arguments on
 both edges, `Exit[kind]`.
 
-Generic Lua operations as helpers: `LuaArith[kind]`, `LuaCmp[cc]`, `LuaEq`,
-`LuaConcat`, `LuaLen`, `LuaIndex`, `LuaNewIndex`, `LuaForPrep`, `LuaNext`,
-`LuaVararg`. Each is a `Helper` with a fixed signature.
+Generic Lua operations as helpers: `LuaArith[kind]`, `LuaConcat`, `LuaLen`,
+`LuaIndex`, `LuaNewIndex`, `LuaForPrep`, `LuaNext`, `LuaVararg`. Each is a
+`Helper` with a fixed signature. The compares are `Helper[Lt|Le|Eq](a, b) -> I32`
+(`jit_lt`, `jit_le`, `jit_eq`: 1, 0, or `FAIL` = 2, tested by a `GuardFalse` that
+deopts `Before`, 7.3).
 
 ### 8.4 Effects and alias classes
 
@@ -1300,9 +1355,11 @@ pool and traced from the region.
 A snapshot describes how to rebuild the Lua frame(s) at an exit. It is built by
 the builder at every instruction that may deopt, from the register map and
 liveness at that pc, and pruned to live registers whose slot does not already hold
-their value. Storage is one `Vec<u32>` arena with each snapshot a header word
-followed by entries; identical snapshots are deduplicated by hash while building
-(most guards in one instruction share one). Appendix C has the encoding. Before
+their value. In the IR a snapshot is a pc, a kind and a run of entries in one
+pool; a snapshot equal to the one before it is shared (most guards of one
+instruction share one), and a pass that changes one an instruction may share
+copies it first. The region's are one `u32` arena, with exits whose encodings are
+equal sharing one; Appendix C has the encoding. Before
 lowering, each snapshot's value references are ordinary IR uses (they keep values
 alive and are the allocator's `Any` uses on the guard instruction); after
 allocation they are replaced by locations. A value that is a constant or a
@@ -1330,8 +1387,14 @@ One pass over the bytecode from the entry pc:
    stop being back-edges, the nest would collapse into one loop with no inner
    preheader, and LICM and peeling would lose the inner loop. The copies cost code
    size: `L_n` appears once per enclosing level plus once. Peeling stops at
-   `OSR_PEEL_LIMIT = 400` duplicated IR instructions, past which the outermost
-   remaining levels stay merged.
+   `OSR_PEEL_LIMIT = 150` duplicated bytecode instructions, about 400 IR
+   instructions at the three per bytecode instruction the builder emits: past it
+   the outermost remaining levels stay merged, their back edges entering the
+   instances already made, so they collapse into the entry's loop. The builder
+   counts in bytecode because it fixes the copies (its instance graph) before it
+   emits any IR. An entry at the entry loop's header has run a whole iteration
+   before the loop proper, which peeling (9.3) does not repeat; one at its latch
+   (a `FORLOOP`, a backward `goto`'s `LOOP`) has run only the latch.
 2. **Captured registers**: the set of registers any `CLOSURE` in the function
    captures by reference, from the child prototypes' `upvalue_desc`
    (`ParentLocal(r)` with `by_value == false`), for the whole function. They
@@ -1419,13 +1482,23 @@ guards the value once, where it is defined, instead of once per use.
    value's last use, the anticipability ("down-safety") condition of partial
    redundancy elimination. A guard placed there deopts only executions that a
    per-use guard would deopt later, so it never adds a deopt, only moves one
-   earlier. Its snapshot is `After` the defining instruction.
+   earlier. Its snapshot is `After` the defining instruction, so the
+   interpreter runs again what lies between: when that point is not right after
+   the definition, it is the start of each of the earliest blocks the definition
+   dominates from which the condition holds, with the guard testing the uses that
+   block dominates, and only where no path from the definition to it writes or
+   calls. Uses no guard covers keep their own.
 5. **Entries are the exception.** Parameters and the live registers at a loop
    entry are guarded in the prologue even where that point is not down-safe: a
    failed entry guard costs one interpreted run of the original instruction
-   (`jit_entry_fail`, 6.4), and the prologue needs the types. A loop entry
-   intersects the expectation with the kind of the live frame's value (J7); if
-   they disagree, the register is not speculated.
+   (`jit_entry_fail`, 6.4), and the prologue needs the types. At a loop entry a
+   register's expectation holds only when the kind of the live frame's value (J7)
+   and the kinds failed entries saw fit it, and the register is not speculated
+   otherwise; the expectation is kept rather than narrowed to the frame's one
+   kind, since it may already cover kinds this frame does not show (an `INT` from
+   a site that saw big integers). A register whose uses expect nothing is typed
+   by the frame's kind and the seen ones, which gives generic compares, truth
+   tests and arithmetic on it a type.
 6. **After the guard** the value is refined and unboxed once; inference (9.2)
    carries the type to every use, which deletes their own guards.
 
@@ -1468,7 +1541,13 @@ guards that held in the peeled iteration and whose values are loop-invariant are
 proven by GVN in the loop (9.4). Peeling is what makes the `_II` counter loop and
 the `_FF` accumulator loop guard-free in their steady state. Outer loops are not
 peeled here; the peeling of enclosing iterations at a loop entry (8.7) is a
-different transformation and runs in the builder.
+different transformation and runs in the builder. The one exception is the loop a
+region enters at its header: the builder already put a whole iteration in front
+of it (8.7). A loop entered at its latch is peeled like any other.
+
+Constant folding of integer and float arithmetic (with the interpreter's floor
+division and modulo, and only where the operation would not exit) runs in the
+simplifier, so the peeled iteration's operations on the loop's start values fold.
 
 ### 9.4 Global value numbering with guard elimination
 
@@ -1479,7 +1558,7 @@ it with no intervening write to the class it reads (8.4). Loads (`TabLoad`,
 write to their class as an extra key, which gives load forwarding for free within
 a block and across blocks along the dominator tree.
 
-### 9.5 Loop-invariant code motion
+### 9.5 Loop-invariant code motion (milestone 2)
 
 For each loop, instructions whose arguments are defined outside the loop and
 whose effects read only classes the loop does not write are moved to the
@@ -1520,18 +1599,34 @@ else live across a tail-out is a builder bug, and the verifier rejects it. This
 is what lets GVN and LICM share constants freely and lets the backend keep
 `NIL`, `BOX` and shape literals in registers between calls (10.3).
 
+Milestone 1 has the constant part: the builder reloads every register after a
+resume and GVN's scopes restart at resume blocks, so only constants can be live
+across a call, which happens when GVN merges a constant into one that dominates
+a join a resume path also reaches. Each such constant is re-emitted after the
+`Resume` of every resume block it is live into, and its later uses get the
+definition that reaches them (Braun et al.'s lookup, with block parameters where
+both meet); afterwards the verifier allows nothing live into a resume block. Pool
+loads and slot unboxes come with LICM in milestone 2.
+
 Snapshots are then re-pruned against the final liveness (a value only referenced
 by snapshots and not otherwise used is a "snapshot-only" value, which the
 allocator may place anywhere and which is rematerialized when it is a constant or
-an unbox of an unchanged slot). Critical edges are split by inserting empty blocks
+an unbox of an unchanged slot); this too comes with LICM. Until then snapshots keep
+the builder's bytecode liveness and slot tracking, whose entries already leave out
+slots that hold their value, and a constant entry is encoded in place (Appendix C)
+rather than kept in a register. Critical edges are split by inserting empty blocks
 so that `regalloc2`'s requirement holds and edge-block parameters have a home.
 
 ### 9.9 Block layout
 
-`order.rs` lays out blocks loop-contiguously with the exit stubs at the end; it
-rejects irreducible graphs, which Lua's `goto` can produce; such a region fails
-compilation with an internal limit and is counted as a strike (6.2), never
-mis-compiled.
+`backend/order.rs` (the old JIT's, ported) lays out blocks loop-contiguously: each
+loop collapses to its header, the collapsed graph is laid out in reverse
+postorder, and each loop's own layout is spliced in where its header landed.
+Blocks that end in a deopt run at most once per entry and go after the rest, so
+loop bodies fall through; the exit stubs follow in the cold section (10.6).
+Irreducible graphs, which Lua's `goto` can produce, are rejected before, by the
+bytecode CFG (`cfg.rs`): such a region fails compilation with an internal limit
+and is counted as a strike (6.2), never mis-compiled.
 
 ## 10. The aarch64 backend
 
@@ -1715,7 +1810,12 @@ it never needed more.
 - **Encoder.** `b`/`bl` check the ±128 MiB range at emission and fail the compile
   (a strike) rather than emit a wrong branch.
 
-Each segment starts with one copy of `exit_common`; regions follow. A region's
+`exit_common` is a naked function in tcvm's own text (`backend/aarch64/abi.rs`),
+its offsets `const` operands and `jit_exit` a `sym` operand, so segments hold only
+regions (after their header and bitmap units) and need no per-segment code. A
+segment copy existed in the old JIT, whose segments could land anywhere; with the
+window above every segment reaches the text directly, while two segments at its
+ends need not reach each other, so one generated copy would not do. A region's
 layout is: prologue, body blocks in loop-contiguous order, resume blocks (each a
 32-byte-aligned continuation, entered only by a callee's return), the cold
 section (exit stubs, the
@@ -1737,8 +1837,11 @@ exit_common:   ldr  x17, [x23, #EXIT_REGS]  ; State.jit.exit_regs, 64 + 64 words
                and  x9, x16, #0xFFFF_FFFF_FFFF              ; the Region
                ldr  w10, [x9, #NUM_SPILLS]                  ; this region's spill count
                (copy w10 words from [x29, #16] to [x17, #512])   ; words 64-127
-               mov  sp, x29                 ; pop the region frame whatever its size
-               ldp  x29, x30, [sp], #16
+               ldr  w10, [x9, #FRAME_SIZE]  ; pop the region frame, whatever its size
+               ldp  x13, x30, [x29]
+               add  x11, x29, x10
+               mov  sp, x11
+               mov  x29, x13
                mov  x20, x16                ; insn = region | K << 48
                b    jit_exit                ; base, rt, closure, thread are the pinned registers
 ```
@@ -1753,13 +1856,15 @@ region.
 walks the snapshot against the register image and the spill copy, writes the
 home slots, counts, updates feedback, publishes the frame and dispatches the
 resume instruction (5.6). The entry-fail stub of the prologue needs no image: it
-pops the frame and tails `jit_entry_fail` with the region in `insn` (6.4).
+pops the frame (its size is known when the stub is emitted), loads the region
+into `insn` and tails `jit_entry_fail` (6.4).
 
-GC exits are exits with an `After` snapshot whose handler returns `Exit::Gc` after
-writing the slots; the executor returns `Pending`, the collection runs as
-`Lua::enter` exits (4.6), and the next step resumes at the published pc, the
-instruction after the allocating one, in the interpreter. The next loop entry or
-call re-enters compiled code (J9).
+GC exits are the collector checks' exits (5.7), with a `Before` snapshot of the
+loop header or the entry, whose handler returns `Exit::Gc` after writing the
+slots; the executor returns `Pending`, the collection runs as `Lua::enter` exits
+(4.6), and the next step resumes at the published pc in the interpreter, which
+dispatches the word there: a loop entry's or function entry's own JIT word
+re-enters the region.
 
 ### 10.7 Encoder extensions
 
@@ -1811,6 +1916,9 @@ pub struct Entry {
     region: Option<Gc<Region>>,
     recompiles: u8,
     state: EntryState,       // Empty | Compiled | Recompile | Blacklisted
+    nest: Box<[u32]>,        // a loop entry's loop headers, innermost first (eviction, 5.2)
+    seen: Vec<(u8, TypeSet)>,// kinds failed entry guards saw, by register (9.1)
+    age: u32,
 }
 ```
 
@@ -1821,11 +1929,17 @@ pub struct Region<'gc> {
     code: CodeBlock,                         // the segment allocation; freed on drop
     entry: *const u8,
     pool: ConstPool<'gc>,                    // traced: the only GC references compiled code embeds
-    exits: Box<[ExitInfo]>,                  // snapshot offset, resume pc, kind, site pc, guard kind, counter
-    snaps: Box<[u32]>,                       // Appendix C
+    exits: Box<[ExitInfo]>,                  // snapshot offset, tag, counter
+    snaps: Box<[u32]>,                       // Appendix C; the snapshot holds the resume pc and kind
+    consts: Box<[u64]>,                      // raw words of snapshot constants
+    entry_regs: Box<[u8]>,                   // the registers the entry guards test (6.4)
+    entry_fails: Cell<u32>,
     calls: Box<[CallSite]>,                  // per call site: a, wanted, kind (for direct-call patching later)
     proto: Gc<'gc, Prototype<'gc>>,
     entry_pc: u32,
+    nest: Box<[u32]>,                        // the entry's loop headers (5.2)
+    frame_size: u32,                         // the native frame exit_common pops (10.6)
+    num_spills: u32,
     retired: Cell<bool>,
 }
 ```
@@ -1917,7 +2031,7 @@ refinement is guarded by a pointer compare, hoisted when loop-invariant.
 | `select('#', ...)`, `select(n, ...)` | from `nv` | |
 | `pairs(t)` | `(next, t, nil)` as `ff_pairs` when the class lacks `PAIRS`; feeds `TFORPREP`, whose `_NEXT` form the region then compiles | `__pairs` present |
 | `ipairs(v)` | `(ipairs_iter, v, 0)` | |
-| `setmetatable(t, mt)` | helper `set_metatable_fast`; `Some(true)` is followed by a GC check | the helper returns `None` |
+| `setmetatable(t, mt)` | helper `set_metatable_fast`, an allocation for 5.7 | the helper returns `None` |
 | `getmetatable(t)` | class owner lookup helper | `__metatable` field present |
 | `assert(v, ...)` | truthiness test; the arguments are the results | falsy |
 | `string.sub`, `string.byte`, `string.len`, `#s` | helpers (allocation for `sub`), `I32` positions | non-small positions |
@@ -1964,6 +2078,11 @@ Environment variables, read once at `Lua` creation:
 | `TCVM_JIT_CHECK=1` | verifier after every pass, `regalloc2` checker, snapshot replay check |
 | `TCVM_JIT_FASTALLOC=1` | the single-pass allocator |
 | `TCVM_JIT_ONLY=proto-name` | compile only prototypes whose source name matches |
+| `TCVM_JIT_TIME=1` | one line per compile with its IR size and each stage's time |
+
+`Lua::set_jit(bool)` turns compiling on or off for one state, as LuaJIT's
+`jit.on`/`jit.off` do; installed regions stay. Tests whose premise is
+interpreted execution (counting the collector's runs in boxed arithmetic) use it.
 
 Tests:
 
@@ -1996,9 +2115,11 @@ pass for its coverage and its measurements are recorded.
    measured with the JIT off. Then the entry table, counters, `jit_hot`,
    `jit_recompile`, `jit_entry_fail`, `JitState`/`Region`, the builder with
    constants, moves, `_II`/`_FF`/`_IF`/`_FI` arithmetic, `I64` arithmetic and
-   loops with `jit_box_i64` and its GC-check exit, immediates, compares,
-   `JT/JF`, `FORPREP`/`FORLOOP_I/F`, `JMP`, `RETURN0/1`, type inference,
-   peeling, GVN, the aarch64 backend with `regalloc2`, exits with snapshots,
+   loops with `jit_box_i64` and the collector checks of 5.7, immediates,
+   compares with the generic compare helpers (7.3), `JT/JF`,
+   `FORPREP`/`FORLOOP_I/F`, `JMP`, `RETURN0/1`, type inference, peeling, GVN,
+   the constant part of the call-boundary pass (9.8), block layout (9.9), the
+   aarch64 backend with `regalloc2`, exits with snapshots,
    `jit_exit`, the never-executed block rule (6.3), use-driven speculation (9.1),
    and the `Call` instruction with resume points for unknown callees
    (so a region can call out). Everything else is `Deopt`. Exit: `primes2`,
@@ -2007,11 +2128,12 @@ pass for its coverage and its measurements are recorded.
    `n` in an x register, 7.2); compile time per stage
    measured on them; the interpreter changes measured with the JIT off against
    main (6.1, 4.8).
-2. **Helpers and allocation.** Generic arithmetic and compare helpers, `_NN` and
-   locked sites, `CONCAT`, `NEWTABLE`, `SETLIST`, `CLOSURE`, GC exits, barriers,
-   `VARARG` forms, `CLOSE`, upvalue reads and writes, intrinsics for `math.*` and
-   `type`. Exit: `fft`, `nbody` compiled end to end; `TCVM_JIT_DEOPT_ALL` passes on
-   all test files.
+2. **Helpers and allocation.** Generic arithmetic helpers, `_NN` and locked
+   sites, `CONCAT`, `NEWTABLE`, `SETLIST`, `CLOSURE`, barriers, `VARARG` forms,
+   `CLOSE`, upvalue reads and writes, intrinsics for `math.*` and `type`; LICM
+   (9.5) with the rest of the call-boundary pass and snapshot re-pruning (9.8),
+   which LICM needs in loops that call. Exit: `fft`, `nbody` compiled end to end;
+   `TCVM_JIT_DEOPT_ALL` passes on all test files.
 3. **Tables and metamethods.** Field forms with ICs, `GETTABLE`/`SETTABLE` array
    paths, `_PROTO` chains, `ARITH_MM*`, metamethod calls, `TFORCALL_NEXT/_IPAIRS`,
    `LEN`, `MULTRET` forms, `TAILCALL` fast arm, hot-exit recompilation with
@@ -2030,6 +2152,17 @@ the M4 Pro: builder 10 µs, passes 15 µs, lowering 10 µs, allocation 25 µs
 (`Ion`), emission 5 µs; total under 70 µs. The old pipeline did 76 µs for `mix`
 with a weaker output. The allocation figure is a target, not a citation: the
 first milestone 1 measurement replaces it.
+
+Measured in milestone 1 (warm: each region compiled 2000 times in one process;
+a single cold compile, which `TCVM_JIT_TIME` shows, costs two to five times as
+much, and a process's first compile also maps the code segment). `mandel_bench`'s
+inner loop, 233 IR instructions after the passes: builder 9.1 µs, passes 65.7 µs,
+lowering 16.1 µs, allocation 31.6 µs, emission 3.3 µs, 126 µs in all; the regions
+of 35 to 100 instructions take 25 to 60 µs. Only the passes are far over their
+budget. The first measurement had them at 137 µs for 188 instructions, 40% of it
+in malloc, which the storage of 8.1 removed; what remains is the fixpoints of
+inference (all instructions up to 50 rounds), the per-parameter scans of
+narrowing, list moves on insertion, and the speculation pass's dataflow.
 
 ## 16. Risks and open questions
 
@@ -2103,26 +2236,33 @@ flags; the only address comparisons against word 1 are with `ret_pcall` and
 
 ## Appendix C: snapshot encoding
 
-One `u32` arena per region. A snapshot:
+One `u32` arena per region (`region.rs`); an exit records its tag, its counter
+and its snapshot's offset, and exits whose encoded snapshots are equal share one.
+A snapshot:
 
 ```
-header:   kind:2 (Before|After|Gc)  frames:2  entries:12  (16 spare)
+header:   kind:1 (Before|After)  frames:2  entries:12  (17 spare)
           pc:32                                                          (pc of the innermost frame)
 frame k (outer frames only, for inlined calls; three words each):
           proto_pool:32                                                  (the inlined callee's closure)
-          call_a:8  wanted:8  base_delta:16                              (callee base = outer base + delta)
+          call_a:8  wanted:8  base_delta:16                              (callee base = enclosing frame's base + delta; `wanted` is the CALL's `c`)
           caller_pc:32                                                   (the inlined CALL's pc)
-entry:    reg:8  rep:3 (Val|I32|F64|B1|Ptr+tag)  loc:3  index:18
-          loc: Reg (register image index) | Spill (spill word index) | Const (pool index)
-             | SlotUnbox (the slot already holds the boxed value: no write)
+entry:    reg:8  rep:3 (Val|I32|I64|F64|B1)  loc:3  index:18
+          loc: Reg (register image index) | Spill (spill word index) | Const (constant-word index)
              | Nil | False | True
 ```
 
 Entries list only registers that are live at the resume pc and whose home slot
-does not hold their current value. `jit_exit` writes innermost-frame entries
-relative to the innermost base and, for inlined frames, writes each inlined
-callee's header (`func` from the pool, `ret = rt.ret(wanted)`, `caller`, `pc`)
-before its entries, outermost first.
+does not hold their current value (the builder never makes an entry for a slot
+that already holds its value, so there is no location for one). A `Const` entry
+indexes the region's raw constant words, deduplicated; nil and the booleans need
+none. Every entry's `reg` counts from the region's own base, inlined frames'
+registers at their frame's `base_delta` plus their own index, so an inlining
+decision (section 13) keeps a nest's frames within 256 registers. `jit_exit`
+writes each inlined callee's header (`func` from the pool, `ret =
+rt.ret(wanted)`, `caller`, `pc`) outermost first, then the entries, and resumes
+the innermost frame. Milestone 1 emits no frames; the decoder handles them, and a
+unit test round-trips a snapshot with two.
 
 ## Appendix D: opcode coverage matrix
 
@@ -2137,7 +2277,7 @@ named milestone, `H` a helper, `I` inline code.
 | `SETUPVAL` | D | H | | barrier helper |
 | `GETTABUP*`, `GETFIELD*`, `SELF*`, `SETTABUP*`, `SETFIELD*` (27 opcodes: 5 generic, 20 forms, 2 `_REF`) | D | D | I | 7.4; `_REF` receivers via the cell |
 | `GETTABLE`, `SETTABLE` | D | D | I/H | array fast path inline, else helper |
-| `NEWTABLE`, `SETLIST` | D | H | | GC check after `NEWTABLE` |
+| `NEWTABLE`, `SETLIST` | D | H | | `NEWTABLE` allocates (5.7) |
 | `ADD`..`SHR` generic (12), `_NN` (7) | D / I | H | | never-executed blocks (6.3) stay D; an integer-kinds byte gives `I64` code from M1 |
 | `_II`, `_FF`, `_IF`, `_FI`, bitwise `_II`, `POW_II` (27) | I | | | 7.2 |
 | `ADDI`..`RSHRI` generic (19) | D / I | H | | as the register forms |
@@ -2147,13 +2287,13 @@ named milestone, `H` a helper, `I` inline code.
 | `LEN`, `CONCAT` | D | H | | |
 | `CLOSE`, `TBC` | D | H / D | | TBC stays D |
 | `JMP` | I | | | |
-| `JEQ`..`JNLE` generic, `JEQI`..`JNGEI`, `JEQS`, `JNEQS` | I/D | H | | inline numeric cases; strings and `__eq`/`__lt` via H |
+| `JEQ`..`JNLE` generic, `JEQI`..`JNGEI`, `JEQS`, `JNEQS` | I + H | | | inline numeric cases, then `jit_lt`/`jit_le`/`jit_eq` (strings, big integers, mixed numbers); `__eq`/`__lt`/`__le` deopt until M3 |
 | `_II` compares (6), `_F` compares (8) | I | | | |
 | `JT`, `JF`, `JTSET`, `JFSET` | I | | | |
 | `CALL`, `CALL_R0`, `CALL_R1`, `CALLS*` | I (5.4) | | direct calls M4 | `b == 0` D until M3 |
 | `TAILCALL` | D | | I fast arm | |
 | `RETURN`, `RETURN0`, `RETURN1` | I | | | `b == 0` and flags set: D until M3 |
-| `FORPREP`, `FORLOOP_I`, `FORLOOP_F`, generic `FORLOOP` | I | | | generic `FORLOOP` as an `I64` loop |
+| `FORPREP`, `FORLOOP_I`, `FORLOOP_F`, generic `FORLOOP` | I | | | generic `FORLOOP` as an `I64` loop; one with nothing recorded never iterated (D); loops that ran as both kinds D |
 | `TFORPREP`, `TFORCALL`, `TFORCALL_NEXT`, `TFORCALL_IPAIRS`, `TFORLOOP` | D | | I | generic `TFORCALL` is a call |
 | `CLOSURE` | D | H | | |
 | `VARARG`, `VARARGGET`, `VARARGPREP` | D | I/H | | |
