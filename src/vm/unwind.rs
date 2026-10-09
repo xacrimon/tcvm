@@ -163,11 +163,8 @@ pub(crate) fn unwind<'gc>(
             }
             if detached {
                 t.set_top_unchecked(bi);
-                let handler = xpcall.then(|| {
-                    let nv = unsafe { frame::extras(base) };
-                    t.stack[bi - HDR - nv - 1].get_function()
-                });
-                return push_close(ctx, t, err, handler.flatten());
+                let handler = xpcall.then(|| unsafe { xpcall_handler(base) }).flatten();
+                return push_close(ctx, t, err, handler);
             }
             let cpc = unsafe { frame::caller_pc(base) };
             pop_frame(ctx, t, base, bi, native, &mut detached);
@@ -282,17 +279,9 @@ fn message_handler<'gc>(ts: &ThreadState<'gc>) -> Option<Function<'gc>> {
     frame::frames(ts)
         .find_map(|f| {
             let rw = f.ret;
-            let marker = rw & !flag::MASK;
-            if marker == handler_bits(crate::vm::native::ret_xpcall) {
-                // `xpcall`'s handler sits in the slot below the callee's
-                // header and extras.
-                let nv = unsafe { frame::extras(f.base) };
-                let bi = ts.slot_index(f.base);
-                return Some(ts.stack[bi - HDR - nv - 1].get_function());
-            }
-            if marker == handler_bits(crate::vm::native::ret_pcall) {
-                return Some(None);
-            }
+            // A native's own protection first, as in `unwind`: `return
+            // pcall(f)` in an `xpcall`'s callee leaves the inner `pcall`'s
+            // frame returning through `ret_xpcall`.
             if f.is_native() && rw & flag::PROTECTED != 0 {
                 return Some(if rw & flag::HANDLER != 0 {
                     let bi = ts.slot_index(f.base);
@@ -301,9 +290,31 @@ fn message_handler<'gc>(ts: &ThreadState<'gc>) -> Option<Function<'gc>> {
                     None
                 });
             }
+            let marker = rw & !flag::MASK;
+            if marker == handler_bits(crate::vm::native::ret_xpcall) {
+                return Some(unsafe { xpcall_handler(f.base) });
+            }
+            if marker == handler_bits(crate::vm::native::ret_pcall) {
+                return Some(None);
+            }
             None
         })
         .flatten()
+}
+
+/// The message handler of the frame at `base`, which `ff_xpcall` called: in
+/// the CALL's first hidden slot.
+///
+/// # Safety
+/// The frame returns through `ret_xpcall`.
+unsafe fn xpcall_handler<'gc>(base: *mut Value<'gc>) -> Option<Function<'gc>> {
+    unsafe {
+        let (caller, cpc) = frame::caller(base);
+        caller
+            .add((*cpc.sub(1)).a() as usize + 1)
+            .read()
+            .get_function()
+    }
 }
 
 /// Push a native frame for `cont` above `live_top`, its window `window`, and

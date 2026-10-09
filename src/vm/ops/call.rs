@@ -515,14 +515,13 @@ handler! {
                 Ok(c) => c,
                 Err(err) => throw!(err),
             };
-            // Past the frame and the results, below the call: where they
-            // end, which the RETURN finds through `top` again.
+            // The call goes past the frame and the results, whose end the
+            // RETURN finds through `top` again.
             let max_stack = unsafe { frame::closure(base) }.max_stack_size as usize;
-            let mark = (vals + n).max(bi + max_stack);
-            let hdr = mark + 1;
+            let hdr = (vals + n).max(bi + max_stack);
             ts.ensure_slots(hdr + HDR + 1);
-            ts.stack[mark] = Value::small((vals + n) as i32);
             base = ts.slot_ptr(bi);
+            unsafe { frame::set_results_end(base, vals + n) };
             let hdr = ts.slot_ptr(hdr);
             unsafe {
                 frame::write_hdr(hdr, tm.to_raw(), handler_bits(crate::vm::ops::meta::ret_return), base, pc);

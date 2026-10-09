@@ -10,7 +10,9 @@
 //! ```
 //!
 //! Header words are not `Value`s: nothing reads them as one, and the tracer
-//! skips words 1 to 3.
+//! skips words 1 to 3. Only VARARG and TAILCALL use a frame's vararg count,
+//! so it is dead once the frame's RETURN runs, and a TAILCALL of a native
+//! drops it.
 
 use crate::dmm::Gc;
 use crate::env::function::{FunctionKind, LuaFn, NativeClosure};
@@ -163,11 +165,18 @@ pub(crate) unsafe fn nv<'gc>(base: *mut Value<'gc>) -> usize {
     unsafe { (func_word(base) >> 48) as usize }
 }
 
-/// How far below `base - 4` the frame's header originally started: a Lua
-/// frame's vararg count, 0 for a native frame (whose word 0 has no `nv`).
+/// Where a returning Lua frame's results end, kept in the `nv` bits while
+/// its `__close` calls run.
 #[inline(always)]
-pub(crate) unsafe fn extras<'gc>(base: *mut Value<'gc>) -> usize {
-    unsafe { if is_native(base) { 0 } else { nv(base) } }
+pub(crate) unsafe fn results_end<'gc>(base: *mut Value<'gc>) -> usize {
+    unsafe { nv(base) }
+}
+
+#[inline(always)]
+pub(crate) unsafe fn set_results_end<'gc>(base: *mut Value<'gc>, end: usize) {
+    const _: () =
+        assert!(crate::env::thread::MAX_STACK + crate::env::thread::NATIVE_SLACK < 1 << 16);
+    unsafe { set_func_word(base, (func_word(base) & PTR_MASK) | (end as u64) << 48) }
 }
 
 /// A Lua frame's word 0.
