@@ -4,7 +4,7 @@
 use crate::env::value::Value;
 use crate::jit::ir::ops::{Cc, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
-use crate::jit::ir::{Func, Inst, Val};
+use crate::jit::ir::{Block, Func, Inst, Val};
 
 fn konst_val(f: &Func<'_>, v: Val) -> Option<Value<'static>> {
     match f.def_op(v) {
@@ -39,22 +39,31 @@ fn konst_b1(f: &Func<'_>, v: Val) -> Option<bool> {
 pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
     let mut map: Vec<Val> = (0..f.vals.len() as u32).map(Val).collect();
     let mut changed = false;
-    let mut remove: Vec<Inst> = Vec::new();
+    let mut removed = vec![false; f.insts.len()];
+    let mut any_removed = false;
+    let mut remove = |i: Inst| {
+        removed[i.idx()] = true;
+        any_removed = true;
+    };
     for b in 0..f.blocks.len() {
         if f.blocks[b].dead {
             continue;
         }
-        let insts = f.blocks[b].insts.clone();
-        for i in insts {
+        let b = Block(b as u32);
+        for k in 0..f.blocks[b.idx()].insts.len() {
+            let i = f.insts_of(b)[k];
             let op = f.op(i);
-            let args: Vec<Val> = f.args(i).to_vec();
+            let mut args = [Val(0); 3];
+            let n = f.args(i).len().min(3);
+            args[..n].copy_from_slice(&f.args(i)[..n]);
+            let args = &args[..n];
             let res = |f: &Func<'_>| f.result(i);
             match op {
                 Op::Guard(set) => {
                     let t = f.ty(args[0]);
                     if t.within(set) && !t.set.is_empty() {
                         map[res(f).idx()] = args[0];
-                        remove.push(i);
+                        remove(i);
                         changed = true;
                     }
                 }
@@ -65,7 +74,7 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                         match f.ty(y).rep {
                             Rep::F64 => {
                                 map[res(f).idx()] = y;
-                                remove.push(i);
+                                remove(i);
                                 changed = true;
                                 continue;
                             }
@@ -151,7 +160,7 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                         changed = true;
                     }
                 }
-                op if fold_arith(f, i, op, &args) => changed = true,
+                op if fold_arith(f, i, op, args) => changed = true,
                 Op::ICmp(cc) | Op::LCmp(cc) => {
                     if let (Some(x), Some(y)) = (konst_int(f, args[0]), konst_int(f, args[1])) {
                         set_b1(f, i, cc.eval_i(x, y));
@@ -196,7 +205,7 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                     if let Some(c) = konst_b1(f, args[0])
                         && c == (op == Op::GuardTrue)
                     {
-                        remove.push(i);
+                        remove(i);
                         changed = true;
                     }
                 }
@@ -209,10 +218,10 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                 Op::Br => {
                     if let Some(c) = konst_b1(f, args[0]) {
                         let keep = if c { 0 } else { 1 };
-                        let e = f.edges(i)[keep].clone();
+                        let e = f.edges(i)[keep];
                         f.insts[i.idx()].op = Op::Jump;
                         f.insts[i.idx()].an = 0;
-                        f.set_edges(i, vec![e]);
+                        f.set_edges(i, &[e]);
                         changed = true;
                     }
                 }
@@ -220,20 +229,17 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
             }
         }
     }
-    if !remove.is_empty() {
+    if any_removed {
         for b in 0..f.blocks.len() {
-            f.blocks[b].insts.retain(|i| !remove.contains(i));
+            f.retain(Block(b as u32), |_, i| !removed[i.idx()]);
         }
     }
     f.apply_replacements(&mut map);
     // An exit boxes what it writes: snapshots take values unboxed.
-    for si in 0..f.snaps.len() {
-        for k in 0..f.snaps[si].entries.len() {
-            let v = f.snaps[si].entries[k].1;
-            if let Some(Op::Box) = f.def_op(v) {
-                let x = f.args(f.def_inst(v).unwrap())[0];
-                f.snaps[si].entries[k].1 = x;
-            }
+    for k in 0..f.snap_pool.len() {
+        let v = f.snap_pool[k].1;
+        if let Some(Op::Box) = f.def_op(v) {
+            f.snap_pool[k].1 = f.args(f.def_inst(v).unwrap())[0];
         }
     }
     if changed {
@@ -312,9 +318,8 @@ fn set_b1(f: &mut Func<'_>, i: Inst, v: bool) {
 
 /// Mark blocks no edge from the entry reaches.
 pub(crate) fn mark_unreachable(f: &mut Func<'_>) {
-    let reach = f.rpo();
     let mut live = vec![false; f.blocks.len()];
-    for b in reach {
+    for &b in &f.cfg().rpo {
         live[b.idx()] = true;
     }
     for (b, l) in live.iter().enumerate() {

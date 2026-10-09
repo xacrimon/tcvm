@@ -2,10 +2,8 @@
 //! front of it, so the loop's header joins only steady-state values and the
 //! copy's guards dominate the loop for GVN.
 
-use std::collections::HashMap;
-
-use crate::jit::build::incoming;
-use crate::jit::ir::{Block, BlockCall, Func, Inst, NO_SNAP, SnapData, Val, ValDef};
+use crate::jit::FastMap as HashMap;
+use crate::jit::ir::{Block, BlockCall, CfgInfo, Func, NO_SNAP, Snap, Val, ValDef};
 use crate::jit::opt::natural_loops;
 
 /// Loops larger than this many instructions are not peeled.
@@ -47,35 +45,37 @@ pub(crate) fn peel(f: &mut Func<'_>) -> bool {
 }
 
 fn peel_loop(f: &mut Func<'_>, h: Block, body: &[Block]) {
-    let rpo = f.rpo();
-    let order: Vec<Block> = rpo.iter().copied().filter(|b| body.contains(b)).collect();
-    let mut bmap: HashMap<Block, Block> = HashMap::new();
+    let order: Vec<Block> = f
+        .cfg()
+        .rpo
+        .iter()
+        .copied()
+        .filter(|b| body.contains(b))
+        .collect();
+    let mut bmap: HashMap<Block, Block> = HashMap::default();
     for &b in &order {
         let nb = f.new_block();
         f.blocks[nb.idx()].resume = f.blocks[b.idx()].resume;
         bmap.insert(b, nb);
     }
-    let mut vmap: HashMap<Val, Val> = HashMap::new();
+    let mut vmap: HashMap<Val, Val> = HashMap::default();
     for &b in &order {
-        for p in f.blocks[b.idx()].params.clone() {
+        for k in 0..f.blocks[b.idx()].params.len() {
+            let p = f.params(b)[k];
             let np = f.add_param(bmap[&b], f.ty(p));
             vmap.insert(p, np);
         }
     }
     let map = |vmap: &HashMap<Val, Val>, v: Val| vmap.get(&v).copied().unwrap_or(v);
+    let mut args: Vec<Val> = Vec::new();
+    let mut edges: Vec<BlockCall> = Vec::new();
     for &b in &order {
-        for i in f.blocks[b.idx()].insts.clone() {
+        for k in 0..f.blocks[b.idx()].insts.len() {
+            let i = f.insts_of(b)[k];
             let d = f.insts[i.idx()];
-            let args: Vec<Val> = f.args(i).iter().map(|&a| map(&vmap, a)).collect();
-            let snap = (d.snap != NO_SNAP).then(|| {
-                let s = &f.snaps[d.snap as usize];
-                let ns = SnapData {
-                    pc: s.pc,
-                    kind: s.kind,
-                    entries: s.entries.iter().map(|&(r, v)| (r, map(&vmap, v))).collect(),
-                };
-                f.add_snap(ns)
-            });
+            args.clear();
+            args.extend(f.args(i).iter().map(|&a| map(&vmap, a)));
+            let snap = (d.snap != NO_SNAP).then(|| f.map_snap(Snap(d.snap), |v| map(&vmap, v)));
             let ni = f.make_inst(d.op, &args, snap, d.tag);
             for (r, nr) in f.results(i).zip(f.results(ni)) {
                 f.vals[nr.idx()].ty = f.vals[r.idx()].ty;
@@ -83,20 +83,23 @@ fn peel_loop(f: &mut Func<'_>, h: Block, body: &[Block]) {
             }
             // The copy's back edges enter the loop; its other edges stay in
             // the copy or leave as the loop's do.
-            let edges: Vec<BlockCall> = f
-                .edges(i)
-                .iter()
-                .map(|e| BlockCall {
-                    target: if e.target == h {
+            edges.clear();
+            for e in 0..f.edges(i).len() {
+                let t = f.edges(i)[e].target;
+                args.clear();
+                args.extend(f.edge_args(i, e).iter().map(|&a| map(&vmap, a)));
+                let a = f.new_vlist(&args);
+                edges.push(BlockCall {
+                    target: if t == h {
                         h
                     } else {
-                        bmap.get(&e.target).copied().unwrap_or(e.target)
+                        bmap.get(&t).copied().unwrap_or(t)
                     },
-                    args: e.args.iter().map(|&a| map(&vmap, a)).collect(),
-                })
-                .collect();
+                    args: a,
+                });
+            }
             if !edges.is_empty() {
-                f.set_edges(ni, edges);
+                f.set_edges(ni, &edges);
             }
             f.append(bmap[&b], ni);
         }
@@ -109,9 +112,9 @@ fn peel_loop(f: &mut Func<'_>, h: Block, body: &[Block]) {
             continue;
         }
         if let Some(t) = f.terminator(b) {
-            for e in f.edges_mut(t) {
-                if e.target == h {
-                    e.target = nh;
+            for k in 0..f.edges(t).len() {
+                if f.edges(t)[k].target == h {
+                    f.set_target(t, k, nh);
                 }
             }
         }
@@ -140,82 +143,55 @@ fn repair_ssa(
         .collect();
     let mut escaping: Vec<Val> = Vec::new();
     for &b in &outside {
-        for &i in &f.blocks[b.idx()].insts {
-            let s = f.insts[i.idx()].snap;
-            let snap_vals = if s != NO_SNAP {
-                {
-                    f.snaps[s as usize]
-                        .entries
-                        .iter()
-                        .map(|e| e.1)
-                        .collect::<Vec<_>>()
-                }
-            } else {
-                Default::default()
-            };
-            for v in f
-                .args(i)
-                .iter()
-                .copied()
-                .chain(f.edges(i).iter().flat_map(|e| e.args.iter().copied()))
-                .chain(snap_vals)
-            {
+        for &i in f.insts_of(b) {
+            f.for_each_use(i, |v| {
                 if defined(f, v) && !escaping.contains(&v) {
                     escaping.push(v);
                 }
-            }
+            });
         }
     }
-    let inc = incoming(f);
+    // The copy's edges into the loop and out of it are new.
+    let cfg = f.cfg();
     for v in escaping {
         let copy = vmap[&v];
-        let mut memo: HashMap<Block, Val> = HashMap::new();
+        let mut memo: HashMap<Block, Val> = HashMap::default();
         let mut reach = Reach {
             v,
             copy,
             body,
             bmap,
-            inc: &inc,
+            cfg: &cfg,
             memo: &mut memo,
         };
         for &b in &outside {
-            let insts = f.blocks[b.idx()].insts.clone();
-            let uses = insts.iter().any(|&i| {
-                let s = f.insts[i.idx()].snap;
-                f.args(i).contains(&v)
-                    || f.edges(i).iter().any(|e| e.args.contains(&v))
-                    || (s != NO_SNAP && f.snaps[s as usize].entries.iter().any(|e| e.1 == v))
-            });
+            let mut uses = false;
+            for &i in f.insts_of(b) {
+                f.for_each_use(i, |x| uses |= x == v);
+            }
             if !uses {
                 continue;
             }
             let r = reach.at(f, b);
-            for &i in &insts {
+            for k in 0..f.blocks[b.idx()].insts.len() {
+                let i = f.insts_of(b)[k];
                 for a in f.args_mut(i) {
                     if *a == v {
                         *a = r;
                     }
                 }
-                for e in f.edges_mut(i) {
-                    for a in &mut e.args {
+                for e in 0..f.edges(i).len() {
+                    for a in f.edge_args_mut(i, e) {
                         if *a == v {
                             *a = r;
                         }
                     }
                 }
                 let s = f.insts[i.idx()].snap;
-                if s != NO_SNAP {
-                    // A shared snapshot is copied before it is changed.
-                    if f.snaps[s as usize].entries.iter().any(|e| e.1 == v) {
-                        let mut ns = f.snaps[s as usize].clone();
-                        for e in &mut ns.entries {
-                            if e.1 == v {
-                                e.1 = r;
-                            }
-                        }
-                        f.snaps.push(ns);
-                        f.insts[i.idx()].snap = f.snaps.len() as u32 - 1;
-                    }
+                // A shared snapshot is copied before it is changed.
+                if s != NO_SNAP && f.entries(s).iter().any(|e| e.1 == v) {
+                    let ns = f.map_snap(Snap(s), |x| if x == v { r } else { x });
+                    f.insts[i.idx()].snap = ns.0;
                 }
             }
         }
@@ -229,7 +205,7 @@ struct Reach<'a> {
     copy: Val,
     body: &'a [Block],
     bmap: &'a HashMap<Block, Block>,
-    inc: &'a [Vec<(Inst, usize)>],
+    cfg: &'a CfgInfo,
     memo: &'a mut HashMap<Block, Val>,
 }
 
@@ -246,7 +222,7 @@ impl Reach<'_> {
         if let Some(&r) = self.memo.get(&b) {
             return r;
         }
-        let inc = &self.inc[b.idx()];
+        let inc = self.cfg.incoming(b);
         if inc.is_empty() {
             return self.v;
         }
@@ -261,7 +237,7 @@ impl Reach<'_> {
         for &(t, k) in inc {
             let pred = f.insts[t.idx()].block;
             let a = self.at(f, pred);
-            f.edges_mut(t)[k].args.push(a);
+            f.push_edge_arg(t, k as usize, a);
         }
         p
     }

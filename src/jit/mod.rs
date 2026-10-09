@@ -30,6 +30,9 @@ use crate::vm::frame;
 
 const PTR_MASK: u64 = (1 << 48) - 1;
 
+/// A hash map with a fast, unkeyed hasher, for compile-time tables.
+pub(crate) type FastMap<K, V> = std::collections::HashMap<K, V, foldhash::fast::FixedState>;
+
 handler! {
     bind(insn, pc, base, rt, closure, thread, nret, values);
 

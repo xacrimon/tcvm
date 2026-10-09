@@ -647,7 +647,7 @@ impl Em<'_> {
                 self.a.bl_far(target);
             }
             Jump => {
-                let t = self.v.blocks[block].succs[0].index();
+                let t = self.v.succs(block)[0].index();
                 if Some(self.labels[t]) != next {
                     self.a.b(self.labels[t]);
                 }
@@ -655,8 +655,8 @@ impl Em<'_> {
             Br { test, cond } => {
                 let c = self.test(i, 0, test, cond);
                 let (t, f) = (
-                    self.v.blocks[block].succs[0].index(),
-                    self.v.blocks[block].succs[1].index(),
+                    self.v.succs(block)[0].index(),
+                    self.v.succs(block)[1].index(),
                 );
                 if Some(self.labels[t]) == next {
                     self.a.b_cond(c.invert(), self.labels[f]);
@@ -668,7 +668,7 @@ impl Em<'_> {
                 }
             }
             Call { a, nargs, pc_after } => {
-                let resume = self.labels[self.v.blocks[block].succs[0].index()];
+                let resume = self.labels[self.v.succs(block)[0].index()];
                 let hdr = a as i32 * 8;
                 self.a.adr(X16, resume);
                 self.a.str(X16, BASE, hdr + 8);
