@@ -175,7 +175,7 @@ fast_entry! {
 
 fast_entry! {
     /// `setmetatable(t, mt)` on a table with no metatable yet: nothing to
-    /// protect, so it cannot fail.
+    /// protect, so it cannot fail. The moves the shapes remember are stores.
     ff_setmetatable => |call, a, nargs, c, _base, rt| {
         if nargs != 2 {
             miss!()
@@ -186,6 +186,17 @@ fast_entry! {
         let Some(mt) = reg![a + 5].get_table() else {
             miss!()
         };
+        match t.set_metatable_fast(rt.mutation(), mt, rt.symbols()) {
+            Some(false) => {
+                reg![a] = Value::table(t);
+                land1!()
+            }
+            Some(true) => {
+                reg![a] = Value::table(t);
+                land1!(gc)
+            }
+            None => {}
+        }
         if t.metatable().is_some() {
             miss!()
         }

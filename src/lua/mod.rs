@@ -22,7 +22,7 @@ use crate::builtin;
 use crate::dmm::Rootable;
 use crate::dmm::arena::{CollectionPhase, MarkedArena};
 use crate::dmm::{Arena, Collect, DynamicRootSet, Gc, GcLock, Lock, Mutation};
-use crate::env::shape::{INLINE_CAPS, Shape};
+use crate::env::shape::{INLINE_CAPS, MtClasses, Shape};
 use crate::env::string::Interner;
 use crate::env::value::ValueKind;
 use crate::env::{Function, Symbols, Table};
@@ -51,6 +51,8 @@ pub struct State<'gc> {
     /// while carrying no metatable. Tables with a metatable use the
     /// per-`MtCache` sentinel via `MtCache::ensure_dict_sentinel`.
     pub(crate) empty_dict_sentinel: Shape<'gc>,
+    /// Metatable classes by content (`Table::ensure_mt_cache`).
+    pub(crate) mt_classes: MtClasses<'gc>,
     /// Globally-interned ambient `LuaString` symbols (metamethod names
     /// and friends). Accessed via `Context::symbols()`.
     pub(crate) symbols: Symbols<'gc>,
@@ -112,7 +114,7 @@ impl Lua {
     pub fn new() -> Self {
         let arena = Arena::<Rootable![State<'_>]>::new(|mc: &Mutation<'_>| {
             let root_shapes = INLINE_CAPS.map(|cap| Shape::root_empty(mc, cap));
-            let empty_dict_sentinel = Shape::dict_sentinel(mc, None);
+            let empty_dict_sentinel = Shape::dict_sentinel(mc, None, false);
             let interner = Interner::new(mc);
             let symbols = Symbols::intern_all(mc, &interner);
             State {
@@ -121,6 +123,7 @@ impl Lua {
                 rt: Runtime::new(mc.metrics()),
                 root_shapes,
                 empty_dict_sentinel,
+                mt_classes: MtClasses::new(mc),
                 symbols,
                 globals: Table::new_with_shape(mc, root_shapes[0]),
                 roots: DynamicRootSet::new(mc),

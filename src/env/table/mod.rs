@@ -14,8 +14,9 @@ use crate::dmm::{
     allocator_api::GcAlloc,
 };
 use crate::env::function::Template;
-use crate::env::shape::{self, MAX_KEYED_PROPERTIES, MAX_PROPERTIES_FAST, Shape, WeakMode};
+use crate::env::shape::{self, MAX_KEYED_PROPERTIES, MAX_PROPERTIES_FAST, MtHome, Shape, WeakMode};
 use crate::env::string::LuaString;
+use crate::env::symbols::Symbols;
 use crate::env::value::{Value, ValueKind, value_hash};
 
 #[derive(Clone, Copy, Collect)]
@@ -55,7 +56,7 @@ impl<'gc> Table<'gc> {
     fn alloc(mc: &Mutation<'gc>, shape: Shape<'gc>, values: &[Value<'gc>], items: usize) -> Self {
         debug_assert_eq!(values.len(), shape.slot_count() as usize);
         // Only `set_metatable` gives a table a metatable, which it then marks.
-        debug_assert!(shape.mt_cache().is_none());
+        debug_assert!(shape.mt_cache().is_none() && shape.as_mt().is_none());
         let cap = shape.inline_cap() as usize;
         let (inline, spilled) = values.split_at(values.len().min(cap));
         let asize = if items == 0 { 0 } else { items + 1 };
@@ -281,18 +282,106 @@ impl<'gc> Table<'gc> {
     }
 
     /// Replace the metatable. Re-shapes the table along the
-    /// `set_metatable` transition edge so subsequent metamethod queries
-    /// observe the new metatable's identity. Subsequent in-place
-    /// mutations of the metatable update its shared `MtCache` in place.
+    /// `set_metatable` transition edge to `mt`'s class; the table keeps `mt`
+    /// itself unless it made the class (see [`shape::ShapeData::mt_slot`]).
     pub fn set_metatable(self, ctx: Context<'gc>, mt: Option<Table<'gc>>) {
-        let new_cache = mt.map(|t| t.ensure_mt_cache(ctx));
+        let class = mt.map(|t| t.ensure_mt_cache(ctx));
         let mut state = self.0.borrow_mut(ctx.mutation());
-        state.shape = shape::transition_set_metatable(
+        let from = state.shape;
+        let poly = from.is_poly() || class.zip(mt).is_some_and(|(c, mt)| !c.owned_by(mt));
+        let shape = shape::transition_set_metatable(
             ctx.mutation(),
-            state.shape,
-            new_cache,
+            from,
+            class,
+            poly,
+            ctx.symbols().mt_key,
             ctx.empty_dict_sentinel(),
         );
+        state.enter_mt_shape(ctx.mutation(), shape, mt);
+        drop(state);
+        if let Some(mt) = mt
+            && from.mt_cache().is_none()
+            && shape.mt_home() != MtHome::Aux
+        {
+            let ms = mt.shape();
+            if ms
+                .as_mt()
+                .zip(class)
+                .is_some_and(|(a, c)| shape::MtCache::ptr_eq(a, c))
+            {
+                ms.set_mt_move(ctx.mutation(), from, shape);
+            }
+        }
+    }
+
+    /// `setmetatable(self, mt)` on a table without a metatable from the
+    /// memos alone (see [`shape::ShapeData::adopt_memo`] and
+    /// [`shape::ShapeData::mt_move`]): `None` where they don't apply, else
+    /// whether it allocated.
+    #[inline(always)]
+    pub(crate) fn set_metatable_fast(
+        self,
+        mc: &Mutation<'gc>,
+        mt: Table<'gc>,
+        symbols: &Symbols<'gc>,
+    ) -> Option<bool> {
+        let mut ms = mt.shape();
+        if ms.as_mt().is_none() {
+            ms = mt.join_by_memo(mc, symbols)?;
+        }
+        let (from, to) = ms.mt_move()?;
+        let class = ms.as_mt()?;
+        if class.is_stale() {
+            return None;
+        }
+        let w = Gc::write_if_clean(mc, self.0)?;
+        let mut state = w.unlock().borrow_mut();
+        if !Shape::ptr_eq(state.shape, from) {
+            return None;
+        }
+        match to.mt_home() {
+            MtHome::Class if class.owned_by(mt) => {
+                state.shape = to;
+                Some(false)
+            }
+            MtHome::Slot(slot) => {
+                let grow = slot == from.slot_count() && !state.has_room(SlotLoc::new(to, slot));
+                if grow {
+                    state.grow_spill(mc);
+                }
+                state.shape = to;
+                state.named_set(slot, Value::table(mt));
+                Some(grow)
+            }
+            _ => None,
+        }
+    }
+
+    /// [`TableState::join_by_memo`] for a metatable that needs no barrier.
+    #[inline(never)]
+    fn join_by_memo(self, mc: &Mutation<'gc>, symbols: &Symbols<'gc>) -> Option<Shape<'gc>> {
+        let w = Gc::write_if_clean(mc, self.0)?;
+        w.unlock().borrow_mut().join_by_memo(symbols)
+    }
+
+    /// This table's metatable class, `None` without a metatable. A stale
+    /// class (see [`shape::MtCache::make_stale`]) moves the table to its
+    /// metatable's current one first, so the table must not be borrowed.
+    #[inline]
+    pub fn meta(self, ctx: Context<'gc>) -> Option<shape::MtCache<'gc>> {
+        let c = self.shape().mt_cache()?;
+        if std::hint::likely(!c.is_stale()) {
+            return Some(c);
+        }
+        self.refresh_meta(ctx)
+    }
+
+    /// Move this table off a stale class, to its metatable's current one.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn refresh_meta(self, ctx: Context<'gc>) -> Option<shape::MtCache<'gc>> {
+        self.set_metatable(ctx, self.metatable());
+        self.shape().mt_cache()
     }
 
     pub fn shape(self) -> Shape<'gc> {
@@ -307,45 +396,66 @@ impl<'gc> Table<'gc> {
         Table(g)
     }
 
-    /// Lazily allocate this table's `MtCache` and return it. The
-    /// cache's identity is invariant across mutations of *this table*;
-    /// metamethod-named and `__mode` writes update the cache in place.
-    /// First adoption computes the initial bits and weak mode.
+    /// This table's class as a metatable, adopting it first: the class of
+    /// its metamethods from `MtClasses`, joined or made. Adopted again once
+    /// that class is stale.
     pub(crate) fn ensure_mt_cache(self, ctx: Context<'gc>) -> shape::MtCache<'gc> {
-        if let Some(c) = self.0.borrow().mt_cache() {
+        if let Some(c) = self.0.borrow().mt_cache()
+            && !c.is_stale()
+        {
             return c;
         }
-        // First adoption: read the metamethods. A metatable made per object
-        // (`setmetatable(o, {__index = C})`) is adopted once per object, so
-        // a shape-mode one is read through its few keys, not by name.
-        let (values, weak) = {
-            let state = self.0.borrow();
-            let shape = state.shape();
-            if shape.is_dict() {
-                let values = ctx
-                    .symbols()
-                    .metamethods()
-                    .map(|(name, _)| state.raw_get(Value::string(name)));
-                let weak = WeakMode::of(state.raw_get(Value::string(ctx.symbols().mode)));
-                (values, weak)
-            } else {
-                let mut values = [Value::nil(); crate::env::symbols::METAMETHOD_COUNT];
-                let mut weak = WeakMode::empty();
-                for (slot, &key) in shape.keys().iter().enumerate() {
-                    let name = key.as_bytes();
-                    if let Some(bit) = shape::metamethod_bit_of_bytes(name) {
-                        values[bit.bits().trailing_zeros() as usize] = state.named_get(slot as u32);
-                    } else if name == b"__mode" {
-                        weak = WeakMode::of(state.named_get(slot as u32));
-                    }
-                }
-                (values, weak)
-            }
-        };
+        self.adopt_mt(ctx)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn adopt_mt(self, ctx: Context<'gc>) -> shape::MtCache<'gc> {
         let mc = ctx.mutation();
-        let cache = shape::MtCache::new(mc, self, values, weak);
-        self.0.borrow_mut(mc).aux_or_new(mc).mt_cache = Some(cache);
-        cache
+        let symbols = ctx.symbols();
+        let mut state = self.0.borrow_mut(mc);
+        let private = state.mt_cache().is_some_and(|c| c.retired_by(state.addr()));
+        if !private && let Some(to) = state.join_by_memo(symbols) {
+            // SAFETY: an adopted shape has a class.
+            return unsafe { to.as_mt().unwrap_unchecked() };
+        }
+        let shape = state.shape();
+        let (values, weak) = if shape.is_dict() {
+            let values = symbols
+                .metamethods()
+                .map(|(name, _)| state.raw_get(Value::string(name)));
+            (
+                values,
+                WeakMode::of(state.raw_get(Value::string(symbols.mode))),
+            )
+        } else {
+            let get = |name| {
+                shape
+                    .find_slot(name)
+                    .map_or(Value::nil(), |s| state.named_get(s))
+            };
+            let mut values = [Value::nil(); crate::env::symbols::METAMETHOD_COUNT];
+            let (named, has_mode) = shape.mirrored();
+            let mut rest = named.bits();
+            while rest != 0 {
+                let i = rest.trailing_zeros();
+                rest &= rest - 1;
+                values[i as usize] = get(symbols.metamethod(i));
+            }
+            let weak = if has_mode {
+                state.mode(symbols)
+            } else {
+                WeakMode::empty()
+            };
+            (values, weak)
+        };
+        let class = ctx.mt_classes().adopt(mc, self, values, weak, private);
+        if shape.is_dict() {
+            state.aux_or_new(mc).mt_cache = Some(class);
+        } else {
+            state.shape = shape::transition_adopt(mc, shape, class);
+        }
+        class
     }
 
     /// One ephemeron pass over the deferred weak tables (see [`TableState::converge`]); returns
@@ -481,6 +591,7 @@ unsafe impl<'gc> Collect<'gc> for TableState<'gc> {
                 cc.trace(&h.misc);
                 cc.trace(&h.strs);
                 cc.trace(&h.mt_cache);
+                cc.trace(&h.metatable);
             }
             return;
         }
@@ -489,6 +600,7 @@ unsafe impl<'gc> Collect<'gc> for TableState<'gc> {
             hash_part::mark(cc, &h.misc);
             hash_part::mark(cc, &h.strs);
             cc.trace(&h.mt_cache);
+            cc.trace(&h.metatable);
         }
         cc.defer();
         let weak_values = mode.contains(WeakMode::VALUES);
@@ -532,8 +644,12 @@ struct Aux<'gc> {
     /// no IC caches. Deletion does not migrate: it must not reorder keys, or
     /// a `pairs` loop that clears entries would skip some.
     strs: hash_part::Part<'gc, LuaString<'gc>, GcAlloc<'gc>>,
-    /// See [`Table::ensure_mt_cache`].
+    /// This table's class as a metatable in dict mode (see
+    /// [`TableState::mt_cache`]).
     mt_cache: Option<shape::MtCache<'gc>>,
+    /// The metatable of a table in a poly dict shape (see
+    /// [`shape::MtHome::Aux`]).
+    metatable: Option<Table<'gc>>,
 }
 
 /// `next` was given a key that is not in the table.
@@ -548,25 +664,106 @@ impl<'gc> TableState<'gc> {
 
     #[inline]
     pub fn metatable(&self) -> Option<Table<'gc>> {
-        // SAFETY: this table is reachable, and the cache comes from its shape.
-        self.shape.mt_cache().map(|c| unsafe { c.table() })
+        let c = self.shape.mt_cache()?;
+        match self.shape.mt_home() {
+            // SAFETY: this table is reachable, and the class comes from its mono shape.
+            MtHome::Class => Some(unsafe { c.owner() }),
+            MtHome::Slot(slot) => self.named_get(slot).get_table(),
+            MtHome::Aux => self.aux().and_then(|a| a.metatable),
+        }
     }
 
-    /// This table's cache as a metatable, made by [`Table::ensure_mt_cache`].
+    /// Move to `shape`, which has this table's keys and `mt`'s class, and
+    /// keep `mt` where `shape` says.
+    fn enter_mt_shape(&mut self, mc: &Mutation<'gc>, shape: Shape<'gc>, mt: Option<Table<'gc>>) {
+        if self.shape.mt_home() == MtHome::Aux
+            && let Some(a) = self.aux_mut()
+        {
+            a.metatable = None;
+        }
+        match shape.mt_home() {
+            MtHome::Class => self.shape = shape,
+            MtHome::Aux => {
+                self.shape = shape;
+                self.aux_or_new(mc).metatable = mt;
+            }
+            MtHome::Slot(slot) => {
+                if slot == self.shape.slot_count() && !self.has_room(SlotLoc::new(shape, slot)) {
+                    self.grow_spill(mc);
+                }
+                self.shape = shape;
+                self.named_set(slot, mt.map_or(Value::nil(), Value::table));
+            }
+        }
+    }
+
+    /// This table's class as a metatable, adopted by
+    /// [`Table::ensure_mt_cache`]: its shape's, or in dict mode its aux
+    /// cell's.
     #[inline]
     pub fn mt_cache(&self) -> Option<shape::MtCache<'gc>> {
-        self.aux().and_then(|a| a.mt_cache)
+        if self.shape.is_dict() {
+            self.aux().and_then(|a| a.mt_cache)
+        } else {
+            self.shape.as_mt()
+        }
     }
 
-    /// If this table has been adopted as a metatable, mirror a string-keyed
-    /// write into the shared `MtCache` (see [`shape::MtCache::mirror`]) so
-    /// downstream shapes observe it without a freshness check.
+    /// The address a class records a member's write by (see
+    /// [`shape::MtCache::retired_by`]).
     #[inline]
-    pub fn maybe_update_mt_bit(&self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>) {
+    fn addr(&self) -> usize {
+        core::ptr::from_ref(self).addr()
+    }
+
+    /// Join the class this table's shape remembers adopting (see
+    /// [`shape::ShapeData::adopt_memo`]) if it has the class's metamethods,
+    /// moving to the adopted shape.
+    fn join_by_memo(&mut self, symbols: &Symbols<'gc>) -> Option<Shape<'gc>> {
+        let to = self.shape.adopt_memo()?;
+        // SAFETY: an adopted shape has a class.
+        let class = unsafe { to.as_mt().unwrap_unchecked() };
+        let shape = self.shape;
+        let get = |name| {
+            shape
+                .find_slot(name)
+                .map_or(Value::nil(), |s| self.named_get(s))
+        };
+        let (named, has_mode) = shape.mirrored();
+        let weak = if has_mode {
+            self.mode(symbols)
+        } else {
+            WeakMode::empty()
+        };
+        if !class.admits(named, |i| get(symbols.metamethod(i)), weak) {
+            return None;
+        }
+        class.join();
+        self.shape = to;
+        Some(to)
+    }
+
+    /// The mode this shape-mode table's `__mode` key makes it as a metatable.
+    #[cold]
+    #[inline(never)]
+    fn mode(&self, symbols: &Symbols<'gc>) -> WeakMode {
+        let v = self
+            .shape
+            .find_slot(symbols.mode)
+            .map_or(Value::nil(), |s| self.named_get(s));
+        WeakMode::of(v)
+    }
+
+    /// If this table has been adopted as a metatable, apply a string-keyed
+    /// write to its class (see [`shape::MtCache::member_write`]) so the
+    /// shapes of the tables it is the metatable of observe it without a
+    /// freshness check.
+    #[inline]
+    pub fn maybe_update_mt_bit(&mut self, mc: &Mutation<'gc>, key: Value<'gc>, value: Value<'gc>) {
         if let Some(s) = key.get_string()
             && let Some(cache) = self.mt_cache()
         {
-            cache.mirror(Some(mc), s, value);
+            cache.member_write(Some(mc), s, value, self.addr());
         }
     }
 
@@ -604,9 +801,10 @@ impl<'gc> TableState<'gc> {
     /// `__mode` changed mid-cycle can only make this drop entries early, which §2.5.4 allows.
     fn clear_dead(&mut self, fc: &Finalization<'gc>) {
         let mt_cache = self.mt_cache();
+        let addr = self.addr();
         let cleared = |key| {
             if let Some(c) = mt_cache {
-                c.mirror(None, key, Value::nil());
+                c.member_write(None, key, Value::nil(), addr);
             }
         };
         let keys = self.shape.keys();
@@ -620,17 +818,18 @@ impl<'gc> TableState<'gc> {
         for v in self.array_mut().iter_mut().filter(|v| v.is_dead(fc)) {
             *v = Value::nil();
         }
-        let Some(h) = self.aux_mut() else { return };
-        h.ints.kill_where(|e| e.value.is_dead(fc));
-        h.strs.kill_where(|e| {
-            let dead = e.value.is_dead(fc);
-            if dead {
-                cleared(e.key);
-            }
-            dead
-        });
-        h.misc
-            .kill_where(|e| e.key.is_dead(fc) || e.value.is_dead(fc));
+        if let Some(h) = self.aux_mut() {
+            h.ints.kill_where(|e| e.value.is_dead(fc));
+            h.strs.kill_where(|e| {
+                let dead = e.value.is_dead(fc);
+                if dead {
+                    cleared(e.key);
+                }
+                dead
+            });
+            h.misc
+                .kill_where(|e| e.key.is_dead(fc) || e.value.is_dead(fc));
+        }
     }
 
     #[inline(always)]
@@ -656,6 +855,7 @@ impl<'gc> TableState<'gc> {
                     misc: hash_part::Part::new_in(GcAlloc::new(mc)),
                     strs: hash_part::Part::new_in(GcAlloc::new(mc)),
                     mt_cache: None,
+                    metatable: None,
                 },
             )
         });
@@ -950,22 +1150,37 @@ impl<'gc> TableState<'gc> {
         debug_assert!(!self.shape.is_dict());
         let mc = ctx.mutation();
         let keys = self.shape.keys();
+        let mt_slot = self.mt_slot();
+        let mt = self.metatable();
+        let as_mt = self.shape.as_mt();
         let mut table = hash_part::Part::with_capacity_in(keys.len(), GcAlloc::new(mc));
         let (inline, spilled) = self.named();
-        for (&k, &v) in keys.iter().zip(inline.iter().chain(spilled)) {
-            if v.is_nil() {
+        for (i, (&k, &v)) in keys.iter().zip(inline.iter().chain(spilled)).enumerate() {
+            if v.is_nil() || i == mt_slot {
                 continue;
             }
             hash_part::insert_unique(&mut table, lua_string_hash(k), k, v);
         }
-        self.aux_or_new(mc).strs = table;
+        let aux = self.aux_or_new(mc);
+        aux.strs = table;
+        aux.mt_cache = as_mt;
         // The inline slots stay in the cell, unread: the dict sentinel has none.
         self.spill = NonNull::dangling();
         self.spill_cap = 0;
-        self.shape = match self.shape.mt_cache() {
-            Some(c) => c.ensure_dict_sentinel(mc),
+        let shape = match self.shape.mt_cache() {
+            Some(c) => c.ensure_dict_sentinel(mc, self.shape.is_poly()),
             None => ctx.empty_dict_sentinel(),
         };
+        self.enter_mt_shape(mc, shape, mt);
+    }
+
+    /// The named slot keeping this table's metatable, else past every slot.
+    #[inline(always)]
+    fn mt_slot(&self) -> usize {
+        match self.shape.mt_home() {
+            MtHome::Slot(slot) => slot as usize,
+            _ => usize::MAX,
+        }
     }
 
     /// `t[offset + i] = items[i - 1]`, as `SETLIST` stores a constructor's
@@ -1226,11 +1441,13 @@ impl<'gc> TableState<'gc> {
                     .map(|(_, e)| (Value::string(e.key), e.value)),
                 false => {
                     let (inline, spilled) = self.named();
+                    let mt_slot = self.mt_slot();
                     self.shape.keys()[from..]
                         .iter()
                         .zip(inline.iter().chain(spilled).skip(from))
-                        .map(|(&k, &v)| (Value::string(k), v))
-                        .find(|(_, v)| !v.is_nil())
+                        .enumerate()
+                        .find(|&(i, (_, v))| !v.is_nil() && from + i != mt_slot)
+                        .map(|(_, (&k, &v))| (Value::string(k), v))
                 }
             };
             if found.is_some() {
@@ -1263,13 +1480,14 @@ impl<'gc> TableState<'gc> {
                 2 => {
                     let keys = self.shape.keys();
                     let (inline, spilled) = self.named();
+                    let mt_slot = self.mt_slot();
                     (from..keys.len()).find_map(|i| {
                         let v = match i.checked_sub(inline.len()) {
                             None => inline.get(i),
                             Some(j) => spilled.get(j),
                         };
                         let (v, k) = (*v?, *keys.get(i)?);
-                        (!v.is_nil()).then(|| (i, Value::string(k), v))
+                        (!v.is_nil() && i != mt_slot).then(|| (i, Value::string(k), v))
                     })
                 }
                 3 => aux
@@ -1315,12 +1533,13 @@ impl<'gc> TableState<'gc> {
                 2 => {
                     let keys = self.shape.keys();
                     let (inline, spilled) = self.named();
+                    let mt_slot = self.mt_slot();
                     (from..keys.len()).find_map(|i| {
                         let v = match i.checked_sub(inline.len()) {
                             None => inline[i],
                             Some(j) => spilled[j],
                         };
-                        (!v.is_nil()).then(|| (i, Value::string(keys[i]), v))
+                        (!v.is_nil() && i != mt_slot).then(|| (i, Value::string(keys[i]), v))
                     })
                 }
                 3 => aux

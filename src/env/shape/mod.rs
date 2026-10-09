@@ -3,11 +3,13 @@
 //!
 //! A `Shape` is an immutable, GC-allocated descriptor identifying the
 //! structural class of a `Table`: the ordered list of string-keyed
-//! properties currently stored on the table, plus the identity of the
+//! properties currently stored on the table, plus the class of the
 //! table's metatable. Two tables with the same shape have the same
 //! storage layout (same string keys live at the same `properties`
-//! slots) and observe the same metamethod-presence bitset (via the
-//! shared `MtCache` pointer).
+//! slots) and observe the same metamethods (via the shared `MtCache`).
+//! Metatables with the same metamethods share one class, so a table keeps
+//! its metatable's identity itself when the class has several (a poly
+//! shape, see [`ShapeData::mt_slot`]).
 //!
 //! Shapes form a transition tree: starting from `EMPTY_SHAPE`,
 //! adding a string key transitions to a child shape; assigning a new
@@ -38,13 +40,13 @@ use crate::env::value::Value;
 #[collect(internal, no_drop)]
 pub struct Shape<'gc>(Gc<'gc, ShapeData<'gc>>);
 
-/// Per-metatable metamethod-presence bitset. Allocated lazily when a
-/// table is first adopted as a metatable; updated eagerly by every
-/// metamethod-named write to the metatable. Multiple shapes (one per
-/// distinct (key-list, metatable) pair) share a single `MtCache`
-/// pointer for the same metatable. Identity (the `Gc` address) is
-/// what `MtEdge` keys transitions on; the inner `bits` field changes
-/// in place across mutations of `__index` / `__newindex` / etc.
+/// A metatable class: the metamethods (and `__mode`) its member metatables
+/// all have. A table adopted as a metatable joins the class with its
+/// metamethods from [`MtClasses`], so `setmetatable(o, {__index = C})` per
+/// object shares one class and one shape per key set. Identity (the `Gc`
+/// address) is what metatable edges key transitions on. A write to a
+/// member's metamethods updates the class in place when it has one member,
+/// and otherwise retires it ([`MtCache::make_stale`]).
 #[derive(Clone, Copy, Collect)]
 #[collect(internal, no_drop)]
 pub struct MtCache<'gc>(Gc<'gc, MtCacheData<'gc>>);
@@ -253,35 +255,43 @@ struct Edge<'gc> {
     child: GcWeak<'gc, ShapeData<'gc>>,
 }
 
-/// What a transition adds: a string key, or a metatable (`None` removes it).
-/// Untraced in an [`Edge`], as a live child keeps it alive through `last_key`
-/// or `mt_cache`; so it may be dead, and is compared and hashed by address.
+/// What a transition adds: a string key, a metatable class (`None`
+/// removes it) and whether the child is poly, or the class tables of the
+/// child are members of as metatables. Untraced in an [`Edge`], as a live
+/// child keeps it alive through `last_key`, `mt_cache` or `as_mt`; so it may
+/// be dead, and is compared and hashed by address.
 #[derive(Clone, Copy)]
 enum EdgeKey<'gc> {
     Prop(LuaString<'gc>),
-    Mt(Option<MtCache<'gc>>),
+    Mt(Option<MtCache<'gc>>, bool),
+    Adopt(MtCache<'gc>),
 }
 
 impl<'gc> EdgeKey<'gc> {
     /// The key of the edge leading to `child`.
     fn of(child: &ShapeData<'gc>) -> Self {
-        match child.last_key {
-            Some(k) => EdgeKey::Prop(k),
-            None => EdgeKey::Mt(child.mt_cache),
+        match (child.last_key, child.as_mt) {
+            (Some(k), _) => EdgeKey::Prop(k),
+            (None, Some(c)) if child.adopt_edge => EdgeKey::Adopt(c),
+            (None, _) => EdgeKey::Mt(child.mt_cache, child.mt_slot != MT_IN_CLASS),
         }
     }
 
     fn addr(self) -> usize {
         match self {
             EdgeKey::Prop(k) => addr(k),
-            EdgeKey::Mt(c) => c.map_or(0, |c| Gc::as_ptr(c.inner()) as usize),
+            // A class is word-aligned, so the low bit is free for poly.
+            EdgeKey::Mt(c, poly) => c.map_or(0, |c| Gc::as_ptr(c.inner()) as usize) | poly as usize,
+            EdgeKey::Adopt(c) => Gc::as_ptr(c.inner()) as usize,
         }
     }
 
     fn same(self, other: Self) -> bool {
         let kinds = matches!(
             (self, other),
-            (EdgeKey::Prop(_), EdgeKey::Prop(_)) | (EdgeKey::Mt(_), EdgeKey::Mt(_))
+            (EdgeKey::Prop(_), EdgeKey::Prop(_))
+                | (EdgeKey::Mt(..), EdgeKey::Mt(..))
+                | (EdgeKey::Adopt(_), EdgeKey::Adopt(_))
         );
         kinds && self.addr() == other.addr()
     }
@@ -369,19 +379,50 @@ pub struct ShapeData<'gc> {
     pub parent: Option<Shape<'gc>>,
 
     /// The string key added at this transition. `None` at the root and
-    /// for shapes reached via a metatable transition (see
-    /// `last_mt_change`).
+    /// for shapes reached via a metatable or adoption transition.
     pub last_key: Option<LuaString<'gc>>,
+
+    /// Whether this shape was reached by [`transition_adopt`].
+    #[collect(require_static)]
+    adopt_edge: bool,
 
     /// Number of string-keyed slots this shape covers. Slot N lives at
     /// `TableState::properties[N]`. Append-only along property
     /// transitions; preserved across metatable transitions.
     pub slot_count: u32,
 
-    /// Metatable identity + live metamethod bits and weak mode. `None` = no
-    /// metatable. Different metatables → different shapes; transitions
-    /// go through `transition_set_metatable`.
+    /// The metatable's class: its metamethods and weak mode. `None` = no
+    /// metatable. Transitions go through `transition_set_metatable`.
     pub mt_cache: Option<MtCache<'gc>>,
+
+    /// Where a table of this shape keeps its metatable: [`MT_IN_CLASS`] for
+    /// the class's owner, [`MT_IN_AUX`] for a dict-mode table's aux cell, else
+    /// the named slot (poly), whose key is `Symbols::mt_key`. A shape stays
+    /// poly along every later transition.
+    #[collect(require_static)]
+    pub mt_slot: u32,
+
+    /// The class tables of this shape are members of as metatables, `None`
+    /// until one is adopted (a dict-mode one keeps it in its aux cell). Kept
+    /// along every later transition, so ICs on a metatable's shape know it
+    /// is one.
+    pub as_mt: Option<MtCache<'gc>>,
+
+    /// The metamethods among this shape's keys, and whether `__mode` is one:
+    /// the keys a metatable's class mirrors.
+    #[collect(require_static)]
+    mirrored: MetamethodBits,
+    #[collect(require_static)]
+    has_mode: bool,
+
+    /// The adopted shape a table of this one moved to last, as a member of
+    /// a shared class, which a table with the same metamethods joins.
+    adopt_memo: Lock<Option<Shape<'gc>>>,
+
+    /// For a metatable of this (adopted) shape: the last move `setmetatable`
+    /// made of a table without a metatable, `(from, to)`, which a table in
+    /// `from` repeats by storing `to` (and the metatable, `to` being poly).
+    mt_move: Lock<Option<(Shape<'gc>, Shape<'gc>)>>,
 
     /// True if this shape represents a table that's gone slow
     /// (dictionary mode). Only one dictionary shape per `mt_cache` —
@@ -402,6 +443,20 @@ pub struct ShapeData<'gc> {
 
     /// This shape's keys are the first `slot_count`, key `i` in slot `i`.
     keys: Gc<'gc, Keys<'gc>>,
+}
+
+/// [`ShapeData::mt_slot`] of a mono shape: the metatable is the class's owner.
+pub const MT_IN_CLASS: u32 = u32::MAX;
+/// [`ShapeData::mt_slot`] of a poly dict sentinel: the metatable is in the
+/// table's aux cell.
+pub const MT_IN_AUX: u32 = u32::MAX - 1;
+
+/// Where a table keeps its metatable (see [`ShapeData::mt_slot`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MtHome {
+    Class,
+    Slot(u32),
+    Aux,
 }
 
 bitflags! {
@@ -430,11 +485,28 @@ impl WeakMode {
 #[derive(Collect)]
 #[collect(internal, no_drop)]
 pub struct MtCacheData<'gc> {
-    /// The metatable this caches, untraced so that a shape held by an IC
-    /// doesn't keep it alive: only tables whose shape carries this cache
-    /// read it, and each of them marks it.
+    /// The metatable that made this class, the metatable of every table in a
+    /// mono shape of it. Untraced so that a shape held by an IC doesn't keep
+    /// it alive: only those tables read it, and each of them marks it. Once
+    /// dead only its address is compared, and a metatable reusing the address
+    /// with these metamethods may as well be the owner.
     #[collect(require_static)]
-    table: NonNull<()>,
+    owner: NonNull<()>,
+    /// Metatables that joined, the owner included; never decremented, so
+    /// more than one means members other than the owner may be alive.
+    #[collect(require_static)]
+    members: Cell<u32>,
+    /// Retired by a member's write (see [`MtCache::make_stale`]).
+    #[collect(require_static)]
+    stale: Cell<bool>,
+    /// The address of the `TableState` of the member whose write retired
+    /// this class, 0 before. Every member was alive at that write, so no
+    /// other member shares the address.
+    #[collect(require_static)]
+    retired_by: Cell<usize>,
+    /// Not in `MtClasses`: no other metatable joins it.
+    #[collect(require_static)]
+    private: bool,
     #[collect(require_static)]
     pub bits: Cell<MetamethodBits>,
     /// Read by the collector when it traces a table with this metatable.
@@ -448,17 +520,18 @@ pub struct MtCacheData<'gc> {
     /// one: a metatable made per object (`{__index = C}`) is adopted per
     /// object, and a cache with all of them inline was five times the size.
     rest: Lock<Option<Gc<'gc, MmValues<'gc>>>>,
-    /// Lazily-allocated dict-mode sentinel for tables that drop into
-    /// dict mode while carrying this metatable. Populated on the first
-    /// call to `MtCache::ensure_dict_sentinel`; subsequent calls return
-    /// the same `Shape` pointer so dict-mode tables sharing a metatable
-    /// also share a shape.
+    /// Lazily-allocated dict-mode sentinels for tables that drop into
+    /// dict mode while carrying this class, mono and poly. Populated on the
+    /// first call to `MtCache::ensure_dict_sentinel`; subsequent calls return
+    /// the same `Shape` pointer so dict-mode tables sharing a class also
+    /// share a shape.
     pub dict_sentinel: Lock<Option<Shape<'gc>>>,
+    pub dict_sentinel_poly: Lock<Option<Shape<'gc>>>,
 }
 
-/// A metamethod in [`MtCacheData`]. Untraced: the metatable holds it, and
-/// is alive whenever a shape carrying the cache is read (see
-/// `MtCacheData::table`).
+/// A metamethod in [`MtCacheData`]. Untraced: every member metatable holds
+/// it, and a shape carrying the class is only read through a table that
+/// keeps its own member alive. A stale class holds nil.
 pub struct MmValue<'gc>(Cell<Value<'gc>>);
 
 unsafe impl<'gc> Collect<'gc> for MmValue<'gc> {
@@ -520,20 +593,41 @@ impl<'gc> MtCacheData<'gc> {
     }
 }
 
+/// The metamethod bits `values` (by bit index) make.
+fn bits_of(values: &[Value<'_>; METAMETHOD_COUNT]) -> MetamethodBits {
+    let mut bits = MetamethodBits::empty();
+    for (i, v) in values.iter().enumerate() {
+        if !v.is_nil() {
+            bits |= MetamethodBits::from_bits_retain(1 << i);
+        }
+    }
+    bits
+}
+
+/// A hash of a class's content, its values by their bits.
+fn content_hash(
+    bits: MetamethodBits,
+    weak: WeakMode,
+    values: &[Value<'_>; METAMETHOD_COUNT],
+) -> u64 {
+    let mut h = addr_hash(bits.bits() as usize ^ (weak.bits() as usize) << 32);
+    for v in values.iter().filter(|v| !v.is_nil()) {
+        h = addr_hash(h as usize ^ v.to_raw() as usize);
+    }
+    h
+}
+
 impl<'gc> MtCache<'gc> {
-    /// The cache of `table`, whose metamethods by bit index are `values`.
+    /// A class of one member, `owner`, whose metamethods by bit index are
+    /// `values`.
     pub fn new(
         mc: &Mutation<'gc>,
-        table: Table<'gc>,
+        owner: Table<'gc>,
         values: [Value<'gc>; METAMETHOD_COUNT],
         weak: WeakMode,
+        private: bool,
     ) -> Self {
-        let mut bits = MetamethodBits::empty();
-        for (i, v) in values.iter().enumerate() {
-            if !v.is_nil() {
-                bits |= MetamethodBits::from_bits_retain(1 << i);
-            }
-        }
+        let bits = bits_of(&values);
         let rest = (bits & !(MetamethodBits::INDEX | MetamethodBits::NEWINDEX))
             .is_empty()
             .not()
@@ -542,33 +636,148 @@ impl<'gc> MtCache<'gc> {
             mc,
             MtCacheData {
                 // SAFETY: a `Gc`'s pointer is never null.
-                table: unsafe { NonNull::new_unchecked(Gc::as_ptr(table.inner()).cast_mut()) }
+                owner: unsafe { NonNull::new_unchecked(Gc::as_ptr(owner.inner()).cast_mut()) }
                     .cast(),
+                members: Cell::new(1),
+                stale: Cell::new(false),
+                retired_by: Cell::new(0),
+                private,
                 bits: Cell::new(bits),
                 weak: Cell::new(weak),
                 index: MmValue(Cell::new(values[INDEX_IDX])),
                 newindex: MmValue(Cell::new(values[NEWINDEX_IDX])),
                 rest: Lock::new(rest),
                 dict_sentinel: Lock::new(None),
+                dict_sentinel_poly: Lock::new(None),
             },
         ))
     }
 
     /// Lazily allocate the dict-mode sentinel shape that all tables
-    /// carrying this metatable share once they migrate to dict mode.
-    /// Hit-side cost is one Gc deref + one option load.
+    /// carrying this class share once they migrate to dict mode, the poly
+    /// one keeping the metatable in the aux cell.
     #[inline]
-    pub fn ensure_dict_sentinel(self, mc: &Mutation<'gc>) -> Shape<'gc> {
-        if let Some(s) = self.0.dict_sentinel.get() {
+    pub fn ensure_dict_sentinel(self, mc: &Mutation<'gc>, poly: bool) -> Shape<'gc> {
+        let slot = match poly {
+            false => &self.0.dict_sentinel,
+            true => &self.0.dict_sentinel_poly,
+        };
+        if let Some(s) = slot.get() {
             return s;
         }
-        let new_shape = Shape::dict_sentinel(mc, Some(self));
+        let new_shape = Shape::dict_sentinel(mc, Some(self), poly);
         // We're adopting a fresh `Shape` Gc through the `Lock<Option<Shape>>`
         // field, so emit the backward barrier on the parent MtCacheData
         // before writing through `as_cell()`.
         mc.backward_barrier(Gc::erase(self.0), None);
-        unsafe { self.0.dict_sentinel.as_cell() }.set(Some(new_shape));
+        unsafe { slot.as_cell() }.set(Some(new_shape));
         new_shape
+    }
+
+    /// Whether `t` made this class (see [`MtCacheData::owner`]).
+    #[inline]
+    pub fn owned_by(self, t: Table<'gc>) -> bool {
+        self.0.owner.as_ptr().cast_const() == Gc::as_ptr(t.inner()).cast()
+    }
+
+    #[inline]
+    pub fn is_stale(self) -> bool {
+        self.0.stale.get()
+    }
+
+    #[inline]
+    pub fn is_private(self) -> bool {
+        self.0.private
+    }
+
+    /// Whether the member whose `TableState` is at `member` retired this
+    /// class (see [`MtCacheData::retired_by`]).
+    #[inline]
+    pub fn retired_by(self, member: usize) -> bool {
+        self.0.retired_by.get() == member
+    }
+
+    /// Count another metatable with this content as a member.
+    pub fn join(self) {
+        self.0.members.set(self.0.members.get().saturating_add(1));
+    }
+
+    /// Retire this class, a member's metamethods having left it: every guard
+    /// reading it fails (all bits, no `__index` or `__newindex`, no others),
+    /// so a table of it reaches a slow path, which moves the table to its
+    /// metatable's current class ([`Table::meta`]). The weak mode stays, as
+    /// changing `__mode` in use is undefined (§2.5.4). `by` is the writer's
+    /// `TableState` address, which gets classes of its own from then on, so
+    /// a metatable that keeps changing can't retire one class after another
+    /// under the tables of the other members.
+    fn make_stale(self, by: usize) {
+        self.0.stale.set(true);
+        self.0.retired_by.set(by);
+        self.0.bits.set(MetamethodBits::all());
+        self.0.index.0.set(Value::nil());
+        self.0.newindex.0.set(Value::nil());
+        // SAFETY: storing `None` adopts nothing.
+        unsafe { self.0.rest.as_cell() }.set(None);
+    }
+
+    /// Apply the write of `key` by the member whose `TableState` is at
+    /// `member` to the class, which the member's metamethods define: in
+    /// place for its only member, else the class is retired. `mc` is `None`
+    /// for a weak clear.
+    pub fn member_write(
+        self,
+        mc: Option<&Mutation<'gc>>,
+        key: LuaString<'gc>,
+        value: Value<'gc>,
+        member: usize,
+    ) {
+        if self.is_stale() {
+            return;
+        }
+        let unchanged = match metamethod_bit_of_bytes(key.as_bytes()) {
+            Some(bit) => self.mm(bit).same_bits(&value),
+            None if key.as_bytes() == b"__mode" => self.weak() == WeakMode::of(value),
+            None => return,
+        };
+        if unchanged {
+            return;
+        }
+        if self.0.members.get() > 1 {
+            self.make_stale(member);
+            return;
+        }
+        self.mirror(mc, key, value);
+    }
+
+    /// Whether a metatable may join this class whose mode is `weak` and
+    /// whose metamethods, absent outside `named`, `value` gives by bit index
+    /// (nil for absent).
+    #[inline(always)]
+    pub fn admits(
+        self,
+        named: MetamethodBits,
+        value: impl Fn(u32) -> Value<'gc>,
+        weak: WeakMode,
+    ) -> bool {
+        if self.is_stale() || self.is_private() || self.weak() != weak {
+            return false;
+        }
+        let mut rest = named.bits();
+        let mut bits = MetamethodBits::empty();
+        while rest != 0 {
+            let i = rest.trailing_zeros();
+            rest &= rest - 1;
+            let v = value(i);
+            if v.is_nil() {
+                continue;
+            }
+            let bit = MetamethodBits::from_bits_retain(1 << i);
+            if !self.mm(bit).same_bits(&v) {
+                return false;
+            }
+            bits |= bit;
+        }
+        bits == self.get()
     }
 
     #[inline]
@@ -629,15 +838,15 @@ impl<'gc> MtCache<'gc> {
         table_addr(self.0.index.0.get())
     }
 
-    /// The metatable this caches.
+    /// The metatable that made this class.
     ///
     /// # Safety
     ///
-    /// Only for a cache read from the shape of a table that is still
-    /// reachable, as that table keeps it alive (see `MtCacheData::table`).
+    /// Only for the class of a reachable table in a mono shape, as that table
+    /// keeps it alive (see `MtCacheData::owner`).
     #[inline]
-    pub unsafe fn table(self) -> Table<'gc> {
-        Table::from_inner(unsafe { Gc::from_ptr(self.0.table.cast().as_ptr()) })
+    pub unsafe fn owner(self) -> Table<'gc> {
+        Table::from_inner(unsafe { Gc::from_ptr(self.0.owner.cast().as_ptr()) })
     }
 
     /// Mirror a write of `key` to this cache's metatable into its bits and
@@ -699,8 +908,15 @@ impl<'gc> Shape<'gc> {
             ShapeData {
                 parent: None,
                 last_key: None,
+                adopt_edge: false,
                 slot_count: 0,
                 mt_cache: None,
+                mt_slot: MT_IN_CLASS,
+                as_mt: None,
+                mirrored: MetamethodBits::empty(),
+                has_mode: false,
+                adopt_memo: Lock::new(None),
+                mt_move: Lock::new(None),
                 is_dict: false,
                 inline_cap,
                 transitions: RefLock::new(TransitionTable::new()),
@@ -710,15 +926,23 @@ impl<'gc> Shape<'gc> {
     }
 
     /// Allocate the dictionary-mode sentinel shape for a given metatable
-    /// cache. Held in `State`'s per-cache registry.
-    pub fn dict_sentinel(mc: &Mutation<'gc>, mt_cache: Option<MtCache<'gc>>) -> Self {
+    /// class, held by the class (or `State`, for none); a poly one keeps
+    /// the metatable in the aux cell.
+    pub fn dict_sentinel(mc: &Mutation<'gc>, mt_cache: Option<MtCache<'gc>>, poly: bool) -> Self {
         Shape(Gc::new(
             mc,
             ShapeData {
                 parent: None,
                 last_key: None,
+                adopt_edge: false,
                 slot_count: 0,
                 mt_cache,
+                mt_slot: if poly { MT_IN_AUX } else { MT_IN_CLASS },
+                as_mt: None,
+                mirrored: MetamethodBits::empty(),
+                has_mode: false,
+                adopt_memo: Lock::new(None),
+                mt_move: Lock::new(None),
                 is_dict: true,
                 inline_cap: 0,
                 transitions: RefLock::new(TransitionTable::new()),
@@ -762,6 +986,68 @@ impl<'gc> Shape<'gc> {
         self.data().mt_cache
     }
 
+    /// Where a table of this shape keeps its metatable.
+    #[inline]
+    pub fn mt_home(self) -> MtHome {
+        match self.data().mt_slot {
+            MT_IN_CLASS => MtHome::Class,
+            MT_IN_AUX => MtHome::Aux,
+            slot => MtHome::Slot(slot),
+        }
+    }
+
+    /// Whether a table of this shape keeps its metatable itself.
+    #[inline]
+    pub fn is_poly(self) -> bool {
+        self.data().mt_slot != MT_IN_CLASS
+    }
+
+    /// See [`ShapeData::as_mt`].
+    #[inline]
+    pub fn as_mt(self) -> Option<MtCache<'gc>> {
+        self.data().as_mt
+    }
+
+    /// The metamethods among this shape's keys, and whether `__mode` is one.
+    #[inline]
+    pub fn mirrored(self) -> (MetamethodBits, bool) {
+        (self.data().mirrored, self.data().has_mode)
+    }
+
+    /// See [`ShapeData::adopt_memo`].
+    #[inline]
+    pub fn adopt_memo(self) -> Option<Shape<'gc>> {
+        self.data().adopt_memo.get()
+    }
+
+    pub fn set_adopt_memo(self, mc: &Mutation<'gc>, to: Shape<'gc>) {
+        let memo = &self.data().adopt_memo;
+        if memo.get().is_some_and(|m| Shape::ptr_eq(m, to)) {
+            return;
+        }
+        // Adopting a `Gc` through the lock, as `MtCache::ensure_dict_sentinel` does.
+        mc.backward_barrier(Gc::erase(self.0), None);
+        unsafe { memo.as_cell() }.set(Some(to));
+    }
+
+    /// See [`ShapeData::mt_move`].
+    #[inline]
+    pub fn mt_move(self) -> Option<(Shape<'gc>, Shape<'gc>)> {
+        self.data().mt_move.get()
+    }
+
+    pub fn set_mt_move(self, mc: &Mutation<'gc>, from: Shape<'gc>, to: Shape<'gc>) {
+        let memo = &self.data().mt_move;
+        if memo
+            .get()
+            .is_some_and(|(f, t)| Shape::ptr_eq(f, from) && Shape::ptr_eq(t, to))
+        {
+            return;
+        }
+        mc.backward_barrier(Gc::erase(self.0), None);
+        unsafe { memo.as_cell() }.set(Some((from, to)));
+    }
+
     /// String keys by slot.
     #[inline]
     pub fn keys(self) -> &'gc [LuaString<'gc>] {
@@ -776,7 +1062,13 @@ impl<'gc> Shape<'gc> {
         if n > LINEAR_LOOKUP {
             return Gc::as_ref(self.data().keys).find(key, n);
         }
-        self.keys().iter().position(|&k| k == key).map(|i| i as u32)
+        // By address, as `Keys::find` does: `Symbols::mt_key` shares its bytes
+        // with an interned string a program can make.
+        let a = addr(key);
+        self.keys()
+            .iter()
+            .position(|&k| addr(k) == a)
+            .map(|i| i as u32)
     }
 
     /// Returns `true` if the metatable behind this shape currently has
@@ -799,6 +1091,26 @@ impl<'gc> Shape<'gc> {
             Some(c) => c.get().intersects(bits),
         }
     }
+}
+
+/// `parent`'s keys with `key` in the next slot: its own array when that
+/// ends at `parent`'s prefix and has room, else a copy.
+fn keys_with<'gc>(
+    mc: &Mutation<'gc>,
+    parent: Shape<'gc>,
+    key: LuaString<'gc>,
+) -> Gc<'gc, Keys<'gc>> {
+    let new_slot = parent.data().slot_count;
+    let mut keys = parent.data().keys;
+    if !keys.try_push(new_slot, key) {
+        keys = Keys::new(
+            mc,
+            parent.keys(),
+            (new_slot as usize + 1).next_power_of_two().max(4),
+        );
+        keys.try_push(new_slot, key);
+    }
+    keys
 }
 
 /// Add a string-keyed property `key` to `parent`, returning the child
@@ -824,26 +1136,102 @@ pub fn transition_add_prop<'gc>(
     }
 
     // Slow path: allocate a child and install/replace the edge.
-    let new_slot = parent.data().slot_count;
-    let mut keys = parent.data().keys;
-    if !keys.try_push(new_slot, key) {
-        keys = Keys::new(
-            mc,
-            parent.keys(),
-            (new_slot as usize + 1).next_power_of_two().max(4),
-        );
-        keys.try_push(new_slot, key);
+    let p = parent.data();
+    let (mut mirrored, mut has_mode) = (p.mirrored, p.has_mode);
+    match metamethod_bit_of_bytes(key.as_bytes()) {
+        Some(bit) => mirrored |= bit,
+        None => has_mode |= key.as_bytes() == b"__mode",
     }
-
     let child_data = Gc::new(
         mc,
         ShapeData {
             parent: Some(parent),
             last_key: Some(key),
-            slot_count: new_slot + 1,
-            mt_cache: parent.data().mt_cache,
+            adopt_edge: false,
+            slot_count: p.slot_count + 1,
+            mt_cache: p.mt_cache,
+            mt_slot: p.mt_slot,
+            as_mt: p.as_mt,
+            mirrored,
+            has_mode,
+            adopt_memo: Lock::new(None),
+            mt_move: Lock::new(None),
             is_dict: false,
-            inline_cap: parent.data().inline_cap,
+            inline_cap: p.inline_cap,
+            transitions: RefLock::new(TransitionTable::new()),
+            keys: keys_with(mc, parent, key),
+        },
+    );
+    let parent_write = Gc::write(mc, parent.0);
+    unlock!(parent_write, ShapeData, transitions)
+        .borrow_mut()
+        .insert(mc, child_data);
+    Shape(child_data)
+}
+
+/// Switch the metatable class on `parent`, returning a shape with the same
+/// ordered key list but `new_mt`. Caches transitions on `parent` so repeated
+/// `setmetatable(t, mt)` calls share shapes. A `poly` child of a mono parent
+/// adds the slot that keeps the metatable, keyed `mt_key`; a poly parent's
+/// children stay poly in the same slot.
+///
+/// For dict-mode parents the call routes to the class's dict sentinel
+/// (`MtCache::ensure_dict_sentinel`) or, when stripping the metatable, to
+/// `State::empty_dict_sentinel` provided by the caller.
+pub fn transition_set_metatable<'gc>(
+    mc: &Mutation<'gc>,
+    parent: Shape<'gc>,
+    new_mt: Option<MtCache<'gc>>,
+    poly: bool,
+    mt_key: LuaString<'gc>,
+    no_mt_dict_sentinel: Shape<'gc>,
+) -> Shape<'gc> {
+    debug_assert!(poly || !parent.is_poly());
+    // Dict-mode parent: never go through the prop-transition tree.
+    // Route to the unique dict sentinel for the new class.
+    if parent.is_dict() {
+        return match new_mt {
+            Some(c) => c.ensure_dict_sentinel(mc, poly),
+            None => no_mt_dict_sentinel,
+        };
+    }
+
+    if let Some(child) = parent
+        .data()
+        .transitions
+        .borrow()
+        .get(mc, EdgeKey::Mt(new_mt, poly))
+    {
+        return child;
+    }
+
+    // Slow path: a sibling with `parent`'s keys and the new class. Future
+    // prop additions on the result mint their own edges normally.
+    let p = parent.data();
+    let (slot_count, mt_slot, keys) = match poly && !parent.is_poly() {
+        true => (
+            p.slot_count + 1,
+            p.slot_count,
+            keys_with(mc, parent, mt_key),
+        ),
+        false => (p.slot_count, p.mt_slot, p.keys),
+    };
+    let child_data = Gc::new(
+        mc,
+        ShapeData {
+            parent: Some(parent),
+            last_key: None,
+            adopt_edge: false,
+            slot_count,
+            mt_cache: new_mt,
+            mt_slot,
+            as_mt: p.as_mt,
+            mirrored: p.mirrored,
+            has_mode: p.has_mode,
+            adopt_memo: Lock::new(None),
+            mt_move: Lock::new(None),
+            is_dict: false,
+            inline_cap: p.inline_cap,
             transitions: RefLock::new(TransitionTable::new()),
             keys,
         },
@@ -855,59 +1243,129 @@ pub fn transition_add_prop<'gc>(
     Shape(child_data)
 }
 
-/// Switch the metatable on `parent`, returning a shape with the same
-/// ordered key list but the new `mt_cache`. Caches transitions on
-/// `parent` so repeated `setmetatable(t, mt)` calls share shapes.
-///
-/// For dict-mode parents the call routes to the per-`mt_cache` dict
-/// sentinel (`MtCache::ensure_dict_sentinel`) or, when stripping the
-/// metatable, to `State::empty_dict_sentinel` provided by the caller.
-pub fn transition_set_metatable<'gc>(
+/// `parent` for tables that are members of `class` as metatables: the same
+/// keys and metatable. A shared class is remembered as `parent`'s
+/// [`ShapeData::adopt_memo`].
+pub fn transition_adopt<'gc>(
     mc: &Mutation<'gc>,
     parent: Shape<'gc>,
-    new_mt: Option<MtCache<'gc>>,
-    no_mt_dict_sentinel: Shape<'gc>,
+    class: MtCache<'gc>,
 ) -> Shape<'gc> {
-    // Dict-mode parent: never go through the prop-transition tree.
-    // Route to the unique dict sentinel for the new metatable.
-    if parent.is_dict() {
-        return match new_mt {
-            Some(c) => c.ensure_dict_sentinel(mc),
-            None => no_mt_dict_sentinel,
-        };
-    }
-
-    if let Some(child) = parent
+    debug_assert!(!parent.is_dict());
+    let edge = parent
         .data()
         .transitions
         .borrow()
-        .get(mc, EdgeKey::Mt(new_mt))
-    {
-        return child;
+        .get(mc, EdgeKey::Adopt(class));
+    let child = match edge {
+        Some(child) => child,
+        None => {
+            let p = parent.data();
+            let child_data = Gc::new(
+                mc,
+                ShapeData {
+                    parent: Some(parent),
+                    last_key: None,
+                    adopt_edge: true,
+                    slot_count: p.slot_count,
+                    mt_cache: p.mt_cache,
+                    mt_slot: p.mt_slot,
+                    as_mt: Some(class),
+                    mirrored: p.mirrored,
+                    has_mode: p.has_mode,
+                    adopt_memo: Lock::new(None),
+                    mt_move: Lock::new(None),
+                    is_dict: false,
+                    inline_cap: p.inline_cap,
+                    transitions: RefLock::new(TransitionTable::new()),
+                    keys: p.keys,
+                },
+            );
+            let parent_write = Gc::write(mc, parent.0);
+            unlock!(parent_write, ShapeData, transitions)
+                .borrow_mut()
+                .insert(mc, child_data);
+            Shape(child_data)
+        }
+    };
+    if !class.is_private() {
+        parent.set_adopt_memo(mc, child);
+    }
+    child
+}
+
+/// The metatable classes of one Lua instance by content, so a table adopted
+/// as a metatable joins the class with its metamethods. Weak, and only a
+/// lookup aid: an entry whose class died, went stale, or changed in place
+/// just stops matching.
+#[derive(Clone, Copy, Collect)]
+#[collect(internal, no_drop)]
+pub struct MtClasses<'gc>(Gc<'gc, RefLock<ClassTable<'gc>>>);
+
+struct ClassTable<'gc>(UnsafeCell<HashTable<ClassEntry<'gc>, MetricsAlloc<'gc>>>);
+
+#[derive(Clone, Copy)]
+struct ClassEntry<'gc> {
+    hash: u64,
+    class: GcWeak<'gc, MtCacheData<'gc>>,
+}
+
+// SAFETY: traces every class weakly and drops the dead ones, as
+// `TransitionTable` does.
+unsafe impl<'gc> Collect<'gc> for ClassTable<'gc> {
+    fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
+        let t = unsafe { &mut *self.0.get() };
+        t.retain(|e| !e.class.is_dropped());
+        for e in t.iter() {
+            cc.trace(&e.class);
+        }
+    }
+}
+
+impl<'gc> MtClasses<'gc> {
+    pub fn new(mc: &Mutation<'gc>) -> Self {
+        let t = HashTable::new_in(MetricsAlloc::new(mc));
+        MtClasses(Gc::new(mc, RefLock::new(ClassTable(UnsafeCell::new(t)))))
     }
 
-    // Slow path: a sibling with `parent`'s keys and the new `mt_cache`. Future
-    // prop additions on the result mint their own edges normally.
-    let child_data = Gc::new(
-        mc,
-        ShapeData {
-            // Anchor the chain on `parent` itself: walking
-            // (None last_key, Some parent) from the new shape reaches
-            // `parent.last_key` -> `parent.parent.last_key` -> ...,
-            // recovering the same key sequence.
-            parent: Some(parent),
-            last_key: None,
-            slot_count: parent.slot_count(),
-            mt_cache: new_mt,
-            is_dict: false,
-            inline_cap: parent.data().inline_cap,
-            transitions: RefLock::new(TransitionTable::new()),
-            keys: parent.data().keys,
-        },
-    );
-    let parent_write = Gc::write(mc, parent.0);
-    unlock!(parent_write, ShapeData, transitions)
-        .borrow_mut()
-        .insert(mc, child_data);
-    Shape(child_data)
+    /// The class for `mt`, whose metamethods by bit index are `values`: the
+    /// registered one with that content, joined, or a new one `mt` owns. A
+    /// metatable with none, or `private` (its writes have retired a class
+    /// before), gets a class of its own that nothing else joins.
+    pub fn adopt(
+        self,
+        mc: &Mutation<'gc>,
+        mt: Table<'gc>,
+        values: [Value<'gc>; METAMETHOD_COUNT],
+        weak: WeakMode,
+        private: bool,
+    ) -> MtCache<'gc> {
+        let bits = bits_of(&values);
+        if private || (bits.is_empty() && weak.is_empty()) {
+            return MtCache::new(mc, mt, values, weak, true);
+        }
+        let hash = content_hash(bits, weak, &values);
+        let mut cell = self.0.borrow_mut(mc);
+        let table = cell.0.get_mut();
+        let found = table
+            .find(hash, |e| {
+                e.hash == hash
+                    && e.class
+                        .upgrade(mc)
+                        .is_some_and(|c| MtCache(c).admits(bits, |i| values[i as usize], weak))
+            })
+            .and_then(|e| e.class.upgrade(mc));
+        if let Some(c) = found {
+            let c = MtCache(c);
+            c.join();
+            return c;
+        }
+        let c = MtCache::new(mc, mt, values, weak, false);
+        let entry = ClassEntry {
+            hash,
+            class: Gc::downgrade(c.0),
+        };
+        table.insert_unique(hash, entry, |e| e.hash);
+        c
+    }
 }

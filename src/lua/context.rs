@@ -180,6 +180,11 @@ impl<'gc> Context<'gc> {
         self.state.empty_dict_sentinel
     }
 
+    #[inline]
+    pub(crate) fn mt_classes(self) -> crate::env::shape::MtClasses<'gc> {
+        self.state.mt_classes
+    }
+
     /// Globally-interned ambient `LuaString` symbols (metamethod
     /// names and friends). Slow paths read this to skip per-call
     /// interning; `Table::ensure_mt_cache` reads it to walk a
@@ -222,7 +227,7 @@ impl<'gc> Context<'gc> {
     #[inline]
     pub fn mm_of(self, v: Value<'gc>, bit: MetamethodBits) -> Value<'gc> {
         let cache = if let Some(t) = v.get_table() {
-            t.shape().mt_cache()
+            t.meta(self)
         } else {
             let Some(mt) = self.metatable_of(v) else {
                 return Value::nil();

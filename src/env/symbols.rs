@@ -26,12 +26,18 @@ macro_rules! emit_struct {
         #[collect(internal, no_drop)]
         pub struct Symbols<'gc> {
             $(pub $field: LuaString<'gc>,)*
+            /// The metamethod names by bit index.
+            by_bit: [LuaString<'gc>; METAMETHOD_COUNT],
             /// `__metatable`, which `getmetatable` returns in place of the metatable.
             pub metatable: LuaString<'gc>,
             /// `__mode`, which makes a table's keys and/or values weak.
             pub mode: LuaString<'gc>,
             /// `n`, the count field of a named vararg table.
             pub n: LuaString<'gc>,
+            /// The key of the slot a table in a poly shape keeps its
+            /// metatable in (see `ShapeData::mt_slot`). Never interned, so it
+            /// equals no key a program can name.
+            pub mt_key: LuaString<'gc>,
         }
     };
 }
@@ -43,9 +49,11 @@ macro_rules! emit_intern_all {
             pub(crate) fn intern_all(mc: &Mutation<'gc>, interner: &Interner<'gc>) -> Self {
                 Symbols {
                     $($field: interner.intern(mc, $bytes),)*
+                    by_bit: [$(interner.intern(mc, $bytes),)*],
                     metatable: interner.intern(mc, b"__metatable"),
                     mode: interner.intern(mc, b"__mode"),
                     n: interner.intern(mc, b"n"),
+                    mt_key: interner.detached(mc, b"(metatable)"),
                 }
             }
 
@@ -57,6 +65,12 @@ macro_rules! emit_intern_all {
                 [
                     $((self.$field, MetamethodBits::$upper),)*
                 ]
+            }
+
+            /// The name of the metamethod with bit index `i`.
+            #[inline]
+            pub fn metamethod(&self, i: u32) -> LuaString<'gc> {
+                self.by_bit[i as usize]
             }
         }
     };
