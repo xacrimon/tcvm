@@ -115,18 +115,23 @@ pub(super) fn always_deopts(b: &Builder<'_, '_>, pc: u32) -> bool {
 /// How the numeric loop whose FORLOOP is at `pc` compiles: as its form,
 /// unless the feedback of the FORLOOP or its FORPREP saw floats or big
 /// integers (`FORPREP` does not rewrite a FORLOOP that is a JIT word).
-/// `None` when it saw both integer and float loops: generic code,
-/// milestone 2.
+/// `None` when it saw both integer and float loops, which deopt: a loop's
+/// kind is visible, so no one representation runs both.
 fn loop_kind(b: &Builder<'_, '_>, pc: u32) -> Option<BcOp> {
     let insn = b.code(pc);
-    let prep = (pc as i64 + insn.branch_offset() as i64) as u32;
-    let seen = (b.feedback(pc) | b.feedback(prep)) & fb::KINDS;
+    let seen = loop_seen(b, pc);
     match (seen & fb::INT != 0, seen & fb::FLOAT != 0) {
         (true, true) => None,
         (false, true) => Some(BcOp::FORLOOP_F),
         _ if seen & fb::BIGINT != 0 => Some(BcOp::FORLOOP),
         _ => Some(insn.op()),
     }
+}
+
+/// The kinds recorded at the FORLOOP at `pc` and its FORPREP.
+fn loop_seen(b: &Builder<'_, '_>, pc: u32) -> u8 {
+    let prep = (pc as i64 + b.code(pc).branch_offset() as i64) as u32;
+    (b.feedback(pc) | b.feedback(prep)) & fb::KINDS
 }
 
 /// The f64 of a number operand of a float loop, which may be an integer.
@@ -246,6 +251,9 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
         FORLOOP_I | FORLOOP_F | FORLOOP => match loop_kind(b, pc) {
             Some(FORLOOP_I) => emit_forloop_i(b, a, succs),
             Some(FORLOOP_F) => emit_forloop_f(b, a, succs),
+            // FORPREP records where it makes a FORLOOP generic, and
+            // `forloop_slow` on each iteration: no record, no iteration.
+            Some(_) if insn.op() == FORLOOP && loop_seen(b, pc) == 0 => b.deopt(ExitTag::NeverRan),
             Some(_) => emit_forloop_l(b, a, succs),
             None => b.deopt(ExitTag::Unsupported),
         },

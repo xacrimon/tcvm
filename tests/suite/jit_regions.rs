@@ -1,8 +1,8 @@
 //! Compiled regions agree with the interpreter on programs that run long
 //! enough to compile them.
 
-use tcvm::Lua;
 use tcvm::env::Value;
+use tcvm::{Lua, StepResult};
 
 use crate::common::start_on;
 
@@ -81,4 +81,32 @@ fn constant_live_across_call() {
         for i = 0, 7 do s = s + data[i] * (i + 1) end
         return string.format('%.6f', s)",
     );
+}
+
+/// A region that boxes big integers outside any loop, entered from a native
+/// that never checks the collector itself, still lets it run: the check at
+/// the region's entry.
+#[test]
+fn boxes_outside_loops_are_collected() {
+    let src = "local function f(c) return (c + 1) << 40 end
+        local s = string.rep('x', 1000000)
+        local r = s:gsub('.', function() return f(1) & 1 end)
+        return tostring(#r)";
+    let mut lua = Lua::new();
+    lua.load_all();
+    let ex = start_on(&mut lua, src);
+    let mut collections = 0;
+    loop {
+        let done = lua.enter(|ctx| match ctx.fetch(&ex).step(ctx).expect("step") {
+            StepResult::Done => true,
+            StepResult::Pending => false,
+            StepResult::Yielded(_) => panic!("yielded"),
+        });
+        if done {
+            break;
+        }
+        collections += 1;
+    }
+    // About seventeen with the check, three without.
+    assert!(collections > 8, "{collections} collections");
 }

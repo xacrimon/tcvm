@@ -851,8 +851,15 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             }
         }
         post.reverse();
-        for (j, &li) in nest.iter().enumerate() {
-            if let Some(ii) = self.instance_of(cfg.loops[li].header, j as u32) {
+        // An entry at the entry loop's header ran a whole iteration before
+        // the loop proper; one at its latch (a FORLOOP, a goto's LOOP) only
+        // the latch, and the loop is peeled as any other.
+        if let Some(&li) = nest.last() {
+            let h = cfg.loops[li].header;
+            if h == entry_bc
+                && cfg.blocks[h as usize].start == self.f.meta.entry_pc
+                && let Some(ii) = self.instance_of(h, n - 1)
+            {
                 let b = self.instances[ii].ir;
                 self.f.blocks[b.idx()].peeled = true;
             }
@@ -880,6 +887,11 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         let order = self.discover(entry_bc);
         let first = self.instances[order[0]].ir;
         self.switch_to(prologue);
+        // The collector's chance at each entry; `prune_gc_checks` keeps it
+        // when code outside loops allocates.
+        self.pc = entry_pc;
+        let s = self.snap_before();
+        self.ins_snap(Op::GcCheck, &[], s, ExitTag::Gc);
         self.jump(first);
         self.instances[order[0]].npreds += 1;
         self.instances[order[0]].done_preds += 1;
