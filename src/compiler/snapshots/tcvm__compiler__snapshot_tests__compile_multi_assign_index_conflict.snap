@@ -6,11 +6,12 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  [  1]  VARARGPREP      fixed=0
-0001  [  1]  LOADI           R0 3
-0002  [  2]  NEWTABLE        R1 T0  ; {}
-0003  [  3]  ADDI            R2 R0 #1
-0004  [  3]  LOADI           R3 20
-0005  [  3]  SETTABLE        R3 R1 R0
-0006  [  3]  MOVE            R0 R2
-0007  [  3]  RETURN          R0 count=1
+0000  [  1]  FUNC
+0001  [  1]  VARARGPREP      fixed=0
+0002  [  1]  LOADI           R0 3
+0003  [  2]  NEWTABLE        R1 T0  ; {}
+0004  [  3]  ADDI            R2 R0 #1
+0005  [  3]  LOADI           R3 20
+0006  [  3]  SETTABLE        R3 R1 R0
+0007  [  3]  MOVE            R0 R2
+0008  [  3]  RETURN          R0 count=1

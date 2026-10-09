@@ -126,6 +126,10 @@ pub(crate) const TABLE: [Handler; 256] = {
         (Op::FORLOOP_F, control::op_forloop_f),
         (Op::TFORCALL_NEXT, control::op_tforcall_next),
         (Op::TFORCALL_IPAIRS, control::op_tforcall_ipairs),
+        (Op::FUNC, control::op_func),
+        (Op::LOOP, control::op_loop),
+        (Op::JIT_ENTRY, crate::jit::op_jit_entry),
+        (Op::JIT_LOOP, crate::jit::op_jit_loop),
     ];
     let ops: [Handler; Op::COUNT] = Op::table_of(
         control::op_invalid,

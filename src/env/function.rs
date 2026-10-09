@@ -65,6 +65,12 @@ pub struct Prototype<'gc> {
     pub ic_table: IcTable<'gc>,
     /// Per distinct constructor template, indexed by `NEWTABLE`.
     pub templates: Box<[Template<'gc>]>,
+    /// What the slow paths saw, one byte per instruction (`jit::feedback`).
+    #[collect(require_static)]
+    pub(crate) feedback: Box<[Cell<u8>]>,
+    /// The JIT's record of this prototype, created when one of its entries
+    /// first gets hot.
+    pub(crate) jit: Lock<Option<crate::jit::state::JitStateRef<'gc>>>,
 }
 
 /// A prototype's bytecode, in cells: the interpreter rewrites an

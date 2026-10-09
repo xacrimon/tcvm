@@ -14,25 +14,26 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  [  1]  VARARGPREP      fixed=0
-0001  [  1]  GETTABUP        R0 U0 K0  ; "x"
-0002  [  1]  JNLTI           R0 #5 +3
-0003  [  2]  GETTABUP        R0 U0 K1  ; "print"
-0004  [  2]  LOAD            R4 K2  ; "x is less than 5"
-0005  [  2]  CALL_R0         R0 args=2
-0006  [  5]  GETTABUP        R0 U0 K3  ; "z"
-0007  [  5]  JNLTI           R0 #5 +4
-0008  [  6]  GETTABUP        R0 U0 K1  ; "print"
-0009  [  6]  LOAD            R4 K4  ; "z is less than 5"
-0010  [  6]  CALL_R0         R0 args=2
-0011  [  6]  JMP             +9
-0012  [  7]  GETTABUP        R0 U0 K3  ; "z"
-0013  [  7]  JNGTI           R0 #10 +4
-0014  [  8]  GETTABUP        R0 U0 K1  ; "print"
-0015  [  8]  LOAD            R4 K5  ; "z is greater than 10"
-0016  [  8]  CALL_R0         R0 args=2
-0017  [  8]  JMP             +3
-0018  [ 10]  GETTABUP        R0 U0 K1  ; "print"
-0019  [ 10]  LOAD            R4 K6  ; "z is greater than or equal to 5 and less than or equal to 10"
-0020  [ 10]  CALL_R0         R0 args=2
-0021  [ 11]  RETURN          R0 count=1
+0000  [  1]  FUNC
+0001  [  1]  VARARGPREP      fixed=0
+0002  [  1]  GETTABUP        R0 U0 K0  ; "x"
+0003  [  1]  JNLTI           R0 #5 +3
+0004  [  2]  GETTABUP        R0 U0 K1  ; "print"
+0005  [  2]  LOAD            R4 K2  ; "x is less than 5"
+0006  [  2]  CALL_R0         R0 args=2
+0007  [  5]  GETTABUP        R0 U0 K3  ; "z"
+0008  [  5]  JNLTI           R0 #5 +4
+0009  [  6]  GETTABUP        R0 U0 K1  ; "print"
+0010  [  6]  LOAD            R4 K4  ; "z is less than 5"
+0011  [  6]  CALL_R0         R0 args=2
+0012  [  6]  JMP             +9
+0013  [  7]  GETTABUP        R0 U0 K3  ; "z"
+0014  [  7]  JNGTI           R0 #10 +4
+0015  [  8]  GETTABUP        R0 U0 K1  ; "print"
+0016  [  8]  LOAD            R4 K5  ; "z is greater than 10"
+0017  [  8]  CALL_R0         R0 args=2
+0018  [  8]  JMP             +3
+0019  [ 10]  GETTABUP        R0 U0 K1  ; "print"
+0020  [ 10]  LOAD            R4 K6  ; "z is greater than or equal to 5 and less than or equal to 10"
+0021  [ 10]  CALL_R0         R0 args=2
+0022  [ 11]  RETURN          R0 count=1

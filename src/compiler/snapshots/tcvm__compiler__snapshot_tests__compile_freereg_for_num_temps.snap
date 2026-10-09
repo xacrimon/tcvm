@@ -8,20 +8,22 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  [  1]  VARARGPREP      fixed=0
-0001  [  1]  CLOSURE         R0 P0
-0002  [  2]  LOADI           R1 0
-0003  [  3]  LOADI           R2 1
-0004  [  3]  CALLS_R1        R5 args=1 f=R0
-0005  [  3]  MOVE            R3 R5
-0006  [  3]  LOAD            R4 K0  ; 1
-0007  [  3]  FORPREP         R2 +2
-0008  [  3]  ADD             R1 R1 R5
-0009  [  3]  FORLOOP         R2 -2
-0010  [  4]  RETURN          R1 count=2
+0000  [  1]  FUNC
+0001  [  1]  VARARGPREP      fixed=0
+0002  [  1]  CLOSURE         R0 P0
+0003  [  2]  LOADI           R1 0
+0004  [  3]  LOADI           R2 1
+0005  [  3]  CALLS_R1        R5 args=1 f=R0
+0006  [  3]  MOVE            R3 R5
+0007  [  3]  LOAD            R4 K0  ; 1
+0008  [  3]  FORPREP         R2 +2
+0009  [  3]  ADD             R1 R1 R5
+0010  [  3]  FORLOOP         R2 -2
+0011  [  4]  RETURN          R1 count=2
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=1, upvalues=0)
   ; code:
-  0000  [  1]  LOADI           R0 3
-  0001  [  1]  RETURN1         R0
+  0000  [  1]  FUNC
+  0001  [  1]  LOADI           R0 3
+  0002  [  1]  RETURN1         R0

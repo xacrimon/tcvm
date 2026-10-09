@@ -150,6 +150,19 @@ macro_rules! tfor_finish {
     }};
 }
 
+/// Count on the hot counter of the instruction being run; at zero its
+/// entry may compile (`jit_hot`), with the frame still at the instruction.
+macro_rules! count_hot {
+    ($rt:ident, $insn:ident) => {{
+        let c = $rt.hot_counter($insn.hot_counter());
+        let n = c.get().wrapping_sub(1);
+        c.set(n);
+        if std::hint::unlikely(n == 0) {
+            tail!(crate::jit::jit_hot)
+        }
+    }};
+}
+
 /// Rewrite the FORLOOP a FORPREP at `pc - 1` guards (the instruction before
 /// its jump target) to `form` when it is not that already. Only on a
 /// change: a store to a word dispatch loads a few instructions later stalls
@@ -161,6 +174,10 @@ fn write_forloop_form(pc: *const Instruction, offset: i32, form: Op) {
     unsafe {
         let site = pc.offset(offset as isize - 1).cast_mut();
         let word = *site;
+        // A compiled loop entry guards the loop kind itself.
+        if word.is_jit_word() {
+            return;
+        }
         debug_assert_eq!(word.generic_op(), Op::FORLOOP);
         if word.op() != form {
             site.write(word.with_op(form));
@@ -257,6 +274,7 @@ handler! {
     /// variable are all small; anything else (`debug.setlocal` on the
     /// hidden slots) goes to the generic FORLOOP.
     op fn op_forloop_i {
+        count_hot!(rt, insn);
         let (a, offset) = insn.a_offset();
         let step = &reg![a + 1];
         let Some(s) = step.get_small() else {
@@ -276,6 +294,7 @@ handler! {
 
     /// `FORLOOP_F`: the float loop.
     op fn op_forloop_f {
+        count_hot!(rt, insn);
         let (a, offset) = insn.a_offset();
         let step = &reg![a + 1];
         if !step.is_float() {
@@ -297,6 +316,9 @@ handler! {
     /// iterations remain, reading the layout FORPREP leaves behind. The
     /// generic form, for a loop with boxed values and for the forms' misses.
     op fn op_forloop {
+        if insn.op() == Op::FORLOOP {
+            count_hot!(rt, insn);
+        }
         let (a, offset) = insn.a_offset();
         // The step's type tells the loop kind, and the hidden slots match it:
         // FORPREP wrote them and nothing else can (the visible copy is never
@@ -334,8 +356,11 @@ handler! {
 
     /// FORLOOP for an integer loop whose values don't all fit a small int.
     slow fn forloop_slow {
-        let insn = insn_at!();
+        // `op_forloop`'s word: the one in `Code` may be a `JIT_LOOP`.
+        let insn = insn.as_insn();
         let (a, offset) = insn.a_offset();
+        let ts_closure = unsafe { frame::closure(base) };
+        crate::jit::feedback::record(ts_closure, unsafe { pc.sub(1) }, crate::jit::feedback::BIGINT);
         let (s, last, idx) = (reg![a + 1], reg![a], reg![a + 2]);
         let (s, last, idx) = unsafe {
             (
@@ -817,6 +842,18 @@ handler! {
         if std::hint::unlikely(!reg![src].is_nil()) {
             raise!(OpError::GlobalRedefined(name_key))
         }
+        next!()
+    }
+
+    /// A function entry: count it.
+    op fn op_func {
+        count_hot!(rt, insn);
+        next!()
+    }
+
+    /// A loop header: count an iteration.
+    op fn op_loop {
+        count_hot!(rt, insn);
         next!()
     }
 
