@@ -28,15 +28,7 @@ pub(crate) fn peel(f: &mut Func<'_>) -> bool {
     for (h, body) in &bodies {
         let innermost = !headers.iter().any(|x| x != h && body.contains(x));
         let size: usize = body.iter().map(|b| f.blocks[b.idx()].insts.len()).sum();
-        // A resume block continues one call: a call resuming outside the
-        // loop would get a second one from the copy.
-        let resumes_outside = body.iter().any(|&b| {
-            f.terminator(b).is_some_and(|t| {
-                matches!(f.op(t), crate::jit::ir::ops::Op::Call { .. })
-                    && !body.contains(&f.edges(t)[0].target)
-            })
-        });
-        if innermost && size <= PEEL_LIMIT && !resumes_outside && !f.blocks[h.idx()].peeled {
+        if innermost && size <= PEEL_LIMIT && !f.blocks[h.idx()].peeled {
             peel_loop(f, *h, body);
             changed = true;
         }

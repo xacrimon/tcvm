@@ -71,21 +71,32 @@ pub(crate) fn natural_loops(f: &Func<'_>) -> Vec<(Block, Vec<Block>)> {
     loops
 }
 
-/// Drop the collector checks of loop headers whose loops neither box an
-/// integer (which may allocate) nor call out.
+/// Keep one collector check per section, as LuaJIT does (`asm_gc_check`):
+/// at the header of each loop that boxes an integer (which may allocate),
+/// allocates or calls out, and at the entry when code outside every loop
+/// does; garbage then waits at most one iteration or one entry.
 pub(crate) fn prune_gc_checks(f: &mut Func<'_>) {
     use crate::jit::ir::types::Rep;
+    let allocates = |f: &Func<'_>, b: Block| {
+        f.insts_of(b).iter().any(|&i| match f.op(i) {
+            Op::Box => f.ty(f.args(i)[0]).rep == Rep::I64,
+            Op::Call { .. } => true,
+            op => op.effects().has(crate::jit::ir::ops::Effects::MAY_ALLOC),
+        })
+    };
     let mut keep = vec![false; f.blocks.len()];
+    let mut in_loop = vec![false; f.blocks.len()];
     for (h, body) in natural_loops(f) {
-        let allocates = body.iter().any(|&b| {
-            f.insts_of(b).iter().any(|&i| match f.op(i) {
-                Op::Box => f.ty(f.args(i)[0]).rep == Rep::I64,
-                Op::Call { .. } => true,
-                op => op.effects().has(crate::jit::ir::ops::Effects::MAY_ALLOC),
-            })
-        });
-        keep[h.idx()] |= allocates;
+        for &b in &body {
+            in_loop[b.idx()] = true;
+        }
+        keep[h.idx()] |= body.iter().any(|&b| allocates(f, b));
     }
+    keep[f.entry.idx()] = f
+        .cfg()
+        .rpo
+        .iter()
+        .any(|&b| !in_loop[b.idx()] && allocates(f, b));
     for b in 0..f.blocks.len() {
         if keep[b] {
             continue;
