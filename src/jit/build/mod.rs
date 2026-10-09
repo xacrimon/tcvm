@@ -20,6 +20,11 @@ pub(crate) enum BuildError {
     TooLarge,
 }
 
+/// Bytecode instructions the outer-loop peeling of a loop entry may copy
+/// (8.7), about 400 IR instructions; past it the outermost levels stay
+/// merged into the entry's loop.
+const OSR_PEEL_LIMIT: u32 = 150;
+
 /// A copy of a bytecode block in an outer-loop peeling version (8.7).
 struct Instance {
     bc: u32,
@@ -795,15 +800,47 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             }
             m
         };
-        let succ_version = |a: u32, k: u32, b: u32| -> u32 {
+        // A back edge of level `j` past the `d` merged outermost levels
+        // starts a fresh copy of that level's header.
+        let succ_version = |a: u32, k: u32, b: u32, d: u32| -> u32 {
             for (j, &li) in nest.iter().enumerate() {
                 let j = j as u32;
-                if j < k && cfg.loops[li].header == b && cfg.loops[li].body[a as usize] {
+                if j >= d && j < k && cfg.loops[li].header == b && cfg.loops[li].body[a as usize] {
                     return j;
                 }
             }
             k.min(level(b))
         };
+        // Merge outermost levels until the copies fit `OSR_PEEL_LIMIT`.
+        let nv = n as usize + 1;
+        let mut d = 0;
+        while d < n {
+            let mut seen = vec![false; cfg.blocks.len() * nv];
+            let mut dup = 0;
+            let v0 = n.min(level(entry_bc));
+            let mut work = vec![(entry_bc, v0)];
+            seen[entry_bc as usize * nv + v0 as usize] = true;
+            let mut first = vec![true; cfg.blocks.len()];
+            while let Some((bc, k)) = work.pop() {
+                let blk = &cfg.blocks[bc as usize];
+                if !std::mem::take(&mut first[bc as usize]) {
+                    dup += blk.end - blk.start;
+                }
+                if self.block_deopts(bc) {
+                    continue;
+                }
+                for &s in &blk.succs {
+                    let v = succ_version(bc, k, s, d);
+                    if !std::mem::replace(&mut seen[s as usize * nv + v as usize], true) {
+                        work.push((s, v));
+                    }
+                }
+            }
+            if dup <= OSR_PEEL_LIMIT {
+                break;
+            }
+            d += 1;
+        }
         let start = self.instance(entry_bc, n.min(level(entry_bc)));
         let mut work = vec![start];
         self.instances[start].discovered = true;
@@ -816,7 +853,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             };
             let mut out = [0usize; 4];
             for (o, &s) in out.iter_mut().zip(succs) {
-                let v = succ_version(bc, k, s);
+                let v = succ_version(bc, k, s, d);
                 let si = self.instance(s, v);
                 *o = si;
                 self.instances[si].npreds += 1;
