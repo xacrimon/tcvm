@@ -206,7 +206,7 @@ fn try_compile<'gc>(
         Err(e) => {
             log(ctx, || {
                 format!(
-                    "compile of {} pc{at} failed: {e:?}",
+                    "compile of {} pc{at} failed: {e}",
                     crate::jit::compile::chunk_name(closure)
                 )
             });
@@ -504,7 +504,7 @@ fn recompile<'gc>(
         compile_caught(ctx, closure, at, frame, &seen).map_err(|e| {
             log(ctx, || {
                 format!(
-                    "recompile of {} pc{at} failed: {e:?}",
+                    "recompile of {} pc{at} failed: {e}",
                     crate::jit::compile::chunk_name(closure)
                 )
             });

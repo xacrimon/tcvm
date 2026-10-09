@@ -18,7 +18,6 @@ pub(crate) mod compiler;
 pub mod dmm;
 pub mod env;
 pub(crate) mod instruction;
-#[allow(dead_code)]
 pub(crate) mod jit;
 pub mod lua;
 pub(crate) mod parser;

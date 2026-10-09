@@ -9,7 +9,7 @@ pub(crate) mod speculate;
 
 use crate::jit::ir::ops::Op;
 use crate::jit::ir::verify::{dominates, dominators};
-use crate::jit::ir::{Block, BlockCall, Func, NO_SNAP};
+use crate::jit::ir::{Block, BlockCall, Func};
 
 /// Whether some path from the entry does work in compiled code before it
 /// leaves: a loop's back edge, a return from a function entry, or an exit a
@@ -158,22 +158,4 @@ pub(crate) fn split_critical_edges(f: &mut Func<'_>) {
             f.edges_mut(t)[k].target = mid;
         }
     }
-}
-
-/// Snapshots referenced by no live instruction are left in place; nothing
-/// reads them.
-pub(crate) fn snapshot_users(f: &Func<'_>) -> Vec<bool> {
-    let mut used = vec![false; f.snaps.len()];
-    for bd in &f.blocks {
-        if bd.dead {
-            continue;
-        }
-        for &i in &bd.insts {
-            let s = f.insts[i.idx()].snap;
-            if s != NO_SNAP {
-                used[s as usize] = true;
-            }
-        }
-    }
-    used
 }

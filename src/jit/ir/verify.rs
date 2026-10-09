@@ -195,10 +195,6 @@ impl ValSet {
         self.0[v / 64] &= !(1 << (v % 64));
     }
 
-    pub(crate) fn contains(&self, v: usize) -> bool {
-        self.0[v / 64] >> (v % 64) & 1 != 0
-    }
-
     /// `self |= other`; whether anything was added.
     pub(crate) fn union(&mut self, other: &ValSet) -> bool {
         let mut changed = false;

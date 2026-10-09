@@ -139,16 +139,11 @@ impl CodeBlock {
 
     /// Overwrite the 64-bit word at byte `off` and publish it.
     pub(crate) fn patch_u64(&self, off: usize, v: u64) {
-        assert!(off + 8 <= self.len() && off % 8 == 0);
+        assert!(off + 8 <= self.len() && off.is_multiple_of(8));
         unsafe {
             self.rw.as_ptr().add(off).cast::<u64>().write(v);
             sync_icache(self.rw.as_ptr().add(off), self.rx.as_ptr().add(off), 8);
         }
-    }
-
-    /// The block's bytes, for disassembly.
-    pub(crate) fn bytes(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.rw.as_ptr(), self.len()) }
     }
 }
 

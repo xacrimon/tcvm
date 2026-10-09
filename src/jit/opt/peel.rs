@@ -142,15 +142,17 @@ fn repair_ssa(
     for &b in &outside {
         for &i in &f.blocks[b.idx()].insts {
             let s = f.insts[i.idx()].snap;
-            let snap_vals = (s != NO_SNAP)
-                .then(|| {
+            let snap_vals = if s != NO_SNAP {
+                {
                     f.snaps[s as usize]
                         .entries
                         .iter()
                         .map(|e| e.1)
                         .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+                }
+            } else {
+                Default::default()
+            };
             for v in f
                 .args(i)
                 .iter()

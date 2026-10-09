@@ -11,18 +11,16 @@ use std::collections::HashMap;
 use crate::dmm::Gc;
 use crate::env::function::{LuaFn, Prototype};
 use crate::env::value::Value;
-use crate::instruction::{Instruction, Op as BcOp};
+use crate::instruction::Instruction;
 use crate::jit::build::cfg::{Cfg, RegSet};
 use crate::jit::ir::ops::{ExitTag, Op};
 use crate::jit::ir::types::{Refine, Rep, Ty, TypeSet};
 use crate::jit::ir::{
     Block, BlockCall, ExitKind, Func, Inst, RegionMeta, Snap, SnapData, Val, ValDef,
 };
-use crate::lua::Context;
 
 #[derive(Debug)]
 pub(crate) enum BuildError {
-    Irreducible,
     TooLarge,
 }
 
@@ -69,7 +67,6 @@ struct BlockState {
 
 pub(crate) struct Builder<'a, 'gc> {
     pub(crate) f: Func<'gc>,
-    pub(crate) ctx: Context<'gc>,
     pub(crate) closure: LuaFn<'gc>,
     pub(crate) proto: Gc<'gc, Prototype<'gc>>,
     pub(crate) cfg: &'a Cfg,
@@ -88,13 +85,7 @@ pub(crate) struct Builder<'a, 'gc> {
 }
 
 impl<'a, 'gc> Builder<'a, 'gc> {
-    pub(crate) fn new(
-        ctx: Context<'gc>,
-        closure: LuaFn<'gc>,
-        cfg: &'a Cfg,
-        entry_pc: u32,
-        loop_entry: bool,
-    ) -> Self {
+    pub(crate) fn new(closure: LuaFn<'gc>, cfg: &'a Cfg, entry_pc: u32, loop_entry: bool) -> Self {
         let proto = closure.proto;
         let meta = RegionMeta {
             entry_pc,
@@ -103,7 +94,6 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         };
         Builder {
             f: Func::new(meta),
-            ctx,
             closure,
             proto,
             cfg,
@@ -152,10 +142,6 @@ impl<'a, 'gc> Builder<'a, 'gc> {
 
     pub(crate) fn switch_to(&mut self, b: Block) {
         self.cur = b;
-    }
-
-    pub(crate) fn cur(&self) -> Block {
-        self.cur
     }
 
     pub(crate) fn terminated(&self) -> bool {
@@ -533,7 +519,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             if !self.slot_holds(r as u8, v) {
                 let b = self.boxed(v);
                 self.push(Op::Store(r as u8), &[b]);
-                self.bs[self.cur.idx()].slots[r as usize] = SlotState::Holds(self.root_of(v));
+                self.bs[self.cur.idx()].slots[r] = SlotState::Holds(self.root_of(v));
             }
             tys[r] = self.ty(v).set;
         }
@@ -970,10 +956,6 @@ impl<'a, 'gc> Builder<'a, 'gc> {
 
     pub(crate) fn code(&self, pc: u32) -> Instruction {
         self.cfg.code[pc as usize]
-    }
-
-    pub(crate) fn cur_op(&self) -> BcOp {
-        self.code(self.pc).op()
     }
 
     pub(crate) fn feedback(&self, pc: u32) -> u8 {

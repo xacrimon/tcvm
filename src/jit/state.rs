@@ -102,8 +102,6 @@ pub(crate) struct JitRuntime {
     /// Where `exit_common` writes the register image (`EXIT_REGS` words).
     pub(crate) exit_regs: *mut u64,
     exit_regs_buf: Box<[Cell<u64>; EXIT_REGS]>,
-    /// Bumped when a number metatable is set (section 11.5).
-    pub(crate) epoch: Cell<u32>,
     pub(crate) config: JitConfig,
     code: RefCell<Option<std::rc::Rc<crate::jit::backend::alloc::CodeAllocator>>>,
     /// Compile failures from running out of code memory turn the JIT off.
@@ -129,7 +127,6 @@ impl JitRuntime {
             table: RefCell::new(EntryTable::default()),
             exit_regs,
             exit_regs_buf,
-            epoch: Cell::new(0),
             config,
             code: RefCell::new(None),
             exhausted: Cell::new(false),
@@ -218,7 +215,6 @@ pub(crate) enum EntryState {
     Compiled,
     /// Its slot points at `jit_recompile`.
     Recompile,
-    Blacklisted,
 }
 
 /// A compiled entry of a prototype: the counting word it replaced and the

@@ -2,6 +2,9 @@
 //! fixed addresses outside the buffer, resolved once the code's address is
 //! known. Encodings are checked against the system assembler in the tests.
 
+// The encoder also covers instructions later milestones emit.
+#![allow(dead_code)]
+
 /// A general-purpose register, `x0`-`x30`; 31 is `xzr` or `sp` by position.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub(crate) struct Gpr(pub(crate) u8);

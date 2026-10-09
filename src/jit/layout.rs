@@ -4,7 +4,6 @@
 
 use std::mem::offset_of;
 
-use crate::env::thread::ThreadState;
 use crate::jit::state::JitRuntime;
 use crate::lua::State;
 use crate::vm::dispatch::Runtime;
@@ -13,16 +12,11 @@ use crate::vm::dispatch::Runtime;
 const JIT: usize = offset_of!(State<'static>, jit);
 /// The pointer to the exit register image.
 pub(crate) const EXIT_REGS: usize = JIT + offset_of!(JitRuntime, exit_regs);
-/// `JitRuntime.epoch` (a `u32`).
-pub(crate) const EPOCH: usize = JIT + offset_of!(JitRuntime, epoch);
 /// The pointer to the arena's `Metrics`.
 pub(crate) const METRICS: usize =
     offset_of!(State<'static>, rt) + offset_of!(Runtime<'static>, metrics);
 /// The allocation counter and threshold pair inside `Metrics`.
 pub(crate) const GC_CHECK: usize = crate::dmm::metrics::Metrics::GC_CHECK_OFFSET;
-/// `ThreadState.stack_end` from the `thread` register.
-pub(crate) const STACK_END: usize = offset_of!(ThreadState<'static>, stack_end);
-pub(crate) const TOP: usize = offset_of!(ThreadState<'static>, top);
 
 // A header word is a `u64` slot of the value stack.
 const _: () = assert!(size_of::<crate::env::value::Value<'static>>() == 8);

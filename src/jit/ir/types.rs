@@ -20,10 +20,6 @@ pub(crate) enum Rep {
 }
 
 impl Rep {
-    pub(crate) fn is_float(self) -> bool {
-        self == Rep::F64
-    }
-
     pub(crate) fn name(self) -> &'static str {
         match self {
             Rep::Val => "val",
@@ -59,65 +55,6 @@ bitflags::bitflags! {
         const HEAP = Self::STR.bits() | Self::TAB.bits() | Self::FUN.bits()
             | Self::THR.bits() | Self::UDATA.bits() | Self::BIGINT.bits();
         const ANY = 0x7ff;
-    }
-}
-
-impl TypeSet {
-    /// No heap object: a store of it needs no write barrier.
-    pub(crate) fn is_immediate(self) -> bool {
-        !self.intersects(TypeSet::HEAP)
-    }
-
-    /// The set of the feedback kind bits `k` (`jit::feedback`).
-    pub(crate) fn from_feedback(k: u8) -> TypeSet {
-        use crate::jit::feedback as fb;
-        let mut s = TypeSet::empty();
-        if k & fb::SMALL != 0 {
-            s |= TypeSet::SMALL;
-        }
-        if k & fb::BIGINT != 0 {
-            s |= TypeSet::BIGINT;
-        }
-        if k & fb::FLOAT != 0 {
-            s |= TypeSet::FLOAT;
-        }
-        if k & fb::STR != 0 {
-            s |= TypeSet::STR;
-        }
-        if k & fb::TAB != 0 {
-            s |= TypeSet::TAB;
-        }
-        if k & fb::OTHER != 0 {
-            s |= TypeSet::NIL | TypeSet::BOOL | TypeSet::FUN | TypeSet::THR | TypeSet::UDATA;
-        }
-        s
-    }
-
-    /// The feedback kind bits of the types in this set.
-    pub(crate) fn to_feedback(self) -> u8 {
-        use crate::jit::feedback as fb;
-        let mut k = 0;
-        if self.contains(TypeSet::SMALL) {
-            k |= fb::SMALL;
-        }
-        if self.contains(TypeSet::BIGINT) {
-            k |= fb::BIGINT;
-        }
-        if self.contains(TypeSet::FLOAT) {
-            k |= fb::FLOAT;
-        }
-        if self.contains(TypeSet::STR) {
-            k |= fb::STR;
-        }
-        if self.contains(TypeSet::TAB) {
-            k |= fb::TAB;
-        }
-        if self
-            .intersects(TypeSet::NIL | TypeSet::BOOL | TypeSet::FUN | TypeSet::THR | TypeSet::UDATA)
-        {
-            k |= fb::OTHER;
-        }
-        k
     }
 }
 
@@ -165,8 +102,6 @@ impl Ty {
         set: TypeSet::empty(),
         refine: Refine::None,
     };
-    /// The type of nothing: inference's starting point.
-    pub(crate) const BOTTOM: Ty = Ty::val(TypeSet::empty());
 
     pub(crate) const fn val(set: TypeSet) -> Ty {
         Ty {
@@ -185,10 +120,6 @@ impl Ty {
             Rep::B1 => Ty::B1,
             Rep::Ptr => Ty::PTR,
         }
-    }
-
-    pub(crate) fn with_set(self, set: TypeSet) -> Ty {
-        Ty { set, ..self }
     }
 
     /// The type a value of this type has once boxed.

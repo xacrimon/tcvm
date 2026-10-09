@@ -57,8 +57,10 @@ pub(crate) struct Region<'gc> {
     /// Freed before the allocator it points into.
     #[collect(require_static)]
     pub(crate) code: CodeBlock,
+    /// Keeps the segment `code` lies in mapped: dropping `code` writes its
+    /// header.
     #[collect(require_static)]
-    pub(crate) alloc: Rc<CodeAllocator>,
+    pub(crate) _alloc: Rc<CodeAllocator>,
     #[collect(require_static)]
     pub(crate) entry: *const u8,
     /// Every heap value the code or a snapshot embeds.
@@ -79,8 +81,6 @@ pub(crate) struct Region<'gc> {
     pub(crate) num_spills: u32,
     #[collect(require_static)]
     pub(crate) retired: Cell<bool>,
-    #[collect(require_static)]
-    pub(crate) entry_fails: Cell<u32>,
 }
 
 impl<'gc> Region<'gc> {

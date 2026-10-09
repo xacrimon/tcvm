@@ -291,7 +291,7 @@ impl Em<'_> {
             self.a.cmn_imm(Sz::W, X16, 1);
             Cond::Eq
         } else if set == TypeSet::FLOAT {
-            self.a.movz(Sz::X, X16, 0xfff9, 3);
+            self.a.mov_imm(X16, BOX);
             self.a.cmp(Sz::X, v, X16);
             Cond::Lo
         } else if set == TypeSet::NIL {
@@ -365,16 +365,6 @@ impl Em<'_> {
         use MInst::*;
         match inst {
             Prologue => self.open_frame(),
-            Mov => {
-                let (d, s) = (
-                    self.allocs(i)[0].as_reg().unwrap(),
-                    self.allocs(i)[1].as_reg().unwrap(),
-                );
-                match d.class() {
-                    RegClass::Int => self.a.mov(gpr(d), gpr(s)),
-                    _ => self.a.fmov(fpr(d), fpr(s)),
-                }
-            }
             MovImm(v) => {
                 let d = self.r(i, 0);
                 self.a.mov_imm(d, v);
@@ -416,9 +406,6 @@ impl Em<'_> {
                     AluOp::Eor => self.a.eor(sz, d, n, m),
                     AluOp::Mul => self.a.mul(sz, d, n, m),
                     AluOp::Udiv => self.a.udiv(sz, d, n, m),
-                    AluOp::Lslv => self.a.lslv(sz, d, n, m),
-                    AluOp::Lsrv => self.a.lsrv(sz, d, n, m),
-                    AluOp::Asrv => self.a.asrv(sz, d, n, m),
                 }
             }
             AluImm(op, sz, k) => {
@@ -548,7 +535,7 @@ impl Em<'_> {
                 self.a.scvtf(Sz::W, d, v);
                 self.a.b(done);
                 self.a.bind(not_small);
-                self.a.movz(Sz::X, X16, 0xfff9, 3);
+                self.a.mov_imm(X16, BOX);
                 self.a.cmp(Sz::X, v, X16);
                 let l = self.exit(exit);
                 self.a.b_cond(Cond::Hs, l);
@@ -656,7 +643,6 @@ impl Em<'_> {
                 let target = match h {
                     HelperId::FMod => self.helpers.fmod,
                     HelperId::FPow => self.helpers.pow,
-                    _ => return Err(format!("helper {h:?}")),
                 };
                 self.a.bl_far(target);
             }

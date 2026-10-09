@@ -17,9 +17,6 @@ pub(crate) enum AluOp {
     Eor,
     Mul,
     Udiv,
-    Lslv,
-    Lsrv,
-    Asrv,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -56,25 +53,10 @@ pub(crate) enum Test {
     B1,
 }
 
-impl Test {
-    pub(crate) fn arity(self) -> usize {
-        match self {
-            Test::I32 { imm: Some(_) }
-            | Test::X { imm: Some(_) }
-            | Test::Type(_)
-            | Test::Falsy
-            | Test::B1 => 1,
-            _ => 2,
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub(crate) enum MInst {
     /// Open the native frame. The entry block's first instruction.
     Prologue,
-    /// `[def d, use s]`, same class.
-    Mov,
     /// `[def d]`, int.
     MovImm(u64),
     /// `[def d]`, float.
@@ -232,29 +214,5 @@ impl TargetInst for MInst {
 
     fn is_ret(&self) -> bool {
         matches!(self, MInst::Return { .. } | MInst::Deopt { .. })
-    }
-}
-
-impl MInst {
-    /// The exit an instruction may take.
-    pub(crate) fn exit(&self) -> Option<u32> {
-        use MInst::*;
-        match *self {
-            AddOvf { exit, .. }
-            | AddImmOvf { exit, .. }
-            | MulOvf { exit }
-            | NegOvf { exit }
-            | DivMod { exit, .. }
-            | ShiftI32 { exit, .. }
-            | LToI { exit }
-            | FToIExact { exit }
-            | ToF64 { exit }
-            | BoxI64 { exit }
-            | Guard { exit, .. }
-            | GuardNoClose { exit }
-            | GcCheck { exit }
-            | Deopt { exit } => Some(exit),
-            _ => None,
-        }
     }
 }
