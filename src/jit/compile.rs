@@ -93,6 +93,8 @@ pub(crate) fn build_ir<'gc>(
         check(&f, "speculate")?;
     }
     optimize(&mut f);
+    opt::prune_gc_checks(&mut f);
+    opt::dce(&mut f);
     check(&f, "optimize")?;
     if !opt::completes(&f) {
         return Err(CompileError::Useless);
