@@ -792,6 +792,18 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 clob.remove(preg_float(0));
                 self.push(MInst::Helper(h), &ops, clob);
             }
+            Op::Helper(h @ (HelperId::Lt | HelperId::Le | HelperId::Eq)) => {
+                // `rt` goes in x0 at the call.
+                let r = res.unwrap();
+                let ops = [
+                    Operand::reg_fixed_def(self.vr(r), preg_int(0)),
+                    Operand::reg_fixed_use(self.vr(args[0]), preg_int(1)),
+                    Operand::reg_fixed_use(self.vr(args[1]), preg_int(2)),
+                ];
+                let mut clob = caller_saved();
+                clob.remove(preg_int(0));
+                self.push(MInst::Helper(h), &ops, clob);
+            }
             Op::Resume { c } => {
                 let a = match self.f.blocks[self.f.insts[i.idx()].block.idx()].resume {
                     true => self.resume_a(i),

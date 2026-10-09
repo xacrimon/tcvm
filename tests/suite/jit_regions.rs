@@ -110,3 +110,43 @@ fn boxes_outside_loops_are_collected() {
     // About seventeen with the check, three without.
     assert!(collections > 8, "{collections} collections");
 }
+
+/// Compares of operands nothing types run inline in the handler's order,
+/// then the helpers, which fail to the interpreter for metamethods and
+/// errors.
+#[test]
+fn generic_compares() {
+    agrees(
+        r#"
+        local function lt(a, b) if a < b then return 1 else return 0 end end
+        local function le(a, b) if a <= b then return 1 else return 0 end end
+        local function eq(a, b) if a == b then return 1 else return 0 end end
+        local function ne(a, b) if a ~= b then return 1 else return 0 end end
+        local function gti(a) if a > 3 then return 1 else return 0 end end
+        local function lei(a) if a <= -2 then return 1 else return 0 end end
+        local function eqi(a) if a == 5 then return 1 else return 0 end end
+        local nan = 0/0
+        local t1, t2 = {}, {}
+        local mt = {__eq = function(x, y) return true end, __lt = function(x, y) return false end, __le = function() return true end}
+        local u1, u2 = setmetatable({}, mt), setmetatable({}, mt)
+        local big = math.maxinteger
+        local vals = {1, 2, 2.0, 2.5, -3, nan, big, big - 1, math.mininteger, 1e300, -0.0, 0, "a", "b", "ab", t1, t2, u1, u2, true, false}
+        local s = {}
+        for rep = 1, 3 do
+          for i = 1, #vals do
+            local a = vals[i]
+            s[#s + 1] = gti(type(a) == "number" and a or 7) .. lei(type(a) == "number" and a or 1) .. eqi(a)
+            for j = 1, #vals do
+              local b = vals[j]
+              s[#s + 1] = eq(a, b) .. ne(a, b)
+              local ok, r = pcall(lt, a, b)
+              s[#s + 1] = ok and tostring(r) or "E"
+              ok, r = pcall(le, a, b)
+              s[#s + 1] = ok and tostring(r) or "E"
+            end
+          end
+        end
+        return table.concat(s)
+"#,
+    );
+}
