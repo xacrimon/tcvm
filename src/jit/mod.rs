@@ -88,11 +88,38 @@ handler! {
         let e = &region.exits[k];
         let mc = rt.mutation();
         let img = rt.jit().exit_regs();
-        for s in region.snap(e) {
+        let snap = region.snap(e);
+        // Inlined calls' frames, outermost first, each a callee of the one
+        // around it.
+        let mut fbase = base;
+        let mut fclosure: LuaFn<'gc> = unsafe { frame::closure(base) };
+        for fr in snap.frames() {
+            let callee = region.pool[fr.func as usize]
+                .get_function()
+                .and_then(|f| f.as_lua())
+                .expect("an inlined Lua closure");
+            debug_assert_eq!(fr.delta as usize, fr.a as usize + frame::HDR);
+            unsafe {
+                let nb = fbase.add(fr.delta as usize);
+                frame::write_hdr(
+                    nb.sub(frame::HDR),
+                    frame::lua_func_word(callee, 0),
+                    crate::vm::abi::handler_bits(rt.ret(fr.c)),
+                    fbase,
+                    fclosure.code.add(fr.caller_pc as usize + 1),
+                );
+                fbase = nb;
+            }
+            fclosure = callee;
+        }
+        for s in snap.entries() {
             let w = match s.loc {
                 Loc::Reg(i) => img[i as usize].get(),
                 Loc::Spill(i) => img[crate::jit::backend::aarch64::abi::IMAGE_SPILLS + i as usize].get(),
                 Loc::Const(c) => region.consts[c as usize],
+                Loc::Nil => Value::nil().to_raw(),
+                Loc::False => Value::boolean(false).to_raw(),
+                Loc::True => Value::boolean(true).to_raw(),
             };
             let v = match s.rep {
                 SRep::Val => unsafe { Value::from_raw(w) },
@@ -103,11 +130,12 @@ handler! {
             };
             unsafe { base.add(s.reg as usize).write(v) };
         }
-        let closure: LuaFn<'gc> = unsafe { frame::closure(base) };
-        on_exit(rt, closure, base, region, e);
-        let at = if e.kind == ExitKind::Before { e.pc } else { e.pc + 1 };
+        base = fbase;
+        let closure = fclosure;
+        on_exit(rt, closure, base, region, e, snap.kind, snap.pc);
+        let at = if snap.kind == ExitKind::Before { snap.pc } else { snap.pc + 1 };
         let resume = unsafe { closure.code.add(at as usize) };
-        if e.kind == ExitKind::Gc || e.tag == crate::jit::ir::ops::ExitTag::Gc {
+        if snap.kind == ExitKind::Gc || e.tag == crate::jit::ir::ops::ExitTag::Gc {
             pc = resume;
             exit!(crate::vm::abi::Exit::Gc)
         }
@@ -116,6 +144,23 @@ handler! {
             word = original_of(closure, word);
         }
         pc = unsafe { resume.add(1) };
+        let h = rt.handler(word.opcode());
+        tail!(h, insn = Slot::insn(word), closure = Slot::closure(closure))
+    }
+
+    /// A failed entry guard (from the region's entry-fail stub, `insn` the
+    /// region, its frame popped and nothing else changed): note the entry's
+    /// kinds and run the original instruction.
+    slow fn jit_entry_fail {
+        let region: &Region<'gc> = unsafe { &*(insn.raw() as *const Region<'gc>) };
+        let closure: LuaFn<'gc> = unsafe { frame::closure(base) };
+        on_entry_fail(rt, closure, base, region);
+        let site = unsafe { closure.code.add(region.entry_pc as usize) };
+        let mut word = unsafe { *site };
+        if word.is_jit_word() {
+            word = original_of(closure, word);
+        }
+        pc = unsafe { site.add(1) };
         let h = rt.handler(word.opcode());
         tail!(h, insn = Slot::insn(word), closure = Slot::closure(closure))
     }
@@ -333,13 +378,14 @@ fn on_exit<'gc>(
     base: *mut Value<'gc>,
     region: &Region<'gc>,
     e: &ExitInfo,
+    kind: ExitKind,
+    pc: u32,
 ) {
     use crate::jit::ir::ops::ExitTag;
-    if let ExitTag::Entry(r) = e.tag {
-        record_entry(ctx, closure, base, region, r);
-    }
-    if e.kind == ExitKind::Before && e.tag.widenable() {
-        record_site(closure, base, e.pc, e.tag == ExitTag::Overflow);
+    // A `Before` exit's operands are in their home slots; the other kinds
+    // follow a completed instruction and have no failed guard.
+    if kind == ExitKind::Before {
+        record_site(closure, base, pc, e.tag == ExitTag::Overflow);
     }
     let n = e.count.get() + 1;
     e.count.set(n);
@@ -348,7 +394,7 @@ fn on_exit<'gc>(
             format!(
                 "first exit {} pc{} ({:?}) of the region at pc{}",
                 crate::jit::compile::chunk_name(closure),
-                e.pc,
+                pc,
                 e.tag,
                 region.entry_pc
             )
@@ -364,7 +410,7 @@ fn on_exit<'gc>(
             format!(
                 "hot exit {} pc{} ({:?}) of the region at pc{}",
                 crate::jit::compile::chunk_name(closure),
-                e.pc,
+                pc,
                 e.tag,
                 region.entry_pc
             )
@@ -424,30 +470,43 @@ fn record_site<'gc>(closure: LuaFn<'gc>, base: *mut Value<'gc>, pc: u32, overflo
     }
 }
 
-/// Record the kind of `R[r]` a failed entry guard saw on its entry.
-fn record_entry<'gc>(
+/// A failed entry guard: the kinds of every register the entry guards test
+/// into the entry's feedback, the entry instruction's operand kinds, and the
+/// count toward a recompile.
+fn on_entry_fail<'gc>(
     ctx: Context<'gc>,
     closure: LuaFn<'gc>,
     base: *mut Value<'gc>,
     region: &Region<'gc>,
-    r: u8,
 ) {
-    let Some(state) = closure.proto.jit.get() else {
-        return;
-    };
-    // SAFETY: an entry guard tests a live register of the frame.
-    let kind = crate::jit::build::value_set(unsafe { *base.add(r as usize) });
-    let mut st = state.borrow_mut(ctx.mutation());
-    let me = region as *const Region<'gc>;
-    if let Some(e) = st
-        .entries
-        .iter_mut()
-        .find(|e| e.region.is_some_and(|x| Gc::as_ptr(x) == me))
-    {
-        match e.seen.iter_mut().find(|(x, _)| *x == r) {
-            Some((_, s)) => *s |= kind,
-            None => e.seen.push((r, kind)),
+    record_site(closure, base, region.entry_pc, false);
+    if let Some(state) = closure.proto.jit.get() {
+        let mut st = state.borrow_mut(ctx.mutation());
+        let me = region as *const Region<'gc>;
+        if let Some(e) = st
+            .entries
+            .iter_mut()
+            .find(|e| e.region.is_some_and(|x| Gc::as_ptr(x) == me))
+        {
+            for &r in &region.entry_regs {
+                // SAFETY: an entry guard tests a live register of the frame.
+                let kind = crate::jit::build::value_set(unsafe { *base.add(r as usize) });
+                match e.seen.iter_mut().find(|(x, _)| *x == r) {
+                    Some((_, s)) => *s |= kind,
+                    None => e.seen.push((r, kind)),
+                }
+            }
         }
+    }
+    let n = region.entry_fails.get() + 1;
+    region.entry_fails.set(n);
+    let name = || crate::jit::compile::chunk_name(closure);
+    if n == 1 {
+        log(ctx, || format!("first entry fail {} pc{}", name(), region.entry_pc));
+    }
+    if n == EXIT_HOT && !region.retired.get() {
+        log(ctx, || format!("hot entry fail {} pc{}", name(), region.entry_pc));
+        request_recompile(ctx, closure, region, false);
     }
 }
 

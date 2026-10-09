@@ -994,15 +994,6 @@ impl Asm {
         self.emit(0x1400_0000);
     }
 
-    /// Point the `k`th `b_far`/`bl_far` at `target`.
-    pub(crate) fn retarget_extern(&mut self, k: usize, target: usize) {
-        self.externs[k].1 = target;
-    }
-
-    pub(crate) fn num_externs(&self) -> usize {
-        self.externs.len()
-    }
-
     /// Bytes `finish` adds: the literal pool, aligned.
     pub(crate) fn pool_bytes(&self) -> usize {
         if self.literals.is_empty() {

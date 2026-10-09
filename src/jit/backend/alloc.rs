@@ -3,9 +3,6 @@
 //! writable address masks back to its segment's header, so a `CodeBlock`
 //! frees itself without a pointer to the allocator; the allocator outlives
 //! every block (regions hold an `Rc` of it).
-//!
-//! Each segment's first data units hold its copy of `exit_common`, which the
-//! region exit stubs of the segment branch to.
 
 use std::cell::{Cell, RefCell};
 use std::io;
@@ -23,8 +20,6 @@ const DATA_UNITS: usize = TOTAL_UNITS - HEADER_UNITS;
 #[repr(C)]
 struct SegHeader {
     rx_base: *mut u8,
-    /// The executable address of the segment's `exit_common`.
-    exit_common: *const u8,
     used_units: Cell<u16>,
     bitmap: [Cell<u64>; BITMAP_WORDS],
 }
@@ -117,11 +112,6 @@ impl CodeBlock {
         self.len_units as usize * UNIT
     }
 
-    /// The segment's `exit_common`.
-    pub(crate) fn exit_common(&self) -> *const u8 {
-        self.header().exit_common
-    }
-
     fn header(&self) -> &SegHeader {
         let base = self.rw.as_ptr() as usize & !(SEG_SIZE - 1);
         unsafe { &*(base as *const SegHeader) }
@@ -156,12 +146,8 @@ impl Drop for CodeBlock {
     }
 }
 
-/// Builds a segment's `exit_common` for code at the given executable address.
-pub(crate) type SegmentInit = fn(rx: usize) -> Vec<u32>;
-
 pub(crate) struct CodeAllocator {
     inner: RefCell<Inner>,
-    init: SegmentInit,
 }
 
 struct Inner {
@@ -172,14 +158,13 @@ struct Inner {
 }
 
 impl CodeAllocator {
-    pub(crate) fn new(init: SegmentInit) -> Self {
+    pub(crate) fn new() -> Self {
         CodeAllocator {
             inner: RefCell::new(Inner {
                 segments: Vec::new(),
                 primary: usize::MAX,
                 exhausted: false,
             }),
-            init,
         }
     }
 
@@ -190,7 +175,7 @@ impl CodeAllocator {
             return Err(io::Error::other("region too large for a code segment"));
         }
         let mut inner = self.inner.borrow_mut();
-        let (seg, start) = inner.reserve(units, self.init)?;
+        let (seg, start) = inner.reserve(units)?;
         let s = &inner.segments[seg];
         let off = start * UNIT;
         let rw = unsafe { s.rw.as_ptr().add(off) };
@@ -204,7 +189,7 @@ impl CodeAllocator {
 }
 
 impl Inner {
-    fn new_segment(&mut self, init: SegmentInit) -> io::Result<usize> {
+    fn new_segment(&mut self) -> io::Result<usize> {
         if self.exhausted {
             return Err(io::Error::other("code memory exhausted"));
         }
@@ -220,28 +205,11 @@ impl Inner {
         for i in 0..HEADER_UNITS {
             h.set(i);
         }
-        let seg = Segment { rw, rx };
-        // `exit_common` takes the first data units.
-        let start = HEADER_UNITS;
-        let at = start * UNIT;
-        let words = init(rx.as_ptr() as usize + at);
-        let units = (words.len() * 4).div_ceil(UNIT);
-        seg.header().mark(start, units);
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                words.as_ptr().cast::<u8>(),
-                rw.as_ptr().add(at),
-                words.len() * 4,
-            );
-            sync_icache(rw.as_ptr().add(at), rx.as_ptr().add(at), words.len() * 4);
-            let h = &mut *(rw.as_ptr() as *mut SegHeader);
-            h.exit_common = rx.as_ptr().add(at);
-        }
-        self.segments.push(seg);
+        self.segments.push(Segment { rw, rx });
         Ok(self.segments.len() - 1)
     }
 
-    fn reserve(&mut self, units: usize, init: SegmentInit) -> io::Result<(usize, usize)> {
+    fn reserve(&mut self, units: usize) -> io::Result<(usize, usize)> {
         if self.primary != usize::MAX
             && let Some(u) = self.segments[self.primary].header().find_free(units)
         {
@@ -266,7 +234,7 @@ impl Inner {
             self.primary = i;
             return Ok((i, u));
         }
-        let i = self.new_segment(init)?;
+        let i = self.new_segment()?;
         let u = self.segments[i]
             .header()
             .find_free(units)
@@ -281,10 +249,6 @@ impl Inner {
 mod tests {
     use super::*;
 
-    fn no_exit(_rx: usize) -> Vec<u32> {
-        vec![0xD420_0000]
-    }
-
     fn ret_const(alloc: &CodeAllocator, imm: u16) -> CodeBlock {
         let b = alloc.reserve(8).expect("reserve");
         b.write(&[0xD280_0000 | (imm as u32) << 5, 0xD65F_03C0]);
@@ -298,11 +262,10 @@ mod tests {
 
     #[test]
     fn allocates_runs_and_frees() {
-        let alloc = CodeAllocator::new(no_exit);
+        let alloc = CodeAllocator::new();
         let blocks: Vec<_> = (0..64).map(|i| ret_const(&alloc, i)).collect();
         for (i, b) in blocks.iter().enumerate() {
             assert_eq!(call(b), i as u64);
-            assert!(!b.exit_common().is_null());
         }
         assert_eq!(alloc.inner.borrow().segments.len(), 1);
         let used = alloc.inner.borrow().segments[0].header().used_units.get();

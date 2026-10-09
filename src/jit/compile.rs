@@ -198,7 +198,7 @@ pub(crate) fn compile<'gc>(
     seen: &[(u8, TypeSet)],
 ) -> Result<crate::dmm::Gc<'gc, crate::jit::region::Region<'gc>>, CompileError> {
     use crate::jit::backend::aarch64::{abi, emit, lower};
-    use crate::jit::region::{ExitInfo, Region, SnapEntry};
+    use crate::jit::region::{ExitInfo, Region, encode_snap};
     let config = &ctx.jit().config;
     let opts = Options {
         check: config.check,
@@ -242,6 +242,8 @@ pub(crate) fn compile<'gc>(
     times.regalloc = t.elapsed().as_micros();
     let t = std::time::Instant::now();
     let helpers = emit::Helpers {
+        exit_common: abi::exit_common as *const () as usize,
+        entry_fail: crate::jit::jit_entry_fail as *const () as usize,
         enter: crate::vm::ops::call::enter as *const () as usize,
         fmod: crate::jit::helpers::jit_fmod as *const () as usize,
         pow: crate::jit::helpers::jit_pow as *const () as usize,
@@ -254,8 +256,6 @@ pub(crate) fn compile<'gc>(
     let block = alloc
         .reserve(size)
         .map_err(|e| CompileError::Backend(format!("code memory: {e}")))?;
-    em.asm
-        .retarget_extern(em.exit_common, block.exit_common() as usize);
     let region_word = em.asm.label_offset(em.region_word);
     let entry = block.rx();
     let words = em
@@ -289,24 +289,36 @@ pub(crate) fn compile<'gc>(
         );
     }
     let mut exits = Vec::with_capacity(em.exits.len());
-    let mut snaps: Vec<SnapEntry> = Vec::new();
+    let mut snaps: Vec<u32> = Vec::new();
     let mut consts: Vec<u64> = Vec::new();
-    for e in &em.exits {
-        let start = snaps.len() as u32;
-        for s in &e.entries {
-            let mut s = *s;
+    let mut last: Option<(usize, usize)> = None;
+    for e in &mut em.exits {
+        for s in &mut e.entries {
             if let crate::jit::region::Loc::Const(c) = s.loc {
-                consts.push(e.consts[c as usize]);
-                s.loc = crate::jit::region::Loc::Const(consts.len() as u32 - 1);
+                let w = e.consts[c as usize];
+                let k = consts.iter().position(|&x| x == w).unwrap_or_else(|| {
+                    consts.push(w);
+                    consts.len() - 1
+                });
+                s.loc = crate::jit::region::Loc::Const(k as u32);
             }
-            snaps.push(s);
         }
+        let at = snaps.len();
+        encode_snap(&mut snaps, e.kind, e.pc, &[], &e.entries);
+        // Consecutive exits often share their snapshot.
+        let at = match last {
+            Some((s, n)) if snaps[s..s + n] == snaps[at..] => {
+                snaps.truncate(at);
+                s
+            }
+            _ => {
+                last = Some((at, snaps.len() - at));
+                at
+            }
+        };
         exits.push(ExitInfo {
-            pc: e.pc,
-            kind: e.kind,
+            snap: at as u32,
             tag: e.tag,
-            snap_start: start,
-            snap_len: e.entries.len() as u32,
             count: std::cell::Cell::new(0),
         });
     }
@@ -320,6 +332,8 @@ pub(crate) fn compile<'gc>(
             exits: exits.into_boxed_slice(),
             snaps: snaps.into_boxed_slice(),
             consts: consts.into_boxed_slice(),
+            entry_regs: lowered.entry_regs.clone().into_boxed_slice(),
+            entry_fails: std::cell::Cell::new(0),
             proto: closure.proto,
             entry_pc: pc,
             frame_size: em.frame_size,

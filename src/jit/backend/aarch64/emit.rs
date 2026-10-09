@@ -11,7 +11,7 @@ use crate::jit::backend::aarch64::abi::{
 use crate::jit::backend::aarch64::asm::{
     Asm, Cond, Extend, FP, Fpr, Gpr, LR, Label, SP, Shift, Sz, ZR,
 };
-use crate::jit::backend::aarch64::inst::{AluOp, FOp, FUnOp, MInst, Test};
+use crate::jit::backend::aarch64::inst::{AluOp, ENTRY_FAIL, FOp, FUnOp, MInst, Test};
 use crate::jit::backend::aarch64::lower::{LExit, Lowered, Src};
 use crate::jit::backend::vcode::VCode;
 use crate::jit::ir::ops::HelperId;
@@ -32,8 +32,6 @@ pub(crate) struct Emitted {
     pub(crate) num_spills: u32,
     /// The 8-byte word holding the region pointer.
     pub(crate) region_word: Label,
-    /// The extern branch to the segment's `exit_common`.
-    pub(crate) exit_common: usize,
     pub(crate) exits: Vec<ExitOut>,
 }
 
@@ -53,12 +51,15 @@ struct Em<'a> {
     labels: Vec<Label>,
     exit_labels: Vec<Label>,
     exit_region: Label,
+    entry_fail: Label,
     helpers: Helpers,
 }
 
 /// Addresses of the Rust routines a region branches to.
 #[derive(Clone, Copy)]
 pub(crate) struct Helpers {
+    pub(crate) exit_common: usize,
+    pub(crate) entry_fail: usize,
     pub(crate) enter: usize,
     pub(crate) fmod: usize,
     pub(crate) pow: usize,
@@ -89,6 +90,7 @@ pub(crate) fn emit(l: &Lowered, out: &Output, helpers: Helpers) -> Result<Emitte
     let labels: Vec<Label> = (0..l.vcode.blocks.len()).map(|_| a.new_label()).collect();
     let exit_labels: Vec<Label> = (0..l.exits.len()).map(|_| a.new_label()).collect();
     let exit_region = a.new_label();
+    let entry_fail = a.new_label();
     let mut em = Em {
         a,
         v: &l.vcode,
@@ -97,6 +99,7 @@ pub(crate) fn emit(l: &Lowered, out: &Output, helpers: Helpers) -> Result<Emitte
         labels,
         exit_labels,
         exit_region,
+        entry_fail,
         helpers,
     };
     let nb = l.vcode.blocks.len();
@@ -116,7 +119,8 @@ pub(crate) fn emit(l: &Lowered, out: &Output, helpers: Helpers) -> Result<Emitte
             }
         }
     }
-    // Cold section: one stub per exit, then the trampoline.
+    // Cold section: one stub per exit, the trampoline, and the prologue's
+    // entry-fail stub, which needs no register image (6.4).
     for (k, _) in l.exits.iter().enumerate() {
         em.a.bind(em.exit_labels[k]);
         em.a.movz(Sz::W, X16, k as u16, 0);
@@ -127,9 +131,13 @@ pub(crate) fn emit(l: &Lowered, out: &Output, helpers: Helpers) -> Result<Emitte
     em.a.bind(em.exit_region);
     em.a.ldr_label(X17, region_word);
     em.a.orr_shift(Sz::X, X16, X17, X16, Shift::Lsl, 48);
-    // Retargeted to the segment's `exit_common` once the code is placed.
-    let exit_common = em.a.num_externs();
-    em.a.b_far(0);
+    em.a.b_far(em.helpers.exit_common);
+    if !l.entry_regs.is_empty() {
+        em.a.bind(em.entry_fail);
+        em.close_frame();
+        em.a.ldr_label(INSN, region_word);
+        em.a.b_far(em.helpers.entry_fail);
+    }
     em.a.align(8);
     em.a.bind(region_word);
     em.a.emit(0);
@@ -145,7 +153,6 @@ pub(crate) fn emit(l: &Lowered, out: &Output, helpers: Helpers) -> Result<Emitte
         frame_size: frame,
         num_spills: out.num_spillslots as u32,
         region_word,
-        exit_common,
         exits,
     })
 }
@@ -157,8 +164,16 @@ fn exit_out(l: &Lowered, out: &Output, e: &LExit, _k: usize) -> ExitOut {
     let inst = e.inst.expect("an exit without an instruction");
     let allocs = out.inst_allocs(regalloc2::Inst::new(inst));
     let base = l.snap_ops[inst] as usize;
+    let (nil, f, t) = (
+        Value::nil().to_raw(),
+        Value::boolean(false).to_raw(),
+        Value::boolean(true).to_raw(),
+    );
     for &(reg, rep, src) in &e.entries {
         let loc = match src {
+            Src::Const(w) if w == nil => Loc::Nil,
+            Src::Const(w) if w == f => Loc::False,
+            Src::Const(w) if w == t => Loc::True,
             Src::Const(w) => {
                 consts.push(w);
                 Loc::Const(consts.len() as u32 - 1)
@@ -357,6 +372,9 @@ impl Em<'_> {
     }
 
     fn exit(&mut self, exit: u32) -> Label {
+        if exit == ENTRY_FAIL {
+            return self.entry_fail;
+        }
         self.exit_labels[exit as usize]
     }
 
