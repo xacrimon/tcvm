@@ -667,6 +667,18 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 let ops = [self.use_(args[0]), self.use_(args[1]), self.use_(args[2])];
                 self.push(MInst::ArrStore, &ops, none);
             }
+            Op::ArrNext => {
+                // Both written while the operands are still read.
+                let d = Operand::new(
+                    self.vr(res.unwrap()),
+                    regalloc2::OperandConstraint::Reg,
+                    regalloc2::OperandKind::Def,
+                    regalloc2::OperandPos::Early,
+                );
+                let v = Operand::reg_temp(self.v.new_vreg(RegClass::Int));
+                let ops = [d, self.use_(args[0]), self.use_(args[1]), v];
+                self.push(MInst::ArrNext, &ops, none);
+            }
             Op::Barrier => {
                 let t = Operand::reg_fixed_use(self.vr(args[0]), preg_int(1));
                 self.push(MInst::Barrier, &[t], caller_saved());

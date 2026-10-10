@@ -786,6 +786,23 @@ impl Em<'_> {
                 let (a, k, v) = (self.r(i, 0), self.r(i, 1), self.r(i, 2));
                 self.a.str_idx(v, a, k, Extend::Uxtw, true);
             }
+            ArrNext => {
+                let (d, t, from, v) = (self.r(i, 0), self.r(i, 1), self.r(i, 2), self.r(i, 3));
+                let (top, done) = (self.a.new_label(), self.a.new_label());
+                self.a.ldr_w(X16, t, layout::T_ASIZE as i32);
+                self.a.ldr(X17, t, layout::T_ARRAY as i32);
+                self.a.mov_w(d, from);
+                self.a.bind(top);
+                self.a.cmp(Sz::W, d, X16);
+                self.a.b_cond(Cond::Hs, done);
+                self.a.ldr_idx(v, X17, d, Extend::Uxtw, true);
+                // Nil is one run of ones, a logical immediate.
+                self.a.eor_imm(Sz::X, v, v, NIL);
+                self.a.cbnz(Sz::X, v, done);
+                self.a.add_imm(Sz::W, d, d, 1);
+                self.a.b(top);
+                self.a.bind(done);
+            }
             Barrier => {
                 let skip = self.a.new_label();
                 self.a.ldr(X16, Gpr(1), layout::T_HEADER);

@@ -434,7 +434,8 @@ fn metamethod_calls() {
 }
 
 /// Generic `for` loops: `pairs` and `ipairs` steps without calling the
-/// iterator, other iterators called, and the forms TFORPREP chose guarded.
+/// iterator (`next`'s array part inline, past holes), other iterators
+/// called, and the forms TFORPREP chose guarded.
 #[test]
 fn generic_for_loops() {
     agrees(
@@ -442,6 +443,7 @@ fn generic_for_loops() {
         local arr, hash = {}, {}
         for i = 1, 50 do arr[i] = i * 2; hash["k" .. i] = i end
         local mixed = {10, 20, 30, a = 1, b = 2, [100] = 7, [2.5] = 3, [true] = 9}
+        local holes = {1, nil, 3, nil, nil, 6, nil, x = 1}
         local idx = setmetatable({1, 2}, {__index = function(t, k) if k < 6 then return k * 10 end end})
         local function psum(t) local s, n = 0, 0 for k, v in pairs(t) do n = n + 1 if type(v) == "number" then s = s + v end end return s + n end
         local function isum(t) local s = 0 for i, v in ipairs(t) do s = s + v * i end return s end
@@ -451,6 +453,7 @@ fn generic_for_loops() {
         local s = 0
         for r = 1, 400 do
           s = s + psum(arr) + psum(hash) + psum(mixed) + isum(arr) + isum(idx) + bnext(mixed) + custom(r % 20)
+          s = s + psum(holes) + bnext(holes)
         end
         return tostring(s)
 "#,
