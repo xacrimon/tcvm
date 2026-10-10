@@ -42,6 +42,9 @@ pub(crate) fn address(h: HelperId) -> usize {
         HelperId::VarargGet => jit_varargget as *const () as usize,
         HelperId::VarargTable(_) => jit_vararg_table as *const () as usize,
         HelperId::Index => jit_index as *const () as usize,
+        HelperId::Mm(_) => jit_mm as *const () as usize,
+        HelperId::IndexFn => jit_index_fn as *const () as usize,
+        HelperId::NewIndexFn => jit_newindex_fn as *const () as usize,
         HelperId::NewIndex { .. } => jit_newindex as *const () as usize,
     }
 }
@@ -326,6 +329,38 @@ pub(crate) extern "C" fn jit_index(rt: *const State<'static>, recv: u64, key: u6
     match walk_index_chain(ctx, recv, key) {
         IndexChain::Resolved(v) => v.to_raw(),
         _ => HELPER_FAIL_VAL,
+    }
+}
+
+/// The metamethod of `bit` from `a`, else `b` (`binop_metamethod`), or nil.
+pub(crate) extern "C" fn jit_mm(rt: *const State<'static>, bit: u64, a: u64, b: u64) -> u64 {
+    let ctx = unsafe { Context::from_state(rt) };
+    let (a, b) = unsafe { (Value::from_raw(a), Value::from_raw(b)) };
+    binop_metamethod(ctx, a, b, MetamethodBits::from_bits_retain(bit as u32)).to_raw()
+}
+
+/// The `__index` function `recv[key]` calls with `recv` itself, or nil: a
+/// call the walk reaches through other tables first is the interpreter's.
+pub(crate) extern "C" fn jit_index_fn(rt: *const State<'static>, recv: u64, key: u64) -> u64 {
+    let ctx = unsafe { Context::from_state(rt) };
+    let (recv, key) = unsafe { (Value::from_raw(recv), Value::from_raw(key)) };
+    match walk_index_chain(ctx, recv, key) {
+        IndexChain::Invoke { func, receiver } if receiver.to_raw() == recv.to_raw() => {
+            Value::function(func).to_raw()
+        }
+        _ => Value::nil().to_raw(),
+    }
+}
+
+/// The same for `__newindex`.
+pub(crate) extern "C" fn jit_newindex_fn(rt: *const State<'static>, recv: u64, key: u64) -> u64 {
+    let ctx = unsafe { Context::from_state(rt) };
+    let (recv, key) = unsafe { (Value::from_raw(recv), Value::from_raw(key)) };
+    match walk_newindex_chain(ctx, recv, key) {
+        NewIndexChain::Invoke { func, receiver } if receiver.to_raw() == recv.to_raw() => {
+            Value::function(func).to_raw()
+        }
+        _ => Value::nil().to_raw(),
     }
 }
 

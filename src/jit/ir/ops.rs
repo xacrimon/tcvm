@@ -112,6 +112,15 @@ pub(crate) enum HelperId {
     VarargGet,
     /// `-> Val`: `VARARGPREP`'s vararg table, also stored in `R[np]`.
     VarargTable(u8),
+    /// `(Val, Val) -> Val`: the metamethod of the bit (`MetamethodBits`)
+    /// from the left operand, else the right, as `binop_metamethod` finds
+    /// it; nil when neither has one.
+    Mm(u32),
+    /// `(Val, Val) -> Val`: the `__index` function `recv[key]` calls, when
+    /// `recv`'s own metatable holds it; else nil.
+    IndexFn,
+    /// `(Val, Val) -> Val`: the same for `__newindex`.
+    NewIndexFn,
     /// `(Val, Val) -> Val`: `recv[key]` through `__index` tables, or
     /// `HELPER_FAIL_VAL` (an `__index` function, an error).
     Index,
@@ -171,6 +180,9 @@ impl HelperId {
             HelperId::VarargGet => "varargget".into(),
             HelperId::VarargTable(np) => format!("varargtable r{np}"),
             HelperId::Index => "index".into(),
+            HelperId::Mm(bit) => format!("mm {bit:#x}"),
+            HelperId::IndexFn => "index_fn".into(),
+            HelperId::NewIndexFn => "newindex_fn".into(),
             HelperId::NewIndex { keyed } => format!("newindex keyed={keyed}"),
         }
     }
@@ -223,7 +235,21 @@ impl HelperId {
                 Some(Val),
                 alloc | Effects::W_SLOT,
             ),
-            // A walk moves a table off a stale class (`Table::meta`).
+            // A lookup moves a table off a stale class (`Table::meta`).
+            HelperId::Mm(bit) => (
+                RT,
+                Some(bit as u64),
+                &[Val, Val],
+                Some(Val),
+                alloc | Effects::W_SHAPE | Effects::W_META,
+            ),
+            HelperId::IndexFn | HelperId::NewIndexFn => (
+                RT,
+                None,
+                &[Val, Val],
+                Some(Val),
+                alloc | Effects::W_SHAPE | Effects::W_META,
+            ),
             HelperId::Index => (
                 RT,
                 None,
@@ -267,6 +293,9 @@ pub(crate) enum ExitTag {
     Gc,
     /// A table's shape is not the one compiled for.
     Shape,
+    /// A helper failed where the site's feedback never saw a metamethod
+    /// run: the exit records one, and the recompile calls it (5.4).
+    Mm,
     /// A prologue guard on an entry value (5.2): fails to the entry-fail
     /// stub, which records the entry's kinds.
     Entry,
@@ -276,7 +305,7 @@ impl ExitTag {
     pub(crate) fn widenable(self) -> bool {
         matches!(
             self,
-            ExitTag::Type | ExitTag::Overflow | ExitTag::NeverRan | ExitTag::Shape
+            ExitTag::Type | ExitTag::Overflow | ExitTag::NeverRan | ExitTag::Shape | ExitTag::Mm
         )
     }
 }
@@ -470,6 +499,16 @@ pub(crate) enum Op {
         a: u8,
         n: u8,
     },
+    /// Call a metamethod, the first operand, with the rest as arguments,
+    /// from a header past the frame's registers (`stage_mm!`); edge 0 is
+    /// the resume block, which takes one result.
+    CallMm {
+        pc: u32,
+        nargs: u8,
+    },
+    /// Exits unless a metamethod call's header and `n` arguments fit below
+    /// the stack's end.
+    GuardFits(u8),
     /// Call `R[a]` with `nargs` arguments in `R[a+4..]` (stored), `c` the
     /// CALL's result operand; edge 0 is the resume block.
     Call {
@@ -553,7 +592,8 @@ impl Op {
             Resume { .. } => Effects::R_SLOT,
             Jump | Br => Effects::TERMINATOR,
             Return { .. } => Effects::TERMINATOR | Effects::TAILOUT | Effects::R_SLOT,
-            Call { .. } => {
+            GuardFits(_) => Effects::MAY_DEOPT,
+            Call { .. } | CallMm { .. } => {
                 Effects::TERMINATOR
                     | Effects::TAILOUT
                     | Effects::W_ALL
@@ -579,13 +619,6 @@ impl Op {
         self.effects() == Effects::NONE && !matches!(self, Op::Helper(_))
     }
 
-    pub(crate) fn is_const(self) -> bool {
-        matches!(
-            self,
-            Op::KVal(_) | Op::KObj(_) | Op::KI32(_) | Op::KI64(_) | Op::KF64(_) | Op::KB1(_)
-        )
-    }
-
     /// How many values the instruction defines.
     pub(crate) fn num_results(self) -> usize {
         use Op::*;
@@ -607,6 +640,8 @@ impl Op {
             | Br
             | Return { .. }
             | Call { .. }
+            | CallMm { .. }
+            | GuardFits(_)
             | Deopt => 0,
             Resume { c } => match c {
                 2 => 1,

@@ -379,3 +379,56 @@ fn inverted_fused_tests() {
 "#,
     );
 }
+
+/// Metamethods are called from compiled code once a site's feedback saw
+/// one run (before that its helper's failure exits and records it):
+/// arithmetic, unary, length, concatenation, compares, string arithmetic,
+/// `__index` and `__newindex` functions; one may yield or raise.
+#[test]
+fn metamethod_calls() {
+    agrees(
+        r#"
+        local V = {}
+        V.__index = V
+        local function vec(x, y) local v = setmetatable({x = x, y = y}, V) return v end
+        V.__add = function(a, b) return vec(a.x + b.x, a.y + b.y) end
+        V.__unm = function(a) return vec(-a.x, -a.y) end
+        V.__len = function(a) return a.x * a.x + a.y * a.y end
+        V.__concat = function(a, b) return "v" .. (type(a) == "table" and a.x or a) .. (type(b) == "table" and b.y or b) end
+        V.__eq = function(a, b) return a.x == b.x end
+        V.__lt = function(a, b) return #a < #b end
+        V.__le = function(a, b) return #a <= #b end
+        local function step(p, q) return -(p + q) end
+        local function cmp(a, b) local r = 0 if a == b then r = r + 1 end if a < b then r = r + 2 end if a <= b then r = r + 4 end return r end
+        local function cat(a, b) return a .. b end
+        local function len(a) return #a end
+        local function sadd(a, b) return a + b end
+        local s, p = 0, vec(0, 0)
+        for i = 1, 600 do
+          p = step(p, vec(i % 3, i % 5))
+          s = s + cmp(vec(i % 3, 1), vec(1, i % 4)) + len(p) % 7 + #cat(p, i) + sadd(tostring(i), "1")
+        end
+        local hits = 0
+        local P = setmetatable({}, {__index = function(t, k) hits = hits + 1 return #k end})
+        local store = {}
+        local W = setmetatable({}, {__newindex = function(t, k, v) store[k] = v * 2 end})
+        local function rd(t) return t.abc end
+        local function wr(t, v) t.slot = v end
+        for i = 1, 600 do s = s + rd(P); wr(W, i) end
+        local E = setmetatable({}, {__add = function() error("boom") end})
+        local function addE(a) return a + 1 end
+        local errs = 0
+        for i = 1, 600 do if not pcall(addE, i % 50 == 0 and E or i) then errs = errs + 1 end end
+        local Y = setmetatable({}, {__add = function(a, b) return coroutine.yield(b) end})
+        local function addY(a, b) return a + b end
+        local co = coroutine.wrap(function()
+          local t = 0
+          for i = 1, 600 do t = t + addY(i % 3 == 0 and Y or i, i) end
+          return t
+        end)
+        local got = co()
+        for _ = 1, 200 do got = co(got * 10) end
+        return table.concat({s, p.x, p.y, hits, store.slot, errs, tostring(got)}, " ")
+"#,
+    );
+}

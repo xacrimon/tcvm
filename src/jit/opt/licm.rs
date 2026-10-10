@@ -95,7 +95,7 @@ fn hoist(f: &mut Func<'_>, h: Block, body: &[Block]) -> bool {
     // Across a call only what can be computed again may live (R6, 9.8).
     let calls = body.iter().any(|&b| {
         f.terminator(b)
-            .is_some_and(|i| matches!(f.op(i), Op::Call { .. }))
+            .is_some_and(|i| matches!(f.op(i), Op::Call { .. } | Op::CallMm { .. }))
     });
     let mut moves: Vec<Inst> = Vec::new();
     let mut moved = vec![false; f.insts.len()];

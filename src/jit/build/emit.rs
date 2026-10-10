@@ -2,6 +2,7 @@
 //! guards from its quickened form and feedback byte, its operation, and its
 //! result writes. What milestone 1 does not compile is a deopt.
 
+use crate::env::MetamethodBits;
 use crate::env::value::Value;
 use crate::instruction::{ArithKind, Family, Instruction, Op as BcOp, UpvalSource};
 use crate::jit::build::{Builder, intrinsics, tables};
@@ -36,8 +37,9 @@ fn arith_mode(b: &Builder<'_, '_>, pc: u32) -> Mode {
     let byte = b.feedback(pc);
     let wide = byte & (fb::OVERFLOW | fb::BIGINT) != 0;
     let float_result = matches!(kind, ArithKind::Div | ArithKind::Pow);
+    // Tables with the metamethod: the generic code's metamethod arm.
     if matches!(op, BcOp::ARITH_MM | BcOp::ARITH_MM_R | BcOp::ARITH_MMI) {
-        return Mode::Deopt;
+        return Mode::Generic;
     }
     if op != generic {
         let forms = &info.forms;
@@ -256,14 +258,19 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
         LEN => {
             let v = b.reg(rb);
             let v = b.boxed(v);
-            let r = helper_val(b, HelperId::Len, &[v]);
-            b.set(a, r);
+            helper_or_mm(b, a, HelperId::Len, &[v], MetamethodBits::LEN, &[v, v]);
         }
         CONCAT => {
             let (x, y) = (b.reg(rb), b.reg(insn.c()));
             let (x, y) = (b.boxed(x), b.boxed(y));
-            let r = helper_val(b, HelperId::Concat, &[x, y]);
-            b.set(a, r);
+            helper_or_mm(
+                b,
+                a,
+                HelperId::Concat,
+                &[x, y],
+                MetamethodBits::CONCAT,
+                &[x, y],
+            );
         }
         JT | JF => {
             let v = b.reg(a);
@@ -650,8 +657,16 @@ fn emit_unm(b: &mut Builder<'_, '_>, pc: u32, dst: u8, src: u8) {
         let r = b.ins(Op::LNeg, &[l]);
         arm_end(b, join, dst, r);
         b.switch_to(rest);
-        let r = helper_val(b, HelperId::Unm, &[x]);
-        arm_end(b, join, dst, r);
+        // Lua passes the operand twice for unary metamethods.
+        helper_arms(
+            b,
+            join,
+            dst,
+            HelperId::Unm,
+            &[x],
+            MetamethodBits::UNM,
+            &[x, x],
+        );
         enter_join(b, join);
         return;
     };
@@ -676,8 +691,15 @@ fn emit_bnot(b: &mut Builder<'_, '_>, dst: u8, src: u8) {
         let r = b.ins(Op::INot, &[i]);
         arm_end(b, join, dst, r);
         b.switch_to(rest);
-        let r = helper_val(b, HelperId::BNot, &[x]);
-        arm_end(b, join, dst, r);
+        helper_arms(
+            b,
+            join,
+            dst,
+            HelperId::BNot,
+            &[x],
+            MetamethodBits::BNOT,
+            &[x, x],
+        );
         enter_join(b, join);
         return;
     };
@@ -728,9 +750,36 @@ fn emit_generic(b: &mut Builder<'_, '_>, kind: ArithKind, dst: u8, l: Operand, r
         arm_end(b, join, dst, v);
         b.switch_to(rest);
     }
-    let v = helper_val(b, HelperId::Arith(kind), &[x, y]);
-    arm_end(b, join, dst, v);
+    helper_arms(
+        b,
+        join,
+        dst,
+        HelperId::Arith(kind),
+        &[x, y],
+        kind_mm(kind),
+        &[x, y],
+    );
     enter_join(b, join);
+}
+
+/// The metamethod of an arithmetic kind (`arith_slow`'s).
+fn kind_mm(kind: ArithKind) -> MetamethodBits {
+    use ArithKind::*;
+    match kind {
+        Add => MetamethodBits::ADD,
+        Sub => MetamethodBits::SUB,
+        Mul => MetamethodBits::MUL,
+        Mod => MetamethodBits::MOD,
+        Pow => MetamethodBits::POW,
+        Div => MetamethodBits::DIV,
+        IDiv => MetamethodBits::IDIV,
+        BAnd => MetamethodBits::BAND,
+        BOr => MetamethodBits::BOR,
+        BXor => MetamethodBits::BXOR,
+        Shl => MetamethodBits::SHL,
+        Shr => MetamethodBits::SHR,
+        None => unreachable!("an arithmetic kind"),
+    }
 }
 
 /// Integer arithmetic of a site without a form, on `I64`s.
@@ -784,14 +833,96 @@ fn small_or_float(b: &mut Builder<'_, '_>, v: Val) -> Val {
     b.ins(Op::Select, &[is_float, f, fi])
 }
 
-/// A `Val` helper's result, deopting `Before` when it failed.
-pub(super) fn helper_val(b: &mut Builder<'_, '_>, h: HelperId, args: &[Val]) -> Val {
+/// Call the metamethod `f` with `args` (5.4) and continue in its resume
+/// block with its one result. What is live after the instruction is stored
+/// first, as for a CALL; a window too small for the header exits to the
+/// interpreter, which grows the stack.
+pub(super) fn mm_call(b: &mut Builder<'_, '_>, f: Val, args: &[Val]) -> Val {
+    let pc = b.pc;
+    let s = b.snap_before();
+    b.ins_snap(Op::GuardFits(args.len() as u8), &[], s, ExitTag::Slow);
+    let insn = b.code(pc);
+    let mut live = b.cfg.live_in[pc as usize];
+    if let Some(next) = b.cfg.live_in.get(pc as usize + 1) {
+        live.union(next);
+    }
+    if insn.op().branch_sense().is_some() {
+        let t = (pc as i64 + 1 + insn.branch_offset() as i64) as usize;
+        if let Some(target) = b.cfg.live_in.get(t) {
+            live.union(target);
+        }
+    }
+    let mut ops = vec![b.boxed(f)];
+    for &a in args {
+        ops.push(b.boxed(a));
+    }
+    let tys = b.store_live(live);
+    let op = Op::CallMm {
+        pc,
+        nargs: args.len() as u8,
+    };
+    let resume = b.call(op, &ops, tys, 2);
+    let first = b.f.insts_of(resume)[0];
+    b.f.result(first)
+}
+
+/// The metamethod of `bit` for `mm_args` (its first two), deopting when
+/// there is none: the interpreter raises.
+fn metamethod(b: &mut Builder<'_, '_>, bit: MetamethodBits, mm_args: &[Val]) -> Val {
+    let f = b.ins(Op::Helper(HelperId::Mm(bit.bits())), &mm_args[..2]);
+    let none = b.ins(Op::IsType(TypeSet::NIL), &[f]);
+    let s = b.snap_before();
+    b.ins_snap(Op::GuardFalse, &[none], s, ExitTag::Slow);
+    f
+}
+
+/// Arms into `join` setting `dst`: the helper's result, or where it fails
+/// the result of calling the metamethod of `bit` with `mm_args`.
+pub(super) fn helper_arms(
+    b: &mut Builder<'_, '_>,
+    join: Block,
+    dst: u8,
+    h: HelperId,
+    args: &[Val],
+    bit: MetamethodBits,
+    mm_args: &[Val],
+) {
     let r = b.ins(Op::Helper(h), args);
     let fail = b.ins(Op::KVal(HELPER_FAIL_VAL), &[]);
     let failed = b.ins(Op::SameBits, &[r, fail]);
-    let snap = b.snap_before();
-    b.ins_snap(Op::GuardFalse, &[failed], snap, ExitTag::Slow);
-    r
+    if !calls_mm(b) {
+        let s = b.snap_before();
+        b.ins_snap(Op::GuardFalse, &[failed], s, ExitTag::Mm);
+        arm_end(b, join, dst, r);
+        return;
+    }
+    let ok = branch_arm(b, failed);
+    let f = metamethod(b, bit, mm_args);
+    let res = mm_call(b, f, mm_args);
+    arm_end(b, join, dst, res);
+    b.switch_to(ok);
+    arm_end(b, join, dst, r);
+}
+
+/// Whether a helper's failure at the instruction calls a metamethod: only
+/// once its feedback saw one run, since a call in a loop keeps the loop's
+/// loads and guards in it; until then the failure exits and records one.
+pub(super) fn calls_mm(b: &Builder<'_, '_>) -> bool {
+    b.feedback(b.pc) & fb::MM != 0
+}
+
+/// `dst` = the helper's result, or the metamethod's (`helper_arms`).
+fn helper_or_mm(
+    b: &mut Builder<'_, '_>,
+    dst: u8,
+    h: HelperId,
+    args: &[Val],
+    bit: MetamethodBits,
+    mm_args: &[Val],
+) {
+    let join = b.new_block();
+    helper_arms(b, join, dst, h, args, bit, mm_args);
+    enter_join(b, join);
 }
 
 /// Branch on the test `op` of `v`: continue in the arm where it holds and
@@ -999,8 +1130,12 @@ fn generic_cmp(b: &mut Builder<'_, '_>, cc: Cc, x: Val, y: Val, sense: bool, suc
         Cc::Lo | Cc::Hi => unreachable!("an unsigned compare of values"),
         Cc::Eq | Cc::Ne => unreachable!("an ordered compare"),
     };
-    let c = helper_test(b, h, x, y);
-    branch(b, c, sense, succs);
+    let bit = if h == HelperId::Lt {
+        MetamethodBits::LT
+    } else {
+        MetamethodBits::LE
+    };
+    helper_branch(b, h, x, y, bit, sense, succs);
 }
 
 /// Branch on `x == y` for `Val`s nothing typed, as the handler orders it:
@@ -1032,19 +1167,40 @@ fn generic_eq(b: &mut Builder<'_, '_>, x: Val, y: Val, sense: bool, succs: &[Blo
     let slow = b.new_sealed_succ();
     b.br(ss, no, slow);
     b.switch_to(slow);
-    let c = helper_test(b, HelperId::Eq, x, y);
-    branch(b, c, sense, succs);
+    helper_branch(b, HelperId::Eq, x, y, MetamethodBits::EQ, sense, succs);
 }
 
-/// A compare helper's result as a `B1`, deopting `Before` when it failed.
-fn helper_test(b: &mut Builder<'_, '_>, h: HelperId, x: Val, y: Val) -> Val {
+/// Branch on a compare helper's result; where it fails, on the truth of
+/// the metamethod's (`ret_cond_t/f`).
+fn helper_branch(
+    b: &mut Builder<'_, '_>,
+    h: HelperId,
+    x: Val,
+    y: Val,
+    bit: MetamethodBits,
+    sense: bool,
+    succs: &[Block],
+) {
     let r = b.ins(Op::Helper(h), &[x, y]);
     let fail = b.ki32(HELPER_FAIL);
     let failed = b.ins(Op::ICmp(Cc::Eq), &[r, fail]);
-    let snap = b.snap_before();
-    b.ins_snap(Op::GuardFalse, &[failed], snap, ExitTag::Slow);
+    if !calls_mm(b) {
+        let s = b.snap_before();
+        b.ins_snap(Op::GuardFalse, &[failed], s, ExitTag::Mm);
+        let zero = b.ki32(0);
+        let c = b.ins(Op::ICmp(Cc::Ne), &[r, zero]);
+        branch(b, c, sense, succs);
+        return;
+    }
+    let ok = branch_arm(b, failed);
+    let f = metamethod(b, bit, &[x, y]);
+    let res = mm_call(b, f, &[x, y]);
+    let falsy = b.ins(Op::IsFalsy, &[res]);
+    branch(b, falsy, !sense, succs);
+    b.switch_to(ok);
     let zero = b.ki32(0);
-    b.ins(Op::ICmp(Cc::Ne), &[r, zero])
+    let c = b.ins(Op::ICmp(Cc::Ne), &[r, zero]);
+    branch(b, c, sense, succs);
 }
 
 /// Whether equality with `v` is identity: it is no number and no table or
@@ -1181,6 +1337,7 @@ fn emit_call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
             c,
             pc,
         },
+        &[],
         tys,
         c,
     );

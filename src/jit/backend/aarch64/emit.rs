@@ -882,6 +882,35 @@ impl Em<'_> {
                     }
                 }
             }
+            CallMm {
+                hdr,
+                nargs,
+                pc_after,
+            } => {
+                let resume = self.labels[self.v.succs(block)[0].index()];
+                let h = hdr as i32 * 8;
+                for k in 0..=nargs as usize {
+                    let v = self.r(i, k);
+                    let at = if k == 0 { h } else { h + 24 + 8 * k as i32 };
+                    self.a.str(v, BASE, at);
+                }
+                self.a.adr(X16, resume);
+                self.a.str(X16, BASE, h + 8);
+                self.a.str(BASE, BASE, h + 16);
+                self.a.ldr_lit(X16, pc_after as u64);
+                self.a.str(X16, BASE, h + 24);
+                self.close_frame();
+                self.a.movz(Sz::X, INSN, nargs as u16, 0);
+                self.a.add_imm(Sz::X, PC, BASE, h as u64);
+                self.a.b_far(self.helpers.enter);
+            }
+            GuardFits { end, exit } => {
+                self.a.ldr(X16, THREAD, layout::THREAD_STACK_END as i32);
+                self.a.add_imm(Sz::X, X17, BASE, end as u64 * 8);
+                self.a.cmp(Sz::X, X17, X16);
+                let l = self.exit(exit);
+                self.a.b_cond(Cond::Hi, l);
+            }
             Return { a, n } => {
                 self.a.ldr(X16, BASE, -24);
                 self.a.and_imm(Sz::X, X16, X16, !31u64);
