@@ -1,5 +1,6 @@
 //! IR operations, their result types and effects.
 
+use crate::instruction::ArithKind;
 use crate::jit::ir::types::{Rep, Ty, TypeSet};
 
 /// An integer or float comparison. Float compares are ordered: false when
@@ -62,19 +63,80 @@ pub(crate) enum HelperId {
     Lt,
     Le,
     Eq,
+    /// `(Val, Val) -> Val`: the arithmetic of two numbers, or
+    /// `HELPER_FAIL_VAL` (not numbers, a zero integer divisor).
+    Arith(ArithKind),
+    /// `Val -> Val`: `-v` and `~v` of a number, or `HELPER_FAIL_VAL`.
+    Unm,
+    BNot,
+    /// `Val -> Val`: `#v` of a string or of a table without `__len`, or
+    /// `HELPER_FAIL_VAL`.
+    Len,
+    /// `(Val, Val) -> Val`: `a .. b` of strings and numbers, or
+    /// `HELPER_FAIL_VAL`.
+    Concat,
 }
 
 /// What a compare helper returns when the interpreter must run the compare.
 pub(crate) const HELPER_FAIL: i32 = 2;
 
+/// What a `Val` helper returns when the interpreter must run the
+/// instruction: the negative quiet NaN, which no `Value` is (floats are
+/// canonical) and one `movz` makes.
+pub(crate) const HELPER_FAIL_VAL: u64 = 0xFFF8_0000_0000_0000;
+
+/// A pinned register a helper takes ahead of its operands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Ctx {
+    Rt,
+}
+
+/// A helper's C signature: the pinned registers, then an immediate, then
+/// the operands, each in the next argument register of its class.
+pub(crate) struct Sig {
+    pub(crate) ctx: &'static [Ctx],
+    pub(crate) imm: Option<u64>,
+    pub(crate) args: &'static [Rep],
+    pub(crate) ret: Rep,
+    pub(crate) effects: Effects,
+}
+
 impl HelperId {
-    pub(crate) fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> String {
         match self {
-            HelperId::FMod => "fmod",
-            HelperId::FPow => "pow",
-            HelperId::Lt => "lt",
-            HelperId::Le => "le",
-            HelperId::Eq => "eq",
+            HelperId::FMod => "fmod".into(),
+            HelperId::FPow => "pow".into(),
+            HelperId::Lt => "lt".into(),
+            HelperId::Le => "le".into(),
+            HelperId::Eq => "eq".into(),
+            HelperId::Arith(k) => format!("arith.{k:?}").to_lowercase(),
+            HelperId::Unm => "unm".into(),
+            HelperId::BNot => "bnot".into(),
+            HelperId::Len => "len".into(),
+            HelperId::Concat => "concat".into(),
+        }
+    }
+
+    pub(crate) fn sig(self) -> Sig {
+        use Rep::*;
+        const RT: &[Ctx] = &[Ctx::Rt];
+        let (ctx, imm, args, ret, effects): (_, _, &'static [Rep], _, _) = match self {
+            HelperId::FMod | HelperId::FPow => (&[][..], None, &[F64, F64], F64, Effects::NONE),
+            HelperId::Lt | HelperId::Le | HelperId::Eq => {
+                (RT, None, &[Val, Val], I32, Effects::NONE)
+            }
+            HelperId::Arith(k) => (RT, Some(k as u64), &[Val, Val], Val, Effects::MAY_ALLOC),
+            HelperId::Unm | HelperId::BNot | HelperId::Len => {
+                (RT, None, &[Val], Val, Effects::MAY_ALLOC)
+            }
+            HelperId::Concat => (RT, None, &[Val, Val], Val, Effects::MAY_ALLOC),
+        };
+        Sig {
+            ctx,
+            imm,
+            args,
+            ret,
+            effects,
         }
     }
 }
@@ -299,7 +361,7 @@ impl Op {
             | INeg | IShl | IShr | IDivFloor | IModFloor | LDivFloor | LModFloor | LToI
             | FToIExact | ToF64 => Effects::MAY_DEOPT,
             GcCheck => Effects::MAY_DEOPT | Effects::R_GC,
-            Helper(_) => Effects::NONE,
+            Helper(h) => h.sig().effects,
             Resume { .. } => Effects::R_SLOT,
             Jump | Br => Effects::TERMINATOR,
             Return { .. } => Effects::TERMINATOR | Effects::TAILOUT | Effects::R_SLOT,
@@ -393,8 +455,13 @@ impl Op {
             | FIDiv | ToF64 => Ty::F64,
             IToL | FToL | LAdd | LSub | LMul | LUDiv | LNeg | LAnd | LOr | LXor | LNot | LShl
             | LShr | LDivFloor | LModFloor => Ty::I64,
-            Helper(HelperId::FMod | HelperId::FPow) => Ty::F64,
-            Helper(HelperId::Lt | HelperId::Le | HelperId::Eq) => Ty::I32,
+            Helper(HelperId::Arith(ArithKind::Div | ArithKind::Pow)) => Ty::val(TypeSet::FLOAT),
+            Helper(HelperId::Arith(ArithKind::Add | ArithKind::Sub | ArithKind::Mul))
+            | Helper(HelperId::Arith(ArithKind::Mod | ArithKind::IDiv))
+            | Helper(HelperId::Unm) => Ty::val(TypeSet::NUM),
+            Helper(HelperId::Arith(_) | HelperId::BNot | HelperId::Len) => Ty::val(TypeSet::INT),
+            Helper(HelperId::Concat) => Ty::val(TypeSet::STR),
+            Helper(h) => Ty::of_rep(h.sig().ret),
             _ => Ty::ANY,
         }
     }

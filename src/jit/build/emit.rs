@@ -6,7 +6,7 @@ use crate::env::value::Value;
 use crate::instruction::{ArithKind, Family, Instruction, Op as BcOp};
 use crate::jit::build::Builder;
 use crate::jit::feedback as fb;
-use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL, HelperId, Op};
+use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL, HELPER_FAIL_VAL, HelperId, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
 use crate::jit::ir::{Block, Val};
 
@@ -20,6 +20,9 @@ enum Mode {
         l_small: bool,
         r_small: bool,
     },
+    /// No form to speculate on: typed operands directly, the rest as the
+    /// generic handler does.
+    Generic,
     Deopt,
 }
 
@@ -78,15 +81,17 @@ fn arith_mode(b: &Builder<'_, '_>, pc: u32) -> Mode {
                     }
                 }
             }
-            _ => Mode::Deopt,
+            // `_NN`, a site whose kinds keep changing.
+            _ => Mode::Generic,
         };
     }
+    // A locked site records only what its slow path sees.
     let (_, locked) = insn.adaptive();
     let ints_only = byte & fb::KINDS != 0 && byte & !(fb::INT | fb::OVERFLOW) == 0;
     if !locked && ints_only && !float_result {
         return Mode::I64;
     }
-    Mode::Deopt
+    Mode::Generic
 }
 
 /// Whether the instruction at `pc` compiles to an unconditional deopt.
@@ -96,7 +101,7 @@ pub(super) fn always_deopts(b: &Builder<'_, '_>, pc: u32) -> bool {
     match insn.op() {
         MOVE | LOAD | LOADI | LOADNIL | LFALSESKIP | GETUPVAL | NOP | FUNC | LOOP | JMP
         | JMP_BACK | NOT | ERRNNIL | JT | JF | JTSET | JFSET | RETURN0 | RETURN1 | FORLOOP_I
-        | FORLOOP_F | FORLOOP | JEQS | JNEQS => false,
+        | FORLOOP_F | FORLOOP | JEQS | JNEQS | LEN | CONCAT => false,
         VARARGPREP => b.proto.needs_vararg_table,
         RETURN => insn.b() == 0,
         CALL | CALL_R0 | CALL_R1 | CALLS | CALLS_R0 | CALLS_R1 => insn.b() == 0,
@@ -201,8 +206,20 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             let v = b.reg(a);
             b.ins_exit(Op::Guard(TypeSet::NIL), &[v], ExitTag::Slow);
         }
-        UNM => emit_unm(b, a, rb),
+        UNM => emit_unm(b, pc, a, rb),
         BNOT => emit_bnot(b, a, rb),
+        LEN => {
+            let v = b.reg(rb);
+            let v = b.boxed(v);
+            let r = helper_val(b, HelperId::Len, &[v]);
+            b.set(a, r);
+        }
+        CONCAT => {
+            let (x, y) = (b.reg(rb), b.reg(insn.c()));
+            let (x, y) = (b.boxed(x), b.boxed(y));
+            let r = helper_val(b, HelperId::Concat, &[x, y]);
+            b.set(a, r);
+        }
         JT | JF => {
             let v = b.reg(a);
             let falsy = b.ins(Op::IsFalsy, &[v]);
@@ -315,6 +332,10 @@ fn emit_arith(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
             b.deopt(ExitTag::Unsupported);
             return;
         }
+        Mode::Generic => {
+            emit_generic(b, kind, dst, l, r);
+            return;
+        }
         Mode::I32 => {
             let (x, y) = (l.i32(b), r.i32(b));
             let (op, exits) = match kind {
@@ -389,6 +410,35 @@ enum Operand {
 }
 
 impl Operand {
+    /// The number kind the operand is for certain.
+    fn kind(self, b: &Builder<'_, '_>) -> Option<CmpAs> {
+        match self {
+            Operand::Reg(v) => num_kind(b, v),
+            Operand::Int(_) => Some(CmpAs::I32),
+            Operand::Float(_) => Some(CmpAs::F64),
+        }
+    }
+
+    fn val(self, b: &mut Builder<'_, '_>) -> Val {
+        match self {
+            Operand::Reg(v) => b.boxed(v),
+            Operand::Int(n) => b.konst(Value::small(n as i32)),
+            Operand::Float(x) => b.konst(Value::float(x)),
+        }
+    }
+
+    /// The f64 of an operand of kind `k`.
+    fn num_f64(self, b: &mut Builder<'_, '_>, k: CmpAs) -> Val {
+        match (self, k) {
+            (Operand::Reg(v), CmpAs::I64) => {
+                let x = b.as_i64(v);
+                b.ins(Op::LToF, &[x])
+            }
+            (Operand::Reg(v), _) => b.num_f64(v),
+            (o, _) => o.f64(b, false),
+        }
+    }
+
     fn i32(self, b: &mut Builder<'_, '_>) -> Val {
         match self {
             Operand::Reg(v) => b.as_i32(v),
@@ -421,20 +471,44 @@ impl Operand {
     }
 }
 
-fn emit_unm(b: &mut Builder<'_, '_>, dst: u8, src: u8) {
+fn emit_unm(b: &mut Builder<'_, '_>, pc: u32, dst: u8, src: u8) {
     let v = b.reg(src);
     let ty = b.ty(v);
-    let r = if ty.rep == Rep::F64 || ty.within(TypeSet::FLOAT) {
+    let known = |set| !ty.set.is_empty() && ty.within(set);
+    let r = if ty.rep == Rep::F64 || known(TypeSet::FLOAT) {
         let x = b.as_f64(v);
         b.ins(Op::FNeg, &[x])
-    } else if ty.rep == Rep::I64 {
-        b.ins(Op::LNeg, &[v])
-    } else if ty.rep == Rep::I32 || ty.within(TypeSet::SMALL) {
+    } else if ty.rep == Rep::I32 || known(TypeSet::SMALL) {
         let x = b.as_i32(v);
-        let i = b.ins_exit(Op::INeg, &[x], ExitTag::Overflow);
-        b.f.result(i)
+        if b.feedback(pc) & fb::OVERFLOW != 0 {
+            // It negated `i32::MIN`.
+            let x = b.ins(Op::IToL, &[x]);
+            b.ins(Op::LNeg, &[x])
+        } else {
+            let i = b.ins_exit(Op::INeg, &[x], ExitTag::Overflow);
+            b.f.result(i)
+        }
+    } else if ty.rep == Rep::I64 || known(TypeSet::INT) {
+        let x = b.as_i64(v);
+        b.ins(Op::LNeg, &[x])
     } else {
-        b.deopt(ExitTag::Type);
+        // As `op_unm`: a float, a small integer, then the helper.
+        let x = b.boxed(v);
+        let join = b.new_block();
+        let rest = arm(b, Op::IsType(TypeSet::FLOAT), x);
+        let f = b.ins(Op::Unbox(Rep::F64), &[x]);
+        let r = b.ins(Op::FNeg, &[f]);
+        arm_end(b, join, dst, r);
+        b.switch_to(rest);
+        let rest = arm(b, Op::IsType(TypeSet::SMALL), x);
+        let i = b.ins(Op::Unbox(Rep::I32), &[x]);
+        let l = b.ins(Op::IToL, &[i]);
+        let r = b.ins(Op::LNeg, &[l]);
+        arm_end(b, join, dst, r);
+        b.switch_to(rest);
+        let r = helper_val(b, HelperId::Unm, &[x]);
+        arm_end(b, join, dst, r);
+        enter_join(b, join);
         return;
     };
     b.set(dst, r);
@@ -443,16 +517,165 @@ fn emit_unm(b: &mut Builder<'_, '_>, dst: u8, src: u8) {
 fn emit_bnot(b: &mut Builder<'_, '_>, dst: u8, src: u8) {
     let v = b.reg(src);
     let ty = b.ty(v);
-    let r = if ty.rep == Rep::I64 {
-        b.ins(Op::LNot, &[v])
-    } else if ty.rep == Rep::I32 || ty.within(TypeSet::SMALL) {
+    let known = |set| !ty.set.is_empty() && ty.within(set);
+    let r = if ty.rep == Rep::I32 || known(TypeSet::SMALL) {
         let x = b.as_i32(v);
         b.ins(Op::INot, &[x])
+    } else if ty.rep == Rep::I64 || known(TypeSet::INT) {
+        let x = b.as_i64(v);
+        b.ins(Op::LNot, &[x])
     } else {
-        b.deopt(ExitTag::Type);
+        let x = b.boxed(v);
+        let join = b.new_block();
+        let rest = arm(b, Op::IsType(TypeSet::SMALL), x);
+        let i = b.ins(Op::Unbox(Rep::I32), &[x]);
+        let r = b.ins(Op::INot, &[i]);
+        arm_end(b, join, dst, r);
+        b.switch_to(rest);
+        let r = helper_val(b, HelperId::BNot, &[x]);
+        arm_end(b, join, dst, r);
+        enter_join(b, join);
         return;
     };
     b.set(dst, r);
+}
+
+// --- generic arithmetic ------------------------------------------------------
+
+/// A site without a form: operands of known number kinds compile directly
+/// (integers as `I64`, which cannot overflow, mixes as floats); otherwise
+/// the generic handler's order: two small integers, two numbers, then
+/// `jit_arith`, whose failure (not numbers, a zero divisor) deopts.
+fn emit_generic(b: &mut Builder<'_, '_>, kind: ArithKind, dst: u8, l: Operand, r: Operand) {
+    use ArithKind::*;
+    let bitwise = matches!(kind, BAnd | BOr | BXor | Shl | Shr);
+    let float_result = matches!(kind, Div | Pow);
+    if let (Some(lk), Some(rk)) = (l.kind(b), r.kind(b)) {
+        let float = lk == CmpAs::F64 || rk == CmpAs::F64;
+        if !(bitwise && float) {
+            let v = if float || float_result {
+                let (x, y) = (l.num_f64(b, lk), r.num_f64(b, rk));
+                float_op(b, kind, x, y)
+            } else {
+                let (x, y) = (l.i64(b), r.i64(b));
+                int_op(b, kind, x, y)
+            };
+            b.set(dst, v);
+            return;
+        }
+    }
+    let (x, y) = (l.val(b), r.val(b));
+    let join = b.new_block();
+    if !float_result {
+        let both_small = both(b, TypeSet::SMALL, x, y);
+        let rest = branch_arm(b, both_small);
+        let xi = b.ins(Op::Unbox(Rep::I32), &[x]);
+        let yi = b.ins(Op::Unbox(Rep::I32), &[y]);
+        let (xl, yl) = (b.ins(Op::IToL, &[xi]), b.ins(Op::IToL, &[yi]));
+        let v = int_op(b, kind, xl, yl);
+        arm_end(b, join, dst, v);
+        b.switch_to(rest);
+    }
+    if !bitwise {
+        let nums = both(b, TypeSet::SMALL | TypeSet::FLOAT, x, y);
+        let rest = branch_arm(b, nums);
+        let (fx, fy) = (small_or_float(b, x), small_or_float(b, y));
+        let v = float_op(b, kind, fx, fy);
+        arm_end(b, join, dst, v);
+        b.switch_to(rest);
+    }
+    let v = helper_val(b, HelperId::Arith(kind), &[x, y]);
+    arm_end(b, join, dst, v);
+    enter_join(b, join);
+}
+
+/// Integer arithmetic of a site without a form, on `I64`s.
+fn int_op(b: &mut Builder<'_, '_>, kind: ArithKind, x: Val, y: Val) -> Val {
+    use ArithKind::*;
+    let op = match kind {
+        Add => Op::LAdd,
+        Sub => Op::LSub,
+        Mul => Op::LMul,
+        BAnd => Op::LAnd,
+        BOr => Op::LOr,
+        BXor => Op::LXor,
+        Shl => Op::LShl,
+        Shr => Op::LShr,
+        // A zero divisor raises in the interpreter.
+        Mod | IDiv => {
+            let op = if kind == Mod {
+                Op::LModFloor
+            } else {
+                Op::LDivFloor
+            };
+            let i = b.ins_exit(op, &[x, y], ExitTag::Slow);
+            return b.f.result(i);
+        }
+        Div | Pow | None => unreachable!("{kind:?} on integers"),
+    };
+    b.ins(op, &[x, y])
+}
+
+/// Float arithmetic, what any number operands of these kinds compute.
+fn float_op(b: &mut Builder<'_, '_>, kind: ArithKind, x: Val, y: Val) -> Val {
+    use ArithKind::*;
+    match kind {
+        Add => b.ins(Op::FAdd, &[x, y]),
+        Sub => b.ins(Op::FSub, &[x, y]),
+        Mul => b.ins(Op::FMul, &[x, y]),
+        Div => b.ins(Op::FDiv, &[x, y]),
+        IDiv => b.ins(Op::FIDiv, &[x, y]),
+        Mod => b.ins(Op::Helper(HelperId::FMod), &[x, y]),
+        Pow => b.ins(Op::Helper(HelperId::FPow), &[x, y]),
+        _ => unreachable!("{kind:?} on floats"),
+    }
+}
+
+/// The f64 of a `Val` that is a small integer or a float.
+fn small_or_float(b: &mut Builder<'_, '_>, v: Val) -> Val {
+    let is_float = b.ins(Op::IsType(TypeSet::FLOAT), &[v]);
+    let f = b.ins(Op::Unbox(Rep::F64), &[v]);
+    let i = b.ins(Op::Unbox(Rep::I32), &[v]);
+    let fi = b.ins(Op::IToF, &[i]);
+    b.ins(Op::Select, &[is_float, f, fi])
+}
+
+/// A `Val` helper's result, deopting `Before` when it failed.
+fn helper_val(b: &mut Builder<'_, '_>, h: HelperId, args: &[Val]) -> Val {
+    let r = b.ins(Op::Helper(h), args);
+    let fail = b.ins(Op::KVal(HELPER_FAIL_VAL), &[]);
+    let failed = b.ins(Op::SameBits, &[r, fail]);
+    let snap = b.snap_before();
+    b.ins_snap(Op::GuardFalse, &[failed], snap, ExitTag::Slow);
+    r
+}
+
+/// Branch on the test `op` of `v`: continue in the arm where it holds and
+/// return the block where it does not.
+fn arm(b: &mut Builder<'_, '_>, op: Op, v: Val) -> Block {
+    let c = b.ins(op, &[v]);
+    branch_arm(b, c)
+}
+
+fn branch_arm(b: &mut Builder<'_, '_>, c: Val) -> Block {
+    let (yes, no) = (b.new_sealed_succ(), b.new_sealed_succ());
+    b.br(c, yes, no);
+    b.switch_to(yes);
+    no
+}
+
+/// End an arm of the instruction with `dst = v`, at the join.
+fn arm_end(b: &mut Builder<'_, '_>, join: Block, dst: u8, v: Val) {
+    b.set(dst, v);
+    b.flush();
+    b.jump(join);
+}
+
+/// Continue after the arms, where `dst` is their join.
+fn enter_join(b: &mut Builder<'_, '_>, join: Block) {
+    b.seal(join);
+    b.switch_to(join);
+    b.init_slots(join);
 }
 
 // --- compares ---------------------------------------------------------------

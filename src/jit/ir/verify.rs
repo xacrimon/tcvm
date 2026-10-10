@@ -267,13 +267,14 @@ pub(crate) fn live_in(f: &Func<'_>, rpo: &[Block]) -> Vec<ValSet> {
 
 /// Each operation's operands are the representations it takes.
 fn check_reps(f: &Func<'_>, i: Inst) -> Result<(), String> {
-    use crate::jit::ir::ops::{HelperId, Op::*};
+    use crate::jit::ir::ops::Op::*;
     use crate::jit::ir::types::Rep::{self, *};
     let op = f.op(i);
     let args = f.args(i);
     let want: &[Rep] = match op {
         Store(_) | Unbox(_) | IsType(_) | IsFalsy | Guard(_) | ToF64 => &[Val],
-        SameBits | GuardSame | Helper(HelperId::Lt | HelperId::Le | HelperId::Eq) => &[Val, Val],
+        SameBits | GuardSame => &[Val, Val],
+        Helper(h) => h.sig().args,
         GuardTrue | GuardFalse | Br => &[B1],
         IAdd | ISub | IMul | IAddNo | ISubNo | IMulNo | IAnd | IOr | IXor | IShl | IShr
         | IDivFloor | IModFloor | ICmp(_) => &[I32, I32],
@@ -281,9 +282,7 @@ fn check_reps(f: &Func<'_>, i: Inst) -> Result<(), String> {
         LAdd | LSub | LMul | LUDiv | LAnd | LOr | LXor | LShl | LShr | LDivFloor | LModFloor
         | LCmp(_) => &[I64, I64],
         LNeg | LNot | LToF | LToI => &[I64],
-        FAdd | FSub | FMul | FDiv | FIDiv | FCmp(_) | Helper(HelperId::FMod | HelperId::FPow) => {
-            &[F64, F64]
-        }
+        FAdd | FSub | FMul | FDiv | FIDiv | FCmp(_) => &[F64, F64],
         FNeg | FAbs | FSqrt | FFloor | FCeil | FToIExact | FToL => &[F64],
         Box => {
             if f.ty(args[0]).rep == Val {

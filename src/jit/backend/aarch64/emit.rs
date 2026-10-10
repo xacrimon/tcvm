@@ -14,7 +14,7 @@ use crate::jit::backend::aarch64::asm::{
 use crate::jit::backend::aarch64::inst::{AluOp, ENTRY_FAIL, FOp, FUnOp, MInst, Test};
 use crate::jit::backend::aarch64::lower::{LExit, Lowered, Src};
 use crate::jit::backend::vcode::VCode;
-use crate::jit::ir::ops::HelperId;
+use crate::jit::ir::ops::Ctx;
 use crate::jit::ir::types::TypeSet;
 use crate::jit::region::{Loc, SnapEntry};
 
@@ -61,13 +61,8 @@ pub(crate) struct Helpers {
     pub(crate) exit_common: usize,
     pub(crate) entry_fail: usize,
     pub(crate) enter: usize,
-    pub(crate) fmod: usize,
-    pub(crate) pow: usize,
     pub(crate) box_i64: usize,
     pub(crate) land: usize,
-    pub(crate) lt: usize,
-    pub(crate) le: usize,
-    pub(crate) eq: usize,
 }
 
 fn gpr(p: PReg) -> Gpr {
@@ -312,6 +307,13 @@ impl Em<'_> {
             self.a.mov_imm(X16, BOX);
             self.a.cmp(Sz::X, v, X16);
             Cond::Lo
+        } else if set == TypeSet::SMALL | TypeSet::FLOAT {
+            // Below `BOX` (a float), else the small-int high word.
+            self.a.mov_imm(X16, BOX);
+            self.a.cmp(Sz::X, v, X16);
+            self.a.lsr_imm(Sz::X, X17, v, 32);
+            self.a.ccmn_imm(Sz::W, X17, 1, 0b0100, Cond::Hs);
+            Cond::Eq
         } else if set == TypeSet::NIL {
             self.a.mov_imm(X16, NIL);
             self.a.cmp(Sz::X, v, X16);
@@ -661,17 +663,16 @@ impl Em<'_> {
             }
             GcCheck { exit } => self.gc_check(exit),
             Helper(h) => {
-                let target = match h {
-                    HelperId::FMod => self.helpers.fmod,
-                    HelperId::FPow => self.helpers.pow,
-                    HelperId::Lt => self.helpers.lt,
-                    HelperId::Le => self.helpers.le,
-                    HelperId::Eq => self.helpers.eq,
-                };
-                if matches!(h, HelperId::Lt | HelperId::Le | HelperId::Eq) {
-                    self.a.mov(Gpr(0), RT);
+                let sig = h.sig();
+                for (k, c) in sig.ctx.iter().enumerate() {
+                    match c {
+                        Ctx::Rt => self.a.mov(Gpr(k as u8), RT),
+                    }
                 }
-                self.a.bl_far(target);
+                if let Some(imm) = sig.imm {
+                    self.a.mov_imm(Gpr(sig.ctx.len() as u8), imm);
+                }
+                self.a.bl_far(crate::jit::helpers::address(h));
             }
             Jump => {
                 let t = self.v.succs(block)[0].index();
@@ -859,6 +860,7 @@ fn single_tag(set: TypeSet) -> Option<u16> {
 fn is_single_test(set: TypeSet) -> bool {
     set == TypeSet::SMALL
         || set == TypeSet::FLOAT
+        || set == TypeSet::SMALL | TypeSet::FLOAT
         || set == TypeSet::NIL
         || set == TypeSet::FALSY
         || set == TypeSet::BOOL

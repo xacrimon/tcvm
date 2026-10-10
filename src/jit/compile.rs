@@ -279,13 +279,8 @@ pub(crate) fn compile<'gc>(
         exit_common: abi::exit_common as *const () as usize,
         entry_fail: crate::jit::jit_entry_fail as *const () as usize,
         enter: crate::vm::ops::call::enter as *const () as usize,
-        fmod: crate::jit::helpers::jit_fmod as *const () as usize,
-        pow: crate::jit::helpers::jit_pow as *const () as usize,
         box_i64: crate::jit::helpers::jit_box_i64 as *const () as usize,
         land: crate::jit::helpers::jit_land as *const () as usize,
-        lt: crate::jit::helpers::jit_lt as *const () as usize,
-        le: crate::jit::helpers::jit_le as *const () as usize,
-        eq: crate::jit::helpers::jit_eq as *const () as usize,
     };
     let mut em = emit::emit(&lowered, &out, helpers).map_err(CompileError::Backend)?;
     let size = em.asm.offset() + em.asm.pool_bytes() + 16;
