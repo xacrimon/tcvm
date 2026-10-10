@@ -204,6 +204,10 @@ pub(crate) struct Region<'gc> {
     pub(crate) num_spills: u32,
     #[collect(require_static)]
     pub(crate) retired: Cell<bool>,
+    /// How many of `JitState::kind_exits` and `shapes_seen` the compile saw:
+    /// a hot exit that adds to them widens the next compile.
+    #[collect(require_static)]
+    pub(crate) known: (u32, u32),
 }
 
 impl<'gc> Region<'gc> {

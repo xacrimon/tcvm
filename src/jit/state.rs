@@ -257,6 +257,8 @@ pub(crate) struct JitState<'gc> {
     pub(crate) entries: Vec<Entry<'gc>>,
     /// Receiver shapes hot shape exits saw, by pc.
     pub(crate) shapes_seen: Vec<(u32, crate::env::shape::Shape<'gc>)>,
+    /// Sites whose form compiled code saw other kinds at, by pc.
+    pub(crate) kind_exits: Vec<u32>,
     /// Every region compiled for the prototype, live or retired: a frame may
     /// still return into a retired one.
     pub(crate) regions: Vec<Gc<'gc, Region<'gc>>>,

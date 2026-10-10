@@ -42,7 +42,7 @@ fn arith_mode(b: &Builder<'_, '_>, pc: u32) -> Mode {
     if matches!(op, BcOp::ARITH_MM | BcOp::ARITH_MM_R | BcOp::ARITH_MMI) {
         return Mode::Generic;
     }
-    if op != generic {
+    if op != generic && !b.kind_exited(pc) {
         let forms = &info.forms;
         let imm = matches!(info.family, Family::ImmArith | Family::ImmBit);
         let idx = forms.iter().position(|f| *f == Some(op));
@@ -1094,7 +1094,7 @@ fn emit_cmp_reg(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Bl
         BcOp::JNEQ => (Cc::Eq, false),
         _ => unreachable!(),
     };
-    let how = if op != generic {
+    let how = if op != generic && !b.kind_exited(pc) {
         // An `_II` form, which exits saw leave i32.
         if wide { CmpAs::I64 } else { CmpAs::I32 }
     } else {
@@ -1289,7 +1289,7 @@ fn emit_cmp_imm(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Bl
     };
     // `k <cc> v` is `v <swapped cc> k`.
     let cc = if swap { cc.swap() } else { cc };
-    let how = if op != generic {
+    let how = if op != generic && !b.kind_exited(pc) {
         CmpAs::F64
     } else {
         match num_kind(b, v).or(byte_kind(b, pc)) {
