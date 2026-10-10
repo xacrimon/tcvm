@@ -10,13 +10,13 @@ use crate::instruction::Instruction;
 use crate::jit::build::Builder;
 use crate::jit::build::emit::{arm_end, branch_arm, enter_join};
 use crate::jit::feedback as fb;
+use crate::jit::ir::Block;
 use crate::jit::ir::Val;
 use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL_VAL, HelperId, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
-use crate::jit::ir::Block;
 use crate::vm::abi::Handler;
-use crate::vm::native::ContFn;
 use crate::vm::ff;
+use crate::vm::native::ContFn;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Intrinsic {
@@ -41,15 +41,24 @@ fn intrinsic_of(f: Function<'_>) -> Option<Intrinsic> {
     let nc = f.as_native()?;
     let plain: [(NativeFn, Intrinsic); 10] = [
         (base::lua_type, Intrinsic::Builtin(HelperId::Type)),
-        (base::lua_getmetatable, Intrinsic::Builtin(HelperId::GetMetatable)),
+        (
+            base::lua_getmetatable,
+            Intrinsic::Builtin(HelperId::GetMetatable),
+        ),
         (base::lua_rawget, Intrinsic::Builtin(HelperId::RawGet)),
         (base::lua_rawset, Intrinsic::Builtin(HelperId::RawSet)),
         (base::lua_rawequal, Intrinsic::Builtin(HelperId::RawEqual)),
         (base::lua_rawlen, Intrinsic::Builtin(HelperId::RawLen)),
         (base::lua_tonumber, Intrinsic::Builtin(HelperId::ToNumber)),
         (base::lua_select, Intrinsic::Select),
-        (crate::builtin::string::lua_len, Intrinsic::Builtin(HelperId::StrLen)),
-        (crate::builtin::string::lua_byte, Intrinsic::Builtin(HelperId::StrByte)),
+        (
+            crate::builtin::string::lua_len,
+            Intrinsic::Builtin(HelperId::StrLen),
+        ),
+        (
+            crate::builtin::string::lua_byte,
+            Intrinsic::Builtin(HelperId::StrByte),
+        ),
     ];
     match nc.function {
         NativeKind::Plain(p) => {
@@ -73,7 +82,10 @@ fn intrinsic_of(f: Function<'_>) -> Option<Intrinsic> {
         (ff::ff_assert, Intrinsic::Assert),
         (crate::vm::native::ff_pairs, Intrinsic::Pairs),
         (crate::vm::native::ff_ipairs, Intrinsic::Ipairs),
-        (ff::ff_setmetatable, Intrinsic::Builtin(HelperId::SetMetatable)),
+        (
+            ff::ff_setmetatable,
+            Intrinsic::Builtin(HelperId::SetMetatable),
+        ),
         (ff::ff_sub, Intrinsic::Builtin(HelperId::StrSub)),
     ];
     table
@@ -189,10 +201,7 @@ fn builtin<'gc>(
     let mut out = Emitted::Done;
     if !matches!(
         h,
-        HelperId::Type
-            | HelperId::GetMetatable
-            | HelperId::RawEqual
-            | HelperId::ToNumber
+        HelperId::Type | HelperId::GetMetatable | HelperId::RawEqual | HelperId::ToNumber
     ) {
         let fail = b.ins(Op::KVal(HELPER_FAIL_VAL), &[]);
         let failed = b.ins(Op::SameBits, &[r, fail]);
@@ -265,8 +274,7 @@ fn select<'gc>(
         let vararg = p.is_some_and(|p| {
             p.op() == crate::instruction::Op::VARARG && p.a() == a + 5 && p.b() == 0
         });
-        let same_block =
-            vararg && b.cfg.block_of[pc as usize] == b.cfg.block_of[pc as usize - 1];
+        let same_block = vararg && b.cfg.block_of[pc as usize] == b.cfg.block_of[pc as usize - 1];
         if !same_block || (!count && !k.is_some_and(|k| (1..=256).contains(&k))) {
             return Emitted::No;
         }

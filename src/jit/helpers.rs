@@ -566,7 +566,12 @@ pub(crate) extern "C" fn jit_getmetatable(rt: *const State<'static>, v: u64) -> 
     match ctx.metatable_of(v) {
         Some(mt) => {
             let prot = mt.raw_get(Value::string(ctx.symbols().metatable));
-            if prot.is_nil() { Value::table(mt) } else { prot }.to_raw()
+            if prot.is_nil() {
+                Value::table(mt)
+            } else {
+                prot
+            }
+            .to_raw()
         }
         None => Value::nil().to_raw(),
     }
@@ -580,7 +585,9 @@ pub(crate) extern "C" fn jit_setmetatable(rt: *const State<'static>, t: u64, mt:
     let (Some(t), Some(mt)) = (tv.get_table(), mt.get_table()) else {
         return HELPER_FAIL_VAL;
     };
-    if t.set_metatable_fast(ctx.mutation(), mt, ctx.symbols()).is_none() {
+    if t.set_metatable_fast(ctx.mutation(), mt, ctx.symbols())
+        .is_none()
+    {
         if t.metatable().is_some() {
             return HELPER_FAIL_VAL;
         }

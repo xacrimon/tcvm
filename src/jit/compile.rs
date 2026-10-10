@@ -128,6 +128,9 @@ pub(crate) fn build_ir<'gc>(
     check(&f, "optimize")?;
     opt::calls::call_boundaries(&mut f).map_err(CompileError::Verify)?;
     check(&f, "call boundaries")?;
+    opt::snaps::prune_snapshots(&mut f);
+    opt::dce(&mut f);
+    check(&f, "snapshot pruning")?;
     times.passes = built.elapsed().as_micros();
     if !opt::completes(&f) {
         return Err(CompileError::Useless);

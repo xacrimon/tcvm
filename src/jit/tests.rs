@@ -273,3 +273,28 @@ fn loop_carried_definitions_guard_only_down_safe() {
     let ir = ir_of(src, "append", 0);
     assert!(!ir.contains("Type after"), "{ir}");
 }
+
+/// An exit does not restore a register whose slot still holds the value:
+/// the parameters here are only ever loaded, though inside the loop the
+/// snapshots name their guarded copies.
+#[test]
+fn snapshots_leave_out_unchanged_slots() {
+    let src = "function h(a, b)
+        local s = 0
+        for i = 1, 10 do s = s + a.x * i + b end
+        return s + a.y
+    end
+    for i = 1, 300 do h({x = 1.5, y = 2}, i) end";
+    let ir = ir_of(src, "h", 0);
+    let snaps: Vec<&str> = ir
+        .lines()
+        .filter_map(|l| l.split_once('[').map(|x| x.1))
+        .collect();
+    assert!(!snaps.is_empty(), "{ir}");
+    assert!(
+        snaps
+            .iter()
+            .all(|s| !s.contains("r0=") && !s.contains("r1=")),
+        "{ir}"
+    );
+}

@@ -41,7 +41,8 @@ pub(crate) const T_HEADER: i32 =
 /// tells a native function, whose variant ends before it, by the niche the
 /// enum's tag takes there (`fn_kind_niche` checks it).
 const FN_LUA: usize = offset_of!(crate::env::function::FunctionKind<'static>, Lua.0);
-pub(crate) const FN_CODE: usize = FN_LUA + offset_of!(crate::env::function::LuaClosure<'static>, code);
+pub(crate) const FN_CODE: usize =
+    FN_LUA + offset_of!(crate::env::function::LuaClosure<'static>, code);
 pub(crate) const FN_NUM_PARAMS: usize =
     FN_LUA + offset_of!(crate::env::function::LuaClosure<'static>, num_params);
 pub(crate) const FN_MAX_STACK: usize =
@@ -161,7 +162,12 @@ mod tests {
             assert_eq!(byte(fixed, FN_IS_VARARG), 0);
             assert_eq!(byte(fixed, FN_NUM_PARAMS), 2);
             assert_eq!(byte(fun(3), FN_IS_VARARG), 1);
-            let lf = t.raw_get(Value::small(2)).get_function().unwrap().as_lua().unwrap();
+            let lf = t
+                .raw_get(Value::small(2))
+                .get_function()
+                .unwrap()
+                .as_lua()
+                .unwrap();
             let code = unsafe { ((fixed + FN_CODE) as *const usize).read() };
             assert_eq!(code, lf.code as usize);
             assert_eq!(byte(fixed, FN_MAX_STACK), lf.max_stack_size);

@@ -7,6 +7,7 @@ pub(crate) mod infer;
 pub(crate) mod licm;
 pub(crate) mod peel;
 pub(crate) mod simplify;
+pub(crate) mod snaps;
 pub(crate) mod speculate;
 
 use crate::jit::ir::ops::Op;
