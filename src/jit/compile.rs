@@ -284,7 +284,16 @@ pub(crate) fn compile<'gc>(
         box_i64: crate::jit::helpers::jit_box_i64 as *const () as usize,
         land: crate::jit::helpers::jit_land as *const () as usize,
     };
-    let mut em = emit::emit(&lowered, &out, helpers).map_err(CompileError::Backend)?;
+    // Allocated now, moved into the region after: the code embeds its address.
+    let fired: Box<[std::cell::Cell<u32>]> = if config.deopt_all {
+        (0..lowered.exits.len())
+            .map(|_| std::cell::Cell::new(0))
+            .collect()
+    } else {
+        Box::new([])
+    };
+    let fired_at = config.deopt_all.then(|| fired.as_ptr() as usize);
+    let mut em = emit::emit(&lowered, &out, helpers, fired_at).map_err(CompileError::Backend)?;
     let size = em.asm.offset() + em.asm.pool_bytes() + 16;
     let alloc = ctx.jit().code_alloc();
     let block = alloc
@@ -365,6 +374,7 @@ pub(crate) fn compile<'gc>(
             pool: f.pool.clone().into_boxed_slice(),
             shapes: f.shapes.clone().into_boxed_slice(),
             exits: exits.into_boxed_slice(),
+            fired,
             snaps: snaps.into_boxed_slice(),
             consts: consts.into_boxed_slice(),
             entry_regs: lowered.entry_regs.clone().into_boxed_slice(),

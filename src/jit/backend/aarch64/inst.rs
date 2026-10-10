@@ -268,6 +268,32 @@ pub(crate) enum MInst {
     },
 }
 
+impl MInst {
+    /// The exit of an instruction that may take one before its effects,
+    /// with the frame its snapshot describes.
+    pub(crate) fn exit_id(&self) -> Option<u32> {
+        use MInst::*;
+        let e = match *self {
+            AddOvf { exit, .. }
+            | AddImmOvf { exit, .. }
+            | MulOvf { exit }
+            | NegOvf { exit }
+            | DivMod { exit, .. }
+            | ShiftI32 { exit, .. }
+            | LToI { exit }
+            | FToIExact { exit }
+            | ToF64 { exit }
+            | Guard { exit, .. }
+            | GuardNoFlag { exit, .. }
+            | GuardShape { exit, .. }
+            | GcCheck { exit }
+            | GuardFits { exit, .. } => exit,
+            _ => return None,
+        };
+        (e != ENTRY_FAIL).then_some(e)
+    }
+}
+
 impl TargetInst for MInst {
     fn is_branch(&self) -> bool {
         matches!(
