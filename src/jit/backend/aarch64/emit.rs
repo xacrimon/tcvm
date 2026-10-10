@@ -53,6 +53,8 @@ struct Em<'a> {
     exit_region: Label,
     entry_fail: Label,
     helpers: Helpers,
+    /// The `TCVM_JIT_DEOPT_ALL` flags of the exits, by address.
+    fired: Option<usize>,
 }
 
 /// Addresses of the Rust routines a region branches to.
@@ -79,7 +81,12 @@ fn spill_off(slot: usize) -> i32 {
     16 + 8 * slot as i32
 }
 
-pub(crate) fn emit(l: &Lowered, out: &Output, helpers: Helpers) -> Result<Emitted, String> {
+pub(crate) fn emit(
+    l: &Lowered,
+    out: &Output,
+    helpers: Helpers,
+    fired: Option<usize>,
+) -> Result<Emitted, String> {
     if out.num_spillslots > 64 {
         return Err(format!("{} spill slots", out.num_spillslots));
     }
@@ -99,6 +106,7 @@ pub(crate) fn emit(l: &Lowered, out: &Output, helpers: Helpers) -> Result<Emitte
         exit_region,
         entry_fail,
         helpers,
+        fired,
     };
     let nb = l.vcode.blocks.len();
     for b in 0..nb {
@@ -395,6 +403,15 @@ impl Em<'_> {
 
     fn inst(&mut self, i: usize, block: usize, next: Option<Label>) -> Result<(), String> {
         let inst = self.v.insts[i].clone();
+        if let Some(fired) = self.fired
+            && let Some(k) = inst.exit_id()
+        {
+            // An exit that never fired fires now.
+            let l = self.exit(k);
+            self.a.ldr_lit(X16, (fired + 4 * k as usize) as u64);
+            self.a.ldr_w(X16, X16, 0);
+            self.a.cbz(Sz::W, X16, l);
+        }
         use MInst::*;
         match inst {
             Prologue => self.open_frame(),

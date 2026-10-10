@@ -181,6 +181,10 @@ pub(crate) struct Region<'gc> {
     pub(crate) shapes: Box<[crate::env::Shape<'gc>]>,
     #[collect(require_static)]
     pub(crate) exits: Box<[ExitInfo]>,
+    /// Under `TCVM_JIT_DEOPT_ALL`, whether each exit fired: the code takes
+    /// one that has not (14); empty otherwise.
+    #[collect(require_static)]
+    pub(crate) fired: Box<[Cell<u32>]>,
     /// The snapshots, which exits with equal ones share.
     #[collect(require_static)]
     pub(crate) snaps: Box<[u32]>,

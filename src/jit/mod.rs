@@ -86,6 +86,9 @@ handler! {
         let region: &Region<'gc> = unsafe { &*((raw & PTR_MASK) as *const Region<'gc>) };
         let k = (raw >> 48) as usize;
         let e = &region.exits[k];
+        if let Some(f) = region.fired.get(k) {
+            f.set(1);
+        }
         let mc = rt.mutation();
         let img = rt.jit().exit_regs();
         let snap = region.snap(e);
