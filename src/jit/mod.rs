@@ -203,7 +203,11 @@ fn entry_site(closure: LuaFn<'_>, site: u32, word: Instruction) -> Option<u32> {
     let at = match word.op() {
         Op::JMP_BACK | Op::TFORLOOP => {
             if let Some(state) = closure.proto.jit.get()
-                && state.borrow().entries.iter().any(|e| e.back_edges.contains(&site))
+                && state
+                    .borrow()
+                    .entries
+                    .iter()
+                    .any(|e| e.back_edges.contains(&site))
             {
                 return None;
             }
@@ -509,6 +513,15 @@ fn record_site<'gc>(closure: LuaFn<'gc>, base: *mut Value<'gc>, pc: u32, overflo
             }
         }
         Op::FORLOOP | Op::FORLOOP_I | Op::FORLOOP_F => kind(i.a() + 1) | kind(i.a() + 2),
+        // An intrinsic's argument (12): one it did not cover makes the next
+        // compile a call.
+        Op::CALL
+        | Op::CALL_R0
+        | Op::CALL_R1
+        | Op::CALLS
+        | Op::CALLS_R0
+        | Op::CALLS_R1
+        | Op::TAILCALL => kind(i.a() + 4),
         _ => 0,
     };
     bits |= match i.op().info().family {

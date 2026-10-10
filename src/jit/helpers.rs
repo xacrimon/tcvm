@@ -24,6 +24,8 @@ pub(crate) fn address(h: HelperId) -> usize {
     match h {
         HelperId::FMod => jit_fmod as *const () as usize,
         HelperId::FPow => jit_pow as *const () as usize,
+        HelperId::Sin => jit_sin as *const () as usize,
+        HelperId::Cos => jit_cos as *const () as usize,
         HelperId::Lt => jit_lt as *const () as usize,
         HelperId::Le => jit_le as *const () as usize,
         HelperId::Eq => jit_eq as *const () as usize,
@@ -60,6 +62,14 @@ pub(crate) extern "C" fn jit_fmod(a: f64, b: f64) -> f64 {
 
 pub(crate) extern "C" fn jit_pow(a: f64, b: f64) -> f64 {
     canonical(<num::Pow as ArithOp>::float_raw(a, b))
+}
+
+pub(crate) extern "C" fn jit_sin(x: f64) -> f64 {
+    canonical(x.sin())
+}
+
+pub(crate) extern "C" fn jit_cos(x: f64) -> f64 {
+    canonical(x.cos())
 }
 
 /// The interpreter's primitive `<` (`le`: `<=`), as `cmp_slow` has it.

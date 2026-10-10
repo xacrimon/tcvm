@@ -5,6 +5,7 @@
 
 pub(crate) mod cfg;
 mod emit;
+mod intrinsics;
 mod tables;
 
 use crate::dmm::Gc;
@@ -89,6 +90,9 @@ pub(crate) struct Builder<'a, 'gc> {
     cur_snap: Option<Snap>,
     pub(crate) pc: u32,
     pub(crate) deopt_all: bool,
+    /// The receiver and constant key of each direct field load, for values
+    /// the builder can know now (intrinsic callees).
+    pub(crate) field_loads: crate::jit::FastMap<Val, (Val, Value<'gc>)>,
 }
 
 impl<'a, 'gc> Builder<'a, 'gc> {
@@ -117,6 +121,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             cur_snap: None,
             pc: entry_pc,
             deopt_all: false,
+            field_loads: Default::default(),
         }
     }
 
