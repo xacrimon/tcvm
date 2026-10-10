@@ -701,7 +701,7 @@ arity checks inlined (the callee's `max_stack_size` and `fixed_arity` are known)
 This skips `enter`'s loads and tests and the `JIT_ENTRY` dispatch. The target
 address is patched through the callee's `JitState` when the callee region is
 retired (section 11.4); until the patch the old region stays valid. This is
-milestone 4 work; the design only requires that the header and its resume point
+milestone 3 work; the design only requires that the header and its resume point
 are the same whichever way the callee was entered.
 
 ### 5.5 Returns and tail calls
@@ -1178,7 +1178,7 @@ and emit nothing by themselves.
 |---|---|
 | `CALL*`, `CALLS*` with an unknown callee | the sequence of 5.4; the callee value is loaded from its SSA value and stored to `R[a]` |
 | callee a compile-time constant native with an intrinsic | section 12 |
-| callee a compile-time constant Lua closure with a live function-entry region | direct call (5.4, milestone 4) |
+| callee a compile-time constant Lua closure with a live function-entry region | direct call (5.4, milestone 3) |
 | `b == 0` (arguments up to `top`) | milestone 1 deopts; later the count comes from `thread.top` |
 | `TAILCALL` | 5.5 |
 | `RETURN*` | 5.5 |
@@ -1608,7 +1608,7 @@ definition when the definition is a boxed `I32` producer (narrowing of block
 parameters: a parameter whose every incoming argument is `Box(I32)` becomes an
 `I32` parameter with the boxes moved to the uses that need `Val`).
 
-### 9.7 Range analysis (after milestone 3)
+### 9.7 Range analysis (milestone 3)
 
 Interval analysis over `I32` values: constants, `FORPREP` bounds (`last` and the
 step give the counter's range), compares on dominating edges, `asize` bounds for
@@ -1831,7 +1831,7 @@ it never needed more.
   target address inside the window and checked on return; a probe loop walks the
   window in 64 KiB steps around the text, both directions, as LuaJIT's
   `mcode_alloc` does. Segments are allocated in one reserved run where the system
-  allows it, so region-to-region branches (exits, M4 direct calls) are direct as
+  allows it, so region-to-region branches (exits, milestone 3 direct calls) are direct as
   well.
 - **Exhaustion.** Code memory is bounded by the window (well over 100 MiB). When
   no segment fits, `jit_hot` refuses new compiles and logs it once; code cannot be
@@ -1997,10 +1997,10 @@ the prototype.
 
 A recompile builds the new region, installs it in the same entry (the opcode word
 is unchanged; only the table slot and `entries[i].region` change), and marks the
-old one retired. Direct calls into the old region (5.4, milestone 4) are repatched through
+old one retired. Direct calls into the old region (5.4, milestone 3) are repatched through
 the callers' `CallSite` lists: each region records which callee entries it jumps
 to directly, and each `Entry` keeps a list of (region, patch offset) pairs to
-rewrite when its code changes. Until milestone 4 no such edges exist.
+rewrite when its code changes. Until milestone 3 no such edges exist.
 
 Blacklisting restores `original` into `Code[pc]`, frees the table slot, retires the
 region and sets the entry's bit; `jit_hot` checks the bit first.
@@ -2076,7 +2076,7 @@ pointer, filled when the standard library is installed.
 
 A `Call` whose callee is a constant Lua closure (7.5) with a small prototype (at
 most `INLINE_LIMIT = 40` instructions, not vararg, no `TBC`, no `CLOSURE` capturing
-its parameters by reference, no `TAILCALL`) can be inlined at milestone 4:
+its parameters by reference, no `TAILCALL`) can be inlined at milestone 3:
 
 - The callee's register `r` maps to caller slot `a + 4 + r`, the slot the callee
   frame would have had (`base + a + 4 + r`), with the window check for
@@ -2159,23 +2159,23 @@ pass for its coverage and its measurements are recorded.
    `n` in an x register, 7.2); compile time per stage
    measured on them; the interpreter changes measured with the JIT off against
    main (6.1, 4.8).
-2. **Helpers and allocation.** Generic arithmetic helpers, `_NN` and locked
-   sites, `CONCAT`, `NEWTABLE`, `SETLIST`, `CLOSURE`, barriers, `VARARG` forms,
-   `CLOSE`, upvalue reads and writes, intrinsics for `math.*` and `type`; LICM
-   (9.5) with the rest of the call-boundary pass and snapshot re-pruning (9.8),
-   which LICM needs in loops that call. Exit: `fft`, `nbody` compiled end to end;
-   `TCVM_JIT_DEOPT_ALL` passes on all test files.
-3. **Tables and metamethods.** Field forms with ICs, `GETTABLE`/`SETTABLE` array
-   paths, `_PROTO` chains, `ARITH_MM*`, metamethod calls, `TFORCALL_NEXT/_IPAIRS`,
-   `LEN`, `MULTRET` forms, `TAILCALL` fast arm, hot-exit recompilation with
-   polymorphic shape chains, blacklisting. Exit: `particles_bench` and the LJR
-   suite compiled; results versus the interpreter and LuaJIT recorded in the
-   perf notes.
-4. **Calls.** Direct calls to compiled entries with patching, inlining (13),
+2. **Helpers, allocation, tables and metamethods.** Generic arithmetic helpers,
+   `_NN` and locked sites, `CONCAT`, `LEN`, `NEWTABLE`, `SETLIST`, `CLOSURE`,
+   barriers, `VARARG` forms, `CLOSE`, upvalue reads and writes, field forms with
+   ICs, `GETTABLE`/`SETTABLE` array paths, `_PROTO` chains, `ARITH_MM*`, metamethod
+   calls, `TFORCALL_NEXT/_IPAIRS`, `MULTRET` forms, the `TAILCALL` fast arm,
+   intrinsics (12), LICM (9.5) with the rest of the call-boundary pass and
+   snapshot re-pruning (9.8), hot-exit recompilation with polymorphic shape
+   chains, blacklisting. Exit: `fft`, `nbody`, `particles_bench` and the LJR suite
+   compiled end to end; `TCVM_JIT_DEOPT_ALL` passes on all test files; results
+   versus the interpreter and LuaJIT recorded in the perf notes. This was two
+   milestones until 2026-10-10: the first one's exit benchmarks, `fft` and `nbody`,
+   are array and field code, which only the second compiled.
+3. **Calls.** Direct calls to compiled entries with patching, inlining (13),
    `pcall` through `enter`, range analysis (9.7). Exit: the LJR call-heavy
    benchmarks (`fib`, `richards`, `deltablue`, `havlak`) measured against the
    interpreter and LuaJIT.
-5. **x86-64.** The second target per Appendix E, run under Rosetta for
+4. **x86-64.** The second target per Appendix E, run under Rosetta for
    correctness.
 
 Compile-time budgets, measured in milestone 1 on a 200-instruction function on
@@ -2306,40 +2306,40 @@ unit test round-trips a snapshot with two.
 Strategy per opcode on main's ISA (204 opcodes); `D` is a `Before` deopt until the
 named milestone, `H` a helper, `I` inline code.
 
-| Opcodes | M1 | M2 | M3 | Notes |
-|---|---|---|---|---|
-| `MOVE`, `LOAD`, `LOADI`, `LOADNIL`, `LFALSESKIP` | I | | | SSA only |
-| `GETUPVAL` | I | | | one load from the closure cell (7.5) |
-| `GETUPVAL_REF` | D | I | | through the cell |
-| `SETUPVAL` | D | H | | barrier helper |
-| `GETTABUP*`, `GETFIELD*`, `SELF*`, `SETTABUP*`, `SETFIELD*` (27 opcodes: 5 generic, 20 forms, 2 `_REF`) | D | D | I | 7.4; `_REF` receivers via the cell |
-| `GETTABLE`, `SETTABLE` | D | D | I/H | array fast path inline, else helper |
-| `NEWTABLE`, `SETLIST` | D | H | | `NEWTABLE` allocates (5.7) |
-| `ADD`..`SHR` generic (12), `_NN` (7) | D / I | H | | never-executed blocks (6.3) stay D; an integer-kinds byte gives `I64` code from M1 |
-| `_II`, `_FF`, `_IF`, `_FI`, bitwise `_II`, `POW_II` (27) | I | | | 7.2 |
-| `ADDI`..`RSHRI` generic (19) | D / I | H | | as the register forms |
-| `_I`, `_F`, `_IF` immediate forms (27) | I | | | |
-| `ARITH_MM`, `_MM_R`, `_MMI` | D | D | I + call | |
-| `UNM`, `BNOT`, `NOT` | I | | | slow cases H in M2 |
-| `LEN`, `CONCAT` | D | H | | |
-| `CLOSE`, `TBC` | D | H / D | | TBC stays D |
-| `JMP` | I | | | |
-| `JEQ`..`JNLE` generic, `JEQI`..`JNGEI`, `JEQS`, `JNEQS` | I + H | | | inline numeric cases, then `jit_lt`/`jit_le`/`jit_eq` (strings, big integers, mixed numbers); `__eq`/`__lt`/`__le` deopt until M3 |
-| `_II` compares (6), `_F` compares (8) | I | | | |
-| `JT`, `JF`, `JTSET`, `JFSET` | I | | | |
-| `CALL`, `CALL_R0`, `CALL_R1`, `CALLS*` | I (5.4) | | direct calls M4 | `b == 0` D until M3 |
-| `TAILCALL` | D | | I fast arm | |
-| `RETURN`, `RETURN0`, `RETURN1` | I | | | `b == 0` and flags set: D until M3 |
-| `FORPREP`, `FORLOOP_I`, `FORLOOP_F`, generic `FORLOOP` | I | | | generic `FORLOOP` as an `I64` loop; one with nothing recorded never iterated (D); loops that ran as both kinds D |
-| `TFORPREP`, `TFORCALL`, `TFORCALL_NEXT`, `TFORCALL_IPAIRS`, `TFORLOOP` | D | | I | generic `TFORCALL` is a call |
-| `CLOSURE` | D | H | | |
-| `VARARG`, `VARARGGET`, `VARARGPREP` | D | I/H | | |
-| `ERRNNIL` | I | | | nil test, deopt to raise |
-| `NOP` | I | | | |
-| `STOP` | D | | | |
-| `FUNC`, `LOOP` | I | | | emit nothing; a region never counts |
-| `JMP_BACK` | I | | | a `JMP` |
-| `JIT_ENTRY`, `JIT_LOOP` | resolved to the original word by the builder | | | |
+| Opcodes | M1 | M2 | Notes |
+|---|---|---|---|
+| `MOVE`, `LOAD`, `LOADI`, `LOADNIL`, `LFALSESKIP` | I | | SSA only |
+| `GETUPVAL` | I | | one load from the closure cell (7.5) |
+| `GETUPVAL_REF` | D | I | through the cell |
+| `SETUPVAL` | D | H | barrier helper |
+| `GETTABUP*`, `GETFIELD*`, `SELF*`, `SETTABUP*`, `SETFIELD*` (27 opcodes: 5 generic, 20 forms, 2 `_REF`) | D | I | 7.4; `_REF` receivers via the cell |
+| `GETTABLE`, `SETTABLE` | D | I/H | array fast path inline, else helper |
+| `NEWTABLE`, `SETLIST` | D | H | `NEWTABLE` allocates (5.7) |
+| `ADD`..`SHR` generic (12), `_NN` (7) | D / I | H | never-executed blocks (6.3) stay D; an integer-kinds byte gives `I64` code from M1 |
+| `_II`, `_FF`, `_IF`, `_FI`, bitwise `_II`, `POW_II` (27) | I | | 7.2 |
+| `ADDI`..`RSHRI` generic (19) | D / I | H | as the register forms |
+| `_I`, `_F`, `_IF` immediate forms (27) | I | |  |
+| `ARITH_MM`, `_MM_R`, `_MMI` | D | I + call | |
+| `UNM`, `BNOT`, `NOT` | I | | slow cases H in M2 |
+| `LEN`, `CONCAT` | D | H | |
+| `CLOSE`, `TBC` | D | H / D | TBC stays D |
+| `JMP` | I | |  |
+| `JEQ`..`JNLE` generic, `JEQI`..`JNGEI`, `JEQS`, `JNEQS` | I + H | | inline numeric cases, then `jit_lt`/`jit_le`/`jit_eq` (strings, big integers, mixed numbers); `__eq`/`__lt`/`__le` calls in M2 |
+| `_II` compares (6), `_F` compares (8) | I | |  |
+| `JT`, `JF`, `JTSET`, `JFSET` | I | |  |
+| `CALL`, `CALL_R0`, `CALL_R1`, `CALLS*` | I (5.4) | | `b == 0` D until M2; direct calls M3 |
+| `TAILCALL` | D | I fast arm | |
+| `RETURN`, `RETURN0`, `RETURN1` | I | | `b == 0` and flags set: D until M2 |
+| `FORPREP`, `FORLOOP_I`, `FORLOOP_F`, generic `FORLOOP` | I | | generic `FORLOOP` as an `I64` loop; one with nothing recorded never iterated (D); loops that ran as both kinds D |
+| `TFORPREP`, `TFORCALL`, `TFORCALL_NEXT`, `TFORCALL_IPAIRS`, `TFORLOOP` | D | I | generic `TFORCALL` is a call |
+| `CLOSURE` | D | H | |
+| `VARARG`, `VARARGGET`, `VARARGPREP` | D | I/H | |
+| `ERRNNIL` | I | | nil test, deopt to raise |
+| `NOP` | I | |  |
+| `STOP` | D | |  |
+| `FUNC`, `LOOP` | I | | emit nothing; a region never counts |
+| `JMP_BACK` | I | | a `JMP` |
+| `JIT_ENTRY`, `JIT_LOOP` | resolved to the original word by the builder | |  |
 
 ## Appendix E: x86-64 extension points
 
