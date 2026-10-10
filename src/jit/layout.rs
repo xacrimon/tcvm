@@ -21,6 +21,10 @@ pub(crate) const METRICS: usize =
 /// The allocation counter and threshold pair inside `Metrics`.
 pub(crate) const GC_CHECK: usize = crate::dmm::metrics::Metrics::GC_CHECK_OFFSET;
 
+/// The end of the running thread's stack, from the `thread` register.
+pub(crate) const THREAD_STACK_END: usize =
+    offset_of!(crate::env::thread::ThreadState<'static>, stack_end);
+
 /// A table's `TableState` from its lock (a table value's payload).
 const T_STATE: usize = RefLock::<TableState<'static>>::TRAILING_FROM_LOCK
     - RefLock::<TableState<'static>>::TRAILING_FROM_INNER;

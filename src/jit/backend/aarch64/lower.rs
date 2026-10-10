@@ -144,7 +144,7 @@ pub(crate) fn lower<'gc>(f: &Func<'gc>, code_base: usize) -> Result<Lowered, Str
             lw.lower_inst(i)?;
             if f.op(i).is_terminator() {
                 // A call's resume block takes its values from the return.
-                let call = matches!(f.op(i), Op::Call { .. });
+                let call = matches!(f.op(i), Op::Call { .. } | Op::CallMm { .. });
                 for e in f.edges(i) {
                     succs.push(RBlock::new(lw.block_of[e.target.idx()] as usize));
                     let a = if call { &[][..] } else { f.vl(e.args) };
@@ -948,6 +948,24 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             Op::Call { a, nargs, pc, .. } => {
                 let pc_after = self.pc_base + (pc as usize + 1) * 8;
                 self.push(MInst::Call { a, nargs, pc_after }, &[], none);
+            }
+            Op::CallMm { pc, nargs } => {
+                let pc_after = self.pc_base + (pc as usize + 1) * 8;
+                let hdr = f.meta.max_stack as u16;
+                let ops: Vec<Operand> = args.iter().map(|&a| self.use_(a)).collect();
+                self.push(
+                    MInst::CallMm {
+                        hdr,
+                        nargs,
+                        pc_after,
+                    },
+                    &ops,
+                    none,
+                );
+            }
+            Op::GuardFits(n) => {
+                let end = f.meta.max_stack as u16 + 4 + n as u16;
+                self.push_exit(i, |exit| MInst::GuardFits { end, exit }, vec![], none);
             }
             Op::Return { a, n } => {
                 self.push(MInst::Return { a, n }, &[], none);

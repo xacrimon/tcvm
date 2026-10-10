@@ -601,10 +601,10 @@ impl<'a, 'gc> Builder<'a, 'gc> {
 
     /// End the block with a call: `Call` to a fresh resume block, which
     /// becomes current.
-    pub(crate) fn call(&mut self, op: Op, slot_tys: Vec<TypeSet>, c: u8) -> Block {
+    pub(crate) fn call(&mut self, op: Op, args: &[Val], slot_tys: Vec<TypeSet>, c: u8) -> Block {
         let resume = self.new_root(slot_tys);
         self.f.blocks[resume.idx()].resume = true;
-        self.terminate(op, &[], &[resume], None);
+        self.terminate(op, args, &[resume], None);
         self.bs[resume.idx()].preds.clear();
         self.switch_to(resume);
         let r = self.push(Op::Resume { c }, &[]);

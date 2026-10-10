@@ -228,6 +228,18 @@ pub(crate) enum MInst {
         nargs: u8,
         pc_after: usize,
     },
+    /// `[use f, use args..]`: a metamethod call from a header at slot `hdr`
+    /// (the frame's register count); succ 0 is the resume block.
+    CallMm {
+        hdr: u16,
+        nargs: u8,
+        pc_after: usize,
+    },
+    /// `[snap..]`: exit unless the header at `hdr` and `n` arguments fit.
+    GuardFits {
+        end: u16,
+        exit: u32,
+    },
     /// A resume block's first instruction: `[def r0, def r1]` up to `wanted`
     /// (1 or 2), or the landing helper.
     Resume {
@@ -248,7 +260,10 @@ pub(crate) enum MInst {
 
 impl TargetInst for MInst {
     fn is_branch(&self) -> bool {
-        matches!(self, MInst::Jump | MInst::Br { .. } | MInst::Call { .. })
+        matches!(
+            self,
+            MInst::Jump | MInst::Br { .. } | MInst::Call { .. } | MInst::CallMm { .. }
+        )
     }
 
     fn is_ret(&self) -> bool {

@@ -10,10 +10,10 @@ use crate::env::value::Value;
 use crate::env::{MetamethodBits, Shape};
 use crate::instruction::{Instruction, Op as BcOp};
 use crate::jit::build::Builder;
-use crate::jit::build::emit::{arm_end, branch_arm, enter_join, helper_val};
+use crate::jit::build::emit::{arm_end, branch_arm, calls_mm, enter_join, mm_call};
 use crate::jit::feedback as fb;
 use crate::jit::ir::Val;
-use crate::jit::ir::ops::{Cc, ExitTag, HelperId, Op};
+use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL_VAL, HelperId, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
 use crate::vm::ops::field::read_ic;
 
@@ -62,16 +62,60 @@ fn barrier_for(b: &mut Builder<'_, '_>, t: Val, v: Val) {
     }
 }
 
-fn index(b: &mut Builder<'_, '_>, recv: Val, key: Val) -> Val {
+/// `recv[key]` through `__index` tables into `dst`, an `__index` function
+/// on `recv`'s own metatable called (5.4); any other walk deopts.
+fn index(b: &mut Builder<'_, '_>, dst: u8, recv: Val, key: Val) -> Val {
     let recv = b.boxed(recv);
     let key = b.boxed(key);
-    helper_val(b, HelperId::Index, &[recv, key])
+    let r = b.ins(Op::Helper(HelperId::Index), &[recv, key]);
+    let fail = b.ins(Op::KVal(HELPER_FAIL_VAL), &[]);
+    let failed = b.ins(Op::SameBits, &[r, fail]);
+    if !calls_mm(b) {
+        let s = b.snap_before();
+        b.ins_snap(Op::GuardFalse, &[failed], s, ExitTag::Mm);
+        return r;
+    }
+    let join = b.new_block();
+    let ok = branch_arm(b, failed);
+    let f = function_or_deopt(b, HelperId::IndexFn, recv, key);
+    let w = mm_call(b, f, &[recv, key]);
+    arm_end(b, join, dst, w);
+    b.switch_to(ok);
+    arm_end(b, join, dst, r);
+    enter_join(b, join);
+    b.reg(dst)
 }
 
+/// `recv[key] = v` through `__newindex` tables, an `__newindex` function on
+/// `recv`'s own metatable called; any other walk deopts.
 fn newindex(b: &mut Builder<'_, '_>, recv: Val, key: Val, v: Val, keyed: bool) {
     let recv = b.boxed(recv);
     let key = b.boxed(key);
-    helper_val(b, HelperId::NewIndex { keyed }, &[recv, key, v]);
+    let r = b.ins(Op::Helper(HelperId::NewIndex { keyed }), &[recv, key, v]);
+    let fail = b.ins(Op::KVal(HELPER_FAIL_VAL), &[]);
+    let failed = b.ins(Op::SameBits, &[r, fail]);
+    if !calls_mm(b) {
+        let s = b.snap_before();
+        b.ins_snap(Op::GuardFalse, &[failed], s, ExitTag::Mm);
+        return;
+    }
+    let join = b.new_block();
+    let ok = branch_arm(b, failed);
+    let f = function_or_deopt(b, HelperId::NewIndexFn, recv, key);
+    mm_call(b, f, &[recv, key, v]);
+    b.jump(join);
+    b.switch_to(ok);
+    b.jump(join);
+    enter_join(b, join);
+}
+
+/// The metamethod function a lookup helper finds, deopting when none.
+fn function_or_deopt(b: &mut Builder<'_, '_>, h: HelperId, recv: Val, key: Val) -> Val {
+    let f = b.ins(Op::Helper(h), &[recv, key]);
+    let none = b.ins(Op::IsType(TypeSet::NIL), &[f]);
+    let s = b.snap_before();
+    b.ins_snap(Op::GuardFalse, &[none], s, ExitTag::Slow);
+    f
 }
 
 /// `dst = v`, or the `__index` walk's answer when `v` is nil and the class
@@ -94,7 +138,7 @@ fn nil_walks<'gc>(
     let not_nil = branch_arm(b, nil);
     let has = class_has(b, shape, MetamethodBits::INDEX).unwrap();
     let plain = branch_arm(b, has);
-    let w = index(b, recv, key);
+    let w = index(b, dst, recv, key);
     arm_end(b, join, dst, w);
     b.switch_to(plain);
     arm_end(b, join, dst, v);
@@ -109,7 +153,10 @@ pub(super) fn emit_get<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
     let (dst, _, ic, e) = insn.abde();
     let recv = receiver(b, insn);
     if insn.op().unquickened() == BcOp::SELF {
+        // Now, not at the end: a metamethod call below stores it first.
+        // An exit before it runs SELF again, which writes it again.
         b.set(dst + 4, recv);
+        b.flush();
     }
     let kv = b.closure.proto.constants[e as usize];
     let key = b.konst(kv);
@@ -162,14 +209,14 @@ pub(super) fn emit_get<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
             let join = b.new_block();
             let nil = b.ins(Op::IsType(TypeSet::NIL), &[v]);
             let found = branch_arm(b, nil);
-            let w = index(b, recv, key);
+            let w = index(b, dst, recv, key);
             arm_end(b, join, dst, w);
             b.switch_to(found);
             arm_end(b, join, dst, v);
             enter_join(b, join);
         }
         InlineCache::Transition { .. } | InlineCache::Empty => {
-            let v = index(b, recv, key);
+            let v = index(b, dst, recv, key);
             b.set(dst, v);
         }
     }
@@ -298,14 +345,14 @@ pub(super) fn emit_gettable(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction)
     let (dst, rt, rk) = (insn.a(), insn.b(), insn.c());
     let (recv, key) = (b.reg(rt), b.reg(rk));
     let Some(t) = table_site(b, pc, recv) else {
-        let v = index(b, recv, key);
+        let v = index(b, dst, recv, key);
         b.set(dst, v);
         return;
     };
     let join = b.new_block();
     let small = match int_key(b, key) {
         Some(false) => {
-            let v = index(b, recv, key);
+            let v = index(b, dst, recv, key);
             b.set(dst, v);
             return;
         }
@@ -327,16 +374,16 @@ pub(super) fn emit_gettable(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction)
     let v = b.ins(Op::ArrLoad, &[arr, i]);
     let nil = b.ins(Op::IsType(TypeSet::NIL), &[v]);
     let found = branch_arm(b, nil);
-    let w = index(b, recv, key);
+    let w = index(b, dst, recv, key);
     arm_end(b, join, dst, w);
     b.switch_to(found);
     arm_end(b, join, dst, v);
     b.switch_to(outside);
-    let w = index(b, recv, key);
+    let w = index(b, dst, recv, key);
     arm_end(b, join, dst, w);
     if let Some((other, _)) = small {
         b.switch_to(other);
-        let w = index(b, recv, key);
+        let w = index(b, dst, recv, key);
         arm_end(b, join, dst, w);
     }
     enter_join(b, join);

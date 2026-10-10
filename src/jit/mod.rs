@@ -450,7 +450,12 @@ fn on_exit<'gc>(
     // A `Before` exit's operands are in their home slots; the other kinds
     // follow a completed instruction and have no failed guard.
     if kind == ExitKind::Before {
-        record_site(closure, base, pc, e.tag == ExitTag::Overflow);
+        let extra = match e.tag {
+            ExitTag::Overflow => crate::jit::feedback::OVERFLOW,
+            ExitTag::Mm => crate::jit::feedback::MM,
+            _ => 0,
+        };
+        record_site(closure, base, pc, extra);
     }
     let n = e.count.get() + 1;
     e.count.set(n);
@@ -486,7 +491,7 @@ fn on_exit<'gc>(
 
 /// Record the kinds of the operands of the site at `pc`, from the frame just
 /// rebuilt, into its feedback byte.
-fn record_site<'gc>(closure: LuaFn<'gc>, base: *mut Value<'gc>, pc: u32, overflow: bool) {
+fn record_site<'gc>(closure: LuaFn<'gc>, base: *mut Value<'gc>, pc: u32, extra: u8) {
     use crate::instruction::Family;
     use crate::jit::feedback as fb;
     let site = unsafe { closure.code.add(pc as usize) };
@@ -536,9 +541,7 @@ fn record_site<'gc>(closure: LuaFn<'gc>, base: *mut Value<'gc>, pc: u32, overflo
         _ if i.op().branch_sense().is_some() => kind(i.a()),
         _ => 0,
     };
-    if overflow {
-        bits |= fb::OVERFLOW;
-    }
+    bits |= extra;
     if bits != 0 {
         fb::record(closure, site, bits);
     }
@@ -553,7 +556,7 @@ fn on_entry_fail<'gc>(
     base: *mut Value<'gc>,
     region: &Region<'gc>,
 ) {
-    record_site(closure, base, region.entry_pc, false);
+    record_site(closure, base, region.entry_pc, 0);
     if let Some(state) = closure.proto.jit.get() {
         let mut st = state.borrow_mut(ctx.mutation());
         let me = region as *const Region<'gc>;
