@@ -178,6 +178,10 @@ pub(crate) enum MInst {
     },
     /// `[def d]`: whether the frame's header has the flag.
     HasFlag(u8),
+    /// `[def d, use f]`: whether the function is a Lua closure without varargs.
+    FnFixedLua,
+    /// `[def d, use f]`: whether the Lua closure's window fits from `base`.
+    FnFits,
     /// `[def d, use c]`: the value of an upvalue cell.
     LoadCell,
     /// `[use c, use v]`: store into an upvalue cell.
@@ -245,6 +249,10 @@ pub(crate) enum MInst {
         word: u64,
         pc_after: usize,
     },
+    /// `[use f]`: the Lua closure takes over the frame (`Op::TailEnter`).
+    TailEnter {
+        nargs: u8,
+    },
     /// `[snap..]`: exit unless the header at `hdr` and `n` arguments fit.
     GuardFits {
         end: u16,
@@ -305,7 +313,10 @@ impl TargetInst for MInst {
     fn is_ret(&self) -> bool {
         matches!(
             self,
-            MInst::Return { .. } | MInst::Deopt { .. } | MInst::Dispatch { .. }
+            MInst::Return { .. }
+                | MInst::Deopt { .. }
+                | MInst::Dispatch { .. }
+                | MInst::TailEnter { .. }
         )
     }
 }

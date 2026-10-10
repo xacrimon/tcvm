@@ -338,8 +338,9 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             if intrinsics::emit(b, pc, insn, callee) {
                 b.flush();
                 emit_return_from(b, a, 1, before);
+            } else if rb != 0 {
+                emit_tailcall(b, a, rb - 1);
             } else {
-                // The interpreter's tail call: any callee, varargs, closing.
                 dispatch(b);
             }
         }
@@ -459,6 +460,43 @@ fn dispatch(b: &mut Builder<'_, '_>) {
     b.store_live(live);
     let word = b.code(pc).raw();
     b.terminate(Op::Dispatch { pc, word }, &[], &[], None);
+}
+
+/// `TAILCALL a` with `nargs` arguments: the fast arm of 5.5 for a Lua
+/// closure without varargs whose window fits, from a frame with nothing to
+/// close; any other callee the interpreter's TAILCALL, from the slots.
+fn emit_tailcall(b: &mut Builder<'_, '_>, a: u8, nargs: u8) {
+    use crate::vm::frame::flag::{HAS_OPEN, HAS_TBC};
+    let f = b.reg(a);
+    let f = b.boxed(f);
+    // Read before the stores below overwrite their slots.
+    let args: Vec<Val> = (0..nargs)
+        .map(|k| {
+            let v = b.reg(a + 4 + k);
+            b.boxed(v)
+        })
+        .collect();
+    let slow = b.new_block();
+    let mut others = vec![arm(b, Op::IsType(TypeSet::FUN), f)];
+    let fun = b.ins(Op::Refine(TypeSet::FUN), &[f]);
+    let p = b.ins(Op::Unbox(Rep::Ptr), &[fun]);
+    others.push(arm(b, Op::FnFixedLua, p));
+    let closes = b.ins(Op::HasFlag((HAS_OPEN | HAS_TBC) as u8), &[]);
+    let (closing, fast) = (b.new_sealed_succ(), b.new_sealed_succ());
+    b.br(closes, closing, fast);
+    b.switch_to(fast);
+    others.push(closing);
+    others.push(arm(b, Op::FnFits, p));
+    for (k, &v) in args.iter().enumerate() {
+        b.push(Op::Store(k as u8), &[v]);
+    }
+    b.terminate(Op::TailEnter { nargs }, &[p], &[], None);
+    for o in others {
+        b.switch_to(o);
+        b.jump(slow);
+    }
+    enter_join(b, slow);
+    dispatch(b);
 }
 
 /// `RETURN` of `n` results from `R[a..]`. A frame with to-be-closed

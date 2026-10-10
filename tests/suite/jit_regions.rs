@@ -457,9 +457,9 @@ fn generic_for_loops() {
     );
 }
 
-/// TAILCALL and RETURN up to `top` leave through the interpreter's
-/// handlers with the frame stored; CALL, SETLIST and VARARG up to `top`
-/// compile.
+/// RETURN up to `top`, and TAILCALLs the fast arm does not take, leave
+/// through the interpreter's handlers with the frame stored; CALL, SETLIST
+/// and VARARG up to `top` compile.
 #[test]
 fn tail_calls_and_multret() {
     agrees(
@@ -483,6 +483,38 @@ fn tail_calls_and_multret() {
         return tostring(s)
 "##,
     );
+}
+
+/// TAILCALL's fast arm (a Lua callee without varargs, from a frame with
+/// nothing to close) and the callees and frames that take the interpreter's.
+#[test]
+fn fast_tail_calls() {
+    let locals: Vec<String> = (1..=150).map(|i| format!("l{i}")).collect();
+    let src = format!(
+        r##"
+        local function three(a, b, c) return (a or 0) + (b or 10) + (c or 100) end
+        local function one(x) return three(x) end
+        local function extra(x) return three(x, 1, 2, 3, 4) end
+        local function vararg(...) return select("#", ...) end
+        local callable = setmetatable({{}}, {{__call = function(self, x) return x * 3 end}})
+        local function via(f, x) return f(x) end
+        local function fixed(a, b) return a + b end
+        local function from_vararg(x, ...) return fixed(x, 1) end
+        local function id(x) return x end
+        local function closing(n) local x = n local f = function() return x end return id(f()) end
+        local function big(n) local {} = n return l1 + (l150 or 1) end
+        local function deep(n) if n == 0 then return big(1) end return 1 + deep(n - 1) end
+        local s = 0
+        for i = 1, 600 do
+          s = s + one(i) + extra(i) + via(id, i) + via(math.abs, -i) + via(vararg, i)
+          s = s + via(callable, i) + from_vararg(i, 1, 2, 3) + select("#", from_vararg(i, 5)) + closing(i)
+        end
+        for i = 1, 20 do s = s + deep(400 * i) end
+        return tostring(s)
+"##,
+        locals.join(", "),
+    );
+    agrees(&src);
 }
 
 /// A field site that saw several shapes compiles a test per shape (own

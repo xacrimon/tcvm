@@ -593,6 +593,15 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 let d = self.def(res.unwrap());
                 self.push(MInst::HasFlag(mask), &[d], none);
             }
+            Op::FnFixedLua | Op::FnFits => {
+                let (d, p) = (self.def(res.unwrap()), self.use_(args[0]));
+                let m = if op == Op::FnFits {
+                    MInst::FnFits
+                } else {
+                    MInst::FnFixedLua
+                };
+                self.push(m, &[d, p], none);
+            }
             Op::UpvalCell(k) => {
                 let d = self.def(res.unwrap());
                 self.push(MInst::LoadUpval(k), &[d], none);
@@ -961,6 +970,10 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 let pc_after = self.pc_base + (pc as usize + 1) * 8;
                 let op = (word & 0xff) as u8;
                 self.push(MInst::Dispatch { op, word, pc_after }, &[], none);
+            }
+            Op::TailEnter { nargs } => {
+                let p = self.use_(args[0]);
+                self.push(MInst::TailEnter { nargs }, &[p], none);
             }
             Op::CallMm { pc, nargs, .. } => {
                 let pc_after = self.pc_base + (pc as usize + 1) * 8;
