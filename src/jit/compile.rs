@@ -361,6 +361,7 @@ pub(crate) fn compile<'gc>(
             _alloc: alloc,
             entry,
             pool: f.pool.clone().into_boxed_slice(),
+            shapes: f.shapes.clone().into_boxed_slice(),
             exits: exits.into_boxed_slice(),
             snaps: snaps.into_boxed_slice(),
             consts: consts.into_boxed_slice(),

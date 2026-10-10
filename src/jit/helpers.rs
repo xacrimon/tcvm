@@ -2,10 +2,11 @@
 //! switches threads, runs Lua or raises (R5).
 
 use crate::dmm::Gc;
+use crate::dmm::lock::RefLock;
 use crate::env::MetamethodBits;
 use crate::env::function::UpvalueCell;
 use crate::env::string::LuaString;
-use crate::env::table::Table;
+use crate::env::table::{Table, TableState};
 use crate::env::thread::ThreadState;
 use crate::env::value::{Value, ValueKind};
 use crate::instruction::ArithKind;
@@ -14,7 +15,9 @@ use crate::lua::{Context, State};
 use crate::vm::frame::{self, land_results};
 use crate::vm::num::{self, ArithOp, SlowNum};
 use crate::vm::ops::control::{close_upvalues, new_closure, vararg_get, vararg_table};
-use crate::vm::ops::meta::binop_metamethod;
+use crate::vm::ops::meta::{
+    IndexChain, NewIndexChain, binop_metamethod, walk_index_chain, walk_newindex_chain,
+};
 
 /// The address a region calls for `h`.
 pub(crate) fn address(h: HelperId) -> usize {
@@ -36,6 +39,8 @@ pub(crate) fn address(h: HelperId) -> usize {
         HelperId::SetList { .. } => jit_setlist as *const () as usize,
         HelperId::VarargGet => jit_varargget as *const () as usize,
         HelperId::VarargTable(_) => jit_vararg_table as *const () as usize,
+        HelperId::Index => jit_index as *const () as usize,
+        HelperId::NewIndex { .. } => jit_newindex as *const () as usize,
     }
 }
 
@@ -296,6 +301,63 @@ pub(crate) extern "C" fn jit_vararg_table(
 ) -> u64 {
     let ctx = unsafe { Context::from_state(rt) };
     Value::table(vararg_table(ctx, base, np as usize)).to_raw()
+}
+
+/// `recv[key]` as `get_slow` resolves it without calling a function.
+pub(crate) extern "C" fn jit_index(rt: *const State<'static>, recv: u64, key: u64) -> u64 {
+    let ctx = unsafe { Context::from_state(rt) };
+    let (recv, key) = unsafe { (Value::from_raw(recv), Value::from_raw(key)) };
+    if let Some(t) = recv.get_table() {
+        let v = t.raw_get(key);
+        if !v.is_nil() {
+            return v.to_raw();
+        }
+    }
+    match walk_index_chain(ctx, recv, key) {
+        IndexChain::Resolved(v) => v.to_raw(),
+        _ => HELPER_FAIL_VAL,
+    }
+}
+
+/// `recv[key] = v` as `set_slow` does it without calling a function or
+/// raising; `keyed` stores as `t[k] = v` does.
+pub(crate) extern "C" fn jit_newindex(
+    rt: *const State<'static>,
+    keyed: u64,
+    recv: u64,
+    key: u64,
+    v: u64,
+) -> u64 {
+    let ctx = unsafe { Context::from_state(rt) };
+    let (recv, key, v) = unsafe {
+        (
+            Value::from_raw(recv),
+            Value::from_raw(key),
+            Value::from_raw(v),
+        )
+    };
+    let NewIndexChain::RawSet(t) = walk_newindex_chain(ctx, recv, key) else {
+        return HELPER_FAIL_VAL;
+    };
+    if key.is_nil() || key.get_float().is_some_and(f64::is_nan) {
+        return HELPER_FAIL_VAL;
+    }
+    if keyed != 0 {
+        t.raw_set_keyed(ctx, key, v);
+    } else {
+        t.raw_set(ctx, key, v);
+    }
+    0
+}
+
+/// The backward barrier of the table whose lock is `t`, not gray.
+pub(crate) extern "C" fn jit_barrier(
+    rt: *const State<'static>,
+    t: *const RefLock<TableState<'static>>,
+) {
+    let ctx = unsafe { Context::from_state(rt) };
+    let g = unsafe { Gc::from_ptr(t) };
+    ctx.mutation().backward_barrier(Gc::erase(g), None);
 }
 
 /// Box an integer outside i32.

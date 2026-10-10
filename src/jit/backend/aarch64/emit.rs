@@ -4,6 +4,8 @@
 
 use regalloc2::{Allocation, Edit, Output, PReg, RegClass};
 
+use crate::env::MtCache;
+use crate::env::table::SlotLoc;
 use crate::env::value::Value;
 use crate::jit::backend::aarch64::abi::{
     BASE, CLOSURE, D31, IMAGE_SPILLS, INSN, PC, RT, THREAD, X16, X17, image_index,
@@ -16,6 +18,7 @@ use crate::jit::backend::aarch64::lower::{LExit, Lowered, Src};
 use crate::jit::backend::vcode::VCode;
 use crate::jit::ir::ops::Ctx;
 use crate::jit::ir::types::TypeSet;
+use crate::jit::layout;
 use crate::jit::region::{Loc, SnapEntry};
 
 const NIL: u64 = 0xFFFF_FFFE_0000_0000;
@@ -669,6 +672,82 @@ impl Em<'_> {
                 self.a
                     .ldr(X16, c, crate::env::function::UpvalueCell::V_OFFSET as i32);
                 self.a.ldr(d, X16, 0);
+            }
+            GuardShape { shape, exit } => {
+                let t = self.r(i, 0);
+                self.a.ldr(X16, t, layout::T_SHAPE as i32);
+                self.a.ldr_lit(X17, shape);
+                self.a.cmp(Sz::X, X16, X17);
+                let l = self.exit(exit);
+                self.a.b_cond(Cond::Ne, l);
+            }
+            ClassBits(class) => {
+                let d = self.r(i, 0);
+                self.a.ldr_lit(X16, class);
+                self.a.ldr_w(d, X16, MtCache::BITS_OFFSET as i32);
+            }
+            ClassIndex(class) => {
+                let d = self.r(i, 0);
+                self.a.ldr_lit(X16, class);
+                self.a.ldr(d, X16, MtCache::INDEX_OFFSET as i32);
+            }
+            TabLoad(loc) => {
+                let (d, t) = (self.r(i, 0), self.r(i, 1));
+                let loc = SlotLoc::from_raw(loc);
+                if loc.spilled() {
+                    self.a.ldr(X16, t, layout::T_SPILL as i32);
+                    self.a.ldr(d, X16, loc.offset() as i32);
+                } else {
+                    self.a.ldr(d, t, loc.offset() as i32);
+                }
+            }
+            TabStore(loc) => {
+                let (t, v) = (self.r(i, 0), self.r(i, 1));
+                let loc = SlotLoc::from_raw(loc);
+                if loc.spilled() {
+                    self.a.ldr(X16, t, layout::T_SPILL as i32);
+                    self.a.str(v, X16, loc.offset() as i32);
+                } else {
+                    self.a.str(v, t, loc.offset() as i32);
+                }
+            }
+            TabHasRoom(loc) => {
+                let (d, t) = (self.r(i, 0), self.r(i, 1));
+                let slot = SlotLoc::from_raw(loc).offset() / 8;
+                self.a.ldr_w(X16, t, layout::T_SPILL_CAP as i32);
+                self.a.mov_imm(X17, slot as u64);
+                self.a.cmp(Sz::W, X16, X17);
+                self.a.cset(Sz::W, d, Cond::Hi);
+            }
+            TabSetShape(shape) => {
+                let t = self.r(i, 0);
+                self.a.ldr_lit(X16, shape);
+                self.a.str(X16, t, layout::T_SHAPE as i32);
+            }
+            TabASize => {
+                let (d, t) = (self.r(i, 0), self.r(i, 1));
+                self.a.ldr_w(d, t, layout::T_ASIZE as i32);
+            }
+            TabArray => {
+                let (d, t) = (self.r(i, 0), self.r(i, 1));
+                self.a.ldr(d, t, layout::T_ARRAY as i32);
+            }
+            ArrLoad => {
+                let (d, a, k) = (self.r(i, 0), self.r(i, 1), self.r(i, 2));
+                self.a.ldr_idx(d, a, k, Extend::Uxtw, true);
+            }
+            ArrStore => {
+                let (a, k, v) = (self.r(i, 0), self.r(i, 1), self.r(i, 2));
+                self.a.str_idx(v, a, k, Extend::Uxtw, true);
+            }
+            Barrier => {
+                let skip = self.a.new_label();
+                self.a.ldr(X16, Gpr(1), layout::T_HEADER);
+                self.a.tbnz(X16, 0, skip);
+                self.a.mov(Gpr(0), RT);
+                self.a
+                    .bl_far(crate::jit::helpers::jit_barrier as *const () as usize);
+                self.a.bind(skip);
             }
             NumVarargs => {
                 let d = self.r(i, 0);

@@ -176,6 +176,7 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                             Cc::Le => x <= y,
                             Cc::Gt => x > y,
                             Cc::Ge => x >= y,
+                            Cc::Lo | Cc::Hi => unreachable!("an unsigned float compare"),
                         };
                         set_b1(f, i, r);
                         changed = true;
