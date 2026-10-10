@@ -4,7 +4,7 @@
 
 use crate::env::value::Value;
 use crate::instruction::{ArithKind, Family, Instruction, Op as BcOp, UpvalSource};
-use crate::jit::build::Builder;
+use crate::jit::build::{Builder, tables};
 use crate::jit::feedback as fb;
 use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL, HELPER_FAIL_VAL, HelperId, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
@@ -103,7 +103,7 @@ pub(super) fn always_deopts(b: &Builder<'_, '_>, pc: u32) -> bool {
         MOVE | LOAD | LOADI | LOADNIL | LFALSESKIP | GETUPVAL | NOP | FUNC | LOOP | JMP
         | JMP_BACK | NOT | ERRNNIL | JT | JF | JTSET | JFSET | RETURN0 | RETURN1 | FORLOOP_I
         | FORLOOP_F | FORLOOP | JEQS | JNEQS | LEN | CONCAT | GETUPVAL_REF | SETUPVAL | CLOSURE
-        | CLOSE => false,
+        | CLOSE | GETTABLE | SETTABLE => false,
         // A vararg table makes VARARG read it, and MULTRET sets `top`.
         VARARG => b.proto.needs_vararg_table || insn.b() == 0,
         VARARGPREP | VARARGGET | NEWTABLE => false,
@@ -117,6 +117,7 @@ pub(super) fn always_deopts(b: &Builder<'_, '_>, pc: u32) -> bool {
                 arith_mode(b, pc) == Mode::Deopt
             }
             Family::CmpReg | Family::CmpImm => false,
+            _ if is_get(op) || is_set(op) => false,
             _ => !matches!(op, JEQI | JNEQI),
         },
     }
@@ -345,6 +346,8 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             b.push(Op::Helper(HelperId::Close(a)), &[]);
         }
         CALL | CALL_R0 | CALL_R1 | CALLS | CALLS_R0 | CALLS_R1 => emit_call(b, pc, insn),
+        GETTABLE => tables::emit_gettable(b, pc, insn),
+        SETTABLE => tables::emit_settable(b, pc, insn),
         FORPREP => emit_forprep(b, pc, insn, succs),
         FORLOOP_I | FORLOOP_F | FORLOOP => match loop_kind(b, pc) {
             Some(FORLOOP_I) => emit_forloop_i(b, a, succs),
@@ -361,10 +364,28 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
                 emit_arith(b, pc, insn)
             }
             Family::CmpReg => emit_cmp_reg(b, pc, insn, succs),
+            _ if is_get(op) => tables::emit_get(b, insn),
+            _ if is_set(op) => tables::emit_set(b, insn),
             Family::CmpImm => emit_cmp_imm(b, pc, insn, succs),
             _ => b.deopt(ExitTag::Unsupported),
         },
     }
+}
+
+/// A constant-key read in any form.
+fn is_get(op: BcOp) -> bool {
+    matches!(
+        op.unquickened(),
+        BcOp::GETFIELD | BcOp::GETTABUP | BcOp::GETTABUP_REF | BcOp::SELF
+    )
+}
+
+/// A constant-key write in any form.
+fn is_set(op: BcOp) -> bool {
+    matches!(
+        op.unquickened(),
+        BcOp::SETFIELD | BcOp::SETTABUP | BcOp::SETTABUP_REF
+    )
 }
 
 /// End the block on `cond`: to the jump target when `cond == jump_when`.
@@ -753,7 +774,7 @@ fn small_or_float(b: &mut Builder<'_, '_>, v: Val) -> Val {
 }
 
 /// A `Val` helper's result, deopting `Before` when it failed.
-fn helper_val(b: &mut Builder<'_, '_>, h: HelperId, args: &[Val]) -> Val {
+pub(super) fn helper_val(b: &mut Builder<'_, '_>, h: HelperId, args: &[Val]) -> Val {
     let r = b.ins(Op::Helper(h), args);
     let fail = b.ins(Op::KVal(HELPER_FAIL_VAL), &[]);
     let failed = b.ins(Op::SameBits, &[r, fail]);
@@ -769,7 +790,7 @@ fn arm(b: &mut Builder<'_, '_>, op: Op, v: Val) -> Block {
     branch_arm(b, c)
 }
 
-fn branch_arm(b: &mut Builder<'_, '_>, c: Val) -> Block {
+pub(super) fn branch_arm(b: &mut Builder<'_, '_>, c: Val) -> Block {
     let (yes, no) = (b.new_sealed_succ(), b.new_sealed_succ());
     b.br(c, yes, no);
     b.switch_to(yes);
@@ -777,14 +798,17 @@ fn branch_arm(b: &mut Builder<'_, '_>, c: Val) -> Block {
 }
 
 /// End an arm of the instruction with `dst = v`, at the join.
-fn arm_end(b: &mut Builder<'_, '_>, join: Block, dst: u8, v: Val) {
+pub(super) fn arm_end(b: &mut Builder<'_, '_>, join: Block, dst: u8, v: Val) {
+    // The instruction's earlier writes (`SELF`'s receiver) hold in every arm.
+    let earlier = b.pending.clone();
     b.set(dst, v);
     b.flush();
     b.jump(join);
+    b.pending = earlier;
 }
 
 /// Continue after the arms, where `dst` is their join.
-fn enter_join(b: &mut Builder<'_, '_>, join: Block) {
+pub(super) fn enter_join(b: &mut Builder<'_, '_>, join: Block) {
     b.seal(join);
     b.switch_to(join);
     b.init_slots(join);
@@ -961,6 +985,7 @@ fn generic_cmp(b: &mut Builder<'_, '_>, cc: Cc, x: Val, y: Val, sense: bool, suc
         Cc::Le => (HelperId::Le, x, y),
         Cc::Gt => (HelperId::Lt, y, x),
         Cc::Ge => (HelperId::Le, y, x),
+        Cc::Lo | Cc::Hi => unreachable!("an unsigned compare of values"),
         Cc::Eq | Cc::Ne => unreachable!("an ordered compare"),
     };
     let c = helper_test(b, h, x, y);

@@ -278,3 +278,50 @@ fn varargs_and_constructors() {
 "#,
     );
 }
+
+/// Field sites compile from their inline caches (own slots, absent keys,
+/// `__index` holders, transitions) and integer keys through the array
+/// part; the rest, and a nil where a metatable may answer, go through the
+/// index helpers. `SELF` passes its receiver on every path.
+#[test]
+fn tables_and_fields() {
+    agrees(
+        r#"
+        local function step(p) p.x = p.x + p.vx; p.n = p.n + 1; return p.x end
+        local p = {x = 0.0, vx = 0.5, n = 0}
+        local s = 0
+        for i = 1, 1000 do s = s + step(p) end
+        local function make(i)
+          local o = {}
+          o.a = i; o.b = "b" .. i; o.c = {i}; o.d = i; o.e = i; o.f = i; o.g = i; o.h = i; o.i = i
+          return o
+        end
+        for i = 1, 600 do local o = make(i); s = s + o.a + #o.b + o.c[1] + o.i end
+        local C = {}
+        for k = 1, 10 do C["m" .. k] = function(self) return k + self.v end end
+        C.__index = C
+        local inst = setmetatable({v = 1}, C)
+        for _ = 1, 500 do s = s + inst:m1() + inst:m10() end
+        C.m10 = function() return 0 end
+        s = s + inst:m10()
+        local arr = {}
+        for i = 1, 100 do arr[i] = i * 3 end
+        local function sum(a, n) local t = 0 for i = 0, n do t = t + (a[i] or 1) end return t end
+        for r = 1, 50 do s = s + sum(arr, 120) end
+        local function fill(a, n) for i = 1, n do a[i] = i end return #a end
+        for r = 1, 50 do s = s + fill({}, r) end
+        local log = 0
+        local proxy = setmetatable({}, {__newindex = function() log = log + 1 end})
+        local sink = {}
+        local redirect = setmetatable({}, {__newindex = sink})
+        local function put(t, v) t.slot = v end
+        for i = 1, 300 do put(i % 3 == 0 and proxy or (i % 3 == 1 and redirect or {}), i) end
+        local fnidx = setmetatable({}, {__index = function(t, k) return k .. "!" end})
+        local function get(t) return t.name end
+        local names = {}
+        for i = 1, 300 do names[#names + 1] = get(i % 2 == 0 and fnidx or {name = "own"}) end
+        local function up(x) return x:upper() end
+        return table.concat({s, log, sink.slot, names[299], names[300], up("ab")}, " ")
+"#,
+    );
+}

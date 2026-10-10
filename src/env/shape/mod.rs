@@ -618,6 +618,18 @@ fn content_hash(
 }
 
 impl<'gc> MtCache<'gc> {
+    // Where compiled code reads the live bits and `__index`/`__newindex`,
+    // from the class's box (`as_word`).
+    pub(crate) const BITS_OFFSET: usize = Gc::<'static, MtCacheData<'static>>::VALUE_OFFSET
+        + core::mem::offset_of!(MtCacheData<'static>, bits);
+    pub(crate) const INDEX_OFFSET: usize = Gc::<'static, MtCacheData<'static>>::VALUE_OFFSET
+        + core::mem::offset_of!(MtCacheData<'static>, index);
+
+    /// The class's box address, what a shape holds.
+    pub(crate) fn as_word(self) -> u64 {
+        Gc::erased_ptr(self.0) as u64
+    }
+
     /// A class of one member, `owner`, whose metamethods by bit index are
     /// `values`.
     pub fn new(
@@ -900,6 +912,11 @@ impl<'gc> MtCache<'gc> {
 }
 
 impl<'gc> Shape<'gc> {
+    /// The shape's box address, what a table's `shape` field holds.
+    pub(crate) fn as_word(self) -> u64 {
+        Gc::erased_ptr(self.0) as u64
+    }
+
     /// Allocate an empty root shape for tables with `inline_cap` inline
     /// slots. There is one per capacity per `State`, see `State::root_shapes`.
     pub fn root_empty(mc: &Mutation<'gc>, inline_cap: u8) -> Self {

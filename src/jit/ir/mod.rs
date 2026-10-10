@@ -217,6 +217,8 @@ pub(crate) struct Func<'gc> {
     pub(crate) snaps: Vec<SnapData>,
     pub(crate) snap_pool: Vec<(u8, Val)>,
     pub(crate) pool: Vec<Value<'gc>>,
+    /// The shapes guards compare against and transitions store.
+    pub(crate) shapes: Vec<crate::env::Shape<'gc>>,
     pub(crate) entry: Block,
     pub(crate) meta: RegionMeta,
     /// The `After` snapshot of a value's definition, where a definition
@@ -256,6 +258,7 @@ impl<'gc> Func<'gc> {
             snaps: Vec::new(),
             snap_pool: Vec::new(),
             pool: Vec::new(),
+            shapes: Vec::new(),
             entry: Block(0),
             meta,
             def_snaps: Vec::new(),

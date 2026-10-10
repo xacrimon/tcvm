@@ -180,6 +180,29 @@ pub(crate) enum MInst {
     LoadCell,
     /// `[use c, use v]`: store into an upvalue cell.
     StoreCell,
+    /// `[use t, snap..]`: exit unless the table's shape is `shape`.
+    GuardShape {
+        shape: u64,
+        exit: u32,
+    },
+    /// `[def d]`: a class's live bits (`I32`) or `__index`.
+    ClassBits(u64),
+    ClassIndex(u64),
+    /// `[def d, use t]` / `[use t, use v]`: a named slot.
+    TabLoad(u32),
+    TabStore(u32),
+    /// `[def d, use t]`: the spill cell has room for the spilled `loc`.
+    TabHasRoom(u32),
+    /// `[use t]`: move the table to `shape`.
+    TabSetShape(u64),
+    /// `[def d, use t]`.
+    TabASize,
+    TabArray,
+    /// `[def d, use arr, use i]` / `[use arr, use i, use v]`.
+    ArrLoad,
+    ArrStore,
+    /// `[use t (x1)]`: the backward barrier unless gray; clobbers as a call.
+    Barrier,
     /// `[def d]`: the frame's `nv`.
     NumVarargs,
     /// `[def d, use nv]`: extra `k`, or nil when `nv <= k`.

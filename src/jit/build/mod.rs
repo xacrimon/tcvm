@@ -5,6 +5,7 @@
 
 pub(crate) mod cfg;
 mod emit;
+mod tables;
 
 use crate::dmm::Gc;
 use crate::env::function::{LuaFn, Prototype};
@@ -630,6 +631,21 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             },
         );
         k
+    }
+
+    pub(crate) fn intern_shape(&mut self, s: crate::env::Shape<'gc>) -> u32 {
+        match self
+            .f
+            .shapes
+            .iter()
+            .position(|&x| crate::env::Shape::ptr_eq(x, s))
+        {
+            Some(k) => k as u32,
+            None => {
+                self.f.shapes.push(s);
+                self.f.shapes.len() as u32 - 1
+            }
+        }
     }
 
     pub(crate) fn ki32(&mut self, n: i32) -> Val {

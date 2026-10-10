@@ -84,6 +84,8 @@ fn int_cond(cc: Cc) -> Cond {
         Cc::Le => Cond::Le,
         Cc::Gt => Cond::Gt,
         Cc::Ge => Cond::Ge,
+        Cc::Lo => Cond::Lo,
+        Cc::Hi => Cond::Hi,
     }
 }
 
@@ -96,6 +98,7 @@ fn float_cond(cc: Cc) -> Cond {
         Cc::Le => Cond::Ls,
         Cc::Gt => Cond::Gt,
         Cc::Ge => Cond::Ge,
+        Cc::Lo | Cc::Hi => unreachable!("an unsigned float compare"),
     }
 }
 
@@ -588,6 +591,67 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             Op::CellLoad => {
                 let (d, c) = (self.def(res.unwrap()), self.use_(args[0]));
                 self.push(MInst::LoadCell, &[d, c], none);
+            }
+            Op::GuardShape(k) => {
+                let shape = f.shapes[k as usize].as_word();
+                let t = self.use_(args[0]);
+                self.push_exit(i, |exit| MInst::GuardShape { shape, exit }, vec![t], none);
+            }
+            Op::ClassBits(k) | Op::ClassIndex(k) => {
+                let class = f.shapes[k as usize]
+                    .mt_cache()
+                    .ok_or("a class read of a shape without a metatable")?
+                    .as_word();
+                let d = self.def(res.unwrap());
+                let m = if matches!(op, Op::ClassBits(_)) {
+                    MInst::ClassBits(class)
+                } else {
+                    MInst::ClassIndex(class)
+                };
+                self.push(m, &[d], none);
+            }
+            Op::TabLoad { loc, .. } | Op::TabHasRoom(loc) => {
+                let (d, t) = (self.def(res.unwrap()), self.use_(args[0]));
+                let m = if matches!(op, Op::TabLoad { .. }) {
+                    MInst::TabLoad(loc)
+                } else {
+                    MInst::TabHasRoom(loc)
+                };
+                self.push(m, &[d, t], none);
+            }
+            Op::TabStore { loc, .. } => {
+                let (t, v) = (self.use_(args[0]), self.use_(args[1]));
+                self.push(MInst::TabStore(loc), &[t, v], none);
+            }
+            Op::TabSetShape(k) => {
+                let t = self.use_(args[0]);
+                self.push(
+                    MInst::TabSetShape(f.shapes[k as usize].as_word()),
+                    &[t],
+                    none,
+                );
+            }
+            Op::TabASize | Op::TabArray => {
+                let (d, t) = (self.def(res.unwrap()), self.use_(args[0]));
+                let m = if op == Op::TabASize {
+                    MInst::TabASize
+                } else {
+                    MInst::TabArray
+                };
+                self.push(m, &[d, t], none);
+            }
+            Op::ArrLoad => {
+                let d = self.def(res.unwrap());
+                let (a, k) = (self.use_(args[0]), self.use_(args[1]));
+                self.push(MInst::ArrLoad, &[d, a, k], none);
+            }
+            Op::ArrStore => {
+                let ops = [self.use_(args[0]), self.use_(args[1]), self.use_(args[2])];
+                self.push(MInst::ArrStore, &ops, none);
+            }
+            Op::Barrier => {
+                let t = Operand::reg_fixed_use(self.vr(args[0]), preg_int(1));
+                self.push(MInst::Barrier, &[t], caller_saved());
             }
             Op::NumVarargs => {
                 let d = self.def(res.unwrap());

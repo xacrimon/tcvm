@@ -173,6 +173,8 @@ pub(crate) struct Region<'gc> {
     pub(crate) entry: *const u8,
     /// Every heap value the code or a snapshot embeds.
     pub(crate) pool: Box<[Value<'gc>]>,
+    /// Every shape the code embeds.
+    pub(crate) shapes: Box<[crate::env::Shape<'gc>]>,
     #[collect(require_static)]
     pub(crate) exits: Box<[ExitInfo]>,
     /// The snapshots, which exits with equal ones share.

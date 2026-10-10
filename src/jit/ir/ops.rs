@@ -13,6 +13,9 @@ pub(crate) enum Cc {
     Le,
     Gt,
     Ge,
+    /// Unsigned, on integers only.
+    Lo,
+    Hi,
 }
 
 impl Cc {
@@ -25,6 +28,8 @@ impl Cc {
             Cc::Le => Cc::Ge,
             Cc::Gt => Cc::Lt,
             Cc::Ge => Cc::Le,
+            Cc::Lo => Cc::Hi,
+            Cc::Hi => Cc::Lo,
         }
     }
 
@@ -36,6 +41,9 @@ impl Cc {
             Cc::Le => a <= b,
             Cc::Gt => a > b,
             Cc::Ge => a >= b,
+            // Sign-extended i32s order as u64s as they do as u32s.
+            Cc::Lo => (a as u64) < (b as u64),
+            Cc::Hi => (a as u64) > (b as u64),
         }
     }
 
@@ -47,6 +55,8 @@ impl Cc {
             Cc::Le => "le",
             Cc::Gt => "gt",
             Cc::Ge => "ge",
+            Cc::Lo => "lo",
+            Cc::Hi => "hi",
         }
     }
 }
@@ -99,6 +109,14 @@ pub(crate) enum HelperId {
     VarargGet,
     /// `-> Val`: `VARARGPREP`'s vararg table, also stored in `R[np]`.
     VarargTable(u8),
+    /// `(Val, Val) -> Val`: `recv[key]` through `__index` tables, or
+    /// `HELPER_FAIL_VAL` (an `__index` function, an error).
+    Index,
+    /// `(Val, Val, Val) ->`: `recv[key] = v` through `__newindex` tables,
+    /// `raw_set_keyed` when `keyed` (`t[k] = v`), or `HELPER_FAIL_VAL`.
+    NewIndex {
+        keyed: bool,
+    },
 }
 
 /// What a compare helper returns when the interpreter must run the compare.
@@ -147,6 +165,8 @@ impl HelperId {
             HelperId::SetList { a, n, off } => format!("setlist r{a} n={n} off={off}"),
             HelperId::VarargGet => "varargget".into(),
             HelperId::VarargTable(np) => format!("varargtable r{np}"),
+            HelperId::Index => "index".into(),
+            HelperId::NewIndex { keyed } => format!("newindex keyed={keyed}"),
         }
     }
 
@@ -197,6 +217,21 @@ impl HelperId {
                 Some(Val),
                 alloc | Effects::W_SLOT,
             ),
+            // A walk moves a table off a stale class (`Table::meta`).
+            HelperId::Index => (
+                RT,
+                None,
+                &[Val, Val],
+                Some(Val),
+                alloc | Effects::W_SHAPE | Effects::W_META,
+            ),
+            HelperId::NewIndex { keyed } => (
+                RT,
+                Some(keyed as u64),
+                &[Val, Val, Val],
+                Some(Val),
+                alloc | Effects::W_TAB | Effects::W_SHAPE | Effects::W_META,
+            ),
         };
         Sig {
             ctx,
@@ -224,6 +259,8 @@ pub(crate) enum ExitTag {
     Slow,
     /// A collector check (5.7): leaves through `Exit::Gc`, then resumes.
     Gc,
+    /// A table's shape is not the one compiled for.
+    Shape,
     /// A prologue guard on an entry value (5.2): fails to the entry-fail
     /// stub, which records the entry's kinds.
     Entry,
@@ -231,7 +268,10 @@ pub(crate) enum ExitTag {
 
 impl ExitTag {
     pub(crate) fn widenable(self) -> bool {
-        matches!(self, ExitTag::Type | ExitTag::Overflow | ExitTag::NeverRan)
+        matches!(
+            self,
+            ExitTag::Type | ExitTag::Overflow | ExitTag::NeverRan | ExitTag::Shape
+        )
     }
 }
 
@@ -362,6 +402,37 @@ pub(crate) enum Op {
     /// Whether the frame's header has the flag (`vm::frame::flag`).
     HasFlag(u8),
 
+    // --- tables: `Ptr` operands are a table's lock (its value's payload) ----
+    /// Exits unless the table's shape is `shapes[i]`.
+    GuardShape(u32),
+    /// The live metamethod bits of the class `shapes[i]` pins, an `I32`.
+    ClassBits(u32),
+    /// The live `__index` of the class `shapes[i]` pins.
+    ClassIndex(u32),
+    /// The named slot at `loc` (a `SlotLoc`); `key` is the pool index of its
+    /// constant key: accesses with other keys never alias it.
+    TabLoad {
+        loc: u32,
+        key: u32,
+    },
+    TabStore {
+        loc: u32,
+        key: u32,
+    },
+    /// Whether the spill cell has room for `loc`, the spilled slot a
+    /// transition adds.
+    TabHasRoom(u32),
+    /// Move the table to `shapes[i]`.
+    TabSetShape(u32),
+    /// The array part's size (`I32`) and cell.
+    TabASize,
+    TabArray,
+    /// `arr[i]` of an array part, `i` an `I32` below its size.
+    ArrLoad,
+    ArrStore,
+    /// The table's backward barrier unless it is gray.
+    Barrier,
+
     // --- varargs: the frame's extras below its header ----------------------
     /// How many extras the frame has (`nv`), an `I32`.
     NumVarargs,
@@ -418,8 +489,14 @@ impl Effects {
     pub(crate) const R_FRAME: Effects = Effects(1 << 9);
     pub(crate) const W_UPVAL: Effects = Effects(1 << 16);
     pub(crate) const W_FRAME: Effects = Effects(1 << 17);
+    pub(crate) const R_TAB: Effects = Effects(1 << 10);
+    pub(crate) const R_SHAPE: Effects = Effects(1 << 11);
+    pub(crate) const R_META: Effects = Effects(1 << 12);
     pub(crate) const W_TAB: Effects = Effects(1 << 18);
     pub(crate) const W_SHAPE: Effects = Effects(1 << 19);
+    pub(crate) const W_META: Effects = Effects(1 << 20);
+    /// The collector's state: a barrier or an allocation.
+    pub(crate) const W_GC: Effects = Effects(1 << 21);
     /// Writes every class (a call: anything may run).
     pub(crate) const W_ALL: Effects = Effects(0xffff_0000);
 
@@ -451,6 +528,13 @@ impl Op {
                 Effects::MAY_DEOPT
             }
             GuardNoFlag(_) => Effects::MAY_DEOPT | Effects::R_FRAME,
+            GuardShape(_) => Effects::MAY_DEOPT | Effects::R_SHAPE,
+            ClassBits(_) | ClassIndex(_) => Effects::R_META,
+            TabLoad { .. } | ArrLoad => Effects::R_TAB,
+            TabStore { .. } | ArrStore => Effects::W_TAB,
+            TabHasRoom(_) | TabASize | TabArray => Effects::R_SHAPE,
+            TabSetShape(_) => Effects::W_SHAPE,
+            Barrier => Effects::W_GC,
             HasFlag(_) => Effects::R_FRAME,
             CellLoad => Effects::R_UPVAL,
             CellStore => Effects::W_UPVAL,
@@ -499,6 +583,11 @@ impl Op {
             Helper(h) => h.sig().ret.is_some() as usize,
             Store(_)
             | CellStore
+            | GuardShape(_)
+            | TabStore { .. }
+            | TabSetShape(_)
+            | ArrStore
+            | Barrier
             | GuardTrue
             | GuardFalse
             | GuardSame
@@ -530,7 +619,10 @@ impl Op {
             KF64(_) => Ty::F64,
             Load(_) | UpvalValue(_) | CellLoad | Resume { .. } => Ty::ANY,
             UpvalCell(_) => Ty::PTR,
-            NumVarargs => Ty::I32,
+            NumVarargs | ClassBits(_) | TabASize => Ty::I32,
+            ClassIndex(_) | TabLoad { .. } | ArrLoad => Ty::ANY,
+            TabArray => Ty::PTR,
+            TabHasRoom(_) => Ty::B1,
             VarargAt(_) | VarargIdx => Ty::ANY,
             HasFlag(_) => Ty::B1,
             Box => args[0].boxed(),
