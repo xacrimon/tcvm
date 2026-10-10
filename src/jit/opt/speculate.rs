@@ -128,9 +128,19 @@ pub(crate) fn speculate(f: &mut Func<'_>, kinds: &EntryKinds) -> bool {
         match at {
             None if c.entry.is_some() => f.insert_before_term(f.entry, g),
             None => {
+                // After the last definition the snapshot names: one bytecode
+                // instruction may define its results one IR instruction each.
                 let d = f.def_inst(c.v).unwrap();
                 let b = f.insts[d.idx()].block;
-                let k = f.insts_of(b).iter().position(|&x| x == d).unwrap();
+                let insts = f.insts_of(b);
+                let k = frames[ci]
+                    .2
+                    .iter()
+                    .filter_map(|&(_, v)| f.def_inst(v))
+                    .chain([d])
+                    .filter_map(|x| insts.iter().position(|&y| y == x))
+                    .max()
+                    .unwrap();
                 f.insert(b, k + 1, g);
             }
             Some(b) => f.insert(b, 0, g),
@@ -248,26 +258,31 @@ fn entry_set(f: &Func<'_>, kinds: &EntryKinds, r: u8, e: TypeSet) -> Option<Type
 /// the region other than by an exit (the anticipability, or down-safety, of
 /// partial redundancy elimination), and the same just after each
 /// candidate's definition: one bit-vector dataflow for all candidates. A
-/// value's names are itself and the parameters it flows into.
+/// value's names are itself and the parameters it flows into, each with its
+/// own bit: a parameter is the value only along the edges that pass it.
 struct Ant {
     words: usize,
     at_start: Vec<u64>,
     after_def: Vec<bool>,
+    /// The bit of each candidate's own value.
+    own: Vec<usize>,
 }
 
 impl Ant {
     fn at(&self, b: Block, c: usize) -> bool {
-        self.at_start[b.idx() * self.words + c / 64] >> (c % 64) & 1 != 0
+        let k = self.own[c];
+        self.at_start[b.idx() * self.words + k / 64] >> (k % 64) & 1 != 0
     }
 }
 
 fn anticipated(f: &Func<'_>, cands: &[Cand]) -> Ant {
     let cfg = f.cfg();
     let rpo = &cfg.rpo;
-    let w = cands.len().div_ceil(64);
-    // The candidates each value names, and those each instruction defines.
-    let mut names: FastMap<Val, Vec<usize>> = FastMap::default();
+    // A bit per (candidate, name); the candidates each instruction defines.
+    let mut bit: FastMap<(usize, Val), usize> = FastMap::default();
+    let mut by_name: FastMap<Val, Vec<(usize, usize)>> = FastMap::default();
     let mut defs: FastMap<Inst, Vec<usize>> = FastMap::default();
+    let mut own = vec![usize::MAX; cands.len()];
     for (ci, c) in cands.iter().enumerate() {
         if c.entry.is_some() {
             continue;
@@ -292,12 +307,17 @@ fn anticipated(f: &Func<'_>, cands: &[Cand]) -> Ant {
             }
         }
         for v in mine {
-            names.entry(v).or_default().push(ci);
+            let n = bit.len();
+            bit.insert((ci, v), n);
+            by_name.entry(v).or_default().push((ci, n));
         }
+        own[ci] = bit[&(ci, c.v)];
     }
+    let w = bit.len().div_ceil(64).max(1);
     let mut at_start = vec![!0u64; f.blocks.len() * w];
     let mut after_def = vec![false; cands.len()];
     let mut cur = vec![0u64; w];
+    let mut edge = vec![0u64; w];
     let mut changed = true;
     while changed {
         changed = false;
@@ -308,8 +328,24 @@ fn anticipated(f: &Func<'_>, cands: &[Cand]) -> Ant {
                 Op::Deopt => cur.fill(!0),
                 Op::Jump | Op::Br => {
                     cur.fill(!0);
-                    for s in f.succs(b) {
-                        for (x, y) in cur.iter_mut().zip(&at_start[s.idx() * w..]) {
+                    for j in 0..f.edges(term).len() {
+                        let s = f.edges(term)[j].target;
+                        edge.copy_from_slice(&at_start[s.idx() * w..(s.idx() + 1) * w]);
+                        // A parameter's use is its argument's along this edge.
+                        for (k, &p) in f.params(s).iter().enumerate() {
+                            let Some(ps) = by_name.get(&p) else {
+                                continue;
+                            };
+                            let a = f.edge_args(term, j)[k];
+                            for &(c, pb) in ps {
+                                if edge[pb / 64] >> (pb % 64) & 1 != 0
+                                    && let Some(&ab) = bit.get(&(c, a))
+                                {
+                                    edge[ab / 64] |= 1 << (ab % 64);
+                                }
+                            }
+                        }
+                        for (x, y) in cur.iter_mut().zip(&edge) {
                             *x &= y;
                         }
                     }
@@ -319,15 +355,16 @@ fn anticipated(f: &Func<'_>, cands: &[Cand]) -> Ant {
             for &i in insts.iter().rev() {
                 if let Some(cs) = defs.get(&i) {
                     for &c in cs {
-                        after_def[c] = cur[c / 64] >> (c % 64) & 1 != 0;
+                        let k = own[c];
+                        after_def[c] = cur[k / 64] >> (k % 64) & 1 != 0;
                     }
                 }
                 if let Some((a, set)) = informative(f, i)
-                    && let Some(cs) = names.get(&a)
+                    && let Some(ns) = by_name.get(&a)
                 {
-                    for &c in cs {
+                    for &(c, n) in ns {
                         if cands[c].set.contains(set) {
-                            cur[c / 64] |= 1 << (c % 64);
+                            cur[n / 64] |= 1 << (n % 64);
                         }
                     }
                 }
@@ -343,6 +380,7 @@ fn anticipated(f: &Func<'_>, cands: &[Cand]) -> Ant {
         words: w,
         at_start,
         after_def,
+        own,
     }
 }
 
