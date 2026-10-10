@@ -122,6 +122,11 @@ pub(crate) enum HelperId {
     /// `(Val, Val) -> Val`: an `ipairs` step past the array part, `t[k]`:
     /// the value, nil at the end, or `HELPER_FAIL_VAL` for `__index`.
     TforIpairs,
+    /// `-> I32`: the arguments of a CALL at `R[a]` up to `top`.
+    TopArgs(u8),
+    /// `-> Val`: `VARARG` of all the extras into `R[a..]`, `top` after
+    /// them: 0, or `HELPER_FAIL_VAL` when they do not fit the stack.
+    VarargAll(u8),
     /// `(Val, Val) -> Val`: the metamethod of the bit (`MetamethodBits`)
     /// from the left operand, else the right, as `binop_metamethod` finds
     /// it; nil when neither has one.
@@ -191,6 +196,8 @@ impl HelperId {
             HelperId::VarargTable(np) => format!("varargtable r{np}"),
             HelperId::TforNext { a, count } => format!("tfornext r{a} count={count}"),
             HelperId::TforIpairs => "tforipairs".into(),
+            HelperId::TopArgs(a) => format!("topargs r{a}"),
+            HelperId::VarargAll(a) => format!("varargall r{a}"),
             HelperId::Index => "index".into(),
             HelperId::Mm(bit) => format!("mm {bit:#x}"),
             HelperId::IndexFn => "index_fn".into(),
@@ -204,6 +211,7 @@ impl HelperId {
         const RT: &[Ctx] = &[Ctx::Rt];
         const FRAME: &[Ctx] = &[Ctx::Rt, Ctx::Thread, Ctx::Base];
         const BASE: &[Ctx] = &[Ctx::Rt, Ctx::Base];
+        const STACK: &[Ctx] = &[Ctx::Thread, Ctx::Base];
         let alloc = Effects::MAY_ALLOC;
         let (ctx, imm, args, ret, effects): (_, _, &'static [Rep], _, _) = match self {
             HelperId::FMod | HelperId::FPow => {
@@ -233,7 +241,7 @@ impl HelperId {
             ),
             HelperId::NewTable(t) => (BASE, Some(t as u64), &[], Some(Val), alloc),
             HelperId::SetList { a, n, off } => (
-                BASE,
+                FRAME,
                 Some(a as u64 | (n as u64) << 8 | (off as u64) << 16),
                 &[],
                 None,
@@ -270,6 +278,8 @@ impl HelperId {
                 alloc | Effects::R_SLOT | Effects::W_SLOT,
             ),
             HelperId::TforIpairs => (RT, None, &[Val, Val], Some(Val), alloc),
+            HelperId::TopArgs(a) => (STACK, Some(a as u64), &[], Some(I32), Effects::NONE),
+            HelperId::VarargAll(a) => (STACK, Some(a as u64), &[], Some(Val), Effects::W_SLOT),
             HelperId::Index => (
                 RT,
                 None,
@@ -532,8 +542,16 @@ pub(crate) enum Op {
     /// Exits unless a metamethod call's header and `n` arguments fit below
     /// the stack's end.
     GuardFits(u8),
+    /// Leave for the interpreter's handler of the instruction at `pc`, the
+    /// frame in its slots (R1): a `TAILCALL` or a `RETURN` that leaves the
+    /// frame, whose interpreter work is all there is left.
+    Dispatch {
+        pc: u32,
+        word: u64,
+    },
     /// Call `R[a]` with `nargs` arguments in `R[a+4..]` (stored), `c` the
-    /// CALL's result operand; edge 0 is the resume block.
+    /// CALL's result operand; edge 0 is the resume block. `nargs` is
+    /// `u8::MAX` for arguments up to `top`, their count the operand.
     Call {
         a: u8,
         nargs: u8,
@@ -616,7 +634,7 @@ impl Op {
             Jump | Br => Effects::TERMINATOR,
             Return { .. } => Effects::TERMINATOR | Effects::TAILOUT | Effects::R_SLOT,
             GuardFits(_) => Effects::MAY_DEOPT,
-            Call { .. } | CallMm { .. } => {
+            Call { .. } | CallMm { .. } | Dispatch { .. } => {
                 Effects::TERMINATOR
                     | Effects::TAILOUT
                     | Effects::W_ALL
@@ -664,6 +682,7 @@ impl Op {
             | Return { .. }
             | Call { .. }
             | CallMm { .. }
+            | Dispatch { .. }
             | GuardFits(_)
             | Deopt => 0,
             Resume { c } => match c {

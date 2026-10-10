@@ -602,6 +602,15 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         }
     }
 
+    /// Continue in a block whose registers are read from their home slots,
+    /// where a helper wrote some; `tys` the types of the stored ones.
+    pub(crate) fn sync_root(&mut self, tys: Vec<TypeSet>) {
+        let root = self.new_root(tys);
+        self.terminate(Op::Jump, &[], &[root], None);
+        self.bs[root.idx()].preds.clear();
+        self.switch_to(root);
+    }
+
     /// `r` loaded from its home slot, which a helper wrote.
     pub(crate) fn reload(&mut self, r: u8) -> Val {
         let v = self.ins(Op::Load(r), &[]);

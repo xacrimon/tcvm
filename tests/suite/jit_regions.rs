@@ -456,3 +456,31 @@ fn generic_for_loops() {
 "#,
     );
 }
+
+/// TAILCALL and RETURN up to `top` leave through the interpreter's
+/// handlers with the frame stored; CALL, SETLIST and VARARG up to `top`
+/// compile.
+#[test]
+fn tail_calls_and_multret() {
+    agrees(
+        r##"
+        local function count(n, acc) if n == 0 then return acc end return count(n - 1, acc + 1) end
+        local callable = setmetatable({}, {__call = function(self, x) return x * 3 end})
+        local function t1(x) return math.max(x, 5) end
+        local function t3(x) return callable(x) end
+        local function t4(...) return select("#", ...) end
+        local function two(x) return x, x + 1 end
+        local function many(n) local t = {} for i = 1, n do t[i] = i end return table.unpack(t) end
+        local function pass(...) return ... end
+        local function sum(...) local s = 0 for i = 1, select("#", ...) do s = s + (select(i, ...) or 0) end return s end
+        local function wrap(...) return {...} end
+        local function opened(...) local x = 1 local f = function() return x end x = 2 return f(), ... end
+        local s = count(100000, 0)
+        for i = 1, 600 do
+          s = s + t1(i % 10) + t3(i) + t4(i, nil, i) + sum(two(i)) + sum(many(i % 7))
+          s = s + #wrap(two(i), two(i)) + sum(pass(1, 2, 3)) + sum(opened(i, i))
+        end
+        return tostring(s)
+"##,
+    );
+}

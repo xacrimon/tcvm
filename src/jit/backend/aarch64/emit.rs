@@ -836,10 +836,22 @@ impl Em<'_> {
                 self.a.str(BASE, BASE, hdr + 16);
                 self.a.ldr_lit(X16, pc_after as u64);
                 self.a.str(X16, BASE, hdr + 24);
+                if nargs == u8::MAX {
+                    let n = self.r(i, 0);
+                    self.a.mov(INSN, n);
+                } else {
+                    self.a.movz(Sz::X, INSN, nargs as u16, 0);
+                }
                 self.close_frame();
-                self.a.movz(Sz::X, INSN, nargs as u16, 0);
                 self.a.add_imm(Sz::X, PC, BASE, hdr as u64);
                 self.a.b_far(self.helpers.enter);
+            }
+            Dispatch { op, word, pc_after } => {
+                self.close_frame();
+                self.a.ldr_lit(INSN, word);
+                self.a.ldr_lit(PC, pc_after as u64);
+                self.a.ldr(X16, RT, op as i32 * 8);
+                self.a.br(X16);
             }
             Resume { wanted, c, a } => {
                 // The callee's header word 2 is this frame's base; its word 0

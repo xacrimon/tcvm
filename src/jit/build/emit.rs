@@ -109,13 +109,11 @@ pub(super) fn always_deopts(b: &Builder<'_, '_>, pc: u32) -> bool {
         | CLOSE | GETTABLE | SETTABLE | TFORPREP | TFORCALL | TFORCALL_NEXT | TFORCALL_IPAIRS
         | TFORLOOP => false,
         // A tail call of an intrinsic compiles; any other deopts at itself.
-        TAILCALL => insn.b() == 0,
+        TAILCALL => false,
         // A vararg table makes VARARG read it, and MULTRET sets `top`.
-        VARARG => b.proto.needs_vararg_table || insn.b() == 0,
+        VARARG => b.proto.needs_vararg_table,
         VARARGPREP | VARARGGET | NEWTABLE => false,
-        SETLIST => insn.b() == 0,
-        RETURN => insn.b() == 0,
-        CALL | CALL_R0 | CALL_R1 | CALLS | CALLS_R0 | CALLS_R1 => insn.b() == 0,
+        SETLIST | RETURN | CALL | CALL_R0 | CALL_R1 | CALLS | CALLS_R0 | CALLS_R1 => false,
         FORPREP => false,
         UNM | BNOT => false,
         op => match op.info().family {
@@ -182,6 +180,26 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
                 let t = b.ins(Op::Helper(HelperId::VarargTable(np)), &[]);
                 b.set(np, t);
             }
+        }
+        VARARG if rb == 0 => {
+            // Registers below `a` live after it are stored; the block after
+            // reads every register from its slot.
+            let mut live = b
+                .cfg
+                .live_in
+                .get(pc as usize + 1)
+                .copied()
+                .unwrap_or_default();
+            for r in a as usize..b.cfg.nregs {
+                live.remove(r);
+            }
+            let tys = b.store_live(live);
+            let r = b.ins(Op::Helper(HelperId::VarargAll(a)), &[]);
+            let fail = b.ins(Op::KVal(HELPER_FAIL_VAL), &[]);
+            let failed = b.ins(Op::SameBits, &[r, fail]);
+            let s = b.snap_before();
+            b.ins_snap(Op::GuardFalse, &[failed], s, ExitTag::Slow);
+            b.sync_root(tys);
         }
         VARARG => {
             let nv = b.ins(Op::NumVarargs, &[]);
@@ -310,6 +328,8 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             store_results(b, a, 1);
             b.terminate(Op::Return { a, n: 1 }, &[], &[], None);
         }
+        // Up to `top`: the interpreter's RETURN, which closes too.
+        RETURN if rb == 0 => dispatch(b),
         RETURN => emit_return(b, a, rb - 1),
         TAILCALL => {
             let callee = b.reg(a);
@@ -317,7 +337,8 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
                 b.flush();
                 emit_return(b, a, 1);
             } else {
-                b.deopt(ExitTag::Unsupported);
+                // The interpreter's tail call: any callee, varargs, closing.
+                dispatch(b);
             }
         }
         GETUPVAL_REF => {
@@ -426,6 +447,16 @@ fn branch(b: &mut Builder<'_, '_>, cond: Val, jump_when: bool, succs: &[Block]) 
     } else {
         b.br(cond, fall, target);
     }
+}
+
+/// Leave for the interpreter's handler of the instruction being emitted,
+/// with what is live stored (R1): what is left of it leaves the frame.
+fn dispatch(b: &mut Builder<'_, '_>) {
+    let pc = b.pc;
+    let live = b.cfg.live_in[pc as usize];
+    b.store_live(live);
+    let word = b.code(pc).raw();
+    b.terminate(Op::Dispatch { pc, word }, &[], &[], None);
 }
 
 /// `RETURN` of `n` results from `R[a..]`. A frame with to-be-closed
@@ -1351,17 +1382,14 @@ fn emit_call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
     for r in a..(a as usize + (nres as usize).max(4)).min(tys.len()) as u8 {
         tys[r as usize] = TypeSet::ANY;
     }
-    let resume = b.call(
-        Op::Call {
-            a,
-            nargs: nb - 1,
-            c,
-            pc,
-        },
-        &[],
-        tys,
-        c,
-    );
+    // Arguments up to `top`: their count from it.
+    let (nargs, count) = if nb == 0 {
+        let n = b.ins(Op::Helper(HelperId::TopArgs(a)), &[]);
+        (u8::MAX, vec![n])
+    } else {
+        (nb - 1, vec![])
+    };
+    let resume = b.call(Op::Call { a, nargs, c, pc }, &count, tys, c);
     let first = b.f.insts_of(resume)[0];
     let rs: Vec<Val> = b.f.results(first).collect();
     for (k, &v) in rs.iter().enumerate() {
