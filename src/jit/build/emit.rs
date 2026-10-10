@@ -4,8 +4,9 @@
 
 use crate::env::MetamethodBits;
 use crate::env::value::Value;
+use crate::instruction::TFOR_VARS;
 use crate::instruction::{ArithKind, Family, Instruction, Op as BcOp, UpvalSource};
-use crate::jit::build::{Builder, intrinsics, tables};
+use crate::jit::build::{Builder, intrinsics, iter, tables};
 use crate::jit::feedback as fb;
 use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL, HELPER_FAIL_VAL, HelperId, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
@@ -105,7 +106,8 @@ pub(super) fn always_deopts(b: &Builder<'_, '_>, pc: u32) -> bool {
         MOVE | LOAD | LOADI | LOADNIL | LFALSESKIP | GETUPVAL | NOP | FUNC | LOOP | JMP
         | JMP_BACK | NOT | ERRNNIL | JT | JF | JTSET | JFSET | RETURN0 | RETURN1 | FORLOOP_I
         | FORLOOP_F | FORLOOP | JEQS | JNEQS | LEN | CONCAT | GETUPVAL_REF | SETUPVAL | CLOSURE
-        | CLOSE | GETTABLE | SETTABLE => false,
+        | CLOSE | GETTABLE | SETTABLE | TFORPREP | TFORCALL | TFORCALL_NEXT | TFORCALL_IPAIRS
+        | TFORLOOP => false,
         // A tail call of an intrinsic compiles; any other deopts at itself.
         TAILCALL => insn.b() == 0,
         // A vararg table makes VARARG read it, and MULTRET sets `top`.
@@ -364,6 +366,16 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             b.push(Op::Helper(HelperId::Close(a)), &[]);
         }
         CALL | CALL_R0 | CALL_R1 | CALLS | CALLS_R0 | CALLS_R1 => emit_call(b, pc, insn),
+        TFORPREP => iter::emit_tforprep(b, pc, insn, succs),
+        TFORCALL => iter::emit_tforcall(b, a, rb),
+        TFORCALL_NEXT => iter::emit_tforcall_next(b, a, rb),
+        TFORCALL_IPAIRS => iter::emit_tforcall_ipairs(b, a, rb),
+        TFORLOOP => {
+            let v = b.reg(a + TFOR_VARS);
+            let v = b.boxed(v);
+            let nil = b.ins(Op::IsType(TypeSet::NIL), &[v]);
+            branch(b, nil, false, succs);
+        }
         GETTABLE => tables::emit_gettable(b, pc, insn),
         SETTABLE => tables::emit_settable(b, pc, insn),
         FORPREP => emit_forprep(b, pc, insn, succs),
@@ -838,6 +850,15 @@ fn small_or_float(b: &mut Builder<'_, '_>, v: Val) -> Val {
 /// first, as for a CALL; a window too small for the header exits to the
 /// interpreter, which grows the stack.
 pub(super) fn mm_call(b: &mut Builder<'_, '_>, f: Val, args: &[Val]) -> Val {
+    let resume = staged_call(b, f, args, 0, 2);
+    let first = b.f.insts_of(resume)[0];
+    b.f.result(first)
+}
+
+/// Call `f` with `args` from a header past the frame's registers, wanting
+/// `c - 1` results (landed from `R[land]` when more than two), and continue
+/// in the resume block.
+pub(super) fn staged_call(b: &mut Builder<'_, '_>, f: Val, args: &[Val], land: u8, c: u8) -> Block {
     let pc = b.pc;
     let s = b.snap_before();
     b.ins_snap(Op::GuardFits(args.len() as u8), &[], s, ExitTag::Slow);
@@ -860,10 +881,10 @@ pub(super) fn mm_call(b: &mut Builder<'_, '_>, f: Val, args: &[Val]) -> Val {
     let op = Op::CallMm {
         pc,
         nargs: args.len() as u8,
+        land,
+        c,
     };
-    let resume = b.call(op, &ops, tys, 2);
-    let first = b.f.insts_of(resume)[0];
-    b.f.result(first)
+    b.call(op, &ops, tys, c)
 }
 
 /// The metamethod of `bit` for `mm_args` (its first two), deopting when

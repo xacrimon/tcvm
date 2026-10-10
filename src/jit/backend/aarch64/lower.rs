@@ -949,7 +949,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 let pc_after = self.pc_base + (pc as usize + 1) * 8;
                 self.push(MInst::Call { a, nargs, pc_after }, &[], none);
             }
-            Op::CallMm { pc, nargs } => {
+            Op::CallMm { pc, nargs, .. } => {
                 let pc_after = self.pc_base + (pc as usize + 1) * 8;
                 let hdr = f.meta.max_stack as u16;
                 let ops: Vec<Operand> = args.iter().map(|&a| self.use_(a)).collect();
@@ -980,10 +980,11 @@ impl<'a, 'gc> Lower<'a, 'gc> {
     fn resume_a(&self, i: Inst) -> u8 {
         let b = self.f.insts[i.idx()].block;
         for &p in self.f.cfg().preds(b) {
-            if let Some(t) = self.f.terminator(p)
-                && let Op::Call { a, .. } = self.f.op(t)
-            {
-                return a;
+            if let Some(t) = self.f.terminator(p) {
+                match self.f.op(t) {
+                    Op::Call { a, .. } | Op::CallMm { land: a, .. } => return a,
+                    _ => {}
+                }
             }
         }
         0

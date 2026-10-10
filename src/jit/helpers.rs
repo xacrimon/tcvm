@@ -6,10 +6,11 @@ use crate::dmm::lock::RefLock;
 use crate::env::MetamethodBits;
 use crate::env::function::UpvalueCell;
 use crate::env::string::LuaString;
-use crate::env::table::{Table, TableState};
+use crate::env::table::{Step, Table, TableState};
 use crate::env::thread::ThreadState;
 use crate::env::value::{Value, ValueKind};
 use crate::instruction::ArithKind;
+use crate::instruction::TFOR_VARS;
 use crate::jit::ir::ops::{HELPER_FAIL, HELPER_FAIL_VAL, HelperId};
 use crate::lua::{Context, State};
 use crate::vm::frame::{self, land_results};
@@ -41,6 +42,8 @@ pub(crate) fn address(h: HelperId) -> usize {
         HelperId::SetList { .. } => jit_setlist as *const () as usize,
         HelperId::VarargGet => jit_varargget as *const () as usize,
         HelperId::VarargTable(_) => jit_vararg_table as *const () as usize,
+        HelperId::TforNext { .. } => jit_tfor_next as *const () as usize,
+        HelperId::TforIpairs => jit_tfor_ipairs as *const () as usize,
         HelperId::Index => jit_index as *const () as usize,
         HelperId::Mm(_) => jit_mm as *const () as usize,
         HelperId::IndexFn => jit_index_fn as *const () as usize,
@@ -260,6 +263,68 @@ pub(crate) extern "C" fn jit_close(
     let ts = unsafe { &mut *thread };
     let level = ts.slot_index(base) + a as usize;
     close_upvalues(ctx.mutation(), ts, level);
+}
+
+/// A `TFORCALL_NEXT` step (`imm`: `a | count << 8`) as `op_tforcall_next`
+/// and `tfor_next` take it, through the frame's slots.
+pub(crate) extern "C" fn jit_tfor_next(
+    rt: *const State<'static>,
+    base: *mut Value<'static>,
+    imm: u64,
+) -> u64 {
+    let ctx = unsafe { Context::from_state(rt) };
+    let (a, count) = (imm as u8 as usize, (imm >> 8) as u8 as usize);
+    let reg = |r: usize| unsafe { base.add(r) };
+    let (Some(t), Some(pos)) = (
+        unsafe { *reg(a + 1) }.get_table(),
+        unsafe { *reg(a + 3) }.get_small().filter(|&p| p >= 0),
+    ) else {
+        return HELPER_FAIL_VAL;
+    };
+    let pos = pos as u32;
+    let step = match t.inner().borrow().next_at_inline(pos) {
+        Step::Entry(next, k, v) => Some((Some(next), k, v)),
+        Step::End => None,
+        Step::Slow => t.inner().borrow().next_at(ctx.mutation(), pos),
+    };
+    let vars = a + TFOR_VARS as usize;
+    unsafe {
+        match step {
+            Some((next, k, v)) => {
+                // Past a position that doesn't fit, `next` resumes from the key.
+                *reg(a + 3) = next.map_or(Value::nil(), |p| Value::small(p as i32));
+                *reg(vars) = k;
+                if count > 1 {
+                    *reg(vars + 1) = v;
+                }
+                for i in 2..count {
+                    *reg(vars + i) = Value::nil();
+                }
+                1
+            }
+            None => {
+                for i in 0..count {
+                    *reg(vars + i) = Value::nil();
+                }
+                0
+            }
+        }
+    }
+}
+
+/// An `ipairs` step past the array part (`tfor_ipairs`): `t[k]`, nil at the
+/// end, or a failure where `__index` may answer.
+pub(crate) extern "C" fn jit_tfor_ipairs(_rt: *const State<'static>, t: u64, k: u64) -> u64 {
+    let (t, k) = unsafe { (Value::from_raw(t), Value::from_raw(k)) };
+    let (Some(t), Some(k)) = (t.get_table(), k.get_integer()) else {
+        return HELPER_FAIL_VAL;
+    };
+    let state = t.inner().borrow();
+    let v = state.get_int(k);
+    if v.is_nil() && state.shape().has_mm(MetamethodBits::INDEX) {
+        return HELPER_FAIL_VAL;
+    }
+    v.to_raw()
 }
 
 /// `NEWTABLE` from template `t` of the running prototype.

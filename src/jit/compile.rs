@@ -70,6 +70,7 @@ pub(crate) struct Times {
 /// The optimized IR of the region of `closure` entered at `pc`. `frame` is
 /// the frame standing at the entry, or null.
 pub(crate) fn build_ir<'gc>(
+    ctx: Context<'gc>,
     closure: LuaFn<'gc>,
     pc: u32,
     opts: &Options,
@@ -87,7 +88,7 @@ pub(crate) fn build_ir<'gc>(
     canonical_back_edges(closure, &mut code);
     let loop_entry = code[pc as usize].op() != crate::instruction::Op::FUNC;
     let cfg = Cfg::build(&closure.proto, code, pc)?;
-    let mut b = Builder::new(closure, &cfg, pc, loop_entry);
+    let mut b = Builder::new(ctx, closure, &cfg, pc, loop_entry);
     b.deopt_all = opts.deopt_all;
     let mut f = b.build()?;
     let check = |f: &Func<'gc>, stage: &str| -> Result<(), CompileError> {
@@ -233,7 +234,7 @@ pub(crate) fn compile<'gc>(
     };
     note_upvalues_offset(closure);
     let mut times = Times::default();
-    let (mut f, cfg) = build_ir(closure, pc, &opts, frame, seen, &mut times)?;
+    let (mut f, cfg) = build_ir(ctx, closure, pc, &opts, frame, seen, &mut times)?;
     let mut nest = Vec::new();
     if f.meta.loop_entry {
         let mut l = cfg.loop_of[cfg.block_of[pc as usize] as usize];
