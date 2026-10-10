@@ -61,6 +61,8 @@ pub(crate) fn address(h: HelperId) -> usize {
         HelperId::ToString => jit_tostring as *const () as usize,
         HelperId::ToNumber => jit_tonumber as *const () as usize,
         HelperId::StrLen => jit_strlen as *const () as usize,
+        HelperId::StrSub => jit_strsub as *const () as usize,
+        HelperId::StrByte => jit_strbyte as *const () as usize,
     }
 }
 
@@ -653,6 +655,49 @@ pub(crate) extern "C" fn jit_tonumber(rt: *const State<'static>, v: u64) -> u64 
     crate::builtin::util::str_to_number(s.as_bytes())
         .map_or(Value::nil(), |n| n.into_value(ctx.mutation()))
         .to_raw()
+}
+
+/// `string.sub(s, i [, j])` with small-integer positions (`j` nil: -1).
+pub(crate) extern "C" fn jit_strsub(rt: *const State<'static>, s: u64, i: u64, j: u64) -> u64 {
+    let ctx = unsafe { Context::from_state(rt) };
+    let (s, i, j) = unsafe { (Value::from_raw(s), Value::from_raw(i), Value::from_raw(j)) };
+    let (Some(s), Some(i)) = (s.get_string(), i.get_small()) else {
+        return HELPER_FAIL_VAL;
+    };
+    let j = match j.get_small() {
+        Some(j) => i64::from(j),
+        None if j.is_nil() => -1,
+        None => return HELPER_FAIL_VAL,
+    };
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let start = crate::builtin::posrelat(i64::from(i), len).max(1);
+    let end = crate::builtin::posrelat(j, len).min(len as i64);
+    let r = if start <= end {
+        &bytes[(start - 1) as usize..end as usize]
+    } else {
+        &[][..]
+    };
+    Value::string(LuaString::new(ctx, r)).to_raw()
+}
+
+/// `string.byte(s [, i])`'s one result: the byte, or nil out of range.
+pub(crate) extern "C" fn jit_strbyte(s: u64, i: u64) -> u64 {
+    let (s, i) = unsafe { (Value::from_raw(s), Value::from_raw(i)) };
+    let Some(s) = s.get_string() else {
+        return HELPER_FAIL_VAL;
+    };
+    let i = match i.get_small() {
+        Some(i) => i64::from(i),
+        None if i.is_nil() => 1,
+        None => return HELPER_FAIL_VAL,
+    };
+    let bytes = s.as_bytes();
+    let k = crate::builtin::posrelat(i, bytes.len());
+    match (k >= 1).then(|| bytes.get(k as usize - 1)).flatten() {
+        Some(&b) => Value::small(b as i32).to_raw(),
+        None => Value::nil().to_raw(),
+    }
 }
 
 /// `string.len(s)` of a string.

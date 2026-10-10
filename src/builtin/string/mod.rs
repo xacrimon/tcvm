@@ -98,7 +98,7 @@ pub fn load<'gc>(ctx: Context<'gc>) {
 
 /// `byte(s [, i [, j]])` — the numeric codes of `s[i..j]` (1-based, negatives
 /// from the end; `i` defaults to 1, `j` to `i`).
-fn lua_byte<'gc>(
+pub(crate) fn lua_byte<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,

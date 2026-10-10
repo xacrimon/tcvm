@@ -521,8 +521,9 @@ fn fast_tail_calls() {
 }
 
 /// Builtins compiled through their helpers (`type`, `getmetatable`,
-/// `setmetatable`, the `raw*` ones, `tostring`, `tonumber`, `string.len`)
-/// and `select`, with the builtin called where a helper declines.
+/// `setmetatable`, the `raw*` ones, `tostring`, `tonumber`, `string.len`,
+/// `string.sub`, `string.byte`) and `select`, with the builtin called where
+/// a helper declines.
 #[test]
 fn builtin_intrinsics() {
     agrees(
@@ -592,6 +593,15 @@ fn builtin_intrinsics() {
           c = c + (bad(1) and 0 or 9)
         end
         emit("select", c)
+
+        local sb = {}
+        for i = 1, 300 do
+          local s = "hello world"
+          sb[1] = string.sub(s, 2) .. string.sub(s, -5) .. string.sub(s, 3, 5) .. string.sub(s, 0) .. string.sub(s, 20) .. "|" .. string.sub(s, -100, 2) .. s:sub(i % 12, -2) .. string.sub(s, 2.0, 3)
+          sb[2] = (string.byte(s) or 0) + (string.byte(s, 3) or 0) + (string.byte(s, -1) or 0) + (string.byte(s, 0) or 1000) + (string.byte(s, 99) or 7) + (s:byte(i % 11 + 1)) + (string.byte(s, 2.0) or 0)
+          sb[3] = pcall(string.sub, {}, 1) and "x" or "e"
+        end
+        emit("strsub", sb[1], sb[2], sb[3])
         return table.concat(out, "\n")
 "##,
     );

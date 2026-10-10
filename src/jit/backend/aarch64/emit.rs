@@ -8,7 +8,7 @@ use crate::env::MtCache;
 use crate::env::table::SlotLoc;
 use crate::env::value::Value;
 use crate::jit::backend::aarch64::abi::{
-    BASE, CLOSURE, D31, IMAGE_SPILLS, INSN, PC, RT, THREAD, X16, X17, image_index,
+    BASE, CLOSURE, D31, IMAGE_SPILLS, INSN, MAX_SPILLS, PC, RT, THREAD, X16, X17, image_index,
 };
 use crate::jit::backend::aarch64::asm::{
     Asm, Cond, Extend, FP, Fpr, Gpr, LR, Label, SP, Shift, Sz, ZR,
@@ -87,7 +87,7 @@ pub(crate) fn emit(
     helpers: Helpers,
     fired: Option<usize>,
 ) -> Result<Emitted, String> {
-    if out.num_spillslots > 64 {
+    if out.num_spillslots > MAX_SPILLS {
         return Err(format!("{} spill slots", out.num_spillslots));
     }
     let frame = (16 + 8 * out.num_spillslots as u32).next_multiple_of(16);

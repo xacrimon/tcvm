@@ -143,7 +143,8 @@ pub(crate) enum HelperId {
     /// must run: `type(v)`, `getmetatable(v)`, `setmetatable(t, mt)` on a
     /// table without one, `rawget(t, k)`, `rawset(t, k, v)`, `rawequal(a,
     /// b)` (`-> I32`), `rawlen(v)`, `tostring(v)` without `__tostring`,
-    /// `tonumber(v)`, `string.len(s)`.
+    /// `tonumber(v)`, `string.len(s)`, `string.sub(s, i, j)` (`j` nil for
+    /// -1), `string.byte(s, i)`'s first result (`i` nil for 1).
     Type,
     GetMetatable,
     SetMetatable,
@@ -154,6 +155,8 @@ pub(crate) enum HelperId {
     ToString,
     ToNumber,
     StrLen,
+    StrSub,
+    StrByte,
     /// `(Val, Val, Val) ->`: `recv[key] = v` through `__newindex` tables,
     /// `raw_set_keyed` when `keyed` (`t[k] = v`), or `HELPER_FAIL_VAL`.
     NewIndex {
@@ -331,6 +334,8 @@ impl HelperId {
                 alloc | Effects::W_TAB | Effects::W_SHAPE,
             ),
             HelperId::RawEqual => (&[][..], None, &[Val, Val], Some(I32), Effects::NONE),
+            HelperId::StrSub => (RT, None, &[Val, Val, Val], Some(Val), alloc),
+            HelperId::StrByte => (&[][..], None, &[Val, Val], Some(Val), Effects::NONE),
         };
         Sig {
             ctx,

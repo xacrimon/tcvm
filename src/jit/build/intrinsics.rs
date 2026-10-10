@@ -39,7 +39,7 @@ enum Intrinsic {
 fn intrinsic_of(f: Function<'_>) -> Option<Intrinsic> {
     use crate::builtin::basic as base;
     let nc = f.as_native()?;
-    let plain: [(NativeFn, Intrinsic); 9] = [
+    let plain: [(NativeFn, Intrinsic); 10] = [
         (base::lua_type, Intrinsic::Builtin(HelperId::Type)),
         (base::lua_getmetatable, Intrinsic::Builtin(HelperId::GetMetatable)),
         (base::lua_rawget, Intrinsic::Builtin(HelperId::RawGet)),
@@ -49,6 +49,7 @@ fn intrinsic_of(f: Function<'_>) -> Option<Intrinsic> {
         (base::lua_tonumber, Intrinsic::Builtin(HelperId::ToNumber)),
         (base::lua_select, Intrinsic::Select),
         (crate::builtin::string::lua_len, Intrinsic::Builtin(HelperId::StrLen)),
+        (crate::builtin::string::lua_byte, Intrinsic::Builtin(HelperId::StrByte)),
     ];
     match nc.function {
         NativeKind::Plain(p) => {
@@ -62,7 +63,7 @@ fn intrinsic_of(f: Function<'_>) -> Option<Intrinsic> {
         _ => {}
     }
     let entry = nc.entry as usize;
-    let table: [(Handler, Intrinsic); 10] = [
+    let table: [(Handler, Intrinsic); 11] = [
         (ff::ff_sqrt, Intrinsic::Sqrt),
         (ff::ff_sin, Intrinsic::Sin),
         (ff::ff_cos, Intrinsic::Cos),
@@ -73,6 +74,7 @@ fn intrinsic_of(f: Function<'_>) -> Option<Intrinsic> {
         (crate::vm::native::ff_pairs, Intrinsic::Pairs),
         (crate::vm::native::ff_ipairs, Intrinsic::Ipairs),
         (ff::ff_setmetatable, Intrinsic::Builtin(HelperId::SetMetatable)),
+        (ff::ff_sub, Intrinsic::Builtin(HelperId::StrSub)),
     ];
     table
         .iter()
@@ -149,12 +151,16 @@ fn builtin<'gc>(
     f: Function<'gc>,
     callee: Val,
 ) -> Emitted {
-    let arity = match h {
-        HelperId::SetMetatable | HelperId::RawGet | HelperId::RawEqual => 2,
-        HelperId::RawSet => 3,
-        _ => 1,
+    // The helper's operand count, and how many of them the call may leave
+    // out (passed as nil).
+    let (arity, optional) = match h {
+        HelperId::SetMetatable | HelperId::RawGet | HelperId::RawEqual => (2, 0),
+        HelperId::RawSet => (3, 0),
+        HelperId::StrSub => (3, 1),
+        HelperId::StrByte => (2, 1),
+        _ => (1, 0),
     };
-    if nargs != arity || c == 0 || c > 2 {
+    if nargs > arity || nargs + optional < arity || c == 0 || c > 2 {
         return Emitted::No;
     }
     let k = b.konst(Value::function(f));
@@ -162,8 +168,12 @@ fn builtin<'gc>(
     b.ins_exit(Op::GuardSame, &[cv, k], ExitTag::Type);
     let args: Vec<Val> = (0..arity)
         .map(|i| {
-            let v = b.reg(a + 4 + i);
-            b.boxed(v)
+            if i < nargs {
+                let v = b.reg(a + 4 + i);
+                b.boxed(v)
+            } else {
+                b.konst(Value::nil())
+            }
         })
         .collect();
     if h == HelperId::Type
@@ -179,7 +189,10 @@ fn builtin<'gc>(
     let mut out = Emitted::Done;
     if !matches!(
         h,
-        HelperId::Type | HelperId::GetMetatable | HelperId::RawEqual | HelperId::ToNumber
+        HelperId::Type
+            | HelperId::GetMetatable
+            | HelperId::RawEqual
+            | HelperId::ToNumber
     ) {
         let fail = b.ins(Op::KVal(HELPER_FAIL_VAL), &[]);
         let failed = b.ins(Op::SameBits, &[r, fail]);
