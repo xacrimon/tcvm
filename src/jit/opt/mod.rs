@@ -35,7 +35,8 @@ pub(crate) fn completes(f: &Func<'_>) -> bool {
         };
         let d = &f.insts[t.idx()];
         done[b.idx()] = match d.op {
-            Op::Return { .. } => !loop_entry,
+            // A dispatched TAILCALL or RETURN leaves the frame as a return does.
+            Op::Return { .. } | Op::Dispatch { .. } => !loop_entry,
             Op::Deopt => d.tag.widenable() && (in_loop[b.idx()] || !loop_entry),
             _ => f.succs(b).any(|s| done[s.idx()] || cfg.dominates(s, b)),
         };
@@ -81,7 +82,7 @@ pub(crate) fn prune_gc_checks(f: &mut Func<'_>) {
     let allocates = |f: &Func<'_>, b: Block| {
         f.insts_of(b).iter().any(|&i| match f.op(i) {
             Op::Box => f.ty(f.args(i)[0]).rep == Rep::I64,
-            Op::Call { .. } => true,
+            Op::Call { .. } | Op::CallMm { .. } => true,
             op => op.effects().has(crate::jit::ir::ops::Effects::MAY_ALLOC),
         })
     };

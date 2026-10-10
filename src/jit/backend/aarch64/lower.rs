@@ -947,7 +947,13 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             }
             Op::Call { a, nargs, pc, .. } => {
                 let pc_after = self.pc_base + (pc as usize + 1) * 8;
-                self.push(MInst::Call { a, nargs, pc_after }, &[], none);
+                let ops: Vec<Operand> = args.iter().map(|&x| self.use_(x)).collect();
+                self.push(MInst::Call { a, nargs, pc_after }, &ops, none);
+            }
+            Op::Dispatch { pc, word } => {
+                let pc_after = self.pc_base + (pc as usize + 1) * 8;
+                let op = (word & 0xff) as u8;
+                self.push(MInst::Dispatch { op, word, pc_after }, &[], none);
             }
             Op::CallMm { pc, nargs, .. } => {
                 let pc_after = self.pc_base + (pc as usize + 1) * 8;

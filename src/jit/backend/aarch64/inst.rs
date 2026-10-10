@@ -222,7 +222,8 @@ pub(crate) enum MInst {
         test: Test,
         cond: Cond,
     },
-    /// Tail-out into `enter`; succ 0 is the resume block.
+    /// Tail-out into `enter`; succ 0 is the resume block. `nargs` is
+    /// `u8::MAX` for the count in the operand.
     Call {
         a: u8,
         nargs: u8,
@@ -233,6 +234,13 @@ pub(crate) enum MInst {
     CallMm {
         hdr: u16,
         nargs: u8,
+        pc_after: usize,
+    },
+    /// Leave for the handler of `op` with `insn` its word and `pc` the
+    /// address after it.
+    Dispatch {
+        op: u8,
+        word: u64,
         pc_after: usize,
     },
     /// `[snap..]`: exit unless the header at `hdr` and `n` arguments fit.
@@ -267,6 +275,9 @@ impl TargetInst for MInst {
     }
 
     fn is_ret(&self) -> bool {
-        matches!(self, MInst::Return { .. } | MInst::Deopt { .. })
+        matches!(
+            self,
+            MInst::Return { .. } | MInst::Deopt { .. } | MInst::Dispatch { .. }
+        )
     }
 }

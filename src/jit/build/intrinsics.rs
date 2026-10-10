@@ -81,6 +81,9 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: 
     } else {
         (insn.a(), insn.b(), insn.c())
     };
+    if nb == 0 {
+        return false;
+    }
     let Some(f) = value_now(b, callee).and_then(|v| v.get_function()) else {
         return false;
     };

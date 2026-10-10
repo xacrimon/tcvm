@@ -44,6 +44,8 @@ pub(crate) fn address(h: HelperId) -> usize {
         HelperId::VarargTable(_) => jit_vararg_table as *const () as usize,
         HelperId::TforNext { .. } => jit_tfor_next as *const () as usize,
         HelperId::TforIpairs => jit_tfor_ipairs as *const () as usize,
+        HelperId::TopArgs(_) => jit_top_args as *const () as usize,
+        HelperId::VarargAll(_) => jit_vararg_all as *const () as usize,
         HelperId::Index => jit_index as *const () as usize,
         HelperId::Mm(_) => jit_mm as *const () as usize,
         HelperId::IndexFn => jit_index_fn as *const () as usize,
@@ -339,10 +341,11 @@ pub(crate) extern "C" fn jit_newtable(
     Value::table(Table::from_template(ctx.mutation(), t)).to_raw()
 }
 
-/// `SETLIST` (`imm`: `a | n << 8 | off << 16`) from the frame's slots, as
-/// `op_setlist` does.
+/// `SETLIST` (`imm`: `a | n << 8 | off << 16`, `n` 0 for up to `top`) from
+/// the frame's slots, as `op_setlist` does.
 pub(crate) extern "C" fn jit_setlist(
     rt: *const State<'static>,
+    thread: *mut ThreadState<'static>,
     base: *mut Value<'static>,
     imm: u64,
 ) {
@@ -352,6 +355,12 @@ pub(crate) extern "C" fn jit_setlist(
         (imm >> 8) as u8 as usize,
         (imm >> 16) as usize,
     );
+    let n = if n == 0 {
+        let ts = unsafe { &*thread };
+        ts.top - ts.slot_index(base) - a - 1
+    } else {
+        n
+    };
     // SAFETY: the compiler gives SETLIST a table and its items' registers.
     let t = unsafe { (*base.add(a)).get_table().unwrap_unchecked() };
     let items = unsafe { std::slice::from_raw_parts(base.add(a + 1), n) };
@@ -359,6 +368,37 @@ pub(crate) extern "C" fn jit_setlist(
         ctx.mutation().backward_barrier(Gc::erase(t.inner()), None);
     }
     unsafe { t.borrow_mut_barriered() }.set_list(ctx.mutation(), off, items);
+}
+
+/// The arguments of the CALL at `R[a]` up to `top`.
+pub(crate) extern "C" fn jit_top_args(
+    thread: *mut ThreadState<'static>,
+    base: *mut Value<'static>,
+    a: u64,
+) -> i32 {
+    let ts = unsafe { &*thread };
+    (ts.top - ts.slot_index(base) - a as usize - frame::HDR) as i32
+}
+
+/// `VARARG a 0`: every extra into `R[a..]` and `top` after them, as
+/// `op_vararg` does; a failure where the stack must grow first.
+pub(crate) extern "C" fn jit_vararg_all(
+    thread: *mut ThreadState<'static>,
+    base: *mut Value<'static>,
+    a: u64,
+) -> u64 {
+    let ts = unsafe { &mut *thread };
+    let nv = unsafe { frame::nv(base) };
+    let target = unsafe { base.add(a as usize) };
+    let end = unsafe { target.add(nv) };
+    if end.cast_const() > ts.stack_end {
+        return HELPER_FAIL_VAL;
+    }
+    ts.top = ts.slot_index(end);
+    // The extras end at the header and the target starts at or above the
+    // base, so the ranges don't overlap.
+    unsafe { land_results(target, base.sub(frame::HDR + nv), nv, nv) };
+    0
 }
 
 /// `VARARGGET` of `key`.
