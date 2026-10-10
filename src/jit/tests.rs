@@ -213,3 +213,30 @@ fn field_reads_numbered_by_memory_version() {
     assert_eq!(count("tabload"), 1, "{ir}");
     assert_eq!(count("tabstore"), 1, "{ir}");
 }
+
+/// What a loop does not change leaves it: the callee guard of an intrinsic
+/// and a field the loop does not store; a field it stores stays.
+#[test]
+fn loop_invariants_leave_the_loop() {
+    let src = "local sqrt = math.sqrt
+    function norm(p, n)
+        local s = 0
+        for i = 1, n do
+            s = s + sqrt(p.x * i)
+            p.y = s
+        end
+        return s
+    end
+    for i = 1, 300 do norm({x = 2.0, y = 0}, 20) end";
+    let ir = ir_of(src, "norm", 0);
+    let count = |s: &str| ir.lines().filter(|l| l.contains(s)).count();
+    // The loop's blocks follow its preheader, the block with the guard.
+    let in_loop = |s: &str| {
+        let after = ir.split("guard.same").nth(1).unwrap_or("");
+        after.lines().skip(1).filter(|l| l.contains(s)).count()
+    };
+    assert_eq!(count("guard.same"), 1, "{ir}");
+    assert_eq!(in_loop("guardshape"), 0, "{ir}");
+    assert_eq!(in_loop("key: 0"), 0, "{ir}");
+    assert_eq!(in_loop("tabstore"), 1, "{ir}");
+}
