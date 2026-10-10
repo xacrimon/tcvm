@@ -51,6 +51,16 @@ pub(crate) fn address(h: HelperId) -> usize {
         HelperId::IndexFn => jit_index_fn as *const () as usize,
         HelperId::NewIndexFn => jit_newindex_fn as *const () as usize,
         HelperId::NewIndex { .. } => jit_newindex as *const () as usize,
+        HelperId::Type => jit_type as *const () as usize,
+        HelperId::GetMetatable => jit_getmetatable as *const () as usize,
+        HelperId::SetMetatable => jit_setmetatable as *const () as usize,
+        HelperId::RawGet => jit_rawget as *const () as usize,
+        HelperId::RawSet => jit_rawset as *const () as usize,
+        HelperId::RawEqual => jit_rawequal as *const () as usize,
+        HelperId::RawLen => jit_rawlen as *const () as usize,
+        HelperId::ToString => jit_tostring as *const () as usize,
+        HelperId::ToNumber => jit_tonumber as *const () as usize,
+        HelperId::StrLen => jit_strlen as *const () as usize,
     }
 }
 
@@ -535,5 +545,122 @@ pub(crate) extern "C" fn jit_land(
             let ts = &mut *thread;
             ts.top = ts.slot_index(dst) + wanted;
         }
+    }
+}
+
+// --- builtins (`jit-design.md` 12) -------------------------------------------
+
+/// `type(v)`: the interned name.
+pub(crate) extern "C" fn jit_type(rt: *const State<'static>, v: u64) -> u64 {
+    let ctx = unsafe { Context::from_state(rt) };
+    let v = unsafe { Value::from_raw(v) };
+    Value::string(LuaString::new(ctx, v.type_name().as_bytes())).to_raw()
+}
+
+/// `getmetatable(v)`, its `__metatable` field shadowing it.
+pub(crate) extern "C" fn jit_getmetatable(rt: *const State<'static>, v: u64) -> u64 {
+    let ctx = unsafe { Context::from_state(rt) };
+    let v = unsafe { Value::from_raw(v) };
+    match ctx.metatable_of(v) {
+        Some(mt) => {
+            let prot = mt.raw_get(Value::string(ctx.symbols().metatable));
+            if prot.is_nil() { Value::table(mt) } else { prot }.to_raw()
+        }
+        None => Value::nil().to_raw(),
+    }
+}
+
+/// `setmetatable(t, mt)` on a table without one, as `ff_setmetatable`; the
+/// builtin does the rest (a protected metatable, a nil one, errors).
+pub(crate) extern "C" fn jit_setmetatable(rt: *const State<'static>, t: u64, mt: u64) -> u64 {
+    let ctx = unsafe { Context::from_state(rt) };
+    let (tv, mt) = unsafe { (Value::from_raw(t), Value::from_raw(mt)) };
+    let (Some(t), Some(mt)) = (tv.get_table(), mt.get_table()) else {
+        return HELPER_FAIL_VAL;
+    };
+    if t.set_metatable_fast(ctx.mutation(), mt, ctx.symbols()).is_none() {
+        if t.metatable().is_some() {
+            return HELPER_FAIL_VAL;
+        }
+        t.set_metatable(ctx, Some(mt));
+    }
+    tv.to_raw()
+}
+
+/// `rawget(t, k)`.
+pub(crate) extern "C" fn jit_rawget(t: u64, k: u64) -> u64 {
+    let (t, k) = unsafe { (Value::from_raw(t), Value::from_raw(k)) };
+    match t.get_table() {
+        Some(t) => t.raw_get(k).to_raw(),
+        None => HELPER_FAIL_VAL,
+    }
+}
+
+/// `rawset(t, k, v)`: `t`, or the builtin's error.
+pub(crate) extern "C" fn jit_rawset(rt: *const State<'static>, t: u64, k: u64, v: u64) -> u64 {
+    let ctx = unsafe { Context::from_state(rt) };
+    let (tv, k, v) = unsafe { (Value::from_raw(t), Value::from_raw(k), Value::from_raw(v)) };
+    let Some(t) = tv.get_table() else {
+        return HELPER_FAIL_VAL;
+    };
+    if k.is_nil() || k.get_float().is_some_and(f64::is_nan) {
+        return HELPER_FAIL_VAL;
+    }
+    t.raw_set_keyed(ctx, k, v);
+    tv.to_raw()
+}
+
+/// `rawequal(a, b)`: 1 or 0.
+pub(crate) extern "C" fn jit_rawequal(a: u64, b: u64) -> u64 {
+    let (a, b) = unsafe { (Value::from_raw(a), Value::from_raw(b)) };
+    num::raw_eq(a, b) as u64
+}
+
+/// `rawlen(v)` of a table or string.
+pub(crate) extern "C" fn jit_rawlen(rt: *const State<'static>, v: u64) -> u64 {
+    let ctx = unsafe { Context::from_state(rt) };
+    let v = unsafe { Value::from_raw(v) };
+    let n = if let Some(s) = v.get_string() {
+        s.len() as i64
+    } else if let Some(t) = v.get_table() {
+        t.raw_len() as i64
+    } else {
+        return HELPER_FAIL_VAL;
+    };
+    Value::integer(ctx.mutation(), n).to_raw()
+}
+
+/// `tostring(v)` without a `__tostring` to call.
+pub(crate) extern "C" fn jit_tostring(rt: *const State<'static>, v: u64) -> u64 {
+    let ctx = unsafe { Context::from_state(rt) };
+    let v = unsafe { Value::from_raw(v) };
+    if !ctx.mm_of(v, MetamethodBits::TOSTRING).is_nil() {
+        return HELPER_FAIL_VAL;
+    }
+    Value::string(crate::builtin::util::basic_tostring(ctx, v)).to_raw()
+}
+
+/// `tonumber(v)` with one argument.
+pub(crate) extern "C" fn jit_tonumber(rt: *const State<'static>, v: u64) -> u64 {
+    let ctx = unsafe { Context::from_state(rt) };
+    let v = unsafe { Value::from_raw(v) };
+    if v.get_integer().is_some() || v.get_float().is_some() {
+        return v.to_raw();
+    }
+    let Some(s) = v.get_string() else {
+        return Value::nil().to_raw();
+    };
+    crate::builtin::util::str_to_number(s.as_bytes())
+        .map_or(Value::nil(), |n| n.into_value(ctx.mutation()))
+        .to_raw()
+}
+
+/// `string.len(s)` of a string.
+pub(crate) extern "C" fn jit_strlen(rt: *const State<'static>, v: u64) -> u64 {
+    let ctx = unsafe { Context::from_state(rt) };
+    let v = unsafe { Value::from_raw(v) };
+    match v.get_string() {
+        Some(s) => Value::integer(ctx.mutation(), s.len() as i64).to_raw(),
+        None => HELPER_FAIL_VAL,
     }
 }

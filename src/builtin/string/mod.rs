@@ -1079,7 +1079,7 @@ fn add_s<'gc>(
 }
 
 /// `len(s)` — number of bytes in `s`.
-fn lua_len<'gc>(
+pub(crate) fn lua_len<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
