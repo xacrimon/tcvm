@@ -62,14 +62,14 @@ handler! {
         }
         counter.set(jit.hot_start(word));
         let closure: LuaFn<'gc> = unsafe { frame::closure(base) };
-        let site = unsafe { pc.sub(1) };
-        // Not when the word in `Code` is an entry an exit dispatched around.
-        if unsafe { *site } == word {
-            let at = unsafe { site.offset_from_unsigned(closure.code) } as u32;
-            if let Some(entry) = try_compile(rt, closure, at, word, base) {
-                let jw = unsafe { *site };
+        let site = unsafe { pc.sub(1).offset_from_unsigned(closure.code) } as u32;
+        if let Some(at) = entry_site(closure, site, word) {
+            let w = unsafe { *closure.code.add(at as usize) };
+            if let Some(entry) = try_compile(rt, closure, at, w, base) {
+                let jw = unsafe { *closure.code.add(at as usize) };
                 let h = unsafe { as_handler(entry) };
-                tail!(h, insn = Slot::insn(jw), closure = Slot::closure(closure))
+                let pc = unsafe { closure.code.add(at as usize + 1) };
+                tail!(h, pc = pc, insn = Slot::insn(jw), closure = Slot::closure(closure))
             }
         }
         // The instruction counts again when it runs: not to trip at once.
@@ -192,6 +192,31 @@ handler! {
 #[inline(always)]
 pub(crate) unsafe fn as_handler(code: *const u8) -> Handler {
     unsafe { std::mem::transmute::<*const u8, Handler>(code) }
+}
+
+/// The entry the counting `word` at `site` compiles, the frame being the
+/// same there: the `LOOP` a back edge jumps past, else the word itself (a
+/// `goto`'s `JMP_BACK` too). None when a JIT word is there already (an exit
+/// dispatched `word` around it), or the back edge is an entry's.
+fn entry_site(closure: LuaFn<'_>, site: u32, word: Instruction) -> Option<u32> {
+    let code = |pc: u32| unsafe { *closure.code.add(pc as usize) };
+    let at = match word.op() {
+        Op::JMP_BACK | Op::TFORLOOP => {
+            if let Some(state) = closure.proto.jit.get()
+                && state.borrow().entries.iter().any(|e| e.back_edges.contains(&site))
+            {
+                return None;
+            }
+            let t = (site as i64 + 1 + word.branch_offset() as i64) as u32;
+            match code(t - 1) {
+                h if h.op() == Op::LOOP => t - 1,
+                h if h.is_jit_word() && original_of(closure, h).op() == Op::LOOP => return None,
+                _ => site,
+            }
+        }
+        _ => site,
+    };
+    (!code(at).is_jit_word()).then_some(at)
 }
 
 /// The word a JIT word replaced.
@@ -324,6 +349,21 @@ fn install<'gc>(
     let mut st = state.borrow_mut(mc);
     st.age += 1;
     let age = st.age;
+    // A loop's back edges, which jump past its `LOOP`, re-enter it now.
+    let mut back_edges = Vec::new();
+    if word.op() == Op::LOOP {
+        for pc in 0..closure.proto.code.len() as u32 {
+            let mut i = unsafe { *closure.code.add(pc as usize) };
+            if matches!(i.op(), Op::JMP_BACK | Op::TFORLOOP)
+                && pc as i64 + 1 + i.branch_offset() as i64 == at as i64 + 1
+                && !st.entries.iter().any(|e| e.back_edges.contains(&pc))
+            {
+                assert!(i.set_branch_offset(i.branch_offset() - 1));
+                write_code(closure, pc, i);
+                back_edges.push(pc);
+            }
+        }
+    }
     st.entries.push(Entry {
         pc: at,
         original: word,
@@ -334,6 +374,7 @@ fn install<'gc>(
         state: EntryState::Compiled,
         nest: region.nest.clone(),
         age,
+        back_edges: back_edges.into_boxed_slice(),
         seen: Vec::new(),
     });
     st.regions.push(region);
@@ -375,9 +416,15 @@ fn write_code(closure: LuaFn<'_>, at: u32, word: Instruction) {
     unsafe { closure.code.add(at as usize).cast_mut().write(word) };
 }
 
-/// Put an entry's original word back and let go of its slot and region.
+/// Put an entry's original word back, and its back edges past it, and let
+/// go of its slot and region.
 fn retire_entry(ctx: Context<'_>, closure: LuaFn<'_>, e: &Entry<'_>) {
     write_code(closure, e.pc, e.original);
+    for &pc in &e.back_edges {
+        let mut i = unsafe { *closure.code.add(pc as usize) };
+        assert!(i.set_branch_offset(i.branch_offset() + 1));
+        write_code(closure, pc, i);
+    }
     ctx.jit().free_slot(e.slot);
     if let Some(r) = e.region {
         r.retired.set(true);

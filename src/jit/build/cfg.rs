@@ -243,7 +243,7 @@ pub(crate) fn use_def(
                 def(proto.num_params as usize);
             }
         }
-        JMP | NOP | STOP | RETURN0 | FUNC | LOOP | JIT_ENTRY | JIT_LOOP => {}
+        JMP | JMP_BACK | NOP | STOP | RETURN0 | FUNC | LOOP | JIT_ENTRY | JIT_LOOP => {}
         GETTABUP | GETTABUP_INL | GETTABUP_AUX | GETTABUP_ABSENT | GETTABUP_PROTO
         | GETTABUP_REF => def(a),
         SETTABUP | SETTABUP_INL | SETTABUP_AUX | SETTABUP_TRANS | SETTABUP_ABSENT
@@ -296,7 +296,7 @@ pub(crate) fn flow(code: &[Instruction], pc: u32) -> Flow {
     let target = |off: i32| (pc as i64 + 1 + off as i64) as u32;
     use Op::*;
     match i.op() {
-        JMP => Flow::Jump(target(i.branch_offset())),
+        JMP | JMP_BACK => Flow::Jump(target(i.branch_offset())),
         RETURN | RETURN0 | RETURN1 | TAILCALL | STOP => Flow::End,
         LFALSESKIP => Flow::Skip,
         TFORPREP => Flow::Jump(target(i.branch_offset())),

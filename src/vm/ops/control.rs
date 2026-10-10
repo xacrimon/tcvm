@@ -121,10 +121,11 @@ fn for_limit(init: i64, limit: Value, step: i64) -> Option<Option<i64>> {
 }
 
 /// Finish a TFORCALL step taken without calling the iterator: store `(k, v)`
-/// in the loop's variables and take the following TFORLOOP's jump, or once
-/// the walk is done, nil them and step past it.
+/// in the loop's variables and take the following TFORLOOP's jump, counted
+/// as TFORLOOP counts it, or once the walk is done, nil them and step past
+/// it.
 macro_rules! tfor_finish {
-    ($pc:ident, $base:ident, $step:expr, $vars:expr, $count:expr) => {{
+    ($pc:ident, $base:ident, $rt:ident, $step:expr, $vars:expr, $count:expr) => {{
         let vars: u8 = $vars;
         let count: u8 = $count;
         match $step {
@@ -136,9 +137,11 @@ macro_rules! tfor_finish {
                 for i in 2..count {
                     reg![vars + i] = Value::nil();
                 }
-                debug_assert_eq!(unsafe { (*$pc).op() }, Op::TFORLOOP);
-                let (_, offset) = unsafe { *$pc }.a_offset();
-                $pc = unsafe { $pc.add(1).offset(offset as isize) };
+                let w = unsafe { *$pc };
+                debug_assert_eq!(w.op(), Op::TFORLOOP);
+                $pc = unsafe { $pc.add(1) };
+                count_hot!($rt, w, b);
+                $pc = unsafe { $pc.offset(w.branch_offset() as isize) };
             }
             None => {
                 for i in 0..count {
@@ -178,6 +181,15 @@ handler! {
 
     /// `pc += imm`
     op fn op_jmp {
+        jump_by!(insn.branch_offset());
+        next!()
+    }
+
+    /// A counted back edge, `pc += imm`: a `while` loop's, past its header's
+    /// `LOOP` (or to the `JIT_LOOP` an entry wrote there), or a backward
+    /// `goto`'s.
+    op fn op_jmp_back {
+        count_hot!(rt, insn, a);
         jump_by!(insn.branch_offset());
         next!()
     }
@@ -439,7 +451,7 @@ handler! {
             Step::End => None,
             Step::Slow => tail!(tfor_next),
         };
-        tfor_finish!(pc, base, step, vars, count)
+        tfor_finish!(pc, base, rt, step, vars, count)
     }
 
     /// `TFORCALL_IPAIRS`: the `ipairs` step through the array part.
@@ -469,7 +481,7 @@ handler! {
             }
         };
         drop(state);
-        tfor_finish!(pc, base, step, vars, count)
+        tfor_finish!(pc, base, rt, step, vars, count)
     }
 
     /// Generic for call: the loop variables = `R[a](R[a+1], first variable)`.
@@ -512,7 +524,7 @@ handler! {
             },
             _ => tail!(tforcall_generic),
         };
-        tfor_finish!(pc, base, step, vars, count)
+        tfor_finish!(pc, base, rt, step, vars, count)
     }
 
     /// TFORCALL's `next` step through a part of integer or other keys.
@@ -529,7 +541,7 @@ handler! {
             reg![a + 3] = next.map_or(Value::nil(), |p| Value::small(p as i32));
             (k, v)
         });
-        tfor_finish!(pc, base, step, vars, count)
+        tfor_finish!(pc, base, rt, step, vars, count)
     }
 
     /// TFORCALL's `ipairs` step past the array part: through the integer
@@ -550,7 +562,7 @@ handler! {
         } else {
             None
         };
-        tfor_finish!(pc, base, step, vars, count)
+        tfor_finish!(pc, base, rt, step, vars, count)
     }
 
     /// TFORCALL by calling the iterator.
@@ -574,10 +586,15 @@ handler! {
         tail!(crate::vm::ops::call::enter, pc = hdr as *const Instruction, insn = crate::vm::abi::Slot::nret(2))
     }
 
-    /// Generic for loop test: jump back while the first variable is not nil.
+    /// Generic for loop test: jump back while the first variable is not nil,
+    /// counting the back edge.
     op fn op_tforloop {
         let (a, offset) = insn.a_offset();
-        branch!(!reg![a + TFOR_VARS].is_nil(), offset)
+        let go = !reg![a + TFOR_VARS].is_nil();
+        if go {
+            count_hot!(rt, insn, b);
+        }
+        branch!(go, offset)
     }
 
     /// Close all upvalues and to-be-closed variables from `R[a]`.

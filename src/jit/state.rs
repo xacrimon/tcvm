@@ -241,6 +241,10 @@ pub(crate) struct Entry<'gc> {
     #[collect(require_static)]
     pub(crate) nest: Box<[u32]>,
     pub(crate) age: u32,
+    /// The back edges of a `LOOP` entry's loop, which jump past the `LOOP`
+    /// until the install points them at it.
+    #[collect(require_static)]
+    pub(crate) back_edges: Box<[u32]>,
     /// Kinds of the entry values failed entry guards saw, by register.
     #[collect(require_static)]
     pub(crate) seen: Vec<(u8, crate::jit::ir::types::TypeSet)>,

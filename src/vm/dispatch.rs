@@ -130,6 +130,7 @@ pub(crate) const TABLE: [Handler; 256] = {
         (Op::LOOP, control::op_loop),
         (Op::JIT_ENTRY, crate::jit::op_jit_entry),
         (Op::JIT_LOOP, crate::jit::op_jit_loop),
+        (Op::JMP_BACK, control::op_jmp_back),
     ];
     let ops: [Handler; Op::COUNT] = Op::table_of(
         control::op_invalid,

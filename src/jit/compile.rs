@@ -78,12 +78,13 @@ pub(crate) fn build_ir<'gc>(
     times: &mut Times,
 ) -> Result<(Func<'gc>, Cfg), CompileError> {
     let start = std::time::Instant::now();
-    let code: Vec<_> = closure
+    let mut code: Vec<_> = closure
         .proto
         .code
         .iter()
         .map(|i| resolve_original(closure, i))
         .collect();
+    canonical_back_edges(closure, &mut code);
     let loop_entry = code[pc as usize].op() != crate::instruction::Op::FUNC;
     let cfg = Cfg::build(&closure.proto, code, pc)?;
     let mut b = Builder::new(closure, &cfg, pc, loop_entry);
@@ -172,6 +173,31 @@ fn resolve_original(
         .find(|e| e.slot == i.d())
         .map(|e| e.original)
         .expect("a JIT word without its entry")
+}
+
+/// Point each counted back edge that jumps past a `LOOP` at it, as the CFG
+/// takes the `LOOP` for the loop's header; an entry there pointed its own
+/// already (`Entry::back_edges`).
+fn canonical_back_edges(closure: LuaFn<'_>, code: &mut [crate::instruction::Instruction]) {
+    use crate::instruction::Op;
+    let pointed: Vec<u32> = closure.proto.jit.get().map_or(Vec::new(), |s| {
+        s.borrow()
+            .entries
+            .iter()
+            .flat_map(|e| e.back_edges.iter().copied())
+            .collect()
+    });
+    for pc in 0..code.len() {
+        let mut i = code[pc];
+        if !matches!(i.op(), Op::JMP_BACK | Op::TFORLOOP) || pointed.contains(&(pc as u32)) {
+            continue;
+        }
+        let t = (pc as i64 + 1 + i.branch_offset() as i64) as usize;
+        if code[t - 1].op() == Op::LOOP {
+            assert!(i.set_branch_offset(i.branch_offset() - 1));
+            code[pc] = i;
+        }
+    }
 }
 
 static UPVALS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
