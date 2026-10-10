@@ -363,3 +363,19 @@ fn intrinsics() {
 "#,
     );
 }
+
+/// A guard that exits when its test holds (`GuardFalse`) and fuses the test
+/// exits on falsy values and on values in the set, not on the others.
+#[test]
+fn inverted_fused_tests() {
+    agrees(
+        r#"
+        local function chk(x) assert(x, "nope") return 1 end
+        local ok, bad = 0, 0
+        for i = 1, 400 do
+          if pcall(chk, i % 13 ~= 0 and i or false) then ok = ok + 1 else bad = bad + 1 end
+        end
+        return ok .. " " .. bad
+"#,
+    );
+}

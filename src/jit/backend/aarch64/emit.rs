@@ -278,21 +278,24 @@ impl Em<'_> {
                 self.a.fcmp(x, y);
                 cond
             }
+            // `cond` is `Lo` for falsy, `Hs` for truthy.
             Test::Falsy => {
                 let v = self.r(i, k);
                 self.a.mov_imm(X16, NIL);
                 self.a.sub(Sz::X, X16, v, X16);
                 self.a.cmp_imm(Sz::X, X16, 2);
-                Cond::Lo
+                cond
             }
             Test::B1 => {
                 let c = self.r(i, k);
                 self.a.cmp_imm(Sz::W, c, 0);
                 cond
             }
+            // `cond` is `Eq` for in the set, `Ne` for not.
             Test::Type(set) => {
                 let v = self.r(i, k);
-                self.type_flags(v, set)
+                let c = self.type_flags(v, set);
+                if cond == Cond::Eq { c } else { c.invert() }
             }
         }
     }
@@ -646,10 +649,14 @@ impl Em<'_> {
                     && !is_single_test(set)
                 {
                     let v = self.r(i, 0);
-                    let ok = self.a.new_label();
-                    self.type_branch(v, set, ok);
-                    self.a.b(l);
-                    self.a.bind(ok);
+                    if cond == Cond::Eq {
+                        let ok = self.a.new_label();
+                        self.type_branch(v, set, ok);
+                        self.a.b(l);
+                        self.a.bind(ok);
+                    } else {
+                        self.type_branch(v, set, l);
+                    }
                 } else {
                     let c = self.test(i, 0, test, cond);
                     self.a.b_cond(c.invert(), l);
