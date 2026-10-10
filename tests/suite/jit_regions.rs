@@ -325,3 +325,41 @@ fn tables_and_fields() {
 "#,
     );
 }
+
+/// Builtins with intrinsics compile inline behind a guard on the callee,
+/// in tail position too; an argument the inline code does not take, or a
+/// replaced builtin, goes back to a call.
+#[test]
+fn intrinsics() {
+    agrees(
+        r#"
+        local sqrt, sin, floor, ceil, abs = math.sqrt, math.sin, math.floor, math.ceil, math.abs
+        local vals = {0, 1, 2.5, -3, -7.25, 2^31, 1e300, -0.0, 1/0, 0/0, math.mininteger, -2147483648, 4}
+        local out = {}
+        local function f(x)
+          local a, b, c, d, e = sqrt(x >= 0 and x or -x), sin(x), floor(x), ceil(x), abs(x)
+          return tostring(a) .. tostring(b) .. tostring(c) .. tostring(d) .. tostring(e)
+        end
+        for r = 1, 300 do
+          for i = 1, #vals do
+            local s = f(vals[i])
+            if r == 300 then out[#out + 1] = s end
+          end
+        end
+        local function h(x) return math.floor(x) end
+        local hs = 0
+        for i = 1, 500 do
+          if i == 300 then math.floor = function() return 42 end end
+          hs = hs + h(i + 0.5)
+        end
+        local function bad(x) return sqrt(x) end
+        local errs = 0
+        for i = 1, 300 do
+          if not pcall(bad, i % 10 == 0 and {} or (i % 7 == 0 and "16" or i)) then errs = errs + 1 end
+        end
+        local function chk(x) assert(x, "nope") return assert(x) end
+        for i = 1, 300 do if not pcall(chk, i % 13 ~= 0 and i or false) then errs = errs + 1 end end
+        return table.concat(out, " ") .. hs .. " " .. errs
+"#,
+    );
+}

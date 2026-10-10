@@ -125,6 +125,7 @@ pub(super) fn emit_get<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
                 },
                 &[t],
             );
+            b.field_loads.insert(v, (recv, kv));
             nil_walks(b, dst, shape, v, recv, key);
         }
         InlineCache::Absent { shape } => {

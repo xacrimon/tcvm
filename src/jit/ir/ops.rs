@@ -68,6 +68,9 @@ pub(crate) enum HelperId {
     FMod,
     /// `(f64, f64) -> f64`: `pow`.
     FPow,
+    /// `f64 -> f64`.
+    Sin,
+    Cos,
     /// `(Val, Val) -> i32`: a generic `<`, `<=` or `==`: 1, 0, or
     /// `HELPER_FAIL` when only the interpreter can (a metamethod, an error).
     Lt,
@@ -150,6 +153,8 @@ impl HelperId {
         match self {
             HelperId::FMod => "fmod".into(),
             HelperId::FPow => "pow".into(),
+            HelperId::Sin => "sin".into(),
+            HelperId::Cos => "cos".into(),
             HelperId::Lt => "lt".into(),
             HelperId::Le => "le".into(),
             HelperId::Eq => "eq".into(),
@@ -180,6 +185,7 @@ impl HelperId {
             HelperId::FMod | HelperId::FPow => {
                 (&[][..], None, &[F64, F64], Some(F64), Effects::NONE)
             }
+            HelperId::Sin | HelperId::Cos => (&[][..], None, &[F64], Some(F64), Effects::NONE),
             HelperId::Lt | HelperId::Le | HelperId::Eq => {
                 (RT, None, &[Val, Val], Some(I32), Effects::NONE)
             }

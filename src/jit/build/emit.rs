@@ -4,7 +4,7 @@
 
 use crate::env::value::Value;
 use crate::instruction::{ArithKind, Family, Instruction, Op as BcOp, UpvalSource};
-use crate::jit::build::{Builder, tables};
+use crate::jit::build::{Builder, intrinsics, tables};
 use crate::jit::feedback as fb;
 use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL, HELPER_FAIL_VAL, HelperId, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
@@ -104,6 +104,8 @@ pub(super) fn always_deopts(b: &Builder<'_, '_>, pc: u32) -> bool {
         | JMP_BACK | NOT | ERRNNIL | JT | JF | JTSET | JFSET | RETURN0 | RETURN1 | FORLOOP_I
         | FORLOOP_F | FORLOOP | JEQS | JNEQS | LEN | CONCAT | GETUPVAL_REF | SETUPVAL | CLOSURE
         | CLOSE | GETTABLE | SETTABLE => false,
+        // A tail call of an intrinsic compiles; any other deopts at itself.
+        TAILCALL => insn.b() == 0,
         // A vararg table makes VARARG read it, and MULTRET sets `top`.
         VARARG => b.proto.needs_vararg_table || insn.b() == 0,
         VARARGPREP | VARARGGET | NEWTABLE => false,
@@ -300,6 +302,15 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             b.terminate(Op::Return { a, n: 1 }, &[], &[], None);
         }
         RETURN => emit_return(b, a, rb - 1),
+        TAILCALL => {
+            let callee = b.reg(a);
+            if intrinsics::emit(b, pc, insn, callee) {
+                b.flush();
+                emit_return(b, a, 1);
+            } else {
+                b.deopt(ExitTag::Unsupported);
+            }
+        }
         GETUPVAL_REF => {
             let c = b.ins(Op::UpvalCell(rb), &[]);
             let v = b.ins(Op::CellLoad, &[c]);
@@ -1146,6 +1157,9 @@ fn emit_call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
     } else {
         b.reg(a)
     };
+    if intrinsics::emit(b, pc, insn, callee) {
+        return;
+    }
     let mut live = b.cfg.live_in[pc as usize];
     live.remove(a as usize);
     let mut tys = b.store_live(live);
