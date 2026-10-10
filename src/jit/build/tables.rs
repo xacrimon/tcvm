@@ -86,6 +86,7 @@ fn nil_walks<'gc>(
 ) {
     if shape.mt_cache().is_none() {
         b.set(dst, v);
+        b.note_def(&[v], None);
         return;
     }
     let join = b.new_block();

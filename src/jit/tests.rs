@@ -175,11 +175,15 @@ fn back_edges_follow_loop_entries() {
         .expect("load");
     lua.finish(&ex).expect("run");
     lua.enter(|ctx| {
-        let f = ctx.globals().raw_get(Value::string(LuaString::new(ctx, b"f")));
+        let f = ctx
+            .globals()
+            .raw_get(Value::string(LuaString::new(ctx, b"f")));
         let lf = f.get_function().and_then(|f| f.as_lua()).unwrap();
         let code = |pc: usize| lf.proto.code.iter().nth(pc).unwrap();
         let n = lf.proto.code.len();
-        let header = (0..n).find(|&pc| code(pc).op() == Op::JIT_LOOP).expect("a loop entry");
+        let header = (0..n)
+            .find(|&pc| code(pc).op() == Op::JIT_LOOP)
+            .expect("a loop entry");
         let back = (0..n).find(|&pc| code(pc).op() == Op::JMP_BACK).unwrap();
         let target = |pc: usize| (pc as i64 + 1 + code(pc).branch_offset() as i64) as usize;
         assert_eq!(target(back), header);
@@ -190,4 +194,22 @@ fn back_edges_follow_loop_entries() {
         assert_eq!(code(header).op(), Op::LOOP);
         assert_eq!(target(back), header + 1);
     });
+}
+
+/// One shape guard per receiver while nothing changes shapes, a field read
+/// again is the first read, and a read after a store is the stored value.
+#[test]
+fn field_reads_numbered_by_memory_version() {
+    let src = "function step(p)
+        local a = p.x + p.x
+        p.y = a
+        return p.y + p.x
+    end
+    local p = {x = 1.5, y = 0}
+    for i = 1, 300 do step(p) end";
+    let ir = ir_of(src, "step", 0);
+    let count = |s: &str| ir.lines().filter(|l| l.contains(s)).count();
+    assert_eq!(count("guardshape"), 1, "{ir}");
+    assert_eq!(count("tabload"), 1, "{ir}");
+    assert_eq!(count("tabstore"), 1, "{ir}");
 }
