@@ -271,7 +271,7 @@ fn kind_of(v: &Value<'_>) -> Kind {
 
 /// The form of `generic` for the numeric operand kinds seen, if one
 /// exists. `rhs` is the immediate for an immediate family.
-fn numeric_form(generic: Op, lhs: &Value<'_>, rhs: &Value<'_>, imm_int: bool) -> Option<Op> {
+fn numeric_form(generic: Op, lhs: &Value<'_>, rhs: &Value<'_>, insn: Instruction) -> Option<Op> {
     let info = generic.info();
     let forms = &info.forms;
     match info.family {
@@ -284,9 +284,11 @@ fn numeric_form(generic: Op, lhs: &Value<'_>, rhs: &Value<'_>, imm_int: bool) ->
         },
         Family::ImmArith | Family::ImmBit => {
             // The register operand: the immediate is on the left for the
-            // reversed forms (and the slow path passed it as `lhs`).
-            let reg = if info.reversed { rhs } else { lhs };
-            match (kind_of(reg), imm_int) {
+            // reversed forms and flipped sites (and the slow path passed it
+            // as `lhs`).
+            let flipped = insn.c() & 1 != 0;
+            let reg = if info.reversed || flipped { rhs } else { lhs };
+            match (kind_of(reg), insn.imm_is_int()) {
                 (Kind::Small, true) => forms[0].or(forms[2]),
                 (Kind::Small, false) => forms[2],
                 (Kind::Float, _) => forms[1],
@@ -547,7 +549,7 @@ handler! {
         };
         if let Some(v) = inline_arith(info.kind, &lhs, &rhs) {
             if !locked {
-                let form = numeric_form(generic, &lhs, &rhs, insn.imm_is_int());
+                let form = numeric_form(generic, &lhs, &rhs, insn);
                 if form.is_none() {
                     // Kinds no form covers leave no other record.
                     feedback::record(closure, site, feedback::kind(lhs) | feedback::kind(rhs));

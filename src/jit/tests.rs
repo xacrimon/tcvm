@@ -153,6 +153,14 @@ fn forms_drop_on_foreign_kinds() {
         "f",
     );
     assert!(ops.contains(&Op::JLT) && !ops.contains(&Op::JLT_II));
+    // `3 * x` has the immediate on the left; the form follows `x`.
+    let ops = ops_of(
+        "function f(x) return 3 * x end
+        for i = 1, 10 do f(i) end
+        f(0.5)",
+        "f",
+    );
+    assert!(ops.contains(&Op::MULI_F) && !ops.contains(&Op::MULI_I));
 }
 
 /// A `while` loop's entry points its back edge at the `JIT_LOOP` over its
