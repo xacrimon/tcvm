@@ -6,6 +6,7 @@ use crate::env::MetamethodBits;
 use crate::env::value::Value;
 use crate::instruction::TFOR_VARS;
 use crate::instruction::{ArithKind, Family, Instruction, Op as BcOp, UpvalSource};
+use crate::jit::build::intrinsics::Emitted;
 use crate::jit::build::{Builder, intrinsics, iter, tables};
 use crate::jit::feedback as fb;
 use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL, HELPER_FAIL_VAL, HelperId, Op};
@@ -182,6 +183,18 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             }
         }
         VARARG if rb == 0 => {
+            // The callee and first argument of a call it passes the extras
+            // to, for its intrinsic, which the slot reloads below would hide.
+            let next = b.code(pc + 1);
+            if matches!(
+                next.op(),
+                BcOp::CALL | BcOp::CALL_R0 | BcOp::CALL_R1 | BcOp::TAILCALL
+            ) && next.b() == 0
+                && next.a() as usize + 5 == a as usize
+            {
+                let (f, first) = (b.reg(next.a()), b.reg(next.a() + 4));
+                b.callee_hint = Some((pc + 1, f, first));
+            }
             // Registers below `a` live after it are stored; the block after
             // reads every register from its slot.
             let mut live = b
@@ -332,16 +345,25 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
         RETURN if rb == 0 => dispatch(b),
         RETURN => emit_return(b, a, rb - 1),
         TAILCALL => {
-            let callee = b.reg(a);
+            let callee = callee_at(b, pc, a);
             // The frame before the TAILCALL, for the return's exit.
             let before = b.snap_before();
-            if intrinsics::emit(b, pc, insn, callee) {
+            let slow = match intrinsics::emit(b, pc, insn, callee) {
+                Emitted::No => Some(b.cur),
+                Emitted::Done => None,
+                Emitted::Fallback(slow) => Some(slow),
+            };
+            if slow != Some(b.cur) {
                 b.flush();
                 emit_return_from(b, a, 1, before);
-            } else if rb != 0 {
-                emit_tailcall(b, a, rb - 1);
-            } else {
-                dispatch(b);
+            }
+            if let Some(slow) = slow {
+                b.switch_to(slow);
+                if rb != 0 {
+                    emit_tailcall(b, a, rb - 1);
+                } else {
+                    dispatch(b);
+                }
             }
         }
         GETUPVAL_REF => {
@@ -1403,16 +1425,40 @@ fn emit_eqi(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Block]
 
 fn emit_call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
     let op = insn.op();
-    let (a, nb, c) = (insn.a(), insn.b(), insn.c());
     let fused = matches!(op, BcOp::CALLS | BcOp::CALLS_R0 | BcOp::CALLS_R1);
     let callee = if fused {
         b.reg(insn.imm() as u8)
     } else {
-        b.reg(a)
+        callee_at(b, pc, insn.a())
     };
-    if intrinsics::emit(b, pc, insn, callee) {
-        return;
+    match intrinsics::emit(b, pc, insn, callee) {
+        Emitted::No => call(b, pc, insn, callee),
+        Emitted::Done => {}
+        Emitted::Fallback(slow) => {
+            // The builtin's results join the inline code's.
+            let join = b.new_block();
+            b.flush();
+            b.jump(join);
+            b.switch_to(slow);
+            call(b, pc, insn, callee);
+            b.flush();
+            b.jump(join);
+            enter_join(b, join);
+        }
     }
+}
+
+/// `R[a]`, the callee of the call at `pc`.
+fn callee_at(b: &mut Builder<'_, '_>, pc: u32, a: u8) -> Val {
+    match b.callee_hint {
+        Some((at, f, _)) if at == pc => f,
+        _ => b.reg(a),
+    }
+}
+
+/// The CALL at `pc` as a call of `callee` (5.4).
+fn call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: Val) {
+    let (a, nb, c) = (insn.a(), insn.b(), insn.c());
     let mut live = b.cfg.live_in[pc as usize];
     live.remove(a as usize);
     let mut tys = b.store_live(live);

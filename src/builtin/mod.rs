@@ -1,4 +1,4 @@
-mod basic;
+pub(crate) mod basic;
 mod coroutine;
 mod debug;
 mod io;
@@ -6,7 +6,7 @@ mod math;
 mod os;
 mod package;
 pub(crate) mod strfmt_num;
-mod string;
+pub(crate) mod string;
 mod table;
 mod utf8;
 // `pub(crate)` so the VM concat path (`vm::num::write_float`) can share the

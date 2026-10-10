@@ -3,16 +3,19 @@
 //! identity and computes the result in place; anything the inline code does
 //! not cover exits before the CALL, and the interpreter runs the builtin.
 
-use crate::env::function::Function;
+use crate::env::function::{Function, NativeFn, NativeKind};
+use crate::env::string::LuaString;
 use crate::env::value::Value;
 use crate::instruction::Instruction;
 use crate::jit::build::Builder;
 use crate::jit::build::emit::{arm_end, branch_arm, enter_join};
 use crate::jit::feedback as fb;
 use crate::jit::ir::Val;
-use crate::jit::ir::ops::{Cc, ExitTag, HelperId, Op};
+use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL_VAL, HelperId, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
+use crate::jit::ir::Block;
 use crate::vm::abi::Handler;
+use crate::vm::native::ContFn;
 use crate::vm::ff;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -26,13 +29,40 @@ enum Intrinsic {
     Assert,
     Pairs,
     Ipairs,
+    Select,
+    /// A builtin computed by its helper.
+    Builtin(HelperId),
 }
 
 /// The intrinsic of a builtin, known by its fast entry (each builtin with
-/// one has its own).
+/// one has its own), else by its function.
 fn intrinsic_of(f: Function<'_>) -> Option<Intrinsic> {
-    let entry = f.as_native()?.entry as usize;
-    let table: [(Handler, Intrinsic); 9] = [
+    use crate::builtin::basic as base;
+    let nc = f.as_native()?;
+    let plain: [(NativeFn, Intrinsic); 9] = [
+        (base::lua_type, Intrinsic::Builtin(HelperId::Type)),
+        (base::lua_getmetatable, Intrinsic::Builtin(HelperId::GetMetatable)),
+        (base::lua_rawget, Intrinsic::Builtin(HelperId::RawGet)),
+        (base::lua_rawset, Intrinsic::Builtin(HelperId::RawSet)),
+        (base::lua_rawequal, Intrinsic::Builtin(HelperId::RawEqual)),
+        (base::lua_rawlen, Intrinsic::Builtin(HelperId::RawLen)),
+        (base::lua_tonumber, Intrinsic::Builtin(HelperId::ToNumber)),
+        (base::lua_select, Intrinsic::Select),
+        (crate::builtin::string::lua_len, Intrinsic::Builtin(HelperId::StrLen)),
+    ];
+    match nc.function {
+        NativeKind::Plain(p) => {
+            if let Some(&(_, i)) = plain.iter().find(|(f, _)| *f as usize == p as usize) {
+                return Some(i);
+            }
+        }
+        NativeKind::Cont(p) if p as usize == base::lua_tostring as ContFn as usize => {
+            return Some(Intrinsic::Builtin(HelperId::ToString));
+        }
+        _ => {}
+    }
+    let entry = nc.entry as usize;
+    let table: [(Handler, Intrinsic); 10] = [
         (ff::ff_sqrt, Intrinsic::Sqrt),
         (ff::ff_sin, Intrinsic::Sin),
         (ff::ff_cos, Intrinsic::Cos),
@@ -42,6 +72,7 @@ fn intrinsic_of(f: Function<'_>) -> Option<Intrinsic> {
         (ff::ff_assert, Intrinsic::Assert),
         (crate::vm::native::ff_pairs, Intrinsic::Pairs),
         (crate::vm::native::ff_ipairs, Intrinsic::Ipairs),
+        (ff::ff_setmetatable, Intrinsic::Builtin(HelperId::SetMetatable)),
     ];
     table
         .iter()
@@ -72,25 +103,216 @@ fn value_now<'gc>(b: &Builder<'_, 'gc>, v: Val) -> Option<Value<'gc>> {
     }
 }
 
+/// What `emit` made of a CALL.
+pub(super) enum Emitted {
+    /// Nothing: the CALL is a call.
+    No,
+    /// Its results.
+    Done,
+    /// Its results, and a block for the call itself, where the inline code
+    /// found the builtin must run.
+    Fallback(Block),
+}
+
 /// Compile the CALL at `pc` as its callee's intrinsic, if it has one that
-/// covers the call's shape; false when the CALL compiles as a call.
-pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: Val) -> bool {
+/// covers the call's shape.
+pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: Val) -> Emitted {
     // A tail call returns the one result.
     let (a, nb, c) = if insn.op() == crate::instruction::Op::TAILCALL {
         (insn.a(), insn.b(), 2)
     } else {
         (insn.a(), insn.b(), insn.c())
     };
-    if nb == 0 {
-        return false;
-    }
     let Some(f) = value_now(b, callee).and_then(|v| v.get_function()) else {
-        return false;
+        return Emitted::No;
     };
     let Some(intr) = intrinsic_of(f) else {
-        return false;
+        return Emitted::No;
     };
-    let nargs = nb - 1;
+    match intr {
+        Intrinsic::Select => return select(b, pc, a, nb, c, f, callee),
+        Intrinsic::Builtin(h) if nb != 0 => return builtin(b, h, a, nb - 1, c, f, callee),
+        _ if nb == 0 => return Emitted::No,
+        _ => {}
+    }
+    let done = emit_math(b, pc, intr, a, nb - 1, c, f, callee);
+    if done { Emitted::Done } else { Emitted::No }
+}
+
+/// A builtin by its helper; `type` of a known kind is a constant.
+fn builtin<'gc>(
+    b: &mut Builder<'_, 'gc>,
+    h: HelperId,
+    a: u8,
+    nargs: u8,
+    c: u8,
+    f: Function<'gc>,
+    callee: Val,
+) -> Emitted {
+    let arity = match h {
+        HelperId::SetMetatable | HelperId::RawGet | HelperId::RawEqual => 2,
+        HelperId::RawSet => 3,
+        _ => 1,
+    };
+    if nargs != arity || c == 0 || c > 2 {
+        return Emitted::No;
+    }
+    let k = b.konst(Value::function(f));
+    let cv = b.boxed(callee);
+    b.ins_exit(Op::GuardSame, &[cv, k], ExitTag::Type);
+    let args: Vec<Val> = (0..arity)
+        .map(|i| {
+            let v = b.reg(a + 4 + i);
+            b.boxed(v)
+        })
+        .collect();
+    if h == HelperId::Type
+        && let Some(name) = type_name(b.ty(args[0]).set)
+    {
+        if c == 2 {
+            let s = b.konst(Value::string(LuaString::new(b.ctx, name.as_bytes())));
+            b.set(a, s);
+        }
+        return Emitted::Done;
+    }
+    let r = b.ins(Op::Helper(h), &args);
+    let mut out = Emitted::Done;
+    if !matches!(
+        h,
+        HelperId::Type | HelperId::GetMetatable | HelperId::RawEqual | HelperId::ToNumber
+    ) {
+        let fail = b.ins(Op::KVal(HELPER_FAIL_VAL), &[]);
+        let failed = b.ins(Op::SameBits, &[r, fail]);
+        let (slow, ok) = (b.new_sealed_succ(), b.new_sealed_succ());
+        b.br(failed, slow, ok);
+        b.switch_to(ok);
+        out = Emitted::Fallback(slow);
+    }
+    if c == 2 {
+        let r = if h == HelperId::RawEqual {
+            let zero = b.ki32(0);
+            let t = b.ins(Op::ICmp(Cc::Ne), &[r, zero]);
+            b.ins(Op::Box, &[t])
+        } else {
+            r
+        };
+        b.set(a, r);
+    }
+    out
+}
+
+/// What `type` answers for values of `set`, when they share it.
+fn type_name(set: TypeSet) -> Option<&'static str> {
+    let names = [
+        (TypeSet::NIL, "nil"),
+        (TypeSet::BOOL, "boolean"),
+        (TypeSet::NUM, "number"),
+        (TypeSet::STR, "string"),
+        (TypeSet::TAB, "table"),
+        (TypeSet::FUN, "function"),
+        (TypeSet::THR, "thread"),
+        (TypeSet::UDATA, "userdata"),
+    ];
+    if set.is_empty() {
+        return None;
+    }
+    names.iter().find(|(s, _)| s.contains(set)).map(|&(_, n)| n)
+}
+
+/// `select('#', ...)` and `select(k, ...)` with a constant selector and one
+/// result, from the arguments, or from the frame's extras when they are a
+/// `VARARG` up to `top` just before.
+fn select<'gc>(
+    b: &mut Builder<'_, 'gc>,
+    pc: u32,
+    a: u8,
+    nb: u8,
+    c: u8,
+    f: Function<'gc>,
+    callee: Val,
+) -> Emitted {
+    if c != 2 || nb == 1 {
+        return Emitted::No;
+    }
+    let sel = match b.callee_hint {
+        Some((at, _, sel)) if at == pc => sel,
+        _ => b.reg(a + 4),
+    };
+    let Some(sv) = const_value(b, sel) else {
+        return Emitted::No;
+    };
+    let count = sv.get_string().is_some_and(|s| s.as_bytes() == b"#");
+    let k = sv.get_integer();
+    if !count && k.is_none() {
+        return Emitted::No;
+    }
+    let extras = nb == 0;
+    if extras {
+        let p = pc.checked_sub(1).map(|p| b.code(p));
+        let vararg = p.is_some_and(|p| {
+            p.op() == crate::instruction::Op::VARARG && p.a() == a + 5 && p.b() == 0
+        });
+        let same_block =
+            vararg && b.cfg.block_of[pc as usize] == b.cfg.block_of[pc as usize - 1];
+        if !same_block || (!count && !k.is_some_and(|k| (1..=256).contains(&k))) {
+            return Emitted::No;
+        }
+    }
+    let m = nb as i64 - 2;
+    let pos = k.map(|k| if k < 0 { m + k + 1 } else { k });
+    if !extras && !count && pos.is_none_or(|p| p < 1) {
+        // An index out of range raises in the builtin.
+        return Emitted::No;
+    }
+    let kf = b.konst(Value::function(f));
+    let cv = b.boxed(callee);
+    b.ins_exit(Op::GuardSame, &[cv, kf], ExitTag::Type);
+    let r = match (count, extras) {
+        (true, false) => b.konst(Value::small(m as i32)),
+        (true, true) => {
+            let nv = b.ins(Op::NumVarargs, &[]);
+            b.ins(Op::Box, &[nv])
+        }
+        (false, false) => {
+            let p = pos.unwrap();
+            if p > m {
+                b.konst(Value::nil())
+            } else {
+                b.reg(a + 4 + p as u8)
+            }
+        }
+        (false, true) => {
+            let nv = b.ins(Op::NumVarargs, &[]);
+            b.ins(Op::VarargAt((k.unwrap() - 1) as u8), &[nv])
+        }
+    };
+    b.set(a, r);
+    Emitted::Done
+}
+
+/// The value of a constant.
+fn const_value<'gc>(b: &Builder<'_, 'gc>, v: Val) -> Option<Value<'gc>> {
+    match b.f.def_op(v)? {
+        Op::KVal(bits) => Some(unsafe { Value::from_raw(bits) }),
+        Op::KObj(p) => Some(b.f.pool[p as usize]),
+        _ => None,
+    }
+}
+
+/// The math intrinsics, `assert`, `pairs` and `ipairs`; false when the
+/// CALL's shape is not one they cover.
+#[allow(clippy::too_many_arguments)]
+fn emit_math<'gc>(
+    b: &mut Builder<'_, 'gc>,
+    pc: u32,
+    intr: Intrinsic,
+    a: u8,
+    nargs: u8,
+    c: u8,
+    f: Function<'gc>,
+    callee: Val,
+) -> bool {
+    let insn = b.code(pc);
     let iterators = matches!(intr, Intrinsic::Pairs | Intrinsic::Ipairs);
     // An exit saw an argument the inline code does not take.
     let seen = b.feedback(pc) & fb::KINDS;
@@ -201,6 +423,7 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: 
             }
         }
         Intrinsic::Pairs | Intrinsic::Ipairs => unreachable!("returned above"),
+        Intrinsic::Select | Intrinsic::Builtin(_) => unreachable!("not math"),
         Intrinsic::Assert => {
             // A falsy one raises in the builtin.
             let xv = b.boxed(x);

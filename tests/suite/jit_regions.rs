@@ -520,6 +520,83 @@ fn fast_tail_calls() {
     agrees(&src);
 }
 
+/// Builtins compiled through their helpers (`type`, `getmetatable`,
+/// `setmetatable`, the `raw*` ones, `tostring`, `tonumber`, `string.len`)
+/// and `select`, with the builtin called where a helper declines.
+#[test]
+fn builtin_intrinsics() {
+    agrees(
+        r##"
+        local out = {}
+        local function emit(...) out[#out + 1] = table.concat({...}, " ") end
+        local vals = {1, 2.5, "s", {}, print, true, nil, coroutine.create(function() end), 2^53}
+        local function types(n)
+          local t = {}
+          for i = 1, n do t[#t + 1] = type(vals[i % 9 + 1]) end
+          local x = 0
+          for i = 1, 100 do x = x + (type(i) == "number" and 1 or 0) + (type("a") == "string" and 1 or 0) end
+          return table.concat(t, ",") .. x
+        end
+        for r = 1, 300 do out.types = types(20) end
+        emit(out.types)
+
+        local P = {}; P.__index = P
+        local Q = {__index = P, __metatable = "locked"}
+        local function new(x) return setmetatable({x = x}, P) end
+        local function newq(x) return setmetatable({x = x}, Q) end
+        local function again(o) return setmetatable(o, P) end
+        local s = 0
+        for i = 1, 300 do
+          local o = new(i); s = s + o.x
+          local q = newq(i); s = s + (getmetatable(q) == "locked" and 1 or 0) + (getmetatable(o) == P and 1 or 0)
+          local ok = pcall(setmetatable, q, P); s = s + (ok and 100 or 1)
+          again(o); s = s + (getmetatable(o) == P and 1 or 0)
+          s = s + (getmetatable("x") ~= nil and 1 or 0) + (getmetatable(1) == nil and 1 or 0)
+        end
+        emit("meta", s)
+
+        local mt = {__index = function(t, k) return "idx" end, __newindex = function(t, k, v) rawset(t, k, v * 2) end, __len = function() return 99 end, __eq = function() return true end}
+        local r = 0
+        local log = {}
+        for i = 1, 300 do
+          local t = setmetatable({}, mt)
+          t.a = i
+          r = r + rawget(t, "a") + (rawget(t, "zz") == nil and 1 or 0) + rawlen(t) + rawlen("abc") + #t
+          rawset(t, "b", i); r = r + rawget(t, "b")
+          local u = setmetatable({}, mt)
+          r = r + (rawequal(t, u) and 1000 or 1) + (t == u and 1 or 0) + (rawequal(1, 1.0) and 1 or 0) + (rawequal("a", "a") and 1 or 0)
+          local ok = pcall(rawset, t, nil, 1); r = r + (ok and 0 or 7)
+          ok = pcall(rawlen, 5); r = r + (ok and 0 or 3)
+        end
+        emit("raw", r)
+
+        local T = setmetatable({}, {__tostring = function() return "custom" end})
+        local N = setmetatable({}, {__name = "Named"})
+        local st = {}
+        for i = 1, 300 do
+          st[1] = tostring(i) .. tostring(1.5) .. tostring(true) .. tostring(nil) .. tostring(T)
+          st[2] = (tostring(N):match("^Named") or "?")
+          st[3] = tostring(tonumber("12")) .. tostring(tonumber("0x10")) .. tostring(tonumber(" 1e2 ")) .. tostring(tonumber("z")) .. tostring(tonumber(3)) .. tostring(tonumber({}))
+          st[4] = string.len("hello") + string.len("") + (pcall(string.len, {}) and 0 or 5)
+        end
+        emit("str", st[1], st[2], st[3], st[4])
+
+        local function count(...) return select("#", ...) end
+        local function second(...) return select(2, ...) end
+        local function last(...) return (select(-1, ...)) end
+        local function fixed(a, b, c) return select("#", a, b, c) + select(2, a, b, c) end
+        local function bad(...) return pcall(select, 0, ...) end
+        local c = 0
+        for i = 1, 300 do
+          c = c + count() + count(1) + count(1, nil, 3) + (second(1, 2, 3) or 0) + (second(1) or 100) + last(4, 5, 6) + fixed(1, 2, 3)
+          c = c + (bad(1) and 0 or 9)
+        end
+        emit("select", c)
+        return table.concat(out, "\n")
+"##,
+    );
+}
+
 /// A field site that saw several shapes compiles a test per shape (own
 /// slots, `__index` holders, absent keys); one that saw more takes the
 /// helper.

@@ -139,6 +139,21 @@ pub(crate) enum HelperId {
     /// `(Val, Val) -> Val`: `recv[key]` through `__index` tables, or
     /// `HELPER_FAIL_VAL` (an `__index` function, an error).
     Index,
+    /// Builtins (12), each `-> Val` with `HELPER_FAIL_VAL` where the builtin
+    /// must run: `type(v)`, `getmetatable(v)`, `setmetatable(t, mt)` on a
+    /// table without one, `rawget(t, k)`, `rawset(t, k, v)`, `rawequal(a,
+    /// b)` (`-> I32`), `rawlen(v)`, `tostring(v)` without `__tostring`,
+    /// `tonumber(v)`, `string.len(s)`.
+    Type,
+    GetMetatable,
+    SetMetatable,
+    RawGet,
+    RawSet,
+    RawEqual,
+    RawLen,
+    ToString,
+    ToNumber,
+    StrLen,
     /// `(Val, Val, Val) ->`: `recv[key] = v` through `__newindex` tables,
     /// `raw_set_keyed` when `keyed` (`t[k] = v`), or `HELPER_FAIL_VAL`.
     NewIndex {
@@ -203,6 +218,7 @@ impl HelperId {
             HelperId::IndexFn => "index_fn".into(),
             HelperId::NewIndexFn => "newindex_fn".into(),
             HelperId::NewIndex { keyed } => format!("newindex keyed={keyed}"),
+            other => format!("{other:?}").to_lowercase(),
         }
     }
 
@@ -294,6 +310,27 @@ impl HelperId {
                 Some(Val),
                 alloc | Effects::W_TAB | Effects::W_SHAPE | Effects::W_META,
             ),
+            HelperId::Type | HelperId::ToNumber | HelperId::StrLen | HelperId::RawLen => {
+                (RT, None, &[Val], Some(Val), alloc)
+            }
+            HelperId::ToString => (RT, None, &[Val], Some(Val), alloc | Effects::W_SHAPE),
+            HelperId::GetMetatable => (RT, None, &[Val], Some(Val), Effects::NONE),
+            HelperId::SetMetatable => (
+                RT,
+                None,
+                &[Val, Val],
+                Some(Val),
+                alloc | Effects::W_TAB | Effects::W_SHAPE | Effects::W_META,
+            ),
+            HelperId::RawGet => (&[][..], None, &[Val, Val], Some(Val), Effects::NONE),
+            HelperId::RawSet => (
+                RT,
+                None,
+                &[Val, Val, Val],
+                Some(Val),
+                alloc | Effects::W_TAB | Effects::W_SHAPE,
+            ),
+            HelperId::RawEqual => (&[][..], None, &[Val, Val], Some(I32), Effects::NONE),
         };
         Sig {
             ctx,
@@ -759,7 +796,7 @@ impl Op {
             | Helper(HelperId::Arith(ArithKind::Mod | ArithKind::IDiv))
             | Helper(HelperId::Unm) => Ty::val(TypeSet::NUM),
             Helper(HelperId::Arith(_) | HelperId::BNot | HelperId::Len) => Ty::val(TypeSet::INT),
-            Helper(HelperId::Concat) => Ty::val(TypeSet::STR),
+            Helper(HelperId::Concat | HelperId::Type) => Ty::val(TypeSet::STR),
             Helper(HelperId::Closure { .. }) => Ty::val(TypeSet::FUN),
             Helper(HelperId::NewTable(_) | HelperId::VarargTable(_)) => Ty::val(TypeSet::TAB),
             Helper(h) => Ty::of_rep(h.sig().ret.unwrap_or(Rep::Val)),

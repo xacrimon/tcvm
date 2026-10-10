@@ -95,6 +95,9 @@ pub(crate) struct Builder<'a, 'gc> {
     /// The receiver and constant key of each direct field load, for values
     /// the builder can know now (intrinsic callees).
     pub(crate) field_loads: crate::jit::FastMap<Val, (Val, Value<'gc>)>,
+    /// The callee and first argument of the call at a pc, known before a
+    /// `VARARG` up to `top` that reloads their registers.
+    pub(crate) callee_hint: Option<(u32, Val, Val)>,
     /// The shapes field sites compiled tests for, by receiver value.
     pub(crate) recv_shapes: crate::jit::FastMap<Val, Vec<crate::env::Shape<'gc>>>,
 }
@@ -134,6 +137,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             deopt_all: false,
             field_loads: Default::default(),
             recv_shapes: Default::default(),
+            callee_hint: None,
         }
     }
 
