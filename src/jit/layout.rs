@@ -37,6 +37,22 @@ pub(crate) const T_ASIZE: usize = T_STATE + TableState::ASIZE_OFFSET;
 pub(crate) const T_HEADER: i32 =
     -(Gc::<'static, RefLock<TableState<'static>>>::VALUE_OFFSET as i32);
 
+/// A Lua closure's fields from its function's payload. `FN_IS_VARARG` also
+/// tells a native function, whose variant ends before it, by the niche the
+/// enum's tag takes there (`fn_kind_niche` checks it).
+const FN_LUA: usize = offset_of!(crate::env::function::FunctionKind<'static>, Lua.0);
+pub(crate) const FN_CODE: usize = FN_LUA + offset_of!(crate::env::function::LuaClosure<'static>, code);
+pub(crate) const FN_NUM_PARAMS: usize =
+    FN_LUA + offset_of!(crate::env::function::LuaClosure<'static>, num_params);
+pub(crate) const FN_MAX_STACK: usize =
+    FN_LUA + offset_of!(crate::env::function::LuaClosure<'static>, max_stack_size);
+pub(crate) const FN_IS_VARARG: usize =
+    FN_LUA + offset_of!(crate::env::function::LuaClosure<'static>, is_vararg);
+const _: () = assert!(
+    size_of::<crate::env::function::NativeClosure<'static>>()
+        <= offset_of!(crate::env::function::FunctionKind<'static>, Native.0) + FN_IS_VARARG
+);
+
 // A header word is a `u64` slot of the value stack.
 const _: () = assert!(size_of::<crate::env::value::Value<'static>>() == 8);
 
@@ -110,6 +126,45 @@ mod tests {
             let boxed = Gc::erased_ptr(cell) as usize;
             let v = unsafe { ((boxed + UpvalueCell::V_OFFSET) as *const *const Value).read() };
             assert_eq!(unsafe { v.read() }.get_small(), Some(7));
+        });
+    }
+
+    #[test]
+    fn fn_kind_niche() {
+        use crate::env::value::Value;
+        let mut lua = Lua::new();
+        lua.load_all();
+        let ex = lua
+            .try_enter(|ctx| {
+                let src = "return {print, function(a, b) return a end, function(...) end}";
+                Ok::<_, crate::LoadError>(ctx.stash(crate::Executor::start(
+                    ctx,
+                    ctx.load(src, None)?,
+                    (),
+                )))
+            })
+            .unwrap();
+        lua.finish(&ex).unwrap();
+        lua.enter(|ctx| {
+            let v: Value = ctx.fetch(&ex).take_result(ctx).unwrap();
+            let t = v.get_table().unwrap();
+            // What compiled code reads: a function value's payload.
+            let fun = |i: i32| {
+                let f = t.raw_get(Value::small(i));
+                let p = (f.to_raw() & ((1 << 48) - 1)) as usize;
+                assert_eq!(p, Gc::as_ptr(f.get_function().unwrap().inner()) as usize);
+                p
+            };
+            let byte = |p: usize, off: usize| unsafe { ((p + off) as *const u8).read() };
+            assert!(byte(fun(1), FN_IS_VARARG) > 1);
+            let fixed = fun(2);
+            assert_eq!(byte(fixed, FN_IS_VARARG), 0);
+            assert_eq!(byte(fixed, FN_NUM_PARAMS), 2);
+            assert_eq!(byte(fun(3), FN_IS_VARARG), 1);
+            let lf = t.raw_get(Value::small(2)).get_function().unwrap().as_lua().unwrap();
+            let code = unsafe { ((fixed + FN_CODE) as *const usize).read() };
+            assert_eq!(code, lf.code as usize);
+            assert_eq!(byte(fixed, FN_MAX_STACK), lf.max_stack_size);
         });
     }
 }

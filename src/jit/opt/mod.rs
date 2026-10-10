@@ -36,7 +36,7 @@ pub(crate) fn completes(f: &Func<'_>) -> bool {
         let d = &f.insts[t.idx()];
         done[b.idx()] = match d.op {
             // A dispatched TAILCALL or RETURN leaves the frame as a return does.
-            Op::Return { .. } | Op::Dispatch { .. } => !loop_entry,
+            Op::Return { .. } | Op::Dispatch { .. } | Op::TailEnter { .. } => !loop_entry,
             Op::Deopt => d.tag.widenable() && (in_loop[b.idx()] || !loop_entry),
             _ => f.succs(b).any(|s| done[s.idx()] || cfg.dominates(s, b)),
         };

@@ -698,6 +698,21 @@ impl Em<'_> {
                 self.a.tst_imm(Sz::X, X16, mask as u64);
                 self.a.cset(Sz::W, d, Cond::Ne);
             }
+            FnFixedLua => {
+                // A native function has the niche value of `is_vararg` there.
+                let (d, f) = (self.r(i, 0), self.r(i, 1));
+                self.a.ldrb(X16, f, layout::FN_IS_VARARG as i32);
+                self.a.cmp_imm(Sz::W, X16, 0);
+                self.a.cset(Sz::W, d, Cond::Eq);
+            }
+            FnFits => {
+                let (d, f) = (self.r(i, 0), self.r(i, 1));
+                self.a.ldrb(X16, f, layout::FN_MAX_STACK as i32);
+                self.a.add_shift(Sz::X, X16, BASE, X16, Shift::Lsl, 3);
+                self.a.ldr(X17, THREAD, layout::THREAD_STACK_END as i32);
+                self.a.cmp(Sz::X, X16, X17);
+                self.a.cset(Sz::W, d, Cond::Ls);
+            }
             LoadCell => {
                 let (d, c) = (self.r(i, 0), self.r(i, 1));
                 self.a
@@ -875,6 +890,36 @@ impl Em<'_> {
                 self.a.ldr_lit(INSN, word);
                 self.a.ldr_lit(PC, pc_after as u64);
                 self.a.ldr(X16, RT, op as i32 * 8);
+                self.a.br(X16);
+            }
+            TailEnter { nargs } => {
+                // The callee is the frame's closure from here, which frees
+                // `insn` and `pc` (allocatable in the body) as scratch.
+                let f = self.r(i, 0);
+                self.a.mov(CLOSURE, f);
+                let (top, done) = (self.a.new_label(), self.a.new_label());
+                self.a.ldrb(X16, CLOSURE, layout::FN_NUM_PARAMS as i32);
+                self.a.movz(Sz::X, X17, nargs as u16, 0);
+                self.a.mov_imm(INSN, NIL);
+                self.a.bind(top);
+                self.a.cmp(Sz::X, X17, X16);
+                self.a.b_cond(Cond::Hs, done);
+                self.a.str_idx(INSN, BASE, X17, Extend::Lsl, true);
+                self.a.add_imm(Sz::X, X17, X17, 1);
+                self.a.b(top);
+                self.a.bind(done);
+                // The frame keeps its vararg count, so its results still land
+                // where its caller expects.
+                self.a.ldr(X16, BASE, -32);
+                self.a.and_imm(Sz::X, X16, X16, !crate::vm::frame::PTR_MASK);
+                self.a.orr(Sz::X, X16, X16, CLOSURE);
+                self.a.str(X16, BASE, -32);
+                self.a.ldr(X16, CLOSURE, layout::FN_CODE as i32);
+                self.close_frame();
+                self.a.ldr(INSN, X16, 0);
+                self.a.add_imm(Sz::X, PC, X16, 8);
+                self.a.and_imm(Sz::X, X17, INSN, 0xff);
+                self.a.ldr_idx(X16, RT, X17, Extend::Lsl, true);
                 self.a.br(X16);
             }
             Resume { wanted, c, a } => {

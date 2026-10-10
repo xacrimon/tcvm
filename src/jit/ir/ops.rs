@@ -470,6 +470,11 @@ pub(crate) enum Op {
     CellStore,
     /// Whether the frame's header has the flag (`vm::frame::flag`).
     HasFlag(u8),
+    /// Whether the function (a `Ptr` to its closure) is a Lua closure
+    /// without varargs.
+    FnFixedLua,
+    /// Whether the Lua closure's window fits from this frame's base.
+    FnFits,
 
     // --- tables: `Ptr` operands are a table's lock (its value's payload) ----
     /// Exits unless the table's shape is `shapes[i]`.
@@ -551,6 +556,13 @@ pub(crate) enum Op {
         pc: u32,
         word: u64,
     },
+    /// `TAILCALL`'s fast arm (5.5): the Lua closure (a `Ptr`) takes over
+    /// the frame, its `nargs` arguments stored to `R[0..]`; missing
+    /// parameters are nil-filled, header word 0 rewritten, and its first
+    /// instruction dispatched.
+    TailEnter {
+        nargs: u8,
+    },
     /// Call `R[a]` with `nargs` arguments in `R[a+4..]` (stored), `c` the
     /// CALL's result operand; edge 0 is the resume block. `nargs` is
     /// `u8::MAX` for arguments up to `top`, their count the operand.
@@ -628,7 +640,7 @@ impl Op {
             TabHasRoom(_) | TabASize | TabArray => Effects::R_SHAPE,
             TabSetShape(_) => Effects::W_SHAPE,
             Barrier => Effects::W_GC,
-            HasFlag(_) => Effects::R_FRAME,
+            HasFlag(_) | FnFits => Effects::R_FRAME,
             CellLoad => Effects::R_UPVAL,
             CellStore => Effects::W_UPVAL,
             GcCheck => Effects::MAY_DEOPT | Effects::R_GC,
@@ -637,7 +649,7 @@ impl Op {
             Jump | Br => Effects::TERMINATOR,
             Return { .. } => Effects::TERMINATOR | Effects::TAILOUT | Effects::R_SLOT,
             GuardFits(_) => Effects::MAY_DEOPT,
-            Call { .. } | CallMm { .. } | Dispatch { .. } => {
+            Call { .. } | CallMm { .. } | Dispatch { .. } | TailEnter { .. } => {
                 Effects::TERMINATOR
                     | Effects::TAILOUT
                     | Effects::W_ALL
@@ -686,6 +698,7 @@ impl Op {
             | Call { .. }
             | CallMm { .. }
             | Dispatch { .. }
+            | TailEnter { .. }
             | GuardFits(_)
             | Deopt => 0,
             Resume { c } => match c {
@@ -714,7 +727,7 @@ impl Op {
             TabArray => Ty::PTR,
             TabHasRoom(_) | ShapeIs(_) => Ty::B1,
             VarargAt(_) | VarargIdx => Ty::ANY,
-            HasFlag(_) => Ty::B1,
+            HasFlag(_) | FnFixedLua | FnFits => Ty::B1,
             Box => args[0].boxed(),
             Unbox(rep) => Ty {
                 rep,
