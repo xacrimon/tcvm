@@ -260,6 +260,13 @@ pub struct Chunk<'gc> {
     pub(super) templates: Vec<Template<'gc>>,
 }
 
+/// The next hot counter of a chunk's round-robin.
+fn next_hot(hot: &mut u8) -> u8 {
+    let i = *hot;
+    *hot = (i + 1) % crate::instruction::HOT_COUNTERS as u8;
+    i
+}
+
 impl<'gc> Chunk<'gc> {
     pub fn new(source: LuaString<'gc>) -> Self {
         Chunk {
@@ -308,6 +315,7 @@ impl<'gc> Chunk<'gc> {
         mut self,
         mc: &Mutation<'gc>,
         assigned: &Assigned,
+        hot: &mut u8,
     ) -> Result<Gc<'gc, Prototype<'gc>>, CompileErrorKind> {
         // Resolve all jump patches
         for &(instr_idx, label_idx) in &self.jump_patches {
@@ -317,7 +325,12 @@ impl<'gc> Chunk<'gc> {
             assert!(
                 matches!(
                     instr.op(),
-                    Op::JMP | Op::FORPREP | Op::FORLOOP | Op::TFORPREP | Op::TFORLOOP
+                    Op::JMP
+                        | Op::JMP_BACK
+                        | Op::FORPREP
+                        | Op::FORLOOP
+                        | Op::TFORPREP
+                        | Op::TFORLOOP
                 ) || instr.op().branch_sense().is_some(),
                 "jump patch on non-jump instruction: {instr:?}"
             );
@@ -374,15 +387,27 @@ impl<'gc> Chunk<'gc> {
             }
         }
 
+        // Hot counters round-robin over the chunk's counting instructions.
+        for instr in &mut self.tape {
+            match instr.op() {
+                Op::FUNC | Op::LOOP | Op::JMP_BACK => instr.set_a(next_hot(hot)),
+                Op::FORLOOP | Op::TFORLOOP => instr.set_b(next_hot(hot)),
+                _ => {}
+            }
+        }
+
         let num_upvalues = upvalue_desc.len() as u8;
         debug_assert_eq!(self.tape.len(), self.lineinfo.len());
         let prototypes = self
             .prototypes
             .into_iter()
-            .map(|child| child.assemble(mc, assigned))
+            .map(|child| child.assemble(mc, assigned, hot))
             .collect::<Result<Vec<_>, _>>()?
             .into_boxed_slice();
 
+        let feedback = (0..self.tape.len())
+            .map(|_| std::cell::Cell::new(0))
+            .collect();
         Ok(Gc::new(
             mc,
             Prototype {
@@ -403,6 +428,8 @@ impl<'gc> Chunk<'gc> {
                 upvalue_names: self.upvalue_names.into_boxed_slice(),
                 ic_table: IcTable::new(self.next_ic_idx as usize),
                 templates: self.templates.into_boxed_slice(),
+                feedback,
+                jit: crate::dmm::Lock::new(None),
             },
         ))
     }

@@ -8,17 +8,19 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  [  1]  VARARGPREP      fixed=0
-0001  [  1]  CLOSURE         R0 P0
-0002  [  2]  GETTABUP        R1 U0 K0  ; "print"
-0003  [  2]  LOADI           R13 2
-0004  [  2]  CALLS           R9 args=2 ret=0 f=R0
-0005  [  2]  CALLS           R5 args=0 ret=0 f=R0
-0006  [  2]  CALL_R0         R1 args=0
-0007  [  2]  RETURN          R0 count=1
+0000  [  1]  FUNC
+0001  [  1]  VARARGPREP      fixed=0
+0002  [  1]  CLOSURE         R0 P0
+0003  [  2]  GETTABUP        R1 U0 K0  ; "print"
+0004  [  2]  LOADI           R13 2
+0005  [  2]  CALLS           R9 args=2 ret=0 f=R0
+0006  [  2]  CALLS           R5 args=0 ret=0 f=R0
+0007  [  2]  CALL_R0         R1 args=0
+0008  [  2]  RETURN          R0 count=1
 
 ; prototype 0:
   ; function (params=1, vararg=false, stack=2, upvalues=0)
   ; code:
-  0000  [  1]  ADDI            R1 R0 #1
-  0001  [  1]  RETURN1         R1
+  0000  [  1]  FUNC
+  0001  [  1]  ADDI            R1 R0 #1
+  0002  [  1]  RETURN1         R1

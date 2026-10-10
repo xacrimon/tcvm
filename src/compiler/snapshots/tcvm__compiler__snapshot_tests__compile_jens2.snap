@@ -6,9 +6,10 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  [  1]  VARARGPREP      fixed=0
-0001  [ 10]  CLOSURE         R0 P0
-0002  [ 10]  RETURN          R0 count=1
+0000  [  1]  FUNC
+0001  [  1]  VARARGPREP      fixed=0
+0002  [ 10]  CLOSURE         R0 P0
+0003  [ 10]  RETURN          R0 count=1
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=7, upvalues=1)
@@ -17,15 +18,16 @@ expression: output
   ; upvalues:
   ;   U0 = upvalue U0
   ; code:
-  0000  [  2]  LOADI           R0 0
-  0001  [  3]  LOADI           R1 10000
-  0002  [  5]  LOADI           R2 0
-  0003  [  5]  MOVE            R3 R1
-  0004  [  5]  LOADI           R4 1
-  0005  [  5]  FORPREP         R2 +2
-  0006  [  6]  ADDI            R0 R0 #1
-  0007  [  5]  FORLOOP         R2 -2
-  0008  [  9]  GETTABUP        R2 U0 K0  ; "print"
-  0009  [  9]  MOVE            R6 R0
-  0010  [  9]  CALL_R0         R2 args=2
-  0011  [ 10]  RETURN0
+  0000  [  1]  FUNC
+  0001  [  2]  LOADI           R0 0
+  0002  [  3]  LOADI           R1 10000
+  0003  [  5]  LOADI           R2 0
+  0004  [  5]  MOVE            R3 R1
+  0005  [  5]  LOADI           R4 1
+  0006  [  5]  FORPREP         R2 +2
+  0007  [  6]  ADDI            R0 R0 #1
+  0008  [  5]  FORLOOP         R2 -2
+  0009  [  9]  GETTABUP        R2 U0 K0  ; "print"
+  0010  [  9]  MOVE            R6 R0
+  0011  [  9]  CALL_R0         R2 args=2
+  0012  [ 10]  RETURN0

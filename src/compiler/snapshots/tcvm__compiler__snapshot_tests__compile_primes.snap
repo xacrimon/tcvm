@@ -10,27 +10,29 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  [  1]  VARARGPREP      fixed=0
-0001  [  9]  CLOSURE         R0 P0
-0002  [ 11]  LOADI           R1 2
-0003  [ 12]  LOADI           R2 0
-0004  [ 13]  LOAD            R3 K0  ; ""
-0005  [ 14]  JNLTI           R2 #10000 +11
-0006  [ 15]  MOVE            R8 R1
-0007  [ 15]  CALLS_R1        R4 args=2 f=R0
-0008  [ 15]  JF              R4 +6
-0009  [ 16]  ADDI            R2 R2 #1
-0010  [ 17]  MOVE            R4 R3
-0011  [ 17]  MOVE            R5 R1
-0012  [ 17]  LOAD            R6 K1  ; "\n"
-0013  [ 17]  CONCAT          R5 R5 R6
-0014  [ 17]  CONCAT          R3 R4 R5
-0015  [ 20]  ADDI            R1 R1 #1
-0016  [ 20]  JMP             -12
-0017  [ 23]  GETTABUP        R4 U0 K2  ; "print"
-0018  [ 23]  MOVE            R8 R3
-0019  [ 23]  CALL_R0         R4 args=2
-0020  [ 23]  RETURN          R0 count=1
+0000  [  1]  FUNC
+0001  [  1]  VARARGPREP      fixed=0
+0002  [  9]  CLOSURE         R0 P0
+0003  [ 11]  LOADI           R1 2
+0004  [ 12]  LOADI           R2 0
+0005  [ 13]  LOAD            R3 K0  ; ""
+0006  [ 14]  LOOP
+0007  [ 14]  JNLTI           R2 #10000 +11
+0008  [ 15]  MOVE            R8 R1
+0009  [ 15]  CALLS_R1        R4 args=2 f=R0
+0010  [ 15]  JF              R4 +6
+0011  [ 16]  ADDI            R2 R2 #1
+0012  [ 17]  MOVE            R4 R3
+0013  [ 17]  MOVE            R5 R1
+0014  [ 17]  LOAD            R6 K1  ; "\n"
+0015  [ 17]  CONCAT          R5 R5 R6
+0016  [ 17]  CONCAT          R3 R4 R5
+0017  [ 20]  ADDI            R1 R1 #1
+0018  [ 20]  JMP_BACK        -12
+0019  [ 23]  GETTABUP        R4 U0 K2  ; "print"
+0020  [ 23]  MOVE            R8 R3
+0021  [ 23]  CALL_R0         R4 args=2
+0022  [ 23]  RETURN          R0 count=1
 
 ; prototype 0:
   ; function (params=1, vararg=false, stack=6, upvalues=0)
@@ -39,14 +41,15 @@ expression: output
   ;   K1 = false
   ;   K2 = true
   ; code:
-  0000  [  2]  LOADI           R1 2
-  0001  [  2]  SUBI            R2 R0 #1
-  0002  [  2]  LOAD            R3 K0  ; 1
-  0003  [  2]  FORPREP         R1 +5
-  0004  [  3]  MOD             R5 R0 R4
-  0005  [  3]  JNEQI           R5 #0 +2
-  0006  [  4]  LOAD            R5 K1  ; false
-  0007  [  4]  RETURN1         R5
-  0008  [  2]  FORLOOP         R1 -5
-  0009  [  8]  LOAD            R1 K2  ; true
-  0010  [  8]  RETURN1         R1
+  0000  [  1]  FUNC
+  0001  [  2]  LOADI           R1 2
+  0002  [  2]  SUBI            R2 R0 #1
+  0003  [  2]  LOAD            R3 K0  ; 1
+  0004  [  2]  FORPREP         R1 +5
+  0005  [  3]  MOD             R5 R0 R4
+  0006  [  3]  JNEQI           R5 #0 +2
+  0007  [  4]  LOAD            R5 K1  ; false
+  0008  [  4]  RETURN1         R5
+  0009  [  2]  FORLOOP         R1 -5
+  0010  [  8]  LOAD            R1 K2  ; true
+  0011  [  8]  RETURN1         R1

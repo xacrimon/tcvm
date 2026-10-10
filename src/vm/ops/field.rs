@@ -540,6 +540,7 @@ handler! {
         if op == Op::SELF {
             reg![dst + 4] = recv;
         }
+        crate::jit::feedback::record(closure, unsafe { pc.sub(1) }, crate::jit::feedback::kind(recv));
         if op == Op::GETTABLE {
             let k = reg![insn.c()];
             if let Some(t) = recv.get_table() {
@@ -575,6 +576,7 @@ handler! {
             Op::SETTABUP_REF => unsafe { (*closure.upvalue_ptr().add(insn.b() as usize)).cell }.get(),
             _ => reg![insn.b()],
         };
+        crate::jit::feedback::record(closure, unsafe { pc.sub(1) }, crate::jit::feedback::kind(recv));
         if op == Op::SETTABLE {
             let k = reg![insn.c()];
             newindex_chain!(pc, base, rt, recv, k, v, raw_set_keyed)

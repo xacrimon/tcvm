@@ -34,6 +34,17 @@ impl<'gc> Context<'gc> {
         Context { state }
     }
 
+    /// The context of the `rt` register compiled code holds.
+    ///
+    /// # Safety
+    /// `state` is the running `State`, inside its `Lua::enter`.
+    #[inline(always)]
+    pub(crate) unsafe fn from_state(state: *const State<'static>) -> Self {
+        Context {
+            state: unsafe { &*(state as *const State<'gc>) },
+        }
+    }
+
     #[inline(always)]
     pub fn mutation(self) -> &'gc Mutation<'gc> {
         // SAFETY: set by `Context::new` inside `Lua::enter`, whose closure
@@ -61,6 +72,25 @@ impl<'gc> Context<'gc> {
                 .cast::<Handler>()
                 .add(256 + c as usize)
         }
+    }
+
+    #[inline(always)]
+    pub(crate) fn jit(self) -> &'gc crate::jit::state::JitRuntime {
+        &self.state.jit
+    }
+
+    /// Hot counter `i` (< `HOT_COUNTERS`).
+    #[inline(always)]
+    pub(crate) fn hot_counter(self, i: usize) -> &'gc std::cell::Cell<u16> {
+        // SAFETY: callers reduce `i` modulo `HOT_COUNTERS`.
+        unsafe { self.state.jit.hot.get_unchecked(i) }
+    }
+
+    /// What entry-table slot `d` tails into.
+    #[inline(always)]
+    pub(crate) fn jit_entry(self, d: u16) -> Handler {
+        // SAFETY: a JIT word's slot is allocated while the word is in `Code`.
+        unsafe { crate::jit::as_handler((*self.state.jit.entries.get().add(d as usize)).get()) }
     }
 
     #[inline(always)]

@@ -10,58 +10,64 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  [  1]  VARARGPREP      fixed=0
-0001  [  6]  NEWTABLE        R0 T0  ; {}
-0002  [  7]  CLOSURE         R1 P0
-0003  [  7]  SETFIELD        R1 R0 K0  ; "id"
-0004  [  8]  CLOSURE         R1 P1
-0005  [  8]  SETFIELD        R1 R0 K1  ; "add"
-0006  [  9]  CLOSURE         R1 P2
-0007  [  9]  SETFIELD        R1 R0 K2  ; "chain"
-0008  [ 12]  SELF            R1 R0 K0  ; "id"
-0009  [ 12]  CALL_R1         R1 args=2
-0010  [ 15]  SELF            R2 R0 K1  ; "add"
-0011  [ 15]  LOADI           R7 1
-0012  [ 15]  LOADI           R8 2
-0013  [ 15]  CALL_R1         R2 args=4
-0014  [ 18]  CLOSURE         R3 P3
-0015  [ 19]  SELF            R8 R0 K0  ; "id"
-0016  [ 19]  CALL            R8 args=2 ret=0
-0017  [ 19]  CALLS_R1        R4 args=0 f=R3
-0018  [ 22]  SELF            R5 R0 K2  ; "chain"
-0019  [ 22]  CALL_R1         R5 args=2
-0020  [ 22]  SELF            R5 R5 K0  ; "id"
-0021  [ 22]  CALL_R1         R5 args=2
-0022  [ 25]  CLOSURE         R6 P4
-0023  [ 26]  MOVE            R11 R0
-0024  [ 26]  CALLS_R0        R7 args=2 f=R6
-0025  [ 28]  RETURN          R2 count=2
+0000  [  1]  FUNC
+0001  [  1]  VARARGPREP      fixed=0
+0002  [  6]  NEWTABLE        R0 T0  ; {}
+0003  [  7]  CLOSURE         R1 P0
+0004  [  7]  SETFIELD        R1 R0 K0  ; "id"
+0005  [  8]  CLOSURE         R1 P1
+0006  [  8]  SETFIELD        R1 R0 K1  ; "add"
+0007  [  9]  CLOSURE         R1 P2
+0008  [  9]  SETFIELD        R1 R0 K2  ; "chain"
+0009  [ 12]  SELF            R1 R0 K0  ; "id"
+0010  [ 12]  CALL_R1         R1 args=2
+0011  [ 15]  SELF            R2 R0 K1  ; "add"
+0012  [ 15]  LOADI           R7 1
+0013  [ 15]  LOADI           R8 2
+0014  [ 15]  CALL_R1         R2 args=4
+0015  [ 18]  CLOSURE         R3 P3
+0016  [ 19]  SELF            R8 R0 K0  ; "id"
+0017  [ 19]  CALL            R8 args=2 ret=0
+0018  [ 19]  CALLS_R1        R4 args=0 f=R3
+0019  [ 22]  SELF            R5 R0 K2  ; "chain"
+0020  [ 22]  CALL_R1         R5 args=2
+0021  [ 22]  SELF            R5 R5 K0  ; "id"
+0022  [ 22]  CALL_R1         R5 args=2
+0023  [ 25]  CLOSURE         R6 P4
+0024  [ 26]  MOVE            R11 R0
+0025  [ 26]  CALLS_R0        R7 args=2 f=R6
+0026  [ 28]  RETURN          R2 count=2
 
 ; prototype 0:
   ; function (params=1, vararg=false, stack=1, upvalues=0)
   ; code:
-  0000  [  7]  RETURN1         R0
+  0000  [  7]  FUNC
+  0001  [  7]  RETURN1         R0
 
 ; prototype 1:
   ; function (params=3, vararg=false, stack=4, upvalues=0)
   ; code:
-  0000  [  8]  ADD             R3 R1 R2
-  0001  [  8]  RETURN1         R3
+  0000  [  8]  FUNC
+  0001  [  8]  ADD             R3 R1 R2
+  0002  [  8]  RETURN1         R3
 
 ; prototype 2:
   ; function (params=1, vararg=false, stack=1, upvalues=0)
   ; code:
-  0000  [  9]  RETURN1         R0
+  0000  [  9]  FUNC
+  0001  [  9]  RETURN1         R0
 
 ; prototype 3:
   ; function (params=1, vararg=false, stack=1, upvalues=0)
   ; code:
-  0000  [ 18]  RETURN1         R0
+  0000  [ 18]  FUNC
+  0001  [ 18]  RETURN1         R0
 
 ; prototype 4:
   ; function (params=1, vararg=false, stack=6, upvalues=0)
   ; constants:
   ;   K0 = "id"
   ; code:
-  0000  [ 25]  SELF            R1 R0 K0  ; "id"
-  0001  [ 25]  TAILCALL        R1 args=2
+  0000  [ 25]  FUNC
+  0001  [ 25]  SELF            R1 R0 K0  ; "id"
+  0002  [ 25]  TAILCALL        R1 args=2

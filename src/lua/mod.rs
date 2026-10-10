@@ -43,6 +43,8 @@ pub struct State<'gc> {
     #[collect(require_static)]
     pub(crate) rets: [Handler; 256],
     pub(crate) rt: Runtime<'gc>,
+    #[collect(require_static)]
+    pub(crate) jit: crate::jit::state::JitRuntime,
     /// Root shapes by inline capacity (`INLINE_CAPS`). Each anchors a
     /// transition tree, so two tables of one capacity that grow through the
     /// same key sequence converge on the same shape pointer.
@@ -121,6 +123,7 @@ impl Lua {
                 dispatch: crate::vm::dispatch::TABLE,
                 rets: crate::vm::dispatch::RETS,
                 rt: Runtime::new(mc.metrics()),
+                jit: crate::jit::state::JitRuntime::new(),
                 root_shapes,
                 empty_dict_sentinel,
                 mt_classes: MtClasses::new(mc),
@@ -167,6 +170,13 @@ impl Lua {
 
     fn marked(&mut self) -> MarkedArena<'_, Rootable![State<'_>]> {
         self.arena.finish_marking()
+    }
+
+    /// Turn the JIT on or off for what runs from now on; installed regions
+    /// stay.
+    pub fn set_jit(&mut self, on: bool) {
+        self.arena
+            .mutate_root(|_, root| root.jit.config.enabled = on && cfg!(target_arch = "aarch64"));
     }
 
     /// Force a full garbage-collection cycle (mark + sweep) to completion.

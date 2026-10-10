@@ -6,16 +6,18 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  [  1]  VARARGPREP      fixed=0
-0001  [ 11]  CLOSURE         R0 P0
-0002  [ 13]  RETURN          R0 count=2
+0000  [  1]  FUNC
+0001  [  1]  VARARGPREP      fixed=0
+0002  [ 11]  CLOSURE         R0 P0
+0003  [ 13]  RETURN          R0 count=2
 
 ; prototype 0:
   ; function (params=1, vararg=false, stack=4, upvalues=0)
   ; constants:
   ;   K0 = 6.28
   ; code:
-  0000  [ 10]  LOADI           R1 8
-  0001  [ 10]  LOAD            R2 K0  ; 6.28
-  0002  [ 10]  MULI            R3 R0 #5 flipped
-  0003  [ 10]  RETURN          R1 count=4
+  0000  [  9]  FUNC
+  0001  [ 10]  LOADI           R1 8
+  0002  [ 10]  LOAD            R2 K0  ; 6.28
+  0003  [ 10]  MULI            R3 R0 #5 flipped
+  0004  [ 10]  RETURN          R1 count=4

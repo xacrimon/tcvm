@@ -9,25 +9,26 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  [  1]  VARARGPREP      fixed=0
-0001  [  1]  LOAD            R0 K0  ; false
-0002  [  2]  LOADI           R1 5
-0003  [  3]  JFSET           R2 R0 +1
-0004  [  3]  MOVE            R2 R1
-0005  [  5]  LOADI           R3 7
-0006  [  6]  LOADI           R4 5
-0007  [  7]  JTSET           R5 R3 +1
-0008  [  7]  MOVE            R5 R4
-0009  [  9]  LOADI           R6 7
-0010  [ 10]  JNEQI           R6 #5 +2
-0011  [ 10]  MOVE            R7 R6
-0012  [ 10]  JMP             +2
-0013  [ 10]  LFALSESKIP      R7
-0014  [ 10]  LOAD            R7 K1  ; true
-0015  [ 12]  MOVE            R8 R1
-0016  [ 12]  MOVE            R9 R4
-0017  [ 12]  MOVE            R10 R6
-0018  [ 12]  MOVE            R11 R2
-0019  [ 12]  MOVE            R12 R5
-0020  [ 12]  MOVE            R13 R7
-0021  [ 12]  RETURN          R8 count=7
+0000  [  1]  FUNC
+0001  [  1]  VARARGPREP      fixed=0
+0002  [  1]  LOAD            R0 K0  ; false
+0003  [  2]  LOADI           R1 5
+0004  [  3]  JFSET           R2 R0 +1
+0005  [  3]  MOVE            R2 R1
+0006  [  5]  LOADI           R3 7
+0007  [  6]  LOADI           R4 5
+0008  [  7]  JTSET           R5 R3 +1
+0009  [  7]  MOVE            R5 R4
+0010  [  9]  LOADI           R6 7
+0011  [ 10]  JNEQI           R6 #5 +2
+0012  [ 10]  MOVE            R7 R6
+0013  [ 10]  JMP             +2
+0014  [ 10]  LFALSESKIP      R7
+0015  [ 10]  LOAD            R7 K1  ; true
+0016  [ 12]  MOVE            R8 R1
+0017  [ 12]  MOVE            R9 R4
+0018  [ 12]  MOVE            R10 R6
+0019  [ 12]  MOVE            R11 R2
+0020  [ 12]  MOVE            R12 R5
+0021  [ 12]  MOVE            R13 R7
+0022  [ 12]  RETURN          R8 count=7
