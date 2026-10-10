@@ -10,7 +10,7 @@ use crate::jit::ir::{Block, Func, Inst, Val};
 
 /// Memory classes, each with a version that every write to it renews.
 const SLOT: usize = 0;
-const TAB: usize = 1;
+pub(crate) const TAB: usize = 1;
 const ARR: usize = 2;
 const SHAPE: usize = 3;
 const META: usize = 4;
@@ -29,7 +29,7 @@ struct Key {
 
 /// The memory a read depends on: its class and, for a home slot or a named
 /// slot, the key within it.
-fn reads(op: Op) -> Option<(usize, Option<u32>)> {
+pub(crate) fn reads(op: Op) -> Option<(usize, Option<u32>)> {
     Some(match op {
         Op::Load(r) => (SLOT, Some(r as u32)),
         Op::TabLoad { key, .. } => (TAB, Some(key)),
@@ -44,7 +44,7 @@ fn reads(op: Op) -> Option<(usize, Option<u32>)> {
 
 /// The classes an instruction writes, a bit each; a keyed write also renews
 /// its key, which `write_key` names.
-fn writes(op: Op) -> u32 {
+pub(crate) fn writes(op: Op) -> u32 {
     let e = op.effects();
     match op {
         Op::Store(_) => 1 << SLOT,
@@ -76,7 +76,7 @@ fn writes(op: Op) -> u32 {
 }
 
 /// The key a keyed write renews within its class.
-fn write_key(op: Op) -> Option<u32> {
+pub(crate) fn write_key(op: Op) -> Option<u32> {
     match op {
         Op::Store(r) => Some(r as u32),
         Op::TabStore { key, .. } => Some(key),

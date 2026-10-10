@@ -316,6 +316,10 @@ pub(crate) enum Op {
     /// Whether two `Val`s are the same word.
     SameBits,
 
+    /// The `Val` refined to the set without a test: a guarded value
+    /// rebuilt after a call (9.8), which a guard already tested.
+    Refine(TypeSet),
+
     // --- guards (each has a snapshot) ----------------------------------------
     /// The `Val` refined to the set; exits when it is not in it.
     Guard(TypeSet),
@@ -643,7 +647,7 @@ impl Op {
             },
             IsType(_) | IsFalsy | SameBits | ICmp(_) | LCmp(_) | FCmp(_) => Ty::B1,
             Select => args[1].join(args[2]),
-            Guard(set) => Ty {
+            Guard(set) | Refine(set) => Ty {
                 set: args[0].set & set,
                 ..args[0]
             },

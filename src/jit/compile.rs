@@ -143,6 +143,7 @@ pub(crate) fn optimize(f: &mut Func<'_>) {
         changed |= opt::simplify::simplify(f);
         remove_trivial_params(f);
         changed |= opt::gvn::gvn(f);
+        changed |= opt::licm::licm(f);
         opt::dce(f);
         if !changed {
             break;

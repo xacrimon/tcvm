@@ -197,7 +197,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
     fn alias(&self, mut v: Val) -> Val {
         while let Some(i) = self.f.def_inst(v) {
             match self.f.op(i) {
-                Op::Guard(_) => v = self.f.args(i)[0],
+                Op::Guard(_) | Op::Refine(_) => v = self.f.args(i)[0],
                 Op::Unbox(Rep::I32) => v = self.f.args(i)[0],
                 Op::LToI => v = self.f.args(i)[0],
                 _ => break,
@@ -471,6 +471,8 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     Rep::Val | Rep::Ptr => return Err("box of a boxed value".into()),
                 }
             }
+            // The operand's register (`alias`).
+            Op::Refine(_) => {}
             Op::Unbox(rep) => {
                 let x = args[0];
                 let r = res.unwrap();
