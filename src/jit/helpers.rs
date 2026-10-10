@@ -1,15 +1,18 @@
 //! Rust routines regions call with `bl` (the C ABI). None grows the stack,
 //! switches threads, runs Lua or raises (R5).
 
+use crate::dmm::Gc;
 use crate::env::MetamethodBits;
+use crate::env::function::UpvalueCell;
 use crate::env::string::LuaString;
 use crate::env::thread::ThreadState;
 use crate::env::value::{Value, ValueKind};
 use crate::instruction::ArithKind;
 use crate::jit::ir::ops::{HELPER_FAIL, HELPER_FAIL_VAL, HelperId};
 use crate::lua::{Context, State};
-use crate::vm::frame::land_results;
+use crate::vm::frame::{self, land_results};
 use crate::vm::num::{self, ArithOp, SlowNum};
+use crate::vm::ops::control::{close_upvalues, new_closure};
 use crate::vm::ops::meta::binop_metamethod;
 
 /// The address a region calls for `h`.
@@ -25,6 +28,9 @@ pub(crate) fn address(h: HelperId) -> usize {
         HelperId::BNot => jit_bnot as *const () as usize,
         HelperId::Len => jit_len as *const () as usize,
         HelperId::Concat => jit_concat as *const () as usize,
+        HelperId::UpvalBarrier(_) => jit_upval_barrier as *const () as usize,
+        HelperId::Closure { .. } => jit_closure as *const () as usize,
+        HelperId::Close(_) => jit_close as *const () as usize,
     }
 }
 
@@ -178,6 +184,59 @@ pub(crate) extern "C" fn jit_concat(rt: *const State<'static>, a: u64, b: u64) -
         Some(s) => Value::string(s).to_raw(),
         None => HELPER_FAIL_VAL,
     }
+}
+
+/// The barrier of a store into upvalue `i`'s cell, as `op_setupval` runs it.
+pub(crate) extern "C" fn jit_upval_barrier(
+    rt: *const State<'static>,
+    thread: *mut ThreadState<'static>,
+    base: *mut Value<'static>,
+    i: u64,
+) {
+    let ctx = unsafe { Context::from_state(rt) };
+    let closure = unsafe { frame::closure(base) };
+    let cell = unsafe { (*closure.upvalue_ptr().add(i as usize)).cell };
+    let running = unsafe { (*thread).handle() };
+    if let Some(target) = UpvalueCell::barrier_target(cell, running)
+        && !Gc::is_gray(target)
+    {
+        ctx.mutation().backward_barrier(target, None);
+    }
+}
+
+/// `CLOSURE` into `R[dst]` (`imm`: `proto | dst << 32`), reading the frame's
+/// slots.
+pub(crate) extern "C" fn jit_closure(
+    rt: *const State<'static>,
+    thread: *mut ThreadState<'static>,
+    base: *mut Value<'static>,
+    imm: u64,
+) -> u64 {
+    let ctx = unsafe { Context::from_state(rt) };
+    let ts = unsafe { &mut *thread };
+    let closure = unsafe { frame::closure(base) };
+    let f = new_closure(
+        ctx,
+        ts,
+        base,
+        closure,
+        imm as u32 as usize,
+        (imm >> 32) as u8,
+    );
+    Value::function(f).to_raw()
+}
+
+/// Close the frame's open upvalues from `R[a]` up.
+pub(crate) extern "C" fn jit_close(
+    rt: *const State<'static>,
+    thread: *mut ThreadState<'static>,
+    base: *mut Value<'static>,
+    a: u64,
+) {
+    let ctx = unsafe { Context::from_state(rt) };
+    let ts = unsafe { &mut *thread };
+    let level = ts.slot_index(base) + a as usize;
+    close_upvalues(ctx.mutation(), ts, level);
 }
 
 /// Box an integer outside i32.

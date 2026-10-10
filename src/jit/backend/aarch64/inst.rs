@@ -169,10 +169,17 @@ pub(crate) enum MInst {
         cond: Cond,
         exit: u32,
     },
-    /// `[snap..]`.
-    GuardNoClose {
+    /// `[snap..]`: exit when the frame's header has any of the flags.
+    GuardNoFlag {
+        mask: u8,
         exit: u32,
     },
+    /// `[def d]`: whether the frame's header has the flag.
+    HasFlag(u8),
+    /// `[def d, use c]`: the value of an upvalue cell.
+    LoadCell,
+    /// `[use c, use v]`: store into an upvalue cell.
+    StoreCell,
     /// `[snap..]`.
     GcCheck {
         exit: u32,

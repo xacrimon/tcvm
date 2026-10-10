@@ -22,9 +22,6 @@ const NIL: u64 = 0xFFFF_FFFE_0000_0000;
 const FALSE: u64 = NIL | 1;
 const BOX: u64 = 0xFFF9_0000_0000_0000;
 const PTR_MASK: u64 = (1 << 48) - 1;
-/// A header's flags `RETURN` must close: `HAS_OPEN | HAS_TBC`.
-const CLOSE_FLAGS: u64 = 6;
-
 /// The machine code of a region, before its address is known.
 pub(crate) struct Emitted {
     pub(crate) asm: Asm,
@@ -655,11 +652,29 @@ impl Em<'_> {
                     self.a.b_cond(c.invert(), l);
                 }
             }
-            GuardNoClose { exit } => {
+            GuardNoFlag { mask, exit } => {
                 self.a.ldr(X16, BASE, -24);
-                self.a.tst_imm(Sz::X, X16, CLOSE_FLAGS);
+                self.a.tst_imm(Sz::X, X16, mask as u64);
                 let l = self.exit(exit);
                 self.a.b_cond(Cond::Ne, l);
+            }
+            HasFlag(mask) => {
+                let d = self.r(i, 0);
+                self.a.ldr(X16, BASE, -24);
+                self.a.tst_imm(Sz::X, X16, mask as u64);
+                self.a.cset(Sz::W, d, Cond::Ne);
+            }
+            LoadCell => {
+                let (d, c) = (self.r(i, 0), self.r(i, 1));
+                self.a
+                    .ldr(X16, c, crate::env::function::UpvalueCell::V_OFFSET as i32);
+                self.a.ldr(d, X16, 0);
+            }
+            StoreCell => {
+                let (c, v) = (self.r(i, 0), self.r(i, 1));
+                self.a
+                    .ldr(X16, c, crate::env::function::UpvalueCell::V_OFFSET as i32);
+                self.a.str(v, X16, 0);
             }
             GcCheck { exit } => self.gc_check(exit),
             Helper(h) => {
@@ -667,6 +682,8 @@ impl Em<'_> {
                 for (k, c) in sig.ctx.iter().enumerate() {
                     match c {
                         Ctx::Rt => self.a.mov(Gpr(k as u8), RT),
+                        Ctx::Thread => self.a.mov(Gpr(k as u8), THREAD),
+                        Ctx::Base => self.a.mov(Gpr(k as u8), BASE),
                     }
                 }
                 if let Some(imm) = sig.imm {

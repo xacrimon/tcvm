@@ -190,3 +190,57 @@ fn generic_arithmetic() {
 "#,
     );
 }
+
+/// Upvalues read and written through their cells, closures made in hot
+/// code, `CLOSE`, and returns that close the frame's cells.
+#[test]
+fn upvalues_and_closures() {
+    agrees(
+        r#"
+        local function counter()
+          local n = 0
+          return function(k) n = n + k; return n end, function() return n end
+        end
+        local inc, get = counter()
+        for i = 1, 1000 do inc(i % 3) end
+        local function make(x)
+          local acc = x
+          local f = function(d) acc = acc + d; return acc end
+          for k = 1, 3 do acc = acc + k end
+          return f, acc
+        end
+        local total = 0
+        for i = 1, 400 do
+          local f, a = make(i)
+          total = total + f(1) + a
+        end
+        local last
+        local function keep(v) last = v end
+        local kept = {}
+        for i = 1, 600 do
+          keep(i % 2 == 0 and ("s" .. i) or {i})
+          if i % 100 == 0 then kept[#kept + 1] = type(last) == "table" and last[1] or last end
+          if i % 150 == 0 then collectgarbage() end
+        end
+        local function pair()
+          local v = 1.5
+          return function(n) local r = 0 for i = 1, n do r = r + v end return r end,
+                 function(x) v = x end
+        end
+        local sum, set = pair()
+        local r = 0
+        for i = 1, 300 do
+          r = r + sum(10)
+          set(i % 2 == 0 and 2 or 0.25)
+        end
+        local fs = {}
+        for i = 1, 500 do
+          local j = i * 2
+          fs[i] = function() return i + j end
+        end
+        local s = 0
+        for i = 1, 500 do s = s + fs[i]() end
+        return table.concat({get(), total, table.concat(kept, ","), r, s}, " ")
+"#,
+    );
+}

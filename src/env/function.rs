@@ -234,6 +234,11 @@ unsafe impl<'gc> Collect<'gc> for UpvalueCell<'gc> {
 }
 
 impl<'gc> UpvalueCell<'gc> {
+    /// Where compiled code finds the pointer to the value, from the cell's
+    /// `Gc` (its box).
+    pub(crate) const V_OFFSET: usize = Gc::<'static, UpvalueCell<'static>>::VALUE_OFFSET
+        + std::mem::offset_of!(UpvalueCell<'static>, v);
+
     /// An open upvalue for `slot` of `thread`'s stack.
     pub(crate) fn new_open(
         mc: &Mutation<'gc>,

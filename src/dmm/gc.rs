@@ -85,6 +85,11 @@ impl<'gc, T: ?Sized + 'gc> Borrow<T> for Gc<'gc, T> {
     }
 }
 
+impl<'gc, T: 'gc> Gc<'gc, T> {
+    /// The value's offset from the box a `Gc` points at, for compiled code.
+    pub(crate) const VALUE_OFFSET: usize = core::mem::offset_of!(GcBoxInner<T>, value);
+}
+
 impl<'gc, T: Collect<'gc> + 'gc> Gc<'gc, T> {
     #[inline]
     pub fn new(mc: &Mutation<'gc>, t: T) -> Gc<'gc, T> {
