@@ -207,6 +207,8 @@ pub(crate) enum MInst {
     /// `[def d, use arr, use i]` / `[use arr, use i, use v]`.
     ArrLoad,
     ArrStore,
+    /// `[early def d, use t, use from, temp v]`.
+    ArrNext,
     /// `[use t (x1)]`: the backward barrier unless gray; clobbers as a call.
     Barrier,
     /// `[def d]`: the frame's `nv`.

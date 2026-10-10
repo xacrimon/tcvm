@@ -5,7 +5,8 @@
 use crate::env::value::Value;
 use crate::instruction::{Instruction, Op as BcOp, TFOR_VARS};
 use crate::jit::build::Builder;
-use crate::jit::build::emit::{branch_arm, staged_call};
+use crate::env::table::POS_PART_SHIFT;
+use crate::jit::build::emit::{branch_arm, enter_join, staged_call};
 use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL_VAL, HelperId, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
 use crate::jit::ir::{Block, Val};
@@ -52,25 +53,54 @@ pub(super) fn emit_tforprep(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction,
     b.jump(succs[0]);
 }
 
-/// `TFORCALL_NEXT a count`: `next`'s walk at the position in `R[a+3]`, by
-/// helper through the slots; `TFORLOOP` then tests the first variable.
+/// `TFORCALL_NEXT a count`: `next`'s walk at the position in `R[a+3]`,
+/// the array part inline and the other parts by helper through the slots;
+/// `TFORLOOP` then tests the first variable.
 pub(super) fn emit_tforcall_next(b: &mut Builder<'_, '_>, a: u8, count: u8) {
+    let vars = a + TFOR_VARS;
     // Not a table, or no position: the interpreter calls the iterator.
     // Tested before the step, which moves the position.
     let state = b.reg(a + 1);
-    b.guard(state, TypeSet::TAB);
+    let g = b.guard(state, TypeSet::TAB);
+    let t = b.ins(Op::Unbox(Rep::Ptr), &[g]);
     let pos = b.reg(a + 3);
     let p = b.as_i32(pos);
     let zero = b.ki32(0);
     let ok = b.ins(Op::ICmp(Cc::Ge), &[p, zero]);
     let s = b.snap_before();
     b.ins_snap(Op::GuardTrue, &[ok], s, ExitTag::Slow);
+    let join = b.new_block();
+    let slow = b.new_block();
+    // A position in the array part is its index.
+    let part = b.ki32(1 << POS_PART_SHIFT);
+    let in_array = b.ins(Op::ICmp(Cc::Lt), &[p, part]);
+    let rest = branch_arm(b, in_array);
+    let i = b.ins(Op::ArrNext, &[t, p]);
+    let n = b.ins(Op::TabASize, &[t]);
+    let found = b.ins(Op::ICmp(Cc::Lo), &[i, n]);
+    let past = branch_arm(b, found);
+    let arr = b.ins(Op::TabArray, &[t]);
+    let v = b.ins(Op::ArrLoad, &[arr, i]);
+    let k = b.ins(Op::Box, &[i]);
+    let one = b.ki32(1);
+    let after = b.ins(Op::IAddNo, &[i, one]);
+    let after = b.ins(Op::Box, &[after]);
+    b.set(a + 3, after);
+    step_to(b, join, vars, count, k, v);
+    for blk in [past, rest] {
+        b.switch_to(blk);
+        b.jump(slow);
+    }
+    enter_join(b, slow);
     b.store_regs([a as usize + 1, a as usize + 3]);
     b.push(Op::Helper(HelperId::TforNext { a, count }), &[]);
     for k in 0..count {
-        b.reload(a + TFOR_VARS + k);
+        b.reload(vars + k);
     }
     b.reload(a + 3);
+    b.flush();
+    b.jump(join);
+    enter_join(b, join);
 }
 
 /// `TFORCALL_IPAIRS a count`: the array part inline, past it the helper,
@@ -103,7 +133,7 @@ pub(super) fn emit_tforcall_ipairs(b: &mut Builder<'_, '_>, a: u8, count: u8) {
     step_to(b, join, vars, count, kv, v);
     b.switch_to(outside);
     past_array(b, join, vars, count, g, kv);
-    crate::jit::build::emit::enter_join(b, join);
+    enter_join(b, join);
 }
 
 /// The `ipairs` step at key `kv` past the array part: the value, or the

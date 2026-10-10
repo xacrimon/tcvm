@@ -506,6 +506,9 @@ pub(crate) enum Op {
     /// `arr[i]` of an array part, `i` an `I32` below its size.
     ArrLoad,
     ArrStore,
+    /// The index of the table's first non-nil array slot at or after the
+    /// `I32` operand, or the array part's size when there is none.
+    ArrNext,
     /// The table's backward barrier unless it is gray.
     Barrier,
 
@@ -636,6 +639,7 @@ impl Op {
             ClassBits(_) | ClassIndex(_) => Effects::R_META,
             ShapeIs(_) => Effects::R_SHAPE,
             TabLoad { .. } | ArrLoad => Effects::R_TAB,
+            ArrNext => Effects::R_TAB | Effects::R_SHAPE,
             TabStore { .. } | ArrStore => Effects::W_TAB,
             TabHasRoom(_) | TabASize | TabArray => Effects::R_SHAPE,
             TabSetShape(_) => Effects::W_SHAPE,
@@ -722,7 +726,7 @@ impl Op {
             KF64(_) => Ty::F64,
             Load(_) | UpvalValue(_) | CellLoad | Resume { .. } => Ty::ANY,
             UpvalCell(_) => Ty::PTR,
-            NumVarargs | ClassBits(_) | TabASize => Ty::I32,
+            NumVarargs | ClassBits(_) | TabASize | ArrNext => Ty::I32,
             ClassIndex(_) | TabLoad { .. } | ArrLoad => Ty::ANY,
             TabArray => Ty::PTR,
             TabHasRoom(_) | ShapeIs(_) => Ty::B1,
