@@ -89,10 +89,13 @@ elaborates them.
   recompilation driven by hot exits. Block duplication at type-divergent joins is
   kept in reserve. (Sections 7 and 9.)
 - **J5. Hotness is counted at function entry and at loop back-edges** through one
-  table of 16-bit counters in `State`, in dedicated instructions: a compiler-emitted
-  `FUNC` at pc 0, a compiler-emitted `LOOP` at `while`/`repeat`/generic-`for` loop
-  headers and at each backward `goto`, and the numeric `FORLOOP` forms. Entries are installed only
-  over those words, as LuaJIT patches `FUNCF`/`LOOP`/`FORL`. (Sections 5.2, 6.)
+  table of 16-bit counters in `State`: calls count the callee's compiler-emitted
+  `FUNC` at pc 0, `while` and generic-`for` loops count at their back edge (a
+  counting `JMP_BACK`, `TFORLOOP`), `repeat` loops at their `LOOP`, and numeric
+  loops in the `FORLOOP` forms. Entries are installed only over dedicated words, as
+  LuaJIT patches `FUNCF`/`LOOP`/`FORL`: `FUNC`, the `LOOP` at a `while`/`repeat`/
+  generic-`for` header, a backward `goto`'s `JMP_BACK` and the `FORLOOP` forms.
+  (Sections 5.2, 6.)
 - **J6. Integers are `I32` or `I64` in compiled code.** A site whose feedback is
   small ints only gets `I32` with overflow guards that deoptimize; a site that saw
   boxed integers or an i32 overflow gets `I64`, which needs no overflow checks
@@ -411,8 +414,9 @@ two-float fast path, generic `JLTI` the small-int one, and `JEQ`/`JNEQ` settle
 floats and identical bits inline, all without a write. Section 6.3 therefore
 decides "never executed" per block, from the sites that do record, and the types
 of compare operands come from inference and use-driven speculation (9.1), not
-from the compare. The interpreter cost of the byte is measured with the
-`FUNC`/`LOOP` cost in milestone 1.
+from the compare. A slow path stores the byte only when its bits change, so a
+site that keeps taking it pays a load and a compare. The interpreter cost of the
+byte is measured with the counting cost in milestone 1.
 
 ### 4.9 Closures, upvalues, prototypes (`src/env/function.rs`)
 
@@ -473,29 +477,42 @@ Entries are installed only over instructions that exist for that purpose, as in
 LuaJIT, where `FUNCF`, `LOOP`, `FORL` and `ITERL` become `JFUNCF`, `JLOOP`, `JFORL`
 and `JITERL` (`LuaJIT/src/lj_bc.h:175-201`). An arbitrary header word cannot be
 overwritten: its slow paths, continuations and quickening re-read or rewrite it
-from `Code` (4.8). Four opcodes are added to the ISA:
+from `Code` (4.8). Five opcodes are added to the ISA:
 
 - `FUNC`, emitted by the compiler at pc 0 of every prototype (before
-  `VARARGPREP`): counts a function entry (6.1), then falls through. Every way into
-  a Lua function (`CALL`, `enter`, `TAILCALL`, a coroutine's first resume) passes
-  it.
+  `VARARGPREP`). Every way into a Lua function (`CALL`, `enter`, `TAILCALL`, a
+  coroutine's first resume) reads it (`call::start!`): a `FUNC` counts the call
+  (6.1) and the callee starts at pc 1, so `FUNC` is not dispatched; a `JIT_ENTRY`
+  is dispatched. Its own handler counts and falls through, for the JIT's paths
+  that run an entry's original word.
 - `LOOP`, emitted at the header of every `while`, `repeat` and generic `for`
-  loop, and at a backward `goto` itself (LuaJIT emits `BC_LOOP` in `parse_while`,
-  `parse_repeat` and at the `goto`, `lj_parse.c:2724,2784,2804`: a one-pass
-  compiler learns that a label heads a loop only when the backward `goto`
-  arrives): counts an iteration, then falls through. A `goto` loop's entry is
-  therefore at its latch, as a numeric loop's is. A generic `for` gets one, where LuaJIT patches `ITERL`,
-  because here its back-jump is taken inside `TFORCALL_*` (`tfor_finish!` reads
-  the `TFORLOOP` word, `control.rs:138-140`), so `TFORLOOP` cannot be patched.
+  loop: a `repeat` loop's counts an iteration and falls through. A `while` loop's
+  back edge is a `JMP_BACK` and a generic `for`'s a `TFORLOOP`, both counting,
+  which jump past the `LOOP` (V8 counts at `JumpLoop`, its back edge,
+  `v8/src/interpreter/interpreter-generator.cc:2453`), so the `LOOP` runs once per
+  entry into a `while` loop and never for a generic `for` until an entry is
+  installed on it: the install points the loop's back edges at the `LOOP`
+  (`Entry::back_edges`, 11.1), and retiring the entry points them past it again.
+  A generic `for` gets one, where LuaJIT patches `ITERL`, because here its
+  back-jump is taken inside `TFORCALL_*` (`tfor_finish!` reads the `TFORLOOP`
+  word, `control.rs:138-140`), so `TFORLOOP` cannot be patched.
+- `JMP_BACK`, shape `AImm { hot: u8, offset }`: a counting jump, emitted as a
+  `while` loop's back edge and as a backward `goto` (LuaJIT emits `BC_LOOP` at
+  the `goto`, `lj_parse.c:2804`: a one-pass compiler learns that a label heads a
+  loop only when the backward `goto` arrives). A `goto`'s `JMP_BACK` is its
+  loop's entry word, so a `goto` loop's entry is at its latch, as a numeric
+  loop's is; one whose label directly follows a `LOOP` is a back edge of that
+  `LOOP`'s loop.
 - `JIT_ENTRY`, shape `Ad { entry: u16 }`, never emitted: written over a `FUNC`
   whose function entry was compiled.
-- `JIT_LOOP`, same shape, never emitted: written over a `LOOP`, or over a numeric
-  loop's `FORLOOP`/`FORLOOP_I`/`FORLOOP_F` (the back-edge, as LuaJIT's `JFORL`),
-  whose loop entry was compiled. A region entered at a `FORLOOP` starts with the
-  loop step.
+- `JIT_LOOP`, same shape, never emitted: written over a `LOOP`, over a numeric
+  loop's `FORLOOP`/`FORLOOP_I`/`FORLOOP_F` (the back-edge, as LuaJIT's `JFORL`) or
+  over a `goto`'s `JMP_BACK`, whose loop entry was compiled. A region entered at a
+  `FORLOOP` starts with the loop step, one at a `JMP_BACK` with the jump.
 
-`FUNC` and `LOOP` have no slow path, no adaptive bits and no continuation that
-decodes them, so nothing but dispatch reads them. A `FORLOOP` has two readers,
+`FUNC`, `LOOP` and `JMP_BACK` have no slow path, no adaptive bits and no
+continuation that decodes them, so nothing but dispatch and `call::start!` (which
+tells `FUNC` from `JIT_ENTRY`) reads them. A `FORLOOP` has two readers,
 both taught to recognize a JIT word: `write_forloop_form` (`control.rs:157-169`)
 leaves it alone (the `FORLOOP_I` region's entry guards and `FORLOOP_I`'s own
 fallback to the generic `FORLOOP`, `control.rs:259-267`, cover a changed loop
@@ -859,8 +876,10 @@ the entry's (a `JIT_LOOP` entry after a deopt and re-entry), both rebased by
 ### 6.1 Counters
 
 `State` gains `hot: [Cell<u16>; 64]`. Each counting instruction carries its
-counter index in a free operand byte (`FUNC` and `LOOP` by construction, `FORLOOP`
-in the `b` byte its `AImm` shape leaves free), assigned round-robin by the compiler.
+counter index in a free operand byte (`FUNC`, `LOOP` and `JMP_BACK` in `a` by
+construction, `FORLOOP` and `TFORLOOP` in the `b` byte their `AImm` shape leaves
+free), assigned round-robin by the compiler; each handler reads its own byte
+(`count_hot!`).
 A hash of the pc would waste half the table on `FUNC` sites, since `Code` is
 16-byte aligned (4.9). Counters decrement by one; one that reaches zero tails
 the cold handler `jit_hot`, which resets it to `HOT_START` and decides.
@@ -868,14 +887,19 @@ Collisions between sites only make a site hot earlier.
 
 | Site | Handler | Cost |
 |---|---|---|
-| function entry | `FUNC`: `ldrh; sub; strh; cbz` on `rt + HOT + idx * 2`, then dispatch | one extra dispatch per call plus 4; `call_body!` and `enter` are unchanged |
-| numeric loop | `FORLOOP_I`, `FORLOOP_F`, `FORLOOP` on the taken branch, before the index is written (so `jit_hot` sees the frame at the instruction) | 4 |
-| other loops | `LOOP` at the header | one extra dispatch per iteration plus 4 |
+| function entry | the call (`call::start!`): the callee's word 0 is loaded as dispatch would; a `FUNC` is tested for, counts with `ubfx; add; ldrh; sub; strh; tst; b.eq` on `rt + HOT + idx * 2`, and the callee starts at pc 1 | 11 per call, no dispatch |
+| numeric loop | `FORLOOP_I`, `FORLOOP_F`, `FORLOOP` on the taken branch, before the index is written (so `jit_hot` sees the frame at the instruction) | 7 |
+| `while` loop, backward `goto` | `JMP_BACK`, before the jump | 7 |
+| generic `for` | `TFORLOOP`, and `TFORCALL_*`'s inline back-jump (`tfor_finish!`), on the taken branch | 7 |
+| `repeat` loop | `LOOP` at the header | one extra dispatch per iteration plus 7 |
 
-No compare handler, `JMP` or `TFORLOOP` counts, so the sign tests on backward
-branches in 22 compare handlers are gone. What the interpreter pays instead is
-the `FUNC` and `LOOP` dispatches; milestone 1 measures them on `mandel`, `nbody`,
-`fib`-shaped call benchmarks and the LJR suite with the JIT off.
+No compare handler counts, so the sign tests on backward branches in 22 compare
+handlers are gone; a `repeat` loop's back edge is one of them, so it keeps the
+`LOOP` dispatch. The milestone 1 measurement with the JIT off found the first
+version, which counted at a dispatched `FUNC` and at a `LOOP` on every
+iteration, 6.2% slower than main over the program benchmarks (geomean cycles),
+most of it those dispatches and an 18-instruction counter handler that decoded
+its byte by opcode; this layout is 4.0% slower (16).
 
 Defaults, all tunable through `TCVM_JIT_HOT_CALL` and `TCVM_JIT_HOT_LOOP`:
 `HOT_START = 200` for both kinds. A function called 200 times or a loop iterating
@@ -886,17 +910,19 @@ and most hot code has.
 
 ### 6.2 `jit_hot`
 
-A `slow` handler, entered from `FUNC`, `LOOP` or a `FORLOOP` with the frame at that
-instruction. It:
+A `slow` handler, entered from a counting instruction with the frame at that
+instruction (for a call, at the callee's `FUNC`). It:
 
 1. Finds or creates the prototype's `JitState`.
 2. Refuses quickly when the entry is blacklisted, already compiled, or compiling.
 3. Runs the compiler (section 15 budget) synchronously, with the live frame
-   available for seeding a loop entry's types; the entry pc is the counting
-   instruction itself.
+   available for seeding a loop entry's types. The entry pc is the counting
+   instruction itself, except for a back edge that jumps past a `LOOP`: its
+   entry is that `LOOP`, where the frame is the same, since a `LOOP` changes
+   nothing. A back edge an installed entry pointed at its `LOOP` refuses at once.
 4. On success, installs the region (11.3), writes the `JIT_ENTRY`/`JIT_LOOP` word
-   over the counting instruction, and enters the region at once, since the frame
-   is exactly at the entry.
+   over the entry instruction, points the loop's back edges at a `LOOP` entry,
+   and enters the region at once, since the frame is exactly at the entry.
 5. On a compiler failure (an internal limit, never a semantic decline) counts a
    strike, dispatches the original instruction; three strikes blacklist the entry.
 6. Refuses, without a strike, a region in which no path does work in compiled
@@ -957,8 +983,10 @@ pointing its entry-table slot (11.1) at `jit_recompile`, a `slow` handler. The
 next arrival at the `JIT_ENTRY`/`JIT_LOOP` word lands there with the frame
 exactly at the entry, compiles with the widened feedback and the live frame's
 types (J7), replaces the region (11.4) and enters it. Counting stops while an
-entry is installed (its `FUNC`/`LOOP`/`FORLOOP` is overwritten), so no counter
-could trigger the recompile, and none is needed. After `MAX_RECOMPILES = 4`
+entry is installed (its `FUNC`/`LOOP`/`FORLOOP`/`JMP_BACK` is overwritten; a
+`while` or generic `for` loop's back edges still count when the interpreter takes
+them after an exit, and `jit_hot` refuses them at once), so no counter could
+trigger the recompile, and none is needed. After `MAX_RECOMPILES = 4`
 recompiles of one entry the entry is blacklisted: its word is restored, its
 regions retired, and `jit_hot` refuses it until the prototype dies. Evictions
 (5.2) re-create entries with fresh counts, so a prototype also has a lifetime cap,
@@ -981,9 +1009,9 @@ instruction.
 Compiled code never rewrites bytecode or inline caches. The interpreter keeps
 quickening, so by the time a recompile happens the deopted instruction has been
 re-specialized by the interpreter's own rules, and the builder reads the newer
-form. Retired entries restore the original word: a `FUNC` or `LOOP`, or a
-`FORLOOP` form, which `FORPREP` rewrites again on the loop's next start as it
-would have.
+form. Retired entries restore the original word: a `FUNC`, `LOOP` or
+`JMP_BACK`, or a `FORLOOP` form, which `FORPREP` rewrites again on the loop's
+next start as it would have; a `LOOP` entry's back edges jump past it again.
 
 A form lasts only while its site sees the form's kinds. A slow path that sees
 kinds no form covers (strings, tables, metamethod kinds, big integers at a float
@@ -1371,7 +1399,9 @@ allocator use, which is what avoids the old design's pinned constants.
 One pass over the bytecode from the entry pc:
 
 1. **CFG**: block boundaries from branch targets and fallthroughs (the ported
-   `cfg.rs`), with `JIT_ENTRY`/`JIT_LOOP` words resolved to their originals, and
+   `cfg.rs`), with `JIT_ENTRY`/`JIT_LOOP` words resolved to their originals and
+   each back edge that jumps past a `LOOP` pointed at it, so a loop's header is
+   its `LOOP` whether or not an entry pointed its back edges there, and
    the `SET`-form branches (`JTSET`/`JFSET`) and `TFORCALL` edge definitions
    handled as edge-block assignments. Loop headers and the loop forest come from
    `order.rs`. Bytecode liveness per block (backward dataflow over `reg_uses`/
@@ -1394,7 +1424,7 @@ One pass over the bytecode from the entry pc:
    counts in bytecode because it fixes the copies (its instance graph) before it
    emits any IR. An entry at the entry loop's header has run a whole iteration
    before the loop proper, which peeling (9.3) does not repeat; one at its latch
-   (a `FORLOOP`, a backward `goto`'s `LOOP`) has run only the latch.
+   (a `FORLOOP`, a backward `goto`'s `JMP_BACK`) has run only the latch.
 2. **Captured registers**: the set of registers any `CLOSURE` in the function
    captures by reference, from the child prototypes' `upvalue_desc`
    (`ParentLocal(r)` with `by_value == false`), for the whole function. They
@@ -1910,8 +1940,9 @@ pub struct JitState<'gc> {
 }
 
 pub struct Entry {
-    pc: u32,                 // the FUNC, LOOP or FORLOOP word
+    pc: u32,                 // the FUNC, LOOP, FORLOOP or JMP_BACK word
     original: Instruction,   // the word JIT_ENTRY/JIT_LOOP replaced
+    back_edges: Box<[u32]>,  // a LOOP entry's back edges, pointed at it (5.2)
     slot: u16,               // index into State.jit.entries, the word's `d`
     region: Option<Gc<Region>>,
     recompiles: u8,
@@ -2009,7 +2040,7 @@ them hoist out of loops that write no metatable and no shape.
 | `exit_regs` buffer | 1 KiB per `State` |
 | hot counter table | 128 bytes per `State` |
 | entry table | 8 bytes per installed entry, grown by doubling |
-| `FUNC` | one instruction per prototype; `LOOP` one per non-numeric loop |
+| `FUNC` | one instruction per prototype; `LOOP` one per non-numeric loop but `goto` loops |
 
 ## 12. Intrinsics
 
@@ -2110,8 +2141,8 @@ Each milestone has exit criteria; a milestone is done when all tests of section 
 pass for its coverage and its measurements are recorded.
 
 1. **Protocol and numerics.** Interpreter first: the feedback byte and its
-   slow-path writers (4.8), ISA opcodes `FUNC`/`LOOP` (emitted by the compiler)
-   and `JIT_ENTRY`/`JIT_LOOP` (the ISA goes from 204 to 208 opcodes), each
+   slow-path writers (4.8), ISA opcodes `FUNC`/`LOOP`/`JMP_BACK` (emitted by the
+   compiler) and `JIT_ENTRY`/`JIT_LOOP` (the ISA goes from 204 to 209 opcodes), each
    measured with the JIT off. Then the entry table, counters, `jit_hot`,
    `jit_recompile`, `jit_entry_fail`, `JitState`/`Region`, the builder with
    constants, moves, `_II`/`_FF`/`_IF`/`_FI` arithmetic, `I64` arithmetic and
@@ -2166,11 +2197,17 @@ narrowing, list moves on insertion, and the speculation pass's dataflow.
 
 ## 16. Risks and open questions
 
-- **`FUNC` and `LOOP` dispatch cost** (6.1): one extra dispatch per call and per
-  non-numeric loop iteration in the interpreter, measured in milestone 1 with the
-  JIT off. If a call-heavy benchmark shows it, `FUNC`'s counter can move into
-  `call_body!`/`enter` with `FUNC` kept only as the patch site, which saves the
-  decrement but not the dispatch.
+- **Counting and feedback cost in the interpreter** (6.1, 4.8): measured in
+  milestone 1 with the JIT off against main (5 interleaved rounds, median
+  cycles): the program benchmarks are 1.040× main (geomean of 25; 1.062× when
+  `FUNC` and `LOOP` were dispatched), the microbenchmarks 1.131× (19). What
+  remains: a numeric loop's count on every iteration (an empty loop 1.75×,
+  `iadd` 1.25×), 11 instructions per call (recursive fib 1.055×), a generic
+  `for`'s count (1.07×), and the slow paths' feedback records, which compute the
+  kinds on every run though they store only on a change (big-integer
+  arithmetic 1.65× main's instructions; `fixpoint-fact` 1.09×, `richard` 1.08×).
+  Counting a numeric loop by its trip count at `FORPREP` is the open option for
+  the first; LuaJIT counts every `FORL` iteration.
 - **`regalloc2` on loops**: the in-house spiller was measured to beat a whole-value
   scan on `mix2`'s loops; `Ion` splits live ranges and should do as well, but
   this is checked in milestone 1 on the old `mix`/`mix2` sources. If it loses,
@@ -2301,6 +2338,7 @@ named milestone, `H` a helper, `I` inline code.
 | `NOP` | I | | | |
 | `STOP` | D | | | |
 | `FUNC`, `LOOP` | I | | | emit nothing; a region never counts |
+| `JMP_BACK` | I | | | a `JMP` |
 | `JIT_ENTRY`, `JIT_LOOP` | resolved to the original word by the builder | | | |
 
 ## Appendix E: x86-64 extension points
