@@ -2,10 +2,10 @@
 //! wrote at its `TFORCALL` says, the `next` and `ipairs` steps without
 //! calling the iterator, any other iterator called, `TFORLOOP` a nil test.
 
+use crate::env::table::POS_PART_SHIFT;
 use crate::env::value::Value;
 use crate::instruction::{Instruction, Op as BcOp, TFOR_VARS};
 use crate::jit::build::Builder;
-use crate::env::table::POS_PART_SHIFT;
 use crate::jit::build::emit::{branch_arm, enter_join, staged_call};
 use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL_VAL, HelperId, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
