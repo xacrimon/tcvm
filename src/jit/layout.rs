@@ -39,4 +39,19 @@ mod tests {
             assert_ne!(metrics, 0);
         });
     }
+
+    #[test]
+    fn upvalue_cell_value_pointer() {
+        use crate::dmm::Gc;
+        use crate::env::function::UpvalueCell;
+        use crate::env::value::Value;
+        let mut lua = Lua::new();
+        lua.enter(|ctx| {
+            let cell = UpvalueCell::new_closed(ctx.mutation(), Value::small(7));
+            // What an upvalue slot holds: the cell's box.
+            let boxed = Gc::erased_ptr(cell) as usize;
+            let v = unsafe { ((boxed + UpvalueCell::V_OFFSET) as *const *const Value).read() };
+            assert_eq!(unsafe { v.read() }.get_small(), Some(7));
+        });
+    }
 }

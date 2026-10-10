@@ -75,6 +75,17 @@ pub(crate) enum HelperId {
     /// `(Val, Val) -> Val`: `a .. b` of strings and numbers, or
     /// `HELPER_FAIL_VAL`.
     Concat,
+    /// `->`: the barrier of a store of a heap value into upvalue `i`'s cell.
+    UpvalBarrier(u8),
+    /// `-> Val`: `CLOSURE` of prototype `proto` into `R[dst]`, from the
+    /// captured registers' home slots.
+    Closure {
+        proto: u16,
+        dst: u8,
+    },
+    /// `->`: close this frame's open upvalues from `R[a]` up, from the
+    /// captured registers' home slots.
+    Close(u8),
 }
 
 /// What a compare helper returns when the interpreter must run the compare.
@@ -89,6 +100,8 @@ pub(crate) const HELPER_FAIL_VAL: u64 = 0xFFF8_0000_0000_0000;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Ctx {
     Rt,
+    Thread,
+    Base,
 }
 
 /// A helper's C signature: the pinned registers, then an immediate, then
@@ -97,7 +110,7 @@ pub(crate) struct Sig {
     pub(crate) ctx: &'static [Ctx],
     pub(crate) imm: Option<u64>,
     pub(crate) args: &'static [Rep],
-    pub(crate) ret: Rep,
+    pub(crate) ret: Option<Rep>,
     pub(crate) effects: Effects,
 }
 
@@ -114,22 +127,42 @@ impl HelperId {
             HelperId::BNot => "bnot".into(),
             HelperId::Len => "len".into(),
             HelperId::Concat => "concat".into(),
+            HelperId::UpvalBarrier(i) => format!("upval_barrier u{i}"),
+            HelperId::Closure { proto, dst } => format!("closure p{proto} r{dst}"),
+            HelperId::Close(a) => format!("close r{a}"),
         }
     }
 
     pub(crate) fn sig(self) -> Sig {
         use Rep::*;
         const RT: &[Ctx] = &[Ctx::Rt];
+        const FRAME: &[Ctx] = &[Ctx::Rt, Ctx::Thread, Ctx::Base];
+        let alloc = Effects::MAY_ALLOC;
         let (ctx, imm, args, ret, effects): (_, _, &'static [Rep], _, _) = match self {
-            HelperId::FMod | HelperId::FPow => (&[][..], None, &[F64, F64], F64, Effects::NONE),
+            HelperId::FMod | HelperId::FPow => {
+                (&[][..], None, &[F64, F64], Some(F64), Effects::NONE)
+            }
             HelperId::Lt | HelperId::Le | HelperId::Eq => {
-                (RT, None, &[Val, Val], I32, Effects::NONE)
+                (RT, None, &[Val, Val], Some(I32), Effects::NONE)
             }
-            HelperId::Arith(k) => (RT, Some(k as u64), &[Val, Val], Val, Effects::MAY_ALLOC),
-            HelperId::Unm | HelperId::BNot | HelperId::Len => {
-                (RT, None, &[Val], Val, Effects::MAY_ALLOC)
-            }
-            HelperId::Concat => (RT, None, &[Val, Val], Val, Effects::MAY_ALLOC),
+            HelperId::Arith(k) => (RT, Some(k as u64), &[Val, Val], Some(Val), alloc),
+            HelperId::Unm | HelperId::BNot | HelperId::Len => (RT, None, &[Val], Some(Val), alloc),
+            HelperId::Concat => (RT, None, &[Val, Val], Some(Val), alloc),
+            HelperId::UpvalBarrier(i) => (FRAME, Some(i as u64), &[], None, Effects::NONE),
+            HelperId::Closure { proto, dst } => (
+                FRAME,
+                Some(proto as u64 | (dst as u64) << 32),
+                &[],
+                Some(Val),
+                alloc | Effects::R_SLOT | Effects::W_FRAME,
+            ),
+            HelperId::Close(a) => (
+                FRAME,
+                Some(a as u64),
+                &[],
+                None,
+                Effects::R_SLOT | Effects::W_UPVAL,
+            ),
         };
         Sig {
             ctx,
@@ -214,8 +247,8 @@ pub(crate) enum Op {
     GuardSame,
     /// The collector check after an allocation.
     GcCheck,
-    /// Exits when the frame has upvalues or to-be-closed variables to close.
-    GuardNoClose,
+    /// Exits when the frame's header has any of the flags.
+    GuardNoFlag(u8),
 
     // --- i32 ------------------------------------------------------------------
     /// Exits on overflow.
@@ -286,6 +319,14 @@ pub(crate) enum Op {
     // --- closure --------------------------------------------------------------
     /// A by-value upvalue of the running closure.
     UpvalValue(u8),
+    /// The cell of a shared upvalue of the running closure.
+    UpvalCell(u8),
+    /// The value of an upvalue cell.
+    CellLoad,
+    /// `cell = v`, without its barrier.
+    CellStore,
+    /// Whether the frame's header has the flag (`vm::frame::flag`).
+    HasFlag(u8),
 
     // --- calls ----------------------------------------------------------------
     /// A C-ABI helper.
@@ -331,6 +372,10 @@ impl Effects {
     pub(crate) const R_SLOT: Effects = Effects(16);
     pub(crate) const W_SLOT: Effects = Effects(32);
     pub(crate) const R_GC: Effects = Effects(128);
+    pub(crate) const R_UPVAL: Effects = Effects(1 << 8);
+    pub(crate) const R_FRAME: Effects = Effects(1 << 9);
+    pub(crate) const W_UPVAL: Effects = Effects(1 << 16);
+    pub(crate) const W_FRAME: Effects = Effects(1 << 17);
     /// Writes every class (a call: anything may run).
     pub(crate) const W_ALL: Effects = Effects(0xffff_0000);
 
@@ -357,9 +402,14 @@ impl Op {
         match self {
             Load(_) => Effects::R_SLOT,
             Store(_) => Effects::W_SLOT,
-            Guard(_) | GuardTrue | GuardFalse | GuardSame | GuardNoClose | IAdd | ISub | IMul
-            | INeg | IShl | IShr | IDivFloor | IModFloor | LDivFloor | LModFloor | LToI
-            | FToIExact | ToF64 => Effects::MAY_DEOPT,
+            Guard(_) | GuardTrue | GuardFalse | GuardSame | IAdd | ISub | IMul | INeg | IShl
+            | IShr | IDivFloor | IModFloor | LDivFloor | LModFloor | LToI | FToIExact | ToF64 => {
+                Effects::MAY_DEOPT
+            }
+            GuardNoFlag(_) => Effects::MAY_DEOPT | Effects::R_FRAME,
+            HasFlag(_) => Effects::R_FRAME,
+            CellLoad => Effects::R_UPVAL,
+            CellStore => Effects::W_UPVAL,
             GcCheck => Effects::MAY_DEOPT | Effects::R_GC,
             Helper(h) => h.sig().effects,
             Resume { .. } => Effects::R_SLOT,
@@ -402,11 +452,13 @@ impl Op {
     pub(crate) fn num_results(self) -> usize {
         use Op::*;
         match self {
+            Helper(h) => h.sig().ret.is_some() as usize,
             Store(_)
+            | CellStore
             | GuardTrue
             | GuardFalse
             | GuardSame
-            | GuardNoClose
+            | GuardNoFlag(_)
             | GcCheck
             | Jump
             | Br
@@ -432,7 +484,9 @@ impl Op {
             KB1(_) => Ty::B1,
             KI64(_) => Ty::I64,
             KF64(_) => Ty::F64,
-            Load(_) | UpvalValue(_) | Resume { .. } => Ty::ANY,
+            Load(_) | UpvalValue(_) | CellLoad | Resume { .. } => Ty::ANY,
+            UpvalCell(_) => Ty::PTR,
+            HasFlag(_) => Ty::B1,
             Box => args[0].boxed(),
             Unbox(rep) => Ty {
                 rep,
@@ -461,7 +515,8 @@ impl Op {
             | Helper(HelperId::Unm) => Ty::val(TypeSet::NUM),
             Helper(HelperId::Arith(_) | HelperId::BNot | HelperId::Len) => Ty::val(TypeSet::INT),
             Helper(HelperId::Concat) => Ty::val(TypeSet::STR),
-            Helper(h) => Ty::of_rep(h.sig().ret),
+            Helper(HelperId::Closure { .. }) => Ty::val(TypeSet::FUN),
+            Helper(h) => Ty::of_rep(h.sig().ret.unwrap_or(Rep::Val)),
             _ => Ty::ANY,
         }
     }
@@ -487,12 +542,14 @@ impl Op {
             GuardFalse => "guard.false".into(),
             GuardSame => "guard.same".into(),
             GcCheck => "gccheck".into(),
-            GuardNoClose => "guard.noclose".into(),
+            GuardNoFlag(m) => format!("guard.noflag {m:#x}"),
+            HasFlag(m) => format!("hasflag {m:#x}"),
             SameBits => "samebits".into(),
             ICmp(c) => format!("icmp.{}", c.name()),
             LCmp(c) => format!("lcmp.{}", c.name()),
             FCmp(c) => format!("fcmp.{}", c.name()),
             UpvalValue(i) => format!("upval u{i}"),
+            UpvalCell(i) => format!("upcell u{i}"),
             Helper(h) => format!("call.{}", h.name()),
             Resume { c } => format!("resume c={c}"),
             Return { a, n } => format!("return r{a} n={n}"),

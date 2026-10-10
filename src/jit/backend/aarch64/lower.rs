@@ -574,8 +574,24 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     none,
                 );
             }
-            Op::GuardNoClose => {
-                self.push_exit(i, |exit| MInst::GuardNoClose { exit }, vec![], none)
+            Op::GuardNoFlag(mask) => {
+                self.push_exit(i, |exit| MInst::GuardNoFlag { mask, exit }, vec![], none)
+            }
+            Op::HasFlag(mask) => {
+                let d = self.def(res.unwrap());
+                self.push(MInst::HasFlag(mask), &[d], none);
+            }
+            Op::UpvalCell(k) => {
+                let d = self.def(res.unwrap());
+                self.push(MInst::LoadUpval(k), &[d], none);
+            }
+            Op::CellLoad => {
+                let (d, c) = (self.def(res.unwrap()), self.use_(args[0]));
+                self.push(MInst::LoadCell, &[d, c], none);
+            }
+            Op::CellStore => {
+                let (c, v) = (self.use_(args[0]), self.use_(args[1]));
+                self.push(MInst::StoreCell, &[c, v], none);
             }
             Op::GcCheck => self.push_exit(i, |exit| MInst::GcCheck { exit }, vec![], none),
             Op::IAdd | Op::ISub => {
@@ -788,7 +804,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 let mut ops = Vec::with_capacity(args.len() + 1);
                 let mut clob = caller_saved();
                 if let Some(r) = res {
-                    let p = if sig.ret == Rep::F64 {
+                    let p = if sig.ret == Some(Rep::F64) {
                         preg_float(0)
                     } else {
                         preg_int(0)

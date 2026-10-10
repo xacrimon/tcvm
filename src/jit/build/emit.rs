@@ -3,12 +3,13 @@
 //! result writes. What milestone 1 does not compile is a deopt.
 
 use crate::env::value::Value;
-use crate::instruction::{ArithKind, Family, Instruction, Op as BcOp};
+use crate::instruction::{ArithKind, Family, Instruction, Op as BcOp, UpvalSource};
 use crate::jit::build::Builder;
 use crate::jit::feedback as fb;
 use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL, HELPER_FAIL_VAL, HelperId, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
 use crate::jit::ir::{Block, Val};
+use crate::vm::frame::flag;
 
 /// How an arithmetic site compiles.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -101,7 +102,8 @@ pub(super) fn always_deopts(b: &Builder<'_, '_>, pc: u32) -> bool {
     match insn.op() {
         MOVE | LOAD | LOADI | LOADNIL | LFALSESKIP | GETUPVAL | NOP | FUNC | LOOP | JMP
         | JMP_BACK | NOT | ERRNNIL | JT | JF | JTSET | JFSET | RETURN0 | RETURN1 | FORLOOP_I
-        | FORLOOP_F | FORLOOP | JEQS | JNEQS | LEN | CONCAT => false,
+        | FORLOOP_F | FORLOOP | JEQS | JNEQS | LEN | CONCAT | GETUPVAL_REF | SETUPVAL | CLOSURE
+        | CLOSE => false,
         VARARGPREP => b.proto.needs_vararg_table,
         RETURN => insn.b() == 0,
         CALL | CALL_R0 | CALL_R1 | CALLS | CALLS_R0 | CALLS_R1 => insn.b() == 0,
@@ -256,12 +258,51 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             store_results(b, a, 1);
             b.terminate(Op::Return { a, n: 1 }, &[], &[], None);
         }
-        RETURN => {
+        RETURN => emit_return(b, a, rb - 1),
+        GETUPVAL_REF => {
+            let c = b.ins(Op::UpvalCell(rb), &[]);
+            let v = b.ins(Op::CellLoad, &[c]);
+            b.set(a, v);
+            b.note_def(&[v], None);
+        }
+        SETUPVAL => {
+            let v = b.reg(a);
+            let v = b.boxed(v);
+            let c = b.ins(Op::UpvalCell(rb), &[]);
+            b.push(Op::CellStore, &[c, v]);
+            let set = b.ty(v).set;
+            if set.is_empty() || set.intersects(TypeSet::HEAP) {
+                b.push(Op::Helper(HelperId::UpvalBarrier(rb)), &[]);
+            }
+        }
+        CLOSURE => {
+            let proto = insn.d();
+            // The helper reads the captured registers from their slots.
+            let child = b.proto.prototypes[proto as usize];
+            let regs: Vec<usize> = child
+                .upvalue_desc
+                .iter()
+                .filter_map(|d| match d.source {
+                    UpvalSource::ParentLocal(r) if !(d.by_value && r == a) => Some(r as usize),
+                    _ => None,
+                })
+                .collect();
+            b.store_regs(regs);
+            let f = b.ins(Op::Helper(HelperId::Closure { proto, dst: a }), &[]);
+            b.set(a, f);
+        }
+        CLOSE => {
+            // A `__close` runs Lua: the interpreter does it.
             let s = b.snap_before();
-            b.ins_snap(Op::GuardNoClose, &[], s, ExitTag::Unsupported);
-            let n = rb - 1;
-            store_results(b, a, n);
-            b.terminate(Op::Return { a, n }, &[], &[], None);
+            b.ins_snap(
+                Op::GuardNoFlag(flag::HAS_TBC as u8),
+                &[],
+                s,
+                ExitTag::Unsupported,
+            );
+            let regs: Vec<usize> = b.cfg.captured.iter().filter(|&r| r >= a as usize).collect();
+            b.store_regs(regs);
+            b.push(Op::Helper(HelperId::Close(a)), &[]);
         }
         CALL | CALL_R0 | CALL_R1 | CALLS | CALLS_R0 | CALLS_R1 => emit_call(b, pc, insn),
         FORPREP => emit_forprep(b, pc, insn, succs),
@@ -294,6 +335,37 @@ fn branch(b: &mut Builder<'_, '_>, cond: Val, jump_when: bool, succs: &[Block]) 
     } else {
         b.br(cond, fall, target);
     }
+}
+
+/// `RETURN` of `n` results from `R[a..]`. A frame with to-be-closed
+/// variables deopts; one whose closures captured registers closes their
+/// cells first, from the captured registers' slots.
+fn emit_return(b: &mut Builder<'_, '_>, a: u8, n: u8) {
+    let captures = b.cfg.captured.iter().next().is_some();
+    let s = b.snap_before();
+    let mask = if captures {
+        flag::HAS_TBC
+    } else {
+        flag::HAS_OPEN | flag::HAS_TBC
+    };
+    b.ins_snap(Op::GuardNoFlag(mask as u8), &[], s, ExitTag::Unsupported);
+    if captures {
+        // Results may overwrite captured slots, as in the interpreter.
+        let regs: Vec<usize> = b.cfg.captured.iter().collect();
+        b.store_regs(regs);
+        store_results(b, a, n);
+        let join = b.new_block();
+        let open = b.ins(Op::HasFlag(flag::HAS_OPEN as u8), &[]);
+        let rest = branch_arm(b, open);
+        b.push(Op::Helper(HelperId::Close(0)), &[]);
+        b.jump(join);
+        b.switch_to(rest);
+        b.jump(join);
+        enter_join(b, join);
+    } else {
+        store_results(b, a, n);
+    }
+    b.terminate(Op::Return { a, n }, &[], &[], None);
 }
 
 /// Store `R[a..a+n]` before a return.

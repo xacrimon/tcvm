@@ -570,6 +570,23 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         tys
     }
 
+    /// Store the registers in `regs` whose home slots do not hold their
+    /// values, for a helper that reads them there.
+    pub(crate) fn store_regs(&mut self, regs: impl IntoIterator<Item = usize>) {
+        for r in regs {
+            if r >= self.nregs || self.untouched(r) {
+                continue;
+            }
+            let v = self.reg(r as u8);
+            if !self.slot_holds(r as u8, v) {
+                let bv = self.boxed(v);
+                self.push(Op::Store(r as u8), &[bv]);
+                let root = self.root_of(v);
+                self.set_slot(self.cur, r, SlotState::Holds(root));
+            }
+        }
+    }
+
     /// Leave for the interpreter at the instruction being emitted.
     pub(crate) fn deopt(&mut self, tag: ExitTag) {
         let s = self.snap_before();

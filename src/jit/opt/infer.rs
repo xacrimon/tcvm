@@ -11,7 +11,12 @@ use crate::jit::ir::{Block, Func, Val};
 fn keeps_type(op: Op) -> bool {
     matches!(
         op,
-        Op::Load(_) | Op::KObj(_) | Op::Resume { .. } | Op::UpvalValue(_) | Op::Helper(_)
+        Op::Load(_)
+            | Op::KObj(_)
+            | Op::Resume { .. }
+            | Op::UpvalValue(_)
+            | Op::CellLoad
+            | Op::Helper(_)
     )
 }
 
