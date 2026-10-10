@@ -5,6 +5,7 @@ use crate::dmm::Gc;
 use crate::env::MetamethodBits;
 use crate::env::function::UpvalueCell;
 use crate::env::string::LuaString;
+use crate::env::table::Table;
 use crate::env::thread::ThreadState;
 use crate::env::value::{Value, ValueKind};
 use crate::instruction::ArithKind;
@@ -12,7 +13,7 @@ use crate::jit::ir::ops::{HELPER_FAIL, HELPER_FAIL_VAL, HelperId};
 use crate::lua::{Context, State};
 use crate::vm::frame::{self, land_results};
 use crate::vm::num::{self, ArithOp, SlowNum};
-use crate::vm::ops::control::{close_upvalues, new_closure};
+use crate::vm::ops::control::{close_upvalues, new_closure, vararg_get, vararg_table};
 use crate::vm::ops::meta::binop_metamethod;
 
 /// The address a region calls for `h`.
@@ -31,6 +32,10 @@ pub(crate) fn address(h: HelperId) -> usize {
         HelperId::UpvalBarrier(_) => jit_upval_barrier as *const () as usize,
         HelperId::Closure { .. } => jit_closure as *const () as usize,
         HelperId::Close(_) => jit_close as *const () as usize,
+        HelperId::NewTable(_) => jit_newtable as *const () as usize,
+        HelperId::SetList { .. } => jit_setlist as *const () as usize,
+        HelperId::VarargGet => jit_varargget as *const () as usize,
+        HelperId::VarargTable(_) => jit_vararg_table as *const () as usize,
     }
 }
 
@@ -237,6 +242,60 @@ pub(crate) extern "C" fn jit_close(
     let ts = unsafe { &mut *thread };
     let level = ts.slot_index(base) + a as usize;
     close_upvalues(ctx.mutation(), ts, level);
+}
+
+/// `NEWTABLE` from template `t` of the running prototype.
+pub(crate) extern "C" fn jit_newtable(
+    rt: *const State<'static>,
+    base: *mut Value<'static>,
+    t: u64,
+) -> u64 {
+    let ctx = unsafe { Context::from_state(rt) };
+    let closure = unsafe { frame::closure(base) };
+    let t = &closure.proto.templates[t as usize];
+    Value::table(Table::from_template(ctx.mutation(), t)).to_raw()
+}
+
+/// `SETLIST` (`imm`: `a | n << 8 | off << 16`) from the frame's slots, as
+/// `op_setlist` does.
+pub(crate) extern "C" fn jit_setlist(
+    rt: *const State<'static>,
+    base: *mut Value<'static>,
+    imm: u64,
+) {
+    let ctx = unsafe { Context::from_state(rt) };
+    let (a, n, off) = (
+        imm as u8 as usize,
+        (imm >> 8) as u8 as usize,
+        (imm >> 16) as usize,
+    );
+    // SAFETY: the compiler gives SETLIST a table and its items' registers.
+    let t = unsafe { (*base.add(a)).get_table().unwrap_unchecked() };
+    let items = unsafe { std::slice::from_raw_parts(base.add(a + 1), n) };
+    if !Gc::is_gray(t.inner()) {
+        ctx.mutation().backward_barrier(Gc::erase(t.inner()), None);
+    }
+    unsafe { t.borrow_mut_barriered() }.set_list(ctx.mutation(), off, items);
+}
+
+/// `VARARGGET` of `key`.
+pub(crate) extern "C" fn jit_varargget(
+    rt: *const State<'static>,
+    base: *mut Value<'static>,
+    key: u64,
+) -> u64 {
+    let ctx = unsafe { Context::from_state(rt) };
+    vararg_get(ctx, base, unsafe { Value::from_raw(key) }).to_raw()
+}
+
+/// `VARARGPREP`'s vararg table into `R[np]`.
+pub(crate) extern "C" fn jit_vararg_table(
+    rt: *const State<'static>,
+    base: *mut Value<'static>,
+    np: u64,
+) -> u64 {
+    let ctx = unsafe { Context::from_state(rt) };
+    Value::table(vararg_table(ctx, base, np as usize)).to_raw()
 }
 
 /// Box an integer outside i32.

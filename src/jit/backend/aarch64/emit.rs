@@ -670,6 +670,36 @@ impl Em<'_> {
                     .ldr(X16, c, crate::env::function::UpvalueCell::V_OFFSET as i32);
                 self.a.ldr(d, X16, 0);
             }
+            NumVarargs => {
+                let d = self.r(i, 0);
+                self.a.ldr(X16, BASE, -32);
+                self.a.lsr_imm(Sz::X, d, X16, 48);
+            }
+            VarargAt(k) => {
+                // The extras end at the header: extra k is at
+                // base - 32 - 8 * nv + 8 * k, read only when k < nv.
+                let (d, nv) = (self.r(i, 0), self.r(i, 1));
+                self.a.cmp_imm(Sz::W, nv, k as u64);
+                self.a.lsl_imm(Sz::W, X16, nv, 3);
+                self.a.sub(Sz::X, X16, BASE, X16);
+                self.a.ldr(d, X16, 8 * k as i32 - 32);
+                self.a.mov_imm(X17, NIL);
+                self.a.csel(Sz::X, d, d, X17, Cond::Hi);
+            }
+            VarargIdx => {
+                // The index clamped to 0 out of range, so the load stays in
+                // the frame.
+                let (d, nv, k) = (self.r(i, 0), self.r(i, 1), self.r(i, 2));
+                self.a.sub_imm(Sz::W, X16, k, 1);
+                self.a.cmp(Sz::W, X16, nv);
+                self.a.csel(Sz::W, X16, X16, ZR, Cond::Lo);
+                self.a.lsl_imm(Sz::W, X17, nv, 3);
+                self.a.sub(Sz::X, X17, BASE, X17);
+                self.a.add_shift(Sz::X, X17, X17, X16, Shift::Lsl, 3);
+                self.a.ldr(d, X17, -32);
+                self.a.mov_imm(X16, NIL);
+                self.a.csel(Sz::X, d, d, X16, Cond::Lo);
+            }
             StoreCell => {
                 let (c, v) = (self.r(i, 0), self.r(i, 1));
                 self.a

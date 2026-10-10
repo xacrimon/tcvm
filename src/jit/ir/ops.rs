@@ -86,6 +86,19 @@ pub(crate) enum HelperId {
     /// `->`: close this frame's open upvalues from `R[a]` up, from the
     /// captured registers' home slots.
     Close(u8),
+    /// `-> Val`: `NEWTABLE` from the prototype's template.
+    NewTable(u16),
+    /// `->`: `SETLIST` of `R[a+1..=a+n]`, in their slots, into the table in
+    /// `R[a]` from index `off + 1`.
+    SetList {
+        a: u8,
+        n: u8,
+        off: u32,
+    },
+    /// `Val -> Val`: `VARARGGET` of a key.
+    VarargGet,
+    /// `-> Val`: `VARARGPREP`'s vararg table, also stored in `R[np]`.
+    VarargTable(u8),
 }
 
 /// What a compare helper returns when the interpreter must run the compare.
@@ -130,6 +143,10 @@ impl HelperId {
             HelperId::UpvalBarrier(i) => format!("upval_barrier u{i}"),
             HelperId::Closure { proto, dst } => format!("closure p{proto} r{dst}"),
             HelperId::Close(a) => format!("close r{a}"),
+            HelperId::NewTable(t) => format!("newtable t{t}"),
+            HelperId::SetList { a, n, off } => format!("setlist r{a} n={n} off={off}"),
+            HelperId::VarargGet => "varargget".into(),
+            HelperId::VarargTable(np) => format!("varargtable r{np}"),
         }
     }
 
@@ -137,6 +154,7 @@ impl HelperId {
         use Rep::*;
         const RT: &[Ctx] = &[Ctx::Rt];
         const FRAME: &[Ctx] = &[Ctx::Rt, Ctx::Thread, Ctx::Base];
+        const BASE: &[Ctx] = &[Ctx::Rt, Ctx::Base];
         let alloc = Effects::MAY_ALLOC;
         let (ctx, imm, args, ret, effects): (_, _, &'static [Rep], _, _) = match self {
             HelperId::FMod | HelperId::FPow => {
@@ -162,6 +180,22 @@ impl HelperId {
                 &[],
                 None,
                 Effects::R_SLOT | Effects::W_UPVAL,
+            ),
+            HelperId::NewTable(t) => (BASE, Some(t as u64), &[], Some(Val), alloc),
+            HelperId::SetList { a, n, off } => (
+                BASE,
+                Some(a as u64 | (n as u64) << 8 | (off as u64) << 16),
+                &[],
+                None,
+                alloc | Effects::R_SLOT | Effects::W_TAB | Effects::W_SHAPE,
+            ),
+            HelperId::VarargGet => (BASE, None, &[Val], Some(Val), alloc),
+            HelperId::VarargTable(np) => (
+                BASE,
+                Some(np as u64),
+                &[],
+                Some(Val),
+                alloc | Effects::W_SLOT,
             ),
         };
         Sig {
@@ -328,6 +362,14 @@ pub(crate) enum Op {
     /// Whether the frame's header has the flag (`vm::frame::flag`).
     HasFlag(u8),
 
+    // --- varargs: the frame's extras below its header ----------------------
+    /// How many extras the frame has (`nv`), an `I32`.
+    NumVarargs,
+    /// Extra `k` (from 0) given `nv`, or nil past the last.
+    VarargAt(u8),
+    /// Extra `k - 1` given `nv` and the `I32` key `k`, or nil out of range.
+    VarargIdx,
+
     // --- calls ----------------------------------------------------------------
     /// A C-ABI helper.
     Helper(HelperId),
@@ -376,6 +418,8 @@ impl Effects {
     pub(crate) const R_FRAME: Effects = Effects(1 << 9);
     pub(crate) const W_UPVAL: Effects = Effects(1 << 16);
     pub(crate) const W_FRAME: Effects = Effects(1 << 17);
+    pub(crate) const W_TAB: Effects = Effects(1 << 18);
+    pub(crate) const W_SHAPE: Effects = Effects(1 << 19);
     /// Writes every class (a call: anything may run).
     pub(crate) const W_ALL: Effects = Effects(0xffff_0000);
 
@@ -486,6 +530,8 @@ impl Op {
             KF64(_) => Ty::F64,
             Load(_) | UpvalValue(_) | CellLoad | Resume { .. } => Ty::ANY,
             UpvalCell(_) => Ty::PTR,
+            NumVarargs => Ty::I32,
+            VarargAt(_) | VarargIdx => Ty::ANY,
             HasFlag(_) => Ty::B1,
             Box => args[0].boxed(),
             Unbox(rep) => Ty {
@@ -516,6 +562,7 @@ impl Op {
             Helper(HelperId::Arith(_) | HelperId::BNot | HelperId::Len) => Ty::val(TypeSet::INT),
             Helper(HelperId::Concat) => Ty::val(TypeSet::STR),
             Helper(HelperId::Closure { .. }) => Ty::val(TypeSet::FUN),
+            Helper(HelperId::NewTable(_) | HelperId::VarargTable(_)) => Ty::val(TypeSet::TAB),
             Helper(h) => Ty::of_rep(h.sig().ret.unwrap_or(Rep::Val)),
             _ => Ty::ANY,
         }

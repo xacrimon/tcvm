@@ -589,6 +589,19 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 let (d, c) = (self.def(res.unwrap()), self.use_(args[0]));
                 self.push(MInst::LoadCell, &[d, c], none);
             }
+            Op::NumVarargs => {
+                let d = self.def(res.unwrap());
+                self.push(MInst::NumVarargs, &[d], none);
+            }
+            Op::VarargAt(k) => {
+                let (d, nv) = (self.def(res.unwrap()), self.use_(args[0]));
+                self.push(MInst::VarargAt(k), &[d, nv], none);
+            }
+            Op::VarargIdx => {
+                let d = self.def(res.unwrap());
+                let (nv, k) = (self.use_(args[0]), self.use_(args[1]));
+                self.push(MInst::VarargIdx, &[d, nv, k], none);
+            }
             Op::CellStore => {
                 let (c, v) = (self.use_(args[0]), self.use_(args[1]));
                 self.push(MInst::StoreCell, &[c, v], none);
