@@ -34,7 +34,9 @@ pub(crate) fn reads(op: Op) -> Option<(usize, Option<u32>)> {
         Op::Load(r) => (SLOT, Some(r as u32)),
         Op::TabLoad { key, .. } => (TAB, Some(key)),
         Op::ArrLoad => (ARR, None),
-        Op::GuardShape(_) | Op::TabASize | Op::TabArray | Op::TabHasRoom(_) => (SHAPE, None),
+        Op::GuardShape(_) | Op::ShapeIs(_) | Op::TabASize | Op::TabArray | Op::TabHasRoom(_) => {
+            (SHAPE, None)
+        }
         Op::ClassBits(_) | Op::ClassIndex(_) => (META, None),
         Op::CellLoad => (UPVAL, None),
         Op::HasFlag(_) | Op::GuardNoFlag(_) => (FRAME, None),

@@ -234,6 +234,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                             | Op::IsType(_)
                             | Op::IsFalsy
                             | Op::SameBits
+                            | Op::ShapeIs(_)
                     )
                 {
                     self.fused[c.idx()] = true;
@@ -279,6 +280,11 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             Op::SameBits => (Test::X { imm: None }, Cond::Eq, args),
             Op::IsType(set) => (Test::Type(set), Cond::Eq, args),
             Op::IsFalsy => (Test::Falsy, Cond::Lo, args),
+            Op::ShapeIs(k) => (
+                Test::Shape(self.f.shapes[k as usize].as_word()),
+                Cond::Eq,
+                args,
+            ),
             op => panic!("test_of {op:?}"),
         }
     }
@@ -500,6 +506,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             Op::IsType(_)
             | Op::IsFalsy
             | Op::SameBits
+            | Op::ShapeIs(_)
             | Op::ICmp(_)
             | Op::LCmp(_)
             | Op::FCmp(_) => {

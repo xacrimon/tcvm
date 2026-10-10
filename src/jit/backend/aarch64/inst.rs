@@ -52,6 +52,8 @@ pub(crate) enum Test {
     Type(TypeSet),
     /// A `Val` is nil or false: `[v]`.
     Falsy,
+    /// A table's shape is the one at this address: `[t]`.
+    Shape(u64),
     /// A `B1` is true: `[c]`.
     B1,
 }

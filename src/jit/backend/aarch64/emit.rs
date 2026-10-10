@@ -291,6 +291,13 @@ impl Em<'_> {
                 self.a.cmp_imm(Sz::W, c, 0);
                 cond
             }
+            Test::Shape(word) => {
+                let t = self.r(i, k);
+                self.a.ldr(X16, t, layout::T_SHAPE as i32);
+                self.a.ldr_lit(X17, word);
+                self.a.cmp(Sz::X, X16, X17);
+                cond
+            }
             // `cond` is `Eq` for in the set, `Ne` for not.
             Test::Type(set) => {
                 let v = self.r(i, k);
