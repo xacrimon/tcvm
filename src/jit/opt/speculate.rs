@@ -330,15 +330,21 @@ fn anticipated(f: &Func<'_>, cands: &[Cand]) -> Ant {
                     cur.fill(!0);
                     for j in 0..f.edges(term).len() {
                         let s = f.edges(term)[j].target;
-                        edge.copy_from_slice(&at_start[s.idx() * w..(s.idx() + 1) * w]);
-                        // A parameter's use is its argument's along this edge.
-                        for (k, &p) in f.params(s).iter().enumerate() {
-                            let Some(ps) = by_name.get(&p) else {
-                                continue;
-                            };
+                        let row = &at_start[s.idx() * w..(s.idx() + 1) * w];
+                        edge.copy_from_slice(row);
+                        // A parameter's use is its argument's along this edge,
+                        // all at once (an argument may be another parameter);
+                        // here its name is the value the target replaces.
+                        let ps = f.params(s);
+                        for p in ps {
+                            for &(_, pb) in by_name.get(p).into_iter().flatten() {
+                                edge[pb / 64] &= !(1 << (pb % 64));
+                            }
+                        }
+                        for (k, p) in ps.iter().enumerate() {
                             let a = f.edge_args(term, j)[k];
-                            for &(c, pb) in ps {
-                                if edge[pb / 64] >> (pb % 64) & 1 != 0
+                            for &(c, pb) in by_name.get(p).into_iter().flatten() {
+                                if row[pb / 64] >> (pb % 64) & 1 != 0
                                     && let Some(&ab) = bit.get(&(c, a))
                                 {
                                     edge[ab / 64] |= 1 << (ab % 64);

@@ -249,3 +249,27 @@ fn loop_invariants_leave_the_loop() {
     assert_eq!(in_loop("key: 0"), 0, "{ir}");
     assert_eq!(in_loop("tabstore"), 1, "{ir}");
 }
+
+/// A loop-carried value whose last iteration's is nil is not guarded where
+/// it is loaded: the path out of the loop never uses it as a table.
+#[test]
+fn loop_carried_definitions_guard_only_down_safe() {
+    let src = "function append(packet, head)
+        packet.link = nil
+        if head == nil then return packet end
+        local mouse = head
+        local link = mouse.link
+        while link ~= nil do
+            mouse = link
+            link = mouse.link
+        end
+        mouse.link = packet
+        return head
+    end
+    for i = 1, 300 do
+        local head
+        for j = 1, i % 5 do head = append({}, head) end
+    end";
+    let ir = ir_of(src, "append", 0);
+    assert!(!ir.contains("Type after"), "{ir}");
+}
