@@ -1088,6 +1088,11 @@ impl<'gc> Shape<'gc> {
             .map(|i| i as u32)
     }
 
+    /// The live child that adds `key`, if a table took that edge.
+    pub fn prop_child(self, mc: &Mutation<'gc>, key: LuaString<'gc>) -> Option<Shape<'gc>> {
+        self.data().transitions.borrow().get(mc, EdgeKey::Prop(key))
+    }
+
     /// Returns `true` if the metatable behind this shape currently has
     /// `bit` set in its live metamethod bitset. With no metatable,
     /// always `false`. The bitset is updated eagerly by writes to the

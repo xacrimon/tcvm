@@ -170,13 +170,13 @@ pub(super) fn emit_get<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
         InlineCache::Transition { from, .. } => Some(from),
         InlineCache::Empty => None,
     };
-    match site_shapes(b, first) {
+    match site_shapes(b, first, recv) {
         None => {
             let v = index(b, dst, recv, key);
             b.set(dst, v);
             return;
         }
-        Some(shapes) if shapes.len() > 1 => {
+        Some(shapes) if shapes.len() > 1 || first.is_none() && !shapes.is_empty() => {
             get_chain(b, dst, &site, &shapes);
             return;
         }
@@ -222,18 +222,53 @@ struct Site<'gc> {
     kid: u32,
 }
 
-/// The shapes a site's shape exits recorded, with the cache's first; `None`
-/// past `MAX_SHAPES`, a site left to the helper (6.4).
-fn site_shapes<'gc>(b: &Builder<'_, 'gc>, first: Option<Shape<'gc>>) -> Option<Vec<Shape<'gc>>> {
+/// The shapes a site tests for: its cache's first, those its shape exits
+/// recorded, then, while there is room, those earlier sites tested on the
+/// same receiver value, which it most likely has here too. `None` past
+/// `MAX_SHAPES` or for a dict shape, a site left to the helper (6.4).
+fn site_shapes<'gc>(
+    b: &mut Builder<'_, 'gc>,
+    first: Option<Shape<'gc>>,
+    recv: Val,
+) -> Option<Vec<Shape<'gc>>> {
+    const MAX: usize = crate::jit::MAX_SHAPES;
+    let has = |v: &[Shape<'gc>], s| v.iter().any(|&x| Shape::ptr_eq(x, s));
     let mut v: Vec<Shape<'gc>> = first.into_iter().collect();
-    if let Some(st) = b.closure.proto.jit.get() {
-        for &(pc, s) in &st.borrow().shapes_seen {
-            if pc == b.pc && !v.iter().any(|&x| Shape::ptr_eq(x, s)) {
+    let state = crate::jit::state::jit_state(b.ctx.mutation(), b.closure.proto);
+    let mut st = state.borrow_mut(b.ctx.mutation());
+    let mut seen = 0;
+    for &(pc, s) in &st.shapes_seen {
+        if pc == b.pc {
+            seen += 1;
+            if !has(&v, s) {
                 v.push(s);
             }
         }
     }
-    (v.len() <= crate::jit::MAX_SHAPES).then_some(v)
+    // The interpreter refills the cache after an exit, so its shape now is
+    // kept: dropped, the next compile would exit on it again.
+    if let Some(f) = first
+        && v.len() > seen
+        && seen <= MAX
+    {
+        st.shapes_seen.push((b.pc, f));
+    }
+    drop(st);
+    if v.len() > MAX || v.iter().any(|s| s.is_dict()) {
+        return None;
+    }
+    let known = b.recv_shapes.entry(recv).or_default();
+    for &s in known.iter() {
+        if v.len() < MAX && !has(&v, s) {
+            v.push(s);
+        }
+    }
+    for &s in &v {
+        if !has(known, s) {
+            known.push(s);
+        }
+    }
+    Some(v)
 }
 
 /// `dst = t.key` from the own slot at `loc`.
@@ -313,7 +348,7 @@ fn get_chain<'gc>(b: &mut Builder<'_, 'gc>, dst: u8, site: &Site<'gc>, shapes: &
     let t = table_of(b, site.recv);
     let key = site.kv.get_string().unwrap();
     let join = b.new_block();
-    for &s in shapes.iter().filter(|s| !s.is_dict()) {
+    for &s in shapes {
         let k = b.intern_shape(s);
         let is = b.ins(Op::ShapeIs(k), &[t]);
         let next = branch_arm(b, is);
@@ -349,24 +384,32 @@ pub(super) fn emit_set<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
         InlineCache::Transition { from, .. } => Some(from),
         InlineCache::Empty => None,
     };
-    match site_shapes(b, first) {
+    match site_shapes(b, first, recv) {
         None => {
             newindex(b, recv, key, v, false);
             return;
         }
-        Some(shapes) if shapes.len() > 1 => {
-            // A test per shape: its own slot, or the generic store.
+        Some(shapes) if shapes.len() > 1 || first.is_none() && !shapes.is_empty() => {
+            // A test per shape: what the interpreter's cache would hold for it.
             let t = table_of(b, recv);
             let ks = kv.get_string().unwrap();
             let join = b.new_block();
-            for &s in shapes.iter().filter(|s| !s.is_dict()) {
+            for &s in &shapes {
                 let k = b.intern_shape(s);
                 let is = b.ins(Op::ShapeIs(k), &[t]);
                 let next = branch_arm(b, is);
-                match s.find_slot(ks) {
-                    Some(slot) => own_store(b, s, t, SlotLoc::new(s, slot), kid, v),
-                    None => newindex(b, recv, key, v, false),
+                // A store to a metatable's mirrored key tells its class.
+                let tells = s.as_mt().is_some() && crate::env::shape::mirrored(ks);
+                match (s.find_slot(ks), s.prop_child(b.ctx.mutation(), ks)) {
+                    _ if tells => newindex(b, recv, key, v, false),
+                    (Some(slot), _) => own_store(b, s, t, SlotLoc::new(s, slot), kid, v),
+                    (None, Some(to)) if !to.is_dict() => {
+                        let loc = SlotLoc::new(to, s.slot_count());
+                        trans_store(b, recv, key, s, to, t, loc, kid, v);
+                    }
+                    (None, _) => newindex(b, recv, key, v, false),
                 }
+                b.flush();
                 b.jump(join);
                 b.switch_to(next);
             }
@@ -385,57 +428,64 @@ pub(super) fn emit_set<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
         InlineCache::Transition { from, to, loc } => {
             let t = table_of(b, recv);
             guard_shape(b, t, from);
-            if let Some(has) = class_has(b, from, MetamethodBits::NEWINDEX) {
-                let s = b.snap_before();
-                b.ins_snap(Op::GuardFalse, &[has], s, ExitTag::Slow);
-            }
-            let join = b.new_block();
-            // Storing nil to an absent key adds nothing.
-            let set = b.ty(v).set;
-            if set.is_empty() || set.contains(TypeSet::NIL) {
-                let nil = b.ins(Op::IsType(TypeSet::NIL), &[v]);
-                let store = branch_arm(b, nil);
-                b.jump(join);
-                b.switch_to(store);
-            }
-            if loc.spilled() {
-                // A full spill cell grows in the generic store.
-                let room = b.ins(Op::TabHasRoom(loc.raw()), &[t]);
-                let full = branch_arm(b, room);
-                b.push(Op::Barrier, &[t]);
-                b.push(
-                    Op::TabStore {
-                        loc: loc.raw(),
-                        key: kid,
-                    },
-                    &[t, v],
-                );
-                let k = b.intern_shape(to);
-                b.push(Op::TabSetShape(k), &[t]);
-                b.jump(join);
-                b.switch_to(full);
-                newindex(b, recv, key, v, false);
-                b.jump(join);
-            } else {
-                // The table now refers to `to` as well as to `v`.
-                b.push(Op::Barrier, &[t]);
-                b.push(
-                    Op::TabStore {
-                        loc: loc.raw(),
-                        key: kid,
-                    },
-                    &[t, v],
-                );
-                let k = b.intern_shape(to);
-                b.push(Op::TabSetShape(k), &[t]);
-                b.jump(join);
-            }
-            enter_join(b, join);
+            trans_store(b, recv, key, from, to, t, loc, kid, v);
         }
         InlineCache::Absent { .. } | InlineCache::ProtoLoad { .. } | InlineCache::Empty => {
             newindex(b, recv, key, v, false);
         }
     }
+}
+
+/// `t.key = v` for a table of shape `from` that lacks the key: `to` with
+/// the key at `loc`, as the interpreter's transition takes it.
+#[allow(clippy::too_many_arguments)]
+fn trans_store<'gc>(
+    b: &mut Builder<'_, 'gc>,
+    recv: Val,
+    key: Val,
+    from: Shape<'gc>,
+    to: Shape<'gc>,
+    t: Val,
+    loc: SlotLoc,
+    kid: u32,
+    v: Val,
+) {
+    if let Some(has) = class_has(b, from, MetamethodBits::NEWINDEX) {
+        let s = b.snap_before();
+        b.ins_snap(Op::GuardFalse, &[has], s, ExitTag::Slow);
+    }
+    let join = b.new_block();
+    // Storing nil to an absent key adds nothing.
+    let set = b.ty(v).set;
+    if set.is_empty() || set.contains(TypeSet::NIL) {
+        let nil = b.ins(Op::IsType(TypeSet::NIL), &[v]);
+        let store = branch_arm(b, nil);
+        b.jump(join);
+        b.switch_to(store);
+    }
+    // A full spill cell grows in the generic store.
+    let full = loc.spilled().then(|| {
+        let room = b.ins(Op::TabHasRoom(loc.raw()), &[t]);
+        branch_arm(b, room)
+    });
+    // The table now refers to `to` as well as to `v`.
+    b.push(Op::Barrier, &[t]);
+    b.push(
+        Op::TabStore {
+            loc: loc.raw(),
+            key: kid,
+        },
+        &[t, v],
+    );
+    let k = b.intern_shape(to);
+    b.push(Op::TabSetShape(k), &[t]);
+    b.jump(join);
+    if let Some(full) = full {
+        b.switch_to(full);
+        newindex(b, recv, key, v, false);
+        b.jump(join);
+    }
+    enter_join(b, join);
 }
 
 /// `t.key = v` into the own slot at `loc`, `__newindex` checked live where
