@@ -6,6 +6,7 @@
 pub(crate) mod cfg;
 mod emit;
 mod intrinsics;
+mod iter;
 mod tables;
 
 use crate::dmm::Gc;
@@ -69,6 +70,7 @@ struct BlockState {
 }
 
 pub(crate) struct Builder<'a, 'gc> {
+    pub(crate) ctx: crate::lua::Context<'gc>,
     pub(crate) f: Func<'gc>,
     pub(crate) closure: LuaFn<'gc>,
     pub(crate) proto: Gc<'gc, Prototype<'gc>>,
@@ -96,7 +98,13 @@ pub(crate) struct Builder<'a, 'gc> {
 }
 
 impl<'a, 'gc> Builder<'a, 'gc> {
-    pub(crate) fn new(closure: LuaFn<'gc>, cfg: &'a Cfg, entry_pc: u32, loop_entry: bool) -> Self {
+    pub(crate) fn new(
+        ctx: crate::lua::Context<'gc>,
+        closure: LuaFn<'gc>,
+        cfg: &'a Cfg,
+        entry_pc: u32,
+        loop_entry: bool,
+    ) -> Self {
         let proto = closure.proto;
         let meta = RegionMeta {
             entry_pc,
@@ -104,6 +112,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             max_stack: proto.max_stack_size,
         };
         Builder {
+            ctx,
             f: Func::new(meta),
             closure,
             proto,
@@ -591,6 +600,14 @@ impl<'a, 'gc> Builder<'a, 'gc> {
                 self.set_slot(self.cur, r, SlotState::Holds(root));
             }
         }
+    }
+
+    /// `r` loaded from its home slot, which a helper wrote.
+    pub(crate) fn reload(&mut self, r: u8) -> Val {
+        let v = self.ins(Op::Load(r), &[]);
+        self.set_def(self.cur, r, v);
+        self.set_slot(self.cur, r as usize, SlotState::Holds(v));
+        v
     }
 
     /// Leave for the interpreter at the instruction being emitted.

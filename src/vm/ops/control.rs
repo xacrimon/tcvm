@@ -18,7 +18,7 @@ use crate::vm::ops::meta::{call_chain_error, ret_close, ret_tfor};
 use crate::vm::unwind::OpError;
 
 /// The position slot's mark for an `ipairs` loop (see `op_tforprep`).
-const TFOR_IPAIRS: i32 = -1;
+pub(crate) const TFOR_IPAIRS: i32 = -1;
 
 /// Whether a to-be-closed variable is registered at or above `level`.
 #[inline]

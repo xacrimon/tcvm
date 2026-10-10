@@ -112,6 +112,16 @@ pub(crate) enum HelperId {
     VarargGet,
     /// `-> Val`: `VARARGPREP`'s vararg table, also stored in `R[np]`.
     VarargTable(u8),
+    /// `-> Val`: a `TFORCALL_NEXT` step from the table in `R[a+1]` at the
+    /// position in `R[a+3]`, their slots, into the slots of the position
+    /// and `count` loop variables: 1, 0 at the end, or `HELPER_FAIL_VAL`.
+    TforNext {
+        a: u8,
+        count: u8,
+    },
+    /// `(Val, Val) -> Val`: an `ipairs` step past the array part, `t[k]`:
+    /// the value, nil at the end, or `HELPER_FAIL_VAL` for `__index`.
+    TforIpairs,
     /// `(Val, Val) -> Val`: the metamethod of the bit (`MetamethodBits`)
     /// from the left operand, else the right, as `binop_metamethod` finds
     /// it; nil when neither has one.
@@ -179,6 +189,8 @@ impl HelperId {
             HelperId::SetList { a, n, off } => format!("setlist r{a} n={n} off={off}"),
             HelperId::VarargGet => "varargget".into(),
             HelperId::VarargTable(np) => format!("varargtable r{np}"),
+            HelperId::TforNext { a, count } => format!("tfornext r{a} count={count}"),
+            HelperId::TforIpairs => "tforipairs".into(),
             HelperId::Index => "index".into(),
             HelperId::Mm(bit) => format!("mm {bit:#x}"),
             HelperId::IndexFn => "index_fn".into(),
@@ -250,6 +262,14 @@ impl HelperId {
                 Some(Val),
                 alloc | Effects::W_SHAPE | Effects::W_META,
             ),
+            HelperId::TforNext { a, count } => (
+                BASE,
+                Some(a as u64 | (count as u64) << 8),
+                &[],
+                Some(Val),
+                alloc | Effects::R_SLOT | Effects::W_SLOT,
+            ),
+            HelperId::TforIpairs => (RT, None, &[Val, Val], Some(Val), alloc),
             HelperId::Index => (
                 RT,
                 None,
@@ -499,12 +519,15 @@ pub(crate) enum Op {
         a: u8,
         n: u8,
     },
-    /// Call a metamethod, the first operand, with the rest as arguments,
-    /// from a header past the frame's registers (`stage_mm!`); edge 0 is
-    /// the resume block, which takes one result.
+    /// Call the first operand with the rest as arguments from a header past
+    /// the frame's registers (`stage_mm!`): a metamethod or a generic `for`'s
+    /// iterator. Edge 0 is the resume block, which takes `c - 1` results,
+    /// landed from `R[land]` when more than two.
     CallMm {
         pc: u32,
         nargs: u8,
+        land: u8,
+        c: u8,
     },
     /// Exits unless a metamethod call's header and `n` arguments fit below
     /// the stack's end.

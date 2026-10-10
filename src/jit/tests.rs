@@ -27,6 +27,7 @@ pub(crate) fn ir_of(src: &str, name: &str, pc: u32) -> String {
             deopt_all: false,
         };
         match crate::jit::compile::build_ir(
+            ctx,
             lf,
             pc,
             &opts,

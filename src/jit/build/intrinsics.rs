@@ -24,13 +24,15 @@ enum Intrinsic {
     Ceil,
     Abs,
     Assert,
+    Pairs,
+    Ipairs,
 }
 
 /// The intrinsic of a builtin, known by its fast entry (each builtin with
 /// one has its own).
 fn intrinsic_of(f: Function<'_>) -> Option<Intrinsic> {
     let entry = f.as_native()?.entry as usize;
-    let table: [(Handler, Intrinsic); 7] = [
+    let table: [(Handler, Intrinsic); 9] = [
         (ff::ff_sqrt, Intrinsic::Sqrt),
         (ff::ff_sin, Intrinsic::Sin),
         (ff::ff_cos, Intrinsic::Cos),
@@ -38,6 +40,8 @@ fn intrinsic_of(f: Function<'_>) -> Option<Intrinsic> {
         (ff::ff_ceil, Intrinsic::Ceil),
         (ff::ff_abs, Intrinsic::Abs),
         (ff::ff_assert, Intrinsic::Assert),
+        (crate::vm::native::ff_pairs, Intrinsic::Pairs),
+        (crate::vm::native::ff_ipairs, Intrinsic::Ipairs),
     ];
     table
         .iter()
@@ -84,19 +88,55 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: 
         return false;
     };
     let nargs = nb - 1;
+    let iterators = matches!(intr, Intrinsic::Pairs | Intrinsic::Ipairs);
     // An exit saw an argument the inline code does not take.
     let seen = b.feedback(pc) & fb::KINDS;
-    if intr != Intrinsic::Assert && seen & !(fb::SMALL | fb::FLOAT) != 0 {
+    let numbers = !matches!(intr, Intrinsic::Assert) && !iterators;
+    if numbers && seen & !(fb::SMALL | fb::FLOAT) != 0 {
         return false;
     }
-    // One result or none; MULTRET wants `top`.
-    if c == 0 || c > 2 || (intr != Intrinsic::Assert && nargs != 1) || nargs == 0 {
+    // A tail call or MULTRET wants all results; the iterators make up to
+    // four, the others one.
+    let tail = insn.op() == crate::instruction::Op::TAILCALL;
+    if c == 0
+        || (c > 2 && !iterators)
+        || (iterators && (tail || c > 5))
+        || (intr != Intrinsic::Assert && nargs != 1)
+        || nargs == 0
+    {
         return false;
     }
     let k = b.konst(Value::function(f));
     let cv = b.boxed(callee);
     b.ins_exit(Op::GuardSame, &[cv, k], ExitTag::Type);
     let x = b.reg(a + 4);
+    if iterators {
+        let x = b.boxed(x);
+        let (iter, control) = if intr == Intrinsic::Pairs {
+            // A table without `__pairs` (`ff_pairs`).
+            let t = b.guard(x, TypeSet::TAB);
+            let mm = b.ins(
+                Op::Helper(HelperId::Mm(crate::env::MetamethodBits::PAIRS.bits())),
+                &[t, t],
+            );
+            let none = b.ins(Op::IsType(TypeSet::NIL), &[mm]);
+            let s = b.snap_before();
+            b.ins_snap(Op::GuardTrue, &[none], s, ExitTag::Slow);
+            (b.ctx.next_fn(), Value::nil())
+        } else {
+            (b.ctx.ipairs_iter(), Value::small(0))
+        };
+        let results = [
+            b.konst(Value::function(iter)),
+            x,
+            b.konst(control),
+            b.konst(Value::nil()),
+        ];
+        for (k, &r) in results.iter().take(c as usize - 1).enumerate() {
+            b.set(a + k as u8, r);
+        }
+        return true;
+    }
     let r = match intr {
         Intrinsic::Sqrt | Intrinsic::Sin | Intrinsic::Cos => {
             let x = number_f64(b, x);
@@ -157,6 +197,7 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: 
                 return true;
             }
         }
+        Intrinsic::Pairs | Intrinsic::Ipairs => unreachable!("returned above"),
         Intrinsic::Assert => {
             // A falsy one raises in the builtin.
             let xv = b.boxed(x);
