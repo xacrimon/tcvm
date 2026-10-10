@@ -93,7 +93,9 @@ pub(crate) fn image_index(p: PReg) -> u8 {
 
 /// Image word of the first spill slot.
 pub(crate) const IMAGE_SPILLS: usize = 64;
-const _: () = assert!(IMAGE_SPILLS + 64 <= EXIT_REGS);
+/// The spill slots a region may have, all copied to the image.
+pub(crate) const MAX_SPILLS: usize = 256;
+const _: () = assert!(IMAGE_SPILLS + MAX_SPILLS <= EXIT_REGS);
 
 /// Entered from a region's exit trampoline with x16 = region | exit << 48
 /// and the region's frame still open: stores the register image in

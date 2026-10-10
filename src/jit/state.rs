@@ -20,7 +20,7 @@ pub(crate) const MAX_STRIKES: u8 = 3;
 pub(crate) const EXIT_HOT: u32 = 10;
 /// Words of the register image `exit_common` writes: x0-x15, x19-x21,
 /// x26-x28, d0-d31, then the region's spill slots from word 64.
-pub(crate) const EXIT_REGS: usize = 128;
+pub(crate) const EXIT_REGS: usize = 320;
 
 /// Settings read from the environment when a `Lua` is created.
 #[derive(Clone, Debug)]
