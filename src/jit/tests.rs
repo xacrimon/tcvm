@@ -153,3 +153,41 @@ fn forms_drop_on_foreign_kinds() {
     );
     assert!(ops.contains(&Op::JLT) && !ops.contains(&Op::JLT_II));
 }
+
+/// A `while` loop's entry points its back edge at the `JIT_LOOP` over its
+/// `LOOP`, and retiring the entry points it past the `LOOP` again.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn back_edges_follow_loop_entries() {
+    use crate::instruction::Op;
+    let mut lua = Lua::new();
+    lua.set_jit(true);
+    lua.load_all();
+    let ex = lua
+        .try_enter(|ctx| -> Result<_, LoadError> {
+            let chunk = ctx.load(
+                "function f(n) local i = 0 while i < n do i = i + 1 end return i end
+                f(1000)",
+                Some("=t"),
+            )?;
+            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+        })
+        .expect("load");
+    lua.finish(&ex).expect("run");
+    lua.enter(|ctx| {
+        let f = ctx.globals().raw_get(Value::string(LuaString::new(ctx, b"f")));
+        let lf = f.get_function().and_then(|f| f.as_lua()).unwrap();
+        let code = |pc: usize| lf.proto.code.iter().nth(pc).unwrap();
+        let n = lf.proto.code.len();
+        let header = (0..n).find(|&pc| code(pc).op() == Op::JIT_LOOP).expect("a loop entry");
+        let back = (0..n).find(|&pc| code(pc).op() == Op::JMP_BACK).unwrap();
+        let target = |pc: usize| (pc as i64 + 1 + code(pc).branch_offset() as i64) as usize;
+        assert_eq!(target(back), header);
+        let state = lf.proto.jit.get().unwrap();
+        let e = state.borrow_mut(ctx.mutation()).entries.remove(0);
+        assert_eq!(&*e.back_edges, &[back as u32]);
+        super::retire_entry(ctx, lf, &e);
+        assert_eq!(code(header).op(), Op::LOOP);
+        assert_eq!(target(back), header + 1);
+    });
+}

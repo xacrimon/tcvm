@@ -94,9 +94,9 @@ pub(super) fn always_deopts(b: &Builder<'_, '_>, pc: u32) -> bool {
     let insn = b.code(pc);
     use BcOp::*;
     match insn.op() {
-        MOVE | LOAD | LOADI | LOADNIL | LFALSESKIP | GETUPVAL | NOP | FUNC | LOOP | JMP | NOT
-        | ERRNNIL | JT | JF | JTSET | JFSET | RETURN0 | RETURN1 | FORLOOP_I | FORLOOP_F
-        | FORLOOP | JEQS | JNEQS => false,
+        MOVE | LOAD | LOADI | LOADNIL | LFALSESKIP | GETUPVAL | NOP | FUNC | LOOP | JMP
+        | JMP_BACK | NOT | ERRNNIL | JT | JF | JTSET | JFSET | RETURN0 | RETURN1 | FORLOOP_I
+        | FORLOOP_F | FORLOOP | JEQS | JNEQS => false,
         VARARGPREP => b.proto.needs_vararg_table,
         RETURN => insn.b() == 0,
         CALL | CALL_R0 | CALL_R1 | CALLS | CALLS_R0 | CALLS_R1 => insn.b() == 0,
@@ -160,7 +160,7 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
     match insn.op() {
         NOP | FUNC | LOOP => {}
         VARARGPREP => {}
-        JMP => b.jump(succs[0]),
+        JMP | JMP_BACK => b.jump(succs[0]),
         MOVE => {
             let v = b.reg(rb);
             b.set(a, v);

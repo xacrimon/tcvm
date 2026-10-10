@@ -2041,15 +2041,14 @@ fn compile_goto(ctx: &mut Ctx, item: Goto) -> Result<(), CompileError> {
         .iter()
         .rev()
         .find_map(|labels| labels.get(&name).copied());
-    let label = match backward {
+    match backward {
         // Backward jump: close whatever locals it leaves (luac `gotostat`).
         Some(VisibleLabel { label, nactvar, .. }) => {
             if ctx.chunk.nactvar > nactvar {
                 ctx.emit(Instruction::close(Reg(nactvar)));
             }
             // A backward goto's loop counts at its latch, as LuaJIT's.
-            ctx.emit(Instruction::loop_(0));
-            label
+            ctx.emit_jump_instr(label, Instruction::jmp_back(0, Offset(0)));
         }
         None => {
             let label = ctx.new_label();
@@ -2061,11 +2060,9 @@ fn compile_goto(ctx: &mut Ctx, item: Goto) -> Result<(), CompileError> {
                 ndecls: ctx.decls.len(),
                 needs_close: false,
             });
-            label
+            ctx.emit_jump(label);
         }
-    };
-    ctx.emit_jump(label);
-
+    }
     Ok(())
 }
 
@@ -4536,9 +4533,10 @@ fn compile_branch_cond_false(ctx: &mut Ctx, cond_expr: Expr) -> Result<JumpList,
 
 fn compile_while(ctx: &mut Ctx, item: While) -> Result<(), CompileError> {
     scope_lexical_break(ctx, |ctx| {
+        // The back edge counts and skips the `LOOP`, the entry's patch site.
+        ctx.emit(Instruction::loop_(0));
         let loop_start = ctx.new_label();
         ctx.set_label(loop_start, ctx.next_offset());
-        ctx.emit(Instruction::loop_(0));
 
         let cond_expr = item.cond().ok_or_else(|| ice("while without condition"))?;
         let break_list = compile_branch_cond_false(ctx, cond_expr)?;
@@ -4555,7 +4553,7 @@ fn compile_while(ctx: &mut Ctx, item: While) -> Result<(), CompileError> {
         })?;
 
         // Jump back to condition check
-        ctx.emit_jump(loop_start);
+        ctx.emit_jump_instr(loop_start, Instruction::jmp_back(0, Offset(0)));
 
         // Patch all "condition false" jumps to the post-loop break target.
         let (break_label, _) = *ctx
@@ -4860,8 +4858,9 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
         // TFORPREP: jump to the test
         ctx.emit_jump_instr(loop_test, Instruction::tforprep(base, Offset(0)));
 
-        ctx.set_label(loop_body, ctx.next_offset());
+        // Only an entry's back edge reaches the `LOOP`: TFORLOOP's skips it.
         ctx.emit(Instruction::loop_(0));
+        ctx.set_label(loop_body, ctx.next_offset());
 
         // Loop variables live in the body scope (see `compile_for_num`).
         scope_lexical(ctx, |ctx| {

@@ -28,7 +28,7 @@ expression: output
 0015  [ 17]  CONCAT          R5 R5 R6
 0016  [ 17]  CONCAT          R3 R4 R5
 0017  [ 20]  ADDI            R1 R1 #1
-0018  [ 20]  JMP             -13
+0018  [ 20]  JMP_BACK        -12
 0019  [ 23]  GETTABUP        R4 U0 K2  ; "print"
 0020  [ 23]  MOVE            R8 R3
 0021  [ 23]  CALL_R0         R4 args=2

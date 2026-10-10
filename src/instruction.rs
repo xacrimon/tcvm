@@ -1123,16 +1123,21 @@ instructions! {
     // --- JIT entries -----------------------------------------------------------
     //
     // `FUNC` is pc 0 of every prototype and `LOOP` the header of every
-    // `while`, `repeat` and generic `for` loop (and the latch of a backward
-    // `goto`, as LuaJIT's `BC_LOOP`); each counts on hot counter `hot`. A
-    // compiled entry overwrites the word with `JIT_ENTRY`/`JIT_LOOP`, whose
-    // `entry` indexes the runtime's entry table; numeric loops count in their
-    // `FORLOOP` (`b`) and are overwritten there.
+    // `while`, `repeat` and generic `for` loop: the words a compiled entry
+    // overwrites with `JIT_ENTRY`/`JIT_LOOP`, whose `entry` indexes the
+    // runtime's entry table. Each counting site has a hot counter `hot`:
+    // calls count the callee's `FUNC` at the call, a `repeat` loop its
+    // `LOOP`; `while` and generic `for` loops count at their back edge
+    // (`JMP_BACK`, `TFORLOOP`'s `b`), which jumps past the `LOOP` until an
+    // entry is installed there; numeric loops count in their `FORLOOP` (`b`)
+    // and are overwritten there, as is the `JMP_BACK` of a backward `goto`
+    // (its loop's latch, as LuaJIT's `BC_LOOP` at the `goto`).
 
     0xcc FUNC         func        A      { hot: u8 }
     0xcd LOOP         loop_       A      { hot: u8 }
     0xce JIT_ENTRY    jit_entry   Ad     { hot: u8, entry: u16 }
     0xcf JIT_LOOP     jit_loop    Ad     { hot: u8, entry: u16 }
+    0xd0 JMP_BACK     jmp_back    AImm   { hot: u8, offset: Offset }
 }
 
 /// The polymorphic family an opcode belongs to.
@@ -2340,11 +2345,12 @@ pub const HOT_COUNTERS: usize = 64;
 
 impl Instruction {
     /// The hot counter a counting instruction decrements: `a` of `FUNC`,
-    /// `LOOP` and the JIT words, `b` of a `FORLOOP` form. For the slow
-    /// paths: a handler knows its byte (`count_hot!`).
+    /// `LOOP`, `JMP_BACK` and the JIT words, `b` of a `FORLOOP` form and
+    /// `TFORLOOP`. For the slow paths: a handler knows its byte
+    /// (`count_hot!`).
     pub(crate) fn hot_counter(self) -> usize {
         let i = match self.op() {
-            Op::FORLOOP | Op::FORLOOP_I | Op::FORLOOP_F => self.b(),
+            Op::FORLOOP | Op::FORLOOP_I | Op::FORLOOP_F | Op::TFORLOOP => self.b(),
             _ => self.a(),
         };
         i as usize % HOT_COUNTERS

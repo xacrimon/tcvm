@@ -29,7 +29,7 @@ expression: output
 0016  [  4]  CLOSURE         R3 P1
 0017  [  4]  SETTABLE        R3 R0 R1
 0018  [  4]  CLOSE           R2
-0019  [  4]  JMP             -8
+0019  [  4]  JMP_BACK        -7
 0020  [  5]  LOOP
 0021  [  5]  MOVE            R2 R1
 0022  [  5]  CLOSURE         R3 P2
@@ -49,7 +49,7 @@ expression: output
 0036  [  6]  SETTABLE        R8 R0 R7
 0037  [  6]  CLOSE           R6
 0038  [  6]  TFORCALL        R2 count=2
-0039  [  6]  TFORLOOP        R2 -6
+0039  [  6]  TFORLOOP        R2 -5
 0040  [  6]  CLOSE           R4
 0041  [  7]  LOADI           R2 1
 0042  [  7]  CLOSURE         R3 P4

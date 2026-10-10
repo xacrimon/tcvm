@@ -272,6 +272,10 @@ fn format_instruction(instr: &Instruction, proto: &Prototype<'_>) -> String {
             let offset = instr.branch_offset();
             format!("JMP             {offset:+}")
         }
+        Op::JMP_BACK => {
+            let offset = instr.branch_offset();
+            format!("JMP_BACK        {offset:+}")
+        }
         Op::JEQ | Op::JNEQ | Op::JLT | Op::JNLT | Op::JLE | Op::JNLE => {
             let (lhs, rhs, offset) = instr.ab_offset();
             format!("{:<15} R{lhs} R{rhs} {offset:+}", instr.op().name())

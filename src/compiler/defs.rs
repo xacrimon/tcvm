@@ -325,7 +325,12 @@ impl<'gc> Chunk<'gc> {
             assert!(
                 matches!(
                     instr.op(),
-                    Op::JMP | Op::FORPREP | Op::FORLOOP | Op::TFORPREP | Op::TFORLOOP
+                    Op::JMP
+                        | Op::JMP_BACK
+                        | Op::FORPREP
+                        | Op::FORLOOP
+                        | Op::TFORPREP
+                        | Op::TFORLOOP
                 ) || instr.op().branch_sense().is_some(),
                 "jump patch on non-jump instruction: {instr:?}"
             );
@@ -385,8 +390,8 @@ impl<'gc> Chunk<'gc> {
         // Hot counters round-robin over the chunk's counting instructions.
         for instr in &mut self.tape {
             match instr.op() {
-                Op::FUNC | Op::LOOP => instr.set_a(next_hot(hot)),
-                Op::FORLOOP => instr.set_b(next_hot(hot)),
+                Op::FUNC | Op::LOOP | Op::JMP_BACK => instr.set_a(next_hot(hot)),
+                Op::FORLOOP | Op::TFORLOOP => instr.set_b(next_hot(hot)),
                 _ => {}
             }
         }
