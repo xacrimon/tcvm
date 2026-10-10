@@ -82,7 +82,7 @@ impl<'gc> Context<'gc> {
     /// Hot counter `i` (< `HOT_COUNTERS`).
     #[inline(always)]
     pub(crate) fn hot_counter(self, i: usize) -> &'gc std::cell::Cell<u16> {
-        // SAFETY: callers pass `Instruction::hot_counter`, which is in range.
+        // SAFETY: callers reduce `i` modulo `HOT_COUNTERS`.
         unsafe { self.state.jit.hot.get_unchecked(i) }
     }
 

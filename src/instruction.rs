@@ -2340,8 +2340,8 @@ pub const HOT_COUNTERS: usize = 64;
 
 impl Instruction {
     /// The hot counter a counting instruction decrements: `a` of `FUNC`,
-    /// `LOOP` and the JIT words, `b` of a `FORLOOP` form.
-    #[inline(always)]
+    /// `LOOP` and the JIT words, `b` of a `FORLOOP` form. For the slow
+    /// paths: a handler knows its byte (`count_hot!`).
     pub(crate) fn hot_counter(self) -> usize {
         let i = match self.op() {
             Op::FORLOOP | Op::FORLOOP_I | Op::FORLOOP_F => self.b(),
