@@ -244,3 +244,37 @@ fn upvalues_and_closures() {
 "#,
     );
 }
+
+/// Fixed-count VARARG and VARARGGET read the extras below the header, nil
+/// past them; vararg tables, NEWTABLE and SETLIST go through helpers. A
+/// definition guard on an extra waits for its instruction's other results,
+/// and a missing extra (nil) does not get one from a use behind `or`.
+#[test]
+fn varargs_and_constructors() {
+    agrees(
+        r#"
+        local function first3(...)
+          local a, b, c = ...
+          return (a or 0) + (b or 0) + (c or 0)
+        end
+        local function pick(k, ...t) return t[k], t.n end
+        local function keep(...t) return t end
+        local function mk(i)
+          local t = {i, i * 2, i * 3, x = i, [10] = 5, "s" .. i}
+          return t[1] + t[2] + t[3] + t.x + t[10] + #t
+        end
+        local s, acc = 0, {}
+        for i = 1, 600 do
+          if i % 3 == 0 then s = s + first3(i)
+          elseif i % 3 == 1 then s = s + first3(i, 1)
+          else s = s + first3(i, 2, 3, 4, 5) end
+          local v, n = pick(i % 5, "a", "b", "c")
+          local w = pick((i % 3) + 0.0, 10, 20)
+          if i > 594 then acc[#acc + 1] = tostring(v) .. "/" .. n .. "/" .. tostring(w) end
+          local t = keep(i, i + 1)
+          s = s + t[2] + t.n + mk(i)
+        end
+        return s .. " " .. table.concat(acc, " ")
+"#,
+    );
+}

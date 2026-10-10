@@ -104,7 +104,10 @@ pub(super) fn always_deopts(b: &Builder<'_, '_>, pc: u32) -> bool {
         | JMP_BACK | NOT | ERRNNIL | JT | JF | JTSET | JFSET | RETURN0 | RETURN1 | FORLOOP_I
         | FORLOOP_F | FORLOOP | JEQS | JNEQS | LEN | CONCAT | GETUPVAL_REF | SETUPVAL | CLOSURE
         | CLOSE => false,
-        VARARGPREP => b.proto.needs_vararg_table,
+        // A vararg table makes VARARG read it, and MULTRET sets `top`.
+        VARARG => b.proto.needs_vararg_table || insn.b() == 0,
+        VARARGPREP | VARARGGET | NEWTABLE => false,
+        SETLIST => insn.b() == 0,
         RETURN => insn.b() == 0,
         CALL | CALL_R0 | CALL_R1 | CALLS | CALLS_R0 | CALLS_R1 => insn.b() == 0,
         FORPREP => false,
@@ -166,7 +169,44 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
     let (a, rb) = (insn.a(), insn.b());
     match insn.op() {
         NOP | FUNC | LOOP => {}
-        VARARGPREP => {}
+        VARARGPREP => {
+            if b.proto.needs_vararg_table {
+                let np = b.closure.num_params;
+                let t = b.ins(Op::Helper(HelperId::VarargTable(np)), &[]);
+                b.set(np, t);
+            }
+        }
+        VARARG => {
+            let nv = b.ins(Op::NumVarargs, &[]);
+            let vals: Vec<Val> = (0..rb - 1).map(|k| b.ins(Op::VarargAt(k), &[nv])).collect();
+            for (k, &v) in vals.iter().enumerate() {
+                b.set(a + k as u8, v);
+            }
+            b.note_def(&vals, None);
+        }
+        VARARGGET => {
+            let key = b.reg(insn.c());
+            let v = if num_kind(b, key) == Some(CmpAs::I32) {
+                let nv = b.ins(Op::NumVarargs, &[]);
+                let k = b.as_i32(key);
+                b.ins(Op::VarargIdx, &[nv, k])
+            } else {
+                let key = b.boxed(key);
+                b.ins(Op::Helper(HelperId::VarargGet), &[key])
+            };
+            b.set(a, v);
+            b.note_def(&[v], None);
+        }
+        NEWTABLE => {
+            let t = b.ins(Op::Helper(HelperId::NewTable(insn.d())), &[]);
+            b.set(a, t);
+        }
+        SETLIST => {
+            // The helper reads the table and the items from their slots.
+            b.store_regs(a as usize..=a as usize + rb as usize);
+            let off = insn.d() as u32;
+            b.push(Op::Helper(HelperId::SetList { a, n: rb, off }), &[]);
+        }
         JMP | JMP_BACK => b.jump(succs[0]),
         MOVE => {
             let v = b.reg(rb);

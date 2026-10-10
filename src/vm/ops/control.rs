@@ -56,6 +56,57 @@ fn close_upvalues_slow<'gc>(mc: &Mutation<'gc>, ts: &mut ThreadState<'gc>, level
     }
 }
 
+/// The vararg of the frame at `base` that `key` names: an integer key
+/// `1..=nv` (an integral float too, as GETTABLE of an escaped vararg would
+/// take it), `"n"` the count, else nil.
+#[inline(always)]
+pub(crate) fn vararg_get<'gc>(
+    ctx: Context<'gc>,
+    base: *mut Value<'gc>,
+    key: Value<'gc>,
+) -> Value<'gc> {
+    let nv = unsafe { frame::nv(base) };
+    let extras = unsafe { base.sub(HDR + nv) };
+    let int_key = key.get_integer().or_else(|| {
+        let f = key.get_float()?;
+        let i = f as i64;
+        (i as f64 == f).then_some(i)
+    });
+    if let Some(k) = int_key {
+        if k >= 1 && (k as usize) <= nv {
+            unsafe { extras.add(k as usize - 1).read() }
+        } else {
+            Value::nil()
+        }
+    } else if key.get_string().is_some_and(|s| s.as_bytes() == b"n") {
+        Value::integer(ctx.mutation(), nv as i64)
+    } else {
+        Value::nil()
+    }
+}
+
+/// `{ extras...; n = count }` of the frame at `base` into `R[np]`
+/// (`createvarargtab`).
+#[inline(always)]
+pub(crate) fn vararg_table<'gc>(ctx: Context<'gc>, base: *mut Value<'gc>, np: usize) -> Table<'gc> {
+    let nv = unsafe { frame::nv(base) };
+    // In the register before filling, so a mid-fill allocation can't
+    // collect the table.
+    let table = Table::new(ctx);
+    unsafe { *base.add(np) = Value::table(table) };
+    let extras = unsafe { base.sub(HDR + nv) };
+    for i in 0..nv {
+        let v = unsafe { extras.add(i).read() };
+        table.raw_set(ctx, Value::integer(ctx.mutation(), i as i64 + 1), v);
+    }
+    table.raw_set(
+        ctx,
+        Value::string(ctx.symbols().n),
+        Value::integer(ctx.mutation(), nv as i64),
+    );
+    table
+}
+
 /// `CLOSURE` of prototype `idx` of `closure`, running at `base`, for `R[dst]`:
 /// by-value upvalues from the frame's slots, shared ones through cells,
 /// opened here (with `HAS_OPEN` set) when the slot has none.
@@ -818,32 +869,7 @@ handler! {
     /// `GETTABLE` at compile time, so `b` is unused here. Lua 5.5 `OP_GETVARG`.
     op fn op_varargget {
         let (dst, _, key) = insn.abc();
-        let key_val = reg![key];
-        let nv = unsafe { frame::nv(base) };
-        let extras = unsafe { base.sub(HDR + nv) };
-        // Normalize integral float keys (`args[1.0]` == `args[1]`) so the
-        // optimized path agrees with the GETTABLE an escaped vararg would use.
-        let int_key = key_val.get_integer().or_else(|| {
-            let f = key_val.get_float()?;
-            let i = f as i64;
-            (i as f64 == f).then_some(i)
-        });
-        let v = if let Some(k) = int_key {
-            if k >= 1 && (k as usize) <= nv {
-                unsafe { extras.add(k as usize - 1).read() }
-            } else {
-                Value::nil()
-            }
-        } else if let Some(s) = key_val.get_string() {
-            if s.as_bytes() == b"n" {
-                Value::integer(rt.mutation(), nv as i64)
-            } else {
-                Value::nil()
-            }
-        } else {
-            Value::nil()
-        };
-        reg![dst] = v;
+        reg![dst] = vararg_get(rt, base, reg![key]);
         next!()
     }
 
@@ -852,18 +878,7 @@ handler! {
     /// `{ extras...; n = count }` into `R[num_params]` (`createvarargtab`).
     op fn op_varargprep {
         if closure.proto.needs_vararg_table {
-            let nv = unsafe { frame::nv(base) };
-            let np = closure.num_params as usize;
-            // Store into the register before filling so a mid-fill allocation
-            // can't collect the table.
-            let table = Table::new(rt);
-            reg![np] = Value::table(table);
-            let extras = unsafe { base.sub(HDR + nv) };
-            for i in 0..nv {
-                let v = unsafe { extras.add(i).read() };
-                table.raw_set(rt, Value::integer(rt.mutation(), i as i64 + 1), v);
-            }
-            table.raw_set(rt, Value::string(rt.symbols().n), Value::integer(rt.mutation(), nv as i64));
+            vararg_table(rt, base, closure.num_params as usize);
             gc_check!();
         }
         next!()

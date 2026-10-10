@@ -180,6 +180,12 @@ pub(crate) enum MInst {
     LoadCell,
     /// `[use c, use v]`: store into an upvalue cell.
     StoreCell,
+    /// `[def d]`: the frame's `nv`.
+    NumVarargs,
+    /// `[def d, use nv]`: extra `k`, or nil when `nv <= k`.
+    VarargAt(u8),
+    /// `[def d, use nv, use k]`: extra `k - 1`, or nil out of range.
+    VarargIdx,
     /// `[snap..]`.
     GcCheck {
         exit: u32,
