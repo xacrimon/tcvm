@@ -1159,7 +1159,7 @@ pub enum Family {
 }
 
 /// The operation of an arithmetic or bitwise opcode, generic or specialized.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArithKind {
     None,
     Add,

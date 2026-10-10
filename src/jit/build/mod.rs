@@ -187,6 +187,9 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     pub(crate) fn new_sealed_succ(&mut self) -> Block {
         let b = self.new_block();
         self.bs[b.idx()].sealed = true;
+        // Its slots start as the current block's end with them.
+        let (n, c) = (self.nregs, self.cur.idx());
+        self.slots.copy_within(c * n..(c + 1) * n, b.idx() * n);
         b
     }
 

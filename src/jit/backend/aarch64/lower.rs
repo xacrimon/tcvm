@@ -10,7 +10,7 @@ use crate::jit::backend::aarch64::abi::{caller_saved, preg_float, preg_int};
 use crate::jit::backend::aarch64::asm::{Asm, Cond, Sz};
 use crate::jit::backend::aarch64::inst::{AluOp, ENTRY_FAIL, FOp, FUnOp, MInst, Test};
 use crate::jit::backend::vcode::VCode;
-use crate::jit::ir::ops::{Cc, ExitTag, HelperId, Op};
+use crate::jit::ir::ops::{Cc, ExitTag, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
 use crate::jit::ir::{Block, ExitKind, Func, Inst, NO_SNAP, Val};
 use crate::jit::region::SRep;
@@ -781,27 +781,33 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 let ops = [self.def(res.unwrap()), self.use_(args[0])];
                 self.push(MInst::FUn(u), &ops, none);
             }
-            Op::Helper(h @ (HelperId::FMod | HelperId::FPow)) => {
-                let r = res.unwrap();
-                let ops = [
-                    Operand::reg_fixed_def(self.vr(r), preg_float(0)),
-                    Operand::reg_fixed_use(self.vr(args[0]), preg_float(0)),
-                    Operand::reg_fixed_use(self.vr(args[1]), preg_float(1)),
-                ];
+            Op::Helper(h) => {
+                // Arguments go in order after the pinned registers and the
+                // immediate, which the emitter moves in at the call.
+                let sig = h.sig();
+                let mut ops = Vec::with_capacity(args.len() + 1);
                 let mut clob = caller_saved();
-                clob.remove(preg_float(0));
-                self.push(MInst::Helper(h), &ops, clob);
-            }
-            Op::Helper(h @ (HelperId::Lt | HelperId::Le | HelperId::Eq)) => {
-                // `rt` goes in x0 at the call.
-                let r = res.unwrap();
-                let ops = [
-                    Operand::reg_fixed_def(self.vr(r), preg_int(0)),
-                    Operand::reg_fixed_use(self.vr(args[0]), preg_int(1)),
-                    Operand::reg_fixed_use(self.vr(args[1]), preg_int(2)),
-                ];
-                let mut clob = caller_saved();
-                clob.remove(preg_int(0));
+                if let Some(r) = res {
+                    let p = if sig.ret == Rep::F64 {
+                        preg_float(0)
+                    } else {
+                        preg_int(0)
+                    };
+                    ops.push(Operand::reg_fixed_def(self.vr(r), p));
+                    clob.remove(p);
+                }
+                let mut xn = (sig.ctx.len() + sig.imm.is_some() as usize) as u8;
+                let mut dn = 0;
+                for &a in &args {
+                    let p = if f.ty(a).rep == Rep::F64 {
+                        dn += 1;
+                        preg_float(dn - 1)
+                    } else {
+                        xn += 1;
+                        preg_int(xn - 1)
+                    };
+                    ops.push(Operand::reg_fixed_use(self.vr(a), p));
+                }
                 self.push(MInst::Helper(h), &ops, clob);
             }
             Op::Resume { c } => {

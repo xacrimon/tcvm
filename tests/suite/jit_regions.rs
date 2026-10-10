@@ -150,3 +150,43 @@ fn generic_compares() {
 "#,
     );
 }
+
+/// Arithmetic sites without a form run inline small-integer and number
+/// cases, then `jit_arith`, whose failure (metamethods, strings, errors)
+/// deopts; `UNM`, `BNOT`, `LEN` and `CONCAT` likewise.
+#[test]
+fn generic_arithmetic() {
+    agrees(
+        r#"
+        local function mix(a, b) return a + b, a - b, a * b, a / b, a % b, a // b, a ^ 2 end
+        local function bits(a, b) return a & b, a | b, a ~ b, a << 3, a >> 2, ~a, a & 2.0 end
+        local function add(a, b) return a + b end
+        local function un(v) return -v end
+        local function ln(v) return #v end
+        local function cc(a, b) return a .. b end
+        local vals = {1, 2.5, -3, 7.25, 2^31, math.maxinteger, math.mininteger, 0.5, -2^40}
+        local ints = {5, 1 << 40, 3, -7, 0x7fffffff, 1 << 62}
+        local mt = setmetatable({}, {__add = function() return 42 end, __unm = function() return 7 end})
+        local s = {}
+        for round = 1, 300 do
+          for i = 1, #vals do
+            local a, b = vals[i], vals[(i % #vals) + 1]
+            local r = {mix(a, b)}
+            if round > 298 then s[#s + 1] = table.concat(r, ",") end
+            s[#s + 1] = tostring(un(a))
+          end
+          for i = 1, #ints do
+            local r = {bits(ints[i], 12)}
+            if round > 298 then s[#s + 1] = table.concat(r, ",") end
+          end
+          local ok, e = pcall(mix, round, round % 50 == 0 and 0 or 3)
+          s[#s + 1] = ok and "ok" or "E"
+          s[#s + 1] = tostring(add(round % 7 == 0 and mt or round, 1.5))
+          s[#s + 1] = tostring(mix(round % 3 == 0 and "10" or round, 2))
+          s[#s + 1] = tostring(un(round % 9 == 0 and mt or round))
+          s[#s + 1] = ln(round % 2 == 0 and "hello" or {1, 2, round}) .. cc(round % 3 == 0 and 1.5 or "x", round)
+        end
+        return table.concat(s, " ")
+"#,
+    );
+}
