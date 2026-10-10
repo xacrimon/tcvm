@@ -13,6 +13,7 @@ use crate::lua::Context;
 use crate::vm::abi::{Exit, handler};
 use crate::vm::frame::{self, HDR, flag, land_results};
 use crate::vm::num;
+use crate::vm::ops::count_hot;
 use crate::vm::ops::meta::{call_chain_error, ret_close, ret_tfor};
 use crate::vm::unwind::OpError;
 
@@ -150,19 +151,6 @@ macro_rules! tfor_finish {
     }};
 }
 
-/// Count on the hot counter of the instruction being run; at zero its
-/// entry may compile (`jit_hot`), with the frame still at the instruction.
-macro_rules! count_hot {
-    ($rt:ident, $insn:ident) => {{
-        let c = $rt.hot_counter($insn.hot_counter());
-        let n = c.get().wrapping_sub(1);
-        c.set(n);
-        if std::hint::unlikely(n == 0) {
-            tail!(crate::jit::jit_hot)
-        }
-    }};
-}
-
 /// Rewrite the FORLOOP a FORPREP at `pc - 1` guards (the instruction before
 /// its jump target) to `form` when it is not that already. Only on a
 /// change: a store to a word dispatch loads a few instructions later stalls
@@ -290,7 +278,7 @@ handler! {
         };
         let go = idx != last;
         if go {
-            count_hot!(rt, insn);
+            count_hot!(rt, insn, b);
             let idx = Value::small(idx.wrapping_add(s));
             reg![a + 2] = idx;
             reg![a + 3] = idx;
@@ -310,7 +298,7 @@ handler! {
         let idx = reg![a + 2].read_float() + s;
         let go = if 0.0 < s { idx <= lim } else { lim <= idx };
         if go {
-            count_hot!(rt, insn);
+            count_hot!(rt, insn, b);
             let idx = Value::float(idx);
             reg![a + 2] = idx;
             reg![a + 3] = idx;
@@ -336,7 +324,7 @@ handler! {
             // also guarantees `idx + step` stays in range.
             let go = idx != last;
             if go {
-                count_hot!(rt, insn);
+                count_hot!(rt, insn, b);
                 let idx = Value::small(idx.wrapping_add(s));
                 reg![a + 2] = idx;
                 reg![a + 3] = idx;
@@ -348,7 +336,7 @@ handler! {
             let idx = reg![a + 2].read_float() + s;
             let go = if 0.0 < s { idx <= lim } else { lim <= idx };
             if go {
-                count_hot!(rt, insn);
+                count_hot!(rt, insn, b);
                 let idx = Value::float(idx);
                 reg![a + 2] = idx;
                 reg![a + 3] = idx;
@@ -377,7 +365,7 @@ handler! {
         };
         let go = idx != last;
         if go {
-            count_hot!(rt, insn);
+            count_hot!(rt, insn, b);
             let idx = Value::integer(rt.mutation(), idx.wrapping_add(s));
             reg![a + 2] = idx;
             reg![a + 3] = idx;
@@ -854,13 +842,13 @@ handler! {
 
     /// A function entry: count it.
     op fn op_func {
-        count_hot!(rt, insn);
+        count_hot!(rt, insn, a);
         next!()
     }
 
     /// A loop header: count an iteration.
     op fn op_loop {
-        count_hot!(rt, insn);
+        count_hot!(rt, insn, a);
         next!()
     }
 
