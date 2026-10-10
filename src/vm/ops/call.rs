@@ -3,9 +3,10 @@
 use crate::env::function::{FunctionKind, LuaFn};
 use crate::env::thread::{ThreadState, ThreadStatus};
 use crate::env::value::Value;
-use crate::instruction::Instruction;
+use crate::instruction::{Instruction, Op};
 use crate::vm::abi::{Exit, Slot, handler, handler_bits};
 use crate::vm::frame::{self, HDR, copy_values, fill_nil, flag, land_results, lua_func_word};
+use crate::vm::ops::count_hot;
 use crate::vm::ops::meta::resolve_call_chain;
 use crate::vm::unwind::OpError;
 
@@ -116,6 +117,22 @@ fn call_nargs(ts: &ThreadState<'_>, b: u8, nb: usize) -> usize {
     if b == 0 { ts.top - nb } else { b as usize - 1 }
 }
 
+/// Run the callee whose frame is set up, from its `code`: count the call on
+/// its `FUNC`'s counter and continue at pc 1, sparing `FUNC`'s dispatch, or
+/// run the `JIT_ENTRY` written over it.
+macro_rules! start {
+    ($pc:ident, $rt:ident, $code:expr) => {{
+        let code: *const Instruction = $code;
+        let w = unsafe { *code };
+        $pc = code;
+        if w.op() == Op::FUNC {
+            $pc = unsafe { code.add(1) };
+            count_hot!($rt, w, a);
+        }
+        next!()
+    }};
+}
+
 /// The Lua arm of CALL, shared by the CALL forms; `$fv` is the callee
 /// (`R[a]`, or the source register of a CALLS, which has just stored it
 /// there) and `$ret` the callee's continuation.
@@ -154,8 +171,7 @@ macro_rules! call_body {
                 };
                 $closure = callee;
                 $base = nb;
-                $pc = callee.code;
-                next!()
+                start!($pc, $rt, callee.code)
             }
         }
     }};
@@ -242,8 +258,7 @@ handler! {
         unsafe { frame::write_hdr(hdr, lua_func_word(callee, nv), handler_bits(rt.ret(c)), base, pc) };
         set_closure!(callee);
         base = unsafe { hdr.add(HDR) };
-        pc = callee.code;
-        next!()
+        start!(pc, rt, callee.code)
     }
 
     /// CALL of a value that is not a function: resolve its `__call` chain
@@ -304,8 +319,7 @@ handler! {
                 unsafe { hdr.cast::<u64>().write(lua_func_word(callee, 0)) };
                 set_closure!(callee);
                 base = nb;
-                pc = callee.code;
-                next!()
+                start!(pc, rt, callee.code)
             }
         }
     }
@@ -345,8 +359,7 @@ handler! {
         unsafe { hdr.cast::<u64>().write(lua_func_word(callee, nv)) };
         set_closure!(callee);
         base = unsafe { hdr.add(HDR) };
-        pc = callee.code;
-        next!()
+        start!(pc, rt, callee.code)
     }
 
     /// `enter` of a value that is not a function.
@@ -399,8 +412,7 @@ handler! {
                         frame::set_func_word(base, w | callee.as_ptr() as usize as u64);
                     }
                     closure = callee;
-                    pc = callee.code;
-                    next!()
+                    start!(pc, rt, callee.code)
                 }
                 tail!(tailcall_slow)
             }
@@ -468,8 +480,7 @@ handler! {
         };
         set_closure!(callee);
         base = unsafe { hdr.add(HDR) };
-        pc = callee.code;
-        next!()
+        start!(pc, rt, callee.code)
     }
 
     /// `return R[a], ... R[a+b-2]` (`b` 0: up to `top`). Nothing to close on

@@ -840,7 +840,8 @@ handler! {
         next!()
     }
 
-    /// A function entry: count it.
+    /// A function entry run as a word: only the JIT's fallbacks dispatch it
+    /// (calls count it and start at pc 1, `call::start!`).
     op fn op_func {
         count_hot!(rt, insn, a);
         next!()
