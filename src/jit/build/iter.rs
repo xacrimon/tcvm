@@ -55,13 +55,18 @@ pub(super) fn emit_tforprep(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction,
 /// `TFORCALL_NEXT a count`: `next`'s walk at the position in `R[a+3]`, by
 /// helper through the slots; `TFORLOOP` then tests the first variable.
 pub(super) fn emit_tforcall_next(b: &mut Builder<'_, '_>, a: u8, count: u8) {
-    b.store_regs([a as usize + 1, a as usize + 3]);
-    let r = b.ins(Op::Helper(HelperId::TforNext { a, count }), &[]);
     // Not a table, or no position: the interpreter calls the iterator.
-    let fail = b.ins(Op::KVal(HELPER_FAIL_VAL), &[]);
-    let failed = b.ins(Op::SameBits, &[r, fail]);
+    // Tested before the step, which moves the position.
+    let state = b.reg(a + 1);
+    b.guard(state, TypeSet::TAB);
+    let pos = b.reg(a + 3);
+    let p = b.as_i32(pos);
+    let zero = b.ki32(0);
+    let ok = b.ins(Op::ICmp(Cc::Ge), &[p, zero]);
     let s = b.snap_before();
-    b.ins_snap(Op::GuardFalse, &[failed], s, ExitTag::Slow);
+    b.ins_snap(Op::GuardTrue, &[ok], s, ExitTag::Slow);
+    b.store_regs([a as usize + 1, a as usize + 3]);
+    b.push(Op::Helper(HelperId::TforNext { a, count }), &[]);
     for k in 0..count {
         b.reload(a + TFOR_VARS + k);
     }

@@ -333,9 +333,11 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
         RETURN => emit_return(b, a, rb - 1),
         TAILCALL => {
             let callee = b.reg(a);
+            // The frame before the TAILCALL, for the return's exit.
+            let before = b.snap_before();
             if intrinsics::emit(b, pc, insn, callee) {
                 b.flush();
-                emit_return(b, a, 1);
+                emit_return_from(b, a, 1, before);
             } else {
                 // The interpreter's tail call: any callee, varargs, closing.
                 dispatch(b);
@@ -463,8 +465,13 @@ fn dispatch(b: &mut Builder<'_, '_>) {
 /// variables deopts; one whose closures captured registers closes their
 /// cells first, from the captured registers' slots.
 fn emit_return(b: &mut Builder<'_, '_>, a: u8, n: u8) {
-    let captures = b.cfg.captured.iter().next().is_some();
     let s = b.snap_before();
+    emit_return_from(b, a, n, s);
+}
+
+/// `emit_return` exiting with the frame `s`.
+fn emit_return_from(b: &mut Builder<'_, '_>, a: u8, n: u8, s: crate::jit::ir::Snap) {
+    let captures = b.cfg.captured.iter().next().is_some();
     let mask = if captures {
         flag::HAS_TBC
     } else {
