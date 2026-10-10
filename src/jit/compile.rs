@@ -365,6 +365,10 @@ pub(crate) fn compile<'gc>(
             count: std::cell::Cell::new(0),
         });
     }
+    let known = closure.proto.jit.get().map_or((0, 0), |s| {
+        let s = s.borrow();
+        (s.kind_exits.len() as u32, s.shapes_seen.len() as u32)
+    });
     let region = crate::dmm::Gc::new(
         ctx.mutation(),
         Region {
@@ -385,6 +389,7 @@ pub(crate) fn compile<'gc>(
             frame_size: em.frame_size,
             num_spills: em.num_spills,
             retired: std::cell::Cell::new(false),
+            known,
         },
     );
     region

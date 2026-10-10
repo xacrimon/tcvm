@@ -462,6 +462,13 @@ fn on_exit<'gc>(
         if e.tag == ExitTag::Shape {
             record_shape(ctx, closure, base, pc);
         }
+        if e.tag == ExitTag::Type {
+            let state = jit_state(ctx.mutation(), closure.proto);
+            let mut st = state.borrow_mut(ctx.mutation());
+            if !st.kind_exits.contains(&pc) {
+                st.kind_exits.push(pc);
+            }
+        }
     }
     let n = e.count.get() + 1;
     e.count.set(n);
@@ -491,7 +498,20 @@ fn on_exit<'gc>(
                 region.entry_pc
             )
         });
-        request_recompile(ctx, closure, region, false);
+        // A site's kinds widen to generic once and its shapes grow to at
+        // most `MAX_SHAPES + 1`, so a recompile that learns one of them is
+        // outside the budget, as the never-executed rule's are.
+        let st = jit_state(ctx.mutation(), closure.proto);
+        let st = st.borrow();
+        let learned = match e.tag {
+            ExitTag::Type => st.kind_exits[region.known.0 as usize..].contains(&pc),
+            ExitTag::Shape => st.shapes_seen[region.known.1 as usize..]
+                .iter()
+                .any(|&(p, _)| p == pc),
+            _ => false,
+        };
+        drop(st);
+        request_recompile(ctx, closure, region, learned);
     }
 }
 
