@@ -456,6 +456,9 @@ fn on_exit<'gc>(
             _ => 0,
         };
         record_site(closure, base, pc, extra);
+        if e.tag == ExitTag::Shape {
+            record_shape(ctx, closure, base, pc);
+        }
     }
     let n = e.count.get() + 1;
     e.count.set(n);
@@ -486,6 +489,43 @@ fn on_exit<'gc>(
             )
         });
         request_recompile(ctx, closure, region, false);
+    }
+}
+
+/// Shapes a site's chain may test (6.4); one more makes it megamorphic.
+pub(crate) const MAX_SHAPES: usize = 4;
+
+/// A shape exit at a field site: its receiver's shape, for a chain in the
+/// next compile.
+fn record_shape<'gc>(ctx: Context<'gc>, closure: LuaFn<'gc>, base: *mut Value<'gc>, pc: u32) {
+    let mut i = unsafe { *closure.code.add(pc as usize) };
+    if i.is_jit_word() {
+        i = original_of(closure, i);
+    }
+    let upval = |k: u8| unsafe { *closure.upvalue_ptr().add(k as usize) };
+    let recv = match i.op().unquickened() {
+        Op::GETTABUP | Op::SETTABUP => unsafe { upval(i.b()).value },
+        Op::GETTABUP_REF | Op::SETTABUP_REF => unsafe { upval(i.b()).cell }.get(),
+        Op::GETFIELD | Op::SELF | Op::SETFIELD => unsafe { *base.add(i.b() as usize) },
+        _ => return,
+    };
+    let Some(t) = recv.get_table() else {
+        return;
+    };
+    let shape = t.shape();
+    let state = jit_state(ctx.mutation(), closure.proto);
+    let mut st = state.borrow_mut(ctx.mutation());
+    let mut n = 0;
+    for &(p, s) in &st.shapes_seen {
+        if p == pc {
+            if crate::env::Shape::ptr_eq(s, shape) {
+                return;
+            }
+            n += 1;
+        }
+    }
+    if n <= MAX_SHAPES {
+        st.shapes_seen.push((pc, shape));
     }
 }
 

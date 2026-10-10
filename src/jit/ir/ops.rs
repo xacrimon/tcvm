@@ -474,6 +474,8 @@ pub(crate) enum Op {
     // --- tables: `Ptr` operands are a table's lock (its value's payload) ----
     /// Exits unless the table's shape is `shapes[i]`.
     GuardShape(u32),
+    /// Whether the table's shape is `shapes[i]`, a `B1`.
+    ShapeIs(u32),
     /// The live metamethod bits of the class `shapes[i]` pins, an `I32`.
     ClassBits(u32),
     /// The live `__index` of the class `shapes[i]` pins.
@@ -620,6 +622,7 @@ impl Op {
             GuardNoFlag(_) => Effects::MAY_DEOPT | Effects::R_FRAME,
             GuardShape(_) => Effects::MAY_DEOPT | Effects::R_SHAPE,
             ClassBits(_) | ClassIndex(_) => Effects::R_META,
+            ShapeIs(_) => Effects::R_SHAPE,
             TabLoad { .. } | ArrLoad => Effects::R_TAB,
             TabStore { .. } | ArrStore => Effects::W_TAB,
             TabHasRoom(_) | TabASize | TabArray => Effects::R_SHAPE,
@@ -709,7 +712,7 @@ impl Op {
             NumVarargs | ClassBits(_) | TabASize => Ty::I32,
             ClassIndex(_) | TabLoad { .. } | ArrLoad => Ty::ANY,
             TabArray => Ty::PTR,
-            TabHasRoom(_) => Ty::B1,
+            TabHasRoom(_) | ShapeIs(_) => Ty::B1,
             VarargAt(_) | VarargIdx => Ty::ANY,
             HasFlag(_) => Ty::B1,
             Box => args[0].boxed(),

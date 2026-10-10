@@ -484,3 +484,36 @@ fn tail_calls_and_multret() {
 "##,
     );
 }
+
+/// A field site that saw several shapes compiles a test per shape (own
+/// slots, `__index` holders, absent keys); one that saw more takes the
+/// helper.
+#[test]
+fn polymorphic_field_sites() {
+    agrees(
+        r#"
+        local A = {}; A.__index = A
+        function A.new(v) return setmetatable({v = v}, A) end
+        function A:get() return self.v end
+        local B = {}; B.__index = B
+        function B.new(v) return setmetatable({w = 0, v = v * 2}, B) end
+        function B:get() return self.v + 1 end
+        local objs = {}
+        for i = 1, 60 do objs[i] = i % 2 == 0 and A.new(i) or B.new(i) end
+        local function sumget(t) local s = 0 for i = 1, #t do s = s + t[i]:get() + t[i].v end return s end
+        local shapes, mega = {}, {}
+        for i = 1, 40 do
+          local k = i % 4
+          shapes[i] = k == 0 and {x = i} or (k == 1 and {a = 0, x = i} or (k == 2 and {a = 0, b = 0, x = i} or {y = i}))
+        end
+        for i = 1, 50 do local t = {} for j = 1, i % 9 do t["f" .. j] = j end t.x = i mega[i] = t end
+        local function bump(t) for i = 1, #t do t[i].x = (t[i].x or 0) + 1 end end
+        local function total(t) local s = 0 for i = 1, #t do s = s + (t[i].x or -1) end return s end
+        local s = 0
+        for r = 1, 300 do s = s + sumget(objs); bump(shapes); s = s + total(shapes) + total(mega) end
+        function A:get() return -self.v end
+        for r = 1, 100 do s = s + sumget(objs) end
+        return tostring(s)
+"#,
+    );
+}

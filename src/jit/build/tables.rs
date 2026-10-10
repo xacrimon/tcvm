@@ -5,7 +5,8 @@
 
 use crate::dmm::Gc;
 use crate::env::function::InlineCache;
-use crate::env::table::Table;
+use crate::env::string::LuaString;
+use crate::env::table::{SlotLoc, Table};
 use crate::env::value::Value;
 use crate::env::{MetamethodBits, Shape};
 use crate::instruction::{Instruction, Op as BcOp};
@@ -161,19 +162,31 @@ pub(super) fn emit_get<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
     let kv = b.closure.proto.constants[e as usize];
     let key = b.konst(kv);
     let kid = b.f.intern(kv);
-    match read_ic(b.closure, ic) {
+    let site = Site { recv, key, kv, kid };
+    let ic = read_ic(b.closure, ic);
+    let first = match ic {
+        InlineCache::Own { shape, .. } | InlineCache::Absent { shape } => Some(shape),
+        InlineCache::ProtoLoad { recv, .. } => Some(recv),
+        InlineCache::Transition { from, .. } => Some(from),
+        InlineCache::Empty => None,
+    };
+    match site_shapes(b, first) {
+        None => {
+            let v = index(b, dst, recv, key);
+            b.set(dst, v);
+            return;
+        }
+        Some(shapes) if shapes.len() > 1 => {
+            get_chain(b, dst, &site, &shapes);
+            return;
+        }
+        Some(_) => {}
+    }
+    match ic {
         InlineCache::Own { shape, loc } => {
             let t = table_of(b, recv);
             guard_shape(b, t, shape);
-            let v = b.ins(
-                Op::TabLoad {
-                    loc: loc.raw(),
-                    key: kid,
-                },
-                &[t],
-            );
-            b.field_loads.insert(v, (recv, kv));
-            nil_walks(b, dst, shape, v, recv, key);
+            own_load(b, dst, &site, shape, t, loc);
         }
         InlineCache::Absent { shape } => {
             let t = table_of(b, recv);
@@ -192,34 +205,132 @@ pub(super) fn emit_get<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
             // The collector empties the entry when `holder` dies, and none
             // ran since the interpreter last read it.
             let holder = Table::from_inner(unsafe { Gc::from_ptr(holder.as_ptr()) });
-            let hv = b.konst(Value::table(holder));
-            let k = b.intern_shape(shape);
-            let live = b.ins(Op::ClassIndex(k), &[]);
-            b.ins_exit(Op::GuardSame, &[live, hv], ExitTag::Shape);
-            let h = b.ins(Op::Unbox(Rep::Ptr), &[hv]);
-            guard_shape(b, h, holder_shape);
-            let v = b.ins(
-                Op::TabLoad {
-                    loc: loc.raw(),
-                    key: kid,
-                },
-                &[h],
-            );
-            // A nil slot means the walk goes on past `holder`.
-            let join = b.new_block();
-            let nil = b.ins(Op::IsType(TypeSet::NIL), &[v]);
-            let found = branch_arm(b, nil);
-            let w = index(b, dst, recv, key);
-            arm_end(b, join, dst, w);
-            b.switch_to(found);
-            arm_end(b, join, dst, v);
-            enter_join(b, join);
+            proto_load(b, dst, &site, shape, holder, holder_shape, loc);
         }
         InlineCache::Transition { .. } | InlineCache::Empty => {
             let v = index(b, dst, recv, key);
             b.set(dst, v);
         }
     }
+}
+
+/// A constant-key site's receiver and key.
+struct Site<'gc> {
+    recv: Val,
+    key: Val,
+    kv: Value<'gc>,
+    kid: u32,
+}
+
+/// The shapes a site's shape exits recorded, with the cache's first; `None`
+/// past `MAX_SHAPES`, a site left to the helper (6.4).
+fn site_shapes<'gc>(b: &Builder<'_, 'gc>, first: Option<Shape<'gc>>) -> Option<Vec<Shape<'gc>>> {
+    let mut v: Vec<Shape<'gc>> = first.into_iter().collect();
+    if let Some(st) = b.closure.proto.jit.get() {
+        for &(pc, s) in &st.borrow().shapes_seen {
+            if pc == b.pc && !v.iter().any(|&x| Shape::ptr_eq(x, s)) {
+                v.push(s);
+            }
+        }
+    }
+    (v.len() <= crate::jit::MAX_SHAPES).then_some(v)
+}
+
+/// `dst = t.key` from the own slot at `loc`.
+fn own_load<'gc>(
+    b: &mut Builder<'_, 'gc>,
+    dst: u8,
+    site: &Site<'gc>,
+    shape: Shape<'gc>,
+    t: Val,
+    loc: SlotLoc,
+) {
+    let v = b.ins(
+        Op::TabLoad {
+            loc: loc.raw(),
+            key: site.kid,
+        },
+        &[t],
+    );
+    b.field_loads.insert(v, (site.recv, site.kv));
+    nil_walks(b, dst, shape, v, site.recv, site.key);
+}
+
+/// `dst = t.key` from the slot at `loc` of `holder`, the `__index` table of
+/// the class `shape` pins, while it is that table and has its shape.
+fn proto_load<'gc>(
+    b: &mut Builder<'_, 'gc>,
+    dst: u8,
+    site: &Site<'gc>,
+    shape: Shape<'gc>,
+    holder: Table<'gc>,
+    holder_shape: Shape<'gc>,
+    loc: SlotLoc,
+) {
+    let hv = b.konst(Value::table(holder));
+    let k = b.intern_shape(shape);
+    let live = b.ins(Op::ClassIndex(k), &[]);
+    b.ins_exit(Op::GuardSame, &[live, hv], ExitTag::Shape);
+    let h = b.ins(Op::Unbox(Rep::Ptr), &[hv]);
+    guard_shape(b, h, holder_shape);
+    let v = b.ins(
+        Op::TabLoad {
+            loc: loc.raw(),
+            key: site.kid,
+        },
+        &[h],
+    );
+    // A nil slot means the walk goes on past `holder`.
+    let join = b.new_block();
+    let nil = b.ins(Op::IsType(TypeSet::NIL), &[v]);
+    let found = branch_arm(b, nil);
+    let w = index(b, dst, site.recv, site.key);
+    arm_end(b, join, dst, w);
+    b.switch_to(found);
+    arm_end(b, join, dst, v);
+    enter_join(b, join);
+}
+
+/// The `__index` table of `shape`'s class holding `key` in a slot of its
+/// shape, as a `ProtoLoad` entry caches it.
+fn holder_of<'gc>(
+    shape: Shape<'gc>,
+    key: LuaString<'gc>,
+) -> Option<(Table<'gc>, Shape<'gc>, SlotLoc)> {
+    let holder = shape.mt_cache()?.mm(MetamethodBits::INDEX).get_table()?;
+    let hs = holder.shape();
+    if hs.is_dict() {
+        return None;
+    }
+    let slot = hs.find_slot(key)?;
+    Some((holder, hs, SlotLoc::new(hs, slot)))
+}
+
+/// A read at a site that saw several shapes: a test per shape, each with
+/// what tables of that shape hold for the key, resolved now; another shape
+/// exits and is recorded.
+fn get_chain<'gc>(b: &mut Builder<'_, 'gc>, dst: u8, site: &Site<'gc>, shapes: &[Shape<'gc>]) {
+    let t = table_of(b, site.recv);
+    let key = site.kv.get_string().unwrap();
+    let join = b.new_block();
+    for &s in shapes.iter().filter(|s| !s.is_dict()) {
+        let k = b.intern_shape(s);
+        let is = b.ins(Op::ShapeIs(k), &[t]);
+        let next = branch_arm(b, is);
+        if let Some(slot) = s.find_slot(key) {
+            own_load(b, dst, site, s, t, SlotLoc::new(s, slot));
+        } else if let Some((holder, hs, loc)) = holder_of(s, key) {
+            proto_load(b, dst, site, s, holder, hs, loc);
+        } else {
+            let nil = b.konst(Value::nil());
+            nil_walks(b, dst, s, nil, site.recv, site.key);
+        }
+        b.flush();
+        b.jump(join);
+        b.switch_to(next);
+    }
+    b.deopt(ExitTag::Shape);
+    enter_join(b, join);
 }
 
 /// `SETFIELD` and `SETTABUP` in all their forms.
@@ -231,36 +342,45 @@ pub(super) fn emit_set<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
     let kv = b.closure.proto.constants[e as usize];
     let key = b.konst(kv);
     let kid = b.f.intern(kv);
-    match read_ic(b.closure, ic) {
+    let ic = read_ic(b.closure, ic);
+    let first = match ic {
+        InlineCache::Own { shape, .. } | InlineCache::Absent { shape } => Some(shape),
+        InlineCache::ProtoLoad { recv, .. } => Some(recv),
+        InlineCache::Transition { from, .. } => Some(from),
+        InlineCache::Empty => None,
+    };
+    match site_shapes(b, first) {
+        None => {
+            newindex(b, recv, key, v, false);
+            return;
+        }
+        Some(shapes) if shapes.len() > 1 => {
+            // A test per shape: its own slot, or the generic store.
+            let t = table_of(b, recv);
+            let ks = kv.get_string().unwrap();
+            let join = b.new_block();
+            for &s in shapes.iter().filter(|s| !s.is_dict()) {
+                let k = b.intern_shape(s);
+                let is = b.ins(Op::ShapeIs(k), &[t]);
+                let next = branch_arm(b, is);
+                match s.find_slot(ks) {
+                    Some(slot) => own_store(b, s, t, SlotLoc::new(s, slot), kid, v),
+                    None => newindex(b, recv, key, v, false),
+                }
+                b.jump(join);
+                b.switch_to(next);
+            }
+            b.deopt(ExitTag::Shape);
+            enter_join(b, join);
+            return;
+        }
+        Some(_) => {}
+    }
+    match ic {
         InlineCache::Own { shape, loc } => {
             let t = table_of(b, recv);
             guard_shape(b, t, shape);
-            let slot = Op::TabLoad {
-                loc: loc.raw(),
-                key: kid,
-            };
-            if shape.mt_cache().is_some() {
-                // `__newindex` fires only on a nil slot.
-                let old = b.ins(slot, &[t]);
-                let join = b.new_block();
-                let nil = b.ins(Op::IsType(TypeSet::NIL), &[old]);
-                let rest = branch_arm(b, nil);
-                let has = class_has(b, shape, MetamethodBits::NEWINDEX).unwrap();
-                let s = b.snap_before();
-                b.ins_snap(Op::GuardFalse, &[has], s, ExitTag::Slow);
-                b.jump(join);
-                b.switch_to(rest);
-                b.jump(join);
-                enter_join(b, join);
-            }
-            barrier_for(b, t, v);
-            b.push(
-                Op::TabStore {
-                    loc: loc.raw(),
-                    key: kid,
-                },
-                &[t, v],
-            );
+            own_store(b, shape, t, loc, kid, v);
         }
         InlineCache::Transition { from, to, loc } => {
             let t = table_of(b, recv);
@@ -316,6 +436,46 @@ pub(super) fn emit_set<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
             newindex(b, recv, key, v, false);
         }
     }
+}
+
+/// `t.key = v` into the own slot at `loc`, `__newindex` checked live where
+/// the class may have it.
+fn own_store<'gc>(
+    b: &mut Builder<'_, 'gc>,
+    shape: Shape<'gc>,
+    t: Val,
+    loc: SlotLoc,
+    kid: u32,
+    v: Val,
+) {
+    if shape.mt_cache().is_some() {
+        // `__newindex` fires only on a nil slot.
+        let old = b.ins(
+            Op::TabLoad {
+                loc: loc.raw(),
+                key: kid,
+            },
+            &[t],
+        );
+        let join = b.new_block();
+        let nil = b.ins(Op::IsType(TypeSet::NIL), &[old]);
+        let rest = branch_arm(b, nil);
+        let has = class_has(b, shape, MetamethodBits::NEWINDEX).unwrap();
+        let s = b.snap_before();
+        b.ins_snap(Op::GuardFalse, &[has], s, ExitTag::Slow);
+        b.jump(join);
+        b.switch_to(rest);
+        b.jump(join);
+        enter_join(b, join);
+    }
+    barrier_for(b, t, v);
+    b.push(
+        Op::TabStore {
+            loc: loc.raw(),
+            key: kid,
+        },
+        &[t, v],
+    );
 }
 
 /// The receiver's lock when the site's feedback saw only tables (or
