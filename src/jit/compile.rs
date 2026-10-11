@@ -123,6 +123,9 @@ pub(crate) fn build_ir<'gc>(
         check(&f, "peel")?;
     }
     optimize(&mut f);
+    if opt::sink::sink(&mut f) {
+        check(&f, "sink")?;
+    }
     opt::prune_gc_checks(&mut f);
     opt::dce(&mut f);
     check(&f, "optimize")?;
@@ -280,12 +283,25 @@ pub(crate) fn compile<'gc>(
     }
     times.regalloc = t.elapsed().as_micros();
     let t = std::time::Instant::now();
+    let jit = ctx.jit();
+    let tramp = |h: usize, f: bool| jit.trampoline(h, f).map_err(CompileError::Backend);
+    let mut trampolines: Vec<(usize, usize)> = Vec::new();
+    for inst in &lowered.vcode.insts {
+        if let crate::jit::backend::aarch64::inst::MInst::HelperCold(h) = inst {
+            let a = crate::jit::helpers::address(*h);
+            if !trampolines.iter().any(|&(x, _)| x == a) {
+                let float = h.sig().ret == Some(crate::jit::ir::types::Rep::F64);
+                trampolines.push((a, tramp(a, float)?));
+            }
+        }
+    }
     let helpers = emit::Helpers {
         exit_common: abi::exit_common as *const () as usize,
         entry_fail: crate::jit::jit_entry_fail as *const () as usize,
         enter: crate::vm::ops::call::enter as *const () as usize,
-        box_i64: crate::jit::helpers::jit_box_i64 as *const () as usize,
+        box_i64: tramp(crate::jit::helpers::jit_box_i64 as *const () as usize, false)?,
         land: crate::jit::helpers::jit_land as *const () as usize,
+        trampolines,
     };
     // Allocated now, moved into the region after: the code embeds its address.
     let fired: Box<[std::cell::Cell<u32>]> = if config.deopt_all {

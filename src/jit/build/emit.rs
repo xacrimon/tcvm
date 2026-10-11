@@ -611,16 +611,18 @@ fn emit_arith(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
     let num = |k: Option<NumKind>| k.unwrap_or(NumKind::Num);
     arith_kinds(b, kind, dst, (l, num(lk)), (r, num(rk)), wide, Some(join));
     enter_join(b, slow);
-    let (x, y) = (l.val(b), r.val(b));
-    slow_arm(
-        b,
-        join,
-        dst,
-        HelperId::ArithCoerce(kind),
-        &[x, y],
-        kind_mm(kind),
-        &[x, y],
-    );
+    cold(b, |b| {
+        let (x, y) = (l.val(b), r.val(b));
+        slow_arm(
+            b,
+            join,
+            dst,
+            HelperId::ArithCoerce(kind),
+            &[x, y],
+            kind_mm(kind),
+            &[x, y],
+        );
+    });
     enter_join(b, join);
 }
 
@@ -856,7 +858,9 @@ fn emit_unm(b: &mut Builder<'_, '_>, pc: u32, dst: u8, src: u8) {
             if let Some(slow) = slow {
                 enter_join(b, slow);
                 // Lua passes the operand twice for unary metamethods.
-                slow_arm(b, join, dst, HelperId::Unm, &[x], MetamethodBits::UNM, &[x, x]);
+                cold(b, |b| {
+                    slow_arm(b, join, dst, HelperId::Unm, &[x], MetamethodBits::UNM, &[x, x])
+                });
             }
             enter_join(b, join);
             return;
@@ -885,7 +889,9 @@ fn emit_bnot(b: &mut Builder<'_, '_>, pc: u32, dst: u8, src: u8) {
             let r = b.ins(Op::INot, &[i]);
             arm_end(b, join, dst, r);
             enter_join(b, slow);
-            slow_arm(b, join, dst, HelperId::BNot, &[x], MetamethodBits::BNOT, &[x, x]);
+            cold(b, |b| {
+                slow_arm(b, join, dst, HelperId::BNot, &[x], MetamethodBits::BNOT, &[x, x])
+            });
             enter_join(b, join);
             return;
         }
@@ -1107,9 +1113,11 @@ pub(super) fn helper_arms(
         return;
     }
     let ok = branch_arm(b, failed);
-    let f = metamethod(b, bit, mm_args);
-    let res = mm_call(b, f, mm_args);
-    arm_end(b, join, dst, res);
+    cold(b, |b| {
+        let f = metamethod(b, bit, mm_args);
+        let res = mm_call(b, f, mm_args);
+        arm_end(b, join, dst, res);
+    });
     b.switch_to(ok);
     arm_end(b, join, dst, r);
 }
@@ -1220,6 +1228,14 @@ pub(super) fn arm_end(b: &mut Builder<'_, '_>, join: Block, dst: u8, v: Val) {
     b.flush();
     b.jump(join);
     b.pending = earlier;
+}
+
+/// Emit `arm` into the current block as a cold arm (A5).
+pub(super) fn cold<R>(b: &mut Builder<'_, '_>, arm: impl FnOnce(&mut Builder<'_, '_>) -> R) -> R {
+    let was = b.begin_cold();
+    let r = arm(b);
+    b.end_cold(was);
+    r
 }
 
 /// Continue after the arms, where `dst` is their join.
@@ -1414,7 +1430,7 @@ fn generic_eq(b: &mut Builder<'_, '_>, x: Val, y: Val, sense: bool, succs: &[Blo
     }
     let not_tables = all_in(b, TypeSet::TAB, &[x, y]);
     if calls_mm(b) {
-        eq_mm_arm(b, x, y, yes, no);
+        cold(b, |b| eq_mm_arm(b, x, y, yes, no));
     } else {
         let (px, py) = (b.ins(Op::Unbox(Rep::Ptr), &[x]), b.ins(Op::Unbox(Rep::Ptr), &[y]));
         let has = tables::class_bit(b, px, MetamethodBits::EQ);
@@ -1427,7 +1443,7 @@ fn generic_eq(b: &mut Builder<'_, '_>, x: Val, y: Val, sense: bool, succs: &[Blo
     enter_join(b, not_tables);
     let not_udata = all_in(b, TypeSet::UDATA, &[x, y]);
     if calls_mm(b) {
-        eq_mm_arm(b, x, y, yes, no);
+        cold(b, |b| eq_mm_arm(b, x, y, yes, no));
     } else {
         // Whether `__eq` runs is the interpreter's to find out.
         b.deopt(ExitTag::Mm);
@@ -1503,10 +1519,12 @@ fn generic_cmp(b: &mut Builder<'_, '_>, cc: Cc, x: Val, y: Val, sense: bool, suc
     } else {
         MetamethodBits::LT
     };
-    let f = metamethod(b, bit, &[x, y]);
-    let res = mm_call(b, f, &[x, y]);
-    let falsy = b.ins(Op::IsFalsy, &[res]);
-    b.br(falsy, no, yes);
+    cold(b, |b| {
+        let f = metamethod(b, bit, &[x, y]);
+        let res = mm_call(b, f, &[x, y]);
+        let falsy = b.ins(Op::IsFalsy, &[res]);
+        b.br(falsy, no, yes);
+    });
 }
 
 fn emit_cmp_imm(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Block]) {
@@ -1580,12 +1598,14 @@ fn emit_cmp_imm(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Bl
                 MetamethodBits::LT
             };
             // The metamethod takes the operands in source order.
-            let kv = b.konst(Value::small(k as i32));
-            let args = if swap { [kv, x] } else { [x, kv] };
-            let f = metamethod(b, bit, &args);
-            let res = mm_call(b, f, &args);
-            let falsy = b.ins(Op::IsFalsy, &[res]);
-            b.br(falsy, no, yes);
+            cold(b, |b| {
+                let kv = b.konst(Value::small(k as i32));
+                let args = if swap { [kv, x] } else { [x, kv] };
+                let f = metamethod(b, bit, &args);
+                let res = mm_call(b, f, &args);
+                let falsy = b.ins(Op::IsFalsy, &[res]);
+                b.br(falsy, no, yes);
+            });
             return;
         }
     };

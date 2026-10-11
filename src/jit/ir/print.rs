@@ -17,10 +17,11 @@ impl Func<'_> {
                 .collect();
             let _ = writeln!(
                 out,
-                "b{}({}){}{}:",
+                "b{}({}){}{}{}:",
                 b.0,
                 params.join(", "),
                 if bd.resume { " resume" } else { "" },
+                if bd.cold { " cold" } else { "" },
                 if b == self.entry { " entry" } else { "" }
             );
             for &i in self.insts_of(b) {

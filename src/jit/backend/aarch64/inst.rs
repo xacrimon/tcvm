@@ -250,6 +250,9 @@ pub(crate) enum MInst {
     },
     /// A C-ABI helper with fixed-register operands.
     Helper(HelperId),
+    /// The same in a cold arm, through its trampoline: it clobbers only the
+    /// pinned and immediate registers the call writes, and its result's.
+    HelperCold(HelperId),
     /// The end of a block: to succ 0.
     Jump,
     /// `[test operands..]`: to succ 0 when `cond` holds, else succ 1.

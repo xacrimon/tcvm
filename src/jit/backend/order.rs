@@ -5,7 +5,7 @@
 //! Each loop collapses to its header, the collapsed graph is laid out in
 //! reverse postorder, and each loop's own layout is spliced in where its
 //! header landed. Blocks that end in a deopt run at most once per entry and
-//! go last, so loop bodies fall through. Irreducible graphs never get here
+//! go after the rest, then cold arms (A5), so loop bodies fall through. Irreducible graphs never get here
 //! (`cfg.rs` refuses them).
 
 use crate::jit::ir::ops::Op;
@@ -72,7 +72,10 @@ pub(crate) fn layout(f: &Func<'_>) -> Vec<Block> {
     lp.scope(f, None, f.entry, &mut order);
     debug_assert_eq!(order.len(), cfg.rpo.len());
     let deopts = |b: &Block| f.terminator(*b).is_some_and(|t| f.op(t) == Op::Deopt);
-    let (cold, mut hot): (Vec<Block>, Vec<Block>) = order.into_iter().partition(deopts);
+    let (deopt, rest): (Vec<Block>, Vec<Block>) = order.into_iter().partition(deopts);
+    let (cold, mut hot): (Vec<Block>, Vec<Block>) =
+        rest.into_iter().partition(|b| f.blocks[b.idx()].cold);
+    hot.extend(deopt);
     hot.extend(cold);
     hot
 }
