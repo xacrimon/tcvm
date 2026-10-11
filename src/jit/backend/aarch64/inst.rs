@@ -182,6 +182,8 @@ pub(crate) enum MInst {
     NumMtSet,
     /// `[def d, use t]`: the metamethod of a bit index from the table's class.
     ClassMm(u8),
+    /// `[def d, use t]`: the class bits of the table, 0 without a class.
+    TabMmBits,
     /// `[def d, use f]`: whether the function is a Lua closure without varargs.
     FnFixedLua,
     /// `[def d, use f]`: whether the Lua closure's window fits from `base`.

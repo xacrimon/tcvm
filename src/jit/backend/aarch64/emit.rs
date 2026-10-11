@@ -726,6 +726,19 @@ impl Em<'_> {
                 self.a.mov_imm(d, NIL);
                 self.a.bind(done);
             }
+            TabMmBits => {
+                let (d, t) = (self.r(i, 0), self.r(i, 1));
+                let (none, done) = (self.a.new_label(), self.a.new_label());
+                self.a.ldr(X16, t, layout::T_SHAPE as i32);
+                self.a
+                    .ldr(X16, X16, crate::env::Shape::MT_CACHE_OFFSET as i32);
+                self.a.cbz(Sz::X, X16, none);
+                self.a.ldr_w(d, X16, MtCache::BITS_OFFSET as i32);
+                self.a.b(done);
+                self.a.bind(none);
+                self.a.movz(Sz::W, d, 0, 0);
+                self.a.bind(done);
+            }
             FnFixedLua => {
                 // A native function has the niche value of `is_vararg` there.
                 let (d, f) = (self.r(i, 0), self.r(i, 1));

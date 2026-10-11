@@ -661,6 +661,41 @@ fn metamethod_forms() {
     );
 }
 
+/// Array slots holding nil: the result, or the store, inline unless the
+/// table's class has `__index` or `__newindex` at the time.
+#[test]
+fn nil_array_slots() {
+    agrees(
+        r#"
+        local function fill(t, n) for i = 1, n do if t[i] == nil then t[i] = i end end return t end
+        local function sum(t, n) local s = 0 for i = 1, n do s = s + (t[i] or 0) end return s end
+        local out = {}
+        for r = 1, 300 do
+          local t = {nil, nil, nil, nil, nil, nil, nil, nil}
+          for i = 1, 8 do t[i] = false end
+          for i = 1, 8, 2 do t[i] = nil end
+          fill(t, 8)
+          out[1] = sum(t, 8)
+          local log = {}
+          local p = setmetatable({1, nil, 3, nil}, {__index = function(_, k) return k * 100 end, __newindex = function(t, k, v) rawset(t, k, v * 10) end})
+          out[2] = sum(p, 4)
+          fill(p, 4)
+          out[3] = sum(p, 4)
+        end
+        -- __index/__newindex added after the regions compiled
+        local late = {1, nil, 3}
+        for r = 1, 300 do sum(late, 3); fill({1, nil, 3}, 3) end
+        setmetatable(late, {__index = function() return 7 end})
+        out[4] = sum(late, 3)
+        local q = {1, nil, 3}
+        setmetatable(q, {__newindex = function(t, k, v) rawset(t, k, -v) end})
+        fill(q, 3)
+        out[5] = sum(q, 3)
+        return table.concat(out, " ")
+"#,
+    );
+}
+
 /// A field site that saw several shapes compiles a test per shape (own
 /// slots, `__index` holders, absent keys); one that saw more takes the
 /// helper.

@@ -55,6 +55,16 @@ fn class_has<'gc>(b: &mut Builder<'_, 'gc>, shape: Shape<'gc>, bit: MetamethodBi
     Some(b.ins(Op::ICmp(Cc::Ne), &[has, zero]))
 }
 
+/// Whether the class of table `t` (a `Ptr`) has `bit`, read live: a table's
+/// shape may be any here.
+fn class_bit(b: &mut Builder<'_, '_>, t: Val, bit: MetamethodBits) -> Val {
+    let bits = b.ins(Op::TabMmBits, &[t]);
+    let mask = b.ki32(bit.bits() as i32);
+    let has = b.ins(Op::IAnd, &[bits, mask]);
+    let zero = b.ki32(0);
+    b.ins(Op::ICmp(Cc::Ne), &[has, zero])
+}
+
 /// The store's barrier, unless the value is never a heap object.
 fn barrier_for(b: &mut Builder<'_, '_>, t: Val, v: Val) {
     let set = b.ty(v).set;
@@ -584,8 +594,13 @@ pub(super) fn emit_gettable(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction)
     let v = b.ins(Op::ArrLoad, &[arr, i]);
     let nil = b.ins(Op::IsType(TypeSet::NIL), &[v]);
     let found = branch_arm(b, nil);
+    // A nil is the result unless the class has `__index` now.
+    let has = class_bit(b, t, MetamethodBits::INDEX);
+    let plain = branch_arm(b, has);
     let w = index(b, dst, recv, key);
     arm_end(b, join, dst, w);
+    b.switch_to(plain);
+    arm_end(b, join, dst, v);
     b.switch_to(found);
     arm_end(b, join, dst, v);
     b.switch_to(outside);
@@ -631,15 +646,19 @@ pub(super) fn emit_settable(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction)
     let outside = branch_arm(b, inside);
     let arr = b.ins(Op::TabArray, &[t]);
     let old = b.ins(Op::ArrLoad, &[arr, i]);
-    // `__newindex` may fire over a nil.
+    // `__newindex` may fire over a nil, if the class has it now.
     let nil = b.ins(Op::IsType(TypeSet::NIL), &[old]);
     let present = branch_arm(b, nil);
+    let has = class_bit(b, t, MetamethodBits::NEWINDEX);
+    let plain = branch_arm(b, has);
     newindex(b, recv, key, v, true);
     b.jump(join);
-    b.switch_to(present);
-    barrier_for(b, t, v);
-    b.push(Op::ArrStore, &[arr, i, v]);
-    b.jump(join);
+    for blk in [plain, present] {
+        b.switch_to(blk);
+        barrier_for(b, t, v);
+        b.push(Op::ArrStore, &[arr, i, v]);
+        b.jump(join);
+    }
     b.switch_to(outside);
     newindex(b, recv, key, v, true);
     b.jump(join);
