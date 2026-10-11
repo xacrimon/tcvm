@@ -178,6 +178,10 @@ pub(crate) enum MInst {
     },
     /// `[def d]`: whether the frame's header has the flag.
     HasFlag(u8),
+    /// `[def d]`: whether numbers have a metatable.
+    NumMtSet,
+    /// `[def d, use t]`: the metamethod of a bit index from the table's class.
+    ClassMm(u8),
     /// `[def d, use f]`: whether the function is a Lua closure without varargs.
     FnFixedLua,
     /// `[def d, use f]`: whether the Lua closure's window fits from `base`.

@@ -607,6 +607,60 @@ fn builtin_intrinsics() {
     );
 }
 
+/// The metamethod forms (`ARITH_MM`, `_MM_R`, `_MMI` either side) call the
+/// operand class's metamethod; a table without it and a number metatable
+/// set after compiling take the handlers.
+#[test]
+fn metamethod_forms() {
+    agrees(
+        r#"
+        local V = {}
+        V.__index = V
+        local function vec(x, y) return setmetatable({x = x, y = y}, V) end
+        V.__add = function(a, b)
+          if type(a) == "number" then return vec(a + b.x, a + b.y) end
+          if type(b) == "number" then return vec(a.x + b, a.y + b) end
+          return vec(a.x + b.x, a.y + b.y)
+        end
+        V.__mul = function(a, b)
+          if type(a) == "number" then return vec(a * b.x, a * b.y) end
+          if type(b) == "number" then return vec(a.x * b, a.y * b) end
+          return vec(a.x * b.x, a.y * b.y)
+        end
+        V.__sub = function(a, b)
+          if type(a) == "number" then return vec(a - b.x, a - b.y) end
+          return vec(a.x - b, a.y - b)
+        end
+        local W = setmetatable({}, {__index = V})
+        local function run(n)
+          local acc = vec(0, 0)
+          local s = 0
+          for i = 1, n do
+            local v = vec(i, -i)
+            acc = acc + v * 2
+            acc = 1 + acc
+            acc = acc - 1
+            local w = 3 - v
+            local m = i * v
+            s = s + w.x + m.y
+          end
+          return acc.x + acc.y + s
+        end
+        local out = {}
+        for r = 1, 200 do out[1] = run(30) end
+        -- A table without the metamethod at a compiled site, then the other side's.
+        local plain = {x = 1, y = 2}
+        out[2] = select(2, pcall(function() local a = vec(1, 1) return (plain + a).x end))
+        -- Numbers get a metatable: its __add comes first where the number is on the left.
+        debug.setmetatable(0, {__add = function(a, b) return "num" end, __sub = function(a, b) return "nsub" end})
+        out[3] = tostring(select(2, pcall(run, 3)))
+        debug.setmetatable(0, nil)
+        out[4] = run(30)
+        return table.concat(out, " ")
+"#,
+    );
+}
+
 /// A field site that saw several shapes compiles a test per shape (own
 /// slots, `__index` holders, absent keys); one that saw more takes the
 /// helper.

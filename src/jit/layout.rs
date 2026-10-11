@@ -21,6 +21,12 @@ pub(crate) const METRICS: usize =
 /// The allocation counter and threshold pair inside `Metrics`.
 pub(crate) const GC_CHECK: usize = crate::dmm::metrics::Metrics::GC_CHECK_OFFSET;
 
+/// The cell of the numbers' metatable (`State::type_metatable`), from `rt`,
+/// and the metatable (null when none) within it.
+pub(crate) const NUMBER_MT_CELL: usize = offset_of!(State<'static>, type_metatables) + 2 * 8;
+pub(crate) const NUMBER_MT: usize =
+    Gc::<'static, crate::dmm::lock::Lock<Option<crate::env::table::Table<'static>>>>::VALUE_OFFSET;
+
 /// The end of the running thread's stack, from the `thread` register.
 pub(crate) const THREAD_STACK_END: usize =
     offset_of!(crate::env::thread::ThreadState<'static>, stack_end);
@@ -73,6 +79,14 @@ mod tests {
             assert_eq!(regs, ctx.jit().exit_regs);
             let metrics = unsafe { ((state + METRICS) as *const usize).read() };
             assert_ne!(metrics, 0);
+            let number_mt = || unsafe {
+                let cell = ((state + NUMBER_MT_CELL) as *const usize).read();
+                ((cell + NUMBER_MT) as *const usize).read()
+            };
+            assert_eq!(number_mt(), 0);
+            let mt = crate::env::table::Table::new(ctx);
+            ctx.set_metatable_of(crate::env::value::Value::small(1), Some(mt));
+            assert_ne!(number_mt(), 0);
         });
     }
 
@@ -84,7 +98,7 @@ mod tests {
         lua.load_all();
         let ex = lua
             .try_enter(|ctx| {
-                let src = "local t = setmetatable({10, 20, 30, x = 1}, {__index = {}}) return t";
+                let src = "local t = setmetatable({10, 20, 30, x = 1}, {__index = {}, __add = print}) return t";
                 Ok::<_, crate::LoadError>(ctx.stash(crate::Executor::start(
                     ctx,
                     ctx.load(src, None)?,
@@ -110,6 +124,18 @@ mod tests {
             assert!(bits & MetamethodBits::INDEX.bits() != 0);
             let index = unsafe { ((cw + MtCache::INDEX_OFFSET) as *const Value).read() };
             assert!(index.get_table().is_some());
+            // The other metamethods: shape -> class -> rest -> slot.
+            let sw = word(T_SHAPE) as usize;
+            let class_word =
+                unsafe { ((sw + crate::env::Shape::MT_CACHE_OFFSET) as *const usize).read() };
+            assert_eq!(class_word, cw);
+            let rest = unsafe { ((cw + MtCache::REST_OFFSET) as *const usize).read() };
+            assert_ne!(rest, 0);
+            let i = MetamethodBits::ADD.bits().trailing_zeros() as usize;
+            let add =
+                unsafe { ((rest + MtCache::REST_VALUES_OFFSET + 8 * i) as *const Value).read() };
+            assert_eq!(add.to_raw(), class.mm(MetamethodBits::ADD).to_raw());
+            assert!(add.get_function().is_some());
             let header = unsafe { ((lock as isize + T_HEADER as isize) as *const u64).read() };
             assert_eq!(header & 1 != 0, Gc::is_gray(t.inner()));
         });

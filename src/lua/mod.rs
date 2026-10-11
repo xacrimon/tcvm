@@ -63,7 +63,7 @@ pub struct State<'gc> {
     pub(crate) interner: Interner<'gc>,
     /// Metatables shared by all values of a type that has no per-value one
     /// (PUC's `G(L)->mt`); see `type_metatable`.
-    type_metatables: [GcLock<'gc, Option<Table<'gc>>>; 6],
+    pub(crate) type_metatables: [GcLock<'gc, Option<Table<'gc>>>; 6],
     /// The `next` that `pairs` returns, and the iterator `ipairs` does:
     /// `TFORCALL` walks a table itself when its loop's iterator is one.
     pub(crate) next: Function<'gc>,

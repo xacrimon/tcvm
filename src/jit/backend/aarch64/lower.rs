@@ -593,6 +593,14 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 let d = self.def(res.unwrap());
                 self.push(MInst::HasFlag(mask), &[d], none);
             }
+            Op::NumMtSet => {
+                let d = self.def(res.unwrap());
+                self.push(MInst::NumMtSet, &[d], none);
+            }
+            Op::ClassMm(k) => {
+                let (d, t) = (self.def(res.unwrap()), self.use_(args[0]));
+                self.push(MInst::ClassMm(k), &[d, t], none);
+            }
             Op::FnFixedLua | Op::FnFits => {
                 let (d, p) = (self.def(res.unwrap()), self.use_(args[0]));
                 let m = if op == Op::FnFits {
