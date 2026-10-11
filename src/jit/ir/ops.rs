@@ -234,7 +234,13 @@ impl HelperId {
             HelperId::FMod | HelperId::FPow => (&[][..], None, &[F64, F64], Some(F64), pure),
             HelperId::Sin | HelperId::Cos => (&[][..], None, &[F64], Some(F64), pure),
             // Integers out of i32 are boxed.
-            HelperId::ArithCoerce(k) => (RT, Some(k as u64), &[Val, Val], Some(Val), e(ALLOC, NONE, NONE)),
+            HelperId::ArithCoerce(k) => (
+                RT,
+                Some(k as u64),
+                &[Val, Val],
+                Some(Val),
+                e(ALLOC, NONE, NONE),
+            ),
             HelperId::Unm | HelperId::BNot => (RT, None, &[Val], Some(Val), e(ALLOC, NONE, NONE)),
             HelperId::Len => (
                 RT,
@@ -283,7 +289,11 @@ impl HelperId {
                 Some(a as u64 | (count as u64) << 8),
                 &[],
                 Some(Val),
-                e(ALLOC, Mem::SLOT | Mem::TAB | Mem::ARR | Mem::SHAPE, Mem::SLOT),
+                e(
+                    ALLOC,
+                    Mem::SLOT | Mem::TAB | Mem::ARR | Mem::SHAPE,
+                    Mem::SLOT,
+                ),
             ),
             HelperId::TforIpairs => (
                 RT,
@@ -292,7 +302,13 @@ impl HelperId {
                 Some(Val),
                 Effects::reads(Mem::ARR | Mem::TAB | Mem::META),
             ),
-            HelperId::TopArgs(a) => (STACK, Some(a as u64), &[], Some(I32), Effects::reads(Mem::FRAME)),
+            HelperId::TopArgs(a) => (
+                STACK,
+                Some(a as u64),
+                &[],
+                Some(I32),
+                Effects::reads(Mem::FRAME),
+            ),
             HelperId::VarargAll(a) => (
                 STACK,
                 Some(a as u64),
@@ -319,7 +335,13 @@ impl HelperId {
             HelperId::Type | HelperId::ToNumber | HelperId::StrLen => {
                 (RT, None, &[Val], Some(Val), e(ALLOC, NONE, NONE))
             }
-            HelperId::RawLen => (RT, None, &[Val], Some(Val), e(ALLOC, Mem::TAB | Mem::ARR, NONE)),
+            HelperId::RawLen => (
+                RT,
+                None,
+                &[Val],
+                Some(Val),
+                e(ALLOC, Mem::TAB | Mem::ARR, NONE),
+            ),
             HelperId::ToString => (RT, None, &[Val], Some(Val), lookup),
             HelperId::GetMetatable => (
                 RT,
@@ -764,9 +786,10 @@ impl Effects {
 
     /// Whether the instruction may go when its results are unused.
     pub(crate) fn removable(self) -> bool {
-        !self.flags.intersects(
-            Flags::SIDE_EFFECT | Flags::MAY_DEOPT | Flags::TERMINATOR | Flags::TAILOUT,
-        ) && self.writes.is_empty()
+        !self
+            .flags
+            .intersects(Flags::SIDE_EFFECT | Flags::MAY_DEOPT | Flags::TERMINATOR | Flags::TAILOUT)
+            && self.writes.is_empty()
     }
 
     /// Whether the instruction may move, its memory and exits permitting.
@@ -786,8 +809,8 @@ impl Op {
             Load(_) => Effects::reads(Mem::SLOT),
             Store(_) => e(Flags::empty(), Mem::empty(), Mem::SLOT),
             Guard(_) | GuardTrue | GuardFalse | GuardSame | IAdd | ISub | IMul | INeg | IShl
-            | IShr | IDivFloor | IModFloor | LDivFloor | LModFloor | LToI | LToFExact | FToIExact
-            | ToF64 => Effects::flags(DEOPT),
+            | IShr | IDivFloor | IModFloor | LDivFloor | LModFloor | LToI | LToFExact
+            | FToIExact | ToF64 => Effects::flags(DEOPT),
             GuardNoFlag(_) | GuardFits(_) => e(DEOPT, Mem::FRAME, Mem::empty()),
             GuardShape(_) => e(DEOPT, Mem::SHAPE, Mem::empty()),
             GcCheck => e(DEOPT, Mem::GC, Mem::empty()),
@@ -920,11 +943,15 @@ impl Op {
             | FCeil | FIDiv | ToF64 => Ty::F64,
             IToL | FToL | StrLenOf | LAdd | LSub | LMul | LUDiv | LNeg | LAnd | LOr | LXor
             | LNot | LShl | LShr | LDivFloor | LModFloor => Ty::I64,
-            Helper(HelperId::ArithCoerce(ArithKind::Div | ArithKind::Pow)) => Ty::val(TypeSet::FLOAT),
+            Helper(HelperId::ArithCoerce(ArithKind::Div | ArithKind::Pow)) => {
+                Ty::val(TypeSet::FLOAT)
+            }
             Helper(HelperId::ArithCoerce(ArithKind::Add | ArithKind::Sub | ArithKind::Mul))
             | Helper(HelperId::ArithCoerce(ArithKind::Mod | ArithKind::IDiv))
             | Helper(HelperId::Unm) => Ty::val(TypeSet::NUM),
-            Helper(HelperId::ArithCoerce(_) | HelperId::BNot | HelperId::Len) => Ty::val(TypeSet::INT),
+            Helper(HelperId::ArithCoerce(_) | HelperId::BNot | HelperId::Len) => {
+                Ty::val(TypeSet::INT)
+            }
             Helper(HelperId::Concat | HelperId::Type) => Ty::val(TypeSet::STR),
             Helper(HelperId::Closure { .. }) => Ty::val(TypeSet::FUN),
             Helper(HelperId::NewTable(_) | HelperId::VarargTable(_)) => Ty::val(TypeSet::TAB),

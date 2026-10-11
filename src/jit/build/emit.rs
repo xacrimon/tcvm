@@ -799,8 +799,7 @@ impl Operand {
                 Op::KI32(n) => Some(n as f64),
                 Op::KF64(bits) => Some(f64::from_bits(bits)),
                 Op::KVal(bits) => {
-                    let k: Value<'_> =
-                        unsafe { std::mem::transmute::<u64, Value<'static>>(bits) };
+                    let k: Value<'_> = unsafe { std::mem::transmute::<u64, Value<'static>>(bits) };
                     k.get_small().map(f64::from).or(k.get_float())
                 }
                 _ => None,
@@ -859,7 +858,15 @@ fn emit_unm(b: &mut Builder<'_, '_>, pc: u32, dst: u8, src: u8) {
                 enter_join(b, slow);
                 // Lua passes the operand twice for unary metamethods.
                 cold(b, |b| {
-                    slow_arm(b, join, dst, HelperId::Unm, &[x], MetamethodBits::UNM, &[x, x])
+                    slow_arm(
+                        b,
+                        join,
+                        dst,
+                        HelperId::Unm,
+                        &[x],
+                        MetamethodBits::UNM,
+                        &[x, x],
+                    )
                 });
             }
             enter_join(b, join);
@@ -890,7 +897,15 @@ fn emit_bnot(b: &mut Builder<'_, '_>, pc: u32, dst: u8, src: u8) {
             arm_end(b, join, dst, r);
             enter_join(b, slow);
             cold(b, |b| {
-                slow_arm(b, join, dst, HelperId::BNot, &[x], MetamethodBits::BNOT, &[x, x])
+                slow_arm(
+                    b,
+                    join,
+                    dst,
+                    HelperId::BNot,
+                    &[x],
+                    MetamethodBits::BNOT,
+                    &[x, x],
+                )
             });
             enter_join(b, join);
             return;
@@ -1288,7 +1303,12 @@ fn cmp_f64(b: &mut Builder<'_, '_>, v: Val, k: NumKind) -> Val {
 }
 
 /// `x cc y` of numbers of these kinds.
-fn cmp_num(b: &mut Builder<'_, '_>, cc: Cc, (x, kx): (Val, NumKind), (y, ky): (Val, NumKind)) -> Val {
+fn cmp_num(
+    b: &mut Builder<'_, '_>,
+    cc: Cc,
+    (x, kx): (Val, NumKind),
+    (y, ky): (Val, NumKind),
+) -> Val {
     use NumKind::*;
     match (kx, ky) {
         (I32, I32) => {
@@ -1309,7 +1329,10 @@ fn cmp_num(b: &mut Builder<'_, '_>, cc: Cc, (x, kx): (Val, NumKind), (y, ky): (V
 /// `x < y` (`le`: `<=`) of two strings.
 fn cmp_str(b: &mut Builder<'_, '_>, le: bool, x: Val, y: Val) -> Val {
     let (x, y) = (b.guard(x, TypeSet::STR), b.guard(y, TypeSet::STR));
-    let (px, py) = (b.ins(Op::Unbox(Rep::Ptr), &[x]), b.ins(Op::Unbox(Rep::Ptr), &[y]));
+    let (px, py) = (
+        b.ins(Op::Unbox(Rep::Ptr), &[x]),
+        b.ins(Op::Unbox(Rep::Ptr), &[y]),
+    );
     b.ins(if le { Op::StrLe } else { Op::StrLt }, &[px, py])
 }
 
@@ -1340,7 +1363,9 @@ fn emit_cmp_reg(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Bl
         }
         let by_bits = |t: crate::jit::ir::types::Ty| {
             t.rep == Rep::Val
-                && t.within(TypeSet::NIL | TypeSet::BOOL | TypeSet::STR | TypeSet::FUN | TypeSet::THR)
+                && t.within(
+                    TypeSet::NIL | TypeSet::BOOL | TypeSet::STR | TypeSet::FUN | TypeSet::THR,
+                )
         };
         if by_bits(tx) || by_bits(ty) {
             let (x, y) = (b.boxed(x), b.boxed(y));
@@ -1350,13 +1375,12 @@ fn emit_cmp_reg(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Bl
         }
     }
     // An `_II` form, which exits saw leave i32 when the byte has big integers.
-    let form = (op != generic && !b.kind_exited(pc)).then_some(CmpKind::Num(
-        if byte & fb::BIGINT != 0 {
+    let form =
+        (op != generic && !b.kind_exited(pc)).then_some(CmpKind::Num(if byte & fb::BIGINT != 0 {
             NumKind::I64
         } else {
             NumKind::I32
-        },
-    ));
+        }));
     let kind = |b: &Builder<'_, '_>, v| cmp_own(b, v).or(form).or_else(|| byte_cmp_kind(byte));
     let c = match (kind(b, x), kind(b, y)) {
         (Some(CmpKind::Num(kx)), Some(CmpKind::Num(ky))) => cmp_num(b, cc, (x, kx), (y, ky)),
@@ -1382,7 +1406,11 @@ fn emit_cmp_reg(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Bl
 /// and when not.
 fn targets(sense: bool, succs: &[Block]) -> (Block, Block) {
     let (fall, target) = (succs[0], succs[1]);
-    if sense { (target, fall) } else { (fall, target) }
+    if sense {
+        (target, fall)
+    } else {
+        (fall, target)
+    }
 }
 
 /// `x == y` where a kind is unknown, as `eq_slow` decides it: floats by
@@ -1423,7 +1451,10 @@ fn generic_eq(b: &mut Builder<'_, '_>, x: Val, y: Val, sense: bool, succs: &[Blo
     b.switch_to(differ);
     if big {
         let other = all_in(b, TypeSet::BIGINT, &[x, y]);
-        let (ix, iy) = (b.ins(Op::Unbox(Rep::I64), &[x]), b.ins(Op::Unbox(Rep::I64), &[y]));
+        let (ix, iy) = (
+            b.ins(Op::Unbox(Rep::I64), &[x]),
+            b.ins(Op::Unbox(Rep::I64), &[y]),
+        );
         let c = b.ins(Op::LCmp(Cc::Eq), &[ix, iy]);
         b.br(c, yes, no);
         enter_join(b, other);
@@ -1432,7 +1463,10 @@ fn generic_eq(b: &mut Builder<'_, '_>, x: Val, y: Val, sense: bool, succs: &[Blo
     if calls_mm(b) {
         cold(b, |b| eq_mm_arm(b, x, y, yes, no));
     } else {
-        let (px, py) = (b.ins(Op::Unbox(Rep::Ptr), &[x]), b.ins(Op::Unbox(Rep::Ptr), &[y]));
+        let (px, py) = (
+            b.ins(Op::Unbox(Rep::Ptr), &[x]),
+            b.ins(Op::Unbox(Rep::Ptr), &[y]),
+        );
         let has = tables::class_bit(b, px, MetamethodBits::EQ);
         let s = b.snap_before();
         b.ins_snap(Op::GuardFalse, &[has], s, ExitTag::Mm);

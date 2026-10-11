@@ -299,7 +299,10 @@ pub(crate) fn compile<'gc>(
         exit_common: abi::exit_common as *const () as usize,
         entry_fail: crate::jit::jit_entry_fail as *const () as usize,
         enter: crate::vm::ops::call::enter as *const () as usize,
-        box_i64: tramp(crate::jit::helpers::jit_box_i64 as *const () as usize, false)?,
+        box_i64: tramp(
+            crate::jit::helpers::jit_box_i64 as *const () as usize,
+            false,
+        )?,
         land: crate::jit::helpers::jit_land as *const () as usize,
         trampolines,
     };

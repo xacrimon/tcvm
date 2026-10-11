@@ -48,7 +48,11 @@ pub(crate) fn kind(v: Value<'_>) -> u8 {
 #[inline(always)]
 pub(crate) fn table_key(recv: Value<'_>, key: Value<'_>) -> u8 {
     let recv = if recv.get_table().is_some() { 0 } else { OTHER };
-    let miss = if key.get_small().is_some() { ARR_MISS } else { 0 };
+    let miss = if key.get_small().is_some() {
+        ARR_MISS
+    } else {
+        0
+    };
     recv | kind(key) | miss
 }
 

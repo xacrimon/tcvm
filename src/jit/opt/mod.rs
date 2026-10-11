@@ -87,10 +87,10 @@ pub(crate) fn prune_gc_checks(f: &mut Func<'_>) {
     let allocates = |f: &Func<'_>, b: Block| {
         !f.blocks[b.idx()].cold
             && f.insts_of(b).iter().any(|&i| match f.op(i) {
-            Op::Box => f.ty(f.args(i)[0]).rep == Rep::I64,
-            Op::Call { .. } | Op::CallMm { .. } => false,
-            op => op.effects().has(crate::jit::ir::ops::Flags::MAY_ALLOC),
-        })
+                Op::Box => f.ty(f.args(i)[0]).rep == Rep::I64,
+                Op::Call { .. } | Op::CallMm { .. } => false,
+                op => op.effects().has(crate::jit::ir::ops::Flags::MAY_ALLOC),
+            })
     };
     let mut keep = vec![false; f.blocks.len()];
     let mut in_loop = vec![false; f.blocks.len()];
@@ -119,9 +119,7 @@ pub(crate) fn dce(f: &mut Func<'_>) {
     let mut uses = f.use_counts();
     let removable = |f: &Func<'_>, uses: &[u32], i: Inst| {
         let d = &f.insts[i.idx()];
-        d.op.effects().removable()
-            && d.rn > 0
-            && f.results(i).all(|r| uses[r.idx()] == 0)
+        d.op.effects().removable() && d.rn > 0 && f.results(i).all(|r| uses[r.idx()] == 0)
     };
     let mut dead = vec![false; f.insts.len()];
     let mut work: Vec<Inst> = Vec::new();

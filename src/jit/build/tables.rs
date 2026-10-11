@@ -13,9 +13,9 @@ use crate::instruction::{Instruction, Op as BcOp};
 use crate::jit::build::Builder;
 use crate::jit::build::emit::{arm_end, branch_arm, calls_mm, cold, enter_join, mm_call};
 use crate::jit::feedback as fb;
-use crate::jit::ir::{Block, Val};
 use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL_VAL, HelperId, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
+use crate::jit::ir::{Block, Val};
 use crate::vm::ops::field::read_ic;
 
 /// The receiver of a constant-key site: a register, a by-value upvalue, or
@@ -651,7 +651,13 @@ fn int_key(b: &mut Builder<'_, '_>, pc: u32, k: Val) -> Option<Result<Val, (Val,
 /// The array part's cell and `i` inside it, where the site's feedback never
 /// saw a miss: the class without `bit` and `i` below the size, guarded
 /// (`Bounds`). `None` after a miss: the caller tests both.
-fn array_guards(b: &mut Builder<'_, '_>, pc: u32, t: Val, i: Val, bit: MetamethodBits) -> Option<Val> {
+fn array_guards(
+    b: &mut Builder<'_, '_>,
+    pc: u32,
+    t: Val,
+    i: Val,
+    bit: MetamethodBits,
+) -> Option<Val> {
     if b.feedback(pc) & fb::ARR_MISS != 0 {
         return None;
     }
