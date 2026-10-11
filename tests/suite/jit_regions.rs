@@ -1092,3 +1092,31 @@ fn constants_the_builder_sees() {
 "##,
     );
 }
+
+/// An accumulator that starts an integer and becomes a float keeps its
+/// kinds per iteration; a counter overflowing i32 mid-loop feeds float
+/// operations and intrinsics.
+#[test]
+fn kinds_that_change_in_a_loop() {
+    agrees(
+        r##"
+        local out = {}
+        local function acc(n, x)
+            local a = 0
+            for i = 1, n do a = a + x end
+            return math.type(a) .. ":" .. tostring(a)
+        end
+        for r = 1, 300 do acc(10, 0.5) end
+        out[#out + 1] = acc(0, 0.5) .. " " .. acc(1, 0.5) .. " " .. acc(7, 0.5) .. " " .. acc(3, 2)
+        local s = 0
+        local k = 2147483000
+        for i = 1, 2000 do
+            k = k + 1
+            local k3 = k * k * k
+            s = s + math.sin(k) + (2 / 3) ^ (k % 7) + k3 / 1e30 + math.sqrt(k)
+        end
+        out[#out + 1] = string.format("%.6f", s) .. " " .. math.type(k)
+        return table.concat(out, " ")
+"##,
+    );
+}

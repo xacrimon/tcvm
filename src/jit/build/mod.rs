@@ -1263,7 +1263,15 @@ pub(crate) fn remove_trivial_params(f: &mut Func<'_>) {
                         }
                     }
                 }
-                if trivial && let Some(s) = same {
+                // An i64 into an i32 parameter would need an exit, which has
+                // no snapshot here: the parameter stays.
+                let narrows = |s: Val| {
+                    f.vals[s.idx()].ty.rep == Rep::I64 && f.vals[p.idx()].ty.rep == Rep::I32
+                };
+                if trivial
+                    && let Some(s) = same
+                    && !narrows(s)
+                {
                     map[p.idx()] = s;
                     changed = true;
                 }
