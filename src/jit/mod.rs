@@ -21,8 +21,8 @@ use crate::instruction::{Instruction, Op};
 use crate::jit::ir::ExitKind;
 use crate::jit::region::{ExitInfo, Loc, Region, SRep};
 use crate::jit::state::{
-    EXIT_HOT, Entry, EntryState, JitStateRef, MAX_COMPILES, MAX_ENTRIES, MAX_RECOMPILES,
-    MAX_STRIKES, jit_state,
+    EXIT_HOT, Entry, EntryState, JitStateRef, MAX_COMPILES, MAX_ENTRIES, MAX_RETRIES, MAX_STRIKES,
+    jit_state,
 };
 use crate::lua::Context;
 use crate::vm::abi::{Handler, Slot, handler};
@@ -168,14 +168,15 @@ handler! {
         tail!(h, insn = Slot::insn(word), closure = Slot::closure(closure))
     }
 
-    /// An entry whose slot a hot exit pointed here: compile it again with the
-    /// widened feedback and enter it, or blacklist it.
-    slow fn jit_recompile {
+    /// An entry whose slot a hot exit pointed here: run the original word
+    /// while its feedback settles, then compile it again and enter it, or
+    /// blacklist it.
+    slow fn jit_settle {
         let word = insn.as_insn();
         let closure: LuaFn<'gc> = unsafe { frame::closure(base) };
         let site = unsafe { pc.sub(1) };
         let at = unsafe { site.offset_from_unsigned(closure.code) } as u32;
-        match recompile(rt, closure, at, word.d(), base) {
+        match settle(rt, closure, at, word.d(), base) {
             Ok(entry) => {
                 let h = unsafe { as_handler(entry) };
                 tail!(h, insn = Slot::insn(word), closure = Slot::closure(closure))
@@ -376,8 +377,9 @@ fn install<'gc>(
         original: word,
         slot,
         region: Some(region),
-        recompiles: 0,
+        retries: 0,
         free_recompile: false,
+        settle: 0,
         state: EntryState::Compiled,
         nest: region.nest.clone(),
         age,
@@ -495,7 +497,7 @@ fn on_exit<'gc>(
     }
     if e.tag == ExitTag::NeverRan && n == 1 {
         request_recompile(ctx, closure, region, true);
-    } else if e.tag.widenable() && n == EXIT_HOT {
+    } else if e.tag.widenable() && n == region.exit_hot.get() {
         log(ctx, || {
             format!(
                 "hot exit {} pc{} ({:?}) of the region at pc{}",
@@ -505,18 +507,20 @@ fn on_exit<'gc>(
                 region.entry_pc
             )
         });
-        // A site's kinds widen to generic once and its shapes grow to at
-        // most `MAX_SHAPES + 1`, so a recompile that learns one of them is
-        // outside the budget, as the never-executed rule's are.
+        // Feedback only grows (kinds, the overflow, misses and metamethod
+        // bits, shapes up to `MAX_SHAPES + 1`), so a recompile that learns
+        // some is outside the budget, as the never-executed rule's are.
         let st = jit_state(ctx.mutation(), closure.proto);
         let st = st.borrow();
-        let learned = match e.tag {
-            ExitTag::Type => st.kind_exits[region.known.0 as usize..].contains(&pc),
-            ExitTag::Shape => st.shapes_seen[region.known.1 as usize..]
-                .iter()
-                .any(|&(p, _)| p == pc),
-            _ => false,
-        };
+        let byte = closure.proto.feedback.get(pc as usize).map_or(0, |c| c.get());
+        let learned = byte != e.byte
+            || match e.tag {
+                ExitTag::Type => st.kind_exits[region.known.0 as usize..].contains(&pc),
+                ExitTag::Shape => st.shapes_seen[region.known.1 as usize..]
+                    .iter()
+                    .any(|&(p, _)| p == pc),
+                _ => false,
+            };
         drop(st);
         request_recompile(ctx, closure, region, learned);
     }
@@ -659,7 +663,7 @@ fn on_entry_fail<'gc>(
             format!("first entry fail {} pc{}", name(), region.entry_pc)
         });
     }
-    if n == EXIT_HOT && !region.retired.get() {
+    if n == region.exit_hot.get() && !region.retired.get() {
         log(ctx, || {
             format!("hot entry fail {} pc{}", name(), region.entry_pc)
         });
@@ -667,11 +671,14 @@ fn on_entry_fail<'gc>(
     }
 }
 
+/// Point the region's entry at `jit_settle`: a quarter of the hot count
+/// after an exit that learned something, so kinds that arrive close
+/// together make one compile; the hot count doubled per retry otherwise.
 fn request_recompile<'gc>(
     ctx: Context<'gc>,
     closure: LuaFn<'gc>,
     region: &Region<'gc>,
-    free: bool,
+    learned: bool,
 ) {
     let Some(state) = closure.proto.jit.get() else {
         return;
@@ -685,14 +692,49 @@ fn request_recompile<'gc>(
         .find(|e| e.region.is_some_and(|r| Gc::as_ptr(r) == me))
         && e.state == EntryState::Compiled
     {
-        e.state = EntryState::Recompile;
-        e.free_recompile |= free;
-        ctx.jit().set_slot(e.slot, jit_recompile as *const u8);
+        let hot = ctx.jit().hot_start(e.original) as u32;
+        e.state = EntryState::Settling;
+        e.free_recompile |= learned;
+        e.settle = if e.free_recompile {
+            hot / 4
+        } else {
+            hot << e.retries
+        };
+        ctx.jit().set_slot(e.slot, jit_settle as *const u8);
         // Compiled callers come through `enter` to the recompile too.
         if e.pc == 0 {
             closure.proto.jit_fast.set(0);
         }
     }
+}
+
+/// One execution of a settling entry: the original word to run while it
+/// settles, else the recompile's.
+fn settle<'gc>(
+    ctx: Context<'gc>,
+    closure: LuaFn<'gc>,
+    at: u32,
+    slot: u16,
+    frame: *const Value<'gc>,
+) -> Result<*const u8, Instruction> {
+    let state = closure
+        .proto
+        .jit
+        .get()
+        .expect("a settling entry without a JIT state");
+    {
+        let mut st = state.borrow_mut(ctx.mutation());
+        let e = st
+            .entries
+            .iter_mut()
+            .find(|e| e.slot == slot)
+            .expect("a settling entry without its entry");
+        if e.settle > 0 {
+            e.settle -= 1;
+            return Err(e.original);
+        }
+    }
+    recompile(ctx, closure, at, slot, frame)
 }
 
 /// Recompile the entry in `slot` at `at`: its new entry address, or the
@@ -719,7 +761,7 @@ fn recompile<'gc>(
             .expect("a recompile without its entry");
         (
             e.original,
-            e.free_recompile || e.recompiles < MAX_RECOMPILES,
+            e.free_recompile || e.retries < MAX_RETRIES,
             e.seen.clone(),
         )
     };
@@ -744,9 +786,10 @@ fn recompile<'gc>(
                 old.retired.set(true);
             }
             if !e.free_recompile {
-                e.recompiles += 1;
+                e.retries += 1;
             }
             e.free_recompile = false;
+            region.exit_hot.set(EXIT_HOT << e.retries);
             e.region = Some(region);
             e.state = EntryState::Compiled;
             st.regions.push(region);

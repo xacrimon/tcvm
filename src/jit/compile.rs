@@ -380,6 +380,11 @@ pub(crate) fn compile<'gc>(
             snap: at as u32,
             tag: e.tag,
             count: std::cell::Cell::new(0),
+            byte: closure
+                .proto
+                .feedback
+                .get(e.pc as usize)
+                .map_or(0, |c| c.get()),
         });
     }
     let known = closure.proto.jit.get().map_or((0, 0), |s| {
@@ -407,6 +412,7 @@ pub(crate) fn compile<'gc>(
             num_spills: em.num_spills,
             retired: std::cell::Cell::new(false),
             known,
+            exit_hot: std::cell::Cell::new(crate::jit::state::EXIT_HOT),
         },
     );
     region
