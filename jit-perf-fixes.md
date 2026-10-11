@@ -349,7 +349,7 @@ are 32-bit.
 | `I32`, `F64` | `scvtf; fcmp`, no guard |
 | `I64`, `F64` | the 2^53 guard below, then `scvtf; fcmp`; the same guard gives `==`, since an int that fits equals the float iff the doubles are equal |
 | `STR`, `STR`: `==`, `~=` | `cmp` of the pointers (every string is interned; the JEQS form already does this) |
-| `STR`, `STR`: `<`, `<=` | the inline word loop below, a pure `StrCmp` op with no clobbers; tcvm's `Ord` is bytewise like LuaJIT's `lj_str_cmp` (`lj_str.c:19`), not reference Lua's locale `strcoll`, so this changes nothing |
+| `STR`, `STR`: `<`, `<=` | the inline byte loop below, a pure `StrCmp` op with no clobbers; tcvm's `Ord` is bytewise like LuaJIT's `lj_str_cmp` (`lj_str.c:19`), not reference Lua's locale `strcoll`, so this changes nothing |
 | different kinds, `==` / `~=` (other than int, float) | the constant `false` / `true`; in 5.5 `__eq` only fires for two tables or two userdata. TurboFan folds `ReferenceEqual` when the types are disjoint (`typed-optimization.cc:461`); LuaJIT's `lj_record_objcmp` returns "two different types are never equal" and emits nothing (`lj_record.c:244`) |
 | different kinds, booleans or nil under `<` / `<=` | exit; the interpreter raises (LuaJIT aborts the trace there, `lj_record.c:2378`) |
 | `TAB`, `TAB` or `UD`, `UD`: `==` | pointer compare under a `TabMmBits` guard that the class has no `__eq`, the same guard the nil arm uses for `__index`; with `__eq` in feedback, the cold arm |
@@ -368,12 +368,11 @@ fcmp  d16, d0
 b.mi  taken
 ```
 
-String ordering, LuaJIT's `lj_str_cmp` widened to 8-byte words: `a < b`
-with `x0`, `x1` the string objects, `LEN` and `DATA` the header offsets. The
-loop body is six instructions; the whole sequence about twenty. Like
-LuaJIT's, it reads up to 7 bytes past the shorter string, so string storage
-needs that much readable padding (LuaJIT's "innocuous access up to end of
-string + 3").
+String ordering, a byte loop: `a < b` with `x0`, `x1` the string objects,
+`LEN` and `DATA` the header offsets. The loop body is six instructions, the
+whole sequence seventeen, and it reads nothing past either string. (LuaJIT's
+`lj_str_cmp` compares a word at a time and relies on readable padding after
+the string; that is a later refinement once the string allocator pads.)
 
 ```
 ldr   w2, [x0, #LEN]
@@ -386,20 +385,11 @@ mov   x5, xzr
 1:
 cmp   x5, x4
 b.hs  3f                  ; common prefix equal: the shorter is smaller
-ldr   x6, [x0, x5]
-ldr   x7, [x1, x5]
-add   x5, x5, #8
-cmp   x6, x7
+ldrb  w6, [x0, x5]
+ldrb  w7, [x1, x5]
+add   x5, x5, #1
+cmp   w6, w7
 b.eq  1b
-rev   x6, x6              ; first byte into the high bits
-rev   x7, x7
-subs  x8, x5, x4          ; bytes read past n, if the word straddles the end
-csel  x8, x8, xzr, hi
-lsl   x8, x8, #3
-lsr   x6, x6, x8          ; drop them
-lsr   x7, x7, x8
-cmp   x6, x7
-b.eq  3f
 cset  w0, lo              ; `ls` for <=
 b     4f
 3:
@@ -501,7 +491,7 @@ main loop reloads five registers and re-guards three after every `resume`.
 in its home slot as a boxed `Value`; after it, the builder reads every
 register again with `Load` and the resume re-guards them, because the frame
 was popped (before J10) and because a callee could in principle have changed
-the slots (D4, `debug.setlocal`). J10 keeps the native frame across a fast
+the slots (D4, `debug.setlocal`, which is not implemented). J10 keeps the native frame across a fast
 call but the protocol still assumes nothing survives. The header is written
 in full at every call, the callee is tested dynamically, its entry repeats
 `enter`'s checks, the result lands through memory with a nil default.
@@ -512,14 +502,14 @@ in full at every call, the callee is tested dynamically, its entry repeats
    registers it reloads: no guards, no unboxing of a value the region
    already had unboxed (the `Load` after the resume is typed by the value
    stored before the call, and a `Load` of a slot whose boxed value is also
-   needed is one `ldr`). The only writer of a suspended frame's registers is
-   `debug.setlocal`; it runs as a native, so the chain was reset and the
-   caller resumes through header word 1: `debug.setlocal` on a frame whose
-   continuation is a region resume point rewrites word 1 to that resume
-   point's *checking* twin (every resume block gets one, emitted in the cold
-   section, that reloads and re-guards as today). Nothing else changes.
-   Removes the 5 guards and 3 unboxes per iteration in spectral, the 3
-   re-guards in coroutine-ring, the `n` re-guard in fib.
+   needed is one `ldr`). The only thing that could write a suspended
+   frame's registers is `debug.setlocal`, and `src/builtin/debug.rs` does
+   not implement it (nor `sethook`); nothing is done to accommodate it
+   until it exists, at which point it has to invalidate the frame's resume
+   point (rewrite header word 1 to a checking twin that reloads and
+   re-guards). Nothing else changes. Removes the 5 guards and 3 unboxes per
+   iteration in spectral, the 3 re-guards in coroutine-ring, the `n`
+   re-guard in fib.
 2. *Values stay in the frame across fast calls.* The frame is kept (J10), so
    a value live across the call lives in the region's spill slots or in a
    callee-saved register instead of its home slot: `regalloc2` sees a fast
