@@ -1388,9 +1388,10 @@ impl Em<'_> {
         self.a.lslv(Sz::X, d, n, cnt);
         self.a.b(done);
         self.a.bind(neg);
+        // Unsigned: `-i64::MIN` is still negative.
         self.a.neg(Sz::X, cnt, cnt);
         self.a.cmp_imm(Sz::X, cnt, 64);
-        self.a.b_cond(Cond::Ge, zero);
+        self.a.b_cond(Cond::Hs, zero);
         self.a.lsrv(Sz::X, d, n, cnt);
         self.a.b(done);
         self.a.bind(zero);

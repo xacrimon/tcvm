@@ -1034,3 +1034,21 @@ fn array_access_misses() {
 "##,
     );
 }
+
+/// 64-bit shifts by counts at and past the width, `math.mininteger` among
+/// them, whose negation is itself.
+#[test]
+fn shift_counts_at_the_extremes() {
+    agrees(
+        r##"
+        local function sh(a, b) return a << b, a >> b end
+        local out = {}
+        for i = 1, 300 do sh(1 << 40, i % 70) end
+        for _, c in ipairs({math.mininteger, -64, -63, 63, 64, math.maxinteger, -1}) do
+            local l, r = sh(5, c)
+            out[#out + 1] = l .. ":" .. r
+        end
+        return table.concat(out, " ")
+"##,
+    );
+}
