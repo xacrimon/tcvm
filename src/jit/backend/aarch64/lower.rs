@@ -597,6 +597,10 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 let d = self.def(res.unwrap());
                 self.push(MInst::NumMtSet, &[d], none);
             }
+            Op::TypeMtIs { slot, word } => {
+                let d = self.def(res.unwrap());
+                self.push(MInst::TypeMtIs { slot, word }, &[d], none);
+            }
             Op::ClassMm(k) => {
                 let (d, t) = (self.def(res.unwrap()), self.use_(args[0]));
                 self.push(MInst::ClassMm(k), &[d, t], none);

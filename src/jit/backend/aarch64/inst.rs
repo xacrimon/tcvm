@@ -180,6 +180,11 @@ pub(crate) enum MInst {
     HasFlag(u8),
     /// `[def d]`: whether numbers have a metatable.
     NumMtSet,
+    /// `[def d]`: whether a type's metatable is the one with that word.
+    TypeMtIs {
+        slot: u8,
+        word: u64,
+    },
     /// `[def d, use t]`: the metamethod of a bit index from the table's class.
     ClassMm(u8),
     /// `[def d, use t]`: the class bits of the table, 0 without a class.

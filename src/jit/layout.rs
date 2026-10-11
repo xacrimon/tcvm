@@ -21,9 +21,13 @@ pub(crate) const METRICS: usize =
 /// The allocation counter and threshold pair inside `Metrics`.
 pub(crate) const GC_CHECK: usize = crate::dmm::metrics::Metrics::GC_CHECK_OFFSET;
 
-/// The cell of the numbers' metatable (`State::type_metatable`), from `rt`,
-/// and the metatable (null when none) within it.
-pub(crate) const NUMBER_MT_CELL: usize = offset_of!(State<'static>, type_metatables) + 2 * 8;
+/// The cell of a type's metatable (`State::type_metatable`, by its slot
+/// there) from `rt`, and the metatable's word (null when none) within it.
+pub(crate) const fn type_mt_cell(slot: u8) -> usize {
+    offset_of!(State<'static>, type_metatables) + 8 * slot as usize
+}
+pub(crate) const NUMBER_MT_CELL: usize = type_mt_cell(2);
+pub(crate) const STRING_MT_SLOT: u8 = 3;
 pub(crate) const NUMBER_MT: usize =
     Gc::<'static, crate::dmm::lock::Lock<Option<crate::env::table::Table<'static>>>>::VALUE_OFFSET;
 

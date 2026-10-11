@@ -725,6 +725,33 @@ fn length_operator() {
     );
 }
 
+/// String methods through the strings' metatable, its `__index` and the
+/// library's slot, each guarded; replacing a method, or `__index` itself,
+/// after compiling (the design's `hijacked` example, 11.5).
+#[test]
+fn string_methods() {
+    agrees(
+        r#"
+        local function work(s, i)
+          return s:upper() .. s:sub(2, 3) .. (s:byte(i % #s + 1) or 0) .. s:len() .. s:rep(2, "-") .. ("%d"):format(i)
+        end
+        local out = {}
+        for r = 1, 300 do out[1] = work("hello", r) end
+        local saved = string.sub
+        string.sub = function(s, i, j) return "SUB" end
+        for r = 1, 50 do out[2] = work("abc", r) end
+        string.sub = saved
+        local smt = getmetatable("")
+        local lib = smt.__index
+        smt.__index = {upper = function() return "hijacked" end, sub = lib.sub, byte = lib.byte, len = lib.len, rep = lib.rep, format = lib.format}
+        for r = 1, 50 do out[3] = work("xyz", r) end
+        smt.__index = lib
+        for r = 1, 50 do out[4] = work("back", r) end
+        return table.concat(out, " ")
+"#,
+    );
+}
+
 /// A field site that saw several shapes compiles a test per shape (own
 /// slots, `__index` holders, absent keys); one that saw more takes the
 /// helper.

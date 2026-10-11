@@ -705,6 +705,14 @@ impl Em<'_> {
                 self.a.cmp_imm(Sz::X, X16, 0);
                 self.a.cset(Sz::W, d, Cond::Ne);
             }
+            TypeMtIs { slot, word } => {
+                let d = self.r(i, 0);
+                self.a.ldr(X16, RT, layout::type_mt_cell(slot) as i32);
+                self.a.ldr(X16, X16, layout::NUMBER_MT as i32);
+                self.a.ldr_lit(X17, word);
+                self.a.cmp(Sz::X, X16, X17);
+                self.a.cset(Sz::W, d, Cond::Eq);
+            }
             ClassMm(k) => {
                 // Shape, class, the class's other metamethods: each may be
                 // missing (null), and then so is the metamethod.

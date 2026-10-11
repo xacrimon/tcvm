@@ -239,6 +239,13 @@ impl<'gc> Context<'gc> {
 
     /// The metatable numbers share, usually none.
     #[inline]
+    /// The word compiled code reads from the cell of strings' metatable.
+    pub(crate) fn string_metatable_word(self) -> u64 {
+        let cell = self.state.type_metatable(crate::lua::ValueKind::String);
+        // SAFETY: the cell holds an `Option<Table>`, a pointer or null.
+        unsafe { (crate::dmm::Gc::as_ptr(cell) as *const u64).read() }
+    }
+
     pub(crate) fn number_metatable(self) -> Option<Table<'gc>> {
         self.state
             .type_metatable(crate::lua::ValueKind::Float)

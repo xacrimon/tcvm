@@ -514,6 +514,12 @@ pub(crate) enum Op {
     HasFlag(u8),
     /// Whether numbers have a metatable.
     NumMtSet,
+    /// Whether the metatable of a type (by its `State` slot) is still the
+    /// one whose word that is.
+    TypeMtIs {
+        slot: u8,
+        word: u64,
+    },
     /// Whether the function (a `Ptr` to its closure) is a Lua closure
     /// without varargs.
     FnFixedLua,
@@ -691,7 +697,7 @@ impl Op {
             TabLoad { .. } | ArrLoad => Effects::R_TAB,
             ArrNext => Effects::R_TAB | Effects::R_SHAPE,
             ClassMm(_) | TabMmBits => Effects::R_SHAPE | Effects::R_META,
-            NumMtSet => Effects::R_META,
+            NumMtSet | TypeMtIs { .. } => Effects::R_META,
             TabStore { .. } | ArrStore => Effects::W_TAB,
             TabHasRoom(_) | TabASize | TabArray => Effects::R_SHAPE,
             TabSetShape(_) => Effects::W_SHAPE,
@@ -783,7 +789,7 @@ impl Op {
             TabArray => Ty::PTR,
             TabHasRoom(_) | ShapeIs(_) => Ty::B1,
             VarargAt(_) | VarargIdx => Ty::ANY,
-            HasFlag(_) | FnFixedLua | FnFits | NumMtSet => Ty::B1,
+            HasFlag(_) | FnFixedLua | FnFits | NumMtSet | TypeMtIs { .. } => Ty::B1,
             ClassMm(_) => Ty::ANY,
             Box => args[0].boxed(),
             Unbox(rep) => Ty {
