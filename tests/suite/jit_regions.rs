@@ -1180,3 +1180,31 @@ fn values_live_across_calls() {
 "##,
     );
 }
+
+/// Invariant i32 arithmetic on a path the loop does not always take moves
+/// out of the loop; where it leaves i32 the loop runs in the interpreter.
+#[test]
+fn invariant_arithmetic_leaves_the_loop() {
+    agrees(
+        r##"
+        local function count(t, c, n)
+            local hits = 0
+            for i = 1, #t do
+                local v = t[i]
+                if v == 0 then hits = hits + 1
+                elseif v - i == c - n or v + i == c + n then hits = hits + 10 end
+            end
+            return hits
+        end
+        local t = {}
+        for i = 1, 64 do t[i] = i % 5 end
+        local out = {}
+        for r = 1, 300 do out[1] = count(t, r % 7, 3) end
+        out[2] = count(t, math.maxinteger, -5)
+        out[3] = count(t, 2147483647, -1)
+        out[4] = count(t, -2147483648, 1)
+        out[5] = count(t, 4, 1)
+        return table.concat(out, " ")
+"##,
+    );
+}

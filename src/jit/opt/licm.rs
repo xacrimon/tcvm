@@ -5,7 +5,9 @@
 //! runs, and a load or a memory guard only until an exiting instruction
 //! stays: it may rely on the guards before it (a table's shape for a slot's
 //! offset). A moved exit leaves `Before` the loop header with the
-//! preheader's frame.
+//! preheader's frame. Invariant i32 arithmetic elsewhere in the loop moves
+//! as i64 arithmetic and a narrowing exit (E3): it exits only where the
+//! interpreter's result would leave i32 anyway.
 
 use crate::jit::ir::ops::{Flags, Mem, Op};
 use crate::jit::ir::{Block, Func, Inst, Val};
@@ -102,6 +104,7 @@ fn hoist(f: &mut Func<'_>, h: Block, body: &[Block]) -> bool {
     });
     let mut moves: Vec<Inst> = Vec::new();
     let mut moved = vec![false; f.insts.len()];
+    let mut widened = vec![false; f.insts.len()];
     // Pure instructions anywhere; the spine's exits and loads in order.
     let mut ordered = true;
     for &b in cfg.rpo.iter().filter(|&&b| in_body[b.idx()]) {
@@ -137,8 +140,18 @@ fn hoist(f: &mut Func<'_>, h: Block, body: &[Block]) -> bool {
                 && (!calls
                     || (op.is_pure() || matches!(op, Op::Guard(_)))
                         && f.args(i).iter().all(|&a| rematerializable(f, a)));
-            if ok {
+            let invariant = f.args(i).iter().all(|&a| {
+                f.def_inst(a).is_some_and(|d| moved[d.idx()])
+                    || f.def_block(a).is_none_or(|d| !in_body[d.idx()])
+            });
+            let widen = !ok
+                && matches!(op, Op::IAdd | Op::ISub | Op::IMul)
+                && entry_snap.is_some()
+                && invariant
+                && (!calls || f.args(i).iter().all(|&a| rematerializable(f, a)));
+            if ok || widen {
                 moved[i.idx()] = true;
+                widened[i.idx()] = widen;
                 moves.push(i);
             } else if exits && on_spine && op != Op::GcCheck {
                 // What it tests may be what a later load relies on.
@@ -176,6 +189,27 @@ fn hoist(f: &mut Func<'_>, h: Block, body: &[Block]) -> bool {
         f.retain(b, |_, i| !moved[i.idx()]);
     }
     for &i in &moves {
+        if widened[i.idx()] {
+            // `i` becomes the narrowing of its i64 twin, keeping its result.
+            let args = [f.args(i)[0], f.args(i)[1]];
+            let wide = match f.op(i) {
+                Op::IAdd => Op::LAdd,
+                Op::ISub => Op::LSub,
+                _ => Op::LMul,
+            };
+            let tag = crate::jit::ir::ops::ExitTag::Type;
+            let (x, y) = (
+                f.make_inst(Op::IToL, &args[..1], None, tag),
+                f.make_inst(Op::IToL, &args[1..], None, tag),
+            );
+            f.insert_before_term(pre, x);
+            f.insert_before_term(pre, y);
+            let l = f.make_inst(wide, &[f.result(x), f.result(y)], None, tag);
+            f.insert_before_term(pre, l);
+            f.insts[i.idx()].op = Op::LToI;
+            f.insts[i.idx()].an = 1;
+            f.args_mut(i)[0] = f.result(l);
+        }
         f.insert_before_term(pre, i);
     }
     true
