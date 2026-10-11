@@ -4,7 +4,7 @@
 //! used then dies at its last other use instead of living to the last exit.
 
 use crate::jit::FastMap;
-use crate::jit::ir::ops::{Effects, Op};
+use crate::jit::ir::ops::{Mem, Op};
 use crate::jit::ir::{Block, CfgInfo, Func, Inst, NO_SNAP, Val};
 
 /// Blocks as a bit set.
@@ -18,7 +18,7 @@ fn has(s: &Blocks, b: Block) -> bool {
 fn writes(op: Op) -> Option<Option<u8>> {
     match op {
         Op::Store(r) => Some(Some(r)),
-        op if op.effects().has(Effects::W_SLOT) => Some(None),
+        op if op.effects().writes.contains(Mem::SLOT) => Some(None),
         _ => None,
     }
 }

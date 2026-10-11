@@ -433,20 +433,45 @@ pub(crate) extern "C" fn jit_vararg_table(
     Value::table(vararg_table(ctx, base, np as usize)).to_raw()
 }
 
-/// `recv[key]` as `get_slow` resolves it without calling a function.
+/// `recv[key]` as `get_slow` resolves it without calling a function. A
+/// stale or not yet adopted class fails rather than be refreshed, so the
+/// walk writes nothing (`HelperId::Index` is a read).
 pub(crate) extern "C" fn jit_index(rt: *const State<'static>, recv: u64, key: u64) -> u64 {
     let ctx = unsafe { Context::from_state(rt) };
-    let (recv, key) = unsafe { (Value::from_raw(recv), Value::from_raw(key)) };
-    if let Some(t) = recv.get_table() {
-        let v = t.raw_get(key);
-        if !v.is_nil() {
-            return v.to_raw();
+    let (mut recv, key) = unsafe { (Value::from_raw(recv), Value::from_raw(key)) };
+    for _ in 0..crate::vm::ops::meta::MAX_TAG_LOOP {
+        let class = match recv.get_table() {
+            Some(t) => {
+                let v = t.raw_get(key);
+                if !v.is_nil() {
+                    return v.to_raw();
+                }
+                match t.shape().mt_cache() {
+                    Some(c) => c,
+                    None => return Value::nil().to_raw(),
+                }
+            }
+            None => match ctx.metatable_of(recv).and_then(|mt| mt.inner().borrow().mt_cache()) {
+                Some(c) => c,
+                None => return HELPER_FAIL_VAL,
+            },
+        };
+        if class.is_stale() {
+            return HELPER_FAIL_VAL;
         }
+        let mm = class.mm(MetamethodBits::INDEX);
+        if mm.is_nil() {
+            return match recv.get_table() {
+                Some(_) => Value::nil().to_raw(),
+                None => HELPER_FAIL_VAL,
+            };
+        }
+        if mm.get_table().is_none() {
+            return HELPER_FAIL_VAL;
+        }
+        recv = mm;
     }
-    match walk_index_chain(ctx, recv, key) {
-        IndexChain::Resolved(v) => v.to_raw(),
-        _ => HELPER_FAIL_VAL,
-    }
+    HELPER_FAIL_VAL
 }
 
 /// The metamethod of `bit` from `a`, else `b` (`binop_metamethod`), or nil.

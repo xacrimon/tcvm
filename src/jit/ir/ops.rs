@@ -231,111 +231,139 @@ impl HelperId {
         const FRAME: &[Ctx] = &[Ctx::Rt, Ctx::Thread, Ctx::Base];
         const BASE: &[Ctx] = &[Ctx::Rt, Ctx::Base];
         const STACK: &[Ctx] = &[Ctx::Thread, Ctx::Base];
-        let alloc = Effects::MAY_ALLOC;
+        const ALLOC: Flags = Flags::MAY_ALLOC;
+        const NO: Flags = Flags::empty();
+        const NONE: Mem = Mem::empty();
+        let pure = Effects::NONE;
+        // A metamethod lookup moves a table off a stale class (`Table::meta`)
+        // or adopts a metatable's class.
+        let lookup = Effects::new(ALLOC, Mem::SHAPE | Mem::META, Mem::SHAPE | Mem::META);
+        let table_write = Mem::TAB | Mem::ARR | Mem::SHAPE | Mem::META | Mem::GC;
+        let e = Effects::new;
         let (ctx, imm, args, ret, effects): (_, _, &'static [Rep], _, _) = match self {
-            HelperId::FMod | HelperId::FPow => {
-                (&[][..], None, &[F64, F64], Some(F64), Effects::NONE)
-            }
-            HelperId::Sin | HelperId::Cos => (&[][..], None, &[F64], Some(F64), Effects::NONE),
-            HelperId::Lt | HelperId::Le | HelperId::Eq => {
-                (RT, None, &[Val, Val], Some(I32), Effects::NONE)
-            }
-            HelperId::Arith(k) => (RT, Some(k as u64), &[Val, Val], Some(Val), alloc),
-            HelperId::Unm | HelperId::BNot | HelperId::Len => (RT, None, &[Val], Some(Val), alloc),
-            HelperId::Concat => (RT, None, &[Val, Val], Some(Val), alloc),
-            HelperId::UpvalBarrier(i) => (FRAME, Some(i as u64), &[], None, Effects::NONE),
+            HelperId::FMod | HelperId::FPow => (&[][..], None, &[F64, F64], Some(F64), pure),
+            HelperId::Sin | HelperId::Cos => (&[][..], None, &[F64], Some(F64), pure),
+            HelperId::Lt | HelperId::Le => (RT, None, &[Val, Val], Some(I32), pure),
+            HelperId::Eq => (RT, None, &[Val, Val], Some(I32), lookup),
+            // Integers out of i32 are boxed.
+            HelperId::Arith(k) => (RT, Some(k as u64), &[Val, Val], Some(Val), e(ALLOC, NONE, NONE)),
+            HelperId::Unm | HelperId::BNot => (RT, None, &[Val], Some(Val), e(ALLOC, NONE, NONE)),
+            HelperId::Len => (
+                RT,
+                None,
+                &[Val],
+                Some(Val),
+                e(ALLOC, Mem::TAB | Mem::ARR | lookup.reads, lookup.writes),
+            ),
+            HelperId::Concat => (RT, None, &[Val, Val], Some(Val), e(ALLOC, NONE, NONE)),
+            HelperId::UpvalBarrier(i) => (FRAME, Some(i as u64), &[], None, e(NO, NONE, Mem::GC)),
+            // New open upvalues join the thread's list.
             HelperId::Closure { proto, dst } => (
                 FRAME,
                 Some(proto as u64 | (dst as u64) << 32),
                 &[],
                 Some(Val),
-                alloc | Effects::R_SLOT | Effects::W_FRAME,
+                e(ALLOC, Mem::SLOT, Mem::FRAME),
             ),
             HelperId::Close(a) => (
                 FRAME,
                 Some(a as u64),
                 &[],
                 None,
-                Effects::R_SLOT | Effects::W_UPVAL,
+                e(NO, Mem::SLOT | Mem::FRAME, Mem::UPVAL | Mem::FRAME),
             ),
-            HelperId::NewTable(t) => (BASE, Some(t as u64), &[], Some(Val), alloc),
+            HelperId::NewTable(t) => (BASE, Some(t as u64), &[], Some(Val), e(ALLOC, NONE, NONE)),
             HelperId::SetList { a, n, off } => (
                 FRAME,
                 Some(a as u64 | (n as u64) << 8 | (off as u64) << 16),
                 &[],
                 None,
-                alloc | Effects::R_SLOT | Effects::W_TAB | Effects::W_SHAPE,
+                e(ALLOC, Mem::SLOT | Mem::FRAME, Mem::TAB | Mem::ARR | Mem::GC),
             ),
-            HelperId::VarargGet => (BASE, None, &[Val], Some(Val), alloc),
+            HelperId::VarargGet => (BASE, None, &[Val], Some(Val), e(ALLOC, NONE, NONE)),
             HelperId::VarargTable(np) => (
                 BASE,
                 Some(np as u64),
                 &[],
                 Some(Val),
-                alloc | Effects::W_SLOT,
+                e(ALLOC, NONE, Mem::SLOT),
             ),
-            // A lookup moves a table off a stale class (`Table::meta`).
-            HelperId::Mm(bit) => (
-                RT,
-                Some(bit as u64),
-                &[Val, Val],
-                Some(Val),
-                alloc | Effects::W_SHAPE | Effects::W_META,
-            ),
-            HelperId::IndexFn | HelperId::NewIndexFn => (
-                RT,
-                None,
-                &[Val, Val],
-                Some(Val),
-                alloc | Effects::W_SHAPE | Effects::W_META,
-            ),
+            HelperId::Mm(bit) => (RT, Some(bit as u64), &[Val, Val], Some(Val), lookup),
+            HelperId::IndexFn | HelperId::NewIndexFn => (RT, None, &[Val, Val], Some(Val), lookup),
             HelperId::TforNext { a, count } => (
                 BASE,
                 Some(a as u64 | (count as u64) << 8),
                 &[],
                 Some(Val),
-                alloc | Effects::R_SLOT | Effects::W_SLOT,
+                e(ALLOC, Mem::SLOT | Mem::TAB | Mem::ARR | Mem::SHAPE, Mem::SLOT),
             ),
-            HelperId::TforIpairs => (RT, None, &[Val, Val], Some(Val), alloc),
-            HelperId::TopArgs(a) => (STACK, Some(a as u64), &[], Some(I32), Effects::NONE),
-            HelperId::VarargAll(a) => (STACK, Some(a as u64), &[], Some(Val), Effects::W_SLOT),
+            HelperId::TforIpairs => (
+                RT,
+                None,
+                &[Val, Val],
+                Some(Val),
+                Effects::reads(Mem::ARR | Mem::TAB | Mem::META),
+            ),
+            HelperId::TopArgs(a) => (STACK, Some(a as u64), &[], Some(I32), Effects::reads(Mem::FRAME)),
+            HelperId::VarargAll(a) => (
+                STACK,
+                Some(a as u64),
+                &[],
+                Some(Val),
+                e(NO, Mem::FRAME, Mem::SLOT | Mem::FRAME),
+            ),
+            // Fails rather than refresh a stale class (`jit_index`).
             HelperId::Index => (
                 RT,
                 None,
                 &[Val, Val],
                 Some(Val),
-                alloc | Effects::W_SHAPE | Effects::W_META,
+                Effects::reads(Mem::TAB | Mem::ARR | Mem::SHAPE | Mem::META),
             ),
+            // `raw_set` may grow the table.
             HelperId::NewIndex { keyed } => (
                 RT,
                 Some(keyed as u64),
                 &[Val, Val, Val],
                 Some(Val),
-                alloc | Effects::W_TAB | Effects::W_SHAPE | Effects::W_META,
+                e(ALLOC, Mem::ALL, table_write),
             ),
-            HelperId::Type | HelperId::ToNumber | HelperId::StrLen | HelperId::RawLen => {
-                (RT, None, &[Val], Some(Val), alloc)
+            HelperId::Type | HelperId::ToNumber | HelperId::StrLen => {
+                (RT, None, &[Val], Some(Val), e(ALLOC, NONE, NONE))
             }
-            HelperId::ToString => (RT, None, &[Val], Some(Val), alloc | Effects::W_SHAPE),
-            HelperId::GetMetatable => (RT, None, &[Val], Some(Val), Effects::NONE),
+            HelperId::RawLen => (RT, None, &[Val], Some(Val), e(ALLOC, Mem::TAB | Mem::ARR, NONE)),
+            HelperId::ToString => (RT, None, &[Val], Some(Val), lookup),
+            HelperId::GetMetatable => (
+                RT,
+                None,
+                &[Val],
+                Some(Val),
+                Effects::reads(Mem::TAB | Mem::SHAPE | Mem::META),
+            ),
             HelperId::SetMetatable => (
                 RT,
                 None,
                 &[Val, Val],
                 Some(Val),
-                alloc | Effects::W_TAB | Effects::W_SHAPE | Effects::W_META,
+                e(ALLOC, Mem::ALL, table_write),
             ),
-            HelperId::RawGet => (&[][..], None, &[Val, Val], Some(Val), Effects::NONE),
+            HelperId::RawGet => (
+                &[][..],
+                None,
+                &[Val, Val],
+                Some(Val),
+                Effects::reads(Mem::TAB | Mem::ARR | Mem::SHAPE),
+            ),
             HelperId::RawSet => (
                 RT,
                 None,
                 &[Val, Val, Val],
                 Some(Val),
-                alloc | Effects::W_TAB | Effects::W_SHAPE,
+                e(ALLOC, Mem::ALL, table_write),
             ),
-            HelperId::RawEqual => (&[][..], None, &[Val, Val], Some(I32), Effects::NONE),
-            HelperId::StrSub => (RT, None, &[Val, Val, Val], Some(Val), alloc),
-            HelperId::StrByte => (&[][..], None, &[Val, Val], Some(Val), Effects::NONE),
+            HelperId::RawEqual => (&[][..], None, &[Val, Val], Some(I32), pure),
+            HelperId::StrSub => (RT, None, &[Val, Val, Val], Some(Val), e(ALLOC, NONE, NONE)),
+            HelperId::StrByte => (&[][..], None, &[Val, Val], Some(Val), pure),
         };
         Sig {
             ctx,
@@ -642,107 +670,173 @@ pub(crate) enum Op {
     Deopt,
 }
 
-/// Memory and control effects.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) struct Effects(u32);
-
-impl Effects {
-    pub(crate) const NONE: Effects = Effects(0);
-    pub(crate) const MAY_DEOPT: Effects = Effects(1);
-    pub(crate) const MAY_ALLOC: Effects = Effects(2);
-    pub(crate) const TAILOUT: Effects = Effects(4);
-    pub(crate) const TERMINATOR: Effects = Effects(8);
-    pub(crate) const R_SLOT: Effects = Effects(16);
-    pub(crate) const W_SLOT: Effects = Effects(32);
-    pub(crate) const R_GC: Effects = Effects(128);
-    pub(crate) const R_UPVAL: Effects = Effects(1 << 8);
-    pub(crate) const R_FRAME: Effects = Effects(1 << 9);
-    pub(crate) const W_UPVAL: Effects = Effects(1 << 16);
-    pub(crate) const W_FRAME: Effects = Effects(1 << 17);
-    pub(crate) const R_TAB: Effects = Effects(1 << 10);
-    pub(crate) const R_SHAPE: Effects = Effects(1 << 11);
-    pub(crate) const R_META: Effects = Effects(1 << 12);
-    pub(crate) const W_TAB: Effects = Effects(1 << 18);
-    pub(crate) const W_SHAPE: Effects = Effects(1 << 19);
-    pub(crate) const W_META: Effects = Effects(1 << 20);
-    /// The collector's state: a barrier or an allocation.
-    pub(crate) const W_GC: Effects = Effects(1 << 21);
-    /// Writes every class (a call: anything may run).
-    pub(crate) const W_ALL: Effects = Effects(0xffff_0000);
-
-    pub(crate) fn has(self, e: Effects) -> bool {
-        self.0 & e.0 == e.0
-    }
-
-    /// Whether anything is written: a slot or a memory class.
-    pub(crate) fn writes(self) -> bool {
-        self.0 & (Effects::W_SLOT.0 | Effects::W_ALL.0) != 0
+bitflags::bitflags! {
+    /// Memory classes, each versioned separately by GVN (8.4). `SLOT`, `TAB`
+    /// and `ARR` reads and writes may name a key within the class
+    /// (`Op::mem_key`).
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+    pub(crate) struct Mem: u16 {
+        const SLOT = 1;
+        const TAB = 2;
+        /// Array parts: their items (`ARR_ITEMS`) and their size and cell
+        /// (`ARR_SIZE`).
+        const ARR = 4;
+        const SHAPE = 8;
+        /// Metatable classes: their bits and metamethods.
+        const META = 16;
+        const UPVAL = 32;
+        const FRAME = 64;
+        /// The collector's state.
+        const GC = 128;
+        const ALL = 0xff;
     }
 }
 
-impl std::ops::BitOr for Effects {
-    type Output = Effects;
-    fn bitor(self, o: Effects) -> Effects {
-        Effects(self.0 | o.0)
+bitflags::bitflags! {
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+    pub(crate) struct Flags: u8 {
+        const MAY_DEOPT = 1;
+        const MAY_ALLOC = 2;
+        const TAILOUT = 4;
+        const TERMINATOR = 8;
+        /// Must stay where it is for a reason no memory class names.
+        const SIDE_EFFECT = 16;
+    }
+}
+
+/// The key of an array part's items within `Mem::ARR`.
+pub(crate) const ARR_ITEMS: u32 = 0;
+/// The key of an array part's size and cell, which only a resize changes.
+pub(crate) const ARR_SIZE: u32 = 1;
+
+/// What an operation or a helper may do besides computing its results.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Effects {
+    pub(crate) flags: Flags,
+    pub(crate) reads: Mem,
+    pub(crate) writes: Mem,
+}
+
+impl Effects {
+    pub(crate) const NONE: Effects = Effects {
+        flags: Flags::empty(),
+        reads: Mem::empty(),
+        writes: Mem::empty(),
+    };
+
+    const fn new(flags: Flags, reads: Mem, writes: Mem) -> Effects {
+        Effects {
+            flags,
+            reads,
+            writes,
+        }
+    }
+
+    const fn flags(flags: Flags) -> Effects {
+        Effects::new(flags, Mem::empty(), Mem::empty())
+    }
+
+    const fn reads(reads: Mem) -> Effects {
+        Effects::new(Flags::empty(), reads, Mem::empty())
+    }
+
+    pub(crate) fn has(self, f: Flags) -> bool {
+        self.flags.contains(f)
+    }
+
+    /// No effect, no exit, no memory: removable when unused, numbered and
+    /// moved freely.
+    pub(crate) fn is_pure(self) -> bool {
+        self == Effects::NONE
+    }
+
+    pub(crate) fn reads_memory(self) -> bool {
+        !self.reads.is_empty()
+    }
+
+    pub(crate) fn writes(self) -> bool {
+        !self.writes.is_empty()
+    }
+
+    /// Whether the instruction may go when its results are unused.
+    pub(crate) fn removable(self) -> bool {
+        !self.flags.intersects(
+            Flags::SIDE_EFFECT | Flags::MAY_DEOPT | Flags::TERMINATOR | Flags::TAILOUT,
+        ) && self.writes.is_empty()
+    }
+
+    /// Whether the instruction may move, its memory and exits permitting.
+    pub(crate) fn movable(self) -> bool {
+        !self
+            .flags
+            .intersects(Flags::SIDE_EFFECT | Flags::TAILOUT | Flags::TERMINATOR)
     }
 }
 
 impl Op {
     pub(crate) fn effects(self) -> Effects {
         use Op::*;
+        const DEOPT: Flags = Flags::MAY_DEOPT;
+        let e = Effects::new;
         match self {
-            Load(_) => Effects::R_SLOT,
-            Store(_) => Effects::W_SLOT,
+            Load(_) => Effects::reads(Mem::SLOT),
+            Store(_) => e(Flags::empty(), Mem::empty(), Mem::SLOT),
             Guard(_) | GuardTrue | GuardFalse | GuardSame | IAdd | ISub | IMul | INeg | IShl
             | IShr | IDivFloor | IModFloor | LDivFloor | LModFloor | LToI | FToIExact | ToF64 => {
-                Effects::MAY_DEOPT
+                Effects::flags(DEOPT)
             }
-            GuardNoFlag(_) => Effects::MAY_DEOPT | Effects::R_FRAME,
-            GuardShape(_) => Effects::MAY_DEOPT | Effects::R_SHAPE,
-            ClassBits(_) | ClassIndex(_) => Effects::R_META,
-            ShapeIs(_) => Effects::R_SHAPE,
-            TabLoad { .. } | ArrLoad => Effects::R_TAB,
-            ArrNext | NamedNext | NamedVal => Effects::R_TAB | Effects::R_SHAPE,
-            NamedKey => Effects::R_SHAPE,
-            ClassMm(_) | TabMmBits => Effects::R_SHAPE | Effects::R_META,
-            NumMtSet | TypeMtIs { .. } => Effects::R_META,
-            TabStore { .. } | ArrStore => Effects::W_TAB,
-            TabHasRoom(_) | TabASize | TabArray => Effects::R_SHAPE,
-            TabSetShape(_) => Effects::W_SHAPE,
-            Barrier => Effects::W_GC,
-            HasFlag(_) | FnFits => Effects::R_FRAME,
-            CellLoad => Effects::R_UPVAL,
-            CellStore => Effects::W_UPVAL,
-            GcCheck => Effects::MAY_DEOPT | Effects::R_GC,
+            GuardNoFlag(_) | GuardFits(_) => e(DEOPT, Mem::FRAME, Mem::empty()),
+            GuardShape(_) => e(DEOPT, Mem::SHAPE, Mem::empty()),
+            GcCheck => e(DEOPT, Mem::GC, Mem::empty()),
+            ShapeIs(_) | TabHasRoom(_) | NamedKey => Effects::reads(Mem::SHAPE),
+            // A table's class changes only through helpers, which write `META`.
+            ClassBits(_) | ClassIndex(_) | ClassMm(_) | TabMmBits | NumMtSet | TypeMtIs { .. } => {
+                Effects::reads(Mem::META)
+            }
+            TabLoad { .. } => Effects::reads(Mem::TAB),
+            TabStore { .. } => e(Flags::empty(), Mem::empty(), Mem::TAB),
+            TabASize | TabArray | ArrLoad | ArrNext => Effects::reads(Mem::ARR),
+            ArrStore => e(Flags::empty(), Mem::empty(), Mem::ARR),
+            NamedNext | NamedVal => Effects::reads(Mem::TAB | Mem::SHAPE),
+            TabSetShape(_) => e(Flags::empty(), Mem::empty(), Mem::SHAPE),
+            Barrier => e(Flags::empty(), Mem::empty(), Mem::GC),
+            HasFlag(_) | FnFits => Effects::reads(Mem::FRAME),
+            CellLoad => Effects::reads(Mem::UPVAL),
+            CellStore => e(Flags::empty(), Mem::empty(), Mem::UPVAL),
             Helper(h) => h.sig().effects,
-            Resume { .. } => Effects::R_SLOT,
-            Jump | Br => Effects::TERMINATOR,
-            Return { .. } => Effects::TERMINATOR | Effects::TAILOUT | Effects::R_SLOT,
-            GuardFits(_) => Effects::MAY_DEOPT,
+            Resume { .. } => e(Flags::SIDE_EFFECT, Mem::SLOT, Mem::empty()),
+            Jump | Br => Effects::flags(Flags::TERMINATOR),
+            Return { .. } => e(Flags::TERMINATOR | Flags::TAILOUT, Mem::SLOT, Mem::empty()),
             Call { .. } | CallMm { .. } | Dispatch { .. } | TailEnter { .. } => {
-                Effects::TERMINATOR
-                    | Effects::TAILOUT
-                    | Effects::W_ALL
-                    | Effects::R_SLOT
-                    | Effects::W_SLOT
+                e(Flags::TERMINATOR | Flags::TAILOUT, Mem::ALL, Mem::ALL)
             }
-            Deopt => Effects::TERMINATOR | Effects::MAY_DEOPT,
+            Deopt => Effects::flags(Flags::TERMINATOR | DEOPT),
             _ => Effects::NONE,
         }
     }
 
+    /// The key within its one memory class a keyed read or write names:
+    /// accesses with other keys never alias it.
+    pub(crate) fn mem_key(self) -> Option<u32> {
+        match self {
+            Op::Load(r) | Op::Store(r) => Some(r as u32),
+            Op::TabLoad { key, .. } | Op::TabStore { key, .. } => Some(key),
+            Op::ArrLoad | Op::ArrStore => Some(ARR_ITEMS),
+            Op::TabASize | Op::TabArray => Some(ARR_SIZE),
+            _ => None,
+        }
+    }
+
     pub(crate) fn is_terminator(self) -> bool {
-        self.effects().has(Effects::TERMINATOR)
+        self.effects().has(Flags::TERMINATOR)
     }
 
     pub(crate) fn may_deopt(self) -> bool {
-        self.effects().has(Effects::MAY_DEOPT)
+        self.effects().has(Flags::MAY_DEOPT)
     }
 
-    /// Pure: no effect, no exit, so it may be removed when unused, numbered
-    /// and moved.
     pub(crate) fn is_pure(self) -> bool {
-        self.effects() == Effects::NONE && !matches!(self, Op::Helper(_))
+        self.effects().is_pure()
     }
 
     /// How many values the instruction defines.
