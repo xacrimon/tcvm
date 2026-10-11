@@ -90,6 +90,10 @@ pub(crate) fn build_ir<'gc>(
     let cfg = Cfg::build(&closure.proto, code, pc)?;
     let mut b = Builder::new(ctx, closure, &cfg, pc, loop_entry);
     b.deopt_all = opts.deopt_all;
+    if loop_entry && !frame.is_null() {
+        // SAFETY: the frame's window holds the prototype's registers.
+        b.entry_frame = (0..cfg.nregs).map(|r| unsafe { *frame.add(r) }).collect();
+    }
     let mut f = b.build()?;
     let check = |f: &Func<'gc>, stage: &str| -> Result<(), CompileError> {
         if opts.check {

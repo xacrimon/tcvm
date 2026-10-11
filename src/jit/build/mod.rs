@@ -102,6 +102,9 @@ pub(crate) struct Builder<'a, 'gc> {
     pub(crate) recv_shapes: crate::jit::FastMap<Val, Vec<crate::env::Shape<'gc>>>,
     /// Blocks made now are cold arms (A5).
     cold: bool,
+    /// A loop entry's frame, by register: what `intrinsics::value_now`
+    /// guesses a loop header's value of a register is.
+    pub(crate) entry_frame: Vec<Value<'gc>>,
 }
 
 impl<'a, 'gc> Builder<'a, 'gc> {
@@ -141,6 +144,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             recv_shapes: Default::default(),
             callee_hint: None,
             cold: false,
+            entry_frame: Vec::new(),
         }
     }
 
@@ -491,6 +495,47 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             }
         }
         i
+    }
+
+    /// The one value a sealed block's parameter receives on every edge
+    /// (through such parameters of earlier joins), or the register an
+    /// unsealed one stands for.
+    pub(crate) fn param_source(&self, p: Val) -> Option<Result<Val, u8>> {
+        self.param_source_at(p, 8)
+    }
+
+    fn param_source_at(&self, p: Val, depth: u32) -> Option<Result<Val, u8>> {
+        let ValDef::Param(blk, k) = self.f.vals[p.idx()].def else {
+            return None;
+        };
+        let s = &self.bs[blk.idx()];
+        if !s.sealed {
+            return s
+                .incomplete
+                .iter()
+                .find(|(_, q)| *q == p)
+                .map(|&(r, _)| Err(r));
+        }
+        let mut same = None;
+        for &pred in &s.preds {
+            let term = self.f.terminator(pred)?;
+            for e in self.f.edges(term).iter().filter(|e| e.target == blk) {
+                let mut a = *self.f.vl(e.args).get(k as usize)?;
+                if depth > 0
+                    && a != p
+                    && let Some(Ok(x)) = self.param_source_at(a, depth - 1)
+                {
+                    a = x;
+                }
+                match same {
+                    _ if a == p => {}
+                    None => same = Some(a),
+                    Some(x) if x == a => {}
+                    Some(_) => return None,
+                }
+            }
+        }
+        same.map(Ok)
     }
 
     /// The register a block parameter stands for.

@@ -242,7 +242,7 @@ fn loop_invariants_leave_the_loop() {
     // The loop is peeled: what stays in it appears in both copies.
     assert_eq!(count("guard.same"), 1, "{ir}");
     assert_eq!(count("guardshape"), 1, "{ir}");
-    assert_eq!(count("key: 0"), 1, "{ir}");
+    assert_eq!(count("tabload"), 1, "{ir}");
     assert_eq!(count("tabstore"), 2, "{ir}");
 }
 

@@ -22,6 +22,9 @@ pub(crate) const FLOAT_LIMIT: u8 = OTHER;
 /// for a receiver that is no table): a small key was outside the array part,
 /// or over a nil there with the class having `__index`/`__newindex`.
 pub(crate) const ARR_MISS: u8 = BIGINT;
+/// At a call (whose kinds are its first argument's) or a `GETUPVAL`: a value
+/// a region took as constant differed (`ExitTag::Const`).
+pub(crate) const CONST_MISS: u8 = MM;
 
 pub(crate) const INT: u8 = SMALL | BIGINT;
 pub(crate) const KINDS: u8 = SMALL | BIGINT | FLOAT | STR | TAB | OTHER;
