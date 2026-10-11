@@ -37,6 +37,7 @@ This is a Cargo workspace with two crates: `tcvm` (main) and `tcvm-derive` (proc
 Requires **nightly Rust** (nightly-2026-04-05, pinned in `rust-toolchain.toml`). Uses these nightly features:
 - `explicit_tail_calls` (`become` keyword) — core to the interpreter dispatch loop
 - `rust_preserve_none_cc` — calling convention for VM opcode handlers
+- `naked_functions_rustic_abi` — the JIT's naked `dispatch_entry` with the handler ABI
 - `fn_align` — `#[rustc_align(32)]` on dispatch targets
 - `try_trait_v2` — `?` in natives that return `NativeOut`
 - `macro_metavar_expr`

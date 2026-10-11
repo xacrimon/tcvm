@@ -99,8 +99,8 @@ const _: () = assert!(IMAGE_SPILLS + MAX_SPILLS <= EXIT_REGS);
 
 /// Entered from a region's exit trampoline with x16 = region | exit << 48
 /// and the region's frame still open: stores the register image in
-/// `image_index` order, copies the frame's spill slots after it, pops the
-/// frame (its size is the region's) and tails `jit_exit`.
+/// `image_index` order, copies the frame's spill slots after it, returns to
+/// dispatch's entry state (`NativeBase`) and tails `jit_exit`.
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn exit_common() {
     core::arch::naked_asm!(
@@ -144,19 +144,67 @@ pub(crate) unsafe extern "C" fn exit_common() {
         "str x13, [x12], #8",
         "subs w10, w10, #1",
         "b.ne 1b",
+        // Back to dispatch's entry state, dropping this frame and any fast
+        // callers' under it.
         "2:",
-        "ldr w10, [x9, #{frame_size}]",
-        "ldp x13, x30, [x29]",
-        "add x11, x29, x10",
+        "ldr x11, [x23, #{nsp}]",
         "mov sp, x11",
-        "mov x29, x13",
+        "ldr x29, [x23, #{nfp}]",
+        "ldr x30, [x23, #{nlr}]",
         "mov x20, x16",
         "b {jit_exit}",
         regs = const crate::jit::layout::EXIT_REGS,
         num_spills = const crate::jit::region::layout::NUM_SPILLS,
         spills = const IMAGE_SPILLS * 8,
-        frame_size = const crate::jit::region::layout::FRAME_SIZE,
+        nsp = const crate::jit::layout::NATIVE_SP,
+        nfp = const crate::jit::layout::NATIVE_FP,
+        nlr = const crate::jit::layout::NATIVE_LR,
         jit_exit = sym crate::jit::jit_exit,
+    )
+}
+
+/// Room below dispatch's entry for chains of fast calls; a fast entry past
+/// it takes the slow path, which uses no native stack.
+pub(crate) const FAST_STACK: usize = 256 * 1024;
+/// Native stack below dispatch's entry past which fast calls branch with a
+/// tagged return address instead of `blr`, and return with `br`: the return
+/// address stack holds about 48 entries here, and a `ret` past it
+/// mispredicts while the indirect predictor keeps up (5.4).
+pub(crate) const RAS_STACK: usize = 512;
+
+/// Dispatch's entry from the executor, in place of the first handler:
+/// records the stack pointer, frame pointer and return address every
+/// handler runs with and the fast entries' limit (`NativeBase`), then
+/// branches to the handler in `NativeBase::target` with the arguments as
+/// they came.
+#[unsafe(naked)]
+pub(crate) unsafe extern "rust-preserve-none" fn dispatch_entry<'gc>(
+    _insn: crate::vm::abi::Slot,
+    _pc: *const crate::instruction::Instruction,
+    _base: *mut crate::env::value::Value<'gc>,
+    _rt: crate::lua::Context<'gc>,
+    _closure: crate::vm::abi::Slot,
+    _thread: *mut crate::env::thread::ThreadState<'gc>,
+) -> crate::vm::abi::Exit {
+    core::arch::naked_asm!(
+        "mov x16, sp",
+        "str x16, [x23, #{sp}]",
+        "str x29, [x23, #{fp}]",
+        "str x30, [x23, #{lr}]",
+        "sub x17, x16, #{ras}",
+        "str x17, [x23, #{deep}]",
+        "sub x16, x16, #{budget}",
+        "str x16, [x23, #{limit}]",
+        "ldr x16, [x23, #{target}]",
+        "br x16",
+        sp = const crate::jit::layout::NATIVE_SP,
+        fp = const crate::jit::layout::NATIVE_FP,
+        lr = const crate::jit::layout::NATIVE_LR,
+        limit = const crate::jit::layout::NATIVE_LIMIT,
+        target = const crate::jit::layout::NATIVE_TARGET,
+        budget = const FAST_STACK,
+        ras = const RAS_STACK,
+        deep = const crate::jit::layout::NATIVE_DEEP,
     )
 }
 

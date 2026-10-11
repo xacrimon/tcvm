@@ -71,6 +71,10 @@ pub struct Prototype<'gc> {
     /// The JIT's record of this prototype, created when one of its entries
     /// first gets hot.
     pub(crate) jit: Lock<Option<crate::jit::state::JitStateRef<'gc>>>,
+    /// The fast entry of the function region at pc 0 while it is installed,
+    /// else 0: compiled callers branch to it with `blr` (5.4).
+    #[collect(require_static)]
+    pub(crate) jit_fast: Cell<usize>,
 }
 
 /// A prototype's bytecode, in cells: the interpreter rewrites an

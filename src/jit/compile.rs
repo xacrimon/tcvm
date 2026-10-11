@@ -296,26 +296,40 @@ pub(crate) fn compile<'gc>(
         Box::new([])
     };
     let fired_at = config.deopt_all.then(|| fired.as_ptr() as usize);
-    let mut em = emit::emit(&lowered, &out, helpers, fired_at).map_err(CompileError::Backend)?;
+    // A function region of a prototype without varargs is what a compiled
+    // caller's `blr` can enter (5.4).
+    let fast = (pc == 0 && !f.meta.loop_entry && !closure.proto.is_vararg).then_some(
+        emit::FastEntry {
+            max_stack: closure.proto.max_stack_size,
+            num_params: closure.proto.num_params,
+        },
+    );
+    let mut em =
+        emit::emit(&lowered, &out, helpers, fired_at, fast).map_err(CompileError::Backend)?;
     let size = em.asm.offset() + em.asm.pool_bytes() + 16;
     let alloc = ctx.jit().code_alloc();
     let block = alloc
         .reserve(size)
         .map_err(|e| CompileError::Backend(format!("code memory: {e}")))?;
     let region_word = em.asm.label_offset(em.region_word);
-    let entry = block.rx();
+    let start = block.rx();
+    let entry = start.wrapping_add(em.asm.label_offset(em.entry));
+    let fast_entry = em
+        .fast
+        .map_or(std::ptr::null(), |l| start.wrapping_add(em.asm.label_offset(l)));
     let words = em
         .asm
-        .finish(entry as usize)
+        .finish(start as usize)
         .map_err(|e| CompileError::Backend(format!("assembler: {e:?}")))?;
     block.write(&words);
     if config.dump.asm {
         eprintln!(
-            "-- jit asm {} pc{pc} at {entry:p}, {} bytes",
+            "-- jit asm {} pc{pc} at {start:p}, {} bytes, entry +{:#x}",
             chunk_name(closure),
-            words.len() * 4
+            words.len() * 4,
+            entry as usize - start as usize
         );
-        dump_words(entry as usize, &words);
+        dump_words(start as usize, &words);
     }
     times.emit = t.elapsed().as_micros();
     if config.time {
@@ -378,6 +392,7 @@ pub(crate) fn compile<'gc>(
             code: block,
             _alloc: alloc,
             entry,
+            fast_entry,
             pool: f.pool.clone().into_boxed_slice(),
             shapes: f.shapes.clone().into_boxed_slice(),
             exits: exits.into_boxed_slice(),
@@ -389,7 +404,6 @@ pub(crate) fn compile<'gc>(
             proto: closure.proto,
             entry_pc: pc,
             nest: nest.into_boxed_slice(),
-            frame_size: em.frame_size,
             num_spills: em.num_spills,
             retired: std::cell::Cell::new(false),
             known,

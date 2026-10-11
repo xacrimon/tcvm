@@ -430,6 +430,7 @@ impl<'gc> Chunk<'gc> {
                 templates: self.templates.into_boxed_slice(),
                 feedback,
                 jit: crate::dmm::Lock::new(None),
+                jit_fast: std::cell::Cell::new(0),
             },
         ))
     }

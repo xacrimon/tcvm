@@ -818,3 +818,69 @@ fn polymorphic_field_sites() {
 "#,
     );
 }
+
+/// Calls from compiled code to compiled functions take the fast path
+/// (`blr` to the callee's fast entry, `ret` back), and leave it for the
+/// caller's slow path or the interpreter in every case the fast entry does
+/// not cover: missing arguments, a stack window that needs growing deep in a
+/// recursion, a callee with varargs, a yield, an error, a deopt, an
+/// allocation, a tail call.
+#[test]
+fn fast_calls() {
+    agrees(
+        r##"
+        local out = {}
+        local function sum(n) if n == 0 then return 0 end return n + sum(n - 1) end
+        local s = 0
+        for i = 1, 300 do s = s + sum(i % 40) end
+        out[1] = s .. " " .. sum(10000)
+        local function opt(a, b) return a + (b or 100) end
+        local function both(i) return opt(i) + opt(i, i) end
+        s = 0
+        for i = 1, 500 do s = s + both(i) end
+        out[2] = s
+        local function grow(n) local a, b, c, d, e, f, g = n, n, n, n, n, n, n
+          if n == 0 then return 0 end return grow(n - 1) + a - b + c - d + e - f + g end
+        out[3] = grow(3000)
+        local function va(...) return select("#", ...) end
+        local function callva(i) return va(i, i) + va() end
+        s = 0
+        for i = 1, 400 do s = s + callva(i) end
+        out[4] = s
+        local function inner(x) coroutine.yield(x) return x + 1 end
+        local function outer(x) return inner(x) * 2 end
+        local co = coroutine.wrap(function() local t = 0 for i = 1, 600 do t = t + outer(i) end return t end)
+        local last
+        for i = 1, 601 do last = co() end
+        out[5] = last
+        local function bad(x) if x % 97 == 0 then error("e" .. x) end return x end
+        local function mid(x) return bad(x) + 1 end
+        local ok, fails = 0, 0
+        for i = 1, 700 do if pcall(mid, i) then ok = ok + 1 else fails = fails + 1 end end
+        out[6] = ok .. "/" .. fails
+        local function g(x) return x + 1 end
+        local function f(x) return g(x) * 2 end
+        s = 0
+        for i = 1, 400 do s = s + f(i) end
+        for i = 1, 400 do s = s + f(i + 0.5) end
+        out[7] = s
+        local function mk(i) return {i, i + 1} end
+        local function use(i) local t = mk(i) return t[1] + t[2] end
+        s = 0
+        for i = 1, 20000 do s = s + use(i) end
+        out[8] = s
+        local function t2(x) return x * 3 end
+        local function t1(x) return t2(x + 1) end
+        local function tc(x) return t1(x) + 1 end
+        s = 0
+        for i = 1, 500 do s = s + tc(i) end
+        out[9] = s
+        local function three(x) return x, x + 1, x + 2 end
+        local function take(i) local a, b, c = three(i) return a * b - c end
+        s = 0
+        for i = 1, 500 do s = s + take(i) end
+        out[10] = s
+        return table.concat(out, " ")
+"##,
+    );
+}

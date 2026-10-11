@@ -171,6 +171,9 @@ pub(crate) struct Region<'gc> {
     pub(crate) _alloc: Rc<CodeAllocator>,
     #[collect(require_static)]
     pub(crate) entry: *const u8,
+    /// A function region's entry for compiled callers (5.4), or null.
+    #[collect(require_static)]
+    pub(crate) fast_entry: *const u8,
     /// Every heap value the code or a snapshot embeds.
     pub(crate) pool: Box<[Value<'gc>]>,
     /// Every shape the code embeds.
@@ -197,9 +200,6 @@ pub(crate) struct Region<'gc> {
     /// The entry's loop nest, innermost first (`Entry::nest`).
     #[collect(require_static)]
     pub(crate) nest: Box<[u32]>,
-    /// The native frame's size, which `exit_common` pops.
-    #[collect(require_static)]
-    pub(crate) frame_size: u32,
     #[collect(require_static)]
     pub(crate) num_spills: u32,
     #[collect(require_static)]
@@ -219,7 +219,6 @@ impl<'gc> Region<'gc> {
 pub(crate) mod layout {
     use super::Region;
 
-    pub(crate) const FRAME_SIZE: usize = std::mem::offset_of!(Region<'static>, frame_size);
     pub(crate) const NUM_SPILLS: usize = std::mem::offset_of!(Region<'static>, num_spills);
 }
 
