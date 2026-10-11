@@ -71,14 +71,10 @@ pub(crate) enum HelperId {
     /// `f64 -> f64`.
     Sin,
     Cos,
-    /// `(Val, Val) -> i32`: a generic `<`, `<=` or `==`: 1, 0, or
-    /// `HELPER_FAIL` when only the interpreter can (a metamethod, an error).
-    Lt,
-    Le,
-    Eq,
-    /// `(Val, Val) -> Val`: the arithmetic of two numbers, or
-    /// `HELPER_FAIL_VAL` (not numbers, a zero integer divisor).
-    Arith(ArithKind),
+    /// `(Val, Val) -> Val`: the arithmetic of numbers and numeric strings, for
+    /// the slow arm of a site that saw them, or `HELPER_FAIL_VAL` (anything
+    /// else, a zero integer divisor).
+    ArithCoerce(ArithKind),
     /// `Val -> Val`: `-v` and `~v` of a number, or `HELPER_FAIL_VAL`.
     Unm,
     BNot,
@@ -164,9 +160,6 @@ pub(crate) enum HelperId {
     },
 }
 
-/// What a compare helper returns when the interpreter must run the compare.
-pub(crate) const HELPER_FAIL: i32 = 2;
-
 /// What a `Val` helper returns when the interpreter must run the
 /// instruction: the negative quiet NaN, which no `Value` is (floats are
 /// canonical) and one `movz` makes.
@@ -197,10 +190,7 @@ impl HelperId {
             HelperId::FPow => "pow".into(),
             HelperId::Sin => "sin".into(),
             HelperId::Cos => "cos".into(),
-            HelperId::Lt => "lt".into(),
-            HelperId::Le => "le".into(),
-            HelperId::Eq => "eq".into(),
-            HelperId::Arith(k) => format!("arith.{k:?}").to_lowercase(),
+            HelperId::ArithCoerce(k) => format!("arith_coerce.{k:?}").to_lowercase(),
             HelperId::Unm => "unm".into(),
             HelperId::BNot => "bnot".into(),
             HelperId::Len => "len".into(),
@@ -243,10 +233,8 @@ impl HelperId {
         let (ctx, imm, args, ret, effects): (_, _, &'static [Rep], _, _) = match self {
             HelperId::FMod | HelperId::FPow => (&[][..], None, &[F64, F64], Some(F64), pure),
             HelperId::Sin | HelperId::Cos => (&[][..], None, &[F64], Some(F64), pure),
-            HelperId::Lt | HelperId::Le => (RT, None, &[Val, Val], Some(I32), pure),
-            HelperId::Eq => (RT, None, &[Val, Val], Some(I32), lookup),
             // Integers out of i32 are boxed.
-            HelperId::Arith(k) => (RT, Some(k as u64), &[Val, Val], Some(Val), e(ALLOC, NONE, NONE)),
+            HelperId::ArithCoerce(k) => (RT, Some(k as u64), &[Val, Val], Some(Val), e(ALLOC, NONE, NONE)),
             HelperId::Unm | HelperId::BNot => (RT, None, &[Val], Some(Val), e(ALLOC, NONE, NONE)),
             HelperId::Len => (
                 RT,
@@ -517,6 +505,9 @@ pub(crate) enum Op {
     LToF,
     /// Exits when outside i32.
     LToI,
+    /// The f64 of an i64 within ±2^53, which converts exactly; exits
+    /// otherwise.
+    LToFExact,
 
     // --- f64 ------------------------------------------------------------------
     FAdd,
@@ -593,6 +584,10 @@ pub(crate) enum Op {
     TabMmBits,
     /// A string's length (`I64`), the operand its value's payload (`Ptr`).
     StrLenOf,
+    /// Whether string `a` orders before (`StrLe`: not after) `b`, by bytes;
+    /// the operands their payloads.
+    StrLt,
+    StrLe,
     /// The array part's size (`I32`) and cell.
     TabASize,
     TabArray,
@@ -791,9 +786,8 @@ impl Op {
             Load(_) => Effects::reads(Mem::SLOT),
             Store(_) => e(Flags::empty(), Mem::empty(), Mem::SLOT),
             Guard(_) | GuardTrue | GuardFalse | GuardSame | IAdd | ISub | IMul | INeg | IShl
-            | IShr | IDivFloor | IModFloor | LDivFloor | LModFloor | LToI | FToIExact | ToF64 => {
-                Effects::flags(DEOPT)
-            }
+            | IShr | IDivFloor | IModFloor | LDivFloor | LModFloor | LToI | LToFExact | FToIExact
+            | ToF64 => Effects::flags(DEOPT),
             GuardNoFlag(_) | GuardFits(_) => e(DEOPT, Mem::FRAME, Mem::empty()),
             GuardShape(_) => e(DEOPT, Mem::SHAPE, Mem::empty()),
             GcCheck => e(DEOPT, Mem::GC, Mem::empty()),
@@ -914,7 +908,7 @@ impl Op {
                 },
                 refine: args[0].refine,
             },
-            IsType(_) | IsFalsy | SameBits | ICmp(_) | LCmp(_) | FCmp(_) => Ty::B1,
+            IsType(_) | IsFalsy | SameBits | ICmp(_) | LCmp(_) | FCmp(_) | StrLt | StrLe => Ty::B1,
             Select => args[1].join(args[2]),
             Guard(set) | Refine(set) => Ty {
                 set: args[0].set & set,
@@ -922,15 +916,15 @@ impl Op {
             },
             IAdd | ISub | IMul | IAddNo | ISubNo | IMulNo | INeg | IAnd | IOr | IXor | INot
             | IShl | IShr | IDivFloor | IModFloor | LToI | FToIExact => Ty::I32,
-            IToF | LToF | FAdd | FSub | FMul | FDiv | FNeg | FAbs | FSqrt | FFloor | FCeil
-            | FIDiv | ToF64 => Ty::F64,
+            IToF | LToF | LToFExact | FAdd | FSub | FMul | FDiv | FNeg | FAbs | FSqrt | FFloor
+            | FCeil | FIDiv | ToF64 => Ty::F64,
             IToL | FToL | StrLenOf | LAdd | LSub | LMul | LUDiv | LNeg | LAnd | LOr | LXor
             | LNot | LShl | LShr | LDivFloor | LModFloor => Ty::I64,
-            Helper(HelperId::Arith(ArithKind::Div | ArithKind::Pow)) => Ty::val(TypeSet::FLOAT),
-            Helper(HelperId::Arith(ArithKind::Add | ArithKind::Sub | ArithKind::Mul))
-            | Helper(HelperId::Arith(ArithKind::Mod | ArithKind::IDiv))
+            Helper(HelperId::ArithCoerce(ArithKind::Div | ArithKind::Pow)) => Ty::val(TypeSet::FLOAT),
+            Helper(HelperId::ArithCoerce(ArithKind::Add | ArithKind::Sub | ArithKind::Mul))
+            | Helper(HelperId::ArithCoerce(ArithKind::Mod | ArithKind::IDiv))
             | Helper(HelperId::Unm) => Ty::val(TypeSet::NUM),
-            Helper(HelperId::Arith(_) | HelperId::BNot | HelperId::Len) => Ty::val(TypeSet::INT),
+            Helper(HelperId::ArithCoerce(_) | HelperId::BNot | HelperId::Len) => Ty::val(TypeSet::INT),
             Helper(HelperId::Concat | HelperId::Type) => Ty::val(TypeSet::STR),
             Helper(HelperId::Closure { .. }) => Ty::val(TypeSet::FUN),
             Helper(HelperId::NewTable(_) | HelperId::VarargTable(_)) => Ty::val(TypeSet::TAB),

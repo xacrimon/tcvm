@@ -8,10 +8,10 @@ use crate::env::function::UpvalueCell;
 use crate::env::string::LuaString;
 use crate::env::table::{Step, Table, TableState};
 use crate::env::thread::ThreadState;
-use crate::env::value::{Value, ValueKind};
+use crate::env::value::Value;
 use crate::instruction::ArithKind;
 use crate::instruction::TFOR_VARS;
-use crate::jit::ir::ops::{HELPER_FAIL, HELPER_FAIL_VAL, HelperId};
+use crate::jit::ir::ops::{HELPER_FAIL_VAL, HelperId};
 use crate::lua::{Context, State};
 use crate::vm::frame::{self, land_results};
 use crate::vm::num::{self, ArithOp, SlowNum};
@@ -27,10 +27,7 @@ pub(crate) fn address(h: HelperId) -> usize {
         HelperId::FPow => jit_pow as *const () as usize,
         HelperId::Sin => jit_sin as *const () as usize,
         HelperId::Cos => jit_cos as *const () as usize,
-        HelperId::Lt => jit_lt as *const () as usize,
-        HelperId::Le => jit_le as *const () as usize,
-        HelperId::Eq => jit_eq as *const () as usize,
-        HelperId::Arith(_) => jit_arith as *const () as usize,
+        HelperId::ArithCoerce(_) => jit_arith as *const () as usize,
         HelperId::Unm => jit_unm as *const () as usize,
         HelperId::BNot => jit_bnot as *const () as usize,
         HelperId::Len => jit_len as *const () as usize,
@@ -90,57 +87,6 @@ pub(crate) extern "C" fn jit_sin(x: f64) -> f64 {
 
 pub(crate) extern "C" fn jit_cos(x: f64) -> f64 {
     canonical(x.cos())
-}
-
-/// The interpreter's primitive `<` (`le`: `<=`), as `cmp_slow` has it.
-fn compare(a: Value<'_>, b: Value<'_>, le: bool) -> i32 {
-    let r = if let (Some(x), Some(y)) = (a.get_integer(), b.get_integer()) {
-        if le { x <= y } else { x < y }
-    } else if let (Some(x), Some(y)) = (a.get_integer(), b.get_float()) {
-        if le {
-            num::le_int_float(x, y)
-        } else {
-            num::lt_int_float(x, y)
-        }
-    } else if let (Some(x), Some(y)) = (a.get_float(), b.get_integer()) {
-        if le {
-            num::le_float_int(x, y)
-        } else {
-            num::lt_float_int(x, y)
-        }
-    } else if let (Some(x), Some(y)) = (a.get_float(), b.get_float()) {
-        if le { x <= y } else { x < y }
-    } else if let (Some(x), Some(y)) = (a.get_string(), b.get_string()) {
-        if le { x <= y } else { x < y }
-    } else {
-        return HELPER_FAIL;
-    };
-    r as i32
-}
-
-pub(crate) extern "C" fn jit_lt(_rt: *const State<'static>, a: u64, b: u64) -> i32 {
-    unsafe { compare(Value::from_raw(a), Value::from_raw(b), false) }
-}
-
-pub(crate) extern "C" fn jit_le(_rt: *const State<'static>, a: u64, b: u64) -> i32 {
-    unsafe { compare(Value::from_raw(a), Value::from_raw(b), true) }
-}
-
-/// The interpreter's `==` without running `__eq`, which fails instead.
-pub(crate) extern "C" fn jit_eq(rt: *const State<'static>, a: u64, b: u64) -> i32 {
-    let (a, b) = unsafe { (Value::from_raw(a), Value::from_raw(b)) };
-    if num::raw_eq(a, b) {
-        return 1;
-    }
-    // Lua 5.5: `__eq` only between two tables or two userdata.
-    let both = |k| a.kind() == k && b.kind() == k;
-    if both(ValueKind::Table) || both(ValueKind::Userdata) {
-        let ctx = unsafe { Context::from_state(rt) };
-        if !binop_metamethod(ctx, a, b, crate::env::MetamethodBits::EQ).is_nil() {
-            return HELPER_FAIL;
-        }
-    }
-    0
 }
 
 /// `arith_slow`'s numeric cases; everything it would raise or hand to a

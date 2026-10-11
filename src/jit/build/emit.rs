@@ -9,94 +9,98 @@ use crate::instruction::{ArithKind, Family, Instruction, Op as BcOp, UpvalSource
 use crate::jit::build::intrinsics::Emitted;
 use crate::jit::build::{Builder, intrinsics, iter, tables};
 use crate::jit::feedback as fb;
-use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL, HELPER_FAIL_VAL, HelperId, Op};
+use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL_VAL, HelperId, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
 use crate::jit::ir::{Block, Val};
 use crate::vm::frame::flag;
 
-/// How an arithmetic site compiles.
+/// What the hot path assumes about one arithmetic operand.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Mode {
+enum NumKind {
     I32,
     I64,
-    /// Floats, with each operand a small integer (converted) or a float.
-    F64 {
-        l_small: bool,
-        r_small: bool,
-    },
-    /// No form to speculate on: typed operands directly, the rest as the
-    /// generic handler does.
-    Generic,
-    Deopt,
+    F64,
+    /// A small integer or a float, told apart where the result depends on it.
+    Num,
 }
 
-fn arith_mode(b: &Builder<'_, '_>, pc: u32) -> Mode {
+/// The kind a value has for certain.
+fn own_kind(b: &Builder<'_, '_>, v: Val) -> Option<NumKind> {
+    let t = b.ty(v);
+    match t.rep {
+        Rep::I32 => return Some(NumKind::I32),
+        Rep::I64 => return Some(NumKind::I64),
+        Rep::F64 => return Some(NumKind::F64),
+        _ => {}
+    }
+    if t.set.is_empty() {
+        None
+    } else if t.within(TypeSet::SMALL) {
+        Some(NumKind::I32)
+    } else if t.within(TypeSet::FLOAT) {
+        Some(NumKind::F64)
+    } else if t.within(TypeSet::INT) {
+        Some(NumKind::I64)
+    } else if t.within(TypeSet::SMALL | TypeSet::FLOAT) {
+        Some(NumKind::Num)
+    } else {
+        None
+    }
+}
+
+/// The operand kinds a feedback byte gives both operands of its site, or
+/// `None` when it saw values no number kind covers (non-numbers, a
+/// metamethod, big integers with floats): those take the slow arm.
+fn byte_num_kind(byte: u8) -> Option<NumKind> {
+    let kinds = byte & fb::KINDS;
+    if byte & fb::MM != 0 || kinds & (fb::STR | fb::TAB | fb::OTHER) != 0 {
+        return None;
+    }
+    let wide = byte & (fb::OVERFLOW | fb::BIGINT) != 0;
+    match (kinds & fb::INT != 0, kinds & fb::FLOAT != 0) {
+        // Only what the inline paths cover: a site locked on numbers.
+        (false, false) => Some(NumKind::Num),
+        (true, false) if wide => Some(NumKind::I64),
+        (true, false) => Some(NumKind::I32),
+        (false, true) => Some(NumKind::F64),
+        (true, true) if kinds & fb::BIGINT != 0 => None,
+        (true, true) => Some(NumKind::Num),
+    }
+}
+
+/// The operand kinds the quickened form at `pc` stands for, unless compiled
+/// code saw it miss (6.4): `(left, right)`, an immediate's side `None`.
+fn form_kinds(b: &Builder<'_, '_>, pc: u32) -> Option<(Option<NumKind>, Option<NumKind>)> {
     let insn = b.code(pc);
     let op = insn.op();
-    let generic = insn.generic_op();
-    let info = generic.info();
-    let kind = info.kind;
-    let byte = b.feedback(pc);
-    let wide = byte & (fb::OVERFLOW | fb::BIGINT) != 0;
-    let float_result = matches!(kind, ArithKind::Div | ArithKind::Pow);
-    // Tables with the metamethod: the generic code's metamethod arm.
-    if matches!(op, BcOp::ARITH_MM | BcOp::ARITH_MM_R | BcOp::ARITH_MMI) {
-        return Mode::Generic;
+    let info = insn.generic_op().info();
+    if op == insn.generic_op() || b.kind_exited(pc) {
+        return None;
     }
-    if op != generic && !b.kind_exited(pc) {
-        let forms = &info.forms;
-        let imm = matches!(info.family, Family::ImmArith | Family::ImmBit);
-        let idx = forms.iter().position(|f| *f == Some(op));
-        // A site keeps a form only while it sees the form's kinds (6.5).
-        return match (imm, idx) {
-            (false, Some(0)) | (true, Some(0)) if float_result => Mode::F64 {
-                l_small: true,
-                r_small: true,
-            },
-            (false, Some(0)) | (true, Some(0)) => {
-                if wide {
-                    Mode::I64
-                } else {
-                    Mode::I32
-                }
-            }
-            (false, Some(1)) | (true, Some(1)) => Mode::F64 {
-                l_small: false,
-                r_small: false,
-            },
-            (false, Some(2)) => Mode::F64 {
-                l_small: true,
-                r_small: false,
-            },
-            (false, Some(3)) => Mode::F64 {
-                l_small: false,
-                r_small: true,
-            },
-            // A small register with an immediate that makes the result a float.
-            (true, Some(2)) => {
-                if info.reversed {
-                    Mode::F64 {
-                        l_small: false,
-                        r_small: true,
-                    }
-                } else {
-                    Mode::F64 {
-                        l_small: true,
-                        r_small: false,
-                    }
-                }
-            }
-            // `_NN`, a site whose kinds keep changing.
-            _ => Mode::Generic,
+    let wide = b.feedback(pc) & (fb::OVERFLOW | fb::BIGINT) != 0;
+    let int = if wide { NumKind::I64 } else { NumKind::I32 };
+    use NumKind::*;
+    let idx = info.forms.iter().position(|f| *f == Some(op))?;
+    if matches!(info.family, Family::ImmArith | Family::ImmBit) {
+        let reg = match idx {
+            1 => F64,
+            // `_IF`: a small register whose immediate or operation makes
+            // the result a float.
+            _ => int,
         };
+        return Some(if info.reversed {
+            (None, Some(reg))
+        } else {
+            (Some(reg), None)
+        });
     }
-    // A locked site records only what its slow path sees.
-    let (_, locked) = insn.adaptive();
-    let ints_only = byte & fb::KINDS != 0 && byte & !(fb::INT | fb::OVERFLOW) == 0;
-    if !locked && ints_only && !float_result {
-        return Mode::I64;
-    }
-    Mode::Generic
+    Some(match idx {
+        0 => (Some(int), Some(int)),
+        1 => (Some(F64), Some(F64)),
+        2 => (Some(I32), Some(F64)),
+        3 => (Some(F64), Some(I32)),
+        _ => (Some(Num), Some(Num)),
+    })
 }
 
 /// Whether the instruction at `pc` compiles to an unconditional deopt.
@@ -118,9 +122,7 @@ pub(super) fn always_deopts(b: &Builder<'_, '_>, pc: u32) -> bool {
         FORPREP => false,
         UNM | BNOT => false,
         op => match op.info().family {
-            Family::RegArith | Family::RegBit | Family::ImmArith | Family::ImmBit => {
-                arith_mode(b, pc) == Mode::Deopt
-            }
+            Family::RegArith | Family::RegBit | Family::ImmArith | Family::ImmBit => false,
             Family::CmpReg | Family::CmpImm => false,
             _ if is_get(op) || is_set(op) => false,
             _ => !matches!(op, JEQI | JNEQI),
@@ -224,7 +226,7 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
         }
         VARARGGET => {
             let key = b.reg(insn.c());
-            let v = if num_kind(b, key) == Some(CmpAs::I32) {
+            let v = if own_kind(b, key) == Some(NumKind::I32) {
                 let nv = b.ins(Op::NumVarargs, &[]);
                 let k = b.as_i32(key);
                 b.ins(Op::VarargIdx, &[nv, k])
@@ -287,7 +289,7 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             b.ins_exit(Op::Guard(TypeSet::NIL), &[v], ExitTag::Slow);
         }
         UNM => emit_unm(b, pc, a, rb),
-        BNOT => emit_bnot(b, a, rb),
+        BNOT => emit_bnot(b, pc, a, rb),
         LEN => emit_len(b, a, rb),
         CONCAT => {
             let (x, y) = (b.reg(rb), b.reg(insn.c()));
@@ -573,9 +575,7 @@ fn emit_arith(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
         emit_arith_mm(b, insn);
         return;
     }
-    let mode = arith_mode(b, pc);
-    let generic = insn.generic_op();
-    let info = generic.info();
+    let info = insn.generic_op().info();
     let kind = info.kind;
     let imm = matches!(info.family, Family::ImmArith | Family::ImmBit);
     let dst = insn.a();
@@ -591,79 +591,124 @@ fn emit_arith(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
     } else {
         (Operand::Reg(b.reg(insn.b())), Operand::Reg(b.reg(insn.c())))
     };
+    let byte = b.feedback(pc);
+    let (fl, fr) = form_kinds(b, pc).unwrap_or((None, None));
+    let (lk, rk) = (l.kind(b, fl, byte), r.kind(b, fr, byte));
+    let wide = byte & (fb::OVERFLOW | fb::BIGINT) != 0;
+    if let (Some(lk), Some(rk)) = (lk, rk) {
+        arith_kinds(b, kind, dst, (l, lk), (r, rk), wide, None);
+        return;
+    }
+    // An operand that may be no number: the numeric path behind a test,
+    // the rest in the slow arm.
+    let join = b.new_block();
+    let unknown: Vec<Val> = [(l, lk), (r, rk)]
+        .into_iter()
+        .filter(|&(_, k)| k.is_none())
+        .map(|(o, _)| o.val(b))
+        .collect();
+    let slow = all_in(b, TypeSet::SMALL | TypeSet::FLOAT, &unknown);
+    let num = |k: Option<NumKind>| k.unwrap_or(NumKind::Num);
+    arith_kinds(b, kind, dst, (l, num(lk)), (r, num(rk)), wide, Some(join));
+    enter_join(b, slow);
+    let (x, y) = (l.val(b), r.val(b));
+    slow_arm(
+        b,
+        join,
+        dst,
+        HelperId::ArithCoerce(kind),
+        &[x, y],
+        kind_mm(kind),
+        &[x, y],
+    );
+    enter_join(b, join);
+}
+
+/// `dst = l <kind> r` for operands of these kinds, at the end of the
+/// current block, or as an arm into `join`.
+fn arith_kinds(
+    b: &mut Builder<'_, '_>,
+    kind: ArithKind,
+    dst: u8,
+    (l, lk): (Operand, NumKind),
+    (r, rk): (Operand, NumKind),
+    wide: bool,
+    join: Option<Block>,
+) {
     use ArithKind::*;
-    let res = match mode {
-        Mode::Deopt => {
-            b.deopt(ExitTag::Unsupported);
-            return;
+    use NumKind::*;
+    let bitwise = matches!(kind, BAnd | BOr | BXor | Shl | Shr);
+    let float = matches!(kind, Div | Pow) || lk == F64 || rk == F64;
+    let res = if bitwise {
+        let (x, y) = (l.int(b, lk), r.int(b, rk));
+        int_arith(b, kind, x, y, wide)
+    } else if float {
+        let (x, y) = (l.f64(b, lk), r.f64(b, rk));
+        float_arith(b, kind, x, y, r)
+    } else if lk == Num || rk == Num {
+        // Two small integers make an integer, anything else a float.
+        let to = join.unwrap_or_else(|| b.new_block());
+        let nums: Vec<Val> = [(l, lk), (r, rk)]
+            .into_iter()
+            .filter(|&(_, k)| k == Num)
+            .map(|(o, _)| o.val(b))
+            .collect();
+        let floats = all_in(b, TypeSet::SMALL, &nums);
+        let (x, y) = (l.small(b, lk), r.small(b, rk));
+        let v = int_arith(b, kind, x, y, wide);
+        arm_end(b, to, dst, v);
+        enter_join(b, floats);
+        let (x, y) = (l.f64(b, lk), r.f64(b, rk));
+        let v = float_arith(b, kind, x, y, r);
+        arm_end(b, to, dst, v);
+        if join.is_none() {
+            enter_join(b, to);
         }
-        Mode::Generic => {
-            emit_generic(b, kind, dst, l, r);
-            return;
-        }
-        Mode::I32 => {
-            let (x, y) = (l.i32(b), r.i32(b));
-            let (op, exits) = match kind {
-                Add => (Op::IAdd, true),
-                Sub => (Op::ISub, true),
-                Mul => (Op::IMul, true),
-                Mod => (Op::IModFloor, true),
-                IDiv => (Op::IDivFloor, true),
-                BAnd => (Op::IAnd, false),
-                BOr => (Op::IOr, false),
-                BXor => (Op::IXor, false),
-                Shl => (Op::IShl, true),
-                Shr => (Op::IShr, true),
-                _ => unreachable!("{kind:?} in i32 mode"),
-            };
-            if exits {
-                let i = b.ins_exit(op, &[x, y], ExitTag::Overflow);
-                b.f.result(i)
-            } else {
-                b.ins(op, &[x, y])
-            }
-        }
-        Mode::I64 => {
-            let (x, y) = (l.i64(b), r.i64(b));
-            let (op, exits) = match kind {
-                Add => (Op::LAdd, false),
-                Sub => (Op::LSub, false),
-                Mul => (Op::LMul, false),
-                Mod => (Op::LModFloor, true),
-                IDiv => (Op::LDivFloor, true),
-                BAnd => (Op::LAnd, false),
-                BOr => (Op::LOr, false),
-                BXor => (Op::LXor, false),
-                Shl => (Op::LShl, false),
-                Shr => (Op::LShr, false),
-                _ => unreachable!("{kind:?} in i64 mode"),
-            };
-            if exits {
-                let i = b.ins_exit(op, &[x, y], ExitTag::Slow);
-                b.f.result(i)
-            } else {
-                b.ins(op, &[x, y])
-            }
-        }
-        Mode::F64 { l_small, r_small } => {
-            let x = l.f64(b, l_small);
-            let y = r.f64(b, r_small);
-            match kind {
-                Add => b.ins(Op::FAdd, &[x, y]),
-                Sub => b.ins(Op::FSub, &[x, y]),
-                Mul => b.ins(Op::FMul, &[x, y]),
-                Div => b.ins(Op::FDiv, &[x, y]),
-                IDiv => b.ins(Op::FIDiv, &[x, y]),
-                Mod => b.ins(Op::Helper(HelperId::FMod), &[x, y]),
-                Pow => b.ins(Op::Helper(HelperId::FPow), &[x, y]),
-                _ => {
-                    b.deopt(ExitTag::Unsupported);
-                    return;
-                }
-            }
-        }
+        return;
+    } else {
+        let (x, y) = (l.int(b, lk), r.int(b, rk));
+        int_arith(b, kind, x, y, wide)
     };
-    b.set(dst, res);
+    if let Some(j) = join {
+        arm_end(b, j, dst, res);
+    } else {
+        b.set(dst, res);
+    }
+}
+
+/// Continue where every value of `vals` is in `set`; the block where one is
+/// not, unsealed until its predecessors are all there (`enter_join`).
+fn all_in(b: &mut Builder<'_, '_>, set: TypeSet, vals: &[Val]) -> Block {
+    let other = b.new_block();
+    for &v in vals {
+        let c = b.ins(Op::IsType(set), &[v]);
+        let no = branch_arm(b, c);
+        let yes = b.cur;
+        b.switch_to(no);
+        b.jump(other);
+        b.switch_to(yes);
+    }
+    other
+}
+
+/// The slow arm of a site whose feedback saw what no number kind covers:
+/// the helper and the metamethod (`helper_arms`) where it saw strings, big
+/// integers or a metamethod; otherwise only what the interpreter raises on
+/// gets here.
+fn slow_arm(
+    b: &mut Builder<'_, '_>,
+    join: Block,
+    dst: u8,
+    h: HelperId,
+    args: &[Val],
+    bit: MetamethodBits,
+    mm_args: &[Val],
+) {
+    if b.feedback(b.pc) & (fb::STR | fb::BIGINT | fb::MM) != 0 {
+        helper_arms(b, join, dst, h, args, bit, mm_args);
+    } else {
+        b.deopt(ExitTag::Slow);
+    }
 }
 
 /// An arithmetic operand: a register's value or the instruction's immediate.
@@ -675,12 +720,13 @@ enum Operand {
 }
 
 impl Operand {
-    /// The number kind the operand is for certain.
-    fn kind(self, b: &Builder<'_, '_>) -> Option<CmpAs> {
+    /// The kind the hot path assumes: the value's own, else its form's,
+    /// else the site's feedback (`byte_num_kind`).
+    fn kind(self, b: &Builder<'_, '_>, form: Option<NumKind>, byte: u8) -> Option<NumKind> {
         match self {
-            Operand::Reg(v) => num_kind(b, v),
-            Operand::Int(_) => Some(CmpAs::I32),
-            Operand::Float(_) => Some(CmpAs::F64),
+            Operand::Reg(v) => own_kind(b, v).or(form).or_else(|| byte_num_kind(byte)),
+            Operand::Int(_) => Some(NumKind::I32),
+            Operand::Float(_) => Some(NumKind::F64),
         }
     }
 
@@ -692,188 +738,159 @@ impl Operand {
         }
     }
 
-    /// The f64 of an operand of kind `k`.
-    fn num_f64(self, b: &mut Builder<'_, '_>, k: CmpAs) -> Val {
+    /// The integer of an operand of kind `k`, guarded to it.
+    fn int(self, b: &mut Builder<'_, '_>, k: NumKind) -> Val {
         match (self, k) {
-            (Operand::Reg(v), CmpAs::I64) => {
+            (Operand::Reg(v), NumKind::I32 | NumKind::Num) => b.as_i32(v),
+            (Operand::Reg(v), NumKind::I64) => b.as_i64(v),
+            // Exits where the float has no integer representation in i32.
+            (Operand::Reg(v), NumKind::F64) => {
+                let x = b.as_f64(v);
+                let i = b.ins_exit(Op::FToIExact, &[x], ExitTag::Type);
+                b.f.result(i)
+            }
+            (Operand::Int(n), _) => b.ki32(n as i32),
+            (Operand::Float(x), _) => b.ki32(x as i32),
+        }
+    }
+
+    /// The integer of an operand that is a small integer here.
+    fn small(self, b: &mut Builder<'_, '_>, k: NumKind) -> Val {
+        match (self, k) {
+            (Operand::Reg(v), NumKind::Num) => {
+                let v = b.boxed(v);
+                b.ins(Op::Unbox(Rep::I32), &[v])
+            }
+            (o, k) => o.int(b, k),
+        }
+    }
+
+    /// The f64 of an operand of kind `k`: integers converted as Lua's
+    /// arithmetic does (rounding), a `Num` by a test of its tag.
+    fn f64(self, b: &mut Builder<'_, '_>, k: NumKind) -> Val {
+        match (self, k) {
+            (Operand::Reg(v), NumKind::I32) => {
+                let x = b.as_i32(v);
+                b.ins(Op::IToF, &[x])
+            }
+            (Operand::Reg(v), NumKind::I64) => {
                 let x = b.as_i64(v);
                 b.ins(Op::LToF, &[x])
             }
-            (Operand::Reg(v), _) => b.num_f64(v),
-            (o, _) => o.f64(b, false),
-        }
-    }
-
-    fn i32(self, b: &mut Builder<'_, '_>) -> Val {
-        match self {
-            Operand::Reg(v) => b.as_i32(v),
-            Operand::Int(n) => b.ki32(n as i32),
-            Operand::Float(x) => b.ki32(x as i32),
-        }
-    }
-
-    fn i64(self, b: &mut Builder<'_, '_>) -> Val {
-        match self {
-            Operand::Reg(v) => b.as_i64(v),
-            Operand::Int(n) => b.ins(Op::KI64(n), &[]),
-            Operand::Float(x) => b.ins(Op::KI64(x as i64), &[]),
-        }
-    }
-
-    fn f64(self, b: &mut Builder<'_, '_>, small: bool) -> Val {
-        match self {
-            Operand::Reg(v) => {
-                if small {
-                    let i = b.as_i32(v);
-                    b.ins(Op::IToF, &[i])
-                } else {
-                    b.as_f64(v)
-                }
+            (Operand::Reg(v), NumKind::F64) => b.as_f64(v),
+            (Operand::Reg(v), NumKind::Num) => {
+                let v = b.boxed(v);
+                let i = b.ins_exit(Op::ToF64, &[v], ExitTag::Type);
+                b.f.result(i)
             }
-            Operand::Int(n) => b.kf64(n as f64),
-            Operand::Float(x) => b.kf64(x),
+            (Operand::Int(n), _) => b.kf64(n as f64),
+            (Operand::Float(x), _) => b.kf64(x),
+        }
+    }
+
+    /// The operand's number when it is a constant.
+    fn konst(self, b: &Builder<'_, '_>) -> Option<f64> {
+        match self {
+            Operand::Int(n) => Some(n as f64),
+            Operand::Float(x) => Some(x),
+            Operand::Reg(v) => match b.f.def_op(v)? {
+                Op::KI32(n) => Some(n as f64),
+                Op::KF64(bits) => Some(f64::from_bits(bits)),
+                Op::KVal(bits) => {
+                    let k: Value<'_> =
+                        unsafe { std::mem::transmute::<u64, Value<'static>>(bits) };
+                    k.get_small().map(f64::from).or(k.get_float())
+                }
+                _ => None,
+            },
         }
     }
 }
 
 fn emit_unm(b: &mut Builder<'_, '_>, pc: u32, dst: u8, src: u8) {
     let v = b.reg(src);
-    let ty = b.ty(v);
-    let known = |set| !ty.set.is_empty() && ty.within(set);
-    let r = if ty.rep == Rep::F64 || known(TypeSet::FLOAT) {
-        let x = b.as_f64(v);
-        b.ins(Op::FNeg, &[x])
-    } else if ty.rep == Rep::I32 || known(TypeSet::SMALL) {
-        let x = b.as_i32(v);
-        if b.feedback(pc) & fb::OVERFLOW != 0 {
-            // It negated `i32::MIN`.
+    let byte = b.feedback(pc);
+    // It negated `i32::MIN`.
+    let wide = byte & fb::OVERFLOW != 0;
+    let neg_int = |b: &mut Builder<'_, '_>, x: Val| {
+        if wide {
             let x = b.ins(Op::IToL, &[x]);
             b.ins(Op::LNeg, &[x])
         } else {
             let i = b.ins_exit(Op::INeg, &[x], ExitTag::Overflow);
             b.f.result(i)
         }
-    } else if ty.rep == Rep::I64 || known(TypeSet::INT) {
-        let x = b.as_i64(v);
-        b.ins(Op::LNeg, &[x])
-    } else {
-        // As `op_unm`: a float, a small integer, then the helper.
-        let x = b.boxed(v);
-        let join = b.new_block();
-        let rest = arm(b, Op::IsType(TypeSet::FLOAT), x);
-        let f = b.ins(Op::Unbox(Rep::F64), &[x]);
-        let r = b.ins(Op::FNeg, &[f]);
-        arm_end(b, join, dst, r);
-        b.switch_to(rest);
-        let rest = arm(b, Op::IsType(TypeSet::SMALL), x);
-        let i = b.ins(Op::Unbox(Rep::I32), &[x]);
-        let l = b.ins(Op::IToL, &[i]);
-        let r = b.ins(Op::LNeg, &[l]);
-        arm_end(b, join, dst, r);
-        b.switch_to(rest);
-        // Lua passes the operand twice for unary metamethods.
-        helper_arms(
-            b,
-            join,
-            dst,
-            HelperId::Unm,
-            &[x],
-            MetamethodBits::UNM,
-            &[x, x],
-        );
-        enter_join(b, join);
-        return;
     };
-    b.set(dst, r);
-}
-
-fn emit_bnot(b: &mut Builder<'_, '_>, dst: u8, src: u8) {
-    let v = b.reg(src);
-    let ty = b.ty(v);
-    let known = |set| !ty.set.is_empty() && ty.within(set);
-    let r = if ty.rep == Rep::I32 || known(TypeSet::SMALL) {
-        let x = b.as_i32(v);
-        b.ins(Op::INot, &[x])
-    } else if ty.rep == Rep::I64 || known(TypeSet::INT) {
-        let x = b.as_i64(v);
-        b.ins(Op::LNot, &[x])
-    } else {
-        let x = b.boxed(v);
-        let join = b.new_block();
-        let rest = arm(b, Op::IsType(TypeSet::SMALL), x);
-        let i = b.ins(Op::Unbox(Rep::I32), &[x]);
-        let r = b.ins(Op::INot, &[i]);
-        arm_end(b, join, dst, r);
-        b.switch_to(rest);
-        helper_arms(
-            b,
-            join,
-            dst,
-            HelperId::BNot,
-            &[x],
-            MetamethodBits::BNOT,
-            &[x, x],
-        );
-        enter_join(b, join);
-        return;
-    };
-    b.set(dst, r);
-}
-
-// --- generic arithmetic ------------------------------------------------------
-
-/// A site without a form: operands of known number kinds compile directly
-/// (integers as `I64`, which cannot overflow, mixes as floats); otherwise
-/// the generic handler's order: two small integers, two numbers, then
-/// `jit_arith`, whose failure (not numbers, a zero divisor) deopts.
-fn emit_generic(b: &mut Builder<'_, '_>, kind: ArithKind, dst: u8, l: Operand, r: Operand) {
-    use ArithKind::*;
-    let bitwise = matches!(kind, BAnd | BOr | BXor | Shl | Shr);
-    let float_result = matches!(kind, Div | Pow);
-    if let (Some(lk), Some(rk)) = (l.kind(b), r.kind(b)) {
-        let float = lk == CmpAs::F64 || rk == CmpAs::F64;
-        if !(bitwise && float) {
-            let v = if float || float_result {
-                let (x, y) = (l.num_f64(b, lk), r.num_f64(b, rk));
-                float_op(b, kind, x, y)
+    // The interpreter's fast path, which records nothing, takes small
+    // integers and floats: `byte_num_kind` makes an empty byte `Num`.
+    let r = match own_kind(b, v).or_else(|| byte_num_kind(byte)) {
+        Some(NumKind::F64) => {
+            let x = b.as_f64(v);
+            b.ins(Op::FNeg, &[x])
+        }
+        Some(NumKind::I32) => {
+            let x = b.as_i32(v);
+            neg_int(b, x)
+        }
+        Some(NumKind::I64) => {
+            let x = b.as_i64(v);
+            b.ins(Op::LNeg, &[x])
+        }
+        k => {
+            let x = b.boxed(v);
+            let join = b.new_block();
+            let slow = if k.is_none() {
+                Some(all_in(b, TypeSet::SMALL | TypeSet::FLOAT, &[x]))
             } else {
-                let (x, y) = (l.i64(b), r.i64(b));
-                int_op(b, kind, x, y)
+                None
             };
-            b.set(dst, v);
+            let floats = all_in(b, TypeSet::SMALL, &[x]);
+            let i = b.ins(Op::Unbox(Rep::I32), &[x]);
+            let r = neg_int(b, i);
+            arm_end(b, join, dst, r);
+            enter_join(b, floats);
+            let f = b.ins_exit(Op::ToF64, &[x], ExitTag::Type);
+            let f = b.f.result(f);
+            let r = b.ins(Op::FNeg, &[f]);
+            arm_end(b, join, dst, r);
+            if let Some(slow) = slow {
+                enter_join(b, slow);
+                // Lua passes the operand twice for unary metamethods.
+                slow_arm(b, join, dst, HelperId::Unm, &[x], MetamethodBits::UNM, &[x, x]);
+            }
+            enter_join(b, join);
             return;
         }
-    }
-    let (x, y) = (l.val(b), r.val(b));
-    let join = b.new_block();
-    if !float_result {
-        let both_small = both(b, TypeSet::SMALL, x, y);
-        let rest = branch_arm(b, both_small);
-        let xi = b.ins(Op::Unbox(Rep::I32), &[x]);
-        let yi = b.ins(Op::Unbox(Rep::I32), &[y]);
-        let (xl, yl) = (b.ins(Op::IToL, &[xi]), b.ins(Op::IToL, &[yi]));
-        let v = int_op(b, kind, xl, yl);
-        arm_end(b, join, dst, v);
-        b.switch_to(rest);
-    }
-    if !bitwise {
-        let nums = both(b, TypeSet::SMALL | TypeSet::FLOAT, x, y);
-        let rest = branch_arm(b, nums);
-        let (fx, fy) = (small_or_float(b, x), small_or_float(b, y));
-        let v = float_op(b, kind, fx, fy);
-        arm_end(b, join, dst, v);
-        b.switch_to(rest);
-    }
-    helper_arms(
-        b,
-        join,
-        dst,
-        HelperId::Arith(kind),
-        &[x, y],
-        kind_mm(kind),
-        &[x, y],
-    );
-    enter_join(b, join);
+    };
+    b.set(dst, r);
+}
+
+fn emit_bnot(b: &mut Builder<'_, '_>, pc: u32, dst: u8, src: u8) {
+    let v = b.reg(src);
+    // The fast path takes small integers only.
+    let r = match own_kind(b, v).or_else(|| byte_num_kind(b.feedback(pc))) {
+        Some(NumKind::I64) => {
+            let x = b.as_i64(v);
+            b.ins(Op::LNot, &[x])
+        }
+        Some(k) => {
+            let x = Operand::Reg(v).int(b, k);
+            b.ins(Op::INot, &[x])
+        }
+        None => {
+            let x = b.boxed(v);
+            let join = b.new_block();
+            let slow = all_in(b, TypeSet::SMALL, &[x]);
+            let i = b.ins(Op::Unbox(Rep::I32), &[x]);
+            let r = b.ins(Op::INot, &[i]);
+            arm_end(b, join, dst, r);
+            enter_join(b, slow);
+            slow_arm(b, join, dst, HelperId::BNot, &[x], MetamethodBits::BNOT, &[x, x]);
+            enter_join(b, join);
+            return;
+        }
+    };
+    b.set(dst, r);
 }
 
 /// `ARITH_MM`, `_MM_R` and `_MMI` (7.2): the metamethod the table operand's
@@ -946,35 +963,59 @@ fn kind_mm(kind: ArithKind) -> MetamethodBits {
     }
 }
 
-/// Integer arithmetic of a site without a form, on `I64`s.
-fn int_op(b: &mut Builder<'_, '_>, kind: ArithKind, x: Val, y: Val) -> Val {
+/// Integer arithmetic: on `I64`s, which wrap, when `wide` or an operand is
+/// one; else on `I32`s, exiting where the result leaves i32.
+fn int_arith(b: &mut Builder<'_, '_>, kind: ArithKind, x: Val, y: Val, wide: bool) -> Val {
     use ArithKind::*;
-    let op = match kind {
-        Add => Op::LAdd,
-        Sub => Op::LSub,
-        Mul => Op::LMul,
-        BAnd => Op::LAnd,
-        BOr => Op::LOr,
-        BXor => Op::LXor,
-        Shl => Op::LShl,
-        Shr => Op::LShr,
-        // A zero divisor raises in the interpreter.
-        Mod | IDiv => {
-            let op = if kind == Mod {
-                Op::LModFloor
-            } else {
-                Op::LDivFloor
-            };
-            let i = b.ins_exit(op, &[x, y], ExitTag::Slow);
-            return b.f.result(i);
-        }
+    if wide || b.ty(x).rep == Rep::I64 || b.ty(y).rep == Rep::I64 {
+        let (x, y) = (b.as_i64(x), b.as_i64(y));
+        let op = match kind {
+            Add => Op::LAdd,
+            Sub => Op::LSub,
+            Mul => Op::LMul,
+            BAnd => Op::LAnd,
+            BOr => Op::LOr,
+            BXor => Op::LXor,
+            Shl => Op::LShl,
+            Shr => Op::LShr,
+            // A zero divisor raises in the interpreter.
+            Mod | IDiv => {
+                let op = if kind == Mod {
+                    Op::LModFloor
+                } else {
+                    Op::LDivFloor
+                };
+                let i = b.ins_exit(op, &[x, y], ExitTag::Slow);
+                return b.f.result(i);
+            }
+            Div | Pow | None => unreachable!("{kind:?} on integers"),
+        };
+        return b.ins(op, &[x, y]);
+    }
+    let (op, exits) = match kind {
+        Add => (Op::IAdd, true),
+        Sub => (Op::ISub, true),
+        Mul => (Op::IMul, true),
+        Mod => (Op::IModFloor, true),
+        IDiv => (Op::IDivFloor, true),
+        BAnd => (Op::IAnd, false),
+        BOr => (Op::IOr, false),
+        BXor => (Op::IXor, false),
+        Shl => (Op::IShl, true),
+        Shr => (Op::IShr, true),
         Div | Pow | None => unreachable!("{kind:?} on integers"),
     };
-    b.ins(op, &[x, y])
+    if exits {
+        let i = b.ins_exit(op, &[x, y], ExitTag::Overflow);
+        b.f.result(i)
+    } else {
+        b.ins(op, &[x, y])
+    }
 }
 
-/// Float arithmetic, what any number operands of these kinds compute.
-fn float_op(b: &mut Builder<'_, '_>, kind: ArithKind, x: Val, y: Val) -> Val {
+/// Float arithmetic; `^` by the constant 0 or 1 folds. Not 2: libm's `pow`,
+/// which the interpreter calls, differs from `x * x` in the last bit.
+fn float_arith(b: &mut Builder<'_, '_>, kind: ArithKind, x: Val, y: Val, r: Operand) -> Val {
     use ArithKind::*;
     match kind {
         Add => b.ins(Op::FAdd, &[x, y]),
@@ -983,18 +1024,13 @@ fn float_op(b: &mut Builder<'_, '_>, kind: ArithKind, x: Val, y: Val) -> Val {
         Div => b.ins(Op::FDiv, &[x, y]),
         IDiv => b.ins(Op::FIDiv, &[x, y]),
         Mod => b.ins(Op::Helper(HelperId::FMod), &[x, y]),
-        Pow => b.ins(Op::Helper(HelperId::FPow), &[x, y]),
+        Pow => match r.konst(b) {
+            Some(e) if e == 0.0 => b.kf64(1.0),
+            Some(e) if e == 1.0 => x,
+            _ => b.ins(Op::Helper(HelperId::FPow), &[x, y]),
+        },
         _ => unreachable!("{kind:?} on floats"),
     }
-}
-
-/// The f64 of a `Val` that is a small integer or a float.
-fn small_or_float(b: &mut Builder<'_, '_>, v: Val) -> Val {
-    let is_float = b.ins(Op::IsType(TypeSet::FLOAT), &[v]);
-    let f = b.ins(Op::Unbox(Rep::F64), &[v]);
-    let i = b.ins(Op::Unbox(Rep::I32), &[v]);
-    let fi = b.ins(Op::IToF, &[i]);
-    b.ins(Op::Select, &[is_float, f, fi])
 }
 
 /// Call the metamethod `f` with `args` (5.4) and continue in its resume
@@ -1194,72 +1230,74 @@ pub(super) fn enter_join(b: &mut Builder<'_, '_>, join: Block) {
 
 // --- compares ---------------------------------------------------------------
 
-/// What a compare's operands are compared as.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CmpAs {
-    I32,
-    I64,
-    F64,
+/// What a compare speculates one operand to be.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CmpKind {
+    Num(NumKind),
+    Str,
 }
 
-/// The numeric kind a value is known or speculated to have.
-fn num_kind(b: &Builder<'_, '_>, v: Val) -> Option<CmpAs> {
-    let ty = b.ty(v);
-    match ty.rep {
-        Rep::I32 => Some(CmpAs::I32),
-        Rep::I64 => Some(CmpAs::I64),
-        Rep::F64 => Some(CmpAs::F64),
-        _ if ty.within(TypeSet::SMALL) && !ty.set.is_empty() => Some(CmpAs::I32),
-        _ if ty.within(TypeSet::FLOAT) && !ty.set.is_empty() => Some(CmpAs::F64),
-        _ if ty.within(TypeSet::INT) && !ty.set.is_empty() => Some(CmpAs::I64),
-        _ => None,
+/// The kind a compare operand has for certain.
+fn cmp_own(b: &Builder<'_, '_>, v: Val) -> Option<CmpKind> {
+    if let Some(k) = own_kind(b, v) {
+        return Some(CmpKind::Num(k));
     }
+    let t = b.ty(v);
+    (t.rep == Rep::Val && !t.set.is_empty() && t.within(TypeSet::STR)).then_some(CmpKind::Str)
 }
 
-/// What the site's feedback byte says its operands compare as: `I64` when
-/// it saw only integers, a big one among them; `F64` when only floats.
-fn byte_kind(b: &Builder<'_, '_>, pc: u32) -> Option<CmpAs> {
-    let kinds = b.feedback(pc) & fb::KINDS;
-    if kinds & fb::BIGINT != 0 && kinds & !fb::INT == 0 {
-        Some(CmpAs::I64)
-    } else if kinds == fb::FLOAT {
-        Some(CmpAs::F64)
+/// The kind a compare site's byte gives both operands: numbers as
+/// `byte_num_kind` has them (the fast paths record nothing, so an empty byte
+/// is small integers and floats), or strings only.
+fn byte_cmp_kind(byte: u8) -> Option<CmpKind> {
+    if byte & fb::KINDS == fb::STR && byte & fb::MM == 0 {
+        Some(CmpKind::Str)
     } else {
-        None
+        byte_num_kind(byte).map(CmpKind::Num)
     }
 }
 
-/// Whether the site's feedback saw only kinds `how` compares.
-fn byte_within(b: &Builder<'_, '_>, pc: u32, how: CmpAs) -> bool {
-    let kinds = match how {
-        CmpAs::I32 => fb::SMALL,
-        CmpAs::I64 => fb::INT,
-        CmpAs::F64 => fb::FLOAT,
-    };
-    b.feedback(pc) & fb::KINDS & !kinds == 0
+/// The f64 of a number of kind `k`, exact for the compare: an i64 outside
+/// ±2^53 exits.
+fn cmp_f64(b: &mut Builder<'_, '_>, v: Val, k: NumKind) -> Val {
+    match k {
+        NumKind::I64 => {
+            let x = b.as_i64(v);
+            let i = b.ins_exit(Op::LToFExact, &[x], ExitTag::Type);
+            b.f.result(i)
+        }
+        k => Operand::Reg(v).f64(b, k),
+    }
 }
 
-fn cmp_vals(b: &mut Builder<'_, '_>, cc: Cc, x: Val, y: Val, how: CmpAs) -> Val {
-    match how {
-        CmpAs::I32 => {
+/// `x cc y` of numbers of these kinds.
+fn cmp_num(b: &mut Builder<'_, '_>, cc: Cc, (x, kx): (Val, NumKind), (y, ky): (Val, NumKind)) -> Val {
+    use NumKind::*;
+    match (kx, ky) {
+        (I32, I32) => {
             let (x, y) = (b.as_i32(x), b.as_i32(y));
             b.ins(Op::ICmp(cc), &[x, y])
         }
-        CmpAs::I64 => {
+        (I32 | I64, I32 | I64) => {
             let (x, y) = (b.as_i64(x), b.as_i64(y));
             b.ins(Op::LCmp(cc), &[x, y])
         }
-        CmpAs::F64 => {
-            let (x, y) = (b.num_f64(x), b.num_f64(y));
+        _ => {
+            let (x, y) = (cmp_f64(b, x, kx), cmp_f64(b, y, ky));
             b.ins(Op::FCmp(cc), &[x, y])
         }
     }
 }
 
+/// `x < y` (`le`: `<=`) of two strings.
+fn cmp_str(b: &mut Builder<'_, '_>, le: bool, x: Val, y: Val) -> Val {
+    let (x, y) = (b.guard(x, TypeSet::STR), b.guard(y, TypeSet::STR));
+    let (px, py) = (b.ins(Op::Unbox(Rep::Ptr), &[x]), b.ins(Op::Unbox(Rep::Ptr), &[y]));
+    b.ins(if le { Op::StrLe } else { Op::StrLt }, &[px, py])
+}
+
 fn emit_cmp_reg(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Block]) {
     let op = insn.op();
-    let seen = byte_kind(b, pc);
-    let wide = seen == Some(CmpAs::I64);
     let generic = insn.generic_op();
     let (x, y) = (b.reg(insn.a()), b.reg(insn.b()));
     let (cc, sense) = match generic {
@@ -1271,181 +1309,203 @@ fn emit_cmp_reg(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Bl
         BcOp::JNEQ => (Cc::Eq, false),
         _ => unreachable!(),
     };
-    let how = if op != generic && !b.kind_exited(pc) {
-        // An `_II` form, which exits saw leave i32.
-        if wide { CmpAs::I64 } else { CmpAs::I32 }
-    } else {
-        match (num_kind(b, x), num_kind(b, y)) {
-            (Some(CmpAs::I32), Some(CmpAs::I32)) => CmpAs::I32,
-            (Some(CmpAs::I32 | CmpAs::I64), Some(CmpAs::I32 | CmpAs::I64)) => CmpAs::I64,
-            (Some(CmpAs::F64), Some(_)) | (Some(_), Some(CmpAs::F64)) => {
-                // Mixed small and float compare exactly as floats; an i64 does not.
-                let wide = num_kind(b, x) == Some(CmpAs::I64) || num_kind(b, y) == Some(CmpAs::I64);
-                if wide {
-                    let (x, y) = (b.boxed(x), b.boxed(y));
-                    match generic {
-                        BcOp::JEQ | BcOp::JNEQ => generic_eq(b, x, y, sense, succs),
-                        _ => generic_cmp(b, cc, x, y, sense, succs),
-                    }
-                    return;
-                }
-                CmpAs::F64
-            }
-            (Some(CmpAs::I32), None) | (None, Some(CmpAs::I32)) if wide => CmpAs::I64,
-            // The other operand speculated to the typed one's kind, unless
-            // exits saw it differ.
-            (Some(k), None) | (None, Some(k))
-                if generic != BcOp::JEQ && generic != BcOp::JNEQ && byte_within(b, pc, k) =>
-            {
-                k
-            }
-            (None, None) if wide => CmpAs::I64,
-            _ if generic == BcOp::JEQ || generic == BcOp::JNEQ => {
-                let (x, y) = (b.boxed(x), b.boxed(y));
-                if eq_by_bits(b, x) || eq_by_bits(b, y) {
-                    let c = b.ins(Op::SameBits, &[x, y]);
-                    branch(b, c, sense, succs);
-                } else {
-                    generic_eq(b, x, y, sense, succs);
-                }
-                return;
-            }
-            _ => match seen {
-                Some(how) => how,
-                None => {
-                    let (x, y) = (b.boxed(x), b.boxed(y));
-                    generic_cmp(b, cc, x, y, sense, succs);
-                    return;
-                }
-            },
+    let eq = cc == Cc::Eq;
+    let byte = b.feedback(pc);
+    let (tx, ty) = (b.ty(x), b.ty(y));
+    if eq && !tx.set.is_empty() && !ty.set.is_empty() {
+        // Values of disjoint types are never equal, but for an integer and
+        // a float; `__eq` needs two tables or two userdata.
+        let nums = tx.set.intersects(TypeSet::NUM) && ty.set.intersects(TypeSet::NUM);
+        if !tx.set.intersects(ty.set) && !nums {
+            let c = b.ins(Op::KB1(false), &[]);
+            branch(b, c, sense, succs);
+            return;
+        }
+        let by_bits = |t: crate::jit::ir::types::Ty| {
+            t.rep == Rep::Val
+                && t.within(TypeSet::NIL | TypeSet::BOOL | TypeSet::STR | TypeSet::FUN | TypeSet::THR)
+        };
+        if by_bits(tx) || by_bits(ty) {
+            let (x, y) = (b.boxed(x), b.boxed(y));
+            let c = b.ins(Op::SameBits, &[x, y]);
+            branch(b, c, sense, succs);
+            return;
+        }
+    }
+    // An `_II` form, which exits saw leave i32 when the byte has big integers.
+    let form = (op != generic && !b.kind_exited(pc)).then(|| {
+        CmpKind::Num(if byte & fb::BIGINT != 0 {
+            NumKind::I64
+        } else {
+            NumKind::I32
+        })
+    });
+    let kind = |b: &Builder<'_, '_>, v| cmp_own(b, v).or(form).or_else(|| byte_cmp_kind(byte));
+    let c = match (kind(b, x), kind(b, y)) {
+        (Some(CmpKind::Num(kx)), Some(CmpKind::Num(ky))) => cmp_num(b, cc, (x, kx), (y, ky)),
+        (Some(CmpKind::Str), Some(CmpKind::Str)) if eq => {
+            let (x, y) = (b.boxed(x), b.boxed(y));
+            let (x, y) = (b.guard(x, TypeSet::STR), b.guard(y, TypeSet::STR));
+            b.ins(Op::SameBits, &[x, y])
+        }
+        (Some(CmpKind::Str), Some(CmpKind::Str)) => cmp_str(b, cc == Cc::Le, x, y),
+        _ if eq => {
+            generic_eq(b, x, y, sense, succs);
+            return;
+        }
+        _ => {
+            generic_cmp(b, cc, x, y, sense, succs);
+            return;
         }
     };
-    let c = cmp_vals(b, cc, x, y, how);
     branch(b, c, sense, succs);
 }
 
-/// Both of two `Val`s of kind `set`.
-fn both(b: &mut Builder<'_, '_>, set: TypeSet, x: Val, y: Val) -> Val {
-    let (cx, cy) = (b.ins(Op::IsType(set), &[x]), b.ins(Op::IsType(set), &[y]));
-    let f = b.ins(Op::KB1(false), &[]);
-    b.ins(Op::Select, &[cx, cy, f])
-}
-
-/// Branch on `x cc y` for `Val`s nothing typed, as the handler orders it:
-/// two floats, two small integers, then `jit_lt`/`jit_le` (mixed numbers,
-/// big integers, strings), whose failure (a metamethod, an error) deopts.
-fn generic_cmp(b: &mut Builder<'_, '_>, cc: Cc, x: Val, y: Val, sense: bool, succs: &[Block]) {
-    let ff = both(b, TypeSet::FLOAT, x, y);
-    let (floats, rest) = (b.new_sealed_succ(), b.new_sealed_succ());
-    b.br(ff, floats, rest);
-    b.switch_to(floats);
-    let (fx, fy) = (
-        b.ins(Op::Unbox(Rep::F64), &[x]),
-        b.ins(Op::Unbox(Rep::F64), &[y]),
-    );
-    let c = b.ins(Op::FCmp(cc), &[fx, fy]);
-    branch(b, c, sense, succs);
-    b.switch_to(rest);
-    let ss = both(b, TypeSet::SMALL, x, y);
-    let (smalls, slow) = (b.new_sealed_succ(), b.new_sealed_succ());
-    b.br(ss, smalls, slow);
-    b.switch_to(smalls);
-    let (ix, iy) = (
-        b.ins(Op::Unbox(Rep::I32), &[x]),
-        b.ins(Op::Unbox(Rep::I32), &[y]),
-    );
-    let c = b.ins(Op::ICmp(cc), &[ix, iy]);
-    branch(b, c, sense, succs);
-    b.switch_to(slow);
-    // `a > b` is `b < a`.
-    let (h, x, y) = match cc {
-        Cc::Lt => (HelperId::Lt, x, y),
-        Cc::Le => (HelperId::Le, x, y),
-        Cc::Gt => (HelperId::Lt, y, x),
-        Cc::Ge => (HelperId::Le, y, x),
-        Cc::Lo | Cc::Hi => unreachable!("an unsigned compare of values"),
-        Cc::Eq | Cc::Ne => unreachable!("an ordered compare"),
-    };
-    let bit = if h == HelperId::Lt {
-        MetamethodBits::LT
-    } else {
-        MetamethodBits::LE
-    };
-    helper_branch(b, h, x, y, bit, sense, succs);
-}
-
-/// Branch on `x == y` for `Val`s nothing typed, as the handler orders it:
-/// two floats by value (a NaN has its own bits), equal bits, two small
-/// integers (unequal), then `jit_eq`, whose failure (`__eq`) deopts.
-fn generic_eq(b: &mut Builder<'_, '_>, x: Val, y: Val, sense: bool, succs: &[Block]) {
+/// The targets of a compare's branch: where it goes when equal (or less)
+/// and when not.
+fn targets(sense: bool, succs: &[Block]) -> (Block, Block) {
     let (fall, target) = (succs[0], succs[1]);
-    let (yes, no) = if sense {
-        (target, fall)
-    } else {
-        (fall, target)
-    };
-    let ff = both(b, TypeSet::FLOAT, x, y);
-    let (floats, rest) = (b.new_sealed_succ(), b.new_sealed_succ());
-    b.br(ff, floats, rest);
-    b.switch_to(floats);
-    let (fx, fy) = (
-        b.ins(Op::Unbox(Rep::F64), &[x]),
-        b.ins(Op::Unbox(Rep::F64), &[y]),
-    );
+    if sense { (target, fall) } else { (fall, target) }
+}
+
+/// `x == y` where a kind is unknown, as `eq_slow` decides it: floats by
+/// value first (a NaN's bits equal another NaN's), equal bits, an integer
+/// and a float, two big integers by value, then `__eq` for two tables or
+/// two userdata, which the site's feedback must have seen run to call.
+fn generic_eq(b: &mut Builder<'_, '_>, x: Val, y: Val, sense: bool, succs: &[Block]) {
+    let (yes, no) = targets(sense, succs);
+    let (x, y) = (b.boxed(x), b.boxed(y));
+    let byte = b.feedback(b.pc);
+    let big = byte & fb::BIGINT != 0;
+    // [x float]
+    let not_float = all_in(b, TypeSet::FLOAT, &[x]);
+    let fx = b.ins(Op::Unbox(Rep::F64), &[x]);
+    let other = all_in(b, TypeSet::SMALL | TypeSet::FLOAT, &[y]);
+    let fy = b.ins_exit(Op::ToF64, &[y], ExitTag::Type);
+    let fy = b.f.result(fy);
     let c = b.ins(Op::FCmp(Cc::Eq), &[fx, fy]);
-    branch(b, c, sense, succs);
-    b.switch_to(rest);
+    b.br(c, yes, no);
+    enter_join(b, other);
+    big_float_eq(b, big, y, fx, yes, no);
+    // [x not float, y float]
+    enter_join(b, not_float);
+    let neither = all_in(b, TypeSet::FLOAT, &[y]);
+    let fy = b.ins(Op::Unbox(Rep::F64), &[y]);
+    let other = all_in(b, TypeSet::SMALL, &[x]);
+    let ix = b.ins(Op::Unbox(Rep::I32), &[x]);
+    let fx = b.ins(Op::IToF, &[ix]);
+    let c = b.ins(Op::FCmp(Cc::Eq), &[fx, fy]);
+    b.br(c, yes, no);
+    enter_join(b, other);
+    big_float_eq(b, big, x, fy, yes, no);
+    // [neither float]
+    enter_join(b, neither);
     let same = b.ins(Op::SameBits, &[x, y]);
     let differ = b.new_sealed_succ();
     b.br(same, yes, differ);
     b.switch_to(differ);
-    let ss = both(b, TypeSet::SMALL, x, y);
-    let slow = b.new_sealed_succ();
-    b.br(ss, no, slow);
-    b.switch_to(slow);
-    helper_branch(b, HelperId::Eq, x, y, MetamethodBits::EQ, sense, succs);
+    if big {
+        let other = all_in(b, TypeSet::BIGINT, &[x, y]);
+        let (ix, iy) = (b.ins(Op::Unbox(Rep::I64), &[x]), b.ins(Op::Unbox(Rep::I64), &[y]));
+        let c = b.ins(Op::LCmp(Cc::Eq), &[ix, iy]);
+        b.br(c, yes, no);
+        enter_join(b, other);
+    }
+    let not_tables = all_in(b, TypeSet::TAB, &[x, y]);
+    if calls_mm(b) {
+        eq_mm_arm(b, x, y, yes, no);
+    } else {
+        let (px, py) = (b.ins(Op::Unbox(Rep::Ptr), &[x]), b.ins(Op::Unbox(Rep::Ptr), &[y]));
+        let has = tables::class_bit(b, px, MetamethodBits::EQ);
+        let s = b.snap_before();
+        b.ins_snap(Op::GuardFalse, &[has], s, ExitTag::Mm);
+        let has = tables::class_bit(b, py, MetamethodBits::EQ);
+        b.ins_snap(Op::GuardFalse, &[has], s, ExitTag::Mm);
+        b.jump(no);
+    }
+    enter_join(b, not_tables);
+    let not_udata = all_in(b, TypeSet::UDATA, &[x, y]);
+    if calls_mm(b) {
+        eq_mm_arm(b, x, y, yes, no);
+    } else {
+        // Whether `__eq` runs is the interpreter's to find out.
+        b.deopt(ExitTag::Mm);
+    }
+    enter_join(b, not_udata);
+    b.jump(no);
 }
 
-/// Branch on a compare helper's result; where it fails, on the truth of
-/// the metamethod's (`ret_cond_t/f`).
-fn helper_branch(
-    b: &mut Builder<'_, '_>,
-    h: HelperId,
-    x: Val,
-    y: Val,
-    bit: MetamethodBits,
-    sense: bool,
-    succs: &[Block],
-) {
-    let r = b.ins(Op::Helper(h), &[x, y]);
-    let fail = b.ki32(HELPER_FAIL);
-    let failed = b.ins(Op::ICmp(Cc::Eq), &[r, fail]);
-    if !calls_mm(b) {
-        let s = b.snap_before();
-        b.ins_snap(Op::GuardFalse, &[failed], s, ExitTag::Mm);
-        let zero = b.ki32(0);
-        let c = b.ins(Op::ICmp(Cc::Ne), &[r, zero]);
-        branch(b, c, sense, succs);
+/// `f == v` for a float `f` and a value `v` known not to be a small integer
+/// or a float: equal only as a big integer of the same value.
+fn big_float_eq(b: &mut Builder<'_, '_>, big: bool, v: Val, f: Val, yes: Block, no: Block) {
+    if !big {
+        b.jump(no);
         return;
     }
-    let ok = branch_arm(b, failed);
+    let not_big = all_in(b, TypeSet::BIGINT, &[v]);
+    let i = b.ins(Op::Unbox(Rep::I64), &[v]);
+    let g = b.ins_exit(Op::LToFExact, &[i], ExitTag::Slow);
+    let g = b.f.result(g);
+    let c = b.ins(Op::FCmp(Cc::Eq), &[g, f]);
+    b.br(c, yes, no);
+    enter_join(b, not_big);
+    b.jump(no);
+}
+
+/// `__eq` of two tables or two userdata with different bits: none means
+/// unequal, else its result's truth.
+fn eq_mm_arm(b: &mut Builder<'_, '_>, x: Val, y: Val, yes: Block, no: Block) {
+    let f = b.ins(Op::Helper(HelperId::Mm(MetamethodBits::EQ.bits())), &[x, y]);
+    let none = b.ins(Op::IsType(TypeSet::NIL), &[f]);
+    let call = b.new_sealed_succ();
+    b.br(none, no, call);
+    b.switch_to(call);
+    let res = mm_call(b, f, &[x, y]);
+    let falsy = b.ins(Op::IsFalsy, &[res]);
+    b.br(falsy, no, yes);
+}
+
+/// `x < y` (or `<=`) where a kind is unknown: numbers and strings behind
+/// tests of what the site's feedback saw; the metamethod arm once it saw one
+/// run; anything else raises in the interpreter.
+fn generic_cmp(b: &mut Builder<'_, '_>, cc: Cc, x: Val, y: Val, sense: bool, succs: &[Block]) {
+    let (yes, no) = targets(sense, succs);
+    let (x, y) = (b.boxed(x), b.boxed(y));
+    let byte = b.feedback(b.pc);
+    let le = cc == Cc::Le;
+    if byte & (fb::SMALL | fb::FLOAT) != 0 || byte & fb::KINDS == 0 {
+        let other = all_in(b, TypeSet::SMALL | TypeSet::FLOAT, &[x, y]);
+        let (fx, fy) = (cmp_f64(b, x, NumKind::Num), cmp_f64(b, y, NumKind::Num));
+        let c = b.ins(Op::FCmp(cc), &[fx, fy]);
+        b.br(c, yes, no);
+        enter_join(b, other);
+    }
+    if byte & fb::STR != 0 {
+        let other = all_in(b, TypeSet::STR, &[x, y]);
+        let c = cmp_str(b, le, x, y);
+        b.br(c, yes, no);
+        enter_join(b, other);
+    }
+    if byte & fb::BIGINT != 0 {
+        let other = all_in(b, TypeSet::INT, &[x, y]);
+        let c = cmp_num(b, cc, (x, NumKind::I64), (y, NumKind::I64));
+        b.br(c, yes, no);
+        enter_join(b, other);
+    }
+    if !calls_mm(b) {
+        // Mixed big integers and floats, or what raises.
+        b.deopt(ExitTag::Slow);
+        return;
+    }
+    let bit = if le {
+        MetamethodBits::LE
+    } else {
+        MetamethodBits::LT
+    };
     let f = metamethod(b, bit, &[x, y]);
     let res = mm_call(b, f, &[x, y]);
     let falsy = b.ins(Op::IsFalsy, &[res]);
-    branch(b, falsy, !sense, succs);
-    b.switch_to(ok);
-    let zero = b.ki32(0);
-    let c = b.ins(Op::ICmp(Cc::Ne), &[r, zero]);
-    branch(b, c, sense, succs);
-}
-
-/// Whether equality with `v` is identity: it is no number and no table or
-/// userdata (`__eq` needs both to be one).
-fn eq_by_bits(b: &Builder<'_, '_>, v: Val) -> bool {
-    let ty = b.ty(v);
-    ty.rep == Rep::Val
-        && !ty.set.is_empty()
-        && ty.within(TypeSet::NIL | TypeSet::BOOL | TypeSet::STR | TypeSet::FUN | TypeSet::THR)
+    b.br(falsy, no, yes);
 }
 
 fn emit_cmp_imm(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Block]) {
@@ -1466,54 +1526,87 @@ fn emit_cmp_imm(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Bl
     };
     // `k <cc> v` is `v <swapped cc> k`.
     let cc = if swap { cc.swap() } else { cc };
-    let how = if op != generic && !b.kind_exited(pc) {
-        CmpAs::F64
-    } else {
-        match num_kind(b, v).or(byte_kind(b, pc)) {
-            Some(how) => how,
-            None => {
-                let (v, kk) = (b.boxed(v), b.konst(Value::small(k as i32)));
-                generic_cmp(b, cc, v, kk, sense, succs);
+    let byte = b.feedback(pc);
+    // The fast path takes big integers too, unrecorded: an empty byte is any
+    // number, which the `Num` path's conversion exits on when big.
+    let form = (op != generic && !b.kind_exited(pc)).then_some(NumKind::F64);
+    let kind = own_kind(b, v).or(form).or_else(|| byte_num_kind(byte));
+    let imm = |b: &mut Builder<'_, '_>, kind: NumKind| match kind {
+        NumKind::I32 => b.ki32(k as i32),
+        NumKind::I64 => b.ins(Op::KI64(k), &[]),
+        _ => b.kf64(k as f64),
+    };
+    let c = match kind {
+        Some(kind) => {
+            let x = match kind {
+                NumKind::I32 => b.as_i32(v),
+                NumKind::I64 => b.as_i64(v),
+                kind => cmp_f64(b, v, kind),
+            };
+            let kk = imm(b, kind);
+            let op = match kind {
+                NumKind::I32 => Op::ICmp(cc),
+                NumKind::I64 => Op::LCmp(cc),
+                _ => Op::FCmp(cc),
+            };
+            b.ins(op, &[x, kk])
+        }
+        None => {
+            let (yes, no) = targets(sense, succs);
+            let x = b.boxed(v);
+            let other = all_in(b, TypeSet::SMALL | TypeSet::FLOAT, &[x]);
+            let fx = cmp_f64(b, x, NumKind::Num);
+            let kk = imm(b, NumKind::F64);
+            let c = b.ins(Op::FCmp(cc), &[fx, kk]);
+            b.br(c, yes, no);
+            enter_join(b, other);
+            if byte & fb::BIGINT != 0 {
+                let other = all_in(b, TypeSet::BIGINT, &[x]);
+                let ix = b.ins(Op::Unbox(Rep::I64), &[x]);
+                let kk = imm(b, NumKind::I64);
+                let c = b.ins(Op::LCmp(cc), &[ix, kk]);
+                b.br(c, yes, no);
+                enter_join(b, other);
+            }
+            if !calls_mm(b) {
+                b.deopt(ExitTag::Slow);
                 return;
             }
-        }
-    };
-    let c = match how {
-        CmpAs::I32 => {
-            let x = b.as_i32(v);
-            let kk = b.ki32(k as i32);
-            b.ins(Op::ICmp(cc), &[x, kk])
-        }
-        CmpAs::I64 => {
-            let x = b.as_i64(v);
-            let kk = b.ins(Op::KI64(k), &[]);
-            b.ins(Op::LCmp(cc), &[x, kk])
-        }
-        CmpAs::F64 => {
-            let x = b.num_f64(v);
-            let kk = b.kf64(k as f64);
-            b.ins(Op::FCmp(cc), &[x, kk])
+            let le = cc == Cc::Le || cc == Cc::Ge;
+            let bit = if le {
+                MetamethodBits::LE
+            } else {
+                MetamethodBits::LT
+            };
+            // The metamethod takes the operands in source order.
+            let kv = b.konst(Value::small(k as i32));
+            let args = if swap { [kv, x] } else { [x, kv] };
+            let f = metamethod(b, bit, &args);
+            let res = mm_call(b, f, &args);
+            let falsy = b.ins(Op::IsFalsy, &[res]);
+            b.br(falsy, no, yes);
+            return;
         }
     };
     branch(b, c, sense, succs);
 }
 
-fn emit_eqi(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Block]) {
+fn emit_eqi(b: &mut Builder<'_, '_>, _pc: u32, insn: Instruction, succs: &[Block]) {
     let v = b.reg(insn.a());
     let k = insn.cmp_imm_int();
     let sense = insn.op() == BcOp::JEQI;
-    let c = match num_kind(b, v).or(byte_kind(b, pc)) {
-        Some(CmpAs::F64) => {
-            let x = b.num_f64(v);
+    let c = match own_kind(b, v) {
+        Some(kind @ (NumKind::F64 | NumKind::Num)) => {
+            let x = cmp_f64(b, v, kind);
             let kk = b.kf64(k as f64);
             b.ins(Op::FCmp(Cc::Eq), &[x, kk])
         }
-        Some(CmpAs::I64) => {
+        Some(NumKind::I64) => {
             let x = b.as_i64(v);
             let kk = b.ins(Op::KI64(k), &[]);
             b.ins(Op::LCmp(Cc::Eq), &[x, kk])
         }
-        Some(CmpAs::I32) => {
+        Some(NumKind::I32) => {
             let x = b.as_i32(v);
             let kk = b.ki32(k as i32);
             b.ins(Op::ICmp(Cc::Eq), &[x, kk])

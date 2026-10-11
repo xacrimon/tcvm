@@ -914,6 +914,23 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 let ops = vec![self.def(res.unwrap()), self.use_(args[0])];
                 self.push_exit(i, |exit| MInst::FToIExact { exit }, ops, none);
             }
+            Op::LToFExact => {
+                let ops = vec![self.def(res.unwrap()), self.use_(args[0])];
+                self.push_exit(i, |exit| MInst::LToFExact { exit }, ops, none);
+            }
+            Op::StrLt | Op::StrLe => {
+                let d = Operand::new(
+                    self.vr(res.unwrap()),
+                    regalloc2::OperandConstraint::Reg,
+                    regalloc2::OperandKind::Def,
+                    regalloc2::OperandPos::Early,
+                );
+                let mut ops = vec![d, self.use_(args[0]), self.use_(args[1])];
+                for _ in 0..5 {
+                    ops.push(Operand::reg_temp(self.v.new_vreg(RegClass::Int)));
+                }
+                self.push(MInst::StrCmp { le: op == Op::StrLe }, &ops, none);
+            }
             Op::ToF64 => {
                 let ops = vec![self.def(res.unwrap()), self.use_(args[0])];
                 self.push_exit(i, |exit| MInst::ToF64 { exit }, ops, none);

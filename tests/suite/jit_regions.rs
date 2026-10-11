@@ -884,3 +884,90 @@ fn fast_calls() {
 "##,
     );
 }
+
+/// The value pairs every operator site is warmed up on and then probed
+/// with, as a chunk returning `fmt(ok, v)` for each probe.
+const KINDS_PRELUDE: &str = r##"
+    local mt = {}
+    for _, k in ipairs({"add", "sub", "mul", "div", "mod", "pow", "unm", "idiv",
+                        "band", "bor", "bxor", "shl", "shr", "bnot", "lt", "le", "eq"}) do
+        mt["__" .. k] = function(a, b) return k end
+    end
+    local vals = {1, -7, 1 << 40, 1.5, -0.0, 2^53, (1 << 53) + 1, math.huge,
+                  "10", "x", {}, true, setmetatable({}, mt), 0/0, math.mininteger, 2^31}
+    local warm = {{1, 2}, {4, 5}, {1, 4}, {3, 1}, {9, 2}, {13, 1}, {7, 6}}
+    local function fmt(ok, v)
+        if not ok then return "E:" .. tostring(v) end
+        return (math.type(v) or type(v)) .. ":" .. tostring(v)
+    end
+    local out = {}
+    local function probe(expr)
+        for _, w in ipairs(warm) do
+            local g = load("return function(a, b) return " .. expr .. " end")()
+            local a, b = vals[w[1]], vals[w[2]]
+            for i = 1, 300 do pcall(g, a, b) end
+            for _, x in ipairs(vals) do
+                for _, y in ipairs(vals) do
+                    out[#out + 1] = fmt(pcall(g, x, y))
+                end
+            end
+        end
+    end
+"##;
+
+/// Every arithmetic operator, register and immediate forms and the unary
+/// ones, compiled after warm-ups of several kind mixes, then run on every
+/// pair of values: compiled code exits or takes its slow arm where the
+/// kinds differ, and the results equal the interpreter's.
+#[test]
+fn arith_kinds() {
+    let src = format!(
+        "{KINDS_PRELUDE}
+        for _, e in ipairs({{\"a + b\", \"a - b\", \"a * b\", \"a / b\", \"a // b\", \"a % b\",
+            \"a ^ b\", \"a & b\", \"a | b\", \"a ~ b\", \"a << b\", \"a >> b\", \"a + 1\",
+            \"a * 2.5\", \"3 - a\", \"a // 2\", \"a % 3\", \"a ^ 2\", \"a ^ 0.5\", \"2 ^ a\",
+            \"-a\", \"~a\", \"a & 7\", \"a << 1\", \"1.5 / a\"}}) do
+            probe(e)
+        end
+        return table.concat(out, ' ')"
+    );
+    agrees(&src);
+}
+
+/// Every compare, register and immediate forms, compiled after warm-ups of
+/// several kind mixes, then run on every pair of values: numbers around
+/// 2^53, NaNs and signed zeros, strings with zeros and high bytes, tables
+/// with and without metamethods.
+#[test]
+fn cmp_kinds() {
+    let src = r##"
+    local mt = {__eq = function() return "eq" end, __lt = function() return "lt" end,
+                __le = function() return false end}
+    local vals = {1, -7, 1 << 40, 1.5, -0.0, 0.0, 2^53, (1 << 53) + 1, 9007199254740993,
+                  math.huge, 0/0, -(0/0), math.mininteger, 2^31, "10", "a", "ab", "b",
+                  "a\0b", "a\0c", "", "\xff", "a\xff", {}, true, false,
+                  setmetatable({}, mt), setmetatable({}, mt)}
+    local warm = {{1, 2}, {4, 5}, {1, 4}, {3, 1}, {16, 17}, {27, 28}, {8, 7}, {11, 12}, {24, 25}}
+    local function fmt(ok, v)
+        if not ok then return "E:" .. tostring(v) end
+        return tostring(v)
+    end
+    local out = {}
+    for _, expr in ipairs({"a < b", "a <= b", "a > b", "a >= b", "a == b", "a ~= b",
+                           "a < 3", "a <= -2", "a > 3", "a >= 0", "3 < a", "a == 5",
+                           "a ~= 0", "a == 'a'", "not (a < b)"}) do
+        for _, w in ipairs(warm) do
+            local g = load("return function(a, b) return " .. expr .. " end")()
+            local a, b = vals[w[1]], vals[w[2]]
+            for i = 1, 300 do pcall(g, a, b) end
+            for _, x in ipairs(vals) do
+                for _, y in ipairs(vals) do
+                    out[#out + 1] = fmt(pcall(g, x, y))
+                end
+            end
+        end
+    end
+    return table.concat(out, " ")
+"##;
+    agrees(src);
+}

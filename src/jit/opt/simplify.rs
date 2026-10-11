@@ -88,6 +88,15 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                             _ => {}
                         }
                     }
+                    if let Some(k) = konst_val(f, x)
+                        && let Some(n) = k.get_small().map(f64::from).or(k.get_float())
+                    {
+                        f.insts[i.idx()].op = Op::KF64(n.to_bits());
+                        f.insts[i.idx()].an = 0;
+                        f.insts[i.idx()].snap = crate::jit::ir::NO_SNAP;
+                        changed = true;
+                        continue;
+                    }
                     let t = f.ty(x);
                     if t.within(TypeSet::FLOAT) && !t.set.is_empty() {
                         f.insts[i.idx()].op = Op::Unbox(Rep::F64);

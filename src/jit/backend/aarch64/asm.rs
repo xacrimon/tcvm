@@ -633,6 +633,11 @@ impl Asm {
         self.madd(sz, d, n, m, ZR);
     }
 
+    /// `cls xd, xn`: the leading bits equal to the sign bit, not counting it.
+    pub(crate) fn cls(&mut self, d: Gpr, n: Gpr) {
+        self.emit(0xDAC0_1400 | r(n) << 5 | r(d));
+    }
+
     /// `smull xd, wn, wm`: the full 64-bit product of two `w` registers.
     pub(crate) fn smull(&mut self, d: Gpr, n: Gpr, m: Gpr) {
         self.emit(0x9B20_7C00 | r(m) << 16 | r(n) << 5 | r(d));
@@ -784,6 +789,11 @@ impl Asm {
 
     pub(crate) fn ldrb(&mut self, t: Gpr, n: Gpr, off: i32) {
         self.mem_op(0x3940_0000, 0x3840_0000, 1, r(t), n, off);
+    }
+
+    /// `ldrb wt, [xn, xm]`.
+    pub(crate) fn ldrb_reg(&mut self, t: Gpr, n: Gpr, m: Gpr) {
+        self.emit(0x3860_6800 | r(m) << 16 | r(n) << 5 | r(t));
     }
 
     pub(crate) fn strb(&mut self, t: Gpr, n: Gpr, off: i32) {
