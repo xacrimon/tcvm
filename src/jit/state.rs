@@ -111,6 +111,26 @@ pub(crate) struct JitRuntime {
     pub(crate) exhausted: Cell<bool>,
     /// The register allocator's buffers, kept between compiles.
     pub(crate) ra: RefCell<regalloc2::Ctx>,
+    pub(crate) native: NativeBase,
+}
+
+/// Where the executor entered dispatch (`dispatch::call_handler`): every
+/// handler runs with this stack pointer, frame pointer and return address. A
+/// region that leaves for the interpreter restores them, which drops the
+/// native frames of a chain of fast calls (5.4); each of those frames' Lua
+/// frames resumes through its callee's header instead.
+#[derive(Default)]
+pub(crate) struct NativeBase {
+    pub(crate) sp: Cell<usize>,
+    pub(crate) fp: Cell<usize>,
+    pub(crate) lr: Cell<usize>,
+    /// A fast entry with the stack pointer below this takes the slow path.
+    pub(crate) limit: Cell<usize>,
+    /// A fast call with the stack pointer below this does not use the return
+    /// address stack, which is deeper than the hardware's from here.
+    pub(crate) deep: Cell<usize>,
+    /// The handler the entry shim branches to.
+    pub(crate) target: Cell<usize>,
 }
 
 #[derive(Default)]
@@ -136,6 +156,7 @@ impl JitRuntime {
             code: RefCell::new(None),
             exhausted: Cell::new(false),
             ra: RefCell::new(regalloc2::Ctx::default()),
+            native: NativeBase::default(),
         };
         rt.grow_table(16);
         rt

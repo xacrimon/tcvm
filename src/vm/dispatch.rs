@@ -212,7 +212,27 @@ fn call_handler<'gc>(
 ) -> Exit {
     #[cfg(target_arch = "aarch64")]
     {
-        h(insn, pc, base, rt, closure, thread)
+        // A nested dispatch (a host call from inside a native) records its
+        // own entry; the outer one's is back when it returns.
+        let nb = &rt.jit().native;
+        let saved = (
+            nb.sp.get(),
+            nb.fp.get(),
+            nb.lr.get(),
+            nb.limit.get(),
+            nb.deep.get(),
+        );
+        nb.target.set(h as usize);
+        // SAFETY: `dispatch_entry` branches to `h` with these arguments.
+        let exit = unsafe {
+            crate::jit::backend::aarch64::abi::dispatch_entry(insn, pc, base, rt, closure, thread)
+        };
+        nb.sp.set(saved.0);
+        nb.fp.set(saved.1);
+        nb.lr.set(saved.2);
+        nb.limit.set(saved.3);
+        nb.deep.set(saved.4);
+        exit
     }
     #[cfg(not(target_arch = "aarch64"))]
     {

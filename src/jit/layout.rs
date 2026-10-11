@@ -15,6 +15,16 @@ use crate::vm::dispatch::Runtime;
 const JIT: usize = offset_of!(State<'static>, jit);
 /// The pointer to the exit register image.
 pub(crate) const EXIT_REGS: usize = JIT + offset_of!(JitRuntime, exit_regs);
+/// `JitRuntime::native`: the dispatch entry's stack pointer, frame pointer
+/// and return address, the fast entries' stack limit and the entry shim's
+/// target. Too far from `rt` for `ldp`; single loads reach them.
+const NATIVE: usize = JIT + offset_of!(JitRuntime, native);
+pub(crate) const NATIVE_SP: usize = NATIVE + offset_of!(crate::jit::state::NativeBase, sp);
+pub(crate) const NATIVE_FP: usize = NATIVE + offset_of!(crate::jit::state::NativeBase, fp);
+pub(crate) const NATIVE_LR: usize = NATIVE + offset_of!(crate::jit::state::NativeBase, lr);
+pub(crate) const NATIVE_LIMIT: usize = NATIVE + offset_of!(crate::jit::state::NativeBase, limit);
+pub(crate) const NATIVE_DEEP: usize = NATIVE + offset_of!(crate::jit::state::NativeBase, deep);
+pub(crate) const NATIVE_TARGET: usize = NATIVE + offset_of!(crate::jit::state::NativeBase, target);
 /// The pointer to the arena's `Metrics`.
 pub(crate) const METRICS: usize =
     offset_of!(State<'static>, rt) + offset_of!(Runtime<'static>, metrics);
@@ -61,6 +71,15 @@ pub(crate) const FN_MAX_STACK: usize =
     FN_LUA + offset_of!(crate::env::function::LuaClosure<'static>, max_stack_size);
 pub(crate) const FN_IS_VARARG: usize =
     FN_LUA + offset_of!(crate::env::function::LuaClosure<'static>, is_vararg);
+/// A function value's top 16 bits (`QNAN_NEG | TAG_FUNCTION << 48`).
+pub(crate) const FUNCTION_TAG: u16 = 0xFFF8 | 5;
+/// A Lua closure's prototype pointer (a `Gc`, so the box), and from that
+/// box the prototype's fast entry.
+pub(crate) const FN_PROTO: usize =
+    FN_LUA + offset_of!(crate::env::function::LuaClosure<'static>, proto);
+pub(crate) const PROTO_FAST: usize =
+    Gc::<'static, crate::env::function::Prototype<'static>>::VALUE_OFFSET
+        + offset_of!(crate::env::function::Prototype<'static>, jit_fast);
 const _: () = assert!(
     size_of::<crate::env::function::NativeClosure<'static>>()
         <= offset_of!(crate::env::function::FunctionKind<'static>, Native.0) + FN_IS_VARARG
@@ -184,6 +203,7 @@ mod tests {
             // What compiled code reads: a function value's payload.
             let fun = |i: i32| {
                 let f = t.raw_get(Value::small(i));
+                assert_eq!((f.to_raw() >> 48) as u16, FUNCTION_TAG);
                 let p = (f.to_raw() & ((1 << 48) - 1)) as usize;
                 assert_eq!(p, Gc::as_ptr(f.get_function().unwrap().inner()) as usize);
                 p
@@ -202,6 +222,10 @@ mod tests {
                 .unwrap();
             let code = unsafe { ((fixed + FN_CODE) as *const usize).read() };
             assert_eq!(code, lf.code as usize);
+            let proto = unsafe { ((fixed + FN_PROTO) as *const usize).read() };
+            lf.proto.jit_fast.set(0x1234);
+            assert_eq!(unsafe { ((proto + PROTO_FAST) as *const usize).read() }, 0x1234);
+            lf.proto.jit_fast.set(0);
             assert_eq!(byte(fixed, FN_MAX_STACK), lf.max_stack_size);
         });
     }

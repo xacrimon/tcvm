@@ -387,6 +387,9 @@ fn install<'gc>(
     st.regions.push(region);
     st.compiles += 1;
     write_code(closure, at, jw);
+    if !region.fast_entry.is_null() {
+        closure.proto.jit_fast.set(region.fast_entry as usize);
+    }
     if st.entries.len() > MAX_ENTRIES {
         // A loop entry inside another live entry's loop, whose region
         // covers it but for the rest of one outer iteration after a deopt
@@ -427,6 +430,9 @@ fn write_code(closure: LuaFn<'_>, at: u32, word: Instruction) {
 /// go of its slot and region.
 fn retire_entry(ctx: Context<'_>, closure: LuaFn<'_>, e: &Entry<'_>) {
     write_code(closure, e.pc, e.original);
+    if e.pc == 0 {
+        closure.proto.jit_fast.set(0);
+    }
     for &pc in &e.back_edges {
         let mut i = unsafe { *closure.code.add(pc as usize) };
         assert!(i.set_branch_offset(i.branch_offset() + 1));
@@ -675,6 +681,10 @@ fn request_recompile<'gc>(
         e.state = EntryState::Recompile;
         e.free_recompile |= free;
         ctx.jit().set_slot(e.slot, jit_recompile as *const u8);
+        // Compiled callers come through `enter` to the recompile too.
+        if e.pc == 0 {
+            closure.proto.jit_fast.set(0);
+        }
     }
 }
 
@@ -735,6 +745,9 @@ fn recompile<'gc>(
             st.regions.push(region);
             st.compiles += 1;
             ctx.jit().set_slot(slot, region.entry);
+            if !region.fast_entry.is_null() {
+                closure.proto.jit_fast.set(region.fast_entry as usize);
+            }
             log(ctx, || {
                 format!(
                     "recompiled {} pc{at}",
