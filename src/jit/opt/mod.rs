@@ -75,15 +75,17 @@ pub(crate) fn natural_loops(f: &Func<'_>) -> Vec<(Block, Vec<Block>)> {
 }
 
 /// Keep one collector check per section, as LuaJIT does (`asm_gc_check`):
-/// at the header of each loop that boxes an integer (which may allocate),
-/// allocates or calls out, and at the entry when code outside every loop
-/// does; garbage then waits at most one iteration or one entry.
+/// at the header of each loop that boxes an integer (which may allocate) or
+/// allocates, and at the entry when code outside every loop does; garbage
+/// then waits at most one iteration or one entry.
 pub(crate) fn prune_gc_checks(f: &mut Func<'_>) {
     use crate::jit::ir::types::Rep;
+    // A call is not an allocation: its callee checks its own, as the
+    // interpreter's allocating handlers and `native_enter` do (5.7).
     let allocates = |f: &Func<'_>, b: Block| {
         f.insts_of(b).iter().any(|&i| match f.op(i) {
             Op::Box => f.ty(f.args(i)[0]).rep == Rep::I64,
-            Op::Call { .. } | Op::CallMm { .. } => true,
+            Op::Call { .. } | Op::CallMm { .. } => false,
             op => op.effects().has(crate::jit::ir::ops::Effects::MAY_ALLOC),
         })
     };
