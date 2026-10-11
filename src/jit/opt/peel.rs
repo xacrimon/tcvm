@@ -1,15 +1,41 @@
-//! Loop peeling (9.3): each small innermost loop gets a copy of its body in
-//! front of it, so the loop's header joins only steady-state values and the
-//! copy's guards dominate the loop for GVN.
+//! Loop peeling (9.3): each innermost loop up to `PEEL_LIMIT`, and each
+//! outer loop of that size whose inner loops are small, gets a copy of its
+//! body in front of it, so the loop's header joins only steady-state values
+//! and the copy's guards dominate the loop for GVN.
 
 use crate::jit::FastMap as HashMap;
 use crate::jit::ir::{Block, BlockCall, CfgInfo, Func, NO_SNAP, Snap, Val, ValDef};
 use crate::jit::opt::natural_loops;
 
 /// Loops larger than this many instructions are not peeled.
-const PEEL_LIMIT: usize = 48;
+const PEEL_LIMIT: usize = 400;
+/// An outer loop is peeled when each loop inside it is at most this large.
+const INNER_LIMIT: usize = 100;
+/// No peel grows a region past this many instructions.
+const REGION_LIMIT: usize = 2500;
 
 pub(crate) fn peel(f: &mut Func<'_>) -> bool {
+    // Innermost loops, then outer ones over small inner loops, whose bodies
+    // the copies have grown: one at a time, each found again after the last.
+    let mut changed = peel_round(f, None);
+    let sizes = first_sizes(f);
+    while peel_round(f, Some(&sizes)) {
+        changed = true;
+    }
+    changed
+}
+
+/// Each loop header's own size before outer peeling: the instructions of
+/// its body.
+fn first_sizes(f: &Func<'_>) -> Vec<(Block, usize)> {
+    loops(f)
+        .into_iter()
+        .map(|(h, body)| (h, size_of(f, &body)))
+        .collect()
+}
+
+/// One entry per header, its body the union of its back edges' loops.
+fn loops(f: &Func<'_>) -> Vec<(Block, Vec<Block>)> {
     let mut bodies: Vec<(Block, Vec<Block>)> = Vec::new();
     for (h, body) in natural_loops(f) {
         match bodies.iter_mut().find(|(x, _)| *x == h) {
@@ -23,14 +49,51 @@ pub(crate) fn peel(f: &mut Func<'_>) -> bool {
             None => bodies.push((h, body)),
         }
     }
+    bodies
+}
+
+fn size_of(f: &Func<'_>, body: &[Block]) -> usize {
+    body.iter().map(|b| f.blocks[b.idx()].insts.len()).sum()
+}
+
+/// Peel every innermost loop (`inner` none), or the first outer loop whose
+/// inner loops all had at most `INNER_LIMIT` instructions.
+fn peel_round(f: &mut Func<'_>, inner: Option<&[(Block, usize)]>) -> bool {
+    let bodies = loops(f);
     let headers: Vec<Block> = bodies.iter().map(|(h, _)| *h).collect();
     let mut changed = false;
+    let mut region = size_of(f, &f.cfg().rpo);
     for (h, body) in &bodies {
-        let innermost = !headers.iter().any(|x| x != h && body.contains(x));
-        let size: usize = body.iter().map(|b| f.blocks[b.idx()].insts.len()).sum();
-        if innermost && size <= PEEL_LIMIT && !f.blocks[h.idx()].peeled {
+        let inside: Vec<Block> = headers
+            .iter()
+            .copied()
+            .filter(|x| x != h && body.contains(x))
+            .collect();
+        let wanted = match inner {
+            None => inside.is_empty(),
+            Some(sizes) => {
+                !inside.is_empty()
+                    && inside.iter().all(|x| {
+                        sizes
+                            .iter()
+                            .find(|(y, _)| y == x)
+                            .is_some_and(|&(_, n)| n <= INNER_LIMIT)
+                    })
+            }
+        };
+        let size = size_of(f, body);
+        if wanted
+            && size <= PEEL_LIMIT
+            && region + size <= REGION_LIMIT
+            && !f.blocks[h.idx()].peeled
+        {
             peel_loop(f, *h, body);
+            f.blocks[h.idx()].peeled = true;
+            region += size;
             changed = true;
+            if inner.is_some() {
+                break;
+            }
         }
     }
     changed
