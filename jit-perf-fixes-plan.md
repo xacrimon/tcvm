@@ -588,6 +588,64 @@ inside the loop (the entry guard holds, the loop's own write is SSA), and a
 global `assert` replaced by a user function between two runs of the loop
 (the `GuardSame` exits and the recompile sees the new value).
 
+### A9. Recompiles: learn for free, back off, let feedback settle
+
+*Files:* `jit/mod.rs:449-522` (`on_exit`), `:563-617` (`record_site`),
+`:622-661` (`on_entry_fail`), `:663-689` (`request_recompile`), `:693-772`
+(`recompile`), `:431-445` (`retire_entry`), `jit/state.rs:12-20`
+(`EXIT_HOT`, `MAX_RECOMPILES`, `MAX_STRIKES`), `:247-291` (`Entry`),
+`jit/compile.rs:108-116` (`EntryKinds.seen`).
+
+Milestone A adds widenable exits (`Bounds`, callee `GuardSame` misses) to
+`Type`, `Shape`, `Overflow` and `Mm`, so a site can learn its kinds one
+exit at a time; with `MAX_RECOMPILES = 4` and a blacklist after it, a site
+could be removed from compilation before it is stable. The engines treat
+this as a tiering policy, not a count:
+
+- V8 has no deopt limit. A deopt discards the code, resets the function's
+  interrupt budget and marks the feedback vector (`deoptimizer.cc:1895-1910`);
+  the function is reoptimized only after running a full budget with its
+  feedback unchanged (`minimum_invocations_after_ic_update`,
+  `tiering-manager.cc:486-540`). Only compile failures and oversized
+  bytecode disable optimization (`ShouldOptimize`, `:412-450`).
+- JSC counts exits against a threshold (`osrExitCountForReoptimization =
+  100`, 5 inside a loop, `OptionsList.h:394-395`), doubles both the warm-up
+  and the exit thresholds per reoptimization (`reoptimizationRetryCounter`,
+  `CodeBlock.cpp:2618, 2743-2748, 2880-2891`, capped only so they do not
+  overflow), and records every jettisoning exit as a `FrequentExitSite`
+  that the DFG consults before speculating (`DFGOSRExitBase.cpp:35-60`,
+  `DFGGraph.h:386-506`).
+
+We already have the exit profile (`kind_exits`, the feedback bytes, B5's
+kinds per exit) and the `NeverRan` free recompile. Three changes complete
+it:
+
+1. **A recompile that learned something is free.** `on_exit` compares the
+   site's feedback byte, its `shapes_seen` list and its callee slot before
+   and after `record_site`; a recompile requested by an exit that changed
+   any of them does not count against `MAX_RECOMPILES` (the `NeverRan`
+   rule, `jit/mod.rs:497-521`, generalized). A recompile whose exit
+   learned nothing counts: that is the flapping case the budget is for.
+2. **Backoff instead of a cliff.** `Entry` gains `retries: u8`; each counted
+   recompile increments it and the entry's exit threshold and hot threshold
+   become `EXIT_HOT << retries` and `HOT << retries`. The blacklist
+   (`retire_entry`) comes at `MAX_RETRIES = 6`, replacing `MAX_RECOMPILES`
+   as the cliff; `MAX_STRIKES` for compile failures is unchanged.
+3. **Let feedback settle.** After a learned exit, `request_recompile`
+   returns the entry to counting at `HOT / 4` instead of compiling on the
+   next entry (today the slot points at `jit_recompile`, which compiles
+   immediately, `:663-689`). Kinds that arrive within a few hundred
+   executions of each other are then folded into one compile. This is the
+   direct fix for T3's churn (deltablue: 50 recompiles of 122 compiles,
+   nearly all from shape exits that arrive in bursts).
+
+*Verification:* `TCVM_JIT_LOG=1` counts of compiles and recompiles on
+deltablue, havlak and json before and after (targets: recompiles under a
+third of compiles, no blacklists on the suite); a unit test in `jit/tests.rs`
+that drives an entry through six learning exits and checks it is still
+compiled, then through six non-learning exits and checks the thresholds
+doubled and the entry retired.
+
 ### Milestone A exit criteria
 
 - `tests/suite` passes with the JIT on, off, `TCVM_JIT_CHECK=1` and
@@ -860,6 +918,22 @@ after C1 alone: spectral about 110 instructions per inner iteration.
 
 **C1.8 Invariants, stated for the verifier and the tests.**
 
+- Every frame between a leave site and `NATIVE_FP` is a region frame. This
+  holds because helpers are leaves (R5: they run no Lua and never call back
+  into compiled code), so the C frames of the trampolines, `jit_barrier` and
+  `jit_box_i64` are never on the chain when `jit_leave` runs; the only
+  frames a region pushes under itself are fast callees' region frames.
+  `jit_leave` asserts in debug builds that `[fp + 16]` of every frame it
+  visits is a known region word (`JitState::regions`), and `TCVM_JIT_CHECK`
+  makes the assertion unconditional.
+- A `TailEnter` to a callee with a fast entry closes this frame and branches
+  with the frame's return address (`emit.rs:1135-1175`), so the callee's
+  frame takes this one's place in the chain and its return address is the
+  tail-caller's caller's site. The site table therefore covers that case by
+  construction (the key is the caller's return address, whichever region
+  returns through it), and a tail-caller has nothing live, so no entry of
+  its own is needed. The `TailEnter` dispatch arm for a callee without a
+  fast entry is a leave site like the others.
 - A `Ptr` value never lives across a call (verifier).
 - No collection runs while a region frame holds unmaterialized values: every
   path to the collector or the unwinder goes through `jit_leave` (the slow
@@ -935,6 +1009,26 @@ full snapshot replay would give (debug builds).
 6. **`select`** gets a fast core (`basic.rs:624-650` allocates a `Vec` per
    call; a core copies `nargs - n` values directly); `tostring` and
    `string.format` stay continuation natives.
+7. **`pcall` and `xpcall` cores, traced.** `ff_pcall` (`native.rs:650-663`)
+   builds a second header: the protected callee's, overlaid on the CALL's
+   hidden slots at `base + a + 1`, with word 1 = `ret_pcall` (`:620`) and
+   `PROTECTED`, then tails `enter` for the callee. From a region the path
+   is: the region writes the `pcall` call's own header at `a` (word 1 = the
+   slow resume entry of this site, since the core may run Lua that yields
+   or errors), `bl jit_leave_stub`, `b ff_pcall_core`. The core reads
+   `nargs` from `insn` and `a` from `pc - base`, writes the inner header at
+   `a + 1` with `ret_pcall` and the outer header untouched, and tails
+   `enter`. On a normal return, `ret_pcall` (`native.rs:620-634`) prepends
+   `true`, pops the inner frame and returns through the *outer* header's
+   word 1, which is the region's slow resume entry: the frame re-opens and
+   the reload stub restores the spill slots. On an error, the unwinder
+   finds the `PROTECTED` inner frame, delivers `false, err` through the
+   same `ret_pcall` path, and lands on the same entry. `xpcall` is the
+   same with the handler moved to `R[a + 1]` and the inner header at
+   `a + 2` (`:667-682`). The protocol test for this is a compiled loop
+   calling `pcall(f)` where `f` returns normally, errors, and yields across
+   the `pcall` from a coroutine, each resumed through the slow entry with
+   values of every rep live across the call.
 
 *Verification:* `agrees` cases for `coroutine.wrap` generators driven from a
 compiled loop, `resume` of a dead coroutine, a yield across a `pcall` inside
@@ -1191,6 +1285,24 @@ already versions blocks (`Instance`, `build/mod.rs:32-42`).
    identity guard. This is mandel-metatable's `__add`/`__mul`.
 6. **Upvalues of the inlinee** read through its closure constant
    (`UpvalValue` on `konst(closure)` → constant for by-value upvalues, A8.2).
+7. **A real call inside an inlined body.** A `Call` the inlined callee makes
+   (one that is not itself inlined) needs the inlined frame to exist on the
+   Lua stack before it runs, because the callee of the callee returns into
+   it through its header and walkers read it: the builder writes the
+   inlined frame's header words before the call, as `jit_exit` would from a
+   two-frame snapshot (`jit/mod.rs:99-117`: `func` from the pool, `ret`
+   = the continuation, `caller` = the enclosing frame's base, `pc` = the
+   inlined `CALL`'s pc after), with word 1 the region's slow resume entry
+   for that site (C1.6) so a return through the interpreter lands in the
+   region. The call-site snapshot (C1.1) then records both frames: the
+   enclosing frame's live registers at `caller_pc` and the inlined frame's
+   at its own pc, using the same `SnapFrame` records as exits. `jit_leave`
+   writes the headers it finds in the snapshot's frame list outermost first,
+   so a chain walk through a region with an inlined frame rebuilds the Lua
+   frames in order. After the call the inlined frame's registers are
+   reloaded from its slots like the enclosing frame's (`root_load` with
+   `delta`), and its header stays in place until the inlined `RETURN`,
+   which needs no pop since the enclosing region never read it as a frame.
 
 *Verification:* IR snapshot tests (`src/jit/tests.rs`) for a two-level inline
 with an exit in the inner frame (the printed snapshot shows two frames);
@@ -1375,7 +1487,7 @@ entries), `TCVM_JIT_LOG` lines for inlining decisions and sunk objects.
 
 | Step | Items | Depends on | Measured by | Target |
 |---|---|---|---|---|
-| 1 | A1–A7 | – | queen, linear-sieve, ray/qt spill counts, array loops | queen ≤ 25 instr/iter; no hot-path `bl`; scimark-*, heapsort, nsieve, towers, list, bounce level with LuaJIT |
+| 1 | A1–A7, A9 | – | queen, linear-sieve, ray/qt spill counts, array loops | queen ≤ 25 instr/iter; no hot-path `bl`; scimark-*, heapsort, nsieve, towers, list, bounce level with LuaJIT |
 | 2 | A8, D1.1–D1.3 (the interpreter's callee slots, so every later region sees them) | A2 (intrinsic kinds) | array3d `assert`, partialsums intrinsics, richard `NO_TASK`; interpreter cycles with the JIT off | intrinsics inline in all three; callee slots within 3% on fib-uv and fixpoint-fact interpreted |
 | 3 | B1–B5 | A2, A3 | spectral add, partialsums, series | partialsums ≤ 400 instr/iter, series compiles once |
 | 4 | C1 | A5 (trampolines keep x29 chains), A6 | spectral, fib, array3d | spectral ≤ 115, fib ≤ 58 |
@@ -1432,3 +1544,15 @@ Decisions the plan takes a position on and the user may want to overrule:
 7. *(Resolved: deferred to E7.)* **Float `%` inline** follows 5.5's `fmod`
    semantics, not LuaJIT's floor formula, and ships behind the edge-case
    test; `FMod` is pure meanwhile (A6), so it no longer disturbs allocation.
+
+Risks the plan carries knowingly:
+
+8. **The recompile budget** with the new widenable exits is handled by A9
+   (learning recompiles are free, thresholds back off, feedback settles
+   before a recompile); if the suite still shows blacklists after step 1,
+   the retry cap moves, not the rule.
+9. **`CONCAT` and string-building loops** are untouched: `CONCAT` goes
+   through `helper_or_mm` with the full clobber (`build/emit.rs:292-303`)
+   and A2–A7 do not change it. None of the measured kernels is
+   concat-bound, so it is a known gap, to be taken up with the
+   string-heavy benchmarks (k-nucleotide, fasta once the harness runs it).
