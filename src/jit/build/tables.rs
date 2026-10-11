@@ -173,6 +173,9 @@ pub(super) fn emit_get<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
     let key = b.konst(kv);
     let kid = b.f.intern(kv);
     let site = Site { recv, key, kv, kid };
+    if string_method(b, dst, &site) {
+        return;
+    }
     let ic = read_ic(b.closure, ic);
     let first = match ic {
         InlineCache::Own { shape, .. } | InlineCache::Absent { shape } => Some(shape),
@@ -222,6 +225,73 @@ pub(super) fn emit_get<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
             b.set(dst, v);
         }
     }
+}
+
+/// A read from strings, which the site only saw (11.5): the strings'
+/// metatable still the one now, its `__index` the table it is now, that
+/// table's slot for the key, each guarded. False when that chain is not
+/// there to compile (a dict, an `__index` function), for the helper.
+fn string_method<'gc>(b: &mut Builder<'_, 'gc>, dst: u8, site: &Site<'gc>) -> bool {
+    let ty = b.ty(site.recv);
+    let kinds = b.feedback(b.pc) & fb::KINDS;
+    if !(kinds == fb::STR || !ty.set.is_empty() && ty.within(TypeSet::STR)) {
+        return false;
+    }
+    let ctx = b.ctx;
+    let index = ctx
+        .symbols()
+        .metamethod(MetamethodBits::INDEX.bits().trailing_zeros());
+    let Some(mt) = ctx.metatable_of(site.kv) else {
+        return false;
+    };
+    let Some(lib) = mt.raw_get(Value::string(index)).get_table() else {
+        return false;
+    };
+    let (ms, ls) = (mt.shape(), lib.shape());
+    let key = site.kv.get_string().unwrap();
+    let (Some(mslot), Some(lslot)) = (
+        (!ms.is_dict()).then(|| ms.find_slot(index)).flatten(),
+        (!ls.is_dict()).then(|| ls.find_slot(key)).flatten(),
+    ) else {
+        return false;
+    };
+    b.guard(site.recv, TypeSet::STR);
+    let word = ctx.string_metatable_word();
+    let same = b.ins(
+        Op::TypeMtIs {
+            slot: crate::jit::layout::STRING_MT_SLOT,
+            word,
+        },
+        &[],
+    );
+    let s = b.snap_before();
+    b.ins_snap(Op::GuardTrue, &[same], s, ExitTag::Shape);
+    // The pool keeps `mt` alive, so its word is not another table's.
+    let mv = b.konst(Value::table(mt));
+    let mp = b.ins(Op::Unbox(Rep::Ptr), &[mv]);
+    guard_shape(b, mp, ms);
+    let ik = b.f.intern(Value::string(index));
+    let iv = b.ins(
+        Op::TabLoad {
+            loc: SlotLoc::new(ms, mslot).raw(),
+            key: ik,
+        },
+        &[mp],
+    );
+    let lv = b.konst(Value::table(lib));
+    b.ins_exit(Op::GuardSame, &[iv, lv], ExitTag::Shape);
+    let lp = b.ins(Op::Unbox(Rep::Ptr), &[lv]);
+    guard_shape(b, lp, ls);
+    let m = b.ins(
+        Op::TabLoad {
+            loc: SlotLoc::new(ls, lslot).raw(),
+            key: site.kid,
+        },
+        &[lp],
+    );
+    b.field_loads.insert(m, (lv, site.kv));
+    b.set(dst, m);
+    true
 }
 
 /// A constant-key site's receiver and key.
