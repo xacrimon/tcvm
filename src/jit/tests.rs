@@ -239,15 +239,11 @@ fn loop_invariants_leave_the_loop() {
     for i = 1, 300 do norm({x = 2.0, y = 0}, 20) end";
     let ir = ir_of(src, "norm", 0);
     let count = |s: &str| ir.lines().filter(|l| l.contains(s)).count();
-    // The loop's blocks follow its preheader, the block with the guard.
-    let in_loop = |s: &str| {
-        let after = ir.split("guard.same").nth(1).unwrap_or("");
-        after.lines().skip(1).filter(|l| l.contains(s)).count()
-    };
+    // The loop is peeled: what stays in it appears in both copies.
     assert_eq!(count("guard.same"), 1, "{ir}");
-    assert_eq!(in_loop("guardshape"), 0, "{ir}");
-    assert_eq!(in_loop("key: 0"), 0, "{ir}");
-    assert_eq!(in_loop("tabstore"), 1, "{ir}");
+    assert_eq!(count("guardshape"), 1, "{ir}");
+    assert_eq!(count("key: 0"), 1, "{ir}");
+    assert_eq!(count("tabstore"), 2, "{ir}");
 }
 
 /// A loop-carried value whose last iteration's is nil is not guarded where

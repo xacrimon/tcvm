@@ -99,8 +99,8 @@ fn key_of(f: &Func<'_>, i: Inst, mem: &Versions) -> Option<Key> {
     let numberable = match op {
         // Allocations between two checks are not memory it reads.
         Op::GcCheck => false,
-        // A value's type never changes.
-        Op::Guard(_) => true,
+        // What these test of values never changes.
+        Op::Guard(_) | Op::GuardSame | Op::GuardTrue | Op::GuardFalse => true,
         _ => {
             e.is_pure() && f.insts[i.idx()].rn == 1
                 || e.reads_memory()

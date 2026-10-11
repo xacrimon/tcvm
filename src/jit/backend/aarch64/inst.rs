@@ -136,6 +136,15 @@ pub(crate) enum MInst {
     FToIExact {
         exit: u32,
     },
+    /// `[def d (float), use n, snap..]`: the f64 of an i64 within ±2^53.
+    LToFExact {
+        exit: u32,
+    },
+    /// `[def d (early), use a, use b, temp x5]`: whether string payload `a`
+    /// orders before `b` (`le`: not after) by bytes.
+    StrCmp {
+        le: bool,
+    },
     /// `[def d (float), use v, snap..]`: the f64 of a small integer or
     /// float `Value`.
     ToF64 {
@@ -310,6 +319,7 @@ impl MInst {
             | ShiftI32 { exit, .. }
             | LToI { exit }
             | FToIExact { exit }
+            | LToFExact { exit }
             | ToF64 { exit }
             | Guard { exit, .. }
             | GuardNoFlag { exit, .. }

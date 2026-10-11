@@ -677,6 +677,50 @@ impl Em<'_> {
                 self.a.bind(ok);
                 self.a.mov_w(d, X16);
             }
+            LToFExact { exit } => {
+                let (d, n) = (self.fr(i, 0), self.r(i, 1));
+                // 10 or more leading bits equal to the sign: |n| <= 2^53.
+                self.a.cls(X16, n);
+                self.a.cmp_imm(Sz::X, X16, 10);
+                let l = self.exit(exit);
+                self.a.b_cond(Cond::Lo, l);
+                self.a.scvtf(Sz::X, d, n);
+            }
+            StrCmp { le } => {
+                use crate::env::string::LuaString;
+                let (d, a, b) = (self.r(i, 0), self.r(i, 1), self.r(i, 2));
+                let (n, k, lb, ca, cb) = (
+                    self.r(i, 3),
+                    self.r(i, 4),
+                    self.r(i, 5),
+                    self.r(i, 6),
+                    self.r(i, 7),
+                );
+                let (top, tail, done) = (self.a.new_label(), self.a.new_label(), self.a.new_label());
+                self.a.ldr(d, a, LuaString::LEN_OFFSET as i32);
+                self.a.ldr(lb, b, LuaString::LEN_OFFSET as i32);
+                self.a.cmp(Sz::X, d, lb);
+                self.a.csel(Sz::X, n, d, lb, Cond::Lo);
+                self.a.add_imm(Sz::X, X16, a, LuaString::DATA_OFFSET as u64);
+                self.a.add_imm(Sz::X, X17, b, LuaString::DATA_OFFSET as u64);
+                self.a.movz(Sz::X, k, 0, 0);
+                self.a.bind(top);
+                self.a.cmp(Sz::X, k, n);
+                self.a.b_cond(Cond::Hs, tail);
+                self.a.ldrb_reg(ca, X16, k);
+                self.a.ldrb_reg(cb, X17, k);
+                self.a.add_imm(Sz::X, k, k, 1);
+                self.a.cmp(Sz::W, ca, cb);
+                self.a.b_cond(Cond::Eq, top);
+                // The first differing byte decides.
+                self.a.cset(Sz::W, d, Cond::Lo);
+                self.a.b(done);
+                // A common prefix: the shorter orders first.
+                self.a.bind(tail);
+                self.a.cmp(Sz::X, d, lb);
+                self.a.cset(Sz::W, d, if le { Cond::Ls } else { Cond::Lo });
+                self.a.bind(done);
+            }
             ToF64 { exit } => {
                 let (d, v) = (self.fr(i, 0), self.r(i, 1));
                 let done = self.a.new_label();
@@ -754,9 +798,23 @@ impl Em<'_> {
                 }
             }
             Set { test, cond } => {
-                let c = self.test(i, 1, test, cond);
                 let d = self.r(i, 0);
-                self.a.cset(Sz::W, d, c);
+                if let Test::Type(set) = test
+                    && !is_single_test(set)
+                {
+                    // `d` may share the tested value's register: written last.
+                    let v = self.r(i, 1);
+                    let (yes, done) = (self.a.new_label(), self.a.new_label());
+                    self.type_branch(v, set, yes);
+                    self.a.movz(Sz::W, d, (cond != Cond::Eq) as u16, 0);
+                    self.a.b(done);
+                    self.a.bind(yes);
+                    self.a.movz(Sz::W, d, (cond == Cond::Eq) as u16, 0);
+                    self.a.bind(done);
+                } else {
+                    let c = self.test(i, 1, test, cond);
+                    self.a.cset(Sz::W, d, c);
+                }
             }
             Select { float } => {
                 let c = self.r(i, 1);
@@ -771,7 +829,14 @@ impl Em<'_> {
             }
             Guard { test, cond, exit } => {
                 let l = self.exit(exit);
-                if let Test::Type(set) = test
+                if test == Test::B1 {
+                    let c = self.r(i, 0);
+                    if cond == Cond::Ne {
+                        self.a.cbz(Sz::W, c, l);
+                    } else {
+                        self.a.cbnz(Sz::W, c, l);
+                    }
+                } else if let Test::Type(set) = test
                     && !is_single_test(set)
                 {
                     let v = self.r(i, 0);
@@ -1090,11 +1155,30 @@ impl Em<'_> {
                 }
             }
             Br { test, cond } => {
-                let c = self.test(i, 0, test, cond);
                 let (t, f) = (
                     self.v.succs(block)[0].index(),
                     self.v.succs(block)[1].index(),
                 );
+                let (lt, lf) = (self.labels[t], self.labels[f]);
+                let multi = matches!(test, Test::Type(set) if !is_single_test(set));
+                if test == Test::B1 || multi {
+                    // Where `cond` holds, and where it does not.
+                    let (yes, no) = if cond == Cond::Eq || (test == Test::B1 && cond == Cond::Ne) {
+                        (lt, lf)
+                    } else {
+                        (lf, lt)
+                    };
+                    let v = self.r(i, 0);
+                    match test {
+                        Test::Type(set) => self.type_branch(v, set, yes),
+                        _ => self.a.cbnz(Sz::W, v, yes),
+                    }
+                    if Some(no) != next {
+                        self.a.b(no);
+                    }
+                    return Ok(());
+                }
+                let c = self.test(i, 0, test, cond);
                 if Some(self.labels[t]) == next {
                     self.a.b_cond(c.invert(), self.labels[f]);
                 } else {
