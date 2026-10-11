@@ -565,6 +565,13 @@ pub(crate) enum Op {
     /// The index of the table's first non-nil array slot at or after the
     /// `I32` operand, or the array part's size when there is none.
     ArrNext,
+    /// The index (`I32`) of the table's first non-nil named slot at or after
+    /// the operand, its metatable's slot skipped; -1 when there is none.
+    NamedNext,
+    /// The value of the table's named slot and the key of its shape's slot
+    /// at an `I32` index below the shape's slot count.
+    NamedVal,
+    NamedKey,
     /// The table's backward barrier unless it is gray.
     Barrier,
 
@@ -695,7 +702,8 @@ impl Op {
             ClassBits(_) | ClassIndex(_) => Effects::R_META,
             ShapeIs(_) => Effects::R_SHAPE,
             TabLoad { .. } | ArrLoad => Effects::R_TAB,
-            ArrNext => Effects::R_TAB | Effects::R_SHAPE,
+            ArrNext | NamedNext | NamedVal => Effects::R_TAB | Effects::R_SHAPE,
+            NamedKey => Effects::R_SHAPE,
             ClassMm(_) | TabMmBits => Effects::R_SHAPE | Effects::R_META,
             NumMtSet | TypeMtIs { .. } => Effects::R_META,
             TabStore { .. } | ArrStore => Effects::W_TAB,
@@ -784,7 +792,9 @@ impl Op {
             KF64(_) => Ty::F64,
             Load(_) | UpvalValue(_) | CellLoad | Resume { .. } => Ty::ANY,
             UpvalCell(_) => Ty::PTR,
-            NumVarargs | ClassBits(_) | TabASize | ArrNext | TabMmBits => Ty::I32,
+            NumVarargs | ClassBits(_) | TabASize | ArrNext | TabMmBits | NamedNext => Ty::I32,
+            NamedVal => Ty::ANY,
+            NamedKey => Ty::val(TypeSet::STR),
             ClassIndex(_) | TabLoad { .. } | ArrLoad => Ty::ANY,
             TabArray => Ty::PTR,
             TabHasRoom(_) | ShapeIs(_) => Ty::B1,

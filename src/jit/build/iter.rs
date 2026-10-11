@@ -54,7 +54,8 @@ pub(super) fn emit_tforprep(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction,
 }
 
 /// `TFORCALL_NEXT a count`: `next`'s walk at the position in `R[a+3]`,
-/// the array part inline and the other parts by helper through the slots;
+/// the array part and named slots inline, the other parts and the step
+/// from one part to the next by helper through the slots;
 /// `TFORLOOP` then tests the first variable.
 pub(super) fn emit_tforcall_next(b: &mut Builder<'_, '_>, a: u8, count: u8) {
     let vars = a + TFOR_VARS;
@@ -87,7 +88,24 @@ pub(super) fn emit_tforcall_next(b: &mut Builder<'_, '_>, a: u8, count: u8) {
     let after = b.ins(Op::Box, &[after]);
     b.set(a + 3, after);
     step_to(b, join, vars, count, k, v);
-    for blk in [past, rest] {
+    // The named slots, part 2, at the index after the position's part.
+    b.switch_to(rest);
+    let named = b.ki32(2 << POS_PART_SHIFT);
+    let rel = b.ins(Op::ISubNo, &[p, named]);
+    let in_named = b.ins(Op::ICmp(Cc::Lo), &[rel, part]);
+    let other = branch_arm(b, in_named);
+    let j = b.ins(Op::NamedNext, &[t, rel]);
+    let none = b.ki32(-1);
+    let found = b.ins(Op::ICmp(Cc::Ne), &[j, none]);
+    let gone = branch_arm(b, found);
+    let k = b.ins(Op::NamedKey, &[t, j]);
+    let v = b.ins(Op::NamedVal, &[t, j]);
+    let next = b.ki32((2 << POS_PART_SHIFT) + 1);
+    let after = b.ins(Op::IAddNo, &[j, next]);
+    let after = b.ins(Op::Box, &[after]);
+    b.set(a + 3, after);
+    step_to(b, join, vars, count, k, v);
+    for blk in [past, other, gone] {
         b.switch_to(blk);
         b.jump(slow);
     }

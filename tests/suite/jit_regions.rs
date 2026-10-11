@@ -752,6 +752,40 @@ fn string_methods() {
     );
 }
 
+/// `next` over named slots inline: inline and spilled slots, nil ones, a
+/// table keeping its metatable in a slot, stores to existing fields while
+/// walking, and dict-mode tables through the helper.
+#[test]
+fn next_over_named_slots() {
+    agrees(
+        r#"
+        local function keys(t) local n, s = 0, 0 for k, v in pairs(t) do n = n + 1; if type(v) == "number" then s = s + v end end return n * 1000 + s end
+        local function cat(t) local o = {} for k, v in pairs(t) do o[#o + 1] = tostring(k) .. "=" .. tostring(v) end table.sort(o) return table.concat(o, ",") end
+        local big = {}
+        for i = 1, 40 do big["f" .. i] = i end
+        local mixed = {1, 2, 3, a = 1, b = 2, c = 3, [10] = 5, [1.5] = 6}
+        local holes = {x = 1, y = 2, z = 3}
+        holes.y = nil
+        local P = {}; P.__index = P
+        local obj = setmetatable({u = 1, v = 2}, P)
+        local poly = setmetatable({p = 1}, setmetatable({}, {__index = P}))
+        local out = {}
+        for r = 1, 300 do
+          out[1] = keys(big); out[2] = keys(mixed); out[3] = keys(holes); out[4] = keys(obj); out[5] = keys(poly)
+          out[6] = cat(mixed); out[7] = cat(holes)
+        end
+        -- assignment to existing fields while traversing
+        local m = {a = 1, b = 2, c = 3}
+        for r = 1, 300 do for k, v in pairs(m) do m[k] = v + 1 end end
+        out[8] = cat(m)
+        local dict = {}
+        for i = 1, 300 do dict["d" .. i] = i end
+        out[9] = keys(dict)
+        return table.concat(out, " ")
+"#,
+    );
+}
+
 /// A field site that saw several shapes compiles a test per shape (own
 /// slots, `__index` holders, absent keys); one that saw more takes the
 /// helper.

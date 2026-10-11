@@ -40,6 +40,8 @@ const CANONICAL_NAN: u64 = 0x7FF8_0000_0000_0000;
 const TAG_USERDATA: u64 = 1;
 const TAG_BOXED_INT: u64 = 2;
 const TAG_STRING: u64 = 3;
+/// A string value's bits above its payload, the value address of its box.
+pub(crate) const STRING_BITS: u64 = QNAN_NEG | TAG_STRING << TAG_SHIFT;
 const TAG_TABLE: u64 = 4;
 const TAG_FUNCTION: u64 = 5;
 const TAG_THREAD: u64 = 6;

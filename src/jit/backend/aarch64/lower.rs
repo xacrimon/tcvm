@@ -688,6 +688,32 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 let ops = [self.use_(args[0]), self.use_(args[1]), self.use_(args[2])];
                 self.push(MInst::ArrStore, &ops, none);
             }
+            Op::NamedNext => {
+                let d = Operand::new(
+                    self.vr(res.unwrap()),
+                    regalloc2::OperandConstraint::Reg,
+                    regalloc2::OperandKind::Def,
+                    regalloc2::OperandPos::Early,
+                );
+                let mut ops = vec![d, self.use_(args[0]), self.use_(args[1])];
+                for _ in 0..3 {
+                    ops.push(Operand::reg_temp(self.v.new_vreg(RegClass::Int)));
+                }
+                self.push(MInst::NamedNext, &ops, none);
+            }
+            Op::NamedVal | Op::NamedKey => {
+                let ops = [
+                    self.def(res.unwrap()),
+                    self.use_(args[0]),
+                    self.use_(args[1]),
+                ];
+                let m = if op == Op::NamedVal {
+                    MInst::NamedVal
+                } else {
+                    MInst::NamedKey
+                };
+                self.push(m, &ops, none);
+            }
             Op::ArrNext => {
                 // Both written while the operands are still read.
                 let d = Operand::new(
