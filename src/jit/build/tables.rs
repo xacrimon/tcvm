@@ -13,7 +13,7 @@ use crate::instruction::{Instruction, Op as BcOp};
 use crate::jit::build::Builder;
 use crate::jit::build::emit::{arm_end, branch_arm, calls_mm, enter_join, mm_call};
 use crate::jit::feedback as fb;
-use crate::jit::ir::Val;
+use crate::jit::ir::{Block, Val};
 use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL_VAL, HelperId, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
 use crate::vm::ops::field::read_ic;
@@ -617,20 +617,47 @@ fn table_site(b: &mut Builder<'_, '_>, pc: u32, recv: Val) -> Option<Val> {
     (tables || b.feedback(pc) & fb::OTHER == 0).then(|| table_of(b, recv))
 }
 
-/// An `I32` key, or `None` when the key may not be a small integer.
-fn int_key(b: &Builder<'_, '_>, k: Val) -> Option<bool> {
+/// The small-integer key of an array access: `Ok` its `I32`, guarded small
+/// unless the site's feedback saw other keys; then `Err(other)`, the block a
+/// test sends them to. `None` for a key never small: no array access.
+fn int_key(b: &mut Builder<'_, '_>, pc: u32, k: Val) -> Option<Result<Val, (Val, Block)>> {
     let ty = b.ty(k);
     if ty.rep == Rep::I32 || (!ty.set.is_empty() && ty.within(TypeSet::SMALL)) {
-        Some(true)
-    } else if !ty.set.is_empty() && !ty.set.intersects(TypeSet::SMALL) {
-        Some(false)
-    } else {
-        None
+        return Some(Ok(b.as_i32(k)));
     }
+    if !ty.set.is_empty() && !ty.set.intersects(TypeSet::SMALL) {
+        return None;
+    }
+    let others = fb::FLOAT | fb::STR | fb::TAB | fb::OTHER;
+    if b.feedback(pc) & others == 0 {
+        return Some(Ok(b.as_i32(k)));
+    }
+    let kb = b.boxed(k);
+    let is = b.ins(Op::IsType(TypeSet::SMALL), &[kb]);
+    let other = branch_arm(b, is);
+    Some(Err((b.ins(Op::Unbox(Rep::I32), &[kb]), other)))
+}
+
+/// The array part's cell and `i` inside it, where the site's feedback never
+/// saw a miss: the class without `bit` and `i` below the size, guarded
+/// (`Bounds`). `None` after a miss: the caller tests both.
+fn array_guards(b: &mut Builder<'_, '_>, pc: u32, t: Val, i: Val, bit: MetamethodBits) -> Option<Val> {
+    if b.feedback(pc) & fb::ARR_MISS != 0 {
+        return None;
+    }
+    // Before the access: its class is the table's for the whole loop.
+    let has = class_bit(b, t, bit);
+    let s = b.snap_before();
+    b.ins_snap(Op::GuardFalse, &[has], s, ExitTag::Bounds);
+    let n = b.ins(Op::TabASize, &[t]);
+    let inside = b.ins(Op::ICmp(Cc::Lo), &[i, n]);
+    b.ins_snap(Op::GuardTrue, &[inside], s, ExitTag::Bounds);
+    Some(b.ins(Op::TabArray, &[t]))
 }
 
 /// `R[a] = R[b][R[c]]`: a small integer key inside the array part loads
-/// inline; a nil there, any other key and other receivers take the helper.
+/// inline, guarded unless the site saw misses; then the misses, other keys
+/// and other receivers take the helper.
 pub(super) fn emit_gettable(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
     let (dst, rt, rk) = (insn.a(), insn.b(), insn.c());
     let (recv, key) = (b.reg(rt), b.reg(rk));
@@ -639,24 +666,31 @@ pub(super) fn emit_gettable(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction)
         b.set(dst, v);
         return;
     };
-    let join = b.new_block();
-    let small = match int_key(b, key) {
-        Some(false) => {
+    let (i, other) = match int_key(b, pc, key) {
+        None => {
             let v = index(b, dst, recv, key);
             b.set(dst, v);
             return;
         }
-        Some(true) => None,
-        None => {
-            let kb = b.boxed(key);
-            let is = b.ins(Op::IsType(TypeSet::SMALL), &[kb]);
-            Some((branch_arm(b, is), kb))
+        Some(Ok(i)) => (i, None),
+        Some(Err((i, other))) => (i, Some(other)),
+    };
+    if let Some(arr) = array_guards(b, pc, t, i, MetamethodBits::INDEX) {
+        let v = b.ins(Op::ArrLoad, &[arr, i]);
+        match other {
+            None => b.set(dst, v),
+            Some(other) => {
+                let join = b.new_block();
+                arm_end(b, join, dst, v);
+                b.switch_to(other);
+                let w = index(b, dst, recv, key);
+                arm_end(b, join, dst, w);
+                enter_join(b, join);
+            }
         }
-    };
-    let i = match small {
-        None => b.as_i32(key),
-        Some((_, kb)) => b.ins(Op::Unbox(Rep::I32), &[kb]),
-    };
+        return;
+    }
+    let join = b.new_block();
     let n = b.ins(Op::TabASize, &[t]);
     let inside = b.ins(Op::ICmp(Cc::Lo), &[i, n]);
     let outside = branch_arm(b, inside);
@@ -676,7 +710,7 @@ pub(super) fn emit_gettable(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction)
     b.switch_to(outside);
     let w = index(b, dst, recv, key);
     arm_end(b, join, dst, w);
-    if let Some((other, _)) = small {
+    if let Some(other) = other {
         b.switch_to(other);
         let w = index(b, dst, recv, key);
         arm_end(b, join, dst, w);
@@ -684,8 +718,9 @@ pub(super) fn emit_gettable(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction)
     enter_join(b, join);
 }
 
-/// `R[b][R[c]] = R[a]`: a small integer key inside the array part over a
-/// non-nil value stores inline; the rest takes the helper.
+/// `R[b][R[c]] = R[a]`: a small integer key inside the array part stores
+/// inline, guarded as for GETTABLE; past a miss, over a nil only where the
+/// class has no `__newindex` now; the rest takes the helper.
 pub(super) fn emit_settable(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
     let (src, rt, rk) = (insn.a(), insn.b(), insn.c());
     let (recv, key, v) = (b.reg(rt), b.reg(rk), b.reg(src));
@@ -694,45 +729,43 @@ pub(super) fn emit_settable(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction)
         newindex(b, recv, key, v, true);
         return;
     };
-    let join = b.new_block();
-    let small = match int_key(b, key) {
-        Some(false) => {
+    let (i, other) = match int_key(b, pc, key) {
+        None => {
             newindex(b, recv, key, v, true);
             return;
         }
-        Some(true) => None,
-        None => {
-            let kb = b.boxed(key);
-            let is = b.ins(Op::IsType(TypeSet::SMALL), &[kb]);
-            Some((branch_arm(b, is), kb))
-        }
+        Some(Ok(i)) => (i, None),
+        Some(Err((i, other))) => (i, Some(other)),
     };
-    let i = match small {
-        None => b.as_i32(key),
-        Some((_, kb)) => b.ins(Op::Unbox(Rep::I32), &[kb]),
-    };
-    let n = b.ins(Op::TabASize, &[t]);
-    let inside = b.ins(Op::ICmp(Cc::Lo), &[i, n]);
-    let outside = branch_arm(b, inside);
-    let arr = b.ins(Op::TabArray, &[t]);
-    let old = b.ins(Op::ArrLoad, &[arr, i]);
-    // `__newindex` may fire over a nil, if the class has it now.
-    let nil = b.ins(Op::IsType(TypeSet::NIL), &[old]);
-    let present = branch_arm(b, nil);
-    let has = class_bit(b, t, MetamethodBits::NEWINDEX);
-    let plain = branch_arm(b, has);
-    newindex(b, recv, key, v, true);
-    b.jump(join);
-    for blk in [plain, present] {
-        b.switch_to(blk);
+    let join = b.new_block();
+    if let Some(arr) = array_guards(b, pc, t, i, MetamethodBits::NEWINDEX) {
         barrier_for(b, t, v);
         b.push(Op::ArrStore, &[arr, i, v]);
         b.jump(join);
+    } else {
+        let n = b.ins(Op::TabASize, &[t]);
+        let inside = b.ins(Op::ICmp(Cc::Lo), &[i, n]);
+        let outside = branch_arm(b, inside);
+        let arr = b.ins(Op::TabArray, &[t]);
+        let old = b.ins(Op::ArrLoad, &[arr, i]);
+        // `__newindex` may fire over a nil, if the class has it now.
+        let nil = b.ins(Op::IsType(TypeSet::NIL), &[old]);
+        let present = branch_arm(b, nil);
+        let has = class_bit(b, t, MetamethodBits::NEWINDEX);
+        let plain = branch_arm(b, has);
+        newindex(b, recv, key, v, true);
+        b.jump(join);
+        for blk in [plain, present] {
+            b.switch_to(blk);
+            barrier_for(b, t, v);
+            b.push(Op::ArrStore, &[arr, i, v]);
+            b.jump(join);
+        }
+        b.switch_to(outside);
+        newindex(b, recv, key, v, true);
+        b.jump(join);
     }
-    b.switch_to(outside);
-    newindex(b, recv, key, v, true);
-    b.jump(join);
-    if let Some((other, _)) = small {
+    if let Some(other) = other {
         b.switch_to(other);
         newindex(b, recv, key, v, true);
         b.jump(join);
