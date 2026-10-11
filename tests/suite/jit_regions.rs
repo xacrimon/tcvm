@@ -971,3 +971,66 @@ fn cmp_kinds() {
 "##;
     agrees(src);
 }
+
+/// Array reads and writes compiled without misses, then given misses:
+/// holes, keys outside the array part (0, negative, huge, floats), and
+/// classes with `__index` or `__newindex` arriving after the compile.
+#[test]
+fn array_access_misses() {
+    agrees(
+        r##"
+        local out = {}
+        local function sum(t, n)
+            local s = 0
+            for i = 1, n do s = s + (t[i] or 100) end
+            return s
+        end
+        local function fill(t, n, v)
+            for i = 1, n do t[i] = v end
+        end
+        local a = {}
+        for i = 1, 50 do a[i] = i end
+        for r = 1, 30 do out[#out + 1] = sum(a, 50) end
+        -- Past the end, a hole, a sparse key.
+        out[#out + 1] = sum(a, 60)
+        a[25] = nil
+        out[#out + 1] = sum(a, 50)
+        local sparse = {}
+        sparse[1000000] = 7
+        for i = 1, 20 do out[#out + 1] = sum(sparse, 3) end
+        -- A class with __index after the compile.
+        local b = {}
+        for i = 1, 40 do b[i] = i end
+        for r = 1, 30 do out[#out + 1] = sum(b, 40) end
+        setmetatable(b, {__index = function(t, k) return k * 1000 end})
+        b[3] = nil
+        out[#out + 1] = sum(b, 45)
+        -- Keys 0, negative, float, string at a compiled site.
+        local function get(t, k) return t[k] end
+        local c = {10, 20, 30, [0] = "zero", [-1] = "neg", x = "str"}
+        for i = 1, 300 do get(c, (i % 3) + 1) end
+        for _, k in ipairs({0, -1, 1.0, 2.5, "x", 3, 4, 2^31, math.mininteger}) do
+            out[#out + 1] = tostring(get(c, k))
+        end
+        -- Writes: appends, holes, __newindex after the compile.
+        local d = {}
+        for r = 1, 30 do fill(d, 20, r) end
+        fill(d, 25, "x")
+        out[#out + 1] = #d .. ":" .. tostring(d[25])
+        local log = {}
+        local e = setmetatable({}, {__newindex = function(t, k, v) log[#log + 1] = k; rawset(t, k, v) end})
+        for i = 1, 10 do rawset(e, i, 0) end
+        for r = 1, 30 do fill(e, 10, r) end
+        e[5] = nil
+        fill(e, 12, "y")
+        out[#out + 1] = table.concat(log, ",") .. ":" .. tostring(e[5]) .. tostring(e[12])
+        local function put(t, k, v) t[k] = v end
+        local f = {1, 2, 3}
+        for i = 1, 300 do put(f, (i % 3) + 1, i) end
+        for _, k in ipairs({0, -1, 1.0, 2.5, "x", 4, 2^31}) do put(f, k, "w") end
+        out[#out + 1] = tostring(f[0]) .. tostring(f[-1]) .. tostring(f[1]) .. tostring(f[2.5])
+            .. tostring(f.x) .. tostring(f[4]) .. tostring(f[2^31]) .. #f
+        return table.concat(out, " ")
+"##,
+    );
+}
