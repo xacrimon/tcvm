@@ -57,7 +57,7 @@ fn class_has<'gc>(b: &mut Builder<'_, 'gc>, shape: Shape<'gc>, bit: MetamethodBi
 
 /// Whether the class of table `t` (a `Ptr`) has `bit`, read live: a table's
 /// shape may be any here.
-fn class_bit(b: &mut Builder<'_, '_>, t: Val, bit: MetamethodBits) -> Val {
+pub(super) fn class_bit(b: &mut Builder<'_, '_>, t: Val, bit: MetamethodBits) -> Val {
     let bits = b.ins(Op::TabMmBits, &[t]);
     let mask = b.ki32(bit.bits() as i32);
     let has = b.ins(Op::IAnd, &[bits, mask]);

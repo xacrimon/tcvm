@@ -31,6 +31,9 @@ unsafe impl TrailingBytes for StringData {
 }
 
 impl<'gc> LuaString<'gc> {
+    /// Where compiled code reads the length from a string value's payload.
+    pub(crate) const LEN_OFFSET: usize = core::mem::offset_of!(StringData, len);
+
     pub fn new(context: Context<'gc>, bytes: &[u8]) -> Self {
         context.interner().intern(context.mutation(), bytes)
     }
