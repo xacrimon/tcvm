@@ -624,6 +624,11 @@ impl<'gc> MtCache<'gc> {
         + core::mem::offset_of!(MtCacheData<'static>, bits);
     pub(crate) const INDEX_OFFSET: usize = Gc::<'static, MtCacheData<'static>>::VALUE_OFFSET
         + core::mem::offset_of!(MtCacheData<'static>, index);
+    /// The box of the other metamethods (`rest`), null before the first.
+    pub(crate) const REST_OFFSET: usize = Gc::<'static, MtCacheData<'static>>::VALUE_OFFSET
+        + core::mem::offset_of!(MtCacheData<'static>, rest);
+    /// The metamethod of bit index `i` at `8 * i` past this, from `rest`.
+    pub(crate) const REST_VALUES_OFFSET: usize = Gc::<'static, MmValues<'static>>::VALUE_OFFSET;
 
     /// The class's box address, what a shape holds.
     pub(crate) fn as_word(self) -> u64 {
@@ -912,6 +917,11 @@ impl<'gc> MtCache<'gc> {
 }
 
 impl<'gc> Shape<'gc> {
+    /// Where compiled code reads the class (`MtCache::as_word`, or null)
+    /// from a shape's box.
+    pub(crate) const MT_CACHE_OFFSET: usize = Gc::<'static, ShapeData<'static>>::VALUE_OFFSET
+        + core::mem::offset_of!(ShapeData<'static>, mt_cache);
+
     /// The shape's box address, what a table's `shape` field holds.
     pub(crate) fn as_word(self) -> u64 {
         Gc::erased_ptr(self.0) as u64

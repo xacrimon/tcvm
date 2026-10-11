@@ -512,6 +512,8 @@ pub(crate) enum Op {
     CellStore,
     /// Whether the frame's header has the flag (`vm::frame::flag`).
     HasFlag(u8),
+    /// Whether numbers have a metatable.
+    NumMtSet,
     /// Whether the function (a `Ptr` to its closure) is a Lua closure
     /// without varargs.
     FnFixedLua,
@@ -542,6 +544,8 @@ pub(crate) enum Op {
     TabHasRoom(u32),
     /// Move the table to `shapes[i]`.
     TabSetShape(u32),
+    /// The metamethod of bit index `i` the table's class has, nil without.
+    ClassMm(u8),
     /// The array part's size (`I32`) and cell.
     TabASize,
     TabArray,
@@ -682,6 +686,8 @@ impl Op {
             ShapeIs(_) => Effects::R_SHAPE,
             TabLoad { .. } | ArrLoad => Effects::R_TAB,
             ArrNext => Effects::R_TAB | Effects::R_SHAPE,
+            ClassMm(_) => Effects::R_SHAPE | Effects::R_META,
+            NumMtSet => Effects::R_META,
             TabStore { .. } | ArrStore => Effects::W_TAB,
             TabHasRoom(_) | TabASize | TabArray => Effects::R_SHAPE,
             TabSetShape(_) => Effects::W_SHAPE,
@@ -773,7 +779,8 @@ impl Op {
             TabArray => Ty::PTR,
             TabHasRoom(_) | ShapeIs(_) => Ty::B1,
             VarargAt(_) | VarargIdx => Ty::ANY,
-            HasFlag(_) | FnFixedLua | FnFits => Ty::B1,
+            HasFlag(_) | FnFixedLua | FnFits | NumMtSet => Ty::B1,
+            ClassMm(_) => Ty::ANY,
             Box => args[0].boxed(),
             Unbox(rep) => Ty {
                 rep,

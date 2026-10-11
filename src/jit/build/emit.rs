@@ -569,6 +569,14 @@ fn store_results(b: &mut Builder<'_, '_>, a: u8, n: u8) {
 // --- arithmetic -------------------------------------------------------------
 
 fn emit_arith(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
+    if matches!(
+        insn.op(),
+        BcOp::ARITH_MM | BcOp::ARITH_MM_R | BcOp::ARITH_MMI
+    ) && !b.kind_exited(pc)
+    {
+        emit_arith_mm(b, insn);
+        return;
+    }
     let mode = arith_mode(b, pc);
     let generic = insn.generic_op();
     let info = generic.info();
@@ -870,6 +878,56 @@ fn emit_generic(b: &mut Builder<'_, '_>, kind: ArithKind, dst: u8, l: Operand, r
         &[x, y],
     );
     enter_join(b, join);
+}
+
+/// `ARITH_MM`, `_MM_R` and `_MMI` (7.2): the metamethod the table operand's
+/// class has, called. Operands of other kinds, or a class without it, exit
+/// as a type guard would, and the site compiles generically after.
+fn emit_arith_mm(b: &mut Builder<'_, '_>, insn: Instruction) {
+    let op = insn.op();
+    let orig = insn.mm_orig();
+    let idx = kind_mm(orig.info().kind).bits().trailing_zeros() as u8;
+    let (l, r, number_left) = match op {
+        BcOp::ARITH_MMI => {
+            let v = b.reg(insn.b());
+            let k = b.konst(if insn.imm_is_int() {
+                Value::small(insn.imm_int() as i32)
+            } else {
+                Value::float(insn.imm_float())
+            });
+            if insn.c() & 1 != 0 || orig.info().reversed {
+                (k, v, true)
+            } else {
+                (v, k, false)
+            }
+        }
+        BcOp::ARITH_MM_R => (b.reg(insn.b()), b.reg(insn.c()), true),
+        _ => (b.reg(insn.b()), b.reg(insn.c()), false),
+    };
+    let (l, t) = if number_left {
+        let l = b.guard(l, TypeSet::NUM);
+        let t = b.guard(r, TypeSet::TAB);
+        // The numbers' own metamethod would come first.
+        let set = b.ins(Op::NumMtSet, &[]);
+        let s = b.snap_before();
+        b.ins_snap(Op::GuardFalse, &[set], s, ExitTag::Slow);
+        (l, t)
+    } else {
+        let t = b.guard(l, TypeSet::TAB);
+        (t, t)
+    };
+    let p = b.ins(Op::Unbox(Rep::Ptr), &[t]);
+    let f = b.ins(Op::ClassMm(idx), &[p]);
+    let none = b.ins(Op::IsType(TypeSet::NIL), &[f]);
+    let s = b.snap_before();
+    b.ins_snap(Op::GuardFalse, &[none], s, ExitTag::Type);
+    let (lv, rv) = if number_left {
+        (b.boxed(l), t)
+    } else {
+        (t, b.boxed(r))
+    };
+    let v = mm_call(b, f, &[lv, rv]);
+    b.set(insn.a(), v);
 }
 
 /// The metamethod of an arithmetic kind (`arith_slow`'s).

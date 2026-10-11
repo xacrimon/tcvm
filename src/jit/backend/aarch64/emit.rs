@@ -698,6 +698,34 @@ impl Em<'_> {
                 self.a.tst_imm(Sz::X, X16, mask as u64);
                 self.a.cset(Sz::W, d, Cond::Ne);
             }
+            NumMtSet => {
+                let d = self.r(i, 0);
+                self.a.ldr(X16, RT, layout::NUMBER_MT_CELL as i32);
+                self.a.ldr(X16, X16, layout::NUMBER_MT as i32);
+                self.a.cmp_imm(Sz::X, X16, 0);
+                self.a.cset(Sz::W, d, Cond::Ne);
+            }
+            ClassMm(k) => {
+                // Shape, class, the class's other metamethods: each may be
+                // missing (null), and then so is the metamethod.
+                let (d, t) = (self.r(i, 0), self.r(i, 1));
+                let (none, done) = (self.a.new_label(), self.a.new_label());
+                self.a.ldr(X16, t, layout::T_SHAPE as i32);
+                self.a
+                    .ldr(X16, X16, crate::env::Shape::MT_CACHE_OFFSET as i32);
+                self.a.cbz(Sz::X, X16, none);
+                self.a.ldr(X16, X16, MtCache::REST_OFFSET as i32);
+                self.a.cbz(Sz::X, X16, none);
+                self.a.ldr(
+                    d,
+                    X16,
+                    (MtCache::REST_VALUES_OFFSET + 8 * k as usize) as i32,
+                );
+                self.a.b(done);
+                self.a.bind(none);
+                self.a.mov_imm(d, NIL);
+                self.a.bind(done);
+            }
             FnFixedLua => {
                 // A native function has the niche value of `is_vararg` there.
                 let (d, f) = (self.r(i, 0), self.r(i, 1));
