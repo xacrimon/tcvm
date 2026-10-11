@@ -260,15 +260,16 @@ pub(crate) enum MInst {
         test: Test,
         cond: Cond,
     },
-    /// Tail-out into `enter`; succ 0 is the resume block. `nargs` is
-    /// `u8::MAX` for the count in the operand.
+    /// `[use count?, site..]`: a call, fast or through `enter`; succ 0 is
+    /// the resume block. `nargs` is `u8::MAX` for the count in the operand;
+    /// the site's values follow in stack slots (`LSite`).
     Call {
         a: u8,
         nargs: u8,
         pc_after: usize,
     },
-    /// `[use f, use args..]`: a metamethod call from a header at slot `hdr`
-    /// (the frame's register count); succ 0 is the resume block.
+    /// `[use f, use args.., site..]`: a metamethod call from a header at
+    /// slot `hdr` (the frame's register count); succ 0 is the resume block.
     CallMm {
         hdr: u16,
         nargs: u8,
@@ -290,8 +291,9 @@ pub(crate) enum MInst {
         end: u16,
         exit: u32,
     },
-    /// A resume block's first instruction: `[def r0, def r1]` up to `wanted`
-    /// (1 or 2), or the landing helper.
+    /// A resume block's first instruction, where a fast callee's `ret`
+    /// lands: `[def x0, def x1]` up to `wanted` (1 or 2), or the landing
+    /// helper.
     Resume {
         wanted: u8,
         c: u8,

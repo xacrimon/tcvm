@@ -6,7 +6,7 @@
 use regalloc2::{Block as RBlock, Operand, PRegSet, RegClass, VReg};
 
 use crate::env::value::Value;
-use crate::jit::backend::aarch64::abi::{caller_saved, preg_float, preg_int};
+use crate::jit::backend::aarch64::abi::{allocatable, caller_saved, preg_float, preg_int};
 use crate::jit::backend::aarch64::asm::{Asm, Cond, Sz};
 use crate::jit::backend::aarch64::inst::{AluOp, ENTRY_FAIL, FOp, FUnOp, MInst, Test};
 use crate::jit::backend::vcode::VCode;
@@ -35,9 +35,20 @@ pub(crate) enum Src {
     Const(u64),
 }
 
+/// A call's site (C1): the values its snapshot names, which live in the
+/// frame's spill slots across it, as operands of the call.
+pub(crate) struct LSite {
+    /// `(register, rep, source)`.
+    pub(crate) entries: Vec<(u8, SRep, Src)>,
+    /// The VCode instruction of the call.
+    pub(crate) inst: usize,
+}
+
 pub(crate) struct Lowered {
     pub(crate) vcode: VCode<MInst>,
     pub(crate) exits: Vec<LExit>,
+    /// The calls' sites, by their resume block's VCode block.
+    pub(crate) sites: Vec<(usize, LSite)>,
     /// The first operand index of each instruction's snapshot uses.
     pub(crate) snap_ops: Vec<u32>,
     /// The registers the entry guards test.
@@ -52,6 +63,7 @@ struct Lower<'a, 'gc> {
     fused: Vec<bool>,
     uses: Vec<u32>,
     exits: Vec<LExit>,
+    sites: Vec<(usize, LSite)>,
     snap_ops: Vec<u32>,
     entry_regs: Vec<u8>,
     block_of: Vec<u32>,
@@ -118,6 +130,7 @@ pub(crate) fn lower<'gc>(f: &Func<'gc>, code_base: usize) -> Result<Lowered, Str
         fused: vec![false; f.vals.len()],
         uses,
         exits: Vec::new(),
+        sites: Vec::new(),
         snap_ops: Vec::new(),
         entry_regs: Vec::new(),
         block_of,
@@ -175,6 +188,7 @@ pub(crate) fn lower<'gc>(f: &Func<'gc>, code_base: usize) -> Result<Lowered, Str
     Ok(Lowered {
         vcode: lw.v,
         exits: lw.exits,
+        sites: lw.sites,
         snap_ops: lw.snap_ops,
         entry_regs: lw.entry_regs,
     })
@@ -370,6 +384,48 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             Op::KI64(n) if i32::try_from(n).is_ok() => Some(Value::small(n as i32).to_raw()),
             _ => None,
         }
+    }
+
+    /// Push a call: `ops`, then its snapshot's values as uses in stack slots,
+    /// which `jit_leave` and the slow resume read (C1).
+    fn push_call(&mut self, i: Inst, mk: MInst, mut ops: Vec<Operand>) {
+        let d = &self.f.insts[i.idx()];
+        let mut entries = Vec::new();
+        let mut seen: Vec<(VReg, u16)> = Vec::new();
+        let base = ops.len();
+        for &(r, v) in self.f.entries(d.snap) {
+            let v = match self.f.def_op(v) {
+                Some(Op::Box) => self.f.args(self.f.def_inst(v).unwrap())[0],
+                _ => v,
+            };
+            if let Some(k) = self.const_word(v) {
+                entries.push((r, SRep::Val, Src::Const(k)));
+                continue;
+            }
+            let vr = self.vr(v);
+            let k = match seen.iter().find(|(x, _)| *x == vr) {
+                Some(&(_, k)) => k,
+                None => {
+                    let k = (ops.len() - base) as u16;
+                    ops.push(Operand::new(
+                        vr,
+                        regalloc2::OperandConstraint::Stack,
+                        regalloc2::OperandKind::Use,
+                        regalloc2::OperandPos::Late,
+                    ));
+                    seen.push((vr, k));
+                    k
+                }
+            };
+            entries.push((r, srep(self.f.ty(v).rep), Src::Operand(k)));
+        }
+        let at = self.v.push(mk, &ops, allocatable()).index();
+        self.snap_ops.push(base as u32);
+        let resume = self.f.edges(i)[0].target;
+        self.sites.push((
+            self.block_of[resume.idx()] as usize,
+            LSite { entries, inst: at },
+        ));
     }
 
     /// Push an exiting instruction: `ops` then the snapshot uses.
@@ -1024,27 +1080,25 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     true => self.resume_a(i),
                     false => 0,
                 };
-                if c == 2 || c == 3 {
-                    let ops: Vec<Operand> = f
-                        .results(i)
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .map(|r| self.def(r))
-                        .collect();
-                    self.push(
-                        MInst::Resume {
-                            wanted: c - 1,
-                            c,
-                            a,
-                        },
-                        &ops,
-                        none,
-                    );
-                } else if c == 1 {
-                    self.push(MInst::Resume { wanted: 0, c, a }, &[], none);
+                // Nothing is in a register here: what lives across the call
+                // is in the frame (C1), and its reloads come after. The
+                // results land in x0 and x1, which a clobber cannot name.
+                let mut clob = allocatable();
+                let ops: Vec<Operand> = if c == 2 || c == 3 {
+                    let rs: Vec<Val> = f.results(i).collect();
+                    rs.into_iter()
+                        .enumerate()
+                        .map(|(k, r)| {
+                            let p = preg_int(k as u8);
+                            clob.remove(p);
+                            Operand::reg_fixed_def(self.vr(r), p)
+                        })
+                        .collect()
                 } else {
-                    self.push(MInst::Resume { wanted: 0, c, a }, &[], caller_saved());
-                }
+                    Vec::new()
+                };
+                let wanted = if c == 2 || c == 3 { c - 1 } else { 0 };
+                self.push(MInst::Resume { wanted, c, a }, &ops, clob);
             }
             Op::Jump => {
                 self.push(MInst::Jump, &[], none);
@@ -1062,7 +1116,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             Op::Call { a, nargs, pc, .. } => {
                 let pc_after = self.pc_base + (pc as usize + 1) * 8;
                 let ops: Vec<Operand> = args.iter().map(|&x| self.use_(x)).collect();
-                self.push(MInst::Call { a, nargs, pc_after }, &ops, none);
+                self.push_call(i, MInst::Call { a, nargs, pc_after }, ops);
             }
             Op::Dispatch { pc, word } => {
                 let pc_after = self.pc_base + (pc as usize + 1) * 8;
@@ -1077,14 +1131,14 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 let pc_after = self.pc_base + (pc as usize + 1) * 8;
                 let hdr = f.meta.max_stack as u16;
                 let ops: Vec<Operand> = args.iter().map(|&a| self.use_(a)).collect();
-                self.push(
+                self.push_call(
+                    i,
                     MInst::CallMm {
                         hdr,
                         nargs,
                         pc_after,
                     },
-                    &ops,
-                    none,
+                    ops,
                 );
             }
             Op::GuardFits(n) => {

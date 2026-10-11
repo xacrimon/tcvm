@@ -219,11 +219,23 @@ pub(crate) struct Region<'gc> {
     /// per retry of the entry.
     #[collect(require_static)]
     pub(crate) exit_hot: Cell<u32>,
+    /// Where control may leave compiled code while a frame of this region
+    /// is live (C1): (code offset of the return address naming the site,
+    /// its snapshot in `snaps`), by offset.
+    #[collect(require_static)]
+    pub(crate) sites: Box<[(u32, u32)]>,
 }
 
 impl<'gc> Region<'gc> {
     pub(crate) fn snap(&self, e: &ExitInfo) -> SnapView<'_> {
         SnapView::decode(&self.snaps[e.snap as usize..])
+    }
+
+    /// The snapshot of the site whose return address is `ra`.
+    pub(crate) fn site(&self, ra: usize) -> Option<SnapView<'_>> {
+        let off = ra.checked_sub(self.code.rx() as usize)? as u32;
+        let k = self.sites.binary_search_by_key(&off, |s| s.0).ok()?;
+        Some(SnapView::decode(&self.snaps[self.sites[k].1 as usize..]))
     }
 }
 

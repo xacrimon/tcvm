@@ -6,6 +6,7 @@ use crate::env::MetamethodBits;
 use crate::env::value::Value;
 use crate::instruction::TFOR_VARS;
 use crate::instruction::{ArithKind, Family, Instruction, Op as BcOp, UpvalSource};
+use crate::jit::build::cfg::RegSet;
 use crate::jit::build::intrinsics::Emitted;
 use crate::jit::build::{Builder, intrinsics, iter, tables};
 use crate::jit::feedback as fb;
@@ -242,8 +243,14 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             b.set(a, t);
         }
         SETLIST => {
-            // The helper reads the table and the items from their slots.
-            b.store_regs(a as usize..=a as usize + rb as usize);
+            // The helper reads the table and the items from their slots (up
+            // to `top`: those before the ones a call or VARARG landed).
+            let end = if rb != 0 {
+                a as usize + rb as usize
+            } else {
+                b.cfg.nregs - 1
+            };
+            b.store_regs(a as usize..=end);
             let off = insn.d() as u32;
             b.push(Op::Helper(HelperId::SetList { a, n: rb, off }), &[]);
         }
@@ -1096,14 +1103,24 @@ pub(super) fn staged_call(b: &mut Builder<'_, '_>, f: Val, args: &[Val], land: u
     for &a in args {
         ops.push(b.boxed(a));
     }
-    let tys = b.store_live(live);
+    // The callee may read the captured registers through their cells.
+    let captured: Vec<usize> = b.cfg.captured.iter().collect();
+    b.store_regs(captured);
+    // The header goes past the frame's registers: only more than two
+    // results land in them.
+    let mut written = RegSet::EMPTY;
+    if c > 3 {
+        for r in land as usize..land as usize + c as usize - 1 {
+            written.insert(r);
+        }
+    }
     let op = Op::CallMm {
         pc,
         nargs: args.len() as u8,
         land,
         c,
     };
-    b.call(op, &ops, tys, c)
+    b.call(op, &ops, live, written, c)
 }
 
 /// The metamethod of `bit` for `mm_args` (its first two), deopting when
@@ -1733,19 +1750,29 @@ fn callee_at(b: &mut Builder<'_, '_>, pc: u32, a: u8) -> Val {
 /// The CALL at `pc` as a call of `callee` (5.4).
 fn call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: Val) {
     let (a, nb, c) = (insn.a(), insn.b(), insn.c());
-    let mut live = b.cfg.live_in[pc as usize];
-    live.remove(a as usize);
-    let mut tys = b.store_live(live);
+    let live = b
+        .cfg
+        .live_in
+        .get(pc as usize + 1)
+        .copied()
+        .unwrap_or_default();
+    // The arguments in the callee's slots (up to `top`: those before the
+    // ones a call or VARARG landed there), and the captured registers, which
+    // it may read through their cells.
+    let mut stored: Vec<usize> = b.cfg.captured.iter().collect();
+    let end = if nb != 0 {
+        a as usize + 4 + nb as usize - 1
+    } else {
+        b.cfg.nregs
+    };
+    stored.extend(a as usize + 4..end);
+    b.store_regs(stored);
     let cv = b.boxed(callee);
     b.push(Op::Store(a), &[cv]);
-    // What lands in the result registers is unknown.
-    let nres = if c == 0 {
-        b.f.meta.max_stack - a
-    } else {
-        c - 1
-    };
-    for r in a..(a as usize + (nres as usize).max(4)).min(tys.len()) as u8 {
-        tys[r as usize] = TypeSet::ANY;
+    // The callee's frame and its results take every register from `a` up.
+    let mut written = RegSet::EMPTY;
+    for r in a as usize..b.cfg.nregs {
+        written.insert(r);
     }
     // Arguments up to `top`: their count from it.
     let (nargs, count) = if nb == 0 {
@@ -1754,7 +1781,7 @@ fn call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: Val) {
     } else {
         (nb - 1, vec![])
     };
-    let resume = b.call(Op::Call { a, nargs, c, pc }, &count, tys, c);
+    let resume = b.call(Op::Call { a, nargs, c, pc }, &count, live, written, c);
     let first = b.f.insts_of(resume)[0];
     let rs: Vec<Val> = b.f.results(first).collect();
     for (k, &v) in rs.iter().enumerate() {

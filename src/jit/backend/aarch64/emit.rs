@@ -19,7 +19,7 @@ use crate::jit::backend::vcode::VCode;
 use crate::jit::ir::ops::Ctx;
 use crate::jit::ir::types::TypeSet;
 use crate::jit::layout;
-use crate::jit::region::{Loc, SnapEntry};
+use crate::jit::region::{Loc, SRep, SnapEntry};
 
 const NIL: u64 = 0xFFFF_FFFE_0000_0000;
 const FALSE: u64 = NIL | 1;
@@ -37,6 +37,16 @@ pub(crate) struct Emitted {
     /// The 8-byte word holding the region pointer.
     pub(crate) region_word: Label,
     pub(crate) exits: Vec<ExitOut>,
+    /// Where control may leave compiled code with this frame live (C1).
+    pub(crate) sites: Vec<SiteOut>,
+}
+
+/// A site of the region (C1): the return addresses (or addresses past a
+/// `bl` to the leave stub) that name it, and the frame's values there.
+pub(crate) struct SiteOut {
+    pub(crate) keys: Vec<Label>,
+    pub(crate) entries: Vec<SnapEntry>,
+    pub(crate) consts: Vec<u64>,
 }
 
 pub(crate) struct ExitOut {
@@ -59,9 +69,19 @@ struct Em<'a> {
     helpers: Helpers,
     /// The `TCVM_JIT_DEOPT_ALL` flags of the exits, by address.
     fired: Option<usize>,
-    /// Per resume block, where a fast callee's `ret` lands: past the frame
-    /// push, since the caller's frame is still open.
+    /// Per resume block, where a fast callee's `ret` lands, the frame still
+    /// open.
     fast_resume: Vec<Label>,
+    /// Per resume block with a call site, where a return through the
+    /// header lands: the frame opened again and its values read back.
+    slow_resume: Vec<Label>,
+    /// The word holding the region pointer, which each frame records.
+    region_word: Label,
+    /// The stub every way out of compiled code calls (C1).
+    leave_stub: Label,
+    sites: Vec<SiteOut>,
+    sites_of: &'a [(usize, crate::jit::backend::aarch64::lower::LSite)],
+    snap_ops: &'a [u32],
 }
 
 /// A function region's fast entry: what `enter` would check of the callee.
@@ -80,6 +100,8 @@ pub(crate) struct Helpers {
     /// `jit_box_i64`'s trampoline.
     pub(crate) box_i64: usize,
     pub(crate) land: usize,
+    /// `jit::jit_leave`.
+    pub(crate) leave: usize,
     /// The trampolines of the helpers cold arms call: (helper, trampoline).
     pub(crate) trampolines: Vec<(usize, usize)>,
 }
@@ -142,8 +164,12 @@ fn fpr(p: PReg) -> Fpr {
     Fpr(p.hw_enc() as u8)
 }
 
+/// The frame: the frame record, the region word, then the spill slots.
+pub(crate) const FRAME_REGION: i32 = 16;
+pub(crate) const FRAME_SPILLS: i32 = 24;
+
 fn spill_off(slot: usize) -> i32 {
-    16 + 8 * slot as i32
+    FRAME_SPILLS + 8 * slot as i32
 }
 
 pub(crate) fn emit(
@@ -156,13 +182,16 @@ pub(crate) fn emit(
     if out.num_spillslots > MAX_SPILLS {
         return Err(format!("{} spill slots", out.num_spillslots));
     }
-    let frame = (16 + 8 * out.num_spillslots as u32).next_multiple_of(16);
+    let frame = (FRAME_SPILLS as u32 + 8 * out.num_spillslots as u32).next_multiple_of(16);
     let mut a = Asm::new();
     let labels: Vec<Label> = (0..l.vcode.blocks.len()).map(|_| a.new_label()).collect();
     let exit_labels: Vec<Label> = (0..l.exits.len()).map(|_| a.new_label()).collect();
     let exit_region = a.new_label();
     let entry_fail = a.new_label();
     let fast_resume = (0..l.vcode.blocks.len()).map(|_| a.new_label()).collect();
+    let slow_resume = (0..l.vcode.blocks.len()).map(|_| a.new_label()).collect();
+    let region_word = a.new_label();
+    let leave_stub = a.new_label();
     let mut em = Em {
         a,
         v: &l.vcode,
@@ -175,6 +204,12 @@ pub(crate) fn emit(
         helpers,
         fired,
         fast_resume,
+        slow_resume,
+        region_word,
+        leave_stub,
+        sites: Vec::new(),
+        sites_of: &l.sites,
+        snap_ops: &l.snap_ops,
     };
     // A compiled caller has written the header, set base, closure and `insn`
     // (the argument count) as `enter` would, and its `blr` left the return
@@ -199,12 +234,17 @@ pub(crate) fn emit(
     let nb = l.vcode.blocks.len();
     for b in 0..nb {
         let blk = &l.vcode.blocks[b];
-        if blk.resume {
-            em.a.align(32);
-        }
         em.a.bind(em.labels[b]);
-        for ie in out.block_insts_and_edits(&l.vcode, regalloc2::Block::new(b)) {
+        for (k, ie) in out
+            .block_insts_and_edits(&l.vcode, regalloc2::Block::new(b))
+            .enumerate()
+        {
             match ie {
+                // A fast callee's `ret` lands at the `Resume`, past anything
+                // before it.
+                regalloc2::InstOrEdit::Edit(_) if blk.resume && k == 0 => {
+                    return Err("a move before a call's resume".into());
+                }
                 regalloc2::InstOrEdit::Edit(Edit::Move { from, to }) => em.mov(*from, *to),
                 regalloc2::InstOrEdit::Inst(i) => {
                     let next = (b + 1 < nb).then(|| em.labels[b + 1]);
@@ -221,23 +261,88 @@ pub(crate) fn emit(
         em.a.b(em.exit_region);
     }
     em.a.align(8);
-    let region_word = em.a.new_label();
+    let region_word = em.region_word;
     em.a.bind(em.exit_region);
     em.a.ldr_label(X17, region_word);
     em.a.orr_shift(Sz::X, X16, X17, X16, Shift::Lsl, 48);
     em.a.b_far(em.helpers.exit_common);
     if !l.entry_regs.is_empty() {
         em.a.bind(em.entry_fail);
+        // The frame holds nothing yet; a compiled caller's does.
+        em.a.mov(Gpr(0), RT);
+        em.a.ldp(Gpr(1), Gpr(2), FP, 0);
+        em.a.ldr(Gpr(3), BASE, -16);
+        em.a.bl_far(em.helpers.leave);
         em.leave();
         em.a.ldr_label(INSN, region_word);
         em.a.b_far(em.helpers.entry_fail);
+    }
+    // The leave stub: the frames from this one down written to their slots
+    // (`jit_leave`), then the native frames dropped; back to the site, whose
+    // address x19 keeps across the call.
+    em.a.bind(em.leave_stub);
+    em.a.mov(Gpr(19), LR);
+    em.a.mov(Gpr(0), RT);
+    em.a.mov(Gpr(1), FP);
+    em.a.mov(Gpr(2), LR);
+    em.a.mov(Gpr(3), BASE);
+    em.a.bl_far(em.helpers.leave);
+    em.leave();
+    em.a.br(Gpr(19));
+    // The slow resumes: the frame opened again, the values the call kept in
+    // it read back from the slots `jit_leave` wrote.
+    for (blk, site) in &l.sites {
+        em.a.align(32);
+        em.a.bind(em.slow_resume[*blk]);
+        em.open_frame();
+        // The callee's header word 2 is this frame's base.
+        em.a.ldr(X17, BASE, -16);
+        let allocs = em.allocs(site.inst).to_vec();
+        let base = l.snap_ops[site.inst] as usize;
+        for &(reg, rep, src) in &site.entries {
+            let Src::Operand(k) = src else {
+                continue;
+            };
+            let slot = allocs[base + k as usize]
+                .as_stack()
+                .ok_or("a kept value outside the frame")?
+                .index();
+            em.a.ldr(X16, X17, reg as i32 * 8);
+            match rep {
+                SRep::B1 => {
+                    em.a.mov_imm(Gpr(9), FALSE);
+                    em.a.sub(Sz::X, X16, X16, Gpr(9));
+                }
+                SRep::I64 => {
+                    let (big, done) = (em.a.new_label(), em.a.new_label());
+                    em.a.lsr_imm(Sz::X, Gpr(9), X16, 32);
+                    em.a.cmn_imm(Sz::W, Gpr(9), 1);
+                    em.a.b_cond(Cond::Ne, big);
+                    em.a.sxtw(X16, X16);
+                    em.a.b(done);
+                    em.a.bind(big);
+                    em.a.and_imm(Sz::X, X16, X16, PTR_MASK);
+                    em.a.ldr(X16, X16, 0);
+                    em.a.bind(done);
+                }
+                SRep::Val | SRep::I32 | SRep::F64 => {}
+            }
+            em.a.str(X16, FP, spill_off(slot));
+        }
+        em.a.b(em.fast_resume[*blk]);
     }
     if fast_label.is_some() {
         // Back to the caller's slow path: the call through `enter` from the
         // header the caller wrote, its frame dropped with the rest. `enter`
         // takes word 0 as the callee value, which the caller had already
-        // rewritten to the closure.
+        // rewritten to the closure. The caller's frames go to their slots
+        // first, from its own (this frame is not open yet).
         em.a.bind(fast_miss);
+        em.a.mov(Gpr(0), RT);
+        em.a.mov(Gpr(1), FP);
+        em.a.mov(Gpr(2), LR);
+        em.a.ldr(Gpr(3), BASE, -16);
+        em.a.bl_far(em.helpers.leave);
         em.a.movz(Sz::X, X16, FUNCTION_TAG, 3);
         em.a.orr(Sz::X, X16, X16, CLOSURE);
         em.a.str(X16, BASE, -32);
@@ -266,6 +371,7 @@ pub(crate) fn emit(
         num_spills: out.num_spillslots as u32,
         region_word,
         exits,
+        sites: em.sites,
     })
 }
 
@@ -347,6 +453,8 @@ impl Em<'_> {
         self.a.sub_imm(Sz::X, SP, SP, self.frame as u64);
         self.a.stp(FP, LR, SP, 0);
         self.a.mov_sp(FP, SP);
+        self.a.ldr_label(X16, self.region_word);
+        self.a.str(X16, FP, FRAME_REGION);
     }
 
     fn close_frame(&mut self) {
@@ -358,8 +466,9 @@ impl Em<'_> {
     /// argument count: a Lua callee without varargs whose prototype has a
     /// fast entry is called with `blr`, this frame kept, and its `ret` lands
     /// past the resume block's frame push (5.4); anything else goes to `slow`.
-    /// Nothing is live across a call (R6), so every register is free here.
-    fn fast_call(&mut self, hdr: i32, block: usize, slow: Label) {
+    /// Every register is free here: what lives across the call is in the
+    /// frame (C1). Returns the return address `blr` leaves.
+    fn fast_call(&mut self, hdr: i32, block: usize, slow: Label) -> Label {
         let fast_resume = self.fast_resume[self.v.succs(block)[0].index()];
         self.a.ldr(X16, BASE, hdr);
         self.a.lsr_imm(Sz::X, X17, X16, 48);
@@ -384,11 +493,57 @@ impl Em<'_> {
         self.a.cmp(Sz::X, Gpr(9), Gpr(10));
         self.a.b_cond(Cond::Lo, deep);
         self.a.blr(X17);
+        let ret = self.a.new_label();
+        self.a.bind(ret);
         self.a.b(fast_resume);
         self.a.bind(deep);
         self.a.adr(LR, fast_resume);
         self.a.orr_imm(Sz::X, LR, LR, 1);
         self.a.br(X17);
+        ret
+    }
+
+    /// Call the leave stub: the site the address past the `bl` names, with
+    /// `entries` of this frame to write (none where all is in its slots).
+    fn leave_site(&mut self, mut keys: Vec<Label>, entries: Vec<SnapEntry>, consts: Vec<u64>) {
+        self.a.bl(self.leave_stub);
+        let k = self.a.new_label();
+        self.a.bind(k);
+        keys.push(k);
+        self.sites.push(SiteOut {
+            keys,
+            entries,
+            consts,
+        });
+    }
+
+    /// The values a call at VCode instruction `i` keeps in the frame: its
+    /// stack-slot snapshot operands (`LSite`).
+    fn site_entries(&self, i: usize, block: usize) -> (Vec<SnapEntry>, Vec<u64>) {
+        let resume = self.v.succs(block)[0].index();
+        let Some((_, site)) = self.sites_of.iter().find(|(b, _)| *b == resume) else {
+            return (Vec::new(), Vec::new());
+        };
+        let allocs = self.allocs(i);
+        let base = self.snap_ops[i] as usize;
+        let mut entries = Vec::new();
+        let mut consts = Vec::new();
+        for &(reg, rep, src) in &site.entries {
+            let loc = match src {
+                Src::Const(w) => {
+                    consts.push(w);
+                    Loc::Const(consts.len() as u32 - 1)
+                }
+                Src::Operand(k) => Loc::Spill(
+                    allocs[base + k as usize]
+                        .as_stack()
+                        .expect("a kept value outside the frame")
+                        .index() as u16,
+                ),
+            };
+            entries.push(SnapEntry { reg, rep, loc });
+        }
+        (entries, consts)
     }
 
     /// Before a tail-out into the interpreter: the stack pointer, frame
@@ -1247,7 +1402,7 @@ impl Em<'_> {
                 }
             }
             Call { a, nargs, pc_after } => {
-                let resume = self.labels[self.v.succs(block)[0].index()];
+                let resume = self.slow_resume[self.v.succs(block)[0].index()];
                 let hdr = a as i32 * 8;
                 self.a.adr(X16, resume);
                 self.a.str(X16, BASE, hdr + 8);
@@ -1261,14 +1416,16 @@ impl Em<'_> {
                     self.a.movz(Sz::X, INSN, nargs as u16, 0);
                 }
                 let slow = self.a.new_label();
-                self.fast_call(hdr, block, slow);
+                let ret = self.fast_call(hdr, block, slow);
                 self.a.bind(slow);
-                self.leave();
+                let fast = self.fast_resume[self.v.succs(block)[0].index()];
+                let (entries, consts) = self.site_entries(i, block);
+                self.leave_site(vec![ret, fast], entries, consts);
                 self.a.add_imm(Sz::X, PC, BASE, hdr as u64);
                 self.a.b_far(self.helpers.enter);
             }
             Dispatch { op, word, pc_after } => {
-                self.leave();
+                self.leave_site(Vec::new(), Vec::new(), Vec::new());
                 self.a.ldr_lit(INSN, word);
                 self.a.ldr_lit(PC, pc_after as u64);
                 self.a.ldr(X16, RT, op as i32 * 8);
@@ -1307,8 +1464,8 @@ impl Em<'_> {
                 self.close_frame();
                 self.a.br(X16);
                 self.a.bind(dispatch);
+                self.leave_site(Vec::new(), Vec::new(), Vec::new());
                 self.a.ldr(X16, CLOSURE, layout::FN_CODE as i32);
-                self.leave();
                 self.a.ldr(INSN, X16, 0);
                 self.a.add_imm(Sz::X, PC, X16, 8);
                 self.a.and_imm(Sz::X, X17, INSN, 0xff);
@@ -1316,7 +1473,6 @@ impl Em<'_> {
                 self.a.br(X16);
             }
             Resume { wanted, c, a } => {
-                self.open_frame();
                 self.a.bind(self.fast_resume[block]);
                 // The callee's header word 2 is this frame's base; its word 0
                 // our closure.
@@ -1362,7 +1518,7 @@ impl Em<'_> {
                 nargs,
                 pc_after,
             } => {
-                let resume = self.labels[self.v.succs(block)[0].index()];
+                let resume = self.slow_resume[self.v.succs(block)[0].index()];
                 let h = hdr as i32 * 8;
                 for k in 0..=nargs as usize {
                     let v = self.r(i, k);
@@ -1376,9 +1532,11 @@ impl Em<'_> {
                 self.a.str(X16, BASE, h + 24);
                 self.a.movz(Sz::X, INSN, nargs as u16, 0);
                 let slow = self.a.new_label();
-                self.fast_call(h, block, slow);
+                let ret = self.fast_call(h, block, slow);
                 self.a.bind(slow);
-                self.leave();
+                let fast = self.fast_resume[self.v.succs(block)[0].index()];
+                let (entries, consts) = self.site_entries(i, block);
+                self.leave_site(vec![ret, fast], entries, consts);
                 self.a.add_imm(Sz::X, PC, BASE, h as u64);
                 self.a.b_far(self.helpers.enter);
             }

@@ -1,8 +1,11 @@
-//! The call-boundary pass (9.8): a call clobbers every register and pops the
-//! native frame, so a value live into a resume block (R6: a constant, or a
-//! pure computation of constants and loop-invariant values LICM moved) is
-//! computed again after the resume, with its later uses given whichever
-//! definition reaches them.
+//! The call-boundary pass (9.8, C1): a call clobbers every register, so a
+//! value live across it stays in the region's frame, and must then be one
+//! the call-site snapshot names: `jit_leave` writes those to their home
+//! slots when compiled code is left during the call, and the slow resume
+//! reads them back. Constants, and pure computations of constants and such
+//! values (raw pointers among them, which the collector does not see), are
+//! computed again after the resume instead, with their later uses given
+//! whichever definition reaches them.
 
 use crate::jit::FastMap;
 use crate::jit::ir::ops::Op;
@@ -15,7 +18,21 @@ pub(crate) fn call_boundaries(f: &mut Func<'_>) -> Result<(), String> {
     if !cfg.rpo.iter().any(|b| f.blocks[b.idx()].resume) {
         return Ok(());
     }
+    // A copy may make a value another call kept live across it instead.
+    for _ in 0..16 {
+        if !boundaries_round(f)? {
+            return Ok(());
+        }
+    }
+    Err("the call boundaries did not settle".into())
+}
+
+/// Keep or copy what is live across each call, and give later uses the
+/// copies; whether anything changed.
+fn boundaries_round(f: &mut Func<'_>) -> Result<bool, String> {
+    let cfg = f.cfg();
     let live = live_in(f, &cfg.rpo);
+    let mut changed = false;
     // Each value live across a call, with its copy in each resume block it
     // is live into.
     let mut across: Vec<(Val, FastMap<Block, Val>)> = Vec::new();
@@ -23,16 +40,23 @@ pub(crate) fn call_boundaries(f: &mut Func<'_>) -> Result<(), String> {
         if !f.blocks[b.idx()].resume {
             continue;
         }
+        let mut kept = kept_across(f, &cfg, b);
         let mut memo: FastMap<Val, Val> = FastMap::default();
         // The copies go after the resume block's `Resume`.
         let mut at = 1;
         for v in live[b.idx()].iter().collect::<Vec<_>>() {
             let v = Val(v as u32);
-            let Some(c) = remat(f, v, b, &mut memo, &mut at) else {
-                return Err(format!(
-                    "v{} is live across the call resuming at b{}",
-                    v.0, b.0
-                ));
+            if kept.contains(&same_reg(f, v)) {
+                continue;
+            }
+            let c = match remat(f, v, b, &mut memo, &mut at, &kept) {
+                Some(c) => c,
+                None => {
+                    keep_in_free_reg(f, &cfg, b, v)?;
+                    kept.push(same_reg(f, v));
+                    changed = true;
+                    continue;
+                }
             };
             match across.iter_mut().find(|(x, _)| *x == v) {
                 Some((_, cs)) => {
@@ -46,6 +70,7 @@ pub(crate) fn call_boundaries(f: &mut Func<'_>) -> Result<(), String> {
             }
         }
     }
+    changed |= !across.is_empty();
     let cfg = f.cfg();
     for (v, copies) in across {
         let d = f.def_inst(v).unwrap();
@@ -87,7 +112,80 @@ pub(crate) fn call_boundaries(f: &mut Func<'_>) -> Result<(), String> {
             }
         }
     }
+    Ok(changed)
+}
+
+/// Name `v`, which no register holds after the call into `b`, in the call's
+/// snapshot under a register dead there, so `jit_leave` writes it to that
+/// slot and the slow resume reads it back.
+fn keep_in_free_reg(f: &mut Func<'_>, cfg: &CfgInfo, b: Block, v: Val) -> Result<(), String> {
+    let none = || format!("v{} is live across the call resuming at b{}", v.0, b.0);
+    if f.ty(v).rep == crate::jit::ir::types::Rep::Ptr {
+        return Err(none());
+    }
+    let p = *cfg.preds(b).first().ok_or_else(none)?;
+    let t = f.terminator(p).ok_or_else(none)?;
+    let pc = match f.op(t) {
+        Op::Call { pc, .. } | Op::CallMm { pc, .. } => pc,
+        _ => return Err(none()),
+    };
+    let used: Vec<u8> = f.snap_entries(t).iter().map(|e| e.0).collect();
+    let r = f
+        .call_free
+        .get(&pc)
+        .and_then(|free| free.iter().find(|&r| !used.contains(&(r as u8))))
+        .ok_or_else(none)?;
+    let d = f.snaps[f.insts[t.idx()].snap as usize];
+    let from = f.snap_pool.len();
+    f.snap_pool
+        .extend_from_within(d.entries.start as usize..(d.entries.start + d.entries.len) as usize);
+    f.snap_pool.push((r as u8, v));
+    let s = f.finish_snap(d.pc, d.kind, from);
+    f.insts[t.idx()].snap = s.0;
     Ok(())
+}
+
+/// The value whose register `v` shares, as the lowering aliases them:
+/// through refining guards and i32 unboxes, whose bits are the operand's
+/// (not `LToI`, whose operand holds an i64).
+pub(crate) fn same_reg(f: &Func<'_>, mut v: Val) -> Val {
+    while let Some(d) = f.def_inst(v) {
+        match f.op(d) {
+            Op::Guard(_) | Op::Refine(_) | Op::Unbox(crate::jit::ir::types::Rep::I32) => {
+                v = f.args(d)[0]
+            }
+            _ => break,
+        }
+    }
+    v
+}
+
+/// Whether `v` is a constant, which needs no spill slot across a call.
+pub(crate) fn is_const(f: &Func<'_>, v: Val) -> bool {
+    matches!(
+        f.def_op(v),
+        Some(Op::KVal(_) | Op::KObj(_) | Op::KI32(_) | Op::KI64(_) | Op::KB1(_) | Op::KF64(_))
+    )
+}
+
+/// The values the call into resume block `b` keeps in the frame: its
+/// snapshot's, but raw pointers and constants, which are computed again
+/// (the slow resume reads back only what `jit_leave` wrote), each as
+/// `same_reg` gives it.
+pub(crate) fn kept_across(f: &Func<'_>, cfg: &CfgInfo, b: Block) -> Vec<Val> {
+    let Some(&p) = cfg.preds(b).first() else {
+        return Vec::new();
+    };
+    let Some(t) = f.terminator(p) else {
+        return Vec::new();
+    };
+    f.snap_entries(t)
+        .iter()
+        .map(|e| e.1)
+        .filter(|&v| f.ty(v).rep != crate::jit::ir::types::Rep::Ptr)
+        .map(|v| same_reg(f, v))
+        .filter(|&v| !is_const(f, v))
+        .collect()
 }
 
 /// Whether `v` can be computed again after a call: a constant, a pure
@@ -103,16 +201,21 @@ pub(crate) fn rematerializable(f: &Func<'_>, v: Val) -> bool {
         && f.args(d).iter().all(|&a| rematerializable(f, a))
 }
 
-/// `v` computed again at position `at` of `b` and on, its operands first.
+/// `v` computed again at position `at` of `b` and on, its operands first;
+/// `kept` values are there after the call as they are.
 fn remat(
     f: &mut Func<'_>,
     v: Val,
     b: Block,
     memo: &mut FastMap<Val, Val>,
     at: &mut usize,
+    kept: &[Val],
 ) -> Option<Val> {
     if let Some(&c) = memo.get(&v) {
         return Some(c);
+    }
+    if kept.contains(&same_reg(f, v)) {
+        return Some(v);
     }
     let d = f.def_inst(v)?;
     let op = match f.op(d) {
@@ -123,7 +226,7 @@ fn remat(
     let args: Vec<Val> = f.args(d).to_vec();
     let mut copied = Vec::with_capacity(args.len());
     for a in args {
-        copied.push(remat(f, a, b, memo, at)?);
+        copied.push(remat(f, a, b, memo, at, kept)?);
     }
     let c = f.make_inst(op, &copied, None, f.insts[d.idx()].tag);
     let cv = f.result(c);

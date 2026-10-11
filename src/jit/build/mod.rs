@@ -57,9 +57,13 @@ struct BlockState {
     sealed: bool,
     incomplete: Vec<(u8, Val)>,
     preds: Vec<Block>,
-    /// A block values do not flow into (the prologue, a resume block):
-    /// registers read there load their home slot.
+    /// A block values do not flow into (the prologue, after a helper that
+    /// wrote slots): registers read there load their home slot.
     root: bool,
+    /// Registers a call's resume block reads from their home slots: the
+    /// call wrote them, a closure may have through a cell, or the slot held
+    /// the value already. The others flow in from before the call.
+    reload: RegSet,
     /// Where a root's loads are inserted.
     root_at: usize,
     /// Types of the slots of a root (what was stored before the call).
@@ -161,6 +165,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             incomplete: Vec::new(),
             preds: Vec::new(),
             root: false,
+            reload: RegSet::EMPTY,
             root_at: 0,
             root_ty: Vec::new(),
             after: None,
@@ -282,7 +287,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
                 break v;
             }
             let s = &self.bs[x.idx()];
-            if s.root {
+            if s.root || s.reload.contains(r as usize) {
                 break self.root_load(x, r);
             }
             if !s.sealed {
@@ -701,17 +706,71 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         self.terminate(Op::Deopt, &[], &[], Some((s, tag)));
     }
 
-    /// End the block with a call: `Call` to a fresh resume block, which
-    /// becomes current.
-    pub(crate) fn call(&mut self, op: Op, args: &[Val], slot_tys: Vec<TypeSet>, c: u8) -> Block {
-        let resume = self.new_root(slot_tys);
+    /// End the block with a call (`Call`, `CallMm`) to a fresh resume block,
+    /// which becomes current. Of the registers `live` after it, those whose
+    /// slots hold their values, those it `written`, and the captured ones are
+    /// read from their slots after it; the others keep their values in the
+    /// region's frame across it, the call-site snapshot naming them for
+    /// `jit_leave` (C1).
+    pub(crate) fn call(
+        &mut self,
+        op: Op,
+        args: &[Val],
+        live: RegSet,
+        written: RegSet,
+        c: u8,
+    ) -> Block {
+        let mut reload = written;
+        reload.union(&self.cfg.captured);
+        let mut tys = vec![TypeSet::ANY; self.nregs];
+        let from = self.f.snap_pool.len();
+        for r in live.iter() {
+            if r >= self.nregs || reload.contains(r) {
+                continue;
+            }
+            if let SlotState::Lazy(root) = self.slot(self.cur, r) {
+                let t = self.bs[root.idx()].root_ty.get(r).copied();
+                tys[r] = t.filter(|t| !t.is_empty()).unwrap_or(TypeSet::ANY);
+                reload.insert(r);
+                continue;
+            }
+            let v = self.reg(r as u8);
+            if self.slot_holds(r as u8, v) {
+                tys[r] = self.ty(v).set;
+                reload.insert(r);
+            } else {
+                self.f.snap_pool.push((r as u8, v));
+            }
+        }
+        let snap = self.f.finish_snap(self.pc, ExitKind::After, from);
+        let mut free = RegSet::EMPTY;
+        for r in 0..self.nregs {
+            if !live.contains(r) && !reload.contains(r) {
+                free.insert(r);
+            }
+        }
+        let e = self.f.call_free.entry(self.pc).or_insert(free);
+        for (w, x) in e.0.iter_mut().zip(free.0) {
+            *w &= x;
+        }
+        let resume = self.new_block();
         self.f.blocks[resume.idx()].resume = true;
-        self.terminate(op, args, &[resume], None);
-        self.bs[resume.idx()].preds.clear();
+        let s = &mut self.bs[resume.idx()];
+        s.sealed = true;
+        s.reload = reload;
+        s.root_ty = tys;
+        self.terminate(op, args, &[resume], Some((snap, ExitTag::Type)));
+        for r in 0..self.nregs {
+            let state = if reload.contains(r) {
+                SlotState::Lazy(resume)
+            } else {
+                SlotState::Unknown
+            };
+            self.set_slot(resume, r, state);
+        }
         self.switch_to(resume);
-        let r = self.push(Op::Resume { c }, &[]);
+        self.push(Op::Resume { c }, &[]);
         self.bs[resume.idx()].root_at = 1;
-        let _ = r;
         resume
     }
 

@@ -1,8 +1,8 @@
 //! Global value numbering (9.4) over the dominator tree: pure instructions,
 //! type guards (a value's type never changes, so a dominating equal guard
 //! makes a later one redundant), and loads and memory guards keyed by the
-//! version of the memory they read (8.4). Scopes restart at resume blocks,
-//! so no value is shared across a call.
+//! version of the memory they read (8.4); a call writes every class, and
+//! scopes restart after one.
 
 use crate::jit::FastMap;
 use crate::jit::ir::ops::{Flags, Mem, Op};
@@ -200,6 +200,8 @@ pub(crate) fn gvn(f: &mut Func<'_>) -> bool {
         }
         marks.push(undo.len());
         let scope = marks.len() - 1;
+        // Scopes restart after a call: a value shared across one must then
+        // stay in the frame or be computed again (C1).
         let lo = if f.blocks[b.idx()].resume {
             scope
         } else {

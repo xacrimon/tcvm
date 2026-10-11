@@ -1120,3 +1120,63 @@ fn kinds_that_change_in_a_loop() {
 "##,
     );
 }
+
+/// Values of every kind live across compiled calls (C1) stay right when the
+/// callee returns straight (the frame kept), and when it leaves compiled code
+/// first: a native, a yield, an error, a collection, deep recursion that
+/// grows the stack and tags return addresses, all resumed through the
+/// header and the values read back from their slots.
+#[test]
+fn values_live_across_calls() {
+    agrees(
+        r##"
+        local out = {}
+        local mode = 0
+        local function leaf(n)
+            if mode == 1 then return #tostring(n) end
+            if mode == 2 then return (coroutine.yield(n)) end
+            if mode == 3 and n % 7 == 3 then error("boom " .. n) end
+            if mode == 4 then local s = "" for i = 1, 20 do s = s .. i end return #s end
+            if mode == 5 then
+                local function deep(k) if k == 0 then return 0 end return 1 + deep(k - 1) end
+                return deep(400) - 400 + n % 3
+            end
+            return n % 5
+        end
+        local function work(n)
+            local i, big, f, t, s, b = 0, math.maxinteger - 5, 0.5, {k = 1}, "str", true
+            local acc = 0
+            for j = 1, n do
+                i = i + 1
+                f = f * 1.0001 + 0.25
+                big = big + 1
+                local r = leaf(j)
+                acc = acc + r + i + (b and 1 or 0) + t.k + #s
+                b = not b
+                if big > math.maxinteger - 3 then big = big - 7 end
+            end
+            return string.format("%d %d %.6f %s %s", acc, big, f, tostring(b), s)
+        end
+        for m = 0, 5 do
+            mode = m
+            if m == 2 then
+                local co = coroutine.wrap(function() return work(300) end)
+                local r = co()
+                local k = 0
+                while type(r) == "number" do k = k + 1; r = co(r * 2) end
+                out[#out + 1] = r .. " " .. k
+            elseif m == 3 then
+                for rep = 1, 5 do
+                    local ok, e = pcall(work, 300)
+                    out[#out + 1] = tostring(ok) .. " " .. tostring(e)
+                end
+                mode = 0
+                out[#out + 1] = work(300)
+            else
+                for rep = 1, 3 do out[#out + 1] = work(300) end
+            end
+        end
+        return table.concat(out, "\n")
+"##,
+    );
+}

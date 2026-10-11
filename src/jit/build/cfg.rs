@@ -21,6 +21,11 @@ impl RegSet {
         self.0[r / 64] &= !(1 << (r % 64));
     }
 
+    #[inline]
+    pub(crate) fn contains(&self, r: usize) -> bool {
+        self.0[r / 64] >> (r % 64) & 1 != 0
+    }
+
     pub(crate) fn union(&mut self, o: &RegSet) {
         for i in 0..4 {
             self.0[i] |= o.0[i];

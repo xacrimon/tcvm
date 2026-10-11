@@ -133,7 +133,9 @@ pub(crate) fn build_ir<'gc>(
     opt::prune_gc_checks(&mut f);
     opt::dce(&mut f);
     check(&f, "optimize")?;
-    opt::calls::call_boundaries(&mut f).map_err(CompileError::Verify)?;
+    if let Err(e) = opt::calls::call_boundaries(&mut f) {
+        return Err(CompileError::Verify(format!("{e}\n{}", f.print())));
+    }
     check(&f, "call boundaries")?;
     opt::snaps::prune_snapshots(&mut f);
     opt::dce(&mut f);
@@ -308,6 +310,7 @@ pub(crate) fn compile<'gc>(
             false,
         )?,
         land: crate::jit::helpers::jit_land as *const () as usize,
+        leave: crate::jit::jit_leave as *const () as usize,
         trampolines,
     };
     // Allocated now, moved into the region after: the code embeds its address.
@@ -340,6 +343,16 @@ pub(crate) fn compile<'gc>(
     let fast_entry = em
         .fast
         .map_or(std::ptr::null(), |l| start.wrapping_add(em.asm.label_offset(l)));
+    let site_keys: Vec<Vec<u32>> = em
+        .sites
+        .iter()
+        .map(|s| {
+            s.keys
+                .iter()
+                .map(|&k| em.asm.label_offset(k) as u32)
+                .collect()
+        })
+        .collect();
     let words = em
         .asm
         .finish(start as usize)
@@ -410,6 +423,30 @@ pub(crate) fn compile<'gc>(
                 .map_or(0, |c| c.get()),
         });
     }
+    // The sites, their snapshots after the exits'.
+    let mut sites: Vec<(u32, u32)> = Vec::new();
+    for (site, keys) in em.sites.iter_mut().zip(&site_keys) {
+        for s in &mut site.entries {
+            if let crate::jit::region::Loc::Const(c) = s.loc {
+                let w = site.consts[c as usize];
+                let k = consts.iter().position(|&x| x == w).unwrap_or_else(|| {
+                    consts.push(w);
+                    consts.len() - 1
+                });
+                s.loc = crate::jit::region::Loc::Const(k as u32);
+            }
+        }
+        let at = snaps.len() as u32;
+        encode_snap(
+            &mut snaps,
+            crate::jit::ir::ExitKind::After,
+            0,
+            &[],
+            &site.entries,
+        );
+        sites.extend(keys.iter().map(|&k| (k, at)));
+    }
+    sites.sort_unstable();
     let known = closure.proto.jit.get().map_or((0, 0), |s| {
         let s = s.borrow();
         (s.kind_exits.len() as u32, s.shapes_seen.len() as u32)
@@ -436,6 +473,7 @@ pub(crate) fn compile<'gc>(
             retired: std::cell::Cell::new(false),
             known,
             exit_hot: std::cell::Cell::new(crate::jit::state::EXIT_HOT),
+            sites: sites.into_boxed_slice(),
         },
     );
     region

@@ -56,6 +56,19 @@ pub(crate) fn machine_env() -> MachineEnv {
     }
 }
 
+/// Every register the allocator hands out: what a call into another region
+/// may change.
+pub(crate) fn allocatable() -> PRegSet {
+    let mut s = PRegSet::empty();
+    for r in INT_PREFERRED.iter().chain(&INT_OTHER) {
+        s.add(PReg::new(*r as usize, RegClass::Int));
+    }
+    for r in FLOAT_PREFERRED.iter().chain(&FLOAT_OTHER) {
+        s.add(PReg::new(*r as usize, RegClass::Float));
+    }
+    s
+}
+
 /// What a C-ABI call clobbers: x0-x17 and d0-d7, d16-d31.
 pub(crate) fn caller_saved() -> PRegSet {
     let mut s = PRegSet::empty();
@@ -99,8 +112,9 @@ const _: () = assert!(IMAGE_SPILLS + MAX_SPILLS <= EXIT_REGS);
 
 /// Entered from a region's exit trampoline with x16 = region | exit << 48
 /// and the region's frame still open: stores the register image in
-/// `image_index` order, copies the frame's spill slots after it, returns to
-/// dispatch's entry state (`NativeBase`) and tails `jit_exit`.
+/// `image_index` order, copies the frame's spill slots after it, writes the
+/// frames of compiled callers under it to their slots (`jit_leave`), returns
+/// to dispatch's entry state (`NativeBase`) and tails `jit_exit`.
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn exit_common() {
     core::arch::naked_asm!(
@@ -133,10 +147,10 @@ pub(crate) unsafe extern "C" fn exit_common() {
         "stp d26, d27, [x17, #384]",
         "stp d28, d29, [x17, #400]",
         "stp d30, d31, [x17, #416]",
-        // The spill slots, [x29 + 16 + 8i], to the image's spill words.
+        // The spill slots, [x29 + 24 + 8i], to the image's spill words.
         "and x9, x16, #0xffffffffffff",
         "ldr w10, [x9, #{num_spills}]",
-        "add x11, x29, #16",
+        "add x11, x29, #{frame_spills}",
         "add x12, x17, #{spills}",
         "cbz w10, 2f",
         "1:",
@@ -144,14 +158,19 @@ pub(crate) unsafe extern "C" fn exit_common() {
         "str x13, [x12], #8",
         "subs w10, w10, #1",
         "b.ne 1b",
+        // The callers' frames, from this one's record and header word 2.
+        "2:",
+        "mov x20, x16",
+        "mov x0, x23",
+        "ldp x1, x2, [x29]",
+        "ldur x3, [x22, #-16]",
+        "bl {jit_leave}",
         // Back to dispatch's entry state, dropping this frame and any fast
         // callers' under it.
-        "2:",
         "ldr x11, [x23, #{nsp}]",
         "mov sp, x11",
         "ldr x29, [x23, #{nfp}]",
         "ldr x30, [x23, #{nlr}]",
-        "mov x20, x16",
         "b {jit_exit}",
         regs = const crate::jit::layout::EXIT_REGS,
         num_spills = const crate::jit::region::layout::NUM_SPILLS,
@@ -159,6 +178,8 @@ pub(crate) unsafe extern "C" fn exit_common() {
         nsp = const crate::jit::layout::NATIVE_SP,
         nfp = const crate::jit::layout::NATIVE_FP,
         nlr = const crate::jit::layout::NATIVE_LR,
+        frame_spills = const crate::jit::backend::aarch64::emit::FRAME_SPILLS,
+        jit_leave = sym crate::jit::jit_leave,
         jit_exit = sym crate::jit::jit_exit,
     )
 }
