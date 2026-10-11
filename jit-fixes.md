@@ -1,0 +1,8 @@
+Why we lose:
+- Calls cost the most. Every call out of compiled code goes back through the interpreter's generic call path. fib pays 90.6 instructions and 12.9 cycles per call, against LuaJIT's 36.9 and 3.9 (C: 16.5 and 3.5). The generic enter alone is 5–32% of cycles in 13 of the 16 benchmarks.
+- Compiled code can't reach the builtins' fast entries. A coroutine switch from JIT code costs about 70 cycles against the interpreter's 31. That is why coroutine-ring and chameneos run slower with the JIT on.
+- Rarely-taken helper arms slow the hot path. Their calls force spills, stop GVN and LICM from reusing values, and keep GC checks in loops. Queen's inner loop is 65 instructions per iteration against LuaJIT's 17 and C's 9.
+- Speculation gaps. Compares never record operand kinds, so qt's float compares are fully generic. Float % goes through libm's fmod at about 90 cycles (LuaJIT: 7), and comparing values of different types still calls a helper.
+- What LuaJIT inlines and sinks, we call and allocate. Examples: ray's four nested calls per sphere test, mandel-metatable's temporary complex-number tables, deltablue's multi-level __index lookups (23% of its cycles), and a setmetatable per object in havlak and json.
+- Where we already win, it's because LuaJIT can't compile closure creation and our allocation and GC are 3–10× cheaper per object: fixpoint-fact 4.6×, havlak 2.7×, deltablue 2.1×.
+- Compile time is 0.2–25 ms per benchmark; LuaJIT's compiler takes 24–47% of the whole run on queen, json and qt. Per IR instruction, though, we're at 1–2 µs against the design's 0.35 budget; the passes and the register allocator take most of it.

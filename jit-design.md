@@ -3,7 +3,10 @@
 Branch `jit2`, written 2026-10-09 against main at bdd8c75 and revised the same day
 after a review against the code. This is the document to implement from; it
 supersedes the design notes of the old `jit` branch (PR #127, issues #123 and #128).
-File references are to main at that commit.
+File references are to main at that commit. Revised again on 2026-10-11 after
+milestone 2's measurements against LuaJIT: section 17 is the performance plan the
+remaining milestones (15) follow, Appendix F its evidence, and the sections it
+changes say so.
 
 ## Contents
 
@@ -19,15 +22,17 @@ File references are to main at that commit.
 10. The aarch64 backend
 11. Runtime data structures and lifetimes
 12. Intrinsics
-13. Inlining (designed now, built later)
+13. Inlining (milestone 5)
 14. Tooling and testing
 15. Milestones
 16. Risks and open questions
+17. Performance plan (after milestone 2)
 - Appendix A: register assignment
 - Appendix B: header words written by a region
 - Appendix C: snapshot encoding
 - Appendix D: opcode coverage matrix
 - Appendix E: x86-64 extension points
+- Appendix F: the milestone 2 measurements, per benchmark
 
 ## 1. Goals and scope
 
@@ -51,11 +56,17 @@ Goals, in priority order:
    compiled against the shape system: one shape compare per receiver per region,
    slot loads at compile-time offsets, class identity for `__index` chains.
 4. Calls cost no more than they do in the interpreter, and known callees cost less:
-   direct jumps to compiled entries, inlined builtins.
+   direct jumps to compiled entries, inlined builtins, the builtins' fast entries
+   for the rest. Milestone 2 does not meet this for builtins: a coroutine switch
+   from compiled code costs twice the interpreter's (17.2).
 5. Compile time stays in the tens of microseconds for ordinary functions, so the
    JIT can trigger early and compile often. Budgets in section 15.
 6. The second target, x86-64, can be added without touching the IR, the optimizer,
    the runtime protocol or the allocator contract. Appendix E lists the seams.
+7. Faster than LuaJIT by a wide margin: the LJR suite at least 2× LuaJIT's
+   compiler (geomean), at a compile time per program well under LuaJIT's trace
+   compiler's. Milestone 2 is at 0.88×; the targets and the plan to reach them
+   are section 17.
 
 Non-goals for this design: a tracing tier, a background compiler thread, a
 baseline (non-speculating) tier, debug-hook support inside compiled code, and
@@ -114,6 +125,19 @@ elaborates them.
   entry point** (a loop entry or a call), and a hot exit recompiles with its site
   widened at the entry's next arrival; a bounded number of recompiles blacklists
   the entry. (Section 6.4.)
+- **J10. Calls between compiled functions are native calls whose frames can be
+  dropped** (2026-10-11, extends J1). A compiled caller writes the callee's
+  header and its live values to their slots exactly as J1 requires, then calls
+  the callee's fast entry with `blr`, and the callee returns with `ret`. The Lua
+  frame stays the record of the call: header word 1 holds the caller's resume
+  point for every other way back. The native frames are a cache: any way out of
+  compiled code into the interpreter (a deopt, a call through `enter`, a native,
+  a dispatch, a collector exit) first resets the native stack to where dispatch
+  was entered, so the interpreter, coroutine switches, unwinding and the
+  collector never see a compiled frame, and each dropped frame resumes through
+  its callee's header. Rejected for now: one native stack per coroutine (V8 and
+  JSC style native frames), which J10 keeps open, since with per-coroutine stacks
+  the same protocol holds and only the reset points move. (Section 5.4.)
 
 ## 3. What the old JIT taught
 
@@ -690,19 +714,107 @@ lands one result (or a truthiness test for the compare continuations). The windo
 check against `stack_end` is emitted inline; its failure is a deopt to the
 instruction, where the interpreter's `stage_grow` handles growth.
 
-Native callees take the same path through `enter` into `native_enter`. The fast
-entries of `ff.rs` are not reached; their work is done by intrinsics (section 12)
-when the callee is known at compile time, and by the full builtin otherwise.
+Native callees take the same path through `enter` into `native_enter`. In
+milestone 2 the fast entries of `ff.rs` are not reached; their work is done by
+intrinsics (section 12) when the callee is known at compile time, and by the full
+builtin otherwise. That makes a builtin without an intrinsic slower to call from
+a region than from the interpreter, whose `CALL` reaches the fast entry: a
+`coroutine.resume`/`yield` switch costs about 70 cycles from a region and 31
+interpreted (17.2). Milestone 3 gives each fast entry a core that takes a written
+header as `enter` does (the callee in word 0, the continuation in word 1, the
+arguments from the header plus 4, `nargs` in `insn`), with today's CALL-word
+adapter in front of it for the interpreter. `enter`'s native arm tails the core
+when the native has one (a load and a branch), and a region whose callee is a
+known native without an intrinsic tails the core directly. A fast entry that
+returns does so through header word 1, which for a region is its resume point,
+so `coroutine.resume`, `yield`, `pcall`, `xpcall` and `coroutine.wrap`'s
+functions keep compiled code on both sides of the switch, as LuaJIT's traces
+stitch around its assembler fast functions (17.3 C3).
 
-Direct calls to a compiled callee: when the callee value is a compile-time
-constant (section 7.5) whose prototype has a live `JIT_ENTRY` region, the region
-jumps to that region's entry after writing the header itself, with the window and
-arity checks inlined (the callee's `max_stack_size` and `fixed_arity` are known).
-This skips `enter`'s loads and tests and the `JIT_ENTRY` dispatch. The target
-address is patched through the callee's `JitState` when the callee region is
-retired (section 11.4); until the patch the old region stays valid. This is
-milestone 3 work; the design only requires that the header and its resume point
-are the same whichever way the callee was entered.
+**Fast calls (J10, milestone 3).** Every call above pays `enter` (31
+instructions: the callee's kind, the window, the arity), the callee's `JIT_ENTRY`
+dispatch and `op_jit_entry` (4 more, two dependent indirect branches), a frame pop
+and push, and a return through an indirect `br` that the return-address stack
+never predicts: 5-32% of the cycles of most benchmarks (17.2). Between compiled
+functions a call is a native call instead:
+
+- *Dispatch's entry.* The executor enters dispatch through `dispatch_entry`
+  (`backend/aarch64/abi.rs`), which records the stack pointer, frame pointer and
+  return address every handler runs with in `JitRuntime::native` (`NativeBase`),
+  and a stack limit `FAST_STACK` (256 KiB) below it; a nested dispatch records
+  its own and the outer one's are restored when it returns. Every way out of a
+  region into the interpreter (calls through `enter`, `Dispatch`, `TAILCALL`'s
+  dispatch, metamethod calls, the entry-fail stub, `exit_common`) restores those
+  three instead of popping its own frame, which drops the frames of any compiled
+  callers under it. So the interpreter, natives, coroutine switches, the unwinder
+  and the collector always run at dispatch's entry with no compiled frame below
+  them, as before.
+- *The caller.* After the header words (word 0, the callee value, already in its
+  slot as R1 stores it), a `CALL` tests that the callee is a function, a Lua
+  closure without varargs (the niche byte, 5.5) whose prototype has a fast
+  entry (`Prototype::jit_fast`, set while a function region at pc 0 is installed
+  and cleared when it is marked for recompilation, retired or blacklisted),
+  rewrites word 0 to the closure as `enter` would, advances `base`, sets
+  `closure` and `insn` (the argument count) and calls the fast entry with `blr`,
+  keeping its own frame. Anything else is the slow path above.
+- *The callee's fast entry*, before the region's prologue, checks what `enter`
+  would: the window against `max_stack_size`, the arity against `num_params`,
+  and the stack pointer against the limit. A miss puts word 0 back to the callee
+  value, restores the caller's `base` and `closure`, resets the native stack and
+  takes the caller's slow path through `enter`, which grows the stack or fills
+  the missing parameters; the caller then resumes through its header.
+- *Returns.* A frame a compiled caller entered holds that caller's return
+  address; any other holds dispatch's. `RETURN` pops the frame and compares: a
+  compiled caller's frame returns with `ret`, `insn` and `pc` set as for a
+  header return; any other returns through header word 1 as before.
+- *Deep chains.* The return address stack holds about 48 entries on the M4: a
+  recursion 64 calls deep costs 32 cycles per call with `ret` against 13 with
+  an indirect `br`, which the branch predictor follows. Below `RAS_STACK`
+  (512 bytes) under dispatch's entry a caller therefore branches with `br` and
+  a return address tagged in bit 0, and a tagged frame returns with `br`; the
+  return address stack then stays right for the shallower frames' `ret`s.
+  (`ret` alone made fixpoint-fact, about 100 calls deep, 8% slower than the
+  old protocol; with the tag it is level, and binary-trees keeps `ret`'s 13%.)
+- *Metamethod calls and tail calls.* `CallMm` takes the same fast path from
+  its header at `max_stack_size`. A `TAILCALL` whose callee has a fast entry
+  pops this frame and branches to it with the frame's return address, so the
+  callee returns where this frame would have.
+- *Resume.* Each resume block has a second label past its frame push, where a
+  fast callee's `ret` lands (the caller's frame is still open). Both reload
+  `base` and `closure` from the callee's header and land the results the same
+  way, and nothing but constants lives across the call (R6), so the fast path
+  needs no other change to the IR.
+
+Measured 2026-10-11 against the milestone 2 protocol (LJR suite, median of 3
+interleaved rounds, f9b7039 and baad547 against dc2266a): 4.5% fewer cycles over
+the suite (geomean of 16); recursive-fib-uv 1.42× (12.9 to 9.2 cycles per call),
+binary-trees 1.17×, recursive-fib-gv 1.15×, richard 1.07×, ray 1.05×, json
+1.04×. Two lose a little, both where the chain cannot stay fast:
+coroutine-ring 3.5% (every `resume`/`yield` call pays the callee test before its
+slow path, until the builtins' header cores below exist) and mandel-metatable
+about 2.5% (its metamethods call `setmetatable`, a native, which drops the chain
+the metamethod call built). deltablue and havlak are within their run-to-run
+spread. What remains per call is the dynamic callee test, the fast entry's
+checks and the reloads after the resume, which a known callee and values kept
+across the call remove; keeping frames across a visit to the interpreter (16)
+keeps chains that call natives fast:
+
+- *Known callees* (direct calls): a constant upvalue (7.5, any by-value upvalue
+  never assigned after capture), a global read through `_ENV`'s IC, a method
+  from a `_PROTO` holder's or a receiver's own slot, a closure the region itself
+  created, and per-site callee feedback (17.4 D1). The identity is guarded once
+  and hoisted when invariant; the window and arity are checked against the
+  callee's known sizes in the caller, and the call goes to a second entry past
+  the checks.
+- *Values across calls.* With the frame kept, values could stay in callee-saved
+  registers and spill slots across a fast call and skip the reload and re-guard
+  after it; that needs a resume edge that carries values (R6 holds only for the
+  slow resume) and the `debug.setlocal` flag of 17.4 D4.
+- *Later*: a typed entry past the entry guards for callers that prove the
+  arguments' kinds; one result in `x0`.
+
+The header and its resume point are the same whichever way the callee was
+entered, so walkers, the unwinder and `pcall` see no difference.
 
 ### 5.5 Returns and tail calls
 
@@ -730,6 +842,14 @@ vararg callee, `__call`, a frame with something to close, a window that needs th
 stack grown) leaves for the interpreter's `TAILCALL` handler with the frame in its
 slots (`Dispatch`, R1), which does exactly the work that remains, with no exit to
 count or snapshot to restore.
+
+A callee whose prototype has a fast entry (J10, 5.4) is entered there after the
+frame rewrite, with this region's frame popped and its return address kept, so
+the callee returns where this frame would have; the argument count passed is
+the parameter count after the nil fill. Only a callee without one dispatches
+its first word (the opcode-table load, the indirect branch, `op_jit_entry`'s
+entry-table load and a second indirect branch, five dependent loads that were
+on fixpoint-fact's hot path).
 
 ### 5.6 Exits
 
@@ -801,12 +921,19 @@ registers needs rooting: no collection can happen while the region's registers
 hold anything. The region must only make sure the collector gets its chance, which
 it does once per section, as LuaJIT does (`asm_gc_check` at a trace's head and its
 `LOOP`, `lj_asm.c:1691,2587`): at the header of every loop that allocates (an
-allocating helper, a boxed integer outside i32, a call) and at the region's entry
-when code outside every loop allocates, the interpreter's check
-`ldp x9, x10, [metrics]; cmp x9, x10; b.hs gc_exit_K`, a `Before` exit at the
-header's or the entry's pc that leaves through `Exit::Gc`. Garbage then waits at
-most one iteration or one entry, and no allocating instruction needs a snapshot
-of its own (boxes are inserted after the builder, where none exists). Natives
+allocating helper, a boxed integer outside i32, an inline allocation) and at the
+region's entry when code outside every loop allocates. A call is not an
+allocation: the callee checks its own, as the interpreter's allocating handlers
+and `native_enter` do. Milestone 2 counts calls, which costs every calling loop
+and every calling function region a check that never fires on its account
+(fib's entry, 6.7% of qt's `clip`, 7.8% of richard's main loop; 17.3 C2), and
+milestone 3 stops. Every loop header gets a check from the builder, LICM (9.5)
+borrows its snapshot for the exits it hoists, and `prune_gc_checks` removes the
+checks a section does not need only after LICM. The check is
+the interpreter's check `ldp x9, x10, [metrics]; cmp x9, x10; b.hs gc_exit_K`, a
+`Before` exit at the header's or the entry's pc that leaves through `Exit::Gc`.
+Garbage then waits at most one iteration or one entry, and no allocating
+instruction needs a snapshot of its own (boxes are inserted after the builder, where none exists). Natives
 returning through a resume point have already had their check in `native_enter`.
 
 The collector may free objects the region holds only pointers to: between
@@ -1079,12 +1206,12 @@ byte:
 | `ADD_II`, `SUB_II`, `MUL_II` | both operands small (`Guard SMALL` on each, usually already refined); `adds/subs/smull+cmp` with `b.vs`/`b.ne` to a `Before` exit; result `I32` |
 | `MOD_II`, `IDIV_II` | both small; divisor zero and `MIN/-1` deopt; expanded to `sdiv`, `msub`, sign-fix `csel` (section 10.3); result `I32` |
 | `DIV_II`, `POW_II` | both small; convert, `fdiv`/`pow` helper; result `F64` |
-| `_FF` | both float (`Guard FLOAT`: unsigned compare against `BOX`); hardware op; `MOD_FF` and `POW_FF` by helper with a canonical-NaN fixup; result `F64` |
+| `_FF` | both float (`Guard FLOAT`: unsigned compare against `BOX`); hardware op; `MOD_FF` inline with a helper fallback (below), `POW_FF` by helper with a canonical-NaN fixup except `x ^ 2`, which is `x * x` (both are correctly rounded; 2M random doubles agree under lua 5.5.1, while `x ^ 0.5` and `sqrt` differ); result `F64` |
 | `_IF`, `_FI` | one small, one float; `scvtf` the small one; result `F64` |
 | `_NN` and locked generic | no speculation on the operands: the handler's inline cases (both small: `I64` arithmetic, boxed; both numbers: `F64`), then helper `jit_arith(rt, kind, a, b) -> Value or FAIL`, whose `FAIL` is as at a generic site; the helper boxes big integers, which the section's collector check covers (5.7) |
 | generic, in a never-executed block (6.3) | `Deopt(Before)` |
 | generic, byte with integer kinds only | `I64` code (below) |
-| generic, any other nonzero byte | generic code: the handler's inline small/float cases, then `jit_arith`; its `FAIL` (a metamethod or an error) exits with the widenable tag `Mm`, which records `MM` in the byte, and a site whose byte has `MM` calls the metamethod `jit_mm` finds instead (5.4) |
+| generic, any other nonzero byte | generic code: the handler's inline small/float cases, then `jit_arith`; its `FAIL` (a metamethod or an error) exits with the widenable tag `Mm`, which records `MM` in the byte, and a site whose byte has `MM` calls the metamethod `jit_mm` finds instead (5.4). From milestone 4 a byte with numbers only (`SMALL`, `FLOAT`, no `MM`, no `OTHER`) compiles the small and float arms and a widenable type exit for the rest instead of the helper arm, whose call clobbers registers on the hot path (17.3 S2) |
 | a form whose guard a type exit failed (`kind_exits`, 6.4) | generic code |
 | immediate forms `_I`, `_F`, `_IF` | one register operand guarded as the form says; the immediate is a constant (`Imm`: 31-bit int or f32-exact float); `ADDI_I` becomes `adds w, w, #imm` when the immediate fits 12 bits |
 | `ARITH_MM`, `_MM_R`, `_MMI` | the operand with the metamethod `Guard TAB`, its metamethod loaded from its class (`ClassMm`: the shape's class, the class's metamethod array, each possibly null, then the slot at `mm_at(idx)`), guarded not nil, and a call through 5.4 with `ret_store_a` semantics (one result into `R[a]`). With the number on the left (`_MM_R`, `_MMI` with the immediate on the left) it is guarded a number and the numbers' metatable cell must be empty (11.5). Nothing records the metamethod a site called, so it is loaded rather than compared with a compile-time constant; a direct call (13) would add that. A failed guard is a type exit, and the site compiles generically after (6.4) |
@@ -1116,6 +1243,18 @@ recompile gives that site, and the values that flow from it, `I64`. The range
 analysis of section 9.7 removes checks and narrows `I64` back to `I32` where
 bounds prove it.
 
+**Float `%`.** Lua 5.5's float modulo is C's `fmod` with the result moved to the
+divisor's sign (`luai_nummod`), so `-4.0 % 2` is `-0.0` and `5.5 % -math.huge`
+is `-inf` (lua 5.5.1), where LuaJIT's `a - floor(a / b) * b` gives `0` and `nan`.
+The helper's libm `fmod` costs about 90 cycles, 12.9% of richard (Appendix F).
+From milestone 4 the site computes `q = frintm(a / b)` and `r = fmsub(q, b, a)`
+(one rounding, exact when `q` is the true floored quotient), corrects `q` by one
+when `r` falls outside the half-open range between 0 and `b`, gives a zero result
+the dividend's sign as `fmod` does, and calls the helper when an operand is not
+finite or `|a / b| ≥ 2^52`. It ships only after a differential run against
+`fmod` over generated edge cases (signed zeros, subnormals, quotients near the
+limit).
+
 `collatz_bench` meets this policy in milestone 1: 948 of its 1.5M starting values
 leave i32, in 7,408 of 203,419,330 steps (measured with lua 5.5.1). The first
 compile is `I32` (the interpreter has seen no overflow by then); the first
@@ -1131,12 +1270,24 @@ compiled loop boxes none, since `n` never escapes the loop.
 | `JLTI_F` … `JNGEI_F` | float register; `fcmp d, #imm-constant` (`fmov` of the 15-bit immediate hoisted); unordered falls to the not-taken side as the handler's `<`/`<=` do |
 | generic register compare (`JLT`, `JNLT`, `JLE`, `JNLE`) | operands typed by inference or use-driven speculation (9.1): `fcmp`, `cmp w` or `I64` `cmp` with `b.cond`; one typed operand speculates the other to its kind unless the byte saw it differ; byte with integer kinds only: `I64` `cmp`; otherwise generic inline in the handler's order: both floats, both small, then the helper `jit_lt`/`jit_le` (mixed numbers, big integers, strings), which returns 1, 0 or `FAIL` for a metamethod or an error, and `FAIL` deopts `Before`. An `I64` against an `F64` goes to the helper boxed, since converting the integer is not exact |
 | generic `JLTI` … `JNGEI` | a register typed `I32`: `cmp w, #imm; b.cond`; typed `F64`: as `_F`; otherwise as the register compare, with the immediate a constant |
-| `JEQ`/`JNEQ` generic | in the handler's order (`compare.rs:67-71`): two floats by `fcmp` first, since a NaN has its own bits and must not equal itself; then bit identity; then both small (unequal); then `jit_eq` (boxed integers, mixed numbers), whose `FAIL` lets the interpreter run an `__eq` |
+| `JEQ`/`JNEQ` generic | in the handler's order (`compare.rs:67-71`): two floats by `fcmp` first, since a NaN has its own bits and must not equal itself; then bit identity; then both small (unequal); then `jit_eq` (boxed integers, mixed numbers), whose `FAIL` lets the interpreter run an `__eq`. From milestone 4 two more inline cases come before the helper: different type tags other than an integer against a float are unequal (Lua consults `__eq` only for two tables or two full userdata; richard's `x ~= NO_TASK` against a nil upvalue is 50 instructions through `jit_eq` today), and a small against a float compares as `scvtf` and `fcmp` (an i32 converts exactly; `20000000 == 2e7` is true in lua 5.5.1) |
 | `JEQI`, `JNEQI`, `JEQS`, `JNEQS` | inline: small compare, float compare, or bit identity against the interned constant; no metamethod |
 | `JT`, `JF`, `JTSET`, `JFSET` | `sub x, v, x_nil; cmp x, #2; b.lo/hs` with `NIL` hoisted; the `SET` forms assign on one edge (an edge block param, as the old `edge_defs` did) |
 
 A compare whose operands the inference proves `I32` or `F64` loses its guards; the
 compare of a loop counter against its `last` is the common case.
+
+Compare sites record kinds only on their slow paths (4.8), and the fast paths of
+the generic compares handle two floats, so a compare that has only ever seen
+floats has a zero byte: it compiles to the three-arm generic compare with a
+`jit_lt`/`jit_le` arm, whose call makes the allocator spill around it. Every
+compare in qt's `clip` and table-sort-cmp's `lhs.x ~= rhs.x` are such sites
+(Appendix F). From milestone 4 their operands are typed from their definitions
+where 9.1 can (field and table loads that other uses type, parameters whose
+entry types come from the live frame at a loop entry and from the callers'
+direct-call argument kinds), and a compare whose operands nothing types records
+its operands' kinds once, on its first execution, with the cost measured with
+the JIT off as 6.1's counters were (17.3 S1).
 
 ### 7.4 Fields
 
@@ -1168,6 +1319,31 @@ receiver is loop-invariant and whose body writes no shape, which a loop of store
 into existing fields does not (section 9.5). The class-bit reads are `R_META` and
 hoist the same way.
 
+**Chains resolved at compile time (milestone 4).** `_PROTO` covers one hop. A
+deeper chain (deltablue's `c:output()` two hops, `c:inputs_known()` three) and a
+nil own slot under a metatable with `__index` (deltablue's `v.determined_by`)
+take the `jit_index` walk on every execution: 23% of deltablue's cycles, 354
+instructions for a two-hop `o:get()` against LuaJIT's 6 (Appendix F). Each hop
+compiles as `_PROTO`'s does: the class's `__index` loaded and compared with the
+table found at compile time, that table's shape guarded, then the key's slot
+loaded or, absent, the next hop; an absent key at the end of the chain is nil
+without a call. The guards are loads and compares of `R_META` and `R_SHAPE`
+that GVN shares between sites on the same receiver and LICM hoists. A chain that
+changes at run time fails a guard, a shape exit that records and widens as any
+other. V8's validity cells (one load and compare per site, invalidated by any
+write to a prototype's shape) are the alternative if guard chains grow long.
+
+**Several shapes.** A site that saw two shapes tests both at every access on
+the receiver, because the paths merge again at each join: deltablue's
+`EqualityConstraint:execute` is 2304 bytes after three compiles, json's
+`Parser:read` 3072. Tail duplication (9.11) after the first dispatch on a
+receiver keeps one shape per path until the next call or loop header.
+
+**Aux slots.** Objects built by `setmetatable({}, mt)` and then filled keep all
+their fields in aux storage, one more load per access. Sizing a `NEWTABLE`'s
+template from the transitions its tables take (allocation-site slack tracking)
+puts them inline; this is runtime work outside the JIT (17.3 F3).
+
 ### 7.5 Globals, upvalues, constants
 
 `GETTABUP` on `_ENV` is the field path of 7.4 with the receiver loaded from the
@@ -1180,6 +1356,19 @@ every path uses it. The same holds for a global read through a `_INL` IC entry o
 `_ENV`'s shape: the loaded function is compared against the constant seen at
 compile time. `SETUPVAL` stores through the cell with the thread-or-cell barrier
 (`UpvalueCell::barrier_target`) done by a helper.
+
+From milestone 4, as LuaJIT's `rec_upvalue_constify`: an upvalue the compiler
+marks never assigned after its capture (a per-upvalue flag in the prototype) is a
+constant of the closure for every type, not only functions, strings and tables;
+it is guarded once per entry and never reloaded or re-tested after a resume.
+richard and qt reload such upvalues and re-test their types after every call
+today, about 15 instructions each (Appendix F). `SETUPVAL`'s barrier tests the
+mark bit inline, as 5.7's table barrier does, and calls the helper only when the
+target is black (chameneos calls it on every store today). A global read after a
+call reloads `_ENV`, re-tests its tag and shape and reloads the slot (13
+instructions, twice per node in recursive-fib-gv); a cell per global that holds
+the value and is invalidated on write (V8's `PropertyCell`) would make it a
+constant; that needs its own design (17.3 F5).
 
 `LOAD`, `LOADI`, `LOADNIL`, `LFALSESKIP`, `MOVE` are constants and copies in SSA
 and emit nothing by themselves.
@@ -1199,14 +1388,43 @@ and emit nothing by themselves.
 | `TFORCALL` generic | a call (5.4) through `ret_tfor` semantics landing `count` results |
 | `CLOSURE` | helper `jit_closure(rt, thread, base, proto_idx)` that does what `op_closure` does, including open upvalue creation and the `HAS_OPEN` flag; an allocation for 5.7; captured registers are stored before it (5.11) |
 
+Changes from the measurements (17.3; milestone in brackets):
+
+- **Array reads [4].** The nil and out-of-bounds arms call `jit_index`, which is
+  declared `MAY_ALLOC | W_SHAPE | W_META` but only reads (raw gets and the
+  `__index` walk; a function `__index` returns `FAIL`). Declared read-only, its
+  arm keeps no collector check at the loop header and ends no fact. The builder
+  reuses an earlier `GETTABLE` site's result for the same table and key with no
+  write between them, as `field_loads` does for fields, so queen's three `a[i]`
+  reads per iteration become one. The arms' calls go through 10.5's cold stubs,
+  and a value only an arm uses (the boxed key) is computed inside it. An index
+  that is a loop counter checks `asize` against the loop's `last` once before
+  the loop (9.7).
+- **Appends [6].** `SETTABLE` at `asize` with capacity left stores and bumps the
+  size inline instead of calling `jit_newindex` (havlak's `Vector:append`).
+- **`NEWTABLE` [6].** A template of known size is bump-allocated inline: the
+  header, the template's shape and its initial values are written directly, with
+  no `from_template` call, no nil fill of slots the following stores overwrite
+  (`memset_pattern16`, 12.5% of binary-trees), and no barrier or shape guard on
+  the fresh table, which is white and has the template's shape. A
+  `setmetatable` with a constant metatable right after it allocates with the
+  shape that transition gives (12). The allocation is an allocation for 5.7.
+- **`CLOSURE` [6].** A closure whose upvalues are all by-value or already open
+  is allocated inline (prototype, header, upvalue words); creating a new open
+  upvalue stays in the helper. fixpoint-fact's `jit_closure` is 42% of its
+  cycles, 17 cycles a closure.
+- **Sinking [6].** A table or closure that does not escape the region after
+  inlining is not allocated at all (9.10).
+
 ### 7.7 Calls
 
 | Site | Code |
 |---|---|
 | `CALL*`, `CALLS*` with an unknown callee | the sequence of 5.4; the callee value is loaded from its SSA value and stored to `R[a]` |
 | callee a compile-time constant native with an intrinsic | section 12 |
-| callee a compile-time constant Lua closure with a live function-entry region | direct call (5.4, milestone 3) |
-| `b == 0` (arguments up to `top`) | milestone 1 deopts; later the count comes from `thread.top` |
+| callee a known native without an intrinsic | milestone 3: its fast entry's header core, else `enter` (5.4) |
+| callee a known Lua closure (5.4's sources) | direct call (5.4, milestone 3); inlined when 13's conditions hold (milestone 5) |
+| `b == 0` (arguments up to `top`) | the count from `thread.top` (`jit_top_args`); when the arguments end in a call whose callee is known to return one value, the inner call is compiled with `c == 2` and the outer one with a constant count, so `math.sqrt(f(x))` reaches its intrinsic (17.3 B2) |
 | `TAILCALL` | 5.5 |
 | `RETURN*` | 5.5 |
 
@@ -1641,6 +1859,13 @@ makes the read valid (a shape guard before a slot load). In a loop that calls
 (`Call`, `CallMm`), only what the call-boundary pass rematerializes after a call
 moves (9.8): constants, pool loads, slot unboxes, refinements.
 
+LICM takes the snapshot of a hoisted exit from the header's `GcCheck`, which
+the builder puts at every loop header and `prune_gc_checks` removes only after
+LICM, so pruning the checks of loops that only call (5.7) does not stop hoisting.
+queen's `c - n` and `c + n` (an `ISub`/`IAdd` with an overflow
+exit, both operands parameters of the function) stay in its inner loop today;
+milestone 4 finds which condition keeps them (17.3 Q6).
+
 ### 9.6 Dead code elimination and narrowing
 
 Unused pure instructions are deleted; `Box` of an `Unbox` and `Unbox` of a `Box`
@@ -1649,7 +1874,7 @@ definition when the definition is a boxed `I32` producer (narrowing of block
 parameters: a parameter whose every incoming argument is `Box(I32)` becomes an
 `I32` parameter with the boxes moved to the uses that need `Val`).
 
-### 9.7 Range analysis (milestone 3)
+### 9.7 Range analysis (milestone 4)
 
 Interval analysis over `I32` values: constants, `FORPREP` bounds (`last` and the
 step give the counter's range), compares on dominating edges, `asize` bounds for
@@ -1658,7 +1883,14 @@ i32 becomes the `No` form without the overflow branch; an `I64` value whose rang
 fits i32 is narrowed to `I32`, which boxes with one `orr` instead of a range test;
 an array index proven in `[0, asize)` by a dominating compare loses its bounds
 check. This is V8's
-`maglev-range-analysis` idea scoped to what Lua loops need.
+`maglev-range-analysis` idea scoped to what Lua loops need. An index that is a
+loop counter, or the counter plus a constant, has its bounds check replaced by
+one check of the loop's range against `asize` in the preheader when the loop
+writes no array size (LuaJIT's `rec_idx_abc`, `lj_record.c:1398-1435`, with the
+scalar evolution of the `FORL` counter); the
+exit is the header's, so a loop that would go out of bounds deopts at its entry
+and runs in the interpreter. fib's `n - 1` and `n - 2` lose their overflow checks
+on the `n >= 2` edge.
 
 ### 9.8 Call boundaries, snapshot pruning and critical edges
 
@@ -1679,6 +1911,12 @@ definition that reaches them (Braun et al.'s lookup, with block parameters where
 both meet); afterwards the verifier allows nothing live into a resume block.
 Milestone 2 adds pool loads, slot unboxes and refinements, which LICM moves out of
 loops that call.
+
+A rematerializable value used after resumes in several blocks is re-emitted at
+each use rather than merged into block parameters: richard's main loop header
+carries eight such parameters (an upvalue, three booleans derived from it, its
+unboxed float, the constants 2 and 0), which the allocator keeps in spill slots
+(one reload is 9.6% of that region's samples; 17.3 Q4).
 
 Snapshots are then re-pruned against the final code: an exit's snapshot drops a
 register whose value is a load of that register's own slot (through boxing, guards
@@ -1701,6 +1939,54 @@ loop bodies fall through; the exit stubs follow in the cold section (10.6).
 Irreducible graphs, which Lua's `goto` can produce, are rejected before, by the
 bytecode CFG (`cfg.rs`): such a region fails compilation with an internal limit
 and is counted as a strike (6.2), never mis-compiled.
+
+An empty block that only jumps is threaded away before layout: branches to it
+go to its target. Milestone 2 leaves branch-to-branch chains at the joins that
+the arms of generic sites and array reads make (six taken jumps per iteration
+of queen's inner loop; 17.3 Q5).
+
+### 9.10 Allocation sinking (milestone 6)
+
+After inlining (13), a table or closure the region allocates (7.6's inline
+`NEWTABLE` and `CLOSURE`) whose result does not escape is not allocated: its uses are loads and stores of constant slots (a template's
+named slots, array slots with constant keys), `setmetatable` with a constant
+metatable, the identity tests of inlined calls, and snapshots. LuaJIT's
+`lj_opt_sink.c` is the model: it sinks three of the four tables per iteration of
+mandel-metatable and records `setmetatable` as one store. In tcvm:
+
+- *Analysis.* A value escapes when it is stored anywhere but into a sunk
+  object's slot, passed to a call or a helper, returned, stored to a home slot at
+  a tail-out (R1), compared by identity with anything but a constant, or carried
+  around a loop's back edge (a loop-carried table, like mandel's `z`, stays
+  allocated, as in LuaJIT). The analysis is a fixpoint over the values' uses,
+  linear in the IR.
+- *Replacement.* Each slot of a sunk object becomes an SSA value; GVN's store
+  forwarding (9.4) already gives every load its stored value, so the loads
+  disappear and the stores become dead.
+- *Snapshots.* An exit whose snapshot refers to a sunk object materializes it:
+  the snapshot gets an object entry (Appendix C: kind table or closure, the
+  template or prototype, then one entry per slot), and `jit_exit` allocates and
+  fills the object before writing the home slots. Objects referring to each other
+  are allocated first and linked after. Nothing needs rooting, since no
+  collection runs between tail-outs (5.7).
+- *Order.* After inlining, GVN and LICM; before the call-boundary pass, which
+  must not see a sunk value live across a tail-out (a sunk value live there
+  escapes and is not sunk).
+
+Estimates (Appendix F): mandel-metatable from 272 to 30-40 cycles per iteration
+(LuaJIT 135, C with value structs 9), fixpoint-fact's two closures per
+recursion level once its calls are inlined.
+
+### 9.11 Tail duplication (milestone 4)
+
+J4 kept block duplication in reserve; the measurements call for one use of it. A
+receiver that a site dispatched on two or three shapes is tested again at each
+later access, because the arms join after every access. From the first dispatch
+on a receiver to the next call, loop header or join that brings in a different
+receiver, the blocks are duplicated per shape, so each path keeps one shape
+(GVN then removes the later tests). The duplication is bounded by a budget of
+IR instructions per region (13's budget counts it), and a site over the budget
+keeps the per-access dispatch.
 
 ## 10. The aarch64 backend
 
@@ -1808,6 +2094,20 @@ compares and selects, so the second target lowers only primitives. The patterns
 that fuse compare and branch, immediates and addressing modes are the per-target
 part.
 
+What milestone 2's code shows the lowering still lacks (Appendix F; milestone 4):
+
+- A branch on a boolean, or on a select of type tests, materializes it
+  (`cset; cmp; b.eq`, `cset`/`csel` chains in generic `==`); it should branch
+  directly (`tbz`/`cbz`, or one conditional branch per test). GVN folds the
+  selects the generic arms leave (`select(c, c, false)`, `select(c, k, k)`)
+  before lowering.
+- `Guard(SMALL | BIGINT)` followed by `Unbox{I64}` tests smallness twice; the
+  pair lowers as one test.
+- Wide constants (`BOX`, `NIL`, tag words) are not shared within a call-free
+  span as the table above says: one ray region materializes the `BOX` bound 25
+  times. A per-span constant cache in the lowering, invalidated at calls.
+- A compare that folded its immediate leaves the `mov` of the constant dead.
+
 ### 10.4 Register allocation with `regalloc2`
 
 The VCode implements `regalloc2::Function`: instructions in block order,
@@ -1833,6 +2133,15 @@ Snapshot references after allocation: for each guard, its snapshot entries that
 were allocator uses are rewritten from the guard's `allocs` (a register image
 slot index or a spill slot); constant and rematerializable entries are untouched.
 
+Measured at milestone 2 (17.7): `Ion` costs 0.4-0.8 µs per IR instruction, about
+a third of compile time; `Fastalloc` is 4-13× faster but its code retires
+10-51% more instructions, so it stays a comparison tool. Two things inflate the
+allocator's work and its spills: helper calls on cold arms, which clobber the
+caller-saved registers at every hot-path value live across them (fixed by the
+cold stubs of 10.5), and constants and block parameters that could be
+rematerialized (9.8). If `Ion` still costs too much after both, the option is a
+linear scan for straight-line function regions with `Ion` kept for loops.
+
 ### 10.5 Prologue, frame, tail-outs
 
 ```
@@ -1855,6 +2164,16 @@ Spill slots are `[x29 + 16 + i*8]`. Helper calls (`bl`) are made with sp 16-byte
 aligned (`F` is a multiple of 16) and x29 a valid frame pointer, so a Rust panic
 or a profiler walking from inside a helper sees a normal chain. The exit routine
 reads spill slots through x29 before popping.
+
+The frame is pushed at entry and at every resume through a header. Since J10 a
+tail-out does not pop it: it resets the stack pointer, frame pointer and return
+address to dispatch's entry (`NativeBase`, 5.4), which drops this frame and those
+of any compiled callers under it; a fast call keeps it, and the callee's `ret`
+lands past the resume block's frame push. A region's `RETURN` pops its own frame
+and returns with `ret` when the frame holds a compiled caller's return address.
+Helper calls on cold arms go through out-of-line stubs that save the
+caller-saved registers the hot path keeps live, so the allocator sees no clobber
+on the hot path and does not spill around a call that rarely runs (17.3 Q1).
 
 ### 10.6 Exits and the code segment
 
@@ -2105,10 +2424,10 @@ refinement is guarded by a pointer compare, hoisted when loop-invariant.
 | `select('#', ...)`, `select(n, ...)` | with a constant selector and one result: from the arguments, or from `nv` and the extras when a `VARARG` up to `top` is the instruction before (the builder keeps the callee and the selector across its slot reloads) | |
 | `pairs(t)` | `(next, t, nil)` as `ff_pairs` when `jit_mm` finds no `__pairs`; feeds `TFORPREP`, whose `_NEXT` form the region then compiles | `__pairs` present |
 | `ipairs(v)` | `(ipairs_iter, v, 0)` | |
-| `setmetatable(t, mt)` | helper (`set_metatable_fast`, else `set_metatable` for a table without one), an allocation for 5.7 | a metatable already set, a nil one |
+| `setmetatable(t, mt)` | helper (`set_metatable_fast`, else `set_metatable` for a table without one), an allocation for 5.7; from milestone 6, `t` a `NEWTABLE` of the region and `mt` a constant: the allocation takes the shape with the metatable (7.6), no call; `mt` a fresh `{__index = K}` per object (havlak's `Vector.new`, json's values: 6-9% of their cycles in `adopt` and `join_by_memo`): a memo from the template and `K` to the class and shape | a metatable already set, a nil one |
 | `getmetatable(t)` | helper, the `__metatable` field honoured | |
 | `assert(v, ...)` | truthiness test; the arguments are the results | falsy |
-| `string.sub`, `string.byte`, `string.len`, `#s` | helpers (allocation for `sub`), small-integer positions, `byte`'s first result only; `#s` is `LEN` (7.6) | other positions |
+| `string.sub`, `string.byte`, `string.len`, `#s` | helpers (allocation for `sub`), small-integer positions, `byte`'s first result only; `#s` is `LEN` (7.6). A one-byte `sub` result comes from a table of the 256 preinterned one-byte strings (two loads; json interns one per character today) | other positions |
 | `tostring(v)`, `tonumber(v)` | helpers, one argument | `__tostring` |
 | `pcall`, `xpcall`, `error`, `coroutine.*`, `string.format`, `table.*` | no intrinsic: an ordinary call through `enter` | |
 
@@ -2119,11 +2438,32 @@ ordinary call. Where a helper declines (the last column), the `CALL` is a call o
 that builtin in an arm that joins the inline result, rather than a deopt: such an
 exit never widens, and would fire on every call of the site that meets the case.
 
-## 13. Inlining (designed now, built later)
+The callee and the selector are looked up when the `CALL` is built. When an
+argument is a field load whose nil arm joins before the `CALL` (any receiver
+with `__index`), milestone 2 finds the join's block parameter instead of the
+callee and compiles a plain call: json's `self.input:sub(self.index,
+self.index)` is a full native call, about 20% of its cycles (17.3 B1). The
+lookup must see through parameters whose incoming values are all the same, as
+`simplify` would make them, before deciding.
 
-A `Call` whose callee is a constant Lua closure (7.5) with a small prototype (at
-most `INLINE_LIMIT = 40` instructions, not vararg, no `TBC`, no `CLOSURE` capturing
-its parameters by reference, no `TAILCALL`) can be inlined at milestone 3:
+`table.sort` stays a native (17.4 D2 asks whether the JIT should see a sort
+written in Lua instead): its comparator calls go through `stage_call`, which
+from milestone 3 enters the comparator's region directly (17.3 C5).
+
+## 13. Inlining (milestone 5)
+
+Inlining is the largest remaining factor on the call-heavy benchmarks (17.3 I1):
+LuaJIT's traces inline four levels per sphere test in ray (273 instructions
+against tcvm's 1266), seven functions in richard's scheduler, every metamethod
+and constructor of mandel-metatable, and two levels of fib's recursion. It was
+designed with milestone 1's snapshots (J8) and is built after direct calls,
+whose callee identity it uses.
+
+A `Call` whose callee is a known Lua closure (5.4's sources: a constant upvalue
+or global, a `_PROTO` holder's or own slot, a closure the region created, callee
+feedback; 17.4 D1) with a small prototype (at most `INLINE_LIMIT = 60`
+instructions, not vararg, no `TBC`, no `CLOSURE` capturing its parameters by
+reference, no `TAILCALL` other than to itself) is inlined:
 
 - The callee's register `r` maps to caller slot `a + 4 + r`, the slot the callee
   frame would have had (`base + a + 4 + r`), with the window check for
@@ -2140,8 +2480,28 @@ its parameters by reference, no `TAILCALL`) can be inlined at milestone 3:
 - The hot-exit and recompile machinery is unchanged: an exit inside an inlined
   body has a two-frame snapshot and its site feedback is recorded on the callee
   prototype's pc.
+- Multiple results: a callee `RETURN` of `n` values jumps to the continuation
+  with `n` block parameters, and `wanted` selects among them (ray's `vsub` and
+  `mul` return three, qt's `f` four); a callee with a `RETURN` up to `top` is not
+  inlined.
+- Metamethod callees: an `ARITH_MM` or `__index`-function site whose metamethod
+  is known (17.4 D6: from callee feedback, or from the class when the operand's
+  shape is known at compile time) guards it with `GuardSame` on the loaded
+  metamethod and inlines it like a call with the operands as arguments
+  (mandel-metatable's `__mul` and `__add`).
+- Recursion: a call of the region's own prototype is inlined up to
+  `RECURSION_UNROLL = 2` levels, the innermost level a direct call (5.4). This is
+  LuaJIT's up-recursion unrolling, which lets it beat C's per-call cost on fib.
+- Calls created in the region: the callee of a call through a closure the
+  region allocated has the `CLOSURE`'s prototype, so fixpoint-fact's
+  `f(f)(x)` chain inlines, and its closures then sink (9.10).
 
-Budget: inlining depth 2, total inlined instructions per region 120.
+Budget: depth 4, `INLINE_LIMIT` bytecodes per callee, and at most 1500 IR
+instructions per region after inlining and tail duplication (9.11), counted in
+IR instructions rather than bytecodes because that is what compile time follows
+(17.7). ray's main region is already 1631 IR instructions without inlining, so
+the budget picks the hottest call sites first (by the callee's call count, 6.1)
+and stops inlining before a region reaches `MAX_INSTS`.
 
 ## 14. Tooling and testing
 
@@ -2157,6 +2517,14 @@ Environment variables, read once at `Lua` creation:
 | `TCVM_JIT_FASTALLOC=1` | the single-pass allocator |
 | `TCVM_JIT_ONLY=proto-name` | compile only prototypes whose source name matches |
 | `TCVM_JIT_TIME=1` | one line per compile with its IR size and each stage's time |
+
+The analysis of section 17 used a diagnostic build whose `TCVM_JIT_LOG` also
+prints each exit's count at every power of two, each region's code address and
+size, and the address of one helper (to find the image's slide), and scripts
+that map a cycle-sampled `xctrace` profile onto regions and instruction offsets
+through that log and `TCVM_JIT_DUMP=asm`. Milestone 3 makes that logging part of
+`TCVM_JIT_LOG`, so the per-benchmark tables of Appendix F can be regenerated at
+each milestone.
 
 `Lua::set_jit(bool)` turns compiling on or off for one state, as LuaJIT's
 `jit.on`/`jit.off` do; installed regions stay. Tests whose premise is
@@ -2218,12 +2586,44 @@ pass for its coverage and its measurements are recorded.
    versus the interpreter and LuaJIT recorded in the perf notes. This was two
    milestones until 2026-10-10: the first one's exit benchmarks, `fft` and `nbody`,
    are array and field code, which only the second compiled.
-3. **Calls.** Direct calls to compiled entries with patching, inlining (13),
-   `pcall` through `enter`, range analysis (9.7). Exit: the LJR call-heavy
-   benchmarks (`fib`, `richards`, `deltablue`, `havlak`) measured against the
-   interpreter and LuaJIT.
-4. **x86-64.** The second target per Appendix E, run under Rosetta for
-   correctness.
+3. **Calls.** Revised 2026-10-11 after the measurements of section 17, which
+   reorder the rest of the plan: calls first, since every benchmark pays them
+   and their callee identity is what inlining builds on. Direct calls with
+   patching and direct tail calls (5.4, 5.5, 11.4); callee feedback (17.4 D1);
+   the builtins' fast entries as header cores, so regions reach them (5.4);
+   `stage_call` into compiled entries (12); no collector check for calls (5.7);
+   native fast calls with droppable frames (J10, 5.4) and cold-arm stubs
+   (10.5); single-result landing and a typed entry for known callees (5.4); `pcall` through `enter`; the callee-lookup fix
+   and `b == 0` intrinsics (12, 7.7). Exit: `enter` and `op_jit_entry` under 2%
+   of the cycles of every LJR benchmark whose callees are known; coroutine-ring
+   and chameneos faster compiled than interpreted and at or ahead of LuaJIT;
+   recursive-fib-uv at most 6 cycles per call; json's `s:sub` the intrinsic.
+4. **Speculation and code quality.** Compare kinds (7.3), number-only generic
+   arms, equality by tags, mixed compares, inline float `%` and `x ^ 2` (7.2),
+   constant upvalues of every type and the inline `SETUPVAL` barrier (7.5),
+   `__index` chains resolved at compile time and tail duplication for
+   polymorphic receivers (7.4, 9.11), precise helper effects and array-site
+   reuse (7.6), the lowering fixes (10.3), rematerialization at uses (9.8), jump
+   threading (9.9), LICM of guarded arithmetic (9.5), range analysis and bounds
+   checks against the loop limit (9.7). Exit: queen's instructions within 10% of
+   LuaJIT's; qt, richard and json ahead of LuaJIT; `jit_index` under 3% of
+   deltablue; spill instructions per hot region reported for ray, qt and queen.
+5. **Inlining** (13), with metamethod callees (17.4 D6) and recursion
+   unrolling. Exit: recursive-fib-uv/gv, ray, queen and richard ahead of LuaJIT;
+   the LJR geomean at least 1.5× LuaJIT; compile time within 17.1's targets.
+6. **Allocation and sinking.** Inline `NEWTABLE` and `CLOSURE`, appends,
+   `setmetatable` at allocation and its memo (7.6, 12), allocation sinking
+   (9.10). Exit: mandel-metatable at least 2× LuaJIT; binary-trees, havlak and
+   fixpoint-fact further ahead; the LJR geomean at least 2× LuaJIT (17.1).
+7. **x86-64.** The second target per Appendix E, run under Rosetta for
+   correctness. (Milestone 4 until the 2026-10-11 revision.)
+
+Every milestone from 3 on records, besides its exit benchmarks, the whole LJR
+suite and the design benchmarks against the interpreter and LuaJIT, compile time
+per IR instruction and per benchmark (17.7), and the exits per benchmark
+(Appendix F), so a change that helps one benchmark and costs another shows. The
+items outside the JIT (17.8) are decided separately; they bound table-sort and
+part of json and havlak whatever the JIT does.
 
 Compile-time budgets, measured in milestone 1 on a 200-instruction function on
 the M4 Pro: builder 10 µs, passes 15 µs, lowering 10 µs, allocation 25 µs
@@ -2241,6 +2641,9 @@ budget. The first measurement had them at 137 µs for 188 instructions, 40% of i
 in malloc, which the storage of 8.1 removed; what remains is the fixpoints of
 inference (all instructions up to 50 rounds), the per-parameter scans of
 narrowing, list moves on insertion, and the speculation pass's dataflow.
+At the end of milestone 2 the whole pipeline runs at 1.0-2.0 µs per IR
+instruction over the LJR suite's regions, passes 0.5-0.9 and allocation 0.4-0.8
+(17.7); the budget from here on is section 17.1's 0.5 µs per instruction.
 
 Measured at the end of milestone 2 (2026-10-11 at `e43dc0a`, before the review's
 changes to the metamethod forms, `LEN`, string methods and `next`; the LJR suite,
@@ -2251,7 +2654,10 @@ havlak 2.8×, binary-trees 2.6×, deltablue 2.1×, table-sort-cmp and qt even.
 Behind: recursive-fib-uv 3.3×, ray 3.0×, mandel-metatable and recursive-fib-gv
 2.2×, queen and chameneos 1.7×, table-sort 1.6× (its printing, which tcvm does not
 buffer), coroutine-ring 1.5×, json 1.3×, richard 1.2×. coroutine-ring and
-chameneos run 13% and 15% slower compiled than interpreted.
+chameneos run 13% and 15% slower compiled than interpreted. Re-measured after the
+review's changes at `dc2266a`: compiled code 1.45× the interpreter, LuaJIT 1.14×
+faster than it; json and qt now even with LuaJIT, mandel-metatable 2.0× behind
+(Appendix F, with the analysis in section 17).
 
 ## 16. Risks and open questions
 
@@ -2270,7 +2676,10 @@ chameneos run 13% and 15% slower compiled than interpreted.
   scan on `mix2`'s loops; `Ion` splits live ranges and should do as well, but
   this is checked in milestone 1 on the old `mix`/`mix2` sources. If it loses,
   the fix is in isel (rematerialization of constants and unboxes, which `Ion`
-  lacks), not a return to the old allocator.
+  lacks), not a return to the old allocator. Milestone 2's code confirms the
+  rematerialization half (constants and rematerializable block parameters in
+  spill slots, 9.8) and adds the cold helper calls that clobber the hot path's
+  registers (10.5); `Ion` is also a third of compile time (10.4, 17.7).
 - **Retired region memory**: regions live until their prototype dies (11.2). A
   program that recompiles a long-lived prototype many times holds a few KiB per
   recompile, bounded by `MAX_COMPILES` per prototype (6.4).
@@ -2289,9 +2698,470 @@ chameneos run 13% and 15% slower compiled than interpreted.
 - **Snapshot-only values across calls**: a value live only in snapshots after a
   call is rematerialized from its home slot (it was stored by R1), so it is never
   an allocator use after a call.
+- **Compile time under inlining and sinking**: inlining grows regions 2-3×,
+  tail duplication and sinking add more, and compile time follows IR size at
+  1-2 µs per instruction today (17.7). The IR budget of 13 bounds a region, the
+  per-pass budgets of 17.3 T1 bound the rate; a benchmark whose compile share
+  passes 2% is a regression like any other (15).
+- **Native stack use of fast calls** (J10): a chain of compiled calls holds one
+  native frame per call, up to `FAST_STACK` below dispatch's entry; past it a
+  fast entry takes the slow path, which uses no native stack. Lua's own stack
+  limit (65,500 slots) keeps chains of small frames under the budget, so the
+  check is a safety net for frames with many spill slots.
+- **Dropped chains**: a native call, a deopt or any other way into the
+  interpreter from inside a chain of fast calls drops the whole chain, and each
+  caller resumes through its header at the slow path's cost. Keeping the
+  frames across such a visit (the interpreter running below them, the
+  callee-saved registers saved at the visit) is the next step if chains that
+  call natives turn out to matter; per-coroutine stacks would remove the drops
+  at coroutine switches as well.
 - **Global facts** (11.5): the number metatable is checked at each site that
   depends on it, string method sites guard the string metatable per site, and
   userdata and other per-type metatables do not affect compiled fast paths.
+
+## 17. Performance plan (after milestone 2)
+
+Milestone 2 compiles the whole LJR suite and runs it 1.45× faster than the
+interpreter, but LuaJIT's compiler is still 1.14× faster than it (geomean of 16,
+dc2266a, Appendix F). This section is the analysis of where compiled code loses
+that time and the plan that the remaining milestones (15) follow. Each item
+says what changes, which section carries the design, what it is expected to
+save, and what it costs at compile time. The per-benchmark evidence (profiles,
+exit counts, hot-path machine code against LuaJIT's traces and clang -O2 ports
+of the kernels) is in Appendix F; figures there are cycles and instructions
+retired, never wall-clock time.
+
+### 17.1 Targets
+
+- **Speed.** The LJR suite at least 2× LuaJIT's compiler (geomean), and no
+  benchmark behind LuaJIT except where the time is spent outside compiled code
+  in a part listed in 17.8. The design benchmarks of section 1
+  (`mandel_bench`, `fft`, `nbody`, `particles_bench`, ...) are measured the same
+  way at each milestone.
+- **Compile time.** At most 0.5 µs per IR instruction after the passes (the
+  pipeline measures 1.0-2.0 µs today, 17.7), and at most 2% of each LJR benchmark's
+  run (deltablue is at 7.7% today, havlak 4.8%). LuaJIT's trace compiler is the
+  ceiling never to reach: it spends 39% of json's run, 47% of qt's, 24% of
+  queen's and 25-88% of ray's (17.7), while tcvm compiles each of those in
+  under 25 ms.
+
+### 17.2 Where the time goes
+
+Cycle shares of the JIT-on run (`xctrace` CPU Profiler, leaf frames; *calls* is
+`enter` plus `op_jit_entry`, the path every call out of a region takes today):
+
+| Benchmark | LJ / tcvm | region code | calls | helpers | interpreter, runtime, natives, libc | GC | main causes (17.3) |
+|---|---|---|---|---|---|---|---|
+| recursive-fib-uv | 0.30 | 61 | 39 | 0 | 0 | 0 | C1, C2, I1 |
+| recursive-fib-gv | 0.48 | 60 | 40 | 0 | 0 | 0 | C1, C2, I1, F5 |
+| ray | 0.18 | 85 | 10 | 3 | 1 | 0 | I1, S2, S8, Q1, Q3 |
+| mandel-metatable | 0.51 | 40 | 14 | 36 | 7 | 3 | I1, A1, A2, A4, B2 |
+| queen | 0.61 | 91 | 7 | 0 | 1 | 0 | Q1, Q2, Q6, Q7, I1 |
+| coroutine-ring | 0.71 | 18 | 5 | 3 | 73 | 0 | C3, S4, C2 |
+| chameneos | 0.59 | 32 | 5 | 2 | 60 | 0 | C3, F4, C2 |
+| table-sort | 0.59 | 4 | 1 | 0 | 85 | 4 | R1, R2 |
+| richard | 0.82 | 55 | 14 | 10 | 18 | 0 | S5, S3, I1, Q4, S7 |
+| json | 1.03 | 44 | 10 | 4 | 32 | 7 | B1, R4, F2, I1, A2 |
+| qt | 1.06 | 74 | 16 | 1 | 4 | 4 | S1, Q1, C1, C2, S6 |
+| table-sort-cmp | 1.06 | 37 | 4 | 0 | 57 | 1 | C5, R3, S1 |
+| deltablue | 2.13 | 36 | 11 | 5 | 30 | 11 | F1, F2, C1, T3 |
+| binary-trees-name | 2.51 | 36 | 13 | 18 | 13 | 18 | A1, C1, C6 |
+| havlak | 2.72 | 25 | 7 | 10 | 21 | 33 | A2, A1, A3, R5 |
+| fixpoint-fact | 4.58 | 29 | 17 | 46 | 5 | 3 | A3, C1, C4, I1, A4 |
+
+(Percent of cycles; the rest is the compiler and unattributed samples. LJ /
+tcvm is LuaJIT's cycles over tcvm's: below 1, LuaJIT is faster. ray's LuaJIT
+figure is its good mode, see 17.5.)
+
+Four facts carry most of it:
+
+1. **Calls are the largest single cost.** A call from a region writes a header,
+   tails `enter` (31 instructions: callee kind, window, arity), dispatches the
+   callee's first word, `JIT_ENTRY`, and `op_jit_entry` (4 more) loads the
+   region's address; the region pays about 30 instructions of its own (native
+   frame pop and push around the call, four header stores, base and closure
+   reloads after the return's indirect branch, a nil default for the result, a
+   collector check at every entry). fib: 90.6 instructions and 12.9 cycles per
+   call against LuaJIT's 36.9 and 3.9 and C's 16.5 and 3.5. A one-level method
+   call in a loop is about 150 instructions and 15 cycles; LuaJIT inlines it to
+   nothing. `enter` alone is 5-32% of the cycles of 13 of the 16 benchmarks.
+2. **Regions never reach the builtins' fast entries** (5.4 says so), so a
+   `coroutine.resume`/`yield` from compiled code takes the general native path
+   (`native_enter`, `drive`, `native_act`, `resume_into`, `prepend_true`), about
+   70 cycles per switch against the interpreter's 31 through `ff_resume` and
+   `ff_yield`. That is why coroutine-ring and chameneos run 13-25% slower
+   compiled than interpreted.
+3. **Cold arms cost the hot path.** Generic arithmetic and compares carry a
+   helper arm, array reads a nil and an out-of-bounds arm, field reads an
+   `__index` arm. The arms rarely run, but their helper calls clobber the
+   caller-saved registers (so the allocator spills around them: up to 41 spill
+   stores and 62 spill loads in one hot region of ray and qt), their declared effects end GVN's
+   and LICM's reuse at the join (queen loads `a[i]` three times per iteration),
+   and an arm that may allocate keeps a collector check at its loop header.
+4. **What LuaJIT inlines and sinks, tcvm calls and allocates.** LuaJIT's ray
+   trace inlines four levels of calls per sphere test (273 instructions against
+   tcvm's 1266), its mandel-metatable trace sinks three of its four tables per
+   iteration and records `setmetatable` as one store. Where LuaJIT cannot
+   compile (closure creation, `FNEW`, in fixpoint-fact, deltablue and havlak;
+   coroutine switches), tcvm already wins by 2-4.6×, and its allocator and
+   collector are 3-10× cheaper per object than LuaJIT's.
+
+### 17.3 Work items
+
+Grouped by kind; the milestone that schedules each is in 15. Estimates are from
+the Appendix F measurements and are per benchmark.
+
+#### Calls
+
+- **C1. Direct calls (5.4, 11.4; milestone 3 already).** A call whose callee is
+  known at compile time (17.4 D1: a constant upvalue, a global through `_ENV`'s
+  IC, a method through a `_PROTO`/own slot, a closure the region created, or
+  per-site callee feedback) and has a function-entry region jumps to it: the
+  identity guard (`GuardSame`, hoisted when invariant), the window check against
+  the callee's `max_stack_size` and the arity fill inline, header word 0 written
+  in its final form (`closure | nv << 48`), and `b` to the callee region's entry. A callee without a region is entered at its
+  `FUNC` through a per-prototype interpreter entry that skips `enter`'s checks.
+  fib: −28 instructions and two dependent indirect branches per call, about 12.9
+  → 8.5 cycles; mandel-metatable's `enter_fixup` for `conj(x)` (called with one
+  argument for two parameters) disappears with the inline arity fill.
+- **C2. A cheaper call and return protocol (new; amends 5.4, 5.5, 5.7, 10.5).**
+  - No collector check for a call: callees check their own allocations, as the
+    interpreter's allocating handlers do. `prune_gc_checks` counts `Call` and
+    `CallMm` as allocating today; an entry or loop header whose only
+    "allocation" is a call loses its check (fib, qt: 6.7% of `clip`'s samples;
+    richard: 7.8% of its main loop's). LICM borrows the header check's
+    snapshot before the checks are pruned, so its hoisting is unaffected.
+  - Native calls between compiled functions (J10, 5.4): the caller keeps its
+    frame and calls the callee's fast entry with `blr`, the callee returns with
+    `ret`; the frame pop and push around every call (about 32% of fib's region
+    samples and 16% of deltablue's `Vector:each`) and the unpredicted return
+    go. Done 2026-10-11; replaces the frameless regions this item first
+    proposed, which J10's kept frames make moot.
+  - The resume of a known callee computes the caller's base (`sub x22, x22,
+    #(a+4)*8`) instead of loading it, and reloads `closure` only before its
+    next use or tail-out.
+  - A callee whose every `RETURN` yields exactly one value lands its result with
+    one load, without the nil default (5 → 1 instructions).
+  - No R1 store of a value its slot already holds, and type facts of slots kept
+    across a resume (17.4 D4): today every live register is reloaded and
+    re-guarded after each call (coroutine-ring's main loop re-guards three).
+  - A second, typed entry per function region (later): a direct caller that
+    proves its arguments' kinds enters past the entry guards and unboxing.
+  - fib, estimated with C1: about 40 instructions and 6 cycles per call, before
+    any inlining.
+- **C3. Builtins through their fast entries (new; amends 5.4 and 12).** Each
+  `ff.rs` fast entry gets a core that takes a written header the way `enter`
+  does (callee in word 0, continuation in word 1, arguments at the header plus
+  4, `nargs` in `insn`) besides today's CALL-word adapter. `enter`'s native arm
+  tails the core when the native has one (one load and a branch), and a region
+  with a constant native callee without an intrinsic tails it directly.
+  `resume_switch!` and `ff_yield` already return through header word 1, which
+  is the region's resume point, so a coroutine switch from compiled code costs
+  what it costs the interpreter, as LuaJIT's traces stitch around its
+  assembler `coroutine.resume`. coroutine-ring 96 → about 51 cycles per round
+  trip (2.01 → about 1.05 Gcyc; LuaJIT 1.42), chameneos 107 → about 68 per
+  meeting (5.26 → about 3.4; LuaJIT 3.10). `pcall`, `xpcall` and
+  `coroutine.wrap`'s functions take the same path.
+- **C4. Direct tail calls (5.5).** A `TAILCALL` with a known callee that has a
+  region rewrites the frame as the fast arm does and branches to the region,
+  instead of dispatching the callee's first word through the opcode table and
+  `op_jit_entry` (a chain of five dependent loads in fixpoint-fact).
+- **C5. Native-to-compiled calls.** `stage_call` (natives calling Lua, the
+  sort comparator) jumps to the callee's region entry, skipping `enter` and
+  `op_jit_entry`. table-sort-cmp spends 53% of its cycles in the native sort's
+  call path; this item takes the `enter` part of it, R3 the rest.
+- **C6. Return prediction.** Returns were `br x16` through header word 1,
+  which the return-address stack never predicts; 36% of BottomUpTree's region
+  samples sat on its two resume points. J10's fast calls return with `ret`
+  (C2); returns into the interpreter keep word 1.
+
+#### Inlining
+
+- **I1. Inlining (13; was "designed now, built later").** The largest
+  remaining factor on the call-heavy benchmarks: ray 205 → about 90 cycles per
+  sphere test, queen −27% instructions (`isplaceok` into `addqueen`), richard's
+  scheduler loop (LuaJIT's root trace inlines seven functions), mandel-
+  metatable's `__add`/`__mul`/`complex`/`norm2`, json's `self:read()` per
+  character, and recursion: LuaJIT unrolls fib's recursion two levels per trace
+  (up-recursion), which is how it beats C's per-call cost. Section 13 now
+  specifies callee sources, budgets, multiple results, metamethod callees and
+  recursion.
+
+#### Speculation and feedback gaps
+
+- **S1. Compare kinds (amends 4.8, 7.3).** Compare sites record kinds only on
+  their slow paths, and the fast paths handle floats, so a float compare's byte
+  stays 0 and compiles to the three-arm generic compare with `jit_lt`/`jit_le`
+  (qt's `clip`: every compare; table-sort-cmp's `lhs.x ~= rhs.x`). Fix: type
+  the operands from their definitions (9.1 extended to compare uses, entry
+  types seeded from the live frame) and, where nothing types them, record a
+  compare's kinds once, on its first execution (the fast path tests the byte
+  for zero), with the interpreter cost measured with the JIT off as 6.1
+  measured the counters.
+- **S2. Number-only generic arms (amends 7.2, 7.3).** A generic site whose byte
+  saw only numbers compiles its small and float arms and a deopt for the rest,
+  not a helper call; with no helper on the path the arms do not spill. The
+  selects the arms leave (`select(c, c, false)`, `select(c, k, k)`) are folded
+  in GVN.
+- **S3. Equality by tags (amends 7.3).** Values with different type tags,
+  other than an integer and a float, are unequal without `__eq` (Lua consults
+  `__eq` only for two tables or two full userdata). `x ~= NO_TASK` with a nil
+  upvalue is 50 instructions through `jit_eq` today and 6 in LuaJIT (richard
+  −8%).
+- **S4. Mixed integer and float compares inline (amends 7.3).** `scvtf` of the
+  `I32` side and `fcmp`: an i32 converts to f64 exactly (`20000000 == 2e7` is
+  true in lua 5.5.1). coroutine-ring's `token == n` (n is the float `2e7`)
+  calls `jit_eq` every iteration today.
+- **S5. Float `%` inline (amends 7.2).** `MOD_FF` calls libm `fmod` through a
+  helper: about 90 cycles, against 7 in LuaJIT, which uses `a - floor(a/b)*b`
+  (5.1 semantics, which 5.5 does not have: `-4.0 % 2` is `-0.0` and
+  `5.5 % -math.huge` is `-inf` in lua 5.5.1, `0` and `nan` in LuaJIT). Inline:
+  `q = frintm(a / b)`, `r = fmsub(q, b, a)`, a fix-up of `q` by one when `r`
+  lands outside `[0, b)` (or `(b, 0]`), a zero result signed as the dividend's,
+  and the helper for non-finite operands and `|a / b| ≥ 2^52`. To be checked
+  against `fmod` on generated edge cases before it ships. richard −12%.
+- **S6. `x ^ 2` as `x * x`.** `pow(x, 2)` and `x * x` are both correctly
+  rounded; 2M random doubles gave no mismatch under lua 5.5.1. Not `x ^ 0.5`
+  (1290 of the same 2M differ from `sqrt`). qt's `pow` share is 4%.
+- **S7. Constant upvalues of every type (amends 7.5).** Only functions, strings
+  and tables are refined to constants today, and only where a site wants it.
+  An upvalue never assigned after its capture (a per-upvalue flag the compiler
+  sets, as LuaJIT's parser marks `uv->immutable` for `rec_upvalue_constify`) is
+  a constant of the closure for any type, guarded once per entry by the
+  closure's identity or the cell's value. richard and qt reload and re-test
+  such upvalues after every call (about 15 instructions each time).
+- **S8. Mixed integer and float values (study).** ray's vectors mix integers
+  (`{0, 0, -4}`, the root sphere) and floats, so its arithmetic is generic with
+  three arms everywhere. Two ways: a representation pass that keeps a
+  `SMALL | FLOAT` value whose uses are all float arithmetic in an `F64` (exact
+  for integers below 2^53, which needs 9.7's ranges), or cloning an inlined
+  body per argument-kind combination. This is the step that brings ray level
+  with LuaJIT; 17.4 D5.
+
+#### Fields and tables
+
+- **F1. `__index` chains resolved at compile time (amends 7.4).** `_PROTO`
+  handles one hop; a deeper chain, and a nil own slot under a metatable with
+  `__index`, takes the `jit_index` walk every time: deltablue loses 23% of its
+  cycles there (`walk_index_chain` and `raw_get`); a two-level `o:get()` is 354
+  instructions and 47 cycles, LuaJIT's 6 and 1. Each hop compiles as `_PROTO`'s
+  does: the class's `__index` loaded and compared with the constant found at
+  compile time, then that table's shape guarded, the key absent or the holder
+  slot loaded. The guards are loads and compares that GVN shares and LICM
+  hoists. (V8's alternative, a validity cell per chain, is one load and compare
+  per site but needs invalidation on every write to a prototype's shape.)
+- **F2. Polymorphic receivers (9.11, new; J4's reserve).** A site that saw two
+  shapes dispatches on the shape at every field access, since the arms merge
+  again at each join: deltablue's `EqualityConstraint:execute` is 2304 bytes
+  after three compiles, json's `Parser:read` 3072. Tail duplication after the
+  first shape dispatch on a receiver, up to the next call or loop header,
+  keeps one shape per path.
+- **F3. Out-of-line slots (runtime).** Objects built by `setmetatable({}, mt)`
+  and then filled keep every field in aux storage (one more load per access).
+  Allocation-site slack tracking, or sizing `NEWTABLE`'s template from the
+  transitions its tables take, puts them inline.
+- **F4. Inline `SETUPVAL` barrier test (amends 7.5).** The upvalue store calls
+  `jit_upval_barrier` unconditionally; test the cell's (an open upvalue's
+  thread's) mark bit inline as 5.7's table barrier does (chameneos 1.5%).
+- **F5. Global cells (study).** A global read after a call reloads `_ENV`,
+  re-tests its tag and shape and reloads the slot (13 instructions, twice per
+  fib-gv node). A cell per global that holds the value and is invalidated on
+  write (V8's `PropertyCell`) makes the read a constant with no guard, and a
+  direct call through a global free of guards. Needs a design of its own.
+
+#### Allocation
+
+- **A1. Inline table allocation (amends 7.6, 5.7).** `NEWTABLE` from a
+  template whose size is known: bump-allocate in the region, write the header,
+  the template shape and the initial values; no `from_template` call, no
+  `memset_pattern16` of nil slots the following stores overwrite (12.5% of
+  binary-trees), no barrier and no shape guard on the fresh table. binary-trees
+  74 → about 45 cycles per node (LuaJIT 196).
+- **A2. `setmetatable` at allocation (amends 12).** `setmetatable(NEWTABLE,
+  constant mt)` allocates with the shape the transition gives, recorded in the
+  template; `setmetatable(obj, {__index = K})` per object (havlak's
+  `Vector.new`, json's values) is memoized by (template, `__index` value) →
+  class and shape instead of running `adopt` and `join_by_memo` each time
+  (havlak 9.4%, json about 6%).
+- **A3. Inline closure allocation (amends 7.6).** `CLOSURE` with only by-value
+  and already-open upvalues allocates inline (prototype, header, upvalue words);
+  creating a new open upvalue stays in the helper. fixpoint-fact's
+  `jit_closure` is 42% of its cycles (about 17 cycles per closure, a third of
+  it the helper's callee-saved registers).
+- **A4. Allocation sinking (9.10, new).** After inlining, a table or closure
+  whose uses are constant-slot loads and stores, a constant-metatable
+  `setmetatable`, calls that were inlined and snapshots is not allocated; its
+  slots are SSA values and snapshots describe it, and `jit_exit` allocates it
+  when an exit needs it. mandel-metatable 272 → an estimated 30-40 cycles per
+  iteration (LuaJIT 135, which allocates the loop-carried `z` only);
+  fixpoint-fact's two closures per level.
+- **A5. Inline array append.** `t[#t + 1] = v` and `SETTABLE` at `asize` with
+  capacity left store and bump the size inline (havlak's `Vector:append` goes
+  through `jit_newindex` and `set_int_key`, 1.8%).
+
+#### Code quality
+
+- **Q1. Cold arms out of the way (amends 10.3, 10.4).** A helper call on a cold
+  arm goes through an out-of-line stub that saves and restores the
+  caller-saved registers the hot path keeps live, so the allocator sees no
+  clobber there; or, where feedback says the arm never ran, the arm is an exit.
+  Values only the arm uses (the boxed key of queen's nil arm) are computed in
+  it (code sinking). ray's `vsub` has 18 spill stores and 38 spill loads in 516
+  instructions, qt's `clip` 41 and 55 in 784.
+- **Q2. Precise helper effects; array-site reuse (amends 7.6, 8.4).**
+  `jit_index` is declared `MAY_ALLOC | W_SHAPE | W_META` but does raw gets and
+  the `__index` walk only (no Lua code runs, a function returns `FAIL`); with
+  read-only effects its arm keeps no collector check and kills no fact. The
+  builder reuses an earlier `GETTABLE` site's result for the same table and key
+  with no write between, as `field_loads` does for fields: queen's three
+  `a[i]` loads become one (65 → about 25 instructions per iteration with Q1
+  and Q4-Q7).
+- **Q3. Lowering (10.3).** Branch on a boolean or a select of type tests
+  directly (`tbz`, two branches) instead of `cset; cmp; b.eq`; fuse a
+  `Guard(SMALL|BIGINT)` with the `Unbox{I64}` after it (one test, not two);
+  share wide constants within a call-free span, as 10.3 already says (ray's
+  `BOX` bound is materialized 25 times in one region); drop constant `mov`s a
+  folded compare left dead.
+- **Q4. Constants are rematerialized, not spilled (10.4, risk 2 of 16).**
+  queen spills the constant 1; richard's main loop carries the upvalue, three
+  booleans derived from it, its unboxed float and the constants 2 and 0 as
+  eight block parameters in spill slots (one reload is 9.6% of the region's
+  samples). The call-boundary pass (9.8) re-emits rematerializable values at
+  each use after a resume rather than merging copies into block parameters.
+- **Q5. Jump threading in block layout (9.9).** Empty join blocks leave
+  branch-to-branch chains (six per iteration in queen's inner loop).
+- **Q6. LICM of guarded arithmetic (9.5).** queen's `c - n` and `c + n`,
+  loop-invariant `ISub`/`IAdd` with overflow exits, stay in the loop. LICM moves
+  an exit only when the header has a `GcCheck` whose snapshot it borrows, and
+  only when every operand is outside the loop or moved; find which fails here.
+- **Q7. Bounds checks against the loop limit (9.7).** An array index that is a
+  loop counter checks `asize` against the loop's `last` once before the loop
+  (LuaJIT's ABC); 9.7 only removes checks a dominating compare proves.
+- **Q8. Range analysis (9.7).** Drops fib's `n - 1`/`n - 2` overflow checks on
+  the `n >= 2` edge and ray's and queen's induction checks.
+
+#### Compile time
+
+- **T1. Per-pass costs (17.7).** The passes are 40% of compile time (GVN,
+  speculation, inference, the call-boundary pass, the verifier's liveness),
+  `regalloc2` 35%. Each pass gets a budget per IR instruction and the
+  compile-time bench of section 14 tracks them.
+- **T2. Register allocation.** `Ion` is 0.4-0.8 µs per IR instruction;
+  `Fastalloc` is 4-13× faster but its code retires 10-50% more instructions
+  (17.7), so it is no replacement. Options: `Ion` for loop regions and a
+  linear scan for straight-line function regions, or fewer virtual registers
+  (Q1's stubs and Q4's remats shrink live ranges).
+- **T3. Recompile churn.** deltablue makes 50 recompiles out of 122 compiles,
+  havlak 22 of 103, json 28 of 84, nearly all from hot shape exits. The first
+  compile of a site reads the shapes the receiver's other sites saw (6.4's
+  receiver sharing) and the sites' IC history where the IC kept it; F2 makes a
+  two-shape site cheaper to compile than a recompile.
+- **T4. Inlining budget.** Inlining grows regions 2-3× (ray's main region is
+  already 1631 IR instructions): the budget in 13 counts IR instructions, not
+  bytecodes, and a region over `MAX_INSTS` stops inlining before it stops
+  compiling.
+
+#### Bugs found by this analysis
+
+- **B1.** A `CALL` whose arguments are field loads under `__index` loses its
+  intrinsic: `self.input:sub(self.index, self.index)` in json's
+  `Parser:read` is a full native call (`native_enter`, `lua_sub`, `intern`,
+  `memcmp`: about 20% of json's cycles). The callee and selector lookups see
+  the block parameter of the join the field loads' nil arms leave. Repro:
+  `t = setmetatable({input = s, index = 2}, {__index = P})` with
+  `function P:read() self.c = self.input:sub(self.index, self.index) end` in a
+  loop. Every compile-time callee decision after such a join is affected.
+- **B2.** `math.sqrt(f(x))` (a `CALL` with `b == 0` fed by a multiple-result
+  call) goes through `jit_top_args` and a plain call to `ff_sqrt` instead of the
+  intrinsic (mandel-metatable's `abs`). With a known callee of one result, the
+  inner call's `c` can be treated as 2.
+
+### 17.4 Decisions needed
+
+- **D1. Callee feedback.** Direct calls and inlining need the callee. Constant
+  upvalues, globals and `_PROTO` holder slots give it at compile time; method
+  fields copied into each object (ray's `intersect = self.intersect`) and
+  closures passed around do not. Options: (a) a per-site callee word the
+  interpreter's `CALL` writes when it differs (an estimated 3 instructions per
+  call, to be measured with the JIT off as 6.1's counters were), (b) the first region records the callee per call
+  site in a region cell (one store per call in compiled code) and a hot call
+  site triggers a recompile that uses it, (c) compile-time sources only.
+- **D2. `table.sort` visible to the JIT.** The same algorithm written in Lua
+  and compiled runs table-sort-cmp's sort 1.6× faster than the native sort
+  today (2.3× once the comparator inlines; LuaJIT's Lua-written sort with the
+  comparator inlined is 1.15 Gcyc against tcvm's native 2.67). This conflicts
+  with the earlier choice of continuation-style Rust natives for `sort`; an
+  intrinsic that runs a compiled sort loop calling the comparator's region is
+  the alternative.
+- **D3. Unbuffered stdout.** All of table-sort's loss is printing: one
+  `write(2)` per line (6.2 Gcyc of system time) and an interned string per
+  number. Pending from the LJR gap analysis.
+- **D4. Slot types across calls.** Only `debug.setlocal` can change a caller's
+  registers during a call. A state flag that `debug.setlocal` sets (and that
+  retires or deopts regions) would let a resume keep its slots' types.
+- **D5. Mixed numbers (S8):** representation pass or per-kind cloning.
+- **D6. The metamethod forms' constant compare.** Milestone 2 loads an
+  `ARITH_MM` site's metamethod from the class without comparing it with a
+  constant (nothing recorded which function a site called). Inlining a
+  metamethod needs that identity: from D1's callee feedback, or from the class
+  seen at compile time when the operand's shape is known.
+- **D7. Targets (17.1).**
+
+### 17.5 What tcvm keeps
+
+LuaJIT's aborts are tcvm's wins: closure creation (`FNEW`, `UCLO`) compiles, so
+fixpoint-fact (4.6×), havlak (2.7×) and deltablue (2.1×) are ahead, and
+tcvm's allocation and collection are 3-10× cheaper per object (havlak's
+three-field object 28.5 cycles against 141). Compile time: tcvm's whole-program
+compile is 0.2-25 ms per benchmark; LuaJIT's trace compiler takes 24-47% of
+queen's, json's and qt's runs, and ray's bimodal runs (1.6 or 3.6 Gcyc) come
+from its trace flushes. Inlining (I1) and sinking (A4) must keep that: a budget
+per region, no recompile storms.
+
+### 17.6 Order
+
+Calls first (C1-C5 and the B items): they are in every benchmark, and C1's
+callee identity is what inlining and metamethod direct calls build on. Then the
+speculation and code-quality items, which are small and independent. Then
+inlining, then allocation and sinking, which pays most after inlining exposes
+the allocations. Section 15 lists the milestones and their exit criteria.
+
+### 17.7 Compile time measured
+
+`TCVM_JIT_TIME` totals per benchmark (release build, one run):
+
+| Benchmark | compiles | IR insts | build | passes | lower | regalloc | emit | total µs | LuaJIT compiler share |
+|---|---|---|---|---|---|---|---|---|---|
+| recursive-fib-uv | 1 | 41 | 41 | 81 | 22 | 39 | 175 | 358 | 6% |
+| queen | 5 | 581 | 131 | 476 | 105 | 268 | 67 | 1047 | 24% |
+| richard | 51 | 4667 | 802 | 2443 | 609 | 2046 | 263 | 6163 | 12% |
+| deltablue | 122 | 20053 | 2804 | 9614 | 2264 | 7755 | 969 | 23406 | 4% |
+| havlak | 103 | 16266 | 2280 | 11045 | 1974 | 9115 | 889 | 25303 | 3% |
+| json | 84 | 13488 | 1569 | 6095 | 1443 | 4079 | 625 | 13811 | 39% |
+| ray | 31 | 10619 | 1276 | 9583 | 1182 | 8566 | 475 | 21082 | 25-88% |
+| qt | 19 | 3704 | 525 | 1569 | 410 | 1501 | 1483 | 5488 | 47% |
+
+(A process's first compile also maps the code segment, which shows in emit.)
+That is 1.0-2.0 µs per IR instruction: passes 0.5-0.9, `regalloc2` 0.4-0.8.
+Within the compiler's own samples (in a run that also dumped assembly), `regalloc2` is 31-41%, GVN 3-12%, the IR's liveness
+and verifier helpers 9-16%, speculation and inference up to 7% each.
+`TCVM_JIT_FASTALLOC=1` cuts allocation 4-13× and total compile time 13-72%, but
+instructions retired rise 22% (richard), 15% (deltablue), 10% (havlak), 31%
+(ray), 51% (queen).
+
+### 17.8 Outside the JIT
+
+These are not compiled-code work, but they decide benchmarks the JIT is
+measured on:
+
+- **R1. Buffered stdout** when it is not a terminal (D3).
+- **R2. `print` of numbers** formats into the output buffer without creating an
+  interned string (table-sort: interning about 9% of samples).
+- **R3. A sort the JIT can see** (D2).
+- **R4. One-byte strings preinterned**, so `s:sub(i, i)` is two loads (json:
+  interning and `memcmp` about 9.5% even with the intrinsic).
+- **R5. Marking** of large live graphs: havlak spends 33% in the collector,
+  mostly `trace(TableState)` and `trace(Value)`.
 
 ## Appendix A: register assignment (aarch64)
 
@@ -2358,6 +3228,14 @@ writes each inlined callee's header (`func` from the pool, `ret =
 rt.ret(wanted)`, `caller`, `pc`) outermost first, then the entries, and resumes
 the innermost frame. Milestone 1 emits no frames; the decoder handles them, and a
 unit test round-trips a snapshot with two.
+
+Milestone 6 adds object entries for sunk allocations (9.10): an object header
+(`kind:2` table or closure, `slots:14`, `template_or_proto:16`, a pool index)
+followed by one entry per slot in the entry format above, its `reg` field the
+slot index. A register entry may then name an object (`loc` `Object`, the index
+of the object in the snapshot). `jit_exit` allocates every object of the
+snapshot first, fills their slots (an object slot naming another object gets its
+pointer), then writes the frames' entries.
 
 ## Appendix D: opcode coverage matrix
 
@@ -2426,3 +3304,182 @@ The IR, the builder, the optimizer, the `regalloc2` adapter, the exit and snapsh
 formats, the runtime structures, the resume protocol, `jit_exit`, the counters and the
 intrinsic table are target-independent by construction and contain no `cfg`
 arms.
+
+## Appendix F: the milestone 2 measurements, per benchmark
+
+Measured 2026-10-11 at dc2266a on the M4 Pro. Speeds: median cycles of 5
+interleaved rounds of tcvm with the JIT on and off and LuaJIT 2.1 with its
+compiler on and off (`/usr/bin/time -l`). Per-operation figures: instruction and
+cycle deltas between two run sizes. Profiles: `xctrace` CPU Profiler (cycle
+sampling), leaf frames symbolized against the binary, JIT code attributed to
+regions and instruction offsets through `TCVM_JIT_LOG`/`TCVM_JIT_DUMP=asm` of the
+same run. Exits: a diagnostic build that logs each exit's count at powers of
+two. LuaJIT: `-jp=v` (VM states), `-jp=F`, `-jv`, `-jdump`. C ports of the hot
+kernels compiled with clang -O2.
+
+| Benchmark | tcvm JIT | tcvm interp | LuaJIT | LuaJIT -joff | (Gcyc) |
+|---|---|---|---|---|---|
+| mandel-metatable | 0.485 | 0.946 | 0.247 | 1.961 | |
+| table-sort-cmp | 3.066 | 3.580 | 3.258 | 4.936 | |
+| table-sort | 12.659 | 13.037 | 7.430 | 8.265 | |
+| binary-trees-name | 0.959 | 1.336 | 2.404 | 3.482 | |
+| fixpoint-fact | 0.424 | 0.560 | 1.941 | 1.923 | |
+| coroutine-ring | 2.008 | 1.608 | 1.416 | 2.140 | |
+| richard | 1.261 | 3.635 | 1.036 | 5.979 | |
+| deltablue | 1.374 | 1.872 | 2.927 | 3.823 | |
+| ray | 9.006 | 13.101 | 1.614 | 17.299 | |
+| queen | 0.683 | 1.810 | 0.416 | 5.296 | |
+| recursive-fib-uv | 4.277 | 5.323 | 1.297 | 7.561 | |
+| recursive-fib-gv | 2.606 | 3.874 | 1.252 | 4.976 | |
+| havlak | 2.354 | 3.104 | 6.407 | 7.771 | |
+| chameneos | 5.264 | 4.615 | 3.102 | 7.707 | |
+| qt | 5.083 | 9.794 | 5.396 | 18.548 | |
+| json | 2.523 | 4.340 | 2.595 | 8.152 | |
+
+Geomeans relative to the JIT: interpreter 1.447, LuaJIT 0.878, LuaJIT -joff
+2.530. LuaJIT's ray is bimodal: 4 of 11 runs fall into a mode with about 270
+trace flushes, 88% of the time in its compiler and 3.6 Gcyc.
+
+No benchmark has a steady-state exit problem: every exit that fired is a
+collector exit, a never-executed block (recompiled once), or a shape or type
+exit that recompiled within `EXIT_HOT`; entry fails stay under 16 per region
+(richard's nil-or-table parameters). No entry is blacklisted.
+
+**recursive-fib-uv** (331M calls). Per call: tcvm 90.6 instructions and 12.9
+cycles, the interpreter 120.6 and 16.1, LuaJIT 36.9 and 3.9, C with two real
+calls 16.5 and 3.5. One function region of 41 IR instructions. Its internal
+node is 92 instructions: prologue 3, argument load and collector check 5
+(`ldr [rt, #METRICS]; ldp; cmp; b.hs`, a two-load chain), parameter guard and
+`n < 2` 6, each call 16 (upvalue load, `subs/b.vs`, box, argument store, four
+header stores, `adr`, a literal load, `mov x20`, frame pop, `add x21`,
+`b enter`), each resume 11 (`ldur x22, [x22, #-16]`, the closure reload and
+mask, frame push, a five-instruction nil default for the result), the add 18
+(re-guards of both results, `adds/b.vs`, box, store, return through
+`ldur; and; br`). Each call also runs `enter` (31) and `op_jit_entry` (4). The
+first instruction after each resume and the frame `stp`/`ldp` hold 14% and
+about 32% of the region's samples. LuaJIT's trace 1 is an up-recursive trace
+that inlines two levels and checks the closure once per level (C1, C2, I1, Q8).
+
+**recursive-fib-gv** (205M calls): as fib-uv, plus the global `f` read twice
+per node after resumes, 13 instructions each (`_ENV` upvalue, its tag test, its
+shape guard, the slot). LuaJIT's traces end in "call unroll limit reached" and
+return traces, 6.1 cycles per call (C1, C2, I1, F5, S7).
+
+**queen** (45.4M inner iterations, 10.1M `isplaceok` calls). `isplaceok`'s
+region is 79% of cycles. Its inner loop is about 65 instructions per iteration
+against LuaJIT's 17 and C's 9: three `a[i]` reads each with a bounds check, an
+out-of-bounds and a nil arm that call `jit_index`, so GVN cannot reuse the
+first load; a collector check at the header kept by those arms; the key boxed
+and spilled each iteration for the arms; `c - n` and `c + n` recomputed with
+overflow checks; `n`, `c` and the constant 1 reloaded from spill slots; six
+branch-to-branch jumps. Call overhead is about 115 instructions per
+`isplaceok` call. LuaJIT's loads are typed integer `ALOAD`s with the bounds
+check hoisted (Q1, Q2, Q4-Q7, I1).
+
+**fixpoint-fact** (5.05M recursion levels: 2 closures, 4 calls of which 2 tail
+calls, 1 multiply each). tcvm 543 instructions and 84 cycles per level; a C port
+with heap closures (bump allocation, four indirect calls) 49 and 21.6. Cycles:
+`jit_closure` 42% (17 cycles per closure, a third of it the helper's
+callee-saved registers), regions 29%, `enter` and `op_jit_entry` 17%, boxing of
+products outside i32 7%. Tail calls dispatch the callee's first word through
+the opcode table and then `op_jit_entry` (five dependent loads). LuaJIT aborts
+every trace on `FNEW` and runs interpreted, 54% of it in its collector
+(A3, C1, C4, I1, A4).
+
+**ray** (44.7M sphere tests). Per test: tcvm 1266 instructions and 205 cycles,
+LuaJIT 273 and 36 in its good mode, C 62 and 10.7. Regions: `sphere_distance`
+45%, `vsub` 14%, `group:intersect` 13%, `dot` 11%; calls 10%. One call is about
+104 instructions and 15.6 cycles, a three-result call (`jit_land`) 152 and 17.
+Arithmetic is generic with three arms because the vectors mix integers and
+floats; the `BOX` bound constant is materialized 25 times in one region; `vsub`
+has 18 spill stores and 38 spill loads in 516 instructions. LuaJIT's root trace
+inlines `c:intersect`, `sphere_distance`, `vsub` and `dot` per child (I1, S2,
+S8, Q1, Q3, D1).
+
+**mandel-metatable** (1.76M inner iterations). tcvm 272 cycles and 2279
+instructions per iteration, LuaJIT 135 and 738 (60% of it collection), C with
+value structs about 9 cycles. Cycles: `jit_newtable` 17%, `jit_setmetatable`
+16.5%, `enter` 10%, `enter_fixup` 3% (`conj(x)` passes one argument for two
+parameters). Four tables per iteration at about 23 cycles each to allocate and
+set the metatable. LuaJIT sinks three of its four `TDUP`s, records
+`setmetatable` as a store, and inlines `__add`, `__mul`, `complex`, `abs`,
+`norm2`, `conj` and `sqrt`. `math.sqrt(Complex.norm2(x))` misses the intrinsic
+(B2) (I1, A1, A2, A4, D6).
+
+**qt.** `clip` 42% (65.9M calls, 32 cycles each), `prewhite` 14%, `color` 11%,
+calls 16%, `pow` 4%. Every float compare is generic with `jit_lt`/`jit_le`
+arms, since compare sites record no kinds (S1); `clip` has 41 spill stores and
+55 spill loads in 784 instructions; its entry collector check is 6.7% of its
+samples. LuaJIT spends 47% of its run in its trace compiler (1157 side traces
+ending in "fallback to interpreter") (S1, Q1, C1, C2, S6, I1).
+
+**binary-trees-name** (12.7M nodes). tcvm 74 cycles and 447 instructions per
+node, LuaJIT 196 and 876 (64% collection). Per node: `jit_newtable` 13.5
+cycles, `memset_pattern16` 9.2 (the template's nil fill that three stores then
+overwrite), collection 13.6, `BottomUpTree` 17, `ItemCheck` 9, calls 9. 36% of
+`BottomUpTree`'s samples sit on its two resume points, which a return through
+`br x16` would explain (unmeasured, C6). Three barriers and a shape guard on
+the fresh table (A1, C1).
+
+**coroutine-ring** (2e7 round trips). Per round trip: tcvm 722 instructions and
+96 cycles, the interpreter 540 and 81, LuaJIT 469 and 64. With the JIT on, 78%
+of cycles are the native call path into `coroutine.resume`/`yield`
+(`enter`, `native_enter`, `lua_resume`, `native_act`, `drive`, `resume_into`,
+`native_continue`, `yield_from`, `prepend_true`): about 76 cycles per round
+trip against 31 through the interpreter's `ff_resume`/`ff_yield`. `token == n`
+compares an integer with the float `2e7` through `jit_eq` (5.5 cycles). The main
+loop region keeps a collector check, reloads five registers and re-guards three
+after the resume. LuaJIT's traces stitch around its assembler fast functions
+(C3, S4, C2).
+
+**chameneos** (5e7 resume/yield pairs). Per pair: tcvm 765 instructions and 107
+cycles, the interpreter 605 and 95, LuaJIT 493 and 60. The switch is about 70
+cycles compiled against 31 interpreted. `meet` stores to closed upvalues through
+an unconditional `jit_upval_barrier` call (C3, F4, S3).
+
+**table-sort** (5e6 floats). Phases: generate 0.37 Gcyc (LuaJIT 0.16; `rand` is
+a call), sort and assert 3.30 (LuaJIT 6.39; tcvm's Rust quicksort is about 2×
+faster), print 9.70 with 1.51 s of system time (LuaJIT 0.66): one `write(2)` per
+line, and each number formatted and interned (R1, R2).
+
+**table-sort-cmp** (22.05M comparator calls). Per comparison: tcvm 529
+instructions and 121 cycles, the interpreter 625 and 126, LuaJIT 417 and 130.
+53% of cycles are the native sort's call path (`sort_drive`, `sort_call`,
+`ret_native`, `sort_cont`, `enter`); the comparator region is 30%, most of it
+waiting on the `lhs.x`/`rhs.x` loads. The float `~=` is the generic chain.
+`rand() % 10000` on floats calls `fmod` (6.5%). The same sort written in Lua is
+1.67 Gcyc against the native 2.67 (LuaJIT's, with the comparator inlined,
+1.15) (C5, R3, S1, S5).
+
+**richard.** Calls 14% (about 151 instructions per method call), `fmod` 12.9%
+(the idler's `% 65536` and friends on floats: 129 instructions and 35 cycles
+per iteration against LuaJIT's 10 and 5), `jit_eq` 9.1% (`x ~= NO_TASK` with a
+nil upvalue). The main loop header carries eight block parameters derived from
+rematerializable values, kept in spill slots; its collector check is 7.8% of the
+region's samples. LuaJIT's root trace inlines seven functions (S5, S3, I1, Q4,
+S7, C2).
+
+**deltablue.** `jit_index` → `walk_index_chain` → `raw_get` 23% (two-level
+`o:get()` 354 instructions and 47 cycles; a nil own field under `__index` 194
+and 26; LuaJIT 6 and 1), calls 11%, collection 11%. `EqualityConstraint:execute`
+dispatches on two shapes at every access (2304 bytes after three compiles).
+Fields of `setmetatable({}, mt)` objects live in aux storage. 50 of 122
+compiles are recompiles; compiling is 7.7% of the run. Two compiles are refused
+("no path does work before a deopt"). LuaJIT aborts on `FNEW` (149), `UCLO`
+(20) and inner loops, and interprets 57% of its run (F1, F2, F3, C1, T3).
+
+**havlak.** Collection 33% (`trace(TableState)`, `trace(Value)`),
+`setmetatable(obj, {__index = K})` 9.4% (`adopt`, `join_by_memo`, transition
+lookups), `jit_newtable` 4.8%, `memset_pattern16` 3.9%, `jit_closure` 2.8%,
+`set_int_key` through `jit_newindex` 1.8%. A three-field object costs 194
+instructions and 28.5 cycles (LuaJIT 798 and 141); with its `setmetatable` 555
+and 78 (LuaJIT 1470 and 256). LuaJIT spends 41% in its collector and aborts on
+`FNEW` (216) and `UCLO` (110) (A2, A1, A3, A5, R5).
+
+**json.** `string.sub` is a full native call in `Parser:read` (about 20% of
+cycles, B1); interning of the one-character results and `memcmp` about 9.5%
+even with the intrinsic (R4); `Parser` has two shapes, so `read` took four
+compiles and grew to 3072 bytes (F2); `self:read()` per character is a call
+(I1); `setmetatable` per value about 6% (A2). LuaJIT spends 39% in its trace
+compiler ("NYI: return to lower frame" 5619 times, 136 mcode allocation
+failures).
