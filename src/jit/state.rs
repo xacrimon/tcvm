@@ -12,11 +12,13 @@ use crate::jit::region::Region;
 pub(crate) const MAX_ENTRIES: usize = 4;
 /// Regions a prototype may ever compile.
 pub(crate) const MAX_COMPILES: u8 = 16;
-/// Recompiles of one entry before it is blacklisted.
-pub(crate) const MAX_RECOMPILES: u8 = 4;
+/// Recompiles of one entry that learned nothing before it is blacklisted;
+/// each doubles the exits and executions the next one waits for.
+pub(crate) const MAX_RETRIES: u8 = 6;
 /// Compiler failures on a prototype before it is refused.
 pub(crate) const MAX_STRIKES: u8 = 3;
-/// Takings of one widenable exit that mark its entry for recompilation.
+/// Takings of one widenable exit that mark its entry for recompilation,
+/// before backoff (`Region::exit_hot`).
 pub(crate) const EXIT_HOT: u32 = 10;
 /// Words of the register image `exit_common` writes: x0-x15, x19-x21,
 /// x26-x28, d0-d31, then the region's spill slots from word 64.
@@ -238,8 +240,9 @@ unsafe impl<'gc> Collect<'gc> for JitRuntime {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum EntryState {
     Compiled,
-    /// Its slot points at `jit_recompile`.
-    Recompile,
+    /// Its slot points at `jit_settle`, which runs the original word until
+    /// `Entry::settle` runs out, then recompiles.
+    Settling,
 }
 
 /// A compiled entry of a prototype: the counting word it replaced and the
@@ -252,9 +255,12 @@ pub(crate) struct Entry<'gc> {
     pub(crate) original: Instruction,
     pub(crate) slot: u16,
     pub(crate) region: Option<Gc<'gc, Region<'gc>>>,
-    pub(crate) recompiles: u8,
-    /// A never-executed exit asked for a recompile outside the budget.
+    /// Recompiles that learned nothing (`MAX_RETRIES`).
+    pub(crate) retries: u8,
+    /// The recompile asked for learned feedback: outside the budget.
     pub(crate) free_recompile: bool,
+    /// Executions left before a settling entry recompiles.
+    pub(crate) settle: u32,
     #[collect(require_static)]
     pub(crate) state: EntryState,
     /// The headers (first pcs) of a loop entry's loop and the loops around

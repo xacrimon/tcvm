@@ -1024,9 +1024,10 @@ fn float_arith(b: &mut Builder<'_, '_>, kind: ArithKind, x: Val, y: Val, r: Oper
         Div => b.ins(Op::FDiv, &[x, y]),
         IDiv => b.ins(Op::FIDiv, &[x, y]),
         Mod => b.ins(Op::Helper(HelperId::FMod), &[x, y]),
+        // `-0.0` matches `0.0`: `pow(x, -0.0)` is 1 too.
         Pow => match r.konst(b) {
-            Some(e) if e == 0.0 => b.kf64(1.0),
-            Some(e) if e == 1.0 => x,
+            Some(0.0) => b.kf64(1.0),
+            Some(1.0) => x,
             _ => b.ins(Op::Helper(HelperId::FPow), &[x, y]),
         },
         _ => unreachable!("{kind:?} on floats"),
@@ -1333,13 +1334,13 @@ fn emit_cmp_reg(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Bl
         }
     }
     // An `_II` form, which exits saw leave i32 when the byte has big integers.
-    let form = (op != generic && !b.kind_exited(pc)).then(|| {
-        CmpKind::Num(if byte & fb::BIGINT != 0 {
+    let form = (op != generic && !b.kind_exited(pc)).then_some(CmpKind::Num(
+        if byte & fb::BIGINT != 0 {
             NumKind::I64
         } else {
             NumKind::I32
-        })
-    });
+        },
+    ));
     let kind = |b: &Builder<'_, '_>, v| cmp_own(b, v).or(form).or_else(|| byte_cmp_kind(byte));
     let c = match (kind(b, x), kind(b, y)) {
         (Some(CmpKind::Num(kx)), Some(CmpKind::Num(ky))) => cmp_num(b, cc, (x, kx), (y, ky)),
