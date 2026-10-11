@@ -157,18 +157,26 @@ pub(crate) fn verify(f: &Func<'_>) -> Result<(), String> {
     Ok(())
 }
 
-/// No value the call-boundary pass cannot compute again is live into a
-/// resume block, and none once it did: everything else lives in home
-/// slots across the call (R6).
+/// Once the call-boundary pass ran, what is live across a call is a
+/// non-constant value its snapshot names, never a raw pointer (C1).
 fn check_r6(f: &Func<'_>, rpo: &[Block], _pos: &[(Block, usize)]) -> Result<(), String> {
+    if !f.boundaries {
+        return Ok(());
+    }
     let live = live_in(f, rpo);
+    let cfg = f.cfg();
     for &b in rpo {
         if !f.blocks[b.idx()].resume {
             continue;
         }
+        let kept = crate::jit::opt::calls::kept_across(f, &cfg, b);
         for v in live[b.idx()].iter() {
-            if f.boundaries || !crate::jit::opt::calls::rematerializable(f, Val(v as u32)) {
-                return Err(format!("v{v} is live across the call resuming at b{}", b.0));
+            let v = Val(v as u32);
+            if !kept.contains(&crate::jit::opt::calls::same_reg(f, v)) {
+                return Err(format!(
+                    "v{} is live across the call resuming at b{}",
+                    v.0, b.0
+                ));
             }
         }
     }

@@ -119,19 +119,9 @@ handler! {
             let w = match s.loc {
                 Loc::Reg(i) => img[i as usize].get(),
                 Loc::Spill(i) => img[crate::jit::backend::aarch64::abi::IMAGE_SPILLS + i as usize].get(),
-                Loc::Const(c) => region.consts[c as usize],
-                Loc::Nil => Value::nil().to_raw(),
-                Loc::False => Value::boolean(false).to_raw(),
-                Loc::True => Value::boolean(true).to_raw(),
+                loc => const_word(region, loc),
             };
-            let v = match s.rep {
-                SRep::Val => unsafe { Value::from_raw(w) },
-                SRep::I32 => Value::small(w as i32),
-                SRep::I64 => Value::integer(mc, w as i64),
-                SRep::F64 => Value::float(f64::from_bits(w)),
-                SRep::B1 => Value::boolean(w & 1 != 0),
-            };
-            unsafe { base.add(s.reg as usize).write(v) };
+            unsafe { base.add(s.reg as usize).write(entry_value(mc, s.rep, w)) };
         }
         base = fbase;
         let closure = fclosure;
@@ -185,6 +175,66 @@ handler! {
                 let h = rt.handler(original.opcode());
                 tail!(h, insn = Slot::insn(original), closure = Slot::closure(closure))
             }
+        }
+    }
+}
+
+/// The word of a constant snapshot location.
+fn const_word(region: &Region<'_>, loc: Loc) -> u64 {
+    match loc {
+        Loc::Const(c) => region.consts[c as usize],
+        Loc::Nil => Value::nil().to_raw(),
+        Loc::False => Value::boolean(false).to_raw(),
+        Loc::True => Value::boolean(true).to_raw(),
+        Loc::Reg(_) | Loc::Spill(_) => unreachable!("not a constant location"),
+    }
+}
+
+/// A snapshot entry's word as the value it stands for.
+fn entry_value<'gc>(mc: &crate::dmm::Mutation<'gc>, rep: SRep, w: u64) -> Value<'gc> {
+    match rep {
+        SRep::Val => unsafe { Value::from_raw(w) },
+        SRep::I32 => Value::small(w as i32),
+        SRep::I64 => Value::integer(mc, w as i64),
+        SRep::F64 => Value::float(f64::from_bits(w)),
+        SRep::B1 => Value::boolean(w & 1 != 0),
+    }
+}
+
+/// Write the values of each region frame from `fp` down to dispatch's into
+/// their home slots before control leaves compiled code (C1): `lr` names
+/// the site in the frame at `fp` (a return address, or the address past a
+/// `bl` to the leave stub), whose base is `base`. A frame's caller is its
+/// frame record's, the caller's base its header's word 2.
+pub(crate) unsafe extern "C" fn jit_leave(
+    rt: *const crate::lua::State<'static>,
+    fp: *const u64,
+    lr: u64,
+    base: *mut Value<'static>,
+) {
+    let ctx = unsafe { Context::from_state(rt) };
+    let native = ctx.jit().native.fp.get();
+    let (mut fp, mut lr, mut base) = (fp, lr, base);
+    while fp as usize != native {
+        // SAFETY: a region frame records its region, and its spill slots
+        // follow (`emit::FRAME_REGION`, `FRAME_SPILLS`).
+        unsafe {
+            let region = &*(*fp.add(2) as *const Region<'static>);
+            let snap = region
+                .site((lr & !1) as usize)
+                .expect("a return address without its site");
+            for s in snap.entries() {
+                let w = match s.loc {
+                    Loc::Spill(i) => *fp.add(3 + i as usize),
+                    Loc::Reg(_) => unreachable!("a site's value in a register"),
+                    loc => const_word(region, loc),
+                };
+                base.add(s.reg as usize)
+                    .write(entry_value(ctx.mutation(), s.rep, w));
+            }
+            lr = *fp.add(1);
+            fp = *fp as *const u64;
+            base = *(base as *const u64).sub(2) as *mut Value<'static>;
         }
     }
 }

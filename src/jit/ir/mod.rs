@@ -228,8 +228,13 @@ pub(crate) struct Func<'gc> {
     /// The `After` snapshot of a value's definition, where a definition
     /// guard (9.1) may exit: call results, loads after a call, upvalues.
     pub(crate) def_snaps: Vec<(Val, Snap)>,
-    /// The call-boundary pass ran: nothing is live across a call (R6).
+    /// The call-boundary pass ran: what is live across a call is a value
+    /// its snapshot names (C1).
     pub(crate) boundaries: bool,
+    /// The registers dead at the calls of each pc: neither live after them,
+    /// nor written by them, nor captured. The call-boundary pass may keep a
+    /// value no register holds in one (C1).
+    pub(crate) call_free: crate::jit::FastMap<u32, crate::jit::build::cfg::RegSet>,
     cfg: RefCell<Option<Rc<CfgInfo>>>,
 }
 
@@ -267,6 +272,7 @@ impl<'gc> Func<'gc> {
             meta,
             def_snaps: Vec::new(),
             boundaries: false,
+            call_free: Default::default(),
             cfg: RefCell::new(None),
         }
     }

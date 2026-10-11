@@ -54,7 +54,9 @@ pub(crate) fn prune_snapshots(f: &mut Func<'_>) {
         for k in 0..f.insts_of(b).len() {
             let e = f.insts_of(b)[k];
             let s = f.insts[e.idx()].snap;
-            if s == NO_SNAP {
+            // A call-site snapshot names what the slow resume reads back
+            // into the frame: a value still in its slot is read back too.
+            if s == NO_SNAP || matches!(f.op(e), Op::Call { .. } | Op::CallMm { .. }) {
                 continue;
             }
             let entries = f.entries(s).to_vec();
