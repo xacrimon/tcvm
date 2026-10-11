@@ -48,6 +48,7 @@ fn peel_loop(f: &mut Func<'_>, h: Block, body: &[Block]) {
     for &b in &order {
         let nb = f.new_block();
         f.blocks[nb.idx()].resume = f.blocks[b.idx()].resume;
+        f.blocks[nb.idx()].cold = f.blocks[b.idx()].cold;
         bmap.insert(b, nb);
     }
     let mut vmap: HashMap<Val, Val> = HashMap::default();

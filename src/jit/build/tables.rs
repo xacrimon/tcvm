@@ -11,7 +11,7 @@ use crate::env::value::Value;
 use crate::env::{MetamethodBits, Shape};
 use crate::instruction::{Instruction, Op as BcOp};
 use crate::jit::build::Builder;
-use crate::jit::build::emit::{arm_end, branch_arm, calls_mm, enter_join, mm_call};
+use crate::jit::build::emit::{arm_end, branch_arm, calls_mm, cold, enter_join, mm_call};
 use crate::jit::feedback as fb;
 use crate::jit::ir::{Block, Val};
 use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL_VAL, HelperId, Op};
@@ -88,9 +88,11 @@ fn index(b: &mut Builder<'_, '_>, dst: u8, recv: Val, key: Val) -> Val {
     }
     let join = b.new_block();
     let ok = branch_arm(b, failed);
-    let f = function_or_deopt(b, HelperId::IndexFn, recv, key);
-    let w = mm_call(b, f, &[recv, key]);
-    arm_end(b, join, dst, w);
+    cold(b, |b| {
+        let f = function_or_deopt(b, HelperId::IndexFn, recv, key);
+        let w = mm_call(b, f, &[recv, key]);
+        arm_end(b, join, dst, w);
+    });
     b.switch_to(ok);
     arm_end(b, join, dst, r);
     enter_join(b, join);
@@ -112,9 +114,11 @@ fn newindex(b: &mut Builder<'_, '_>, recv: Val, key: Val, v: Val, keyed: bool) {
     }
     let join = b.new_block();
     let ok = branch_arm(b, failed);
-    let f = function_or_deopt(b, HelperId::NewIndexFn, recv, key);
-    mm_call(b, f, &[recv, key, v]);
-    b.jump(join);
+    cold(b, |b| {
+        let f = function_or_deopt(b, HelperId::NewIndexFn, recv, key);
+        mm_call(b, f, &[recv, key, v]);
+        b.jump(join);
+    });
     b.switch_to(ok);
     b.jump(join);
     enter_join(b, join);
@@ -149,8 +153,10 @@ fn nil_walks<'gc>(
     let not_nil = branch_arm(b, nil);
     let has = class_has(b, shape, MetamethodBits::INDEX).unwrap();
     let plain = branch_arm(b, has);
-    let w = index(b, dst, recv, key);
-    arm_end(b, join, dst, w);
+    cold(b, |b| {
+        let w = index(b, dst, recv, key);
+        arm_end(b, join, dst, w);
+    });
     b.switch_to(plain);
     arm_end(b, join, dst, v);
     b.switch_to(not_nil);
@@ -399,8 +405,10 @@ fn proto_load<'gc>(
     let join = b.new_block();
     let nil = b.ins(Op::IsType(TypeSet::NIL), &[v]);
     let found = branch_arm(b, nil);
-    let w = index(b, dst, site.recv, site.key);
-    arm_end(b, join, dst, w);
+    cold(b, |b| {
+        let w = index(b, dst, site.recv, site.key);
+        arm_end(b, join, dst, w);
+    });
     b.switch_to(found);
     arm_end(b, join, dst, v);
     enter_join(b, join);
@@ -562,8 +570,10 @@ fn trans_store<'gc>(
     b.jump(join);
     if let Some(full) = full {
         b.switch_to(full);
-        newindex(b, recv, key, v, false);
-        b.jump(join);
+        cold(b, |b| {
+            newindex(b, recv, key, v, false);
+            b.jump(join);
+        });
     }
     enter_join(b, join);
 }
@@ -683,8 +693,10 @@ pub(super) fn emit_gettable(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction)
                 let join = b.new_block();
                 arm_end(b, join, dst, v);
                 b.switch_to(other);
-                let w = index(b, dst, recv, key);
-                arm_end(b, join, dst, w);
+                cold(b, |b| {
+                    let w = index(b, dst, recv, key);
+                    arm_end(b, join, dst, w);
+                });
                 enter_join(b, join);
             }
         }
@@ -701,19 +713,22 @@ pub(super) fn emit_gettable(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction)
     // A nil is the result unless the class has `__index` now.
     let has = class_bit(b, t, MetamethodBits::INDEX);
     let plain = branch_arm(b, has);
-    let w = index(b, dst, recv, key);
-    arm_end(b, join, dst, w);
+    let walk = |b: &mut Builder<'_, '_>| {
+        cold(b, |b| {
+            let w = index(b, dst, recv, key);
+            arm_end(b, join, dst, w);
+        })
+    };
+    walk(b);
     b.switch_to(plain);
     arm_end(b, join, dst, v);
     b.switch_to(found);
     arm_end(b, join, dst, v);
     b.switch_to(outside);
-    let w = index(b, dst, recv, key);
-    arm_end(b, join, dst, w);
+    walk(b);
     if let Some(other) = other {
         b.switch_to(other);
-        let w = index(b, dst, recv, key);
-        arm_end(b, join, dst, w);
+        walk(b);
     }
     enter_join(b, join);
 }
@@ -753,8 +768,10 @@ pub(super) fn emit_settable(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction)
         let present = branch_arm(b, nil);
         let has = class_bit(b, t, MetamethodBits::NEWINDEX);
         let plain = branch_arm(b, has);
-        newindex(b, recv, key, v, true);
-        b.jump(join);
+        cold(b, |b| {
+            newindex(b, recv, key, v, true);
+            b.jump(join);
+        });
         for blk in [plain, present] {
             b.switch_to(blk);
             barrier_for(b, t, v);
@@ -762,13 +779,17 @@ pub(super) fn emit_settable(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction)
             b.jump(join);
         }
         b.switch_to(outside);
-        newindex(b, recv, key, v, true);
-        b.jump(join);
+        cold(b, |b| {
+            newindex(b, recv, key, v, true);
+            b.jump(join);
+        });
     }
     if let Some(other) = other {
         b.switch_to(other);
-        newindex(b, recv, key, v, true);
-        b.jump(join);
+        cold(b, |b| {
+            newindex(b, recv, key, v, true);
+            b.jump(join);
+        });
     }
     enter_join(b, join);
 }

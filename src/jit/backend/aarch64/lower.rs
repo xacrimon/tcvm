@@ -463,11 +463,12 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                         let (d, u) = (self.def(r), self.use_(x));
                         self.push(MInst::BoxB1, &[d, u], none);
                     }
+                    // The slow case calls through a trampoline (A5): only x0
+                        // changes.
                     Rep::I64 => {
                         let d = Operand::reg_fixed_def(self.vr(r), preg_int(0));
                         let u = Operand::reg_fixed_use(self.vr(x), preg_int(1));
-                        let mut clob = caller_saved();
-                        clob.remove(preg_int(0));
+                        let clob = none;
                         if f.insts[i.idx()].snap != NO_SNAP {
                             self.push_exit(i, |exit| MInst::BoxI64 { exit }, vec![d, u], clob);
                         } else {
@@ -970,10 +971,20 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             }
             Op::Helper(h) => {
                 // Arguments go in order after the pinned registers and the
-                // immediate, which the emitter moves in at the call.
+                // immediate, which the emitter moves in at the call. A cold
+                // arm's trampoline keeps every other register.
                 let sig = h.sig();
+                let cold = f.blocks[f.insts[i.idx()].block.idx()].cold;
                 let mut ops = Vec::with_capacity(args.len() + 1);
-                let mut clob = caller_saved();
+                let mut clob = if cold {
+                    let mut s = PRegSet::empty();
+                    for k in 0..sig.ctx.len() + sig.imm.is_some() as usize {
+                        s.add(preg_int(k as u8));
+                    }
+                    s
+                } else {
+                    caller_saved()
+                };
                 if let Some(r) = res {
                     let p = if sig.ret == Some(Rep::F64) {
                         preg_float(0)
@@ -995,7 +1006,12 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     };
                     ops.push(Operand::reg_fixed_use(self.vr(a), p));
                 }
-                self.push(MInst::Helper(h), &ops, clob);
+                let m = if cold {
+                    MInst::HelperCold(h)
+                } else {
+                    MInst::Helper(h)
+                };
+                self.push(m, &ops, clob);
             }
             Op::Resume { c } => {
                 let a = match self.f.blocks[self.f.insts[i.idx()].block.idx()].resume {

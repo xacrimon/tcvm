@@ -72,13 +72,61 @@ pub(crate) struct FastEntry {
 }
 
 /// Addresses of the Rust routines a region branches to.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct Helpers {
     pub(crate) exit_common: usize,
     pub(crate) entry_fail: usize,
     pub(crate) enter: usize,
+    /// `jit_box_i64`'s trampoline.
     pub(crate) box_i64: usize,
     pub(crate) land: usize,
+    /// The trampolines of the helpers cold arms call: (helper, trampoline).
+    pub(crate) trampolines: Vec<(usize, usize)>,
+}
+
+/// A trampoline (A5): a C call of `target` that keeps x0-x15, d0-d7 and
+/// d16-d30 but the result's register, behind a frame record that keeps the
+/// frame chain walkable.
+pub(crate) fn trampoline(target: usize, ret_float: bool) -> Asm {
+    let ints: Vec<Gpr> = (0..16u8).filter(|&r| ret_float || r != 0).map(Gpr).collect();
+    let floats: Vec<Fpr> = (0..8u8)
+        .chain(16..31)
+        .filter(|&r| !ret_float || r != 0)
+        .map(Fpr)
+        .collect();
+    let frame = (16 + 8 * (ints.len() + floats.len()) as u64).next_multiple_of(16);
+    let mut a = Asm::new();
+    a.sub_imm(Sz::X, SP, SP, frame);
+    a.stp(FP, LR, SP, 0);
+    a.mov_sp(FP, SP);
+    let save = |a: &mut Asm, load: bool| {
+        let mut off = 16;
+        for p in ints.chunks(2) {
+            match (p, load) {
+                ([x, y], false) => a.stp(*x, *y, SP, off),
+                ([x, y], true) => a.ldp(*x, *y, SP, off),
+                (_, false) => a.str(p[0], SP, off),
+                (_, true) => a.ldr(p[0], SP, off),
+            }
+            off += 8 * p.len() as i32;
+        }
+        for p in floats.chunks(2) {
+            match (p, load) {
+                ([x, y], false) => a.stp_d(*x, *y, SP, off),
+                ([x, y], true) => a.ldp_d(*x, *y, SP, off),
+                (_, false) => a.str_d(p[0], SP, off),
+                (_, true) => a.ldr_d(p[0], SP, off),
+            }
+            off += 8 * p.len() as i32;
+        }
+    };
+    save(&mut a, false);
+    a.bl_far(target);
+    save(&mut a, true);
+    a.ldp(FP, LR, SP, 0);
+    a.add_imm(Sz::X, SP, SP, frame);
+    a.ret();
+    a
 }
 
 fn gpr(p: PReg) -> Gpr {
@@ -1134,7 +1182,7 @@ impl Em<'_> {
                 self.a.str(v, X16, 0);
             }
             GcCheck { exit } => self.gc_check(exit),
-            Helper(h) => {
+            Helper(h) | HelperCold(h) => {
                 let sig = h.sig();
                 for (k, c) in sig.ctx.iter().enumerate() {
                     match c {
@@ -1146,7 +1194,13 @@ impl Em<'_> {
                 if let Some(imm) = sig.imm {
                     self.a.mov_imm(Gpr(sig.ctx.len() as u8), imm);
                 }
-                self.a.bl_far(crate::jit::helpers::address(h));
+                let target = crate::jit::helpers::address(h);
+                if matches!(inst, HelperCold(_)) {
+                    let t = self.helpers.trampolines.iter().find(|(x, _)| *x == target);
+                    self.a.bl_far(t.expect("a trampoline for a cold helper").1);
+                } else {
+                    self.a.bl_far(target);
+                }
             }
             Jump => {
                 let t = self.v.succs(block)[0].index();

@@ -108,6 +108,11 @@ pub(crate) struct JitRuntime {
     pub(crate) exit_regs: *mut u64,
     exit_regs_buf: Box<[Cell<u64>; EXIT_REGS]>,
     pub(crate) config: JitConfig,
+    /// The cold-arm trampolines made so far: (helper, its entry). Their code
+    /// is freed before the allocator below.
+    trampolines: RefCell<Vec<(usize, usize)>>,
+    #[cfg(target_arch = "aarch64")]
+    trampoline_code: RefCell<Vec<crate::jit::backend::alloc::CodeBlock>>,
     code: RefCell<Option<std::rc::Rc<crate::jit::backend::alloc::CodeAllocator>>>,
     /// Compile failures from running out of code memory turn the JIT off.
     pub(crate) exhausted: Cell<bool>,
@@ -155,6 +160,9 @@ impl JitRuntime {
             exit_regs,
             exit_regs_buf,
             config,
+            trampolines: RefCell::new(Vec::new()),
+            #[cfg(target_arch = "aarch64")]
+            trampoline_code: RefCell::new(Vec::new()),
             code: RefCell::new(None),
             exhausted: Cell::new(false),
             ra: RefCell::new(regalloc2::Ctx::default()),
@@ -213,6 +221,28 @@ impl JitRuntime {
                 std::rc::Rc::new(crate::jit::backend::alloc::CodeAllocator::new())
             })
             .clone()
+    }
+
+    /// The trampoline that calls `helper` keeping the registers (A5), made
+    /// on first use; `ret_float` for a helper returning in d0.
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn trampoline(&self, helper: usize, ret_float: bool) -> Result<usize, String> {
+        if let Some(&(_, t)) = self.trampolines.borrow().iter().find(|(h, _)| *h == helper) {
+            return Ok(t);
+        }
+        let asm = crate::jit::backend::aarch64::emit::trampoline(helper, ret_float);
+        let alloc = self.code_alloc();
+        let block = alloc
+            .reserve(asm.offset() + asm.pool_bytes() + 16)
+            .map_err(|e| format!("code memory: {e}"))?;
+        let words = asm
+            .finish(block.rx() as usize)
+            .map_err(|e| format!("assembler: {e:?}"))?;
+        block.write(&words);
+        let t = block.rx() as usize;
+        self.trampoline_code.borrow_mut().push(block);
+        self.trampolines.borrow_mut().push((helper, t));
+        Ok(t)
     }
 
     /// The register image of the last exit.

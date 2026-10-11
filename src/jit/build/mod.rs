@@ -100,6 +100,8 @@ pub(crate) struct Builder<'a, 'gc> {
     pub(crate) callee_hint: Option<(u32, Val, Val)>,
     /// The shapes field sites compiled tests for, by receiver value.
     pub(crate) recv_shapes: crate::jit::FastMap<Val, Vec<crate::env::Shape<'gc>>>,
+    /// Blocks made now are cold arms (A5).
+    cold: bool,
 }
 
 impl<'a, 'gc> Builder<'a, 'gc> {
@@ -138,6 +140,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             field_loads: Default::default(),
             recv_shapes: Default::default(),
             callee_hint: None,
+            cold: false,
         }
     }
 
@@ -145,6 +148,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
 
     pub(crate) fn new_block(&mut self) -> Block {
         let b = self.f.new_block();
+        self.f.blocks[b.idx()].cold = self.cold;
         self.defs.extend(std::iter::repeat_n(None, self.nregs));
         self.slots
             .extend(std::iter::repeat_n(SlotState::Unknown, self.nregs));
@@ -199,6 +203,17 @@ impl<'a, 'gc> Builder<'a, 'gc> {
 
     pub(crate) fn switch_to(&mut self, b: Block) {
         self.cur = b;
+    }
+
+    /// Make the current block, and the blocks made until `end_cold`, a cold
+    /// arm; the previous setting, for `end_cold`.
+    pub(crate) fn begin_cold(&mut self) -> bool {
+        self.f.blocks[self.cur.idx()].cold = true;
+        std::mem::replace(&mut self.cold, true)
+    }
+
+    pub(crate) fn end_cold(&mut self, was: bool) {
+        self.cold = was;
     }
 
     pub(crate) fn terminated(&self) -> bool {
@@ -391,6 +406,15 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     // --- instructions -------------------------------------------------------
 
     pub(crate) fn push(&mut self, op: Op, args: &[Val]) -> Inst {
+        // A cold arm's allocation has its own collector check, so the loop
+        // around it needs none (A5): garbage waits for the arm's next run.
+        if let Op::Helper(h) = op
+            && self.f.blocks[self.cur.idx()].cold
+            && h.sig().effects.has(crate::jit::ir::ops::Flags::MAY_ALLOC)
+        {
+            let s = self.snap_before();
+            self.ins_snap(Op::GcCheck, &[], s, ExitTag::Gc);
+        }
         let i = self.f.make_inst(op, args, None, ExitTag::Type);
         self.f.append(self.cur, i);
         i

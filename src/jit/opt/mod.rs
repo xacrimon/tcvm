@@ -7,6 +7,7 @@ pub(crate) mod infer;
 pub(crate) mod licm;
 pub(crate) mod peel;
 pub(crate) mod simplify;
+pub(crate) mod sink;
 pub(crate) mod snaps;
 pub(crate) mod speculate;
 
@@ -81,9 +82,11 @@ pub(crate) fn natural_loops(f: &Func<'_>) -> Vec<(Block, Vec<Block>)> {
 pub(crate) fn prune_gc_checks(f: &mut Func<'_>) {
     use crate::jit::ir::types::Rep;
     // A call is not an allocation: its callee checks its own, as the
-    // interpreter's allocating handlers and `native_enter` do (5.7).
+    // interpreter's allocating handlers and `native_enter` do (5.7). A cold
+    // arm checks before its own allocations.
     let allocates = |f: &Func<'_>, b: Block| {
-        f.insts_of(b).iter().any(|&i| match f.op(i) {
+        !f.blocks[b.idx()].cold
+            && f.insts_of(b).iter().any(|&i| match f.op(i) {
             Op::Box => f.ty(f.args(i)[0]).rep == Rep::I64,
             Op::Call { .. } | Op::CallMm { .. } => false,
             op => op.effects().has(crate::jit::ir::ops::Flags::MAY_ALLOC),
@@ -103,7 +106,7 @@ pub(crate) fn prune_gc_checks(f: &mut Func<'_>) {
         .iter()
         .any(|&b| !in_loop[b.idx()] && allocates(f, b));
     for b in 0..f.blocks.len() {
-        if keep[b] {
+        if keep[b] || f.blocks[b].cold {
             continue;
         }
         f.retain(Block(b as u32), |f, i| f.op(i) != Op::GcCheck);
@@ -175,6 +178,7 @@ pub(crate) fn split_critical_edges(f: &mut Func<'_>) {
                 continue;
             }
             let mid = f.new_block();
+            f.blocks[mid.idx()].cold = f.blocks[e.target.idx()].cold;
             let j = f.make_inst(Op::Jump, &[], None, crate::jit::ir::ops::ExitTag::Type);
             f.append(mid, j);
             f.set_edges(j, &[e]);

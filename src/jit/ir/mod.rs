@@ -145,6 +145,10 @@ pub(crate) struct BlockData {
     /// A loop header the region enters after a whole iteration of the loop
     /// (an entry at its header, 8.7), so peeling it again buys nothing.
     pub(crate) peeled: bool,
+    /// An arm for what the site's feedback says is rare (a helper's slow
+    /// case, a metamethod): laid out last, its helpers called through
+    /// trampolines that keep the registers (A5).
+    pub(crate) cold: bool,
 }
 
 /// How an exit resumes the interpreter.
