@@ -184,6 +184,8 @@ pub(crate) enum MInst {
     ClassMm(u8),
     /// `[def d, use t]`: the class bits of the table, 0 without a class.
     TabMmBits,
+    /// `[def d, use s]`: a string's length.
+    StrLenOf,
     /// `[def d, use f]`: whether the function is a Lua closure without varargs.
     FnFixedLua,
     /// `[def d, use f]`: whether the Lua closure's window fits from `base`.

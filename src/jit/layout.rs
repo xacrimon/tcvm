@@ -199,4 +199,17 @@ mod tests {
             assert_eq!(byte(fixed, FN_MAX_STACK), lf.max_stack_size);
         });
     }
+
+    #[test]
+    fn string_length() {
+        use crate::env::string::LuaString;
+        use crate::env::value::Value;
+        let mut lua = Lua::new();
+        lua.enter(|ctx| {
+            let s = LuaString::new(ctx, b"hello, world");
+            let p = (Value::string(s).to_raw() & ((1 << 48) - 1)) as usize;
+            let len = unsafe { ((p + LuaString::LEN_OFFSET) as *const usize).read() };
+            assert_eq!(len, 12);
+        });
+    }
 }

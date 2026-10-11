@@ -288,11 +288,7 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
         }
         UNM => emit_unm(b, pc, a, rb),
         BNOT => emit_bnot(b, a, rb),
-        LEN => {
-            let v = b.reg(rb);
-            let v = b.boxed(v);
-            helper_or_mm(b, a, HelperId::Len, &[v], MetamethodBits::LEN, &[v, v]);
-        }
+        LEN => emit_len(b, a, rb),
         CONCAT => {
             let (x, y) = (b.reg(rb), b.reg(insn.c()));
             let (x, y) = (b.boxed(x), b.boxed(y));
@@ -1086,6 +1082,69 @@ pub(super) fn helper_arms(
 /// loads and guards in it; until then the failure exits and records one.
 pub(super) fn calls_mm(b: &Builder<'_, '_>) -> bool {
     b.feedback(b.pc) & fb::MM != 0
+}
+
+/// `R[dst] = #R[src]` (7.2): a string's length inline; a table's by helper
+/// unless its class has `__len` now; anything else, and `__len`, as the
+/// generic helper and metamethod arms do.
+fn emit_len(b: &mut Builder<'_, '_>, dst: u8, src: u8) {
+    let v = b.reg(src);
+    let v = b.boxed(v);
+    let set = b.ty(v).set;
+    let may = |s: TypeSet| set.is_empty() || set.intersects(s);
+    let only = |s: TypeSet| !set.is_empty() && s.contains(set);
+    let join = b.new_block();
+    if may(TypeSet::STR) {
+        let other = (!only(TypeSet::STR)).then(|| arm(b, Op::IsType(TypeSet::STR), v));
+        let s = b.ins(Op::Refine(TypeSet::STR), &[v]);
+        let p = b.ins(Op::Unbox(Rep::Ptr), &[s]);
+        let n = b.ins(Op::StrLenOf, &[p]);
+        let n = b.ins(Op::Box, &[n]);
+        arm_end(b, join, dst, n);
+        match other {
+            Some(o) => b.switch_to(o),
+            None => {
+                enter_join(b, join);
+                return;
+            }
+        }
+    }
+    if may(TypeSet::TAB) {
+        let other = (!only(TypeSet::TAB)).then(|| arm(b, Op::IsType(TypeSet::TAB), v));
+        let t = b.ins(Op::Refine(TypeSet::TAB), &[v]);
+        let p = b.ins(Op::Unbox(Rep::Ptr), &[t]);
+        let has = tables::class_bit(b, p, MetamethodBits::LEN);
+        let plain = branch_arm(b, has);
+        helper_arms(
+            b,
+            join,
+            dst,
+            HelperId::Len,
+            &[v],
+            MetamethodBits::LEN,
+            &[v, v],
+        );
+        b.switch_to(plain);
+        let n = b.ins(Op::Helper(HelperId::RawLen), &[v]);
+        arm_end(b, join, dst, n);
+        match other {
+            Some(o) => b.switch_to(o),
+            None => {
+                enter_join(b, join);
+                return;
+            }
+        }
+    }
+    helper_arms(
+        b,
+        join,
+        dst,
+        HelperId::Len,
+        &[v],
+        MetamethodBits::LEN,
+        &[v, v],
+    );
+    enter_join(b, join);
 }
 
 /// `dst` = the helper's result, or the metamethod's (`helper_arms`).

@@ -548,6 +548,8 @@ pub(crate) enum Op {
     ClassMm(u8),
     /// The live metamethod bits (`I32`) of the table's class, 0 without one.
     TabMmBits,
+    /// A string's length (`I64`), the operand its value's payload (`Ptr`).
+    StrLenOf,
     /// The array part's size (`I32`) and cell.
     TabASize,
     TabArray,
@@ -803,8 +805,8 @@ impl Op {
             | IShl | IShr | IDivFloor | IModFloor | LToI | FToIExact => Ty::I32,
             IToF | LToF | FAdd | FSub | FMul | FDiv | FNeg | FAbs | FSqrt | FFloor | FCeil
             | FIDiv | ToF64 => Ty::F64,
-            IToL | FToL | LAdd | LSub | LMul | LUDiv | LNeg | LAnd | LOr | LXor | LNot | LShl
-            | LShr | LDivFloor | LModFloor => Ty::I64,
+            IToL | FToL | StrLenOf | LAdd | LSub | LMul | LUDiv | LNeg | LAnd | LOr | LXor
+            | LNot | LShl | LShr | LDivFloor | LModFloor => Ty::I64,
             Helper(HelperId::Arith(ArithKind::Div | ArithKind::Pow)) => Ty::val(TypeSet::FLOAT),
             Helper(HelperId::Arith(ArithKind::Add | ArithKind::Sub | ArithKind::Mul))
             | Helper(HelperId::Arith(ArithKind::Mod | ArithKind::IDiv))

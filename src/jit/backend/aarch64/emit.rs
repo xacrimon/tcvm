@@ -726,6 +726,11 @@ impl Em<'_> {
                 self.a.mov_imm(d, NIL);
                 self.a.bind(done);
             }
+            StrLenOf => {
+                let (d, s) = (self.r(i, 0), self.r(i, 1));
+                self.a
+                    .ldr(d, s, crate::env::string::LuaString::LEN_OFFSET as i32);
+            }
             TabMmBits => {
                 let (d, t) = (self.r(i, 0), self.r(i, 1));
                 let (none, done) = (self.a.new_label(), self.a.new_label());

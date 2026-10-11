@@ -696,6 +696,35 @@ fn nil_array_slots() {
     );
 }
 
+/// `#`: strings inline, tables through the length helper unless their class
+/// has `__len` at the time, which is called.
+#[test]
+fn length_operator() {
+    agrees(
+        r#"
+        local L = setmetatable({}, {__len = function() return 42 end})
+        local items = {"abc", {1, 2, 3}, "", L, {n = 1}, setmetatable({1, 2}, {__index = function() return 1 end})}
+        local function len(x) return #x end
+        local function strs(s) local n = 0 for i = 1, 10 do n = n + #s end return n end
+        local function tabs(t) local n = 0 for i = 1, 10 do t[#t + 1] = i; n = n + #t end return n end
+        local out = {}
+        for r = 1, 300 do
+          local s = 0
+          for i = 1, #items do s = s + len(items[i]) end
+          out[1] = s
+          out[2] = strs("hello")
+          out[3] = tabs({})
+        end
+        local late = {1, 2, 3}
+        for r = 1, 300 do len(late) end
+        setmetatable(late, {__len = function() return -1 end})
+        out[4] = len(late)
+        out[5] = select(2, pcall(len, 5))
+        return table.concat(out, " ")
+"#,
+    );
+}
+
 /// A field site that saw several shapes compiles a test per shape (own
 /// slots, `__index` holders, absent keys); one that saw more takes the
 /// helper.
