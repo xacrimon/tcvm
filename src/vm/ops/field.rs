@@ -403,6 +403,12 @@ macro_rules! index_chain {
                 next!()
             }
             IndexChain::Invoke { func, receiver } => {
+                // SAFETY: the site is the instruction before `pc` of the frame's closure.
+                crate::jit::feedback::record(
+                    unsafe { crate::vm::frame::closure($base) },
+                    unsafe { $pc.sub(1) },
+                    crate::jit::feedback::MM,
+                );
                 stage_mm!(
                     $pc,
                     $base,
@@ -430,6 +436,12 @@ macro_rules! newindex_chain {
                 next!()
             }
             NewIndexChain::Invoke { func, receiver } => {
+                // SAFETY: as in `index_chain!`.
+                crate::jit::feedback::record(
+                    unsafe { crate::vm::frame::closure($base) },
+                    unsafe { $pc.sub(1) },
+                    crate::jit::feedback::MM,
+                );
                 stage_mm!(
                     $pc,
                     $base,
@@ -540,9 +552,9 @@ handler! {
         if op == Op::SELF {
             reg![dst + 4] = recv;
         }
-        crate::jit::feedback::record(closure, unsafe { pc.sub(1) }, crate::jit::feedback::kind(recv));
         if op == Op::GETTABLE {
             let k = reg![insn.c()];
+            crate::jit::feedback::record(closure, unsafe { pc.sub(1) }, crate::jit::feedback::table_key(recv, k));
             if let Some(t) = recv.get_table() {
                 let v = t.raw_get(k);
                 if !v.is_nil() {
@@ -552,6 +564,7 @@ handler! {
             }
             index_chain!(pc, base, rt, recv, k, dst)
         }
+        crate::jit::feedback::record(closure, unsafe { pc.sub(1) }, crate::jit::feedback::kind(recv));
         let k = unsafe { *closure.constants.add(insn.e() as usize) };
         let Some(t) = recv.get_table() else {
             index_chain!(pc, base, rt, recv, k, dst)
@@ -576,11 +589,12 @@ handler! {
             Op::SETTABUP_REF => unsafe { (*closure.upvalue_ptr().add(insn.b() as usize)).cell }.get(),
             _ => reg![insn.b()],
         };
-        crate::jit::feedback::record(closure, unsafe { pc.sub(1) }, crate::jit::feedback::kind(recv));
         if op == Op::SETTABLE {
             let k = reg![insn.c()];
+            crate::jit::feedback::record(closure, unsafe { pc.sub(1) }, crate::jit::feedback::table_key(recv, k));
             newindex_chain!(pc, base, rt, recv, k, v, raw_set_keyed)
         }
+        crate::jit::feedback::record(closure, unsafe { pc.sub(1) }, crate::jit::feedback::kind(recv));
         let k = unsafe { *closure.constants.add(insn.e() as usize) };
         if let Some(t) = recv.get_table()
             && set_own_fill_ic(rt, closure, insn.d(), unsafe { pc.sub(1) }, t, k, v)

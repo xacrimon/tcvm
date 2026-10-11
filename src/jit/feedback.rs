@@ -18,6 +18,10 @@ pub(crate) const OVERFLOW: u8 = 64;
 pub(crate) const MM: u8 = 128;
 /// At a `FORPREP`: an integer loop's limit was a float.
 pub(crate) const FLOAT_LIMIT: u8 = OTHER;
+/// At a `GETTABLE` or `SETTABLE`, whose kinds are the key's (`OTHER` also
+/// for a receiver that is no table): a small key was outside the array part,
+/// or over a nil there with the class having `__index`/`__newindex`.
+pub(crate) const ARR_MISS: u8 = BIGINT;
 
 pub(crate) const INT: u8 = SMALL | BIGINT;
 pub(crate) const KINDS: u8 = SMALL | BIGINT | FLOAT | STR | TAB | OTHER;
@@ -38,6 +42,14 @@ pub(crate) fn kind(v: Value<'_>) -> u8 {
     } else {
         OTHER
     }
+}
+
+/// The bits of a `GETTABLE`/`SETTABLE` that left the array fast path.
+#[inline(always)]
+pub(crate) fn table_key(recv: Value<'_>, key: Value<'_>) -> u8 {
+    let recv = if recv.get_table().is_some() { 0 } else { OTHER };
+    let miss = if key.get_small().is_some() { ARR_MISS } else { 0 };
+    recv | kind(key) | miss
 }
 
 /// OR `bits` into the feedback of the instruction at `site` of `closure`.
