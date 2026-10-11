@@ -7,10 +7,9 @@
 //! offset). A moved exit leaves `Before` the loop header with the
 //! preheader's frame.
 
-use crate::jit::ir::ops::{Effects, Op};
+use crate::jit::ir::ops::{Flags, Mem, Op};
 use crate::jit::ir::{Block, Func, Inst, Val};
 use crate::jit::opt::calls::rematerializable;
-use crate::jit::opt::gvn::{TAB, reads, write_key, writes};
 use crate::jit::opt::natural_loops;
 
 pub(crate) fn licm(f: &mut Func<'_>) -> bool {
@@ -55,15 +54,16 @@ fn hoist(f: &mut Func<'_>, h: Block, body: &[Block]) -> bool {
     if !matches!(f.op(t), Op::Jump | Op::Br) {
         return false;
     }
-    // The loop's memory writes: classes, and the keys of keyed slot stores.
-    let mut wclass = 0u32;
-    let mut wkeys: Vec<u32> = Vec::new();
+    // The loop's memory writes: whole classes, and keys within a class.
+    let mut wclass = Mem::empty();
+    let mut wkeys: Vec<(Mem, u32)> = Vec::new();
     for &b in body {
         for &i in f.insts_of(b) {
             let op = f.op(i);
-            match (op, write_key(op)) {
-                (Op::TabStore { .. }, Some(key)) => wkeys.push(key),
-                _ => wclass |= writes(op),
+            let w = op.effects().writes;
+            match op.mem_key() {
+                Some(k) if !w.is_empty() => wkeys.push((w, k)),
+                _ => wclass |= w,
             }
         }
     }
@@ -87,10 +87,13 @@ fn hoist(f: &mut Func<'_>, h: Block, body: &[Block]) -> bool {
     });
     let params: Vec<Val> = f.params(h).to_vec();
     let edge_args: Vec<Val> = f.edge_args(t, k as usize).to_vec();
-    let memory_kept = |op: Op| match reads(op) {
-        None => true,
-        Some((TAB, Some(key))) => wclass >> TAB & 1 == 0 && !wkeys.contains(&key),
-        Some((c, _)) => wclass >> c & 1 == 0,
+    let memory_kept = |op: Op| {
+        let r = op.effects().reads;
+        !r.intersects(wclass)
+            && match op.mem_key() {
+                Some(k) => !wkeys.contains(&(r, k)),
+                None => !wkeys.iter().any(|&(c, _)| r.intersects(c)),
+            }
     };
     // Across a call only what can be computed again may live (R6, 9.8).
     let calls = body.iter().any(|&b| {
@@ -109,14 +112,13 @@ fn hoist(f: &mut Func<'_>, h: Block, body: &[Block]) -> bool {
                 continue;
             }
             let e = op.effects();
-            let exits = e.has(Effects::MAY_DEOPT);
-            let reads_memory = reads(op).is_some();
+            let exits = e.has(Flags::MAY_DEOPT);
+            let reads_memory = e.reads_memory();
             let movable = match op {
                 // Slots are loaded only where a region (re)starts.
-                Op::Load(_) => false,
-                _ if op.is_pure() => true,
-                _ if writes(op) != 0 || e.has(Effects::MAY_ALLOC) || e.has(Effects::R_GC) => false,
-                Op::Helper(_) | Op::Resume { .. } => false,
+                Op::Load(_) | Op::GcCheck => false,
+                _ if e.is_pure() => true,
+                _ if !e.movable() || e.writes() || e.has(Flags::MAY_ALLOC) => false,
                 // A test of values alone needs no earlier guard; a read of
                 // memory may (a slot's offset is right for one shape).
                 _ => {

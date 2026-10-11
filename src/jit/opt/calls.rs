@@ -98,7 +98,8 @@ pub(crate) fn rematerializable(f: &Func<'_>, v: Val) -> bool {
         return false;
     };
     let op = f.op(d);
-    (op.is_pure() || matches!(op, Op::Guard(_) | Op::Refine(_)))
+    // A pure helper is a call again.
+    (op.is_pure() && !matches!(op, Op::Helper(_)) || matches!(op, Op::Guard(_) | Op::Refine(_)))
         && f.args(d).iter().all(|&a| rematerializable(f, a))
 }
 
@@ -116,7 +117,7 @@ fn remat(
     let d = f.def_inst(v)?;
     let op = match f.op(d) {
         Op::Guard(set) => Op::Refine(set),
-        op if op.is_pure() || matches!(op, Op::Refine(_)) => op,
+        op if op.is_pure() && !matches!(op, Op::Helper(_)) || matches!(op, Op::Refine(_)) => op,
         _ => return None,
     };
     let args: Vec<Val> = f.args(d).to_vec();
