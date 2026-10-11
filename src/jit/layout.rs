@@ -43,6 +43,8 @@ pub(crate) const T_SPILL: usize = T_STATE + TableState::SPILL_OFFSET;
 pub(crate) const T_SPILL_CAP: usize = T_STATE + TableState::SPILL_CAP_OFFSET;
 pub(crate) const T_ARRAY: usize = T_STATE + TableState::ARRAY_OFFSET;
 pub(crate) const T_ASIZE: usize = T_STATE + TableState::ASIZE_OFFSET;
+/// A table's inline named slots, the values trailing its state.
+pub(crate) const T_INLINE: usize = RefLock::<TableState<'static>>::TRAILING_FROM_LOCK;
 /// A table's GC header (bit 0: gray, no barrier needed) before its lock.
 pub(crate) const T_HEADER: i32 =
     -(Gc::<'static, RefLock<TableState<'static>>>::VALUE_OFFSET as i32);
@@ -214,6 +216,61 @@ mod tests {
             let p = (Value::string(s).to_raw() & ((1 << 48) - 1)) as usize;
             let len = unsafe { ((p + LuaString::LEN_OFFSET) as *const usize).read() };
             assert_eq!(len, 12);
+        });
+    }
+
+    #[test]
+    fn named_slots_and_keys() {
+        use crate::env::Shape;
+        use crate::env::string::LuaString;
+        use crate::env::value::{STRING_BITS, Value};
+        let mut lua = Lua::new();
+        lua.load_all();
+        let ex = lua
+            .try_enter(|ctx| {
+                // More fields than any inline capacity, so some spill.
+                let mut src = String::from("local t = {}");
+                for i in 0..40 {
+                    src += &format!(" t.k{i} = {i}");
+                }
+                src += " return t";
+                Ok::<_, crate::LoadError>(ctx.stash(crate::Executor::start(
+                    ctx,
+                    ctx.load(src.as_str(), None)?,
+                    (),
+                )))
+            })
+            .unwrap();
+        lua.finish(&ex).unwrap();
+        lua.enter(|ctx| {
+            let v: Value = ctx.fetch(&ex).take_result(ctx).unwrap();
+            let t = v.get_table().unwrap();
+            let lock = (v.to_raw() & ((1 << 48) - 1)) as usize;
+            let rd = |a: usize| unsafe { (a as *const u64).read() } as usize;
+            let rd32 = |a: usize| unsafe { (a as *const u32).read() } as usize;
+            let shape = t.shape();
+            let sw = rd(lock + T_SHAPE);
+            assert_eq!(sw as u64, shape.as_word());
+            let n = rd32(sw + Shape::SLOT_COUNT_OFFSET);
+            assert_eq!(n, 40);
+            let cap = unsafe { ((sw + Shape::INLINE_CAP_OFFSET) as *const u8).read() } as usize;
+            assert!(cap < n);
+            assert_eq!(rd32(sw + Shape::MT_SLOT_OFFSET), u32::MAX as usize);
+            let keys = rd(rd(sw + Shape::KEYS_OFFSET) + Shape::KEYS_SLOTS_OFFSET);
+            for i in 0..n {
+                let kbox = rd(keys + 8 * i);
+                let key = ((kbox + LuaString::VALUE_OFFSET) as u64) | STRING_BITS;
+                let kv = unsafe { Value::from_raw(key) };
+                let k = kv.get_string().unwrap();
+                assert_eq!(k.as_bytes(), format!("k{i}").as_bytes());
+                let at = if i < cap {
+                    lock + T_INLINE + 8 * i
+                } else {
+                    rd(lock + T_SPILL) + 8 * (i - cap)
+                };
+                let v = unsafe { (at as *const Value).read() };
+                assert_eq!(v.get_small(), Some(i as i32));
+            }
         });
     }
 }

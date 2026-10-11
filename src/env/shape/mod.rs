@@ -921,6 +921,20 @@ impl<'gc> Shape<'gc> {
     /// from a shape's box.
     pub(crate) const MT_CACHE_OFFSET: usize = Gc::<'static, ShapeData<'static>>::VALUE_OFFSET
         + core::mem::offset_of!(ShapeData<'static>, mt_cache);
+    /// The slot count (`u32`), inline slot count (`u8`), metatable slot
+    /// (`u32`) and the box of the keys from a shape's box.
+    pub(crate) const SLOT_COUNT_OFFSET: usize = Gc::<'static, ShapeData<'static>>::VALUE_OFFSET
+        + core::mem::offset_of!(ShapeData<'static>, slot_count);
+    pub(crate) const INLINE_CAP_OFFSET: usize = Gc::<'static, ShapeData<'static>>::VALUE_OFFSET
+        + core::mem::offset_of!(ShapeData<'static>, inline_cap);
+    pub(crate) const MT_SLOT_OFFSET: usize = Gc::<'static, ShapeData<'static>>::VALUE_OFFSET
+        + core::mem::offset_of!(ShapeData<'static>, mt_slot);
+    pub(crate) const KEYS_OFFSET: usize = Gc::<'static, ShapeData<'static>>::VALUE_OFFSET
+        + core::mem::offset_of!(ShapeData<'static>, keys);
+    /// The keys' array (string boxes) from the keys' box: the first word of
+    /// the slice box (a layout test checks it).
+    pub(crate) const KEYS_SLOTS_OFFSET: usize =
+        Gc::<'static, Keys<'static>>::VALUE_OFFSET + core::mem::offset_of!(Keys<'static>, slots);
 
     /// The shape's box address, what a table's `shape` field holds.
     pub(crate) fn as_word(self) -> u64 {

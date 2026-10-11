@@ -222,6 +222,11 @@ pub(crate) enum MInst {
     ArrStore,
     /// `[early def d, use t, use from, temp v]`.
     ArrNext,
+    /// `[early def d, use t, use from, temp n, temp cap, temp mt]`.
+    NamedNext,
+    /// `[def d, use t, use i]`.
+    NamedVal,
+    NamedKey,
     /// `[use t (x1)]`: the backward barrier unless gray; clobbers as a call.
     Barrier,
     /// `[def d]`: the frame's `nv`.
