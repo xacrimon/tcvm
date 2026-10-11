@@ -462,6 +462,7 @@ fn on_exit<'gc>(
         let extra = match e.tag {
             ExitTag::Overflow => crate::jit::feedback::OVERFLOW,
             ExitTag::Mm => crate::jit::feedback::MM,
+            ExitTag::Bounds => crate::jit::feedback::ARR_MISS,
             _ => 0,
         };
         record_site(closure, base, pc, extra);
@@ -596,6 +597,12 @@ fn record_site<'gc>(closure: LuaFn<'gc>, base: *mut Value<'gc>, pc: u32, extra: 
         | Op::CALLS_R0
         | Op::CALLS_R1
         | Op::TAILCALL => kind(i.a() + 4),
+        Op::GETTABLE | Op::SETTABLE => {
+            let recv = if reg(i.b()).get_table().is_some() { 0 } else { fb::OTHER };
+            recv | kind(i.c())
+        }
+        Op::UNM | Op::BNOT | Op::LEN => kind(i.b()),
+        Op::CONCAT => kind(i.b()) | kind(i.c()),
         _ => 0,
     };
     bits |= match i.op().info().family {

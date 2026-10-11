@@ -609,12 +609,12 @@ fn own_store<'gc>(
 }
 
 /// The receiver's lock when the site's feedback saw only tables (or
-/// nothing yet); `None` when it saw other receivers, which take the helper.
+/// nothing yet); `None` when it saw other receivers (`OTHER`, which an odd
+/// key also sets), which take the helper.
 fn table_site(b: &mut Builder<'_, '_>, pc: u32, recv: Val) -> Option<Val> {
-    let kinds = b.feedback(pc) & fb::KINDS;
     let ty = b.ty(recv);
     let tables = !ty.set.is_empty() && ty.within(TypeSet::TAB);
-    (tables || kinds & !fb::TAB == 0).then(|| table_of(b, recv))
+    (tables || b.feedback(pc) & fb::OTHER == 0).then(|| table_of(b, recv))
 }
 
 /// An `I32` key, or `None` when the key may not be a small integer.

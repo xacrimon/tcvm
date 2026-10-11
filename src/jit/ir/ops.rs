@@ -393,6 +393,10 @@ pub(crate) enum ExitTag {
     Gc,
     /// A table's shape is not the one compiled for.
     Shape,
+    /// An array access left the array part, or met a class with
+    /// `__index`/`__newindex`, where the site's feedback never saw one: the
+    /// exit records `ARR_MISS`, and the recompile keeps the slow arm.
+    Bounds,
     /// A helper failed where the site's feedback never saw a metamethod
     /// run: the exit records one, and the recompile calls it (5.4).
     Mm,
@@ -405,7 +409,12 @@ impl ExitTag {
     pub(crate) fn widenable(self) -> bool {
         matches!(
             self,
-            ExitTag::Type | ExitTag::Overflow | ExitTag::NeverRan | ExitTag::Shape | ExitTag::Mm
+            ExitTag::Type
+                | ExitTag::Overflow
+                | ExitTag::NeverRan
+                | ExitTag::Shape
+                | ExitTag::Mm
+                | ExitTag::Bounds
         )
     }
 }

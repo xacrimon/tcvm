@@ -475,6 +475,11 @@ handler! {
         let insn = insn_at!();
         let (dst, src) = insn.ab();
         let v = reg![src];
+        let closure = unsafe { frame::closure(base) };
+        let site = unsafe { pc.sub(1) };
+        // A small operand here is `i32::MIN`.
+        let overflow = if v.get_small().is_some() { feedback::OVERFLOW } else { 0 };
+        feedback::record(closure, site, feedback::kind(v) | overflow);
         if let Some(i) = v.get_integer() {
             reg![dst] = Value::integer(rt.mutation(), i.wrapping_neg());
             next!()
@@ -483,6 +488,7 @@ handler! {
         if mm.is_nil() {
             raise!(OpError::Arith(v, v))
         }
+        feedback::record(closure, site, feedback::MM);
         // Lua passes the operand twice for unary metamethods.
         stage_mm!(pc, base, rt, ret_store_a, mm, [v, v])
     }
@@ -501,6 +507,9 @@ handler! {
         let insn = insn_at!();
         let (dst, src) = insn.ab();
         let v = reg![src];
+        let closure = unsafe { frame::closure(base) };
+        let site = unsafe { pc.sub(1) };
+        feedback::record(closure, site, feedback::kind(v));
         if let Some(i) = v.get_integer() {
             reg![dst] = Value::integer(rt.mutation(), !i);
             next!()
@@ -509,6 +518,7 @@ handler! {
         if mm.is_nil() {
             raise!(OpError::Bitwise(v, v))
         }
+        feedback::record(closure, site, feedback::MM);
         stage_mm!(pc, base, rt, ret_store_a, mm, [v, v])
     }
 
