@@ -1052,3 +1052,43 @@ fn shift_counts_at_the_extremes() {
 "##,
     );
 }
+
+/// Values compiled as constants: by-value upvalues that differ between
+/// closures of one prototype, a loop's function register reassigned inside
+/// it, a global builtin replaced between runs, intrinsics given big
+/// integers.
+#[test]
+fn constants_the_builder_sees() {
+    agrees(
+        r##"
+        local out = {}
+        local function adder(k) return function(x) return x + k end end
+        local fs = {}
+        for i = 1, 8 do fs[i] = adder(i * 10) end
+        local s = 0
+        for r = 1, 400 do for i = 1, 8 do s = s + fs[i](r) end end
+        out[#out + 1] = s
+        local f, t = math.sin, 0
+        for i = 1, 600 do
+            t = t + f(i)
+            if i == 300 then f = math.cos end
+        end
+        out[#out + 1] = string.format("%.10f", t)
+        local function check(n)
+            local c = 0
+            for i = 1, n do if assert(i > 0, "pos") then c = c + 1 end end
+            return c
+        end
+        out[#out + 1] = check(500)
+        local real = assert
+        assert = function(v, m) return v and "mine" or m end
+        out[#out + 1] = check(500)
+        assert = real
+        local big = math.maxinteger // 3
+        local q = 0
+        for i = 1, 400 do q = q + math.sqrt(big + i) + math.floor(big + i * 0.5) * 0 end
+        out[#out + 1] = string.format("%.3f", q)
+        return table.concat(out, " ")
+"##,
+    );
+}

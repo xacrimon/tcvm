@@ -403,6 +403,10 @@ pub(crate) enum ExitTag {
     Gc,
     /// A table's shape is not the one compiled for.
     Shape,
+    /// A value compiled as a constant differed (an intrinsic's callee, a
+    /// by-value upvalue): the exit records `CONST_MISS`, and the recompile
+    /// takes only what is known for certain as constant.
+    Const,
     /// An array access left the array part, or met a class with
     /// `__index`/`__newindex`, where the site's feedback never saw one: the
     /// exit records `ARR_MISS`, and the recompile keeps the slow arm.
@@ -425,6 +429,7 @@ impl ExitTag {
                 | ExitTag::Shape
                 | ExitTag::Mm
                 | ExitTag::Bounds
+                | ExitTag::Const
         )
     }
 }

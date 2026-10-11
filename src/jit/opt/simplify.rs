@@ -211,6 +211,14 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                         changed = true;
                     }
                 }
+                Op::GuardSame if args[0] == args[1] => {
+                    remove(i);
+                    changed = true;
+                }
+                Op::SameBits if args[0] == args[1] => {
+                    set_b1(f, i, true);
+                    changed = true;
+                }
                 Op::GuardTrue | Op::GuardFalse => {
                     if let Some(c) = konst_b1(f, args[0])
                         && c == (op == Op::GuardTrue)

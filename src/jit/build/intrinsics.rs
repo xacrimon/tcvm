@@ -95,13 +95,24 @@ fn intrinsic_of(f: Function<'_>) -> Option<Intrinsic> {
 }
 
 /// The value `v` has now, when it is a load the builder can redo: a
-/// constant, an upvalue of the closure being compiled, or a field read of
-/// such a table. The region guards what it uses of it.
-fn value_now<'gc>(b: &Builder<'_, 'gc>, v: Val) -> Option<Value<'gc>> {
-    let i = b.f.def_inst(v)?;
+/// constant, an upvalue of the closure being compiled, a field read of such
+/// a table, or a join of one value. With `guess`, a loop header's value of a
+/// register is taken to be the loop entry's, and a load of the entry's frame
+/// its value there. The region guards what it uses of it.
+fn value_now<'gc>(b: &Builder<'_, 'gc>, v: Val, guess: bool) -> Option<Value<'gc>> {
+    let Some(i) = b.f.def_inst(v) else {
+        return match b.param_source(v)? {
+            Ok(a) => value_now(b, a, guess),
+            Err(r) if guess => b.entry_frame.get(r as usize).copied(),
+            Err(_) => None,
+        };
+    };
     match b.f.op(i) {
+        Op::Load(r) if guess && b.f.def_block(v) == Some(b.f.entry) => {
+            b.entry_frame.get(r as usize).copied()
+        }
         Op::KObj(p) => Some(b.f.pool[p as usize]),
-        Op::Guard(_) => value_now(b, b.f.args(i)[0]),
+        Op::Guard(_) => value_now(b, b.f.args(i)[0], guess),
         Op::UpvalValue(k) => Some(unsafe { (*b.closure.upvalue_ptr().add(k as usize)).value }),
         Op::CellLoad => {
             let c = b.f.def_inst(b.f.args(i)[0])?;
@@ -112,7 +123,7 @@ fn value_now<'gc>(b: &Builder<'_, 'gc>, v: Val) -> Option<Value<'gc>> {
         }
         _ => {
             let &(recv, key) = b.field_loads.get(&v)?;
-            Some(value_now(b, recv)?.get_table()?.raw_get(key))
+            Some(value_now(b, recv, guess)?.get_table()?.raw_get(key))
         }
     }
 }
@@ -137,7 +148,8 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: 
     } else {
         (insn.a(), insn.b(), insn.c())
     };
-    let Some(f) = value_now(b, callee).and_then(|v| v.get_function()) else {
+    let guess = b.feedback(pc) & fb::CONST_MISS == 0;
+    let Some(f) = value_now(b, callee, guess).and_then(|v| v.get_function()) else {
         return Emitted::No;
     };
     let Some(intr) = intrinsic_of(f) else {
@@ -177,7 +189,7 @@ fn builtin<'gc>(
     }
     let k = b.konst(Value::function(f));
     let cv = b.boxed(callee);
-    b.ins_exit(Op::GuardSame, &[cv, k], ExitTag::Type);
+    b.ins_exit(Op::GuardSame, &[cv, k], ExitTag::Const);
     let args: Vec<Val> = (0..arity)
         .map(|i| {
             if i < nargs {
@@ -287,7 +299,7 @@ fn select<'gc>(
     }
     let kf = b.konst(Value::function(f));
     let cv = b.boxed(callee);
-    b.ins_exit(Op::GuardSame, &[cv, kf], ExitTag::Type);
+    b.ins_exit(Op::GuardSame, &[cv, kf], ExitTag::Const);
     let r = match (count, extras) {
         (true, false) => b.konst(Value::small(m as i32)),
         (true, true) => {
@@ -338,7 +350,7 @@ fn emit_math<'gc>(
     // An exit saw an argument the inline code does not take.
     let seen = b.feedback(pc) & fb::KINDS;
     let numbers = !matches!(intr, Intrinsic::Assert) && !iterators;
-    if numbers && seen & !(fb::SMALL | fb::FLOAT) != 0 {
+    if numbers && seen & !(fb::SMALL | fb::BIGINT | fb::FLOAT) != 0 {
         return false;
     }
     // A tail call or MULTRET wants all results; the iterators make up to
@@ -354,7 +366,7 @@ fn emit_math<'gc>(
     }
     let k = b.konst(Value::function(f));
     let cv = b.boxed(callee);
-    b.ins_exit(Op::GuardSame, &[cv, k], ExitTag::Type);
+    b.ins_exit(Op::GuardSame, &[cv, k], ExitTag::Const);
     let x = b.reg(a + 4);
     if iterators {
         let x = b.boxed(x);
@@ -385,7 +397,7 @@ fn emit_math<'gc>(
     }
     let r = match intr {
         Intrinsic::Sqrt | Intrinsic::Sin | Intrinsic::Cos => {
-            let x = number_f64(b, x);
+            let x = number_f64(b, x, seen);
             match intr {
                 Intrinsic::Sqrt => b.ins(Op::FSqrt, &[x]),
                 Intrinsic::Sin => b.ins(Op::Helper(HelperId::Sin), &[x]),
@@ -401,7 +413,7 @@ fn emit_math<'gc>(
                 // An integer is its own floor.
                 x
             } else {
-                let x = number_f64(b, x);
+                let x = number_f64(b, x, seen);
                 let op = if intr == Intrinsic::Floor {
                     Op::FFloor
                 } else {
@@ -469,17 +481,29 @@ fn abs_i32(b: &mut Builder<'_, '_>, x: Val) -> Val {
     b.ins(Op::Select, &[below, neg, x])
 }
 
-/// The f64 of a number argument: typed ones converted, others a small
-/// integer or a float, else an exit to the builtin (a big integer, an
-/// error).
-fn number_f64(b: &mut Builder<'_, '_>, x: Val) -> Val {
+/// The f64 of a number argument as the builtin converts it (an integer
+/// rounds): typed ones converted, else a small integer or a float, or an
+/// integer where the site's feedback (`seen`) saw big ones and no floats;
+/// anything else exits to the builtin, for good where it saw both.
+fn number_f64(b: &mut Builder<'_, '_>, x: Val, seen: u8) -> Val {
     let ty = b.ty(x);
+    let known = |set| !ty.set.is_empty() && ty.within(set);
     if matches!(ty.rep, Rep::F64 | Rep::I32 | Rep::I64)
-        || (!ty.set.is_empty() && (ty.within(TypeSet::FLOAT) || ty.within(TypeSet::SMALL)))
+        || known(TypeSet::FLOAT)
+        || known(TypeSet::SMALL)
     {
         return b.num_f64(x);
     }
+    if known(TypeSet::INT) || (seen & fb::BIGINT != 0 && seen & fb::FLOAT == 0) {
+        let i = b.as_i64(x);
+        return b.ins(Op::LToF, &[i]);
+    }
     let xv = b.boxed(x);
-    let i = b.ins_exit(Op::ToF64, &[xv], ExitTag::Type);
+    let tag = if seen & fb::BIGINT == 0 {
+        ExitTag::Type
+    } else {
+        ExitTag::Slow
+    };
+    let i = b.ins_exit(Op::ToF64, &[xv], tag);
     b.f.result(i)
 }

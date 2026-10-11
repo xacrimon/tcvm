@@ -465,6 +465,7 @@ fn on_exit<'gc>(
             ExitTag::Overflow => crate::jit::feedback::OVERFLOW,
             ExitTag::Mm => crate::jit::feedback::MM,
             ExitTag::Bounds => crate::jit::feedback::ARR_MISS,
+            ExitTag::Const => crate::jit::feedback::CONST_MISS,
             _ => 0,
         };
         record_site(closure, base, pc, extra);
