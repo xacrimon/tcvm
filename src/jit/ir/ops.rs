@@ -546,6 +546,8 @@ pub(crate) enum Op {
     TabSetShape(u32),
     /// The metamethod of bit index `i` the table's class has, nil without.
     ClassMm(u8),
+    /// The live metamethod bits (`I32`) of the table's class, 0 without one.
+    TabMmBits,
     /// The array part's size (`I32`) and cell.
     TabASize,
     TabArray,
@@ -686,7 +688,7 @@ impl Op {
             ShapeIs(_) => Effects::R_SHAPE,
             TabLoad { .. } | ArrLoad => Effects::R_TAB,
             ArrNext => Effects::R_TAB | Effects::R_SHAPE,
-            ClassMm(_) => Effects::R_SHAPE | Effects::R_META,
+            ClassMm(_) | TabMmBits => Effects::R_SHAPE | Effects::R_META,
             NumMtSet => Effects::R_META,
             TabStore { .. } | ArrStore => Effects::W_TAB,
             TabHasRoom(_) | TabASize | TabArray => Effects::R_SHAPE,
@@ -774,7 +776,7 @@ impl Op {
             KF64(_) => Ty::F64,
             Load(_) | UpvalValue(_) | CellLoad | Resume { .. } => Ty::ANY,
             UpvalCell(_) => Ty::PTR,
-            NumVarargs | ClassBits(_) | TabASize | ArrNext => Ty::I32,
+            NumVarargs | ClassBits(_) | TabASize | ArrNext | TabMmBits => Ty::I32,
             ClassIndex(_) | TabLoad { .. } | ArrLoad => Ty::ANY,
             TabArray => Ty::PTR,
             TabHasRoom(_) | ShapeIs(_) => Ty::B1,
