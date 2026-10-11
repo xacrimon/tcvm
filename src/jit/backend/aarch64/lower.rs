@@ -464,7 +464,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                         self.push(MInst::BoxB1, &[d, u], none);
                     }
                     // The slow case calls through a trampoline (A5): only x0
-                        // changes.
+                    // changes.
                     Rep::I64 => {
                         let d = Operand::reg_fixed_def(self.vr(r), preg_int(0));
                         let u = Operand::reg_fixed_use(self.vr(x), preg_int(1));
@@ -930,7 +930,13 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 for _ in 0..5 {
                     ops.push(Operand::reg_temp(self.v.new_vreg(RegClass::Int)));
                 }
-                self.push(MInst::StrCmp { le: op == Op::StrLe }, &ops, none);
+                self.push(
+                    MInst::StrCmp {
+                        le: op == Op::StrLe,
+                    },
+                    &ops,
+                    none,
+                );
             }
             Op::ToF64 => {
                 let ops = vec![self.def(res.unwrap()), self.use_(args[0])];

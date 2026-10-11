@@ -512,7 +512,11 @@ fn on_exit<'gc>(
         // some is outside the budget, as the never-executed rule's are.
         let st = jit_state(ctx.mutation(), closure.proto);
         let st = st.borrow();
-        let byte = closure.proto.feedback.get(pc as usize).map_or(0, |c| c.get());
+        let byte = closure
+            .proto
+            .feedback
+            .get(pc as usize)
+            .map_or(0, |c| c.get());
         let learned = byte != e.byte
             || match e.tag {
                 ExitTag::Type => st.kind_exits[region.known.0 as usize..].contains(&pc),
@@ -602,7 +606,11 @@ fn record_site<'gc>(closure: LuaFn<'gc>, base: *mut Value<'gc>, pc: u32, extra: 
         | Op::CALLS_R1
         | Op::TAILCALL => kind(i.a() + 4),
         Op::GETTABLE | Op::SETTABLE => {
-            let recv = if reg(i.b()).get_table().is_some() { 0 } else { fb::OTHER };
+            let recv = if reg(i.b()).get_table().is_some() {
+                0
+            } else {
+                fb::OTHER
+            };
             recv | kind(i.c())
         }
         Op::UNM | Op::BNOT | Op::LEN => kind(i.b()),

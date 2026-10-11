@@ -397,7 +397,10 @@ pub(crate) extern "C" fn jit_index(rt: *const State<'static>, recv: u64, key: u6
                     None => return Value::nil().to_raw(),
                 }
             }
-            None => match ctx.metatable_of(recv).and_then(|mt| mt.inner().borrow().mt_cache()) {
+            None => match ctx
+                .metatable_of(recv)
+                .and_then(|mt| mt.inner().borrow().mt_cache())
+            {
                 Some(c) => c,
                 None => return HELPER_FAIL_VAL,
             },

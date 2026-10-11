@@ -88,7 +88,10 @@ pub(crate) struct Helpers {
 /// d16-d30 but the result's register, behind a frame record that keeps the
 /// frame chain walkable.
 pub(crate) fn trampoline(target: usize, ret_float: bool) -> Asm {
-    let ints: Vec<Gpr> = (0..16u8).filter(|&r| ret_float || r != 0).map(Gpr).collect();
+    let ints: Vec<Gpr> = (0..16u8)
+        .filter(|&r| ret_float || r != 0)
+        .map(Gpr)
+        .collect();
     let floats: Vec<Fpr> = (0..8u8)
         .chain(16..31)
         .filter(|&r| !ret_float || r != 0)
@@ -744,7 +747,8 @@ impl Em<'_> {
                     self.r(i, 6),
                     self.r(i, 7),
                 );
-                let (top, tail, done) = (self.a.new_label(), self.a.new_label(), self.a.new_label());
+                let (top, tail, done) =
+                    (self.a.new_label(), self.a.new_label(), self.a.new_label());
                 self.a.ldr(d, a, LuaString::LEN_OFFSET as i32);
                 self.a.ldr(lb, b, LuaString::LEN_OFFSET as i32);
                 self.a.cmp(Sz::X, d, lb);
