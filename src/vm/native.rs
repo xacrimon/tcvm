@@ -849,7 +849,7 @@ pub(crate) fn drive<'gc>(
 
 /// Make the native frame at header `hdr` wait at window slot `at`, with
 /// `cont` and `ok` for what comes back and `protect` its frame flag.
-fn set_wait<'gc>(
+pub(crate) fn set_wait<'gc>(
     t: &mut ThreadState<'gc>,
     hdr: usize,
     nc: &NativeClosure<'gc>,
@@ -913,6 +913,61 @@ pub(crate) fn native_continue<'gc>(
         out = NativeOut::error(native_overflow(ctx));
     }
     drive(ctx, ts, win - HDR, out)
+}
+
+/// `native_continue` for `jit_call_native`, which switched for the native
+/// in place: a pass-through lands at the window, `win .. top`, as a plain
+/// return; anything else is the continuation's answer, to act on.
+pub(crate) fn continued<'gc>(
+    ctx: Context<'gc>,
+    ts: *mut ThreadState<'gc>,
+    win: usize,
+) -> NativeOut {
+    let t = unsafe { &mut *ts };
+    let win_ptr = t.slot_ptr(win);
+    let nh = NativeHdr::unpack(unsafe { frame::func_word(win_ptr) });
+    let fits = t.top < t.stack_limit;
+    match nh.ok {
+        ok::RETURN if fits => return NativeOut::RETURN,
+        ok::RETURN_TRUE if fits => {
+            let at = win + nh.at;
+            let nret = t.top - at;
+            let vi = prepend_true(t, win, at, nret);
+            t.stack.copy_within(vi..vi + nret + 1, win);
+            t.set_top_unchecked(win + nret + 1);
+            return NativeOut::RETURN;
+        }
+        _ => {}
+    }
+    unsafe { frame::clear_flags(win_ptr, flag::PROTECTED | flag::HANDLER) };
+    let nc = unsafe { frame::native_closure(win_ptr) };
+    let out = cont_fn(nh.cont)(ctx, nc, Stack::new(t, win), Ok(()));
+    if out.tag() != tag::ERROR && t.native_overflowed() {
+        return NativeOut::error(native_overflow(ctx));
+    }
+    out
+}
+
+/// `native_catch` for `jit_call_native`: the continuation's answer to the
+/// error that reached the native frame at window `win`.
+pub(crate) fn caught<'gc>(
+    ctx: Context<'gc>,
+    ts: *mut ThreadState<'gc>,
+    win: usize,
+    err: Error<'gc>,
+) -> NativeOut {
+    let t = unsafe { &mut *ts };
+    let win_ptr = t.slot_ptr(win);
+    let nh = NativeHdr::unpack(unsafe { frame::func_word(win_ptr) });
+    t.set_top_unchecked(win + nh.at);
+    t.top_base = win_ptr;
+    unsafe { frame::clear_flags(win_ptr, flag::PROTECTED | flag::HANDLER) };
+    let nc = unsafe { frame::native_closure(win_ptr) };
+    let out = cont_fn(nh.cont)(ctx, nc, Stack::new(t, win), Err(err));
+    if out.tag() != tag::ERROR && t.native_overflowed() {
+        return NativeOut::error(native_overflow(ctx));
+    }
+    out
 }
 
 /// An error reached the protected native frame at window `win`: its
