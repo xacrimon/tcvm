@@ -51,6 +51,11 @@ pub(crate) const NUMBER_MT: usize =
 pub(crate) const THREAD_STACK_END: usize =
     offset_of!(crate::env::thread::ThreadState<'static>, stack_end);
 
+/// The running thread's first slot and its `top`, from the `thread`
+/// register.
+pub(crate) const THREAD_STACK: usize = crate::env::thread::STACK_PTR_OFFSET;
+pub(crate) const THREAD_TOP: usize = offset_of!(crate::env::thread::ThreadState<'static>, top);
+
 /// A table's `TableState` from its lock (a table value's payload).
 const T_STATE: usize = RefLock::<TableState<'static>>::TRAILING_FROM_LOCK
     - RefLock::<TableState<'static>>::TRAILING_FROM_INNER;

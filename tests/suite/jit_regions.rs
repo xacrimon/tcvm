@@ -1800,3 +1800,43 @@ fn callee_feedback() {
         return tostring(s)",
     );
 }
+
+/// Calls with fewer arguments than the callee's parameters (I3): a known
+/// callee's caller stores the nils, an unknown one's entry fills them in.
+#[test]
+fn arity_shortfall() {
+    agrees(
+        "local function f(a, b, c) return a + (b == nil and 1 or b) + (c == nil and 10 or c) end
+        local fs = {f, function(a, b) return a * 2 + (b or 3) end}
+        local s = 0
+        for i = 1, 3000 do
+          s = s + f(i) + f(i, 2) + f(i, 2, 3)
+          local g = fs[i % 2 + 1]
+          s = s + g(i) + g(i, 1)
+        end
+        return tostring(s)",
+    );
+}
+
+/// A call's results landed in its registers (I5): all of them with `top`
+/// past them, for up to three and for more, and a fixed count above two
+/// from a callee returning fewer, compiled and native.
+#[test]
+fn result_landing() {
+    agrees(
+        "local function many(n, ...) if n == 0 then return end return n, many(n - 1) end
+        local function pack(...) return select('#', ...), ... end
+        local s, txt = 0, {}
+        for i = 1, 3000 do
+          local k = i % 6
+          local n, a, b, c = pack(many(k))
+          s = s + n + (a or 0) + (b or 0) + (c or 0)
+          local x, y, z = many(k % 3)
+          s = s + (x or 100) + (y or 200) + (z or 300)
+          for w in string.gmatch('a b', '%a') do txt[#txt + 1] = w end
+          local p, q, r = string.byte('xy', 1, -1)
+          s = s + p + q + (r or 7)
+        end
+        return s .. ' ' .. #txt",
+    );
+}
