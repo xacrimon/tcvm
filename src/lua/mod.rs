@@ -107,6 +107,10 @@ impl<'gc> State<'gc> {
 /// A Lua runtime instance.
 pub struct Lua {
     arena: Arena<Rootable![State<'_>]>,
+    /// `TCVM_GC_STRESS=N`: collect at every `enter`'s end, which the
+    /// collector checks reach every N bytes allocated; a full collection
+    /// every eighth time.
+    stress: Option<(usize, std::cell::Cell<u32>)>,
 }
 
 impl Default for Lua {
@@ -144,12 +148,32 @@ impl Lua {
                 stacks: crate::vm::stack::StackPool::new(),
             }
         });
-        Lua { arena }
+        let stress = std::env::var("TCVM_GC_STRESS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .map(|n| (n, std::cell::Cell::new(0)));
+        Lua { arena, stress }
     }
 
     /// Collect once memory in use is past the heap limit, then re-arm the
     /// interpreter's check.
     fn collect_debt(&mut self) {
+        if let Some((n, count)) = &self.stress {
+            let (n, k) = (*n, count.get().wrapping_add(1));
+            count.set(k);
+            if self.arena.collection_phase() != CollectionPhase::Sleeping {
+                self.finalize_and_sweep();
+            }
+            if k % 8 == 0 {
+                self.arena.force_full_collection();
+            } else {
+                self.arena.force_minor_collection();
+            }
+            self.finalize_and_sweep();
+            self.arena.metrics().set_gc_check_in(n);
+            return;
+        }
         if self.arena.metrics().allocation_debt() > 0.0 {
             self.finalize_and_sweep();
         }

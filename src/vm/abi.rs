@@ -492,39 +492,37 @@ macro_rules! handler_impl {
             }};
         }
 
-        /// Go where a cold routine says.
+        /// Go where a cold routine says, at the start of the thread's
+        /// current level: the unwinder may have dropped levels above it.
         macro_rules! jump {
             ($$j:expr) => {{
                 let __j: $crate::vm::abi::Jump<'gc> = $$j;
                 reload_thread!();
-                match __j {
+                let (__h, __i, __p, __b): ($crate::vm::abi::Handler, $crate::vm::abi::Slot, *const $crate::instruction::Instruction, *mut $crate::env::value::Value<'gc>) = match __j {
                     $crate::vm::abi::Jump::Ret { ret: __r, nret: __n, values: __v, base: __b } => {
-                        become __r(
-                            $crate::vm::abi::Slot::nret(__n),
-                            __v as *const $crate::instruction::Instruction,
-                            __b,
-                            $rt,
-                            closure_slot!()
-                            $(, $th)?
-                        )
+                        (__r, $crate::vm::abi::Slot::nret(__n), __v as *const _, __b)
                     }
                     $crate::vm::abi::Jump::Enter { hdr: __h, nargs: __n, base: __b } => {
-                        become $crate::vm::ops::call::enter(
-                            $crate::vm::abi::Slot::nret(__n),
-                            __h as *const $crate::instruction::Instruction,
-                            __b,
-                            $rt,
-                            closure_slot!()
-                            $(, $th)?
-                        )
+                        ($crate::vm::ops::call::enter, $crate::vm::abi::Slot::nret(__n), __h as *const _, __b)
                     }
-                    $crate::vm::abi::Jump::Exit(__e) => return __e,
-                }
+                    $crate::vm::abi::Jump::Exit($crate::vm::abi::Exit::End) => {
+                        ($crate::vm::dispatch::exit_end, $crate::vm::abi::Slot::from_raw(0), $pc, $base)
+                    }
+                };
+                $crate::vm::abi::handler_impl!(@jump __h, __i, __p, __b, $rt, [$($th)?], closure_slot!())
             }};
         }
 
         $crate::vm::abi::handler_impl!(@kind_body $kind, $insn, $pc, $base, $rt, $closure, $thread);
     };
+
+    (@jump $h:ident, $i:ident, $p:ident, $b:ident, $rt:ident, [$th:ident], $c:expr) => {{
+        $rt.jit().jump_target.set($h as usize);
+        become $crate::jit::backend::aarch64::abi::level_jump($i, $p, $b, $rt, $c, $th)
+    }};
+    (@jump $h:ident, $i:ident, $p:ident, $b:ident, $rt:ident, [], $c:expr) => {{
+        become $h($i, $p, $b, $rt, $c)
+    }};
 
     (@kind_body op, $insn:ident, $pc:ident, $base:ident, $rt:ident, $closure:ident, $thread:ident) => {
         /// Constant `$$i` of the running prototype.

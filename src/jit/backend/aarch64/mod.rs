@@ -5,3 +5,4 @@ pub(crate) mod asm;
 pub(crate) mod emit;
 pub(crate) mod inst;
 pub(crate) mod lower;
+pub(crate) mod unwind;

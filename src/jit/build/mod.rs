@@ -864,8 +864,8 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     /// which becomes current. Of the registers `live` after it, those whose
     /// slots hold their values, those it `written`, and the captured ones are
     /// read from their slots after it; the others keep their values in the
-    /// region's frame across it, the call-site snapshot naming them for
-    /// `jit_leave` (C1).
+    /// region's frame across it, the call-site snapshot naming them for the
+    /// collector (H11).
     pub(crate) fn call(
         &mut self,
         op: Op,
@@ -876,6 +876,8 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     ) -> Block {
         let mut reload = written;
         reload.union(&self.cfg.captured);
+        // The captured registers are stored and read through their cells.
+        let mut homes = self.cfg.captured;
         let mut tys = vec![TypeSet::ANY; self.nregs];
         let from = self.f.snap_pool.len();
         for r in live.iter() {
@@ -886,12 +888,14 @@ impl<'a, 'gc> Builder<'a, 'gc> {
                 let t = self.bs[root.idx()].root_ty.get(r).copied();
                 tys[r] = t.filter(|t| !t.is_empty()).unwrap_or(TypeSet::ANY);
                 reload.insert(r);
+                homes.insert(r);
                 continue;
             }
             let v = self.reg(r as u8);
             if self.slot_holds(r as u8, v) {
                 tys[r] = self.ty(v).set;
                 reload.insert(r);
+                homes.insert(r);
             } else {
                 self.f.snap_pool.push((r as u8, v));
             }
@@ -899,6 +903,9 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         self.inline_check(op);
         let frame = self.frame_id();
         let snap = self.f.finish_snap(frame, self.pc, ExitKind::After, from);
+        // A snapshot equal to an earlier one is shared: every call of it
+        // traces what any of them keeps in its slots.
+        self.f.call_homes.entry(snap.0).or_default().union(&homes);
         let mut free = RegSet::EMPTY;
         for r in 0..self.nregs {
             if !live.contains(r) && !reload.contains(r) {

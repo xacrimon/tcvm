@@ -1,8 +1,8 @@
 //! Compiled regions agree with the interpreter on programs that run long
 //! enough to compile them.
 
-use tcvm::env::Value;
-use tcvm::{Lua, StepResult};
+use tcvm::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Value};
+use tcvm::{Context, Lua, RuntimeError, StepResult};
 
 use crate::common::start_on;
 
@@ -1513,5 +1513,200 @@ fn inlined_calls() {
         end
         return out[1]
 "##,
+    );
+}
+
+/// Calls from compiled code into the interpreter run as levels on top of
+/// the compiled frames (H6): errors unwind across them, coroutines yield
+/// inside them, the collector walks them, and a deopted fast-called frame
+/// that enters a loop region again calls through a level of its own.
+#[test]
+fn levels() {
+    agrees(
+        r##"
+        local out = {}
+        local junk = load("return function(n) local t = {} for i = 1, n do t[i] = {i, tostring(i)} end return #t end")()
+        local function work(x, n)
+          local s = 0
+          for i = 1, n do s = s + junk(10) + x end
+          return s
+        end
+        local function caller(x) return work(x, 20) + 1 end
+        local acc = 0
+        for i = 1, 300 do acc = acc + caller(i) end
+        for i = 1, 300 do acc = acc + caller(i + 0.5) end
+        out[1] = acc
+        local function thrower(x) if x % 5 == 0 then error("boom" .. x) end return x end
+        local mid = load("local f = ... return function(x) return f(x) + 1 end")(thrower)
+        local function top(x) local v = {x} return mid(v[1]) * 2 end
+        local ok, fail, msg = 0, 0, nil
+        for i = 1, 300 do
+          local s, e = pcall(top, i)
+          if s then ok = ok + e else fail = fail + 1 msg = e end
+        end
+        out[2] = ok .. " " .. fail .. " " .. msg
+        local function lvl2() error("at level 2", 2) end
+        local function lvlcaller() lvl2() end
+        for i = 1, 300 do local _, e = pcall(lvlcaller) out[3] = e end
+        local closed = 0
+        local function withclose(x)
+          local h <close> = setmetatable({}, {__close = function() closed = closed + 1 end})
+          return thrower(x)
+        end
+        for i = 1, 300 do pcall(withclose, i) end
+        out[4] = closed
+        local r
+        for i = 1, 300 do local _, m = xpcall(top, function(m) return "h:" .. m end, i * 5) r = m end
+        out[5] = r
+        local function inner(x) coroutine.yield(x) return x + 1 end
+        local yields = load("local f = ... return function(x) return f(x) * 2 end")(inner)
+        local co = coroutine.wrap(function() local t = 0 for i = 1, 500 do t = t + yields(i) end return t end)
+        local last
+        for i = 1, 501 do last = co() end
+        out[6] = last
+        local deaths = 0
+        for i = 1, 300 do
+          local c = coroutine.create(function(x) if x % 3 == 0 then error("dead") end return x end)
+          if not coroutine.resume(c, i) then deaths = deaths + 1 end
+        end
+        out[7] = deaths
+        local interp = load("return function(x) return x * 3 end")()
+        local function tc(x) return interp(x + 1) end
+        local function use(x) return tc(x) + 1 end
+        local u = 0
+        for i = 1, 500 do u = u + use(i) end
+        out[8] = u
+        return table.concat(out, " ")
+"##,
+    );
+}
+
+/// Recursion that starts a level per call (each `pcall` from compiled code
+/// is a native that calls Lua) runs past the native budget, where compiled
+/// entries refuse and the interpreter goes on, and unwinds back (H9).
+#[test]
+fn levels_past_the_native_budget() {
+    agrees(
+        "local function f(n)
+          if n == 0 then return 0 end
+          local ok, r = pcall(f, n - 1)
+          return r + 1
+        end
+        local s = 0
+        for i = 1, 300 do s = s + f(20) end
+        return s .. ' ' .. f(4000)",
+    );
+}
+
+/// Coroutines parked inside compiled frames, below levels, while the
+/// collector runs; a yield inside a `pcall` from compiled code.
+#[test]
+fn coroutines_parked_in_compiled_frames() {
+    agrees(
+        "local function inner(x) return coroutine.yield(x) end
+        local mid = load('local f = ... return function(x) return f(x) + 1 end')(inner)
+        local cos = {}
+        for i = 1, 200 do
+          cos[i] = coroutine.wrap(function(x)
+            local keep = {x, tostring(x)}
+            local t = 0
+            for k = 1, 50 do t = t + mid(k) + keep[1] end
+            return t + #keep[2]
+          end)
+          cos[i](i)
+        end
+        local junk = {}
+        local s = 0
+        for round = 1, 50 do
+          for i = 1, 200 do
+            for j = 1, 20 do junk[j] = {round, i, j} end
+            local v = cos[i](round)
+            if round == 50 then s = s + v end
+          end
+        end
+        local function step(x) local r = coroutine.yield(x) if r < 0 then error('neg') end return r end
+        local co = coroutine.wrap(function()
+          local good, bad = 0, 0
+          for i = 1, 400 do
+            local ok, v = pcall(step, i)
+            if ok then good = good + v else bad = bad + 1 end
+          end
+          return good .. ' ' .. bad
+        end)
+        co()
+        local last
+        for i = 1, 400 do last = co(i % 7 == 0 and -1 or i) end
+        return s .. ' ' .. last",
+    );
+}
+
+fn panicker<'gc>(
+    _ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
+    stack: Stack<'gc, '_>,
+) -> Result<(), Error<'gc>> {
+    if stack.get(0).get_integer() == Some(5000) {
+        panic!("native panic below compiled frames");
+    }
+    Ok(())
+}
+
+/// A panic in a native that compiled code called, under a chain of fast
+/// calls, unwinds through their frames (`unwind::Fde`) to the host.
+#[test]
+#[should_panic(expected = "native panic below compiled frames")]
+fn panic_through_compiled_frames() {
+    let mut lua = Lua::new();
+    lua.load_all();
+    lua.enter(|ctx| {
+        let f = Function::new_native(ctx.mutation(), panicker as NativeFn, &[]);
+        let key = Value::string(LuaString::new(ctx, b"maybe_panic"));
+        ctx.globals().raw_set(ctx, key, Value::function(f));
+    });
+    let ex = start_on(
+        &mut lua,
+        "local function c(i) maybe_panic(i) return i end
+         local function b(i) return c(i) + 1 end
+         local function a(i) return b(i) + 1 end
+         local s = 0
+         for i = 1, 10000 do s = s + a(i) end
+         return tostring(s)",
+    );
+    let _ = lua.finish(&ex);
+}
+
+/// `os.exit` in a level compiled code started ends the thread from its
+/// bottom level instead of returning into that code.
+#[test]
+fn exit_from_an_upper_level() {
+    let mut lua = Lua::new();
+    lua.load_all();
+    let ex = start_on(
+        &mut lua,
+        "local function g(i) if i == 5000 then os.exit(7) end end
+         local co = coroutine.wrap(function()
+           for i = 1, 10000 do pcall(g, i) end
+         end)
+         co()
+         return 'after'",
+    );
+    assert!(matches!(lua.finish(&ex), Err(RuntimeError::Exit(7))));
+}
+
+/// A generic `for`'s closing value stays in its slot while the collector
+/// runs with the loop's region parked at a call: the close it exits for
+/// reads it there.
+#[test]
+fn closing_value_survives_collections() {
+    agrees(
+        "local closed = 0
+        local function mk() return setmetatable({}, {__close = function() closed = closed + 1 end}) end
+        local function iter(n)
+          return function(_, i) i = i + 1 if i <= n then return i end end, nil, 0, mk()
+        end
+        local function churn(i) local t = {} for j = 1, 20 do t[j] = {i, j} end return #t end
+        local s = 0
+        for i in iter(30000) do s = s + churn(i) if i == 25000 then break end end
+        return s .. ' ' .. closed",
     );
 }

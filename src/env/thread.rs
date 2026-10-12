@@ -106,8 +106,16 @@ pub struct ThreadState<'gc> {
     /// Where this thread continues when switched to (`vm::stack`); `cont`
     /// is 0 before it first runs.
     pub(crate) sw: crate::vm::stack::SwitchPoint,
-    /// Where dispatch entered on this thread's stack, for compiled code.
-    pub(crate) native: crate::jit::state::NativeBase,
+    /// The entry record of the level the thread runs in (`vm::stack`), 0
+    /// before it first runs and on x86-64.
+    pub(crate) record: usize,
+    /// Compiled entries refuse with the stack pointer below this: the native
+    /// stack's end plus headroom for natives.
+    pub(crate) native_limit: usize,
+    /// Fast calls with the stack pointer below this branch with a tagged
+    /// return address instead of `blr` (5.4): this level's return address
+    /// stack is full from here.
+    pub(crate) native_deep: usize,
     /// The function a seeded thread calls, until it gets its stack.
     pub(crate) entry: Option<Value<'gc>>,
     /// Logical stack top: the end of the value-passing window. Multires
@@ -215,9 +223,12 @@ impl<'gc> DerefMut for ValueStack<'gc> {
 // live region are dead scratch and must NOT be traced; they are nil-filled
 // here instead, as in LuaJIT and PUC, so every slot below the live region
 // holds a marked object or a primitive and every slot above holds nil. Header
-// words are skipped except word 0, traced as the frame's function. Writing
-// through `&self` is sound because collection runs outside `mutate`, with no
-// borrow of the thread outstanding.
+// words are skipped except word 0, traced as the frame's function, and dead
+// words 2 and 3, cleared (`vm::frame`). A compiled frame below a level (H11)
+// keeps values in its native frame and in the home slots of the registers
+// its call site's snapshot names; the rest of its window is cleared.
+// Writing through `&self` is sound because collection runs outside `mutate`,
+// with no borrow of the thread outstanding and every thread parked.
 unsafe impl<'gc> Collect<'gc> for ThreadState<'gc> {
     fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
         let live = self.live_top().min(self.stack.len());
@@ -228,14 +239,61 @@ unsafe impl<'gc> Collect<'gc> for ThreadState<'gc> {
         stack[live..].fill(Value::nil());
         let sp = stack.as_ptr();
         let mut upper = live;
-        let mut base = self.top_base;
-        while !base.is_null() {
-            let bi = unsafe { base.offset_from_unsigned(sp) };
+        for f in frame::frames(self) {
+            if f.is_elided() {
+                continue;
+            }
+            let bi = unsafe { f.base.offset_from_unsigned(sp) };
             debug_assert!(bi >= frame::HDR && bi <= upper);
-            cc.trace(&unsafe { frame::function(base) });
-            cc.trace(&stack[bi..upper]);
+            // A frame of nothing (`enter_raise`) has no function.
+            if f.func & frame::PTR_MASK != 0 {
+                cc.trace(&unsafe { frame::function(f.base) });
+            }
+            if f.caller_words_dead() {
+                stack[bi - 2..bi].fill(Value::nil());
+            }
+            match f.compiled {
+                None => cc.trace(&stack[bi..upper]),
+                // SAFETY: the site's snapshot names the frame's spill slots
+                // that hold values across the call and the registers whose
+                // home slots hold theirs. Its other registers below the
+                // callee's header slot are dead until written, and may hold
+                // what an earlier frame left there: they are cleared, as the
+                // slots above the live region are. A to-be-closed variable's
+                // slot is the exception, read by a close the region exits
+                // for. From the header slot up the slots are the callee's (a
+                // vararg callee's extras sit below its header).
+                Some((fp, site, region)) => unsafe {
+                    use crate::jit::region::{Loc, SRep, SnapView};
+                    let snap = SnapView::decode(&(&*region).snaps[(*site).snap as usize..]);
+                    let mut homes = crate::jit::build::cfg::RegSet::EMPTY;
+                    for e in snap.entries() {
+                        match (e.loc, e.rep) {
+                            (Loc::Spill(i), SRep::Val) => {
+                                let p = (fp + crate::jit::FRAME_SPILLS + 8 * i as usize)
+                                    as *const Value<'gc>;
+                                cc.trace(&*p);
+                            }
+                            (Loc::Home, _) => homes.insert(e.reg as usize),
+                            _ => {}
+                        }
+                    }
+                    let hdr = (*site).hdr as usize;
+                    let tbc = |s| {
+                        self.tbc_list
+                            .iter()
+                            .any(|e| matches!(e, TbcEntry::Slot(i) if *i == s))
+                    };
+                    for (r, slot) in stack[bi..upper].iter_mut().enumerate() {
+                        if r >= hdr || homes.contains(r) || tbc(bi + r) {
+                            cc.trace(slot);
+                        } else {
+                            *slot = Value::nil();
+                        }
+                    }
+                },
+            }
             upper = bi - frame::HDR;
-            base = unsafe { frame::caller_base(base) };
         }
         cc.trace(&stack[..upper]);
         cc.trace(&self.open_upvalues);
@@ -274,6 +332,7 @@ impl<'gc> ThreadState<'gc> {
     pub(crate) fn ensure_stack(&mut self, pool: &std::rc::Rc<crate::vm::stack::StackPool>) {
         if self.mem.is_none() {
             let mem = pool.acquire();
+            self.native_limit = mem.native_end() + crate::vm::stack::NATIVE_HEADROOM;
             let v = self.stack.0.get_mut();
             v.ptr = unsafe { NonNull::new_unchecked(mem.values()) };
             v.len = 0;
@@ -305,6 +364,7 @@ impl<'gc> ThreadState<'gc> {
             len: 0,
         };
         self.sw = Default::default();
+        self.record = 0;
         self.top = 0;
         self.update_stack_end();
         Some(mem)
@@ -514,7 +574,9 @@ impl<'gc> Thread<'gc> {
             stack_end: std::ptr::null(),
             mem: None,
             sw: Default::default(),
-            native: Default::default(),
+            record: 0,
+            native_limit: 0,
+            native_deep: 0,
             entry: None,
             top: 0,
             top_base: std::ptr::null_mut(),

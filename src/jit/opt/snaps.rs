@@ -54,8 +54,8 @@ pub(crate) fn prune_snapshots(f: &mut Func<'_>) {
         for k in 0..f.insts_of(b).len() {
             let e = f.insts_of(b)[k];
             let s = f.insts[e.idx()].snap;
-            // A call-site snapshot names what the slow resume reads back
-            // into the frame: a value still in its slot is read back too.
+            // A call-site snapshot names what the frame keeps in spill slots
+            // for the collector, whatever its home slot holds.
             if s == NO_SNAP || matches!(f.op(e), Op::Call { .. } | Op::CallMm { .. }) {
                 continue;
             }

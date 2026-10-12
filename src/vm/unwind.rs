@@ -108,6 +108,9 @@ pub(crate) fn unwind<'gc>(
     if let ExitKind::Process(_) = err.exit_kind() {
         t.uncaught = Some(err);
         t.status = ThreadStatus::Stopped;
+        // Out of the thread from its bottom level: an upper one's end would
+        // return to the compiled code that started it.
+        pop_levels(t, bottom_level(t));
         return Jump::Exit(Exit::End);
     }
     let exit = err.exit_kind() != ExitKind::No;
@@ -127,21 +130,25 @@ pub(crate) fn unwind<'gc>(
     // catcher is reached, after the frames are gone (`luaD_pcall`). An
     // exit never has any: the coroutine closed them before raising it.
     let mut detached = false;
-    loop {
-        let base = t.top_base;
-        if base.is_null() {
-            break;
+    for f in frame::frames(t) {
+        if f.is_elided() {
+            continue;
         }
+        // A frame of a lower level: the levels above it are gone with the
+        // compiled frames their records name.
+        pop_levels(t, f.level);
+        let base = f.base;
         let bi = t.slot_index(base);
-        let rw = unsafe { frame::ret_word(base) };
+        let rw = f.ret;
         let native = rw & flag::NATIVE != 0;
         let marker = rw & !flag::MASK;
         let xpcall = marker == handler_bits(crate::vm::native::ret_xpcall);
         // A native frame's own protection comes first: its continuation
         // decides what the error becomes.
         if native && rw & flag::PROTECTED != 0 {
-            let nh = NativeHdr::unpack(unsafe { frame::func_word(base) });
+            let nh = NativeHdr::unpack(f.func);
             if !exit || catches_exit(nh.cont) {
+                t.top_base = base;
                 if detached && !exit {
                     let handler = (rw & flag::HANDLER != 0)
                         .then(|| t.stack[bi].get_function())
@@ -162,12 +169,14 @@ pub(crate) fn unwind<'gc>(
                 detach_tbc(t, bi, &mut detached);
             }
             if detached {
+                (t.top_base, t.top_pc) = (base, f.pc);
                 t.set_top_unchecked(bi);
                 let handler = xpcall.then(|| unsafe { xpcall_handler(base) }).flatten();
                 return push_close(ctx, t, err, handler);
             }
             let cpc = unsafe { frame::caller_pc(base) };
-            pop_frame(ctx, t, base, bi, native, &mut detached);
+            pop_frame(ctx, t, &f, bi, &mut detached);
+            unsafe { (t.top_base, t.top_pc) = (frame::caller_base(base), cpc) };
             t.ensure_slots(bi + 2);
             t.stack[bi] = Value::boolean(false);
             t.stack[bi + 1] = err.value();
@@ -180,8 +189,12 @@ pub(crate) fn unwind<'gc>(
                 base: t.slot_ptr(bi),
             };
         }
-        pop_frame(ctx, t, base, bi, native, &mut detached);
+        pop_frame(ctx, t, &f, bi, &mut detached);
     }
+    t.top_base = std::ptr::null_mut();
+    t.top_pc = std::ptr::null();
+    // Nothing caught: on, or out of the thread, from its bottom level.
+    pop_levels(t, bottom_level(t));
     // The host's call closes like a `pcall`; a dead coroutine keeps its
     // variables for `coroutine.close` (`lua_resume` leaves them open).
     if detached && t.main {
@@ -208,19 +221,17 @@ pub(crate) fn unwind<'gc>(
     unsafe { crate::vm::coro::die_to(ctx, ts, err) }
 }
 
-/// Pop the frame at `base`: close its upvalues, detach its to-be-closed
-/// variables, drop its task, and make its caller the top frame.
+/// Pop the frame `f` at `bi`: close its upvalues, detach its to-be-closed
+/// variables (a compiled frame has none), and drop its task.
 fn pop_frame<'gc>(
     ctx: Context<'gc>,
     t: &mut ThreadState<'gc>,
-    base: *mut Value<'gc>,
+    f: &frame::Frame<'gc>,
     bi: usize,
-    native: bool,
     detached: &mut bool,
 ) {
-    if native {
-        let nh = NativeHdr::unpack(unsafe { frame::func_word(base) });
-        if nh.cont == cont::ASYNC.0 {
+    if f.is_native() {
+        if NativeHdr::unpack(f.func).cont == cont::ASYNC.0 {
             t.drop_task();
         }
     } else {
@@ -228,12 +239,34 @@ fn pop_frame<'gc>(
         detach_tbc(t, bi, detached);
     }
     // Only the logical top drops: an outer frame's register window can
-    // extend past this frame's base, so the vec must not shrink.
+    // extend past this frame's base.
     t.set_top_unchecked(bi);
-    unsafe {
-        t.top_pc = frame::caller_pc(base);
-        t.top_base = frame::caller_base(base);
+}
+
+/// Drop the levels above `level` (an entry record of the thread's, H6),
+/// restoring what each saved of the level below. The native frames go when
+/// the thread next continues at `level`'s start (`jump!`, `level_jump`).
+fn pop_levels(t: &mut ThreadState<'_>, level: usize) {
+    while t.record != level {
+        // SAFETY: the thread's records chain from `t.record`, and `level` is
+        // one of them.
+        let r = unsafe { &*(t.record as *const crate::vm::stack::EntryRecord) };
+        t.native_deep = r.deep;
+        t.record = r.prev;
     }
+}
+
+/// The thread's bottom level, the record dispatch started on its stack.
+fn bottom_level(t: &ThreadState<'_>) -> usize {
+    let mut r = t.record;
+    while r != 0 {
+        let prev = unsafe { (*(r as *const crate::vm::stack::EntryRecord)).prev };
+        if prev == 0 {
+            break;
+        }
+        r = prev;
+    }
+    r
 }
 
 /// Detach the to-be-closed variables of the frame at `bi`, which an error is

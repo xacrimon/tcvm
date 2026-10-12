@@ -123,26 +123,11 @@ pub(crate) struct JitRuntime {
     pub(crate) exhausted: Cell<bool>,
     /// The register allocator's buffers, kept between compiles.
     pub(crate) ra: RefCell<regalloc2::Ctx>,
-}
-
-/// Where a thread entered dispatch on its stack (`dispatch::call_handler`),
-/// in its `ThreadState`: every handler runs with this stack pointer, frame
-/// pointer and return address. A region that leaves for the interpreter
-/// restores them, which drops the native frames of a chain of fast calls
-/// (5.4); each of those frames' Lua frames resumes through its callee's
-/// header instead.
-#[derive(Default)]
-pub(crate) struct NativeBase {
-    pub(crate) sp: Cell<usize>,
-    pub(crate) fp: Cell<usize>,
-    pub(crate) lr: Cell<usize>,
-    /// A fast entry with the stack pointer below this takes the slow path.
-    pub(crate) limit: Cell<usize>,
-    /// A fast call with the stack pointer below this does not use the return
-    /// address stack, which is deeper than the hardware's from here.
-    pub(crate) deep: Cell<usize>,
-    /// The handler the entry shim branches to.
-    pub(crate) target: Cell<usize>,
+    /// Where handlers return in a level (`abi::level_return`): a region
+    /// whose return address is this was entered from dispatch.
+    pub(crate) level_ret: usize,
+    /// What `abi::level_jump` branches to.
+    pub(crate) jump_target: Cell<usize>,
 }
 
 #[derive(Default)]
@@ -171,6 +156,11 @@ impl JitRuntime {
             code: RefCell::new(None),
             exhausted: Cell::new(false),
             ra: RefCell::new(regalloc2::Ctx::default()),
+            #[cfg(target_arch = "aarch64")]
+            level_ret: crate::jit::backend::aarch64::abi::level_return_addr(),
+            #[cfg(not(target_arch = "aarch64"))]
+            level_ret: 0,
+            jump_target: Cell::new(0),
         };
         rt.grow_table(16);
         rt
@@ -234,15 +224,16 @@ impl JitRuntime {
         if let Some(&(_, t)) = self.trampolines.borrow().iter().find(|(h, _)| *h == helper) {
             return Ok(t);
         }
-        let asm = crate::jit::backend::aarch64::emit::trampoline(helper, ret_float);
+        let (asm, frame) = crate::jit::backend::aarch64::emit::trampoline(helper, ret_float);
         let alloc = self.code_alloc();
-        let block = alloc
+        let mut block = alloc
             .reserve(asm.offset() + asm.pool_bytes() + 16)
             .map_err(|e| format!("code memory: {e}"))?;
         let words = asm
             .finish(block.rx() as usize)
             .map_err(|e| format!("assembler: {e:?}"))?;
         block.write(&words);
+        block.describe_frame(frame);
         let t = block.rx() as usize;
         self.trampoline_code.borrow_mut().push(block);
         self.trampolines.borrow_mut().push((helper, t));

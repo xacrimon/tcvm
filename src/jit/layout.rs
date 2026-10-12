@@ -15,16 +15,16 @@ use crate::vm::dispatch::Runtime;
 const JIT: usize = offset_of!(State<'static>, jit);
 /// The pointer to the exit register image.
 pub(crate) const EXIT_REGS: usize = JIT + offset_of!(JitRuntime, exit_regs);
-/// `ThreadState::native`, from the `thread` register: the dispatch entry's
-/// stack pointer, frame pointer and return address, the fast entries' stack
-/// limit and the entry shim's target.
-const NATIVE: usize = offset_of!(crate::env::thread::ThreadState<'static>, native);
-pub(crate) const NATIVE_SP: usize = NATIVE + offset_of!(crate::jit::state::NativeBase, sp);
-pub(crate) const NATIVE_FP: usize = NATIVE + offset_of!(crate::jit::state::NativeBase, fp);
-pub(crate) const NATIVE_LR: usize = NATIVE + offset_of!(crate::jit::state::NativeBase, lr);
-pub(crate) const NATIVE_LIMIT: usize = NATIVE + offset_of!(crate::jit::state::NativeBase, limit);
-pub(crate) const NATIVE_DEEP: usize = NATIVE + offset_of!(crate::jit::state::NativeBase, deep);
-pub(crate) const NATIVE_TARGET: usize = NATIVE + offset_of!(crate::jit::state::NativeBase, target);
+/// The thread's level record and native stack bounds, from the `thread`
+/// register.
+pub(crate) const RECORD: usize = offset_of!(crate::env::thread::ThreadState<'static>, record);
+pub(crate) const NATIVE_LIMIT: usize =
+    offset_of!(crate::env::thread::ThreadState<'static>, native_limit);
+pub(crate) const NATIVE_DEEP: usize =
+    offset_of!(crate::env::thread::ThreadState<'static>, native_deep);
+/// `JitRuntime::level_ret` and `jump_target`, from `rt`.
+pub(crate) const LEVEL_RET: usize = JIT + offset_of!(JitRuntime, level_ret);
+pub(crate) const JUMP_TARGET: usize = JIT + offset_of!(JitRuntime, jump_target);
 /// The pointer to the arena's `Metrics`.
 pub(crate) const METRICS: usize =
     offset_of!(State<'static>, rt) + offset_of!(Runtime<'static>, metrics);

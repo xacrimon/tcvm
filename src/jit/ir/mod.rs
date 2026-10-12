@@ -252,6 +252,10 @@ pub(crate) struct Func<'gc> {
     /// nor written by them, nor captured. The call-boundary pass may keep a
     /// value no register holds in one (C1).
     pub(crate) call_free: crate::jit::FastMap<u32, crate::jit::build::cfg::RegSet>,
+    /// By a call's snapshot: the registers below its callee whose home slots
+    /// hold what they will be read as after it, which the collector traces
+    /// while the call runs (H11); it clears the frame's other slots there.
+    pub(crate) call_homes: crate::jit::FastMap<u32, crate::jit::build::cfg::RegSet>,
     /// Exits whose miss belongs to another pc than their snapshot's: a
     /// guard hoisted out of a loop (E2), and the access it stands for.
     pub(crate) exit_sites: crate::jit::FastMap<Inst, u32>,
@@ -294,6 +298,7 @@ impl<'gc> Func<'gc> {
             def_snaps: Vec::new(),
             boundaries: false,
             call_free: Default::default(),
+            call_homes: Default::default(),
             exit_sites: Default::default(),
             inline_frames: Vec::new(),
             cfg: RefCell::new(None),
@@ -678,7 +683,11 @@ impl<'gc> Func<'gc> {
             },
             frame: d.frame,
         });
-        Snap(self.snaps.len() as u32 - 1)
+        let ns = Snap(self.snaps.len() as u32 - 1);
+        if let Some(&homes) = self.call_homes.get(&s.0) {
+            self.call_homes.insert(ns.0, homes);
+        }
+        ns
     }
 
     #[inline]

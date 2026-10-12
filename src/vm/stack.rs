@@ -26,6 +26,9 @@ pub(crate) const VALUE_BYTES: usize = 512 * 1024 + PAGE / 2;
 pub(crate) const VALUE_SLOTS: usize = VALUE_BYTES / size_of::<Value<'static>>();
 /// The default native stack size.
 pub(crate) const NATIVE_BYTES: usize = 1024 * 1024;
+/// Native stack above its end that compiled code leaves to natives and the
+/// interpreter: past it, compiled entries refuse (H9).
+pub(crate) const NATIVE_HEADROOM: usize = 256 * 1024;
 /// Free mappings the pool keeps; more are unmapped.
 const POOL_MAX: usize = 64;
 
@@ -148,6 +151,11 @@ impl ThreadStack {
         self.map.as_ptr() as usize + PAGE + self.native + PAGE / 2
     }
 
+    /// The lowest address the native stack may use.
+    pub(crate) fn native_end(&self) -> usize {
+        self.map.as_ptr() as usize + PAGE
+    }
+
     pub(crate) fn values<'gc>(&self) -> *mut Value<'gc> {
         self.meet() as *mut Value<'gc>
     }
@@ -156,6 +164,70 @@ impl ThreadStack {
 impl Drop for ThreadStack {
     fn drop(&mut self) {
         self.pool.release(self.map, self.native, self.value_used);
+    }
+}
+
+/// A level's entry record (`jit-perf-fixes2.md` H6): a run of dispatch
+/// started on top of compiled frames on the same native stack, which
+/// returns to them through `ret_to_native`. Pushed on the native stack by
+/// `abi::jit_level`, which handlers then run below; the bottom level's is
+/// `dispatch_entry`'s.
+#[repr(C)]
+pub(crate) struct EntryRecord {
+    /// The frame record of the code that started the level: its frame
+    /// pointer and the return address (tagged in bit 0 for a `br` return).
+    pub(crate) fp: usize,
+    pub(crate) lr: usize,
+    /// The record of the level below, 0 for the bottom level's.
+    pub(crate) prev: usize,
+    /// The base of the level's first frame: frames below it are the
+    /// compiled caller's. 0 for the bottom level.
+    pub(crate) first: usize,
+    /// `ThreadState::native_deep` of the level below.
+    pub(crate) deep: usize,
+    _pad: usize,
+    /// x19 to x28 of the code that started the level, x22 its `BASE`.
+    pub(crate) x: [usize; 10],
+    pub(crate) d: [u64; 8],
+}
+
+pub(crate) mod rec {
+    use std::mem::offset_of;
+
+    use super::EntryRecord;
+    pub(crate) const SIZE: usize = size_of::<EntryRecord>();
+    pub(crate) const PREV: usize = offset_of!(EntryRecord, prev);
+    pub(crate) const DEEP: usize = offset_of!(EntryRecord, deep);
+    pub(crate) const X: usize = offset_of!(EntryRecord, x);
+    pub(crate) const D: usize = offset_of!(EntryRecord, d);
+    const _: () = assert!(SIZE == 192 && PREV == 16 && X == 48 && D == 128);
+}
+
+/// Where handlers in a level return to (`abi::level_return`), 0 where
+/// there are no levels.
+#[inline]
+pub(crate) fn level_ret() -> usize {
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::jit::backend::aarch64::abi::level_return_addr()
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        0
+    }
+}
+
+/// `abi::ret_to_native` as header words hold it, a value no handler has
+/// where there are no levels.
+#[inline]
+pub(crate) fn ret_to_native_bits() -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::vm::abi::handler_bits(crate::jit::backend::aarch64::abi::ret_to_native)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        u64::MAX
     }
 }
 
