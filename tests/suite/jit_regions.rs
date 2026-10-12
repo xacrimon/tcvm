@@ -1441,3 +1441,32 @@ fn known_callees() {
 "##,
     );
 }
+
+/// Closures capturing registers of fast-called frames, some of which exit
+/// and return in the interpreter: the closure sets `HAS_OPEN` in the
+/// frame's header word 1, which the call zeroes and the walk keeps.
+#[test]
+fn closures_in_fast_called_frames() {
+    agrees(
+        r##"
+        local function mk(i, v)
+            local x = i
+            local f = function() return x end
+            local y = v + 1
+            return f, y
+        end
+        local function fill(a, b, c, d) return a + b + c + d end
+        local fs = {}
+        for i = 1, 300 do
+            local v = i
+            if i % 50 == 0 then v = i + 0.5 end
+            local f = mk(i, v)
+            fill(-1, -2, -3, -4)
+            fs[i] = f
+        end
+        local out = {}
+        for i = 1, 300, 37 do out[#out + 1] = fs[i]() end
+        return table.concat(out, " ")
+"##,
+    );
+}
