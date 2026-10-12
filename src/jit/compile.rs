@@ -170,7 +170,7 @@ pub(crate) fn optimize(f: &mut Func<'_>) {
 }
 
 /// The word a JIT entry replaced, for an instruction that is one.
-fn resolve_original(
+pub(crate) fn resolve_original(
     closure: LuaFn<'_>,
     i: crate::instruction::Instruction,
 ) -> crate::instruction::Instruction {
@@ -193,7 +193,10 @@ fn resolve_original(
 /// Point each counted back edge that jumps past a `LOOP` at it, as the CFG
 /// takes the `LOOP` for the loop's header; an entry there pointed its own
 /// already (`Entry::back_edges`).
-fn canonical_back_edges(closure: LuaFn<'_>, code: &mut [crate::instruction::Instruction]) {
+pub(crate) fn canonical_back_edges(
+    closure: LuaFn<'_>,
+    code: &mut [crate::instruction::Instruction],
+) {
     use crate::instruction::Op;
     let pointed: Vec<u32> = closure.proto.jit.get().map_or(Vec::new(), |s| {
         s.borrow()
@@ -413,7 +416,7 @@ pub(crate) fn compile<'gc>(
             }
         }
         let at = snaps.len();
-        encode_snap(&mut snaps, e.kind, e.pc, &[], &e.entries);
+        encode_snap(&mut snaps, e.kind, e.pc, &e.frames, &e.entries);
         // Consecutive exits often share their snapshot.
         let at = match last {
             Some((s, n)) if snaps[s..s + n] == snaps[at..] => {
@@ -425,13 +428,23 @@ pub(crate) fn compile<'gc>(
                 at
             }
         };
+        // An exit in an inlined body is a site of its callee's.
+        let proto = match e.frames.last() {
+            Some(fr) => {
+                f.pool[fr.func as usize]
+                    .get_function()
+                    .and_then(|x| x.as_lua())
+                    .expect("an inlined Lua closure")
+                    .proto
+            }
+            None => closure.proto,
+        };
         exits.push(ExitInfo {
             snap: at as u32,
             tag: e.tag,
             count: std::cell::Cell::new(0),
             site: e.site,
-            byte: closure
-                .proto
+            byte: proto
                 .feedback
                 .get(e.site.unwrap_or(e.pc) as usize)
                 .map_or(0, |c| c.get()),

@@ -165,8 +165,25 @@ pub(crate) enum ExitKind {
 pub(crate) struct SnapData {
     pub(crate) pc: u32,
     pub(crate) kind: ExitKind,
-    /// `(register, value)` by register: a run of `snap_pool`.
+    /// `(register, value)` by register: a run of `snap_pool`. Registers
+    /// count from the region's base, through inlined frames.
     pub(crate) entries: List,
+    /// The inlined frame `pc` is in (`Func::inline_frames`), or `NO_FRAME`.
+    pub(crate) frame: u32,
+}
+
+pub(crate) const NO_FRAME: u32 = u32::MAX;
+
+/// An inlined call's frame (E1): the callee (a pool index), the `CALL`'s
+/// `a` and `c` and pc in the enclosing frame, which is `parent` or the
+/// region's. Its base is `a + 4` past the enclosing frame's.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InlineFrame {
+    pub(crate) parent: u32,
+    pub(crate) func: u32,
+    pub(crate) a: u8,
+    pub(crate) c: u8,
+    pub(crate) caller_pc: u32,
 }
 
 /// What a region was compiled from.
@@ -238,6 +255,7 @@ pub(crate) struct Func<'gc> {
     /// Exits whose miss belongs to another pc than their snapshot's: a
     /// guard hoisted out of a loop (E2), and the access it stands for.
     pub(crate) exit_sites: crate::jit::FastMap<Inst, u32>,
+    pub(crate) inline_frames: Vec<InlineFrame>,
     cfg: RefCell<Option<Rc<CfgInfo>>>,
 }
 
@@ -277,6 +295,7 @@ impl<'gc> Func<'gc> {
             boundaries: false,
             call_free: Default::default(),
             exit_sites: Default::default(),
+            inline_frames: Vec::new(),
             cfg: RefCell::new(None),
         }
     }
@@ -619,7 +638,7 @@ impl<'gc> Func<'gc> {
     /// A snapshot of the entries pushed to `snap_pool` since `from`; the
     /// previous one when it is equal, as most guards of one instruction
     /// share their snapshot.
-    pub(crate) fn finish_snap(&mut self, pc: u32, kind: ExitKind, from: usize) -> Snap {
+    pub(crate) fn finish_snap(&mut self, frame: u32, pc: u32, kind: ExitKind, from: usize) -> Snap {
         let entries = List {
             start: from as u32,
             len: (self.snap_pool.len() - from) as u32,
@@ -627,12 +646,18 @@ impl<'gc> Func<'gc> {
         if let Some(last) = self.snaps.last()
             && last.pc == pc
             && last.kind == kind
+            && last.frame == frame
             && self.snap_pool[last.entries.range()] == self.snap_pool[entries.range()]
         {
             self.snap_pool.truncate(from);
             return Snap(self.snaps.len() as u32 - 1);
         }
-        self.snaps.push(SnapData { pc, kind, entries });
+        self.snaps.push(SnapData {
+            pc,
+            kind,
+            entries,
+            frame,
+        });
         Snap(self.snaps.len() as u32 - 1)
     }
 
@@ -651,6 +676,7 @@ impl<'gc> Func<'gc> {
                 start: start as u32,
                 len: d.entries.len,
             },
+            frame: d.frame,
         });
         Snap(self.snaps.len() as u32 - 1)
     }

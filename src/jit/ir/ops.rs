@@ -674,6 +674,9 @@ pub(crate) enum Op {
     /// Exits unless a metamethod call's header and `n` arguments fit below
     /// the stack's end.
     GuardFits(u8),
+    /// Exits unless the stack holds `end` slots past the region's base: an
+    /// inlined frame's window, which its exits write (E1).
+    GuardWindow(u16),
     /// Leave for the interpreter's handler of the instruction at `pc`, the
     /// frame in its slots (R1): a `TAILCALL` or a `RETURN` that leaves the
     /// frame, whose interpreter work is all there is left.
@@ -816,7 +819,7 @@ impl Op {
             Guard(_) | GuardTrue | GuardFalse | GuardSame | IAdd | ISub | IMul | INeg | IShl
             | IShr | IDivFloor | IModFloor | LDivFloor | LModFloor | LToI | LToFExact
             | FToIExact | ToF64 => Effects::flags(DEOPT),
-            GuardNoFlag(_) | GuardFits(_) => e(DEOPT, Mem::FRAME, Mem::empty()),
+            GuardNoFlag(_) | GuardFits(_) | GuardWindow(_) => e(DEOPT, Mem::FRAME, Mem::empty()),
             GuardShape(_) => e(DEOPT, Mem::SHAPE, Mem::empty()),
             GcCheck => e(DEOPT, Mem::GC, Mem::empty()),
             ShapeIs(_) | TabHasRoom(_) | NamedKey => Effects::reads(Mem::SHAPE),
@@ -895,6 +898,7 @@ impl Op {
             | Dispatch { .. }
             | TailEnter { .. }
             | GuardFits(_)
+            | GuardWindow(_)
             | Deopt => 0,
             Resume { c } => match c {
                 2 => 1,

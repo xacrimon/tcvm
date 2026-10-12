@@ -90,7 +90,7 @@ pub(crate) fn prune_snapshots(f: &mut Func<'_>) {
                         f.snap_pool.push((r, v));
                     }
                 }
-                f.finish_snap(d.pc, d.kind, from).0
+                f.finish_snap(d.frame, d.pc, d.kind, from).0
             });
             f.insts[e.idx()].snap = ns;
         }

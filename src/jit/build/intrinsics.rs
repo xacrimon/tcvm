@@ -99,7 +99,7 @@ fn intrinsic_of(f: Function<'_>) -> Option<Intrinsic> {
 /// a table, or a join of one value. With `guess`, a loop header's value of a
 /// register is taken to be the loop entry's, and a load of the entry's frame
 /// its value there. The region guards what it uses of it.
-fn value_now<'gc>(b: &Builder<'_, 'gc>, v: Val, guess: bool) -> Option<Value<'gc>> {
+pub(super) fn value_now<'gc>(b: &Builder<'_, 'gc>, v: Val, guess: bool) -> Option<Value<'gc>> {
     let Some(i) = b.f.def_inst(v) else {
         return match b.param_source(v)? {
             Ok(a) => value_now(b, a, guess),

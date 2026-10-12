@@ -38,6 +38,8 @@ pub(crate) struct JitConfig {
     pub(crate) fastalloc: bool,
     pub(crate) only: Option<String>,
     pub(crate) deopt_all: bool,
+    /// Inline known small callees (E1); `TCVM_JIT_INLINE=0` turns it off.
+    pub(crate) inline: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -90,6 +92,7 @@ impl JitConfig {
             fastalloc: flag("TCVM_JIT_FASTALLOC"),
             only: var("TCVM_JIT_ONLY"),
             deopt_all: flag("TCVM_JIT_DEOPT_ALL"),
+            inline: var("TCVM_JIT_INLINE").is_none_or(|v| v != "0" && v != "off"),
         }
     }
 }

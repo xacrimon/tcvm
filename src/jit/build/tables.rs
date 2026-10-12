@@ -22,6 +22,10 @@ use crate::vm::ops::field::read_ic;
 /// a shared cell's value.
 fn receiver(b: &mut Builder<'_, '_>, insn: Instruction) -> Val {
     match insn.op().unquickened() {
+        BcOp::GETTABUP | BcOp::SETTABUP if b.inline.is_some() => {
+            let now = unsafe { (*b.closure.upvalue_ptr().add(insn.b() as usize)).value };
+            b.konst(now)
+        }
         BcOp::GETTABUP | BcOp::SETTABUP => b.ins(Op::UpvalValue(insn.b()), &[]),
         BcOp::GETTABUP_REF | BcOp::SETTABUP_REF => {
             let c = b.ins(Op::UpvalCell(insn.b()), &[]);

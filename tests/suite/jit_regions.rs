@@ -85,10 +85,11 @@ fn constant_live_across_call() {
 
 /// A region that boxes big integers outside any loop, entered from a native
 /// that never checks the collector itself, still lets it run: the check at
-/// the region's entry.
+/// the region's entry. (`f` takes varargs so that it is not inlined, which
+/// would fold its box away.)
 #[test]
 fn boxes_outside_loops_are_collected() {
-    let src = "local function f(c) return (c + 1) << 40 end
+    let src = "local function f(c, ...) return (c + 1) << 40 end
         local s = string.rep('x', 1000000)
         local r = s:gsub('.', function() return f(1) & 1 end)
         return tostring(#r)";
@@ -1467,6 +1468,50 @@ fn closures_in_fast_called_frames() {
         local out = {}
         for i = 1, 300, 37 do out[#out + 1] = fs[i]() end
         return table.concat(out, " ")
+"##,
+    );
+}
+
+/// Inlined callees (E1): exits inside the inlined frame (a kind change, an
+/// error), results into one and two wanted, missing and extra arguments,
+/// nesting, loops and upvalues in the callee, globals, a callee replaced
+/// at run time, and one with a real call, which stays a call.
+#[test]
+fn inlined_calls() {
+    agrees(
+        r##"
+        local K = 3
+        local function sq(x) return x * x end
+        local function two(x) return x, x + K end
+        local function none(x) end
+        local function opt(a, b) if b == nil then return a end return a + b end
+        local function nest(x) return sq(x) + sq(x + 1) end
+        local function deep(x) return nest(x) - nest(x - 1) end
+        local function loopy(n) local s = 0 for i = 1, n do s = s + i end return s end
+        local function glob(x) return math.floor(x / 2) end
+        local function calls(x) return tostring(x) end
+        local function field(t) return t.v + t[1] end
+        local cur = sq
+        local function viaup(x) return cur(x) end
+        local out = {}
+        for i = 1, 400 do
+            local v = i
+            if i == 350 then v = i + 0.5 end
+            local a = sq(v)
+            local b, c = two(i)
+            local d = none(i)
+            local e = opt(i) + opt(i, 2, 99)
+            local g = deep(i)
+            local h = loopy(i % 10)
+            local m = glob(i)
+            local n = calls(i)
+            local p = field({v = i, i})
+            if i == 300 then cur = function(x) return -x end end
+            local q = viaup(i)
+            local ok, err = pcall(sq, i < 390 and i or nil)
+            out[1] = table.concat({a, b, c, tostring(d), e, g, h, m, n, p, q, tostring(ok)}, " ")
+        end
+        return out[1]
 "##,
     );
 }

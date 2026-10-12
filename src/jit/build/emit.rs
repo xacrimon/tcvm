@@ -280,6 +280,13 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             b.flush();
             b.jump(succs[0]);
         }
+        // An inlined callee's closure is a constant, and so its by-value
+        // upvalues (E1).
+        GETUPVAL if b.inline.is_some() => {
+            let now = unsafe { (*b.closure.upvalue_ptr().add(rb as usize)).value };
+            let k = b.konst(now);
+            b.set(a, k);
+        }
         // A by-value upvalue is a constant of the closure, guarded once per
         // region since other closures of the prototype may run it.
         GETUPVAL if b.feedback(pc) & fb::CONST_MISS == 0 => {
@@ -347,6 +354,14 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             let kv = b.konst(k);
             let eq = b.ins(Op::SameBits, &[v, kv]);
             branch(b, eq, insn.op() == JEQS, succs);
+        }
+        RETURN0 | RETURN1 | RETURN if b.inline.is_some() && (insn.op() != RETURN || rb != 0) => {
+            let n = match insn.op() {
+                RETURN0 => 0,
+                RETURN1 => 1,
+                _ => rb - 1,
+            };
+            super::inline::inline_return(b, a, n);
         }
         RETURN0 => {
             b.terminate(Op::Return { a: 0, n: 0 }, &[], &[], None);
@@ -1723,7 +1738,11 @@ fn emit_call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
         callee_at(b, pc, insn.a())
     };
     match intrinsics::emit(b, pc, insn, callee) {
-        Emitted::No => call(b, pc, insn, callee),
+        Emitted::No => {
+            if !super::inline::try_inline(b, pc, insn, callee) {
+                call(b, pc, insn, callee)
+            }
+        }
         Emitted::Done => {}
         Emitted::Fallback(slow) => {
             // The builtin's results join the inline code's.

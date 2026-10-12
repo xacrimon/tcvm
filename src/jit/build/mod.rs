@@ -5,6 +5,7 @@
 
 pub(crate) mod cfg;
 mod emit;
+mod inline;
 mod intrinsics;
 mod iter;
 mod tables;
@@ -109,6 +110,44 @@ pub(crate) struct Builder<'a, 'gc> {
     /// A loop entry's frame, by register: what `intrinsics::value_now`
     /// guesses a loop header's value of a register is.
     pub(crate) entry_frame: Vec<Value<'gc>>,
+    loop_entry: bool,
+    /// Set when this builds an inlined callee's body (E1).
+    pub(crate) inline: Option<Inline>,
+}
+
+/// What the builder of an inlined callee knows of its call (E1).
+pub(crate) struct Inline {
+    /// Its frame in `Func::inline_frames`.
+    pub(crate) frame: u32,
+    /// Its register 0, counted from the region's base.
+    pub(crate) base: usize,
+    /// The enclosing frames' snapshot entries at the call.
+    pub(crate) outer: Vec<(u8, Val)>,
+    /// Where its returns jump, with the `wanted` results as arguments.
+    pub(crate) cont: Block,
+    pub(crate) wanted: u8,
+    /// How many inlined frames enclose it, itself included.
+    pub(crate) depth: u8,
+    /// It emitted an instruction that needs its frame on the stack.
+    pub(crate) failed: bool,
+    /// Some path reached a return: a body that only exits is no inline.
+    pub(crate) returned: bool,
+}
+
+impl BlockState {
+    fn placeholder() -> Self {
+        BlockState {
+            sealed: false,
+            incomplete: Vec::new(),
+            preds: Vec::new(),
+            root: false,
+            reload: RegSet::EMPTY,
+            root_at: 0,
+            root_ty: Vec::new(),
+            after: None,
+            terminated: false,
+        }
+    }
 }
 
 impl<'a, 'gc> Builder<'a, 'gc> {
@@ -149,7 +188,101 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             callee_hint: None,
             cold: false,
             entry_frame: Vec::new(),
+            loop_entry,
+            inline: None,
         }
+    }
+
+    /// The builder of an inlined callee's body into `f`, whose blocks so far
+    /// are another builder's.
+    pub(crate) fn new_inline(
+        ctx: crate::lua::Context<'gc>,
+        closure: LuaFn<'gc>,
+        cfg: &'a Cfg,
+        f: Func<'gc>,
+        inline: Inline,
+        cold: bool,
+        deopt_all: bool,
+    ) -> Self {
+        let n = f.blocks.len();
+        let mut b = Builder {
+            ctx,
+            f,
+            closure,
+            proto: closure.proto,
+            cfg,
+            nregs: cfg.nregs,
+            bs: Vec::new(),
+            defs: vec![None; n * cfg.nregs],
+            slots: vec![SlotState::Unknown; n * cfg.nregs],
+            cur: Block(0),
+            instances: Vec::new(),
+            inst_succs: Vec::new(),
+            inst_of: vec![Vec::new(); cfg.blocks.len()],
+            scratch: Vec::new(),
+            pending: Vec::new(),
+            cur_snap: None,
+            pc: 0,
+            deopt_all,
+            field_loads: Default::default(),
+            recv_shapes: Default::default(),
+            callee_hint: None,
+            cold,
+            entry_frame: Vec::new(),
+            loop_entry: false,
+            inline: Some(inline),
+        };
+        b.bs.resize_with(n, BlockState::placeholder);
+        b
+    }
+
+    /// Cover blocks another builder made since this one's last.
+    pub(crate) fn pad_blocks(&mut self) {
+        let n = self.f.blocks.len();
+        self.defs.resize(n * self.nregs, None);
+        self.slots.resize(n * self.nregs, SlotState::Unknown);
+        self.bs.resize_with(n, BlockState::placeholder);
+    }
+
+    /// The inlined frame snapshots name, or `NO_FRAME`.
+    fn frame_id(&self) -> u32 {
+        self.inline
+            .as_ref()
+            .map_or(crate::jit::ir::NO_FRAME, |i| i.frame)
+    }
+
+    /// Register 0 counted from the region's base.
+    pub(crate) fn reg_base(&self) -> usize {
+        self.inline.as_ref().map_or(0, |i| i.base)
+    }
+
+    /// An inlined body cannot hold what needs its frame on the stack: its
+    /// slots, its closure (upvalues), a call, a tail-out.
+    fn inline_check(&mut self, op: Op) {
+        use crate::jit::ir::ops::{Ctx, Mem};
+        let Some(i) = &mut self.inline else {
+            return;
+        };
+        let e = op.effects();
+        let frame = (e.reads | e.writes).intersects(Mem::SLOT | Mem::FRAME)
+            && !matches!(op, Op::GuardWindow(_));
+        let bad = frame
+            || match op {
+                Op::Load(_)
+                | Op::Store(_)
+                | Op::UpvalValue(_)
+                | Op::UpvalCell(_)
+                | Op::Call { .. }
+                | Op::CallMm { .. }
+                | Op::Dispatch { .. }
+                | Op::TailEnter { .. }
+                | Op::Return { .. }
+                | Op::Resume { .. }
+                | Op::GuardFits(_) => true,
+                Op::Helper(h) => h.sig().ctx.contains(&Ctx::Base),
+                _ => false,
+            };
+        i.failed |= bad;
     }
 
     // --- blocks ---------------------------------------------------------------
@@ -160,17 +293,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         self.defs.extend(std::iter::repeat_n(None, self.nregs));
         self.slots
             .extend(std::iter::repeat_n(SlotState::Unknown, self.nregs));
-        self.bs.push(BlockState {
-            sealed: false,
-            incomplete: Vec::new(),
-            preds: Vec::new(),
-            root: false,
-            reload: RegSet::EMPTY,
-            root_at: 0,
-            root_ty: Vec::new(),
-            after: None,
-            terminated: false,
-        });
+        self.bs.push(BlockState::placeholder());
         b
     }
 
@@ -325,6 +448,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     }
 
     fn root_load(&mut self, b: Block, r: u8) -> Val {
+        self.inline_check(Op::Load(r));
         let set = self.bs[b.idx()]
             .root_ty
             .get(r as usize)
@@ -424,6 +548,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             let s = self.snap_before();
             self.ins_snap(Op::GcCheck, &[], s, ExitTag::Gc);
         }
+        self.inline_check(op);
         let i = self.f.make_inst(op, args, None, ExitTag::Type);
         self.f.append(self.cur, i);
         i
@@ -438,6 +563,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     /// An instruction that may exit, with the instruction's `Before`
     /// snapshot.
     pub(crate) fn ins_exit(&mut self, op: Op, args: &[Val], tag: ExitTag) -> Inst {
+        self.inline_check(op);
         let s = self.snap_before();
         let i = self.f.make_inst(op, args, Some(s), tag);
         self.f.append(self.cur, i);
@@ -445,6 +571,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     }
 
     pub(crate) fn ins_snap(&mut self, op: Op, args: &[Val], snap: Snap, tag: ExitTag) -> Inst {
+        self.inline_check(op);
         let i = self.f.make_inst(op, args, Some(snap), tag);
         self.f.append(self.cur, i);
         i
@@ -467,6 +594,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         snap: Option<(Snap, ExitTag)>,
     ) -> Inst {
         debug_assert!(!self.terminated());
+        self.inline_check(op);
         let (s, tag) = match snap {
             Some((s, t)) => (Some(s), t),
             None => (None, ExitTag::Type),
@@ -581,16 +709,41 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         // Reading a register creates no snapshot, so the entries are the
         // pool's tail.
         let from = self.f.snap_pool.len();
+        // An inlined frame's registers follow its callers', by register.
+        if let Some(i) = &self.inline {
+            self.f.snap_pool.extend_from_slice(&i.outer);
+        }
+        let base = self.reg_base();
         for r in regs.iter() {
             if r >= self.nregs || self.untouched(r) {
                 continue;
             }
             let v = self.reg(r as u8);
             if !self.slot_holds(r as u8, v) {
-                self.f.snap_pool.push((r as u8, v));
+                self.f.snap_pool.push(((base + r) as u8, v));
             }
         }
-        self.f.finish_snap(pc, kind, from)
+        let frame = self.frame_id();
+        self.f.finish_snap(frame, pc, kind, from)
+    }
+
+    /// This frame's and its callers' snapshot entries at a call at the
+    /// current pc, for a callee inlined there: the registers `live` after
+    /// it below `a`, where its frame starts.
+    pub(crate) fn call_entries(&mut self, live: RegSet, a: u8) -> Vec<(u8, Val)> {
+        let regs = self.exit_regs(live);
+        let mut out = self.inline.as_ref().map_or(Vec::new(), |i| i.outer.clone());
+        let base = self.reg_base();
+        for r in regs.iter() {
+            if r >= a as usize || r >= self.nregs || self.untouched(r) {
+                continue;
+            }
+            let v = self.reg(r as u8);
+            if !self.slot_holds(r as u8, v) {
+                out.push(((base + r) as u8, v));
+            }
+        }
+        out
     }
 
     /// The snapshot that re-runs the instruction being emitted.
@@ -694,6 +847,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
 
     /// `r` loaded from its home slot, which a helper wrote.
     pub(crate) fn reload(&mut self, r: u8) -> Val {
+        self.inline_check(Op::Load(r));
         let v = self.ins(Op::Load(r), &[]);
         self.set_def(self.cur, r, v);
         self.set_slot(self.cur, r as usize, SlotState::Holds(v));
@@ -742,7 +896,9 @@ impl<'a, 'gc> Builder<'a, 'gc> {
                 self.f.snap_pool.push((r as u8, v));
             }
         }
-        let snap = self.f.finish_snap(self.pc, ExitKind::After, from);
+        self.inline_check(op);
+        let frame = self.frame_id();
+        let snap = self.f.finish_snap(frame, self.pc, ExitKind::After, from);
         let mut free = RegSet::EMPTY;
         for r in 0..self.nregs {
             if !live.contains(r) && !reload.contains(r) {
@@ -981,7 +1137,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         let cfg = self.cfg;
         // The loops around the entry, outermost first.
         let mut nest = Vec::new();
-        let mut l = if self.f.meta.loop_entry {
+        let mut l = if self.loop_entry {
             cfg.loop_of[entry_bc as usize]
         } else {
             None
@@ -1132,9 +1288,71 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         let s = self.snap_before();
         self.ins_snap(Op::GcCheck, &[], s, ExitTag::Gc);
         self.jump(first);
+        self.emit_order(&order, 4000)?;
+        // Any block left unsealed (its unreached predecessors) is sealed now.
+        for b in 0..self.bs.len() {
+            if !self.bs[b].sealed {
+                self.seal(Block(b as u32));
+            }
+        }
+        // Blocks no edge reaches.
+        let mut live = vec![false; self.f.blocks.len()];
+        for &b in &self.f.cfg().rpo {
+            live[b.idx()] = true;
+        }
+        for (b, l) in live.iter().enumerate() {
+            if !l {
+                self.f.blocks[b].dead = true;
+            }
+        }
+        remove_trivial_params(&mut self.f);
+        Ok(self.f)
+    }
+
+    /// Build an inlined callee's body from `args`, its parameters: its entry
+    /// block, unreached until the caller jumps there, or none when it needs
+    /// its frame (`Inline::failed`) or grew past `limit` instructions.
+    pub(crate) fn build_inline(&mut self, args: &[Val], limit: usize) -> Option<Block> {
+        let first_block = self.f.blocks.len();
+        let entry = self.new_block();
+        self.bs[entry.idx()].sealed = true;
+        for r in 0..self.proto.num_params as usize {
+            let v = match args.get(r) {
+                Some(&v) => v,
+                None => self.konst_in(entry, Value::nil()),
+            };
+            self.set_def(entry, r as u8, v);
+        }
+        let entry_bc = self.cfg.block_of[0];
+        let order = self.discover(entry_bc);
+        let first = self.instances[order[0]].ir;
+        self.switch_to(entry);
+        self.jump(first);
+        let built = self.emit_order(&order, limit).is_ok();
+        for b in first_block..self.bs.len() {
+            if !self.bs[b].sealed {
+                self.seal(Block(b as u32));
+            }
+        }
+        let ok = built
+            && self
+                .inline
+                .as_ref()
+                .is_some_and(|i| !i.failed && i.returned);
+        if !ok {
+            for b in first_block..self.f.blocks.len() {
+                self.f.blocks[b].dead = true;
+            }
+        }
+        ok.then_some(entry)
+    }
+
+    /// Emit the instances in `order`, whose first the current block jumped
+    /// to; past `limit` instructions, give up.
+    fn emit_order(&mut self, order: &[usize], limit: usize) -> Result<(), BuildError> {
         self.instances[order[0]].npreds += 1;
         self.instances[order[0]].done_preds += 1;
-        for &ii in &order {
+        for &ii in order {
             let (bc, ir) = (self.instances[ii].bc, self.instances[ii].ir);
             let reached = self.instances[ii].done_preds > 0 || !self.bs[ir.idx()].preds.is_empty();
             self.instances[ii].started = true;
@@ -1159,28 +1377,11 @@ impl<'a, 'gc> Builder<'a, 'gc> {
                     self.seal(sb);
                 }
             }
-            if self.f.insts.len() > 4000 {
+            if self.f.insts.len() > limit || self.inline.as_ref().is_some_and(|i| i.failed) {
                 return Err(BuildError::TooLarge);
             }
         }
-        // Any block left unsealed (its unreached predecessors) is sealed now.
-        for b in 0..self.bs.len() {
-            if !self.bs[b].sealed {
-                self.seal(Block(b as u32));
-            }
-        }
-        // Blocks no edge reaches.
-        let mut live = vec![false; self.f.blocks.len()];
-        for &b in &self.f.cfg().rpo {
-            live[b.idx()] = true;
-        }
-        for (b, l) in live.iter().enumerate() {
-            if !l {
-                self.f.blocks[b].dead = true;
-            }
-        }
-        remove_trivial_params(&mut self.f);
-        Ok(self.f)
+        Ok(())
     }
 
     /// The slot state at the start of a block: the meet over its emitted
