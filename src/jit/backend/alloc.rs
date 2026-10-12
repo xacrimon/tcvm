@@ -100,6 +100,8 @@ pub(crate) struct CodeBlock {
     rx: NonNull<u8>,
     rw: NonNull<u8>,
     len_units: u16,
+    #[cfg(target_arch = "aarch64")]
+    unwind: Option<crate::jit::backend::aarch64::unwind::Fde>,
 }
 
 impl CodeBlock {
@@ -127,6 +129,17 @@ impl CodeBlock {
         }
     }
 
+    /// Tell the unwinder the block's calls are made with a frame of
+    /// `frame` bytes open (`unwind::Fde`).
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn describe_frame(&mut self, frame: u32) {
+        self.unwind = Some(crate::jit::backend::aarch64::unwind::Fde::register(
+            self.rx() as usize,
+            self.len(),
+            frame,
+        ));
+    }
+
     /// Overwrite the 64-bit word at byte `off` and publish it.
     pub(crate) fn patch_u64(&self, off: usize, v: u64) {
         assert!(off + 8 <= self.len() && off.is_multiple_of(8));
@@ -139,6 +152,9 @@ impl CodeBlock {
 
 impl Drop for CodeBlock {
     fn drop(&mut self) {
+        // Out of the unwinder's tables before the units are reused.
+        #[cfg(target_arch = "aarch64")]
+        drop(self.unwind.take());
         let rw = self.rw.as_ptr() as usize;
         let base = rw & !(SEG_SIZE - 1);
         let start = (rw - base) / UNIT;
@@ -184,6 +200,8 @@ impl CodeAllocator {
             rx: NonNull::new(rx).expect("segment rx"),
             rw: NonNull::new(rw).expect("segment rw"),
             len_units: units as u16,
+            #[cfg(target_arch = "aarch64")]
+            unwind: None,
         })
     }
 }

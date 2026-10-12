@@ -183,7 +183,8 @@ impl Metrics {
         self.set_gc_check_in(DEFERRED_GC_CHECK);
     }
 
-    fn set_gc_check_in(&self, bytes: usize) {
+    /// Fire [`Metrics::gc_check_due`] after `bytes` more bytes.
+    pub(crate) fn set_gc_check_in(&self, bytes: usize) {
         let c = &self.0.gc_check;
         c.gc_check_at
             .set(c.allocated_bytes_total.get().saturating_add(bytes));

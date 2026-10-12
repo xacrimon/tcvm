@@ -1,10 +1,9 @@
-//! The call-boundary pass (9.8, C1): a call clobbers every register, so a
-//! value live across it stays in the region's frame, and must then be one
-//! the call-site snapshot names: `jit_leave` writes those to their home
-//! slots when compiled code is left during the call, and the slow resume
-//! reads them back. Constants, and pure computations of constants and such
-//! values (raw pointers among them, which the collector does not see), are
-//! computed again after the resume instead, with their later uses given
+//! The call-boundary pass (9.8, C1, H11): a call clobbers every register,
+//! so a value live across it stays in the region's frame, and must then be
+//! one the call-site snapshot names: the collector traces those spill slots
+//! while the call runs. Constants, and pure computations of constants and
+//! such values (raw pointers among them, which the collector does not see),
+//! are computed again after the resume instead, with their later uses given
 //! whichever definition reaches them.
 
 use crate::jit::FastMap;
@@ -116,8 +115,8 @@ fn boundaries_round(f: &mut Func<'_>) -> Result<bool, String> {
 }
 
 /// Name `v`, which no register holds after the call into `b`, in the call's
-/// snapshot under a register dead there, so `jit_leave` writes it to that
-/// slot and the slow resume reads it back.
+/// snapshot under a register dead there, so the collector traces its spill
+/// slot.
 fn keep_in_free_reg(f: &mut Func<'_>, cfg: &CfgInfo, b: Block, v: Val) -> Result<(), String> {
     let none = || format!("v{} is live across the call resuming at b{}", v.0, b.0);
     if f.ty(v).rep == crate::jit::ir::types::Rep::Ptr {
@@ -141,6 +140,9 @@ fn keep_in_free_reg(f: &mut Func<'_>, cfg: &CfgInfo, b: Block, v: Val) -> Result
         .extend_from_within(d.entries.start as usize..(d.entries.start + d.entries.len) as usize);
     f.snap_pool.push((r as u8, v));
     let s = f.finish_snap(d.frame, d.pc, d.kind, from);
+    if let Some(&homes) = f.call_homes.get(&f.insts[t.idx()].snap) {
+        f.call_homes.insert(s.0, homes);
+    }
     f.insts[t.idx()].snap = s.0;
     Ok(())
 }
@@ -170,8 +172,7 @@ pub(crate) fn is_const(f: &Func<'_>, v: Val) -> bool {
 
 /// The values the call into resume block `b` keeps in the frame: its
 /// snapshot's, but raw pointers and constants, which are computed again
-/// (the slow resume reads back only what `jit_leave` wrote), each as
-/// `same_reg` gives it.
+/// (the collector traces only values), each as `same_reg` gives it.
 pub(crate) fn kept_across(f: &Func<'_>, cfg: &CfgInfo, b: Block) -> Vec<Val> {
     let Some(&p) = cfg.preds(b).first() else {
         return Vec::new();

@@ -40,12 +40,12 @@ pub(crate) enum Src {
 }
 
 /// A call's site (C1): the values its snapshot names, which live in the
-/// frame's spill slots across it, as operands of the call.
+/// frame's spill slots across it, as operands of the call, and the
+/// registers whose home slots hold theirs (`Func::call_homes`).
 pub(crate) struct LSite {
     /// `(register, rep, source)`.
     pub(crate) entries: Vec<(u8, SRep, Src)>,
-    /// The VCode instruction of the call.
-    pub(crate) inst: usize,
+    pub(crate) homes: crate::jit::build::cfg::RegSet,
 }
 
 pub(crate) struct Lowered {
@@ -473,9 +473,10 @@ impl<'a, 'gc> Lower<'a, 'gc> {
     }
 
     /// Push a call: `ops`, then its snapshot's values as uses in stack slots,
-    /// which `jit_leave` and the slow resume read (C1).
+    /// which the collector traces while the call runs (H11).
     fn push_call(&mut self, i: Inst, mk: MInst, mut ops: Vec<Operand>) {
         let d = &self.f.insts[i.idx()];
+        let d_snap = d.snap;
         debug_assert_eq!(
             self.f.snaps[d.snap as usize].frame,
             crate::jit::ir::NO_FRAME,
@@ -510,12 +511,15 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             };
             entries.push((r, srep(self.f.ty(v).rep), Src::Operand(k)));
         }
-        let at = self.v.push(mk, &ops, allocatable()).index();
+        self.v.push(mk, &ops, allocatable());
         self.snap_ops.push(base as u32);
         let resume = self.f.edges(i)[0].target;
         self.sites.push((
             self.block_of[resume.idx()] as usize,
-            LSite { entries, inst: at },
+            LSite {
+                entries,
+                homes: self.f.call_homes.get(&d_snap).copied().unwrap_or_default(),
+            },
         ));
     }
 

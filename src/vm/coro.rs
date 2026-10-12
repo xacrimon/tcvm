@@ -273,6 +273,8 @@ macro_rules! resume_entry {
             );
         }
         ts.top_base = win_ptr;
+        // The window is the published frame's, live while it waits.
+        ts.top = args + n;
         let b = unsafe { begin_resume($rt, thread_ptr!(), co, args, n, win + $at) };
         switch_out!(b)
     }};

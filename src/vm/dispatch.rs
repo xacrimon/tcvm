@@ -213,8 +213,8 @@ impl<'gc> Runtime<'gc> {
     }
 }
 
-/// Call `h` as the trampoline does: a plain call, which dispatch leaves by
-/// returning its `Exit`.
+/// Call `h` as the bottom level of the running thread: a plain call, which
+/// dispatch leaves by returning its `Exit`.
 #[inline(always)]
 fn call_handler<'gc>(
     h: Handler,
@@ -227,10 +227,12 @@ fn call_handler<'gc>(
 ) -> Exit {
     #[cfg(target_arch = "aarch64")]
     {
-        unsafe { (*thread).native.target.set(h as usize) };
-        // SAFETY: `dispatch_entry` branches to `h` with these arguments.
+        // SAFETY: `dispatch_entry` starts the bottom level and branches to
+        // `h` with these arguments.
         unsafe {
-            crate::jit::backend::aarch64::abi::dispatch_entry(insn, pc, base, rt, closure, thread)
+            crate::jit::backend::aarch64::abi::dispatch_entry(
+                insn, pc, base, rt, closure, thread, h,
+            )
         }
     }
     #[cfg(not(target_arch = "aarch64"))]
@@ -298,6 +300,11 @@ pub(crate) unsafe fn start<'gc>(ctx: Context<'gc>, ts: *mut ThreadState<'gc>) {
 
 handler! {
     bind(insn, pc, base, rt, closure, thread, nret, values);
+
+    /// End the bottom level's dispatch (`jump!` of `Jump::Exit`).
+    slow fn exit_end {
+        return Exit::End;
+    }
 
     /// The collector is owed work (`gc_check!`): publish the frame, park for
     /// the host to collect, then dispatch the next instruction.

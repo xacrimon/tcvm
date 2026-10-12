@@ -321,7 +321,8 @@ pub(crate) fn compile<'gc>(
             false,
         )?,
         land: crate::jit::helpers::jit_land as *const () as usize,
-        leave: crate::jit::jit_leave as *const () as usize,
+        level: abi::jit_level as *const () as usize,
+        ret_to_native: abi::ret_to_native as *const () as usize,
         trampolines,
     };
     // Allocated now, moved into the region after: the code embeds its address.
@@ -345,7 +346,7 @@ pub(crate) fn compile<'gc>(
         emit::emit(&lowered, &out, helpers, fired_at, fast).map_err(CompileError::Backend)?;
     let size = em.asm.offset() + em.asm.pool_bytes() + 16;
     let alloc = ctx.jit().code_alloc();
-    let block = alloc
+    let mut block = alloc
         .reserve(size)
         .map_err(|e| CompileError::Backend(format!("code memory: {e}")))?;
     let region_word = em.asm.label_offset(em.region_word);
@@ -354,19 +355,14 @@ pub(crate) fn compile<'gc>(
     let fast_entry = em
         .fast
         .map_or(std::ptr::null(), |l| start.wrapping_add(em.asm.label_offset(l)));
-    let site_keys: Vec<(Vec<u32>, Option<(u16, u32, u64)>)> = em
+    let site_keys: Vec<Vec<(u32, bool)>> = em
         .sites
         .iter()
         .map(|s| {
-            let keys = s
-                .keys
+            s.keys
                 .iter()
-                .map(|&k| em.asm.label_offset(k) as u32)
-                .collect();
-            let call = s
-                .call
-                .map(|(h, r, pc)| (h, em.asm.label_offset(r) as u32, pc));
-            (keys, call)
+                .map(|&(k, level)| (em.asm.label_offset(k) as u32, level))
+                .collect()
         })
         .collect();
     let words = em
@@ -374,6 +370,7 @@ pub(crate) fn compile<'gc>(
         .finish(start as usize)
         .map_err(|e| CompileError::Backend(format!("assembler: {e:?}")))?;
     block.write(&words);
+    block.describe_frame(em.frame_size);
     if config.dump.asm {
         eprintln!(
             "-- jit asm {} pc{pc} at {start:p}, {} bytes, entry +{:#x}",
@@ -452,7 +449,7 @@ pub(crate) fn compile<'gc>(
     }
     // The sites, their snapshots after the exits'.
     let mut sites: Vec<crate::jit::region::Site> = Vec::new();
-    for (site, (keys, call)) in em.sites.iter_mut().zip(&site_keys) {
+    for (site, keys) in em.sites.iter_mut().zip(&site_keys) {
         for s in &mut site.entries {
             if let crate::jit::region::Loc::Const(c) = s.loc {
                 let w = site.consts[c as usize];
@@ -471,13 +468,12 @@ pub(crate) fn compile<'gc>(
             &[],
             &site.entries,
         );
-        let (hdr, resume, pc_after) = call.unwrap_or((u16::MAX, 0, 0));
-        sites.extend(keys.iter().map(|&key| crate::jit::region::Site {
+        sites.extend(keys.iter().map(|&(key, level)| crate::jit::region::Site {
             key,
             snap: at,
-            hdr,
-            resume,
-            pc_after,
+            hdr: site.hdr,
+            pc_after: site.pc_after,
+            level,
         }));
     }
     sites.sort_unstable_by_key(|s| s.key);
@@ -504,6 +500,7 @@ pub(crate) fn compile<'gc>(
             entry_pc: pc,
             nest: nest.into_boxed_slice(),
             num_spills: em.num_spills,
+            frame_size: em.frame_size,
             retired: std::cell::Cell::new(false),
             known,
             exit_hot: std::cell::Cell::new(crate::jit::state::EXIT_HOT),

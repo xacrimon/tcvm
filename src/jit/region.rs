@@ -33,6 +33,8 @@ pub(crate) enum Loc {
     Nil,
     False,
     True,
+    /// At a call site: the register's home slot holds its value.
+    Home,
 }
 
 /// One home-slot write of an exit; `reg` counts from the region's base.
@@ -81,6 +83,7 @@ pub(crate) fn encode_snap(
             Loc::Nil => (3, 0),
             Loc::False => (4, 0),
             Loc::True => (5, 0),
+            Loc::Home => (6, 0),
         };
         assert!(index < 1 << 18);
         out.push(e.reg as u32 | (e.rep as u32) << 8 | loc << 11 | index << 14);
@@ -144,7 +147,8 @@ impl<'a> SnapView<'a> {
                 2 => Loc::Const(index),
                 3 => Loc::Nil,
                 4 => Loc::False,
-                _ => Loc::True,
+                5 => Loc::True,
+                _ => Loc::Home,
             };
             SnapEntry {
                 reg: w as u8,
@@ -212,6 +216,9 @@ pub(crate) struct Region<'gc> {
     pub(crate) nest: Box<[u32]>,
     #[collect(require_static)]
     pub(crate) num_spills: u32,
+    /// Bytes of the region's native frame, which `exit_common` pops.
+    #[collect(require_static)]
+    pub(crate) frame_size: u32,
     #[collect(require_static)]
     pub(crate) retired: Cell<bool>,
     /// How many of `JitState::kind_exits` and `shapes_seen` the compile saw:
@@ -222,25 +229,28 @@ pub(crate) struct Region<'gc> {
     /// per retry of the entry.
     #[collect(require_static)]
     pub(crate) exit_hot: Cell<u32>,
-    /// Where control may leave compiled code while a frame of this region
-    /// is live (C1), by the code offset of the return address naming them.
+    /// The calls a frame of this region can be in while others run above
+    /// it, by the code offset of the return addresses naming them.
     #[collect(require_static)]
     pub(crate) sites: Box<[Site]>,
 }
 
-/// A place compiled code leaves from with this region's frame live.
+/// A call of the region's: its return address, and what a walk of the
+/// frame needs there (H7, H11).
 #[derive(Clone, Copy)]
 pub(crate) struct Site {
-    /// The code offset of the return address naming it.
+    /// The code offset of the return address.
     pub(crate) key: u32,
-    /// Its snapshot in `snaps`.
+    /// The snapshot naming the values the frame keeps in spill slots
+    /// across the call, in `snaps`.
     pub(crate) snap: u32,
-    /// A call's header slot (`u16::MAX` for none), and the header words a
-    /// fast call does not write (D4): the slow resume's code offset and the
-    /// `pc` after the call.
+    /// The callee's header slot, and the `pc` after the call, whose header
+    /// words a fast call does not write (D4).
     pub(crate) hdr: u16,
-    pub(crate) resume: u32,
     pub(crate) pc_after: u64,
+    /// The return address is a level's (`jit_level`): `BASE` there is this
+    /// frame's. Otherwise it is a fast callee's, and `BASE` the callee's.
+    pub(crate) level: bool,
 }
 
 impl<'gc> Region<'gc> {
@@ -261,6 +271,7 @@ pub(crate) mod layout {
     use super::Region;
 
     pub(crate) const NUM_SPILLS: usize = std::mem::offset_of!(Region<'static>, num_spills);
+    pub(crate) const FRAME_SIZE: usize = std::mem::offset_of!(Region<'static>, frame_size);
 }
 
 #[cfg(test)]

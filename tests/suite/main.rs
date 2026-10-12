@@ -84,6 +84,7 @@ mod tailcall_shapes;
 mod tailcall_suspend;
 mod take_result_tailcall;
 mod tbc_close;
+mod thread_stacks;
 mod tostring_metamethods;
 mod type_metatables;
 mod upvalues;
