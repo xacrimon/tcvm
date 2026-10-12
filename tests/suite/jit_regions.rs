@@ -1840,3 +1840,22 @@ fn result_landing() {
         return s .. ' ' .. #txt",
     );
 }
+
+/// A recursive call of the closure being compiled enters its region's known
+/// entry by `bl` (I4); another closure of the same prototype fails the
+/// identity guard and recompiles without it.
+#[test]
+fn self_calls() {
+    agrees(
+        "local function make(k)
+          local f
+          f = function(n) if n == 0 then return k end return f(n - 1) + 1 end
+          return f
+        end
+        local a, b = make(0), make(100)
+        local s = 0
+        for i = 1, 2000 do s = s + a(20) end
+        for i = 1, 2000 do s = s + a(i % 30) + b(10) end
+        return tostring(s)",
+    );
+}

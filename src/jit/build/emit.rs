@@ -1766,17 +1766,21 @@ fn callee_at(b: &mut Builder<'_, '_>, pc: u32, a: u8) -> Val {
     }
 }
 
-/// `callee` as a constant when `known_callee` names a native, guarded by
-/// identity: lowering calls it through `jit_call_native` (I1). A Lua
-/// callee's closure may be a new one of the same prototype each time (a
-/// function's local functions), which wants a guard on the prototype.
+/// `callee` as a constant when `known_callee` names a native, or the
+/// closure being compiled (a recursive call), guarded by identity: lowering
+/// calls the one through `jit_call_native` (I1) and the other by a direct
+/// `bl` to this region's known entry (I4). Another Lua callee's closure may
+/// be a new one of the same prototype each time (a function's local
+/// functions), which wants a guard on the prototype.
 fn known_callee(b: &mut Builder<'_, '_>, pc: u32, callee: Val) -> Val {
     // Once such a guard failed here; even a value of the closure being
     // compiled's own upvalues may differ per closure.
     if matches!(b.f.def_op(callee), Some(Op::KObj(_))) || b.feedback(pc) & fb::CONST_MISS != 0 {
         return callee;
     }
-    let Some(f) = intrinsics::known_callee(b, pc, callee).filter(|f| f.as_native().is_some())
+    let own = b.closure.function();
+    let Some(f) = intrinsics::known_callee(b, pc, callee)
+        .filter(|f| f.as_native().is_some() || (crate::dmm::Gc::ptr_eq(f.inner(), own.inner()) && !b.proto.is_vararg))
     else {
         return callee;
     };

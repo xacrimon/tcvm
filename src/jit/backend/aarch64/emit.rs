@@ -558,7 +558,7 @@ impl Em<'_> {
         self.a.ldr(X17, X16, layout::FN_PROTO as i32);
         self.a.ldr(X17, X17, layout::PROTO_FAST as i32);
         self.a.cbz(Sz::X, X17, slow);
-        self.fast_enter(hdr, block)
+        self.fast_enter(hdr, block, None)
     }
 
     /// `fast_call` for a known callee (D2): its prototype's fast entry, or
@@ -573,7 +573,7 @@ impl Em<'_> {
         slow: Label,
         (f, proto, nparams): (u64, u64, u8),
         nargs: u8,
-    ) -> (Label, Label, bool) {
+    ) -> (Label, Label, bool, Option<Label>) {
         let known = nargs != u8::MAX;
         if known && nargs < nparams {
             // Inside the callee's window, which its known entry checks; the
@@ -583,8 +583,10 @@ impl Em<'_> {
                 self.a.str(Gpr(9), BASE, hdr + 32 + 8 * k as i32);
             }
         }
-        match self.own_entry {
-            Some((p, l)) if p == proto && known => self.a.adr(X17, l),
+        // A call of this region's own function enters its known entry by a
+        // direct `bl` (I4): the region cannot outlive itself.
+        let own = match self.own_entry {
+            Some((p, l)) if p == proto && known => Some(l),
             _ => {
                 self.a.mov_imm(X17, proto);
                 self.a.ldr(X17, X17, layout::PROTO_FAST as i32);
@@ -592,19 +594,20 @@ impl Em<'_> {
                 if known {
                     self.a.add_imm(Sz::X, X17, X17, KNOWN_ENTRY);
                 }
+                None
             }
-        }
+        };
         self.a.mov_imm(X16, f & PTR_MASK);
-        let (ret, deep) = self.fast_enter(hdr, block);
-        (ret, deep, known)
+        let (ret, deep) = self.fast_enter(hdr, block, own);
+        (ret, deep, known, own)
     }
 
-    /// Enter the fast entry in x17 of the closure in x16 (`fast_call`).
-    /// Returns the return address `blr` leaves, where a branch to the fast
-    /// resume sits; a callee whose entry checks fail returns 4 bytes past it,
-    /// where `miss_path` must follow. Also returns the deep path's label,
-    /// for `deep_path`.
-    fn fast_enter(&mut self, hdr: i32, block: usize) -> (Label, Label) {
+    /// Enter the fast entry in x17, or `own`, of the closure in x16
+    /// (`fast_call`). Returns the return address `blr` leaves, where a
+    /// branch to the fast resume sits; a callee whose entry checks fail
+    /// returns 4 bytes past it, where `miss_path` must follow. Also returns
+    /// the deep path's label, for `deep_path`.
+    fn fast_enter(&mut self, hdr: i32, block: usize, own: Option<Label>) -> (Label, Label) {
         let fast_resume = self.fast_resume[self.v.succs(block)[0].index()];
         // Word 1 zero: the frame's flags, which helpers set there (a closure
         // capturing a register, `HAS_OPEN`) and `HasFlag` reads. Left stale,
@@ -623,7 +626,10 @@ impl Em<'_> {
         self.a.ldr(Gpr(10), THREAD, layout::NATIVE_DEEP as i32);
         self.a.cmp(Sz::X, Gpr(9), Gpr(10));
         self.a.b_cond(Cond::Lo, deep);
-        self.a.blr(X17);
+        match own {
+            Some(l) => self.a.bl(l),
+            None => self.a.blr(X17),
+        }
         let ret = self.a.new_label();
         self.a.bind(ret);
         self.a.b(fast_resume);
@@ -702,8 +708,11 @@ impl Em<'_> {
     /// callee returns with `br` and the return address stack stays as it
     /// was, right for the shallower frames' `ret`s. It names the fast resume
     /// itself, before which a branch to the miss path sits.
-    fn deep_path(&mut self, deep: Label, block: usize, known: bool) {
+    fn deep_path(&mut self, deep: Label, block: usize, known: bool, own: Option<Label>) {
         self.a.bind(deep);
+        if let Some(l) = own {
+            self.a.adr(X17, l);
+        }
         if known {
             // The known entry trusts the native stack, which is deep enough
             // here to check: below the limit the full entry misses.
@@ -1701,17 +1710,17 @@ impl Em<'_> {
                 }
                 let (slow, common) = (self.a.new_label(), self.a.new_label());
                 let native = self.a.new_label();
-                let (ret, deep, entered_known) = match known {
+                let (ret, deep, entered_known, own) = match known {
                     Some(Known::Lua(f, proto, nparams)) => {
                         self.known_call(hdr, block, slow, (f, proto, nparams), nargs)
                     }
                     _ => {
                         let (r, d) = self.fast_call(hdr, block, slow, native);
-                        (r, d, false)
+                        (r, d, false, None)
                     }
                 };
                 self.miss_path(hdr, block, common);
-                self.deep_path(deep, block, entered_known);
+                self.deep_path(deep, block, entered_known, own);
                 let mut keys = vec![(ret, false)];
                 if known.is_none() {
                     keys.extend(self.native_path(hdr, block, Ok((native, slow))));
@@ -1864,7 +1873,7 @@ impl Em<'_> {
                 let (slow, native) = (self.a.new_label(), self.a.new_label());
                 let (ret, deep) = self.fast_call(h, block, slow, native);
                 self.miss_path(h, block, slow);
-                self.deep_path(deep, block, false);
+                self.deep_path(deep, block, false, None);
                 let mut keys = vec![(ret, false)];
                 keys.extend(self.native_path(h, block, Ok((native, slow))));
                 self.a.bind(slow);
