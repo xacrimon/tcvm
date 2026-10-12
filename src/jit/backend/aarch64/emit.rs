@@ -57,12 +57,55 @@ pub(crate) struct ExitOut {
     pub(crate) consts: Vec<u64>,
 }
 
+/// Each block's branch target and whether it is left out: a block that is
+/// only a `Jump` once allocated (an edge split for moves that needed none)
+/// is branched past, unless the chain is a loop.
+fn thread_jumps(l: &Lowered, out: &Output, labels: &[Label]) -> (Vec<Label>, Vec<bool>) {
+    let nb = l.vcode.blocks.len();
+    let bare: Vec<Option<usize>> = (0..nb)
+        .map(|b| {
+            let blk = &l.vcode.blocks[b];
+            if b == 0 || blk.resume || blk.end - blk.start != 1 {
+                return None;
+            }
+            let mut it = out.block_insts_and_edits(&l.vcode, regalloc2::Block::new(b));
+            match (it.next(), it.next()) {
+                (Some(regalloc2::InstOrEdit::Inst(i)), None)
+                    if matches!(l.vcode.insts[i.index()], MInst::Jump) =>
+                {
+                    Some(l.vcode.succs(b)[0].index())
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    let mut dest = labels.to_vec();
+    let mut skip = vec![false; nb];
+    for b in 0..nb {
+        let mut t = b;
+        let mut n = 0;
+        while let Some(s) = bare[t] {
+            t = s;
+            n += 1;
+            if n > nb {
+                t = b;
+                break;
+            }
+        }
+        dest[b] = labels[t];
+        skip[b] = t != b;
+    }
+    (dest, skip)
+}
+
 struct Em<'a> {
     a: Asm,
     v: &'a VCode<MInst>,
     out: &'a Output,
     frame: u32,
     labels: Vec<Label>,
+    /// Where a branch to each block goes: past blocks that only jump (E6).
+    dest: Vec<Label>,
     exit_labels: Vec<Label>,
     exit_region: Label,
     entry_fail: Label,
@@ -185,6 +228,7 @@ pub(crate) fn emit(
     let frame = (FRAME_SPILLS as u32 + 8 * out.num_spillslots as u32).next_multiple_of(16);
     let mut a = Asm::new();
     let labels: Vec<Label> = (0..l.vcode.blocks.len()).map(|_| a.new_label()).collect();
+    let (dest, skip) = thread_jumps(l, out, &labels);
     let exit_labels: Vec<Label> = (0..l.exits.len()).map(|_| a.new_label()).collect();
     let exit_region = a.new_label();
     let entry_fail = a.new_label();
@@ -198,6 +242,7 @@ pub(crate) fn emit(
         out,
         frame,
         labels,
+        dest,
         exit_labels,
         exit_region,
         entry_fail,
@@ -233,6 +278,9 @@ pub(crate) fn emit(
     });
     let nb = l.vcode.blocks.len();
     for b in 0..nb {
+        if skip[b] {
+            continue;
+        }
         let blk = &l.vcode.blocks[b];
         em.a.bind(em.labels[b]);
         for (k, ie) in out
@@ -247,7 +295,7 @@ pub(crate) fn emit(
                 }
                 regalloc2::InstOrEdit::Edit(Edit::Move { from, to }) => em.mov(*from, *to),
                 regalloc2::InstOrEdit::Inst(i) => {
-                    let next = (b + 1 < nb).then(|| em.labels[b + 1]);
+                    let next = (b + 1..nb).find(|&x| !skip[x]).map(|x| em.labels[x]);
                     em.inst(i.index(), b, next)?;
                 }
             }
@@ -1362,9 +1410,9 @@ impl Em<'_> {
                 }
             }
             Jump => {
-                let t = self.v.succs(block)[0].index();
-                if Some(self.labels[t]) != next {
-                    self.a.b(self.labels[t]);
+                let t = self.dest[self.v.succs(block)[0].index()];
+                if Some(t) != next {
+                    self.a.b(t);
                 }
             }
             Br { test, cond } => {
@@ -1372,7 +1420,7 @@ impl Em<'_> {
                     self.v.succs(block)[0].index(),
                     self.v.succs(block)[1].index(),
                 );
-                let (lt, lf) = (self.labels[t], self.labels[f]);
+                let (lt, lf) = (self.dest[t], self.dest[f]);
                 let multi = matches!(test, Test::Type(set) if !is_single_test(set));
                 if test == Test::B1 || multi {
                     // Where `cond` holds, and where it does not.
@@ -1392,12 +1440,12 @@ impl Em<'_> {
                     return Ok(());
                 }
                 let c = self.test(i, 0, test, cond);
-                if Some(self.labels[t]) == next {
-                    self.a.b_cond(c.invert(), self.labels[f]);
+                if Some(lt) == next {
+                    self.a.b_cond(c.invert(), lf);
                 } else {
-                    self.a.b_cond(c, self.labels[t]);
-                    if Some(self.labels[f]) != next {
-                        self.a.b(self.labels[f]);
+                    self.a.b_cond(c, lt);
+                    if Some(lf) != next {
+                        self.a.b(lf);
                     }
                 }
             }
