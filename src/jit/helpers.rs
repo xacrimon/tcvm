@@ -14,7 +14,7 @@ use crate::instruction::TFOR_VARS;
 use crate::jit::ir::ops::{HELPER_FAIL_VAL, HelperId};
 use crate::lua::{Context, State};
 use crate::vm::frame::{self, NativeHdr, land_results};
-use crate::vm::native::{invoke, ok};
+use crate::vm::native::{caught, continued, invoke, ok, set_wait, tag};
 use crate::vm::num::{self, ArithOp, SlowNum};
 use crate::vm::ops::control::{close_upvalues, new_closure, vararg_get, vararg_table};
 use crate::vm::ops::meta::{
@@ -513,7 +513,9 @@ pub(crate) struct NativeRet {
 /// Run the native `nc` on its `nargs` arguments at `w` for compiled code,
 /// from `abi::native_entry` (I1): its header as `native_call` writes it,
 /// returning through `ret_shim`. A collection owed after a plain return
-/// parks here: the call's site names what the caller keeps. A panic in the
+/// parks here: the call's site names what the caller keeps. So does a
+/// resume or a yield, which switches threads here (H5) and goes on as
+/// `drive` would while what comes back is a plain return. A panic in the
 /// native unwinds through it into the compiled caller (`unwind::Fde`).
 pub(crate) unsafe extern "C-unwind" fn jit_call_native(
     rt: *const State<'static>,
@@ -540,11 +542,40 @@ pub(crate) unsafe extern "C-unwind" fn jit_call_native(
     ts.top_base = w;
     let win = ts.slot_index(w);
     ts.top = win + nargs;
-    let out = invoke(ctx, ts, nc, win);
-    if !out.is_return() {
-        return NativeRet {
-            first: out.raw(),
-            n: u64::MAX,
+    let tp = ctx.thread_ptr();
+    let mut out = invoke(ctx, ts, nc, win);
+    loop {
+        let t = unsafe { &mut *tp };
+        out = match out.tag() {
+            tag::RETURN => break,
+            tag::RESUME if t.resume_depth + 1 < crate::vm::coro::MAX_RESUME_DEPTH => {
+                let at = out.at();
+                set_wait(t, win - frame::HDR, nc, at, out.cont(), out.ok(), frame::flag::PROTECTED);
+                t.top_base = w;
+                let co = t.stack[win + at].get_thread().expect("resume of a non-thread");
+                let (args, n) = (win + at + 1, t.top - (win + at + 1));
+                match unsafe { crate::vm::coro::resume(ctx, tp, co, args, n, win + at) } {
+                    crate::vm::coro::Back::Values => continued(ctx, tp, win),
+                    crate::vm::coro::Back::Died(err) => caught(ctx, tp, win, err),
+                }
+            }
+            tag::YIELD | tag::YIELD_THEN if !t.no_yield => {
+                let (at, cont, okk) = if out.tag() == tag::YIELD {
+                    (0, 0, ok::RETURN)
+                } else {
+                    (out.at(), out.cont(), ok::CONT)
+                };
+                set_wait(t, win - frame::HDR, nc, at, cont, okk, 0);
+                t.top_base = w;
+                unsafe { crate::vm::coro::yield_to(ctx, tp, win + at) };
+                continued(ctx, tp, win)
+            }
+            _ => {
+                return NativeRet {
+                    first: out.raw(),
+                    n: u64::MAX,
+                };
+            }
         };
     }
     if ctx.gc_due() {
