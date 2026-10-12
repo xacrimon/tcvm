@@ -81,6 +81,9 @@ pub struct State<'gc> {
     /// Scratch for building strings (`Context::with_buf`).
     #[collect(require_static)]
     pub(crate) buf: std::cell::Cell<Vec<u8>>,
+    /// Where threads get their stacks (`vm::stack`).
+    #[collect(require_static)]
+    pub(crate) stacks: std::rc::Rc<crate::vm::stack::StackPool>,
 }
 
 impl<'gc> State<'gc> {
@@ -138,6 +141,7 @@ impl Lua {
                 epoch: std::cell::Cell::new(0),
                 waker: std::cell::Cell::new(std::ptr::null()),
                 buf: std::cell::Cell::new(Vec::new()),
+                stacks: crate::vm::stack::StackPool::new(),
             }
         });
         Lua { arena }
@@ -170,6 +174,14 @@ impl Lua {
 
     fn marked(&mut self) -> MarkedArena<'_, Rootable![State<'_>]> {
         self.arena.finish_marking()
+    }
+
+    /// The native stack size of threads that get their stack from now on,
+    /// 1 MB by default. Calls past it, less headroom for natives, run in the
+    /// interpreter.
+    pub fn set_stack_size(&mut self, bytes: usize) {
+        self.arena
+            .mutate(|_, root| root.stacks.set_native_size(bytes));
     }
 
     /// Turn the JIT on or off for what runs from now on; installed regions

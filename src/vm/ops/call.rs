@@ -40,18 +40,6 @@ pub(crate) fn fixup_entry<'gc>(
     Ok(nv)
 }
 
-/// `enter`'s `base`: the calling Lua frame's window, or null for a native
-/// caller. As an index, for use across growth.
-#[inline(always)]
-fn caller_index<'gc>(ts: &ThreadState<'gc>, base: *mut Value<'gc>) -> Option<usize> {
-    (!base.is_null()).then(|| ts.slot_index(base))
-}
-
-#[inline(always)]
-fn caller_ptr<'gc>(ts: &mut ThreadState<'gc>, bi: Option<usize>) -> *mut Value<'gc> {
-    bi.map_or(std::ptr::null_mut(), |i| ts.slot_ptr(i))
-}
-
 /// Publish the caller of an `enter` path before the stack may grow:
 /// the Lua frame `base`, at the pc the staged header holds, or nothing for a
 /// native caller, which is published already.
@@ -64,23 +52,12 @@ macro_rules! enter_sync {
     };
 }
 
-/// After the stack grew under an `enter` path: the staged header is not in
-/// the frame chain yet, so its caller word was not rebased; rewrite it from
-/// the caller `base`, or the published native frame.
-macro_rules! enter_rebase {
-    ($base:ident, $ts:ident, $hdr:expr) => {{
-        let caller = if $base.is_null() { $ts.top_base } else { $base };
-        unsafe { frame::set_caller_base($ts.slot_ptr($hdr + HDR), caller) };
-    }};
-}
-
 /// Raise from an `enter` path, before the callee's frame exists: the caller's
 /// frame is published from the staged header's pc, or already published for
 /// a native caller.
 macro_rules! enter_raise {
-    ($rt:ident, $base:ident, $pc:ident, $ts:ident, $hdr:expr, $bi:expr, $err:expr) => {{
+    ($rt:ident, $base:ident, $pc:ident, $ts:ident, $hdr:expr, $err:expr) => {{
         let hdr: usize = $hdr;
-        $base = caller_ptr($ts, $bi);
         $pc = unsafe { frame::caller_pc($ts.slot_ptr(hdr + HDR)) };
         // Staged by a frameless `pcall`: the reference raises with the
         // `pcall` (a C function) running, so without a position, and the
@@ -234,7 +211,6 @@ handler! {
         if !ts.ensure_frame_slots(hdr + HDR + max_stack) {
             raise!(OpError::StackOverflow)
         }
-        base = ts.slot_ptr(bi);
         let h = rt.handler(call.opcode());
         tail!(h, insn = Slot::insn(call))
     }
@@ -253,7 +229,6 @@ handler! {
         let Ok(nv) = fixup_entry(ts, hdr, nargs, callee) else {
             raise!(OpError::StackOverflow)
         };
-        base = ts.slot_ptr(bi);
         let hdr = ts.slot_ptr(hdr + nv);
         unsafe { frame::write_hdr(hdr, lua_func_word(callee, nv), handler_bits(rt.ret(c)), base, pc) };
         set_closure!(callee);
@@ -274,11 +249,9 @@ handler! {
         let nargs = match resolve_call_chain(rt, ts, hdr, nargs) {
             Ok(n) => n,
             Err(e) => {
-                base = ts.slot_ptr(bi);
                 raise!(e)
             }
         };
-        base = ts.slot_ptr(bi);
         // The chain's hops changed the argument count, which the CALL's `b`
         // cannot carry: enter from a header, which takes the count.
         let hdr = ts.slot_ptr(hdr);
@@ -329,16 +302,13 @@ handler! {
         let ts = thread!();
         let hdr = ts.slot_index(pc as *const Value<'gc>);
         enter_sync!(base, ts, hdr);
-        let bi = caller_index(ts, base);
         let max_stack = match ts.stack[hdr].get_function().map(|f| f.inner().as_ref()) {
             Some(FunctionKind::Lua(p)) => p.max_stack_size as usize,
             _ => unreachable!("enter_grow on a non-Lua callee"),
         };
         if !ts.ensure_frame_slots(hdr + HDR + max_stack) {
-            enter_raise!(rt, base, pc, ts, hdr, bi, OpError::StackOverflow)
+            enter_raise!(rt, base, pc, ts, hdr, OpError::StackOverflow)
         }
-        base = caller_ptr(ts, bi);
-        enter_rebase!(base, ts, hdr);
         tail!(enter, pc = ts.slot_ptr(hdr) as *const Instruction, insn = insn)
     }
 
@@ -348,13 +318,10 @@ handler! {
         let ts = thread!();
         let hdr = ts.slot_index(pc as *const Value<'gc>);
         enter_sync!(base, ts, hdr);
-        let bi = caller_index(ts, base);
         let callee = unsafe { LuaFn::from_function_unchecked(ts.stack[hdr].get_function().unwrap_unchecked()) };
         let Ok(nv) = fixup_entry(ts, hdr, nargs, callee) else {
-            enter_raise!(rt, base, pc, ts, hdr, bi, OpError::StackOverflow)
+            enter_raise!(rt, base, pc, ts, hdr, OpError::StackOverflow)
         };
-        base = caller_ptr(ts, bi);
-        enter_rebase!(base, ts, hdr + nv);
         let hdr = ts.slot_ptr(hdr + nv);
         unsafe { hdr.cast::<u64>().write(lua_func_word(callee, nv)) };
         set_closure!(callee);
@@ -368,13 +335,10 @@ handler! {
         let ts = thread!();
         let hdr = ts.slot_index(pc as *const Value<'gc>);
         enter_sync!(base, ts, hdr);
-        let bi = caller_index(ts, base);
         let nargs = match resolve_call_chain(rt, ts, hdr, nargs) {
             Ok(n) => n,
-            Err(e) => enter_raise!(rt, base, pc, ts, hdr, bi, e),
+            Err(e) => enter_raise!(rt, base, pc, ts, hdr, e),
         };
-        base = caller_ptr(ts, bi);
-        enter_rebase!(base, ts, hdr);
         tail!(enter, pc = ts.slot_ptr(hdr) as *const Instruction, insn = Slot::nret(nargs))
     }
 
@@ -433,11 +397,9 @@ handler! {
         let nargs = match resolve_call_chain(rt, ts, hdr, nargs) {
             Ok(n) => n,
             Err(e) => {
-                base = ts.slot_ptr(bi);
                 raise!(e)
             }
         };
-        base = ts.slot_ptr(bi);
         let f = unsafe { ts.stack[hdr].get_function().unwrap_unchecked() };
         let FunctionKind::Lua(_) = f.inner().as_ref() else {
             // The chain left the native in the function slot and its count
@@ -459,13 +421,12 @@ handler! {
         // Before the arguments overwrite these slots, so an open upvalue
         // keeps the local, not the argument.
         crate::vm::ops::control::close_upvalues(rt.mutation(), ts, bi);
-        // Room first, while the header the rebase walks through is intact.
+        // Room first, while the header is intact.
         let np = callee.num_params as usize;
         let nv = if callee.is_vararg { nargs.saturating_sub(np) } else { 0 };
         if !ts.ensure_frame_slots(f_slot + HDR + nv + callee.max_stack_size as usize) {
             raise!(OpError::StackOverflow)
         }
-        base = ts.slot_ptr(bi);
         let (rword, caller, cpc) = unsafe { (frame::ret_word(base), frame::caller_base(base), frame::caller_pc(base)) };
         // Arguments down to where a fixed callee's would be; the copy is
         // ascending, so the overlap is safe.
@@ -531,7 +492,6 @@ handler! {
             let max_stack = unsafe { frame::closure(base) }.max_stack_size as usize;
             let hdr = (vals + n).max(bi + max_stack);
             ts.ensure_slots(hdr + HDR + 1);
-            base = ts.slot_ptr(bi);
             unsafe { frame::set_results_end(base, vals + n) };
             let hdr = ts.slot_ptr(hdr);
             unsafe {

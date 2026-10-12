@@ -21,8 +21,10 @@ pub(crate) const MAX_STRIKES: u8 = 3;
 /// before backoff (`Region::exit_hot`).
 pub(crate) const EXIT_HOT: u32 = 10;
 /// Words of the register image `exit_common` writes: x0-x15, x19-x21,
-/// x26-x28, d0-d31, then the region's spill slots from word 64.
+/// x26-x28, d0-d31, then the region's spill slots from word `IMAGE_SPILLS`.
 pub(crate) const EXIT_REGS: usize = 320;
+/// Image word of the first spill slot.
+pub(crate) const IMAGE_SPILLS: usize = 64;
 
 /// Settings read from the environment when a `Lua` is created.
 #[derive(Clone, Debug)]
@@ -121,14 +123,14 @@ pub(crate) struct JitRuntime {
     pub(crate) exhausted: Cell<bool>,
     /// The register allocator's buffers, kept between compiles.
     pub(crate) ra: RefCell<regalloc2::Ctx>,
-    pub(crate) native: NativeBase,
 }
 
-/// Where the executor entered dispatch (`dispatch::call_handler`): every
-/// handler runs with this stack pointer, frame pointer and return address. A
-/// region that leaves for the interpreter restores them, which drops the
-/// native frames of a chain of fast calls (5.4); each of those frames' Lua
-/// frames resumes through its callee's header instead.
+/// Where a thread entered dispatch on its stack (`dispatch::call_handler`),
+/// in its `ThreadState`: every handler runs with this stack pointer, frame
+/// pointer and return address. A region that leaves for the interpreter
+/// restores them, which drops the native frames of a chain of fast calls
+/// (5.4); each of those frames' Lua frames resumes through its callee's
+/// header instead.
 #[derive(Default)]
 pub(crate) struct NativeBase {
     pub(crate) sp: Cell<usize>,
@@ -169,7 +171,6 @@ impl JitRuntime {
             code: RefCell::new(None),
             exhausted: Cell::new(false),
             ra: RefCell::new(regalloc2::Ctx::default()),
-            native: NativeBase::default(),
         };
         rt.grow_table(16);
         rt

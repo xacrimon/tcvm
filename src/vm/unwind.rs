@@ -60,9 +60,8 @@ handler! {
         if !base.is_null() {
             sync!();
         }
-        let mut tsr: &mut ThreadState<'gc> = thread!();
-        let err = render(rt, tsr, rt.take_fault(), true);
-        let j = unwind(rt, &mut tsr, err);
+        let err = render(rt, thread!(), rt.take_fault(), true);
+        let j = unwind(rt, thread_ptr!(), err);
         jump!(j)
     }
 }
@@ -96,15 +95,16 @@ fn catches_exit(cont: u8) -> bool {
     cont == cont::CLOSE_ENTRY.0
 }
 
-/// Unwind `ts` from the raise of `err` to the frame that catches it. An error
-/// that kills a coroutine goes on in its resumer, which becomes `ts`.
+/// Unwind the running thread `ts` from the raise of `err` to the frame that
+/// catches it. An error that kills a coroutine goes on in its resumer, which
+/// it switches to for good.
 pub(crate) fn unwind<'gc>(
     ctx: Context<'gc>,
-    ts: &mut &mut ThreadState<'gc>,
+    ts: *mut ThreadState<'gc>,
     err: Error<'gc>,
 ) -> Jump<'gc> {
-    let mut err = crate::vm::debug::locate(ctx, ts, err);
-    let t = &mut **ts;
+    let mut err = crate::vm::debug::locate(ctx, unsafe { &*ts }, err);
+    let t = unsafe { &mut *ts };
     if let ExitKind::Process(_) = err.exit_kind() {
         t.uncaught = Some(err);
         t.status = ThreadStatus::Stopped;
@@ -169,9 +169,6 @@ pub(crate) fn unwind<'gc>(
             let cpc = unsafe { frame::caller_pc(base) };
             pop_frame(ctx, t, base, bi, native, &mut detached);
             t.ensure_slots(bi + 2);
-            // Popped before the growth, the frame's header was not
-            // rebased; the continuation still reads its caller word.
-            unsafe { frame::set_caller_base(t.slot_ptr(bi), t.top_base) };
             t.stack[bi] = Value::boolean(false);
             t.stack[bi + 1] = err.value();
             t.set_top_unchecked(bi + 2);
@@ -190,46 +187,25 @@ pub(crate) fn unwind<'gc>(
     if detached && t.main {
         return push_close(ctx, t, err, None);
     }
-    if !t.main && err.exit_kind() == ExitKind::Clean {
-        // A coroutine closed itself: it returns nothing.
-        t.set_top_unchecked(0);
-        return match crate::vm::coro::end_into_resumer(ctx, ts, 0) {
-            Some(j) => j,
-            None => {
-                let t = &mut **ts;
-                t.discard_above(0);
-                t.status = ThreadStatus::Result { bottom: 0 };
-                Jump::Exit(Exit::End)
-            }
-        };
-    }
-    // A dead coroutine whose resumer waits in dispatch: its native frame
-    // catches the error. Anything else is the host's.
-    let resumer = t
-        .resumer
-        .filter(|_| !t.main)
-        .map(|r| unsafe { r.state_mut(ctx.mutation()) })
-        .filter(|rs| rs.top_is_native());
-    let Some(rs) = resumer else {
+    if t.main || t.resumer.is_none() {
         t.uncaught = Some(err);
         t.status = ThreadStatus::Stopped;
         return Jump::Exit(Exit::End);
-    };
-    // Stash the killing error so `coroutine.close` can surface it as
-    // `(false, err)`.
-    t.status = ThreadStatus::Stopped;
+    }
+    if err.exit_kind() == ExitKind::Clean {
+        // A coroutine closed itself: it returns nothing.
+        t.set_top_unchecked(0);
+        unsafe { crate::vm::coro::end_to(ctx, ts, 0) }
+    }
+    // A dead coroutine: its resumer's native frame catches the error, and
+    // `coroutine.close` surfaces it as `(false, err)`.
     t.death_error = Some(err.value());
-    t.resumer = None;
-    rs.status = ThreadStatus::Normal;
     // Already located on the coroutine. An exit ends only the coroutine
     // that closed itself.
     if exit {
         err = Error::new(ctx, err.value());
     }
-    let rwin = rs.top_base_index();
-    *ts = rs;
-    ctx.set_thread(*ts);
-    native_catch(ctx, ts, rwin, err)
+    unsafe { crate::vm::coro::die_to(ctx, ts, err) }
 }
 
 /// Pop the frame at `base`: close its upvalues, detach its to-be-closed

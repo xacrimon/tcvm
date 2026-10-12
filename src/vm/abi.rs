@@ -82,16 +82,11 @@ impl Slot {
     }
 }
 
-/// Why the dispatch chain returned to the trampoline.
+/// Why the dispatch chain returned to the trampoline: the thread's entry
+/// frame returned, or an error nothing caught ended it. Everything else that
+/// needs the host parks the thread instead (`vm::stack::park`).
 pub(crate) enum Exit {
-    /// The executor takes over from the thread state (the entry frame
-    /// returned, a suspension, an uncaught error).
     End,
-    /// Allocation crossed the GC check threshold; the host collects before
-    /// stepping again.
-    Gc,
-    /// An async native waits on the host.
-    Pending,
 }
 
 /// A dispatch target. Every one carries `#[rustc_align(32)]`: an unaligned
@@ -132,11 +127,6 @@ pub(crate) unsafe fn handler_from_bits(bits: u64) -> Handler {
 /// Where a cold Rust routine (unwinder, native driver, coroutine switch)
 /// tells its handler to go next; the handler `become`s it with `jump!`.
 pub(crate) enum Jump<'gc> {
-    /// Dispatch the instruction at `pc` in the Lua frame at `base`.
-    Dispatch {
-        pc: *const Instruction,
-        base: *mut Value<'gc>,
-    },
     /// Run `ret` with `nret` results at `values`; `base` is the finished
     /// frame's base, so `base - 4` is its header.
     Ret {
@@ -251,6 +241,12 @@ macro_rules! handler_impl {
                 (unsafe { &mut *$th })
             };
         }
+        /// The thread as the raw pointer routines that may switch stacks take.
+        macro_rules! thread_ptr {
+            () => {
+                $th
+            };
+        }
         /// Make `$$ts` the running thread, in the slot and the runtime.
         macro_rules! switch {
             ($$ts:expr) => {{
@@ -270,6 +266,11 @@ macro_rules! handler_impl {
         macro_rules! thread {
             () => {
                 (unsafe { &mut *$rt.thread_ptr() })
+            };
+        }
+        macro_rules! thread_ptr {
+            () => {
+                $rt.thread_ptr()
             };
         }
         macro_rules! switch {
@@ -432,11 +433,12 @@ macro_rules! handler_impl {
             }};
         }
 
-        /// After an allocation: leave for the collector if it is owed work.
+        /// After an allocation, before `next!()`: park for the collector if
+        /// it is owed work (`gc_park` dispatches the next instruction).
         macro_rules! gc_check {
             () => {{
                 if ::std::hint::unlikely($rt.gc_due()) {
-                    exit!($crate::vm::abi::Exit::Gc);
+                    tail!($crate::vm::dispatch::gc_park);
                 }
             }};
         }
@@ -496,9 +498,6 @@ macro_rules! handler_impl {
                 let __j: $crate::vm::abi::Jump<'gc> = $$j;
                 reload_thread!();
                 match __j {
-                    $crate::vm::abi::Jump::Dispatch { pc: __p, base: __b } => {
-                        resume!(__b, __p)
-                    }
                     $crate::vm::abi::Jump::Ret { ret: __r, nret: __n, values: __v, base: __b } => {
                         become __r(
                             $crate::vm::abi::Slot::nret(__n),
@@ -619,8 +618,8 @@ pub(crate) fn check_sync<'gc>(ts: &ThreadState<'gc>) {
     );
 }
 
-/// Debug: at the first dispatch after a `sync!`, the published base still
-/// points into the stack (growth in between must have rebased it). The
+/// Debug: at the first dispatch after a `sync!`, the published base points
+/// into the stack. The
 /// pair itself may be stale by now: a tail call replaces the frame in place,
 /// and D10 reads the published state only at exits, which publish again.
 #[cfg(debug_assertions)]

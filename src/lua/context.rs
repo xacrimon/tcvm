@@ -74,6 +74,19 @@ impl<'gc> Context<'gc> {
         }
     }
 
+    /// The cells dispatch keeps in `State`.
+    #[inline(always)]
+    pub(crate) fn runtime(self) -> &'gc crate::vm::dispatch::Runtime<'gc> {
+        &self.state.rt
+    }
+
+    /// The `State` this context is a handle on, for the `rt` of code that
+    /// outlives it (a thread's stack).
+    #[inline(always)]
+    pub(crate) fn state_ptr(self) -> *const State<'gc> {
+        self.state
+    }
+
     #[inline(always)]
     pub(crate) fn jit(self) -> &'gc crate::jit::state::JitRuntime {
         &self.state.jit
@@ -148,6 +161,11 @@ impl<'gc> Context<'gc> {
     #[inline]
     pub(crate) fn ipairs_iter(self) -> Function<'gc> {
         self.state.ipairs_iter
+    }
+
+    /// See `State::stacks`.
+    pub(crate) fn stack_pool(self) -> &'gc std::rc::Rc<crate::vm::stack::StackPool> {
+        &self.state.stacks
     }
 
     /// See `State::unwind`.
@@ -381,6 +399,16 @@ impl<'gc> Context<'gc> {
     }
 
     fn load_text(
+        self,
+        source: &str,
+        name: LuaString<'gc>,
+        env: Value<'gc>,
+    ) -> Result<Function<'gc>, LoadError> {
+        // The parser and compiler recurse with the source's nesting.
+        crate::vm::stack::on_host(self, || self.load_text_here(source, name, env))
+    }
+
+    fn load_text_here(
         self,
         source: &str,
         name: LuaString<'gc>,

@@ -119,11 +119,6 @@ pub(crate) unsafe fn caller_base<'gc>(base: *mut Value<'gc>) -> *mut Value<'gc> 
 }
 
 #[inline(always)]
-pub(crate) unsafe fn set_caller_base<'gc>(base: *mut Value<'gc>, caller: *mut Value<'gc>) {
-    unsafe { hdr(base).add(2).write(caller as usize as u64) }
-}
-
-#[inline(always)]
 pub(crate) unsafe fn caller_pc<'gc>(base: *mut Value<'gc>) -> *const Instruction {
     unsafe { hdr(base).add(3).read() as usize as *const Instruction }
 }
@@ -400,25 +395,4 @@ pub(crate) fn frames<'a, 'gc>(ts: &'a ThreadState<'gc>) -> impl Iterator<Item = 
         }
         Some(f)
     })
-}
-
-/// Point every header's caller word, and the published base, into a stack
-/// that moved from address `old` to `new`.
-pub(crate) fn rebase<'gc>(ts: &mut ThreadState<'gc>, old: usize, new: *mut Value<'gc>) {
-    let shift = |p: *mut Value<'gc>| -> *mut Value<'gc> {
-        if p.is_null() {
-            p
-        } else {
-            unsafe { new.add((p.addr() - old) / size_of::<Value<'gc>>()) }
-        }
-    };
-    ts.top_base = shift(ts.top_base);
-    let mut base = ts.top_base;
-    while !base.is_null() {
-        unsafe {
-            let c = shift(caller_base(base));
-            set_caller_base(base, c);
-            base = c;
-        }
-    }
 }
