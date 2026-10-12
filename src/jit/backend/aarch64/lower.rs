@@ -76,7 +76,7 @@ struct Lower<'a, 'gc> {
     box_reg: Option<VReg>,
     /// Stores a known call writes itself, and its callee (D2).
     absorbed: Vec<bool>,
-    known: crate::jit::FastMap<Inst, (u64, u64)>,
+    known: crate::jit::FastMap<Inst, (u64, u64, u8)>,
 }
 
 fn rep_class(rep: Rep) -> RegClass {
@@ -257,7 +257,6 @@ impl<'a, 'gc> Lower<'a, 'gc> {
     /// the call's slot nothing between reads.
     fn find_known_callees(&mut self, order: &[Block]) {
         use crate::jit::ir::ops::Mem;
-        use crate::jit::layout::{FN_IS_VARARG, FN_PROTO, FUNCTION_TAG};
         for &b in order {
             let Some(t) = self.f.terminator(b) else {
                 continue;
@@ -272,22 +271,16 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                         let Some(Op::KObj(p)) = self.f.def_op(self.f.args(j)[0]) else {
                             break;
                         };
-                        let bits = self.f.pool[p as usize].to_raw();
-                        if (bits >> 48) as u16 != FUNCTION_TAG {
-                            break;
-                        }
-                        let ptr = (bits & crate::vm::frame::PTR_MASK) as usize;
-                        // SAFETY: the pool keeps the closure, a Lua one when
-                        // its vararg byte is 0, and so its prototype alive.
-                        let (vararg, proto) = unsafe {
-                            (
-                                *((ptr + FN_IS_VARARG) as *const u8),
-                                *((ptr + FN_PROTO) as *const usize),
-                            )
-                        };
-                        if vararg == 0 {
+                        let v = self.f.pool[p as usize];
+                        if let Some(func) = v.get_function()
+                            && let crate::env::function::FunctionKind::Lua(c) =
+                                func.inner().as_ref()
+                            && !c.is_vararg
+                        {
+                            // The prototype word the fast path loads.
+                            let proto = c.proto.ptr.as_ptr() as u64;
                             self.absorbed[j.idx()] = true;
-                            self.known.insert(t, (bits, proto as u64));
+                            self.known.insert(t, (v.to_raw(), proto, c.num_params));
                         }
                         break;
                     }

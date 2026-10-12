@@ -131,6 +131,8 @@ struct Em<'a> {
     sites: Vec<SiteOut>,
     sites_of: &'a [(usize, crate::jit::backend::aarch64::lower::LSite)],
     snap_ops: &'a [u32],
+    /// This region's prototype and its known entry, when it has one.
+    own_entry: Option<(u64, Label)>,
     /// `FMod`'s out-of-line paths: (entry, return, d, a, b).
     fmods: Vec<(Label, Label, Fpr, Fpr, Fpr)>,
 }
@@ -140,7 +142,13 @@ struct Em<'a> {
 pub(crate) struct FastEntry {
     pub(crate) max_stack: u8,
     pub(crate) num_params: u8,
+    /// The region's prototype, whose calls enter here directly (D2).
+    pub(crate) proto: u64,
 }
+
+/// The fast entry past its arity and native stack checks, for a caller
+/// that proved them (D2).
+pub(crate) const KNOWN_ENTRY: u64 = 24;
 
 /// Addresses of the Rust routines a region branches to.
 #[derive(Clone)]
@@ -266,6 +274,7 @@ pub(crate) fn emit(
         sites_of: &l.sites,
         snap_ops: &l.snap_ops,
         fmods: Vec::new(),
+        own_entry: None,
     };
     // A compiled caller has written the header, set base, closure and `insn`
     // (the argument count) as `enter` would, and its `blr` left the return
@@ -275,16 +284,23 @@ pub(crate) fn emit(
     let fast_label = fast.map(|fe| {
         let l = em.a.new_label();
         em.a.bind(l);
-        em.a.ldr(X16, THREAD, layout::THREAD_STACK_END as i32);
-        em.a.add_imm(Sz::X, X17, BASE, fe.max_stack as u64 * 8);
-        em.a.cmp(Sz::X, X17, X16);
-        em.a.b_cond(Cond::Hi, fast_miss);
         em.a.cmp_imm(Sz::X, INSN, fe.num_params as u64);
         em.a.b_cond(Cond::Lo, fast_miss);
         em.a.mov_sp(X16, SP);
         em.a.ldr(X17, RT, layout::NATIVE_LIMIT as i32);
         em.a.cmp(Sz::X, X16, X17);
         em.a.b_cond(Cond::Lo, fast_miss);
+        let known = em.a.new_label();
+        em.a.bind(known);
+        assert_eq!(
+            (em.a.label_offset(known) - em.a.label_offset(l)) as u64,
+            KNOWN_ENTRY
+        );
+        em.own_entry = Some((fe.proto, known));
+        em.a.ldr(X16, THREAD, layout::THREAD_STACK_END as i32);
+        em.a.add_imm(Sz::X, X17, BASE, fe.max_stack as u64 * 8);
+        em.a.cmp(Sz::X, X17, X16);
+        em.a.b_cond(Cond::Hi, fast_miss);
         l
     });
     let nb = l.vcode.blocks.len();
@@ -578,21 +594,40 @@ impl Em<'_> {
         self.a.ldr(X17, X16, layout::FN_PROTO as i32);
         self.a.ldr(X17, X17, layout::PROTO_FAST as i32);
         self.a.cbz(Sz::X, X17, slow);
-        self.fast_enter(hdr, block)
+        self.fast_enter(hdr, block, false)
     }
 
     /// `fast_call` for a known callee (D2): its prototype's fast entry, or
-    /// `slow`; word 0 the closure word.
-    fn known_call(&mut self, hdr: i32, block: usize, slow: Label, f: u64, proto: u64) -> Label {
-        self.a.mov_imm(X17, proto);
-        self.a.ldr(X17, X17, layout::PROTO_FAST as i32);
-        self.a.cbz(Sz::X, X17, slow);
+    /// `slow`, past the arity check when `nargs` (static) covers its
+    /// parameters, and this region's own when it is the callee's; word 0
+    /// the closure word.
+    fn known_call(
+        &mut self,
+        hdr: i32,
+        block: usize,
+        slow: Label,
+        (f, proto, nparams): (u64, u64, u8),
+        nargs: u8,
+    ) -> Label {
+        let known = nargs != u8::MAX && nargs >= nparams;
+        match self.own_entry {
+            Some((p, l)) if p == proto && known => self.a.adr(X17, l),
+            _ => {
+                self.a.mov_imm(X17, proto);
+                self.a.ldr(X17, X17, layout::PROTO_FAST as i32);
+                self.a.cbz(Sz::X, X17, slow);
+                if known {
+                    self.a.add_imm(Sz::X, X17, X17, KNOWN_ENTRY);
+                }
+            }
+        }
         self.a.mov_imm(X16, f & PTR_MASK);
-        self.fast_enter(hdr, block)
+        self.fast_enter(hdr, block, known)
     }
 
-    /// Enter the fast entry in x17 of the closure in x16 (`fast_call`).
-    fn fast_enter(&mut self, hdr: i32, block: usize) -> Label {
+    /// Enter the fast entry in x17 of the closure in x16 (`fast_call`), its
+    /// known entry when `known`.
+    fn fast_enter(&mut self, hdr: i32, block: usize, known: bool) -> Label {
         let fast_resume = self.fast_resume[self.v.succs(block)[0].index()];
         // Word 1 zero: the frame's flags, which helpers set there (a closure
         // capturing a register, `HAS_OPEN`) and `HasFlag` reads; a walk adds
@@ -619,6 +654,16 @@ impl Em<'_> {
         self.a.bind(ret);
         self.a.b(fast_resume);
         self.a.bind(deep);
+        if known {
+            // The known entry trusts the native stack, which is deep enough
+            // here to check: below the limit the full entry misses.
+            let ok = self.a.new_label();
+            self.a.ldr(Gpr(10), RT, layout::NATIVE_LIMIT as i32);
+            self.a.cmp(Sz::X, Gpr(9), Gpr(10));
+            self.a.b_cond(Cond::Hs, ok);
+            self.a.sub_imm(Sz::X, X17, X17, KNOWN_ENTRY);
+            self.a.bind(ok);
+        }
         self.a.adr(LR, fast_resume);
         self.a.orr_imm(Sz::X, LR, LR, 1);
         self.a.br(X17);
@@ -1571,7 +1616,7 @@ impl Em<'_> {
                 }
                 let slow = self.a.new_label();
                 let ret = match known {
-                    Some((f, proto)) => self.known_call(hdr, block, slow, f, proto),
+                    Some(k) => self.known_call(hdr, block, slow, k, nargs),
                     None => self.fast_call(hdr, block, slow),
                 };
                 self.a.bind(slow);
@@ -1579,7 +1624,7 @@ impl Em<'_> {
                 let (entries, consts) = self.site_entries(i, block);
                 let call = Some((a as u16, resume, pc_after as u64));
                 self.leave_site(vec![ret, fast], entries, consts, call);
-                if let Some((f, _)) = known {
+                if let Some((f, _, _)) = known {
                     self.a.mov_imm(X16, f);
                     self.a.str(X16, BASE, hdr);
                 }
