@@ -23,7 +23,7 @@ use crate::jit::region::{Loc, SRep, SnapEntry};
 
 const NIL: u64 = 0xFFFF_FFFE_0000_0000;
 const FALSE: u64 = NIL | 1;
-const BOX: u64 = 0xFFF9_0000_0000_0000;
+pub(crate) const BOX: u64 = 0xFFF9_0000_0000_0000;
 const PTR_MASK: u64 = (1 << 48) - 1;
 use crate::jit::layout::FUNCTION_TAG;
 /// The machine code of a region, before its address is known.
@@ -732,9 +732,9 @@ impl Em<'_> {
             self.a.cmp_imm(Sz::X, X16, 2);
             Cond::Lo
         } else if let Some(tag) = single_tag(set) {
-            self.a.lsr_imm(Sz::X, X16, v, 48);
-            self.a.movz(Sz::W, X17, 0xfff8 | tag, 0);
-            self.a.cmp(Sz::W, X16, X17);
+            // The high 16 bits, sign extended, are `tag - 8`.
+            self.a.asr_imm(Sz::X, X16, v, 48);
+            self.a.cmn_imm(Sz::X, X16, 8 - tag as u64);
             Cond::Eq
         } else {
             panic!("type test of {set:?} needs more than one compare")
