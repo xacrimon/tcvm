@@ -1302,3 +1302,35 @@ fn loop_range_bounds() {
 "##,
     );
 }
+
+/// Float compares of converted integers become integer compares where the
+/// constant converts back exactly.
+#[test]
+fn int_compares_against_float_constants() {
+    agrees(
+        r##"
+        local function f(x, y)
+            local n = 0
+            if x < 2.0 then n = n + 1 end
+            if x <= 2.5 then n = n + 2 end
+            if x == -0.0 then n = n + 4 end
+            if x < 2147483648.0 then n = n + 8 end
+            if 3.0 >= x then n = n + 16 end
+            if x + 0.0 < y + 0.0 then n = n + 32 end
+            if x > -2147483648.0 then n = n + 64 end
+            if x ~= 1e300 then n = n + 128 end
+            return n
+        end
+        local out = {}
+        for r = 1, 300 do
+            local x = r % 9 - 4
+            out[#out + 1] = f(x, 2 - x)
+        end
+        out[#out + 1] = f(2147483647, -2147483648)
+        out[#out + 1] = f(-2147483648, 0)
+        out[#out + 1] = f(math.maxinteger, 1)
+        out[#out + 1] = f(2.5, 3)
+        return table.concat(out, " ")
+"##,
+    );
+}
