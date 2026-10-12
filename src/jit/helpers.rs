@@ -4,7 +4,7 @@
 use crate::dmm::Gc;
 use crate::dmm::lock::RefLock;
 use crate::env::MetamethodBits;
-use crate::env::function::UpvalueCell;
+use crate::env::function::{NativeClosure, UpvalueCell};
 use crate::env::string::LuaString;
 use crate::env::table::{Step, Table, TableState};
 use crate::env::thread::ThreadState;
@@ -13,7 +13,8 @@ use crate::instruction::ArithKind;
 use crate::instruction::TFOR_VARS;
 use crate::jit::ir::ops::{HELPER_FAIL_VAL, HelperId};
 use crate::lua::{Context, State};
-use crate::vm::frame::{self, land_results};
+use crate::vm::frame::{self, NativeHdr, land_results};
+use crate::vm::native::{invoke, ok};
 use crate::vm::num::{self, ArithOp, SlowNum};
 use crate::vm::ops::control::{close_upvalues, new_closure, vararg_get, vararg_table};
 use crate::vm::ops::meta::{
@@ -60,6 +61,10 @@ pub(crate) fn address(h: HelperId) -> usize {
         HelperId::StrLen => jit_strlen as *const () as usize,
         HelperId::StrSub => jit_strsub as *const () as usize,
         HelperId::StrByte => jit_strbyte as *const () as usize,
+        HelperId::TInsert => jit_tinsert as *const () as usize,
+        HelperId::TRemove => jit_tremove as *const () as usize,
+        HelperId::Min => jit_min as *const () as usize,
+        HelperId::Max => jit_max as *const () as usize,
     }
 }
 
@@ -496,6 +501,64 @@ pub(crate) extern "C" fn jit_barrier(
     ctx.mutation().backward_barrier(Gc::erase(g), None);
 }
 
+/// What `jit_call_native` returns in x0 and x1: a plain return's first
+/// result (nil for none) and count, or the native's `NativeOut` and
+/// `u64::MAX`.
+#[repr(C)]
+pub(crate) struct NativeRet {
+    first: u64,
+    n: u64,
+}
+
+/// Run the native `nc` on its `nargs` arguments at `w` for compiled code,
+/// from `abi::native_entry` (I1): its header as `native_call` writes it,
+/// returning through `ret_shim`. A collection owed after a plain return
+/// parks here: the call's site names what the caller keeps. A panic in the
+/// native unwinds through it into the compiled caller (`unwind::Fde`).
+pub(crate) unsafe extern "C-unwind" fn jit_call_native(
+    rt: *const State<'static>,
+    w: *mut Value<'static>,
+    nargs: usize,
+    nc: *const NativeClosure<'static>,
+) -> NativeRet {
+    let ctx = unsafe { Context::from_state(rt) };
+    let ts = unsafe { &mut *ctx.thread_ptr() };
+    let nc = unsafe { &*nc };
+    unsafe {
+        let h = w.sub(frame::HDR).cast::<u64>();
+        h.write(
+            NativeHdr {
+                at: 0,
+                cont: 0,
+                ok: ok::CONT,
+            }
+            .pack(nc),
+        );
+        h.add(1)
+            .write(crate::vm::stack::ret_shim_bits() | frame::flag::NATIVE);
+    }
+    ts.top_base = w;
+    let win = ts.slot_index(w);
+    ts.top = win + nargs;
+    let out = invoke(ctx, ts, nc, win);
+    if !out.is_return() {
+        return NativeRet {
+            first: out.raw(),
+            n: u64::MAX,
+        };
+    }
+    if ctx.gc_due() {
+        crate::vm::stack::park(ctx, crate::vm::stack::Park::Gc);
+    }
+    let ts = unsafe { &*ctx.thread_ptr() };
+    let n = ts.top - win;
+    let first = if n == 0 { Value::nil() } else { ts.stack[win] };
+    NativeRet {
+        first: first.to_raw(),
+        n: n as u64,
+    }
+}
+
 /// Box an integer outside i32.
 pub(crate) extern "C" fn jit_box_i64(rt: *const State<'static>, v: i64) -> u64 {
     let ctx = unsafe { Context::from_state(rt) };
@@ -600,6 +663,80 @@ pub(crate) extern "C" fn jit_rawequal(a: u64, b: u64) -> u64 {
 }
 
 /// `rawlen(v)` of a table or string.
+/// The table `v` is when `table.insert` and `table.remove` would access it
+/// raw.
+fn raw_list<'gc>(v: u64) -> Option<Table<'gc>> {
+    let t = unsafe { Value::from_raw(v) }.get_table()?;
+    let mm = MetamethodBits::INDEX | MetamethodBits::NEWINDEX | MetamethodBits::LEN;
+    (!t.shape().has_any_mm(mm)).then_some(t)
+}
+
+/// `table.insert(t, v)`, appending.
+pub(crate) extern "C" fn jit_tinsert(rt: *const State<'static>, t: u64, v: u64) -> u64 {
+    let ctx = unsafe { Context::from_state(rt) };
+    let Some(t) = raw_list(t) else {
+        return HELPER_FAIL_VAL;
+    };
+    let e = (t.raw_len() as i64).wrapping_add(1);
+    t.raw_set(ctx, Value::integer(ctx.mutation(), e), unsafe {
+        Value::from_raw(v)
+    });
+    Value::nil().to_raw()
+}
+
+/// `table.remove(t)`: `t[#t]`, cleared (`t[0]` for an empty list, as the
+/// builtin's).
+pub(crate) extern "C" fn jit_tremove(rt: *const State<'static>, t: u64) -> u64 {
+    let ctx = unsafe { Context::from_state(rt) };
+    let Some(t) = raw_list(t) else {
+        return HELPER_FAIL_VAL;
+    };
+    let k = Value::integer(ctx.mutation(), t.raw_len() as i64);
+    let v = t.raw_get(k);
+    t.raw_set(ctx, k, Value::nil());
+    v.to_raw()
+}
+
+/// `x < y` for two numbers, compared exactly.
+fn num_lt(x: Value<'_>, y: Value<'_>) -> Option<bool> {
+    Some(match (x.get_integer(), y.get_integer()) {
+        (Some(a), Some(b)) => a < b,
+        (Some(a), None) => num::lt_int_float(a, y.get_float()?),
+        (None, Some(b)) => num::lt_float_int(x.get_float()?, b),
+        (None, None) => x.get_float()? < y.get_float()?,
+    })
+}
+
+/// `math.min(a, b)`: `b` when it is below `a`.
+pub(crate) extern "C" fn jit_min(a: u64, b: u64) -> u64 {
+    let (x, y) = unsafe { (Value::from_raw(a), Value::from_raw(b)) };
+    match num_lt(y, x) {
+        Some(lt) => {
+            if lt {
+                b
+            } else {
+                a
+            }
+        }
+        None => HELPER_FAIL_VAL,
+    }
+}
+
+/// `math.max(a, b)`: `b` when `a` is below it.
+pub(crate) extern "C" fn jit_max(a: u64, b: u64) -> u64 {
+    let (x, y) = unsafe { (Value::from_raw(a), Value::from_raw(b)) };
+    match num_lt(x, y) {
+        Some(lt) => {
+            if lt {
+                b
+            } else {
+                a
+            }
+        }
+        None => HELPER_FAIL_VAL,
+    }
+}
+
 pub(crate) extern "C" fn jit_rawlen(rt: *const State<'static>, v: u64) -> u64 {
     let ctx = unsafe { Context::from_state(rt) };
     let v = unsafe { Value::from_raw(v) };

@@ -319,7 +319,7 @@ fn round_to_int<'gc>(
     Ok(())
 }
 
-fn lua_max<'gc>(
+pub(crate) fn lua_max<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
@@ -327,7 +327,7 @@ fn lua_max<'gc>(
     select_extreme(ctx, stack, "max", false)
 }
 
-fn lua_min<'gc>(
+pub(crate) fn lua_min<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,

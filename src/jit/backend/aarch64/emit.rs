@@ -13,7 +13,7 @@ use crate::jit::backend::aarch64::abi::{
 use crate::jit::backend::aarch64::asm::{
     Asm, Cond, Extend, FP, Fpr, Gpr, LR, Label, SP, Shift, Sz, ZR,
 };
-use crate::jit::backend::aarch64::inst::{AluOp, ENTRY_FAIL, FOp, FUnOp, MInst, Test};
+use crate::jit::backend::aarch64::inst::{AluOp, ENTRY_FAIL, FOp, FUnOp, Known, MInst, Test};
 use crate::jit::backend::aarch64::lower::{LExit, Lowered, Src};
 use crate::jit::backend::vcode::VCode;
 use crate::jit::ir::ops::Ctx;
@@ -163,6 +163,10 @@ pub(crate) struct Helpers {
     /// `abi::jit_level` and `abi::ret_to_native`.
     pub(crate) level: usize,
     pub(crate) ret_to_native: usize,
+    /// `abi::native_entry`, and `native_act` for what a native asks for
+    /// besides a plain return.
+    pub(crate) native: usize,
+    pub(crate) native_act: usize,
     /// The trampolines of the helpers cold arms call: (helper, trampoline).
     pub(crate) trampolines: Vec<(usize, usize)>,
 }
@@ -516,10 +520,11 @@ impl Em<'_> {
     /// The fast path of a call whose header is at `base + hdr`, `insn` the
     /// argument count: a Lua callee without varargs whose prototype has a
     /// fast entry is called with `blr`, this frame kept, and its `ret` lands
-    /// past the resume block's frame push (5.4); anything else goes to `slow`.
-    /// Every register is free here: what lives across the call is in the
-    /// frame. Returns `fast_enter`'s labels.
-    fn fast_call(&mut self, hdr: i32, block: usize, slow: Label) -> (Label, Label) {
+    /// past the resume block's frame push (5.4); a native goes to `native`
+    /// (`native_path`), anything else to `slow`. Every register is free
+    /// here: what lives across the call is in the frame. Returns
+    /// `fast_enter`'s labels.
+    fn fast_call(&mut self, hdr: i32, block: usize, slow: Label, native: Label) -> (Label, Label) {
         self.a.ldr(X16, BASE, hdr);
         self.a.lsr_imm(Sz::X, X17, X16, 48);
         self.a.movz(Sz::W, Gpr(9), FUNCTION_TAG, 0);
@@ -527,7 +532,7 @@ impl Em<'_> {
         self.a.b_cond(Cond::Ne, slow);
         self.a.and_imm(Sz::X, X16, X16, PTR_MASK);
         self.a.ldrb(X17, X16, layout::FN_IS_VARARG as i32);
-        self.a.cbnz(Sz::W, X17, slow);
+        self.a.cbnz(Sz::W, X17, native);
         self.a.ldr(X17, X16, layout::FN_PROTO as i32);
         self.a.ldr(X17, X17, layout::PROTO_FAST as i32);
         self.a.cbz(Sz::X, X17, slow);
@@ -606,6 +611,60 @@ impl Em<'_> {
         self.a.orr(Sz::X, X16, X16, X17);
         self.a.str(X16, BASE, hdr);
         self.a.b(slow);
+    }
+
+    /// A native callee, run by `jit_call_native` on this stack (I1): from
+    /// `check`, `fast_call`'s test with the function in x16 and its
+    /// `FN_IS_VARARG` byte in w17 (1 for a vararg Lua callee, which goes to
+    /// `slow`, the enum's tag above that), or the constant closure `nc`. A
+    /// plain return lands as a fast callee's; anything else goes on in a
+    /// level running `native_act` on the frame, which returns through
+    /// `ret_to_native`. Returns the return addresses for `call_site`.
+    fn native_path(
+        &mut self,
+        hdr: i32,
+        block: usize,
+        from: Result<(Label, Label), u64>,
+    ) -> Vec<(Label, bool)> {
+        let resume = self.resume_based[self.v.succs(block)[0].index()];
+        match from {
+            Ok((check, slow)) => {
+                self.a.bind(check);
+                self.a.cmp_imm(Sz::W, X17, 1);
+                self.a.b_cond(Cond::Eq, slow);
+                self.a.add_imm(Sz::X, Gpr(3), X16, layout::FN_NATIVE as u64);
+            }
+            Err(nc) => self.a.mov_imm(Gpr(3), nc),
+        }
+        let win = hdr as u64 + 32;
+        self.a.mov(Gpr(0), RT);
+        self.a.add_imm(Sz::X, Gpr(1), BASE, win);
+        self.a.mov(Gpr(2), INSN);
+        self.a.bl_far(self.helpers.native);
+        let ret = self.a.new_label();
+        self.a.bind(ret);
+        let outcome = self.a.new_label();
+        self.a.cmn_imm(Sz::X, Gpr(1), 1);
+        self.a.b_cond(Cond::Eq, outcome);
+        self.a.mov(INSN, Gpr(1));
+        self.a.add_imm(Sz::X, PC, BASE, win);
+        self.a.b(resume);
+        self.a.bind(outcome);
+        self.a.ldr(Gpr(9), BASE, hdr + 8);
+        self.a
+            .and_imm(Sz::X, Gpr(9), Gpr(9), crate::vm::frame::flag::MASK);
+        self.a.ldr_lit(Gpr(10), self.helpers.ret_to_native as u64);
+        self.a.orr(Sz::X, Gpr(9), Gpr(9), Gpr(10));
+        self.a.str(Gpr(9), BASE, hdr + 8);
+        self.a.mov(INSN, Gpr(0));
+        self.a.add_imm(Sz::X, PC, BASE, hdr as u64);
+        self.a.add_imm(Sz::X, X17, BASE, win);
+        self.a.ldr_lit(X16, self.helpers.native_act as u64);
+        self.a.bl_far(self.helpers.level);
+        let back = self.a.new_label();
+        self.a.bind(back);
+        self.a.b(resume);
+        vec![(ret, false), (back, true)]
     }
 
     /// Deep in a chain the return address goes in tagged (bit 0), so the
@@ -1601,31 +1660,41 @@ impl Em<'_> {
                 } else {
                     self.a.movz(Sz::X, INSN, nargs as u16, 0);
                 }
+                if let Some(Known::Native(nc)) = known {
+                    let keys = self.native_path(hdr, block, Err(nc));
+                    // Nothing returns past the resume block's branch to it.
+                    self.a.bind(self.miss[self.v.succs(block)[0].index()]);
+                    self.a.brk(0xf2);
+                    self.call_site(keys, i, block, a as u16, pc_after);
+                    return Ok(());
+                }
                 let (slow, common) = (self.a.new_label(), self.a.new_label());
+                let native = self.a.new_label();
                 let (ret, deep, entered_known) = match known {
-                    Some(k) => self.known_call(hdr, block, slow, k, nargs),
-                    None => {
-                        let (r, d) = self.fast_call(hdr, block, slow);
+                    Some(Known::Lua(f, proto, nparams)) => {
+                        self.known_call(hdr, block, slow, (f, proto, nparams), nargs)
+                    }
+                    _ => {
+                        let (r, d) = self.fast_call(hdr, block, slow, native);
                         (r, d, false)
                     }
                 };
                 self.miss_path(hdr, block, common);
                 self.deep_path(deep, block, entered_known);
+                let mut keys = vec![(ret, false)];
+                if known.is_none() {
+                    keys.extend(self.native_path(hdr, block, Ok((native, slow))));
+                }
                 self.a.bind(slow);
-                if let Some((f, _, _)) = known {
+                if let Some(Known::Lua(f, _, _)) = known {
                     self.a.mov_imm(X16, f);
                     self.a.str(X16, BASE, hdr);
                 }
                 self.a.bind(common);
                 let back = self.level_call(hdr, block, pc_after);
                 let fast = self.fast_resume[self.v.succs(block)[0].index()];
-                self.call_site(
-                    vec![(ret, false), (fast, false), (back, true)],
-                    i,
-                    block,
-                    a as u16,
-                    pc_after,
-                );
+                keys.extend([(fast, false), (back, true)]);
+                self.call_site(keys, i, block, a as u16, pc_after);
             }
             Dispatch { op, word, pc_after } => {
                 self.close_frame();
@@ -1725,20 +1794,17 @@ impl Em<'_> {
                     self.a.str(v, BASE, at);
                 }
                 self.a.movz(Sz::X, INSN, nargs as u16, 0);
-                let slow = self.a.new_label();
-                let (ret, deep) = self.fast_call(h, block, slow);
+                let (slow, native) = (self.a.new_label(), self.a.new_label());
+                let (ret, deep) = self.fast_call(h, block, slow, native);
                 self.miss_path(h, block, slow);
                 self.deep_path(deep, block, false);
+                let mut keys = vec![(ret, false)];
+                keys.extend(self.native_path(h, block, Ok((native, slow))));
                 self.a.bind(slow);
                 let back = self.level_call(h, block, pc_after);
                 let fast = self.fast_resume[self.v.succs(block)[0].index()];
-                self.call_site(
-                    vec![(ret, false), (fast, false), (back, true)],
-                    i,
-                    block,
-                    hdr,
-                    pc_after,
-                );
+                keys.extend([(fast, false), (back, true)]);
+                self.call_site(keys, i, block, hdr, pc_after);
             }
             GuardFits { end, exit } => {
                 self.a.ldr(X16, THREAD, layout::THREAD_STACK_END as i32);

@@ -1710,3 +1710,68 @@ fn closing_value_survives_collections() {
         return s .. ' ' .. closed",
     );
 }
+
+/// Cases an intrinsic's inline code does not take, once compiled: the
+/// builtin runs from the region (I1).
+#[test]
+fn intrinsic_fallbacks() {
+    agrees(
+        "local mt = {__pairs = function(t) return function(_, k) if not k then return 1, 'p' end end, t, nil end}
+        local plain, special = {10, 20}, setmetatable({}, mt)
+        local out, n = {}, 0
+        for i = 1, 400 do
+          local t = i > 300 and special or plain
+          for k, v in pairs(t) do n = n + 1 end
+          local ok, e = pcall(function() return assert(i < 350 or nil, 'falsy at ' .. i) end)
+          if not ok then out[#out + 1] = e end
+          local x = i > 380 and ('-' .. i) or -i
+          n = n + math.abs(x)
+        end
+        return n .. ' ' .. #out .. ' ' .. out[1]",
+    );
+}
+
+/// `math.min`, `math.max`, `table.insert` and `table.remove` as intrinsics
+/// (I1): mixed number kinds, NaN, and lists whose metatables the builtin
+/// must see.
+#[test]
+fn list_and_min_max_intrinsics() {
+    agrees(
+        r#"
+        local out = {}
+        local function p(...) out[#out + 1] = table.concat({...}, ",") end
+        local nan = 0/0
+        local vals = {1, 2, -3, 2.5, 1.0, math.huge, -0.0, 0, 2^53, math.maxinteger, math.mininteger}
+        local s1, s2 = 0, 0
+        for r = 1, 50 do
+          for i = 1, #vals do for j = 1, #vals do
+            local a, b = vals[i], vals[j]
+            local x, y = math.max(a, b), math.min(a, b)
+            if r == 50 then p(math.type(x), tostring(x), math.type(y), tostring(y)) end
+          end end
+          local ia, ib = r, 50 - r
+          s1 = s1 + math.max(ia, ib) - math.min(ia, ib)
+          local fa, fb = r * 0.5, 25.25
+          s2 = s2 + math.max(fa, fb) + math.min(fa, fb)
+        end
+        p(tostring(math.max(nan, 1)), tostring(math.max(1, nan)), tostring(math.min(nan, 1)), tostring(math.min(1, nan)))
+        p(s1, s2)
+        -- insert / remove
+        local t, sum = {}, 0
+        for i = 1, 300 do table.insert(t, i) end
+        for i = 1, 100 do sum = sum + table.remove(t) end
+        p(#t, sum, tostring(table.remove({})), tostring(table.remove({[0] = 'z'})))
+        local logged = {}
+        local proxy = setmetatable({}, {__newindex = function(tt, k, v) logged[#logged + 1] = k rawset(tt, k, v) end})
+        for i = 1, 300 do table.insert(proxy, i * 2) end
+        p(#logged, #proxy)
+        local lenned = setmetatable({}, {__len = function() return 7 end})
+        for i = 1, 300 do table.insert(lenned, i) end
+        p(tostring(rawget(lenned, 8)), tostring(rawget(lenned, 9)))
+        local e = {}
+        for i = 1, 300 do table.insert(e, nil) end
+        p(#e)
+        return table.concat(out, "\n")
+"#,
+    );
+}

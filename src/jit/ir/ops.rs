@@ -153,6 +153,15 @@ pub(crate) enum HelperId {
     StrLen,
     StrSub,
     StrByte,
+    /// `table.insert(t, v)` and `table.remove(t)` on a table whose
+    /// metatable has none of `__index`, `__newindex` and `__len`, else
+    /// `HELPER_FAIL_VAL`; `insert` gives nil.
+    TInsert,
+    TRemove,
+    /// `math.min(a, b)` and `math.max(a, b)` of two numbers, the one the
+    /// builtin picks, else `HELPER_FAIL_VAL`.
+    Min,
+    Max,
     /// `(Val, Val, Val) ->`: `recv[key] = v` through `__newindex` tables,
     /// `raw_set_keyed` when `keyed` (`t[k] = v`), or `HELPER_FAIL_VAL`.
     NewIndex {
@@ -374,6 +383,15 @@ impl HelperId {
             HelperId::RawEqual => (&[][..], None, &[Val, Val], Some(I32), pure),
             HelperId::StrSub => (RT, None, &[Val, Val, Val], Some(Val), e(ALLOC, NONE, NONE)),
             HelperId::StrByte => (&[][..], None, &[Val, Val], Some(Val), pure),
+            HelperId::TInsert => (
+                RT,
+                None,
+                &[Val, Val],
+                Some(Val),
+                e(ALLOC, Mem::ALL, table_write),
+            ),
+            HelperId::TRemove => (RT, None, &[Val], Some(Val), e(ALLOC, Mem::ALL, table_write)),
+            HelperId::Min | HelperId::Max => (&[][..], None, &[Val, Val], Some(Val), pure),
         };
         Sig {
             ctx,

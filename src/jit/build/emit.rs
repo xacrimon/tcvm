@@ -380,7 +380,7 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             let slow = match intrinsics::emit(b, pc, insn, callee) {
                 Emitted::No => Some(b.cur),
                 Emitted::Done => None,
-                Emitted::Fallback(slow) => Some(slow),
+                Emitted::Fallback(slow, _) => Some(slow),
             };
             if slow != Some(b.cur) {
                 b.flush();
@@ -1744,13 +1744,13 @@ fn emit_call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
             }
         }
         Emitted::Done => {}
-        Emitted::Fallback(slow) => {
+        Emitted::Fallback(slow, f) => {
             // The builtin's results join the inline code's.
             let join = b.new_block();
             b.flush();
             b.jump(join);
             b.switch_to(slow);
-            call(b, pc, insn, callee);
+            call(b, pc, insn, f);
             b.flush();
             b.jump(join);
             enter_join(b, join);
@@ -1766,9 +1766,30 @@ fn callee_at(b: &mut Builder<'_, '_>, pc: u32, a: u8) -> Val {
     }
 }
 
+/// A native `callee` as a constant, which lowering calls through
+/// `jit_call_native` without testing it (I1): one `value_now` takes for a
+/// constant is guarded by identity.
+fn native_callee(b: &mut Builder<'_, '_>, pc: u32, callee: Val) -> Val {
+    if matches!(b.f.def_op(callee), Some(Op::KObj(_))) {
+        return callee;
+    }
+    let guess = b.feedback(pc) & fb::CONST_MISS == 0;
+    let Some(f) = intrinsics::value_now(b, callee, guess)
+        .and_then(|v| v.get_function())
+        .filter(|f| f.as_native().is_some())
+    else {
+        return callee;
+    };
+    let k = b.konst(Value::function(f));
+    let cv = b.boxed(callee);
+    b.ins_exit(Op::GuardSame, &[cv, k], ExitTag::Const);
+    k
+}
+
 /// The CALL at `pc` as a call of `callee` (5.4).
 fn call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: Val) {
     let (a, nb, c) = (insn.a(), insn.b(), insn.c());
+    let callee = native_callee(b, pc, callee);
     let live = b
         .cfg
         .live_in

@@ -341,6 +341,37 @@ pub(crate) extern "rust-preserve-none" fn ret_to_native<'gc>(
     )
 }
 
+/// The continuation of a native's frame while `jit_call_native` runs it for
+/// compiled code: it only marks the frame for walks, which find its caller
+/// in `ThreadState::shim`. A native that does not return plainly gets
+/// `ret_to_native` in its place before it goes on in a level.
+#[unsafe(naked)]
+#[rustc_align(32)]
+pub(crate) extern "rust-preserve-none" fn ret_shim<'gc>(
+    _nret: crate::vm::abi::Slot,
+    _values: *const crate::instruction::Instruction,
+    _base: *mut crate::env::value::Value<'gc>,
+    _rt: crate::lua::Context<'gc>,
+    _closure: crate::vm::abi::Slot,
+    _thread: *mut crate::env::thread::ThreadState<'gc>,
+) -> crate::vm::abi::Exit {
+    core::arch::naked_asm!("brk #0xf1")
+}
+
+/// Compiled code's call of a native (I1), with `jit_call_native`'s
+/// arguments: records the caller's frame pointer and return address in the
+/// thread (x25) for walks, and goes on in `jit_call_native`, which returns
+/// to the caller.
+#[unsafe(naked)]
+pub(crate) unsafe extern "C" fn native_entry() {
+    core::arch::naked_asm!(
+        "stp x29, x30, [x25, #{shim}]",
+        "b {body}",
+        shim = const crate::jit::layout::SHIM,
+        body = sym crate::jit::helpers::jit_call_native,
+    )
+}
+
 /// Continue in the handler in `JitRuntime::jump_target` at the start of the
 /// thread's current level: where the unwinder resets a thread to the level
 /// of the frame that catches (H8).

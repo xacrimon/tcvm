@@ -231,6 +231,20 @@ pub(crate) fn ret_to_native_bits() -> u64 {
     }
 }
 
+/// `abi::ret_shim` as header words hold it, a value no handler has where
+/// there are no compiled natives.
+#[inline]
+pub(crate) fn ret_shim_bits() -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::vm::abi::handler_bits(crate::jit::backend::aarch64::abi::ret_shim)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        u64::MAX - 1
+    }
+}
+
 /// Why a thread handed control back to the host.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u64)]

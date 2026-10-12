@@ -58,6 +58,17 @@ pub(crate) enum Test {
     B1,
 }
 
+/// A call's constant callee.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Known {
+    /// A non-vararg Lua closure (D2): its value, prototype and parameter
+    /// count. The call writes the closure word on the fast path and the
+    /// value on the slow one.
+    Lua(u64, u64, u8),
+    /// A native: its closure, which `jit_call_native` runs (I1).
+    Native(u64),
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum MInst {
     /// Open the native frame. The entry block's first instruction.
@@ -270,10 +281,8 @@ pub(crate) enum MInst {
         a: u8,
         nargs: u8,
         pc_after: usize,
-        /// A constant non-vararg Lua callee (D2): its value, prototype and
-        /// parameter count. The call writes word 0 itself, the closure word
-        /// on the fast path and the value on the slow one.
-        known: Option<(u64, u64, u8)>,
+        /// A constant callee the call writes word 0 for itself.
+        known: Option<Known>,
     },
     /// `[use f, use args.., site..]`: a metamethod call from a header at
     /// slot `hdr` (the frame's register count); succ 0 is the resume block.

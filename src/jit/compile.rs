@@ -323,6 +323,8 @@ pub(crate) fn compile<'gc>(
         land: crate::jit::helpers::jit_land as *const () as usize,
         level: abi::jit_level as *const () as usize,
         ret_to_native: abi::ret_to_native as *const () as usize,
+        native: abi::native_entry as *const () as usize,
+        native_act: crate::vm::native::native_act as *const () as usize,
         trampolines,
     };
     // Allocated now, moved into the region after: the code embeds its address.
