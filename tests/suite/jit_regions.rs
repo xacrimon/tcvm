@@ -1208,3 +1208,44 @@ fn invariant_arithmetic_leaves_the_loop() {
 "##,
     );
 }
+
+/// Float `%` inline (E7): signed zeros, infinities, NaN, huge and tiny
+/// quotients, exact multiples and the doubles either side of them.
+#[test]
+fn float_modulo_edges() {
+    agrees(
+        r##"
+        local function bits(n) return string.unpack("<d", string.pack("<i8", n)) end
+        local function step(x, d)
+            return bits(string.unpack("<i8", string.pack("<d", x)) + d)
+        end
+        local as = {0.0, -0.0, 1.0, -1.0, 5.5, -5.5, 4.0, -4.0, 7.0, -7.0, 0.3, -0.3,
+            1e308, -1e308, 1e-300, -1e-300, 5e-324, -5e-324, 2.0^52, 2.0^53 + 2,
+            -2.0^60, 1e15 + 0.3, 1/0, -1/0, 0/0}
+        local bs = {2.0, -2.0, 3.0, -3.0, 0.1, -0.1, 1.0, 0.7, -0.7, 2.0^-30, 1e10,
+            1e300, 1e-300, 5e-324, 0.0, -0.0, 1/0, -1/0, 0/0}
+        for _, k in ipairs({3.0, 10.0, 1e6, 2.0^40, -3.0, -1e6}) do
+            for _, b in ipairs({0.1, 0.7, 3.3}) do
+                local m = k * b
+                as[#as + 1] = m
+                as[#as + 1] = step(m, 1)
+                as[#as + 1] = step(m, -1)
+            end
+        end
+        local function run()
+            local out = {}
+            for i = 1, #as do
+                local a = as[i]
+                for j = 1, #bs do
+                    local r = a % bs[j]
+                    out[#out + 1] = r ~= r and "nan" or string.format("%a", r)
+                end
+            end
+            return out
+        end
+        local out
+        for _ = 1, 30 do out = run() end
+        return table.concat(out, " ")
+"##,
+    );
+}

@@ -293,8 +293,15 @@ pub(crate) fn compile<'gc>(
     let tramp = |h: usize, f: bool| jit.trampoline(h, f).map_err(CompileError::Backend);
     let mut trampolines: Vec<(usize, usize)> = Vec::new();
     for inst in &lowered.vcode.insts {
-        if let crate::jit::backend::aarch64::inst::MInst::HelperCold(h) = inst {
-            let a = crate::jit::helpers::address(*h);
+        let h = match inst {
+            crate::jit::backend::aarch64::inst::MInst::HelperCold(h) => Some(*h),
+            crate::jit::backend::aarch64::inst::MInst::FMod => {
+                Some(crate::jit::ir::ops::HelperId::FMod)
+            }
+            _ => None,
+        };
+        if let Some(h) = h {
+            let a = crate::jit::helpers::address(h);
             if !trampolines.iter().any(|&(x, _)| x == a) {
                 let float = h.sig().ret == Some(crate::jit::ir::types::Rep::F64);
                 trampolines.push((a, tramp(a, float)?));

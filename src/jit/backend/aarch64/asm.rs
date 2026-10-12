@@ -932,6 +932,17 @@ impl Asm {
         self.ff(0x1E65_C000, d, n);
     }
 
+    /// `fmsub dd, dn, dm, da`: `a - n * m`, rounded once.
+    pub(crate) fn fmsub(&mut self, d: Fpr, n: Fpr, m: Fpr, a: Fpr) {
+        self.emit(0x1F40_8000 | f(m) << 16 | f(a) << 10 | f(n) << 5 | f(d));
+    }
+
+    /// `fccmp dn, dm, #nzcv, c`: the flags of `fcmp dn, dm` where `c` holds,
+    /// else `nzcv`.
+    pub(crate) fn fccmp(&mut self, n: Fpr, m: Fpr, nzcv: u8, c: Cond) {
+        self.emit(0x1E60_0400 | f(m) << 16 | (c as u32) << 12 | f(n) << 5 | nzcv as u32);
+    }
+
     pub(crate) fn fcmp(&mut self, n: Fpr, m: Fpr) {
         self.emit(0x1E60_2000 | f(m) << 16 | f(n) << 5);
     }

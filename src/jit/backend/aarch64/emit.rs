@@ -125,6 +125,8 @@ struct Em<'a> {
     sites: Vec<SiteOut>,
     sites_of: &'a [(usize, crate::jit::backend::aarch64::lower::LSite)],
     snap_ops: &'a [u32],
+    /// `FMod`'s out-of-line paths: (entry, return, d, a, b).
+    fmods: Vec<(Label, Label, Fpr, Fpr, Fpr)>,
 }
 
 /// A function region's fast entry: what `enter` would check of the callee.
@@ -255,6 +257,7 @@ pub(crate) fn emit(
         sites: Vec::new(),
         sites_of: &l.sites,
         snap_ops: &l.snap_ops,
+        fmods: Vec::new(),
     };
     // A compiled caller has written the header, set base, closure and `insn`
     // (the argument count) as `enter` would, and its `blr` left the return
@@ -307,6 +310,32 @@ pub(crate) fn emit(
         em.a.bind(em.exit_labels[k]);
         em.a.movz(Sz::W, X16, k as u16, 0);
         em.a.b(em.exit_region);
+    }
+    for (slow, back, d, x, y) in std::mem::take(&mut em.fmods) {
+        // A zero remainder is exact: fmod's zero has the dividend's sign.
+        let call = em.a.new_label();
+        em.a.bind(slow);
+        em.a.fcmp_zero(d);
+        em.a.b_cond(Cond::Ne, call);
+        em.a.fmov_to_gpr(X16, x);
+        em.a.and_imm(Sz::X, X16, X16, 1 << 63);
+        em.a.fmov_from_gpr(d, X16);
+        em.a.b(back);
+        em.a.bind(call);
+        let t = crate::jit::helpers::address(crate::jit::ir::ops::HelperId::FMod);
+        let t = em.helpers.trampolines.iter().find(|(h, _)| *h == t);
+        em.a.fmov_to_gpr(X16, x);
+        em.a.fmov_to_gpr(X17, y);
+        em.a.sub_imm(Sz::X, SP, SP, 16);
+        em.a.stp_d(Fpr(0), Fpr(1), SP, 0);
+        em.a.fmov_from_gpr(Fpr(0), X16);
+        em.a.fmov_from_gpr(Fpr(1), X17);
+        em.a.bl_far(t.expect("fmod's trampoline").1);
+        em.a.fmov_to_gpr(X16, Fpr(0));
+        em.a.ldp_d(Fpr(0), Fpr(1), SP, 0);
+        em.a.add_imm(Sz::X, SP, SP, 16);
+        em.a.fmov_from_gpr(d, X16);
+        em.a.b(back);
     }
     em.a.align(8);
     let region_word = em.region_word;
@@ -1032,6 +1061,21 @@ impl Em<'_> {
                 self.a.and_imm(Sz::X, X16, v, PTR_MASK);
                 self.a.ldr(d, X16, 0);
                 self.a.bind(done);
+            }
+            FMod => {
+                // r = a - floor(a / b) * b. A rounded quotient whose floor is
+                // off leaves r outside (0, b), as do a NaN, an infinity, a
+                // zero or negative divisor and a zero remainder.
+                let (d, q, x, y) = (self.fr(i, 0), self.fr(i, 1), self.fr(i, 2), self.fr(i, 3));
+                let (slow, back) = (self.a.new_label(), self.a.new_label());
+                self.a.fdiv(q, x, y);
+                self.a.frintm(q, q);
+                self.a.fmsub(d, q, y, x);
+                self.a.fcmp_zero(d);
+                self.a.fccmp(d, y, 0, Cond::Gt);
+                self.a.b_cond(Cond::Ge, slow);
+                self.a.bind(back);
+                self.fmods.push((slow, back, d, x, y));
             }
             FAlu(op) => {
                 let (d, n, m) = (self.fr(i, 0), self.fr(i, 1), self.fr(i, 2));
