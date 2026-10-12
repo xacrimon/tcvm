@@ -68,6 +68,10 @@ struct Lower<'a, 'gc> {
     entry_regs: Vec<u8>,
     block_of: Vec<u32>,
     pc_base: usize,
+    /// The float guards of the block being lowered, and a register holding
+    /// `BOX` they share when there are two or more (A7.4).
+    float_guards: u32,
+    box_reg: Option<VReg>,
 }
 
 fn rep_class(rep: Rep) -> RegClass {
@@ -135,6 +139,8 @@ pub(crate) fn lower<'gc>(f: &Func<'gc>, code_base: usize) -> Result<Lowered, Str
         entry_regs: Vec::new(),
         block_of,
         pc_base: code_base,
+        float_guards: 0,
+        box_reg: None,
     };
     lw.find_fusions(order);
     let mut params: Vec<VReg> = Vec::new();
@@ -153,6 +159,14 @@ pub(crate) fn lower<'gc>(f: &Func<'gc>, code_base: usize) -> Result<Lowered, Str
         succs.clear();
         args.clear();
         nargs.clear();
+        lw.box_reg = None;
+        lw.float_guards = f
+            .insts_of(b)
+            .iter()
+            .filter(|&&i| {
+                f.op(i) == Op::Guard(TypeSet::FLOAT) && f.insts[i.idx()].tag != ExitTag::Entry
+            })
+            .count() as u32;
         for &i in f.insts_of(b) {
             lw.lower_inst(i)?;
             if f.op(i).is_terminator() {
@@ -221,6 +235,9 @@ impl<'a, 'gc> Lower<'a, 'gc> {
     }
 
     fn push(&mut self, inst: MInst, ops: &[Operand], clob: PRegSet) -> usize {
+        if clob != PRegSet::empty() {
+            self.box_reg = None;
+        }
         let i = self.v.push(inst, ops, clob);
         self.snap_ops.push(ops.len() as u32);
         i.index()
@@ -436,6 +453,9 @@ impl<'a, 'gc> Lower<'a, 'gc> {
         mut ops: Vec<Operand>,
         clob: PRegSet,
     ) {
+        if clob != PRegSet::empty() {
+            self.box_reg = None;
+        }
         let (exit, sops) = self.exit_of(i);
         let base = ops.len() as u32;
         ops.extend(sops);
@@ -599,6 +619,29 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                         exit: ENTRY_FAIL,
                     },
                     &[u],
+                    none,
+                );
+            }
+            Op::Guard(TypeSet::FLOAT) if self.float_guards >= 2 => {
+                let k = match self.box_reg {
+                    Some(k) => k,
+                    None => {
+                        let k = self.v.new_vreg(RegClass::Int);
+                        let box_ = crate::jit::backend::aarch64::emit::BOX;
+                        self.push(MInst::MovImm(box_), &[Operand::reg_def(k)], none);
+                        self.box_reg = Some(k);
+                        k
+                    }
+                };
+                let ops = vec![self.use_(args[0]), Operand::reg_use(k)];
+                self.push_exit(
+                    i,
+                    |exit| MInst::Guard {
+                        test: Test::X { imm: None },
+                        cond: Cond::Lo,
+                        exit,
+                    },
+                    ops,
                     none,
                 );
             }
