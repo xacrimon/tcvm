@@ -1249,3 +1249,56 @@ fn float_modulo_edges() {
 "##,
     );
 }
+
+/// Bounds checks against a loop's range (E2): limits past the array,
+/// early breaks, negative and non-unit steps, an array grown in the loop
+/// and empty loops.
+#[test]
+fn loop_range_bounds() {
+    agrees(
+        r##"
+        local t = {}
+        for i = 1, 100 do t[i] = i end
+        local function sum(t, a, b, s)
+            local x = 0
+            for i = a, b, s do x = x + t[i] end
+            return x
+        end
+        local function find(t, n, v)
+            for i = 1, n do
+                local y = t[i]
+                if y == v or y == nil then return i end
+            end
+            return -1
+        end
+        local function grow(t, n)
+            local u = {}
+            for i = 1, n do u[i] = i; u[i] = u[i] + (t[i] or 0) end
+            return #u
+        end
+        local function store(t, a, b)
+            for i = a, b do t[i] = i * 2 end
+            return t[b]
+        end
+        local out = {}
+        for r = 1, 400 do
+            out[1] = sum(t, 1, 100, 1)
+            out[2] = sum(t, 100, 1, -1)
+            out[3] = sum(t, 2, 99, 3)
+            out[4] = sum(t, 5, 4, 1)
+            out[5] = find(t, 100, r % 120)
+            out[6] = find(t, 150, 50)
+            out[7] = grow(t, 120)
+            out[8] = store({}, 1, 10)
+            out[9] = store(t, 1, 100)
+        end
+        out[10] = pcall(sum, t, 1, 101, 1)
+        out[11] = find(t, 1000, -5)
+        out[12] = pcall(sum, t, 0, 100, 1)
+        out[13] = sum(t, 100, 1, -7)
+        out[14] = select(2, pcall(sum, {1, 2, 3}, 1, 4, 1)) ~= nil
+        return table.concat(out, " ", 1, 9) .. " " .. tostring(out[10]) .. " "
+            .. out[11] .. " " .. tostring(out[12]) .. " " .. out[13] .. " " .. tostring(out[14])
+"##,
+    );
+}

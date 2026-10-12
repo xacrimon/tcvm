@@ -157,6 +157,7 @@ pub(crate) fn optimize(f: &mut Func<'_>) {
         remove_trivial_params(f);
         changed |= opt::gvn::gvn(f);
         changed |= opt::licm::licm(f);
+        changed |= opt::range::loop_bounds(f);
         opt::dce(f);
         if !changed {
             break;
@@ -423,10 +424,11 @@ pub(crate) fn compile<'gc>(
             snap: at as u32,
             tag: e.tag,
             count: std::cell::Cell::new(0),
+            site: e.site,
             byte: closure
                 .proto
                 .feedback
-                .get(e.pc as usize)
+                .get(e.site.unwrap_or(e.pc) as usize)
                 .map_or(0, |c| c.get()),
         });
     }

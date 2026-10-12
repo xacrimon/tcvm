@@ -19,6 +19,8 @@ use crate::jit::region::SRep;
 /// with a value in a register as operands of the exiting instruction.
 pub(crate) struct LExit {
     pub(crate) pc: u32,
+    /// The pc whose feedback the exit records, when not `pc` (E2).
+    pub(crate) site: Option<u32>,
     pub(crate) kind: ExitKind,
     pub(crate) tag: ExitTag,
     /// `(register, rep, source)`.
@@ -382,6 +384,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
         let tag = d.tag;
         self.exits.push(LExit {
             pc,
+            site: self.f.exit_sites.get(&i).copied(),
             kind,
             tag,
             entries,

@@ -6,6 +6,7 @@ pub(crate) mod gvn;
 pub(crate) mod infer;
 pub(crate) mod licm;
 pub(crate) mod peel;
+pub(crate) mod range;
 pub(crate) mod simplify;
 pub(crate) mod sink;
 pub(crate) mod snaps;

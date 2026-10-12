@@ -159,6 +159,9 @@ pub(crate) struct ExitInfo {
     /// The feedback byte of the exit's site when compiled: one the exit
     /// changed means the recompile learns something.
     pub(crate) byte: u8,
+    /// The site, when not the snapshot's pc: a check hoisted out of a loop
+    /// records its access's miss (E2).
+    pub(crate) site: Option<u32>,
 }
 
 /// A region of compiled code, owned by its prototype's `JitState`.
