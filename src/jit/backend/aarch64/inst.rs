@@ -270,10 +270,10 @@ pub(crate) enum MInst {
         a: u8,
         nargs: u8,
         pc_after: usize,
-        /// A constant non-vararg Lua callee (D2): its value and prototype.
-        /// The call writes word 0 itself, the closure word on the fast path
-        /// and the value on the slow one.
-        known: Option<(u64, u64)>,
+        /// A constant non-vararg Lua callee (D2): its value, prototype and
+        /// parameter count. The call writes word 0 itself, the closure word
+        /// on the fast path and the value on the slow one.
+        known: Option<(u64, u64, u8)>,
     },
     /// `[use f, use args.., site..]`: a metamethod call from a header at
     /// slot `hdr` (the frame's register count); succ 0 is the resume block.

@@ -332,12 +332,12 @@ pub(crate) fn compile<'gc>(
     let fired_at = config.deopt_all.then(|| fired.as_ptr() as usize);
     // A function region of a prototype without varargs is what a compiled
     // caller's `blr` can enter (5.4).
-    let fast = (pc == 0 && !f.meta.loop_entry && !closure.proto.is_vararg).then_some(
-        emit::FastEntry {
+    let fast =
+        (pc == 0 && !f.meta.loop_entry && !closure.proto.is_vararg).then_some(emit::FastEntry {
             max_stack: closure.proto.max_stack_size,
             num_params: closure.proto.num_params,
-        },
-    );
+            proto: closure.proto.ptr.as_ptr() as u64,
+        });
     let mut em =
         emit::emit(&lowered, &out, helpers, fired_at, fast).map_err(CompileError::Backend)?;
     let size = em.asm.offset() + em.asm.pool_bytes() + 16;
