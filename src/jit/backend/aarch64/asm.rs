@@ -332,21 +332,35 @@ impl Asm {
         self.emit(sz.sf() | 0x7280_0000 | hw << 21 | (imm16 as u32) << 5 | r(d));
     }
 
-    /// `xd = imm` in the fewest of `movz`/`movn`/`movk` or one `orr` of a
-    /// logical immediate.
+    /// `xd = imm` in the fewest of `movz`/`movn`/`movk`, one `orr` of a
+    /// logical immediate, or one load from the pool.
     pub(crate) fn mov_imm(&mut self, d: Gpr, imm: u64) {
+        let halves = |v: u64| (0..4).filter(|&h| (v >> (h * 16)) & 0xffff != 0).count();
+        let zeros = 4 - halves(imm);
+        let ones = 4 - halves(!imm);
+        if imm != 0
+            && zeros < 3
+            && ones < 3
+            && let Some(enc) = logical_imm(imm, 64)
+        {
+            self.emit(0xB200_03E0 | enc << 10 | r(d));
+            return;
+        }
+        // Three or four halves to build: one load from the pool instead.
+        if zeros.max(ones) < 2 {
+            self.ldr_lit(d, imm);
+            return;
+        }
+        self.mov_seq(d, imm);
+    }
+
+    /// `xd = imm` built by `movz`/`movn` and `movk`.
+    pub(crate) fn mov_seq(&mut self, d: Gpr, imm: u64) {
         let halves = |v: u64| (0..4).filter(|&h| (v >> (h * 16)) & 0xffff != 0).count();
         let zeros = 4 - halves(imm);
         let ones = 4 - halves(!imm);
         if imm == 0 {
             self.movz(Sz::X, d, 0, 0);
-            return;
-        }
-        if zeros < 3
-            && ones < 3
-            && let Some(enc) = logical_imm(imm, 64)
-        {
-            self.emit(0xB200_03E0 | enc << 10 | r(d));
             return;
         }
         if ones > zeros {
@@ -1404,22 +1418,25 @@ mod tests {
             0xffff_0000_ffff_ffff,
         ] {
             let before = a.words().len();
-            a.mov_imm(x0, v);
+            a.mov_seq(x0, v);
             let n = a.words().len() - before;
             let mut b = Asm::new();
-            b.mov_imm(x0, v);
+            b.mov_seq(x0, v);
             assert_eq!(b.words().len(), n);
             // Check by emulation instead of text: the value each sequence makes.
             let mut x = 0u64;
             for &w in b.words() {
                 x = emulate_mov(x, w).unwrap_or_else(|| panic!("not a mov word {w:#x}"));
             }
-            assert_eq!(x, v, "mov_imm {v:#x}");
+            assert_eq!(x, v, "mov_seq {v:#x}");
             // Keep the system-assembler comparison aligned: assemble the same words.
             for &w in b.words() {
                 src.push_str(&format!(".inst {w:#x}\n"));
             }
         }
+        let mut c = Asm::new();
+        c.mov_imm(x0, 0x1234_5678_9abc_def0);
+        assert_eq!(c.words().len(), 1, "a four-half constant is one load");
         let words = a.finish(0).unwrap();
         let Some(sys) = system_asm(&src) else {
             eprintln!("no system assembler; skipping");
