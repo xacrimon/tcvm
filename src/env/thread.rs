@@ -192,6 +192,10 @@ pub struct ThreadState<'gc> {
 /// which the collector may also clear from `trace(&self)` (hence the cell).
 pub struct ValueStack<'gc>(UnsafeCell<StackView<'gc>>);
 
+/// The first slot's address in a `ThreadState`, for compiled code.
+pub(crate) const STACK_PTR_OFFSET: usize = std::mem::offset_of!(ThreadState<'static>, stack)
+    + std::mem::offset_of!(StackView<'static>, ptr);
+
 struct StackView<'gc> {
     ptr: NonNull<Value<'gc>>,
     len: usize,

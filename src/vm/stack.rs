@@ -186,7 +186,9 @@ pub(crate) struct EntryRecord {
     /// `ThreadState::native_deep` of the level below.
     pub(crate) deep: usize,
     _pad: usize,
-    /// x19 to x28 of the code that started the level, x22 its `BASE`.
+    /// x19 to x28 and d8 to d15 of the Rust code that started the bottom
+    /// level; a level compiled code starts keeps only x22 to x25, x22 its
+    /// `BASE` (`abi::jit_level`).
     pub(crate) x: [usize; 10],
     pub(crate) d: [u64; 8],
 }

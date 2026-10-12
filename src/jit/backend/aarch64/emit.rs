@@ -283,13 +283,16 @@ pub(crate) fn emit(
     // A compiled caller has written the header, set base, closure and `insn`
     // (the argument count) as `enter` would, and its `blr` left the return
     // address in x30; what `enter` would check of a Lua callee is checked
-    // here, and a miss goes to the caller's slow path (`fast_miss`).
+    // here, and a miss goes to the caller's slow path (`fast_miss`). Missing
+    // arguments are filled in (`arity_fixup`, I3).
     let fast_miss = em.a.new_label();
+    let (fixup, budget) = (em.a.new_label(), em.a.new_label());
     let fast_label = fast.map(|fe| {
         let l = em.a.new_label();
         em.a.bind(l);
         em.a.cmp_imm(Sz::X, INSN, fe.num_params as u64);
-        em.a.b_cond(Cond::Lo, fast_miss);
+        em.a.b_cond(Cond::Lo, fixup);
+        em.a.bind(budget);
         em.a.mov_sp(X16, SP);
         em.a.ldr(X17, THREAD, layout::NATIVE_LIMIT as i32);
         em.a.cmp(Sz::X, X16, X17);
@@ -377,6 +380,25 @@ pub(crate) fn emit(
         em.a.ldr_label(INSN, region_word);
         em.a.ldr_lit(X16, em.helpers.entry_fail as u64);
         em.tail_level();
+    }
+    if let Some(fe) = fast {
+        // The arguments short of the parameters are nil, once the window
+        // fits; then on to the checks past the arity one.
+        em.a.bind(fixup);
+        em.a.ldr(X16, THREAD, layout::THREAD_STACK_END as i32);
+        em.a.add_imm(Sz::X, X17, BASE, fe.max_stack as u64 * 8);
+        em.a.cmp(Sz::X, X17, X16);
+        em.a.b_cond(Cond::Hi, fast_miss);
+        em.a.add_shift(Sz::X, X17, BASE, INSN, Shift::Lsl, 3);
+        em.a.add_imm(Sz::X, Gpr(9), BASE, fe.num_params as u64 * 8);
+        em.a.mov_imm(X16, NIL);
+        let fill = em.a.new_label();
+        em.a.bind(fill);
+        em.a.str(X16, X17, 0);
+        em.a.add_imm(Sz::X, X17, X17, 8);
+        em.a.cmp(Sz::X, X17, Gpr(9));
+        em.a.b_cond(Cond::Lo, fill);
+        em.a.b(budget);
     }
     if fast_label.is_some() {
         // Back to the caller's slow path (`miss_path`): 4 bytes past its
@@ -540,9 +562,10 @@ impl Em<'_> {
     }
 
     /// `fast_call` for a known callee (D2): its prototype's fast entry, or
-    /// `slow`, past the arity check when `nargs` (static) covers its
-    /// parameters, and this region's own when it is the callee's; word 0
-    /// the closure word. Also returns whether it enters past the checks.
+    /// `slow`, past the arity check when `nargs` is static, the parameters it
+    /// leaves out stored nil (I3), and this region's own when it is the
+    /// callee's; word 0 the closure word. Also returns whether it enters past
+    /// the checks.
     fn known_call(
         &mut self,
         hdr: i32,
@@ -551,7 +574,15 @@ impl Em<'_> {
         (f, proto, nparams): (u64, u64, u8),
         nargs: u8,
     ) -> (Label, Label, bool) {
-        let known = nargs != u8::MAX && nargs >= nparams;
+        let known = nargs != u8::MAX;
+        if known && nargs < nparams {
+            // Inside the callee's window, which its known entry checks; the
+            // value stack's mapping runs past any window that fits.
+            self.a.mov_imm(Gpr(9), NIL);
+            for k in nargs..nparams {
+                self.a.str(Gpr(9), BASE, hdr + 32 + 8 * k as i32);
+            }
+        }
         match self.own_entry {
             Some((p, l)) if p == proto && known => self.a.adr(X17, l),
             _ => {
@@ -1759,6 +1790,41 @@ impl Em<'_> {
                 match wanted {
                     0 if c == 1 => {}
                     0 => {
+                        // The results to `R[a..]` (I5): all of them, `top`
+                        // past them, or `c - 1` filled out with nil. Up to
+                        // three here, more through the helper. They come from
+                        // at least a header above `R[a]`, so copying up is
+                        // safe, and reading past them stays in the stack.
+                        let (helper, top, done) =
+                            (self.a.new_label(), self.a.new_label(), self.a.new_label());
+                        let at = a as i32 * 8;
+                        if c == 0 {
+                            self.a.cmp_imm(Sz::X, INSN, 3);
+                            self.a.b_cond(Cond::Hi, helper);
+                            for k in 0..3 {
+                                self.a.cmp_imm(Sz::X, INSN, k);
+                                self.a.b_cond(Cond::Eq, top);
+                                self.a.ldr(X16, PC, 8 * k as i32);
+                                self.a.str(X16, BASE, at + 8 * k as i32);
+                            }
+                            self.a.bind(top);
+                            self.a.ldr(X16, THREAD, layout::THREAD_STACK as i32);
+                            self.a.add_imm(Sz::X, X17, BASE, at as u64);
+                            self.a.sub(Sz::X, X17, X17, X16);
+                            self.a.add_shift(Sz::X, X17, INSN, X17, Shift::Lsr, 3);
+                            self.a.str(X17, THREAD, layout::THREAD_TOP as i32);
+                            self.a.b(done);
+                        } else if c <= 4 {
+                            self.a.mov_imm(X17, NIL);
+                            for k in 0..(c - 1) as u64 {
+                                self.a.ldr(X16, PC, 8 * k as i32);
+                                self.a.cmp_imm(Sz::X, INSN, k);
+                                self.a.csel(Sz::X, X16, X16, X17, Cond::Hi);
+                                self.a.str(X16, BASE, at + 8 * k as i32);
+                            }
+                            self.a.b(done);
+                        }
+                        self.a.bind(helper);
                         // Land through the helper: (rt, thread, base, a, values, nret, c).
                         self.a.mov(Gpr(0), RT);
                         self.a.mov(Gpr(1), THREAD);
@@ -1768,6 +1834,7 @@ impl Em<'_> {
                         self.a.movz(Sz::X, Gpr(3), a as u16, 0);
                         self.a.movz(Sz::X, Gpr(6), c as u16, 0);
                         self.a.bl_far(self.helpers.land);
+                        self.a.bind(done);
                     }
                     // The first result is in x0 (D3).
                     1 => {}
