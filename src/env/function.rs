@@ -209,8 +209,7 @@ unsafe impl<'gc> Collect<'gc> for IcTable<'gc> {
 }
 
 /// A captured local: open while its frame lives, `v` pointing at its slot in
-/// `thread`'s stack (rebased when the stack moves), then closed, `v` pointing
-/// at `closed`. Reads are one load through `v`, whichever state.
+/// `thread`'s stack, then closed, `v` pointing at `closed`. Reads are one load through `v`, whichever state.
 pub struct UpvalueCell<'gc> {
     v: Cell<*mut Value<'gc>>,
     closed: Cell<Value<'gc>>,
@@ -275,7 +274,7 @@ impl<'gc> UpvalueCell<'gc> {
     #[inline(always)]
     pub(crate) fn get(&self) -> Value<'gc> {
         // SAFETY: `v` is a live slot of `thread`'s stack while open (closed
-        // before the frame goes, rebased when the stack moves), else `closed`.
+        // before the frame goes), else `closed`.
         unsafe { *self.v.get() }
     }
 
@@ -306,15 +305,6 @@ impl<'gc> UpvalueCell<'gc> {
     pub(crate) fn slot(&self) -> *mut Value<'gc> {
         debug_assert!(self.thread.get().is_some());
         self.v.get()
-    }
-
-    /// Point an open upvalue into its stack's new buffer, which moved from
-    /// address `old`.
-    #[inline]
-    pub(crate) fn rebase(&self, old: usize, new: *mut Value<'gc>) {
-        let index = (self.v.get().addr() - old) / size_of::<Value>();
-        // SAFETY: the slot moved with the rest of the stack.
-        self.v.set(unsafe { new.add(index) });
     }
 
     #[inline]
@@ -513,6 +503,11 @@ impl<'gc, 'a> Stack<'gc, 'a> {
     #[inline]
     pub fn push(&mut self, v: Value<'gc>) {
         let top = self.thread.top;
+        // Past the stack's end a push is dropped: the native has overflowed,
+        // which `invoke` reports once it returns.
+        if top >= crate::vm::stack::VALUE_SLOTS {
+            return;
+        }
         self.thread.ensure_slots(top + 1);
         self.thread.stack[top] = v;
         self.thread.top = top + 1;
@@ -542,6 +537,8 @@ impl<'gc, 'a> Stack<'gc, 'a> {
     #[inline]
     pub fn extend_from_slice(&mut self, values: &[Value<'gc>]) {
         let top = self.thread.top;
+        let room = crate::vm::stack::VALUE_SLOTS.saturating_sub(top);
+        let values = &values[..values.len().min(room)];
         let end = top + values.len();
         self.thread.ensure_slots(end);
         for (i, v) in values.iter().enumerate() {

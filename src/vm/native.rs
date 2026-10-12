@@ -9,9 +9,10 @@ use crate::env::thread::ThreadState;
 use crate::env::value::Value;
 use crate::instruction::{Instruction, Op};
 use crate::lua::Context;
-use crate::vm::abi::{Exit, Jump, Slot, handler, handler_bits};
+use crate::vm::abi::{Jump, Slot, handler, handler_bits};
 use crate::vm::frame::{self, HDR, NativeHdr, copy_values, fill_nil, flag};
 use crate::vm::ops::control::close_upvalues;
+use crate::vm::stack::{Park, park};
 
 /// Whether a continuation receives the errors its call raises, instead of
 /// them unwinding past it.
@@ -388,26 +389,6 @@ fn call_nargs(ts: &ThreadState<'_>, b: u8, win: usize) -> usize {
     if b == 0 { ts.top - win } else { b as usize - 1 }
 }
 
-/// Leave for the collector with the native frame at window `win` holding
-/// its results; `ok = RETURN` tells the trampoline to land them.
-#[cold]
-#[inline(never)]
-fn gc_exit<'gc>(ts: &mut ThreadState<'gc>, win: *mut Value<'gc>, nc: &NativeClosure<'gc>) -> Exit {
-    let nh = NativeHdr::unpack(unsafe { frame::func_word(win) });
-    unsafe {
-        frame::set_func_word(
-            win,
-            NativeHdr {
-                ok: ok::RETURN,
-                ..nh
-            }
-            .pack(nc),
-        )
-    };
-    ts.top_base = win;
-    Exit::Gc
-}
-
 /// Return the native frame at window `win`'s results, `win .. top`, through
 /// its continuation.
 pub(crate) fn land_pending<'gc>(ts: &mut ThreadState<'gc>, win: usize) -> Jump<'gc> {
@@ -448,20 +429,18 @@ handler! {
                 pc,
             );
         }
-        ts.top_base = ts.slot_ptr(win);
+        let w = unsafe { base.add(a as usize + HDR) };
+        ts.top_base = w;
         ts.top = win + nargs;
         let out = invoke(rt, ts, nc, win);
-        // The native may have grown the stack.
-        let sp = ts.stack.as_mut_ptr();
         if std::hint::likely(out.is_return()) {
-            let nret = ts.top - win;
-            let w = unsafe { sp.add(win) };
             if std::hint::unlikely(rt.gc_due()) {
-                return gc_exit(ts, w, nc);
+                park(rt, Park::Gc);
             }
+            let nret = thread!().top - win;
             tail!(ret, pc = w as *const Instruction, insn = Slot::nret(nret), base = w)
         }
-        tail!(native_act, pc = unsafe { sp.add(hdr) } as *const Instruction, insn = Slot::from_raw(out.raw()), base = unsafe { sp.add(bi) })
+        tail!(native_act, pc = unsafe { base.add(a as usize) } as *const Instruction, insn = Slot::from_raw(out.raw()))
     }
 
     /// `enter` of a native: the header is written (word 0 as a raw value),
@@ -477,22 +456,21 @@ handler! {
             h.write(NativeHdr { at: 0, cont: 0, ok: ok::CONT }.pack(nc));
             h.add(1).write(h.add(1).read() | flag::NATIVE);
         }
-        ts.top_base = ts.slot_ptr(win);
+        let w = unsafe { (pc as *mut Value<'gc>).add(HDR) };
+        ts.top_base = w;
         ts.top = win + nargs;
         let out = invoke(rt, ts, nc, win);
-        let sp = ts.stack.as_mut_ptr();
-        let w = unsafe { sp.add(win) };
         if std::hint::likely(out.is_return()) {
-            let nret = ts.top - win;
             if std::hint::unlikely(rt.gc_due()) {
-                return gc_exit(ts, w, nc);
+                park(rt, Park::Gc);
             }
+            let nret = thread!().top - win;
             let ret = unsafe { frame::ret(w) };
             tail!(ret, pc = w as *const Instruction, insn = Slot::nret(nret), base = w)
         }
-        // `base` is passed on as it came: null or stale for a native caller,
-        // which `native_act` never reads.
-        tail!(native_act, pc = unsafe { sp.add(hdr) } as *const Instruction, insn = Slot::from_raw(out.raw()))
+        // `base` is passed on as it came: null for a native caller, which
+        // `native_act` never reads.
+        tail!(native_act, insn = Slot::from_raw(out.raw()))
     }
 
     /// TAILCALL of a native: run it on the window `R[a+4] ..` and
@@ -513,13 +491,14 @@ handler! {
         ts.top_pc = pc;
         ts.top = win + nargs;
         let out = invoke(rt, ts, nc, win);
-        let sp = ts.stack.as_mut_ptr();
-        base = unsafe { sp.add(bi) };
-        let returned = out.is_return();
-        if std::hint::likely(returned) && std::hint::likely(!rt.gc_due()) {
+        if std::hint::likely(out.is_return()) {
+            if std::hint::unlikely(rt.gc_due()) {
+                park(rt, Park::Gc);
+            }
+            let ts = thread!();
             let nret = ts.top - win;
             let ret = unsafe { frame::ret(base) };
-            tail!(ret, pc = unsafe { sp.add(win) } as *const Instruction, insn = Slot::nret(nret))
+            tail!(ret, pc = ts.slot_ptr(win) as *const Instruction, insn = Slot::nret(nret))
         }
         if out.tag() == tag::ERROR {
             // The native has no frame here, so its level 1 is this frame.
@@ -538,9 +517,6 @@ handler! {
             let rw = h.add(1).read() & !(flag::HAS_OPEN | flag::HAS_TBC);
             h.add(1).write_volatile(rw | flag::NATIVE);
         }
-        if returned {
-            return gc_exit(ts, base, nc);
-        }
         tail!(native_act, pc = unsafe { base.sub(HDR) } as *const Instruction, insn = Slot::from_raw(out.raw()))
     }
 
@@ -549,7 +525,7 @@ handler! {
     /// entered directly; the other requests go to `drive`.
     slow fn native_act {
         let out = NativeOut::from_raw(insn.raw());
-        let mut ts: &mut ThreadState<'gc> = thread!();
+        let ts = thread!();
         let hdr = ts.slot_index(pc as *const Value<'gc>);
         if std::hint::likely(out.tag() == tag::CALL_THEN) {
             let nc = unsafe { frame::native_closure(ts.slot_ptr(hdr + HDR)) };
@@ -561,7 +537,7 @@ handler! {
                 base = std::ptr::null_mut()
             )
         }
-        let j = drive(rt, &mut ts, hdr, out);
+        let j = drive(rt, thread_ptr!(), hdr, out);
         jump!(j)
     }
 
@@ -572,7 +548,7 @@ handler! {
     /// modes are `native_continue`'s.
     cont fn ret_native {
         let win = unsafe { frame::caller_base(base) };
-        let mut ts: &mut ThreadState<'gc> = thread!();
+        let ts = thread!();
         let wi = ts.slot_index(win);
         let w0 = unsafe { frame::func_word(win) };
         let nh = NativeHdr::unpack(w0);
@@ -582,7 +558,7 @@ handler! {
         unsafe { std::ptr::write_volatile(&mut ts.top, wi + nh.at + nret) };
         ts.top_base = win;
         if std::hint::unlikely(nh.ok != ok::CONT) {
-            let j = native_continue(rt, &mut ts, wi);
+            let j = native_continue(rt, thread_ptr!(), wi);
             jump!(j)
         }
         let nc = unsafe { frame::native_closure_of(w0) };
@@ -592,13 +568,11 @@ handler! {
         if out.tag() != tag::ERROR && ts.native_overflowed() {
             out = NativeOut::error(native_overflow(rt));
         }
-        // The continuation may have grown the stack.
-        let win = ts.slot_ptr(wi);
         if std::hint::likely(out.is_return()) {
             if std::hint::unlikely(rt.gc_due()) {
-                return gc_exit(ts, win, nc);
+                park(rt, Park::Gc);
             }
-            let nret = ts.top - wi;
+            let nret = thread!().top - wi;
             let ret = unsafe { frame::ret(win) };
             tail!(ret, pc = win as *const Instruction, insn = Slot::nret(nret), base = win)
         }
@@ -611,7 +585,7 @@ handler! {
                 base = std::ptr::null_mut()
             )
         }
-        let j = drive(rt, &mut ts, wi - HDR, out);
+        let j = drive(rt, thread_ptr!(), wi - HDR, out);
         jump!(j)
     }
 
@@ -759,7 +733,7 @@ fn stage_call<'gc>(
         c.add(2).write_volatile(win_ptr as usize as u64);
         c.add(3).write_volatile(0);
     }
-    // Every path here has published the native frame (growth rebases it).
+    // Every path here has published the native frame.
     debug_assert!(std::ptr::eq(ts.top_base, win_ptr));
     (unsafe { sp.add(callee) }, nargs)
 }
@@ -768,21 +742,22 @@ fn stage_call<'gc>(
 #[inline(never)]
 pub(crate) fn drive<'gc>(
     ctx: Context<'gc>,
-    ts: &mut &mut ThreadState<'gc>,
+    ts: *mut ThreadState<'gc>,
     hdr: usize,
     mut out: NativeOut,
 ) -> Jump<'gc> {
     loop {
-        let t = &mut **ts;
+        let t = unsafe { &mut *ts };
         let win = hdr + HDR;
         let win_ptr = t.slot_ptr(win);
         let nc = unsafe { frame::native_closure(win_ptr) };
         match out.tag() {
             tag::RETURN => {
                 if std::hint::unlikely(ctx.gc_due()) {
-                    return Jump::Exit(gc_exit(t, win_ptr, nc));
+                    t.top_base = win_ptr;
+                    park(ctx, Park::Gc);
                 }
-                return land_pending(t, win);
+                return land_pending(unsafe { &mut *ts }, win);
             }
             tag::ERROR => {
                 // Raised with the native's frame on top (its level 0); the
@@ -815,19 +790,7 @@ pub(crate) fn drive<'gc>(
             }
             tag::RESUME => {
                 let at = out.at();
-                unsafe {
-                    let h = t.slot_ptr(hdr).cast::<u64>();
-                    h.write(
-                        NativeHdr {
-                            at,
-                            cont: out.cont(),
-                            ok: out.ok(),
-                        }
-                        .pack(nc),
-                    );
-                    let rw = h.add(1).read() & !(flag::PROTECTED | flag::HANDLER);
-                    h.add(1).write(rw | flag::NATIVE | flag::PROTECTED);
-                }
+                set_wait(t, hdr, nc, at, out.cont(), out.ok(), flag::PROTECTED);
                 t.top_base = win_ptr;
                 let co = t.stack[win + at]
                     .get_thread()
@@ -839,61 +802,31 @@ pub(crate) fn drive<'gc>(
                     let err = Error::new(ctx, Value::string(msg));
                     return crate::vm::unwind::unwind(ctx, ts, err);
                 }
-                return crate::vm::coro::resume_into(ctx, ts, co, win + at + 1);
+                let (args, n) = (win + at + 1, t.top - (win + at + 1));
+                return match unsafe { crate::vm::coro::resume(ctx, ts, co, args, n, win + at) } {
+                    crate::vm::coro::Back::Values => native_continue(ctx, ts, win),
+                    crate::vm::coro::Back::Died(err) => native_catch(ctx, ts, win, err),
+                };
             }
-            tag::YIELD => {
-                // The values it resumes with are the native's results.
-                unsafe {
-                    let h = t.slot_ptr(hdr).cast::<u64>();
-                    h.write(
-                        NativeHdr {
-                            at: 0,
-                            cont: 0,
-                            ok: ok::RETURN,
-                        }
-                        .pack(nc),
-                    );
-                    h.add(1).write(
-                        (h.add(1).read() & !(flag::PROTECTED | flag::HANDLER)) | flag::NATIVE,
-                    );
-                }
+            tag::YIELD | tag::YIELD_THEN => {
+                // After a plain yield the values it resumes with are the
+                // native's results.
+                let (at, contx, okk) = if out.tag() == tag::YIELD {
+                    (0, 0, ok::RETURN)
+                } else {
+                    (out.at(), out.cont(), ok::CONT)
+                };
+                set_wait(t, hdr, nc, at, contx, okk, 0);
                 t.top_base = win_ptr;
-                return crate::vm::coro::yield_from(ctx, ts, win);
-            }
-            tag::YIELD_THEN => {
-                let at = out.at();
-                unsafe {
-                    let h = t.slot_ptr(hdr).cast::<u64>();
-                    h.write(
-                        NativeHdr {
-                            at,
-                            cont: out.cont(),
-                            ok: ok::CONT,
-                        }
-                        .pack(nc),
-                    );
-                    h.add(1).write(
-                        (h.add(1).read() & !(flag::PROTECTED | flag::HANDLER)) | flag::NATIVE,
-                    );
+                if t.no_yield {
+                    let err = crate::vm::coro::yield_across_close(ctx);
+                    return crate::vm::unwind::unwind(ctx, ts, err);
                 }
-                t.top_base = win_ptr;
-                return crate::vm::coro::yield_from(ctx, ts, win + at);
+                unsafe { crate::vm::coro::yield_to(ctx, ts, win + at) };
+                return native_continue(ctx, ts, win);
             }
             tag::ASYNC => {
-                unsafe {
-                    let h = t.slot_ptr(hdr).cast::<u64>();
-                    h.write(
-                        NativeHdr {
-                            at: 0,
-                            cont: cont::ASYNC.0,
-                            ok: ok::CONT,
-                        }
-                        .pack(nc),
-                    );
-                    h.add(1).write(
-                        (h.add(1).read() & !(flag::PROTECTED | flag::HANDLER)) | flag::NATIVE,
-                    );
-                }
+                set_wait(t, hdr, nc, 0, cont::ASYNC.0, ok::CONT, 0);
                 t.top_base = win_ptr;
                 out = crate::vm::async_native::async_cont(ctx, nc, Stack::new(t, win), Ok(()));
                 if out.tag() != tag::ERROR && t.native_overflowed() {
@@ -903,9 +836,33 @@ pub(crate) fn drive<'gc>(
             _ => {
                 debug_assert_eq!(out.tag(), tag::PENDING);
                 t.top_base = win_ptr;
-                return Jump::Exit(Exit::Pending);
+                park(ctx, Park::Pending);
+                let t = unsafe { &mut *ts };
+                out = crate::vm::async_native::async_cont(ctx, nc, Stack::new(t, win), Ok(()));
+                if out.tag() != tag::ERROR && t.native_overflowed() {
+                    out = NativeOut::error(native_overflow(ctx));
+                }
             }
         }
+    }
+}
+
+/// Make the native frame at header `hdr` wait at window slot `at`, with
+/// `cont` and `ok` for what comes back and `protect` its frame flag.
+fn set_wait<'gc>(
+    t: &mut ThreadState<'gc>,
+    hdr: usize,
+    nc: &NativeClosure<'gc>,
+    at: usize,
+    cont: u8,
+    okk: u8,
+    protect: u64,
+) {
+    unsafe {
+        let h = t.slot_ptr(hdr).cast::<u64>();
+        h.write(NativeHdr { at, cont, ok: okk }.pack(nc));
+        let rw = h.add(1).read() & !(flag::PROTECTED | flag::HANDLER);
+        h.add(1).write(rw | flag::NATIVE | protect);
     }
 }
 
@@ -915,10 +872,10 @@ pub(crate) fn drive<'gc>(
 #[inline(never)]
 pub(crate) fn native_continue<'gc>(
     ctx: Context<'gc>,
-    ts: &mut &mut ThreadState<'gc>,
+    ts: *mut ThreadState<'gc>,
     win: usize,
 ) -> Jump<'gc> {
-    let t = &mut **ts;
+    let t = unsafe { &mut *ts };
     let win_ptr = t.slot_ptr(win);
     let nh = NativeHdr::unpack(unsafe { frame::func_word(win_ptr) });
     let ret = unsafe { frame::ret(win_ptr) };
@@ -963,11 +920,11 @@ pub(crate) fn native_continue<'gc>(
 #[inline(never)]
 pub(crate) fn native_catch<'gc>(
     ctx: Context<'gc>,
-    ts: &mut &mut ThreadState<'gc>,
+    ts: *mut ThreadState<'gc>,
     win: usize,
     err: Error<'gc>,
 ) -> Jump<'gc> {
-    let t = &mut **ts;
+    let t = unsafe { &mut *ts };
     let win_ptr = t.slot_ptr(win);
     let nh = NativeHdr::unpack(unsafe { frame::func_word(win_ptr) });
     t.set_top_unchecked(win + nh.at);
@@ -975,22 +932,6 @@ pub(crate) fn native_catch<'gc>(
     unsafe { frame::clear_flags(win_ptr, flag::PROTECTED | flag::HANDLER) };
     let nc = unsafe { frame::native_closure(win_ptr) };
     let mut out = cont_fn(nh.cont)(ctx, nc, Stack::new(t, win), Err(err));
-    if out.tag() != tag::ERROR && t.native_overflowed() {
-        out = NativeOut::error(native_overflow(ctx));
-    }
-    drive(ctx, ts, win - HDR, out)
-}
-
-/// Poll the async native frame at window `win` again, after the host ran.
-pub(crate) fn repoll<'gc>(
-    ctx: Context<'gc>,
-    ts: &mut &mut ThreadState<'gc>,
-    win: usize,
-) -> Jump<'gc> {
-    let t = &mut **ts;
-    let win_ptr = t.slot_ptr(win);
-    let nc = unsafe { frame::native_closure(win_ptr) };
-    let mut out = crate::vm::async_native::async_cont(ctx, nc, Stack::new(t, win), Ok(()));
     if out.tag() != tag::ERROR && t.native_overflowed() {
         out = NativeOut::error(native_overflow(ctx));
     }

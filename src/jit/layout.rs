@@ -15,10 +15,10 @@ use crate::vm::dispatch::Runtime;
 const JIT: usize = offset_of!(State<'static>, jit);
 /// The pointer to the exit register image.
 pub(crate) const EXIT_REGS: usize = JIT + offset_of!(JitRuntime, exit_regs);
-/// `JitRuntime::native`: the dispatch entry's stack pointer, frame pointer
-/// and return address, the fast entries' stack limit and the entry shim's
-/// target. Too far from `rt` for `ldp`; single loads reach them.
-const NATIVE: usize = JIT + offset_of!(JitRuntime, native);
+/// `ThreadState::native`, from the `thread` register: the dispatch entry's
+/// stack pointer, frame pointer and return address, the fast entries' stack
+/// limit and the entry shim's target.
+const NATIVE: usize = offset_of!(crate::env::thread::ThreadState<'static>, native);
 pub(crate) const NATIVE_SP: usize = NATIVE + offset_of!(crate::jit::state::NativeBase, sp);
 pub(crate) const NATIVE_FP: usize = NATIVE + offset_of!(crate::jit::state::NativeBase, fp);
 pub(crate) const NATIVE_LR: usize = NATIVE + offset_of!(crate::jit::state::NativeBase, lr);
@@ -28,6 +28,10 @@ pub(crate) const NATIVE_TARGET: usize = NATIVE + offset_of!(crate::jit::state::N
 /// The pointer to the arena's `Metrics`.
 pub(crate) const METRICS: usize =
     offset_of!(State<'static>, rt) + offset_of!(Runtime<'static>, metrics);
+/// The running thread's state, from `rt`.
+#[cfg(target_arch = "x86_64")]
+pub(crate) const RT_THREAD: usize =
+    offset_of!(State<'static>, rt) + offset_of!(Runtime<'static>, thread);
 /// The allocation counter and threshold pair inside `Metrics`.
 pub(crate) const GC_CHECK: usize = crate::dmm::metrics::Metrics::GC_CHECK_OFFSET;
 

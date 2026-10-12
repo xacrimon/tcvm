@@ -5,6 +5,7 @@ use regalloc2::{MachineEnv, PReg, PRegSet, RegClass};
 
 use crate::jit::backend::aarch64::asm::{Fpr, Gpr};
 use crate::jit::state::EXIT_REGS;
+pub(crate) use crate::jit::state::IMAGE_SPILLS;
 
 /// Pinned for a region's whole body.
 pub(crate) const BASE: Gpr = Gpr(22);
@@ -104,8 +105,6 @@ pub(crate) fn image_index(p: PReg) -> u8 {
     }
 }
 
-/// Image word of the first spill slot.
-pub(crate) const IMAGE_SPILLS: usize = 64;
 /// The spill slots a region may have, all copied to the image.
 pub(crate) const MAX_SPILLS: usize = 256;
 const _: () = assert!(IMAGE_SPILLS + MAX_SPILLS <= EXIT_REGS);
@@ -168,10 +167,10 @@ pub(crate) unsafe extern "C" fn exit_common() {
         "bl {jit_leave}",
         // Back to dispatch's entry state, dropping this frame and any fast
         // callers' under it.
-        "ldr x11, [x23, #{nsp}]",
+        "ldr x11, [x25, #{nsp}]",
         "mov sp, x11",
-        "ldr x29, [x23, #{nfp}]",
-        "ldr x30, [x23, #{nlr}]",
+        "ldr x29, [x25, #{nfp}]",
+        "ldr x30, [x25, #{nlr}]",
         "b {jit_exit}",
         regs = const crate::jit::layout::EXIT_REGS,
         num_spills = const crate::jit::region::layout::NUM_SPILLS,
@@ -194,9 +193,9 @@ pub(crate) const FAST_STACK: usize = 256 * 1024;
 /// mispredicts while the indirect predictor keeps up (5.4).
 pub(crate) const RAS_STACK: usize = 512;
 
-/// Dispatch's entry from the executor, in place of the first handler:
-/// records the stack pointer, frame pointer and return address every
-/// handler runs with and the fast entries' limit (`NativeBase`), then
+/// Dispatch's entry on a thread's stack, in place of the first handler:
+/// records in the thread the stack pointer, frame pointer and return address
+/// every handler runs with and the fast entries' limit (`NativeBase`), then
 /// branches to the handler in `NativeBase::target` with the arguments as
 /// they came.
 #[unsafe(naked)]
@@ -210,14 +209,14 @@ pub(crate) unsafe extern "rust-preserve-none" fn dispatch_entry<'gc>(
 ) -> crate::vm::abi::Exit {
     core::arch::naked_asm!(
         "mov x16, sp",
-        "str x16, [x23, #{sp}]",
-        "str x29, [x23, #{fp}]",
-        "str x30, [x23, #{lr}]",
+        "str x16, [x25, #{sp}]",
+        "str x29, [x25, #{fp}]",
+        "str x30, [x25, #{lr}]",
         "sub x17, x16, #{ras}",
-        "str x17, [x23, #{deep}]",
+        "str x17, [x25, #{deep}]",
         "sub x16, x16, #{budget}",
-        "str x16, [x23, #{limit}]",
-        "ldr x16, [x23, #{target}]",
+        "str x16, [x25, #{limit}]",
+        "ldr x16, [x25, #{target}]",
         "br x16",
         sp = const crate::jit::layout::NATIVE_SP,
         fp = const crate::jit::layout::NATIVE_FP,

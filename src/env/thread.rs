@@ -1,7 +1,7 @@
 use std::cell::UnsafeCell;
 use std::ops::{Deref, DerefMut};
+use std::ptr::NonNull;
 
-use crate::dmm::allocator_api::MetricsAlloc;
 use crate::dmm::{Collect, Gc, Mutation, Ref, RefLock, RefMut, Trace};
 use crate::env::error::Error;
 use crate::env::function::Upvalue;
@@ -75,29 +75,41 @@ pub(crate) const NATIVE_SLACK: usize = 20;
 ///
 /// # The stack invariant
 ///
-/// `stack` is *physical storage*; `top` is the *logical* stack top. Three
-/// rules, enforced by the `stack_*` accessors below:
+/// `stack` is the value region of the thread's mapping (`vm::stack`), which
+/// never moves; `stack.len()` is how far it is committed (nil-filled) and
+/// `top` is the *logical* stack top. Three rules, enforced by the `stack_*`
+/// accessors below:
 ///
 ///  1. `top <= stack.len()` at all times.
-///  2. The vec is **grown, never shrunk**, while any frame is live. A native
-///     runs on the same vec as its caller, so a shrink would pull the storage
-///     out from under an outer frame's register window. The only sanctioned
-///     shrink is [`ThreadState::discard_above`], for a thread with no frames.
+///  2. The committed length only grows while any frame is live. The only
+///     sanctioned shrink is [`ThreadState::discard_above`], for a thread
+///     with no frames.
 ///  3. Removing values means **lowering `top`**. The vacated slots keep stale
 ///     contents until the collector traces the thread, which nil-fills
 ///     everything above the live region; the mutator never reads a slot above
 ///     `top` or outside a live frame's window.
 ///
-/// Frames are headers inside `stack` (`vm::frame`), chained from `top_base`
-/// through their caller words; `top_base` and `top_pc` are published by
-/// dispatch at every exit, so outside dispatch they are current.
+/// A thread gets its mapping when it first runs: a coroutine at its first
+/// resume, a main thread at `Executor::start`. Frames are headers inside
+/// `stack` (`vm::frame`), chained from `top_base` through their caller
+/// words; `top_base` and `top_pc` are published by dispatch at every exit,
+/// so outside dispatch they are current.
 pub struct ThreadState<'gc> {
-    /// Backing store. May hold dead slots above the live region; the
+    /// The value stack. May hold dead slots above the live region; the
     /// collector clears them when it traces the thread.
     pub(crate) stack: ValueStack<'gc>,
-    /// One past `stack`'s last slot: what CALL compares a window against.
-    /// Kept current by every path that resizes the vec.
+    /// One past `stack`'s last committed slot: what CALL compares a window
+    /// against. Kept current by every path that commits or discards slots.
     pub(crate) stack_end: *const Value<'gc>,
+    /// The mapping `stack` lies in, none before the thread first runs.
+    pub(crate) mem: Option<crate::vm::stack::ThreadStack>,
+    /// Where this thread continues when switched to (`vm::stack`); `cont`
+    /// is 0 before it first runs.
+    pub(crate) sw: crate::vm::stack::SwitchPoint,
+    /// Where dispatch entered on this thread's stack, for compiled code.
+    pub(crate) native: crate::jit::state::NativeBase,
+    /// The function a seeded thread calls, until it gets its stack.
+    pub(crate) entry: Option<Value<'gc>>,
     /// Logical stack top: the end of the value-passing window. Multires
     /// producers publish through it; their consumers read it back.
     pub(crate) top: usize,
@@ -117,7 +129,7 @@ pub struct ThreadState<'gc> {
     /// An error nothing on the thread caught; the executor reports it.
     pub(crate) uncaught: Option<Error<'gc>>,
     /// Upvalues still pointing into `stack`, sorted by slot, so a `CLOSE` or
-    /// return closes a tail of the list. `grow_slots` rebases them.
+    /// return closes a tail of the list.
     pub(crate) open_upvalues: Vec<Upvalue<'gc>>,
     /// Open to-be-closed variables by stack position, innermost last
     /// (`L->tbclist`). Each leaves the list just before its `__close` runs.
@@ -141,6 +153,12 @@ pub struct ThreadState<'gc> {
     pub(crate) stack_limit: usize,
     /// The thread that resumed this one, while it runs (status `Normal`).
     pub(crate) resumer: Option<Thread<'gc>>,
+    /// While this thread waits on a coroutine it resumed: where the values
+    /// that coroutine yields or returns land.
+    pub(crate) resume_wait: usize,
+    /// The error that killed a coroutine this thread resumed, handed over
+    /// with the switch back.
+    pub(crate) transfer: Option<Error<'gc>>,
     /// Threads below this one in the resume chain.
     pub(crate) resume_depth: u16,
     /// The futures of the async natives with a frame here, innermost last.
@@ -158,42 +176,55 @@ pub struct ThreadState<'gc> {
     pub(crate) async_env: Option<std::rc::Rc<crate::vm::async_native::EnvCell>>,
 }
 
-/// The value stack's storage: a `Vec` the mutator uses as such, that the
-/// collector may also clear from `trace(&self)` (hence the cell).
-pub struct ValueStack<'gc>(UnsafeCell<Vec<Value<'gc>, MetricsAlloc<'gc>>>);
+/// The value stack: the committed part of the mapping's value region,
+/// which the collector may also clear from `trace(&self)` (hence the cell).
+pub struct ValueStack<'gc>(UnsafeCell<StackView<'gc>>);
+
+struct StackView<'gc> {
+    ptr: NonNull<Value<'gc>>,
+    len: usize,
+}
 
 impl<'gc> ValueStack<'gc> {
-    pub fn new(mc: &Mutation<'gc>) -> Self {
-        ValueStack(UnsafeCell::new(Vec::new_in(MetricsAlloc::new(mc))))
+    fn empty() -> Self {
+        ValueStack(UnsafeCell::new(StackView {
+            ptr: NonNull::dangling(),
+            len: 0,
+        }))
     }
 }
 
 impl<'gc> Deref for ValueStack<'gc> {
-    type Target = Vec<Value<'gc>, MetricsAlloc<'gc>>;
+    type Target = [Value<'gc>];
     #[inline(always)]
     fn deref(&self) -> &Self::Target {
-        unsafe { &*self.0.get() }
+        let v = unsafe { &*self.0.get() };
+        unsafe { std::slice::from_raw_parts(v.ptr.as_ptr(), v.len) }
     }
 }
 
 impl<'gc> DerefMut for ValueStack<'gc> {
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0.get_mut()
+        let v = self.0.get_mut();
+        unsafe { std::slice::from_raw_parts_mut(v.ptr.as_ptr(), v.len) }
     }
 }
 
-// SAFETY: traces every field that can own a `Gc` pointer. `stack` is
-// grown-not-shrunk, so slots above the live region are dead scratch and must
-// NOT be traced; they are nil-filled here instead, as in LuaJIT and PUC, so
-// every slot below the live region holds a marked object or a primitive and
-// every slot above holds nil. Header words are skipped except word 0, traced
-// as the frame's function. Writing through `&self` is sound because collection
-// runs outside `mutate`, with no borrow of the thread outstanding.
+// SAFETY: traces every field that can own a `Gc` pointer. Slots above the
+// live region are dead scratch and must NOT be traced; they are nil-filled
+// here instead, as in LuaJIT and PUC, so every slot below the live region
+// holds a marked object or a primitive and every slot above holds nil. Header
+// words are skipped except word 0, traced as the frame's function. Writing
+// through `&self` is sound because collection runs outside `mutate`, with no
+// borrow of the thread outstanding.
 unsafe impl<'gc> Collect<'gc> for ThreadState<'gc> {
     fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
         let live = self.live_top().min(self.stack.len());
-        let stack = unsafe { &mut *self.stack.0.get() };
+        let stack = unsafe {
+            let v = &*self.stack.0.get();
+            std::slice::from_raw_parts_mut(v.ptr.as_ptr(), v.len)
+        };
         stack[live..].fill(Value::nil());
         let sp = stack.as_ptr();
         let mut upper = live;
@@ -213,6 +244,8 @@ unsafe impl<'gc> Collect<'gc> for ThreadState<'gc> {
         cc.trace(&self.tbc_list);
         cc.trace(&self.uncaught);
         cc.trace(&self.death_error);
+        cc.trace(&self.entry);
+        cc.trace(&self.transfer);
         for (v, _) in &self.locals {
             cc.trace(v);
         }
@@ -228,13 +261,53 @@ impl<'gc> ThreadState<'gc> {
         unsafe { self.thread_handle.unwrap_unchecked() }
     }
 
-    /// Seed a thread with the call of `f`, its arguments to follow at slot 4:
-    /// `[f, _, _, _]`, entered on its first resume.
+    /// Seed a thread with the call of `f`, entered on its first resume.
     pub(crate) fn seed(&mut self, f: Value<'gc>) {
         debug_assert!(self.top_base.is_null());
-        self.set_window(0, [f, Value::nil(), Value::nil(), Value::nil()]);
+        self.entry = Some(f);
         self.started = false;
         self.status = ThreadStatus::Suspended;
+    }
+
+    /// Give the thread its mapping if it has none, and lay out the seeded
+    /// call `[f, _, _, _]` at slot 0, its arguments to follow at slot 4.
+    pub(crate) fn ensure_stack(&mut self, pool: &std::rc::Rc<crate::vm::stack::StackPool>) {
+        if self.mem.is_none() {
+            let mem = pool.acquire();
+            let v = self.stack.0.get_mut();
+            v.ptr = unsafe { NonNull::new_unchecked(mem.values()) };
+            v.len = 0;
+            self.mem = Some(mem);
+            self.top = 0;
+            self.update_stack_end();
+        }
+        if let Some(f) = self.entry.take() {
+            self.set_window(0, [f, Value::nil(), Value::nil(), Value::nil()]);
+        }
+    }
+
+    /// Hand the mapping back to its pool. The thread runs no more: it has no
+    /// frames, and nothing reads its stack.
+    pub(crate) fn release_stack(&mut self) {
+        drop(self.take_stack());
+    }
+
+    /// Take the mapping, leaving the thread without a stack: [`release_stack`]
+    /// for a thread still running on it, which hands it to the next one.
+    ///
+    /// [`release_stack`]: Self::release_stack
+    pub(crate) fn take_stack(&mut self) -> Option<crate::vm::stack::ThreadStack> {
+        debug_assert!(self.top_base.is_null());
+        let mut mem = self.mem.take()?;
+        mem.value_used = self.stack.len() * size_of::<Value<'gc>>();
+        *self.stack.0.get_mut() = StackView {
+            ptr: NonNull::dangling(),
+            len: 0,
+        };
+        self.sw = Default::default();
+        self.top = 0;
+        self.update_stack_end();
+        Some(mem)
     }
 
     /// The top frame's base as an index.
@@ -250,13 +323,15 @@ impl<'gc> ThreadState<'gc> {
         !self.top_base.is_null() && unsafe { frame::is_native(self.top_base) }
     }
 
-    /// Drop everything a previous run left behind; `status` is the caller's.
+    /// Drop everything a previous run left behind, its stack too; `status`
+    /// is the caller's.
     pub(crate) fn reset(&mut self) {
         // An open upvalue left behind would keep pointing into `stack`.
         debug_assert!(self.open_upvalues.is_empty());
         self.top_base = std::ptr::null_mut();
         self.top_pc = std::ptr::null();
-        self.discard_above(0);
+        self.release_stack();
+        self.entry = None;
         self.started = false;
         self.uncaught = None;
         self.open_upvalues.clear();
@@ -291,7 +366,7 @@ impl<'gc> ThreadState<'gc> {
     // them over touching `stack` / `top` directly; the only code that should
     // index `stack` raw is register access off a frame's `base`.
 
-    /// Make `stack[..n]` physically addressable. Grow-only, per rule (2).
+    /// Make `stack[..n]` addressable. Grow-only, per rule (2).
     #[inline]
     pub(crate) fn ensure_slots(&mut self, n: usize) {
         if self.stack.len() < n {
@@ -299,21 +374,20 @@ impl<'gc> ThreadState<'gc> {
         }
     }
 
-    /// Out of line so the growth path never sits in a handler's fast path.
-    /// Rebases everything that points into the stack: open upvalues, the
-    /// headers' caller words and the published base.
+    /// Commit up to `n`, nil-filling. Out of line so the growth path never
+    /// sits in a handler's fast path.
     #[cold]
     #[inline(never)]
     fn grow_slots(&mut self, n: usize) {
-        let old = self.stack.as_ptr().addr();
-        self.stack.resize(n, Value::nil());
-        let new = self.stack.as_mut_ptr();
-        if new.addr() != old {
-            for uv in &self.open_upvalues {
-                uv.rebase(old, new);
-            }
-            frame::rebase(self, old, new);
+        assert!(
+            self.mem.is_some() && n <= crate::vm::stack::VALUE_SLOTS,
+            "value stack overflow"
+        );
+        let v = self.stack.0.get_mut();
+        for i in v.len..n {
+            unsafe { v.ptr.as_ptr().add(i).write(Value::nil()) };
         }
+        v.len = n;
         self.update_stack_end();
     }
 
@@ -390,15 +464,26 @@ impl<'gc> ThreadState<'gc> {
         self.set_top(end);
     }
 
-    /// Cut the stack down to exactly `n` slots, releasing the storage above it.
-    /// The **only** sanctioned shrink (rule 2): the caller must guarantee no
-    /// live frame window and no in-flight native call sits above `n`.
+    /// Cut the committed stack down to `n` slots. The **only** sanctioned
+    /// shrink (rule 2): the caller must guarantee no live frame window and no
+    /// in-flight native call sits above `n`.
     pub(crate) fn discard_above(&mut self, n: usize) {
         debug_assert!(n <= self.stack.len());
         debug_assert!(self.top_base.is_null() || self.top_base_index() <= n);
-        self.stack.truncate(n);
+        self.stack.0.get_mut().len = n;
         self.top = n;
         self.update_stack_end();
+    }
+
+    /// Copy `n` values from `src` (another thread's stack) to `at` and make
+    /// them the top. Those past the stack's end are dropped: `top` is then
+    /// past `stack_limit`, which the receiving continuation reports as too
+    /// many results.
+    pub(crate) fn copy_in(&mut self, at: usize, src: *const Value<'gc>, n: usize) {
+        let n = n.min(crate::vm::stack::VALUE_SLOTS.saturating_sub(at));
+        self.ensure_slots(at + n);
+        unsafe { frame::copy_values(self.slot_ptr(at), src, n) };
+        self.top = at + n;
     }
 
     /// The stack slot at index `i` as a pointer.
@@ -425,8 +510,12 @@ impl<'gc> ThreadState<'gc> {
 impl<'gc> Thread<'gc> {
     pub fn new(mc: &Mutation<'gc>) -> Self {
         let state = ThreadState {
-            stack: ValueStack::new(mc),
+            stack: ValueStack::empty(),
             stack_end: std::ptr::null(),
+            mem: None,
+            sw: Default::default(),
+            native: Default::default(),
+            entry: None,
             top: 0,
             top_base: std::ptr::null_mut(),
             top_pc: std::ptr::null(),
@@ -446,6 +535,8 @@ impl<'gc> Thread<'gc> {
             death_error: None,
             stack_limit: STACK_LIMIT,
             resumer: None,
+            resume_wait: 0,
+            transfer: None,
             resume_depth: 0,
             tasks: Vec::new(),
             task_arena: crate::vm::async_native::TaskArena::new(),
@@ -480,19 +571,6 @@ impl<'gc> Thread<'gc> {
     #[inline]
     pub(crate) unsafe fn state_mut(self, mc: &Mutation<'gc>) -> &'gc mut ThreadState<'gc> {
         unsafe { &mut *self.0.unlock(mc).as_ptr() }
-    }
-
-    /// [`Thread::state_mut`] when its barrier would do nothing, else `None`:
-    /// for fast paths that would rather bail out than call the collector.
-    ///
-    /// # Safety
-    /// As [`Thread::state_mut`].
-    #[inline]
-    pub(crate) unsafe fn state_mut_if_clean(
-        self,
-        mc: &Mutation<'gc>,
-    ) -> Option<&'gc mut ThreadState<'gc>> {
-        Gc::write_if_clean(mc, self.0).map(|w| unsafe { &mut *w.unlock().as_ptr() })
     }
 
     pub fn status(self) -> ThreadStatus {

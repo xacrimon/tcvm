@@ -816,7 +816,6 @@ handler! {
         if !ts.ensure_frame_slots(bi + dst as usize + nv) {
             raise!(OpError::StackOverflow)
         }
-        base = ts.slot_ptr(bi);
         jump_by!(-1);
         next!()
     }
@@ -850,7 +849,6 @@ handler! {
             if !ts.ensure_frame_slots(new_top) {
                 raise!(OpError::StackOverflow)
             }
-            base = ts.slot_ptr(bi);
             let filled = wanted.min(navail);
             let t = table.inner().borrow();
             for i in 0..filled {

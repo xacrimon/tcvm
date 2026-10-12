@@ -288,7 +288,7 @@ pub(crate) fn emit(
         em.a.cmp_imm(Sz::X, INSN, fe.num_params as u64);
         em.a.b_cond(Cond::Lo, fast_miss);
         em.a.mov_sp(X16, SP);
-        em.a.ldr(X17, RT, layout::NATIVE_LIMIT as i32);
+        em.a.ldr(X17, THREAD, layout::NATIVE_LIMIT as i32);
         em.a.cmp(Sz::X, X16, X17);
         em.a.b_cond(Cond::Lo, fast_miss);
         let known = em.a.new_label();
@@ -648,7 +648,7 @@ impl Em<'_> {
         // was, right for the shallower frames' `ret`s.
         let deep = self.a.new_label();
         self.a.mov_sp(Gpr(9), SP);
-        self.a.ldr(Gpr(10), RT, layout::NATIVE_DEEP as i32);
+        self.a.ldr(Gpr(10), THREAD, layout::NATIVE_DEEP as i32);
         self.a.cmp(Sz::X, Gpr(9), Gpr(10));
         self.a.b_cond(Cond::Lo, deep);
         self.a.blr(X17);
@@ -660,7 +660,7 @@ impl Em<'_> {
             // The known entry trusts the native stack, which is deep enough
             // here to check: below the limit the full entry misses.
             let ok = self.a.new_label();
-            self.a.ldr(Gpr(10), RT, layout::NATIVE_LIMIT as i32);
+            self.a.ldr(Gpr(10), THREAD, layout::NATIVE_LIMIT as i32);
             self.a.cmp(Sz::X, Gpr(9), Gpr(10));
             self.a.b_cond(Cond::Hs, ok);
             self.a.sub_imm(Sz::X, X17, X17, KNOWN_ENTRY);
@@ -736,10 +736,10 @@ impl Em<'_> {
     /// pointer and return address dispatch was entered with, which drops this
     /// frame and the frames of any fast callers under it (5.4). Clobbers x17.
     fn leave(&mut self) {
-        self.a.ldr(X17, RT, layout::NATIVE_SP as i32);
+        self.a.ldr(X17, THREAD, layout::NATIVE_SP as i32);
         self.a.mov_sp(SP, X17);
-        self.a.ldr(FP, RT, layout::NATIVE_FP as i32);
-        self.a.ldr(LR, RT, layout::NATIVE_LR as i32);
+        self.a.ldr(FP, THREAD, layout::NATIVE_FP as i32);
+        self.a.ldr(LR, THREAD, layout::NATIVE_LR as i32);
     }
 
     /// Set the flags for `test` on instruction `i`'s operands from `k`;
@@ -1759,7 +1759,7 @@ impl Em<'_> {
                 self.close_frame();
                 self.a.movz(Sz::X, INSN, n as u16, 0);
                 self.a.add_imm(Sz::X, PC, BASE, a as u64 * 8);
-                self.a.ldr(X17, RT, layout::NATIVE_LR as i32);
+                self.a.ldr(X17, THREAD, layout::NATIVE_LR as i32);
                 self.a.cmp(Sz::X, LR, X17);
                 self.a.b_cond(Cond::Eq, slow);
                 let deep = self.a.new_label();

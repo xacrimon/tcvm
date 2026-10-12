@@ -119,7 +119,7 @@ handler! {
         for s in snap.entries() {
             let w = match s.loc {
                 Loc::Reg(i) => img[i as usize].get(),
-                Loc::Spill(i) => img[crate::jit::backend::aarch64::abi::IMAGE_SPILLS + i as usize].get(),
+                Loc::Spill(i) => img[crate::jit::state::IMAGE_SPILLS + i as usize].get(),
                 loc => const_word(region, loc),
             };
             unsafe { base.add(s.reg as usize).write(entry_value(mc, s.rep, w)) };
@@ -130,8 +130,7 @@ handler! {
         let at = if snap.kind == ExitKind::Before { snap.pc } else { snap.pc + 1 };
         let resume = unsafe { closure.code.add(at as usize) };
         if e.tag == crate::jit::ir::ops::ExitTag::Gc {
-            pc = resume;
-            exit!(crate::vm::abi::Exit::Gc)
+            tail!(crate::vm::dispatch::gc_park, pc = resume, insn = Slot::from_raw(0), closure = Slot::closure(closure))
         }
         let mut word = unsafe { *resume };
         if word.is_jit_word() {
@@ -218,7 +217,7 @@ pub(crate) unsafe extern "C" fn jit_leave(
     below: u64,
 ) {
     let ctx = unsafe { Context::from_state(rt) };
-    let native = ctx.jit().native.fp.get();
+    let native = unsafe { (*ctx.thread_ptr()).native.fp.get() };
     let (mut fp, mut lr, mut base) = (fp, lr, base);
     let mut callee = if below != 0 {
         base
@@ -382,9 +381,11 @@ fn compile_caught<'gc>(
 ) -> Result<Gc<'gc, Region<'gc>>, crate::jit::compile::CompileError> {
     #[cfg(target_arch = "aarch64")]
     {
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::jit::compile::compile(ctx, closure, at, frame, seen)
-        }));
+        let r = crate::vm::stack::on_host(ctx, || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::jit::compile::compile(ctx, closure, at, frame, seen)
+            }))
+        });
         match r {
             Ok(r) => r,
             Err(p) => {
