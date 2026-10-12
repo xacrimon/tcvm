@@ -113,6 +113,22 @@ macro_rules! start {
 /// The Lua arm of CALL, shared by the CALL forms; `$fv` is the callee
 /// (`R[a]`, or the source register of a CALLS, which has just stored it
 /// there) and `$ret` the callee's continuation.
+/// The callee feedback of the call `insn` of `closure` (I2): a hit costs a
+/// load and a compare, a miss records the function `fv` in `call_note`. A
+/// handler that called out to record it would push a frame on every call.
+macro_rules! note_callee {
+    ($closure:ident, $insn:expr, $fv:expr) => {{
+        let seen = unsafe { (*$closure.callees.add($insn.d() as usize)).get() };
+        if std::hint::unlikely(seen != $fv.to_raw()) {
+            // Only `MEGAMORPHIC` has bit 0 set: a function value's payload
+            // is aligned.
+            if seen & 1 == 0 {
+                tail!(call_note)
+            }
+        }
+    }};
+}
+
 macro_rules! call_body {
     ($insn:ident, $pc:ident, $base:ident, $rt:ident, $closure:ident, $fv:expr, $ret:expr) => {{
         let (a, b) = ($insn.a(), $insn.b());
@@ -120,6 +136,7 @@ macro_rules! call_body {
         let Some(f) = fv.get_function() else {
             tail!(call_meta)
         };
+        note_callee!($closure, $insn, fv);
         match f.inner().as_ref() {
             FunctionKind::Native(nc) => {
                 let entry = nc.entry;
@@ -177,23 +194,42 @@ handler! {
     /// (the fused MOVE). `R[a]` gets the callee so the slow paths, which
     /// re-read the function slot, see a plain CALL.
     op fn op_calls {
-        let fv = reg![insn.imm() as u8];
+        let fv = reg![insn.e() as u8];
         reg![insn.a()] = fv;
         call_body!(insn, pc, base, rt, closure, fv, rt.ret(insn.c()))
     }
 
     /// CALLS wanting no result.
     op fn op_calls_r0 {
-        let fv = reg![insn.imm() as u8];
+        let fv = reg![insn.e() as u8];
         reg![insn.a()] = fv;
         call_body!(insn, pc, base, rt, closure, fv, ret_call0)
     }
 
     /// CALLS wanting one result.
     op fn op_calls_r1 {
-        let fv = reg![insn.imm() as u8];
+        let fv = reg![insn.e() as u8];
         reg![insn.a()] = fv;
         call_body!(insn, pc, base, rt, closure, fv, ret_call1)
+    }
+
+    /// A call whose callee slot missed (`note_callee!`): its first function,
+    /// or a second, which makes the site megamorphic; then the call again.
+    slow fn call_note {
+        let call = insn_at!();
+        // `R[a]` is the callee, a CALLS's included.
+        let fv: Value<'gc> = reg![call.a()];
+        let proto = unsafe { frame::closure(base) }.proto;
+        let slot = &proto.callees[call.d() as usize];
+        slot.set(if slot.get() == 0 {
+            fv.to_raw()
+        } else {
+            crate::env::function::MEGAMORPHIC
+        });
+        rt.mutation()
+            .backward_barrier(crate::dmm::Gc::erase(proto), None);
+        let h = rt.handler(call.opcode());
+        tail!(h, insn = Slot::insn(call))
     }
 
     /// CALL of a Lua closure whose window does not fit: grow, then retry
@@ -351,6 +387,7 @@ handler! {
         let Some(f) = fv.get_function() else {
             tail!(tailcall_slow)
         };
+        note_callee!(closure, insn, fv);
         match f.inner().as_ref() {
             FunctionKind::Native(nc) => {
                 let entry = nc.entry;

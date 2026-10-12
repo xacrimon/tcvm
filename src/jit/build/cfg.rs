@@ -149,7 +149,7 @@ pub(crate) fn use_def(
         }
         CALL | CALL_R0 | CALL_R1 | CALLS | CALLS_R0 | CALLS_R1 => {
             if matches!(op, CALLS | CALLS_R0 | CALLS_R1) {
-                u(i.imm() as u8 as usize);
+                u(i.e() as usize);
             } else {
                 u(a);
             }

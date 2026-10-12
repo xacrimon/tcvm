@@ -745,13 +745,14 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         returns: u8,
         src: Option<RegisterIndex>,
     ) {
+        let k = self.chunk.alloc_callee_slot();
         let insn = match (returns, src) {
-            (1, None) => Instruction::call_r0(func, args, returns),
-            (2, None) => Instruction::call_r1(func, args, returns),
-            (_, None) => Instruction::call(func, args, returns),
-            (1, Some(s)) => Instruction::calls_r0(func, args, returns, Reg(s.0)),
-            (2, Some(s)) => Instruction::calls_r1(func, args, returns, Reg(s.0)),
-            (_, Some(s)) => Instruction::calls(func, args, returns, Reg(s.0)),
+            (1, None) => Instruction::call_r0(func, args, returns, k),
+            (2, None) => Instruction::call_r1(func, args, returns, k),
+            (_, None) => Instruction::call(func, args, returns, k),
+            (1, Some(s)) => Instruction::calls_r0(func, args, returns, k, Reg(s.0)),
+            (2, Some(s)) => Instruction::calls_r1(func, args, returns, k, Reg(s.0)),
+            (_, Some(s)) => Instruction::calls(func, args, returns, k, Reg(s.0)),
         };
         self.emit(insn);
     }
@@ -4115,7 +4116,8 @@ fn compile_expr_func_call(
 /// `frame_return`).
 fn compile_tail_func_call(ctx: &mut Ctx, item: FuncCall) -> Result<(), CompileError> {
     let (func, args_wire, _) = emit_func_call_setup(ctx, &item, false)?;
-    ctx.emit(Instruction::tailcall(func, args_wire));
+    let k = ctx.chunk.alloc_callee_slot();
+    ctx.emit(Instruction::tailcall(func, args_wire, k));
     // Frame is about to be torn down; conservatively snap freereg to func
     // so any post-TAILCALL code in the compiler (there shouldn't be any
     // reachable) sees a clean cursor.
@@ -4128,7 +4130,8 @@ fn compile_tail_func_call(ctx: &mut Ctx, item: FuncCall) -> Result<(), CompileEr
 /// register list.
 fn compile_tail_method_call(ctx: &mut Ctx, item: MethodCall) -> Result<(), CompileError> {
     let (func, args_wire) = emit_method_call_setup(ctx, &item)?;
-    ctx.emit(Instruction::tailcall(func, args_wire));
+    let k = ctx.chunk.alloc_callee_slot();
+    ctx.emit(Instruction::tailcall(func, args_wire, k));
     ctx.chunk.freereg = func.0;
     Ok(())
 }
