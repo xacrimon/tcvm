@@ -96,6 +96,7 @@ handler! {
         // around it.
         let mut fbase = base;
         let mut fclosure: LuaFn<'gc> = unsafe { frame::closure(base) };
+        let region_closure = fclosure;
         for fr in snap.frames() {
             let callee = region.pool[fr.func as usize]
                 .get_function()
@@ -125,7 +126,7 @@ handler! {
         }
         base = fbase;
         let closure = fclosure;
-        on_exit(rt, closure, base, region, e, snap.kind, snap.pc);
+        on_exit(rt, region_closure, closure, base, region, e, snap.kind, snap.pc);
         let at = if snap.kind == ExitKind::Before { snap.pc } else { snap.pc + 1 };
         let resume = unsafe { closure.code.add(at as usize) };
         if e.tag == crate::jit::ir::ops::ExitTag::Gc {
@@ -518,9 +519,13 @@ fn retire_entry(ctx: Context<'_>, closure: LuaFn<'_>, e: &Entry<'_>) {
 }
 
 /// What an exit leaves behind: the operand kinds the guard saw, the count,
-/// and a recompile request when the exit is hot.
+/// and a recompile request when the exit is hot. `closure` and `base` are
+/// the innermost frame's, an inlined callee's when the exit is in its body
+/// (E1), whose sites the feedback is for; `region_closure` the region's.
+#[allow(clippy::too_many_arguments)]
 fn on_exit<'gc>(
     ctx: Context<'gc>,
+    region_closure: LuaFn<'gc>,
     closure: LuaFn<'gc>,
     base: *mut Value<'gc>,
     region: &Region<'gc>,
@@ -576,7 +581,7 @@ fn on_exit<'gc>(
         return;
     }
     if e.tag == ExitTag::NeverRan && n == 1 {
-        request_recompile(ctx, closure, region, true);
+        request_recompile(ctx, region_closure, region, true);
     } else if e.tag.widenable() && n == region.exit_hot.get() {
         log(ctx, || {
             format!(
@@ -597,16 +602,19 @@ fn on_exit<'gc>(
             .feedback
             .get(e.site.unwrap_or(pc) as usize)
             .map_or(0, |c| c.get());
+        // An inlined callee's kinds and shapes are its own state's.
+        let inlined = !std::ptr::eq(closure.as_ptr(), region_closure.as_ptr());
         let learned = byte != e.byte
-            || match e.tag {
-                ExitTag::Type => st.kind_exits[region.known.0 as usize..].contains(&pc),
-                ExitTag::Shape => st.shapes_seen[region.known.1 as usize..]
-                    .iter()
-                    .any(|&(p, _)| p == pc),
-                _ => false,
-            };
+            || !inlined
+                && match e.tag {
+                    ExitTag::Type => st.kind_exits[region.known.0 as usize..].contains(&pc),
+                    ExitTag::Shape => st.shapes_seen[region.known.1 as usize..]
+                        .iter()
+                        .any(|&(p, _)| p == pc),
+                    _ => false,
+                };
         drop(st);
-        request_recompile(ctx, closure, region, learned);
+        request_recompile(ctx, region_closure, region, learned);
     }
 }
 

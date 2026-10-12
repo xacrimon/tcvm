@@ -58,7 +58,18 @@ impl Func<'_> {
                         .iter()
                         .map(|&(r, v)| format!("r{r}=v{}", v.0))
                         .collect();
-                    let _ = write!(out, "  [{:?} {kind} pc{} {}]", d.tag, s.pc, ents.join(" "));
+                    let fr = if s.frame == crate::jit::ir::NO_FRAME {
+                        String::new()
+                    } else {
+                        format!(" f{}", s.frame)
+                    };
+                    let _ = write!(
+                        out,
+                        "  [{:?} {kind}{fr} pc{} {}]",
+                        d.tag,
+                        s.pc,
+                        ents.join(" ")
+                    );
                 }
                 let _ = writeln!(out);
             }

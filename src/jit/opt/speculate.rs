@@ -105,15 +105,21 @@ pub(crate) fn speculate(f: &mut Func<'_>, kinds: &EntryKinds) -> bool {
     }
     // Each guard tests the value itself and exits with the frame of the
     // value's definition, which the replacements below must not touch.
-    let frames: Vec<(u32, ExitKind, Vec<(u8, Val)>)> = cands
+    let frames: Vec<(u32, ExitKind, Vec<(u8, Val)>, u32)> = cands
         .iter()
         .map(|c| match c.snap {
             Some(s) => (
                 f.snaps[s.idx()].pc,
                 f.snaps[s.idx()].kind,
                 f.entries(s.0).to_vec(),
+                f.snaps[s.idx()].frame,
             ),
-            None => (f.meta.entry_pc, ExitKind::Before, Vec::new()),
+            None => (
+                f.meta.entry_pc,
+                ExitKind::Before,
+                Vec::new(),
+                crate::jit::ir::NO_FRAME,
+            ),
         })
         .collect();
     let mut guards = Vec::with_capacity(places.len());
@@ -175,10 +181,10 @@ pub(crate) fn speculate(f: &mut Func<'_>, kinds: &EntryKinds) -> bool {
     }
     for (&(ci, _), &g) in places.iter().zip(&guards) {
         f.args_mut(g)[0] = cands[ci].v;
-        let (pc, kind, entries) = &frames[ci];
+        let (pc, kind, entries, frame) = &frames[ci];
         let from = f.snap_pool.len();
         f.snap_pool.extend_from_slice(entries);
-        let s = f.finish_snap(*pc, *kind, from);
+        let s = f.finish_snap(*frame, *pc, *kind, from);
         f.insts[g.idx()].snap = s.0;
     }
     true

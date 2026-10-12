@@ -19,6 +19,8 @@ use crate::jit::region::SRep;
 /// with a value in a register as operands of the exiting instruction.
 pub(crate) struct LExit {
     pub(crate) pc: u32,
+    /// The inlined frames the exit rebuilds, outermost first (E1).
+    pub(crate) frames: Vec<crate::jit::region::SnapFrame>,
     /// The pc whose feedback the exit records, when not `pc` (E2).
     pub(crate) site: Option<u32>,
     pub(crate) kind: ExitKind,
@@ -431,8 +433,23 @@ impl<'a, 'gc> Lower<'a, 'gc> {
         let pc = s.pc;
         let kind = s.kind;
         let tag = d.tag;
+        let mut frames = Vec::new();
+        let mut fr = s.frame;
+        while fr != crate::jit::ir::NO_FRAME {
+            let x = self.f.inline_frames[fr as usize];
+            frames.push(crate::jit::region::SnapFrame {
+                func: x.func,
+                a: x.a,
+                c: x.c,
+                delta: x.a as u16 + 4,
+                caller_pc: x.caller_pc,
+            });
+            fr = x.parent;
+        }
+        frames.reverse();
         self.exits.push(LExit {
             pc,
+            frames,
             site: self.f.exit_sites.get(&i).copied(),
             kind,
             tag,
@@ -459,6 +476,11 @@ impl<'a, 'gc> Lower<'a, 'gc> {
     /// which `jit_leave` and the slow resume read (C1).
     fn push_call(&mut self, i: Inst, mk: MInst, mut ops: Vec<Operand>) {
         let d = &self.f.insts[i.idx()];
+        debug_assert_eq!(
+            self.f.snaps[d.snap as usize].frame,
+            crate::jit::ir::NO_FRAME,
+            "a call inside an inlined body"
+        );
         let mut entries = Vec::new();
         let mut seen: Vec<(VReg, u16)> = Vec::new();
         let base = ops.len();
@@ -1259,6 +1281,9 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     },
                     ops,
                 );
+            }
+            Op::GuardWindow(end) => {
+                self.push_exit(i, |exit| MInst::GuardFits { end, exit }, vec![], none);
             }
             Op::GuardFits(n) => {
                 let end = f.meta.max_stack as u16 + 4 + n as u16;

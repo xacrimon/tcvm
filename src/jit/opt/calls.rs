@@ -140,7 +140,7 @@ fn keep_in_free_reg(f: &mut Func<'_>, cfg: &CfgInfo, b: Block, v: Val) -> Result
     f.snap_pool
         .extend_from_within(d.entries.start as usize..(d.entries.start + d.entries.len) as usize);
     f.snap_pool.push((r as u8, v));
-    let s = f.finish_snap(d.pc, d.kind, from);
+    let s = f.finish_snap(d.frame, d.pc, d.kind, from);
     f.insts[t.idx()].snap = s.0;
     Ok(())
 }
