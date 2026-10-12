@@ -185,10 +185,11 @@ pub(crate) unsafe extern "C" fn exit_common() {
 }
 
 /// Native stack below a level's start past which fast calls branch with a
-/// tagged return address instead of `blr`, and return with `br`: the return
-/// address stack holds about 48 entries here, and a `ret` past it
-/// mispredicts while the indirect predictor keeps up (5.4).
-pub(crate) const RAS_STACK: usize = 512;
+/// tagged return address instead of `blr`, and return with `br`: the M4's
+/// return address stack holds 48 to 64 entries (a chain of 64 returns runs
+/// at three times the cycles of one of 48, the tagged returns at 1.05), and
+/// the median region frame is 32 bytes (I6).
+pub(crate) const RAS_STACK: usize = 1536;
 
 /// Start a level (H6) for compiled code: entered by `bl` or `b` with the
 /// return address in x30, the handler to run in x16, the base of the
