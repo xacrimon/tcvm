@@ -594,7 +594,16 @@ impl Em<'_> {
     /// Enter the fast entry in x17 of the closure in x16 (`fast_call`).
     fn fast_enter(&mut self, hdr: i32, block: usize) -> Label {
         let fast_resume = self.fast_resume[self.v.succs(block)[0].index()];
-        self.a.str(X16, BASE, hdr);
+        // Word 1 zero: the frame's flags, which helpers set there (a closure
+        // capturing a register, `HAS_OPEN`) and `HasFlag` reads; a walk adds
+        // the continuation (D4). Left stale, a flag would land on a value of
+        // the caller's that the collector traces once the call returns.
+        if hdr <= 504 {
+            self.a.stp(X16, ZR, BASE, hdr);
+        } else {
+            self.a.str(X16, BASE, hdr);
+            self.a.str(ZR, BASE, hdr + 8);
+        }
         self.a.add_imm(Sz::X, BASE, BASE, hdr as u64 + 32);
         self.a.mov(CLOSURE, X16);
         // Deep in a chain the return address goes in tagged (bit 0), so the

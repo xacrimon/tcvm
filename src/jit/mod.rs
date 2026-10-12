@@ -237,7 +237,10 @@ pub(crate) unsafe extern "C" fn jit_leave(
                 assert!(site.hdr != u16::MAX, "a frame under a site without a call");
                 base = callee.sub(site.hdr as usize + 4);
                 let h = callee as *mut u64;
-                h.sub(3).write(region.code.rx() as u64 + site.resume as u64);
+                // The frame's flags (`HAS_OPEN` from a closure) stay.
+                let flags = h.sub(3).read() & crate::vm::frame::flag::MASK;
+                h.sub(3)
+                    .write(region.code.rx() as u64 + site.resume as u64 | flags);
                 h.sub(2).write(base as u64);
                 h.sub(1).write(site.pc_after);
             }
