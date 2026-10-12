@@ -1333,6 +1333,25 @@ pub(crate) fn remove_trivial_params(f: &mut Func<'_>) {
                 {
                     map[p.idx()] = s;
                     changed = true;
+                    continue;
+                }
+                // A parameter every edge passes what it passes an earlier
+                // one is that one: a loop's index and its variable.
+                for j in 0..k {
+                    let q = f.params(b)[j];
+                    if resolve(&map, q) != q || f.vals[q.idx()].ty != f.vals[p.idx()].ty {
+                        continue;
+                    }
+                    let dup = cfg.incoming(b).iter().all(|&(term, e)| {
+                        let args = f.edge_args(term, e as usize);
+                        let (x, y) = (resolve(&map, args[j]), resolve(&map, args[k]));
+                        x == y || (x == q && y == p)
+                    });
+                    if dup {
+                        map[p.idx()] = q;
+                        changed = true;
+                        break;
+                    }
                 }
             }
         }
