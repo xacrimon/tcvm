@@ -1775,3 +1775,28 @@ fn list_and_min_max_intrinsics() {
 "#,
     );
 }
+
+/// Callees the interpreter saw at a site (I2): one function loaded from
+/// varying tables is guarded and called as a constant, a site that changes
+/// its callee after compiling leaves and recompiles, and a megamorphic one
+/// stays a call.
+#[test]
+fn callee_feedback() {
+    agrees(
+        "local function inc(x) return x + 1 end
+        local objs, poly = {}, {}
+        for i = 1, 10 do
+          objs[i] = {f = math.abs, g = inc}
+          poly[i] = {g = function(x) return x * i end}
+        end
+        local s = 0
+        for i = 1, 3000 do
+          local o = objs[i % 10 + 1]
+          s = s + o.f(-i) + o.g(i) + poly[i % 10 + 1].g(2)
+          if i == 2000 then
+            for j = 1, 10 do objs[j].f, objs[j].g = math.floor, function(x) return x - 1 end end
+          end
+        end
+        return tostring(s)",
+    );
+}

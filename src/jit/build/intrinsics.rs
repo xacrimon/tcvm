@@ -143,6 +143,28 @@ pub(super) fn value_now<'gc>(b: &Builder<'_, 'gc>, v: Val, guess: bool) -> Optio
     }
 }
 
+/// The function the call at `pc` calls when the builder may take it for a
+/// constant, which its user guards by identity: what `callee` holds now
+/// (`value_now`), else the one function the site has called since the last
+/// collection (`Prototype::callees`, I2). Neither once such a guard failed.
+pub(super) fn known_callee<'gc>(
+    b: &Builder<'_, 'gc>,
+    pc: u32,
+    callee: Val,
+) -> Option<Function<'gc>> {
+    if b.feedback(pc) & fb::CONST_MISS != 0 {
+        return value_now(b, callee, false).and_then(|v| v.get_function());
+    }
+    if let Some(f) = value_now(b, callee, true).and_then(|v| v.get_function()) {
+        return Some(f);
+    }
+    let seen = b.proto.callees.get(b.code(pc).d() as usize)?.get();
+    if seen == 0 || seen == crate::env::function::MEGAMORPHIC {
+        return None;
+    }
+    unsafe { Value::from_raw(seen) }.get_function()
+}
+
 /// What `emit` made of a CALL.
 pub(super) enum Emitted {
     /// Nothing: the CALL is a call.
@@ -163,8 +185,7 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: 
     } else {
         (insn.a(), insn.b(), insn.c())
     };
-    let guess = b.feedback(pc) & fb::CONST_MISS == 0;
-    let Some(f) = value_now(b, callee, guess).and_then(|v| v.get_function()) else {
+    let Some(f) = known_callee(b, pc, callee) else {
         return Emitted::No;
     };
     let Some(intr) = intrinsic_of(f) else {

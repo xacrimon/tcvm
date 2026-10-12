@@ -1733,7 +1733,7 @@ fn emit_call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
     let op = insn.op();
     let fused = matches!(op, BcOp::CALLS | BcOp::CALLS_R0 | BcOp::CALLS_R1);
     let callee = if fused {
-        b.reg(insn.imm() as u8)
+        b.reg(insn.e() as u8)
     } else {
         callee_at(b, pc, insn.a())
     };
@@ -1766,17 +1766,17 @@ fn callee_at(b: &mut Builder<'_, '_>, pc: u32, a: u8) -> Val {
     }
 }
 
-/// A native `callee` as a constant, which lowering calls through
-/// `jit_call_native` without testing it (I1): one `value_now` takes for a
-/// constant is guarded by identity.
-fn native_callee(b: &mut Builder<'_, '_>, pc: u32, callee: Val) -> Val {
-    if matches!(b.f.def_op(callee), Some(Op::KObj(_))) {
+/// `callee` as a constant when `known_callee` names a native, guarded by
+/// identity: lowering calls it through `jit_call_native` (I1). A Lua
+/// callee's closure may be a new one of the same prototype each time (a
+/// function's local functions), which wants a guard on the prototype.
+fn known_callee(b: &mut Builder<'_, '_>, pc: u32, callee: Val) -> Val {
+    // Once such a guard failed here; even a value of the closure being
+    // compiled's own upvalues may differ per closure.
+    if matches!(b.f.def_op(callee), Some(Op::KObj(_))) || b.feedback(pc) & fb::CONST_MISS != 0 {
         return callee;
     }
-    let guess = b.feedback(pc) & fb::CONST_MISS == 0;
-    let Some(f) = intrinsics::value_now(b, callee, guess)
-        .and_then(|v| v.get_function())
-        .filter(|f| f.as_native().is_some())
+    let Some(f) = intrinsics::known_callee(b, pc, callee).filter(|f| f.as_native().is_some())
     else {
         return callee;
     };
@@ -1789,7 +1789,7 @@ fn native_callee(b: &mut Builder<'_, '_>, pc: u32, callee: Val) -> Val {
 /// The CALL at `pc` as a call of `callee` (5.4).
 fn call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: Val) {
     let (a, nb, c) = (insn.a(), insn.b(), insn.c());
-    let callee = native_callee(b, pc, callee);
+    let callee = known_callee(b, pc, callee);
     let live = b
         .cfg
         .live_in

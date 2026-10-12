@@ -63,6 +63,8 @@ pub struct Prototype<'gc> {
     /// counter-free reads via `get()` and barrier-aware writes via
     /// the parent `Prototype`'s `Gc`. Entries are [`InlineCache`].
     pub ic_table: IcTable<'gc>,
+    /// One per CALL, CALLS and TAILCALL, the instruction's `d`.
+    pub callees: Callees,
     /// Per distinct constructor template, indexed by `NEWTABLE`.
     pub templates: Box<[Template<'gc>]>,
     /// What the slow paths saw, one byte per instruction (`jit::feedback`).
@@ -208,6 +210,46 @@ unsafe impl<'gc> Collect<'gc> for IcTable<'gc> {
     }
 }
 
+/// [`Prototype::callees`], the JIT's callee feedback (I2): per call site,
+/// the bits of the function value the interpreter last called there,
+/// [`MEGAMORPHIC`] once it called two, 0 for none. Its trace clears it
+/// rather than tracing it, and a write takes the prototype's barrier, so a
+/// nonzero slot names a function called since the last collection, which
+/// is alive.
+pub struct Callees(Box<[Cell<u64>]>);
+
+/// A callee slot that saw two functions: no `Value` has these bits, and
+/// only it has bit 0 set among what a slot holds (a function's payload is
+/// aligned), which the interpreter tests.
+pub(crate) const MEGAMORPHIC: u64 = 0xFFF8_0000_0000_0001;
+
+impl Callees {
+    pub fn new(len: usize) -> Self {
+        Callees((0..len).map(|_| Cell::new(0)).collect())
+    }
+
+    pub(crate) fn as_ptr(&self) -> *const Cell<u64> {
+        self.0.as_ptr()
+    }
+}
+
+impl std::ops::Deref for Callees {
+    type Target = [Cell<u64>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+// SAFETY: holds no pointer past a collection: tracing empties it.
+unsafe impl<'gc> Collect<'gc> for Callees {
+    fn trace<T: Trace<'gc>>(&self, _cc: &mut T) {
+        for slot in self.iter() {
+            slot.set(0);
+        }
+    }
+}
+
 /// A captured local: open while its frame lives, `v` pointing at its slot in
 /// `thread`'s stack, then closed, `v` pointing at `closed`. Reads are one load through `v`, whichever state.
 pub struct UpvalueCell<'gc> {
@@ -326,6 +368,7 @@ pub struct LuaClosure<'gc> {
     pub code: *const crate::instruction::Instruction,
     pub constants: *const Value<'gc>,
     pub ic_table: *const Lock<InlineCache<'gc>>,
+    pub callees: *const Cell<u64>,
     pub max_stack_size: u8,
     pub num_params: u8,
     pub is_vararg: bool,
@@ -807,6 +850,7 @@ impl<'gc> Function<'gc> {
             code: proto.code.as_ptr(),
             constants: proto.constants.as_ptr(),
             ic_table: proto.ic_table.as_ptr(),
+            callees: proto.callees.as_ptr(),
             max_stack_size: proto.max_stack_size,
             num_params: proto.num_params,
             is_vararg: proto.is_vararg,

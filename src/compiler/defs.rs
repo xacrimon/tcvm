@@ -256,6 +256,9 @@ pub struct Chunk<'gc> {
     /// GETFIELD/SETFIELD/GETTABUP/SETTABUP/SELF. The final count seeds the
     /// prototype's `ic_table` length.
     pub(super) next_ic_idx: u16,
+    /// Callee slots reserved so far, one per CALL, CALLS and TAILCALL: the
+    /// length of `Prototype::callees`.
+    pub(super) next_callee_idx: u16,
     /// Becomes `Prototype::templates`.
     pub(super) templates: Vec<Template<'gc>>,
 }
@@ -292,6 +295,7 @@ impl<'gc> Chunk<'gc> {
             too_long: false,
             source,
             next_ic_idx: 0,
+            next_callee_idx: 0,
             templates: Vec::new(),
         }
     }
@@ -306,6 +310,14 @@ impl<'gc> Chunk<'gc> {
         // ever hit it, fall back to "no cache" (Empty stays).
         self.next_ic_idx = self.next_ic_idx.saturating_add(1);
         i
+    }
+
+    /// Reserve a call site's callee slot. Past `u16::MAX` sites the last one
+    /// is shared, which the JIT reads as a polymorphic site at worst.
+    pub(super) fn alloc_callee_slot(&mut self) -> crate::instruction::CalleeIdx {
+        let i = self.next_callee_idx;
+        self.next_callee_idx = i.saturating_add(1);
+        crate::instruction::CalleeIdx(i.min(u16::MAX - 1))
     }
 
     /// Resolve jump patches and convert into an immutable Prototype, with
@@ -427,6 +439,7 @@ impl<'gc> Chunk<'gc> {
                 locvars: self.locvars.into_boxed_slice(),
                 upvalue_names: self.upvalue_names.into_boxed_slice(),
                 ic_table: IcTable::new(self.next_ic_idx as usize),
+                callees: crate::env::function::Callees::new(self.next_callee_idx as usize),
                 templates: self.templates.into_boxed_slice(),
                 feedback,
                 jit: crate::dmm::Lock::new(None),
