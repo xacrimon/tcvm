@@ -165,6 +165,9 @@ pub(crate) enum MInst {
     FAlu(FOp),
     /// `[def d (float), use n]`.
     FUn(FUnOp),
+    /// `[def d (early), temp q, use a, use b]`: Lua's float `%` (E7), the
+    /// cases the floor of the rounded quotient misses out of line.
+    FMod,
     /// `[def d (w), test operands..]`: `cset`.
     Set {
         test: Test,
