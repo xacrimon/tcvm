@@ -2,12 +2,12 @@ pub(crate) mod basic;
 mod coroutine;
 mod debug;
 mod io;
-mod math;
+pub(crate) mod math;
 mod os;
 mod package;
 pub(crate) mod strfmt_num;
 pub(crate) mod string;
-mod table;
+pub(crate) mod table;
 mod utf8;
 // `pub(crate)` so the VM concat path (`vm::num::write_float`) can share the
 // canonical float-stringification (`push_float`) with `tostring`/`print`.

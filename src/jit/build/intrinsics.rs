@@ -39,7 +39,7 @@ enum Intrinsic {
 fn intrinsic_of(f: Function<'_>) -> Option<Intrinsic> {
     use crate::builtin::basic as base;
     let nc = f.as_native()?;
-    let plain: [(NativeFn, Intrinsic); 10] = [
+    let plain: [(NativeFn, Intrinsic); 12] = [
         (base::lua_type, Intrinsic::Builtin(HelperId::Type)),
         (
             base::lua_getmetatable,
@@ -59,6 +59,14 @@ fn intrinsic_of(f: Function<'_>) -> Option<Intrinsic> {
             crate::builtin::string::lua_byte,
             Intrinsic::Builtin(HelperId::StrByte),
         ),
+        (
+            crate::builtin::math::lua_min,
+            Intrinsic::Builtin(HelperId::Min),
+        ),
+        (
+            crate::builtin::math::lua_max,
+            Intrinsic::Builtin(HelperId::Max),
+        ),
     ];
     match nc.function {
         NativeKind::Plain(p) => {
@@ -66,8 +74,15 @@ fn intrinsic_of(f: Function<'_>) -> Option<Intrinsic> {
                 return Some(i);
             }
         }
-        NativeKind::Cont(p) if p as usize == base::lua_tostring as ContFn as usize => {
-            return Some(Intrinsic::Builtin(HelperId::ToString));
+        NativeKind::Cont(p) => {
+            let cont: [(ContFn, HelperId); 3] = [
+                (base::lua_tostring, HelperId::ToString),
+                (crate::builtin::table::lua_insert, HelperId::TInsert),
+                (crate::builtin::table::lua_remove, HelperId::TRemove),
+            ];
+            if let Some(&(_, h)) = cont.iter().find(|(f, _)| *f as usize == p as usize) {
+                return Some(Intrinsic::Builtin(h));
+            }
         }
         _ => {}
     }
@@ -135,8 +150,8 @@ pub(super) enum Emitted {
     /// Its results.
     Done,
     /// Its results, and a block for the call itself, where the inline code
-    /// found the builtin must run.
-    Fallback(Block),
+    /// found the builtin must run, with the builtin as a constant.
+    Fallback(Block, Val),
 }
 
 /// Compile the CALL at `pc` as its callee's intrinsic, if it has one that
@@ -161,8 +176,7 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: 
         _ if nb == 0 => return Emitted::No,
         _ => {}
     }
-    let done = emit_math(b, pc, intr, a, nb - 1, c, f, callee);
-    if done { Emitted::Done } else { Emitted::No }
+    emit_math(b, pc, intr, a, nb - 1, c, f, callee)
 }
 
 /// A builtin by its helper; `type` of a known kind is a constant.
@@ -182,6 +196,7 @@ fn builtin<'gc>(
         HelperId::RawSet => (3, 0),
         HelperId::StrSub => (3, 1),
         HelperId::StrByte => (2, 1),
+        HelperId::TInsert | HelperId::Min | HelperId::Max => (2, 0),
         _ => (1, 0),
     };
     if nargs > arity || nargs + optional < arity || c == 0 || c > 2 {
@@ -200,6 +215,14 @@ fn builtin<'gc>(
             }
         })
         .collect();
+    if matches!(h, HelperId::Min | HelperId::Max)
+        && let Some(r) = min_max_inline(b, h == HelperId::Max, args[0], args[1])
+    {
+        if c == 2 {
+            b.set(a, r);
+        }
+        return Emitted::Done;
+    }
     if h == HelperId::Type
         && let Some(name) = type_name(b.ty(args[0]).set)
     {
@@ -220,7 +243,7 @@ fn builtin<'gc>(
         let (slow, ok) = (b.new_sealed_succ(), b.new_sealed_succ());
         b.br(failed, slow, ok);
         b.switch_to(ok);
-        out = Emitted::Fallback(slow);
+        out = Emitted::Fallback(slow, k);
     }
     if c == 2 {
         let r = if h == HelperId::RawEqual {
@@ -233,6 +256,28 @@ fn builtin<'gc>(
         b.set(a, r);
     }
     out
+}
+
+/// `math.max(x, y)` (or `min`) of two small integers or two floats: the
+/// builtin's pick by `<`, which keeps `x` for a NaN.
+fn min_max_inline(b: &mut Builder<'_, '_>, max: bool, x: Val, y: Val) -> Option<Val> {
+    let (tx, ty) = (b.ty(x), b.ty(y));
+    let is = |t: crate::jit::ir::types::Ty, rep, set| {
+        t.rep == rep || (!t.set.is_empty() && t.within(set))
+    };
+    let (x, y, cmp) = if is(tx, Rep::I32, TypeSet::SMALL) && is(ty, Rep::I32, TypeSet::SMALL) {
+        (b.as_i32(x), b.as_i32(y), Op::ICmp(Cc::Lt))
+    } else if is(tx, Rep::F64, TypeSet::FLOAT) && is(ty, Rep::F64, TypeSet::FLOAT) {
+        (b.as_f64(x), b.as_f64(y), Op::FCmp(Cc::Lt))
+    } else {
+        return None;
+    };
+    let lt = if max {
+        b.ins(cmp, &[x, y])
+    } else {
+        b.ins(cmp, &[y, x])
+    };
+    Some(b.ins(Op::Select, &[lt, y, x]))
 }
 
 /// What `type` answers for values of `set`, when they share it.
@@ -332,8 +377,9 @@ fn const_value<'gc>(b: &Builder<'_, 'gc>, v: Val) -> Option<Value<'gc>> {
     }
 }
 
-/// The math intrinsics, `assert`, `pairs` and `ipairs`; false when the
-/// CALL's shape is not one they cover.
+/// The math intrinsics, `assert`, `pairs` and `ipairs`. An argument their
+/// inline code does not take goes to the builtin (I1), but where an
+/// operation's own exit stops it (an overflow, a result outside i32).
 #[allow(clippy::too_many_arguments)]
 fn emit_math<'gc>(
     b: &mut Builder<'_, 'gc>,
@@ -344,14 +390,14 @@ fn emit_math<'gc>(
     c: u8,
     f: Function<'gc>,
     callee: Val,
-) -> bool {
+) -> Emitted {
     let insn = b.code(pc);
     let iterators = matches!(intr, Intrinsic::Pairs | Intrinsic::Ipairs);
     // An exit saw an argument the inline code does not take.
     let seen = b.feedback(pc) & fb::KINDS;
     let numbers = !matches!(intr, Intrinsic::Assert) && !iterators;
     if numbers && seen & !(fb::SMALL | fb::BIGINT | fb::FLOAT) != 0 {
-        return false;
+        return Emitted::No;
     }
     // A tail call or MULTRET wants all results; the iterators make up to
     // four, the others one.
@@ -362,12 +408,14 @@ fn emit_math<'gc>(
         || (intr != Intrinsic::Assert && nargs != 1)
         || nargs == 0
     {
-        return false;
+        return Emitted::No;
     }
     let k = b.konst(Value::function(f));
     let cv = b.boxed(callee);
     b.ins_exit(Op::GuardSame, &[cv, k], ExitTag::Const);
     let x = b.reg(a + 4);
+    // Where the builtin runs instead.
+    let mut slow = None;
     if iterators {
         let x = b.boxed(x);
         let (iter, control) = if intr == Intrinsic::Pairs {
@@ -378,8 +426,7 @@ fn emit_math<'gc>(
                 &[t, t],
             );
             let none = b.ins(Op::IsType(TypeSet::NIL), &[mm]);
-            let s = b.snap_before();
-            b.ins_snap(Op::GuardTrue, &[none], s, ExitTag::Slow);
+            slow = Some(fallback(b, none, true));
             (b.ctx.next_fn(), Value::nil())
         } else {
             (b.ctx.ipairs_iter(), Value::small(0))
@@ -393,7 +440,7 @@ fn emit_math<'gc>(
         for (k, &r) in results.iter().take(c as usize - 1).enumerate() {
             b.set(a + k as u8, r);
         }
-        return true;
+        return done(slow, k);
     }
     let r = match intr {
         Intrinsic::Sqrt | Intrinsic::Sin | Intrinsic::Cos => {
@@ -449,10 +496,8 @@ fn emit_math<'gc>(
                 let i = b.ins(Op::Unbox(Rep::I32), &[xv]);
                 let r = abs_i32(b, i);
                 arm_end(b, join, a, r);
-                b.switch_to(other);
-                b.deopt(ExitTag::Slow);
                 enter_join(b, join);
-                return true;
+                return Emitted::Fallback(other, k);
             }
         }
         Intrinsic::Pairs | Intrinsic::Ipairs => unreachable!("returned above"),
@@ -461,15 +506,33 @@ fn emit_math<'gc>(
             // A falsy one raises in the builtin.
             let xv = b.boxed(x);
             let falsy = b.ins(Op::IsFalsy, &[xv]);
-            let s = b.snap_before();
-            b.ins_snap(Op::GuardFalse, &[falsy], s, ExitTag::Slow);
+            slow = Some(fallback(b, falsy, false));
             xv
         }
     };
     if c == 2 {
         b.set(a, r);
     }
-    true
+    done(slow, k)
+}
+
+/// Go on where `cond` is `holds`, the returned block taking the other way.
+fn fallback(b: &mut Builder<'_, '_>, cond: Val, holds: bool) -> Block {
+    let (slow, ok) = (b.new_sealed_succ(), b.new_sealed_succ());
+    if holds {
+        b.br(cond, ok, slow);
+    } else {
+        b.br(cond, slow, ok);
+    }
+    b.switch_to(ok);
+    slow
+}
+
+fn done(slow: Option<Block>, k: Val) -> Emitted {
+    match slow {
+        Some(s) => Emitted::Fallback(s, k),
+        None => Emitted::Done,
+    }
 }
 
 /// `|x|` of an i32; `abs(i32::MIN)` leaves i32 and exits to the builtin.

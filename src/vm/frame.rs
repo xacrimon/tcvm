@@ -346,11 +346,14 @@ impl<'gc> Frame<'gc> {
     }
 
     /// Whether header words 2 and 3 are dead: the walk finds the caller of
-    /// a frame returning through `ret_to_native` in its level's record and
-    /// a fast-called one's through its native frame, and a fast call leaves
-    /// them holding whatever was there.
+    /// a frame returning through `ret_to_native` in its level's record, of
+    /// one through `ret_shim` in `ThreadState::shim`, and of a fast-called
+    /// one through its native frame, and calls from compiled code leave them
+    /// holding whatever was there.
     pub(crate) fn caller_words_dead(&self) -> bool {
-        self.ret & !flag::MASK == crate::vm::stack::ret_to_native_bits()
+        let ret = self.ret & !flag::MASK;
+        ret == crate::vm::stack::ret_to_native_bits()
+            || ret == crate::vm::stack::ret_shim_bits()
             || self.compiled.is_some_and(|(fp, ..)| {
                 // SAFETY: a compiled frame's saved return address is at `fp + 8`.
                 unsafe { *((fp + 8) as *const usize) != crate::vm::stack::level_ret() }
@@ -400,6 +403,7 @@ pub(crate) fn frames<'gc>(ts: &ThreadState<'gc>) -> Walk<'gc> {
         pc: ts.top_pc,
         rec: ts.record,
         level: ts.record,
+        shim: ts.shim,
         cross: false,
         compiled: None,
         elided: None,
@@ -414,11 +418,13 @@ pub(crate) struct Walk<'gc> {
     /// The innermost entry record not crossed yet.
     rec: usize,
     level: usize,
+    /// `ThreadState::shim`.
+    shim: [usize; 2],
     /// The frame just walked was a level's first: its caller is compiled.
     cross: bool,
     /// Walking compiled frames: the next one's frame pointer, return
-    /// address, and its callee's base (or, for the first, `BASE` from the
-    /// record and whether that is its own).
+    /// address, and its callee's base; for the first, whether that may be
+    /// `BASE` from a record, the frame's own where its site is a level's.
     compiled: Option<(usize, usize, *mut Value<'gc>, bool)>,
     elided: Option<Frame<'gc>>,
 }
@@ -504,10 +510,13 @@ impl<'gc> Iterator for Walk<'gc> {
 impl<'gc> Walk<'gc> {
     /// Go on to the caller of `f`, whose header names it: through its
     /// caller words, or below its level for a level's first frame, whose
-    /// caller is compiled.
+    /// caller is compiled, as is a native's that `jit_call_native` runs.
     fn header_caller(&mut self, f: &Frame<'gc>) {
-        if f.ret & !flag::MASK == crate::vm::stack::ret_to_native_bits() {
+        let ret = f.ret & !flag::MASK;
+        if ret == crate::vm::stack::ret_to_native_bits() {
             self.cross = true;
+        } else if ret == crate::vm::stack::ret_shim_bits() {
+            self.compiled = Some((self.shim[0], self.shim[1], f.base, true));
         } else {
             unsafe { (self.pc, self.base) = (caller_pc(f.base), caller_base(f.base)) };
         }

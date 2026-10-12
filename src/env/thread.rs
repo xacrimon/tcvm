@@ -116,6 +116,10 @@ pub struct ThreadState<'gc> {
     /// return address instead of `blr` (5.4): this level's return address
     /// stack is full from here.
     pub(crate) native_deep: usize,
+    /// The frame pointer and return address of the compiled code a native
+    /// runs for through `jit_call_native` (I1): its frame's caller while
+    /// the frame returns through `ret_shim`.
+    pub(crate) shim: [usize; 2],
     /// The function a seeded thread calls, until it gets its stack.
     pub(crate) entry: Option<Value<'gc>>,
     /// Logical stack top: the end of the value-passing window. Multires
@@ -577,6 +581,7 @@ impl<'gc> Thread<'gc> {
             record: 0,
             native_limit: 0,
             native_deep: 0,
+            shim: [0; 2],
             entry: None,
             top: 0,
             top_base: std::ptr::null_mut(),

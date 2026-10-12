@@ -8,7 +8,7 @@ use regalloc2::{Block as RBlock, Operand, PRegSet, RegClass, VReg};
 use crate::env::value::Value;
 use crate::jit::backend::aarch64::abi::{allocatable, caller_saved, preg_float, preg_int};
 use crate::jit::backend::aarch64::asm::{Asm, Cond, Sz};
-use crate::jit::backend::aarch64::inst::{AluOp, ENTRY_FAIL, FOp, FUnOp, MInst, Test};
+use crate::jit::backend::aarch64::inst::{AluOp, ENTRY_FAIL, FOp, FUnOp, Known, MInst, Test};
 use crate::jit::backend::vcode::VCode;
 use crate::jit::ir::ops::{Cc, ExitTag, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
@@ -78,7 +78,7 @@ struct Lower<'a, 'gc> {
     box_reg: Option<VReg>,
     /// Stores a known call writes itself, and its callee (D2).
     absorbed: Vec<bool>,
-    known: crate::jit::FastMap<Inst, (u64, u64, u8)>,
+    known: crate::jit::FastMap<Inst, Known>,
 }
 
 fn rep_class(rep: Rep) -> RegClass {
@@ -255,8 +255,8 @@ impl<'a, 'gc> Lower<'a, 'gc> {
 
     /// Mark compares used once, by a branch, guard or select of the same
     /// block, to be computed there.
-    /// Calls of a constant Lua closure without varargs (D2), whose store to
-    /// the call's slot nothing between reads.
+    /// Calls of a constant Lua closure without varargs (D2) or native (I1),
+    /// whose store to the call's slot nothing between reads.
     fn find_known_callees(&mut self, order: &[Block]) {
         use crate::jit::ir::ops::Mem;
         for &b in order {
@@ -273,16 +273,23 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                         let Some(Op::KObj(p)) = self.f.def_op(self.f.args(j)[0]) else {
                             break;
                         };
+                        use crate::env::function::FunctionKind;
                         let v = self.f.pool[p as usize];
-                        if let Some(func) = v.get_function()
-                            && let crate::env::function::FunctionKind::Lua(c) =
-                                func.inner().as_ref()
-                            && !c.is_vararg
-                        {
+                        let known = match v.get_function().map(|f| f.inner().as_ref()) {
                             // The prototype word the fast path loads.
-                            let proto = c.proto.ptr.as_ptr() as u64;
+                            Some(FunctionKind::Lua(c)) if !c.is_vararg => Some(Known::Lua(
+                                v.to_raw(),
+                                c.proto.ptr.as_ptr() as u64,
+                                c.num_params,
+                            )),
+                            Some(FunctionKind::Native(nc)) => {
+                                Some(Known::Native(nc as *const _ as u64))
+                            }
+                            _ => None,
+                        };
+                        if let Some(k) = known {
                             self.absorbed[j.idx()] = true;
-                            self.known.insert(t, (v.to_raw(), proto, c.num_params));
+                            self.known.insert(t, k);
                         }
                         break;
                     }

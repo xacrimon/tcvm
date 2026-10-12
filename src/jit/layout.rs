@@ -22,6 +22,8 @@ pub(crate) const NATIVE_LIMIT: usize =
     offset_of!(crate::env::thread::ThreadState<'static>, native_limit);
 pub(crate) const NATIVE_DEEP: usize =
     offset_of!(crate::env::thread::ThreadState<'static>, native_deep);
+/// `ThreadState::shim`, from the `thread` register.
+pub(crate) const SHIM: usize = offset_of!(crate::env::thread::ThreadState<'static>, shim);
 /// `JitRuntime::level_ret` and `jump_target`, from `rt`.
 pub(crate) const LEVEL_RET: usize = JIT + offset_of!(JitRuntime, level_ret);
 pub(crate) const JUMP_TARGET: usize = JIT + offset_of!(JitRuntime, jump_target);
@@ -75,6 +77,9 @@ pub(crate) const FN_MAX_STACK: usize =
     FN_LUA + offset_of!(crate::env::function::LuaClosure<'static>, max_stack_size);
 pub(crate) const FN_IS_VARARG: usize =
     FN_LUA + offset_of!(crate::env::function::LuaClosure<'static>, is_vararg);
+/// A native function's closure, from its function's payload.
+pub(crate) const FN_NATIVE: usize =
+    offset_of!(crate::env::function::FunctionKind<'static>, Native.0);
 /// A function value's top 16 bits (`QNAN_NEG | TAG_FUNCTION << 48`).
 pub(crate) const FUNCTION_TAG: u16 = 0xFFF8 | 5;
 /// A Lua closure's prototype pointer (a `Gc`, so the box), and from that
