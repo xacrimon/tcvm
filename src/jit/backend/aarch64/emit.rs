@@ -47,6 +47,8 @@ pub(crate) struct SiteOut {
     pub(crate) keys: Vec<Label>,
     pub(crate) entries: Vec<SnapEntry>,
     pub(crate) consts: Vec<u64>,
+    /// A call's header slot, slow resume and `pc` after it (D4).
+    pub(crate) call: Option<(u16, Label, u64)>,
 }
 
 pub(crate) struct ExitOut {
@@ -119,6 +121,9 @@ struct Em<'a> {
     /// Per resume block with a call site, where a return through the
     /// header lands: the frame opened again and its values read back.
     slow_resume: Vec<Label>,
+    /// Per resume block, past the fast resume's `BASE`, which the slow one
+    /// reads from the header instead.
+    resume_based: Vec<Label>,
     /// The word holding the region pointer, which each frame records.
     region_word: Label,
     /// The stub every way out of compiled code calls (C1).
@@ -237,6 +242,7 @@ pub(crate) fn emit(
     let entry_fail = a.new_label();
     let fast_resume = (0..l.vcode.blocks.len()).map(|_| a.new_label()).collect();
     let slow_resume = (0..l.vcode.blocks.len()).map(|_| a.new_label()).collect();
+    let resume_based = (0..l.vcode.blocks.len()).map(|_| a.new_label()).collect();
     let region_word = a.new_label();
     let leave_stub = a.new_label();
     let mut em = Em {
@@ -253,6 +259,7 @@ pub(crate) fn emit(
         fired,
         fast_resume,
         slow_resume,
+        resume_based,
         region_word,
         leave_stub,
         sites: Vec::new(),
@@ -349,7 +356,8 @@ pub(crate) fn emit(
         // The frame holds nothing yet; a compiled caller's does.
         em.a.mov(Gpr(0), RT);
         em.a.ldp(Gpr(1), Gpr(2), FP, 0);
-        em.a.ldr(Gpr(3), BASE, -16);
+        em.a.mov(Gpr(3), BASE);
+        em.a.movz(Sz::X, Gpr(4), 1, 0);
         em.a.bl_far(em.helpers.leave);
         em.leave();
         em.a.ldr_label(INSN, region_word);
@@ -364,6 +372,7 @@ pub(crate) fn emit(
     em.a.mov(Gpr(1), FP);
     em.a.mov(Gpr(2), LR);
     em.a.mov(Gpr(3), BASE);
+    em.a.movz(Sz::X, Gpr(4), 0, 0);
     em.a.bl_far(em.helpers.leave);
     em.leave();
     em.a.br(Gpr(19));
@@ -374,7 +383,7 @@ pub(crate) fn emit(
         em.a.bind(em.slow_resume[*blk]);
         em.open_frame();
         // The callee's header word 2 is this frame's base.
-        em.a.ldr(X17, BASE, -16);
+        em.a.ldr(BASE, BASE, -16);
         let allocs = em.allocs(site.inst).to_vec();
         let base = l.snap_ops[site.inst] as usize;
         for &(reg, rep, src) in &site.entries {
@@ -385,7 +394,7 @@ pub(crate) fn emit(
                 .as_stack()
                 .ok_or("a kept value outside the frame")?
                 .index();
-            em.a.ldr(X16, X17, reg as i32 * 8);
+            em.a.ldr(X16, BASE, reg as i32 * 8);
             match rep {
                 SRep::B1 => {
                     em.a.mov_imm(Gpr(9), FALSE);
@@ -416,7 +425,7 @@ pub(crate) fn emit(
             em.a.ldr(Gpr(0), PC, 0);
             em.a.bind(done);
         }
-        em.a.b(em.fast_resume[*blk]);
+        em.a.b(em.resume_based[*blk]);
     }
     if fast_label.is_some() {
         // Back to the caller's slow path: the call through `enter` from the
@@ -428,7 +437,8 @@ pub(crate) fn emit(
         em.a.mov(Gpr(0), RT);
         em.a.mov(Gpr(1), FP);
         em.a.mov(Gpr(2), LR);
-        em.a.ldr(Gpr(3), BASE, -16);
+        em.a.mov(Gpr(3), BASE);
+        em.a.movz(Sz::X, Gpr(4), 1, 0);
         em.a.bl_far(em.helpers.leave);
         em.a.movz(Sz::X, X16, FUNCTION_TAG, 3);
         em.a.orr(Sz::X, X16, X16, CLOSURE);
@@ -557,7 +567,6 @@ impl Em<'_> {
     /// Every register is free here: what lives across the call is in the
     /// frame (C1). Returns the return address `blr` leaves.
     fn fast_call(&mut self, hdr: i32, block: usize, slow: Label) -> Label {
-        let fast_resume = self.fast_resume[self.v.succs(block)[0].index()];
         self.a.ldr(X16, BASE, hdr);
         self.a.lsr_imm(Sz::X, X17, X16, 48);
         self.a.movz(Sz::W, Gpr(9), FUNCTION_TAG, 0);
@@ -569,6 +578,22 @@ impl Em<'_> {
         self.a.ldr(X17, X16, layout::FN_PROTO as i32);
         self.a.ldr(X17, X17, layout::PROTO_FAST as i32);
         self.a.cbz(Sz::X, X17, slow);
+        self.fast_enter(hdr, block)
+    }
+
+    /// `fast_call` for a known callee (D2): its prototype's fast entry, or
+    /// `slow`; word 0 the closure word.
+    fn known_call(&mut self, hdr: i32, block: usize, slow: Label, f: u64, proto: u64) -> Label {
+        self.a.mov_imm(X17, proto);
+        self.a.ldr(X17, X17, layout::PROTO_FAST as i32);
+        self.a.cbz(Sz::X, X17, slow);
+        self.a.mov_imm(X16, f & PTR_MASK);
+        self.fast_enter(hdr, block)
+    }
+
+    /// Enter the fast entry in x17 of the closure in x16 (`fast_call`).
+    fn fast_enter(&mut self, hdr: i32, block: usize) -> Label {
+        let fast_resume = self.fast_resume[self.v.succs(block)[0].index()];
         self.a.str(X16, BASE, hdr);
         self.a.add_imm(Sz::X, BASE, BASE, hdr as u64 + 32);
         self.a.mov(CLOSURE, X16);
@@ -593,7 +618,13 @@ impl Em<'_> {
 
     /// Call the leave stub: the site the address past the `bl` names, with
     /// `entries` of this frame to write (none where all is in its slots).
-    fn leave_site(&mut self, mut keys: Vec<Label>, entries: Vec<SnapEntry>, consts: Vec<u64>) {
+    fn leave_site(
+        &mut self,
+        mut keys: Vec<Label>,
+        entries: Vec<SnapEntry>,
+        consts: Vec<u64>,
+        call: Option<(u16, Label, u64)>,
+    ) {
         self.a.bl(self.leave_stub);
         let k = self.a.new_label();
         self.a.bind(k);
@@ -602,7 +633,18 @@ impl Em<'_> {
             keys,
             entries,
             consts,
+            call,
         });
+    }
+
+    /// Header words 1-3 of a call at `hdr` (bytes), which only a call that
+    /// leaves compiled code writes itself (D4).
+    fn header_words(&mut self, hdr: i32, resume: Label, pc_after: usize) {
+        self.a.adr(X16, resume);
+        self.a.str(X16, BASE, hdr + 8);
+        self.a.str(BASE, BASE, hdr + 16);
+        self.a.ldr_lit(X16, pc_after as u64);
+        self.a.str(X16, BASE, hdr + 24);
     }
 
     /// The values a call at VCode instruction `i` keeps in the frame: its
@@ -1504,14 +1546,14 @@ impl Em<'_> {
                     }
                 }
             }
-            Call { a, nargs, pc_after } => {
+            Call {
+                a,
+                nargs,
+                pc_after,
+                known,
+            } => {
                 let resume = self.slow_resume[self.v.succs(block)[0].index()];
                 let hdr = a as i32 * 8;
-                self.a.adr(X16, resume);
-                self.a.str(X16, BASE, hdr + 8);
-                self.a.str(BASE, BASE, hdr + 16);
-                self.a.ldr_lit(X16, pc_after as u64);
-                self.a.str(X16, BASE, hdr + 24);
                 if nargs == u8::MAX {
                     let n = self.r(i, 0);
                     self.a.mov(INSN, n);
@@ -1519,16 +1561,25 @@ impl Em<'_> {
                     self.a.movz(Sz::X, INSN, nargs as u16, 0);
                 }
                 let slow = self.a.new_label();
-                let ret = self.fast_call(hdr, block, slow);
+                let ret = match known {
+                    Some((f, proto)) => self.known_call(hdr, block, slow, f, proto),
+                    None => self.fast_call(hdr, block, slow),
+                };
                 self.a.bind(slow);
                 let fast = self.fast_resume[self.v.succs(block)[0].index()];
                 let (entries, consts) = self.site_entries(i, block);
-                self.leave_site(vec![ret, fast], entries, consts);
+                let call = Some((a as u16, resume, pc_after as u64));
+                self.leave_site(vec![ret, fast], entries, consts, call);
+                if let Some((f, _)) = known {
+                    self.a.mov_imm(X16, f);
+                    self.a.str(X16, BASE, hdr);
+                }
+                self.header_words(hdr, resume, pc_after);
                 self.a.add_imm(Sz::X, PC, BASE, hdr as u64);
                 self.a.b_far(self.helpers.enter);
             }
             Dispatch { op, word, pc_after } => {
-                self.leave_site(Vec::new(), Vec::new(), Vec::new());
+                self.leave_site(Vec::new(), Vec::new(), Vec::new(), None);
                 self.a.ldr_lit(INSN, word);
                 self.a.ldr_lit(PC, pc_after as u64);
                 self.a.ldr(X16, RT, op as i32 * 8);
@@ -1567,7 +1618,7 @@ impl Em<'_> {
                 self.close_frame();
                 self.a.br(X16);
                 self.a.bind(dispatch);
-                self.leave_site(Vec::new(), Vec::new(), Vec::new());
+                self.leave_site(Vec::new(), Vec::new(), Vec::new(), None);
                 self.a.ldr(X16, CLOSURE, layout::FN_CODE as i32);
                 self.a.ldr(INSN, X16, 0);
                 self.a.add_imm(Sz::X, PC, X16, 8);
@@ -1575,11 +1626,12 @@ impl Em<'_> {
                 self.a.ldr_idx(X16, RT, X17, Extend::Lsl, true);
                 self.a.br(X16);
             }
-            Resume { wanted, c, a } => {
+            Resume { wanted, c, a, hdr } => {
                 self.a.bind(self.fast_resume[block]);
-                // The callee's header word 2 is this frame's base; its word 0
-                // our closure.
-                self.a.ldr(BASE, BASE, -16);
+                // The callee's base is past the header at `hdr`; our header's
+                // word 0 is our closure.
+                self.a.sub_imm(Sz::X, BASE, BASE, hdr as u64 * 8 + 32);
+                self.a.bind(self.resume_based[block]);
                 self.a.ldr(CLOSURE, BASE, -32);
                 self.a.and_imm(Sz::X, CLOSURE, CLOSURE, PTR_MASK);
                 match wanted {
@@ -1620,18 +1672,15 @@ impl Em<'_> {
                     let at = if k == 0 { h } else { h + 24 + 8 * k as i32 };
                     self.a.str(v, BASE, at);
                 }
-                self.a.adr(X16, resume);
-                self.a.str(X16, BASE, h + 8);
-                self.a.str(BASE, BASE, h + 16);
-                self.a.ldr_lit(X16, pc_after as u64);
-                self.a.str(X16, BASE, h + 24);
                 self.a.movz(Sz::X, INSN, nargs as u16, 0);
                 let slow = self.a.new_label();
                 let ret = self.fast_call(h, block, slow);
                 self.a.bind(slow);
                 let fast = self.fast_resume[self.v.succs(block)[0].index()];
                 let (entries, consts) = self.site_entries(i, block);
-                self.leave_site(vec![ret, fast], entries, consts);
+                let call = Some((hdr, resume, pc_after as u64));
+                self.leave_site(vec![ret, fast], entries, consts, call);
+                self.header_words(h, resume, pc_after);
                 self.a.add_imm(Sz::X, PC, BASE, h as u64);
                 self.a.b_far(self.helpers.enter);
             }

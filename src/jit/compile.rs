@@ -351,14 +351,19 @@ pub(crate) fn compile<'gc>(
     let fast_entry = em
         .fast
         .map_or(std::ptr::null(), |l| start.wrapping_add(em.asm.label_offset(l)));
-    let site_keys: Vec<Vec<u32>> = em
+    let site_keys: Vec<(Vec<u32>, Option<(u16, u32, u64)>)> = em
         .sites
         .iter()
         .map(|s| {
-            s.keys
+            let keys = s
+                .keys
                 .iter()
                 .map(|&k| em.asm.label_offset(k) as u32)
-                .collect()
+                .collect();
+            let call = s
+                .call
+                .map(|(h, r, pc)| (h, em.asm.label_offset(r) as u32, pc));
+            (keys, call)
         })
         .collect();
     let words = em
@@ -433,8 +438,8 @@ pub(crate) fn compile<'gc>(
         });
     }
     // The sites, their snapshots after the exits'.
-    let mut sites: Vec<(u32, u32)> = Vec::new();
-    for (site, keys) in em.sites.iter_mut().zip(&site_keys) {
+    let mut sites: Vec<crate::jit::region::Site> = Vec::new();
+    for (site, (keys, call)) in em.sites.iter_mut().zip(&site_keys) {
         for s in &mut site.entries {
             if let crate::jit::region::Loc::Const(c) = s.loc {
                 let w = site.consts[c as usize];
@@ -453,9 +458,16 @@ pub(crate) fn compile<'gc>(
             &[],
             &site.entries,
         );
-        sites.extend(keys.iter().map(|&k| (k, at)));
+        let (hdr, resume, pc_after) = call.unwrap_or((u16::MAX, 0, 0));
+        sites.extend(keys.iter().map(|&key| crate::jit::region::Site {
+            key,
+            snap: at,
+            hdr,
+            resume,
+            pc_after,
+        }));
     }
-    sites.sort_unstable();
+    sites.sort_unstable_by_key(|s| s.key);
     let known = closure.proto.jit.get().map_or((0, 0), |s| {
         let s = s.borrow();
         (s.kind_exits.len() as u32, s.shapes_seen.len() as u32)

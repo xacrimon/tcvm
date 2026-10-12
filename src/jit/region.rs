@@ -219,10 +219,24 @@ pub(crate) struct Region<'gc> {
     #[collect(require_static)]
     pub(crate) exit_hot: Cell<u32>,
     /// Where control may leave compiled code while a frame of this region
-    /// is live (C1): (code offset of the return address naming the site,
-    /// its snapshot in `snaps`), by offset.
+    /// is live (C1), by the code offset of the return address naming them.
     #[collect(require_static)]
-    pub(crate) sites: Box<[(u32, u32)]>,
+    pub(crate) sites: Box<[Site]>,
+}
+
+/// A place compiled code leaves from with this region's frame live.
+#[derive(Clone, Copy)]
+pub(crate) struct Site {
+    /// The code offset of the return address naming it.
+    pub(crate) key: u32,
+    /// Its snapshot in `snaps`.
+    pub(crate) snap: u32,
+    /// A call's header slot (`u16::MAX` for none), and the header words a
+    /// fast call does not write (D4): the slow resume's code offset and the
+    /// `pc` after the call.
+    pub(crate) hdr: u16,
+    pub(crate) resume: u32,
+    pub(crate) pc_after: u64,
 }
 
 impl<'gc> Region<'gc> {
@@ -230,11 +244,12 @@ impl<'gc> Region<'gc> {
         SnapView::decode(&self.snaps[e.snap as usize..])
     }
 
-    /// The snapshot of the site whose return address is `ra`.
-    pub(crate) fn site(&self, ra: usize) -> Option<SnapView<'_>> {
+    /// The site whose return address is `ra`, and its snapshot.
+    pub(crate) fn site(&self, ra: usize) -> Option<(&Site, SnapView<'_>)> {
         let off = ra.checked_sub(self.code.rx() as usize)? as u32;
-        let k = self.sites.binary_search_by_key(&off, |s| s.0).ok()?;
-        Some(SnapView::decode(&self.snaps[self.sites[k].1 as usize..]))
+        let k = self.sites.binary_search_by_key(&off, |s| s.key).ok()?;
+        let s = &self.sites[k];
+        Some((s, SnapView::decode(&self.snaps[s.snap as usize..])))
     }
 }
 

@@ -74,6 +74,9 @@ struct Lower<'a, 'gc> {
     /// `BOX` they share when there are two or more (A7.4).
     float_guards: u32,
     box_reg: Option<VReg>,
+    /// Stores a known call writes itself, and its callee (D2).
+    absorbed: Vec<bool>,
+    known: crate::jit::FastMap<Inst, (u64, u64)>,
 }
 
 fn rep_class(rep: Rep) -> RegClass {
@@ -143,8 +146,11 @@ pub(crate) fn lower<'gc>(f: &Func<'gc>, code_base: usize) -> Result<Lowered, Str
         pc_base: code_base,
         float_guards: 0,
         box_reg: None,
+        absorbed: vec![false; f.insts.len()],
+        known: Default::default(),
     };
     lw.find_fusions(order);
+    lw.find_known_callees(order);
     let mut params: Vec<VReg> = Vec::new();
     let mut succs: Vec<RBlock> = Vec::new();
     let mut args: Vec<VReg> = Vec::new();
@@ -247,6 +253,56 @@ impl<'a, 'gc> Lower<'a, 'gc> {
 
     /// Mark compares used once, by a branch, guard or select of the same
     /// block, to be computed there.
+    /// Calls of a constant Lua closure without varargs (D2), whose store to
+    /// the call's slot nothing between reads.
+    fn find_known_callees(&mut self, order: &[Block]) {
+        use crate::jit::ir::ops::Mem;
+        use crate::jit::layout::{FN_IS_VARARG, FN_PROTO, FUNCTION_TAG};
+        for &b in order {
+            let Some(t) = self.f.terminator(b) else {
+                continue;
+            };
+            let Op::Call { a, .. } = self.f.op(t) else {
+                continue;
+            };
+            for &j in self.f.insts_of(b).iter().rev().skip(1) {
+                let op = self.f.op(j);
+                match op {
+                    Op::Store(r) if r == a => {
+                        let Some(Op::KObj(p)) = self.f.def_op(self.f.args(j)[0]) else {
+                            break;
+                        };
+                        let bits = self.f.pool[p as usize].to_raw();
+                        if (bits >> 48) as u16 != FUNCTION_TAG {
+                            break;
+                        }
+                        let ptr = (bits & crate::vm::frame::PTR_MASK) as usize;
+                        // SAFETY: the pool keeps the closure, a Lua one when
+                        // its vararg byte is 0, and so its prototype alive.
+                        let (vararg, proto) = unsafe {
+                            (
+                                *((ptr + FN_IS_VARARG) as *const u8),
+                                *((ptr + FN_PROTO) as *const usize),
+                            )
+                        };
+                        if vararg == 0 {
+                            self.absorbed[j.idx()] = true;
+                            self.known.insert(t, (bits, proto as u64));
+                        }
+                        break;
+                    }
+                    Op::Store(_) => {}
+                    op if op.effects().reads.intersects(Mem::SLOT)
+                        || op.effects().writes.intersects(Mem::SLOT) =>
+                    {
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     fn find_fusions(&mut self, order: &[Block]) {
         for &b in order {
             for &i in self.f.insts_of(b) {
@@ -479,6 +535,9 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             return Ok(());
         }
         let none = PRegSet::empty();
+        if self.absorbed[i.idx()] {
+            return Ok(());
+        }
         match op {
             Op::KVal(b) => {
                 let d = self.def(res.unwrap());
@@ -1133,9 +1192,9 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 self.push(m, &ops, clob);
             }
             Op::Resume { c } => {
-                let a = match self.f.blocks[self.f.insts[i.idx()].block.idx()].resume {
+                let (a, hdr) = match self.f.blocks[self.f.insts[i.idx()].block.idx()].resume {
                     true => self.resume_a(i),
-                    false => 0,
+                    false => (0, 0),
                 };
                 // Nothing is in a register here: what lives across the call
                 // is in the frame (C1), and its reloads come after. The
@@ -1155,7 +1214,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     Vec::new()
                 };
                 let wanted = if c == 2 || c == 3 { c - 1 } else { 0 };
-                self.push(MInst::Resume { wanted, c, a }, &ops, clob);
+                self.push(MInst::Resume { wanted, c, a, hdr }, &ops, clob);
             }
             Op::Jump => {
                 self.push(MInst::Jump, &[], none);
@@ -1173,7 +1232,17 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             Op::Call { a, nargs, pc, .. } => {
                 let pc_after = self.pc_base + (pc as usize + 1) * 8;
                 let ops: Vec<Operand> = args.iter().map(|&x| self.use_(x)).collect();
-                self.push_call(i, MInst::Call { a, nargs, pc_after }, ops);
+                let known = self.known.get(&i).copied();
+                self.push_call(
+                    i,
+                    MInst::Call {
+                        a,
+                        nargs,
+                        pc_after,
+                        known,
+                    },
+                    ops,
+                );
             }
             Op::Dispatch { pc, word } => {
                 let pc_after = self.pc_base + (pc as usize + 1) * 8;
@@ -1242,19 +1311,20 @@ impl<'a, 'gc> Lower<'a, 'gc> {
         Ok(())
     }
 
-    /// The `a` of the call a resume block resumes, from its predecessor's
-    /// terminator.
-    fn resume_a(&self, i: Inst) -> u8 {
+    /// The `a` and the header slot of the call a resume block resumes,
+    /// from its predecessor's terminator.
+    fn resume_a(&self, i: Inst) -> (u8, u16) {
         let b = self.f.insts[i.idx()].block;
         for &p in self.f.cfg().preds(b) {
             if let Some(t) = self.f.terminator(p) {
                 match self.f.op(t) {
-                    Op::Call { a, .. } | Op::CallMm { land: a, .. } => return a,
+                    Op::Call { a, .. } => return (a, a as u16),
+                    Op::CallMm { land, .. } => return (land, self.f.meta.max_stack as u16),
                     _ => {}
                 }
             }
         }
-        0
+        (0, 0)
     }
 }
 

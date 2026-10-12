@@ -270,6 +270,10 @@ pub(crate) enum MInst {
         a: u8,
         nargs: u8,
         pc_after: usize,
+        /// A constant non-vararg Lua callee (D2): its value and prototype.
+        /// The call writes word 0 itself, the closure word on the fast path
+        /// and the value on the slow one.
+        known: Option<(u64, u64)>,
     },
     /// `[use f, use args.., site..]`: a metamethod call from a header at
     /// slot `hdr` (the frame's register count); succ 0 is the resume block.
@@ -301,6 +305,8 @@ pub(crate) enum MInst {
         wanted: u8,
         c: u8,
         a: u8,
+        /// The call's header slot: the callee's base is `hdr + 4` past ours.
+        hdr: u16,
     },
     /// Return `n` results from `R[a..]`, the first (or nil) also in x0
     /// (D3): `[use x0]` when `x0`, else it is read from its slot.
