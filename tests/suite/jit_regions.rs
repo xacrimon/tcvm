@@ -1334,3 +1334,40 @@ fn int_compares_against_float_constants() {
 "##,
     );
 }
+
+/// Results of compiled callees in registers (D3): none, one (stored,
+/// in its slot already, a float, a constant), two and three into one and
+/// two wanted, varargs, deep chains and returns through the interpreter.
+#[test]
+fn call_results() {
+    agrees(
+        r##"
+        local function r0() end
+        local function r1(x) return x end
+        local function r1f(x) return x * 0.5 end
+        local function r1k() return 42 end
+        local function r2(x) return x, x + 1 end
+        local function r3(x) return x, x + 1, x + 2 end
+        local function rv(...) return ... end
+        local function deep(n) if n == 0 then return "d" end return (deep(n - 1)) end
+        local function odd(x) if x % 7 == 0 then return "s" .. x end return x end
+        local out = {}
+        for i = 1, 500 do
+            local a = r0()
+            local b = r1(i)
+            local c = r1f(i)
+            local d = r1k()
+            local e, f = r2(i)
+            local g, h = r1(i)
+            local j, k = r3(i)
+            local m = rv(i, 2)
+            local n = deep(10)
+            local o = odd(i)
+            local p, q = r0()
+            out[1] = tostring(a) .. b .. c .. d .. e .. f .. g .. tostring(h) .. j .. k
+                .. m .. n .. o .. tostring(p) .. tostring(q)
+        end
+        return out[1]
+"##,
+    );
+}

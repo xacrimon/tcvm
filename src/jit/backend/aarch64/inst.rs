@@ -302,10 +302,12 @@ pub(crate) enum MInst {
         c: u8,
         a: u8,
     },
-    /// Return `n` results from `R[a..]`.
+    /// Return `n` results from `R[a..]`, the first (or nil) also in x0
+    /// (D3): `[use x0]` when `x0`, else it is read from its slot.
     Return {
         a: u8,
         n: u8,
+        x0: bool,
     },
     /// `[snap..]`.
     Deopt {

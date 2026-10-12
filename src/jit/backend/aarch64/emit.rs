@@ -407,6 +407,15 @@ pub(crate) fn emit(
             }
             em.a.str(X16, FP, spill_off(slot));
         }
+        // A return through the header leaves no result in x0.
+        let first = l.vcode.blocks[*blk].start as usize;
+        if let MInst::Resume { wanted: 1.., .. } = l.vcode.insts[first] {
+            let done = em.a.new_label();
+            em.a.mov_imm(Gpr(0), NIL);
+            em.a.cbz(Sz::X, INSN, done);
+            em.a.ldr(Gpr(0), PC, 0);
+            em.a.bind(done);
+        }
         em.a.b(em.fast_resume[*blk]);
     }
     if fast_label.is_some() {
@@ -1586,24 +1595,16 @@ impl Em<'_> {
                         self.a.movz(Sz::X, Gpr(6), c as u16, 0);
                         self.a.bl_far(self.helpers.land);
                     }
+                    // The first result is in x0 (D3).
+                    1 => {}
                     _ => {
                         let done = self.a.new_label();
-                        self.a.mov_imm(X16, NIL);
-                        self.a.mov(X17, X16);
-                        self.a.cbz(Sz::X, INSN, done);
-                        self.a.ldr(X16, PC, 0);
-                        if wanted == 2 {
-                            self.a.cmp_imm(Sz::X, INSN, 1);
-                            self.a.b_cond(Cond::Eq, done);
-                            self.a.ldr(X17, PC, 8);
-                        }
+                        let d1 = self.r(i, 1);
+                        self.a.mov_imm(d1, NIL);
+                        self.a.cmp_imm(Sz::X, INSN, 2);
+                        self.a.b_cond(Cond::Lo, done);
+                        self.a.ldr(d1, PC, 8);
                         self.a.bind(done);
-                        let d0 = self.r(i, 0);
-                        self.a.mov(d0, X16);
-                        if wanted == 2 {
-                            let d1 = self.r(i, 1);
-                            self.a.mov(d1, X17);
-                        }
                     }
                 }
             }
@@ -1641,10 +1642,15 @@ impl Em<'_> {
                 let l = self.exit(exit);
                 self.a.b_cond(Cond::Hi, l);
             }
-            Return { a, n } => {
+            Return { a, n, x0 } => {
                 // A frame a compiled caller entered holds that caller's
                 // return address, any other dispatch's entry one (`leave`'s).
                 let slow = self.a.new_label();
+                if n == 0 {
+                    self.a.mov_imm(Gpr(0), NIL);
+                } else if !x0 {
+                    self.a.ldr(Gpr(0), BASE, a as i32 * 8);
+                }
                 self.close_frame();
                 self.a.movz(Sz::X, INSN, n as u16, 0);
                 self.a.add_imm(Sz::X, PC, BASE, a as u64 * 8);

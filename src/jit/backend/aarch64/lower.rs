@@ -1203,7 +1203,39 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 self.push_exit(i, |exit| MInst::GuardFits { end, exit }, vec![], none);
             }
             Op::Return { a, n } => {
-                self.push(MInst::Return { a, n }, &[], none);
+                // The value this block stored to `R[a]`, if a register has it.
+                let b = f.insts[i.idx()].block;
+                let mut stored = None;
+                for &j in f.insts_of(b).iter().rev().skip(1) {
+                    match f.op(j) {
+                        Op::Store(r) if r == a => {
+                            stored = Some(f.args(j)[0]);
+                            break;
+                        }
+                        op if op.effects().writes.contains(crate::jit::ir::ops::Mem::SLOT) => break,
+                        _ => {}
+                    }
+                }
+                let v = stored.filter(|&v| {
+                    n > 0
+                        && f.ty(v).rep == Rep::Val
+                        && match f.def_op(v) {
+                            // A float's box is its store's: no register has it.
+                            Some(Op::Box) => {
+                                f.ty(f.args(f.def_inst(v).unwrap())[0]).rep != Rep::F64
+                            }
+                            _ => true,
+                        }
+                });
+                match v {
+                    Some(v) => {
+                        let u = Operand::reg_fixed_use(self.vr(v), preg_int(0));
+                        self.push(MInst::Return { a, n, x0: true }, &[u], none);
+                    }
+                    None => {
+                        self.push(MInst::Return { a, n, x0: false }, &[], none);
+                    }
+                }
             }
             Op::Deopt => self.push_exit(i, |exit| MInst::Deopt { exit }, vec![], none),
         }
