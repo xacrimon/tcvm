@@ -204,25 +204,43 @@ fn entry_value<'gc>(mc: &crate::dmm::Mutation<'gc>, rep: SRep, w: u64) -> Value<
 /// Write the values of each region frame from `fp` down to dispatch's into
 /// their home slots before control leaves compiled code (C1): `lr` names
 /// the site in the frame at `fp` (a return address, or the address past a
-/// `bl` to the leave stub), whose base is `base`. A frame's caller is its
-/// frame record's, the caller's base its header's word 2.
+/// `bl` to the leave stub). `base` is that frame's, or with `below` the
+/// base of the frame it called. A frame's caller is its frame record's;
+/// each frame was entered by a fast call, so its base is the call's header
+/// slot plus 4 past its caller's, and its header's words 1-3 are written
+/// here from the caller's site (D4).
 pub(crate) unsafe extern "C" fn jit_leave(
     rt: *const crate::lua::State<'static>,
     fp: *const u64,
     lr: u64,
     base: *mut Value<'static>,
+    below: u64,
 ) {
     let ctx = unsafe { Context::from_state(rt) };
     let native = ctx.jit().native.fp.get();
     let (mut fp, mut lr, mut base) = (fp, lr, base);
+    let mut callee = if below != 0 {
+        base
+    } else {
+        std::ptr::null_mut()
+    };
     while fp as usize != native {
         // SAFETY: a region frame records its region, and its spill slots
-        // follow (`emit::FRAME_REGION`, `FRAME_SPILLS`).
+        // follow (`emit::FRAME_REGION`, `FRAME_SPILLS`); a callee's header
+        // is the 4 words under its base.
         unsafe {
             let region = &*(*fp.add(2) as *const Region<'static>);
-            let snap = region
+            let (site, snap) = region
                 .site((lr & !1) as usize)
                 .expect("a return address without its site");
+            if !callee.is_null() {
+                assert!(site.hdr != u16::MAX, "a frame under a site without a call");
+                base = callee.sub(site.hdr as usize + 4);
+                let h = callee as *mut u64;
+                h.sub(3).write(region.code.rx() as u64 + site.resume as u64);
+                h.sub(2).write(base as u64);
+                h.sub(1).write(site.pc_after);
+            }
             for s in snap.entries() {
                 let w = match s.loc {
                     Loc::Spill(i) => *fp.add(3 + i as usize),
@@ -232,9 +250,9 @@ pub(crate) unsafe extern "C" fn jit_leave(
                 base.add(s.reg as usize)
                     .write(entry_value(ctx.mutation(), s.rep, w));
             }
+            callee = base;
             lr = *fp.add(1);
             fp = *fp as *const u64;
-            base = *(base as *const u64).sub(2) as *mut Value<'static>;
         }
     }
 }

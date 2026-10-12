@@ -158,12 +158,13 @@ pub(crate) unsafe extern "C" fn exit_common() {
         "str x13, [x12], #8",
         "subs w10, w10, #1",
         "b.ne 1b",
-        // The callers' frames, from this one's record and header word 2.
+        // The callers' frames, from this one's record and base.
         "2:",
         "mov x20, x16",
         "mov x0, x23",
         "ldp x1, x2, [x29]",
-        "ldur x3, [x22, #-16]",
+        "mov x3, x22",
+        "mov x4, #1",
         "bl {jit_leave}",
         // Back to dispatch's entry state, dropping this frame and any fast
         // callers' under it.

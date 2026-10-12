@@ -1371,3 +1371,73 @@ fn call_results() {
 "##,
     );
 }
+
+/// Headers a fast call leaves at word 0 (D4), read by everything after a
+/// leave: tracebacks, error positions, a native call, an exit deep in a
+/// chain and a yield across compiled frames.
+#[test]
+fn lazy_call_headers() {
+    agrees(
+        r##"
+        local out = {}
+        local function f3(x, mode)
+            if mode == 1 then error("e" .. x) end
+            if mode == 2 then return debug.traceback("t", 1) end
+            if mode == 3 then return tostring(x) .. "n" end
+            if mode == 4 then return coroutine.yield(x) end
+            if mode == 5 then return "s" .. x end
+            return x + 1
+        end
+        local function f2(x, mode) local r = f3(x, mode); return r end
+        local function f1(x, mode) local r = f2(x + 1, mode); return r end
+        for i = 1, 300 do
+            local mode = i > 250 and (i % 6) or 0
+            if mode == 4 then
+                local co = coroutine.wrap(function() return f1(i, 4) end)
+                out[#out + 1] = tostring(co()) .. tostring(co(7))
+            elseif mode == 1 then
+                local ok, e = pcall(f1, i, 1)
+                out[#out + 1] = tostring(ok) .. e
+            else
+                out[#out + 1] = tostring(f1(i, mode))
+            end
+        end
+        return table.concat(out, "|")
+"##,
+    );
+}
+
+/// Calls of a callee known at compile time (D2, D4): replaced through an
+/// upvalue and a global, retired and recompiled while its caller's region
+/// runs, and mutual recursion past the native depth limit.
+#[test]
+fn known_callees() {
+    agrees(
+        r##"
+        local function inc(x) return x + 1 end
+        local cur = inc
+        local function viaup(x) return cur(x) end
+        G_f = inc
+        local function viaglobal(x) return G_f(x) end
+        local function kinds(x)
+            if x > 250 then return x .. "" end
+            return x * 2
+        end
+        local function callkinds(x) return kinds(x) end
+        local even, odd
+        function even(n) if n == 0 then return true end return odd(n - 1) end
+        function odd(n) if n == 0 then return false end return even(n - 1) end
+        local out = {}
+        for i = 1, 400 do
+            if i == 200 then cur = function(x) return x - 1 end end
+            if i == 300 then G_f = function(x) return -x end end
+            out[1] = viaup(i)
+            out[2] = viaglobal(i)
+            out[3] = callkinds(i)
+            out[4] = tostring(even(i % 20))
+        end
+        out[5] = tostring(even(30001))
+        return table.concat(out, " ")
+"##,
+    );
+}
