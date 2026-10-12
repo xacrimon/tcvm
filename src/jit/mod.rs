@@ -518,7 +518,15 @@ fn on_exit<'gc>(
             ExitTag::Const => crate::jit::feedback::CONST_MISS,
             _ => 0,
         };
-        record_site(closure, base, pc, extra);
+        match e.site {
+            // The frame is the loop header's: only the miss is the access's.
+            Some(s) => {
+                if let Some(c) = closure.proto.feedback.get(s as usize) {
+                    c.set(c.get() | extra);
+                }
+            }
+            None => record_site(closure, base, pc, extra),
+        }
         if e.tag == ExitTag::Shape {
             record_shape(ctx, closure, base, pc);
         }
@@ -566,7 +574,7 @@ fn on_exit<'gc>(
         let byte = closure
             .proto
             .feedback
-            .get(pc as usize)
+            .get(e.site.unwrap_or(pc) as usize)
             .map_or(0, |c| c.get());
         let learned = byte != e.byte
             || match e.tag {

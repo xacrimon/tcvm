@@ -235,6 +235,9 @@ pub(crate) struct Func<'gc> {
     /// nor written by them, nor captured. The call-boundary pass may keep a
     /// value no register holds in one (C1).
     pub(crate) call_free: crate::jit::FastMap<u32, crate::jit::build::cfg::RegSet>,
+    /// Exits whose miss belongs to another pc than their snapshot's: a
+    /// guard hoisted out of a loop (E2), and the access it stands for.
+    pub(crate) exit_sites: crate::jit::FastMap<Inst, u32>,
     cfg: RefCell<Option<Rc<CfgInfo>>>,
 }
 
@@ -273,6 +276,7 @@ impl<'gc> Func<'gc> {
             def_snaps: Vec::new(),
             boundaries: false,
             call_free: Default::default(),
+            exit_sites: Default::default(),
             cfg: RefCell::new(None),
         }
     }
