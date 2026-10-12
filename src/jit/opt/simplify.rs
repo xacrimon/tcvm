@@ -2,7 +2,7 @@
 //! branches.
 
 use crate::env::value::Value;
-use crate::jit::ir::ops::{Cc, Op};
+use crate::jit::ir::ops::{Cc, ExitTag, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
 use crate::jit::ir::{Block, Func, Inst, Val};
 
@@ -102,6 +102,15 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                         f.insts[i.idx()].op = Op::Unbox(Rep::F64);
                         f.insts[i.idx()].snap = crate::jit::ir::NO_SNAP;
                         changed = true;
+                    } else if t.rep == Rep::Val && t.within(TypeSet::SMALL) && !t.set.is_empty() {
+                        // The block's last instruction waits for the next round.
+                        let u = f.make_inst(Op::Unbox(Rep::I32), &[x], None, ExitTag::Type);
+                        f.insert(b, k, u);
+                        let u = f.result(u);
+                        f.insts[i.idx()].op = Op::IToF;
+                        f.insts[i.idx()].snap = crate::jit::ir::NO_SNAP;
+                        f.args_mut(i)[0] = u;
+                        changed = true;
                     }
                 }
                 Op::Unbox(rep) => {
@@ -177,6 +186,37 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                     }
                 }
                 Op::FCmp(cc) => {
+                    // Integers compare as they do converted, and an integral
+                    // constant in range converts back exactly.
+                    let int_of = |f: &Func<'_>, v: Val| match f.def_op(v) {
+                        Some(Op::IToF) => Some(Ok(f.args(f.def_inst(v).unwrap())[0])),
+                        Some(Op::KF64(bits)) => {
+                            let c = f64::from_bits(bits);
+                            (c == c as i32 as f64).then_some(Err(c as i32))
+                        }
+                        _ => None,
+                    };
+                    if let (Some(x), Some(y)) = (int_of(f, args[0]), int_of(f, args[1]))
+                        && (x.is_ok() || y.is_ok())
+                    {
+                        let mut ops = [Val(0); 2];
+                        let mut at = k;
+                        for (n, s) in [x, y].into_iter().enumerate() {
+                            ops[n] = match s {
+                                Ok(v) => v,
+                                Err(c) => {
+                                    let ki = f.make_inst(Op::KI32(c), &[], None, ExitTag::Type);
+                                    f.insert(b, at, ki);
+                                    at += 1;
+                                    f.result(ki)
+                                }
+                            };
+                        }
+                        f.insts[i.idx()].op = Op::ICmp(cc);
+                        f.args_mut(i).copy_from_slice(&ops);
+                        changed = true;
+                        continue;
+                    }
                     if let (Some(x), Some(y)) = (konst_f64(f, args[0]), konst_f64(f, args[1])) {
                         let r = match cc {
                             Cc::Eq => x == y,
@@ -249,8 +289,14 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
     }
     if any_removed {
         for b in 0..f.blocks.len() {
-            f.retain(Block(b as u32), |_, i| !removed[i.idx()]);
+            f.retain(Block(b as u32), |_, i| {
+                !removed.get(i.idx()).is_some_and(|&r| r)
+            });
         }
+    }
+    // Instructions made here have values past the map.
+    while map.len() < f.vals.len() {
+        map.push(Val(map.len() as u32));
     }
     f.apply_replacements(&mut map);
     // An exit boxes what it writes: snapshots take values unboxed.
