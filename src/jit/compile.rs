@@ -65,6 +65,22 @@ pub(crate) struct Times {
     pub(crate) lower: u128,
     pub(crate) regalloc: u128,
     pub(crate) emit: u128,
+    /// Each pass's share of `passes`, summed over its runs (F1).
+    pub(crate) pass: Vec<(&'static str, u128)>,
+}
+
+impl Times {
+    /// Run `f` as the pass `name`, adding its time.
+    fn timed<T>(&mut self, name: &'static str, f: impl FnOnce() -> T) -> T {
+        let t = std::time::Instant::now();
+        let r = f();
+        let us = t.elapsed().as_micros();
+        match self.pass.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, x)) => *x += us,
+            None => self.pass.push((name, us)),
+        }
+        r
+    }
 }
 
 /// The optimized IR of the region of `closure` entered at `pc`. `frame` is
@@ -118,28 +134,28 @@ pub(crate) fn build_ir<'gc>(
             }
         }
     }
-    opt::infer::infer(&mut f);
-    if opt::speculate::speculate(&mut f, &kinds) {
-        check(&f, "speculate")?;
+    times.timed("infer", || opt::infer::infer(&mut f));
+    if times.timed("speculate", || opt::speculate::speculate(&mut f, &kinds)) {
+        times.timed("verify", || check(&f, "speculate"))?;
     }
-    if opt::peel::peel(&mut f) {
-        remove_trivial_params(&mut f);
-        check(&f, "peel")?;
+    if times.timed("peel", || opt::peel::peel(&mut f)) {
+        times.timed("params", || remove_trivial_params(&mut f));
+        times.timed("verify", || check(&f, "peel"))?;
     }
-    optimize(&mut f);
-    if opt::sink::sink(&mut f) {
-        check(&f, "sink")?;
+    optimize(&mut f, times);
+    if times.timed("sink", || opt::sink::sink(&mut f)) {
+        times.timed("verify", || check(&f, "sink"))?;
     }
-    opt::prune_gc_checks(&mut f);
-    opt::dce(&mut f);
-    check(&f, "optimize")?;
-    if let Err(e) = opt::calls::call_boundaries(&mut f) {
+    times.timed("gc checks", || opt::prune_gc_checks(&mut f));
+    times.timed("dce", || opt::dce(&mut f));
+    times.timed("verify", || check(&f, "optimize"))?;
+    if let Err(e) = times.timed("calls", || opt::calls::call_boundaries(&mut f)) {
         return Err(CompileError::Verify(format!("{e}\n{}", f.print())));
     }
-    check(&f, "call boundaries")?;
-    opt::snaps::prune_snapshots(&mut f);
-    opt::dce(&mut f);
-    check(&f, "snapshot pruning")?;
+    times.timed("verify", || check(&f, "call boundaries"))?;
+    times.timed("snapshots", || opt::snaps::prune_snapshots(&mut f));
+    times.timed("dce", || opt::dce(&mut f));
+    times.timed("verify", || check(&f, "snapshot pruning"))?;
     times.passes = built.elapsed().as_micros();
     if !opt::completes(&f) {
         return Err(CompileError::Useless);
@@ -148,25 +164,25 @@ pub(crate) fn build_ir<'gc>(
     Ok((f, cfg))
 }
 
-pub(crate) fn optimize(f: &mut Func<'_>) {
+pub(crate) fn optimize(f: &mut Func<'_>, t: &mut Times) {
     for _ in 0..4 {
-        opt::infer::infer(f);
-        let mut changed = opt::infer::narrow(f);
-        opt::infer::infer(f);
-        changed |= opt::simplify::simplify(f);
-        remove_trivial_params(f);
-        changed |= opt::gvn::gvn(f);
-        changed |= opt::licm::licm(f);
-        changed |= opt::range::loop_bounds(f);
-        opt::dce(f);
+        t.timed("infer", || opt::infer::infer(f));
+        let mut changed = t.timed("narrow", || opt::infer::narrow(f));
+        t.timed("infer", || opt::infer::infer(f));
+        changed |= t.timed("simplify", || opt::simplify::simplify(f));
+        t.timed("params", || remove_trivial_params(f));
+        changed |= t.timed("gvn", || opt::gvn::gvn(f));
+        changed |= t.timed("licm", || opt::licm::licm(f));
+        changed |= t.timed("range", || opt::range::loop_bounds(f));
+        t.timed("dce", || opt::dce(f));
         if !changed {
             break;
         }
     }
-    opt::infer::infer(f);
-    opt::infer::legalize(f);
-    opt::infer::infer(f);
-    opt::dce(f);
+    t.timed("infer", || opt::infer::infer(f));
+    t.timed("legalize", || opt::infer::legalize(f));
+    t.timed("infer", || opt::infer::infer(f));
+    t.timed("dce", || opt::dce(f));
 }
 
 /// The word a JIT entry replaced, for an instruction that is one.
@@ -405,7 +421,7 @@ pub(crate) fn compile<'gc>(
     times.emit = t.elapsed().as_micros();
     if config.time {
         eprintln!(
-            "jit time {} pc{pc}: {} IR insts, build {}us, passes {}us, lower {}us, regalloc {}us, emit {}us",
+            "jit time {} pc{pc}: {} IR insts, build {}us, passes {}us, lower {}us, regalloc {}us, emit {}us; passes: {}",
             chunk_name(closure),
             f.blocks
                 .iter()
@@ -416,7 +432,13 @@ pub(crate) fn compile<'gc>(
             times.passes,
             times.lower,
             times.regalloc,
-            times.emit
+            times.emit,
+            times
+                .pass
+                .iter()
+                .map(|(n, us)| format!("{n} {us}"))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     let mut exits = Vec::with_capacity(em.exits.len());
