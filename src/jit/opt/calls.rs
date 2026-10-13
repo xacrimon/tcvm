@@ -7,7 +7,7 @@
 //! whichever definition reaches them.
 
 use crate::jit::FastMap;
-use crate::jit::ir::ops::Op;
+use crate::jit::ir::ops::{ExitTag, Op};
 use crate::jit::ir::verify::live_in;
 use crate::jit::ir::{Block, CfgInfo, Func, Inst, Val};
 
@@ -20,10 +20,74 @@ pub(crate) fn call_boundaries(f: &mut Func<'_>) -> Result<(), String> {
     // A copy may make a value another call kept live across it instead.
     for _ in 0..16 {
         if !boundaries_round(f)? {
+            fold_constant_params(f);
             return Ok(());
         }
     }
     Err("the call boundaries did not settle".into())
+}
+
+/// Parameters that only join copies of one argument-free value (a constant
+/// made again after each call) are that value, made where the block starts:
+/// a loop's callee stays a constant (`find_known_callees`) and costs no
+/// moves.
+fn fold_constant_params(f: &mut Func<'_>) {
+    let cfg = f.cfg();
+    let mut map: Vec<Val> = (0..f.vals.len() as u32).map(Val).collect();
+    let mut changed = false;
+    for &b in &cfg.rpo {
+        let incoming = cfg.incoming(b);
+        if f.blocks[b.idx()].params.len() == 0 || incoming.is_empty() {
+            continue;
+        }
+        let params = f.params(b).to_vec();
+        let mut kept = Vec::with_capacity(params.len());
+        for (k, &p) in params.iter().enumerate() {
+            let mut op = None;
+            let same = incoming.iter().all(|&(t, e)| {
+                let a = map[f.edge_args(t, e as usize)[k].idx()];
+                if a == p {
+                    return true;
+                }
+                let o = f
+                    .def_inst(a)
+                    .filter(|&d| f.insts[d.idx()].an == 0 && f.op(d).is_pure())
+                    .map(|d| f.op(d));
+                o.is_some() && *op.get_or_insert(o) == o
+            });
+            let Some(Some(op)) = op.filter(|_| same) else {
+                kept.push(k);
+                continue;
+            };
+            let at = usize::from(
+                f.insts_of(b)
+                    .first()
+                    .is_some_and(|&i| matches!(f.op(i), Op::Resume { .. })),
+            );
+            let i = f.make_inst(op, &[], None, ExitTag::Type);
+            f.insert(b, at, i);
+            let r = f.result(i);
+            f.vals[r.idx()].ty = f.vals[p.idx()].ty;
+            map.push(r);
+            map[p.idx()] = r;
+            changed = true;
+        }
+        if kept.len() == params.len() {
+            continue;
+        }
+        for &(t, e) in incoming {
+            let args: Vec<Val> = kept
+                .iter()
+                .map(|&k| f.edge_args(t, e as usize)[k])
+                .collect();
+            f.set_edge_args(t, e as usize, &args);
+        }
+        let ps: Vec<Val> = kept.iter().map(|&k| params[k]).collect();
+        f.set_params(b, &ps);
+    }
+    if changed {
+        f.apply_replacements(&mut map);
+    }
 }
 
 /// Keep or copy what is live across each call, and give later uses the

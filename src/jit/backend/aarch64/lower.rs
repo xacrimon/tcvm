@@ -288,7 +288,9 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                             _ => None,
                         };
                         if let Some(k) = known {
+                            // The constant is then made for nothing else.
                             self.absorbed[j.idx()] = true;
+                            self.uses[self.f.args(j)[0].idx()] -= 1;
                             self.known.insert(t, k);
                         }
                         break;

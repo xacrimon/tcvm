@@ -89,7 +89,11 @@ impl Versions {
     }
 }
 
-fn key_of(f: &Func<'_>, i: Inst, mem: &Versions) -> Option<Key> {
+/// `i`'s number, if it has one. Equal argument-free values (constants,
+/// by-value upvalues) count as one argument, `consts` holding the first of
+/// each: they are made again after every call (`calls`), which keeps them
+/// apart as values.
+fn key_of(f: &Func<'_>, i: Inst, mem: &Versions, consts: &mut FastMap<Op, Val>) -> Option<Key> {
     let op = f.op(i);
     let a = f.args(i);
     if a.len() > 3 {
@@ -114,7 +118,14 @@ fn key_of(f: &Func<'_>, i: Inst, mem: &Versions) -> Option<Key> {
         return None;
     }
     let mut args = [Val(0); 3];
-    args[..a.len()].copy_from_slice(a);
+    for (k, &v) in a.iter().enumerate() {
+        args[k] = match f.def_inst(v) {
+            Some(d) if f.insts[d.idx()].an == 0 && f.op(d).is_pure() => {
+                *consts.entry(f.op(d)).or_insert(v)
+            }
+            _ => v,
+        };
+    }
     Some(Key {
         op,
         n: a.len() as u8,
@@ -177,6 +188,7 @@ pub(crate) fn gvn(f: &mut Func<'_>) -> bool {
     // Each number with the scope that made it; an undo log restores the
     // table when a scope closes.
     let mut table: FastMap<Key, (Val, u32)> = FastMap::default();
+    let mut consts: FastMap<Op, Val> = FastMap::default();
     let mut undo: Vec<(Key, Option<(Val, u32)>)> = Vec::new();
     let mut marks: Vec<usize> = Vec::new();
     // The versions at each block's end, for its dominator-tree children.
@@ -237,9 +249,11 @@ pub(crate) fn gvn(f: &mut Func<'_>) -> bool {
                     *a = map[a.idx()];
                 }
             }
-            if let Some(key) = key_of(f, i, &mem) {
+            if let Some(key) = key_of(f, i, &mem, &mut consts) {
                 match table.get(&key) {
-                    Some(&(v, s)) if s as usize >= lo => {
+                    // A check without a result keeps nothing alive across
+                    // a call.
+                    Some(&(v, s)) if s as usize >= lo || f.insts[i.idx()].rn == 0 => {
                         if f.insts[i.idx()].rn == 1 {
                             map[f.result(i).idx()] = v;
                         }
