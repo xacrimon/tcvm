@@ -174,6 +174,9 @@ pub(crate) enum HelperId {
 /// canonical) and one `movz` makes.
 pub(crate) const HELPER_FAIL_VAL: u64 = 0xFFF8_0000_0000_0000;
 
+/// A `Call` or `TailEnter` whose callee's prototype is not known.
+pub(crate) const NO_PROTO: u32 = u32::MAX;
+
 /// A pinned register a helper takes ahead of its operands.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Ctx {
@@ -500,6 +503,8 @@ pub(crate) enum Op {
     GuardFalse,
     /// Exits when the two `Val`s are not the same word.
     GuardSame,
+    /// Exits unless the `Val` is a Lua closure of `Func::protos[k]`.
+    GuardProto(u32),
     /// The collector check after an allocation.
     GcCheck,
     /// Exits when the frame's header has any of the flags.
@@ -705,18 +710,24 @@ pub(crate) enum Op {
     /// `TAILCALL`'s fast arm (5.5): the Lua closure (a `Ptr`) takes over
     /// the frame, its `nargs` arguments stored to `R[0..]`; missing
     /// parameters are nil-filled, header word 0 rewritten, and its first
-    /// instruction dispatched.
+    /// instruction dispatched. With `proto` (`Func::protos`, else
+    /// `NO_PROTO`) the closure is known to be one of it, which takes at
+    /// least `nargs` arguments, stored nil past those given.
     TailEnter {
         nargs: u8,
+        proto: u32,
     },
     /// Call `R[a]` with `nargs` arguments in `R[a+4..]` (stored), `c` the
     /// CALL's result operand; edge 0 is the resume block. `nargs` is
     /// `u8::MAX` for arguments up to `top`, their count the operand.
+    /// `proto` is the callee's prototype when a guard proved it
+    /// (`Func::protos`), else `NO_PROTO`.
     Call {
         a: u8,
         nargs: u8,
         c: u8,
         pc: u32,
+        proto: u32,
     },
     /// Leave for the interpreter (with a snapshot).
     Deopt,
@@ -834,9 +845,9 @@ impl Op {
         match self {
             Load(_) => Effects::reads(Mem::SLOT),
             Store(_) => e(Flags::empty(), Mem::empty(), Mem::SLOT),
-            Guard(_) | GuardTrue | GuardFalse | GuardSame | IAdd | ISub | IMul | INeg | IShl
-            | IShr | IDivFloor | IModFloor | LDivFloor | LModFloor | LToI | LToFExact
-            | FToIExact | ToF64 => Effects::flags(DEOPT),
+            Guard(_) | GuardTrue | GuardFalse | GuardSame | GuardProto(_) | IAdd | ISub | IMul
+            | INeg | IShl | IShr | IDivFloor | IModFloor | LDivFloor | LModFloor | LToI
+            | LToFExact | FToIExact | ToF64 => Effects::flags(DEOPT),
             GuardNoFlag(_) | GuardFits(_) | GuardWindow(_) => e(DEOPT, Mem::FRAME, Mem::empty()),
             GuardShape(_) => e(DEOPT, Mem::SHAPE, Mem::empty()),
             GcCheck => e(DEOPT, Mem::GC, Mem::empty()),
@@ -906,6 +917,7 @@ impl Op {
             | GuardTrue
             | GuardFalse
             | GuardSame
+            | GuardProto(_)
             | GuardNoFlag(_)
             | GcCheck
             | Jump
@@ -1007,6 +1019,7 @@ impl Op {
             GuardTrue => "guard.true".into(),
             GuardFalse => "guard.false".into(),
             GuardSame => "guard.same".into(),
+            GuardProto(k) => format!("guard.proto p{k}"),
             GcCheck => "gccheck".into(),
             GuardNoFlag(m) => format!("guard.noflag {m:#x}"),
             HasFlag(m) => format!("hasflag {m:#x}"),
@@ -1019,7 +1032,20 @@ impl Op {
             Helper(h) => format!("call.{}", h.name()),
             Resume { c } => format!("resume c={c}"),
             Return { a, n } => format!("return r{a} n={n}"),
-            Call { a, nargs, c, pc } => format!("call r{a} nargs={nargs} c={c} pc{pc}"),
+            Call {
+                a,
+                nargs,
+                c,
+                pc,
+                proto,
+            } => {
+                let p = if proto == NO_PROTO {
+                    String::new()
+                } else {
+                    format!(" p{proto}")
+                };
+                format!("call r{a} nargs={nargs} c={c} pc{pc}{p}")
+            }
             other => format!("{other:?}").to_lowercase(),
         }
     }

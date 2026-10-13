@@ -21,8 +21,8 @@ use crate::instruction::{Instruction, Op};
 use crate::jit::ir::ExitKind;
 use crate::jit::region::{ExitInfo, Loc, Region, SRep};
 use crate::jit::state::{
-    EXIT_HOT, Entry, EntryState, JitStateRef, MAX_COMPILES, MAX_ENTRIES, MAX_RETRIES, MAX_STRIKES,
-    jit_state,
+    EXIT_HOT, Entry, EntryState, JitState, JitStateRef, MAX_COMPILES, MAX_ENTRIES, MAX_RETRIES,
+    MAX_STRIKES, jit_state,
 };
 use crate::lua::Context;
 use crate::vm::abi::{Handler, Slot, handler};
@@ -450,7 +450,7 @@ fn install<'gc>(
     st.compiles += 1;
     write_code(closure, at, jw);
     if !region.fast_entry.is_null() {
-        closure.proto.jit_fast.set(region.fast_entry as usize);
+        set_fast(ctx, &closure.proto, &mut st, region.fast_entry as usize);
     }
     if st.entries.len() > MAX_ENTRIES {
         // A loop entry inside another live entry's loop, whose region
@@ -477,10 +477,47 @@ fn install<'gc>(
             .map(|(i, _)| i);
         if let Some(v) = victim {
             let e = st.entries.remove(v);
-            retire_entry(ctx, closure, &e);
+            retire_entry(ctx, closure, &mut st, &e);
         }
     }
     Some(region.entry)
+}
+
+/// Set the prototype's fast entry (0 for none) and point the direct calls
+/// of it there (`direct_target`); `st` is its state.
+fn set_fast<'gc>(
+    ctx: Context<'gc>,
+    proto: &crate::env::function::Prototype<'gc>,
+    st: &mut JitState<'gc>,
+    entry: usize,
+) {
+    proto.jit_fast.set(entry);
+    let target = direct_target(entry);
+    st.callers
+        .retain(|&(r, off)| match r.upgrade(ctx.mutation()) {
+            Some(r) => {
+                r.code.repoint_branch(off as usize, target);
+                true
+            }
+            None => false,
+        });
+}
+
+/// Where a direct call of a prototype whose fast entry is `fast` branches:
+/// past its arity and native stack checks, or without one to a miss
+/// (`abi::direct_miss`).
+pub(crate) fn direct_target(fast: usize) -> usize {
+    #[cfg(target_arch = "aarch64")]
+    {
+        use crate::jit::backend::aarch64::{abi::direct_miss, emit::KNOWN_ENTRY};
+        if fast == 0 {
+            direct_miss as *const () as usize
+        } else {
+            fast + KNOWN_ENTRY as usize
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    fast
 }
 
 fn write_code(closure: LuaFn<'_>, at: u32, word: Instruction) {
@@ -489,11 +526,16 @@ fn write_code(closure: LuaFn<'_>, at: u32, word: Instruction) {
 }
 
 /// Put an entry's original word back, and its back edges past it, and let
-/// go of its slot and region.
-fn retire_entry(ctx: Context<'_>, closure: LuaFn<'_>, e: &Entry<'_>) {
+/// go of its slot and region; `st` is the prototype's state.
+fn retire_entry<'gc>(
+    ctx: Context<'gc>,
+    closure: LuaFn<'gc>,
+    st: &mut JitState<'gc>,
+    e: &Entry<'gc>,
+) {
     write_code(closure, e.pc, e.original);
     if e.pc == 0 {
-        closure.proto.jit_fast.set(0);
+        set_fast(ctx, &closure.proto, st, 0);
     }
     for &pc in &e.back_edges {
         let mut i = unsafe { *closure.code.add(pc as usize) };
@@ -529,6 +571,9 @@ fn on_exit<'gc>(
             ExitTag::Overflow => crate::jit::feedback::OVERFLOW,
             ExitTag::Mm => crate::jit::feedback::MM,
             ExitTag::Bounds => crate::jit::feedback::ARR_MISS,
+            // A closure of the prototype a guard took one closure of: the
+            // next compile guards the prototype.
+            ExitTag::Const if callee_of_proto(ctx, closure, base, pc) => 0,
             ExitTag::Const => crate::jit::feedback::CONST_MISS,
             _ => 0,
         };
@@ -604,6 +649,53 @@ fn on_exit<'gc>(
         drop(st);
         request_recompile(ctx, region_closure, region, learned);
     }
+}
+
+/// Whether the callee of the call at `pc`, whose guard failed, is a closure
+/// of the prototype the site's callee slot names (or of one that made
+/// several, the slot emptied by a collection): then the slot names the
+/// prototype (`call_note`), which the next compile guards instead.
+fn callee_of_proto<'gc>(
+    ctx: Context<'gc>,
+    closure: LuaFn<'gc>,
+    base: *mut Value<'gc>,
+    pc: u32,
+) -> bool {
+    use crate::env::function::{proto_slot, slot_proto};
+    let mut i = unsafe { *closure.code.add(pc as usize) };
+    if i.is_jit_word() {
+        i = original_of(closure, i);
+    }
+    let r = match i.op() {
+        Op::CALL | Op::CALL_R0 | Op::CALL_R1 | Op::TAILCALL => i.a(),
+        Op::CALLS | Op::CALLS_R0 | Op::CALLS_R1 => i.e() as u8,
+        _ => return false,
+    };
+    // SAFETY: the callee is a register of the frame's window.
+    let fv = unsafe { *base.add(r as usize) };
+    let Some(lf) = fv.get_function().and_then(|f| f.as_lua()) else {
+        return false;
+    };
+    let Some(slot) = closure.proto.callees.get(i.d() as usize) else {
+        return false;
+    };
+    let seen = slot.get();
+    let same = match slot_proto(seen) {
+        Some(p) => Gc::ptr_eq(p, lf.proto),
+        None if seen == 0 => lf.proto.closures.get() > 1,
+        None if seen == crate::env::function::MEGAMORPHIC => false,
+        // SAFETY: a nonzero slot names a live function.
+        None => unsafe { Value::from_raw(seen) }
+            .get_function()
+            .and_then(|f| f.as_lua())
+            .is_some_and(|c| Gc::ptr_eq(c.proto, lf.proto)),
+    };
+    if same {
+        slot.set(proto_slot(lf.proto));
+        ctx.mutation()
+            .backward_barrier(Gc::erase(closure.proto), None);
+    }
+    same
 }
 
 /// Shapes a site's chain may test (6.4); one more makes it megamorphic.
@@ -787,7 +879,7 @@ fn request_recompile<'gc>(
         ctx.jit().set_slot(e.slot, jit_settle as *const u8);
         // Compiled callers come through `enter` to the recompile too.
         if e.pc == 0 {
-            closure.proto.jit_fast.set(0);
+            set_fast(ctx, &closure.proto, &mut st, 0);
         }
     }
 }
@@ -880,7 +972,7 @@ fn recompile<'gc>(
             st.compiles += 1;
             ctx.jit().set_slot(slot, region.entry);
             if !region.fast_entry.is_null() {
-                closure.proto.jit_fast.set(region.fast_entry as usize);
+                set_fast(ctx, &closure.proto, &mut st, region.fast_entry as usize);
             }
             log(ctx, || {
                 format!(
@@ -892,7 +984,7 @@ fn recompile<'gc>(
         }
         Err(()) => {
             let e = st.entries.remove(ei);
-            retire_entry(ctx, closure, &e);
+            retire_entry(ctx, closure, &mut st, &e);
             st.refused.push(at);
             log(ctx, || {
                 format!(

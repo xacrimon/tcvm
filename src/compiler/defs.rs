@@ -444,6 +444,7 @@ impl<'gc> Chunk<'gc> {
                 feedback,
                 jit: crate::dmm::Lock::new(None),
                 jit_fast: std::cell::Cell::new(0),
+                closures: std::cell::Cell::new(0),
             },
         ))
     }

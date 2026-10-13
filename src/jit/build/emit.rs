@@ -3,6 +3,7 @@
 //! result writes. What milestone 1 does not compile is a deopt.
 
 use crate::env::MetamethodBits;
+use crate::env::function::Function;
 use crate::env::value::Value;
 use crate::instruction::TFOR_VARS;
 use crate::instruction::{ArithKind, Family, Instruction, Op as BcOp, UpvalSource};
@@ -10,7 +11,7 @@ use crate::jit::build::cfg::RegSet;
 use crate::jit::build::intrinsics::Emitted;
 use crate::jit::build::{Builder, intrinsics, iter, tables};
 use crate::jit::feedback as fb;
-use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL_VAL, HelperId, Op};
+use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL_VAL, HelperId, NO_PROTO, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
 use crate::jit::ir::{Block, Val};
 use crate::vm::frame::flag;
@@ -389,7 +390,7 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             if let Some(slow) = slow {
                 b.switch_to(slow);
                 if rb != 0 {
-                    emit_tailcall(b, a, rb - 1);
+                    emit_tailcall(b, pc, a, rb - 1);
                 } else {
                     dispatch(b);
                 }
@@ -515,10 +516,13 @@ fn dispatch(b: &mut Builder<'_, '_>) {
 
 /// `TAILCALL a` with `nargs` arguments: the fast arm of 5.5 for a Lua
 /// closure without varargs whose window fits, from a frame with nothing to
-/// close; any other callee the interpreter's TAILCALL, from the slots.
-fn emit_tailcall(b: &mut Builder<'_, '_>, a: u8, nargs: u8) {
+/// close; any other callee the interpreter's TAILCALL, from the slots. A
+/// known callee (`known_callee`) is entered past its checks (D2), its
+/// window checked there.
+fn emit_tailcall(b: &mut Builder<'_, '_>, pc: u32, a: u8, nargs: u8) {
     use crate::vm::frame::flag::{HAS_OPEN, HAS_TBC};
     let f = b.reg(a);
+    let (f, proto) = known_callee(b, pc, f);
     let f = b.boxed(f);
     // Read before the stores below overwrite their slots.
     let args: Vec<Val> = (0..nargs)
@@ -528,20 +532,27 @@ fn emit_tailcall(b: &mut Builder<'_, '_>, a: u8, nargs: u8) {
         })
         .collect();
     let slow = b.new_block();
-    let mut others = vec![arm(b, Op::IsType(TypeSet::FUN), f)];
+    let mut others = Vec::new();
+    if proto == NO_PROTO {
+        others.push(arm(b, Op::IsType(TypeSet::FUN), f));
+    }
     let fun = b.ins(Op::Refine(TypeSet::FUN), &[f]);
     let p = b.ins(Op::Unbox(Rep::Ptr), &[fun]);
-    others.push(arm(b, Op::FnFixedLua, p));
+    if proto == NO_PROTO {
+        others.push(arm(b, Op::FnFixedLua, p));
+    }
     let closes = b.ins(Op::HasFlag((HAS_OPEN | HAS_TBC) as u8), &[]);
     let (closing, fast) = (b.new_sealed_succ(), b.new_sealed_succ());
     b.br(closes, closing, fast);
     b.switch_to(fast);
     others.push(closing);
-    others.push(arm(b, Op::FnFits, p));
+    if proto == NO_PROTO {
+        others.push(arm(b, Op::FnFits, p));
+    }
     for (k, &v) in args.iter().enumerate() {
         b.push(Op::Store(k as u8), &[v]);
     }
-    b.terminate(Op::TailEnter { nargs }, &[p], &[], None);
+    b.terminate(Op::TailEnter { nargs, proto }, &[p], &[], None);
     for o in others {
         b.switch_to(o);
         b.jump(slow);
@@ -1766,35 +1777,65 @@ fn callee_at(b: &mut Builder<'_, '_>, pc: u32, a: u8) -> Val {
     }
 }
 
-/// `callee` as a constant when `known_callee` names a native, or the
-/// closure being compiled (a recursive call), guarded by identity: lowering
-/// calls the one through `jit_call_native` (I1) and the other by a direct
-/// `bl` to this region's known entry (I4). Another Lua callee's closure may
-/// be a new one of the same prototype each time (a function's local
-/// functions), which wants a guard on the prototype.
-fn known_callee(b: &mut Builder<'_, '_>, pc: u32, callee: Val) -> Val {
-    // Once such a guard failed here; even a value of the closure being
-    // compiled's own upvalues may differ per closure.
-    if matches!(b.f.def_op(callee), Some(Op::KObj(_))) || b.feedback(pc) & fb::CONST_MISS != 0 {
-        return callee;
+/// `callee` as the call at `pc` may take it, guarded, and the prototype of
+/// a Lua callee without varargs (`Func::protos`, else `NO_PROTO`), which
+/// lowering enters past its checks (D2): a native `known_callee` names
+/// becomes a constant, called through `jit_call_native` (I1); so does a Lua
+/// closure, unless its prototype made several closures (a function's local
+/// functions are new ones on each call), which is guarded instead, as a
+/// site whose slot names a prototype is (`proto_slot`).
+fn known_callee(b: &mut Builder<'_, '_>, pc: u32, callee: Val) -> (Val, u32) {
+    use crate::env::function::slot_proto;
+    fn lua<'gc>(f: Function<'gc>) -> Option<crate::env::function::LuaFn<'gc>> {
+        f.as_lua().filter(|c| !c.proto.is_vararg)
     }
-    let own = b.closure.function();
-    let Some(f) = intrinsics::known_callee(b, pc, callee).filter(|f| {
-        f.as_native().is_some()
-            || (crate::dmm::Gc::ptr_eq(f.inner(), own.inner()) && !b.proto.is_vararg)
-    }) else {
-        return callee;
+    if let Some(Op::KObj(k)) = b.f.def_op(callee) {
+        let p = b.f.pool[k as usize]
+            .get_function()
+            .and_then(lua)
+            .map(|c| c.proto);
+        return (callee, p.map_or(NO_PROTO, |p| b.f.intern_proto(p)));
+    }
+    // Once such a guard failed here, even a value of the compiled closure's
+    // own upvalues, which may differ per closure.
+    if b.feedback(pc) & fb::CONST_MISS != 0 {
+        return (callee, NO_PROTO);
+    }
+    let f = intrinsics::known_callee(b, pc, callee);
+    let slot = b
+        .proto
+        .callees
+        .get(b.code(pc).d() as usize)
+        .map(|s| s.get());
+    let proto = match f {
+        Some(f) if f.as_native().is_some() => None,
+        Some(f) => match lua(f) {
+            Some(c) if c.proto.closures.get() > 1 => Some(c.proto),
+            Some(_) => None,
+            None => return (callee, NO_PROTO),
+        },
+        None => match slot.and_then(slot_proto) {
+            Some(p) if !p.is_vararg => Some(p),
+            _ => return (callee, NO_PROTO),
+        },
     };
-    let k = b.konst(Value::function(f));
     let cv = b.boxed(callee);
+    if let Some(p) = proto {
+        let k = b.f.intern_proto(p);
+        b.ins_exit(Op::GuardProto(k), &[cv], ExitTag::Const);
+        return (callee, k);
+    }
+    let f = f.expect("a known callee");
+    let k = b.konst(Value::function(f));
     b.ins_exit(Op::GuardSame, &[cv, k], ExitTag::Const);
-    k
+    let p = lua(f).map_or(NO_PROTO, |c| b.f.intern_proto(c.proto));
+    (k, p)
 }
 
 /// The CALL at `pc` as a call of `callee` (5.4).
 fn call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: Val) {
     let (a, nb, c) = (insn.a(), insn.b(), insn.c());
-    let callee = known_callee(b, pc, callee);
+    let (callee, proto) = known_callee(b, pc, callee);
     let live = b
         .cfg
         .live_in
@@ -1826,7 +1867,14 @@ fn call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: Val) {
     } else {
         (nb - 1, vec![])
     };
-    let resume = b.call(Op::Call { a, nargs, c, pc }, &count, live, written, c);
+    let op = Op::Call {
+        a,
+        nargs,
+        c,
+        pc,
+        proto,
+    };
+    let resume = b.call(op, &count, live, written, c);
     let first = b.f.insts_of(resume)[0];
     let rs: Vec<Val> = b.f.results(first).collect();
     for (k, &v) in rs.iter().enumerate() {

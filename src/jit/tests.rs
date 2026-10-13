@@ -197,9 +197,11 @@ fn back_edges_follow_loop_entries() {
         let target = |pc: usize| (pc as i64 + 1 + code(pc).branch_offset() as i64) as usize;
         assert_eq!(target(back), header);
         let state = lf.proto.jit.get().unwrap();
-        let e = state.borrow_mut(ctx.mutation()).entries.remove(0);
+        let mut st = state.borrow_mut(ctx.mutation());
+        let e = st.entries.remove(0);
         assert_eq!(&*e.back_edges, &[back as u32]);
-        super::retire_entry(ctx, lf, &e);
+        super::retire_entry(ctx, lf, &mut st, &e);
+        drop(st);
         assert_eq!(code(header).op(), Op::LOOP);
         assert_eq!(target(back), header + 1);
     });

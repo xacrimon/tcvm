@@ -104,7 +104,7 @@ fn key_of(f: &Func<'_>, i: Inst, mem: &Versions, consts: &mut FastMap<Op, Val>) 
         // Allocations between two checks are not memory it reads.
         Op::GcCheck => false,
         // What these test of values never changes.
-        Op::Guard(_) | Op::GuardSame | Op::GuardTrue | Op::GuardFalse => true,
+        Op::Guard(_) | Op::GuardSame | Op::GuardProto(_) | Op::GuardTrue | Op::GuardFalse => true,
         _ => {
             e.is_pure() && f.insts[i.idx()].rn == 1
                 || e.reads_memory()

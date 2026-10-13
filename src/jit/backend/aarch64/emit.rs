@@ -42,6 +42,9 @@ pub(crate) struct Emitted {
     pub(crate) exits: Vec<ExitOut>,
     /// The calls, for walks of the frame (H7).
     pub(crate) sites: Vec<SiteOut>,
+    /// The direct branches to other regions' known entries, by the callee's
+    /// prototype (its box), which `jit::set_fast` repoints.
+    pub(crate) direct: Vec<(Label, u64)>,
 }
 
 /// A call of the region: its return addresses, whether each is a level's
@@ -135,6 +138,8 @@ struct Em<'a> {
     snap_ops: &'a [u32],
     /// This region's prototype and its known entry, when it has one.
     own_entry: Option<(u64, Label)>,
+    /// The direct branches to known entries, by the callee's prototype.
+    direct: Vec<(Label, u64)>,
     /// `FMod`'s out-of-line paths: (entry, return, d, a, b).
     fmods: Vec<(Label, Label, Fpr, Fpr, Fpr)>,
 }
@@ -172,6 +177,22 @@ pub(crate) struct Helpers {
     pub(crate) native_act: usize,
     /// The trampolines of the helpers cold arms call: (helper, trampoline).
     pub(crate) trampolines: Vec<(usize, usize)>,
+    /// Known callees' prototypes (their boxes) and where a direct call of
+    /// each branches now (`jit::direct_target`).
+    pub(crate) direct: Vec<(u64, usize)>,
+}
+
+/// Where a known call enters its callee (D2).
+#[derive(Clone, Copy)]
+enum Target {
+    /// This region's own entry.
+    Own(Label),
+    /// The known entry of the prototype's fast entry, by a branch that
+    /// `jit::set_fast` repoints (`Emitted::direct`): the prototype's box
+    /// and the branch's first target.
+    Direct(u64, usize),
+    /// The fast entry in x17.
+    Reg,
 }
 
 /// A trampoline (A5): a C call of `target` that keeps x0-x15, d0-d7 and
@@ -282,6 +303,7 @@ pub(crate) fn emit(
         snap_ops: &l.snap_ops,
         fmods: Vec::new(),
         own_entry: None,
+        direct: Vec::new(),
     };
     // A compiled caller has written the header, set base, closure and `insn`
     // (the argument count) as `enter` would, and its `blr` left the return
@@ -450,6 +472,7 @@ pub(crate) fn emit(
         region_word,
         exits,
         sites: em.sites,
+        direct: em.direct,
     })
 }
 
@@ -561,22 +584,24 @@ impl Em<'_> {
         self.a.ldr(X17, X16, layout::FN_PROTO as i32);
         self.a.ldr(X17, X17, layout::PROTO_FAST as i32);
         self.a.cbz(Sz::X, X17, slow);
-        self.fast_enter(hdr, block, None)
+        self.fast_enter(hdr, block, Target::Reg)
     }
 
-    /// `fast_call` for a known callee (D2): its prototype's fast entry, or
-    /// `slow`, past the arity check when `nargs` is static, the parameters it
-    /// leaves out stored nil (I3), and this region's own when it is the
-    /// callee's; word 0 the closure word. Also returns whether it enters past
-    /// the checks.
+    /// `fast_call` for a known callee (D2), word 0 its closure word: the
+    /// constant `closure`'s, or the stored value's. With a static argument
+    /// count it enters past the arity and native stack checks, the
+    /// parameters left out stored nil (I3), by a direct branch
+    /// (`direct_target`); else it loads the fast entry, `slow` without
+    /// one. Returns `fast_enter`'s labels, whether it enters past the
+    /// checks, and where.
     fn known_call(
         &mut self,
         hdr: i32,
         block: usize,
         slow: Label,
-        (f, proto, nparams): (u64, u64, u8),
+        (closure, proto, nparams): (Option<u64>, u64, u8),
         nargs: u8,
-    ) -> (Label, Label, bool, Option<Label>) {
+    ) -> (Label, Label, bool, Target) {
         let known = nargs != u8::MAX;
         if known && nargs < nparams {
             // Inside the callee's window, which its known entry checks; the
@@ -586,10 +611,8 @@ impl Em<'_> {
                 self.a.str(Gpr(9), BASE, hdr + 32 + 8 * k as i32);
             }
         }
-        // A call of this region's own function enters its known entry by a
-        // direct `bl` (I4): the region cannot outlive itself.
-        let own = match self.own_entry {
-            Some((p, l)) if p == proto && known => Some(l),
+        let target = match self.direct_target(proto) {
+            Some(t) if known => t,
             _ => {
                 self.a.mov_imm(X17, proto);
                 self.a.ldr(X17, X17, layout::PROTO_FAST as i32);
@@ -597,20 +620,62 @@ impl Em<'_> {
                 if known {
                     self.a.add_imm(Sz::X, X17, X17, KNOWN_ENTRY);
                 }
-                None
+                Target::Reg
             }
         };
-        self.a.mov_imm(X16, f & PTR_MASK);
-        let (ret, deep) = self.fast_enter(hdr, block, own);
-        (ret, deep, known, own)
+        match closure {
+            Some(f) => self.a.mov_imm(X16, f & PTR_MASK),
+            None => {
+                self.a.ldr(X16, BASE, hdr);
+                self.a.and_imm(Sz::X, X16, X16, PTR_MASK);
+            }
+        }
+        let (ret, deep) = self.fast_enter(hdr, block, target);
+        (ret, deep, known, target)
     }
 
-    /// Enter the fast entry in x17, or `own`, of the closure in x16
-    /// (`fast_call`). Returns the return address `blr` leaves, where a
-    /// branch to the fast resume sits; a callee whose entry checks fail
-    /// returns 4 bytes past it, where `miss_path` must follow. Also returns
-    /// the deep path's label, for `deep_path`.
-    fn fast_enter(&mut self, hdr: i32, block: usize, own: Option<Label>) -> (Label, Label) {
+    /// A known entry of `proto` (its box) a branch can take: this region's
+    /// own, or one `jit::set_fast` keeps the branch pointed at.
+    fn direct_target(&self, proto: u64) -> Option<Target> {
+        match self.own_entry {
+            // The region cannot outlive itself (I4).
+            Some((p, l)) if p == proto => Some(Target::Own(l)),
+            _ => self
+                .helpers
+                .direct
+                .iter()
+                .find(|d| d.0 == proto)
+                .map(|&(p, t)| Target::Direct(p, t)),
+        }
+    }
+
+    /// `bl` (`b` unless `link`) to `target`, a direct one recorded for
+    /// `jit::set_fast`.
+    fn branch_to(&mut self, target: Target, link: bool) {
+        match (target, link) {
+            (Target::Own(l), true) => self.a.bl(l),
+            (Target::Own(l), false) => self.a.b(l),
+            (Target::Direct(proto, t), _) => {
+                let at = self.a.new_label();
+                self.a.bind(at);
+                self.direct.push((at, proto));
+                if link {
+                    self.a.bl_far(t);
+                } else {
+                    self.a.b_far(t);
+                }
+            }
+            (Target::Reg, true) => self.a.blr(X17),
+            (Target::Reg, false) => self.a.br(X17),
+        }
+    }
+
+    /// Enter `target` (`Target::Reg`: the fast entry in x17) with the
+    /// closure in x16 (`fast_call`). Returns the return address the call
+    /// leaves, where a branch to the fast resume sits; a callee whose entry
+    /// checks fail returns 4 bytes past it, where `miss_path` must follow.
+    /// Also returns the deep path's label, for `deep_path`.
+    fn fast_enter(&mut self, hdr: i32, block: usize, target: Target) -> (Label, Label) {
         let fast_resume = self.fast_resume[self.v.succs(block)[0].index()];
         // Word 1 zero: the frame's flags, which helpers set there (a closure
         // capturing a register, `HAS_OPEN`) and `HasFlag` reads. Left stale,
@@ -629,10 +694,7 @@ impl Em<'_> {
         self.a.ldr(Gpr(10), THREAD, layout::NATIVE_DEEP as i32);
         self.a.cmp(Sz::X, Gpr(9), Gpr(10));
         self.a.b_cond(Cond::Lo, deep);
-        match own {
-            Some(l) => self.a.bl(l),
-            None => self.a.blr(X17),
-        }
+        self.branch_to(target, true);
         let ret = self.a.new_label();
         self.a.bind(ret);
         self.a.b(fast_resume);
@@ -754,10 +816,19 @@ impl Em<'_> {
     /// callee returns with `br` and the return address stack stays as it
     /// was, right for the shallower frames' `ret`s. It names the fast resume
     /// itself, before which a branch to the miss path sits.
-    fn deep_path(&mut self, deep: Label, block: usize, known: bool, own: Option<Label>) {
+    fn deep_path(&mut self, deep: Label, block: usize, known: bool, target: Target) {
         self.a.bind(deep);
-        if let Some(l) = own {
-            self.a.adr(X17, l);
+        match target {
+            Target::Own(l) => self.a.adr(X17, l),
+            Target::Direct(proto, _) => {
+                // The fast entry, or the miss path without one.
+                let miss = self.miss[self.v.succs(block)[0].index()];
+                self.a.mov_imm(X17, proto);
+                self.a.ldr(X17, X17, layout::PROTO_FAST as i32);
+                self.a.cbz(Sz::X, X17, miss);
+                self.a.add_imm(Sz::X, X17, X17, KNOWN_ENTRY);
+            }
+            Target::Reg => {}
         }
         if known {
             // The known entry trusts the native stack, which is deep enough
@@ -1487,6 +1558,25 @@ impl Em<'_> {
                 let l = self.exit(exit);
                 self.a.b_cond(Cond::Ne, l);
             }
+            GuardProto { proto, fun, exit } => {
+                let v = self.r(i, 0);
+                let l = self.exit(exit);
+                if !fun {
+                    self.a.lsr_imm(Sz::X, X16, v, 48);
+                    self.a.movz(Sz::W, X17, FUNCTION_TAG, 0);
+                    self.a.cmp(Sz::W, X16, X17);
+                    self.a.b_cond(Cond::Ne, l);
+                }
+                // A native's bytes past its variant may be anything: the
+                // tag byte first (`FN_IS_VARARG`, 0 for a fixed Lua closure).
+                self.a.and_imm(Sz::X, X16, v, PTR_MASK);
+                self.a.ldrb(X17, X16, layout::FN_IS_VARARG as i32);
+                self.a.cbnz(Sz::W, X17, l);
+                self.a.ldr(X16, X16, layout::FN_PROTO as i32);
+                self.a.ldr_lit(X17, proto);
+                self.a.cmp(Sz::X, X16, X17);
+                self.a.b_cond(Cond::Ne, l);
+            }
             ClassBits(class) => {
                 let d = self.r(i, 0);
                 self.a.ldr_lit(X16, class);
@@ -1762,23 +1852,33 @@ impl Em<'_> {
                 }
                 let (slow, common) = (self.a.new_label(), self.a.new_label());
                 let native = self.a.new_label();
-                let (ret, deep, entered_known, own) = match known {
-                    Some(Known::Lua(f, proto, nparams)) => {
-                        self.known_call(hdr, block, slow, (f, proto, nparams), nargs)
-                    }
+                let (ret, deep, entered_known, target) = match known {
+                    Some(Known::Lua {
+                        closure,
+                        proto,
+                        nparams,
+                    }) => self.known_call(hdr, block, slow, (closure, proto, nparams), nargs),
                     _ => {
                         let (r, d) = self.fast_call(hdr, block, slow, native);
-                        (r, d, false, None)
+                        (r, d, false, Target::Reg)
                     }
                 };
                 self.miss_path(hdr, block, common);
-                self.deep_path(deep, block, entered_known, own);
+                self.deep_path(deep, block, entered_known, target);
                 let mut keys = vec![(ret, false)];
                 if known.is_none() {
                     keys.extend(self.native_path(hdr, block, Ok((native, slow))));
                 }
                 self.a.bind(slow);
-                if let Some(Known::Lua(f, _, _)) = known {
+                // Only a call through the loaded fast entry branches here
+                // before writing word 0.
+                if let (
+                    Some(Known::Lua {
+                        closure: Some(f), ..
+                    }),
+                    Target::Reg,
+                ) = (known, target)
+                {
                     self.a.mov_imm(X16, f);
                     self.a.str(X16, BASE, hdr);
                 }
@@ -1795,11 +1895,32 @@ impl Em<'_> {
                 self.a.ldr(X16, RT, op as i32 * 8);
                 self.tail_level();
             }
-            TailEnter { nargs } => {
+            TailEnter { nargs, known } => {
                 // The callee is the frame's closure from here, which frees
                 // `insn` and `pc` (allocatable in the body) as scratch.
                 let f = self.r(i, 0);
                 self.a.mov(CLOSURE, f);
+                let target =
+                    known.and_then(|(proto, nparams)| Some((self.direct_target(proto)?, nparams)));
+                if let Some((target, nparams)) = target {
+                    // A known callee (D2): the parameters left out nil, then
+                    // its entry past the arity and native stack checks, the
+                    // stack no deeper than this frame's caller left it.
+                    if nargs < nparams {
+                        self.a.mov_imm(X16, NIL);
+                        for k in nargs..nparams {
+                            self.a.str(X16, BASE, 8 * k as i32);
+                        }
+                    }
+                    self.a.ldr(X16, BASE, -32);
+                    self.a.and_imm(Sz::X, X16, X16, !crate::vm::frame::PTR_MASK);
+                    self.a.orr(Sz::X, X16, X16, CLOSURE);
+                    self.a.str(X16, BASE, -32);
+                    self.a.movz(Sz::X, INSN, nargs.max(nparams) as u16, 0);
+                    self.close_frame();
+                    self.branch_to(target, false);
+                    return Ok(());
+                }
                 let (top, done) = (self.a.new_label(), self.a.new_label());
                 self.a.ldrb(X16, CLOSURE, layout::FN_NUM_PARAMS as i32);
                 self.a.movz(Sz::X, X17, nargs as u16, 0);
@@ -1925,7 +2046,7 @@ impl Em<'_> {
                 let (slow, native) = (self.a.new_label(), self.a.new_label());
                 let (ret, deep) = self.fast_call(h, block, slow, native);
                 self.miss_path(h, block, slow);
-                self.deep_path(deep, block, false, None);
+                self.deep_path(deep, block, false, Target::Reg);
                 let mut keys = vec![(ret, false)];
                 keys.extend(self.native_path(h, block, Ok((native, slow))));
                 self.a.bind(slow);

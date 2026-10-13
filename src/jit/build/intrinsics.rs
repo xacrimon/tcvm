@@ -159,7 +159,8 @@ pub(super) fn known_callee<'gc>(
         return Some(f);
     }
     let seen = b.proto.callees.get(b.code(pc).d() as usize)?.get();
-    if seen == 0 || seen == crate::env::function::MEGAMORPHIC {
+    // Bit 0: megamorphic, or a prototype's (`proto_slot`).
+    if seen == 0 || seen & 1 != 0 {
         return None;
     }
     unsafe { Value::from_raw(seen) }.get_function()

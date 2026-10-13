@@ -214,17 +214,25 @@ handler! {
     }
 
     /// A call whose callee slot missed (`note_callee!`): its first function,
-    /// or a second, which makes the site megamorphic; then the call again.
+    /// or a second, which makes the site its prototype's when both are
+    /// closures of one, else megamorphic; then the call again.
     slow fn call_note {
+        use crate::env::function::{MEGAMORPHIC, proto_slot};
         let call = insn_at!();
         // `R[a]` is the callee, a CALLS's included.
         let fv: Value<'gc> = reg![call.a()];
         let proto = unsafe { frame::closure(base) }.proto;
         let slot = &proto.callees[call.d() as usize];
-        slot.set(if slot.get() == 0 {
+        let seen = slot.get();
+        let lua_proto = |v: Value<'gc>| v.get_function().and_then(|f| f.as_lua()).map(|c| c.proto);
+        slot.set(if seen == 0 {
             fv.to_raw()
         } else {
-            crate::env::function::MEGAMORPHIC
+            // SAFETY: a nonzero slot names a live function.
+            match (lua_proto(unsafe { Value::from_raw(seen) }), lua_proto(fv)) {
+                (Some(p), Some(q)) if crate::dmm::Gc::ptr_eq(p, q) => proto_slot(p),
+                _ => MEGAMORPHIC,
+            }
         });
         rt.mutation()
             .backward_barrier(crate::dmm::Gc::erase(proto), None);

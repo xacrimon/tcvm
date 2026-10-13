@@ -58,13 +58,18 @@ pub(crate) enum Test {
     B1,
 }
 
-/// A call's constant callee.
+/// A call's callee, known at compile time.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Known {
-    /// A non-vararg Lua closure (D2): its value, prototype and parameter
-    /// count. The call writes the closure word on the fast path and the
-    /// value on the slow one.
-    Lua(u64, u64, u8),
+    /// A closure without varargs of the prototype at `proto` (its box),
+    /// which takes `nparams` (D2): `closure`, a constant the call writes word
+    /// 0 for itself (the closure word on the fast path, the value on the
+    /// slow one), or one a guard proved to be of the prototype.
+    Lua {
+        closure: Option<u64>,
+        proto: u64,
+        nparams: u8,
+    },
     /// A native: its closure, which `jit_call_native` runs (I1).
     Native(u64),
 }
@@ -227,6 +232,13 @@ pub(crate) enum MInst {
         shape: u64,
         exit: u32,
     },
+    /// `[use f, snap..]`: exit unless the value is a Lua closure of the
+    /// prototype at `proto` (its box); `fun` when it is known a function.
+    GuardProto {
+        proto: u64,
+        fun: bool,
+        exit: u32,
+    },
     /// `[def d]`: a class's live bits (`I32`) or `__index`.
     ClassBits(u64),
     ClassIndex(u64),
@@ -298,9 +310,12 @@ pub(crate) enum MInst {
         word: u64,
         pc_after: usize,
     },
-    /// `[use f]`: the Lua closure takes over the frame (`Op::TailEnter`).
+    /// `[use f]`: the Lua closure takes over the frame (`Op::TailEnter`);
+    /// `known` its prototype (its box) and parameter count when a guard
+    /// proved them.
     TailEnter {
         nargs: u8,
+        known: Option<(u64, u8)>,
     },
     /// `[snap..]`: exit unless the header at `hdr` and `n` arguments fit.
     GuardFits {
@@ -349,6 +364,7 @@ impl MInst {
             | Guard { exit, .. }
             | GuardNoFlag { exit, .. }
             | GuardShape { exit, .. }
+            | GuardProto { exit, .. }
             | GcCheck { exit }
             | GuardFits { exit, .. } => exit,
             _ => return None,

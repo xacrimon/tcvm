@@ -210,6 +210,9 @@ pub(crate) struct Region<'gc> {
     #[collect(require_static)]
     pub(crate) entry_fails: Cell<u32>,
     pub(crate) proto: Gc<'gc, Prototype<'gc>>,
+    /// The prototypes of known callees (`Func::protos`), whose states
+    /// repoint the code's direct calls of them.
+    pub(crate) protos: Box<[Gc<'gc, Prototype<'gc>>]>,
     pub(crate) entry_pc: u32,
     /// The entry's loop nest, innermost first (`Entry::nest`).
     #[collect(require_static)]

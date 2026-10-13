@@ -77,6 +77,11 @@ pub struct Prototype<'gc> {
     /// else 0: compiled callers branch to it with `blr` (5.4).
     #[collect(require_static)]
     pub(crate) jit_fast: Cell<usize>,
+    /// Closures made of it, up to 2: a callee whose prototype made several
+    /// is guarded by its prototype rather than its identity (LuaJIT's
+    /// `PROTO_CLCOUNT`).
+    #[collect(require_static)]
+    pub(crate) closures: Cell<u8>,
 }
 
 /// A prototype's bytecode, in cells: the interpreter rewrites an
@@ -211,17 +216,29 @@ unsafe impl<'gc> Collect<'gc> for IcTable<'gc> {
 }
 
 /// [`Prototype::callees`], the JIT's callee feedback (I2): per call site,
-/// the bits of the function value the interpreter last called there,
-/// [`MEGAMORPHIC`] once it called two, 0 for none. Its trace clears it
-/// rather than tracing it, and a write takes the prototype's barrier, so a
-/// nonzero slot names a function called since the last collection, which
-/// is alive.
+/// the bits of the function value the interpreter last called there, a
+/// [`proto_slot`] once it called two closures of one prototype,
+/// [`MEGAMORPHIC`] once it called two other functions, 0 for none. Its trace
+/// clears it rather than tracing it, and a write takes the prototype's
+/// barrier, so a nonzero slot names a function or prototype called since the
+/// last collection, which is alive.
 pub struct Callees(Box<[Cell<u64>]>);
 
 /// A callee slot that saw two functions: no `Value` has these bits, and
 /// only it has bit 0 set among what a slot holds (a function's payload is
 /// aligned), which the interpreter tests.
 pub(crate) const MEGAMORPHIC: u64 = 0xFFF8_0000_0000_0001;
+
+/// A callee slot's word for closures of `proto`: its address with bit 0
+/// set, which the interpreter, like [`MEGAMORPHIC`]'s, does not record over.
+pub(crate) fn proto_slot(proto: Gc<'_, Prototype<'_>>) -> u64 {
+    Gc::as_ptr(proto) as u64 | 1
+}
+
+/// The prototype a callee slot's word names (`proto_slot`).
+pub(crate) fn slot_proto<'gc>(w: u64) -> Option<Gc<'gc, Prototype<'gc>>> {
+    (w & 1 != 0 && w != MEGAMORPHIC).then(|| unsafe { Gc::from_ptr((w & !1) as *const _) })
+}
 
 impl Callees {
     pub fn new(len: usize) -> Self {
@@ -861,6 +878,10 @@ impl<'gc> Function<'gc> {
             },
             num_upvalues: proto.num_upvalues,
         };
+        let made = proto.closures.get();
+        if made < 2 {
+            proto.closures.set(made + 1);
+        }
         // SAFETY: `init` writes every upvalue.
         Function(unsafe {
             Gc::new_with_trailing(mc, FunctionKind::Lua(closure), |p| init(p.cast().as_ptr()))

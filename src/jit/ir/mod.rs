@@ -11,6 +11,8 @@ pub(crate) mod verify;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::dmm::Gc;
+use crate::env::function::Prototype;
 use crate::env::value::Value;
 use crate::jit::ir::ops::{ExitTag, Op};
 use crate::jit::ir::types::{Ty, TypeSet};
@@ -260,6 +262,9 @@ pub(crate) struct Func<'gc> {
     /// guard hoisted out of a loop (E2), and the access it stands for.
     pub(crate) exit_sites: crate::jit::FastMap<Inst, u32>,
     pub(crate) inline_frames: Vec<InlineFrame>,
+    /// The prototypes guards prove callees closures of, which the region
+    /// keeps alive.
+    pub(crate) protos: Vec<Gc<'gc, Prototype<'gc>>>,
     cfg: RefCell<Option<Rc<CfgInfo>>>,
 }
 
@@ -301,6 +306,7 @@ impl<'gc> Func<'gc> {
             call_homes: Default::default(),
             exit_sites: Default::default(),
             inline_frames: Vec::new(),
+            protos: Vec::new(),
             cfg: RefCell::new(None),
         }
     }
@@ -476,6 +482,14 @@ impl<'gc> Func<'gc> {
     // --- values -----------------------------------------------------------------
 
     /// The pool index of a heap value.
+    pub(crate) fn intern_proto(&mut self, p: Gc<'gc, Prototype<'gc>>) -> u32 {
+        if let Some(i) = self.protos.iter().position(|&q| Gc::ptr_eq(q, p)) {
+            return i as u32;
+        }
+        self.protos.push(p);
+        self.protos.len() as u32 - 1
+    }
+
     pub(crate) fn intern(&mut self, v: Value<'gc>) -> u32 {
         if let Some(i) = self.pool.iter().position(|p| p.same_bits(&v)) {
             return i as u32;

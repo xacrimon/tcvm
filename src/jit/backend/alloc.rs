@@ -140,6 +140,18 @@ impl CodeBlock {
         ));
     }
 
+    /// Point the `b` or `bl` at byte `off` at `target` and publish it.
+    pub(crate) fn repoint_branch(&self, off: usize, target: usize) {
+        assert!(off + 4 <= self.len() && off.is_multiple_of(4));
+        let d = target as i64 - (self.rx() as usize + off) as i64;
+        assert!(d.unsigned_abs() < 1 << 27, "a branch target out of reach");
+        unsafe {
+            let p = self.rw.as_ptr().add(off).cast::<u32>();
+            p.write(p.read() & 0xfc00_0000 | (d >> 2) as u32 & 0x03ff_ffff);
+            sync_icache(self.rw.as_ptr().add(off), self.rx.as_ptr().add(off), 4);
+        }
+    }
+
     /// Overwrite the 64-bit word at byte `off` and publish it.
     pub(crate) fn patch_u64(&self, off: usize, v: u64) {
         assert!(off + 8 <= self.len() && off.is_multiple_of(8));

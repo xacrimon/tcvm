@@ -10,7 +10,7 @@ use crate::jit::backend::aarch64::abi::{allocatable, caller_saved, preg_float, p
 use crate::jit::backend::aarch64::asm::{Asm, Cond, Sz};
 use crate::jit::backend::aarch64::inst::{AluOp, ENTRY_FAIL, FOp, FUnOp, Known, MInst, Test};
 use crate::jit::backend::vcode::VCode;
-use crate::jit::ir::ops::{Cc, ExitTag, Op};
+use crate::jit::ir::ops::{Cc, ExitTag, NO_PROTO, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
 use crate::jit::ir::{Block, ExitKind, Func, Inst, NO_SNAP, Val};
 use crate::jit::region::SRep;
@@ -256,16 +256,28 @@ impl<'a, 'gc> Lower<'a, 'gc> {
     /// Mark compares used once, by a branch, guard or select of the same
     /// block, to be computed there.
     /// Calls of a constant Lua closure without varargs (D2) or native (I1),
-    /// whose store to the call's slot nothing between reads.
+    /// whose store to the call's slot nothing between reads, and of a Lua
+    /// closure of a prototype a guard proved.
     fn find_known_callees(&mut self, order: &[Block]) {
         use crate::jit::ir::ops::Mem;
         for &b in order {
             let Some(t) = self.f.terminator(b) else {
                 continue;
             };
-            let Op::Call { a, .. } = self.f.op(t) else {
+            let Op::Call { a, proto, .. } = self.f.op(t) else {
                 continue;
             };
+            if proto != NO_PROTO {
+                let p = self.f.protos[proto as usize];
+                self.known.insert(
+                    t,
+                    Known::Lua {
+                        closure: None,
+                        proto: p.ptr.as_ptr() as u64,
+                        nparams: p.num_params,
+                    },
+                );
+            }
             for &j in self.f.insts_of(b).iter().rev().skip(1) {
                 let op = self.f.op(j);
                 match op {
@@ -277,11 +289,11 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                         let v = self.f.pool[p as usize];
                         let known = match v.get_function().map(|f| f.inner().as_ref()) {
                             // The prototype word the fast path loads.
-                            Some(FunctionKind::Lua(c)) if !c.is_vararg => Some(Known::Lua(
-                                v.to_raw(),
-                                c.proto.ptr.as_ptr() as u64,
-                                c.num_params,
-                            )),
+                            Some(FunctionKind::Lua(c)) if !c.is_vararg => Some(Known::Lua {
+                                closure: Some(v.to_raw()),
+                                proto: c.proto.ptr.as_ptr() as u64,
+                                nparams: c.num_params,
+                            }),
                             Some(FunctionKind::Native(nc)) => {
                                 Some(Known::Native(nc as *const _ as u64))
                             }
@@ -826,6 +838,17 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 let t = self.use_(args[0]);
                 self.push_exit(i, |exit| MInst::GuardShape { shape, exit }, vec![t], none);
             }
+            Op::GuardProto(k) => {
+                let proto = f.protos[k as usize].ptr.as_ptr() as u64;
+                let fun = TypeSet::FUN.contains(f.ty(args[0]).set);
+                let v = self.use_(args[0]);
+                self.push_exit(
+                    i,
+                    |exit| MInst::GuardProto { proto, fun, exit },
+                    vec![v],
+                    none,
+                );
+            }
             Op::ClassBits(k) | Op::ClassIndex(k) => {
                 let class = f.shapes[k as usize]
                     .mt_cache()
@@ -1277,9 +1300,13 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 let op = (word & 0xff) as u8;
                 self.push(MInst::Dispatch { op, word, pc_after }, &[], none);
             }
-            Op::TailEnter { nargs } => {
+            Op::TailEnter { nargs, proto } => {
                 let p = self.use_(args[0]);
-                self.push(MInst::TailEnter { nargs }, &[p], none);
+                let known = (proto != NO_PROTO).then(|| {
+                    let p = f.protos[proto as usize];
+                    (p.ptr.as_ptr() as u64, p.num_params)
+                });
+                self.push(MInst::TailEnter { nargs, known }, &[p], none);
             }
             Op::CallMm { pc, nargs, .. } => {
                 let pc_after = self.pc_base + (pc as usize + 1) * 8;

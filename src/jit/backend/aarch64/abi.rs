@@ -322,6 +322,38 @@ pub(crate) unsafe extern "C" fn level_return() {
     )
 }
 
+/// Where a direct call goes while its callee's prototype has no fast entry
+/// (`jit::direct_target`): what a fast entry's failed check does (`emit`'s
+/// `fast_miss`). Back to the caller's slow path 4 bytes past its return
+/// address, or before its fast resume, which a tagged one names; a tail
+/// call from a frame dispatch entered has the level's return address, and
+/// `enter` runs the call from the header the tail call wrote.
+#[unsafe(naked)]
+pub(crate) unsafe extern "C" fn direct_miss() {
+    core::arch::naked_asm!(
+        "ldr x17, [x23, #{level_ret}]",
+        "cmp x30, x17",
+        "b.eq 2f",
+        "tbnz x30, #0, 1f",
+        "add x30, x30, #4",
+        "ret",
+        "1:",
+        "and x30, x30, #~1",
+        "sub x30, x30, #4",
+        "br x30",
+        "2:",
+        "movz x16, #{tag}, lsl #48",
+        "orr x16, x16, x24",
+        "str x16, [x22, #-32]",
+        "sub x21, x22, #32",
+        "mov x22, xzr",
+        "b {enter}",
+        level_ret = const crate::jit::layout::LEVEL_RET,
+        tag = const crate::jit::layout::FUNCTION_TAG,
+        enter = sym crate::vm::ops::call::enter,
+    )
+}
+
 /// The address handlers in a level return to: past `level_return`'s `nop`.
 pub(crate) fn level_return_addr() -> usize {
     level_return as *const () as usize + 4

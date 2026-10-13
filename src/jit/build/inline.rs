@@ -44,7 +44,9 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
     };
     let proto = lf.proto;
     let base = b.reg_base() + a as usize + 4;
-    if proto.is_vararg
+    // Its closures differ per call: a guard on this one would fail.
+    if proto.closures.get() > 1
+        || proto.is_vararg
         || proto.code.len() > INLINE_LIMIT
         || crate::dmm::Gc::ptr_eq(proto, b.proto)
         || base + proto.max_stack_size as usize > 255

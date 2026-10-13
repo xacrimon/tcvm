@@ -280,7 +280,7 @@ fn check_reps(f: &Func<'_>, i: Inst) -> Result<(), String> {
     let op = f.op(i);
     let args = f.args(i);
     let want: &[Rep] = match op {
-        Store(_) | Unbox(_) | IsType(_) | IsFalsy | Guard(_) | ToF64 => &[Val],
+        Store(_) | Unbox(_) | IsType(_) | IsFalsy | Guard(_) | GuardProto(_) | ToF64 => &[Val],
         SameBits | GuardSame => &[Val, Val],
         Helper(h) => h.sig().args,
         GuardTrue | GuardFalse | Br => &[B1],

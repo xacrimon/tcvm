@@ -331,6 +331,16 @@ pub(crate) fn compile<'gc>(
         ],
         native_act: crate::vm::native::native_act as *const () as usize,
         trampolines,
+        direct: f
+            .protos
+            .iter()
+            .map(|&p| {
+                (
+                    p.ptr.as_ptr() as u64,
+                    crate::jit::direct_target(p.jit_fast.get()),
+                )
+            })
+            .collect(),
     };
     // Allocated now, moved into the region after: the code embeds its address.
     let fired: Box<[std::cell::Cell<u32>]> = if config.deopt_all {
@@ -371,6 +381,11 @@ pub(crate) fn compile<'gc>(
                 .map(|&(k, level)| (em.asm.label_offset(k) as u32, level))
                 .collect()
         })
+        .collect();
+    let direct: Vec<(u32, u64)> = em
+        .direct
+        .iter()
+        .map(|&(l, p)| (em.asm.label_offset(l) as u32, p))
         .collect();
     let words = em
         .asm
@@ -504,6 +519,7 @@ pub(crate) fn compile<'gc>(
             entry_regs: lowered.entry_regs.clone().into_boxed_slice(),
             entry_fails: std::cell::Cell::new(0),
             proto: closure.proto,
+            protos: f.protos.clone().into_boxed_slice(),
             entry_pc: pc,
             nest: nest.into_boxed_slice(),
             num_spills: em.num_spills,
@@ -517,6 +533,17 @@ pub(crate) fn compile<'gc>(
     region
         .code
         .patch_u64(region_word, crate::dmm::Gc::as_ptr(region) as u64);
+    // The callees repoint the direct calls as their fast entries change.
+    for (off, p) in direct {
+        let proto = *f
+            .protos
+            .iter()
+            .find(|q| q.ptr.as_ptr() as u64 == p)
+            .unwrap();
+        let state = crate::jit::state::jit_state(ctx.mutation(), proto);
+        let weak = crate::dmm::Gc::downgrade(region);
+        state.borrow_mut(ctx.mutation()).callers.push((weak, off));
+    }
     Ok(region)
 }
 
