@@ -1,0 +1,906 @@
+//! The method JIT (`jit-design.md`): regions compiled from a prototype's
+//! function entry or a hot loop header, entered and left as dispatch targets.
+
+pub(crate) mod backend;
+pub(crate) mod build;
+pub(crate) mod compile;
+pub(crate) mod feedback;
+pub(crate) mod helpers;
+pub(crate) mod ir;
+pub(crate) mod layout;
+pub(crate) mod opt;
+pub(crate) mod region;
+pub(crate) mod state;
+#[cfg(test)]
+mod tests;
+
+use crate::dmm::Gc;
+use crate::env::function::LuaFn;
+use crate::env::value::Value;
+use crate::instruction::{Instruction, Op};
+use crate::jit::ir::ExitKind;
+use crate::jit::region::{ExitInfo, Loc, Region, SRep};
+use crate::jit::state::{
+    EXIT_HOT, Entry, EntryState, JitStateRef, MAX_COMPILES, MAX_ENTRIES, MAX_RETRIES, MAX_STRIKES,
+    jit_state,
+};
+use crate::lua::Context;
+use crate::vm::abi::{Handler, Slot, handler};
+use crate::vm::frame;
+
+const PTR_MASK: u64 = (1 << 48) - 1;
+
+/// Where a compiled frame records its region, from its frame pointer.
+pub(crate) const FRAME_REGION: usize = 16;
+/// Its spill slots, from its frame pointer.
+pub(crate) const FRAME_SPILLS: usize = 24;
+
+/// A hash map with a fast, unkeyed hasher, for compile-time tables.
+pub(crate) type FastMap<K, V> = std::collections::HashMap<K, V, foldhash::fast::FixedState>;
+
+handler! {
+    bind(insn, pc, base, rt, closure, thread, nret, values);
+
+    /// A compiled function entry: tail into its region, unless the native
+    /// stack is past its budget (H9): the function runs interpreted, which
+    /// takes no native stack.
+    op fn op_jit_entry {
+        if std::hint::unlikely(below_budget(thread!())) {
+            next!()
+        }
+        let code = rt.jit_entry(insn.d());
+        tail!(code)
+    }
+
+    /// A compiled loop entry, or the instruction it replaced past the
+    /// budget.
+    op fn op_jit_loop {
+        if std::hint::unlikely(below_budget(thread!())) {
+            let word = original_of(closure, insn);
+            let h = rt.handler(word.opcode());
+            tail!(h, insn = Slot::insn(word))
+        }
+        let code = rt.jit_entry(insn.d());
+        tail!(code)
+    }
+
+    /// A counting instruction's counter ran out: compile its entry and enter
+    /// it, or run the instruction. `insn` is the counting word, `pc` past it,
+    /// and the frame stands exactly at it.
+    slow fn jit_hot {
+        let word = insn.as_insn();
+        let jit = rt.jit();
+        let counter = &jit.hot[word.hot_counter()];
+        if !jit.config.enabled || jit.exhausted.get() {
+            counter.set(u16::MAX);
+            let h = rt.handler(word.opcode());
+            tail!(h, insn = Slot::insn(word))
+        }
+        counter.set(jit.hot_start(word));
+        let closure: LuaFn<'gc> = unsafe { frame::closure(base) };
+        let site = unsafe { pc.sub(1).offset_from_unsigned(closure.code) } as u32;
+        if let Some(at) = entry_site(closure, site, word) {
+            let w = unsafe { *closure.code.add(at as usize) };
+            if let Some(entry) = try_compile(rt, closure, at, w, base) {
+                let jw = unsafe { *closure.code.add(at as usize) };
+                let h = unsafe { as_handler(entry) };
+                let pc = unsafe { closure.code.add(at as usize + 1) };
+                tail!(h, pc = pc, insn = Slot::insn(jw), closure = Slot::closure(closure))
+            }
+        }
+        // The instruction counts again when it runs: not to trip at once.
+        counter.set(jit.hot_start(word).saturating_add(1));
+        let h = rt.handler(word.opcode());
+        tail!(h, insn = Slot::insn(word), closure = Slot::closure(closure))
+    }
+
+    /// Leave a region (from `exit_common`, its frame popped): `insn` is the
+    /// region and the exit, the register image is in the runtime. Rebuild
+    /// the frame from the exit's snapshot and continue in the interpreter,
+    /// in a level of its own when compiled code had called the frame.
+    slow fn jit_exit {
+        let raw = insn.raw();
+        let region: &Region<'gc> = unsafe { &*((raw & PTR_MASK) as *const Region<'gc>) };
+        let k = (raw >> 48) as usize;
+        let e = &region.exits[k];
+        if let Some(f) = region.fired.get(k) {
+            f.set(1);
+        }
+        let mc = rt.mutation();
+        let img = rt.jit().exit_regs();
+        let snap = region.snap(e);
+        // Inlined calls' frames, outermost first, each a callee of the one
+        // around it.
+        let mut fbase = base;
+        let mut fclosure: LuaFn<'gc> = unsafe { frame::closure(base) };
+        let region_closure = fclosure;
+        for fr in snap.frames() {
+            let callee = region.pool[fr.func as usize]
+                .get_function()
+                .and_then(|f| f.as_lua())
+                .expect("an inlined Lua closure");
+            debug_assert_eq!(fr.delta as usize, fr.a as usize + frame::HDR);
+            unsafe {
+                let nb = fbase.add(fr.delta as usize);
+                frame::write_hdr(
+                    nb.sub(frame::HDR),
+                    frame::lua_func_word(callee, 0),
+                    crate::vm::abi::handler_bits(rt.ret(fr.c)),
+                    fbase,
+                    fclosure.code.add(fr.caller_pc as usize + 1),
+                );
+                fbase = nb;
+            }
+            fclosure = callee;
+        }
+        for s in snap.entries() {
+            let w = match s.loc {
+                Loc::Reg(i) => img[i as usize].get(),
+                Loc::Spill(i) => img[crate::jit::state::IMAGE_SPILLS + i as usize].get(),
+                loc => const_word(region, loc),
+            };
+            unsafe { base.add(s.reg as usize).write(entry_value(mc, s.rep, w)) };
+        }
+        // A fast-called frame's header has no continuation (D4): it returns
+        // through the level `exit_common` started.
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let w = frame::ret_word(base);
+            if w & !frame::flag::MASK == 0 {
+                let r = crate::jit::backend::aarch64::abi::ret_to_native;
+                frame::set_ret_word(base, w | crate::vm::abi::handler_bits(r));
+            }
+        }
+        base = fbase;
+        let closure = fclosure;
+        on_exit(rt, region_closure, closure, base, region, e, snap.kind, snap.pc);
+        let at = if snap.kind == ExitKind::Before { snap.pc } else { snap.pc + 1 };
+        let resume = unsafe { closure.code.add(at as usize) };
+        if e.tag == crate::jit::ir::ops::ExitTag::Gc {
+            tail!(crate::vm::dispatch::gc_park, pc = resume, insn = Slot::from_raw(0), closure = Slot::closure(closure))
+        }
+        let mut word = unsafe { *resume };
+        if word.is_jit_word() {
+            word = original_of(closure, word);
+        }
+        pc = unsafe { resume.add(1) };
+        let h = rt.handler(word.opcode());
+        tail!(h, insn = Slot::insn(word), closure = Slot::closure(closure))
+    }
+
+    /// A failed entry guard (from the region's entry-fail stub, `insn` the
+    /// region, its frame popped and nothing else changed): note the entry's
+    /// kinds and run the original instruction.
+    slow fn jit_entry_fail {
+        let region: &Region<'gc> = unsafe { &*(insn.raw() as *const Region<'gc>) };
+        let closure: LuaFn<'gc> = unsafe { frame::closure(base) };
+        on_entry_fail(rt, closure, base, region);
+        let site = unsafe { closure.code.add(region.entry_pc as usize) };
+        let mut word = unsafe { *site };
+        if word.is_jit_word() {
+            word = original_of(closure, word);
+        }
+        pc = unsafe { site.add(1) };
+        let h = rt.handler(word.opcode());
+        tail!(h, insn = Slot::insn(word), closure = Slot::closure(closure))
+    }
+
+    /// An entry whose slot a hot exit pointed here: run the original word
+    /// while its feedback settles, then compile it again and enter it, or
+    /// blacklist it.
+    slow fn jit_settle {
+        let word = insn.as_insn();
+        let closure: LuaFn<'gc> = unsafe { frame::closure(base) };
+        let site = unsafe { pc.sub(1) };
+        let at = unsafe { site.offset_from_unsigned(closure.code) } as u32;
+        match settle(rt, closure, at, word.d(), base) {
+            Ok(entry) => {
+                let h = unsafe { as_handler(entry) };
+                tail!(h, insn = Slot::insn(word), closure = Slot::closure(closure))
+            }
+            Err(original) => {
+                let h = rt.handler(original.opcode());
+                tail!(h, insn = Slot::insn(original), closure = Slot::closure(closure))
+            }
+        }
+    }
+}
+
+/// The word of a constant snapshot location.
+fn const_word(region: &Region<'_>, loc: Loc) -> u64 {
+    match loc {
+        Loc::Const(c) => region.consts[c as usize],
+        Loc::Nil => Value::nil().to_raw(),
+        Loc::False => Value::boolean(false).to_raw(),
+        Loc::True => Value::boolean(true).to_raw(),
+        Loc::Reg(_) | Loc::Spill(_) | Loc::Home => unreachable!("not a constant location"),
+    }
+}
+
+/// A snapshot entry's word as the value it stands for.
+fn entry_value<'gc>(mc: &crate::dmm::Mutation<'gc>, rep: SRep, w: u64) -> Value<'gc> {
+    match rep {
+        SRep::Val => unsafe { Value::from_raw(w) },
+        SRep::I32 => Value::small(w as i32),
+        SRep::I64 => Value::integer(mc, w as i64),
+        SRep::F64 => Value::float(f64::from_bits(w)),
+        SRep::B1 => Value::boolean(w & 1 != 0),
+    }
+}
+
+/// Whether the native stack pointer is past the thread's budget, where
+/// compiled code refuses entry.
+#[inline(always)]
+fn below_budget(ts: &crate::env::thread::ThreadState<'_>) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let sp: usize;
+        unsafe {
+            core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags))
+        };
+        sp < ts.native_limit
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = ts;
+        false
+    }
+}
+
+/// `code` as the dispatch target it is.
+///
+/// # Safety
+/// `code` is the entry of a region or a handler.
+#[inline(always)]
+pub(crate) unsafe fn as_handler(code: *const u8) -> Handler {
+    unsafe { std::mem::transmute::<*const u8, Handler>(code) }
+}
+
+/// The entry the counting `word` at `site` compiles, the frame being the
+/// same there: the `LOOP` a back edge jumps past, else the word itself (a
+/// `goto`'s `JMP_BACK` too). None when a JIT word is there already (an exit
+/// dispatched `word` around it), or the back edge is an entry's.
+fn entry_site(closure: LuaFn<'_>, site: u32, word: Instruction) -> Option<u32> {
+    let code = |pc: u32| unsafe { *closure.code.add(pc as usize) };
+    let at = match word.op() {
+        Op::JMP_BACK | Op::TFORLOOP => {
+            if let Some(state) = closure.proto.jit.get()
+                && state
+                    .borrow()
+                    .entries
+                    .iter()
+                    .any(|e| e.back_edges.contains(&site))
+            {
+                return None;
+            }
+            let t = (site as i64 + 1 + word.branch_offset() as i64) as u32;
+            match code(t - 1) {
+                h if h.op() == Op::LOOP => t - 1,
+                h if h.is_jit_word() && original_of(closure, h).op() == Op::LOOP => return None,
+                _ => site,
+            }
+        }
+        _ => site,
+    };
+    (!code(at).is_jit_word()).then_some(at)
+}
+
+/// The word a JIT word replaced.
+fn original_of(closure: LuaFn<'_>, word: Instruction) -> Instruction {
+    let state = closure
+        .proto
+        .jit
+        .get()
+        .expect("a JIT word without a JIT state");
+    let st = state.borrow();
+    st.entries
+        .iter()
+        .find(|e| e.slot == word.d())
+        .map(|e| e.original)
+        .expect("a JIT word without its entry")
+}
+
+fn log(ctx: Context<'_>, msg: impl FnOnce() -> String) {
+    if ctx.jit().config.log {
+        eprintln!("jit: {}", msg());
+    }
+}
+
+/// Compile the entry at `at` and install it; its entry address.
+fn try_compile<'gc>(
+    ctx: Context<'gc>,
+    closure: LuaFn<'gc>,
+    at: u32,
+    word: Instruction,
+    frame: *const Value<'gc>,
+) -> Option<*const u8> {
+    let config = &ctx.jit().config;
+    if let Some(only) = &config.only
+        && !crate::jit::compile::chunk_name(closure).contains(only.as_str())
+    {
+        return None;
+    }
+    let mc = ctx.mutation();
+    let state = jit_state(mc, closure.proto);
+    {
+        let st = state.borrow();
+        if st.refused.contains(&at) || st.compiles >= MAX_COMPILES || st.strikes >= MAX_STRIKES {
+            return None;
+        }
+    }
+    match compile_caught(ctx, closure, at, frame, &[]) {
+        Ok(region) => {
+            let entry = install(ctx, closure, state, at, word, region)?;
+            log(ctx, || {
+                format!(
+                    "compiled {} pc{at} ({}), {} bytes, {} exits",
+                    crate::jit::compile::chunk_name(closure),
+                    word.op().name(),
+                    region.code.len(),
+                    region.exits.len()
+                )
+            });
+            Some(entry)
+        }
+        Err(e) => {
+            log(ctx, || {
+                format!(
+                    "compile of {} pc{at} failed: {e}",
+                    crate::jit::compile::chunk_name(closure)
+                )
+            });
+            let mut st = state.borrow_mut(mc);
+            if !matches!(e, crate::jit::compile::CompileError::Useless) {
+                st.strikes += 1;
+            }
+            st.refused.push(at);
+            None
+        }
+    }
+}
+
+fn compile_caught<'gc>(
+    ctx: Context<'gc>,
+    closure: LuaFn<'gc>,
+    at: u32,
+    frame: *const Value<'gc>,
+    seen: &[(u8, crate::jit::ir::types::TypeSet)],
+) -> Result<Gc<'gc, Region<'gc>>, crate::jit::compile::CompileError> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let r = crate::vm::stack::on_host(ctx, || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::jit::compile::compile(ctx, closure, at, frame, seen)
+            }))
+        });
+        match r {
+            Ok(r) => r,
+            Err(p) => {
+                let msg = p
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                Err(crate::jit::compile::CompileError::Backend(format!(
+                    "panic: {msg}"
+                )))
+            }
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (ctx, closure, at, frame, seen);
+        Err(crate::jit::compile::CompileError::Backend(
+            "no backend".into(),
+        ))
+    }
+}
+
+/// Install a compiled region over the counting word at `at`.
+fn install<'gc>(
+    ctx: Context<'gc>,
+    closure: LuaFn<'gc>,
+    state: JitStateRef<'gc>,
+    at: u32,
+    word: Instruction,
+    region: Gc<'gc, Region<'gc>>,
+) -> Option<*const u8> {
+    let jit = ctx.jit();
+    let slot = jit.alloc_slot(region.entry)?;
+    let hot = word.hot_counter() as u8;
+    let jw = if word.op() == Op::FUNC {
+        Instruction::jit_entry(hot, slot)
+    } else {
+        Instruction::jit_loop(hot, slot)
+    };
+    let mc = ctx.mutation();
+    let mut st = state.borrow_mut(mc);
+    st.age += 1;
+    let age = st.age;
+    // A loop's back edges, which jump past its `LOOP`, re-enter it now.
+    let mut back_edges = Vec::new();
+    if word.op() == Op::LOOP {
+        for pc in 0..closure.proto.code.len() as u32 {
+            let mut i = unsafe { *closure.code.add(pc as usize) };
+            if matches!(i.op(), Op::JMP_BACK | Op::TFORLOOP)
+                && pc as i64 + 1 + i.branch_offset() as i64 == at as i64 + 1
+                && !st.entries.iter().any(|e| e.back_edges.contains(&pc))
+            {
+                assert!(i.set_branch_offset(i.branch_offset() - 1));
+                write_code(closure, pc, i);
+                back_edges.push(pc);
+            }
+        }
+    }
+    st.entries.push(Entry {
+        pc: at,
+        original: word,
+        slot,
+        region: Some(region),
+        retries: 0,
+        free_recompile: false,
+        settle: 0,
+        state: EntryState::Compiled,
+        nest: region.nest.clone(),
+        age,
+        back_edges: back_edges.into_boxed_slice(),
+        seen: Vec::new(),
+    });
+    st.regions.push(region);
+    st.compiles += 1;
+    write_code(closure, at, jw);
+    if !region.fast_entry.is_null() {
+        closure.proto.jit_fast.set(region.fast_entry as usize);
+    }
+    if st.entries.len() > MAX_ENTRIES {
+        // A loop entry inside another live entry's loop, whose region
+        // covers it but for the rest of one outer iteration after a deopt
+        // (5.2): the deepest such, else the oldest loop entry, never this one.
+        let inside = |e: &Entry<'_>| {
+            st.entries
+                .iter()
+                .any(|o| o.pc != e.pc && !o.nest.is_empty() && e.nest[1..].contains(&o.nest[0]))
+        };
+        let victim = st
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.pc != at && !e.nest.is_empty())
+            .max_by_key(|(_, e)| {
+                let n = inside(e);
+                (
+                    n,
+                    if n { e.nest.len() } else { 0 },
+                    std::cmp::Reverse(e.age),
+                )
+            })
+            .map(|(i, _)| i);
+        if let Some(v) = victim {
+            let e = st.entries.remove(v);
+            retire_entry(ctx, closure, &e);
+        }
+    }
+    Some(region.entry)
+}
+
+fn write_code(closure: LuaFn<'_>, at: u32, word: Instruction) {
+    // SAFETY: `Code` keeps instructions in cells.
+    unsafe { closure.code.add(at as usize).cast_mut().write(word) };
+}
+
+/// Put an entry's original word back, and its back edges past it, and let
+/// go of its slot and region.
+fn retire_entry(ctx: Context<'_>, closure: LuaFn<'_>, e: &Entry<'_>) {
+    write_code(closure, e.pc, e.original);
+    if e.pc == 0 {
+        closure.proto.jit_fast.set(0);
+    }
+    for &pc in &e.back_edges {
+        let mut i = unsafe { *closure.code.add(pc as usize) };
+        assert!(i.set_branch_offset(i.branch_offset() + 1));
+        write_code(closure, pc, i);
+    }
+    ctx.jit().free_slot(e.slot);
+    if let Some(r) = e.region {
+        r.retired.set(true);
+    }
+}
+
+/// What an exit leaves behind: the operand kinds the guard saw, the count,
+/// and a recompile request when the exit is hot. `closure` and `base` are
+/// the innermost frame's, an inlined callee's when the exit is in its body
+/// (E1), whose sites the feedback is for; `region_closure` the region's.
+#[allow(clippy::too_many_arguments)]
+fn on_exit<'gc>(
+    ctx: Context<'gc>,
+    region_closure: LuaFn<'gc>,
+    closure: LuaFn<'gc>,
+    base: *mut Value<'gc>,
+    region: &Region<'gc>,
+    e: &ExitInfo,
+    kind: ExitKind,
+    pc: u32,
+) {
+    use crate::jit::ir::ops::ExitTag;
+    // A `Before` exit's operands are in their home slots; the other kinds
+    // follow a completed instruction and have no failed guard.
+    if kind == ExitKind::Before {
+        let extra = match e.tag {
+            ExitTag::Overflow => crate::jit::feedback::OVERFLOW,
+            ExitTag::Mm => crate::jit::feedback::MM,
+            ExitTag::Bounds => crate::jit::feedback::ARR_MISS,
+            ExitTag::Const => crate::jit::feedback::CONST_MISS,
+            _ => 0,
+        };
+        match e.site {
+            // The frame is the loop header's: only the miss is the access's.
+            Some(s) => {
+                if let Some(c) = closure.proto.feedback.get(s as usize) {
+                    c.set(c.get() | extra);
+                }
+            }
+            None => record_site(closure, base, pc, extra),
+        }
+        if e.tag == ExitTag::Shape {
+            record_shape(ctx, closure, base, pc);
+        }
+        if e.tag == ExitTag::Type {
+            let state = jit_state(ctx.mutation(), closure.proto);
+            let mut st = state.borrow_mut(ctx.mutation());
+            if !st.kind_exits.contains(&pc) {
+                st.kind_exits.push(pc);
+            }
+        }
+    }
+    let n = e.count.get() + 1;
+    e.count.set(n);
+    if n == 1 {
+        log(ctx, || {
+            format!(
+                "first exit {} pc{} ({:?}) of the region at pc{}",
+                crate::jit::compile::chunk_name(closure),
+                pc,
+                e.tag,
+                region.entry_pc
+            )
+        });
+    }
+    if region.retired.get() {
+        return;
+    }
+    if e.tag == ExitTag::NeverRan && n == 1 {
+        request_recompile(ctx, region_closure, region, true);
+    } else if e.tag.widenable() && n == region.exit_hot.get() {
+        log(ctx, || {
+            format!(
+                "hot exit {} pc{} ({:?}) of the region at pc{}",
+                crate::jit::compile::chunk_name(closure),
+                pc,
+                e.tag,
+                region.entry_pc
+            )
+        });
+        // Feedback only grows (kinds, the overflow, misses and metamethod
+        // bits, shapes up to `MAX_SHAPES + 1`), so a recompile that learns
+        // some is outside the budget, as the never-executed rule's are.
+        let st = jit_state(ctx.mutation(), closure.proto);
+        let st = st.borrow();
+        let byte = closure
+            .proto
+            .feedback
+            .get(e.site.unwrap_or(pc) as usize)
+            .map_or(0, |c| c.get());
+        // An inlined callee's kinds and shapes are its own state's.
+        let inlined = !std::ptr::eq(closure.as_ptr(), region_closure.as_ptr());
+        let learned = byte != e.byte
+            || !inlined
+                && match e.tag {
+                    ExitTag::Type => st.kind_exits[region.known.0 as usize..].contains(&pc),
+                    ExitTag::Shape => st.shapes_seen[region.known.1 as usize..]
+                        .iter()
+                        .any(|&(p, _)| p == pc),
+                    _ => false,
+                };
+        drop(st);
+        request_recompile(ctx, region_closure, region, learned);
+    }
+}
+
+/// Shapes a site's chain may test (6.4); one more makes it megamorphic.
+pub(crate) const MAX_SHAPES: usize = 4;
+
+/// A shape exit at a field site: its receiver's shape, for a chain in the
+/// next compile.
+fn record_shape<'gc>(ctx: Context<'gc>, closure: LuaFn<'gc>, base: *mut Value<'gc>, pc: u32) {
+    let mut i = unsafe { *closure.code.add(pc as usize) };
+    if i.is_jit_word() {
+        i = original_of(closure, i);
+    }
+    let upval = |k: u8| unsafe { *closure.upvalue_ptr().add(k as usize) };
+    let recv = match i.op().unquickened() {
+        Op::GETTABUP | Op::SETTABUP => unsafe { upval(i.b()).value },
+        Op::GETTABUP_REF | Op::SETTABUP_REF => unsafe { upval(i.b()).cell }.get(),
+        Op::GETFIELD | Op::SELF | Op::SETFIELD => unsafe { *base.add(i.b() as usize) },
+        _ => return,
+    };
+    let Some(t) = recv.get_table() else {
+        return;
+    };
+    let shape = t.shape();
+    let state = jit_state(ctx.mutation(), closure.proto);
+    let mut st = state.borrow_mut(ctx.mutation());
+    let mut n = 0;
+    for &(p, s) in &st.shapes_seen {
+        if p == pc {
+            if crate::env::Shape::ptr_eq(s, shape) {
+                return;
+            }
+            n += 1;
+        }
+    }
+    if n <= MAX_SHAPES {
+        st.shapes_seen.push((pc, shape));
+    }
+}
+
+/// Record the kinds of the operands of the site at `pc`, from the frame just
+/// rebuilt, into its feedback byte.
+fn record_site<'gc>(closure: LuaFn<'gc>, base: *mut Value<'gc>, pc: u32, extra: u8) {
+    use crate::instruction::Family;
+    use crate::jit::feedback as fb;
+    let site = unsafe { closure.code.add(pc as usize) };
+    let mut i = unsafe { *site };
+    if i.is_jit_word() {
+        i = original_of(closure, i);
+    }
+    // SAFETY: the operands are registers of the frame's window.
+    let reg = |r: u8| unsafe { *base.add(r as usize) };
+    let kind = |r: u8| fb::kind(reg(r));
+    let imm = |i: Instruction| if i.imm_is_int() { fb::SMALL } else { fb::FLOAT };
+    let num = |v: Value<'_>| v.is_float() || v.get_integer().is_some();
+    let mut bits = match i.op() {
+        // The loop's kind: integer (and whether it is big) or float.
+        Op::FORPREP => {
+            let (init, limit, step) = (reg(i.a()), reg(i.a() + 1), reg(i.a() + 2));
+            if init.get_integer().is_some() && step.get_integer().is_some() {
+                let float_limit = if limit.is_float() { fb::FLOAT_LIMIT } else { 0 };
+                fb::kind(init) | fb::kind(step) | (fb::kind(limit) & fb::BIGINT) | float_limit
+            } else if num(init) && num(step) {
+                fb::FLOAT
+            } else {
+                0
+            }
+        }
+        Op::FORLOOP | Op::FORLOOP_I | Op::FORLOOP_F => kind(i.a() + 1) | kind(i.a() + 2),
+        // An intrinsic's argument (12): one it did not cover makes the next
+        // compile a call.
+        Op::CALL
+        | Op::CALL_R0
+        | Op::CALL_R1
+        | Op::CALLS
+        | Op::CALLS_R0
+        | Op::CALLS_R1
+        | Op::TAILCALL => kind(i.a() + 4),
+        Op::GETTABLE | Op::SETTABLE => {
+            let recv = if reg(i.b()).get_table().is_some() {
+                0
+            } else {
+                fb::OTHER
+            };
+            recv | kind(i.c())
+        }
+        Op::UNM | Op::BNOT | Op::LEN => kind(i.b()),
+        Op::CONCAT => kind(i.b()) | kind(i.c()),
+        _ => 0,
+    };
+    bits |= match i.op().info().family {
+        Family::RegArith | Family::RegBit | Family::CmpReg
+            if i.op().info().family != Family::CmpReg =>
+        {
+            kind(i.b()) | kind(i.c())
+        }
+        Family::CmpReg => kind(i.a()) | kind(i.b()),
+        Family::ImmArith | Family::ImmBit => kind(i.b()) | imm(i),
+        Family::CmpImm => kind(i.a()),
+        _ if i.op().branch_sense().is_some() => kind(i.a()),
+        _ => 0,
+    };
+    bits |= extra;
+    if bits != 0 {
+        fb::record(closure, site, bits);
+    }
+}
+
+/// A failed entry guard: the kinds of every register the entry guards test
+/// into the entry's feedback, the entry instruction's operand kinds, and the
+/// count toward a recompile.
+fn on_entry_fail<'gc>(
+    ctx: Context<'gc>,
+    closure: LuaFn<'gc>,
+    base: *mut Value<'gc>,
+    region: &Region<'gc>,
+) {
+    record_site(closure, base, region.entry_pc, 0);
+    if let Some(state) = closure.proto.jit.get() {
+        let mut st = state.borrow_mut(ctx.mutation());
+        let me = region as *const Region<'gc>;
+        if let Some(e) = st
+            .entries
+            .iter_mut()
+            .find(|e| e.region.is_some_and(|x| Gc::as_ptr(x) == me))
+        {
+            for &r in &region.entry_regs {
+                // SAFETY: an entry guard tests a live register of the frame.
+                let kind = crate::jit::build::value_set(unsafe { *base.add(r as usize) });
+                match e.seen.iter_mut().find(|(x, _)| *x == r) {
+                    Some((_, s)) => *s |= kind,
+                    None => e.seen.push((r, kind)),
+                }
+            }
+        }
+    }
+    let n = region.entry_fails.get() + 1;
+    region.entry_fails.set(n);
+    let name = || crate::jit::compile::chunk_name(closure);
+    if n == 1 {
+        log(ctx, || {
+            format!("first entry fail {} pc{}", name(), region.entry_pc)
+        });
+    }
+    if n == region.exit_hot.get() && !region.retired.get() {
+        log(ctx, || {
+            format!("hot entry fail {} pc{}", name(), region.entry_pc)
+        });
+        request_recompile(ctx, closure, region, false);
+    }
+}
+
+/// Point the region's entry at `jit_settle`: a quarter of the hot count
+/// after an exit that learned something, so kinds that arrive close
+/// together make one compile; the hot count doubled per retry otherwise.
+fn request_recompile<'gc>(
+    ctx: Context<'gc>,
+    closure: LuaFn<'gc>,
+    region: &Region<'gc>,
+    learned: bool,
+) {
+    let Some(state) = closure.proto.jit.get() else {
+        return;
+    };
+    let mc = ctx.mutation();
+    let mut st = state.borrow_mut(mc);
+    let me = region as *const Region<'gc>;
+    if let Some(e) = st
+        .entries
+        .iter_mut()
+        .find(|e| e.region.is_some_and(|r| Gc::as_ptr(r) == me))
+        && e.state == EntryState::Compiled
+    {
+        let hot = ctx.jit().hot_start(e.original) as u32;
+        e.state = EntryState::Settling;
+        e.free_recompile |= learned;
+        e.settle = if e.free_recompile {
+            hot / 4
+        } else {
+            hot << e.retries
+        };
+        ctx.jit().set_slot(e.slot, jit_settle as *const u8);
+        // Compiled callers come through `enter` to the recompile too.
+        if e.pc == 0 {
+            closure.proto.jit_fast.set(0);
+        }
+    }
+}
+
+/// One execution of a settling entry: the original word to run while it
+/// settles, else the recompile's.
+fn settle<'gc>(
+    ctx: Context<'gc>,
+    closure: LuaFn<'gc>,
+    at: u32,
+    slot: u16,
+    frame: *const Value<'gc>,
+) -> Result<*const u8, Instruction> {
+    let state = closure
+        .proto
+        .jit
+        .get()
+        .expect("a settling entry without a JIT state");
+    {
+        let mut st = state.borrow_mut(ctx.mutation());
+        let e = st
+            .entries
+            .iter_mut()
+            .find(|e| e.slot == slot)
+            .expect("a settling entry without its entry");
+        if e.settle > 0 {
+            e.settle -= 1;
+            return Err(e.original);
+        }
+    }
+    recompile(ctx, closure, at, slot, frame)
+}
+
+/// Recompile the entry in `slot` at `at`: its new entry address, or the
+/// original word to run when it was blacklisted instead.
+fn recompile<'gc>(
+    ctx: Context<'gc>,
+    closure: LuaFn<'gc>,
+    at: u32,
+    slot: u16,
+    frame: *const Value<'gc>,
+) -> Result<*const u8, Instruction> {
+    let mc = ctx.mutation();
+    let state = closure
+        .proto
+        .jit
+        .get()
+        .expect("a recompile without a JIT state");
+    let (original, budget_left, seen) = {
+        let st = state.borrow();
+        let e = st
+            .entries
+            .iter()
+            .find(|e| e.slot == slot)
+            .expect("a recompile without its entry");
+        (
+            e.original,
+            e.free_recompile || e.retries < MAX_RETRIES,
+            e.seen.clone(),
+        )
+    };
+    let result = if budget_left && state.borrow().compiles < MAX_COMPILES {
+        compile_caught(ctx, closure, at, frame, &seen).map_err(|e| {
+            log(ctx, || {
+                format!(
+                    "recompile of {} pc{at} failed: {e}",
+                    crate::jit::compile::chunk_name(closure)
+                )
+            });
+        })
+    } else {
+        Err(())
+    };
+    let mut st = state.borrow_mut(mc);
+    let ei = st.entries.iter().position(|e| e.slot == slot).unwrap();
+    match result {
+        Ok(region) => {
+            let e = &mut st.entries[ei];
+            if let Some(old) = e.region {
+                old.retired.set(true);
+            }
+            if !e.free_recompile {
+                e.retries += 1;
+            }
+            e.free_recompile = false;
+            region.exit_hot.set(EXIT_HOT << e.retries);
+            e.region = Some(region);
+            e.state = EntryState::Compiled;
+            st.regions.push(region);
+            st.compiles += 1;
+            ctx.jit().set_slot(slot, region.entry);
+            if !region.fast_entry.is_null() {
+                closure.proto.jit_fast.set(region.fast_entry as usize);
+            }
+            log(ctx, || {
+                format!(
+                    "recompiled {} pc{at}",
+                    crate::jit::compile::chunk_name(closure)
+                )
+            });
+            Ok(region.entry)
+        }
+        Err(()) => {
+            let e = st.entries.remove(ei);
+            retire_entry(ctx, closure, &e);
+            st.refused.push(at);
+            log(ctx, || {
+                format!(
+                    "blacklisted {} pc{at}",
+                    crate::jit::compile::chunk_name(closure)
+                )
+            });
+            Err(original)
+        }
+    }
+}

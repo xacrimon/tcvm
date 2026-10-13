@@ -18,6 +18,8 @@ fn start(lua: &mut Lua, src: &str) -> StashedExecutor {
 /// integer result and how often dispatch left for the collector.
 fn run_counting(prologue: &str, src: &str) -> (i64, usize) {
     let mut lua = Lua::new();
+    // Compiled loops keep integers unboxed and allocate nothing.
+    lua.set_jit(false);
     lua.load_all();
     let ex = start(&mut lua, prologue);
     lua.finish(&ex).expect("prologue");

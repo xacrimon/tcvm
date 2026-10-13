@@ -47,6 +47,11 @@ pub struct KIdx(pub u16);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct IcIdx(pub u16);
 
+/// An index into the prototype's `callees`: one per CALL, CALLS and
+/// TAILCALL site (the JIT's callee feedback).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CalleeIdx(pub u16);
+
 /// An index into the prototype's child-prototype list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProtoIdx(pub u16);
@@ -167,6 +172,7 @@ impl_operand! {
     UpIdx    => |self| self.0 as u64,
     KIdx     => |self| self.0 as u64,
     IcIdx    => |self| self.0 as u64,
+    CalleeIdx => |self| self.0 as u64,
     ProtoIdx => |self| self.0 as u64,
     TemplateIdx => |self| self.0 as u64,
     u8       => |self| self as u64,
@@ -190,6 +196,8 @@ pub enum Shape {
     A,
     Ab,
     Abc,
+    Abcd,
+    Abcde,
     Ad,
     Abd,
     Abde,
@@ -233,6 +241,8 @@ pub mod shape {
     pub struct A;
     pub struct Ab;
     pub struct Abc;
+    pub struct Abcd;
+    pub struct Abcde;
     pub struct Ad;
     pub struct Abd;
     pub struct Abde;
@@ -307,6 +317,46 @@ pub mod shape {
                 op as u64
                     | slot8(a.bits()) << A_SHIFT
                     | slot8(b.bits()) << B_SHIFT
+                    | slot16(d.bits()) << D_SHIFT
+                    | slot16(e.bits()) << E_SHIFT,
+            )
+        }
+    }
+
+    impl Abcd {
+        #[inline(always)]
+        pub fn pack(
+            op: Op,
+            a: impl Operand,
+            b: impl Operand,
+            c: impl Operand,
+            d: impl Operand,
+        ) -> Instruction {
+            Instruction(
+                op as u64
+                    | slot8(a.bits()) << A_SHIFT
+                    | slot8(b.bits()) << B_SHIFT
+                    | slot8(c.bits()) << C_SHIFT
+                    | slot16(d.bits()) << D_SHIFT,
+            )
+        }
+    }
+
+    impl Abcde {
+        #[inline(always)]
+        pub fn pack(
+            op: Op,
+            a: impl Operand,
+            b: impl Operand,
+            c: impl Operand,
+            d: impl Operand,
+            e: impl Operand,
+        ) -> Instruction {
+            Instruction(
+                op as u64
+                    | slot8(a.bits()) << A_SHIFT
+                    | slot8(b.bits()) << B_SHIFT
+                    | slot8(c.bits()) << C_SHIFT
                     | slot16(d.bits()) << D_SHIFT
                     | slot16(e.bits()) << E_SHIFT,
             )
@@ -536,18 +586,27 @@ impl Instruction {
         );
     }
 
+    /// `a`, `b`; also of an `Abd` word (a TAILCALL read for its callee and
+    /// argument count).
     #[inline(always)]
     pub fn ab(self) -> (u8, u8) {
-        self.expect(Shape::Ab);
+        debug_assert!(
+            matches!(self.op().shape(), Shape::Ab | Shape::Abd),
+            "{:?} is not Ab-shaped",
+            self.op()
+        );
         (self.a(), self.b())
     }
 
-    /// `a`, `b`, `c`; also of an `AbcImm` word, whose first three slots
-    /// are the same (a CALLS read as a CALL).
+    /// `a`, `b`, `c`; also of a word with more slots after them (a CALLS
+    /// read as a CALL).
     #[inline(always)]
     pub fn abc(self) -> (u8, u8, u8) {
         debug_assert!(
-            matches!(self.op().shape(), Shape::Abc | Shape::AbcImm),
+            matches!(
+                self.op().shape(),
+                Shape::Abc | Shape::Abcd | Shape::Abcde | Shape::AbcImm
+            ),
             "{:?} is not Abc-shaped",
             self.op()
         );
@@ -679,6 +738,23 @@ impl fmt::Debug for Instruction {
             Shape::A => write!(f, "(a={})", self.a()),
             Shape::Ab => write!(f, "(a={}, b={})", self.a(), self.b()),
             Shape::Abc => write!(f, "(a={}, b={}, c={})", self.a(), self.b(), self.c()),
+            Shape::Abcd => write!(
+                f,
+                "(a={}, b={}, c={}, d={})",
+                self.a(),
+                self.b(),
+                self.c(),
+                self.d()
+            ),
+            Shape::Abcde => write!(
+                f,
+                "(a={}, b={}, c={}, d={}, e={})",
+                self.a(),
+                self.b(),
+                self.c(),
+                self.d(),
+                self.e()
+            ),
             Shape::Ad => write!(f, "(a={}, d={})", self.a(), self.d()),
             Shape::Abd => write!(f, "(a={}, b={}, d={})", self.a(), self.b(), self.d()),
             Shape::Abde => write!(
@@ -886,8 +962,8 @@ instructions! {
     0x35 JTSET      jtset       AbImm { dst: Reg, src: Reg, offset: Offset }
     0x36 JFSET      jfset       AbImm { dst: Reg, src: Reg, offset: Offset }
 
-    0x37 CALL       call        Abc   { func: Reg, args: u8, returns: u8 }
-    0x38 TAILCALL   tailcall    Ab    { func: Reg, args: u8 }
+    0x37 CALL       call        Abcd  { func: Reg, args: u8, returns: u8, callee: CalleeIdx }
+    0x38 TAILCALL   tailcall    Abd   { func: Reg, args: u8, callee: CalleeIdx }
     0x39 RETURN     ret         Ab    { values: Reg, count: u8 }
     0x3a FORLOOP    forloop     AImm  { base: Reg, offset: Offset }
     0x3b FORPREP    forprep     AImm  { base: Reg, offset: Offset }
@@ -988,8 +1064,8 @@ instructions! {
     // A CALL wanting no result (`returns` 1) or one (`returns` 2), whose
     // continuation is a constant. `returns` stays for the generic paths.
 
-    0x73 CALL_R0    call_r0     Abc   { func: Reg, args: u8, returns: u8 }
-    0x74 CALL_R1    call_r1     Abc   { func: Reg, args: u8, returns: u8 }
+    0x73 CALL_R0    call_r0     Abcd  { func: Reg, args: u8, returns: u8, callee: CalleeIdx }
+    0x74 CALL_R1    call_r1     Abcd  { func: Reg, args: u8, returns: u8, callee: CalleeIdx }
 
     // --- adaptive arithmetic -------------------------------------------------
     //
@@ -1116,9 +1192,28 @@ instructions! {
     // of a local. The callee is read when the call runs, after the
     // arguments (the manual fixes no order between the two). `R[func]`
     // gets the callee first, so the slow paths see a plain CALL.
-    0xc9 CALLS        calls       AbcImm { func: Reg, args: u8, returns: u8, src: Reg }
-    0xca CALLS_R0     calls_r0    AbcImm { func: Reg, args: u8, returns: u8, src: Reg }
-    0xcb CALLS_R1     calls_r1    AbcImm { func: Reg, args: u8, returns: u8, src: Reg }
+    0xc9 CALLS        calls       Abcde { func: Reg, args: u8, returns: u8, callee: CalleeIdx, src: Reg }
+    0xca CALLS_R0     calls_r0    Abcde { func: Reg, args: u8, returns: u8, callee: CalleeIdx, src: Reg }
+    0xcb CALLS_R1     calls_r1    Abcde { func: Reg, args: u8, returns: u8, callee: CalleeIdx, src: Reg }
+
+    // --- JIT entries -----------------------------------------------------------
+    //
+    // `FUNC` is pc 0 of every prototype and `LOOP` the header of every
+    // `while`, `repeat` and generic `for` loop: the words a compiled entry
+    // overwrites with `JIT_ENTRY`/`JIT_LOOP`, whose `entry` indexes the
+    // runtime's entry table. Each counting site has a hot counter `hot`:
+    // calls count the callee's `FUNC` at the call, a `repeat` loop its
+    // `LOOP`; `while` and generic `for` loops count at their back edge
+    // (`JMP_BACK`, `TFORLOOP`'s `b`), which jumps past the `LOOP` until an
+    // entry is installed there; numeric loops count in their `FORLOOP` (`b`)
+    // and are overwritten there, as is the `JMP_BACK` of a backward `goto`
+    // (its loop's latch, as LuaJIT's `BC_LOOP` at the `goto`).
+
+    0xcc FUNC         func        A      { hot: u8 }
+    0xcd LOOP         loop_       A      { hot: u8 }
+    0xce JIT_ENTRY    jit_entry   Ad     { hot: u8, entry: u16 }
+    0xcf JIT_LOOP     jit_loop    Ad     { hot: u8, entry: u16 }
+    0xd0 JMP_BACK     jmp_back    AImm   { hot: u8, offset: Offset }
 }
 
 /// The polymorphic family an opcode belongs to.
@@ -1140,7 +1235,7 @@ pub enum Family {
 }
 
 /// The operation of an arithmetic or bitwise opcode, generic or specialized.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArithKind {
     None,
     Add,
@@ -2318,6 +2413,29 @@ impl Instruction {
             i = i.with_adaptive(0, false);
         }
         i
+    }
+}
+
+/// Hot counters in the runtime's table (`Instruction::hot_counter`).
+pub const HOT_COUNTERS: usize = 64;
+
+impl Instruction {
+    /// The hot counter a counting instruction decrements: `a` of `FUNC`,
+    /// `LOOP`, `JMP_BACK` and the JIT words, `b` of a `FORLOOP` form and
+    /// `TFORLOOP`. For the slow paths: a handler knows its byte
+    /// (`count_hot!`).
+    pub(crate) fn hot_counter(self) -> usize {
+        let i = match self.op() {
+            Op::FORLOOP | Op::FORLOOP_I | Op::FORLOOP_F | Op::TFORLOOP => self.b(),
+            _ => self.a(),
+        };
+        i as usize % HOT_COUNTERS
+    }
+
+    /// Whether this is a word a compiled entry wrote.
+    #[inline(always)]
+    pub(crate) fn is_jit_word(self) -> bool {
+        matches!(self.op(), Op::JIT_ENTRY | Op::JIT_LOOP)
     }
 }
 

@@ -217,7 +217,7 @@ fn lua_create<'gc>(
 
 /// `insert(t, [pos,] value)` — append `value`, or insert it at `pos`, shifting
 /// later elements up by one.
-fn lua_insert<'gc>(
+pub(crate) fn lua_insert<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
@@ -410,7 +410,7 @@ fn lua_pack<'gc>(
 
 /// `remove(t [, pos])` — remove and return `t[pos]` (default `#t`), shifting
 /// later elements down by one.
-fn lua_remove<'gc>(
+pub(crate) fn lua_remove<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,

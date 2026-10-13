@@ -9,6 +9,7 @@
 #![feature(likely_unlikely)]
 #![feature(allocator_api)]
 #![feature(rust_preserve_none_cc)]
+#![feature(naked_functions_rustic_abi)]
 #![feature(variant_count)]
 #![feature(int_format_into)]
 #![feature(offset_of_enum)]
@@ -18,6 +19,7 @@ pub(crate) mod compiler;
 pub mod dmm;
 pub mod env;
 pub(crate) mod instruction;
+pub(crate) mod jit;
 pub mod lua;
 pub(crate) mod parser;
 pub mod vm;

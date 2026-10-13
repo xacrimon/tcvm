@@ -272,6 +272,10 @@ fn format_instruction(instr: &Instruction, proto: &Prototype<'_>) -> String {
             let offset = instr.branch_offset();
             format!("JMP             {offset:+}")
         }
+        Op::JMP_BACK => {
+            let offset = instr.branch_offset();
+            format!("JMP_BACK        {offset:+}")
+        }
         Op::JEQ | Op::JNEQ | Op::JLT | Op::JNLT | Op::JLE | Op::JNLE => {
             let (lhs, rhs, offset) = instr.ab_offset();
             format!("{:<15} R{lhs} R{rhs} {offset:+}", instr.op().name())
@@ -335,16 +339,16 @@ fn format_instruction(instr: &Instruction, proto: &Prototype<'_>) -> String {
             let (func, args, returns) = (instr.a(), instr.b(), instr.c());
             format!(
                 "CALLS           R{func} args={args} ret={returns} f=R{}",
-                instr.imm()
+                instr.e()
             )
         }
         Op::CALLS_R0 => {
             let (func, args) = (instr.a(), instr.b());
-            format!("CALLS_R0        R{func} args={args} f=R{}", instr.imm())
+            format!("CALLS_R0        R{func} args={args} f=R{}", instr.e())
         }
         Op::CALLS_R1 => {
             let (func, args) = (instr.a(), instr.b());
-            format!("CALLS_R1        R{func} args={args} f=R{}", instr.imm())
+            format!("CALLS_R1        R{func} args={args} f=R{}", instr.e())
         }
         Op::TAILCALL => {
             let (func, args) = instr.ab();
@@ -405,6 +409,9 @@ fn format_instruction(instr: &Instruction, proto: &Prototype<'_>) -> String {
         }
         Op::NOP => "NOP".to_string(),
         Op::STOP => "STOP".to_string(),
+        Op::FUNC => "FUNC".to_string(),
+        Op::LOOP => "LOOP".to_string(),
+        Op::JIT_ENTRY | Op::JIT_LOOP => format!("{:<15} entry={}", instr.op().name(), instr.d()),
         Op::ADDI
         | Op::SUBI
         | Op::MULI

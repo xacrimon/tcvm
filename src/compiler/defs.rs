@@ -256,8 +256,18 @@ pub struct Chunk<'gc> {
     /// GETFIELD/SETFIELD/GETTABUP/SETTABUP/SELF. The final count seeds the
     /// prototype's `ic_table` length.
     pub(super) next_ic_idx: u16,
+    /// Callee slots reserved so far, one per CALL, CALLS and TAILCALL: the
+    /// length of `Prototype::callees`.
+    pub(super) next_callee_idx: u16,
     /// Becomes `Prototype::templates`.
     pub(super) templates: Vec<Template<'gc>>,
+}
+
+/// The next hot counter of a chunk's round-robin.
+fn next_hot(hot: &mut u8) -> u8 {
+    let i = *hot;
+    *hot = (i + 1) % crate::instruction::HOT_COUNTERS as u8;
+    i
 }
 
 impl<'gc> Chunk<'gc> {
@@ -285,6 +295,7 @@ impl<'gc> Chunk<'gc> {
             too_long: false,
             source,
             next_ic_idx: 0,
+            next_callee_idx: 0,
             templates: Vec::new(),
         }
     }
@@ -301,6 +312,14 @@ impl<'gc> Chunk<'gc> {
         i
     }
 
+    /// Reserve a call site's callee slot. Past `u16::MAX` sites the last one
+    /// is shared, which the JIT reads as a polymorphic site at worst.
+    pub(super) fn alloc_callee_slot(&mut self) -> crate::instruction::CalleeIdx {
+        let i = self.next_callee_idx;
+        self.next_callee_idx = i.saturating_add(1);
+        crate::instruction::CalleeIdx(i.min(u16::MAX - 1))
+    }
+
     /// Resolve jump patches and convert into an immutable Prototype, with
     /// its nested functions. `assigned` must be final: it decides which
     /// upvalues are by value.
@@ -308,6 +327,7 @@ impl<'gc> Chunk<'gc> {
         mut self,
         mc: &Mutation<'gc>,
         assigned: &Assigned,
+        hot: &mut u8,
     ) -> Result<Gc<'gc, Prototype<'gc>>, CompileErrorKind> {
         // Resolve all jump patches
         for &(instr_idx, label_idx) in &self.jump_patches {
@@ -317,7 +337,12 @@ impl<'gc> Chunk<'gc> {
             assert!(
                 matches!(
                     instr.op(),
-                    Op::JMP | Op::FORPREP | Op::FORLOOP | Op::TFORPREP | Op::TFORLOOP
+                    Op::JMP
+                        | Op::JMP_BACK
+                        | Op::FORPREP
+                        | Op::FORLOOP
+                        | Op::TFORPREP
+                        | Op::TFORLOOP
                 ) || instr.op().branch_sense().is_some(),
                 "jump patch on non-jump instruction: {instr:?}"
             );
@@ -374,15 +399,27 @@ impl<'gc> Chunk<'gc> {
             }
         }
 
+        // Hot counters round-robin over the chunk's counting instructions.
+        for instr in &mut self.tape {
+            match instr.op() {
+                Op::FUNC | Op::LOOP | Op::JMP_BACK => instr.set_a(next_hot(hot)),
+                Op::FORLOOP | Op::TFORLOOP => instr.set_b(next_hot(hot)),
+                _ => {}
+            }
+        }
+
         let num_upvalues = upvalue_desc.len() as u8;
         debug_assert_eq!(self.tape.len(), self.lineinfo.len());
         let prototypes = self
             .prototypes
             .into_iter()
-            .map(|child| child.assemble(mc, assigned))
+            .map(|child| child.assemble(mc, assigned, hot))
             .collect::<Result<Vec<_>, _>>()?
             .into_boxed_slice();
 
+        let feedback = (0..self.tape.len())
+            .map(|_| std::cell::Cell::new(0))
+            .collect();
         Ok(Gc::new(
             mc,
             Prototype {
@@ -402,7 +439,11 @@ impl<'gc> Chunk<'gc> {
                 locvars: self.locvars.into_boxed_slice(),
                 upvalue_names: self.upvalue_names.into_boxed_slice(),
                 ic_table: IcTable::new(self.next_ic_idx as usize),
+                callees: crate::env::function::Callees::new(self.next_callee_idx as usize),
                 templates: self.templates.into_boxed_slice(),
+                feedback,
+                jit: crate::dmm::Lock::new(None),
+                jit_fast: std::cell::Cell::new(0),
             },
         ))
     }

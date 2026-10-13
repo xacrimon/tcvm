@@ -553,9 +553,20 @@ impl SlotLoc {
         self.0 & Self::SPILLED != 0
     }
 
+    /// The byte offset: from the table's lock when inline, into the spill
+    /// cell when spilled.
     #[inline(always)]
-    fn offset(self) -> usize {
+    pub(crate) fn offset(self) -> usize {
         (self.0 & !Self::SPILLED) as usize
+    }
+
+    /// The encoded word, for an IR payload.
+    pub(crate) fn raw(self) -> u32 {
+        self.0
+    }
+
+    pub(crate) fn from_raw(raw: u32) -> Self {
+        SlotLoc(raw)
     }
 }
 
@@ -657,6 +668,14 @@ struct Aux<'gc> {
 pub struct InvalidKey;
 
 impl<'gc> TableState<'gc> {
+    // Field offsets compiled code reads (`jit::layout`).
+    pub(crate) const SHAPE_OFFSET: usize = core::mem::offset_of!(TableState<'static>, shape);
+    pub(crate) const SPILL_OFFSET: usize = core::mem::offset_of!(TableState<'static>, spill);
+    pub(crate) const SPILL_CAP_OFFSET: usize =
+        core::mem::offset_of!(TableState<'static>, spill_cap);
+    pub(crate) const ARRAY_OFFSET: usize = core::mem::offset_of!(TableState<'static>, array);
+    pub(crate) const ASIZE_OFFSET: usize = core::mem::offset_of!(TableState<'static>, asize);
+
     #[inline]
     pub fn shape(&self) -> Shape<'gc> {
         self.shape

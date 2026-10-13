@@ -13,11 +13,12 @@ use crate::lua::Context;
 use crate::vm::abi::{Exit, handler};
 use crate::vm::frame::{self, HDR, flag, land_results};
 use crate::vm::num;
+use crate::vm::ops::count_hot;
 use crate::vm::ops::meta::{call_chain_error, ret_close, ret_tfor};
 use crate::vm::unwind::OpError;
 
 /// The position slot's mark for an `ipairs` loop (see `op_tforprep`).
-const TFOR_IPAIRS: i32 = -1;
+pub(crate) const TFOR_IPAIRS: i32 = -1;
 
 /// Whether a to-be-closed variable is registered at or above `level`.
 #[inline]
@@ -53,6 +54,123 @@ fn close_upvalues_slow<'gc>(mc: &Mutation<'gc>, ts: &mut ThreadState<'gc>, level
         UpvalueCell::close(uv, mc);
         ts.open_upvalues.pop();
     }
+}
+
+/// The vararg of the frame at `base` that `key` names: an integer key
+/// `1..=nv` (an integral float too, as GETTABLE of an escaped vararg would
+/// take it), `"n"` the count, else nil.
+#[inline(always)]
+pub(crate) fn vararg_get<'gc>(
+    ctx: Context<'gc>,
+    base: *mut Value<'gc>,
+    key: Value<'gc>,
+) -> Value<'gc> {
+    let nv = unsafe { frame::nv(base) };
+    let extras = unsafe { base.sub(HDR + nv) };
+    let int_key = key.get_integer().or_else(|| {
+        let f = key.get_float()?;
+        let i = f as i64;
+        (i as f64 == f).then_some(i)
+    });
+    if let Some(k) = int_key {
+        if k >= 1 && (k as usize) <= nv {
+            unsafe { extras.add(k as usize - 1).read() }
+        } else {
+            Value::nil()
+        }
+    } else if key.get_string().is_some_and(|s| s.as_bytes() == b"n") {
+        Value::integer(ctx.mutation(), nv as i64)
+    } else {
+        Value::nil()
+    }
+}
+
+/// `{ extras...; n = count }` of the frame at `base` into `R[np]`
+/// (`createvarargtab`).
+#[inline(always)]
+pub(crate) fn vararg_table<'gc>(ctx: Context<'gc>, base: *mut Value<'gc>, np: usize) -> Table<'gc> {
+    let nv = unsafe { frame::nv(base) };
+    // In the register before filling, so a mid-fill allocation can't
+    // collect the table.
+    let table = Table::new(ctx);
+    unsafe { *base.add(np) = Value::table(table) };
+    let extras = unsafe { base.sub(HDR + nv) };
+    for i in 0..nv {
+        let v = unsafe { extras.add(i).read() };
+        table.raw_set(ctx, Value::integer(ctx.mutation(), i as i64 + 1), v);
+    }
+    table.raw_set(
+        ctx,
+        Value::string(ctx.symbols().n),
+        Value::integer(ctx.mutation(), nv as i64),
+    );
+    table
+}
+
+/// `CLOSURE` of prototype `idx` of `closure`, running at `base`, for `R[dst]`:
+/// by-value upvalues from the frame's slots, shared ones through cells,
+/// opened here (with `HAS_OPEN` set) when the slot has none.
+#[inline(always)]
+pub(crate) fn new_closure<'gc>(
+    ctx: Context<'gc>,
+    ts: &mut ThreadState<'gc>,
+    base: *mut Value<'gc>,
+    closure: LuaFn<'gc>,
+    idx: usize,
+    dst: u8,
+) -> Function<'gc> {
+    let proto = closure.proto.prototypes[idx];
+    let mut self_slot = None;
+    let mut captured = false;
+    let func = Function::new_lua(ctx.mutation(), proto, |slots| {
+        for (i, desc) in proto.upvalue_desc.iter().enumerate() {
+            let slot = match desc.source {
+                // A local function's capture of itself: its register is
+                // only written below.
+                UpvalSource::ParentLocal(idx) if desc.by_value && idx == dst => {
+                    self_slot = Some(i);
+                    UpvalueSlot {
+                        value: Value::nil(),
+                    }
+                }
+                UpvalSource::ParentLocal(idx) if desc.by_value => UpvalueSlot {
+                    value: unsafe { *base.add(idx as usize) },
+                },
+                UpvalSource::ParentLocal(idx) => {
+                    let slot = unsafe { base.add(idx as usize) };
+                    // Sorted by slot, so this frame's are at the end.
+                    let open = &ts.open_upvalues;
+                    let below = open.iter().rposition(|uv| uv.slot() <= slot);
+                    let cell = match below {
+                        Some(i) if open[i].slot() == slot => open[i],
+                        _ => {
+                            let uv = UpvalueCell::new_open(ctx.mutation(), ts.handle(), slot);
+                            let at = below.map_or(0, |i| i + 1);
+                            ts.open_upvalues.insert(at, uv);
+                            captured = true;
+                            uv
+                        }
+                    };
+                    UpvalueSlot { cell }
+                }
+                UpvalSource::ParentUpvalue(idx) => unsafe {
+                    *closure.upvalue_ptr().add(idx as usize)
+                },
+            };
+            unsafe { slots.add(i).write(slot) };
+        }
+    });
+    if captured {
+        unsafe { frame::set_flags(base, flag::HAS_OPEN) };
+    }
+    if let Some(i) = self_slot {
+        // The fresh closure pointing at itself needs no barrier.
+        unsafe {
+            let f = LuaFn::from_function_unchecked(func);
+            (*f.upvalue_ptr().add(i)).value = Value::function(func);
+        }
+    }
+    func
 }
 
 /// Take the innermost to-be-closed variable off the list: its value and
@@ -120,10 +238,11 @@ fn for_limit(init: i64, limit: Value, step: i64) -> Option<Option<i64>> {
 }
 
 /// Finish a TFORCALL step taken without calling the iterator: store `(k, v)`
-/// in the loop's variables and take the following TFORLOOP's jump, or once
-/// the walk is done, nil them and step past it.
+/// in the loop's variables and take the following TFORLOOP's jump, counted
+/// as TFORLOOP counts it, or once the walk is done, nil them and step past
+/// it.
 macro_rules! tfor_finish {
-    ($pc:ident, $base:ident, $step:expr, $vars:expr, $count:expr) => {{
+    ($pc:ident, $base:ident, $rt:ident, $step:expr, $vars:expr, $count:expr) => {{
         let vars: u8 = $vars;
         let count: u8 = $count;
         match $step {
@@ -135,9 +254,11 @@ macro_rules! tfor_finish {
                 for i in 2..count {
                     reg![vars + i] = Value::nil();
                 }
-                debug_assert_eq!(unsafe { (*$pc).op() }, Op::TFORLOOP);
-                let (_, offset) = unsafe { *$pc }.a_offset();
-                $pc = unsafe { $pc.add(1).offset(offset as isize) };
+                let w = unsafe { *$pc };
+                debug_assert_eq!(w.op(), Op::TFORLOOP);
+                $pc = unsafe { $pc.add(1) };
+                count_hot!($rt, w, b);
+                $pc = unsafe { $pc.offset(w.branch_offset() as isize) };
             }
             None => {
                 for i in 0..count {
@@ -161,6 +282,10 @@ fn write_forloop_form(pc: *const Instruction, offset: i32, form: Op) {
     unsafe {
         let site = pc.offset(offset as isize - 1).cast_mut();
         let word = *site;
+        // A compiled loop entry guards the loop kind itself.
+        if word.is_jit_word() {
+            return;
+        }
         debug_assert_eq!(word.generic_op(), Op::FORLOOP);
         if word.op() != form {
             site.write(word.with_op(form));
@@ -173,6 +298,15 @@ handler! {
 
     /// `pc += imm`
     op fn op_jmp {
+        jump_by!(insn.branch_offset());
+        next!()
+    }
+
+    /// A counted back edge, `pc += imm`: a `while` loop's, past its header's
+    /// `LOOP` (or to the `JIT_LOOP` an entry wrote there), or a backward
+    /// `goto`'s.
+    op fn op_jmp_back {
+        count_hot!(rt, insn, a);
         jump_by!(insn.branch_offset());
         next!()
     }
@@ -222,6 +356,11 @@ handler! {
                         && i32::try_from(s).is_ok()
                         && i32::try_from(i).is_ok();
                     write_forloop_form(pc, offset, if all_small { Op::FORLOOP_I } else { Op::FORLOOP });
+                    if !all_small {
+                        // A generic FORLOOP whose byte is empty never ran.
+                        let site = unsafe { pc.offset(offset as isize - 1) };
+                        crate::jit::feedback::record(closure, site, crate::jit::feedback::BIGINT);
+                    }
                     false
                 }
             }
@@ -255,7 +394,8 @@ handler! {
 
     /// `FORLOOP_I`: the integer loop whose last value, step and control
     /// variable are all small; anything else (`debug.setlocal` on the
-    /// hidden slots) goes to the generic FORLOOP.
+    /// hidden slots) goes to the generic FORLOOP. The FORLOOP forms count
+    /// a taken back edge, before writing anything.
     op fn op_forloop_i {
         let (a, offset) = insn.a_offset();
         let step = &reg![a + 1];
@@ -267,6 +407,7 @@ handler! {
         };
         let go = idx != last;
         if go {
+            count_hot!(rt, insn, b);
             let idx = Value::small(idx.wrapping_add(s));
             reg![a + 2] = idx;
             reg![a + 3] = idx;
@@ -286,6 +427,7 @@ handler! {
         let idx = reg![a + 2].read_float() + s;
         let go = if 0.0 < s { idx <= lim } else { lim <= idx };
         if go {
+            count_hot!(rt, insn, b);
             let idx = Value::float(idx);
             reg![a + 2] = idx;
             reg![a + 3] = idx;
@@ -295,7 +437,8 @@ handler! {
 
     /// Numeric for step: advance the control variable and jump back while
     /// iterations remain, reading the layout FORPREP leaves behind. The
-    /// generic form, for a loop with boxed values and for the forms' misses.
+    /// generic form, for a loop with boxed values and for the forms' misses,
+    /// which have not counted yet.
     op fn op_forloop {
         let (a, offset) = insn.a_offset();
         // The step's type tells the loop kind, and the hidden slots match it:
@@ -310,6 +453,7 @@ handler! {
             // also guarantees `idx + step` stays in range.
             let go = idx != last;
             if go {
+                count_hot!(rt, insn, b);
                 let idx = Value::small(idx.wrapping_add(s));
                 reg![a + 2] = idx;
                 reg![a + 3] = idx;
@@ -321,6 +465,7 @@ handler! {
             let idx = reg![a + 2].read_float() + s;
             let go = if 0.0 < s { idx <= lim } else { lim <= idx };
             if go {
+                count_hot!(rt, insn, b);
                 let idx = Value::float(idx);
                 reg![a + 2] = idx;
                 reg![a + 3] = idx;
@@ -334,8 +479,11 @@ handler! {
 
     /// FORLOOP for an integer loop whose values don't all fit a small int.
     slow fn forloop_slow {
-        let insn = insn_at!();
+        // `op_forloop`'s word: the one in `Code` may be a `JIT_LOOP`.
+        let insn = insn.as_insn();
         let (a, offset) = insn.a_offset();
+        let ts_closure = unsafe { frame::closure(base) };
+        crate::jit::feedback::record(ts_closure, unsafe { pc.sub(1) }, crate::jit::feedback::BIGINT);
         let (s, last, idx) = (reg![a + 1], reg![a], reg![a + 2]);
         let (s, last, idx) = unsafe {
             (
@@ -346,6 +494,7 @@ handler! {
         };
         let go = idx != last;
         if go {
+            count_hot!(rt, insn, b);
             let idx = Value::integer(rt.mutation(), idx.wrapping_add(s));
             reg![a + 2] = idx;
             reg![a + 3] = idx;
@@ -419,7 +568,7 @@ handler! {
             Step::End => None,
             Step::Slow => tail!(tfor_next),
         };
-        tfor_finish!(pc, base, step, vars, count)
+        tfor_finish!(pc, base, rt, step, vars, count)
     }
 
     /// `TFORCALL_IPAIRS`: the `ipairs` step through the array part.
@@ -449,7 +598,7 @@ handler! {
             }
         };
         drop(state);
-        tfor_finish!(pc, base, step, vars, count)
+        tfor_finish!(pc, base, rt, step, vars, count)
     }
 
     /// Generic for call: the loop variables = `R[a](R[a+1], first variable)`.
@@ -492,7 +641,7 @@ handler! {
             },
             _ => tail!(tforcall_generic),
         };
-        tfor_finish!(pc, base, step, vars, count)
+        tfor_finish!(pc, base, rt, step, vars, count)
     }
 
     /// TFORCALL's `next` step through a part of integer or other keys.
@@ -509,7 +658,7 @@ handler! {
             reg![a + 3] = next.map_or(Value::nil(), |p| Value::small(p as i32));
             (k, v)
         });
-        tfor_finish!(pc, base, step, vars, count)
+        tfor_finish!(pc, base, rt, step, vars, count)
     }
 
     /// TFORCALL's `ipairs` step past the array part: through the integer
@@ -530,7 +679,7 @@ handler! {
         } else {
             None
         };
-        tfor_finish!(pc, base, step, vars, count)
+        tfor_finish!(pc, base, rt, step, vars, count)
     }
 
     /// TFORCALL by calling the iterator.
@@ -554,10 +703,15 @@ handler! {
         tail!(crate::vm::ops::call::enter, pc = hdr as *const Instruction, insn = crate::vm::abi::Slot::nret(2))
     }
 
-    /// Generic for loop test: jump back while the first variable is not nil.
+    /// Generic for loop test: jump back while the first variable is not nil,
+    /// counting the back edge.
     op fn op_tforloop {
         let (a, offset) = insn.a_offset();
-        branch!(!reg![a + TFOR_VARS].is_nil(), offset)
+        let go = !reg![a + TFOR_VARS].is_nil();
+        if go {
+            count_hot!(rt, insn, b);
+        }
+        branch!(go, offset)
     }
 
     /// Close all upvalues and to-be-closed variables from `R[a]`.
@@ -615,52 +769,7 @@ handler! {
     /// `R[a] = closure(proto[d])`
     op fn op_closure {
         let (dst, proto_idx) = insn.ad();
-        let proto = closure.proto.prototypes[proto_idx as usize];
-        let ts = thread!();
-        let mut self_slot = None;
-        let mut captured = false;
-        let func = Function::new_lua(rt.mutation(), proto, |slots| {
-            for (i, desc) in proto.upvalue_desc.iter().enumerate() {
-                let slot = match desc.source {
-                    // A local function's capture of itself: its register is
-                    // only written below.
-                    UpvalSource::ParentLocal(idx) if desc.by_value && idx == dst => {
-                        self_slot = Some(i);
-                        UpvalueSlot { value: Value::nil() }
-                    }
-                    UpvalSource::ParentLocal(idx) if desc.by_value => UpvalueSlot { value: reg![idx] },
-                    UpvalSource::ParentLocal(idx) => {
-                        let slot = unsafe { base.add(idx as usize) };
-                        // Sorted by slot, so this frame's are at the end.
-                        let open = &ts.open_upvalues;
-                        let below = open.iter().rposition(|uv| uv.slot() <= slot);
-                        let cell = match below {
-                            Some(i) if open[i].slot() == slot => open[i],
-                            _ => {
-                                let uv = UpvalueCell::new_open(rt.mutation(), ts.handle(), slot);
-                                let at = below.map_or(0, |i| i + 1);
-                                ts.open_upvalues.insert(at, uv);
-                                captured = true;
-                                uv
-                            }
-                        };
-                        UpvalueSlot { cell }
-                    }
-                    UpvalSource::ParentUpvalue(idx) => upval!(idx),
-                };
-                unsafe { slots.add(i).write(slot) };
-            }
-        });
-        if captured {
-            unsafe { frame::set_flags(base, flag::HAS_OPEN) };
-        }
-        if let Some(i) = self_slot {
-            // The fresh closure pointing at itself needs no barrier.
-            unsafe {
-                let f = LuaFn::from_function_unchecked(func);
-                (*f.upvalue_ptr().add(i)).value = Value::function(func);
-            }
-        }
+        let func = new_closure(rt, thread!(), base, closure, proto_idx as usize, dst);
         reg![dst] = Value::function(func);
         gc_check!();
         next!()
@@ -707,7 +816,6 @@ handler! {
         if !ts.ensure_frame_slots(bi + dst as usize + nv) {
             raise!(OpError::StackOverflow)
         }
-        base = ts.slot_ptr(bi);
         jump_by!(-1);
         next!()
     }
@@ -741,7 +849,6 @@ handler! {
             if !ts.ensure_frame_slots(new_top) {
                 raise!(OpError::StackOverflow)
             }
-            base = ts.slot_ptr(bi);
             let filled = wanted.min(navail);
             let t = table.inner().borrow();
             for i in 0..filled {
@@ -760,32 +867,7 @@ handler! {
     /// `GETTABLE` at compile time, so `b` is unused here. Lua 5.5 `OP_GETVARG`.
     op fn op_varargget {
         let (dst, _, key) = insn.abc();
-        let key_val = reg![key];
-        let nv = unsafe { frame::nv(base) };
-        let extras = unsafe { base.sub(HDR + nv) };
-        // Normalize integral float keys (`args[1.0]` == `args[1]`) so the
-        // optimized path agrees with the GETTABLE an escaped vararg would use.
-        let int_key = key_val.get_integer().or_else(|| {
-            let f = key_val.get_float()?;
-            let i = f as i64;
-            (i as f64 == f).then_some(i)
-        });
-        let v = if let Some(k) = int_key {
-            if k >= 1 && (k as usize) <= nv {
-                unsafe { extras.add(k as usize - 1).read() }
-            } else {
-                Value::nil()
-            }
-        } else if let Some(s) = key_val.get_string() {
-            if s.as_bytes() == b"n" {
-                Value::integer(rt.mutation(), nv as i64)
-            } else {
-                Value::nil()
-            }
-        } else {
-            Value::nil()
-        };
-        reg![dst] = v;
+        reg![dst] = vararg_get(rt, base, reg![key]);
         next!()
     }
 
@@ -794,18 +876,7 @@ handler! {
     /// `{ extras...; n = count }` into `R[num_params]` (`createvarargtab`).
     op fn op_varargprep {
         if closure.proto.needs_vararg_table {
-            let nv = unsafe { frame::nv(base) };
-            let np = closure.num_params as usize;
-            // Store into the register before filling so a mid-fill allocation
-            // can't collect the table.
-            let table = Table::new(rt);
-            reg![np] = Value::table(table);
-            let extras = unsafe { base.sub(HDR + nv) };
-            for i in 0..nv {
-                let v = unsafe { extras.add(i).read() };
-                table.raw_set(rt, Value::integer(rt.mutation(), i as i64 + 1), v);
-            }
-            table.raw_set(rt, Value::string(rt.symbols().n), Value::integer(rt.mutation(), nv as i64));
+            vararg_table(rt, base, closure.num_params as usize);
             gc_check!();
         }
         next!()
@@ -817,6 +888,19 @@ handler! {
         if std::hint::unlikely(!reg![src].is_nil()) {
             raise!(OpError::GlobalRedefined(name_key))
         }
+        next!()
+    }
+
+    /// A function entry run as a word: only the JIT's fallbacks dispatch it
+    /// (calls count it and start at pc 1, `call::start!`).
+    op fn op_func {
+        count_hot!(rt, insn, a);
+        next!()
+    }
+
+    /// A loop header: count an iteration.
+    op fn op_loop {
+        count_hot!(rt, insn, a);
         next!()
     }
 

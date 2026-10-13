@@ -745,13 +745,14 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         returns: u8,
         src: Option<RegisterIndex>,
     ) {
+        let k = self.chunk.alloc_callee_slot();
         let insn = match (returns, src) {
-            (1, None) => Instruction::call_r0(func, args, returns),
-            (2, None) => Instruction::call_r1(func, args, returns),
-            (_, None) => Instruction::call(func, args, returns),
-            (1, Some(s)) => Instruction::calls_r0(func, args, returns, Reg(s.0)),
-            (2, Some(s)) => Instruction::calls_r1(func, args, returns, Reg(s.0)),
-            (_, Some(s)) => Instruction::calls(func, args, returns, Reg(s.0)),
+            (1, None) => Instruction::call_r0(func, args, returns, k),
+            (2, None) => Instruction::call_r1(func, args, returns, k),
+            (_, None) => Instruction::call(func, args, returns, k),
+            (1, Some(s)) => Instruction::calls_r0(func, args, returns, k, Reg(s.0)),
+            (2, Some(s)) => Instruction::calls_r1(func, args, returns, k, Reg(s.0)),
+            (_, Some(s)) => Instruction::calls(func, args, returns, k, Reg(s.0)),
         };
         self.emit(insn);
     }
@@ -1786,7 +1787,7 @@ pub fn compile<'gc>(
         assigned.clone(),
     )?;
     chunk
-        .assemble(ctx.mutation(), &assigned)
+        .assemble(ctx.mutation(), &assigned, &mut 0)
         .map_err(|kind| CompileError {
             kind,
             line_number: LineNumber(0),
@@ -1841,6 +1842,9 @@ fn compile_function_to_chunk<'gc, 'a>(
     };
 
     ctx.push_scope();
+
+    // The function entry's hot counter and JIT entry point.
+    ctx.emit(Instruction::func(0));
 
     // Emit VARARGPREP for vararg functions
     if is_vararg {
@@ -2038,13 +2042,14 @@ fn compile_goto(ctx: &mut Ctx, item: Goto) -> Result<(), CompileError> {
         .iter()
         .rev()
         .find_map(|labels| labels.get(&name).copied());
-    let label = match backward {
+    match backward {
         // Backward jump: close whatever locals it leaves (luac `gotostat`).
         Some(VisibleLabel { label, nactvar, .. }) => {
             if ctx.chunk.nactvar > nactvar {
                 ctx.emit(Instruction::close(Reg(nactvar)));
             }
-            label
+            // A backward goto's loop counts at its latch, as LuaJIT's.
+            ctx.emit_jump_instr(label, Instruction::jmp_back(0, Offset(0)));
         }
         None => {
             let label = ctx.new_label();
@@ -2056,11 +2061,9 @@ fn compile_goto(ctx: &mut Ctx, item: Goto) -> Result<(), CompileError> {
                 ndecls: ctx.decls.len(),
                 needs_close: false,
             });
-            label
+            ctx.emit_jump(label);
         }
-    };
-    ctx.emit_jump(label);
-
+    }
     Ok(())
 }
 
@@ -4113,7 +4116,8 @@ fn compile_expr_func_call(
 /// `frame_return`).
 fn compile_tail_func_call(ctx: &mut Ctx, item: FuncCall) -> Result<(), CompileError> {
     let (func, args_wire, _) = emit_func_call_setup(ctx, &item, false)?;
-    ctx.emit(Instruction::tailcall(func, args_wire));
+    let k = ctx.chunk.alloc_callee_slot();
+    ctx.emit(Instruction::tailcall(func, args_wire, k));
     // Frame is about to be torn down; conservatively snap freereg to func
     // so any post-TAILCALL code in the compiler (there shouldn't be any
     // reachable) sees a clean cursor.
@@ -4126,7 +4130,8 @@ fn compile_tail_func_call(ctx: &mut Ctx, item: FuncCall) -> Result<(), CompileEr
 /// register list.
 fn compile_tail_method_call(ctx: &mut Ctx, item: MethodCall) -> Result<(), CompileError> {
     let (func, args_wire) = emit_method_call_setup(ctx, &item)?;
-    ctx.emit(Instruction::tailcall(func, args_wire));
+    let k = ctx.chunk.alloc_callee_slot();
+    ctx.emit(Instruction::tailcall(func, args_wire, k));
     ctx.chunk.freereg = func.0;
     Ok(())
 }
@@ -4531,6 +4536,8 @@ fn compile_branch_cond_false(ctx: &mut Ctx, cond_expr: Expr) -> Result<JumpList,
 
 fn compile_while(ctx: &mut Ctx, item: While) -> Result<(), CompileError> {
     scope_lexical_break(ctx, |ctx| {
+        // The back edge counts and skips the `LOOP`, the entry's patch site.
+        ctx.emit(Instruction::loop_(0));
         let loop_start = ctx.new_label();
         ctx.set_label(loop_start, ctx.next_offset());
 
@@ -4549,7 +4556,7 @@ fn compile_while(ctx: &mut Ctx, item: While) -> Result<(), CompileError> {
         })?;
 
         // Jump back to condition check
-        ctx.emit_jump(loop_start);
+        ctx.emit_jump_instr(loop_start, Instruction::jmp_back(0, Offset(0)));
 
         // Patch all "condition false" jumps to the post-loop break target.
         let (break_label, _) = *ctx
@@ -4577,6 +4584,7 @@ fn compile_repeat(ctx: &mut Ctx, item: Repeat) -> Result<(), CompileError> {
         // in the same lexical scope.
         scope_lexical(ctx, |ctx| {
             let loop_start_off = ctx.next_offset();
+            ctx.emit(Instruction::loop_(0));
 
             // Compile body
             let stmts: Vec<_> = item.block().map(|b| b.collect()).unwrap_or_default();
@@ -4853,6 +4861,8 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
         // TFORPREP: jump to the test
         ctx.emit_jump_instr(loop_test, Instruction::tforprep(base, Offset(0)));
 
+        // Only an entry's back edge reaches the `LOOP`: TFORLOOP's skips it.
+        ctx.emit(Instruction::loop_(0));
         ctx.set_label(loop_body, ctx.next_offset());
 
         // Loop variables live in the body scope (see `compile_for_num`).

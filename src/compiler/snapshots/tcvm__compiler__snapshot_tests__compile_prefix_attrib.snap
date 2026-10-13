@@ -6,15 +6,16 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  [  1]  VARARGPREP      fixed=0
-0001  [  3]  LOADNIL         R0 count=1
-0002  [  3]  TBC             R0
-0003  [  4]  LOADNIL         R1 count=1
-0004  [  4]  TBC             R1
-0005  [  5]  LOADI           R2 1
-0006  [  5]  LOADI           R3 2
-0007  [  5]  LOADI           R4 3
-0008  [  5]  MOVE            R5 R0
-0009  [  5]  MOVE            R6 R1
-0010  [  5]  LOADI           R7 5
-0011  [  5]  RETURN          R2 count=7
+0000  [  1]  FUNC
+0001  [  1]  VARARGPREP      fixed=0
+0002  [  3]  LOADNIL         R0 count=1
+0003  [  3]  TBC             R0
+0004  [  4]  LOADNIL         R1 count=1
+0005  [  4]  TBC             R1
+0006  [  5]  LOADI           R2 1
+0007  [  5]  LOADI           R3 2
+0008  [  5]  LOADI           R4 3
+0009  [  5]  MOVE            R5 R0
+0010  [  5]  MOVE            R6 R1
+0011  [  5]  LOADI           R7 5
+0012  [  5]  RETURN          R2 count=7

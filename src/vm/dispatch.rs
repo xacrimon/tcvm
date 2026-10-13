@@ -5,14 +5,13 @@ use std::cell::Cell;
 
 use crate::dmm::metrics::Metrics;
 use crate::dmm::{Collect, Mutation, Trace};
-use crate::env::Thread;
 use crate::env::thread::{ThreadState, ThreadStatus};
 use crate::instruction::{Instruction, Op};
 use crate::lua::Context;
-use crate::vm::abi::{Exit, Handler, Jump, Slot};
+use crate::vm::abi::{Exit, Handler, Jump, Slot, handler};
+use crate::vm::coro;
 use crate::vm::ops::{arith, call, compare, control, data, field, table};
 use crate::vm::unwind::OpError;
-use crate::vm::{coro, frame, native};
 
 /// The handler of every opcode, the unused bytes trapping.
 pub(crate) const TABLE: [Handler; 256] = {
@@ -126,6 +125,11 @@ pub(crate) const TABLE: [Handler; 256] = {
         (Op::FORLOOP_F, control::op_forloop_f),
         (Op::TFORCALL_NEXT, control::op_tforcall_next),
         (Op::TFORCALL_IPAIRS, control::op_tforcall_ipairs),
+        (Op::FUNC, control::op_func),
+        (Op::LOOP, control::op_loop),
+        (Op::JIT_ENTRY, crate::jit::op_jit_entry),
+        (Op::JIT_LOOP, crate::jit::op_jit_loop),
+        (Op::JMP_BACK, control::op_jmp_back),
     ];
     let ops: [Handler; Op::COUNT] = Op::table_of(
         control::op_invalid,
@@ -167,6 +171,17 @@ pub(crate) struct Runtime<'gc> {
     pub(crate) metrics: *const Metrics,
     /// The fault `raise!` leaves for `impl_error`.
     pub(crate) fault: Cell<Option<OpError<'gc>>>,
+    /// Where the host waits while a thread runs (`vm::stack::run`).
+    pub(crate) host: Cell<crate::vm::stack::SwitchPoint>,
+    /// The stack of a coroutine that ended, which the thread it switched to
+    /// hands back to the pool.
+    pub(crate) dead: Cell<Option<crate::vm::stack::ThreadStack>>,
+    /// Whether code runs on a thread's stack rather than the host's.
+    pub(crate) on_thread: Cell<bool>,
+    /// What a `Park::Host` asks the host to run (`vm::stack::on_host`).
+    pub(crate) host_call: Cell<Option<std::ptr::NonNull<dyn FnMut()>>>,
+    /// The panic a `Park::Panic` hands the host.
+    pub(crate) panic: Cell<Option<Box<dyn std::any::Any + Send>>>,
 }
 
 // SAFETY: holds no `Gc` pointer that outlives a `Lua::enter`: the fault is
@@ -189,12 +204,17 @@ impl<'gc> Runtime<'gc> {
             mutation: Cell::new(std::ptr::null()),
             metrics,
             fault: Cell::new(None),
+            host: Cell::new(Default::default()),
+            dead: Cell::new(None),
+            on_thread: Cell::new(false),
+            host_call: Cell::new(None),
+            panic: Cell::new(None),
         }
     }
 }
 
-/// Call `h` as the trampoline does: a plain call, which dispatch leaves by
-/// returning its `Exit`.
+/// Call `h` as the bottom level of the running thread: a plain call, which
+/// dispatch leaves by returning its `Exit`.
 #[inline(always)]
 fn call_handler<'gc>(
     h: Handler,
@@ -207,7 +227,13 @@ fn call_handler<'gc>(
 ) -> Exit {
     #[cfg(target_arch = "aarch64")]
     {
-        h(insn, pc, base, rt, closure, thread)
+        // SAFETY: `dispatch_entry` starts the bottom level and branches to
+        // `h` with these arguments.
+        unsafe {
+            crate::jit::backend::aarch64::abi::dispatch_entry(
+                insn, pc, base, rt, closure, thread, h,
+            )
+        }
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -220,18 +246,6 @@ fn call_handler<'gc>(
 fn run<'gc>(ctx: Context<'gc>, j: Jump<'gc>) -> Exit {
     let ts = ctx.thread_ptr();
     match j {
-        Jump::Dispatch { pc, base } => {
-            let closure = unsafe { frame::closure(base) };
-            call_handler(
-                control::op_nop,
-                Slot::insn(Instruction::nop()),
-                pc,
-                base,
-                ctx,
-                Slot::closure(closure),
-                ts,
-            )
-        }
         Jump::Ret {
             ret,
             nret,
@@ -259,49 +273,44 @@ fn run<'gc>(ctx: Context<'gc>, j: Jump<'gc>) -> Exit {
     }
 }
 
-/// Run `thread` from where it stands: its seeded call, the values a
-/// host resume delivered, an async native waiting on the host, or the
-/// published top Lua frame.
-#[inline(never)]
-pub(crate) fn enter<'gc>(ctx: Context<'gc>, thread: Thread<'gc>) -> Exit {
-    // SAFETY: the executor runs one thread at a time and holds no borrow of
-    // it; dispatch may switch to coroutines it resumes the same way.
-    let mut ts: &mut ThreadState<'gc> = unsafe { thread.state_mut(ctx.mutation()) };
-    ctx.set_thread(ts);
-    if !ts.started {
-        let nargs = call::seed_header(ts, call::ret_exit);
-        ts.status = ThreadStatus::Normal;
-        let hdr = ts.slot_ptr(0);
-        return run(
-            ctx,
-            Jump::Enter {
-                hdr,
-                nargs,
-                base: std::ptr::null_mut(),
-            },
-        );
-    }
-    if let Some(yb) = ts.yield_bottom.take() {
-        ts.status = ThreadStatus::Normal;
-        let j = coro::deliver(ctx, &mut ts, yb);
-        return run(ctx, j);
-    }
-    debug_assert!(
-        !ts.top_base.is_null(),
-        "dispatch of a thread with no frames"
+/// Run the seeded call of the running thread `ts`, on its own stack, until
+/// its dispatch ends (`vm::stack::thread_start`).
+///
+/// # Safety
+/// `ts` is the running thread, just switched to its fresh stack.
+pub(crate) unsafe fn start<'gc>(ctx: Context<'gc>, ts: *mut ThreadState<'gc>) {
+    let t = unsafe { &mut *ts };
+    let ret = if t.main {
+        call::ret_exit
+    } else {
+        coro::ret_coroutine_end
+    };
+    let nargs = call::seed_header(t, ret);
+    t.status = ThreadStatus::Normal;
+    let hdr = t.slot_ptr(0);
+    run(
+        ctx,
+        Jump::Enter {
+            hdr,
+            nargs,
+            base: std::ptr::null_mut(),
+        },
     );
-    if ts.top_is_native() {
-        let win = ts.top_base_index();
-        // Results a collector exit left in the frame land now; otherwise an
-        // async native waits on the host.
-        let nh = frame::NativeHdr::unpack(unsafe { frame::func_word(ts.top_base) });
-        let j = if nh.ok == native::ok::RETURN {
-            native::land_pending(ts, win)
-        } else {
-            native::repoll(ctx, &mut ts, win)
-        };
-        return run(ctx, j);
+}
+
+handler! {
+    bind(insn, pc, base, rt, closure, thread, nret, values);
+
+    /// End the bottom level's dispatch (`jump!` of `Jump::Exit`).
+    slow fn exit_end {
+        return Exit::End;
     }
-    let (pc, base) = (ts.top_pc, ts.top_base);
-    run(ctx, Jump::Dispatch { pc, base })
+
+    /// The collector is owed work (`gc_check!`): publish the frame, park for
+    /// the host to collect, then dispatch the next instruction.
+    slow fn gc_park {
+        sync!();
+        crate::vm::stack::park(rt, crate::vm::stack::Park::Gc);
+        next!()
+    }
 }

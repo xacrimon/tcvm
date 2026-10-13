@@ -618,6 +618,23 @@ fn content_hash(
 }
 
 impl<'gc> MtCache<'gc> {
+    // Where compiled code reads the live bits and `__index`/`__newindex`,
+    // from the class's box (`as_word`).
+    pub(crate) const BITS_OFFSET: usize = Gc::<'static, MtCacheData<'static>>::VALUE_OFFSET
+        + core::mem::offset_of!(MtCacheData<'static>, bits);
+    pub(crate) const INDEX_OFFSET: usize = Gc::<'static, MtCacheData<'static>>::VALUE_OFFSET
+        + core::mem::offset_of!(MtCacheData<'static>, index);
+    /// The box of the other metamethods (`rest`), null before the first.
+    pub(crate) const REST_OFFSET: usize = Gc::<'static, MtCacheData<'static>>::VALUE_OFFSET
+        + core::mem::offset_of!(MtCacheData<'static>, rest);
+    /// The metamethod of bit index `i` at `8 * i` past this, from `rest`.
+    pub(crate) const REST_VALUES_OFFSET: usize = Gc::<'static, MmValues<'static>>::VALUE_OFFSET;
+
+    /// The class's box address, what a shape holds.
+    pub(crate) fn as_word(self) -> u64 {
+        Gc::erased_ptr(self.0) as u64
+    }
+
     /// A class of one member, `owner`, whose metamethods by bit index are
     /// `values`.
     pub fn new(
@@ -900,6 +917,30 @@ impl<'gc> MtCache<'gc> {
 }
 
 impl<'gc> Shape<'gc> {
+    /// Where compiled code reads the class (`MtCache::as_word`, or null)
+    /// from a shape's box.
+    pub(crate) const MT_CACHE_OFFSET: usize = Gc::<'static, ShapeData<'static>>::VALUE_OFFSET
+        + core::mem::offset_of!(ShapeData<'static>, mt_cache);
+    /// The slot count (`u32`), inline slot count (`u8`), metatable slot
+    /// (`u32`) and the box of the keys from a shape's box.
+    pub(crate) const SLOT_COUNT_OFFSET: usize = Gc::<'static, ShapeData<'static>>::VALUE_OFFSET
+        + core::mem::offset_of!(ShapeData<'static>, slot_count);
+    pub(crate) const INLINE_CAP_OFFSET: usize = Gc::<'static, ShapeData<'static>>::VALUE_OFFSET
+        + core::mem::offset_of!(ShapeData<'static>, inline_cap);
+    pub(crate) const MT_SLOT_OFFSET: usize = Gc::<'static, ShapeData<'static>>::VALUE_OFFSET
+        + core::mem::offset_of!(ShapeData<'static>, mt_slot);
+    pub(crate) const KEYS_OFFSET: usize = Gc::<'static, ShapeData<'static>>::VALUE_OFFSET
+        + core::mem::offset_of!(ShapeData<'static>, keys);
+    /// The keys' array (string boxes) from the keys' box: the first word of
+    /// the slice box (a layout test checks it).
+    pub(crate) const KEYS_SLOTS_OFFSET: usize =
+        Gc::<'static, Keys<'static>>::VALUE_OFFSET + core::mem::offset_of!(Keys<'static>, slots);
+
+    /// The shape's box address, what a table's `shape` field holds.
+    pub(crate) fn as_word(self) -> u64 {
+        Gc::erased_ptr(self.0) as u64
+    }
+
     /// Allocate an empty root shape for tables with `inline_cap` inline
     /// slots. There is one per capacity per `State`, see `State::root_shapes`.
     pub fn root_empty(mc: &Mutation<'gc>, inline_cap: u8) -> Self {
@@ -1069,6 +1110,11 @@ impl<'gc> Shape<'gc> {
             .iter()
             .position(|&k| addr(k) == a)
             .map(|i| i as u32)
+    }
+
+    /// The live child that adds `key`, if a table took that edge.
+    pub fn prop_child(self, mc: &Mutation<'gc>, key: LuaString<'gc>) -> Option<Shape<'gc>> {
+        self.data().transitions.borrow().get(mc, EdgeKey::Prop(key))
     }
 
     /// Returns `true` if the metatable behind this shape currently has

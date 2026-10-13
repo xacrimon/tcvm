@@ -6,6 +6,7 @@ use crate::lua::RuntimeError;
 use crate::lua::context::Context;
 use crate::lua::convert::{FromMultiValue, IntoMultiValue};
 use crate::vm;
+use crate::vm::stack::Park;
 
 #[derive(Clone, Copy, PartialEq, Eq, Collect)]
 #[collect(internal, require_static)]
@@ -82,6 +83,7 @@ impl<'gc> Executor<'gc> {
             let mut ts = thread.borrow_mut(mc);
             ts.main = true;
             ts.seed(function.into());
+            ts.ensure_stack(ctx.stack_pool());
             ts.set_window(vm::frame::HDR, buf);
         }
         Executor(Gc::new(
@@ -142,19 +144,22 @@ impl<'gc> Executor<'gc> {
             _ => {}
         }
 
-        let exit = vm::dispatch::enter(ctx, current);
-        // Dispatch may have ended on a coroutine `current` resumed.
-        let ended_on = unsafe { (*ctx.thread_ptr()).handle() };
+        // SAFETY: the executor runs one thread at a time and holds no borrow
+        // of it; `current` parked last time for a reason dealt with below.
+        let (why, parked) = unsafe { vm::stack::run(ctx, current.state_mut(mc)) };
+        // A coroutine `current` resumed may be the one that parked.
+        let ended_on = unsafe { (*parked).handle() };
         self.0.borrow_mut(mc).current = ended_on;
-        match exit {
-            vm::Exit::Gc => {
+        match why {
+            Park::Gc => {
                 ctx.mutation().metrics().defer_gc_check();
                 // Ready again as soon as the host has collected.
                 ctx.waker().wake_by_ref();
                 return Ok(StepResult::Pending);
             }
-            vm::Exit::Pending => return Ok(StepResult::Pending),
-            vm::Exit::End => {}
+            Park::Pending => return Ok(StepResult::Pending),
+            Park::Yield | Park::End => {}
+            Park::Host | Park::Panic => unreachable!("`run` deals with these"),
         }
 
         let uncaught = ended_on.borrow_mut(mc).uncaught.take();
@@ -175,7 +180,7 @@ impl<'gc> Executor<'gc> {
                 return Err(RuntimeError::Exit(code));
             }
             // Only the main thread can leave an error uncaught: a coroutine's
-            // resumer always waits in dispatch.
+            // resumer always waits for it.
             debug_assert!(ended_on.ptr_eq(main));
             return Err(RuntimeError::Lua(crate::lua::Stashable::stash(
                 err,
