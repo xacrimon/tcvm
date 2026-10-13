@@ -324,6 +324,11 @@ pub(crate) fn compile<'gc>(
         level: abi::jit_level as *const () as usize,
         ret_to_native: abi::ret_to_native as *const () as usize,
         native: abi::native_entry as *const () as usize,
+        coro: [
+            abi::coro_resume as *const () as usize,
+            abi::coro_wrap as *const () as usize,
+            abi::coro_yield as *const () as usize,
+        ],
         native_act: crate::vm::native::native_act as *const () as usize,
         trampolines,
     };

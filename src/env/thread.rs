@@ -644,6 +644,25 @@ impl<'gc> Thread<'gc> {
         unsafe { &mut *self.0.unlock(mc).as_ptr() }
     }
 
+    /// [`Thread::state_mut`] when the thread is gray, so that writing to it
+    /// needs no barrier, else `None`: for fast paths that would rather bail
+    /// out than call into the collector.
+    ///
+    /// # Safety
+    /// As [`Thread::state_mut`].
+    #[inline(always)]
+    pub(crate) unsafe fn state_mut_if_gray(self) -> Option<&'gc mut ThreadState<'gc>> {
+        if !Gc::is_gray(self.0) {
+            return None;
+        }
+        // SAFETY: a gray object may be written without a barrier.
+        Some(unsafe {
+            &mut *crate::dmm::barrier::Write::assume(self.0.as_ref())
+                .unlock()
+                .as_ptr()
+        })
+    }
+
     pub fn status(self) -> ThreadStatus {
         self.0.borrow().status
     }

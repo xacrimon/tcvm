@@ -402,6 +402,99 @@ pub(crate) unsafe extern "C" fn native_entry() {
     )
 }
 
+/// Compiled code's call of a coroutine builtin (`coro::Switch`), with
+/// `jit_call_native`'s arguments, recording the caller as `native_entry`
+/// does. The switch function either ran the native, whose result goes back,
+/// or names the thread to switch to (H5): this one then waits at its switch
+/// point, `BASE` and `CLOSURE` in the frame, and when switched back to
+/// returns what the landing function makes of it. Switches are branches,
+/// and so is the return after one (the return address stack holds the
+/// other thread's calls), so every `ret` here and in the Rust calls pairs
+/// with its own `bl`.
+macro_rules! coro_stub {
+    ($(#[$doc:meta])* $name:ident, $switch:path, $landed:path) => {
+        $(#[$doc])*
+        #[unsafe(naked)]
+        pub(crate) unsafe extern "C" fn $name() {
+            // The frame is addressed from x9, not `sp`, as in `stack_switch`.
+            core::arch::naked_asm!(
+                ".cfi_startproc",
+                "stp x29, x30, [x25, #{shim}]",
+                "sub x9, sp, #32",
+                "stp x29, x30, [x9]",
+                "stp x22, x24, [x9, #16]",
+                "mov sp, x9",
+                ".cfi_def_cfa_offset 32",
+                ".cfi_offset x29, -32",
+                ".cfi_offset x30, -24",
+                ".cfi_offset x22, -16",
+                ".cfi_offset x24, -8",
+                "bl {switch}",
+                "cmn x1, #2",
+                "b.eq 1f",
+                ".cfi_remember_state",
+                "ldp x29, x30, [sp], #32",
+                ".cfi_def_cfa_offset 0",
+                ".cfi_restore x29",
+                ".cfi_restore x30",
+                ".cfi_restore x22",
+                ".cfi_restore x24",
+                "ret",
+                ".cfi_restore_state",
+                // Wait to continue at 2, and switch to the thread in x0.
+                "1:",
+                "mov x9, sp",
+                "add x10, x25, #{tsw}",
+                "adr x11, 2f",
+                "stp x9, x11, [x10, #{sp}]",
+                "ldp x12, x13, [x9]",
+                "stp x13, x12, [x10, #{lr}]",
+                "add x11, x0, #{tsw}",
+                "ldp x9, x12, [x11, #{sp}]",
+                "ldp x30, x29, [x11, #{lr}]",
+                "mov sp, x9",
+                "mov x25, x0",
+                "mov x0, #0",
+                "br x12",
+                "2:",
+                "mov x0, x23",
+                "bl {landed}",
+                "mov x9, sp",
+                "ldp x22, x24, [x9, #16]",
+                "ldp x29, x30, [x9]",
+                "add sp, x9, #32",
+                "br x30",
+                ".cfi_endproc",
+                shim = const crate::jit::layout::SHIM,
+                tsw = const crate::vm::stack::sw::THREAD,
+                sp = const crate::vm::stack::sw::SP,
+                lr = const crate::vm::stack::sw::LR,
+                switch = sym $switch,
+                landed = sym $landed,
+            )
+        }
+    };
+}
+
+coro_stub!(
+    /// `coroutine.resume`.
+    coro_resume,
+    crate::jit::helpers::jit_resume_switch,
+    crate::jit::helpers::jit_resume_landed
+);
+coro_stub!(
+    /// A `coroutine.wrap` function.
+    coro_wrap,
+    crate::jit::helpers::jit_wrap_switch,
+    crate::jit::helpers::jit_coro_landed
+);
+coro_stub!(
+    /// `coroutine.yield`.
+    coro_yield,
+    crate::jit::helpers::jit_yield_switch,
+    crate::jit::helpers::jit_coro_landed
+);
+
 /// Continue in the handler in `JitRuntime::jump_target` at the start of the
 /// thread's current level: where the unwinder resets a thread to the level
 /// of the frame that catches (H8).

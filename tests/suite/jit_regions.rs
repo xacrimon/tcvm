@@ -1665,6 +1665,108 @@ fn fast_callee_miss_keeps_the_callers_closure() {
     );
 }
 
+/// Compiled resumes, yields and `wrap` calls that switch in the stub
+/// (`abi::coro_entry`): values both ways, first resumes, ends, errors,
+/// refused resumes, nesting, closes and collections while parked.
+#[test]
+fn compiled_coroutine_switches() {
+    agrees(
+        "local resume, yield, wrap, create = coroutine.resume, coroutine.yield, coroutine.wrap, coroutine.create
+        local status, running, close = coroutine.status, coroutine.running, coroutine.close
+        local out, junk = {}, {}
+        local echo = create(function(...)
+          local a, b, c, d, e = ...
+          while true do
+            local k = a % 6
+            if k == 0 then a, b, c, d, e = yield()
+            elseif k == 1 then a, b, c, d, e = yield(a)
+            elseif k == 2 then a, b, c, d, e = yield(a, b)
+            elseif k == 3 then a, b, c, d, e = yield(a, b, c)
+            else a, b, c, d, e = yield(a, b, c, d, e) end
+            junk[a % 50 + 1] = {a, b}
+          end
+        end)
+        local s = 0
+        for i = 1, 4000 do
+          local r = table.pack(resume(echo, i, i + 1, i + 2, i + 3, i + 4))
+          s = s + r.n
+          for j = 2, r.n do s = s + (r[j] or 0) end
+        end
+        out[#out + 1] = s
+        local ended, died = 0, 0
+        for i = 1, 3000 do
+          local co = create(function(x)
+            local y = yield(x + 1)
+            if y % 7 == 0 then error('seven') end
+            return x + y, 'done'
+          end)
+          local ok1, v1 = resume(co, i)
+          local ok2, v2, v3 = resume(co, v1)
+          if ok2 then ended = ended + v2 + #v3 else died = died + 1 end
+          local ok3, m = resume(co)
+          if not ok3 and status(co) == 'dead' then ended = ended + #m end
+        end
+        out[#out + 1] = ended .. '/' .. died
+        local gen = wrap(function(n) for k = 1, n do yield(k) end return 'last' end)
+        local g = gen(3000)
+        for i = 1, 3000 do g = gen() end
+        local ok, err = pcall(gen)
+        out[#out + 1] = tostring(g) .. ' ' .. tostring(ok) .. ' ' .. tostring(err)
+        local caught = 0
+        for i = 1, 2000 do
+          local f = wrap(function() if i % 3 == 0 then error({i}) end return i end)
+          local ok, e = pcall(f)
+          caught = caught + (ok and e or e[1] * 2)
+        end
+        out[#out + 1] = caught
+        local refused = 0
+        local self = create(function()
+          for i = 1, 2000 do
+            local ok, m = resume(running())
+            if not ok then refused = refused + #m end
+            local ok2, m2 = pcall(resume)
+            if not ok2 then refused = refused + 1 end
+            yield(i)
+          end
+        end)
+        for i = 1, 2000 do resume(self) end
+        out[#out + 1] = refused
+        local inner = create(function() local t = 0 while true do t = t + yield(t) end end)
+        local outer = create(function()
+          local t = 0
+          while true do
+            local _, v = resume(inner, 1)
+            t = t + yield(v + t)
+          end
+        end)
+        local nest = 0
+        for i = 1, 3000 do local _, v = resume(outer, i) nest = (nest + v) % 1000003 end
+        out[#out + 1] = nest
+        local closed = 0
+        for i = 1, 300 do
+          local co = create(function()
+            local x <close> = setmetatable({}, {__close = function() closed = closed + 1 end})
+            for k = 1, 1e9 do yield(k) end
+          end)
+          for k = 1, 10 do resume(co) end
+          close(co)
+        end
+        out[#out + 1] = closed
+        local p = create(function()
+          local n = 0
+          for i = 1, 3000 do
+            local ok, v = pcall(yield, i)
+            if ok then n = n + v end
+          end
+          return n
+        end)
+        local last
+        for i = 1, 3001 do local _, v = resume(p, i) last = v end
+        out[#out + 1] = last
+        return table.concat(out, ' ')",
+    );
+}
+
 fn panicker<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
