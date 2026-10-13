@@ -124,8 +124,8 @@ struct Em<'a> {
     /// Per resume block, its call's miss path (`miss_path`), branched to
     /// from just before `fast_resume`.
     miss: Vec<Label>,
-    /// Per resume block, past the fast resume's `BASE`, which a level's
-    /// return restores instead.
+    /// Per resume block, past the fast resume's `BASE` and `CLOSURE`, which
+    /// a native call keeps and a level's return restores.
     resume_based: Vec<Label>,
     /// The word holding the region pointer, which each frame records.
     region_word: Label,
@@ -638,11 +638,13 @@ impl Em<'_> {
 
     /// Where a fast callee whose entry checks failed returns (4 bytes past
     /// `fast_enter`'s return address, or from before the fast resume): the
-    /// caller's `BASE` and word 0's callee value back, then its slow path
-    /// at `slow`.
+    /// caller's `BASE` and `CLOSURE` and word 0's callee value back, then
+    /// its slow path at `slow`, whose level keeps that `CLOSURE`.
     fn miss_path(&mut self, hdr: i32, block: usize, slow: Label) {
         self.a.bind(self.miss[self.v.succs(block)[0].index()]);
         self.a.sub_imm(Sz::X, BASE, BASE, hdr as u64 + 32);
+        self.a.ldr(CLOSURE, BASE, -32);
+        self.a.and_imm(Sz::X, CLOSURE, CLOSURE, PTR_MASK);
         self.a.ldr(X16, BASE, hdr);
         self.a.movz(Sz::X, X17, FUNCTION_TAG, 3);
         self.a.orr(Sz::X, X16, X16, X17);
@@ -653,7 +655,8 @@ impl Em<'_> {
     /// A native callee, run by `jit_call_native` on this stack (I1): from
     /// `check`, `fast_call`'s test with the function in x16 and its
     /// `FN_IS_VARARG` byte in w17 (1 for a vararg Lua callee, which goes to
-    /// `slow`, the enum's tag above that), or the constant closure `nc`. A
+    /// `slow`, the enum's tag above that), or the constant closure `nc`,
+    /// whose argument count is in x2 already (else in `INSN`). A
     /// plain return lands as a fast callee's; anything else goes on in a
     /// level running `native_act` on the frame, which returns through
     /// `ret_to_native`. Returns the return addresses for `call_site`.
@@ -676,16 +679,22 @@ impl Em<'_> {
         let win = hdr as u64 + 32;
         self.a.mov(Gpr(0), RT);
         self.a.add_imm(Sz::X, Gpr(1), BASE, win);
-        self.a.mov(Gpr(2), INSN);
+        if from.is_ok() {
+            self.a.mov(Gpr(2), INSN);
+        }
         self.a.bl_far(self.helpers.native);
         let ret = self.a.new_label();
         self.a.bind(ret);
         let outcome = self.a.new_label();
         self.a.cmn_imm(Sz::X, Gpr(1), 1);
-        self.a.b_cond(Cond::Eq, outcome);
-        self.a.mov(INSN, Gpr(1));
-        self.a.add_imm(Sz::X, PC, BASE, win);
-        self.a.b(resume);
+        if self.resume_reads_count(block) {
+            self.a.b_cond(Cond::Eq, outcome);
+            self.a.mov(INSN, Gpr(1));
+            self.a.add_imm(Sz::X, PC, BASE, win);
+            self.a.b(resume);
+        } else {
+            self.a.b_cond(Cond::Ne, resume);
+        }
         self.a.bind(outcome);
         self.a.ldr(Gpr(9), BASE, hdr + 8);
         self.a
@@ -702,6 +711,21 @@ impl Em<'_> {
         self.a.bind(back);
         self.a.b(resume);
         vec![(ret, false), (back, true)]
+    }
+
+    /// Whether the resume block after `block` reads the result count and
+    /// the values (`INSN`, `PC`), not just the first result in x0.
+    fn resume_reads_count(&self, block: usize) -> bool {
+        let r = self.v.succs(block)[0].index();
+        !matches!(
+            self.v.insts[self.v.blocks[r].start as usize],
+            MInst::Resume { wanted: 1, .. }
+                | MInst::Resume {
+                    wanted: 0,
+                    c: 1,
+                    ..
+                }
+        )
     }
 
     /// Deep in a chain the return address goes in tagged (bit 0), so the
@@ -1694,11 +1718,17 @@ impl Em<'_> {
                 known,
             } => {
                 let hdr = a as i32 * 8;
+                // A known native takes the count in x2 (`native_path`).
+                let count = if matches!(known, Some(Known::Native(_))) {
+                    Gpr(2)
+                } else {
+                    INSN
+                };
                 if nargs == u8::MAX {
                     let n = self.r(i, 0);
-                    self.a.mov(INSN, n);
+                    self.a.mov(count, n);
                 } else {
-                    self.a.movz(Sz::X, INSN, nargs as u16, 0);
+                    self.a.movz(Sz::X, count, nargs as u16, 0);
                 }
                 if let Some(Known::Native(nc)) = known {
                     let keys = self.native_path(hdr, block, Err(nc));
@@ -1793,9 +1823,9 @@ impl Em<'_> {
                 // The callee's base is past the header at `hdr`; our header's
                 // word 0 is our closure.
                 self.a.sub_imm(Sz::X, BASE, BASE, hdr as u64 * 8 + 32);
-                self.a.bind(self.resume_based[block]);
                 self.a.ldr(CLOSURE, BASE, -32);
                 self.a.and_imm(Sz::X, CLOSURE, CLOSURE, PTR_MASK);
+                self.a.bind(self.resume_based[block]);
                 match wanted {
                     0 if c == 1 => {}
                     0 => {
