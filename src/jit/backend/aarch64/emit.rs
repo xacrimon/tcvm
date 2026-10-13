@@ -1142,6 +1142,11 @@ impl Em<'_> {
                 let off = crate::jit::compile::upvalues_offset() + k as usize * 8;
                 self.a.ldr(d, CLOSURE, off as i32);
             }
+            LoadUpvalOf(k) => {
+                let (d, c) = (self.r(i, 0), self.r(i, 1));
+                let off = crate::jit::compile::upvalues_offset() + k as usize * 8;
+                self.a.ldr(d, c, off as i32);
+            }
             Alu(op, sz) => {
                 let (d, n, m) = (self.r(i, 0), self.r(i, 1), self.r(i, 2));
                 match op {

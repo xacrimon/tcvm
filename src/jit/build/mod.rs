@@ -132,6 +132,9 @@ pub(crate) struct Inline {
     pub(crate) failed: bool,
     /// Some path reached a return: a body that only exits is no inline.
     pub(crate) returned: bool,
+    /// The callee closure (a `Ptr`) when known by its prototype only, whose
+    /// upvalues are loaded from it; else the builder's closure is it.
+    pub(crate) closure: Option<Val>,
 }
 
 impl BlockState {

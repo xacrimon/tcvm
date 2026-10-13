@@ -176,9 +176,10 @@ pub(crate) struct SnapData {
 
 pub(crate) const NO_FRAME: u32 = u32::MAX;
 
-/// An inlined call's frame (E1): the callee (a pool index), the `CALL`'s
-/// `a` and `c` and pc in the enclosing frame, which is `parent` or the
-/// region's. Its base is `a + 4` past the enclosing frame's.
+/// An inlined call's frame (E1): the callee (a pool index, or
+/// `region::DYNAMIC` with a `Func::protos` index), the `CALL`'s `a` and `c`
+/// and pc in the enclosing frame, which is `parent` or the region's. Its
+/// base is `a + 4` past the enclosing frame's.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct InlineFrame {
     pub(crate) parent: u32,

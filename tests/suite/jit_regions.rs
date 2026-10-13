@@ -1970,7 +1970,7 @@ fn result_landing() {
 
 /// A recursive call of the closure being compiled enters its region's known
 /// entry by `bl` (I4); another closure of the same prototype fails the
-/// identity guard and recompiles without it.
+/// identity guard and recompiles with a guard on the prototype.
 #[test]
 fn self_calls() {
     agrees(
@@ -1984,5 +1984,64 @@ fn self_calls() {
         for i = 1, 2000 do s = s + a(20) end
         for i = 1, 2000 do s = s + a(i % 30) + b(10) end
         return tostring(s)",
+    );
+}
+
+/// Callees known by their prototype (D2): new closures of one prototype on
+/// every call, inlined with their upvalues loaded from the closure and an
+/// exit inside the inlined body; tail calls of a known callee that
+/// recompiles under its callers; a site that turns polymorphic.
+#[test]
+fn prototype_callees() {
+    agrees(
+        "local function make(k)
+          local function add(x, y) return x + y + k end
+          return add
+        end
+        local s = 0
+        for i = 1, 3000 do
+          local add = make(i % 7)
+          for j = 1, 3 do s = s + add(j, i) end
+          if i == 2500 then s = s + add(0.5, 1) end
+        end
+        local function leaf(a, b) return a * 2 + (b or 0) end
+        local function mid(a) return leaf(a) end
+        local t = 0
+        for i = 1, 4000 do t = t + mid(i) end
+        for i = 1, 4000 do t = t + mid(i + 0.5) end
+        local function f1(x) return x + 1 end
+        local function f2(x) return x + 2 end
+        local fs = {f1, f2}
+        local u = 0
+        for i = 1, 4000 do
+          local f = i < 3000 and f1 or fs[i % 2 + 1]
+          u = u + f(i)
+        end
+        return s .. ' ' .. t .. ' ' .. u",
+    );
+}
+
+/// Methods found through `__index` inlined from the call sites' callee
+/// feedback (E1): three results, and an intrinsic whose builtin an inlined
+/// body cannot call, which exits there instead.
+#[test]
+fn inlined_methods() {
+    agrees(
+        "local V = {}
+        V.__index = V
+        function V.new(x, y, z) return setmetatable({x = x, y = y, z = z}, V) end
+        function V:parts() return self.x, self.y, self.z end
+        function V:mag() return math.abs(self.x) + math.abs(self.y) end
+        local vs = {}
+        for i = 1, 50 do vs[i] = V.new(i, -i, i * 2) end
+        local m = 0
+        for k = 1, 200 do
+          if k == 150 then vs[7].x = '5' end
+          for i = 1, #vs do
+            local a, b, c = vs[i]:parts()
+            m = m + b + c + vs[i]:mag()
+          end
+        end
+        return tostring(m)",
     );
 }

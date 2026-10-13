@@ -584,6 +584,10 @@ pub(crate) enum Op {
     UpvalValue(u8),
     /// The cell of a shared upvalue of the running closure.
     UpvalCell(u8),
+    /// A by-value upvalue of the Lua closure (a `Ptr`): of an inlined
+    /// callee known by its prototype (E1). A memory read, so that it stays
+    /// behind that guard.
+    UpvalValueOf(u8),
     /// The value of an upvalue cell.
     CellLoad,
     /// `cell = v`, without its barrier.
@@ -864,7 +868,7 @@ impl Op {
             TabSetShape(_) => e(Flags::empty(), Mem::empty(), Mem::SHAPE),
             Barrier => e(Flags::empty(), Mem::empty(), Mem::GC),
             HasFlag(_) | FnFits => Effects::reads(Mem::FRAME),
-            CellLoad => Effects::reads(Mem::UPVAL),
+            CellLoad | UpvalValueOf(_) => Effects::reads(Mem::UPVAL),
             CellStore => e(Flags::empty(), Mem::empty(), Mem::UPVAL),
             Helper(h) => h.sig().effects,
             Resume { .. } => e(Flags::SIDE_EFFECT, Mem::SLOT, Mem::empty()),
@@ -949,7 +953,7 @@ impl Op {
             KB1(_) => Ty::B1,
             KI64(_) => Ty::I64,
             KF64(_) => Ty::F64,
-            Load(_) | UpvalValue(_) | CellLoad | Resume { .. } => Ty::ANY,
+            Load(_) | UpvalValue(_) | UpvalValueOf(_) | CellLoad | Resume { .. } => Ty::ANY,
             UpvalCell(_) => Ty::PTR,
             NumVarargs | ClassBits(_) | TabASize | ArrNext | TabMmBits | NamedNext => Ty::I32,
             NamedVal => Ty::ANY,
@@ -1028,6 +1032,7 @@ impl Op {
             LCmp(c) => format!("lcmp.{}", c.name()),
             FCmp(c) => format!("fcmp.{}", c.name()),
             UpvalValue(i) => format!("upval u{i}"),
+            UpvalValueOf(i) => format!("upval.of u{i}"),
             UpvalCell(i) => format!("upcell u{i}"),
             Helper(h) => format!("call.{}", h.name()),
             Resume { c } => format!("resume c={c}"),

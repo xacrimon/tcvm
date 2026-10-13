@@ -3,50 +3,57 @@
 //! snapshots name its frame and the callers' registers at the call, so an
 //! exit rebuilds both; its returns jump to a block taking the results.
 //! A body that needs its frame on the stack (a call, its slots, a cell
-//! upvalue) is not inlined.
+//! upvalue) is not inlined. The callee is what the call would guard
+//! (`intrinsics::callee_of`): a closure, whose upvalues are constants, or
+//! one of a prototype, whose upvalues are loaded from it.
 
-use super::intrinsics::value_now;
+use super::intrinsics::{Callee, callee_of};
 use super::{Builder, Inline, SlotState};
 use crate::instruction::{Instruction, Op as BcOp};
 use crate::jit::build::cfg::Cfg;
-use crate::jit::feedback as fb;
 use crate::jit::ir::ops::{ExitTag, Op};
-use crate::jit::ir::types::Ty;
+use crate::jit::ir::types::{Rep, Ty};
 use crate::jit::ir::{Func, InlineFrame, Val};
 
-/// Callees longer than this many bytecodes are called.
-const INLINE_LIMIT: usize = 60;
+/// Callees longer than this many bytecodes are called. Fitted to two
+/// programs: ray's `sphere_distance` (41) inlined runs 7% fewer cycles,
+/// bounce's `Ball:bounce` (49), copied again by loop peeling, 10% more (on
+/// 3% fewer instructions: instruction delivery stalls).
+const INLINE_LIMIT: usize = 48;
 /// Inlined frames nest at most this deep.
 const MAX_DEPTH: u8 = 3;
-/// No inlining grows a region past this many instructions.
-const MAX_INSTS: usize = 3000;
+/// No inlining grows a region past this many instructions: compile time
+/// grows faster than the region (json at 3000: 81 ms of compiles, 22 without
+/// inlining).
+const MAX_INSTS: usize = 1500;
 
-/// Inline the CALL at `pc` of `callee`, its value known now; whether it did,
-/// the current block then the one after the call.
+/// Inline the CALL at `pc` of `callee`; whether it did, the current block
+/// then the one after the call.
 pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: Val) -> bool {
     if !b.ctx.jit().config.inline {
         return false;
     }
     let (a, nb, c) = (insn.a(), insn.b(), insn.c());
-    if nb == 0 || c == 0 || c > 3 || insn.op() == BcOp::TAILCALL {
+    if nb == 0 || c == 0 || insn.op() == BcOp::TAILCALL {
         return false;
     }
     let depth = b.inline.as_ref().map_or(0, |i| i.depth);
     if depth >= MAX_DEPTH || b.f.insts.len() > MAX_INSTS {
         return false;
     }
-    let guess = b.feedback(pc) & fb::CONST_MISS == 0;
-    let Some(fv) = value_now(b, callee, guess) else {
-        return false;
-    };
-    let Some(lf) = fv.get_function().and_then(|f| f.as_lua()) else {
-        return false;
+    // A closure of a prototype that made several closures stands for any
+    // of them: only its prototype's facts are used.
+    let (lf, dynamic) = match callee_of(b, pc, callee) {
+        Callee::Const(f) | Callee::Same(f) => match f.as_lua() {
+            Some(lf) => (lf, false),
+            None => return false,
+        },
+        Callee::Proto(_, Some(lf)) => (lf, true),
+        Callee::Proto(_, None) | Callee::Unknown => return false,
     };
     let proto = lf.proto;
     let base = b.reg_base() + a as usize + 4;
-    // Its closures differ per call: a guard on this one would fail.
-    if proto.closures.get() > 1
-        || proto.is_vararg
+    if proto.is_vararg
         || proto.code.len() > INLINE_LIMIT
         || crate::dmm::Gc::ptr_eq(proto, b.proto)
         || base + proto.max_stack_size as usize > 255
@@ -75,7 +82,7 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
         .get(pc as usize + 1)
         .copied()
         .unwrap_or_default();
-    let outer = b.call_entries(live, a);
+    let mut outer = b.call_entries(live, a);
     let regs: Vec<usize> = b
         .exit_regs(live)
         .iter()
@@ -86,9 +93,20 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
         .map(|r| (r as u8, b.reg(r as u8)))
         .collect();
     let args: Vec<Val> = (0..nb - 1).map(|k| b.reg(a + 4 + k)).collect();
-    let k = b.konst(fv);
-    let Some(Op::KObj(func)) = b.f.def_op(k) else {
-        return false;
+    let cv = b.boxed(callee);
+    // The guard's operand: the closure, or the prototype (`Func::protos`).
+    let (guard, func, closure) = if dynamic {
+        let k = b.f.intern_proto(proto);
+        // Exits write the closure to the frame's header.
+        outer.push(((base - 4) as u8, cv));
+        let p = b.ins(Op::Unbox(Rep::Ptr), &[cv]);
+        (Err(k), crate::jit::region::DYNAMIC | k, Some(p))
+    } else {
+        let k = b.konst(crate::env::value::Value::function(lf.function()));
+        let Some(Op::KObj(func)) = b.f.def_op(k) else {
+            return false;
+        };
+        (Ok(k), func, None)
     };
     let frame = b.f.inline_frames.len() as u32;
     let parent = b.frame_id();
@@ -114,6 +132,7 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
         depth: depth + 1,
         failed: false,
         returned: false,
+        closure,
     };
     let mut ib = Builder::new_inline(b.ctx, lf, &cfg, f, inline, b.cold, b.deopt_all);
     let entry = ib.build_inline(&args, MAX_INSTS);
@@ -126,8 +145,10 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
         return false;
     };
     // The callee pinned, its frame's window, then its body.
-    let cv = b.boxed(callee);
-    b.ins_exit(Op::GuardSame, &[cv, k], ExitTag::Const);
+    match guard {
+        Ok(k) => b.ins_exit(Op::GuardSame, &[cv, k], ExitTag::Const),
+        Err(k) => b.ins_exit(Op::GuardProto(k), &[cv], ExitTag::Const),
+    };
     let end = (base + proto.max_stack_size as usize) as u16;
     b.ins_exit(Op::GuardWindow(end), &[], ExitTag::Slow);
     b.flush();
@@ -149,7 +170,8 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
 }
 
 /// Whether a callee's instruction needs its frame on the stack: its slots,
-/// closures over it, cells, varargs, metamethod calls. A call may be an
+/// closures over it, cells, varargs, metamethod calls, a constructor (whose
+/// helper finds the template through the frame). A call may be an
 /// intrinsic's inline code; the build finds out.
 fn needs_frame(op: BcOp) -> bool {
     use BcOp::*;
@@ -162,6 +184,7 @@ fn needs_frame(op: BcOp) -> bool {
             | TFORPREP
             | TFORCALL
             | TFORLOOP
+            | NEWTABLE
             | SETLIST
             | CLOSURE
             | VARARG

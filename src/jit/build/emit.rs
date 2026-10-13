@@ -282,11 +282,16 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             b.jump(succs[0]);
         }
         // An inlined callee's closure is a constant, and so its by-value
-        // upvalues (E1).
+        // upvalues, unless it is known by its prototype only (E1).
         GETUPVAL if b.inline.is_some() => {
-            let now = unsafe { (*b.closure.upvalue_ptr().add(rb as usize)).value };
-            let k = b.konst(now);
-            b.set(a, k);
+            let v = match b.inline.as_ref().and_then(|i| i.closure) {
+                Some(c) => b.ins(Op::UpvalValueOf(rb), &[c]),
+                None => {
+                    let now = unsafe { (*b.closure.upvalue_ptr().add(rb as usize)).value };
+                    b.konst(now)
+                }
+            };
+            b.set(a, v);
         }
         // A by-value upvalue is a constant of the closure, guarded once per
         // region since other closures of the prototype may run it.
@@ -1755,6 +1760,16 @@ fn emit_call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
             }
         }
         Emitted::Done => {}
+        // An inlined body cannot call: the interpreter runs the builtin,
+        // and the kinds the exit records make the next compile call it (E1).
+        Emitted::Fallback(slow, _) if b.inline.is_some() => {
+            let join = b.new_block();
+            b.flush();
+            b.jump(join);
+            b.switch_to(slow);
+            b.deopt(ExitTag::Type);
+            enter_join(b, join);
+        }
         Emitted::Fallback(slow, f) => {
             // The builtin's results join the inline code's.
             let join = b.new_block();
@@ -1777,59 +1792,34 @@ fn callee_at(b: &mut Builder<'_, '_>, pc: u32, a: u8) -> Val {
     }
 }
 
-/// `callee` as the call at `pc` may take it, guarded, and the prototype of
-/// a Lua callee without varargs (`Func::protos`, else `NO_PROTO`), which
-/// lowering enters past its checks (D2): a native `known_callee` names
-/// becomes a constant, called through `jit_call_native` (I1); so does a Lua
-/// closure, unless its prototype made several closures (a function's local
-/// functions are new ones on each call), which is guarded instead, as a
-/// site whose slot names a prototype is (`proto_slot`).
+/// `callee` as the call at `pc` may take it (`intrinsics::callee_of`),
+/// guarded, and the prototype of a Lua callee without varargs
+/// (`Func::protos`, else `NO_PROTO`), which lowering enters past its checks
+/// (D2). A function guarded by identity becomes a constant: a native is
+/// called through `jit_call_native` (I1).
 fn known_callee(b: &mut Builder<'_, '_>, pc: u32, callee: Val) -> (Val, u32) {
-    use crate::env::function::slot_proto;
-    fn lua<'gc>(f: Function<'gc>) -> Option<crate::env::function::LuaFn<'gc>> {
-        f.as_lua().filter(|c| !c.proto.is_vararg)
+    use intrinsics::Callee;
+    fn fixed<'gc>(
+        f: Function<'gc>,
+    ) -> Option<crate::dmm::Gc<'gc, crate::env::function::Prototype<'gc>>> {
+        f.as_lua().filter(|c| !c.proto.is_vararg).map(|c| c.proto)
     }
-    if let Some(Op::KObj(k)) = b.f.def_op(callee) {
-        let p = b.f.pool[k as usize]
-            .get_function()
-            .and_then(lua)
-            .map(|c| c.proto);
-        return (callee, p.map_or(NO_PROTO, |p| b.f.intern_proto(p)));
+    match intrinsics::callee_of(b, pc, callee) {
+        Callee::Unknown => (callee, NO_PROTO),
+        Callee::Const(f) => (callee, fixed(f).map_or(NO_PROTO, |p| b.f.intern_proto(p))),
+        Callee::Same(f) => {
+            let cv = b.boxed(callee);
+            let k = b.konst(Value::function(f));
+            b.ins_exit(Op::GuardSame, &[cv, k], ExitTag::Const);
+            (k, fixed(f).map_or(NO_PROTO, |p| b.f.intern_proto(p)))
+        }
+        Callee::Proto(p, _) => {
+            let cv = b.boxed(callee);
+            let k = b.f.intern_proto(p);
+            b.ins_exit(Op::GuardProto(k), &[cv], ExitTag::Const);
+            (callee, k)
+        }
     }
-    // Once such a guard failed here, even a value of the compiled closure's
-    // own upvalues, which may differ per closure.
-    if b.feedback(pc) & fb::CONST_MISS != 0 {
-        return (callee, NO_PROTO);
-    }
-    let f = intrinsics::known_callee(b, pc, callee);
-    let slot = b
-        .proto
-        .callees
-        .get(b.code(pc).d() as usize)
-        .map(|s| s.get());
-    let proto = match f {
-        Some(f) if f.as_native().is_some() => None,
-        Some(f) => match lua(f) {
-            Some(c) if c.proto.closures.get() > 1 => Some(c.proto),
-            Some(_) => None,
-            None => return (callee, NO_PROTO),
-        },
-        None => match slot.and_then(slot_proto) {
-            Some(p) if !p.is_vararg => Some(p),
-            _ => return (callee, NO_PROTO),
-        },
-    };
-    let cv = b.boxed(callee);
-    if let Some(p) = proto {
-        let k = b.f.intern_proto(p);
-        b.ins_exit(Op::GuardProto(k), &[cv], ExitTag::Const);
-        return (callee, k);
-    }
-    let f = f.expect("a known callee");
-    let k = b.konst(Value::function(f));
-    b.ins_exit(Op::GuardSame, &[cv, k], ExitTag::Const);
-    let p = lua(f).map_or(NO_PROTO, |c| b.f.intern_proto(c.proto));
-    (k, p)
 }
 
 /// The CALL at `pc` as a call of `callee` (5.4).

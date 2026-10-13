@@ -15,6 +15,7 @@ fn keeps_type(op: Op) -> bool {
             | Op::KObj(_)
             | Op::Resume { .. }
             | Op::UpvalValue(_)
+            | Op::UpvalValueOf(_)
             | Op::CellLoad
             | Op::Helper(_)
     )

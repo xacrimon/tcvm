@@ -449,6 +449,9 @@ pub(crate) fn compile<'gc>(
         };
         // An exit in an inlined body is a site of its callee's.
         let proto = match e.frames.last() {
+            Some(fr) if fr.func & crate::jit::region::DYNAMIC != 0 => {
+                f.protos[(fr.func & !crate::jit::region::DYNAMIC) as usize]
+            }
             Some(fr) => {
                 f.pool[fr.func as usize]
                     .get_function()

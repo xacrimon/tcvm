@@ -23,8 +23,13 @@ use crate::vm::ops::field::read_ic;
 fn receiver(b: &mut Builder<'_, '_>, insn: Instruction) -> Val {
     match insn.op().unquickened() {
         BcOp::GETTABUP | BcOp::SETTABUP if b.inline.is_some() => {
-            let now = unsafe { (*b.closure.upvalue_ptr().add(insn.b() as usize)).value };
-            b.konst(now)
+            match b.inline.as_ref().and_then(|i| i.closure) {
+                Some(c) => b.ins(Op::UpvalValueOf(insn.b()), &[c]),
+                None => {
+                    let now = unsafe { (*b.closure.upvalue_ptr().add(insn.b() as usize)).value };
+                    b.konst(now)
+                }
+            }
         }
         BcOp::GETTABUP | BcOp::SETTABUP => b.ins(Op::UpvalValue(insn.b()), &[]),
         BcOp::GETTABUP_REF | BcOp::SETTABUP_REF => {

@@ -90,6 +90,8 @@ pub(crate) enum MInst {
     StoreSlotF(u8),
     /// `[def d]`: a by-value upvalue of the running closure.
     LoadUpval(u8),
+    /// `[def d, use c]`: a by-value upvalue of the closure `c`.
+    LoadUpvalOf(u8),
     /// `[def d, use n, use m]`.
     Alu(AluOp, Sz),
     /// `[def d, use n]`.

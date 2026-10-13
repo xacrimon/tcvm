@@ -625,6 +625,10 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 let d = self.def(res.unwrap());
                 self.push(MInst::LoadUpval(k), &[d], none);
             }
+            Op::UpvalValueOf(k) => {
+                let (d, c) = (self.def(res.unwrap()), self.use_(args[0]));
+                self.push(MInst::LoadUpvalOf(k), &[d, c], none);
+            }
             Op::Box => {
                 let x = args[0];
                 let r = res.unwrap();

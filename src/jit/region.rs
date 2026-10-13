@@ -46,8 +46,8 @@ pub(crate) struct SnapEntry {
 }
 
 /// An inlined call's frame an exit rebuilds, outermost first: the callee
-/// (a pool index), the `CALL`'s `a` and `c`, its base relative to the
-/// enclosing frame's, and the `CALL`'s pc.
+/// (a pool index, or `DYNAMIC`), the `CALL`'s `a` and `c`, its base
+/// relative to the enclosing frame's, and the `CALL`'s pc.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct SnapFrame {
     pub(crate) func: u32,
@@ -56,6 +56,11 @@ pub(crate) struct SnapFrame {
     pub(crate) delta: u16,
     pub(crate) caller_pc: u32,
 }
+
+/// A `SnapFrame::func` of a closure known by its prototype, `Region::protos`
+/// by the low bits: the snapshot's entry for the header's word 0 (register
+/// `delta - 4` of the enclosing frame) holds it.
+pub(crate) const DYNAMIC: u32 = 1 << 31;
 
 /// Append a snapshot to `out`: `kind:1 frames:2 entries:12`, the pc, three
 /// words per frame, a word per entry (`reg:8 rep:3 loc:3 index:18`).

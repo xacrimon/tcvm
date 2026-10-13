@@ -219,9 +219,9 @@ unsafe impl<'gc> Collect<'gc> for IcTable<'gc> {
 /// the bits of the function value the interpreter last called there, a
 /// [`proto_slot`] once it called two closures of one prototype,
 /// [`MEGAMORPHIC`] once it called two other functions, 0 for none. Its trace
-/// clears it rather than tracing it, and a write takes the prototype's
-/// barrier, so a nonzero slot names a function or prototype called since the
-/// last collection, which is alive.
+/// clears it rather than tracing it (all but `MEGAMORPHIC`), and a write
+/// takes the prototype's barrier, so a slot naming a function or prototype
+/// names one called since the last collection, which is alive.
 pub struct Callees(Box<[Cell<u64>]>);
 
 /// A callee slot that saw two functions: no `Value` has these bits, and
@@ -258,11 +258,14 @@ impl std::ops::Deref for Callees {
     }
 }
 
-// SAFETY: holds no pointer past a collection: tracing empties it.
+// SAFETY: holds no pointer past a collection: tracing empties every slot
+// but a megamorphic one, which names nothing (and stays megamorphic).
 unsafe impl<'gc> Collect<'gc> for Callees {
     fn trace<T: Trace<'gc>>(&self, _cc: &mut T) {
         for slot in self.iter() {
-            slot.set(0);
+            if slot.get() != MEGAMORPHIC {
+                slot.set(0);
+            }
         }
     }
 }

@@ -109,13 +109,27 @@ handler! {
         let mc = rt.mutation();
         let img = rt.jit().exit_regs();
         let snap = region.snap(e);
+        for s in snap.entries() {
+            let w = match s.loc {
+                Loc::Reg(i) => img[i as usize].get(),
+                Loc::Spill(i) => img[crate::jit::state::IMAGE_SPILLS + i as usize].get(),
+                loc => const_word(region, loc),
+            };
+            unsafe { base.add(s.reg as usize).write(entry_value(mc, s.rep, w)) };
+        }
         // Inlined calls' frames, outermost first, each a callee of the one
-        // around it.
+        // around it; one known by its prototype is the value the entries
+        // wrote to its header.
         let mut fbase = base;
         let mut fclosure: LuaFn<'gc> = unsafe { frame::closure(base) };
         let region_closure = fclosure;
         for fr in snap.frames() {
-            let callee = region.pool[fr.func as usize]
+            let f = if fr.func & crate::jit::region::DYNAMIC != 0 {
+                unsafe { *fbase.add(fr.a as usize) }
+            } else {
+                region.pool[fr.func as usize]
+            };
+            let callee = f
                 .get_function()
                 .and_then(|f| f.as_lua())
                 .expect("an inlined Lua closure");
@@ -132,14 +146,6 @@ handler! {
                 fbase = nb;
             }
             fclosure = callee;
-        }
-        for s in snap.entries() {
-            let w = match s.loc {
-                Loc::Reg(i) => img[i as usize].get(),
-                Loc::Spill(i) => img[crate::jit::state::IMAGE_SPILLS + i as usize].get(),
-                loc => const_word(region, loc),
-            };
-            unsafe { base.add(s.reg as usize).write(entry_value(mc, s.rep, w)) };
         }
         // A fast-called frame's header has no continuation (D4): it returns
         // through the level `exit_common` started.

@@ -3,7 +3,8 @@
 //! identity and computes the result in place; anything the inline code does
 //! not cover exits before the CALL, and the interpreter runs the builtin.
 
-use crate::env::function::{Function, NativeFn, NativeKind};
+use crate::dmm::Gc;
+use crate::env::function::{Function, LuaFn, NativeFn, NativeKind, Prototype};
 use crate::env::string::LuaString;
 use crate::env::value::Value;
 use crate::instruction::Instruction;
@@ -164,6 +165,53 @@ pub(super) fn known_callee<'gc>(
         return None;
     }
     unsafe { Value::from_raw(seen) }.get_function()
+}
+
+/// What the call at `pc` may take its callee for (`callee_of`).
+pub(super) enum Callee<'gc> {
+    Unknown,
+    /// The callee value is this constant.
+    Const(Function<'gc>),
+    /// This function, guarded by identity.
+    Same(Function<'gc>),
+    /// A closure without varargs of this prototype, guarded as such: one
+    /// that made several closures (a function's local functions are new
+    /// ones on each call), or that a site's slot names (`proto_slot`).
+    /// With a closure of it `known_callee` names.
+    Proto(Gc<'gc, Prototype<'gc>>, Option<LuaFn<'gc>>),
+}
+
+/// The callee of the call at `pc` as the region may take it: a constant;
+/// what `known_callee` names, guarded by identity unless a Lua closure of a
+/// prototype that made several closures; else the prototype the site's slot
+/// names. Nothing once such a guard failed here, even for a value of the
+/// compiled closure's own upvalues, which may differ per closure.
+pub(super) fn callee_of<'gc>(b: &Builder<'_, 'gc>, pc: u32, callee: Val) -> Callee<'gc> {
+    use crate::env::function::slot_proto;
+    if let Some(Op::KObj(k)) = b.f.def_op(callee) {
+        return match b.f.pool[k as usize].get_function() {
+            Some(f) => Callee::Const(f),
+            None => Callee::Unknown,
+        };
+    }
+    if b.feedback(pc) & fb::CONST_MISS != 0 {
+        return Callee::Unknown;
+    }
+    match known_callee(b, pc, callee) {
+        Some(f) => match f.as_lua() {
+            // The generic call tests such a callee anyway.
+            Some(c) if c.proto.is_vararg => Callee::Unknown,
+            Some(c) if c.proto.closures.get() > 1 => Callee::Proto(c.proto, Some(c)),
+            _ => Callee::Same(f),
+        },
+        None => {
+            let slot = b.proto.callees.get(b.code(pc).d() as usize);
+            match slot.and_then(|s| slot_proto(s.get())) {
+                Some(p) if !p.is_vararg => Callee::Proto(p, None),
+                _ => Callee::Unknown,
+            }
+        }
+    }
 }
 
 /// What `emit` made of a CALL.
