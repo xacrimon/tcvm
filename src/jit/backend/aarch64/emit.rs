@@ -671,6 +671,7 @@ impl Em<'_> {
     ) -> Vec<(Label, bool)> {
         let resume = self.resume_based[self.v.succs(block)[0].index()];
         let mut entry = self.helpers.native;
+        let mut switches = false;
         match from {
             Ok((check, slow)) => {
                 self.a.bind(check);
@@ -684,6 +685,7 @@ impl Em<'_> {
                     crate::vm::coro::switch_kind(unsafe { &*(nc as *const NativeClosure) })
                 {
                     entry = self.helpers.coro[k as usize];
+                    switches = true;
                 }
                 self.a.mov_imm(Gpr(3), nc);
             }
@@ -694,8 +696,16 @@ impl Em<'_> {
         if from.is_ok() {
             self.a.mov(Gpr(2), INSN);
         }
-        self.a.bl_far(entry);
         let ret = self.a.new_label();
+        if switches {
+            // A stub that switches returns with a branch (the return
+            // address stack's top is the other thread's call), so it is
+            // entered with one: neither touches that stack.
+            self.a.adr(LR, ret);
+            self.a.b_far(entry);
+        } else {
+            self.a.bl_far(entry);
+        }
         self.a.bind(ret);
         let outcome = self.a.new_label();
         self.a.cmn_imm(Sz::X, Gpr(1), 1);

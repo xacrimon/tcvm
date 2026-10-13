@@ -408,9 +408,9 @@ pub(crate) unsafe extern "C" fn native_entry() {
 /// or names the thread to switch to (H5): this one then waits at its switch
 /// point, `BASE` and `CLOSURE` in the frame, and when switched back to
 /// returns what the landing function makes of it. Switches are branches,
-/// and so is the return after one (the return address stack holds the
-/// other thread's calls), so every `ret` here and in the Rust calls pairs
-/// with its own `bl`.
+/// and the stub is entered and returns with branches too (`native_path`),
+/// so the return address stack sees only the Rust calls' pairs: a return
+/// after a switch would find the other thread's call on top.
 macro_rules! coro_stub {
     ($(#[$doc:meta])* $name:ident, $switch:path, $landed:path) => {
         $(#[$doc])*
@@ -439,7 +439,7 @@ macro_rules! coro_stub {
                 ".cfi_restore x30",
                 ".cfi_restore x22",
                 ".cfi_restore x24",
-                "ret",
+                "br x30",
                 ".cfi_restore_state",
                 // Wait to continue at 2, and switch to the thread in x0.
                 "1:",
