@@ -238,7 +238,10 @@ mod tests {
             assert_eq!(code, lf.code as usize);
             let proto = unsafe { ((fixed + FN_PROTO) as *const usize).read() };
             lf.proto.jit_fast.set(0x1234);
-            assert_eq!(unsafe { ((proto + PROTO_FAST) as *const usize).read() }, 0x1234);
+            assert_eq!(
+                unsafe { ((proto + PROTO_FAST) as *const usize).read() },
+                0x1234
+            );
             lf.proto.jit_fast.set(0);
             assert_eq!(byte(fixed, FN_MAX_STACK), lf.max_stack_size);
         });

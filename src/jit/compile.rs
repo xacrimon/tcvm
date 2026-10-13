@@ -359,9 +359,9 @@ pub(crate) fn compile<'gc>(
     let region_word = em.asm.label_offset(em.region_word);
     let start = block.rx();
     let entry = start.wrapping_add(em.asm.label_offset(em.entry));
-    let fast_entry = em
-        .fast
-        .map_or(std::ptr::null(), |l| start.wrapping_add(em.asm.label_offset(l)));
+    let fast_entry = em.fast.map_or(std::ptr::null(), |l| {
+        start.wrapping_add(em.asm.label_offset(l))
+    });
     let site_keys: Vec<Vec<(u32, bool)>> = em
         .sites
         .iter()

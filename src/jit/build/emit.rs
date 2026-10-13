@@ -1779,9 +1779,10 @@ fn known_callee(b: &mut Builder<'_, '_>, pc: u32, callee: Val) -> Val {
         return callee;
     }
     let own = b.closure.function();
-    let Some(f) = intrinsics::known_callee(b, pc, callee)
-        .filter(|f| f.as_native().is_some() || (crate::dmm::Gc::ptr_eq(f.inner(), own.inner()) && !b.proto.is_vararg))
-    else {
+    let Some(f) = intrinsics::known_callee(b, pc, callee).filter(|f| {
+        f.as_native().is_some()
+            || (crate::dmm::Gc::ptr_eq(f.inner(), own.inner()) && !b.proto.is_vararg)
+    }) else {
         return callee;
     };
     let k = b.konst(Value::function(f));
