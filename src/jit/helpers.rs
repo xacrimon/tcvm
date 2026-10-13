@@ -1,5 +1,7 @@
 //! Rust routines regions call with `bl` (the C ABI). None grows the stack,
-//! switches threads, runs Lua or raises (R5).
+//! switches threads, runs Lua or raises (R5), except the native shim
+//! (`jit_call_native`) and the coroutine switches, which return to compiled
+//! code only with a plain result and leave the rest to a level.
 
 use crate::dmm::Gc;
 use crate::dmm::lock::RefLock;
@@ -622,6 +624,116 @@ fn shim_drive<'gc>(
         };
     }
     returned(ctx, win)
+}
+
+/// `NativeRet::n` from the coroutine switches for a switch to the thread in
+/// `first`.
+pub(crate) const SWITCH: u64 = u64::MAX - 1;
+
+macro_rules! coro_switch {
+    ($(#[$doc:meta])* $name:ident, |$ctx:ident, $a:ident, $w:ident, $n:ident, $nc:ident| $start:expr) => {
+        $(#[$doc])*
+        pub(crate) unsafe extern "C-unwind" fn $name(
+            rt: *const State<'static>,
+            w: *mut Value<'static>,
+            nargs: usize,
+            nc: *const NativeClosure<'static>,
+        ) -> NativeRet {
+            let $ctx = unsafe { Context::from_state(rt) };
+            let ($a, $w, $n, $nc) = ($ctx.thread_ptr(), w, nargs, unsafe { &*nc });
+            match unsafe { $start } {
+                Some(to) => NativeRet {
+                    first: to as u64,
+                    n: SWITCH,
+                },
+                None => unsafe { become jit_call_native(rt, w, nargs, nc) },
+            }
+        }
+    };
+}
+
+coro_switch!(
+    /// `coroutine.resume` from compiled code (`abi::coro_resume`), with
+    /// `jit_call_native`'s arguments: the thread to switch to, or what the
+    /// builtin's own path came to.
+    jit_resume_switch,
+    |ctx, a, w, n, nc| crate::vm::coro::compiled_resume(ctx, a, w, n, nc, false)
+);
+coro_switch!(
+    /// A `coroutine.wrap` function from compiled code; see
+    /// `jit_resume_switch`.
+    jit_wrap_switch,
+    |ctx, a, w, n, nc| crate::vm::coro::compiled_resume(ctx, a, w, n, nc, true)
+);
+coro_switch!(
+    /// `coroutine.yield` from compiled code; see `jit_resume_switch`.
+    jit_yield_switch,
+    |ctx, a, w, n, nc| crate::vm::coro::compiled_yield(ctx, a, w, n, nc)
+);
+
+/// Whether the waiting frame at `top_base` takes what came back as it is:
+/// no error, the values fit, no stack to hand back, no collection owed.
+#[inline(always)]
+fn lands_plain(ctx: Context<'_>, t: &ThreadState<'_>) -> bool {
+    // SAFETY: a peek at the cell, which nothing else holds.
+    let dead = unsafe { (*ctx.runtime().dead.as_ptr()).is_some() };
+    t.transfer.is_none() && t.top < t.stack_limit && !dead && !ctx.gc_due()
+}
+
+/// Where `abi::coro_yield` and `abi::coro_wrap` land when switched back
+/// to: the values at the waiting window, `top_base .. top`.
+pub(crate) unsafe extern "C-unwind" fn jit_coro_landed(rt: *const State<'static>) -> NativeRet {
+    let ctx = unsafe { Context::from_state(rt) };
+    let t = unsafe { &*ctx.thread_ptr() };
+    if !lands_plain(ctx, t) {
+        unsafe { become jit_landed_slow(rt) }
+    }
+    let n = t.top - t.top_base_index();
+    // SAFETY: the window is on the stack, with the values in it.
+    let first = if n == 0 {
+        Value::nil()
+    } else {
+        unsafe { t.top_base.read() }
+    };
+    NativeRet {
+        first: first.to_raw(),
+        n: n as u64,
+    }
+}
+
+/// Where `abi::coro_resume` lands: `true` goes in the slot of the thread
+/// argument, below the values.
+pub(crate) unsafe extern "C-unwind" fn jit_resume_landed(rt: *const State<'static>) -> NativeRet {
+    let ctx = unsafe { Context::from_state(rt) };
+    let t = unsafe { &mut *ctx.thread_ptr() };
+    if !lands_plain(ctx, t) {
+        unsafe { become jit_landed_slow(rt) }
+    }
+    let w = t.top_base;
+    let yes = Value::boolean(true);
+    unsafe { w.write(yes) };
+    NativeRet {
+        first: yes.to_raw(),
+        n: (t.top - t.slot_index(w)) as u64,
+    }
+}
+
+/// The landings' general case: the frame's continuation or `drive`'s
+/// work, as `jit_call_native` does after a switch.
+#[cold]
+#[inline(never)]
+unsafe extern "C-unwind" fn jit_landed_slow(rt: *const State<'static>) -> NativeRet {
+    let ctx = unsafe { Context::from_state(rt) };
+    crate::vm::stack::release_dead(ctx);
+    let tp = ctx.thread_ptr();
+    let t = unsafe { &mut *tp };
+    let (w, win) = (t.top_base, t.top_base_index());
+    let out = match t.transfer.take() {
+        Some(err) => caught(ctx, tp, win, err),
+        None => continued(ctx, tp, win),
+    };
+    let nc = unsafe { frame::native_closure(w) };
+    shim_drive(ctx, w, nc, out)
 }
 
 /// Box an integer outside i32.

@@ -4,6 +4,7 @@
 
 use regalloc2::{Allocation, Edit, Output, PReg, RegClass};
 
+use crate::env::function::NativeClosure;
 use crate::env::table::SlotLoc;
 use crate::env::value::Value;
 use crate::env::{MtCache, Shape};
@@ -163,9 +164,11 @@ pub(crate) struct Helpers {
     /// `abi::jit_level` and `abi::ret_to_native`.
     pub(crate) level: usize,
     pub(crate) ret_to_native: usize,
-    /// `abi::native_entry`, and `native_act` for what a native asks for
-    /// besides a plain return.
+    /// `abi::native_entry`, `abi::coro_resume` and its siblings by
+    /// `coro::Switch`, and `native_act` for what a native asks for besides
+    /// a plain return.
     pub(crate) native: usize,
+    pub(crate) coro: [usize; 3],
     pub(crate) native_act: usize,
     /// The trampolines of the helpers cold arms call: (helper, trampoline).
     pub(crate) trampolines: Vec<(usize, usize)>,
@@ -667,6 +670,7 @@ impl Em<'_> {
         from: Result<(Label, Label), u64>,
     ) -> Vec<(Label, bool)> {
         let resume = self.resume_based[self.v.succs(block)[0].index()];
+        let mut entry = self.helpers.native;
         match from {
             Ok((check, slow)) => {
                 self.a.bind(check);
@@ -674,7 +678,15 @@ impl Em<'_> {
                 self.a.b_cond(Cond::Eq, slow);
                 self.a.add_imm(Sz::X, Gpr(3), X16, layout::FN_NATIVE as u64);
             }
-            Err(nc) => self.a.mov_imm(Gpr(3), nc),
+            Err(nc) => {
+                // SAFETY: the region's constants keep the closure alive.
+                if let Some(k) =
+                    crate::vm::coro::switch_kind(unsafe { &*(nc as *const NativeClosure) })
+                {
+                    entry = self.helpers.coro[k as usize];
+                }
+                self.a.mov_imm(Gpr(3), nc);
+            }
         }
         let win = hdr as u64 + 32;
         self.a.mov(Gpr(0), RT);
@@ -682,7 +694,7 @@ impl Em<'_> {
         if from.is_ok() {
             self.a.mov(Gpr(2), INSN);
         }
-        self.a.bl_far(self.helpers.native);
+        self.a.bl_far(entry);
         let ret = self.a.new_label();
         self.a.bind(ret);
         let outcome = self.a.new_label();

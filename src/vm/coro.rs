@@ -11,6 +11,7 @@
 
 use crate::env::Thread;
 use crate::env::error::Error;
+use crate::env::function::NativeClosure;
 use crate::env::thread::{ThreadState, ThreadStatus};
 use crate::env::value::Value;
 use crate::instruction::{Instruction, Op};
@@ -60,13 +61,28 @@ unsafe fn begin_resume<'gc>(
             bt.ensure_stack(ctx.stack_pool());
             bt.copy_in(HDR, src, n);
         }
-        at.status = ThreadStatus::Normal;
-        at.resume_wait = wait;
-        bt.status = ThreadStatus::Normal;
-        bt.resumer = Some(at.handle());
-        bt.resume_depth = at.resume_depth + 1;
+        link_resume(at, bt, wait);
     }
     b
+}
+
+/// `b`, which has its values, is the resumed coroutine of `a`, whose values
+/// land at `a.stack[wait..]`.
+#[inline(always)]
+fn link_resume<'gc>(a: &mut ThreadState<'gc>, b: &mut ThreadState<'gc>, wait: usize) {
+    a.status = ThreadStatus::Normal;
+    a.resume_wait = wait;
+    b.status = ThreadStatus::Normal;
+    b.resumer = Some(a.handle());
+    b.resume_depth = a.resume_depth + 1;
+}
+
+/// `b`, which handed its resumer `a` the values from `yb`, waits there.
+#[inline(always)]
+fn link_yield<'gc>(b: &mut ThreadState<'gc>, a: &mut ThreadState<'gc>, yb: usize) {
+    a.status = ThreadStatus::Normal;
+    b.resumer = None;
+    b.top = yb;
 }
 
 /// Resume `co` from the running thread `a` (see [`begin_resume`]) and wait
@@ -115,9 +131,7 @@ unsafe fn begin_yield<'gc>(
         unsafe { bt.stack.as_ptr().add(yb) },
         bt.top - yb,
     );
-    at.status = ThreadStatus::Normal;
-    bt.resumer = None;
-    bt.top = yb;
+    link_yield(bt, at, yb);
     Some(a)
 }
 
@@ -216,6 +230,184 @@ pub(crate) unsafe fn die_to<'gc>(
     unsafe { finish(ctx, b, 0, Some(err)) }
 }
 
+/// Whether the running thread `ts` may resume `co` with `n` values without
+/// the builtin: anything else is the builtin's to raise or refuse.
+#[inline(always)]
+fn may_resume<'gc>(ts: &ThreadState<'gc>, co: Thread<'gc>, n: usize) -> bool {
+    if co.ptr_eq(ts.handle()) || ts.resume_depth + 1 >= MAX_RESUME_DEPTH {
+        return false;
+    }
+    let Ok(cs) = co.inner().try_borrow() else {
+        return false;
+    };
+    let bottom = cs.yield_bottom.unwrap_or(HDR);
+    cs.status == ThreadStatus::Suspended && !cs.main && n <= cs.stack_limit.saturating_sub(bottom)
+}
+
+/// The coroutine builtins compiled code switches for itself
+/// (`abi::coro_resume` and its siblings).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Switch {
+    Resume,
+    Wrap,
+    Yield,
+}
+
+/// Which of the switching builtins `nc` is, by its fast entry.
+pub(crate) fn switch_kind(nc: &NativeClosure<'_>) -> Option<Switch> {
+    let e = handler_bits(nc.entry);
+    [
+        (handler_bits(ff_resume), Switch::Resume),
+        (handler_bits(ff_wrap), Switch::Wrap),
+        (handler_bits(ff_yield), Switch::Yield),
+    ]
+    .into_iter()
+    .find_map(|(h, k)| (h == e).then_some(k))
+}
+
+/// Make the native frame of compiled code's call of `nc` with the `n`
+/// values at window `w` (index `win`) wait with `h` for what comes back,
+/// returning through `ret_shim` (whose walks find the caller through
+/// `shim`).
+#[inline(always)]
+unsafe fn compiled_wait<'gc>(
+    ts: &mut ThreadState<'gc>,
+    (w, win, n): (*mut Value<'gc>, usize, usize),
+    nc: &NativeClosure<'gc>,
+    h: NativeHdr,
+    protect: u64,
+) {
+    unsafe {
+        let p = w.sub(HDR).cast::<u64>();
+        p.write(h.pack(nc));
+        p.add(1)
+            .write(crate::vm::stack::ret_shim_bits() | flag::NATIVE | protect);
+    }
+    ts.top_base = w;
+    ts.top = win + n;
+}
+
+/// Start compiled code's call of `coroutine.resume` (`wrap` false) or of a
+/// `wrap` function `nc` on the `n` values at `w`, as `ff_resume` and
+/// `ff_wrap` do, when nothing on the way calls out: the coroutine yielded
+/// before, its committed stack takes the values, and writing to it needs no
+/// barrier. Returns the thread to switch to, now the running one, or `None`
+/// with nothing changed for the builtin's own path.
+///
+/// # Safety
+/// `a` is the running thread, `w` a window on its stack with room for a
+/// header below it, and no reference to its state is live.
+#[inline(always)]
+pub(crate) unsafe fn compiled_resume<'gc>(
+    ctx: Context<'gc>,
+    a: *mut ThreadState<'gc>,
+    w: *mut Value<'gc>,
+    n: usize,
+    nc: &NativeClosure<'gc>,
+    wrap: bool,
+) -> Option<*mut ThreadState<'gc>> {
+    let ts = unsafe { &mut *a };
+    let (co, at, h) = if wrap {
+        let co = unsafe {
+            nc.upvalues()
+                .get_unchecked(0)
+                .get_thread()
+                .unwrap_unchecked()
+        };
+        (
+            co,
+            0,
+            NativeHdr {
+                at: 0,
+                cont: cont::WRAP.0,
+                ok: ok::RETURN,
+            },
+        )
+    } else {
+        // Without the thread argument the builtin raises.
+        if n == 0 {
+            return None;
+        }
+        let co = unsafe { w.read() }.get_thread()?;
+        (
+            co,
+            1,
+            NativeHdr {
+                at: 1,
+                cont: cont::RESUME.0,
+                ok: ok::RETURN_TRUE,
+            },
+        )
+    };
+    let k = n - at;
+    if !may_resume(ts, co, k) {
+        return None;
+    }
+    // SAFETY: `co` is suspended, so nothing else uses its state.
+    let b = unsafe { co.state_mut_if_gray() }?;
+    let yb = b.yield_bottom?;
+    if b.stack.len() < yb + k {
+        return None;
+    }
+    let win = ts.slot_index(w);
+    unsafe {
+        compiled_wait(ts, (w, win, n), nc, h, flag::PROTECTED);
+        frame::copy_values(b.slot_ptr(yb), w.add(at), k);
+    }
+    b.yield_bottom = None;
+    b.top = yb + k;
+    link_resume(ts, b, win + at);
+    ctx.set_thread(b);
+    Some(b)
+}
+
+/// Start compiled code's call of `coroutine.yield` `nc` on the `n` values
+/// at `w`, as `ff_yield` does, when nothing on the way calls out; see
+/// [`compiled_resume`].
+///
+/// # Safety
+/// As [`compiled_resume`].
+#[inline(always)]
+pub(crate) unsafe fn compiled_yield<'gc>(
+    ctx: Context<'gc>,
+    b: *mut ThreadState<'gc>,
+    w: *mut Value<'gc>,
+    n: usize,
+    nc: &NativeClosure<'gc>,
+) -> Option<*mut ThreadState<'gc>> {
+    let ts = unsafe { &mut *b };
+    if ts.no_yield || ts.main {
+        return None;
+    }
+    // SAFETY: the resumer waits, so nothing else uses its state.
+    let a = unsafe { ts.resumer?.state_mut_if_gray() }?;
+    let wait = a.resume_wait;
+    if a.stack.len() < wait + n {
+        return None;
+    }
+    let win = ts.slot_index(w);
+    unsafe {
+        compiled_wait(
+            ts,
+            (w, win, n),
+            nc,
+            NativeHdr {
+                at: 0,
+                cont: 0,
+                ok: ok::RETURN,
+            },
+            0,
+        );
+        frame::copy_values(a.slot_ptr(wait), w, n);
+    }
+    a.top = wait + n;
+    ts.yield_bottom = Some(win);
+    ts.status = ThreadStatus::Suspended;
+    link_yield(ts, a, win);
+    ctx.set_thread(a);
+    Some(a)
+}
+
 /// A yield while `coroutine.close`/`wrap` closes the thread's variables.
 pub(crate) fn yield_across_close(ctx: Context<'_>) -> Error<'_> {
     let msg = crate::env::LuaString::new(ctx, b"attempt to yield across a C-call boundary");
@@ -233,9 +425,6 @@ macro_rules! resume_entry {
         let co: Thread<'gc> = $co;
         let (a, b, c) = $call.abc();
         let ts = thread!();
-        if co.ptr_eq(ts.handle()) || ts.resume_depth + 1 >= MAX_RESUME_DEPTH {
-            tail!(native_call)
-        }
         let bi = ts.slot_index($base);
         let win = bi + a as usize + HDR;
         let args = win + $skip;
@@ -244,17 +433,8 @@ macro_rules! resume_entry {
         } else {
             b as usize - 1 - $skip
         };
-        {
-            let Ok(cs) = co.inner().try_borrow() else {
-                tail!(native_call)
-            };
-            let bottom = cs.yield_bottom.unwrap_or(HDR);
-            if cs.status != ThreadStatus::Suspended
-                || cs.main
-                || n > cs.stack_limit.saturating_sub(bottom)
-            {
-                tail!(native_call)
-            }
+        if !may_resume(ts, co, n) {
+            tail!(native_call)
         }
         let nc = unsafe { $closure.as_native() };
         let win_ptr = unsafe { $base.add(a as usize + HDR) };
