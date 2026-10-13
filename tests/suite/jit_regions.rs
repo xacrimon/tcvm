@@ -1640,6 +1640,31 @@ fn coroutines_parked_in_compiled_frames() {
     );
 }
 
+/// A fast callee whose window does not fit the committed stack misses to
+/// its caller's slow path, which must run with the caller's CLOSURE: a
+/// mutable upvalue the caller reads after the call is a cell found through
+/// it.
+#[test]
+fn fast_callee_miss_keeps_the_callers_closure() {
+    agrees(
+        "local count, kt = 0, {3}
+        local function f(n)
+          local a, b, c, d, e, g, h, i, j, k, l, m, o, p, q, r = n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n
+          local s, t, u, v, w, x, y, z = n, n, n, n, n, n, n, n
+          return #('x' .. n) + (a + z) % 3
+        end
+        local function h(n)
+          local x = f(n)
+          count = count + 1
+          if n > 0 then x = x + h(n - 1) end
+          return x + count % 7 + kt[1]
+        end
+        local s = 0
+        for r = 1, 200 do s = s + h(50 + r * 20) end
+        return tostring(s)",
+    );
+}
+
 fn panicker<'gc>(
     _ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,

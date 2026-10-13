@@ -542,17 +542,60 @@ pub(crate) unsafe extern "C-unwind" fn jit_call_native(
     ts.top_base = w;
     let win = ts.slot_index(w);
     ts.top = win + nargs;
+    let out = invoke(ctx, ts, nc, win);
+    if out.tag() == tag::RETURN {
+        return returned(ctx, win);
+    }
+    shim_drive(ctx, w, nc, out)
+}
+
+/// A native's plain return of `win .. top` to compiled code, after the
+/// collection it may owe.
+#[inline(always)]
+fn returned(ctx: Context<'_>, win: usize) -> NativeRet {
+    if ctx.gc_due() {
+        crate::vm::stack::park(ctx, crate::vm::stack::Park::Gc);
+    }
+    let ts = unsafe { &*ctx.thread_ptr() };
+    let n = ts.top - win;
+    let first = if n == 0 { Value::nil() } else { ts.stack[win] };
+    NativeRet {
+        first: first.to_raw(),
+        n: n as u64,
+    }
+}
+
+/// What the native `nc` with its frame at `w` asked for, `out`, done as
+/// `drive` would while it comes to a plain return, whose results then go
+/// back to compiled code; anything else goes back as an outcome.
+#[inline(never)]
+fn shim_drive<'gc>(
+    ctx: Context<'gc>,
+    w: *mut Value<'gc>,
+    nc: &NativeClosure<'gc>,
+    mut out: crate::vm::native::NativeOut,
+) -> NativeRet {
     let tp = ctx.thread_ptr();
-    let mut out = invoke(ctx, ts, nc, win);
+    let win = unsafe { (*tp).slot_index(w) };
     loop {
         let t = unsafe { &mut *tp };
         out = match out.tag() {
             tag::RETURN => break,
             tag::RESUME if t.resume_depth + 1 < crate::vm::coro::MAX_RESUME_DEPTH => {
                 let at = out.at();
-                set_wait(t, win - frame::HDR, nc, at, out.cont(), out.ok(), frame::flag::PROTECTED);
+                set_wait(
+                    t,
+                    win - frame::HDR,
+                    nc,
+                    at,
+                    out.cont(),
+                    out.ok(),
+                    frame::flag::PROTECTED,
+                );
                 t.top_base = w;
-                let co = t.stack[win + at].get_thread().expect("resume of a non-thread");
+                let co = t.stack[win + at]
+                    .get_thread()
+                    .expect("resume of a non-thread");
                 let (args, n) = (win + at + 1, t.top - (win + at + 1));
                 match unsafe { crate::vm::coro::resume(ctx, tp, co, args, n, win + at) } {
                     crate::vm::coro::Back::Values => continued(ctx, tp, win),
@@ -578,16 +621,7 @@ pub(crate) unsafe extern "C-unwind" fn jit_call_native(
             }
         };
     }
-    if ctx.gc_due() {
-        crate::vm::stack::park(ctx, crate::vm::stack::Park::Gc);
-    }
-    let ts = unsafe { &*ctx.thread_ptr() };
-    let n = ts.top - win;
-    let first = if n == 0 { Value::nil() } else { ts.stack[win] };
-    NativeRet {
-        first: first.to_raw(),
-        n: n as u64,
-    }
+    returned(ctx, win)
 }
 
 /// Box an integer outside i32.
