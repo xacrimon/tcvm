@@ -388,7 +388,8 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
                 Emitted::Done => None,
                 Emitted::Fallback(slow, _) => Some(slow),
             };
-            if slow != Some(b.cur) {
+            // `return error(...)` left already.
+            if slow != Some(b.cur) && !b.terminated() {
                 b.flush();
                 emit_return_from(b, a, 1, before);
             }

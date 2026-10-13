@@ -174,7 +174,7 @@ fn lua_dofile<'gc>(
 /// `error(message [, level])`. The position prefix for `level >= 1` is
 /// applied when the error is raised (`ThreadState::raise`); a negative level
 /// names no frame, like any level past the bottom of the stack.
-fn lua_error<'gc>(
+pub(crate) fn lua_error<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,

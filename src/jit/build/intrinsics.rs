@@ -28,6 +28,7 @@ enum Intrinsic {
     Ceil,
     Abs,
     Assert,
+    Error,
     Pairs,
     Ipairs,
     Select,
@@ -40,8 +41,9 @@ enum Intrinsic {
 fn intrinsic_of(f: Function<'_>) -> Option<Intrinsic> {
     use crate::builtin::basic as base;
     let nc = f.as_native()?;
-    let plain: [(NativeFn, Intrinsic); 12] = [
+    let plain: [(NativeFn, Intrinsic); 13] = [
         (base::lua_type, Intrinsic::Builtin(HelperId::Type)),
+        (base::lua_error, Intrinsic::Error),
         (
             base::lua_getmetatable,
             Intrinsic::Builtin(HelperId::GetMetatable),
@@ -228,8 +230,10 @@ pub(super) enum Emitted {
 /// Compile the CALL at `pc` as its callee's intrinsic, if it has one that
 /// covers the call's shape.
 pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: Val) -> Emitted {
-    // A tail call returns the one result.
-    let (a, nb, c) = if insn.op() == crate::instruction::Op::TAILCALL {
+    // A tail call returns the one result: not for a builtin that may
+    // return more.
+    let tail = insn.op() == crate::instruction::Op::TAILCALL;
+    let (a, nb, c) = if tail {
         (insn.a(), insn.b(), 2)
     } else {
         (insn.a(), insn.b(), insn.c())
@@ -241,12 +245,56 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: 
         return Emitted::No;
     };
     match intr {
-        Intrinsic::Select => return select(b, pc, a, nb, c, f, callee),
+        Intrinsic::Select => return select(b, pc, a, nb, c, f, callee, tail),
+        Intrinsic::Assert if nb != 0 && c != 0 && !(tail && nb > 2) => {
+            return assert(b, a, nb - 1, c, f, callee);
+        }
+        Intrinsic::Assert => return Emitted::No,
+        Intrinsic::Error => {
+            // The interpreter's builtin raises; nothing follows.
+            pin(b, f, callee);
+            b.deopt(ExitTag::Slow);
+            return Emitted::Done;
+        }
         Intrinsic::Builtin(h) if nb != 0 => return builtin(b, h, a, nb - 1, c, f, callee),
         _ if nb == 0 => return Emitted::No,
         _ => {}
     }
     emit_math(b, pc, intr, a, nb - 1, c, f, callee)
+}
+
+/// Guard `callee` to be the builtin `f`; the constant.
+fn pin<'gc>(b: &mut Builder<'_, 'gc>, f: Function<'gc>, callee: Val) -> Val {
+    let k = b.konst(Value::function(f));
+    let cv = b.boxed(callee);
+    b.ins_exit(Op::GuardSame, &[cv, k], ExitTag::Const);
+    k
+}
+
+/// `assert(v, ...)`: its `nargs` arguments, a falsy `v` an exit, where the
+/// interpreter's builtin raises (LuaJIT's `recff_assert`).
+fn assert<'gc>(
+    b: &mut Builder<'_, 'gc>,
+    a: u8,
+    nargs: u8,
+    c: u8,
+    f: Function<'gc>,
+    callee: Val,
+) -> Emitted {
+    pin(b, f, callee);
+    let x = b.reg(a + 4);
+    let xv = b.boxed(x);
+    let falsy = b.ins(Op::IsFalsy, &[xv]);
+    b.ins_exit(Op::GuardFalse, &[falsy], ExitTag::Slow);
+    for k in 0..c - 1 {
+        let v = if k < nargs {
+            b.reg(a + 4 + k)
+        } else {
+            b.konst(Value::nil())
+        };
+        b.set(a + k, v);
+    }
+    Emitted::Done
 }
 
 /// A builtin by its helper; `type` of a known kind is a constant.
@@ -370,7 +418,9 @@ fn type_name(set: TypeSet) -> Option<&'static str> {
 
 /// `select('#', ...)` and `select(k, ...)` with a constant selector and one
 /// result, from the arguments, or from the frame's extras when they are a
-/// `VARARG` up to `top` just before.
+/// `VARARG` up to `top` just before; a `tail` call only of the count, the
+/// one select that returns one value.
+#[allow(clippy::too_many_arguments)]
 fn select<'gc>(
     b: &mut Builder<'_, 'gc>,
     pc: u32,
@@ -379,6 +429,7 @@ fn select<'gc>(
     c: u8,
     f: Function<'gc>,
     callee: Val,
+    tail: bool,
 ) -> Emitted {
     if c != 2 || nb == 1 {
         return Emitted::No;
@@ -392,7 +443,7 @@ fn select<'gc>(
     };
     let count = sv.get_string().is_some_and(|s| s.as_bytes() == b"#");
     let k = sv.get_integer();
-    if !count && k.is_none() {
+    if !count && (k.is_none() || tail) {
         return Emitted::No;
     }
     let extras = nb == 0;
@@ -447,7 +498,7 @@ fn const_value<'gc>(b: &Builder<'_, 'gc>, v: Val) -> Option<Value<'gc>> {
     }
 }
 
-/// The math intrinsics, `assert`, `pairs` and `ipairs`. An argument their
+/// The math intrinsics, `pairs` and `ipairs`. An argument their
 /// inline code does not take goes to the builtin (I1), but where an
 /// operation's own exit stops it (an overflow, a result outside i32).
 #[allow(clippy::too_many_arguments)]
@@ -465,24 +516,16 @@ fn emit_math<'gc>(
     let iterators = matches!(intr, Intrinsic::Pairs | Intrinsic::Ipairs);
     // An exit saw an argument the inline code does not take.
     let seen = b.feedback(pc) & fb::KINDS;
-    let numbers = !matches!(intr, Intrinsic::Assert) && !iterators;
-    if numbers && seen & !(fb::SMALL | fb::BIGINT | fb::FLOAT) != 0 {
+    if !iterators && seen & !(fb::SMALL | fb::BIGINT | fb::FLOAT) != 0 {
         return Emitted::No;
     }
     // A tail call or MULTRET wants all results; the iterators make up to
     // four, the others one.
     let tail = insn.op() == crate::instruction::Op::TAILCALL;
-    if c == 0
-        || (c > 2 && !iterators)
-        || (iterators && (tail || c > 5))
-        || (intr != Intrinsic::Assert && nargs != 1)
-        || nargs == 0
-    {
+    if c == 0 || (c > 2 && !iterators) || (iterators && (tail || c > 5)) || nargs != 1 {
         return Emitted::No;
     }
-    let k = b.konst(Value::function(f));
-    let cv = b.boxed(callee);
-    b.ins_exit(Op::GuardSame, &[cv, k], ExitTag::Const);
+    let k = pin(b, f, callee);
     let x = b.reg(a + 4);
     // Where the builtin runs instead.
     let mut slow = None;
@@ -571,13 +614,8 @@ fn emit_math<'gc>(
             }
         }
         Intrinsic::Pairs | Intrinsic::Ipairs => unreachable!("returned above"),
-        Intrinsic::Select | Intrinsic::Builtin(_) => unreachable!("not math"),
-        Intrinsic::Assert => {
-            // A falsy one raises in the builtin.
-            let xv = b.boxed(x);
-            let falsy = b.ins(Op::IsFalsy, &[xv]);
-            slow = Some(fallback(b, falsy, false));
-            xv
+        Intrinsic::Select | Intrinsic::Builtin(_) | Intrinsic::Assert | Intrinsic::Error => {
+            unreachable!("not math")
         }
     };
     if c == 2 {

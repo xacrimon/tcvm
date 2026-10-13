@@ -2045,3 +2045,58 @@ fn inlined_methods() {
         return tostring(m)",
     );
 }
+
+/// `assert` is its arguments, a falsy first one an exit; `error` is an exit
+/// (the interpreter's builtins raise, at the call's position), also in
+/// inlined bodies and for `return error(...)`. A tail call of `assert` or
+/// `select` returns all their results.
+#[test]
+fn assert_and_error_exit() {
+    agrees(
+        "local function check(t, i)
+          assert(t[i] ~= nil, 'missing ' .. i)
+          local a, b = assert(t[i], 'x')
+          if t[i] < 0 then error('negative at ' .. i) end
+          return a + #b
+        end
+        local t = {}
+        for i = 1, 300 do t[i] = i end
+        local s = 0
+        for i = 1, 300 do s = s + check(t, i) end
+        local msgs = {}
+        local function run()
+          local x = 0
+          for i = 1, 300 do x = x + check(t, i) end
+          return x
+        end
+        for k = 1, 3 do
+          t[150] = nil
+          local ok, e = pcall(run)
+          msgs[#msgs + 1] = tostring(ok) .. ':' .. tostring(e)
+          t[150] = -1
+          ok, e = pcall(run)
+          msgs[#msgs + 1] = tostring(ok) .. ':' .. tostring(e)
+          t[150] = 150
+        end
+        local function thrower(n) if n > 250 then return error({code = n}) end return n end
+        local u = 0
+        for i = 1, 300 do
+          local ok, e = pcall(thrower, i)
+          u = u + (ok and e or e.code)
+        end
+        local function two(v, w)
+          local p, q, r = assert(v, w)
+          return (p or 0) + (q or 0) + (r and 1 or 0)
+        end
+        local w = 0
+        for i = 1, 500 do w = w + two(i, i) end
+        local function both(x) return assert(x, 'm') end
+        local function rest(...) return select(2, ...) end
+        for i = 1, 500 do
+          local p, q = both(i)
+          local r, t = rest(i, i, i)
+          w = w + #q + r + t
+        end
+        return s .. ' ' .. table.concat(msgs, ' | ') .. ' ' .. u .. ' ' .. w",
+    );
+}
