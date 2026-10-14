@@ -66,7 +66,7 @@ return table.concat(out, ' | ')
 "#;
     assert_eq!(
         run(src),
-        r#"# r5 w6=5 r4 w5=4 r3 w4=3 r2 w3=2 w2=x | # w7=y | 1 # r1 r2 w1=x r3 w2=2 r4 w3=3 r5 w4=4 r6 w5=5 r7 w6=y w7=nil | y # r6 w6=nil | nil # r0 w0=nil | 2-3 # r2 r3 | 2 # r2 r3 | r1 w2=1 r2 w3=2 r3 w4=3 r4 w5=4 | r3 w4=3 r2 w3=2 r1 w2=1 | r3 w4=2 r2 w3=1 r1 w2=1"#
+        r#"# r5 w6=5 r4 w5=4 r3 w4=3 r2 w3=2 w2=x | # w7=y | 1 # r1 r2 w1=x r3 w2=2 r4 w3=3 r5 w4=4 r6 w5=5 r7 w6=y w7=nil | y # r6 w6=nil | nil # r0 w0=nil | 2-3 # r2 r3 | 2 r2 r3 | r1 w2=1 r2 w3=2 r3 w4=3 r4 w5=4 | r3 w4=3 r2 w3=2 r1 w2=1 | r3 w4=2 r2 w3=1 r1 w2=1"#
     );
 }
 
@@ -286,4 +286,86 @@ end)
 return cat(co(), co(), co(), co())
 "#;
     assert_eq!(run(src), "len y1 y2 1+2");
+}
+
+#[test]
+fn unpack_explicit_end_skips_length() {
+    assert_eq!(
+        ok(r#"
+local t = setmetatable({10, 20}, {__len = function() error('unexpected length') end})
+return cat(table.unpack(t, 1, 2)) .. '|' .. select('#', table.unpack(t, 2, 1))
+"#),
+        "10 20|0"
+    );
+}
+
+#[test]
+fn unpack_default_end_uses_length() {
+    assert_eq!(
+        ok(r#"
+local calls = 0
+local t = setmetatable({10, 20}, {__len = function() calls = calls + 1; return 1 end})
+return cat(table.unpack(t)) .. '|' .. cat(table.unpack(t, nil, nil)) .. '|' .. calls
+"#),
+        "10|10|2"
+    );
+}
+
+#[test]
+fn unpack_only_requires_operations_it_performs() {
+    assert_eq!(
+        ok(r#"
+local u = io.tmpfile()
+u:close()
+debug.setmetatable(u, {__index = function(_, k) return k * 10 end})
+local a = cat(table.unpack(u, 1, 2))
+debug.setmetatable(u, {__len = function() return 0 end})
+return a .. '|' .. cat(select('#', table.unpack(u)), select('#', table.unpack(false, 2, 1)),
+  select('#', table.unpack(nil, 2, 1)))
+"#),
+        "10 20|0 0 0"
+    );
+}
+
+#[test]
+fn unpack_validates_start_before_length() {
+    assert_eq!(
+        ok(r#"
+local calls = 0
+local t = setmetatable({}, {__len = function() calls = calls + 1; error('length') end})
+local ok, err = pcall(table.unpack, t, {})
+return cat(ok, err:find('number expected', 1, true) ~= nil, calls)
+"#),
+        "false true 0"
+    );
+}
+
+#[test]
+fn unpack_length_can_install_index() {
+    assert_eq!(
+        ok(r#"
+local mt = {__len = function(t)
+  getmetatable(t).__index = function(_, k) return k * 10 end
+  collectgarbage('collect')
+  return 2
+end}
+return cat(table.unpack(setmetatable({}, mt)))
+"#),
+        "10 20"
+    );
+}
+
+#[test]
+fn unpack_propagates_required_hook_errors() {
+    assert_eq!(
+        ok(r#"
+local token = {}
+local t = setmetatable({}, {__len = function() error(token) end})
+local a, b = pcall(table.unpack, t)
+setmetatable(t, {__index = function() error(token) end})
+local c, d = pcall(table.unpack, t, 1, 1)
+return cat(a, b == token, c, d == token)
+"#),
+        "false true false true"
+    );
 }

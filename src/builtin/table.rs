@@ -1083,10 +1083,22 @@ fn lua_unpack<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> NativeOut {
-    let Some(t) = check_tab(ctx, stack.get(0), "unpack", 1, TAB_R | TAB_L)? else {
-        return unpack_meta(ctx, &mut stack);
+    let i_arg = stack.get(1);
+    let i = if i_arg.is_nil() {
+        1
+    } else {
+        util::check_integer(ctx, i_arg, "unpack", 2)?
     };
-    let Some((i, n)) = unpack_range(ctx, &stack, t.raw_len() as i64)? else {
+    // Unlike checktab callers, unpack only needs indexing for a nonempty
+    // range, and only needs a length when the upper bound is omitted.
+    let Some(t) = stack
+        .get(0)
+        .get_table()
+        .filter(|t| !t.shape().has_any_mm(TAB_R | TAB_L))
+    else {
+        return unpack_meta(ctx, &mut stack, i);
+    };
+    let Some((i, n)) = unpack_range(ctx, &stack, i, t.raw_len() as i64)? else {
         stack.clear();
         return NativeOut::RETURN;
     };
@@ -1102,10 +1114,14 @@ fn lua_unpack<'gc>(
 /// `unpack` on a value whose accesses may run metamethods.
 #[cold]
 #[inline(never)]
-fn unpack_meta<'gc>(ctx: Context<'gc>, stack: &mut Stack<'gc, '_>) -> NativeOut {
-    stack.spawn_action(ctx, |cx| async move {
-        let len = util::len(&cx, 0).await?;
-        let range = cx.try_enter(|ctx, stack| unpack_range(ctx, stack, len))?;
+fn unpack_meta<'gc>(ctx: Context<'gc>, stack: &mut Stack<'gc, '_>, i: i64) -> NativeOut {
+    stack.spawn_action(ctx, move |cx| async move {
+        let len = if cx.enter(|_, stack| stack.get(2).is_nil()) {
+            util::len(&cx, 0).await?
+        } else {
+            0
+        };
+        let range = cx.try_enter(|ctx, stack| unpack_range(ctx, stack, i, len))?;
         let Some((i, n)) = range else {
             cx.enter(|_ctx, mut stack| stack.clear());
             return Ok(());
@@ -1125,14 +1141,9 @@ fn unpack_meta<'gc>(ctx: Context<'gc>, stack: &mut Stack<'gc, '_>) -> NativeOut 
 fn unpack_range<'gc>(
     ctx: Context<'gc>,
     stack: &Stack<'gc, '_>,
+    i: i64,
     len: i64,
 ) -> Result<Option<(i64, usize)>, Error<'gc>> {
-    let i_arg = stack.get(1);
-    let i = if i_arg.is_nil() {
-        1
-    } else {
-        util::check_integer(ctx, i_arg, "unpack", 2)?
-    };
     let j_arg = stack.get(2);
     let j = if j_arg.is_nil() {
         len
