@@ -40,6 +40,7 @@ mod loadfile;
 mod local_env;
 mod loop_close;
 mod main_yielded;
+mod math_extreme_metamethods;
 mod math_fast_entries;
 mod math_frexp_ldexp;
 mod metamethod_dispatch;
