@@ -243,6 +243,8 @@ pub(crate) struct Func<'gc> {
     pub(crate) pool: Vec<Value<'gc>>,
     /// The shapes guards compare against and transitions store.
     pub(crate) shapes: Vec<crate::env::Shape<'gc>>,
+    /// Sets of `shapes` indices, sorted, for `GuardShapeIn` and `ShapeIn`.
+    pub(crate) shape_sets: Vec<Vec<u32>>,
     pub(crate) entry: Block,
     pub(crate) meta: RegionMeta,
     /// The `After` snapshot of a value's definition, where a definition
@@ -302,6 +304,7 @@ impl<'gc> Func<'gc> {
             snap_pool: Vec::new(),
             pool: Vec::new(),
             shapes: Vec::new(),
+            shape_sets: Vec::new(),
             entry: Block(0),
             meta,
             def_snaps: Vec::new(),
@@ -580,6 +583,20 @@ impl<'gc> Func<'gc> {
     }
 
     /// `op`'s result type from its operands' (only the first three matter).
+    /// The index of the set of `shapes` indices `set`, interned.
+    pub(crate) fn intern_shape_set(&mut self, set: &[u32]) -> u32 {
+        let mut v = set.to_vec();
+        v.sort_unstable();
+        v.dedup();
+        match self.shape_sets.iter().position(|x| *x == v) {
+            Some(k) => k as u32,
+            None => {
+                self.shape_sets.push(v);
+                self.shape_sets.len() as u32 - 1
+            }
+        }
+    }
+
     pub(crate) fn result_ty(&self, op: Op, args: &[Val]) -> Ty {
         let mut tys = [Ty::ANY; 3];
         let n = args.len().min(3);

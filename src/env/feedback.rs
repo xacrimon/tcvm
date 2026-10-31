@@ -420,14 +420,45 @@ impl<'gc> FeedbackVector<'gc> {
     /// Record `shape` at the field site at `pc`, up to `MAX_SHAPES + 1`. The
     /// caller runs the prototype's barrier.
     pub(crate) fn add_shape(&self, pc: usize, shape: Shape<'gc>) {
-        let Some((w, SlotKind::Field)) = self.slot(pc) else {
-            return;
-        };
+        if let Some((w, SlotKind::Field)) = self.slot(pc) {
+            self.add_shape_at(w, shape);
+        }
+    }
+
+    /// [`Self::add_shape`] for the field slot at word `w`.
+    pub(crate) fn add_shape_at(&self, w: usize, shape: Shape<'gc>) {
+        debug_assert!(self.is_field(w));
         if shape.is_deprecated() {
             return;
         }
+        self.record_at(w).push(shape);
+    }
+
+    /// An interpreter refill of the field slot at word `w` from `old` to
+    /// `new`, another shape: the first records both, later ones `new`, none
+    /// once the site is megamorphic (refills of such a site are its steady
+    /// state, and cost the interpreter little this way).
+    #[inline]
+    pub(crate) fn add_refill(&self, w: usize, old: Shape<'gc>, new: Shape<'gc>) {
+        debug_assert!(self.is_field(w));
+        if let Some(r) = self.record(self.word(w).get()) {
+            if !r.full() && !r.has(new) && !new.is_deprecated() {
+                r.push(new);
+            }
+            return;
+        }
+        let r = self.record_at(w);
+        for s in [old, new] {
+            if !s.is_deprecated() {
+                r.push(s);
+            }
+        }
+    }
+
+    /// The shape record of the field slot at word `w`, made when missing.
+    fn record_at(&self, w: usize) -> &ShapeRecord<'gc> {
         let s = self.word(w);
-        let r = match self.record(s.get()) {
+        match self.record(s.get()) {
             Some(r) => r,
             None => {
                 let r = Box::new(ShapeRecord {
@@ -440,8 +471,7 @@ impl<'gc> FeedbackVector<'gc> {
                 // SAFETY: just made, owned by the vector from here on.
                 unsafe { &*r }
             }
-        };
-        r.push(shape);
+        }
     }
 
     /// What exits compare to tell whether a recompile learns something: the
@@ -512,6 +542,16 @@ impl<'gc> FeedbackVector<'gc> {
 }
 
 impl<'gc> ShapeRecord<'gc> {
+    fn full(&self) -> bool {
+        self.len.get() as usize == RECORD_SHAPES
+    }
+
+    fn has(&self, shape: Shape<'gc>) -> bool {
+        self.shapes[..self.len.get() as usize]
+            .iter()
+            .any(|s| s.get().is_some_and(|s| Shape::ptr_eq(s, shape)))
+    }
+
     fn push(&self, shape: Shape<'gc>) {
         let n = self.len.get() as usize;
         let have = self.shapes[..n]

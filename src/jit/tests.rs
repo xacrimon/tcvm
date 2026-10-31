@@ -432,3 +432,29 @@ fn second_member_deprecates_mono_shapes() {
         assert_eq!(v("same_mt").get_boolean(), Some(true));
     });
 }
+
+/// Shapes that keep the key in one slot share one guard and one load; the
+/// interpreter's refills told the compiler of all three.
+#[test]
+fn polymorphic_reads_merge() {
+    let src = "function getx(p) return p.x + 1 end
+    for i = 1, 300 do getx({x = i, y = 2}); getx({x = i, z = 3}); getx({x = i, w = 4}) end";
+    let ir = ir_of(src, "getx", 0);
+    let count = |s: &str| ir.lines().filter(|l| l.contains(s)).count();
+    assert_eq!(count("guardshapein"), 1, "{ir}");
+    assert_eq!(count("tabload"), 1, "{ir}");
+    assert_eq!(count("deopt"), 0, "{ir}");
+}
+
+/// Two layouts dispatch once: the last needs a guard, not a test and an
+/// exit, and later reads of the same table know its shape is one of two.
+#[test]
+fn polymorphic_dispatch_carries_its_shapes() {
+    let src = "function len2(p) return p.x * p.x + p.y * p.y end
+    for i = 1, 300 do len2({x = i, y = 2}); len2({y = 2, x = i}) end";
+    let ir = ir_of(src, "len2", 0);
+    let count = |s: &str| ir.lines().filter(|l| l.contains(s)).count();
+    assert_eq!(count("shapeis"), 1, "{ir}");
+    assert_eq!(count("guardshape("), 1, "{ir}");
+    assert_eq!(count("deopt"), 0, "{ir}");
+}

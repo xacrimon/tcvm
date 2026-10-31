@@ -64,8 +64,27 @@ fn fill_ic<'gc>(
         // A fresh `Shape` pointer is adopted through this slot, so the
         // prototype gets its barrier before the write.
         ctx.mutation().backward_barrier(Gc::erase(proto), None);
-        proto.feedback.cache(d as usize).set(entry);
+        let cache = proto.feedback.cache(d as usize);
+        // A site that saw another shape records both: the compiler learns
+        // its polymorphism before its first exit.
+        if let (Some(old), Some(new)) = (entry_shape(cache.get()), entry_shape(entry))
+            && !Shape::ptr_eq(old, new)
+        {
+            proto.feedback.add_refill(d as usize, old, new);
+        }
+        cache.set(entry);
         quicken(site, &entry);
+    }
+}
+
+/// The receiver shape an entry is for.
+#[inline(always)]
+fn entry_shape<'gc>(entry: InlineCache<'gc>) -> Option<Shape<'gc>> {
+    match entry {
+        InlineCache::Own { shape, .. } | InlineCache::Absent { shape } => Some(shape),
+        InlineCache::ProtoLoad { recv, .. } => Some(recv),
+        InlineCache::Transition { from, .. } => Some(from),
+        InlineCache::Empty => None,
     }
 }
 

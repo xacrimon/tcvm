@@ -136,6 +136,7 @@ struct Em<'a> {
     sites: Vec<SiteOut>,
     sites_of: &'a [(usize, crate::jit::backend::aarch64::lower::LSite)],
     snap_ops: &'a [u32],
+    shape_sets: &'a [Vec<u64>],
     /// This region's prototype and its known entry, when it has one.
     own_entry: Option<(u64, Label)>,
     /// The direct branches to known entries, by the callee's prototype.
@@ -301,6 +302,7 @@ pub(crate) fn emit(
         sites: Vec::new(),
         sites_of: &l.sites,
         snap_ops: &l.snap_ops,
+        shape_sets: &l.shape_sets,
         fmods: Vec::new(),
         own_entry: None,
         direct: Vec::new(),
@@ -944,6 +946,21 @@ impl Em<'_> {
         (entries, consts)
     }
 
+    /// Flags `Eq` when table `t`'s shape is one of `shape_sets[set]`: one
+    /// load, then a compare per shape, each after the first only while none
+    /// matched (`ccmp`, `Z` set otherwise).
+    fn shape_in(&mut self, t: Gpr, set: u32) {
+        self.a.ldr(X16, t, layout::T_SHAPE as i32);
+        for (n, &word) in self.shape_sets[set as usize].iter().enumerate() {
+            self.a.ldr_lit(X17, word);
+            if n == 0 {
+                self.a.cmp(Sz::X, X16, X17);
+            } else {
+                self.a.ccmp(Sz::X, X16, X17, 0b0100, Cond::Ne);
+            }
+        }
+    }
+
     /// Set the flags for `test` on instruction `i`'s operands from `k`;
     /// returns the condition that means the test holds, given `cond` (the
     /// IR's condition for compares, ignored for type tests).
@@ -1000,6 +1017,11 @@ impl Em<'_> {
                 self.a.ldr(X16, t, layout::T_SHAPE as i32);
                 self.a.ldr_lit(X17, word);
                 self.a.cmp(Sz::X, X16, X17);
+                cond
+            }
+            Test::ShapeIn(set) => {
+                let t = self.r(i, k);
+                self.shape_in(t, set);
                 cond
             }
             // `cond` is `Eq` for in the set, `Ne` for not.
@@ -1560,6 +1582,12 @@ impl Em<'_> {
                 self.a.ldr(X16, t, layout::T_SHAPE as i32);
                 self.a.ldr_lit(X17, shape);
                 self.a.cmp(Sz::X, X16, X17);
+                let l = self.exit(exit);
+                self.a.b_cond(Cond::Ne, l);
+            }
+            GuardShapeIn { set, exit } => {
+                let t = self.r(i, 0);
+                self.shape_in(t, set);
                 let l = self.exit(exit);
                 self.a.b_cond(Cond::Ne, l);
             }

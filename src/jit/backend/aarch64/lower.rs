@@ -57,6 +57,8 @@ pub(crate) struct Lowered {
     pub(crate) snap_ops: Vec<u32>,
     /// The registers the entry guards test.
     pub(crate) entry_regs: Vec<u8>,
+    /// `Func::shape_sets` as the shapes' addresses.
+    pub(crate) shape_sets: Vec<Vec<u64>>,
 }
 
 struct Lower<'a, 'gc> {
@@ -215,6 +217,15 @@ pub(crate) fn lower<'gc>(f: &Func<'gc>, code_base: usize) -> Result<Lowered, Str
         sites: lw.sites,
         snap_ops: lw.snap_ops,
         entry_regs: lw.entry_regs,
+        shape_sets: f
+            .shape_sets
+            .iter()
+            .map(|set| {
+                set.iter()
+                    .map(|&k| f.shapes[k as usize].as_word())
+                    .collect()
+            })
+            .collect(),
     })
 }
 
@@ -340,6 +351,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                             | Op::IsFalsy
                             | Op::SameBits
                             | Op::ShapeIs(_)
+                            | Op::ShapeIn(_)
                     )
                 {
                     self.fused[c.idx()] = true;
@@ -390,6 +402,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 Cond::Eq,
                 args,
             ),
+            Op::ShapeIn(k) => (Test::ShapeIn(k), Cond::Eq, args),
             op => panic!("test_of {op:?}"),
         }
     }
@@ -690,6 +703,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             | Op::IsFalsy
             | Op::SameBits
             | Op::ShapeIs(_)
+            | Op::ShapeIn(_)
             | Op::ICmp(_)
             | Op::LCmp(_)
             | Op::FCmp(_) => {
@@ -841,6 +855,10 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 let shape = f.shapes[k as usize].as_word();
                 let t = self.use_(args[0]);
                 self.push_exit(i, |exit| MInst::GuardShape { shape, exit }, vec![t], none);
+            }
+            Op::GuardShapeIn(set) => {
+                let t = self.use_(args[0]);
+                self.push_exit(i, |exit| MInst::GuardShapeIn { set, exit }, vec![t], none);
             }
             Op::GuardProto(k) => {
                 let proto = f.protos[k as usize].ptr.as_ptr() as u64;

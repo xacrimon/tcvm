@@ -90,6 +90,32 @@ impl Shapes {
         Some(s)
     }
 
+    /// The set of `ks`, when it fits.
+    pub(crate) fn of(ks: &[u32]) -> Option<Shapes> {
+        let mut s = Shapes {
+            n: 0,
+            k: [0; crate::jit::MAX_SHAPES],
+        };
+        for &k in ks {
+            if !s.contains(k) {
+                *s.k.get_mut(s.n as usize)? = k;
+                s.n += 1;
+            }
+        }
+        Some(s)
+    }
+
+    /// These, but those also in `ks`.
+    fn only(self, ks: &[u32]) -> Shapes {
+        let mut s = self;
+        for &x in self.as_slice() {
+            if !ks.contains(&x) {
+                s = s.without(x);
+            }
+        }
+        s
+    }
+
     fn without(self, k: u32) -> Shapes {
         let mut s = Shapes {
             n: 0,
@@ -697,6 +723,16 @@ impl<'a, 'gc> Builder<'a, 'gc> {
                 let set = match self.known_shapes(a[0]) {
                     _ if holds => Shapes::one(k),
                     Some(s) => s.without(k),
+                    None => return None,
+                };
+                return Some((a[0], Fact::Shapes(set)));
+            }
+            Op::ShapeIn(i) => {
+                let ks = &self.f.shape_sets[i as usize];
+                let set = match self.known_shapes(a[0]) {
+                    Some(s) if holds => s.only(ks),
+                    None if holds => Shapes::of(ks)?,
+                    Some(s) => ks.iter().fold(s, |s, &k| s.without(k)),
                     None => return None,
                 };
                 return Some((a[0], Fact::Shapes(set)));

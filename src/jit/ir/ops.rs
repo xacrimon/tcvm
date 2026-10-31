@@ -613,6 +613,10 @@ pub(crate) enum Op {
     GuardShape(u32),
     /// Whether the table's shape is `shapes[i]`, a `B1`.
     ShapeIs(u32),
+    /// Exits unless the table's shape is one of `shape_sets[i]`.
+    GuardShapeIn(u32),
+    /// Whether the table's shape is one of `shape_sets[i]`, a `B1`.
+    ShapeIn(u32),
     /// The live metamethod bits of the class `shapes[i]` pins, an `I32`.
     ClassBits(u32),
     /// The live `__index` of the class `shapes[i]` pins.
@@ -853,9 +857,9 @@ impl Op {
             | INeg | IShl | IShr | IDivFloor | IModFloor | LDivFloor | LModFloor | LToI
             | LToFExact | FToIExact | ToF64 => Effects::flags(DEOPT),
             GuardNoFlag(_) | GuardFits(_) | GuardWindow(_) => e(DEOPT, Mem::FRAME, Mem::empty()),
-            GuardShape(_) => e(DEOPT, Mem::SHAPE, Mem::empty()),
+            GuardShape(_) | GuardShapeIn(_) => e(DEOPT, Mem::SHAPE, Mem::empty()),
             GcCheck => e(DEOPT, Mem::GC, Mem::empty()),
-            ShapeIs(_) | TabHasRoom(_) | NamedKey => Effects::reads(Mem::SHAPE),
+            ShapeIs(_) | ShapeIn(_) | TabHasRoom(_) | NamedKey => Effects::reads(Mem::SHAPE),
             // A table's class changes only through helpers, which write `META`.
             ClassBits(_) | ClassIndex(_) | ClassMm(_) | TabMmBits | NumMtSet | TypeMtIs { .. } => {
                 Effects::reads(Mem::META)
@@ -914,6 +918,7 @@ impl Op {
             Store(_)
             | CellStore
             | GuardShape(_)
+            | GuardShapeIn(_)
             | TabStore { .. }
             | TabSetShape(_)
             | ArrStore
@@ -960,7 +965,7 @@ impl Op {
             NamedKey => Ty::val(TypeSet::STR),
             ClassIndex(_) | TabLoad { .. } | ArrLoad => Ty::ANY,
             TabArray => Ty::PTR,
-            TabHasRoom(_) | ShapeIs(_) => Ty::B1,
+            TabHasRoom(_) | ShapeIs(_) | ShapeIn(_) => Ty::B1,
             VarargAt(_) | VarargIdx => Ty::ANY,
             HasFlag(_) | FnFixedLua | FnFits | NumMtSet | TypeMtIs { .. } => Ty::B1,
             ClassMm(_) => Ty::ANY,

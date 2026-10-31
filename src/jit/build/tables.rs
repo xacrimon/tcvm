@@ -56,16 +56,109 @@ fn guard_shape<'gc>(b: &mut Builder<'_, 'gc>, t: Val, shape: Shape<'gc>) {
     b.set_shapes(t, Shapes::one(k));
 }
 
-/// Which of a chain's shapes `t` may have here, each with its index and
-/// whether it is the only one left (no test needed); `None` for a shape it
-/// is known not to have.
-fn chain_step<'gc>(b: &mut Builder<'_, 'gc>, t: Val, s: Shape<'gc>) -> Option<(u32, bool)> {
-    let k = b.intern_shape(s);
-    match b.known_shapes(t) {
-        Some(set) if !set.contains(k) => None,
-        Some(set) => Some((k, set.as_slice().len() == 1)),
-        None => Some((k, false)),
+/// What an access does for tables of a shape: shapes with equal ways are
+/// served by one arm under one shape-set test (V8's merged property
+/// accesses).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Way {
+    /// A load or store of the own slot at this location, the class's
+    /// `__index`/`__newindex` checked on nil.
+    Own(u32, u64),
+    /// The slot at `loc` of an `__index` table of a shape, for this class.
+    Proto(u64, u64, u32, u64),
+    /// Absent: nil unless the class's `__index` answers.
+    Absent(u64),
+    /// The generic helper.
+    Helper,
+    /// Its own arm.
+    Unique(usize),
+}
+
+/// The class `shape` pins, as a word, 0 without one.
+fn class_word(shape: Shape<'_>) -> u64 {
+    shape.mt_cache().map_or(0, |c| c.as_word())
+}
+
+/// `t` guarded to one of `ks`, unless it is known to have one of them.
+fn guard_shapes(b: &mut Builder<'_, '_>, t: Val, ks: &[u32]) {
+    if b.known_shapes(t)
+        .is_some_and(|k| k.as_slice().iter().all(|x| ks.contains(x)))
+    {
+        return;
     }
+    let op = match ks {
+        [k] => Op::GuardShape(*k),
+        _ => Op::GuardShapeIn(b.f.intern_shape_set(ks)),
+    };
+    b.ins_exit(op, &[t], ExitTag::Shape);
+    let known = b.known_shapes(t);
+    let set = match known {
+        Some(kn) => kn
+            .as_slice()
+            .iter()
+            .copied()
+            .filter(|x| ks.contains(x))
+            .collect(),
+        None => ks.to_vec(),
+    };
+    if let Some(s) = Shapes::of(&set) {
+        b.set_shapes(t, s);
+    }
+}
+
+/// An access of table `t` dispatched on its shape, `shapes` grouped by
+/// `way`: an arm per group, which `arm` emits for its first shape, each
+/// but the last behind a test of the group's set; the last guarded, or
+/// with no check when the facts leave no other shape.
+fn dispatch<'gc>(
+    b: &mut Builder<'_, 'gc>,
+    t: Val,
+    shapes: &[Shape<'gc>],
+    way: impl Fn(&mut Builder<'_, 'gc>, usize, Shape<'gc>) -> Way,
+    mut arm: impl FnMut(&mut Builder<'_, 'gc>, Shape<'gc>),
+) {
+    let known = b.known_shapes(t);
+    let mut groups: Vec<(Way, Vec<u32>, Shape<'gc>)> = Vec::new();
+    for (n, &s) in shapes.iter().enumerate() {
+        let k = b.intern_shape(s);
+        if known.is_some_and(|kn| !kn.contains(k)) {
+            continue;
+        }
+        let w = way(b, n, s);
+        match groups.iter_mut().find(|g| g.0 == w) {
+            Some(g) => g.1.push(k),
+            None => groups.push((w, vec![k], s)),
+        }
+    }
+    let join = b.new_block();
+    let last = groups.len().saturating_sub(1);
+    for (n, (_, ks, rep)) in groups.into_iter().enumerate() {
+        let covers = b
+            .known_shapes(t)
+            .is_some_and(|kn| kn.as_slice().iter().all(|x| ks.contains(x)));
+        let next = if covers {
+            None
+        } else if n == last {
+            guard_shapes(b, t, &ks);
+            None
+        } else {
+            let op = match ks[..] {
+                [k] => Op::ShapeIs(k),
+                _ => Op::ShapeIn(b.f.intern_shape_set(&ks)),
+            };
+            let is = b.ins(op, &[t]);
+            Some(branch_arm(b, is))
+        };
+        arm(b, rep);
+        b.flush();
+        b.jump(join);
+        match next {
+            Some(next) => b.switch_to(next),
+            None => return enter_join(b, join),
+        }
+    }
+    b.deopt(ExitTag::Shape);
+    enter_join(b, join);
 }
 
 /// Whether the class `shape` pins has `bit` now, read live (a shape pins
@@ -520,15 +613,17 @@ fn holder_of<'gc>(
 fn get_chain<'gc>(b: &mut Builder<'_, 'gc>, dst: u8, site: &Site<'gc>, shapes: &[Shape<'gc>]) {
     let t = table_of(b, site.recv);
     let key = site.kv.get_string().unwrap();
-    let join = b.new_block();
-    for &s in shapes {
-        let Some((k, only)) = chain_step(b, t, s) else {
-            continue;
-        };
-        let next = (!only).then(|| {
-            let is = b.ins(Op::ShapeIs(k), &[t]);
-            branch_arm(b, is)
-        });
+    let way = |_: &mut Builder<'_, 'gc>, _, s: Shape<'gc>| {
+        if let Some(slot) = s.find_slot(key) {
+            Way::Own(SlotLoc::new(s, slot).raw(), class_word(s))
+        } else if let Some((holder, hs, loc)) = holder_of(s, key) {
+            let h = Gc::as_ptr(holder.inner()) as u64;
+            Way::Proto(h, hs.as_word(), loc.raw(), class_word(s))
+        } else {
+            Way::Absent(class_word(s))
+        }
+    };
+    dispatch(b, t, shapes, way, |b, s| {
         if let Some(slot) = s.find_slot(key) {
             own_load(b, dst, site, s, t, SlotLoc::new(s, slot));
         } else if let Some((holder, hs, loc)) = holder_of(s, key) {
@@ -537,15 +632,7 @@ fn get_chain<'gc>(b: &mut Builder<'_, 'gc>, dst: u8, site: &Site<'gc>, shapes: &
             let nil = b.konst(Value::nil());
             nil_walks(b, dst, s, nil, site.recv, site.key);
         }
-        b.flush();
-        b.jump(join);
-        match next {
-            Some(next) => b.switch_to(next),
-            None => return enter_join(b, join),
-        }
-    }
-    b.deopt(ExitTag::Shape);
-    enter_join(b, join);
+    });
 }
 
 /// `SETFIELD` and `SETTABUP` in all their forms.
@@ -570,22 +657,25 @@ pub(super) fn emit_set<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
             return;
         }
         Some(shapes) if shapes.len() > 1 || first.is_none() && !shapes.is_empty() => {
-            // A test per shape: what the interpreter's cache would hold for it.
+            // What the interpreter's cache would hold for each shape; own
+            // stores to one location of one class share an arm.
             let t = table_of(b, recv);
             let ks = kv.get_string().unwrap();
-            let join = b.new_block();
-            for &s in &shapes {
-                let Some((k, only)) = chain_step(b, t, s) else {
-                    continue;
-                };
-                let next = (!only).then(|| {
-                    let is = b.ins(Op::ShapeIs(k), &[t]);
-                    branch_arm(b, is)
-                });
-                // A store to a metatable's mirrored key tells its class.
-                let tells = s.as_mt().is_some() && crate::env::shape::mirrored(ks);
-                match (s.find_slot(ks), s.prop_child(b.ctx.mutation(), ks)) {
-                    _ if tells => newindex(b, recv, key, v, false),
+            let mc = b.ctx.mutation();
+            // A store to a metatable's mirrored key tells its class.
+            let tells = |s: Shape<'gc>| s.as_mt().is_some() && crate::env::shape::mirrored(ks);
+            let way = |_: &mut Builder<'_, 'gc>, n, s: Shape<'gc>| match (
+                s.find_slot(ks),
+                s.prop_child(mc, ks),
+            ) {
+                _ if tells(s) => Way::Helper,
+                (Some(slot), _) => Way::Own(SlotLoc::new(s, slot).raw(), class_word(s)),
+                (None, Some(to)) if !to.is_dict() => Way::Unique(n),
+                (None, _) => Way::Helper,
+            };
+            dispatch(b, t, &shapes, way, |b, s| {
+                match (s.find_slot(ks), s.prop_child(mc, ks)) {
+                    _ if tells(s) => newindex(b, recv, key, v, false),
                     (Some(slot), _) => own_store(b, s, t, SlotLoc::new(s, slot), kid, v),
                     (None, Some(to)) if !to.is_dict() => {
                         let loc = SlotLoc::new(to, s.slot_count());
@@ -593,15 +683,7 @@ pub(super) fn emit_set<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
                     }
                     (None, _) => newindex(b, recv, key, v, false),
                 }
-                b.flush();
-                b.jump(join);
-                match next {
-                    Some(next) => b.switch_to(next),
-                    None => return enter_join(b, join),
-                }
-            }
-            b.deopt(ExitTag::Shape);
-            enter_join(b, join);
+            });
             return;
         }
         Some(_) => {}

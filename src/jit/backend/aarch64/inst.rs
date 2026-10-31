@@ -54,6 +54,8 @@ pub(crate) enum Test {
     Falsy,
     /// A table's shape is the one at this address: `[t]`.
     Shape(u64),
+    /// A table's shape is one of `Lowered::shape_sets[i]`: `[t]`.
+    ShapeIn(u32),
     /// A `B1` is true: `[c]`.
     B1,
 }
@@ -234,6 +236,12 @@ pub(crate) enum MInst {
         shape: u64,
         exit: u32,
     },
+    /// `[use t, snap..]`: exit unless the table's shape is one of
+    /// `Lowered::shape_sets[set]`.
+    GuardShapeIn {
+        set: u32,
+        exit: u32,
+    },
     /// `[use f, snap..]`: exit unless the value is a Lua closure of the
     /// prototype at `proto` (its box); `fun` when it is known a function.
     GuardProto {
@@ -366,6 +374,7 @@ impl MInst {
             | Guard { exit, .. }
             | GuardNoFlag { exit, .. }
             | GuardShape { exit, .. }
+            | GuardShapeIn { exit, .. }
             | GuardProto { exit, .. }
             | GcCheck { exit }
             | GuardFits { exit, .. } => exit,
