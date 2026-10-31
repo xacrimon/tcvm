@@ -27,12 +27,13 @@ use crate::vm::unwind::OpError;
 /// The IC entry of the current site, whose slot is `d`.
 #[inline(always)]
 pub(crate) fn read_ic<'gc>(closure: LuaFn<'gc>, d: u16) -> InlineCache<'gc> {
-    debug_assert!((d as usize) + 4 <= closure.proto.feedback.len());
-    // SAFETY: a field site's `d` starts a field slot (`FeedbackVector::cache`).
+    debug_assert!((d as usize) + 5 <= closure.proto.feedback.len());
+    // SAFETY: a field site's `d` starts a field slot, its entry after the site
+    // word (`FeedbackVector::cache`).
     unsafe {
         (*closure
             .feedback
-            .add(d as usize)
+            .add(d as usize + 1)
             .cast::<std::cell::Cell<InlineCache<'gc>>>())
         .get()
     }

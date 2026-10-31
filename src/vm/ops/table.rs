@@ -171,16 +171,17 @@ handler! {
         }
         let closure: crate::env::function::LuaFn<'gc> = unsafe { crate::vm::frame::closure(base) };
         let site = unsafe { pc.sub(1) };
-        crate::jit::feedback::record(closure, site, crate::jit::feedback::kind(v));
+        let kind = crate::jit::feedback::kind(v);
         let mm = rt.mm_of(v, MetamethodBits::LEN);
         if mm.is_nil() {
+            crate::jit::feedback::record(closure, site, kind);
             let Some(t) = v.get_table() else {
                 raise!(OpError::Len(v))
             };
             reg![dst] = Value::integer(rt.mutation(), t.raw_len() as i64);
             next!()
         }
-        crate::jit::feedback::record(closure, site, crate::jit::feedback::MM);
+        crate::jit::feedback::record(closure, site, kind | crate::jit::feedback::MM);
         // Like the other unary metamethods, `__len` gets its operand twice.
         crate::vm::ops::meta::stage_mm!(pc, base, rt, ret_store_a, mm, [v, v])
     }

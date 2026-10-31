@@ -65,7 +65,13 @@ pub(crate) fn table_key(recv: Value<'_>, key: Value<'_>) -> Bits {
 /// OR `bits` into the feedback of the instruction at `site` of `closure`.
 #[inline(always)]
 pub(crate) fn record(closure: LuaFn<'_>, site: *const Instruction, bits: Bits) {
-    // SAFETY: `site` is an instruction of `closure`'s code.
-    let pc = unsafe { site.offset_from_unsigned(closure.code) };
-    closure.proto.feedback.add_bits(pc, bits);
+    // SAFETY: `site` is an instruction of `closure`'s code, whose vector
+    // `closure.feedback` points into.
+    unsafe {
+        let pc = site.offset_from_unsigned(closure.code);
+        closure
+            .proto
+            .feedback
+            .add_bits_at(closure.feedback, pc, bits);
+    }
 }

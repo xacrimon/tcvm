@@ -137,7 +137,8 @@ pub(crate) use count_invocation;
 /// handler that called out to record it would push a frame on every call.
 macro_rules! note_callee {
     ($closure:ident, $insn:expr, $fv:expr) => {{
-        let slot = unsafe { $closure.feedback.add($insn.d() as usize) };
+        // The callee word, after the slot's site word.
+        let slot = unsafe { $closure.feedback.add($insn.d() as usize + 1) };
         // Both words in one load pair.
         let (seen, count) = unsafe { ((*slot).get(), (*slot.add(1)).get()) };
         if std::hint::unlikely(seen != $fv.to_raw()) {

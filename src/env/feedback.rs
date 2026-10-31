@@ -23,9 +23,9 @@ pub(crate) enum SlotKind {
     /// The slot overflowing sites share: an entry that stays empty and a
     /// megamorphic callee word.
     Null,
-    /// Constant-key access: the inline cache (4 words), the site word.
+    /// Constant-key access: the site word, the inline cache (4 words).
     Field,
-    /// The callee word, the call count, the site word.
+    /// The site word, the callee word, the call count.
     Call,
     /// GETTABLE, SETTABLE.
     Table,
@@ -44,15 +44,6 @@ impl SlotKind {
             SlotKind::Field => 5,
             SlotKind::Call => 3,
             _ => 1,
-        }
-    }
-
-    /// The site word's offset in the slot.
-    const fn site(self) -> usize {
-        match self {
-            SlotKind::Field => 4,
-            SlotKind::Call => 2,
-            _ => 0,
         }
     }
 
@@ -95,8 +86,8 @@ impl SlotKind {
 pub(crate) const NO_SLOT: u16 = u16::MAX;
 /// Words a vector may hold: a slot index is a `u16` short of `NO_SLOT`.
 const MAX_WORDS: usize = NO_SLOT as usize;
-/// The null slot: a field slot, then a callee word and its count.
-const NULL_WORDS: usize = 7;
+/// The null slot: a field slot, then a call slot.
+const NULL_WORDS: usize = 8;
 const NULL_CALL: u16 = 5;
 /// An upvalue's mask bits: a closure gave it a value, and two gave it
 /// different ones.
@@ -216,14 +207,12 @@ impl<'gc> FeedbackVector<'gc> {
             match k {
                 SlotKind::Null => {
                     v.cache(w).set(InlineCache::Empty);
-                    v.word(w + NULL_CALL as usize).set(MEGAMORPHIC);
+                    v.callee_at(w + NULL_CALL as usize).set(MEGAMORPHIC);
                 }
                 SlotKind::Field => v.cache(w).set(InlineCache::Empty),
                 _ => {}
             }
-            if k != SlotKind::Null {
-                v.word(w + k.site()).set(INLINE);
-            }
+            v.word(w).set(INLINE);
             w += k.words();
         }
         v
@@ -259,9 +248,9 @@ impl<'gc> FeedbackVector<'gc> {
     #[inline(always)]
     pub(crate) fn cache(&self, w: usize) -> &Cell<InlineCache<'gc>> {
         debug_assert!(matches!(self.kinds[w], SlotKind::Field | SlotKind::Null));
-        // SAFETY: a field slot starts with an entry's four words, which `new`
-        // initialized as one; the assert above keeps its alignment within 8.
-        unsafe { &*self.as_ptr().add(w).cast::<Cell<InlineCache<'gc>>>() }
+        // SAFETY: a field slot's words after its site word are an entry, which
+        // `new` initialized as one; the assert above keeps its alignment.
+        unsafe { &*self.as_ptr().add(w + 1).cast::<Cell<InlineCache<'gc>>>() }
     }
 
     /// Whether word `w` starts a field slot the interpreter may fill (not the
@@ -275,15 +264,16 @@ impl<'gc> FeedbackVector<'gc> {
     #[inline]
     pub(crate) fn callee(&self, pc: usize) -> Option<&Cell<u64>> {
         match self.slot(pc)? {
-            (w, SlotKind::Call) => Some(self.word(w)),
+            (w, SlotKind::Call) => Some(self.callee_at(w)),
             _ => None,
         }
     }
 
-    /// The callee word at word `w` (a call's `d`, the null slot's included).
+    /// The callee word of the call slot at word `w` (a call's `d`, the null
+    /// slot's included); its count is the word after.
     #[inline(always)]
     pub(crate) fn callee_at(&self, w: usize) -> &Cell<u64> {
-        self.word(w)
+        self.word(w + 1)
     }
 
     /// Upvalue `k`'s mask word and the shift of its bits there.
@@ -352,9 +342,11 @@ impl<'gc> FeedbackVector<'gc> {
         old >> sh & VARIES == 0
     }
 
+    /// The site word of the instruction at `pc`: its slot's first word.
+    #[inline(always)]
     fn site(&self, pc: usize) -> Option<&Cell<u64>> {
-        let (w, k) = self.slot(pc)?;
-        Some(self.word(w + k.site()))
+        let w = *self.slot_of_pc.get(pc)?;
+        (w != NO_SLOT).then(|| self.word(w as usize))
     }
 
     fn record(&self, w: u64) -> Option<&ShapeRecord<'gc>> {
@@ -370,6 +362,31 @@ impl<'gc> FeedbackVector<'gc> {
         match self.record(w) {
             Some(r) => r.bits.get(),
             None => (w >> 1) as Bits,
+        }
+    }
+
+    /// `add_bits` for the interpreter's slow paths, reaching the site word
+    /// through `base`, a closure's cached `as_ptr`.
+    ///
+    /// # Safety
+    /// `pc` is an instruction of this vector's prototype, `base` its `as_ptr`.
+    #[inline(always)]
+    pub(crate) unsafe fn add_bits_at(&self, base: *const Cell<u64>, pc: usize, bits: Bits) {
+        debug_assert!(pc < self.slot_of_pc.len() && std::ptr::eq(base, self.as_ptr()));
+        let w = unsafe { *self.slot_of_pc.get_unchecked(pc) };
+        if w == NO_SLOT {
+            return;
+        }
+        let s = unsafe { &*base.add(w as usize) };
+        let v = s.get();
+        match self.record(v) {
+            Some(r) => r.bits.set(r.bits.get() | bits),
+            None => {
+                let n = v | (bits as u64) << 1;
+                if n != v {
+                    s.set(n);
+                }
+            }
         }
     }
 
@@ -406,7 +423,7 @@ impl<'gc> FeedbackVector<'gc> {
         let Some((w, SlotKind::Field)) = self.slot(pc) else {
             return;
         };
-        let s = self.word(w + SlotKind::Field.site());
+        let s = self.word(w);
         let r = match self.record(s.get()) {
             Some(r) => r,
             None => {
@@ -464,13 +481,13 @@ impl<'gc> FeedbackVector<'gc> {
                         self.cache(w).set(InlineCache::Empty);
                         code.unquicken(pc);
                     }
-                    let site = self.word(w + SlotKind::Field.site()).get();
+                    let site = self.word(w).get();
                     if let Some(r) = self.record(site) {
                         r.retain(|s| !dead(s));
                     }
                 }
                 SlotKind::Call => {
-                    let c = self.word(w);
+                    let c = self.callee_at(w);
                     let v = c.get();
                     let gone = if v == 0 || v == MEGAMORPHIC {
                         false
@@ -523,7 +540,7 @@ impl Drop for FeedbackVector<'_> {
     fn drop(&mut self) {
         for (w, k) in self.kinds.iter().enumerate() {
             if *k == SlotKind::Field
-                && let s = self.word(w + SlotKind::Field.site()).get()
+                && let s = self.word(w).get()
                 && s & INLINE == 0
             {
                 // SAFETY: made by `add_shape` with `Box::into_raw`, owned here.
