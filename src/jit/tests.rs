@@ -350,3 +350,18 @@ fn identity_guards_make_constants() {
     let count = |s: &str| ir.lines().filter(|l| l.contains(s)).count();
     assert_eq!(count("guard.same"), 1, "{ir}");
 }
+
+/// A table guarded to one shape on both arms of a branch has it after the
+/// join, where GVN (by dominance) does not see it: no third guard.
+#[test]
+fn shape_guards_carry_through_joins() {
+    let src = "function f(o, c)
+        local a
+        if c then a = o.x else a = o.y end
+        return a + o.z
+    end
+    for i = 1, 300 do f({x = 1, y = 2, z = 3}, i % 2 == 0) end";
+    let ir = ir_of(src, "f", 0);
+    let count = |s: &str| ir.lines().filter(|l| l.contains(s)).count();
+    assert_eq!(count("guardshape"), 2, "{ir}");
+}

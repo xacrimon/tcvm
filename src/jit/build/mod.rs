@@ -52,6 +52,57 @@ enum SlotState {
     Lazy(Block),
 }
 
+/// The shapes a table may have (`Func::shapes` indices), at most
+/// `MAX_SHAPES`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Shapes {
+    n: u8,
+    k: [u32; crate::jit::MAX_SHAPES],
+}
+
+impl Shapes {
+    pub(crate) fn one(k: u32) -> Shapes {
+        let mut s = Shapes {
+            n: 1,
+            k: [0; crate::jit::MAX_SHAPES],
+        };
+        s.k[0] = k;
+        s
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u32] {
+        &self.k[..self.n as usize]
+    }
+
+    pub(crate) fn contains(&self, k: u32) -> bool {
+        self.as_slice().contains(&k)
+    }
+
+    /// These and `o`'s, when they fit.
+    fn union(self, o: Shapes) -> Option<Shapes> {
+        let mut s = self;
+        for &k in o.as_slice() {
+            if !s.contains(k) {
+                *s.k.get_mut(s.n as usize)? = k;
+                s.n += 1;
+            }
+        }
+        Some(s)
+    }
+
+    fn without(self, k: u32) -> Shapes {
+        let mut s = Shapes {
+            n: 0,
+            k: [0; crate::jit::MAX_SHAPES],
+        };
+        for &x in self.as_slice().iter().filter(|&&x| x != k) {
+            s.k[s.n as usize] = x;
+            s.n += 1;
+        }
+        s
+    }
+}
+
 /// What a branch or guard tells of a value on one of its edges.
 #[derive(Clone, Copy, Debug)]
 enum Fact {
@@ -59,6 +110,8 @@ enum Fact {
     Narrow(TypeSet),
     /// It is this constant.
     Is(Val),
+    /// The table it unboxes to has one of these shapes.
+    Shapes(Shapes),
 }
 
 /// Per IR block SSA state; its registers' definitions and slot states are
@@ -87,6 +140,10 @@ struct BlockState {
     /// What the branch into it tells, bound once it is entered from that
     /// branch alone.
     on_entry: Vec<(Val, Fact)>,
+    /// The shapes tables have here, by the value they unbox (`root_of`):
+    /// the shape guards and tests passed since an instruction that may
+    /// change shapes (W1.7 5.2).
+    shapes: Vec<(Val, Shapes)>,
 }
 
 pub(crate) struct Builder<'a, 'gc> {
@@ -133,6 +190,8 @@ pub(crate) struct Builder<'a, 'gc> {
     /// The refinements the instruction being emitted made, in order: its
     /// `Before` snapshot, shared by all its arms, names what they refined.
     pc_refines: Vec<(Val, Val)>,
+    /// `fact_key` of parameters of sealed blocks, whose arguments are final.
+    fact_keys: std::cell::RefCell<crate::jit::FastMap<Val, Val>>,
 }
 
 /// What the builder of an inlined callee knows of its call (E1).
@@ -171,6 +230,7 @@ impl BlockState {
             terminated: false,
             refines: Vec::new(),
             on_entry: Vec::new(),
+            shapes: Vec::new(),
         }
     }
 }
@@ -219,6 +279,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             inline: None,
             chain: Vec::new(),
             pc_refines: Vec::new(),
+            fact_keys: Default::default(),
         }
     }
 
@@ -262,6 +323,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             inline: Some(inline),
             chain: Vec::new(),
             pc_refines: Vec::new(),
+            fact_keys: Default::default(),
         };
         b.bs.resize_with(n, BlockState::placeholder);
         b
@@ -399,9 +461,10 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     pub(crate) fn new_sealed_succ(&mut self) -> Block {
         let b = self.new_block();
         self.bs[b.idx()].sealed = true;
-        // Its slots start as the current block's end with them.
+        // Its slots and facts start as the current block's end with them.
         let (n, c) = (self.nregs, self.cur.idx());
         self.slots.copy_within(c * n..(c + 1) * n, b.idx() * n);
+        self.bs[b.idx()].shapes = self.bs[c].shapes.clone();
         b
     }
 
@@ -630,6 +693,14 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         let i = self.f.def_inst(cond)?;
         let a = self.f.args(i);
         let (v, narrow) = match self.f.op(i) {
+            Op::ShapeIs(k) => {
+                let set = match self.known_shapes(a[0]) {
+                    _ if holds => Shapes::one(k),
+                    Some(s) => s.without(k),
+                    None => return None,
+                };
+                return Some((a[0], Fact::Shapes(set)));
+            }
             Op::IsType(set) => (a[0], if holds { set } else { TypeSet::ANY - set }),
             Op::IsFalsy if holds => (a[0], TypeSet::FALSY),
             Op::IsFalsy => (a[0], TypeSet::ANY - TypeSet::FALSY),
@@ -670,8 +741,86 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         let to = match fact {
             Fact::Is(k) => k,
             Fact::Narrow(set) => self.ins(Op::Refine(set), &[v]),
+            Fact::Shapes(s) => return self.set_shapes(v, s),
         };
         self.refine(v, to);
+    }
+
+    /// The value facts about `v` are kept under: its root, through
+    /// parameters every edge passes the same root (a register read where
+    /// arms that guarded it join).
+    fn fact_key(&self, v: Val) -> Val {
+        self.fact_key_at(v, 8)
+    }
+
+    fn fact_key_at(&self, v: Val, depth: u32) -> Val {
+        let r = self.root_of(v);
+        let ValDef::Param(blk, k) = self.f.vals[r.idx()].def else {
+            return r;
+        };
+        if depth == 0 || !self.bs[blk.idx()].sealed {
+            return r;
+        }
+        if let Some(&x) = self.fact_keys.borrow().get(&r) {
+            return x;
+        }
+        let x = self.param_fact_key(r, blk, k, depth);
+        self.fact_keys.borrow_mut().insert(r, x);
+        x
+    }
+
+    /// The fact key of parameter `r`, the `k`th of sealed block `blk`.
+    fn param_fact_key(&self, r: Val, blk: Block, k: u16, depth: u32) -> Val {
+        let s = &self.bs[blk.idx()];
+        let mut same = None;
+        for &pred in &s.preds {
+            let Some(term) = self.f.terminator(pred) else {
+                return r;
+            };
+            for e in self.f.edges(term).iter().filter(|e| e.target == blk) {
+                let Some(&a) = self.f.vl(e.args).get(k as usize) else {
+                    return r;
+                };
+                if a == r {
+                    continue;
+                }
+                let ka = self.fact_key_at(a, depth - 1);
+                match same {
+                    None => same = Some(ka),
+                    Some(x) if x == ka => {}
+                    Some(_) => return r,
+                }
+            }
+        }
+        same.unwrap_or(r)
+    }
+
+    /// The shapes the table `t` unboxes from may have here, if known.
+    pub(crate) fn known_shapes(&self, t: Val) -> Option<Shapes> {
+        let r = self.fact_key(t);
+        let s = &self.bs[self.cur.idx()].shapes;
+        s.iter().find(|x| x.0 == r).map(|x| x.1)
+    }
+
+    /// Know that the table `t` unboxes from has one of `s` here.
+    pub(crate) fn set_shapes(&mut self, t: Val, s: Shapes) {
+        let r = self.fact_key(t);
+        let facts = &mut self.bs[self.cur.idx()].shapes;
+        match facts.iter_mut().find(|x| x.0 == r) {
+            Some(x) => x.1 = s,
+            None => facts.push((r, s)),
+        }
+    }
+
+    /// An instruction that may change shapes ends what is known of them.
+    fn note_effects(&mut self, op: Op) {
+        if op
+            .effects()
+            .writes
+            .contains(crate::jit::ir::ops::Mem::SHAPE)
+        {
+            self.bs[self.cur.idx()].shapes.clear();
+        }
     }
 
     /// What an exiting check just emitted proves from here on.
@@ -709,6 +858,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             self.ins_snap(Op::GcCheck, &[], s, ExitTag::Gc);
         }
         self.inline_check(op);
+        self.note_effects(op);
         let i = self.f.make_inst(op, args, None, ExitTag::Type);
         self.f.append(self.cur, i);
         i
@@ -724,6 +874,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     /// snapshot.
     pub(crate) fn ins_exit(&mut self, op: Op, args: &[Val], tag: ExitTag) -> Inst {
         self.inline_check(op);
+        self.note_effects(op);
         let s = self.snap_before();
         let i = self.f.make_inst(op, args, Some(s), tag);
         self.f.append(self.cur, i);
@@ -733,6 +884,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
 
     pub(crate) fn ins_snap(&mut self, op: Op, args: &[Val], snap: Snap, tag: ExitTag) -> Inst {
         self.inline_check(op);
+        self.note_effects(op);
         let i = self.f.make_inst(op, args, Some(snap), tag);
         self.f.append(self.cur, i);
         self.note_check(i);
@@ -1575,11 +1727,13 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             if !self.bs[b.idx()].root {
                 self.slots_of(b).fill(SlotState::Unknown);
             }
+            self.bs[b.idx()].shapes.clear();
             return;
         }
         let p0 = self.bs[b.idx()].preds[0];
         self.slots
             .copy_within(p0.idx() * n..(p0.idx() + 1) * n, b.idx() * n);
+        let mut shapes = self.bs[p0.idx()].shapes.clone();
         for j in 1..self.bs[b.idx()].preds.len() {
             let p = self.bs[b.idx()].preds[j];
             for r in 0..n {
@@ -1587,7 +1741,19 @@ impl<'a, 'gc> Builder<'a, 'gc> {
                     self.set_slot(b, r, SlotState::Unknown);
                 }
             }
+            // A table's shapes are those it may have on every edge.
+            let theirs = &self.bs[p.idx()].shapes;
+            shapes.retain_mut(|(v, s)| {
+                match theirs.iter().find(|x| x.0 == *v).and_then(|x| s.union(x.1)) {
+                    Some(u) => {
+                        *s = u;
+                        true
+                    }
+                    None => false,
+                }
+            });
         }
+        self.bs[b.idx()].shapes = shapes;
     }
 
     fn emit_instance(&mut self, ii: usize, bc: u32) {

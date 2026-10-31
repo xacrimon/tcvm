@@ -10,8 +10,8 @@ use crate::env::table::{SlotLoc, Table};
 use crate::env::value::Value;
 use crate::env::{MetamethodBits, Shape};
 use crate::instruction::{Instruction, Op as BcOp};
-use crate::jit::build::Builder;
 use crate::jit::build::emit::{arm_end, branch_arm, calls_mm, cold, enter_join, mm_call};
+use crate::jit::build::{Builder, Shapes};
 use crate::jit::feedback as fb;
 use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL_VAL, HelperId, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
@@ -46,9 +46,26 @@ fn table_of(b: &mut Builder<'_, '_>, v: Val) -> Val {
     b.ins(Op::Unbox(Rep::Ptr), &[g])
 }
 
+/// `t` guarded to have `shape`, unless it is known to have it already.
 fn guard_shape<'gc>(b: &mut Builder<'_, 'gc>, t: Val, shape: Shape<'gc>) {
     let k = b.intern_shape(shape);
+    if b.known_shapes(t) == Some(Shapes::one(k)) {
+        return;
+    }
     b.ins_exit(Op::GuardShape(k), &[t], ExitTag::Shape);
+    b.set_shapes(t, Shapes::one(k));
+}
+
+/// Which of a chain's shapes `t` may have here, each with its index and
+/// whether it is the only one left (no test needed); `None` for a shape it
+/// is known not to have.
+fn chain_step<'gc>(b: &mut Builder<'_, 'gc>, t: Val, s: Shape<'gc>) -> Option<(u32, bool)> {
+    let k = b.intern_shape(s);
+    match b.known_shapes(t) {
+        Some(set) if !set.contains(k) => None,
+        Some(set) => Some((k, set.as_slice().len() == 1)),
+        None => Some((k, false)),
+    }
 }
 
 /// Whether the class `shape` pins has `bit` now, read live (a shape pins
@@ -444,9 +461,13 @@ fn get_chain<'gc>(b: &mut Builder<'_, 'gc>, dst: u8, site: &Site<'gc>, shapes: &
     let key = site.kv.get_string().unwrap();
     let join = b.new_block();
     for &s in shapes {
-        let k = b.intern_shape(s);
-        let is = b.ins(Op::ShapeIs(k), &[t]);
-        let next = branch_arm(b, is);
+        let Some((k, only)) = chain_step(b, t, s) else {
+            continue;
+        };
+        let next = (!only).then(|| {
+            let is = b.ins(Op::ShapeIs(k), &[t]);
+            branch_arm(b, is)
+        });
         if let Some(slot) = s.find_slot(key) {
             own_load(b, dst, site, s, t, SlotLoc::new(s, slot));
         } else if let Some((holder, hs, loc)) = holder_of(s, key) {
@@ -457,7 +478,10 @@ fn get_chain<'gc>(b: &mut Builder<'_, 'gc>, dst: u8, site: &Site<'gc>, shapes: &
         }
         b.flush();
         b.jump(join);
-        b.switch_to(next);
+        match next {
+            Some(next) => b.switch_to(next),
+            None => return enter_join(b, join),
+        }
     }
     b.deopt(ExitTag::Shape);
     enter_join(b, join);
@@ -490,9 +514,13 @@ pub(super) fn emit_set<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
             let ks = kv.get_string().unwrap();
             let join = b.new_block();
             for &s in &shapes {
-                let k = b.intern_shape(s);
-                let is = b.ins(Op::ShapeIs(k), &[t]);
-                let next = branch_arm(b, is);
+                let Some((k, only)) = chain_step(b, t, s) else {
+                    continue;
+                };
+                let next = (!only).then(|| {
+                    let is = b.ins(Op::ShapeIs(k), &[t]);
+                    branch_arm(b, is)
+                });
                 // A store to a metatable's mirrored key tells its class.
                 let tells = s.as_mt().is_some() && crate::env::shape::mirrored(ks);
                 match (s.find_slot(ks), s.prop_child(b.ctx.mutation(), ks)) {
@@ -506,7 +534,10 @@ pub(super) fn emit_set<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
                 }
                 b.flush();
                 b.jump(join);
-                b.switch_to(next);
+                match next {
+                    Some(next) => b.switch_to(next),
+                    None => return enter_join(b, join),
+                }
             }
             b.deopt(ExitTag::Shape);
             enter_join(b, join);
@@ -574,6 +605,7 @@ fn trans_store<'gc>(
     );
     let k = b.intern_shape(to);
     b.push(Op::TabSetShape(k), &[t]);
+    b.set_shapes(t, Shapes::one(k));
     b.jump(join);
     if let Some(full) = full {
         b.switch_to(full);
