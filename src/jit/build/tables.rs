@@ -230,8 +230,8 @@ pub(super) fn emit_get<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
         } => {
             let t = table_of(b, recv);
             guard_shape(b, t, shape);
-            // The collector empties the entry when `holder` dies, and none
-            // ran since the interpreter last read it.
+            // The entry's references are live: the collector empties it
+            // when one dies.
             let holder = Table::from_inner(unsafe { Gc::from_ptr(holder.as_ptr()) });
             proto_load(b, dst, &site, shape, holder, holder_shape, loc);
         }
@@ -329,15 +329,13 @@ fn site_shapes<'gc>(
     const MAX: usize = crate::jit::MAX_SHAPES;
     let has = |v: &[Shape<'gc>], s| v.iter().any(|&x| Shape::ptr_eq(x, s));
     let mut v: Vec<Shape<'gc>> = first.into_iter().collect();
-    let state = crate::jit::state::jit_state(b.ctx.mutation(), b.closure.proto);
-    let mut st = state.borrow_mut(b.ctx.mutation());
+    let vector = &b.proto.feedback;
+    let pc = b.pc as usize;
     let mut seen = 0;
-    for &(pc, s) in &st.shapes_seen {
-        if pc == b.pc {
-            seen += 1;
-            if !has(&v, s) {
-                v.push(s);
-            }
+    for s in vector.shapes(pc) {
+        seen += 1;
+        if !has(&v, s) {
+            v.push(s);
         }
     }
     // The interpreter refills the cache after an exit, so its shape now is
@@ -346,9 +344,9 @@ fn site_shapes<'gc>(
         && v.len() > seen
         && seen <= MAX
     {
-        st.shapes_seen.push((b.pc, f));
+        vector.add_shape(pc, f);
+        b.ctx.mutation().backward_barrier(Gc::erase(b.proto), None);
     }
-    drop(st);
     if v.len() > MAX || v.iter().any(|s| s.is_dict()) {
         return None;
     }

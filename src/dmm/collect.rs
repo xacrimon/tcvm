@@ -57,6 +57,9 @@ pub unsafe trait Collect<'gc> {
 ///
 /// This trait is not itself unsafe, but implementers of [`Collect`] *must* uphold the safety
 /// guarantees of [`Collect`] when using this trait.
+/// Deferral queues an arena keeps ([`Trace::defer`]).
+pub const DEFER_QUEUES: usize = 2;
+
 pub trait Trace<'gc> {
     /// Trace a [`Gc`] pointer (of any real type).
     fn trace_gc(&mut self, gc: Gc<'gc, ()>);
@@ -64,13 +67,13 @@ pub trait Trace<'gc> {
     /// Trace a [`GcWeak`] pointer (of any real type).
     fn trace_gc_weak(&mut self, gc: GcWeak<'gc, ()>);
 
-    /// Queue the object being traced for [`Finalization::deferred`], for pointers its trace
-    /// skipped. No default: a tracer that dropped the request would leave them dangling.
-    /// The arena's owner decides what a deferred object is; in tcvm only tables defer
-    /// (`Table::converge_weak`).
+    /// Queue the object being traced on deferral queue `queue` (below [`DEFER_QUEUES`]) for
+    /// [`Finalization::deferred`], for pointers its trace skipped. No default: a tracer that
+    /// dropped the request would leave them dangling. The arena's owner decides what each queue
+    /// holds, so that it knows the type of what it gets back.
     ///
     /// [`Finalization::deferred`]: crate::dmm::Finalization::deferred
-    fn defer(&mut self);
+    fn defer(&mut self, queue: usize);
 
     /// This is a convenience method that calls [`Collect::trace`] but automatically adds a
     /// [`Collect::NEEDS_TRACE`] check around it.

@@ -26,6 +26,7 @@ mod debug_info;
 mod error_position;
 mod executor_isolation;
 mod fast_entry_gc;
+mod feedback_gc;
 mod field_ic;
 mod gc_stack_trace;
 mod generational;

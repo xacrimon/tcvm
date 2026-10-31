@@ -583,24 +583,19 @@ fn on_exit<'gc>(
             ExitTag::Const => crate::jit::feedback::CONST_MISS,
             _ => 0,
         };
+        let extra = extra
+            | if e.tag == ExitTag::Type {
+                crate::jit::feedback::KIND_EXIT
+            } else {
+                0
+            };
         match e.site {
             // The frame is the loop header's: only the miss is the access's.
-            Some(s) => {
-                if let Some(c) = closure.proto.feedback.get(s as usize) {
-                    c.set(c.get() | extra);
-                }
-            }
+            Some(s) => closure.proto.feedback.add_bits(s as usize, extra),
             None => record_site(closure, base, pc, extra),
         }
         if e.tag == ExitTag::Shape {
             record_shape(ctx, closure, base, pc);
-        }
-        if e.tag == ExitTag::Type {
-            let state = jit_state(ctx.mutation(), closure.proto);
-            let mut st = state.borrow_mut(ctx.mutation());
-            if !st.kind_exits.contains(&pc) {
-                st.kind_exits.push(pc);
-            }
         }
     }
     let n = e.count.get() + 1;
@@ -634,40 +629,22 @@ fn on_exit<'gc>(
         // Feedback only grows (kinds, the overflow, misses and metamethod
         // bits, shapes up to `MAX_SHAPES + 1`), so a recompile that learns
         // some is outside the budget, as the never-executed rule's are.
-        let st = jit_state(ctx.mutation(), closure.proto);
-        let st = st.borrow();
-        let byte = closure
-            .proto
-            .feedback
-            .get(e.site.unwrap_or(pc) as usize)
-            .map_or(0, |c| c.get());
-        // An inlined callee's kinds and shapes are its own state's.
-        let inlined = !std::ptr::eq(closure.as_ptr(), region_closure.as_ptr());
-        let learned = byte != e.byte
-            || !inlined
-                && match e.tag {
-                    ExitTag::Type => st.kind_exits[region.known.0 as usize..].contains(&pc),
-                    ExitTag::Shape => st.shapes_seen[region.known.1 as usize..]
-                        .iter()
-                        .any(|&(p, _)| p == pc),
-                    _ => false,
-                };
-        drop(st);
+        let learned = closure.proto.feedback.seen(e.site.unwrap_or(pc) as usize) != e.seen;
         request_recompile(ctx, region_closure, region, learned);
     }
 }
 
 /// Whether the callee of the call at `pc`, whose guard failed, is a closure
-/// of the prototype the site's callee slot names (or of one that made
-/// several, the slot emptied by a collection): then the slot names the
-/// prototype (`call_note`), which the next compile guards instead.
+/// of the prototype the site's callee word names (or of one that made
+/// several, the word emptied by its function's death): then the word names
+/// the prototype (`call_note`), which the next compile guards instead.
 fn callee_of_proto<'gc>(
     ctx: Context<'gc>,
     closure: LuaFn<'gc>,
     base: *mut Value<'gc>,
     pc: u32,
 ) -> bool {
-    use crate::env::function::{proto_slot, slot_proto};
+    use crate::env::feedback::{MEGAMORPHIC, proto_slot, slot_proto};
     let mut i = unsafe { *closure.code.add(pc as usize) };
     if i.is_jit_word() {
         i = original_of(closure, i);
@@ -682,15 +659,15 @@ fn callee_of_proto<'gc>(
     let Some(lf) = fv.get_function().and_then(|f| f.as_lua()) else {
         return false;
     };
-    let Some(slot) = closure.proto.callees.get(i.d() as usize) else {
+    let Some(slot) = closure.proto.feedback.callee(pc as usize) else {
         return false;
     };
     let seen = slot.get();
     let same = match slot_proto(seen) {
         Some(p) => Gc::ptr_eq(p, lf.proto),
         None if seen == 0 => lf.proto.closures.get() > 1,
-        None if seen == crate::env::function::MEGAMORPHIC => false,
-        // SAFETY: a nonzero slot names a live function.
+        None if seen == MEGAMORPHIC => false,
+        // SAFETY: any other word names a live function.
         None => unsafe { Value::from_raw(seen) }
             .get_function()
             .and_then(|f| f.as_lua())
@@ -724,26 +701,19 @@ fn record_shape<'gc>(ctx: Context<'gc>, closure: LuaFn<'gc>, base: *mut Value<'g
     let Some(t) = recv.get_table() else {
         return;
     };
-    let shape = t.shape();
-    let state = jit_state(ctx.mutation(), closure.proto);
-    let mut st = state.borrow_mut(ctx.mutation());
-    let mut n = 0;
-    for &(p, s) in &st.shapes_seen {
-        if p == pc {
-            if crate::env::Shape::ptr_eq(s, shape) {
-                return;
-            }
-            n += 1;
-        }
-    }
-    if n <= MAX_SHAPES {
-        st.shapes_seen.push((pc, shape));
-    }
+    closure.proto.feedback.add_shape(pc as usize, t.shape());
+    ctx.mutation()
+        .backward_barrier(Gc::erase(closure.proto), None);
 }
 
 /// Record the kinds of the operands of the site at `pc`, from the frame just
-/// rebuilt, into its feedback byte.
-fn record_site<'gc>(closure: LuaFn<'gc>, base: *mut Value<'gc>, pc: u32, extra: u8) {
+/// rebuilt, into its feedback.
+fn record_site<'gc>(
+    closure: LuaFn<'gc>,
+    base: *mut Value<'gc>,
+    pc: u32,
+    extra: crate::jit::feedback::Bits,
+) {
     use crate::instruction::Family;
     use crate::jit::feedback as fb;
     let site = unsafe { closure.code.add(pc as usize) };

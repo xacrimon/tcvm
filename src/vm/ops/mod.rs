@@ -97,12 +97,12 @@ macro_rules! family {
         $($crate::vm::abi::handler! {
             bind(insn, pc, base, rt, closure, thread, nret, values);
             op fn $name {
-                let (dst, b, ic_idx, _) = insn.abde();
+                let (dst, b, ic, _) = insn.abde();
                 let recv_val = receiver!($recv, b);
                 let Some(t) = recv_val.get_table() else {
                     tail!($slow)
                 };
-                let cache = $crate::vm::ops::field::read_ic(closure, ic_idx);
+                let cache = $crate::vm::ops::field::read_ic(closure, ic);
                 let v = $crate::vm::ops::family!(@load $kind, $slow, cache, t, recv_val, insn, dst, $self_);
                 if $self_ {
                     reg![dst + 4] = recv_val;
@@ -121,12 +121,12 @@ macro_rules! family {
         $($crate::vm::abi::handler! {
             bind(insn, pc, base, rt, closure, thread, nret, values);
             op fn $name {
-                let (src, b, ic_idx, _) = insn.abde();
+                let (src, b, ic, _) = insn.abde();
                 let recv_val = receiver!($recv, b);
                 let Some(t) = recv_val.get_table() else {
                     tail!($slow)
                 };
-                let cache = $crate::vm::ops::field::read_ic(closure, ic_idx);
+                let cache = $crate::vm::ops::field::read_ic(closure, ic);
                 $crate::vm::ops::family!(@store $kind, $slow, insn, cache, t, recv_val, src);
                 next!()
             }
@@ -134,9 +134,9 @@ macro_rules! family {
         pub(crate) const $rows: &[($crate::instruction::Op, $crate::vm::abi::Handler)] =
             &[$(($crate::instruction::Op::$OP, $name)),*];
     };
-    // Own and Absent entries only change through `fill_ic`, which rewrites
-    // the site, so the form implies the entry's kind; the collector may
-    // empty a ProtoLoad one, so that kind is checked.
+    // Entries only change through `fill_ic`, which rewrites the site, and
+    // the collector's clearing, which unquickens it: the form implies the
+    // entry's kind.
     (@load Inl, $slow:ident, $cache:expr, $t:ident, $recv:ident, $insn:ident, $dst:ident, $self_:literal) => {{
         let $crate::env::function::InlineCache::Own { shape, loc } = $cache else {
             unsafe { std::hint::unreachable_unchecked() }
@@ -197,7 +197,7 @@ macro_rules! family {
             loc,
         } = $cache
         else {
-            tail!($slow)
+            unsafe { std::hint::unreachable_unchecked() }
         };
         let live = $t.shape();
         if !$crate::env::shape::Shape::ptr_eq(live, recv) {

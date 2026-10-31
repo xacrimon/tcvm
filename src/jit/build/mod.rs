@@ -1463,8 +1463,8 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         self.cfg.code[pc as usize]
     }
 
-    pub(crate) fn feedback(&self, pc: u32) -> u8 {
-        self.proto.feedback[pc as usize].get()
+    pub(crate) fn feedback(&self, pc: u32) -> crate::jit::feedback::Bits {
+        self.proto.feedback.bits(pc as usize)
     }
 
     /// Whether compiled code exited at the site at `pc` on operand kinds its
@@ -1472,10 +1472,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     /// again: the interpreter's forms do not only widen, a region's
     /// speculation must (6.4).
     pub(crate) fn kind_exited(&self, pc: u32) -> bool {
-        self.proto
-            .jit
-            .get()
-            .is_some_and(|s| s.borrow().kind_exits.contains(&pc))
+        self.feedback(pc) & crate::jit::feedback::KIND_EXIT != 0
     }
 }
 

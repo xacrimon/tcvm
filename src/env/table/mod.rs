@@ -462,7 +462,7 @@ impl<'gc> Table<'gc> {
     /// whether marking must resume and the pass rerun.
     pub(crate) fn converge_weak(fc: &Finalization<'gc>) -> bool {
         let mut resurrected = false;
-        for t in fc.deferred() {
+        for t in fc.deferred(crate::env::DEFER_TABLES) {
             resurrected |= unsafe { Self::from_deferred(t) }.0.borrow().converge(fc);
         }
         resurrected
@@ -470,7 +470,7 @@ impl<'gc> Table<'gc> {
 
     /// Clear the deferred weak tables' dead entries (see [`TableState::clear_dead`]).
     pub(crate) fn clear_weak(fc: &Finalization<'gc>) {
-        for t in fc.deferred() {
+        for t in fc.deferred(crate::env::DEFER_TABLES) {
             // Storing nil adopts no pointer, so no barrier is needed. One would re-gray the
             // table, and its retrace would defer it again after `clear_deferred`, tripping the
             // sweep assert.
@@ -481,8 +481,8 @@ impl<'gc> Table<'gc> {
     }
 
     /// # Safety
-    /// `gc` must come from [`Finalization::deferred`], and `TableState::trace` must be the only
-    /// caller of `Trace::defer`.
+    /// `gc` must come from [`Finalization::deferred`] of `DEFER_TABLES`, which only
+    /// `TableState::trace` defers to.
     unsafe fn from_deferred(gc: Gc<'gc, ()>) -> Self {
         Table(unsafe { Gc::cast(gc) })
     }
@@ -613,7 +613,7 @@ unsafe impl<'gc> Collect<'gc> for TableState<'gc> {
             cc.trace(&h.mt_cache);
             cc.trace(&h.metatable);
         }
-        cc.defer();
+        cc.defer(crate::env::DEFER_TABLES);
         let weak_values = mode.contains(WeakMode::VALUES);
         let value = |cc: &mut T, v: &Value<'gc>| {
             if !(weak_values && v.is_weak_object()) {

@@ -488,10 +488,7 @@ pub(crate) fn compile<'gc>(
             tag: e.tag,
             count: std::cell::Cell::new(0),
             site: e.site,
-            byte: proto
-                .feedback
-                .get(e.site.unwrap_or(e.pc) as usize)
-                .map_or(0, |c| c.get()),
+            seen: proto.feedback.seen(e.site.unwrap_or(e.pc) as usize),
         });
     }
     // The sites, their snapshots after the exits'.
@@ -524,10 +521,6 @@ pub(crate) fn compile<'gc>(
         }));
     }
     sites.sort_unstable_by_key(|s| s.key);
-    let known = closure.proto.jit.get().map_or((0, 0), |s| {
-        let s = s.borrow();
-        (s.kind_exits.len() as u32, s.shapes_seen.len() as u32)
-    });
     let region = crate::dmm::Gc::new(
         ctx.mutation(),
         Region {
@@ -550,7 +543,6 @@ pub(crate) fn compile<'gc>(
             num_spills: em.num_spills,
             frame_size: em.frame_size,
             retired: std::cell::Cell::new(false),
-            known,
             exit_hot: std::cell::Cell::new(crate::jit::state::EXIT_HOT),
             sites: sites.into_boxed_slice(),
         },

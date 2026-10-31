@@ -55,21 +55,10 @@ pub struct Prototype<'gc> {
     pub locvars: Box<[LocVar<'gc>]>,
     /// Parallel to `upvalue_desc`.
     pub upvalue_names: Box<[LuaString<'gc>]>,
-    /// Inline-cache table indexed by `ic_idx` embedded in
-    /// GETTABUP/SETTABUP/GETFIELD/SETFIELD/SELF instructions. One entry
-    /// per cache site (call site, not instruction count). The slice
-    /// lives inline in the prototype (no separate `Gc` allocation,
-    /// no `RefLock`); per-slot `Lock<InlineCache>` exposes
-    /// counter-free reads via `get()` and barrier-aware writes via
-    /// the parent `Prototype`'s `Gc`. Entries are [`InlineCache`].
-    pub ic_table: IcTable<'gc>,
-    /// One per CALL, CALLS and TAILCALL, the instruction's `d`.
-    pub callees: Callees,
+    /// Per site, its inline cache or callee and what was seen there.
+    pub feedback: crate::env::feedback::FeedbackVector<'gc>,
     /// Per distinct constructor template, indexed by `NEWTABLE`.
     pub templates: Box<[Template<'gc>]>,
-    /// What the slow paths saw, one byte per instruction (`jit::feedback`).
-    #[collect(require_static)]
-    pub(crate) feedback: Box<[Cell<u8>]>,
     /// The JIT's record of this prototype, created when one of its entries
     /// first gets hot.
     pub(crate) jit: Lock<Option<crate::jit::state::JitStateRef<'gc>>>,
@@ -114,6 +103,15 @@ impl Code {
     pub fn iter(&self) -> impl Iterator<Item = crate::instruction::Instruction> + '_ {
         self.0.iter().map(std::cell::Cell::get)
     }
+
+    /// Rewrite a quickened field access at `pc` to its generic form, for an
+    /// emptied cache entry.
+    pub(crate) fn unquicken(&self, pc: usize) {
+        let i = self.0[pc].get();
+        if i.op().info().family == crate::instruction::Family::Field {
+            self.0[pc].set(i.with_op(i.op().unquickened()));
+        }
+    }
 }
 
 /// What `NEWTABLE` starts a constructor's table with: the shape of its
@@ -136,24 +134,18 @@ impl<'gc> Prototype<'gc> {
 }
 
 /// Per-call-site inline cache for one constant string key, keyed on the
-/// receiver's shape. `Empty` until a slow path fills it.
+/// receiver's shape. `Empty` until a slow path fills it. Lives in a field
+/// slot of the feedback vector, which holds its references weakly.
 ///
 /// Metamethods are read live through `Shape::has_mm`, so a cached shape
 /// stays a valid identity as its metatable's metamethods change; only
 /// `ProtoLoad`, which caches what `__index` names, also checks
 /// `MtCache::index_table`.
-// A power-of-two size keeps indexing `ic_table` to a shift.
-#[derive(Clone, Copy, Collect, Default)]
-#[collect(internal, no_drop)]
-#[repr(align(32))]
+#[derive(Clone, Copy, Default)]
 pub enum InlineCache<'gc> {
     // First, so the hottest hit tests a zero discriminant.
     /// Tables of `shape` hold the key at `loc`.
-    Own {
-        shape: Shape<'gc>,
-        #[collect(require_static)]
-        loc: SlotLoc,
-    },
+    Own { shape: Shape<'gc>, loc: SlotLoc },
     /// Tables of `shape` lack the key: a load is nil unless `__index` fires.
     Absent { shape: Shape<'gc> },
     /// Tables of `from` lack the key; adding it moves them to `to`, which
@@ -161,113 +153,18 @@ pub enum InlineCache<'gc> {
     Transition {
         from: Shape<'gc>,
         to: Shape<'gc>,
-        #[collect(require_static)]
         loc: SlotLoc,
     },
     /// Tables of `recv` lack the key, and while their metatable's `__index`
     /// is `holder`, it holds the key at `loc` if its shape is `holder_shape`.
-    /// `holder` is weak, as a metatable's `__index` may be.
     ProtoLoad {
         recv: Shape<'gc>,
         holder: GcWeak<'gc, RefLock<TableState<'gc>>>,
         holder_shape: Shape<'gc>,
-        #[collect(require_static)]
         loc: SlotLoc,
     },
     #[default]
     Empty,
-}
-
-const _: () = assert!(size_of::<InlineCache<'static>>() == 32);
-
-/// [`Prototype::ic_table`]. Its trace empties the `ProtoLoad` entries whose
-/// holder was dropped, so they stop reserving its allocation.
-pub struct IcTable<'gc>(Box<[Lock<InlineCache<'gc>>]>);
-
-impl<'gc> IcTable<'gc> {
-    pub fn new(len: usize) -> Self {
-        IcTable(vec![Lock::new(InlineCache::Empty); len].into_boxed_slice())
-    }
-}
-
-impl<'gc> std::ops::Deref for IcTable<'gc> {
-    type Target = [Lock<InlineCache<'gc>>];
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-// SAFETY: traces every entry it keeps. Emptying one from `trace(&self)` adopts
-// nothing, and the collector never runs while the mutator reads an entry.
-unsafe impl<'gc> Collect<'gc> for IcTable<'gc> {
-    fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
-        for slot in self.iter() {
-            let entry = slot.get();
-            if let InlineCache::ProtoLoad { holder, .. } = entry
-                && holder.is_dropped()
-            {
-                unsafe { slot.as_cell() }.set(InlineCache::Empty);
-            } else {
-                cc.trace(&entry);
-            }
-        }
-    }
-}
-
-/// [`Prototype::callees`], the JIT's callee feedback (I2): per call site,
-/// the bits of the function value the interpreter last called there, a
-/// [`proto_slot`] once it called two closures of one prototype,
-/// [`MEGAMORPHIC`] once it called two other functions, 0 for none. Its trace
-/// clears it rather than tracing it (all but `MEGAMORPHIC`), and a write
-/// takes the prototype's barrier, so a slot naming a function or prototype
-/// names one called since the last collection, which is alive.
-pub struct Callees(Box<[Cell<u64>]>);
-
-/// A callee slot that saw two functions: no `Value` has these bits, and
-/// only it has bit 0 set among what a slot holds (a function's payload is
-/// aligned), which the interpreter tests.
-pub(crate) const MEGAMORPHIC: u64 = 0xFFF8_0000_0000_0001;
-
-/// A callee slot's word for closures of `proto`: its address with bit 0
-/// set, which the interpreter, like [`MEGAMORPHIC`]'s, does not record over.
-pub(crate) fn proto_slot(proto: Gc<'_, Prototype<'_>>) -> u64 {
-    Gc::as_ptr(proto) as u64 | 1
-}
-
-/// The prototype a callee slot's word names (`proto_slot`).
-pub(crate) fn slot_proto<'gc>(w: u64) -> Option<Gc<'gc, Prototype<'gc>>> {
-    (w & 1 != 0 && w != MEGAMORPHIC).then(|| unsafe { Gc::from_ptr((w & !1) as *const _) })
-}
-
-impl Callees {
-    pub fn new(len: usize) -> Self {
-        Callees((0..len).map(|_| Cell::new(0)).collect())
-    }
-
-    pub(crate) fn as_ptr(&self) -> *const Cell<u64> {
-        self.0.as_ptr()
-    }
-}
-
-impl std::ops::Deref for Callees {
-    type Target = [Cell<u64>];
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-// SAFETY: holds no pointer past a collection: tracing empties every slot
-// but a megamorphic one, which names nothing (and stays megamorphic).
-unsafe impl<'gc> Collect<'gc> for Callees {
-    fn trace<T: Trace<'gc>>(&self, _cc: &mut T) {
-        for slot in self.iter() {
-            if slot.get() != MEGAMORPHIC {
-                slot.set(0);
-            }
-        }
-    }
 }
 
 /// A captured local: open while its frame lives, `v` pointing at its slot in
@@ -387,8 +284,8 @@ pub struct LuaClosure<'gc> {
     // this closure; they are not traced (the `Gc` above is).
     pub code: *const crate::instruction::Instruction,
     pub constants: *const Value<'gc>,
-    pub ic_table: *const Lock<InlineCache<'gc>>,
-    pub callees: *const Cell<u64>,
+    /// The feedback vector's first word (`FeedbackVector::as_ptr`).
+    pub feedback: *const Cell<u64>,
     pub max_stack_size: u8,
     pub num_params: u8,
     pub is_vararg: bool,
@@ -869,8 +766,7 @@ impl<'gc> Function<'gc> {
             proto,
             code: proto.code.as_ptr(),
             constants: proto.constants.as_ptr(),
-            ic_table: proto.ic_table.as_ptr(),
-            callees: proto.callees.as_ptr(),
+            feedback: proto.feedback.as_ptr(),
             max_stack_size: proto.max_stack_size,
             num_params: proto.num_params,
             is_vararg: proto.is_vararg,

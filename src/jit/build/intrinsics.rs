@@ -148,8 +148,8 @@ pub(super) fn value_now<'gc>(b: &Builder<'_, 'gc>, v: Val, guess: bool) -> Optio
 
 /// The function the call at `pc` calls when the builder may take it for a
 /// constant, which its user guards by identity: what `callee` holds now
-/// (`value_now`), else the one function the site has called since the last
-/// collection (`Prototype::callees`, I2). Neither once such a guard failed.
+/// (`value_now`), else the one function the site has called (its callee
+/// word, I2). Neither once such a guard failed.
 pub(super) fn known_callee<'gc>(
     b: &Builder<'_, 'gc>,
     pc: u32,
@@ -161,7 +161,7 @@ pub(super) fn known_callee<'gc>(
     if let Some(f) = value_now(b, callee, true).and_then(|v| v.get_function()) {
         return Some(f);
     }
-    let seen = b.proto.callees.get(b.code(pc).d() as usize)?.get();
+    let seen = b.proto.feedback.callee(pc as usize)?.get();
     // Bit 0: megamorphic, or a prototype's (`proto_slot`).
     if seen == 0 || seen & 1 != 0 {
         return None;
@@ -189,7 +189,7 @@ pub(super) enum Callee<'gc> {
 /// names. Nothing once such a guard failed here, even for a value of the
 /// compiled closure's own upvalues, which may differ per closure.
 pub(super) fn callee_of<'gc>(b: &Builder<'_, 'gc>, pc: u32, callee: Val) -> Callee<'gc> {
-    use crate::env::function::slot_proto;
+    use crate::env::feedback::slot_proto;
     if let Some(Op::KObj(k)) = b.f.def_op(callee) {
         return match b.f.pool[k as usize].get_function() {
             Some(f) => Callee::Const(f),
@@ -207,7 +207,7 @@ pub(super) fn callee_of<'gc>(b: &Builder<'_, 'gc>, pc: u32, callee: Val) -> Call
             _ => Callee::Same(f),
         },
         None => {
-            let slot = b.proto.callees.get(b.code(pc).d() as usize);
+            let slot = b.proto.feedback.callee(pc as usize);
             match slot.and_then(|s| slot_proto(s.get())) {
                 Some(p) if !p.is_vararg => Callee::Proto(p, None),
                 _ => Callee::Unknown,
@@ -656,7 +656,7 @@ fn abs_i32(b: &mut Builder<'_, '_>, x: Val) -> Val {
 /// rounds): typed ones converted, else a small integer or a float, or an
 /// integer where the site's feedback (`seen`) saw big ones and no floats;
 /// anything else exits to the builtin, for good where it saw both.
-fn number_f64(b: &mut Builder<'_, '_>, x: Val, seen: u8) -> Val {
+fn number_f64(b: &mut Builder<'_, '_>, x: Val, seen: fb::Bits) -> Val {
     let ty = b.ty(x);
     let known = |set| !ty.set.is_empty() && ty.within(set);
     if matches!(ty.rep, Rep::F64 | Rep::I32 | Rep::I64)

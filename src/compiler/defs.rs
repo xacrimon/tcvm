@@ -1,7 +1,7 @@
 use super::rules::{Assigned, VarId};
 use crate::compiler::CompileErrorKind;
 use crate::dmm::{Gc, Mutation};
-use crate::env::function::{IcTable, LocVar, Template};
+use crate::env::function::{LocVar, Template};
 use crate::env::{LuaString, Prototype, Value};
 /// Newtype for register indices, providing type safety over raw u8. Defined
 /// with the instruction word so the emitter can pass one straight to an
@@ -252,13 +252,6 @@ pub struct Chunk<'gc> {
     /// fails with "control structure too long" when it is assembled.
     pub(super) too_long: bool,
     pub(super) source: LuaString<'gc>,
-    /// Number of IC slots reserved so far. Incremented once per emitted
-    /// GETFIELD/SETFIELD/GETTABUP/SETTABUP/SELF. The final count seeds the
-    /// prototype's `ic_table` length.
-    pub(super) next_ic_idx: u16,
-    /// Callee slots reserved so far, one per CALL, CALLS and TAILCALL: the
-    /// length of `Prototype::callees`.
-    pub(super) next_callee_idx: u16,
     /// Becomes `Prototype::templates`.
     pub(super) templates: Vec<Template<'gc>>,
 }
@@ -294,30 +287,8 @@ impl<'gc> Chunk<'gc> {
             last_target: 0,
             too_long: false,
             source,
-            next_ic_idx: 0,
-            next_callee_idx: 0,
             templates: Vec::new(),
         }
-    }
-
-    /// Reserve a fresh inline-cache slot. Returns the index to embed in
-    /// the GETFIELD/SETFIELD/GETTABUP/SETTABUP/SELF instruction. Slots are
-    /// **not** deduped across call sites — sharing would defeat ICs at
-    /// any non-monomorphic shared use.
-    pub(super) fn alloc_ic_slot(&mut self) -> u16 {
-        let i = self.next_ic_idx;
-        // u16::MAX cache sites per prototype is more than ample; if we
-        // ever hit it, fall back to "no cache" (Empty stays).
-        self.next_ic_idx = self.next_ic_idx.saturating_add(1);
-        i
-    }
-
-    /// Reserve a call site's callee slot. Past `u16::MAX` sites the last one
-    /// is shared, which the JIT reads as a polymorphic site at worst.
-    pub(super) fn alloc_callee_slot(&mut self) -> crate::instruction::CalleeIdx {
-        let i = self.next_callee_idx;
-        self.next_callee_idx = i.saturating_add(1);
-        crate::instruction::CalleeIdx(i.min(u16::MAX - 1))
     }
 
     /// Resolve jump patches and convert into an immutable Prototype, with
@@ -417,9 +388,8 @@ impl<'gc> Chunk<'gc> {
             .collect::<Result<Vec<_>, _>>()?
             .into_boxed_slice();
 
-        let feedback = (0..self.tape.len())
-            .map(|_| std::cell::Cell::new(0))
-            .collect();
+        // Last: every rewrite of the tape is done, and slots follow the code.
+        let feedback = crate::env::feedback::FeedbackVector::new(&mut self.tape);
         Ok(Gc::new(
             mc,
             Prototype {
@@ -438,10 +408,8 @@ impl<'gc> Chunk<'gc> {
                 lineinfo: self.lineinfo.into_boxed_slice(),
                 locvars: self.locvars.into_boxed_slice(),
                 upvalue_names: self.upvalue_names.into_boxed_slice(),
-                ic_table: IcTable::new(self.next_ic_idx as usize),
-                callees: crate::env::function::Callees::new(self.next_callee_idx as usize),
-                templates: self.templates.into_boxed_slice(),
                 feedback,
+                templates: self.templates.into_boxed_slice(),
                 jit: crate::dmm::Lock::new(None),
                 jit_fast: std::cell::Cell::new(0),
                 closures: std::cell::Cell::new(0),

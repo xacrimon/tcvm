@@ -118,10 +118,10 @@ macro_rules! start {
 /// handler that called out to record it would push a frame on every call.
 macro_rules! note_callee {
     ($closure:ident, $insn:expr, $fv:expr) => {{
-        let seen = unsafe { (*$closure.callees.add($insn.d() as usize)).get() };
+        let seen = unsafe { (*$closure.feedback.add($insn.d() as usize)).get() };
         if std::hint::unlikely(seen != $fv.to_raw()) {
-            // Only `MEGAMORPHIC` has bit 0 set: a function value's payload
-            // is aligned.
+            // Bit 0 marks a word that stays (`MEGAMORPHIC`, a `proto_slot`):
+            // a function value's payload is aligned.
             if seen & 1 == 0 {
                 tail!(call_note)
             }
@@ -217,18 +217,18 @@ handler! {
     /// or a second, which makes the site its prototype's when both are
     /// closures of one, else megamorphic; then the call again.
     slow fn call_note {
-        use crate::env::function::{MEGAMORPHIC, proto_slot};
+        use crate::env::feedback::{MEGAMORPHIC, proto_slot};
         let call = insn_at!();
         // `R[a]` is the callee, a CALLS's included.
         let fv: Value<'gc> = reg![call.a()];
         let proto = unsafe { frame::closure(base) }.proto;
-        let slot = &proto.callees[call.d() as usize];
+        let slot = proto.feedback.callee_at(call.d() as usize);
         let seen = slot.get();
         let lua_proto = |v: Value<'gc>| v.get_function().and_then(|f| f.as_lua()).map(|c| c.proto);
         slot.set(if seen == 0 {
             fv.to_raw()
         } else {
-            // SAFETY: a nonzero slot names a live function.
+            // SAFETY: a callee word without bit 0 names a live function.
             match (lua_proto(unsafe { Value::from_raw(seen) }), lua_proto(fv)) {
                 (Some(p), Some(q)) if crate::dmm::Gc::ptr_eq(p, q) => proto_slot(p),
                 _ => MEGAMORPHIC,

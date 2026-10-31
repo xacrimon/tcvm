@@ -169,9 +169,9 @@ pub(crate) struct ExitInfo {
     pub(crate) snap: u32,
     pub(crate) tag: ExitTag,
     pub(crate) count: Cell<u32>,
-    /// The feedback byte of the exit's site when compiled: one the exit
+    /// `FeedbackVector::seen` of the exit's site when compiled: one the exit
     /// changed means the recompile learns something.
-    pub(crate) byte: u8,
+    pub(crate) seen: u64,
     /// The site, when not the snapshot's pc: a check hoisted out of a loop
     /// records its access's miss (E2).
     pub(crate) site: Option<u32>,
@@ -229,10 +229,6 @@ pub(crate) struct Region<'gc> {
     pub(crate) frame_size: u32,
     #[collect(require_static)]
     pub(crate) retired: Cell<bool>,
-    /// How many of `JitState::kind_exits` and `shapes_seen` the compile saw:
-    /// a hot exit that adds to them widens the next compile.
-    #[collect(require_static)]
-    pub(crate) known: (u32, u32),
     /// Takings of one exit that ask for a recompile: `EXIT_HOT`, doubled
     /// per retry of the entry.
     #[collect(require_static)]

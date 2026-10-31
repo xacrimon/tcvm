@@ -42,15 +42,15 @@ pub struct UpIdx(pub u8);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct KIdx(pub u16);
 
-/// An index into the prototype's `ic_table`. One slot is allocated per emitted
-/// GETTABUP/SETTABUP/GETFIELD/SETFIELD/SELF; sites are not deduped.
+/// A field or call site's slot: the word index of its feedback vector slot,
+/// which `assemble` assigns once the code is final (`FeedbackVector::new`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct IcIdx(pub u16);
+pub struct SlotIdx(pub u16);
 
-/// An index into the prototype's `callees`: one per CALL, CALLS and
-/// TAILCALL site (the JIT's callee feedback).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CalleeIdx(pub u16);
+impl SlotIdx {
+    /// What the compiler emits before `assemble` assigns the slot.
+    pub const UNASSIGNED: SlotIdx = SlotIdx(0);
+}
 
 /// An index into the prototype's child-prototype list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -153,7 +153,7 @@ impl CmpImm {
 /// Something that can occupy an operand slot. Implemented for the index
 /// newtypes and for the raw types used by count/flag operands; the *declared*
 /// type of each field is what a constructor takes, so two same-width operands
-/// (`IcIdx` and `KIdx`, say) can't be passed in the wrong order.
+/// (`SlotIdx` and `KIdx`, say) can't be passed in the wrong order.
 pub trait Operand: Copy {
     fn bits(self) -> u64;
 }
@@ -171,8 +171,7 @@ impl_operand! {
     Reg      => |self| self.0 as u64,
     UpIdx    => |self| self.0 as u64,
     KIdx     => |self| self.0 as u64,
-    IcIdx    => |self| self.0 as u64,
-    CalleeIdx => |self| self.0 as u64,
+    SlotIdx  => |self| self.0 as u64,
     ProtoIdx => |self| self.0 as u64,
     TemplateIdx => |self| self.0 as u64,
     u8       => |self| self as u64,
@@ -887,16 +886,16 @@ instructions! {
     /// SETUPVAL's upvalue is never by value.
     0x03 GETUPVAL   getupval    Ab    { dst: Reg, idx: UpIdx }
     0x04 SETUPVAL   setupval    Ab    { src: Reg, idx: UpIdx }
-    0x05 GETTABUP   gettabup    Abde  { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
-    0x06 SETTABUP   settabup    Abde  { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+    0x05 GETTABUP   gettabup    Abde  { dst: Reg, idx: UpIdx, slot: SlotIdx, key: KIdx }
+    0x06 SETTABUP   settabup    Abde  { src: Reg, idx: UpIdx, slot: SlotIdx, key: KIdx }
     0x07 GETTABLE   gettable    Abc   { dst: Reg, table: Reg, key: Reg }
     0x08 SETTABLE   settable    Abc   { src: Reg, table: Reg, key: Reg }
-    0x09 GETFIELD   getfield    Abde  { dst: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x0a SETFIELD   setfield    Abde  { src: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x09 GETFIELD   getfield    Abde  { dst: Reg, table: Reg, slot: SlotIdx, key_idx: KIdx }
+    0x0a SETFIELD   setfield    Abde  { src: Reg, table: Reg, slot: SlotIdx, key_idx: KIdx }
 
     /// Method-call setup: `R[dst] = R[object][K[key_idx]]; R[dst+1] = R[object]`.
     /// Backs `obj:m(...)` codegen.
-    0x0b SELF       self_       Abde  { dst: Reg, object: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x0b SELF       self_       Abde  { dst: Reg, object: Reg, slot: SlotIdx, key_idx: KIdx }
 
     /// `R[dst]` = a new table made from `templates[template]`.
     0x0c NEWTABLE   newtable    Ad    { dst: Reg, template: TemplateIdx }
@@ -962,8 +961,8 @@ instructions! {
     0x35 JTSET      jtset       AbImm { dst: Reg, src: Reg, offset: Offset }
     0x36 JFSET      jfset       AbImm { dst: Reg, src: Reg, offset: Offset }
 
-    0x37 CALL       call        Abcd  { func: Reg, args: u8, returns: u8, callee: CalleeIdx }
-    0x38 TAILCALL   tailcall    Abd   { func: Reg, args: u8, callee: CalleeIdx }
+    0x37 CALL       call        Abcd  { func: Reg, args: u8, returns: u8, slot: SlotIdx }
+    0x38 TAILCALL   tailcall    Abd   { func: Reg, args: u8, slot: SlotIdx }
     0x39 RETURN     ret         Ab    { values: Reg, count: u8 }
     0x3a FORLOOP    forloop     AImm  { base: Reg, offset: Offset }
     0x3b FORPREP    forprep     AImm  { base: Reg, offset: Offset }
@@ -1029,26 +1028,26 @@ instructions! {
     // lacks (`_ABSENT`), a slot in the `__index` table (`_PROTO`), an added
     // key (`_TRANS`). Same operands as the generic form; every miss refills.
 
-    0x5c GETFIELD_INL     getfield_inl    Abde { dst: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x5d GETFIELD_AUX     getfield_aux    Abde { dst: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x5e GETFIELD_ABSENT  getfield_absent Abde { dst: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x5f GETFIELD_PROTO   getfield_proto  Abde { dst: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x60 GETTABUP_INL     gettabup_inl    Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
-    0x61 GETTABUP_AUX     gettabup_aux    Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
-    0x62 GETTABUP_ABSENT  gettabup_absent Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
-    0x63 GETTABUP_PROTO   gettabup_proto  Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
-    0x64 SELF_INL         self_inl        Abde { dst: Reg, object: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x65 SELF_AUX         self_aux        Abde { dst: Reg, object: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x66 SELF_ABSENT      self_absent     Abde { dst: Reg, object: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x67 SELF_PROTO       self_proto      Abde { dst: Reg, object: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x68 SETFIELD_INL     setfield_inl    Abde { src: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x69 SETFIELD_AUX     setfield_aux    Abde { src: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x6a SETFIELD_TRANS   setfield_trans  Abde { src: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x6b SETFIELD_ABSENT  setfield_absent Abde { src: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x6c SETTABUP_INL     settabup_inl    Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
-    0x6d SETTABUP_AUX     settabup_aux    Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
-    0x6e SETTABUP_TRANS   settabup_trans  Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
-    0x6f SETTABUP_ABSENT  settabup_absent Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+    0x5c GETFIELD_INL     getfield_inl    Abde { dst: Reg, table: Reg, slot: SlotIdx, key_idx: KIdx }
+    0x5d GETFIELD_AUX     getfield_aux    Abde { dst: Reg, table: Reg, slot: SlotIdx, key_idx: KIdx }
+    0x5e GETFIELD_ABSENT  getfield_absent Abde { dst: Reg, table: Reg, slot: SlotIdx, key_idx: KIdx }
+    0x5f GETFIELD_PROTO   getfield_proto  Abde { dst: Reg, table: Reg, slot: SlotIdx, key_idx: KIdx }
+    0x60 GETTABUP_INL     gettabup_inl    Abde { dst: Reg, idx: UpIdx, slot: SlotIdx, key: KIdx }
+    0x61 GETTABUP_AUX     gettabup_aux    Abde { dst: Reg, idx: UpIdx, slot: SlotIdx, key: KIdx }
+    0x62 GETTABUP_ABSENT  gettabup_absent Abde { dst: Reg, idx: UpIdx, slot: SlotIdx, key: KIdx }
+    0x63 GETTABUP_PROTO   gettabup_proto  Abde { dst: Reg, idx: UpIdx, slot: SlotIdx, key: KIdx }
+    0x64 SELF_INL         self_inl        Abde { dst: Reg, object: Reg, slot: SlotIdx, key_idx: KIdx }
+    0x65 SELF_AUX         self_aux        Abde { dst: Reg, object: Reg, slot: SlotIdx, key_idx: KIdx }
+    0x66 SELF_ABSENT      self_absent     Abde { dst: Reg, object: Reg, slot: SlotIdx, key_idx: KIdx }
+    0x67 SELF_PROTO       self_proto      Abde { dst: Reg, object: Reg, slot: SlotIdx, key_idx: KIdx }
+    0x68 SETFIELD_INL     setfield_inl    Abde { src: Reg, table: Reg, slot: SlotIdx, key_idx: KIdx }
+    0x69 SETFIELD_AUX     setfield_aux    Abde { src: Reg, table: Reg, slot: SlotIdx, key_idx: KIdx }
+    0x6a SETFIELD_TRANS   setfield_trans  Abde { src: Reg, table: Reg, slot: SlotIdx, key_idx: KIdx }
+    0x6b SETFIELD_ABSENT  setfield_absent Abde { src: Reg, table: Reg, slot: SlotIdx, key_idx: KIdx }
+    0x6c SETTABUP_INL     settabup_inl    Abde { src: Reg, idx: UpIdx, slot: SlotIdx, key: KIdx }
+    0x6d SETTABUP_AUX     settabup_aux    Abde { src: Reg, idx: UpIdx, slot: SlotIdx, key: KIdx }
+    0x6e SETTABUP_TRANS   settabup_trans  Abde { src: Reg, idx: UpIdx, slot: SlotIdx, key: KIdx }
+    0x6f SETTABUP_ABSENT  settabup_absent Abde { src: Reg, idx: UpIdx, slot: SlotIdx, key: KIdx }
 
     // --- shared-cell upvalue forms ------------------------------------------
     //
@@ -1056,16 +1055,16 @@ instructions! {
     // to these for an upvalue that is not by value. Not quickened.
 
     0x70 GETUPVAL_REF getupval_ref Ab   { dst: Reg, idx: UpIdx }
-    0x71 GETTABUP_REF gettabup_ref Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
-    0x72 SETTABUP_REF settabup_ref Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+    0x71 GETTABUP_REF gettabup_ref Abde { dst: Reg, idx: UpIdx, slot: SlotIdx, key: KIdx }
+    0x72 SETTABUP_REF settabup_ref Abde { src: Reg, idx: UpIdx, slot: SlotIdx, key: KIdx }
 
     // --- CALL by result count -----------------------------------------------
     //
     // A CALL wanting no result (`returns` 1) or one (`returns` 2), whose
     // continuation is a constant. `returns` stays for the generic paths.
 
-    0x73 CALL_R0    call_r0     Abcd  { func: Reg, args: u8, returns: u8, callee: CalleeIdx }
-    0x74 CALL_R1    call_r1     Abcd  { func: Reg, args: u8, returns: u8, callee: CalleeIdx }
+    0x73 CALL_R0    call_r0     Abcd  { func: Reg, args: u8, returns: u8, slot: SlotIdx }
+    0x74 CALL_R1    call_r1     Abcd  { func: Reg, args: u8, returns: u8, slot: SlotIdx }
 
     // --- adaptive arithmetic -------------------------------------------------
     //
@@ -1192,9 +1191,9 @@ instructions! {
     // of a local. The callee is read when the call runs, after the
     // arguments (the manual fixes no order between the two). `R[func]`
     // gets the callee first, so the slow paths see a plain CALL.
-    0xc9 CALLS        calls       Abcde { func: Reg, args: u8, returns: u8, callee: CalleeIdx, src: Reg }
-    0xca CALLS_R0     calls_r0    Abcde { func: Reg, args: u8, returns: u8, callee: CalleeIdx, src: Reg }
-    0xcb CALLS_R1     calls_r1    Abcde { func: Reg, args: u8, returns: u8, callee: CalleeIdx, src: Reg }
+    0xc9 CALLS        calls       Abcde { func: Reg, args: u8, returns: u8, slot: SlotIdx, src: Reg }
+    0xca CALLS_R0     calls_r0    Abcde { func: Reg, args: u8, returns: u8, slot: SlotIdx, src: Reg }
+    0xcb CALLS_R1     calls_r1    Abcde { func: Reg, args: u8, returns: u8, slot: SlotIdx, src: Reg }
 
     // --- JIT entries -----------------------------------------------------------
     //
@@ -2481,7 +2480,7 @@ mod tests {
         assert_eq!(i.op(), Op::ADD);
         assert_eq!(i.abc(), (1, 2, 3));
 
-        let i = Instruction::getfield(Reg(4), Reg(5), IcIdx(600), KIdx(700));
+        let i = Instruction::getfield(Reg(4), Reg(5), SlotIdx(600), KIdx(700));
         assert_eq!(i.op(), Op::GETFIELD);
         assert_eq!(i.abde(), (4, 5, 600, 700));
 
@@ -2500,7 +2499,7 @@ mod tests {
         assert!(!i.set_branch_offset(-(1 << 23) - 1));
         assert_eq!(i.with_adaptive(1, false).ab_offset(), (7, 8, (1 << 23) - 1));
 
-        let i = Instruction::self_(Reg(1), Reg(2), IcIdx(4), KIdx(3));
+        let i = Instruction::self_(Reg(1), Reg(2), SlotIdx(4), KIdx(3));
         assert_eq!(i.abde(), (1, 2, 4, 3));
 
         let i = Instruction::setlist(Reg(1), 2, 3);
@@ -2584,7 +2583,7 @@ mod tests {
         assert_eq!(i.branch_offset(), -1);
         assert_eq!(i.op(), Op::JMP);
 
-        let mut i = Instruction::getfield(Reg(1), Reg(2), IcIdx(3), KIdx(4));
+        let mut i = Instruction::getfield(Reg(1), Reg(2), SlotIdx(3), KIdx(4));
         i.set_d(u16::MAX);
         assert_eq!(i.abde(), (1, 2, u16::MAX, 4));
     }

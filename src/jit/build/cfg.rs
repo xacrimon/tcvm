@@ -360,18 +360,19 @@ pub(crate) enum CfgError {
 fn recorded(proto: &Prototype<'_>, i: Instruction, pc: usize) -> Option<bool> {
     let op = i.op();
     let info = op.info();
-    let byte = proto.feedback[pc].get();
+    let bits = proto.feedback.bits(pc);
     match info.family {
         Family::RegArith | Family::RegBit | Family::ImmArith | Family::ImmBit => {
             let generic = i.generic_op();
             let (misses, locked) = i.adaptive();
-            Some(op != generic || misses > 0 || locked || byte != 0)
+            Some(op != generic || misses > 0 || locked || bits != 0)
         }
         Family::Field => Some(true),
         _ => match op {
             Op::GETFIELD | Op::SETFIELD | Op::GETTABUP | Op::SETTABUP | Op::SELF => {
-                let ic = proto.ic_table[i.d() as usize].get();
-                Some(!matches!(ic, InlineCache::Empty) || byte != 0)
+                let (w, _) = proto.feedback.slot(pc)?;
+                let ic = proto.feedback.cache(w).get();
+                Some(!matches!(ic, InlineCache::Empty) || bits != 0)
             }
             _ => None,
         },

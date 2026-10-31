@@ -12,7 +12,7 @@ use crate::dmm::{Gc, Mutation};
 use crate::env::function::{LocVar, Template};
 use crate::env::{LuaString, Prototype, value::Value};
 use crate::instruction::{
-    CmpImm, IcIdx, Imm, Instruction, KIdx, Offset, Op, ProtoIdx, Reg, Shape, TFOR_VARS,
+    CmpImm, Imm, Instruction, KIdx, Offset, Op, ProtoIdx, Reg, Shape, SlotIdx, TFOR_VARS,
     TemplateIdx, UpIdx, UpvalSource,
 };
 use crate::lua;
@@ -745,7 +745,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         returns: u8,
         src: Option<RegisterIndex>,
     ) {
-        let k = self.chunk.alloc_callee_slot();
+        let k = SlotIdx::UNASSIGNED;
         let insn = match (returns, src) {
             (1, None) => Instruction::call_r0(func, args, returns, k),
             (2, None) => Instruction::call_r1(func, args, returns, k),
@@ -1504,14 +1504,10 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         Ok(LuaString::new(self.ctx, name.as_bytes()))
     }
 
-    /// Allocate a string constant for use as a field/global/method key, and
-    /// reserve a fresh `ic_idx` for the GETFIELD/SETFIELD/GETTABUP/
-    /// SETTABUP/SELF instruction emitted right after.
-    fn alloc_field_key(&mut self, s: &[u8]) -> Result<(u16, u16), CompileError> {
+    /// Allocate a string constant for use as a field/global/method key.
+    fn alloc_field_key(&mut self, s: &[u8]) -> Result<u16, CompileError> {
         let lua_str = LuaString::new(self.ctx, s);
-        let idx = self.alloc_constant(Value::string(lua_str))?;
-        let ic = self.chunk.alloc_ic_slot();
-        Ok((idx, ic))
+        self.alloc_constant(Value::string(lua_str))
     }
 
     /// The `_ENV` in scope for an access to the global `name`; an error while
@@ -1549,17 +1545,19 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
         }
     }
 
-    fn emit_env_get(&mut self, dst: RegisterIndex, env: Env, ic_idx: u16, key: u16) {
+    fn emit_env_get(&mut self, dst: RegisterIndex, env: Env, key: u16) {
+        let s = SlotIdx::UNASSIGNED;
         self.emit(match env {
-            Env::Reg(table) => Instruction::getfield(dst, table, IcIdx(ic_idx), KIdx(key)),
-            Env::Upvalue(idx) => Instruction::gettabup(dst, UpIdx(idx), IcIdx(ic_idx), KIdx(key)),
+            Env::Reg(table) => Instruction::getfield(dst, table, s, KIdx(key)),
+            Env::Upvalue(idx) => Instruction::gettabup(dst, UpIdx(idx), s, KIdx(key)),
         });
     }
 
-    fn emit_env_set(&mut self, src: RegisterIndex, env: Env, ic_idx: u16, key: u16) {
+    fn emit_env_set(&mut self, src: RegisterIndex, env: Env, key: u16) {
+        let s = SlotIdx::UNASSIGNED;
         self.emit(match env {
-            Env::Reg(table) => Instruction::setfield(src, table, IcIdx(ic_idx), KIdx(key)),
-            Env::Upvalue(idx) => Instruction::settabup(src, UpIdx(idx), IcIdx(ic_idx), KIdx(key)),
+            Env::Reg(table) => Instruction::setfield(src, table, s, KIdx(key)),
+            Env::Upvalue(idx) => Instruction::settabup(src, UpIdx(idx), s, KIdx(key)),
         });
     }
 
@@ -2328,7 +2326,7 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
 
         // `_ENV` resolves before the body, as in `globalfunc`'s
         // `buildglobal`.
-        let (key, ic_idx) = ctx.alloc_field_key(name.as_bytes())?;
+        let key = ctx.alloc_field_key(name.as_bytes())?;
         let env = ctx.env(&name)?;
 
         // Compile the closure into a register. `compile_func_body`
@@ -2350,9 +2348,9 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
         // `globalfunc` (`lparser.c:1956-1968`), which emits the same guard
         // via `checkglobal` + `luaK_storevar`.
         let guard_reg = ctx.alloc_register()?;
-        ctx.emit_env_get(guard_reg, env, ic_idx, key);
+        ctx.emit_env_get(guard_reg, env, key);
         ctx.emit(Instruction::errnnil(guard_reg, KIdx(key)));
-        ctx.emit_env_set(func_reg, env, ic_idx, key);
+        ctx.emit_env_set(func_reg, env, key);
         ctx.free_reg(guard_reg);
         ctx.free_reg(target_reg);
         if let Env::Reg(env) = env {
@@ -2498,12 +2496,12 @@ fn compile_global(ctx: &mut Ctx, item: Global) -> Result<(), CompileError> {
     // corresponding slot. (Forward order — equivalent to upstream's
     // reverse-on-unwind emission, just simpler to read.)
     for (i, (name, _kind)) in decl_kinds.iter().enumerate() {
-        let (key, ic_idx) = ctx.alloc_field_key(name.as_bytes())?;
+        let key = ctx.alloc_field_key(name.as_bytes())?;
         let value_reg = value_base + i as u8;
         let guard_reg = ctx.alloc_register()?;
-        ctx.emit_env_get(guard_reg, env, ic_idx, key);
+        ctx.emit_env_get(guard_reg, env, key);
         ctx.emit(Instruction::errnnil(guard_reg, KIdx(key)));
-        ctx.emit_env_set(Reg(value_reg), env, ic_idx, key);
+        ctx.emit_env_set(Reg(value_reg), env, key);
         ctx.free_reg(guard_reg);
     }
     // Free the value-block.
@@ -2532,7 +2530,6 @@ enum Lvalue {
     Global {
         env_idx: u8,
         key: u16,
-        ic_idx: u16,
     },
     Indexed {
         table: RegisterIndex,
@@ -2541,7 +2538,6 @@ enum Lvalue {
     Field {
         table: RegisterIndex,
         key_idx: u16,
-        ic_idx: u16,
     },
 }
 
@@ -2781,7 +2777,7 @@ fn compile_lvalue(
                         DefaultPolicy::Preamble | DefaultPolicy::Star(GlobalKind::Reg) => {}
                     }
                 }
-                let (key, ic_idx) = ctx.alloc_field_key(name.as_bytes())?;
+                let key = ctx.alloc_field_key(name.as_bytes())?;
                 Ok(match ctx.env(name)? {
                     Env::Upvalue(env_idx) if env_is_target => {
                         let table = ctx.alloc_register()?;
@@ -2789,18 +2785,12 @@ fn compile_lvalue(
                         Lvalue::Field {
                             table,
                             key_idx: key,
-                            ic_idx,
                         }
                     }
-                    Env::Upvalue(env_idx) => Lvalue::Global {
-                        env_idx,
-                        key,
-                        ic_idx,
-                    },
+                    Env::Upvalue(env_idx) => Lvalue::Global { env_idx, key },
                     Env::Reg(env) => Lvalue::Field {
                         table: protect_target_local(ctx, env, target_local_regs)?,
                         key_idx: key,
-                        ic_idx,
                     },
                 })
             }
@@ -2822,12 +2812,8 @@ fn compile_lvalue(
             let t = binop.lhs().ok_or_else(|| ice("binop without lhs"))?;
             let f = binop.rhs().ok_or_else(|| ice("binop without rhs"))?;
             let table = compile_indexed_subexpr(ctx, t, target_local_regs)?;
-            if let Some((key_idx, ic_idx)) = try_property_key_constant(ctx, &f)? {
-                return Ok(Lvalue::Field {
-                    table,
-                    key_idx,
-                    ic_idx,
-                });
+            if let Some(key_idx) = try_property_key_constant(ctx, &f)? {
+                return Ok(Lvalue::Field { table, key_idx });
             }
             // Fallback: non-ident RHS still goes through LOAD K + SETTABLE.
             let key = compile_property_key(ctx, f, None)?;
@@ -2891,25 +2877,17 @@ fn emit_store(ctx: &mut Ctx, lv: Lvalue, src: u8) {
         Lvalue::Local { dst } if dst.0 != src => ctx.emit(Instruction::mov(dst, Reg(src))),
         Lvalue::Local { .. } => {} // self-MOVE; skip
         Lvalue::Upvalue { idx } => ctx.emit(Instruction::setupval(Reg(src), UpIdx(idx))),
-        Lvalue::Global {
-            env_idx,
-            key,
-            ic_idx,
-        } => ctx.emit(Instruction::settabup(
+        Lvalue::Global { env_idx, key } => ctx.emit(Instruction::settabup(
             Reg(src),
             UpIdx(env_idx),
-            IcIdx(ic_idx),
+            SlotIdx::UNASSIGNED,
             KIdx(key),
         )),
         Lvalue::Indexed { table, key } => ctx.emit(Instruction::settable(Reg(src), table, key)),
-        Lvalue::Field {
-            table,
-            key_idx,
-            ic_idx,
-        } => ctx.emit(Instruction::setfield(
+        Lvalue::Field { table, key_idx } => ctx.emit(Instruction::setfield(
             Reg(src),
             table,
-            IcIdx(ic_idx),
+            SlotIdx::UNASSIGNED,
             KIdx(key_idx),
         )),
     }
@@ -3160,14 +3138,14 @@ fn compile_expr_ident<'gc>(
         return Err(ctx.err(CompileErrorKind::UndeclaredGlobal(name.to_owned())));
     }
 
-    let (key, ic_idx) = ctx.alloc_field_key(name.as_bytes())?;
+    let key = ctx.alloc_field_key(name.as_bytes())?;
     let env = ctx.env(name)?;
     // Freed first so the result can reuse a temp `_ENV`: GETFIELD R, R, K.
     if let Env::Reg(env) = env {
         ctx.free_reg(env);
     }
     let dst = ctx.dst_or_alloc(dst)?;
-    ctx.emit_env_get(dst, env, ic_idx, key);
+    ctx.emit_env_get(dst, env, key);
     Ok(ExprDesc::from_reg(dst))
 }
 
@@ -3219,10 +3197,7 @@ fn compile_property_key(
     }
 }
 
-fn try_property_key_constant(
-    ctx: &mut Ctx,
-    field: &Expr,
-) -> Result<Option<(u16, u16)>, CompileError> {
+fn try_property_key_constant(ctx: &mut Ctx, field: &Expr) -> Result<Option<u16>, CompileError> {
     let bytes: Vec<u8> = match field {
         Expr::Ident(ident) => ident
             .name(ctx.interner)
@@ -3382,11 +3357,10 @@ fn compile_expr_table(ctx: &mut Ctx, item: Table) -> Result<RegisterIndex, Compi
                 }
                 let val = ctx.discharge_to_reg_mut(&mut value, None)?;
                 let key_idx = ctx.alloc_constant(Value::string(key))?;
-                let ic_idx = ctx.chunk.alloc_ic_slot();
                 ctx.emit(Instruction::setfield(
                     val,
                     dst,
-                    IcIdx(ic_idx),
+                    SlotIdx::UNASSIGNED,
                     KIdx(key_idx),
                 ));
                 ctx.free_reg(val);
@@ -3603,13 +3577,13 @@ fn compile_expr_binary_op<'gc>(
         if let Some(key_node) = rhs.syntax() {
             ctx.set_line(key_node);
         }
-        if let Some((key_idx, ic_idx)) = try_property_key_constant(ctx, &rhs)? {
+        if let Some(key_idx) = try_property_key_constant(ctx, &rhs)? {
             ctx.free_reg(table);
             let dst = ctx.dst_or_alloc(dst)?;
             ctx.emit(Instruction::getfield(
                 dst,
                 table,
-                IcIdx(ic_idx),
+                SlotIdx::UNASSIGNED,
                 KIdx(key_idx),
             ));
             return Ok(ExprDesc::from_reg(dst));
@@ -4116,8 +4090,7 @@ fn compile_expr_func_call(
 /// `frame_return`).
 fn compile_tail_func_call(ctx: &mut Ctx, item: FuncCall) -> Result<(), CompileError> {
     let (func, args_wire, _) = emit_func_call_setup(ctx, &item, false)?;
-    let k = ctx.chunk.alloc_callee_slot();
-    ctx.emit(Instruction::tailcall(func, args_wire, k));
+    ctx.emit(Instruction::tailcall(func, args_wire, SlotIdx::UNASSIGNED));
     // Frame is about to be torn down; conservatively snap freereg to func
     // so any post-TAILCALL code in the compiler (there shouldn't be any
     // reachable) sees a clean cursor.
@@ -4130,8 +4103,7 @@ fn compile_tail_func_call(ctx: &mut Ctx, item: FuncCall) -> Result<(), CompileEr
 /// register list.
 fn compile_tail_method_call(ctx: &mut Ctx, item: MethodCall) -> Result<(), CompileError> {
     let (func, args_wire) = emit_method_call_setup(ctx, &item)?;
-    let k = ctx.chunk.alloc_callee_slot();
-    ctx.emit(Instruction::tailcall(func, args_wire, k));
+    ctx.emit(Instruction::tailcall(func, args_wire, SlotIdx::UNASSIGNED));
     ctx.chunk.freereg = func.0;
     Ok(())
 }
@@ -4188,7 +4160,7 @@ fn emit_method_call_setup(
     let object = compile_expr_to_reg(ctx, object_expr, None)?;
     ctx.set_line(method_ident.syntax());
 
-    let (key_idx, ic_idx) = ctx.alloc_field_key(method_name.as_bytes())?;
+    let key_idx = ctx.alloc_field_key(method_name.as_bytes())?;
 
     // A receiver temp at the top of the stack is dead once SELF has read it,
     // so reuse its slot as `func` (luac's `luaK_self`). Leaving it below the
@@ -4201,7 +4173,7 @@ fn emit_method_call_setup(
     ctx.emit(Instruction::self_(
         func,
         object,
-        IcIdx(ic_idx),
+        SlotIdx::UNASSIGNED,
         KIdx(key_idx),
     ));
 

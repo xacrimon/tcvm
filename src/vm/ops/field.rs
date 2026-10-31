@@ -24,11 +24,18 @@ use crate::vm::unwind::OpError;
 // Inline cache helpers
 // ---------------------------------------------------------------------------
 
-/// The IC entry of the current site.
+/// The IC entry of the current site, whose slot is `d`.
 #[inline(always)]
-pub(crate) fn read_ic<'gc>(closure: LuaFn<'gc>, ic_idx: u16) -> InlineCache<'gc> {
-    debug_assert!((ic_idx as usize) < closure.proto.ic_table.len());
-    unsafe { (*closure.ic_table.add(ic_idx as usize)).get() }
+pub(crate) fn read_ic<'gc>(closure: LuaFn<'gc>, d: u16) -> InlineCache<'gc> {
+    debug_assert!((d as usize) + 4 <= closure.proto.feedback.len());
+    // SAFETY: a field site's `d` starts a field slot (`FeedbackVector::cache`).
+    unsafe {
+        (*closure
+            .feedback
+            .add(d as usize)
+            .cast::<std::cell::Cell<InlineCache<'gc>>>())
+        .get()
+    }
 }
 
 /// Refill the IC entry after a full lookup, and rewrite the site.
@@ -36,7 +43,7 @@ pub(crate) fn read_ic<'gc>(closure: LuaFn<'gc>, ic_idx: u16) -> InlineCache<'gc>
 fn fill_ic<'gc>(
     ctx: Context<'gc>,
     closure: LuaFn<'gc>,
-    ic_idx: u16,
+    d: u16,
     site: *const Instruction,
     entry: InlineCache<'gc>,
 ) {
@@ -50,12 +57,13 @@ fn fill_ic<'gc>(
         } => !recv.is_dict() && !holder_shape.is_dict(),
         InlineCache::Empty => true,
     });
-    let proto_gc = closure.proto;
-    if let Some(slot_lock) = proto_gc.ic_table.get(ic_idx as usize) {
+    let proto = closure.proto;
+    // Not the null slot of sites past the vector's capacity.
+    if proto.feedback.is_field(d as usize) {
         // A fresh `Shape` pointer is adopted through this slot, so the
-        // prototype gets its barrier before the write through `as_cell`.
-        ctx.mutation().backward_barrier(Gc::erase(proto_gc), None);
-        unsafe { slot_lock.as_cell() }.set(entry);
+        // prototype gets its barrier before the write.
+        ctx.mutation().backward_barrier(Gc::erase(proto), None);
+        proto.feedback.cache(d as usize).set(entry);
         quicken(site, &entry);
     }
 }
@@ -212,7 +220,7 @@ fn constant_key<'gc>(k: Value<'gc>) -> LuaString<'gc> {
 fn get_fill_ic<'gc>(
     ctx: Context<'gc>,
     closure: LuaFn<'gc>,
-    ic_idx: u16,
+    ic: u16,
     site: *const Instruction,
     t: Table<'gc>,
     k: Value<'gc>,
@@ -229,7 +237,7 @@ fn get_fill_ic<'gc>(
         };
     }
     // The entry already says `t` lacks the key: only `__index` is left.
-    if let InlineCache::Absent { shape: cached } = read_ic(closure, ic_idx)
+    if let InlineCache::Absent { shape: cached } = read_ic(closure, ic)
         && Shape::ptr_eq(cached, shape)
         && let Some(mt) = shape.mt_cache()
     {
@@ -238,10 +246,10 @@ fn get_fill_ic<'gc>(
         if index.get_function().is_some() {
             return Err(Value::table(t));
         }
-        return get_index_fill_ic(ctx, closure, ic_idx, site, t, index, Some(shape), k);
+        return get_index_fill_ic(ctx, closure, ic, site, t, index, Some(shape), k);
     }
     let slot = shape.find_slot(constant_key(k));
-    fill_ic(ctx, closure, ic_idx, site, shape_entry(shape, slot));
+    fill_ic(ctx, closure, ic, site, shape_entry(shape, slot));
     let v = slot.map_or(Value::nil(), |s| state.named_get(s));
     if !v.is_nil() || !shape.has_mm(MetamethodBits::INDEX) {
         return Ok(v);
@@ -249,7 +257,7 @@ fn get_fill_ic<'gc>(
     let index = unsafe { shape.mt_cache().unwrap_unchecked() }.mm(MetamethodBits::INDEX);
     drop(state);
     let recv = slot.is_none().then_some(shape);
-    get_index_fill_ic(ctx, closure, ic_idx, site, t, index, recv, k)
+    get_index_fill_ic(ctx, closure, ic, site, t, index, recv, k)
 }
 
 /// Move `t` off a stale metatable class before a fill reads the class or
@@ -271,7 +279,7 @@ fn leave_stale_class<'gc>(ctx: Context<'gc>, t: Table<'gc>) {
 fn get_index_fill_ic<'gc>(
     ctx: Context<'gc>,
     closure: LuaFn<'gc>,
-    ic_idx: u16,
+    ic: u16,
     site: *const Instruction,
     t: Table<'gc>,
     index: Value<'gc>,
@@ -310,7 +318,7 @@ fn get_index_fill_ic<'gc>(
             holder_shape,
             loc: SlotLoc::new(holder_shape, holder_slot),
         };
-        fill_ic(ctx, closure, ic_idx, site, entry);
+        fill_ic(ctx, closure, ic, site, entry);
     }
     Ok(v)
 }
@@ -322,7 +330,7 @@ fn get_index_fill_ic<'gc>(
 fn set_own_fill_ic<'gc>(
     ctx: Context<'gc>,
     closure: LuaFn<'gc>,
-    ic_idx: u16,
+    ic: u16,
     site: *const Instruction,
     t: Table<'gc>,
     k: Value<'gc>,
@@ -342,7 +350,7 @@ fn set_own_fill_ic<'gc>(
     }
     // As in `get_fill_ic`: the entry already says only `__newindex` is left.
     if newindex
-        && let InlineCache::Absent { shape: cached } = read_ic(closure, ic_idx)
+        && let InlineCache::Absent { shape: cached } = read_ic(closure, ic)
         && Shape::ptr_eq(cached, shape)
     {
         return false;
@@ -355,7 +363,7 @@ fn set_own_fill_ic<'gc>(
     let existing = slot.map_or(Value::nil(), |s| state.named_get(s));
     if existing.is_nil() && newindex {
         if cache {
-            fill_ic(ctx, closure, ic_idx, site, shape_entry(shape, slot));
+            fill_ic(ctx, closure, ic, site, shape_entry(shape, slot));
         }
         return false;
     }
@@ -385,7 +393,7 @@ fn set_own_fill_ic<'gc>(
     };
     drop(state);
     if cache {
-        fill_ic(ctx, closure, ic_idx, site, entry);
+        fill_ic(ctx, closure, ic, site, entry);
     }
     true
 }
@@ -505,13 +513,13 @@ handler! {
     /// The shared-cell upvalue read (`GETTABUP_REF`, never specialized):
     /// `R[a] = recv[K[e]]` through the IC, whatever its entry.
     op fn op_gettabup_ref {
-        let (dst, b, ic_idx, _) = insn.abde();
+        let (dst, b, ic, _) = insn.abde();
         let recv_val = receiver!(cell, b);
         let Some(t) = recv_val.get_table() else {
             tail!(get_slow)
         };
         let state = t.inner().borrow();
-        if let Some(v) = ic_get(read_ic(closure, ic_idx), t, &state) {
+        if let Some(v) = ic_get(read_ic(closure, ic), t, &state) {
             drop(state);
             reg![dst] = v;
             next!()
@@ -522,11 +530,11 @@ handler! {
 
     /// The shared-cell upvalue write (`SETTABUP_REF`, never specialized).
     op fn op_settabup_ref {
-        let (src, b, ic_idx, _) = insn.abde();
+        let (src, b, ic, _) = insn.abde();
         let Some(t) = receiver!(cell, b).get_table() else {
             tail!(set_slow)
         };
-        if ic_set(rt, read_ic(closure, ic_idx), t, reg![src]) {
+        if ic_set(rt, read_ic(closure, ic), t, reg![src]) {
             next!()
         }
         tail!(set_slow)

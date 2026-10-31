@@ -1,5 +1,5 @@
 //! Per-opcode emission (`jit-design.md` 7, Appendix D): each instruction's
-//! guards from its quickened form and feedback byte, its operation, and its
+//! guards from its quickened form and feedback bits, its operation, and its
 //! result writes. What milestone 1 does not compile is a deopt.
 
 use crate::env::MetamethodBits;
@@ -50,15 +50,15 @@ fn own_kind(b: &Builder<'_, '_>, v: Val) -> Option<NumKind> {
     }
 }
 
-/// The operand kinds a feedback byte gives both operands of its site, or
+/// The operand kinds a site's feedback bits give both its operands, or
 /// `None` when it saw values no number kind covers (non-numbers, a
 /// metamethod, big integers with floats): those take the slow arm.
-fn byte_num_kind(byte: u8) -> Option<NumKind> {
-    let kinds = byte & fb::KINDS;
-    if byte & fb::MM != 0 || kinds & (fb::STR | fb::TAB | fb::OTHER) != 0 {
+fn bits_num_kind(bits: fb::Bits) -> Option<NumKind> {
+    let kinds = bits & fb::KINDS;
+    if bits & fb::MM != 0 || kinds & (fb::STR | fb::TAB | fb::OTHER) != 0 {
         return None;
     }
-    let wide = byte & (fb::OVERFLOW | fb::BIGINT) != 0;
+    let wide = bits & (fb::OVERFLOW | fb::BIGINT) != 0;
     match (kinds & fb::INT != 0, kinds & fb::FLOAT != 0) {
         // Only what the inline paths cover: a site locked on numbers.
         (false, false) => Some(NumKind::Num),
@@ -149,7 +149,7 @@ fn loop_kind(b: &Builder<'_, '_>, pc: u32) -> Option<BcOp> {
 }
 
 /// The kinds recorded at the FORLOOP at `pc` and its FORPREP.
-fn loop_seen(b: &Builder<'_, '_>, pc: u32) -> u8 {
+fn loop_seen(b: &Builder<'_, '_>, pc: u32) -> fb::Bits {
     let prep = (pc as i64 + b.code(pc).branch_offset() as i64) as u32;
     (b.feedback(pc) | b.feedback(prep)) & fb::KINDS
 }
@@ -639,10 +639,10 @@ fn emit_arith(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
     } else {
         (Operand::Reg(b.reg(insn.b())), Operand::Reg(b.reg(insn.c())))
     };
-    let byte = b.feedback(pc);
+    let bits = b.feedback(pc);
     let (fl, fr) = form_kinds(b, pc).unwrap_or((None, None));
-    let (lk, rk) = (l.kind(b, fl, byte), r.kind(b, fr, byte));
-    let wide = byte & (fb::OVERFLOW | fb::BIGINT) != 0;
+    let (lk, rk) = (l.kind(b, fl, bits), r.kind(b, fr, bits));
+    let wide = bits & (fb::OVERFLOW | fb::BIGINT) != 0;
     if let (Some(lk), Some(rk)) = (lk, rk) {
         arith_kinds(b, kind, dst, (l, lk), (r, rk), wide, None);
         return;
@@ -771,10 +771,10 @@ enum Operand {
 
 impl Operand {
     /// The kind the hot path assumes: the value's own, else its form's,
-    /// else the site's feedback (`byte_num_kind`).
-    fn kind(self, b: &Builder<'_, '_>, form: Option<NumKind>, byte: u8) -> Option<NumKind> {
+    /// else the site's feedback (`bits_num_kind`).
+    fn kind(self, b: &Builder<'_, '_>, form: Option<NumKind>, bits: fb::Bits) -> Option<NumKind> {
         match self {
-            Operand::Reg(v) => own_kind(b, v).or(form).or_else(|| byte_num_kind(byte)),
+            Operand::Reg(v) => own_kind(b, v).or(form).or_else(|| bits_num_kind(bits)),
             Operand::Int(_) => Some(NumKind::I32),
             Operand::Float(_) => Some(NumKind::F64),
         }
@@ -858,9 +858,9 @@ impl Operand {
 
 fn emit_unm(b: &mut Builder<'_, '_>, pc: u32, dst: u8, src: u8) {
     let v = b.reg(src);
-    let byte = b.feedback(pc);
+    let bits = b.feedback(pc);
     // It negated `i32::MIN`.
-    let wide = byte & fb::OVERFLOW != 0;
+    let wide = bits & fb::OVERFLOW != 0;
     let neg_int = |b: &mut Builder<'_, '_>, x: Val| {
         if wide {
             let x = b.ins(Op::IToL, &[x]);
@@ -871,8 +871,8 @@ fn emit_unm(b: &mut Builder<'_, '_>, pc: u32, dst: u8, src: u8) {
         }
     };
     // The interpreter's fast path, which records nothing, takes small
-    // integers and floats: `byte_num_kind` makes an empty byte `Num`.
-    let r = match own_kind(b, v).or_else(|| byte_num_kind(byte)) {
+    // integers and floats: `bits_num_kind` makes empty bits `Num`.
+    let r = match own_kind(b, v).or_else(|| bits_num_kind(bits)) {
         Some(NumKind::F64) => {
             let x = b.as_f64(v);
             b.ins(Op::FNeg, &[x])
@@ -927,7 +927,7 @@ fn emit_unm(b: &mut Builder<'_, '_>, pc: u32, dst: u8, src: u8) {
 fn emit_bnot(b: &mut Builder<'_, '_>, pc: u32, dst: u8, src: u8) {
     let v = b.reg(src);
     // The fast path takes small integers only.
-    let r = match own_kind(b, v).or_else(|| byte_num_kind(b.feedback(pc))) {
+    let r = match own_kind(b, v).or_else(|| bits_num_kind(b.feedback(pc))) {
         Some(NumKind::I64) => {
             let x = b.as_i64(v);
             b.ins(Op::LNot, &[x])
@@ -1336,14 +1336,14 @@ fn cmp_own(b: &Builder<'_, '_>, v: Val) -> Option<CmpKind> {
     (t.rep == Rep::Val && !t.set.is_empty() && t.within(TypeSet::STR)).then_some(CmpKind::Str)
 }
 
-/// The kind a compare site's byte gives both operands: numbers as
-/// `byte_num_kind` has them (the fast paths record nothing, so an empty byte
+/// The kind a compare site's bits give both operands: numbers as
+/// `bits_num_kind` has them (the fast paths record nothing, so empty bits
 /// is small integers and floats), or strings only.
-fn byte_cmp_kind(byte: u8) -> Option<CmpKind> {
-    if byte & fb::KINDS == fb::STR && byte & fb::MM == 0 {
+fn bits_cmp_kind(bits: fb::Bits) -> Option<CmpKind> {
+    if bits & fb::KINDS == fb::STR && bits & fb::MM == 0 {
         Some(CmpKind::Str)
     } else {
-        byte_num_kind(byte).map(CmpKind::Num)
+        bits_num_kind(bits).map(CmpKind::Num)
     }
 }
 
@@ -1408,7 +1408,7 @@ fn emit_cmp_reg(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Bl
         _ => unreachable!(),
     };
     let eq = cc == Cc::Eq;
-    let byte = b.feedback(pc);
+    let bits = b.feedback(pc);
     let (tx, ty) = (b.ty(x), b.ty(y));
     if eq && !tx.set.is_empty() && !ty.set.is_empty() {
         // Values of disjoint types are never equal, but for an integer and
@@ -1432,14 +1432,14 @@ fn emit_cmp_reg(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Bl
             return;
         }
     }
-    // An `_II` form, which exits saw leave i32 when the byte has big integers.
+    // An `_II` form, which exits saw leave i32 when the bits have big integers.
     let form =
-        (op != generic && !b.kind_exited(pc)).then_some(CmpKind::Num(if byte & fb::BIGINT != 0 {
+        (op != generic && !b.kind_exited(pc)).then_some(CmpKind::Num(if bits & fb::BIGINT != 0 {
             NumKind::I64
         } else {
             NumKind::I32
         }));
-    let kind = |b: &Builder<'_, '_>, v| cmp_own(b, v).or(form).or_else(|| byte_cmp_kind(byte));
+    let kind = |b: &Builder<'_, '_>, v| cmp_own(b, v).or(form).or_else(|| bits_cmp_kind(bits));
     let c = match (kind(b, x), kind(b, y)) {
         (Some(CmpKind::Num(kx)), Some(CmpKind::Num(ky))) => cmp_num(b, cc, (x, kx), (y, ky)),
         (Some(CmpKind::Str), Some(CmpKind::Str)) if eq => {
@@ -1478,8 +1478,8 @@ fn targets(sense: bool, succs: &[Block]) -> (Block, Block) {
 fn generic_eq(b: &mut Builder<'_, '_>, x: Val, y: Val, sense: bool, succs: &[Block]) {
     let (yes, no) = targets(sense, succs);
     let (x, y) = (b.boxed(x), b.boxed(y));
-    let byte = b.feedback(b.pc);
-    let big = byte & fb::BIGINT != 0;
+    let bits = b.feedback(b.pc);
+    let big = bits & fb::BIGINT != 0;
     // [x float]
     let not_float = all_in(b, TypeSet::FLOAT, &[x]);
     let fx = b.ins(Op::Unbox(Rep::F64), &[x]);
@@ -1580,22 +1580,22 @@ fn eq_mm_arm(b: &mut Builder<'_, '_>, x: Val, y: Val, yes: Block, no: Block) {
 fn generic_cmp(b: &mut Builder<'_, '_>, cc: Cc, x: Val, y: Val, sense: bool, succs: &[Block]) {
     let (yes, no) = targets(sense, succs);
     let (x, y) = (b.boxed(x), b.boxed(y));
-    let byte = b.feedback(b.pc);
+    let bits = b.feedback(b.pc);
     let le = cc == Cc::Le;
-    if byte & (fb::SMALL | fb::FLOAT) != 0 || byte & fb::KINDS == 0 {
+    if bits & (fb::SMALL | fb::FLOAT) != 0 || bits & fb::KINDS == 0 {
         let other = all_in(b, TypeSet::SMALL | TypeSet::FLOAT, &[x, y]);
         let (fx, fy) = (cmp_f64(b, x, NumKind::Num), cmp_f64(b, y, NumKind::Num));
         let c = b.ins(Op::FCmp(cc), &[fx, fy]);
         b.br(c, yes, no);
         enter_join(b, other);
     }
-    if byte & fb::STR != 0 {
+    if bits & fb::STR != 0 {
         let other = all_in(b, TypeSet::STR, &[x, y]);
         let c = cmp_str(b, le, x, y);
         b.br(c, yes, no);
         enter_join(b, other);
     }
-    if byte & fb::BIGINT != 0 {
+    if bits & fb::BIGINT != 0 {
         let other = all_in(b, TypeSet::INT, &[x, y]);
         let c = cmp_num(b, cc, (x, NumKind::I64), (y, NumKind::I64));
         b.br(c, yes, no);
@@ -1637,11 +1637,11 @@ fn emit_cmp_imm(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Bl
     };
     // `k <cc> v` is `v <swapped cc> k`.
     let cc = if swap { cc.swap() } else { cc };
-    let byte = b.feedback(pc);
-    // The fast path takes big integers too, unrecorded: an empty byte is any
+    let bits = b.feedback(pc);
+    // The fast path takes big integers too, unrecorded: empty bits are any
     // number, which the `Num` path's conversion exits on when big.
     let form = (op != generic && !b.kind_exited(pc)).then_some(NumKind::F64);
-    let kind = own_kind(b, v).or(form).or_else(|| byte_num_kind(byte));
+    let kind = own_kind(b, v).or(form).or_else(|| bits_num_kind(bits));
     let imm = |b: &mut Builder<'_, '_>, kind: NumKind| match kind {
         NumKind::I32 => b.ki32(k as i32),
         NumKind::I64 => b.ins(Op::KI64(k), &[]),
@@ -1671,7 +1671,7 @@ fn emit_cmp_imm(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Bl
             let c = b.ins(Op::FCmp(cc), &[fx, kk]);
             b.br(c, yes, no);
             enter_join(b, other);
-            if byte & fb::BIGINT != 0 {
+            if bits & fb::BIGINT != 0 {
                 let other = all_in(b, TypeSet::BIGINT, &[x]);
                 let ix = b.ins(Op::Unbox(Rep::I64), &[x]);
                 let kk = imm(b, NumKind::I64);

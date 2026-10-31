@@ -181,7 +181,7 @@ impl Lua {
     }
 
     /// Run the current cycle, or a new one if the collector sleeps: mark to
-    /// completion, settle weak tables and the interner, and sweep, with no
+    /// completion, settle weak tables, feedback and the interner, and sweep, with no
     /// mutation in between: an object allocated and dropped there would be
     /// freed while still held by them.
     fn finalize_and_sweep(&mut self) {
@@ -190,6 +190,7 @@ impl Lua {
         while self.marked().finalize(|fc, _| Table::converge_weak(fc)) {}
         self.marked().finalize(|fc, root| {
             Table::clear_weak(fc);
+            crate::env::Prototype::clear_dead_feedback(fc);
             fc.clear_deferred();
             root.interner.prune(fc);
         });
