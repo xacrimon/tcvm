@@ -339,9 +339,9 @@ fn lua_move<'gc>(
 
 /// `move` of `n` elements when an access may run metamethods or the copy
 /// direction needs `eq_mm` (`forward` is `None`).
+#[allow(clippy::too_many_arguments)]
 #[cold]
 #[inline(never)]
-#[allow(clippy::too_many_arguments)]
 fn move_meta<'gc>(
     ctx: Context<'gc>,
     stack: &mut Stack<'gc, '_>,
