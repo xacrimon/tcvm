@@ -70,13 +70,21 @@ handler! {
     slow fn jit_hot {
         let word = insn.as_insn();
         let jit = rt.jit();
+        // A function's own invocation count trips it (`call_mask`).
+        let func = word.op() == Op::FUNC;
         let counter = &jit.hot[word.hot_counter()];
         if !jit.config.enabled || jit.exhausted.get() {
+            if func {
+                jit.call_mask.set(u64::MAX);
+                next!()
+            }
             counter.set(u16::MAX);
             let h = rt.handler(word.opcode());
             tail!(h, insn = Slot::insn(word))
         }
-        counter.set(jit.hot_start(word));
+        if !func {
+            counter.set(jit.hot_start(word));
+        }
         let closure: LuaFn<'gc> = unsafe { frame::closure(base) };
         let site = unsafe { pc.sub(1).offset_from_unsigned(closure.code) } as u32;
         if let Some(at) = entry_site(closure, site, word) {
@@ -87,6 +95,10 @@ handler! {
                 let pc = unsafe { closure.code.add(at as usize + 1) };
                 tail!(h, pc = pc, insn = Slot::insn(jw), closure = Slot::closure(closure))
             }
+        }
+        // A FUNC has counted this invocation: go on past it.
+        if func {
+            next!()
         }
         // The instruction counts again when it runs: not to trip at once.
         counter.set(jit.hot_start(word).saturating_add(1));

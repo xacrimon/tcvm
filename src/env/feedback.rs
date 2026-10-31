@@ -25,7 +25,7 @@ pub(crate) enum SlotKind {
     Null,
     /// Constant-key access: the inline cache (4 words), the site word.
     Field,
-    /// The callee word, the site word.
+    /// The callee word, the call count, the site word.
     Call,
     /// GETTABLE, SETTABLE.
     Table,
@@ -44,7 +44,7 @@ impl SlotKind {
         match self {
             SlotKind::Null => NULL_WORDS,
             SlotKind::Field => 5,
-            SlotKind::Call => 2,
+            SlotKind::Call => 3,
             _ => 1,
         }
     }
@@ -53,7 +53,7 @@ impl SlotKind {
     const fn site(self) -> usize {
         match self {
             SlotKind::Field => 4,
-            SlotKind::Call => 1,
+            SlotKind::Call => 2,
             _ => 0,
         }
     }
@@ -98,9 +98,11 @@ impl SlotKind {
 pub(crate) const NO_SLOT: u16 = u16::MAX;
 /// Words a vector may hold: a slot index is a `u16` short of `NO_SLOT`.
 const MAX_WORDS: usize = NO_SLOT as usize;
-/// The null slot: a field slot, then the callee word.
-const NULL_WORDS: usize = 6;
+/// The null slot: a field slot, then a callee word and its count.
+const NULL_WORDS: usize = 7;
 const NULL_CALL: u16 = 5;
+/// Header words, before slot 0 (`as_ptr`): the invocation count at -1.
+const HEAD: usize = 1;
 
 /// A site word: bit 0 set, inline bits above it; clear, a [`ShapeRecord`].
 const INLINE: u64 = 1;
@@ -136,6 +138,7 @@ const RECORD_SHAPES: usize = crate::jit::MAX_SHAPES + 1;
 /// See the module doc. The words and their layout are fixed when the
 /// prototype is made; `kinds` and `slot_of_pc` never change.
 pub struct FeedbackVector<'gc> {
+    /// The header, then the slots.
     words: Box<[Cell<u64>]>,
     kinds: Box<[SlotKind]>,
     /// Per instruction, its slot's first word, or `NO_SLOT`. Field and call
@@ -186,7 +189,7 @@ impl<'gc> FeedbackVector<'gc> {
             }
         }
         let v = FeedbackVector {
-            words: (0..kinds.len()).map(|_| Cell::new(0)).collect(),
+            words: (0..HEAD + kinds.len()).map(|_| Cell::new(0)).collect(),
             refs: kinds
                 .iter()
                 .any(|k| matches!(k, SlotKind::Field | SlotKind::Call)),
@@ -200,27 +203,36 @@ impl<'gc> FeedbackVector<'gc> {
             match k {
                 SlotKind::Null => {
                     v.cache(w).set(InlineCache::Empty);
-                    v.words[w + NULL_CALL as usize].set(MEGAMORPHIC);
+                    v.word(w + NULL_CALL as usize).set(MEGAMORPHIC);
                 }
                 SlotKind::Field => v.cache(w).set(InlineCache::Empty),
                 _ => {}
             }
             if k != SlotKind::Null {
-                v.words[w + k.site()].set(INLINE);
+                v.word(w + k.site()).set(INLINE);
             }
             w += k.words();
         }
         v
     }
 
-    /// The first word, which closures cache.
+    /// Slot 0's word, which closures cache; the header is below it. The
+    /// interpreter counts calls in the word after a callee word, and
+    /// invocations (`FUNC`) in the word before slot 0.
     #[inline(always)]
     pub(crate) fn as_ptr(&self) -> *const Cell<u64> {
-        self.words.as_ptr()
+        // SAFETY: the header is `HEAD` words.
+        unsafe { self.words.as_ptr().add(HEAD) }
     }
 
+    /// Slot words.
     pub(crate) fn len(&self) -> usize {
-        self.words.len()
+        self.words.len() - HEAD
+    }
+
+    #[inline(always)]
+    fn word(&self, w: usize) -> &Cell<u64> {
+        &self.words[HEAD + w]
     }
 
     /// The slot of the instruction at `pc`, with its kind.
@@ -236,7 +248,7 @@ impl<'gc> FeedbackVector<'gc> {
         debug_assert!(matches!(self.kinds[w], SlotKind::Field | SlotKind::Null));
         // SAFETY: a field slot starts with an entry's four words, which `new`
         // initialized as one; the assert above keeps its alignment within 8.
-        unsafe { &*self.words.as_ptr().add(w).cast::<Cell<InlineCache<'gc>>>() }
+        unsafe { &*self.as_ptr().add(w).cast::<Cell<InlineCache<'gc>>>() }
     }
 
     /// Whether word `w` starts a field slot the interpreter may fill (not the
@@ -250,7 +262,7 @@ impl<'gc> FeedbackVector<'gc> {
     #[inline]
     pub(crate) fn callee(&self, pc: usize) -> Option<&Cell<u64>> {
         match self.slot(pc)? {
-            (w, SlotKind::Call) => Some(&self.words[w]),
+            (w, SlotKind::Call) => Some(self.word(w)),
             _ => None,
         }
     }
@@ -258,12 +270,12 @@ impl<'gc> FeedbackVector<'gc> {
     /// The callee word at word `w` (a call's `d`, the null slot's included).
     #[inline(always)]
     pub(crate) fn callee_at(&self, w: usize) -> &Cell<u64> {
-        &self.words[w]
+        self.word(w)
     }
 
     fn site(&self, pc: usize) -> Option<&Cell<u64>> {
         let (w, k) = self.slot(pc)?;
-        Some(&self.words[w + k.site()])
+        Some(self.word(w + k.site()))
     }
 
     fn record(&self, w: u64) -> Option<&ShapeRecord<'gc>> {
@@ -315,7 +327,7 @@ impl<'gc> FeedbackVector<'gc> {
         let Some((w, SlotKind::Field)) = self.slot(pc) else {
             return;
         };
-        let s = &self.words[w + SlotKind::Field.site()];
+        let s = self.word(w + SlotKind::Field.site());
         let r = match self.record(s.get()) {
             Some(r) => r,
             None => {
@@ -373,13 +385,13 @@ impl<'gc> FeedbackVector<'gc> {
                         self.cache(w).set(InlineCache::Empty);
                         code.unquicken(pc);
                     }
-                    let site = self.words[w + SlotKind::Field.site()].get();
+                    let site = self.word(w + SlotKind::Field.site()).get();
                     if let Some(r) = self.record(site) {
                         r.retain(|s| !dead(s));
                     }
                 }
                 SlotKind::Call => {
-                    let c = &self.words[w];
+                    let c = self.word(w);
                     let v = c.get();
                     let gone = if v == 0 || v == MEGAMORPHIC {
                         false
@@ -432,7 +444,7 @@ impl Drop for FeedbackVector<'_> {
     fn drop(&mut self) {
         for (w, k) in self.kinds.iter().enumerate() {
             if *k == SlotKind::Field
-                && let s = self.words[w + SlotKind::Field.site()].get()
+                && let s = self.word(w + SlotKind::Field.site()).get()
                 && s & INLINE == 0
             {
                 // SAFETY: made by `add_shape` with `Box::into_raw`, owned here.

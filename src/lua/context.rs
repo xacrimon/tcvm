@@ -99,6 +99,12 @@ impl<'gc> Context<'gc> {
         unsafe { self.state.jit.hot.get_unchecked(i) }
     }
 
+    /// `JitRuntime::call_mask`.
+    #[inline(always)]
+    pub(crate) fn call_mask(self) -> u64 {
+        self.state.jit.call_mask.get()
+    }
+
     /// What entry-table slot `d` tails into.
     #[inline(always)]
     pub(crate) fn jit_entry(self, d: u16) -> Handler {

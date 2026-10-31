@@ -85,7 +85,10 @@ impl JitConfig {
         JitConfig {
             enabled: var("TCVM_JIT").is_none_or(|v| v != "off" && v != "0")
                 && cfg!(target_arch = "aarch64"),
-            hot_call: num("TCVM_JIT_HOT_CALL"),
+            // A power of two: `FUNC` tests the invocation count's low bits.
+            hot_call: num("TCVM_JIT_HOT_CALL")
+                .checked_next_power_of_two()
+                .unwrap_or(1 << 15),
             hot_loop: num("TCVM_JIT_HOT_LOOP"),
             log: flag("TCVM_JIT_LOG"),
             dump,
@@ -102,9 +105,13 @@ impl JitConfig {
 /// The JIT's part of `State`. Compiled code reaches its fields through the
 /// `layout` offsets off the `rt` register.
 pub(crate) struct JitRuntime {
-    /// Counters `FUNC`, `LOOP` and the `FORLOOP` forms decrement; zero
-    /// tails `jit_hot`.
+    /// Counters `LOOP` and the `FORLOOP` forms decrement; zero tails
+    /// `jit_hot`.
     pub(crate) hot: [Cell<u16>; HOT_COUNTERS],
+    /// `FUNC` tails `jit_hot` when a function's invocation count has these
+    /// bits clear: every `hot_call` (a power of two) invocations; all ones
+    /// while the JIT is off.
+    pub(crate) call_mask: Cell<u64>,
     /// Base of the entry table: slot `d` holds what `JIT_ENTRY d` and
     /// `JIT_LOOP d` tail into. Republished when the table grows.
     pub(crate) entries: Cell<*const Cell<*const u8>>,
@@ -145,6 +152,7 @@ impl JitRuntime {
         let exit_regs = exit_regs_buf.as_ptr() as *mut u64;
         let rt = JitRuntime {
             hot: std::array::from_fn(|_| Cell::new(start)),
+            call_mask: Cell::new(config.hot_call as u64 - 1),
             entries: Cell::new(std::ptr::null()),
             table: RefCell::new(EntryTable::default()),
             exit_regs,

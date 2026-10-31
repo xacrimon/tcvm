@@ -6,7 +6,6 @@ use crate::env::value::Value;
 use crate::instruction::{Instruction, Op};
 use crate::vm::abi::{Exit, Slot, handler, handler_bits};
 use crate::vm::frame::{self, HDR, copy_values, fill_nil, flag, land_results, lua_func_word};
-use crate::vm::ops::count_hot;
 use crate::vm::ops::meta::resolve_call_chain;
 use crate::vm::unwind::OpError;
 
@@ -98,17 +97,37 @@ fn call_nargs(ts: &ThreadState<'_>, b: u8, nb: usize) -> usize {
 /// its `FUNC`'s counter and continue at pc 1, sparing `FUNC`'s dispatch, or
 /// run the `JIT_ENTRY` written over it.
 macro_rules! start {
-    ($pc:ident, $rt:ident, $code:expr) => {{
-        let code: *const Instruction = $code;
+    ($pc:ident, $rt:ident, $callee:expr) => {{
+        let callee: LuaFn<'gc> = $callee;
+        let code: *const Instruction = callee.code;
         let w = unsafe { *code };
         $pc = code;
         if w.op() == Op::FUNC {
             $pc = unsafe { code.add(1) };
-            count_hot!($rt, w, a);
+            count_invocation!($rt, callee, w);
         }
         next!()
     }};
 }
+
+/// Count an interpreted invocation of the closure `$f`, whose `FUNC` is
+/// `$word`, in its feedback vector's header; every `hot_call` of them its
+/// entry may compile (`jit_hot`), with `pc` past the `FUNC`.
+macro_rules! count_invocation {
+    ($rt:ident, $f:expr, $word:expr) => {{
+        // SAFETY: the word before slot 0 is the invocation count.
+        let n = unsafe { &*$f.feedback.sub(1) };
+        let c = n.get().wrapping_add(1);
+        n.set(c);
+        if std::hint::unlikely(c & $rt.call_mask() == 0) {
+            tail!(
+                crate::jit::jit_hot,
+                insn = $crate::vm::abi::Slot::insn($word)
+            )
+        }
+    }};
+}
+pub(crate) use count_invocation;
 
 /// The Lua arm of CALL, shared by the CALL forms; `$fv` is the callee
 /// (`R[a]`, or the source register of a CALLS, which has just stored it
@@ -118,7 +137,9 @@ macro_rules! start {
 /// handler that called out to record it would push a frame on every call.
 macro_rules! note_callee {
     ($closure:ident, $insn:expr, $fv:expr) => {{
-        let seen = unsafe { (*$closure.feedback.add($insn.d() as usize)).get() };
+        let slot = unsafe { $closure.feedback.add($insn.d() as usize) };
+        // Both words in one load pair.
+        let (seen, count) = unsafe { ((*slot).get(), (*slot.add(1)).get()) };
         if std::hint::unlikely(seen != $fv.to_raw()) {
             // Bit 0 marks a word that stays (`MEGAMORPHIC`, a `proto_slot`):
             // a function value's payload is aligned.
@@ -126,6 +147,8 @@ macro_rules! note_callee {
                 tail!(call_note)
             }
         }
+        // After the check: a recording call runs again and counts once.
+        unsafe { (*slot.add(1)).set(count.wrapping_add(1)) };
     }};
 }
 
@@ -165,7 +188,7 @@ macro_rules! call_body {
                 };
                 $closure = callee;
                 $base = nb;
-                start!($pc, $rt, callee.code)
+                start!($pc, $rt, callee)
             }
         }
     }};
@@ -277,7 +300,7 @@ handler! {
         unsafe { frame::write_hdr(hdr, lua_func_word(callee, nv), handler_bits(rt.ret(c)), base, pc) };
         set_closure!(callee);
         base = unsafe { hdr.add(HDR) };
-        start!(pc, rt, callee.code)
+        start!(pc, rt, callee)
     }
 
     /// CALL of a value that is not a function: resolve its `__call` chain
@@ -336,7 +359,7 @@ handler! {
                 unsafe { hdr.cast::<u64>().write(lua_func_word(callee, 0)) };
                 set_closure!(callee);
                 base = nb;
-                start!(pc, rt, callee.code)
+                start!(pc, rt, callee)
             }
         }
     }
@@ -370,7 +393,7 @@ handler! {
         unsafe { hdr.cast::<u64>().write(lua_func_word(callee, nv)) };
         set_closure!(callee);
         base = unsafe { hdr.add(HDR) };
-        start!(pc, rt, callee.code)
+        start!(pc, rt, callee)
     }
 
     /// `enter` of a value that is not a function.
@@ -421,7 +444,7 @@ handler! {
                         frame::set_func_word(base, w | callee.as_ptr() as usize as u64);
                     }
                     closure = callee;
-                    start!(pc, rt, callee.code)
+                    start!(pc, rt, callee)
                 }
                 tail!(tailcall_slow)
             }
@@ -486,7 +509,7 @@ handler! {
         };
         set_closure!(callee);
         base = unsafe { hdr.add(HDR) };
-        start!(pc, rt, callee.code)
+        start!(pc, rt, callee)
     }
 
     /// `return R[a], ... R[a+b-2]` (`b` 0: up to `top`). Nothing to close on
