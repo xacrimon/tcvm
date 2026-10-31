@@ -423,6 +423,9 @@ impl<'gc> FeedbackVector<'gc> {
         let Some((w, SlotKind::Field)) = self.slot(pc) else {
             return;
         };
+        if shape.is_deprecated() {
+            return;
+        }
         let s = self.word(w);
         let r = match self.record(s.get()) {
             Some(r) => r,

@@ -365,3 +365,70 @@ fn shape_guards_carry_through_joins() {
     let count = |s: &str| ir.lines().filter(|l| l.contains(s)).count();
     assert_eq!(count("guardshape"), 2, "{ir}");
 }
+
+/// Tables of per-object metatables of one content share one layout: the
+/// owner's mono shape is deprecated once a second member joins, new tables
+/// of the owner go poly, and an old one moves at its next field slow path.
+#[test]
+fn second_member_deprecates_mono_shapes() {
+    let src = "V = {}
+    V.__index = V
+    a = setmetatable({x = 1}, {__index = V})
+    a_before = a
+    b = setmetatable({x = 2}, {__index = V})
+    c = setmetatable({x = 3}, getmetatable(a))
+    local s = a.x + b.x + c.x
+    W = {}
+    W.__index = W
+    local function new(x, y)
+        local o = setmetatable({}, {__index = W})
+        o.x = x
+        o.y = y
+        return o
+    end
+    p = new(1, 2)
+    p_mt = getmetatable(p)
+    q = new(3, 4)
+    sum = p.x + q.x + p.y + q.y
+    same_mt = getmetatable(p) == p_mt";
+    let mut lua = Lua::new();
+    lua.set_jit(false);
+    lua.load_all();
+    let ex = lua
+        .try_enter(|ctx| -> Result<_, LoadError> {
+            let chunk = ctx.load(src, Some("=t"))?;
+            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+        })
+        .expect("load");
+    lua.finish(&ex).expect("run");
+    lua.enter(|ctx| {
+        let g = |n: &str| {
+            ctx.globals()
+                .raw_get(Value::string(LuaString::new(ctx, n.as_bytes())))
+                .get_table()
+                .expect("a table")
+        };
+        let (a, b, c) = (g("a"), g("b"), g("c"));
+        for (n, t) in [("a", a), ("b", b), ("c", c)] {
+            let s = t.shape();
+            assert!(
+                s.is_poly() && !s.is_deprecated(),
+                "{n}: poly {} deprecated {} class {:?}",
+                s.is_poly(),
+                s.is_deprecated(),
+                s.mt_cache().map(|c| c.is_shared())
+            );
+        }
+        assert!(crate::env::Shape::ptr_eq(a.shape(), b.shape()));
+        assert!(crate::env::Shape::ptr_eq(c.shape(), b.shape()));
+        // Fields set after `setmetatable`: the old table's slots move.
+        let (p, q) = (g("p"), g("q"));
+        assert!(crate::env::Shape::ptr_eq(p.shape(), q.shape()));
+        let v = |n: &str| {
+            ctx.globals()
+                .raw_get(Value::string(LuaString::new(ctx, n.as_bytes())))
+        };
+        assert_eq!(v("sum").get_integer(), Some(10));
+        assert_eq!(v("same_mt").get_boolean(), Some(true));
+    });
+}

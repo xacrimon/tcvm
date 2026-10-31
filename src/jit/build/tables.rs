@@ -208,7 +208,7 @@ pub(super) fn emit_get<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
     if string_method(b, dst, &site) {
         return;
     }
-    let ic = read_ic(b.closure, ic);
+    let ic = current_entry(b, read_ic(b.closure, ic), kv);
     let first = match ic {
         InlineCache::Own { shape, .. } | InlineCache::Absent { shape } => Some(shape),
         InlineCache::ProtoLoad { recv, .. } => Some(recv),
@@ -326,6 +326,65 @@ fn string_method<'gc>(b: &mut Builder<'_, 'gc>, dst: u8, site: &Site<'gc>) -> bo
     true
 }
 
+/// The interpreter's entry as for tables that left a deprecated shape:
+/// they move to its poly twin on their next slow path, the twin's slots
+/// being the deprecated shape's and the metatable's.
+fn current_entry<'gc>(
+    b: &mut Builder<'_, 'gc>,
+    ic: InlineCache<'gc>,
+    kv: Value<'gc>,
+) -> InlineCache<'gc> {
+    let ctx = b.ctx;
+    let twin = |s: Shape<'gc>| {
+        s.poly_twin(
+            ctx.mutation(),
+            ctx.symbols().mt_key,
+            ctx.empty_dict_sentinel(),
+        )
+    };
+    let Some(key) = kv.get_string() else {
+        return ic;
+    };
+    match ic {
+        InlineCache::Own { shape, .. } if shape.is_deprecated() => {
+            let p = twin(shape);
+            match (!p.is_dict()).then(|| p.find_slot(key)).flatten() {
+                Some(slot) => InlineCache::Own {
+                    shape: p,
+                    loc: SlotLoc::new(p, slot),
+                },
+                None => InlineCache::Empty,
+            }
+        }
+        InlineCache::Absent { shape } if shape.is_deprecated() => {
+            InlineCache::Absent { shape: twin(shape) }
+        }
+        InlineCache::ProtoLoad {
+            recv,
+            holder,
+            holder_shape,
+            loc,
+        } if recv.is_deprecated() => InlineCache::ProtoLoad {
+            recv: twin(recv),
+            holder,
+            holder_shape,
+            loc,
+        },
+        InlineCache::Transition { from, .. } if from.is_deprecated() => {
+            let p = twin(from);
+            match p.prop_child(ctx.mutation(), key) {
+                Some(to) if !p.is_dict() && !to.is_dict() => InlineCache::Transition {
+                    from: p,
+                    to,
+                    loc: SlotLoc::new(to, p.slot_count()),
+                },
+                _ => InlineCache::Empty,
+            }
+        }
+        ic => ic,
+    }
+}
+
 /// A constant-key site's receiver and key.
 struct Site<'gc> {
     recv: Val,
@@ -345,13 +404,15 @@ fn site_shapes<'gc>(
 ) -> Option<Vec<Shape<'gc>>> {
     const MAX: usize = crate::jit::MAX_SHAPES;
     let has = |v: &[Shape<'gc>], s| v.iter().any(|&x| Shape::ptr_eq(x, s));
+    // A deprecated shape's tables move to the poly one at their next exit.
+    let first = first.filter(|s| !s.is_deprecated());
     let mut v: Vec<Shape<'gc>> = first.into_iter().collect();
     let vector = &b.proto.feedback;
     let pc = b.pc as usize;
     let mut seen = 0;
     for s in vector.shapes(pc) {
         seen += 1;
-        if !has(&v, s) {
+        if !has(&v, s) && !s.is_deprecated() {
             v.push(s);
         }
     }
@@ -369,7 +430,7 @@ fn site_shapes<'gc>(
     }
     let known = b.recv_shapes.entry(b.root_of(recv)).or_default();
     for &s in known.iter() {
-        if v.len() < MAX && !has(&v, s) {
+        if v.len() < MAX && !has(&v, s) && !s.is_deprecated() {
             v.push(s);
         }
     }
@@ -496,7 +557,7 @@ pub(super) fn emit_set<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
     let kv = b.closure.proto.constants[e as usize];
     let key = b.konst(kv);
     let kid = b.f.intern(kv);
-    let ic = read_ic(b.closure, ic);
+    let ic = current_entry(b, read_ic(b.closure, ic), kv);
     let first = match ic {
         InlineCache::Own { shape, .. } | InlineCache::Absent { shape } => Some(shape),
         InlineCache::ProtoLoad { recv, .. } => Some(recv),

@@ -226,7 +226,7 @@ fn get_fill_ic<'gc>(
     t: Table<'gc>,
     k: Value<'gc>,
 ) -> Result<Value<'gc>, Value<'gc>> {
-    leave_stale_class(ctx, t);
+    leave_old_shape(ctx, t);
     let state = t.inner().borrow();
     let shape = state.shape();
     if shape.is_dict() {
@@ -261,12 +261,13 @@ fn get_fill_ic<'gc>(
     get_index_fill_ic(ctx, closure, ic, site, t, index, recv, k)
 }
 
-/// Move `t` off a stale metatable class before a fill reads the class or
-/// caches its shape (see [`Table::meta`]).
+/// Move `t` off a stale metatable class or a deprecated shape before a fill
+/// reads the class or caches its shape (see [`Table::meta`]).
 #[inline(always)]
-fn leave_stale_class<'gc>(ctx: Context<'gc>, t: Table<'gc>) {
-    if let Some(c) = t.shape().mt_cache()
-        && c.is_stale()
+fn leave_old_shape<'gc>(ctx: Context<'gc>, t: Table<'gc>) {
+    let shape = t.shape();
+    if let Some(c) = shape.mt_cache()
+        && (c.is_stale() || shape.is_deprecated())
     {
         t.refresh_meta(ctx);
     }
@@ -337,7 +338,7 @@ fn set_own_fill_ic<'gc>(
     k: Value<'gc>,
     v: Value<'gc>,
 ) -> bool {
-    leave_stale_class(ctx, t);
+    leave_old_shape(ctx, t);
     let state = t.inner().borrow();
     let shape = state.shape();
     let newindex = shape.has_mm(MetamethodBits::NEWINDEX);

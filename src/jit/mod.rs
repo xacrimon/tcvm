@@ -738,6 +738,11 @@ fn record_shape<'gc>(ctx: Context<'gc>, closure: LuaFn<'gc>, base: *mut Value<'g
     let Some(t) = recv.get_table() else {
         return;
     };
+    // A table on a deprecated shape moves now: the interpreter's entry may
+    // still hold that shape, and the next compile guards the poly one.
+    if t.shape().is_deprecated() {
+        t.refresh_meta(ctx);
+    }
     closure.proto.feedback.add_shape(pc as usize, t.shape());
     ctx.mutation()
         .backward_barrier(Gc::erase(closure.proto), None);

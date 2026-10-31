@@ -288,7 +288,11 @@ impl<'gc> Table<'gc> {
         let class = mt.map(|t| t.ensure_mt_cache(ctx));
         let mut state = self.0.borrow_mut(ctx.mutation());
         let from = state.shape;
-        let poly = from.is_poly() || class.zip(mt).is_some_and(|(c, mt)| !c.owned_by(mt));
+        // Only the owner's tables of a class nothing else joined are mono.
+        let poly = from.is_poly()
+            || class
+                .zip(mt)
+                .is_some_and(|(c, mt)| !c.owned_by(mt) || c.is_shared());
         let shape = shape::transition_set_metatable(
             ctx.mutation(),
             from,
@@ -340,7 +344,7 @@ impl<'gc> Table<'gc> {
             return None;
         }
         match to.mt_home() {
-            MtHome::Class if class.owned_by(mt) => {
+            MtHome::Class if class.owned_by(mt) && !class.is_shared() => {
                 state.shape = to;
                 Some(false)
             }
@@ -376,10 +380,24 @@ impl<'gc> Table<'gc> {
         self.refresh_meta(ctx)
     }
 
-    /// Move this table off a stale class, to its metatable's current one.
+    /// Move this table off a stale class or a deprecated shape, to its
+    /// metatable's current class and shape.
     #[cold]
     #[inline(never)]
     pub(crate) fn refresh_meta(self, ctx: Context<'gc>) -> Option<shape::MtCache<'gc>> {
+        let shape = self.shape();
+        if shape.is_deprecated()
+            && !shape.is_dict()
+            && let Some(mt) = self.metatable()
+            && shape.mt_cache().is_some_and(|c| !c.is_stale())
+        {
+            let symbols = ctx.symbols();
+            let to = shape.poly_twin(ctx.mutation(), symbols.mt_key, ctx.empty_dict_sentinel());
+            self.0
+                .borrow_mut(ctx.mutation())
+                .relayout(ctx.mutation(), to, mt, symbols.mt_key);
+            return to.mt_cache();
+        }
         self.set_metatable(ctx, self.metatable());
         self.shape().mt_cache()
     }
@@ -1149,6 +1167,36 @@ impl<'gc> TableState<'gc> {
     /// Move the spilled slots to a cell with room for more; the old one is
     /// left for the sweep.
     #[cold]
+    /// Move to `to`, a shape of this one's keys and the metatable's slot
+    /// (a deprecated shape's poly twin): each value to its slot there.
+    fn relayout(
+        &mut self,
+        mc: &Mutation<'gc>,
+        to: Shape<'gc>,
+        mt: Table<'gc>,
+        mt_key: LuaString<'gc>,
+    ) {
+        let from = self.shape;
+        let vals: Vec<Value<'gc>> = to
+            .keys()
+            .iter()
+            .map(|&k| match from.find_slot(k) {
+                _ if k == mt_key => Value::table(mt),
+                Some(s) => self.named_get(s),
+                None => Value::nil(),
+            })
+            .collect();
+        if let Some(last) = to.slot_count().checked_sub(1) {
+            while !self.has_room(SlotLoc::new(to, last)) {
+                self.grow_spill(mc);
+            }
+        }
+        self.shape = to;
+        for (i, v) in vals.into_iter().enumerate() {
+            self.named_set(i as u32, v);
+        }
+    }
+
     fn grow_spill(&mut self, mc: &Mutation<'gc>) {
         let old = self.named().1;
         let cap = (old.len() * 2).max(4);

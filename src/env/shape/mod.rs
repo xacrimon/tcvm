@@ -719,6 +719,14 @@ impl<'gc> MtCache<'gc> {
         self.0.members.set(self.0.members.get().saturating_add(1));
     }
 
+    /// Whether another metatable than the owner joined: from then on the
+    /// class's tables keep their metatable in a slot (its mono shapes are
+    /// deprecated, see [`Shape::is_deprecated`]).
+    #[inline]
+    pub fn is_shared(self) -> bool {
+        self.0.members.get() > 1
+    }
+
     /// Retire this class, a member's metamethods having left it: every guard
     /// reading it fails (all bits, no `__index` or `__newindex`, no others),
     /// so a table of it reaches a slow path, which moves the table to its
@@ -1035,6 +1043,71 @@ impl<'gc> Shape<'gc> {
             MT_IN_AUX => MtHome::Aux,
             slot => MtHome::Slot(slot),
         }
+    }
+
+    /// A mono shape whose class another metatable joined: its tables move to
+    /// the class's poly shape on their next slow path (V8's deprecated maps),
+    /// so one site sees one layout for all members' tables. Nothing caches
+    /// or compiles against it.
+    #[inline]
+    pub fn is_deprecated(self) -> bool {
+        self.data().mt_slot == MT_IN_CLASS && self.mt_cache().is_some_and(|c| c.is_shared())
+    }
+
+    /// The shape a table of this deprecated one moves to: the shape a table
+    /// made the same way gets now that the class is shared, so old and new
+    /// tables meet in one. The metatable transition is taken poly from where
+    /// it was taken and the keys added since are added again (V8's
+    /// `Map::TryUpdate`); the metatable's slot may come before keys, so a
+    /// table moving there is laid out again ([`TableState::relayout`]).
+    pub fn poly_twin(
+        self,
+        mc: &Mutation<'gc>,
+        mt_key: LuaString<'gc>,
+        no_mt_dict_sentinel: Shape<'gc>,
+    ) -> Shape<'gc> {
+        debug_assert!(self.is_deprecated());
+        let class = self.mt_cache();
+        let simple =
+            || transition_set_metatable(mc, self, class, true, mt_key, no_mt_dict_sentinel);
+        if self.is_dict() {
+            return simple();
+        }
+        // The keys added after the metatable transition, newest first.
+        let mut keys = Vec::new();
+        let mut s = self;
+        let base = loop {
+            let d = s.data();
+            let Some(parent) = d.parent else {
+                return simple();
+            };
+            match d.last_key {
+                Some(k) if !d.adopt_edge => {
+                    keys.push(k);
+                    s = parent;
+                }
+                None if !d.adopt_edge && parent.mt_slot_raw() != MT_IN_CLASS
+                    || parent
+                        .mt_cache()
+                        .is_none_or(|c| !MtCache::ptr_eq(c, class.unwrap())) =>
+                {
+                    break parent;
+                }
+                _ => return simple(),
+            }
+        };
+        let mut t = transition_set_metatable(mc, base, class, true, mt_key, no_mt_dict_sentinel);
+        for &k in keys.iter().rev() {
+            if t.is_dict() {
+                return simple();
+            }
+            t = transition_add_prop(mc, t, k);
+        }
+        t
+    }
+
+    fn mt_slot_raw(self) -> u32 {
+        self.data().mt_slot
     }
 
     /// Whether a table of this shape keeps its metatable itself.
