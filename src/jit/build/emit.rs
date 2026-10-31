@@ -1315,8 +1315,8 @@ pub(super) fn cold<R>(b: &mut Builder<'_, '_>, arm: impl FnOnce(&mut Builder<'_,
 /// Continue after the arms, where `dst` is their join.
 pub(super) fn enter_join(b: &mut Builder<'_, '_>, join: Block) {
     b.seal(join);
-    b.switch_to(join);
     b.init_slots(join);
+    b.switch_to(join);
 }
 
 // --- compares ---------------------------------------------------------------

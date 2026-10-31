@@ -130,7 +130,7 @@ pub(super) fn value_now<'gc>(b: &Builder<'_, 'gc>, v: Val, guess: bool) -> Optio
             b.entry_frame.get(r as usize).copied()
         }
         Op::KObj(p) => Some(b.f.pool[p as usize]),
-        Op::Guard(_) => value_now(b, b.f.args(i)[0], guess),
+        Op::Guard(_) | Op::Refine(_) => value_now(b, b.f.args(i)[0], guess),
         Op::UpvalValue(k) if !b.closure.proto.feedback.upvalue_varies(k as usize) => {
             Some(unsafe { (*b.closure.upvalue_ptr().add(k as usize)).value })
         }

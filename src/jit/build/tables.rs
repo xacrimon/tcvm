@@ -350,7 +350,7 @@ fn site_shapes<'gc>(
     if v.len() > MAX || v.iter().any(|s| s.is_dict()) {
         return None;
     }
-    let known = b.recv_shapes.entry(recv).or_default();
+    let known = b.recv_shapes.entry(b.root_of(recv)).or_default();
     for &s in known.iter() {
         if v.len() < MAX && !has(&v, s) {
             v.push(s);

@@ -259,6 +259,9 @@ pub(crate) struct Func<'gc> {
     /// hold what they will be read as after it, which the collector traces
     /// while the call runs (H11); it clears the frame's other slots there.
     pub(crate) call_homes: crate::jit::FastMap<u32, crate::jit::build::cfg::RegSet>,
+    /// The registers closures capture, whose slots a call may write through
+    /// their cells.
+    pub(crate) captured: crate::jit::build::cfg::RegSet,
     /// Exits whose miss belongs to another pc than their snapshot's: a
     /// guard hoisted out of a loop (E2), and the access it stands for.
     pub(crate) exit_sites: crate::jit::FastMap<Inst, u32>,
@@ -305,6 +308,7 @@ impl<'gc> Func<'gc> {
             boundaries: false,
             call_free: Default::default(),
             call_homes: Default::default(),
+            captured: Default::default(),
             exit_sites: Default::default(),
             inline_frames: Vec::new(),
             protos: Vec::new(),

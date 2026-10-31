@@ -2129,3 +2129,44 @@ fn assert_and_error_exit() {
         return s .. ' ' .. table.concat(msgs, ' | ') .. ' ' .. u .. ' ' .. w",
     );
 }
+
+/// A register a call does not write keeps its value in its slot across the
+/// call, but a captured one may change through its cell: `current` is not
+/// reloaded from `last_id`'s slot, which held the same value before.
+#[test]
+fn captured_slots_change_across_calls() {
+    agrees(
+        "local List = {}
+        List.__index = List
+        function List.new() return setmetatable({n = 0}, List) end
+        function List:add(x) self.n = self.n + 1; self[self.n] = x end
+        function List:each(f) for i = 1, self.n do f(self[i]) end end
+        local Finder = {}
+        Finder.__index = Finder
+        function Finder.new(n)
+          local o = setmetatable({number = {}, last = {}, nodes = {}}, Finder)
+          for i = 1, n do o.nodes[i] = {out = List.new(), id = i} end
+          for i = 1, n - 1 do o.nodes[i].out:add(o.nodes[i + 1]) end
+          for i = 1, n - 2, 3 do o.nodes[i].out:add(o.nodes[i + 2]) end
+          return o
+        end
+        function Finder:dfs(node, current)
+          self.number[node.id] = current
+          local last_id = current
+          node.out:each(function(target)
+            if self.number[target.id] == nil then
+              last_id = self:dfs(target, last_id + 1)
+            end
+          end)
+          self.last[current] = last_id
+          return last_id
+        end
+        local s = 0
+        for k = 1, 300 do
+          local f = Finder.new(30)
+          f:dfs(f.nodes[1], 1)
+          for i = 1, 30 do s = s + (f.last[i] or -1000) end
+        end
+        return tostring(s)",
+    );
+}

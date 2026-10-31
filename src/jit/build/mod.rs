@@ -52,6 +52,15 @@ enum SlotState {
     Lazy(Block),
 }
 
+/// What a branch or guard tells of a value on one of its edges.
+#[derive(Clone, Copy, Debug)]
+enum Fact {
+    /// Its type set narrowed to this.
+    Narrow(TypeSet),
+    /// It is this constant.
+    Is(Val),
+}
+
 /// Per IR block SSA state; its registers' definitions and slot states are
 /// rows of `Builder::defs` and `Builder::slots`.
 struct BlockState {
@@ -72,6 +81,12 @@ struct BlockState {
     /// The frame at a resume block's start, for guards of its loads.
     after: Option<Snap>,
     terminated: bool,
+    /// Values this block refined, in order (`Builder::refine`): a read
+    /// through it of a register holding the first gets the second.
+    refines: Vec<(Val, Val)>,
+    /// What the branch into it tells, bound once it is entered from that
+    /// branch alone.
+    on_entry: Vec<(Val, Fact)>,
 }
 
 pub(crate) struct Builder<'a, 'gc> {
@@ -113,6 +128,11 @@ pub(crate) struct Builder<'a, 'gc> {
     loop_entry: bool,
     /// Set when this builds an inlined callee's body (E1).
     pub(crate) inline: Option<Inline>,
+    /// Scratch for `read_var_at`'s walk.
+    chain: Vec<Block>,
+    /// The refinements the instruction being emitted made, in order: its
+    /// `Before` snapshot, shared by all its arms, names what they refined.
+    pc_refines: Vec<(Val, Val)>,
 }
 
 /// What the builder of an inlined callee knows of its call (E1).
@@ -149,6 +169,8 @@ impl BlockState {
             root_ty: Vec::new(),
             after: None,
             terminated: false,
+            refines: Vec::new(),
+            on_entry: Vec::new(),
         }
     }
 }
@@ -167,9 +189,11 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             loop_entry,
             max_stack: proto.max_stack_size,
         };
+        let mut f = Func::new(meta);
+        f.captured = cfg.captured;
         Builder {
             ctx,
-            f: Func::new(meta),
+            f,
             closure,
             proto,
             cfg,
@@ -193,6 +217,8 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             entry_frame: Vec::new(),
             loop_entry,
             inline: None,
+            chain: Vec::new(),
+            pc_refines: Vec::new(),
         }
     }
 
@@ -234,6 +260,8 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             entry_frame: Vec::new(),
             loop_entry: false,
             inline: Some(inline),
+            chain: Vec::new(),
+            pc_refines: Vec::new(),
         };
         b.bs.resize_with(n, BlockState::placeholder);
         b
@@ -336,8 +364,20 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         &mut self.slots[b.idx() * self.nregs..(b.idx() + 1) * self.nregs]
     }
 
+    /// Continue in `b`; entered for the first time from the branch that
+    /// alone reaches it, what the branch tells holds there.
     pub(crate) fn switch_to(&mut self, b: Block) {
         self.cur = b;
+        if self.bs[b.idx()].on_entry.is_empty() {
+            return;
+        }
+        let facts = std::mem::take(&mut self.bs[b.idx()].on_entry);
+        let s = &self.bs[b.idx()];
+        if s.sealed && s.preds.len() == 1 && self.f.blocks[b.idx()].insts.is_empty() {
+            for (v, fact) in facts {
+                self.bind_fact(v, fact);
+            }
+        }
     }
 
     /// Make the current block, and the blocks made until `end_cold`, a cold
@@ -436,18 +476,31 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             self.add_param_args(x, r, p);
             break p;
         };
-        // The chain walked, again.
+        // The chain walked again, top down, with the refinements of the
+        // blocks below `x` (its own are in its definition).
+        if self.def(x, r).is_none() {
+            self.set_def(x, r, v);
+        }
+        let mut chain = std::mem::take(&mut self.chain);
+        chain.clear();
         let mut c = b;
-        loop {
+        while c != x {
+            chain.push(c);
+            c = self.bs[c.idx()].preds[0];
+        }
+        let mut v = v;
+        for &c in chain.iter().rev() {
+            for &(from, to) in &self.bs[c.idx()].refines {
+                if v == from {
+                    v = to;
+                }
+            }
             if self.def(c, r).is_none() {
                 self.set_def(c, r, v);
             }
-            if c == x {
-                break;
-            }
-            c = self.bs[c.idx()].preds[0];
         }
-        v
+        self.chain = chain;
+        self.def(b, r).unwrap_or(v)
     }
 
     fn root_load(&mut self, b: Block, r: u8) -> Val {
@@ -512,12 +565,13 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         self.cur_snap = None;
     }
 
-    /// The value `v` is a representation of: through guards, boxes and unboxes.
+    /// The value `v` is a representation of: through guards, refinements,
+    /// boxes and unboxes.
     pub(crate) fn root_of(&self, mut v: Val) -> Val {
         loop {
             match self.f.vals[v.idx()].def {
                 ValDef::Inst(i, _) => match self.f.op(i) {
-                    Op::Guard(_) | Op::Box | Op::Unbox(_) => v = self.f.args(i)[0],
+                    Op::Guard(_) | Op::Refine(_) | Op::Box | Op::Unbox(_) => v = self.f.args(i)[0],
                     _ => return v,
                 },
                 ValDef::Param(..) => return v,
@@ -536,6 +590,109 @@ impl<'a, 'gc> Builder<'a, 'gc> {
                     && self.f.def_block(rv) == Some(root)
             }
             SlotState::Unknown => false,
+        }
+    }
+
+    // --- refinements -----------------------------------------------------------
+
+    /// From here on in the current block, and in blocks a read reaches it
+    /// through, registers holding `v` hold `to`: a guard's result, a
+    /// refinement, or the constant `v` was proven to be. A slot holding `v`
+    /// holds that constant.
+    pub(crate) fn refine(&mut self, v: Val, to: Val) {
+        if v == to {
+            return;
+        }
+        let cur = self.cur;
+        if self.root_of(to) != self.root_of(v) {
+            for r in 0..self.nregs {
+                if self.slot_holds(r as u8, v) {
+                    self.set_slot(cur, r, SlotState::Holds(to));
+                }
+            }
+        }
+        for r in 0..self.nregs as u8 {
+            if self.def(cur, r) == Some(v) {
+                self.set_def(cur, r, to);
+            }
+        }
+        self.bs[cur.idx()].refines.push((v, to));
+        self.pc_refines.push((v, to));
+    }
+
+    fn is_konst(&self, v: Val) -> bool {
+        matches!(self.f.def_op(v), Some(Op::KVal(_) | Op::KObj(_)))
+    }
+
+    /// What `cond` being `holds` tells of a value: a narrower type set, or
+    /// (an equality with a constant holding) the constant.
+    fn fact_of(&self, cond: Val, holds: bool) -> Option<(Val, Fact)> {
+        let i = self.f.def_inst(cond)?;
+        let a = self.f.args(i);
+        let (v, narrow) = match self.f.op(i) {
+            Op::IsType(set) => (a[0], if holds { set } else { TypeSet::ANY - set }),
+            Op::IsFalsy if holds => (a[0], TypeSet::FALSY),
+            Op::IsFalsy => (a[0], TypeSet::ANY - TypeSet::FALSY),
+            Op::SameBits if self.is_konst(a[1]) => {
+                if holds {
+                    return Some((a[0], Fact::Is(a[1])));
+                }
+                let Some(Op::KVal(bits)) = self.f.def_op(a[1]) else {
+                    return None;
+                };
+                let one = [
+                    (Value::nil(), TypeSet::NIL),
+                    (Value::boolean(false), TypeSet::FALSE),
+                    (Value::boolean(true), TypeSet::TRUE),
+                ]
+                .into_iter()
+                .find(|(k, _)| k.to_raw() == bits)?
+                .1;
+                (a[0], TypeSet::ANY - one)
+            }
+            _ => return None,
+        };
+        let t = self.ty(v);
+        if t.rep != Rep::Val {
+            return None;
+        }
+        let have = if t.set.is_empty() {
+            TypeSet::ANY
+        } else {
+            t.set
+        };
+        let set = have & narrow;
+        (set != have && !set.is_empty()).then_some((v, Fact::Narrow(set)))
+    }
+
+    /// Bind `fact` of `v` in the current block from here on.
+    fn bind_fact(&mut self, v: Val, fact: Fact) {
+        let to = match fact {
+            Fact::Is(k) => k,
+            Fact::Narrow(set) => self.ins(Op::Refine(set), &[v]),
+        };
+        self.refine(v, to);
+    }
+
+    /// What an exiting check just emitted proves from here on.
+    fn note_check(&mut self, i: Inst) {
+        let op = self.f.op(i);
+        let a0 = self.f.args(i).first().copied();
+        match op {
+            Op::Guard(_) => {
+                let g = self.f.result(i);
+                self.refine(a0.unwrap(), g);
+            }
+            Op::GuardSame if self.is_konst(self.f.args(i)[1]) => {
+                let k = self.f.args(i)[1];
+                self.refine(a0.unwrap(), k);
+            }
+            Op::GuardTrue | Op::GuardFalse => {
+                if let Some((v, fact)) = self.fact_of(a0.unwrap(), op == Op::GuardTrue) {
+                    self.bind_fact(v, fact);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -570,6 +727,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         let s = self.snap_before();
         let i = self.f.make_inst(op, args, Some(s), tag);
         self.f.append(self.cur, i);
+        self.note_check(i);
         i
     }
 
@@ -577,6 +735,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         self.inline_check(op);
         let i = self.f.make_inst(op, args, Some(snap), tag);
         self.f.append(self.cur, i);
+        self.note_check(i);
         i
     }
 
@@ -693,8 +852,18 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         self.terminate(Op::Jump, &[], &[target], None);
     }
 
+    /// Branch on `cond`; what it tells each edge holds in the block it
+    /// enters when that is reached from here alone.
     pub(crate) fn br(&mut self, cond: Val, t: Block, f: Block) {
         self.terminate(Op::Br, &[cond], &[t, f], None);
+        if t == f {
+            return;
+        }
+        for (b, holds) in [(t, true), (f, false)] {
+            if let Some(fact) = self.fact_of(cond, holds) {
+                self.bs[b.idx()].on_entry.push(fact);
+            }
+        }
     }
 
     // --- snapshots and tail-outs ----------------------------------------------
@@ -721,7 +890,14 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             if r >= self.nregs || self.untouched(r) {
                 continue;
             }
-            let v = self.reg(r as u8);
+            let mut v = self.reg(r as u8);
+            if kind == ExitKind::Before {
+                for &(from, to) in self.pc_refines.iter().rev() {
+                    if v == to {
+                        v = from;
+                    }
+                }
+            }
             if !self.slot_holds(r as u8, v) {
                 self.f.snap_pool.push(((base + r) as u8, v));
             }
@@ -864,11 +1040,12 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     }
 
     /// End the block with a call (`Call`, `CallMm`) to a fresh resume block,
-    /// which becomes current. Of the registers `live` after it, those whose
-    /// slots hold their values, those it `written`, and the captured ones are
-    /// read from their slots after it; the others keep their values in the
-    /// region's frame across it, the call-site snapshot naming them for the
-    /// collector (H11).
+    /// which becomes current. Of the registers `live` after it, those it
+    /// `written` and the captured ones are read from their slots after it;
+    /// those whose slots hold their values keep them there (its homes: the
+    /// call-boundary pass reloads what is used after it, typed as before);
+    /// the others keep their values in the region's frame across it, the
+    /// call-site snapshot naming them for the collector (H11).
     pub(crate) fn call(
         &mut self,
         op: Op,
@@ -881,23 +1058,17 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         reload.union(&self.cfg.captured);
         // The captured registers are stored and read through their cells.
         let mut homes = self.cfg.captured;
-        let mut tys = vec![TypeSet::ANY; self.nregs];
         let from = self.f.snap_pool.len();
         for r in live.iter() {
             if r >= self.nregs || reload.contains(r) {
                 continue;
             }
-            if let SlotState::Lazy(root) = self.slot(self.cur, r) {
-                let t = self.bs[root.idx()].root_ty.get(r).copied();
-                tys[r] = t.filter(|t| !t.is_empty()).unwrap_or(TypeSet::ANY);
-                reload.insert(r);
+            if self.untouched(r) {
                 homes.insert(r);
                 continue;
             }
             let v = self.reg(r as u8);
             if self.slot_holds(r as u8, v) {
-                tys[r] = self.ty(v).set;
-                reload.insert(r);
                 homes.insert(r);
             } else {
                 self.f.snap_pool.push((r as u8, v));
@@ -919,16 +1090,18 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         for (w, x) in e.0.iter_mut().zip(free.0) {
             *w &= x;
         }
+        let before = self.cur;
         let resume = self.new_block();
         self.f.blocks[resume.idx()].resume = true;
         let s = &mut self.bs[resume.idx()];
         s.sealed = true;
         s.reload = reload;
-        s.root_ty = tys;
         self.terminate(op, args, &[resume], Some((snap, ExitTag::Type)));
         for r in 0..self.nregs {
             let state = if reload.contains(r) {
                 SlotState::Lazy(resume)
+            } else if homes.contains(r) {
+                self.slot(before, r)
             } else {
                 SlotState::Unknown
             };
@@ -1370,8 +1543,8 @@ impl<'a, 'gc> Builder<'a, 'gc> {
                 self.seal(ir);
             }
             if reached {
-                self.switch_to(ir);
                 self.init_slots(ir);
+                self.switch_to(ir);
                 self.emit_instance(ii, bc);
             } else {
                 self.f.blocks[ir.idx()].dead = true;
@@ -1421,6 +1594,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         let blk = &self.cfg.blocks[bc as usize];
         let (start, end) = (blk.start, blk.end);
         self.cur_snap = None;
+        self.pc_refines.clear();
         if self.cfg.never_ran[bc as usize] {
             self.pc = start;
             self.deopt(ExitTag::NeverRan);
@@ -1441,6 +1615,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         for pc in start..end {
             self.pc = pc;
             self.cur_snap = None;
+            self.pc_refines.clear();
             let last = pc + 1 == end;
             let succs = if last { &sb[..ns] } else { &[][..] };
             emit::emit(self, pc, succs);
@@ -1501,12 +1676,28 @@ pub(crate) fn value_set(v: Value<'_>) -> TypeSet {
     }
 }
 
+/// The value a boxed value refines: through guards and refinements.
+fn refined_from(f: &Func<'_>, mut v: Val) -> Val {
+    while let Some(i) = f.def_inst(v) {
+        match f.op(i) {
+            Op::Guard(_) | Op::Refine(_) => v = f.args(i)[0],
+            _ => break,
+        }
+    }
+    v
+}
+
 /// Remove parameters whose incoming arguments are all one other value (or
-/// the parameter itself), to a fixpoint.
+/// the parameter itself), to a fixpoint. Arguments that are refinements of
+/// one value (a register guarded differently on each path) join to that
+/// value, refined to their union where that is narrower.
 pub(crate) fn remove_trivial_params(f: &mut Func<'_>) {
     let cfg = f.cfg();
     let mut map: Vec<Val> = Vec::new();
     let mut kept: Vec<Val> = Vec::new();
+    // Parameters replaced by a refinement of a value, made where the block
+    // starts once the replacements settle.
+    let mut refined: Vec<(Block, Val, Val, TypeSet)> = Vec::new();
     loop {
         map.clear();
         map.extend((0..f.vals.len() as u32).map(Val));
@@ -1516,19 +1707,43 @@ pub(crate) fn remove_trivial_params(f: &mut Func<'_>) {
                 let p = f.params(b)[k];
                 let mut same: Option<Val> = None;
                 let mut trivial = true;
+                // The one value the arguments refine, and their types' union.
+                let mut base: Option<(Val, TypeSet)> = None;
                 for &(term, e) in cfg.incoming(b) {
                     let a = resolve(&map, f.edge_args(term, e as usize)[k]);
                     if a == p {
                         continue;
                     }
+                    let (ra, ta) = (refined_from(f, a), f.vals[a.idx()].ty);
+                    base = match base {
+                        _ if ta.rep != Rep::Val || f.vals[p.idx()].ty.rep != Rep::Val => None,
+                        None if same.is_none() => Some((ra, ta.set)),
+                        Some((x, set)) if x == ra => Some((x, set | ta.set)),
+                        _ => None,
+                    };
                     match same {
                         None => same = Some(a),
                         Some(s) if s == a => {}
                         Some(_) => {
                             trivial = false;
-                            break;
                         }
                     }
+                    if !trivial && base.is_none() {
+                        break;
+                    }
+                }
+                if !trivial
+                    && let Some((x, set)) = base
+                    && x != p
+                {
+                    let whole = f.vals[x.idx()].ty.set;
+                    if set.is_empty() || whole.is_empty() || set.contains(whole) {
+                        map[p.idx()] = x;
+                    } else {
+                        refined.push((b, p, x, set & whole));
+                    }
+                    changed = true;
+                    continue;
                 }
                 // An i64 into an i32 parameter would need an exit, which has
                 // no snapshot here: the parameter stays.
@@ -1565,6 +1780,16 @@ pub(crate) fn remove_trivial_params(f: &mut Func<'_>) {
         }
         if !changed {
             break;
+        }
+        for (b, p, x, set) in refined.drain(..) {
+            let x = resolve(&map, x);
+            let i = f.make_inst(Op::Refine(set), &[x], None, ExitTag::Type);
+            f.insert(b, 0, i);
+            let r = f.result(i);
+            while map.len() < f.vals.len() {
+                map.push(Val(map.len() as u32));
+            }
+            map[p.idx()] = r;
         }
         // A replacement of another representation enters through a
         // conversion at the parameter's block.

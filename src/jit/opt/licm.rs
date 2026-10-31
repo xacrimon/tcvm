@@ -118,8 +118,9 @@ fn hoist(f: &mut Func<'_>, h: Block, body: &[Block]) -> bool {
             let exits = e.has(Flags::MAY_DEOPT);
             let reads_memory = e.reads_memory();
             let movable = match op {
-                // Slots are loaded only where a region (re)starts.
-                Op::Load(_) | Op::GcCheck => false,
+                // Slots are loaded only where a region (re)starts; a
+                // refinement holds only where the test before it passed.
+                Op::Load(_) | Op::GcCheck | Op::Refine(_) => false,
                 _ if e.is_pure() => true,
                 _ if !e.movable() || e.writes() || e.has(Flags::MAY_ALLOC) => false,
                 // A test of values alone needs no earlier guard; a read of

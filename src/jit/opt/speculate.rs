@@ -191,8 +191,9 @@ pub(crate) fn speculate(f: &mut Func<'_>, kinds: &EntryKinds) -> bool {
 }
 
 /// The set every informative use of each value expects: the intersection
-/// of its type guards' sets and of what the block parameters it flows into
-/// expect. `ANY` is no expectation, the empty set a conflict.
+/// of its type guards' sets, of what the block parameters it flows into
+/// expect, and of what its refinements' uses expect where they hold. `ANY`
+/// is no expectation, the empty set a conflict.
 fn expectations(f: &Func<'_>) -> Vec<TypeSet> {
     let mut exp = vec![TypeSet::ANY; f.vals.len()];
     let cfg = f.cfg();
@@ -207,6 +208,18 @@ fn expectations(f: &Func<'_>) -> Vec<TypeSet> {
     while changed {
         changed = false;
         for &b in &cfg.rpo {
+            // A refinement's uses expect of the value only where it holds.
+            for &i in f.insts_of(b) {
+                if let Op::Refine(set) = f.op(i) {
+                    let (r, v) = (f.result(i), f.args(i)[0]);
+                    let e = exp[r.idx()];
+                    let n = exp[v.idx()] & (e | (TypeSet::ANY - set));
+                    if e != TypeSet::ANY && n != exp[v.idx()] {
+                        exp[v.idx()] = n;
+                        changed = true;
+                    }
+                }
+            }
             for (k, &p) in f.params(b).iter().enumerate() {
                 let e = exp[p.idx()];
                 if e == TypeSet::ANY {

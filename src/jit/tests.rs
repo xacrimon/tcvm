@@ -3,9 +3,11 @@
 use crate::env::{LuaString, Value};
 use crate::{Executor, LoadError, Lua};
 
-/// Run `src`, then build the IR of global function `name` from `pc`.
+/// Run `src` in the interpreter, then build the IR of global function
+/// `name` from `pc` with the feedback it left, whatever the JIT mode.
 pub(crate) fn ir_of(src: &str, name: &str, pc: u32) -> String {
     let mut lua = Lua::new();
+    lua.set_jit(false);
     lua.load_all();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
@@ -295,4 +297,56 @@ fn snapshots_leave_out_unchanged_slots() {
             .all(|s| !s.contains("r0=") && !s.contains("r1=")),
         "{ir}"
     );
+}
+
+/// Registers a call does not write keep their values in their slots and
+/// their types after it: the entry guards cover the uses after each call.
+#[test]
+fn calls_keep_the_types_of_unwritten_registers() {
+    let src = "local g
+    g = function(x) local a = {} for j = 1, 3 do a[j] = x end return a[1] end
+    function f(t, i, o)
+        local s = t[i] + o.d
+        g(i)
+        s = s + t[i] + o.d
+        g(i)
+        return s + t[i] + i
+    end
+    local t = {}
+    for i = 1, 10 do t[i] = i end
+    for k = 1, 300 do f(t, 5, {d = 3}) end";
+    let ir = ir_of(src, "f", 0);
+    let count = |s: &str| ir.lines().filter(|l| l.contains(s)).count();
+    assert_eq!(count("guard val:tab"), 2, "{ir}");
+    assert_eq!(count("load r0"), 3, "{ir}");
+}
+
+/// A branch on an equality with a constant makes the register that
+/// constant in the arm where it holds.
+#[test]
+fn branches_refine_what_they_test() {
+    let src = "function f(x)
+        if x == 'key' then return #x end
+        return 0
+    end
+    for i = 1, 300 do f(i % 2 == 0 and 'key' or i) end";
+    let ir = ir_of(src, "f", 0);
+    assert!(!ir.contains("istype"), "{ir}");
+}
+
+/// An identity guard on a callee makes its register that function: the
+/// second call needs no guard.
+#[test]
+fn identity_guards_make_constants() {
+    let src = "local g
+    g = function(x) local a = {} for j = 1, 3 do a[j] = x end return a[1] end
+    function f(h, x)
+        h(x)
+        h(x)
+        return x
+    end
+    for i = 1, 300 do f(g, i) end";
+    let ir = ir_of(src, "f", 0);
+    let count = |s: &str| ir.lines().filter(|l| l.contains(s)).count();
+    assert_eq!(count("guard.same"), 1, "{ir}");
 }
