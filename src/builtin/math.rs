@@ -10,11 +10,13 @@ use crate::builtin::util::{
 };
 use crate::env::function::NativeKind;
 use crate::env::{
-    Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Userdata, Value,
+    Error, Function, LuaString, MetamethodBits, NativeClosure, NativeFn, Stack, Table, Userdata,
+    Value,
 };
 use crate::vm::abi::Handler;
+use crate::vm::native::{ContFn, NativeOut};
 use crate::vm::num;
-use crate::vm::{ff, native};
+use crate::vm::{binop_metamethod, ff, native};
 
 pub fn load<'gc>(ctx: Context<'gc>) {
     // Third column: the CALL entry, `call` unless the builtin has a fast path.
@@ -33,8 +35,6 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         ("frexp", lua_frexp, call),
         ("ldexp", lua_ldexp, call),
         ("log", lua_log, call),
-        ("max", lua_max, call),
-        ("min", lua_min, call),
         ("modf", lua_modf, call),
         ("rad", lua_rad, call),
         ("random", lua_random, call),
@@ -66,6 +66,12 @@ pub fn load<'gc>(ctx: Context<'gc>) {
             entry,
         );
         let key = Value::string(LuaString::new(ctx, name.as_bytes()));
+        lib.raw_set(ctx, key, Value::function(handler));
+    }
+
+    for (name, handler) in [("max", lua_max as ContFn), ("min", lua_min as ContFn)] {
+        let key = Value::string(LuaString::new(ctx, name.as_bytes()));
+        let handler = Function::new_cont(ctx.mutation(), handler, &[]);
         lib.raw_set(ctx, key, Value::function(handler));
     }
 
@@ -323,7 +329,7 @@ fn lua_max<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
-) -> Result<(), Error<'gc>> {
+) -> NativeOut {
     select_extreme(ctx, stack, "max", false)
 }
 
@@ -331,7 +337,7 @@ fn lua_min<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
-) -> Result<(), Error<'gc>> {
+) -> NativeOut {
     select_extreme(ctx, stack, "min", true)
 }
 
@@ -345,10 +351,11 @@ fn select_extreme<'gc>(
     mut stack: Stack<'gc, '_>,
     fname: &str,
     want_min: bool,
-) -> Result<(), Error<'gc>> {
+) -> NativeOut {
     check_any(ctx, &stack, fname, 1)?;
     let n = stack.len();
     let mut best = stack.get(0);
+    let mut best_at = 0;
     for i in 1..n {
         let v = stack.get(i);
         // max keeps `v` when best < v; min keeps `v` when v < best.
@@ -364,14 +371,83 @@ fn select_extreme<'gc>(
         } else if let (Some(x), Some(y)) = (lhs.get_string(), rhs.get_string()) {
             x < y
         } else {
-            return Err(Error::from_str(ctx, &compare_error_msg(lhs, rhs)));
+            return select_extreme_meta(ctx, &mut stack, i, best_at, want_min);
         };
         if lt {
             best = v;
+            best_at = i;
         }
     }
     stack.ret1(best);
-    Ok(())
+    NativeOut::RETURN
+}
+
+#[cold]
+#[inline(never)]
+fn select_extreme_meta<'gc>(
+    ctx: Context<'gc>,
+    stack: &mut Stack<'gc, '_>,
+    start: usize,
+    mut best: usize,
+    want_min: bool,
+) -> NativeOut {
+    stack.spawn_action(ctx, move |cx| async move {
+        // Keep every candidate rooted in the native window across calls and GC;
+        // the future only retains slot indices, never borrowed Lua values.
+        let n = cx.enter(|_, stack| stack.len());
+        for i in start..n {
+            let comparison = cx.try_enter(|ctx, stack| {
+                let (lhs, rhs) = if want_min {
+                    (stack.get(i), stack.get(best))
+                } else {
+                    (stack.get(best), stack.get(i))
+                };
+                let lt = if let (Some(x), Some(y)) = (lhs.get_integer(), rhs.get_integer()) {
+                    Some(x < y)
+                } else if let (Some(x), Some(y)) = (lhs.get_float(), rhs.get_float()) {
+                    Some(x < y)
+                } else if let (Some(x), Some(y)) = (lhs.get_integer(), rhs.get_float()) {
+                    Some(num::lt_int_float(x, y))
+                } else if let (Some(x), Some(y)) = (lhs.get_float(), rhs.get_integer()) {
+                    Some(num::lt_float_int(x, y))
+                } else if let (Some(x), Some(y)) = (lhs.get_string(), rhs.get_string()) {
+                    Some(x < y)
+                } else {
+                    None
+                };
+                if let Some(lt) = lt {
+                    Ok(Ok(lt))
+                } else {
+                    let mm = binop_metamethod(ctx, lhs, rhs, MetamethodBits::LT);
+                    if mm.is_nil() {
+                        return Err(Error::from_str(ctx, &compare_error_msg(lhs, rhs)));
+                    }
+                    let at = stack.len();
+                    stack.extend([mm, lhs, rhs]);
+                    Ok(Err(at))
+                }
+            })?;
+            let lt = match comparison {
+                Ok(lt) => lt,
+                Err(at) => {
+                    cx.call(at).await;
+                    cx.enter(|_, mut stack| {
+                        let lt = !stack.get(at).is_falsy();
+                        stack.truncate(at);
+                        lt
+                    })
+                }
+            };
+            if lt {
+                best = i;
+            }
+        }
+        cx.enter(|_, mut stack| {
+            let result = stack.get(best);
+            stack.ret1(result);
+        });
+        Ok(())
+    })
 }
 
 /// `tointeger(x)` — the integer value of `x` if it has one, else `nil`. No
