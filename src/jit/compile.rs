@@ -488,7 +488,7 @@ pub(crate) fn compile<'gc>(
             tag: e.tag,
             count: std::cell::Cell::new(0),
             site: e.site,
-            seen: proto.feedback.seen(e.site.unwrap_or(e.pc) as usize),
+            seen: crate::jit::exit_seen(proto, e.site.unwrap_or(e.pc)),
         });
     }
     // The sites, their snapshots after the exits'.

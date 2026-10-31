@@ -131,7 +131,9 @@ pub(super) fn value_now<'gc>(b: &Builder<'_, 'gc>, v: Val, guess: bool) -> Optio
         }
         Op::KObj(p) => Some(b.f.pool[p as usize]),
         Op::Guard(_) => value_now(b, b.f.args(i)[0], guess),
-        Op::UpvalValue(k) => Some(unsafe { (*b.closure.upvalue_ptr().add(k as usize)).value }),
+        Op::UpvalValue(k) if !b.closure.proto.feedback.upvalue_varies(k as usize) => {
+            Some(unsafe { (*b.closure.upvalue_ptr().add(k as usize)).value })
+        }
         Op::CellLoad => {
             let c = b.f.def_inst(b.f.args(i)[0])?;
             let Op::UpvalCell(k) = b.f.op(c) else {
@@ -207,6 +209,15 @@ pub(super) fn callee_of<'gc>(b: &Builder<'_, 'gc>, pc: u32, callee: Val) -> Call
             _ => Callee::Same(f),
         },
         None => {
+            // An upvalue that differs between closures, holding a closure of
+            // a prototype that made several: guarded by that prototype, its
+            // value now still names the code to inline.
+            if let Some(c) = varying_closure(b, callee)
+                && c.proto.closures.get() > 1
+                && !c.proto.is_vararg
+            {
+                return Callee::Proto(c.proto, Some(c));
+            }
             let slot = b.proto.feedback.callee(pc as usize);
             match slot.and_then(|s| slot_proto(s.get())) {
                 Some(p) if !p.is_vararg => Callee::Proto(p, None),
@@ -214,6 +225,23 @@ pub(super) fn callee_of<'gc>(b: &Builder<'_, 'gc>, pc: u32, callee: Val) -> Call
             }
         }
     }
+}
+
+/// The Lua closure `v` holds now when it is a load of an upvalue that
+/// differs between closures, which `value_now` does not take as known.
+fn varying_closure<'gc>(b: &Builder<'_, 'gc>, v: Val) -> Option<LuaFn<'gc>> {
+    let i = b.f.def_inst(v)?;
+    let Op::UpvalValue(k) = b.f.op(i) else {
+        return None;
+    };
+    b.closure
+        .proto
+        .feedback
+        .upvalue_varies(k as usize)
+        .then_some(())?;
+    unsafe { (*b.closure.upvalue_ptr().add(k as usize)).value }
+        .get_function()?
+        .as_lua()
 }
 
 /// What `emit` made of a CALL.

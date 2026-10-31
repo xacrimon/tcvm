@@ -1054,6 +1054,35 @@ fn shift_counts_at_the_extremes() {
     );
 }
 
+/// By-value upvalues of one prototype's closures: one that differs between
+/// closures is loaded, one the same in all stays a constant; closures that
+/// differ made after a region compiled the first one's values as constants.
+#[test]
+fn upvalues_that_vary_between_closures() {
+    agrees(
+        "local function mk(p, drag)
+          return function(n)
+            local s = 0
+            for i = 1, n do s = s + p.x * drag + i end
+            return s
+          end
+        end
+        local first = mk({x = 1}, 0.5)
+        local s = 0
+        for _ = 1, 500 do s = s + first(10) end
+        local others = {}
+        for i = 1, 20 do others[i] = mk({x = i}, 0.5) end
+        for _ = 1, 50 do for i = 1, 20 do s = s + others[i](10) end end
+        local self_ref = {}
+        for i = 1, 20 do
+          local function f(n) if n == 0 then return i end return f(n - 1) end
+          self_ref[i] = f
+        end
+        for _ = 1, 50 do for i = 1, 20 do s = s + self_ref[i](3) end end
+        return tostring(s)",
+    );
+}
+
 /// Values compiled as constants: by-value upvalues that differ between
 /// closures of one prototype, a loop's function register reassigned inside
 /// it, a global builtin replaced between runs, intrinsics given big

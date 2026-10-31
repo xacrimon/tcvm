@@ -294,8 +294,9 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             b.set(a, v);
         }
         // A by-value upvalue is a constant of the closure, guarded once per
-        // region since other closures of the prototype may run it.
-        GETUPVAL if b.feedback(pc) & fb::CONST_MISS == 0 => {
+        // region since other closures of the prototype may run it, unless
+        // closures differ in it.
+        GETUPVAL if !b.closure.proto.feedback.upvalue_varies(rb as usize) => {
             let v = b.ins(Op::UpvalValue(rb), &[]);
             let now = unsafe { (*b.closure.upvalue_ptr().add(rb as usize)).value };
             let k = b.konst(now);

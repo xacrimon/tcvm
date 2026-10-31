@@ -451,8 +451,11 @@ impl<'gc> Context<'gc> {
                 cell: UpvalueCell::new_closed(self.mutation(), env),
             }
         };
-        Ok(Function::new_lua(self.mutation(), proto, |dst| unsafe {
-            dst.write(env)
-        }))
+        let f = Function::new_lua(self.mutation(), proto, |dst| unsafe { dst.write(env) });
+        // SAFETY: made a Lua closure just above.
+        proto
+            .feedback
+            .note_closure(unsafe { crate::env::function::LuaFn::from_function_unchecked(f) });
+        Ok(f)
     }
 }

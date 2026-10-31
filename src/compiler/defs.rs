@@ -389,7 +389,8 @@ impl<'gc> Chunk<'gc> {
             .into_boxed_slice();
 
         // Last: every rewrite of the tape is done, and slots follow the code.
-        let feedback = crate::env::feedback::FeedbackVector::new(&mut self.tape);
+        let feedback =
+            crate::env::feedback::FeedbackVector::new(&mut self.tape, num_upvalues as usize);
         Ok(Gc::new(
             mc,
             Prototype {

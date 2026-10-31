@@ -163,13 +163,12 @@ pub(crate) fn new_closure<'gc>(
     if captured {
         unsafe { frame::set_flags(base, flag::HAS_OPEN) };
     }
+    let f = unsafe { LuaFn::from_function_unchecked(func) };
     if let Some(i) = self_slot {
         // The fresh closure pointing at itself needs no barrier.
-        unsafe {
-            let f = LuaFn::from_function_unchecked(func);
-            (*f.upvalue_ptr().add(i)).value = Value::function(func);
-        }
+        unsafe { (*f.upvalue_ptr().add(i)).value = Value::function(func) };
     }
+    proto.feedback.note_closure(f);
     func
 }
 

@@ -9,7 +9,7 @@
 use std::cell::Cell;
 
 use crate::dmm::{Collect, Finalization, Gc, Trace};
-use crate::env::function::{Code, InlineCache, Prototype};
+use crate::env::function::{Code, InlineCache, LuaFn, Prototype};
 use crate::env::shape::Shape;
 use crate::env::value::Value;
 use crate::instruction::{Family, Instruction, Op};
@@ -35,8 +35,6 @@ pub(crate) enum SlotKind {
     Compare,
     /// FORPREP, FORLOOP.
     Loop,
-    /// A by-value GETUPVAL's constant miss.
-    Upval,
 }
 
 impl SlotKind {
@@ -81,7 +79,6 @@ impl SlotKind {
             Op::UNM | Op::BNOT | Op::LEN | Op::CONCAT => SlotKind::Arith,
             Op::ARITH_MM | Op::ARITH_MM_R | Op::ARITH_MMI => SlotKind::Arith,
             Op::FORPREP | Op::FORLOOP | Op::FORLOOP_I | Op::FORLOOP_F => SlotKind::Loop,
-            Op::GETUPVAL => SlotKind::Upval,
             _ => match info.family {
                 Family::RegArith | Family::RegBit | Family::ImmArith | Family::ImmBit => {
                     SlotKind::Arith
@@ -101,8 +98,13 @@ const MAX_WORDS: usize = NO_SLOT as usize;
 /// The null slot: a field slot, then a callee word and its count.
 const NULL_WORDS: usize = 7;
 const NULL_CALL: u16 = 5;
-/// Header words, before slot 0 (`as_ptr`): the invocation count at -1.
-const HEAD: usize = 1;
+/// An upvalue's mask bits: a closure gave it a value, and two gave it
+/// different ones.
+const SEEN: u64 = 1;
+const VARIES: u64 = 2;
+/// Closures of a prototype `note_closure` learns from; later ones that
+/// differ are found by a failed constant guard (`set_upvalue_varies`).
+const LEARN_CLOSURES: u8 = 8;
 
 /// A site word: bit 0 set, inline bits above it; clear, a [`ShapeRecord`].
 const INLINE: u64 = 1;
@@ -138,8 +140,15 @@ const RECORD_SHAPES: usize = crate::jit::MAX_SHAPES + 1;
 /// See the module doc. The words and their layout are fixed when the
 /// prototype is made; `kinds` and `slot_of_pc` never change.
 pub struct FeedbackVector<'gc> {
-    /// The header, then the slots.
+    /// The header, then the slots. The header: per upvalue the first
+    /// closure's value bits, per 32 upvalues a mask word (`SEEN`, `VARIES`
+    /// per upvalue), then the invocation count, the word before slot 0.
     words: Box<[Cell<u64>]>,
+    /// Header words.
+    head: u32,
+    upvalues: u16,
+    /// Closures left to learn from: 0 once every by-value upvalue varies.
+    learn: Cell<u8>,
     kinds: Box<[SlotKind]>,
     /// Per instruction, its slot's first word, or `NO_SLOT`. Field and call
     /// instructions also hold it in `d`, for the interpreter's fast paths.
@@ -153,10 +162,10 @@ const _: () =
     assert!(size_of::<InlineCache<'static>>() == 32 && align_of::<InlineCache<'static>>() <= 8);
 
 impl<'gc> FeedbackVector<'gc> {
-    /// The vector of `code`, whose field and call instructions get their
-    /// slot in `d`. Sites past `MAX_WORDS` share the null slot and record
-    /// nothing.
-    pub(crate) fn new(code: &mut [Instruction]) -> Self {
+    /// The vector of `code`, of a prototype with `upvalues` upvalues, whose
+    /// field and call instructions get their slot in `d`. Sites past
+    /// `MAX_WORDS` share the null slot and record nothing.
+    pub(crate) fn new(code: &mut [Instruction], upvalues: usize) -> Self {
         let slot_kinds: Vec<Option<SlotKind>> = code.iter().map(|i| SlotKind::of(i.op())).collect();
         let total: usize = slot_kinds.iter().flatten().map(|k| k.words()).sum();
         let mut kinds: Vec<SlotKind> = Vec::with_capacity(total.min(MAX_WORDS));
@@ -188,8 +197,12 @@ impl<'gc> FeedbackVector<'gc> {
                 i.set_d(w as u16);
             }
         }
+        let head = upvalues + upvalues.div_ceil(32) + 1;
         let v = FeedbackVector {
-            words: (0..HEAD + kinds.len()).map(|_| Cell::new(0)).collect(),
+            words: (0..head + kinds.len()).map(|_| Cell::new(0)).collect(),
+            head: head as u32,
+            upvalues: upvalues as u16,
+            learn: Cell::new(LEARN_CLOSURES),
             refs: kinds
                 .iter()
                 .any(|k| matches!(k, SlotKind::Field | SlotKind::Call)),
@@ -221,18 +234,18 @@ impl<'gc> FeedbackVector<'gc> {
     /// invocations (`FUNC`) in the word before slot 0.
     #[inline(always)]
     pub(crate) fn as_ptr(&self) -> *const Cell<u64> {
-        // SAFETY: the header is `HEAD` words.
-        unsafe { self.words.as_ptr().add(HEAD) }
+        // SAFETY: the header is `head` words.
+        unsafe { self.words.as_ptr().add(self.head as usize) }
     }
 
     /// Slot words.
     pub(crate) fn len(&self) -> usize {
-        self.words.len() - HEAD
+        self.words.len() - self.head as usize
     }
 
     #[inline(always)]
     fn word(&self, w: usize) -> &Cell<u64> {
-        &self.words[HEAD + w]
+        &self.words[self.head as usize + w]
     }
 
     /// The slot of the instruction at `pc`, with its kind.
@@ -271,6 +284,72 @@ impl<'gc> FeedbackVector<'gc> {
     #[inline(always)]
     pub(crate) fn callee_at(&self, w: usize) -> &Cell<u64> {
         self.word(w)
+    }
+
+    /// Upvalue `k`'s mask word and the shift of its bits there.
+    fn upvalue_mask(&self, k: usize) -> (&Cell<u64>, u32) {
+        (
+            &self.words[self.upvalues as usize + k / 32],
+            2 * (k % 32) as u32,
+        )
+    }
+
+    /// Learn from a new closure `f` of this vector's prototype, one of its
+    /// first `LEARN_CLOSURES`, which of its by-value upvalues differ between
+    /// closures: the first closure's value bits are kept, a later one that
+    /// differs marks the upvalue `VARIES`. Bits only, untraced: a dead value
+    /// whose address is reused reads as the same, which costs one failed
+    /// constant guard.
+    #[inline(always)]
+    pub(crate) fn note_closure(&self, f: LuaFn<'gc>) {
+        if self.learn.get() != 0 {
+            self.learn_closure(f);
+        }
+    }
+
+    #[inline(never)]
+    fn learn_closure(&self, f: LuaFn<'gc>) {
+        self.learn.set(self.learn.get() - 1);
+        let mut undecided = false;
+        for (k, (desc, slot)) in f.proto.upvalue_desc.iter().zip(f.upvalues()).enumerate() {
+            if !desc.by_value {
+                continue;
+            }
+            let (m, sh) = self.upvalue_mask(k);
+            let bits = m.get() >> sh;
+            if bits & VARIES != 0 {
+                continue;
+            }
+            // SAFETY: `by_value` says the slot holds a value.
+            let v = unsafe { slot.value }.to_raw();
+            if bits & SEEN == 0 {
+                self.words[k].set(v);
+                m.set(m.get() | SEEN << sh);
+                undecided = true;
+            } else if self.words[k].get() != v {
+                m.set(m.get() | VARIES << sh);
+            } else {
+                undecided = true;
+            }
+        }
+        if !undecided {
+            self.learn.set(0);
+        }
+    }
+
+    /// Whether closures gave upvalue `k` different values (`note_closure`),
+    /// or a region's constant guard on it failed (`set_upvalue_varies`).
+    pub(crate) fn upvalue_varies(&self, k: usize) -> bool {
+        let (m, sh) = self.upvalue_mask(k);
+        m.get() >> sh & VARIES != 0
+    }
+
+    /// Mark upvalue `k` as varying; whether it was not already.
+    pub(crate) fn set_upvalue_varies(&self, k: usize) -> bool {
+        let (m, sh) = self.upvalue_mask(k);
+        let old = m.get();
+        m.set(old | VARIES << sh);
+        old >> sh & VARIES == 0
     }
 
     fn site(&self, pc: usize) -> Option<&Cell<u64>> {

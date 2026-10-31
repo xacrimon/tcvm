@@ -23,8 +23,8 @@ pub(crate) const FLOAT_LIMIT: Bits = OTHER;
 /// for a receiver that is no table): a small key was outside the array part,
 /// or over a nil there with the class having `__index`/`__newindex`.
 pub(crate) const ARR_MISS: Bits = BIGINT;
-/// At a call (whose kinds are its first argument's) or a `GETUPVAL`: a value
-/// a region took as constant differed (`ExitTag::Const`).
+/// At a call (whose kinds are its first argument's): a callee a region took
+/// as constant differed (`ExitTag::Const`).
 pub(crate) const CONST_MISS: Bits = MM;
 /// Compiled code exited on operand kinds the site's form does not cover.
 pub(crate) const KIND_EXIT: Bits = 256;

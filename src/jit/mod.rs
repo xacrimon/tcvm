@@ -592,7 +592,14 @@ fn on_exit<'gc>(
             // A closure of the prototype a guard took one closure of: the
             // next compile guards the prototype.
             ExitTag::Const if callee_of_proto(ctx, closure, base, pc) => 0,
-            ExitTag::Const => crate::jit::feedback::CONST_MISS,
+            ExitTag::Const => match upvalue_of(closure, pc) {
+                // Every site of the upvalue loads it from now on.
+                Some(k) => {
+                    closure.proto.feedback.set_upvalue_varies(k);
+                    0
+                }
+                None => crate::jit::feedback::CONST_MISS,
+            },
             _ => 0,
         };
         let extra = extra
@@ -641,9 +648,27 @@ fn on_exit<'gc>(
         // Feedback only grows (kinds, the overflow, misses and metamethod
         // bits, shapes up to `MAX_SHAPES + 1`), so a recompile that learns
         // some is outside the budget, as the never-executed rule's are.
-        let learned = closure.proto.feedback.seen(e.site.unwrap_or(pc) as usize) != e.seen;
+        let learned = exit_seen(closure.proto, e.site.unwrap_or(pc)) != e.seen;
         request_recompile(ctx, region_closure, region, learned);
     }
+}
+
+/// The by-value upvalue `GETUPVAL` at `pc` reads.
+fn upvalue_of(closure: LuaFn<'_>, pc: u32) -> Option<usize> {
+    let i = unsafe { *closure.code.add(pc as usize) };
+    (i.op() == Op::GETUPVAL).then(|| i.b() as usize)
+}
+
+/// What a hot exit at `pc` compares with its copy from the compile
+/// (`ExitInfo::seen`) to tell whether a recompile learns something: the
+/// site's feedback, or for a `GETUPVAL` whether its upvalue varies.
+pub(crate) fn exit_seen(proto: Gc<'_, crate::env::function::Prototype<'_>>, pc: u32) -> u64 {
+    // SAFETY: `pc` is an instruction of `proto`.
+    let i = unsafe { *proto.code.as_ptr().add(pc as usize) };
+    if i.op() == Op::GETUPVAL {
+        return proto.feedback.upvalue_varies(i.b() as usize) as u64;
+    }
+    proto.feedback.seen(pc as usize)
 }
 
 /// Whether the callee of the call at `pc`, whose guard failed, is a closure
