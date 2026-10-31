@@ -12,7 +12,7 @@
 //! [`Local`] handles keep them instead, rooted on the thread until the native
 //! returns.
 
-use std::alloc::{AllocError, Allocator, Layout};
+use std::alloc::{AllocError, Allocator, Layout, StaticAllocator};
 use std::cell::Cell;
 use std::future::Future;
 use std::pin::Pin;
@@ -543,6 +543,10 @@ unsafe impl Allocator for TaskAlloc {
         unsafe { (*self.0).free(p, l) }
     }
 }
+
+// Blocks are freed only by `deallocate`: task boxes are never leaked, and the
+// arena's chunks are released only after `tasks` has dropped them all.
+unsafe impl StaticAllocator for TaskAlloc {}
 
 #[cfg(test)]
 mod tests {

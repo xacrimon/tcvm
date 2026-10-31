@@ -252,8 +252,8 @@ impl<'gc, T: ?Sized + 'gc> Gc<'gc, T> {
     ///
     /// Unlike `AsRef` or `Deref`, the returned reference isn't bound to the `Gc` itself, and
     /// will stay valid for the entirety of the current arena callback.
-    #[inline]
     #[allow(clippy::should_implement_trait)]
+    #[inline]
     pub fn as_ref(self: Gc<'gc, T>) -> &'gc T {
         // SAFETY: The returned reference cannot escape the current arena callback, as `&'gc T`
         // never implements `Collect` (unless `'gc` is `'static`, which is impossible here), and

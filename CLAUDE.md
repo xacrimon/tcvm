@@ -34,7 +34,7 @@ This is a Cargo workspace with two crates: `tcvm` (main) and `tcvm-derive` (proc
 
 ## Toolchain
 
-Requires **nightly Rust** (nightly-2026-04-05, pinned in `rust-toolchain.toml`). Uses these nightly features:
+Requires **nightly Rust** (nightly-2026-08-15, pinned in `rust-toolchain.toml`). Uses these nightly features:
 - `explicit_tail_calls` (`become` keyword) — core to the interpreter dispatch loop
 - `rust_preserve_none_cc` — calling convention for VM opcode handlers
 - `fn_align` — `#[rustc_align(32)]` on dispatch targets
@@ -43,7 +43,6 @@ Requires **nightly Rust** (nightly-2026-04-05, pinned in `rust-toolchain.toml`).
 - `likely_unlikely`
 - `allocator_api`
 - `variant_count`
-- `int_format_into`
 - `offset_of_enum`
 
 Edition 2024.

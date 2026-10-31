@@ -391,6 +391,7 @@ impl ArithOp for IDiv {
     }
 }
 
+#[allow(clippy::question_mark)]
 #[inline(always)]
 pub fn op_bit<'gc, Op: BitOp>(mc: &Mutation<'gc>, lhs: Value, rhs: Value) -> Option<Value<'gc>> {
     let lhs = if let Some(v) = lhs.get_integer() {

@@ -45,8 +45,8 @@ pub unsafe trait Collect<'gc> {
     ///
     /// It is always okay to use the [`Trace::trace_gc`] and [`Trace::trace_gc_weak`] directly as a
     /// potentially less risky alternative when manually implementing `Collect`.
-    #[inline]
     #[allow(unused_variables)]
+    #[inline]
     fn trace<T: Trace<'gc>>(&self, cc: &mut T) {}
 }
 

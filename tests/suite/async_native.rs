@@ -276,17 +276,11 @@ fn nested_deeply() {
     assert_eq!(run(src), Ok("1".into()));
 }
 
-struct NoWake;
-
-impl Wake for NoWake {
-    fn wake(self: std::sync::Arc<Self>) {}
-}
-
 #[test]
 fn waits_on_the_host_across_a_collection() {
     let mut lua = lua_with_natives();
     let ex = start(&mut lua, "return wait({41})[1] + 1");
-    let waker = Waker::from(std::sync::Arc::new(NoWake));
+    let waker = Waker::noop().clone();
     HOST.with(|h| h.0.set(false));
     let pending = lua.enter(|ctx| {
         matches!(

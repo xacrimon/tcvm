@@ -266,8 +266,8 @@ fn leave_stale_class<'gc>(ctx: Context<'gc>, t: Table<'gc>) {
 /// The `__index` half of [`get_fill_ic`]: `t`'s raw lookup missed and its
 /// metatable's `__index` is `index`. `recv` is `t`'s shape when that shape
 /// lacks the key, which a hit in an `__index` table can be cached against.
-#[inline(never)]
 #[allow(clippy::too_many_arguments)]
+#[inline(never)]
 fn get_index_fill_ic<'gc>(
     ctx: Context<'gc>,
     closure: LuaFn<'gc>,
