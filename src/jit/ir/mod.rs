@@ -271,10 +271,32 @@ pub(crate) struct Func<'gc> {
     /// The prototypes guards prove callees closures of, which the region
     /// keeps alive.
     pub(crate) protos: Vec<Gc<'gc, Prototype<'gc>>>,
-    /// The classes whose metamethod bits the code assumes, and which
+    /// What the code assumes of runtime objects, and which groups of facts
     /// (ws2 §5.3); without any, the lazy exits go.
-    pub(crate) deps: Vec<(crate::env::MtCache<'gc>, crate::env::MetamethodBits)>,
+    pub(crate) deps: Vec<(DepOn<'gc>, u64)>,
     cfg: RefCell<Option<Rc<CfgInfo>>>,
+}
+
+/// An object the region assumes something of (`Func::deps`).
+#[derive(Clone, Copy)]
+pub(crate) enum DepOn<'gc> {
+    /// A class's metamethods, by their bits.
+    Class(crate::env::MtCache<'gc>),
+    /// A watched holder's shape, by `deps::SHAPE_GROUP` and `deps::slot_group`.
+    Holder(crate::env::Shape<'gc>),
+}
+
+impl DepOn<'_> {
+    fn word(self) -> u64 {
+        match self {
+            DepOn::Class(c) => c.as_word(),
+            DepOn::Holder(s) => s.as_word(),
+        }
+    }
+
+    pub(crate) fn same(self, other: Self) -> bool {
+        self.word() == other.word()
+    }
 }
 
 /// The type set of a constant `Value` word.

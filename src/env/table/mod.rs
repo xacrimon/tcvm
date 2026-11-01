@@ -131,6 +131,8 @@ impl<'gc> Table<'gc> {
         v: Value<'gc>,
     ) {
         debug_assert!(state.has_room(loc) && to.slot_count() == state.shape.slot_count() + 1);
+        // No cache entry or compiled store moves a watched holder.
+        debug_assert!(!state.shape.is_watched());
         unsafe { *self.slot_ptr(state, loc) = v };
         state.shape = to;
     }
@@ -303,9 +305,11 @@ impl<'gc> Table<'gc> {
         );
         state.enter_mt_shape(ctx.mutation(), shape, mt);
         drop(state);
+        // A watched holder's old shape is never taken again.
         if let Some(mt) = mt
             && from.mt_cache().is_none()
             && shape.mt_home() != MtHome::Aux
+            && !from.is_watched()
         {
             let ms = mt.shape();
             if ms
@@ -343,6 +347,8 @@ impl<'gc> Table<'gc> {
         if !Shape::ptr_eq(state.shape, from) {
             return None;
         }
+        // `set_metatable` records no move from a watched holder's shape.
+        debug_assert!(!from.is_watched());
         match to.mt_home() {
             MtHome::Class if class.owned_by(mt) && !class.is_shared() => {
                 state.shape = to;
@@ -471,8 +477,9 @@ impl<'gc> Table<'gc> {
         if shape.is_dict() {
             state.aux_or_new(mc).mt_cache = Some(class);
         } else {
-            state.shape = shape::transition_adopt(mc, shape, class);
+            state.set_shape(mc, shape::transition_adopt(mc, shape, class));
         }
+        state.watch_index(mc, class);
         class
     }
 
@@ -719,19 +726,88 @@ impl<'gc> TableState<'gc> {
             a.metatable = None;
         }
         match shape.mt_home() {
-            MtHome::Class => self.shape = shape,
+            MtHome::Class => self.set_shape(mc, shape),
             MtHome::Aux => {
-                self.shape = shape;
+                self.set_shape(mc, shape);
                 self.aux_or_new(mc).metatable = mt;
             }
             MtHome::Slot(slot) => {
                 if slot == self.shape.slot_count() && !self.has_room(SlotLoc::new(shape, slot)) {
                     self.grow_spill(mc);
                 }
-                self.shape = shape;
+                self.set_shape(mc, shape);
                 self.named_set(slot, mt.map_or(Value::nil(), Value::table));
             }
         }
+    }
+
+    /// Move to `to`. A watched holder's moves invalidate what code assumed
+    /// of its old shape, and it stays watched in a shape of its own, unless
+    /// it went dict (ws2 §5.2).
+    #[inline(always)]
+    fn set_shape(&mut self, mc: &Mutation<'gc>, to: Shape<'gc>) {
+        let from = self.shape;
+        self.shape = to;
+        if from.is_watched() {
+            self.rewatch(mc, from);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn rewatch(&mut self, mc: &Mutation<'gc>, from: Shape<'gc>) {
+        let any = from.left(mc);
+        let to = self.shape;
+        if to.is_dict() {
+            return;
+        }
+        // A child of `from` is this table's alone already.
+        if to.is_watched() {
+            if any {
+                to.mark_volatile_holder();
+            }
+            return;
+        }
+        let volatile = from.is_volatile_holder() || any;
+        self.shape = to.watched_copy(mc, from.mutable_for(to), volatile);
+    }
+
+    /// Watch this table, which became a class's `__index` (ws2 §5.2): it
+    /// moves to a shape of its own, which no cache entry or compiled code
+    /// has seen. A dict table is not watched.
+    fn watch(&mut self, mc: &Mutation<'gc>) {
+        let s = self.shape;
+        if !s.is_dict() && !s.is_watched() {
+            self.shape = s.watched_copy(mc, 0, false);
+        }
+    }
+
+    /// Watch the table `class`'s `__index` names, which may be this one.
+    fn watch_index(&mut self, mc: &Mutation<'gc>, class: shape::MtCache<'gc>) {
+        let Some(t) = class.mm(shape::MetamethodBits::INDEX).get_table() else {
+            return;
+        };
+        if core::ptr::eq(t.inner().as_ptr(), self) {
+            self.watch(mc);
+        } else if !t.shape().is_watched() {
+            t.inner().borrow_mut(mc).watch(mc);
+        }
+    }
+
+    /// Store `v` to `slot`, string `key`'s, telling a metatable's class and a
+    /// watched holder's dependents.
+    pub(crate) fn set_named(
+        &mut self,
+        mc: &Mutation<'gc>,
+        slot: u32,
+        key: LuaString<'gc>,
+        v: Value<'gc>,
+    ) {
+        if self.shape.is_watched() && !self.named_get(slot).same_bits(&v) {
+            self.shape.slot_changed(mc, slot);
+        }
+        self.named_set(slot, v);
+        self.maybe_update_mt_bit(mc, Value::string(key), v);
     }
 
     /// This table's class as a metatable, adopted by
@@ -776,6 +852,9 @@ impl<'gc> TableState<'gc> {
             return None;
         }
         class.join();
+        // Only `transition_adopt` leaves a memo, on the shape its table
+        // leaves: none is a watched holder's.
+        debug_assert!(!self.shape.is_watched());
         self.shape = to;
         Some(to)
     }
@@ -801,6 +880,12 @@ impl<'gc> TableState<'gc> {
             && let Some(cache) = self.mt_cache()
         {
             cache.member_write(mc, s, value, self.addr());
+            // A class's new `__index` table, set in place.
+            if let Some(t) = value.get_table()
+                && cache.index_table() == Gc::as_ptr(t.inner()) as usize
+            {
+                self.watch_index(mc, cache);
+            }
         }
     }
 
@@ -844,12 +929,16 @@ impl<'gc> TableState<'gc> {
                 c.member_write(fc, key, Value::nil(), addr);
             }
         };
-        let keys = self.shape.keys();
+        let shape = self.shape;
+        let keys = shape.keys();
         let (inline, spilled) = self.named_mut();
-        for (v, &key) in inline.iter_mut().chain(spilled).zip(keys) {
+        for (i, (v, &key)) in inline.iter_mut().chain(spilled).zip(keys).enumerate() {
             if v.is_dead(fc) {
                 *v = Value::nil();
                 cleared(key);
+                if shape.is_watched() {
+                    shape.slot_changed(fc, i as u32);
+                }
             }
         }
         for v in self.array_mut().iter_mut().filter(|v| v.is_dead(fc)) {
@@ -1123,12 +1212,9 @@ impl<'gc> TableState<'gc> {
         }
 
         match self.shape.find_slot(key) {
-            Some(slot) => {
-                // Deletion keeps the slot (nil-valued) so the shape stays stable
-                // and `next` can resume from the deleted key.
-                self.named_set(slot, value);
-                self.maybe_update_mt_bit(ctx.mutation(), Value::string(key), value);
-            }
+            // Deletion keeps the slot (nil-valued) so the shape stays stable
+            // and `next` can resume from the deleted key.
+            Some(slot) => self.set_named(ctx.mutation(), slot, key, value),
             None => self.add_string_key(ctx, key, value, cap),
         }
     }
@@ -1159,7 +1245,7 @@ impl<'gc> TableState<'gc> {
         if !self.has_room(SlotLoc::new(new_shape, slot)) {
             self.grow_spill(ctx.mutation());
         }
-        self.shape = new_shape;
+        self.set_shape(ctx.mutation(), new_shape);
         self.named_set(slot, value);
         self.maybe_update_mt_bit(ctx.mutation(), Value::string(key), value);
     }
@@ -1191,7 +1277,7 @@ impl<'gc> TableState<'gc> {
                 self.grow_spill(mc);
             }
         }
-        self.shape = to;
+        self.set_shape(mc, to);
         for (i, v) in vals.into_iter().enumerate() {
             self.named_set(i as u32, v);
         }

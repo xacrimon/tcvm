@@ -372,16 +372,15 @@ fn remat(f: &mut Func<'_>, v: Val, cx: &mut After<'_>) -> Option<Val> {
     if cx.kept.contains(&same_reg(f, v)) {
         return Some(v);
     }
-    // Another name of the value the call keeps.
-    if same_reg(f, v) == v {
-        let o = origin_of(cx.origin, v);
-        if let Some(&k) = cx
-            .kept
-            .iter()
-            .find(|&&k| origin_of(cx.origin, k) == o && f.ty(k).rep == f.ty(v).rep)
-        {
-            return Some(k);
-        }
+    // Another name of the value the call keeps; a refinement's too (a
+    // repair parameter of a refined load is kept, not the load).
+    let o = origin_of(cx.origin, v);
+    if let Some(&k) = cx
+        .kept
+        .iter()
+        .find(|&&k| origin_of(cx.origin, k) == o && f.ty(k).rep == f.ty(v).rep)
+    {
+        return Some(k);
     }
     // A slot holds `v`, or `v` boxed.
     let rep = f.ty(v).rep;

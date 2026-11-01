@@ -18,7 +18,9 @@ use crate::instruction::Instruction;
 use crate::jit::build::cfg::{Cfg, RegSet};
 use crate::jit::ir::ops::{ExitTag, Op};
 use crate::jit::ir::types::{Refine, Rep, Ty, TypeSet};
-use crate::jit::ir::{Block, BlockCall, ExitKind, Func, Inst, List, RegionMeta, Snap, Val, ValDef};
+use crate::jit::ir::{
+    Block, BlockCall, DepOn, ExitKind, Func, Inst, List, RegionMeta, Snap, Val, ValDef,
+};
 
 #[derive(Debug)]
 pub(crate) enum BuildError {
@@ -219,6 +221,9 @@ pub(crate) struct Builder<'a, 'gc> {
     pc_refines: Vec<(Val, Val)>,
     /// `fact_key` of parameters of sealed blocks, whose arguments are final.
     fact_keys: std::cell::RefCell<crate::jit::FastMap<Val, Val>>,
+    /// The first constant of each pool entry, which facts of every other
+    /// constant of it are kept under.
+    konst_keys: crate::jit::FastMap<u32, Val>,
 }
 
 /// What the builder of an inlined callee knows of its call (E1).
@@ -307,6 +312,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             chain: Vec::new(),
             pc_refines: Vec::new(),
             fact_keys: Default::default(),
+            konst_keys: Default::default(),
         }
     }
 
@@ -351,6 +357,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             chain: Vec::new(),
             pc_refines: Vec::new(),
             fact_keys: Default::default(),
+            konst_keys: Default::default(),
         };
         b.bs.resize_with(n, BlockState::placeholder);
         b
@@ -793,7 +800,10 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     fn fact_key_at(&self, v: Val, depth: u32) -> Val {
         let r = self.root_of(v);
         let ValDef::Param(blk, k) = self.f.vals[r.idx()].def else {
-            return r;
+            return match self.f.def_op(r) {
+                Some(Op::KObj(idx)) => self.konst_keys.get(&idx).copied().unwrap_or(r),
+                _ => r,
+            };
         };
         if depth == 0 || !self.bs[blk.idx()].sealed {
             return r;
@@ -1178,14 +1188,18 @@ impl<'a, 'gc> Builder<'a, 'gc> {
 
     /// Assume `class` keeps `bits` as they are now (ws2 §5.5).
     pub(crate) fn depend_class(&mut self, class: crate::env::MtCache<'gc>, bits: MetamethodBits) {
-        match self
-            .f
-            .deps
-            .iter_mut()
-            .find(|(c, _)| c.as_word() == class.as_word())
-        {
-            Some((_, b)) => *b |= bits,
-            None => self.f.deps.push((class, bits)),
+        self.depend(DepOn::Class(class), bits.bits() as u64);
+    }
+
+    /// Assume the watched holder of `shape` keeps it, and `groups` of it.
+    pub(crate) fn depend_holder(&mut self, shape: crate::env::Shape<'gc>, groups: u64) {
+        self.depend(DepOn::Holder(shape), groups);
+    }
+
+    fn depend(&mut self, on: DepOn<'gc>, groups: u64) {
+        match self.f.deps.iter_mut().find(|(o, _)| o.same(on)) {
+            Some((_, g)) => *g |= groups,
+            None => self.f.deps.push((on, groups)),
         }
     }
 
@@ -1349,6 +1363,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         }
         let idx = self.f.intern(v);
         let k = self.ins(Op::KObj(idx), &[]);
+        self.konst_keys.entry(idx).or_insert(k);
         let set = value_set(v);
         self.set_ty(
             k,

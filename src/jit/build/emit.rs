@@ -969,7 +969,7 @@ fn emit_bnot(b: &mut Builder<'_, '_>, pc: u32, dst: u8, src: u8) {
 fn emit_arith_mm(b: &mut Builder<'_, '_>, insn: Instruction) {
     let op = insn.op();
     let orig = insn.mm_orig();
-    let idx = kind_mm(orig.info().kind).bits().trailing_zeros() as u8;
+    let bit = kind_mm(orig.info().kind);
     let (l, r, number_left) = match op {
         BcOp::ARITH_MMI => {
             let v = b.reg(insn.b());
@@ -1000,7 +1000,7 @@ fn emit_arith_mm(b: &mut Builder<'_, '_>, insn: Instruction) {
         (t, t)
     };
     let p = b.ins(Op::Unbox(Rep::Ptr), &[t]);
-    let f = b.ins(Op::ClassMm(idx), &[p]);
+    let f = tables::class_mm(b, p, bit);
     let none = b.ins(Op::IsType(TypeSet::NIL), &[f]);
     let s = b.snap_before();
     b.ins_snap(Op::GuardFalse, &[none], s, ExitTag::Type);
@@ -1336,7 +1336,10 @@ fn call_br(b: &mut Builder<'_, '_>, c: Val, t: Block, f: Block, succs: &[Block])
 }
 
 /// Emit `arm` into the current block as a cold arm (A5).
-pub(super) fn cold<R>(b: &mut Builder<'_, '_>, arm: impl FnOnce(&mut Builder<'_, '_>) -> R) -> R {
+pub(super) fn cold<'gc, R>(
+    b: &mut Builder<'_, 'gc>,
+    arm: impl FnOnce(&mut Builder<'_, 'gc>) -> R,
+) -> R {
     let was = b.begin_cold();
     let r = arm(b);
     b.end_cold(was);

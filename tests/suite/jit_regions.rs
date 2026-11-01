@@ -2307,3 +2307,146 @@ fn class_changes_reach_metamethod_arms_and_entries() {
         return table.concat(out, ' ')",
     );
 }
+
+/// Methods read through `__index` tables at any depth fold to constants
+/// (ws2 §5.5); replacing one, shadowing an inherited one, deleting one and
+/// re-parenting a holder each reach the compiled readers, from outside, from
+/// a call and from the loop's own stores.
+#[test]
+fn holder_changes_deopt_folded_method_reads() {
+    agrees(
+        "local Base = {}
+        function Base:kind() return 1 end
+        function Base:tag() return 'b' end
+        local Mid = setmetatable({}, {__index = Base})
+        local Derived = setmetatable({}, {__index = Mid})
+        function Derived:extra() return 2 end
+        local function new() return setmetatable({v = 3}, {__index = Derived}) end
+        local o = new()
+        local hook = function(i) end
+        local function run()
+          local s, t = 0, ''
+          for i = 1, 300 do
+            hook(i)
+            s = s + o:kind() + o:extra() + (o.missing and 100 or 0)
+            if i == 300 then t = o:tag() end
+          end
+          return s .. t
+        end
+        local r = {}
+        for k = 1, 10 do r[#r + 1] = run() end
+        Base.kind = function() return 5 end
+        r[#r + 1] = run()
+        Mid.kind = function() return 7 end
+        r[#r + 1] = run()
+        hook = function(i) if i == 150 then Derived.missing = true end end
+        r[#r + 1] = run()
+        hook = function(i) if i == 100 then Derived.missing = nil end end
+        r[#r + 1] = run()
+        hook = function(i) if i == 120 then setmetatable(Derived, {__index = Base}) end end
+        r[#r + 1] = run()
+        Mid.tag = function() return 'm' end
+        hook = function(i) if i == 10 then setmetatable(Derived, {__index = Mid}) end end
+        r[#r + 1] = run()
+        Mid.kind = nil
+        r[#r + 1] = run()
+        local function self_edit()
+          local s = 0
+          for i = 1, 300 do
+            s = s + o:extra()
+            if i == 200 then Derived.extra = function() return 40 end end
+            if i == 250 then rawset(Derived, 'extra', function() return 400 end) end
+          end
+          return s
+        end
+        for k = 1, 5 do r[#r + 1] = self_edit(); Derived.extra = function() return 2 end end
+        return table.concat(r, ',')",
+    );
+}
+
+/// A holder slot that keeps changing is read, not folded, and its stores
+/// stay right once cached; a holder that grows past the shape limit into a
+/// dictionary leaves its dependents.
+#[test]
+fn changing_and_growing_holders() {
+    agrees(
+        "local C = {count = 0}
+        function C:get() return C.count end
+        local mt = {__index = C}
+        local o = setmetatable({}, mt)
+        local function run()
+          local s = 0
+          for i = 1, 300 do
+            C.count = C.count + 1
+            s = s + o:get() + o.count
+          end
+          return s
+        end
+        local r = {}
+        for k = 1, 10 do r[#r + 1] = run() end
+        for i = 1, 600 do C['k' .. i] = i end
+        r[#r + 1] = run()
+        r[#r + 1] = o.k599
+        return table.concat(r, ',')",
+    );
+}
+
+/// An `__index` function past a holder is called with that holder, not the
+/// receiver; one on the receiver's class with the receiver.
+#[test]
+fn index_functions_past_holders_get_the_holder() {
+    agrees(
+        "local B = {}
+        setmetatable(B, {__index = function(t, k) return t == B and 1 or 2 end})
+        local o = setmetatable({}, {__index = B})
+        local p = setmetatable({}, {__index = function(t, k) return t == o and 10 or 20 end})
+        local s = 0
+        for i = 1, 400 do s = s + o.foo + p.bar end
+        return tostring(s)",
+    );
+}
+
+/// String methods fold through the strings' metatable and the `string`
+/// table, which a replaced function reaches.
+#[test]
+fn string_methods_follow_the_string_table() {
+    agrees(
+        "local function run()
+          local n = 0
+          for i = 1, 300 do n = n + #(('ab'):upper()) end
+          return n
+        end
+        local r = {}
+        for k = 1, 10 do r[#r + 1] = run() end
+        local up = string.upper
+        string.upper = function(s) return up(s) .. '!' end
+        r[#r + 1] = run()
+        string.upper = up
+        r[#r + 1] = run()
+        return table.concat(r, ',')",
+    );
+}
+
+/// An arithmetic metamethod of a table whose shape the code knows is
+/// called as a constant; replacing it reaches the loop.
+#[test]
+fn known_arithmetic_metamethods_follow_the_class() {
+    agrees(
+        "local mt = {}
+        mt.__add = function(a, b) return a.v + b end
+        local o = setmetatable({v = 1}, mt)
+        local function run()
+          local s = 0
+          for i = 1, 300 do
+            s = s + o.v
+            s = s + (o + i)
+            if i == 200 then mt.__add = function(a, b) return 1000 end end
+          end
+          mt.__add = function(a, b) return a.v + b end
+          return s
+        end
+        local r = {}
+        for k = 1, 10 do r[#r + 1] = run() end
+        return table.concat(r, ',')",
+    );
+}

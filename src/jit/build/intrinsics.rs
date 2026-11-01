@@ -401,9 +401,12 @@ fn builtin<'gc>(
         };
         b.set(a, r);
     }
-    // `rawset` may change a class (`MtCache::member_write`); a `TAILCALL`
-    // only returns after it.
-    if h == HelperId::RawSet && b.code(b.pc).op() != crate::instruction::Op::TAILCALL {
+    // `rawset` may change a class (`MtCache::member_write`) or a watched
+    // holder, `setmetatable` a holder's shape or adopt one; a `TAILCALL` only
+    // returns after them.
+    if matches!(h, HelperId::RawSet | HelperId::SetMetatable)
+        && b.code(b.pc).op() != crate::instruction::Op::TAILCALL
+    {
         b.flush();
         b.lazy_exit_after();
     }

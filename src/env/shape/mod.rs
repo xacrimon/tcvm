@@ -33,6 +33,7 @@ use crate::env::string::LuaString;
 use crate::env::symbols::METAMETHOD_COUNT;
 use crate::env::table::Table;
 use crate::env::value::Value;
+use crate::jit::deps::{self, DepSlot};
 
 /// V8-style "Map" / hidden class. Copy wrapper over a single Gc pointer
 /// for cheap pass-by-value and pointer-equality identity checks.
@@ -443,6 +444,41 @@ pub struct ShapeData<'gc> {
 
     /// This shape's keys are the first `slot_count`, key `i` in slot `i`.
     keys: Gc<'gc, Keys<'gc>>,
+
+    /// Set when tables of this shape are watched `__index` holders, inherited
+    /// by its children (see [`Watch`]).
+    #[collect(require_static)]
+    watch: Watch,
+    /// The regions assuming a watched holder keeps this shape, or a slot's
+    /// value (ws2 §5.2), by `deps::SHAPE_GROUP` and `deps::slot_group`.
+    deps: DepSlot<'gc>,
+}
+
+/// A watched holder's shape (ws2 §5.2): only the one table, a class's
+/// `__index`, is ever in it, since it is a fresh copy or a child of one, so
+/// compiled code may assume the table's keys and slot values from it. Its
+/// stores are never cached while they could change what was assumed, and
+/// every move to another shape invalidates (`TableState::set_shape`).
+#[derive(Default)]
+pub(crate) struct Watch {
+    on: bool,
+    /// The slots a store changed, by `slot % 63`: their values are not
+    /// assumed (V8's const fields).
+    mutable: Cell<u64>,
+    /// A move off a shape of the table's invalidated code: the compiler
+    /// guards its shape instead (as `MtCacheData::volatile`).
+    volatile: Cell<bool>,
+}
+
+impl Watch {
+    /// A child's: the parent's state, carried on.
+    fn inherit(&self) -> Self {
+        Watch {
+            on: self.on,
+            mutable: Cell::new(self.mutable.get()),
+            volatile: Cell::new(self.volatile.get()),
+        }
+    }
 }
 
 /// [`ShapeData::mt_slot`] of a mono shape: the metatable is the class's owner.
@@ -528,7 +564,7 @@ pub struct MtCacheData<'gc> {
     pub dict_sentinel: Lock<Option<Shape<'gc>>>,
     pub dict_sentinel_poly: Lock<Option<Shape<'gc>>>,
     /// The regions assuming the bits stay (ws2 §5.3), by the bits.
-    deps: Lock<Option<Gc<'gc, crate::jit::deps::DepList<'gc>>>>,
+    deps: DepSlot<'gc>,
     #[collect(require_static)]
     volatile: Cell<bool>,
 }
@@ -789,10 +825,7 @@ impl<'gc> MtCache<'gc> {
     /// Invalidate the code depending on `bits` of this class; a class that
     /// had some is volatile from then on.
     fn changed(self, mc: &Mutation<'gc>, bits: MetamethodBits) {
-        if let Some(list) = self.0.deps.get()
-            && !bits.is_empty()
-            && crate::jit::deps::invalidate(mc, list, bits.bits())
-        {
+        if !bits.is_empty() && deps::invalidate(mc, &self.0.deps, bits.bits() as u64) {
             self.0.volatile.set(true);
         }
     }
@@ -805,18 +838,7 @@ impl<'gc> MtCache<'gc> {
         region: Gc<'gc, crate::jit::region::Region<'gc>>,
         bits: MetamethodBits,
     ) {
-        let list = match self.0.deps.get() {
-            Some(l) => l,
-            None => {
-                let l = Gc::new(mc, RefLock::new(Vec::new()));
-                // Adopting a fresh `Gc` through the lock, as
-                // `ensure_dict_sentinel` does.
-                mc.backward_barrier(Gc::erase(self.0), None);
-                unsafe { self.0.deps.as_cell() }.set(Some(l));
-                l
-            }
-        };
-        crate::jit::deps::add(mc, list, region, bits.bits());
+        deps::add(mc, self.0, &self.0.deps, region, bits.bits() as u64);
     }
 
     /// Whether code that depended on this class was invalidated: the
@@ -1006,6 +1028,8 @@ impl<'gc> Shape<'gc> {
                 inline_cap,
                 transitions: RefLock::new(TransitionTable::new()),
                 keys: Keys::new(mc, &[], 0),
+                watch: Watch::default(),
+                deps: Lock::new(None),
             },
         ))
     }
@@ -1032,6 +1056,8 @@ impl<'gc> Shape<'gc> {
                 inline_cap: 0,
                 transitions: RefLock::new(TransitionTable::new()),
                 keys: Keys::new(mc, &[], 0),
+                watch: Watch::default(),
+                deps: Lock::new(None),
             },
         ))
     }
@@ -1246,6 +1272,103 @@ impl<'gc> Shape<'gc> {
             Some(c) => c.get().intersects(bits),
         }
     }
+
+    /// Whether this is a watched holder's shape (see [`Watch`]).
+    #[inline]
+    pub fn is_watched(self) -> bool {
+        self.data().watch.on
+    }
+
+    /// Whether moves of the watched holder invalidated code before.
+    pub(crate) fn is_volatile_holder(self) -> bool {
+        self.data().watch.volatile.get()
+    }
+
+    pub(crate) fn mark_volatile_holder(self) {
+        self.data().watch.volatile.set(true);
+    }
+
+    /// Whether a store changed `slot` of this watched shape's table, so code
+    /// assumes nothing of its value.
+    pub(crate) fn slot_mutable(self, slot: u32) -> bool {
+        self.data().watch.mutable.get() & deps::slot_group(slot) != 0
+    }
+
+    /// A fresh shape like this one for a table that is now a watched holder,
+    /// with the slots `mutable` (by [`deps::slot_group`]) already changed.
+    pub(crate) fn watched_copy(self, mc: &Mutation<'gc>, mutable: u64, volatile: bool) -> Self {
+        let p = self.data();
+        debug_assert!(!p.is_dict);
+        Shape(Gc::new(
+            mc,
+            ShapeData {
+                parent: p.parent,
+                last_key: p.last_key,
+                adopt_edge: p.adopt_edge,
+                slot_count: p.slot_count,
+                mt_cache: p.mt_cache,
+                mt_slot: p.mt_slot,
+                as_mt: p.as_mt,
+                mirrored: p.mirrored,
+                has_mode: p.has_mode,
+                adopt_memo: Lock::new(None),
+                mt_move: Lock::new(None),
+                is_dict: false,
+                inline_cap: p.inline_cap,
+                transitions: RefLock::new(TransitionTable::new()),
+                keys: p.keys,
+                watch: Watch {
+                    on: true,
+                    mutable: Cell::new(mutable),
+                    volatile: Cell::new(volatile),
+                },
+                deps: Lock::new(None),
+            },
+        ))
+    }
+
+    /// The groups of [`Self::slot_mutable`] for `to`'s keys, which this
+    /// watched shape's table keeps as it moves there.
+    pub(crate) fn mutable_for(self, to: Shape<'gc>) -> u64 {
+        let m = self.data().watch.mutable.get();
+        if m == 0 {
+            return 0;
+        }
+        let mut out = 0;
+        for (i, &k) in to.keys().iter().enumerate() {
+            if self.find_slot(k).is_some_and(|s| self.slot_mutable(s)) {
+                out |= deps::slot_group(i as u32);
+            }
+        }
+        out
+    }
+
+    /// Note that `region` assumes `groups` of this watched shape hold.
+    pub(crate) fn depend(
+        self,
+        mc: &Mutation<'gc>,
+        region: Gc<'gc, crate::jit::region::Region<'gc>>,
+        groups: u64,
+    ) {
+        deps::add(mc, self.0, &self.0.deps, region, groups);
+    }
+
+    /// A store changed `slot` of this watched shape's table: code assuming its
+    /// value is invalidated the first time, as nothing assumes it after.
+    pub(crate) fn slot_changed(self, mc: &Mutation<'gc>, slot: u32) {
+        let w = &self.data().watch;
+        let g = deps::slot_group(slot);
+        if w.mutable.get() & g == 0 {
+            w.mutable.set(w.mutable.get() | g);
+            deps::invalidate(mc, &self.0.deps, g);
+        }
+    }
+
+    /// This watched shape's table left it: everything assumed of it is
+    /// invalidated; whether anything was.
+    pub(crate) fn left(self, mc: &Mutation<'gc>) -> bool {
+        deps::invalidate(mc, &self.0.deps, u64::MAX)
+    }
 }
 
 /// `parent`'s keys with `key` in the next slot: its own array when that
@@ -1315,6 +1438,8 @@ pub fn transition_add_prop<'gc>(
             inline_cap: p.inline_cap,
             transitions: RefLock::new(TransitionTable::new()),
             keys: keys_with(mc, parent, key),
+            watch: p.watch.inherit(),
+            deps: Lock::new(None),
         },
     );
     let parent_write = Gc::write(mc, parent.0);
@@ -1389,6 +1514,8 @@ pub fn transition_set_metatable<'gc>(
             inline_cap: p.inline_cap,
             transitions: RefLock::new(TransitionTable::new()),
             keys,
+            watch: p.watch.inherit(),
+            deps: Lock::new(None),
         },
     );
     let parent_write = Gc::write(mc, parent.0);
@@ -1434,6 +1561,8 @@ pub fn transition_adopt<'gc>(
                     inline_cap: p.inline_cap,
                     transitions: RefLock::new(TransitionTable::new()),
                     keys: p.keys,
+                    watch: p.watch.inherit(),
+                    deps: Lock::new(None),
                 },
             );
             let parent_write = Gc::write(mc, parent.0);

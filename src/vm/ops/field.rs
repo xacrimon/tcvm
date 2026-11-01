@@ -380,35 +380,38 @@ fn set_own_fill_ic<'gc>(
     // A hit stores without telling a metatable's class, so an adopted
     // table's mirrored keys are left uncached; adoption changes the shape.
     let cache = shape.as_mt().is_none() || !mirrored(key);
+    // Nor a watched holder: until a store changed its slot, which code may
+    // assume no more; its moves never.
+    let own_cache = |slot| cache && (!shape.is_watched() || shape.slot_mutable(slot));
     let slot = shape.find_slot(key);
     let existing = slot.map_or(Value::nil(), |s| state.named_get(s));
     if existing.is_nil() && newindex {
-        if cache {
+        if slot.map_or(cache, own_cache) {
             fill_ic(ctx, closure, ic, site, shape_entry(shape, slot));
         }
         return false;
     }
     drop(state);
     let mut state = t.inner().borrow_mut(ctx.mutation());
-    let entry = match slot {
+    let (entry, cache) = match slot {
         Some(slot) => {
-            state.named_set(slot, v);
-            state.maybe_update_mt_bit(ctx.mutation(), k, v);
-            shape_entry(shape, Some(slot))
+            state.set_named(ctx.mutation(), slot, key, v);
+            (shape_entry(shape, Some(slot)), own_cache(slot))
         }
         None => {
             state.add_string_key(ctx, key, v, MAX_PROPERTIES_FAST);
             let to = state.shape();
             // A nil store adds nothing; past the cap the table went dict.
             if Shape::ptr_eq(to, shape) || to.is_dict() {
-                InlineCache::Absent { shape }
+                (InlineCache::Absent { shape }, cache)
             } else {
                 let loc = SlotLoc::new(to, shape.slot_count());
-                InlineCache::Transition {
+                let entry = InlineCache::Transition {
                     from: shape,
                     to,
                     loc,
-                }
+                };
+                (entry, cache && !shape.is_watched())
             }
         }
     };

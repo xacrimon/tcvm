@@ -8,12 +8,13 @@ use crate::env::function::InlineCache;
 use crate::env::string::LuaString;
 use crate::env::table::{SlotLoc, Table};
 use crate::env::value::Value;
-use crate::env::{MetamethodBits, Shape};
+use crate::env::{Function, MetamethodBits, MtCache, Shape};
 use crate::instruction::{Instruction, Op as BcOp};
 use crate::jit::build::emit::{
     arm_end, branch_arm, call_arm_end, calls_mm, cold, enter_join, mm_call,
 };
 use crate::jit::build::{Builder, Shapes};
+use crate::jit::deps;
 use crate::jit::feedback as fb;
 use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL_VAL, HelperId, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
@@ -63,17 +64,169 @@ fn guard_shape<'gc>(b: &mut Builder<'_, 'gc>, t: Val, shape: Shape<'gc>) {
 /// accesses).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Way {
-    /// A load or store of the own slot at this location, the class's
-    /// `__index`/`__newindex` checked on nil.
-    Own(u32, u64),
-    /// The slot at `loc` of an `__index` table of a shape, for this class.
+    /// A load of the own slot at this location, and what a nil there walks
+    /// to.
+    Own(u32, FoundKey),
+    /// A store to the own slot at this location, and the class when its
+    /// `__newindex` may fire (0 when it may not).
+    Store(u32, u64),
+    /// Absent: what the walk finds, unless it is `Live`.
+    Walk(FoundKey),
+    /// The slot at `loc` of an `__index` table of a shape, for this class
+    /// read live.
     Proto(u64, u64, u32, u64),
-    /// Absent: nil unless the class's `__index` answers.
+    /// Absent: nil unless this class, read live, has `__index`.
     Absent(u64),
     /// The generic helper.
     Helper,
     /// Its own arm.
     Unique(usize),
+}
+
+/// Classes and holders an access walks at compile time.
+const MAX_WALK: usize = 8;
+
+/// What the `__index` walk gives for a key that a table of some class lacks
+/// or holds nil, as far as the region may assume it; each assumption is a
+/// dependency (ws2 §5.5).
+#[derive(Clone, Copy)]
+enum Found<'gc> {
+    /// Nil: no `__index` past the tables without the key.
+    Nil,
+    /// A slot of a watched holder that no store changed.
+    Const(Value<'gc>),
+    /// The slot at `loc` of a holder: a watched one's whose value may change,
+    /// or an unwatched one's while it has this shape. Nil walks on.
+    Slot(Table<'gc>, Option<Shape<'gc>>, SlotLoc),
+    /// The `__index` function, called with the receiver, or with the holder
+    /// it is reached from.
+    Call(Function<'gc>, Option<Table<'gc>>),
+    /// Past what the region may assume: the generic walk.
+    Helper,
+    /// The receiver's class may change (volatile or stale): read live.
+    Live(MtCache<'gc>),
+}
+
+/// What makes walks the same, for merged arms (`Found::key`).
+type FoundKey = (u8, u64, u64, u64);
+
+impl Found<'_> {
+    fn key(self) -> FoundKey {
+        let t = |t: Table<'_>| Gc::as_ptr(t.inner()) as u64;
+        match self {
+            Found::Nil => (0, 0, 0, 0),
+            Found::Const(v) => (1, v.to_raw(), 0, 0),
+            Found::Slot(h, s, loc) => (2, t(h), s.map_or(0, |s| s.as_word()), loc.raw() as u64),
+            Found::Call(f, on) => (3, Value::function(f).to_raw(), on.map_or(0, t), 0),
+            Found::Helper => (4, 0, 0, 0),
+            Found::Live(c) => (5, c.as_word(), 0, 0),
+        }
+    }
+}
+
+/// The `__index` walk for `key` from a table of `class` that lacks it or
+/// holds nil: through `__index` tables that are watched holders, their
+/// shapes and unchanged slots assumed (ws2 §5.5).
+fn walk<'gc>(
+    b: &mut Builder<'_, 'gc>,
+    class: Option<MtCache<'gc>>,
+    key: LuaString<'gc>,
+) -> Found<'gc> {
+    let Some(mut class) = class else {
+        return Found::Nil;
+    };
+    if class.is_stale() || class.is_volatile() {
+        return Found::Live(class);
+    }
+    let mut on = None;
+    for _ in 0..MAX_WALK {
+        b.depend_class(class, MetamethodBits::INDEX);
+        let index = class.mm(MetamethodBits::INDEX);
+        if index.is_nil() {
+            return Found::Nil;
+        }
+        if let Some(f) = index.get_function() {
+            return Found::Call(f, on);
+        }
+        let Some(h) = index.get_table() else {
+            return Found::Helper;
+        };
+        let hs = h.shape();
+        if hs.is_dict() {
+            return Found::Helper;
+        }
+        let slot = hs.find_slot(key);
+        if !hs.is_watched() || hs.is_volatile_holder() {
+            return match slot {
+                Some(s) => Found::Slot(h, Some(hs), SlotLoc::new(hs, s)),
+                None => Found::Helper,
+            };
+        }
+        b.depend_holder(hs, deps::SHAPE_GROUP);
+        if let Some(s) = slot {
+            if hs.slot_mutable(s) {
+                return Found::Slot(h, None, SlotLoc::new(hs, s));
+            }
+            b.depend_holder(hs, deps::slot_group(s));
+            let v = h.inner().borrow().named_get(s);
+            if !v.is_nil() {
+                return Found::Const(v);
+            }
+        }
+        match hs.mt_cache() {
+            None => return Found::Nil,
+            Some(c) if c.is_stale() || c.is_volatile() => return Found::Helper,
+            Some(c) => (class, on) = (c, Some(h)),
+        }
+    }
+    Found::Helper
+}
+
+/// `dst` = what `found` (not `Live`) gives the read at `site`.
+fn emit_found<'gc>(b: &mut Builder<'_, 'gc>, dst: u8, found: Found<'gc>, site: &Site<'gc>) -> Val {
+    match found {
+        Found::Nil => b.konst(Value::nil()),
+        Found::Const(v) => b.konst(v),
+        Found::Slot(h, guard, loc) => {
+            let hv = b.konst(Value::table(h));
+            let hp = b.ins(Op::Unbox(Rep::Ptr), &[hv]);
+            if let Some(hs) = guard {
+                guard_shape(b, hp, hs);
+            }
+            let v = b.ins(
+                Op::TabLoad {
+                    loc: loc.raw(),
+                    key: site.kid,
+                },
+                &[hp],
+            );
+            b.field_loads.insert(v, (hv, site.kv));
+            let join = b.new_block();
+            let nil = b.ins(Op::IsType(TypeSet::NIL), &[v]);
+            let present = branch_arm(b, nil);
+            cold(b, |b| {
+                let w = index(b, dst, site.recv, site.key);
+                arm_end(b, join, dst, w);
+            });
+            b.switch_to(present);
+            arm_end(b, join, dst, v);
+            enter_join(b, join);
+            b.reg(dst)
+        }
+        Found::Call(f, on) if calls_mm(b) => {
+            let fv = b.konst(Value::function(f));
+            let this = match on {
+                Some(t) => b.konst(Value::table(t)),
+                None => site.recv,
+            };
+            let join = b.new_block();
+            let w = mm_call(b, fv, &[this, site.key]);
+            call_arm_end(b, join, Some((dst, w)));
+            enter_join(b, join);
+            b.reg(dst)
+        }
+        Found::Call(..) | Found::Helper | Found::Live(_) => index(b, dst, site.recv, site.key),
+    }
 }
 
 /// The class `shape` pins, as a word, 0 without one.
@@ -168,14 +321,9 @@ fn dispatch<'gc>(
 /// live from a class whose dependents were invalidated before; `None` for a
 /// shape without a class, whose tables have no metatable.
 fn class_has<'gc>(b: &mut Builder<'_, 'gc>, shape: Shape<'gc>, bit: MetamethodBits) -> Option<Val> {
-    let class = shape.mt_cache()?;
-    // A stale class has every bit, and changes no more.
-    if class.is_stale() {
-        return Some(b.ins(Op::KB1(true), &[]));
-    }
-    if !class.is_volatile() {
-        b.depend_class(class, bit);
-        return Some(b.ins(Op::KB1(class.get().contains(bit)), &[]));
+    shape.mt_cache()?;
+    if let Some(has) = known_bit(b, shape, bit) {
+        return Some(b.ins(Op::KB1(has), &[]));
     }
     let k = b.intern_shape(shape);
     let bits = b.ins(Op::ClassBits(k), &[]);
@@ -185,19 +333,86 @@ fn class_has<'gc>(b: &mut Builder<'_, 'gc>, shape: Shape<'gc>, bit: MetamethodBi
     Some(b.ins(Op::ICmp(Cc::Ne), &[has, zero]))
 }
 
+/// Whether the class `shape` pins has `bit`, when the region may assume it:
+/// none has none; a stale class has every bit and changes no more; else a
+/// dependency, unless the class is volatile.
+fn known_bit<'gc>(
+    b: &mut Builder<'_, 'gc>,
+    shape: Shape<'gc>,
+    bit: MetamethodBits,
+) -> Option<bool> {
+    let has = bit_now(shape, bit)?;
+    if let Some(class) = shape.mt_cache()
+        && !class.is_stale()
+    {
+        b.depend_class(class, bit);
+    }
+    Some(has)
+}
+
+/// [`known_bit`] without the dependency.
+fn bit_now(shape: Shape<'_>, bit: MetamethodBits) -> Option<bool> {
+    match shape.mt_cache() {
+        None => Some(false),
+        Some(c) if c.is_stale() => Some(true),
+        Some(c) if c.is_volatile() => None,
+        Some(c) => Some(c.get().contains(bit)),
+    }
+}
+
 /// Whether `has` is a constant false: the class lacks the bit for good.
 fn never(b: &Builder<'_, '_>, has: Val) -> bool {
     b.f.def_op(has) == Some(Op::KB1(false))
 }
 
-/// Whether the class of table `t` (a `Ptr`) has `bit`, read live: a table's
-/// shape may be any here.
+/// Whether the class of table `t` (a `Ptr`) has `bit`: a constant when the
+/// shapes `t` may have are known and their classes agree, else read live.
 pub(super) fn class_bit(b: &mut Builder<'_, '_>, t: Val, bit: MetamethodBits) -> Val {
+    if let Some(known) = b.known_shapes(t) {
+        let shapes: Vec<Shape<'_>> = known
+            .as_slice()
+            .iter()
+            .map(|&k| b.f.shapes[k as usize])
+            .collect();
+        if let Some(has) = shapes.first().and_then(|&s| bit_now(s, bit))
+            && shapes.iter().all(|&s| bit_now(s, bit) == Some(has))
+        {
+            for &s in &shapes {
+                known_bit(b, s, bit);
+            }
+            return b.ins(Op::KB1(has), &[]);
+        }
+    }
     let bits = b.ins(Op::TabMmBits, &[t]);
     let mask = b.ki32(bit.bits() as i32);
     let has = b.ins(Op::IAnd, &[bits, mask]);
     let zero = b.ki32(0);
     b.ins(Op::ICmp(Cc::Ne), &[has, zero])
+}
+
+/// The metamethod of `bit` the class of table `t` (a `Ptr`) has: a constant
+/// when the shapes `t` may have are known and share a class that has it,
+/// else read live (nil when it has none).
+pub(super) fn class_mm(b: &mut Builder<'_, '_>, t: Val, bit: MetamethodBits) -> Val {
+    if let Some(known) = b.known_shapes(t) {
+        let classes: Vec<Option<MtCache<'_>>> = known
+            .as_slice()
+            .iter()
+            .map(|&k| b.f.shapes[k as usize].mt_cache())
+            .collect();
+        if let Some(Some(c)) = classes.first().copied()
+            && classes
+                .iter()
+                .all(|x| x.is_some_and(|x| MtCache::ptr_eq(x, c)))
+            && !c.is_stale()
+            && !c.is_volatile()
+            && !c.mm(bit).is_nil()
+        {
+            b.depend_class(c, bit);
+            return b.konst(c.mm(bit));
+        }
+    }
+    b.ins(Op::ClassMm(bit.bits().trailing_zeros() as u8), &[t])
 }
 
 /// The store's barrier, unless the value is never a heap object.
@@ -271,36 +486,56 @@ fn function_or_deopt(b: &mut Builder<'_, '_>, h: HelperId, recv: Val, key: Val) 
     f
 }
 
-/// `dst = v`, or the `__index` walk's answer when `v` is nil and the class
-/// of `shape` has `__index` by then.
+/// `dst = v`, or where `v` is nil what `found`, the walk from a table of
+/// `shape`, gives.
 fn nil_walks<'gc>(
     b: &mut Builder<'_, 'gc>,
     dst: u8,
     shape: Shape<'gc>,
     v: Val,
-    recv: Val,
-    key: Val,
+    site: &Site<'gc>,
+    found: Found<'gc>,
 ) {
-    let has = class_has(b, shape, MetamethodBits::INDEX);
-    if has.is_none_or(|h| never(b, h)) {
+    if let Found::Nil = found {
         b.set(dst, v);
         b.note_def(&[v], None);
         return;
     }
-    let has = has.unwrap();
     let join = b.new_block();
     let nil = b.ins(Op::IsType(TypeSet::NIL), &[v]);
     let not_nil = branch_arm(b, nil);
-    let plain = branch_arm(b, has);
-    cold(b, |b| {
-        let w = index(b, dst, recv, key);
-        arm_end(b, join, dst, w);
-    });
-    b.switch_to(plain);
-    arm_end(b, join, dst, v);
+    if let Found::Live(_) = found {
+        let has = class_has(b, shape, MetamethodBits::INDEX).unwrap();
+        let plain = branch_arm(b, has);
+        cold(b, |b| {
+            let w = index(b, dst, site.recv, site.key);
+            arm_end(b, join, dst, w);
+        });
+        b.switch_to(plain);
+        arm_end(b, join, dst, v);
+    } else {
+        cold(b, |b| {
+            let w = emit_found(b, dst, found, site);
+            arm_end(b, join, dst, w);
+        });
+    }
     b.switch_to(not_nil);
     arm_end(b, join, dst, v);
     enter_join(b, join);
+}
+
+/// `dst = t.key` for a table of `shape` that lacks the key.
+fn absent<'gc>(b: &mut Builder<'_, 'gc>, dst: u8, site: &Site<'gc>, shape: Shape<'gc>) {
+    match walk(b, shape.mt_cache(), site.str()) {
+        found @ Found::Live(_) => {
+            let nil = b.konst(Value::nil());
+            nil_walks(b, dst, shape, nil, site, found);
+        }
+        found => {
+            let v = emit_found(b, dst, found, site);
+            b.set(dst, v);
+        }
+    }
 }
 
 /// `GETFIELD`, `GETTABUP` and `SELF` in all their forms: what the site's
@@ -349,8 +584,7 @@ pub(super) fn emit_get<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
         InlineCache::Absent { shape } => {
             let t = table_of(b, recv);
             guard_shape(b, t, shape);
-            let nil = b.konst(Value::nil());
-            nil_walks(b, dst, shape, nil, recv, key);
+            absent(b, dst, &site, shape);
         }
         InlineCache::ProtoLoad {
             recv: shape,
@@ -360,10 +594,18 @@ pub(super) fn emit_get<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
         } => {
             let t = table_of(b, recv);
             guard_shape(b, t, shape);
-            // The entry's references are live: the collector empties it
-            // when one dies.
-            let holder = Table::from_inner(unsafe { Gc::from_ptr(holder.as_ptr()) });
-            proto_load(b, dst, &site, shape, holder, holder_shape, loc);
+            match walk(b, shape.mt_cache(), site.str()) {
+                Found::Live(_) => {
+                    // The entry's references are live: the collector empties
+                    // it when one dies.
+                    let holder = Table::from_inner(unsafe { Gc::from_ptr(holder.as_ptr()) });
+                    proto_load(b, dst, &site, shape, holder, holder_shape, loc);
+                }
+                found => {
+                    let v = emit_found(b, dst, found, &site);
+                    b.set(dst, v);
+                }
+            }
         }
         InlineCache::Transition { .. } | InlineCache::Empty => {
             let v = index(b, dst, recv, key);
@@ -411,6 +653,13 @@ fn string_method<'gc>(b: &mut Builder<'_, 'gc>, dst: u8, site: &Site<'gc>) -> bo
     );
     let s = b.snap_before();
     b.ins_snap(Op::GuardTrue, &[same], s, ExitTag::Shape);
+    if let Some(class) = ms.as_mt()
+        && let Found::Const(m) = walk(b, Some(class), key)
+    {
+        let m = b.konst(m);
+        b.set(dst, m);
+        return true;
+    }
     // The pool keeps `mt` alive, so its word is not another table's.
     let mv = b.konst(Value::table(mt));
     let mp = b.ins(Op::Unbox(Rep::Ptr), &[mv]);
@@ -506,6 +755,12 @@ struct Site<'gc> {
     kid: u32,
 }
 
+impl<'gc> Site<'gc> {
+    fn str(&self) -> LuaString<'gc> {
+        self.kv.get_string().unwrap()
+    }
+}
+
 /// The shapes a site tests for: its cache's first, those its shape exits
 /// recorded, then, while there is room, those earlier sites tested on the
 /// same receiver value, which it most likely has here too. `None` past
@@ -572,7 +827,8 @@ fn own_load<'gc>(
         &[t],
     );
     b.field_loads.insert(v, (site.recv, site.kv));
-    nil_walks(b, dst, shape, v, site.recv, site.key);
+    let found = walk(b, shape.mt_cache(), site.str());
+    nil_walks(b, dst, shape, v, site, found);
 }
 
 /// `dst = t.key` from the slot at `loc` of `holder`, the `__index` table of
@@ -632,10 +888,15 @@ fn holder_of<'gc>(
 /// exits and is recorded.
 fn get_chain<'gc>(b: &mut Builder<'_, 'gc>, dst: u8, site: &Site<'gc>, shapes: &[Shape<'gc>]) {
     let t = table_of(b, site.recv);
-    let key = site.kv.get_string().unwrap();
-    let way = |_: &mut Builder<'_, 'gc>, _, s: Shape<'gc>| {
+    let key = site.str();
+    // Each shape's walk, its dependencies taken: an arm serves shapes of
+    // any class whose walks agree.
+    let way = |b: &mut Builder<'_, 'gc>, _, s: Shape<'gc>| {
+        let found = walk(b, s.mt_cache(), key);
         if let Some(slot) = s.find_slot(key) {
-            Way::Own(SlotLoc::new(s, slot).raw(), class_word(s))
+            Way::Own(SlotLoc::new(s, slot).raw(), found.key())
+        } else if !matches!(found, Found::Live(_)) {
+            Way::Walk(found.key())
         } else if let Some((holder, hs, loc)) = holder_of(s, key) {
             let h = Gc::as_ptr(holder.inner()) as u64;
             Way::Proto(h, hs.as_word(), loc.raw(), class_word(s))
@@ -644,13 +905,13 @@ fn get_chain<'gc>(b: &mut Builder<'_, 'gc>, dst: u8, site: &Site<'gc>, shapes: &
         }
     };
     dispatch(b, t, shapes, way, |b, s| {
+        let found = walk(b, s.mt_cache(), key);
         if let Some(slot) = s.find_slot(key) {
             own_load(b, dst, site, s, t, SlotLoc::new(s, slot));
-        } else if let Some((holder, hs, loc)) = holder_of(s, key) {
+        } else if let (Found::Live(_), Some((holder, hs, loc))) = (found, holder_of(s, key)) {
             proto_load(b, dst, site, s, holder, hs, loc);
         } else {
-            let nil = b.konst(Value::nil());
-            nil_walks(b, dst, s, nil, site.recv, site.key);
+            absent(b, dst, site, s);
         }
     });
 }
@@ -682,20 +943,27 @@ pub(super) fn emit_set<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
             let t = table_of(b, recv);
             let ks = kv.get_string().unwrap();
             let mc = b.ctx.mutation();
-            // A store to a metatable's mirrored key tells its class.
+            // A store to a metatable's mirrored key tells its class, one to a
+            // watched holder its dependents.
             let tells = |s: Shape<'gc>| s.as_mt().is_some() && crate::env::shape::mirrored(ks);
-            let way = |_: &mut Builder<'_, 'gc>, n, s: Shape<'gc>| match (
+            let way = |b: &mut Builder<'_, 'gc>, n, s: Shape<'gc>| match (
                 s.find_slot(ks),
                 s.prop_child(mc, ks),
             ) {
-                _ if tells(s) => Way::Helper,
-                (Some(slot), _) => Way::Own(SlotLoc::new(s, slot).raw(), class_word(s)),
+                _ if tells(s) || !stores_inline(s, ks) => Way::Helper,
+                (Some(slot), _) => {
+                    let k = match known_bit(b, s, MetamethodBits::NEWINDEX) {
+                        Some(false) => 0,
+                        _ => class_word(s),
+                    };
+                    Way::Store(SlotLoc::new(s, slot).raw(), k)
+                }
                 (None, Some(to)) if !to.is_dict() => Way::Unique(n),
                 (None, _) => Way::Helper,
             };
             dispatch(b, t, &shapes, way, |b, s| {
                 match (s.find_slot(ks), s.prop_child(mc, ks)) {
-                    _ if tells(s) => newindex(b, recv, key, v, false),
+                    _ if tells(s) || !stores_inline(s, ks) => newindex(b, recv, key, v, false),
                     (Some(slot), _) => own_store(b, s, t, SlotLoc::new(s, slot), kid, v),
                     (None, Some(to)) if !to.is_dict() => {
                         let loc = SlotLoc::new(to, s.slot_count());
@@ -708,7 +976,13 @@ pub(super) fn emit_set<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
         }
         Some(_) => {}
     }
+    let ks = kv.get_string().unwrap();
     match ic {
+        InlineCache::Own { shape, .. } | InlineCache::Transition { from: shape, .. }
+            if !stores_inline(shape, ks) =>
+        {
+            newindex(b, recv, key, v, false);
+        }
         InlineCache::Own { shape, loc } => {
             let t = table_of(b, recv);
             guard_shape(b, t, shape);
@@ -723,6 +997,13 @@ pub(super) fn emit_set<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
             newindex(b, recv, key, v, false);
         }
     }
+}
+
+/// Whether compiled code may store `key` to tables of `shape` itself: a
+/// watched holder only to a slot an earlier store changed, so nothing
+/// assumes its value, and never adding a key (ws2 §5.2).
+fn stores_inline<'gc>(shape: Shape<'gc>, key: LuaString<'gc>) -> bool {
+    !shape.is_watched() || shape.find_slot(key).is_some_and(|s| shape.slot_mutable(s))
 }
 
 /// `t.key = v` for a table of shape `from` that lacks the key: `to` with

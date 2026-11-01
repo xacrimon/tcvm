@@ -544,3 +544,65 @@ fn class_writes_invalidate_dependent_regions() {
         assert!(left >= 1);
     });
 }
+
+/// Reads through `__index` tables fold to what the watched holders hold
+/// (ws2 §5.5): a method two holders up is a constant callee, an own field
+/// of a class whose walk ends in nil needs no nil test, and a key no holder
+/// has is nil; nothing reads a class or a holder.
+#[test]
+fn holder_reads_fold() {
+    let src = "local Base = {}
+    function Base:kind() return 1 end
+    local Mid = setmetatable({}, {__index = Base})
+    local C = setmetatable({}, {__index = Mid})
+    local o = setmetatable({v = 3}, {__index = C})
+    function f()
+        local s = 0
+        for i = 1, 300 do
+            s = s + o:kind() + o.v
+            if o.missing then s = s + 1 end
+        end
+        return s
+    end
+    f()";
+    let ir = ir_of(src, "f", 0);
+    for op in [
+        "classindex",
+        "classbits",
+        "call.index",
+        "istype val:nil",
+        "call r",
+    ] {
+        assert!(!ir.contains(op), "{op} in {ir}");
+    }
+}
+
+/// A refined parameter is kept across a call in a loop as the repair
+/// parameter standing for it, and its unboxed use after the next call is
+/// made again from that (permute's `permute`, once its field reads lost
+/// their nil arms).
+#[test]
+fn unboxed_refinements_survive_repeated_calls() {
+    let src = "local P = setmetatable({count = 0, v = {0, 0, 0, 0, 0, 0}}, {__index = {}})
+    function P:rec(n)
+        self.count = self.count + 1
+        if n ~= 0 then
+            local n1 = n - 1
+            self:rec(n1)
+            for i = n, 1, -1 do
+                self:swap(n, i)
+                self:rec(n1)
+                self:swap(n, i)
+            end
+        end
+    end
+    function P:swap(i, j)
+        local t = self.v[i]
+        self.v[i] = self.v[j]
+        self.v[j] = t
+    end
+    for k = 1, 3 do P:rec(5) end
+    f = P.rec";
+    let ir = ir_of(src, "f", 0);
+    assert!(ir.contains("call"), "{ir}");
+}

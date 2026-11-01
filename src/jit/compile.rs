@@ -5,9 +5,9 @@ use crate::env::function::LuaFn;
 use crate::env::value::Value;
 use crate::jit::build::cfg::{Cfg, CfgError};
 use crate::jit::build::{BuildError, Builder, remove_trivial_params, value_set};
-use crate::jit::ir::Func;
 use crate::jit::ir::types::TypeSet;
 use crate::jit::ir::verify::verify;
+use crate::jit::ir::{DepOn, Func};
 use crate::jit::opt;
 use crate::jit::opt::speculate::EntryKinds;
 use crate::lua::Context;
@@ -574,8 +574,14 @@ pub(crate) fn compile<'gc>(
         let weak = crate::dmm::Gc::downgrade(region);
         state.borrow_mut(ctx.mutation()).callers.push((weak, off));
     }
-    for &(class, bits) in &f.deps {
-        class.depend(ctx.mutation(), region, bits);
+    for &(on, groups) in &f.deps {
+        match on {
+            DepOn::Class(c) => {
+                let bits = crate::env::MetamethodBits::from_bits_retain(groups as u32);
+                c.depend(ctx.mutation(), region, bits);
+            }
+            DepOn::Holder(s) => s.depend(ctx.mutation(), region, groups),
+        }
     }
     Ok(region)
 }
