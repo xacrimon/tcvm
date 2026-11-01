@@ -2505,6 +2505,43 @@ fn tail_calls_take_over_the_region_frame() {
     );
 }
 
+/// A tail call of the region frame's replacement (W3 step 6b) inlines in
+/// its place only a constant callee: `mid` takes over `outer`'s frame, and
+/// `t.f`, a closure of a prototype that made several, is called for real.
+/// No slot below the region frame's window holds such a closure for exits
+/// (its header entry was register `-4`). `mid2`'s constant `leaf` takes
+/// `outer2`'s frame in turn.
+#[test]
+fn replacements_inline_constant_tail_callees_only() {
+    compiles_cleanly(
+        "local xs = {}
+        for i = 1, 3000 do xs[i] = i end
+        xs[2500] = 0.5
+        local function mk(k)
+          return function(i)
+            local v = xs[i] * k
+            local ok, e = pcall(error, 'm', 2)
+            return v, e
+          end
+        end
+        local o, h3 = {f = mk(2)}, mk(3)
+        local function mid(t, i) return t.f(i) end
+        local function outer(i) return mid(o, i) end
+        local leaf = mk(4)
+        local function mid2(i) return leaf(i) end
+        local function outer2(i) return mid2(i) end
+        local s, at, at2 = 0
+        for i = 1, 3000 do
+          local ok, v, e = pcall(outer, i)
+          local ok2, v2, e2 = pcall(outer2, i)
+          s = s + v + v2
+          if i == 2500 then at, at2 = e, e2 end
+        end
+        return s .. ' ' .. at .. ' ' .. at2 .. ' ' .. h3(1)",
+        true,
+    );
+}
+
 /// A function region's tail calls of itself are its loop (W3 step 6c), the
 /// frame reused as the interpreter's `TAILCALL` reuses it: level 3 from
 /// `find` is the loop calling it. `f1` and `f2` are closures of one

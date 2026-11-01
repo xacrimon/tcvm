@@ -65,6 +65,9 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
     if replace && b.cfg.captured.iter().next().is_some() {
         return false;
     }
+    // In the region frame's place (its tail call or a replacement's) only a
+    // constant callee: below the frame's window no slot holds a closure.
+    let in_region_place = tail && (b.inline.as_ref()).is_none_or(|i| i.region_return);
     let (a, nb) = (insn.a(), insn.b());
     let c = match &b.inline {
         Some(i) if tail => b.f.inline_frames[i.frame as usize].c,
@@ -88,7 +91,7 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
             Some(lf) => (lf, false),
             None => return false,
         },
-        Callee::Proto(_, Some(lf)) if !replace => (lf, true),
+        Callee::Proto(_, Some(lf)) if !in_region_place => (lf, true),
         Callee::Proto(..) | Callee::Unknown => return false,
     };
     let proto = lf.proto;

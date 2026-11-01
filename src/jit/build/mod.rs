@@ -328,13 +328,14 @@ pub(crate) enum Top {
 
 impl Inline {
     /// The enclosing frames' entries without its own header's (a callee
-    /// known by its prototype), for what replaces its frame.
+    /// known by its prototype), for what replaces its frame. One in the
+    /// region frame's place (base 0) has no header slot.
     pub(crate) fn outer_entries(&self) -> Vec<(u8, Val)> {
-        let hdr = (self.base - 4) as u8;
+        let hdr = self.base.checked_sub(4);
         self.outer
             .iter()
             .copied()
-            .filter(|&(r, _)| r != hdr)
+            .filter(|&(r, _)| Some(r as usize) != hdr)
             .collect()
     }
 }

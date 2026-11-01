@@ -137,6 +137,7 @@ handler! {
         let mut fclosure: LuaFn<'gc> = unsafe { frame::closure(base) };
         let region_closure = fclosure;
         for fr in snap.frames() {
+            debug_assert!(fr.delta != 0 || fr.func & crate::jit::region::DYNAMIC == 0);
             let f = if fr.func & crate::jit::region::DYNAMIC != 0 {
                 unsafe { *fbase.add(fr.a as usize) }
             } else {
