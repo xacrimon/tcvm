@@ -2024,6 +2024,34 @@ fn deep_misses_find_their_sites() {
     agrees(src);
 }
 
+/// More live values than the registers once allocatable, so x23 and x24
+/// hold some (W4 §3: no longer the runtime and closure), across a helper
+/// call and into an exit, which restores them from their image slots.
+#[test]
+fn values_in_former_pinned_registers_survive_exits() {
+    agrees(
+        "local function f(n, t)
+          local a, b, c, d, e, g, h, i, j, k = 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+          local l, m, o, p, q, r, s, u, v, w = 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
+          local acc = 0
+          for x = 1, n do
+            a = (a + x) % 997 b = (b + a) % 997 c = (c + b) % 997 d = (d + c) % 997
+            e = (e + d) % 997 g = (g + e) % 997 h = (h + g) % 997 i = (i + h) % 997
+            j = (j + i) % 997 k = (k + j) % 997 l = (l + k) % 997 m = (m + l) % 997
+            o = (o + m) % 997 p = (p + o) % 997 q = (q + p) % 997 r = (r + q) % 997
+            s = (s + r) % 997 u = (u + s) % 997 v = (v + u) % 997 w = (w + v) % 997
+            acc = acc + #tostring(x) + t[x % #t + 1]
+          end
+          return table.concat({a, b, c, d, e, g, h, i, j, k, l, m, o, p, q, r, s, u, v, w, acc}, ' ')
+        end
+        local t = {}
+        for x = 1, 50 do t[x] = x end
+        local out = f(2000, t)
+        t[50] = 0.5
+        return out .. ' / ' .. f(2000, t)",
+    );
+}
+
 /// A panic in a native that compiled code called, under a chain of fast
 /// calls, unwinds through their frames (`unwind::Fde`) to the host.
 #[test]

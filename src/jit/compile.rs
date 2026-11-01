@@ -357,6 +357,13 @@ pub(crate) fn compile<'gc>(
         dead_entry: crate::jit::jit_dead_entry as *const () as usize,
         level_enter: abi::level_enter as *const () as usize,
         call_miss: abi::call_miss as *const () as usize,
+        rt: crate::jit::layout::rt_word(ctx) as u64,
+        metrics: crate::jit::layout::rt_read(ctx, crate::jit::layout::METRICS) as u64,
+        type_mt_cells: std::array::from_fn(|s| {
+            crate::jit::layout::rt_read(ctx, crate::jit::layout::type_mt_cell(s as u8)) as u64
+        }),
+        level_ret: abi::level_return_addr() as u64,
+        level_land: abi::level_land() as u64,
         trampolines,
         direct: f
             .protos

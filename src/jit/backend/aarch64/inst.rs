@@ -90,8 +90,9 @@ pub(crate) enum MInst {
     StoreSlot(u8),
     /// `[use v]` (float): `R[r] = v` as a float `Value`.
     StoreSlotF(u8),
-    /// `[def d]`: a by-value upvalue of the running closure.
-    LoadUpval(u8),
+    /// `[def d]`: the frame's closure, from its header (W4 §3: no register
+    /// holds it), for its upvalues.
+    FrameClosure,
     /// `[def d, use c]`: a by-value upvalue of the closure `c`.
     LoadUpvalOf(u8),
     /// `[def d, use n, use m]`.

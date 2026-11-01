@@ -136,7 +136,7 @@ struct Em<'a> {
     /// Per resume block, its call's miss path (`miss_path`), which its site
     /// names (`abi::call_miss`).
     miss: Vec<Label>,
-    /// Per resume block, past the fast resume's `BASE` and `CLOSURE`, which
+    /// Per resume block, past the fast resume's `BASE`, which
     /// a native call keeps and a level's return restores.
     resume_based: Vec<Label>,
     /// The code's first word, the region pointer (`Region::of_return`).
@@ -194,6 +194,14 @@ pub(crate) struct Helpers {
     /// `abi::level_enter` and `abi::call_miss`.
     pub(crate) level_enter: usize,
     pub(crate) call_miss: usize,
+    /// The runtime (the handler ABI's x23), and what code reads through it
+    /// that stays put for the runtime's life: the arena's `Metrics`, the
+    /// type metatables' cells, and the level's return and landing.
+    pub(crate) rt: u64,
+    pub(crate) metrics: u64,
+    pub(crate) type_mt_cells: [u64; 6],
+    pub(crate) level_ret: u64,
+    pub(crate) level_land: u64,
     /// The trampolines of the helpers cold arms call: (helper, trampoline).
     pub(crate) trampolines: Vec<(usize, usize)>,
     /// Known callees' prototypes (their boxes) and where a direct call of
@@ -477,17 +485,19 @@ pub(crate) fn emit(
         // from the header the tail call wrote.
         em.a.bind(fast_miss);
         let dispatched = em.a.new_label();
-        em.a.ldr(X17, RT, layout::LEVEL_LAND as i32);
+        em.a.ldr_lit(X17, em.helpers.level_land);
         em.a.cmp(Sz::X, LR, X17);
         em.a.b_cond(Cond::Eq, dispatched);
         em.a.b_far(em.helpers.call_miss);
         em.a.bind(dispatched);
+        // The tail call left its callee in `CLOSURE`.
         em.a.movz(Sz::X, X16, FUNCTION_TAG, 3);
         em.a.orr(Sz::X, X16, X16, CLOSURE);
         em.a.str(X16, BASE, -32);
         em.a.sub_imm(Sz::X, PC, BASE, 32);
         em.a.mov(BASE, ZR);
-        em.a.ldr(LR, RT, layout::LEVEL_RET as i32);
+        em.a.ldr_lit(RT, em.helpers.rt);
+        em.a.ldr_lit(LR, em.helpers.level_ret);
         em.a.b_far(em.helpers.enter);
     }
     let exits = l
@@ -721,7 +731,6 @@ impl Em<'_> {
             self.a.str(ZR, BASE, hdr + 8);
         }
         self.a.add_imm(Sz::X, BASE, BASE, hdr as u64 + 32);
-        self.a.mov(CLOSURE, X16);
         let deep = self.a.new_label();
         self.a.mov_sp(Gpr(9), SP);
         self.a.ldr(Gpr(10), THREAD, layout::NATIVE_DEEP as i32);
@@ -743,14 +752,11 @@ impl Em<'_> {
     }
 
     /// Where a fast callee whose entry checks failed goes (its site's
-    /// `miss`): the caller's `BASE` and `CLOSURE` and word 0's callee value
-    /// back, then its slow path at `slow`, whose level keeps that
-    /// `CLOSURE`.
+    /// `miss`): the caller's `BASE` and word 0's callee value back, then its
+    /// slow path at `slow`.
     fn miss_path(&mut self, hdr: i32, block: usize, slow: Label) {
         self.a.bind(self.miss[self.v.succs(block)[0].index()]);
         self.a.sub_imm(Sz::X, BASE, BASE, hdr as u64 + 32);
-        self.a.ldr(CLOSURE, BASE, -32);
-        self.a.and_imm(Sz::X, CLOSURE, CLOSURE, PTR_MASK);
         self.a.ldr(X16, BASE, hdr);
         self.a.movz(Sz::X, X17, FUNCTION_TAG, 3);
         self.a.orr(Sz::X, X16, X16, X17);
@@ -794,7 +800,7 @@ impl Em<'_> {
             }
         }
         let win = hdr as u64 + 32;
-        self.a.mov(Gpr(0), RT);
+        self.a.ldr_lit(Gpr(0), self.helpers.rt);
         self.a.add_imm(Sz::X, Gpr(1), BASE, win);
         if from.is_ok() {
             self.a.mov(Gpr(2), INSN);
@@ -830,6 +836,7 @@ impl Em<'_> {
         self.a.mov(INSN, Gpr(0));
         self.a.add_imm(Sz::X, PC, BASE, hdr as u64);
         self.a.add_imm(Sz::X, X17, BASE, win);
+        self.handler_regs();
         self.a.ldr_lit(X16, self.helpers.native_act as u64);
         self.a.bl_far(self.helpers.level);
         let back = self.a.new_label();
@@ -900,6 +907,7 @@ impl Em<'_> {
         self.a.str(X16, BASE, hdr + 24);
         self.a.add_imm(Sz::X, PC, BASE, hdr as u64);
         self.a.add_imm(Sz::X, X17, BASE, hdr as u64 + 32);
+        self.handler_regs();
         self.a.ldr_lit(X16, self.helpers.enter as u64);
         self.a.bl_far(self.helpers.level);
         let back = self.a.new_label();
@@ -913,10 +921,11 @@ impl Em<'_> {
     /// level returning to its caller, its header made to return through it.
     fn tail_level(&mut self) {
         let level = self.a.new_label();
-        self.a.ldr(X17, RT, layout::LEVEL_LAND as i32);
+        self.handler_regs();
+        self.a.ldr_lit(X17, self.helpers.level_land);
         self.a.cmp(Sz::X, LR, X17);
         self.a.b_cond(Cond::Ne, level);
-        self.a.ldr(LR, RT, layout::LEVEL_RET as i32);
+        self.a.ldr_lit(LR, self.helpers.level_ret);
         self.a.br(X16);
         self.a.bind(level);
         self.a.ldr(Gpr(9), BASE, -24);
@@ -927,6 +936,14 @@ impl Em<'_> {
         self.a.str(Gpr(9), BASE, -24);
         self.a.mov(X17, BASE);
         self.a.b_far(self.helpers.level);
+    }
+
+    /// The handler ABI's runtime and closure registers, for code going on
+    /// into a handler or a level: the frame's closure from its header.
+    fn handler_regs(&mut self) {
+        self.a.ldr_lit(RT, self.helpers.rt);
+        self.a.ldr(CLOSURE, BASE, -32);
+        self.a.and_imm(Sz::X, CLOSURE, CLOSURE, PTR_MASK);
     }
 
     /// Record the call at VCode instruction `i` and its return addresses:
@@ -1202,10 +1219,10 @@ impl Em<'_> {
                 let v = self.fr(i, 0);
                 self.a.str_d(v, BASE, r as i32 * 8);
             }
-            LoadUpval(k) => {
+            FrameClosure => {
                 let d = self.r(i, 0);
-                let off = crate::jit::compile::upvalues_offset() + k as usize * 8;
-                self.a.ldr(d, CLOSURE, off as i32);
+                self.a.ldr(d, BASE, -32);
+                self.a.and_imm(Sz::X, d, d, PTR_MASK);
             }
             LoadUpvalOf(k) => {
                 let (d, c) = (self.r(i, 0), self.r(i, 1));
@@ -1422,7 +1439,7 @@ impl Em<'_> {
                 self.a.orr_imm(Sz::X, Gpr(0), Gpr(1), 0xFFFF_FFFF_0000_0000);
                 self.a.b(done);
                 self.a.bind(slow);
-                self.a.mov(Gpr(0), RT);
+                self.a.ldr_lit(Gpr(0), self.helpers.rt);
                 self.a.bl_far(self.helpers.box_i64);
                 if exit != u32::MAX {
                     self.gc_check(exit);
@@ -1547,14 +1564,18 @@ impl Em<'_> {
             }
             NumMtSet => {
                 let d = self.r(i, 0);
-                self.a.ldr(X16, RT, layout::NUMBER_MT_CELL as i32);
+                self.a.ldr_lit(
+                    X16,
+                    self.helpers.type_mt_cells[layout::NUMBER_MT_SLOT as usize],
+                );
                 self.a.ldr(X16, X16, layout::NUMBER_MT as i32);
                 self.a.cmp_imm(Sz::X, X16, 0);
                 self.a.cset(Sz::W, d, Cond::Ne);
             }
             TypeMtIs { slot, word } => {
                 let d = self.r(i, 0);
-                self.a.ldr(X16, RT, layout::type_mt_cell(slot) as i32);
+                self.a
+                    .ldr_lit(X16, self.helpers.type_mt_cells[slot as usize]);
                 self.a.ldr(X16, X16, layout::NUMBER_MT as i32);
                 self.a.ldr_lit(X17, word);
                 self.a.cmp(Sz::X, X16, X17);
@@ -1797,7 +1818,7 @@ impl Em<'_> {
                 let skip = self.a.new_label();
                 self.a.ldr(X16, Gpr(1), layout::T_HEADER);
                 self.a.tbnz(X16, 0, skip);
-                self.a.mov(Gpr(0), RT);
+                self.a.ldr_lit(Gpr(0), self.helpers.rt);
                 self.a
                     .bl_far(crate::jit::helpers::jit_barrier as *const () as usize);
                 self.a.bind(skip);
@@ -1843,7 +1864,7 @@ impl Em<'_> {
                 let sig = h.sig();
                 for (k, c) in sig.ctx.iter().enumerate() {
                     match c {
-                        Ctx::Rt => self.a.mov(Gpr(k as u8), RT),
+                        Ctx::Rt => self.a.ldr_lit(Gpr(k as u8), self.helpers.rt),
                         Ctx::Thread => self.a.mov(Gpr(k as u8), THREAD),
                         Ctx::Base => self.a.mov(Gpr(k as u8), BASE),
                     }
@@ -1971,7 +1992,8 @@ impl Em<'_> {
                 self.close_frame();
                 self.a.ldr_lit(INSN, word);
                 self.a.ldr_lit(PC, pc_after as u64);
-                self.a.ldr(X16, RT, op as i32 * 8);
+                self.a.ldr_lit(X16, self.helpers.rt);
+                self.a.ldr(X16, X16, op as i32 * 8);
                 self.tail_level();
             }
             TailEnter { nargs, known } => {
@@ -2033,17 +2055,15 @@ impl Em<'_> {
                 self.a.ldr(INSN, X16, 0);
                 self.a.add_imm(Sz::X, PC, X16, 8);
                 self.a.and_imm(Sz::X, X17, INSN, 0xff);
-                self.a.ldr_idx(X16, RT, X17, Extend::Lsl, true);
+                self.a.ldr_lit(X16, self.helpers.rt);
+                self.a.ldr_idx(X16, X16, X17, Extend::Lsl, true);
                 self.tail_level();
             }
             Resume { wanted, c, a, hdr } => {
                 // A fast callee returns here (`fall_into_resume`).
                 self.a.bind(self.fast_resume[block]);
-                // The callee's base is past the header at `hdr`; our header's
-                // word 0 is our closure.
+                // The callee's base is past the header at `hdr`.
                 self.a.sub_imm(Sz::X, BASE, BASE, hdr as u64 * 8 + 32);
-                self.a.ldr(CLOSURE, BASE, -32);
-                self.a.and_imm(Sz::X, CLOSURE, CLOSURE, PTR_MASK);
                 self.a.bind(self.resume_based[block]);
                 match wanted {
                     0 if c == 1 => {}
@@ -2084,7 +2104,7 @@ impl Em<'_> {
                         }
                         self.a.bind(helper);
                         // Land through the helper: (rt, thread, base, a, values, nret, c).
-                        self.a.mov(Gpr(0), RT);
+                        self.a.ldr_lit(Gpr(0), self.helpers.rt);
                         self.a.mov(Gpr(1), THREAD);
                         self.a.mov(Gpr(4), PC);
                         self.a.mov(Gpr(5), INSN);
@@ -2174,7 +2194,7 @@ impl Em<'_> {
     }
 
     fn gc_check(&mut self, exit: u32) {
-        self.a.ldr(X16, RT, crate::jit::layout::METRICS as i32);
+        self.a.ldr_lit(X16, self.helpers.metrics);
         self.a
             .ldp(X16, X17, X16, crate::jit::layout::GC_CHECK as i32);
         self.a.cmp(Sz::X, X16, X17);

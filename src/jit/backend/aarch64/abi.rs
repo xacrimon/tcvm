@@ -9,9 +9,16 @@ pub(crate) use crate::jit::state::IMAGE_SPILLS;
 
 /// Pinned for a region's whole body.
 pub(crate) const BASE: Gpr = Gpr(22);
+pub(crate) const THREAD: Gpr = Gpr(25);
+/// The handler ABI's runtime and closure: allocatable in a region (W4 §3),
+/// set where code goes on into a handler or a stub that reads them. The
+/// runtime is a constant of the region; a level's record keeps it
+/// (`abi::jit_level`), where stubs without it find it (`RT_OF_LEVEL`).
 pub(crate) const RT: Gpr = Gpr(23);
 pub(crate) const CLOSURE: Gpr = Gpr(24);
-pub(crate) const THREAD: Gpr = Gpr(25);
+/// Where a level's record keeps the runtime (its x23), from the record.
+pub(crate) const RT_OF_LEVEL: usize = crate::vm::stack::rec::X + 32;
+const PTR_MASK: u64 = (1 << 48) - 1;
 /// The handler slots loaded at every tail-out.
 pub(crate) const INSN: Gpr = Gpr(20);
 pub(crate) const PC: Gpr = Gpr(21);
@@ -22,7 +29,7 @@ pub(crate) const D31: Fpr = Fpr(31);
 
 /// Allocatable integer registers, caller-saved first.
 pub(crate) const INT_PREFERRED: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
-pub(crate) const INT_OTHER: [u8; 6] = [19, 20, 21, 26, 27, 28];
+pub(crate) const INT_OTHER: [u8; 8] = [19, 20, 21, 23, 24, 26, 27, 28];
 pub(crate) const FLOAT_PREFERRED: [u8; 23] = [
     0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
 ];
@@ -97,10 +104,11 @@ pub(crate) fn image_index(p: PReg) -> u8 {
         RegClass::Int => match n {
             0..=15 => n,
             19..=21 => 16 + (n - 19),
-            26..=28 => 19 + (n - 26),
+            23..=24 => 19 + (n - 23),
+            26..=28 => 21 + (n - 26),
             _ => panic!("x{n} is not allocatable"),
         },
-        RegClass::Float => 22 + n,
+        RegClass::Float => 24 + n,
         RegClass::Vector => unreachable!(),
     }
 }
@@ -114,11 +122,14 @@ const _: () = assert!(IMAGE_SPILLS + MAX_SPILLS <= EXIT_REGS);
 /// `image_index` order, copies the frame's spill slots after it, and pops
 /// the frame. A frame dispatch entered tails `jit_exit` in its level; a
 /// fast-called one starts a level that returns to its caller, and the
-/// interpreter runs the rest of it there (H10).
+/// interpreter runs the rest of it there (H10). Every allocatable register
+/// may hold a value: the runtime comes from the level's record.
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn exit_common() {
     core::arch::naked_asm!(
-        "ldr x17, [x23, #{regs}]",
+        "ldr x17, [x25, #{record}]",
+        "ldr x17, [x17, #{rt_of_level}]",
+        "ldr x17, [x17, #{regs}]",
         "stp x0, x1, [x17, #0]",
         "stp x2, x3, [x17, #16]",
         "stp x4, x5, [x17, #32]",
@@ -128,25 +139,25 @@ pub(crate) unsafe extern "C" fn exit_common() {
         "stp x12, x13, [x17, #96]",
         "stp x14, x15, [x17, #112]",
         "stp x19, x20, [x17, #128]",
-        "str x21, [x17, #144]",
-        "stp x26, x27, [x17, #152]",
-        "str x28, [x17, #168]",
-        "stp d0, d1, [x17, #176]",
-        "stp d2, d3, [x17, #192]",
-        "stp d4, d5, [x17, #208]",
-        "stp d6, d7, [x17, #224]",
-        "stp d8, d9, [x17, #240]",
-        "stp d10, d11, [x17, #256]",
-        "stp d12, d13, [x17, #272]",
-        "stp d14, d15, [x17, #288]",
-        "stp d16, d17, [x17, #304]",
-        "stp d18, d19, [x17, #320]",
-        "stp d20, d21, [x17, #336]",
-        "stp d22, d23, [x17, #352]",
-        "stp d24, d25, [x17, #368]",
-        "stp d26, d27, [x17, #384]",
-        "stp d28, d29, [x17, #400]",
-        "stp d30, d31, [x17, #416]",
+        "stp x21, x23, [x17, #144]",
+        "stp x24, x26, [x17, #160]",
+        "stp x27, x28, [x17, #176]",
+        "stp d0, d1, [x17, #192]",
+        "stp d2, d3, [x17, #208]",
+        "stp d4, d5, [x17, #224]",
+        "stp d6, d7, [x17, #240]",
+        "stp d8, d9, [x17, #256]",
+        "stp d10, d11, [x17, #272]",
+        "stp d12, d13, [x17, #288]",
+        "stp d14, d15, [x17, #304]",
+        "stp d16, d17, [x17, #320]",
+        "stp d18, d19, [x17, #336]",
+        "stp d20, d21, [x17, #352]",
+        "stp d22, d23, [x17, #368]",
+        "stp d24, d25, [x17, #384]",
+        "stp d26, d27, [x17, #400]",
+        "stp d28, d29, [x17, #416]",
+        "stp d30, d31, [x17, #432]",
         // The spill slots, [x29 + 24 + 8i], to the image's spill words.
         "and x9, x16, #0xffffffffffff",
         "ldr w10, [x9, #{num_spills}]",
@@ -165,6 +176,10 @@ pub(crate) unsafe extern "C" fn exit_common() {
         "ldp x29, x30, [x29]",
         "mov sp, x10",
         "mov x20, x16",
+        "ldr x23, [x25, #{record}]",
+        "ldr x23, [x23, #{rt_of_level}]",
+        "ldr x24, [x22, #-32]",
+        "and x24, x24, #{ptr_mask}",
         "ldr x11, [x23, #{level_land}]",
         "cmp x30, x11",
         "b.eq 3f",
@@ -176,6 +191,9 @@ pub(crate) unsafe extern "C" fn exit_common() {
         "4:",
         "b {jit_exit}",
         regs = const crate::jit::layout::EXIT_REGS,
+        record = const crate::jit::layout::RECORD,
+        rt_of_level = const RT_OF_LEVEL,
+        ptr_mask = const PTR_MASK,
         num_spills = const crate::jit::region::layout::NUM_SPILLS,
         frame_size = const crate::jit::region::layout::FRAME_SIZE,
         spills = const IMAGE_SPILLS * 8,
@@ -333,7 +351,9 @@ pub(crate) unsafe extern "C" fn level_return() {
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn direct_miss() {
     core::arch::naked_asm!(
-        "ldr x17, [x23, #{level_land}]",
+        "ldr x17, [x25, #{record}]",
+        "ldr x17, [x17, #{rt_of_level}]",
+        "ldr x17, [x17, #{level_land}]",
         "cmp x30, x17",
         "b.eq 1f",
         "b {call_miss}",
@@ -343,8 +363,12 @@ pub(crate) unsafe extern "C" fn direct_miss() {
         "str x16, [x22, #-32]",
         "sub x21, x22, #32",
         "mov x22, xzr",
+        "ldr x23, [x25, #{record}]",
+        "ldr x23, [x23, #{rt_of_level}]",
         "ldr x30, [x23, #{level_ret}]",
         "b {enter}",
+        record = const crate::jit::layout::RECORD,
+        rt_of_level = const RT_OF_LEVEL,
         level_land = const crate::jit::layout::LEVEL_LAND,
         level_ret = const crate::jit::layout::LEVEL_RET,
         tag = const crate::jit::layout::FUNCTION_TAG,
@@ -399,6 +423,9 @@ pub(crate) unsafe extern "C" fn level_enter() {
         ".cfi_offset x27, -{size} + {x} + 64",
         ".cfi_offset x28, -{size} + {x} + 72",
         "blr x16",
+        "ldr x23, [sp, #{x} + 32]",
+        "ldr x24, [x22, #-32]",
+        "and x24, x24, #{ptr_mask}",
         "ldr x30, [x23, #{level_ret}]",
         "ldr x16, [x22, #-24]",
         "and x16, x16, #~31",
@@ -406,13 +433,15 @@ pub(crate) unsafe extern "C" fn level_enter() {
         ".cfi_endproc",
         size = const crate::vm::stack::rec::SIZE,
         x = const crate::vm::stack::rec::X,
+        ptr_mask = const PTR_MASK,
         level_ret = const crate::jit::layout::LEVEL_RET,
     )
 }
 
 /// Where a region dispatch entered returns: on in its level through the
 /// frame's continuation, as an interpreted callee returns (the results'
-/// count in `insn`, the values at `pc`).
+/// count in `insn`, the values at `pc`), the handler ABI's runtime and
+/// closure back.
 pub(crate) fn level_land() -> usize {
     level_enter as *const () as usize + 4
 }
@@ -512,13 +541,12 @@ macro_rules! coro_stub {
                 "stp x29, x30, [x25, #{shim}]",
                 "sub x9, sp, #32",
                 "stp x29, x30, [x9]",
-                "stp x22, x24, [x9, #16]",
+                "stp x22, x0, [x9, #16]",
                 "mov sp, x9",
                 ".cfi_def_cfa_offset 32",
                 ".cfi_offset x29, -32",
                 ".cfi_offset x30, -24",
                 ".cfi_offset x22, -16",
-                ".cfi_offset x24, -8",
                 "bl {switch}",
                 "cmn x1, #2",
                 "b.eq 1f",
@@ -528,12 +556,14 @@ macro_rules! coro_stub {
                 ".cfi_restore x29",
                 ".cfi_restore x30",
                 ".cfi_restore x22",
-                ".cfi_restore x24",
                 "br x30",
                 ".cfi_restore_state",
-                // Wait to continue at 2, and switch to the thread in x0.
+                // Wait to continue at 2, and switch to the thread in x0,
+                // whose fresh stack starts with the runtime in x23
+                // (`thread_entry`).
                 "1:",
                 "mov x9, sp",
+                "ldr x23, [x9, #24]",
                 "add x10, x25, #{tsw}",
                 "adr x11, 2f",
                 "stp x9, x11, [x10, #{sp}]",
@@ -547,10 +577,10 @@ macro_rules! coro_stub {
                 "mov x0, #0",
                 "br x12",
                 "2:",
-                "mov x0, x23",
+                "ldr x0, [sp, #24]",
                 "bl {landed}",
                 "mov x9, sp",
-                "ldp x22, x24, [x9, #16]",
+                "ldr x22, [x9, #16]",
                 "ldp x29, x30, [x9]",
                 "add sp, x9, #32",
                 "br x30",
@@ -640,9 +670,11 @@ mod tests {
         assert_eq!(image_index(preg_int(15)), 15);
         assert_eq!(image_index(preg_int(19)), 16);
         assert_eq!(image_index(preg_int(21)), 18);
-        assert_eq!(image_index(preg_int(26)), 19);
-        assert_eq!(image_index(preg_int(28)), 21);
-        assert_eq!(image_index(preg_float(0)), 22);
-        assert_eq!(image_index(preg_float(31)), 53);
+        assert_eq!(image_index(preg_int(23)), 19);
+        assert_eq!(image_index(preg_int(24)), 20);
+        assert_eq!(image_index(preg_int(26)), 21);
+        assert_eq!(image_index(preg_int(28)), 23);
+        assert_eq!(image_index(preg_float(0)), 24);
+        assert_eq!(image_index(preg_float(31)), 55);
     }
 }

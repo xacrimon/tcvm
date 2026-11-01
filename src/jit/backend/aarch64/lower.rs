@@ -92,6 +92,9 @@ struct Lower<'a, 'gc> {
     /// Stores a known call writes itself, and its callee (D2).
     absorbed: Vec<bool>,
     known: crate::jit::FastMap<Inst, Known>,
+    /// The frame's closure, defined in the entry block when the region
+    /// reads its upvalues.
+    closure: Option<VReg>,
 }
 
 fn rep_class(rep: Rep) -> RegClass {
@@ -164,7 +167,9 @@ pub(crate) fn lower<'gc>(f: &Func<'gc>, code_base: usize) -> Result<Lowered, Str
         box_reg: None,
         absorbed: vec![false; f.insts.len()],
         known: Default::default(),
+        closure: None,
     };
+    let closure_at = closure_block(f, &cfg, order);
     lw.find_fusions(order);
     lw.find_known_callees(order);
     // Float tests by block, then with those of the blocks entered from it
@@ -204,6 +209,12 @@ pub(crate) fn lower<'gc>(f: &Func<'gc>, code_base: usize) -> Result<Lowered, Str
         if b == f.entry {
             lw.push(MInst::Prologue, &[], PRegSet::empty());
         }
+        // A resume block's first instruction is where a fast callee returns.
+        let mut closure_due = closure_at == Some(b);
+        if closure_due && !f.blocks[b.idx()].resume {
+            lw.frame_closure();
+            closure_due = false;
+        }
         succs.clear();
         args.clear();
         nargs.clear();
@@ -214,6 +225,9 @@ pub(crate) fn lower<'gc>(f: &Func<'gc>, code_base: usize) -> Result<Lowered, Str
         lw.float_guards = floats[b.idx()];
         for &i in f.insts_of(b) {
             lw.lower_inst(i)?;
+            if std::mem::take(&mut closure_due) {
+                lw.frame_closure();
+            }
             if f.op(i).is_terminator() {
                 // A call's resume block takes its values from the return.
                 let call = matches!(f.op(i), Op::Call { .. } | Op::CallMm { .. });
@@ -265,7 +279,43 @@ pub(crate) fn lower<'gc>(f: &Func<'gc>, code_base: usize) -> Result<Lowered, Str
     })
 }
 
+/// Where the frame's closure is loaded for the upvalue reads (W4 §3): the
+/// nearest block dominating them all, or the entry when that lies in a loop.
+fn closure_block(f: &Func<'_>, cfg: &crate::jit::ir::CfgInfo, order: &[Block]) -> Option<Block> {
+    let mut at: Option<Block> = None;
+    for &b in order {
+        let reads = f
+            .insts_of(b)
+            .iter()
+            .any(|&i| matches!(f.op(i), Op::UpvalValue(_) | Op::UpvalCell(_)));
+        if !reads {
+            continue;
+        }
+        let mut a = at.unwrap_or(b);
+        while !cfg.dominates(a, b) {
+            a = cfg.idom[a.idx()].expect("a dominator");
+        }
+        at = Some(a);
+    }
+    let at = at?;
+    let in_loop = order.iter().any(|&p| {
+        f.succs(p)
+            .any(|h| cfg.dominates(h, p) && cfg.dominates(h, at))
+    });
+    Some(if in_loop { f.entry } else { at })
+}
+
 impl<'a, 'gc> Lower<'a, 'gc> {
+    fn frame_closure(&mut self) {
+        let c = self.v.new_vreg(RegClass::Int);
+        self.push(
+            MInst::FrameClosure,
+            &[Operand::reg_def(c)],
+            PRegSet::empty(),
+        );
+        self.closure = Some(c);
+    }
+
     /// The vreg of a value, through aliases.
     fn vr(&mut self, v: Val) -> VReg {
         let v = self.alias(v);
@@ -698,7 +748,8 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             }
             Op::UpvalValue(k) => {
                 let d = self.def(res.unwrap());
-                self.push(MInst::LoadUpval(k), &[d], none);
+                let c = Operand::reg_use(self.closure.expect("the frame's closure"));
+                self.push(MInst::LoadUpvalOf(k), &[d, c], none);
             }
             Op::UpvalValueOf(k) => {
                 let (d, c) = (self.def(res.unwrap()), self.use_(args[0]));
@@ -899,7 +950,8 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             }
             Op::UpvalCell(k) => {
                 let d = self.def(res.unwrap());
-                self.push(MInst::LoadUpval(k), &[d], none);
+                let c = Operand::reg_use(self.closure.expect("the frame's closure"));
+                self.push(MInst::LoadUpvalOf(k), &[d, c], none);
             }
             Op::CellLoad => {
                 let (d, c) = (self.def(res.unwrap()), self.use_(args[0]));

@@ -28,6 +28,17 @@ pub(crate) const SHIM: usize = offset_of!(crate::env::thread::ThreadState<'stati
 pub(crate) const LEVEL_RET: usize = JIT + offset_of!(JitRuntime, level_ret);
 pub(crate) const LEVEL_LAND: usize = JIT + offset_of!(JitRuntime, level_land);
 pub(crate) const JUMP_TARGET: usize = JIT + offset_of!(JitRuntime, jump_target);
+/// The runtime register's value for `ctx` (the `State`'s address), and the
+/// word at `off` from it.
+pub(crate) fn rt_word(ctx: crate::lua::Context<'_>) -> usize {
+    ctx.jit() as *const JitRuntime as usize - JIT
+}
+
+pub(crate) fn rt_read(ctx: crate::lua::Context<'_>, off: usize) -> usize {
+    // SAFETY: `off` is a field offset of the `State`.
+    unsafe { ((rt_word(ctx) + off) as *const usize).read() }
+}
+
 /// The pointer to the arena's `Metrics`.
 pub(crate) const METRICS: usize =
     offset_of!(State<'static>, rt) + offset_of!(Runtime<'static>, metrics);
@@ -43,7 +54,7 @@ pub(crate) const GC_CHECK: usize = crate::dmm::metrics::Metrics::GC_CHECK_OFFSET
 pub(crate) const fn type_mt_cell(slot: u8) -> usize {
     offset_of!(State<'static>, type_metatables) + 8 * slot as usize
 }
-pub(crate) const NUMBER_MT_CELL: usize = type_mt_cell(2);
+pub(crate) const NUMBER_MT_SLOT: u8 = 2;
 pub(crate) const STRING_MT_SLOT: u8 = 3;
 pub(crate) const NUMBER_MT: usize =
     Gc::<'static, crate::dmm::lock::Lock<Option<crate::env::table::Table<'static>>>>::VALUE_OFFSET;
@@ -120,7 +131,7 @@ mod tests {
             let metrics = unsafe { ((state + METRICS) as *const usize).read() };
             assert_ne!(metrics, 0);
             let number_mt = || unsafe {
-                let cell = ((state + NUMBER_MT_CELL) as *const usize).read();
+                let cell = ((state + type_mt_cell(NUMBER_MT_SLOT)) as *const usize).read();
                 ((cell + NUMBER_MT) as *const usize).read()
             };
             assert_eq!(number_mt(), 0);
