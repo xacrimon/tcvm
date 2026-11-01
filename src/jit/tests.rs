@@ -939,3 +939,35 @@ fn unboxed_registers_test_as_truthy() {
     let ir = ir_of(src, "pick", 0);
     assert!(!ir.contains("isfalsy"), "{ir}");
 }
+
+/// How many `br`s branch on a value an instruction containing `op` defines.
+fn branches_on(ir: &str, op: &str) -> usize {
+    let defs: Vec<&str> = ir
+        .lines()
+        .filter(|l| l.contains(op))
+        .filter_map(|l| l.trim().split(':').next())
+        .collect();
+    ir.lines()
+        .filter_map(|l| l.trim().strip_prefix("br "))
+        .filter(|l| defs.iter().any(|d| l.split(' ').next() == Some(*d)))
+        .count()
+}
+
+/// A branch an edge of an equal one dominates folds (W1 5.3): one branch
+/// on `x < 3` per copy of the loop body (the peeled one, the loop's).
+#[test]
+fn dominated_branches_fold() {
+    let src = "function f(x, n)
+        local s = 0
+        for i = 1, n do
+            if x < 3 then
+                s = s + 1
+                if x < 3 then s = s + 2 end
+            end
+        end
+        return s
+    end
+    for r = 1, 300 do f(r % 7, 10) end";
+    let ir = ir_of(src, "f", 0);
+    assert_eq!(branches_on(&ir, "cmp.lt"), 2, "{ir}");
+}

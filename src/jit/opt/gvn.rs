@@ -2,11 +2,14 @@
 //! type guards (a value's type never changes, so a dominating equal guard
 //! makes a later one redundant), and loads and memory guards keyed by the
 //! version of the memory they read (8.4); a call writes every class, and
-//! scopes restart after one.
+//! scopes restart after one. Branch outcomes (W1 5.3): a `B1` is known in
+//! the blocks an edge of a `br` on it dominates and after a guard on it, and
+//! a `br`, guard or `select` on a known one folds.
 
 use crate::jit::FastMap;
 use crate::jit::ir::ops::{Flags, Mem, Op};
 use crate::jit::ir::{Block, Func, Inst, Val};
+use crate::jit::opt::DomTree;
 
 const CLASSES: usize = 8;
 
@@ -159,29 +162,8 @@ fn forwarded(f: &Func<'_>, i: Inst) -> Option<(Op, Vec<Val>, Val)> {
 
 pub(crate) fn gvn(f: &mut Func<'_>) -> bool {
     let cfg = f.cfg();
-    // The dominator tree's children, by block.
     let n = f.blocks.len();
-    let mut at = vec![0u32; n + 1];
-    for &b in &cfg.rpo {
-        if b != f.entry
-            && let Some(p) = cfg.idom[b.idx()]
-        {
-            at[p.idx() + 1] += 1;
-        }
-    }
-    for k in 0..n {
-        at[k + 1] += at[k];
-    }
-    let mut fill = at.clone();
-    let mut children = vec![Block(0); at[n] as usize];
-    for &b in &cfg.rpo {
-        if b != f.entry
-            && let Some(p) = cfg.idom[b.idx()]
-        {
-            children[fill[p.idx()] as usize] = b;
-            fill[p.idx()] += 1;
-        }
-    }
+    let tree = DomTree::new(f, &cfg);
     // The classes each block writes.
     let mut wmask = vec![Mem::empty(); n];
     for &b in &cfg.rpo {
@@ -201,6 +183,11 @@ pub(crate) fn gvn(f: &mut Func<'_>) -> bool {
     // The versions at each block's end, for its dominator-tree children.
     let mut end: Vec<Option<Versions>> = vec![None; n];
     let mut fresh = 0u32;
+    // Known `B1`s, with their own undo log, marked per scope.
+    let mut known: FastMap<Val, bool> = FastMap::default();
+    let mut kundo: Vec<(Val, Option<bool>)> = Vec::new();
+    let mut kmarks: Vec<usize> = Vec::new();
+    let mut folded = false;
     let mut seen = vec![false; n];
     let mut work: Vec<Block> = Vec::new();
     // (block, done, lowest visible scope)
@@ -215,9 +202,25 @@ pub(crate) fn gvn(f: &mut Func<'_>) -> bool {
                     None => table.remove(&k),
                 };
             }
+            let m = kmarks.pop().unwrap();
+            while kundo.len() > m {
+                let (c, old) = kundo.pop().unwrap();
+                match old {
+                    Some(o) => known.insert(c, o),
+                    None => known.remove(&c),
+                };
+            }
             continue;
         }
         marks.push(undo.len());
+        kmarks.push(kundo.len());
+        // A fact crosses calls: folding on it adds no use.
+        if let &[(t, k)] = cfg.incoming(b)
+            && f.op(t) == Op::Br
+        {
+            let c = f.args(t)[0];
+            kundo.push((c, known.insert(c, k == 0)));
+        }
         let scope = marks.len() - 1;
         // Scopes restart after a call: a value shared across one must then
         // stay in the frame or be computed again (C1).
@@ -256,6 +259,39 @@ pub(crate) fn gvn(f: &mut Func<'_>) -> bool {
                     *a = map[a.idx()];
                 }
             }
+            let op = f.op(i);
+            if let Op::Br | Op::GuardTrue | Op::GuardFalse | Op::Select = op
+                && let Some(&c) = known.get(&f.args(i)[0])
+            {
+                match op {
+                    Op::Br => {
+                        let e = f.edges(i)[!c as usize];
+                        f.insts[i.idx()].op = Op::Jump;
+                        f.insts[i.idx()].an = 0;
+                        f.set_edges(i, &[e]);
+                        folded = true;
+                        changed = true;
+                        continue;
+                    }
+                    Op::Select => {
+                        map[f.result(i).idx()] = f.args(i)[2 - c as usize];
+                        removed[i.idx()] = true;
+                        changed = true;
+                        continue;
+                    }
+                    // One that always fails stays: its exit is the path.
+                    _ if c == (op == Op::GuardTrue) => {
+                        removed[i.idx()] = true;
+                        changed = true;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            if matches!(op, Op::GuardTrue | Op::GuardFalse) {
+                let c = f.args(i)[0];
+                kundo.push((c, known.insert(c, op == Op::GuardTrue)));
+            }
             if let Some(key) = key_of(f, i, &mem, &mut consts) {
                 match table.get(&key) {
                     // A check without a result keeps nothing alive across
@@ -279,7 +315,6 @@ pub(crate) fn gvn(f: &mut Func<'_>) -> bool {
                     }
                 }
             }
-            let op = f.op(i);
             if !op.effects().writes() {
                 continue;
             }
@@ -300,10 +335,7 @@ pub(crate) fn gvn(f: &mut Func<'_>) -> bool {
         }
         end[b.idx()] = Some(mem);
         stack.push((b, true, lo));
-        for &c in children[at[b.idx()] as usize..at[b.idx() + 1] as usize]
-            .iter()
-            .rev()
-        {
+        for &c in tree.children(b).iter().rev() {
             stack.push((c, false, lo));
         }
     }
@@ -312,6 +344,9 @@ pub(crate) fn gvn(f: &mut Func<'_>) -> bool {
             f.retain(Block(b as u32), |_, i| !removed[i.idx()]);
         }
         f.apply_replacements(&mut map);
+    }
+    if folded {
+        crate::jit::opt::simplify::mark_unreachable(f);
     }
     changed
 }
