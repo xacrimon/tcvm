@@ -33,6 +33,10 @@ use crate::env::string::LuaString;
 use crate::env::symbols::METAMETHOD_COUNT;
 use crate::env::table::Table;
 use crate::env::value::Value;
+use crate::jit::deps::{self, DepSlot};
+
+mod kind;
+pub use kind::{Field, Kind, class as kind_class};
 
 /// V8-style "Map" / hidden class. Copy wrapper over a single Gc pointer
 /// for cheap pass-by-value and pointer-equality identity checks.
@@ -60,6 +64,8 @@ pub struct MtCache<'gc>(Gc<'gc, MtCacheData<'gc>>);
 /// only a shape whose prefix is the whole array may, and it keeps that key alive.
 struct Keys<'gc> {
     slots: Box<[UnsafeCell<MaybeUninit<LuaString<'gc>>>], MetricsAlloc<'gc>>,
+    /// Each slot's [`Field`], shared with every copy of a prefix holding it.
+    fields: Box<[Cell<Option<Field<'gc>>>], MetricsAlloc<'gc>>,
     len: Cell<u32>,
     /// `(address, slot)` of the first `len` keys, built by the first lookup
     /// past `LINEAR_LOOKUP` keys. A dead key's address may be reused, but not
@@ -72,21 +78,38 @@ struct Keys<'gc> {
 /// Longest prefix [`Shape::find_slot`] scans rather than hashes.
 const LINEAR_LOOKUP: u32 = 16;
 
-// SAFETY: deliberately untraced (see `Keys`); it holds no other pointer.
+// SAFETY: the keys are deliberately untraced (see `Keys`); the fields are
+// traced, all `len` of them, and set once each behind a barrier.
 unsafe impl<'gc> Collect<'gc> for Keys<'gc> {
-    const NEEDS_TRACE: bool = false;
+    fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
+        for f in &self.fields[..self.len.get() as usize] {
+            cc.trace(&f.get());
+        }
+    }
 }
 
 impl<'gc> Keys<'gc> {
-    fn new(mc: &Mutation<'gc>, prefix: &[LuaString<'gc>], cap: usize) -> Gc<'gc, Self> {
+    /// Keys `prefix` of `from`, with room for `cap`.
+    fn new(mc: &Mutation<'gc>, from: Option<&Keys<'gc>>, prefix: u32, cap: usize) -> Gc<'gc, Self> {
+        let n = prefix as usize;
         let mut slots = Vec::with_capacity_in(cap, MetricsAlloc::new(mc));
-        slots.extend(prefix.iter().map(|&k| UnsafeCell::new(MaybeUninit::new(k))));
+        let mut fields = Vec::with_capacity_in(cap, MetricsAlloc::new(mc));
+        if let Some(from) = from {
+            slots.extend(
+                from.prefix(prefix)
+                    .iter()
+                    .map(|&k| UnsafeCell::new(MaybeUninit::new(k))),
+            );
+            fields.extend(from.fields[..n].iter().map(|f| Cell::new(f.get())));
+        }
         slots.resize_with(cap, || UnsafeCell::new(MaybeUninit::uninit()));
+        fields.resize_with(cap, || Cell::new(None));
         Gc::new(
             mc,
             Keys {
                 slots: slots.into_boxed_slice(),
-                len: Cell::new(prefix.len() as u32),
+                fields: fields.into_boxed_slice(),
+                len: Cell::new(prefix),
                 index: UnsafeCell::new(None),
             },
         )
@@ -124,17 +147,20 @@ impl<'gc> Keys<'gc> {
         unsafe { core::slice::from_raw_parts(self.slots.as_ptr().cast(), n as usize) }
     }
 
-    /// Append `key` for a shape whose prefix is `n` long, if that is the
-    /// whole array and there is room.
-    fn try_push(&self, n: u32, key: LuaString<'gc>) -> bool {
-        if self.len.get() != n || n as usize == self.slots.len() {
+    /// Append `key`, in a new field, for a shape whose prefix is `n` long, if
+    /// that is the whole array and there is room.
+    fn try_push(this: Gc<'gc, Self>, mc: &Mutation<'gc>, n: u32, key: LuaString<'gc>) -> bool {
+        if this.len.get() != n || n as usize == this.slots.len() {
             return false;
         }
         // SAFETY: no prefix reaches slot `n` yet.
-        unsafe { (*self.slots[n as usize].get()).write(key) };
-        self.len.set(n + 1);
+        unsafe { (*this.slots[n as usize].get()).write(key) };
+        // Adopting a fresh `Gc` in place: barrier first.
+        mc.backward_barrier(Gc::erase(this), None);
+        this.fields[n as usize].set(Some(Field::new(mc)));
+        this.len.set(n + 1);
         // SAFETY: as in `find`.
-        if let Some(index) = unsafe { &mut *self.index.get() } {
+        if let Some(index) = unsafe { &mut *this.index.get() } {
             index.insert_unique(addr_hash(addr(key)), (addr(key), n), |e| addr_hash(e.0));
         }
         true
@@ -443,6 +469,41 @@ pub struct ShapeData<'gc> {
 
     /// This shape's keys are the first `slot_count`, key `i` in slot `i`.
     keys: Gc<'gc, Keys<'gc>>,
+
+    /// Set when tables of this shape are watched `__index` holders, inherited
+    /// by its children (see [`Watch`]).
+    #[collect(require_static)]
+    watch: Watch,
+    /// The regions assuming a watched holder keeps this shape, or a slot's
+    /// value (ws2 §5.2), by `deps::SHAPE_GROUP` and `deps::slot_group`.
+    deps: DepSlot<'gc>,
+}
+
+/// A watched holder's shape (ws2 §5.2): only the one table, a class's
+/// `__index`, is ever in it, since it is a fresh copy or a child of one, so
+/// compiled code may assume the table's keys and slot values from it. Its
+/// stores are never cached while they could change what was assumed, and
+/// every move to another shape invalidates (`TableState::set_shape`).
+#[derive(Default)]
+pub(crate) struct Watch {
+    on: bool,
+    /// The slots a store changed, by `slot % 63`: their values are not
+    /// assumed (V8's const fields).
+    mutable: Cell<u64>,
+    /// A move off a shape of the table's invalidated code: the compiler
+    /// guards its shape instead (as `MtCacheData::volatile`).
+    volatile: Cell<bool>,
+}
+
+impl Watch {
+    /// A child's: the parent's state, carried on.
+    fn inherit(&self) -> Self {
+        Watch {
+            on: self.on,
+            mutable: Cell::new(self.mutable.get()),
+            volatile: Cell::new(self.volatile.get()),
+        }
+    }
 }
 
 /// [`ShapeData::mt_slot`] of a mono shape: the metatable is the class's owner.
@@ -527,6 +588,10 @@ pub struct MtCacheData<'gc> {
     /// share a shape.
     pub dict_sentinel: Lock<Option<Shape<'gc>>>,
     pub dict_sentinel_poly: Lock<Option<Shape<'gc>>>,
+    /// The regions assuming the bits stay (ws2 §5.3), by the bits.
+    deps: DepSlot<'gc>,
+    #[collect(require_static)]
+    volatile: Cell<bool>,
 }
 
 /// A metamethod in [`MtCacheData`]. Untraced: every member metatable holds
@@ -618,6 +683,23 @@ fn content_hash(
 }
 
 impl<'gc> MtCache<'gc> {
+    // Where compiled code reads the live bits and `__index`/`__newindex`,
+    // from the class's box (`as_word`).
+    pub(crate) const BITS_OFFSET: usize = Gc::<'static, MtCacheData<'static>>::VALUE_OFFSET
+        + core::mem::offset_of!(MtCacheData<'static>, bits);
+    pub(crate) const INDEX_OFFSET: usize = Gc::<'static, MtCacheData<'static>>::VALUE_OFFSET
+        + core::mem::offset_of!(MtCacheData<'static>, index);
+    /// The box of the other metamethods (`rest`), null before the first.
+    pub(crate) const REST_OFFSET: usize = Gc::<'static, MtCacheData<'static>>::VALUE_OFFSET
+        + core::mem::offset_of!(MtCacheData<'static>, rest);
+    /// The metamethod of bit index `i` at `8 * i` past this, from `rest`.
+    pub(crate) const REST_VALUES_OFFSET: usize = Gc::<'static, MmValues<'static>>::VALUE_OFFSET;
+
+    /// The class's box address, what a shape holds.
+    pub(crate) fn as_word(self) -> u64 {
+        Gc::erased_ptr(self.0) as u64
+    }
+
     /// A class of one member, `owner`, whose metamethods by bit index are
     /// `values`.
     pub fn new(
@@ -649,6 +731,8 @@ impl<'gc> MtCache<'gc> {
                 rest: Lock::new(rest),
                 dict_sentinel: Lock::new(None),
                 dict_sentinel_poly: Lock::new(None),
+                deps: Lock::new(None),
+                volatile: Cell::new(false),
             },
         ))
     }
@@ -702,6 +786,14 @@ impl<'gc> MtCache<'gc> {
         self.0.members.set(self.0.members.get().saturating_add(1));
     }
 
+    /// Whether another metatable than the owner joined: from then on the
+    /// class's tables keep their metatable in a slot (its mono shapes are
+    /// deprecated, see [`Shape::is_deprecated`]).
+    #[inline]
+    pub fn is_shared(self) -> bool {
+        self.0.members.get() > 1
+    }
+
     /// Retire this class, a member's metamethods having left it: every guard
     /// reading it fails (all bits, no `__index` or `__newindex`, no others),
     /// so a table of it reaches a slow path, which moves the table to its
@@ -722,11 +814,12 @@ impl<'gc> MtCache<'gc> {
 
     /// Apply the write of `key` by the member whose `TableState` is at
     /// `member` to the class, which the member's metamethods define: in
-    /// place for its only member, else the class is retired. `mc` is `None`
-    /// for a weak clear.
+    /// place for its only member, else the class is retired. Code depending
+    /// on what changed is invalidated. A weak clear passes its
+    /// finalization's `mc`: storing nil allocates and adopts nothing.
     pub fn member_write(
         self,
-        mc: Option<&Mutation<'gc>>,
+        mc: &Mutation<'gc>,
         key: LuaString<'gc>,
         value: Value<'gc>,
         member: usize,
@@ -734,9 +827,12 @@ impl<'gc> MtCache<'gc> {
         if self.is_stale() {
             return;
         }
-        let unchanged = match metamethod_bit_of_bytes(key.as_bytes()) {
-            Some(bit) => self.mm(bit).same_bits(&value),
-            None if key.as_bytes() == b"__mode" => self.weak() == WeakMode::of(value),
+        let (unchanged, bit) = match metamethod_bit_of_bytes(key.as_bytes()) {
+            Some(bit) => (self.mm(bit).same_bits(&value), bit),
+            // No code depends on the mode.
+            None if key.as_bytes() == b"__mode" => {
+                (self.weak() == WeakMode::of(value), MetamethodBits::empty())
+            }
             None => return,
         };
         if unchanged {
@@ -744,9 +840,37 @@ impl<'gc> MtCache<'gc> {
         }
         if self.0.members.get() > 1 {
             self.make_stale(member);
+            self.changed(mc, MetamethodBits::all());
             return;
         }
         self.mirror(mc, key, value);
+        self.changed(mc, bit);
+    }
+
+    /// Invalidate the code depending on `bits` of this class; a class that
+    /// had some is volatile from then on.
+    fn changed(self, mc: &Mutation<'gc>, bits: MetamethodBits) {
+        if !bits.is_empty() && deps::invalidate(mc, &self.0.deps, bits.bits() as u64) {
+            self.0.volatile.set(true);
+        }
+    }
+
+    /// Note that `region` assumes `bits` of this class stay as they are
+    /// (ws2 §5.5).
+    pub(crate) fn depend(
+        self,
+        mc: &Mutation<'gc>,
+        region: Gc<'gc, crate::jit::region::Region<'gc>>,
+        bits: MetamethodBits,
+    ) {
+        deps::add(mc, self.0, &self.0.deps, region, bits.bits() as u64);
+    }
+
+    /// Whether code that depended on this class was invalidated: the
+    /// compiler reads its bits live instead (V8's mutable property cells).
+    #[inline]
+    pub(crate) fn is_volatile(self) -> bool {
+        self.0.volatile.get()
     }
 
     /// Whether a metatable may join this class whose mode is `weak` and
@@ -783,21 +907,6 @@ impl<'gc> MtCache<'gc> {
     #[inline]
     pub fn get(self) -> MetamethodBits {
         self.0.get()
-    }
-
-    #[inline]
-    pub fn set_bit(self, bit: MetamethodBits) {
-        self.0.set_bit(bit);
-    }
-
-    #[inline]
-    pub fn clear_bit(self, bit: MetamethodBits) {
-        self.0.clear_bit(bit);
-    }
-
-    #[inline]
-    pub fn update(self, bit: MetamethodBits, value: crate::env::value::Value<'gc>) {
-        self.0.update(bit, value);
     }
 
     #[inline]
@@ -850,10 +959,10 @@ impl<'gc> MtCache<'gc> {
     }
 
     /// Mirror a write of `key` to this cache's metatable into its bits and
-    /// weak mode; only keys [`mirrored`] names change anything. `mc` may be
-    /// `None` for a store of nil (a weak clear), which allocates nothing.
+    /// weak mode; only keys [`mirrored`] names change anything. A store of
+    /// nil allocates nothing. Only `member_write`'s, which invalidates.
     #[inline]
-    pub fn mirror(self, mc: Option<&Mutation<'gc>>, key: LuaString<'gc>, value: Value<'gc>) {
+    fn mirror(self, mc: &Mutation<'gc>, key: LuaString<'gc>, value: Value<'gc>) {
         match metamethod_bit_of_bytes(key.as_bytes()) {
             Some(bit) => {
                 if bit == MetamethodBits::INDEX {
@@ -865,7 +974,6 @@ impl<'gc> MtCache<'gc> {
                         Some(rest) => Some(rest),
                         None if value.is_nil() => None,
                         None => {
-                            let mc = mc.expect("a metamethod stored without a mutation");
                             let rest = Gc::new(
                                 mc,
                                 MmValues(std::array::from_fn(|_| Cell::new(Value::nil()))),
@@ -881,7 +989,7 @@ impl<'gc> MtCache<'gc> {
                         rest.0[bit.bits().trailing_zeros() as usize].set(value);
                     }
                 }
-                self.update(bit, value)
+                self.0.update(bit, value)
             }
             None if key.as_bytes() == b"__mode" => self.0.weak.set(WeakMode::of(value)),
             None => {}
@@ -900,6 +1008,30 @@ impl<'gc> MtCache<'gc> {
 }
 
 impl<'gc> Shape<'gc> {
+    /// Where compiled code reads the class (`MtCache::as_word`, or null)
+    /// from a shape's box.
+    pub(crate) const MT_CACHE_OFFSET: usize = Gc::<'static, ShapeData<'static>>::VALUE_OFFSET
+        + core::mem::offset_of!(ShapeData<'static>, mt_cache);
+    /// The slot count (`u32`), inline slot count (`u8`), metatable slot
+    /// (`u32`) and the box of the keys from a shape's box.
+    pub(crate) const SLOT_COUNT_OFFSET: usize = Gc::<'static, ShapeData<'static>>::VALUE_OFFSET
+        + core::mem::offset_of!(ShapeData<'static>, slot_count);
+    pub(crate) const INLINE_CAP_OFFSET: usize = Gc::<'static, ShapeData<'static>>::VALUE_OFFSET
+        + core::mem::offset_of!(ShapeData<'static>, inline_cap);
+    pub(crate) const MT_SLOT_OFFSET: usize = Gc::<'static, ShapeData<'static>>::VALUE_OFFSET
+        + core::mem::offset_of!(ShapeData<'static>, mt_slot);
+    pub(crate) const KEYS_OFFSET: usize = Gc::<'static, ShapeData<'static>>::VALUE_OFFSET
+        + core::mem::offset_of!(ShapeData<'static>, keys);
+    /// The keys' array (string boxes) from the keys' box: the first word of
+    /// the slice box (a layout test checks it).
+    pub(crate) const KEYS_SLOTS_OFFSET: usize =
+        Gc::<'static, Keys<'static>>::VALUE_OFFSET + core::mem::offset_of!(Keys<'static>, slots);
+
+    /// The shape's box address, what a table's `shape` field holds.
+    pub(crate) fn as_word(self) -> u64 {
+        Gc::erased_ptr(self.0) as u64
+    }
+
     /// Allocate an empty root shape for tables with `inline_cap` inline
     /// slots. There is one per capacity per `State`, see `State::root_shapes`.
     pub fn root_empty(mc: &Mutation<'gc>, inline_cap: u8) -> Self {
@@ -920,7 +1052,9 @@ impl<'gc> Shape<'gc> {
                 is_dict: false,
                 inline_cap,
                 transitions: RefLock::new(TransitionTable::new()),
-                keys: Keys::new(mc, &[], 0),
+                keys: Keys::new(mc, None, 0, 0),
+                watch: Watch::default(),
+                deps: Lock::new(None),
             },
         ))
     }
@@ -946,7 +1080,9 @@ impl<'gc> Shape<'gc> {
                 is_dict: true,
                 inline_cap: 0,
                 transitions: RefLock::new(TransitionTable::new()),
-                keys: Keys::new(mc, &[], 0),
+                keys: Keys::new(mc, None, 0, 0),
+                watch: Watch::default(),
+                deps: Lock::new(None),
             },
         ))
     }
@@ -994,6 +1130,71 @@ impl<'gc> Shape<'gc> {
             MT_IN_AUX => MtHome::Aux,
             slot => MtHome::Slot(slot),
         }
+    }
+
+    /// A mono shape whose class another metatable joined: its tables move to
+    /// the class's poly shape on their next slow path (V8's deprecated maps),
+    /// so one site sees one layout for all members' tables. Nothing caches
+    /// or compiles against it.
+    #[inline]
+    pub fn is_deprecated(self) -> bool {
+        self.data().mt_slot == MT_IN_CLASS && self.mt_cache().is_some_and(|c| c.is_shared())
+    }
+
+    /// The shape a table of this deprecated one moves to: the shape a table
+    /// made the same way gets now that the class is shared, so old and new
+    /// tables meet in one. The metatable transition is taken poly from where
+    /// it was taken and the keys added since are added again (V8's
+    /// `Map::TryUpdate`); the metatable's slot may come before keys, so a
+    /// table moving there is laid out again ([`TableState::relayout`]).
+    pub fn poly_twin(
+        self,
+        mc: &Mutation<'gc>,
+        mt_key: LuaString<'gc>,
+        no_mt_dict_sentinel: Shape<'gc>,
+    ) -> Shape<'gc> {
+        debug_assert!(self.is_deprecated());
+        let class = self.mt_cache();
+        let simple =
+            || transition_set_metatable(mc, self, class, true, mt_key, no_mt_dict_sentinel);
+        if self.is_dict() {
+            return simple();
+        }
+        // The keys added after the metatable transition, newest first.
+        let mut keys = Vec::new();
+        let mut s = self;
+        let base = loop {
+            let d = s.data();
+            let Some(parent) = d.parent else {
+                return simple();
+            };
+            match d.last_key {
+                Some(k) if !d.adopt_edge => {
+                    keys.push(k);
+                    s = parent;
+                }
+                None if !d.adopt_edge && parent.mt_slot_raw() != MT_IN_CLASS
+                    || parent
+                        .mt_cache()
+                        .is_none_or(|c| !MtCache::ptr_eq(c, class.unwrap())) =>
+                {
+                    break parent;
+                }
+                _ => return simple(),
+            }
+        };
+        let mut t = transition_set_metatable(mc, base, class, true, mt_key, no_mt_dict_sentinel);
+        for &k in keys.iter().rev() {
+            if t.is_dict() {
+                return simple();
+            }
+            t = transition_add_prop(mc, t, k);
+        }
+        t
+    }
+
+    fn mt_slot_raw(self) -> u32 {
+        self.data().mt_slot
     }
 
     /// Whether a table of this shape keeps its metatable itself.
@@ -1054,6 +1255,18 @@ impl<'gc> Shape<'gc> {
         Gc::as_ref(self.data().keys).prefix(self.data().slot_count)
     }
 
+    /// The field of `slot`, one of this shape's.
+    #[inline]
+    pub fn field(self, slot: u32) -> Field<'gc> {
+        debug_assert!(slot < self.slot_count());
+        // SAFETY: a set field stays set; a shape's slots are below `len`.
+        unsafe {
+            Gc::as_ref(self.data().keys).fields[slot as usize]
+                .get()
+                .unwrap_unchecked()
+        }
+    }
+
     /// Look up a string key in this shape. The IC fast path bypasses this
     /// entirely; only slow paths reach here.
     #[inline]
@@ -1069,6 +1282,11 @@ impl<'gc> Shape<'gc> {
             .iter()
             .position(|&k| addr(k) == a)
             .map(|i| i as u32)
+    }
+
+    /// The live child that adds `key`, if a table took that edge.
+    pub fn prop_child(self, mc: &Mutation<'gc>, key: LuaString<'gc>) -> Option<Shape<'gc>> {
+        self.data().transitions.borrow().get(mc, EdgeKey::Prop(key))
     }
 
     /// Returns `true` if the metatable behind this shape currently has
@@ -1091,6 +1309,103 @@ impl<'gc> Shape<'gc> {
             Some(c) => c.get().intersects(bits),
         }
     }
+
+    /// Whether this is a watched holder's shape (see [`Watch`]).
+    #[inline]
+    pub fn is_watched(self) -> bool {
+        self.data().watch.on
+    }
+
+    /// Whether moves of the watched holder invalidated code before.
+    pub(crate) fn is_volatile_holder(self) -> bool {
+        self.data().watch.volatile.get()
+    }
+
+    pub(crate) fn mark_volatile_holder(self) {
+        self.data().watch.volatile.set(true);
+    }
+
+    /// Whether a store changed `slot` of this watched shape's table, so code
+    /// assumes nothing of its value.
+    pub(crate) fn slot_mutable(self, slot: u32) -> bool {
+        self.data().watch.mutable.get() & deps::slot_group(slot) != 0
+    }
+
+    /// A fresh shape like this one for a table that is now a watched holder,
+    /// with the slots `mutable` (by [`deps::slot_group`]) already changed.
+    pub(crate) fn watched_copy(self, mc: &Mutation<'gc>, mutable: u64, volatile: bool) -> Self {
+        let p = self.data();
+        debug_assert!(!p.is_dict);
+        Shape(Gc::new(
+            mc,
+            ShapeData {
+                parent: p.parent,
+                last_key: p.last_key,
+                adopt_edge: p.adopt_edge,
+                slot_count: p.slot_count,
+                mt_cache: p.mt_cache,
+                mt_slot: p.mt_slot,
+                as_mt: p.as_mt,
+                mirrored: p.mirrored,
+                has_mode: p.has_mode,
+                adopt_memo: Lock::new(None),
+                mt_move: Lock::new(None),
+                is_dict: false,
+                inline_cap: p.inline_cap,
+                transitions: RefLock::new(TransitionTable::new()),
+                keys: p.keys,
+                watch: Watch {
+                    on: true,
+                    mutable: Cell::new(mutable),
+                    volatile: Cell::new(volatile),
+                },
+                deps: Lock::new(None),
+            },
+        ))
+    }
+
+    /// The groups of [`Self::slot_mutable`] for `to`'s keys, which this
+    /// watched shape's table keeps as it moves there.
+    pub(crate) fn mutable_for(self, to: Shape<'gc>) -> u64 {
+        let m = self.data().watch.mutable.get();
+        if m == 0 {
+            return 0;
+        }
+        let mut out = 0;
+        for (i, &k) in to.keys().iter().enumerate() {
+            if self.find_slot(k).is_some_and(|s| self.slot_mutable(s)) {
+                out |= deps::slot_group(i as u32);
+            }
+        }
+        out
+    }
+
+    /// Note that `region` assumes `groups` of this watched shape hold.
+    pub(crate) fn depend(
+        self,
+        mc: &Mutation<'gc>,
+        region: Gc<'gc, crate::jit::region::Region<'gc>>,
+        groups: u64,
+    ) {
+        deps::add(mc, self.0, &self.0.deps, region, groups);
+    }
+
+    /// A store changed `slot` of this watched shape's table: code assuming its
+    /// value is invalidated the first time, as nothing assumes it after.
+    pub(crate) fn slot_changed(self, mc: &Mutation<'gc>, slot: u32) {
+        let w = &self.data().watch;
+        let g = deps::slot_group(slot);
+        if w.mutable.get() & g == 0 {
+            w.mutable.set(w.mutable.get() | g);
+            deps::invalidate(mc, &self.0.deps, g);
+        }
+    }
+
+    /// This watched shape's table left it: everything assumed of it is
+    /// invalidated; whether anything was.
+    pub(crate) fn left(self, mc: &Mutation<'gc>) -> bool {
+        deps::invalidate(mc, &self.0.deps, u64::MAX)
+    }
 }
 
 /// `parent`'s keys with `key` in the next slot: its own array when that
@@ -1102,13 +1417,14 @@ fn keys_with<'gc>(
 ) -> Gc<'gc, Keys<'gc>> {
     let new_slot = parent.data().slot_count;
     let mut keys = parent.data().keys;
-    if !keys.try_push(new_slot, key) {
+    if !Keys::try_push(keys, mc, new_slot, key) {
         keys = Keys::new(
             mc,
-            parent.keys(),
+            Some(Gc::as_ref(keys)),
+            new_slot,
             (new_slot as usize + 1).next_power_of_two().max(4),
         );
-        keys.try_push(new_slot, key);
+        Keys::try_push(keys, mc, new_slot, key);
     }
     keys
 }
@@ -1160,6 +1476,8 @@ pub fn transition_add_prop<'gc>(
             inline_cap: p.inline_cap,
             transitions: RefLock::new(TransitionTable::new()),
             keys: keys_with(mc, parent, key),
+            watch: p.watch.inherit(),
+            deps: Lock::new(None),
         },
     );
     let parent_write = Gc::write(mc, parent.0);
@@ -1234,6 +1552,8 @@ pub fn transition_set_metatable<'gc>(
             inline_cap: p.inline_cap,
             transitions: RefLock::new(TransitionTable::new()),
             keys,
+            watch: p.watch.inherit(),
+            deps: Lock::new(None),
         },
     );
     let parent_write = Gc::write(mc, parent.0);
@@ -1279,6 +1599,8 @@ pub fn transition_adopt<'gc>(
                     inline_cap: p.inline_cap,
                     transitions: RefLock::new(TransitionTable::new()),
                     keys: p.keys,
+                    watch: p.watch.inherit(),
+                    deps: Lock::new(None),
                 },
             );
             let parent_write = Gc::write(mc, parent.0);

@@ -8,15 +8,17 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  [  1]  VARARGPREP      fixed=0
-0001  [  1]  CLOSURE         R0 P0
-0002  [  2]  LOAD            R1 K0  ; true
-0003  [  3]  JFSET           R2 R1 +1
-0004  [  3]  CALLS_R1        R2 args=1 f=R0
-0005  [  4]  RETURN          R2 count=2
+0000  [  1]  FUNC
+0001  [  1]  VARARGPREP      fixed=0
+0002  [  1]  CLOSURE         R0 P0
+0003  [  2]  LOAD            R1 K0  ; true
+0004  [  3]  JFSET           R2 R1 +1
+0005  [  3]  CALLS_R1        R2 args=1 f=R0
+0006  [  4]  RETURN          R2 count=2
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=1, upvalues=0)
   ; code:
-  0000  [  1]  LOADI           R0 42
-  0001  [  1]  RETURN1         R0
+  0000  [  1]  FUNC
+  0001  [  1]  LOADI           R0 42
+  0002  [  1]  RETURN1         R0

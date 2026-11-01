@@ -6,18 +6,21 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  [  1]  VARARGPREP      fixed=0
-0001  [ 11]  CLOSURE         R0 P0
-0002  [ 13]  RETURN          R0 count=2
+0000  [  1]  FUNC
+0001  [  1]  VARARGPREP      fixed=0
+0002  [ 11]  CLOSURE         R0 P0
+0003  [ 13]  RETURN          R0 count=2
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=1, upvalues=0)
   ; code:
-  0000  [  9]  CLOSURE         R0 P0
-  0001  [ 10]  RETURN1         R0
+  0000  [  6]  FUNC
+  0001  [  9]  CLOSURE         R0 P0
+  0002  [ 10]  RETURN1         R0
 
   ; prototype 0:
     ; function (params=0, vararg=false, stack=1, upvalues=0)
     ; code:
-    0000  [  8]  LOADI           R0 8
-    0001  [  8]  RETURN1         R0
+    0000  [  7]  FUNC
+    0001  [  8]  LOADI           R0 8
+    0002  [  8]  RETURN1         R0

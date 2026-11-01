@@ -43,6 +43,8 @@ pub struct State<'gc> {
     #[collect(require_static)]
     pub(crate) rets: [Handler; 256],
     pub(crate) rt: Runtime<'gc>,
+    #[collect(require_static)]
+    pub(crate) jit: crate::jit::state::JitRuntime,
     /// Root shapes by inline capacity (`INLINE_CAPS`). Each anchors a
     /// transition tree, so two tables of one capacity that grow through the
     /// same key sequence converge on the same shape pointer.
@@ -61,7 +63,7 @@ pub struct State<'gc> {
     pub(crate) interner: Interner<'gc>,
     /// Metatables shared by all values of a type that has no per-value one
     /// (PUC's `G(L)->mt`); see `type_metatable`.
-    type_metatables: [GcLock<'gc, Option<Table<'gc>>>; 6],
+    pub(crate) type_metatables: [GcLock<'gc, Option<Table<'gc>>>; 6],
     /// The `next` that `pairs` returns, and the iterator `ipairs` does:
     /// `TFORCALL` walks a table itself when its loop's iterator is one.
     pub(crate) next: Function<'gc>,
@@ -79,6 +81,9 @@ pub struct State<'gc> {
     /// Scratch for building strings (`Context::with_buf`).
     #[collect(require_static)]
     pub(crate) buf: std::cell::Cell<Vec<u8>>,
+    /// Where threads get their stacks (`vm::stack`).
+    #[collect(require_static)]
+    pub(crate) stacks: std::rc::Rc<crate::vm::stack::StackPool>,
 }
 
 impl<'gc> State<'gc> {
@@ -102,6 +107,10 @@ impl<'gc> State<'gc> {
 /// A Lua runtime instance.
 pub struct Lua {
     arena: Arena<Rootable![State<'_>]>,
+    /// `TCVM_GC_STRESS=N`: collect at every `enter`'s end, which the
+    /// collector checks reach every N bytes allocated; a full collection
+    /// every eighth time.
+    stress: Option<(usize, std::cell::Cell<u32>)>,
 }
 
 impl Default for Lua {
@@ -121,6 +130,7 @@ impl Lua {
                 dispatch: crate::vm::dispatch::TABLE,
                 rets: crate::vm::dispatch::RETS,
                 rt: Runtime::new(mc.metrics()),
+                jit: crate::jit::state::JitRuntime::new(),
                 root_shapes,
                 empty_dict_sentinel,
                 mt_classes: MtClasses::new(mc),
@@ -135,14 +145,35 @@ impl Lua {
                 epoch: std::cell::Cell::new(0),
                 waker: std::cell::Cell::new(std::ptr::null()),
                 buf: std::cell::Cell::new(Vec::new()),
+                stacks: crate::vm::stack::StackPool::new(),
             }
         });
-        Lua { arena }
+        let stress = std::env::var("TCVM_GC_STRESS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .map(|n| (n, std::cell::Cell::new(0)));
+        Lua { arena, stress }
     }
 
     /// Collect once memory in use is past the heap limit, then re-arm the
     /// interpreter's check.
     fn collect_debt(&mut self) {
+        if let Some((n, count)) = &self.stress {
+            let (n, k) = (*n, count.get().wrapping_add(1));
+            count.set(k);
+            if self.arena.collection_phase() != CollectionPhase::Sleeping {
+                self.finalize_and_sweep();
+            }
+            if k % 8 == 0 {
+                self.arena.force_full_collection();
+            } else {
+                self.arena.force_minor_collection();
+            }
+            self.finalize_and_sweep();
+            self.arena.metrics().set_gc_check_in(n);
+            return;
+        }
         if self.arena.metrics().allocation_debt() > 0.0 {
             self.finalize_and_sweep();
         }
@@ -150,7 +181,7 @@ impl Lua {
     }
 
     /// Run the current cycle, or a new one if the collector sleeps: mark to
-    /// completion, settle weak tables and the interner, and sweep, with no
+    /// completion, settle weak tables, feedback and the interner, and sweep, with no
     /// mutation in between: an object allocated and dropped there would be
     /// freed while still held by them.
     fn finalize_and_sweep(&mut self) {
@@ -159,6 +190,7 @@ impl Lua {
         while self.marked().finalize(|fc, _| Table::converge_weak(fc)) {}
         self.marked().finalize(|fc, root| {
             Table::clear_weak(fc);
+            crate::env::Prototype::clear_dead_feedback(fc);
             fc.clear_deferred();
             root.interner.prune(fc);
         });
@@ -167,6 +199,21 @@ impl Lua {
 
     fn marked(&mut self) -> MarkedArena<'_, Rootable![State<'_>]> {
         self.arena.finish_marking()
+    }
+
+    /// The native stack size of threads that get their stack from now on,
+    /// 1 MB by default. Calls past it, less headroom for natives, run in the
+    /// interpreter.
+    pub fn set_stack_size(&mut self, bytes: usize) {
+        self.arena
+            .mutate(|_, root| root.stacks.set_native_size(bytes));
+    }
+
+    /// Turn the JIT on or off for what runs from now on; installed regions
+    /// stay.
+    pub fn set_jit(&mut self, on: bool) {
+        self.arena
+            .mutate_root(|_, root| root.jit.config.enabled = on && cfg!(target_arch = "aarch64"));
     }
 
     /// Force a full garbage-collection cycle (mark + sweep) to completion.

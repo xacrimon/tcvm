@@ -3,7 +3,7 @@
 use crate::env::function::{FunctionKind, LuaFn};
 use crate::env::thread::{ThreadState, ThreadStatus};
 use crate::env::value::Value;
-use crate::instruction::Instruction;
+use crate::instruction::{Instruction, Op};
 use crate::vm::abi::{Exit, Slot, handler, handler_bits};
 use crate::vm::frame::{self, HDR, copy_values, fill_nil, flag, land_results, lua_func_word};
 use crate::vm::ops::meta::resolve_call_chain;
@@ -39,18 +39,6 @@ pub(crate) fn fixup_entry<'gc>(
     Ok(nv)
 }
 
-/// `enter`'s `base`: the calling Lua frame's window, or null for a native
-/// caller. As an index, for use across growth.
-#[inline(always)]
-fn caller_index<'gc>(ts: &ThreadState<'gc>, base: *mut Value<'gc>) -> Option<usize> {
-    (!base.is_null()).then(|| ts.slot_index(base))
-}
-
-#[inline(always)]
-fn caller_ptr<'gc>(ts: &mut ThreadState<'gc>, bi: Option<usize>) -> *mut Value<'gc> {
-    bi.map_or(std::ptr::null_mut(), |i| ts.slot_ptr(i))
-}
-
 /// Publish the caller of an `enter` path before the stack may grow:
 /// the Lua frame `base`, at the pc the staged header holds, or nothing for a
 /// native caller, which is published already.
@@ -63,23 +51,12 @@ macro_rules! enter_sync {
     };
 }
 
-/// After the stack grew under an `enter` path: the staged header is not in
-/// the frame chain yet, so its caller word was not rebased; rewrite it from
-/// the caller `base`, or the published native frame.
-macro_rules! enter_rebase {
-    ($base:ident, $ts:ident, $hdr:expr) => {{
-        let caller = if $base.is_null() { $ts.top_base } else { $base };
-        unsafe { frame::set_caller_base($ts.slot_ptr($hdr + HDR), caller) };
-    }};
-}
-
 /// Raise from an `enter` path, before the callee's frame exists: the caller's
 /// frame is published from the staged header's pc, or already published for
 /// a native caller.
 macro_rules! enter_raise {
-    ($rt:ident, $base:ident, $pc:ident, $ts:ident, $hdr:expr, $bi:expr, $err:expr) => {{
+    ($rt:ident, $base:ident, $pc:ident, $ts:ident, $hdr:expr, $err:expr) => {{
         let hdr: usize = $hdr;
-        $base = caller_ptr($ts, $bi);
         $pc = unsafe { frame::caller_pc($ts.slot_ptr(hdr + HDR)) };
         // Staged by a frameless `pcall`: the reference raises with the
         // `pcall` (a C function) running, so without a position, and the
@@ -116,9 +93,66 @@ fn call_nargs(ts: &ThreadState<'_>, b: u8, nb: usize) -> usize {
     if b == 0 { ts.top - nb } else { b as usize - 1 }
 }
 
+/// Run the callee whose frame is set up, from its `code`: count the call on
+/// its `FUNC`'s counter and continue at pc 1, sparing `FUNC`'s dispatch, or
+/// run the `JIT_ENTRY` written over it.
+macro_rules! start {
+    ($pc:ident, $rt:ident, $callee:expr) => {{
+        let callee: LuaFn<'gc> = $callee;
+        let code: *const Instruction = callee.code;
+        let w = unsafe { *code };
+        $pc = code;
+        if w.op() == Op::FUNC {
+            $pc = unsafe { code.add(1) };
+            count_invocation!($rt, callee, w);
+        }
+        next!()
+    }};
+}
+
+/// Count an interpreted invocation of the closure `$f`, whose `FUNC` is
+/// `$word`, in its feedback vector's header; every `hot_call` of them its
+/// entry may compile (`jit_hot`), with `pc` past the `FUNC`.
+macro_rules! count_invocation {
+    ($rt:ident, $f:expr, $word:expr) => {{
+        // SAFETY: the word before slot 0 is the invocation count.
+        let n = unsafe { &*$f.feedback.sub(1) };
+        let c = n.get().wrapping_add(1);
+        n.set(c);
+        if std::hint::unlikely(c & $rt.call_mask() == 0) {
+            tail!(
+                crate::jit::jit_hot,
+                insn = $crate::vm::abi::Slot::insn($word)
+            )
+        }
+    }};
+}
+pub(crate) use count_invocation;
+
 /// The Lua arm of CALL, shared by the CALL forms; `$fv` is the callee
 /// (`R[a]`, or the source register of a CALLS, which has just stored it
 /// there) and `$ret` the callee's continuation.
+/// The callee feedback of the call `insn` of `closure` (I2): a hit costs a
+/// load and a compare, a miss records the function `fv` in `call_note`. A
+/// handler that called out to record it would push a frame on every call.
+macro_rules! note_callee {
+    ($closure:ident, $insn:expr, $fv:expr) => {{
+        // The callee word, after the slot's site word.
+        let slot = unsafe { $closure.feedback.add($insn.d() as usize + 1) };
+        // Both words in one load pair.
+        let (seen, count) = unsafe { ((*slot).get(), (*slot.add(1)).get()) };
+        if std::hint::unlikely(seen != $fv.to_raw()) {
+            // Bit 0 marks a word that stays (`MEGAMORPHIC`, a `proto_slot`):
+            // a function value's payload is aligned.
+            if seen & 1 == 0 {
+                tail!(call_note)
+            }
+        }
+        // After the check: a recording call runs again and counts once.
+        unsafe { (*slot.add(1)).set(count.wrapping_add(1)) };
+    }};
+}
+
 macro_rules! call_body {
     ($insn:ident, $pc:ident, $base:ident, $rt:ident, $closure:ident, $fv:expr, $ret:expr) => {{
         let (a, b) = ($insn.a(), $insn.b());
@@ -126,6 +160,7 @@ macro_rules! call_body {
         let Some(f) = fv.get_function() else {
             tail!(call_meta)
         };
+        note_callee!($closure, $insn, fv);
         match f.inner().as_ref() {
             FunctionKind::Native(nc) => {
                 let entry = nc.entry;
@@ -154,8 +189,7 @@ macro_rules! call_body {
                 };
                 $closure = callee;
                 $base = nb;
-                $pc = callee.code;
-                next!()
+                start!($pc, $rt, callee)
             }
         }
     }};
@@ -184,23 +218,50 @@ handler! {
     /// (the fused MOVE). `R[a]` gets the callee so the slow paths, which
     /// re-read the function slot, see a plain CALL.
     op fn op_calls {
-        let fv = reg![insn.imm() as u8];
+        let fv = reg![insn.e() as u8];
         reg![insn.a()] = fv;
         call_body!(insn, pc, base, rt, closure, fv, rt.ret(insn.c()))
     }
 
     /// CALLS wanting no result.
     op fn op_calls_r0 {
-        let fv = reg![insn.imm() as u8];
+        let fv = reg![insn.e() as u8];
         reg![insn.a()] = fv;
         call_body!(insn, pc, base, rt, closure, fv, ret_call0)
     }
 
     /// CALLS wanting one result.
     op fn op_calls_r1 {
-        let fv = reg![insn.imm() as u8];
+        let fv = reg![insn.e() as u8];
         reg![insn.a()] = fv;
         call_body!(insn, pc, base, rt, closure, fv, ret_call1)
+    }
+
+    /// A call whose callee slot missed (`note_callee!`): its first function,
+    /// or a second, which makes the site its prototype's when both are
+    /// closures of one, else megamorphic; then the call again.
+    slow fn call_note {
+        use crate::env::feedback::{MEGAMORPHIC, proto_slot};
+        let call = insn_at!();
+        // `R[a]` is the callee, a CALLS's included.
+        let fv: Value<'gc> = reg![call.a()];
+        let proto = unsafe { frame::closure(base) }.proto;
+        let slot = proto.feedback.callee_at(call.d() as usize);
+        let seen = slot.get();
+        let lua_proto = |v: Value<'gc>| v.get_function().and_then(|f| f.as_lua()).map(|c| c.proto);
+        slot.set(if seen == 0 {
+            fv.to_raw()
+        } else {
+            // SAFETY: a callee word without bit 0 names a live function.
+            match (lua_proto(unsafe { Value::from_raw(seen) }), lua_proto(fv)) {
+                (Some(p), Some(q)) if crate::dmm::Gc::ptr_eq(p, q) => proto_slot(p),
+                _ => MEGAMORPHIC,
+            }
+        });
+        rt.mutation()
+            .backward_barrier(crate::dmm::Gc::erase(proto), None);
+        let h = rt.handler(call.opcode());
+        tail!(h, insn = Slot::insn(call))
     }
 
     /// CALL of a Lua closure whose window does not fit: grow, then retry
@@ -218,7 +279,6 @@ handler! {
         if !ts.ensure_frame_slots(hdr + HDR + max_stack) {
             raise!(OpError::StackOverflow)
         }
-        base = ts.slot_ptr(bi);
         let h = rt.handler(call.opcode());
         tail!(h, insn = Slot::insn(call))
     }
@@ -237,13 +297,11 @@ handler! {
         let Ok(nv) = fixup_entry(ts, hdr, nargs, callee) else {
             raise!(OpError::StackOverflow)
         };
-        base = ts.slot_ptr(bi);
         let hdr = ts.slot_ptr(hdr + nv);
         unsafe { frame::write_hdr(hdr, lua_func_word(callee, nv), handler_bits(rt.ret(c)), base, pc) };
         set_closure!(callee);
         base = unsafe { hdr.add(HDR) };
-        pc = callee.code;
-        next!()
+        start!(pc, rt, callee)
     }
 
     /// CALL of a value that is not a function: resolve its `__call` chain
@@ -259,11 +317,9 @@ handler! {
         let nargs = match resolve_call_chain(rt, ts, hdr, nargs) {
             Ok(n) => n,
             Err(e) => {
-                base = ts.slot_ptr(bi);
                 raise!(e)
             }
         };
-        base = ts.slot_ptr(bi);
         // The chain's hops changed the argument count, which the CALL's `b`
         // cannot carry: enter from a header, which takes the count.
         let hdr = ts.slot_ptr(hdr);
@@ -304,8 +360,7 @@ handler! {
                 unsafe { hdr.cast::<u64>().write(lua_func_word(callee, 0)) };
                 set_closure!(callee);
                 base = nb;
-                pc = callee.code;
-                next!()
+                start!(pc, rt, callee)
             }
         }
     }
@@ -315,16 +370,13 @@ handler! {
         let ts = thread!();
         let hdr = ts.slot_index(pc as *const Value<'gc>);
         enter_sync!(base, ts, hdr);
-        let bi = caller_index(ts, base);
         let max_stack = match ts.stack[hdr].get_function().map(|f| f.inner().as_ref()) {
             Some(FunctionKind::Lua(p)) => p.max_stack_size as usize,
             _ => unreachable!("enter_grow on a non-Lua callee"),
         };
         if !ts.ensure_frame_slots(hdr + HDR + max_stack) {
-            enter_raise!(rt, base, pc, ts, hdr, bi, OpError::StackOverflow)
+            enter_raise!(rt, base, pc, ts, hdr, OpError::StackOverflow)
         }
-        base = caller_ptr(ts, bi);
-        enter_rebase!(base, ts, hdr);
         tail!(enter, pc = ts.slot_ptr(hdr) as *const Instruction, insn = insn)
     }
 
@@ -334,19 +386,15 @@ handler! {
         let ts = thread!();
         let hdr = ts.slot_index(pc as *const Value<'gc>);
         enter_sync!(base, ts, hdr);
-        let bi = caller_index(ts, base);
         let callee = unsafe { LuaFn::from_function_unchecked(ts.stack[hdr].get_function().unwrap_unchecked()) };
         let Ok(nv) = fixup_entry(ts, hdr, nargs, callee) else {
-            enter_raise!(rt, base, pc, ts, hdr, bi, OpError::StackOverflow)
+            enter_raise!(rt, base, pc, ts, hdr, OpError::StackOverflow)
         };
-        base = caller_ptr(ts, bi);
-        enter_rebase!(base, ts, hdr + nv);
         let hdr = ts.slot_ptr(hdr + nv);
         unsafe { hdr.cast::<u64>().write(lua_func_word(callee, nv)) };
         set_closure!(callee);
         base = unsafe { hdr.add(HDR) };
-        pc = callee.code;
-        next!()
+        start!(pc, rt, callee)
     }
 
     /// `enter` of a value that is not a function.
@@ -355,13 +403,10 @@ handler! {
         let ts = thread!();
         let hdr = ts.slot_index(pc as *const Value<'gc>);
         enter_sync!(base, ts, hdr);
-        let bi = caller_index(ts, base);
         let nargs = match resolve_call_chain(rt, ts, hdr, nargs) {
             Ok(n) => n,
-            Err(e) => enter_raise!(rt, base, pc, ts, hdr, bi, e),
+            Err(e) => enter_raise!(rt, base, pc, ts, hdr, e),
         };
-        base = caller_ptr(ts, bi);
-        enter_rebase!(base, ts, hdr);
         tail!(enter, pc = ts.slot_ptr(hdr) as *const Instruction, insn = Slot::nret(nargs))
     }
 
@@ -374,6 +419,7 @@ handler! {
         let Some(f) = fv.get_function() else {
             tail!(tailcall_slow)
         };
+        note_callee!(closure, insn, fv);
         match f.inner().as_ref() {
             FunctionKind::Native(nc) => {
                 let entry = nc.entry;
@@ -399,8 +445,7 @@ handler! {
                         frame::set_func_word(base, w | callee.as_ptr() as usize as u64);
                     }
                     closure = callee;
-                    pc = callee.code;
-                    next!()
+                    start!(pc, rt, callee)
                 }
                 tail!(tailcall_slow)
             }
@@ -421,11 +466,9 @@ handler! {
         let nargs = match resolve_call_chain(rt, ts, hdr, nargs) {
             Ok(n) => n,
             Err(e) => {
-                base = ts.slot_ptr(bi);
                 raise!(e)
             }
         };
-        base = ts.slot_ptr(bi);
         let f = unsafe { ts.stack[hdr].get_function().unwrap_unchecked() };
         let FunctionKind::Lua(_) = f.inner().as_ref() else {
             // The chain left the native in the function slot and its count
@@ -447,13 +490,12 @@ handler! {
         // Before the arguments overwrite these slots, so an open upvalue
         // keeps the local, not the argument.
         crate::vm::ops::control::close_upvalues(rt.mutation(), ts, bi);
-        // Room first, while the header the rebase walks through is intact.
+        // Room first, while the header is intact.
         let np = callee.num_params as usize;
         let nv = if callee.is_vararg { nargs.saturating_sub(np) } else { 0 };
         if !ts.ensure_frame_slots(f_slot + HDR + nv + callee.max_stack_size as usize) {
             raise!(OpError::StackOverflow)
         }
-        base = ts.slot_ptr(bi);
         let (rword, caller, cpc) = unsafe { (frame::ret_word(base), frame::caller_base(base), frame::caller_pc(base)) };
         // Arguments down to where a fixed callee's would be; the copy is
         // ascending, so the overlap is safe.
@@ -468,8 +510,7 @@ handler! {
         };
         set_closure!(callee);
         base = unsafe { hdr.add(HDR) };
-        pc = callee.code;
-        next!()
+        start!(pc, rt, callee)
     }
 
     /// `return R[a], ... R[a+b-2]` (`b` 0: up to `top`). Nothing to close on
@@ -520,7 +561,6 @@ handler! {
             let max_stack = unsafe { frame::closure(base) }.max_stack_size as usize;
             let hdr = (vals + n).max(bi + max_stack);
             ts.ensure_slots(hdr + HDR + 1);
-            base = ts.slot_ptr(bi);
             unsafe { frame::set_results_end(base, vals + n) };
             let hdr = ts.slot_ptr(hdr);
             unsafe {

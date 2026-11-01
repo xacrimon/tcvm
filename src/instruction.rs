@@ -42,10 +42,15 @@ pub struct UpIdx(pub u8);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct KIdx(pub u16);
 
-/// An index into the prototype's `ic_table`. One slot is allocated per emitted
-/// GETTABUP/SETTABUP/GETFIELD/SETFIELD/SELF; sites are not deduped.
+/// A field or call site's slot: the word index of its feedback vector slot,
+/// which `assemble` assigns once the code is final (`FeedbackVector::new`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct IcIdx(pub u16);
+pub struct SlotIdx(pub u16);
+
+impl SlotIdx {
+    /// What the compiler emits before `assemble` assigns the slot.
+    pub const UNASSIGNED: SlotIdx = SlotIdx(0);
+}
 
 /// An index into the prototype's child-prototype list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -148,7 +153,7 @@ impl CmpImm {
 /// Something that can occupy an operand slot. Implemented for the index
 /// newtypes and for the raw types used by count/flag operands; the *declared*
 /// type of each field is what a constructor takes, so two same-width operands
-/// (`IcIdx` and `KIdx`, say) can't be passed in the wrong order.
+/// (`SlotIdx` and `KIdx`, say) can't be passed in the wrong order.
 pub trait Operand: Copy {
     fn bits(self) -> u64;
 }
@@ -166,7 +171,7 @@ impl_operand! {
     Reg      => |self| self.0 as u64,
     UpIdx    => |self| self.0 as u64,
     KIdx     => |self| self.0 as u64,
-    IcIdx    => |self| self.0 as u64,
+    SlotIdx  => |self| self.0 as u64,
     ProtoIdx => |self| self.0 as u64,
     TemplateIdx => |self| self.0 as u64,
     u8       => |self| self as u64,
@@ -190,6 +195,8 @@ pub enum Shape {
     A,
     Ab,
     Abc,
+    Abcd,
+    Abcde,
     Ad,
     Abd,
     Abde,
@@ -233,6 +240,8 @@ pub mod shape {
     pub struct A;
     pub struct Ab;
     pub struct Abc;
+    pub struct Abcd;
+    pub struct Abcde;
     pub struct Ad;
     pub struct Abd;
     pub struct Abde;
@@ -307,6 +316,46 @@ pub mod shape {
                 op as u64
                     | slot8(a.bits()) << A_SHIFT
                     | slot8(b.bits()) << B_SHIFT
+                    | slot16(d.bits()) << D_SHIFT
+                    | slot16(e.bits()) << E_SHIFT,
+            )
+        }
+    }
+
+    impl Abcd {
+        #[inline(always)]
+        pub fn pack(
+            op: Op,
+            a: impl Operand,
+            b: impl Operand,
+            c: impl Operand,
+            d: impl Operand,
+        ) -> Instruction {
+            Instruction(
+                op as u64
+                    | slot8(a.bits()) << A_SHIFT
+                    | slot8(b.bits()) << B_SHIFT
+                    | slot8(c.bits()) << C_SHIFT
+                    | slot16(d.bits()) << D_SHIFT,
+            )
+        }
+    }
+
+    impl Abcde {
+        #[inline(always)]
+        pub fn pack(
+            op: Op,
+            a: impl Operand,
+            b: impl Operand,
+            c: impl Operand,
+            d: impl Operand,
+            e: impl Operand,
+        ) -> Instruction {
+            Instruction(
+                op as u64
+                    | slot8(a.bits()) << A_SHIFT
+                    | slot8(b.bits()) << B_SHIFT
+                    | slot8(c.bits()) << C_SHIFT
                     | slot16(d.bits()) << D_SHIFT
                     | slot16(e.bits()) << E_SHIFT,
             )
@@ -536,18 +585,27 @@ impl Instruction {
         );
     }
 
+    /// `a`, `b`; also of an `Abd` word (a TAILCALL read for its callee and
+    /// argument count).
     #[inline(always)]
     pub fn ab(self) -> (u8, u8) {
-        self.expect(Shape::Ab);
+        debug_assert!(
+            matches!(self.op().shape(), Shape::Ab | Shape::Abd),
+            "{:?} is not Ab-shaped",
+            self.op()
+        );
         (self.a(), self.b())
     }
 
-    /// `a`, `b`, `c`; also of an `AbcImm` word, whose first three slots
-    /// are the same (a CALLS read as a CALL).
+    /// `a`, `b`, `c`; also of a word with more slots after them (a CALLS
+    /// read as a CALL).
     #[inline(always)]
     pub fn abc(self) -> (u8, u8, u8) {
         debug_assert!(
-            matches!(self.op().shape(), Shape::Abc | Shape::AbcImm),
+            matches!(
+                self.op().shape(),
+                Shape::Abc | Shape::Abcd | Shape::Abcde | Shape::AbcImm
+            ),
             "{:?} is not Abc-shaped",
             self.op()
         );
@@ -679,6 +737,23 @@ impl fmt::Debug for Instruction {
             Shape::A => write!(f, "(a={})", self.a()),
             Shape::Ab => write!(f, "(a={}, b={})", self.a(), self.b()),
             Shape::Abc => write!(f, "(a={}, b={}, c={})", self.a(), self.b(), self.c()),
+            Shape::Abcd => write!(
+                f,
+                "(a={}, b={}, c={}, d={})",
+                self.a(),
+                self.b(),
+                self.c(),
+                self.d()
+            ),
+            Shape::Abcde => write!(
+                f,
+                "(a={}, b={}, c={}, d={}, e={})",
+                self.a(),
+                self.b(),
+                self.c(),
+                self.d(),
+                self.e()
+            ),
             Shape::Ad => write!(f, "(a={}, d={})", self.a(), self.d()),
             Shape::Abd => write!(f, "(a={}, b={}, d={})", self.a(), self.b(), self.d()),
             Shape::Abde => write!(
@@ -811,16 +886,16 @@ instructions! {
     /// SETUPVAL's upvalue is never by value.
     0x03 GETUPVAL   getupval    Ab    { dst: Reg, idx: UpIdx }
     0x04 SETUPVAL   setupval    Ab    { src: Reg, idx: UpIdx }
-    0x05 GETTABUP   gettabup    Abde  { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
-    0x06 SETTABUP   settabup    Abde  { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+    0x05 GETTABUP   gettabup    Abde  { dst: Reg, idx: UpIdx, slot: SlotIdx, key: KIdx }
+    0x06 SETTABUP   settabup    Abde  { src: Reg, idx: UpIdx, slot: SlotIdx, key: KIdx }
     0x07 GETTABLE   gettable    Abc   { dst: Reg, table: Reg, key: Reg }
     0x08 SETTABLE   settable    Abc   { src: Reg, table: Reg, key: Reg }
-    0x09 GETFIELD   getfield    Abde  { dst: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x0a SETFIELD   setfield    Abde  { src: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x09 GETFIELD   getfield    Abde  { dst: Reg, table: Reg, slot: SlotIdx, key_idx: KIdx }
+    0x0a SETFIELD   setfield    Abde  { src: Reg, table: Reg, slot: SlotIdx, key_idx: KIdx }
 
     /// Method-call setup: `R[dst] = R[object][K[key_idx]]; R[dst+1] = R[object]`.
     /// Backs `obj:m(...)` codegen.
-    0x0b SELF       self_       Abde  { dst: Reg, object: Reg, ic_idx: IcIdx, key_idx: KIdx }
+    0x0b SELF       self_       Abde  { dst: Reg, object: Reg, slot: SlotIdx, key_idx: KIdx }
 
     /// `R[dst]` = a new table made from `templates[template]`.
     0x0c NEWTABLE   newtable    Ad    { dst: Reg, template: TemplateIdx }
@@ -886,8 +961,8 @@ instructions! {
     0x35 JTSET      jtset       AbImm { dst: Reg, src: Reg, offset: Offset }
     0x36 JFSET      jfset       AbImm { dst: Reg, src: Reg, offset: Offset }
 
-    0x37 CALL       call        Abc   { func: Reg, args: u8, returns: u8 }
-    0x38 TAILCALL   tailcall    Ab    { func: Reg, args: u8 }
+    0x37 CALL       call        Abcd  { func: Reg, args: u8, returns: u8, slot: SlotIdx }
+    0x38 TAILCALL   tailcall    Abd   { func: Reg, args: u8, slot: SlotIdx }
     0x39 RETURN     ret         Ab    { values: Reg, count: u8 }
     0x3a FORLOOP    forloop     AImm  { base: Reg, offset: Offset }
     0x3b FORPREP    forprep     AImm  { base: Reg, offset: Offset }
@@ -953,26 +1028,26 @@ instructions! {
     // lacks (`_ABSENT`), a slot in the `__index` table (`_PROTO`), an added
     // key (`_TRANS`). Same operands as the generic form; every miss refills.
 
-    0x5c GETFIELD_INL     getfield_inl    Abde { dst: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x5d GETFIELD_AUX     getfield_aux    Abde { dst: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x5e GETFIELD_ABSENT  getfield_absent Abde { dst: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x5f GETFIELD_PROTO   getfield_proto  Abde { dst: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x60 GETTABUP_INL     gettabup_inl    Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
-    0x61 GETTABUP_AUX     gettabup_aux    Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
-    0x62 GETTABUP_ABSENT  gettabup_absent Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
-    0x63 GETTABUP_PROTO   gettabup_proto  Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
-    0x64 SELF_INL         self_inl        Abde { dst: Reg, object: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x65 SELF_AUX         self_aux        Abde { dst: Reg, object: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x66 SELF_ABSENT      self_absent     Abde { dst: Reg, object: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x67 SELF_PROTO       self_proto      Abde { dst: Reg, object: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x68 SETFIELD_INL     setfield_inl    Abde { src: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x69 SETFIELD_AUX     setfield_aux    Abde { src: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x6a SETFIELD_TRANS   setfield_trans  Abde { src: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x6b SETFIELD_ABSENT  setfield_absent Abde { src: Reg, table: Reg, ic_idx: IcIdx, key_idx: KIdx }
-    0x6c SETTABUP_INL     settabup_inl    Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
-    0x6d SETTABUP_AUX     settabup_aux    Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
-    0x6e SETTABUP_TRANS   settabup_trans  Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
-    0x6f SETTABUP_ABSENT  settabup_absent Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+    0x5c GETFIELD_INL     getfield_inl    Abde { dst: Reg, table: Reg, slot: SlotIdx, key_idx: KIdx }
+    0x5d GETFIELD_AUX     getfield_aux    Abde { dst: Reg, table: Reg, slot: SlotIdx, key_idx: KIdx }
+    0x5e GETFIELD_ABSENT  getfield_absent Abde { dst: Reg, table: Reg, slot: SlotIdx, key_idx: KIdx }
+    0x5f GETFIELD_PROTO   getfield_proto  Abde { dst: Reg, table: Reg, slot: SlotIdx, key_idx: KIdx }
+    0x60 GETTABUP_INL     gettabup_inl    Abde { dst: Reg, idx: UpIdx, slot: SlotIdx, key: KIdx }
+    0x61 GETTABUP_AUX     gettabup_aux    Abde { dst: Reg, idx: UpIdx, slot: SlotIdx, key: KIdx }
+    0x62 GETTABUP_ABSENT  gettabup_absent Abde { dst: Reg, idx: UpIdx, slot: SlotIdx, key: KIdx }
+    0x63 GETTABUP_PROTO   gettabup_proto  Abde { dst: Reg, idx: UpIdx, slot: SlotIdx, key: KIdx }
+    0x64 SELF_INL         self_inl        Abde { dst: Reg, object: Reg, slot: SlotIdx, key_idx: KIdx }
+    0x65 SELF_AUX         self_aux        Abde { dst: Reg, object: Reg, slot: SlotIdx, key_idx: KIdx }
+    0x66 SELF_ABSENT      self_absent     Abde { dst: Reg, object: Reg, slot: SlotIdx, key_idx: KIdx }
+    0x67 SELF_PROTO       self_proto      Abde { dst: Reg, object: Reg, slot: SlotIdx, key_idx: KIdx }
+    0x68 SETFIELD_INL     setfield_inl    Abde { src: Reg, table: Reg, slot: SlotIdx, key_idx: KIdx }
+    0x69 SETFIELD_AUX     setfield_aux    Abde { src: Reg, table: Reg, slot: SlotIdx, key_idx: KIdx }
+    0x6a SETFIELD_TRANS   setfield_trans  Abde { src: Reg, table: Reg, slot: SlotIdx, key_idx: KIdx }
+    0x6b SETFIELD_ABSENT  setfield_absent Abde { src: Reg, table: Reg, slot: SlotIdx, key_idx: KIdx }
+    0x6c SETTABUP_INL     settabup_inl    Abde { src: Reg, idx: UpIdx, slot: SlotIdx, key: KIdx }
+    0x6d SETTABUP_AUX     settabup_aux    Abde { src: Reg, idx: UpIdx, slot: SlotIdx, key: KIdx }
+    0x6e SETTABUP_TRANS   settabup_trans  Abde { src: Reg, idx: UpIdx, slot: SlotIdx, key: KIdx }
+    0x6f SETTABUP_ABSENT  settabup_absent Abde { src: Reg, idx: UpIdx, slot: SlotIdx, key: KIdx }
 
     // --- shared-cell upvalue forms ------------------------------------------
     //
@@ -980,16 +1055,16 @@ instructions! {
     // to these for an upvalue that is not by value. Not quickened.
 
     0x70 GETUPVAL_REF getupval_ref Ab   { dst: Reg, idx: UpIdx }
-    0x71 GETTABUP_REF gettabup_ref Abde { dst: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
-    0x72 SETTABUP_REF settabup_ref Abde { src: Reg, idx: UpIdx, ic_idx: IcIdx, key: KIdx }
+    0x71 GETTABUP_REF gettabup_ref Abde { dst: Reg, idx: UpIdx, slot: SlotIdx, key: KIdx }
+    0x72 SETTABUP_REF settabup_ref Abde { src: Reg, idx: UpIdx, slot: SlotIdx, key: KIdx }
 
     // --- CALL by result count -----------------------------------------------
     //
     // A CALL wanting no result (`returns` 1) or one (`returns` 2), whose
     // continuation is a constant. `returns` stays for the generic paths.
 
-    0x73 CALL_R0    call_r0     Abc   { func: Reg, args: u8, returns: u8 }
-    0x74 CALL_R1    call_r1     Abc   { func: Reg, args: u8, returns: u8 }
+    0x73 CALL_R0    call_r0     Abcd  { func: Reg, args: u8, returns: u8, slot: SlotIdx }
+    0x74 CALL_R1    call_r1     Abcd  { func: Reg, args: u8, returns: u8, slot: SlotIdx }
 
     // --- adaptive arithmetic -------------------------------------------------
     //
@@ -1116,9 +1191,28 @@ instructions! {
     // of a local. The callee is read when the call runs, after the
     // arguments (the manual fixes no order between the two). `R[func]`
     // gets the callee first, so the slow paths see a plain CALL.
-    0xc9 CALLS        calls       AbcImm { func: Reg, args: u8, returns: u8, src: Reg }
-    0xca CALLS_R0     calls_r0    AbcImm { func: Reg, args: u8, returns: u8, src: Reg }
-    0xcb CALLS_R1     calls_r1    AbcImm { func: Reg, args: u8, returns: u8, src: Reg }
+    0xc9 CALLS        calls       Abcde { func: Reg, args: u8, returns: u8, slot: SlotIdx, src: Reg }
+    0xca CALLS_R0     calls_r0    Abcde { func: Reg, args: u8, returns: u8, slot: SlotIdx, src: Reg }
+    0xcb CALLS_R1     calls_r1    Abcde { func: Reg, args: u8, returns: u8, slot: SlotIdx, src: Reg }
+
+    // --- JIT entries -----------------------------------------------------------
+    //
+    // `FUNC` is pc 0 of every prototype and `LOOP` the header of every
+    // `while`, `repeat` and generic `for` loop: the words a compiled entry
+    // overwrites with `JIT_ENTRY`/`JIT_LOOP`, whose `entry` indexes the
+    // runtime's entry table. Each counting site has a hot counter `hot`:
+    // calls count the callee's `FUNC` at the call, a `repeat` loop its
+    // `LOOP`; `while` and generic `for` loops count at their back edge
+    // (`JMP_BACK`, `TFORLOOP`'s `b`), which jumps past the `LOOP` until an
+    // entry is installed there; numeric loops count in their `FORLOOP` (`b`)
+    // and are overwritten there, as is the `JMP_BACK` of a backward `goto`
+    // (its loop's latch, as LuaJIT's `BC_LOOP` at the `goto`).
+
+    0xcc FUNC         func        A      { hot: u8 }
+    0xcd LOOP         loop_       A      { hot: u8 }
+    0xce JIT_ENTRY    jit_entry   Ad     { hot: u8, entry: u16 }
+    0xcf JIT_LOOP     jit_loop    Ad     { hot: u8, entry: u16 }
+    0xd0 JMP_BACK     jmp_back    AImm   { hot: u8, offset: Offset }
 }
 
 /// The polymorphic family an opcode belongs to.
@@ -1140,7 +1234,7 @@ pub enum Family {
 }
 
 /// The operation of an arithmetic or bitwise opcode, generic or specialized.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArithKind {
     None,
     Add,
@@ -2321,6 +2415,29 @@ impl Instruction {
     }
 }
 
+/// Hot counters in the runtime's table (`Instruction::hot_counter`).
+pub const HOT_COUNTERS: usize = 64;
+
+impl Instruction {
+    /// The hot counter a counting instruction decrements: `a` of `FUNC`,
+    /// `LOOP`, `JMP_BACK` and the JIT words, `b` of a `FORLOOP` form and
+    /// `TFORLOOP`. For the slow paths: a handler knows its byte
+    /// (`count_hot!`).
+    pub(crate) fn hot_counter(self) -> usize {
+        let i = match self.op() {
+            Op::FORLOOP | Op::FORLOOP_I | Op::FORLOOP_F | Op::TFORLOOP => self.b(),
+            _ => self.a(),
+        };
+        i as usize % HOT_COUNTERS
+    }
+
+    /// Whether this is a word a compiled entry wrote.
+    #[inline(always)]
+    pub(crate) fn is_jit_word(self) -> bool {
+        matches!(self.op(), Op::JIT_ENTRY | Op::JIT_LOOP)
+    }
+}
+
 /// Offset of a generic `for`'s first variable from its base. Past Lua 5.5's
 /// three hidden slots is a fourth, where `TFORCALL` keeps its place in a
 /// table it walks without calling `next`, as LuaJIT keeps it in its control
@@ -2363,7 +2480,7 @@ mod tests {
         assert_eq!(i.op(), Op::ADD);
         assert_eq!(i.abc(), (1, 2, 3));
 
-        let i = Instruction::getfield(Reg(4), Reg(5), IcIdx(600), KIdx(700));
+        let i = Instruction::getfield(Reg(4), Reg(5), SlotIdx(600), KIdx(700));
         assert_eq!(i.op(), Op::GETFIELD);
         assert_eq!(i.abde(), (4, 5, 600, 700));
 
@@ -2382,7 +2499,7 @@ mod tests {
         assert!(!i.set_branch_offset(-(1 << 23) - 1));
         assert_eq!(i.with_adaptive(1, false).ab_offset(), (7, 8, (1 << 23) - 1));
 
-        let i = Instruction::self_(Reg(1), Reg(2), IcIdx(4), KIdx(3));
+        let i = Instruction::self_(Reg(1), Reg(2), SlotIdx(4), KIdx(3));
         assert_eq!(i.abde(), (1, 2, 4, 3));
 
         let i = Instruction::setlist(Reg(1), 2, 3);
@@ -2466,7 +2583,7 @@ mod tests {
         assert_eq!(i.branch_offset(), -1);
         assert_eq!(i.op(), Op::JMP);
 
-        let mut i = Instruction::getfield(Reg(1), Reg(2), IcIdx(3), KIdx(4));
+        let mut i = Instruction::getfield(Reg(1), Reg(2), SlotIdx(3), KIdx(4));
         i.set_d(u16::MAX);
         assert_eq!(i.abde(), (1, 2, u16::MAX, 4));
     }

@@ -3,7 +3,7 @@ use std::cell::Cell;
 use crate::Context;
 use crate::dmm::{Collect, Gc, GcWeak, Lock, Mutation, RefLock, Trace};
 use crate::env::error::Error;
-use crate::env::shape::Shape;
+use crate::env::shape::{Kind, Shape};
 use crate::env::string::LuaString;
 use crate::env::table::{SlotLoc, TableState};
 use crate::env::thread::{Thread, ThreadState};
@@ -55,16 +55,22 @@ pub struct Prototype<'gc> {
     pub locvars: Box<[LocVar<'gc>]>,
     /// Parallel to `upvalue_desc`.
     pub upvalue_names: Box<[LuaString<'gc>]>,
-    /// Inline-cache table indexed by `ic_idx` embedded in
-    /// GETTABUP/SETTABUP/GETFIELD/SETFIELD/SELF instructions. One entry
-    /// per cache site (call site, not instruction count). The slice
-    /// lives inline in the prototype (no separate `Gc` allocation,
-    /// no `RefLock`); per-slot `Lock<InlineCache>` exposes
-    /// counter-free reads via `get()` and barrier-aware writes via
-    /// the parent `Prototype`'s `Gc`. Entries are [`InlineCache`].
-    pub ic_table: IcTable<'gc>,
+    /// Per site, its inline cache or callee and what was seen there.
+    pub feedback: crate::env::feedback::FeedbackVector<'gc>,
     /// Per distinct constructor template, indexed by `NEWTABLE`.
     pub templates: Box<[Template<'gc>]>,
+    /// The JIT's record of this prototype, created when one of its entries
+    /// first gets hot.
+    pub(crate) jit: Lock<Option<crate::jit::state::JitStateRef<'gc>>>,
+    /// The fast entry of the function region at pc 0 while it is installed,
+    /// else 0: compiled callers branch to it with `blr` (5.4).
+    #[collect(require_static)]
+    pub(crate) jit_fast: Cell<usize>,
+    /// Closures made of it, up to 2: a callee whose prototype made several
+    /// is guarded by its prototype rather than its identity (LuaJIT's
+    /// `PROTO_CLCOUNT`).
+    #[collect(require_static)]
+    pub(crate) closures: Cell<u8>,
 }
 
 /// A prototype's bytecode, in cells: the interpreter rewrites an
@@ -97,6 +103,15 @@ impl Code {
     pub fn iter(&self) -> impl Iterator<Item = crate::instruction::Instruction> + '_ {
         self.0.iter().map(std::cell::Cell::get)
     }
+
+    /// Rewrite a quickened field access at `pc` to its generic form, for an
+    /// emptied cache entry.
+    pub(crate) fn unquicken(&self, pc: usize) {
+        let i = self.0[pc].get();
+        if i.op().info().family == crate::instruction::Family::Field {
+            self.0[pc].set(i.with_op(i.op().unquickened()));
+        }
+    }
 }
 
 /// What `NEWTABLE` starts a constructor's table with: the shape of its
@@ -119,88 +134,47 @@ impl<'gc> Prototype<'gc> {
 }
 
 /// Per-call-site inline cache for one constant string key, keyed on the
-/// receiver's shape. `Empty` until a slow path fills it.
+/// receiver's shape. `Empty` until a slow path fills it. Lives in a field
+/// slot of the feedback vector, which holds its references weakly.
 ///
 /// Metamethods are read live through `Shape::has_mm`, so a cached shape
 /// stays a valid identity as its metatable's metamethods change; only
 /// `ProtoLoad`, which caches what `__index` names, also checks
 /// `MtCache::index_table`.
-// A power-of-two size keeps indexing `ic_table` to a shift.
-#[derive(Clone, Copy, Collect, Default)]
-#[collect(internal, no_drop)]
-#[repr(align(32))]
+#[derive(Clone, Copy, Default)]
 pub enum InlineCache<'gc> {
     // First, so the hottest hit tests a zero discriminant.
-    /// Tables of `shape` hold the key at `loc`.
+    /// Tables of `shape` hold the key at `loc`. A store needs its value to
+    /// fit `kind`, a copy of the slot's (which only widens).
     Own {
         shape: Shape<'gc>,
-        #[collect(require_static)]
         loc: SlotLoc,
+        kind: Kind,
     },
     /// Tables of `shape` lack the key: a load is nil unless `__index` fires.
     Absent { shape: Shape<'gc> },
     /// Tables of `from` lack the key; adding it moves them to `to`, which
-    /// holds it at `loc`, the slot after `from`'s last.
+    /// holds it at `loc`, the slot after `from`'s last, of `kind` as in `Own`.
     Transition {
         from: Shape<'gc>,
         to: Shape<'gc>,
-        #[collect(require_static)]
         loc: SlotLoc,
+        kind: Kind,
     },
     /// Tables of `recv` lack the key, and while their metatable's `__index`
     /// is `holder`, it holds the key at `loc` if its shape is `holder_shape`.
-    /// `holder` is weak, as a metatable's `__index` may be.
     ProtoLoad {
         recv: Shape<'gc>,
         holder: GcWeak<'gc, RefLock<TableState<'gc>>>,
         holder_shape: Shape<'gc>,
-        #[collect(require_static)]
         loc: SlotLoc,
     },
     #[default]
     Empty,
 }
 
-const _: () = assert!(size_of::<InlineCache<'static>>() == 32);
-
-/// [`Prototype::ic_table`]. Its trace empties the `ProtoLoad` entries whose
-/// holder was dropped, so they stop reserving its allocation.
-pub struct IcTable<'gc>(Box<[Lock<InlineCache<'gc>>]>);
-
-impl<'gc> IcTable<'gc> {
-    pub fn new(len: usize) -> Self {
-        IcTable(vec![Lock::new(InlineCache::Empty); len].into_boxed_slice())
-    }
-}
-
-impl<'gc> std::ops::Deref for IcTable<'gc> {
-    type Target = [Lock<InlineCache<'gc>>];
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-// SAFETY: traces every entry it keeps. Emptying one from `trace(&self)` adopts
-// nothing, and the collector never runs while the mutator reads an entry.
-unsafe impl<'gc> Collect<'gc> for IcTable<'gc> {
-    fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
-        for slot in self.iter() {
-            let entry = slot.get();
-            if let InlineCache::ProtoLoad { holder, .. } = entry
-                && holder.is_dropped()
-            {
-                unsafe { slot.as_cell() }.set(InlineCache::Empty);
-            } else {
-                cc.trace(&entry);
-            }
-        }
-    }
-}
-
 /// A captured local: open while its frame lives, `v` pointing at its slot in
-/// `thread`'s stack (rebased when the stack moves), then closed, `v` pointing
-/// at `closed`. Reads are one load through `v`, whichever state.
+/// `thread`'s stack, then closed, `v` pointing at `closed`. Reads are one load through `v`, whichever state.
 pub struct UpvalueCell<'gc> {
     v: Cell<*mut Value<'gc>>,
     closed: Cell<Value<'gc>>,
@@ -228,6 +202,11 @@ unsafe impl<'gc> Collect<'gc> for UpvalueCell<'gc> {
 }
 
 impl<'gc> UpvalueCell<'gc> {
+    /// Where compiled code finds the pointer to the value, from the cell's
+    /// `Gc` (its box).
+    pub(crate) const V_OFFSET: usize = Gc::<'static, UpvalueCell<'static>>::VALUE_OFFSET
+        + std::mem::offset_of!(UpvalueCell<'static>, v);
+
     /// An open upvalue for `slot` of `thread`'s stack.
     pub(crate) fn new_open(
         mc: &Mutation<'gc>,
@@ -260,7 +239,7 @@ impl<'gc> UpvalueCell<'gc> {
     #[inline(always)]
     pub(crate) fn get(&self) -> Value<'gc> {
         // SAFETY: `v` is a live slot of `thread`'s stack while open (closed
-        // before the frame goes, rebased when the stack moves), else `closed`.
+        // before the frame goes), else `closed`.
         unsafe { *self.v.get() }
     }
 
@@ -293,15 +272,6 @@ impl<'gc> UpvalueCell<'gc> {
         self.v.get()
     }
 
-    /// Point an open upvalue into its stack's new buffer, which moved from
-    /// address `old`.
-    #[inline]
-    pub(crate) fn rebase(&self, old: usize, new: *mut Value<'gc>) {
-        let index = (self.v.get().addr() - old) / size_of::<Value>();
-        // SAFETY: the slot moved with the rest of the stack.
-        self.v.set(unsafe { new.add(index) });
-    }
-
     #[inline]
     pub(crate) fn close(this: Upvalue<'gc>, mc: &Mutation<'gc>) {
         mc.backward_barrier(Gc::erase(this), None);
@@ -320,7 +290,8 @@ pub struct LuaClosure<'gc> {
     // this closure; they are not traced (the `Gc` above is).
     pub code: *const crate::instruction::Instruction,
     pub constants: *const Value<'gc>,
-    pub ic_table: *const Lock<InlineCache<'gc>>,
+    /// The feedback vector's first word (`FeedbackVector::as_ptr`).
+    pub feedback: *const Cell<u64>,
     pub max_stack_size: u8,
     pub num_params: u8,
     pub is_vararg: bool,
@@ -498,6 +469,11 @@ impl<'gc, 'a> Stack<'gc, 'a> {
     #[inline]
     pub fn push(&mut self, v: Value<'gc>) {
         let top = self.thread.top;
+        // Past the stack's end a push is dropped: the native has overflowed,
+        // which `invoke` reports once it returns.
+        if top >= crate::vm::stack::VALUE_SLOTS {
+            return;
+        }
         self.thread.ensure_slots(top + 1);
         self.thread.stack[top] = v;
         self.thread.top = top + 1;
@@ -527,6 +503,8 @@ impl<'gc, 'a> Stack<'gc, 'a> {
     #[inline]
     pub fn extend_from_slice(&mut self, values: &[Value<'gc>]) {
         let top = self.thread.top;
+        let room = crate::vm::stack::VALUE_SLOTS.saturating_sub(top);
+        let values = &values[..values.len().min(room)];
         let end = top + values.len();
         self.thread.ensure_slots(end);
         for (i, v) in values.iter().enumerate() {
@@ -794,7 +772,7 @@ impl<'gc> Function<'gc> {
             proto,
             code: proto.code.as_ptr(),
             constants: proto.constants.as_ptr(),
-            ic_table: proto.ic_table.as_ptr(),
+            feedback: proto.feedback.as_ptr(),
             max_stack_size: proto.max_stack_size,
             num_params: proto.num_params,
             is_vararg: proto.is_vararg,
@@ -805,6 +783,10 @@ impl<'gc> Function<'gc> {
             },
             num_upvalues: proto.num_upvalues,
         };
+        let made = proto.closures.get();
+        if made < 2 {
+            proto.closures.set(made + 1);
+        }
         // SAFETY: `init` writes every upvalue.
         Function(unsafe {
             Gc::new_with_trailing(mc, FunctionKind::Lua(closure), |p| init(p.cast().as_ptr()))

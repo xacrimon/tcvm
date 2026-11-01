@@ -6,6 +6,7 @@ use crate::env::shape::{MetamethodBits, MmIndex};
 use crate::env::table::Table;
 use crate::env::value::Value;
 use crate::instruction::{ArithKind, Family, Instruction, MISSES_TO_LOCK, Op};
+use crate::jit::feedback;
 use crate::vm::abi::{Slot, handler, handler_bits};
 use crate::vm::frame::{self, HDR};
 use crate::vm::num::{self, ArithOp, BitOp};
@@ -270,7 +271,7 @@ fn kind_of(v: &Value<'_>) -> Kind {
 
 /// The form of `generic` for the numeric operand kinds seen, if one
 /// exists. `rhs` is the immediate for an immediate family.
-fn numeric_form(generic: Op, lhs: &Value<'_>, rhs: &Value<'_>, imm_int: bool) -> Option<Op> {
+fn numeric_form(generic: Op, lhs: &Value<'_>, rhs: &Value<'_>, insn: Instruction) -> Option<Op> {
     let info = generic.info();
     let forms = &info.forms;
     match info.family {
@@ -283,9 +284,11 @@ fn numeric_form(generic: Op, lhs: &Value<'_>, rhs: &Value<'_>, imm_int: bool) ->
         },
         Family::ImmArith | Family::ImmBit => {
             // The register operand: the immediate is on the left for the
-            // reversed forms (and the slow path passed it as `lhs`).
-            let reg = if info.reversed { rhs } else { lhs };
-            match (kind_of(reg), imm_int) {
+            // reversed forms and flipped sites (and the slow path passed it
+            // as `lhs`).
+            let flipped = insn.c() & 1 != 0;
+            let reg = if info.reversed || flipped { rhs } else { lhs };
+            match (kind_of(reg), insn.imm_is_int()) {
                 (Kind::Small, true) => forms[0].or(forms[2]),
                 (Kind::Small, false) => forms[2],
                 (Kind::Float, _) => forms[1],
@@ -472,6 +475,11 @@ handler! {
         let insn = insn_at!();
         let (dst, src) = insn.ab();
         let v = reg![src];
+        let closure = unsafe { frame::closure(base) };
+        let site = unsafe { pc.sub(1) };
+        // A small operand here is `i32::MIN`.
+        let overflow = if v.get_small().is_some() { feedback::OVERFLOW } else { 0 };
+        feedback::record(closure, site, feedback::kind(v) | overflow);
         if let Some(i) = v.get_integer() {
             reg![dst] = Value::integer(rt.mutation(), i.wrapping_neg());
             next!()
@@ -480,6 +488,7 @@ handler! {
         if mm.is_nil() {
             raise!(OpError::Arith(v, v))
         }
+        feedback::record(closure, site, feedback::MM);
         // Lua passes the operand twice for unary metamethods.
         stage_mm!(pc, base, rt, ret_store_a, mm, [v, v])
     }
@@ -498,6 +507,9 @@ handler! {
         let insn = insn_at!();
         let (dst, src) = insn.ab();
         let v = reg![src];
+        let closure = unsafe { frame::closure(base) };
+        let site = unsafe { pc.sub(1) };
+        feedback::record(closure, site, feedback::kind(v));
         if let Some(i) = v.get_integer() {
             reg![dst] = Value::integer(rt.mutation(), !i);
             next!()
@@ -506,6 +518,7 @@ handler! {
         if mm.is_nil() {
             raise!(OpError::Bitwise(v, v))
         }
+        feedback::record(closure, site, feedback::MM);
         stage_mm!(pc, base, rt, ret_store_a, mm, [v, v])
     }
 
@@ -546,8 +559,15 @@ handler! {
         };
         if let Some(v) = inline_arith(info.kind, &lhs, &rhs) {
             if !locked {
-                let form = numeric_form(generic, &lhs, &rhs, insn.imm_is_int());
-                unsafe { specialize(site, insn, form, false) };
+                let form = numeric_form(generic, &lhs, &rhs, insn);
+                if form.is_none() {
+                    // Kinds no form covers leave no other record.
+                    feedback::record(closure, site, feedback::kind(lhs) | feedback::kind(rhs));
+                }
+                // A form drops on kinds no form covers, so no form
+                // outlives the kinds its site sees.
+                let drop = form.is_none() && insn.op() != generic;
+                unsafe { specialize(site, insn, form, drop) };
             }
             reg![dst] = v;
             next!()
@@ -590,10 +610,24 @@ handler! {
             None => unreachable!("arith_slow on {generic:?}"),
         };
         let bit = kind_mm(info.kind);
+        let closure = unsafe { frame::closure(base) };
+        let kinds = feedback::kind(lhs) | feedback::kind(rhs);
+        let overflow = if kinds == feedback::SMALL { feedback::OVERFLOW } else { 0 };
+        feedback::record(closure, site, kinds | overflow);
         match r {
             num::SlowNum::Value(v) => {
-                // Boxed integers, or an overflow of the inline case: no form
-                // change, and the site stays as it is.
+                // An overflow of the inline case, or boxed integers at an
+                // integer form, leave the site as it is; other kinds (big
+                // integers at a float form, strings) drop its form.
+                let int_form =
+                    info.forms[0] == Some(insn.op()) && !matches!(info.kind, Div | Pow);
+                let foreign = feedback::STR
+                    | feedback::TAB
+                    | feedback::OTHER
+                    | if int_form { 0 } else { feedback::BIGINT };
+                if !locked && insn.op() != generic && kinds & foreign != 0 {
+                    unsafe { specialize(site, insn, Option::None, true) };
+                }
                 reg![dst] = v;
                 gc_check!();
                 next!()
@@ -615,6 +649,7 @@ handler! {
                 OpError::Arith(lhs, rhs)
             })
         }
+        feedback::record(closure, site, feedback::MM);
         if !locked {
             // The forms read the metamethod from a table's shape; taking it
             // from the right needs the left to be a number without one.

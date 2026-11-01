@@ -131,6 +131,8 @@ impl<'gc> Table<'gc> {
         v: Value<'gc>,
     ) {
         debug_assert!(state.has_room(loc) && to.slot_count() == state.shape.slot_count() + 1);
+        // No cache entry or compiled store moves a watched holder.
+        debug_assert!(!state.shape.is_watched());
         unsafe { *self.slot_ptr(state, loc) = v };
         state.shape = to;
     }
@@ -288,7 +290,11 @@ impl<'gc> Table<'gc> {
         let class = mt.map(|t| t.ensure_mt_cache(ctx));
         let mut state = self.0.borrow_mut(ctx.mutation());
         let from = state.shape;
-        let poly = from.is_poly() || class.zip(mt).is_some_and(|(c, mt)| !c.owned_by(mt));
+        // Only the owner's tables of a class nothing else joined are mono.
+        let poly = from.is_poly()
+            || class
+                .zip(mt)
+                .is_some_and(|(c, mt)| !c.owned_by(mt) || c.is_shared());
         let shape = shape::transition_set_metatable(
             ctx.mutation(),
             from,
@@ -299,9 +305,11 @@ impl<'gc> Table<'gc> {
         );
         state.enter_mt_shape(ctx.mutation(), shape, mt);
         drop(state);
+        // A watched holder's old shape is never taken again.
         if let Some(mt) = mt
             && from.mt_cache().is_none()
             && shape.mt_home() != MtHome::Aux
+            && !from.is_watched()
         {
             let ms = mt.shape();
             if ms
@@ -339,8 +347,10 @@ impl<'gc> Table<'gc> {
         if !Shape::ptr_eq(state.shape, from) {
             return None;
         }
+        // `set_metatable` records no move from a watched holder's shape.
+        debug_assert!(!from.is_watched());
         match to.mt_home() {
-            MtHome::Class if class.owned_by(mt) => {
+            MtHome::Class if class.owned_by(mt) && !class.is_shared() => {
                 state.shape = to;
                 Some(false)
             }
@@ -350,6 +360,7 @@ impl<'gc> Table<'gc> {
                     state.grow_spill(mc);
                 }
                 state.shape = to;
+                to.field(slot).admit(mc, Value::table(mt));
                 state.named_set(slot, Value::table(mt));
                 Some(grow)
             }
@@ -376,10 +387,24 @@ impl<'gc> Table<'gc> {
         self.refresh_meta(ctx)
     }
 
-    /// Move this table off a stale class, to its metatable's current one.
+    /// Move this table off a stale class or a deprecated shape, to its
+    /// metatable's current class and shape.
     #[cold]
     #[inline(never)]
     pub(crate) fn refresh_meta(self, ctx: Context<'gc>) -> Option<shape::MtCache<'gc>> {
+        let shape = self.shape();
+        if shape.is_deprecated()
+            && !shape.is_dict()
+            && let Some(mt) = self.metatable()
+            && shape.mt_cache().is_some_and(|c| !c.is_stale())
+        {
+            let symbols = ctx.symbols();
+            let to = shape.poly_twin(ctx.mutation(), symbols.mt_key, ctx.empty_dict_sentinel());
+            self.0
+                .borrow_mut(ctx.mutation())
+                .relayout(ctx.mutation(), to, mt, symbols.mt_key);
+            return to.mt_cache();
+        }
         self.set_metatable(ctx, self.metatable());
         self.shape().mt_cache()
     }
@@ -453,8 +478,9 @@ impl<'gc> Table<'gc> {
         if shape.is_dict() {
             state.aux_or_new(mc).mt_cache = Some(class);
         } else {
-            state.shape = shape::transition_adopt(mc, shape, class);
+            state.set_shape(mc, shape::transition_adopt(mc, shape, class));
         }
+        state.watch_index(mc, class);
         class
     }
 
@@ -462,7 +488,7 @@ impl<'gc> Table<'gc> {
     /// whether marking must resume and the pass rerun.
     pub(crate) fn converge_weak(fc: &Finalization<'gc>) -> bool {
         let mut resurrected = false;
-        for t in fc.deferred() {
+        for t in fc.deferred(crate::env::DEFER_TABLES) {
             resurrected |= unsafe { Self::from_deferred(t) }.0.borrow().converge(fc);
         }
         resurrected
@@ -470,7 +496,7 @@ impl<'gc> Table<'gc> {
 
     /// Clear the deferred weak tables' dead entries (see [`TableState::clear_dead`]).
     pub(crate) fn clear_weak(fc: &Finalization<'gc>) {
-        for t in fc.deferred() {
+        for t in fc.deferred(crate::env::DEFER_TABLES) {
             // Storing nil adopts no pointer, so no barrier is needed. One would re-gray the
             // table, and its retrace would defer it again after `clear_deferred`, tripping the
             // sweep assert.
@@ -481,8 +507,8 @@ impl<'gc> Table<'gc> {
     }
 
     /// # Safety
-    /// `gc` must come from [`Finalization::deferred`], and `TableState::trace` must be the only
-    /// caller of `Trace::defer`.
+    /// `gc` must come from [`Finalization::deferred`] of `DEFER_TABLES`, which only
+    /// `TableState::trace` defers to.
     unsafe fn from_deferred(gc: Gc<'gc, ()>) -> Self {
         Table(unsafe { Gc::cast(gc) })
     }
@@ -553,9 +579,39 @@ impl SlotLoc {
         self.0 & Self::SPILLED != 0
     }
 
+    /// The byte offset: from the table's lock when inline, into the spill
+    /// cell when spilled.
     #[inline(always)]
-    fn offset(self) -> usize {
+    pub(crate) fn offset(self) -> usize {
         (self.0 & !Self::SPILLED) as usize
+    }
+
+    /// The encoded word, for an IR payload.
+    pub(crate) fn raw(self) -> u32 {
+        self.0
+    }
+
+    /// The slot this is for tables of `shape`.
+    pub(crate) fn slot(self, shape: Shape<'_>) -> u32 {
+        let size = size_of::<Value>() as u32;
+        match self.spilled() {
+            false => (self.0 - RefLock::<TableState>::TRAILING_FROM_LOCK as u32) / size,
+            true => shape.inline_cap() + self.offset() as u32 / size,
+        }
+    }
+
+    /// Debug builds: `v`, read from here in a table of `shape`, fits the
+    /// slot's kind (ws2 §6.1).
+    #[inline(always)]
+    pub(crate) fn check_kind(self, shape: Shape<'_>, v: Value<'_>) {
+        if cfg!(debug_assertions) {
+            let kind = shape.field(self.slot(shape)).kind();
+            assert!(kind.fits(v), "{:#x} in a slot of {kind:?}", v.to_raw());
+        }
+    }
+
+    pub(crate) fn from_raw(raw: u32) -> Self {
+        SlotLoc(raw)
     }
 }
 
@@ -602,7 +658,7 @@ unsafe impl<'gc> Collect<'gc> for TableState<'gc> {
             cc.trace(&h.mt_cache);
             cc.trace(&h.metatable);
         }
-        cc.defer();
+        cc.defer(crate::env::DEFER_TABLES);
         let weak_values = mode.contains(WeakMode::VALUES);
         let value = |cc: &mut T, v: &Value<'gc>| {
             if !(weak_values && v.is_weak_object()) {
@@ -657,6 +713,14 @@ struct Aux<'gc> {
 pub struct InvalidKey;
 
 impl<'gc> TableState<'gc> {
+    // Field offsets compiled code reads (`jit::layout`).
+    pub(crate) const SHAPE_OFFSET: usize = core::mem::offset_of!(TableState<'static>, shape);
+    pub(crate) const SPILL_OFFSET: usize = core::mem::offset_of!(TableState<'static>, spill);
+    pub(crate) const SPILL_CAP_OFFSET: usize =
+        core::mem::offset_of!(TableState<'static>, spill_cap);
+    pub(crate) const ARRAY_OFFSET: usize = core::mem::offset_of!(TableState<'static>, array);
+    pub(crate) const ASIZE_OFFSET: usize = core::mem::offset_of!(TableState<'static>, asize);
+
     #[inline]
     pub fn shape(&self) -> Shape<'gc> {
         self.shape
@@ -682,19 +746,91 @@ impl<'gc> TableState<'gc> {
             a.metatable = None;
         }
         match shape.mt_home() {
-            MtHome::Class => self.shape = shape,
+            MtHome::Class => self.set_shape(mc, shape),
             MtHome::Aux => {
-                self.shape = shape;
+                self.set_shape(mc, shape);
                 self.aux_or_new(mc).metatable = mt;
             }
             MtHome::Slot(slot) => {
                 if slot == self.shape.slot_count() && !self.has_room(SlotLoc::new(shape, slot)) {
                     self.grow_spill(mc);
                 }
-                self.shape = shape;
-                self.named_set(slot, mt.map_or(Value::nil(), Value::table));
+                self.set_shape(mc, shape);
+                let v = mt.map_or(Value::nil(), Value::table);
+                self.shape.field(slot).admit(mc, v);
+                self.named_set(slot, v);
             }
         }
+    }
+
+    /// Move to `to`. A watched holder's moves invalidate what code assumed
+    /// of its old shape, and it stays watched in a shape of its own, unless
+    /// it went dict (ws2 §5.2).
+    #[inline(always)]
+    fn set_shape(&mut self, mc: &Mutation<'gc>, to: Shape<'gc>) {
+        let from = self.shape;
+        self.shape = to;
+        if from.is_watched() {
+            self.rewatch(mc, from);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn rewatch(&mut self, mc: &Mutation<'gc>, from: Shape<'gc>) {
+        let any = from.left(mc);
+        let to = self.shape;
+        if to.is_dict() {
+            return;
+        }
+        // A child of `from` is this table's alone already.
+        if to.is_watched() {
+            if any {
+                to.mark_volatile_holder();
+            }
+            return;
+        }
+        let volatile = from.is_volatile_holder() || any;
+        self.shape = to.watched_copy(mc, from.mutable_for(to), volatile);
+    }
+
+    /// Watch this table, which became a class's `__index` (ws2 §5.2): it
+    /// moves to a shape of its own, which no cache entry or compiled code
+    /// has seen. A dict table is not watched.
+    fn watch(&mut self, mc: &Mutation<'gc>) {
+        let s = self.shape;
+        if !s.is_dict() && !s.is_watched() {
+            self.shape = s.watched_copy(mc, 0, false);
+        }
+    }
+
+    /// Watch the table `class`'s `__index` names, which may be this one.
+    fn watch_index(&mut self, mc: &Mutation<'gc>, class: shape::MtCache<'gc>) {
+        let Some(t) = class.mm(shape::MetamethodBits::INDEX).get_table() else {
+            return;
+        };
+        if core::ptr::eq(t.inner().as_ptr(), self) {
+            self.watch(mc);
+        } else if !t.shape().is_watched() {
+            t.inner().borrow_mut(mc).watch(mc);
+        }
+    }
+
+    /// Store `v` to `slot`, string `key`'s, telling a metatable's class and a
+    /// watched holder's dependents.
+    pub(crate) fn set_named(
+        &mut self,
+        mc: &Mutation<'gc>,
+        slot: u32,
+        key: LuaString<'gc>,
+        v: Value<'gc>,
+    ) {
+        if self.shape.is_watched() && !self.named_get(slot).same_bits(&v) {
+            self.shape.slot_changed(mc, slot);
+        }
+        self.shape.field(slot).admit(mc, v);
+        self.named_set(slot, v);
+        self.maybe_update_mt_bit(mc, Value::string(key), v);
     }
 
     /// This table's class as a metatable, adopted by
@@ -739,6 +875,9 @@ impl<'gc> TableState<'gc> {
             return None;
         }
         class.join();
+        // Only `transition_adopt` leaves a memo, on the shape its table
+        // leaves: none is a watched holder's.
+        debug_assert!(!self.shape.is_watched());
         self.shape = to;
         Some(to)
     }
@@ -763,7 +902,13 @@ impl<'gc> TableState<'gc> {
         if let Some(s) = key.get_string()
             && let Some(cache) = self.mt_cache()
         {
-            cache.member_write(Some(mc), s, value, self.addr());
+            cache.member_write(mc, s, value, self.addr());
+            // A class's new `__index` table, set in place.
+            if let Some(t) = value.get_table()
+                && cache.index_table() == Gc::as_ptr(t.inner()) as usize
+            {
+                self.watch_index(mc, cache);
+            }
         }
     }
 
@@ -804,15 +949,22 @@ impl<'gc> TableState<'gc> {
         let addr = self.addr();
         let cleared = |key| {
             if let Some(c) = mt_cache {
-                c.member_write(None, key, Value::nil(), addr);
+                c.member_write(fc, key, Value::nil(), addr);
             }
         };
-        let keys = self.shape.keys();
+        let shape = self.shape;
+        let keys = shape.keys();
         let (inline, spilled) = self.named_mut();
-        for (v, &key) in inline.iter_mut().chain(spilled).zip(keys) {
+        for (i, (v, &key)) in inline.iter_mut().chain(spilled).zip(keys).enumerate() {
             if v.is_dead(fc) {
                 *v = Value::nil();
                 cleared(key);
+                if shape.is_watched() {
+                    shape.slot_changed(fc, i as u32);
+                }
+                // Code that assumed otherwise is retired before it runs
+                // again (`jit::build::tables::slot_types`).
+                shape.field(i as u32).admit(fc, Value::nil());
             }
         }
         for v in self.array_mut().iter_mut().filter(|v| v.is_dead(fc)) {
@@ -928,9 +1080,10 @@ impl<'gc> TableState<'gc> {
         unsafe { *self.named_ptr(slot) }
     }
 
-    /// Store to `slot` of this table's shape.
+    /// Store to `slot` of this table's shape, which the caller admitted to
+    /// the slot's field.
     #[inline]
-    pub fn named_set(&mut self, slot: u32, v: Value<'gc>) {
+    fn named_set(&mut self, slot: u32, v: Value<'gc>) {
         unsafe { *self.named_ptr(slot) = v }
     }
 
@@ -1086,12 +1239,9 @@ impl<'gc> TableState<'gc> {
         }
 
         match self.shape.find_slot(key) {
-            Some(slot) => {
-                // Deletion keeps the slot (nil-valued) so the shape stays stable
-                // and `next` can resume from the deleted key.
-                self.named_set(slot, value);
-                self.maybe_update_mt_bit(ctx.mutation(), Value::string(key), value);
-            }
+            // Deletion keeps the slot (nil-valued) so the shape stays stable
+            // and `next` can resume from the deleted key.
+            Some(slot) => self.set_named(ctx.mutation(), slot, key, value),
             None => self.add_string_key(ctx, key, value, cap),
         }
     }
@@ -1122,7 +1272,8 @@ impl<'gc> TableState<'gc> {
         if !self.has_room(SlotLoc::new(new_shape, slot)) {
             self.grow_spill(ctx.mutation());
         }
-        self.shape = new_shape;
+        self.set_shape(ctx.mutation(), new_shape);
+        self.shape.field(slot).admit(ctx.mutation(), value);
         self.named_set(slot, value);
         self.maybe_update_mt_bit(ctx.mutation(), Value::string(key), value);
     }
@@ -1130,6 +1281,37 @@ impl<'gc> TableState<'gc> {
     /// Move the spilled slots to a cell with room for more; the old one is
     /// left for the sweep.
     #[cold]
+    /// Move to `to`, a shape of this one's keys and the metatable's slot
+    /// (a deprecated shape's poly twin): each value to its slot there.
+    fn relayout(
+        &mut self,
+        mc: &Mutation<'gc>,
+        to: Shape<'gc>,
+        mt: Table<'gc>,
+        mt_key: LuaString<'gc>,
+    ) {
+        let from = self.shape;
+        let vals: Vec<Value<'gc>> = to
+            .keys()
+            .iter()
+            .map(|&k| match from.find_slot(k) {
+                _ if k == mt_key => Value::table(mt),
+                Some(s) => self.named_get(s),
+                None => Value::nil(),
+            })
+            .collect();
+        if let Some(last) = to.slot_count().checked_sub(1) {
+            while !self.has_room(SlotLoc::new(to, last)) {
+                self.grow_spill(mc);
+            }
+        }
+        self.set_shape(mc, to);
+        for (i, v) in vals.into_iter().enumerate() {
+            self.shape.field(i as u32).admit(mc, v);
+            self.named_set(i as u32, v);
+        }
+    }
+
     fn grow_spill(&mut self, mc: &Mutation<'gc>) {
         let old = self.named().1;
         let cap = (old.len() * 2).max(4);

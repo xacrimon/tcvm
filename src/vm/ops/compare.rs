@@ -7,6 +7,7 @@
 use crate::env::MetamethodBits;
 use crate::env::value::{Value, ValueKind};
 use crate::instruction::{ADAPTIVE_AB_IMM, ADAPTIVE_AH_IMM, Instruction, Op};
+use crate::jit::feedback;
 use crate::vm::abi::{Slot, handler};
 use crate::vm::num;
 use crate::vm::ops::arith::specialize;
@@ -64,10 +65,17 @@ macro_rules! eq_handler {
             bind(insn, pc, base, rt, closure, thread, nret, values);
             op fn $name {
                 let (a, b) = (&reg![insn.a()], &reg![insn.b()]);
-                // Floats first: a NaN has the same bits as itself.
+                // Floats first: a NaN has the same bits as itself. A form
+                // here saw other kinds than two small integers.
                 let eq = if a.is_float() && b.is_float() {
+                    if insn.op() != Op::$g {
+                        adapt!(Option::None)
+                    }
                     a.read_float() == b.read_float()
                 } else if a.same_bits(b) {
+                    if insn.op() != Op::$g {
+                        adapt!(Option::None)
+                    }
                     true
                 } else if let Some((x, y)) = Value::both_small(a, b) {
                     if insn.op() == Op::$g && !locked!(insn, ADAPTIVE_AB_IMM) {
@@ -157,6 +165,9 @@ macro_rules! cmp_imm_handler {
                     let f = v.read_float();
                     if $swap { floats(k as f64, f) } else { floats(f, k as f64) }
                 } else if let Some(i) = v.get_integer() {
+                    if insn.op() != Op::$g {
+                        adapt!(Option::None)
+                    }
                     if $swap { ints(k, i) } else { ints(i, k) }
                 } else {
                     tail!(cmp_slow)
@@ -279,8 +290,16 @@ handler! {
     slow fn eq_slow {
         let insn: Instruction = insn_at!();
         let (a, b) = (reg![insn.a()], reg![insn.b()]);
+        let closure = unsafe { crate::vm::frame::closure(base) };
+        // Recorded once per run, with the metamethod bit when one runs.
+        let kinds = feedback::kind(a) | feedback::kind(b);
+        // A form here saw other kinds than its own.
+        if insn.op() != insn.generic_op() {
+            unsafe { specialize(pc.sub(1).cast_mut(), insn, Option::None, true) };
+        }
         let k = insn.generic_op() == Op::JEQ;
         if num::raw_eq(a, b) {
+            feedback::record(closure, unsafe { pc.sub(1) }, kinds);
             branch!(k, insn.branch_offset())
         }
         // Lua 5.5: `__eq` fires only when both operands are the same
@@ -290,9 +309,11 @@ handler! {
         if try_meta {
             let mm = binop_metamethod(rt, a, b, MetamethodBits::EQ);
             if !mm.is_nil() {
+                feedback::record(closure, unsafe { pc.sub(1) }, kinds | feedback::MM);
                 stage_mm!(pc, base, rt, if k { ret_cond_t } else { ret_cond_f }, mm, [a, b])
             }
         }
+        feedback::record(closure, unsafe { pc.sub(1) }, kinds);
         branch!(!k, insn.branch_offset())
     }
 
@@ -309,6 +330,15 @@ handler! {
             let (v, lit) = (reg![insn.a()], insn.cmp_imm_value(rt.mutation()));
             if matches!(op, Op::JGTI | Op::JNGTI | Op::JGEI | Op::JNGEI) { (lit, v) } else { (v, lit) }
         };
+        let closure = unsafe { crate::vm::frame::closure(base) };
+        // Recorded once per run, with the metamethod bit when one runs.
+        let kinds = feedback::kind(a) | feedback::kind(b);
+        // Strings and the metamethod kinds drop a form; big integers are
+        // an integer form's too.
+        let foreign = feedback::STR | feedback::TAB | feedback::OTHER;
+        if insn.op() != op && kinds & foreign != 0 {
+            unsafe { specialize(pc.sub(1).cast_mut(), insn, Option::None, true) };
+        }
         let le = matches!(op, Op::JLE | Op::JNLE | Op::JLEI | Op::JNLEI | Op::JGEI | Op::JNGEI);
         let primitive = if let Some(x) = a.get_integer()
             && let Some(y) = b.get_integer()
@@ -326,13 +356,16 @@ handler! {
             None
         };
         if let Some(r) = primitive {
+            feedback::record(closure, unsafe { pc.sub(1) }, kinds);
             branch!(r == k, offset)
         }
         let bit = if le { MetamethodBits::LE } else { MetamethodBits::LT };
         let mm = binop_metamethod(rt, a, b, bit);
         if mm.is_nil() {
+            feedback::record(closure, unsafe { pc.sub(1) }, kinds);
             raise!(OpError::Compare(a, b))
         }
+        feedback::record(closure, unsafe { pc.sub(1) }, kinds | feedback::MM);
         stage_mm!(pc, base, rt, if k { ret_cond_t } else { ret_cond_f }, mm, [a, b])
     }
 }

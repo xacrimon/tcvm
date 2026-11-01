@@ -115,3 +115,46 @@ fn text(v: Value<'_>) -> String {
     let s = v.get_string().expect("a string value");
     String::from_utf8_lossy(s.as_bytes()).into_owned()
 }
+
+/// Run each chunk of `src`, separated by `--full` or `--minor` lines, to completion, then that
+/// collection. Returns the last chunk's string result and the live bytes before and after each
+/// collection.
+pub fn run_steps(lua: &mut Lua, src: &str) -> (String, Vec<(usize, usize)>) {
+    let mut result = String::new();
+    let mut live = Vec::new();
+    let mut chunk = String::new();
+    for line in src.lines().chain(["--end"]) {
+        let full = match line {
+            "--full" => true,
+            "--minor" | "--end" => false,
+            _ => {
+                chunk.push_str(line);
+                chunk.push('\n');
+                continue;
+            }
+        };
+        let ex = start_on(lua, &chunk);
+        lua.finish(&ex).expect("run");
+        result = lua
+            .try_enter(|ctx| {
+                let r = ctx.fetch(&ex).take_result::<Option<LuaString>>(ctx)?;
+                Ok::<_, RuntimeError>(r.map_or(String::new(), |s| {
+                    String::from_utf8_lossy(s.as_bytes()).into_owned()
+                }))
+            })
+            .expect("take result");
+        drop(ex);
+        chunk.clear();
+        if line == "--end" {
+            break;
+        }
+        let before = lua.live_bytes();
+        if full {
+            lua.collect_all();
+        } else {
+            lua.collect_young();
+        }
+        live.push((before, lua.live_bytes()));
+    }
+    (result, live)
+}

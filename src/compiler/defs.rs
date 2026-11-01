@@ -1,7 +1,7 @@
 use super::rules::{Assigned, VarId};
 use crate::compiler::CompileErrorKind;
 use crate::dmm::{Gc, Mutation};
-use crate::env::function::{IcTable, LocVar, Template};
+use crate::env::function::{LocVar, Template};
 use crate::env::{LuaString, Prototype, Value};
 /// Newtype for register indices, providing type safety over raw u8. Defined
 /// with the instruction word so the emitter can pass one straight to an
@@ -252,12 +252,15 @@ pub struct Chunk<'gc> {
     /// fails with "control structure too long" when it is assembled.
     pub(super) too_long: bool,
     pub(super) source: LuaString<'gc>,
-    /// Number of IC slots reserved so far. Incremented once per emitted
-    /// GETFIELD/SETFIELD/GETTABUP/SETTABUP/SELF. The final count seeds the
-    /// prototype's `ic_table` length.
-    pub(super) next_ic_idx: u16,
     /// Becomes `Prototype::templates`.
     pub(super) templates: Vec<Template<'gc>>,
+}
+
+/// The next hot counter of a chunk's round-robin.
+fn next_hot(hot: &mut u8) -> u8 {
+    let i = *hot;
+    *hot = (i + 1) % crate::instruction::HOT_COUNTERS as u8;
+    i
 }
 
 impl<'gc> Chunk<'gc> {
@@ -284,21 +287,8 @@ impl<'gc> Chunk<'gc> {
             last_target: 0,
             too_long: false,
             source,
-            next_ic_idx: 0,
             templates: Vec::new(),
         }
-    }
-
-    /// Reserve a fresh inline-cache slot. Returns the index to embed in
-    /// the GETFIELD/SETFIELD/GETTABUP/SETTABUP/SELF instruction. Slots are
-    /// **not** deduped across call sites — sharing would defeat ICs at
-    /// any non-monomorphic shared use.
-    pub(super) fn alloc_ic_slot(&mut self) -> u16 {
-        let i = self.next_ic_idx;
-        // u16::MAX cache sites per prototype is more than ample; if we
-        // ever hit it, fall back to "no cache" (Empty stays).
-        self.next_ic_idx = self.next_ic_idx.saturating_add(1);
-        i
     }
 
     /// Resolve jump patches and convert into an immutable Prototype, with
@@ -308,6 +298,7 @@ impl<'gc> Chunk<'gc> {
         mut self,
         mc: &Mutation<'gc>,
         assigned: &Assigned,
+        hot: &mut u8,
     ) -> Result<Gc<'gc, Prototype<'gc>>, CompileErrorKind> {
         // Resolve all jump patches
         for &(instr_idx, label_idx) in &self.jump_patches {
@@ -317,7 +308,12 @@ impl<'gc> Chunk<'gc> {
             assert!(
                 matches!(
                     instr.op(),
-                    Op::JMP | Op::FORPREP | Op::FORLOOP | Op::TFORPREP | Op::TFORLOOP
+                    Op::JMP
+                        | Op::JMP_BACK
+                        | Op::FORPREP
+                        | Op::FORLOOP
+                        | Op::TFORPREP
+                        | Op::TFORLOOP
                 ) || instr.op().branch_sense().is_some(),
                 "jump patch on non-jump instruction: {instr:?}"
             );
@@ -374,15 +370,27 @@ impl<'gc> Chunk<'gc> {
             }
         }
 
+        // Hot counters round-robin over the chunk's counting instructions.
+        for instr in &mut self.tape {
+            match instr.op() {
+                Op::FUNC | Op::LOOP | Op::JMP_BACK => instr.set_a(next_hot(hot)),
+                Op::FORLOOP | Op::TFORLOOP => instr.set_b(next_hot(hot)),
+                _ => {}
+            }
+        }
+
         let num_upvalues = upvalue_desc.len() as u8;
         debug_assert_eq!(self.tape.len(), self.lineinfo.len());
         let prototypes = self
             .prototypes
             .into_iter()
-            .map(|child| child.assemble(mc, assigned))
+            .map(|child| child.assemble(mc, assigned, hot))
             .collect::<Result<Vec<_>, _>>()?
             .into_boxed_slice();
 
+        // Last: every rewrite of the tape is done, and slots follow the code.
+        let feedback =
+            crate::env::feedback::FeedbackVector::new(&mut self.tape, num_upvalues as usize);
         Ok(Gc::new(
             mc,
             Prototype {
@@ -401,8 +409,11 @@ impl<'gc> Chunk<'gc> {
                 lineinfo: self.lineinfo.into_boxed_slice(),
                 locvars: self.locvars.into_boxed_slice(),
                 upvalue_names: self.upvalue_names.into_boxed_slice(),
-                ic_table: IcTable::new(self.next_ic_idx as usize),
+                feedback,
                 templates: self.templates.into_boxed_slice(),
+                jit: crate::dmm::Lock::new(None),
+                jit_fast: std::cell::Cell::new(0),
+                closures: std::cell::Cell::new(0),
             },
         ))
     }

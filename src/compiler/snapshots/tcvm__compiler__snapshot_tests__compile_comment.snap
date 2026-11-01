@@ -10,10 +10,11 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  [  1]  VARARGPREP      fixed=0
-0001  [  1]  LOADI           R0 5
-0002  [  3]  LOADI           R1 -6
-0003  [  3]  SETTABUP        R1 U0 K0  ; "y"
-0004  [  7]  LOAD            R1 K2  ; 20000000.0
-0005  [  7]  SETTABUP        R1 U0 K1  ; "z"
-0006  [  7]  RETURN          R0 count=1
+0000  [  1]  FUNC
+0001  [  1]  VARARGPREP      fixed=0
+0002  [  1]  LOADI           R0 5
+0003  [  3]  LOADI           R1 -6
+0004  [  3]  SETTABUP        R1 U0 K0  ; "y"
+0005  [  7]  LOAD            R1 K2  ; 20000000.0
+0006  [  7]  SETTABUP        R1 U0 K1  ; "z"
+0007  [  7]  RETURN          R0 count=1

@@ -55,6 +55,8 @@ handler! {
             tail!(crate::vm::ops::field::get_slow)
         };
         let k = reg![key];
+        let closure: crate::env::function::LuaFn<'gc> = unsafe { crate::vm::frame::closure(base) };
+        crate::jit::feedback::record(closure, unsafe { pc.sub(1) }, crate::jit::feedback::table_key(reg![table], k));
         let (v, need_index) = {
             let state = t.inner().borrow();
             let v = state.raw_get(k);
@@ -100,6 +102,8 @@ handler! {
         };
         let k = reg![key];
         let v = reg![src];
+        let closure: crate::env::function::LuaFn<'gc> = unsafe { crate::vm::frame::closure(base) };
+        crate::jit::feedback::record(closure, unsafe { pc.sub(1) }, crate::jit::feedback::table_key(reg![table], k));
         let needs_newindex = {
             let state = t.inner().borrow();
             state.shape().has_mm(MetamethodBits::NEWINDEX) && state.raw_get(k).is_nil()
@@ -165,14 +169,19 @@ handler! {
             reg![dst] = Value::integer(rt.mutation(), s.len() as i64);
             next!()
         }
+        let closure: crate::env::function::LuaFn<'gc> = unsafe { crate::vm::frame::closure(base) };
+        let site = unsafe { pc.sub(1) };
+        let kind = crate::jit::feedback::kind(v);
         let mm = rt.mm_of(v, MetamethodBits::LEN);
         if mm.is_nil() {
+            crate::jit::feedback::record(closure, site, kind);
             let Some(t) = v.get_table() else {
                 raise!(OpError::Len(v))
             };
             reg![dst] = Value::integer(rt.mutation(), t.raw_len() as i64);
             next!()
         }
+        crate::jit::feedback::record(closure, site, kind | crate::jit::feedback::MM);
         // Like the other unary metamethods, `__len` gets its operand twice.
         crate::vm::ops::meta::stage_mm!(pc, base, rt, ret_store_a, mm, [v, v])
     }
@@ -195,6 +204,8 @@ handler! {
         if mm.is_nil() {
             raise!(OpError::Concat(a, b))
         }
+        let f: crate::env::function::LuaFn<'gc> = unsafe { crate::vm::frame::closure(base) };
+        crate::jit::feedback::record(f, unsafe { pc.sub(1) }, crate::jit::feedback::MM);
         call_mm!(ret_store_a, mm, [a, b])
     }
 }

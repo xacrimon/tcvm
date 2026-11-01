@@ -24,11 +24,19 @@ use crate::vm::unwind::OpError;
 // Inline cache helpers
 // ---------------------------------------------------------------------------
 
-/// The IC entry of the current site.
+/// The IC entry of the current site, whose slot is `d`.
 #[inline(always)]
-pub(crate) fn read_ic<'gc>(closure: LuaFn<'gc>, ic_idx: u16) -> InlineCache<'gc> {
-    debug_assert!((ic_idx as usize) < closure.proto.ic_table.len());
-    unsafe { (*closure.ic_table.add(ic_idx as usize)).get() }
+pub(crate) fn read_ic<'gc>(closure: LuaFn<'gc>, d: u16) -> InlineCache<'gc> {
+    debug_assert!((d as usize) + 5 <= closure.proto.feedback.len());
+    // SAFETY: a field site's `d` starts a field slot, its entry after the site
+    // word (`FeedbackVector::cache`).
+    unsafe {
+        (*closure
+            .feedback
+            .add(d as usize + 1)
+            .cast::<std::cell::Cell<InlineCache<'gc>>>())
+        .get()
+    }
 }
 
 /// Refill the IC entry after a full lookup, and rewrite the site.
@@ -36,7 +44,7 @@ pub(crate) fn read_ic<'gc>(closure: LuaFn<'gc>, ic_idx: u16) -> InlineCache<'gc>
 fn fill_ic<'gc>(
     ctx: Context<'gc>,
     closure: LuaFn<'gc>,
-    ic_idx: u16,
+    d: u16,
     site: *const Instruction,
     entry: InlineCache<'gc>,
 ) {
@@ -50,13 +58,33 @@ fn fill_ic<'gc>(
         } => !recv.is_dict() && !holder_shape.is_dict(),
         InlineCache::Empty => true,
     });
-    let proto_gc = closure.proto;
-    if let Some(slot_lock) = proto_gc.ic_table.get(ic_idx as usize) {
+    let proto = closure.proto;
+    // Not the null slot of sites past the vector's capacity.
+    if proto.feedback.is_field(d as usize) {
         // A fresh `Shape` pointer is adopted through this slot, so the
-        // prototype gets its barrier before the write through `as_cell`.
-        ctx.mutation().backward_barrier(Gc::erase(proto_gc), None);
-        unsafe { slot_lock.as_cell() }.set(entry);
+        // prototype gets its barrier before the write.
+        ctx.mutation().backward_barrier(Gc::erase(proto), None);
+        let cache = proto.feedback.cache(d as usize);
+        // A site that saw another shape records both: the compiler learns
+        // its polymorphism before its first exit.
+        if let (Some(old), Some(new)) = (entry_shape(cache.get()), entry_shape(entry))
+            && !Shape::ptr_eq(old, new)
+        {
+            proto.feedback.add_refill(d as usize, old, new);
+        }
+        cache.set(entry);
         quicken(site, &entry);
+    }
+}
+
+/// The receiver shape an entry is for.
+#[inline(always)]
+fn entry_shape<'gc>(entry: InlineCache<'gc>) -> Option<Shape<'gc>> {
+    match entry {
+        InlineCache::Own { shape, .. } | InlineCache::Absent { shape } => Some(shape),
+        InlineCache::ProtoLoad { recv, .. } => Some(recv),
+        InlineCache::Transition { from, .. } => Some(from),
+        InlineCache::Empty => None,
     }
 }
 
@@ -98,6 +126,7 @@ fn shape_entry<'gc>(shape: Shape<'gc>, slot: Option<u32>) -> InlineCache<'gc> {
         Some(slot) => InlineCache::Own {
             shape,
             loc: SlotLoc::new(shape, slot),
+            kind: shape.field(slot).kind(),
         },
         None => InlineCache::Absent { shape },
     }
@@ -113,10 +142,12 @@ fn ic_get<'gc>(
 ) -> Option<Value<'gc>> {
     let live = state.shape();
     let v = if std::hint::likely(matches!(cache, InlineCache::Own { .. }))
-        && let InlineCache::Own { shape, loc } = cache
+        && let InlineCache::Own { shape, loc, .. } = cache
         && Shape::ptr_eq(live, shape)
     {
-        unsafe { t.load(state, loc) }
+        let v = unsafe { t.load(state, loc) };
+        loc.check_kind(shape, v);
+        v
     } else if let InlineCache::Absent { shape } = cache
         && Shape::ptr_eq(live, shape)
     {
@@ -156,12 +187,12 @@ fn ic_set<'gc>(ctx: Context<'gc>, cache: InlineCache<'gc>, t: Table<'gc>, v: Val
     let state = t.inner().borrow();
     let live = state.shape();
     if std::hint::likely(matches!(cache, InlineCache::Own { .. }))
-        && let InlineCache::Own { shape, loc } = cache
+        && let InlineCache::Own { shape, loc, kind } = cache
         && Shape::ptr_eq(live, shape)
     {
         // `__newindex` fires only on currently-nil keys.
         let existing = unsafe { t.load(&state, loc) };
-        if existing.is_nil() && live.has_mm(MetamethodBits::NEWINDEX) {
+        if existing.is_nil() && live.has_mm(MetamethodBits::NEWINDEX) || !kind.fits(v) {
             return false;
         }
         // Barrier work goes to the slow path, keeping calls out of this handler.
@@ -173,7 +204,12 @@ fn ic_set<'gc>(ctx: Context<'gc>, cache: InlineCache<'gc>, t: Table<'gc>, v: Val
         unsafe { t.store(&state, loc, v) };
         return true;
     }
-    if let InlineCache::Transition { from, to, loc } = cache
+    if let InlineCache::Transition {
+        from,
+        to,
+        loc,
+        kind,
+    } = cache
         && Shape::ptr_eq(live, from)
     {
         if live.has_mm(MetamethodBits::NEWINDEX) {
@@ -183,7 +219,7 @@ fn ic_set<'gc>(ctx: Context<'gc>, cache: InlineCache<'gc>, t: Table<'gc>, v: Val
         if v.is_nil() {
             return true;
         }
-        if !state.has_room(loc) {
+        if !state.has_room(loc) || !kind.fits(v) {
             return false;
         }
         drop(state);
@@ -212,12 +248,12 @@ fn constant_key<'gc>(k: Value<'gc>) -> LuaString<'gc> {
 fn get_fill_ic<'gc>(
     ctx: Context<'gc>,
     closure: LuaFn<'gc>,
-    ic_idx: u16,
+    ic: u16,
     site: *const Instruction,
     t: Table<'gc>,
     k: Value<'gc>,
 ) -> Result<Value<'gc>, Value<'gc>> {
-    leave_stale_class(ctx, t);
+    leave_old_shape(ctx, t);
     let state = t.inner().borrow();
     let shape = state.shape();
     if shape.is_dict() {
@@ -229,7 +265,7 @@ fn get_fill_ic<'gc>(
         };
     }
     // The entry already says `t` lacks the key: only `__index` is left.
-    if let InlineCache::Absent { shape: cached } = read_ic(closure, ic_idx)
+    if let InlineCache::Absent { shape: cached } = read_ic(closure, ic)
         && Shape::ptr_eq(cached, shape)
         && let Some(mt) = shape.mt_cache()
     {
@@ -238,10 +274,10 @@ fn get_fill_ic<'gc>(
         if index.get_function().is_some() {
             return Err(Value::table(t));
         }
-        return get_index_fill_ic(ctx, closure, ic_idx, site, t, index, Some(shape), k);
+        return get_index_fill_ic(ctx, closure, ic, site, t, index, Some(shape), k);
     }
     let slot = shape.find_slot(constant_key(k));
-    fill_ic(ctx, closure, ic_idx, site, shape_entry(shape, slot));
+    fill_ic(ctx, closure, ic, site, shape_entry(shape, slot));
     let v = slot.map_or(Value::nil(), |s| state.named_get(s));
     if !v.is_nil() || !shape.has_mm(MetamethodBits::INDEX) {
         return Ok(v);
@@ -249,15 +285,16 @@ fn get_fill_ic<'gc>(
     let index = unsafe { shape.mt_cache().unwrap_unchecked() }.mm(MetamethodBits::INDEX);
     drop(state);
     let recv = slot.is_none().then_some(shape);
-    get_index_fill_ic(ctx, closure, ic_idx, site, t, index, recv, k)
+    get_index_fill_ic(ctx, closure, ic, site, t, index, recv, k)
 }
 
-/// Move `t` off a stale metatable class before a fill reads the class or
-/// caches its shape (see [`Table::meta`]).
+/// Move `t` off a stale metatable class or a deprecated shape before a fill
+/// reads the class or caches its shape (see [`Table::meta`]).
 #[inline(always)]
-fn leave_stale_class<'gc>(ctx: Context<'gc>, t: Table<'gc>) {
-    if let Some(c) = t.shape().mt_cache()
-        && c.is_stale()
+fn leave_old_shape<'gc>(ctx: Context<'gc>, t: Table<'gc>) {
+    let shape = t.shape();
+    if let Some(c) = shape.mt_cache()
+        && (c.is_stale() || shape.is_deprecated())
     {
         t.refresh_meta(ctx);
     }
@@ -271,7 +308,7 @@ fn leave_stale_class<'gc>(ctx: Context<'gc>, t: Table<'gc>) {
 fn get_index_fill_ic<'gc>(
     ctx: Context<'gc>,
     closure: LuaFn<'gc>,
-    ic_idx: u16,
+    ic: u16,
     site: *const Instruction,
     t: Table<'gc>,
     index: Value<'gc>,
@@ -310,7 +347,7 @@ fn get_index_fill_ic<'gc>(
             holder_shape,
             loc: SlotLoc::new(holder_shape, holder_slot),
         };
-        fill_ic(ctx, closure, ic_idx, site, entry);
+        fill_ic(ctx, closure, ic, site, entry);
     }
     Ok(v)
 }
@@ -322,13 +359,13 @@ fn get_index_fill_ic<'gc>(
 fn set_own_fill_ic<'gc>(
     ctx: Context<'gc>,
     closure: LuaFn<'gc>,
-    ic_idx: u16,
+    ic: u16,
     site: *const Instruction,
     t: Table<'gc>,
     k: Value<'gc>,
     v: Value<'gc>,
 ) -> bool {
-    leave_stale_class(ctx, t);
+    leave_old_shape(ctx, t);
     let state = t.inner().borrow();
     let shape = state.shape();
     let newindex = shape.has_mm(MetamethodBits::NEWINDEX);
@@ -342,7 +379,7 @@ fn set_own_fill_ic<'gc>(
     }
     // As in `get_fill_ic`: the entry already says only `__newindex` is left.
     if newindex
-        && let InlineCache::Absent { shape: cached } = read_ic(closure, ic_idx)
+        && let InlineCache::Absent { shape: cached } = read_ic(closure, ic)
         && Shape::ptr_eq(cached, shape)
     {
         return false;
@@ -351,41 +388,45 @@ fn set_own_fill_ic<'gc>(
     // A hit stores without telling a metatable's class, so an adopted
     // table's mirrored keys are left uncached; adoption changes the shape.
     let cache = shape.as_mt().is_none() || !mirrored(key);
+    // Nor a watched holder: until a store changed its slot, which code may
+    // assume no more; its moves never.
+    let own_cache = |slot| cache && (!shape.is_watched() || shape.slot_mutable(slot));
     let slot = shape.find_slot(key);
     let existing = slot.map_or(Value::nil(), |s| state.named_get(s));
     if existing.is_nil() && newindex {
-        if cache {
-            fill_ic(ctx, closure, ic_idx, site, shape_entry(shape, slot));
+        if slot.map_or(cache, own_cache) {
+            fill_ic(ctx, closure, ic, site, shape_entry(shape, slot));
         }
         return false;
     }
     drop(state);
     let mut state = t.inner().borrow_mut(ctx.mutation());
-    let entry = match slot {
+    let (entry, cache) = match slot {
         Some(slot) => {
-            state.named_set(slot, v);
-            state.maybe_update_mt_bit(ctx.mutation(), k, v);
-            shape_entry(shape, Some(slot))
+            state.set_named(ctx.mutation(), slot, key, v);
+            (shape_entry(shape, Some(slot)), own_cache(slot))
         }
         None => {
             state.add_string_key(ctx, key, v, MAX_PROPERTIES_FAST);
             let to = state.shape();
             // A nil store adds nothing; past the cap the table went dict.
             if Shape::ptr_eq(to, shape) || to.is_dict() {
-                InlineCache::Absent { shape }
+                (InlineCache::Absent { shape }, cache)
             } else {
-                let loc = SlotLoc::new(to, shape.slot_count());
-                InlineCache::Transition {
+                let slot = shape.slot_count();
+                let entry = InlineCache::Transition {
                     from: shape,
                     to,
-                    loc,
-                }
+                    loc: SlotLoc::new(to, slot),
+                    kind: to.field(slot).kind(),
+                };
+                (entry, cache && !shape.is_watched())
             }
         }
     };
     drop(state);
     if cache {
-        fill_ic(ctx, closure, ic_idx, site, entry);
+        fill_ic(ctx, closure, ic, site, entry);
     }
     true
 }
@@ -403,6 +444,12 @@ macro_rules! index_chain {
                 next!()
             }
             IndexChain::Invoke { func, receiver } => {
+                // SAFETY: the site is the instruction before `pc` of the frame's closure.
+                crate::jit::feedback::record(
+                    unsafe { crate::vm::frame::closure($base) },
+                    unsafe { $pc.sub(1) },
+                    crate::jit::feedback::MM,
+                );
                 stage_mm!(
                     $pc,
                     $base,
@@ -430,6 +477,12 @@ macro_rules! newindex_chain {
                 next!()
             }
             NewIndexChain::Invoke { func, receiver } => {
+                // SAFETY: as in `index_chain!`.
+                crate::jit::feedback::record(
+                    unsafe { crate::vm::frame::closure($base) },
+                    unsafe { $pc.sub(1) },
+                    crate::jit::feedback::MM,
+                );
                 stage_mm!(
                     $pc,
                     $base,
@@ -493,13 +546,13 @@ handler! {
     /// The shared-cell upvalue read (`GETTABUP_REF`, never specialized):
     /// `R[a] = recv[K[e]]` through the IC, whatever its entry.
     op fn op_gettabup_ref {
-        let (dst, b, ic_idx, _) = insn.abde();
+        let (dst, b, ic, _) = insn.abde();
         let recv_val = receiver!(cell, b);
         let Some(t) = recv_val.get_table() else {
             tail!(get_slow)
         };
         let state = t.inner().borrow();
-        if let Some(v) = ic_get(read_ic(closure, ic_idx), t, &state) {
+        if let Some(v) = ic_get(read_ic(closure, ic), t, &state) {
             drop(state);
             reg![dst] = v;
             next!()
@@ -510,11 +563,11 @@ handler! {
 
     /// The shared-cell upvalue write (`SETTABUP_REF`, never specialized).
     op fn op_settabup_ref {
-        let (src, b, ic_idx, _) = insn.abde();
+        let (src, b, ic, _) = insn.abde();
         let Some(t) = receiver!(cell, b).get_table() else {
             tail!(set_slow)
         };
-        if ic_set(rt, read_ic(closure, ic_idx), t, reg![src]) {
+        if ic_set(rt, read_ic(closure, ic), t, reg![src]) {
             next!()
         }
         tail!(set_slow)
@@ -542,6 +595,7 @@ handler! {
         }
         if op == Op::GETTABLE {
             let k = reg![insn.c()];
+            crate::jit::feedback::record(closure, unsafe { pc.sub(1) }, crate::jit::feedback::table_key(recv, k));
             if let Some(t) = recv.get_table() {
                 let v = t.raw_get(k);
                 if !v.is_nil() {
@@ -551,6 +605,7 @@ handler! {
             }
             index_chain!(pc, base, rt, recv, k, dst)
         }
+        crate::jit::feedback::record(closure, unsafe { pc.sub(1) }, crate::jit::feedback::kind(recv));
         let k = unsafe { *closure.constants.add(insn.e() as usize) };
         let Some(t) = recv.get_table() else {
             index_chain!(pc, base, rt, recv, k, dst)
@@ -577,8 +632,10 @@ handler! {
         };
         if op == Op::SETTABLE {
             let k = reg![insn.c()];
+            crate::jit::feedback::record(closure, unsafe { pc.sub(1) }, crate::jit::feedback::table_key(recv, k));
             newindex_chain!(pc, base, rt, recv, k, v, raw_set_keyed)
         }
+        crate::jit::feedback::record(closure, unsafe { pc.sub(1) }, crate::jit::feedback::kind(recv));
         let k = unsafe { *closure.constants.add(insn.e() as usize) };
         if let Some(t) = recv.get_table()
             && set_own_fill_ic(rt, closure, insn.d(), unsafe { pc.sub(1) }, t, k, v)

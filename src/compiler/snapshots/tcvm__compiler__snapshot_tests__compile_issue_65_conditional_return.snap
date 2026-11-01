@@ -6,17 +6,19 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  [  1]  VARARGPREP      fixed=0
-0001  [  1]  CLOSURE         R0 P0
-0002  [  2]  CALLS_R0        R1 args=1 f=R0
-0003  [  3]  LOADI           R1 1
-0004  [  4]  NOT             R2 R1
-0005  [  4]  JF              R2 +2
-0006  [  4]  LOADI           R2 1
-0007  [  4]  RETURN          R2 count=2
-0008  [  4]  RETURN          R0 count=1
+0000  [  1]  FUNC
+0001  [  1]  VARARGPREP      fixed=0
+0002  [  1]  CLOSURE         R0 P0
+0003  [  2]  CALLS_R0        R1 args=1 f=R0
+0004  [  3]  LOADI           R1 1
+0005  [  4]  NOT             R2 R1
+0006  [  4]  JF              R2 +2
+0007  [  4]  LOADI           R2 1
+0008  [  4]  RETURN          R2 count=2
+0009  [  4]  RETURN          R0 count=1
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=0, upvalues=0)
   ; code:
-  0000  [  1]  RETURN0
+  0000  [  1]  FUNC
+  0001  [  1]  RETURN0
