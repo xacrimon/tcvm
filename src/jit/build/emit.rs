@@ -321,8 +321,11 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             b.set(a, v);
             b.note_def(&[v], None);
         }
+        // A test of a register held unboxed (a number) tests its box, which
+        // `simplify` folds by the type.
         NOT => {
             let v = b.reg(rb);
+            let v = b.boxed(v);
             let c = b.ins(Op::IsFalsy, &[v]);
             let r = b.ins(Op::Box, &[c]);
             b.set(a, r);
@@ -348,6 +351,7 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
         }
         JT | JF => {
             let v = b.reg(a);
+            let v = b.boxed(v);
             let falsy = b.ins(Op::IsFalsy, &[v]);
             // JT jumps when truthy: when not falsy.
             let jump_if_falsy = insn.op() == JF;
@@ -355,7 +359,8 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
         }
         JTSET | JFSET => {
             let v = b.reg(rb);
-            let falsy = b.ins(Op::IsFalsy, &[v]);
+            let bv = b.boxed(v);
+            let falsy = b.ins(Op::IsFalsy, &[bv]);
             let jump_if_falsy = insn.op() == JFSET;
             let edge = b.new_sealed_succ();
             if jump_if_falsy {

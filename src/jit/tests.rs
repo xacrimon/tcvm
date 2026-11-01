@@ -710,3 +710,16 @@ fn cold_arm_successors_pass_the_allocator_checker() {
         );
     });
 }
+
+/// A test of a register held unboxed (a float `and`/`or` picks) tests its
+/// box, which the type folds; the verifier checks it right after the build.
+#[test]
+fn unboxed_registers_test_as_truthy() {
+    let src = "function pick(a, b)
+      local t1 = a - b
+      return t1 > 0 and t1 or b
+    end
+    for i = 1, 300 do pick(i + 0.5, 3.5) end";
+    let ir = ir_of(src, "pick", 0);
+    assert!(!ir.contains("isfalsy"), "{ir}");
+}
