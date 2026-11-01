@@ -331,6 +331,10 @@ pub(crate) struct Frame<'gc> {
     /// For a compiled frame below a level: its native frame pointer and the
     /// call it is in, whose snapshot names what it keeps in spill slots.
     pub(crate) compiled: Option<(usize, *const Site, *const Region<'static>)>,
+    /// A frame inlined into the compiled frame below it, which a call from
+    /// its body is made in (W3 §4): no header of its own (`ret` is 0), its
+    /// slots part of the compiled frame's window.
+    pub(crate) inlined: bool,
 }
 
 impl<'gc> Frame<'gc> {
@@ -394,6 +398,8 @@ impl<'gc> Frame<'gc> {
 /// started the level, which its entry record names: the walk follows their
 /// frame records, each frame's region and call site from its return
 /// address, down to the frame dispatch entered, whose header is complete.
+/// A call site in an inlined body shows the frames inlined around it first
+/// (`Frame::inlined`), from its snapshot's frame chain.
 /// A `pcall`/`xpcall` that called a frame without a frame of its own still
 /// counts as a level: a synthetic native frame follows the frame it called,
 /// so error levels match the reference.
@@ -407,6 +413,8 @@ pub(crate) fn frames<'gc>(ts: &ThreadState<'gc>) -> Walk<'gc> {
         cross: false,
         compiled: None,
         elided: None,
+        queue: [None; 3],
+        queued: 0,
     }
 }
 
@@ -427,6 +435,11 @@ pub(crate) struct Walk<'gc> {
     /// `BASE` from a record, the frame's own where its site is a level's.
     compiled: Option<(usize, usize, *mut Value<'gc>, bool)>,
     elided: Option<Frame<'gc>>,
+    /// The frames of the compiled frame just reached that come after its
+    /// innermost inlined one: its other inlined frames, then itself, the
+    /// last first.
+    queue: [Option<Frame<'gc>>; 3],
+    queued: usize,
 }
 
 impl<'gc> Iterator for Walk<'gc> {
@@ -434,6 +447,12 @@ impl<'gc> Iterator for Walk<'gc> {
 
     fn next(&mut self) -> Option<Frame<'gc>> {
         if let Some(f) = self.elided.take() {
+            return Some(f);
+        }
+        if self.queued > 0 {
+            self.queued -= 1;
+            let f = self.queue[self.queued].take().expect("a queued frame");
+            self.elide(f);
             return Some(f);
         }
         loop {
@@ -457,6 +476,7 @@ impl<'gc> Iterator for Walk<'gc> {
                         pc: site.pc_after as usize as *const Instruction,
                         level: self.level,
                         compiled: Some((fp, site as *const Site, region)),
+                        inlined: false,
                     };
                     let lr = *((fp + 8) as *const usize);
                     let next = (lr != crate::vm::stack::level_land())
@@ -469,6 +489,8 @@ impl<'gc> Iterator for Walk<'gc> {
                     // complete or a level's first.
                     self.header_caller(&f);
                 }
+                // SAFETY: as above.
+                let f = unsafe { self.expand(f) };
                 self.elide(f);
                 return Some(f);
             }
@@ -496,6 +518,7 @@ impl<'gc> Iterator for Walk<'gc> {
                     pc: self.pc,
                     level: self.level,
                     compiled: None,
+                    inlined: false,
                 }
             };
             self.header_caller(&f);
@@ -531,7 +554,66 @@ impl<'gc> Walk<'gc> {
                 pc: std::ptr::null(),
                 level: f.level,
                 compiled: None,
+                inlined: false,
             });
         }
+    }
+
+    /// The innermost of the frames inlined into compiled frame `f0` that its
+    /// call is made from, or `f0` itself; the others and `f0` are queued.
+    /// Each frame's pc is past its call of the next; a callee known by its
+    /// prototype is the site's entry for its header slot, as an exit
+    /// writes it.
+    ///
+    /// # Safety
+    /// `f0` is a compiled frame from the walk.
+    unsafe fn expand(&mut self, f0: Frame<'gc>) -> Frame<'gc> {
+        use crate::jit::region::{DYNAMIC, Loc};
+        let (fp, site, region) = f0.compiled.expect("a compiled frame");
+        let (site, region) = unsafe { (&*site, &*region) };
+        let snap = crate::jit::region::SnapView::decode(&region.snaps[site.snap as usize..]);
+        let mut cur = f0;
+        let mut code = f0.closure().code;
+        for fr in snap.frames() {
+            cur.pc = unsafe { code.add(fr.caller_pc as usize + 1) };
+            self.queue[self.queued] = Some(cur);
+            self.queued += 1;
+            let v = if fr.func & DYNAMIC != 0 {
+                let reg = unsafe { cur.base.offset_from_unsigned(f0.base) } + fr.a as usize;
+                let e = snap
+                    .entries()
+                    .find(|e| e.reg as usize == reg)
+                    .expect("an entry for a dynamic callee");
+                let w = match e.loc {
+                    Loc::Spill(i) => unsafe {
+                        *((fp + crate::jit::FRAME_SPILLS + 8 * i as usize) as *const u64)
+                    },
+                    Loc::Home => unsafe { *(f0.base.add(reg) as *const u64) },
+                    loc => crate::jit::const_word(region, loc),
+                };
+                unsafe { Value::from_raw(w) }
+            } else {
+                region.pool[fr.func as usize]
+            };
+            let callee = v
+                .get_function()
+                .and_then(|f| f.as_lua())
+                .expect("an inlined Lua closure");
+            cur = Frame {
+                base: unsafe { cur.base.add(fr.delta as usize) },
+                func: lua_func_word(callee, 0),
+                ret: 0,
+                pc: std::ptr::null(),
+                level: f0.level,
+                compiled: None,
+                inlined: true,
+            };
+            code = callee.code;
+        }
+        if self.queued == 0 {
+            return f0;
+        }
+        cur.pc = site.pc_after as usize as *const Instruction;
+        cur
     }
 }

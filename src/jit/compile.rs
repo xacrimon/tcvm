@@ -567,7 +567,7 @@ pub(crate) fn compile<'gc>(
             &mut snaps,
             crate::jit::ir::ExitKind::After,
             0,
-            &[],
+            &site.frames,
             &site.entries,
         );
         sites.extend(keys.iter().map(|&(key, level)| crate::jit::region::Site {

@@ -27,8 +27,9 @@ fn agrees(src: &str) {
 
 /// `agrees`, every compile succeeding or refusing the code: none failing on
 /// a verifier or backend error, which runs the code interpreted unseen.
-fn compiles_cleanly(src: &str) {
+fn compiles_cleanly(src: &str, inline: bool) {
     let mut lua = Lua::new();
+    lua.set_jit_inline(inline);
     lua.load_all();
     let ex = start_on(&mut lua, src);
     lua.finish(&ex)
@@ -2171,7 +2172,140 @@ fn parameters_stay_at_the_entry() {
         local s = setmetatable({count = 0}, S)
         for r = 1, 50 do s:build(6) end
         return tostring(s.count)",
+        true,
     );
+}
+
+/// Calls from inlined bodies (W3 step 2): the frame walk shows the frames
+/// inlined around a call, so error levels count them and positions are
+/// theirs. `pcall(error, msg, k)` is a native call wherever it is: level 2
+/// is `inner`, level 3 its caller `mid`, both inlined into `run`'s loop;
+/// `fs[1]` is one of two closures of a prototype, inlined by it, whose
+/// closure the walk reads from the call site.
+#[test]
+fn errors_locate_inlined_frames() {
+    agrees(
+        "local function inner()
+          local ok, e = pcall(error, 'm', 2)
+          local ok3, e3 = pcall(error, 'n', 3)
+          return e, e3
+        end
+        local function mid()
+          local a, b = inner()
+          return a, b
+        end
+        local function mk(k)
+          return function()
+            local ok, e = pcall(error, 'd', 2)
+            return e
+          end
+        end
+        local fs = {mk(1), mk(2)}
+        local function run(n)
+          local x, y, z
+          for i = 1, n do
+            x, y = mid()
+            z = fs[1]()
+          end
+          return x .. ' ' .. y .. ' ' .. z
+        end
+        return run(3000)",
+    );
+}
+
+/// An error in a native called from an inlined body names the body's line
+/// (level 1 is the inlined frame) and unwinds through the region to a
+/// `pcall` below it, which then runs the region again.
+#[test]
+fn errors_unwind_through_bodies() {
+    agrees(
+        "local args = {}
+        for i = 1, 3000 do args[i] = 3 end
+        args[2999] = 'x'
+        local function body(i)
+          return #string.rep('a', args[i])
+        end
+        local function run(n)
+          local s = 0
+          for i = 1, n do s = s + body(i) end
+          return s
+        end
+        local ok, e = pcall(run, 3000)
+        local ok2, s = pcall(run, 2000)
+        return tostring(ok) .. ' ' .. e .. ' ' .. tostring(ok2) .. ' ' .. s",
+    );
+}
+
+/// Collections during calls from an inlined body: what lives across them
+/// is the region's, in slots counted from its base. `p` and `q`, results
+/// landed in the body's window and not yet read, stay in their home slots
+/// across the allocating call; `t` in the frame's spill slots.
+#[test]
+fn bodies_keep_values_across_collections() {
+    agrees(
+        "local function pair(i) return {i}, {i + 1} end
+        local function body(t, i)
+          local ok, p, q = pcall(pair, i)
+          local b = string.rep('y', 300)
+          return p[1] + q[1] + #b + t[1]
+        end
+        local function run(n)
+          local s = 0
+          for i = 1, n do
+            local t = {i}
+            s = s + body(t, i) + t[1]
+          end
+          return tostring(s)
+        end
+        return run(20000)",
+    );
+}
+
+/// A call in an inlined body may write its callers' captured variables:
+/// they are stored before the body and read back after it.
+#[test]
+fn bodies_calls_write_captured_variables() {
+    agrees(
+        "local function body(f) pcall(f) return 1 end
+        local function run(n)
+          local count, s = 0, 0
+          local function bump() count = count + 1 end
+          for i = 1, n do
+            s = s + body(bump) + count
+          end
+          return s .. ' ' .. count
+        end
+        return run(3000)",
+    );
+}
+
+/// A call keeps what the code after it uses and nothing can compute again
+/// (a `^` LICM moved above it) without a register naming it: in `kept`'s
+/// own region every register is live or the call's, and so in its body
+/// inlined into the loop below. `g` never compiles (an irreducible loop).
+#[test]
+fn kept_values_need_no_dead_register() {
+    let src = "local function g(m)
+          local i = 0
+          if m > 3 then goto b end
+          ::a:: i = i + 1
+          ::b:: i = i + 2
+          if i < 5 then goto a end
+          return m + i
+        end
+        local function kept(h)
+          local x0 = 0.5
+          local s = 0
+          for i = 1, 100 do
+            s = s + h(i) * (x0 + 1) ^ x0
+          end
+          return s
+        end
+        local t = 0
+        for k = 1, 300 do t = t + kept(g) end
+        return string.format('%.6f', t)";
+    compiles_cleanly(src, false);
+    compiles_cleanly(src, true);
 }
 
 /// A panic in a native that compiled code called, under a chain of fast

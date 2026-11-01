@@ -2,8 +2,10 @@
 //! built by a builder of its own into the same function. The body's
 //! snapshots name its frame and the callers' registers at the call, so an
 //! exit rebuilds both; its returns jump to a block taking the results.
-//! A body that needs its frame on the stack (a call, its slots, a cell
-//! upvalue) is not inlined. The callee is what the call would guard
+//! A call in the body is the region's, its frame past the body's registers;
+//! the frame walk finds the inlined frames from its site (W3 §4). A body
+//! that needs its frame on the stack (its closure's cells, a frame-relative
+//! helper) is not inlined. The callee is what the call would guard
 //! (`intrinsics::callee_of`): a closure, whose upvalues are constants, or
 //! one of a prototype, whose upvalues are loaded from it.
 
@@ -36,6 +38,8 @@ pub(crate) struct InlineCode {
     cfg: Cfg,
     /// The registers some instruction writes.
     written: RegSet,
+    /// Some instruction is a call, which a body may make.
+    calls: bool,
 }
 
 /// Inline the CALL at `pc` of `callee`; whether it did, the current block
@@ -83,6 +87,14 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
     let Some(code) = code else {
         return false;
     };
+    // A call in the body may write the captured registers through their
+    // cells: they live in their slots across it, read from them after.
+    let captured = if code.calls {
+        b.cfg.captured
+    } else {
+        RegSet::EMPTY
+    };
+    b.store_regs(captured.iter());
     // What the callers hold at the call, and the callee's arguments.
     let live = b
         .cfg
@@ -101,6 +113,17 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
         .iter()
         .filter(|&r| r < a as usize && r < b.nregs)
         .collect();
+    // The callers' slots a call in the body keeps, by region slot.
+    let mut outer_homes = b.inline.as_ref().map_or(RegSet::EMPTY, |i| i.outer_homes);
+    for r in captured.iter() {
+        outer_homes.insert(b.reg_base() + r);
+    }
+    for &r in &regs {
+        let v = b.reg(r as u8);
+        if b.untouched(r) || b.slot_holds(r as u8, v) {
+            outer_homes.insert(b.reg_base() + r);
+        }
+    }
     let kept: Vec<(u8, Val)> = regs
         .into_iter()
         .map(|r| (r as u8, b.reg(r as u8)))
@@ -138,6 +161,7 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
         a,
         c,
         caller_pc: pc,
+        code: proto.code.as_ptr() as usize,
     });
     let wanted = c - 1;
     let cont = b.new_block();
@@ -150,6 +174,7 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
         frame,
         base,
         outer,
+        outer_homes,
         cont,
         wanted,
         depth: depth + 1,
@@ -214,20 +239,30 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
         }
     }
     // After it: the callers' registers as at the call, the results. Every
-    // register is defined, so no read walks into the body's blocks.
+    // register is defined, so no read walks into the body's blocks, but for
+    // the captured ones a call in it may have written, read from their
+    // slots.
     b.bs[cont.idx()].sealed = true;
     let nil = b.konst_in(cont, crate::env::value::Value::nil());
     for r in 0..b.nregs as u8 {
-        b.set_def(cont, r, nil);
+        if !captured.contains(r as usize) {
+            b.set_def(cont, r, nil);
+        }
     }
     for &(r, v) in &kept {
-        b.set_def(cont, r, v);
+        if !captured.contains(r as usize) {
+            b.set_def(cont, r, v);
+        }
     }
     for (k, &v) in results.iter().enumerate() {
         b.set_def(cont, a + k as u8, v);
     }
     for (r, s) in slots.into_iter().enumerate() {
         b.set_slot(cont, r, s);
+    }
+    b.bs[cont.idx()].reload = captured;
+    for r in captured.iter() {
+        b.set_slot(cont, r, SlotState::Lazy(cont));
     }
     b.init_facts(cont);
     b.switch_to(cont);
@@ -254,6 +289,13 @@ fn prepare(lf: LuaFn<'_>) -> Option<InlineCode> {
     if cfg.never_ran[cfg.block_of[0] as usize] {
         return None;
     }
+    let calls = cfg.code.iter().any(|i| {
+        use BcOp::*;
+        matches!(
+            i.op().unquickened(),
+            CALL | CALL_R0 | CALL_R1 | CALLS | CALLS_R0 | CALLS_R1
+        )
+    });
     let mut written = RegSet::EMPTY;
     for &i in &cfg.code {
         written.union(&use_def(&proto, i, cfg.nregs, &cfg.captured).defs);
@@ -262,13 +304,16 @@ fn prepare(lf: LuaFn<'_>) -> Option<InlineCode> {
             written.insert(i.a() as usize);
         }
     }
-    Some(InlineCode { cfg, written })
+    Some(InlineCode {
+        cfg,
+        written,
+        calls,
+    })
 }
 
-/// Whether a callee's instruction needs its frame on the stack: its slots,
-/// closures over it, cells, varargs, metamethod calls, a constructor (whose
-/// helper finds the template through the frame). A call may be an
-/// intrinsic's inline code; the build finds out.
+/// Whether a callee's instruction needs its frame on the stack: closures
+/// over it, cells, varargs, metamethod calls, a constructor (whose helper
+/// finds the template through the frame).
 fn needs_frame(op: BcOp) -> bool {
     use BcOp::*;
     matches!(

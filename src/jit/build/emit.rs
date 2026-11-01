@@ -1836,16 +1836,6 @@ fn emit_call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
             }
         }
         Emitted::Done => {}
-        // An inlined body cannot call: the interpreter runs the builtin,
-        // and the kinds the exit records make the next compile call it (E1).
-        Emitted::Fallback(slow, _) if b.inline.is_some() => {
-            let join = b.new_block();
-            b.flush();
-            b.jump(join);
-            b.switch_to(slow);
-            b.deopt(ExitTag::Type);
-            enter_join(b, join);
-        }
         Emitted::Fallback(slow, f) => {
             // The builtin's results join the inline code's.
             let join = b.new_block();
@@ -1928,7 +1918,7 @@ fn call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: Val) {
         })
         .collect();
     let cv = b.boxed(callee);
-    b.push(Op::Store(a), &[cv]);
+    b.push(Op::Store(b.slot_of(a)), &[cv]);
     // The callee's frame and its results take every register from `a` up.
     let mut written = RegSet::EMPTY;
     for r in a as usize..b.cfg.nregs {
@@ -1936,13 +1926,13 @@ fn call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: Val) {
     }
     // Arguments up to `top`: their count from it.
     let (nargs, count) = if nb == 0 {
-        let n = b.ins(Op::Helper(HelperId::TopArgs(a)), &[]);
+        let n = b.ins(Op::Helper(HelperId::TopArgs(b.slot_of(a))), &[]);
         (u8::MAX, vec![n])
     } else {
         (nb - 1, args)
     };
     let op = Op::Call {
-        a,
+        a: b.slot_of(a),
         nargs,
         c,
         pc,

@@ -246,7 +246,7 @@ handler! {
 }
 
 /// The word of a constant snapshot location.
-fn const_word(region: &Region<'_>, loc: Loc) -> u64 {
+pub(crate) fn const_word(region: &Region<'_>, loc: Loc) -> u64 {
     match loc {
         Loc::Const(c) => region.consts[c as usize],
         Loc::Nil => Value::nil().to_raw(),

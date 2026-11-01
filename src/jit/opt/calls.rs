@@ -141,7 +141,7 @@ fn boundaries_round(f: &mut Func<'_>, origin: &mut FastMap<Val, Val>) -> Result<
             let c = match remat(f, v, &mut cx) {
                 Some(c) => c,
                 None => {
-                    keep_in_free_reg(f, &cfg, b, v)?;
+                    keep_unnamed(f, &cfg, b, v)?;
                     cx.kept.push(same_reg(f, v));
                     changed = true;
                     continue;
@@ -248,9 +248,8 @@ fn boundaries_round(f: &mut Func<'_>, origin: &mut FastMap<Val, Val>) -> Result<
 }
 
 /// Name `v`, which no register holds after the call into `b`, in the call's
-/// snapshot under a register dead there, so the collector traces its spill
-/// slot.
-fn keep_in_free_reg(f: &mut Func<'_>, cfg: &CfgInfo, b: Block, v: Val) -> Result<(), String> {
+/// snapshot as `KEPT`, so the collector traces its spill slot.
+fn keep_unnamed(f: &mut Func<'_>, cfg: &CfgInfo, b: Block, v: Val) -> Result<(), String> {
     let none = || {
         format!(
             "v{} ({:?} {}) is live across the call resuming at b{}",
@@ -265,21 +264,14 @@ fn keep_in_free_reg(f: &mut Func<'_>, cfg: &CfgInfo, b: Block, v: Val) -> Result
     }
     let p = *cfg.preds(b).first().ok_or_else(none)?;
     let t = f.terminator(p).ok_or_else(none)?;
-    let pc = match f.op(t) {
-        Op::Call { pc, .. } | Op::CallMm { pc, .. } => pc,
-        _ => return Err(none()),
-    };
-    let used: Vec<u8> = f.snap_entries(t).iter().map(|e| e.0).collect();
-    let r = f
-        .call_free
-        .get(&pc)
-        .and_then(|free| free.iter().find(|&r| !used.contains(&(r as u8))))
-        .ok_or_else(none)?;
+    if !matches!(f.op(t), Op::Call { .. } | Op::CallMm { .. }) {
+        return Err(none());
+    }
     let d = f.snaps[f.insts[t.idx()].snap as usize];
     let from = f.snap_pool.len();
     f.snap_pool
         .extend_from_within(d.entries.start as usize..(d.entries.start + d.entries.len) as usize);
-    f.snap_pool.push((r as u8, v));
+    f.snap_pool.push((crate::jit::ir::KEPT, v));
     let s = f.finish_snap(d.frame, d.pc, d.kind, from);
     if let Some(&homes) = f.call_homes.get(&f.insts[t.idx()].snap) {
         f.call_homes.insert(s.0, homes);

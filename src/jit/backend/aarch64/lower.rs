@@ -52,6 +52,9 @@ pub(crate) struct LSite {
     /// `(register, rep, source)`.
     pub(crate) entries: Vec<(u8, SRep, Src)>,
     pub(crate) homes: crate::jit::build::cfg::RegSet,
+    /// The inlined frames the call is made from, outermost first, which the
+    /// frame walk shows (W3 §4).
+    pub(crate) frames: Vec<crate::jit::region::SnapFrame>,
 }
 
 pub(crate) struct Lowered {
@@ -633,6 +636,10 @@ impl<'a, 'gc> Lower<'a, 'gc> {
         let mut seen: Vec<(VReg, u16)> = Vec::new();
         let mut entries = Vec::new();
         for &(r, v) in self.f.entries(d.snap) {
+            // A call's kept value, in a snapshot an exit shares.
+            if r == crate::jit::ir::KEPT {
+                continue;
+            }
             // Boxes in snapshots are the exit's work.
             let v = match self.f.def_op(v) {
                 Some(Op::Box) => self.f.args(self.f.def_inst(v).unwrap())[0],
@@ -665,20 +672,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
         let pc = s.pc;
         let kind = s.kind;
         let tag = d.tag;
-        let mut frames = Vec::new();
-        let mut fr = s.frame;
-        while fr != crate::jit::ir::NO_FRAME {
-            let x = self.f.inline_frames[fr as usize];
-            frames.push(crate::jit::region::SnapFrame {
-                func: x.func,
-                a: x.a,
-                c: x.c,
-                delta: x.a as u16 + 4,
-                caller_pc: x.caller_pc,
-            });
-            fr = x.parent;
-        }
-        frames.reverse();
+        let frames = self.snap_frames(s.frame);
         let f = self.f;
         let store_failed = d.op == Op::GuardFalse
             && f.def_inst(f.args(i)[0]).is_some_and(|c| {
@@ -716,14 +710,39 @@ impl<'a, 'gc> Lower<'a, 'gc> {
 
     /// Push a call: `ops`, then its snapshot's values as uses in stack slots,
     /// which the collector traces while the call runs (H11).
+    /// The inlined frames up to `frame`, outermost first.
+    fn snap_frames(&self, mut frame: u32) -> Vec<crate::jit::region::SnapFrame> {
+        let mut frames = Vec::new();
+        while frame != crate::jit::ir::NO_FRAME {
+            let x = self.f.inline_frames[frame as usize];
+            frames.push(crate::jit::region::SnapFrame {
+                func: x.func,
+                a: x.a,
+                c: x.c,
+                delta: x.a as u16 + 4,
+                caller_pc: x.caller_pc,
+            });
+            frame = x.parent;
+        }
+        frames.reverse();
+        frames
+    }
+
+    /// The address of the instruction past `pc` in the code of the frame
+    /// call `i` is made from.
+    fn pc_after(&self, i: Inst, pc: u32) -> usize {
+        let frame = self.f.snaps[self.f.insts[i.idx()].snap as usize].frame;
+        let code = match frame {
+            crate::jit::ir::NO_FRAME => self.pc_base,
+            fr => self.f.inline_frames[fr as usize].code,
+        };
+        code + (pc as usize + 1) * 8
+    }
+
     fn push_call(&mut self, i: Inst, mk: MInst, mut ops: Vec<Operand>) {
         let d = &self.f.insts[i.idx()];
         let d_snap = d.snap;
-        debug_assert_eq!(
-            self.f.snaps[d.snap as usize].frame,
-            crate::jit::ir::NO_FRAME,
-            "a call inside an inlined body"
-        );
+        let frames = self.snap_frames(self.f.snaps[d_snap as usize].frame);
         let mut entries = Vec::new();
         let mut seen: Vec<(VReg, u16)> = Vec::new();
         let base = ops.len();
@@ -761,6 +780,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             LSite {
                 entries,
                 homes: self.f.call_homes.get(&d_snap).copied().unwrap_or_default(),
+                frames,
             },
         ));
     }
@@ -1508,7 +1528,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 self.push(MInst::Br { test, cond }, &ops, none);
             }
             Op::Call { a, nargs, pc, .. } => {
-                let pc_after = self.pc_base + (pc as usize + 1) * 8;
+                let pc_after = self.pc_after(i, pc);
                 let known = self.known.get(&i).copied();
                 // A known Lua callee takes its first arguments in x0.. (W4
                 // §2); any other callee finds them in its slots.
@@ -1549,7 +1569,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 self.push(MInst::TailEnter { nargs, known }, &[p], none);
             }
             Op::CallMm { pc, nargs, .. } => {
-                let pc_after = self.pc_base + (pc as usize + 1) * 8;
+                let pc_after = self.pc_after(i, pc);
                 let hdr = f.meta.max_stack as u16;
                 let ops: Vec<Operand> = args.iter().map(|&a| self.use_(a)).collect();
                 self.push_call(

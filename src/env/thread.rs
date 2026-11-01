@@ -248,7 +248,8 @@ unsafe impl<'gc> Collect<'gc> for ThreadState<'gc> {
         let sp = stack.as_ptr();
         let mut upper = live;
         for f in frame::frames(self) {
-            if f.is_elided() {
+            // An inlined frame's slots are its compiled frame's.
+            if f.is_elided() || f.inlined {
                 continue;
             }
             let bi = unsafe { f.base.offset_from_unsigned(sp) };

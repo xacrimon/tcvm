@@ -284,6 +284,9 @@ pub(crate) struct Inline {
     pub(crate) base: usize,
     /// The enclosing frames' snapshot entries at the call.
     pub(crate) outer: Vec<(u8, Val)>,
+    /// The enclosing frames' slots that hold what they are read as after
+    /// it, by region slot: a call in the body keeps them (`call_homes`).
+    pub(crate) outer_homes: RegSet,
     /// Where its returns jump, with the `wanted` results as arguments.
     pub(crate) cont: Block,
     pub(crate) wanted: u8,
@@ -441,28 +444,41 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         self.inline.as_ref().map_or(0, |i| i.base)
     }
 
-    /// An inlined body cannot hold what needs its frame on the stack: its
-    /// slots, its closure (upvalues), a call, a tail-out.
+    /// Register `r`'s home slot, counted from the region's base.
+    pub(crate) fn slot_of(&self, r: u8) -> u8 {
+        (self.reg_base() + r as usize) as u8
+    }
+
+    /// An inlined body cannot hold what needs its frame on the stack (its
+    /// closure's upvalues, a tail-out, a frame-relative helper) or a
+    /// metamethod call, whose frame goes past the region's registers and
+    /// so may overlap the body's. Its slots and calls are the region's.
     fn inline_check(&mut self, op: Op) {
-        use crate::jit::ir::ops::{Ctx, Mem};
+        use crate::jit::ir::ops::{Ctx, HelperId, Mem};
         let Some(i) = &mut self.inline else {
             return;
         };
+        if matches!(
+            op,
+            Op::Load(_)
+                | Op::Store(_)
+                | Op::Call { .. }
+                | Op::Resume { .. }
+                | Op::Helper(HelperId::TopArgs(_))
+        ) {
+            return;
+        }
         let e = op.effects();
         let frame = (e.reads | e.writes).intersects(Mem::SLOT | Mem::FRAME)
             && !matches!(op, Op::GuardWindow(_));
         let bad = frame
             || match op {
-                Op::Load(_)
-                | Op::Store(_)
-                | Op::UpvalValue(_)
+                Op::UpvalValue(_)
                 | Op::UpvalCell(_)
-                | Op::Call { .. }
                 | Op::CallMm { .. }
                 | Op::Dispatch { .. }
                 | Op::TailEnter { .. }
                 | Op::Return { .. }
-                | Op::Resume { .. }
                 | Op::GuardFits(_) => true,
                 Op::Helper(h) => h.sig().ctx.contains(&Ctx::Base),
                 _ => false,
@@ -662,7 +678,11 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         // A parameter its entry passed in a register; its slot holds
         // nothing until an exit writes it.
         let param = b == self.f.entry && r < self.f.meta.params;
-        let op = if param { Op::Param(r) } else { Op::Load(r) };
+        let op = if param {
+            Op::Param(r)
+        } else {
+            Op::Load(self.slot_of(r))
+        };
         self.inline_check(op);
         let set = self.bs[b.idx()]
             .root_ty
@@ -747,7 +767,8 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             SlotState::Lazy(root) => {
                 // Untouched since the root: `v` is the root's load of `r`.
                 let rv = self.root_of(v);
-                matches!(self.f.op_of_val(rv), Some(Op::Load(lr)) if lr == r)
+                let s = self.slot_of(r);
+                matches!(self.f.op_of_val(rv), Some(Op::Load(lr)) if lr == s)
                     && self.f.def_block(rv) == Some(root)
             }
             SlotState::Unknown => false,
@@ -1363,7 +1384,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             let v = self.reg(r as u8);
             if !self.slot_holds(r as u8, v) {
                 let b = self.boxed(v);
-                self.push(Op::Store(r as u8), &[b]);
+                self.push(Op::Store(self.slot_of(r as u8)), &[b]);
                 let root = self.root_of(v);
                 self.set_slot(self.cur, r, SlotState::Holds(root));
             }
@@ -1387,7 +1408,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             let v = self.reg(r as u8);
             if !self.slot_holds(r as u8, v) {
                 let bv = self.boxed(v);
-                self.push(Op::Store(r as u8), &[bv]);
+                self.push(Op::Store(self.slot_of(r as u8)), &[bv]);
                 let root = self.root_of(v);
                 self.set_slot(self.cur, r, SlotState::Holds(root));
             }
@@ -1405,8 +1426,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
 
     /// `r` loaded from its home slot, which a helper wrote.
     pub(crate) fn reload(&mut self, r: u8) -> Val {
-        self.inline_check(Op::Load(r));
-        let v = self.ins(Op::Load(r), &[]);
+        let v = self.ins(Op::Load(self.slot_of(r)), &[]);
         self.set_def(self.cur, r, v);
         self.set_slot(self.cur, r as usize, SlotState::Holds(v));
         v
@@ -1435,22 +1455,31 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     ) -> Block {
         let mut reload = written;
         reload.union(&self.cfg.captured);
-        // The captured registers are stored and read through their cells.
-        let mut homes = self.cfg.captured;
+        // By region slot: the captured registers are stored and read through
+        // their cells. A body's call keeps its callers' entries and homes.
+        let base = self.reg_base();
+        let mut homes = RegSet::EMPTY;
+        for r in self.cfg.captured.iter() {
+            homes.insert(base + r);
+        }
         let from = self.f.snap_pool.len();
+        if let Some(i) = &self.inline {
+            homes.union(&i.outer_homes);
+            self.f.snap_pool.extend_from_slice(&i.outer);
+        }
         for r in live.iter() {
             if r >= self.nregs || reload.contains(r) {
                 continue;
             }
             if self.untouched(r) {
-                homes.insert(r);
+                homes.insert(base + r);
                 continue;
             }
             let v = self.reg(r as u8);
             if self.slot_holds(r as u8, v) {
-                homes.insert(r);
+                homes.insert(base + r);
             } else {
-                self.f.snap_pool.push((r as u8, v));
+                self.f.snap_pool.push(((base + r) as u8, v));
             }
         }
         self.inline_check(op);
@@ -1459,16 +1488,6 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         // A snapshot equal to an earlier one is shared: every call of it
         // traces what any of them keeps in its slots.
         self.f.call_homes.entry(snap.0).or_default().union(&homes);
-        let mut free = RegSet::EMPTY;
-        for r in 0..self.nregs {
-            if !live.contains(r) && !reload.contains(r) {
-                free.insert(r);
-            }
-        }
-        let e = self.f.call_free.entry(self.pc).or_insert(free);
-        for (w, x) in e.0.iter_mut().zip(free.0) {
-            *w &= x;
-        }
         let before = self.cur;
         let resume = self.new_block();
         self.f.blocks[resume.idx()].resume = true;

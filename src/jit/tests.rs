@@ -820,8 +820,9 @@ fn float_keys_index_arrays() {
 
 /// Callees storing through the table helpers inline (W2.7): `rawset`,
 /// `table.insert`, `table.remove`, `setmetatable` and a generic store touch
-/// table memory alone. (A tail call or a constructor still keeps a callee
-/// out, `inline::needs_frame`.)
+/// table memory alone; the builtins' fallbacks are calls from the bodies.
+/// (A tail call or a constructor still keeps a callee out,
+/// `inline::needs_frame`.)
 #[test]
 fn table_helpers_inline() {
     let src = "local mt = {}
@@ -841,7 +842,12 @@ fn table_helpers_inline() {
     end
     for k = 1, 300 do f({}, 10) end";
     let ir = ir_of(src, "f", 0);
-    assert!(!ir.contains("call r"), "{ir}");
+    assert!(
+        ir.lines()
+            .filter(|l| l.contains("call r"))
+            .all(|l| l.contains(" after f")),
+        "{ir}"
+    );
     for h in [
         "call.rawset",
         "call.tinsert",

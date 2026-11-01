@@ -185,10 +185,16 @@ pub(crate) struct ExitSite {
     pub(crate) frame: u32,
 }
 
+/// The register of a call snapshot's entry for a value no register holds,
+/// which the call keeps in the frame (C1): past every region slot (the
+/// window ends by 255), so exits skip it.
+pub(crate) const KEPT: u8 = u8::MAX;
+
 /// An inlined call's frame (E1): the callee (a pool index, or
 /// `region::DYNAMIC` with a `Func::protos` index), the `CALL`'s `a` and `c`
 /// and pc in the enclosing frame, which is `parent` or the region's. Its
-/// base is `a + 4` past the enclosing frame's.
+/// base is `a + 4` past the enclosing frame's; `code` is its prototype's,
+/// which a call in its body returns into.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct InlineFrame {
     pub(crate) parent: u32,
@@ -196,6 +202,7 @@ pub(crate) struct InlineFrame {
     pub(crate) a: u8,
     pub(crate) c: u8,
     pub(crate) caller_pc: u32,
+    pub(crate) code: usize,
 }
 
 /// What a region was compiled from.
@@ -266,10 +273,6 @@ pub(crate) struct Func<'gc> {
     /// The call-boundary pass ran: what is live across a call is a value
     /// its snapshot names (C1).
     pub(crate) boundaries: bool,
-    /// The registers dead at the calls of each pc: neither live after them,
-    /// nor written by them, nor captured. The call-boundary pass may keep a
-    /// value no register holds in one (C1).
-    pub(crate) call_free: crate::jit::FastMap<u32, crate::jit::build::cfg::RegSet>,
     /// By a call's snapshot: the registers below its callee whose home slots
     /// hold what they will be read as after it, which the collector traces
     /// while the call runs (H11); it clears the frame's other slots there.
@@ -364,7 +367,6 @@ impl<'gc> Func<'gc> {
             meta,
             def_snaps: Vec::new(),
             boundaries: false,
-            call_free: Default::default(),
             call_homes: Default::default(),
             captured: Default::default(),
             exit_sites: Default::default(),
