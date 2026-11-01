@@ -389,6 +389,12 @@ fn builtin<'gc>(
         }
         return Emitted::Done;
     }
+    // A tail call's after-snapshot would resume at the `RETURN` after it.
+    let class = (h == HelperId::SetMetatable
+        && c == 2
+        && b.code(b.pc).op() != crate::instruction::Op::TAILCALL)
+        .then(|| moved_shape(b, &args))
+        .flatten();
     let r = b.ins(Op::Helper(h), &args);
     let mut out = Emitted::Done;
     if !matches!(
@@ -411,6 +417,7 @@ fn builtin<'gc>(
             r
         };
         b.set(a, r);
+        b.moved_shape = class;
     }
     // `rawset` may change a class (`MtCache::member_write`) or a watched
     // holder, `setmetatable` a holder's shape or adopt one; a `TAILCALL` only
@@ -422,6 +429,20 @@ fn builtin<'gc>(
         b.lazy_exit_after();
     }
     out
+}
+
+/// The shape `setmetatable(t, mt)` gives `t`, known before the call, when
+/// the constant `mt`'s last move took `t`'s shape there: the result is
+/// guarded to have it after the call (`emit_call`), and its class's
+/// metamethods are then constants (W3 §9).
+fn moved_shape(b: &mut Builder<'_, '_>, args: &[Val]) -> Option<u32> {
+    let Some(Op::KObj(k)) = b.f.def_op(args[1]) else {
+        return None;
+    };
+    let (from, to) = b.f.pool[k as usize].get_table()?.shape().mt_move()?;
+    let from = b.intern_shape(from);
+    (b.known_shapes(args[0]) == Some(crate::jit::build::Shapes::one(from)))
+        .then(|| b.intern_shape(to))
 }
 
 /// `math.max(x, y)` (or `min`) of two small integers or two floats: the

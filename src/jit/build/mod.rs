@@ -265,6 +265,9 @@ pub(crate) struct Builder<'a, 'gc> {
     /// The callee and first argument of the call at a pc, known before a
     /// `VARARG` up to `top` that reloads their registers.
     pub(crate) callee_hint: Option<(u32, Val, Val)>,
+    /// The shape a `setmetatable` call's result has after it, guarded once
+    /// its arms join (`intrinsics::moved_shape`).
+    pub(crate) moved_shape: Option<u32>,
     /// What an inlined call left up to `top` from a register, for the next
     /// instruction (W3 §7); `cur_top` is the current instruction's.
     pub(crate) top: Option<(u8, Top)>,
@@ -402,6 +405,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             deopt_all: false,
             known: Known::default(),
             callee_hint: None,
+            moved_shape: None,
             top: None,
             cur_top: None,
             cold: false,
@@ -447,6 +451,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             deopt_all: outer.deopt_all,
             known: std::mem::take(&mut outer.known),
             callee_hint: None,
+            moved_shape: None,
             top: None,
             cur_top: None,
             cold: outer.cold,

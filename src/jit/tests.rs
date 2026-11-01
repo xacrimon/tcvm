@@ -889,6 +889,24 @@ fn recursion_inlines_one_copy() {
     assert_eq!(ir.matches("call r").count(), 4, "{ir}");
 }
 
+/// A `setmetatable` result with a constant metatable has the class its
+/// last move gave the table's shape, guarded after the call: its
+/// metamethods are constants that inline (W3 §9). (A second `setmetatable`
+/// would drop the fact: it may reshape any table.)
+#[test]
+fn setmetatable_results_have_classes() {
+    let src = "local V = {}
+    V.__index = V
+    V.__add = function(a, b) return a.x + b.x end
+    function f(i)
+        local a = setmetatable({x = i}, V)
+        return a + a
+    end
+    for k = 1, 300 do f(k) end";
+    let ir = ir_of(src, "f", 0);
+    assert!(!ir.contains("callmm"), "{ir}");
+}
+
 /// A metamethod the operand's class gives as a constant inlines (W3 §9).
 #[test]
 fn class_metamethods_inline() {

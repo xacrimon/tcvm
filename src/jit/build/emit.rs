@@ -1962,6 +1962,7 @@ fn emit_call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
         Emitted::Done => {}
         Emitted::Fallback(slow, f) => {
             // The builtin's results join the inline code's.
+            let moved = b.moved_shape.take();
             let join = b.new_block();
             b.flush();
             b.jump(join);
@@ -1970,6 +1971,17 @@ fn emit_call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
             b.flush();
             b.jump(join);
             enter_join(b, join);
+            if let Some(to) = moved {
+                // After the call, which ran: its result in `R[A]`.
+                let r = b.reg(insn.a());
+                let s = b.snap_after(pc);
+                let g = b.ins_snap(Op::Guard(TypeSet::TAB), &[r], s, ExitTag::Type);
+                let t = b.f.result(g);
+                let p = b.ins(Op::Unbox(Rep::Ptr), &[t]);
+                b.ins_snap(Op::GuardShape(to), &[p], s, ExitTag::Shape);
+                b.set_shapes(p, super::Shapes::one(to));
+                b.set(insn.a(), t);
+            }
         }
     }
 }
