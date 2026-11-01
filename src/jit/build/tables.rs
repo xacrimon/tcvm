@@ -347,7 +347,12 @@ fn emit_found<'gc>(b: &mut Builder<'_, 'gc>, dst: u8, found: Found<'gc>, site: &
                 None => site.recv,
             };
             let join = b.new_block();
-            let w = mm_call(b, fv, &[this, site.key]);
+            // `SELF`'s interpreter writes `R[A+1]` before the call.
+            let w = if b.code(b.pc).op().unquickened() == crate::instruction::Op::SELF {
+                mm_call(b, fv, &[this, site.key])
+            } else {
+                super::emit::mm_call_a(b, fv, &[this, site.key])
+            };
             call_arm_end(b, join, Some((dst, w)));
             enter_join(b, join);
             b.reg(dst)

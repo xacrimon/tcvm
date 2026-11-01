@@ -2678,6 +2678,32 @@ fn recursion_inlines_one_copy() {
     );
 }
 
+/// A metamethod the operand's class gives as a constant inlines (W3 §9):
+/// `a + b`'s `__add`, where `a.y` guarded `a`'s shape. At 2500 its i32 add
+/// overflows and exits inside it (its frame's continuation stores the
+/// result to the `ADD`'s register), and a table field raises inside it.
+#[test]
+fn class_metamethods_inline() {
+    compiles_cleanly(
+        "local V = {}
+        V.__index = V
+        local function vec(x, y) return setmetatable({x = x, y = y}, V) end
+        V.__add = function(a, b) return vec(a.x + b.x, a.y + b.y) end
+        local s = 0
+        for i = 1, 3000 do
+          local x = i % 3
+          if i == 2500 then x = 2147483647 end
+          local a, b = vec(x, i % 5), vec(1, 2)
+          s = s + a.y + b.y
+          local r = a + b
+          s = s + r.x + r.y
+        end
+        local ok, e = pcall(function() local a = vec({}, 1) local t = a.y return a + vec(1, 2) end)
+        return s .. ' ' .. tostring(ok) .. ' ' .. e",
+        true,
+    );
+}
+
 /// A region frame's tail call taking a call's results up to `top`: `f`
 /// and `ack` loop (W3 step 6c), `f`'s arguments past `acc` from `m`'s
 /// zero, one or two results, nil past them.

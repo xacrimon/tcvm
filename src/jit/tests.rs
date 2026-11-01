@@ -889,6 +889,24 @@ fn recursion_inlines_one_copy() {
     assert_eq!(ir.matches("call r").count(), 4, "{ir}");
 }
 
+/// A metamethod the operand's class gives as a constant inlines (W3 §9).
+#[test]
+fn class_metamethods_inline() {
+    let src = "local V = {}
+    V.__index = V
+    local function vec(x, y) return setmetatable({x = x, y = y}, V) end
+    V.__add = function(a, b) return vec(a.x + b.x, a.y + b.y) end
+    function f(i)
+        local a, b = vec(i, 1), vec(1, 2)
+        local t = a.x + b.y
+        local r = a + b
+        return r.x + t
+    end
+    for k = 1, 300 do f(k) end";
+    let ir = ir_of(src, "f", 0);
+    assert!(!ir.contains("callmm"), "{ir}");
+}
+
 /// A region frame's self tail call up to a real call's `top` is its loop:
 /// `ack`'s region does not leave for the interpreter's `TAILCALL`.
 #[test]

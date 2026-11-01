@@ -1142,7 +1142,7 @@ fn emit_arith_mm(b: &mut Builder<'_, '_>, insn: Instruction) {
     } else {
         (t, b.boxed(r))
     };
-    let v = mm_call(b, f, &[lv, rv]);
+    let v = mm_call_a(b, f, &[lv, rv]);
     b.set(insn.a(), v);
     b.flush();
     b.lazy_exit_after();
@@ -1249,6 +1249,15 @@ pub(super) fn mm_call(b: &mut Builder<'_, '_>, f: Val, args: &[Val]) -> Val {
     b.f.result(first)
 }
 
+/// `mm_call` of a metamethod whose result goes to `R[A]` of the
+/// instruction (`ret_store_a`): inlined when `f` is a constant (W3 §9).
+pub(super) fn mm_call_a(b: &mut Builder<'_, '_>, f: Val, args: &[Val]) -> Val {
+    if let Some(v) = super::inline::try_inline_mm(b, f, args) {
+        return v;
+    }
+    mm_call(b, f, args)
+}
+
 /// Call `f` with `args` from a header past the frame's registers, wanting
 /// `c - 1` results (landed from `R[land]` when more than two), and continue
 /// in the resume block.
@@ -1260,17 +1269,7 @@ pub(super) fn staged_call(b: &mut Builder<'_, '_>, f: Val, args: &[Val], land: u
     let s = b.snap_before();
     let end = hdr + 4 + args.len() as u16;
     b.ins_snap(Op::GuardWindow(end), &[], s, ExitTag::Slow);
-    let insn = b.code(pc);
-    let mut live = b.cfg.live_in[pc as usize];
-    if let Some(next) = b.cfg.live_in.get(pc as usize + 1) {
-        live.union(next);
-    }
-    if insn.op().branch_sense().is_some() {
-        let t = (pc as i64 + 1 + insn.branch_offset() as i64) as usize;
-        if let Some(target) = b.cfg.live_in.get(t) {
-            live.union(target);
-        }
-    }
+    let live = staged_live(b, pc);
     let mut ops = vec![b.boxed(f)];
     for &a in args {
         ops.push(b.boxed(a));
@@ -1294,6 +1293,23 @@ pub(super) fn staged_call(b: &mut Builder<'_, '_>, f: Val, args: &[Val], land: u
         hdr: hdr as u8,
     };
     b.call(op, &ops, live, written, c)
+}
+
+/// What a metamethod's call at `pc` keeps: the registers live into the
+/// instruction or after it, or at its branch's target.
+pub(super) fn staged_live(b: &Builder<'_, '_>, pc: u32) -> RegSet {
+    let insn = b.code(pc);
+    let mut live = b.cfg.live_in[pc as usize];
+    if let Some(next) = b.cfg.live_in.get(pc as usize + 1) {
+        live.union(next);
+    }
+    if insn.op().branch_sense().is_some() {
+        let t = (pc as i64 + 1 + insn.branch_offset() as i64) as usize;
+        if let Some(target) = b.cfg.live_in.get(t) {
+            live.union(target);
+        }
+    }
+    live
 }
 
 /// The metamethod of `bit` for `mm_args` (its first two), deopting when

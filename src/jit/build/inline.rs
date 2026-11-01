@@ -42,6 +42,8 @@ pub(crate) struct InlineCode {
     /// Some instruction may read or write its callers' captured registers
     /// through their cells: a call, or a load or store of a cell upvalue.
     cells: bool,
+    /// Its own instructions load or store a cell upvalue.
+    cell_ops: bool,
     /// The most values a return gives, none if one returns up to `top`.
     returns: Option<u8>,
     /// Some instruction is a tail call.
@@ -56,44 +58,96 @@ pub(crate) struct InlineCode {
 /// constant callee takes it over: exits give frame 0's header the callee,
 /// and its returns are the region's.
 pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: Val) -> bool {
-    if !b.ctx.jit().config.inline {
-        return false;
+    inline_site(b, pc, Site::Call(insn), callee).is_some()
+}
+
+/// Inline the call of the metamethod `f`, a constant, with `args` (W3 §9),
+/// whose result goes to `R[A]` of the instruction at `pc` (`ret_store_a`);
+/// its result, then in the block after it.
+pub(super) fn try_inline_mm(b: &mut Builder<'_, '_>, f: Val, args: &[Val]) -> Option<Val> {
+    if !matches!(b.f.def_op(f), Some(Op::KObj(_))) {
+        return None;
     }
-    let tail = insn.op() == BcOp::TAILCALL;
+    let pc = b.pc;
+    inline_site(b, pc, Site::Mm(args), f).flatten()
+}
+
+/// What a body is inlined for: a bytecode call, or a metamethod's call
+/// from a header at the window's end, as `stage_mm` makes it.
+#[derive(Clone, Copy)]
+enum Site<'s> {
+    Call(Instruction),
+    Mm(&'s [Val]),
+}
+
+/// `try_inline` for `site`: `Some` when it inlined, with a metamethod's
+/// result.
+fn inline_site(
+    b: &mut Builder<'_, '_>,
+    pc: u32,
+    site: Site<'_>,
+    callee: Val,
+) -> Option<Option<Val>> {
+    if !b.ctx.jit().config.inline {
+        return None;
+    }
+    // A metamethod's header is past the frame's registers (`a`), and one
+    // result goes on as a value. Its frame wants one (`c = 2`): `ret_call1`
+    // stores it to the instruction's `R[A]`, as `ret_store_a` does.
+    let (tail, a, nb, mm) = match site {
+        Site::Call(insn) => (insn.op() == BcOp::TAILCALL, insn.a(), insn.b(), None),
+        Site::Mm(args) => (
+            false,
+            b.proto.max_stack_size,
+            args.len() as u8 + 1,
+            Some(args),
+        ),
+    };
     let replace = tail && b.inline.is_none();
     if replace && b.cfg.captured.iter().next().is_some() {
-        return false;
+        return None;
     }
     // In the region frame's place (its tail call or a replacement's) only a
     // constant callee: below the frame's window no slot holds a closure.
     let in_region_place = tail && (b.inline.as_ref()).is_none_or(|i| i.region_return);
-    let (a, nb) = (insn.a(), insn.b());
-    let c = match &b.inline {
-        Some(i) if tail => b.f.inline_frames[i.frame as usize].c,
-        None if tail => 1,
-        _ => insn.c(),
+    let c = match (&b.inline, site) {
+        (_, Site::Mm(_)) => 2,
+        (Some(i), _) if tail => b.f.inline_frames[i.frame as usize].c,
+        (None, _) if tail => 1,
+        (_, Site::Call(insn)) => insn.c(),
     };
     // Every result (W3 §7): for an instruction after it that takes them up
     // to `top`, from a callee each of whose returns gives a fixed count.
     let multi = c == 0 && !tail;
     if multi && !takes_top(b.code(pc + 1)) {
-        return false;
+        return None;
     }
     let depth = b.inline.as_ref().map_or(0, |i| i.depth);
     if depth >= MAX_DEPTH || b.f.insts.len() > MAX_INSTS {
-        return false;
+        return None;
     }
     // A callee known by its prototype (several closures of it, or one this
     // compile made) is built from its prototype, its upvalues loaded from
     // the closure value (W3 §10); one the compile made needs no guard.
-    let (lf, proto, dynamic, made) = match callee_of(b, pc, callee) {
+    let known = match mm {
+        // A metamethod site's feedback is not a call's.
+        Some(_) => match b.f.def_op(callee) {
+            Some(Op::KObj(k)) => match b.f.pool[k as usize].get_function() {
+                Some(f) => Callee::Const(f),
+                None => Callee::Unknown,
+            },
+            _ => Callee::Unknown,
+        },
+        None => callee_of(b, pc, callee),
+    };
+    let (lf, proto, dynamic, made) = match known {
         Callee::Const(f) | Callee::Same(f) => match f.as_lua() {
             Some(lf) => (Some(lf), lf.proto, false, false),
-            None => return false,
+            None => return None,
         },
         Callee::Proto(p, lf) if !in_region_place => (lf, p, true, false),
         Callee::Made(p) if !in_region_place => (None, p, true, true),
-        Callee::Proto(..) | Callee::Made(_) | Callee::Unknown => return false,
+        Callee::Proto(..) | Callee::Made(_) | Callee::Unknown => return None,
     };
     let base = if tail {
         b.reg_base()
@@ -105,7 +159,7 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
         || runs_in_chain(b, proto) > 1
         || base + proto.max_stack_size as usize > 255
     {
-        return false;
+        return None;
     }
     let key = crate::dmm::Gc::as_ptr(proto) as usize;
     let code = match b.known.callees.get(&key) {
@@ -117,15 +171,15 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
         }
     };
     let Some(code) = code else {
-        return false;
+        return None;
     };
     let returns = code.returns.unwrap_or(u8::MAX);
     if multi && (code.tails || a as usize + returns as usize > b.nregs) {
-        return false;
+        return None;
     }
     let top_args = if nb == 0 {
         let Some(v) = top_args(b, pc, a, proto.num_params) else {
-            return false;
+            return None;
         };
         v
     } else {
@@ -146,13 +200,12 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
     let (entry, inline, cont, results, args, kept, captured, guard, cv, top) = loop {
         let captured = if sync { b.cfg.captured } else { RegSet::EMPTY };
         b.store_regs(captured.iter());
-        // What the callers hold at the call, and the callee's arguments.
-        let live = b
-            .cfg
-            .live_in
-            .get(pc as usize + 1)
-            .copied()
-            .unwrap_or_default();
+        // What the callers hold at the call, and the callee's arguments; a
+        // metamethod's caller as `staged_call` keeps it.
+        let live = match mm {
+            Some(_) => super::emit::staged_live(b, pc),
+            None => (b.cfg.live_in.get(pc as usize + 1).copied()).unwrap_or_default(),
+        };
         let mut outer = match &b.inline {
             Some(i) if tail => i.outer_entries(),
             None if tail => Vec::new(),
@@ -183,7 +236,9 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
             .into_iter()
             .map(|r| (r as u8, b.reg(r as u8)))
             .collect();
-        let args: Vec<Val> = if nb == 0 {
+        let args: Vec<Val> = if let Some(args) = mm {
+            args.to_vec()
+        } else if nb == 0 {
             top_args.clone()
         } else {
             (0..nb - 1).map(|k| b.reg(a + 4 + k)).collect()
@@ -210,7 +265,7 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
             let lf = lf.expect("a constant callee");
             let k = b.konst(crate::env::value::Value::function(lf.function()));
             let Some(Op::KObj(func)) = b.f.def_op(k) else {
-                return false;
+                return None;
             };
             (Ok(k), func, None)
         };
@@ -280,7 +335,7 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
             b.f.def_snaps.truncate(def_snaps);
             b.f.stable_used.borrow_mut().truncate(stable_used);
             b.known.recv_shapes = recv_shapes;
-            return false;
+            return None;
         };
         if inline.called && !sync && b.cfg.captured.iter().next().is_some() {
             b.f.blocks[cont.idx()].dead = true;
@@ -311,14 +366,15 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
             b.f.def_snaps.truncate(def_snaps);
             b.f.stable_used.borrow_mut().truncate(stable_used);
             b.known.recv_shapes = recv_shapes;
-            return false;
+            return None;
         }
         break (
             entry, inline, cont, results, args, kept, captured, guard, cv, top,
         );
     };
-    // A call in it is a call of its caller's.
-    if inline.called
+    // A call in it is a call of its caller's, as is a cell it reads or
+    // writes: the caller's callers' captured registers sync around it.
+    if (inline.called || code.cell_ops)
         && let Some(i) = b.inline.as_mut()
     {
         i.called = true;
@@ -340,7 +396,9 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
     let end = (base + proto.max_stack_size as usize) as u16;
     b.ins_exit(Op::GuardWindow(end), &[], ExitTag::Slow);
     b.flush();
-    let slots: Vec<SlotState> = (0..a as usize).map(|r| b.slot(b.cur, r)).collect();
+    let slots: Vec<SlotState> = (0..(a as usize).min(b.nregs))
+        .map(|r| b.slot(b.cur, r))
+        .collect();
     b.jump(entry);
     // Its returns are the body's, reporting what the body's watched, or
     // the region's.
@@ -350,7 +408,7 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
                 i.returns.push((t, seen.clone()));
             }
         }
-        return true;
+        return Some(None);
     }
     // The results have the types the returns give them.
     let rets = &inline.returns;
@@ -402,8 +460,10 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
             b.set_def(cont, r, v);
         }
     }
-    for (k, &v) in results.iter().enumerate() {
-        b.set_def(cont, a + k as u8, v);
+    if mm.is_none() {
+        for (k, &v) in results.iter().enumerate() {
+            b.set_def(cont, a + k as u8, v);
+        }
     }
     for (r, s) in slots.into_iter().enumerate() {
         b.set_slot(cont, r, s);
@@ -428,7 +488,7 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
         b.push(Op::SetTop(b.slot_of(a)), &[n]);
         b.top = Some((a, t));
     }
-    true
+    Some(mm.map(|_| results[0]))
 }
 
 /// How many frames of the chain from the region's to the current one run
@@ -490,22 +550,21 @@ fn prepare(proto: crate::dmm::Gc<'_, crate::env::function::Prototype<'_>>) -> Op
     if cfg.never_ran[cfg.block_of[0] as usize] {
         return None;
     }
-    let cells = cfg.code.iter().any(|i| {
+    let cell_ops = cfg.code.iter().any(|i| {
         use BcOp::*;
         matches!(
             i.op().unquickened(),
-            CALL | CALL_R0
-                | CALL_R1
-                | TAILCALL
-                | CALLS
-                | CALLS_R0
-                | CALLS_R1
-                | GETUPVAL_REF
-                | SETUPVAL
-                | GETTABUP_REF
-                | SETTABUP_REF
+            GETUPVAL_REF | SETUPVAL | GETTABUP_REF | SETTABUP_REF
         )
     });
+    let cells = cell_ops
+        || cfg.code.iter().any(|i| {
+            use BcOp::*;
+            matches!(
+                i.op().unquickened(),
+                CALL | CALL_R0 | CALL_R1 | TAILCALL | CALLS | CALLS_R0 | CALLS_R1
+            )
+        });
     let (mut returns, mut tails) = (Some(0u8), false);
     for &i in &cfg.code {
         let n = match i.op().unquickened() {
@@ -536,6 +595,7 @@ fn prepare(proto: crate::dmm::Gc<'_, crate::env::function::Prototype<'_>>) -> Op
         cfg,
         written,
         cells,
+        cell_ops,
         returns,
         tails,
     })
