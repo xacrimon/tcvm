@@ -2651,6 +2651,33 @@ fn exits_before_takers_see_the_inlined_top() {
     );
 }
 
+/// Recursion inlines one copy (W3 §8), through another function too: a
+/// float at depth exits inside a copy, an error two levels up names the
+/// copy's caller, and `even`/`odd` recurse through each other.
+#[test]
+fn recursion_inlines_one_copy() {
+    compiles_cleanly(
+        "local function fib(n)
+          if n < 2 then
+            if n == 0.5 then error('half', 3) end
+            return n
+          end
+          return fib(n - 1) + fib(n - 2)
+        end
+        local odd
+        local function even(n) if n == 0 then return true end return not odd(n - 1) end
+        odd = function(n) if n == 0 then return false end return not even(n - 1) end
+        local s, e = 0
+        for i = 1, 300 do s = s + fib(i % 12) end
+        s = s + fib(6.25)
+        local ok, m = pcall(fib, 4.5)
+        local t = 0
+        for i = 1, 300 do if even(i % 20) then t = t + 1 end end
+        return s .. ' ' .. m .. ' ' .. t",
+        true,
+    );
+}
+
 /// Known callees (W3 step 8): `fs`'s two closures of one prototype take
 /// turns at a site, inlined by the prototype with each one's `k` read from
 /// the closure called; `add` and `bump` are closures the loop makes, inlined

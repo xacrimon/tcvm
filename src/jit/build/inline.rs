@@ -102,7 +102,7 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
     };
     if proto.is_vararg
         || proto.code.len() > INLINE_LIMIT
-        || crate::dmm::Gc::ptr_eq(proto, b.proto)
+        || runs_in_chain(b, proto) > 1
         || base + proto.max_stack_size as usize > 255
     {
         return false;
@@ -437,6 +437,27 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
         b.top = Some((a, t));
     }
     true
+}
+
+/// How many frames of the chain from the region's to the current one run
+/// `proto`: recursion inlines one copy (W3 §8), whose own calls of it stay
+/// real calls.
+fn runs_in_chain(
+    b: &Builder<'_, '_>,
+    proto: crate::dmm::Gc<'_, crate::env::function::Prototype<'_>>,
+) -> usize {
+    let code = proto.code.as_ptr() as usize;
+    let mut n = usize::from(b.region.proto.code.as_ptr() as usize == code);
+    let mut fr = b
+        .inline
+        .as_ref()
+        .map_or(crate::jit::ir::NO_FRAME, |i| i.frame);
+    while fr != crate::jit::ir::NO_FRAME {
+        let x = &b.f.inline_frames[fr as usize];
+        n += usize::from(x.code == code);
+        fr = x.parent;
+    }
+    n
 }
 
 /// Whether `next` takes values up to `top`: a call, tail call or return.
