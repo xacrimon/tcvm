@@ -299,7 +299,7 @@ fn closure_block(f: &Func<'_>, cfg: &crate::jit::ir::CfgInfo, order: &[Block]) -
         let reads = f
             .insts_of(b)
             .iter()
-            .any(|&i| matches!(f.op(i), Op::UpvalValue(_) | Op::UpvalCell(_)));
+            .any(|&i| matches!(f.op(i), Op::UpvalValue(_) | Op::UpvalCell(_) | Op::FrameFn));
         if !reads {
             continue;
         }
@@ -857,6 +857,21 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 let d = self.def(res.unwrap());
                 let c = Operand::reg_use(self.closure.expect("the frame's closure"));
                 self.push(MInst::LoadUpvalOf(k), &[d, c], none);
+            }
+            Op::FrameFn => {
+                let d = self.def(res.unwrap());
+                let t = self.v.new_vreg(RegClass::Int);
+                self.push(
+                    MInst::MovImm(crate::env::value::FUNCTION_BITS),
+                    &[Operand::reg_def(t)],
+                    none,
+                );
+                let c = Operand::reg_use(self.closure.expect("the frame's closure"));
+                self.push(
+                    MInst::Alu(AluOp::Orr, Sz::X),
+                    &[d, c, Operand::reg_use(t)],
+                    none,
+                );
             }
             Op::UpvalValueOf(k) | Op::UpvalCellOf(k) => {
                 let (d, c) = (self.def(res.unwrap()), self.use_(args[0]));

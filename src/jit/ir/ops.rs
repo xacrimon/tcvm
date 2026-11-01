@@ -614,6 +614,8 @@ pub(crate) enum Op {
     /// The cell of a shared upvalue of the Lua closure (a `Ptr`): of an
     /// inlined callee (W3 §6).
     UpvalCellOf(u8),
+    /// The region frame's function, from its header.
+    FrameFn,
     /// The value of an upvalue cell. An open cell is a slot, perhaps one of
     /// this region's: it reads and writes slots too.
     CellLoad,
@@ -909,6 +911,7 @@ impl Op {
             Barrier => e(Flags::empty(), Mem::empty(), Mem::GC),
             HasFlag(_) | FnFits => Effects::reads(Mem::FRAME),
             UpvalValueOf(_) | UpvalCellOf(_) => Effects::reads(Mem::UPVAL),
+            FrameFn => Effects::reads(Mem::FRAME),
             CellLoad => Effects::reads(Mem::UPVAL | Mem::SLOT),
             CellStore => e(Flags::empty(), Mem::empty(), Mem::UPVAL | Mem::SLOT),
             Helper(h) => h.sig().effects,
@@ -1001,6 +1004,7 @@ impl Op {
                 Ty::ANY
             }
             UpvalCell(_) | UpvalCellOf(_) => Ty::PTR,
+            FrameFn => Ty::val(TypeSet::FUN),
             NumVarargs | ClassBits(_) | TabASize | ArrNext | TabMmBits | NamedNext => Ty::I32,
             NamedVal => Ty::ANY,
             NamedKey => Ty::val(TypeSet::STR),
@@ -1083,6 +1087,7 @@ impl Op {
             UpvalValueOf(i) => format!("upval.of u{i}"),
             UpvalCell(i) => format!("upcell u{i}"),
             UpvalCellOf(i) => format!("upcell.of u{i}"),
+            FrameFn => "framefn".into(),
             Helper(h) => format!("call.{}", h.name()),
             Resume { c } => format!("resume c={c}"),
             Return { a, n } => format!("return r{a} n={n}"),

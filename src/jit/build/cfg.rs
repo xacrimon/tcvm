@@ -343,6 +343,9 @@ pub(crate) struct Cfg {
     /// Registers live into each instruction.
     pub(crate) live_in: Vec<RegSet>,
     pub(crate) captured: RegSet,
+    /// `TAILCALL`s of the function itself, jumps to its start (pc 1, past
+    /// `FUNC`) for a function region (W3 §5, Q6).
+    pub(crate) self_tails: Vec<u32>,
     pub(crate) loops: Vec<Loop>,
     /// The innermost loop of each block.
     pub(crate) loop_of: Vec<Option<usize>>,
@@ -384,7 +387,15 @@ impl Cfg {
         proto: &Prototype<'_>,
         code: Vec<Instruction>,
         entry_pc: u32,
+        self_tails: Vec<u32>,
     ) -> Result<Cfg, CfgError> {
+        let flow = |code: &[Instruction], pc: u32| {
+            if self_tails.contains(&pc) {
+                Flow::Jump(1)
+            } else {
+                flow(code, pc)
+            }
+        };
         let n = code.len();
         let nregs = proto.max_stack_size as usize;
         let captured = captured(proto);
@@ -641,6 +652,7 @@ impl Cfg {
             block_of,
             live_in,
             captured,
+            self_tails,
             loops,
             loop_of,
             never_ran,

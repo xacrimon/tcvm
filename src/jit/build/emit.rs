@@ -402,6 +402,20 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
         RETURN if rb == 0 => dispatch(b),
         RETURN => emit_return(b, a, rb - 1),
         TAILCALL if b.inline.is_some() => body_tailcall(b, pc, insn),
+        // The function calling itself: its frame again, from its start.
+        TAILCALL if b.cfg.self_tails.contains(&pc) => {
+            let callee = b.reg(a);
+            let cv = b.boxed(callee);
+            let me = b.ins(Op::FrameFn, &[]);
+            b.ins_exit(Op::GuardSame, &[cv, me], ExitTag::Const);
+            let args: Vec<Val> = (0..rb - 1).map(|k| b.reg(a + 4 + k)).collect();
+            let nil = b.konst(Value::nil());
+            for k in 0..b.proto.num_params {
+                b.set(k, args.get(k as usize).copied().unwrap_or(nil));
+            }
+            b.flush();
+            b.jump(succs[0]);
+        }
         TAILCALL => {
             let callee = callee_at(b, pc, a);
             // The frame before the TAILCALL, for the return's exit, which is

@@ -44,6 +44,8 @@ const TAG_STRING: u64 = 3;
 pub(crate) const STRING_BITS: u64 = QNAN_NEG | TAG_STRING << TAG_SHIFT;
 const TAG_TABLE: u64 = 4;
 const TAG_FUNCTION: u64 = 5;
+/// A function value's bits but its payload, the closure's address.
+pub(crate) const FUNCTION_BITS: u64 = QNAN_NEG | TAG_FUNCTION << TAG_SHIFT;
 const TAG_THREAD: u64 = 6;
 const TAG_IMMEDIATE: u64 = 7;
 

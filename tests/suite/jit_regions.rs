@@ -2505,6 +2505,46 @@ fn tail_calls_take_over_the_region_frame() {
     );
 }
 
+/// A function region's tail calls of itself are its loop (W3 step 6c), the
+/// frame reused as the interpreter's `TAILCALL` reuses it: level 3 from
+/// `find` is the loop calling it. `f1` and `f2` are closures of one
+/// prototype tail-calling each other: only the running closure loops, so
+/// each call keeps its own `k`.
+#[test]
+fn tail_self_calls_loop() {
+    agrees(
+        "local function sum(n, acc)
+          if n == 0 then return acc end
+          return sum(n - 1, acc + n)
+        end
+        local function find(t, i, x)
+          if t[i] == x then
+            local ok, e = pcall(error, 'at', 3)
+            return i, e
+          end
+          return find(t, i + 1, x)
+        end
+        local function mk(k)
+          local f
+          f = function(n, other, acc)
+            if n == 0 then return acc end
+            return other(n - 1, f, acc + k)
+          end
+          return f
+        end
+        local f1, f2 = mk(1), mk(1000)
+        local t = {}
+        for i = 1, 200 do t[i] = i end
+        local s, where = 0
+        for k = 1, 300 do
+          local i, e = find(t, 1, k % 200 + 1)
+          s = s + sum(500, 0) + i + f1(9, f2, 0) + f1(10, f1, 0)
+          where = e
+        end
+        return s .. ' ' .. where",
+    );
+}
+
 /// A panic in a native that compiled code called, under a chain of fast
 /// calls, unwinds through their frames (`unwind::Fde`) to the host.
 #[test]

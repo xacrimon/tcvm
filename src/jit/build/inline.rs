@@ -376,7 +376,7 @@ fn prepare(lf: LuaFn<'_>) -> Option<InlineCode> {
         return None;
     }
     crate::jit::compile::canonical_back_edges(lf, &mut code);
-    let cfg = Cfg::build(&proto, code, 0).ok()?;
+    let cfg = Cfg::build(&proto, code, 0, Vec::new()).ok()?;
     if cfg.never_ran[cfg.block_of[0] as usize] {
         return None;
     }

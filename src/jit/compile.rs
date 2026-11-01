@@ -110,7 +110,12 @@ pub(crate) fn build_ir<'gc>(
         .collect();
     canonical_back_edges(closure, &mut code);
     let loop_entry = code[pc as usize].op() != crate::instruction::Op::FUNC;
-    let cfg = Cfg::build(&closure.proto, code, pc)?;
+    let tails = if loop_entry {
+        Vec::new()
+    } else {
+        self_tail_calls(closure, &code)
+    };
+    let cfg = Cfg::build(&closure.proto, code, pc, tails)?;
     let mut b = Builder::new(ctx, closure, &cfg, pc, loop_entry);
     b.deopt_all = opts.deopt_all;
     if loop_entry && !frame.is_null() {
@@ -224,6 +229,41 @@ pub(crate) fn resolve_original(
 /// Point each counted back edge that jumps past a `LOOP` at it, as the CFG
 /// takes the `LOOP` for the loop's header; an entry there pointed its own
 /// already (`Entry::back_edges`).
+/// The `TAILCALL`s of a function region whose call sites saw only its own
+/// prototype's closures, which become jumps to its start (W3 §5, Q6), the
+/// callee guarded to be the frame's: not for a vararg function, nor one
+/// whose closures capture its registers (the frame's open upvalues would
+/// have to close first).
+pub(crate) fn self_tail_calls(
+    closure: LuaFn<'_>,
+    code: &[crate::instruction::Instruction],
+) -> Vec<u32> {
+    use crate::env::feedback::slot_proto;
+    let proto = closure.proto;
+    if proto.is_vararg
+        || crate::jit::build::cfg::captured(&proto)
+            .iter()
+            .next()
+            .is_some()
+    {
+        return Vec::new();
+    }
+    let me = crate::env::value::Value::function(closure.function()).to_raw();
+    (0..code.len() as u32)
+        .filter(|&t| {
+            let i = code[t as usize];
+            if i.op() != crate::instruction::Op::TAILCALL
+                || i.b() == 0
+                || proto.feedback.bits(t as usize) & crate::jit::feedback::CONST_MISS != 0
+            {
+                return false;
+            }
+            let w = proto.feedback.callee(t as usize).map_or(0, |c| c.get());
+            w == me || slot_proto(w).is_some_and(|p| crate::dmm::Gc::ptr_eq(p, proto))
+        })
+        .collect()
+}
+
 pub(crate) fn canonical_back_edges(
     closure: LuaFn<'_>,
     code: &mut [crate::instruction::Instruction],

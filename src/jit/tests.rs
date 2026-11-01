@@ -68,7 +68,12 @@ fn built_ir_of(src: &str, name: &str, pc: u32) -> String {
             .collect();
         canonical_back_edges(lf, &mut code);
         let loop_entry = code[pc as usize].op() != crate::instruction::Op::FUNC;
-        let cfg = crate::jit::build::cfg::Cfg::build(&lf.proto, code, pc).expect("a CFG");
+        let tails = if loop_entry {
+            Vec::new()
+        } else {
+            crate::jit::compile::self_tail_calls(lf, &code)
+        };
+        let cfg = crate::jit::build::cfg::Cfg::build(&lf.proto, code, pc, tails).expect("a CFG");
         let b = crate::jit::build::Builder::new(ctx, lf, &cfg, pc, loop_entry);
         b.build().expect("built").print()
     })
