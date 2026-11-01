@@ -173,6 +173,7 @@ pub(crate) fn optimize(f: &mut Func<'_>, t: &mut Times) {
         changed |= t.timed("simplify", || opt::simplify::simplify(f));
         t.timed("params", || remove_trivial_params(f));
         changed |= t.timed("gvn", || opt::gvn::gvn(f));
+        changed |= t.timed("branches", || opt::branch::eliminate(f));
         changed |= t.timed("licm", || opt::licm::licm(f));
         changed |= t.timed("range", || opt::range::loop_bounds(f));
         t.timed("dce", || opt::dce(f));

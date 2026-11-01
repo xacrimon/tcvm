@@ -971,3 +971,32 @@ fn dominated_branches_fold() {
     let ir = ir_of(src, "f", 0);
     assert_eq!(branches_on(&ir, "cmp.lt"), 2, "{ir}");
 }
+
+/// A merge whose branch each incoming edge decides is copied into the
+/// edges (W1 5.4): the second `x < 3` and the test of `y` go.
+#[test]
+fn merges_an_edge_decides_are_copied() {
+    let src = "function f(x, t, n)
+        local s = 0
+        for i = 1, n do
+            local y
+            if x < 3 then y = t[1] else y = 2 end
+            if x < 3 then s = s + y else s = s - 1 end
+        end
+        return s
+    end
+    function g(x, n)
+        local s = 0
+        for i = 1, n do
+            local y = x < 3 and i or false
+            if y then s = s + y end
+        end
+        return s
+    end
+    local t = {5, 6, 7, 8}
+    for r = 1, 300 do f(r % 7, t, 10); g(r % 7, 10) end";
+    let ir = ir_of(src, "f", 0);
+    assert_eq!(branches_on(&ir, "cmp.lt"), 2, "{ir}");
+    let ir = ir_of(src, "g", 0);
+    assert!(!ir.contains("isfalsy"), "{ir}");
+}
